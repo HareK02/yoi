@@ -1,0 +1,6 @@
+{"timestamp":1767714197,"model":"gemini-2.0-flash","description":"Simple text response"}
+{"elapsed_ms":20439,"event_type":"Discriminant(1)","data":"{\"Usage\":{\"input_tokens\":18,\"output_tokens\":null,\"total_tokens\":18,\"cache_read_input_tokens\":null,\"cache_creation_input_tokens\":null}}"}
+{"elapsed_ms":20439,"event_type":"Discriminant(5)","data":"{\"BlockDelta\":{\"index\":0,\"delta\":{\"Text\":\"Hello\"}}}"}
+{"elapsed_ms":20439,"event_type":"Discriminant(1)","data":"{\"Usage\":{\"input_tokens\":16,\"output_tokens\":3,\"total_tokens\":19,\"cache_read_input_tokens\":null,\"cache_creation_input_tokens\":null}}"}
+{"elapsed_ms":20439,"event_type":"Discriminant(5)","data":"{\"BlockDelta\":{\"index\":0,\"delta\":{\"Text\":\".\\n\"}}}"}
+{"elapsed_ms":20439,"event_type":"Discriminant(6)","data":"{\"BlockStop\":{\"index\":0,\"block_type\":\"Text\",\"stop_reason\":\"EndTurn\"}}"}

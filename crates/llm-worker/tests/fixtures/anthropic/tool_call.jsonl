@@ -1,0 +1,16 @@
+{"timestamp":1767692881,"model":"claude-sonnet-4-20250514","description":"Tool call response"}
+{"elapsed_ms":1783,"event_type":"Discriminant(1)","data":"{\"Usage\":{\"input_tokens\":409,\"output_tokens\":3,\"total_tokens\":412,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0}}"}
+{"elapsed_ms":1783,"event_type":"Discriminant(4)","data":"{\"BlockStart\":{\"index\":0,\"block_type\":\"Text\",\"metadata\":\"Text\"}}"}
+{"elapsed_ms":1783,"event_type":"Discriminant(5)","data":"{\"BlockDelta\":{\"index\":0,\"delta\":{\"Text\":\"I'll check\"}}}"}
+{"elapsed_ms":1883,"event_type":"Discriminant(5)","data":"{\"BlockDelta\":{\"index\":0,\"delta\":{\"Text\":\" the current\"}}}"}
+{"elapsed_ms":2063,"event_type":"Discriminant(0)","data":"{\"Ping\":{\"timestamp\":null}}"}
+{"elapsed_ms":2063,"event_type":"Discriminant(5)","data":"{\"BlockDelta\":{\"index\":0,\"delta\":{\"Text\":\" weather in Tokyo for you using\"}}}"}
+{"elapsed_ms":2124,"event_type":"Discriminant(5)","data":"{\"BlockDelta\":{\"index\":0,\"delta\":{\"Text\":\" the get_weather tool.\"}}}"}
+{"elapsed_ms":2252,"event_type":"Discriminant(6)","data":"{\"BlockStop\":{\"index\":0,\"block_type\":\"Text\",\"stop_reason\":null}}"}
+{"elapsed_ms":2253,"event_type":"Discriminant(4)","data":"{\"BlockStart\":{\"index\":1,\"block_type\":\"ToolUse\",\"metadata\":{\"ToolUse\":{\"id\":\"toolu_011Hg5wju1LGL7F65HyfE6bM\",\"name\":\"get_weather\"}}}}"}
+{"elapsed_ms":2253,"event_type":"Discriminant(5)","data":"{\"BlockDelta\":{\"index\":1,\"delta\":{\"InputJson\":\"\"}}}"}
+{"elapsed_ms":2306,"event_type":"Discriminant(5)","data":"{\"BlockDelta\":{\"index\":1,\"delta\":{\"InputJson\":\"{\\\"city\\\": \\\"Tokyo\"}}}"}
+{"elapsed_ms":2451,"event_type":"Discriminant(5)","data":"{\"BlockDelta\":{\"index\":1,\"delta\":{\"InputJson\":\"\\\"}\"}}}"}
+{"elapsed_ms":2451,"event_type":"Discriminant(6)","data":"{\"BlockStop\":{\"index\":1,\"block_type\":\"Text\",\"stop_reason\":null}}"}
+{"elapsed_ms":2464,"event_type":"Discriminant(1)","data":"{\"Usage\":{\"input_tokens\":409,\"output_tokens\":71,\"total_tokens\":480,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0}}"}
+{"elapsed_ms":2470,"event_type":"Discriminant(2)","data":"{\"Status\":{\"status\":\"Completed\"}}"}

@@ -1,0 +1,7 @@
+{"timestamp":1767624445,"model":"claude-sonnet-4-20250514","description":"Simple greeting test"}
+{"elapsed_ms":1697,"event_type":"Discriminant(1)","data":"{\"Usage\":{\"input_tokens\":24,\"output_tokens\":2,\"total_tokens\":26,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0}}"}
+{"elapsed_ms":1697,"event_type":"Discriminant(4)","data":"{\"BlockStart\":{\"index\":0,\"block_type\":\"Text\",\"metadata\":\"Text\"}}"}
+{"elapsed_ms":1697,"event_type":"Discriminant(5)","data":"{\"BlockDelta\":{\"index\":0,\"delta\":{\"Text\":\"Hello!\"}}}"}
+{"elapsed_ms":1885,"event_type":"Discriminant(6)","data":"{\"BlockStop\":{\"index\":0,\"block_type\":\"Text\",\"stop_reason\":null}}"}
+{"elapsed_ms":1929,"event_type":"Discriminant(1)","data":"{\"Usage\":{\"input_tokens\":24,\"output_tokens\":5,\"total_tokens\":29,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0}}"}
+{"elapsed_ms":1929,"event_type":"Discriminant(2)","data":"{\"Status\":{\"status\":\"Completed\"}}"}

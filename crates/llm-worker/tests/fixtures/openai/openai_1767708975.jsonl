@@ -1,0 +1,8 @@
+{"timestamp":1767708975,"model":"gpt-4o","description":"Simple greeting test"}
+{"elapsed_ms":2195,"event_type":"Discriminant(4)","data":"{\"BlockStart\":{\"index\":0,\"block_type\":\"ToolUse\",\"metadata\":{\"ToolUse\":{\"id\":\"call_44oSltIww2HDJTqJZdlBp6Mw\",\"name\":\"get_weather\"}}}}"}
+{"elapsed_ms":2227,"event_type":"Discriminant(5)","data":"{\"BlockDelta\":{\"index\":0,\"delta\":{\"InputJson\":\"{\\\"\"}}}"}
+{"elapsed_ms":2227,"event_type":"Discriminant(5)","data":"{\"BlockDelta\":{\"index\":0,\"delta\":{\"InputJson\":\"location\"}}}"}
+{"elapsed_ms":2255,"event_type":"Discriminant(5)","data":"{\"BlockDelta\":{\"index\":0,\"delta\":{\"InputJson\":\"\\\":\\\"\"}}}"}
+{"elapsed_ms":2255,"event_type":"Discriminant(5)","data":"{\"BlockDelta\":{\"index\":0,\"delta\":{\"InputJson\":\"Tokyo\"}}}"}
+{"elapsed_ms":2263,"event_type":"Discriminant(5)","data":"{\"BlockDelta\":{\"index\":0,\"delta\":{\"InputJson\":\"\\\"}\"}}}"}
+{"elapsed_ms":2268,"event_type":"Discriminant(1)","data":"{\"Usage\":{\"input_tokens\":60,\"output_tokens\":14,\"total_tokens\":74,\"cache_read_input_tokens\":null,\"cache_creation_input_tokens\":null}}"}

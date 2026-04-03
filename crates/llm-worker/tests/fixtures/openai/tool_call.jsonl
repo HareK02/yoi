@@ -1,0 +1,8 @@
+{"timestamp":1767710387,"model":"gpt-4o","description":"Tool call response"}
+{"elapsed_ms":1560,"event_type":"Discriminant(4)","data":"{\"BlockStart\":{\"index\":0,\"block_type\":\"ToolUse\",\"metadata\":{\"ToolUse\":{\"id\":\"call_20MaqO3n8LBQG77HCpBYi22A\",\"name\":\"get_weather\"}}}}"}
+{"elapsed_ms":1599,"event_type":"Discriminant(5)","data":"{\"BlockDelta\":{\"index\":0,\"delta\":{\"InputJson\":\"{\\\"\"}}}"}
+{"elapsed_ms":1599,"event_type":"Discriminant(5)","data":"{\"BlockDelta\":{\"index\":0,\"delta\":{\"InputJson\":\"city\"}}}"}
+{"elapsed_ms":1625,"event_type":"Discriminant(5)","data":"{\"BlockDelta\":{\"index\":0,\"delta\":{\"InputJson\":\"\\\":\\\"\"}}}"}
+{"elapsed_ms":1625,"event_type":"Discriminant(5)","data":"{\"BlockDelta\":{\"index\":0,\"delta\":{\"InputJson\":\"Tokyo\"}}}"}
+{"elapsed_ms":1631,"event_type":"Discriminant(5)","data":"{\"BlockDelta\":{\"index\":0,\"delta\":{\"InputJson\":\"\\\"}\"}}}"}
+{"elapsed_ms":1632,"event_type":"Discriminant(1)","data":"{\"Usage\":{\"input_tokens\":73,\"output_tokens\":14,\"total_tokens\":87,\"cache_read_input_tokens\":null,\"cache_creation_input_tokens\":null}}"}

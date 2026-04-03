@@ -1,0 +1,5 @@
+{"timestamp":1767714198,"model":"gemini-2.0-flash","description":"Tool call response"}
+{"elapsed_ms":798,"event_type":"Discriminant(1)","data":"{\"Usage\":{\"input_tokens\":43,\"output_tokens\":5,\"total_tokens\":48,\"cache_read_input_tokens\":null,\"cache_creation_input_tokens\":null}}"}
+{"elapsed_ms":798,"event_type":"Discriminant(4)","data":"{\"BlockStart\":{\"index\":0,\"block_type\":\"ToolUse\",\"metadata\":{\"ToolUse\":{\"id\":\"call_get_weather\",\"name\":\"get_weather\"}}}}"}
+{"elapsed_ms":798,"event_type":"Discriminant(5)","data":"{\"BlockDelta\":{\"index\":0,\"delta\":{\"InputJson\":\"{\\\"city\\\":\\\"Tokyo\\\"}\"}}}"}
+{"elapsed_ms":798,"event_type":"Discriminant(6)","data":"{\"BlockStop\":{\"index\":0,\"block_type\":\"Text\",\"stop_reason\":\"EndTurn\"}}"}
