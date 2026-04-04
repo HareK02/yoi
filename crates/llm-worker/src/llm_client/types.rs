@@ -501,7 +501,7 @@ impl ToolDefinition {
 // ============================================================================
 
 /// Request configuration
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RequestConfig {
     /// Maximum tokens to generate
     pub max_tokens: Option<u32>,

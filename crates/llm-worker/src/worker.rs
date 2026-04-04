@@ -1308,6 +1308,16 @@ impl<C: LlmClient> Worker<C, Mutable> {
         self.history.clear();
     }
 
+    /// Set the turn count (for session restoration)
+    pub fn set_turn_count(&mut self, count: usize) {
+        self.turn_count = count;
+    }
+
+    /// Set the last_run_interrupted flag (for session restoration)
+    pub fn set_last_run_interrupted(&mut self, interrupted: bool) {
+        self.last_run_interrupted = interrupted;
+    }
+
     /// Apply configuration (reserved for future extensions)
     #[allow(dead_code)]
     pub fn config(self, _config: WorkerConfig) -> Self {
