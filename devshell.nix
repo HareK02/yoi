@@ -1,8 +1,15 @@
 { pkgs }:
 pkgs.mkShell {
-  buildInputs = with pkgs; [
+  packages = with pkgs; [
+    nixfmt
+    deno
+    git
     rustc
     cargo
+  ];
+  buildInputs = with pkgs; [
+    pkg-config
+    openssl
   ];
   shellHook = ''
     echo "dev-shell-loaded"
