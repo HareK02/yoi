@@ -1,7 +1,7 @@
 //! Debug-only raw stream event recording.
 //!
 //! [`TraceEntry`] captures every LLM stream event verbatim for debugging
-//! and replay analysis. Written to a separate `.trace.jsonl` file,
+//! and post-hoc analysis. Written to a separate `.trace.jsonl` file,
 //! completely independent of the session log used for state restoration.
 //!
 //! Disabled by default. Enable via `SessionConfig::record_event_trace`.

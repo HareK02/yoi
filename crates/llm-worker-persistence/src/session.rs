@@ -77,7 +77,7 @@ impl<C: LlmClient, St: Store> Session<C, St> {
 
     /// Restore a session from a stored log.
     ///
-    /// Reads all log entries, replays them to reconstruct state,
+    /// Reads all log entries, collects state from them,
     /// and returns a `Session` ready for `resume()`.
     pub async fn restore(
         client: C,
@@ -86,7 +86,7 @@ impl<C: LlmClient, St: Store> Session<C, St> {
         config: SessionConfig,
     ) -> Result<Self, SessionError> {
         let entries = store.read_all(session_id).await?;
-        let state = session_log::replay_entries(&entries);
+        let state = session_log::collect_state(&entries);
 
         let mut worker = Worker::new(client);
         if let Some(ref prompt) = state.system_prompt {
@@ -172,7 +172,7 @@ impl<C: LlmClient, St: Store> Session<C, St> {
     ) -> Result<SessionId, StoreError> {
         let entries = store.read_all(source_id).await?;
         let truncated = &entries[..up_to_entry.min(entries.len())];
-        let state = session_log::replay_entries(truncated);
+        let state = session_log::collect_state(truncated);
 
         let fork_id = crate::new_session_id();
         let start = LogEntry::SessionStart {

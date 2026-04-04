@@ -1,8 +1,8 @@
 //! Session log types for append-only JSONL persistence.
 //!
 //! Each [`LogEntry`] represents a single state transition in a session,
-//! serialized as one line in a `.jsonl` file. Replaying the sequence of
-//! entries reconstructs the full [`Worker`] state.
+//! serialized as one line in a `.jsonl` file. Reading all entries and
+//! collecting them via [`collect_state`] reconstructs the full [`Worker`] state.
 
 use llm_worker::llm_client::types::{Item, RequestConfig};
 use serde::{Deserialize, Serialize};
@@ -50,7 +50,7 @@ pub enum LogEntry {
     CacheUnlocked { ts: u64 },
 
     /// Outcome of a `run()` or `resume()` call.
-    /// This is metadata for auditing; replay logic does not branch on the outcome.
+    /// This is metadata for auditing; state collection does not branch on the outcome.
     RunOutcome {
         ts: u64,
         outcome: Outcome,
@@ -61,7 +61,7 @@ pub enum LogEntry {
     ConfigChanged { ts: u64, config: RequestConfig },
 }
 
-/// Outcome of a run/resume call. Used for auditing, not for replay branching.
+/// Outcome of a run/resume call. Metadata for auditing only.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Outcome {
@@ -70,7 +70,7 @@ pub enum Outcome {
     Error { message: String },
 }
 
-/// State reconstructed by replaying log entries.
+/// State collected from log entries.
 #[derive(Debug, Clone)]
 pub struct RestoredState {
     pub system_prompt: Option<String>,
@@ -82,7 +82,7 @@ pub struct RestoredState {
 }
 
 /// Replay a sequence of log entries to reconstruct worker state.
-pub fn replay_entries(entries: &[LogEntry]) -> RestoredState {
+pub fn collect_state(entries: &[LogEntry]) -> RestoredState {
     let mut state = RestoredState {
         system_prompt: None,
         config: RequestConfig::default(),
@@ -153,7 +153,7 @@ mod tests {
 
     #[test]
     fn replay_empty() {
-        let state = replay_entries(&[]);
+        let state = collect_state(&[]);
         assert!(state.history.is_empty());
         assert_eq!(state.turn_count, 0);
         assert_eq!(state.locked_prefix_len, 0);
@@ -167,7 +167,7 @@ mod tests {
             config: RequestConfig::default().with_max_tokens(1024),
             history: vec![Item::user_message("seed")],
         }];
-        let state = replay_entries(&entries);
+        let state = collect_state(&entries);
         assert_eq!(state.system_prompt.as_deref(), Some("You are helpful."));
         assert_eq!(state.config.max_tokens, Some(1024));
         assert_eq!(state.history.len(), 1);
@@ -200,7 +200,7 @@ mod tests {
                 interrupted: false,
             },
         ];
-        let state = replay_entries(&entries);
+        let state = collect_state(&entries);
         assert_eq!(state.history.len(), 2);
         assert_eq!(state.turn_count, 1);
         assert!(!state.last_run_interrupted);
@@ -236,7 +236,7 @@ mod tests {
                 turn_count: 1,
             },
         ];
-        let state = replay_entries(&entries);
+        let state = collect_state(&entries);
         assert_eq!(state.history.len(), 4);
         assert!(state.history[1].is_tool_call());
         assert!(state.history[2].is_tool_result());
@@ -257,11 +257,11 @@ mod tests {
             },
             LogEntry::CacheUnlocked { ts: 3000 },
         ];
-        let state = replay_entries(&entries);
+        let state = collect_state(&entries);
         assert_eq!(state.locked_prefix_len, 0);
 
         // Check locked state before unlock
-        let state_locked = replay_entries(&entries[..2]);
+        let state_locked = collect_state(&entries[..2]);
         assert_eq!(state_locked.locked_prefix_len, 2);
     }
 
@@ -279,7 +279,7 @@ mod tests {
                 config: RequestConfig::default().with_temperature(0.5),
             },
         ];
-        let state = replay_entries(&entries);
+        let state = collect_state(&entries);
         assert_eq!(state.config.temperature, Some(0.5));
     }
 }

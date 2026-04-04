@@ -3,7 +3,7 @@
 ## 概要
 
 `llm-worker-persistence` クレートは、`llm-worker` の `Worker` セッション状態を
-JSONL append-only ログとして永続化する。ログを replay することで Worker 状態を完全に復元する。
+JSONL append-only ログとして永続化する。ログを読み込んで集約することで Worker 状態を復元する。
 
 ## 設計方針
 
@@ -12,7 +12,7 @@ JSONL append-only ログとして永続化する。ログを replay すること
   (`history: Vec<Item>` + `turn_count` + `request_config`)。
   `resume()` は「ユーザー入力を追加せず `run_turn_loop()` に再入する」だけなので、
   復元に必要なのは history の中身であり、前回の終了理由ではない。
-  `RunOutcome` の `Finished`/`Paused` 区分は監査用メタデータであり、replay の分岐には使わない。
+  `RunOutcome` の `Finished`/`Paused` 区分は監査用メタデータであり、状態復元の分岐には使わない。
 - **クレート分離**: `llm-worker` は永続化を知らない。`Session` ラッパーが外から Worker を包む。
 
 ## 命名規約
@@ -43,7 +43,7 @@ llm-worker-persistence → llm-worker → llm-worker-macros
 
 各エントリは Worker の特定の状態変更に対応する:
 
-| エントリ | Worker 上の対応箇所 | replay での効果 |
+| エントリ | Worker 上の対応箇所 | collect_state での効果 |
 |---|---|---|
 | `SessionStart` | セッション開始 / fork | system_prompt, config, history を初期化 |
 | `UserInput` | `worker.rs:229` | history に追加 |
@@ -69,7 +69,7 @@ pub struct Session<C: LlmClient, St: Store> {
 - `Session::new()` — SessionStart を書き込み
 - `Session::run()` — Worker::run() の前後で history を比較、差分をログ記録
 - `Session::resume()` — 同上
-- `Session::restore()` — ログを replay して Worker を再構築
+- `Session::restore()` — ログを読み込み、状態を集約して Worker を再構築
 - `Session::fork()` — 現在の history をシードにした新セッションを作成
 - `Session::fork_at()` — 任意のログ地点から分岐
 

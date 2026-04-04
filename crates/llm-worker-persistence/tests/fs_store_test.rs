@@ -1,6 +1,6 @@
 use llm_worker::llm_client::types::{Item, RequestConfig};
 use llm_worker_persistence::{
-    FsStore, LogEntry, Outcome, Store, TraceEntry, new_session_id, replay_entries,
+    FsStore, LogEntry, Outcome, Store, TraceEntry, new_session_id, collect_state,
 };
 
 #[tokio::test]
@@ -45,7 +45,7 @@ async fn round_trip_write_and_read() {
     assert_eq!(read_back.len(), entries.len());
 
     // Replay and verify state
-    let state = replay_entries(&read_back);
+    let state = collect_state(&read_back);
     assert_eq!(state.system_prompt.as_deref(), Some("You are helpful."));
     assert_eq!(state.config.max_tokens, Some(1024));
     assert_eq!(state.history.len(), 2);
@@ -72,7 +72,7 @@ async fn create_session_writes_all_entries() {
     let read_back = store.read_all(id).await.unwrap();
     assert_eq!(read_back.len(), 1);
 
-    let state = replay_entries(&read_back);
+    let state = collect_state(&read_back);
     assert_eq!(state.history.len(), 2);
 }
 
