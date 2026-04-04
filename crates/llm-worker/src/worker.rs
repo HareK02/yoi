@@ -516,9 +516,9 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
             items.push(Item::assistant_message(text));
         }
 
-        // Add tool calls as FunctionCall items
+        // Add tool calls as ToolCall items
         for call in tool_calls {
-            items.push(Item::function_call_json(
+            items.push(Item::tool_call_json(
                 &call.id,
                 &call.name,
                 call.input.clone(),
@@ -702,20 +702,20 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
 
     /// Check for pending tool calls (for resuming from Pause)
     fn get_pending_tool_calls(&self) -> Option<Vec<ToolCall>> {
-        // Find the last FunctionCall items that don't have corresponding FunctionCallOutput
+        // Find the last ToolCall items that don't have corresponding ToolResult
         let mut pending_calls = Vec::new();
         let mut answered_call_ids = std::collections::HashSet::new();
 
         // First pass: collect all answered call IDs
         for item in &self.history {
-            if let Item::FunctionCallOutput { call_id, .. } = item {
+            if let Item::ToolResult { call_id, .. } = item {
                 answered_call_ids.insert(call_id.clone());
             }
         }
 
-        // Second pass: find unanswered function calls
+        // Second pass: find unanswered tool calls
         for item in &self.history {
-            if let Item::FunctionCall {
+            if let Item::ToolCall {
                 call_id,
                 name,
                 arguments,
@@ -894,7 +894,7 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
                 }
                 Ok(ToolExecutionResult::Completed(results)) => {
                     for result in results {
-                        self.history.push(Item::function_call_output(
+                        self.history.push(Item::tool_result(
                             &result.tool_use_id,
                             &result.content,
                         ));
@@ -985,27 +985,25 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
                                 }
                                 let event = result
                                     .inspect_err(|_| self.last_run_interrupted = true)?;
-                                let timeline_event: crate::timeline::event::Event = event.into();
-                                self.timeline.dispatch(&timeline_event);
+                                self.timeline.dispatch(&event);
 
-                                let worker_event: crate::event::Event = timeline_event.clone().into();
-                                self.run_on_stream_chunk_hooks(worker_event)
+                                self.run_on_stream_chunk_hooks(event.clone())
                                     .await
                                     .inspect_err(|_| self.last_run_interrupted = true)?;
 
-                                if let crate::timeline::event::Event::BlockDelta(delta) = &timeline_event {
+                                if let crate::llm_client::event::Event::BlockDelta(delta) = &event {
                                     match &delta.delta {
-                                        crate::timeline::event::DeltaContent::Text(text) => {
+                                        crate::llm_client::event::DeltaContent::Text(text) => {
                                             self.run_on_text_delta_hooks(delta.index, text.clone())
                                                 .await
                                                 .inspect_err(|_| self.last_run_interrupted = true)?;
                                         }
-                                        crate::timeline::event::DeltaContent::InputJson(json_fragment) => {
+                                        crate::llm_client::event::DeltaContent::InputJson(json_fragment) => {
                                             self.run_on_tool_call_delta_hooks(delta.index, json_fragment.clone())
                                                 .await
                                                 .inspect_err(|_| self.last_run_interrupted = true)?;
                                         }
-                                        crate::timeline::event::DeltaContent::Thinking(_) => {}
+                                        crate::llm_client::event::DeltaContent::Thinking(_) => {}
                                     }
                                 }
                             }
@@ -1072,7 +1070,7 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
                 }
                 Ok(ToolExecutionResult::Completed(results)) => {
                     for result in results {
-                        self.history.push(Item::function_call_output(
+                        self.history.push(Item::tool_result(
                             &result.tool_use_id,
                             &result.content,
                         ));

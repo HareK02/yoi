@@ -195,7 +195,7 @@ impl OpenAIScheme {
                     });
                 }
 
-                Item::FunctionCall {
+                Item::ToolCall {
                     call_id,
                     name,
                     arguments,
@@ -211,7 +211,7 @@ impl OpenAIScheme {
                     });
                 }
 
-                Item::FunctionCallOutput {
+                Item::ToolResult {
                     call_id, output, ..
                 } => {
                     // Flush pending tool calls before tool result
@@ -339,16 +339,16 @@ mod tests {
     }
 
     #[test]
-    fn test_function_call_and_output() {
+    fn test_tool_call_and_result() {
         let scheme = OpenAIScheme::new();
         let request = Request::new()
             .user("Check weather")
-            .item(Item::function_call(
+            .item(Item::tool_call(
                 "call_123",
                 "get_weather",
                 r#"{"city":"Tokyo"}"#,
             ))
-            .item(Item::function_call_output("call_123", "Sunny, 25°C"));
+            .item(Item::tool_result("call_123", "Sunny, 25°C"));
 
         let body = scheme.build_request("gpt-4o", &request);
 

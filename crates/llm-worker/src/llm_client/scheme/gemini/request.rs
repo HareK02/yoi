@@ -234,7 +234,7 @@ impl GeminiScheme {
                     });
                 }
 
-                Item::FunctionCall {
+                Item::ToolCall {
                     name, arguments, ..
                 } => {
                     // Flush pending user parts first
@@ -257,7 +257,7 @@ impl GeminiScheme {
                     });
                 }
 
-                Item::FunctionCallOutput {
+                Item::ToolResult {
                     call_id, output, ..
                 } => {
                     // Flush pending model parts first
@@ -390,16 +390,16 @@ mod tests {
     }
 
     #[test]
-    fn test_function_call_and_output() {
+    fn test_tool_call_and_result() {
         let scheme = GeminiScheme::new();
         let request = Request::new()
             .user("What's the weather?")
-            .item(Item::function_call(
+            .item(Item::tool_call(
                 "call_123",
                 "get_weather",
                 r#"{"city":"Tokyo"}"#,
             ))
-            .item(Item::function_call_output("call_123", "Sunny, 25°C"));
+            .item(Item::tool_result("call_123", "Sunny, 25°C"));
 
         let gemini_req = scheme.build_request(&request);
 
