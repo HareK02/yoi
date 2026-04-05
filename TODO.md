@@ -1,3 +1,5 @@
 - [x] 永続化データ構造の制定
 - [ ] テスト設計
+- [x] ツール出力の遅延読み込み設計 (ToolOutput / BlobStore / auto_summarize)
 - [ ] ツール設計
+- [ ] inspect ツール実装

@@ -23,7 +23,7 @@ use crate::{
         ToolUseBlockSubscriberAdapter, UsageSubscriberAdapter, WorkerSubscriber,
     },
     timeline::{TextBlockCollector, Timeline, ToolCallCollector},
-    tool::{ToolDefinition as WorkerToolDefinition, ToolError},
+    tool::{ToolDefinition as WorkerToolDefinition, ToolError, ToolOutputProcessor},
     tool_server::{ToolServer, ToolServerError, ToolServerHandle},
 };
 
@@ -185,6 +185,8 @@ pub struct Worker<C: LlmClient, S: WorkerState = Mutable> {
     request_config: RequestConfig,
     /// Whether the previous run was interrupted
     last_run_interrupted: bool,
+    /// Optional processor for large tool outputs (stores externally, returns summary)
+    output_processor: Option<Arc<dyn ToolOutputProcessor>>,
     /// Cancel notification channel (for interrupting execution)
     cancel_tx: mpsc::Sender<()>,
     cancel_rx: mpsc::Receiver<()>,
@@ -840,6 +842,20 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
             }
         };
 
+        // Phase 2.5: Apply output processor (store large results externally)
+        if let Some(ref processor) = self.output_processor {
+            for tool_result in &mut results {
+                if !tool_result.is_error {
+                    match processor.process(tool_result.content.clone()).await {
+                        Ok(processed) => tool_result.content = processed,
+                        Err(e) => {
+                            warn!(error = %e, "Output processor failed, keeping original content");
+                        }
+                    }
+                }
+            }
+        }
+
         // Phase 3: Apply post_tool_call hooks
         for tool_result in &mut results {
             // Get saved information
@@ -1124,6 +1140,7 @@ impl<C: LlmClient> Worker<C, Mutable> {
             turn_notifiers: Vec::new(),
             request_config: RequestConfig::default(),
             last_run_interrupted: false,
+            output_processor: None,
             cancel_tx,
             cancel_rx,
             _state: PhantomData,
@@ -1318,6 +1335,14 @@ impl<C: LlmClient> Worker<C, Mutable> {
         self.last_run_interrupted = interrupted;
     }
 
+    /// Set a tool output processor for handling large tool results.
+    ///
+    /// When set, tool execution results are passed through this processor
+    /// before being placed into conversation history.
+    pub fn set_output_processor(&mut self, processor: Arc<dyn ToolOutputProcessor>) {
+        self.output_processor = Some(processor);
+    }
+
     /// Apply configuration (reserved for future extensions)
     #[allow(dead_code)]
     pub fn config(self, _config: WorkerConfig) -> Self {
@@ -1344,6 +1369,7 @@ impl<C: LlmClient> Worker<C, Mutable> {
             turn_notifiers: self.turn_notifiers,
             request_config: self.request_config,
             last_run_interrupted: self.last_run_interrupted,
+            output_processor: self.output_processor,
             cancel_tx: self.cancel_tx,
             cancel_rx: self.cancel_rx,
             _state: PhantomData,
@@ -1380,6 +1406,7 @@ impl<C: LlmClient> Worker<C, CacheLocked> {
             turn_notifiers: self.turn_notifiers,
             request_config: self.request_config,
             last_run_interrupted: self.last_run_interrupted,
+            output_processor: self.output_processor,
             cancel_tx: self.cancel_tx,
             cancel_rx: self.cancel_rx,
             _state: PhantomData,
