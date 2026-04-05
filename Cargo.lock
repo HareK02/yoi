@@ -788,6 +788,8 @@ dependencies = [
 name = "llm-worker-persistence"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "futures",
  "llm-worker",
  "serde",
  "serde_json",

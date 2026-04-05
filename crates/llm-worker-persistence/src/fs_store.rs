@@ -16,6 +16,7 @@ use tokio::io::AsyncWriteExt;
 ///
 /// Each session is stored as a single `.jsonl` file with one [`LogEntry`]
 /// per line. Writes use append mode for crash safety.
+#[derive(Clone)]
 pub struct FsStore {
     root: PathBuf,
 }

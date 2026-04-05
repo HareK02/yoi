@@ -8,7 +8,6 @@ use crate::session_log::{self, LogEntry, Outcome};
 use crate::store::{Store, StoreError};
 use crate::SessionId;
 use llm_worker::llm_client::client::LlmClient;
-use llm_worker::llm_client::types::Item;
 use llm_worker::state::Mutable;
 use llm_worker::{Worker, WorkerError, WorkerResult};
 
@@ -120,14 +119,11 @@ impl<C: LlmClient, St: Store> Session<C, St> {
         &mut self,
         user_input: impl Into<String>,
     ) -> Result<WorkerResult, SessionError> {
-        let input = user_input.into();
-        let user_item = Item::user_message(&input);
         let history_before = self.worker.history().len();
 
-        let result = self.worker.run(input).await;
+        let result = self.worker.run(user_input).await;
 
-        self.log_history_delta(history_before, Some(&user_item))
-            .await?;
+        self.log_history_delta(history_before).await?;
         self.log_turn_end().await?;
         self.log_outcome(&result).await?;
 
@@ -140,7 +136,7 @@ impl<C: LlmClient, St: Store> Session<C, St> {
 
         let result = self.worker.resume().await;
 
-        self.log_history_delta(history_before, None).await?;
+        self.log_history_delta(history_before).await?;
         self.log_turn_end().await?;
         self.log_outcome(&result).await?;
 
@@ -228,11 +224,7 @@ impl<C: LlmClient, St: Store> Session<C, St> {
 
     // ── Private helpers ──────────────────────────────────────────────────
 
-    async fn log_history_delta(
-        &self,
-        before_len: usize,
-        user_item: Option<&Item>,
-    ) -> Result<(), StoreError> {
+    async fn log_history_delta(&self, before_len: usize) -> Result<(), StoreError> {
         let history = self.worker.history();
         if history.len() <= before_len {
             return Ok(());
@@ -242,24 +234,23 @@ impl<C: LlmClient, St: Store> Session<C, St> {
         let new_items = &history[before_len..];
         let mut i = 0;
 
-        // If we have a user_item, the first new item should be the user input
-        if let Some(item) = user_item {
-            self.store
-                .append(
-                    self.session_id,
-                    &LogEntry::UserInput {
-                        ts,
-                        item: item.clone(),
-                    },
-                )
-                .await?;
-            i = 1;
-        }
-
-        // Classify and group remaining items
+        // Classify and group items by type.
+        // The actual items from history are used (not pre-constructed copies),
+        // so any modifications by hooks (e.g. on_prompt_submit) are captured correctly.
         while i < new_items.len() {
             let item = &new_items[i];
-            if item.is_tool_result() {
+            if item.is_user_message() {
+                self.store
+                    .append(
+                        self.session_id,
+                        &LogEntry::UserInput {
+                            ts,
+                            item: new_items[i].clone(),
+                        },
+                    )
+                    .await?;
+                i += 1;
+            } else if item.is_tool_result() {
                 let start = i;
                 while i < new_items.len() && new_items[i].is_tool_result() {
                     i += 1;
