@@ -2,4 +2,6 @@
 - [ ] テスト設計
 - [x] ツール出力の遅延読み込み設計 (ToolOutput / BlobStore / auto_summarize)
 - [ ] ツール設計
-- [ ] inspect ツール実装
+  - [ ] ツールの動的追加/削除 (unregister, replace)
+  - [ ] ToolDefinition ファクトリの遅延初期化修正 (現状 register 時に即時呼び出しされている。セッション開始=初回メッセージ送信時まで遅延させる)
+- [x] inspect ツール実装
