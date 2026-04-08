@@ -1,10 +1,10 @@
 [package]
-name = "insomnia"
+name = "insomnia-daemon"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
 insomnia-core = { path = "../insomnia-core" }
-insomnia-daemon = { path = "../insomnia-daemon" }
+llm-worker-persistence = { path = "../llm-worker-persistence" }
 tokio = { version = "1.49", features = ["full"] }
