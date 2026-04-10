@@ -7,20 +7,11 @@ use llm_worker_persistence::{
 
 use manifest::{PodManifest, Scope, WorkerManifest};
 
-/// Pod identifier. UUID v7 (time-ordered).
-pub type PodId = uuid::Uuid;
-
-/// Generate a new Pod ID.
-pub fn new_pod_id() -> PodId {
-    uuid::Uuid::now_v7()
-}
-
 /// An independent agent execution unit.
 ///
 /// Wraps a persistent [`Session`] with manifest metadata and an optional
 /// directory scope. This is the primary abstraction in insomnia.
 pub struct Pod<C: LlmClient, St: Store> {
-    id: PodId,
     manifest: PodManifest,
     session: Session<C, St>,
     scope: Option<Scope>,
@@ -40,7 +31,6 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     ) -> Result<Self, PodError> {
         let session = Session::new(worker, store, SessionConfig::default()).await?;
         Ok(Self {
-            id: new_pod_id(),
             manifest,
             session,
             scope,
@@ -49,7 +39,6 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
 
     /// Restore a Pod from a persisted session.
     pub async fn restore(
-        id: PodId,
         session_id: SessionId,
         manifest: PodManifest,
         client: C,
@@ -58,16 +47,10 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     ) -> Result<Self, PodError> {
         let session = Session::restore(client, store, session_id, SessionConfig::default()).await?;
         Ok(Self {
-            id,
             manifest,
             session,
             scope,
         })
-    }
-
-    /// The Pod's unique identifier.
-    pub fn id(&self) -> PodId {
-        self.id
     }
 
     /// The session ID used for persistence.
@@ -121,7 +104,6 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
         apply_worker_manifest(&mut worker, &manifest.worker);
         let session = Session::new(worker, store, SessionConfig::default()).await?;
         Ok(Self {
-            id: new_pod_id(),
             manifest,
             session,
             scope,

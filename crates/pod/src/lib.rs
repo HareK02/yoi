@@ -7,7 +7,7 @@ mod pod;
 
 pub use controller::{PodController, PodHandle};
 pub use manifest::{PodManifest, ProviderConfig, ProviderKind, Scope};
-pub use pod::{Pod, PodError, PodId, PodRunResult, apply_worker_manifest, new_pod_id};
+pub use pod::{Pod, PodError, PodRunResult, apply_worker_manifest};
 pub use protocol::{ErrorCode, Event, Method, TurnResult};
 pub use provider::{ProviderError, build_client};
 pub use runtime_dir::RuntimeDir;
