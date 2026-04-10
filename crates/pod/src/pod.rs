@@ -142,6 +142,7 @@ pub fn apply_worker_manifest<C: LlmClient>(worker: &mut Worker<C>, wm: &WorkerMa
         config.temperature = Some(temperature);
     }
     worker.set_request_config(config);
+    worker.set_max_turns(wm.max_turns.map(|n| n.get()));
 }
 
 /// Result of a Pod run.
@@ -151,6 +152,8 @@ pub enum PodRunResult {
     Finished,
     /// The LLM paused (e.g. awaiting user confirmation via a hook).
     Paused,
+    /// The worker reached its configured max_turns limit.
+    LimitReached,
 }
 
 impl From<llm_worker::WorkerResult> for PodRunResult {
@@ -158,6 +161,7 @@ impl From<llm_worker::WorkerResult> for PodRunResult {
         match r {
             llm_worker::WorkerResult::Finished => PodRunResult::Finished,
             llm_worker::WorkerResult::Paused => PodRunResult::Paused,
+            llm_worker::WorkerResult::LimitReached => PodRunResult::LimitReached,
         }
     }
 }

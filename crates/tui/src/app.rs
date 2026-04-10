@@ -131,6 +131,9 @@ impl App {
                 });
                 self.scroll_to_bottom();
             }
+            Event::RunEnd { result } => {
+                self.push_status(format!("[run end] {result:?}"));
+            }
             Event::ToolCallArgsDelta { .. } => {}
         }
     }

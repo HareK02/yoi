@@ -60,6 +60,9 @@ pub enum Event {
         input_tokens: Option<u64>,
         output_tokens: Option<u64>,
     },
+    RunEnd {
+        result: RunResult,
+    },
     Error {
         code: ErrorCode,
         message: String,
@@ -81,6 +84,14 @@ impl Event {
 pub enum TurnResult {
     Finished,
     Paused,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunResult {
+    Finished,
+    Paused,
+    LimitReached,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -124,6 +135,17 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["event"], "text_delta");
         assert_eq!(parsed["data"]["text"], "Hello");
+    }
+
+    #[test]
+    fn event_run_end_format() {
+        let event = Event::RunEnd {
+            result: RunResult::LimitReached,
+        };
+        let json = event.to_json_line().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["event"], "run_end");
+        assert_eq!(parsed["data"]["result"], "limit_reached");
     }
 
     #[test]

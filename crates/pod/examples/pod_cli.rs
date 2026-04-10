@@ -49,6 +49,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match result {
         PodRunResult::Finished => println!("(finished)"),
         PodRunResult::Paused => println!("(paused)"),
+        PodRunResult::LimitReached => println!("(turn limit reached)"),
     }
 
     // 5. Extract the assistant's reply from history

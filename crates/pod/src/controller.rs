@@ -11,7 +11,7 @@ use llm_worker_persistence::Store;
 use tokio::sync::{broadcast, mpsc};
 
 use crate::pod::{Pod, PodRunResult, PodError};
-use protocol::{ErrorCode, Event, Method, TurnResult};
+use protocol::{ErrorCode, Event, Method, RunResult, TurnResult};
 use crate::runtime_dir::RuntimeDir;
 use crate::shared_state::{PodSharedState, PodStatus};
 use crate::socket_server::SocketServer;
@@ -193,10 +193,15 @@ where
         tokio::select! {
             result = &mut pod_future => {
                 return match result {
-                    Ok(r) => match r {
-                        PodRunResult::Finished => PodStatus::Idle,
-                        PodRunResult::Paused => PodStatus::Paused,
-                    },
+                    Ok(r) => {
+                        let (status, run_result) = match r {
+                            PodRunResult::Finished => (PodStatus::Idle, RunResult::Finished),
+                            PodRunResult::Paused => (PodStatus::Paused, RunResult::Paused),
+                            PodRunResult::LimitReached => (PodStatus::Idle, RunResult::LimitReached),
+                        };
+                        let _ = event_tx.send(Event::RunEnd { result: run_result });
+                        status
+                    }
                     Err(e) => {
                         let code = worker_error_code(&e);
                         let _ = event_tx.send(Event::Error {

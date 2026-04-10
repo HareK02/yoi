@@ -49,6 +49,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(WorkerResult::Paused) => {
                 println!("⏸️  Task paused");
             }
+            Ok(WorkerResult::LimitReached) => {
+                println!("🔒 Turn limit reached");
+            }
             Err(e) => {
                 println!("❌ Task error: {}", e);
             }

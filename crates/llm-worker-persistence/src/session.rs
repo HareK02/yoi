@@ -320,6 +320,7 @@ impl<C: LlmClient, St: Store> Session<C, St> {
         let outcome = match result {
             Ok(WorkerResult::Finished) => Outcome::Finished,
             Ok(WorkerResult::Paused) => Outcome::Paused,
+            Ok(WorkerResult::LimitReached) => Outcome::LimitReached,
             Err(e) => Outcome::Error {
                 message: e.to_string(),
             },

@@ -67,6 +67,7 @@ pub enum LogEntry {
 pub enum Outcome {
     Finished,
     Paused,
+    LimitReached,
     Error { message: String },
 }
 

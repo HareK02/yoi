@@ -20,3 +20,4 @@ LLM との対話を管理する低レベル基盤クレート。会話履歴、�
 - `timeline` — イベントストリームのディスパッチ（`Handler` トレイト、各ブロックコレクター）
 - `event` — ストリーミングイベント型（`Event`, `BlockStart`, `BlockDelta` など）
 - `state` — 型状態パターンによるキャッシュ保護（`Mutable` / `CacheLocked`）
+cratesの整理Add READMEsRE to all crates@@

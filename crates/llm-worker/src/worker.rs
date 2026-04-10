@@ -84,6 +84,8 @@ pub enum WorkerResult {
     Finished,
     /// Paused (can be resumed)
     Paused,
+    /// Turn limit reached (max_turns exceeded)
+    LimitReached,
 }
 
 /// Internal: tool execution result
@@ -179,6 +181,8 @@ pub struct Worker<C: LlmClient, S: WorkerState = Mutable> {
     locked_prefix_len: usize,
     /// Turn count
     turn_count: usize,
+    /// Maximum number of turns (None = unlimited)
+    max_turns: Option<u32>,
     /// Turn notification callbacks
     turn_notifiers: Vec<Box<dyn TurnNotifier>>,
     /// Request configuration (max_tokens, temperature, etc.)
@@ -1097,6 +1101,15 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
                     return Err(err);
                 }
             }
+
+            // Check turn limit (after assistant items and tool results are in history)
+            if let Some(max) = self.max_turns {
+                if self.turn_count >= max as usize {
+                    info!(turn_count = self.turn_count, max_turns = max, "Turn limit reached");
+                    self.last_run_interrupted = false;
+                    return Ok(WorkerResult::LimitReached);
+                }
+            }
         }
     }
 
@@ -1137,6 +1150,7 @@ impl<C: LlmClient> Worker<C, Mutable> {
             history: Vec::new(),
             locked_prefix_len: 0,
             turn_count: 0,
+            max_turns: None,
             turn_notifiers: Vec::new(),
             request_config: RequestConfig::default(),
             last_run_interrupted: false,
@@ -1330,6 +1344,11 @@ impl<C: LlmClient> Worker<C, Mutable> {
         self.turn_count = count;
     }
 
+    /// Set the maximum number of turns. None means unlimited.
+    pub fn set_max_turns(&mut self, max_turns: Option<u32>) {
+        self.max_turns = max_turns;
+    }
+
     /// Set the last_run_interrupted flag (for session restoration)
     pub fn set_last_run_interrupted(&mut self, interrupted: bool) {
         self.last_run_interrupted = interrupted;
@@ -1366,6 +1385,7 @@ impl<C: LlmClient> Worker<C, Mutable> {
             history: self.history,
             locked_prefix_len,
             turn_count: self.turn_count,
+            max_turns: self.max_turns,
             turn_notifiers: self.turn_notifiers,
             request_config: self.request_config,
             last_run_interrupted: self.last_run_interrupted,
@@ -1403,6 +1423,7 @@ impl<C: LlmClient> Worker<C, CacheLocked> {
             history: self.history,
             locked_prefix_len: 0,
             turn_count: self.turn_count,
+            max_turns: self.max_turns,
             turn_notifiers: self.turn_notifiers,
             request_config: self.request_config,
             last_run_interrupted: self.last_run_interrupted,

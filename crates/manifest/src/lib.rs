@@ -2,6 +2,7 @@ mod scope;
 
 pub use scope::Scope;
 
+use std::num::NonZeroU32;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -55,6 +56,8 @@ pub struct WorkerManifest {
     pub system_prompt: Option<String>,
     #[serde(default)]
     pub max_tokens: Option<u32>,
+    #[serde(default)]
+    pub max_turns: Option<NonZeroU32>,
     #[serde(default)]
     pub temperature: Option<f32>,
 }
@@ -149,6 +152,55 @@ model = "llama3"
         let manifest = PodManifest::from_toml(toml).unwrap();
         assert_eq!(manifest.provider.kind, ProviderKind::Ollama);
         assert!(manifest.provider.api_key_env.is_none());
+    }
+
+    #[test]
+    fn parse_max_turns() {
+        let toml = r#"
+[pod]
+name = "test"
+
+[provider]
+kind = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[worker]
+max_turns = 50
+"#;
+        let manifest = PodManifest::from_toml(toml).unwrap();
+        assert_eq!(manifest.worker.max_turns.unwrap().get(), 50);
+    }
+
+    #[test]
+    fn omitted_max_turns_is_none() {
+        let toml = r#"
+[pod]
+name = "test"
+
+[provider]
+kind = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[worker]
+"#;
+        let manifest = PodManifest::from_toml(toml).unwrap();
+        assert!(manifest.worker.max_turns.is_none());
+    }
+
+    #[test]
+    fn reject_max_turns_zero() {
+        let toml = r#"
+[pod]
+name = "test"
+
+[provider]
+kind = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[worker]
+max_turns = 0
+"#;
+        assert!(PodManifest::from_toml(toml).is_err());
     }
 
     #[test]
