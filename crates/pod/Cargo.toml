@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+clap = { version = "4.6.0", features = ["derive"] }
 llm-worker = { version = "0.2.1", path = "../llm-worker" }
 llm-worker-persistence = { version = "0.1.0", path = "../llm-worker-persistence" }
 manifest = { version = "0.1.0", path = "../manifest" }
@@ -13,7 +14,7 @@ provider = { version = "0.1.0", path = "../provider" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 thiserror = "2.0"
-tokio = { version = "1.49", features = ["fs", "io-util", "net", "sync"] }
+tokio = { version = "1.49", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync"] }
 toml = "1.1.2"
 uuid = { version = "1.23.0", features = ["v7", "serde"] }
 

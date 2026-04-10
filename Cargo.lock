@@ -1159,6 +1159,7 @@ name = "pod"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "clap",
  "dotenv",
  "futures",
  "llm-worker",
