@@ -1,0 +1,140 @@
+use serde::{Deserialize, Serialize};
+
+// ---------------------------------------------------------------------------
+// Method (Client → Pod via Unix Socket)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "method", content = "params", rename_all = "snake_case")]
+pub enum Method {
+    Run { input: String },
+    Resume,
+    Cancel,
+}
+
+impl Method {
+    pub fn from_json_line(line: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(line)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Event (Pod → Client via Unix Socket broadcast)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "event", content = "data", rename_all = "snake_case")]
+pub enum Event {
+    TurnStart {
+        turn: usize,
+    },
+    TurnEnd {
+        turn: usize,
+        result: TurnResult,
+    },
+    TextDelta {
+        text: String,
+    },
+    TextDone {
+        text: String,
+    },
+    ToolCallStart {
+        id: String,
+        name: String,
+    },
+    ToolCallArgsDelta {
+        id: String,
+        json: String,
+    },
+    ToolCallDone {
+        id: String,
+        name: String,
+        arguments: String,
+    },
+    ToolResult {
+        id: String,
+        output: String,
+        is_error: bool,
+    },
+    Usage {
+        input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
+    },
+    Error {
+        code: ErrorCode,
+        message: String,
+    },
+}
+
+impl Event {
+    pub fn to_json_line(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(self)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Supporting types
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnResult {
+    Finished,
+    Paused,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorCode {
+    AlreadyRunning,
+    NotRunning,
+    NotPaused,
+    ProviderError,
+    ToolError,
+    Internal,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn method_run_json_roundtrip() {
+        let json = r#"{"method":"run","params":{"input":"Hello"}}"#;
+        let method = Method::from_json_line(json).unwrap();
+        assert!(matches!(method, Method::Run { ref input } if input == "Hello"));
+
+        let serialized = serde_json::to_string(&method).unwrap();
+        assert_eq!(serialized, json);
+    }
+
+    #[test]
+    fn method_without_params() {
+        let json = r#"{"method":"resume"}"#;
+        let method = Method::from_json_line(json).unwrap();
+        assert!(matches!(method, Method::Resume));
+    }
+
+    #[test]
+    fn event_text_delta_format() {
+        let event = Event::TextDelta {
+            text: "Hello".into(),
+        };
+        let json = event.to_json_line().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["event"], "text_delta");
+        assert_eq!(parsed["data"]["text"], "Hello");
+    }
+
+    #[test]
+    fn event_error_format() {
+        let event = Event::Error {
+            code: ErrorCode::AlreadyRunning,
+            message: "Pod is already executing a turn".into(),
+        };
+        let json = event.to_json_line().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["event"], "error");
+        assert_eq!(parsed["data"]["code"], "already_running");
+    }
+}

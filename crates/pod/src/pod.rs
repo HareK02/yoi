@@ -5,8 +5,7 @@ use llm_worker_persistence::{
     Session, SessionConfig, SessionError, SessionId, Store, StoreError,
 };
 
-use crate::manifest::{PodManifest, WorkerManifest};
-use crate::scope::Scope;
+use manifest::{PodManifest, Scope, WorkerManifest};
 
 /// Pod identifier. UUID v7 (time-ordered).
 pub type PodId = uuid::Uuid;
@@ -117,7 +116,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
         store: St,
         scope: Option<Scope>,
     ) -> Result<Self, PodError> {
-        let client = crate::provider::build_client(&manifest.provider)?;
+        let client = provider::build_client(&manifest.provider)?;
         let mut worker = Worker::new(client);
         apply_worker_manifest(&mut worker, &manifest.worker);
         let session = Session::new(worker, store, SessionConfig::default()).await?;
@@ -175,6 +174,6 @@ pub enum PodError {
     #[error("scope violation: {path} is outside the allowed directory")]
     ScopeViolation { path: String },
 
-    #[error("provider configuration error: {0}")]
-    ProviderConfig(String),
+    #[error(transparent)]
+    Provider(#[from] provider::ProviderError),
 }

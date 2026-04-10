@@ -1,12 +1,16 @@
+mod scope;
+
+pub use scope::Scope;
+
 use std::path::PathBuf;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Declarative configuration for a Pod.
 ///
 /// Parsed from a TOML manifest file. Describes the provider, model,
 /// system prompt, and optional directory scope.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PodManifest {
     pub pod: PodMeta,
     pub provider: ProviderConfig,
@@ -16,13 +20,13 @@ pub struct PodManifest {
 }
 
 /// Pod metadata.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PodMeta {
     pub name: String,
 }
 
 /// LLM provider configuration.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
     pub kind: ProviderKind,
     pub model: String,
@@ -35,7 +39,7 @@ pub struct ProviderConfig {
 }
 
 /// Supported LLM providers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ProviderKind {
     Anthropic,
@@ -45,7 +49,7 @@ pub enum ProviderKind {
 }
 
 /// Worker-level configuration embedded in the manifest.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerManifest {
     #[serde(default)]
     pub system_prompt: Option<String>,
@@ -56,7 +60,7 @@ pub struct WorkerManifest {
 }
 
 /// Directory scope configuration.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScopeConfig {
     pub root: PathBuf,
 }

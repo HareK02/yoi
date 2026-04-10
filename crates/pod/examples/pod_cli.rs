@@ -8,10 +8,10 @@
 //!
 //! ```bash
 //! echo "ANTHROPIC_API_KEY=your-key" > .env
-//! cargo run -p insomnia-core --example pod_cli
+//! cargo run -p pod --example pod_cli
 //! ```
 
-use insomnia_core::{Pod, PodManifest, PodRunResult};
+use pod::{Pod, PodManifest, PodRunResult};
 use llm_worker_persistence::FsStore;
 
 const MANIFEST_TOML: &str = r#"

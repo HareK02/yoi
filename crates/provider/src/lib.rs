@@ -4,24 +4,30 @@ use llm_worker::llm_client::providers::gemini::GeminiClient;
 use llm_worker::llm_client::providers::ollama::OllamaClient;
 use llm_worker::llm_client::providers::openai::OpenAIClient;
 
-use crate::manifest::{ProviderConfig, ProviderKind};
-use crate::pod::PodError;
+use manifest::{ProviderConfig, ProviderKind};
+
+/// Errors from provider client construction.
+#[derive(Debug, thiserror::Error)]
+pub enum ProviderError {
+    #[error("provider configuration error: {0}")]
+    Config(String),
+}
 
 /// Build an [`LlmClient`] from a [`ProviderConfig`].
 ///
 /// Resolves the API key from the environment variable specified in the config.
-pub fn build_client(config: &ProviderConfig) -> Result<Box<dyn LlmClient>, PodError> {
+pub fn build_client(config: &ProviderConfig) -> Result<Box<dyn LlmClient>, ProviderError> {
     let api_key = config
         .api_key_env
         .as_deref()
         .map(std::env::var)
         .transpose()
-        .map_err(|e| PodError::ProviderConfig(format!("env var: {e}")))?;
+        .map_err(|e| ProviderError::Config(format!("env var: {e}")))?;
 
     match config.kind {
         ProviderKind::Anthropic => {
             let key = api_key.ok_or_else(|| {
-                PodError::ProviderConfig("anthropic requires api_key_env".into())
+                ProviderError::Config("anthropic requires api_key_env".into())
             })?;
             let mut client = AnthropicClient::new(key, &config.model);
             if let Some(ref url) = config.base_url {
@@ -31,7 +37,7 @@ pub fn build_client(config: &ProviderConfig) -> Result<Box<dyn LlmClient>, PodEr
         }
         ProviderKind::Openai => {
             let key = api_key.ok_or_else(|| {
-                PodError::ProviderConfig("openai requires api_key_env".into())
+                ProviderError::Config("openai requires api_key_env".into())
             })?;
             let mut client = OpenAIClient::new(key, &config.model);
             if let Some(ref url) = config.base_url {
@@ -41,7 +47,7 @@ pub fn build_client(config: &ProviderConfig) -> Result<Box<dyn LlmClient>, PodEr
         }
         ProviderKind::Gemini => {
             let key = api_key.ok_or_else(|| {
-                PodError::ProviderConfig("gemini requires api_key_env".into())
+                ProviderError::Config("gemini requires api_key_env".into())
             })?;
             let mut client = GeminiClient::new(key, &config.model);
             if let Some(ref url) = config.base_url {
