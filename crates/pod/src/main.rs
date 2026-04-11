@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
@@ -84,7 +84,10 @@ async fn main() -> ExitCode {
     };
 
     // Build the Pod
-    let pod = match Pod::from_manifest(manifest, store, scope).await {
+    let manifest_dir = std::fs::canonicalize(&cli.manifest)
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf));
+    let pod = match Pod::from_manifest(manifest, store, scope, manifest_dir).await {
         Ok(p) => p,
         Err(e) => {
             eprintln!("error: failed to create pod: {e}");

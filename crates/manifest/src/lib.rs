@@ -31,9 +31,9 @@ pub struct PodMeta {
 pub struct ProviderConfig {
     pub kind: ProviderKind,
     pub model: String,
-    /// Environment variable name holding the API key.
+    /// Path to a file containing the API key (read and trimmed at startup).
     #[serde(default)]
-    pub api_key_env: Option<String>,
+    pub api_key_file: Option<PathBuf>,
     /// Custom base URL for the provider API.
     #[serde(default)]
     pub base_url: Option<String>,
@@ -47,6 +47,21 @@ pub enum ProviderKind {
     Openai,
     Gemini,
     Ollama,
+}
+
+impl ProviderKind {
+    /// Conventional environment variable name for the API key.
+    ///
+    /// Returns `INSOMNIA_API_KEY_{KIND}` (e.g. `INSOMNIA_API_KEY_ANTHROPIC`).
+    pub fn env_var_name(self) -> String {
+        let kind = match self {
+            Self::Anthropic => "ANTHROPIC",
+            Self::Openai => "OPENAI",
+            Self::Gemini => "GEMINI",
+            Self::Ollama => "OLLAMA",
+        };
+        format!("INSOMNIA_API_KEY_{kind}")
+    }
 }
 
 /// Worker-level configuration embedded in the manifest.
@@ -95,7 +110,7 @@ model = "claude-sonnet-4-20250514"
         assert_eq!(manifest.pod.name, "test-agent");
         assert_eq!(manifest.provider.kind, ProviderKind::Anthropic);
         assert_eq!(manifest.provider.model, "claude-sonnet-4-20250514");
-        assert!(manifest.provider.api_key_env.is_none());
+        assert!(manifest.provider.api_key_file.is_none());
         assert!(manifest.scope.is_none());
         assert!(manifest.worker.system_prompt.is_none());
     }
@@ -109,7 +124,7 @@ name = "code-reviewer"
 [provider]
 kind = "anthropic"
 model = "claude-sonnet-4-20250514"
-api_key_env = "ANTHROPIC_API_KEY"
+api_key_file = "~/.config/insomnia/keys/anthropic"
 
 [worker]
 system_prompt = "You are a code reviewer."
@@ -122,8 +137,8 @@ root = "./src"
         let manifest = PodManifest::from_toml(toml).unwrap();
         assert_eq!(manifest.pod.name, "code-reviewer");
         assert_eq!(
-            manifest.provider.api_key_env.as_deref(),
-            Some("ANTHROPIC_API_KEY")
+            manifest.provider.api_key_file.as_deref(),
+            Some(std::path::Path::new("~/.config/insomnia/keys/anthropic"))
         );
         assert_eq!(
             manifest.worker.system_prompt.as_deref(),
@@ -151,7 +166,7 @@ model = "llama3"
 "#;
         let manifest = PodManifest::from_toml(toml).unwrap();
         assert_eq!(manifest.provider.kind, ProviderKind::Ollama);
-        assert!(manifest.provider.api_key_env.is_none());
+        assert!(manifest.provider.api_key_file.is_none());
     }
 
     #[test]

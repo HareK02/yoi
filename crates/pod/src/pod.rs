@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use llm_worker::llm_client::client::LlmClient;
@@ -173,8 +174,9 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
         manifest: PodManifest,
         store: St,
         scope: Option<Scope>,
+        manifest_dir: Option<PathBuf>,
     ) -> Result<Self, PodError> {
-        let client = provider::build_client(&manifest.provider)?;
+        let client = provider::build_client(&manifest.provider, manifest_dir.as_deref())?;
         let mut worker = Worker::new(client);
         apply_worker_manifest(&mut worker, &manifest.worker);
         let session = Session::new(worker, store, SessionConfig::default()).await?;

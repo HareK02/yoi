@@ -15,7 +15,6 @@ name = "protocol-demo"
 [provider]
 kind = "anthropic"
 model = "claude-sonnet-4-20250514"
-api_key_env = "ANTHROPIC_API_KEY"
 
 [worker]
 system_prompt = "You are a concise assistant. Reply in one or two sentences."
@@ -29,7 +28,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let manifest = PodManifest::from_toml(MANIFEST_TOML)?;
     let tmp = tempfile::tempdir()?;
     let store = FsStore::new(tmp.path()).await?;
-    let pod = pod::Pod::from_manifest(manifest, store, None).await?;
+    let pod = pod::Pod::from_manifest(manifest, store, None, None).await?;
 
     let runtime_tmp = tempfile::tempdir()?;
     let handle = PodController::spawn(pod, runtime_tmp.path()).await?;
