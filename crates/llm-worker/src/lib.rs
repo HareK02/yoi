@@ -7,7 +7,7 @@
 //! - [`Worker`] - Central component for managing LLM interactions
 //! - [`tool::Tool`] - Tools that can be invoked by the LLM
 //! - [`hook::Hook`] - Hooks for intercepting turn progression
-//! - [`subscriber::WorkerSubscriber`] - Subscribing to streaming events
+//! - Closure-based event callbacks via `Worker::on_text_block()`, `on_tool_use_block()`, etc.
 //!
 //! # Quick Start
 //!
@@ -39,14 +39,16 @@ mod handler;
 mod message;
 mod worker;
 
+pub(crate) mod callback;
 pub mod event;
 pub mod hook;
 pub mod llm_client;
 pub mod state;
-pub mod subscriber;
 pub mod timeline;
 pub mod tool;
 pub mod tool_server;
 
+pub use callback::{TextBlockScope, ToolUseBlockScope};
+pub use handler::ToolUseBlockStart;
 pub use message::{ContentPart, Item, Message, Role};
 pub use worker::{ToolRegistryError, Worker, WorkerConfig, WorkerError, WorkerResult};

@@ -33,7 +33,7 @@ llm-workerは3層構成でLLMとのインタラクションを管理する。
 | `tool` / `tool_server` | ツール定義・登録・実行 | R3 |
 | `timeline` | イベントストリーム処理、Handler dispatch | — |
 | `handler` | Handler/Kind trait、ブロック別ハンドラ | — |
-| `subscriber` | WorkerSubscriber trait、UI向けイベント配信 | — |
+| `callback` | クロージャベースイベント購読（`on_text_block`, `on_usage` 等） | — |
 | `llm_client` | LLMプロバイダへのHTTPリクエスト/ストリーミング | — |
 | `llm_client/scheme` | プロバイダ固有ワイヤーフォーマット変換 | — |
 | `llm_client/providers` | Anthropic, OpenAI, Gemini, Ollama実装 | — |

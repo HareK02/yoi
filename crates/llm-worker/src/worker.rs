@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::marker::PhantomData;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use futures::StreamExt;
 use tokio::sync::mpsc;
@@ -18,11 +18,13 @@ use crate::{
     },
     llm_client::{ClientError, ConfigWarning, LlmClient, Request, RequestConfig, ToolDefinition},
     state::{CacheLocked, Mutable, WorkerState},
-    subscriber::{
-        ErrorSubscriberAdapter, StatusSubscriberAdapter, TextBlockSubscriberAdapter,
-        ToolUseBlockSubscriberAdapter, UsageSubscriberAdapter, WorkerSubscriber,
+    callback::{
+        ClosureMetaHandler, ClosureTextBlockHandler, ClosureToolUseBlockHandler, TextBlockScope,
+        ToolUseBlockScope,
     },
+    handler::{ErrorKind, StatusKind, ToolUseBlockStart, UsageKind},
     timeline::{TextBlockCollector, Timeline, ToolCallCollector},
+    timeline::event::{ErrorEvent, StatusEvent, UsageEvent},
     tool::{ToolDefinition as WorkerToolDefinition, ToolError, ToolOutputProcessor},
     tool_server::{ToolServer, ToolServerError, ToolServerHandle},
 };
@@ -95,34 +97,6 @@ enum ToolExecutionResult {
 }
 
 // =============================================================================
-// Turn Control Callback Storage
-// =============================================================================
-
-/// Callback for notifying turn events (type-erased)
-trait TurnNotifier: Send + Sync {
-    fn on_turn_start(&self, turn: usize);
-    fn on_turn_end(&self, turn: usize);
-}
-
-struct SubscriberTurnNotifier<S: WorkerSubscriber + 'static> {
-    subscriber: Arc<Mutex<S>>,
-}
-
-impl<S: WorkerSubscriber + 'static> TurnNotifier for SubscriberTurnNotifier<S> {
-    fn on_turn_start(&self, turn: usize) {
-        if let Ok(mut s) = self.subscriber.lock() {
-            s.on_turn_start(turn);
-        }
-    }
-
-    fn on_turn_end(&self, turn: usize) {
-        if let Ok(mut s) = self.subscriber.lock() {
-            s.on_turn_end(turn);
-        }
-    }
-}
-
-// =============================================================================
 // Worker
 // =============================================================================
 
@@ -183,8 +157,10 @@ pub struct Worker<C: LlmClient, S: WorkerState = Mutable> {
     turn_count: usize,
     /// Maximum number of turns (None = unlimited)
     max_turns: Option<u32>,
-    /// Turn notification callbacks
-    turn_notifiers: Vec<Box<dyn TurnNotifier>>,
+    /// Turn-start callbacks
+    turn_start_cbs: Vec<Box<dyn Fn(usize) + Send + Sync>>,
+    /// Turn-end callbacks
+    turn_end_cbs: Vec<Box<dyn Fn(usize) + Send + Sync>>,
     /// Request configuration (max_tokens, temperature, etc.)
     request_config: RequestConfig,
     /// Whether the previous run was interrupted
@@ -256,59 +232,102 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
         }
     }
 
-    /// Register an event subscriber
+    /// Register a text block observer with scoped callbacks.
     ///
-    /// Registered subscribers receive streaming events from the LLM
-    /// in real-time. Useful for streaming display to UI.
-    ///
-    /// # Available Events
-    ///
-    /// - **Block events**: `on_text_block`, `on_tool_use_block`
-    /// - **Meta events**: `on_usage`, `on_status`, `on_error`
-    /// - **Completion events**: `on_text_complete`, `on_tool_call_complete`
-    /// - **Turn control**: `on_turn_start`, `on_turn_end`
+    /// The setup closure is called once per text block. Inside it, register
+    /// `on_delta` and/or `on_stop` callbacks on the provided scope.
     ///
     /// # Examples
     ///
     /// ```ignore
-    /// use llm_worker::{Worker, WorkerSubscriber, TextBlockEvent};
-    ///
-    /// struct MyPrinter;
-    /// impl WorkerSubscriber for MyPrinter {
-    ///     type TextBlockScope = ();
-    ///     type ToolUseBlockScope = ();
-    ///
-    ///     fn on_text_block(&mut self, _: &mut (), event: &TextBlockEvent) {
-    ///         if let TextBlockEvent::Delta(text) = event {
-    ///             print!("{}", text);
-    ///         }
-    ///     }
-    /// }
-    ///
-    /// worker.subscribe(MyPrinter);
+    /// worker.on_text_block(|block| {
+    ///     block.on_delta(|text| print!("{}", text));
+    ///     block.on_stop(|full_text| println!("\n--- {} chars ---", full_text.len()));
+    /// });
     /// ```
-    pub fn subscribe<Sub: WorkerSubscriber + 'static>(&mut self, subscriber: Sub) {
-        let subscriber = Arc::new(Mutex::new(subscriber));
+    pub fn on_text_block(
+        &mut self,
+        setup: impl FnMut(&mut TextBlockScope) + Send + Sync + 'static,
+    ) {
+        self.timeline
+            .on_text_block(ClosureTextBlockHandler {
+                setup: Box::new(setup),
+            });
+    }
 
-        // Register TextBlock handler
+    /// Register a tool use block observer with scoped callbacks.
+    ///
+    /// The setup closure receives `&ToolUseBlockStart` (containing `id` and `name`)
+    /// and a scope for registering `on_delta` and `on_stop` callbacks.
+    ///
+    /// `on_stop` receives a fully assembled `&ToolCall` with parsed JSON input.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// worker.on_tool_use_block(|start, block| {
+    ///     println!("Tool: {} ({})", start.name, start.id);
+    ///     block.on_delta(|json| { /* streaming JSON fragment */ });
+    ///     block.on_stop(|call| println!("Done: {}", call.name));
+    /// });
+    /// ```
+    pub fn on_tool_use_block(
+        &mut self,
+        setup: impl FnMut(&ToolUseBlockStart, &mut ToolUseBlockScope) + Send + Sync + 'static,
+    ) {
         self.timeline
-            .on_text_block(TextBlockSubscriberAdapter::new(subscriber.clone()));
+            .on_tool_use_block(ClosureToolUseBlockHandler {
+                setup: Box::new(setup),
+            });
+    }
 
-        // Register ToolUseBlock handler
-        self.timeline
-            .on_tool_use_block(ToolUseBlockSubscriberAdapter::new(subscriber.clone()));
+    /// Register a usage event callback.
+    pub fn on_usage(
+        &mut self,
+        callback: impl FnMut(&UsageEvent) + Send + Sync + 'static,
+    ) {
+        self.timeline.on_usage(ClosureMetaHandler {
+            callback,
+            _kind: PhantomData::<UsageKind>,
+        });
+    }
 
-        // Register meta handlers
-        self.timeline
-            .on_usage(UsageSubscriberAdapter::new(subscriber.clone()));
-        self.timeline
-            .on_status(StatusSubscriberAdapter::new(subscriber.clone()));
-        self.timeline
-            .on_error(ErrorSubscriberAdapter::new(subscriber.clone()));
+    /// Register a status event callback.
+    pub fn on_status(
+        &mut self,
+        callback: impl FnMut(&StatusEvent) + Send + Sync + 'static,
+    ) {
+        self.timeline.on_status(ClosureMetaHandler {
+            callback,
+            _kind: PhantomData::<StatusKind>,
+        });
+    }
 
-        // Register turn control callback
-        self.turn_notifiers
-            .push(Box::new(SubscriberTurnNotifier { subscriber }));
+    /// Register an error event callback.
+    pub fn on_error(
+        &mut self,
+        callback: impl FnMut(&ErrorEvent) + Send + Sync + 'static,
+    ) {
+        self.timeline.on_error(ClosureMetaHandler {
+            callback,
+            _kind: PhantomData::<ErrorKind>,
+        });
+    }
+
+    /// Register a turn-start callback (receives 0-based turn number).
+    pub fn on_turn_start(
+        &mut self,
+        callback: impl Fn(usize) + Send + Sync + 'static,
+    ) {
+        self.turn_start_cbs.push(Box::new(callback));
+    }
+
+    /// Register a turn-end callback (receives 0-based turn number).
+    pub fn on_turn_end(
+        &mut self,
+        callback: impl Fn(usize) + Send + Sync + 'static,
+    ) {
+        self.turn_end_cbs.push(Box::new(callback));
     }
 
     /// Get a shared tool server handle.
@@ -940,8 +959,8 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
             // Notify turn start
             let current_turn = self.turn_count;
             debug!(turn = current_turn, "Turn start");
-            for notifier in &self.turn_notifiers {
-                notifier.on_turn_start(current_turn);
+            for cb in &self.turn_start_cbs {
+                cb(current_turn);
             }
 
             // Hook: pre_llm_request
@@ -952,8 +971,8 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
             match control {
                 PreLlmRequestResult::Cancel(reason) => {
                     info!(reason = %reason, "Aborted by hook");
-                    for notifier in &self.turn_notifiers {
-                        notifier.on_turn_end(current_turn);
+                    for cb in &self.turn_end_cbs {
+                        cb(current_turn);
                     }
                     self.last_run_interrupted = true;
                     return Err(WorkerError::Aborted(reason));
@@ -1047,8 +1066,8 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
             debug!(event_count = event_count, "Stream completed");
 
             // Notify turn end
-            for notifier in &self.turn_notifiers {
-                notifier.on_turn_end(current_turn);
+            for cb in &self.turn_end_cbs {
+                cb(current_turn);
             }
             self.turn_count += 1;
 
@@ -1151,7 +1170,8 @@ impl<C: LlmClient> Worker<C, Mutable> {
             locked_prefix_len: 0,
             turn_count: 0,
             max_turns: None,
-            turn_notifiers: Vec::new(),
+            turn_start_cbs: Vec::new(),
+            turn_end_cbs: Vec::new(),
             request_config: RequestConfig::default(),
             last_run_interrupted: false,
             output_processor: None,
@@ -1386,7 +1406,8 @@ impl<C: LlmClient> Worker<C, Mutable> {
             locked_prefix_len,
             turn_count: self.turn_count,
             max_turns: self.max_turns,
-            turn_notifiers: self.turn_notifiers,
+            turn_start_cbs: self.turn_start_cbs,
+            turn_end_cbs: self.turn_end_cbs,
             request_config: self.request_config,
             last_run_interrupted: self.last_run_interrupted,
             output_processor: self.output_processor,
@@ -1424,7 +1445,8 @@ impl<C: LlmClient> Worker<C, CacheLocked> {
             locked_prefix_len: 0,
             turn_count: self.turn_count,
             max_turns: self.max_turns,
-            turn_notifiers: self.turn_notifiers,
+            turn_start_cbs: self.turn_start_cbs,
+            turn_end_cbs: self.turn_end_cbs,
             request_config: self.request_config,
             last_run_interrupted: self.last_run_interrupted,
             output_processor: self.output_processor,

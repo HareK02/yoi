@@ -17,7 +17,7 @@ mod tool_call_collector;
 // 公開API
 pub use event::*;
 pub use text_block_collector::TextBlockCollector;
-pub use timeline::{ErasedHandler, HandlerWrapper, Timeline};
+pub use timeline::Timeline;
 pub use tool_call_collector::ToolCallCollector;
 
 // 型定義からのre-export

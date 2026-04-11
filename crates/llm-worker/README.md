@@ -16,8 +16,8 @@ LLM との対話を管理する低レベル基盤クレート。会話履歴、�
 - `tool` — ツール定義・実行（`Tool` トレイト、`ToolDefinition`, `ToolOutput`, サイズ判定による Inline/Stored 切替）
 - `tool_server` — ツール登録・ルックアップ（`ToolServer`, `ToolServerHandle`）
 - `hook` — 実行フローへの介入ポイント（`Hook` トレイト、`PreToolCall`, `PostToolCall`, `OnTurnEnd` など）
-- `subscriber` — リアルタイムイベント購読（`WorkerSubscriber` トレイト）
-- `timeline` — イベントストリームのディスパッチ（`Handler` トレイト、各ブロックコレクター）
+- クロージャベースイベント購読（`Worker::on_text_block()`, `on_tool_use_block()`, `on_usage()` 等）
+- `timeline` — イベントストリームのディスパッチ（`Handler` トレイト、各ブロックコレクター）。パワーユーザー向けに `timeline_mut()` も提供
 - `event` — ストリーミングイベント型（`Event`, `BlockStart`, `BlockDelta` など）
 - `state` — 型状態パターンによるキャッシュ保護（`Mutable` / `CacheLocked`）
 cratesの整理Add READMEsRE to all crates@@

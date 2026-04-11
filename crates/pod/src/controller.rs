@@ -1,11 +1,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use llm_worker::hook::ToolCall;
 use llm_worker::llm_client::client::LlmClient;
-use llm_worker::subscriber::WorkerSubscriber;
-use llm_worker::timeline::event::{ErrorEvent, UsageEvent};
-use llm_worker::timeline::{TextBlockEvent, ToolUseBlockEvent};
 use llm_worker::WorkerError;
 use llm_worker_persistence::Store;
 use tokio::sync::{broadcast, mpsc};
@@ -87,11 +83,79 @@ impl PodController {
         // Keep the server alive by moving it into the controller task
         // (it will be dropped when the task ends)
 
-        // Register the event bridge subscriber on the worker
-        let bridge = EventBridgeSubscriber {
-            event_tx: event_tx.clone(),
-        };
-        pod.session_mut().worker.subscribe(bridge);
+        // Register event bridge callbacks on the worker
+        {
+            let worker = &mut pod.session_mut().worker;
+
+            let tx = event_tx.clone();
+            worker.on_turn_start(move |turn| {
+                let _ = tx.send(Event::TurnStart { turn });
+            });
+
+            let tx = event_tx.clone();
+            worker.on_turn_end(move |turn| {
+                let _ = tx.send(Event::TurnEnd {
+                    turn,
+                    result: TurnResult::Finished,
+                });
+            });
+
+            let tx = event_tx.clone();
+            worker.on_text_block(move |block| {
+                let tx_d = tx.clone();
+                block.on_delta(move |text| {
+                    let _ = tx_d.send(Event::TextDelta {
+                        text: text.to_owned(),
+                    });
+                });
+                let tx_s = tx.clone();
+                block.on_stop(move |text| {
+                    let _ = tx_s.send(Event::TextDone {
+                        text: text.to_owned(),
+                    });
+                });
+            });
+
+            let tx = event_tx.clone();
+            worker.on_tool_use_block(move |start, block| {
+                let _ = tx.send(Event::ToolCallStart {
+                    id: start.id.clone(),
+                    name: start.name.clone(),
+                });
+                let id_for_delta = start.id.clone();
+                let tx_d = tx.clone();
+                block.on_delta(move |json| {
+                    let _ = tx_d.send(Event::ToolCallArgsDelta {
+                        id: id_for_delta.clone(),
+                        json: json.to_owned(),
+                    });
+                });
+                let tx_s = tx.clone();
+                block.on_stop(move |call| {
+                    let _ = tx_s.send(Event::ToolCallDone {
+                        id: call.id.clone(),
+                        name: call.name.clone(),
+                        arguments: call.input.to_string(),
+                    });
+                });
+            });
+
+            let tx = event_tx.clone();
+            worker.on_usage(move |event| {
+                let _ = tx.send(Event::Usage {
+                    input_tokens: event.input_tokens,
+                    output_tokens: event.output_tokens,
+                });
+            });
+
+            let tx = event_tx.clone();
+            worker.on_error(move |event| {
+                let _ = tx.send(Event::Error {
+                    code: ErrorCode::ProviderError,
+                    message: event.message.clone(),
+                });
+            });
+        }
 
         // Clone cancel sender before moving pod
         let cancel_tx = pod.session_mut().worker.cancel_sender();
@@ -252,83 +316,3 @@ fn worker_error_code(e: &PodError) -> ErrorCode {
     }
 }
 
-// ---------------------------------------------------------------------------
-// EventBridgeSubscriber — bridges Worker events to broadcast channel
-// ---------------------------------------------------------------------------
-
-struct EventBridgeSubscriber {
-    event_tx: broadcast::Sender<Event>,
-}
-
-impl WorkerSubscriber for EventBridgeSubscriber {
-    type TextBlockScope = ();
-    type ToolUseBlockScope = ();
-
-    fn on_turn_start(&mut self, turn: usize) {
-        let _ = self.event_tx.send(Event::TurnStart { turn });
-    }
-
-    fn on_turn_end(&mut self, turn: usize) {
-        let _ = self.event_tx.send(Event::TurnEnd {
-            turn,
-            result: TurnResult::Finished,
-        });
-    }
-
-    fn on_text_block(&mut self, _scope: &mut (), event: &TextBlockEvent) {
-        match event {
-            TextBlockEvent::Delta(text) => {
-                let _ = self.event_tx.send(Event::TextDelta {
-                    text: text.clone(),
-                });
-            }
-            TextBlockEvent::Start(_) | TextBlockEvent::Stop(_) => {}
-        }
-    }
-
-    fn on_text_complete(&mut self, text: &str) {
-        let _ = self.event_tx.send(Event::TextDone {
-            text: text.to_owned(),
-        });
-    }
-
-    fn on_tool_use_block(&mut self, _scope: &mut (), event: &ToolUseBlockEvent) {
-        match event {
-            ToolUseBlockEvent::Start(start) => {
-                let _ = self.event_tx.send(Event::ToolCallStart {
-                    id: start.id.clone(),
-                    name: start.name.clone(),
-                });
-            }
-            ToolUseBlockEvent::InputJsonDelta(json) => {
-                let _ = self.event_tx.send(Event::ToolCallArgsDelta {
-                    id: String::new(),
-                    json: json.clone(),
-                });
-            }
-            ToolUseBlockEvent::Stop(_) => {}
-        }
-    }
-
-    fn on_tool_call_complete(&mut self, call: &ToolCall) {
-        let _ = self.event_tx.send(Event::ToolCallDone {
-            id: call.id.clone(),
-            name: call.name.clone(),
-            arguments: call.input.to_string(),
-        });
-    }
-
-    fn on_usage(&mut self, event: &UsageEvent) {
-        let _ = self.event_tx.send(Event::Usage {
-            input_tokens: event.input_tokens,
-            output_tokens: event.output_tokens,
-        });
-    }
-
-    fn on_error(&mut self, event: &ErrorEvent) {
-        let _ = self.event_tx.send(Event::Error {
-            code: ErrorCode::ProviderError,
-            message: event.message.clone(),
-        });
-    }
-}
