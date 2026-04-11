@@ -9,3 +9,4 @@
 - [x] pod バイナリエントリポイント
 - [x] セッションエントリのハッシュチェーン
 - [x] Subscriber → クロージャ API 移行
+- [x] JSONL ストリーム変換ユーティリティ (protocol::stream)

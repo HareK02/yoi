@@ -1,3 +1,5 @@
+pub mod stream;
+
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -10,12 +12,6 @@ pub enum Method {
     Run { input: String },
     Resume,
     Cancel,
-}
-
-impl Method {
-    pub fn from_json_line(line: &str) -> Result<Self, serde_json::Error> {
-        serde_json::from_str(line)
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -69,12 +65,6 @@ pub enum Event {
     },
 }
 
-impl Event {
-    pub fn to_json_line(&self) -> Result<String, serde_json::Error> {
-        serde_json::to_string(self)
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Supporting types
 // ---------------------------------------------------------------------------
@@ -112,7 +102,7 @@ mod tests {
     #[test]
     fn method_run_json_roundtrip() {
         let json = r#"{"method":"run","params":{"input":"Hello"}}"#;
-        let method = Method::from_json_line(json).unwrap();
+        let method: Method = serde_json::from_str(json).unwrap();
         assert!(matches!(method, Method::Run { ref input } if input == "Hello"));
 
         let serialized = serde_json::to_string(&method).unwrap();
@@ -122,7 +112,7 @@ mod tests {
     #[test]
     fn method_without_params() {
         let json = r#"{"method":"resume"}"#;
-        let method = Method::from_json_line(json).unwrap();
+        let method: Method = serde_json::from_str(json).unwrap();
         assert!(matches!(method, Method::Resume));
     }
 
@@ -131,7 +121,7 @@ mod tests {
         let event = Event::TextDelta {
             text: "Hello".into(),
         };
-        let json = event.to_json_line().unwrap();
+        let json = serde_json::to_string(&event).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["event"], "text_delta");
         assert_eq!(parsed["data"]["text"], "Hello");
@@ -142,7 +132,7 @@ mod tests {
         let event = Event::RunEnd {
             result: RunResult::LimitReached,
         };
-        let json = event.to_json_line().unwrap();
+        let json = serde_json::to_string(&event).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["event"], "run_end");
         assert_eq!(parsed["data"]["result"], "limit_reached");
@@ -154,7 +144,7 @@ mod tests {
             code: ErrorCode::AlreadyRunning,
             message: "Pod is already executing a turn".into(),
         };
-        let json = event.to_json_line().unwrap();
+        let json = serde_json::to_string(&event).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["event"], "error");
         assert_eq!(parsed["data"]["code"], "already_running");

@@ -331,7 +331,7 @@ async fn status_json_reflects_pod_name() {
 
 #[tokio::test]
 async fn socket_run_receives_events() {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use protocol::stream::{JsonLineReader, JsonLineWriter};
     use tokio::net::UnixStream;
 
     let client = MockClient::new(simple_text_events());
@@ -343,12 +343,15 @@ async fn socket_run_receives_events() {
 
     let sock_path = handle.runtime_dir.socket_path();
     let stream = UnixStream::connect(&sock_path).await.unwrap();
-    let (reader, mut writer) = stream.into_split();
-    let mut lines = BufReader::new(reader).lines();
+    let (reader, writer) = stream.into_split();
+    let mut reader = JsonLineReader::new(reader);
+    let mut writer = JsonLineWriter::new(writer);
 
     // Send run method via socket
     writer
-        .write_all(b"{\"method\":\"run\",\"params\":{\"input\":\"Hello\"}}\n")
+        .write(&Method::Run {
+            input: "Hello".into(),
+        })
         .await
         .unwrap();
 
@@ -360,21 +363,16 @@ async fn socket_run_receives_events() {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
     loop {
         tokio::select! {
-            line = lines.next_line() => {
-                match line {
-                    Ok(Some(line)) => {
-                        let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
-                        match parsed["event"].as_str() {
-                            Some("turn_start") => saw_turn_start = true,
-                            Some("text_delta") => saw_text_delta = true,
-                            Some("turn_end") => {
-                                saw_turn_end = true;
-                                break;
-                            }
-                            _ => {}
-                        }
+            event = reader.next::<Event>() => {
+                match event {
+                    Ok(Some(Event::TurnStart { .. })) => saw_turn_start = true,
+                    Ok(Some(Event::TextDelta { .. })) => saw_text_delta = true,
+                    Ok(Some(Event::TurnEnd { .. })) => {
+                        saw_turn_end = true;
+                        break;
                     }
-                    _ => break,
+                    Ok(None) | Err(_) => break,
+                    _ => {}
                 }
             }
             _ = tokio::time::sleep_until(deadline) => break,
@@ -388,7 +386,8 @@ async fn socket_run_receives_events() {
 
 #[tokio::test]
 async fn socket_invalid_method_returns_error() {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use protocol::stream::JsonLineReader;
+    use tokio::io::AsyncWriteExt;
     use tokio::net::UnixStream;
 
     let client = MockClient::new(simple_text_events());
@@ -400,7 +399,7 @@ async fn socket_invalid_method_returns_error() {
     let sock_path = handle.runtime_dir.socket_path();
     let stream = UnixStream::connect(&sock_path).await.unwrap();
     let (reader, mut writer) = stream.into_split();
-    let mut lines = BufReader::new(reader).lines();
+    let mut reader = JsonLineReader::new(reader);
 
     // Send garbage
     writer.write_all(b"{\"bad\":\"json\"}\n").await.unwrap();
@@ -409,16 +408,14 @@ async fn socket_invalid_method_returns_error() {
     let mut saw_error = false;
     loop {
         tokio::select! {
-            line = lines.next_line() => {
-                match line {
-                    Ok(Some(line)) => {
-                        let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
-                        if parsed["event"] == "error" {
-                            saw_error = true;
-                            break;
-                        }
+            event = reader.next::<Event>() => {
+                match event {
+                    Ok(Some(Event::Error { .. })) => {
+                        saw_error = true;
+                        break;
                     }
-                    _ => break,
+                    Ok(None) | Err(_) => break,
+                    _ => {}
                 }
             }
             _ = tokio::time::sleep_until(deadline) => break,

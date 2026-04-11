@@ -1,7 +1,7 @@
 use std::io;
 use std::path::PathBuf;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use protocol::stream::{JsonLineReader, JsonLineWriter};
 use tokio::net::UnixListener;
 use tokio::task::JoinHandle;
 
@@ -61,34 +61,28 @@ impl Drop for SocketServer {
 }
 
 async fn handle_connection(stream: tokio::net::UnixStream, handle: PodHandle) {
-    let (reader, mut writer) = stream.into_split();
-    let mut lines = BufReader::new(reader).lines();
+    let (reader, writer) = stream.into_split();
+    let mut reader = JsonLineReader::new(reader);
+    let mut writer = JsonLineWriter::new(writer);
     let mut rx = handle.subscribe();
 
     // Event writer: broadcast events → socket
     let write_task = tokio::spawn(async move {
         while let Ok(event) = rx.recv().await {
-            if let Ok(line) = event.to_json_line() {
-                let mut buf = line.into_bytes();
-                buf.push(b'\n');
-                if writer.write_all(&buf).await.is_err() {
-                    break;
-                }
+            if writer.write(&event).await.is_err() {
+                break;
             }
         }
     });
 
     // Method reader: socket → controller
-    while let Ok(Some(line)) = lines.next_line().await {
-        if line.is_empty() {
-            continue;
-        }
-        match Method::from_json_line(&line) {
-            Ok(method) => {
+    loop {
+        match reader.next::<Method>().await {
+            Ok(Some(method)) => {
                 let _ = handle.send(method).await;
             }
+            Ok(None) => break,
             Err(e) => {
-                // Send parse error back as an event
                 let _ = handle.send_event(Event::Error {
                     code: protocol::ErrorCode::Internal,
                     message: format!("invalid method: {e}"),
