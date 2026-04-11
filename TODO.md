@@ -17,3 +17,5 @@
 - [ ] コンテキスト圧縮 (Prune + Compact) → [tickets/context-compaction.md](tickets/context-compaction.md)
 - [x] Protocol: request-response パターン (GetHistory等) → [tickets/request-response-protocol.md](tickets/request-response-protocol.md)
 - [ ] パーミッション: パターンベースのツール実行制御 → [tickets/permission-extension-point.md](tickets/permission-extension-point.md)
+- [ ] session-store: persistence クレートの再構成（wrap廃止、リネーム） → [tickets/session-store-extraction.md](tickets/session-store-extraction.md)
+- [ ] UI用トークン情報の記録（run stats の永続化、session-store 後）

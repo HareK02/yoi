@@ -1,10 +1,10 @@
-use ratatui::layout::{Constraint, Layout, Position};
+use ratatui::layout::{Alignment, Constraint, Layout, Position};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::app::{App, MessageKind};
+use crate::app::{fmt_tokens, App, MessageKind};
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let chunks = Layout::vertical([
@@ -28,9 +28,14 @@ fn draw_messages(frame: &mut Frame, app: &mut App, area: ratatui::layout::Rect) 
         .iter()
         .flat_map(|(kind, content)| {
             let style = kind_style(kind);
+            let align = if matches!(kind, MessageKind::TurnStats) {
+                Alignment::Right
+            } else {
+                Alignment::Left
+            };
             content
                 .lines()
-                .map(move |l| Line::from(Span::styled(l.to_owned(), style)))
+                .map(move |l| Line::from(Span::styled(l.to_owned(), style)).alignment(align))
         })
         .collect();
 
@@ -72,16 +77,31 @@ fn draw_status(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         ),
     ];
 
-    if !app.status_line.is_empty() {
+    if app.running {
+        let status = if let Some(tool) = &app.current_tool {
+            format!(
+                "request: {} | ↑{}/↓{} | tool: {tool}",
+                app.run_requests,
+                fmt_tokens(app.run_input_tokens),
+                fmt_tokens(app.run_output_tokens),
+            )
+        } else {
+            format!(
+                "request: {} | ↑{}/↓{}",
+                app.run_requests,
+                fmt_tokens(app.run_input_tokens),
+                fmt_tokens(app.run_output_tokens),
+            )
+        };
         spans.push(Span::raw(" | "));
-        spans.push(Span::styled(
-            &app.status_line,
-            Style::default().fg(Color::Yellow),
-        ));
+        spans.push(Span::styled(status, Style::default().fg(Color::Yellow)));
+    } else {
+        spans.push(Span::styled(" idle", Style::default().fg(Color::DarkGray)));
     }
 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
+
 
 fn draw_input(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let line = Line::from(vec![
@@ -97,9 +117,11 @@ fn draw_input(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 
 fn kind_style(kind: &MessageKind) -> Style {
     match kind {
+        MessageKind::TurnHeader => Style::default().fg(Color::DarkGray),
         MessageKind::User => Style::default().fg(Color::Green),
         MessageKind::Assistant => Style::default().fg(Color::White),
         MessageKind::Tool => Style::default().fg(Color::Cyan),
         MessageKind::Error => Style::default().fg(Color::Red),
+        MessageKind::TurnStats => Style::default().fg(Color::DarkGray),
     }
 }

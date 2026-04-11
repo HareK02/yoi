@@ -5,7 +5,12 @@ pub struct App {
     pub connected: bool,
     pub messages: Vec<Message>,
     pub current_text: String,
-    pub status_line: String,
+    pub running: bool,
+    pub run_requests: usize,
+    pub run_input_tokens: u64,
+    pub run_output_tokens: u64,
+    pub turn_index: usize,
+    pub current_tool: Option<String>,
     pub input: String,
     pub cursor: usize,
     pub scroll: u16,
@@ -19,10 +24,12 @@ pub struct Message {
 
 #[derive(Clone, Copy)]
 pub enum MessageKind {
+    TurnHeader,
     User,
     Assistant,
     Tool,
     Error,
+    TurnStats,
 }
 
 impl App {
@@ -32,7 +39,12 @@ impl App {
             connected: false,
             messages: Vec::new(),
             current_text: String::new(),
-            status_line: String::new(),
+            running: false,
+            run_requests: 0,
+            run_input_tokens: 0,
+            run_output_tokens: 0,
+            turn_index: 0,
+            current_tool: None,
             input: String::new(),
             cursor: 0,
             scroll: 0,
@@ -45,6 +57,11 @@ impl App {
         if text.is_empty() {
             return None;
         }
+        self.turn_index += 1;
+        self.messages.push(Message {
+            kind: MessageKind::TurnHeader,
+            content: format!("#{}", self.turn_index),
+        });
         self.messages.push(Message {
             kind: MessageKind::User,
             content: text.clone(),
@@ -57,8 +74,10 @@ impl App {
 
     pub fn handle_pod_event(&mut self, event: Event) {
         match event {
-            Event::TurnStart { turn } => {
-                self.status_line = format!("turn {turn}");
+            Event::TurnStart { .. } => {
+                self.running = true;
+                self.run_requests += 1;
+                self.current_tool = None;
             }
             Event::TextDelta { text } => {
                 self.current_text.push_str(&text);
@@ -73,7 +92,7 @@ impl App {
                     self.scroll_to_bottom();
                 }
             }
-            Event::TurnEnd { turn, result } => {
+            Event::TurnEnd { .. } => {
                 if !self.current_text.is_empty() {
                     let text = std::mem::take(&mut self.current_text);
                     self.messages.push(Message {
@@ -81,10 +100,10 @@ impl App {
                         content: text,
                     });
                 }
-                self.status_line = format!("turn {turn} {result:?}");
+                self.current_tool = None;
             }
             Event::ToolCallStart { name, .. } => {
-                self.status_line = format!("tool: {name}");
+                self.current_tool = Some(name.clone());
                 self.messages.push(Message {
                     kind: MessageKind::Tool,
                     content: format!("[tool] {name}"),
@@ -94,6 +113,7 @@ impl App {
             Event::ToolCallDone {
                 name, arguments, ..
             } => {
+                self.current_tool = None;
                 self.messages.push(Message {
                     kind: MessageKind::Tool,
                     content: format!("[tool] {name} done ({} bytes)", arguments.len()),
@@ -119,10 +139,8 @@ impl App {
                 input_tokens,
                 output_tokens,
             } => {
-                let in_t = input_tokens.unwrap_or(0);
-                let out_t = output_tokens.unwrap_or(0);
-                self.status_line
-                    .push_str(&format!(" | in:{in_t} out:{out_t}"));
+                self.run_input_tokens += input_tokens.unwrap_or(0);
+                self.run_output_tokens += output_tokens.unwrap_or(0);
             }
             Event::Error { code, message } => {
                 self.messages.push(Message {
@@ -131,8 +149,22 @@ impl App {
                 });
                 self.scroll_to_bottom();
             }
-            Event::RunEnd { result } => {
-                self.status_line = format!("{result:?}");
+            Event::RunEnd { .. } => {
+                self.messages.push(Message {
+                    kind: MessageKind::TurnStats,
+                    content: format!(
+                        "{} reqs ↑{}/↓{}",
+                        self.run_requests,
+                        fmt_tokens(self.run_input_tokens),
+                        fmt_tokens(self.run_output_tokens),
+                    ),
+                });
+                self.running = false;
+                self.run_requests = 0;
+                self.run_input_tokens = 0;
+                self.run_output_tokens = 0;
+                self.current_tool = None;
+                self.scroll_to_bottom();
             }
             Event::ToolCallArgsDelta { .. } => {}
             Event::History { items } => {
@@ -220,13 +252,21 @@ impl App {
 
     fn restore_history(&mut self, items: &[serde_json::Value]) {
         self.messages.clear();
+        self.turn_index = 0;
         for item in items {
             let item_type = item["type"].as_str().unwrap_or("");
             match item_type {
                 "message" => {
                     let role = item["role"].as_str().unwrap_or("");
                     let kind = match role {
-                        "user" => MessageKind::User,
+                        "user" => {
+                            self.turn_index += 1;
+                            self.messages.push(Message {
+                                kind: MessageKind::TurnHeader,
+                                content: format!("#{}", self.turn_index),
+                            });
+                            MessageKind::User
+                        }
                         "assistant" => MessageKind::Assistant,
                         _ => continue,
                     };
@@ -274,5 +314,15 @@ impl App {
     fn scroll_to_bottom(&mut self) {
         // Will be clamped during rendering
         self.scroll = u16::MAX;
+    }
+}
+
+pub fn fmt_tokens(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
     }
 }
