@@ -1,4 +1,5 @@
 use protocol::{Event, Method};
+use tui_scrollview::ScrollViewState;
 
 pub struct App {
     pub pod_name: String,
@@ -13,7 +14,7 @@ pub struct App {
     pub current_tool: Option<String>,
     pub input: String,
     pub cursor: usize,
-    pub scroll: u16,
+    pub scroll_state: ScrollViewState,
     pub quit: bool,
 }
 
@@ -47,7 +48,7 @@ impl App {
             current_tool: None,
             input: String::new(),
             cursor: 0,
-            scroll: 0,
+            scroll_state: ScrollViewState::new(),
             quit: false,
         }
     }
@@ -230,24 +231,15 @@ impl App {
     }
 
     pub fn scroll_up(&mut self) {
-        self.scroll = self.scroll.saturating_sub(3);
+        self.scroll_state.scroll_up();
+        self.scroll_state.scroll_up();
+        self.scroll_state.scroll_up();
     }
 
     pub fn scroll_down(&mut self) {
-        self.scroll = self.scroll.saturating_add(3);
-    }
-
-    /// Total visible lines (for rendering the in-progress text as part of output).
-    pub fn display_lines(&self) -> Vec<(&MessageKind, &str)> {
-        let mut lines: Vec<(&MessageKind, &str)> = self
-            .messages
-            .iter()
-            .map(|m| (&m.kind, m.content.as_str()))
-            .collect();
-        if !self.current_text.is_empty() {
-            lines.push((&MessageKind::Assistant, &self.current_text));
-        }
-        lines
+        self.scroll_state.scroll_down();
+        self.scroll_state.scroll_down();
+        self.scroll_state.scroll_down();
     }
 
     fn restore_history(&mut self, items: &[serde_json::Value]) {
@@ -312,8 +304,7 @@ impl App {
     }
 
     fn scroll_to_bottom(&mut self) {
-        // Will be clamped during rendering
-        self.scroll = u16::MAX;
+        self.scroll_state.scroll_to_bottom();
     }
 }
 

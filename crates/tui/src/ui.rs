@@ -1,8 +1,9 @@
-use ratatui::layout::{Alignment, Constraint, Layout, Position};
+use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect, Size};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Wrap};
+use ratatui::widgets::{Block, Padding, Paragraph, Wrap};
 use ratatui::Frame;
+use tui_scrollview::{ScrollView, ScrollbarVisibility};
 
 use crate::app::{fmt_tokens, App, MessageKind};
 
@@ -21,35 +22,111 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_input(frame, app, chunks[3]);
 }
 
-fn draw_messages(frame: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
-    let display = app.display_lines();
+fn draw_messages(frame: &mut Frame, app: &mut App, area: Rect) {
+    let width = area.width;
+    let padded_inner = width.saturating_sub(1); // content width inside Block::padding(left=1)
 
-    let lines: Vec<Line> = display
-        .iter()
-        .flat_map(|(kind, content)| {
-            let style = kind_style(kind);
-            let align = if matches!(kind, MessageKind::TurnStats) {
-                Alignment::Right
-            } else {
-                Alignment::Left
-            };
-            content
-                .lines()
-                .map(move |l| Line::from(Span::styled(l.to_owned(), style)).alignment(align))
-        })
-        .collect();
-
-    let total = lines.len() as u16;
-    let max_scroll = total.saturating_sub(area.height);
-    if app.scroll > max_scroll {
-        app.scroll = max_scroll;
+    // Build segments: (is_padded, lines, wrapped_height)
+    struct Seg<'a> {
+        lines: Vec<Line<'a>>,
+        padded: bool,
+        height: u16,
     }
 
-    let paragraph = Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .scroll((app.scroll, 0));
+    let mut segs: Vec<Seg> = Vec::new();
+    let mut content: Vec<Line> = Vec::new();
 
-    frame.render_widget(paragraph, area);
+    macro_rules! flush_content {
+        () => {
+            if !content.is_empty() {
+                let h = wrapped_height(&content, padded_inner);
+                segs.push(Seg { lines: std::mem::take(&mut content), padded: true, height: h });
+            }
+        };
+    }
+
+    for msg in &app.messages {
+        let style = kind_style(&msg.kind);
+        match msg.kind {
+            MessageKind::TurnHeader => {
+                flush_content!();
+                if !segs.is_empty() {
+                    segs.push(Seg { lines: vec![Line::raw("")], padded: false, height: 1 });
+                }
+                let lines = vec![Line::from(Span::styled(msg.content.clone(), style))];
+                segs.push(Seg { lines, padded: false, height: 1 });
+            }
+            MessageKind::TurnStats => {
+                flush_content!();
+                let lines: Vec<Line> = msg.content.lines()
+                    .map(|l| Line::from(Span::styled(l.to_owned(), style)).alignment(Alignment::Right))
+                    .collect();
+                let h = wrapped_height(&lines, padded_inner);
+                segs.push(Seg { lines, padded: true, height: h });
+                segs.push(Seg { lines: vec![Line::raw("")], padded: false, height: 1 });
+            }
+            MessageKind::User => {
+                for l in msg.content.lines() {
+                    content.push(Line::from(Span::styled(l.to_owned(), style)));
+                }
+                content.push(Line::raw(""));
+            }
+            _ => {
+                for l in msg.content.lines() {
+                    content.push(Line::from(Span::styled(l.to_owned(), style)));
+                }
+            }
+        }
+    }
+
+    // In-progress streaming text
+    if !app.current_text.is_empty() {
+        let style = kind_style(&MessageKind::Assistant);
+        for l in app.current_text.lines() {
+            content.push(Line::from(Span::styled(l.to_owned(), style)));
+        }
+    }
+
+    flush_content!();
+
+    // Total content height
+    let total_height: u16 = segs.iter().map(|s| s.height).sum();
+
+    // Build ScrollView
+    let mut sv = ScrollView::new(Size::new(width, total_height.max(1)))
+        .horizontal_scrollbar_visibility(ScrollbarVisibility::Never);
+
+    let mut y: u16 = 0;
+    for seg in segs {
+        let rect = Rect::new(0, y, width, seg.height);
+        if seg.padded {
+            sv.render_widget(
+                Paragraph::new(seg.lines)
+                    .block(Block::default().padding(Padding::left(1)))
+                    .wrap(Wrap { trim: false }),
+                rect,
+            );
+        } else {
+            sv.render_widget(Paragraph::new(seg.lines), rect);
+        }
+        y += seg.height;
+    }
+
+    frame.render_stateful_widget(sv, area, &mut app.scroll_state);
+}
+
+/// Estimate the number of visual rows after wrapping.
+fn wrapped_height(lines: &[Line], avail_width: u16) -> u16 {
+    if avail_width == 0 {
+        return lines.len() as u16;
+    }
+    lines
+        .iter()
+        .map(|line| {
+            let w = line.width() as u16;
+            if w == 0 { 1 } else { w.div_ceil(avail_width) }
+        })
+        .sum()
 }
 
 fn draw_separator(frame: &mut Frame, area: ratatui::layout::Rect) {
