@@ -3,7 +3,7 @@
 - [x] ツール出力の遅延読み込み設計 (ToolOutput / BlobStore / auto_summarize)
 - [ ] ツール設計
   - [ ] ツールの動的追加/削除 → [tickets/tool-dynamic-registry.md](tickets/tool-dynamic-registry.md)
-  - [ ] ToolDefinition ファクトリの遅延初期化修正 → [tickets/worker-builder-api.md](tickets/worker-builder-api.md)
+  - [ ] run() 自動ロックとファクトリ遅延初期化 → [tickets/worker-auto-lock.md](tickets/worker-auto-lock.md)
 - [x] inspect ツール実装
 - [x] max_turns: マニフェストによるターン数制限
 - [x] pod バイナリエントリポイント
@@ -12,3 +12,5 @@
 - [x] JSONL ストリーム変換ユーティリティ (protocol::stream)
 - [x] Hook モジュールの llm-worker からの除去 → [tickets/remove-hook-module.md](tickets/remove-hook-module.md)
 - [ ] api_key_file: ファイルパスによるAPIキー解決 → [tickets/api-key-file.md](tickets/api-key-file.md)
+- [ ] コンテキスト圧縮 (Prune + Compact) → [tickets/context-compaction.md](tickets/context-compaction.md)
+- [ ] パーミッション: パターンベースのツール実行制御 → [tickets/permission-extension-point.md](tickets/permission-extension-point.md)
