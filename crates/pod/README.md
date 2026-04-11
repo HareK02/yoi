@@ -7,7 +7,6 @@
 ### コア
 
 - `Pod<C, St>` — LLM ワーカーセッション + マニフェスト + スコープのラッパー（`run()`, `resume()`, `from_manifest()`）
-- `PodId` — UUID v7 による Pod 識別子
 - `PodRunResult` — 実行結果（`Finished`, `Paused`）
 - `PodError` — エラー型
 
