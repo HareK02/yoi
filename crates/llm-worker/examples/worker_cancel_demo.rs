@@ -40,17 +40,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("📡 Sending request to LLM...");
 
-    // Mutable::run consumes self → (Locked, WorkerResult)
     match worker.run("Tell me a very long story about a brave knight. Make it as detailed as possible with many paragraphs.").await {
-        Ok((_locked, WorkerResult::Finished)) => {
-            println!("✅ Task completed normally");
-        }
-        Ok((_locked, WorkerResult::Paused)) => {
-            println!("⏸️  Task paused");
-        }
-        Ok((_locked, WorkerResult::LimitReached)) => {
-            println!("🔒 Turn limit reached");
-        }
+        Ok(out) => match out.result {
+            WorkerResult::Finished => println!("✅ Task completed normally"),
+            WorkerResult::Paused => println!("⏸️  Task paused"),
+            WorkerResult::LimitReached => println!("🔒 Turn limit reached"),
+        },
         Err(e) => {
             println!("❌ Task error: {}", e);
         }

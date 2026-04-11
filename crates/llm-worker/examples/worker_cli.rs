@@ -476,8 +476,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let (mut locked, _) = match worker.run(first_input).await {
-        Ok(pair) => pair,
+    let mut locked = match worker.run(first_input).await {
+        Ok(out) => out.worker,
         Err(e) => {
             eprintln!("\n❌ Error: {}", e);
             return Ok(());

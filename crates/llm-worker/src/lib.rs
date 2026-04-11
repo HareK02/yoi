@@ -55,4 +55,4 @@ pub use handler::ToolUseBlockStart;
 pub use message::{ContentPart, Item, Message, Role};
 pub use interceptor::Interceptor;
 pub use tool::{ToolCall, ToolResult};
-pub use worker::{ToolRegistryError, Worker, WorkerConfig, WorkerError, WorkerResult};
+pub use worker::{RunOutput, ToolRegistryError, Worker, WorkerConfig, WorkerError, WorkerResult};

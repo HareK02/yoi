@@ -211,8 +211,9 @@ async fn test_mutable_run_updates_history() -> Result<(), WorkerError> {
     let client = MockLlmClient::new(events);
     let worker = Worker::new(client);
 
-    // Execute (Mutable::run consumes self, returns (Locked, WorkerResult))
-    let (worker, _result) = worker.run("Hi there").await?;
+    // Execute (Mutable::run consumes self, returns RunOutput)
+    let out = worker.run("Hi there").await?;
+    let worker = out.worker;
 
     // History is updated
     let history = worker.history();
@@ -352,8 +353,8 @@ async fn test_turn_count_increment() -> Result<(), WorkerError> {
 
     assert_eq!(worker.turn_count(), 0);
 
-    // First run consumes Mutable, returns Locked
-    let (mut worker, _) = worker.run("First").await?;
+    // First run consumes Mutable, returns RunOutput
+    let mut worker = worker.run("First").await?.worker;
     assert_eq!(worker.turn_count(), 1);
 
     // Subsequent runs on Locked take &mut self
