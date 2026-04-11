@@ -73,8 +73,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Connect to pod
     match PodClient::connect(&socket_path).await {
-        Ok(client) => {
+        Ok(mut client) => {
             app.connected = true;
+            let _ = client.send(&Method::GetHistory).await;
             run_loop(&mut terminal, &mut app, client).await?;
         }
         Err(e) => {

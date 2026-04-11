@@ -135,7 +135,9 @@ impl App {
                 self.push_status(format!("[run end] {result:?}"));
             }
             Event::ToolCallArgsDelta { .. } => {}
-            Event::History { .. } => {}
+            Event::History { items } => {
+                self.restore_history(&items);
+            }
         }
     }
 
@@ -214,6 +216,59 @@ impl App {
             lines.push((&MessageKind::Assistant, &self.current_text));
         }
         lines
+    }
+
+    fn restore_history(&mut self, items: &[serde_json::Value]) {
+        self.messages.clear();
+        for item in items {
+            let item_type = item["type"].as_str().unwrap_or("");
+            match item_type {
+                "message" => {
+                    let role = item["role"].as_str().unwrap_or("");
+                    let kind = match role {
+                        "user" => MessageKind::User,
+                        "assistant" => MessageKind::Assistant,
+                        _ => continue,
+                    };
+                    let text = item["content"]
+                        .as_array()
+                        .and_then(|parts| {
+                            parts
+                                .iter()
+                                .filter_map(|p| p["text"].as_str())
+                                .next()
+                        })
+                        .unwrap_or("");
+                    if !text.is_empty() {
+                        self.messages.push(Message {
+                            kind,
+                            content: text.to_owned(),
+                        });
+                    }
+                }
+                "tool_call" => {
+                    let name = item["name"].as_str().unwrap_or("?");
+                    self.messages.push(Message {
+                        kind: MessageKind::Tool,
+                        content: format!("[tool] {name}"),
+                    });
+                }
+                "tool_result" => {
+                    let output = item["output"].as_str().unwrap_or("");
+                    let display = if output.len() > 200 {
+                        format!("{}...", &output[..200])
+                    } else {
+                        output.to_owned()
+                    };
+                    self.messages.push(Message {
+                        kind: MessageKind::Tool,
+                        content: format!("[tool result] {display}"),
+                    });
+                }
+                _ => {}
+            }
+        }
+        self.scroll_to_bottom();
     }
 
     fn push_status(&mut self, content: String) {
