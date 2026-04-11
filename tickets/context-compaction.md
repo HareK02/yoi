@@ -5,112 +5,137 @@
 長時間実行エージェントにとって、コンテキストウィンドウの管理はコア要件。
 現状の Worker は history をそのまま保持し、オーバーフロー時の対策がない。
 
-2段階のアプローチで対処する:
-1. **Prune**: リクエストごとに古いツール出力を削ぎ落とし、コンテキストを節約
-2. **Compact**: 閾値超過時に要約を生成し、history 全体を圧縮
+Claude Code の3層構造（MicroCompaction / AutoCompact / Full Compact）を参考に、
+Insomnia では2層（条件付き Prune + Compact）で対処する。
+
+参考: [docs/ref/claude-code-compaction.md](../docs/ref/claude-code-compaction.md)
 
 ---
 
-## Phase 1: Prune
+## 前提: ToolOutput の再設計
+
+Prune の設計は ToolOutput の構造に依存する。
+現行の Inline/Stored enum を **summary + content** の2フィールド構造に改める。
+
+詳細: [crates/llm-worker/docs/tool-output-design.md](../crates/llm-worker/docs/tool-output-design.md)
+
+### 構造
+
+```rust
+pub struct ToolOutput {
+    pub summary: String,          // 1-2行。常に残る
+    pub content: Option<String>,  // 詳細。Prune で消える
+}
+```
+
+```rust
+Item::ToolResult {
+    call_id: CallId,
+    summary: String,
+    content: Option<String>,
+}
+```
+
+### Prune との関係
+
+- summary: Prune 後も残る。「何をしたか」の最低限の情報
+- content: Prune 対象。`None` に置換するだけ
+- 巨大出力はツール側がファイルに退避し、content に見取り図を置く
+
+### 削除対象
+
+ToolOutput 再設計に伴い、以下を削除:
+
+- `ToolOutput` enum（Inline/Stored）→ struct に置換
+- `Content` enum, `auto_summarize`, `ToolOutputProcessor` trait
+- `BlobStore` trait, `FsBlobStore`, `BlobOutputProcessor`
+- `inspect_tool.rs`（汎用の read_file/grep で代替）
+- Worker の `output_processor` フィールド
+
+---
+
+## Phase 1: 条件付き Prune
 
 ### 概要
 
-`PreLlmRequest` フックとして実装する。リクエストコンテキスト（history のクローン）上で動作し、実際の history は変更しない。セッションログの完全性を保ちつつ、LLM に送るコンテキストを軽量化する。
+Claude Code の `clear_at_least` パターンに倣い、**削れるトークン量が閾値を超える場合にのみ** Prune を実行する。キャッシュを無駄に壊さない。
+
+### キャッシュの制約
+
+全主要プロバイダ（Anthropic / OpenAI / Gemini）で KV キャッシュはプレフィクスベース。
+プレフィクス中のアイテムを変更すると、**変更地点以降が全て再計算**になる。
+
+```
+キャッシュ済み: [A, B, C, D, E]
+Prune:         [A', B, C, D, E]   ← A の content を消した
+再計算:        [A', B, C, D, E]   ← A' 以降すべて
+```
+
+Prune で得られるトークン節約 vs キャッシュ再計算コスト。
+`min_savings` 閾値で「削る価値がある場合だけ」実行する。
 
 ### コード配置
 
 | 場所 | 内容 |
 |------|------|
-| `crates/llm-worker/src/prune.rs` | Prune アルゴリズム（純粋関数） |
+| `crates/llm-worker/src/prune.rs` | Prune アルゴリズム（集計 + 置換） |
 | `crates/pod/src/prune_hook.rs` | `PruneHook`（`Hook<PreLlmRequest>` 実装） |
-
-アルゴリズムは `Item` を操作する純粋関数なので llm-worker に置く。
-フックの配線は Pod 層の責務。
 
 ### アルゴリズム
 
 ```rust
-// crates/llm-worker/src/prune.rs
-
-/// 古いターンのツール出力を刈り込む。
-///
-/// `items` はリクエストコンテキスト（history のクローン）。
-/// 直近 `protected_turns` ターン以内のアイテムは保護される。
-pub fn prune(items: &mut Vec<Item>, protected_turns: usize) {
-    // 1. ターン境界の特定
-    //    UserMessage の出現位置 = ターンの開始点
-    let turn_starts: Vec<usize> = items
-        .iter()
-        .enumerate()
-        .filter(|(_, item)| item.is_user_message())
-        .map(|(i, _)| i)
-        .collect();
-
-    // 2. 保護境界の計算
-    //    直近 N ターンの最初の UserMessage のインデックス
-    let protection_boundary = if turn_starts.len() <= protected_turns {
-        return; // 保護対象以内ならスキップ
-    } else {
-        turn_starts[turn_starts.len() - protected_turns]
-    };
-
-    // 3. 境界より前のアイテムを刈り込み
-    for item in items[..protection_boundary].iter_mut() {
-        prune_item(item);
-    }
+pub struct PruneConfig {
+    /// Prune 対象外とする直近ターン数
+    pub protected_turns: usize,
+    /// この推定トークン数以上削れる場合にのみ Prune を実行
+    pub min_savings: usize,
 }
 
-fn prune_item(item: &mut Item) {
-    match item {
-        Item::ToolResult { output, .. } => {
-            if output == "[pruned]" || output.starts_with("[pruned]") {
-                return; // 冪等性: 既に刈り込み済み
-            }
-            // blob 参照があれば保持し、サマリーだけ除去
-            if let Some(blob_ref) = extract_blob_ref(output) {
-                *output = format!("[pruned] {blob_ref}");
-            } else {
-                *output = "[pruned]".to_string();
-            }
-        }
-        Item::Reasoning { text, .. } => {
-            *text = "[pruned]".to_string();
-        }
-        // UserMessage, AssistantMessage, ToolCall は保持
-        // （会話の流れとツール呼び出しの意図は残す）
-        _ => {}
+pub fn prune(items: &mut Vec<Item>, config: &PruneConfig) -> bool {
+    // 1. ターン境界の特定（UserMessage 出現位置）
+    let turn_starts = find_turn_starts(items);
+    if turn_starts.len() <= config.protected_turns {
+        return false;
     }
-}
+    let boundary = turn_starts[turn_starts.len() - config.protected_turns];
 
-/// "[blob:abc123] summary..." から "[blob:abc123]" を抽出
-fn extract_blob_ref(output: &str) -> Option<String> {
-    if output.starts_with("[blob:") {
-        output.find(']').map(|end| output[..=end].to_string())
-    } else {
-        None
+    // 2. Prune 可能なトークン数を集計
+    let mut total_savings: usize = 0;
+    let mut prunable: Vec<usize> = Vec::new();
+
+    for (i, item) in items[..boundary].iter().enumerate() {
+        if let Item::ToolResult { content: Some(c), .. } = item {
+            total_savings += c.len() / 4; // 粗い推定
+            prunable.push(i);
+        }
     }
+
+    // 3. 閾値チェック
+    if total_savings < config.min_savings {
+        return false;
+    }
+
+    // 4. Prune: content を None にするだけ
+    for &i in &prunable {
+        if let Item::ToolResult { content, .. } = &mut items[i] {
+            *content = None;
+        }
+    }
+    true
 }
 ```
 
 ### PruneHook
 
 ```rust
-// crates/pod/src/prune_hook.rs
-
 pub struct PruneHook {
-    protected_turns: usize,
-}
-
-impl PruneHook {
-    pub fn new(protected_turns: usize) -> Self {
-        Self { protected_turns }
-    }
+    config: PruneConfig,
 }
 
 #[async_trait]
 impl Hook<PreLlmRequest> for PruneHook {
     async fn call(&self, context: &mut Vec<Item>) -> PreRequestAction {
-        prune(context, self.protected_turns);
+        prune(context, &self.config);
         PreRequestAction::Continue
     }
 }
@@ -118,14 +143,10 @@ impl Hook<PreLlmRequest> for PruneHook {
 
 ### 特性
 
-- **冪等**: 既に `[pruned]` のアイテムは再処理しない
-- **非破壊**: history 本体は変更せず、リクエストコンテキスト（クローン）のみ操作
-- **blob 参照保持**: `[pruned] [blob:abc123]` の形式で blob 参照を残す。LLM は `inspect` ツールで必要に応じて内容を取得可能
-- **対象**: `ToolResult`（最大の節約源）と `Reasoning`。`ToolCall` の arguments は残す（ツール操作の意図が消えるため）
-
-### KV キャッシュへの影響
-
-`pre_llm_request` はリクエストコンテキスト（クローン）を操作する。プロバイダ側の KV キャッシュは、送信内容が変わった部分で再計算が必要。ただし刈り込み対象は古いアイテムであり、キャッシュヒットしない領域なのでトレードオフとして許容。
+- **条件付き**: 集計して閾値を超えた場合のみ実行
+- **冪等**: `content: None` のアイテムはスキップ
+- **非破壊**: history 本体は変更しない。Prune 状態（どこまで刈ったか）を Pod が保持し、LLM リクエスト構築時に反映する
+- **単純**: Prune = `content = None`。blob 参照の解析やサマリ生成は不要
 
 ---
 
@@ -133,16 +154,14 @@ impl Hook<PreLlmRequest> for PruneHook {
 
 ### 概要
 
-Prune がアイテム単位の軽量な刈り込みであるのに対し、Compact は history 全体を要約で置き換える重量級の操作。別の Worker（要約専用・ツールなし）を使って要約を生成し、history を圧縮する。
+history 全体を要約で置き換える。
+別の Worker（要約専用・ツールなし）で要約を生成する。
 
 ### トリガー
 
-Controller が `input_tokens` を追跡し、run 完了後に閾値と比較する。
+Controller が `input_tokens` を追跡し、run 完了後に閾値と比較。
 
 ```rust
-// controller.rs 内の actor ループ
-
-// 使用量トラッカー（セットアップ時に Worker コールバックに登録）
 let last_input_tokens = Arc::new(AtomicU64::new(0));
 {
     let tracker = last_input_tokens.clone();
@@ -152,238 +171,98 @@ let last_input_tokens = Arc::new(AtomicU64::new(0));
         }
     });
 }
+```
 
-// run 完了後のチェック（actor ループ内）
-let input_tokens = last_input_tokens.load(Ordering::Relaxed);
-if let Some(threshold) = compact_threshold {
-    if input_tokens > threshold {
-        // → compaction 実行
-    }
-}
+### サーキットブレーカー
+
+```rust
+const MAX_COMPACT_FAILURES: usize = 3;
+// 3回連続失敗で compaction を無効化
 ```
 
 ### Compaction フロー
 
+Compact は fork と同じ構造。旧セッションを保全し、新しい SessionId で圧縮後のセッションを開始する。
+
 ```
-Run 完了
+Run 完了 → input_tokens > threshold
   ↓
-Controller: input_tokens > threshold?
-  ↓ yes
-Controller: history 全体を要約プロンプトに変換
+Controller: history を要約プロンプトに変換
   ↓
-Controller: 要約用 Worker を生成（ツールなし、専用 system prompt）
+Controller: 要約用 Worker 生成（ツールなし、temperature=0）
   ↓
-要約 Worker: 要約テキストを生成
+要約 Worker: 構造化要約を生成
   ↓
-Controller: 要約 + 直近 N ターンで新しい history を構築
+Controller: [要約 Item, 直近 N ターン] で新 history を構築
   ↓
-Controller: pod.session_mut().worker_mut().set_history(compacted)
+Controller: 新 SessionId で新セッションを作成（SessionStart に compacted_from を記録）
   ↓
-Controller: セッションログに Compacted エントリを記録
-  ↓
-次の run/resume で圧縮済み history を使用
+旧セッション JSONL はそのまま保全（append-only 原則を維持）
 ```
 
-### 要約用 Worker
+```
+旧セッション (abc-123):
+  [entry0] → [entry1] → ... → [entryN]  ← そのまま残る
+
+新セッション (def-456):
+  [SessionStart { history: [要約 + 直近N], compacted_from: (abc-123, entryN.hash) }] → ...
+```
+
+### SessionStart の出自フィールド
 
 ```rust
-// controller.rs 内、compaction 実行部分
-
-async fn compact<C, St>(
-    pod: &mut Pod<C, St>,
-    retained_turns: usize,
-) -> Result<(), PodError>
-where
-    C: LlmClient + 'static,
-    St: Store + 'static,
-{
-    let manifest = pod.manifest().clone();
-    let history = pod.session_mut().worker_mut().history().to_vec();
-
-    // 1. 直近 N ターンのアイテムを分離
-    let (old_items, recent_items) = split_at_turn_boundary(&history, retained_turns);
-
-    if old_items.is_empty() {
-        return Ok(()); // 圧縮対象なし
-    }
-
-    // 2. 要約用 Worker を構築
-    let client = provider::build_client(&manifest.provider, None)?;
-    let mut summary_worker = Worker::new(client);
-    summary_worker.set_system_prompt(COMPACTION_SYSTEM_PROMPT);
-    summary_worker.set_request_config(
-        RequestConfig::new()
-            .with_max_tokens(2048)
-            .with_temperature(0.0),
-    );
-
-    // 3. 会話履歴を要約対象テキストとして入力
-    let summary_input = format_history_for_summary(&old_items);
-    let locked = summary_worker.lock();
-    let output = locked.run(summary_input).await;
-    let summary_worker = output.worker.unlock();
-
-    // 4. 要約テキストを取得
-    let summary_text = extract_last_assistant_text(summary_worker.history())
-        .unwrap_or_else(|| "[compaction failed]".to_string());
-
-    // 5. 新しい history を構築
-    let summary_item = Item::user_message(format!(
-        "[Compaction Summary — previous conversation condensed]\n\n{summary_text}"
-    ));
-    let mut compacted = vec![summary_item];
-    compacted.extend(recent_items);
-
-    // 6. 適用
-    pod.session_mut().worker_mut().set_history(compacted);
-
-    Ok(())
+LogEntry::SessionStart {
+    ts: u64,
+    system_prompt: Option<String>,
+    config: RequestConfig,
+    history: Vec<Item>,
+    /// fork 由来の場合、元セッションと分岐点
+    forked_from: Option<(SessionId, EntryHash)>,
+    /// compact 由来の場合、元セッションと圧縮時点
+    compacted_from: Option<(SessionId, EntryHash)>,
 }
 ```
+
+- 通常の新規セッション: 両方 `None`
+- fork: `forked_from = Some(...)`
+- compact: `compacted_from = Some(...)`
+- EntryHash で元セッションのどの時点からの操作かを追跡可能
 
 ### 要約フォーマット
 
-要約用 Worker の system prompt:
-
 ```
-You are a conversation summarizer for an AI coding assistant.
-
-Given a conversation history between a user and an assistant, produce a structured
-summary. The summary will replace the conversation history, so include all
-information the assistant needs to continue working effectively.
-
-Format:
-
 ## Original Task
-(The user's original goal or instruction)
+（元のユーザー指示）
 
 ## Completed Work
-- (Bullet list of what was accomplished, with specific file paths and changes)
+- （完了した作業。ファイルパス・関数名等の具体情報）
 
 ## Key Discoveries
-- (Important facts, constraints, decisions, or errors encountered)
+- （判明した事実・制約・エラー）
 
 ## Current State
-- (What files were modified, what remains to be done)
-
-Be precise about file paths, function names, and technical details.
-Omit pleasantries and conversational filler.
-```
-
-### 直近ターンの分離
-
-```rust
-/// history を「古い部分」と「直近 N ターン」に分割する。
-/// ターン境界は UserMessage の出現で判定。
-fn split_at_turn_boundary(
-    items: &[Item],
-    retained_turns: usize,
-) -> (Vec<Item>, Vec<Item>) {
-    let turn_starts: Vec<usize> = items
-        .iter()
-        .enumerate()
-        .filter(|(_, item)| item.is_user_message())
-        .map(|(i, _)| i)
-        .collect();
-
-    if turn_starts.len() <= retained_turns {
-        return (vec![], items.to_vec()); // 全て保護
-    }
-
-    let split_at = turn_starts[turn_starts.len() - retained_turns];
-    let old = items[..split_at].to_vec();
-    let recent = items[split_at..].to_vec();
-    (old, recent)
-}
-```
-
-### セッションログ
-
-新しい `LogEntry` variant を追加:
-
-```rust
-// session_log.rs
-
-pub enum LogEntry {
-    // ... existing variants ...
-
-    /// Context compaction: history was replaced with a summary + recent items.
-    Compacted {
-        ts: u64,
-        /// The new compacted history.
-        history: Vec<Item>,
-    },
-}
-```
-
-`collect_state` での処理:
-
-```rust
-LogEntry::Compacted { history, .. } => {
-    state.history = history.clone();
-}
-```
-
-append-only のログ整合性を維持。圧縮前の全履歴はログの過去エントリに残る。
-
-### Controller の変更
-
-Controller の actor ループに compaction ロジックを追加:
-
-```rust
-// controller.rs (actor ループ内、run 完了後)
-
-Method::Run { input } => {
-    // ... existing run logic ...
-
-    // Compaction check
-    let input_tokens = last_input_tokens.load(Ordering::Relaxed);
-    if let Some(threshold) = compaction_config.compact_threshold {
-        if input_tokens > threshold {
-            info!(input_tokens, threshold, "Triggering context compaction");
-            let _ = event_tx.send(Event::CompactionStart);
-            match compact(&mut pod, compaction_config.retained_turns).await {
-                Ok(()) => {
-                    let _ = event_tx.send(Event::CompactionDone);
-                    // セッションログに記録
-                    // ...
-                }
-                Err(e) => {
-                    warn!(error = %e, "Compaction failed, continuing without");
-                }
-            }
-        }
-    }
-}
+- （変更されたファイル、残タスク）
 ```
 
 ### エラーハンドリング
 
-Compaction は best-effort。失敗してもデータは失われない:
-- 要約 Worker がエラー → ログに警告を出して続行。次の run 完了後に再試行
-- 要約テキストの抽出に失敗 → フォールバック: 古い history をそのまま保持
+- 要約 Worker エラー → 警告ログ、スキップ、consecutive_failures++
+- 3回連続失敗 → セッション残りで compaction 無効化
+- Thrash loop（compaction 直後に再び閾値超過）→ エラーで停止
 
 ---
 
 ## 設定
 
-### マニフェスト拡張
+### マニフェスト
 
 ```toml
-[pod]
-name = "code-agent"
-
-[provider]
-kind = "anthropic"
-model = "claude-sonnet-4-20250514"
-
-[worker]
-system_prompt = "..."
-max_tokens = 8192
-
 [compaction]
 # Prune: 直近何ターンを保護するか（デフォルト: 3）
 prune_protected_turns = 3
+
+# Prune: この推定トークン数以上削れる場合にのみ実行（デフォルト: 4096）
+prune_min_savings = 4096
 
 # Compact: input_tokens がこの値を超えたら要約を実行（省略 = 無効）
 compact_threshold = 80000
@@ -393,48 +272,22 @@ compact_retained_turns = 2
 ```
 
 ```rust
-// manifest/src/lib.rs
-
-pub struct PodManifest {
-    pub pod: PodMeta,
-    pub provider: ProviderConfig,
-    pub worker: WorkerManifest,
-    #[serde(default)]
-    pub scope: Option<ScopeConfig>,
-    #[serde(default)]
-    pub compaction: Option<CompactionConfig>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompactionConfig {
     #[serde(default = "default_prune_protected_turns")]
-    pub prune_protected_turns: usize,  // default: 3
+    pub prune_protected_turns: usize,       // default: 3
+    #[serde(default = "default_prune_min_savings")]
+    pub prune_min_savings: usize,           // default: 4096
     pub compact_threshold: Option<u64>,
     #[serde(default = "default_compact_retained_turns")]
-    pub compact_retained_turns: usize, // default: 2
+    pub compact_retained_turns: usize,      // default: 2
 }
 ```
 
 ### デフォルト動作
 
-- `[compaction]` セクション省略時: Prune も Compact も無効
-- `[compaction]` セクションあり・`compact_threshold` 省略時: Prune のみ有効
-
----
-
-## Protocol 拡張
-
-Compact イベントをクライアントに通知:
-
-```rust
-// protocol/src/lib.rs
-
-pub enum Event {
-    // ... existing ...
-    CompactionStart,
-    CompactionDone,
-}
-```
+- `[compaction]` 省略: Prune も Compact も無効
+- `[compaction]` あり・`compact_threshold` 省略: Prune のみ有効
 
 ---
 
@@ -442,28 +295,32 @@ pub enum Event {
 
 | 判断 | 理由 |
 |------|------|
-| Prune は request context（クローン）を操作 | history 本体を保全。セッションログに完全な履歴が残る |
-| Compact は run 間で実行（mid-loop ではない） | 要約生成は LLM 呼び出しを伴う重い処理。ターンループ内で中断すると複雑性が増す。Prune がループ内のコンテキスト膨張を抑制するので十分 |
-| 要約は UserMessage として挿入 | LLM がコンテキストとして自然に参照できる。system prompt とは分離 |
-| `LogEntry::Compacted` で新 history を記録 | append-only チェーンを破らず、`collect_state` で正しく復元可能 |
-| Compact 失敗は best-effort | データ喪失リスクをゼロにする。失敗しても次回の run 後に再試行可能 |
-| 新しい trait は不要 | 設計原則3: `Hook<PreLlmRequest>` + Controller 制御 + `set_history()` の組み合わせで完結 |
+| ToolOutput を summary + content に | Prune が `content = None` で済む。blob/inspect の複雑さが消える |
+| BlobStore / inspect を削除 | 巨大出力はツール側の責務。フレームワークは summary/content を受け取るだけ |
+| Prune は条件付き（`min_savings`） | KV キャッシュ無効化コスト vs 節約量。Claude Code の `clear_at_least` に倣う |
+| Prune は request context を操作 | history 本体を保全。session log の完全性を維持 |
+| Compact は run 間で実行 | 要約は LLM 呼び出しを伴う。ターンループ内では Prune が対処 |
+| サーキットブレーカー | 連続失敗の無限ループ防止。Claude Code の知見 |
+| 新しい trait は不要 | 設計原則3: Hook + Controller 制御 + set_history() で完結 |
 
 ---
 
 ## 実装順序
 
-1. **`prune.rs`** — llm-worker にアルゴリズムを追加。単体テスト
-2. **`PruneHook`** — pod に Hook 実装。`Pod::add_pre_llm_request_hook` で登録
-3. **`CompactionConfig`** — manifest にセクション追加。パースのテスト
-4. **`LogEntry::Compacted`** — session_log に variant 追加。`collect_state` テスト
-5. **`compact()` 関数** — Controller に compaction ロジック。統合テスト
-6. **Protocol** — `CompactionStart` / `CompactionDone` イベント追加
+1. **ToolOutput 再設計** — enum → struct（summary + content）。Item::ToolResult の変更。単体テスト
+2. **旧モジュール削除** — BlobStore, BlobOutputProcessor, inspect_tool, ToolOutputProcessor, Content, auto_summarize。Worker から output_processor 除去
+3. **`prune.rs`** — 条件付き Prune アルゴリズム。単体テスト
+4. **`PruneHook`** — Pod に Hook 実装
+5. **`CompactionConfig`** — manifest にセクション追加
+6. **`LogEntry::Compacted`** — session_log に variant 追加
+7. **`compact()` 関数** — Controller に compaction ロジック + サーキットブレーカー
+8. **Protocol** — `CompactionStart` / `CompactionDone` イベント追加
 
-Phase 1（ステップ 1-2）と Phase 2 の準備（ステップ 3-4）は並行可能。
+ステップ 1-2 は ToolOutput 移行として独立実行可能。
+ステップ 3-4（Prune）と 5-6（Compact 準備）は並行可能。
 
 ---
 
 ## 依存チケット
 
-- ~~[remove-hook-module.md](remove-hook-module.md)~~ — 完了。`PreLlmRequest` は Pod 層の `hook::Hook<PreLlmRequest>` として利用可能
+- ~~[remove-hook-module.md](remove-hook-module.md)~~ — 完了
