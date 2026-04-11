@@ -123,6 +123,33 @@ impl ToolServerHandle {
             .map_err(|e| ToolServerError::ToolExecution(e.to_string()))
     }
 
+    /// Remove a registered tool by name.
+    ///
+    /// In-flight calls that already obtained an `Arc<dyn Tool>` clone are
+    /// unaffected and will run to completion.
+    pub fn unregister(&self, name: &str) -> Result<(), ToolServerError> {
+        let mut guard = self.tools.lock().unwrap_or_else(|e| e.into_inner());
+        guard
+            .remove(name)
+            .map(|_| ())
+            .ok_or_else(|| ToolServerError::ToolNotFound(name.to_string()))
+    }
+
+    /// Replace an existing tool with a new implementation.
+    ///
+    /// The factory is called immediately and the resulting tool overwrites
+    /// the entry with the same name. Returns `ToolNotFound` if the name
+    /// produced by the factory does not match any registered tool.
+    pub fn replace(&self, factory: WorkerToolDefinition) -> Result<(), ToolServerError> {
+        let (meta, instance) = factory();
+        let mut guard = self.tools.lock().unwrap_or_else(|e| e.into_inner());
+        if !guard.contains_key(&meta.name) {
+            return Err(ToolServerError::ToolNotFound(meta.name));
+        }
+        guard.insert(meta.name.clone(), (meta, instance));
+        Ok(())
+    }
+
     /// Build deterministic tool definitions sorted by tool name.
     pub fn tool_definitions_sorted(&self) -> Vec<LlmToolDefinition> {
         let guard = self.tools.lock().unwrap_or_else(|e| e.into_inner());
@@ -233,5 +260,239 @@ mod tests {
         let handle = ToolServer::new().handle();
         handle.flush_pending();
         handle.flush_pending();
+    }
+
+    #[test]
+    fn unregister_removes_tool() {
+        let handle = ToolServer::new().handle();
+        handle.register_tool(def("alpha"));
+        handle.flush_pending();
+
+        handle.unregister("alpha").expect("unregister");
+        assert!(handle.get_tool("alpha").is_none());
+    }
+
+    #[test]
+    fn unregister_not_found() {
+        let handle = ToolServer::new().handle();
+        let err = handle.unregister("ghost").expect_err("should fail");
+        assert_eq!(err, ToolServerError::ToolNotFound("ghost".to_string()));
+    }
+
+    #[test]
+    fn replace_swaps_implementation() {
+        let handle = ToolServer::new().handle();
+        handle.register_tool(def("alpha"));
+        handle.flush_pending();
+
+        // Replace with a tool that returns a fixed string.
+        struct FixedTool;
+
+        #[async_trait]
+        impl Tool for FixedTool {
+            async fn execute(&self, _input_json: &str) -> Result<String, ToolError> {
+                Ok("replaced".to_string())
+            }
+        }
+
+        let replacement: ToolDefinition = Arc::new(|| {
+            (
+                ToolMeta::new("alpha")
+                    .description("replaced-desc")
+                    .input_schema(json!({"type":"object"})),
+                Arc::new(FixedTool) as Arc<dyn Tool>,
+            )
+        });
+        handle.replace(replacement).expect("replace");
+
+        let (meta, _) = handle.get_tool("alpha").expect("exists");
+        assert_eq!(meta.description, "replaced-desc");
+    }
+
+    #[tokio::test]
+    async fn replace_updates_call_result() {
+        let handle = ToolServer::new().handle();
+        handle.register_tool(def("echo"));
+        handle.flush_pending();
+
+        struct ConstTool;
+
+        #[async_trait]
+        impl Tool for ConstTool {
+            async fn execute(&self, _input_json: &str) -> Result<String, ToolError> {
+                Ok("const".to_string())
+            }
+        }
+
+        let replacement: ToolDefinition = Arc::new(|| {
+            (
+                ToolMeta::new("echo")
+                    .description("const")
+                    .input_schema(json!({"type":"object"})),
+                Arc::new(ConstTool) as Arc<dyn Tool>,
+            )
+        });
+        handle.replace(replacement).expect("replace");
+
+        let out = handle.call_tool("echo", "{}").await.expect("call");
+        assert_eq!(out, "const");
+    }
+
+    #[tokio::test]
+    async fn unregister_during_execution_does_not_affect_inflight() {
+        use tokio::sync::Notify;
+
+        let started = Arc::new(Notify::new());
+        let finish = Arc::new(Notify::new());
+
+        struct GatedTool {
+            started: Arc<Notify>,
+            finish: Arc<Notify>,
+        }
+
+        #[async_trait]
+        impl Tool for GatedTool {
+            async fn execute(&self, _input_json: &str) -> Result<String, ToolError> {
+                self.started.notify_one();
+                self.finish.notified().await;
+                Ok("done".to_string())
+            }
+        }
+
+        let handle = ToolServer::new().handle();
+        let s = Arc::clone(&started);
+        let f = Arc::clone(&finish);
+        handle.register_tool(Arc::new(move || {
+            (
+                ToolMeta::new("slow")
+                    .description("slow")
+                    .input_schema(json!({"type":"object"})),
+                Arc::new(GatedTool {
+                    started: Arc::clone(&s),
+                    finish: Arc::clone(&f),
+                }) as Arc<dyn Tool>,
+            )
+        }));
+        handle.flush_pending();
+
+        let h = handle.clone();
+        let call = tokio::spawn(async move { h.call_tool("slow", "{}").await });
+
+        // Wait until the tool is actually executing.
+        started.notified().await;
+
+        // Unregister while the tool is mid-execution.
+        handle.unregister("slow").expect("unregister");
+        assert!(handle.get_tool("slow").is_none());
+
+        // Let the in-flight call finish.
+        finish.notify_one();
+        let result = call.await.expect("join");
+        assert_eq!(result.expect("call"), "done");
+    }
+
+    #[tokio::test]
+    async fn replace_during_execution_inflight_uses_old_impl() {
+        use tokio::sync::Notify;
+
+        let started = Arc::new(Notify::new());
+        let finish = Arc::new(Notify::new());
+
+        struct OldTool {
+            started: Arc<Notify>,
+            finish: Arc<Notify>,
+        }
+
+        #[async_trait]
+        impl Tool for OldTool {
+            async fn execute(&self, _input_json: &str) -> Result<String, ToolError> {
+                self.started.notify_one();
+                self.finish.notified().await;
+                Ok("old".to_string())
+            }
+        }
+
+        let handle = ToolServer::new().handle();
+        let s = Arc::clone(&started);
+        let f = Arc::clone(&finish);
+        handle.register_tool(Arc::new(move || {
+            (
+                ToolMeta::new("t")
+                    .description("d")
+                    .input_schema(json!({"type":"object"})),
+                Arc::new(OldTool {
+                    started: Arc::clone(&s),
+                    finish: Arc::clone(&f),
+                }) as Arc<dyn Tool>,
+            )
+        }));
+        handle.flush_pending();
+
+        let h = handle.clone();
+        let call = tokio::spawn(async move { h.call_tool("t", "{}").await });
+
+        // Wait until the old tool is mid-execution.
+        started.notified().await;
+
+        // Replace while the old tool is executing.
+        struct NewTool;
+
+        #[async_trait]
+        impl Tool for NewTool {
+            async fn execute(&self, _input_json: &str) -> Result<String, ToolError> {
+                Ok("new".to_string())
+            }
+        }
+
+        handle
+            .replace(Arc::new(|| {
+                (
+                    ToolMeta::new("t")
+                        .description("d")
+                        .input_schema(json!({"type":"object"})),
+                    Arc::new(NewTool) as Arc<dyn Tool>,
+                )
+            }))
+            .expect("replace");
+
+        // Let the old in-flight call finish — it should return "old".
+        finish.notify_one();
+        let result = call.await.expect("join");
+        assert_eq!(result.expect("call"), "old");
+
+        // New calls use the replacement.
+        let out = handle.call_tool("t", "{}").await.expect("call");
+        assert_eq!(out, "new");
+    }
+
+    #[test]
+    fn unregister_reflects_in_tool_definitions() {
+        let handle = ToolServer::new().handle();
+        handle.register_tool(def("alpha"));
+        handle.register_tool(def("beta"));
+        handle.flush_pending();
+
+        handle.unregister("alpha").expect("unregister");
+        let names: Vec<_> = handle
+            .tool_definitions_sorted()
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
+        assert_eq!(names, vec!["beta"]);
+    }
+
+    #[test]
+    fn replace_not_found() {
+        let handle = ToolServer::new().handle();
+        let factory: ToolDefinition = Arc::new(|| {
+            (
+                ToolMeta::new("ghost")
+                    .description("x")
+                    .input_schema(json!({"type":"object"})),
+                Arc::new(EchoTool) as Arc<dyn Tool>,
+            )
+        });
+        let err = handle.replace(factory).expect_err("should fail");
+        assert_eq!(err, ToolServerError::ToolNotFound("ghost".to_string()));
     }
 }

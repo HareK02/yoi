@@ -2,7 +2,7 @@
 - [ ] テスト設計 → [tickets/test-design.md](tickets/test-design.md)
 - [x] ツール出力の遅延読み込み設計 (ToolOutput / BlobStore / auto_summarize)
 - [ ] ツール設計
-  - [ ] ツールの動的追加/削除 → [tickets/tool-dynamic-registry.md](tickets/tool-dynamic-registry.md)
+  - [x] ツールの動的追加/削除 → [tickets/tool-dynamic-registry.md](tickets/tool-dynamic-registry.md)
   - [x] run() 自動ロックとファクトリ遅延初期化 → [tickets/worker-auto-lock.md](tickets/worker-auto-lock.md)
 - [x] inspect ツール実装
 - [x] max_turns: マニフェストによるターン数制限
