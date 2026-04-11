@@ -37,7 +37,10 @@ pub use event_trace::TraceEntry;
 pub use fs_blob_store::FsBlobStore;
 pub use fs_store::FsStore;
 pub use session::{Session, SessionConfig, SessionError};
-pub use session_log::{LogEntry, Outcome, RestoredState, collect_state};
+pub use session_log::{
+    EntryHash, HashedEntry, LogEntry, Outcome, RestoredState, build_chain, collect_state,
+    compute_hash,
+};
 pub use store::{Store, StoreError};
 
 /// Session identifier. UUID v7 (time-ordered, lexicographically sortable).

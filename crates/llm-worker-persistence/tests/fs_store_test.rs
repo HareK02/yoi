@@ -1,6 +1,6 @@
 use llm_worker::llm_client::types::{Item, RequestConfig};
 use llm_worker_persistence::{
-    FsStore, LogEntry, Outcome, Store, TraceEntry, new_session_id, collect_state,
+    FsStore, LogEntry, Outcome, Store, TraceEntry, build_chain, collect_state, new_session_id,
 };
 
 #[tokio::test]
@@ -9,7 +9,7 @@ async fn round_trip_write_and_read() {
     let store = FsStore::new(dir.path()).await.unwrap();
     let id = new_session_id();
 
-    let entries = vec![
+    let raw = vec![
         LogEntry::SessionStart {
             ts: 1000,
             system_prompt: Some("You are helpful.".into()),
@@ -34,6 +34,7 @@ async fn round_trip_write_and_read() {
             interrupted: false,
         },
     ];
+    let entries = build_chain(&raw);
 
     // Write entries one by one
     for entry in &entries {
@@ -44,6 +45,12 @@ async fn round_trip_write_and_read() {
     let read_back = store.read_all(id).await.unwrap();
     assert_eq!(read_back.len(), entries.len());
 
+    // Verify hashes survived round-trip
+    for (orig, read) in entries.iter().zip(read_back.iter()) {
+        assert_eq!(orig.hash, read.hash);
+        assert_eq!(orig.prev_hash, read.prev_hash);
+    }
+
     // Replay and verify state
     let state = collect_state(&read_back);
     assert_eq!(state.system_prompt.as_deref(), Some("You are helpful."));
@@ -51,6 +58,7 @@ async fn round_trip_write_and_read() {
     assert_eq!(state.history.len(), 2);
     assert_eq!(state.turn_count, 1);
     assert!(!state.last_run_interrupted);
+    assert!(state.head_hash.is_some());
 }
 
 #[tokio::test]
@@ -59,14 +67,12 @@ async fn create_session_writes_all_entries() {
     let store = FsStore::new(dir.path()).await.unwrap();
     let id = new_session_id();
 
-    let entries = vec![
-        LogEntry::SessionStart {
-            ts: 1000,
-            system_prompt: None,
-            config: RequestConfig::default(),
-            history: vec![Item::user_message("seed"), Item::assistant_message("ok")],
-        },
-    ];
+    let entries = build_chain(&[LogEntry::SessionStart {
+        ts: 1000,
+        system_prompt: None,
+        config: RequestConfig::default(),
+        history: vec![Item::user_message("seed"), Item::assistant_message("ok")],
+    }]);
 
     store.create_session(id, &entries).await.unwrap();
     let read_back = store.read_all(id).await.unwrap();
@@ -86,15 +92,21 @@ async fn list_sessions_returns_newest_first() {
     tokio::time::sleep(std::time::Duration::from_millis(2)).await;
     let id2 = new_session_id();
 
-    let start = LogEntry::SessionStart {
+    let entries1 = build_chain(&[LogEntry::SessionStart {
         ts: 1000,
         system_prompt: None,
         config: RequestConfig::default(),
         history: vec![],
-    };
+    }]);
+    let entries2 = build_chain(&[LogEntry::SessionStart {
+        ts: 1001,
+        system_prompt: None,
+        config: RequestConfig::default(),
+        history: vec![],
+    }]);
 
-    store.append(id1, &start).await.unwrap();
-    store.append(id2, &start).await.unwrap();
+    store.append(id1, &entries1[0]).await.unwrap();
+    store.append(id2, &entries2[0]).await.unwrap();
 
     let sessions = store.list_sessions().await.unwrap();
     assert_eq!(sessions.len(), 2);
@@ -110,18 +122,13 @@ async fn exists_returns_correct_state() {
 
     assert!(!store.exists(id).await.unwrap());
 
-    store
-        .append(
-            id,
-            &LogEntry::SessionStart {
-                ts: 1000,
-                system_prompt: None,
-                config: RequestConfig::default(),
-                history: vec![],
-            },
-        )
-        .await
-        .unwrap();
+    let entries = build_chain(&[LogEntry::SessionStart {
+        ts: 1000,
+        system_prompt: None,
+        config: RequestConfig::default(),
+        history: vec![],
+    }]);
+    store.append(id, &entries[0]).await.unwrap();
 
     assert!(store.exists(id).await.unwrap());
 }
@@ -143,18 +150,13 @@ async fn trace_entries_in_separate_file() {
     let id = new_session_id();
 
     // Write a log entry
-    store
-        .append(
-            id,
-            &LogEntry::SessionStart {
-                ts: 1000,
-                system_prompt: None,
-                config: RequestConfig::default(),
-                history: vec![],
-            },
-        )
-        .await
-        .unwrap();
+    let entries = build_chain(&[LogEntry::SessionStart {
+        ts: 1000,
+        system_prompt: None,
+        config: RequestConfig::default(),
+        history: vec![],
+    }]);
+    store.append(id, &entries[0]).await.unwrap();
 
     // Write a trace entry
     let trace = TraceEntry {
@@ -173,4 +175,31 @@ async fn trace_entries_in_separate_file() {
     // Trace file should exist separately
     let trace_path = dir.path().join(format!("{id}.trace.jsonl"));
     assert!(trace_path.exists());
+}
+
+#[tokio::test]
+async fn read_head_hash_returns_last_entry_hash() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FsStore::new(dir.path()).await.unwrap();
+    let id = new_session_id();
+
+    let entries = build_chain(&[
+        LogEntry::SessionStart {
+            ts: 1000,
+            system_prompt: None,
+            config: RequestConfig::default(),
+            history: vec![],
+        },
+        LogEntry::UserInput {
+            ts: 2000,
+            item: Item::user_message("Hello"),
+        },
+    ]);
+
+    for entry in &entries {
+        store.append(id, entry).await.unwrap();
+    }
+
+    let head = store.read_head_hash(id).await.unwrap();
+    assert_eq!(head.as_ref(), Some(&entries[1].hash));
 }

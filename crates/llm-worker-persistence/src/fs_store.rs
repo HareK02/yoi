@@ -5,7 +5,7 @@
 //! - Event trace: `{root}/{session_id}.trace.jsonl`
 
 use crate::event_trace::TraceEntry;
-use crate::session_log::LogEntry;
+use crate::session_log::{EntryHash, HashedEntry};
 use crate::store::{Store, StoreError};
 use crate::SessionId;
 use std::path::{Path, PathBuf};
@@ -70,12 +70,12 @@ impl FsStore {
 }
 
 impl Store for FsStore {
-    async fn append(&self, id: SessionId, entry: &LogEntry) -> Result<(), StoreError> {
+    async fn append(&self, id: SessionId, entry: &HashedEntry) -> Result<(), StoreError> {
         let line = serde_json::to_string(entry)?;
         self.append_line(&self.log_path(id), &line).await
     }
 
-    async fn read_all(&self, id: SessionId) -> Result<Vec<LogEntry>, StoreError> {
+    async fn read_all(&self, id: SessionId) -> Result<Vec<HashedEntry>, StoreError> {
         let path = self.log_path(id);
         if !path.exists() {
             return Err(StoreError::NotFound(id));
@@ -106,7 +106,7 @@ impl Store for FsStore {
     async fn create_session(
         &self,
         id: SessionId,
-        entries: &[LogEntry],
+        entries: &[HashedEntry],
     ) -> Result<(), StoreError> {
         let path = self.log_path(id);
         let mut content = String::new();
@@ -120,6 +120,30 @@ impl Store for FsStore {
 
     async fn exists(&self, id: SessionId) -> Result<bool, StoreError> {
         Ok(self.log_path(id).exists())
+    }
+
+    async fn read_head_hash(
+        &self,
+        id: SessionId,
+    ) -> Result<Option<EntryHash>, StoreError> {
+        let path = self.log_path(id);
+        if !path.exists() {
+            return Err(StoreError::NotFound(id));
+        }
+        let content = fs::read_to_string(&path).await?;
+        let last_line = content.lines().rev().find(|l| !l.trim().is_empty());
+        match last_line {
+            Some(line) => {
+                let entry: HashedEntry = serde_json::from_str(line).map_err(|e| {
+                    StoreError::Corrupt {
+                        line: content.lines().count(),
+                        message: e.to_string(),
+                    }
+                })?;
+                Ok(Some(entry.hash))
+            }
+            None => Ok(None),
+        }
     }
 
     async fn append_trace(
