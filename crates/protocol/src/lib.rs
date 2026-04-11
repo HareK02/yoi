@@ -12,6 +12,7 @@ pub enum Method {
     Run { input: String },
     Resume,
     Cancel,
+    GetHistory,
 }
 
 // ---------------------------------------------------------------------------
@@ -62,6 +63,9 @@ pub enum Event {
     Error {
         code: ErrorCode,
         message: String,
+    },
+    History {
+        items: Vec<serde_json::Value>,
     },
 }
 
@@ -136,6 +140,25 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["event"], "run_end");
         assert_eq!(parsed["data"]["result"], "limit_reached");
+    }
+
+    #[test]
+    fn method_get_history() {
+        let json = r#"{"method":"get_history"}"#;
+        let method: Method = serde_json::from_str(json).unwrap();
+        assert!(matches!(method, Method::GetHistory));
+    }
+
+    #[test]
+    fn event_history_format() {
+        let event = Event::History {
+            items: vec![serde_json::json!({"type": "message", "role": "user"})],
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["event"], "history");
+        assert!(parsed["data"]["items"].is_array());
+        assert_eq!(parsed["data"]["items"][0]["role"], "user");
     }
 
     #[test]

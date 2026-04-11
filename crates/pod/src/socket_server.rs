@@ -66,31 +66,44 @@ async fn handle_connection(stream: tokio::net::UnixStream, handle: PodHandle) {
     let mut writer = JsonLineWriter::new(writer);
     let mut rx = handle.subscribe();
 
-    // Event writer: broadcast events → socket
-    let write_task = tokio::spawn(async move {
-        while let Ok(event) = rx.recv().await {
-            if writer.write(&event).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    // Method reader: socket → controller
     loop {
-        match reader.next::<Method>().await {
-            Ok(Some(method)) => {
-                let _ = handle.send(method).await;
+        tokio::select! {
+            // Broadcast events → this client
+            event = rx.recv() => {
+                match event {
+                    Ok(event) => {
+                        if writer.write(&event).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
             }
-            Ok(None) => break,
-            Err(e) => {
-                let _ = handle.send_event(Event::Error {
-                    code: protocol::ErrorCode::Internal,
-                    message: format!("invalid method: {e}"),
-                });
+            // Client methods → handle or forward to controller
+            method = reader.next::<Method>() => {
+                match method {
+                    Ok(Some(Method::GetHistory)) => {
+                        let items = handle.shared_state.history();
+                        let values = items
+                            .iter()
+                            .map(|item| serde_json::to_value(item).expect("Item is Serialize"))
+                            .collect();
+                        if writer.write(&Event::History { items: values }).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(Some(method)) => {
+                        let _ = handle.send(method).await;
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        let _ = handle.send_event(Event::Error {
+                            code: protocol::ErrorCode::Internal,
+                            message: format!("invalid method: {e}"),
+                        });
+                    }
+                }
             }
         }
     }
-
-    // Client disconnected — stop the write task
-    write_task.abort();
 }

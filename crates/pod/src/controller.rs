@@ -231,6 +231,10 @@ impl PodController {
                             message: "Pod is not running".into(),
                         });
                     }
+
+                    // GetHistory is handled at the socket layer (direct response).
+                    // If it somehow reaches the controller, ignore it.
+                    Method::GetHistory => {}
                 }
             }
         });
@@ -286,6 +290,9 @@ where
                             code: ErrorCode::AlreadyRunning,
                             message: "Pod is already executing a turn".into(),
                         });
+                    }
+                    Some(Method::GetHistory) => {
+                        // Handled at socket layer; ignore here.
                     }
                     None => {
                         let _ = cancel_tx.try_send(());

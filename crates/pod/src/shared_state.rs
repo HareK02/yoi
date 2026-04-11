@@ -49,6 +49,10 @@ impl PodSharedState {
         self.status.read().map(|s| *s).unwrap_or(PodStatus::Idle)
     }
 
+    pub fn history(&self) -> Vec<Item> {
+        self.history.read().map(|h| h.clone()).unwrap_or_default()
+    }
+
     pub fn update_history(&self, items: Vec<Item>) {
         if let Ok(mut h) = self.history.write() {
             *h = items;

@@ -135,6 +135,7 @@ impl App {
                 self.push_status(format!("[run end] {result:?}"));
             }
             Event::ToolCallArgsDelta { .. } => {}
+            Event::History { .. } => {}
         }
     }
 
