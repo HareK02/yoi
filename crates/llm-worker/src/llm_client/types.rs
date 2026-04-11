@@ -99,6 +99,20 @@ impl Item {
     // Message constructors
     // ========================================================================
 
+    /// Create a system message item with text content.
+    ///
+    /// System items in history are sent as `role: "system"` on OpenAI,
+    /// and as `role: "user"` on Anthropic/Gemini (which lack a system
+    /// role in conversation items).
+    pub fn system_message(text: impl Into<String>) -> Self {
+        Self::Message {
+            id: None,
+            role: Role::System,
+            content: vec![ContentPart::Text { text: text.into() }],
+            status: None,
+        }
+    }
+
     /// Create a user message item with text content
     pub fn user_message(text: impl Into<String>) -> Self {
         Self::Message {

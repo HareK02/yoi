@@ -302,6 +302,11 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
         &mut self.timeline
     }
 
+    /// Get a reference to the LLM client.
+    pub fn client(&self) -> &C {
+        &self.client
+    }
+
     /// Get a reference to the history
     pub fn history(&self) -> &[Item] {
         &self.history

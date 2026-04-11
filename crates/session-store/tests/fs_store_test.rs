@@ -15,6 +15,8 @@ async fn round_trip_write_and_read() {
             system_prompt: Some("You are helpful.".into()),
             config: RequestConfig::default().with_max_tokens(1024),
             history: vec![],
+            forked_from: None,
+            compacted_from: None,
         },
         LogEntry::UserInput {
             ts: 2000,
@@ -72,6 +74,8 @@ async fn create_session_writes_all_entries() {
         system_prompt: None,
         config: RequestConfig::default(),
         history: vec![Item::user_message("seed"), Item::assistant_message("ok")],
+        forked_from: None,
+        compacted_from: None,
     }]);
 
     store.create_session(id, &entries).await.unwrap();
@@ -97,12 +101,16 @@ async fn list_sessions_returns_newest_first() {
         system_prompt: None,
         config: RequestConfig::default(),
         history: vec![],
+        forked_from: None,
+        compacted_from: None,
     }]);
     let entries2 = build_chain(&[LogEntry::SessionStart {
         ts: 1001,
         system_prompt: None,
         config: RequestConfig::default(),
         history: vec![],
+        forked_from: None,
+        compacted_from: None,
     }]);
 
     store.append(id1, &entries1[0]).await.unwrap();
@@ -127,6 +135,8 @@ async fn exists_returns_correct_state() {
         system_prompt: None,
         config: RequestConfig::default(),
         history: vec![],
+        forked_from: None,
+        compacted_from: None,
     }]);
     store.append(id, &entries[0]).await.unwrap();
 
@@ -155,6 +165,8 @@ async fn trace_entries_in_separate_file() {
         system_prompt: None,
         config: RequestConfig::default(),
         history: vec![],
+        forked_from: None,
+        compacted_from: None,
     }]);
     store.append(id, &entries[0]).await.unwrap();
 
@@ -189,6 +201,8 @@ async fn read_head_hash_returns_last_entry_hash() {
             system_prompt: None,
             config: RequestConfig::default(),
             history: vec![],
+            forked_from: None,
+            compacted_from: None,
         },
         LogEntry::UserInput {
             ts: 2000,

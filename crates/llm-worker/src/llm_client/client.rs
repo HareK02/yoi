@@ -54,6 +54,12 @@ pub trait LlmClient: Send + Sync {
         request: Request,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<Event, ClientError>> + Send>>, ClientError>;
 
+    /// Clone this client into a new `Box<dyn LlmClient>`.
+    ///
+    /// Used when a second client instance is needed (e.g. for context
+    /// compaction) without access to the original construction parameters.
+    fn clone_boxed(&self) -> Box<dyn LlmClient>;
+
     /// 設定をバリデーションし、未サポートの設定があれば警告を返す
     ///
     /// # Arguments
@@ -78,6 +84,10 @@ impl LlmClient for Box<dyn LlmClient> {
         request: Request,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<Event, ClientError>> + Send>>, ClientError> {
         (**self).stream(request).await
+    }
+
+    fn clone_boxed(&self) -> Box<dyn LlmClient> {
+        (**self).clone_boxed()
     }
 
     fn validate_config(&self, config: &RequestConfig) -> Vec<ConfigWarning> {

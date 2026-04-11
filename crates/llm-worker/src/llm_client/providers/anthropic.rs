@@ -13,6 +13,7 @@ use futures::{Stream, StreamExt, TryStreamExt, future::ready};
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
 
 /// Anthropic クライアント
+#[derive(Clone)]
 pub struct AnthropicClient {
     /// HTTPクライアント
     http_client: reqwest::Client,
@@ -86,6 +87,10 @@ impl AnthropicClient {
 
 #[async_trait]
 impl LlmClient for AnthropicClient {
+    fn clone_boxed(&self) -> Box<dyn LlmClient> {
+        Box::new(self.clone())
+    }
+
     async fn stream(
         &self,
         request: Request,

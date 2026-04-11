@@ -320,22 +320,25 @@ pub struct CompactionConfig {
 
 ## 実装順序
 
-1. **ToolOutput 再設計** — enum → struct（summary + content）。Item::ToolResult の変更。単体テスト
-2. **旧モジュール削除** — BlobStore, BlobOutputProcessor, inspect_tool, ToolOutputProcessor, Content, auto_summarize。Worker から output_processor 除去
-3. **`prune.rs`** — 条件付き Prune アルゴリズム。単体テスト
-4. **`PruneHook`** — Pod に Hook 実装
-5. **`CompactionConfig`** — manifest にセクション追加
-6. **`LogEntry` に provenance フィールド追加** — SessionStart に `compacted_from` / `forked_from`
-7. **`compact()` 関数** — Pod に compaction ロジック + サーキットブレーカー
-8. **Protocol** — `CompactionStart` / `CompactionDone` イベント追加
+1. ~~**ToolOutput 再設計**~~ — 実装済み
+2. ~~**旧モジュール削除**~~ — 実装済み
+3. ~~**`prune.rs`**~~ — 実装済み（`crates/llm-worker/src/prune.rs`）
+4. ~~**`PruneHook`**~~ — 実装済み（`crates/pod/src/prune_hook.rs`）
+5. ~~**`CompactionConfig`**~~ — 実装済み（`manifest::CompactionConfig`）
+6. ~~**`LogEntry` に provenance フィールド追加**~~ — 実装済み（`SessionOrigin`, `forked_from`, `compacted_from`）
+7. ~~**`compact()` 関数**~~ — 実装済み（`Pod::compact()`）。サーキットブレーカーは Controller 統合時に追加
+8. **Protocol イベント** — 保留（Controller 統合時に必要に応じて追加）
 
-ステップ 1-2 は ToolOutput 移行として独立実行可能。
-ステップ 3-4（Prune）と 5-6（Compact 準備）は並行可能。
-ステップ 5-8 は session-store-extraction 完了後に実装。
+### 残作業
+
+- Controller への統合: run 完了後に `input_tokens > threshold` をチェックし `pod.compact()` を呼ぶ
+- サーキットブレーカー（consecutive failures カウンタ）
+- Thrash loop 検出（compact 直後に再び閾値超過 → エラー停止）
+- 要約プロンプトの調整（実運用でのチューニング）
 
 ---
 
 ## 依存チケット
 
 - ~~[remove-hook-module.md](remove-hook-module.md)~~ — 完了
-- [session-store-extraction.md](session-store-extraction.md) — ステップ 5-8 の前提
+- ~~[session-store-extraction.md](session-store-extraction.md)~~ — 完了

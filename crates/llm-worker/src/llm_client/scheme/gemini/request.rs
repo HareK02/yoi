@@ -216,9 +216,8 @@ impl GeminiScheme {
                     );
 
                     let gemini_role = match role {
-                        Role::User => "user",
+                        Role::User | Role::System => "user",
                         Role::Assistant => "model",
-                        Role::System => continue, // Skip system role items
                     };
 
                     let parts: Vec<GeminiPart> = content

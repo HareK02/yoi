@@ -101,6 +101,12 @@ pub enum LogEntry {
         system_prompt: Option<String>,
         config: RequestConfig,
         history: Vec<Item>,
+        /// Origin: forked from another session at a specific entry.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        forked_from: Option<SessionOrigin>,
+        /// Origin: compacted from another session at a specific entry.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        compacted_from: Option<SessionOrigin>,
     },
 
     /// User input pushed to history (worker.rs:229).
@@ -135,6 +141,15 @@ pub enum LogEntry {
 
     /// `RequestConfig` changed.
     ConfigChanged { ts: u64, config: RequestConfig },
+}
+
+/// Provenance reference to a parent session.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionOrigin {
+    /// Session ID of the source session.
+    pub session_id: crate::SessionId,
+    /// Hash of the entry in the source session at the point of fork/compact.
+    pub at_hash: EntryHash,
 }
 
 /// Outcome of a run/resume call. Metadata for auditing only.
@@ -269,6 +284,8 @@ mod tests {
             system_prompt: Some("You are helpful.".into()),
             config: RequestConfig::default().with_max_tokens(1024),
             history: vec![Item::user_message("seed")],
+            forked_from: None,
+            compacted_from: None,
         }]);
         let state = collect_state(&entries);
         assert_eq!(state.system_prompt.as_deref(), Some("You are helpful."));
@@ -285,6 +302,8 @@ mod tests {
                 system_prompt: None,
                 config: RequestConfig::default(),
                 history: vec![],
+                forked_from: None,
+                compacted_from: None,
             },
             LogEntry::UserInput {
                 ts: 2000,
@@ -318,6 +337,8 @@ mod tests {
                 system_prompt: None,
                 config: RequestConfig::default(),
                 history: vec![],
+                forked_from: None,
+                compacted_from: None,
             },
             LogEntry::UserInput {
                 ts: 2000,
@@ -354,6 +375,8 @@ mod tests {
                 system_prompt: None,
                 config: RequestConfig::default(),
                 history: vec![Item::user_message("a"), Item::assistant_message("b")],
+                forked_from: None,
+                compacted_from: None,
             },
             LogEntry::Locked {
                 ts: 2000,
@@ -377,6 +400,8 @@ mod tests {
                 system_prompt: None,
                 config: RequestConfig::default(),
                 history: vec![],
+                forked_from: None,
+                compacted_from: None,
             },
             LogEntry::ConfigChanged {
                 ts: 2000,
@@ -395,6 +420,8 @@ mod tests {
                 system_prompt: None,
                 config: RequestConfig::default(),
                 history: vec![],
+                forked_from: None,
+                compacted_from: None,
             },
             LogEntry::UserInput {
                 ts: 2000,
@@ -429,6 +456,8 @@ mod tests {
             system_prompt: None,
             config: RequestConfig::default(),
             history: vec![],
+            forked_from: None,
+            compacted_from: None,
         };
         let hash = compute_hash(None, &entry);
         let hex = hash.to_hex();

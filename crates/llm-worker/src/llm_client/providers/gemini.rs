@@ -13,6 +13,7 @@ use futures::{Stream, StreamExt, TryStreamExt};
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
 
 /// Gemini クライアント
+#[derive(Clone)]
 pub struct GeminiClient {
     /// HTTPクライアント
     http_client: reqwest::Client,
@@ -68,6 +69,10 @@ impl GeminiClient {
 
 #[async_trait]
 impl LlmClient for GeminiClient {
+    fn clone_boxed(&self) -> Box<dyn LlmClient> {
+        Box::new(self.clone())
+    }
+
     async fn stream(
         &self,
         request: Request,

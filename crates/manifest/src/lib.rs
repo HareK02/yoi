@@ -18,6 +18,8 @@ pub struct PodManifest {
     pub worker: WorkerManifest,
     #[serde(default)]
     pub scope: Option<ScopeConfig>,
+    #[serde(default)]
+    pub compaction: Option<CompactionConfig>,
 }
 
 /// Pod metadata.
@@ -81,6 +83,50 @@ pub struct WorkerManifest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScopeConfig {
     pub root: PathBuf,
+}
+
+/// Context compaction configuration.
+///
+/// Controls Prune (content removal from old tool results) and Compact
+/// (full history summarisation). Omitting `[compaction]` disables both.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompactionConfig {
+    /// Number of recent turns protected from pruning.
+    #[serde(default = "default_prune_protected_turns")]
+    pub prune_protected_turns: usize,
+
+    /// Minimum estimated token savings to trigger a prune.
+    #[serde(default = "default_prune_min_savings")]
+    pub prune_min_savings: usize,
+
+    /// When `input_tokens` exceeds this, run compact. `None` = compact disabled.
+    #[serde(default)]
+    pub compact_threshold: Option<u64>,
+
+    /// Number of recent turns retained after compaction.
+    #[serde(default = "default_compact_retained_turns")]
+    pub compact_retained_turns: usize,
+
+    /// Optional provider for the compactor (summary) LLM.
+    /// If omitted, the main provider is cloned via `clone_boxed()`.
+    #[serde(default)]
+    pub provider: Option<ProviderConfig>,
+}
+
+fn default_prune_protected_turns() -> usize { 3 }
+fn default_prune_min_savings() -> usize { 4096 }
+fn default_compact_retained_turns() -> usize { 2 }
+
+impl Default for CompactionConfig {
+    fn default() -> Self {
+        Self {
+            prune_protected_turns: default_prune_protected_turns(),
+            prune_min_savings: default_prune_min_savings(),
+            compact_threshold: None,
+            compact_retained_turns: default_compact_retained_turns(),
+            provider: None,
+        }
+    }
 }
 
 impl PodManifest {
@@ -216,6 +262,71 @@ model = "claude-sonnet-4-20250514"
 max_turns = 0
 "#;
         assert!(PodManifest::from_toml(toml).is_err());
+    }
+
+    #[test]
+    fn parse_compaction_config() {
+        let toml = r#"
+[pod]
+name = "test"
+
+[provider]
+kind = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[worker]
+
+[compaction]
+compact_threshold = 80000
+"#;
+        let manifest = PodManifest::from_toml(toml).unwrap();
+        let c = manifest.compaction.unwrap();
+        assert_eq!(c.prune_protected_turns, 3);
+        assert_eq!(c.prune_min_savings, 4096);
+        assert_eq!(c.compact_threshold, Some(80000));
+        assert_eq!(c.compact_retained_turns, 2);
+    }
+
+    #[test]
+    fn parse_compaction_with_provider() {
+        let toml = r#"
+[pod]
+name = "test"
+
+[provider]
+kind = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[worker]
+
+[compaction]
+compact_threshold = 80000
+
+[compaction.provider]
+kind = "gemini"
+model = "gemini-2.0-flash"
+"#;
+        let manifest = PodManifest::from_toml(toml).unwrap();
+        let c = manifest.compaction.unwrap();
+        let p = c.provider.unwrap();
+        assert_eq!(p.kind, ProviderKind::Gemini);
+        assert_eq!(p.model, "gemini-2.0-flash");
+    }
+
+    #[test]
+    fn omitted_compaction_is_none() {
+        let toml = r#"
+[pod]
+name = "test"
+
+[provider]
+kind = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[worker]
+"#;
+        let manifest = PodManifest::from_toml(toml).unwrap();
+        assert!(manifest.compaction.is_none());
     }
 
     #[test]

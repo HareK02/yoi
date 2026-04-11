@@ -14,6 +14,7 @@ use futures::{Stream, StreamExt, TryStreamExt};
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
 
 /// OpenAI クライアント
+#[derive(Clone)]
 pub struct OpenAIClient {
     /// HTTPクライアント
     http_client: reqwest::Client,
@@ -85,6 +86,10 @@ impl OpenAIClient {
 
 #[async_trait]
 impl LlmClient for OpenAIClient {
+    fn clone_boxed(&self) -> Box<dyn LlmClient> {
+        Box::new(self.clone())
+    }
+
     async fn stream(
         &self,
         request: Request,

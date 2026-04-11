@@ -34,6 +34,10 @@ impl MockClient {
 
 #[async_trait]
 impl LlmClient for MockClient {
+    fn clone_boxed(&self) -> Box<dyn LlmClient> {
+        Box::new(self.clone())
+    }
+
     async fn stream(
         &self,
         _request: Request,

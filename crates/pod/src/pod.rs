@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use llm_worker::Item;
 use llm_worker::llm_client::client::LlmClient;
 use llm_worker::llm_client::RequestConfig;
 use llm_worker::state::Mutable;
@@ -17,6 +18,20 @@ use crate::hook::{
 };
 use crate::hook_interceptor::HookInterceptor;
 
+const SUMMARY_SYSTEM_PROMPT: &str = "\
+You are a context compaction assistant. \
+Summarise the conversation below into a structured summary. \
+Preserve concrete details: file paths, function names, error messages, decisions made. \
+Use the following format:\n\n\
+## Original Task\n\
+(the user's original request)\n\n\
+## Completed Work\n\
+- (what was done, with specifics)\n\n\
+## Key Discoveries\n\
+- (facts, constraints, errors found)\n\n\
+## Current State\n\
+- (files changed, remaining work)";
+
 /// An independent agent execution unit.
 ///
 /// Holds a [`Worker`] directly and persists session state via
@@ -31,6 +46,8 @@ pub struct Pod<C: LlmClient, St: Store> {
     scope: Option<Scope>,
     hook_builder: HookRegistryBuilder,
     interceptor_installed: bool,
+    /// Directory containing the manifest file (needed for api_key_file resolution).
+    manifest_dir: Option<PathBuf>,
 }
 
 impl<C: LlmClient, St: Store> Pod<C, St> {
@@ -56,6 +73,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             scope,
             hook_builder: HookRegistryBuilder::new(),
             interceptor_installed: false,
+            manifest_dir: None,
         })
     }
 
@@ -86,6 +104,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             scope,
             hook_builder: HookRegistryBuilder::new(),
             interceptor_installed: false,
+            manifest_dir: None,
         })
     }
 
@@ -285,6 +304,112 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
 
         Ok(())
     }
+
+    /// Compact the current session by summarising history via a
+    /// disposable Worker, then replacing history with
+    /// `[summary, ...recent_turns]` and creating a new session.
+    ///
+    /// The summary Worker uses:
+    /// - `compaction.provider` from the manifest if configured, or
+    /// - a clone of the main LlmClient via `clone_boxed()`.
+    ///
+    /// Returns the new session ID.
+    pub async fn compact(
+        &mut self,
+        retained_turns: usize,
+    ) -> Result<SessionId, PodError> {
+        let worker = self.worker.as_ref().expect("worker taken during run");
+        let history = worker.history();
+
+        // Identify turn boundaries (user message positions).
+        let turn_starts: Vec<usize> = history
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| item.is_user_message())
+            .map(|(i, _)| i)
+            .collect();
+
+        // Items to retain: everything from `retained_turns` turns ago onward.
+        let retain_from = if turn_starts.len() > retained_turns {
+            turn_starts[turn_starts.len() - retained_turns]
+        } else {
+            0
+        };
+        let retained_items = history[retain_from..].to_vec();
+        let items_to_summarise = &history[..retain_from];
+
+        // Build summary prompt.
+        let summary_prompt = build_summary_prompt(items_to_summarise);
+
+        // Create a disposable summary Worker.
+        let summary_client: Box<dyn LlmClient> = self.build_compactor_client()?;
+        let mut summary_worker = Worker::new(summary_client)
+            .system_prompt(SUMMARY_SYSTEM_PROMPT)
+            .temperature(0.0);
+        summary_worker.set_max_tokens(2048);
+
+        let out = summary_worker.run(summary_prompt).await
+            .map_err(PodError::Worker)?;
+        let summary_text = out.worker
+            .history()
+            .iter()
+            .filter_map(|item| {
+                if item.is_assistant_message() { item.as_text().map(String::from) } else { None }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Build new history: [summary as user message, ...retained].
+        let mut new_history = Vec::with_capacity(retained_items.len() + 1);
+        new_history.push(Item::system_message(format!(
+            "[Compacted context summary]\n\n{summary_text}"
+        )));
+        new_history.extend(retained_items);
+
+        // Persist as a new compacted session.
+        let old_session_id = self.session_id;
+        let old_head_hash = self.head_hash.clone()
+            .expect("head_hash should be set after at least one entry");
+
+        let w = self.worker.as_ref().unwrap();
+        let state = SessionStartState {
+            system_prompt: w.get_system_prompt(),
+            config: w.request_config(),
+            history: &new_history,
+        };
+        let (new_session_id, new_head_hash) = session_store::create_compacted_session(
+            &self.store,
+            state,
+            old_session_id,
+            old_head_hash,
+        )
+        .await?;
+
+        // Swap in the new session state.
+        self.session_id = new_session_id;
+        self.head_hash = Some(new_head_hash);
+        self.worker.as_mut().unwrap().set_history(new_history);
+
+        Ok(new_session_id)
+    }
+
+    /// Build the LlmClient for the compactor Worker.
+    ///
+    /// Uses `compaction.provider` from manifest if set, otherwise clones
+    /// the main client.
+    fn build_compactor_client(&self) -> Result<Box<dyn LlmClient>, PodError> {
+        if let Some(ref compaction) = self.manifest.compaction {
+            if let Some(ref provider_config) = compaction.provider {
+                let client = provider::build_client(
+                    provider_config,
+                    self.manifest_dir.as_deref().map(|p| p.as_ref()),
+                )?;
+                return Ok(client);
+            }
+        }
+        let worker = self.worker.as_ref().expect("worker taken during run");
+        Ok(worker.client().clone_boxed())
+    }
 }
 
 impl<St: Store> Pod<Box<dyn LlmClient>, St> {
@@ -314,8 +439,10 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             scope,
             hook_builder: HookRegistryBuilder::new(),
             interceptor_installed: false,
+            manifest_dir,
         })
     }
+
 }
 
 /// Apply worker-level manifest settings to a Worker.
@@ -353,6 +480,37 @@ impl From<WorkerResult> for PodRunResult {
             WorkerResult::LimitReached => PodRunResult::LimitReached,
         }
     }
+}
+
+/// Format conversation items into a text prompt for the summary Worker.
+fn build_summary_prompt(items: &[Item]) -> String {
+    let mut lines = Vec::new();
+    for item in items {
+        match item {
+            Item::Message { role, content, .. } => {
+                let role_label = match role {
+                    llm_worker::Role::User => "User",
+                    llm_worker::Role::Assistant => "Assistant",
+                    llm_worker::Role::System => "System",
+                };
+                let text: String = content.iter().map(|p| p.as_text()).collect::<Vec<_>>().join("");
+                lines.push(format!("[{role_label}] {text}"));
+            }
+            Item::ToolCall { name, arguments, .. } => {
+                lines.push(format!("[ToolCall] {name}({arguments})"));
+            }
+            Item::ToolResult { summary, content, .. } => {
+                match content {
+                    Some(c) => lines.push(format!("[ToolResult] {summary}\n{c}")),
+                    None => lines.push(format!("[ToolResult] {summary}")),
+                }
+            }
+            Item::Reasoning { text, .. } => {
+                lines.push(format!("[Reasoning] {text}"));
+            }
+        }
+    }
+    lines.join("\n\n")
 }
 
 /// Pod errors.

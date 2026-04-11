@@ -16,6 +16,7 @@ use futures::Stream;
 ///
 /// 内部的にOpenAIClientを使用するラッパー、もしくはOpenAIClientと同様の実装を持つ。
 /// ここではOpenAIClient構成をカスタマイズして提供する。
+#[derive(Clone)]
 pub struct OllamaClient {
     inner: OpenAIClient,
 }
@@ -53,6 +54,10 @@ impl OllamaClient {
 
 #[async_trait]
 impl LlmClient for OllamaClient {
+    fn clone_boxed(&self) -> Box<dyn LlmClient> {
+        Box::new(self.clone())
+    }
+
     async fn stream(
         &self,
         request: Request,

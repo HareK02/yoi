@@ -118,9 +118,8 @@ impl AnthropicScheme {
                     );
 
                     let anthropic_role = match role {
-                        Role::User => "user",
+                        Role::User | Role::System => "user",
                         Role::Assistant => "assistant",
-                        Role::System => continue, // Skip system role items
                     };
 
                     let parts: Vec<AnthropicContentPart> = content
