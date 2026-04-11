@@ -121,8 +121,8 @@ async fn run_loop(
                     }
                 }
             }
-            // Pod events
-            event = client.next_event() => {
+            // Pod events (disabled after disconnect)
+            event = client.next_event(), if app.connected => {
                 match event {
                     Some(ev) => app.handle_pod_event(ev),
                     None => {

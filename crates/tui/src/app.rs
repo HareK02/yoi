@@ -5,6 +5,7 @@ pub struct App {
     pub connected: bool,
     pub messages: Vec<Message>,
     pub current_text: String,
+    pub status_line: String,
     pub input: String,
     pub cursor: usize,
     pub scroll: u16,
@@ -22,7 +23,6 @@ pub enum MessageKind {
     Assistant,
     Tool,
     Error,
-    Status,
 }
 
 impl App {
@@ -32,6 +32,7 @@ impl App {
             connected: false,
             messages: Vec::new(),
             current_text: String::new(),
+            status_line: String::new(),
             input: String::new(),
             cursor: 0,
             scroll: 0,
@@ -57,7 +58,7 @@ impl App {
     pub fn handle_pod_event(&mut self, event: Event) {
         match event {
             Event::TurnStart { turn } => {
-                self.push_status(format!("[turn {turn}] start"));
+                self.status_line = format!("turn {turn}");
             }
             Event::TextDelta { text } => {
                 self.current_text.push_str(&text);
@@ -73,7 +74,6 @@ impl App {
                 }
             }
             Event::TurnEnd { turn, result } => {
-                // Flush any remaining text delta
                 if !self.current_text.is_empty() {
                     let text = std::mem::take(&mut self.current_text);
                     self.messages.push(Message {
@@ -81,9 +81,10 @@ impl App {
                         content: text,
                     });
                 }
-                self.push_status(format!("[turn {turn}] end ({result:?})"));
+                self.status_line = format!("turn {turn} {result:?}");
             }
             Event::ToolCallStart { name, .. } => {
+                self.status_line = format!("tool: {name}");
                 self.messages.push(Message {
                     kind: MessageKind::Tool,
                     content: format!("[tool] {name}"),
@@ -118,11 +119,10 @@ impl App {
                 input_tokens,
                 output_tokens,
             } => {
-                self.push_status(format!(
-                    "[usage] in={} out={}",
-                    input_tokens.unwrap_or(0),
-                    output_tokens.unwrap_or(0),
-                ));
+                let in_t = input_tokens.unwrap_or(0);
+                let out_t = output_tokens.unwrap_or(0);
+                self.status_line
+                    .push_str(&format!(" | in:{in_t} out:{out_t}"));
             }
             Event::Error { code, message } => {
                 self.messages.push(Message {
@@ -132,7 +132,7 @@ impl App {
                 self.scroll_to_bottom();
             }
             Event::RunEnd { result } => {
-                self.push_status(format!("[run end] {result:?}"));
+                self.status_line = format!("{result:?}");
             }
             Event::ToolCallArgsDelta { .. } => {}
             Event::History { items } => {
@@ -268,14 +268,6 @@ impl App {
                 _ => {}
             }
         }
-        self.scroll_to_bottom();
-    }
-
-    fn push_status(&mut self, content: String) {
-        self.messages.push(Message {
-            kind: MessageKind::Status,
-            content,
-        });
         self.scroll_to_bottom();
     }
 
