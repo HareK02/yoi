@@ -74,8 +74,11 @@ pub enum Item {
         id: Option<ItemId>,
         /// Call ID linking to the tool call
         call_id: CallId,
-        /// Output content
-        output: String,
+        /// Short summary (always kept in history, survives pruning)
+        summary: String,
+        /// Detailed output (removed by pruning when old enough)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content: Option<String>,
     },
 
     /// Reasoning/thinking item
@@ -164,12 +167,27 @@ impl Item {
         Self::tool_call(call_id, name, arguments.to_string())
     }
 
-    /// Create a tool result item
-    pub fn tool_result(call_id: impl Into<String>, output: impl Into<String>) -> Self {
+    /// Create a tool result item with summary only (no content).
+    pub fn tool_result(call_id: impl Into<String>, summary: impl Into<String>) -> Self {
         Self::ToolResult {
             id: None,
             call_id: call_id.into(),
-            output: output.into(),
+            summary: summary.into(),
+            content: None,
+        }
+    }
+
+    /// Create a tool result item with summary and content.
+    pub fn tool_result_with_content(
+        call_id: impl Into<String>,
+        summary: impl Into<String>,
+        content: impl Into<String>,
+    ) -> Self {
+        Self::ToolResult {
+            id: None,
+            call_id: call_id.into(),
+            summary: summary.into(),
+            content: Some(content.into()),
         }
     }
 

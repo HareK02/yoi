@@ -292,9 +292,9 @@ impl Interceptor for ToolResultPrinterPolicy {
             .unwrap_or_else(|| info.result.tool_use_id.clone());
 
         if info.result.is_error {
-            println!("   Result ({}): ❌ {}", name, info.result.content);
+            println!("   Result ({}): ❌ {}", name, info.result.summary);
         } else {
-            println!("   Result ({}): ✅ {}", name, info.result.content);
+            println!("   Result ({}): ✅ {}", name, info.result.summary);
         }
 
         PostToolAction::Continue

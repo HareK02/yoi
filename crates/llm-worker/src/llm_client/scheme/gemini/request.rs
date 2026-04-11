@@ -258,7 +258,7 @@ impl GeminiScheme {
                 }
 
                 Item::ToolResult {
-                    call_id, output, ..
+                    call_id, summary, content, ..
                 } => {
                     // Flush pending model parts first
                     if !pending_model_parts.is_empty() {
@@ -268,12 +268,16 @@ impl GeminiScheme {
                         });
                     }
 
+                    let text = match content {
+                        Some(c) => format!("{summary}\n{c}"),
+                        None => summary.clone(),
+                    };
                     pending_user_parts.push(GeminiPart::FunctionResponse {
                         function_response: GeminiFunctionResponse {
                             name: call_id.clone(),
                             response: GeminiFunctionResponseContent {
                                 name: call_id.clone(),
-                                content: Value::String(output.clone()),
+                                content: Value::String(text),
                             },
                         },
                     });

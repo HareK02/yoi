@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use llm_worker::Worker;
 use llm_worker::llm_client::event::{Event, ResponseStatus, StatusEvent};
 use llm_worker::interceptor::{Interceptor, PostToolAction, PreToolAction, ToolCallInfo, ToolResultInfo};
-use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta};
+use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 
 mod common;
 use common::MockLlmClient;
@@ -57,10 +57,10 @@ impl SlowTool {
 
 #[async_trait]
 impl Tool for SlowTool {
-    async fn execute(&self, _input_json: &str) -> Result<String, ToolError> {
+    async fn execute(&self, _input_json: &str) -> Result<ToolOutput, ToolError> {
         self.call_count.fetch_add(1, Ordering::SeqCst);
         tokio::time::sleep(Duration::from_millis(self.delay_ms)).await;
-        Ok(format!("Completed after {}ms", self.delay_ms))
+        Ok(format!("Completed after {}ms", self.delay_ms).into())
     }
 }
 
@@ -218,8 +218,8 @@ async fn test_post_tool_call_modification() {
 
     #[async_trait]
     impl Tool for SimpleTool {
-        async fn execute(&self, _: &str) -> Result<String, ToolError> {
-            Ok("Original Result".to_string())
+        async fn execute(&self, _: &str) -> Result<ToolOutput, ToolError> {
+            Ok("Original Result".to_string().into())
         }
     }
 
@@ -242,8 +242,8 @@ async fn test_post_tool_call_modification() {
     #[async_trait]
     impl Interceptor for ModifyingPolicy {
         async fn post_tool_call(&self, info: &mut ToolResultInfo) -> PostToolAction {
-            info.result.content = format!("[Modified] {}", info.result.content);
-            *self.modified_content.lock().unwrap() = Some(info.result.content.clone());
+            info.result.summary = format!("[Modified] {}", info.result.summary);
+            *self.modified_content.lock().unwrap() = Some(info.result.summary.clone());
             PostToolAction::Continue
         }
     }

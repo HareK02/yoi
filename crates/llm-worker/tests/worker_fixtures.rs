@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use async_trait::async_trait;
 use common::MockLlmClient;
 use llm_worker::Worker;
-use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta};
+use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 
 /// Fixture directory path
 fn fixtures_dir() -> std::path::PathBuf {
@@ -58,7 +58,7 @@ impl MockWeatherTool {
 
 #[async_trait]
 impl Tool for MockWeatherTool {
-    async fn execute(&self, input_json: &str) -> Result<String, ToolError> {
+    async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError> {
         self.call_count.fetch_add(1, Ordering::SeqCst);
 
         // Parse input
@@ -68,7 +68,7 @@ impl Tool for MockWeatherTool {
         let city = input["city"].as_str().unwrap_or("Unknown");
 
         // Return mock response
-        Ok(format!("Weather in {}: Sunny, 22°C", city))
+        Ok(format!("Weather in {}: Sunny, 22°C", city).into())
     }
 }
 

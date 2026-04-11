@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::marker::PhantomData;
-use std::sync::Arc;
 
 use futures::StreamExt;
 use tokio::sync::mpsc;
@@ -21,7 +20,7 @@ use crate::{
     handler::{ErrorKind, StatusKind, ToolUseBlockStart, UsageKind},
     timeline::{TextBlockCollector, Timeline, ToolCallCollector},
     timeline::event::{ErrorEvent, StatusEvent, UsageEvent},
-    tool::{ToolCall, ToolDefinition as WorkerToolDefinition, ToolError, ToolOutputProcessor, ToolResult},
+    tool::{ToolCall, ToolDefinition as WorkerToolDefinition, ToolError, ToolResult},
     tool_server::{ToolServer, ToolServerHandle},
 };
 
@@ -154,8 +153,6 @@ pub struct Worker<C: LlmClient, S: WorkerState = Mutable> {
     request_config: RequestConfig,
     /// Whether the previous run was interrupted
     last_run_interrupted: bool,
-    /// Optional processor for large tool outputs (stores externally, returns summary)
-    output_processor: Option<Arc<dyn ToolOutputProcessor>>,
     /// Cancel notification channel (for interrupting execution)
     cancel_tx: mpsc::Sender<()>,
     cancel_rx: mpsc::Receiver<()>,
@@ -610,7 +607,7 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
                 async move {
                     let input_json = serde_json::to_string(&tool_call.input).unwrap_or_default();
                     match tool_server.call_tool(&tool_call.name, &input_json).await {
-                        Ok(content) => ToolResult::success(&tool_call.id, content),
+                        Ok(output) => ToolResult::from_output(&tool_call.id, output),
                         Err(e) => ToolResult::error(&tool_call.id, e.to_string()),
                     }
                 }
@@ -629,20 +626,6 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
                 return Err(WorkerError::Cancelled);
             }
         };
-
-        // Phase 2.5: Apply output processor (store large results externally)
-        if let Some(ref processor) = self.output_processor {
-            for tool_result in &mut results {
-                if !tool_result.is_error {
-                    match processor.process(tool_result.content.clone()).await {
-                        Ok(processed) => tool_result.content = processed,
-                        Err(e) => {
-                            warn!(error = %e, "Output processor failed, keeping original content");
-                        }
-                    }
-                }
-            }
-        }
 
         // Phase 3: Apply post_tool_call interceptor
         for tool_result in &mut results {
@@ -835,8 +818,18 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
             }
             Ok(ToolExecutionResult::Completed(results)) => {
                 for result in results {
-                    self.history
-                        .push(Item::tool_result(&result.tool_use_id, &result.content));
+                    if let Some(ref content) = result.content {
+                        self.history.push(Item::tool_result_with_content(
+                            &result.tool_use_id,
+                            &result.summary,
+                            content,
+                        ));
+                    } else {
+                        self.history.push(Item::tool_result(
+                            &result.tool_use_id,
+                            &result.summary,
+                        ));
+                    }
                 }
                 Ok(None)
             }
@@ -878,7 +871,6 @@ impl<C: LlmClient> Worker<C, Mutable> {
             turn_end_cbs: Vec::new(),
             request_config: RequestConfig::default(),
             last_run_interrupted: false,
-            output_processor: None,
             cancel_tx,
             cancel_rx,
             _state: PhantomData,
@@ -1063,14 +1055,6 @@ impl<C: LlmClient> Worker<C, Mutable> {
         self.last_run_interrupted = interrupted;
     }
 
-    /// Set a tool output processor for handling large tool results.
-    ///
-    /// When set, tool execution results are passed through this processor
-    /// before being placed into conversation history.
-    pub fn set_output_processor(&mut self, processor: Arc<dyn ToolOutputProcessor>) {
-        self.output_processor = Some(processor);
-    }
-
     /// Apply configuration (reserved for future extensions)
     #[allow(dead_code)]
     pub fn config(self, _config: WorkerConfig) -> Self {
@@ -1134,7 +1118,7 @@ impl<C: LlmClient> Worker<C, Mutable> {
             turn_end_cbs: self.turn_end_cbs,
             request_config: self.request_config,
             last_run_interrupted: self.last_run_interrupted,
-            output_processor: self.output_processor,
+
             cancel_tx: self.cancel_tx,
             cancel_rx: self.cancel_rx,
             _state: PhantomData,
@@ -1204,7 +1188,7 @@ impl<C: LlmClient> Worker<C, Locked> {
             turn_end_cbs: self.turn_end_cbs,
             request_config: self.request_config,
             last_run_interrupted: self.last_run_interrupted,
-            output_processor: self.output_processor,
+
             cancel_tx: self.cancel_tx,
             cancel_rx: self.cancel_rx,
             _state: PhantomData,

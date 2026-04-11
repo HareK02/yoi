@@ -25,199 +25,50 @@ pub enum ToolError {
 }
 
 // =============================================================================
-// ToolOutput - Tool execution result with size-aware storage
+// ToolOutput - Tool execution result with summary + content
 // =============================================================================
 
-/// Tool output size threshold in bytes.
-/// Results larger than this are automatically promoted to `Stored`.
-pub const INLINE_THRESHOLD: usize = 800;
-
-/// Maximum size of auto-generated summaries in bytes.
-pub const SUMMARY_MAX_BYTES: usize = 400;
-
-/// Number of lines to include from the head of text content in summaries.
-pub const SUMMARY_HEAD_LINES: usize = 5;
-
-/// Number of lines to include from the tail of text content in summaries.
-pub const SUMMARY_TAIL_LINES: usize = 3;
+/// Threshold below which tool output is treated as summary-only (no content).
+/// Outputs this small don't benefit from pruning.
+pub const SUMMARY_THRESHOLD: usize = 200;
 
 /// Tool execution result.
 ///
-/// Small results are kept inline in conversation history.
-/// Large results are stored externally via `BlobStore`, with only
-/// a summary placed in the history. The LLM can retrieve details
-/// using the built-in `inspect` tool.
-#[derive(Debug, Clone)]
-pub enum ToolOutput {
-    /// Small result: placed directly into history as-is.
-    Inline(String),
-    /// Large result: summary goes into history, full content is stored externally.
-    Stored {
-        /// Concise summary shown to the LLM in conversation context.
-        summary: String,
-        /// Full content to be persisted in a BlobStore.
-        content: Content,
-    },
-}
-
-impl ToolOutput {
-    /// Get the string that should be placed into conversation history.
-    pub fn history_text(&self) -> &str {
-        match self {
-            ToolOutput::Inline(s) => s,
-            ToolOutput::Stored { summary, .. } => summary,
-        }
-    }
-
-    /// Whether this output requires external storage.
-    pub fn is_stored(&self) -> bool {
-        matches!(self, ToolOutput::Stored { .. })
-    }
-}
-
-/// Content to be stored in a BlobStore.
+/// Every output has a mandatory `summary` (1-2 lines) that persists in
+/// conversation history even after pruning. The optional `content` carries
+/// full details and is removed by the Prune mechanism when the context
+/// grows too large.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", content = "data")]
-pub enum Content {
-    /// Plain text (file contents, search results, logs, etc.)
-    Text(String),
-    /// Structured JSON data (API responses, query results, etc.)
-    Structured(Value),
+pub struct ToolOutput {
+    /// Short summary (1-2 lines). Always remains in history.
+    pub summary: String,
+    /// Detailed output. Removed by Prune when old enough.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
 }
 
 impl From<String> for ToolOutput {
     fn from(s: String) -> Self {
-        if s.len() <= INLINE_THRESHOLD {
-            ToolOutput::Inline(s)
+        if s.len() <= SUMMARY_THRESHOLD {
+            ToolOutput {
+                summary: s,
+                content: None,
+            }
         } else {
-            let summary = auto_summarize_text(&s);
-            ToolOutput::Stored {
-                summary,
-                content: Content::Text(s),
-            }
-        }
-    }
-}
-
-/// Generate a summary for any [`Content`] variant.
-///
-/// The blob ID prefix (`[blob:<id>]`) is NOT included here — it is
-/// prepended by the Worker after the content is stored and an ID is assigned.
-pub fn auto_summarize(content: &Content) -> String {
-    match content {
-        Content::Text(text) => auto_summarize_text(text),
-        Content::Structured(value) => auto_summarize_structured(value),
-    }
-}
-
-/// Generate a summary for plain text content.
-fn auto_summarize_text(text: &str) -> String {
-    let lines: Vec<&str> = text.lines().collect();
-    let total = lines.len();
-
-    let mut summary = format!("text | {total} lines\n");
-
-    // Head
-    summary.push_str("── head ──\n");
-    for line in lines.iter().take(SUMMARY_HEAD_LINES) {
-        summary.push_str(line);
-        summary.push('\n');
-    }
-
-    // Tail (only if there's content beyond head)
-    if total > SUMMARY_HEAD_LINES + SUMMARY_TAIL_LINES {
-        summary.push_str("── tail ──\n");
-        let tail_start = total.saturating_sub(SUMMARY_TAIL_LINES);
-        for line in &lines[tail_start..] {
-            summary.push_str(line);
-            summary.push('\n');
-        }
-    }
-
-    // Truncate if summary itself is too large
-    if summary.len() > SUMMARY_MAX_BYTES {
-        summary.truncate(SUMMARY_MAX_BYTES);
-        summary.push_str("…\n");
-    }
-
-    summary
-}
-
-/// Generate a summary for structured JSON content.
-fn auto_summarize_structured(value: &Value) -> String {
-    let mut summary = match value {
-        Value::Array(arr) => {
-            let mut s = format!("json_array | {} entries\n", arr.len());
-            // Show schema from first element
-            if let Some(first) = arr.first() {
-                s.push_str("── schema ──\n");
-                s.push_str(&describe_value_shape(first));
-                s.push('\n');
-            }
-            // Show first 2 entries
-            s.push_str("── head ──\n");
-            for item in arr.iter().take(2) {
-                if let Ok(json) = serde_json::to_string(item) {
-                    s.push_str(&json);
-                    s.push('\n');
-                }
-            }
-            s
-        }
-        Value::Object(map) => {
-            let mut s = format!("json_object | {} keys\n", map.len());
-            s.push_str("── keys ──\n");
-            for (key, val) in map.iter() {
-                s.push_str(&format!("{key}: {}\n", value_type_label(val)));
-            }
-            s
-        }
-        _ => {
-            // Scalar or other — just show the JSON
-            format!(
-                "json | {}\n",
-                serde_json::to_string(value).unwrap_or_default()
-            )
-        }
-    };
-
-    if summary.len() > SUMMARY_MAX_BYTES {
-        summary.truncate(SUMMARY_MAX_BYTES);
-        summary.push_str("…\n");
-    }
-
-    summary
-}
-
-/// Describe the shape of a JSON value (for schema preview).
-fn describe_value_shape(value: &Value) -> String {
-    match value {
-        Value::Object(map) => {
-            let fields: Vec<String> = map
-                .iter()
-                .map(|(k, v)| format!("{k}: {}", value_type_label(v)))
+            let lines = s.lines().count();
+            let first_line: String = s
+                .lines()
+                .next()
+                .unwrap_or("")
+                .chars()
+                .take(80)
                 .collect();
-            format!("{{ {} }}", fields.join(", "))
-        }
-        _ => value_type_label(value),
-    }
-}
-
-/// Human-readable type label for a JSON value.
-fn value_type_label(value: &Value) -> String {
-    match value {
-        Value::Null => "null".to_string(),
-        Value::Bool(_) => "bool".to_string(),
-        Value::Number(_) => "number".to_string(),
-        Value::String(s) => {
-            if s.len() > 50 {
-                format!("string({})", s.len())
-            } else {
-                "string".to_string()
+            let summary = format!("{lines} lines | {first_line}…");
+            ToolOutput {
+                summary,
+                content: Some(s),
             }
         }
-        Value::Array(arr) => format!("array({})", arr.len()),
-        Value::Object(map) => format!("object({})", map.len()),
     }
 }
 
@@ -341,34 +192,15 @@ pub type ToolDefinition = Arc<dyn Fn() -> (ToolMeta, Arc<dyn Tool>) + Send + Syn
 /// ```
 #[async_trait]
 pub trait Tool: Send + Sync {
-    /// Execute the tool
+    /// Execute the tool.
     ///
     /// # Arguments
     /// * `input_json` - JSON-formatted arguments generated by LLM
     ///
     /// # Returns
-    /// Result string from execution. This content is returned to LLM.
-    async fn execute(&self, input_json: &str) -> Result<String, ToolError>;
-}
-
-// =============================================================================
-// ToolOutputProcessor - Output storage abstraction
-// =============================================================================
-
-/// Processes tool output before it enters conversation history.
-///
-/// When a tool produces a large result, the processor can store the
-/// full content externally and return a summary string for the history.
-///
-/// If no processor is set on Worker, all tool outputs are used as-is (inline).
-#[async_trait]
-pub trait ToolOutputProcessor: Send + Sync {
-    /// Process a tool's raw output string.
-    ///
-    /// Returns the string that should be placed into conversation history.
-    /// For small outputs, this may be the original string unchanged.
-    /// For large outputs, this should be a summary with a blob reference.
-    async fn process(&self, output: String) -> Result<String, ToolError>;
+    /// A [`ToolOutput`] with summary and optional detailed content.
+    /// For simple cases, use `From<String>`: `Ok("done".to_string().into())`
+    async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError>;
 }
 
 // =============================================================================
@@ -390,33 +222,39 @@ pub struct ToolCall {
 
 /// Tool execution result
 ///
-/// Represents the result after tool execution.
+/// Intermediate representation between tool execution and history.
+/// Carries `summary` + optional `content` from [`ToolOutput`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolResult {
     /// Corresponding tool call ID
     pub tool_use_id: String,
-    /// Result content
-    pub content: String,
+    /// Short summary (always kept in history)
+    pub summary: String,
+    /// Detailed output (prunable)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
     /// Whether this is an error
     #[serde(default)]
     pub is_error: bool,
 }
 
 impl ToolResult {
-    /// Create a success result
-    pub fn success(tool_use_id: impl Into<String>, content: impl Into<String>) -> Self {
+    /// Create a success result from a [`ToolOutput`].
+    pub fn from_output(tool_use_id: impl Into<String>, output: ToolOutput) -> Self {
         Self {
             tool_use_id: tool_use_id.into(),
-            content: content.into(),
+            summary: output.summary,
+            content: output.content,
             is_error: false,
         }
     }
 
-    /// Create an error result
-    pub fn error(tool_use_id: impl Into<String>, content: impl Into<String>) -> Self {
+    /// Create an error result.
+    pub fn error(tool_use_id: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             tool_use_id: tool_use_id.into(),
-            content: content.into(),
+            summary: message.into(),
+            content: None,
             is_error: true,
         }
     }

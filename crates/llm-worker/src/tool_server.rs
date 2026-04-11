@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
 use crate::llm_client::ToolDefinition as LlmToolDefinition;
-use crate::tool::{Tool, ToolDefinition as WorkerToolDefinition, ToolMeta};
+use crate::tool::{Tool, ToolDefinition as WorkerToolDefinition, ToolMeta, ToolOutput};
 
 type ToolMap = HashMap<String, (ToolMeta, Arc<dyn Tool>)>;
 
@@ -110,7 +110,7 @@ impl ToolServerHandle {
     }
 
     /// Execute a tool by name.
-    pub async fn call_tool(&self, name: &str, input_json: &str) -> Result<String, ToolServerError> {
+    pub async fn call_tool(&self, name: &str, input_json: &str) -> Result<ToolOutput, ToolServerError> {
         let tool = {
             let guard = self.tools.lock().unwrap_or_else(|e| e.into_inner());
             let (_, tool) = guard
@@ -180,8 +180,8 @@ mod tests {
 
     #[async_trait]
     impl Tool for EchoTool {
-        async fn execute(&self, input_json: &str) -> Result<String, ToolError> {
-            Ok(input_json.to_string())
+        async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError> {
+            Ok(input_json.to_string().into())
         }
     }
 
@@ -230,7 +230,8 @@ mod tests {
         handle.flush_pending();
 
         let out = handle.call_tool("echo", r#"{"x":1}"#).await.expect("call");
-        assert_eq!(out, r#"{"x":1}"#);
+        assert_eq!(out.summary, r#"{"x":1}"#);
+        assert!(out.content.is_none());
 
         let err = handle
             .call_tool("missing", "{}")
@@ -290,8 +291,8 @@ mod tests {
 
         #[async_trait]
         impl Tool for FixedTool {
-            async fn execute(&self, _input_json: &str) -> Result<String, ToolError> {
-                Ok("replaced".to_string())
+            async fn execute(&self, _input_json: &str) -> Result<ToolOutput, ToolError> {
+                Ok("replaced".to_string().into())
             }
         }
 
@@ -319,8 +320,8 @@ mod tests {
 
         #[async_trait]
         impl Tool for ConstTool {
-            async fn execute(&self, _input_json: &str) -> Result<String, ToolError> {
-                Ok("const".to_string())
+            async fn execute(&self, _input_json: &str) -> Result<ToolOutput, ToolError> {
+                Ok("const".to_string().into())
             }
         }
 
@@ -335,7 +336,7 @@ mod tests {
         handle.replace(replacement).expect("replace");
 
         let out = handle.call_tool("echo", "{}").await.expect("call");
-        assert_eq!(out, "const");
+        assert_eq!(out.summary, "const");
     }
 
     #[tokio::test]
@@ -352,10 +353,10 @@ mod tests {
 
         #[async_trait]
         impl Tool for GatedTool {
-            async fn execute(&self, _input_json: &str) -> Result<String, ToolError> {
+            async fn execute(&self, _input_json: &str) -> Result<ToolOutput, ToolError> {
                 self.started.notify_one();
                 self.finish.notified().await;
-                Ok("done".to_string())
+                Ok("done".to_string().into())
             }
         }
 
@@ -388,7 +389,7 @@ mod tests {
         // Let the in-flight call finish.
         finish.notify_one();
         let result = call.await.expect("join");
-        assert_eq!(result.expect("call"), "done");
+        assert_eq!(result.expect("call").summary, "done");
     }
 
     #[tokio::test]
@@ -405,10 +406,10 @@ mod tests {
 
         #[async_trait]
         impl Tool for OldTool {
-            async fn execute(&self, _input_json: &str) -> Result<String, ToolError> {
+            async fn execute(&self, _input_json: &str) -> Result<ToolOutput, ToolError> {
                 self.started.notify_one();
                 self.finish.notified().await;
-                Ok("old".to_string())
+                Ok("old".to_string().into())
             }
         }
 
@@ -439,8 +440,8 @@ mod tests {
 
         #[async_trait]
         impl Tool for NewTool {
-            async fn execute(&self, _input_json: &str) -> Result<String, ToolError> {
-                Ok("new".to_string())
+            async fn execute(&self, _input_json: &str) -> Result<ToolOutput, ToolError> {
+                Ok("new".to_string().into())
             }
         }
 
@@ -458,11 +459,11 @@ mod tests {
         // Let the old in-flight call finish — it should return "old".
         finish.notify_one();
         let result = call.await.expect("join");
-        assert_eq!(result.expect("call"), "old");
+        assert_eq!(result.expect("call").summary, "old");
 
         // New calls use the replacement.
         let out = handle.call_tool("t", "{}").await.expect("call");
-        assert_eq!(out, "new");
+        assert_eq!(out.summary, "new");
     }
 
     #[test]

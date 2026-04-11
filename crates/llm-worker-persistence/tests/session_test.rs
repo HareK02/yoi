@@ -7,7 +7,7 @@ use common::MockLlmClient;
 use llm_worker::interceptor::{Interceptor, TurnEndAction};
 use llm_worker::llm_client::event::{Event, ResponseStatus, StatusEvent};
 use llm_worker::llm_client::types::{Item, RequestConfig};
-use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta};
+use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use llm_worker::Worker;
 use llm_worker_persistence::{
     FsStore, LogEntry, Outcome, Session, SessionConfig, Store, collect_state,
@@ -56,8 +56,8 @@ struct MockWeatherTool;
 
 #[async_trait]
 impl Tool for MockWeatherTool {
-    async fn execute(&self, _input_json: &str) -> Result<String, ToolError> {
-        Ok("Sunny, 25C".to_string())
+    async fn execute(&self, _input_json: &str) -> Result<ToolOutput, ToolError> {
+        Ok("Sunny, 25C".to_string().into())
     }
 }
 

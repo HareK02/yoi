@@ -17,7 +17,7 @@ Insomnia では2層（条件付き Prune + Compact）で対処する。
 Prune の設計は ToolOutput の構造に依存する。
 現行の Inline/Stored enum を **summary + content** の2フィールド構造に改める。
 
-詳細: [crates/llm-worker/docs/tool-output-design.md](../crates/llm-worker/docs/tool-output-design.md)
+詳細: ~~[tool-output-design.md](tool-output-design.md)~~ — **実装済み**
 
 ### 構造
 

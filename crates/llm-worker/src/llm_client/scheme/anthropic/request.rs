@@ -183,7 +183,7 @@ impl AnthropicScheme {
                 }
 
                 Item::ToolResult {
-                    call_id, output, ..
+                    call_id, summary, content, ..
                 } => {
                     // Flush pending assistant parts first
                     if !pending_assistant_parts.is_empty() {
@@ -195,9 +195,13 @@ impl AnthropicScheme {
                         });
                     }
 
+                    let text = match content {
+                        Some(c) => format!("{summary}\n{c}"),
+                        None => summary.clone(),
+                    };
                     pending_user_parts.push(AnthropicContentPart::ToolResult {
                         tool_use_id: call_id.clone(),
-                        content: output.clone(),
+                        content: text,
                     });
                 }
 

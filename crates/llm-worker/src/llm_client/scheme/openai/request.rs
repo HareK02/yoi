@@ -212,7 +212,7 @@ impl OpenAIScheme {
                 }
 
                 Item::ToolResult {
-                    call_id, output, ..
+                    call_id, summary, content, ..
                 } => {
                     // Flush pending tool calls before tool result
                     self.flush_pending_assistant(
@@ -221,9 +221,13 @@ impl OpenAIScheme {
                         &mut pending_assistant_text,
                     );
 
+                    let text = match content {
+                        Some(c) => format!("{summary}\n{c}"),
+                        None => summary.clone(),
+                    };
                     messages.push(OpenAIMessage {
                         role: "tool".to_string(),
-                        content: Some(OpenAIContent::Text(output.clone())),
+                        content: Some(OpenAIContent::Text(text)),
                         tool_calls: vec![],
                         tool_call_id: Some(call_id.clone()),
                         name: None,

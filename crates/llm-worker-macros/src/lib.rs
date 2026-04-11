@@ -192,13 +192,13 @@ fn generate_tool_impl(self_ty: &Type, method: &syn::ImplItemFn) -> proc_macro2::
     let result_handling = if is_result_type(&sig.output) {
         quote! {
             match result {
-                Ok(val) => Ok(format!("{:?}", val)),
+                Ok(val) => Ok(format!("{:?}", val).into()),
                 Err(e) => Err(::llm_worker::tool::ToolError::ExecutionFailed(format!("{}", e))),
             }
         }
     } else {
         quote! {
-            Ok(format!("{:?}", result))
+            Ok(format!("{:?}", result).into())
         }
     };
 
@@ -247,7 +247,7 @@ fn generate_tool_impl(self_ty: &Type, method: &syn::ImplItemFn) -> proc_macro2::
 
         #[async_trait::async_trait]
         impl ::llm_worker::tool::Tool for #tool_struct_name {
-            async fn execute(&self, input_json: &str) -> Result<String, ::llm_worker::tool::ToolError> {
+            async fn execute(&self, input_json: &str) -> Result<::llm_worker::tool::ToolOutput, ::llm_worker::tool::ToolError> {
                 #execute_body
             }
         }

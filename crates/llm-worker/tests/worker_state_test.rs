@@ -13,7 +13,7 @@ use common::MockLlmClient;
 use llm_worker::Item;
 use llm_worker::{Worker, WorkerError};
 use llm_worker::llm_client::event::{Event, ResponseStatus, StatusEvent};
-use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta};
+use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 
 // =============================================================================
 // Mutable State Tests
@@ -134,9 +134,9 @@ impl CountingTool {
 
 #[async_trait]
 impl Tool for CountingTool {
-    async fn execute(&self, _input_json: &str) -> Result<String, ToolError> {
+    async fn execute(&self, _input_json: &str) -> Result<ToolOutput, ToolError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        Ok(format!("{}-ok", self.name))
+        Ok(format!("{}-ok", self.name).into())
     }
 }
 

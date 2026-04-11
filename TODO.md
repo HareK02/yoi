@@ -1,6 +1,7 @@
 - [x] 永続化データ構造の制定
 - [ ] テスト設計 → [tickets/test-design.md](tickets/test-design.md)
 - [x] ツール出力の遅延読み込み設計 (ToolOutput / BlobStore / auto_summarize)
+- [x] ToolOutput 再設計: summary + content 構造化、BlobStore/inspect 削除 → [tickets/tool-output-design.md](tickets/tool-output-design.md)
 - [ ] ツール設計
   - [x] ツールの動的追加/削除 → [tickets/tool-dynamic-registry.md](tickets/tool-dynamic-registry.md)
   - [x] run() 自動ロックとファクトリ遅延初期化 → [tickets/worker-auto-lock.md](tickets/worker-auto-lock.md)

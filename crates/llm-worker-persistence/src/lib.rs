@@ -20,21 +20,13 @@
 //! session.run("Hello!").await?;
 //! ```
 
-pub mod blob_output_processor;
-pub mod blob_store;
 pub mod event_trace;
-pub mod fs_blob_store;
 pub mod fs_store;
-pub mod inspect_tool;
 pub mod session;
 pub mod session_log;
 pub mod store;
 
-pub use blob_output_processor::BlobOutputProcessor;
-pub use blob_store::{BlobId, BlobStore, BlobStoreError};
-pub use inspect_tool::{InspectTool, register_inspect_tool};
 pub use event_trace::TraceEntry;
-pub use fs_blob_store::FsBlobStore;
 pub use fs_store::FsStore;
 pub use session::{Session, SessionConfig, SessionError};
 pub use session_log::{
