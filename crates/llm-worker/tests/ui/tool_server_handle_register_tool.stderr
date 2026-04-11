@@ -1,13 +1,10 @@
 error[E0624]: method `register_tool` is private
   --> tests/ui/tool_server_handle_register_tool.rs:10:20
    |
-10 |       let _ = handle.register_tool(def);
-   |                      ^^^^^^^^^^^^^ private method
+10 |     let _ = handle.register_tool(def);
+   |                    ^^^^^^^^^^^^^ private method
    |
   ::: src/tool_server.rs
    |
-   | /     pub(crate) fn register_tool(
-   | |         &self,
-   | |         factory: WorkerToolDefinition,
-   | |     ) -> Result<(), ToolServerError> {
-   | |____________________________________- private method defined here
+   |     pub(crate) fn register_tool(&self, factory: WorkerToolDefinition) {
+   |     ----------------------------------------------------------------- private method defined here

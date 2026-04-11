@@ -26,6 +26,7 @@ pub enum ToolServerError {
 #[derive(Clone, Default)]
 pub struct ToolServer {
     tools: Arc<Mutex<ToolMap>>,
+    pending: Arc<Mutex<Vec<WorkerToolDefinition>>>,
 }
 
 impl ToolServer {
@@ -38,6 +39,7 @@ impl ToolServer {
     pub fn handle(&self) -> ToolServerHandle {
         ToolServerHandle {
             tools: Arc::clone(&self.tools),
+            pending: Arc::clone(&self.pending),
         }
     }
 }
@@ -46,32 +48,57 @@ impl ToolServer {
 #[derive(Clone, Default)]
 pub struct ToolServerHandle {
     tools: Arc<Mutex<ToolMap>>,
+    pending: Arc<Mutex<Vec<WorkerToolDefinition>>>,
 }
 
 impl ToolServerHandle {
-    /// Register one tool.
-    pub(crate) fn register_tool(
-        &self,
-        factory: WorkerToolDefinition,
-    ) -> Result<(), ToolServerError> {
-        let (meta, instance) = factory();
-        let mut guard = self.tools.lock().unwrap_or_else(|e| e.into_inner());
-        if guard.contains_key(&meta.name) {
-            return Err(ToolServerError::DuplicateName(meta.name));
-        }
-        guard.insert(meta.name.clone(), (meta, instance));
-        Ok(())
+    /// Queue a tool factory for deferred initialization.
+    ///
+    /// The factory is **not** called here; it is stored and executed
+    /// when [`flush_pending`](Self::flush_pending) is called (typically
+    /// at the start of `Worker::run()`).
+    pub(crate) fn register_tool(&self, factory: WorkerToolDefinition) {
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(factory);
     }
 
-    /// Register many tools.
+    /// Queue many tool factories for deferred initialization.
     pub(crate) fn register_tools(
         &self,
         factories: impl IntoIterator<Item = WorkerToolDefinition>,
-    ) -> Result<(), ToolServerError> {
-        for factory in factories {
-            self.register_tool(factory)?;
+    ) {
+        let mut guard = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        guard.extend(factories);
+    }
+
+    /// Execute all pending factories and register the resulting tools.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any factory produces a tool whose name collides with
+    /// an already-registered tool. Duplicate names are a programming
+    /// error and should be caught during development.
+    pub(crate) fn flush_pending(&self) {
+        let pending: Vec<_> = {
+            let mut guard = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            std::mem::take(&mut *guard)
+        };
+        if pending.is_empty() {
+            return;
         }
-        Ok(())
+        // Execute all factories first, then validate and insert atomically.
+        let materialized: Vec<_> = pending.into_iter().map(|f| f()).collect();
+        let mut tools = self.tools.lock().unwrap_or_else(|e| e.into_inner());
+        for (meta, instance) in materialized {
+            assert!(
+                !tools.contains_key(&meta.name),
+                "duplicate tool name: '{}'",
+                meta.name,
+            );
+            tools.insert(meta.name.clone(), (meta, instance));
+        }
     }
 
     /// Get a tool by name for hook contexts.
@@ -143,19 +170,37 @@ mod tests {
     }
 
     #[test]
-    fn register_duplicate_name_fails() {
+    fn flush_pending_registers_tools() {
         let handle = ToolServer::new().handle();
-        handle.register_tool(def("alpha")).expect("first register");
-        let err = handle
-            .register_tool(def("alpha"))
-            .expect_err("duplicate should fail");
-        assert_eq!(err, ToolServerError::DuplicateName("alpha".to_string()));
+        handle.register_tool(def("alpha"));
+        handle.register_tool(def("beta"));
+
+        // Before flush, no tools are available
+        assert!(handle.get_tool("alpha").is_none());
+
+        handle.flush_pending();
+
+        // After flush, tools are available
+        assert!(handle.get_tool("alpha").is_some());
+        assert!(handle.get_tool("beta").is_some());
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate tool name: 'alpha'")]
+    fn flush_pending_duplicate_name_panics() {
+        let handle = ToolServer::new().handle();
+        handle.register_tool(def("alpha"));
+        handle.flush_pending();
+
+        handle.register_tool(def("alpha"));
+        handle.flush_pending(); // panics
     }
 
     #[tokio::test]
     async fn call_tool_success_and_not_found() {
         let handle = ToolServer::new().handle();
-        handle.register_tool(def("echo")).expect("register");
+        handle.register_tool(def("echo"));
+        handle.flush_pending();
 
         let out = handle.call_tool("echo", r#"{"x":1}"#).await.expect("call");
         assert_eq!(out, r#"{"x":1}"#);
@@ -170,9 +215,10 @@ mod tests {
     #[test]
     fn tool_definitions_are_sorted() {
         let handle = ToolServer::new().handle();
-        handle.register_tool(def("zeta")).expect("register zeta");
-        handle.register_tool(def("alpha")).expect("register alpha");
-        handle.register_tool(def("beta")).expect("register beta");
+        handle.register_tool(def("zeta"));
+        handle.register_tool(def("alpha"));
+        handle.register_tool(def("beta"));
+        handle.flush_pending();
 
         let names: Vec<_> = handle
             .tool_definitions_sorted()
@@ -180,5 +226,12 @@ mod tests {
             .map(|d| d.name)
             .collect();
         assert_eq!(names, vec!["alpha", "beta", "zeta"]);
+    }
+
+    #[test]
+    fn flush_pending_is_noop_when_empty() {
+        let handle = ToolServer::new().handle();
+        handle.flush_pending();
+        handle.flush_pending();
     }
 }

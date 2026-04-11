@@ -27,12 +27,14 @@
 //!
 //! # Cache Protection
 //!
-//! To maximize KV cache hit rate, transition to the locked state
-//! with [`Worker::lock()`] before execution.
+//! `run()` automatically locks the cache. To edit state between turns,
+//! call `unlock_cache()` first; the next `run()` re-locks automatically.
 //!
 //! ```ignore
-//! let mut locked = worker.lock();
-//! locked.run("user input").await?;
+//! worker.run("user input").await?;
+//! worker.unlock_cache();
+//! worker.set_system_prompt("new prompt");
+//! worker.run("next input").await?;
 //! ```
 
 mod handler;

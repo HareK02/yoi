@@ -159,8 +159,8 @@ async fn session_restore_round_trip() {
 
     session.run("Hi").await.unwrap();
 
-    let original_history = session.worker.history().to_vec();
-    let original_turn_count = session.worker.turn_count();
+    let original_history = session.worker().history().to_vec();
+    let original_turn_count = session.worker().turn_count();
     let original_head_hash = session.head_hash().cloned();
 
     // Restore
@@ -170,10 +170,10 @@ async fn session_restore_round_trip() {
             .await
             .unwrap();
 
-    assert_eq!(restored.worker.history().len(), original_history.len());
-    assert_eq!(restored.worker.turn_count(), original_turn_count);
+    assert_eq!(restored.worker().history().len(), original_history.len());
+    assert_eq!(restored.worker().turn_count(), original_turn_count);
     assert_eq!(
-        restored.worker.get_system_prompt().map(String::from),
+        restored.worker().get_system_prompt().map(String::from),
         Some("You are helpful.".to_string())
     );
     assert_eq!(restored.head_hash(), original_head_hash.as_ref());
@@ -184,7 +184,7 @@ async fn session_run_with_tool_call() {
     let (_dir, store) = make_store().await;
     let client = MockLlmClient::with_responses(tool_call_events());
     let mut worker = Worker::new(client);
-    worker.register_tool(weather_tool_definition()).unwrap();
+    worker.register_tool(weather_tool_definition());
 
     let mut session = Session::new(worker, store.clone(), SessionConfig::default())
         .await
@@ -213,7 +213,7 @@ async fn session_resume_after_pause() {
     // First run: tool call with pause hook → Paused
     let client = MockLlmClient::with_responses(tool_call_events());
     let mut worker = Worker::new(client);
-    worker.register_tool(weather_tool_definition()).unwrap();
+    worker.register_tool(weather_tool_definition());
     worker.set_interceptor(PausePolicy);
 
     let mut session = Session::new(worker, store.clone(), SessionConfig::default())
@@ -251,7 +251,7 @@ async fn session_resume_after_pause() {
             .await
             .unwrap();
 
-    assert!(restored.worker.last_run_interrupted());
+    assert!(restored.worker().last_run_interrupted());
 
     // resume may or may not succeed depending on Worker internal state,
     // but the restore itself should work
@@ -271,7 +271,7 @@ async fn session_fork_preserves_state() {
 
     session.run("Hello").await.unwrap();
 
-    let original_history_len = session.worker.history().len();
+    let original_history_len = session.worker().history().len();
     let fork_id = session.fork().await.unwrap();
 
     // Fork should have a SessionStart with the current history
@@ -334,7 +334,7 @@ async fn session_config_changed_logged() {
 
     // Modify config via worker and log it
     session
-        .worker
+        .worker_mut()
         .set_request_config(RequestConfig::default().with_temperature(0.7));
     session.log_config_changed().await.unwrap();
 
@@ -367,13 +367,13 @@ async fn session_cache_lock_unlock_logged() {
     let has_locked = entries.iter().any(|e| {
         matches!(
             &e.entry,
-            LogEntry::CacheLocked {
+            LogEntry::Locked {
                 locked_prefix_len: 5,
                 ..
             }
         )
     });
-    assert!(has_locked, "should have CacheLocked entry");
+    assert!(has_locked, "should have Locked entry");
 
     let has_unlocked = entries
         .iter()

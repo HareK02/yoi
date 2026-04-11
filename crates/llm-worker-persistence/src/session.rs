@@ -43,12 +43,13 @@ pub enum SessionError {
 
 /// Persistent session wrapping a [`Worker`].
 ///
-/// The `worker` field is public for direct access to Worker APIs
-/// (tool registration, hook setup, subscriber management, etc.).
-/// State-mutating operations (`run`, `resume`) should go through
-/// Session methods to ensure proper logging.
+/// Use [`worker()`](Self::worker) / [`worker_mut()`](Self::worker_mut) to
+/// access the underlying Worker for configuration (tool registration, etc.).
+/// State-mutating operations (`run`, `resume`) should go through Session
+/// methods to ensure proper logging.
 pub struct Session<C: LlmClient, St: Store> {
-    pub worker: Worker<C, Mutable>,
+    /// Always `Some` outside of `run()` / `resume()`.
+    worker: Option<Worker<C, Mutable>>,
     store: St,
     session_id: SessionId,
     head_hash: Option<EntryHash>,
@@ -78,7 +79,7 @@ impl<C: LlmClient, St: Store> Session<C, St> {
         store.append(session_id, &hashed_entry).await?;
 
         Ok(Self {
-            worker,
+            worker: Some(worker),
             store,
             session_id,
             head_hash: Some(hashed),
@@ -87,9 +88,6 @@ impl<C: LlmClient, St: Store> Session<C, St> {
     }
 
     /// Restore a session from a stored log.
-    ///
-    /// Reads all log entries, collects state from them,
-    /// and returns a `Session` ready for `resume()`.
     pub async fn restore(
         client: C,
         store: St,
@@ -109,12 +107,26 @@ impl<C: LlmClient, St: Store> Session<C, St> {
         worker.set_last_run_interrupted(state.last_run_interrupted);
 
         Ok(Self {
-            worker,
+            worker: Some(worker),
             store,
             session_id,
             head_hash: state.head_hash,
             _config: config,
         })
+    }
+
+    fn w(&self) -> &Worker<C, Mutable> {
+        self.worker.as_ref().expect("worker taken during run")
+    }
+
+    /// Reference to the underlying Worker.
+    pub fn worker(&self) -> &Worker<C, Mutable> {
+        self.w()
+    }
+
+    /// Mutable reference to the underlying Worker.
+    pub fn worker_mut(&mut self) -> &mut Worker<C, Mutable> {
+        self.worker.as_mut().expect("worker taken during run")
     }
 
     /// The session ID.
@@ -133,15 +145,23 @@ impl<C: LlmClient, St: Store> Session<C, St> {
     }
 
     /// Run a user turn, logging all state changes.
+    ///
+    /// Internally locks the Worker (flushing pending tools), runs the turn,
+    /// then unlocks back to Mutable state.
     pub async fn run(
         &mut self,
         user_input: impl Into<String>,
     ) -> Result<WorkerResult, SessionError> {
+        let input = user_input.into();
         self.ensure_head_or_fork().await?;
 
-        let history_before = self.worker.history().len();
+        let history_before = self.w().history().len();
 
-        let result = self.worker.run(user_input).await;
+        // lock → run → unlock (use lock() directly to keep worker on error)
+        let worker = self.worker.take().expect("worker taken during run");
+        let mut locked = worker.lock();
+        let result = locked.run(input).await;
+        self.worker = Some(locked.unlock());
 
         self.log_history_delta(history_before).await?;
         self.log_turn_end().await?;
@@ -154,9 +174,13 @@ impl<C: LlmClient, St: Store> Session<C, St> {
     pub async fn resume(&mut self) -> Result<WorkerResult, SessionError> {
         self.ensure_head_or_fork().await?;
 
-        let history_before = self.worker.history().len();
+        let history_before = self.w().history().len();
 
-        let result = self.worker.resume().await;
+        // lock → resume → unlock
+        let worker = self.worker.take().expect("worker taken during run");
+        let mut locked = worker.lock();
+        let result = locked.resume().await;
+        self.worker = Some(locked.unlock());
 
         self.log_history_delta(history_before).await?;
         self.log_turn_end().await?;
@@ -166,15 +190,13 @@ impl<C: LlmClient, St: Store> Session<C, St> {
     }
 
     /// Fork this session at its current state.
-    /// Returns the new session ID. The new log contains a `SessionStart`
-    /// seeded with the current history.
     pub async fn fork(&self) -> Result<SessionId, StoreError> {
         let fork_id = crate::new_session_id();
         let entry = LogEntry::SessionStart {
             ts: session_log::now_millis(),
-            system_prompt: self.worker.get_system_prompt().map(String::from),
-            config: self.worker.request_config().clone(),
-            history: self.worker.history().to_vec(),
+            system_prompt: self.w().get_system_prompt().map(String::from),
+            config: self.w().request_config().clone(),
+            history: self.w().history().to_vec(),
         };
         let hashed = session_log::compute_hash(None, &entry);
         let hashed_entry = HashedEntry {
@@ -189,8 +211,6 @@ impl<C: LlmClient, St: Store> Session<C, St> {
     }
 
     /// Fork from an arbitrary point in a stored session's log.
-    /// Finds the entry matching `at_hash` and creates a new session
-    /// with state reconstructed up to that point.
     pub async fn fork_at(
         store: &St,
         source_id: SessionId,
@@ -221,12 +241,12 @@ impl<C: LlmClient, St: Store> Session<C, St> {
         Ok(fork_id)
     }
 
-    /// Log a `CacheLocked` entry.
+    /// Log a `Locked` entry.
     pub async fn log_cache_locked(
         &mut self,
         locked_prefix_len: usize,
     ) -> Result<(), StoreError> {
-        let entry = LogEntry::CacheLocked {
+        let entry = LogEntry::Locked {
             ts: session_log::now_millis(),
             locked_prefix_len,
         };
@@ -245,14 +265,13 @@ impl<C: LlmClient, St: Store> Session<C, St> {
     pub async fn log_config_changed(&mut self) -> Result<(), StoreError> {
         let entry = LogEntry::ConfigChanged {
             ts: session_log::now_millis(),
-            config: self.worker.request_config().clone(),
+            config: self.w().request_config().clone(),
         };
         self.append_entry(entry).await
     }
 
     // ── Private helpers ──────────────────────────────────────────────────
 
-    /// Append a `LogEntry`, computing its hash and updating `head_hash`.
     async fn append_entry(&mut self, entry: LogEntry) -> Result<(), StoreError> {
         let hash = session_log::compute_hash(self.head_hash.as_ref(), &entry);
         let hashed_entry = HashedEntry {
@@ -267,19 +286,17 @@ impl<C: LlmClient, St: Store> Session<C, St> {
         Ok(())
     }
 
-    /// Check that the store's head still matches ours. If not, auto-fork.
     async fn ensure_head_or_fork(&mut self) -> Result<(), StoreError> {
         let store_head = self.store.read_head_hash(self.session_id).await?;
         if store_head == self.head_hash {
             return Ok(());
         }
-        // Another writer advanced this session — fork from our known state.
         let fork_id = crate::new_session_id();
         let entry = LogEntry::SessionStart {
             ts: session_log::now_millis(),
-            system_prompt: self.worker.get_system_prompt().map(String::from),
-            config: self.worker.request_config().clone(),
-            history: self.worker.history().to_vec(),
+            system_prompt: self.w().get_system_prompt().map(String::from),
+            config: self.w().request_config().clone(),
+            history: self.w().history().to_vec(),
         };
         let hash = session_log::compute_hash(None, &entry);
         let hashed_entry = HashedEntry {
@@ -296,7 +313,7 @@ impl<C: LlmClient, St: Store> Session<C, St> {
     }
 
     async fn log_history_delta(&mut self, before_len: usize) -> Result<(), StoreError> {
-        let history = self.worker.history();
+        let history = self.w().history();
         if history.len() <= before_len {
             return Ok(());
         }
@@ -356,7 +373,7 @@ impl<C: LlmClient, St: Store> Session<C, St> {
     async fn log_turn_end(&mut self) -> Result<(), StoreError> {
         self.append_entry(LogEntry::TurnEnd {
             ts: session_log::now_millis(),
-            turn_count: self.worker.turn_count(),
+            turn_count: self.w().turn_count(),
         })
         .await
     }
@@ -376,7 +393,7 @@ impl<C: LlmClient, St: Store> Session<C, St> {
         self.append_entry(LogEntry::RunOutcome {
             ts: session_log::now_millis(),
             outcome,
-            interrupted: self.worker.last_run_interrupted(),
+            interrupted: self.w().last_run_interrupted(),
         })
         .await
     }

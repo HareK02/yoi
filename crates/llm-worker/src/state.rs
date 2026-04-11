@@ -1,7 +1,7 @@
 //! Worker State
 //!
 //! State marker types for cache protection using the Type-state pattern.
-//! Worker has state transitions from `Mutable` → `CacheLocked`.
+//! Worker has state transitions from `Mutable` → `Locked`.
 
 /// Marker trait representing Worker state
 ///
@@ -19,7 +19,7 @@ mod private {
 /// - Editing message history (add, delete, clear)
 /// - Registering tools and hooks
 ///
-/// Can transition to [`CacheLocked`] state via `Worker::lock()`.
+/// Can transition to [`Locked`] state via `Worker::lock()`.
 ///
 /// # Examples
 ///
@@ -54,7 +54,7 @@ impl WorkerState for Mutable {}
 /// Can return to [`Mutable`] state via `Worker::unlock()`,
 /// but note that cache protection will be released.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct CacheLocked;
+pub struct Locked;
 
-impl private::Sealed for CacheLocked {}
-impl WorkerState for CacheLocked {}
+impl private::Sealed for Locked {}
+impl WorkerState for Locked {}

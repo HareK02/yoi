@@ -13,7 +13,7 @@ use crate::{
         DefaultInterceptor, Interceptor, PostToolAction, PreRequestAction, PreToolAction,
         PromptAction, ToolCallInfo, ToolResultInfo, TurnEndAction,
     },
-    state::{CacheLocked, Mutable, WorkerState},
+    state::{Locked, Mutable, WorkerState},
     callback::{
         ClosureMetaHandler, ClosureTextBlockHandler, ClosureToolUseBlockHandler, TextBlockScope,
         ToolUseBlockScope,
@@ -22,12 +22,9 @@ use crate::{
     timeline::{TextBlockCollector, Timeline, ToolCallCollector},
     timeline::event::{ErrorEvent, StatusEvent, UsageEvent},
     tool::{ToolCall, ToolDefinition as WorkerToolDefinition, ToolError, ToolOutputProcessor, ToolResult},
-    tool_server::{ToolServer, ToolServerError, ToolServerHandle},
+    tool_server::{ToolServer, ToolServerHandle},
 };
 
-// =============================================================================
-// Worker Error
-// =============================================================================
 
 /// Worker errors
 #[derive(Debug, thiserror::Error)]
@@ -57,9 +54,6 @@ pub enum ToolRegistryError {
     DuplicateName(String),
 }
 
-// =============================================================================
-// Worker Config
-// =============================================================================
 
 /// Worker configuration
 #[derive(Debug, Clone, Default)]
@@ -68,9 +62,6 @@ pub struct WorkerConfig {
     _private: (),
 }
 
-// =============================================================================
-// Worker Result Types
-// =============================================================================
 
 /// Worker execution result (status)
 #[derive(Debug)]
@@ -89,9 +80,6 @@ enum ToolExecutionResult {
     Paused,
 }
 
-// =============================================================================
-// Worker
-// =============================================================================
 
 /// Central component for managing LLM interactions
 ///
@@ -100,32 +88,28 @@ enum ToolExecutionResult {
 ///
 /// # State Transitions (Type-state)
 ///
-/// - [`Mutable`]: Initial state. System prompt and history can be freely edited.
-/// - [`CacheLocked`]: Cache-protected state. Transition via `lock()`. Prefix context is immutable.
+/// - [`Mutable`]: Initial state. System prompt, history, and tools can be freely edited.
+/// - [`Locked`]: Cache-protected state. Prefix context is immutable; only `run()` / `resume()` are available.
 ///
-/// # Examples
+/// Calling `run()` on a `Mutable` Worker consumes it and returns a
+/// `Locked` Worker together with the result. This ensures the
+/// cache prefix is fixed for optimal KV cache hit rate.
 ///
 /// ```ignore
-/// use llm_worker::{Worker, Item};
-///
-/// // Create a Worker and register tools
 /// let mut worker = Worker::new(client)
 ///     .system_prompt("You are a helpful assistant.");
 /// worker.register_tool(my_tool);
 ///
-/// // Run the interaction
-/// let history = worker.run("Hello!").await?;
-/// ```
+/// // Mutable::run() consumes self → Locked
+/// let (mut worker, _result) = worker.run("Hello").await?;
 ///
-/// # When Cache Protection is Needed
+/// // Locked::run() borrows &mut self
+/// worker.run("Follow-up").await?;
 ///
-/// ```ignore
-/// let mut worker = Worker::new(client)
-///     .system_prompt("...");
-///
-/// // After setting history, lock to protect cache
-/// let mut locked = worker.lock();
-/// locked.run("user input").await?;
+/// // To edit between turns, unlock back to Mutable
+/// let mut worker = worker.unlock();
+/// worker.history_mut().truncate(5);
+/// let (mut worker, _result) = worker.run("Continue").await?;
 /// ```
 pub struct Worker<C: LlmClient, S: WorkerState = Mutable> {
     /// LLM client
@@ -144,7 +128,7 @@ pub struct Worker<C: LlmClient, S: WorkerState = Mutable> {
     system_prompt: Option<String>,
     /// Item history (owned by Worker)
     history: Vec<Item>,
-    /// History length at lock time (only meaningful in CacheLocked state)
+    /// History length at lock time (only meaningful in Locked state)
     locked_prefix_len: usize,
     /// Turn count
     turn_count: usize,
@@ -167,38 +151,10 @@ pub struct Worker<C: LlmClient, S: WorkerState = Mutable> {
     _state: PhantomData<S>,
 }
 
-// =============================================================================
-// Common Implementation (available in all states)
-// =============================================================================
 
 impl<C: LlmClient, S: WorkerState> Worker<C, S> {
     fn reset_interruption_state(&mut self) {
         self.last_run_interrupted = false;
-    }
-
-    /// Execute a turn
-    ///
-    /// Adds a new user message to history and sends a request to the LLM.
-    /// Automatically loops if there are tool calls.
-    pub async fn run(
-        &mut self,
-        user_input: impl Into<String>,
-    ) -> Result<WorkerResult, WorkerError> {
-        self.reset_interruption_state();
-        // Interceptor: on_prompt_submit
-        let mut user_item = Item::user_message(user_input);
-        match self.interceptor.on_prompt_submit(&mut user_item).await {
-            PromptAction::Cancel(reason) => {
-                self.last_run_interrupted = true;
-                return self
-                    .finalize_interruption(Err(WorkerError::Aborted(reason)))
-                    .await;
-            }
-            PromptAction::Continue => {}
-        }
-        self.history.push(user_item);
-        let result = self.run_turn_loop().await;
-        self.finalize_interruption(result).await
     }
 
     fn drain_cancel_queue(&mut self) {
@@ -892,19 +848,8 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
         }
     }
 
-    /// Resume execution (from Paused state)
-    ///
-    /// Resumes turn processing from current state without adding a new user message to history.
-    pub async fn resume(&mut self) -> Result<WorkerResult, WorkerError> {
-        self.reset_interruption_state();
-        let result = self.run_turn_loop().await;
-        self.finalize_interruption(result).await
-    }
 }
 
-// =============================================================================
-// Mutable State-Specific Implementation
-// =============================================================================
 
 impl<C: LlmClient> Worker<C, Mutable> {
     /// Create a new Worker (in Mutable state)
@@ -941,43 +886,21 @@ impl<C: LlmClient> Worker<C, Mutable> {
         }
     }
 
-    /// Register a tool
+    /// Register a tool factory for deferred initialization.
     ///
-    /// Registered tools are automatically executed when called by the LLM.
-    /// Registering a tool with the same name will result in an error.
-    ///
-    /// Available only in Mutable state.
-    pub fn register_tool(
-        &mut self,
-        factory: WorkerToolDefinition,
-    ) -> Result<(), ToolRegistryError> {
-        match self.tool_server.register_tool(factory) {
-            Ok(()) => Ok(()),
-            Err(ToolServerError::DuplicateName(name)) => {
-                Err(ToolRegistryError::DuplicateName(name))
-            }
-            Err(ToolServerError::ToolNotFound(_) | ToolServerError::ToolExecution(_)) => {
-                unreachable!("register_tool should only fail with DuplicateName")
-            }
-        }
+    /// The factory is queued and executed at the next `run()` or `resume()` call.
+    /// Duplicate name detection occurs at that point and surfaces as
+    /// [`WorkerError::ToolRegistry`].
+    pub fn register_tool(&mut self, factory: WorkerToolDefinition) {
+        self.tool_server.register_tool(factory);
     }
 
-    /// Register multiple tools
-    ///
-    /// Available only in Mutable state.
+    /// Register multiple tool factories for deferred initialization.
     pub fn register_tools(
         &mut self,
         factories: impl IntoIterator<Item = WorkerToolDefinition>,
-    ) -> Result<(), ToolRegistryError> {
-        match self.tool_server.register_tools(factories) {
-            Ok(()) => Ok(()),
-            Err(ToolServerError::DuplicateName(name)) => {
-                Err(ToolRegistryError::DuplicateName(name))
-            }
-            Err(ToolServerError::ToolNotFound(_) | ToolServerError::ToolExecution(_)) => {
-                unreachable!("register_tools should only fail with DuplicateName")
-            }
-        }
+    ) {
+        self.tool_server.register_tools(factories);
     }
 
     /// Set system prompt (builder pattern)
@@ -1082,40 +1005,47 @@ impl<C: LlmClient> Worker<C, Mutable> {
 
     /// Get a mutable reference to history
     ///
-    /// Available only in Mutable state. History can be freely edited.
+    /// Available only in Mutable state.
     pub fn history_mut(&mut self) -> &mut Vec<Item> {
+
         &mut self.history
     }
 
     /// Set history
     pub fn set_history(&mut self, items: Vec<Item>) {
+
         self.history = items;
     }
 
     /// Add an item to history (builder pattern)
     pub fn with_item(mut self, item: Item) -> Self {
+
         self.history.push(item);
         self
     }
 
     /// Add an item to history
     pub fn push_item(&mut self, item: Item) {
+
         self.history.push(item);
     }
 
     /// Add multiple items to history (builder pattern)
     pub fn with_items(mut self, items: impl IntoIterator<Item = Item>) -> Self {
+
         self.history.extend(items);
         self
     }
 
     /// Add multiple items to history
     pub fn extend_history(&mut self, items: impl IntoIterator<Item = Item>) {
+
         self.history.extend(items);
     }
 
     /// Clear history
     pub fn clear_history(&mut self) {
+
         self.history.clear();
     }
 
@@ -1148,11 +1078,48 @@ impl<C: LlmClient> Worker<C, Mutable> {
         self
     }
 
-    /// Lock and transition to CacheLocked state
+    /// Execute a turn, consuming self and transitioning to Locked.
     ///
-    /// This operation fixes the current system prompt and history as a "committed prefix".
-    /// After this, only appending to history is allowed, ensuring cache hits.
-    pub fn lock(self) -> Worker<C, CacheLocked> {
+    /// This is the primary entry point for first use. Equivalent to
+    /// `self.lock()` followed by `locked.run(user_input)`.
+    ///
+    /// Subsequent runs can use [`Worker<C, Locked>::run()`] directly.
+    /// To edit state between turns, call [`unlock()`](Worker::unlock) first.
+    pub async fn run(
+        self,
+        user_input: impl Into<String>,
+    ) -> Result<(Worker<C, Locked>, WorkerResult), WorkerError> {
+        let mut locked = self.lock();
+        let result = locked.run(user_input).await?;
+        Ok((locked, result))
+    }
+
+    /// Resume from Paused, consuming self and transitioning to Locked.
+    ///
+    /// Used after `unlock()` → edit → resume.
+    pub async fn resume(
+        self,
+    ) -> Result<(Worker<C, Locked>, WorkerResult), WorkerError> {
+        let mut locked = self.lock();
+        let result = locked.resume().await?;
+        Ok((locked, result))
+    }
+
+    /// Lock and transition to Locked state
+    ///
+    /// Flushes pending tool factories, then fixes the current system prompt
+    /// and history as a "committed prefix". After this, only `run()` / `resume()`
+    /// may append to history, ensuring cache hits.
+    ///
+    /// Most callers should use [`run()`](Self::run) instead, which calls
+    /// this internally. Use `lock()` directly only when you need the
+    /// `Locked` worker back on error (e.g. in a persistence layer).
+    ///
+    /// # Panics
+    ///
+    /// Panics if a pending tool factory produces a duplicate name.
+    pub fn lock(self) -> Worker<C, Locked> {
+        self.tool_server.flush_pending();
         let locked_prefix_len = self.history.len();
         Worker {
             client: self.client,
@@ -1178,11 +1145,42 @@ impl<C: LlmClient> Worker<C, Mutable> {
     }
 }
 
-// =============================================================================
-// CacheLocked State-Specific Implementation
-// =============================================================================
 
-impl<C: LlmClient> Worker<C, CacheLocked> {
+impl<C: LlmClient> Worker<C, Locked> {
+    /// Execute a turn
+    ///
+    /// Adds a new user message to history and sends a request to the LLM.
+    /// Automatically loops if there are tool calls.
+    pub async fn run(
+        &mut self,
+        user_input: impl Into<String>,
+    ) -> Result<WorkerResult, WorkerError> {
+        self.reset_interruption_state();
+        // Interceptor: on_prompt_submit
+        let mut user_item = Item::user_message(user_input);
+        match self.interceptor.on_prompt_submit(&mut user_item).await {
+            PromptAction::Cancel(reason) => {
+                self.last_run_interrupted = true;
+                return self
+                    .finalize_interruption(Err(WorkerError::Aborted(reason)))
+                    .await;
+            }
+            PromptAction::Continue => {}
+        }
+        self.history.push(user_item);
+        let result = self.run_turn_loop().await;
+        self.finalize_interruption(result).await
+    }
+
+    /// Resume execution (from Paused state)
+    ///
+    /// Resumes turn processing from current state without adding a new user message.
+    pub async fn resume(&mut self) -> Result<WorkerResult, WorkerError> {
+        self.reset_interruption_state();
+        let result = self.run_turn_loop().await;
+        self.finalize_interruption(result).await
+    }
+
     /// Get the prefix length at lock time
     pub fn locked_prefix_len(&self) -> usize {
         self.locked_prefix_len

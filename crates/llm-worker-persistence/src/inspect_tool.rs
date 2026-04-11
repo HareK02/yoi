@@ -13,7 +13,6 @@ use serde_json::json;
 
 use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta};
 use llm_worker::state::Mutable;
-use llm_worker::ToolRegistryError;
 use llm_worker::Worker;
 use llm_worker::llm_client::LlmClient;
 
@@ -332,12 +331,11 @@ fn apply_selector(content: &Content, selector: &Selector) -> Result<String, Tool
 pub fn register_inspect_tool<C, B>(
     worker: &mut Worker<C, Mutable>,
     blob_store: Arc<B>,
-) -> Result<(), ToolRegistryError>
-where
+) where
     C: LlmClient,
     B: BlobStore + 'static,
 {
-    worker.register_tool(InspectTool::<B>::tool_definition(blob_store))
+    worker.register_tool(InspectTool::<B>::tool_definition(blob_store));
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────

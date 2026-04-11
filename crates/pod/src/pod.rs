@@ -144,7 +144,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             let builder = std::mem::take(&mut self.hook_builder);
             let registry = Arc::new(builder.build());
             let interceptor = HookInterceptor::new(registry);
-            self.session.worker.set_interceptor(interceptor);
+            self.session.worker_mut().set_interceptor(interceptor);
             self.interceptor_installed = true;
         }
     }

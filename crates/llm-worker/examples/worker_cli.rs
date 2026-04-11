@@ -438,10 +438,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Register tools (unless --no-tools)
     if !args.no_tools {
         let app = AppContext;
-        worker
-            .register_tool(app.get_current_time_definition())
-            .unwrap();
-        worker.register_tool(app.calculate_definition()).unwrap();
+        worker.register_tool(app.get_current_time_definition());
+        worker.register_tool(app.calculate_definition());
     }
 
     // Register streaming display handlers
@@ -465,7 +463,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // Interactive loop
+    // Interactive loop — first input transitions Mutable → Locked
+    print!("\n👤 You: ");
+    io::stdout().flush()?;
+
+    let mut first_input = String::new();
+    io::stdin().read_line(&mut first_input)?;
+    let first_input = first_input.trim();
+
+    if first_input == "quit" || first_input == "exit" || first_input.is_empty() {
+        println!("\n👋 Goodbye!");
+        return Ok(());
+    }
+
+    let (mut locked, _) = match worker.run(first_input).await {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln!("\n❌ Error: {}", e);
+            return Ok(());
+        }
+    };
+
     loop {
         print!("\n👤 You: ");
         io::stdout().flush()?;
@@ -483,8 +501,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             break;
         }
 
-        // Run Worker (Worker manages history)
-        match worker.run(input).await {
+        match locked.run(input).await {
             Ok(_) => {}
             Err(e) => {
                 eprintln!("\n❌ Error: {}", e);

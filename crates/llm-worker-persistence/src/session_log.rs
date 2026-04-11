@@ -88,7 +88,7 @@ pub struct HashedEntry {
 /// - `SessionStart` — always the first entry; captures initial state
 /// - `UserInput` / `AssistantItems` / `ToolResults` / `HookInjectedItems` — history appends
 /// - `TurnEnd` — turn boundary marker
-/// - `CacheLocked` / `CacheUnlocked` — KV cache state transitions
+/// - `Locked` / `CacheUnlocked` — KV cache state transitions
 /// - `RunOutcome` — marks end of a `run()` or `resume()` call
 /// - `ConfigChanged` — `RequestConfig` mutation
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,7 +119,8 @@ pub enum LogEntry {
     TurnEnd { ts: u64, turn_count: usize },
 
     /// KV cache locked. Records the history prefix length that is now immutable.
-    CacheLocked { ts: u64, locked_prefix_len: usize },
+    #[serde(alias = "cache_locked")]
+    Locked { ts: u64, locked_prefix_len: usize },
 
     /// KV cache unlocked.
     CacheUnlocked { ts: u64 },
@@ -200,7 +201,7 @@ pub fn collect_state(entries: &[HashedEntry]) -> RestoredState {
             LogEntry::TurnEnd { turn_count, .. } => {
                 state.turn_count = *turn_count;
             }
-            LogEntry::CacheLocked {
+            LogEntry::Locked {
                 locked_prefix_len, ..
             } => {
                 state.locked_prefix_len = *locked_prefix_len;
@@ -354,7 +355,7 @@ mod tests {
                 config: RequestConfig::default(),
                 history: vec![Item::user_message("a"), Item::assistant_message("b")],
             },
-            LogEntry::CacheLocked {
+            LogEntry::Locked {
                 ts: 2000,
                 locked_prefix_len: 2,
             },

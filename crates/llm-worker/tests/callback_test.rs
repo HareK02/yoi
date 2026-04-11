@@ -46,8 +46,9 @@ async fn test_callback_text_block_events() {
         });
     });
 
+    // Mutable::run consumes self, returns (Locked, WorkerResult)
     let result = worker.run("Greet me").await;
-    assert!(result.is_ok(), "Worker should complete: {:?}", result);
+    assert!(result.is_ok(), "Worker should complete");
 
     let deltas = text_deltas.lock().unwrap();
     assert_eq!(deltas.len(), 2);
@@ -91,6 +92,7 @@ async fn test_callback_tool_call_complete() {
         });
     });
 
+    // Mutable::run consumes self, returns (Locked, WorkerResult)
     let _ = worker.run("Weather please").await;
 
     let starts = tool_starts.lock().unwrap();
@@ -133,6 +135,7 @@ async fn test_callback_turn_events() {
         ends.lock().unwrap().push(turn);
     });
 
+    // Mutable::run consumes self, returns (Locked, WorkerResult)
     let result = worker.run("Do something").await;
     assert!(result.is_ok());
 
@@ -169,6 +172,7 @@ async fn test_callback_usage_events() {
         usages.lock().unwrap().push(event.clone());
     });
 
+    // Mutable::run consumes self, returns (Locked, WorkerResult)
     let _ = worker.run("Hello").await;
 
     let usages = usage_events.lock().unwrap();

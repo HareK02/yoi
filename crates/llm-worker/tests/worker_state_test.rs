@@ -1,6 +1,6 @@
 //! Worker state management tests
 //!
-//! Tests for state transitions using the Type-state pattern (Mutable/CacheLocked)
+//! Tests for state transitions using the Type-state pattern (Mutable/Locked)
 //! and state preservation between turns.
 
 mod common;
@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use async_trait::async_trait;
 use common::MockLlmClient;
 use llm_worker::Item;
-use llm_worker::Worker;
+use llm_worker::{Worker, WorkerError};
 use llm_worker::llm_client::event::{Event, ResponseStatus, StatusEvent};
 use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta};
 
@@ -147,15 +147,15 @@ fn test_mutable_can_register_tool() {
     let mut worker = Worker::new(client);
     let tool = CountingTool::new("count_tool");
 
-    let result = worker.register_tool(tool.definition());
-    assert!(result.is_ok(), "Mutable should allow tool registration");
+    // register_tool is infallible (factory deferred to run-time flush)
+    worker.register_tool(tool.definition());
 }
 
 // =============================================================================
 // State Transition Tests
 // =============================================================================
 
-/// Verify that lock() transitions from Mutable -> CacheLocked state
+/// Verify that lock() transitions from Mutable -> Locked state
 #[test]
 fn test_lock_transition() {
     let client = MockLlmClient::new(vec![]);
@@ -168,13 +168,13 @@ fn test_lock_transition() {
     // Lock
     let locked_worker = worker.lock();
 
-    // History and system prompt are still accessible in CacheLocked state
+    // History and system prompt are still accessible in Locked state
     assert_eq!(locked_worker.get_system_prompt(), Some("System"));
     assert_eq!(locked_worker.history().len(), 2);
     assert_eq!(locked_worker.locked_prefix_len(), 2);
 }
 
-/// Verify that unlock() transitions from CacheLocked -> Mutable state
+/// Verify that unlock() transitions from Locked -> Mutable state
 #[test]
 fn test_unlock_transition() {
     let client = MockLlmClient::new(vec![]);
@@ -198,7 +198,7 @@ fn test_unlock_transition() {
 
 /// Verify that history is correctly updated after running a turn in Mutable state
 #[tokio::test]
-async fn test_mutable_run_updates_history() {
+async fn test_mutable_run_updates_history() -> Result<(), WorkerError> {
     let events = vec![
         Event::text_block_start(0),
         Event::text_delta(0, "Hello, I'm an assistant!"),
@@ -209,11 +209,10 @@ async fn test_mutable_run_updates_history() {
     ];
 
     let client = MockLlmClient::new(events);
-    let mut worker = Worker::new(client);
+    let worker = Worker::new(client);
 
-    // Execute
-    let result = worker.run("Hi there").await;
-    assert!(result.is_ok());
+    // Execute (Mutable::run consumes self, returns (Locked, WorkerResult))
+    let (worker, _result) = worker.run("Hi there").await?;
 
     // History is updated
     let history = worker.history();
@@ -224,9 +223,11 @@ async fn test_mutable_run_updates_history() {
 
     // Assistant message
     assert_eq!(history[1].as_text(), Some("Hello, I'm an assistant!"));
+
+    Ok(())
 }
 
-/// Verify that history accumulates correctly over multiple turns in CacheLocked state
+/// Verify that history accumulates correctly over multiple turns in Locked state
 #[tokio::test]
 async fn test_locked_multi_turn_history_accumulation() {
     // Prepare responses for 2 requests
@@ -327,7 +328,7 @@ async fn test_locked_prefix_len_tracking() {
 
 /// Verify that turn count is correctly incremented
 #[tokio::test]
-async fn test_turn_count_increment() {
+async fn test_turn_count_increment() -> Result<(), WorkerError> {
     let client = MockLlmClient::with_responses(vec![
         vec![
             Event::text_block_start(0),
@@ -347,15 +348,19 @@ async fn test_turn_count_increment() {
         ],
     ]);
 
-    let mut worker = Worker::new(client);
+    let worker = Worker::new(client);
 
     assert_eq!(worker.turn_count(), 0);
 
-    worker.run("First").await.unwrap();
+    // First run consumes Mutable, returns Locked
+    let (mut worker, _) = worker.run("First").await?;
     assert_eq!(worker.turn_count(), 1);
 
-    worker.run("Second").await.unwrap();
+    // Subsequent runs on Locked take &mut self
+    worker.run("Second").await?;
     assert_eq!(worker.turn_count(), 2);
+
+    Ok(())
 }
 
 /// Verify that history can be edited after unlock and re-locked
@@ -430,9 +435,7 @@ async fn test_lock_unlock_relock_tools_remain_effective() {
 
     let mut worker = Worker::new(client);
     let tool_a = CountingTool::new("tool_a");
-    worker
-        .register_tool(tool_a.definition())
-        .expect("register tool_a should succeed");
+    worker.register_tool(tool_a.definition());
 
     let mut locked = worker.lock();
     locked.run("first").await.expect("first run");
@@ -440,9 +443,7 @@ async fn test_lock_unlock_relock_tools_remain_effective() {
 
     let mut unlocked = locked.unlock();
     let tool_b = CountingTool::new("tool_b");
-    unlocked
-        .register_tool(tool_b.definition())
-        .expect("register tool_b after unlock should succeed");
+    unlocked.register_tool(tool_b.definition());
 
     let mut relocked = unlocked.lock();
     relocked.run("second").await.expect("second run");
@@ -455,7 +456,7 @@ async fn test_lock_unlock_relock_tools_remain_effective() {
 // System Prompt Preservation Tests
 // =============================================================================
 
-/// Verify that system prompt is preserved in CacheLocked state
+/// Verify that system prompt is preserved in Locked state
 #[test]
 fn test_system_prompt_preserved_in_locked_state() {
     let client = MockLlmClient::new(vec![]);

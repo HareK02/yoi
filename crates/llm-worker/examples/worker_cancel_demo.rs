@@ -4,9 +4,7 @@
 
 use llm_worker::llm_client::providers::anthropic::AnthropicClient;
 use llm_worker::{Worker, WorkerResult};
-use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -25,48 +23,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::env::var("ANTHROPIC_API_KEY").expect("ANTHROPIC_API_KEY environment variable not set");
 
     let client = AnthropicClient::new(&api_key, "claude-sonnet-4-20250514");
-    let worker = Arc::new(Mutex::new(Worker::new(client)));
+    let worker = Worker::new(client);
 
     println!("🚀 Starting Worker...");
     println!("💡 Will cancel after 2 seconds\n");
 
-    // Get cancel sender first (without holding lock)
-    let cancel_tx = {
-        let w = worker.lock().await;
-        w.cancel_sender()
-    };
+    // Get cancel sender before run (Mutable state)
+    let cancel_tx = worker.cancel_sender();
 
-    // Task 1: Run Worker
-    let worker_clone = worker.clone();
-    let task = tokio::spawn(async move {
-        let mut w = worker_clone.lock().await;
-        println!("📡 Sending request to LLM...");
-
-        match w.run("Tell me a very long story about a brave knight. Make it as detailed as possible with many paragraphs.").await {
-            Ok(WorkerResult::Finished) => {
-                println!("✅ Task completed normally");
-            }
-            Ok(WorkerResult::Paused) => {
-                println!("⏸️  Task paused");
-            }
-            Ok(WorkerResult::LimitReached) => {
-                println!("🔒 Turn limit reached");
-            }
-            Err(e) => {
-                println!("❌ Task error: {}", e);
-            }
-        }
-    });
-
-    // Task 2: Cancel after 2 seconds
+    // Task: Cancel after 2 seconds
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_secs(2)).await;
         println!("\n🛑 Cancelling worker...");
         let _ = cancel_tx.send(()).await;
     });
 
-    // Wait for task completion
-    task.await?;
+    println!("📡 Sending request to LLM...");
+
+    // Mutable::run consumes self → (Locked, WorkerResult)
+    match worker.run("Tell me a very long story about a brave knight. Make it as detailed as possible with many paragraphs.").await {
+        Ok((_locked, WorkerResult::Finished)) => {
+            println!("✅ Task completed normally");
+        }
+        Ok((_locked, WorkerResult::Paused)) => {
+            println!("⏸️  Task paused");
+        }
+        Ok((_locked, WorkerResult::LimitReached)) => {
+            println!("🔒 Turn limit reached");
+        }
+        Err(e) => {
+            println!("❌ Task error: {}", e);
+        }
+    }
 
     println!("\n✨ Demo complete!");
 

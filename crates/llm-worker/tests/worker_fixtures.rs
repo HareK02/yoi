@@ -129,9 +129,9 @@ async fn test_worker_simple_text_response() {
     }
 
     let client = MockLlmClient::from_fixture(&fixture_path).unwrap();
-    let mut worker = Worker::new(client);
+    let worker = Worker::new(client);
 
-    // Send a simple message
+    // Send a simple message (Mutable::run consumes self, returns tuple)
     let result = worker.run("Hello").await;
 
     assert!(result.is_ok(), "Worker should complete successfully");
@@ -156,9 +156,9 @@ async fn test_worker_tool_call() {
     // Register tool
     let weather_tool = MockWeatherTool::new();
     let tool_for_check = weather_tool.clone();
-    worker.register_tool(weather_tool.definition()).unwrap();
+    worker.register_tool(weather_tool.definition());
 
-    // Send message
+    // Send message (Mutable::run consumes self, returns tuple)
     let _result = worker.run("What's the weather in Tokyo?").await;
 
     // Verify tool was called
@@ -190,8 +190,9 @@ async fn test_worker_with_programmatic_events() {
     ];
 
     let client = MockLlmClient::new(events);
-    let mut worker = Worker::new(client);
+    let worker = Worker::new(client);
 
+    // Mutable::run consumes self, returns tuple
     let result = worker.run("Greet me").await;
 
     assert!(result.is_ok(), "Worker should complete successfully");

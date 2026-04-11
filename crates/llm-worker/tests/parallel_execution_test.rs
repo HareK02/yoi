@@ -102,11 +102,12 @@ async fn test_parallel_tool_execution() {
     let tool2_clone = tool2.clone();
     let tool3_clone = tool3.clone();
 
-    worker.register_tool(tool1.definition()).unwrap();
-    worker.register_tool(tool2.definition()).unwrap();
-    worker.register_tool(tool3.definition()).unwrap();
+    worker.register_tool(tool1.definition());
+    worker.register_tool(tool2.definition());
+    worker.register_tool(tool3.definition());
 
     let start = Instant::now();
+    // Mutable::run consumes self, returns (Locked, WorkerResult)
     let _result = worker.run("Run all tools").await;
     let elapsed = start.elapsed();
 
@@ -150,8 +151,8 @@ async fn test_before_tool_call_skip() {
     let allowed_clone = allowed_tool.clone();
     let blocked_clone = blocked_tool.clone();
 
-    worker.register_tool(allowed_tool.definition()).unwrap();
-    worker.register_tool(blocked_tool.definition()).unwrap();
+    worker.register_tool(allowed_tool.definition());
+    worker.register_tool(blocked_tool.definition());
 
     // Policy to skip "blocked_tool"
     struct BlockingPolicy;
@@ -169,6 +170,7 @@ async fn test_before_tool_call_skip() {
 
     worker.set_interceptor(BlockingPolicy);
 
+    // Mutable::run consumes self, returns (Locked, WorkerResult)
     let _result = worker.run("Test hook").await;
 
     // allowed_tool is called, but blocked_tool is not
@@ -230,7 +232,7 @@ async fn test_post_tool_call_modification() {
         })
     }
 
-    worker.register_tool(simple_tool_definition()).unwrap();
+    worker.register_tool(simple_tool_definition());
 
     // Policy to modify results
     struct ModifyingPolicy {
@@ -251,9 +253,10 @@ async fn test_post_tool_call_modification() {
         modified_content: modified_content.clone(),
     });
 
+    // Mutable::run consumes self, returns (Locked, WorkerResult)
     let result = worker.run("Test modification").await;
 
-    assert!(result.is_ok(), "Worker should complete: {:?}", result);
+    assert!(result.is_ok(), "Worker should complete");
 
     // Verify hook was called and content was modified
     let content = modified_content.lock().unwrap().clone();
