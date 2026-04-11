@@ -1,10 +1,14 @@
-//! Session persistence for `llm-worker` via append-only JSONL logs.
+//! Session persistence via append-only JSONL logs.
 //!
 //! # Architecture
 //!
 //! Sessions are recorded as a sequence of [`LogEntry`] values, one per line
 //! in a `.jsonl` file. Reading the log and collecting entries reconstructs
-//! the full [`Worker`] state — no separate snapshots or checkpoints needed.
+//! the full Worker state — no separate snapshots or checkpoints needed.
+//!
+//! This crate provides free functions for persistence operations.
+//! The caller (typically Pod) holds the Worker directly and calls these
+//! functions after state-mutating operations.
 //!
 //! Debug-mode [`TraceEntry`] records capture raw stream events in a separate
 //! `.trace.jsonl` file, independent of the session log.
@@ -12,12 +16,14 @@
 //! # Quick start
 //!
 //! ```ignore
-//! use llm_worker_persistence::{Session, SessionConfig, FsStore};
+//! use session_store::{create_session, restore, save_delta, FsStore, SessionStartState};
 //!
 //! let store = FsStore::new("./sessions").await?;
-//! let worker = Worker::new(client);
-//! let mut session = Session::new(worker, store, SessionConfig::default()).await?;
-//! session.run("Hello!").await?;
+//! let (session_id, head_hash) = create_session(&store, SessionStartState {
+//!     system_prompt: None,
+//!     config: &config,
+//!     history: &[],
+//! }).await?;
 //! ```
 
 pub mod event_trace;
@@ -28,7 +34,10 @@ pub mod store;
 
 pub use event_trace::TraceEntry;
 pub use fs_store::FsStore;
-pub use session::{Session, SessionConfig, SessionError};
+pub use session::{
+    SessionStartState, create_session, ensure_head_or_fork, fork, fork_at, restore, save_cache_locked,
+    save_cache_unlocked, save_config_changed, save_delta, save_outcome, save_turn_end,
+};
 pub use session_log::{
     EntryHash, HashedEntry, LogEntry, Outcome, RestoredState, build_chain, collect_state,
     compute_hash,

@@ -6,7 +6,7 @@
 //! ```
 
 use pod::{Event, Method, PodController, PodManifest};
-use llm_worker_persistence::FsStore;
+use session_store::FsStore;
 
 const MANIFEST_TOML: &str = r#"
 [pod]

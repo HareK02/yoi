@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
-use llm_worker_persistence::FsStore;
+use session_store::FsStore;
 use pod::{Pod, PodController};
 
 #[derive(Parser)]

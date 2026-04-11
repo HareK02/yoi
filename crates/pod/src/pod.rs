@@ -3,9 +3,10 @@ use std::sync::Arc;
 
 use llm_worker::llm_client::client::LlmClient;
 use llm_worker::llm_client::RequestConfig;
-use llm_worker::Worker;
-use llm_worker_persistence::{
-    Session, SessionConfig, SessionError, SessionId, Store, StoreError,
+use llm_worker::state::Mutable;
+use llm_worker::{Worker, WorkerError, WorkerResult};
+use session_store::{
+    EntryHash, Outcome, SessionId, SessionStartState, Store, StoreError,
 };
 
 use manifest::{PodManifest, Scope, WorkerManifest};
@@ -18,11 +19,15 @@ use crate::hook_interceptor::HookInterceptor;
 
 /// An independent agent execution unit.
 ///
-/// Wraps a persistent [`Session`] with manifest metadata and an optional
-/// directory scope. This is the primary abstraction in insomnia.
+/// Holds a [`Worker`] directly and persists session state via
+/// `session-store` functions after each turn.
 pub struct Pod<C: LlmClient, St: Store> {
     manifest: PodManifest,
-    session: Session<C, St>,
+    /// Always `Some` outside of `run()`/`resume()`.
+    worker: Option<Worker<C, Mutable>>,
+    store: St,
+    session_id: SessionId,
+    head_hash: Option<EntryHash>,
     scope: Option<Scope>,
     hook_builder: HookRegistryBuilder,
     interceptor_installed: bool,
@@ -30,20 +35,24 @@ pub struct Pod<C: LlmClient, St: Store> {
 
 impl<C: LlmClient, St: Store> Pod<C, St> {
     /// Create a new Pod from a pre-built Worker and store.
-    ///
-    /// The caller is responsible for constructing the `LlmClient` from the
-    /// manifest's provider config. This keeps Pod free of provider-specific
-    /// dependencies.
     pub async fn new(
         manifest: PodManifest,
         worker: Worker<C>,
         store: St,
         scope: Option<Scope>,
     ) -> Result<Self, PodError> {
-        let session = Session::new(worker, store, SessionConfig::default()).await?;
+        let state = SessionStartState {
+            system_prompt: worker.get_system_prompt(),
+            config: worker.request_config(),
+            history: worker.history(),
+        };
+        let (session_id, head_hash) = session_store::create_session(&store, state).await?;
         Ok(Self {
             manifest,
-            session,
+            worker: Some(worker),
+            store,
+            session_id,
+            head_hash: Some(head_hash),
             scope,
             hook_builder: HookRegistryBuilder::new(),
             interceptor_installed: false,
@@ -58,10 +67,22 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         store: St,
         scope: Option<Scope>,
     ) -> Result<Self, PodError> {
-        let session = Session::restore(client, store, session_id, SessionConfig::default()).await?;
+        let state = session_store::restore(&store, session_id).await?;
+        let mut worker = Worker::new(client);
+        if let Some(ref prompt) = state.system_prompt {
+            worker.set_system_prompt(prompt);
+        }
+        worker.set_history(state.history);
+        worker.set_request_config(state.config);
+        worker.set_turn_count(state.turn_count);
+        worker.set_last_run_interrupted(state.last_run_interrupted);
+
         Ok(Self {
             manifest,
-            session,
+            worker: Some(worker),
+            store,
+            session_id,
+            head_hash: state.head_hash,
             scope,
             hook_builder: HookRegistryBuilder::new(),
             interceptor_installed: false,
@@ -70,7 +91,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
 
     /// The session ID used for persistence.
     pub fn session_id(&self) -> SessionId {
-        self.session.session_id()
+        self.session_id
     }
 
     /// The Pod's manifest.
@@ -83,18 +104,25 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         self.scope.as_ref()
     }
 
-    /// Direct access to the underlying session.
+    /// Direct access to the underlying Worker.
+    pub fn worker(&self) -> &Worker<C, Mutable> {
+        self.worker.as_ref().expect("worker taken during run")
+    }
+
+    /// Mutable access to the underlying Worker.
     ///
-    /// Use this to register tools, hooks, or subscribers on the worker
-    /// before calling [`run`](Self::run).
-    pub fn session_mut(&mut self) -> &mut Session<C, St> {
-        &mut self.session
+    /// Use this to register tools, hooks, or subscribers before calling
+    /// [`run`](Self::run).
+    pub fn worker_mut(&mut self) -> &mut Worker<C, Mutable> {
+        self.worker.as_mut().expect("worker taken during run")
+    }
+
+    /// Reference to the store.
+    pub fn store(&self) -> &St {
+        &self.store
     }
 
     // --- Hook registration ---
-    //
-    // Hooks must be registered before the first call to `run()` or `resume()`.
-    // Attempting to add a hook after execution has started will panic.
 
     fn assert_hooks_open(&self) {
         assert!(
@@ -145,7 +173,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             let builder = std::mem::take(&mut self.hook_builder);
             let registry = Arc::new(builder.build());
             let interceptor = HookInterceptor::new(registry);
-            self.session.worker_mut().set_interceptor(interceptor);
+            self.worker_mut().set_interceptor(interceptor);
             self.interceptor_installed = true;
         }
     }
@@ -153,23 +181,114 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     /// Send user input and run until the LLM turn completes.
     pub async fn run(&mut self, input: impl Into<String>) -> Result<PodRunResult, PodError> {
         self.ensure_interceptor_installed();
-        let result = self.session.run(input).await?;
-        Ok(result.into())
+
+        // Split borrow: access worker field directly to allow concurrent
+        // mutable borrows on session_id / head_hash.
+        let w = self.worker.as_ref().unwrap();
+        session_store::ensure_head_or_fork(
+            &self.store,
+            &mut self.session_id,
+            &mut self.head_hash,
+            SessionStartState {
+                system_prompt: w.get_system_prompt(),
+                config: w.request_config(),
+                history: w.history(),
+            },
+        )
+        .await?;
+
+        let history_before = self.worker.as_ref().unwrap().history().len();
+
+        // lock → run → unlock
+        let worker = self.worker.take().expect("worker taken during run");
+        let mut locked = worker.lock();
+        let result = locked.run(input).await;
+        self.worker = Some(locked.unlock());
+
+        self.persist_turn(history_before, &result).await?;
+        result.map(PodRunResult::from).map_err(PodError::Worker)
     }
 
     /// Resume from a paused state.
     pub async fn resume(&mut self) -> Result<PodRunResult, PodError> {
         self.ensure_interceptor_installed();
-        let result = self.session.resume().await?;
-        Ok(result.into())
+
+        let w = self.worker.as_ref().unwrap();
+        session_store::ensure_head_or_fork(
+            &self.store,
+            &mut self.session_id,
+            &mut self.head_hash,
+            SessionStartState {
+                system_prompt: w.get_system_prompt(),
+                config: w.request_config(),
+                history: w.history(),
+            },
+        )
+        .await?;
+
+        let history_before = self.worker.as_ref().unwrap().history().len();
+
+        // lock → resume → unlock
+        let worker = self.worker.take().expect("worker taken during run");
+        let mut locked = worker.lock();
+        let result = locked.resume().await;
+        self.worker = Some(locked.unlock());
+
+        self.persist_turn(history_before, &result).await?;
+        result.map(PodRunResult::from).map_err(PodError::Worker)
+    }
+
+    /// Persist delta + turn end + outcome after a run/resume.
+    async fn persist_turn(
+        &mut self,
+        history_before: usize,
+        result: &Result<WorkerResult, WorkerError>,
+    ) -> Result<(), StoreError> {
+        // Use direct field access for split borrows (worker immutable,
+        // head_hash mutable).
+        let w = self.worker.as_ref().unwrap();
+        let new_items = &w.history()[history_before..];
+        session_store::save_delta(
+            &self.store,
+            self.session_id,
+            &mut self.head_hash,
+            new_items,
+        )
+        .await?;
+
+        let turn_count = self.worker.as_ref().unwrap().turn_count();
+        session_store::save_turn_end(
+            &self.store,
+            self.session_id,
+            &mut self.head_hash,
+            turn_count,
+        )
+        .await?;
+
+        let interrupted = self.worker.as_ref().unwrap().last_run_interrupted();
+        let outcome = match result {
+            Ok(WorkerResult::Finished) => Outcome::Finished,
+            Ok(WorkerResult::Paused) => Outcome::Paused,
+            Ok(WorkerResult::LimitReached) => Outcome::LimitReached,
+            Err(e) => Outcome::Error {
+                message: e.to_string(),
+            },
+        };
+        session_store::save_outcome(
+            &self.store,
+            self.session_id,
+            &mut self.head_hash,
+            outcome,
+            interrupted,
+        )
+        .await?;
+
+        Ok(())
     }
 }
 
 impl<St: Store> Pod<Box<dyn LlmClient>, St> {
     /// Create a Pod entirely from a manifest.
-    ///
-    /// Builds the LLM client from the provider config, applies worker
-    /// settings, and creates a new persistent session.
     pub async fn from_manifest(
         manifest: PodManifest,
         store: St,
@@ -179,10 +298,19 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
         let client = provider::build_client(&manifest.provider, manifest_dir.as_deref())?;
         let mut worker = Worker::new(client);
         apply_worker_manifest(&mut worker, &manifest.worker);
-        let session = Session::new(worker, store, SessionConfig::default()).await?;
+
+        let state = SessionStartState {
+            system_prompt: worker.get_system_prompt(),
+            config: worker.request_config(),
+            history: worker.history(),
+        };
+        let (session_id, head_hash) = session_store::create_session(&store, state).await?;
         Ok(Self {
             manifest,
-            session,
+            worker: Some(worker),
+            store,
+            session_id,
+            head_hash: Some(head_hash),
             scope,
             hook_builder: HookRegistryBuilder::new(),
             interceptor_installed: false,
@@ -217,12 +345,12 @@ pub enum PodRunResult {
     LimitReached,
 }
 
-impl From<llm_worker::WorkerResult> for PodRunResult {
-    fn from(r: llm_worker::WorkerResult) -> Self {
+impl From<WorkerResult> for PodRunResult {
+    fn from(r: WorkerResult) -> Self {
         match r {
-            llm_worker::WorkerResult::Finished => PodRunResult::Finished,
-            llm_worker::WorkerResult::Paused => PodRunResult::Paused,
-            llm_worker::WorkerResult::LimitReached => PodRunResult::LimitReached,
+            WorkerResult::Finished => PodRunResult::Finished,
+            WorkerResult::Paused => PodRunResult::Paused,
+            WorkerResult::LimitReached => PodRunResult::LimitReached,
         }
     }
 }
@@ -231,7 +359,7 @@ impl From<llm_worker::WorkerResult> for PodRunResult {
 #[derive(Debug, thiserror::Error)]
 pub enum PodError {
     #[error(transparent)]
-    Session(#[from] SessionError),
+    Worker(#[from] WorkerError),
 
     #[error(transparent)]
     Store(#[from] StoreError),

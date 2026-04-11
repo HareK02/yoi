@@ -12,7 +12,7 @@
 //! ```
 
 use pod::{Pod, PodManifest, PodRunResult};
-use llm_worker_persistence::FsStore;
+use session_store::FsStore;
 
 const MANIFEST_TOML: &str = r#"
 [pod]
@@ -52,7 +52,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 5. Extract the assistant's reply from history
-    let history = pod.session_mut().worker().history();
+    let history = pod.worker().history();
     if let Some(text) = history
         .iter()
         .rev()

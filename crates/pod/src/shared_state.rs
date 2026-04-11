@@ -1,7 +1,7 @@
 use std::sync::RwLock;
 
 use llm_worker::llm_client::types::Item;
-use llm_worker_persistence::SessionId;
+use session_store::SessionId;
 use serde::{Deserialize, Serialize};
 
 /// Shared state between PodController and runtime directory.
@@ -88,7 +88,7 @@ mod tests {
     fn test_state() -> PodSharedState {
         PodSharedState::new(
             "test-pod".into(),
-            llm_worker_persistence::new_session_id(),
+            session_store::new_session_id(),
             "[pod]\nname = \"test-pod\"".into(),
         )
     }

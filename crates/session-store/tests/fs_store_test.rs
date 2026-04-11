@@ -1,5 +1,5 @@
 use llm_worker::llm_client::types::{Item, RequestConfig};
-use llm_worker_persistence::{
+use session_store::{
     FsStore, LogEntry, Outcome, Store, TraceEntry, build_chain, collect_state, new_session_id,
 };
 

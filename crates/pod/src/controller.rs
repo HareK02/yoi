@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use llm_worker::llm_client::client::LlmClient;
 use llm_worker::WorkerError;
-use llm_worker_persistence::Store;
+use session_store::Store;
 use tokio::sync::{broadcast, mpsc};
 
 use crate::pod::{Pod, PodRunResult, PodError};
@@ -85,7 +85,7 @@ impl PodController {
 
         // Register event bridge callbacks on the worker
         {
-            let worker = pod.session_mut().worker_mut();
+            let worker = pod.worker_mut();
 
             let tx = event_tx.clone();
             worker.on_turn_start(move |turn| {
@@ -158,7 +158,7 @@ impl PodController {
         }
 
         // Clone cancel sender before moving pod
-        let cancel_tx = pod.session_mut().worker_mut().cancel_sender();
+        let cancel_tx = pod.worker_mut().cancel_sender();
 
         tokio::spawn(async move {
             // Hold socket server alive for the lifetime of the controller task
@@ -191,7 +191,7 @@ impl PodController {
                         )
                         .await;
 
-                        let items = pod.session_mut().worker_mut().history().to_vec();
+                        let items = pod.worker().history().to_vec();
                         shared_state.update_history(items);
                         shared_state.set_status(new_status);
                         let _ = runtime_dir.write_status(&shared_state).await;
@@ -218,7 +218,7 @@ impl PodController {
                         )
                         .await;
 
-                        let items = pod.session_mut().worker_mut().history().to_vec();
+                        let items = pod.worker().history().to_vec();
                         shared_state.update_history(items);
                         shared_state.set_status(new_status);
                         let _ = runtime_dir.write_status(&shared_state).await;
@@ -307,19 +307,12 @@ where
 
 fn worker_error_code(e: &PodError) -> ErrorCode {
     match e {
-        PodError::Session(se) => {
-            use llm_worker_persistence::SessionError;
-            match se {
-                SessionError::Worker(we) => match we {
-                    WorkerError::Tool(_) => ErrorCode::ToolError,
-                    WorkerError::Client(_) => ErrorCode::ProviderError,
-                    _ => ErrorCode::Internal,
-                },
-                _ => ErrorCode::Internal,
-            }
-        }
+        PodError::Worker(we) => match we {
+            WorkerError::Tool(_) => ErrorCode::ToolError,
+            WorkerError::Client(_) => ErrorCode::ProviderError,
+            _ => ErrorCode::Internal,
+        },
         PodError::Provider(_) => ErrorCode::ProviderError,
         _ => ErrorCode::Internal,
     }
 }
-

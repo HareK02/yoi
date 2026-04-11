@@ -4,7 +4,7 @@ members = [
     "crates/daemon",
     "crates/llm-worker",
     "crates/llm-worker-macros",
-    "crates/llm-worker-persistence",
+    "crates/session-store",
     "crates/manifest",
     "crates/pod",
     "crates/protocol",
