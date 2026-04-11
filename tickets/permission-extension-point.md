@@ -51,4 +51,4 @@ action = "allow"
 
 ## 依存チケット
 
-- [remove-hook-module.md](remove-hook-module.md) — PreToolCall が insomnia 層に移動してから実装
+- ~~[remove-hook-module.md](remove-hook-module.md)~~ — 完了。PreToolCall は Pod 層の `hook::Hook<PreToolCall>` として利用可能

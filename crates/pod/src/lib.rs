@@ -1,12 +1,15 @@
 pub mod controller;
+pub mod hook;
 pub mod runtime_dir;
 pub mod shared_state;
 pub mod socket_server;
 
+mod hook_interceptor;
 mod pod;
 
 pub use controller::{PodController, PodHandle};
 pub use manifest::{PodManifest, ProviderConfig, ProviderKind, Scope};
+pub use hook::{Hook, HookEventKind, HookRegistryBuilder};
 pub use pod::{Pod, PodError, PodRunResult, apply_worker_manifest};
 pub use protocol::{ErrorCode, Event, Method, TurnResult};
 pub use provider::{ProviderError, build_client};

@@ -370,3 +370,54 @@ pub trait ToolOutputProcessor: Send + Sync {
     /// For large outputs, this should be a summary with a blob reference.
     async fn process(&self, output: String) -> Result<String, ToolError>;
 }
+
+// =============================================================================
+// Tool Call / Result Types
+// =============================================================================
+
+/// Tool call information
+///
+/// Represents a ToolUse block from LLM.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCall {
+    /// Tool call ID (used for linking with response)
+    pub id: String,
+    /// Tool name
+    pub name: String,
+    /// Input arguments (JSON)
+    pub input: Value,
+}
+
+/// Tool execution result
+///
+/// Represents the result after tool execution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolResult {
+    /// Corresponding tool call ID
+    pub tool_use_id: String,
+    /// Result content
+    pub content: String,
+    /// Whether this is an error
+    #[serde(default)]
+    pub is_error: bool,
+}
+
+impl ToolResult {
+    /// Create a success result
+    pub fn success(tool_use_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            tool_use_id: tool_use_id.into(),
+            content: content.into(),
+            is_error: false,
+        }
+    }
+
+    /// Create an error result
+    pub fn error(tool_use_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            tool_use_id: tool_use_id.into(),
+            content: content.into(),
+            is_error: true,
+        }
+    }
+}

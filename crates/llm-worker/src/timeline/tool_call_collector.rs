@@ -5,7 +5,7 @@
 
 use crate::{
     handler::{Handler, ToolUseBlockEvent, ToolUseBlockKind},
-    hook::ToolCall,
+    tool::ToolCall,
 };
 use std::sync::{Arc, Mutex};
 

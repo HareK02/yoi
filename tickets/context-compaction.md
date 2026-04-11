@@ -64,4 +64,4 @@ history 内のツール出力を走査:
 
 ## 依存チケット
 
-- [remove-hook-module.md](remove-hook-module.md) — Hook が insomnia 層に移動した後、PreLlmRequest で Prune を差し込む
+- ~~[remove-hook-module.md](remove-hook-module.md)~~ — 完了。PreLlmRequest は Pod 層の `hook::Hook<PreLlmRequest>` として利用可能

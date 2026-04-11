@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use llm_worker::llm_client::client::LlmClient;
 use llm_worker::llm_client::RequestConfig;
 use llm_worker::Worker;
@@ -7,6 +9,12 @@ use llm_worker_persistence::{
 
 use manifest::{PodManifest, Scope, WorkerManifest};
 
+use crate::hook::{
+    Hook, HookRegistryBuilder, OnAbort, OnPromptSubmit, OnTurnEnd, PostToolCall, PreLlmRequest,
+    PreToolCall,
+};
+use crate::hook_interceptor::HookInterceptor;
+
 /// An independent agent execution unit.
 ///
 /// Wraps a persistent [`Session`] with manifest metadata and an optional
@@ -15,6 +23,8 @@ pub struct Pod<C: LlmClient, St: Store> {
     manifest: PodManifest,
     session: Session<C, St>,
     scope: Option<Scope>,
+    hook_builder: HookRegistryBuilder,
+    interceptor_installed: bool,
 }
 
 impl<C: LlmClient, St: Store> Pod<C, St> {
@@ -34,6 +44,8 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             manifest,
             session,
             scope,
+            hook_builder: HookRegistryBuilder::new(),
+            interceptor_installed: false,
         })
     }
 
@@ -50,6 +62,8 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             manifest,
             session,
             scope,
+            hook_builder: HookRegistryBuilder::new(),
+            interceptor_installed: false,
         })
     }
 
@@ -76,14 +90,75 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         &mut self.session
     }
 
+    // --- Hook registration ---
+    //
+    // Hooks must be registered before the first call to `run()` or `resume()`.
+    // Attempting to add a hook after execution has started will panic.
+
+    fn assert_hooks_open(&self) {
+        assert!(
+            !self.interceptor_installed,
+            "cannot add hooks after run() or resume() has been called"
+        );
+    }
+
+    /// Register a hook that runs after receiving user input.
+    pub fn add_on_prompt_submit_hook(&mut self, hook: impl Hook<OnPromptSubmit> + 'static) {
+        self.assert_hooks_open();
+        self.hook_builder.add_on_prompt_submit(hook);
+    }
+
+    /// Register a hook that runs before each LLM request.
+    pub fn add_pre_llm_request_hook(&mut self, hook: impl Hook<PreLlmRequest> + 'static) {
+        self.assert_hooks_open();
+        self.hook_builder.add_pre_llm_request(hook);
+    }
+
+    /// Register a hook that runs before each tool call.
+    pub fn add_pre_tool_call_hook(&mut self, hook: impl Hook<PreToolCall> + 'static) {
+        self.assert_hooks_open();
+        self.hook_builder.add_pre_tool_call(hook);
+    }
+
+    /// Register a hook that runs after each tool call.
+    pub fn add_post_tool_call_hook(&mut self, hook: impl Hook<PostToolCall> + 'static) {
+        self.assert_hooks_open();
+        self.hook_builder.add_post_tool_call(hook);
+    }
+
+    /// Register a hook that runs at the end of a turn.
+    pub fn add_on_turn_end_hook(&mut self, hook: impl Hook<OnTurnEnd> + 'static) {
+        self.assert_hooks_open();
+        self.hook_builder.add_on_turn_end(hook);
+    }
+
+    /// Register a hook that runs when execution is aborted.
+    pub fn add_on_abort_hook(&mut self, hook: impl Hook<OnAbort> + 'static) {
+        self.assert_hooks_open();
+        self.hook_builder.add_on_abort(hook);
+    }
+
+    /// Install the hook-based interceptor on the Worker if not already done.
+    fn ensure_interceptor_installed(&mut self) {
+        if !self.interceptor_installed {
+            let builder = std::mem::take(&mut self.hook_builder);
+            let registry = Arc::new(builder.build());
+            let interceptor = HookInterceptor::new(registry);
+            self.session.worker.set_interceptor(interceptor);
+            self.interceptor_installed = true;
+        }
+    }
+
     /// Send user input and run until the LLM turn completes.
     pub async fn run(&mut self, input: impl Into<String>) -> Result<PodRunResult, PodError> {
+        self.ensure_interceptor_installed();
         let result = self.session.run(input).await?;
         Ok(result.into())
     }
 
     /// Resume from a paused state.
     pub async fn resume(&mut self) -> Result<PodRunResult, PodError> {
+        self.ensure_interceptor_installed();
         let result = self.session.resume().await?;
         Ok(result.into())
     }
@@ -107,6 +182,8 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             manifest,
             session,
             scope,
+            hook_builder: HookRegistryBuilder::new(),
+            interceptor_installed: false,
         })
     }
 }

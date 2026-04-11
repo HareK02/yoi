@@ -41,7 +41,6 @@ use tracing_subscriber::EnvFilter;
 use clap::{Parser, ValueEnum};
 use llm_worker::{
     Worker,
-    hook::{Hook, HookError, PostToolCall, PostToolCallContext, PostToolCallResult},
     llm_client::{
         LlmClient,
         providers::{
@@ -49,6 +48,7 @@ use llm_worker::{
             openai::OpenAIClient,
         },
     },
+    interceptor::{Interceptor, PostToolAction, ToolResultInfo},
     timeline::{Handler, TextBlockEvent, TextBlockKind, ToolUseBlockEvent, ToolUseBlockKind},
 };
 use llm_worker_macros::tool_registry;
@@ -270,34 +270,34 @@ impl Handler<ToolUseBlockKind> for ToolCallPrinter {
     }
 }
 
-/// Hook that displays tool execution results
-struct ToolResultPrinterHook {
+/// Policy that displays tool execution results.
+struct ToolResultPrinterPolicy {
     call_names: Arc<Mutex<HashMap<String, String>>>,
 }
 
-impl ToolResultPrinterHook {
+impl ToolResultPrinterPolicy {
     fn new(call_names: Arc<Mutex<HashMap<String, String>>>) -> Self {
         Self { call_names }
     }
 }
 
 #[async_trait]
-impl Hook<PostToolCall> for ToolResultPrinterHook {
-    async fn call(&self, ctx: &mut PostToolCallContext) -> Result<PostToolCallResult, HookError> {
+impl Interceptor for ToolResultPrinterPolicy {
+    async fn post_tool_call(&self, info: &mut ToolResultInfo) -> PostToolAction {
         let name = self
             .call_names
             .lock()
             .unwrap()
-            .remove(&ctx.result.tool_use_id)
-            .unwrap_or_else(|| ctx.result.tool_use_id.clone());
+            .remove(&info.result.tool_use_id)
+            .unwrap_or_else(|| info.result.tool_use_id.clone());
 
-        if ctx.result.is_error {
-            println!("   Result ({}): ❌ {}", name, ctx.result.content);
+        if info.result.is_error {
+            println!("   Result ({}): ❌ {}", name, info.result.content);
         } else {
-            println!("   Result ({}): ✅ {}", name, ctx.result.content);
+            println!("   Result ({}): ✅ {}", name, info.result.content);
         }
 
-        Ok(PostToolCallResult::Continue)
+        PostToolAction::Continue
     }
 }
 
@@ -450,7 +450,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .on_text_block(StreamingPrinter::new())
         .on_tool_use_block(ToolCallPrinter::new(tool_call_names.clone()));
 
-    worker.add_post_tool_call_hook(ToolResultPrinterHook::new(tool_call_names));
+    worker.set_interceptor(ToolResultPrinterPolicy::new(tool_call_names));
 
     // One-shot mode
     if let Some(prompt) = args.prompt {

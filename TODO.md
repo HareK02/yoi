@@ -10,3 +10,5 @@
 - [x] セッションエントリのハッシュチェーン
 - [x] Subscriber → クロージャ API 移行
 - [x] JSONL ストリーム変換ユーティリティ (protocol::stream)
+- [x] Hook モジュールの llm-worker からの除去 → [tickets/remove-hook-module.md](tickets/remove-hook-module.md)
+- [ ] api_key_file: ファイルパスによるAPIキー解決 → [tickets/api-key-file.md](tickets/api-key-file.md)

@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use common::MockLlmClient;
-use llm_worker::hook::{Hook, HookError, OnTurnEnd, OnTurnEndResult};
+use llm_worker::interceptor::{Interceptor, TurnEndAction};
 use llm_worker::llm_client::event::{Event, ResponseStatus, StatusEvent};
 use llm_worker::llm_client::types::{Item, RequestConfig};
 use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta};
@@ -76,13 +76,13 @@ fn weather_tool_definition() -> ToolDefinition {
     })
 }
 
-/// Hook that forces Pause on the first turn end.
-struct PauseOnFirstTurnEnd;
+/// Policy that forces Pause on every turn end.
+struct PausePolicy;
 
 #[async_trait]
-impl Hook<OnTurnEnd> for PauseOnFirstTurnEnd {
-    async fn call(&self, _input: &mut Vec<Item>) -> Result<OnTurnEndResult, HookError> {
-        Ok(OnTurnEndResult::Paused)
+impl Interceptor for PausePolicy {
+    async fn on_turn_end(&self, _history: &[Item]) -> TurnEndAction {
+        TurnEndAction::Pause
     }
 }
 
@@ -214,7 +214,7 @@ async fn session_resume_after_pause() {
     let client = MockLlmClient::with_responses(tool_call_events());
     let mut worker = Worker::new(client);
     worker.register_tool(weather_tool_definition()).unwrap();
-    worker.add_on_turn_end_hook(PauseOnFirstTurnEnd);
+    worker.set_interceptor(PausePolicy);
 
     let mut session = Session::new(worker, store.clone(), SessionConfig::default())
         .await

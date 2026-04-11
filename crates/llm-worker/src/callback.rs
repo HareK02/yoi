@@ -10,7 +10,7 @@ use crate::handler::{
     Handler, Kind, TextBlockEvent, TextBlockKind, ToolUseBlockEvent, ToolUseBlockKind,
     ToolUseBlockStart,
 };
-use crate::hook::ToolCall;
+use crate::tool::ToolCall;
 
 // =============================================================================
 // TextBlock Closure Handler

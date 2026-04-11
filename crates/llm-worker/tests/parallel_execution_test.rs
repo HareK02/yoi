@@ -8,11 +8,8 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use llm_worker::Worker;
-use llm_worker::hook::{
-    Hook, HookError, PostToolCall, PostToolCallContext, PostToolCallResult, PreToolCall,
-    PreToolCallResult, ToolCallContext,
-};
 use llm_worker::llm_client::event::{Event, ResponseStatus, StatusEvent};
+use llm_worker::interceptor::{Interceptor, PostToolAction, PreToolAction, ToolCallInfo, ToolResultInfo};
 use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta};
 
 mod common;
@@ -156,21 +153,21 @@ async fn test_before_tool_call_skip() {
     worker.register_tool(allowed_tool.definition()).unwrap();
     worker.register_tool(blocked_tool.definition()).unwrap();
 
-    // Hook to skip "blocked_tool"
-    struct BlockingHook;
+    // Policy to skip "blocked_tool"
+    struct BlockingPolicy;
 
     #[async_trait]
-    impl Hook<PreToolCall> for BlockingHook {
-        async fn call(&self, ctx: &mut ToolCallContext) -> Result<PreToolCallResult, HookError> {
-            if ctx.call.name == "blocked_tool" {
-                Ok(PreToolCallResult::Skip)
+    impl Interceptor for BlockingPolicy {
+        async fn pre_tool_call(&self, info: &mut ToolCallInfo) -> PreToolAction {
+            if info.call.name == "blocked_tool" {
+                PreToolAction::Skip
             } else {
-                Ok(PreToolCallResult::Continue)
+                PreToolAction::Continue
             }
         }
     }
 
-    worker.add_pre_tool_call_hook(BlockingHook);
+    worker.set_interceptor(BlockingPolicy);
 
     let _result = worker.run("Test hook").await;
 
@@ -235,25 +232,22 @@ async fn test_post_tool_call_modification() {
 
     worker.register_tool(simple_tool_definition()).unwrap();
 
-    // Hook to modify results
-    struct ModifyingHook {
+    // Policy to modify results
+    struct ModifyingPolicy {
         modified_content: Arc<std::sync::Mutex<Option<String>>>,
     }
 
     #[async_trait]
-    impl Hook<PostToolCall> for ModifyingHook {
-        async fn call(
-            &self,
-            ctx: &mut PostToolCallContext,
-        ) -> Result<PostToolCallResult, HookError> {
-            ctx.result.content = format!("[Modified] {}", ctx.result.content);
-            *self.modified_content.lock().unwrap() = Some(ctx.result.content.clone());
-            Ok(PostToolCallResult::Continue)
+    impl Interceptor for ModifyingPolicy {
+        async fn post_tool_call(&self, info: &mut ToolResultInfo) -> PostToolAction {
+            info.result.content = format!("[Modified] {}", info.result.content);
+            *self.modified_content.lock().unwrap() = Some(info.result.content.clone());
+            PostToolAction::Continue
         }
     }
 
     let modified_content = Arc::new(std::sync::Mutex::new(None));
-    worker.add_post_tool_call_hook(ModifyingHook {
+    worker.set_interceptor(ModifyingPolicy {
         modified_content: modified_content.clone(),
     });
 
