@@ -10,4 +10,3 @@ ratatui = "0.30.0"
 crossterm = "0.28"
 tokio = { version = "1.49", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
 serde_json = "1.0"
-tui-scrollview = "0.6.4"

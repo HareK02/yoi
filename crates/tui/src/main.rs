@@ -6,11 +6,10 @@ use std::io;
 use std::path::PathBuf;
 
 use crossterm::event::{self, Event as TermEvent, KeyCode, KeyEvent, KeyModifiers};
-use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
-use crossterm::{execute};
+use crossterm::terminal;
 use protocol::Method;
 use ratatui::backend::CrosstermBackend;
-use ratatui::Terminal;
+use ratatui::{Terminal, TerminalOptions, Viewport};
 
 use crate::app::App;
 use crate::client::PodClient;
@@ -54,24 +53,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (pod_name, socket_override) = parse_args();
     let socket_path = resolve_socket(&pod_name, socket_override);
 
-    // Install panic hook to restore terminal
-    let original_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        let _ = terminal::disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
-        original_hook(info);
-    }));
-
-    // Setup terminal
     terminal::enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    let stdout = io::stdout();
     let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    let mut terminal = Terminal::with_options(
+        backend,
+        TerminalOptions {
+            viewport: Viewport::Inline(3),
+        },
+    )?;
 
     let mut app = App::new(pod_name);
 
-    // Connect to pod
     match PodClient::connect(&socket_path).await {
         Ok(mut client) => {
             app.connected = true;
@@ -79,18 +72,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             run_loop(&mut terminal, &mut app, client).await?;
         }
         Err(e) => {
-            app.messages.push(app::Message {
-                kind: app::MessageKind::Error,
-                content: format!("Failed to connect to {}: {e}", socket_path.display()),
-            });
-            // Show error and wait for quit
-            run_disconnected(&mut terminal, &mut app)?;
+            app.output_queue.push(app::OutputItem::Padded(
+                app::MessageKind::Error,
+                format!("Failed to connect to {}: {e}", socket_path.display()),
+            ));
+            ui::flush_output(&mut terminal, &mut app)?;
+            terminal.draw(|f| ui::draw(f, &app))?;
+            run_disconnected(&mut app)?;
         }
     }
 
-    // Restore terminal
     terminal::disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
 
     Ok(())
 }
@@ -100,9 +92,10 @@ async fn run_loop(
     app: &mut App,
     mut client: PodClient,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    loop {
-        terminal.draw(|f| ui::draw(f, app))?;
+    // Initial draw of the viewport
+    terminal.draw(|f| ui::draw(f, app))?;
 
+    loop {
         if app.quit {
             break;
         }
@@ -127,26 +120,26 @@ async fn run_loop(
                     Some(ev) => app.handle_pod_event(ev),
                     None => {
                         app.connected = false;
-                        app.messages.push(app::Message {
-                            kind: app::MessageKind::Error,
-                            content: "Connection lost".into(),
-                        });
+                        app.output_queue.push(app::OutputItem::Padded(
+                            app::MessageKind::Error,
+                            "Connection lost".into(),
+                        ));
                     }
                 }
             }
         }
+
+        // Flush any queued output above the viewport
+        ui::flush_output(terminal, app)?;
+        // Redraw the fixed viewport (status + input)
+        terminal.draw(|f| ui::draw(f, app))?;
     }
 
     Ok(())
 }
 
-fn run_disconnected(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    app: &mut App,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn run_disconnected(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
     loop {
-        terminal.draw(|f| ui::draw(f, app))?;
-
         if event::poll(std::time::Duration::from_millis(100))? {
             if let TermEvent::Key(key) = event::read()? {
                 match key.code {
@@ -199,14 +192,6 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Option<Method> {
         }
         KeyCode::End => {
             app.move_cursor_end();
-            None
-        }
-        KeyCode::PageUp => {
-            app.scroll_up();
-            None
-        }
-        KeyCode::PageDown => {
-            app.scroll_down();
             None
         }
         KeyCode::Char(c) => {

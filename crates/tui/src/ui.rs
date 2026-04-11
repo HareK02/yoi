@@ -1,124 +1,92 @@
-use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect, Size};
+use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Padding, Paragraph, Wrap};
 use ratatui::Frame;
-use tui_scrollview::{ScrollView, ScrollbarVisibility};
 
-use crate::app::{fmt_tokens, App, MessageKind};
+use crate::app::{fmt_tokens, App, MessageKind, OutputItem};
 
-pub fn draw(frame: &mut Frame, app: &mut App) {
+/// Draw the fixed viewport (3 lines: separator, status, input).
+pub fn draw(frame: &mut Frame, app: &App) {
+    let area = frame.area();
     let chunks = Layout::vertical([
-        Constraint::Min(1),    // messages (scroll area)
         Constraint::Length(1), // separator
-        Constraint::Length(1), // status line
+        Constraint::Length(1), // status
         Constraint::Length(1), // input
     ])
-    .split(frame.area());
+    .split(area);
 
-    draw_messages(frame, app, chunks[0]);
-    draw_separator(frame, chunks[1]);
-    draw_status(frame, app, chunks[2]);
-    draw_input(frame, app, chunks[3]);
+    draw_separator(frame, chunks[0]);
+    draw_status(frame, app, chunks[1]);
+    draw_input(frame, app, chunks[2]);
 }
 
-fn draw_messages(frame: &mut Frame, app: &mut App, area: Rect) {
-    let width = area.width;
-    let padded_inner = width.saturating_sub(1); // content width inside Block::padding(left=1)
-
-    // Build segments: (is_padded, lines, wrapped_height)
-    struct Seg<'a> {
-        lines: Vec<Line<'a>>,
-        padded: bool,
-        height: u16,
+/// Flush queued output items above the inline viewport via insert_before.
+pub fn flush_output(
+    terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
+    app: &mut App,
+) -> std::io::Result<()> {
+    let items: Vec<OutputItem> = app.output_queue.drain(..).collect();
+    if items.is_empty() {
+        return Ok(());
     }
 
-    let mut segs: Vec<Seg> = Vec::new();
-    let mut content: Vec<Line> = Vec::new();
+    let width = terminal.size()?.width;
 
-    macro_rules! flush_content {
-        () => {
-            if !content.is_empty() {
-                let h = wrapped_height(&content, padded_inner);
-                segs.push(Seg { lines: std::mem::take(&mut content), padded: true, height: h });
+    for item in items {
+        match item {
+            OutputItem::Blank => {
+                terminal.insert_before(1, |buf| {
+                    // empty line
+                    let _ = buf;
+                })?;
             }
-        };
-    }
-
-    for msg in &app.messages {
-        let style = kind_style(&msg.kind);
-        match msg.kind {
-            MessageKind::TurnHeader => {
-                flush_content!();
-                if !segs.is_empty() {
-                    segs.push(Seg { lines: vec![Line::raw("")], padded: false, height: 1 });
-                }
-                let lines = vec![Line::from(Span::styled(msg.content.clone(), style))];
-                segs.push(Seg { lines, padded: false, height: 1 });
+            OutputItem::TurnHeader(text) => {
+                terminal.insert_before(1, |buf| {
+                    let style = kind_style(&MessageKind::TurnHeader);
+                    Paragraph::new(Line::from(Span::styled(text, style)))
+                        .render(buf.area, buf);
+                })?;
             }
-            MessageKind::TurnStats => {
-                flush_content!();
-                let lines: Vec<Line> = msg.content.lines()
-                    .map(|l| Line::from(Span::styled(l.to_owned(), style)).alignment(Alignment::Right))
+            OutputItem::Padded(kind, text) => {
+                let style = kind_style(&kind);
+                let lines: Vec<Line> = text
+                    .lines()
+                    .map(|l| Line::from(Span::styled(l.to_owned(), style)))
                     .collect();
-                let h = wrapped_height(&lines, padded_inner);
-                segs.push(Seg { lines, padded: true, height: h });
-                segs.push(Seg { lines: vec![Line::raw("")], padded: false, height: 1 });
+                let height = wrapped_height(&lines, width.saturating_sub(1));
+                terminal.insert_before(height, |buf| {
+                    Paragraph::new(lines)
+                        .block(Block::default().padding(Padding::left(1)))
+                        .wrap(Wrap { trim: false })
+                        .render(buf.area, buf);
+                })?;
             }
-            MessageKind::User => {
-                for l in msg.content.lines() {
-                    content.push(Line::from(Span::styled(l.to_owned(), style)));
-                }
-                content.push(Line::raw(""));
-            }
-            _ => {
-                for l in msg.content.lines() {
-                    content.push(Line::from(Span::styled(l.to_owned(), style)));
-                }
+            OutputItem::PaddedRight(kind, text) => {
+                let style = kind_style(&kind);
+                let lines: Vec<Line> = text
+                    .lines()
+                    .map(|l| {
+                        Line::from(Span::styled(l.to_owned(), style)).alignment(Alignment::Right)
+                    })
+                    .collect();
+                let height = wrapped_height(&lines, width.saturating_sub(1));
+                terminal.insert_before(height, |buf| {
+                    Paragraph::new(lines)
+                        .block(Block::default().padding(Padding::left(1)))
+                        .wrap(Wrap { trim: false })
+                        .render(buf.area, buf);
+                })?;
             }
         }
     }
 
-    // In-progress streaming text
-    if !app.current_text.is_empty() {
-        let style = kind_style(&MessageKind::Assistant);
-        for l in app.current_text.lines() {
-            content.push(Line::from(Span::styled(l.to_owned(), style)));
-        }
-    }
-
-    flush_content!();
-
-    // Total content height
-    let total_height: u16 = segs.iter().map(|s| s.height).sum();
-
-    // Build ScrollView
-    let mut sv = ScrollView::new(Size::new(width, total_height.max(1)))
-        .horizontal_scrollbar_visibility(ScrollbarVisibility::Never);
-
-    let mut y: u16 = 0;
-    for seg in segs {
-        let rect = Rect::new(0, y, width, seg.height);
-        if seg.padded {
-            sv.render_widget(
-                Paragraph::new(seg.lines)
-                    .block(Block::default().padding(Padding::left(1)))
-                    .wrap(Wrap { trim: false }),
-                rect,
-            );
-        } else {
-            sv.render_widget(Paragraph::new(seg.lines), rect);
-        }
-        y += seg.height;
-    }
-
-    frame.render_stateful_widget(sv, area, &mut app.scroll_state);
+    Ok(())
 }
 
-/// Estimate the number of visual rows after wrapping.
 fn wrapped_height(lines: &[Line], avail_width: u16) -> u16 {
     if avail_width == 0 {
-        return lines.len() as u16;
+        return lines.len().max(1) as u16;
     }
     lines
         .iter()
@@ -126,19 +94,22 @@ fn wrapped_height(lines: &[Line], avail_width: u16) -> u16 {
             let w = line.width() as u16;
             if w == 0 { 1 } else { w.div_ceil(avail_width) }
         })
-        .sum()
+        .sum::<u16>()
+        .max(1)
 }
 
-fn draw_separator(frame: &mut Frame, area: ratatui::layout::Rect) {
+fn draw_separator(frame: &mut Frame, area: Rect) {
     let line = "─".repeat(area.width as usize);
-    let paragraph = Paragraph::new(Line::from(Span::styled(
-        line,
-        Style::default().fg(Color::DarkGray),
-    )));
-    frame.render_widget(paragraph, area);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            line,
+            Style::default().fg(Color::DarkGray),
+        ))),
+        area,
+    );
 }
 
-fn draw_status(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     let conn = if app.connected {
         Span::styled("●", Style::default().fg(Color::Green))
     } else {
@@ -179,8 +150,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-
-fn draw_input(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
     let line = Line::from(vec![
         Span::styled("> ", Style::default().fg(Color::DarkGray)),
         Span::raw(&app.input),
@@ -192,7 +162,7 @@ fn draw_input(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     frame.set_cursor_position(Position::new(cursor_x, cursor_y));
 }
 
-fn kind_style(kind: &MessageKind) -> Style {
+pub fn kind_style(kind: &MessageKind) -> Style {
     match kind {
         MessageKind::TurnHeader => Style::default().fg(Color::DarkGray),
         MessageKind::User => Style::default().fg(Color::Green),
@@ -202,3 +172,5 @@ fn kind_style(kind: &MessageKind) -> Style {
         MessageKind::TurnStats => Style::default().fg(Color::DarkGray),
     }
 }
+
+use ratatui::widgets::Widget;

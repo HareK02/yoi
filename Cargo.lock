@@ -2812,18 +2812,6 @@ dependencies = [
  "ratatui",
  "serde_json",
  "tokio",
- "tui-scrollview",
-]
-
-[[package]]
-name = "tui-scrollview"
-version = "0.6.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "94a94f467c7ac7c291039b0733e3b2d379c77884e34fc27d167921fc1ab4842f"
-dependencies = [
- "indoc",
- "ratatui-core",
- "ratatui-widgets",
 ]
 
 [[package]]

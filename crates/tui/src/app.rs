@@ -1,11 +1,8 @@
 use protocol::{Event, Method};
-use tui_scrollview::ScrollViewState;
 
 pub struct App {
     pub pod_name: String,
     pub connected: bool,
-    pub messages: Vec<Message>,
-    pub current_text: String,
     pub running: bool,
     pub run_requests: usize,
     pub run_input_tokens: u64,
@@ -14,13 +11,19 @@ pub struct App {
     pub current_tool: Option<String>,
     pub input: String,
     pub cursor: usize,
-    pub scroll_state: ScrollViewState,
     pub quit: bool,
+    /// Lines waiting to be flushed to terminal via insert_before.
+    pub output_queue: Vec<OutputItem>,
+    /// Partial streaming text not yet terminated by newline.
+    pending_text: String,
 }
 
-pub struct Message {
-    pub kind: MessageKind,
-    pub content: String,
+/// A unit of output to push above the inline viewport.
+pub enum OutputItem {
+    TurnHeader(String),
+    Padded(MessageKind, String),
+    PaddedRight(MessageKind, String),
+    Blank,
 }
 
 #[derive(Clone, Copy)]
@@ -38,8 +41,6 @@ impl App {
         Self {
             pod_name,
             connected: false,
-            messages: Vec::new(),
-            current_text: String::new(),
             running: false,
             run_requests: 0,
             run_input_tokens: 0,
@@ -48,8 +49,9 @@ impl App {
             current_tool: None,
             input: String::new(),
             cursor: 0,
-            scroll_state: ScrollViewState::new(),
             quit: false,
+            output_queue: Vec::new(),
+            pending_text: String::new(),
         }
     }
 
@@ -59,17 +61,14 @@ impl App {
             return None;
         }
         self.turn_index += 1;
-        self.messages.push(Message {
-            kind: MessageKind::TurnHeader,
-            content: format!("#{}", self.turn_index),
-        });
-        self.messages.push(Message {
-            kind: MessageKind::User,
-            content: text.clone(),
-        });
+        self.output_queue.push(OutputItem::Blank);
+        self.output_queue
+            .push(OutputItem::TurnHeader(format!("#{}", self.turn_index)));
+        self.output_queue
+            .push(OutputItem::Padded(MessageKind::User, text.clone()));
+        self.output_queue.push(OutputItem::Blank);
         self.input.clear();
         self.cursor = 0;
-        self.scroll_to_bottom();
         Some(Method::Run { input: text })
     }
 
@@ -81,45 +80,39 @@ impl App {
                 self.current_tool = None;
             }
             Event::TextDelta { text } => {
-                self.current_text.push_str(&text);
+                self.pending_text.push_str(&text);
+                self.flush_pending_lines();
             }
             Event::TextDone { .. } => {
-                let text = std::mem::take(&mut self.current_text);
-                if !text.is_empty() {
-                    self.messages.push(Message {
-                        kind: MessageKind::Assistant,
-                        content: text,
-                    });
-                    self.scroll_to_bottom();
+                // Flush any remaining partial line
+                if !self.pending_text.is_empty() {
+                    let text = std::mem::take(&mut self.pending_text);
+                    self.output_queue
+                        .push(OutputItem::Padded(MessageKind::Assistant, text));
                 }
             }
             Event::TurnEnd { .. } => {
-                if !self.current_text.is_empty() {
-                    let text = std::mem::take(&mut self.current_text);
-                    self.messages.push(Message {
-                        kind: MessageKind::Assistant,
-                        content: text,
-                    });
+                // Flush streaming text if TextDone wasn't received
+                if !self.pending_text.is_empty() {
+                    let text = std::mem::take(&mut self.pending_text);
+                    self.output_queue
+                        .push(OutputItem::Padded(MessageKind::Assistant, text));
                 }
                 self.current_tool = None;
             }
             Event::ToolCallStart { name, .. } => {
                 self.current_tool = Some(name.clone());
-                self.messages.push(Message {
-                    kind: MessageKind::Tool,
-                    content: format!("[tool] {name}"),
-                });
-                self.scroll_to_bottom();
+                self.output_queue
+                    .push(OutputItem::Padded(MessageKind::Tool, format!("[tool] {name}")));
             }
             Event::ToolCallDone {
                 name, arguments, ..
             } => {
                 self.current_tool = None;
-                self.messages.push(Message {
-                    kind: MessageKind::Tool,
-                    content: format!("[tool] {name} done ({} bytes)", arguments.len()),
-                });
-                self.scroll_to_bottom();
+                self.output_queue.push(OutputItem::Padded(
+                    MessageKind::Tool,
+                    format!("[tool] {name} done ({} bytes)", arguments.len()),
+                ));
             }
             Event::ToolResult {
                 output, is_error, ..
@@ -130,11 +123,10 @@ impl App {
                 } else {
                     output
                 };
-                self.messages.push(Message {
-                    kind: MessageKind::Tool,
-                    content: format!("{prefix} {display}"),
-                });
-                self.scroll_to_bottom();
+                self.output_queue.push(OutputItem::Padded(
+                    MessageKind::Tool,
+                    format!("{prefix} {display}"),
+                ));
             }
             Event::Usage {
                 input_tokens,
@@ -144,33 +136,42 @@ impl App {
                 self.run_output_tokens += output_tokens.unwrap_or(0);
             }
             Event::Error { code, message } => {
-                self.messages.push(Message {
-                    kind: MessageKind::Error,
-                    content: format!("[{code:?}] {message}"),
-                });
-                self.scroll_to_bottom();
+                self.output_queue.push(OutputItem::Padded(
+                    MessageKind::Error,
+                    format!("[{code:?}] {message}"),
+                ));
             }
             Event::RunEnd { .. } => {
-                self.messages.push(Message {
-                    kind: MessageKind::TurnStats,
-                    content: format!(
+                self.output_queue.push(OutputItem::PaddedRight(
+                    MessageKind::TurnStats,
+                    format!(
                         "{} reqs ↑{}/↓{}",
                         self.run_requests,
                         fmt_tokens(self.run_input_tokens),
                         fmt_tokens(self.run_output_tokens),
                     ),
-                });
+                ));
+                self.output_queue.push(OutputItem::Blank);
                 self.running = false;
                 self.run_requests = 0;
                 self.run_input_tokens = 0;
                 self.run_output_tokens = 0;
                 self.current_tool = None;
-                self.scroll_to_bottom();
             }
             Event::ToolCallArgsDelta { .. } => {}
             Event::History { items } => {
                 self.restore_history(&items);
             }
+        }
+    }
+
+    /// Extract complete lines (ending with \n) from pending_text and queue them.
+    fn flush_pending_lines(&mut self) {
+        while let Some(pos) = self.pending_text.find('\n') {
+            let line = self.pending_text[..pos].to_owned();
+            self.pending_text = self.pending_text[pos + 1..].to_owned();
+            self.output_queue
+                .push(OutputItem::Padded(MessageKind::Assistant, line));
         }
     }
 
@@ -230,20 +231,7 @@ impl App {
         self.cursor = self.input.len();
     }
 
-    pub fn scroll_up(&mut self) {
-        self.scroll_state.scroll_up();
-        self.scroll_state.scroll_up();
-        self.scroll_state.scroll_up();
-    }
-
-    pub fn scroll_down(&mut self) {
-        self.scroll_state.scroll_down();
-        self.scroll_state.scroll_down();
-        self.scroll_state.scroll_down();
-    }
-
     fn restore_history(&mut self, items: &[serde_json::Value]) {
-        self.messages.clear();
         self.turn_index = 0;
         for item in items {
             let item_type = item["type"].as_str().unwrap_or("");
@@ -253,10 +241,11 @@ impl App {
                     let kind = match role {
                         "user" => {
                             self.turn_index += 1;
-                            self.messages.push(Message {
-                                kind: MessageKind::TurnHeader,
-                                content: format!("#{}", self.turn_index),
-                            });
+                            self.output_queue.push(OutputItem::Blank);
+                            self.output_queue.push(OutputItem::TurnHeader(format!(
+                                "#{}",
+                                self.turn_index
+                            )));
                             MessageKind::User
                         }
                         "assistant" => MessageKind::Assistant,
@@ -264,26 +253,20 @@ impl App {
                     };
                     let text = item["content"]
                         .as_array()
-                        .and_then(|parts| {
-                            parts
-                                .iter()
-                                .filter_map(|p| p["text"].as_str())
-                                .next()
-                        })
+                        .and_then(|parts| parts.iter().filter_map(|p| p["text"].as_str()).next())
                         .unwrap_or("");
                     if !text.is_empty() {
-                        self.messages.push(Message {
-                            kind,
-                            content: text.to_owned(),
-                        });
+                        self.output_queue
+                            .push(OutputItem::Padded(kind, text.to_owned()));
+                        if matches!(kind, MessageKind::User) {
+                            self.output_queue.push(OutputItem::Blank);
+                        }
                     }
                 }
                 "tool_call" => {
                     let name = item["name"].as_str().unwrap_or("?");
-                    self.messages.push(Message {
-                        kind: MessageKind::Tool,
-                        content: format!("[tool] {name}"),
-                    });
+                    self.output_queue
+                        .push(OutputItem::Padded(MessageKind::Tool, format!("[tool] {name}")));
                 }
                 "tool_result" => {
                     let output = item["output"].as_str().unwrap_or("");
@@ -292,19 +275,14 @@ impl App {
                     } else {
                         output.to_owned()
                     };
-                    self.messages.push(Message {
-                        kind: MessageKind::Tool,
-                        content: format!("[tool result] {display}"),
-                    });
+                    self.output_queue.push(OutputItem::Padded(
+                        MessageKind::Tool,
+                        format!("[tool result] {display}"),
+                    ));
                 }
                 _ => {}
             }
         }
-        self.scroll_to_bottom();
-    }
-
-    fn scroll_to_bottom(&mut self) {
-        self.scroll_state.scroll_to_bottom();
     }
 }
 
