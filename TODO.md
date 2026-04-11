@@ -4,6 +4,7 @@
 - [ ] ツール設計
   - [x] ツールの動的追加/削除 → [tickets/tool-dynamic-registry.md](tickets/tool-dynamic-registry.md)
   - [x] run() 自動ロックとファクトリ遅延初期化 → [tickets/worker-auto-lock.md](tickets/worker-auto-lock.md)
+  - [ ] 組み込みツール実装 (tools クレート) → [tickets/builtin-tools.md](tickets/builtin-tools.md)
 - [x] inspect ツール実装
 - [x] max_turns: マニフェストによるターン数制限
 - [x] pod バイナリエントリポイント
@@ -13,4 +14,5 @@
 - [x] Hook モジュールの llm-worker からの除去 → [tickets/remove-hook-module.md](tickets/remove-hook-module.md)
 - [x] api_key_file: ファイルパスによるAPIキー解決 → [tickets/api-key-file.md](tickets/api-key-file.md)
 - [ ] コンテキスト圧縮 (Prune + Compact) → [tickets/context-compaction.md](tickets/context-compaction.md)
+- [ ] Protocol: request-response パターン (GetHistory等) → [tickets/request-response-protocol.md](tickets/request-response-protocol.md)
 - [ ] パーミッション: パターンベースのツール実行制御 → [tickets/permission-extension-point.md](tickets/permission-extension-point.md)
