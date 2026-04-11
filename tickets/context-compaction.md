@@ -182,20 +182,23 @@ const MAX_COMPACT_FAILURES: usize = 3;
 
 ### Compaction フロー
 
-Compact は fork と同じ構造。旧セッションを保全し、新しい SessionId で圧縮後のセッションを開始する。
+session-store-extraction 後の構造を前提とする。
+Pod が Worker を直接保持し、session-store は save/restore の関数群。
 
 ```
 Run 完了 → input_tokens > threshold
   ↓
-Controller: history を要約プロンプトに変換
+Pod: worker.history() + worker.request_config() を読み出す
   ↓
-Controller: 要約用 Worker 生成（ツールなし、temperature=0）
+Pod: build_client(&manifest.provider) で要約用 Worker を生成（ツールなし、temperature=0）
   ↓
-要約 Worker: 構造化要約を生成
+要約 Worker: history を要約プロンプトとして受け取り、構造化要約を生成
   ↓
-Controller: [要約 Item, 直近 N ターン] で新 history を構築
+Pod: [要約 Item, 直近 N ターン] で新 history を構築
   ↓
-Controller: 新 SessionId で新セッションを作成（SessionStart に compacted_from を記録）
+Pod: worker.set_history(新 history)
+  ↓
+Pod: session_store::save_compacted(store, new_id, compacted_from, ...) で新セッション開始
   ↓
 旧セッション JSONL はそのまま保全（append-only 原則を維持）
 ```
@@ -228,7 +231,17 @@ LogEntry::SessionStart {
 - compact: `compacted_from = Some(...)`
 - EntryHash で元セッションのどの時点からの操作かを追跡可能
 
-### 要約フォーマット
+### 要約用 Worker
+
+- `build_client(&manifest.provider, manifest_dir)` で新しい LlmClient を作る
+  - reqwest::Client は内部 Arc。1回きりのリクエストなので新規プールで問題なし
+- Pod が `manifest_dir` を保持する必要がある（現状 `from_manifest` では受け取るが保持していない）
+
+### 要約プロンプト
+
+TODO: system prompt の文面、history を文字列化する方法を詰める。
+
+出力フォーマット:
 
 ```
 ## Original Task
@@ -312,15 +325,17 @@ pub struct CompactionConfig {
 3. **`prune.rs`** — 条件付き Prune アルゴリズム。単体テスト
 4. **`PruneHook`** — Pod に Hook 実装
 5. **`CompactionConfig`** — manifest にセクション追加
-6. **`LogEntry::Compacted`** — session_log に variant 追加
-7. **`compact()` 関数** — Controller に compaction ロジック + サーキットブレーカー
+6. **`LogEntry` に provenance フィールド追加** — SessionStart に `compacted_from` / `forked_from`
+7. **`compact()` 関数** — Pod に compaction ロジック + サーキットブレーカー
 8. **Protocol** — `CompactionStart` / `CompactionDone` イベント追加
 
 ステップ 1-2 は ToolOutput 移行として独立実行可能。
 ステップ 3-4（Prune）と 5-6（Compact 準備）は並行可能。
+ステップ 5-8 は session-store-extraction 完了後に実装。
 
 ---
 
 ## 依存チケット
 
 - ~~[remove-hook-module.md](remove-hook-module.md)~~ — 完了
+- [session-store-extraction.md](session-store-extraction.md) — ステップ 5-8 の前提

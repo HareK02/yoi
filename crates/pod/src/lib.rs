@@ -4,12 +4,15 @@ pub mod runtime_dir;
 pub mod shared_state;
 pub mod socket_server;
 
+pub mod prune_hook;
+
 mod hook_interceptor;
 mod pod;
 
 pub use controller::{PodController, PodHandle};
 pub use manifest::{PodManifest, ProviderConfig, ProviderKind, Scope};
 pub use hook::{Hook, HookEventKind, HookRegistryBuilder};
+pub use prune_hook::PruneHook;
 pub use pod::{Pod, PodError, PodRunResult, apply_worker_manifest};
 pub use protocol::{ErrorCode, Event, Method, TurnResult};
 pub use provider::{ProviderError, build_client};
