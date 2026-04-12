@@ -1,27 +1,10 @@
-- [x] 永続化データ構造の制定
 - [ ] テスト設計 → [tickets/test-design.md](tickets/test-design.md)
-- [x] ツール出力の遅延読み込み設計 (ToolOutput / BlobStore / auto_summarize)
-- [x] ToolOutput 再設計: summary + content 構造化、BlobStore/inspect 削除 → [tickets/tool-output-design.md](tickets/tool-output-design.md)
 - [ ] ツール設計
-  - [x] ツールの動的追加/削除 → [tickets/tool-dynamic-registry.md](tickets/tool-dynamic-registry.md)
-  - [x] run() 自動ロックとファクトリ遅延初期化 → [tickets/worker-auto-lock.md](tickets/worker-auto-lock.md)
-  - [x] 組み込みツール実装 (tools クレート、Bash 除く) → [tickets/builtin-tools.md](tickets/builtin-tools.md)
   - [ ] Bash ツール (Permission 層と統合) → [tickets/bash-tool.md](tickets/bash-tool.md)
 - [ ] Scope の再設計 (pwd + writable、必須化) → [tickets/scope-redesign.md](tickets/scope-redesign.md)
-- [x] inspect ツール実装
-- [x] max_turns: マニフェストによるターン数制限
-- [x] pod バイナリエントリポイント
-- [x] セッションエントリのハッシュチェーン
-- [x] Subscriber → クロージャ API 移行
-- [x] JSONL ストリーム変換ユーティリティ (protocol::stream)
-- [x] Hook モジュールの llm-worker からの除去 → [tickets/remove-hook-module.md](tickets/remove-hook-module.md)
-- [x] api_key_file: ファイルパスによるAPIキー解決 → [tickets/api-key-file.md](tickets/api-key-file.md)
-- [x] コンテキスト圧縮 (Prune + Compact) → [tickets/context-compaction.md](tickets/context-compaction.md)
-- [ ] LlmClient へ Tokenizer の導入 → [tickets/token-counter.md](tickets/token-counter.md)
-- [x] Tracker: ReadTracker リネーム + recent_files 追加 → [tickets/tracker.md](tickets/tracker.md)
+- [ ] Usage 履歴の永続化 (session-store に LlmUsage entry 追加) → [tickets/usage-history.md](tickets/usage-history.md)
+- [ ] トークン会計 (Usage 履歴ベースの retained/savings 計算) → [tickets/token-counter.md](tickets/token-counter.md)
 - [ ] Compact の改善（要約品質 + 挙動詳細） → [tickets/compact-improvements.md](tickets/compact-improvements.md)
 - [ ] Protocol の設計 → [tickets/protocol-design.md](tickets/protocol-design.md)
-- [x] Protocol: request-response パターン (GetHistory等) → [tickets/request-response-protocol.md](tickets/request-response-protocol.md)
 - [ ] パーミッション: パターンベースのツール実行制御 → [tickets/permission-extension-point.md](tickets/permission-extension-point.md)
-- [x] session-store: persistence クレートの再構成（wrap廃止、リネーム） → [tickets/session-store-extraction.md](tickets/session-store-extraction.md)
 - [ ] UI用トークン情報の記録（run stats の永続化、session-store 後）

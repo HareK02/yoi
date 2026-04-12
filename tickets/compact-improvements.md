@@ -7,7 +7,8 @@
 
 ## 前提チケット
 
-- [token-counter.md](token-counter.md) — LlmClient に Tokenizer 導入。retained_tokens / auto-read budget がこれに依存
+- [usage-history.md](usage-history.md) — session-store に LLM Usage を積む基盤
+- [token-counter.md](token-counter.md) — Usage 履歴ベースのトークン会計 API。retained_tokens / auto-read budget がこれに依存
 - [tracker.md](tracker.md) — `ReadTracker` → `Tracker` リネーム + `recent_files(n)` 追加。デフォルトリファレンスがこれに依存
 
 ---
@@ -183,8 +184,8 @@ history (全て pruned 済み = summary only):
     要約対象            そのまま新 history に載せる
 ```
 
-- Prune 済みの history に対して `LlmClient::tokenizer()` でトークン数を推定
-- 末尾から逆順に数えて N トークン分の位置で切る
+- Prune 済みの history に対して `Session::split_for_retained(N)` で cut 位置を求める
+- 計算は session-store の Usage 履歴 (実測値) を逆算ソースに使う
 - ターン境界は無視。アイテム単位で切る
 
 ```toml
@@ -193,7 +194,7 @@ compact_threshold = 80000
 retained_tokens = 8000     # ← retained_turns から変更
 ```
 
-token-counter チケットが前提。
+token-counter チケット（および前提の usage-history）が前提。
 
 ---
 
@@ -253,7 +254,7 @@ auto_read_budget = 8000   # 合計トークン上限
   `"Error: auto-read budget exhausted (8000 tokens). Remove an existing mark or use add_reference instead."`
 - compact worker が判断して自分で調整できる（Err は即中断ではない）
 
-token-counter チケットが前提（budget の計測に `estimate_text` が要る）。
+token-counter チケットが前提（budget の計測にトークン会計 API が要る）。
 
 ### compact worker の暴走抑止
 
@@ -372,7 +373,8 @@ compact 後の新セッションが存在する場合、どちらを restore す
 
 ## 実装順序
 
-0. **[前提] token-counter** — LlmClient に Tokenizer
+0. **[前提] usage-history** — session-store に LLM Usage 蓄積
+0. **[前提] token-counter** — Usage 履歴ベースのトークン会計 API
 0. **[前提] tracker** — `ReadTracker` → `Tracker` リネーム + `recent_files` 追加 + Pod 接続
 1. **閾値の修正 + リネーム + 個別指定化** — manifest に `compact_request_threshold` 追加、`compact_state.rs` の 2 閾値を `Option<u64>` 化、`turn_threshold` → `request_threshold` リネーム、`exceeds_turn()` → `exceeds_request()`。compact_state.rs / compact_interceptor.rs / pod.rs / manifest / テスト / docs 更新
 2. **要約入力の削減** — `build_summary_prompt` から content/arguments/reasoning を除去
