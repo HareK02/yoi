@@ -83,6 +83,10 @@ impl PodController {
         // Keep the server alive by moving it into the controller task
         // (it will be dropped when the task ends)
 
+        // Grab the scope before the mutable borrow of the worker so we can
+        // build a `ScopedFs` for the builtin tools. `Scope` is cheap to clone.
+        let scope_for_tools = pod.scope().cloned();
+
         // Register event bridge callbacks on the worker
         {
             let worker = pod.worker_mut();
@@ -155,6 +159,19 @@ impl PodController {
                     message: event.message.clone(),
                 });
             });
+
+            // Register the builtin file-manipulation tools (Read / Write /
+            // Edit / Glob / Grep) when the manifest declares a scope.
+            //
+            // `ScopedFs` carries the pod-lifetime write boundary (derived
+            // from the manifest scope). `ReadTracker` is session-scoped —
+            // a fresh instance per controller spawn ensures state from a
+            // previous process lifetime cannot be reused after a resume.
+            if let Some(scope) = scope_for_tools {
+                let fs = tools::ScopedFs::new(scope);
+                let tracker = tools::ReadTracker::new();
+                worker.register_tools(tools::builtin_tools(fs, tracker));
+            }
         }
 
         // Clone cancel sender before moving pod

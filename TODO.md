@@ -15,6 +15,8 @@
 - [x] Hook モジュールの llm-worker からの除去 → [tickets/remove-hook-module.md](tickets/remove-hook-module.md)
 - [x] api_key_file: ファイルパスによるAPIキー解決 → [tickets/api-key-file.md](tickets/api-key-file.md)
 - [x] コンテキスト圧縮 (Prune + Compact) → [tickets/context-compaction.md](tickets/context-compaction.md)
+- [ ] LlmClient へ Tokenizer の導入 → [tickets/token-counter.md](tickets/token-counter.md)
+- [ ] ToolOutput.referenced_files: ツール参照ファイル追跡 → [tickets/tool-output-referenced-files.md](tickets/tool-output-referenced-files.md)
 - [ ] Compact の改善（要約品質 + 挙動詳細） → [tickets/compact-improvements.md](tickets/compact-improvements.md)
 - [ ] Protocol の設計 → [tickets/protocol-design.md](tickets/protocol-design.md)
 - [x] Protocol: request-response パターン (GetHistory等) → [tickets/request-response-protocol.md](tickets/request-response-protocol.md)

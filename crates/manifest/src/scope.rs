@@ -24,17 +24,19 @@ impl Scope {
 
     /// Check whether `path` falls within this scope.
     ///
-    /// The path is canonicalized before comparison.
+    /// The path is canonicalized before comparison. If the path does not
+    /// exist yet (typical for new-file writes), the closest existing
+    /// ancestor is canonicalized and checked, so deep new directory
+    /// hierarchies inside the scope are also accepted.
     pub fn contains(&self, path: &Path) -> bool {
-        match path.canonicalize() {
-            Ok(canonical) => canonical.starts_with(&self.root),
-            Err(_) => {
-                // Path doesn't exist yet — check the parent directory instead.
-                // This handles write_file to a new file inside the scope.
-                match path.parent().and_then(|p| p.canonicalize().ok()) {
-                    Some(parent) => parent.starts_with(&self.root),
-                    None => false,
-                }
+        let mut cur = path;
+        loop {
+            if let Ok(canonical) = cur.canonicalize() {
+                return canonical.starts_with(&self.root);
+            }
+            match cur.parent() {
+                Some(parent) if parent != cur => cur = parent,
+                _ => return false,
             }
         }
     }
@@ -97,5 +99,17 @@ mod tests {
 
         let traversal = dir.path().join("../../../etc/passwd");
         assert!(!scope.contains(&traversal));
+    }
+
+    #[test]
+    fn contains_deeply_nested_new_path() {
+        let dir = TempDir::new().unwrap();
+        let scope = Scope::new(dir.path()).unwrap();
+
+        // Neither the file nor any of its ancestors (a, a/b, a/b/c) exist yet
+        // under the scope; contains should still accept because the closest
+        // existing ancestor (the scope root) is inside the scope.
+        let deep = dir.path().join("a/b/c/new.txt");
+        assert!(scope.contains(&deep));
     }
 }
