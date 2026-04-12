@@ -30,8 +30,13 @@ pub enum PromptAction {
 pub enum PreRequestAction {
     /// Proceed normally.
     Continue,
-    /// Cancel with a reason.
+    /// Cancel with a reason (treated as an error).
     Cancel(String),
+    /// Yield control to the caller for external processing.
+    ///
+    /// The Worker exits the turn loop cleanly with `WorkerResult::Yielded`.
+    /// The caller is expected to resume execution later.
+    Yield,
 }
 
 /// Action before a tool call.

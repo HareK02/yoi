@@ -71,6 +71,12 @@ pub enum WorkerResult {
     Paused,
     /// Turn limit reached (max_turns exceeded)
     LimitReached,
+    /// Yielded to caller for external processing (e.g. context compaction).
+    ///
+    /// Distinct from `Paused`: internal machinery, not user-facing. The
+    /// caller is expected to perform some side work and then call `resume()`
+    /// to continue the turn loop.
+    Yielded,
 }
 
 /// Result of [`Worker<C, Mutable>::run()`] / [`Worker<C, Mutable>::resume()`].
@@ -701,6 +707,14 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
                     }
                     self.last_run_interrupted = true;
                     return Err(WorkerError::Aborted(reason));
+                }
+                PreRequestAction::Yield => {
+                    info!("Yielded by interceptor");
+                    for cb in &self.turn_end_cbs {
+                        cb(current_turn);
+                    }
+                    self.last_run_interrupted = true;
+                    return Ok(WorkerResult::Yielded);
                 }
                 PreRequestAction::Continue => {}
             }

@@ -6,6 +6,8 @@ pub mod socket_server;
 
 pub mod prune_hook;
 
+mod compact_interceptor;
+mod compact_state;
 mod hook_interceptor;
 mod pod;
 

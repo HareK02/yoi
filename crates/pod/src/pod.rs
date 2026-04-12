@@ -9,9 +9,12 @@ use llm_worker::{Worker, WorkerError, WorkerResult};
 use session_store::{
     EntryHash, Outcome, SessionId, SessionStartState, Store, StoreError,
 };
+use tracing::{info, warn};
 
 use manifest::{PodManifest, Scope, WorkerManifest};
 
+use crate::compact_interceptor::CompactInterceptor;
+use crate::compact_state::CompactState;
 use crate::hook::{
     Hook, HookRegistryBuilder, OnAbort, OnPromptSubmit, OnTurnEnd, PostToolCall, PreLlmRequest,
     PreToolCall,
@@ -48,6 +51,8 @@ pub struct Pod<C: LlmClient, St: Store> {
     interceptor_installed: bool,
     /// Directory containing the manifest file (needed for api_key_file resolution).
     manifest_dir: Option<PathBuf>,
+    /// Shared compaction state (present when compact_threshold is configured).
+    compact_state: Option<Arc<CompactState>>,
 }
 
 impl<C: LlmClient, St: Store> Pod<C, St> {
@@ -74,6 +79,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             hook_builder: HookRegistryBuilder::new(),
             interceptor_installed: false,
             manifest_dir: None,
+            compact_state: None,
         })
     }
 
@@ -105,6 +111,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             hook_builder: HookRegistryBuilder::new(),
             interceptor_installed: false,
             manifest_dir: None,
+            compact_state: None,
         })
     }
 
@@ -187,34 +194,59 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     }
 
     /// Install the hook-based interceptor on the Worker if not already done.
+    ///
+    /// When `compact_threshold` is configured in the manifest, wraps the
+    /// `HookInterceptor` in a [`CompactInterceptor`] and registers an
+    /// `on_usage` callback to track `input_tokens`.
     fn ensure_interceptor_installed(&mut self) {
         if !self.interceptor_installed {
             let builder = std::mem::take(&mut self.hook_builder);
             let registry = Arc::new(builder.build());
-            let interceptor = HookInterceptor::new(registry);
-            self.worker_mut().set_interceptor(interceptor);
+            let hook_interceptor = HookInterceptor::new(registry);
+
+            let compact_threshold = self
+                .manifest
+                .compaction
+                .as_ref()
+                .and_then(|c| c.compact_threshold);
+
+            if let Some(threshold) = compact_threshold {
+                let retained = self
+                    .manifest
+                    .compaction
+                    .as_ref()
+                    .map(|c| c.compact_retained_turns)
+                    .unwrap_or(2);
+
+                let state = Arc::new(CompactState::new(threshold, retained));
+
+                // Track input_tokens via on_usage callback.
+                let state_for_usage = state.clone();
+                self.worker_mut().on_usage(move |event| {
+                    if let Some(tokens) = event.input_tokens {
+                        state_for_usage.update_input_tokens(tokens);
+                    }
+                });
+
+                let interceptor = CompactInterceptor::new(hook_interceptor, state.clone());
+                self.worker_mut().set_interceptor(interceptor);
+                self.compact_state = Some(state);
+            } else {
+                self.worker_mut().set_interceptor(hook_interceptor);
+            }
+
             self.interceptor_installed = true;
         }
     }
 
     /// Send user input and run until the LLM turn completes.
+    ///
+    /// If the between-turns compaction threshold is exceeded mid-run,
+    /// the Worker is aborted, history is compacted, and execution resumes
+    /// automatically.
     pub async fn run(&mut self, input: impl Into<String>) -> Result<PodRunResult, PodError> {
         self.ensure_interceptor_installed();
-
-        // Split borrow: access worker field directly to allow concurrent
-        // mutable borrows on session_id / head_hash.
-        let w = self.worker.as_ref().unwrap();
-        session_store::ensure_head_or_fork(
-            &self.store,
-            &mut self.session_id,
-            &mut self.head_hash,
-            SessionStartState {
-                system_prompt: w.get_system_prompt(),
-                config: w.request_config(),
-                history: w.history(),
-            },
-        )
-        .await?;
+        self.ensure_session_head().await?;
 
         let history_before = self.worker.as_ref().unwrap().history().len();
 
@@ -224,14 +256,27 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         let result = locked.run(input).await;
         self.worker = Some(locked.unlock());
 
-        self.persist_turn(history_before, &result).await?;
-        result.map(PodRunResult::from).map_err(PodError::Worker)
+        self.handle_worker_result(result, history_before).await
     }
 
     /// Resume from a paused state.
     pub async fn resume(&mut self) -> Result<PodRunResult, PodError> {
         self.ensure_interceptor_installed();
+        self.ensure_session_head().await?;
 
+        let history_before = self.worker.as_ref().unwrap().history().len();
+
+        // lock → resume → unlock
+        let worker = self.worker.take().expect("worker taken during run");
+        let mut locked = worker.lock();
+        let result = locked.resume().await;
+        self.worker = Some(locked.unlock());
+
+        self.handle_worker_result(result, history_before).await
+    }
+
+    /// Ensure session head exists (fork if needed).
+    async fn ensure_session_head(&mut self) -> Result<(), PodError> {
         let w = self.worker.as_ref().unwrap();
         session_store::ensure_head_or_fork(
             &self.store,
@@ -244,17 +289,107 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             },
         )
         .await?;
+        Ok(())
+    }
 
-        let history_before = self.worker.as_ref().unwrap().history().len();
-
-        // lock → resume → unlock
-        let worker = self.worker.take().expect("worker taken during run");
-        let mut locked = worker.lock();
-        let result = locked.resume().await;
-        self.worker = Some(locked.unlock());
-
+    /// Handle Worker result: always persist the turn first, then if
+    /// `Yielded`, perform compaction and resume.
+    ///
+    /// Persisting before compaction ensures that if compact fails, the
+    /// turn is fully recorded in the old session (interrupted, outcome
+    /// `Yielded`), so restore remains consistent.
+    async fn handle_worker_result(
+        &mut self,
+        result: Result<WorkerResult, WorkerError>,
+        history_before: usize,
+    ) -> Result<PodRunResult, PodError> {
         self.persist_turn(history_before, &result).await?;
+
+        if matches!(result, Ok(WorkerResult::Yielded)) {
+            return self.do_compact_and_resume().await;
+        }
+
+        if result.is_ok() {
+            if let Some(ref state) = self.compact_state {
+                state.set_just_compacted(false);
+            }
+        }
         result.map(PodRunResult::from).map_err(PodError::Worker)
+    }
+
+    /// Perform compaction after a `compact_needed` abort and resume execution.
+    ///
+    /// Uses `Box::pin` for the recursive `resume()` call to break the
+    /// async layout cycle (`run → handle_worker_result → do_compact_and_resume → resume`).
+    fn do_compact_and_resume(
+        &mut self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<PodRunResult, PodError>> + Send + '_>>
+    {
+        Box::pin(async move {
+            // Thrash detection: if we just compacted and hit the threshold again,
+            // something is wrong.
+            if let Some(ref state) = self.compact_state {
+                if state.just_compacted() {
+                    state.set_just_compacted(false);
+                    return Err(PodError::CompactThrash);
+                }
+            }
+
+            let retained = self
+                .compact_state
+                .as_ref()
+                .map(|s| s.retained_turns())
+                .unwrap_or(2);
+
+            match self.compact(retained).await {
+                Ok(new_session_id) => {
+                    info!(
+                        new_session_id = %new_session_id,
+                        "Compaction succeeded, resuming execution"
+                    );
+                    if let Some(ref state) = self.compact_state {
+                        state.record_compact_success();
+                    }
+                    self.resume().await
+                }
+                Err(e) => {
+                    warn!(error = %e, "Compaction failed during run");
+                    if let Some(ref state) = self.compact_state {
+                        state.record_compact_failure();
+                    }
+                    Err(e)
+                }
+            }
+        })
+    }
+
+    /// Attempt proactive compaction (called by Controller after run).
+    ///
+    /// Best-effort: failures are logged but do not propagate.
+    pub async fn try_post_run_compact(&mut self) -> Result<(), PodError> {
+        let state = match self.compact_state.as_ref() {
+            Some(s) if !s.is_disabled() && s.exceeds_post_run() && !s.just_compacted() => {
+                s.clone()
+            }
+            _ => return Ok(()),
+        };
+
+        let retained = state.retained_turns();
+        match self.compact(retained).await {
+            Ok(new_session_id) => {
+                info!(
+                    new_session_id = %new_session_id,
+                    "Proactive post-run compaction succeeded"
+                );
+                state.record_compact_success();
+                Ok(())
+            }
+            Err(e) => {
+                warn!(error = %e, "Proactive post-run compaction failed");
+                state.record_compact_failure();
+                Ok(())
+            }
+        }
     }
 
     /// Persist delta + turn end + outcome after a run/resume.
@@ -289,6 +424,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             Ok(WorkerResult::Finished) => Outcome::Finished,
             Ok(WorkerResult::Paused) => Outcome::Paused,
             Ok(WorkerResult::LimitReached) => Outcome::LimitReached,
+            Ok(WorkerResult::Yielded) => Outcome::Yielded,
             Err(e) => Outcome::Error {
                 message: e.to_string(),
             },
@@ -440,6 +576,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             hook_builder: HookRegistryBuilder::new(),
             interceptor_installed: false,
             manifest_dir,
+            compact_state: None,
         })
     }
 
@@ -478,6 +615,9 @@ impl From<WorkerResult> for PodRunResult {
             WorkerResult::Finished => PodRunResult::Finished,
             WorkerResult::Paused => PodRunResult::Paused,
             WorkerResult::LimitReached => PodRunResult::LimitReached,
+            // Yielded is internal to Pod: it's always caught by
+            // handle_worker_result and never converted to PodRunResult.
+            WorkerResult::Yielded => unreachable!("Yielded never converts to PodRunResult"),
         }
     }
 }
@@ -527,4 +667,7 @@ pub enum PodError {
 
     #[error(transparent)]
     Provider(#[from] provider::ProviderError),
+
+    #[error("compaction thrash: context still exceeds threshold immediately after compact")]
+    CompactThrash,
 }

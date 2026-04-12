@@ -159,6 +159,9 @@ pub enum Outcome {
     Finished,
     Paused,
     LimitReached,
+    /// Worker yielded control to the caller for external processing.
+    /// Distinct from `Paused`: caller handles internally and resumes.
+    Yielded,
     Error { message: String },
 }
 

@@ -119,6 +119,7 @@ async fn run_and_persist(
         Ok(llm_worker::WorkerResult::Finished) => Outcome::Finished,
         Ok(llm_worker::WorkerResult::Paused) => Outcome::Paused,
         Ok(llm_worker::WorkerResult::LimitReached) => Outcome::LimitReached,
+        Ok(llm_worker::WorkerResult::Yielded) => Outcome::Yielded,
         Err(e) => Outcome::Error {
             message: e.to_string(),
         },

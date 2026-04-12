@@ -191,6 +191,13 @@ impl PodController {
                         )
                         .await;
 
+                        // Proactive post-run compaction (best-effort).
+                        if new_status == PodStatus::Idle {
+                            if let Err(e) = pod.try_post_run_compact().await {
+                                tracing::warn!(error = %e, "Post-run compaction error");
+                            }
+                        }
+
                         let items = pod.worker().history().to_vec();
                         shared_state.update_history(items);
                         shared_state.set_status(new_status);
@@ -217,6 +224,13 @@ impl PodController {
                             &shared_state,
                         )
                         .await;
+
+                        // Proactive post-run compaction (best-effort).
+                        if new_status == PodStatus::Idle {
+                            if let Err(e) = pod.try_post_run_compact().await {
+                                tracing::warn!(error = %e, "Post-run compaction error");
+                            }
+                        }
 
                         let items = pod.worker().history().to_vec();
                         shared_state.update_history(items);
