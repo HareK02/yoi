@@ -8,7 +8,7 @@
 ## 前提チケット
 
 - [token-counter.md](token-counter.md) — LlmClient に Tokenizer 導入。retained_tokens / auto-read budget がこれに依存
-- [tool-output-referenced-files.md](tool-output-referenced-files.md) — ToolOutput にファイル追跡フィールド追加。デフォルトリファレンスがこれに依存
+- [tracker.md](tracker.md) — `ReadTracker` → `Tracker` リネーム + `recent_files(n)` 追加。デフォルトリファレンスがこれに依存
 
 ---
 
@@ -37,29 +37,100 @@
 
 ---
 
+## 用語の定義（重要 — 混乱防止のため明記）
+
+- **run = turn**: 同じ概念を指す。1 ユーザープロンプト → 完了までの単位
+- **リクエスト**: 1 run/turn 内で投げる個別の LLM 呼び出し。ツール使用で 1 turn に複数リクエストが発生する
+- **リクエストの合間** (between requests): 1 turn 内、次の LLM リクエストを投げる前の地点。`CompactInterceptor::pre_llm_request` で観測される
+- **ターンの合間** (between turns): turn が完了して次の turn を待つ状態。`Controller::try_post_run_compact` で観測される
+
+この 2 つを区別することに意味がある:
+- **ターンの合間**は自然なタスクの区切り。次の turn に入る前に **先を見越して早めに** compact すべき
+- **リクエストの合間**は turn 内部の中継点。通常は proactive な必要はなく、暴走的な膨張を拾う **safety net** として **遅めに** 発動すれば十分
+
+---
+
 ## 閾値の修正（重要）
 
-現状の実装は閾値の大小関係が意図と逆になっている。修正する。
+現状の実装は:
+1. 閾値の大小関係が意図と逆
+2. `turn_threshold` が pre_llm_request 側で使われていて命名がミスリード
+3. もう片方を `turn_threshold * 9 / 8` で導出しているが、9/8 に根拠がない
+
+これらをまとめて修正する。値入れ替え + リネーム + マニフェストで両閾値を個別指定。
 
 ### 正しい方針
 
-- **post-run (タスク区切り) = 早めの閾値**: タスクの区切りで先を見越して compact
-- **mid-turn (pre_llm_request) = 遅めの閾値**: ターン中は最終防衛ラインとして、遅くなっても止まらないよう
+| チェックポイント | 変数名 (コード) | マニフェスト | 役割 |
+|----------------|---------------|------------|------|
+| `Controller::try_post_run_compact` (ターンの合間) | `post_run_threshold` | `compact_threshold` | proactive (小) |
+| `CompactInterceptor::pre_llm_request` (リクエストの合間) | `request_threshold` | `compact_request_threshold` | safety net (大) |
 
+両方とも manifest で個別指定する。導出はしない。
+
+```toml
+[compaction]
+compact_threshold = 80000          # ターンの合間, proactive
+compact_request_threshold = 90000  # リクエストの合間, safety net
 ```
-manifest.compact_threshold  →  post_run_threshold  (基本ライン, 早め)
-                               turn_threshold = post_run_threshold * 9 / 8  (safety net, 遅め)
-```
+
+想定: `compact_threshold < compact_request_threshold`。逆転していてもエラーにはしないが、
+warn を出す。両方 None なら compact 無効（今まで通り）。片方だけ None なら...
+
+**片方だけ指定されたときの挙動**:
+- `compact_threshold` のみ設定 → `compact_request_threshold` は無効 (リクエスト間チェック無し)
+- `compact_request_threshold` のみ設定 → `compact_threshold` は無効 (post_run チェック無し)
+- 両方設定 → 両方有効
+
+→ `CompactState` 内部では `Option<u64>` 2 本持ち。`exceeds_*` メソッドは `Option` が `None` なら常に `false`。
 
 ### 影響箇所
 
-- `crates/pod/src/compact_state.rs`
-  - フィールド名と初期化を入れ替え: `manifest compact_threshold` は `post_run_threshold` に代入
-  - `turn_threshold` は `post_run_threshold * 9 / 8` として導出
-  - テストの `assert_eq!(state.post_run_threshold, 90_000)` を逆転（`turn_threshold = 90_000`, `post_run_threshold = 80_000` が正）
-- `crates/pod/src/compact_interceptor.rs` — そのまま（`exceeds_turn` を呼ぶだけ）
-- `crates/pod/src/pod.rs:371` の `exceeds_post_run` 判定 — そのまま
-- `docs/compaction.md` — 「ターン間は早めの閾値」の記述を逆に修正
+- **`crates/manifest/src/lib.rs`**
+  - `CompactionConfig` に `compact_request_threshold: Option<u64>` フィールドを追加
+  - デフォルトは `None`
+  - テスト更新 (両閾値が読めること)
+
+- **`crates/pod/src/compact_state.rs`**
+  - `turn_threshold` フィールドを `request_threshold: Option<u64>` にリネーム + `Option` 化
+  - `post_run_threshold: u64` → `Option<u64>` に変更
+  - コンストラクタシグネチャ変更:
+    ```rust
+    // Before
+    pub fn new(turn_threshold: u64, retained_turns: usize) -> Self
+    // After
+    pub fn new(
+        post_run_threshold: Option<u64>,
+        request_threshold: Option<u64>,
+        retained_turns: usize,
+    ) -> Self
+    ```
+  - `exceeds_turn()` → `exceeds_request()` にリネーム。中身:
+    ```rust
+    pub(crate) fn exceeds_request(&self) -> bool {
+        self.request_threshold
+            .map(|t| self.last_input_tokens() > t)
+            .unwrap_or(false)
+    }
+    ```
+  - `exceeds_post_run()` も同様に Option 対応
+  - `turn_threshold()` getter → `request_threshold()`、戻り値は `Option<u64>`
+  - ドックコメントを「proactive = post_run」「safety net = request」で書き直し
+  - テスト: 両方設定/片方だけ/両方 None の 3 ケース
+
+- **`crates/pod/src/compact_interceptor.rs`**
+  - `exceeds_turn()` 呼び出しを `exceeds_request()` に
+  - ログメッセージ "Between-turns ..." → "Between-requests ..."
+  - コメント "Step 2: Check between-turns compaction threshold" → "Step 2: Check between-requests compaction threshold (safety net)"
+
+- **`crates/pod/src/pod.rs`**
+  - `ensure_interceptor_installed` で `compact_threshold` + `compact_request_threshold` の両方を manifest から読み、`CompactState::new` に渡す
+  - wrap 条件: 両方 None なら CompactInterceptor を挟まない (+ Controller の post_run チェックも実質無効)。片方でも Some なら挟む
+  - Disjoint チェックで `post_run_threshold > request_threshold` の場合 warn ログ
+
+- **`docs/compaction.md`**
+  - TOML 例に `compact_request_threshold` を追加
+  - トリガーセクションから「9/8 で導出」の記述を削除、個別指定である旨に修正
 
 ---
 
@@ -130,9 +201,9 @@ token-counter チケットが前提。
 
 ### デフォルトリファレンスの抽出
 
-Pod は `ToolOutput.referenced_files` を `HookInterceptor::post_tool_call` で観察し、
-LRU 的な履歴バッファに積む（→ tool-output-referenced-files チケット）。
-Compact 時は先頭 5 件を compact worker のデフォルトリファレンスとして渡す。
+`tools::Tracker` (既存の `ReadTracker` を拡張したもの → [tracker.md](tracker.md)) が
+Read/Write/Edit で触られたファイルを LRU で保持している。Compact 時は
+`self.tracker.recent_files(5)` で先頭 5 件を compact worker のデフォルトリファレンスとして渡す。
 
 ### compact worker のツール
 
@@ -148,7 +219,7 @@ write_summary(text)                       — 構造化要約を出力/上書き
 
 ### フロー
 
-1. Pod が referenced_files バッファから先頭 5 件を抽出（デフォルトリファレンス）
+1. Pod が `Tracker::recent_files(5)` で最近触られたファイルを抽出（デフォルトリファレンス）
 2. compact worker のプロンプトに含める:
 
    ```
@@ -270,17 +341,17 @@ pruned history から:
 
 ### Yield のタイミング精度
 
-現状 `pre_llm_request`（リクエストの切れ目）でのみチェック。
-1ターン内でツール呼び出しが多く途中でコンテキストが膨らむケースは次のリクエストまで待つ。
+現状 `pre_llm_request`（リクエストの合間）でのみチェック。
+1 turn 内でツール呼び出しが多く途中でコンテキストが膨らむケースは次のリクエストまで待つ。
 
 検討: `post_tool_call` でもチェックする？
 
-### 閾値の比率
+### 閾値の推奨値
 
-- `post_run_threshold` = マニフェストの `compact_threshold`
-- `turn_threshold` = `post_run_threshold * 9 / 8`（≈ 112.5%）
+- `compact_threshold` (post_run, proactive): モデルのコンテキスト上限の 70-80% あたりが目安
+- `compact_request_threshold` (request, safety net): `compact_threshold` より少し上、85-95% あたり
 
-9/8 の根拠はない（安全マージン）。要調整。
+両方 manifest で個別指定する（導出はしない）。要調整の余地あり。
 
 ### Prune と Compact の相互作用
 
@@ -302,12 +373,12 @@ compact 後の新セッションが存在する場合、どちらを restore す
 ## 実装順序
 
 0. **[前提] token-counter** — LlmClient に Tokenizer
-0. **[前提] tool-output-referenced-files** — ToolOutput + Pod の LRU バッファ
-1. **閾値逆転の修正** — `compact_state.rs` のフィールド入れ替え、テスト修正、docs 更新
+0. **[前提] tracker** — `ReadTracker` → `Tracker` リネーム + `recent_files` 追加 + Pod 接続
+1. **閾値の修正 + リネーム + 個別指定化** — manifest に `compact_request_threshold` 追加、`compact_state.rs` の 2 閾値を `Option<u64>` 化、`turn_threshold` → `request_threshold` リネーム、`exceeds_turn()` → `exceeds_request()`。compact_state.rs / compact_interceptor.rs / pod.rs / manifest / テスト / docs 更新
 2. **要約入力の削減** — `build_summary_prompt` から content/arguments/reasoning を除去
 3. **retained_tokens 化** — retained_turns → retained_tokens に変更。マニフェスト設定追加
 4. **compact worker のツール化** — read_file + mark_read_required + add_reference + write_summary (上書き可)
-5. **Auto-Read + リファレンス** — デフォルト5ファイル抽出 (referenced_files バッファから)、compact worker による選定、system message での注入
+5. **Auto-Read + リファレンス** — デフォルト5ファイル抽出 (`Tracker::recent_files` から)、compact worker による選定、system message での注入
 6. **Auto-Read Budget** — `mark_read_required` のトークン会計、残量通知、超過エラー
 7. **compact worker の累計入力トークン制限** — `compact_worker_max_input_tokens`
 8. **要約フォーマット** — タスク分類の要約プロンプト調整

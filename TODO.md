@@ -5,7 +5,9 @@
 - [ ] ツール設計
   - [x] ツールの動的追加/削除 → [tickets/tool-dynamic-registry.md](tickets/tool-dynamic-registry.md)
   - [x] run() 自動ロックとファクトリ遅延初期化 → [tickets/worker-auto-lock.md](tickets/worker-auto-lock.md)
-  - [ ] 組み込みツール実装 (tools クレート) → [tickets/builtin-tools.md](tickets/builtin-tools.md)
+  - [x] 組み込みツール実装 (tools クレート、Bash 除く) → [tickets/builtin-tools.md](tickets/builtin-tools.md)
+  - [ ] Bash ツール (Permission 層と統合) → [tickets/bash-tool.md](tickets/bash-tool.md)
+- [ ] Scope の再設計 (pwd + writable、必須化) → [tickets/scope-redesign.md](tickets/scope-redesign.md)
 - [x] inspect ツール実装
 - [x] max_turns: マニフェストによるターン数制限
 - [x] pod バイナリエントリポイント
@@ -16,7 +18,7 @@
 - [x] api_key_file: ファイルパスによるAPIキー解決 → [tickets/api-key-file.md](tickets/api-key-file.md)
 - [x] コンテキスト圧縮 (Prune + Compact) → [tickets/context-compaction.md](tickets/context-compaction.md)
 - [ ] LlmClient へ Tokenizer の導入 → [tickets/token-counter.md](tickets/token-counter.md)
-- [ ] ToolOutput.referenced_files: ツール参照ファイル追跡 → [tickets/tool-output-referenced-files.md](tickets/tool-output-referenced-files.md)
+- [ ] Tracker: ReadTracker リネーム + recent_files 追加 → [tickets/tracker.md](tickets/tracker.md)
 - [ ] Compact の改善（要約品質 + 挙動詳細） → [tickets/compact-improvements.md](tickets/compact-improvements.md)
 - [ ] Protocol の設計 → [tickets/protocol-design.md](tickets/protocol-design.md)
 - [x] Protocol: request-response パターン (GetHistory等) → [tickets/request-response-protocol.md](tickets/request-response-protocol.md)
