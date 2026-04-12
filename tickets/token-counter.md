@@ -18,6 +18,11 @@ Compact / Prune の挙動改善に「**履歴上の任意位置のトークン�
 
 正確なトークン数（推定でも実測由来）が要る箇所:
 
+- **Compact 閾値判定** — 現状 `CompactState::last_input_tokens` (`AtomicU64`) が
+  on_usage callback で更新されているが、これは usage_history と情報源が二重化
+  している。本チケットで `Session::total_tokens()` を生やせば、`compact_interceptor.rs` /
+  `controller.rs` から閾値判定がこの API 経由になり、`last_input_tokens` 経路を
+  撤去できる（撤去自体は compact-improvements 側で実施）
 - **Compact の retained_tokens 切り出し** — 末尾から N トークン残す cut 位置を決める
 - **Prune の `min_savings` 判定** — 「この content を捨てたら何トークン浮くか」を見積もる
 - **Compact worker の auto-read budget 判定** — `mark_read_required` の累計

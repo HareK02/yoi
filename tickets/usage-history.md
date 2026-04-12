@@ -107,13 +107,14 @@ pub async fn save_usage(
 - 各プロバイダの scheme で 1 リクエスト内の複数 Usage event（Anthropic の
   message_start + message_delta）を集約し、**完了時の最終値だけを 1 つの
   `UsageEvent` として外に発火する**。pod 側では暫定値を見ない
-- `UsageEvent` 上で provider 別 raw 値（`input_tokens` / `cache_read_input_tokens`
-  / `cache_creation_input_tokens` / `output_tokens`）はそのまま保持。占有量への
-  正規化は consumer 側（save_usage 呼び出し側）で行う
-  - 動機: llm-worker は raw 値の運搬役に徹し、「プロンプト全長」のような
-    プロバイダ依存の意味付けは upper layer に集約する
-  - 正規化ヘルパー（例: `UsageEvent::input_total_tokens()`）を llm-worker に
-    生やすかは実装時判断
+- 占有量への正規化（Anthropic: `input_tokens + cache_read + cache_creation`）は
+  各 scheme の `convert_usage` で行い、`UsageEvent.input_tokens` には正規化済みの
+  占有量（プロンプト全長）が入る。consumer 側（pod / UsageTracker）は
+  `event.input_tokens` をそのまま使う
+  - 動機: 正規化ロジックを scheme に閉じ込めることで、consumer が provider 差異を
+    意識する必要がなくなる
+- `cache_read_input_tokens` / `cache_creation_input_tokens` は内訳として
+  別フィールドに保持。料金会計用
 
 ### pod 側
 
@@ -186,6 +187,10 @@ callback と同じ場所。
   - 複数 entry を replay して `usage_history` が時系列順に積まれる
   - 既存ログ（`LlmUsage` 無し）を読んでも壊れない
   - Anthropic の cache hit ありレスポンスで input_total が正しく計算される
+
+## レビュー状態
+
+Reviewed — [usage-history.review.md](usage-history.review.md)
 
 ## 依存
 

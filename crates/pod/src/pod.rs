@@ -20,6 +20,24 @@ use crate::hook::{
     PreToolCall,
 };
 use crate::hook_interceptor::HookInterceptor;
+use crate::usage_tracker::UsageTracker;
+use llm_worker::interceptor::PreRequestAction;
+use async_trait::async_trait;
+
+/// Pre-LLM-request hook that records `history.len()` at send time into a
+/// shared `UsageTracker`. The on_usage callback later pairs this with the
+/// aggregated UsageEvent to produce one `UsageRecord` per LLM call.
+struct UsageTrackingHook {
+    tracker: Arc<UsageTracker>,
+}
+
+#[async_trait]
+impl Hook<PreLlmRequest> for UsageTrackingHook {
+    async fn call(&self, context: &mut Vec<Item>) -> PreRequestAction {
+        self.tracker.note_request(context.len());
+        PreRequestAction::Continue
+    }
+}
 
 const SUMMARY_SYSTEM_PROMPT: &str = "\
 You are a context compaction assistant. \
@@ -53,6 +71,10 @@ pub struct Pod<C: LlmClient, St: Store> {
     manifest_dir: Option<PathBuf>,
     /// Shared compaction state (present when compact_threshold is configured).
     compact_state: Option<Arc<CompactState>>,
+    /// Per-LLM-request Usage tracker. Always present after construction.
+    /// Captures `(history_len, UsageEvent)` pairs during a run; drained
+    /// in `persist_turn` and persisted as `LogEntry::LlmUsage` entries.
+    usage_tracker: Arc<UsageTracker>,
     /// Session-lifetime file-operation tracker from the builtin `tools`
     /// crate. Populated by the Controller when it registers the builtin
     /// tools so that Pod-owned operations (e.g. compaction) can consult
@@ -85,6 +107,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             interceptor_installed: false,
             manifest_dir: None,
             compact_state: None,
+            usage_tracker: Arc::new(UsageTracker::new()),
             tracker: None,
         })
     }
@@ -118,6 +141,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             interceptor_installed: false,
             manifest_dir: None,
             compact_state: None,
+            usage_tracker: Arc::new(UsageTracker::new()),
             tracker: None,
         })
     }
@@ -220,6 +244,14 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     /// `on_usage` callback to track `input_tokens`.
     fn ensure_interceptor_installed(&mut self) {
         if !self.interceptor_installed {
+            // Pre-LLM-request hook: capture history.len() into the
+            // UsageTracker so the upcoming on_usage callback can pair
+            // it with the measured input_tokens.
+            self.hook_builder
+                .add_pre_llm_request(UsageTrackingHook {
+                    tracker: self.usage_tracker.clone(),
+                });
+
             let builder = std::mem::take(&mut self.hook_builder);
             let registry = Arc::new(builder.build());
             let hook_interceptor = HookInterceptor::new(registry);
@@ -229,6 +261,11 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 .compaction
                 .as_ref()
                 .and_then(|c| c.compact_threshold);
+
+            // Usage tracking via on_usage callback. Independent of
+            // compact_threshold so that LlmUsage entries are persisted
+            // unconditionally.
+            let tracker_for_usage = self.usage_tracker.clone();
 
             if let Some(threshold) = compact_threshold {
                 let retained = self
@@ -240,18 +277,23 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
 
                 let state = Arc::new(CompactState::new(threshold, retained));
 
-                // Track input_tokens via on_usage callback.
+                // Combined on_usage: feed both the legacy compact threshold
+                // tracker and the new UsageTracker.
                 let state_for_usage = state.clone();
                 self.worker_mut().on_usage(move |event| {
                     if let Some(tokens) = event.input_tokens {
                         state_for_usage.update_input_tokens(tokens);
                     }
+                    tracker_for_usage.record_usage(event);
                 });
 
                 let interceptor = CompactInterceptor::new(hook_interceptor, state.clone());
                 self.worker_mut().set_interceptor(interceptor);
                 self.compact_state = Some(state);
             } else {
+                self.worker_mut().on_usage(move |event| {
+                    tracker_for_usage.record_usage(event);
+                });
                 self.worker_mut().set_interceptor(hook_interceptor);
             }
 
@@ -439,6 +481,24 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         )
         .await?;
 
+        // Persist any LLM Usage measurements collected during this run.
+        // One LogEntry::LlmUsage per LLM call (the tool loop may have run
+        // many calls within a single Pod::run).
+        let usage_records = self.usage_tracker.drain();
+        for record in usage_records {
+            session_store::save_usage(
+                &self.store,
+                self.session_id,
+                &mut self.head_hash,
+                record.history_len,
+                record.input_total_tokens,
+                record.cache_read_tokens,
+                record.cache_write_tokens,
+                record.output_tokens,
+            )
+            .await?;
+        }
+
         let interrupted = self.worker.as_ref().unwrap().last_run_interrupted();
         let outcome = match result {
             Ok(WorkerResult::Finished) => Outcome::Finished,
@@ -597,6 +657,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             interceptor_installed: false,
             manifest_dir,
             compact_state: None,
+            usage_tracker: Arc::new(UsageTracker::new()),
             tracker: None,
         })
     }

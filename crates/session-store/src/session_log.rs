@@ -141,6 +141,28 @@ pub enum LogEntry {
 
     /// `RequestConfig` changed.
     ConfigChanged { ts: u64, config: RequestConfig },
+
+    /// LLM リクエスト 1 件分の Usage スナップショット。
+    ///
+    /// `history_len` は送信時の `history.len()`。`input_total_tokens` は
+    /// その prefix をプロバイダが実測した占有量（プロンプト全長）。
+    /// このリクエスト 1 件で新しく追加された分ではない。
+    ///
+    /// プロバイダ別の正規化（呼び出し側で行う想定）:
+    ///   - Anthropic: `input_tokens + cache_read + cache_creation`
+    ///   - OpenAI:    `prompt_tokens`
+    ///   - Gemini:    `promptTokenCount`
+    ///   - Ollama:    `prompt_eval_count`
+    ///
+    /// `cache_read_tokens` / `cache_write_tokens` は上記の内訳で、料金会計用。
+    LlmUsage {
+        ts: u64,
+        history_len: usize,
+        input_total_tokens: u64,
+        cache_read_tokens: u64,
+        cache_write_tokens: u64,
+        output_tokens: u64,
+    },
 }
 
 /// Provenance reference to a parent session.
@@ -176,6 +198,27 @@ pub struct RestoredState {
     pub last_run_interrupted: bool,
     /// Hash of the last entry in the chain (None if empty).
     pub head_hash: Option<EntryHash>,
+    /// LLM リクエストごとの Usage スナップショット時系列。
+    /// `LogEntry::LlmUsage` を replay して時系列順に積まれる。
+    /// 任意位置のトークン数推定に使う。
+    pub usage_history: Vec<UsageRecord>,
+}
+
+/// LLM リクエスト送信時点での占有量スナップショット。
+///
+/// `LogEntry::LlmUsage` の replay 時に `RestoredState.usage_history` に積まれる。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsageRecord {
+    /// 送信時の history.len()
+    pub history_len: usize,
+    /// history[..history_len] の占有量（プロンプト全長、実測）
+    pub input_total_tokens: u64,
+    /// 上記のうちキャッシュから読み出された分
+    pub cache_read_tokens: u64,
+    /// 上記のうちこのリクエストでキャッシュに書かれた分
+    pub cache_write_tokens: u64,
+    /// このリクエストで生成された出力トークン数
+    pub output_tokens: u64,
 }
 
 /// Replay a sequence of hashed entries to reconstruct worker state.
@@ -188,6 +231,7 @@ pub fn collect_state(entries: &[HashedEntry]) -> RestoredState {
         locked_prefix_len: 0,
         last_run_interrupted: false,
         head_hash: None,
+        usage_history: Vec::new(),
     };
 
     for hashed in entries {
@@ -232,6 +276,22 @@ pub fn collect_state(entries: &[HashedEntry]) -> RestoredState {
             }
             LogEntry::ConfigChanged { config, .. } => {
                 state.config = config.clone();
+            }
+            LogEntry::LlmUsage {
+                history_len,
+                input_total_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
+                output_tokens,
+                ..
+            } => {
+                state.usage_history.push(UsageRecord {
+                    history_len: *history_len,
+                    input_total_tokens: *input_total_tokens,
+                    cache_read_tokens: *cache_read_tokens,
+                    cache_write_tokens: *cache_write_tokens,
+                    output_tokens: *output_tokens,
+                });
             }
         }
     }
@@ -450,6 +510,106 @@ mod tests {
         let hash_a = compute_hash(None, &entry_a);
         let hash_b = compute_hash(None, &entry_b);
         assert_ne!(hash_a, hash_b);
+    }
+
+    #[test]
+    fn replay_llm_usage_appends_to_usage_history() {
+        let entries = build_chain(&[
+            LogEntry::SessionStart {
+                ts: 1000,
+                system_prompt: None,
+                config: RequestConfig::default(),
+                history: vec![],
+                forked_from: None,
+                compacted_from: None,
+            },
+            LogEntry::UserInput {
+                ts: 2000,
+                item: Item::user_message("hi"),
+            },
+            LogEntry::LlmUsage {
+                ts: 2100,
+                history_len: 1,
+                input_total_tokens: 50,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                output_tokens: 10,
+            },
+            LogEntry::AssistantItems {
+                ts: 2200,
+                items: vec![Item::assistant_message("yo")],
+            },
+            LogEntry::LlmUsage {
+                ts: 3100,
+                history_len: 2,
+                input_total_tokens: 65,
+                cache_read_tokens: 50,
+                cache_write_tokens: 0,
+                output_tokens: 5,
+            },
+        ]);
+        let state = collect_state(&entries);
+        // history は LlmUsage で変化しない
+        assert_eq!(state.history.len(), 2);
+        // usage_history は時系列順
+        assert_eq!(state.usage_history.len(), 2);
+        assert_eq!(state.usage_history[0].history_len, 1);
+        assert_eq!(state.usage_history[0].input_total_tokens, 50);
+        assert_eq!(state.usage_history[1].history_len, 2);
+        assert_eq!(state.usage_history[1].cache_read_tokens, 50);
+    }
+
+    #[test]
+    fn replay_without_llm_usage_keeps_usage_history_empty() {
+        // 既存ログ互換: LlmUsage entry が無くても collect_state は壊れない
+        let entries = build_chain(&[
+            LogEntry::SessionStart {
+                ts: 1000,
+                system_prompt: None,
+                config: RequestConfig::default(),
+                history: vec![],
+                forked_from: None,
+                compacted_from: None,
+            },
+            LogEntry::UserInput {
+                ts: 2000,
+                item: Item::user_message("hi"),
+            },
+        ]);
+        let state = collect_state(&entries);
+        assert!(state.usage_history.is_empty());
+    }
+
+    #[test]
+    fn llm_usage_entry_round_trip_via_json() {
+        let entry = LogEntry::LlmUsage {
+            ts: 12345,
+            history_len: 7,
+            input_total_tokens: 1000,
+            cache_read_tokens: 800,
+            cache_write_tokens: 100,
+            output_tokens: 42,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let parsed: LogEntry = serde_json::from_str(&json).unwrap();
+        match parsed {
+            LogEntry::LlmUsage {
+                ts,
+                history_len,
+                input_total_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
+                output_tokens,
+            } => {
+                assert_eq!(ts, 12345);
+                assert_eq!(history_len, 7);
+                assert_eq!(input_total_tokens, 1000);
+                assert_eq!(cache_read_tokens, 800);
+                assert_eq!(cache_write_tokens, 100);
+                assert_eq!(output_tokens, 42);
+            }
+            other => panic!("expected LlmUsage, got {:?}", other),
+        }
     }
 
     #[test]

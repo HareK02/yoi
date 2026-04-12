@@ -265,12 +265,23 @@ impl AnthropicScheme {
     }
 
     fn convert_usage(&self, usage: &UsageData) -> UsageEvent {
-        let input = usage.input_tokens.unwrap_or(0);
+        // Anthropic の `input_tokens` は **キャッシュ外** の入力トークンのみで、
+        // プロンプト全長は input_tokens + cache_read + cache_creation。
+        // UsageEvent の `input_tokens` には「占有量（プロンプト全長）」を載せる
+        // 規約に合わせて、ここでキャッシュ分を足し込む。
+        // cache_read_input_tokens / cache_creation_input_tokens は内訳として
+        // 別フィールドに残るので、料金計算側で `input - cache_read - cache_creation`
+        // により非キャッシュ入力分は逆算可能。
+        let raw_input = usage.input_tokens.unwrap_or(0);
+        let cache_read = usage.cache_read_input_tokens.unwrap_or(0);
+        let cache_creation = usage.cache_creation_input_tokens.unwrap_or(0);
+        let input_total = raw_input + cache_read + cache_creation;
         let output = usage.output_tokens.unwrap_or(0);
+
         UsageEvent {
-            input_tokens: usage.input_tokens,
+            input_tokens: usage.input_tokens.map(|_| input_total),
             output_tokens: usage.output_tokens,
-            total_tokens: Some(input + output),
+            total_tokens: Some(input_total + output),
             cache_read_input_tokens: usage.cache_read_input_tokens,
             cache_creation_input_tokens: usage.cache_creation_input_tokens,
         }
@@ -289,10 +300,31 @@ mod tests {
         let event = scheme.parse_event("message_start", data).unwrap().unwrap();
         match event {
             Event::Usage(u) => {
+                // キャッシュなしなので input_total = raw_input = 10
                 assert_eq!(u.input_tokens, Some(10));
             }
             _ => panic!("Expected Usage event"),
         }
+    }
+
+    #[test]
+    fn test_convert_usage_includes_cache_in_input_total() {
+        // Anthropic の input_tokens はキャッシュ外のみで、占有量は
+        // input + cache_read + cache_creation。
+        // UsageEvent.input_tokens は占有量に正規化される。
+        let scheme = AnthropicScheme::new();
+        let usage = UsageData {
+            input_tokens: Some(100),
+            output_tokens: Some(50),
+            cache_read_input_tokens: Some(800),
+            cache_creation_input_tokens: Some(200),
+        };
+        let event = scheme.convert_usage(&usage);
+        // 100 + 800 + 200 = 1100
+        assert_eq!(event.input_tokens, Some(1100));
+        assert_eq!(event.cache_read_input_tokens, Some(800));
+        assert_eq!(event.cache_creation_input_tokens, Some(200));
+        assert_eq!(event.total_tokens, Some(1150));
     }
 
     #[test]

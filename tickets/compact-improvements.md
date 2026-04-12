@@ -85,6 +85,28 @@ warn を出す。両方 None なら compact 無効（今まで通り）。片方
 
 → `CompactState` 内部では `Option<u64>` 2 本持ち。`exceeds_*` メソッドは `Option` が `None` なら常に `false`。
 
+### 占有量ソースの統合（重要）
+
+現在 `CompactState::last_input_tokens: AtomicU64` が `on_usage` callback から
+更新され、閾値判定に使われている。これは usage-history チケットで導入された
+session-store の `LogEntry::LlmUsage` 履歴と**情報源が二重化**している状態。
+
+本チケットで両者を統合する。**改善版である `usage_history` を単一の情報源とし、
+`last_input_tokens` 経路を撤去する**:
+
+- `CompactState` から `last_input_tokens: AtomicU64` フィールドを削除
+- `CompactState::update_input_tokens` メソッドを削除
+- `Pod::ensure_interceptor_installed` の on_usage callback から
+  `state_for_usage.update_input_tokens(tokens)` の行を削除
+  （`tracker_for_usage.record_usage(event)` だけが残る）
+- 閾値判定 (`exceeds_request` / `exceeds_post_run`) は `Session::total_tokens()`
+  （token-counter で導入される API）の戻り値を見る形に変える
+- これにより「実測値の単一履歴 → トークン会計 API → 閾値判定」と一直線になる
+
+Anthropic のキャッシュヒット時に占有量を取りこぼす旧バグも、このパスを
+廃止することで自動的に解消する（`UsageEvent.input_tokens` は scheme 層で
+すでに占有量に正規化済み、かつ usage_history はそれをそのまま保存している）。
+
 ### 影響箇所
 
 - **`crates/manifest/src/lib.rs`**
@@ -93,6 +115,8 @@ warn を出す。両方 None なら compact 無効（今まで通り）。片方
   - テスト更新 (両閾値が読めること)
 
 - **`crates/pod/src/compact_state.rs`**
+  - `last_input_tokens: AtomicU64` フィールドを **削除**（情報源を usage_history に一本化）
+  - `update_input_tokens` / `last_input_tokens` メソッドも削除
   - `turn_threshold` フィールドを `request_threshold: Option<u64>` にリネーム + `Option` 化
   - `post_run_threshold: u64` → `Option<u64>` に変更
   - コンストラクタシグネチャ変更:
@@ -106,18 +130,26 @@ warn を出す。両方 None なら compact 無効（今まで通り）。片方
         retained_turns: usize,
     ) -> Self
     ```
-  - `exceeds_turn()` → `exceeds_request()` にリネーム。中身:
+  - `exceeds_turn()` → `exceeds_request()` にリネーム。閾値超過判定は
+    呼び出し側で現在の占有量を渡す形に変える（CompactState は閾値しか持たない）:
     ```rust
-    pub(crate) fn exceeds_request(&self) -> bool {
+    pub(crate) fn exceeds_request(&self, current_tokens: u64) -> bool {
         self.request_threshold
-            .map(|t| self.last_input_tokens() > t)
+            .map(|t| current_tokens > t)
             .unwrap_or(false)
     }
     ```
+    呼び出し元 (`compact_interceptor.rs` / `controller.rs`) は `Session::total_tokens()`
+    （token-counter で生やす API）から現在の占有量を取って渡す
   - `exceeds_post_run()` も同様に Option 対応
   - `turn_threshold()` getter → `request_threshold()`、戻り値は `Option<u64>`
   - ドックコメントを「proactive = post_run」「safety net = request」で書き直し
   - テスト: 両方設定/片方だけ/両方 None の 3 ケース
+
+- **`crates/pod/src/pod.rs`** (上記の compact_state 変更に伴って)
+  - `ensure_interceptor_installed` の on_usage callback から
+    `state_for_usage.update_input_tokens(tokens)` の行を削除。
+    `tracker_for_usage.record_usage(event)` だけが残る
 
 - **`crates/pod/src/compact_interceptor.rs`**
   - `exceeds_turn()` 呼び出しを `exceeds_request()` に
@@ -356,8 +388,9 @@ pruned history から:
 
 ### Prune と Compact の相互作用
 
-Prune はリクエストコンテキストのみ操作、`last_input_tokens` は前回の LLM レスポンスの値。
-Prune の効果は閾値判断に反映されない。保守的（compact しすぎる方向）で実害は小さい。
+Prune はリクエストコンテキストのみ操作。閾値判定は usage_history の最新
+測定値（前回の LLM レスポンス時点の占有量）を見るので、Prune の効果は
+次回 LLM call まで反映されない。保守的（compact しすぎる方向）で実害は小さい。
 
 ### compact 中のクライアント通知
 

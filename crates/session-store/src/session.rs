@@ -214,6 +214,33 @@ pub async fn save_outcome(
     .await
 }
 
+/// Log an `LlmUsage` entry — 1 LLM リクエスト分の Usage スナップショット。
+///
+/// `history_len` は送信時の `history.len()`。`input_total_tokens` は
+/// その prefix をプロバイダが実測した占有量（プロンプト全長）で、
+/// プロバイダ別の正規化（Anthropic では `input + cache_read + cache_creation`）を
+/// 済ませた値を渡す。
+pub async fn save_usage(
+    store: &impl Store,
+    session_id: SessionId,
+    head_hash: &mut Option<EntryHash>,
+    history_len: usize,
+    input_total_tokens: u64,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
+    output_tokens: u64,
+) -> Result<(), StoreError> {
+    append_entry(store, session_id, head_hash, LogEntry::LlmUsage {
+        ts: session_log::now_millis(),
+        history_len,
+        input_total_tokens,
+        cache_read_tokens,
+        cache_write_tokens,
+        output_tokens,
+    })
+    .await
+}
+
 /// Log a `Locked` entry (KV cache locked).
 pub async fn save_cache_locked(
     store: &impl Store,

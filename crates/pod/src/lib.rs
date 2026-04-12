@@ -10,6 +10,7 @@ mod compact_interceptor;
 mod compact_state;
 mod hook_interceptor;
 mod pod;
+mod usage_tracker;
 
 pub use controller::{PodController, PodHandle};
 pub use manifest::{PodManifest, ProviderConfig, ProviderKind, Scope};

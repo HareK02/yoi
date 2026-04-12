@@ -803,7 +803,11 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
                                 }
                             }
                             let event = result
-                                .inspect_err(|_| self.last_run_interrupted = true)?;
+                                .inspect_err(|_| {
+                                    self.last_run_interrupted = true;
+                                    // 部分情報でも発火しておく（料金会計用）
+                                    self.timeline.flush_usage();
+                                })?;
                             self.timeline.dispatch(&event);
                         }
                         None => break,
@@ -814,11 +818,14 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
                         info!("Stream cancelled");
                     }
                     self.timeline.abort_current_block();
+                    self.timeline.flush_usage();
                     self.last_run_interrupted = true;
                     return Err(WorkerError::Cancelled);
                 }
             }
         }
+        // ストリーム完了時に集約済み Usage を 1 度だけ発火
+        self.timeline.flush_usage();
         debug!(event_count = event_count, "Stream completed");
         Ok(())
     }

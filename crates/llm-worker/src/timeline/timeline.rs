@@ -9,6 +9,33 @@ use super::event::*;
 use crate::handler::*;
 
 // =============================================================================
+// Helpers
+// =============================================================================
+
+/// 1リクエスト内で受信した複数 UsageEvent をマージする。
+/// 各フィールドについて新しい値が `Some` ならそれで上書き。
+/// プロバイダによっては input/cache 系を最初の event だけに載せ、
+/// output_tokens を後続 event で更新するため、最後の値だけを取るのではなく
+/// フィールド単位で latest-non-None を取る。
+fn merge_usage(acc: &mut UsageEvent, new: &UsageEvent) {
+    if new.input_tokens.is_some() {
+        acc.input_tokens = new.input_tokens;
+    }
+    if new.output_tokens.is_some() {
+        acc.output_tokens = new.output_tokens;
+    }
+    if new.total_tokens.is_some() {
+        acc.total_tokens = new.total_tokens;
+    }
+    if new.cache_read_input_tokens.is_some() {
+        acc.cache_read_input_tokens = new.cache_read_input_tokens;
+    }
+    if new.cache_creation_input_tokens.is_some() {
+        acc.cache_creation_input_tokens = new.cache_creation_input_tokens;
+    }
+}
+
+// =============================================================================
 // Type-erased Handler
 // =============================================================================
 
@@ -362,6 +389,12 @@ pub struct Timeline {
 
     // 現在アクティブなブロック
     current_block: Option<BlockType>,
+
+    // 1リクエスト内で受信した Usage event の集約バッファ。
+    // Anthropic は message_start と message_delta、Gemini は各チャンクと、
+    // 多くのプロバイダが複数 Usage を発行するため、リクエスト境界で
+    // 1度だけ発火するためにここでマージする。flush_usage() で発火する。
+    pending_usage: Option<UsageEvent>,
 }
 
 impl Default for Timeline {
@@ -381,6 +414,7 @@ impl Timeline {
             thinking_block_handlers: Vec::new(),
             tool_use_block_handlers: Vec::new(),
             current_block: None,
+            pending_usage: None,
         }
     }
 
@@ -491,9 +525,24 @@ impl Timeline {
         }
     }
 
+    /// Usage event を即時には dispatch せず、pending_usage にマージする。
+    /// 1リクエスト内で複数の Usage event が来ても、ハンドラには 1 度だけ
+    /// 最終値を渡したいため。flush_usage() で発火する。
     fn dispatch_usage(&mut self, event: &UsageEvent) {
-        for handler in &mut self.usage_handlers {
-            handler.dispatch(event);
+        match &mut self.pending_usage {
+            Some(acc) => merge_usage(acc, event),
+            None => self.pending_usage = Some(event.clone()),
+        }
+    }
+
+    /// pending_usage を usage_handlers に発火し、バッファをクリアする。
+    /// 1リクエスト分のストリーム終了時に1回だけ呼ぶ想定。
+    /// pending_usage が空ならば何もしない。
+    pub fn flush_usage(&mut self) {
+        if let Some(event) = self.pending_usage.take() {
+            for handler in &mut self.usage_handlers {
+                handler.dispatch(&event);
+            }
         }
     }
 
@@ -629,9 +678,63 @@ mod tests {
         timeline.on_usage(handler);
 
         timeline.dispatch(&Event::usage(100, 50));
+        // pending_usage に積まれているだけなのでまだ未発火
+        assert_eq!(calls.lock().unwrap().len(), 0);
 
+        // flush で 1 度だけ発火
+        timeline.flush_usage();
         let recorded = calls.lock().unwrap();
         assert_eq!(recorded.len(), 1);
         assert_eq!(recorded[0].input_tokens, Some(100));
+    }
+
+    #[test]
+    fn test_usage_aggregation_and_flush() {
+        struct TestUsageHandler {
+            calls: Arc<Mutex<Vec<UsageEvent>>>,
+        }
+        impl Handler<UsageKind> for TestUsageHandler {
+            type Scope = ();
+            fn on_event(&mut self, _scope: &mut (), event: &UsageEvent) {
+                self.calls.lock().unwrap().push(event.clone());
+            }
+        }
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut timeline = Timeline::new();
+        timeline.on_usage(TestUsageHandler {
+            calls: calls.clone(),
+        });
+
+        // Anthropic 風: message_start で input + 暫定 output
+        timeline.dispatch(&Event::Usage(UsageEvent {
+            input_tokens: Some(409),
+            output_tokens: Some(1),
+            total_tokens: Some(410),
+            cache_read_input_tokens: Some(0),
+            cache_creation_input_tokens: Some(0),
+        }));
+        // message_delta で最終 output
+        timeline.dispatch(&Event::Usage(UsageEvent {
+            input_tokens: Some(409),
+            output_tokens: Some(71),
+            total_tokens: Some(480),
+            cache_read_input_tokens: Some(0),
+            cache_creation_input_tokens: Some(0),
+        }));
+
+        // 未 flush の段階では発火しない
+        assert_eq!(calls.lock().unwrap().len(), 0);
+
+        timeline.flush_usage();
+        let recorded = calls.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].input_tokens, Some(409));
+        assert_eq!(recorded[0].output_tokens, Some(71));
+
+        // flush 後にもう一度 flush しても何も起きない
+        drop(recorded);
+        timeline.flush_usage();
+        assert_eq!(calls.lock().unwrap().len(), 1);
     }
 }
