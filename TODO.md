@@ -18,7 +18,7 @@
 - [x] api_key_file: ファイルパスによるAPIキー解決 → [tickets/api-key-file.md](tickets/api-key-file.md)
 - [x] コンテキスト圧縮 (Prune + Compact) → [tickets/context-compaction.md](tickets/context-compaction.md)
 - [ ] LlmClient へ Tokenizer の導入 → [tickets/token-counter.md](tickets/token-counter.md)
-- [ ] Tracker: ReadTracker リネーム + recent_files 追加 → [tickets/tracker.md](tickets/tracker.md)
+- [x] Tracker: ReadTracker リネーム + recent_files 追加 → [tickets/tracker.md](tickets/tracker.md)
 - [ ] Compact の改善（要約品質 + 挙動詳細） → [tickets/compact-improvements.md](tickets/compact-improvements.md)
 - [ ] Protocol の設計 → [tickets/protocol-design.md](tickets/protocol-design.md)
 - [x] Protocol: request-response パターン (GetHistory等) → [tickets/request-response-protocol.md](tickets/request-response-protocol.md)

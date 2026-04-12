@@ -69,7 +69,7 @@ if let Some(scope) = scope_for_tools { ... }
 
 // 後: 常にツール登録（scope は必須）
 let fs = tools::ScopedFs::new(pod.scope().clone());
-let tracker = tools::ReadTracker::new();
+let tracker = tools::Tracker::new();
 worker.register_tools(tools::builtin_tools(fs, tracker));
 ```
 

@@ -11,7 +11,7 @@ use llm_worker::tool::{Tool, ToolDefinition, ToolMeta};
 use manifest::Scope;
 use serde_json::json;
 use tempfile::TempDir;
-use tools::{ReadTracker, ScopedFs, builtin_tools};
+use tools::{Tracker, ScopedFs, builtin_tools};
 
 struct Registry {
     entries: Vec<(ToolMeta, Arc<dyn Tool>)>,
@@ -39,7 +39,7 @@ impl Registry {
 fn setup() -> (TempDir, Registry) {
     let dir = TempDir::new().unwrap();
     let fs = ScopedFs::new(Scope::new(dir.path()).unwrap());
-    let tracker = ReadTracker::new();
+    let tracker = Tracker::new();
     let reg = Registry::new(builtin_tools(fs, tracker));
     (dir, reg)
 }
@@ -268,6 +268,43 @@ fn tool_names_match_reference_spec() {
             "missing tool {expected}"
         );
     }
+}
+
+#[tokio::test]
+async fn tracker_recent_files_tracks_read_write_edit() {
+    // Build a fresh registry that shares a tracker we can query afterwards.
+    let dir = TempDir::new().unwrap();
+    let fs = ScopedFs::new(Scope::new(dir.path()).unwrap());
+    let tracker = Tracker::new();
+    let reg = Registry::new(builtin_tools(fs, tracker.clone()));
+
+    let a = dir.path().join("a.txt");
+    let b = dir.path().join("b.txt");
+    std::fs::write(&a, "one\n").unwrap();
+
+    // Read `a` — should appear in recency.
+    call(&reg.get("Read"), json!({ "file_path": a.to_str().unwrap() })).await;
+    // Write `b` (new file) — should appear ahead of `a`.
+    call(
+        &reg.get("Write"),
+        json!({ "file_path": b.to_str().unwrap(), "content": "hello\n" }),
+    )
+    .await;
+    // Edit `a` — should bump it back to the front.
+    call(
+        &reg.get("Edit"),
+        json!({
+            "file_path": a.to_str().unwrap(),
+            "old_string": "one",
+            "new_string": "two",
+        }),
+    )
+    .await;
+
+    let recent = tracker.recent_files(10);
+    assert_eq!(recent.len(), 2);
+    assert!(recent[0].ends_with("a.txt"), "front should be a.txt: {recent:?}");
+    assert!(recent[1].ends_with("b.txt"), "second should be b.txt: {recent:?}");
 }
 
 // Sanity: unused Path import guard

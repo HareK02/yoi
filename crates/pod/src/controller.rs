@@ -164,13 +164,17 @@ impl PodController {
             // Edit / Glob / Grep) when the manifest declares a scope.
             //
             // `ScopedFs` carries the pod-lifetime write boundary (derived
-            // from the manifest scope). `ReadTracker` is session-scoped —
+            // from the manifest scope). `Tracker` is session-scoped —
             // a fresh instance per controller spawn ensures state from a
             // previous process lifetime cannot be reused after a resume.
+            // The tracker is also handed to the Pod itself so Pod-level
+            // operations (e.g. context compaction) can ask which files
+            // the agent has been touching.
             if let Some(scope) = scope_for_tools {
                 let fs = tools::ScopedFs::new(scope);
-                let tracker = tools::ReadTracker::new();
-                worker.register_tools(tools::builtin_tools(fs, tracker));
+                let tracker = tools::Tracker::new();
+                worker.register_tools(tools::builtin_tools(fs, tracker.clone()));
+                pod.attach_tracker(tracker);
             }
         }
 

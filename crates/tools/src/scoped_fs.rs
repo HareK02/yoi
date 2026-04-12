@@ -4,7 +4,7 @@
 //! [`manifest::Scope`] and refuses writes outside of it. It carries no
 //! per-session state and is cheap to clone (pod-lifetime, reusable across
 //! sessions). The read-before-edit policy lives separately in
-//! [`crate::ReadTracker`].
+//! [`crate::Tracker`].
 //!
 //! Reads are unrestricted by design (see `tickets/builtin-tools.md`).
 
@@ -83,7 +83,7 @@ impl ScopedFs {
     ///
     /// This method does **not** consult any read history. Callers that
     /// want the "must read before overwrite" policy should verify with a
-    /// [`ReadTracker`](crate::ReadTracker) beforehand.
+    /// [`Tracker`](crate::Tracker) beforehand.
     pub fn write(&self, path: &Path, content: &[u8]) -> Result<WriteOutcome, ToolsError> {
         if !path.is_absolute() {
             return Err(ToolsError::RelativePath(path.to_path_buf()));

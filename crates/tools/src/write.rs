@@ -7,8 +7,8 @@ use async_trait::async_trait;
 use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use serde::Deserialize;
 
-use crate::read_tracker::ReadTracker;
 use crate::scoped_fs::ScopedFs;
+use crate::tracker::Tracker;
 
 const DESCRIPTION: &str = "Create a new file or overwrite an existing one with \
 the given content. Missing parent directories within scope are created \
@@ -25,7 +25,7 @@ pub(crate) struct WriteParams {
 
 pub(crate) struct WriteTool {
     fs: ScopedFs,
-    tracker: ReadTracker,
+    tracker: Tracker,
 }
 
 #[async_trait]
@@ -69,7 +69,7 @@ impl Tool for WriteTool {
 }
 
 /// Factory for the `Write` tool.
-pub fn write_tool(fs: ScopedFs, tracker: ReadTracker) -> ToolDefinition {
+pub fn write_tool(fs: ScopedFs, tracker: Tracker) -> ToolDefinition {
     Arc::new(move || {
         let schema = schemars::schema_for!(WriteParams);
         let schema_value = serde_json::to_value(schema).unwrap_or(serde_json::json!({}));
@@ -91,10 +91,10 @@ mod tests {
     use manifest::Scope;
     use tempfile::TempDir;
 
-    fn setup() -> (TempDir, ScopedFs, ReadTracker) {
+    fn setup() -> (TempDir, ScopedFs, Tracker) {
         let dir = TempDir::new().unwrap();
         let fs = ScopedFs::new(Scope::new(dir.path()).unwrap());
-        (dir, fs, ReadTracker::new())
+        (dir, fs, Tracker::new())
     }
 
     #[tokio::test]

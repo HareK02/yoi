@@ -53,6 +53,11 @@ pub struct Pod<C: LlmClient, St: Store> {
     manifest_dir: Option<PathBuf>,
     /// Shared compaction state (present when compact_threshold is configured).
     compact_state: Option<Arc<CompactState>>,
+    /// Session-lifetime file-operation tracker from the builtin `tools`
+    /// crate. Populated by the Controller when it registers the builtin
+    /// tools so that Pod-owned operations (e.g. compaction) can consult
+    /// the recency of touched files.
+    tracker: Option<tools::Tracker>,
 }
 
 impl<C: LlmClient, St: Store> Pod<C, St> {
@@ -80,6 +85,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             interceptor_installed: false,
             manifest_dir: None,
             compact_state: None,
+            tracker: None,
         })
     }
 
@@ -112,6 +118,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             interceptor_installed: false,
             manifest_dir: None,
             compact_state: None,
+            tracker: None,
         })
     }
 
@@ -146,6 +153,19 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     /// Reference to the store.
     pub fn store(&self) -> &St {
         &self.store
+    }
+
+    /// Attach the session-scoped file-operation tracker from the builtin
+    /// `tools` crate. Called by the Controller immediately after it
+    /// registers the builtin tools on the Worker. Overwrites any
+    /// previously attached tracker.
+    pub fn attach_tracker(&mut self, tracker: tools::Tracker) {
+        self.tracker = Some(tracker);
+    }
+
+    /// The attached session-scoped file-operation tracker, if any.
+    pub fn tracker(&self) -> Option<&tools::Tracker> {
+        self.tracker.as_ref()
     }
 
     // --- Hook registration ---
@@ -577,6 +597,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             interceptor_installed: false,
             manifest_dir,
             compact_state: None,
+            tracker: None,
         })
     }
 

@@ -8,8 +8,8 @@ use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use serde::Deserialize;
 
 use crate::error::ToolsError;
-use crate::read_tracker::ReadTracker;
 use crate::scoped_fs::ScopedFs;
+use crate::tracker::Tracker;
 
 const DESCRIPTION: &str = "Replace a substring in an existing file. By default \
 `old_string` must be unique in the file; set `replace_all: true` to replace \
@@ -31,7 +31,7 @@ pub(crate) struct EditParams {
 
 pub(crate) struct EditTool {
     fs: ScopedFs,
-    tracker: ReadTracker,
+    tracker: Tracker,
 }
 
 #[async_trait]
@@ -135,7 +135,7 @@ fn make_preview(text: &str, needle: &str) -> String {
 }
 
 /// Factory for the `Edit` tool.
-pub fn edit_tool(fs: ScopedFs, tracker: ReadTracker) -> ToolDefinition {
+pub fn edit_tool(fs: ScopedFs, tracker: Tracker) -> ToolDefinition {
     Arc::new(move || {
         let schema = schemars::schema_for!(EditParams);
         let schema_value = serde_json::to_value(schema).unwrap_or(serde_json::json!({}));
@@ -157,13 +157,13 @@ mod tests {
     use manifest::Scope;
     use tempfile::TempDir;
 
-    fn setup() -> (TempDir, ScopedFs, ReadTracker) {
+    fn setup() -> (TempDir, ScopedFs, Tracker) {
         let dir = TempDir::new().unwrap();
         let fs = ScopedFs::new(Scope::new(dir.path()).unwrap());
-        (dir, fs, ReadTracker::new())
+        (dir, fs, Tracker::new())
     }
 
-    async fn read_first(fs: &ScopedFs, tracker: &ReadTracker, file: &std::path::Path) {
+    async fn read_first(fs: &ScopedFs, tracker: &Tracker, file: &std::path::Path) {
         let def = read_tool(fs.clone(), tracker.clone());
         let (_, reader) = def();
         let inp = serde_json::json!({ "file_path": file.to_str().unwrap() });

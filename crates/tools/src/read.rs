@@ -7,8 +7,8 @@ use async_trait::async_trait;
 use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use serde::Deserialize;
 
-use crate::read_tracker::ReadTracker;
 use crate::scoped_fs::ScopedFs;
+use crate::tracker::Tracker;
 
 const DESCRIPTION: &str = "Read a text file from the local filesystem. \
 Supports offset/limit for large files. Returns line-numbered output (1-based). \
@@ -31,7 +31,7 @@ pub(crate) struct ReadParams {
 
 pub(crate) struct ReadTool {
     fs: ScopedFs,
-    tracker: ReadTracker,
+    tracker: Tracker,
 }
 
 #[async_trait]
@@ -114,7 +114,7 @@ fn render_numbered(text: &str, offset: usize, limit: usize) -> Rendered {
 }
 
 /// Factory for the `Read` tool.
-pub fn read_tool(fs: ScopedFs, tracker: ReadTracker) -> ToolDefinition {
+pub fn read_tool(fs: ScopedFs, tracker: Tracker) -> ToolDefinition {
     Arc::new(move || {
         let schema = schemars::schema_for!(ReadParams);
         let schema_value = serde_json::to_value(schema).unwrap_or(serde_json::json!({}));
@@ -135,10 +135,10 @@ mod tests {
     use manifest::Scope;
     use tempfile::TempDir;
 
-    fn setup() -> (TempDir, ScopedFs, ReadTracker) {
+    fn setup() -> (TempDir, ScopedFs, Tracker) {
         let dir = TempDir::new().unwrap();
         let fs = ScopedFs::new(Scope::new(dir.path()).unwrap());
-        (dir, fs, ReadTracker::new())
+        (dir, fs, Tracker::new())
     }
 
     #[tokio::test]
