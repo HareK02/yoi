@@ -54,17 +54,27 @@ pub struct PingEvent {
 }
 
 /// 使用量イベント
+///
+/// プロバイダから受信した 1 LLM リクエスト分のトークン会計。
+/// 各 scheme で正規化され、フィールドの意味は全プロバイダ共通:
+///
+/// - `input_tokens` は **送信した prompt prefix 全体の占有量**（プロンプト全長）。
+///   キャッシュヒット分も含まれる。Anthropic は raw API では非キャッシュ分のみを
+///   `input_tokens` として返すため、`AnthropicScheme::convert_usage` で
+///   `cache_read + cache_creation` を加算してこの規約に揃えている。
+/// - `cache_read_input_tokens` / `cache_creation_input_tokens` は上記の内訳で、
+///   料金会計用。占有量からは差し引かない。
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct UsageEvent {
-    /// 入力トークン数
+    /// 送信した prompt prefix の総トークン数（占有量、キャッシュ込み）
     pub input_tokens: Option<u64>,
-    /// 出力トークン数
+    /// このリクエストで生成された出力トークン数
     pub output_tokens: Option<u64>,
-    /// 合計トークン数
+    /// `input_tokens + output_tokens`
     pub total_tokens: Option<u64>,
-    /// キャッシュ読み込みトークン数
+    /// `input_tokens` のうちキャッシュから読まれた分（割引料金）
     pub cache_read_input_tokens: Option<u64>,
-    /// キャッシュ作成トークン数
+    /// `input_tokens` のうちこのリクエストでキャッシュに書かれた分（割増料金、Anthropic）
     pub cache_creation_input_tokens: Option<u64>,
 }
 
