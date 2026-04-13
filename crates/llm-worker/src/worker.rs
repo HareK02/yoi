@@ -162,6 +162,12 @@ pub struct Worker<C: LlmClient, S: WorkerState = Mutable> {
     /// Cancel notification channel (for interrupting execution)
     cancel_tx: mpsc::Sender<()>,
     cancel_rx: mpsc::Receiver<()>,
+    /// Prune configuration. `None` disables the prune projection.
+    prune_config: Option<crate::prune::PruneConfig>,
+    /// Callback that estimates token savings for a drop range, injected
+    /// by higher layers that own usage measurements. `None` disables
+    /// the prune projection.
+    savings_estimator: Option<crate::prune::SavingsEstimator>,
     /// State marker
     _state: PhantomData<S>,
 }
@@ -301,6 +307,28 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
     /// interceptor is used (all Continue / Finish).
     pub fn set_interceptor(&mut self, interceptor: impl Interceptor + 'static) {
         self.interceptor = Box::new(interceptor);
+    }
+
+    /// Configure the prune projection applied to each outgoing request
+    /// context.
+    ///
+    /// Both this and [`set_savings_estimator`](Self::set_savings_estimator)
+    /// must be set for the projection to fire; missing either one is a
+    /// no-op. See the crate-level [`prune`](crate::prune) docs for the
+    /// semantics.
+    pub fn set_prune_config(&mut self, config: Option<crate::prune::PruneConfig>) {
+        self.prune_config = config;
+    }
+
+    /// Inject the callback used to estimate token savings for a prune
+    /// candidate range.
+    ///
+    /// The callback is invoked with the *request context* (a clone of
+    /// history) and the candidate index range. It must be pure/idempotent
+    /// since it may be called once per LLM request. Return `0` to signal
+    /// "no data" or "refuse to prune".
+    pub fn set_savings_estimator(&mut self, estimator: Option<crate::prune::SavingsEstimator>) {
+        self.savings_estimator = estimator;
     }
 
     /// Get a mutable reference to the timeline (for additional handler registration)
@@ -697,8 +725,40 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
                 cb(current_turn);
             }
 
-            // Interceptor: pre_llm_request
+            // Clone the history into a per-request context. Everything
+            // below (prune projection, interceptor hooks) mutates only
+            // this clone, so the persistent `self.history` stays intact.
             let mut request_context = self.history.clone();
+
+            // Prune projection: if both the config and the savings
+            // estimator are configured, drop ToolResult.content from
+            // prunable candidates whose estimated savings meet the
+            // threshold. Worker does not own usage history itself; the
+            // estimator is injected by the layer that does.
+            if let (Some(config), Some(estimator)) =
+                (&self.prune_config, &self.savings_estimator)
+            {
+                let candidates =
+                    crate::prune::prunable_indices(&request_context, config.protected_turns);
+                if !candidates.is_empty() {
+                    let first = *candidates.first().unwrap();
+                    let last = *candidates.last().unwrap() + 1;
+                    let savings = estimator(&request_context, first..last);
+                    if savings >= config.min_savings {
+                        let pruned =
+                            crate::prune::project(&mut request_context, &candidates);
+                        if pruned > 0 {
+                            debug!(
+                                pruned,
+                                estimated_savings_tokens = savings,
+                                "Projected old tool-result content out of request context"
+                            );
+                        }
+                    }
+                }
+            }
+
+            // Interceptor: pre_llm_request
             match self.interceptor.pre_llm_request(&mut request_context).await {
                 PreRequestAction::Cancel(reason) => {
                     info!(reason = %reason, "Aborted by interceptor");
@@ -899,6 +959,8 @@ impl<C: LlmClient> Worker<C, Mutable> {
             last_run_interrupted: false,
             cancel_tx,
             cancel_rx,
+            prune_config: None,
+            savings_estimator: None,
             _state: PhantomData,
         }
     }
@@ -1147,6 +1209,8 @@ impl<C: LlmClient> Worker<C, Mutable> {
 
             cancel_tx: self.cancel_tx,
             cancel_rx: self.cancel_rx,
+            prune_config: self.prune_config,
+            savings_estimator: self.savings_estimator,
             _state: PhantomData,
         }
     }
@@ -1217,6 +1281,8 @@ impl<C: LlmClient> Worker<C, Locked> {
 
             cancel_tx: self.cancel_tx,
             cancel_rx: self.cancel_rx,
+            prune_config: self.prune_config,
+            savings_estimator: self.savings_estimator,
             _state: PhantomData,
         }
     }

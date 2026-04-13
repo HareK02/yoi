@@ -14,9 +14,18 @@
 //! `min_savings` 判定や savings 推定もこの crate には置かず、上位層が
 //! usage 履歴ベースのトークン会計と組み合わせて行う。
 
+use std::ops::Range;
+
 use serde::{Deserialize, Serialize};
 
 use crate::llm_client::types::Item;
+
+/// Callback that estimates the token savings for dropping `history[range]`.
+///
+/// Injected into [`crate::Worker`] via `set_savings_estimator` so the
+/// Worker can make `min_savings` decisions without knowing about usage
+/// measurement sources. Return `0` to signal "no data / refuse to prune".
+pub type SavingsEstimator = Box<dyn Fn(&[Item], Range<usize>) -> u64 + Send + Sync>;
 
 /// Configuration for the Prune algorithm.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,6 +71,24 @@ fn find_turn_starts(items: &[Item]) -> Vec<usize> {
         .filter(|(_, item)| item.is_user_message())
         .map(|(i, _)| i)
         .collect()
+}
+
+/// Set `content = None` on each `Item::ToolResult` at the given indices.
+///
+/// Returns the number of items that were actually modified — items that
+/// are already content-less are counted as 0. Intended for use on a
+/// request-context clone (never on a persistent history).
+pub fn project(items: &mut [Item], indices: &[usize]) -> usize {
+    let mut count = 0;
+    for &i in indices {
+        if let Item::ToolResult { content, .. } = &mut items[i] {
+            if content.is_some() {
+                *content = None;
+                count += 1;
+            }
+        }
+    }
+    count
 }
 
 /// Indices of `Item::ToolResult { content: Some(_), .. }` that lie outside
@@ -148,6 +175,62 @@ mod tests {
             ("turn4", vec![]),
         ]);
         assert!(prunable_indices(&items, 2).is_empty());
+    }
+
+    #[test]
+    fn project_drops_content_and_counts_modifications() {
+        let big = "x".repeat(64);
+        let mut items = make_history(&[
+            ("turn1", vec![("s1", Some(&big))]),
+            ("turn2", vec![("s2", Some(&big))]),
+            ("turn3", vec![("s3", Some("keep me"))]),
+            ("turn4", vec![("s4", Some("keep me too"))]),
+        ]);
+        let candidates = prunable_indices(&items, 2);
+        let count = project(&mut items, &candidates);
+        assert_eq!(count, 2);
+
+        for item in &items {
+            if let Item::ToolResult { summary, content, .. } = item {
+                if summary == "s1" || summary == "s2" {
+                    assert!(content.is_none(), "old content should be projected out");
+                } else {
+                    assert!(content.is_some(), "protected content should remain");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn project_skips_already_pruned_items() {
+        // indices points at an item whose content is already None.
+        // project() should count it as 0 modifications.
+        let mut items = make_history(&[
+            ("turn1", vec![("s1", None)]),
+            ("turn2", vec![("s2", Some("hello"))]),
+        ]);
+        // Manually target s1 (index 3) even though it's already None.
+        let target = items
+            .iter()
+            .position(|it| matches!(it, Item::ToolResult { summary, .. } if summary == "s1"))
+            .unwrap();
+        let count = project(&mut items, &[target]);
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn project_is_idempotent() {
+        let big = "x".repeat(64);
+        let mut items = make_history(&[
+            ("turn1", vec![("s1", Some(&big))]),
+            ("turn2", vec![]),
+            ("turn3", vec![]),
+            ("turn4", vec![]),
+        ]);
+        let candidates = prunable_indices(&items, 2);
+        assert_eq!(project(&mut items, &candidates), 1);
+        // 2 周目: 候補は一度の prunable_indices 結果を使い回しても 0 件。
+        assert_eq!(project(&mut items, &candidates), 0);
     }
 
     #[test]

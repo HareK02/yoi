@@ -43,6 +43,80 @@ clone が消えると設計が即座に壊れる。対策案:
 `PruneHook::call` を呼んで、context が変更され、かつ元 history が
 変わらないことを検証する統合テストがあると安心。
 
-## 判定
+## 判定（初回）
 
-承認。
+承認。ただし初回レビューで「pure ロジックが `llm-worker::prune` にあるのに
+適用は pod 側 Hook で行う」という責務の不整合が見つかり、追加作業
+「Worker への統合」をチケットに追記して再実装。
+
+---
+
+# 追加作業レビュー: Worker への統合
+
+## 要件の充足
+
+追加作業で定義した変更は全て実装されている:
+
+| 項目 | 実装 |
+|---|---|
+| `Worker::set_prune_config` | `worker.rs:317` |
+| `Worker::set_savings_estimator` | `worker.rs:329` |
+| `build_request` 直前での射影 | `worker.rs:733-758` |
+| `SavingsEstimator` 型定義 | `llm-worker::prune::SavingsEstimator` |
+| `pod::prune_hook` モジュール削除 | 削除済み |
+| Pod 側は config と estimator を渡すだけ | `pod::prune::attach_prune` |
+
+Worker が prune の責任を持ち、pod は usage 履歴に依存する estimator
+コールバックを注入するだけ、という責務分離はチケット通り。Locked 状態への
+lock 時にも `prune_config` / `savings_estimator` が保持される点も対処済み
+(`worker.rs:1214-1217, 1286-1289`)。
+
+## 指摘と対処
+
+### A. `attach_prune` がどこからも呼ばれていない（未対処、要判断）
+
+`Pod::attach_prune` は実装されているが、コードベース内で呼び出し箇所が無い。
+履歴を見ると、リファクタ前の `PruneHook` も一度も registration されていない
+デッドコードだった (`be1119d` 以降 `PruneHook::new` を呼んだ箇所無し)。
+つまりこのリファクタは「デッドコードを別の形のデッドコードに置き換えた」状態。
+
+チケットの「追加作業」範疇としては設計通り完結しているが、prune 機能が実際に
+有効化されていないのは事実。Manifest や `Controller::spawn` のどこで
+`attach_prune` を呼ぶかは別チケット扱いにするか、このチケット内で一緒に
+対処するかを要判断。
+
+### B. 閉包内でのロック取得（非ブロッカー、未対処）
+
+`attach_prune` の estimator は毎回 `usage.lock().expect(...).clone()` する。
+現在 `usage_history` を触る箇所は:
+
+- `Pod::persist_turn`（run 終了後、短時間）
+- `Pod::compact`（同上）
+- `Pod::usage_history()`（snapshot 取得、短い）
+- estimator（request ごと、clone のみ）
+
+estimator 発火は worker.rs の `build_request` 直前、つまり Pod の `run()` が
+待機中なので他のロック取得と並走しない。現時点では安全。将来 `usage_history`
+を別スレッドから触るコードが増えた時の事故防止として、pod.rs の
+`usage_history_handle` doc コメントに「Mutex は短時間 clone 専用」という
+前提を明示すべき。
+
+### C. Worker 内部のインラインループ（非ブロッカー、未対処）
+
+`worker.rs:733-758` に content 射影のインラインループが直書き。`prune`
+モジュール側に `apply_projection(&mut Vec<Item>, &[usize])` のような
+pure 関数を用意して Worker はそれを呼ぶだけにすれば、Worker のメインループが
+短くなり、`prune` モジュール内でのテストも書きやすくなる。現状 Worker の
+`run` ループが肥大化する方向に寄っている。
+
+### D. 射影ロジックに単体テストが無い（初回指摘2から継続、未対処）
+
+Worker に統合したことで Worker のテストとして書きやすくなったはずだが、
+テストは追加されていない。指摘 C で `apply_projection` に切り出せば、
+その pure 関数単位でテストが書ける。
+
+## 判定（追加作業）
+
+条件付き承認。指摘 A が機能有効化の観点で重要。意図通り（別チケットで
+manifest 配線）なら承認、このチケット内で対処するなら未完了扱い。
+指摘 B/C/D はコード品質の改善で非ブロッカー。

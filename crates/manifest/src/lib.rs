@@ -97,7 +97,7 @@ pub struct CompactionConfig {
 
     /// Minimum estimated token savings to trigger a prune.
     #[serde(default = "default_prune_min_savings")]
-    pub prune_min_savings: usize,
+    pub prune_min_savings: u64,
 
     /// When `input_tokens` exceeds this, run compact. `None` = compact disabled.
     #[serde(default)]
@@ -114,7 +114,7 @@ pub struct CompactionConfig {
 }
 
 fn default_prune_protected_turns() -> usize { 3 }
-fn default_prune_min_savings() -> usize { 4096 }
+fn default_prune_min_savings() -> u64 { 4096 }
 fn default_compact_retained_turns() -> usize { 2 }
 
 impl Default for CompactionConfig {

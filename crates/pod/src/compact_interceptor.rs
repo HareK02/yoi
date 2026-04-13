@@ -39,7 +39,7 @@ impl Interceptor for CompactInterceptor {
     }
 
     async fn pre_llm_request(&self, context: &mut Vec<Item>) -> PreRequestAction {
-        // Step 1: Delegate to inner (PruneHook and other hooks run first).
+        // Step 1: Delegate to inner hooks first.
         let inner_action = self.inner.pre_llm_request(context).await;
         if !matches!(inner_action, PreRequestAction::Continue) {
             return inner_action;

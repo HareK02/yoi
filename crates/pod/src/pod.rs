@@ -79,9 +79,9 @@ pub struct Pod<C: LlmClient, St: Store> {
     /// Restored from session log on `restore`, appended on each persist.
     /// Read by token-accounting APIs (`Pod::total_tokens`, etc.).
     ///
-    /// Wrapped in `Arc<Mutex>` so that hooks living on the Worker
-    /// (e.g. `PruneHook`) can share the same view via
-    /// [`Pod::usage_history_handle`].
+    /// Wrapped in `Arc<Mutex>` so that callbacks injected into the
+    /// Worker (e.g. the savings estimator used by the prune projection)
+    /// can share the same view via [`Pod::usage_history_handle`].
     usage_history: Arc<Mutex<Vec<UsageRecord>>>,
     /// Session-lifetime file-operation tracker from the builtin `tools`
     /// crate. Populated by the Controller when it registers the builtin
@@ -104,7 +104,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             history: worker.history(),
         };
         let (session_id, head_hash) = session_store::create_session(&store, state).await?;
-        Ok(Self {
+        let mut pod = Self {
             manifest,
             worker: Some(worker),
             store,
@@ -118,7 +118,9 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             usage_tracker: Arc::new(UsageTracker::new()),
             usage_history: Arc::new(Mutex::new(Vec::<UsageRecord>::new())),
             tracker: None,
-        })
+        };
+        pod.apply_prune_from_manifest();
+        Ok(pod)
     }
 
     /// Restore a Pod from a persisted session.
@@ -139,7 +141,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         worker.set_turn_count(state.turn_count);
         worker.set_last_run_interrupted(state.last_run_interrupted);
 
-        Ok(Self {
+        let mut pod = Self {
             manifest,
             worker: Some(worker),
             store,
@@ -153,7 +155,9 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             usage_tracker: Arc::new(UsageTracker::new()),
             usage_history: Arc::new(Mutex::new(state.usage_history)),
             tracker: None,
-        })
+        };
+        pod.apply_prune_from_manifest();
+        Ok(pod)
     }
 
     /// The session ID used for persistence.
@@ -206,9 +210,16 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
 
     /// Shared handle to the cumulative Usage history.
     ///
-    /// Hooks (e.g. `PruneHook`) take a clone of this `Arc` so they can
-    /// read the latest measurements at request time. The handle outlives
+    /// Callbacks that need live access to the latest measurements (e.g.
+    /// the savings estimator that `attach_prune` installs on the Worker)
+    /// clone this `Arc` and read it at request time. The handle outlives
     /// any individual run.
+    ///
+    /// **Locking contract:** the inner `Mutex` is held only for a short
+    /// clone (`lock().unwrap().clone()`) and released immediately.
+    /// Callers must not hold the guard across `.await` points, I/O, or
+    /// long computations — the guard is implicitly assumed to be
+    /// non-contended at every Pod lifecycle event.
     pub fn usage_history_handle(&self) -> Arc<Mutex<Vec<UsageRecord>>> {
         self.usage_history.clone()
     }
@@ -686,7 +697,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             history: worker.history(),
         };
         let (session_id, head_hash) = session_store::create_session(&store, state).await?;
-        Ok(Self {
+        let mut pod = Self {
             manifest,
             worker: Some(worker),
             store,
@@ -700,7 +711,9 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             usage_tracker: Arc::new(UsageTracker::new()),
             usage_history: Arc::new(Mutex::new(Vec::new())),
             tracker: None,
-        })
+        };
+        pod.apply_prune_from_manifest();
+        Ok(pod)
     }
 
 }
