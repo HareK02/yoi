@@ -4,11 +4,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use common::MockLlmClient;
+use llm_worker::Worker;
 use llm_worker::interceptor::{Interceptor, TurnEndAction};
 use llm_worker::llm_client::event::{Event, ResponseStatus, StatusEvent};
 use llm_worker::llm_client::types::{Item, RequestConfig};
 use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
-use llm_worker::Worker;
 use session_store::{
     EntryHash, FsStore, LogEntry, Outcome, SessionStartState, Store, collect_state,
 };
@@ -124,9 +124,15 @@ async fn run_and_persist(
             message: e.to_string(),
         },
     };
-    session_store::save_outcome(store, session_id, head_hash, outcome, worker.last_run_interrupted())
-        .await
-        .unwrap();
+    session_store::save_outcome(
+        store,
+        session_id,
+        head_hash,
+        outcome,
+        worker.last_run_interrupted(),
+    )
+    .await
+    .unwrap();
 
     let r = result.unwrap();
     (worker, r)
@@ -245,7 +251,8 @@ async fn session_run_with_tool_call() {
     .unwrap();
     let mut head_hash = Some(head_hash);
 
-    let (_worker, _) = run_and_persist(worker, &store, sid, &mut head_hash, "What's the weather?").await;
+    let (_worker, _) =
+        run_and_persist(worker, &store, sid, &mut head_hash, "What's the weather?").await;
 
     let entries = store.read_all(sid).await.unwrap();
 

@@ -191,7 +191,10 @@ mod tests {
         assert_eq!(count, 2);
 
         for item in &items {
-            if let Item::ToolResult { summary, content, .. } = item {
+            if let Item::ToolResult {
+                summary, content, ..
+            } = item
+            {
                 if summary == "s1" || summary == "s2" {
                     assert!(content.is_none(), "old content should be projected out");
                 } else {

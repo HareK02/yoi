@@ -6,7 +6,7 @@ use llm_worker::tool::{Tool, ToolDefinition};
 use manifest::Scope;
 use serde_json::json;
 use tempfile::TempDir;
-use tools::{Tracker, ScopedFs, builtin_tools};
+use tools::{ScopedFs, Tracker, builtin_tools};
 
 struct Registry {
     entries: Vec<(llm_worker::tool::ToolMeta, Arc<dyn Tool>)>,
@@ -54,10 +54,7 @@ async fn unicode_path_and_content() {
 
     let read = reg.get("Read");
     let out = read
-        .execute(
-            &json!({ "file_path": file.to_str().unwrap() })
-                .to_string(),
-        )
+        .execute(&json!({ "file_path": file.to_str().unwrap() }).to_string())
         .await
         .unwrap();
     let body = out.content.unwrap();
@@ -81,11 +78,9 @@ async fn symlink_to_outside_scope_is_rejected_for_write() {
 
     // Read tool must work against the symlink (read is unrestricted).
     let read = reg.get("Read");
-    read.execute(
-        &json!({ "file_path": link.to_str().unwrap() }).to_string(),
-    )
-    .await
-    .unwrap();
+    read.execute(&json!({ "file_path": link.to_str().unwrap() }).to_string())
+        .await
+        .unwrap();
 
     // Write through the symlink must be rejected because canonicalization
     // resolves it to outside the scope.

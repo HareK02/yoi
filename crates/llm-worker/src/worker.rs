@@ -7,23 +7,22 @@ use tracing::{debug, info, trace, warn};
 
 use crate::{
     Item,
-    llm_client::{ClientError, ConfigWarning, LlmClient, Request, RequestConfig, ToolDefinition},
-    interceptor::{
-        DefaultInterceptor, Interceptor, PostToolAction, PreRequestAction, PreToolAction,
-        PromptAction, ToolCallInfo, ToolResultInfo, TurnEndAction,
-    },
-    state::{Locked, Mutable, WorkerState},
     callback::{
         ClosureMetaHandler, ClosureTextBlockHandler, ClosureToolUseBlockHandler, TextBlockScope,
         ToolUseBlockScope,
     },
     handler::{ErrorKind, StatusKind, ToolUseBlockStart, UsageKind},
-    timeline::{TextBlockCollector, Timeline, ToolCallCollector},
+    interceptor::{
+        DefaultInterceptor, Interceptor, PostToolAction, PreRequestAction, PreToolAction,
+        PromptAction, ToolCallInfo, ToolResultInfo, TurnEndAction,
+    },
+    llm_client::{ClientError, ConfigWarning, LlmClient, Request, RequestConfig, ToolDefinition},
+    state::{Locked, Mutable, WorkerState},
     timeline::event::{ErrorEvent, StatusEvent, UsageEvent},
+    timeline::{TextBlockCollector, Timeline, ToolCallCollector},
     tool::{ToolCall, ToolDefinition as WorkerToolDefinition, ToolError, ToolResult},
     tool_server::{ToolServer, ToolServerHandle},
 };
-
 
 /// Worker errors
 #[derive(Debug, thiserror::Error)]
@@ -53,14 +52,12 @@ pub enum ToolRegistryError {
     DuplicateName(String),
 }
 
-
 /// Worker configuration
 #[derive(Debug, Clone, Default)]
 pub struct WorkerConfig {
     // Reserved for future extensions (currently empty)
     _private: (),
 }
-
 
 /// Worker execution result (status)
 #[derive(Debug)]
@@ -94,7 +91,6 @@ enum ToolExecutionResult {
     Completed(Vec<ToolResult>),
     Paused,
 }
-
 
 /// Central component for managing LLM interactions
 ///
@@ -172,7 +168,6 @@ pub struct Worker<C: LlmClient, S: WorkerState = Mutable> {
     _state: PhantomData<S>,
 }
 
-
 impl<C: LlmClient, S: WorkerState> Worker<C, S> {
     fn reset_interruption_state(&mut self) {
         self.last_run_interrupted = false;
@@ -214,10 +209,9 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
         &mut self,
         setup: impl FnMut(&mut TextBlockScope) + Send + Sync + 'static,
     ) {
-        self.timeline
-            .on_text_block(ClosureTextBlockHandler {
-                setup: Box::new(setup),
-            });
+        self.timeline.on_text_block(ClosureTextBlockHandler {
+            setup: Box::new(setup),
+        });
     }
 
     /// Register a tool use block observer with scoped callbacks.
@@ -240,17 +234,13 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
         &mut self,
         setup: impl FnMut(&ToolUseBlockStart, &mut ToolUseBlockScope) + Send + Sync + 'static,
     ) {
-        self.timeline
-            .on_tool_use_block(ClosureToolUseBlockHandler {
-                setup: Box::new(setup),
-            });
+        self.timeline.on_tool_use_block(ClosureToolUseBlockHandler {
+            setup: Box::new(setup),
+        });
     }
 
     /// Register a usage event callback.
-    pub fn on_usage(
-        &mut self,
-        callback: impl FnMut(&UsageEvent) + Send + Sync + 'static,
-    ) {
+    pub fn on_usage(&mut self, callback: impl FnMut(&UsageEvent) + Send + Sync + 'static) {
         self.timeline.on_usage(ClosureMetaHandler {
             callback,
             _kind: PhantomData::<UsageKind>,
@@ -258,10 +248,7 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
     }
 
     /// Register a status event callback.
-    pub fn on_status(
-        &mut self,
-        callback: impl FnMut(&StatusEvent) + Send + Sync + 'static,
-    ) {
+    pub fn on_status(&mut self, callback: impl FnMut(&StatusEvent) + Send + Sync + 'static) {
         self.timeline.on_status(ClosureMetaHandler {
             callback,
             _kind: PhantomData::<StatusKind>,
@@ -269,10 +256,7 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
     }
 
     /// Register an error event callback.
-    pub fn on_error(
-        &mut self,
-        callback: impl FnMut(&ErrorEvent) + Send + Sync + 'static,
-    ) {
+    pub fn on_error(&mut self, callback: impl FnMut(&ErrorEvent) + Send + Sync + 'static) {
         self.timeline.on_error(ClosureMetaHandler {
             callback,
             _kind: PhantomData::<ErrorKind>,
@@ -280,18 +264,12 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
     }
 
     /// Register a turn-start callback (receives 0-based turn number).
-    pub fn on_turn_start(
-        &mut self,
-        callback: impl Fn(usize) + Send + Sync + 'static,
-    ) {
+    pub fn on_turn_start(&mut self, callback: impl Fn(usize) + Send + Sync + 'static) {
         self.turn_start_cbs.push(Box::new(callback));
     }
 
     /// Register a turn-end callback (receives 0-based turn number).
-    pub fn on_turn_end(
-        &mut self,
-        callback: impl Fn(usize) + Send + Sync + 'static,
-    ) {
+    pub fn on_turn_end(&mut self, callback: impl Fn(usize) + Send + Sync + 'static) {
         self.turn_end_cbs.push(Box::new(callback));
     }
 
@@ -735,9 +713,7 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
             // prunable candidates whose estimated savings meet the
             // threshold. Worker does not own usage history itself; the
             // estimator is injected by the layer that does.
-            if let (Some(config), Some(estimator)) =
-                (&self.prune_config, &self.savings_estimator)
-            {
+            if let (Some(config), Some(estimator)) = (&self.prune_config, &self.savings_estimator) {
                 let candidates =
                     crate::prune::prunable_indices(&request_context, config.protected_turns);
                 if !candidates.is_empty() {
@@ -745,8 +721,7 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
                     let last = *candidates.last().unwrap() + 1;
                     let savings = estimator(&request_context, first..last);
                     if savings >= config.min_savings {
-                        let pruned =
-                            crate::prune::project(&mut request_context, &candidates);
+                        let pruned = crate::prune::project(&mut request_context, &candidates);
                         if pruned > 0 {
                             debug!(
                                 pruned,
@@ -817,7 +792,11 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
 
             if let Some(max) = self.max_turns {
                 if self.turn_count >= max as usize {
-                    info!(turn_count = self.turn_count, max_turns = max, "Turn limit reached");
+                    info!(
+                        turn_count = self.turn_count,
+                        max_turns = max,
+                        "Turn limit reached"
+                    );
                     self.last_run_interrupted = false;
                     return Ok(WorkerResult::LimitReached);
                 }
@@ -911,10 +890,8 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
                             content,
                         ));
                     } else {
-                        self.history.push(Item::tool_result(
-                            &result.tool_use_id,
-                            &result.summary,
-                        ));
+                        self.history
+                            .push(Item::tool_result(&result.tool_use_id, &result.summary));
                     }
                 }
                 Ok(None)
@@ -925,9 +902,7 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
             }
         }
     }
-
 }
-
 
 impl<C: LlmClient> Worker<C, Mutable> {
     /// Create a new Worker (in Mutable state)
@@ -975,10 +950,7 @@ impl<C: LlmClient> Worker<C, Mutable> {
     }
 
     /// Register multiple tool factories for deferred initialization.
-    pub fn register_tools(
-        &mut self,
-        factories: impl IntoIterator<Item = WorkerToolDefinition>,
-    ) {
+    pub fn register_tools(&mut self, factories: impl IntoIterator<Item = WorkerToolDefinition>) {
         self.tool_server.register_tools(factories);
     }
 
@@ -1086,45 +1058,38 @@ impl<C: LlmClient> Worker<C, Mutable> {
     ///
     /// Available only in Mutable state.
     pub fn history_mut(&mut self) -> &mut Vec<Item> {
-
         &mut self.history
     }
 
     /// Set history
     pub fn set_history(&mut self, items: Vec<Item>) {
-
         self.history = items;
     }
 
     /// Add an item to history (builder pattern)
     pub fn with_item(mut self, item: Item) -> Self {
-
         self.history.push(item);
         self
     }
 
     /// Add an item to history
     pub fn push_item(&mut self, item: Item) {
-
         self.history.push(item);
     }
 
     /// Add multiple items to history (builder pattern)
     pub fn with_items(mut self, items: impl IntoIterator<Item = Item>) -> Self {
-
         self.history.extend(items);
         self
     }
 
     /// Add multiple items to history
     pub fn extend_history(&mut self, items: impl IntoIterator<Item = Item>) {
-
         self.history.extend(items);
     }
 
     /// Clear history
     pub fn clear_history(&mut self) {
-
         self.history.clear();
     }
 
@@ -1156,13 +1121,13 @@ impl<C: LlmClient> Worker<C, Mutable> {
     ///
     /// Subsequent runs can use [`Worker<C, Locked>::run()`] directly.
     /// To edit state between turns, call [`unlock()`](Worker::unlock) first.
-    pub async fn run(
-        self,
-        user_input: impl Into<String>,
-    ) -> Result<RunOutput<C>, WorkerError> {
+    pub async fn run(self, user_input: impl Into<String>) -> Result<RunOutput<C>, WorkerError> {
         let mut locked = self.lock();
         let result = locked.run(user_input).await?;
-        Ok(RunOutput { worker: locked, result })
+        Ok(RunOutput {
+            worker: locked,
+            result,
+        })
     }
 
     /// Resume from Paused, consuming self and transitioning to Locked.
@@ -1171,7 +1136,10 @@ impl<C: LlmClient> Worker<C, Mutable> {
     pub async fn resume(self) -> Result<RunOutput<C>, WorkerError> {
         let mut locked = self.lock();
         let result = locked.resume().await?;
-        Ok(RunOutput { worker: locked, result })
+        Ok(RunOutput {
+            worker: locked,
+            result,
+        })
     }
 
     /// Lock and transition to Locked state
@@ -1215,7 +1183,6 @@ impl<C: LlmClient> Worker<C, Mutable> {
         }
     }
 }
-
 
 impl<C: LlmClient> Worker<C, Locked> {
     /// Execute a turn

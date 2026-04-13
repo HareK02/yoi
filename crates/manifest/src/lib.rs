@@ -113,9 +113,15 @@ pub struct CompactionConfig {
     pub provider: Option<ProviderConfig>,
 }
 
-fn default_prune_protected_turns() -> usize { 3 }
-fn default_prune_min_savings() -> u64 { 4096 }
-fn default_compact_retained_turns() -> usize { 2 }
+fn default_prune_protected_turns() -> usize {
+    3
+}
+fn default_prune_min_savings() -> u64 {
+    4096
+}
+fn default_compact_retained_turns() -> usize {
+    2
+}
 
 impl Default for CompactionConfig {
     fn default() -> Self {

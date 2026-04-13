@@ -91,8 +91,7 @@ impl Tool for EditTool {
         let occurrences = if params.replace_all { count } else { 1 };
 
         self.fs.write(&params.file_path, new_text.as_bytes())?;
-        self.tracker
-            .record(&params.file_path, new_text.as_bytes());
+        self.tracker.record(&params.file_path, new_text.as_bytes());
 
         let summary = format!(
             "Edited {} ({} replacement{})",

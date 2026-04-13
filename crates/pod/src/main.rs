@@ -2,8 +2,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
-use session_store::FsStore;
 use pod::{Pod, PodController};
+use session_store::FsStore;
 
 #[derive(Parser)]
 #[command(name = "pod", about = "Run a Pod process from a manifest file")]
@@ -18,9 +18,8 @@ struct Cli {
 }
 
 fn default_store_dir() -> Result<PathBuf, std::io::Error> {
-    let home = std::env::var("HOME").map_err(|_| {
-        std::io::Error::new(std::io::ErrorKind::NotFound, "HOME is not set")
-    })?;
+    let home = std::env::var("HOME")
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::NotFound, "HOME is not set"))?;
     Ok(PathBuf::from(home).join(".insomnia").join("sessions"))
 }
 
@@ -111,7 +110,10 @@ async fn main() -> ExitCode {
         }
     };
 
-    eprintln!("pod: {pod_name} listening on {:?}", handle.runtime_dir.socket_path());
+    eprintln!(
+        "pod: {pod_name} listening on {:?}",
+        handle.runtime_dir.socket_path()
+    );
 
     // Wait for shutdown signal
     match tokio::signal::ctrl_c().await {

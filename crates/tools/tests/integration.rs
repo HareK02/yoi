@@ -11,7 +11,7 @@ use llm_worker::tool::{Tool, ToolDefinition, ToolMeta};
 use manifest::Scope;
 use serde_json::json;
 use tempfile::TempDir;
-use tools::{Tracker, ScopedFs, builtin_tools};
+use tools::{ScopedFs, Tracker, builtin_tools};
 
 struct Registry {
     entries: Vec<(ToolMeta, Arc<dyn Tool>)>,
@@ -50,10 +50,7 @@ async fn call(tool: &Arc<dyn Tool>, input: serde_json::Value) -> llm_worker::too
         .expect("tool execution failed")
 }
 
-async fn call_err(
-    tool: &Arc<dyn Tool>,
-    input: serde_json::Value,
-) -> llm_worker::tool::ToolError {
+async fn call_err(tool: &Arc<dyn Tool>, input: serde_json::Value) -> llm_worker::tool::ToolError {
     tool.execute(&input.to_string())
         .await
         .expect_err("expected error")
@@ -71,7 +68,11 @@ fn builtin_tools_registers_all_five() {
 fn meta_has_description_and_schema() {
     let (_dir, reg) = setup();
     for (meta, _) in &reg.entries {
-        assert!(!meta.description.is_empty(), "{} missing description", meta.name);
+        assert!(
+            !meta.description.is_empty(),
+            "{} missing description",
+            meta.name
+        );
         // Input schema must be a JSON object
         assert!(
             meta.input_schema.is_object(),
@@ -283,7 +284,11 @@ async fn tracker_recent_files_tracks_read_write_edit() {
     std::fs::write(&a, "one\n").unwrap();
 
     // Read `a` — should appear in recency.
-    call(&reg.get("Read"), json!({ "file_path": a.to_str().unwrap() })).await;
+    call(
+        &reg.get("Read"),
+        json!({ "file_path": a.to_str().unwrap() }),
+    )
+    .await;
     // Write `b` (new file) — should appear ahead of `a`.
     call(
         &reg.get("Write"),
@@ -303,8 +308,14 @@ async fn tracker_recent_files_tracks_read_write_edit() {
 
     let recent = tracker.recent_files(10);
     assert_eq!(recent.len(), 2);
-    assert!(recent[0].ends_with("a.txt"), "front should be a.txt: {recent:?}");
-    assert!(recent[1].ends_with("b.txt"), "second should be b.txt: {recent:?}");
+    assert!(
+        recent[0].ends_with("a.txt"),
+        "front should be a.txt: {recent:?}"
+    );
+    assert!(
+        recent[1].ends_with("b.txt"),
+        "second should be b.txt: {recent:?}"
+    );
 }
 
 // Sanity: unused Path import guard

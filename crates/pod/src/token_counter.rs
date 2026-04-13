@@ -140,9 +140,7 @@ fn tokens_at(
             let up_bytes = prefix[up.history_len.min(cap)];
             let at_bytes = prefix[index];
             let span_bytes = up_bytes.saturating_sub(lo_bytes);
-            let span_tokens = up
-                .input_total_tokens
-                .saturating_sub(lo.input_total_tokens);
+            let span_tokens = up.input_total_tokens.saturating_sub(lo.input_total_tokens);
             if span_bytes == 0 || span_tokens == 0 {
                 return TokenEstimate {
                     tokens: lo.input_total_tokens,
@@ -198,11 +196,7 @@ fn total_tokens_impl(history: &[Item], records: &[UsageRecord]) -> TokenEstimate
     tokens_at(history, records, history.len(), &prefix)
 }
 
-fn split_for_retained_impl(
-    history: &[Item],
-    records: &[UsageRecord],
-    retained: u64,
-) -> SplitPoint {
+fn split_for_retained_impl(history: &[Item], records: &[UsageRecord], retained: u64) -> SplitPoint {
     let prefix = prefix_bytes(history);
     let current = tokens_at(history, records, history.len(), &prefix);
     if current.tokens <= retained {
@@ -351,12 +345,7 @@ mod tests {
 
     #[test]
     fn split_interpolated_between_measurements() {
-        let history = vec![
-            msg("aaaaaa"),
-            msg("bbbbbb"),
-            msg("cccccc"),
-            msg("dddddd"),
-        ];
+        let history = vec![msg("aaaaaa"), msg("bbbbbb"), msg("cccccc"), msg("dddddd")];
         let records = vec![record(1, 50), record(4, 400)];
         let cut = split_for_retained_impl(&history, &records, 250);
         assert!(cut.index > 1 && cut.index <= 4);

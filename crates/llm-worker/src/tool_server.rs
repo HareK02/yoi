@@ -65,10 +65,7 @@ impl ToolServerHandle {
     }
 
     /// Queue many tool factories for deferred initialization.
-    pub(crate) fn register_tools(
-        &self,
-        factories: impl IntoIterator<Item = WorkerToolDefinition>,
-    ) {
+    pub(crate) fn register_tools(&self, factories: impl IntoIterator<Item = WorkerToolDefinition>) {
         let mut guard = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         guard.extend(factories);
     }
@@ -110,7 +107,11 @@ impl ToolServerHandle {
     }
 
     /// Execute a tool by name.
-    pub async fn call_tool(&self, name: &str, input_json: &str) -> Result<ToolOutput, ToolServerError> {
+    pub async fn call_tool(
+        &self,
+        name: &str,
+        input_json: &str,
+    ) -> Result<ToolOutput, ToolServerError> {
         let tool = {
             let guard = self.tools.lock().unwrap_or_else(|e| e.into_inner());
             let (_, tool) = guard

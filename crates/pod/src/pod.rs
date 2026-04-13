@@ -2,8 +2,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use llm_worker::Item;
-use llm_worker::llm_client::client::LlmClient;
 use llm_worker::llm_client::RequestConfig;
+use llm_worker::llm_client::client::LlmClient;
 use llm_worker::state::Mutable;
 use llm_worker::{Worker, WorkerError, WorkerResult};
 use session_store::{
@@ -21,8 +21,8 @@ use crate::hook::{
 };
 use crate::hook_interceptor::HookInterceptor;
 use crate::usage_tracker::UsageTracker;
-use llm_worker::interceptor::PreRequestAction;
 use async_trait::async_trait;
+use llm_worker::interceptor::PreRequestAction;
 
 /// Pre-LLM-request hook that records `history.len()` at send time into a
 /// shared `UsageTracker`. The on_usage callback later pairs this with the
@@ -205,7 +205,10 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     /// Returns a clone since the underlying vector is shared with hooks
     /// running on the Worker.
     pub fn usage_history(&self) -> Vec<UsageRecord> {
-        self.usage_history.lock().expect("usage_history poisoned").clone()
+        self.usage_history
+            .lock()
+            .expect("usage_history poisoned")
+            .clone()
     }
 
     /// Shared handle to the cumulative Usage history.
@@ -292,10 +295,9 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             // Pre-LLM-request hook: capture history.len() into the
             // UsageTracker so the upcoming on_usage callback can pair
             // it with the measured input_tokens.
-            self.hook_builder
-                .add_pre_llm_request(UsageTrackingHook {
-                    tracker: self.usage_tracker.clone(),
-                });
+            self.hook_builder.add_pre_llm_request(UsageTrackingHook {
+                tracker: self.usage_tracker.clone(),
+            });
 
             let builder = std::mem::take(&mut self.hook_builder);
             let registry = Arc::new(builder.build());
@@ -430,8 +432,9 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     /// async layout cycle (`run → handle_worker_result → do_compact_and_resume → resume`).
     fn do_compact_and_resume(
         &mut self,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<PodRunResult, PodError>> + Send + '_>>
-    {
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<PodRunResult, PodError>> + Send + '_>,
+    > {
         Box::pin(async move {
             // Thrash detection: if we just compacted and hit the threshold again,
             // something is wrong.
@@ -475,9 +478,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     /// Best-effort: failures are logged but do not propagate.
     pub async fn try_post_run_compact(&mut self) -> Result<(), PodError> {
         let state = match self.compact_state.as_ref() {
-            Some(s) if !s.is_disabled() && s.exceeds_post_run() && !s.just_compacted() => {
-                s.clone()
-            }
+            Some(s) if !s.is_disabled() && s.exceeds_post_run() && !s.just_compacted() => s.clone(),
             _ => return Ok(()),
         };
 
@@ -509,13 +510,8 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         // head_hash mutable).
         let w = self.worker.as_ref().unwrap();
         let new_items = &w.history()[history_before..];
-        session_store::save_delta(
-            &self.store,
-            self.session_id,
-            &mut self.head_hash,
-            new_items,
-        )
-        .await?;
+        session_store::save_delta(&self.store, self.session_id, &mut self.head_hash, new_items)
+            .await?;
 
         let turn_count = self.worker.as_ref().unwrap().turn_count();
         session_store::save_turn_end(
@@ -544,7 +540,10 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 record.output_tokens,
             )
             .await?;
-            self.usage_history.lock().expect("usage_history poisoned").push(record);
+            self.usage_history
+                .lock()
+                .expect("usage_history poisoned")
+                .push(record);
         }
 
         let interrupted = self.worker.as_ref().unwrap().last_run_interrupted();
@@ -578,10 +577,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     /// - a clone of the main LlmClient via `clone_boxed()`.
     ///
     /// Returns the new session ID.
-    pub async fn compact(
-        &mut self,
-        retained_turns: usize,
-    ) -> Result<SessionId, PodError> {
+    pub async fn compact(&mut self, retained_turns: usize) -> Result<SessionId, PodError> {
         let worker = self.worker.as_ref().expect("worker taken during run");
         let history = worker.history();
 
@@ -612,13 +608,20 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             .temperature(0.0);
         summary_worker.set_max_tokens(2048);
 
-        let out = summary_worker.run(summary_prompt).await
+        let out = summary_worker
+            .run(summary_prompt)
+            .await
             .map_err(PodError::Worker)?;
-        let summary_text = out.worker
+        let summary_text = out
+            .worker
             .history()
             .iter()
             .filter_map(|item| {
-                if item.is_assistant_message() { item.as_text().map(String::from) } else { None }
+                if item.is_assistant_message() {
+                    item.as_text().map(String::from)
+                } else {
+                    None
+                }
             })
             .collect::<Vec<_>>()
             .join("\n");
@@ -632,7 +635,9 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
 
         // Persist as a new compacted session.
         let old_session_id = self.session_id;
-        let old_head_hash = self.head_hash.clone()
+        let old_head_hash = self
+            .head_hash
+            .clone()
             .expect("head_hash should be set after at least one entry");
 
         let w = self.worker.as_ref().unwrap();
@@ -655,7 +660,10 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         self.session_id = new_session_id;
         self.head_hash = Some(new_head_hash);
         self.worker.as_mut().unwrap().set_history(new_history);
-        self.usage_history.lock().expect("usage_history poisoned").clear();
+        self.usage_history
+            .lock()
+            .expect("usage_history poisoned")
+            .clear();
 
         Ok(new_session_id)
     }
@@ -715,7 +723,6 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
         pod.apply_prune_from_manifest();
         Ok(pod)
     }
-
 }
 
 /// Apply worker-level manifest settings to a Worker.
@@ -769,18 +776,24 @@ fn build_summary_prompt(items: &[Item]) -> String {
                     llm_worker::Role::Assistant => "Assistant",
                     llm_worker::Role::System => "System",
                 };
-                let text: String = content.iter().map(|p| p.as_text()).collect::<Vec<_>>().join("");
+                let text: String = content
+                    .iter()
+                    .map(|p| p.as_text())
+                    .collect::<Vec<_>>()
+                    .join("");
                 lines.push(format!("[{role_label}] {text}"));
             }
-            Item::ToolCall { name, arguments, .. } => {
+            Item::ToolCall {
+                name, arguments, ..
+            } => {
                 lines.push(format!("[ToolCall] {name}({arguments})"));
             }
-            Item::ToolResult { summary, content, .. } => {
-                match content {
-                    Some(c) => lines.push(format!("[ToolResult] {summary}\n{c}")),
-                    None => lines.push(format!("[ToolResult] {summary}")),
-                }
-            }
+            Item::ToolResult {
+                summary, content, ..
+            } => match content {
+                Some(c) => lines.push(format!("[ToolResult] {summary}\n{c}")),
+                None => lines.push(format!("[ToolResult] {summary}")),
+            },
             Item::Reasoning { text, .. } => {
                 lines.push(format!("[Reasoning] {text}"));
             }

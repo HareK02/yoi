@@ -56,13 +56,7 @@ impl From<String> for ToolOutput {
             }
         } else {
             let lines = s.lines().count();
-            let first_line: String = s
-                .lines()
-                .next()
-                .unwrap_or("")
-                .chars()
-                .take(80)
-                .collect();
+            let first_line: String = s.lines().next().unwrap_or("").chars().take(80).collect();
             let summary = format!("{lines} lines | {first_line}…");
             ToolOutput {
                 summary,

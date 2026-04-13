@@ -39,10 +39,7 @@ pub use write::write_tool;
 /// All returned factories share the same tracker instance so that
 /// `Read` / `Write` / `Edit` see a consistent history across tool
 /// invocations within a single session.
-pub fn builtin_tools(
-    fs: ScopedFs,
-    tracker: Tracker,
-) -> Vec<llm_worker::tool::ToolDefinition> {
+pub fn builtin_tools(fs: ScopedFs, tracker: Tracker) -> Vec<llm_worker::tool::ToolDefinition> {
     vec![
         read_tool(fs.clone(), tracker.clone()),
         write_tool(fs.clone(), tracker.clone()),

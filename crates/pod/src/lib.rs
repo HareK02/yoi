@@ -15,8 +15,8 @@ mod usage_tracker;
 pub use token_counter::{EstimateSource, SplitPoint, TokenEstimate};
 
 pub use controller::{PodController, PodHandle};
-pub use manifest::{PodManifest, ProviderConfig, ProviderKind, Scope};
 pub use hook::{Hook, HookEventKind, HookRegistryBuilder};
+pub use manifest::{PodManifest, ProviderConfig, ProviderKind, Scope};
 pub use pod::{Pod, PodError, PodRunResult, apply_worker_manifest};
 pub use protocol::{ErrorCode, Event, Method, TurnResult};
 pub use provider::{ProviderError, build_client};

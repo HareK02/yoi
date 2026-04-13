@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::tool::{Tool, ToolCall, ToolMeta, ToolResult};
 use crate::Item;
+use crate::tool::{Tool, ToolCall, ToolMeta, ToolResult};
 
 // =============================================================================
 // Action Enums

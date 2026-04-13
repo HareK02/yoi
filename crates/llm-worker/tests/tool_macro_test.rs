@@ -77,8 +77,14 @@ async fn test_basic_tool_generation() {
     let result = tool.execute(r#"{"message": "World"}"#).await;
     assert!(result.is_ok(), "Should execute successfully");
     let output = result.unwrap();
-    assert!(output.summary.contains("Hello"), "Output should contain prefix");
-    assert!(output.summary.contains("World"), "Output should contain message");
+    assert!(
+        output.summary.contains("Hello"),
+        "Output should contain prefix"
+    );
+    assert!(
+        output.summary.contains("World"),
+        "Output should contain message"
+    );
 }
 
 #[tokio::test]
@@ -94,7 +100,11 @@ async fn test_multiple_arguments() {
     let result = tool.execute(r#"{"a": 10, "b": 20}"#).await;
     assert!(result.is_ok());
     let output = result.unwrap();
-    assert!(output.summary.contains("30"), "Should contain sum: {:?}", output);
+    assert!(
+        output.summary.contains("30"),
+        "Should contain sum: {:?}",
+        output
+    );
 }
 
 #[tokio::test]
@@ -168,7 +178,11 @@ async fn test_result_return_type_success() {
     let result = tool.execute(r#"{"value": 42}"#).await;
     assert!(result.is_ok(), "Should succeed for positive value");
     let output = result.unwrap();
-    assert!(output.summary.contains("Valid"), "Should contain Valid: {:?}", output);
+    assert!(
+        output.summary.contains("Valid"),
+        "Should contain Valid: {:?}",
+        output
+    );
 }
 
 #[tokio::test]

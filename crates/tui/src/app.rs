@@ -102,8 +102,10 @@ impl App {
             }
             Event::ToolCallStart { name, .. } => {
                 self.current_tool = Some(name.clone());
-                self.output_queue
-                    .push(OutputItem::Padded(MessageKind::Tool, format!("[tool] {name}")));
+                self.output_queue.push(OutputItem::Padded(
+                    MessageKind::Tool,
+                    format!("[tool] {name}"),
+                ));
             }
             Event::ToolCallDone {
                 name, arguments, ..
@@ -117,7 +119,11 @@ impl App {
             Event::ToolResult {
                 output, is_error, ..
             } => {
-                let prefix = if is_error { "[tool error]" } else { "[tool result]" };
+                let prefix = if is_error {
+                    "[tool error]"
+                } else {
+                    "[tool result]"
+                };
                 let display = if output.len() > 200 {
                     format!("{}...", &output[..200])
                 } else {
@@ -242,10 +248,8 @@ impl App {
                         "user" => {
                             self.turn_index += 1;
                             self.output_queue.push(OutputItem::Blank);
-                            self.output_queue.push(OutputItem::TurnHeader(format!(
-                                "#{}",
-                                self.turn_index
-                            )));
+                            self.output_queue
+                                .push(OutputItem::TurnHeader(format!("#{}", self.turn_index)));
                             MessageKind::User
                         }
                         "assistant" => MessageKind::Assistant,
@@ -265,8 +269,10 @@ impl App {
                 }
                 "tool_call" => {
                     let name = item["name"].as_str().unwrap_or("?");
-                    self.output_queue
-                        .push(OutputItem::Padded(MessageKind::Tool, format!("[tool] {name}")));
+                    self.output_queue.push(OutputItem::Padded(
+                        MessageKind::Tool,
+                        format!("[tool] {name}"),
+                    ));
                 }
                 "tool_result" => {
                     let output = item["output"].as_str().unwrap_or("");

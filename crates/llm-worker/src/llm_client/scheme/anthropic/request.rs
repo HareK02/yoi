@@ -182,7 +182,10 @@ impl AnthropicScheme {
                 }
 
                 Item::ToolResult {
-                    call_id, summary, content, ..
+                    call_id,
+                    summary,
+                    content,
+                    ..
                 } => {
                     // Flush pending assistant parts first
                     if !pending_assistant_parts.is_empty() {

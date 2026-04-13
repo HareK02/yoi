@@ -3,9 +3,9 @@
 //! [`Store`] defines the async interface for reading and writing session logs.
 //! Implementations handle the physical storage (filesystem, database, etc.).
 
+use crate::SessionId;
 use crate::event_trace::TraceEntry;
 use crate::session_log::{EntryHash, HashedEntry};
-use crate::SessionId;
 use std::future::Future;
 
 /// Errors from the persistence store.
@@ -43,9 +43,7 @@ pub trait Store: Send + Sync {
     ) -> impl Future<Output = Result<Vec<HashedEntry>, StoreError>> + Send;
 
     /// List all session IDs, most recent first.
-    fn list_sessions(
-        &self,
-    ) -> impl Future<Output = Result<Vec<SessionId>, StoreError>> + Send;
+    fn list_sessions(&self) -> impl Future<Output = Result<Vec<SessionId>, StoreError>> + Send;
 
     /// Create a new session with initial entries.
     fn create_session(
@@ -55,10 +53,7 @@ pub trait Store: Send + Sync {
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
 
     /// Check if a session exists.
-    fn exists(
-        &self,
-        id: SessionId,
-    ) -> impl Future<Output = Result<bool, StoreError>> + Send;
+    fn exists(&self, id: SessionId) -> impl Future<Output = Result<bool, StoreError>> + Send;
 
     /// Read the hash of the last entry in a session (the head).
     ///

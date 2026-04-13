@@ -19,7 +19,10 @@ fn resolve_socket(pod_name: &str, override_path: Option<PathBuf>) -> PathBuf {
         return p;
     }
     if let Ok(rd) = std::env::var("XDG_RUNTIME_DIR") {
-        PathBuf::from(rd).join("insomnia").join(pod_name).join("sock")
+        PathBuf::from(rd)
+            .join("insomnia")
+            .join(pod_name)
+            .join("sock")
     } else if let Ok(home) = std::env::var("HOME") {
         PathBuf::from(home)
             .join(".insomnia")
@@ -163,12 +166,8 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Option<Method> {
             app.quit = true;
             None
         }
-        KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            Some(Method::Resume)
-        }
-        KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            Some(Method::Cancel)
-        }
+        KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => Some(Method::Resume),
+        KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => Some(Method::Cancel),
         KeyCode::Enter => app.submit_input(),
         KeyCode::Backspace => {
             app.delete_char_before();

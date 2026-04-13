@@ -257,7 +257,10 @@ impl GeminiScheme {
                 }
 
                 Item::ToolResult {
-                    call_id, summary, content, ..
+                    call_id,
+                    summary,
+                    content,
+                    ..
                 } => {
                     // Flush pending model parts first
                     if !pending_model_parts.is_empty() {

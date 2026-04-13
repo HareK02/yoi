@@ -48,7 +48,9 @@ impl Tool for WriteTool {
             self.tracker.verify(&params.file_path, &current)?;
         }
 
-        let outcome = self.fs.write(&params.file_path, params.content.as_bytes())?;
+        let outcome = self
+            .fs
+            .write(&params.file_path, params.content.as_bytes())?;
 
         // Refresh the history entry to reflect the newly-written content,
         // so a subsequent Edit / Write can proceed without a re-read.
@@ -57,7 +59,11 @@ impl Tool for WriteTool {
 
         let summary = format!(
             "{} {} ({} bytes)",
-            if outcome.created { "Created" } else { "Overwrote" },
+            if outcome.created {
+                "Created"
+            } else {
+                "Overwrote"
+            },
             params.file_path.display(),
             outcome.bytes_written
         );

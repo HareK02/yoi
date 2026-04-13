@@ -6,9 +6,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use grep_regex::RegexMatcherBuilder;
 use grep_searcher::sinks::UTF8 as UTF8Sink;
-use grep_searcher::{
-    BinaryDetection, Searcher, SearcherBuilder, Sink, SinkContext, SinkMatch,
-};
+use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkContext, SinkMatch};
 use ignore::WalkBuilder;
 use ignore::overrides::OverrideBuilder;
 use ignore::types::TypesBuilder;
@@ -94,10 +92,9 @@ impl Tool for GrepTool {
         );
 
         let default_base = self.fs.scope().root().to_path_buf();
-        let report =
-            tokio::task::spawn_blocking(move || run_grep(default_base, params))
-                .await
-                .map_err(|e| ToolError::Internal(format!("spawn_blocking failed: {e}")))??;
+        let report = tokio::task::spawn_blocking(move || run_grep(default_base, params))
+            .await
+            .map_err(|e| ToolError::Internal(format!("spawn_blocking failed: {e}")))??;
 
         Ok(report.render())
     }
@@ -212,12 +209,7 @@ impl GrepReport {
                             continue;
                         }
                     }
-                    body.push_str(&format!(
-                        "{}{}{}\n",
-                        line.path.display(),
-                        sep,
-                        line.text
-                    ));
+                    body.push_str(&format!("{}{}{}\n", line.path.display(), sep, line.text));
                 }
                 let mut summary = format!(
                     "{} matching line(s) in {} file(s)",
@@ -285,7 +277,8 @@ fn run_grep(default_base: PathBuf, p: GrepParams) -> Result<GrepReport, ToolsErr
     }
     if let Some(g) = p.glob.as_deref() {
         let mut ob = OverrideBuilder::new(&base);
-        ob.add(g).map_err(|e| ToolsError::InvalidGlob(e.to_string()))?;
+        ob.add(g)
+            .map_err(|e| ToolsError::InvalidGlob(e.to_string()))?;
         let ov = ob
             .build()
             .map_err(|e| ToolsError::InvalidGlob(e.to_string()))?;
@@ -414,11 +407,7 @@ struct ContentSink<'a> {
 impl Sink for ContentSink<'_> {
     type Error = std::io::Error;
 
-    fn matched(
-        &mut self,
-        _searcher: &Searcher,
-        mat: &SinkMatch<'_>,
-    ) -> Result<bool, Self::Error> {
+    fn matched(&mut self, _searcher: &Searcher, mat: &SinkMatch<'_>) -> Result<bool, Self::Error> {
         let idx = *self.matches_seen;
         *self.matches_seen += 1;
 
@@ -589,10 +578,7 @@ mod tests {
     #[tokio::test]
     async fn grep_multiline() {
         let (dir, fs) = setup();
-        touch(
-            &dir.path().join("a.txt"),
-            "start\nfoo\nbar\nend\n",
-        );
+        touch(&dir.path().join("a.txt"), "start\nfoo\nbar\nend\n");
 
         let def = grep_tool(fs);
         let (_, tool) = def();

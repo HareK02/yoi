@@ -103,10 +103,7 @@ impl ScopedFs {
         let existed = path.exists();
 
         let parent = path.parent().ok_or_else(|| {
-            ToolsError::InvalidArgument(format!(
-                "path has no parent directory: {}",
-                path.display()
-            ))
+            ToolsError::InvalidArgument(format!("path has no parent directory: {}", path.display()))
         })?;
         if !parent.as_os_str().is_empty() && !parent.exists() {
             std::fs::create_dir_all(parent).map_err(|e| ToolsError::io(parent, e))?;
@@ -119,7 +116,8 @@ impl ScopedFs {
         };
         let mut tmp = tempfile::NamedTempFile::new_in(tmp_parent)
             .map_err(|e| ToolsError::io(tmp_parent, e))?;
-        tmp.write_all(content).map_err(|e| ToolsError::io(path, e))?;
+        tmp.write_all(content)
+            .map_err(|e| ToolsError::io(path, e))?;
         tmp.as_file()
             .sync_all()
             .map_err(|e| ToolsError::io(path, e))?;

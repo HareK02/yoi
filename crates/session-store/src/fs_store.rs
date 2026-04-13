@@ -4,10 +4,10 @@
 //! - Session log: `{root}/{session_id}.jsonl`
 //! - Event trace: `{root}/{session_id}.trace.jsonl`
 
+use crate::SessionId;
 use crate::event_trace::TraceEntry;
 use crate::session_log::{EntryHash, HashedEntry};
 use crate::store::{Store, StoreError};
-use crate::SessionId;
 use std::path::{Path, PathBuf};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
@@ -50,19 +50,16 @@ impl FsStore {
         Ok(())
     }
 
-    fn parse_jsonl<T: serde::de::DeserializeOwned>(
-        content: &str,
-    ) -> Result<Vec<T>, StoreError> {
+    fn parse_jsonl<T: serde::de::DeserializeOwned>(content: &str) -> Result<Vec<T>, StoreError> {
         let mut entries = Vec::new();
         for (i, line) in content.lines().enumerate() {
             if line.trim().is_empty() {
                 continue;
             }
-            let entry: T =
-                serde_json::from_str(line).map_err(|e| StoreError::Corrupt {
-                    line: i + 1,
-                    message: e.to_string(),
-                })?;
+            let entry: T = serde_json::from_str(line).map_err(|e| StoreError::Corrupt {
+                line: i + 1,
+                message: e.to_string(),
+            })?;
             entries.push(entry);
         }
         Ok(entries)
@@ -122,10 +119,7 @@ impl Store for FsStore {
         Ok(self.log_path(id).exists())
     }
 
-    async fn read_head_hash(
-        &self,
-        id: SessionId,
-    ) -> Result<Option<EntryHash>, StoreError> {
+    async fn read_head_hash(&self, id: SessionId) -> Result<Option<EntryHash>, StoreError> {
         let path = self.log_path(id);
         if !path.exists() {
             return Err(StoreError::NotFound(id));
@@ -134,23 +128,18 @@ impl Store for FsStore {
         let last_line = content.lines().rev().find(|l| !l.trim().is_empty());
         match last_line {
             Some(line) => {
-                let entry: HashedEntry = serde_json::from_str(line).map_err(|e| {
-                    StoreError::Corrupt {
+                let entry: HashedEntry =
+                    serde_json::from_str(line).map_err(|e| StoreError::Corrupt {
                         line: content.lines().count(),
                         message: e.to_string(),
-                    }
-                })?;
+                    })?;
                 Ok(Some(entry.hash))
             }
             None => Ok(None),
         }
     }
 
-    async fn append_trace(
-        &self,
-        id: SessionId,
-        entry: &TraceEntry,
-    ) -> Result<(), StoreError> {
+    async fn append_trace(&self, id: SessionId, entry: &TraceEntry) -> Result<(), StoreError> {
         let line = serde_json::to_string(entry)?;
         self.append_line(&self.trace_path(id), &line).await
     }

@@ -42,10 +42,7 @@ impl SocketServer {
             }
         });
 
-        Ok(Self {
-            _accept_task,
-            path,
-        })
+        Ok(Self { _accept_task, path })
     }
 
     /// The socket file path.

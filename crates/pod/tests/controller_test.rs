@@ -1,17 +1,15 @@
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use futures::Stream;
+use llm_worker::Worker;
 use llm_worker::llm_client::event::{Event as LlmEvent, ResponseStatus, StatusEvent};
 use llm_worker::llm_client::{ClientError, LlmClient, Request};
-use llm_worker::Worker;
 use session_store::FsStore;
 
-use pod::{
-    Event, Method, Pod, PodController, PodManifest, PodStatus,
-};
+use pod::{Event, Method, Pod, PodController, PodManifest, PodStatus};
 
 // ---------------------------------------------------------------------------
 // Mock LLM Client

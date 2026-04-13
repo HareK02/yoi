@@ -212,7 +212,10 @@ impl OpenAIScheme {
                 }
 
                 Item::ToolResult {
-                    call_id, summary, content, ..
+                    call_id,
+                    summary,
+                    content,
+                    ..
                 } => {
                     // Flush pending tool calls before tool result
                     self.flush_pending_assistant(

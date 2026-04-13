@@ -43,8 +43,8 @@ mod worker;
 
 pub(crate) mod callback;
 pub mod event;
-pub mod llm_client;
 pub mod interceptor;
+pub mod llm_client;
 pub mod prune;
 pub mod state;
 pub mod timeline;
@@ -53,7 +53,7 @@ pub mod tool_server;
 
 pub use callback::{TextBlockScope, ToolUseBlockScope};
 pub use handler::ToolUseBlockStart;
-pub use message::{ContentPart, Item, Message, Role};
 pub use interceptor::Interceptor;
+pub use message::{ContentPart, Item, Message, Role};
 pub use tool::{ToolCall, ToolResult};
 pub use worker::{RunOutput, ToolRegistryError, Worker, WorkerConfig, WorkerError, WorkerResult};

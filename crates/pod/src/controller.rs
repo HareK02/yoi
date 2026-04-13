@@ -1,16 +1,16 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use llm_worker::llm_client::client::LlmClient;
 use llm_worker::WorkerError;
+use llm_worker::llm_client::client::LlmClient;
 use session_store::Store;
 use tokio::sync::{broadcast, mpsc};
 
-use crate::pod::{Pod, PodRunResult, PodError};
-use protocol::{ErrorCode, Event, Method, RunResult, TurnResult};
+use crate::pod::{Pod, PodError, PodRunResult};
 use crate::runtime_dir::RuntimeDir;
 use crate::shared_state::{PodSharedState, PodStatus};
 use crate::socket_server::SocketServer;
+use protocol::{ErrorCode, Event, Method, RunResult, TurnResult};
 
 // ---------------------------------------------------------------------------
 // PodHandle — client-facing, Clone-able

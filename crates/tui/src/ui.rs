@@ -1,10 +1,10 @@
+use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Padding, Paragraph, Wrap};
-use ratatui::Frame;
 
-use crate::app::{fmt_tokens, App, MessageKind, OutputItem};
+use crate::app::{App, MessageKind, OutputItem, fmt_tokens};
 
 /// Draw the fixed viewport (3 lines: separator, status, input).
 pub fn draw(frame: &mut Frame, app: &App) {
@@ -44,8 +44,7 @@ pub fn flush_output(
             OutputItem::TurnHeader(text) => {
                 terminal.insert_before(1, |buf| {
                     let style = kind_style(&MessageKind::TurnHeader);
-                    Paragraph::new(Line::from(Span::styled(text, style)))
-                        .render(buf.area, buf);
+                    Paragraph::new(Line::from(Span::styled(text, style))).render(buf.area, buf);
                 })?;
             }
             OutputItem::Padded(kind, text) => {
@@ -119,10 +118,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     let mut spans = vec![
         conn,
         Span::raw(" "),
-        Span::styled(
-            &app.pod_name,
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(&app.pod_name, Style::default().add_modifier(Modifier::BOLD)),
     ];
 
     if app.running {

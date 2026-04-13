@@ -1,8 +1,8 @@
 use std::sync::RwLock;
 
 use llm_worker::llm_client::types::Item;
-use session_store::SessionId;
 use serde::{Deserialize, Serialize};
+use session_store::SessionId;
 
 /// Shared state between PodController and runtime directory.
 ///
@@ -25,11 +25,7 @@ pub enum PodStatus {
 }
 
 impl PodSharedState {
-    pub fn new(
-        pod_name: String,
-        session_id: SessionId,
-        manifest_toml: String,
-    ) -> Self {
+    pub fn new(pod_name: String, session_id: SessionId, manifest_toml: String) -> Self {
         Self {
             pod_name,
             session_id,

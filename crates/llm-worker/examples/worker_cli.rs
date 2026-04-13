@@ -41,6 +41,7 @@ use tracing_subscriber::EnvFilter;
 use clap::{Parser, ValueEnum};
 use llm_worker::{
     Worker,
+    interceptor::{Interceptor, PostToolAction, ToolResultInfo},
     llm_client::{
         LlmClient,
         providers::{
@@ -48,7 +49,6 @@ use llm_worker::{
             openai::OpenAIClient,
         },
     },
-    interceptor::{Interceptor, PostToolAction, ToolResultInfo},
     timeline::{Handler, TextBlockEvent, TextBlockKind, ToolUseBlockEvent, ToolUseBlockKind},
 };
 use llm_worker_macros::tool_registry;

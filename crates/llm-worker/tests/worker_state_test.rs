@@ -11,9 +11,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use async_trait::async_trait;
 use common::MockLlmClient;
 use llm_worker::Item;
-use llm_worker::{Worker, WorkerError};
 use llm_worker::llm_client::event::{Event, ResponseStatus, StatusEvent};
 use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
+use llm_worker::{Worker, WorkerError};
 
 // =============================================================================
 // Mutable State Tests

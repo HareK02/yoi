@@ -38,7 +38,10 @@ fn resolve_api_key(
     if let Some(ref raw_path) = config.api_key_file {
         let path = expand_key_path(raw_path, manifest_dir)?;
         let contents = std::fs::read_to_string(&path).map_err(|e| {
-            ProviderError::Config(format!("failed to read api_key_file {}: {e}", path.display()))
+            ProviderError::Config(format!(
+                "failed to read api_key_file {}: {e}",
+                path.display()
+            ))
         })?;
         return Ok(Some(contents.trim().to_owned()));
     }
@@ -47,10 +50,7 @@ fn resolve_api_key(
 }
 
 /// Expand `~` and resolve relative paths against `manifest_dir`.
-fn expand_key_path(
-    raw: &Path,
-    manifest_dir: Option<&Path>,
-) -> Result<PathBuf, ProviderError> {
+fn expand_key_path(raw: &Path, manifest_dir: Option<&Path>) -> Result<PathBuf, ProviderError> {
     let path = if raw.starts_with("~") {
         let home = std::env::var("HOME")
             .map_err(|_| ProviderError::Config("HOME is not set for ~ expansion".into()))?;

@@ -184,7 +184,9 @@ pub enum Outcome {
     /// Worker yielded control to the caller for external processing.
     /// Distinct from `Paused`: caller handles internally and resumes.
     Yielded,
-    Error { message: String },
+    Error {
+        message: String,
+    },
 }
 
 /// State collected from log entries.
@@ -409,7 +411,11 @@ mod tests {
             },
             LogEntry::AssistantItems {
                 ts: 3000,
-                items: vec![Item::tool_call("call_1", "get_weather", r#"{"city":"Tokyo"}"#)],
+                items: vec![Item::tool_call(
+                    "call_1",
+                    "get_weather",
+                    r#"{"city":"Tokyo"}"#,
+                )],
             },
             LogEntry::ToolResults {
                 ts: 3500,

@@ -88,8 +88,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Wait for completion
     tokio::time::sleep(std::time::Duration::from_secs(15)).await;
-    println!("\n[shared_state] final: {}", handle.shared_state.status_json());
-    println!("[history] {} bytes", handle.shared_state.history_json().len());
+    println!(
+        "\n[shared_state] final: {}",
+        handle.shared_state.status_json()
+    );
+    println!(
+        "[history] {} bytes",
+        handle.shared_state.history_json().len()
+    );
 
     drop(handle);
     let _ = listener.await;

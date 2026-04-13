@@ -4,11 +4,11 @@
 //! The caller (typically Pod) holds the Worker directly and calls these
 //! functions after state-mutating operations.
 
+use crate::SessionId;
 use crate::session_log::{self, EntryHash, HashedEntry, LogEntry, Outcome, SessionOrigin};
 use crate::store::{Store, StoreError};
-use crate::SessionId;
-use llm_worker::llm_client::types::Item;
 use llm_worker::llm_client::RequestConfig;
+use llm_worker::llm_client::types::Item;
 
 /// State snapshot for creating a SessionStart entry.
 pub struct SessionStartState<'a> {
@@ -142,10 +142,15 @@ pub async fn save_delta(
     while i < new_items.len() {
         let item = &new_items[i];
         if item.is_user_message() {
-            append_entry(store, session_id, head_hash, LogEntry::UserInput {
-                ts,
-                item: new_items[i].clone(),
-            })
+            append_entry(
+                store,
+                session_id,
+                head_hash,
+                LogEntry::UserInput {
+                    ts,
+                    item: new_items[i].clone(),
+                },
+            )
             .await?;
             i += 1;
         } else if item.is_tool_result() {
@@ -153,10 +158,15 @@ pub async fn save_delta(
             while i < new_items.len() && new_items[i].is_tool_result() {
                 i += 1;
             }
-            append_entry(store, session_id, head_hash, LogEntry::ToolResults {
-                ts,
-                items: new_items[start..i].to_vec(),
-            })
+            append_entry(
+                store,
+                session_id,
+                head_hash,
+                LogEntry::ToolResults {
+                    ts,
+                    items: new_items[start..i].to_vec(),
+                },
+            )
             .await?;
         } else if item.is_assistant_message() || item.is_tool_call() || item.is_reasoning() {
             let start = i;
@@ -167,16 +177,26 @@ pub async fn save_delta(
             {
                 i += 1;
             }
-            append_entry(store, session_id, head_hash, LogEntry::AssistantItems {
-                ts,
-                items: new_items[start..i].to_vec(),
-            })
+            append_entry(
+                store,
+                session_id,
+                head_hash,
+                LogEntry::AssistantItems {
+                    ts,
+                    items: new_items[start..i].to_vec(),
+                },
+            )
             .await?;
         } else {
-            append_entry(store, session_id, head_hash, LogEntry::HookInjectedItems {
-                ts,
-                items: vec![new_items[i].clone()],
-            })
+            append_entry(
+                store,
+                session_id,
+                head_hash,
+                LogEntry::HookInjectedItems {
+                    ts,
+                    items: vec![new_items[i].clone()],
+                },
+            )
             .await?;
             i += 1;
         }
@@ -191,10 +211,15 @@ pub async fn save_turn_end(
     head_hash: &mut Option<EntryHash>,
     turn_count: usize,
 ) -> Result<(), StoreError> {
-    append_entry(store, session_id, head_hash, LogEntry::TurnEnd {
-        ts: session_log::now_millis(),
-        turn_count,
-    })
+    append_entry(
+        store,
+        session_id,
+        head_hash,
+        LogEntry::TurnEnd {
+            ts: session_log::now_millis(),
+            turn_count,
+        },
+    )
     .await
 }
 
@@ -206,11 +231,16 @@ pub async fn save_outcome(
     outcome: Outcome,
     interrupted: bool,
 ) -> Result<(), StoreError> {
-    append_entry(store, session_id, head_hash, LogEntry::RunOutcome {
-        ts: session_log::now_millis(),
-        outcome,
-        interrupted,
-    })
+    append_entry(
+        store,
+        session_id,
+        head_hash,
+        LogEntry::RunOutcome {
+            ts: session_log::now_millis(),
+            outcome,
+            interrupted,
+        },
+    )
     .await
 }
 
@@ -230,14 +260,19 @@ pub async fn save_usage(
     cache_write_tokens: u64,
     output_tokens: u64,
 ) -> Result<(), StoreError> {
-    append_entry(store, session_id, head_hash, LogEntry::LlmUsage {
-        ts: session_log::now_millis(),
-        history_len,
-        input_total_tokens,
-        cache_read_tokens,
-        cache_write_tokens,
-        output_tokens,
-    })
+    append_entry(
+        store,
+        session_id,
+        head_hash,
+        LogEntry::LlmUsage {
+            ts: session_log::now_millis(),
+            history_len,
+            input_total_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+            output_tokens,
+        },
+    )
     .await
 }
 
@@ -248,10 +283,15 @@ pub async fn save_cache_locked(
     head_hash: &mut Option<EntryHash>,
     locked_prefix_len: usize,
 ) -> Result<(), StoreError> {
-    append_entry(store, session_id, head_hash, LogEntry::Locked {
-        ts: session_log::now_millis(),
-        locked_prefix_len,
-    })
+    append_entry(
+        store,
+        session_id,
+        head_hash,
+        LogEntry::Locked {
+            ts: session_log::now_millis(),
+            locked_prefix_len,
+        },
+    )
     .await
 }
 
@@ -261,9 +301,14 @@ pub async fn save_cache_unlocked(
     session_id: SessionId,
     head_hash: &mut Option<EntryHash>,
 ) -> Result<(), StoreError> {
-    append_entry(store, session_id, head_hash, LogEntry::CacheUnlocked {
-        ts: session_log::now_millis(),
-    })
+    append_entry(
+        store,
+        session_id,
+        head_hash,
+        LogEntry::CacheUnlocked {
+            ts: session_log::now_millis(),
+        },
+    )
     .await
 }
 
@@ -274,10 +319,15 @@ pub async fn save_config_changed(
     head_hash: &mut Option<EntryHash>,
     config: &RequestConfig,
 ) -> Result<(), StoreError> {
-    append_entry(store, session_id, head_hash, LogEntry::ConfigChanged {
-        ts: session_log::now_millis(),
-        config: config.clone(),
-    })
+    append_entry(
+        store,
+        session_id,
+        head_hash,
+        LogEntry::ConfigChanged {
+            ts: session_log::now_millis(),
+            config: config.clone(),
+        },
+    )
     .await
 }
 
