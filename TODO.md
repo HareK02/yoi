@@ -2,7 +2,6 @@
 - [ ] ツール設計
   - [ ] Bash ツール (Permission 層と統合) → [tickets/bash-tool.md](tickets/bash-tool.md)
 - [ ] Scope の再設計 (pwd + writable、必須化) → [tickets/scope-redesign.md](tickets/scope-redesign.md)
-- [ ] Prune をコンテキスト射影に変更 → [tickets/prune-projection.md](tickets/prune-projection.md)
 - [ ] Prune の savings 推定を正確にする → [tickets/prune-savings-estimation.md](tickets/prune-savings-estimation.md)
 - [ ] Compact の改善（要約品質 + 挙動詳細） → [tickets/compact-improvements.md](tickets/compact-improvements.md)
 - [ ] Protocol の設計 → [tickets/protocol-design.md](tickets/protocol-design.md)
