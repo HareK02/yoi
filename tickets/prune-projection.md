@@ -34,6 +34,54 @@ history の変換ではない。
 - PreLlmRequest hook の戻り値: 現在 `PreRequestAction::Continue` で history を
   そのまま使う設計。射影したコンテキストを渡す方法の検討が必要
 
+## 追加作業: Worker への統合
+
+初回レビューで「pure ロジックが `llm-worker::prune` にあるのに適用は pod 側
+Hook で行う」という責務の不整合が見つかった。現状:
+
+- `llm-worker::prune` が `PruneConfig` と `prunable_indices` を提供
+- `pod::prune_hook::PruneHook` が `PreLlmRequest` hook として射影を実行
+
+Worker 自身が context window 管理の責任を持つべき。`build_request` の直前
+（`worker.rs:701` 付近）で射影すれば `PruneHook` は不要になる。
+
+### 変更内容
+
+- `Worker` が `PruneConfig` を直接保持する
+  （`Worker::set_prune_config(config)` 等）
+- `worker.rs:701` の `request_context = self.history.clone()` の直後に
+  Worker 自身が `prunable_indices` で候補を抽出し、`min_savings` を満たせば
+  content を射影する
+- `min_savings` 判定のためのトークン会計は Worker から外部に問い合わせる。
+  `Worker::set_savings_estimator(Box<dyn Fn(&[Item], Range<usize>) -> u64>)`
+  のようにコールバックを注入する形にする
+  （Worker は usage 履歴を知らないので、計算は pod 側に残す）
+- `pod::prune_hook` モジュールを廃止。Pod は `worker.set_prune_config(...)` と
+  `worker.set_savings_estimator(...)` を呼ぶだけ
+
+### 影響範囲
+
+- `crates/llm-worker/src/worker.rs`: `PruneConfig` / savings estimator の
+  保持、`build_request` 直前での射影適用
+- `crates/pod/src/prune_hook.rs`: **削除**
+- `crates/pod/src/pod.rs`: `PruneHook` 生成を `worker.set_prune_config` +
+  `worker.set_savings_estimator` に置き換え
+- `crates/pod/src/lib.rs`: `prune_hook` モジュールの削除
+
+### 得られるもの
+
+- llm-worker 側に prune 関連コードを集約できる
+- `PreLlmRequest` hook から prune 固有の mutation が消える
+  （現状 hook に渡る `&mut Vec<Item>` はユーザー向け hook が自由に使えるが、
+  Worker 内部の prune と同じ経路を共有するのは混乱の元）
+- PruneHook の単体テスト不足問題（初回レビュー指摘2）も Worker のテストとして
+  自然に書ける
+
+## レビュー状態
+
+Reviewed — [prune-projection.review.md](prune-projection.review.md)
+（追加作業「Worker への統合」は未着手）
+
 ## 依存
 
 - なし

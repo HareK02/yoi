@@ -1,6 +1,11 @@
-//! PruneHook — applies conditional pruning before each LLM request.
+//! PruneHook — projects the LLM request context before each call.
 //!
-//! Wraps the pure `prune` API from `llm-worker` as a [`Hook<PreLlmRequest>`].
+//! Prune は **コンテキスト射影** として実装する。`PreLlmRequest` hook に
+//! 渡される `context: &mut Vec<Item>` は Worker が毎 turn 冒頭で history を
+//! clone した一時配列 (`worker.rs:701`)。ここで ToolResult.content を省いても
+//! Worker の永続履歴には影響しない。`prunable_indices` で候補を抽出し、
+//! `min_savings` を満たせば content を `None` に射影する。
+//!
 //! `min_savings` の判定は usage 履歴ベースのトークン会計
 //! ([`crate::token_counter::savings_for_drop_impl`]) で行う。
 
@@ -9,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use llm_worker::Item;
 use llm_worker::interceptor::PreRequestAction;
-use llm_worker::prune::{PruneConfig, apply_prune, prunable_indices};
+use llm_worker::prune::{PruneConfig, prunable_indices};
 use session_store::UsageRecord;
 use tracing::debug;
 
@@ -66,13 +71,23 @@ impl Hook<PreLlmRequest> for PruneHook {
             return PreRequestAction::Continue;
         }
 
-        let result = apply_prune(context, &candidates);
-        if result.pruned_count > 0 {
+        // 射影: context (= history の clone) 上の対象 ToolResult だけ content を
+        // drop する。Worker の永続履歴は別インスタンスなので影響を受けない。
+        let mut projected = 0usize;
+        for &i in &candidates {
+            if let Item::ToolResult { content, .. } = &mut context[i] {
+                if content.is_some() {
+                    *content = None;
+                    projected += 1;
+                }
+            }
+        }
+        if projected > 0 {
             debug!(
-                pruned = result.pruned_count,
+                pruned = projected,
                 estimated_savings_tokens = savings.tokens,
                 source = ?savings.source,
-                "Pruned old tool-result content"
+                "Projected old tool-result content out of request context"
             );
         }
         PreRequestAction::Continue
