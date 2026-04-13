@@ -141,6 +141,10 @@ if saved.tokens >= min_savings {
     呼び出しに置き換え（呼び出し側で渡す）
   - prune の API シグネチャ調整は最小限に
 
+## レビュー状態
+
+Reviewed — [token-counter.review.md](token-counter.review.md)
+
 ## 依存
 
 - [usage-history.md](usage-history.md) — Usage を session-store に積む基盤

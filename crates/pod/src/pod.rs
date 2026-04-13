@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use llm_worker::Item;
 use llm_worker::llm_client::client::LlmClient;
@@ -7,7 +7,7 @@ use llm_worker::llm_client::RequestConfig;
 use llm_worker::state::Mutable;
 use llm_worker::{Worker, WorkerError, WorkerResult};
 use session_store::{
-    EntryHash, Outcome, SessionId, SessionStartState, Store, StoreError,
+    EntryHash, Outcome, SessionId, SessionStartState, Store, StoreError, UsageRecord,
 };
 use tracing::{info, warn};
 
@@ -75,6 +75,14 @@ pub struct Pod<C: LlmClient, St: Store> {
     /// Captures `(history_len, UsageEvent)` pairs during a run; drained
     /// in `persist_turn` and persisted as `LogEntry::LlmUsage` entries.
     usage_tracker: Arc<UsageTracker>,
+    /// Cumulative Usage measurement timeline, one entry per LLM call.
+    /// Restored from session log on `restore`, appended on each persist.
+    /// Read by token-accounting APIs (`Pod::total_tokens`, etc.).
+    ///
+    /// Wrapped in `Arc<Mutex>` so that hooks living on the Worker
+    /// (e.g. `PruneHook`) can share the same view via
+    /// [`Pod::usage_history_handle`].
+    usage_history: Arc<Mutex<Vec<UsageRecord>>>,
     /// Session-lifetime file-operation tracker from the builtin `tools`
     /// crate. Populated by the Controller when it registers the builtin
     /// tools so that Pod-owned operations (e.g. compaction) can consult
@@ -108,6 +116,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             manifest_dir: None,
             compact_state: None,
             usage_tracker: Arc::new(UsageTracker::new()),
+            usage_history: Arc::new(Mutex::new(Vec::<UsageRecord>::new())),
             tracker: None,
         })
     }
@@ -142,6 +151,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             manifest_dir: None,
             compact_state: None,
             usage_tracker: Arc::new(UsageTracker::new()),
+            usage_history: Arc::new(Mutex::new(state.usage_history)),
             tracker: None,
         })
     }
@@ -177,6 +187,30 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     /// Reference to the store.
     pub fn store(&self) -> &St {
         &self.store
+    }
+
+    /// Current history items held by the underlying Worker.
+    pub fn history(&self) -> &[Item] {
+        self.worker().history()
+    }
+
+    /// Snapshot of the cumulative LLM Usage measurement timeline.
+    ///
+    /// One entry per LLM call. Restored on `restore` and appended in
+    /// `persist_turn`. Used by token-accounting APIs in [`token_counter`].
+    /// Returns a clone since the underlying vector is shared with hooks
+    /// running on the Worker.
+    pub fn usage_history(&self) -> Vec<UsageRecord> {
+        self.usage_history.lock().expect("usage_history poisoned").clone()
+    }
+
+    /// Shared handle to the cumulative Usage history.
+    ///
+    /// Hooks (e.g. `PruneHook`) take a clone of this `Arc` so they can
+    /// read the latest measurements at request time. The handle outlives
+    /// any individual run.
+    pub fn usage_history_handle(&self) -> Arc<Mutex<Vec<UsageRecord>>> {
+        self.usage_history.clone()
     }
 
     /// Attach the session-scoped file-operation tracker from the builtin
@@ -483,7 +517,9 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
 
         // Persist any LLM Usage measurements collected during this run.
         // One LogEntry::LlmUsage per LLM call (the tool loop may have run
-        // many calls within a single Pod::run).
+        // many calls within a single Pod::run). Each is also appended to
+        // the in-memory `usage_history` so token-accounting APIs see it
+        // before the next run.
         let usage_records = self.usage_tracker.drain();
         for record in usage_records {
             session_store::save_usage(
@@ -497,6 +533,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 record.output_tokens,
             )
             .await?;
+            self.usage_history.lock().expect("usage_history poisoned").push(record);
         }
 
         let interrupted = self.worker.as_ref().unwrap().last_run_interrupted();
@@ -601,10 +638,13 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         )
         .await?;
 
-        // Swap in the new session state.
+        // Swap in the new session state. usage_history belongs to the old
+        // session — the new compacted session starts with no measurements
+        // until its first LLM call.
         self.session_id = new_session_id;
         self.head_hash = Some(new_head_hash);
         self.worker.as_mut().unwrap().set_history(new_history);
+        self.usage_history.lock().expect("usage_history poisoned").clear();
 
         Ok(new_session_id)
     }
@@ -658,6 +698,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             manifest_dir,
             compact_state: None,
             usage_tracker: Arc::new(UsageTracker::new()),
+            usage_history: Arc::new(Mutex::new(Vec::new())),
             tracker: None,
         })
     }

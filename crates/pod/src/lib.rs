@@ -10,7 +10,10 @@ mod compact_interceptor;
 mod compact_state;
 mod hook_interceptor;
 mod pod;
+mod token_counter;
 mod usage_tracker;
+
+pub use token_counter::{EstimateSource, SplitPoint, TokenEstimate};
 
 pub use controller::{PodController, PodHandle};
 pub use manifest::{PodManifest, ProviderConfig, ProviderKind, Scope};
