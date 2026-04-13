@@ -95,8 +95,18 @@ fn item_bytes(item: &Item) -> u64 {
 }
 
 /// `history[..index]` までのトークン数を推定する。
-fn tokens_at(history: &[Item], records: &[UsageRecord], index: usize) -> TokenEstimate {
+///
+/// `prefix` は [`prefix_bytes`] で得た `history.len() + 1` 長の累積バイト列。
+/// 呼び出し側が 1 度だけ計算して使い回すことで、線形探索や複数回の推定が
+/// O(n) シリアライズで済む（内部で毎回再計算すると O(n²) になる）。
+fn tokens_at(
+    history: &[Item],
+    records: &[UsageRecord],
+    index: usize,
+    prefix: &[u64],
+) -> TokenEstimate {
     debug_assert!(index <= history.len());
+    debug_assert_eq!(prefix.len(), history.len() + 1);
 
     if index == 0 {
         return TokenEstimate {
@@ -106,7 +116,6 @@ fn tokens_at(history: &[Item], records: &[UsageRecord], index: usize) -> TokenEs
     }
 
     if records.is_empty() {
-        let prefix = prefix_bytes(history);
         return TokenEstimate {
             tokens: prefix[index] / 4,
             source: EstimateSource::NoData,
@@ -123,7 +132,6 @@ fn tokens_at(history: &[Item], records: &[UsageRecord], index: usize) -> TokenEs
 
     let lower = records.iter().rev().find(|r| r.history_len < index);
     let upper = records.iter().find(|r| r.history_len > index);
-    let prefix = prefix_bytes(history);
     let cap = history.len();
 
     match (lower, upper) {
@@ -186,7 +194,8 @@ fn tokens_at(history: &[Item], records: &[UsageRecord], index: usize) -> TokenEs
 }
 
 fn total_tokens_impl(history: &[Item], records: &[UsageRecord]) -> TokenEstimate {
-    tokens_at(history, records, history.len())
+    let prefix = prefix_bytes(history);
+    tokens_at(history, records, history.len(), &prefix)
 }
 
 fn split_for_retained_impl(
@@ -194,7 +203,8 @@ fn split_for_retained_impl(
     records: &[UsageRecord],
     retained: u64,
 ) -> SplitPoint {
-    let current = total_tokens_impl(history, records);
+    let prefix = prefix_bytes(history);
+    let current = tokens_at(history, records, history.len(), &prefix);
     if current.tokens <= retained {
         return SplitPoint {
             index: 0,
@@ -204,11 +214,12 @@ fn split_for_retained_impl(
     let target = current.tokens - retained;
 
     // `tokens_at` が target 以上になる最小の idx を線形探索。
-    // history.len() は高々数百〜数千なので十分速い。将来ボトルネックになれば
+    // prefix を使い回すので 1 回の split 呼び出しあたり O(n) で済む
+    // （内部で毎回再計算すると O(n²) になる）。将来ボトルネックになれば
     // record 境界で二分探索に置き換える。
     let mut chosen_source = current.source;
     for idx in 1..=history.len() {
-        let est = tokens_at(history, records, idx);
+        let est = tokens_at(history, records, idx, &prefix);
         if est.tokens >= target {
             chosen_source = est.source;
             return SplitPoint {
@@ -234,8 +245,9 @@ pub(crate) fn savings_for_drop_impl(
             source: EstimateSource::Measured,
         };
     }
-    let s = tokens_at(history, records, range.start);
-    let e = tokens_at(history, records, range.end);
+    let prefix = prefix_bytes(history);
+    let s = tokens_at(history, records, range.start, &prefix);
+    let e = tokens_at(history, records, range.end, &prefix);
     TokenEstimate {
         tokens: e.tokens.saturating_sub(s.tokens),
         source: s.source.worst(e.source),
