@@ -12,7 +12,7 @@ use llm_worker::prune::{PruneConfig, SavingsEstimator};
 use session_store::Store;
 
 use crate::Pod;
-use crate::token_counter::{EstimateSource, savings_for_drop_impl};
+use crate::token_counter::{EstimateSource, savings_for_prune_impl};
 
 impl<C: LlmClient, St: Store> Pod<C, St> {
     /// Enable prune projection on the underlying Worker.
@@ -21,14 +21,14 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     /// The estimator captures a shared handle to [`Pod::usage_history_handle`]
     /// so that every LLM request sees the latest measurements.
     ///
-    /// Measurement-less ranges (before the first LLM call, or immediately
+    /// Measurement-less estimates (before the first LLM call, or immediately
     /// after a compact) return `0` from the estimator, which naturally
     /// prevents the prune projection from firing until usage data exists.
     pub fn attach_prune(&mut self, config: PruneConfig) {
         let usage = self.usage_history_handle();
-        let estimator: SavingsEstimator = Box::new(move |history: &[Item], range| {
+        let estimator: SavingsEstimator = Box::new(move |history: &[Item], indices| {
             let snapshot = usage.lock().expect("usage_history poisoned").clone();
-            let est = savings_for_drop_impl(history, &snapshot, range);
+            let est = savings_for_prune_impl(history, &snapshot, indices);
             match est.source {
                 EstimateSource::NoData => 0,
                 _ => est.tokens,

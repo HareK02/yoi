@@ -14,18 +14,21 @@
 //! `min_savings` 判定や savings 推定もこの crate には置かず、上位層が
 //! usage 履歴ベースのトークン会計と組み合わせて行う。
 
-use std::ops::Range;
-
 use serde::{Deserialize, Serialize};
 
 use crate::llm_client::types::Item;
 
-/// Callback that estimates the token savings for dropping `history[range]`.
+/// Callback that estimates the token savings for projecting the
+/// `ToolResult.content` out of `history[i]` for each `i` in `indices`.
 ///
 /// Injected into [`crate::Worker`] via `set_savings_estimator` so the
 /// Worker can make `min_savings` decisions without knowing about usage
 /// measurement sources. Return `0` to signal "no data / refuse to prune".
-pub type SavingsEstimator = Box<dyn Fn(&[Item], Range<usize>) -> u64 + Send + Sync>;
+///
+/// 推定対象は「drop する範囲全体」ではなく「content を None にする差分」
+/// であることに注意。item 自体（summary 等）は残るので、この callback は
+/// 実際の projection と一致する savings を返す必要がある。
+pub type SavingsEstimator = Box<dyn Fn(&[Item], &[usize]) -> u64 + Send + Sync>;
 
 /// Configuration for the Prune algorithm.
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -717,9 +717,7 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
                 let candidates =
                     crate::prune::prunable_indices(&request_context, config.protected_turns);
                 if !candidates.is_empty() {
-                    let first = *candidates.first().unwrap();
-                    let last = *candidates.last().unwrap() + 1;
-                    let savings = estimator(&request_context, first..last);
+                    let savings = estimator(&request_context, &candidates);
                     if savings >= config.min_savings {
                         let pruned = crate::prune::project(&mut request_context, &candidates);
                         if pruned > 0 {
