@@ -1,7 +1,10 @@
 - [ ] テスト設計 → [tickets/test-design.md](tickets/test-design.md)
 - [ ] ツール設計
   - [ ] Bash ツール (Permission 層と統合) → [tickets/bash-tool.md](tickets/bash-tool.md)
+  - [ ] ツール実行結果のサイズ上限 → [tickets/tool-output-limit.md](tickets/tool-output-limit.md)
 - [ ] 複数 Pod 間の Scope 排他制御 → [tickets/scope-exclusion.md](tickets/scope-exclusion.md)
 - [ ] Compact の改善（要約品質 + 挙動詳細） → [tickets/compact-improvements.md](tickets/compact-improvements.md)
 - [ ] Protocol の設計 → [tickets/protocol-design.md](tickets/protocol-design.md)
 - [ ] パーミッション: パターンベースのツール実行制御 → [tickets/permission-extension-point.md](tickets/permission-extension-point.md)
+- [ ] システムプロンプトのテンプレート化 → [tickets/system-prompt-template.md](tickets/system-prompt-template.md)
+- [ ] AGENTS.md の取り込み → [tickets/agents-md-ingestion.md](tickets/agents-md-ingestion.md)

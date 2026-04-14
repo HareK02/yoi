@@ -3,6 +3,7 @@ use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Padding, Paragraph, Wrap};
+use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, MessageKind, OutputItem, fmt_tokens};
 
@@ -153,7 +154,7 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
     ]);
     frame.render_widget(Paragraph::new(line), area);
 
-    let cursor_x = area.x + 2 + app.input[..app.cursor].chars().count() as u16;
+    let cursor_x = area.x + 2 + UnicodeWidthStr::width(&app.input[..app.cursor]) as u16;
     let cursor_y = area.y;
     frame.set_cursor_position(Position::new(cursor_x, cursor_y));
 }
