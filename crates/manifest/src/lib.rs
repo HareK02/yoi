@@ -2,6 +2,7 @@ mod scope;
 
 pub use scope::{Scope, ScopeError};
 
+use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 
@@ -79,6 +80,48 @@ pub struct WorkerManifest {
     pub max_turns: Option<NonZeroU32>,
     #[serde(default)]
     pub temperature: Option<f32>,
+    #[serde(default)]
+    pub tool_output: Option<ToolOutputLimits>,
+}
+
+/// Byte-size caps applied to tool execution `content` before it enters
+/// conversation history. Guards against a single oversized tool result
+/// blowing past the provider's per-minute input-token rate limit.
+///
+/// Field names are deliberately phrased in bytes (not tokens) because
+/// accurate pre-send token counting is not yet available; the caps can
+/// be migrated to token units later without renaming.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolOutputLimits {
+    /// Cap applied to any tool not listed in `per_tool`.
+    #[serde(default = "default_tool_output_max_bytes")]
+    pub default_max_bytes: usize,
+    /// Per-tool overrides, keyed by tool registration name (e.g. "Glob").
+    #[serde(default)]
+    pub per_tool: HashMap<String, usize>,
+}
+
+fn default_tool_output_max_bytes() -> usize {
+    16 * 1024
+}
+
+impl Default for ToolOutputLimits {
+    fn default() -> Self {
+        Self {
+            default_max_bytes: default_tool_output_max_bytes(),
+            per_tool: HashMap::new(),
+        }
+    }
+}
+
+impl ToolOutputLimits {
+    /// Resolve the cap for a given tool name.
+    pub fn limit_for(&self, tool_name: &str) -> usize {
+        self.per_tool
+            .get(tool_name)
+            .copied()
+            .unwrap_or(self.default_max_bytes)
+    }
 }
 
 /// Declarative scope configuration.
@@ -365,6 +408,44 @@ permission = "write"
     fn reject_unknown_provider() {
         let toml = MINIMAL_REQUIRED.replace("kind = \"anthropic\"", "kind = \"unknown_provider\"");
         assert!(PodManifest::from_toml(&toml).is_err());
+    }
+
+    #[test]
+    fn omitted_tool_output_is_none() {
+        let manifest = PodManifest::from_toml(MINIMAL_REQUIRED).unwrap();
+        assert!(manifest.worker.tool_output.is_none());
+    }
+
+    #[test]
+    fn parse_tool_output_limits() {
+        let toml = MINIMAL_REQUIRED.replace(
+            "[worker]\n",
+            "[worker]\n\
+             [worker.tool_output]\n\
+             default_max_bytes = 8192\n\n\
+             [worker.tool_output.per_tool]\n\
+             Read = 32768\n\
+             Grep = 4096\n",
+        );
+        let manifest = PodManifest::from_toml(&toml).unwrap();
+        let limits = manifest.worker.tool_output.unwrap();
+        assert_eq!(limits.default_max_bytes, 8192);
+        assert_eq!(limits.limit_for("Read"), 32768);
+        assert_eq!(limits.limit_for("Grep"), 4096);
+        assert_eq!(limits.limit_for("Unknown"), 8192);
+    }
+
+    #[test]
+    fn tool_output_default_max_bytes_is_16k() {
+        let toml = MINIMAL_REQUIRED.replace(
+            "[worker]\n",
+            "[worker]\n\
+             [worker.tool_output]\n",
+        );
+        let manifest = PodManifest::from_toml(&toml).unwrap();
+        let limits = manifest.worker.tool_output.unwrap();
+        assert_eq!(limits.default_max_bytes, 16 * 1024);
+        assert!(limits.per_tool.is_empty());
     }
 
     #[test]

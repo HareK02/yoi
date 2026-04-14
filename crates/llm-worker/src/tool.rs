@@ -3,6 +3,7 @@
 //! Traits for defining tools callable by LLM.
 //! Usually auto-implemented using the `#[tool]` macro.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -31,6 +32,62 @@ pub enum ToolError {
 /// Threshold below which tool output is treated as summary-only (no content).
 /// Outputs this small don't benefit from pruning.
 pub const SUMMARY_THRESHOLD: usize = 200;
+
+/// Byte-size caps applied to tool execution `content` at the Worker's
+/// tool-execution boundary, before results enter conversation history.
+///
+/// Exists so a single oversized tool result (e.g. a wide `Glob` scan)
+/// cannot blow past the provider's per-minute input-token rate limit.
+/// Individual tools are not trusted to self-limit — this is the single
+/// chokepoint.
+///
+/// The unit is bytes rather than tokens because accurate pre-send token
+/// estimation is not available. The limits can be migrated to token
+/// units later without changing callers.
+#[derive(Debug, Clone)]
+pub struct ToolOutputLimits {
+    /// Cap applied to any tool not listed in `per_tool`.
+    pub default_max_bytes: usize,
+    /// Per-tool overrides, keyed by tool registration name.
+    pub per_tool: HashMap<String, usize>,
+}
+
+impl ToolOutputLimits {
+    /// Resolve the cap for a given tool name.
+    pub fn limit_for(&self, tool_name: &str) -> usize {
+        self.per_tool
+            .get(tool_name)
+            .copied()
+            .unwrap_or(self.default_max_bytes)
+    }
+}
+
+/// Truncate `content` in-place if it exceeds `limit` bytes, replacing
+/// the dropped tail with a short human- and LLM-readable marker so the
+/// model can self-correct by narrowing its query.
+///
+/// The cut point is walked back to the nearest UTF-8 char boundary so
+/// multibyte characters are never split.
+pub(crate) fn truncate_content(content: &mut String, limit: usize) {
+    let original_len = content.len();
+    if original_len <= limit {
+        return;
+    }
+
+    let suffix_template = "\n\n[truncated: %BYTES% bytes dropped, refine your query]";
+    // Reserve enough headroom for the suffix (upper bound on the byte length
+    // of the number substitution). usize::MAX fits in 20 digits.
+    let reserved = suffix_template.len() + 20 - "%BYTES%".len();
+    let body_budget = limit.saturating_sub(reserved);
+
+    let mut cut = body_budget.min(original_len);
+    while cut > 0 && !content.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    content.truncate(cut);
+    let dropped = original_len - cut;
+    content.push_str(&suffix_template.replace("%BYTES%", &dropped.to_string()));
+}
 
 /// Tool execution result.
 ///
@@ -251,5 +308,66 @@ impl ToolResult {
             content: None,
             is_error: true,
         }
+    }
+}
+
+#[cfg(test)]
+mod truncate_tests {
+    use super::*;
+
+    #[test]
+    fn noop_when_within_limit() {
+        let mut s = "hello world".to_string();
+        truncate_content(&mut s, 1024);
+        assert_eq!(s, "hello world");
+    }
+
+    #[test]
+    fn noop_at_exact_limit() {
+        let mut s = "a".repeat(100);
+        truncate_content(&mut s, 100);
+        assert_eq!(s.len(), 100);
+    }
+
+    #[test]
+    fn truncates_oversized_ascii_with_marker() {
+        let mut s = "a".repeat(1000);
+        truncate_content(&mut s, 200);
+        assert!(s.contains("[truncated:"));
+        assert!(s.contains("refine your query"));
+        assert!(s.len() <= 200, "result was {} bytes", s.len());
+        let dropped: usize = s
+            .split("[truncated: ")
+            .nth(1)
+            .unwrap()
+            .split(' ')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let body_len = s.find("\n\n[truncated:").unwrap();
+        assert_eq!(body_len + dropped, 1000);
+    }
+
+    #[test]
+    fn respects_utf8_char_boundaries() {
+        // 100 copies of "あ" (3 bytes each) = 300 bytes.
+        let mut s = "あ".repeat(100);
+        truncate_content(&mut s, 120);
+        // Truncation must not split a multibyte character.
+        assert!(s.is_char_boundary(s.find("\n\n[truncated:").unwrap_or(s.len())));
+        // And the result must still be valid UTF-8 (implicitly true for String).
+        assert!(s.contains("[truncated:"));
+    }
+
+    #[test]
+    fn limits_per_tool_override() {
+        let mut limits = ToolOutputLimits {
+            default_max_bytes: 1024,
+            per_tool: HashMap::new(),
+        };
+        limits.per_tool.insert("Read".to_string(), 4096);
+        assert_eq!(limits.limit_for("Read"), 4096);
+        assert_eq!(limits.limit_for("Grep"), 1024);
     }
 }

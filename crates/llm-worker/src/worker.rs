@@ -20,7 +20,10 @@ use crate::{
     state::{Locked, Mutable, WorkerState},
     timeline::event::{ErrorEvent, StatusEvent, UsageEvent},
     timeline::{TextBlockCollector, Timeline, ToolCallCollector},
-    tool::{ToolCall, ToolDefinition as WorkerToolDefinition, ToolError, ToolResult},
+    tool::{
+        ToolCall, ToolDefinition as WorkerToolDefinition, ToolError, ToolOutputLimits, ToolResult,
+        truncate_content,
+    },
     tool_server::{ToolServer, ToolServerHandle},
 };
 
@@ -158,6 +161,9 @@ pub struct Worker<C: LlmClient, S: WorkerState = Mutable> {
     /// Cancel notification channel (for interrupting execution)
     cancel_tx: mpsc::Sender<()>,
     cancel_rx: mpsc::Receiver<()>,
+    /// Byte-size caps applied to tool `content` before it reaches history.
+    /// `None` disables truncation (tests and minimal setups).
+    tool_output_limits: Option<ToolOutputLimits>,
     /// Prune configuration. `None` disables the prune projection.
     prune_config: Option<crate::prune::PruneConfig>,
     /// Callback that estimates token savings for a drop range, injected
@@ -644,6 +650,33 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
             }
         };
 
+        // Cap `content` byte-size before it enters history. This is the
+        // single chokepoint that protects the next LLM request from
+        // blowing past the provider's per-minute input-token limit; no
+        // individual tool is trusted to self-limit.
+        if let Some(limits) = self.tool_output_limits.as_ref() {
+            for tool_result in &mut results {
+                let Some(content) = tool_result.content.as_mut() else {
+                    continue;
+                };
+                let Some((tool_call, _, _)) = call_info_map.get(&tool_result.tool_use_id) else {
+                    continue;
+                };
+                let limit = limits.limit_for(&tool_call.name);
+                let before = content.len();
+                truncate_content(content, limit);
+                if content.len() != before {
+                    warn!(
+                        tool = %tool_call.name,
+                        before_bytes = before,
+                        after_bytes = content.len(),
+                        limit_bytes = limit,
+                        "Tool output exceeded byte limit and was truncated"
+                    );
+                }
+            }
+        }
+
         // Phase 3: Apply post_tool_call interceptor
         for tool_result in &mut results {
             if let Some((tool_call, meta, tool)) = call_info_map.get(&tool_result.tool_use_id) {
@@ -932,6 +965,7 @@ impl<C: LlmClient> Worker<C, Mutable> {
             last_run_interrupted: false,
             cancel_tx,
             cancel_rx,
+            tool_output_limits: None,
             prune_config: None,
             savings_estimator: None,
             _state: PhantomData,
@@ -961,6 +995,15 @@ impl<C: LlmClient> Worker<C, Mutable> {
     /// Set system prompt (mutable reference version)
     pub fn set_system_prompt(&mut self, prompt: impl Into<String>) {
         self.system_prompt = Some(prompt.into());
+    }
+
+    /// Install byte-size caps for tool execution `content`.
+    ///
+    /// Passing `None` (the default) disables truncation. Higher layers
+    /// (e.g. Pod) translate manifest configuration into a concrete
+    /// [`ToolOutputLimits`] and install it here.
+    pub fn set_tool_output_limits(&mut self, limits: Option<ToolOutputLimits>) {
+        self.tool_output_limits = limits;
     }
 
     /// Set maximum tokens (builder pattern)
@@ -1175,6 +1218,7 @@ impl<C: LlmClient> Worker<C, Mutable> {
 
             cancel_tx: self.cancel_tx,
             cancel_rx: self.cancel_rx,
+            tool_output_limits: self.tool_output_limits,
             prune_config: self.prune_config,
             savings_estimator: self.savings_estimator,
             _state: PhantomData,
@@ -1246,6 +1290,7 @@ impl<C: LlmClient> Worker<C, Locked> {
 
             cancel_tx: self.cancel_tx,
             cancel_rx: self.cancel_rx,
+            tool_output_limits: self.tool_output_limits,
             prune_config: self.prune_config,
             savings_estimator: self.savings_estimator,
             _state: PhantomData,

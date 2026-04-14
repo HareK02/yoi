@@ -5,7 +5,7 @@ use llm_worker::Item;
 use llm_worker::llm_client::RequestConfig;
 use llm_worker::llm_client::client::LlmClient;
 use llm_worker::state::Mutable;
-use llm_worker::{Worker, WorkerError, WorkerResult};
+use llm_worker::{ToolOutputLimits, Worker, WorkerError, WorkerResult};
 use session_store::{
     EntryHash, Outcome, SessionId, SessionStartState, Store, StoreError, UsageRecord,
 };
@@ -846,6 +846,10 @@ pub fn apply_worker_manifest<C: LlmClient>(worker: &mut Worker<C>, wm: &WorkerMa
     }
     worker.set_request_config(config);
     worker.set_max_turns(wm.max_turns.map(|n| n.get()));
+    worker.set_tool_output_limits(wm.tool_output.as_ref().map(|limits| ToolOutputLimits {
+        default_max_bytes: limits.default_max_bytes,
+        per_tool: limits.per_tool.clone(),
+    }));
 }
 
 /// Result of a Pod run.

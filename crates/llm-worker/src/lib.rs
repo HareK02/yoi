@@ -55,5 +55,5 @@ pub use callback::{TextBlockScope, ToolUseBlockScope};
 pub use handler::ToolUseBlockStart;
 pub use interceptor::Interceptor;
 pub use message::{ContentPart, Item, Message, Role};
-pub use tool::{ToolCall, ToolResult};
+pub use tool::{ToolCall, ToolOutputLimits, ToolResult};
 pub use worker::{RunOutput, ToolRegistryError, Worker, WorkerConfig, WorkerError, WorkerResult};
