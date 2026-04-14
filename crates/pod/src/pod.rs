@@ -846,9 +846,9 @@ pub fn apply_worker_manifest<C: LlmClient>(worker: &mut Worker<C>, wm: &WorkerMa
     }
     worker.set_request_config(config);
     worker.set_max_turns(wm.max_turns.map(|n| n.get()));
-    worker.set_tool_output_limits(wm.tool_output.as_ref().map(|limits| ToolOutputLimits {
-        default_max_bytes: limits.default_max_bytes,
-        per_tool: limits.per_tool.clone(),
+    worker.set_tool_output_limits(Some(ToolOutputLimits {
+        default_max_bytes: wm.tool_output.default_max_bytes,
+        per_tool: wm.tool_output.per_tool.clone(),
     }));
 }
 

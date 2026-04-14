@@ -650,10 +650,33 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
             }
         };
 
-        // Cap `content` byte-size before it enters history. This is the
-        // single chokepoint that protects the next LLM request from
-        // blowing past the provider's per-minute input-token limit; no
-        // individual tool is trusted to self-limit.
+        // Phase 3: Apply post_tool_call interceptor
+        for tool_result in &mut results {
+            if let Some((tool_call, meta, tool)) = call_info_map.get(&tool_result.tool_use_id) {
+                let mut info = ToolResultInfo {
+                    call: tool_call.clone(),
+                    result: tool_result.clone(),
+                    meta: meta.clone(),
+                    tool: tool.clone(),
+                };
+
+                match self.interceptor.post_tool_call(&mut info).await {
+                    PostToolAction::Continue => {}
+                    PostToolAction::Abort(reason) => {
+                        self.last_run_interrupted = true;
+                        return Err(WorkerError::Aborted(reason));
+                    }
+                }
+                // Reflect interceptor-modified results
+                *tool_result = info.result;
+            }
+        }
+
+        // Phase 4: Cap `content` byte-size before it enters history.
+        // Runs *after* post_tool_call so interceptors (audit, logging,
+        // classification) still observe the full content, and any
+        // content they inject is also truncated — closing the last gap
+        // before the data reaches the next LLM request.
         if let Some(limits) = self.tool_output_limits.as_ref() {
             for tool_result in &mut results {
                 let Some(content) = tool_result.content.as_mut() else {
@@ -674,28 +697,6 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
                         "Tool output exceeded byte limit and was truncated"
                     );
                 }
-            }
-        }
-
-        // Phase 3: Apply post_tool_call interceptor
-        for tool_result in &mut results {
-            if let Some((tool_call, meta, tool)) = call_info_map.get(&tool_result.tool_use_id) {
-                let mut info = ToolResultInfo {
-                    call: tool_call.clone(),
-                    result: tool_result.clone(),
-                    meta: meta.clone(),
-                    tool: tool.clone(),
-                };
-
-                match self.interceptor.post_tool_call(&mut info).await {
-                    PostToolAction::Continue => {}
-                    PostToolAction::Abort(reason) => {
-                        self.last_run_interrupted = true;
-                        return Err(WorkerError::Aborted(reason));
-                    }
-                }
-                // Reflect interceptor-modified results
-                *tool_result = info.result;
             }
         }
 

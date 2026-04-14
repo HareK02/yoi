@@ -80,8 +80,12 @@ pub struct WorkerManifest {
     pub max_turns: Option<NonZeroU32>,
     #[serde(default)]
     pub temperature: Option<f32>,
+    /// Byte-size caps applied to tool `content` before it reaches the
+    /// conversation history. The section is optional in TOML — when
+    /// omitted, `ToolOutputLimits::default()` (16KB default cap, no
+    /// per-tool overrides) is applied so truncation is on by default.
     #[serde(default)]
-    pub tool_output: Option<ToolOutputLimits>,
+    pub tool_output: ToolOutputLimits,
 }
 
 /// Byte-size caps applied to tool execution `content` before it enters
@@ -411,9 +415,11 @@ permission = "write"
     }
 
     #[test]
-    fn omitted_tool_output_is_none() {
+    fn omitted_tool_output_falls_back_to_default_16k() {
         let manifest = PodManifest::from_toml(MINIMAL_REQUIRED).unwrap();
-        assert!(manifest.worker.tool_output.is_none());
+        let limits = &manifest.worker.tool_output;
+        assert_eq!(limits.default_max_bytes, 16 * 1024);
+        assert!(limits.per_tool.is_empty());
     }
 
     #[test]
@@ -428,7 +434,7 @@ permission = "write"
              Grep = 4096\n",
         );
         let manifest = PodManifest::from_toml(&toml).unwrap();
-        let limits = manifest.worker.tool_output.unwrap();
+        let limits = &manifest.worker.tool_output;
         assert_eq!(limits.default_max_bytes, 8192);
         assert_eq!(limits.limit_for("Read"), 32768);
         assert_eq!(limits.limit_for("Grep"), 4096);
@@ -436,14 +442,14 @@ permission = "write"
     }
 
     #[test]
-    fn tool_output_default_max_bytes_is_16k() {
+    fn empty_tool_output_section_uses_default_max_bytes() {
         let toml = MINIMAL_REQUIRED.replace(
             "[worker]\n",
             "[worker]\n\
              [worker.tool_output]\n",
         );
         let manifest = PodManifest::from_toml(&toml).unwrap();
-        let limits = manifest.worker.tool_output.unwrap();
+        let limits = &manifest.worker.tool_output;
         assert_eq!(limits.default_max_bytes, 16 * 1024);
         assert!(limits.per_tool.is_empty());
     }
