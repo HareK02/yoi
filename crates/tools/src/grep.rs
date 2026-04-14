@@ -11,6 +11,7 @@ use ignore::WalkBuilder;
 use ignore::overrides::OverrideBuilder;
 use ignore::types::TypesBuilder;
 use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
+use manifest::Scope;
 use serde::Deserialize;
 
 use crate::error::ToolsError;
@@ -91,8 +92,9 @@ impl Tool for GrepTool {
             "Grep"
         );
 
-        let default_base = self.fs.scope().root().to_path_buf();
-        let report = tokio::task::spawn_blocking(move || run_grep(default_base, params))
+        let default_base = self.fs.pwd().to_path_buf();
+        let scope = self.fs.scope().clone();
+        let report = tokio::task::spawn_blocking(move || run_grep(default_base, params, &scope))
             .await
             .map_err(|e| ToolError::Internal(format!("spawn_blocking failed: {e}")))??;
 
@@ -228,7 +230,7 @@ impl GrepReport {
     }
 }
 
-fn run_grep(default_base: PathBuf, p: GrepParams) -> Result<GrepReport, ToolsError> {
+fn run_grep(default_base: PathBuf, p: GrepParams, scope: &Scope) -> Result<GrepReport, ToolsError> {
     let matcher = RegexMatcherBuilder::new()
         .case_insensitive(p.case_insensitive)
         .multi_line(p.multiline)
@@ -309,6 +311,9 @@ fn run_grep(default_base: PathBuf, p: GrepParams) -> Result<GrepReport, ToolsErr
             continue;
         }
         let path = entry.path();
+        if !scope.is_readable(path) {
+            continue;
+        }
 
         match mode {
             GrepOutputMode::FilesWithMatches => {
@@ -472,7 +477,10 @@ mod tests {
 
     fn setup() -> (TempDir, ScopedFs) {
         let dir = TempDir::new().unwrap();
-        let fs = ScopedFs::new(Scope::new(dir.path()).unwrap());
+        let fs = ScopedFs::new(
+            Scope::writable(dir.path()).unwrap(),
+            dir.path().to_path_buf(),
+        );
         (dir, fs)
     }
 
@@ -481,6 +489,43 @@ mod tests {
             fs::create_dir_all(parent).unwrap();
         }
         fs::write(path, content).unwrap();
+    }
+
+    #[tokio::test]
+    async fn grep_filters_results_by_scope_readability() {
+        use manifest::{Permission, ScopeConfig, ScopeRule};
+
+        let dir = TempDir::new().unwrap();
+        let secret_dir = dir.path().join("secret");
+        fs::create_dir(&secret_dir).unwrap();
+        touch(&dir.path().join("visible.txt"), "needle\n");
+        touch(&secret_dir.join("hidden.txt"), "needle\n");
+
+        let cfg = ScopeConfig {
+            allow: vec![ScopeRule {
+                target: dir.path().to_path_buf(),
+                permission: Permission::Write,
+                recursive: true,
+            }],
+            deny: vec![ScopeRule {
+                target: secret_dir.clone(),
+                permission: Permission::Read,
+                recursive: true,
+            }],
+        };
+        let scope = Scope::from_config(&cfg, dir.path()).unwrap();
+        let scoped = ScopedFs::new(scope, dir.path().to_path_buf());
+
+        let def = grep_tool(scoped);
+        let (_, tool) = def();
+        let inp = serde_json::json!({ "pattern": "needle" });
+        let out = tool.execute(&inp.to_string()).await.unwrap();
+        let body = out.content.unwrap_or_default();
+        assert!(body.contains("visible.txt"));
+        assert!(
+            !body.contains("hidden.txt"),
+            "scope-denied file leaked into grep output: {body}"
+        );
     }
 
     #[tokio::test]

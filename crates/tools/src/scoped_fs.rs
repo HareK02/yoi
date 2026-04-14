@@ -1,15 +1,16 @@
 //! Scope-aware filesystem primitive.
 //!
-//! `ScopedFs` represents **only** the write-block boundary: it knows a
-//! [`manifest::Scope`] and refuses writes outside of it. It carries no
-//! per-session state and is cheap to clone (pod-lifetime, reusable across
-//! sessions). The read-before-edit policy lives separately in
-//! [`crate::Tracker`].
+//! `ScopedFs` is the write/read gate layered on top of a [`manifest::Scope`]
+//! and a Pod's working directory. The scope decides which paths are
+//! readable and writable; the pwd is carried alongside for convenience
+//! (Glob/Grep default their search base to it).
 //!
-//! Reads are unrestricted by design (see `tickets/builtin-tools.md`).
+//! `ScopedFs` is cheap to clone (`Arc` inside) and carries no per-session
+//! state — the read-before-edit policy lives separately in
+//! [`crate::Tracker`].
 
 use std::io::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use manifest::Scope;
@@ -19,6 +20,7 @@ use crate::error::ToolsError;
 #[derive(Debug)]
 struct ScopedFsInner {
     scope: Scope,
+    pwd: PathBuf,
 }
 
 /// Scope-aware filesystem handle. Clone-cheap (`Arc` inside).
@@ -35,10 +37,10 @@ pub struct WriteOutcome {
 }
 
 impl ScopedFs {
-    /// Create a new [`ScopedFs`] wrapping the given [`Scope`].
-    pub fn new(scope: Scope) -> Self {
+    /// Create a new [`ScopedFs`] wrapping the given [`Scope`] and pwd.
+    pub fn new(scope: Scope, pwd: PathBuf) -> Self {
         Self {
-            inner: Arc::new(ScopedFsInner { scope }),
+            inner: Arc::new(ScopedFsInner { scope, pwd }),
         }
     }
 
@@ -47,17 +49,26 @@ impl ScopedFs {
         &self.inner.scope
     }
 
+    /// The Pod's working directory. Glob/Grep default their search base
+    /// to this path when callers omit an explicit `path` parameter.
+    pub fn pwd(&self) -> &Path {
+        &self.inner.pwd
+    }
+
     // =========================================================================
-    // Read — unrestricted
+    // Read — scope-checked against readability
     // =========================================================================
 
     /// Read the full contents of `path` as raw bytes.
     ///
-    /// Follows symlinks. Rejects directories, relative paths, and missing
-    /// files. No scope check.
+    /// Follows symlinks. Rejects directories, relative paths, paths not
+    /// readable by the scope, and missing files.
     pub fn read_bytes(&self, path: &Path) -> Result<Vec<u8>, ToolsError> {
         if !path.is_absolute() {
             return Err(ToolsError::RelativePath(path.to_path_buf()));
+        }
+        if !self.inner.scope.is_readable(path) {
+            return Err(ToolsError::OutOfScope(path.to_path_buf()));
         }
         let meta = std::fs::metadata(path).map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => ToolsError::NotFound(path.to_path_buf()),
@@ -75,9 +86,10 @@ impl ScopedFs {
 
     /// Atomically write `content` to `path`, creating or overwriting it.
     ///
-    /// - `path` must be absolute and inside the scope (delegates to
-    ///   [`Scope::contains`]).
-    /// - Missing parent directories inside the scope are created.
+    /// - `path` must be absolute and writable under the scope.
+    /// - Paths that are readable but not writable return [`ToolsError::ReadOnly`].
+    /// - Paths outside the scope entirely return [`ToolsError::OutOfScope`].
+    /// - Missing parent directories are created.
     /// - The actual write uses a sibling tempfile + `persist`, so the
     ///   target file transitions atomically between states.
     ///
@@ -88,8 +100,12 @@ impl ScopedFs {
         if !path.is_absolute() {
             return Err(ToolsError::RelativePath(path.to_path_buf()));
         }
-        if !self.inner.scope.contains(path) {
-            return Err(ToolsError::OutOfScope(path.to_path_buf()));
+        if !self.inner.scope.is_writable(path) {
+            return Err(if self.inner.scope.is_readable(path) {
+                ToolsError::ReadOnly(path.to_path_buf())
+            } else {
+                ToolsError::OutOfScope(path.to_path_buf())
+            });
         }
 
         // Reject existing directory targets.
@@ -138,11 +154,15 @@ impl ScopedFs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use manifest::{Permission, ScopeConfig, ScopeRule};
     use std::fs;
     use tempfile::TempDir;
 
     fn make_fs(dir: &TempDir) -> ScopedFs {
-        ScopedFs::new(Scope::new(dir.path()).unwrap())
+        ScopedFs::new(
+            Scope::writable(dir.path()).unwrap(),
+            dir.path().to_path_buf(),
+        )
     }
 
     // -------------------------------------------------------------------------
@@ -183,15 +203,15 @@ mod tests {
     }
 
     #[test]
-    fn read_bytes_allows_paths_outside_scope() {
-        // Reads are unrestricted — scope only gates writes.
+    fn read_bytes_rejects_paths_outside_scope() {
         let dir = TempDir::new().unwrap();
         let outside = TempDir::new().unwrap();
         let outside_file = outside.path().join("x.txt");
         fs::write(&outside_file, b"hi").unwrap();
 
         let scoped = make_fs(&dir);
-        assert_eq!(scoped.read_bytes(&outside_file).unwrap(), b"hi");
+        let err = scoped.read_bytes(&outside_file).unwrap_err();
+        assert!(matches!(err, ToolsError::OutOfScope(_)));
     }
 
     // -------------------------------------------------------------------------
@@ -227,6 +247,32 @@ mod tests {
         let fs = make_fs(&dir);
         let err = fs.write(&outside.path().join("x"), b"x").unwrap_err();
         assert!(matches!(err, ToolsError::OutOfScope(_)));
+    }
+
+    #[test]
+    fn write_rejects_readonly_path() {
+        let dir = TempDir::new().unwrap();
+        let sub = dir.path().join("sub");
+        fs::create_dir(&sub).unwrap();
+        let cfg = ScopeConfig {
+            allow: vec![ScopeRule {
+                target: dir.path().to_path_buf(),
+                permission: Permission::Write,
+                recursive: true,
+            }],
+            deny: vec![ScopeRule {
+                target: sub.clone(),
+                permission: Permission::Write,
+                recursive: true,
+            }],
+        };
+        let scope = Scope::from_config(&cfg, dir.path()).unwrap();
+        let scoped = ScopedFs::new(scope, dir.path().to_path_buf());
+        let err = scoped.write(&sub.join("locked.txt"), b"x").unwrap_err();
+        assert!(
+            matches!(err, ToolsError::ReadOnly(_)),
+            "expected ReadOnly, got {err:?}"
+        );
     }
 
     #[test]

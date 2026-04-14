@@ -1,6 +1,6 @@
 mod scope;
 
-pub use scope::Scope;
+pub use scope::{Scope, ScopeError};
 
 use std::num::NonZeroU32;
 use std::path::PathBuf;
@@ -10,14 +10,13 @@ use serde::{Deserialize, Serialize};
 /// Declarative configuration for a Pod.
 ///
 /// Parsed from a TOML manifest file. Describes the provider, model,
-/// system prompt, and optional directory scope.
+/// system prompt, and directory scope (required).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PodManifest {
     pub pod: PodMeta,
     pub provider: ProviderConfig,
     pub worker: WorkerManifest,
-    #[serde(default)]
-    pub scope: Option<ScopeConfig>,
+    pub scope: ScopeConfig,
     #[serde(default)]
     pub compaction: Option<CompactionConfig>,
 }
@@ -26,6 +25,9 @@ pub struct PodManifest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PodMeta {
     pub name: String,
+    /// Working directory for the Pod. Relative paths are resolved against
+    /// the directory containing the manifest file.
+    pub pwd: PathBuf,
 }
 
 /// LLM provider configuration.
@@ -79,10 +81,53 @@ pub struct WorkerManifest {
     pub temperature: Option<f32>,
 }
 
-/// Directory scope configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Declarative scope configuration.
+///
+/// A Pod may only touch paths whose effective permission (computed from
+/// allow/deny rules below) is at least `Read` / `Write`. See
+/// [`Scope`] for the resolved runtime form.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ScopeConfig {
-    pub root: PathBuf,
+    /// Rules granting access. At least one entry is required for the
+    /// scope to be meaningful; [`Scope::from_config`] enforces this.
+    #[serde(default)]
+    pub allow: Vec<ScopeRule>,
+    /// Rules capping access below the stated permission level. Empty by
+    /// default.
+    #[serde(default)]
+    pub deny: Vec<ScopeRule>,
+}
+
+/// A single allow or deny rule inside [`ScopeConfig`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScopeRule {
+    /// Target path. Relative paths are resolved against the Pod's pwd
+    /// when [`Scope::from_config`] runs.
+    pub target: PathBuf,
+    /// Permission level this rule grants (allow) or caps strictly below
+    /// (deny).
+    pub permission: Permission,
+    /// When `false`, the rule only matches the target itself and its
+    /// direct children. Defaults to `true`.
+    #[serde(default = "default_recursive")]
+    pub recursive: bool,
+}
+
+fn default_recursive() -> bool {
+    true
+}
+
+/// Permission lattice used by [`ScopeRule`].
+///
+/// The derived `Ord` instance follows declaration order, so
+/// `Read < Write`. Allow rules grant the stated level (and by extension
+/// everything below); deny rules cap the effective level **strictly
+/// below** the stated level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Permission {
+    Read,
+    Write,
 }
 
 /// Context compaction configuration.
@@ -146,24 +191,32 @@ impl PodManifest {
 mod tests {
     use super::*;
 
-    #[test]
-    fn parse_minimal_manifest() {
-        let toml = r#"
+    const MINIMAL_REQUIRED: &str = r#"
 [pod]
 name = "test-agent"
+pwd = "./"
 
 [provider]
 kind = "anthropic"
 model = "claude-sonnet-4-20250514"
 
 [worker]
+
+[[scope.allow]]
+target = "./"
+permission = "write"
 "#;
-        let manifest = PodManifest::from_toml(toml).unwrap();
+
+    #[test]
+    fn parse_minimal_manifest() {
+        let manifest = PodManifest::from_toml(MINIMAL_REQUIRED).unwrap();
         assert_eq!(manifest.pod.name, "test-agent");
+        assert_eq!(manifest.pod.pwd, PathBuf::from("./"));
         assert_eq!(manifest.provider.kind, ProviderKind::Anthropic);
         assert_eq!(manifest.provider.model, "claude-sonnet-4-20250514");
         assert!(manifest.provider.api_key_file.is_none());
-        assert!(manifest.scope.is_none());
+        assert_eq!(manifest.scope.allow.len(), 1);
+        assert!(manifest.scope.deny.is_empty());
         assert!(manifest.worker.system_prompt.is_none());
     }
 
@@ -172,6 +225,7 @@ model = "claude-sonnet-4-20250514"
         let toml = r#"
 [pod]
 name = "code-reviewer"
+pwd = "./src"
 
 [provider]
 kind = "anthropic"
@@ -183,11 +237,22 @@ system_prompt = "You are a code reviewer."
 max_tokens = 4096
 temperature = 0.3
 
-[scope]
-root = "./src"
+[[scope.allow]]
+target = "./"
+permission = "write"
+
+[[scope.allow]]
+target = "../docs"
+permission = "read"
+recursive = false
+
+[[scope.deny]]
+target = "./secrets.rs"
+permission = "write"
 "#;
         let manifest = PodManifest::from_toml(toml).unwrap();
         assert_eq!(manifest.pod.name, "code-reviewer");
+        assert_eq!(manifest.pod.pwd, PathBuf::from("./src"));
         assert_eq!(
             manifest.provider.api_key_file.as_deref(),
             Some(std::path::Path::new("~/.config/insomnia/keys/anthropic"))
@@ -198,83 +263,37 @@ root = "./src"
         );
         assert_eq!(manifest.worker.max_tokens, Some(4096));
         assert_eq!(manifest.worker.temperature, Some(0.3));
-        assert_eq!(
-            manifest.scope.as_ref().unwrap().root,
-            PathBuf::from("./src")
-        );
+        let allow = &manifest.scope.allow;
+        assert_eq!(allow.len(), 2);
+        assert_eq!(allow[0].permission, Permission::Write);
+        assert!(allow[0].recursive);
+        assert_eq!(allow[1].permission, Permission::Read);
+        assert!(!allow[1].recursive);
+        assert_eq!(manifest.scope.deny.len(), 1);
+        assert_eq!(manifest.scope.deny[0].permission, Permission::Write);
     }
 
     #[test]
-    fn parse_ollama_no_api_key() {
+    fn reject_missing_scope() {
         let toml = r#"
 [pod]
-name = "local-agent"
-
-[provider]
-kind = "ollama"
-model = "llama3"
-
-[worker]
-"#;
-        let manifest = PodManifest::from_toml(toml).unwrap();
-        assert_eq!(manifest.provider.kind, ProviderKind::Ollama);
-        assert!(manifest.provider.api_key_file.is_none());
-    }
-
-    #[test]
-    fn parse_max_turns() {
-        let toml = r#"
-[pod]
-name = "test"
+name = "missing-scope"
+pwd = "./"
 
 [provider]
 kind = "anthropic"
 model = "claude-sonnet-4-20250514"
 
 [worker]
-max_turns = 50
-"#;
-        let manifest = PodManifest::from_toml(toml).unwrap();
-        assert_eq!(manifest.worker.max_turns.unwrap().get(), 50);
-    }
-
-    #[test]
-    fn omitted_max_turns_is_none() {
-        let toml = r#"
-[pod]
-name = "test"
-
-[provider]
-kind = "anthropic"
-model = "claude-sonnet-4-20250514"
-
-[worker]
-"#;
-        let manifest = PodManifest::from_toml(toml).unwrap();
-        assert!(manifest.worker.max_turns.is_none());
-    }
-
-    #[test]
-    fn reject_max_turns_zero() {
-        let toml = r#"
-[pod]
-name = "test"
-
-[provider]
-kind = "anthropic"
-model = "claude-sonnet-4-20250514"
-
-[worker]
-max_turns = 0
 "#;
         assert!(PodManifest::from_toml(toml).is_err());
     }
 
     #[test]
-    fn parse_compaction_config() {
+    fn reject_missing_pwd() {
         let toml = r#"
 [pod]
-name = "test"
+name = "missing-pwd"
 
 [provider]
 kind = "anthropic"
@@ -282,10 +301,36 @@ model = "claude-sonnet-4-20250514"
 
 [worker]
 
-[compaction]
-compact_threshold = 80000
+[[scope.allow]]
+target = "./"
+permission = "write"
 "#;
-        let manifest = PodManifest::from_toml(toml).unwrap();
+        assert!(PodManifest::from_toml(toml).is_err());
+    }
+
+    #[test]
+    fn parse_max_turns() {
+        let toml = MINIMAL_REQUIRED.replace("[worker]\n", "[worker]\nmax_turns = 50\n");
+        let manifest = PodManifest::from_toml(&toml).unwrap();
+        assert_eq!(manifest.worker.max_turns.unwrap().get(), 50);
+    }
+
+    #[test]
+    fn omitted_max_turns_is_none() {
+        let manifest = PodManifest::from_toml(MINIMAL_REQUIRED).unwrap();
+        assert!(manifest.worker.max_turns.is_none());
+    }
+
+    #[test]
+    fn reject_max_turns_zero() {
+        let toml = MINIMAL_REQUIRED.replace("[worker]\n", "[worker]\nmax_turns = 0\n");
+        assert!(PodManifest::from_toml(&toml).is_err());
+    }
+
+    #[test]
+    fn parse_compaction_config() {
+        let toml = format!("{MINIMAL_REQUIRED}\n[compaction]\ncompact_threshold = 80000\n");
+        let manifest = PodManifest::from_toml(&toml).unwrap();
         let c = manifest.compaction.unwrap();
         assert_eq!(c.prune_protected_turns, 3);
         assert_eq!(c.prune_min_savings, 4096);
@@ -295,24 +340,15 @@ compact_threshold = 80000
 
     #[test]
     fn parse_compaction_with_provider() {
-        let toml = r#"
-[pod]
-name = "test"
-
-[provider]
-kind = "anthropic"
-model = "claude-sonnet-4-20250514"
-
-[worker]
-
-[compaction]
-compact_threshold = 80000
-
-[compaction.provider]
-kind = "gemini"
-model = "gemini-2.0-flash"
-"#;
-        let manifest = PodManifest::from_toml(toml).unwrap();
+        let toml = format!(
+            "{MINIMAL_REQUIRED}\n\
+             [compaction]\n\
+             compact_threshold = 80000\n\n\
+             [compaction.provider]\n\
+             kind = \"gemini\"\n\
+             model = \"gemini-2.0-flash\"\n"
+        );
+        let manifest = PodManifest::from_toml(&toml).unwrap();
         let c = manifest.compaction.unwrap();
         let p = c.provider.unwrap();
         assert_eq!(p.kind, ProviderKind::Gemini);
@@ -321,32 +357,25 @@ model = "gemini-2.0-flash"
 
     #[test]
     fn omitted_compaction_is_none() {
-        let toml = r#"
-[pod]
-name = "test"
-
-[provider]
-kind = "anthropic"
-model = "claude-sonnet-4-20250514"
-
-[worker]
-"#;
-        let manifest = PodManifest::from_toml(toml).unwrap();
+        let manifest = PodManifest::from_toml(MINIMAL_REQUIRED).unwrap();
         assert!(manifest.compaction.is_none());
     }
 
     #[test]
     fn reject_unknown_provider() {
-        let toml = r#"
-[pod]
-name = "test"
+        let toml = MINIMAL_REQUIRED.replace("kind = \"anthropic\"", "kind = \"unknown_provider\"");
+        assert!(PodManifest::from_toml(&toml).is_err());
+    }
 
-[provider]
-kind = "unknown_provider"
-model = "x"
-
-[worker]
-"#;
-        assert!(PodManifest::from_toml(toml).is_err());
+    #[test]
+    fn default_recursive_true() {
+        let rule: ScopeRule = toml::from_str(
+            r#"
+target = "./"
+permission = "read"
+"#,
+        )
+        .unwrap();
+        assert!(rule.recursive);
     }
 }

@@ -38,7 +38,10 @@ impl Registry {
 
 fn setup() -> (TempDir, Registry) {
     let dir = TempDir::new().unwrap();
-    let fs = ScopedFs::new(Scope::new(dir.path()).unwrap());
+    let fs = ScopedFs::new(
+        Scope::writable(dir.path()).unwrap(),
+        dir.path().to_path_buf(),
+    );
     let tracker = Tracker::new();
     let reg = Registry::new(builtin_tools(fs, tracker));
     (dir, reg)
@@ -275,7 +278,10 @@ fn tool_names_match_reference_spec() {
 async fn tracker_recent_files_tracks_read_write_edit() {
     // Build a fresh registry that shares a tracker we can query afterwards.
     let dir = TempDir::new().unwrap();
-    let fs = ScopedFs::new(Scope::new(dir.path()).unwrap());
+    let fs = ScopedFs::new(
+        Scope::writable(dir.path()).unwrap(),
+        dir.path().to_path_buf(),
+    );
     let tracker = Tracker::new();
     let reg = Registry::new(builtin_tools(fs, tracker.clone()));
 

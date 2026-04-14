@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use llm_worker::Item;
@@ -11,7 +11,7 @@ use session_store::{
 };
 use tracing::{info, warn};
 
-use manifest::{PodManifest, Scope, WorkerManifest};
+use manifest::{PodManifest, Scope, ScopeError, WorkerManifest};
 
 use crate::compact_interceptor::CompactInterceptor;
 use crate::compact_state::CompactState;
@@ -64,7 +64,10 @@ pub struct Pod<C: LlmClient, St: Store> {
     store: St,
     session_id: SessionId,
     head_hash: Option<EntryHash>,
-    scope: Option<Scope>,
+    /// Absolute working directory of the Pod.
+    pwd: PathBuf,
+    /// Resolved scope — always present.
+    scope: Scope,
     hook_builder: HookRegistryBuilder,
     interceptor_installed: bool,
     /// Directory containing the manifest file (needed for api_key_file resolution).
@@ -92,11 +95,16 @@ pub struct Pod<C: LlmClient, St: Store> {
 
 impl<C: LlmClient, St: Store> Pod<C, St> {
     /// Create a new Pod from a pre-built Worker and store.
+    ///
+    /// Callers must pre-resolve `pwd` (absolute) and build a [`Scope`]
+    /// — typically via [`Scope::from_config`] when coming from a
+    /// manifest, or [`Scope::writable`] in tests.
     pub async fn new(
         manifest: PodManifest,
         worker: Worker<C>,
         store: St,
-        scope: Option<Scope>,
+        pwd: PathBuf,
+        scope: Scope,
     ) -> Result<Self, PodError> {
         let state = SessionStartState {
             system_prompt: worker.get_system_prompt(),
@@ -110,6 +118,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             store,
             session_id,
             head_hash: Some(head_hash),
+            pwd,
             scope,
             hook_builder: HookRegistryBuilder::new(),
             interceptor_installed: false,
@@ -129,7 +138,8 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         manifest: PodManifest,
         client: C,
         store: St,
-        scope: Option<Scope>,
+        pwd: PathBuf,
+        scope: Scope,
     ) -> Result<Self, PodError> {
         let state = session_store::restore(&store, session_id).await?;
         let mut worker = Worker::new(client);
@@ -147,6 +157,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             store,
             session_id,
             head_hash: state.head_hash,
+            pwd,
             scope,
             hook_builder: HookRegistryBuilder::new(),
             interceptor_installed: false,
@@ -170,9 +181,14 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         &self.manifest
     }
 
-    /// The Pod's directory scope, if any.
-    pub fn scope(&self) -> Option<&Scope> {
-        self.scope.as_ref()
+    /// The Pod's working directory.
+    pub fn pwd(&self) -> &Path {
+        &self.pwd
+    }
+
+    /// The Pod's directory scope.
+    pub fn scope(&self) -> &Scope {
+        &self.scope
     }
 
     /// Direct access to the underlying Worker.
@@ -689,12 +705,22 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
 
 impl<St: Store> Pod<Box<dyn LlmClient>, St> {
     /// Create a Pod entirely from a manifest.
+    ///
+    /// Resolves `manifest.pod.pwd` against `manifest_dir` (or the
+    /// current working directory when absent), builds the [`Scope`]
+    /// from `manifest.scope`, and validates that the resolved pwd is
+    /// readable under that scope.
     pub async fn from_manifest(
         manifest: PodManifest,
         store: St,
-        scope: Option<Scope>,
         manifest_dir: Option<PathBuf>,
     ) -> Result<Self, PodError> {
+        let pwd = resolve_pwd(&manifest.pod.pwd, manifest_dir.as_deref())?;
+        let scope = Scope::from_config(&manifest.scope, &pwd).map_err(PodError::Scope)?;
+        if !scope.is_readable(&pwd) {
+            return Err(PodError::PwdOutsideScope { pwd });
+        }
+
         let client = provider::build_client(&manifest.provider, manifest_dir.as_deref())?;
         let mut worker = Worker::new(client);
         apply_worker_manifest(&mut worker, &manifest.worker);
@@ -711,6 +737,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             store,
             session_id,
             head_hash: Some(head_hash),
+            pwd,
             scope,
             hook_builder: HookRegistryBuilder::new(),
             interceptor_installed: false,
@@ -811,12 +838,42 @@ pub enum PodError {
     #[error(transparent)]
     Store(#[from] StoreError),
 
-    #[error("scope violation: {path} is outside the allowed directory")]
-    ScopeViolation { path: String },
+    #[error(transparent)]
+    Scope(ScopeError),
+
+    #[error("pwd is not readable under the configured scope: {}", .pwd.display())]
+    PwdOutsideScope { pwd: PathBuf },
+
+    #[error("failed to resolve pwd {}: {source}", .pwd.display())]
+    InvalidPwd {
+        pwd: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 
     #[error(transparent)]
     Provider(#[from] provider::ProviderError),
 
     #[error("compaction thrash: context still exceeds threshold immediately after compact")]
     CompactThrash,
+}
+
+/// Resolve the pwd declared in a manifest against `manifest_dir` (or the
+/// current working directory when absent), canonicalizing symlinks.
+fn resolve_pwd(pwd: &Path, manifest_dir: Option<&Path>) -> Result<PathBuf, PodError> {
+    let joined = if pwd.is_absolute() {
+        pwd.to_path_buf()
+    } else {
+        let base = manifest_dir
+            .map(Path::to_path_buf)
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."));
+        base.join(pwd)
+    };
+    joined
+        .canonicalize()
+        .map_err(|source| PodError::InvalidPwd {
+            pwd: joined,
+            source,
+        })
 }

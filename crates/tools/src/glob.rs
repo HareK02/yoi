@@ -6,6 +6,7 @@ use std::time::SystemTime;
 
 use async_trait::async_trait;
 use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
+use manifest::Scope;
 use serde::Deserialize;
 
 use crate::error::ToolsError;
@@ -47,12 +48,13 @@ impl Tool for GlobTool {
         let base = params
             .path
             .clone()
-            .unwrap_or_else(|| self.fs.scope().root().to_path_buf());
+            .unwrap_or_else(|| self.fs.pwd().to_path_buf());
         let pattern = params.pattern.clone();
+        let scope = self.fs.scope().clone();
 
         // ignore::Walk is synchronous; run it on a blocking thread so we
         // don't stall the runtime for large trees.
-        let results = tokio::task::spawn_blocking(move || run_glob(&base, &pattern))
+        let results = tokio::task::spawn_blocking(move || run_glob(&base, &pattern, &scope))
             .await
             .map_err(|e| ToolError::Internal(format!("spawn_blocking failed: {e}")))??;
 
@@ -92,7 +94,7 @@ impl Tool for GlobTool {
     }
 }
 
-fn run_glob(base: &Path, pattern: &str) -> Result<Vec<PathBuf>, ToolsError> {
+fn run_glob(base: &Path, pattern: &str, scope: &Scope) -> Result<Vec<PathBuf>, ToolsError> {
     if !base.is_absolute() {
         return Err(ToolsError::RelativePath(base.to_path_buf()));
     }
@@ -131,6 +133,9 @@ fn run_glob(base: &Path, pattern: &str) -> Result<Vec<PathBuf>, ToolsError> {
         if !glob.is_match(rel) {
             continue;
         }
+        if !scope.is_readable(entry.path()) {
+            continue;
+        }
         let mtime = entry
             .metadata()
             .ok()
@@ -164,7 +169,10 @@ mod tests {
 
     fn setup() -> (TempDir, ScopedFs) {
         let dir = TempDir::new().unwrap();
-        let fs = ScopedFs::new(Scope::new(dir.path()).unwrap());
+        let fs = ScopedFs::new(
+            Scope::writable(dir.path()).unwrap(),
+            dir.path().to_path_buf(),
+        );
         (dir, fs)
     }
 
@@ -235,6 +243,43 @@ mod tests {
         let inp = serde_json::json!({ "pattern": "[unterminated" });
         let err = tool.execute(&inp.to_string()).await.unwrap_err();
         assert!(matches!(err, ToolError::InvalidArgument(_)));
+    }
+
+    #[tokio::test]
+    async fn glob_filters_results_by_scope_readability() {
+        use manifest::{Permission, ScopeConfig, ScopeRule};
+
+        let dir = TempDir::new().unwrap();
+        let secret_dir = dir.path().join("secret");
+        std::fs::create_dir(&secret_dir).unwrap();
+        touch(&dir.path().join("visible.rs"), "");
+        touch(&secret_dir.join("hidden.rs"), "");
+
+        let cfg = ScopeConfig {
+            allow: vec![ScopeRule {
+                target: dir.path().to_path_buf(),
+                permission: Permission::Write,
+                recursive: true,
+            }],
+            deny: vec![ScopeRule {
+                target: secret_dir.clone(),
+                permission: Permission::Read,
+                recursive: true,
+            }],
+        };
+        let scope = Scope::from_config(&cfg, dir.path()).unwrap();
+        let fs = ScopedFs::new(scope, dir.path().to_path_buf());
+
+        let def = glob_tool(fs);
+        let (_, tool) = def();
+        let inp = serde_json::json!({ "pattern": "**/*.rs" });
+        let out = tool.execute(&inp.to_string()).await.unwrap();
+        let body = out.content.unwrap_or_default();
+        assert!(body.contains("visible.rs"));
+        assert!(
+            !body.contains("hidden.rs"),
+            "scope-denied file leaked into glob output: {body}"
+        );
     }
 
     #[tokio::test]

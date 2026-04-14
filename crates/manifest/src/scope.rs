@@ -1,115 +1,349 @@
+//! Runtime representation of a Pod's access scope.
+//!
+//! Built from [`crate::ScopeConfig`] via [`Scope::from_config`] once the
+//! Pod's pwd (working directory) has been resolved to an absolute path.
+//! All rule `target` paths inside the [`Scope`] are absolute and lexically
+//! stable, so access checks are pure path comparisons.
+
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-/// Directory scope constraining a Pod's write access.
+use crate::{Permission, ScopeConfig, ScopeRule};
+
+/// Parsed, pwd-resolved set of allow/deny rules for a Pod.
 ///
-/// Read access is unrestricted — only write operations are checked against the scope.
+/// Read/write access decisions are pure functions of the path being
+/// queried and these rules — see [`Scope::permission_at`].
 #[derive(Debug, Clone)]
 pub struct Scope {
-    root: PathBuf,
+    allow: Vec<ResolvedRule>,
+    deny: Vec<ResolvedRule>,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedRule {
+    /// Absolute, canonicalized-or-normalized target directory/file.
+    target: PathBuf,
+    permission: Permission,
+    recursive: bool,
+}
+
+/// Errors raised when constructing a [`Scope`] from a [`ScopeConfig`].
+#[derive(Debug, thiserror::Error)]
+pub enum ScopeError {
+    #[error("scope must declare at least one [[scope.allow]] rule")]
+    EmptyAllow,
+    #[error("scope base path must be absolute: {}", .0.display())]
+    BaseNotAbsolute(PathBuf),
+    #[error("failed to resolve scope target {}: {source}", .path.display())]
+    ResolveTarget {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 impl Scope {
-    /// Create a new scope rooted at the given directory.
-    ///
-    /// The path is canonicalized to resolve symlinks and relative components.
-    pub fn new(root: impl Into<PathBuf>) -> std::io::Result<Self> {
-        let root = root.into().canonicalize()?;
-        Ok(Self { root })
+    /// Build a [`Scope`] from a declarative [`ScopeConfig`], resolving
+    /// relative `target` paths against `base` (conventionally the Pod's
+    /// absolute pwd).
+    pub fn from_config(config: &ScopeConfig, base: &Path) -> Result<Self, ScopeError> {
+        if !base.is_absolute() {
+            return Err(ScopeError::BaseNotAbsolute(base.to_path_buf()));
+        }
+        if config.allow.is_empty() {
+            return Err(ScopeError::EmptyAllow);
+        }
+        let allow = config
+            .allow
+            .iter()
+            .map(|r| resolve_rule(r, base))
+            .collect::<Result<Vec<_>, _>>()?;
+        let deny = config
+            .deny
+            .iter()
+            .map(|r| resolve_rule(r, base))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self { allow, deny })
     }
 
-    /// The root directory of this scope.
-    pub fn root(&self) -> &Path {
-        &self.root
+    /// Convenience constructor for tests and simple setups: a single
+    /// recursive `allow(Write)` rule rooted at `root`.
+    pub fn writable(root: impl AsRef<Path>) -> std::io::Result<Self> {
+        let root = root.as_ref().canonicalize()?;
+        Ok(Self {
+            allow: vec![ResolvedRule {
+                target: root,
+                permission: Permission::Write,
+                recursive: true,
+            }],
+            deny: Vec::new(),
+        })
     }
 
-    /// Check whether `path` falls within this scope.
+    /// Effective permission for `path`.
     ///
-    /// The path is canonicalized before comparison. If the path does not
-    /// exist yet (typical for new-file writes), the closest existing
-    /// ancestor is canonicalized and checked, so deep new directory
-    /// hierarchies inside the scope are also accepted.
-    pub fn contains(&self, path: &Path) -> bool {
-        let mut cur = path;
-        loop {
-            if let Ok(canonical) = cur.canonicalize() {
-                return canonical.starts_with(&self.root);
-            }
-            match cur.parent() {
-                Some(parent) if parent != cur => cur = parent,
-                _ => return false,
+    /// Returns `None` when `path` is outside every allow rule, or when
+    /// deny rules have knocked it below `Read`.
+    pub fn permission_at(&self, path: &Path) -> Option<Permission> {
+        let resolved = resolve_path(path)?;
+        let mut effective: Option<Permission> = None;
+        for rule in &self.allow {
+            if rule.matches(&resolved) {
+                effective = match effective {
+                    None => Some(rule.permission),
+                    Some(cur) => Some(cur.max(rule.permission)),
+                };
             }
         }
+        let mut effective = effective?;
+
+        // Deny: min(min_deny) dictates the cap. Effective level is capped
+        // strictly below that value, so deny(read) wipes access entirely.
+        let mut min_deny: Option<Permission> = None;
+        for rule in &self.deny {
+            if rule.matches(&resolved) {
+                min_deny = match min_deny {
+                    None => Some(rule.permission),
+                    Some(cur) => Some(cur.min(rule.permission)),
+                };
+            }
+        }
+        if let Some(cap) = min_deny {
+            match cap {
+                Permission::Read => return None,
+                Permission::Write => effective = effective.min(Permission::Read),
+            }
+        }
+        Some(effective)
+    }
+
+    /// Shorthand: `permission_at(path) >= Some(Read)`.
+    pub fn is_readable(&self, path: &Path) -> bool {
+        matches!(
+            self.permission_at(path),
+            Some(Permission::Read | Permission::Write)
+        )
+    }
+
+    /// Shorthand: `permission_at(path) == Some(Write)`.
+    pub fn is_writable(&self, path: &Path) -> bool {
+        matches!(self.permission_at(path), Some(Permission::Write))
+    }
+}
+
+impl ResolvedRule {
+    fn matches(&self, path: &Path) -> bool {
+        if self.recursive {
+            path.starts_with(&self.target)
+        } else {
+            path == self.target || path.parent() == Some(self.target.as_path())
+        }
+    }
+}
+
+fn resolve_rule(rule: &ScopeRule, base: &Path) -> Result<ResolvedRule, ScopeError> {
+    let joined = if rule.target.is_absolute() {
+        rule.target.clone()
+    } else {
+        base.join(&rule.target)
+    };
+    let target = resolve_path(&joined).ok_or_else(|| ScopeError::ResolveTarget {
+        path: rule.target.clone(),
+        source: std::io::Error::new(std::io::ErrorKind::Other, "could not absolutize target"),
+    })?;
+    Ok(ResolvedRule {
+        target,
+        permission: rule.permission,
+        recursive: rule.recursive,
+    })
+}
+
+/// Convert `path` to an absolute form suitable for prefix comparison.
+///
+/// Tries `canonicalize` on the full path first (resolves symlinks). If
+/// the path doesn't exist yet, climbs to the closest existing ancestor,
+/// canonicalizes it, then rejoins the missing tail. Returns `None` for
+/// relative inputs that have no existing ancestor to anchor against.
+fn resolve_path(path: &Path) -> Option<PathBuf> {
+    if !path.is_absolute() {
+        return None;
+    }
+    if let Ok(canonical) = path.canonicalize() {
+        return Some(canonical);
+    }
+    let mut tail: Vec<OsString> = Vec::new();
+    let mut cur = path.to_path_buf();
+    loop {
+        if let Ok(canonical) = cur.canonicalize() {
+            let mut out = canonical;
+            for segment in tail.iter().rev() {
+                out.push(segment);
+            }
+            return Some(out);
+        }
+        let name = cur.file_name()?.to_os_string();
+        tail.push(name);
+        let parent = cur.parent()?.to_path_buf();
+        if parent == cur {
+            return None;
+        }
+        cur = parent;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
     use tempfile::TempDir;
 
-    #[test]
-    fn contains_file_inside_scope() {
-        let dir = TempDir::new().unwrap();
-        let scope = Scope::new(dir.path()).unwrap();
-
-        let file = dir.path().join("test.txt");
-        fs::write(&file, "hello").unwrap();
-
-        assert!(scope.contains(&file));
+    fn allow_rule(target: &Path, permission: Permission) -> ScopeRule {
+        ScopeRule {
+            target: target.to_path_buf(),
+            permission,
+            recursive: true,
+        }
     }
 
     #[test]
-    fn rejects_file_outside_scope() {
+    fn writable_shortcut_permits_root() {
+        let dir = TempDir::new().unwrap();
+        let scope = Scope::writable(dir.path()).unwrap();
+        assert!(scope.is_writable(&dir.path().join("a.txt")));
+        assert!(scope.is_readable(&dir.path().join("a.txt")));
+    }
+
+    #[test]
+    fn writable_shortcut_rejects_outside() {
         let dir = TempDir::new().unwrap();
         let outside = TempDir::new().unwrap();
-        let scope = Scope::new(dir.path()).unwrap();
-
-        let file = outside.path().join("test.txt");
-        fs::write(&file, "hello").unwrap();
-
-        assert!(!scope.contains(&file));
+        let scope = Scope::writable(dir.path()).unwrap();
+        assert!(!scope.is_readable(&outside.path().join("x")));
     }
 
     #[test]
-    fn contains_new_file_in_existing_parent() {
+    fn allow_write_grants_read_and_write() {
         let dir = TempDir::new().unwrap();
-        let scope = Scope::new(dir.path()).unwrap();
-
-        // File doesn't exist yet, but parent dir is inside scope
-        let new_file = dir.path().join("new.txt");
-        assert!(scope.contains(&new_file));
+        let cfg = ScopeConfig {
+            allow: vec![allow_rule(dir.path(), Permission::Write)],
+            deny: Vec::new(),
+        };
+        let scope = Scope::from_config(&cfg, dir.path()).unwrap();
+        let f = dir.path().join("a.txt");
+        assert_eq!(scope.permission_at(&f), Some(Permission::Write));
     }
 
     #[test]
-    fn contains_nested_directory() {
+    fn allow_read_only() {
         let dir = TempDir::new().unwrap();
-        let nested = dir.path().join("a/b/c");
-        fs::create_dir_all(&nested).unwrap();
-        let scope = Scope::new(dir.path()).unwrap();
+        let cfg = ScopeConfig {
+            allow: vec![allow_rule(dir.path(), Permission::Read)],
+            deny: Vec::new(),
+        };
+        let scope = Scope::from_config(&cfg, dir.path()).unwrap();
+        let f = dir.path().join("a.txt");
+        assert_eq!(scope.permission_at(&f), Some(Permission::Read));
+        assert!(scope.is_readable(&f));
+        assert!(!scope.is_writable(&f));
+    }
 
-        let file = nested.join("test.txt");
-        assert!(scope.contains(&file));
+    #[test]
+    fn deny_write_downgrades_to_read() {
+        let dir = TempDir::new().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let cfg = ScopeConfig {
+            allow: vec![allow_rule(dir.path(), Permission::Write)],
+            deny: vec![allow_rule(&sub, Permission::Write)],
+        };
+        let scope = Scope::from_config(&cfg, dir.path()).unwrap();
+        let f = sub.join("a.txt");
+        assert_eq!(scope.permission_at(&f), Some(Permission::Read));
+        // outside the deny, still writable.
+        assert_eq!(
+            scope.permission_at(&dir.path().join("top.txt")),
+            Some(Permission::Write)
+        );
+    }
+
+    #[test]
+    fn deny_read_removes_access_entirely() {
+        let dir = TempDir::new().unwrap();
+        let secret = dir.path().join("secret.txt");
+        std::fs::write(&secret, b"").unwrap();
+        let cfg = ScopeConfig {
+            allow: vec![allow_rule(dir.path(), Permission::Write)],
+            deny: vec![allow_rule(&secret, Permission::Read)],
+        };
+        let scope = Scope::from_config(&cfg, dir.path()).unwrap();
+        assert_eq!(scope.permission_at(&secret), None);
+    }
+
+    #[test]
+    fn multiple_allow_rules_take_max() {
+        let dir = TempDir::new().unwrap();
+        let docs = dir.path().join("docs");
+        std::fs::create_dir(&docs).unwrap();
+        let cfg = ScopeConfig {
+            allow: vec![
+                allow_rule(dir.path(), Permission::Read),
+                allow_rule(&docs, Permission::Write),
+            ],
+            deny: Vec::new(),
+        };
+        let scope = Scope::from_config(&cfg, dir.path()).unwrap();
+        assert_eq!(
+            scope.permission_at(&dir.path().join("a.txt")),
+            Some(Permission::Read)
+        );
+        assert_eq!(
+            scope.permission_at(&docs.join("a.txt")),
+            Some(Permission::Write)
+        );
+    }
+
+    #[test]
+    fn non_recursive_rule_matches_direct_children_only() {
+        let dir = TempDir::new().unwrap();
+        let nested = dir.path().join("a/b");
+        std::fs::create_dir_all(&nested).unwrap();
+        let cfg = ScopeConfig {
+            allow: vec![ScopeRule {
+                target: dir.path().to_path_buf(),
+                permission: Permission::Write,
+                recursive: false,
+            }],
+            deny: Vec::new(),
+        };
+        let scope = Scope::from_config(&cfg, dir.path()).unwrap();
+        assert!(scope.is_writable(&dir.path().join("top.txt")));
+        assert!(!scope.is_writable(&nested.join("deep.txt")));
+    }
+
+    #[test]
+    fn empty_allow_rejected() {
+        let dir = TempDir::new().unwrap();
+        let cfg = ScopeConfig {
+            allow: Vec::new(),
+            deny: Vec::new(),
+        };
+        let err = Scope::from_config(&cfg, dir.path()).unwrap_err();
+        assert!(matches!(err, ScopeError::EmptyAllow));
     }
 
     #[test]
     fn rejects_traversal_attack() {
         let dir = TempDir::new().unwrap();
-        let scope = Scope::new(dir.path()).unwrap();
-
+        let scope = Scope::writable(dir.path()).unwrap();
         let traversal = dir.path().join("../../../etc/passwd");
-        assert!(!scope.contains(&traversal));
+        assert!(!scope.is_readable(&traversal));
     }
 
     #[test]
-    fn contains_deeply_nested_new_path() {
+    fn resolves_new_nested_file_inside_scope() {
         let dir = TempDir::new().unwrap();
-        let scope = Scope::new(dir.path()).unwrap();
-
-        // Neither the file nor any of its ancestors (a, a/b, a/b/c) exist yet
-        // under the scope; contains should still accept because the closest
-        // existing ancestor (the scope root) is inside the scope.
+        let scope = Scope::writable(dir.path()).unwrap();
         let deep = dir.path().join("a/b/c/new.txt");
-        assert!(scope.contains(&deep));
+        assert!(scope.is_writable(&deep));
     }
 }

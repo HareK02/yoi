@@ -74,6 +74,7 @@ fn simple_text_events() -> Vec<LlmEvent> {
 const MANIFEST_TOML: &str = r#"
 [pod]
 name = "test-pod"
+pwd = "./"
 
 [provider]
 kind = "anthropic"
@@ -81,16 +82,28 @@ model = "test-model"
 
 [worker]
 max_tokens = 100
+
+[[scope.allow]]
+target = "./"
+permission = "write"
 "#;
 
 async fn make_pod(client: MockClient) -> Pod<MockClient, FsStore> {
     let manifest = PodManifest::from_toml(MANIFEST_TOML).unwrap();
-    let tmp = tempfile::tempdir().unwrap();
-    let store = FsStore::new(tmp.path()).await.unwrap();
-    // Leak tempdir to keep it alive
-    std::mem::forget(tmp);
+    let store_tmp = tempfile::tempdir().unwrap();
+    let store = FsStore::new(store_tmp.path()).await.unwrap();
+    std::mem::forget(store_tmp);
+
+    // Separate tempdir to serve as the Pod's pwd/scope — these tests
+    // exercise the controller via a mock client and never touch the
+    // filesystem through tools, so a throwaway writable dir is enough.
+    let pwd_tmp = tempfile::tempdir().unwrap();
+    let pwd = pwd_tmp.path().to_path_buf();
+    let scope = manifest::Scope::writable(&pwd).unwrap();
+    std::mem::forget(pwd_tmp);
+
     let worker = Worker::new(client);
-    Pod::new(manifest, worker, store, None).await.unwrap()
+    Pod::new(manifest, worker, store, pwd, scope).await.unwrap()
 }
 
 use pod::PodHandle;

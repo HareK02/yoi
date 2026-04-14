@@ -16,6 +16,9 @@ pub enum ToolsError {
     #[error("path is outside allowed scope: {}", .0.display())]
     OutOfScope(PathBuf),
 
+    #[error("path is read-only in this scope: {}", .0.display())]
+    ReadOnly(PathBuf),
+
     #[error("path is a directory: {}", .0.display())]
     IsDirectory(PathBuf),
 
@@ -70,6 +73,7 @@ impl From<ToolsError> for ToolError {
         match err {
             RelativePath(_)
             | OutOfScope(_)
+            | ReadOnly(_)
             | IsDirectory(_)
             | NotRead(_)
             | ExternallyModified(_)

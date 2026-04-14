@@ -137,7 +137,10 @@ mod tests {
 
     fn setup() -> (TempDir, ScopedFs, Tracker) {
         let dir = TempDir::new().unwrap();
-        let fs = ScopedFs::new(Scope::new(dir.path()).unwrap());
+        let fs = ScopedFs::new(
+            Scope::writable(dir.path()).unwrap(),
+            dir.path().to_path_buf(),
+        );
         (dir, fs, Tracker::new())
     }
 

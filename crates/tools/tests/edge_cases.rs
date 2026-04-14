@@ -29,7 +29,10 @@ impl Registry {
 
 fn setup() -> (TempDir, Registry) {
     let dir = TempDir::new().unwrap();
-    let fs = ScopedFs::new(Scope::new(dir.path()).unwrap());
+    let fs = ScopedFs::new(
+        Scope::writable(dir.path()).unwrap(),
+        dir.path().to_path_buf(),
+    );
     let tracker = Tracker::new();
     (dir, Registry::new(builtin_tools(fs, tracker)))
 }
@@ -76,14 +79,19 @@ async fn symlink_to_outside_scope_is_rejected_for_write() {
     let link = dir.path().join("linked.txt");
     symlink(&outside_target, &link).unwrap();
 
-    // Read tool must work against the symlink (read is unrestricted).
+    // Read through the symlink must be rejected because the resolved
+    // target sits outside the scope.
     let read = reg.get("Read");
-    read.execute(&json!({ "file_path": link.to_str().unwrap() }).to_string())
+    let read_err = read
+        .execute(&json!({ "file_path": link.to_str().unwrap() }).to_string())
         .await
-        .unwrap();
+        .unwrap_err();
+    assert!(
+        format!("{read_err}").contains("outside allowed scope"),
+        "symlink read escape not rejected: {read_err}"
+    );
 
-    // Write through the symlink must be rejected because canonicalization
-    // resolves it to outside the scope.
+    // Write through the symlink must be rejected for the same reason.
     let write = reg.get("Write");
     let err = write
         .execute(

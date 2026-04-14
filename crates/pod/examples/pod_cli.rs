@@ -17,6 +17,7 @@ use session_store::FsStore;
 const MANIFEST_TOML: &str = r#"
 [pod]
 name = "hello-pod"
+pwd = "./"
 
 [provider]
 kind = "anthropic"
@@ -25,6 +26,10 @@ model = "claude-sonnet-4-20250514"
 [worker]
 system_prompt = "You are a concise assistant. Reply in one or two sentences."
 max_tokens = 256
+
+[[scope.allow]]
+target = "./"
+permission = "write"
 "#;
 
 #[tokio::main]
@@ -40,7 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store = FsStore::new(tmp.path()).await?;
 
     // 3. Build the Pod from manifest
-    let mut pod = Pod::from_manifest(manifest, store, None, None).await?;
+    let mut pod = Pod::from_manifest(manifest, store, None).await?;
     println!("Session: {}", pod.session_id());
 
     // 4. Run a prompt

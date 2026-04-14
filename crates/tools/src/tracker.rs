@@ -25,10 +25,11 @@
 //! the Pod wires them together when registering builtin tools.
 //!
 //! ```no_run
+//! # use std::path::PathBuf;
 //! # use manifest::Scope;
 //! # use tools::{ScopedFs, Tracker, builtin_tools};
-//! let scope = Scope::new("/workspace").unwrap();
-//! let fs = ScopedFs::new(scope);   // pod lifetime
+//! let scope = Scope::writable("/workspace").unwrap();
+//! let fs = ScopedFs::new(scope, PathBuf::from("/workspace")); // pod lifetime
 //! let tracker = Tracker::new();    // session lifetime
 //! let defs = builtin_tools(fs, tracker);
 //! ```

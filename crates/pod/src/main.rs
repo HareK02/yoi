@@ -70,23 +70,11 @@ async fn main() -> ExitCode {
         }
     };
 
-    // Build scope from manifest
-    let scope = match manifest.scope.as_ref() {
-        Some(sc) => match manifest::Scope::new(&sc.root) {
-            Ok(s) => Some(s),
-            Err(e) => {
-                eprintln!("error: invalid scope root {:?}: {e}", sc.root);
-                return ExitCode::FAILURE;
-            }
-        },
-        None => None,
-    };
-
-    // Build the Pod
+    // Build the Pod (pwd/scope derived from manifest + manifest_dir).
     let manifest_dir = std::fs::canonicalize(&cli.manifest)
         .ok()
         .and_then(|p| p.parent().map(Path::to_path_buf));
-    let pod = match Pod::from_manifest(manifest, store, scope, manifest_dir).await {
+    let pod = match Pod::from_manifest(manifest, store, manifest_dir).await {
         Ok(p) => p,
         Err(e) => {
             eprintln!("error: failed to create pod: {e}");

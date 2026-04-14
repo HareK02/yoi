@@ -83,9 +83,10 @@ impl PodController {
         // Keep the server alive by moving it into the controller task
         // (it will be dropped when the task ends)
 
-        // Grab the scope before the mutable borrow of the worker so we can
-        // build a `ScopedFs` for the builtin tools. `Scope` is cheap to clone.
-        let scope_for_tools = pod.scope().cloned();
+        // Grab the scope/pwd before the mutable borrow of the worker so we
+        // can build a `ScopedFs` for the builtin tools.
+        let scope_for_tools = pod.scope().clone();
+        let pwd_for_tools = pod.pwd().to_path_buf();
 
         // Register event bridge callbacks on the worker
         {
@@ -161,21 +162,17 @@ impl PodController {
             });
 
             // Register the builtin file-manipulation tools (Read / Write /
-            // Edit / Glob / Grep) when the manifest declares a scope.
-            //
-            // `ScopedFs` carries the pod-lifetime write boundary (derived
-            // from the manifest scope). `Tracker` is session-scoped —
-            // a fresh instance per controller spawn ensures state from a
-            // previous process lifetime cannot be reused after a resume.
-            // The tracker is also handed to the Pod itself so Pod-level
-            // operations (e.g. context compaction) can ask which files
-            // the agent has been touching.
-            if let Some(scope) = scope_for_tools {
-                let fs = tools::ScopedFs::new(scope);
-                let tracker = tools::Tracker::new();
-                worker.register_tools(tools::builtin_tools(fs, tracker.clone()));
-                pod.attach_tracker(tracker);
-            }
+            // Edit / Glob / Grep). `ScopedFs` carries the pod-lifetime
+            // scope/pwd; `Tracker` is session-scoped — a fresh instance per
+            // controller spawn ensures state from a previous process
+            // lifetime cannot be reused after a resume. The tracker is
+            // also handed to the Pod itself so Pod-level operations (e.g.
+            // context compaction) can ask which files the agent has been
+            // touching.
+            let fs = tools::ScopedFs::new(scope_for_tools, pwd_for_tools);
+            let tracker = tools::Tracker::new();
+            worker.register_tools(tools::builtin_tools(fs, tracker.clone()));
+            pod.attach_tracker(tracker);
         }
 
         // Clone cancel sender before moving pod
