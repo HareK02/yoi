@@ -6,3 +6,8 @@
 - [ ] Protocol の設計 → [tickets/protocol-design.md](tickets/protocol-design.md)
 - [ ] パーミッション: パターンベースのツール実行制御 → [tickets/permission-extension-point.md](tickets/permission-extension-point.md)
 - [ ] AGENTS.md の取り込み → [tickets/agents-md-ingestion.md](tickets/agents-md-ingestion.md)
+- [ ] TUI 拡充
+  - [ ] 通知チャネル (Warn/Error 可視化) → [tickets/tui-notification-channel.md](tickets/tui-notification-channel.md)
+  - [ ] 空 Pod 起動時の Greeting カード → [tickets/tui-greeting-card.md](tickets/tui-greeting-card.md)
+  - [ ] Pod の明示的 shutdown → [tickets/tui-pod-shutdown.md](tickets/tui-pod-shutdown.md)
+  - [ ] 新しい Pod を spawn する UI の設計 → [tickets/tui-pod-spawn-ui.md](tickets/tui-pod-spawn-ui.md)

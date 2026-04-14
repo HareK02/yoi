@@ -13,6 +13,7 @@ use tracing::{info, warn};
 
 use manifest::{PodManifest, Scope, ScopeError, WorkerManifest};
 
+use crate::agents_md::read_agents_md;
 use crate::compact_interceptor::CompactInterceptor;
 use crate::compact_state::CompactState;
 use crate::hook::{
@@ -402,12 +403,16 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             .into_iter()
             .map(|d| d.name)
             .collect();
+        let mut files = std::collections::BTreeMap::new();
+        if let Some(body) = read_agents_md(&self.pwd) {
+            files.insert("agents_md".to_string(), body);
+        }
         let ctx = SystemPromptContext {
             now: chrono::Utc::now(),
             cwd: &self.pwd,
             scope: &self.scope,
             tool_names,
-            files: std::collections::BTreeMap::new(),
+            files,
         };
         let rendered = template
             .render(&ctx)

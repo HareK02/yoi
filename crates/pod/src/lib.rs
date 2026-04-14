@@ -4,6 +4,7 @@ pub mod runtime_dir;
 pub mod shared_state;
 pub mod socket_server;
 
+mod agents_md;
 mod compact_interceptor;
 mod compact_state;
 mod hook_interceptor;

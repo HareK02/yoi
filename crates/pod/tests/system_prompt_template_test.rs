@@ -210,6 +210,74 @@ async fn materialise_runs_only_once_across_turns() {
 }
 
 #[tokio::test]
+async fn agents_md_is_injected_when_present() {
+    let client = MockClient::new(vec![single_text_events("ok")]);
+    let mut pod = make_pod_with_template(
+        Some(
+            "{% if files.agents_md is defined %}AGENTS:{{ files.agents_md }}\
+             {% else %}NONE{% endif %}",
+        ),
+        client,
+    )
+    .await
+    .unwrap();
+    std::fs::write(pod.pwd().join("AGENTS.md"), "# project rules\nbe kind").unwrap();
+
+    pod.run("hi").await.unwrap();
+    let rendered = pod.worker().get_system_prompt().unwrap().to_string();
+    assert_eq!(rendered, "AGENTS:# project rules\nbe kind");
+}
+
+#[tokio::test]
+async fn agents_md_absent_leaves_key_undefined() {
+    let client = MockClient::new(vec![single_text_events("ok")]);
+    let mut pod = make_pod_with_template(
+        Some("{% if files.agents_md is defined %}HAS{% else %}NONE{% endif %}"),
+        client,
+    )
+    .await
+    .unwrap();
+    // No AGENTS.md written.
+    pod.run("hi").await.unwrap();
+    assert_eq!(pod.worker().get_system_prompt().unwrap(), "NONE");
+}
+
+#[tokio::test]
+async fn agents_md_not_reread_after_compact() {
+    // Render AGENTS.md on the first turn, then mutate the file on disk
+    // and compact. The post-compact prompt must still reflect the
+    // original content (template re-rendering is forbidden).
+    let client = MockClient::new(vec![
+        single_text_events("a"),
+        single_text_events("b"),
+        single_text_events("summary"),
+        single_text_events("c"),
+    ]);
+    let mut pod = make_pod_with_template(
+        Some("{{ files.agents_md }}"),
+        client,
+    )
+    .await
+    .unwrap();
+    let agents_path = pod.pwd().join("AGENTS.md");
+    std::fs::write(&agents_path, "original").unwrap();
+
+    pod.run("first").await.unwrap();
+    let before = pod.worker().get_system_prompt().unwrap().to_string();
+    assert_eq!(before, "original");
+    pod.run("second").await.unwrap();
+
+    // Mutate the file after the first turn — must not affect the cached
+    // system prompt either on a subsequent turn or across compaction.
+    std::fs::write(&agents_path, "mutated").unwrap();
+    pod.compact(1).await.unwrap();
+    assert_eq!(pod.worker().get_system_prompt().unwrap(), "original");
+
+    pod.run("third").await.unwrap();
+    assert_eq!(pod.worker().get_system_prompt().unwrap(), "original");
+}
+
+#[tokio::test]
 async fn compact_preserves_system_prompt() {
     // Three user turns, then compact with retained_turns=1. The new
     // compacted session must carry the same rendered system prompt and
