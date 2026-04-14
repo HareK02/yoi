@@ -130,6 +130,59 @@ impl Scope {
     pub fn is_writable(&self, path: &Path) -> bool {
         matches!(self.permission_at(path), Some(Permission::Write))
     }
+
+    /// Iterate over absolute paths granted at least `Read` by an allow
+    /// rule, preserving declaration order. Does not account for deny
+    /// rules, which only cap effective permission at query time.
+    pub fn readable_paths(&self) -> impl Iterator<Item = &Path> {
+        self.allow.iter().map(|r| r.target.as_path())
+    }
+
+    /// Iterate over absolute paths granted `Write` by an allow rule.
+    /// Subset of [`readable_paths`](Self::readable_paths).
+    pub fn writable_paths(&self) -> impl Iterator<Item = &Path> {
+        self.allow
+            .iter()
+            .filter(|r| r.permission == Permission::Write)
+            .map(|r| r.target.as_path())
+    }
+
+    /// Human-readable grouping of allow rules, suitable for embedding in
+    /// LLM system prompts. Deny rules are intentionally omitted — they
+    /// only cap effective permission and surface them would mislead the
+    /// reader about what paths are accessible.
+    ///
+    /// ```text
+    /// Readable:
+    ///   - /abs/path1
+    /// Writable:
+    ///   - /abs/path2
+    /// ```
+    pub fn summary(&self) -> String {
+        let mut out = String::new();
+        let readable: Vec<_> = self.readable_paths().collect();
+        if !readable.is_empty() {
+            out.push_str("Readable:\n");
+            for p in &readable {
+                out.push_str("  - ");
+                out.push_str(&p.display().to_string());
+                out.push('\n');
+            }
+        }
+        let writable: Vec<_> = self.writable_paths().collect();
+        if !writable.is_empty() {
+            out.push_str("Writable:\n");
+            for p in &writable {
+                out.push_str("  - ");
+                out.push_str(&p.display().to_string());
+                out.push('\n');
+            }
+        }
+        if out.ends_with('\n') {
+            out.pop();
+        }
+        out
+    }
 }
 
 impl ResolvedRule {
@@ -337,6 +390,61 @@ mod tests {
         let scope = Scope::writable(dir.path()).unwrap();
         let traversal = dir.path().join("../../../etc/passwd");
         assert!(!scope.is_readable(&traversal));
+    }
+
+    #[test]
+    fn summary_lists_readable_and_writable() {
+        let dir = TempDir::new().unwrap();
+        let docs = dir.path().join("docs");
+        std::fs::create_dir(&docs).unwrap();
+        let cfg = ScopeConfig {
+            allow: vec![
+                allow_rule(dir.path(), Permission::Read),
+                allow_rule(&docs, Permission::Write),
+            ],
+            deny: Vec::new(),
+        };
+        let scope = Scope::from_config(&cfg, dir.path()).unwrap();
+        let summary = scope.summary();
+        assert!(summary.contains("Readable:"));
+        assert!(summary.contains("Writable:"));
+        assert!(summary.contains(&dir.path().canonicalize().unwrap().display().to_string()));
+        assert!(summary.contains(&docs.canonicalize().unwrap().display().to_string()));
+        assert!(!summary.ends_with('\n'));
+    }
+
+    #[test]
+    fn summary_excludes_deny_rules() {
+        let dir = TempDir::new().unwrap();
+        let secret = dir.path().join("secret");
+        std::fs::create_dir(&secret).unwrap();
+        let cfg = ScopeConfig {
+            allow: vec![allow_rule(dir.path(), Permission::Write)],
+            deny: vec![allow_rule(&secret, Permission::Read)],
+        };
+        let scope = Scope::from_config(&cfg, dir.path()).unwrap();
+        let summary = scope.summary();
+        assert!(!summary.contains("secret"));
+    }
+
+    #[test]
+    fn readable_paths_includes_writable() {
+        let dir = TempDir::new().unwrap();
+        let docs = dir.path().join("docs");
+        std::fs::create_dir(&docs).unwrap();
+        let cfg = ScopeConfig {
+            allow: vec![
+                allow_rule(dir.path(), Permission::Read),
+                allow_rule(&docs, Permission::Write),
+            ],
+            deny: Vec::new(),
+        };
+        let scope = Scope::from_config(&cfg, dir.path()).unwrap();
+        let readable: Vec<_> = scope.readable_paths().collect();
+        let writable: Vec<_> = scope.writable_paths().collect();
+        assert_eq!(readable.len(), 2);
+        assert_eq!(writable.len(), 1);
+        assert!(writable.iter().all(|w| readable.contains(w)));
     }
 
     #[test]

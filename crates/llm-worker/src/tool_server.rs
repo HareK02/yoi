@@ -72,12 +72,18 @@ impl ToolServerHandle {
 
     /// Execute all pending factories and register the resulting tools.
     ///
+    /// Called implicitly by `Worker::lock()` before the first turn.
+    /// Exposed as `pub` so higher layers (e.g. Pod) can force-materialise
+    /// tools earlier — for example when building a system-prompt template
+    /// context that needs the list of registered tool names. Redundant
+    /// calls are no-ops.
+    ///
     /// # Panics
     ///
     /// Panics if any factory produces a tool whose name collides with
     /// an already-registered tool. Duplicate names are a programming
     /// error and should be caught during development.
-    pub(crate) fn flush_pending(&self) {
+    pub fn flush_pending(&self) {
         let pending: Vec<_> = {
             let mut guard = self.pending.lock().unwrap_or_else(|e| e.into_inner());
             std::mem::take(&mut *guard)

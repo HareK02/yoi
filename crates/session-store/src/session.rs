@@ -25,6 +25,20 @@ pub async fn create_session(
     state: SessionStartState<'_>,
 ) -> Result<(SessionId, EntryHash), StoreError> {
     let session_id = crate::new_session_id();
+    let hash = create_session_with_id(store, session_id, state).await?;
+    Ok((session_id, hash))
+}
+
+/// Write a fresh `SessionStart` entry using a pre-generated session ID.
+///
+/// Used by callers that need to reserve a session ID synchronously but
+/// defer the initial log append (e.g. Pod, which resolves a templated
+/// system prompt only at first turn). Returns the resulting head hash.
+pub async fn create_session_with_id(
+    store: &impl Store,
+    session_id: SessionId,
+    state: SessionStartState<'_>,
+) -> Result<EntryHash, StoreError> {
     let entry = LogEntry::SessionStart {
         ts: session_log::now_millis(),
         system_prompt: state.system_prompt.map(String::from),
@@ -40,7 +54,7 @@ pub async fn create_session(
         entry,
     };
     store.append(session_id, &hashed_entry).await?;
-    Ok((session_id, hash))
+    Ok(hash)
 }
 
 /// Create a compacted session from an existing one.

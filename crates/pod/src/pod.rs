@@ -20,6 +20,7 @@ use crate::hook::{
     PreToolCall,
 };
 use crate::hook_interceptor::HookInterceptor;
+use crate::system_prompt::{SystemPromptContext, SystemPromptError, SystemPromptTemplate};
 use crate::usage_tracker::UsageTracker;
 use async_trait::async_trait;
 use llm_worker::interceptor::PreRequestAction;
@@ -91,6 +92,10 @@ pub struct Pod<C: LlmClient, St: Store> {
     /// tools so that Pod-owned operations (e.g. compaction) can consult
     /// the recency of touched files.
     tracker: Option<tools::Tracker>,
+    /// Parsed system-prompt template awaiting first-turn materialisation.
+    /// `Some` until `ensure_system_prompt_materialized` renders it once,
+    /// then `None` forever — including after compaction.
+    system_prompt_template: Option<SystemPromptTemplate>,
 }
 
 impl<C: LlmClient, St: Store> Pod<C, St> {
@@ -106,18 +111,16 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         pwd: PathBuf,
         scope: Scope,
     ) -> Result<Self, PodError> {
-        let state = SessionStartState {
-            system_prompt: worker.get_system_prompt(),
-            config: worker.request_config(),
-            history: worker.history(),
-        };
-        let (session_id, head_hash) = session_store::create_session(&store, state).await?;
+        // Session creation is deferred to `ensure_session_head` at first
+        // run so a later-installed system-prompt template (see
+        // `set_system_prompt_template`) can be captured by `SessionStart`.
+        let session_id = session_store::new_session_id();
         let mut pod = Self {
             manifest,
             worker: Some(worker),
             store,
             session_id,
-            head_hash: Some(head_hash),
+            head_hash: None,
             pwd,
             scope,
             hook_builder: HookRegistryBuilder::new(),
@@ -127,9 +130,18 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             usage_tracker: Arc::new(UsageTracker::new()),
             usage_history: Arc::new(Mutex::new(Vec::<UsageRecord>::new())),
             tracker: None,
+            system_prompt_template: None,
         };
         pod.apply_prune_from_manifest();
         Ok(pod)
+    }
+
+    /// Install a parsed system-prompt template that will be rendered
+    /// exactly once, immediately before the first LLM turn. Mirrors the
+    /// path used by `Pod::from_manifest` and is exposed for tests and
+    /// other callers that build a Pod without going through a manifest.
+    pub fn set_system_prompt_template(&mut self, template: SystemPromptTemplate) {
+        self.system_prompt_template = Some(template);
     }
 
     /// Restore a Pod from a persisted session.
@@ -166,6 +178,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             usage_tracker: Arc::new(UsageTracker::new()),
             usage_history: Arc::new(Mutex::new(state.usage_history)),
             tracker: None,
+            system_prompt_template: None,
         };
         pod.apply_prune_from_manifest();
         Ok(pod)
@@ -364,6 +377,40 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         }
     }
 
+    /// Render the manifest-supplied system-prompt template exactly once,
+    /// just before the first LLM turn, and hand the resulting string to
+    /// the Worker via `set_system_prompt`. Subsequent invocations are
+    /// no-ops: the template field is consumed with `Option::take()`, so
+    /// the rendered value persists across all later turns and compaction.
+    fn ensure_system_prompt_materialized(&mut self) -> Result<(), PodError> {
+        let Some(template) = self.system_prompt_template.take() else {
+            return Ok(());
+        };
+        let worker = self.worker.as_mut().expect("worker present");
+        // Materialise any pending tool factories so the template sees the
+        // full list of tool names. Redundant with the flush inside
+        // `Worker::lock()`; safe because `flush_pending` is idempotent.
+        worker.tool_server_handle().flush_pending();
+        let tool_names: Vec<String> = worker
+            .tool_server_handle()
+            .tool_definitions_sorted()
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
+        let ctx = SystemPromptContext {
+            now: chrono::Utc::now(),
+            cwd: &self.pwd,
+            scope: &self.scope,
+            tool_names,
+            files: std::collections::BTreeMap::new(),
+        };
+        let rendered = template
+            .render(&ctx)
+            .map_err(|source| PodError::SystemPromptRender { source })?;
+        worker.set_system_prompt(rendered);
+        Ok(())
+    }
+
     /// Send user input and run until the LLM turn completes.
     ///
     /// If the between-turns compaction threshold is exceeded mid-run,
@@ -371,6 +418,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     /// automatically.
     pub async fn run(&mut self, input: impl Into<String>) -> Result<PodRunResult, PodError> {
         self.ensure_interceptor_installed();
+        self.ensure_system_prompt_materialized()?;
         self.ensure_session_head().await?;
 
         let history_before = self.worker.as_ref().unwrap().history().len();
@@ -387,6 +435,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     /// Resume from a paused state.
     pub async fn resume(&mut self) -> Result<PodRunResult, PodError> {
         self.ensure_interceptor_installed();
+        self.ensure_system_prompt_materialized()?;
         self.ensure_session_head().await?;
 
         let history_before = self.worker.as_ref().unwrap().history().len();
@@ -400,18 +449,32 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         self.handle_worker_result(result, history_before).await
     }
 
-    /// Ensure session head exists (fork if needed).
+    /// Ensure the session exists and its head still matches ours.
+    ///
+    /// On the first call for a Pod built via `from_manifest`, the session
+    /// has not been written to the store yet — this is when we append the
+    /// initial `SessionStart` entry, carrying the system prompt that
+    /// `ensure_system_prompt_materialized` has just rendered. Subsequent
+    /// calls fall through to `ensure_head_or_fork`, which auto-forks when
+    /// another writer has advanced the store head behind our back.
     async fn ensure_session_head(&mut self) -> Result<(), PodError> {
         let w = self.worker.as_ref().unwrap();
+        let state = SessionStartState {
+            system_prompt: w.get_system_prompt(),
+            config: w.request_config(),
+            history: w.history(),
+        };
+        if self.head_hash.is_none() {
+            let hash =
+                session_store::create_session_with_id(&self.store, self.session_id, state).await?;
+            self.head_hash = Some(hash);
+            return Ok(());
+        }
         session_store::ensure_head_or_fork(
             &self.store,
             &mut self.session_id,
             &mut self.head_hash,
-            SessionStartState {
-                system_prompt: w.get_system_prompt(),
-                config: w.request_config(),
-                history: w.history(),
-            },
+            state,
         )
         .await?;
         Ok(())
@@ -725,18 +788,28 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
         let mut worker = Worker::new(client);
         apply_worker_manifest(&mut worker, &manifest.worker);
 
-        let state = SessionStartState {
-            system_prompt: worker.get_system_prompt(),
-            config: worker.request_config(),
-            history: worker.history(),
+        // Parse the system-prompt template eagerly (syntax check only).
+        // Rendering is deferred to `ensure_system_prompt_materialized`
+        // at first turn so implementation runtime values (date, tools,
+        // scope summary, ...) can be injected.
+        let system_prompt_template = match manifest.worker.system_prompt.as_deref() {
+            Some(source) => Some(
+                SystemPromptTemplate::parse(source)
+                    .map_err(|source| PodError::InvalidSystemPromptTemplate { source })?,
+            ),
+            None => None,
         };
-        let (session_id, head_hash) = session_store::create_session(&store, state).await?;
+
+        // Session creation is deferred to the first run (see
+        // `ensure_session_head`) so the SessionStart entry can capture
+        // the rendered system prompt, not the raw template source.
+        let session_id = session_store::new_session_id();
         let mut pod = Self {
             manifest,
             worker: Some(worker),
             store,
             session_id,
-            head_hash: Some(head_hash),
+            head_hash: None,
             pwd,
             scope,
             hook_builder: HookRegistryBuilder::new(),
@@ -746,6 +819,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             usage_tracker: Arc::new(UsageTracker::new()),
             usage_history: Arc::new(Mutex::new(Vec::new())),
             tracker: None,
+            system_prompt_template,
         };
         pod.apply_prune_from_manifest();
         Ok(pod)
@@ -753,10 +827,11 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
 }
 
 /// Apply worker-level manifest settings to a Worker.
+///
+/// Note: `system_prompt` is intentionally not applied here. It is a
+/// minijinja template that is parsed by `Pod::from_manifest` and
+/// rendered once at first turn in `ensure_system_prompt_materialized`.
 pub fn apply_worker_manifest<C: LlmClient>(worker: &mut Worker<C>, wm: &WorkerManifest) {
-    if let Some(ref prompt) = wm.system_prompt {
-        worker.set_system_prompt(prompt);
-    }
     let mut config = RequestConfig::new();
     if let Some(max_tokens) = wm.max_tokens {
         config.max_tokens = Some(max_tokens);
@@ -856,6 +931,18 @@ pub enum PodError {
 
     #[error("compaction thrash: context still exceeds threshold immediately after compact")]
     CompactThrash,
+
+    #[error("invalid system prompt template: {source}")]
+    InvalidSystemPromptTemplate {
+        #[source]
+        source: SystemPromptError,
+    },
+
+    #[error("failed to render system prompt template: {source}")]
+    SystemPromptRender {
+        #[source]
+        source: SystemPromptError,
+    },
 }
 
 /// Resolve the pwd declared in a manifest against `manifest_dir` (or the

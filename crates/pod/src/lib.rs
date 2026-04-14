@@ -9,6 +9,7 @@ mod compact_state;
 mod hook_interceptor;
 mod pod;
 mod prune;
+mod system_prompt;
 mod token_counter;
 mod usage_tracker;
 
@@ -23,3 +24,4 @@ pub use provider::{ProviderError, build_client};
 pub use runtime_dir::RuntimeDir;
 pub use shared_state::{PodSharedState, PodStatus};
 pub use socket_server::SocketServer;
+pub use system_prompt::{SystemPromptContext, SystemPromptError, SystemPromptTemplate};

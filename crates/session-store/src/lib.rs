@@ -35,9 +35,9 @@ pub mod store;
 pub use event_trace::TraceEntry;
 pub use fs_store::FsStore;
 pub use session::{
-    SessionStartState, create_compacted_session, create_session, ensure_head_or_fork, fork,
-    fork_at, restore, save_cache_locked, save_cache_unlocked, save_config_changed, save_delta,
-    save_outcome, save_turn_end, save_usage,
+    SessionStartState, create_compacted_session, create_session, create_session_with_id,
+    ensure_head_or_fork, fork, fork_at, restore, save_cache_locked, save_cache_unlocked,
+    save_config_changed, save_delta, save_outcome, save_turn_end, save_usage,
 };
 pub use session_log::{
     EntryHash, HashedEntry, LogEntry, Outcome, RestoredState, SessionOrigin, UsageRecord,

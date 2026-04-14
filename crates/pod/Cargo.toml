@@ -19,6 +19,8 @@ tokio = { version = "1.49", features = ["fs", "io-util", "macros", "net", "rt-mu
 toml = "1.1.2"
 tracing = "0.1.44"
 tools = { version = "0.1.0", path = "../tools" }
+minijinja = "2.19.0"
+chrono = "0.4.44"
 
 [dev-dependencies]
 async-trait = "0.1.89"
