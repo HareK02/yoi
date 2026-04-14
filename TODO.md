@@ -6,5 +6,4 @@
 - [ ] Compact の改善（要約品質 + 挙動詳細） → [tickets/compact-improvements.md](tickets/compact-improvements.md)
 - [ ] Protocol の設計 → [tickets/protocol-design.md](tickets/protocol-design.md)
 - [ ] パーミッション: パターンベースのツール実行制御 → [tickets/permission-extension-point.md](tickets/permission-extension-point.md)
-- [ ] システムプロンプトのテンプレート化 → [tickets/system-prompt-template.md](tickets/system-prompt-template.md)
 - [ ] AGENTS.md の取り込み → [tickets/agents-md-ingestion.md](tickets/agents-md-ingestion.md)

@@ -104,6 +104,11 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     /// Callers must pre-resolve `pwd` (absolute) and build a [`Scope`]
     /// — typically via [`Scope::from_config`] when coming from a
     /// manifest, or [`Scope::writable`] in tests.
+    ///
+    /// Note: this constructor does **not** parse `manifest.worker.system_prompt`
+    /// as a template. `Pod::from_manifest` is the production path for
+    /// templated prompts; callers of `Pod::new` that want a template
+    /// should parse it themselves and call [`set_system_prompt_template`].
     pub async fn new(
         manifest: PodManifest,
         worker: Worker<C>,
