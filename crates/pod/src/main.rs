@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
-use pod::{Pod, PodController, PodFactory};
+use pod::{Pod, PodController, PodFactory, PodManifestConfig, PodMetaConfig};
 use session_store::FsStore;
 
 #[derive(Parser)]
@@ -57,28 +57,17 @@ fn default_runtime_dir() -> Result<PathBuf, std::io::Error> {
     }
 }
 
-/// Turn CLI inputs into a single programmatic overlay TOML string,
-/// combining `--pwd` and `--overlay`. Returns `None` if neither flag
-/// is set.
-fn build_overlay_toml(pwd: Option<&PathBuf>, overlay: Option<&str>) -> Option<String> {
-    let mut parts: Vec<String> = Vec::new();
-    if let Some(pwd) = pwd {
-        // Canonicalize the pwd shorthand here so relative CLI arguments
-        // (e.g. `--pwd .`) turn into the absolute path required by the
-        // manifest cascade.
-        let absolute = std::fs::canonicalize(pwd).unwrap_or_else(|_| pwd.clone());
-        parts.push(format!(
-            "[pod]\npwd = \"{}\"\n",
-            absolute.display().to_string().replace('\\', "\\\\")
-        ));
-    }
-    if let Some(overlay) = overlay {
-        parts.push(overlay.to_string());
-    }
-    if parts.is_empty() {
-        None
-    } else {
-        Some(parts.join("\n"))
+/// Construct a programmatic overlay [`PodManifestConfig`] that carries
+/// `pod.pwd` derived from the `--pwd` shorthand. Relative CLI paths
+/// are canonicalized here so the cascade always sees an absolute path.
+fn pwd_overlay(pwd: &PathBuf) -> PodManifestConfig {
+    let absolute = std::fs::canonicalize(pwd).unwrap_or_else(|_| pwd.clone());
+    PodManifestConfig {
+        pod: PodMetaConfig {
+            pwd: Some(absolute),
+            ..Default::default()
+        },
+        ..Default::default()
     }
 }
 
@@ -103,9 +92,16 @@ async fn build_factory(cli: &Cli) -> Result<PodFactory, String> {
             .map_err(|e| format!("failed to auto-load project manifest: {e}"))?,
     };
 
-    if let Some(overlay) = build_overlay_toml(cli.pwd.as_ref(), cli.overlay.as_deref()) {
+    // `--pwd` goes in as a typed config so path strings never have to
+    // pass through TOML escaping. `--overlay` keeps its inline-TOML
+    // interface (that is its entire reason for existing). Both feed
+    // the same overlay slot and merge in call order.
+    if let Some(pwd) = cli.pwd.as_ref() {
+        factory = factory.with_overlay_config(pwd_overlay(pwd));
+    }
+    if let Some(overlay) = cli.overlay.as_deref() {
         factory = factory
-            .with_overlay_toml(&overlay)
+            .with_overlay_toml(overlay)
             .map_err(|e| format!("failed to parse overlay TOML: {e}"))?;
     }
 

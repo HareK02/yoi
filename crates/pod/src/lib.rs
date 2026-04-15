@@ -23,7 +23,9 @@ pub use controller::{PodController, PodHandle};
 pub use factory::{FactoryError, PodFactory};
 pub use notifier::Notifier;
 pub use hook::{Hook, HookEventKind, HookRegistryBuilder};
-pub use manifest::{PodManifest, PodManifestConfig, ProviderConfig, ProviderKind, Scope};
+pub use manifest::{
+    PodManifest, PodManifestConfig, PodMetaConfig, ProviderConfig, ProviderKind, Scope,
+};
 pub use pod::{Pod, PodError, PodRunResult, apply_worker_manifest};
 pub use prompt_loader::PromptLoader;
 pub use protocol::{ErrorCode, Event, Method, TurnResult};
