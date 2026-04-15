@@ -8,7 +8,6 @@
 - [ ] ネイティブ GUI クライアント MVP → [tickets/native-gui-mvp.md](tickets/native-gui-mvp.md)
 - [ ] Pod Factory: カスケード設定とプロンプト資産 → [tickets/pod-factory.md](tickets/pod-factory.md)
 - [ ] TUI 拡充
-  - [ ] 通知チャネル (Warn/Error 可視化) → [tickets/tui-notification-channel.md](tickets/tui-notification-channel.md)
   - [ ] Pod の明示的 shutdown → [tickets/tui-pod-shutdown.md](tickets/tui-pod-shutdown.md)
   - [ ] 新しい Pod を spawn する UI の設計 → [tickets/tui-pod-spawn-ui.md](tickets/tui-pod-spawn-ui.md)
   - [ ] ツール呼び出しのフレーム更新型表示 → [tickets/tui-tool-call-ui.md](tickets/tui-tool-call-ui.md)
