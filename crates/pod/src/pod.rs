@@ -21,8 +21,10 @@ use crate::hook::{
     PreToolCall,
 };
 use crate::hook_interceptor::HookInterceptor;
+use crate::notifier::Notifier;
 use crate::system_prompt::{SystemPromptContext, SystemPromptError, SystemPromptTemplate};
 use crate::usage_tracker::UsageTracker;
+use protocol::{NotificationLevel, NotificationSource};
 use async_trait::async_trait;
 use llm_worker::interceptor::PreRequestAction;
 
@@ -97,6 +99,9 @@ pub struct Pod<C: LlmClient, St: Store> {
     /// `Some` until `ensure_system_prompt_materialized` renders it once,
     /// then `None` forever — including after compaction.
     system_prompt_template: Option<SystemPromptTemplate>,
+    /// User-facing notification sink attached by the Controller at
+    /// spawn time. `None` in tests / direct `Pod::new` usage.
+    notifier: Option<Notifier>,
 }
 
 impl<C: LlmClient, St: Store> Pod<C, St> {
@@ -137,6 +142,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             usage_history: Arc::new(Mutex::new(Vec::<UsageRecord>::new())),
             tracker: None,
             system_prompt_template: None,
+            notifier: None,
         };
         pod.apply_prune_from_manifest();
         Ok(pod)
@@ -185,6 +191,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             usage_history: Arc::new(Mutex::new(state.usage_history)),
             tracker: None,
             system_prompt_template: None,
+            notifier: None,
         };
         pod.apply_prune_from_manifest();
         Ok(pod)
@@ -273,6 +280,21 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     /// The attached session-scoped file-operation tracker, if any.
     pub fn tracker(&self) -> Option<&tools::Tracker> {
         self.tracker.as_ref()
+    }
+
+    /// Attach a user-facing notification sink.
+    ///
+    /// Called by the Controller immediately after spawning so that
+    /// Pod-internal operations (compaction failures, AGENTS.md
+    /// ingestion warnings) can surface messages to connected clients.
+    pub fn attach_notifier(&mut self, notifier: Notifier) {
+        self.notifier = Some(notifier);
+    }
+
+    fn notify(&self, level: NotificationLevel, source: NotificationSource, message: String) {
+        if let Some(n) = self.notifier.as_ref() {
+            n.notify(level, source, message);
+        }
     }
 
     // --- Hook registration ---
@@ -392,6 +414,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         let Some(template) = self.system_prompt_template.take() else {
             return Ok(());
         };
+        let notifier = self.notifier.clone();
         let worker = self.worker.as_mut().expect("worker present");
         // Materialise any pending tool factories so the template sees the
         // full list of tool names. Redundant with the flush inside
@@ -404,7 +427,17 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             .map(|d| d.name)
             .collect();
         let mut files = std::collections::BTreeMap::new();
-        if let Some(body) = read_agents_md(&self.pwd) {
+        let agents_md = read_agents_md(&self.pwd);
+        for warning in agents_md.warnings {
+            if let Some(n) = notifier.as_ref() {
+                n.notify(
+                    NotificationLevel::Warn,
+                    NotificationSource::AgentsMd,
+                    warning,
+                );
+            }
+        }
+        if let Some(body) = agents_md.body {
             files.insert("agents_md".to_string(), body);
         }
         let ctx = SystemPromptContext {
@@ -553,6 +586,11 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 }
                 Err(e) => {
                     warn!(error = %e, "Compaction failed during run");
+                    self.notify(
+                        NotificationLevel::Error,
+                        NotificationSource::Compactor,
+                        format!("mid-run compaction failed: {e}"),
+                    );
                     if let Some(ref state) = self.compact_state {
                         state.record_compact_failure();
                     }
@@ -583,6 +621,11 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             }
             Err(e) => {
                 warn!(error = %e, "Proactive post-run compaction failed");
+                self.notify(
+                    NotificationLevel::Warn,
+                    NotificationSource::Compactor,
+                    format!("post-run compaction failed: {e}"),
+                );
                 state.record_compact_failure();
                 Ok(())
             }
@@ -830,6 +873,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             usage_history: Arc::new(Mutex::new(Vec::new())),
             tracker: None,
             system_prompt_template,
+            notifier: None,
         };
         pod.apply_prune_from_manifest();
         Ok(pod)

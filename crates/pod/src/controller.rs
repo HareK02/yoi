@@ -6,11 +6,12 @@ use llm_worker::llm_client::client::LlmClient;
 use session_store::Store;
 use tokio::sync::{broadcast, mpsc};
 
+use crate::notifier::Notifier;
 use crate::pod::{Pod, PodError, PodRunResult};
 use crate::runtime_dir::RuntimeDir;
 use crate::shared_state::{PodSharedState, PodStatus};
 use crate::socket_server::SocketServer;
-use protocol::{ErrorCode, Event, Method, RunResult, TurnResult};
+use protocol::{ErrorCode, Event, Method, NotificationLevel, NotificationSource, RunResult, TurnResult};
 
 // ---------------------------------------------------------------------------
 // PodHandle — client-facing, Clone-able
@@ -22,6 +23,7 @@ pub struct PodHandle {
     event_tx: broadcast::Sender<Event>,
     pub shared_state: Arc<PodSharedState>,
     pub runtime_dir: Arc<RuntimeDir>,
+    pub notifier: Notifier,
 }
 
 impl PodHandle {
@@ -36,6 +38,11 @@ impl PodHandle {
     /// Broadcast an event to all listeners (including socket clients).
     pub fn send_event(&self, event: Event) -> Result<usize, broadcast::error::SendError<Event>> {
         self.event_tx.send(event)
+    }
+
+    /// Emit a user-facing notification. Thin wrapper over `Notifier::notify`.
+    pub fn notify(&self, level: NotificationLevel, source: NotificationSource, message: String) {
+        self.notifier.notify(level, source, message);
     }
 }
 
@@ -56,6 +63,7 @@ impl PodController {
     {
         let (method_tx, mut method_rx) = mpsc::channel::<Method>(32);
         let (event_tx, _) = broadcast::channel::<Event>(256);
+        let notifier = Notifier::new(event_tx.clone());
 
         let manifest_toml = toml::to_string_pretty(pod.manifest()).unwrap_or_default();
         let greeting = build_greeting(&pod);
@@ -78,7 +86,13 @@ impl PodController {
             event_tx: event_tx.clone(),
             shared_state: shared_state.clone(),
             runtime_dir: runtime_dir.clone(),
+            notifier: notifier.clone(),
         };
+
+        // Hand the notifier to the Pod so internal operations (compaction,
+        // AGENTS.md ingestion during the first turn) can emit user-facing
+        // notifications on the same channel.
+        pod.attach_notifier(notifier.clone());
 
         // Start socket server (lives as a background task, cleaned up on drop via RuntimeDir)
         let _socket_server = SocketServer::start(&handle).await?;
@@ -163,6 +177,15 @@ impl PodController {
                 });
             });
 
+            let notifier_for_worker = notifier.clone();
+            worker.on_warning(move |message| {
+                notifier_for_worker.notify(
+                    NotificationLevel::Warn,
+                    NotificationSource::Worker,
+                    message.to_owned(),
+                );
+            });
+
             // Register the builtin file-manipulation tools (Read / Write /
             // Edit / Glob / Grep). `ScopedFs` carries the pod-lifetime
             // scope/pwd; `Tracker` is session-scoped — a fresh instance per
@@ -215,6 +238,11 @@ impl PodController {
                         if new_status == PodStatus::Idle {
                             if let Err(e) = pod.try_post_run_compact().await {
                                 tracing::warn!(error = %e, "Post-run compaction error");
+                                notifier.notify(
+                                    NotificationLevel::Warn,
+                                    NotificationSource::Compactor,
+                                    format!("post-run compaction error: {e}"),
+                                );
                             }
                         }
 
@@ -249,6 +277,11 @@ impl PodController {
                         if new_status == PodStatus::Idle {
                             if let Err(e) = pod.try_post_run_compact().await {
                                 tracing::warn!(error = %e, "Post-run compaction error");
+                                notifier.notify(
+                                    NotificationLevel::Warn,
+                                    NotificationSource::Compactor,
+                                    format!("post-run compaction error: {e}"),
+                                );
                             }
                         }
 

@@ -6,6 +6,7 @@
 - [ ] Protocol の設計 → [tickets/protocol-design.md](tickets/protocol-design.md)
 - [ ] パーミッション: パターンベースのツール実行制御 → [tickets/permission-extension-point.md](tickets/permission-extension-point.md)
 - [ ] ネイティブ GUI クライアント MVP → [tickets/native-gui-mvp.md](tickets/native-gui-mvp.md)
+- [ ] Pod Factory: カスケード設定とプロンプト資産 → [tickets/pod-factory.md](tickets/pod-factory.md)
 - [ ] TUI 拡充
   - [ ] 通知チャネル (Warn/Error 可視化) → [tickets/tui-notification-channel.md](tickets/tui-notification-channel.md)
   - [ ] Pod の明示的 shutdown → [tickets/tui-pod-shutdown.md](tickets/tui-pod-shutdown.md)

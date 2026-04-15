@@ -68,6 +68,38 @@ pub enum Event {
         items: Vec<serde_json::Value>,
         greeting: Greeting,
     },
+    Notification(Notification),
+}
+
+/// User-facing notification emitted from the Pod layer.
+///
+/// This is a separate channel from `tracing` (developer logs): entries
+/// here are assembled explicitly by the Pod when a condition should be
+/// surfaced to the person driving the client. Keep messages short and
+/// human-readable.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Notification {
+    pub level: NotificationLevel,
+    pub source: NotificationSource,
+    pub message: String,
+    /// Milliseconds since the Unix epoch.
+    pub timestamp_ms: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationLevel {
+    Warn,
+    Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationSource {
+    Pod,
+    Worker,
+    Compactor,
+    AgentsMd,
 }
 
 /// Pod self-description rendered by the TUI when a session starts empty.
@@ -185,6 +217,23 @@ mod tests {
         assert_eq!(parsed["data"]["items"][0]["role"], "user");
         assert_eq!(parsed["data"]["greeting"]["pod_name"], "test");
         assert_eq!(parsed["data"]["greeting"]["tools"][0], "Read");
+    }
+
+    #[test]
+    fn event_notification_format() {
+        let event = Event::Notification(Notification {
+            level: NotificationLevel::Warn,
+            source: NotificationSource::Compactor,
+            message: "compaction failed".into(),
+            timestamp_ms: 1_700_000_000_000,
+        });
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["event"], "notification");
+        assert_eq!(parsed["data"]["level"], "warn");
+        assert_eq!(parsed["data"]["source"], "compactor");
+        assert_eq!(parsed["data"]["message"], "compaction failed");
+        assert_eq!(parsed["data"]["timestamp_ms"], 1_700_000_000_000i64);
     }
 
     #[test]

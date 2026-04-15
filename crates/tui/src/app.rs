@@ -1,4 +1,4 @@
-use protocol::{Event, Greeting, Method};
+use protocol::{Event, Greeting, Method, NotificationLevel, NotificationSource};
 
 pub struct App {
     pub pod_name: String,
@@ -35,6 +35,10 @@ pub enum MessageKind {
     Tool,
     Error,
     TurnStats,
+    /// Pod → user notification, Warn level.
+    NoticeWarn,
+    /// Pod → user notification, Error level.
+    NoticeError,
 }
 
 impl App {
@@ -166,6 +170,21 @@ impl App {
                 self.current_tool = None;
             }
             Event::ToolCallArgsDelta { .. } => {}
+            Event::Notification(notification) => {
+                let kind = match notification.level {
+                    NotificationLevel::Warn => MessageKind::NoticeWarn,
+                    NotificationLevel::Error => MessageKind::NoticeError,
+                };
+                let prefix = match notification.level {
+                    NotificationLevel::Warn => "[notice]",
+                    NotificationLevel::Error => "[notice error]",
+                };
+                let source = notification_source_label(notification.source);
+                self.output_queue.push(OutputItem::Padded(
+                    kind,
+                    format!("{prefix} {source}: {}", notification.message),
+                ));
+            }
             Event::History { items, greeting } => {
                 self.restore_history(&items);
                 if self.turn_index == 0 {
@@ -295,6 +314,15 @@ impl App {
                 _ => {}
             }
         }
+    }
+}
+
+fn notification_source_label(source: NotificationSource) -> &'static str {
+    match source {
+        NotificationSource::Pod => "pod",
+        NotificationSource::Worker => "worker",
+        NotificationSource::Compactor => "compactor",
+        NotificationSource::AgentsMd => "AGENTS.md",
     }
 }
 

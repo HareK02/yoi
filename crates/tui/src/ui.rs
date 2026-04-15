@@ -232,6 +232,14 @@ pub fn kind_style(kind: &MessageKind) -> Style {
         MessageKind::Tool => Style::default().fg(Color::Cyan),
         MessageKind::Error => Style::default().fg(Color::Red),
         MessageKind::TurnStats => Style::default().fg(Color::DarkGray),
+        MessageKind::NoticeWarn => Style::default()
+            .fg(Color::Black)
+            .bg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+        MessageKind::NoticeError => Style::default()
+            .fg(Color::White)
+            .bg(Color::Red)
+            .add_modifier(Modifier::BOLD),
     }
 }
 

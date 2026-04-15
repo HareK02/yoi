@@ -1,5 +1,10 @@
 # TUI 通知チャネル: Warn/Error をユーザーに可視化
 
+## レビュー状態
+
+初回レビュー実施済み。[tui-notification-channel.review.md](tui-notification-channel.review.md) を参照。
+コア要件は達成。残る指摘は (1) `Notifier::buffer` の無制限成長、(2) TUI 側の表示強度（履歴行に紛れるか別立てで見落とさない位置に出すか）の 2 点で、いずれも user 判断待ち。
+
 ## 背景
 
 Pod/Worker 層は現在、通知すべき事象（compaction 失敗、AGENTS.md 読み取り失敗、ツール出力の切り詰め、将来追加される様々な前処理エラー等）をすべて `tracing::warn!` で出している。TUI はこのログを受け取る仕組みを持たないため、**ユーザーは何も気づかないまま Pod が縮退動作している状態**になりうる。

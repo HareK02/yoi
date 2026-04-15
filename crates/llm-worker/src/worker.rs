@@ -154,6 +154,11 @@ pub struct Worker<C: LlmClient, S: WorkerState = Mutable> {
     turn_start_cbs: Vec<Box<dyn Fn(usize) + Send + Sync>>,
     /// Turn-end callbacks
     turn_end_cbs: Vec<Box<dyn Fn(usize) + Send + Sync>>,
+    /// Non-fatal warning callbacks. Invoked when the Worker wants to
+    /// surface an advisory message to the upper layer (e.g. Pod) so it
+    /// can be forwarded to the user — distinct from `tracing::warn!`,
+    /// which is for developer-facing logs.
+    warning_cbs: Vec<Box<dyn Fn(&str) + Send + Sync>>,
     /// Request configuration (max_tokens, temperature, etc.)
     request_config: RequestConfig,
     /// Whether the previous run was interrupted
@@ -272,6 +277,23 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
     /// Register a turn-start callback (receives 0-based turn number).
     pub fn on_turn_start(&mut self, callback: impl Fn(usize) + Send + Sync + 'static) {
         self.turn_start_cbs.push(Box::new(callback));
+    }
+
+    /// Register a non-fatal warning callback.
+    ///
+    /// The callback is invoked with a short human-readable message
+    /// whenever the Worker encounters a condition that should be
+    /// surfaced to a human (e.g. tool output byte-cap truncation).
+    /// This channel is separate from `tracing::warn!`, which remains
+    /// in place for developer logs.
+    pub fn on_warning(&mut self, callback: impl Fn(&str) + Send + Sync + 'static) {
+        self.warning_cbs.push(Box::new(callback));
+    }
+
+    fn emit_warning(&self, message: &str) {
+        for cb in &self.warning_cbs {
+            cb(message);
+        }
     }
 
     /// Register a turn-end callback (receives 0-based turn number).
@@ -696,6 +718,13 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
                         limit_bytes = limit,
                         "Tool output exceeded byte limit and was truncated"
                     );
+                    self.emit_warning(&format!(
+                        "tool `{}` output truncated from {} to {} bytes (limit {})",
+                        tool_call.name,
+                        before,
+                        content.len(),
+                        limit
+                    ));
                 }
             }
         }
@@ -962,6 +991,7 @@ impl<C: LlmClient> Worker<C, Mutable> {
             max_turns: None,
             turn_start_cbs: Vec::new(),
             turn_end_cbs: Vec::new(),
+            warning_cbs: Vec::new(),
             request_config: RequestConfig::default(),
             last_run_interrupted: false,
             cancel_tx,
@@ -1214,6 +1244,7 @@ impl<C: LlmClient> Worker<C, Mutable> {
             max_turns: self.max_turns,
             turn_start_cbs: self.turn_start_cbs,
             turn_end_cbs: self.turn_end_cbs,
+            warning_cbs: self.warning_cbs,
             request_config: self.request_config,
             last_run_interrupted: self.last_run_interrupted,
 
@@ -1286,6 +1317,7 @@ impl<C: LlmClient> Worker<C, Locked> {
             max_turns: self.max_turns,
             turn_start_cbs: self.turn_start_cbs,
             turn_end_cbs: self.turn_end_cbs,
+            warning_cbs: self.warning_cbs,
             request_config: self.request_config,
             last_run_interrupted: self.last_run_interrupted,
 

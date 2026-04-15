@@ -18,21 +18,43 @@ pub(crate) const AGENTS_MD_LIMIT: usize = 64 * 1024;
 
 const TRUNCATION_NOTICE: &str = "\n\n[truncated: AGENTS.md exceeded 64KB limit]";
 
-/// Read `AGENTS.md` from `cwd` if present. Returns `None` for "absent or
-/// unreadable"; all non-fatal problems are logged via `tracing::warn!`.
+/// Outcome of an `AGENTS.md` ingestion attempt.
 ///
-/// - Absent: `None`, no warn.
-/// - Over limit: first 64KB (UTF-8 char boundary) + truncation notice, warn.
-/// - Non-UTF-8 or I/O error: `None`, warn.
-pub(crate) fn read_agents_md(cwd: &Path) -> Option<String> {
+/// `body` carries the text that should be handed to the template
+/// engine (if any); `warnings` are short human-readable messages that
+/// Pod forwards to the user-facing notification channel. The caller
+/// also gets `tracing::warn!` lines for the developer log.
+pub(crate) struct AgentsMdResult {
+    pub body: Option<String>,
+    pub warnings: Vec<String>,
+}
+
+/// Read `AGENTS.md` from `cwd` if present. All non-fatal problems are
+/// both logged via `tracing::warn!` (developer-facing) and surfaced
+/// via `AgentsMdResult::warnings` (user-facing).
+///
+/// - Absent: `body = None`, no warning.
+/// - Over limit: first 64KB (UTF-8 char boundary) + truncation notice, warning.
+/// - Non-UTF-8 or I/O error: `body = None`, warning.
+pub(crate) fn read_agents_md(cwd: &Path) -> AgentsMdResult {
     let path = cwd.join("AGENTS.md");
+    let mut warnings = Vec::new();
 
     let file = match File::open(&path) {
         Ok(f) => f,
-        Err(e) if e.kind() == ErrorKind::NotFound => return None,
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            return AgentsMdResult {
+                body: None,
+                warnings,
+            };
+        }
         Err(e) => {
             warn!(path = %path.display(), error = %e, "failed to open AGENTS.md");
-            return None;
+            warnings.push(format!("failed to open AGENTS.md ({}): {}", path.display(), e));
+            return AgentsMdResult {
+                body: None,
+                warnings,
+            };
         }
     };
 
@@ -42,7 +64,11 @@ pub(crate) fn read_agents_md(cwd: &Path) -> Option<String> {
     let read_limit = (AGENTS_MD_LIMIT as u64) + 1;
     if let Err(e) = file.take(read_limit).read_to_end(&mut buf) {
         warn!(path = %path.display(), error = %e, "failed to read AGENTS.md");
-        return None;
+        warnings.push(format!("failed to read AGENTS.md ({}): {}", path.display(), e));
+        return AgentsMdResult {
+            body: None,
+            warnings,
+        };
     }
 
     let truncated = buf.len() > AGENTS_MD_LIMIT;
@@ -69,7 +95,15 @@ pub(crate) fn read_agents_md(cwd: &Path) -> Option<String> {
         }
         Err(e) => {
             warn!(path = %path.display(), error = %e, "AGENTS.md is not valid UTF-8");
-            return None;
+            warnings.push(format!(
+                "AGENTS.md ({}) is not valid UTF-8: {}",
+                path.display(),
+                e
+            ));
+            return AgentsMdResult {
+                body: None,
+                warnings,
+            };
         }
     };
 
@@ -80,10 +114,18 @@ pub(crate) fn read_agents_md(cwd: &Path) -> Option<String> {
             limit = AGENTS_MD_LIMIT,
             "AGENTS.md exceeded size limit; truncating"
         );
+        warnings.push(format!(
+            "AGENTS.md ({}) exceeded {} bytes; the tail was truncated",
+            path.display(),
+            AGENTS_MD_LIMIT
+        ));
         text.push_str(TRUNCATION_NOTICE);
     }
 
-    Some(text)
+    AgentsMdResult {
+        body: Some(text),
+        warnings,
+    }
 }
 
 #[cfg(test)]
@@ -95,17 +137,16 @@ mod tests {
     #[test]
     fn absent_file_returns_none() {
         let dir = TempDir::new().unwrap();
-        assert!(read_agents_md(dir.path()).is_none());
+        assert!(read_agents_md(dir.path()).body.is_none());
     }
 
     #[test]
     fn reads_small_file_verbatim() {
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join("AGENTS.md"), "# hello\nworld").unwrap();
-        assert_eq!(
-            read_agents_md(dir.path()).as_deref(),
-            Some("# hello\nworld"),
-        );
+        let result = read_agents_md(dir.path());
+        assert_eq!(result.body.as_deref(), Some("# hello\nworld"));
+        assert!(result.warnings.is_empty());
     }
 
     #[test]
@@ -114,11 +155,13 @@ mod tests {
         let body = "a".repeat(AGENTS_MD_LIMIT + 1024);
         fs::write(dir.path().join("AGENTS.md"), &body).unwrap();
 
-        let got = read_agents_md(dir.path()).expect("some");
+        let result = read_agents_md(dir.path());
+        let got = result.body.expect("some");
         assert!(got.ends_with(TRUNCATION_NOTICE));
         let prefix = got.strip_suffix(TRUNCATION_NOTICE).unwrap();
         assert_eq!(prefix.len(), AGENTS_MD_LIMIT);
         assert!(prefix.chars().all(|c| c == 'a'));
+        assert_eq!(result.warnings.len(), 1);
     }
 
     #[test]
@@ -127,9 +170,11 @@ mod tests {
         let body = "a".repeat(AGENTS_MD_LIMIT);
         fs::write(dir.path().join("AGENTS.md"), &body).unwrap();
 
-        let got = read_agents_md(dir.path()).expect("some");
+        let result = read_agents_md(dir.path());
+        let got = result.body.expect("some");
         assert_eq!(got.len(), AGENTS_MD_LIMIT);
         assert!(!got.contains("truncated"));
+        assert!(result.warnings.is_empty());
     }
 
     #[test]
@@ -142,12 +187,23 @@ mod tests {
         body.push_str(&"b".repeat(128));
         fs::write(dir.path().join("AGENTS.md"), &body).unwrap();
 
-        let got = read_agents_md(dir.path()).expect("some");
+        let result = read_agents_md(dir.path());
+        let got = result.body.expect("some");
         assert!(got.ends_with(TRUNCATION_NOTICE));
         let prefix = got.strip_suffix(TRUNCATION_NOTICE).unwrap();
         // The partial 'あ' must have been dropped, leaving only the ASCII prefix.
         assert_eq!(prefix.len(), AGENTS_MD_LIMIT - 1);
         assert!(prefix.chars().all(|c| c == 'a'));
+        assert_eq!(result.warnings.len(), 1);
+    }
+
+    #[test]
+    fn non_utf8_surfaces_warning() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("AGENTS.md"), [0xff, 0xfe, 0xfd]).unwrap();
+        let result = read_agents_md(dir.path());
+        assert!(result.body.is_none());
+        assert_eq!(result.warnings.len(), 1);
     }
 
     #[test]
@@ -159,7 +215,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let body = vec![0xffu8; AGENTS_MD_LIMIT + 1024];
         fs::write(dir.path().join("AGENTS.md"), body).unwrap();
-        assert!(read_agents_md(dir.path()).is_none());
+        assert!(read_agents_md(dir.path()).body.is_none());
     }
 
     #[test]
@@ -167,6 +223,6 @@ mod tests {
         let dir = TempDir::new().unwrap();
         // Invalid UTF-8 start byte.
         fs::write(dir.path().join("AGENTS.md"), [0xff, 0xfe, 0xfd]).unwrap();
-        assert!(read_agents_md(dir.path()).is_none());
+        assert!(read_agents_md(dir.path()).body.is_none());
     }
 }

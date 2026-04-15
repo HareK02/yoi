@@ -1,5 +1,6 @@
 pub mod controller;
 pub mod hook;
+pub mod notifier;
 pub mod runtime_dir;
 pub mod shared_state;
 pub mod socket_server;
@@ -17,6 +18,7 @@ mod usage_tracker;
 pub use token_counter::{EstimateSource, SplitPoint, TokenEstimate};
 
 pub use controller::{PodController, PodHandle};
+pub use notifier::Notifier;
 pub use hook::{Hook, HookEventKind, HookRegistryBuilder};
 pub use manifest::{PodManifest, ProviderConfig, ProviderKind, Scope};
 pub use pod::{Pod, PodError, PodRunResult, apply_worker_manifest};
