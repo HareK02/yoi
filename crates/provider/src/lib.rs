@@ -1,5 +1,3 @@
-use std::path::{Path, PathBuf};
-
 use llm_worker::llm_client::client::LlmClient;
 use llm_worker::llm_client::providers::anthropic::AnthropicClient;
 use llm_worker::llm_client::providers::gemini::GeminiClient;
@@ -22,22 +20,23 @@ pub enum ProviderError {
 ///
 /// Resolution order:
 /// 1. Environment variable `INSOMNIA_API_KEY_{KIND}`
-/// 2. File specified by `api_key_file` (trimmed)
+/// 2. File specified by `api_key_file` (must be an absolute path; the
+///    cascade layer is responsible for normalisation)
 /// 3. `None`
-fn resolve_api_key(
-    config: &ProviderConfig,
-    manifest_dir: Option<&Path>,
-) -> Result<Option<String>, ProviderError> {
-    // 1. Convention-based environment variable
+fn resolve_api_key(config: &ProviderConfig) -> Result<Option<String>, ProviderError> {
     let env_name = config.kind.env_var_name();
     if let Ok(val) = std::env::var(&env_name) {
         return Ok(Some(val));
     }
 
-    // 2. File
-    if let Some(ref raw_path) = config.api_key_file {
-        let path = expand_key_path(raw_path, manifest_dir)?;
-        let contents = std::fs::read_to_string(&path).map_err(|e| {
+    if let Some(ref path) = config.api_key_file {
+        if !path.is_absolute() {
+            return Err(ProviderError::Config(format!(
+                "api_key_file must be absolute: {}",
+                path.display()
+            )));
+        }
+        let contents = std::fs::read_to_string(path).map_err(|e| {
             ProviderError::Config(format!(
                 "failed to read api_key_file {}: {e}",
                 path.display()
@@ -49,38 +48,13 @@ fn resolve_api_key(
     Ok(None)
 }
 
-/// Expand `~` and resolve relative paths against `manifest_dir`.
-fn expand_key_path(raw: &Path, manifest_dir: Option<&Path>) -> Result<PathBuf, ProviderError> {
-    let path = if raw.starts_with("~") {
-        let home = std::env::var("HOME")
-            .map_err(|_| ProviderError::Config("HOME is not set for ~ expansion".into()))?;
-        PathBuf::from(home).join(raw.strip_prefix("~").unwrap())
-    } else {
-        raw.to_path_buf()
-    };
-
-    if path.is_relative() {
-        match manifest_dir {
-            Some(dir) => Ok(dir.join(&path)),
-            None => Err(ProviderError::Config(format!(
-                "relative api_key_file '{}' requires a manifest directory",
-                path.display()
-            ))),
-        }
-    } else {
-        Ok(path)
-    }
-}
-
 /// Build an [`LlmClient`] from a [`ProviderConfig`].
 ///
-/// Resolves the API key from `INSOMNIA_API_KEY_{KIND}` env var or `api_key_file`.
-/// `manifest_dir` is used to resolve relative `api_key_file` paths.
-pub fn build_client(
-    config: &ProviderConfig,
-    manifest_dir: Option<&Path>,
-) -> Result<Box<dyn LlmClient>, ProviderError> {
-    let api_key = resolve_api_key(config, manifest_dir)?;
+/// `api_key_file` (if set) must already be an absolute path — relative
+/// paths are rejected because cascade resolution is the sole source of
+/// path normalisation.
+pub fn build_client(config: &ProviderConfig) -> Result<Box<dyn LlmClient>, ProviderError> {
+    let api_key = resolve_api_key(config)?;
 
     match config.kind {
         ProviderKind::Anthropic => {
@@ -128,6 +102,7 @@ mod tests {
     use super::*;
     use serial_test::serial;
     use std::io::Write;
+    use std::path::PathBuf;
 
     fn anthropic_config() -> ProviderConfig {
         ProviderConfig {
@@ -143,7 +118,7 @@ mod tests {
     fn resolve_from_env() {
         let env_name = ProviderKind::Anthropic.env_var_name();
         unsafe { std::env::set_var(&env_name, "sk-from-env") };
-        let key = resolve_api_key(&anthropic_config(), None).unwrap();
+        let key = resolve_api_key(&anthropic_config()).unwrap();
         unsafe { std::env::remove_var(&env_name) };
         assert_eq!(key.as_deref(), Some("sk-from-env"));
     }
@@ -160,7 +135,7 @@ mod tests {
             api_key_file: Some(key_path),
             ..anthropic_config()
         };
-        let key = resolve_api_key(&config, None).unwrap();
+        let key = resolve_api_key(&config).unwrap();
         assert_eq!(key.as_deref(), Some("sk-from-file"));
     }
 
@@ -178,40 +153,25 @@ mod tests {
             api_key_file: Some(key_path),
             ..anthropic_config()
         };
-        let key = resolve_api_key(&config, None).unwrap();
+        let key = resolve_api_key(&config).unwrap();
         unsafe { std::env::remove_var(&env_name) };
         assert_eq!(key.as_deref(), Some("sk-from-env"));
     }
 
     #[test]
-    fn relative_path_resolved_against_manifest_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        let key_path = dir.path().join("keys").join("anthropic");
-        std::fs::create_dir_all(key_path.parent().unwrap()).unwrap();
-        std::fs::write(&key_path, "sk-relative").unwrap();
-
+    fn relative_api_key_file_is_rejected() {
         let config = ProviderConfig {
             api_key_file: Some(PathBuf::from("keys/anthropic")),
             ..anthropic_config()
         };
-        let key = resolve_api_key(&config, Some(dir.path())).unwrap();
-        assert_eq!(key.as_deref(), Some("sk-relative"));
-    }
-
-    #[test]
-    fn relative_path_without_manifest_dir_errors() {
-        let config = ProviderConfig {
-            api_key_file: Some(PathBuf::from("keys/anthropic")),
-            ..anthropic_config()
-        };
-        let err = resolve_api_key(&config, None).unwrap_err();
+        let err = resolve_api_key(&config).unwrap_err();
         assert!(matches!(err, ProviderError::Config(_)));
     }
 
     #[test]
     fn missing_key_returns_api_key_missing() {
         let config = anthropic_config();
-        let result = build_client(&config, None);
+        let result = build_client(&config);
         assert!(matches!(result, Err(ProviderError::ApiKeyMissing { .. })));
     }
 
@@ -223,6 +183,6 @@ mod tests {
             api_key_file: None,
             base_url: None,
         };
-        assert!(build_client(&config, None).is_ok());
+        assert!(build_client(&config).is_ok());
     }
 }

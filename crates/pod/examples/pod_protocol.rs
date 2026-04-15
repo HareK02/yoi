@@ -5,13 +5,16 @@
 //! cargo run -p pod --example pod_protocol
 //! ```
 
-use pod::{Event, Method, PodController, PodManifest};
+use pod::{Event, Method, PodController};
 use session_store::FsStore;
 
-const MANIFEST_TOML: &str = r#"
+fn manifest_toml(pwd: &std::path::Path) -> String {
+    let pwd = pwd.display();
+    format!(
+        r#"
 [pod]
 name = "protocol-demo"
-pwd = "./"
+pwd = "{pwd}"
 
 [provider]
 kind = "anthropic"
@@ -22,18 +25,22 @@ system_prompt = "You are a concise assistant. Reply in one or two sentences."
 max_tokens = 256
 
 [[scope.allow]]
-target = "./"
+target = "{pwd}"
 permission = "write"
-"#;
+"#
+    )
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenv::dotenv().ok();
 
-    let manifest = PodManifest::from_toml(MANIFEST_TOML)?;
+    // All manifest paths must be absolute — see the pod-factory ticket.
+    let pwd = std::env::current_dir()?;
+    let toml = manifest_toml(&pwd);
     let tmp = tempfile::tempdir()?;
     let store = FsStore::new(tmp.path()).await?;
-    let pod = pod::Pod::from_manifest(manifest, store, None).await?;
+    let pod = pod::Pod::from_manifest_toml(&toml, store).await?;
 
     let runtime_tmp = tempfile::tempdir()?;
     let handle = PodController::spawn(pod, runtime_tmp.path()).await?;

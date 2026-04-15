@@ -1,0 +1,539 @@
+//! Builder that assembles a [`PodManifest`] from cascade layers.
+//!
+//! Layers are merged in order of increasing priority:
+//! 1. **Builtin defaults** — in-code defaults, currently empty. Upper
+//!    layers provide everything; `TryFrom<PodManifestConfig>` fills in
+//!    per-field defaults (`ToolOutputLimits`, `CompactionConfig`, ...).
+//! 2. **User manifest** — `$XDG_CONFIG_HOME/insomnia/manifest.toml`
+//!    (falling back to `~/.config/insomnia/manifest.toml`).
+//! 3. **Project manifest** — closest `.insomnia/manifest.toml` found by
+//!    walking up from `cwd`.
+//! 4. **Programmatic overlay** — inline TOML string or typed
+//!    [`PodManifestConfig`] supplied by the caller (CLI flags, GUI,
+//!    spawning Pod, etc.). Highest priority.
+
+use std::path::{Path, PathBuf};
+
+use manifest::{PodManifest, PodManifestConfig, ResolveError};
+
+use crate::prompt_loader::PromptLoader;
+
+/// Errors raised while building a [`PodManifest`] from cascade layers.
+#[derive(Debug, thiserror::Error)]
+pub enum FactoryError {
+    #[error("failed to read manifest {}: {source}", .path.display())]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to parse manifest {}: {source}", .path.display())]
+    Parse {
+        path: PathBuf,
+        #[source]
+        source: toml::de::Error,
+    },
+    #[error("failed to parse overlay TOML: {0}")]
+    OverlayParse(#[source] toml::de::Error),
+    #[error("failed to resolve manifest config: {0}")]
+    Resolve(#[source] ResolveError),
+    #[error("cannot locate home directory for user manifest lookup")]
+    HomeDirUnavailable,
+}
+
+/// Builder that accumulates cascade layers and resolves them to a
+/// validated [`PodManifest`].
+///
+/// Call order does not matter — layers are always merged in the fixed
+/// priority order listed at the module level. Calling the same
+/// `with_*` method twice overwrites the previous value for that slot.
+#[derive(Debug, Default)]
+pub struct PodFactory {
+    user: Option<PodManifestConfig>,
+    project: Option<PodManifestConfig>,
+    overlay: Option<PodManifestConfig>,
+    /// Directory holding the user prompts library — co-located with
+    /// the user manifest when loaded. `<user_manifest_dir>/prompts/`.
+    user_prompts_dir: Option<PathBuf>,
+    /// `<project_root>/.insomnia/prompts/` — co-located with the
+    /// project manifest when loaded.
+    project_prompts_dir: Option<PathBuf>,
+}
+
+impl PodFactory {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Attempt to load the user manifest from the XDG config directory.
+    ///
+    /// Looks at `$XDG_CONFIG_HOME/insomnia/manifest.toml` first, then
+    /// falls back to `$HOME/.config/insomnia/manifest.toml`. If the
+    /// resolved file does not exist the call is a no-op — user
+    /// manifests are optional.
+    pub fn with_user_manifest_auto(mut self) -> Result<Self, FactoryError> {
+        let path = user_manifest_path()?;
+        if path.exists() {
+            self.user = Some(read_config_file(&path)?);
+            self.user_prompts_dir = path.parent().map(|p| p.join("prompts"));
+        }
+        Ok(self)
+    }
+
+    /// Load the user manifest from an explicit path. The file must
+    /// exist; missing files are an error (unlike the `_auto` variant).
+    pub fn with_user_manifest(mut self, path: impl AsRef<Path>) -> Result<Self, FactoryError> {
+        let path = path.as_ref();
+        self.user = Some(read_config_file(path)?);
+        self.user_prompts_dir = path.parent().map(|p| p.join("prompts"));
+        Ok(self)
+    }
+
+    /// Walk up from `cwd` looking for a `.insomnia/manifest.toml` and
+    /// load it as the project layer. If no project root is found the
+    /// call is a no-op.
+    pub fn with_project_manifest_auto(mut self) -> Result<Self, FactoryError> {
+        let cwd = std::env::current_dir().map_err(|source| FactoryError::Io {
+            path: PathBuf::from("."),
+            source,
+        })?;
+        if let Some(path) = find_project_manifest(&cwd) {
+            self.project = Some(read_config_file(&path)?);
+            self.project_prompts_dir = path.parent().map(|p| p.join("prompts"));
+        }
+        Ok(self)
+    }
+
+    /// Walk up from `start` looking for a `.insomnia/manifest.toml`.
+    /// Explicit variant of [`with_project_manifest_auto`] for tests.
+    pub fn with_project_manifest_from(
+        mut self,
+        start: impl AsRef<Path>,
+    ) -> Result<Self, FactoryError> {
+        if let Some(path) = find_project_manifest(start.as_ref()) {
+            self.project = Some(read_config_file(&path)?);
+            self.project_prompts_dir = path.parent().map(|p| p.join("prompts"));
+        }
+        Ok(self)
+    }
+
+    /// Install a programmatic overlay parsed from a TOML string. This
+    /// is the highest-priority layer — use it to inject per-spawn
+    /// values like `pod.name` or `pod.pwd` from CLI flags.
+    pub fn with_overlay_toml(mut self, toml: &str) -> Result<Self, FactoryError> {
+        let config = PodManifestConfig::from_toml(toml).map_err(FactoryError::OverlayParse)?;
+        self.overlay = Some(match self.overlay {
+            Some(existing) => existing.merge(config),
+            None => config,
+        });
+        Ok(self)
+    }
+
+    /// Install a programmatic overlay from an already-parsed config.
+    pub fn with_overlay_config(mut self, config: PodManifestConfig) -> Self {
+        self.overlay = Some(match self.overlay {
+            Some(existing) => existing.merge(config),
+            None => config,
+        });
+        self
+    }
+
+    /// Build a [`PromptLoader`] that reflects the user / project
+    /// prompt directories registered with this factory (a sibling of
+    /// each manifest file: `prompts/`). Missing directories are
+    /// silently skipped.
+    fn build_prompt_loader(&self) -> PromptLoader {
+        let user = self
+            .user_prompts_dir
+            .as_ref()
+            .filter(|p| p.is_dir())
+            .cloned();
+        let project = self
+            .project_prompts_dir
+            .as_ref()
+            .filter(|p| p.is_dir())
+            .cloned();
+        PromptLoader::new(user, project)
+    }
+
+    /// Merge all installed layers, convert the result to a validated
+    /// [`PodManifest`], and return it together with a [`PromptLoader`]
+    /// that reflects the user / project prompt directories. The loader
+    /// feeds `{% include "name" %}` references in the Pod's system
+    /// prompt template.
+    ///
+    /// The base layer is [`PodManifestConfig::builtin_defaults`] so
+    /// every per-field default flows through a single source of truth
+    /// (see [`manifest::defaults`]).
+    pub fn resolve(self) -> Result<(PodManifest, PromptLoader), FactoryError> {
+        let loader = self.build_prompt_loader();
+        let merged = PodManifestConfig::builtin_defaults();
+        let merged = match self.user {
+            Some(user) => merged.merge(user),
+            None => merged,
+        };
+        let merged = match self.project {
+            Some(project) => merged.merge(project),
+            None => merged,
+        };
+        let merged = match self.overlay {
+            Some(overlay) => merged.merge(overlay),
+            None => merged,
+        };
+        let manifest = PodManifest::try_from(merged).map_err(FactoryError::Resolve)?;
+        Ok((manifest, loader))
+    }
+}
+
+fn user_manifest_path() -> Result<PathBuf, FactoryError> {
+    if let Ok(dir) = std::env::var("XDG_CONFIG_HOME") {
+        if !dir.is_empty() {
+            return Ok(PathBuf::from(dir).join("insomnia").join("manifest.toml"));
+        }
+    }
+    let home = std::env::var("HOME").map_err(|_| FactoryError::HomeDirUnavailable)?;
+    Ok(PathBuf::from(home)
+        .join(".config")
+        .join("insomnia")
+        .join("manifest.toml"))
+}
+
+fn find_project_manifest(start: &Path) -> Option<PathBuf> {
+    let start = start.canonicalize().ok().unwrap_or_else(|| start.to_path_buf());
+    let mut cur: Option<&Path> = Some(start.as_path());
+    while let Some(dir) = cur {
+        let candidate = dir.join(".insomnia").join("manifest.toml");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        cur = dir.parent();
+    }
+    None
+}
+
+fn read_config_file(path: &Path) -> Result<PodManifestConfig, FactoryError> {
+    let toml = std::fs::read_to_string(path).map_err(|source| FactoryError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    PodManifestConfig::from_toml(&toml).map_err(|source| FactoryError::Parse {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn write(path: &Path, contents: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, contents).unwrap();
+    }
+
+    #[test]
+    fn resolve_overlay_only() {
+        let tmp = TempDir::new().unwrap();
+        let pwd = tmp.path().canonicalize().unwrap();
+        let overlay = format!(
+            r#"
+[pod]
+name = "solo"
+pwd = "{pwd}"
+
+[provider]
+kind = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[[scope.allow]]
+target = "{pwd}"
+permission = "write"
+"#,
+            pwd = pwd.display()
+        );
+        let manifest = PodFactory::new()
+            .with_overlay_toml(&overlay)
+            .unwrap()
+            .resolve()
+            .unwrap();
+        let manifest = manifest.0;
+        assert_eq!(manifest.pod.name, "solo");
+        assert_eq!(manifest.pod.pwd, pwd);
+    }
+
+    #[test]
+    fn overlay_stacking_merges_in_place() {
+        let tmp = TempDir::new().unwrap();
+        let pwd = tmp.path().canonicalize().unwrap();
+        let user_cfg = PodManifestConfig::from_toml(&format!(
+            r#"
+[provider]
+kind = "anthropic"
+model = "user-model"
+
+[[scope.allow]]
+target = "{pwd}"
+permission = "read"
+"#,
+            pwd = pwd.display()
+        ))
+        .unwrap();
+        let project_cfg = PodManifestConfig::from_toml(&format!(
+            r#"
+[provider]
+model = "project-model"
+
+[[scope.allow]]
+target = "{pwd}"
+permission = "write"
+"#,
+            pwd = pwd.display()
+        ))
+        .unwrap();
+        let overlay_cfg = PodManifestConfig::from_toml(&format!(
+            r#"
+[pod]
+name = "overlay-name"
+pwd = "{pwd}"
+"#,
+            pwd = pwd.display()
+        ))
+        .unwrap();
+
+        let (manifest, _loader) = PodFactory::new()
+            .with_overlay_config(user_cfg)
+            .with_overlay_config(project_cfg)
+            .with_overlay_config(overlay_cfg)
+            .resolve()
+            .unwrap();
+
+        // Note: stacking via with_overlay_config merges into one
+        // overlay layer so later calls win. This also exercises the
+        // scope union across layers (two allow rules).
+        assert_eq!(manifest.pod.name, "overlay-name");
+        assert_eq!(manifest.provider.model, "project-model");
+        assert_eq!(manifest.scope.allow.len(), 2);
+    }
+
+    #[test]
+    fn cascade_priority_layer_ordering() {
+        let tmp = TempDir::new().unwrap();
+        let pwd = tmp.path().canonicalize().unwrap();
+
+        // Simulate distinct user / project / overlay layers by using
+        // the dedicated slots on the factory.
+        let user = tmp.path().join("user.toml");
+        write(
+            &user,
+            &format!(
+                r#"
+[pod]
+name = "from-user"
+pwd = "{pwd}"
+
+[provider]
+kind = "anthropic"
+model = "user-model"
+
+[[scope.allow]]
+target = "{pwd}"
+permission = "write"
+"#,
+                pwd = pwd.display()
+            ),
+        );
+
+        let project_root = tmp.path().join("proj");
+        let project_manifest = project_root.join(".insomnia").join("manifest.toml");
+        write(
+            &project_manifest,
+            r#"
+[provider]
+model = "project-model"
+"#,
+        );
+
+        let (manifest, _loader) = PodFactory::new()
+            .with_user_manifest(&user)
+            .unwrap()
+            .with_project_manifest_from(&project_root)
+            .unwrap()
+            .resolve()
+            .unwrap();
+
+        // project layer overrides user layer on provider.model
+        assert_eq!(manifest.provider.model, "project-model");
+        // user layer provides the rest
+        assert_eq!(manifest.pod.name, "from-user");
+    }
+
+    #[test]
+    fn project_manifest_walks_up_from_nested_dir() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let project_manifest = root.join(".insomnia").join("manifest.toml");
+        write(
+            &project_manifest,
+            &format!(
+                r#"
+[pod]
+name = "walked-up"
+pwd = "{root}"
+
+[provider]
+kind = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[[scope.allow]]
+target = "{root}"
+permission = "write"
+"#,
+                root = root.display()
+            ),
+        );
+
+        let nested = root.join("a").join("b").join("c");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let manifest = PodFactory::new()
+            .with_project_manifest_from(&nested)
+            .unwrap()
+            .resolve()
+            .unwrap();
+        let manifest = manifest.0;
+        assert_eq!(manifest.pod.name, "walked-up");
+    }
+
+    #[test]
+    fn missing_project_root_is_ok() {
+        let tmp = TempDir::new().unwrap();
+        let pwd = tmp.path().canonicalize().unwrap();
+        let overlay = format!(
+            r#"
+[pod]
+name = "standalone"
+pwd = "{pwd}"
+
+[provider]
+kind = "anthropic"
+model = "m"
+
+[[scope.allow]]
+target = "{pwd}"
+permission = "write"
+"#,
+            pwd = pwd.display()
+        );
+
+        // The temp dir has no .insomnia/ — walking up should skip the
+        // project layer silently.
+        let manifest = PodFactory::new()
+            .with_project_manifest_from(&pwd)
+            .unwrap()
+            .with_overlay_toml(&overlay)
+            .unwrap()
+            .resolve()
+            .unwrap();
+        let manifest = manifest.0;
+        assert_eq!(manifest.pod.name, "standalone");
+    }
+
+    #[test]
+    fn resolve_produces_loader_with_project_prompts_dir() {
+        use crate::system_prompt::{SystemPromptContext, SystemPromptTemplate};
+        use manifest::{Permission, Scope, ScopeConfig, ScopeRule};
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        // .insomnia/manifest.toml and .insomnia/prompts/coder.md
+        let manifest_path = root.join(".insomnia").join("manifest.toml");
+        write(
+            &manifest_path,
+            &format!(
+                r#"
+[pod]
+name = "factory-pod"
+pwd = "{root}"
+
+[provider]
+kind = "anthropic"
+model = "m"
+
+[[scope.allow]]
+target = "{root}"
+permission = "write"
+"#,
+                root = root.display()
+            ),
+        );
+        let project_prompts_dir = root.join(".insomnia").join("prompts");
+        std::fs::create_dir_all(&project_prompts_dir).unwrap();
+        std::fs::write(
+            project_prompts_dir.join("coder.md"),
+            "PROJECT-OVERRIDE from {{ cwd }}",
+        )
+        .unwrap();
+
+        let (_manifest, loader) = PodFactory::new()
+            .with_project_manifest_from(&root)
+            .unwrap()
+            .resolve()
+            .unwrap();
+
+        // The loader must see the project override, not the builtin.
+        let source = "{% include \"coder\" %}";
+        let tmpl = SystemPromptTemplate::parse_with_loader(source, loader).unwrap();
+        let scope_cfg = ScopeConfig {
+            allow: vec![ScopeRule {
+                target: root.clone(),
+                permission: Permission::Write,
+                recursive: true,
+            }],
+            deny: Vec::new(),
+        };
+        let scope = Scope::from_config(&scope_cfg, &root).unwrap();
+        let ctx = SystemPromptContext {
+            now: chrono::Utc::now(),
+            cwd: &root,
+            scope: &scope,
+            tool_names: Vec::new(),
+            files: std::collections::BTreeMap::new(),
+        };
+        let rendered = tmpl.render(&ctx).unwrap();
+        assert!(
+            rendered.starts_with("PROJECT-OVERRIDE"),
+            "expected project override, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn resolve_fails_on_missing_required_field() {
+        let tmp = TempDir::new().unwrap();
+        let pwd = tmp.path().canonicalize().unwrap();
+        // pwd set but pod.name missing
+        let overlay = format!(
+            r#"
+[pod]
+pwd = "{pwd}"
+
+[provider]
+kind = "anthropic"
+model = "m"
+
+[[scope.allow]]
+target = "{pwd}"
+permission = "write"
+"#,
+            pwd = pwd.display()
+        );
+        let err = PodFactory::new()
+            .with_overlay_toml(&overlay)
+            .unwrap()
+            .resolve()
+            .unwrap_err();
+        assert!(matches!(err, FactoryError::Resolve(_)));
+    }
+}

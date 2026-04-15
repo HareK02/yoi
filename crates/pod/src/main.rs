@@ -1,18 +1,39 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
-use pod::{Pod, PodController};
+use pod::{Pod, PodController, PodFactory};
 use session_store::FsStore;
 
 #[derive(Parser)]
-#[command(name = "pod", about = "Run a Pod process from a manifest file")]
+#[command(
+    name = "pod",
+    about = "Spawn a Pod process from cascaded manifest layers"
+)]
 struct Cli {
-    /// Path to the manifest TOML file
-    #[arg(short, long)]
-    manifest: PathBuf,
+    /// User manifest TOML. Defaults to
+    /// `$XDG_CONFIG_HOME/insomnia/manifest.toml`.
+    #[arg(long, value_name = "PATH")]
+    user_manifest: Option<PathBuf>,
 
-    /// Directory for session persistence (default: ~/.insomnia/sessions/)
+    /// Start the project-manifest walk from this directory. When
+    /// omitted, the factory walks up from the current working
+    /// directory looking for `.insomnia/manifest.toml`.
+    #[arg(long, value_name = "PATH")]
+    project: Option<PathBuf>,
+
+    /// Inline TOML string applied as the highest-priority overlay
+    /// layer. Example: `--overlay 'pod.name = "dbg"'`.
+    #[arg(long, value_name = "TOML")]
+    overlay: Option<String>,
+
+    /// Shorthand that injects `pod.pwd = <path>` into the overlay
+    /// layer. `--pwd .` uses the current working directory.
+    #[arg(long, value_name = "PATH")]
+    pwd: Option<PathBuf>,
+
+    /// Directory for session persistence. Defaults to
+    /// `~/.insomnia/sessions/`.
     #[arg(short, long)]
     store: Option<PathBuf>,
 }
@@ -36,30 +57,83 @@ fn default_runtime_dir() -> Result<PathBuf, std::io::Error> {
     }
 }
 
+/// Turn CLI inputs into a single programmatic overlay TOML string,
+/// combining `--pwd` and `--overlay`. Returns `None` if neither flag
+/// is set.
+fn build_overlay_toml(pwd: Option<&PathBuf>, overlay: Option<&str>) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(pwd) = pwd {
+        // Canonicalize the pwd shorthand here so relative CLI arguments
+        // (e.g. `--pwd .`) turn into the absolute path required by the
+        // manifest cascade.
+        let absolute = std::fs::canonicalize(pwd).unwrap_or_else(|_| pwd.clone());
+        parts.push(format!(
+            "[pod]\npwd = \"{}\"\n",
+            absolute.display().to_string().replace('\\', "\\\\")
+        ));
+    }
+    if let Some(overlay) = overlay {
+        parts.push(overlay.to_string());
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n"))
+    }
+}
+
+async fn build_factory(cli: &Cli) -> Result<PodFactory, String> {
+    let mut factory = PodFactory::new();
+
+    factory = match &cli.user_manifest {
+        Some(path) => factory
+            .with_user_manifest(path)
+            .map_err(|e| format!("failed to load user manifest: {e}"))?,
+        None => factory
+            .with_user_manifest_auto()
+            .map_err(|e| format!("failed to auto-load user manifest: {e}"))?,
+    };
+
+    factory = match &cli.project {
+        Some(path) => factory
+            .with_project_manifest_from(path)
+            .map_err(|e| format!("failed to load project manifest: {e}"))?,
+        None => factory
+            .with_project_manifest_auto()
+            .map_err(|e| format!("failed to auto-load project manifest: {e}"))?,
+    };
+
+    if let Some(overlay) = build_overlay_toml(cli.pwd.as_ref(), cli.overlay.as_deref()) {
+        factory = factory
+            .with_overlay_toml(&overlay)
+            .map_err(|e| format!("failed to parse overlay TOML: {e}"))?;
+    }
+
+    Ok(factory)
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
 
-    // Read and parse the manifest
-    let toml_str = match tokio::fs::read_to_string(&cli.manifest).await {
-        Ok(s) => s,
+    let factory = match build_factory(&cli).await {
+        Ok(f) => f,
         Err(e) => {
-            eprintln!("error: failed to read manifest {:?}: {e}", cli.manifest);
-            return ExitCode::FAILURE;
-        }
-    };
-    let manifest = match manifest::PodManifest::from_toml(&toml_str) {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("error: invalid manifest: {e}");
+            eprintln!("error: {e}");
             return ExitCode::FAILURE;
         }
     };
 
-    let pod_name = manifest.pod.name.clone();
+    let (manifest, loader) = match factory.resolve() {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln!("error: failed to resolve manifest cascade: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     // Initialize persistent store
-    let store_dir = cli.store.unwrap_or_else(|| {
+    let store_dir = cli.store.clone().unwrap_or_else(|| {
         default_store_dir().unwrap_or_else(|_| PathBuf::from(".insomnia/sessions"))
     });
     let store = match FsStore::new(&store_dir).await {
@@ -70,17 +144,14 @@ async fn main() -> ExitCode {
         }
     };
 
-    // Build the Pod (pwd/scope derived from manifest + manifest_dir).
-    let manifest_dir = std::fs::canonicalize(&cli.manifest)
-        .ok()
-        .and_then(|p| p.parent().map(Path::to_path_buf));
-    let pod = match Pod::from_manifest(manifest, store, manifest_dir).await {
+    let pod = match Pod::from_manifest(manifest, store, loader).await {
         Ok(p) => p,
         Err(e) => {
             eprintln!("error: failed to create pod: {e}");
             return ExitCode::FAILURE;
         }
     };
+    let pod_name = pod.manifest().pod.name.clone();
 
     // Spawn the controller (starts socket server)
     let runtime_base = match default_runtime_dir() {
@@ -113,8 +184,6 @@ async fn main() -> ExitCode {
         }
     }
 
-    // TODO: handle.shutdown().await — PodController に採用しないスフルシャットダウン機構を追加したら組み込む
     drop(handle);
-
     ExitCode::SUCCESS
 }

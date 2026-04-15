@@ -11,7 +11,7 @@ use session_store::{
 };
 use tracing::{info, warn};
 
-use manifest::{PodManifest, Scope, ScopeError, WorkerManifest};
+use manifest::{PodManifest, PodManifestConfig, ResolveError, Scope, ScopeError, WorkerManifest};
 
 use crate::agents_md::read_agents_md;
 use crate::compact_interceptor::CompactInterceptor;
@@ -22,6 +22,7 @@ use crate::hook::{
 };
 use crate::hook_interceptor::HookInterceptor;
 use crate::notifier::Notifier;
+use crate::prompt_loader::PromptLoader;
 use crate::system_prompt::{SystemPromptContext, SystemPromptError, SystemPromptTemplate};
 use crate::usage_tracker::UsageTracker;
 use protocol::{NotificationLevel, NotificationSource};
@@ -74,8 +75,6 @@ pub struct Pod<C: LlmClient, St: Store> {
     scope: Scope,
     hook_builder: HookRegistryBuilder,
     interceptor_installed: bool,
-    /// Directory containing the manifest file (needed for api_key_file resolution).
-    manifest_dir: Option<PathBuf>,
     /// Shared compaction state (present when compact_threshold is configured).
     compact_state: Option<Arc<CompactState>>,
     /// Per-LLM-request Usage tracker. Always present after construction.
@@ -136,7 +135,6 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             scope,
             hook_builder: HookRegistryBuilder::new(),
             interceptor_installed: false,
-            manifest_dir: None,
             compact_state: None,
             usage_tracker: Arc::new(UsageTracker::new()),
             usage_history: Arc::new(Mutex::new(Vec::<UsageRecord>::new())),
@@ -185,7 +183,6 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             scope,
             hook_builder: HookRegistryBuilder::new(),
             interceptor_installed: false,
-            manifest_dir: None,
             compact_state: None,
             usage_tracker: Arc::new(UsageTracker::new()),
             usage_history: Arc::new(Mutex::new(state.usage_history)),
@@ -807,10 +804,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     fn build_compactor_client(&self) -> Result<Box<dyn LlmClient>, PodError> {
         if let Some(ref compaction) = self.manifest.compaction {
             if let Some(ref provider_config) = compaction.provider {
-                let client = provider::build_client(
-                    provider_config,
-                    self.manifest_dir.as_deref().map(|p| p.as_ref()),
-                )?;
+                let client = provider::build_client(provider_config)?;
                 return Ok(client);
             }
         }
@@ -820,24 +814,30 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
 }
 
 impl<St: Store> Pod<Box<dyn LlmClient>, St> {
-    /// Create a Pod entirely from a manifest.
+    /// Create a Pod entirely from a validated manifest.
     ///
-    /// Resolves `manifest.pod.pwd` against `manifest_dir` (or the
-    /// current working directory when absent), builds the [`Scope`]
-    /// from `manifest.scope`, and validates that the resolved pwd is
-    /// readable under that scope.
+    /// `manifest.pod.pwd` must already be an absolute path (the cascade
+    /// layer — `PodManifestConfig` → `PodManifest` — is the sole place
+    /// where path normalisation happens). The Pod builds its [`Scope`]
+    /// from `manifest.scope`, canonicalizes the pwd, and validates that
+    /// the resolved pwd is readable under that scope.
+    ///
+    /// `loader` is installed into the system-prompt template
+    /// environment so that `{% include "name" %}` /
+    /// `{% import "name" %}` references resolve against the three-layer
+    /// prompt asset library.
     pub async fn from_manifest(
         manifest: PodManifest,
         store: St,
-        manifest_dir: Option<PathBuf>,
+        loader: PromptLoader,
     ) -> Result<Self, PodError> {
-        let pwd = resolve_pwd(&manifest.pod.pwd, manifest_dir.as_deref())?;
+        let pwd = resolve_pwd(&manifest.pod.pwd)?;
         let scope = Scope::from_config(&manifest.scope, &pwd).map_err(PodError::Scope)?;
         if !scope.is_readable(&pwd) {
             return Err(PodError::PwdOutsideScope { pwd });
         }
 
-        let client = provider::build_client(&manifest.provider, manifest_dir.as_deref())?;
+        let client = provider::build_client(&manifest.provider)?;
         let mut worker = Worker::new(client);
         apply_worker_manifest(&mut worker, &manifest.worker);
 
@@ -847,7 +847,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
         // scope summary, ...) can be injected.
         let system_prompt_template = match manifest.worker.system_prompt.as_deref() {
             Some(source) => Some(
-                SystemPromptTemplate::parse(source)
+                SystemPromptTemplate::parse_with_loader(source, loader)
                     .map_err(|source| PodError::InvalidSystemPromptTemplate { source })?,
             ),
             None => None,
@@ -867,7 +867,6 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             scope,
             hook_builder: HookRegistryBuilder::new(),
             interceptor_installed: false,
-            manifest_dir,
             compact_state: None,
             usage_tracker: Arc::new(UsageTracker::new()),
             usage_history: Arc::new(Mutex::new(Vec::new())),
@@ -877,6 +876,18 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
         };
         pod.apply_prune_from_manifest();
         Ok(pod)
+    }
+
+    /// Convenience: build a Pod from a single-layer TOML manifest string.
+    ///
+    /// Parses the TOML into a [`PodManifestConfig`], converts to a
+    /// validated [`PodManifest`] via `TryFrom`, then delegates to
+    /// [`Pod::from_manifest`]. Useful for tests, debugging, and any
+    /// caller that wants to skip the cascade entirely.
+    pub async fn from_manifest_toml(toml: &str, store: St) -> Result<Self, PodError> {
+        let config = PodManifestConfig::from_toml(toml).map_err(PodError::ManifestParse)?;
+        let manifest = PodManifest::try_from(config).map_err(PodError::ManifestResolve)?;
+        Self::from_manifest(manifest, store, PromptLoader::builtins_only()).await
     }
 }
 
@@ -984,6 +995,15 @@ pub enum PodError {
         source: std::io::Error,
     },
 
+    #[error("pwd must be absolute: {}", .0.display())]
+    PwdNotAbsolute(PathBuf),
+
+    #[error("failed to parse manifest TOML: {0}")]
+    ManifestParse(#[source] toml::de::Error),
+
+    #[error("failed to resolve manifest config: {0}")]
+    ManifestResolve(#[source] ResolveError),
+
     #[error(transparent)]
     Provider(#[from] provider::ProviderError),
 
@@ -1003,22 +1023,16 @@ pub enum PodError {
     },
 }
 
-/// Resolve the pwd declared in a manifest against `manifest_dir` (or the
-/// current working directory when absent), canonicalizing symlinks.
-fn resolve_pwd(pwd: &Path, manifest_dir: Option<&Path>) -> Result<PathBuf, PodError> {
-    let joined = if pwd.is_absolute() {
-        pwd.to_path_buf()
-    } else {
-        let base = manifest_dir
-            .map(Path::to_path_buf)
-            .or_else(|| std::env::current_dir().ok())
-            .unwrap_or_else(|| PathBuf::from("."));
-        base.join(pwd)
-    };
-    joined
-        .canonicalize()
-        .map_err(|source| PodError::InvalidPwd {
-            pwd: joined,
-            source,
-        })
+/// Canonicalize an absolute pwd (resolves symlinks and any `.`/`..`
+/// components). Relative inputs are rejected — the cascade layer is
+/// the sole source of path normalisation and must hand off an absolute
+/// path.
+fn resolve_pwd(pwd: &Path) -> Result<PathBuf, PodError> {
+    if !pwd.is_absolute() {
+        return Err(PodError::PwdNotAbsolute(pwd.to_path_buf()));
+    }
+    pwd.canonicalize().map_err(|source| PodError::InvalidPwd {
+        pwd: pwd.to_path_buf(),
+        source,
+    })
 }

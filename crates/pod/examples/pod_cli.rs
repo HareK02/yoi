@@ -14,10 +14,13 @@
 use pod::{Pod, PodManifest, PodRunResult};
 use session_store::FsStore;
 
-const MANIFEST_TOML: &str = r#"
+fn manifest_toml(pwd: &std::path::Path) -> String {
+    let pwd = pwd.display();
+    format!(
+        r#"
 [pod]
 name = "hello-pod"
-pwd = "./"
+pwd = "{pwd}"
 
 [provider]
 kind = "anthropic"
@@ -28,24 +31,29 @@ system_prompt = "You are a concise assistant. Reply in one or two sentences."
 max_tokens = 256
 
 [[scope.allow]]
-target = "./"
+target = "{pwd}"
 permission = "write"
-"#;
+"#
+    )
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenv::dotenv().ok();
 
-    // 1. Parse the manifest
-    let manifest = PodManifest::from_toml(MANIFEST_TOML)?;
-    println!("Pod: {}", manifest.pod.name);
+    // 1. Build a manifest rooted at the current working directory.
+    //    All paths in a manifest must be absolute — see the pod-factory ticket.
+    let pwd = std::env::current_dir()?;
+    let toml = manifest_toml(&pwd);
 
     // 2. Create a persistent store (temp dir for demo)
     let tmp = tempfile::tempdir()?;
     let store = FsStore::new(tmp.path()).await?;
 
-    // 3. Build the Pod from manifest
-    let mut pod = Pod::from_manifest(manifest, store, None).await?;
+    // 3. Build the Pod from the single-layer manifest TOML
+    let mut pod = Pod::from_manifest_toml(&toml, store).await?;
+    let manifest: &PodManifest = pod.manifest();
+    println!("Pod: {}", manifest.pod.name);
     println!("Session: {}", pod.session_id());
 
     // 4. Run a prompt

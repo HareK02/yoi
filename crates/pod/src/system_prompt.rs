@@ -14,8 +14,10 @@ use std::sync::Arc;
 use chrono::{DateTime, SecondsFormat, Utc};
 use manifest::Scope;
 use minijinja::value::Value;
-use minijinja::{Environment, UndefinedBehavior};
+use minijinja::{Environment, ErrorKind, UndefinedBehavior};
 use thiserror::Error;
+
+use crate::prompt_loader::PromptLoader;
 
 const TEMPLATE_NAME: &str = "system_prompt";
 
@@ -35,11 +37,31 @@ pub struct SystemPromptTemplate {
 }
 
 impl SystemPromptTemplate {
-    /// Parse a template source. Performs syntax validation only — no
-    /// variable resolution is attempted here.
+    /// Parse a template source with a builtins-only prompt loader.
+    /// Convenience wrapper for callers that do not need user/project
+    /// prompt layers — see [`SystemPromptTemplate::parse_with_loader`]
+    /// for the factory-driven path.
     pub fn parse(source: impl Into<String>) -> Result<Self, SystemPromptError> {
+        Self::parse_with_loader(source, PromptLoader::builtins_only())
+    }
+
+    /// Parse a template source with a custom prompt loader installed.
+    /// The loader resolves `{% include "name" %}` / `{% import "name" %}`
+    /// references by consulting the cascade layers (project → user →
+    /// builtin) before reporting a missing template.
+    pub fn parse_with_loader(
+        source: impl Into<String>,
+        loader: PromptLoader,
+    ) -> Result<Self, SystemPromptError> {
         let mut env = Environment::new();
         env.set_undefined_behavior(UndefinedBehavior::Strict);
+        env.set_loader(move |name| match loader.lookup(name) {
+            Some(source) => Ok(Some(source)),
+            None => Err(minijinja::Error::new(
+                ErrorKind::TemplateNotFound,
+                format!("prompt asset '{name}' not found"),
+            )),
+        });
         env.add_template_owned(TEMPLATE_NAME, source.into())
             .map_err(|e| SystemPromptError::Parse(e.to_string()))?;
         Ok(Self { env: Arc::new(env) })
@@ -228,6 +250,45 @@ mod tests {
         let rendered = t.render(&ctx(dir.path(), &scope, vec![])).unwrap();
         assert!(rendered.starts_with("Readable:"));
         assert!(rendered.contains(&dir.path().canonicalize().unwrap().display().to_string()));
+    }
+
+    #[test]
+    fn include_resolves_builtin_prompt() {
+        // User-supplied source pulls in a builtin via the loader.
+        let source = "HEAD\n{% include \"common/tool-usage\" %}";
+        let tmpl = SystemPromptTemplate::parse_with_loader(
+            source,
+            PromptLoader::builtins_only(),
+        )
+        .unwrap();
+        let dir = TempDir::new().unwrap();
+        let scope = build_scope(dir.path());
+        let rendered = tmpl
+            .render(&ctx(
+                dir.path(),
+                &scope,
+                vec!["Read".into(), "Edit".into()],
+            ))
+            .unwrap();
+        assert!(rendered.starts_with("HEAD"));
+        // The common/tool-usage builtin references {{ tools | join(", ") }}
+        // so including it must have resolved that expression with the
+        // parent scope's variables.
+        assert!(rendered.contains("Read"));
+        assert!(rendered.contains("Edit"));
+    }
+
+    #[test]
+    fn include_unknown_prompt_fails_at_render() {
+        let tmpl = SystemPromptTemplate::parse_with_loader(
+            "{% include \"nonexistent-prompt\" %}",
+            PromptLoader::builtins_only(),
+        )
+        .unwrap();
+        let dir = TempDir::new().unwrap();
+        let scope = build_scope(dir.path());
+        let err = tmpl.render(&ctx(dir.path(), &scope, vec![])).unwrap_err();
+        assert!(matches!(err, SystemPromptError::Render(_)));
     }
 
     #[test]

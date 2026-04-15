@@ -1,5 +1,11 @@
+mod config;
+pub mod defaults;
 mod scope;
 
+pub use config::{
+    CompactionConfigPartial, PodManifestConfig, PodMetaConfig, ProviderConfigPartial, ResolveError,
+    ToolOutputLimitsPartial, WorkerManifestConfig,
+};
 pub use scope::{Scope, ScopeError};
 
 use std::collections::HashMap;
@@ -106,7 +112,7 @@ pub struct ToolOutputLimits {
 }
 
 fn default_tool_output_max_bytes() -> usize {
-    16 * 1024
+    defaults::TOOL_OUTPUT_MAX_BYTES
 }
 
 impl Default for ToolOutputLimits {
@@ -206,13 +212,13 @@ pub struct CompactionConfig {
 }
 
 fn default_prune_protected_turns() -> usize {
-    3
+    defaults::PRUNE_PROTECTED_TURNS
 }
 fn default_prune_min_savings() -> u64 {
-    4096
+    defaults::PRUNE_MIN_SAVINGS
 }
 fn default_compact_retained_turns() -> usize {
-    2
+    defaults::COMPACT_RETAINED_TURNS
 }
 
 impl Default for CompactionConfig {
