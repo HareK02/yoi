@@ -58,10 +58,12 @@ impl PodController {
         let (event_tx, _) = broadcast::channel::<Event>(256);
 
         let manifest_toml = toml::to_string_pretty(pod.manifest()).unwrap_or_default();
+        let greeting = build_greeting(&pod);
         let shared_state = Arc::new(PodSharedState::new(
             pod.manifest().pod.name.clone(),
             pod.session_id(),
             manifest_toml.clone(),
+            greeting,
         ));
 
         // Create runtime directory and write initial files
@@ -334,6 +336,37 @@ where
                 }
             }
         }
+    }
+}
+
+fn build_greeting<C, St>(pod: &Pod<C, St>) -> protocol::Greeting
+where
+    C: LlmClient,
+    St: Store,
+{
+    let manifest = pod.manifest();
+    let provider = match manifest.provider.kind {
+        manifest::ProviderKind::Anthropic => "anthropic",
+        manifest::ProviderKind::Openai => "openai",
+        manifest::ProviderKind::Gemini => "gemini",
+        manifest::ProviderKind::Ollama => "ollama",
+    };
+    // The tool list mirrors `builtin_tools`. A fresh `ScopedFs`/`Tracker`
+    // is instantiated only to invoke the factories for name extraction;
+    // the instances themselves are discarded.
+    let fs = tools::ScopedFs::new(pod.scope().clone(), pod.pwd().to_path_buf());
+    let tracker = tools::Tracker::new();
+    let tool_names = tools::builtin_tools(fs, tracker)
+        .iter()
+        .map(|def| def().0.name)
+        .collect();
+    protocol::Greeting {
+        pod_name: manifest.pod.name.clone(),
+        cwd: pod.pwd().display().to_string(),
+        provider: provider.into(),
+        model: manifest.provider.model.clone(),
+        scope_summary: pod.scope().summary(),
+        tools: tool_names,
     }
 }
 

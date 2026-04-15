@@ -1,4 +1,4 @@
-use protocol::{Event, Method};
+use protocol::{Event, Greeting, Method};
 
 pub struct App {
     pub pod_name: String,
@@ -23,6 +23,7 @@ pub enum OutputItem {
     TurnHeader(String),
     Padded(MessageKind, String),
     PaddedRight(MessageKind, String),
+    GreetingCard(Greeting),
     Blank,
 }
 
@@ -165,8 +166,13 @@ impl App {
                 self.current_tool = None;
             }
             Event::ToolCallArgsDelta { .. } => {}
-            Event::History { items } => {
+            Event::History { items, greeting } => {
                 self.restore_history(&items);
+                if self.turn_index == 0 {
+                    self.output_queue
+                        .insert(0, OutputItem::GreetingCard(greeting));
+                    self.output_queue.insert(1, OutputItem::Blank);
+                }
             }
         }
     }

@@ -2,8 +2,10 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Padding, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph, Wrap};
 use unicode_width::UnicodeWidthStr;
+
+use protocol::Greeting;
 
 use crate::app::{App, MessageKind, OutputItem, fmt_tokens};
 
@@ -58,6 +60,34 @@ pub fn flush_output(
                 terminal.insert_before(height, |buf| {
                     Paragraph::new(lines)
                         .block(Block::default().padding(Padding::left(1)))
+                        .wrap(Wrap { trim: false })
+                        .render(buf.area, buf);
+                })?;
+            }
+            OutputItem::GreetingCard(g) => {
+                let lines = greeting_lines(&g);
+                let inner_width = width.saturating_sub(4);
+                let body_height: u16 = lines
+                    .iter()
+                    .map(|l| {
+                        let w = l.width() as u16;
+                        if inner_width == 0 || w == 0 {
+                            1
+                        } else {
+                            w.div_ceil(inner_width)
+                        }
+                    })
+                    .sum();
+                let height = body_height + 2; // top + bottom border
+                terminal.insert_before(height, |buf| {
+                    Paragraph::new(lines)
+                        .block(
+                            Block::default()
+                                .borders(Borders::ALL)
+                                .border_type(BorderType::Rounded)
+                                .border_style(Style::default().fg(Color::DarkGray))
+                                .padding(Padding::horizontal(1)),
+                        )
                         .wrap(Wrap { trim: false })
                         .render(buf.area, buf);
                 })?;
@@ -157,6 +187,41 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
     let cursor_x = area.x + 2 + UnicodeWidthStr::width(&app.input[..app.cursor]) as u16;
     let cursor_y = area.y;
     frame.set_cursor_position(Position::new(cursor_x, cursor_y));
+}
+
+fn greeting_lines(g: &Greeting) -> Vec<Line<'static>> {
+    let label = Style::default().fg(Color::DarkGray);
+    let value = Style::default().fg(Color::White);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    lines.push(Line::from(Span::styled(
+        g.pod_name.clone(),
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(Span::styled(
+        format!("{} ({})", g.model, g.provider),
+        Style::default().fg(Color::Cyan),
+    )));
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("cwd:   ", label),
+        Span::styled(g.cwd.clone(), value),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("tools: ", label),
+        Span::styled(g.tools.join(", "), value),
+    ]));
+
+    if !g.scope_summary.is_empty() {
+        lines.push(Line::from(""));
+        for line in g.scope_summary.lines() {
+            lines.push(Line::from(Span::styled(line.to_owned(), value)));
+        }
+    }
+
+    lines
 }
 
 pub fn kind_style(kind: &MessageKind) -> Style {

@@ -109,6 +109,14 @@ mod tests {
             "test-pod".into(),
             session_store::new_session_id(),
             "[pod]\nname = \"test-pod\"".into(),
+            protocol::Greeting {
+                pod_name: "test-pod".into(),
+                cwd: "/tmp".into(),
+                provider: "anthropic".into(),
+                model: "claude".into(),
+                scope_summary: String::new(),
+                tools: Vec::new(),
+            },
         )
     }
 

@@ -66,7 +66,23 @@ pub enum Event {
     },
     History {
         items: Vec<serde_json::Value>,
+        greeting: Greeting,
     },
+}
+
+/// Pod self-description rendered by the TUI when a session starts empty.
+///
+/// Built once in the Pod controller from the resolved manifest and
+/// transmitted alongside `Event::History` so clients don't need their
+/// own view of the manifest.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Greeting {
+    pub pod_name: String,
+    pub cwd: String,
+    pub provider: String,
+    pub model: String,
+    pub scope_summary: String,
+    pub tools: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -153,12 +169,22 @@ mod tests {
     fn event_history_format() {
         let event = Event::History {
             items: vec![serde_json::json!({"type": "message", "role": "user"})],
+            greeting: Greeting {
+                pod_name: "test".into(),
+                cwd: "/tmp".into(),
+                provider: "anthropic".into(),
+                model: "claude".into(),
+                scope_summary: "Writable:\n  - /tmp".into(),
+                tools: vec!["Read".into()],
+            },
         };
         let json = serde_json::to_string(&event).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["event"], "history");
         assert!(parsed["data"]["items"].is_array());
         assert_eq!(parsed["data"]["items"][0]["role"], "user");
+        assert_eq!(parsed["data"]["greeting"]["pod_name"], "test");
+        assert_eq!(parsed["data"]["greeting"]["tools"][0], "Read");
     }
 
     #[test]

@@ -12,6 +12,7 @@ pub struct PodSharedState {
     pub pod_name: String,
     pub session_id: SessionId,
     pub manifest_toml: String,
+    pub greeting: protocol::Greeting,
     pub status: RwLock<PodStatus>,
     pub history: RwLock<Vec<Item>>,
 }
@@ -25,11 +26,17 @@ pub enum PodStatus {
 }
 
 impl PodSharedState {
-    pub fn new(pod_name: String, session_id: SessionId, manifest_toml: String) -> Self {
+    pub fn new(
+        pod_name: String,
+        session_id: SessionId,
+        manifest_toml: String,
+        greeting: protocol::Greeting,
+    ) -> Self {
         Self {
             pod_name,
             session_id,
             manifest_toml,
+            greeting,
             status: RwLock::new(PodStatus::Idle),
             history: RwLock::new(Vec::new()),
         }
@@ -86,7 +93,19 @@ mod tests {
             "test-pod".into(),
             session_store::new_session_id(),
             "[pod]\nname = \"test-pod\"".into(),
+            test_greeting(),
         )
+    }
+
+    fn test_greeting() -> protocol::Greeting {
+        protocol::Greeting {
+            pod_name: "test-pod".into(),
+            cwd: "/tmp".into(),
+            provider: "anthropic".into(),
+            model: "claude".into(),
+            scope_summary: String::new(),
+            tools: Vec::new(),
+        }
     }
 
     #[test]

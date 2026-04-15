@@ -85,7 +85,15 @@ async fn handle_connection(stream: tokio::net::UnixStream, handle: PodHandle) {
                             .iter()
                             .map(|item| serde_json::to_value(item).expect("Item is Serialize"))
                             .collect();
-                        if writer.write(&Event::History { items: values }).await.is_err() {
+                        let greeting = handle.shared_state.greeting.clone();
+                        if writer
+                            .write(&Event::History {
+                                items: values,
+                                greeting,
+                            })
+                            .await
+                            .is_err()
+                        {
                             break;
                         }
                     }
