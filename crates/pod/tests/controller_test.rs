@@ -111,9 +111,9 @@ use pod::PodHandle;
 async fn spawn_controller(pod: Pod<MockClient, FsStore>) -> PodHandle {
     let tmp = tempfile::tempdir().unwrap();
     let runtime_base = tmp.path().to_owned();
-    // Leak tempdir so it survives the test
     std::mem::forget(tmp);
-    PodController::spawn(pod, &runtime_base).await.unwrap()
+    let (handle, _shutdown_rx) = PodController::spawn(pod, &runtime_base).await.unwrap();
+    handle
 }
 
 // ---------------------------------------------------------------------------

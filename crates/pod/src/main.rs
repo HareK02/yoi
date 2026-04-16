@@ -157,8 +157,8 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let handle = match PodController::spawn(pod, &runtime_base).await {
-        Ok(h) => h,
+    let (handle, shutdown_rx) = match PodController::spawn(pod, &runtime_base).await {
+        Ok(pair) => pair,
         Err(e) => {
             eprintln!("error: failed to start pod controller: {e}");
             return ExitCode::FAILURE;
@@ -170,13 +170,12 @@ async fn main() -> ExitCode {
         handle.runtime_dir.socket_path()
     );
 
-    // Wait for shutdown signal
-    match tokio::signal::ctrl_c().await {
-        Ok(()) => {
-            eprintln!("pod: {pod_name} shutting down");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            eprintln!("pod: {pod_name} shutting down (signal)");
         }
-        Err(e) => {
-            eprintln!("error: failed to listen for signal: {e}");
+        _ = shutdown_rx => {
+            eprintln!("pod: {pod_name} shutting down (client request)");
         }
     }
 

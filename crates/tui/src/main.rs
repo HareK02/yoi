@@ -168,6 +168,9 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Option<Method> {
         }
         KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => Some(Method::Resume),
         KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => Some(Method::Cancel),
+        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            return handle_shutdown(app);
+        }
         KeyCode::Enter => app.submit_input(),
         KeyCode::Backspace => {
             app.delete_char_before();
@@ -199,4 +202,24 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Option<Method> {
         }
         _ => None,
     }
+}
+
+const SHUTDOWN_CONFIRM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+fn handle_shutdown(app: &mut App) -> Option<Method> {
+    if !app.running {
+        return Some(Method::Shutdown);
+    }
+    if let Some(t) = app.shutdown_confirm {
+        if t.elapsed() < SHUTDOWN_CONFIRM_TIMEOUT {
+            app.shutdown_confirm = None;
+            return Some(Method::Shutdown);
+        }
+    }
+    app.shutdown_confirm = Some(std::time::Instant::now());
+    app.output_queue.push(app::OutputItem::Padded(
+        app::MessageKind::Error,
+        "Turn is running. Press Ctrl-D again to cancel and shut down.".into(),
+    ));
+    None
 }

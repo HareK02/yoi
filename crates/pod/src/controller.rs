@@ -4,7 +4,7 @@ use std::sync::Arc;
 use llm_worker::WorkerError;
 use llm_worker::llm_client::client::LlmClient;
 use session_store::Store;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::notifier::Notifier;
 use crate::pod::{Pod, PodError, PodRunResult};
@@ -50,17 +50,20 @@ impl PodHandle {
 // PodController — actor that owns a Pod
 // ---------------------------------------------------------------------------
 
+pub type ShutdownReceiver = oneshot::Receiver<()>;
+
 pub struct PodController;
 
 impl PodController {
     pub async fn spawn<C, St>(
         mut pod: Pod<C, St>,
         runtime_base: &Path,
-    ) -> Result<PodHandle, std::io::Error>
+    ) -> Result<(PodHandle, ShutdownReceiver), std::io::Error>
     where
         C: LlmClient + 'static,
         St: Store + 'static,
     {
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let (method_tx, mut method_rx) = mpsc::channel::<Method>(32);
         let (event_tx, _) = broadcast::channel::<Event>(256);
         let notifier = Notifier::new(event_tx.clone());
@@ -225,7 +228,7 @@ impl PodController {
                         shared_state.set_status(PodStatus::Running);
                         let _ = runtime_dir.write_status(&shared_state).await;
 
-                        let new_status = run_with_cancel_support(
+                        let (new_status, shutdown) = run_with_cancel_support(
                             pod.run(&input),
                             &mut method_rx,
                             &event_tx,
@@ -234,7 +237,6 @@ impl PodController {
                         )
                         .await;
 
-                        // Proactive post-run compaction (best-effort).
                         if new_status == PodStatus::Idle {
                             if let Err(e) = pod.try_post_run_compact().await {
                                 tracing::warn!(error = %e, "Post-run compaction error");
@@ -251,6 +253,11 @@ impl PodController {
                         shared_state.set_status(new_status);
                         let _ = runtime_dir.write_status(&shared_state).await;
                         let _ = runtime_dir.write_history(&shared_state).await;
+
+                        if shutdown {
+                            let _ = event_tx.send(Event::Shutdown);
+                            break;
+                        }
                     }
 
                     Method::Resume => {
@@ -264,7 +271,7 @@ impl PodController {
                         shared_state.set_status(PodStatus::Running);
                         let _ = runtime_dir.write_status(&shared_state).await;
 
-                        let new_status = run_with_cancel_support(
+                        let (new_status, shutdown) = run_with_cancel_support(
                             pod.resume(),
                             &mut method_rx,
                             &event_tx,
@@ -273,7 +280,6 @@ impl PodController {
                         )
                         .await;
 
-                        // Proactive post-run compaction (best-effort).
                         if new_status == PodStatus::Idle {
                             if let Err(e) = pod.try_post_run_compact().await {
                                 tracing::warn!(error = %e, "Post-run compaction error");
@@ -290,6 +296,11 @@ impl PodController {
                         shared_state.set_status(new_status);
                         let _ = runtime_dir.write_status(&shared_state).await;
                         let _ = runtime_dir.write_history(&shared_state).await;
+
+                        if shutdown {
+                            let _ = event_tx.send(Event::Shutdown);
+                            break;
+                        }
                     }
 
                     Method::Cancel => {
@@ -299,30 +310,39 @@ impl PodController {
                         });
                     }
 
+                    Method::Shutdown => {
+                        let _ = event_tx.send(Event::Shutdown);
+                        break;
+                    }
+
                     // GetHistory is handled at the socket layer (direct response).
                     // If it somehow reaches the controller, ignore it.
                     Method::GetHistory => {}
                 }
             }
+
+            let _ = shutdown_tx.send(());
         });
 
-        Ok(handle)
+        Ok((handle, shutdown_rx))
     }
 }
 
 /// Runs a Pod future while concurrently processing incoming methods.
-/// Only `Cancel` is handled during execution; `Run` and `Resume` get errors.
+///
+/// Returns `(final_status, shutdown_requested)`.
 async fn run_with_cancel_support<F>(
     pod_future: F,
     method_rx: &mut mpsc::Receiver<Method>,
     event_tx: &broadcast::Sender<Event>,
     cancel_tx: &mpsc::Sender<()>,
     shared_state: &Arc<PodSharedState>,
-) -> PodStatus
+) -> (PodStatus, bool)
 where
     F: std::future::Future<Output = Result<PodRunResult, PodError>>,
 {
     tokio::pin!(pod_future);
+    let mut shutdown_requested = false;
 
     loop {
         tokio::select! {
@@ -335,7 +355,7 @@ where
                             PodRunResult::LimitReached => (PodStatus::Idle, RunResult::LimitReached),
                         };
                         let _ = event_tx.send(Event::RunEnd { result: run_result });
-                        status
+                        (status, shutdown_requested)
                     }
                     Err(e) => {
                         let code = worker_error_code(&e);
@@ -343,7 +363,7 @@ where
                             code,
                             message: e.to_string(),
                         });
-                        PodStatus::Idle
+                        (PodStatus::Idle, shutdown_requested)
                     }
                 };
             }
@@ -352,19 +372,21 @@ where
                     Some(Method::Cancel) => {
                         let _ = cancel_tx.try_send(());
                     }
+                    Some(Method::Shutdown) => {
+                        shutdown_requested = true;
+                        let _ = cancel_tx.try_send(());
+                    }
                     Some(Method::Run { .. } | Method::Resume) => {
                         let _ = event_tx.send(Event::Error {
                             code: ErrorCode::AlreadyRunning,
                             message: "Pod is already executing a turn".into(),
                         });
                     }
-                    Some(Method::GetHistory) => {
-                        // Handled at socket layer; ignore here.
-                    }
+                    Some(Method::GetHistory) => {}
                     None => {
                         let _ = cancel_tx.try_send(());
                         shared_state.set_status(PodStatus::Idle);
-                        return PodStatus::Idle;
+                        return (PodStatus::Idle, false);
                     }
                 }
             }

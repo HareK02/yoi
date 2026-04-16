@@ -19,7 +19,7 @@ mod usage_tracker;
 
 pub use token_counter::{EstimateSource, SplitPoint, TokenEstimate};
 
-pub use controller::{PodController, PodHandle};
+pub use controller::{PodController, PodHandle, ShutdownReceiver};
 pub use factory::{FactoryError, PodFactory};
 pub use notifier::Notifier;
 pub use hook::{Hook, HookEventKind, HookRegistryBuilder};

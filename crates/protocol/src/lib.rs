@@ -12,6 +12,7 @@ pub enum Method {
     Run { input: String },
     Resume,
     Cancel,
+    Shutdown,
     GetHistory,
 }
 
@@ -69,6 +70,7 @@ pub enum Event {
         greeting: Greeting,
     },
     Notification(Notification),
+    Shutdown,
 }
 
 /// User-facing notification emitted from the Pod layer.

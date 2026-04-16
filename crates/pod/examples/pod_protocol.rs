@@ -43,7 +43,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pod = pod::Pod::from_manifest_toml(&toml, store).await?;
 
     let runtime_tmp = tempfile::tempdir()?;
-    let handle = PodController::spawn(pod, runtime_tmp.path()).await?;
+    let (handle, _shutdown_rx) = PodController::spawn(pod, runtime_tmp.path()).await?;
 
     // Check initial status via shared state
     println!("[shared_state] {}", handle.shared_state.status_json());

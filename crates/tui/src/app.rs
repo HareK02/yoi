@@ -12,6 +12,7 @@ pub struct App {
     pub input: String,
     pub cursor: usize,
     pub quit: bool,
+    pub shutdown_confirm: Option<std::time::Instant>,
     /// Lines waiting to be flushed to terminal via insert_before.
     pub output_queue: Vec<OutputItem>,
     /// Partial streaming text not yet terminated by newline.
@@ -55,6 +56,7 @@ impl App {
             input: String::new(),
             cursor: 0,
             quit: false,
+            shutdown_confirm: None,
             output_queue: Vec::new(),
             pending_text: String::new(),
         }
@@ -192,6 +194,9 @@ impl App {
                         .insert(0, OutputItem::GreetingCard(greeting));
                     self.output_queue.insert(1, OutputItem::Blank);
                 }
+            }
+            Event::Shutdown => {
+                self.quit = true;
             }
         }
     }

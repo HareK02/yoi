@@ -5,6 +5,7 @@
 - [ ] Compact の改善（要約品質 + 挙動詳細） → [tickets/compact-improvements.md](tickets/compact-improvements.md)
 - [ ] Protocol の設計 → [tickets/protocol-design.md](tickets/protocol-design.md)
 - [ ] パーミッション: パターンベースのツール実行制御 → [tickets/permission-extension-point.md](tickets/permission-extension-point.md)
+- [ ] Pod オーケストレーション: LLM によるマルチエージェント分業 → [tickets/pod-orchestration.md](tickets/pod-orchestration.md)
 - [ ] ネイティブ GUI クライアント MVP → [tickets/native-gui-mvp.md](tickets/native-gui-mvp.md)
 - [ ] TUI 拡充
   - [ ] Pod の明示的 shutdown → [tickets/tui-pod-shutdown.md](tickets/tui-pod-shutdown.md)
