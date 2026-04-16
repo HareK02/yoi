@@ -1,11 +1,16 @@
 //! System prompt template machinery for the Pod layer.
 //!
-//! Manifests describe `system_prompt` as a minijinja template string.
-//! The template is parsed eagerly at `Pod::from_manifest` (syntax check
-//! only) and held on the Pod until `ensure_system_prompt_materialized`
-//! renders it exactly once, just before the first LLM turn. The rendered
-//! string is pushed to the worker via `set_system_prompt` and is reused
-//! for every subsequent turn, including after compaction.
+//! Manifests describe the system prompt body as a reference to a
+//! prompt asset (`worker.instruction`, see [`manifest::WorkerManifest`]).
+//! [`SystemPromptTemplate`] resolves that reference through a
+//! [`PromptLoader`], parses the source as a minijinja template, and
+//! eagerly syntax-checks it at Pod construction. The final system
+//! prompt is materialised exactly once just before the first LLM turn:
+//! the rendered body is appended with a fixed trailing section carrying
+//! the Pod's `Scope` summary and (if present) the project's `AGENTS.md`
+//! contents, and the whole string is handed to the Worker via
+//! `set_system_prompt`. Subsequent turns and compactions reuse that
+//! materialised string verbatim.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -17,87 +22,124 @@ use minijinja::value::Value;
 use minijinja::{Environment, ErrorKind, UndefinedBehavior};
 use thiserror::Error;
 
-use crate::prompt_loader::PromptLoader;
-
-const TEMPLATE_NAME: &str = "system_prompt";
+use crate::prompt_loader::{LoaderError, PromptLoader, PromptRef};
 
 #[derive(Debug, Error)]
 pub enum SystemPromptError {
+    #[error("failed to resolve instruction reference: {0}")]
+    LoaderResolve(#[source] LoaderError),
     #[error("system prompt template parse error: {0}")]
     Parse(String),
     #[error("system prompt template render error: {0}")]
     Render(String),
 }
 
-/// Parsed system-prompt template. Holds a minijinja Environment with a
-/// single named template; rendering only needs a fresh [`SystemPromptContext`].
+/// Parsed instruction template bound to a prompt loader.
+///
+/// Holds a minijinja Environment pre-populated with the instruction
+/// template registered under its fully-qualified name (`$prefix/path`).
+/// Includes are resolved via the loader using a path-join callback that
+/// tracks the including template's prefix and directory, so
+/// `{% include "sibling" %}` fragments work as expected.
 #[derive(Clone)]
 pub struct SystemPromptTemplate {
     env: Arc<Environment<'static>>,
+    instruction_name: String,
 }
 
 impl SystemPromptTemplate {
-    /// Parse a template source with a builtins-only prompt loader.
-    /// Convenience wrapper for callers that do not need user/project
-    /// prompt layers — see [`SystemPromptTemplate::parse_with_loader`]
-    /// for the factory-driven path.
-    pub fn parse(source: impl Into<String>) -> Result<Self, SystemPromptError> {
-        Self::parse_with_loader(source, PromptLoader::builtins_only())
-    }
-
-    /// Parse a template source with a custom prompt loader installed.
-    /// The loader resolves `{% include "name" %}` / `{% import "name" %}`
-    /// references by consulting the cascade layers (project → user →
-    /// builtin) before reporting a missing template.
-    pub fn parse_with_loader(
-        source: impl Into<String>,
+    /// Parse the instruction asset referenced by `instruction_ref`
+    /// using the supplied [`PromptLoader`]. The reference is resolved
+    /// at parse time so syntax errors surface immediately.
+    pub fn parse(
+        instruction_ref: &str,
         loader: PromptLoader,
     ) -> Result<Self, SystemPromptError> {
+        let root_ref = loader
+            .parse_ref(instruction_ref, None)
+            .map_err(SystemPromptError::LoaderResolve)?;
+        let source = loader
+            .load(&root_ref)
+            .map_err(SystemPromptError::LoaderResolve)?;
+        let root_name = root_ref.to_qualified_string();
+
         let mut env = Environment::new();
         env.set_undefined_behavior(UndefinedBehavior::Strict);
-        env.set_loader(move |name| match loader.lookup(name) {
-            Some(source) => Ok(Some(source)),
-            None => Err(minijinja::Error::new(
-                ErrorKind::TemplateNotFound,
-                format!("prompt asset '{name}' not found"),
-            )),
+
+        // Path-join callback: compute the target template name when a
+        // template includes another by a possibly-unqualified string.
+        // The joined name is then looked up via `set_loader` below.
+        let loader_for_join = loader.clone();
+        env.set_path_join_callback(move |name, parent| {
+            let parent_ref = loader_for_join
+                .parse_ref(parent, None)
+                .ok();
+            match loader_for_join.parse_ref(name, parent_ref.as_ref()) {
+                Ok(r) => r.to_qualified_string().into(),
+                // Propagate the raw name on error so set_loader surfaces
+                // a proper TemplateNotFound/LoaderError to the caller.
+                Err(_) => name.to_string().into(),
+            }
         });
-        env.add_template_owned(TEMPLATE_NAME, source.into())
+
+        let loader_for_src = loader.clone();
+        env.set_loader(move |name| {
+            let reference = loader_for_src
+                .parse_ref(name, None)
+                .map_err(|e| minijinja::Error::new(ErrorKind::TemplateNotFound, e.to_string()))?;
+            match loader_for_src.load(&reference) {
+                Ok(source) => Ok(Some(source)),
+                Err(e) => Err(minijinja::Error::new(ErrorKind::TemplateNotFound, e.to_string())),
+            }
+        });
+
+        env.add_template_owned(root_name.clone(), source)
             .map_err(|e| SystemPromptError::Parse(e.to_string()))?;
-        Ok(Self { env: Arc::new(env) })
+
+        Ok(Self {
+            env: Arc::new(env),
+            instruction_name: root_name,
+        })
     }
 
-    /// Render the template with the supplied context. Missing variables
-    /// surface as [`SystemPromptError::Render`].
+    /// Render the instruction body and append the fixed trailing
+    /// section (scope summary + optional AGENTS.md). The trailing
+    /// section is assembled in Rust so that authored templates cannot
+    /// accidentally omit the scope boundary or the project instructions.
     pub fn render(&self, ctx: &SystemPromptContext<'_>) -> Result<String, SystemPromptError> {
         let tmpl = self
             .env
-            .get_template(TEMPLATE_NAME)
+            .get_template(&self.instruction_name)
             .map_err(|e| SystemPromptError::Render(e.to_string()))?;
-        tmpl.render(ctx.to_minijinja_value())
-            .map_err(|e| SystemPromptError::Render(e.to_string()))
+        let body = tmpl
+            .render(ctx.to_minijinja_value())
+            .map_err(|e| SystemPromptError::Render(e.to_string()))?;
+        Ok(append_trailing_section(&body, ctx.scope, ctx.agents_md.as_deref()))
     }
 }
 
 impl std::fmt::Debug for SystemPromptTemplate {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SystemPromptTemplate")
+            .field("instruction", &self.instruction_name)
             .finish_non_exhaustive()
     }
 }
 
-/// Inputs available to a system-prompt template at materialisation time.
+/// Inputs available to an instruction template at materialisation time.
 ///
-/// `files` is reserved for AGENTS.md and other external file ingestion
-/// (supplied by a separate ticket). It is always present so template
-/// authors can reference `{{ files.agents_md }}` without having to guard
-/// for key existence.
+/// Scope summary and AGENTS.md are deliberately **not** exposed to the
+/// template — they live in the Rust-owned trailing section so user
+/// templates cannot drop them on the floor.
 pub struct SystemPromptContext<'a> {
     pub now: DateTime<Utc>,
     pub cwd: &'a Path,
     pub scope: &'a Scope,
     pub tool_names: Vec<String>,
-    pub files: BTreeMap<String, String>,
+    /// Project-level instructions read from the nearest `AGENTS.md`.
+    /// Not visible from the template; consumed by the trailing-section
+    /// formatter in [`SystemPromptTemplate::render`].
+    pub agents_md: Option<String>,
 }
 
 impl<'a> SystemPromptContext<'a> {
@@ -116,7 +158,6 @@ impl<'a> SystemPromptContext<'a> {
             Value::from(self.now.to_rfc3339_opts(SecondsFormat::Secs, true)),
         );
         root.insert("cwd".into(), Value::from(self.cwd.display().to_string()));
-        root.insert("scope".into(), scope_value(self.scope));
         root.insert(
             "tools".into(),
             Value::from(
@@ -127,33 +168,45 @@ impl<'a> SystemPromptContext<'a> {
                     .collect::<Vec<_>>(),
             ),
         );
-        root.insert(
-            "files".into(),
-            Value::from(
-                self.files
-                    .iter()
-                    .map(|(k, v)| (k.clone(), Value::from(v.clone())))
-                    .collect::<BTreeMap<String, Value>>(),
-            ),
-        );
         Value::from(root)
     }
 }
 
-fn scope_value(scope: &Scope) -> Value {
-    let readable: Vec<Value> = scope
-        .readable_paths()
-        .map(|p| Value::from(p.display().to_string()))
-        .collect();
-    let writable: Vec<Value> = scope
-        .writable_paths()
-        .map(|p| Value::from(p.display().to_string()))
-        .collect();
-    let mut obj: BTreeMap<String, Value> = BTreeMap::new();
-    obj.insert("readable".into(), Value::from(readable));
-    obj.insert("writable".into(), Value::from(writable));
-    obj.insert("summary".into(), Value::from(scope.summary()));
-    Value::from(obj)
+/// Build the final system prompt by appending the fixed trailing
+/// section to `body`. Exposed at the module level so callers that skip
+/// the template path (e.g. pre-rendered content in tests) can reuse the
+/// exact same formatter.
+pub fn append_trailing_section(body: &str, scope: &Scope, agents_md: Option<&str>) -> String {
+    let mut out = String::with_capacity(body.len() + 256);
+    out.push_str(body);
+    if !body.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push('\n');
+    out.push_str("---\n## Working boundaries\n\n");
+    out.push_str(&scope.summary());
+    out.push('\n');
+    if let Some(agents) = agents_md {
+        out.push('\n');
+        out.push_str("---\n## Project instructions (AGENTS.md)\n\n");
+        out.push_str(agents);
+        if !agents.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    // Trim trailing whitespace on the final line so the emitted prompt
+    // has a single canonical form regardless of input quirks.
+    while out.ends_with('\n') || out.ends_with(' ') {
+        out.pop();
+    }
+    out
+}
+
+/// Bridge used by [`Pod::ensure_system_prompt_materialized`] so tests
+/// can construct a synthetic context without going through a full Pod.
+#[doc(hidden)]
+pub fn __instruction_ref_for_tests(raw: &str, loader: &PromptLoader) -> Option<PromptRef> {
+    loader.parse_ref(raw, None).ok()
 }
 
 #[cfg(test)]
@@ -179,44 +232,167 @@ mod tests {
         Scope::from_config(&cfg, dir).unwrap()
     }
 
-    fn ctx<'a>(cwd: &'a Path, scope: &'a Scope, tools: Vec<String>) -> SystemPromptContext<'a> {
+    fn ctx<'a>(
+        cwd: &'a Path,
+        scope: &'a Scope,
+        tools: Vec<String>,
+        agents_md: Option<String>,
+    ) -> SystemPromptContext<'a> {
         SystemPromptContext {
             now: fixed_now(),
             cwd,
             scope,
             tool_names: tools,
-            files: BTreeMap::new(),
+            agents_md,
         }
     }
 
+    fn user_loader_with(file_name: &str, body: &str) -> (TempDir, PromptLoader) {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join(file_name), body).unwrap();
+        let loader = PromptLoader::new(Some(tmp.path().to_path_buf()), None);
+        (tmp, loader)
+    }
+
     #[test]
-    fn parse_succeeds_for_minimal_template() {
-        let t = SystemPromptTemplate::parse("hello").unwrap();
+    fn instruction_default_resolves_to_insomnia_default() {
+        let loader = PromptLoader::builtins_only();
+        let tmpl = SystemPromptTemplate::parse("$insomnia/default", loader).unwrap();
         let dir = TempDir::new().unwrap();
         let scope = build_scope(dir.path());
-        let rendered = t.render(&ctx(dir.path(), &scope, vec![])).unwrap();
-        assert_eq!(rendered, "hello");
+        let rendered = tmpl
+            .render(&ctx(dir.path(), &scope, vec!["Read".into()], None))
+            .unwrap();
+        // Trailing section must be present.
+        assert!(rendered.contains("## Working boundaries"));
+        assert!(rendered.contains("Readable:"));
+    }
+
+    #[test]
+    fn instruction_prefix_addressing_user() {
+        let (_tmp, loader) = user_loader_with("greet.md", "HELLO from {{ cwd }}");
+        let tmpl = SystemPromptTemplate::parse("$user/greet", loader).unwrap();
+        let dir = TempDir::new().unwrap();
+        let scope = build_scope(dir.path());
+        let rendered = tmpl.render(&ctx(dir.path(), &scope, vec![], None)).unwrap();
+        assert!(rendered.starts_with("HELLO from"));
+        assert!(rendered.contains("## Working boundaries"));
+    }
+
+    #[test]
+    fn instruction_prefix_addressing_workspace() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("ws.md"), "WS {{ date }}").unwrap();
+        let loader = PromptLoader::new(None, Some(tmp.path().to_path_buf()));
+        let tmpl = SystemPromptTemplate::parse("$workspace/ws", loader).unwrap();
+        let dir = TempDir::new().unwrap();
+        let scope = build_scope(dir.path());
+        let rendered = tmpl.render(&ctx(dir.path(), &scope, vec![], None)).unwrap();
+        assert!(rendered.starts_with("WS 2026-04-15"));
+    }
+
+    #[test]
+    fn include_unqualified_resolves_relative_to_current_prefix() {
+        let tmp = TempDir::new().unwrap();
+        // parent.md and sibling.md both under the user root.
+        std::fs::write(
+            tmp.path().join("parent.md"),
+            "PARENT\n{% include \"sibling\" %}",
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("sibling.md"), "SIBLING-BODY").unwrap();
+        let loader = PromptLoader::new(Some(tmp.path().to_path_buf()), None);
+        let tmpl = SystemPromptTemplate::parse("$user/parent", loader).unwrap();
+        let dir = TempDir::new().unwrap();
+        let scope = build_scope(dir.path());
+        let rendered = tmpl.render(&ctx(dir.path(), &scope, vec![], None)).unwrap();
+        assert!(rendered.contains("PARENT"));
+        assert!(rendered.contains("SIBLING-BODY"));
+    }
+
+    #[test]
+    fn include_unqualified_from_subdirectory_resolves_in_same_dir() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join("common")).unwrap();
+        std::fs::write(
+            tmp.path().join("common/header.md"),
+            "HEADER\n{% include \"nested\" %}",
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("common/nested.md"), "NESTED-OK").unwrap();
+        let loader = PromptLoader::new(Some(tmp.path().to_path_buf()), None);
+        let tmpl = SystemPromptTemplate::parse("$user/common/header", loader).unwrap();
+        let dir = TempDir::new().unwrap();
+        let scope = build_scope(dir.path());
+        let rendered = tmpl.render(&ctx(dir.path(), &scope, vec![], None)).unwrap();
+        assert!(rendered.contains("HEADER"));
+        assert!(rendered.contains("NESTED-OK"));
+    }
+
+    #[test]
+    fn include_explicit_prefix_overrides_relative() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("root.md"),
+            "U-ROOT\n{% include \"$insomnia/common/tool-usage\" %}",
+        )
+        .unwrap();
+        let loader = PromptLoader::new(Some(tmp.path().to_path_buf()), None);
+        let tmpl = SystemPromptTemplate::parse("$user/root", loader).unwrap();
+        let dir = TempDir::new().unwrap();
+        let scope = build_scope(dir.path());
+        let rendered = tmpl
+            .render(&ctx(
+                dir.path(),
+                &scope,
+                vec!["Read".into(), "Edit".into()],
+                None,
+            ))
+            .unwrap();
+        assert!(rendered.contains("U-ROOT"));
+        // Pulled in from the builtin tool-usage asset.
+        assert!(rendered.contains("Read"));
+    }
+
+    #[test]
+    fn prefix_with_missing_file_is_hard_error() {
+        let loader = PromptLoader::builtins_only();
+        let err = SystemPromptTemplate::parse("$insomnia/definitely-missing", loader).unwrap_err();
+        assert!(matches!(err, SystemPromptError::LoaderResolve(_)));
     }
 
     #[test]
     fn parse_fails_on_syntax_error() {
-        let err = SystemPromptTemplate::parse("{{ unclosed").unwrap_err();
+        let (_tmp, loader) = user_loader_with("broken.md", "{{ unclosed");
+        let err = SystemPromptTemplate::parse("$user/broken", loader).unwrap_err();
         assert!(matches!(err, SystemPromptError::Parse(_)));
     }
 
     #[test]
-    fn render_substitutes_date_cwd_tools() {
-        let t = SystemPromptTemplate::parse(
-            "date={{ date }} cwd={{ cwd }} tools={{ tools | join(',') }}",
-        )
-        .unwrap();
+    fn render_fails_on_undefined_variable() {
+        let (_tmp, loader) = user_loader_with("ghost.md", "{{ ghost }}");
+        let tmpl = SystemPromptTemplate::parse("$user/ghost", loader).unwrap();
         let dir = TempDir::new().unwrap();
         let scope = build_scope(dir.path());
-        let rendered = t
+        let err = tmpl.render(&ctx(dir.path(), &scope, vec![], None)).unwrap_err();
+        assert!(matches!(err, SystemPromptError::Render(_)));
+    }
+
+    #[test]
+    fn render_substitutes_date_cwd_tools() {
+        let (_tmp, loader) = user_loader_with(
+            "vars.md",
+            "date={{ date }} cwd={{ cwd }} tools={{ tools | join(',') }}",
+        );
+        let tmpl = SystemPromptTemplate::parse("$user/vars", loader).unwrap();
+        let dir = TempDir::new().unwrap();
+        let scope = build_scope(dir.path());
+        let rendered = tmpl
             .render(&ctx(
                 dir.path(),
                 &scope,
                 vec!["alpha".into(), "beta".into()],
+                None,
             ))
             .unwrap();
         assert!(rendered.contains("date=2026-04-15"));
@@ -225,81 +401,43 @@ mod tests {
     }
 
     #[test]
-    fn render_fails_on_undefined_variable() {
-        let t = SystemPromptTemplate::parse("{{ ghost }}").unwrap();
+    fn trailing_section_always_contains_scope_summary() {
+        let (_tmp, loader) = user_loader_with("body.md", "BODY");
+        let tmpl = SystemPromptTemplate::parse("$user/body", loader).unwrap();
         let dir = TempDir::new().unwrap();
         let scope = build_scope(dir.path());
-        let err = t.render(&ctx(dir.path(), &scope, vec![])).unwrap_err();
-        assert!(matches!(err, SystemPromptError::Render(_)));
+        let rendered = tmpl.render(&ctx(dir.path(), &scope, vec![], None)).unwrap();
+        assert!(rendered.contains("## Working boundaries"));
+        assert!(rendered.contains("Readable:"));
+        assert!(rendered.contains("Writable:"));
     }
 
     #[test]
-    fn escape_double_braces() {
-        let t = SystemPromptTemplate::parse("literal {{ '{{' }} here").unwrap();
-        let dir = TempDir::new().unwrap();
-        let scope = build_scope(dir.path());
-        let rendered = t.render(&ctx(dir.path(), &scope, vec![])).unwrap();
-        assert_eq!(rendered, "literal {{ here");
-    }
-
-    #[test]
-    fn scope_summary_renders() {
-        let t = SystemPromptTemplate::parse("{{ scope.summary }}").unwrap();
-        let dir = TempDir::new().unwrap();
-        let scope = build_scope(dir.path());
-        let rendered = t.render(&ctx(dir.path(), &scope, vec![])).unwrap();
-        assert!(rendered.starts_with("Readable:"));
-        assert!(rendered.contains(&dir.path().canonicalize().unwrap().display().to_string()));
-    }
-
-    #[test]
-    fn include_resolves_builtin_prompt() {
-        // User-supplied source pulls in a builtin via the loader.
-        let source = "HEAD\n{% include \"common/tool-usage\" %}";
-        let tmpl = SystemPromptTemplate::parse_with_loader(
-            source,
-            PromptLoader::builtins_only(),
-        )
-        .unwrap();
+    fn trailing_section_contains_agents_md_when_present() {
+        let (_tmp, loader) = user_loader_with("body.md", "BODY");
+        let tmpl = SystemPromptTemplate::parse("$user/body", loader).unwrap();
         let dir = TempDir::new().unwrap();
         let scope = build_scope(dir.path());
         let rendered = tmpl
             .render(&ctx(
                 dir.path(),
                 &scope,
-                vec!["Read".into(), "Edit".into()],
+                vec![],
+                Some("PROJECT DOCS".into()),
             ))
             .unwrap();
-        assert!(rendered.starts_with("HEAD"));
-        // The common/tool-usage builtin references {{ tools | join(", ") }}
-        // so including it must have resolved that expression with the
-        // parent scope's variables.
-        assert!(rendered.contains("Read"));
-        assert!(rendered.contains("Edit"));
+        assert!(rendered.contains("## Project instructions (AGENTS.md)"));
+        assert!(rendered.contains("PROJECT DOCS"));
     }
 
     #[test]
-    fn include_unknown_prompt_fails_at_render() {
-        let tmpl = SystemPromptTemplate::parse_with_loader(
-            "{% include \"nonexistent-prompt\" %}",
-            PromptLoader::builtins_only(),
-        )
-        .unwrap();
+    fn trailing_section_omits_agents_md_when_absent() {
+        let (_tmp, loader) = user_loader_with("body.md", "BODY");
+        let tmpl = SystemPromptTemplate::parse("$user/body", loader).unwrap();
         let dir = TempDir::new().unwrap();
         let scope = build_scope(dir.path());
-        let err = tmpl.render(&ctx(dir.path(), &scope, vec![])).unwrap_err();
-        assert!(matches!(err, SystemPromptError::Render(_)));
-    }
-
-    #[test]
-    fn files_reserved_namespace_is_empty() {
-        let t = SystemPromptTemplate::parse(
-            "{% if files.agents_md is defined %}yes{% else %}no{% endif %}",
-        )
-        .unwrap();
-        let dir = TempDir::new().unwrap();
-        let scope = build_scope(dir.path());
-        let rendered = t.render(&ctx(dir.path(), &scope, vec![])).unwrap();
-        assert_eq!(rendered, "no");
+        let rendered = tmpl.render(&ctx(dir.path(), &scope, vec![], None)).unwrap();
+        assert!(!rendered.contains("AGENTS.md"));
+        assert!(!rendered.contains("Project instructions"));
     }
 }

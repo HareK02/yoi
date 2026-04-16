@@ -150,32 +150,42 @@ impl Scope {
     /// Human-readable grouping of allow rules, suitable for embedding in
     /// LLM system prompts. Deny rules are intentionally omitted — they
     /// only cap effective permission and surface them would mislead the
-    /// reader about what paths are accessible.
+    /// reader about what paths are accessible. Rules with
+    /// `recursive = false` are tagged with a trailing `[non-recursive]`
+    /// marker so the model does not assume child paths are included.
     ///
     /// ```text
     /// Readable:
-    ///   - /abs/path1
+    ///   - /abs/path1 [non-recursive]
     /// Writable:
     ///   - /abs/path2
     /// ```
     pub fn summary(&self) -> String {
+        fn push_rule(out: &mut String, rule: &ResolvedRule) {
+            out.push_str("  - ");
+            out.push_str(&rule.target.display().to_string());
+            if !rule.recursive {
+                out.push_str(" [non-recursive]");
+            }
+            out.push('\n');
+        }
+
         let mut out = String::new();
-        let readable: Vec<_> = self.readable_paths().collect();
-        if !readable.is_empty() {
+        if !self.allow.is_empty() {
             out.push_str("Readable:\n");
-            for p in &readable {
-                out.push_str("  - ");
-                out.push_str(&p.display().to_string());
-                out.push('\n');
+            for rule in &self.allow {
+                push_rule(&mut out, rule);
             }
         }
-        let writable: Vec<_> = self.writable_paths().collect();
+        let writable: Vec<&ResolvedRule> = self
+            .allow
+            .iter()
+            .filter(|r| r.permission == Permission::Write)
+            .collect();
         if !writable.is_empty() {
             out.push_str("Writable:\n");
-            for p in &writable {
-                out.push_str("  - ");
-                out.push_str(&p.display().to_string());
-                out.push('\n');
+            for rule in &writable {
+                push_rule(&mut out, rule);
             }
         }
         if out.ends_with('\n') {
@@ -425,6 +435,41 @@ mod tests {
         let scope = Scope::from_config(&cfg, dir.path()).unwrap();
         let summary = scope.summary();
         assert!(!summary.contains("secret"));
+    }
+
+    #[test]
+    fn summary_marks_non_recursive_rules() {
+        let dir = TempDir::new().unwrap();
+        let docs = dir.path().join("docs");
+        std::fs::create_dir(&docs).unwrap();
+        let cfg = ScopeConfig {
+            allow: vec![
+                ScopeRule {
+                    target: docs.clone(),
+                    permission: Permission::Read,
+                    recursive: false,
+                },
+                ScopeRule {
+                    target: dir.path().to_path_buf(),
+                    permission: Permission::Write,
+                    recursive: true,
+                },
+            ],
+            deny: Vec::new(),
+        };
+        let scope = Scope::from_config(&cfg, dir.path()).unwrap();
+        let summary = scope.summary();
+        let docs_canon = docs.canonicalize().unwrap().display().to_string();
+        let dir_canon = dir.path().canonicalize().unwrap().display().to_string();
+        assert!(
+            summary.contains(&format!("{docs_canon} [non-recursive]")),
+            "expected non-recursive marker in: {summary}"
+        );
+        // Recursive rule must NOT carry the marker.
+        assert!(
+            !summary.contains(&format!("{dir_canon} [non-recursive]")),
+            "recursive rule incorrectly marked: {summary}"
+        );
     }
 
     #[test]

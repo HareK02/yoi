@@ -442,13 +442,13 @@ permission = "write"
     }
 
     #[test]
-    fn resolve_produces_loader_with_project_prompts_dir() {
+    fn resolve_produces_loader_with_workspace_prompts_dir() {
         use crate::system_prompt::{SystemPromptContext, SystemPromptTemplate};
         use manifest::{Permission, Scope, ScopeConfig, ScopeRule};
 
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().canonicalize().unwrap();
-        // .insomnia/manifest.toml and .insomnia/prompts/coder.md
+        // .insomnia/manifest.toml and .insomnia/prompts/local.md
         let manifest_path = root.join(".insomnia").join("manifest.toml");
         write(
             &manifest_path,
@@ -469,11 +469,11 @@ permission = "write"
                 root = root.display()
             ),
         );
-        let project_prompts_dir = root.join(".insomnia").join("prompts");
-        std::fs::create_dir_all(&project_prompts_dir).unwrap();
+        let workspace_prompts_dir = root.join(".insomnia").join("prompts");
+        std::fs::create_dir_all(&workspace_prompts_dir).unwrap();
         std::fs::write(
-            project_prompts_dir.join("coder.md"),
-            "PROJECT-OVERRIDE from {{ cwd }}",
+            workspace_prompts_dir.join("local.md"),
+            "WORKSPACE-BODY from {{ cwd }}",
         )
         .unwrap();
 
@@ -483,9 +483,8 @@ permission = "write"
             .resolve()
             .unwrap();
 
-        // The loader must see the project override, not the builtin.
-        let source = "{% include \"coder\" %}";
-        let tmpl = SystemPromptTemplate::parse_with_loader(source, loader).unwrap();
+        // The workspace prompt must be reachable via $workspace/local.
+        let tmpl = SystemPromptTemplate::parse("$workspace/local", loader).unwrap();
         let scope_cfg = ScopeConfig {
             allow: vec![ScopeRule {
                 target: root.clone(),
@@ -500,12 +499,12 @@ permission = "write"
             cwd: &root,
             scope: &scope,
             tool_names: Vec::new(),
-            files: std::collections::BTreeMap::new(),
+            agents_md: None,
         };
         let rendered = tmpl.render(&ctx).unwrap();
         assert!(
-            rendered.starts_with("PROJECT-OVERRIDE"),
-            "expected project override, got: {rendered}"
+            rendered.starts_with("WORKSPACE-BODY"),
+            "expected workspace body, got: {rendered}"
         );
     }
 

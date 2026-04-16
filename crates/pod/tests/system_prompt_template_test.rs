@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -9,7 +10,7 @@ use llm_worker::llm_client::event::{Event as LlmEvent, ResponseStatus, StatusEve
 use llm_worker::llm_client::{ClientError, LlmClient, Request};
 use session_store::{FsStore, LogEntry, Store};
 
-use pod::{Pod, PodError, SystemPromptTemplate};
+use pod::{Pod, PodError, PromptLoader, SystemPromptTemplate};
 
 // ---------------------------------------------------------------------------
 // Mock LLM Client
@@ -60,13 +61,7 @@ fn single_text_events(text: &str) -> Vec<LlmEvent> {
     ]
 }
 
-fn manifest_toml(system_prompt: Option<&str>) -> String {
-    let prompt_line = match system_prompt {
-        Some(s) => format!("system_prompt = {:?}\n", s),
-        None => String::new(),
-    };
-    format!(
-        r#"
+const MINIMAL_MANIFEST_TOML: &str = r#"
 [pod]
 name = "test-pod"
 pwd = "./"
@@ -77,19 +72,22 @@ model = "test-model"
 
 [worker]
 max_tokens = 100
-{prompt_line}
+
 [[scope.allow]]
 target = "./"
 permission = "write"
-"#
-    )
-}
+"#;
 
-async fn make_pod_with_template(
-    template_source: Option<&str>,
+/// Build a Pod with a synthetic instruction template.
+///
+/// Writes `body` to a temp user-prompts dir under `$user/test`, builds a
+/// PromptLoader pointing at it, parses the template, and installs it on
+/// a Pod constructed directly via `Pod::new`.
+async fn make_pod_with_body(
+    body: &str,
     client: MockClient,
-) -> Result<Pod<MockClient, FsStore>, PodError> {
-    let manifest = pod::PodManifest::from_toml(&manifest_toml(template_source)).unwrap();
+) -> Result<(Pod<MockClient, FsStore>, PathBuf), PodError> {
+    let manifest = pod::PodManifest::from_toml(MINIMAL_MANIFEST_TOML).unwrap();
 
     let store_tmp = tempfile::tempdir().unwrap();
     let store = FsStore::new(store_tmp.path()).await.unwrap();
@@ -100,15 +98,19 @@ async fn make_pod_with_template(
     let scope = pod::Scope::writable(&pwd).unwrap();
     std::mem::forget(pwd_tmp);
 
-    let worker = Worker::new(client);
-    let mut pod = Pod::new(manifest, worker, store, pwd, scope).await?;
+    let user_prompts_tmp = tempfile::tempdir().unwrap();
+    std::fs::write(user_prompts_tmp.path().join("test.md"), body).unwrap();
+    let loader = PromptLoader::new(Some(user_prompts_tmp.path().to_path_buf()), None);
+    std::mem::forget(user_prompts_tmp);
 
-    if let Some(source) = template_source {
-        let template = SystemPromptTemplate::parse(source)
-            .map_err(|source| PodError::InvalidSystemPromptTemplate { source })?;
-        pod.set_system_prompt_template(template);
-    }
-    Ok(pod)
+    let worker = Worker::new(client);
+    let mut pod = Pod::new(manifest, worker, store, pwd.clone(), scope).await?;
+
+    let template = SystemPromptTemplate::parse("$user/test", loader)
+        .map_err(|source| PodError::InvalidSystemPromptTemplate { source })?;
+    pod.set_system_prompt_template(template);
+
+    Ok((pod, pwd))
 }
 
 // ---------------------------------------------------------------------------
@@ -117,10 +119,10 @@ async fn make_pod_with_template(
 
 #[tokio::test]
 async fn template_parse_rejects_invalid_syntax() {
-    let err = SystemPromptTemplate::parse("{{ unclosed").unwrap_err();
-    // Surfaces via PodError::InvalidSystemPromptTemplate when used with
-    // Pod::from_manifest — tested at the SystemPromptTemplate level here
-    // because building a Pod via from_manifest requires a real provider.
+    let user_prompts_tmp = tempfile::tempdir().unwrap();
+    std::fs::write(user_prompts_tmp.path().join("broken.md"), "{{ unclosed").unwrap();
+    let loader = PromptLoader::new(Some(user_prompts_tmp.path().to_path_buf()), None);
+    let err = SystemPromptTemplate::parse("$user/broken", loader).unwrap_err();
     let pod_err: PodError = PodError::InvalidSystemPromptTemplate { source: err };
     assert!(matches!(
         pod_err,
@@ -131,7 +133,7 @@ async fn template_parse_rejects_invalid_syntax() {
 #[tokio::test]
 async fn template_is_not_materialised_before_first_run() {
     let client = MockClient::new(vec![single_text_events("ok")]);
-    let pod = make_pod_with_template(Some("hello"), client).await.unwrap();
+    let (pod, _pwd) = make_pod_with_body("hello", client).await.unwrap();
     // Before first run, worker still has no system prompt.
     assert!(pod.worker().get_system_prompt().is_none());
 }
@@ -139,8 +141,8 @@ async fn template_is_not_materialised_before_first_run() {
 #[tokio::test]
 async fn materialise_on_first_turn_populates_worker() {
     let client = MockClient::new(vec![single_text_events("ok")]);
-    let mut pod = make_pod_with_template(
-        Some("date={{ date }} cwd={{ cwd }} tools={{ tools | join(',') }}"),
+    let (mut pod, pwd) = make_pod_with_body(
+        "date={{ date }} cwd={{ cwd }} tools={{ tools | join(',') }}",
         client,
     )
     .await
@@ -153,27 +155,28 @@ async fn materialise_on_first_turn_populates_worker() {
         .to_string();
     assert!(rendered.contains("date="));
     assert!(rendered.contains("cwd="));
-    assert!(rendered.contains(&pod.pwd().display().to_string()));
+    assert!(rendered.contains(&pwd.display().to_string()));
     assert!(rendered.starts_with("date="));
+    // Trailing fixed section must be appended.
+    assert!(rendered.contains("## Working boundaries"));
 }
 
 #[tokio::test]
 async fn session_start_state_captures_rendered_prompt() {
     let client = MockClient::new(vec![single_text_events("ok")]);
-    let mut pod = make_pod_with_template(Some("hello cwd={{ cwd }}"), client)
+    let (mut pod, pwd) = make_pod_with_body("hello cwd={{ cwd }}", client)
         .await
         .unwrap();
     pod.run("hi").await.unwrap();
 
-    // Inspect the first log entry directly: it must be a SessionStart
-    // with the rendered system prompt, not `None`.
     let entries = pod.store().read_all(pod.session_id()).await.unwrap();
     let first = entries.first().expect("at least one entry");
     match &first.entry {
         LogEntry::SessionStart { system_prompt, .. } => {
             let sp = system_prompt.as_deref().expect("system prompt set");
             assert!(sp.starts_with("hello cwd="));
-            assert!(sp.contains(&pod.pwd().display().to_string()));
+            assert!(sp.contains(&pwd.display().to_string()));
+            assert!(sp.contains("## Working boundaries"));
         }
         other => panic!("expected SessionStart as first entry, got {other:?}"),
     }
@@ -182,24 +185,18 @@ async fn session_start_state_captures_rendered_prompt() {
 #[tokio::test]
 async fn render_failure_propagates_as_pod_error() {
     let client = MockClient::new(vec![single_text_events("ok")]);
-    let mut pod = make_pod_with_template(Some("{{ ghost }}"), client)
-        .await
-        .unwrap();
+    let (mut pod, _pwd) = make_pod_with_body("{{ ghost }}", client).await.unwrap();
     let err = pod.run("hi").await.unwrap_err();
     assert!(matches!(err, PodError::SystemPromptRender { .. }));
 }
 
 #[tokio::test]
 async fn materialise_runs_only_once_across_turns() {
-    // Two turns; the second one must not re-render the template. We
-    // approximate this by checking that the rendered system prompt is
-    // identical across turns and that the Pod's template slot is
-    // exhausted after the first run.
     let client = MockClient::new(vec![
         single_text_events("first"),
         single_text_events("second"),
     ]);
-    let mut pod = make_pod_with_template(Some("fixed prompt {{ cwd }}"), client)
+    let (mut pod, _pwd) = make_pod_with_body("fixed prompt {{ cwd }}", client)
         .await
         .unwrap();
     pod.run("one").await.unwrap();
@@ -210,85 +207,69 @@ async fn materialise_runs_only_once_across_turns() {
 }
 
 #[tokio::test]
-async fn agents_md_is_injected_when_present() {
+async fn agents_md_is_injected_as_trailing_section_when_present() {
     let client = MockClient::new(vec![single_text_events("ok")]);
-    let mut pod = make_pod_with_template(
-        Some(
-            "{% if files.agents_md is defined %}AGENTS:{{ files.agents_md }}\
-             {% else %}NONE{% endif %}",
-        ),
-        client,
-    )
-    .await
-    .unwrap();
-    std::fs::write(pod.pwd().join("AGENTS.md"), "# project rules\nbe kind").unwrap();
+    let (mut pod, pwd) = make_pod_with_body("BODY", client).await.unwrap();
+    std::fs::write(pwd.join("AGENTS.md"), "# project rules\nbe kind").unwrap();
 
     pod.run("hi").await.unwrap();
     let rendered = pod.worker().get_system_prompt().unwrap().to_string();
-    assert_eq!(rendered, "AGENTS:# project rules\nbe kind");
+    assert!(rendered.starts_with("BODY"));
+    assert!(rendered.contains("## Project instructions (AGENTS.md)"));
+    assert!(rendered.contains("# project rules"));
+    assert!(rendered.contains("be kind"));
 }
 
 #[tokio::test]
-async fn agents_md_absent_leaves_key_undefined() {
+async fn agents_md_absent_omits_trailing_section() {
     let client = MockClient::new(vec![single_text_events("ok")]);
-    let mut pod = make_pod_with_template(
-        Some("{% if files.agents_md is defined %}HAS{% else %}NONE{% endif %}"),
-        client,
-    )
-    .await
-    .unwrap();
-    // No AGENTS.md written.
+    let (mut pod, _pwd) = make_pod_with_body("BODY", client).await.unwrap();
     pod.run("hi").await.unwrap();
-    assert_eq!(pod.worker().get_system_prompt().unwrap(), "NONE");
+    let rendered = pod.worker().get_system_prompt().unwrap().to_string();
+    assert!(!rendered.contains("## Project instructions"));
+    assert!(!rendered.contains("AGENTS.md"));
 }
 
 #[tokio::test]
 async fn agents_md_not_reread_after_compact() {
-    // Render AGENTS.md on the first turn, then mutate the file on disk
-    // and compact. The post-compact prompt must still reflect the
-    // original content (template re-rendering is forbidden).
     let client = MockClient::new(vec![
         single_text_events("a"),
         single_text_events("b"),
         single_text_events("summary"),
         single_text_events("c"),
     ]);
-    let mut pod = make_pod_with_template(
-        Some("{{ files.agents_md }}"),
-        client,
-    )
-    .await
-    .unwrap();
-    let agents_path = pod.pwd().join("AGENTS.md");
+    let (mut pod, pwd) = make_pod_with_body("BODY", client).await.unwrap();
+    let agents_path = pwd.join("AGENTS.md");
     std::fs::write(&agents_path, "original").unwrap();
 
     pod.run("first").await.unwrap();
     let before = pod.worker().get_system_prompt().unwrap().to_string();
-    assert_eq!(before, "original");
+    assert!(before.contains("original"));
     pod.run("second").await.unwrap();
 
     // Mutate the file after the first turn — must not affect the cached
     // system prompt either on a subsequent turn or across compaction.
     std::fs::write(&agents_path, "mutated").unwrap();
     pod.compact(1).await.unwrap();
-    assert_eq!(pod.worker().get_system_prompt().unwrap(), "original");
+    let after_compact = pod.worker().get_system_prompt().unwrap().to_string();
+    assert!(after_compact.contains("original"));
+    assert!(!after_compact.contains("mutated"));
 
     pod.run("third").await.unwrap();
-    assert_eq!(pod.worker().get_system_prompt().unwrap(), "original");
+    let after_third = pod.worker().get_system_prompt().unwrap().to_string();
+    assert!(after_third.contains("original"));
+    assert!(!after_third.contains("mutated"));
 }
 
 #[tokio::test]
 async fn compact_preserves_system_prompt() {
-    // Three user turns, then compact with retained_turns=1. The new
-    // compacted session must carry the same rendered system prompt and
-    // the template must not re-run.
     let client = MockClient::new(vec![
         single_text_events("a"),
         single_text_events("b"),
         single_text_events("summary"),
         single_text_events("c"),
     ]);
-    let mut pod = make_pod_with_template(Some("SP cwd={{ cwd }}"), client)
+    let (mut pod, _pwd) = make_pod_with_body("SP cwd={{ cwd }}", client)
         .await
         .unwrap();
 
@@ -301,8 +282,6 @@ async fn compact_preserves_system_prompt() {
     let after = pod.worker().get_system_prompt().unwrap().to_string();
     assert_eq!(before, after);
 
-    // A further run must still see the same prompt (template is None, so
-    // ensure_system_prompt_materialized is a no-op).
     pod.run("third").await.unwrap();
     assert_eq!(pod.worker().get_system_prompt().unwrap(), after.as_str());
 }

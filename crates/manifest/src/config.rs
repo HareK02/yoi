@@ -58,7 +58,7 @@ pub struct ProviderConfigPartial {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WorkerManifestConfig {
     #[serde(default)]
-    pub system_prompt: Option<String>,
+    pub instruction: Option<String>,
     #[serde(default)]
     pub max_tokens: Option<u32>,
     #[serde(default)]
@@ -179,7 +179,7 @@ impl ProviderConfigPartial {
 impl WorkerManifestConfig {
     fn merge(self, upper: Self) -> Self {
         Self {
-            system_prompt: upper.system_prompt.or(self.system_prompt),
+            instruction: upper.instruction.or(self.instruction),
             max_tokens: upper.max_tokens.or(self.max_tokens),
             max_turns: upper.max_turns.or(self.max_turns),
             temperature: upper.temperature.or(self.temperature),
@@ -275,7 +275,10 @@ impl TryFrom<PodManifestConfig> for PodManifest {
         )?;
 
         let worker = WorkerManifest {
-            system_prompt: cfg.worker.system_prompt,
+            instruction: cfg
+                .worker
+                .instruction
+                .unwrap_or_else(|| defaults::DEFAULT_INSTRUCTION.to_string()),
             max_tokens: cfg.worker.max_tokens,
             max_turns: cfg.worker.max_turns,
             temperature: cfg.worker.temperature,

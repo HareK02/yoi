@@ -78,8 +78,13 @@ impl ProviderKind {
 /// Worker-level configuration embedded in the manifest.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerManifest {
-    #[serde(default)]
-    pub system_prompt: Option<String>,
+    /// Reference to the instruction prompt asset used as the body of
+    /// the worker's system prompt. Uses the `PromptLoader` prefix
+    /// addressing scheme (`$insomnia/...`, `$user/...`,
+    /// `$workspace/...`) and is always populated after resolution —
+    /// unset manifests fall through to [`defaults::DEFAULT_INSTRUCTION`].
+    #[serde(default = "default_instruction")]
+    pub instruction: String,
     #[serde(default)]
     pub max_tokens: Option<u32>,
     #[serde(default)]
@@ -113,6 +118,10 @@ pub struct ToolOutputLimits {
 
 fn default_tool_output_max_bytes() -> usize {
     defaults::TOOL_OUTPUT_MAX_BYTES
+}
+
+fn default_instruction() -> String {
+    defaults::DEFAULT_INSTRUCTION.to_string()
 }
 
 impl Default for ToolOutputLimits {
@@ -270,7 +279,7 @@ permission = "write"
         assert!(manifest.provider.api_key_file.is_none());
         assert_eq!(manifest.scope.allow.len(), 1);
         assert!(manifest.scope.deny.is_empty());
-        assert!(manifest.worker.system_prompt.is_none());
+        assert_eq!(manifest.worker.instruction, defaults::DEFAULT_INSTRUCTION);
     }
 
     #[test]
@@ -286,7 +295,7 @@ model = "claude-sonnet-4-20250514"
 api_key_file = "~/.config/insomnia/keys/anthropic"
 
 [worker]
-system_prompt = "You are a code reviewer."
+instruction = "$user/reviewer"
 max_tokens = 4096
 temperature = 0.3
 
@@ -310,10 +319,7 @@ permission = "write"
             manifest.provider.api_key_file.as_deref(),
             Some(std::path::Path::new("~/.config/insomnia/keys/anthropic"))
         );
-        assert_eq!(
-            manifest.worker.system_prompt.as_deref(),
-            Some("You are a code reviewer.")
-        );
+        assert_eq!(manifest.worker.instruction, "$user/reviewer");
         assert_eq!(manifest.worker.max_tokens, Some(4096));
         assert_eq!(manifest.worker.temperature, Some(0.3));
         let allow = &manifest.scope.allow;

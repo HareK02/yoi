@@ -21,3 +21,8 @@ pub const PRUNE_MIN_SAVINGS: u64 = 4096;
 /// Number of most-recent turns retained after a compact. See
 /// [`crate::CompactionConfig::compact_retained_turns`].
 pub const COMPACT_RETAINED_TURNS: usize = 2;
+
+/// Default instruction asset reference used when `worker.instruction`
+/// is omitted. See the `PromptLoader` prefix addressing scheme for the
+/// `$insomnia/` / `$user/` / `$workspace/` namespaces.
+pub const DEFAULT_INSTRUCTION: &str = "$insomnia/default";

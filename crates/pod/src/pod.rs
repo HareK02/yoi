@@ -402,11 +402,13 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         }
     }
 
-    /// Render the manifest-supplied system-prompt template exactly once,
-    /// just before the first LLM turn, and hand the resulting string to
-    /// the Worker via `set_system_prompt`. Subsequent invocations are
-    /// no-ops: the template field is consumed with `Option::take()`, so
-    /// the rendered value persists across all later turns and compaction.
+    /// Render the manifest-supplied instruction template exactly once,
+    /// just before the first LLM turn, append the fixed trailing
+    /// section (scope summary + optional AGENTS.md), and hand the
+    /// resulting string to the Worker via `set_system_prompt`.
+    /// Subsequent invocations are no-ops: the template field is
+    /// consumed with `Option::take()`, so the materialised value
+    /// persists across all later turns and compaction.
     fn ensure_system_prompt_materialized(&mut self) -> Result<(), PodError> {
         let Some(template) = self.system_prompt_template.take() else {
             return Ok(());
@@ -423,9 +425,8 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             .into_iter()
             .map(|d| d.name)
             .collect();
-        let mut files = std::collections::BTreeMap::new();
-        let agents_md = read_agents_md(&self.pwd);
-        for warning in agents_md.warnings {
+        let agents_md_read = read_agents_md(&self.pwd);
+        for warning in agents_md_read.warnings {
             if let Some(n) = notifier.as_ref() {
                 n.notify(
                     NotificationLevel::Warn,
@@ -434,15 +435,12 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 );
             }
         }
-        if let Some(body) = agents_md.body {
-            files.insert("agents_md".to_string(), body);
-        }
         let ctx = SystemPromptContext {
             now: chrono::Utc::now(),
             cwd: &self.pwd,
             scope: &self.scope,
             tool_names,
-            files,
+            agents_md: agents_md_read.body,
         };
         let rendered = template
             .render(&ctx)
@@ -841,17 +839,15 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
         let mut worker = Worker::new(client);
         apply_worker_manifest(&mut worker, &manifest.worker);
 
-        // Parse the system-prompt template eagerly (syntax check only).
-        // Rendering is deferred to `ensure_system_prompt_materialized`
-        // at first turn so implementation runtime values (date, tools,
-        // scope summary, ...) can be injected.
-        let system_prompt_template = match manifest.worker.system_prompt.as_deref() {
-            Some(source) => Some(
-                SystemPromptTemplate::parse_with_loader(source, loader)
-                    .map_err(|source| PodError::InvalidSystemPromptTemplate { source })?,
-            ),
-            None => None,
-        };
+        // Resolve the instruction reference and parse the resulting
+        // template eagerly (syntax check only). Rendering is deferred
+        // to `ensure_system_prompt_materialized` at first turn so
+        // runtime values (date, tools, scope summary, ...) can be
+        // injected.
+        let system_prompt_template = Some(
+            SystemPromptTemplate::parse(&manifest.worker.instruction, loader)
+                .map_err(|source| PodError::InvalidSystemPromptTemplate { source })?,
+        );
 
         // Session creation is deferred to the first run (see
         // `ensure_session_head`) so the SessionStart entry can capture
