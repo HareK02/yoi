@@ -5,7 +5,6 @@
 - [ ] Compact の改善（要約品質 + 挙動詳細） → [tickets/compact-improvements.md](tickets/compact-improvements.md)
 - [ ] Protocol の設計 → [tickets/protocol-design.md](tickets/protocol-design.md)
 - [ ] パーミッション: パターンベースのツール実行制御 → [tickets/permission-extension-point.md](tickets/permission-extension-point.md)
-- [ ] instruction のファイル参照化と system prompt の hardcode wrap → [tickets/instruction-file-refs.md](tickets/instruction-file-refs.md)
 - [ ] ネイティブ GUI クライアント MVP → [tickets/native-gui-mvp.md](tickets/native-gui-mvp.md)
 - [ ] TUI 拡充
   - [ ] Pod の明示的 shutdown → [tickets/tui-pod-shutdown.md](tickets/tui-pod-shutdown.md)
