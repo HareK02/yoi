@@ -1,5 +1,10 @@
 # Scope lock file: write 排他とスコープ分譲の記録基盤
 
+## レビュー状態
+
+初回レビュー実施済み。[scope-lock.review.md](scope-lock.review.md) を参照。
+指摘1件（ファイルパーミッション 0600 の明示設定）の修正を条件に受け入れ可。
+
 ## 背景
 
 Pod オーケストレーションでは scope の分譲（spawner が自身の scope を spawned Pod に譲渡）が発生する。また、人間が独立に複数の Pod を起動した場合にも同一パスへの write 衝突を検出する必要がある。

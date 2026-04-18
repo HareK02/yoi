@@ -86,7 +86,11 @@ async fn atomic_write(target: &Path, content: &[u8]) -> Result<(), io::Error> {
 }
 
 /// Resolve the default base directory for runtime data.
-fn default_base() -> Result<PathBuf, io::Error> {
+///
+/// Public so the scope-lock registry (which lives outside the
+/// `RuntimeDir` instance lifecycle) can predict a Pod's socket path
+/// without constructing a `RuntimeDir` first.
+pub fn default_base() -> Result<PathBuf, io::Error> {
     if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
         Ok(PathBuf::from(runtime_dir).join("insomnia"))
     } else if let Ok(home) = std::env::var("HOME") {

@@ -23,6 +23,8 @@ use crate::notification_buffer::NotificationBuffer;
 use crate::notifier::Notifier;
 use crate::pod_interceptor::PodInterceptor;
 use crate::prompt_loader::PromptLoader;
+use crate::runtime_dir;
+use crate::scope_lock::{self, ScopeAllocationGuard, ScopeLockError};
 use crate::system_prompt::{SystemPromptContext, SystemPromptError, SystemPromptTemplate};
 use crate::usage_tracker::UsageTracker;
 use protocol::{NotificationLevel, NotificationSource};
@@ -105,6 +107,13 @@ pub struct Pod<C: LlmClient, St: Store> {
     /// injection into the next LLM request. Shared with the
     /// PodInterceptor installed in `ensure_interceptor_installed`.
     pending_notifications: NotificationBuffer,
+    /// Scope allocation in the machine-wide lock file. `Some` for
+    /// Pods built via `from_manifest` (production path); `None` for
+    /// lower-level constructors (`Pod::new`, `Pod::restore`) that
+    /// bypass the registry. Kept purely for its `Drop` impl, which
+    /// releases the allocation when the Pod is dropped.
+    #[allow(dead_code)]
+    scope_allocation: Option<ScopeAllocationGuard>,
 }
 
 impl<C: LlmClient, St: Store> Pod<C, St> {
@@ -146,6 +155,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             system_prompt_template: None,
             notifier: None,
             pending_notifications: NotificationBuffer::new(),
+            scope_allocation: None,
         };
         pod.apply_prune_from_manifest();
         Ok(pod)
@@ -195,6 +205,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             system_prompt_template: None,
             notifier: None,
             pending_notifications: NotificationBuffer::new(),
+            scope_allocation: None,
         };
         pod.apply_prune_from_manifest();
         Ok(pod)
@@ -875,6 +886,20 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             return Err(PodError::PwdOutsideScope { pwd });
         }
 
+        // Register this Pod in the machine-wide scope-lock registry
+        // before building anything else, so a spawn that conflicts on
+        // scope fails fast (and without having paid for client setup).
+        let socket_path = runtime_dir::default_base()
+            .map_err(ScopeLockError::from)?
+            .join(&manifest.pod.name)
+            .join("sock");
+        let scope_allocation = scope_lock::install_top_level(
+            manifest.pod.name.clone(),
+            std::process::id(),
+            socket_path,
+            scope.allow_rules(),
+        )?;
+
         let client = provider::build_client(&manifest.provider)?;
         let mut worker = Worker::new(client);
         apply_worker_manifest(&mut worker, &manifest.worker);
@@ -910,6 +935,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             system_prompt_template,
             notifier: None,
             pending_notifications: NotificationBuffer::new(),
+            scope_allocation: Some(scope_allocation),
         };
         pod.apply_prune_from_manifest();
         Ok(pod)
@@ -1058,6 +1084,9 @@ pub enum PodError {
         #[source]
         source: SystemPromptError,
     },
+
+    #[error(transparent)]
+    ScopeLock(#[from] ScopeLockError),
 }
 
 /// Canonicalize an absolute pwd (resolves symlinks and any `.`/`..`

@@ -138,6 +138,22 @@ impl Scope {
         self.allow.iter().map(|r| r.target.as_path())
     }
 
+    /// Allow rules with their targets resolved to absolute paths.
+    ///
+    /// Used by the scope-lock registry, where every Pod's allocation
+    /// must be expressed in absolute terms so prefix comparisons are
+    /// meaningful across processes.
+    pub fn allow_rules(&self) -> Vec<ScopeRule> {
+        self.allow
+            .iter()
+            .map(|r| ScopeRule {
+                target: r.target.clone(),
+                permission: r.permission,
+                recursive: r.recursive,
+            })
+            .collect()
+    }
+
     /// Iterate over absolute paths granted `Write` by an allow rule.
     /// Subset of [`readable_paths`](Self::readable_paths).
     pub fn writable_paths(&self) -> impl Iterator<Item = &Path> {

@@ -2,6 +2,7 @@ pub mod controller;
 pub mod hook;
 pub mod notifier;
 pub mod runtime_dir;
+pub mod scope_lock;
 pub mod shared_state;
 pub mod socket_server;
 
