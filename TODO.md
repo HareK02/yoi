@@ -4,7 +4,6 @@
 - [ ] Compact の改善（要約品質 + 挙動詳細） → [tickets/compact-improvements.md](tickets/compact-improvements.md)
 - [ ] Protocol の設計 → [tickets/protocol-design.md](tickets/protocol-design.md)
 - [ ] パーミッション: パターンベースのツール実行制御 → [tickets/permission-extension-point.md](tickets/permission-extension-point.md)
-- [ ] Hook と Interceptor の責務分離 → [tickets/hook-interceptor-separation.md](tickets/hook-interceptor-separation.md)
 - [ ] Method::Notify: システム起点のコンテキスト注入 → [tickets/method-notify.md](tickets/method-notify.md)
 - [ ] Pod オーケストレーション: LLM によるマルチエージェント分業 → [tickets/pod-orchestration.md](tickets/pod-orchestration.md)
 - [ ] ネイティブ GUI クライアント MVP → [tickets/native-gui-mvp.md](tickets/native-gui-mvp.md)
