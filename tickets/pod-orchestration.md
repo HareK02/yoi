@@ -14,60 +14,152 @@ Pod の LLM が、ツール呼び出しを通じて別 Pod のライフサイク
 
 ```
 Human (GUI / TUI) ─── Pod A (orchestrator)
-                          ├── socket ──→ Pod B (researcher)
-                          ├── socket ──→ Pod C (coder)
-                          │                  └── socket ──→ Pod D (reviewer)
-                          └── socket ──→ Pod E (tester)
+                          ├── callback addr ──→ Pod B (researcher)
+                          ├── callback addr ──→ Pod C (coder)
+                          │                        └── callback addr ──→ Pod D (reviewer)
+                          └── callback addr ──→ Pod E (tester)
 ```
 
 ### プロセス独立
 
 - spawn された Pod は **完全に独立したプロセス** として動作する。OS レベルの親子関係（subprocess）は持たない
-- spawner が落ちても、spawned Pod は**続行**する。再接続も可能
-- spawner と spawned Pod の関係は「socket client として接続している」だけ。関係性はプロセスではなく**ソケット接続**で表現される
+- spawner が落ちても、spawned Pod は**続行**する
 - すべての Pod は同格。「誰が spawn したか」は Pod の runtime 属性であり、プロセスの従属関係ではない
-- Pod の発見には**レジストリ**（runtime_dir 内の socket パスを列挙、または明示的な登録）が必要
 
-### Scope の分譲
+### Pod の発見と知識
+
+- Pod は**自分が spawn した相手**と**親から明示的に教えてもらった相手**しか知らない
+- runtime_dir のスキャンや共有レジストリによる探索は行わない（セキュリティリスク）
+- 親抜きで会話すべき Pod があるなら、それは親が明示的に紹介する
+- Pod が知っている Pod のリスト = spawn 記録 + 紹介された相手の記録
+
+### 接続モデル: 常時接続なし
+
+- Pod 間の接続は**すべて一時的**。常時接続は張らない
+- 操作（メッセージ送信・出力読み取り・停止）は**都度接続の request-response**:
+  - ローカル: unix socket に接続 → request → response → 切断
+  - リモート: SSH 経由で接続 → request → response → 切断
+- 非同期通知は**コールバック**方式: spawned Pod がイベント発生時に spawner のアドレスに一発接続して通知し、即切断（webhook と同じモデル）
+- 接続は常に**送信側が開始**する
+
+## Scope の分譲と排他制御
+
+### 原則
 
 - Pod A が Pod B を spawn するとき、A は自身の scope の一部を B に**譲渡**する
-- 譲渡した scope 領域は A の effective scope から **deny** される（A は自分が譲った部分にアクセスできなくなる）
-- これにより**構造的に排他制御が保証**される：同一パスに対して write 権限を持つ Pod は常に高々1つ
-- Pod B が終了すると、譲渡された scope は A に**返却**される（A の deny が解除される）
-- Pod B が scope の一部をさらに Pod D に分譲した場合、B の終了時に D が保持している分は D にそのまま残る（D は独立して生きているため）。D が終了するまで、その scope 領域は誰にも返却されない
+- 譲渡した scope 領域は A の effective scope から deny される（A は自分が譲った部分にアクセスできなくなる）
+- **write scope の排他制御が保証**される：同一パスに対して write 権限を持つ Pod は常に高々1つ
+- read は衝突しない（複数 Pod が同じパスを同時に read 可能）
 
-### `tickets/scope-exclusion.md` との関係
+### Scope lock file
 
-scope 分譲により Pod 間の write 排他制御は spawn 時に構造的に保証される。`tickets/scope-exclusion.md` が扱おうとしていた「複数 Pod が同一パスに同時 write する問題」は、**本チケットの scope 分譲モデルで吸収される**。
+scope の割り当てをマシン上の**単一の lock file** で一元管理する。spawn 系譜を持たない Pod 同士（人間が独立に起動した Pod 等）でも write 衝突を検出できる。
 
-ただし、分譲ではなく**共有 read** (複数 Pod が同じパスを同時に read する) は引き続き許可される。read 同士は衝突しない。
+置き場: `$XDG_RUNTIME_DIR/insomnia/scope.lock`
+
+内容:
+```json
+{
+  "allocations": [
+    {
+      "pod_id": "abc123",
+      "pid": 12345,
+      "socket": "/run/insomnia/.../pod-a.sock",
+      "scope_allow": ["/project/src:write:recursive"],
+      "delegated_from": null
+    },
+    {
+      "pod_id": "def456",
+      "pid": 12346,
+      "socket": "/run/insomnia/.../pod-b.sock",
+      "scope_allow": ["/project/src/core:write:recursive"],
+      "delegated_from": "abc123"
+    }
+  ]
+}
+```
+
+操作は `flock(2)` による advisory lock で排他アクセスする:
+
+| タイミング | 動作 |
+|---|---|
+| **Pod 起動** | lock → stale 検出（PID 死活）→ 自動回収 → write 衝突チェック → 自分の scope を登録 → unlock |
+| **scope 分譲 (SpawnPod)** | lock → spawner の allocation に deny 追記 → 新 Pod の allocation を追加（`delegated_from` に spawner）→ unlock |
+| **Pod 正常終了** | lock → 自分の allocation を削除 → `delegated_from` が自分の子が残っていなければ親の deny を解除 → unlock |
+| **stale 検出** | `kill(pid, 0)` で生存確認。死んでいたら allocation を削除し、scope を `delegated_from` の親に返却 |
+
+### stale の自動回収
+
+Pod がクラッシュ（正常終了せず PID が消えた）した場合、lock file にエントリが残る。**次に lock file を開いた Pod が stale を検出し自動回収する**:
+
+- Pod B (pid=200, dead): `/project/src` write, delegated_from=A
+- Pod D (pid=300, alive): `/project/src/core` write, delegated_from=B
+
+→ B が死んでいる:
+1. B の scope `/project/src` のうち D が持つ `/project/src/core` を除いた部分を A に返却
+2. B のエントリを削除
+3. D の `delegated_from` を A に付け替え
+
+能動的なコールバックが届かなくても、いつか誰かが lock file を開けば回収が走る。
+
+### Effective scope の導出
+
+Pod の effective scope は lock file から導出される:
+
+```
+effective_scope = 自分の allocation - Σ(delegated_from が自分を指す子の allocation)
+```
+
+Pod は lock file を読むことで自分の effective scope を知れる。ただし常時読むとパフォーマンスに影響するため、キャッシュして scope 変動のコールバック通知で更新するのが実用的。
+
+### 返却
+
+- Pod B が終了すると、scope は `delegated_from` が指す spawner (A) に自動返却される
+- 返却先は常に `delegated_from`。プールへの返却や他者への再分配はない
+
+### 又貸し
+
+- Pod B が `/src/core` を Pod D に又貸しする場合、lock file 上で:
+  - B の allocation から `/src/core` を除外
+  - D の allocation を追加（`delegated_from=B`）
+- B は spawner (A) にコールバックで通知:「`/src/core` を D に委譲した」
+  - A は D の存在と D の socket address をこの通知で知る（= 親からの紹介）
+- B が終了したとき: lock file の stale 回収で D の `delegated_from` が A に付け替わり、D が保持しない残りの scope が A に戻る
+
+### 観測可能性
+
+- `insomnia scope list` 的なコマンドで lock file を読めば、マシン上の全 Pod の scope 割り当てを一覧できる
+- 人間が「今どの Pod がどこを write 占有しているか」を確認する手段になる
+- 衝突で Pod 起動が拒否されたとき、競合相手の pod_id を lock file から取得してエラーメッセージに含める
 
 ## LLM に公開するツール群
 
-Pod の LLM が使えるツールとして以下を設計する。いずれも通常の Tool trait 実装で、Worker に登録される。
+Pod の LLM が使えるツールとして以下を設計する。すべて**都度接続の request-response** で動作する。
 
 ### `SpawnPod`
 
 新しい Pod を起動し、scope の一部を譲渡する。
 
 入力:
-- `name`: spawned Pod の識別名（spawner のスコープ内で一意）
-- `instruction`: spawned Pod の instruction ファイル参照（省略時は `$insomnia/default`）
-- `task`: spawned Pod への最初のメッセージ（spawn 後に即座に run される）
-- `scope`: 譲渡する scope 定義（allow / deny ルール）。**spawner の現在の effective scope のサブセットでなければならない**。バリデーションで超過分は拒否
+- `name`: spawned Pod の識別名
+- `instruction`: instruction ファイル参照（省略時は `$insomnia/default`）
+- `task`: 最初のメッセージ（spawn 後に即座に run される）
+- `scope`: 譲渡する scope 定義。spawner の effective scope のサブセットでなければならない
+- `address`: (自動注入) spawner の callback address
 
 出力:
-- spawned Pod の識別子（`pod_id`）と接続状態
+- spawned Pod の `pod_id` と接続先 address
 
 内部動作:
-- spawner の effective scope から、譲渡する scope 領域を deny に追加（spawner 側の scope を縮小）
-- PodFactory のカスケード（user manifest + project manifest）に加え、spawner からの overlay（譲渡 scope + instruction + provider 等）を重ねて spawned Pod の PodManifest を構築
-- 独立プロセスとして Pod を起動、socket 確立
+- scope lock file を flock → write 衝突チェック → spawner の allocation に deny 追記 + 新 Pod の allocation を登録 → unlock
+- PodFactory のカスケードに spawner からの overlay を重ねて PodManifest を構築
+- 独立プロセスとして Pod を起動
+- spawner の callback address を spawned Pod に渡す
 - `task` を `Method::Run` で送信
 
 ### `SendToPod`
 
-spawned Pod にメッセージを送る。
+既知の Pod にメッセージを送る（都度接続）。
 
 入力:
 - `pod_id`: 対象の Pod
@@ -78,11 +170,11 @@ spawned Pod にメッセージを送る。
 
 ### `ReadPodOutput`
 
-spawned Pod の最新の出力を読む。
+既知の Pod の最新の出力を読む（都度接続）。
 
 入力:
 - `pod_id`: 対象の Pod
-- `since`: 前回読んだ時点からの差分のみ取得するオプション（省略時は全出力）
+- `since`: 前回読んだ時点からの差分のみ取得するオプション
 
 出力:
 - 対象 Pod の assistant 応答テキスト（最新ターン or 差分）
@@ -90,7 +182,7 @@ spawned Pod の最新の出力を読む。
 
 ### `StopPod`
 
-spawned Pod を終了させ、譲渡した scope を回収する。
+既知の Pod を終了させ、譲渡した scope を回収する（都度接続）。
 
 入力:
 - `pod_id`: 対象の Pod
@@ -99,72 +191,50 @@ spawned Pod を終了させ、譲渡した scope を回収する。
 - 終了確認
 - 回収された scope の要約
 
-内部動作:
-- 対象 Pod に graceful shutdown を要求
-- 対象 Pod が保持していた scope のうち、さらに下流に分譲されていない分を spawner に返却
-- spawner の deny リストから返却分を解除
-
 ### `ListPods`
 
-spawner が spawn した Pod の一覧とそれぞれの状態を返す。
+自分が知っている Pod の一覧と状態を返す。
 
 入力: なし
 
 出力:
-- spawned Pod の `pod_id`、`name`、`status`（running / idle / stopped）、譲渡中の scope 要約、最終応答の要約
+- 各 Pod の `pod_id`、`name`、`status`（running / idle / stopped）、譲渡中の scope 要約、最終応答の要約
 
-## 非同期通知
+内部動作:
+- spawn 記録を元にリストを構築
+- 各 Pod に都度接続して health check（接続できなければ stopped 扱い）
+- Hook で定期的に自動実行することも可能
 
-spawned Pod が出力を生成したとき、spawner の LLM にそれを伝える仕組みが必要。ただし LLM は「ターン」の単位で動くため、イベントストリームをリアルタイムに割り込ませるのは不自然。
+## 非同期通知: コールバック方式
 
-### 方針: ターン間フックで集約通知
+### 仕組み
 
-- spawner のターンが終了した後、次のターンの開始前に**フック**が走り、spawned Pod から届いているイベントを集約する
-- 集約された通知は次のターンの**先頭に system message として注入**される（例: `[pod "researcher"] completed: found 3 relevant files`）
+- spawn 時に spawner が**自分の callback address** を spawned Pod に渡す
+  - ローカル: unix socket path
+  - リモート: `insomnia@host:pod-name` 形式の SSH address
+- spawned Pod がイベント発生時に、spawner の callback address に**一発接続して通知を送り、即切断**する
+- spawner が落ちていたら callback が失敗するだけ（spawned Pod は続行する）
+
+### 通知の種類
+
+- **ターン完了**: spawned Pod の1ターンが終わった（spawner は `ReadPodOutput` で内容を取りに行く）
+- **scope 又貸し**: spawned Pod が自身の scope の一部をさらに別の Pod に委譲した（spawner の scope 記録を更新する材料）
+- **エラー**: spawned Pod でエラーが発生
+- **終了**: spawned Pod が停止した（scope 返却のトリガー）
+
+### 通知は「シグナル」のみ
+
+通知にはイベントの種類と最小限のメタデータ（pod_id、scope 変動等）のみを含める。応答テキスト全体のような大きなデータは含まない。spawner が内容を知りたければ `ReadPodOutput` で取りに行く。
+
+### 通知の LLM への伝達
+
+- spawner が受け取ったコールバック通知はバッファに溜められる
+- spawner の次のターン開始前に、Hook が溜まった通知を集約してターンの先頭に system message として注入する
 - 通知が無い場合は何もしない
 
-### 通知の粒度
+### ポーリングでも代替可能
 
-- **ターン完了通知**: spawned Pod の1ターンが終わったとき
-- **エラー通知**: spawned Pod でエラーが発生したとき
-- **終了通知**: spawned Pod が停止したとき（scope 返却が発生する）
-
-ツール出力の内容自体は `ReadPodOutput` で明示的に取りに行くモデル。通知は「何か変化があった」というシグナルのみで、内容全体は含まない（spawner のコンテキストを圧迫しない）。
-
-## Scope の分譲と回収の詳細
-
-### 分譲時
-
-1. spawner が `SpawnPod` で `scope` を指定
-2. システムが検証: 指定された scope が spawner の **現在の effective scope のサブセット**であること
-3. 検証通過後、spawner の effective scope から譲渡分を deny として差し引く
-4. spawned Pod は譲渡された scope を自身の allow として持って起動
-
-### 回収時（StopPod または spawned Pod の自発的終了）
-
-1. 終了する Pod が保持している effective scope を確認
-2. そのうち、さらに下流に分譲中の scope は除外（下流 Pod が生きている間は返却されない）
-3. 残りの scope を spawner の deny から解除し、spawner の effective scope に復帰
-
-### 分譲チェーンのケース
-
-Pod A が Pod B に `/src` を分譲 → Pod B が Pod D に `/src/core` を分譲:
-
-- A の scope: `/src` は deny
-- B の scope: `/src` を持つが `/src/core` は deny（D に分譲済み）
-- D の scope: `/src/core`
-
-B が終了すると:
-- `/src` のうち D に分譲中の `/src/core` は返却されない（D が生きている）
-- `/src` から `/src/core` を除いた部分が A に返却される
-- A の scope: `/src` の `/src/core` 以外が復帰。`/src/core` は引き続き deny（D が保持中）
-- D が終了すると `/src/core` が A に返却される
-
-### runtime scope state
-
-- Pod の scope は manifest の static 定義だけでは決まらない。分譲と回収による**動的な state** が加わる
-- この state を管理するレイヤーが必要（Pod 内のメモリ状態 + 永続化の選択肢）
-- spawner がクラッシュして復帰した場合、分譲中の scope を復元する必要がある → scope ledger の永続化が事実上必須
+コールバックが届かなくても、spawner は `ListPods` のポーリングで状態を拾える。コールバックは「早く気付くための最適化」であって唯一の手段ではない。
 
 ## Pod の設定
 
@@ -172,84 +242,77 @@ B が終了すると:
 
 - spawned Pod の `instruction` は `SpawnPod` の引数で明示指定
 - 省略時は `$insomnia/default`
-- spawner の instruction を引き継ぐケースはまれ（分業目的の spawn なので、spawned Pod には固有の役割がある）
+- spawner の instruction を引き継ぐケースはまれ（分業目的の spawn なので固有の役割がある）
 
 ### provider
 
-- API キーと provider 設定は通常ユーザー manifest / プロジェクト manifest 由来なので、spawned Pod は PodFactory 経由で同じカスケードから取得する
-- spawned Pod に異なるモデルを使わせたい場合は overlay で上書きする（例: 調査用 Pod には小さいモデル、コード生成にはフルモデル）
+- API キーと provider 設定は PodFactory のカスケード（user / project manifest）から取得
+- spawned Pod に異なるモデルを使わせたい場合は overlay で上書き
+
+### Pod 起動コマンド
+
+- 環境変数またはユーザー設定で上書き可能
+- デフォルトは `pod`（PATH 上の `pod` バイナリ）
+- リモートの場合は SSH 越しに実行
 
 ## 人間向けの監視
 
-### 各 Pod は独立して観測可能
+### 各 Pod に個別接続
 
-- すべての Pod は通常の socket サーバーを持つ。人間は GUI / TUI で任意の Pod に接続して会話を閲覧・介入できる
-- Pod 間に主従関係が無いので、人間はどの Pod にも同格にアクセスできる
+- すべての Pod は通常の socket サーバーを持つ。人間は GUI / TUI で Pod に接続して会話を閲覧・介入できる
+- ただし、Pod の存在を知る手段は**spawn 記録（+ 紹介）のみ**。人間もオーケストレーター Pod 経由か、事前に Pod の address を知っている必要がある
 
 ### Pod ネットワークの可視化
 
-- GUI / TUI が Pod の一覧を表示（spawn 関係をグラフまたはリストで表現）
-- 各ノードに status（running / idle / stopped）、保持中の scope 要約、最終ターンの要約を表示
-- ノードをクリック/選択すると、その Pod の会話ビューに切り替わる
+- GUI / TUI がオーケストレーター Pod の spawn 記録を読んで Pod リストを表示
+- 各エントリに status、scope 要約、最終応答の要約を表示
+- エントリを選択すると、その Pod に接続して会話ビューに切り替わる
 
 ### 介入
 
-- 人間は任意の Pod に直接メッセージを送れる（通常のクライアントとして接続）
+- 人間は既知の Pod に直接メッセージを送れる（通常のクライアントとして都度接続）
 - 人間が Pod を直接 stop できる（scope は spawner に返却される）
-- spawner の LLM は spawned Pod に人間が介入したことを（次の通知で）知る
-
-## Pod の発見と登録
-
-プロセスが独立しているため、起動中の Pod を**発見**する仕組みが要る。
-
-候補:
-- **A. runtime_dir convention**: 各 Pod が socket path を `runtime_dir/<pod_name>.sock` に作る。ディレクトリを列挙すれば一覧が取れる（現行の仕組みの延長）
-- **B. 明示的なレジストリ**: Pod 起動時に共有レジストリ（ファイルまたは IPC）に登録。終了時に削除
-- **C. daemon**: 軽量な daemon プロセスがレジストリ役を担う（`crates/daemon` は現在空）
-
-現時点では A が最もシンプル。daemon が必要になるのは「リモート Pod」や「Pod の自動再起動」が必要になってから。
 
 ## 設計で決めること
 
-- **Pod の起動方式**: 独立プロセスとして `pod` バイナリを起動する形で確定。起動方法の詳細（fork? 直接 exec? nix-shell 経由?）
-- **scope ledger の永続化方式**: ファイルベース / session-store / 別の永続ストア
-- **scope の分譲粒度**: パス単位で分譲するか、permission レベル（read / write）でも分譲できるか（例: write だけ譲って read は共有する等）
-- **通知の注入方式**: system message として注入するか、専用の `Event` としてターン開始前に Worker に流すか
-- **通知のバッファリング**: spawner の1ターンが数分かかる場合、その間のイベントをどこに溜めるか
-- **Pod の発見**: A (runtime_dir) / B (レジストリファイル) / C (daemon)
+- **callback の protocol**: 通知メッセージの具体的なフォーマット。既存の protocol crate (`Event` enum) を拡張するか、別の軽量フォーマットにするか
+- **scope の分譲粒度**: パス単位で分譲するか、permission レベル（write だけ渡して read は共有等）でも制御できるか
+- **通知のバッファリング**: spawner のターン実行中に溜まるコールバック通知をどこに保持するか
 - **リソース制限**: 最大 spawned Pod 数、ネスト深さの上限
-- **ツール名**: `SpawnPod` / `SendToPod` / `ReadPodOutput` / `StopPod` / `ListPods` の命名はそのままで良いか
+- **ツール名**: `SpawnPod` / `SendToPod` / `ReadPodOutput` / `StopPod` / `ListPods` の命名
 - **Pod ネットワークの可視化**: GUI / TUI どちらに先行実装するか
-- **spawner 復帰時の再接続**: scope ledger を読んで spawned Pod のソケットに再接続する手順
-- **分譲チェーンの depth limit**: 再帰的 spawn の深さ上限を設けるか
+- **spawner 復帰時の再接続**: spawn 記録を読んで spawned Pod に再接続する手順。callback address の再登録
+- **リモート spawn**: SSH-only モデルの詳細（`docs/network-peering.md` を参照）
 
 ## 完了条件
 
 - Pod の LLM が `SpawnPod` ツールで別 Pod を起動でき、spawned Pod が独立プロセスとして動作する
-- spawn 時に scope が分譲され、spawner の effective scope が縮小されることを検証できる
-- `SendToPod` で spawned Pod にメッセージを送り、`ReadPodOutput` で応答を読み取れる
-- `StopPod` で spawned Pod を graceful に停止でき、scope が spawner に返却される
-- `ListPods` で spawned Pod の状態と scope 要約を一覧できる
-- spawned Pod のターン完了・エラー・停止が spawner に非同期通知され、次のターン開始時に LLM に伝わる
-- spawner が停止しても spawned Pod が続行し、spawner 復帰時に再接続できる
-- 人間が GUI または TUI で Pod ネットワークを閲覧でき、任意の Pod に接続して会話を見られる
-- spawned Pod がさらに別の Pod を spawn する再帰的なネットワークが動作する
-- scope 分譲チェーンの返却（中間ノードの終了時に部分返却）が正しく動作する
+- spawn 時に scope lock file に allocation が記録され、spawner の effective scope が���小される
+- 同一パスへの write 衝突が lock file で検出され、Pod 起動が拒否される（競合相手の pod_id がエラーに含まれる）
+- stale エントリ（PID が死亡）が自動回収され、scope が `delegated_from` の親に戻る
+- `SendToPod` / `ReadPodOutput` が都度接続の request-response で動作する
+- `StopPod` で spawned Pod を graceful に停止でき、lock file から allocation が削除されて scope が返却される
+- `ListPods` で既知の Pod の状態を一覧でき、health check が機能する
+- spawned Pod のターン完了・エラー・停止がコールバックで spawner に通知され、`Method::Notify` 経由で LLM に伝わる
+- spawner が停止しても spawned Pod が続行する
+- 又貸しが lock file に記録され、コールバック通知により spawner が孫 Pod の存在と scope を把握できる
+- `insomnia scope list` 相当のコマンドで lock file を読み、マシン上の全 Pod の scope 割り当てを一覧できる
+- 人間が GUI または TUI で Pod リストを閲覧でき、任意の既知 Pod に接続して会話を見られる
 
 ## 他チケットとの関係
 
-- **tickets/scope-exclusion.md**: scope 分譲モデルにより**本チケットに吸収される**。write 排他制御は分譲時に構造的に保証されるため、別の排他制御メカニズムは不要。scope-exclusion.md は本チケットの scope 設計がカバーする
-- **tickets/protocol-design.md**: Protocol に Pod 間通知のイベント（spawned Pod の状態変化通知など）を追加する必要があるかもしれない。ただし各 Pod は通常の socket サーバーなので、protocol 拡張なしで「複数 socket に繋ぐクライアント」として実装できる可能性もある
-- **tickets/native-gui-mvp.md**: Pod ネットワーク可視化は GUI 側の拡張。MVP scope には含まれていないが、本チケットの監視要件は GUI の次フェーズに自然に接続する
-- **tickets/tui-pod-spawn-ui.md**: TUI からの Pod spawn UI。本チケットは LLM からの spawn だが、spawn のインフラ（PodFactory + プロセス起動）は共通
-- **tickets/tui-pod-shutdown.md**: Pod ネットワークの shutdown 戦略にも影響。Pod を停止したとき scope がどこに返るか
-- **tickets/permission-extension-point.md**: spawned Pod のツール実行パーミッションを spawner が制御する可能性
+- **tickets/method-notify.md**: コールバック通知を親 Pod に注入する仕組み。オーケストレーションの非同期通知に必須
+- **tickets/protocol-design.md**: コールバック通知の protocol 拡張が必要になりうる
+- **tickets/native-gui-mvp.md**: Pod リスト可視化は GUI 側の拡張
+- **tickets/tui-pod-spawn-ui.md**: TUI からの Pod spawn UI。spawn のインフラは共通
+- **tickets/permission-extension-point.md**: spawned Pod のツール実行パーミッションを spawner が制御��る可能性
+- **scope-exclusion (削除済み)**: scope lock file による write 排他で吸収された
 
 ## 範囲外
 
-- **Pod 間の直接メッセージパッシング**: Pod 同士が spawner を介さずに直接通信する仕組み。すべてのやり取りは spawner（オーケストレーター）を介す
-- **共有メモリ / 共有状態**: Pod 間のデータ共有はツール経由のテキストメッセージのみ。ファイルシステムを介した暗黙の共有は scope が許す範囲で起きうるが、それは Pod の既存動作の延長であり、分譲により write 衝突は構造的に排除される
-- **自動スケーリング / 負荷分散**: Pod の spawn 先は常にローカルマシン。リモート実行やクラウド分散は扱わない
-- **課金・トークン予算管理**: spawned Pod が消費するトークンの予算制御や spawner への請求集約は扱わない
-- **人間がネットワークの構造を変更する操作**（Pod の spawn 元替え、ネットワークの組み替えなど）
-- **daemon の導入**: Pod の発見は runtime_dir convention または軽量レジストリで対応。daemon は必要が明確になってから
+- **Pod 間の直接メッセージパッシング**: すべてのやり取りは spawner を介するか、spawner が明示的に紹介した相手とのみ行う
+- **常時接続**: Pod 間の接続はすべて一時的（都度接続 or コールバック一発）
+- **runtime_dir のスキャンによる Pod 探索**: セキュリティリスクのため行わない。Pod の存在は spawn 記録 + 明示的な紹介 + lock file のみで把握
+- **自動スケーリング / 負荷分散 / リモート実行**: ローカルの単一マシン上での動作に集中。リモート spawn は `docs/network-peering.md` を参照
+- **課金・トークン予算管理**
+- **環境再現（git clone, コンテナ構築等）**: insomnia の責務外

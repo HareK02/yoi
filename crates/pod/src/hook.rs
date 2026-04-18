@@ -1,18 +1,95 @@
 //! Pod-layer hook infrastructure
 //!
-//! Provides the `Hook<E>` trait and `HookRegistry` for orchestration hooks
-//! that govern control-flow decisions in the Worker execution loop.
+//! Hooks are the **public** orchestration extension point. They receive
+//! read-only summary information about each event in the Worker
+//! execution loop and return a control-flow action
+//! (continue / skip / abort / pause).
 //!
-//! The type system (`HookEventKind` / `Hook<E>`) mirrors the pattern
-//! originally in llm-worker, now at the insomnia layer where orchestration
-//! concerns belong.
+//! Hooks intentionally cannot mutate the Worker's context, history, tool
+//! call, or tool result. Internal mechanisms that need such access (e.g.
+//! compaction, notification injection, output truncation) implement
+//! `llm_worker::Interceptor` directly inside Pod, never via this trait.
+//!
+//! This separation lets Hooks be exposed safely to user-facing
+//! extension surfaces (scripting, plugins) in the future without
+//! exposing the underlying mutable state.
 
 use async_trait::async_trait;
-use llm_worker::Item;
+use llm_worker::tool::ToolOutput;
 use llm_worker::interceptor::{
-    PostToolAction, PreRequestAction, PreToolAction, PromptAction, ToolCallInfo, ToolResultInfo,
-    TurnEndAction,
+    PostToolAction, PreRequestAction, PreToolAction, PromptAction, TurnEndAction,
 };
+use serde_json::Value;
+
+// =============================================================================
+// Hook input summary types (read-only)
+// =============================================================================
+
+/// Information passed to `OnPromptSubmit` hooks.
+pub struct PromptSubmitInfo {
+    /// Concatenated text content of the user's input message.
+    pub input_text: String,
+    /// 0-based turn index this prompt opens.
+    pub turn_index: usize,
+}
+
+/// Information passed to `PreLlmRequest` hooks.
+pub struct PreRequestInfo {
+    /// Number of items currently in the Worker context.
+    pub item_count: usize,
+    /// Most recently observed `input_tokens` from the LLM provider.
+    /// `None` when the Pod has no compaction state attached, or when
+    /// no LLM call has completed yet.
+    pub estimated_tokens: Option<u64>,
+    /// Current turn index (0-based).
+    pub turn_index: usize,
+    /// Tool calls already executed in this turn.
+    pub tool_calls_this_turn: usize,
+}
+
+/// Information passed to `PreToolCall` hooks.
+pub struct ToolCallSummary {
+    /// Provider-assigned tool call id.
+    pub call_id: String,
+    /// Registered tool name.
+    pub tool_name: String,
+    /// Tool arguments as a JSON value (cloned).
+    ///
+    /// LLM-generated arguments are bounded by max_tokens, so cloning
+    /// is cheap relative to tool execution. Structural access is
+    /// required for permission decisions (e.g. inspecting a `path`
+    /// field), which a stringified preview would not support.
+    pub arguments: Value,
+}
+
+/// Information passed to `PostToolCall` hooks.
+pub struct ToolResultSummary {
+    /// Provider-assigned tool call id this result corresponds to.
+    pub call_id: String,
+    /// Registered tool name.
+    pub tool_name: String,
+    /// Whether the tool reported an error.
+    pub is_error: bool,
+    /// Tool output (`summary` always present, `content` may be `None`).
+    pub output: ToolOutput,
+}
+
+/// Information passed to `OnTurnEnd` hooks.
+pub struct TurnEndInfo {
+    /// Turn that just ended (0-based).
+    pub turn_index: usize,
+    /// Tool calls executed in this turn.
+    pub tool_calls_count: usize,
+    /// Preview of the assistant's final text in this turn.
+    /// Truncated at a UTF-8 boundary; empty when no assistant text exists.
+    pub final_text_preview: String,
+}
+
+/// Information passed to `OnAbort` hooks.
+pub struct AbortInfo {
+    /// Reason supplied by the aborter.
+    pub reason: String,
+}
 
 // =============================================================================
 // Hook Event Kinds
@@ -20,16 +97,14 @@ use llm_worker::interceptor::{
 
 /// Marker trait for hook event kinds.
 ///
-/// Each event kind specifies its input (passed mutably to hooks) and
-/// output (the control-flow action returned by hooks).
+/// Each event kind specifies its read-only input and the control-flow
+/// action returned by hooks.
 pub trait HookEventKind: Send + Sync + 'static {
-    /// Mutable input passed to the hook.
-    type Input;
+    /// Read-only input passed to the hook.
+    type Input: Send + Sync;
     /// Control-flow action returned by the hook.
     type Output;
 }
-
-// --- Event kind markers ---
 
 /// After receiving user input, before adding to history.
 pub struct OnPromptSubmit;
@@ -45,32 +120,32 @@ pub struct OnTurnEnd;
 pub struct OnAbort;
 
 impl HookEventKind for OnPromptSubmit {
-    type Input = Item;
+    type Input = PromptSubmitInfo;
     type Output = PromptAction;
 }
 
 impl HookEventKind for PreLlmRequest {
-    type Input = Vec<Item>;
+    type Input = PreRequestInfo;
     type Output = PreRequestAction;
 }
 
 impl HookEventKind for PreToolCall {
-    type Input = ToolCallInfo;
+    type Input = ToolCallSummary;
     type Output = PreToolAction;
 }
 
 impl HookEventKind for PostToolCall {
-    type Input = ToolResultInfo;
+    type Input = ToolResultSummary;
     type Output = PostToolAction;
 }
 
 impl HookEventKind for OnTurnEnd {
-    type Input = Vec<Item>;
+    type Input = TurnEndInfo;
     type Output = TurnEndAction;
 }
 
 impl HookEventKind for OnAbort {
-    type Input = String;
+    type Input = AbortInfo;
     type Output = ();
 }
 
@@ -80,13 +155,13 @@ impl HookEventKind for OnAbort {
 
 /// Async hook for a specific event kind.
 ///
-/// Hooks receive mutable access to the event's input and return a
-/// control-flow action. Multiple hooks can be registered per event;
-/// they are evaluated in registration order and short-circuit on the
-/// first non-Continue result.
+/// Hooks receive a shared reference to the event's read-only input
+/// and return a control-flow action. Multiple hooks can be registered
+/// per event; they are evaluated in registration order and
+/// short-circuit on the first non-Continue (or non-Finish) result.
 #[async_trait]
 pub trait Hook<E: HookEventKind>: Send + Sync {
-    async fn call(&self, input: &mut E::Input) -> E::Output;
+    async fn call(&self, input: &E::Input) -> E::Output;
 }
 
 // =============================================================================

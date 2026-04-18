@@ -6,11 +6,10 @@ pub mod shared_state;
 pub mod socket_server;
 
 mod agents_md;
-mod compact_interceptor;
 mod compact_state;
 mod factory;
-mod hook_interceptor;
 mod pod;
+mod pod_interceptor;
 mod prompt_loader;
 mod prune;
 mod system_prompt;

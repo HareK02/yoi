@@ -14,14 +14,13 @@ use tracing::{info, warn};
 use manifest::{PodManifest, PodManifestConfig, ResolveError, Scope, ScopeError, WorkerManifest};
 
 use crate::agents_md::read_agents_md;
-use crate::compact_interceptor::CompactInterceptor;
 use crate::compact_state::CompactState;
 use crate::hook::{
     Hook, HookRegistryBuilder, OnAbort, OnPromptSubmit, OnTurnEnd, PostToolCall, PreLlmRequest,
-    PreToolCall,
+    PreRequestInfo, PreToolCall,
 };
-use crate::hook_interceptor::HookInterceptor;
 use crate::notifier::Notifier;
+use crate::pod_interceptor::PodInterceptor;
 use crate::prompt_loader::PromptLoader;
 use crate::system_prompt::{SystemPromptContext, SystemPromptError, SystemPromptTemplate};
 use crate::usage_tracker::UsageTracker;
@@ -38,8 +37,8 @@ struct UsageTrackingHook {
 
 #[async_trait]
 impl Hook<PreLlmRequest> for UsageTrackingHook {
-    async fn call(&self, context: &mut Vec<Item>) -> PreRequestAction {
-        self.tracker.note_request(context.len());
+    async fn call(&self, info: &PreRequestInfo) -> PreRequestAction {
+        self.tracker.note_request(info.item_count);
         PreRequestAction::Continue
     }
 }
@@ -346,16 +345,15 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     /// `on_usage` callback to track `input_tokens`.
     fn ensure_interceptor_installed(&mut self) {
         if !self.interceptor_installed {
-            // Pre-LLM-request hook: capture history.len() into the
-            // UsageTracker so the upcoming on_usage callback can pair
-            // it with the measured input_tokens.
+            // Pre-LLM-request hook: record the item count at send time
+            // so the on_usage callback can pair it with the measured
+            // input_tokens.
             self.hook_builder.add_pre_llm_request(UsageTrackingHook {
                 tracker: self.usage_tracker.clone(),
             });
 
             let builder = std::mem::take(&mut self.hook_builder);
             let registry = Arc::new(builder.build());
-            let hook_interceptor = HookInterceptor::new(registry);
 
             let compact_threshold = self
                 .manifest
@@ -363,12 +361,9 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 .as_ref()
                 .and_then(|c| c.compact_threshold);
 
-            // Usage tracking via on_usage callback. Independent of
-            // compact_threshold so that LlmUsage entries are persisted
-            // unconditionally.
             let tracker_for_usage = self.usage_tracker.clone();
 
-            if let Some(threshold) = compact_threshold {
+            let compact_state = if let Some(threshold) = compact_threshold {
                 let retained = self
                     .manifest
                     .compaction
@@ -377,9 +372,6 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                     .unwrap_or(2);
 
                 let state = Arc::new(CompactState::new(threshold, retained));
-
-                // Combined on_usage: feed both the legacy compact threshold
-                // tracker and the new UsageTracker.
                 let state_for_usage = state.clone();
                 self.worker_mut().on_usage(move |event| {
                     if let Some(tokens) = event.input_tokens {
@@ -387,17 +379,17 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                     }
                     tracker_for_usage.record_usage(event);
                 });
-
-                let interceptor = CompactInterceptor::new(hook_interceptor, state.clone());
-                self.worker_mut().set_interceptor(interceptor);
-                self.compact_state = Some(state);
+                self.compact_state = Some(state.clone());
+                Some(state)
             } else {
                 self.worker_mut().on_usage(move |event| {
                     tracker_for_usage.record_usage(event);
                 });
-                self.worker_mut().set_interceptor(hook_interceptor);
-            }
+                None
+            };
 
+            let interceptor = PodInterceptor::new(registry, compact_state);
+            self.worker_mut().set_interceptor(interceptor);
             self.interceptor_installed = true;
         }
     }
