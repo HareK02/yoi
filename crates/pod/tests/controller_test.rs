@@ -346,7 +346,6 @@ async fn notify_while_idle_auto_starts_turn_and_injects_system_message() {
 
     handle
         .send(Method::Notify {
-            source: "child-a".into(),
             message: "turn finished".into(),
         })
         .await
@@ -384,7 +383,7 @@ async fn notify_while_idle_auto_starts_turn_and_injects_system_message() {
         .unwrap_or_default()
         .to_string();
     assert!(
-        last_item_text.contains("[Notification from child-a]"),
+        last_item_text.contains("[Notification]"),
         "injected system message missing, got: {last_item_text:?}"
     );
     assert!(last_item_text.contains("turn finished"));
@@ -406,7 +405,6 @@ async fn notify_while_running_does_not_emit_already_running_error() {
         .unwrap();
     handle
         .send(Method::Notify {
-            source: "child".into(),
             message: "ping".into(),
         })
         .await

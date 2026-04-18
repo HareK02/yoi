@@ -23,9 +23,11 @@ use tokio::net::UnixStream;
 use tokio::process::Command;
 use tokio::time::sleep;
 
+use crate::pod_events;
 use crate::runtime_dir::SpawnedPodRecord;
 use crate::scope_lock::{self, LockFileGuard, ScopeLockError};
 use crate::spawned_pod_registry::SpawnedPodRegistry;
+use protocol::PodEvent;
 
 const DESCRIPTION: &str = "Spawn a new Pod process to work on a delegated task. \
 The spawner's write scope is reduced by the scope passed here; the spawned \
@@ -93,7 +95,7 @@ pub struct SpawnPodTool {
     /// `delegated_from` in the scope-lock registry.
     spawner_name: String,
     /// Path to the spawner's Unix socket. Handed to the child via
-    /// `--callback` so `Method::Notify` has somewhere to land.
+    /// `--callback` so its `PodEvent` callbacks have somewhere to land.
     callback_socket: PathBuf,
     /// Root of the `$XDG_RUNTIME_DIR/insomnia/` tree, used to predict
     /// the spawned Pod's socket path before the child has bound it.
@@ -105,6 +107,12 @@ pub struct SpawnPodTool {
     /// pod-comm tools (`SendToPod` / `ReadPodOutput` / `StopPod` /
     /// `ListPods`). Writes the list to `spawned_pods.json` on each add.
     registry: Arc<SpawnedPodRegistry>,
+    /// THIS Pod's own parent-callback socket, if any. After a
+    /// successful spawn we fire `PodEvent::ScopeSubDelegated` upward
+    /// so the grandparent can register the grandchild directly.
+    /// `None` for top-level Pods — in that case the re-emission is a
+    /// no-op.
+    parent_socket: Option<PathBuf>,
 }
 
 impl SpawnPodTool {
@@ -114,6 +122,7 @@ impl SpawnPodTool {
         runtime_base: PathBuf,
         spawner_pwd: PathBuf,
         registry: Arc<SpawnedPodRegistry>,
+        parent_socket: Option<PathBuf>,
     ) -> Self {
         Self {
             spawner_name,
@@ -121,6 +130,7 @@ impl SpawnPodTool {
             runtime_base,
             spawner_pwd,
             registry,
+            parent_socket,
         }
     }
 }
@@ -197,13 +207,26 @@ impl Tool for SpawnPodTool {
         let record = SpawnedPodRecord {
             pod_name: input.name.clone(),
             socket_path: predicted_socket.clone(),
-            scope_delegated: scope_allow,
+            scope_delegated: scope_allow.clone(),
             callback_address: self.callback_socket.clone(),
         };
         self.registry
             .add(record)
             .await
             .map_err(|e| ToolError::ExecutionFailed(format!("write spawned_pods.json: {e}")))?;
+
+        // Notify this Pod's own parent so the grandparent can register
+        // the new grandchild directly. Fire-and-forget; top-level Pods
+        // (with no parent) skip the send inside `fire_and_forget`.
+        pod_events::fire_and_forget(
+            self.parent_socket.clone(),
+            PodEvent::ScopeSubDelegated {
+                parent_pod: self.spawner_name.clone(),
+                sub_pod: input.name.clone(),
+                sub_socket: predicted_socket.clone(),
+                scope: scope_allow,
+            },
+        );
 
         Ok(ToolOutput {
             summary: format!(
@@ -362,6 +385,7 @@ pub fn spawn_pod_tool(
     runtime_base: PathBuf,
     spawner_pwd: PathBuf,
     registry: Arc<SpawnedPodRegistry>,
+    parent_socket: Option<PathBuf>,
 ) -> ToolDefinition {
     Arc::new(move || {
         let schema = schemars::schema_for!(SpawnPodInput);
@@ -375,6 +399,7 @@ pub fn spawn_pod_tool(
             runtime_base.clone(),
             spawner_pwd.clone(),
             registry.clone(),
+            parent_socket.clone(),
         ));
         (meta, tool)
     })

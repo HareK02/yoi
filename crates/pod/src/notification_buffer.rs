@@ -17,7 +17,6 @@ const CAPACITY: usize = 128;
 /// One pending notification awaiting injection into the next LLM request.
 #[derive(Debug, Clone)]
 pub struct PendingNotification {
-    pub source: String,
     pub message: String,
 }
 
@@ -37,17 +36,17 @@ impl NotificationBuffer {
     /// Push a notification onto the queue. If the queue is full, the
     /// oldest entry is dropped and a `tracing::warn` is emitted — the
     /// caller should never hit this in normal operation.
-    pub fn push(&self, source: String, message: String) {
+    pub fn push(&self, message: String) {
         let mut q = self.inner.lock().expect("notification buffer poisoned");
         if q.len() >= CAPACITY {
             let dropped = q.pop_front();
             warn!(
                 capacity = CAPACITY,
-                dropped_source = dropped.as_ref().map(|n| n.source.as_str()),
+                dropped_message = dropped.as_ref().map(|n| n.message.as_str()),
                 "notification buffer overflow; dropped oldest"
             );
         }
-        q.push_back(PendingNotification { source, message });
+        q.push_back(PendingNotification { message });
     }
 
     /// Remove and return all pending notifications in FIFO order.
@@ -73,11 +72,10 @@ impl NotificationBuffer {
 /// that gets injected into the per-request context.
 pub(crate) fn format_notification(n: &PendingNotification) -> Item {
     let text = format!(
-        "[Notification from {source}]\n{message}\n\n\
+        "[Notification]\n{message}\n\n\
          This is a notification, not a blocking request. \
          If you are in the middle of a task, continue your current work \
          and address this at a natural stopping point.",
-        source = n.source,
         message = n.message,
     );
     Item::system_message(text)
@@ -90,12 +88,12 @@ mod tests {
     #[test]
     fn push_then_drain_preserves_order() {
         let buf = NotificationBuffer::new();
-        buf.push("a".into(), "one".into());
-        buf.push("b".into(), "two".into());
+        buf.push("one".into());
+        buf.push("two".into());
         let drained = buf.drain();
         assert_eq!(drained.len(), 2);
-        assert_eq!(drained[0].source, "a");
-        assert_eq!(drained[1].source, "b");
+        assert_eq!(drained[0].message, "one");
+        assert_eq!(drained[1].message, "two");
         assert!(buf.is_empty());
     }
 
@@ -103,24 +101,23 @@ mod tests {
     fn capacity_drops_oldest() {
         let buf = NotificationBuffer::new();
         for i in 0..(CAPACITY + 5) {
-            buf.push(format!("src{i}"), format!("msg{i}"));
+            buf.push(format!("msg{i}"));
         }
         let drained = buf.drain();
         assert_eq!(drained.len(), CAPACITY);
-        // Oldest 5 were dropped; first retained is src5.
-        assert_eq!(drained[0].source, "src5");
-        assert_eq!(drained[CAPACITY - 1].source, format!("src{}", CAPACITY + 4));
+        // Oldest 5 were dropped; first retained is msg5.
+        assert_eq!(drained[0].message, "msg5");
+        assert_eq!(drained[CAPACITY - 1].message, format!("msg{}", CAPACITY + 4));
     }
 
     #[test]
-    fn format_notification_includes_source_message_and_nonblocking_hint() {
+    fn format_notification_includes_message_and_nonblocking_hint() {
         let n = PendingNotification {
-            source: "child".into(),
             message: "hello".into(),
         };
         let item = format_notification(&n);
         let text = item.as_text().unwrap_or_default().to_string();
-        assert!(text.contains("[Notification from child]"));
+        assert!(text.contains("[Notification]"));
         assert!(text.contains("hello"));
         assert!(text.contains("not a blocking request"));
     }

@@ -6,6 +6,7 @@ pub use config::{
     CompactionConfigPartial, PodManifestConfig, PodMetaConfig, ProviderConfigPartial, ResolveError,
     ToolOutputLimitsPartial, WorkerManifestConfig,
 };
+pub use protocol::{Permission, ScopeRule};
 pub use scope::{Scope, ScopeError};
 
 use std::collections::HashMap;
@@ -157,39 +158,6 @@ pub struct ScopeConfig {
     /// default.
     #[serde(default)]
     pub deny: Vec<ScopeRule>,
-}
-
-/// A single allow or deny rule inside [`ScopeConfig`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ScopeRule {
-    /// Target path. Must be absolute by the time [`Scope::from_config`]
-    /// runs — relative paths are resolved per-layer against the manifest
-    /// file's directory (cwd for overlay layers) before cascade merge.
-    pub target: PathBuf,
-    /// Permission level this rule grants (allow) or caps strictly below
-    /// (deny).
-    pub permission: Permission,
-    /// When `false`, the rule only matches the target itself and its
-    /// direct children. Defaults to `true`.
-    #[serde(default = "default_recursive")]
-    pub recursive: bool,
-}
-
-fn default_recursive() -> bool {
-    true
-}
-
-/// Permission lattice used by [`ScopeRule`].
-///
-/// The derived `Ord` instance follows declaration order, so
-/// `Read < Write`. Allow rules grant the stated level (and by extension
-/// everything below); deny rules cap the effective level **strictly
-/// below** the stated level.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Permission {
-    Read,
-    Write,
 }
 
 /// Context compaction configuration.

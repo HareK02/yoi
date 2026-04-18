@@ -115,11 +115,9 @@ pub struct Pod<C: LlmClient, St: Store> {
     #[allow(dead_code)]
     scope_allocation: Option<ScopeAllocationGuard>,
     /// Socket path of the spawning Pod. `Some` only for Pods built via
-    /// `from_manifest_spawned`. The callback is consumed by the
-    /// `pod-callback` layer (separate ticket) to deliver
-    /// `Method::Notify` back to the spawner; stored here so the Pod
-    /// carries the reference for the duration of its life.
-    #[allow(dead_code)]
+    /// `from_manifest_spawned`. Consumed by the controller to fire
+    /// `Method::PodEvent` reports upward (turn end, error, shutdown,
+    /// scope sub-delegation).
     callback_socket: Option<PathBuf>,
 }
 
@@ -325,8 +323,8 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     /// The notification will be injected as an `Item::system_message`
     /// into the next outgoing LLM request context (not into history).
     /// See [`NotificationBuffer`] for overflow behaviour.
-    pub fn push_notification(&self, source: String, message: String) {
-        self.pending_notifications.push(source, message);
+    pub fn push_notification(&self, message: String) {
+        self.pending_notifications.push(message);
     }
 
     /// Shared handle to the pending notification buffer.
@@ -335,6 +333,15 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     /// while `pod.run()` is in flight can still reach the interceptor.
     pub fn notification_buffer_handle(&self) -> NotificationBuffer {
         self.pending_notifications.clone()
+    }
+
+    /// Parent callback socket set by `from_manifest_spawned`.
+    ///
+    /// Consumed by the Controller to fire `Method::PodEvent` upward on
+    /// lifecycle transitions. `None` for top-level Pods, in which case
+    /// the Controller silently skips the send.
+    pub fn callback_socket(&self) -> Option<&PathBuf> {
+        self.callback_socket.as_ref()
     }
 
     // --- Hook registration ---

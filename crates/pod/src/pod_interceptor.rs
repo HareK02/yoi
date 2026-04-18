@@ -292,8 +292,8 @@ mod tests {
     async fn pre_llm_request_drains_pending_notifications_into_context() {
         let registry = Arc::new(HookRegistryBuilder::new().build());
         let buffer = NotificationBuffer::new();
-        buffer.push("child-a".into(), "first".into());
-        buffer.push("child-b".into(), "second".into());
+        buffer.push("first".into());
+        buffer.push("second".into());
 
         let interceptor = PodInterceptor::new(registry, None, buffer.clone());
         let mut ctx: Vec<Item> = vec![Item::user_message("hi")];
@@ -304,9 +304,9 @@ mod tests {
         assert_eq!(ctx.len(), 3);
         let second = ctx[1].as_text().unwrap_or_default();
         let third = ctx[2].as_text().unwrap_or_default();
-        assert!(second.contains("[Notification from child-a]"));
+        assert!(second.contains("[Notification]"));
         assert!(second.contains("first"));
-        assert!(third.contains("[Notification from child-b]"));
+        assert!(third.contains("[Notification]"));
         assert!(third.contains("second"));
         // Buffer is drained after a single pre_llm_request call.
         assert!(buffer.is_empty());
@@ -318,7 +318,7 @@ mod tests {
         // the next pre_llm_request (after compaction + resume).
         let registry = Arc::new(HookRegistryBuilder::new().build());
         let buffer = NotificationBuffer::new();
-        buffer.push("src".into(), "msg".into());
+        buffer.push("msg".into());
 
         let state = Arc::new(CompactState::new(100, 2));
         state.update_input_tokens(200);

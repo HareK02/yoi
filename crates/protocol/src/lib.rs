@@ -1,5 +1,7 @@
 pub mod stream;
 
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -10,11 +12,61 @@ use serde::{Deserialize, Serialize};
 #[serde(tag = "method", content = "params", rename_all = "snake_case")]
 pub enum Method {
     Run { input: String },
-    Notify { source: String, message: String },
+    /// Human-readable text injected into the target Pod's LLM context
+    /// as a non-blocking system message. No side effects beyond LLM
+    /// context; use `PodEvent` for typed lifecycle reports.
+    Notify { message: String },
+    /// Typed lifecycle report from a child Pod to its direct parent.
+    PodEvent(PodEvent),
     Resume,
     Cancel,
     Shutdown,
     GetHistory,
+}
+
+/// Typed lifecycle events sent from a child Pod to its parent.
+///
+/// Delivered as `Method::PodEvent` over the parent's Unix socket. The
+/// parent Controller applies variant-specific side effects (registry /
+/// scope-lock updates) and renders a human-readable string that is
+/// injected into the parent's LLM context via the notification buffer.
+///
+/// Transport is fire-and-forget; receivers must tolerate out-of-order
+/// delivery (e.g. `TurnEnded` arriving after `ShutDown` for the same
+/// child Pod).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PodEvent {
+    /// Child finished one turn and is back to IDLE.
+    TurnEnded { pod_name: String },
+
+    /// Worker execution error occurred inside the child's turn.
+    ///
+    /// Limited to worker runtime failures (provider / tool errors) —
+    /// does not include transient method-rejection responses such as
+    /// `AlreadyRunning`.
+    Errored { pod_name: String, message: String },
+
+    /// Child has stopped (controller loop is exiting).
+    ShutDown { pod_name: String },
+
+    /// Child sub-delegated scope to a grandchild Pod via `SpawnPod`.
+    ///
+    /// The parent uses this to add the grandchild to its own
+    /// `spawned_pods.json` so it can manage the grandchild directly
+    /// even if the intermediate child dies. The parent then re-fires
+    /// this event upward (if it has a parent of its own) to maintain
+    /// the chain to root.
+    ScopeSubDelegated {
+        /// Sub-delegating Pod (= the sender itself).
+        parent_pod: String,
+        /// Name of the grandchild Pod.
+        sub_pod: String,
+        /// Unix-socket path where the grandchild is reachable.
+        sub_socket: PathBuf,
+        /// Scope delegated to the grandchild.
+        scope: Vec<ScopeRule>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -150,6 +202,48 @@ pub enum ErrorCode {
     Internal,
 }
 
+// ---------------------------------------------------------------------------
+// Scope rule / permission (wire type)
+//
+// Defined here so that both `manifest` (config parsing) and `protocol`
+// itself (inter-pod messaging such as `PodEvent::ScopeSubDelegated`) can
+// reference the same type without introducing a reverse dependency.
+// ---------------------------------------------------------------------------
+
+/// A single allow or deny rule inside a scope configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScopeRule {
+    /// Target path. Must be absolute by the time a `Scope` is built from
+    /// this rule — relative paths are resolved per-layer against the
+    /// manifest file's directory (cwd for overlay layers) before cascade
+    /// merge.
+    pub target: PathBuf,
+    /// Permission level this rule grants (allow) or caps strictly below
+    /// (deny).
+    pub permission: Permission,
+    /// When `false`, the rule only matches the target itself and its
+    /// direct children. Defaults to `true`.
+    #[serde(default = "default_recursive")]
+    pub recursive: bool,
+}
+
+fn default_recursive() -> bool {
+    true
+}
+
+/// Permission lattice used by [`ScopeRule`].
+///
+/// The derived `Ord` instance follows declaration order, so
+/// `Read < Write`. Allow rules grant the stated level (and by extension
+/// everything below); deny rules cap the effective level **strictly
+/// below** the stated level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Permission {
+    Read,
+    Write,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,12 +289,11 @@ mod tests {
 
     #[test]
     fn method_notify_json_roundtrip() {
-        let json = r#"{"method":"notify","params":{"source":"child-pod","message":"turn done"}}"#;
+        let json = r#"{"method":"notify","params":{"message":"turn done"}}"#;
         let method: Method = serde_json::from_str(json).unwrap();
         assert!(matches!(
             method,
-            Method::Notify { ref source, ref message }
-            if source == "child-pod" && message == "turn done"
+            Method::Notify { ref message } if message == "turn done"
         ));
         let serialized = serde_json::to_string(&method).unwrap();
         assert_eq!(serialized, json);
@@ -233,6 +326,87 @@ mod tests {
         assert_eq!(parsed["data"]["items"][0]["role"], "user");
         assert_eq!(parsed["data"]["greeting"]["pod_name"], "test");
         assert_eq!(parsed["data"]["greeting"]["tools"][0], "Read");
+    }
+
+    #[test]
+    fn method_pod_event_turn_ended_roundtrip() {
+        let method = Method::PodEvent(PodEvent::TurnEnded {
+            pod_name: "child".into(),
+        });
+        let json = serde_json::to_string(&method).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["method"], "pod_event");
+        assert_eq!(parsed["params"]["kind"], "turn_ended");
+        assert_eq!(parsed["params"]["pod_name"], "child");
+
+        let decoded: Method = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            decoded,
+            Method::PodEvent(PodEvent::TurnEnded { ref pod_name }) if pod_name == "child"
+        ));
+    }
+
+    #[test]
+    fn method_pod_event_errored_roundtrip() {
+        let method = Method::PodEvent(PodEvent::Errored {
+            pod_name: "child".into(),
+            message: "provider 429".into(),
+        });
+        let json = serde_json::to_string(&method).unwrap();
+        let decoded: Method = serde_json::from_str(&json).unwrap();
+        match decoded {
+            Method::PodEvent(PodEvent::Errored { pod_name, message }) => {
+                assert_eq!(pod_name, "child");
+                assert_eq!(message, "provider 429");
+            }
+            other => panic!("expected Errored, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn method_pod_event_shutdown_roundtrip() {
+        let method = Method::PodEvent(PodEvent::ShutDown {
+            pod_name: "child".into(),
+        });
+        let json = serde_json::to_string(&method).unwrap();
+        let decoded: Method = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            decoded,
+            Method::PodEvent(PodEvent::ShutDown { ref pod_name }) if pod_name == "child"
+        ));
+    }
+
+    #[test]
+    fn method_pod_event_scope_sub_delegated_roundtrip() {
+        let method = Method::PodEvent(PodEvent::ScopeSubDelegated {
+            parent_pod: "child".into(),
+            sub_pod: "grandchild".into(),
+            sub_socket: "/run/insomnia/grandchild/sock".into(),
+            scope: vec![ScopeRule {
+                target: "/tmp/work".into(),
+                permission: Permission::Write,
+                recursive: true,
+            }],
+        });
+        let json = serde_json::to_string(&method).unwrap();
+        let decoded: Method = serde_json::from_str(&json).unwrap();
+        match decoded {
+            Method::PodEvent(PodEvent::ScopeSubDelegated {
+                parent_pod,
+                sub_pod,
+                sub_socket,
+                scope,
+            }) => {
+                assert_eq!(parent_pod, "child");
+                assert_eq!(sub_pod, "grandchild");
+                assert_eq!(sub_socket, PathBuf::from("/run/insomnia/grandchild/sock"));
+                assert_eq!(scope.len(), 1);
+                assert_eq!(scope[0].target, PathBuf::from("/tmp/work"));
+                assert_eq!(scope[0].permission, Permission::Write);
+                assert!(scope[0].recursive);
+            }
+            other => panic!("expected ScopeSubDelegated, got {other:?}"),
+        }
     }
 
     #[test]

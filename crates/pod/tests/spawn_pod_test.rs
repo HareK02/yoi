@@ -158,6 +158,7 @@ async fn spawn_pod_delegates_scope_and_sends_run() {
         runtime_base.clone(),
         allow_root.path().to_path_buf(),
         registry,
+        None,
     );
     let (_meta, tool) = def();
 
@@ -219,6 +220,7 @@ async fn spawn_pod_rejects_scope_outside_spawner() {
         runtime_base,
         allow_root.path().to_path_buf(),
         registry,
+        None,
     );
     let (_meta, tool) = def();
 
@@ -276,6 +278,7 @@ async fn spawn_pod_rolls_back_reservation_when_socket_never_appears() {
         runtime_base,
         allow_root.path().to_path_buf(),
         registry,
+        None,
     );
     let (_meta, tool) = def();
 

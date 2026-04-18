@@ -114,6 +114,17 @@ impl PodController {
         let pwd_for_tools = pod.pwd().to_path_buf();
         let spawner_name = pod.manifest().pod.name.clone();
 
+        // Parent callback socket (this Pod's own parent, used for
+        // `PodEvent` upward reports). `None` for top-level Pods.
+        let self_parent_socket = pod.callback_socket().cloned();
+
+        // `SpawnedPodRegistry` is shared between the Pod-orchestration
+        // tools (registered below) and the main loop's `PodEvent`
+        // handler (added later in this function), so hoist its creation
+        // above the worker-borrow block.
+        let spawner_socket = runtime_dir.socket_path();
+        let spawned_registry = SpawnedPodRegistry::new(runtime_dir.clone());
+
         // Register event bridge callbacks on the worker
         {
             let worker = pod.worker_mut();
@@ -209,24 +220,20 @@ impl PodController {
             worker.register_tools(tools::builtin_tools(fs, tracker.clone()));
 
             // Pod-orchestration tools (SpawnPod + the four comm tools)
-            // share a single `SpawnedPodRegistry`: `SpawnPod` writes to
-            // it, the others read/mutate. Wired here rather than in
-            // `tools::builtin_tools` because these need Pod-scoped
-            // handles (this Pod's own socket path, runtime_dir, spawner
-            // name) that the generic tools crate has no access to.
-            let spawner_socket = runtime_dir.socket_path();
-            let spawned_registry = SpawnedPodRegistry::new(runtime_dir.clone());
+            // share the Pod-scoped `SpawnedPodRegistry` hoisted above
+            // (also consumed by the main loop's `PodEvent` handler).
             worker.register_tool(spawn_pod_tool(
-                spawner_name,
-                spawner_socket,
+                spawner_name.clone(),
+                spawner_socket.clone(),
                 runtime_base.to_path_buf(),
                 pwd_for_tools,
                 spawned_registry.clone(),
+                self_parent_socket.clone(),
             ));
             worker.register_tool(send_to_pod_tool(spawned_registry.clone()));
             worker.register_tool(read_pod_output_tool(spawned_registry.clone()));
             worker.register_tool(stop_pod_tool(spawned_registry.clone()));
-            worker.register_tool(list_pods_tool(spawned_registry));
+            worker.register_tool(list_pods_tool(spawned_registry.clone()));
             pod.attach_tracker(tracker);
         }
 
@@ -266,6 +273,8 @@ impl PodController {
                             &cancel_tx,
                             &shared_state,
                             &notification_buffer,
+                            self_parent_socket.as_ref(),
+                            &spawner_name,
                         )
                         .await;
 
@@ -292,8 +301,8 @@ impl PodController {
                         }
                     }
 
-                    Method::Notify { source, message } => {
-                        pod.push_notification(source, message);
+                    Method::Notify { message } => {
+                        pod.push_notification(message);
                         if shared_state.get_status() != PodStatus::Idle {
                             // RUNNING / Paused: the buffer push is the
                             // entire operation; the in-flight turn (or
@@ -313,6 +322,8 @@ impl PodController {
                             &cancel_tx,
                             &shared_state,
                             &notification_buffer,
+                            self_parent_socket.as_ref(),
+                            &spawner_name,
                         )
                         .await;
 
@@ -357,6 +368,8 @@ impl PodController {
                             &cancel_tx,
                             &shared_state,
                             &notification_buffer,
+                            self_parent_socket.as_ref(),
+                            &spawner_name,
                         )
                         .await;
 
@@ -398,8 +411,78 @@ impl PodController {
                     // GetHistory is handled at the socket layer (direct response).
                     // If it somehow reaches the controller, ignore it.
                     Method::GetHistory => {}
+
+                    Method::PodEvent(event) => {
+                        // (1) system side effects — idempotent and
+                        // tolerant of out-of-order delivery (e.g.
+                        // `TurnEnded` arriving after `ShutDown`).
+                        crate::pod_events::apply_event_side_effects(
+                            &event,
+                            &spawned_registry,
+                            &spawner_name,
+                            &self_parent_socket,
+                        )
+                        .await;
+                        // (2) render a one-line summary and push it
+                        // into the notification buffer; the next LLM
+                        // request will inject it as a system message
+                        // via `PodInterceptor::pre_llm_request`.
+                        let text = crate::pod_events::render_event(&event);
+                        pod.push_notification(text);
+                        // Auto-kick a turn if the Pod is idle so the
+                        // notification is not stranded. Matches the
+                        // `Method::Notify` idle path.
+                        if shared_state.get_status() == PodStatus::Idle {
+                            shared_state.set_status(PodStatus::Running);
+                            let _ = runtime_dir.write_status(&shared_state).await;
+
+                            let (new_status, shutdown) = run_with_cancel_support(
+                                pod.run_for_notification(),
+                                &mut method_rx,
+                                &event_tx,
+                                &cancel_tx,
+                                &shared_state,
+                                &notification_buffer,
+                                self_parent_socket.as_ref(),
+                                &spawner_name,
+                            )
+                            .await;
+
+                            if new_status == PodStatus::Idle {
+                                if let Err(e) = pod.try_post_run_compact().await {
+                                    tracing::warn!(error = %e, "Post-run compaction error");
+                                    notifier.notify(
+                                        NotificationLevel::Warn,
+                                        NotificationSource::Compactor,
+                                        format!("post-run compaction error: {e}"),
+                                    );
+                                }
+                            }
+
+                            let items = pod.worker().history().to_vec();
+                            shared_state.update_history(items);
+                            shared_state.set_status(new_status);
+                            let _ = runtime_dir.write_status(&shared_state).await;
+                            let _ = runtime_dir.write_history(&shared_state).await;
+
+                            if shutdown {
+                                let _ = event_tx.send(Event::Shutdown);
+                                break;
+                            }
+                        }
+                    }
                 }
             }
+
+            // Report upward that this Pod is stopping before the
+            // controller task exits. Fire-and-forget; the parent may
+            // already be gone.
+            crate::pod_events::fire_and_forget(
+                self_parent_socket.clone(),
+                protocol::PodEvent::ShutDown {
+                    pod_name: spawner_name.clone(),
+                },
+            );
 
             let _ = shutdown_tx.send(());
         });
@@ -411,6 +494,12 @@ impl PodController {
 /// Runs a Pod future while concurrently processing incoming methods.
 ///
 /// Returns `(final_status, shutdown_requested)`.
+///
+/// `parent_socket` / `self_name` drive upward `PodEvent` reports
+/// (`TurnEnded` on a clean Finished, `Errored` on a worker failure).
+/// `None` parent skips the send (top-level Pod). Transient method
+/// rejections such as `AlreadyRunning` are intentionally NOT reported
+/// as `Errored` — only the worker-execution `Err` branch below fires.
 async fn run_with_cancel_support<F>(
     pod_future: F,
     method_rx: &mut mpsc::Receiver<Method>,
@@ -418,6 +507,8 @@ async fn run_with_cancel_support<F>(
     cancel_tx: &mpsc::Sender<()>,
     shared_state: &Arc<PodSharedState>,
     notification_buffer: &NotificationBuffer,
+    parent_socket: Option<&std::path::PathBuf>,
+    self_name: &str,
 ) -> (PodStatus, bool)
 where
     F: std::future::Future<Output = Result<PodRunResult, PodError>>,
@@ -436,14 +527,30 @@ where
                             PodRunResult::LimitReached => (PodStatus::Idle, RunResult::LimitReached),
                         };
                         let _ = event_tx.send(Event::RunEnd { result: run_result });
+                        if matches!(run_result, RunResult::Finished) {
+                            crate::pod_events::fire_and_forget(
+                                parent_socket.cloned(),
+                                protocol::PodEvent::TurnEnded {
+                                    pod_name: self_name.to_string(),
+                                },
+                            );
+                        }
                         (status, shutdown_requested)
                     }
                     Err(e) => {
                         let code = worker_error_code(&e);
+                        let message = e.to_string();
                         let _ = event_tx.send(Event::Error {
                             code,
-                            message: e.to_string(),
+                            message: message.clone(),
                         });
+                        crate::pod_events::fire_and_forget(
+                            parent_socket.cloned(),
+                            protocol::PodEvent::Errored {
+                                pod_name: self_name.to_string(),
+                                message,
+                            },
+                        );
                         (PodStatus::Idle, shutdown_requested)
                     }
                 };
@@ -463,12 +570,22 @@ where
                             message: "Pod is already executing a turn".into(),
                         });
                     }
-                    Some(Method::Notify { source, message }) => {
+                    Some(Method::Notify { message }) => {
                         // Route into the buffer; the in-flight turn will
                         // drain it at its next pre_llm_request.
-                        notification_buffer.push(source, message);
+                        notification_buffer.push(message);
                     }
                     Some(Method::GetHistory) => {}
+                    Some(Method::PodEvent(_)) => {
+                        // PodEvent is handled in the main loop (next
+                        // iteration). Dropping it here is fine because
+                        // the sender is external and we will see it
+                        // again via `method_rx` after the current turn
+                        // ends — this arm only fires for concurrent
+                        // arrivals during an in-flight turn, where the
+                        // strict ordering guarantees that matter for
+                        // PodEvent don't exist anyway (fire-and-forget).
+                    }
                     None => {
                         let _ = cancel_tx.try_send(());
                         shared_state.set_status(PodStatus::Idle);

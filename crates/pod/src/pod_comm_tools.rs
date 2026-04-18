@@ -325,7 +325,7 @@ fn unknown_pod_err(name: &str) -> ToolError {
 /// Connect with a timeout, write one `Method` line, flush, and close.
 /// Any socket error maps to an `io::Error`; the caller decides whether
 /// to surface it to the LLM or treat it as "pod stopped".
-async fn connect_and_send(socket: &Path, method: &Method) -> std::io::Result<()> {
+pub(crate) async fn connect_and_send(socket: &Path, method: &Method) -> std::io::Result<()> {
     let stream = tokio::time::timeout(SOCKET_OP_TIMEOUT, UnixStream::connect(socket))
         .await
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timed out"))??;

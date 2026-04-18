@@ -1517,6 +1517,7 @@ dependencies = [
 name = "manifest"
 version = "0.1.0"
 dependencies = [
+ "protocol",
  "serde",
  "serde_ignored",
  "tempfile",
