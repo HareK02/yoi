@@ -13,9 +13,9 @@
 //! recovery rides on the next Pod that opens the file — no background
 //! reaper.
 
-use std::fs::{File, OpenOptions};
+use std::fs::{DirBuilder, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use fs4::fs_std::FileExt;
@@ -109,11 +109,10 @@ impl LockFileGuard {
     /// allocation table. Existing files/directories are left alone.
     pub fn open(path: &Path) -> io::Result<Self> {
         if let Some(parent) = path.parent() {
-            let existed = parent.exists();
-            std::fs::create_dir_all(parent)?;
-            if !existed {
-                std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
-            }
+            DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)?;
         }
         let file = OpenOptions::new()
             .read(true)

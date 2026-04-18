@@ -5,7 +5,6 @@
 - [ ] Protocol の設計 → [tickets/protocol-design.md](tickets/protocol-design.md)
 - [ ] パーミッション: パターンベースのツール実行制御 → [tickets/permission-extension-point.md](tickets/permission-extension-point.md)
 - [ ] Pod オーケストレーション
-  - [ ] Scope lock file: write 排他とスコープ分譲の記録基盤 → [tickets/scope-lock.md](tickets/scope-lock.md)
   - [ ] SpawnPod ツール: LLM から Pod を生成 → [tickets/spawn-pod-tool.md](tickets/spawn-pod-tool.md)
   - [ ] Pod 間通信ツール: SendToPod / ReadPodOutput / StopPod / ListPods → [tickets/pod-comm-tools.md](tickets/pod-comm-tools.md)
   - [ ] Pod 間コールバック通知 → [tickets/pod-callback.md](tickets/pod-callback.md)
