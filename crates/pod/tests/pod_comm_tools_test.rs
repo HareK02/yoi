@@ -21,7 +21,7 @@ use pod::runtime_dir::{RuntimeDir, SpawnedPodRecord};
 use pod::scope_lock::{self, LockFileGuard};
 use pod::spawned_pod_registry::SpawnedPodRegistry;
 use protocol::stream::{JsonLineReader, JsonLineWriter};
-use protocol::{Event, Greeting, Method};
+use protocol::{ErrorCode, Event, Greeting, Method};
 use serde_json::json;
 use tempfile::TempDir;
 use tokio::net::UnixListener;
@@ -94,6 +94,26 @@ fn accept_one_method(listener: UnixListener) -> JoinHandle<Option<Method>> {
     })
 }
 
+/// Accept one connection, read one `Method`, then write `response`
+/// back. Used by `SendToPod` tests to mock the real controller's
+/// `TurnStart` acknowledgement (or its `AlreadyRunning` rejection).
+fn accept_method_and_respond(
+    listener: UnixListener,
+    response: Event,
+) -> JoinHandle<Option<Method>> {
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.ok()?;
+        let (r, w) = stream.into_split();
+        let mut reader = JsonLineReader::new(r);
+        let mut writer = JsonLineWriter::new(w);
+        let method = reader.next::<Method>().await.ok().flatten();
+        if method.is_some() {
+            let _ = writer.write(&response).await;
+        }
+        method
+    })
+}
+
 /// Pretend to be a spawned Pod that responds to `GetHistory` with a
 /// fixed set of items. Accepts connections until the first one that
 /// delivers a `GetHistory` method; earlier probes (empty accepts) and
@@ -152,7 +172,9 @@ fn assistant(text: &str) -> Item {
 async fn send_to_pod_delivers_run_method() {
     let (tmp, registry, _rd) = setup_registry().await;
     let (socket, listener) = bind_mock_socket(tmp.path(), "child").await;
-    let received = accept_one_method(listener);
+    // Mock the controller's accept path: after reading the method,
+    // ack with `TurnStart` so `SendToPod`'s confirmation loop succeeds.
+    let received = accept_method_and_respond(listener, Event::TurnStart { turn: 1 });
     register_child(&registry, "child", &socket, tmp.path()).await;
 
     let def = send_to_pod_tool(registry);
@@ -176,6 +198,37 @@ async fn send_to_pod_errors_on_unknown_pod() {
     let input = json!({ "name": "nope", "message": "hi" }).to_string();
     let err = tool.execute(&input).await.unwrap_err();
     assert!(err.to_string().contains("no spawned pod"), "{err}");
+}
+
+#[tokio::test]
+async fn send_to_pod_errors_when_pod_already_running() {
+    let (tmp, registry, _rd) = setup_registry().await;
+    let (socket, listener) = bind_mock_socket(tmp.path(), "child").await;
+    // Respond with the same `Error { AlreadyRunning }` that the real
+    // controller emits when `Method::Run` arrives during RUNNING.
+    let received = accept_method_and_respond(
+        listener,
+        Event::Error {
+            code: ErrorCode::AlreadyRunning,
+            message: "Pod is already executing a turn".into(),
+        },
+    );
+    register_child(&registry, "child", &socket, tmp.path()).await;
+
+    let def = send_to_pod_tool(registry);
+    let (_meta, tool) = def();
+    let input = json!({ "name": "child", "message": "hi" }).to_string();
+    let err = tool.execute(&input).await.unwrap_err();
+    assert!(
+        err.to_string().contains("already running"),
+        "expected AlreadyRunning wording: {err}"
+    );
+
+    // Ensure the listener was in fact hit with a Method::Run before the
+    // rejection path fired — otherwise we'd be asserting on an error
+    // that came from a connect failure.
+    let method = received.await.unwrap().expect("expected a method");
+    assert!(matches!(method, Method::Run { .. }));
 }
 
 // ---------------------------------------------------------------------------

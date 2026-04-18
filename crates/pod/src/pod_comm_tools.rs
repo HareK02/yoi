@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use llm_worker::llm_client::types::{ContentPart, Item, Role};
 use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use protocol::stream::{JsonLineReader, JsonLineWriter};
-use protocol::{Event, Method};
+use protocol::{ErrorCode, Event, Method};
 use serde::Deserialize;
 use tokio::net::UnixStream;
 
@@ -45,7 +45,8 @@ struct NameInput {
 
 const SEND_TO_POD_DESCRIPTION: &str =
     "Send a text message to a previously spawned Pod. The spawned Pod \
-processes it as a user turn. Does not wait for the Pod's response — \
+processes it as a user turn. Fails if the Pod is already executing a \
+turn — retry after it finishes. Does not wait for the turn to complete; \
 use `ReadPodOutput` to fetch results afterwards.";
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -71,9 +72,17 @@ impl Tool for SendToPodTool {
             .await
             .ok_or_else(|| unknown_pod_err(&input.name))?;
 
-        connect_and_send(&record.socket_path, &Method::Run { input: input.message })
+        send_run_and_confirm(&record.socket_path, input.message)
             .await
-            .map_err(|e| ToolError::ExecutionFailed(format!("send to `{}`: {e}", input.name)))?;
+            .map_err(|e| match e {
+                SendRunError::AlreadyRunning => ToolError::ExecutionFailed(format!(
+                    "pod `{}` is already running a turn; wait for it to finish and retry",
+                    input.name
+                )),
+                SendRunError::Io(msg) => {
+                    ToolError::ExecutionFailed(format!("send to `{}`: {msg}", input.name))
+                }
+            })?;
 
         Ok(ToolOutput {
             summary: format!("sent message to `{}`", input.name),
@@ -328,6 +337,51 @@ async fn connect_and_send(socket: &Path, method: &Method) -> std::io::Result<()>
     Ok(())
 }
 
+/// Failure modes distinguished by `SendToPod`.
+enum SendRunError {
+    /// Target Pod responded with `Error { AlreadyRunning }` — the
+    /// caller can retry once the current turn ends.
+    AlreadyRunning,
+    /// Any other failure (connect / write / read / unexpected EOF).
+    Io(String),
+}
+
+/// Write `Method::Run` to the target and read back events until we see
+/// either `TurnStart` (accepted) or `Error { AlreadyRunning }`
+/// (rejected). Any replayed notifications that precede the response are
+/// skipped. Times out per-read so a stuck Pod doesn't hang the tool.
+async fn send_run_and_confirm(socket: &Path, input: String) -> Result<(), SendRunError> {
+    let stream = tokio::time::timeout(SOCKET_OP_TIMEOUT, UnixStream::connect(socket))
+        .await
+        .map_err(|_| SendRunError::Io("connect timed out".into()))?
+        .map_err(|e| SendRunError::Io(format!("connect: {e}")))?;
+    let (r, w) = stream.into_split();
+    let mut writer = JsonLineWriter::new(w);
+    let mut reader = JsonLineReader::new(r);
+    tokio::time::timeout(SOCKET_OP_TIMEOUT, writer.write(&Method::Run { input }))
+        .await
+        .map_err(|_| SendRunError::Io("write timed out".into()))?
+        .map_err(|e| SendRunError::Io(format!("write: {e}")))?;
+    loop {
+        let event = tokio::time::timeout(SOCKET_OP_TIMEOUT, reader.next::<Event>())
+            .await
+            .map_err(|_| SendRunError::Io("read timed out".into()))?
+            .map_err(|e| SendRunError::Io(format!("read: {e}")))?;
+        match event {
+            Some(Event::Error {
+                code: ErrorCode::AlreadyRunning,
+                ..
+            }) => return Err(SendRunError::AlreadyRunning),
+            Some(Event::TurnStart { .. }) => return Ok(()),
+            // Notifications and other pre-turn events are replayed to
+            // new subscribers; keep reading until the controller's
+            // response to our `Run` shows up.
+            Some(_) => continue,
+            None => return Err(SendRunError::Io("connection closed before response".into())),
+        }
+    }
+}
+
 /// Connect and ask the Pod for its conversation history. Skips
 /// pre-History events (such as buffered notifications replayed to new
 /// clients). Returns the raw JSON items as `serde_json::Value` since
@@ -384,7 +438,7 @@ fn extract_assistant_text(items: &[serde_json::Value]) -> String {
             for part in content {
                 if let ContentPart::Text { text } = part {
                     if !out.is_empty() {
-                        out.push('\n');
+                        out.push_str("\n\n");
                     }
                     out.push_str(&text);
                 }

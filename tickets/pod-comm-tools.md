@@ -38,7 +38,7 @@
 
 出力:
 - 前回読んだ位置以降の assistant テキスト出力
-- 現在の状態（`running` / `idle` / `stopped`）
+- 現在の到達性（`alive` / `stopped`）
 
 内部動作:
 - spawn 記録から socket path を引く
@@ -53,11 +53,11 @@
 - `name`: 対象の Pod
 
 出力:
-- 終了確認
+- 終了要求を送った旨
 - 回収された scope の要約
 
 内部動作:
-- socket に接続 → `Method::Shutdown` 送信 → 終了確認受信 → 切断
+- socket に接続 → `Method::Shutdown` 送信（応答は待たない）→ 切断
 - scope lock file を flock → 対象の allocation 削除 → spawner の deny を解除 → unlock
 - spawn 記録から対象を削除
 
@@ -94,3 +94,6 @@
 
 - コールバック通知は `tickets/pod-callback.md`
 - Pod ネットワークの GUI / TUI 可視化
+- spawner プロセス再起動後の `spawned_pods.json` からの復旧（現状は write-through のみ）
+- `ReadPodOutput` カーソルの永続化（インメモリのみ、再起動で 0 に戻る）
+- Pod の詳細ステータス（`running` / `idle`）を `Event::History` に含める拡張
