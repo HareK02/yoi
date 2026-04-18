@@ -1,5 +1,7 @@
 # Pod の上流イベント報告 (子 → 親)
 
+レビュー中: [pod-upstream-events.review.md](pod-upstream-events.review.md)
+
 ## 背景
 
 spawned Pod（子）のライフサイクルに親 Pod が反応する仕組みが必要。反応には 2 系統ある：
@@ -160,3 +162,4 @@ variant 別の (1) の中身：
 - リモート親への送信（SSH 越し）。ローカル Unix socket のみ
 - 配信保証（at-least-once / exactly-once）
 - 親再起動時の「見逃したイベント」の再送。ポーリングで補う前提
+- 中間子が死亡した後の孫の upstream 通知路（孫 `callback_address` の再 attach / redirection）。本チケットは scope 管理の保全が主目的で、LLM 通知の連鎖保全は別課題

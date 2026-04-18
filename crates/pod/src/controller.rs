@@ -275,6 +275,7 @@ impl PodController {
                             &notification_buffer,
                             self_parent_socket.as_ref(),
                             &spawner_name,
+                            &spawned_registry,
                         )
                         .await;
 
@@ -324,6 +325,7 @@ impl PodController {
                             &notification_buffer,
                             self_parent_socket.as_ref(),
                             &spawner_name,
+                            &spawned_registry,
                         )
                         .await;
 
@@ -370,6 +372,7 @@ impl PodController {
                             &notification_buffer,
                             self_parent_socket.as_ref(),
                             &spawner_name,
+                            &spawned_registry,
                         )
                         .await;
 
@@ -445,6 +448,7 @@ impl PodController {
                                 &notification_buffer,
                                 self_parent_socket.as_ref(),
                                 &spawner_name,
+                                &spawned_registry,
                             )
                             .await;
 
@@ -475,14 +479,23 @@ impl PodController {
             }
 
             // Report upward that this Pod is stopping before the
-            // controller task exits. Fire-and-forget; the parent may
-            // already be gone.
-            crate::pod_events::fire_and_forget(
-                self_parent_socket.clone(),
-                protocol::PodEvent::ShutDown {
-                    pod_name: spawner_name.clone(),
-                },
-            );
+            // controller task exits. Awaited (not fire-and-forget):
+            // after `shutdown_tx.send` the process may exit quickly,
+            // and a spawned task would be killed mid-send. The
+            // `connect_and_send` helper enforces a 5 s timeout so a
+            // stuck parent cannot block process exit indefinitely.
+            if let Some(parent) = self_parent_socket.as_ref() {
+                if let Err(e) = crate::pod_events::send_pod_event(
+                    parent,
+                    protocol::PodEvent::ShutDown {
+                        pod_name: spawner_name.clone(),
+                    },
+                )
+                .await
+                {
+                    tracing::warn!(error = %e, "ShutDown PodEvent send failed");
+                }
+            }
 
             let _ = shutdown_tx.send(());
         });
@@ -509,6 +522,7 @@ async fn run_with_cancel_support<F>(
     notification_buffer: &NotificationBuffer,
     parent_socket: Option<&std::path::PathBuf>,
     self_name: &str,
+    spawned_registry: &Arc<SpawnedPodRegistry>,
 ) -> (PodStatus, bool)
 where
     F: std::future::Future<Output = Result<PodRunResult, PodError>>,
@@ -576,15 +590,23 @@ where
                         notification_buffer.push(message);
                     }
                     Some(Method::GetHistory) => {}
-                    Some(Method::PodEvent(_)) => {
-                        // PodEvent is handled in the main loop (next
-                        // iteration). Dropping it here is fine because
-                        // the sender is external and we will see it
-                        // again via `method_rx` after the current turn
-                        // ends — this arm only fires for concurrent
-                        // arrivals during an in-flight turn, where the
-                        // strict ordering guarantees that matter for
-                        // PodEvent don't exist anyway (fire-and-forget).
+                    Some(Method::PodEvent(event)) => {
+                        // mpsc is consume-once, so we cannot defer this
+                        // to the next main-loop iteration — drop here
+                        // would lose the event entirely (children fire
+                        // and forget). Apply the side effects inline
+                        // and stage the rendered string on the
+                        // notification buffer so the in-flight turn's
+                        // next `pre_llm_request` surfaces it.
+                        let self_parent_socket = parent_socket.cloned();
+                        crate::pod_events::apply_event_side_effects(
+                            &event,
+                            spawned_registry,
+                            self_name,
+                            &self_parent_socket,
+                        )
+                        .await;
+                        notification_buffer.push(crate::pod_events::render_event(&event));
                     }
                     None => {
                         let _ = cancel_tx.try_send(());
