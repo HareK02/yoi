@@ -7,8 +7,8 @@
 //! read-only summary information and only return control-flow
 //! decisions (continue / skip / abort / pause).
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use llm_worker::Item;
@@ -17,6 +17,7 @@ use llm_worker::interceptor::{
     ToolResultInfo, TurnEndAction,
 };
 use llm_worker::tool::ToolOutput;
+use session_store::UsageRecord;
 use tracing::info;
 
 use crate::compact_state::CompactState;
@@ -25,6 +26,7 @@ use crate::hook::{
     TurnEndInfo,
 };
 use crate::notification_buffer::{NotificationBuffer, format_notification};
+use crate::token_counter::total_tokens_impl;
 
 /// Maximum number of bytes copied into `TurnEndInfo::final_text_preview`.
 const FINAL_TEXT_PREVIEW_LIMIT: usize = 512;
@@ -32,6 +34,10 @@ const FINAL_TEXT_PREVIEW_LIMIT: usize = 512;
 pub(crate) struct PodInterceptor {
     registry: Arc<HookRegistry>,
     compact_state: Option<Arc<CompactState>>,
+    /// Shared view of the cumulative UsageRecord timeline. Used with the
+    /// per-request `context` to estimate current occupancy for threshold
+    /// checks. `None` when compaction is disabled (both thresholds unset).
+    usage_history: Option<Arc<Mutex<Vec<UsageRecord>>>>,
     /// Pending-notification buffer drained into the per-request
     /// context at the head of `pre_llm_request`.
     pending_notifications: NotificationBuffer,
@@ -45,11 +51,13 @@ impl PodInterceptor {
     pub(crate) fn new(
         registry: Arc<HookRegistry>,
         compact_state: Option<Arc<CompactState>>,
+        usage_history: Option<Arc<Mutex<Vec<UsageRecord>>>>,
         pending_notifications: NotificationBuffer,
     ) -> Self {
         Self {
             registry,
             compact_state,
+            usage_history,
             pending_notifications,
             next_turn_index: AtomicUsize::new(0),
             tool_calls_this_turn: AtomicUsize::new(0),
@@ -60,6 +68,15 @@ impl PodInterceptor {
         self.next_turn_index
             .load(Ordering::Relaxed)
             .saturating_sub(1)
+    }
+
+    /// Estimate current input-token occupancy for `context`, projected
+    /// through the shared UsageRecord timeline. Returns `None` when
+    /// `usage_history` is not attached (compaction fully disabled).
+    fn estimated_tokens(&self, context: &[Item]) -> Option<u64> {
+        let handle = self.usage_history.as_ref()?;
+        let records = handle.lock().expect("usage_history poisoned").clone();
+        Some(total_tokens_impl(context, &records).tokens)
     }
 }
 
@@ -83,15 +100,20 @@ impl Interceptor for PodInterceptor {
     }
 
     async fn pre_llm_request(&self, context: &mut Vec<Item>) -> PreRequestAction {
-        // Internal mechanism: between-turns compaction trigger.
+        let current_tokens = self.estimated_tokens(context);
+
+        // Internal mechanism: between-requests compaction trigger (safety net).
         if let Some(state) = self.compact_state.as_ref() {
-            if !state.is_disabled() && state.exceeds_turn() {
-                info!(
-                    input_tokens = state.last_input_tokens(),
-                    threshold = state.turn_threshold(),
-                    "Between-turns compaction threshold exceeded, yielding"
-                );
-                return PreRequestAction::Yield;
+            if !state.is_disabled() {
+                let current = current_tokens.unwrap_or(0);
+                if state.exceeds_request(current) {
+                    info!(
+                        input_tokens = current,
+                        threshold = state.request_threshold().unwrap_or(0),
+                        "Between-requests compaction threshold exceeded, yielding"
+                    );
+                    return PreRequestAction::Yield;
+                }
             }
         }
 
@@ -105,7 +127,7 @@ impl Interceptor for PodInterceptor {
 
         let info = PreRequestInfo {
             item_count: context.len(),
-            estimated_tokens: self.compact_state.as_ref().map(|s| s.last_input_tokens()),
+            estimated_tokens: current_tokens,
             turn_index: self.current_turn_index(),
             tool_calls_this_turn: self.tool_calls_this_turn.load(Ordering::Relaxed),
         };
@@ -232,16 +254,35 @@ mod tests {
         Arc::new(builder.build())
     }
 
+    /// Build a usage_history handle with a single record pinned at the
+    /// current `context_len` so that `total_tokens_impl` returns exactly
+    /// `tokens` (Measured, no interpolation or byte-based fallback).
+    fn usage_handle_with(context_len: usize, tokens: u64) -> Arc<Mutex<Vec<UsageRecord>>> {
+        Arc::new(Mutex::new(vec![UsageRecord {
+            history_len: context_len,
+            input_total_tokens: tokens,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            output_tokens: 0,
+        }]))
+    }
+
     #[tokio::test]
-    async fn pre_llm_request_yields_and_skips_hooks_when_compact_threshold_exceeded() {
+    async fn pre_llm_request_yields_and_skips_hooks_when_request_threshold_exceeded() {
         let count = Arc::new(AtomicUsize::new(0));
         let registry = registry_with_pre_llm_hook(count.clone());
 
-        let state = Arc::new(CompactState::new(100, 2));
-        state.update_input_tokens(200); // exceeds turn threshold
+        let state = Arc::new(CompactState::new(None, Some(100), 2));
+        let ctx_items = vec![Item::user_message("hi")];
+        let history = usage_handle_with(ctx_items.len(), 200);
 
-        let interceptor = PodInterceptor::new(registry, Some(state), NotificationBuffer::new());
-        let mut ctx: Vec<Item> = vec![Item::user_message("hi")];
+        let interceptor = PodInterceptor::new(
+            registry,
+            Some(state),
+            Some(history),
+            NotificationBuffer::new(),
+        );
+        let mut ctx = ctx_items;
         let action = interceptor.pre_llm_request(&mut ctx).await;
 
         assert!(matches!(action, PreRequestAction::Yield));
@@ -254,11 +295,41 @@ mod tests {
         let count = Arc::new(AtomicUsize::new(0));
         let registry = registry_with_pre_llm_hook(count.clone());
 
-        let state = Arc::new(CompactState::new(100, 2));
-        // last_input_tokens stays at 0, well below threshold.
+        let state = Arc::new(CompactState::new(None, Some(100), 2));
+        let ctx_items = vec![Item::user_message("hi")];
+        let history = usage_handle_with(ctx_items.len(), 50);
 
-        let interceptor = PodInterceptor::new(registry, Some(state), NotificationBuffer::new());
-        let mut ctx: Vec<Item> = vec![Item::user_message("hi")];
+        let interceptor = PodInterceptor::new(
+            registry,
+            Some(state),
+            Some(history),
+            NotificationBuffer::new(),
+        );
+        let mut ctx = ctx_items;
+        let action = interceptor.pre_llm_request(&mut ctx).await;
+
+        assert!(matches!(action, PreRequestAction::Continue));
+        assert_eq!(count.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn pre_llm_request_does_not_yield_when_only_post_run_threshold_set() {
+        // request_threshold = None → safety-net check is inert inside the turn
+        // even if current occupancy is huge. Post-run check runs elsewhere.
+        let count = Arc::new(AtomicUsize::new(0));
+        let registry = registry_with_pre_llm_hook(count.clone());
+
+        let state = Arc::new(CompactState::new(Some(100), None, 2));
+        let ctx_items = vec![Item::user_message("hi")];
+        let history = usage_handle_with(ctx_items.len(), 10_000);
+
+        let interceptor = PodInterceptor::new(
+            registry,
+            Some(state),
+            Some(history),
+            NotificationBuffer::new(),
+        );
+        let mut ctx = ctx_items;
         let action = interceptor.pre_llm_request(&mut ctx).await;
 
         assert!(matches!(action, PreRequestAction::Continue));
@@ -270,7 +341,7 @@ mod tests {
         let count = Arc::new(AtomicUsize::new(0));
         let registry = registry_with_pre_llm_hook(count.clone());
 
-        let interceptor = PodInterceptor::new(registry, None, NotificationBuffer::new());
+        let interceptor = PodInterceptor::new(registry, None, None, NotificationBuffer::new());
         let mut ctx: Vec<Item> = Vec::new();
         let action = interceptor.pre_llm_request(&mut ctx).await;
 
@@ -295,7 +366,7 @@ mod tests {
         buffer.push("first".into());
         buffer.push("second".into());
 
-        let interceptor = PodInterceptor::new(registry, None, buffer.clone());
+        let interceptor = PodInterceptor::new(registry, None, None, buffer.clone());
         let mut ctx: Vec<Item> = vec![Item::user_message("hi")];
         let action = interceptor.pre_llm_request(&mut ctx).await;
 
@@ -320,15 +391,18 @@ mod tests {
         let buffer = NotificationBuffer::new();
         buffer.push("msg".into());
 
-        let state = Arc::new(CompactState::new(100, 2));
-        state.update_input_tokens(200);
+        let state = Arc::new(CompactState::new(None, Some(100), 2));
+        let ctx_items = vec![Item::user_message("hi")];
+        let history = usage_handle_with(ctx_items.len(), 200);
 
-        let interceptor = PodInterceptor::new(registry, Some(state), buffer.clone());
-        let mut ctx: Vec<Item> = Vec::new();
+        let interceptor =
+            PodInterceptor::new(registry, Some(state), Some(history), buffer.clone());
+        let mut ctx = ctx_items;
         let action = interceptor.pre_llm_request(&mut ctx).await;
 
         assert!(matches!(action, PreRequestAction::Yield));
-        assert!(ctx.is_empty());
+        // Notifications were not drained (still held for post-compact resume).
+        assert_eq!(ctx.len(), 1);
         assert_eq!(buffer.len(), 1);
     }
 
@@ -341,7 +415,7 @@ mod tests {
         builder.add_pre_llm_request(CountingHook(second_count.clone()));
         let registry = Arc::new(builder.build());
 
-        let interceptor = PodInterceptor::new(registry, None, NotificationBuffer::new());
+        let interceptor = PodInterceptor::new(registry, None, None, NotificationBuffer::new());
         let mut ctx: Vec<Item> = Vec::new();
         let action = interceptor.pre_llm_request(&mut ctx).await;
 

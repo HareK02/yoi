@@ -174,9 +174,26 @@ pub struct CompactionConfig {
     #[serde(default = "default_prune_min_savings")]
     pub prune_min_savings: u64,
 
-    /// When `input_tokens` exceeds this, run compact. `None` = compact disabled.
+    /// Proactive (between-turns) compaction threshold.
+    ///
+    /// Checked by the Controller after each run. When current occupancy
+    /// exceeds this value, compact runs before the next turn. `None`
+    /// disables the between-turns check.
     #[serde(default)]
     pub compact_threshold: Option<u64>,
+
+    /// Safety-net (between-requests) compaction threshold.
+    ///
+    /// Checked by `PodInterceptor::pre_llm_request` inside a turn. When
+    /// current occupancy exceeds this value, the run yields so that the
+    /// Controller can compact before the next LLM request. `None`
+    /// disables the between-requests check.
+    ///
+    /// Expected relation: `compact_threshold < compact_request_threshold`
+    /// (proactive triggers before safety net). A reversed configuration
+    /// is accepted but logged as a warning.
+    #[serde(default)]
+    pub compact_request_threshold: Option<u64>,
 
     /// Number of recent turns retained after compaction.
     #[serde(default = "default_compact_retained_turns")]
@@ -204,6 +221,7 @@ impl Default for CompactionConfig {
             prune_protected_turns: default_prune_protected_turns(),
             prune_min_savings: default_prune_min_savings(),
             compact_threshold: None,
+            compact_request_threshold: None,
             compact_retained_turns: default_compact_retained_turns(),
             provider: None,
         }
@@ -338,7 +356,35 @@ model = "claude-sonnet-4-20250514"
         assert_eq!(c.prune_protected_turns, 3);
         assert_eq!(c.prune_min_savings, 4096);
         assert_eq!(c.compact_threshold, Some(80000));
+        assert_eq!(c.compact_request_threshold, None);
         assert_eq!(c.compact_retained_turns, 2);
+    }
+
+    #[test]
+    fn parse_compaction_both_thresholds() {
+        let toml = format!(
+            "{MINIMAL_REQUIRED}\n\
+             [compaction]\n\
+             compact_threshold = 80000\n\
+             compact_request_threshold = 90000\n"
+        );
+        let manifest = PodManifest::from_toml(&toml).unwrap();
+        let c = manifest.compaction.unwrap();
+        assert_eq!(c.compact_threshold, Some(80000));
+        assert_eq!(c.compact_request_threshold, Some(90000));
+    }
+
+    #[test]
+    fn parse_compaction_request_threshold_only() {
+        let toml = format!(
+            "{MINIMAL_REQUIRED}\n\
+             [compaction]\n\
+             compact_request_threshold = 90000\n"
+        );
+        let manifest = PodManifest::from_toml(&toml).unwrap();
+        let c = manifest.compaction.unwrap();
+        assert_eq!(c.compact_threshold, None);
+        assert_eq!(c.compact_request_threshold, Some(90000));
     }
 
     #[test]

@@ -391,9 +391,10 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
 
     /// Install the hook-based interceptor on the Worker if not already done.
     ///
-    /// When `compact_threshold` is configured in the manifest, wraps the
-    /// `HookInterceptor` in a [`CompactInterceptor`] and registers an
-    /// `on_usage` callback to track `input_tokens`.
+    /// When either compaction threshold (`compact_threshold` or
+    /// `compact_request_threshold`) is configured in the manifest, allocates
+    /// a shared [`CompactState`] and wires the interceptor to read current
+    /// occupancy through the `UsageRecord` timeline.
     fn ensure_interceptor_installed(&mut self) {
         if !self.interceptor_installed {
             // Pre-LLM-request hook: record the item count at send time
@@ -406,41 +407,56 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             let builder = std::mem::take(&mut self.hook_builder);
             let registry = Arc::new(builder.build());
 
-            let compact_threshold = self
+            let (post_run_threshold, request_threshold, retained) = self
                 .manifest
                 .compaction
                 .as_ref()
-                .and_then(|c| c.compact_threshold);
+                .map(|c| {
+                    (
+                        c.compact_threshold,
+                        c.compact_request_threshold,
+                        c.compact_retained_turns,
+                    )
+                })
+                .unwrap_or((None, None, 2));
 
             let tracker_for_usage = self.usage_tracker.clone();
+            self.worker_mut().on_usage(move |event| {
+                tracker_for_usage.record_usage(event);
+            });
 
-            let compact_state = if let Some(threshold) = compact_threshold {
-                let retained = self
-                    .manifest
-                    .compaction
-                    .as_ref()
-                    .map(|c| c.compact_retained_turns)
-                    .unwrap_or(2);
-
-                let state = Arc::new(CompactState::new(threshold, retained));
-                let state_for_usage = state.clone();
-                self.worker_mut().on_usage(move |event| {
-                    if let Some(tokens) = event.input_tokens {
-                        state_for_usage.update_input_tokens(tokens);
+            let compact_state = if post_run_threshold.is_some() || request_threshold.is_some() {
+                if let (Some(post), Some(req)) = (post_run_threshold, request_threshold) {
+                    if post > req {
+                        warn!(
+                            post_run_threshold = post,
+                            request_threshold = req,
+                            "compact_threshold > compact_request_threshold; \
+                             proactive check will never fire before the safety net"
+                        );
                     }
-                    tracker_for_usage.record_usage(event);
-                });
+                }
+                let state = Arc::new(CompactState::new(
+                    post_run_threshold,
+                    request_threshold,
+                    retained,
+                ));
                 self.compact_state = Some(state.clone());
                 Some(state)
             } else {
-                self.worker_mut().on_usage(move |event| {
-                    tracker_for_usage.record_usage(event);
-                });
                 None
             };
 
-            let interceptor =
-                PodInterceptor::new(registry, compact_state, self.pending_notifications.clone());
+            let usage_history_handle = compact_state
+                .as_ref()
+                .map(|_| self.usage_history.clone());
+
+            let interceptor = PodInterceptor::new(
+                registry,
+                compact_state,
+                usage_history_handle,
+                self.pending_notifications.clone(),
+            );
             self.worker_mut().set_interceptor(interceptor);
             self.interceptor_installed = true;
         }
@@ -667,9 +683,13 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     /// Best-effort: failures are logged but do not propagate.
     pub async fn try_post_run_compact(&mut self) -> Result<(), PodError> {
         let state = match self.compact_state.as_ref() {
-            Some(s) if !s.is_disabled() && s.exceeds_post_run() && !s.just_compacted() => s.clone(),
+            Some(s) if !s.is_disabled() && !s.just_compacted() => s.clone(),
             _ => return Ok(()),
         };
+        let current_tokens = self.total_tokens().tokens;
+        if !state.exceeds_post_run(current_tokens) {
+            return Ok(());
+        }
 
         let retained = state.retained_turns();
         match self.compact(retained).await {

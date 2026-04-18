@@ -169,7 +169,7 @@ fn tokens_at(
     }
 }
 
-fn total_tokens_impl(history: &[Item], records: &[UsageRecord]) -> TokenEstimate {
+pub(crate) fn total_tokens_impl(history: &[Item], records: &[UsageRecord]) -> TokenEstimate {
     let prefix = prefix_bytes(history);
     tokens_at(history, records, history.len(), &prefix)
 }
