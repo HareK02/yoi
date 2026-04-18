@@ -22,7 +22,7 @@ spawned Pod（子）のライフサイクルに親 Pod が反応する仕組み�
 ```rust
 pub enum Method {
     Run { input: String },
-    Notify { message: String },           // 既存: 人間・tool → LLM 文脈、副作用なし
+    Notify { message: String },           // 人間・tool → LLM 文脈、副作用なし（本チケットで source を削除）
     PodEvent(PodEvent),                   // 新: 子 → 親、typed なライフサイクル報告
     Resume,
     Cancel,
@@ -34,7 +34,7 @@ pub enum PodEvent {
     /// 子が1ターン終えて IDLE になった
     TurnEnded { pod_name: String },
 
-    /// 子でエラーが発生した（ターンは続行されるとは限らない）
+    /// 子で Worker 実行エラーが発生した
     Errored { pod_name: String, message: String },
 
     /// 子が停止した
@@ -45,12 +45,24 @@ pub enum PodEvent {
         parent_pod: String,               // 又貸し元（= 子自身）
         sub_pod: String,                  // 孫 Pod の名前
         sub_socket: PathBuf,              // 孫 Pod の socket path
-        scope: Vec<ScopeRule>,            // 又貸しされた scope
+        scope: Vec<ScopeRule>,            // 又貸しされた scope（`protocol` crate に移動）
     },
 }
 ```
 
-`Method::Notify` は触らない。`message: String` のまま。
+### `Method::Notify` の `source` 削除
+
+現状 `Method::Notify { source: String, message: String }` の `source` フィールドを削除して `Method::Notify { message: String }` にする。`PodEvent` が typed な子 → 親報告を担うようになったことで、`Notify` は本来の「人間・tool が LLM 文脈に自由テキストを注入する」役割に純化する（発信者の識別は不要になる）。
+
+影響範囲：
+- `protocol::Method::Notify` の定義変更、serde round-trip テストの更新
+- Controller main loop の `Method::Notify { source, message } => pod.push_notification(source, message)` を `pod.push_notification(message)` 形へ変更
+- `Pod::push_notification(source, message)` のシグネチャから `source` を落とす（呼び出し元を追って整理）
+- 既存テスト（`controller_test.rs` の Notify ケース、`pod_comm_tools_test.rs` など）の入力を新シグネチャに揃える
+
+### `ScopeRule` / `Permission` の移動
+
+`ScopeRule` と `Permission` は wire 型として `PodEvent::ScopeSubDelegated` で protocol を経由する必要があるため、現状の `manifest` crate から `protocol` crate へ移動する。`manifest` は `protocol::ScopeRule` を re-export するか、単に `protocol::ScopeRule` を直接参照する形に切り替える。移動により `protocol` → `manifest` の逆依存が発生しないようにする。
 
 ### 子（発信側）
 
@@ -123,17 +135,14 @@ variant 別の (1) の中身：
 - 親が再起動した場合や送信漏れた場合は、親の `ListPods` ツール（既存）による health check + `scope_lock::reclaim_stale` の stale 回収で不整合を解消する
 - これは「コールバックは最適化、ポーリングが真のフォールバック」という方針の継続
 
-## 設計で決めること
-
-- **送信の接続タイムアウト**: `SpawnPod` / pod-comm-tools と揃える（5 秒想定）
-
-### 決定事項
+## 決定事項
 
 - **順序保証は求めず、ハンドラを冪等・遅延到着に強くする**: fire-and-forget の unix socket 接続は順序を保証しない。`TurnEnded` 直後に `ShutDown` が届いても、逆順で到着しても親側で成立するように `apply_event_side_effects` を設計する。具体的には：
   - `ShutDown` 受信時、すでに registry から削除済みでもエラーにしない（`release_pod` の `UnknownPod` を swallow する既存挙動を踏襲）
   - `TurnEnded` が `ShutDown` より後に届いても、該当 Pod が既に registry にいなければ render だけして終える（LLM 向け通知は出る、system 処理は no-op）
   - `ScopeSubDelegated` で孫が既に registry にいたら上書きせず no-op（`DuplicatePodName` を swallow）
 - **`ScopeSubDelegated` の親連鎖は直接の親のみ + 再発射**: 上記「又貸しの親連鎖」セクション参照。曾孫以上は再帰的に再発射で root まで届く
+- **送信の接続タイムアウト**: `SpawnPod` / pod-comm-tools と揃えて 5 秒固定
 
 ## 完了条件
 
@@ -151,4 +160,3 @@ variant 別の (1) の中身：
 - リモート親への送信（SSH 越し）。ローカル Unix socket のみ
 - 配信保証（at-least-once / exactly-once）
 - 親再起動時の「見逃したイベント」の再送。ポーリングで補う前提
-- `Method::Notify` の `source` フィールド削除（別チケット）
