@@ -39,8 +39,6 @@ pub struct PodManifestConfig {
 pub struct PodMetaConfig {
     #[serde(default)]
     pub name: Option<String>,
-    #[serde(default)]
-    pub pwd: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -137,6 +135,40 @@ impl PodManifestConfig {
         }
     }
 
+    /// Resolve every relative path inside this partial config against
+    /// `base` (assumed absolute). Paths that are already absolute are
+    /// left untouched. This is the only place per-layer path resolution
+    /// happens — cascade merge runs against fully absolute paths so
+    /// rules from different layers do not accidentally inherit another
+    /// layer's base.
+    ///
+    /// Affected fields: `provider.api_key_file`,
+    /// `scope.allow[].target`, `scope.deny[].target`,
+    /// `compaction.provider.api_key_file`.
+    pub fn resolve_paths(mut self, base: &Path) -> Self {
+        debug_assert!(
+            base.is_absolute(),
+            "resolve_paths base must be absolute: {}",
+            base.display()
+        );
+        if let Some(ref mut p) = self.provider.api_key_file {
+            *p = join_if_relative(base, p);
+        }
+        for rule in &mut self.scope.allow {
+            rule.target = join_if_relative(base, &rule.target);
+        }
+        for rule in &mut self.scope.deny {
+            rule.target = join_if_relative(base, &rule.target);
+        }
+        if let Some(ref mut compaction) = self.compaction
+            && let Some(ref mut cp) = compaction.provider
+            && let Some(ref mut p) = cp.api_key_file
+        {
+            *p = join_if_relative(base, p);
+        }
+        self
+    }
+
     /// Merge `upper` into `self`. Fields present in `upper` override
     /// fields from `self`. Map entries merge key-wise with `upper`
     /// winning on conflict. Scope rules from both layers accumulate
@@ -160,7 +192,6 @@ impl PodMetaConfig {
     fn merge(self, upper: Self) -> Self {
         Self {
             name: upper.name.or(self.name),
-            pwd: upper.pwd.or(self.pwd),
         }
     }
 }
@@ -226,6 +257,18 @@ fn merge_option<T>(lower: Option<T>, upper: Option<T>, merge: fn(T, T) -> T) -> 
     }
 }
 
+fn join_if_relative(base: &Path, p: &Path) -> PathBuf {
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        base.join(p)
+    }
+}
+
+/// Invariant check: every path in a fully-resolved [`PodManifestConfig`]
+/// must be absolute. Relative paths are resolved per-layer via
+/// [`PodManifestConfig::resolve_paths`]; if one reaches `TryFrom` it
+/// indicates a caller skipped the per-layer resolve step.
 fn ensure_absolute(field: &'static str, path: &Path) -> Result<(), ResolveError> {
     if path.is_absolute() {
         Ok(())
@@ -264,8 +307,6 @@ impl TryFrom<PodManifestConfig> for PodManifest {
             .pod
             .name
             .ok_or(ResolveError::MissingField("pod.name"))?;
-        let pwd = cfg.pod.pwd.ok_or(ResolveError::MissingField("pod.pwd"))?;
-        ensure_absolute("pod.pwd", &pwd)?;
 
         let provider = resolve_provider(
             cfg.provider,
@@ -333,7 +374,7 @@ impl TryFrom<PodManifestConfig> for PodManifest {
             .transpose()?;
 
         Ok(PodManifest {
-            pod: PodMeta { name, pwd },
+            pod: PodMeta { name },
             provider,
             worker,
             scope: cfg.scope,
@@ -355,7 +396,6 @@ mod tests {
         PodManifestConfig {
             pod: PodMetaConfig {
                 name: Some("test".into()),
-                pwd: Some(abs("/pod")),
             },
             provider: ProviderConfigPartial {
                 kind: Some(ProviderKind::Anthropic),
@@ -379,25 +419,54 @@ mod tests {
     fn resolve_minimal_succeeds() {
         let manifest: PodManifest = minimal_valid().try_into().unwrap();
         assert_eq!(manifest.pod.name, "test");
-        assert_eq!(manifest.pod.pwd, abs("/pod"));
         assert_eq!(manifest.provider.kind, ProviderKind::Anthropic);
     }
 
     #[test]
-    fn resolve_rejects_relative_pwd() {
+    fn resolve_paths_joins_relative_api_key_file() {
         let mut cfg = minimal_valid();
-        cfg.pod.pwd = Some(PathBuf::from("./rel"));
-        let err = PodManifest::try_from(cfg).unwrap_err();
-        assert!(matches!(
-            err,
-            ResolveError::RelativePath { field: "pod.pwd", .. }
-        ));
+        cfg.provider.api_key_file = Some(PathBuf::from("keys/anthropic"));
+        let resolved = cfg.resolve_paths(Path::new("/home/user/.config/insomnia"));
+        assert_eq!(
+            resolved.provider.api_key_file.as_deref(),
+            Some(Path::new("/home/user/.config/insomnia/keys/anthropic"))
+        );
     }
 
     #[test]
-    fn resolve_rejects_relative_api_key_file() {
+    fn resolve_paths_leaves_absolute_paths_untouched() {
         let mut cfg = minimal_valid();
-        cfg.provider.api_key_file = Some(PathBuf::from("~/.config/key"));
+        cfg.provider.api_key_file = Some(PathBuf::from("/etc/already/abs"));
+        let resolved = cfg.resolve_paths(Path::new("/home/user"));
+        assert_eq!(
+            resolved.provider.api_key_file.as_deref(),
+            Some(Path::new("/etc/already/abs"))
+        );
+    }
+
+    #[test]
+    fn resolve_paths_joins_relative_scope_targets() {
+        let mut cfg = minimal_valid();
+        cfg.scope.allow[0].target = PathBuf::from(".");
+        cfg.scope.deny.push(ScopeRule {
+            target: PathBuf::from("secrets"),
+            permission: Permission::Write,
+            recursive: true,
+        });
+        let resolved = cfg.resolve_paths(Path::new("/workspace/proj"));
+        assert_eq!(resolved.scope.allow[0].target, Path::new("/workspace/proj"));
+        assert_eq!(
+            resolved.scope.deny[0].target,
+            Path::new("/workspace/proj/secrets")
+        );
+    }
+
+    #[test]
+    fn try_from_invariant_rejects_lingering_relative_api_key_file() {
+        let mut cfg = minimal_valid();
+        cfg.provider.api_key_file = Some(PathBuf::from("keys/relative"));
+        // Skipping resolve_paths on purpose: TryFrom must catch the
+        // invariant violation.
         let err = PodManifest::try_from(cfg).unwrap_err();
         assert!(matches!(
             err,
@@ -409,9 +478,9 @@ mod tests {
     }
 
     #[test]
-    fn resolve_rejects_relative_scope_target() {
+    fn try_from_invariant_rejects_lingering_relative_scope_target() {
         let mut cfg = minimal_valid();
-        cfg.scope.allow[0].target = PathBuf::from("./docs");
+        cfg.scope.allow[0].target = PathBuf::from("docs");
         let err = PodManifest::try_from(cfg).unwrap_err();
         assert!(matches!(
             err,
@@ -443,21 +512,23 @@ mod tests {
         let lower = PodManifestConfig {
             pod: PodMetaConfig {
                 name: Some("lower".into()),
-                pwd: Some(abs("/lower")),
+            },
+            provider: ProviderConfigPartial {
+                model: Some("lower-model".into()),
+                ..Default::default()
             },
             ..Default::default()
         };
         let upper = PodManifestConfig {
             pod: PodMetaConfig {
                 name: Some("upper".into()),
-                pwd: None,
             },
             ..Default::default()
         };
         let merged = lower.merge(upper);
         assert_eq!(merged.pod.name.as_deref(), Some("upper"));
-        // pwd not present in upper — retain lower
-        assert_eq!(merged.pod.pwd, Some(abs("/lower")));
+        // model not present in upper — retain lower
+        assert_eq!(merged.provider.model.as_deref(), Some("lower-model"));
     }
 
     #[test]
@@ -556,7 +627,6 @@ mod tests {
         let bad = r#"
 [pod]
 name = "x"
-pwd = "/abs"
 
 [worker]
 max_tokens = "not-a-number"
@@ -567,10 +637,13 @@ max_tokens = "not-a-number"
     #[test]
     fn from_toml_accepts_unknown_field() {
         // Unknown keys are warn-and-ignored, not hard errors.
+        // `pod.pwd` specifically is silently dropped after the
+        // path-resolution ticket — keep it in the fixture to exercise
+        // that code path.
         let ok = r#"
 [pod]
 name = "x"
-pwd = "/abs"
+pwd = "/obsolete"
 
 [worker]
 max_tokens = 1000
@@ -610,7 +683,6 @@ permission = "write"
         let overlay = PodManifestConfig {
             pod: PodMetaConfig {
                 name: Some("x".into()),
-                pwd: Some(abs("/pod")),
             },
             provider: ProviderConfigPartial {
                 kind: Some(ProviderKind::Anthropic),
@@ -658,7 +730,6 @@ permission = "write"
             r#"
 [pod]
 name = "dbg"
-pwd = "/abs/project"
 "#,
         )
         .unwrap();
@@ -666,7 +737,6 @@ pwd = "/abs/project"
         let merged = builtin.merge(user).merge(project).merge(overlay);
         let manifest: PodManifest = merged.try_into().unwrap();
         assert_eq!(manifest.pod.name, "dbg");
-        assert_eq!(manifest.pod.pwd, PathBuf::from("/abs/project"));
         assert_eq!(manifest.provider.kind, ProviderKind::Anthropic);
         assert_eq!(manifest.scope.allow.len(), 1);
     }

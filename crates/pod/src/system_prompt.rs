@@ -229,7 +229,7 @@ mod tests {
             }],
             deny: Vec::new(),
         };
-        Scope::from_config(&cfg, dir).unwrap()
+        Scope::from_config(&cfg).unwrap()
     }
 
     fn ctx<'a>(

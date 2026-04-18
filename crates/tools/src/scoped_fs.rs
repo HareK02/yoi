@@ -266,7 +266,7 @@ mod tests {
                 recursive: true,
             }],
         };
-        let scope = Scope::from_config(&cfg, dir.path()).unwrap();
+        let scope = Scope::from_config(&cfg).unwrap();
         let scoped = ScopedFs::new(scope, dir.path().to_path_buf());
         let err = scoped.write(&sub.join("locked.txt"), b"x").unwrap_err();
         assert!(

@@ -17,7 +17,9 @@ use serde::{Deserialize, Serialize};
 /// Declarative configuration for a Pod.
 ///
 /// Parsed from a TOML manifest file. Describes the provider, model,
-/// system prompt, and directory scope (required).
+/// system prompt, and directory scope (required). The Pod's working
+/// directory is **not** part of the manifest — it is the process's
+/// `std::env::current_dir()` at construction time.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PodManifest {
     pub pod: PodMeta,
@@ -32,9 +34,6 @@ pub struct PodManifest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PodMeta {
     pub name: String,
-    /// Working directory for the Pod. Relative paths are resolved against
-    /// the directory containing the manifest file.
-    pub pwd: PathBuf,
 }
 
 /// LLM provider configuration.
@@ -163,8 +162,9 @@ pub struct ScopeConfig {
 /// A single allow or deny rule inside [`ScopeConfig`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScopeRule {
-    /// Target path. Relative paths are resolved against the Pod's pwd
-    /// when [`Scope::from_config`] runs.
+    /// Target path. Must be absolute by the time [`Scope::from_config`]
+    /// runs — relative paths are resolved per-layer against the manifest
+    /// file's directory (cwd for overlay layers) before cascade merge.
     pub target: PathBuf,
     /// Permission level this rule grants (allow) or caps strictly below
     /// (deny).
@@ -256,7 +256,6 @@ mod tests {
     const MINIMAL_REQUIRED: &str = r#"
 [pod]
 name = "test-agent"
-pwd = "./"
 
 [provider]
 kind = "anthropic"
@@ -265,7 +264,7 @@ model = "claude-sonnet-4-20250514"
 [worker]
 
 [[scope.allow]]
-target = "./"
+target = "/abs/scope"
 permission = "write"
 "#;
 
@@ -273,7 +272,6 @@ permission = "write"
     fn parse_minimal_manifest() {
         let manifest = PodManifest::from_toml(MINIMAL_REQUIRED).unwrap();
         assert_eq!(manifest.pod.name, "test-agent");
-        assert_eq!(manifest.pod.pwd, PathBuf::from("./"));
         assert_eq!(manifest.provider.kind, ProviderKind::Anthropic);
         assert_eq!(manifest.provider.model, "claude-sonnet-4-20250514");
         assert!(manifest.provider.api_key_file.is_none());
@@ -287,12 +285,11 @@ permission = "write"
         let toml = r#"
 [pod]
 name = "code-reviewer"
-pwd = "./src"
 
 [provider]
 kind = "anthropic"
 model = "claude-sonnet-4-20250514"
-api_key_file = "~/.config/insomnia/keys/anthropic"
+api_key_file = "/abs/keys/anthropic"
 
 [worker]
 instruction = "$user/reviewer"
@@ -300,24 +297,23 @@ max_tokens = 4096
 temperature = 0.3
 
 [[scope.allow]]
-target = "./"
+target = "/abs/project"
 permission = "write"
 
 [[scope.allow]]
-target = "../docs"
+target = "/abs/docs"
 permission = "read"
 recursive = false
 
 [[scope.deny]]
-target = "./secrets.rs"
+target = "/abs/project/secrets.rs"
 permission = "write"
 "#;
         let manifest = PodManifest::from_toml(toml).unwrap();
         assert_eq!(manifest.pod.name, "code-reviewer");
-        assert_eq!(manifest.pod.pwd, PathBuf::from("./src"));
         assert_eq!(
             manifest.provider.api_key_file.as_deref(),
-            Some(std::path::Path::new("~/.config/insomnia/keys/anthropic"))
+            Some(std::path::Path::new("/abs/keys/anthropic"))
         );
         assert_eq!(manifest.worker.instruction, "$user/reviewer");
         assert_eq!(manifest.worker.max_tokens, Some(4096));
@@ -337,32 +333,12 @@ permission = "write"
         let toml = r#"
 [pod]
 name = "missing-scope"
-pwd = "./"
 
 [provider]
 kind = "anthropic"
 model = "claude-sonnet-4-20250514"
 
 [worker]
-"#;
-        assert!(PodManifest::from_toml(toml).is_err());
-    }
-
-    #[test]
-    fn reject_missing_pwd() {
-        let toml = r#"
-[pod]
-name = "missing-pwd"
-
-[provider]
-kind = "anthropic"
-model = "claude-sonnet-4-20250514"
-
-[worker]
-
-[[scope.allow]]
-target = "./"
-permission = "write"
 "#;
         assert!(PodManifest::from_toml(toml).is_err());
     }

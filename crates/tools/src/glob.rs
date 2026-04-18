@@ -267,7 +267,7 @@ mod tests {
                 recursive: true,
             }],
         };
-        let scope = Scope::from_config(&cfg, dir.path()).unwrap();
+        let scope = Scope::from_config(&cfg).unwrap();
         let fs = ScopedFs::new(scope, dir.path().to_path_buf());
 
         let def = glob_tool(fs);

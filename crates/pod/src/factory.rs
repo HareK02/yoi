@@ -11,6 +11,18 @@
 //! 4. **Programmatic overlay** — inline TOML string or typed
 //!    [`PodManifestConfig`] supplied by the caller (CLI flags, GUI,
 //!    spawning Pod, etc.). Highest priority.
+//!
+//! Path resolution happens **before** merge. Each layer is resolved
+//! against its own base directory so that a relative `target = "."`
+//! in the project manifest means "project directory" regardless of
+//! how the user or overlay layers lay out their own paths:
+//!
+//! - user manifest: base = the directory holding the manifest file
+//! - project manifest: base = the directory holding the manifest file
+//!   (i.e. `<project>/.insomnia/`)
+//! - overlay: base = the process's `current_dir()` at the time the
+//!   overlay is installed, since an inline TOML string has no file
+//!   location of its own
 
 use std::path::{Path, PathBuf};
 
@@ -49,8 +61,15 @@ pub enum FactoryError {
 /// `with_*` method twice overwrites the previous value for that slot.
 #[derive(Debug, Default)]
 pub struct PodFactory {
-    user: Option<PodManifestConfig>,
-    project: Option<PodManifestConfig>,
+    /// User layer paired with the directory the manifest lives in
+    /// (base for resolving its relative paths).
+    user: Option<(PodManifestConfig, PathBuf)>,
+    /// Project layer paired with the directory the manifest lives in.
+    project: Option<(PodManifestConfig, PathBuf)>,
+    /// Programmatic overlays are resolved against the process's
+    /// `current_dir()` at the time each call arrives, then merged into
+    /// this slot. Storing a pre-resolved (absolute-paths) config means
+    /// later overlay calls from a different cwd still work correctly.
     overlay: Option<PodManifestConfig>,
     /// Directory holding the user prompts library — co-located with
     /// the user manifest when loaded. `<user_manifest_dir>/prompts/`.
@@ -74,8 +93,9 @@ impl PodFactory {
     pub fn with_user_manifest_auto(mut self) -> Result<Self, FactoryError> {
         let path = user_manifest_path()?;
         if path.exists() {
-            self.user = Some(read_config_file(&path)?);
-            self.user_prompts_dir = path.parent().map(|p| p.join("prompts"));
+            let base = manifest_base(&path)?;
+            self.user = Some((read_config_file(&path)?, base.clone()));
+            self.user_prompts_dir = Some(base.join("prompts"));
         }
         Ok(self)
     }
@@ -84,8 +104,9 @@ impl PodFactory {
     /// exist; missing files are an error (unlike the `_auto` variant).
     pub fn with_user_manifest(mut self, path: impl AsRef<Path>) -> Result<Self, FactoryError> {
         let path = path.as_ref();
-        self.user = Some(read_config_file(path)?);
-        self.user_prompts_dir = path.parent().map(|p| p.join("prompts"));
+        let base = manifest_base(path)?;
+        self.user = Some((read_config_file(path)?, base.clone()));
+        self.user_prompts_dir = Some(base.join("prompts"));
         Ok(self)
     }
 
@@ -98,8 +119,9 @@ impl PodFactory {
             source,
         })?;
         if let Some(path) = find_project_manifest(&cwd) {
-            self.project = Some(read_config_file(&path)?);
-            self.project_prompts_dir = path.parent().map(|p| p.join("prompts"));
+            let base = manifest_base(&path)?;
+            self.project = Some((read_config_file(&path)?, base.clone()));
+            self.project_prompts_dir = Some(base.join("prompts"));
         }
         Ok(self)
     }
@@ -111,31 +133,28 @@ impl PodFactory {
         start: impl AsRef<Path>,
     ) -> Result<Self, FactoryError> {
         if let Some(path) = find_project_manifest(start.as_ref()) {
-            self.project = Some(read_config_file(&path)?);
-            self.project_prompts_dir = path.parent().map(|p| p.join("prompts"));
+            let base = manifest_base(&path)?;
+            self.project = Some((read_config_file(&path)?, base.clone()));
+            self.project_prompts_dir = Some(base.join("prompts"));
         }
         Ok(self)
     }
 
-    /// Install a programmatic overlay parsed from a TOML string. This
-    /// is the highest-priority layer — use it to inject per-spawn
-    /// values like `pod.name` or `pod.pwd` from CLI flags.
+    /// Install a programmatic overlay parsed from a TOML string. Any
+    /// relative paths in the overlay are resolved against the process's
+    /// current working directory at the time of this call — an inline
+    /// TOML string has no file location of its own.
     pub fn with_overlay_toml(mut self, toml: &str) -> Result<Self, FactoryError> {
         let config = PodManifestConfig::from_toml(toml).map_err(FactoryError::OverlayParse)?;
-        self.overlay = Some(match self.overlay {
-            Some(existing) => existing.merge(config),
-            None => config,
-        });
+        self.overlay = Some(resolve_and_merge_overlay(self.overlay, config)?);
         Ok(self)
     }
 
     /// Install a programmatic overlay from an already-parsed config.
-    pub fn with_overlay_config(mut self, config: PodManifestConfig) -> Self {
-        self.overlay = Some(match self.overlay {
-            Some(existing) => existing.merge(config),
-            None => config,
-        });
-        self
+    /// Behaves like [`Self::with_overlay_toml`] regarding relative paths.
+    pub fn with_overlay_config(mut self, config: PodManifestConfig) -> Result<Self, FactoryError> {
+        self.overlay = Some(resolve_and_merge_overlay(self.overlay, config)?);
+        Ok(self)
     }
 
     /// Build a [`PromptLoader`] that reflects the user / project
@@ -162,6 +181,11 @@ impl PodFactory {
     /// feeds `{% include "name" %}` references in the Pod's system
     /// prompt template.
     ///
+    /// Each layer is resolved to absolute paths against its own base
+    /// (see module docs) **before** merge, so scope rules and
+    /// `api_key_file` paths from different layers do not accidentally
+    /// inherit another layer's base.
+    ///
     /// The base layer is [`PodManifestConfig::builtin_defaults`] so
     /// every per-field default flows through a single source of truth
     /// (see [`manifest::defaults`]).
@@ -169,11 +193,11 @@ impl PodFactory {
         let loader = self.build_prompt_loader();
         let merged = PodManifestConfig::builtin_defaults();
         let merged = match self.user {
-            Some(user) => merged.merge(user),
+            Some((user, base)) => merged.merge(user.resolve_paths(&base)),
             None => merged,
         };
         let merged = match self.project {
-            Some(project) => merged.merge(project),
+            Some((project, base)) => merged.merge(project.resolve_paths(&base)),
             None => merged,
         };
         let merged = match self.overlay {
@@ -183,6 +207,43 @@ impl PodFactory {
         let manifest = PodManifest::try_from(merged).map_err(FactoryError::Resolve)?;
         Ok((manifest, loader))
     }
+}
+
+fn manifest_base(path: &Path) -> Result<PathBuf, FactoryError> {
+    let parent = path.parent().ok_or_else(|| FactoryError::Io {
+        path: path.to_path_buf(),
+        source: std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "manifest path has no parent directory",
+        ),
+    })?;
+    // Absolutise against cwd so later path joins produce absolute
+    // results regardless of whether the caller passed a relative
+    // manifest path.
+    if parent.is_absolute() {
+        Ok(parent.to_path_buf())
+    } else {
+        let cwd = std::env::current_dir().map_err(|source| FactoryError::Io {
+            path: PathBuf::from("."),
+            source,
+        })?;
+        Ok(cwd.join(parent))
+    }
+}
+
+fn resolve_and_merge_overlay(
+    existing: Option<PodManifestConfig>,
+    incoming: PodManifestConfig,
+) -> Result<PodManifestConfig, FactoryError> {
+    let cwd = std::env::current_dir().map_err(|source| FactoryError::Io {
+        path: PathBuf::from("."),
+        source,
+    })?;
+    let resolved = incoming.resolve_paths(&cwd);
+    Ok(match existing {
+        Some(prev) => prev.merge(resolved),
+        None => resolved,
+    })
 }
 
 fn user_manifest_path() -> Result<PathBuf, FactoryError> {
@@ -242,7 +303,6 @@ mod tests {
             r#"
 [pod]
 name = "solo"
-pwd = "{pwd}"
 
 [provider]
 kind = "anthropic"
@@ -261,7 +321,6 @@ permission = "write"
             .unwrap();
         let manifest = manifest.0;
         assert_eq!(manifest.pod.name, "solo");
-        assert_eq!(manifest.pod.pwd, pwd);
     }
 
     #[test]
@@ -293,20 +352,21 @@ permission = "write"
             pwd = pwd.display()
         ))
         .unwrap();
-        let overlay_cfg = PodManifestConfig::from_toml(&format!(
+        let overlay_cfg = PodManifestConfig::from_toml(
             r#"
 [pod]
 name = "overlay-name"
-pwd = "{pwd}"
 "#,
-            pwd = pwd.display()
-        ))
+        )
         .unwrap();
 
         let (manifest, _loader) = PodFactory::new()
             .with_overlay_config(user_cfg)
+            .unwrap()
             .with_overlay_config(project_cfg)
+            .unwrap()
             .with_overlay_config(overlay_cfg)
+            .unwrap()
             .resolve()
             .unwrap();
 
@@ -332,7 +392,6 @@ pwd = "{pwd}"
                 r#"
 [pod]
 name = "from-user"
-pwd = "{pwd}"
 
 [provider]
 kind = "anthropic"
@@ -381,7 +440,6 @@ model = "project-model"
                 r#"
 [pod]
 name = "walked-up"
-pwd = "{root}"
 
 [provider]
 kind = "anthropic"
@@ -415,7 +473,6 @@ permission = "write"
             r#"
 [pod]
 name = "standalone"
-pwd = "{pwd}"
 
 [provider]
 kind = "anthropic"
@@ -442,6 +499,77 @@ permission = "write"
     }
 
     #[test]
+    fn user_manifest_relative_paths_resolve_against_its_directory() {
+        // user manifest at <tmp>/cfg/manifest.toml with a relative
+        // scope target `./workspace` must resolve to <tmp>/cfg/workspace.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let cfg_dir = root.join("cfg");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        let workspace = cfg_dir.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let user = cfg_dir.join("manifest.toml");
+        write(
+            &user,
+            r#"
+[pod]
+name = "rel-user"
+
+[provider]
+kind = "anthropic"
+model = "m"
+
+[[scope.allow]]
+target = "./workspace"
+permission = "write"
+"#,
+        );
+
+        let (manifest, _loader) = PodFactory::new()
+            .with_user_manifest(&user)
+            .unwrap()
+            .resolve()
+            .unwrap();
+        assert_eq!(manifest.scope.allow[0].target, workspace);
+    }
+
+    #[test]
+    fn project_manifest_relative_paths_resolve_against_insomnia_dir() {
+        // per ticket: base is the directory holding the manifest —
+        // `.insomnia/` for a project manifest. `target = "."` inside
+        // a project manifest therefore points at `.insomnia/`, not at
+        // the project root.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let insomnia_dir = root.join(".insomnia");
+        std::fs::create_dir_all(&insomnia_dir).unwrap();
+        let project_manifest = insomnia_dir.join("manifest.toml");
+        write(
+            &project_manifest,
+            r#"
+[pod]
+name = "rel-project"
+
+[provider]
+kind = "anthropic"
+model = "m"
+
+[[scope.allow]]
+target = "."
+permission = "read"
+"#,
+        );
+
+        let (manifest, _loader) = PodFactory::new()
+            .with_project_manifest_from(&root)
+            .unwrap()
+            .resolve()
+            .unwrap();
+        assert_eq!(manifest.scope.allow[0].target, insomnia_dir);
+    }
+
+    #[test]
     fn resolve_produces_loader_with_workspace_prompts_dir() {
         use crate::system_prompt::{SystemPromptContext, SystemPromptTemplate};
         use manifest::{Permission, Scope, ScopeConfig, ScopeRule};
@@ -456,7 +584,6 @@ permission = "write"
                 r#"
 [pod]
 name = "factory-pod"
-pwd = "{root}"
 
 [provider]
 kind = "anthropic"
@@ -493,7 +620,7 @@ permission = "write"
             }],
             deny: Vec::new(),
         };
-        let scope = Scope::from_config(&scope_cfg, &root).unwrap();
+        let scope = Scope::from_config(&scope_cfg).unwrap();
         let ctx = SystemPromptContext {
             now: chrono::Utc::now(),
             cwd: &root,
@@ -512,12 +639,9 @@ permission = "write"
     fn resolve_fails_on_missing_required_field() {
         let tmp = TempDir::new().unwrap();
         let pwd = tmp.path().canonicalize().unwrap();
-        // pwd set but pod.name missing
+        // pod.name missing — resolver must reject.
         let overlay = format!(
             r#"
-[pod]
-pwd = "{pwd}"
-
 [provider]
 kind = "anthropic"
 model = "m"

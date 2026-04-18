@@ -174,16 +174,15 @@ impl Tool for SpawnPodTool {
         // it back — even if later steps (Method::Run delivery, record
         // write) fail, the child is running and will release its own
         // entry on exit.
-        let overlay_toml =
-            match build_overlay_toml(&input.name, &self.spawner_pwd, &instruction, &scope_allow) {
-                Ok(s) => s,
-                Err(e) => {
-                    self.release_reservation(&lock_path, &input.name);
-                    return Err(ToolError::ExecutionFailed(format!(
-                        "overlay serialisation: {e}"
-                    )));
-                }
-            };
+        let overlay_toml = match build_overlay_toml(&input.name, &instruction, &scope_allow) {
+            Ok(s) => s,
+            Err(e) => {
+                self.release_reservation(&lock_path, &input.name);
+                return Err(ToolError::ExecutionFailed(format!(
+                    "overlay serialisation: {e}"
+                )));
+            }
+        };
 
         let start_outcome = self.exec_child(&overlay_toml, &predicted_socket).await;
         if let Err(e) = start_outcome {
@@ -231,6 +230,7 @@ impl SpawnPodTool {
             .arg(&self.callback_socket)
             .arg("--overlay")
             .arg(overlay_toml)
+            .current_dir(&self.spawner_pwd)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -281,16 +281,18 @@ fn parse_scope(rules: &[ScopeRuleInput]) -> Result<Vec<ScopeRule>, ToolError> {
 /// Serialise the overlay TOML that gets handed to the child `pod`
 /// binary via `--overlay`. `PodManifestConfig`'s `Serialize` impl is
 /// the single source of truth for the on-disk manifest format.
+///
+/// The child's working directory is set separately via
+/// `Command::current_dir` (see [`SpawnPodTool::exec_child`]) — it is
+/// not part of the manifest.
 fn build_overlay_toml(
     name: &str,
-    pwd: &Path,
     instruction: &str,
     scope_allow: &[ScopeRule],
 ) -> Result<String, toml::ser::Error> {
     let overlay = PodManifestConfig {
         pod: PodMetaConfig {
             name: Some(name.to_string()),
-            pwd: Some(pwd.to_path_buf()),
         },
         worker: WorkerManifestConfig {
             instruction: Some(instruction.to_string()),

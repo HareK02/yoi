@@ -3,9 +3,10 @@
   - [ ] Bash ツール (Permission 層と統合) → [tickets/bash-tool.md](tickets/bash-tool.md)
 - [ ] Compact の改善（要約品質 + 挙動詳細） → [tickets/compact-improvements.md](tickets/compact-improvements.md)
 - [ ] Protocol の設計 → [tickets/protocol-design.md](tickets/protocol-design.md)
+- [ ] Manifest のパス解決: cwd ベース + manifest ファイル相対 → [tickets/manifest-path-resolution.md](tickets/manifest-path-resolution.md)
 - [ ] パーミッション: パターンベースのツール実行制御 → [tickets/permission-extension-point.md](tickets/permission-extension-point.md)
 - [ ] Pod オーケストレーション
-  - [ ] Pod 間コールバック通知 → [tickets/pod-callback.md](tickets/pod-callback.md)
+  - [ ] Pod の上流イベント報告 (子 → 親) → [tickets/pod-upstream-events.md](tickets/pod-upstream-events.md)
   - [ ] 動的 Scope 変更 → [tickets/dynamic-scope.md](tickets/dynamic-scope.md)
 - [ ] ネイティブ GUI クライアント MVP → [tickets/native-gui-mvp.md](tickets/native-gui-mvp.md)
 - [ ] TUI 拡充

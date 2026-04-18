@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
-use pod::{Pod, PodController, PodFactory, PodManifestConfig, PodMetaConfig};
+use pod::{Pod, PodController, PodFactory};
 use session_store::FsStore;
 
 #[derive(Parser)]
@@ -26,11 +26,6 @@ struct Cli {
     /// layer. Example: `--overlay 'pod.name = "dbg"'`.
     #[arg(long, value_name = "TOML")]
     overlay: Option<String>,
-
-    /// Shorthand that injects `pod.pwd = <path>` into the overlay
-    /// layer. `--pwd .` uses the current working directory.
-    #[arg(long, value_name = "PATH")]
-    pwd: Option<PathBuf>,
 
     /// Directory for session persistence. Defaults to
     /// `~/.insomnia/sessions/`.
@@ -68,20 +63,6 @@ fn default_runtime_dir() -> Result<PathBuf, std::io::Error> {
     }
 }
 
-/// Construct a programmatic overlay [`PodManifestConfig`] that carries
-/// `pod.pwd` derived from the `--pwd` shorthand. Relative CLI paths
-/// are canonicalized here so the cascade always sees an absolute path.
-fn pwd_overlay(pwd: &PathBuf) -> PodManifestConfig {
-    let absolute = std::fs::canonicalize(pwd).unwrap_or_else(|_| pwd.clone());
-    PodManifestConfig {
-        pod: PodMetaConfig {
-            pwd: Some(absolute),
-            ..Default::default()
-        },
-        ..Default::default()
-    }
-}
-
 async fn build_factory(cli: &Cli) -> Result<PodFactory, String> {
     let mut factory = PodFactory::new();
 
@@ -103,13 +84,6 @@ async fn build_factory(cli: &Cli) -> Result<PodFactory, String> {
             .map_err(|e| format!("failed to auto-load project manifest: {e}"))?,
     };
 
-    // `--pwd` goes in as a typed config so path strings never have to
-    // pass through TOML escaping. `--overlay` keeps its inline-TOML
-    // interface (that is its entire reason for existing). Both feed
-    // the same overlay slot and merge in call order.
-    if let Some(pwd) = cli.pwd.as_ref() {
-        factory = factory.with_overlay_config(pwd_overlay(pwd));
-    }
     if let Some(overlay) = cli.overlay.as_deref() {
         factory = factory
             .with_overlay_toml(overlay)

@@ -1,9 +1,10 @@
 //! Runtime representation of a Pod's access scope.
 //!
-//! Built from [`crate::ScopeConfig`] via [`Scope::from_config`] once the
-//! Pod's pwd (working directory) has been resolved to an absolute path.
-//! All rule `target` paths inside the [`Scope`] are absolute and lexically
-//! stable, so access checks are pure path comparisons.
+//! Built from [`crate::ScopeConfig`] via [`Scope::from_config`]. Every
+//! rule `target` must already be an absolute path — per-layer path
+//! resolution runs earlier, inside [`crate::PodManifestConfig::resolve_paths`].
+//! All rule `target` paths inside the [`Scope`] are canonicalised (where
+//! possible) so access checks are pure path comparisons.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -33,8 +34,8 @@ struct ResolvedRule {
 pub enum ScopeError {
     #[error("scope must declare at least one [[scope.allow]] rule")]
     EmptyAllow,
-    #[error("scope base path must be absolute: {}", .0.display())]
-    BaseNotAbsolute(PathBuf),
+    #[error("scope target must be absolute: {}", .0.display())]
+    RelativeTarget(PathBuf),
     #[error("failed to resolve scope target {}: {source}", .path.display())]
     ResolveTarget {
         path: PathBuf,
@@ -44,25 +45,26 @@ pub enum ScopeError {
 }
 
 impl Scope {
-    /// Build a [`Scope`] from a declarative [`ScopeConfig`], resolving
-    /// relative `target` paths against `base` (conventionally the Pod's
-    /// absolute pwd).
-    pub fn from_config(config: &ScopeConfig, base: &Path) -> Result<Self, ScopeError> {
-        if !base.is_absolute() {
-            return Err(ScopeError::BaseNotAbsolute(base.to_path_buf()));
-        }
+    /// Build a [`Scope`] from a declarative [`ScopeConfig`].
+    ///
+    /// Every `target` in `config` must already be absolute — per-layer
+    /// resolution happens upstream in
+    /// [`crate::PodManifestConfig::resolve_paths`] so that cascade merge
+    /// operates on fully-qualified paths. A lingering relative target
+    /// here signals an upstream bug and is rejected.
+    pub fn from_config(config: &ScopeConfig) -> Result<Self, ScopeError> {
         if config.allow.is_empty() {
             return Err(ScopeError::EmptyAllow);
         }
         let allow = config
             .allow
             .iter()
-            .map(|r| resolve_rule(r, base))
+            .map(resolve_rule)
             .collect::<Result<Vec<_>, _>>()?;
         let deny = config
             .deny
             .iter()
-            .map(|r| resolve_rule(r, base))
+            .map(resolve_rule)
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self { allow, deny })
     }
@@ -221,13 +223,11 @@ impl ResolvedRule {
     }
 }
 
-fn resolve_rule(rule: &ScopeRule, base: &Path) -> Result<ResolvedRule, ScopeError> {
-    let joined = if rule.target.is_absolute() {
-        rule.target.clone()
-    } else {
-        base.join(&rule.target)
-    };
-    let target = resolve_path(&joined).ok_or_else(|| ScopeError::ResolveTarget {
+fn resolve_rule(rule: &ScopeRule) -> Result<ResolvedRule, ScopeError> {
+    if !rule.target.is_absolute() {
+        return Err(ScopeError::RelativeTarget(rule.target.clone()));
+    }
+    let target = resolve_path(&rule.target).ok_or_else(|| ScopeError::ResolveTarget {
         path: rule.target.clone(),
         source: std::io::Error::new(std::io::ErrorKind::Other, "could not absolutize target"),
     })?;
@@ -307,7 +307,7 @@ mod tests {
             allow: vec![allow_rule(dir.path(), Permission::Write)],
             deny: Vec::new(),
         };
-        let scope = Scope::from_config(&cfg, dir.path()).unwrap();
+        let scope = Scope::from_config(&cfg).unwrap();
         let f = dir.path().join("a.txt");
         assert_eq!(scope.permission_at(&f), Some(Permission::Write));
     }
@@ -319,7 +319,7 @@ mod tests {
             allow: vec![allow_rule(dir.path(), Permission::Read)],
             deny: Vec::new(),
         };
-        let scope = Scope::from_config(&cfg, dir.path()).unwrap();
+        let scope = Scope::from_config(&cfg).unwrap();
         let f = dir.path().join("a.txt");
         assert_eq!(scope.permission_at(&f), Some(Permission::Read));
         assert!(scope.is_readable(&f));
@@ -335,7 +335,7 @@ mod tests {
             allow: vec![allow_rule(dir.path(), Permission::Write)],
             deny: vec![allow_rule(&sub, Permission::Write)],
         };
-        let scope = Scope::from_config(&cfg, dir.path()).unwrap();
+        let scope = Scope::from_config(&cfg).unwrap();
         let f = sub.join("a.txt");
         assert_eq!(scope.permission_at(&f), Some(Permission::Read));
         // outside the deny, still writable.
@@ -354,7 +354,7 @@ mod tests {
             allow: vec![allow_rule(dir.path(), Permission::Write)],
             deny: vec![allow_rule(&secret, Permission::Read)],
         };
-        let scope = Scope::from_config(&cfg, dir.path()).unwrap();
+        let scope = Scope::from_config(&cfg).unwrap();
         assert_eq!(scope.permission_at(&secret), None);
     }
 
@@ -370,7 +370,7 @@ mod tests {
             ],
             deny: Vec::new(),
         };
-        let scope = Scope::from_config(&cfg, dir.path()).unwrap();
+        let scope = Scope::from_config(&cfg).unwrap();
         assert_eq!(
             scope.permission_at(&dir.path().join("a.txt")),
             Some(Permission::Read)
@@ -394,20 +394,33 @@ mod tests {
             }],
             deny: Vec::new(),
         };
-        let scope = Scope::from_config(&cfg, dir.path()).unwrap();
+        let scope = Scope::from_config(&cfg).unwrap();
         assert!(scope.is_writable(&dir.path().join("top.txt")));
         assert!(!scope.is_writable(&nested.join("deep.txt")));
     }
 
     #[test]
     fn empty_allow_rejected() {
-        let dir = TempDir::new().unwrap();
         let cfg = ScopeConfig {
             allow: Vec::new(),
             deny: Vec::new(),
         };
-        let err = Scope::from_config(&cfg, dir.path()).unwrap_err();
+        let err = Scope::from_config(&cfg).unwrap_err();
         assert!(matches!(err, ScopeError::EmptyAllow));
+    }
+
+    #[test]
+    fn relative_target_rejected_as_invariant_violation() {
+        let cfg = ScopeConfig {
+            allow: vec![ScopeRule {
+                target: PathBuf::from("relative/path"),
+                permission: Permission::Read,
+                recursive: true,
+            }],
+            deny: Vec::new(),
+        };
+        let err = Scope::from_config(&cfg).unwrap_err();
+        assert!(matches!(err, ScopeError::RelativeTarget(_)));
     }
 
     #[test]
@@ -430,7 +443,7 @@ mod tests {
             ],
             deny: Vec::new(),
         };
-        let scope = Scope::from_config(&cfg, dir.path()).unwrap();
+        let scope = Scope::from_config(&cfg).unwrap();
         let summary = scope.summary();
         assert!(summary.contains("Readable:"));
         assert!(summary.contains("Writable:"));
@@ -448,7 +461,7 @@ mod tests {
             allow: vec![allow_rule(dir.path(), Permission::Write)],
             deny: vec![allow_rule(&secret, Permission::Read)],
         };
-        let scope = Scope::from_config(&cfg, dir.path()).unwrap();
+        let scope = Scope::from_config(&cfg).unwrap();
         let summary = scope.summary();
         assert!(!summary.contains("secret"));
     }
@@ -473,7 +486,7 @@ mod tests {
             ],
             deny: Vec::new(),
         };
-        let scope = Scope::from_config(&cfg, dir.path()).unwrap();
+        let scope = Scope::from_config(&cfg).unwrap();
         let summary = scope.summary();
         let docs_canon = docs.canonicalize().unwrap().display().to_string();
         let dir_canon = dir.path().canonicalize().unwrap().display().to_string();
@@ -500,7 +513,7 @@ mod tests {
             ],
             deny: Vec::new(),
         };
-        let scope = Scope::from_config(&cfg, dir.path()).unwrap();
+        let scope = Scope::from_config(&cfg).unwrap();
         let readable: Vec<_> = scope.readable_paths().collect();
         let writable: Vec<_> = scope.writable_paths().collect();
         assert_eq!(readable.len(), 2);

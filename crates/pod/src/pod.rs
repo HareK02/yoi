@@ -874,11 +874,12 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
 impl<St: Store> Pod<Box<dyn LlmClient>, St> {
     /// Create a Pod entirely from a validated manifest.
     ///
-    /// `manifest.pod.pwd` must already be an absolute path (the cascade
-    /// layer — `PodManifestConfig` → `PodManifest` — is the sole place
-    /// where path normalisation happens). The Pod builds its [`Scope`]
-    /// from `manifest.scope`, canonicalizes the pwd, and validates that
-    /// the resolved pwd is readable under that scope.
+    /// The Pod's working directory is captured once here from the
+    /// process's `std::env::current_dir()` — callers that want a
+    /// different cwd must `cd` before constructing the Pod (e.g. the
+    /// `SpawnPod` tool sets `Command::current_dir` on the child). The
+    /// captured pwd is canonicalised and validated against
+    /// `manifest.scope`.
     ///
     /// `loader` is installed into the system-prompt template
     /// environment so that `{% include "name" %}` /
@@ -889,8 +890,8 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
         store: St,
         loader: PromptLoader,
     ) -> Result<Self, PodError> {
-        let pwd = resolve_pwd(&manifest.pod.pwd)?;
-        let scope = Scope::from_config(&manifest.scope, &pwd).map_err(PodError::Scope)?;
+        let pwd = current_pwd()?;
+        let scope = Scope::from_config(&manifest.scope).map_err(PodError::Scope)?;
         if !scope.is_readable(&pwd) {
             return Err(PodError::PwdOutsideScope { pwd });
         }
@@ -967,8 +968,8 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
         loader: PromptLoader,
         callback_socket: PathBuf,
     ) -> Result<Self, PodError> {
-        let pwd = resolve_pwd(&manifest.pod.pwd)?;
-        let scope = Scope::from_config(&manifest.scope, &pwd).map_err(PodError::Scope)?;
+        let pwd = current_pwd()?;
+        let scope = Scope::from_config(&manifest.scope).map_err(PodError::Scope)?;
         if !scope.is_readable(&pwd) {
             return Err(PodError::PwdOutsideScope { pwd });
         }
@@ -1127,9 +1128,6 @@ pub enum PodError {
         source: std::io::Error,
     },
 
-    #[error("pwd must be absolute: {}", .0.display())]
-    PwdNotAbsolute(PathBuf),
-
     #[error("failed to parse manifest TOML: {0}")]
     ManifestParse(#[source] toml::de::Error),
 
@@ -1158,16 +1156,17 @@ pub enum PodError {
     ScopeLock(#[from] ScopeLockError),
 }
 
-/// Canonicalize an absolute pwd (resolves symlinks and any `.`/`..`
-/// components). Relative inputs are rejected — the cascade layer is
-/// the sole source of path normalisation and must hand off an absolute
-/// path.
-fn resolve_pwd(pwd: &Path) -> Result<PathBuf, PodError> {
-    if !pwd.is_absolute() {
-        return Err(PodError::PwdNotAbsolute(pwd.to_path_buf()));
-    }
-    pwd.canonicalize().map_err(|source| PodError::InvalidPwd {
-        pwd: pwd.to_path_buf(),
+/// Snapshot the process's current working directory as the Pod's pwd,
+/// canonicalising symlinks and any `.`/`..` components. The Pod keeps
+/// this value for its lifetime; changes to the process-wide cwd after
+/// construction do not affect scope checks or the system prompt.
+fn current_pwd() -> Result<PathBuf, PodError> {
+    let cwd = std::env::current_dir().map_err(|source| PodError::InvalidPwd {
+        pwd: PathBuf::from("."),
+        source,
+    })?;
+    cwd.canonicalize().map_err(|source| PodError::InvalidPwd {
+        pwd: cwd,
         source,
     })
 }
