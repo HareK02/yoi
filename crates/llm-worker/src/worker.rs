@@ -16,7 +16,10 @@ use crate::{
         DefaultInterceptor, Interceptor, PostToolAction, PreRequestAction, PreToolAction,
         PromptAction, ToolCallInfo, ToolResultInfo, TurnEndAction,
     },
-    llm_client::{ClientError, ConfigWarning, LlmClient, Request, RequestConfig, ToolDefinition},
+    llm_client::{
+        ClientError, ConfigWarning, LlmClient, Request, RequestConfig, ToolDefinition,
+        types::parse_tool_arguments,
+    },
     state::{Locked, Mutable, WorkerState},
     timeline::event::{ErrorEvent, StatusEvent, UsageEvent},
     timeline::{TextBlockCollector, Timeline, ToolCallCollector},
@@ -573,8 +576,7 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
             } = item
             {
                 if !answered_call_ids.contains(call_id) {
-                    let input = serde_json::from_str(arguments)
-                        .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
+                    let input = parse_tool_arguments(arguments);
                     pending_calls.push(ToolCall {
                         id: call_id.clone(),
                         name: name.clone(),

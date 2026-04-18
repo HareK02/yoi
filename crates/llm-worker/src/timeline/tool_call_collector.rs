@@ -5,6 +5,7 @@
 
 use crate::{
     handler::{Handler, ToolUseBlockEvent, ToolUseBlockKind},
+    llm_client::types::parse_tool_arguments,
     tool::ToolCall,
 };
 use std::sync::{Arc, Mutex};
@@ -84,8 +85,7 @@ impl Handler<ToolUseBlockKind> for ToolCallCollector {
                 // ブロック完了時にToolCallを確定
                 if let (Some(id), Some(name)) = (scope.current_id.take(), scope.current_name.take())
                 {
-                    let input = serde_json::from_str(&scope.input_json_buffer)
-                        .unwrap_or(serde_json::Value::Null);
+                    let input = parse_tool_arguments(&scope.input_json_buffer);
 
                     let tool_call = ToolCall { id, name, input };
 
@@ -121,6 +121,27 @@ mod tests {
         assert_eq!(calls[0].id, "tool_123");
         assert_eq!(calls[0].name, "get_weather");
         assert_eq!(calls[0].input["city"], "Tokyo");
+    }
+
+    #[test]
+    fn test_collect_empty_buffer_returns_object() {
+        // 引数なしツール呼び出し: input_json_delta が一度も来ないケース
+        let collector = ToolCallCollector::new();
+        let mut timeline = Timeline::new();
+        timeline.on_tool_use_block(collector.clone());
+
+        timeline.dispatch(&Event::tool_use_start(0, "tool_empty", "ListPods"));
+        timeline.dispatch(&Event::tool_use_stop(0));
+
+        let calls = collector.take_collected();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "tool_empty");
+        assert_eq!(calls[0].name, "ListPods");
+        assert!(calls[0].input.is_object());
+        assert_eq!(
+            calls[0].input,
+            serde_json::Value::Object(serde_json::Map::new())
+        );
     }
 
     #[test]

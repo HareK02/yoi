@@ -7,7 +7,7 @@ use serde_json::Value;
 
 use crate::llm_client::{
     Request,
-    types::{Item, Role, ToolDefinition},
+    types::{Item, Role, ToolDefinition, parse_tool_arguments},
 };
 
 use super::OpenAIScheme;
@@ -201,12 +201,15 @@ impl OpenAIScheme {
                     arguments,
                     ..
                 } => {
+                    // Normalize non-object / legacy "null" payloads to "{}" so
+                    // OpenAI gets a valid JSON object string.
+                    let normalized_args = parse_tool_arguments(arguments).to_string();
                     pending_tool_calls.push(OpenAIToolCall {
                         id: call_id.clone(),
                         r#type: "function".to_string(),
                         function: OpenAIToolCallFunction {
                             name: name.clone(),
-                            arguments: arguments.clone(),
+                            arguments: normalized_args,
                         },
                     });
                 }

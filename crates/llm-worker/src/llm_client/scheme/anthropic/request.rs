@@ -6,7 +6,7 @@ use serde::Serialize;
 
 use crate::llm_client::{
     Request,
-    types::{ContentPart, Item, Role, ToolDefinition},
+    types::{ContentPart, Item, Role, ToolDefinition, parse_tool_arguments},
 };
 
 use super::AnthropicScheme;
@@ -170,9 +170,9 @@ impl AnthropicScheme {
                         });
                     }
 
-                    // Parse arguments JSON string to Value
-                    let input = serde_json::from_str(arguments)
-                        .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
+                    // Parse arguments JSON string to Value (defensive: normalize
+                    // non-object / legacy "null" payloads to {} so Anthropic API accepts it)
+                    let input = parse_tool_arguments(arguments);
 
                     pending_assistant_parts.push(AnthropicContentPart::ToolUse {
                         id: call_id.clone(),

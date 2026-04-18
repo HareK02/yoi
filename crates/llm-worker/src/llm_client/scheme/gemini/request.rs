@@ -7,7 +7,7 @@ use serde_json::Value;
 
 use crate::llm_client::{
     Request,
-    types::{Item, Role, ToolDefinition},
+    types::{Item, Role, ToolDefinition, parse_tool_arguments},
 };
 
 use super::GeminiScheme;
@@ -244,9 +244,8 @@ impl GeminiScheme {
                         });
                     }
 
-                    // Parse arguments
-                    let args = serde_json::from_str(arguments)
-                        .unwrap_or_else(|_| Value::Object(serde_json::Map::new()));
+                    // Parse arguments (normalize non-object / legacy "null" payloads to {})
+                    let args = parse_tool_arguments(arguments);
 
                     pending_model_parts.push(GeminiPart::FunctionCall {
                         function_call: GeminiFunctionCall {

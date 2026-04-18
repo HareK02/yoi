@@ -317,6 +317,19 @@ impl Item {
     }
 }
 
+/// Parse a ToolCall `arguments` string into a JSON object.
+///
+/// Tool call arguments must be a JSON object at the provider API level
+/// (Anthropic rejects non-object `tool_use.input`). This helper normalizes
+/// anything that is not a JSON object — empty string, the literal `"null"`,
+/// arrays, scalars, or parse failures — to an empty object `{}`.
+pub fn parse_tool_arguments(arguments: &str) -> serde_json::Value {
+    match serde_json::from_str::<serde_json::Value>(arguments) {
+        Ok(value) if value.is_object() => value,
+        _ => serde_json::Value::Object(serde_json::Map::new()),
+    }
+}
+
 // ============================================================================
 // Content Parts - Components within message items
 // ============================================================================
@@ -581,5 +594,56 @@ impl RequestConfig {
     pub fn with_stop_sequence(mut self, sequence: impl Into<String>) -> Self {
         self.stop_sequences.push(sequence.into());
         self
+    }
+}
+
+#[cfg(test)]
+mod parse_tool_arguments_tests {
+    use super::parse_tool_arguments;
+    use serde_json::{Value, json};
+
+    fn empty_object() -> Value {
+        Value::Object(serde_json::Map::new())
+    }
+
+    #[test]
+    fn empty_string_normalizes_to_object() {
+        assert_eq!(parse_tool_arguments(""), empty_object());
+    }
+
+    #[test]
+    fn literal_null_normalizes_to_object() {
+        // 既存セッションに残っている "null" が resume 時に復旧できること
+        assert_eq!(parse_tool_arguments("null"), empty_object());
+    }
+
+    #[test]
+    fn array_normalizes_to_object() {
+        assert_eq!(parse_tool_arguments("[1, 2, 3]"), empty_object());
+    }
+
+    #[test]
+    fn scalar_normalizes_to_object() {
+        assert_eq!(parse_tool_arguments("42"), empty_object());
+        assert_eq!(parse_tool_arguments("\"str\""), empty_object());
+        assert_eq!(parse_tool_arguments("true"), empty_object());
+    }
+
+    #[test]
+    fn invalid_json_normalizes_to_object() {
+        assert_eq!(parse_tool_arguments("{not json"), empty_object());
+    }
+
+    #[test]
+    fn valid_object_passes_through() {
+        assert_eq!(
+            parse_tool_arguments(r#"{"city":"Tokyo","days":3}"#),
+            json!({"city": "Tokyo", "days": 3}),
+        );
+    }
+
+    #[test]
+    fn empty_object_passes_through() {
+        assert_eq!(parse_tool_arguments("{}"), empty_object());
     }
 }
