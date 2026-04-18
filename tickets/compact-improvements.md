@@ -5,11 +5,13 @@
 `Pod::compact()` とその周辺機構は実装済み。
 要約品質、保護単位、compact 後のコンテキスト構築に改善が必要。
 
-## 前提チケット
+## 前提（完了済み）
 
-- [usage-history.md](usage-history.md) — session-store に LLM Usage を積む基盤
-- [token-counter.md](token-counter.md) — Usage 履歴ベースのトークン会計 API。retained_tokens / auto-read budget がこれに依存
-- [tracker.md](tracker.md) — `ReadTracker` → `Tracker` リネーム + `recent_files(n)` 追加。デフォルトリファレンスがこれに依存
+以下は完了済み。git 履歴参照。
+
+- **usage-history** — session-store に `UsageRecord` を積む基盤（`101679d usageデータの永続化実装`）
+- **token-counter** — Usage 履歴ベースのトークン会計。`Pod::total_tokens()` / `Pod::split_for_retained(n)` として公開済み（`a89c448 token-counter実装`）
+- **tracker** — `tools::Tracker` に `recent_files(n)` 実装済み（`6f2362e ToolsのTracker実装`）
 
 ---
 
@@ -88,24 +90,24 @@ warn を出す。両方 None なら compact 無効（今まで通り）。片方
 ### 占有量ソースの統合（重要）
 
 現在 `CompactState::last_input_tokens: AtomicU64` が `on_usage` callback から
-更新され、閾値判定に使われている。これは usage-history チケットで導入された
-session-store の `LogEntry::LlmUsage` 履歴と**情報源が二重化**している状態。
+更新され、閾値判定に使われている。これは session-store の `UsageRecord`
+履歴（usage-history で導入済み）と**情報源が二重化**している状態。
 
-本チケットで両者を統合する。**改善版である `usage_history` を単一の情報源とし、
-`last_input_tokens` 経路を撤去する**:
+本チケットで両者を統合する。**`Pod::total_tokens()`（token-counter で導入済み）を
+単一の情報源とし、`last_input_tokens` 経路を撤去する**:
 
 - `CompactState` から `last_input_tokens: AtomicU64` フィールドを削除
 - `CompactState::update_input_tokens` メソッドを削除
 - `Pod::ensure_interceptor_installed` の on_usage callback から
   `state_for_usage.update_input_tokens(tokens)` の行を削除
   （`tracker_for_usage.record_usage(event)` だけが残る）
-- 閾値判定 (`exceeds_request` / `exceeds_post_run`) は `Session::total_tokens()`
-  （token-counter で導入される API）の戻り値を見る形に変える
-- これにより「実測値の単一履歴 → トークン会計 API → 閾値判定」と一直線になる
+- 閾値判定 (`exceeds_request` / `exceeds_post_run`) は `Pod::total_tokens()` の
+  戻り値を見る形に変える
+- これにより「実測値の単一履歴 → `Pod::total_tokens()` → 閾値判定」と一直線になる
 
 Anthropic のキャッシュヒット時に占有量を取りこぼす旧バグも、このパスを
-廃止することで自動的に解消する（`UsageEvent.input_tokens` は scheme 層で
-すでに占有量に正規化済み、かつ usage_history はそれをそのまま保存している）。
+廃止することで自動的に解消する（`UsageRecord.input_total_tokens` は
+scheme 層で占有量に正規化済み）。
 
 ### 影響箇所
 
@@ -139,8 +141,8 @@ Anthropic のキャッシュヒット時に占有量を取りこぼす旧バグ�
             .unwrap_or(false)
     }
     ```
-    呼び出し元 (`compact_interceptor.rs` / `controller.rs`) は `Session::total_tokens()`
-    （token-counter で生やす API）から現在の占有量を取って渡す
+    呼び出し元 (`compact_interceptor.rs` / `controller.rs`) は `Pod::total_tokens()`
+    から現在の占有量を取って渡す
   - `exceeds_post_run()` も同様に Option 対応
   - `turn_threshold()` getter → `request_threshold()`、戻り値は `Option<u64>`
   - ドックコメントを「proactive = post_run」「safety net = request」で書き直し
@@ -216,8 +218,9 @@ history (全て pruned 済み = summary only):
     要約対象            そのまま新 history に載せる
 ```
 
-- Prune 済みの history に対して `Session::split_for_retained(N)` で cut 位置を求める
-- 計算は session-store の Usage 履歴 (実測値) を逆算ソースに使う
+- Prune 済みの history に対して `Pod::split_for_retained(N)`（token-counter で
+  導入済み）で cut 位置を求める
+- 計算は session-store の `UsageRecord` 履歴 (実測値) を逆算ソースに使う
 - ターン境界は無視。アイテム単位で切る
 
 ```toml
@@ -226,17 +229,15 @@ compact_threshold = 80000
 retained_tokens = 8000     # ← retained_turns から変更
 ```
 
-token-counter チケット（および前提の usage-history）が前提。
-
 ---
 
 ## R3: Auto-Read + リファレンス
 
 ### デフォルトリファレンスの抽出
 
-`tools::Tracker` (既存の `ReadTracker` を拡張したもの → [tracker.md](tracker.md)) が
-Read/Write/Edit で触られたファイルを LRU で保持している。Compact 時は
-`self.tracker.recent_files(5)` で先頭 5 件を compact worker のデフォルトリファレンスとして渡す。
+`tools::Tracker`（実装済み）が Read/Write/Edit で触られたファイルを LRU で
+保持している。Compact 時は `self.tracker.recent_files(5)` で先頭 5 件を
+compact worker のデフォルトリファレンスとして渡す。
 
 ### compact worker のツール
 
@@ -285,8 +286,6 @@ auto_read_budget = 8000   # 合計トークン上限
 - 100% 超過で Err:
   `"Error: auto-read budget exhausted (8000 tokens). Remove an existing mark or use add_reference instead."`
 - compact worker が判断して自分で調整できる（Err は即中断ではない）
-
-token-counter チケットが前提（budget の計測にトークン会計 API が要る）。
 
 ### compact worker の暴走抑止
 
@@ -406,10 +405,9 @@ compact 後の新セッションが存在する場合、どちらを restore す
 
 ## 実装順序
 
-0. **[前提] usage-history** — session-store に LLM Usage 蓄積
-0. **[前提] token-counter** — Usage 履歴ベースのトークン会計 API
-0. **[前提] tracker** — `ReadTracker` → `Tracker` リネーム + `recent_files` 追加 + Pod 接続
-1. **閾値の修正 + リネーム + 個別指定化** — manifest に `compact_request_threshold` 追加、`compact_state.rs` の 2 閾値を `Option<u64>` 化、`turn_threshold` → `request_threshold` リネーム、`exceeds_turn()` → `exceeds_request()`。compact_state.rs / compact_interceptor.rs / pod.rs / manifest / テスト / docs 更新
+前提（usage-history / token-counter / tracker）は完了済み。
+
+1. **閾値の修正 + リネーム + 個別指定化 + 占有量ソース統合** — manifest に `compact_request_threshold` 追加、`compact_state.rs` の 2 閾値を `Option<u64>` 化、`turn_threshold` → `request_threshold` リネーム、`exceeds_turn()` → `exceeds_request()`。`last_input_tokens` 撤去、閾値判定は `Pod::total_tokens()` 経由に切替。compact_state.rs / compact_interceptor.rs / pod.rs / manifest / テスト / docs 更新
 2. **要約入力の削減** — `build_summary_prompt` から content/arguments/reasoning を除去
 3. **retained_tokens 化** — retained_turns → retained_tokens に変更。マニフェスト設定追加
 4. **compact worker のツール化** — read_file + mark_read_required + add_reference + write_summary (上書き可)
