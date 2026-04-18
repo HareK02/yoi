@@ -1,5 +1,7 @@
 # Manifest のパス解決: cwd ベース + manifest ファイル相対
 
+レビュー中: [manifest-path-resolution.review.md](manifest-path-resolution.review.md)
+
 ## 背景
 
 現状 manifest 内のパス（`pod.pwd` / `provider.api_key_file` / `scope.allow.target` / `scope.deny.target` / `compaction.provider.api_key_file`）は全て絶対必須で、相対パスは `ResolveError::RelativePath` で弾かれる。
@@ -15,9 +17,9 @@ cargo / pyproject / npm などに倣い「相対パスは manifest ファイル�
 ## 新しい解決規則
 
 - `pod.pwd` フィールドは削除。Pod の作業ディレクトリ = プロセスの cwd
-- 相対パスは **manifest ファイルがあるディレクトリ** を基準に解決
-  - user manifest (`~/.config/insomnia/manifest.toml`) の相対 = そのディレクトリ基準
-  - project manifest (`<project>/.insomnia/manifest.toml`) の相対 = そのディレクトリ基準
+- 相対パスの基準は層ごとに決める
+  - user manifest (`~/.config/insomnia/manifest.toml`) の相対 = そのファイルの親ディレクトリ
+  - project manifest (`<project>/.insomnia/manifest.toml`) の相対 = **プロジェクトルート**（`.insomnia/` の親）。`target = "."` がワークスペース全体を指すように
 - overlay（インライン TOML、ファイル位置なし）の相対パスは **プロセスの cwd** 基準
 - builtin 層には manifest を埋め込んでいないので対象外
 

@@ -59,13 +59,27 @@ pub enum PodEvent {
 | タイミング | variant |
 |---|---|
 | `RunEnd { result: Finished }` 発行時 | `TurnEnded` |
-| `Event::Error` 発行時 | `Errored` |
+| Worker 実行エラー発生時（後述） | `Errored` |
 | shutdown シーケンス（controller loop 終了直前） | `ShutDown` |
 | `SpawnPod` tool 成功直後 | `ScopeSubDelegated` |
+
+`Errored` の対象は **`run_with_cancel_support` 内で Worker 実行が失敗した `Event::Error`** に限定する。`AlreadyRunning` / `NotPaused` / `NotRunning` のような method 拒否応答はクライアント向けの一時的なフィードバックであり、親に通知すべき子のライフサイクルイベントではない。実装時は発火点を worker エラー経路に絞ること。
 
 送信は非同期 spawn で発射し、await しない。接続失敗はログのみで続行（親が落ちていても子は生きる）。
 
 親 socket のアドレスは spawn 時に `--callback <PATH>` で受け取って保持している（既存）。
+
+### 又貸しの親連鎖
+
+`ScopeSubDelegated` は**直接の親にのみ送る**。曾孫が現れた場合：
+
+1. 孫 (C) が曾孫 (D) を `SpawnPod` する
+2. C は自分の親 (B) に `ScopeSubDelegated { parent_pod: C, sub_pod: D, ... }` を送る
+3. B は D を自分の `spawned_pods.json` に追加し、さらに B の親 (A) へ `ScopeSubDelegated { parent_pod: B, sub_pod: D, ... }` を再発射する
+
+これを再帰的に繰り返すことで、`scope.lock` の `delegated_from` チェーンと一致した形で root まで D の存在が登録される。各 Pod は「自分の直接の子＋紹介された孫（= 更に下の Pod も含む）」を把握し、孫より下の階層は子経由で管理される。
+
+再発射は `ScopeSubDelegated` 受信時の system 処理の一部として行う（後述の表に反映）。
 
 ### 親（受信側）
 
@@ -89,9 +103,19 @@ variant 別の (1) の中身：
 | `TurnEnded` | なし |
 | `Errored` | なし（LLM に判断させる） |
 | `ShutDown` | `spawned_registry.remove(pod_name)`、scope lock を flock して該当 allocation を `release_pod` で解放 |
-| `ScopeSubDelegated` | `spawned_registry.add(SpawnedPodRecord { sub_pod, sub_socket, scope, ... })`（孫を直接把握する。親が子を経由せず孫を管理することで、子が死んでも孫の scope 管理が維持される） |
+| `ScopeSubDelegated` | `spawned_registry.add(SpawnedPodRecord { sub_pod, sub_socket, scope, ... })` で孫を追加。続けて自分の親（いれば）へ `ScopeSubDelegated { parent_pod: self, sub_pod, ... }` を再発射（親連鎖参照） |
 
 (2) の `render_event` は一箇所に集約し、`format!("Pod `{pod_name}` finished a turn.")` のような短い human-readable 文字列を返す。
+
+### Controller の配線変更
+
+現状 `PodController::spawn` 内で `SpawnedPodRegistry` は tool 登録のためだけに生成され、main loop の `method_rx` 処理ループには渡っていない。`Method::PodEvent` ハンドラを追加するには：
+
+- `spawned_registry: Arc<SpawnedPodRegistry>` を main loop に `clone` で持ち込む
+- `scope_lock::default_lock_path()` を event 処理時に呼ぶ（毎回 open するので保持は不要）
+- 親 callback socket（自分の親、トップ Pod では `None`）を `Pod::from_manifest_spawned` 経由で既に保持している値から再利用（再発射で使う）
+
+`apply_event_side_effects` は Controller の main loop から呼ぶ非同期関数として定義する。
 
 ### 失敗時のフォールバック
 
@@ -102,16 +126,23 @@ variant 別の (1) の中身：
 ## 設計で決めること
 
 - **送信の接続タイムアウト**: `SpawnPod` / pod-comm-tools と揃える（5 秒想定）
-- **同時多発イベントの順序保証**: `TurnEnded` 直後に `ShutDown` が起きた場合、親側で順序を保証する必要があるか。現状は fire-and-forget で並列送信されうる
-- **`ScopeSubDelegated` の親連鎖**: 孫がさらに曾孫を spawn したとき、曾孫の `ScopeSubDelegated` は誰に送る？（子に送り、子が親に転送? or 最上位の root まで届ける? or 直接の親だけで十分?）
+
+### 決定事項
+
+- **順序保証は求めず、ハンドラを冪等・遅延到着に強くする**: fire-and-forget の unix socket 接続は順序を保証しない。`TurnEnded` 直後に `ShutDown` が届いても、逆順で到着しても親側で成立するように `apply_event_side_effects` を設計する。具体的には：
+  - `ShutDown` 受信時、すでに registry から削除済みでもエラーにしない（`release_pod` の `UnknownPod` を swallow する既存挙動を踏襲）
+  - `TurnEnded` が `ShutDown` より後に届いても、該当 Pod が既に registry にいなければ render だけして終える（LLM 向け通知は出る、system 処理は no-op）
+  - `ScopeSubDelegated` で孫が既に registry にいたら上書きせず no-op（`DuplicatePodName` を swallow）
+- **`ScopeSubDelegated` の親連鎖は直接の親のみ + 再発射**: 上記「又貸しの親連鎖」セクション参照。曾孫以上は再帰的に再発射で root まで届く
 
 ## 完了条件
 
 - `Method::PodEvent(PodEvent)` が `protocol` crate に追加され、serde round-trip テストが通る
-- 子の Controller が 4 種の variant を適切なタイミングで親 socket に送信する
+- 子の Controller が 4 種の variant を適切なタイミングで親 socket に送信する。`Errored` は Worker 実行エラーにのみ限定されることを確認
 - 親の Controller が variant ごとの system 処理を実行し、レンダリングした文字列を LLM 通知バッファに流す
-- `ScopeSubDelegated` 受信後、孫 Pod が親の `spawned_pods.json` に現れる
+- `ScopeSubDelegated` 受信後、孫 Pod が親の `spawned_pods.json` に現れ、親が更に上位親を持つ場合は上位へ再発射される
 - `ShutDown` 受信後、該当 Pod が親の registry から消え、scope lock からも解放される
+- イベント到着順が入れ替わっても副作用が安全（冪等）であることを単体テストで確認
 - 送信失敗しても子プロセスが続行する
 - 各 variant の送受信を検証する単体テスト
 

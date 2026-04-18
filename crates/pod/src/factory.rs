@@ -14,12 +14,13 @@
 //!
 //! Path resolution happens **before** merge. Each layer is resolved
 //! against its own base directory so that a relative `target = "."`
-//! in the project manifest means "project directory" regardless of
-//! how the user or overlay layers lay out their own paths:
+//! in the project manifest means the project root regardless of how
+//! the user or overlay layers lay out their own paths:
 //!
 //! - user manifest: base = the directory holding the manifest file
-//! - project manifest: base = the directory holding the manifest file
-//!   (i.e. `<project>/.insomnia/`)
+//! - project manifest: base = the **project root** (the parent of
+//!   `.insomnia/`, not `.insomnia/` itself) so that natural project
+//!   manifests with `target = "."` cover the whole workspace
 //! - overlay: base = the process's `current_dir()` at the time the
 //!   overlay is installed, since an inline TOML string has no file
 //!   location of its own
@@ -119,9 +120,7 @@ impl PodFactory {
             source,
         })?;
         if let Some(path) = find_project_manifest(&cwd) {
-            let base = manifest_base(&path)?;
-            self.project = Some((read_config_file(&path)?, base.clone()));
-            self.project_prompts_dir = Some(base.join("prompts"));
+            self.install_project_manifest(&path)?;
         }
         Ok(self)
     }
@@ -133,11 +132,25 @@ impl PodFactory {
         start: impl AsRef<Path>,
     ) -> Result<Self, FactoryError> {
         if let Some(path) = find_project_manifest(start.as_ref()) {
-            let base = manifest_base(&path)?;
-            self.project = Some((read_config_file(&path)?, base.clone()));
-            self.project_prompts_dir = Some(base.join("prompts"));
+            self.install_project_manifest(&path)?;
         }
         Ok(self)
+    }
+
+    /// Shared setup for `with_project_manifest_auto` / `_from`: record
+    /// the manifest's project root as the base for relative-path
+    /// resolution (the parent of `.insomnia/`, not `.insomnia/` itself)
+    /// so `target = "."` in a project manifest means the project root.
+    /// `prompts/` still lives inside `.insomnia/`.
+    fn install_project_manifest(&mut self, path: &Path) -> Result<(), FactoryError> {
+        let insomnia_dir = manifest_base(path)?;
+        let project_root = insomnia_dir
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| insomnia_dir.clone());
+        self.project = Some((read_config_file(path)?, project_root));
+        self.project_prompts_dir = Some(insomnia_dir.join("prompts"));
+        Ok(())
     }
 
     /// Install a programmatic overlay parsed from a TOML string. Any
@@ -535,11 +548,12 @@ permission = "write"
     }
 
     #[test]
-    fn project_manifest_relative_paths_resolve_against_insomnia_dir() {
-        // per ticket: base is the directory holding the manifest —
-        // `.insomnia/` for a project manifest. `target = "."` inside
-        // a project manifest therefore points at `.insomnia/`, not at
-        // the project root.
+    fn project_manifest_relative_paths_resolve_against_project_root() {
+        // `.insomnia/manifest.toml` is the marker for the project, but
+        // the intuitive base for its relative paths is the project
+        // root (the parent of `.insomnia/`) — `target = "."` in a
+        // project manifest should cover the whole workspace, not the
+        // `.insomnia/` subdir.
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().canonicalize().unwrap();
         let insomnia_dir = root.join(".insomnia");
@@ -558,6 +572,10 @@ model = "m"
 [[scope.allow]]
 target = "."
 permission = "read"
+
+[[scope.allow]]
+target = "src"
+permission = "write"
 "#,
         );
 
@@ -566,7 +584,8 @@ permission = "read"
             .unwrap()
             .resolve()
             .unwrap();
-        assert_eq!(manifest.scope.allow[0].target, insomnia_dir);
+        assert_eq!(manifest.scope.allow[0].target, root);
+        assert_eq!(manifest.scope.allow[1].target, root.join("src"));
     }
 
     #[test]
