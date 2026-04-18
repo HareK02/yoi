@@ -21,11 +21,11 @@ use protocol::stream::JsonLineWriter;
 use serde::Deserialize;
 use tokio::net::UnixStream;
 use tokio::process::Command;
-use tokio::sync::Mutex;
 use tokio::time::sleep;
 
-use crate::runtime_dir::{RuntimeDir, SpawnedPodRecord};
+use crate::runtime_dir::SpawnedPodRecord;
 use crate::scope_lock::{self, LockFileGuard, ScopeLockError};
+use crate::spawned_pod_registry::SpawnedPodRegistry;
 
 const DESCRIPTION: &str = "Spawn a new Pod process to work on a delegated task. \
 The spawner's write scope is reduced by the scope passed here; the spawned \
@@ -101,11 +101,10 @@ pub struct SpawnPodTool {
     /// Directory the spawned Pod should run in when the LLM did not
     /// override it. Defaults to the spawner's pwd — see module docs.
     spawner_pwd: PathBuf,
-    /// Spawner's own runtime directory — target for `spawned_pods.json`.
-    runtime_dir: Arc<RuntimeDir>,
-    /// Running list of successful spawns, replayed into
-    /// `spawned_pods.json` on every successful `execute`.
-    records: Arc<Mutex<Vec<SpawnedPodRecord>>>,
+    /// Shared registry of spawned children, also used by the
+    /// pod-comm tools (`SendToPod` / `ReadPodOutput` / `StopPod` /
+    /// `ListPods`). Writes the list to `spawned_pods.json` on each add.
+    registry: Arc<SpawnedPodRegistry>,
 }
 
 impl SpawnPodTool {
@@ -114,15 +113,14 @@ impl SpawnPodTool {
         callback_socket: PathBuf,
         runtime_base: PathBuf,
         spawner_pwd: PathBuf,
-        runtime_dir: Arc<RuntimeDir>,
+        registry: Arc<SpawnedPodRegistry>,
     ) -> Self {
         Self {
             spawner_name,
             callback_socket,
             runtime_base,
             spawner_pwd,
-            runtime_dir,
-            records: Arc::new(Mutex::new(Vec::new())),
+            registry,
         }
     }
 }
@@ -203,16 +201,10 @@ impl Tool for SpawnPodTool {
             scope_delegated: scope_allow,
             callback_address: self.callback_socket.clone(),
         };
-        {
-            let mut records = self.records.lock().await;
-            records.push(record);
-            self.runtime_dir
-                .write_spawned_pods(records.as_slice())
-                .await
-                .map_err(|e| {
-                    ToolError::ExecutionFailed(format!("write spawned_pods.json: {e}"))
-                })?;
-        }
+        self.registry
+            .add(record)
+            .await
+            .map_err(|e| ToolError::ExecutionFailed(format!("write spawned_pods.json: {e}")))?;
 
         Ok(ToolOutput {
             summary: format!(
@@ -367,7 +359,7 @@ pub fn spawn_pod_tool(
     callback_socket: PathBuf,
     runtime_base: PathBuf,
     spawner_pwd: PathBuf,
-    runtime_dir: Arc<RuntimeDir>,
+    registry: Arc<SpawnedPodRegistry>,
 ) -> ToolDefinition {
     Arc::new(move || {
         let schema = schemars::schema_for!(SpawnPodInput);
@@ -380,7 +372,7 @@ pub fn spawn_pod_tool(
             callback_socket.clone(),
             runtime_base.clone(),
             spawner_pwd.clone(),
-            runtime_dir.clone(),
+            registry.clone(),
         ));
         (meta, tool)
     })

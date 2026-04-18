@@ -4,8 +4,10 @@ pub mod notifier;
 pub mod runtime_dir;
 pub mod scope_lock;
 pub mod shared_state;
+pub mod pod_comm_tools;
 pub mod socket_server;
 pub mod spawn_pod;
+pub mod spawned_pod_registry;
 
 mod agents_md;
 mod compact_state;

@@ -15,6 +15,7 @@ use manifest::{Permission, ScopeRule};
 use pod::runtime_dir::{RuntimeDir, SpawnedPodRecord};
 use pod::scope_lock::{self, LockFileGuard};
 use pod::spawn_pod::spawn_pod_tool;
+use pod::spawned_pod_registry::SpawnedPodRegistry;
 use protocol::Method;
 use protocol::stream::JsonLineReader;
 use serde_json::json;
@@ -150,12 +151,13 @@ async fn spawn_pod_delegates_scope_and_sends_run() {
     let (_predicted_socket, listener) = bind_mock_pod_socket(&runtime_base, "child").await;
     let received = accept_one_method(listener);
 
+    let registry = SpawnedPodRegistry::new(spawner_rd.clone());
     let def = spawn_pod_tool(
         "root".into(),
         spawner_socket.clone(),
         runtime_base.clone(),
         allow_root.path().to_path_buf(),
-        spawner_rd.clone(),
+        registry,
     );
     let (_meta, tool) = def();
 
@@ -210,12 +212,13 @@ async fn spawn_pod_rejects_scope_outside_spawner() {
         setup_spawner("root", allow_root.path()).await;
     point_pod_command_at_true();
 
+    let registry = SpawnedPodRegistry::new(spawner_rd);
     let def = spawn_pod_tool(
         "root".into(),
         spawner_socket,
         runtime_base,
         allow_root.path().to_path_buf(),
-        spawner_rd,
+        registry,
     );
     let (_meta, tool) = def();
 
@@ -266,12 +269,13 @@ async fn spawn_pod_rolls_back_reservation_when_socket_never_appears() {
     // marked with `// slow_test`. Keep the rest of the test suite fast
     // by running this test alone when iterating.
 
+    let registry = SpawnedPodRegistry::new(spawner_rd);
     let def = spawn_pod_tool(
         "root".into(),
         spawner_socket,
         runtime_base,
         allow_root.path().to_path_buf(),
-        spawner_rd,
+        registry,
     );
     let (_meta, tool) = def();
 

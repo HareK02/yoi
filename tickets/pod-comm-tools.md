@@ -1,5 +1,7 @@
 # Pod 間通信ツール: SendToPod / ReadPodOutput / StopPod / ListPods
 
+レビュー中: [pod-comm-tools.review.md](pod-comm-tools.review.md)
+
 ## 背景
 
 `SpawnPod` で Pod を生成した後、spawner の LLM が spawned Pod に指示を送り、結果を読み、完了したら停止させる手段が必要。

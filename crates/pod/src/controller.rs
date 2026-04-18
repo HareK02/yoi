@@ -9,10 +9,14 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use crate::notification_buffer::NotificationBuffer;
 use crate::notifier::Notifier;
 use crate::pod::{Pod, PodError, PodRunResult};
+use crate::pod_comm_tools::{
+    list_pods_tool, read_pod_output_tool, send_to_pod_tool, stop_pod_tool,
+};
 use crate::runtime_dir::RuntimeDir;
 use crate::shared_state::{PodSharedState, PodStatus};
 use crate::socket_server::SocketServer;
 use crate::spawn_pod::spawn_pod_tool;
+use crate::spawned_pod_registry::SpawnedPodRegistry;
 use protocol::{ErrorCode, Event, Method, NotificationLevel, NotificationSource, RunResult, TurnResult};
 
 // ---------------------------------------------------------------------------
@@ -204,18 +208,25 @@ impl PodController {
             let tracker = tools::Tracker::new();
             worker.register_tools(tools::builtin_tools(fs, tracker.clone()));
 
-            // SpawnPod is wired here rather than in `tools::builtin_tools`
-            // because it needs Pod-scoped handles (this Pod's own socket
-            // path, runtime_dir, spawner name) that the generic tools
-            // crate has no access to.
+            // Pod-orchestration tools (SpawnPod + the four comm tools)
+            // share a single `SpawnedPodRegistry`: `SpawnPod` writes to
+            // it, the others read/mutate. Wired here rather than in
+            // `tools::builtin_tools` because these need Pod-scoped
+            // handles (this Pod's own socket path, runtime_dir, spawner
+            // name) that the generic tools crate has no access to.
             let spawner_socket = runtime_dir.socket_path();
+            let spawned_registry = SpawnedPodRegistry::new(runtime_dir.clone());
             worker.register_tool(spawn_pod_tool(
                 spawner_name,
                 spawner_socket,
                 runtime_base.to_path_buf(),
                 pwd_for_tools,
-                runtime_dir.clone(),
+                spawned_registry.clone(),
             ));
+            worker.register_tool(send_to_pod_tool(spawned_registry.clone()));
+            worker.register_tool(read_pod_output_tool(spawned_registry.clone()));
+            worker.register_tool(stop_pod_tool(spawned_registry.clone()));
+            worker.register_tool(list_pods_tool(spawned_registry));
             pod.attach_tracker(tracker);
         }
 
@@ -482,16 +493,21 @@ where
         manifest::ProviderKind::Ollama => "ollama",
     };
     // The tool list mirrors what `spawn()` registers on the Worker:
-    // builtin filesystem tools plus `SpawnPod`. `SpawnPod` is appended
-    // by name because constructing its factory here would require
-    // Pod-lifetime handles we haven't built yet (runtime_dir, socket).
+    // builtin filesystem tools plus the pod-orchestration tools.
+    // Orchestration tools are appended by name because constructing
+    // their factories here would require Pod-lifetime handles we
+    // haven't built yet (runtime_dir, socket).
     let fs = tools::ScopedFs::new(pod.scope().clone(), pod.pwd().to_path_buf());
     let tracker = tools::Tracker::new();
     let mut tool_names: Vec<String> = tools::builtin_tools(fs, tracker)
         .iter()
         .map(|def| def().0.name)
         .collect();
-    tool_names.push("SpawnPod".into());
+    tool_names.extend(
+        ["SpawnPod", "SendToPod", "ReadPodOutput", "StopPod", "ListPods"]
+            .iter()
+            .map(|s| (*s).into()),
+    );
     protocol::Greeting {
         pod_name: manifest.pod.name.clone(),
         cwd: pod.pwd().display().to_string(),
