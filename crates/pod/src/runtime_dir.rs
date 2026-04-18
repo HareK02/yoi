@@ -1,9 +1,29 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
+use manifest::ScopeRule;
+use serde::{Deserialize, Serialize};
 use tokio::fs;
 
 use crate::shared_state::PodSharedState;
+
+/// One spawned-child record persisted to `spawned_pods.json`.
+///
+/// Written by the spawner after a successful `SpawnPod` tool call so
+/// `ListPods` (future ticket) and a restored spawner can enumerate
+/// their live children without re-querying `scope.lock`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpawnedPodRecord {
+    /// Spawned Pod's identity.
+    pub pod_name: String,
+    /// Spawned Pod's Unix socket path.
+    pub socket_path: PathBuf,
+    /// Scope allow rules delegated to the spawned Pod.
+    pub scope_delegated: Vec<ScopeRule>,
+    /// Socket path the spawned Pod was told to use for callbacks
+    /// (= this Pod's own socket when spawn happened).
+    pub callback_address: PathBuf,
+}
 
 /// Manages the Pod's runtime directory on tmpfs.
 ///
@@ -58,6 +78,17 @@ impl RuntimeDir {
     pub async fn write_history(&self, state: &PodSharedState) -> Result<(), io::Error> {
         let content = state.history_json();
         atomic_write(&self.path.join("history.json"), content.as_bytes()).await
+    }
+
+    /// Write `spawned_pods.json` atomically. The entries are the full
+    /// set of spawned children known to this Pod — callers pass the
+    /// replacement list, no incremental merge.
+    pub async fn write_spawned_pods(
+        &self,
+        records: &[SpawnedPodRecord],
+    ) -> Result<(), io::Error> {
+        let json = serde_json::to_vec_pretty(records).map_err(io::Error::other)?;
+        atomic_write(&self.path.join("spawned_pods.json"), &json).await
     }
 
     /// Path to this Pod's runtime directory.
@@ -171,6 +202,30 @@ mod tests {
 
         let content = std::fs::read_to_string(rt.path().join("manifest.toml")).unwrap();
         assert_eq!(content, "[pod]\nname = \"test\"");
+    }
+
+    #[tokio::test]
+    async fn write_spawned_pods_creates_file() {
+        use manifest::{Permission, ScopeRule};
+        let tmp = tempfile::tempdir().unwrap();
+        let rt = RuntimeDir::create(tmp.path(), "my-pod").await.unwrap();
+
+        let records = vec![SpawnedPodRecord {
+            pod_name: "child".into(),
+            socket_path: "/run/insomnia/child/sock".into(),
+            scope_delegated: vec![ScopeRule {
+                target: "/tmp/work".into(),
+                permission: Permission::Write,
+                recursive: true,
+            }],
+            callback_address: "/run/insomnia/my-pod/sock".into(),
+        }];
+        rt.write_spawned_pods(&records).await.unwrap();
+
+        let content = std::fs::read_to_string(rt.path().join("spawned_pods.json")).unwrap();
+        let parsed: Vec<SpawnedPodRecord> = serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].pod_name, "child");
     }
 
     #[tokio::test]

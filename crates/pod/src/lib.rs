@@ -5,6 +5,7 @@ pub mod runtime_dir;
 pub mod scope_lock;
 pub mod shared_state;
 pub mod socket_server;
+pub mod spawn_pod;
 
 mod agents_md;
 mod compact_state;

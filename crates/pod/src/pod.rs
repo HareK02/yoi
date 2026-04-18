@@ -114,6 +114,13 @@ pub struct Pod<C: LlmClient, St: Store> {
     /// releases the allocation when the Pod is dropped.
     #[allow(dead_code)]
     scope_allocation: Option<ScopeAllocationGuard>,
+    /// Socket path of the spawning Pod. `Some` only for Pods built via
+    /// `from_manifest_spawned`. The callback is consumed by the
+    /// `pod-callback` layer (separate ticket) to deliver
+    /// `Method::Notify` back to the spawner; stored here so the Pod
+    /// carries the reference for the duration of its life.
+    #[allow(dead_code)]
+    callback_socket: Option<PathBuf>,
 }
 
 impl<C: LlmClient, St: Store> Pod<C, St> {
@@ -156,6 +163,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             notifier: None,
             pending_notifications: NotificationBuffer::new(),
             scope_allocation: None,
+            callback_socket: None,
         };
         pod.apply_prune_from_manifest();
         Ok(pod)
@@ -206,6 +214,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             notifier: None,
             pending_notifications: NotificationBuffer::new(),
             scope_allocation: None,
+            callback_socket: None,
         };
         pod.apply_prune_from_manifest();
         Ok(pod)
@@ -936,6 +945,66 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             notifier: None,
             pending_notifications: NotificationBuffer::new(),
             scope_allocation: Some(scope_allocation),
+            callback_socket: None,
+        };
+        pod.apply_prune_from_manifest();
+        Ok(pod)
+    }
+
+    /// Build a Pod spawned by another Pod (sibling process).
+    ///
+    /// Behaves like [`Pod::from_manifest`] but claims the scope
+    /// allocation that the spawner pre-registered via
+    /// [`scope_lock::delegate_scope`], rather than installing a new
+    /// top-level entry. `callback_socket` carries the spawner's
+    /// Unix-socket path so the spawned Pod can send `Method::Notify`
+    /// back to the spawner; it is stored but unused in the
+    /// `spawn-pod-tool` ticket — the receiving side lands in the
+    /// follow-up `pod-callback` ticket.
+    pub async fn from_manifest_spawned(
+        manifest: PodManifest,
+        store: St,
+        loader: PromptLoader,
+        callback_socket: PathBuf,
+    ) -> Result<Self, PodError> {
+        let pwd = resolve_pwd(&manifest.pod.pwd)?;
+        let scope = Scope::from_config(&manifest.scope, &pwd).map_err(PodError::Scope)?;
+        if !scope.is_readable(&pwd) {
+            return Err(PodError::PwdOutsideScope { pwd });
+        }
+
+        let scope_allocation =
+            scope_lock::adopt_allocation(manifest.pod.name.clone(), std::process::id())?;
+
+        let client = provider::build_client(&manifest.provider)?;
+        let mut worker = Worker::new(client);
+        apply_worker_manifest(&mut worker, &manifest.worker);
+
+        let system_prompt_template = Some(
+            SystemPromptTemplate::parse(&manifest.worker.instruction, loader)
+                .map_err(|source| PodError::InvalidSystemPromptTemplate { source })?,
+        );
+
+        let session_id = session_store::new_session_id();
+        let mut pod = Self {
+            manifest,
+            worker: Some(worker),
+            store,
+            session_id,
+            head_hash: None,
+            pwd,
+            scope,
+            hook_builder: HookRegistryBuilder::new(),
+            interceptor_installed: false,
+            compact_state: None,
+            usage_tracker: Arc::new(UsageTracker::new()),
+            usage_history: Arc::new(Mutex::new(Vec::new())),
+            tracker: None,
+            system_prompt_template,
+            notifier: None,
+            pending_notifications: NotificationBuffer::new(),
+            scope_allocation: Some(scope_allocation),
+            callback_socket: Some(callback_socket),
         };
         pod.apply_prune_from_manifest();
         Ok(pod)

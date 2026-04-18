@@ -15,7 +15,7 @@ provider = { version = "0.1.0", path = "../provider" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 thiserror = "2.0"
-tokio = { version = "1.49", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync"] }
+tokio = { version = "1.49", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 toml = "1.1.2"
 tracing = "0.1.44"
 tools = { version = "0.1.0", path = "../tools" }
@@ -24,6 +24,7 @@ chrono = "0.4.44"
 include_dir = "0.7.4"
 fs4 = { version = "0.13.1", features = ["sync"] }
 libc = "0.2.185"
+schemars = "1.2.1"
 
 [dev-dependencies]
 async-trait = "0.1.89"

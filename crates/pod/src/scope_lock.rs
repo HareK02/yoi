@@ -460,6 +460,7 @@ fn pid_alive(pid: u32) -> bool {
 /// Owned allocation: on drop, opens the lock file and releases this
 /// Pod's entry. The guard keeps only the name + lock-file path; it
 /// does not hold the `flock` for the Pod's lifetime.
+#[derive(Debug)]
 pub struct ScopeAllocationGuard {
     pod_name: String,
     lock_path: PathBuf,
@@ -500,6 +501,32 @@ pub fn install_top_level(
     })
 }
 
+/// Take ownership of an existing allocation that was pre-registered by
+/// a spawning Pod.
+///
+/// The spawning flow is two-stage: the spawner calls [`delegate_scope`]
+/// (with its own pid as a live placeholder), then exec's the child; the
+/// child, once running, calls this function to rewrite the allocation's
+/// pid to its own and claim the `ScopeAllocationGuard` so the entry is
+/// released when the child exits.
+pub fn adopt_allocation(
+    pod_name: String,
+    new_pid: u32,
+) -> Result<ScopeAllocationGuard, ScopeLockError> {
+    let lock_path = default_lock_path()?;
+    let mut guard = LockFileGuard::open(&lock_path)?;
+    let alloc = guard
+        .data_mut()
+        .find_mut(&pod_name)
+        .ok_or_else(|| ScopeLockError::UnknownPod(pod_name.clone()))?;
+    alloc.pid = new_pid;
+    guard.save()?;
+    Ok(ScopeAllocationGuard {
+        pod_name,
+        lock_path,
+    })
+}
+
 /// Errors raised by the mutating scope-lock operations.
 #[derive(Debug, thiserror::Error)]
 pub enum ScopeLockError {
@@ -528,7 +555,14 @@ pub enum ScopeLockError {
 mod tests {
     use super::*;
     use manifest::Permission;
+    use std::sync::{LazyLock, Mutex};
     use tempfile::TempDir;
+
+    /// Serialises tests that mutate `INSOMNIA_SCOPE_LOCK`. The test
+    /// harness runs tests on multiple threads inside a single process,
+    /// so env-var writes from one test would otherwise leak into a
+    /// parallel test's `default_lock_path()` lookup.
+    static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     fn write_rule(path: &str, recursive: bool) -> ScopeRule {
         ScopeRule {
@@ -943,12 +977,9 @@ mod tests {
 
     #[test]
     fn scope_allocation_guard_releases_on_drop() {
+        let _env = ENV_LOCK.lock().unwrap();
         let dir = TempDir::new().unwrap();
         let lock_path = dir.path().join("scope.lock");
-        // Override the default path for the duration of the test.
-        // SAFETY: single-threaded inside each #[test]; concurrent tests
-        // that also touch INSOMNIA_SCOPE_LOCK are excluded by using
-        // per-test paths and not clearing the var until after drop.
         unsafe {
             std::env::set_var("INSOMNIA_SCOPE_LOCK", &lock_path);
         }
@@ -971,6 +1002,65 @@ mod tests {
         unsafe {
             std::env::remove_var("INSOMNIA_SCOPE_LOCK");
         }
+    }
+
+    #[test]
+    fn adopt_allocation_rewrites_pid_and_releases_on_drop() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let dir = TempDir::new().unwrap();
+        let lock_path = dir.path().join("scope.lock");
+        unsafe {
+            std::env::set_var("INSOMNIA_SCOPE_LOCK", &lock_path);
+        }
+        // Pre-register an allocation under spawner's pid, as delegate_scope would.
+        {
+            let mut g = LockFileGuard::open(&lock_path).unwrap();
+            delegate_placeholder(&mut g, "child", std::process::id());
+        }
+        let child_pid = std::process::id().wrapping_add(1);
+        let guard = adopt_allocation("child".into(), child_pid).unwrap();
+        {
+            let g = LockFileGuard::open(&lock_path).unwrap();
+            let alloc = g.data().find("child").unwrap();
+            assert_eq!(alloc.pid, child_pid);
+        }
+        drop(guard);
+        {
+            let g = LockFileGuard::open(&lock_path).unwrap();
+            assert!(g.data().find("child").is_none());
+        }
+        unsafe {
+            std::env::remove_var("INSOMNIA_SCOPE_LOCK");
+        }
+    }
+
+    #[test]
+    fn adopt_allocation_errors_on_unknown_pod() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let dir = TempDir::new().unwrap();
+        let lock_path = dir.path().join("scope.lock");
+        unsafe {
+            std::env::set_var("INSOMNIA_SCOPE_LOCK", &lock_path);
+        }
+        let err = adopt_allocation("ghost".into(), 42).unwrap_err();
+        assert!(matches!(err, ScopeLockError::UnknownPod(ref n) if n == "ghost"));
+        unsafe {
+            std::env::remove_var("INSOMNIA_SCOPE_LOCK");
+        }
+    }
+
+    /// Mimic what the spawner does before the child comes up: push an
+    /// allocation for the child carrying the spawner's (live) pid as a
+    /// placeholder. Exists only in tests.
+    fn delegate_placeholder(g: &mut LockFileGuard, pod_name: &str, placeholder_pid: u32) {
+        g.data_mut().allocations.push(Allocation {
+            pod_name: pod_name.to_string(),
+            pid: placeholder_pid,
+            socket: sock(pod_name),
+            scope_allow: vec![write_rule("/tmp/child", true)],
+            delegated_from: None,
+        });
+        g.save().unwrap();
     }
 
     #[test]

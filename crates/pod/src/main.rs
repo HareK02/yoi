@@ -36,6 +36,17 @@ struct Cli {
     /// `~/.insomnia/sessions/`.
     #[arg(short, long)]
     store: Option<PathBuf>,
+
+    /// Claim a scope allocation pre-registered by a spawning Pod, rather
+    /// than installing a new top-level allocation. Used only when this
+    /// process is launched by `SpawnPod`; end users should never pass it.
+    #[arg(long)]
+    adopt: bool,
+
+    /// Socket path of the spawning Pod, for delivering `Method::Notify`
+    /// callbacks upward. Required alongside `--adopt`.
+    #[arg(long, value_name = "PATH", requires = "adopt")]
+    callback: Option<PathBuf>,
 }
 
 fn default_store_dir() -> Result<PathBuf, std::io::Error> {
@@ -140,11 +151,28 @@ async fn main() -> ExitCode {
         }
     };
 
-    let pod = match Pod::from_manifest(manifest, store, loader).await {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("error: failed to create pod: {e}");
-            return ExitCode::FAILURE;
+    let pod = if cli.adopt {
+        let callback = match cli.callback.clone() {
+            Some(p) => p,
+            None => {
+                eprintln!("error: --adopt requires --callback");
+                return ExitCode::FAILURE;
+            }
+        };
+        match Pod::from_manifest_spawned(manifest, store, loader, callback).await {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("error: failed to create spawned pod: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        match Pod::from_manifest(manifest, store, loader).await {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("error: failed to create pod: {e}");
+                return ExitCode::FAILURE;
+            }
         }
     };
     let pod_name = pod.manifest().pod.name.clone();

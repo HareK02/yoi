@@ -12,6 +12,7 @@ use crate::pod::{Pod, PodError, PodRunResult};
 use crate::runtime_dir::RuntimeDir;
 use crate::shared_state::{PodSharedState, PodStatus};
 use crate::socket_server::SocketServer;
+use crate::spawn_pod::spawn_pod_tool;
 use protocol::{ErrorCode, Event, Method, NotificationLevel, NotificationSource, RunResult, TurnResult};
 
 // ---------------------------------------------------------------------------
@@ -107,6 +108,7 @@ impl PodController {
         // can build a `ScopedFs` for the builtin tools.
         let scope_for_tools = pod.scope().clone();
         let pwd_for_tools = pod.pwd().to_path_buf();
+        let spawner_name = pod.manifest().pod.name.clone();
 
         // Register event bridge callbacks on the worker
         {
@@ -198,9 +200,22 @@ impl PodController {
             // also handed to the Pod itself so Pod-level operations (e.g.
             // context compaction) can ask which files the agent has been
             // touching.
-            let fs = tools::ScopedFs::new(scope_for_tools, pwd_for_tools);
+            let fs = tools::ScopedFs::new(scope_for_tools, pwd_for_tools.clone());
             let tracker = tools::Tracker::new();
             worker.register_tools(tools::builtin_tools(fs, tracker.clone()));
+
+            // SpawnPod is wired here rather than in `tools::builtin_tools`
+            // because it needs Pod-scoped handles (this Pod's own socket
+            // path, runtime_dir, spawner name) that the generic tools
+            // crate has no access to.
+            let spawner_socket = runtime_dir.socket_path();
+            worker.register_tool(spawn_pod_tool(
+                spawner_name,
+                spawner_socket,
+                runtime_base.to_path_buf(),
+                pwd_for_tools,
+                runtime_dir.clone(),
+            ));
             pod.attach_tracker(tracker);
         }
 
@@ -466,15 +481,17 @@ where
         manifest::ProviderKind::Gemini => "gemini",
         manifest::ProviderKind::Ollama => "ollama",
     };
-    // The tool list mirrors `builtin_tools`. A fresh `ScopedFs`/`Tracker`
-    // is instantiated only to invoke the factories for name extraction;
-    // the instances themselves are discarded.
+    // The tool list mirrors what `spawn()` registers on the Worker:
+    // builtin filesystem tools plus `SpawnPod`. `SpawnPod` is appended
+    // by name because constructing its factory here would require
+    // Pod-lifetime handles we haven't built yet (runtime_dir, socket).
     let fs = tools::ScopedFs::new(pod.scope().clone(), pod.pwd().to_path_buf());
     let tracker = tools::Tracker::new();
-    let tool_names = tools::builtin_tools(fs, tracker)
+    let mut tool_names: Vec<String> = tools::builtin_tools(fs, tracker)
         .iter()
         .map(|def| def().0.name)
         .collect();
+    tool_names.push("SpawnPod".into());
     protocol::Greeting {
         pod_name: manifest.pod.name.clone(),
         cwd: pod.pwd().display().to_string(),
