@@ -1097,6 +1097,13 @@ impl From<WorkerResult> for PodRunResult {
 }
 
 /// Format conversation items into a text prompt for the summary Worker.
+///
+/// The summary should capture decisions and user intent, not recreate code.
+/// File contents and tool IO belong in auto-read / references, not in the
+/// summary input. So this strips:
+/// - `ToolCall.arguments` (keep only the tool name)
+/// - `ToolResult.content` (keep only the summary line)
+/// - `Reasoning` entirely (intermediate thought, superseded by decisions)
 fn build_summary_prompt(items: &[Item]) -> String {
     let mut lines = Vec::new();
     for item in items {
@@ -1114,20 +1121,13 @@ fn build_summary_prompt(items: &[Item]) -> String {
                     .join("");
                 lines.push(format!("[{role_label}] {text}"));
             }
-            Item::ToolCall {
-                name, arguments, ..
-            } => {
-                lines.push(format!("[ToolCall] {name}({arguments})"));
+            Item::ToolCall { name, .. } => {
+                lines.push(format!("[ToolCall] {name}"));
             }
-            Item::ToolResult {
-                summary, content, ..
-            } => match content {
-                Some(c) => lines.push(format!("[ToolResult] {summary}\n{c}")),
-                None => lines.push(format!("[ToolResult] {summary}")),
-            },
-            Item::Reasoning { text, .. } => {
-                lines.push(format!("[Reasoning] {text}"));
+            Item::ToolResult { summary, .. } => {
+                lines.push(format!("[ToolResult] {summary}"));
             }
+            Item::Reasoning { .. } => {}
         }
     }
     lines.join("\n\n")
@@ -1196,4 +1196,57 @@ fn current_pwd() -> Result<PathBuf, PodError> {
         pwd: cwd,
         source,
     })
+}
+
+#[cfg(test)]
+mod build_summary_prompt_tests {
+    use super::*;
+
+    #[test]
+    fn strips_tool_call_arguments() {
+        let items = vec![Item::tool_call_json(
+            "call-1",
+            "read_file",
+            serde_json::json!({ "path": "src/main.rs" }),
+        )];
+        let prompt = build_summary_prompt(&items);
+        assert_eq!(prompt, "[ToolCall] read_file");
+        assert!(!prompt.contains("src/main.rs"));
+    }
+
+    #[test]
+    fn strips_tool_result_content() {
+        let items = vec![Item::tool_result_with_content(
+            "call-1",
+            "read 3 lines",
+            "fn main() { println!(\"hello\"); }",
+        )];
+        let prompt = build_summary_prompt(&items);
+        assert_eq!(prompt, "[ToolResult] read 3 lines");
+        assert!(!prompt.contains("println"));
+    }
+
+    #[test]
+    fn drops_reasoning_entirely() {
+        let items = vec![
+            Item::user_message("hi"),
+            Item::reasoning("internal deliberation"),
+            Item::assistant_message("hello"),
+        ];
+        let prompt = build_summary_prompt(&items);
+        assert!(prompt.contains("[User] hi"));
+        assert!(prompt.contains("[Assistant] hello"));
+        assert!(!prompt.contains("Reasoning"));
+        assert!(!prompt.contains("deliberation"));
+    }
+
+    #[test]
+    fn keeps_user_and_assistant_messages() {
+        let items = vec![
+            Item::user_message("fix the bug"),
+            Item::assistant_message("done"),
+        ];
+        let prompt = build_summary_prompt(&items);
+        assert_eq!(prompt, "[User] fix the bug\n\n[Assistant] done");
+    }
 }
