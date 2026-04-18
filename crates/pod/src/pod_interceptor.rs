@@ -24,6 +24,7 @@ use crate::hook::{
     AbortInfo, HookRegistry, PreRequestInfo, PromptSubmitInfo, ToolCallSummary, ToolResultSummary,
     TurnEndInfo,
 };
+use crate::notification_buffer::{NotificationBuffer, format_notification};
 
 /// Maximum number of bytes copied into `TurnEndInfo::final_text_preview`.
 const FINAL_TEXT_PREVIEW_LIMIT: usize = 512;
@@ -31,6 +32,9 @@ const FINAL_TEXT_PREVIEW_LIMIT: usize = 512;
 pub(crate) struct PodInterceptor {
     registry: Arc<HookRegistry>,
     compact_state: Option<Arc<CompactState>>,
+    /// Pending-notification buffer drained into the per-request
+    /// context at the head of `pre_llm_request`.
+    pending_notifications: NotificationBuffer,
     /// Next turn index assigned by `on_prompt_submit`.
     next_turn_index: AtomicUsize,
     /// Tool calls observed in the current turn (reset on each new prompt).
@@ -41,10 +45,12 @@ impl PodInterceptor {
     pub(crate) fn new(
         registry: Arc<HookRegistry>,
         compact_state: Option<Arc<CompactState>>,
+        pending_notifications: NotificationBuffer,
     ) -> Self {
         Self {
             registry,
             compact_state,
+            pending_notifications,
             next_turn_index: AtomicUsize::new(0),
             tool_calls_this_turn: AtomicUsize::new(0),
         }
@@ -87,6 +93,14 @@ impl Interceptor for PodInterceptor {
                 );
                 return PreRequestAction::Yield;
             }
+        }
+
+        // Internal mechanism: drain pending `Method::Notify` notifications
+        // into the per-request context as transient system messages.
+        // These are not persisted to the Worker history; they exist only
+        // for this single LLM request.
+        for notification in self.pending_notifications.drain() {
+            context.push(format_notification(&notification));
         }
 
         let info = PreRequestInfo {
@@ -226,7 +240,7 @@ mod tests {
         let state = Arc::new(CompactState::new(100, 2));
         state.update_input_tokens(200); // exceeds turn threshold
 
-        let interceptor = PodInterceptor::new(registry, Some(state));
+        let interceptor = PodInterceptor::new(registry, Some(state), NotificationBuffer::new());
         let mut ctx: Vec<Item> = vec![Item::user_message("hi")];
         let action = interceptor.pre_llm_request(&mut ctx).await;
 
@@ -243,7 +257,7 @@ mod tests {
         let state = Arc::new(CompactState::new(100, 2));
         // last_input_tokens stays at 0, well below threshold.
 
-        let interceptor = PodInterceptor::new(registry, Some(state));
+        let interceptor = PodInterceptor::new(registry, Some(state), NotificationBuffer::new());
         let mut ctx: Vec<Item> = vec![Item::user_message("hi")];
         let action = interceptor.pre_llm_request(&mut ctx).await;
 
@@ -256,7 +270,7 @@ mod tests {
         let count = Arc::new(AtomicUsize::new(0));
         let registry = registry_with_pre_llm_hook(count.clone());
 
-        let interceptor = PodInterceptor::new(registry, None);
+        let interceptor = PodInterceptor::new(registry, None, NotificationBuffer::new());
         let mut ctx: Vec<Item> = Vec::new();
         let action = interceptor.pre_llm_request(&mut ctx).await;
 
@@ -275,6 +289,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pre_llm_request_drains_pending_notifications_into_context() {
+        let registry = Arc::new(HookRegistryBuilder::new().build());
+        let buffer = NotificationBuffer::new();
+        buffer.push("child-a".into(), "first".into());
+        buffer.push("child-b".into(), "second".into());
+
+        let interceptor = PodInterceptor::new(registry, None, buffer.clone());
+        let mut ctx: Vec<Item> = vec![Item::user_message("hi")];
+        let action = interceptor.pre_llm_request(&mut ctx).await;
+
+        assert!(matches!(action, PreRequestAction::Continue));
+        // Original user message preserved, two notifications appended in order.
+        assert_eq!(ctx.len(), 3);
+        let second = ctx[1].as_text().unwrap_or_default();
+        let third = ctx[2].as_text().unwrap_or_default();
+        assert!(second.contains("[Notification from child-a]"));
+        assert!(second.contains("first"));
+        assert!(third.contains("[Notification from child-b]"));
+        assert!(third.contains("second"));
+        // Buffer is drained after a single pre_llm_request call.
+        assert!(buffer.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pre_llm_request_skips_notification_injection_when_yielding() {
+        // When compaction yields, notifications remain in the buffer for
+        // the next pre_llm_request (after compaction + resume).
+        let registry = Arc::new(HookRegistryBuilder::new().build());
+        let buffer = NotificationBuffer::new();
+        buffer.push("src".into(), "msg".into());
+
+        let state = Arc::new(CompactState::new(100, 2));
+        state.update_input_tokens(200);
+
+        let interceptor = PodInterceptor::new(registry, Some(state), buffer.clone());
+        let mut ctx: Vec<Item> = Vec::new();
+        let action = interceptor.pre_llm_request(&mut ctx).await;
+
+        assert!(matches!(action, PreRequestAction::Yield));
+        assert!(ctx.is_empty());
+        assert_eq!(buffer.len(), 1);
+    }
+
+    #[tokio::test]
     async fn pre_llm_request_short_circuits_on_first_non_continue() {
         let first_called = Arc::new(AtomicBool::new(false));
         let second_count = Arc::new(AtomicUsize::new(0));
@@ -283,7 +341,7 @@ mod tests {
         builder.add_pre_llm_request(CountingHook(second_count.clone()));
         let registry = Arc::new(builder.build());
 
-        let interceptor = PodInterceptor::new(registry, None);
+        let interceptor = PodInterceptor::new(registry, None, NotificationBuffer::new());
         let mut ctx: Vec<Item> = Vec::new();
         let action = interceptor.pre_llm_request(&mut ctx).await;
 

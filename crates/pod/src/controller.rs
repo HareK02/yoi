@@ -6,6 +6,7 @@ use llm_worker::llm_client::client::LlmClient;
 use session_store::Store;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
+use crate::notification_buffer::NotificationBuffer;
 use crate::notifier::Notifier;
 use crate::pod::{Pod, PodError, PodRunResult};
 use crate::runtime_dir::RuntimeDir;
@@ -203,8 +204,12 @@ impl PodController {
             pod.attach_tracker(tracker);
         }
 
-        // Clone cancel sender before moving pod
+        // Clone cancel sender and notification buffer before moving pod
+        // into the controller task so the main loop can route
+        // `Method::Notify` into the buffer even while `pod` is held by
+        // an in-flight `run_for_notification` / `run` future.
         let cancel_tx = pod.worker_mut().cancel_sender();
+        let notification_buffer = pod.notification_buffer_handle();
 
         tokio::spawn(async move {
             // Hold socket server alive for the lifetime of the controller task
@@ -234,6 +239,54 @@ impl PodController {
                             &event_tx,
                             &cancel_tx,
                             &shared_state,
+                            &notification_buffer,
+                        )
+                        .await;
+
+                        if new_status == PodStatus::Idle {
+                            if let Err(e) = pod.try_post_run_compact().await {
+                                tracing::warn!(error = %e, "Post-run compaction error");
+                                notifier.notify(
+                                    NotificationLevel::Warn,
+                                    NotificationSource::Compactor,
+                                    format!("post-run compaction error: {e}"),
+                                );
+                            }
+                        }
+
+                        let items = pod.worker().history().to_vec();
+                        shared_state.update_history(items);
+                        shared_state.set_status(new_status);
+                        let _ = runtime_dir.write_status(&shared_state).await;
+                        let _ = runtime_dir.write_history(&shared_state).await;
+
+                        if shutdown {
+                            let _ = event_tx.send(Event::Shutdown);
+                            break;
+                        }
+                    }
+
+                    Method::Notify { source, message } => {
+                        pod.push_notification(source, message);
+                        if shared_state.get_status() != PodStatus::Idle {
+                            // RUNNING / Paused: the buffer push is the
+                            // entire operation; the in-flight turn (or
+                            // next Resume) will drain the buffer at its
+                            // next pre_llm_request.
+                            continue;
+                        }
+                        // IDLE: auto-start a turn so the LLM sees the
+                        // buffered notification(s) without a human Run.
+                        shared_state.set_status(PodStatus::Running);
+                        let _ = runtime_dir.write_status(&shared_state).await;
+
+                        let (new_status, shutdown) = run_with_cancel_support(
+                            pod.run_for_notification(),
+                            &mut method_rx,
+                            &event_tx,
+                            &cancel_tx,
+                            &shared_state,
+                            &notification_buffer,
                         )
                         .await;
 
@@ -277,6 +330,7 @@ impl PodController {
                             &event_tx,
                             &cancel_tx,
                             &shared_state,
+                            &notification_buffer,
                         )
                         .await;
 
@@ -337,6 +391,7 @@ async fn run_with_cancel_support<F>(
     event_tx: &broadcast::Sender<Event>,
     cancel_tx: &mpsc::Sender<()>,
     shared_state: &Arc<PodSharedState>,
+    notification_buffer: &NotificationBuffer,
 ) -> (PodStatus, bool)
 where
     F: std::future::Future<Output = Result<PodRunResult, PodError>>,
@@ -381,6 +436,11 @@ where
                             code: ErrorCode::AlreadyRunning,
                             message: "Pod is already executing a turn".into(),
                         });
+                    }
+                    Some(Method::Notify { source, message }) => {
+                        // Route into the buffer; the in-flight turn will
+                        // drain it at its next pre_llm_request.
+                        notification_buffer.push(source, message);
                     }
                     Some(Method::GetHistory) => {}
                     None => {

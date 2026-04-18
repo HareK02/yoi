@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 #[serde(tag = "method", content = "params", rename_all = "snake_case")]
 pub enum Method {
     Run { input: String },
+    Notify { source: String, message: String },
     Resume,
     Cancel,
     Shutdown,
@@ -190,6 +191,19 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["event"], "run_end");
         assert_eq!(parsed["data"]["result"], "limit_reached");
+    }
+
+    #[test]
+    fn method_notify_json_roundtrip() {
+        let json = r#"{"method":"notify","params":{"source":"child-pod","message":"turn done"}}"#;
+        let method: Method = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            method,
+            Method::Notify { ref source, ref message }
+            if source == "child-pod" && message == "turn done"
+        ));
+        let serialized = serde_json::to_string(&method).unwrap();
+        assert_eq!(serialized, json);
     }
 
     #[test]

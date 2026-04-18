@@ -1,5 +1,5 @@
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
@@ -19,6 +19,7 @@ use pod::{Event, Method, Pod, PodController, PodManifest, PodStatus};
 struct MockClient {
     responses: Arc<Vec<Vec<LlmEvent>>>,
     call_count: Arc<AtomicUsize>,
+    captured: Arc<Mutex<Vec<Request>>>,
 }
 
 impl MockClient {
@@ -26,7 +27,12 @@ impl MockClient {
         Self {
             responses: Arc::new(vec![events]),
             call_count: Arc::new(AtomicUsize::new(0)),
+            captured: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    fn captured_requests(&self) -> Vec<Request> {
+        self.captured.lock().unwrap().clone()
     }
 }
 
@@ -38,9 +44,10 @@ impl LlmClient for MockClient {
 
     async fn stream(
         &self,
-        _request: Request,
+        request: Request,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<LlmEvent, ClientError>> + Send>>, ClientError>
     {
+        self.captured.lock().unwrap().push(request);
         let count = self.call_count.fetch_add(1, Ordering::SeqCst);
         if count >= self.responses.len() {
             return Err(ClientError::Api {
@@ -327,6 +334,101 @@ async fn cancel_without_run_returns_error() {
     }
 
     assert!(saw_not_running, "should see not_running error");
+}
+
+#[tokio::test]
+async fn notify_while_idle_auto_starts_turn_and_injects_system_message() {
+    let client = MockClient::new(simple_text_events());
+    let client_for_assert = client.clone();
+    let pod = make_pod(client).await;
+    let handle = spawn_controller(pod).await;
+    let mut rx = handle.subscribe();
+
+    handle
+        .send(Method::Notify {
+            source: "child-a".into(),
+            message: "turn finished".into(),
+        })
+        .await
+        .unwrap();
+
+    // Wait for the auto-started turn to complete.
+    let mut saw_turn_end = false;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        tokio::select! {
+            event = rx.recv() => {
+                match event {
+                    Ok(Event::TurnEnd { .. }) => { saw_turn_end = true; break; }
+                    Err(_) => break,
+                    _ => {}
+                }
+            }
+            _ = tokio::time::sleep_until(deadline) => break,
+        }
+    }
+    assert!(saw_turn_end, "auto-triggered turn should complete");
+    // Status flips back to Idle on the controller thread after RunEnd.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(handle.shared_state.get_status(), PodStatus::Idle);
+
+    // Exactly one request was made; it must contain the formatted
+    // notification as the last item (injected into request_context by
+    // PodInterceptor::pre_llm_request).
+    let requests = client_for_assert.captured_requests();
+    assert_eq!(requests.len(), 1, "one LLM call expected");
+    let last_item_text = requests[0]
+        .items
+        .last()
+        .and_then(|i| i.as_text())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        last_item_text.contains("[Notification from child-a]"),
+        "injected system message missing, got: {last_item_text:?}"
+    );
+    assert!(last_item_text.contains("turn finished"));
+    assert!(last_item_text.contains("not a blocking request"));
+}
+
+#[tokio::test]
+async fn notify_while_running_does_not_emit_already_running_error() {
+    let client = MockClient::new(simple_text_events());
+    let pod = make_pod(client).await;
+    let handle = spawn_controller(pod).await;
+    let mut rx = handle.subscribe();
+
+    handle
+        .send(Method::Run {
+            input: "start".into(),
+        })
+        .await
+        .unwrap();
+    handle
+        .send(Method::Notify {
+            source: "child".into(),
+            message: "ping".into(),
+        })
+        .await
+        .unwrap();
+
+    // Drain events until the run ends; AlreadyRunning must never appear.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        tokio::select! {
+            event = rx.recv() => {
+                match event {
+                    Ok(Event::Error { code, .. }) if code == pod::ErrorCode::AlreadyRunning => {
+                        panic!("Notify while running must not produce AlreadyRunning");
+                    }
+                    Ok(Event::TurnEnd { .. }) => break,
+                    Err(_) => break,
+                    _ => {}
+                }
+            }
+            _ = tokio::time::sleep_until(deadline) => break,
+        }
+    }
 }
 
 #[tokio::test]

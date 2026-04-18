@@ -8,6 +8,7 @@ pub mod socket_server;
 mod agents_md;
 mod compact_state;
 mod factory;
+mod notification_buffer;
 mod pod;
 mod pod_interceptor;
 mod prompt_loader;

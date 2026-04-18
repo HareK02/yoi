@@ -19,6 +19,7 @@ use crate::hook::{
     Hook, HookRegistryBuilder, OnAbort, OnPromptSubmit, OnTurnEnd, PostToolCall, PreLlmRequest,
     PreRequestInfo, PreToolCall,
 };
+use crate::notification_buffer::NotificationBuffer;
 use crate::notifier::Notifier;
 use crate::pod_interceptor::PodInterceptor;
 use crate::prompt_loader::PromptLoader;
@@ -100,6 +101,10 @@ pub struct Pod<C: LlmClient, St: Store> {
     /// User-facing notification sink attached by the Controller at
     /// spawn time. `None` in tests / direct `Pod::new` usage.
     notifier: Option<Notifier>,
+    /// Queue of pending `Method::Notify` notifications awaiting
+    /// injection into the next LLM request. Shared with the
+    /// PodInterceptor installed in `ensure_interceptor_installed`.
+    pending_notifications: NotificationBuffer,
 }
 
 impl<C: LlmClient, St: Store> Pod<C, St> {
@@ -140,6 +145,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             tracker: None,
             system_prompt_template: None,
             notifier: None,
+            pending_notifications: NotificationBuffer::new(),
         };
         pod.apply_prune_from_manifest();
         Ok(pod)
@@ -188,6 +194,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             tracker: None,
             system_prompt_template: None,
             notifier: None,
+            pending_notifications: NotificationBuffer::new(),
         };
         pod.apply_prune_from_manifest();
         Ok(pod)
@@ -293,6 +300,23 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         }
     }
 
+    /// Push a `Method::Notify` entry onto the pending buffer.
+    ///
+    /// The notification will be injected as an `Item::system_message`
+    /// into the next outgoing LLM request context (not into history).
+    /// See [`NotificationBuffer`] for overflow behaviour.
+    pub fn push_notification(&self, source: String, message: String) {
+        self.pending_notifications.push(source, message);
+    }
+
+    /// Shared handle to the pending notification buffer.
+    ///
+    /// The Controller holds a clone so that `Method::Notify` arriving
+    /// while `pod.run()` is in flight can still reach the interceptor.
+    pub fn notification_buffer_handle(&self) -> NotificationBuffer {
+        self.pending_notifications.clone()
+    }
+
     // --- Hook registration ---
 
     fn assert_hooks_open(&self) {
@@ -388,7 +412,8 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 None
             };
 
-            let interceptor = PodInterceptor::new(registry, compact_state);
+            let interceptor =
+                PodInterceptor::new(registry, compact_state, self.pending_notifications.clone());
             self.worker_mut().set_interceptor(interceptor);
             self.interceptor_installed = true;
         }
@@ -457,6 +482,29 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         let worker = self.worker.take().expect("worker taken during run");
         let mut locked = worker.lock();
         let result = locked.run(input).await;
+        self.worker = Some(locked.unlock());
+
+        self.handle_worker_result(result, history_before).await
+    }
+
+    /// Run a turn triggered by `Method::Notify` while the Pod is idle.
+    ///
+    /// Unlike [`run`](Self::run), no user message is appended to
+    /// history. The `PodInterceptor::pre_llm_request` drains the
+    /// pending-notification buffer and injects each entry as an
+    /// `Item::system_message` into the per-request context, then the
+    /// Worker's resume path issues the LLM request without a new
+    /// user turn.
+    pub async fn run_for_notification(&mut self) -> Result<PodRunResult, PodError> {
+        self.ensure_interceptor_installed();
+        self.ensure_system_prompt_materialized()?;
+        self.ensure_session_head().await?;
+
+        let history_before = self.worker.as_ref().unwrap().history().len();
+
+        let worker = self.worker.take().expect("worker taken during run");
+        let mut locked = worker.lock();
+        let result = locked.resume().await;
         self.worker = Some(locked.unlock());
 
         self.handle_worker_result(result, history_before).await
@@ -861,6 +909,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             tracker: None,
             system_prompt_template,
             notifier: None,
+            pending_notifications: NotificationBuffer::new(),
         };
         pod.apply_prune_from_manifest();
         Ok(pod)
