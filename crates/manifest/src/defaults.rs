@@ -18,9 +18,11 @@ pub const PRUNE_PROTECTED_TURNS: usize = 3;
 /// [`crate::CompactionConfig::prune_min_savings`].
 pub const PRUNE_MIN_SAVINGS: u64 = 4096;
 
-/// Number of most-recent turns retained after a compact. See
-/// [`crate::CompactionConfig::compact_retained_turns`].
-pub const COMPACT_RETAINED_TURNS: usize = 2;
+/// Token budget retained (unchanged) at the tail of the history across
+/// a compact. Items whose cumulative token count fits within this budget
+/// starting from the end are kept verbatim; the rest are summarised.
+/// See [`crate::CompactionConfig::compact_retained_tokens`].
+pub const COMPACT_RETAINED_TOKENS: u64 = 8000;
 
 /// Default instruction asset reference used when `worker.instruction`
 /// is omitted. See the `PromptLoader` prefix addressing scheme for the

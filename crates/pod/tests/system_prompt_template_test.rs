@@ -250,7 +250,7 @@ async fn agents_md_not_reread_after_compact() {
     // Mutate the file after the first turn — must not affect the cached
     // system prompt either on a subsequent turn or across compaction.
     std::fs::write(&agents_path, "mutated").unwrap();
-    pod.compact(1).await.unwrap();
+    pod.compact(0).await.unwrap();
     let after_compact = pod.worker().get_system_prompt().unwrap().to_string();
     assert!(after_compact.contains("original"));
     assert!(!after_compact.contains("mutated"));
@@ -277,7 +277,7 @@ async fn compact_preserves_system_prompt() {
     let before = pod.worker().get_system_prompt().unwrap().to_string();
     pod.run("second").await.unwrap();
 
-    pod.compact(1).await.unwrap();
+    pod.compact(0).await.unwrap();
 
     let after = pod.worker().get_system_prompt().unwrap().to_string();
     assert_eq!(before, after);

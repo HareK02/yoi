@@ -195,9 +195,11 @@ pub struct CompactionConfig {
     #[serde(default)]
     pub compact_request_threshold: Option<u64>,
 
-    /// Number of recent turns retained after compaction.
-    #[serde(default = "default_compact_retained_turns")]
-    pub compact_retained_turns: usize,
+    /// Token budget retained verbatim at the tail of the history after
+    /// compaction. Measured against the occupancy estimate from
+    /// `UsageRecord` history; turn boundaries are ignored.
+    #[serde(default = "default_compact_retained_tokens")]
+    pub compact_retained_tokens: u64,
 
     /// Optional provider for the compactor (summary) LLM.
     /// If omitted, the main provider is cloned via `clone_boxed()`.
@@ -211,8 +213,8 @@ fn default_prune_protected_turns() -> usize {
 fn default_prune_min_savings() -> u64 {
     defaults::PRUNE_MIN_SAVINGS
 }
-fn default_compact_retained_turns() -> usize {
-    defaults::COMPACT_RETAINED_TURNS
+fn default_compact_retained_tokens() -> u64 {
+    defaults::COMPACT_RETAINED_TOKENS
 }
 
 impl Default for CompactionConfig {
@@ -222,7 +224,7 @@ impl Default for CompactionConfig {
             prune_min_savings: default_prune_min_savings(),
             compact_threshold: None,
             compact_request_threshold: None,
-            compact_retained_turns: default_compact_retained_turns(),
+            compact_retained_tokens: default_compact_retained_tokens(),
             provider: None,
         }
     }
@@ -357,7 +359,7 @@ model = "claude-sonnet-4-20250514"
         assert_eq!(c.prune_min_savings, 4096);
         assert_eq!(c.compact_threshold, Some(80000));
         assert_eq!(c.compact_request_threshold, None);
-        assert_eq!(c.compact_retained_turns, 2);
+        assert_eq!(c.compact_retained_tokens, 8000);
     }
 
     #[test]

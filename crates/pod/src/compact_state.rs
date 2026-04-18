@@ -25,8 +25,8 @@ pub(crate) struct CompactState {
     /// Between-requests threshold (safety net). Checked inside a turn
     /// before each LLM request. `None` disables the request check.
     request_threshold: Option<u64>,
-    /// Number of recent turns to retain after compaction.
-    retained_turns: usize,
+    /// Token budget retained verbatim at the tail after compaction.
+    retained_tokens: u64,
     /// Consecutive compact failures. At `MAX_COMPACT_FAILURES`, compaction is disabled.
     consecutive_failures: AtomicUsize,
     /// `true` immediately after a successful compact, cleared on next normal completion.
@@ -39,12 +39,12 @@ impl CompactState {
     pub(crate) fn new(
         post_run_threshold: Option<u64>,
         request_threshold: Option<u64>,
-        retained_turns: usize,
+        retained_tokens: u64,
     ) -> Self {
         Self {
             post_run_threshold,
             request_threshold,
-            retained_turns,
+            retained_tokens,
             consecutive_failures: AtomicUsize::new(0),
             just_compacted: AtomicBool::new(false),
             disabled: AtomicBool::new(false),
@@ -56,9 +56,9 @@ impl CompactState {
         self.request_threshold
     }
 
-    /// Number of turns to retain after compaction.
-    pub(crate) fn retained_turns(&self) -> usize {
-        self.retained_turns
+    /// Token budget retained verbatim at the tail after compaction.
+    pub(crate) fn retained_tokens(&self) -> u64 {
+        self.retained_tokens
     }
 
     /// Whether compaction has been disabled by the circuit breaker.
@@ -115,7 +115,7 @@ mod tests {
     fn both_thresholds_configured() {
         let state = CompactState::new(Some(80_000), Some(90_000), 2);
         assert_eq!(state.request_threshold(), Some(90_000));
-        assert_eq!(state.retained_turns(), 2);
+        assert_eq!(state.retained_tokens(), 2);
 
         assert!(!state.exceeds_request(70_000));
         assert!(!state.exceeds_post_run(70_000));

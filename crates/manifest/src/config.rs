@@ -86,7 +86,7 @@ pub struct CompactionConfigPartial {
     #[serde(default)]
     pub compact_request_threshold: Option<u64>,
     #[serde(default)]
-    pub compact_retained_turns: Option<usize>,
+    pub compact_retained_tokens: Option<u64>,
     #[serde(default)]
     pub provider: Option<ProviderConfigPartial>,
 }
@@ -241,9 +241,9 @@ impl CompactionConfigPartial {
             compact_request_threshold: upper
                 .compact_request_threshold
                 .or(self.compact_request_threshold),
-            compact_retained_turns: upper
-                .compact_retained_turns
-                .or(self.compact_retained_turns),
+            compact_retained_tokens: upper
+                .compact_retained_tokens
+                .or(self.compact_retained_tokens),
             provider: merge_option(self.provider, upper.provider, ProviderConfigPartial::merge),
         }
     }
@@ -371,9 +371,9 @@ impl TryFrom<PodManifestConfig> for PodManifest {
                         .unwrap_or(defaults::PRUNE_MIN_SAVINGS),
                     compact_threshold: c.compact_threshold,
                     compact_request_threshold: c.compact_request_threshold,
-                    compact_retained_turns: c
-                        .compact_retained_turns
-                        .unwrap_or(defaults::COMPACT_RETAINED_TURNS),
+                    compact_retained_tokens: c
+                        .compact_retained_tokens
+                        .unwrap_or(defaults::COMPACT_RETAINED_TOKENS),
                     provider: comp_provider,
                 })
             })

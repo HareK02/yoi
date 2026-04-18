@@ -415,10 +415,10 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                     (
                         c.compact_threshold,
                         c.compact_request_threshold,
-                        c.compact_retained_turns,
+                        c.compact_retained_tokens,
                     )
                 })
-                .unwrap_or((None, None, 2));
+                .unwrap_or((None, None, manifest::defaults::COMPACT_RETAINED_TOKENS));
 
             let tracker_for_usage = self.usage_tracker.clone();
             self.worker_mut().on_usage(move |event| {
@@ -648,8 +648,8 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             let retained = self
                 .compact_state
                 .as_ref()
-                .map(|s| s.retained_turns())
-                .unwrap_or(2);
+                .map(|s| s.retained_tokens())
+                .unwrap_or(manifest::defaults::COMPACT_RETAINED_TOKENS);
 
             match self.compact(retained).await {
                 Ok(new_session_id) => {
@@ -691,7 +691,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             return Ok(());
         }
 
-        let retained = state.retained_turns();
+        let retained = state.retained_tokens();
         match self.compact(retained).await {
             Ok(new_session_id) => {
                 info!(
@@ -791,24 +791,15 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     /// - a clone of the main LlmClient via `clone_boxed()`.
     ///
     /// Returns the new session ID.
-    pub async fn compact(&mut self, retained_turns: usize) -> Result<SessionId, PodError> {
+    pub async fn compact(&mut self, retained_tokens: u64) -> Result<SessionId, PodError> {
+        // Decide the cut point by projecting the UsageRecord timeline onto
+        // the current history: keep the tail whose estimated token count is
+        // within `retained_tokens`. Item-granular, turn boundaries ignored.
+        let cut = self.split_for_retained(retained_tokens);
+
         let worker = self.worker.as_ref().expect("worker taken during run");
         let history = worker.history();
-
-        // Identify turn boundaries (user message positions).
-        let turn_starts: Vec<usize> = history
-            .iter()
-            .enumerate()
-            .filter(|(_, item)| item.is_user_message())
-            .map(|(i, _)| i)
-            .collect();
-
-        // Items to retain: everything from `retained_turns` turns ago onward.
-        let retain_from = if turn_starts.len() > retained_turns {
-            turn_starts[turn_starts.len() - retained_turns]
-        } else {
-            0
-        };
+        let retain_from = cut.index.min(history.len());
         let retained_items = history[retain_from..].to_vec();
         let items_to_summarise = &history[..retain_from];
 
