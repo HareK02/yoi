@@ -113,9 +113,9 @@ mod tests {
 
     #[test]
     fn both_thresholds_configured() {
-        let state = CompactState::new(Some(80_000), Some(90_000), 2);
+        let state = CompactState::new(Some(80_000), Some(90_000), 8_000);
         assert_eq!(state.request_threshold(), Some(90_000));
-        assert_eq!(state.retained_tokens(), 2);
+        assert_eq!(state.retained_tokens(), 8_000);
 
         assert!(!state.exceeds_request(70_000));
         assert!(!state.exceeds_post_run(70_000));
@@ -129,7 +129,7 @@ mod tests {
 
     #[test]
     fn post_run_only() {
-        let state = CompactState::new(Some(80_000), None, 2);
+        let state = CompactState::new(Some(80_000), None, 8_000);
         // request check always false when threshold is None.
         assert!(!state.exceeds_request(1_000_000));
         assert!(state.exceeds_post_run(85_000));
@@ -137,21 +137,21 @@ mod tests {
 
     #[test]
     fn request_only() {
-        let state = CompactState::new(None, Some(90_000), 2);
+        let state = CompactState::new(None, Some(90_000), 8_000);
         assert!(!state.exceeds_post_run(1_000_000));
         assert!(state.exceeds_request(95_000));
     }
 
     #[test]
     fn both_none_disables_all_checks() {
-        let state = CompactState::new(None, None, 2);
+        let state = CompactState::new(None, None, 8_000);
         assert!(!state.exceeds_request(1_000_000));
         assert!(!state.exceeds_post_run(1_000_000));
     }
 
     #[test]
     fn circuit_breaker_trips_after_max_failures() {
-        let state = CompactState::new(Some(80_000), Some(90_000), 2);
+        let state = CompactState::new(Some(80_000), Some(90_000), 8_000);
         assert!(!state.is_disabled());
 
         state.record_compact_failure();
@@ -164,7 +164,7 @@ mod tests {
 
     #[test]
     fn success_resets_failure_count() {
-        let state = CompactState::new(Some(80_000), Some(90_000), 2);
+        let state = CompactState::new(Some(80_000), Some(90_000), 8_000);
         state.record_compact_failure();
         state.record_compact_failure();
         assert!(!state.is_disabled());
@@ -179,7 +179,7 @@ mod tests {
 
     #[test]
     fn just_compacted_lifecycle() {
-        let state = CompactState::new(Some(80_000), Some(90_000), 2);
+        let state = CompactState::new(Some(80_000), Some(90_000), 8_000);
         assert!(!state.just_compacted());
 
         state.record_compact_success();
