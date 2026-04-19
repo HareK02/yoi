@@ -2,7 +2,11 @@
 //!
 //! Example of cancelling from another thread during streaming
 
-use llm_worker::llm_client::providers::anthropic::AnthropicClient;
+use llm_worker::llm_client::capability::{
+    CacheStrategy, ModelCapability, StructuredOutput, ToolCallingSupport,
+};
+use llm_worker::llm_client::scheme::{Scheme, anthropic::AnthropicScheme};
+use llm_worker::llm_client::transport::{HttpTransport, ResolvedAuth};
 use llm_worker::{Worker, WorkerResult};
 use std::time::Duration;
 
@@ -22,7 +26,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let api_key =
         std::env::var("ANTHROPIC_API_KEY").expect("ANTHROPIC_API_KEY environment variable not set");
 
-    let client = AnthropicClient::new(&api_key, "claude-sonnet-4-20250514");
+    let scheme = AnthropicScheme::new();
+    let model = "claude-sonnet-4-20250514".to_string();
+    let cap = scheme.capability_for(&model).unwrap_or(ModelCapability {
+        tool_calling: ToolCallingSupport::Parallel,
+        structured_output: StructuredOutput::JsonSchema,
+        reasoning: None,
+        vision: false,
+        prompt_caching: CacheStrategy::Auto,
+    });
+    let base_url = scheme.default_base_url().to_string();
+    let client = HttpTransport::new(scheme, model, base_url, ResolvedAuth::ApiKey(api_key), cap);
     let worker = Worker::new(client);
 
     println!("🚀 Starting Worker...");

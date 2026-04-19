@@ -44,10 +44,11 @@ use llm_worker::{
     interceptor::{Interceptor, PostToolAction, ToolResultInfo},
     llm_client::{
         LlmClient,
-        providers::{
-            anthropic::AnthropicClient, gemini::GeminiClient, ollama::OllamaClient,
-            openai::OpenAIClient,
+        capability::{CacheStrategy, ModelCapability, StructuredOutput, ToolCallingSupport},
+        scheme::{
+            Scheme, anthropic::AnthropicScheme, gemini::GeminiScheme, openai_chat::OpenAIScheme,
         },
+        transport::{HttpTransport, ResolvedAuth},
     },
     timeline::{Handler, TextBlockEvent, TextBlockKind, ToolUseBlockEvent, ToolUseBlockKind},
 };
@@ -327,6 +328,28 @@ fn get_api_key(args: &Args) -> Result<String, String> {
 }
 
 /// Create client based on provider
+fn default_capability() -> ModelCapability {
+    ModelCapability {
+        tool_calling: ToolCallingSupport::Parallel,
+        structured_output: StructuredOutput::JsonSchema,
+        reasoning: None,
+        vision: false,
+        prompt_caching: CacheStrategy::Auto,
+    }
+}
+
+fn build_transport<S: Scheme>(
+    scheme: S,
+    model: String,
+    auth: ResolvedAuth,
+) -> Box<dyn LlmClient> {
+    let cap = scheme
+        .capability_for(&model)
+        .unwrap_or_else(default_capability);
+    let base_url = scheme.default_base_url().to_string();
+    Box::new(HttpTransport::new(scheme, model, base_url, auth, cap))
+}
+
 fn create_client(args: &Args) -> Result<Box<dyn LlmClient>, String> {
     let model = args
         .model
@@ -336,21 +359,32 @@ fn create_client(args: &Args) -> Result<Box<dyn LlmClient>, String> {
     let api_key = get_api_key(args)?;
 
     match args.provider {
-        Provider::Anthropic => {
-            let client = AnthropicClient::new(&api_key, &model);
-            Ok(Box::new(client))
-        }
-        Provider::Gemini => {
-            let client = GeminiClient::new(&api_key, &model);
-            Ok(Box::new(client))
-        }
-        Provider::Openai => {
-            let client = OpenAIClient::new(&api_key, &model);
-            Ok(Box::new(client))
-        }
+        Provider::Anthropic => Ok(build_transport(
+            AnthropicScheme::new(),
+            model,
+            ResolvedAuth::ApiKey(api_key),
+        )),
+        Provider::Gemini => Ok(build_transport(
+            GeminiScheme::new(),
+            model,
+            ResolvedAuth::ApiKey(api_key),
+        )),
+        Provider::Openai => Ok(build_transport(
+            OpenAIScheme::new(),
+            model,
+            ResolvedAuth::ApiKey(api_key),
+        )),
         Provider::Ollama => {
-            let client = OllamaClient::new(&model);
-            Ok(Box::new(client))
+            // Ollama = Anthropic scheme + base_url 差し替え + 認証なし
+            let scheme = AnthropicScheme::new();
+            let cap = default_capability();
+            Ok(Box::new(HttpTransport::new(
+                scheme,
+                model,
+                "http://localhost:11434".to_string(),
+                ResolvedAuth::None,
+                cap,
+            )))
         }
     }
 }

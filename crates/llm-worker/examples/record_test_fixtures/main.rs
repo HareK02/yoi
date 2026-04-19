@@ -20,9 +20,35 @@ mod recorder;
 mod scenarios;
 
 use clap::{Parser, ValueEnum};
-use llm_worker::llm_client::providers::anthropic::AnthropicClient;
-use llm_worker::llm_client::providers::gemini::GeminiClient;
-use llm_worker::llm_client::providers::openai::OpenAIClient;
+use llm_worker::llm_client::capability::{
+    CacheStrategy, ModelCapability, StructuredOutput, ToolCallingSupport,
+};
+use llm_worker::llm_client::scheme::{
+    Scheme, anthropic::AnthropicScheme, gemini::GeminiScheme, openai_chat::OpenAIScheme,
+};
+use llm_worker::llm_client::transport::{HttpTransport, ResolvedAuth};
+
+/// 既定の capability: fixture 記録には cache_control を付けない
+/// （既知モデルの静的テーブルを経由すると scheme 毎に自動設定される）。
+fn fallback_capability() -> ModelCapability {
+    ModelCapability {
+        tool_calling: ToolCallingSupport::Parallel,
+        structured_output: StructuredOutput::JsonSchema,
+        reasoning: None,
+        vision: false,
+        prompt_caching: CacheStrategy::Auto,
+    }
+}
+
+fn make_transport<S: Scheme>(
+    scheme: S,
+    model: &str,
+    auth: ResolvedAuth,
+) -> HttpTransport<S> {
+    let cap = scheme.capability_for(model).unwrap_or_else(fallback_capability);
+    let base_url = scheme.default_base_url().to_string();
+    HttpTransport::new(scheme, model.to_string(), base_url, auth, cap)
+}
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -60,7 +86,11 @@ async fn run_scenario_with_anthropic(
     let api_key = std::env::var("ANTHROPIC_API_KEY")
         .expect("ANTHROPIC_API_KEY environment variable must be set");
     let model = model.as_deref().unwrap_or("claude-sonnet-4-20250514");
-    let client = AnthropicClient::new(&api_key, model);
+    let client = make_transport(
+        AnthropicScheme::new(),
+        model,
+        ResolvedAuth::ApiKey(api_key),
+    );
 
     recorder::record_request(
         &client,
@@ -82,7 +112,7 @@ async fn run_scenario_with_openai(
     let api_key =
         std::env::var("OPENAI_API_KEY").expect("OPENAI_API_KEY environment variable must be set");
     let model = model.as_deref().unwrap_or("gpt-4o");
-    let client = OpenAIClient::new(&api_key, model);
+    let client = make_transport(OpenAIScheme::new(), model, ResolvedAuth::ApiKey(api_key));
 
     recorder::record_request(
         &client,
@@ -101,10 +131,15 @@ async fn run_scenario_with_ollama(
     subdir: &str,
     model: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use llm_worker::llm_client::providers::ollama::OllamaClient;
-    // Ollama typically runs local, no key needed or placeholder
-    let model = model.as_deref().unwrap_or("llama3"); // default example
-    let client = OllamaClient::new(model); // base_url placeholder, handled by client default
+    // Ollama = Anthropic scheme + base_url 差し替え + 認証なし
+    let model = model.as_deref().unwrap_or("llama3");
+    let client = HttpTransport::new(
+        AnthropicScheme::new(),
+        model.to_string(),
+        "http://localhost:11434".to_string(),
+        ResolvedAuth::None,
+        fallback_capability(),
+    );
 
     recorder::record_request(
         &client,
@@ -126,7 +161,7 @@ async fn run_scenario_with_gemini(
     let api_key =
         std::env::var("GEMINI_API_KEY").expect("GEMINI_API_KEY environment variable must be set");
     let model = model.as_deref().unwrap_or("gemini-2.0-flash");
-    let client = GeminiClient::new(&api_key, model);
+    let client = make_transport(GeminiScheme::new(), model, ResolvedAuth::ApiKey(api_key));
 
     recorder::record_request(
         &client,

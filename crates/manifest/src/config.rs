@@ -13,10 +13,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::defaults;
-use crate::{
-    CompactionConfig, PodManifest, PodMeta, ProviderConfig, ProviderKind, ScopeConfig,
-    ToolOutputLimits, WorkerManifest,
-};
+use crate::model::{AuthRef, ModelConfig, SchemeKind};
+use crate::{CompactionConfig, PodManifest, PodMeta, ScopeConfig, ToolOutputLimits, WorkerManifest};
 
 /// Partial-form Pod manifest. Every field is optional; one or more
 /// instances merge via [`PodManifestConfig::merge`] before being
@@ -26,7 +24,7 @@ pub struct PodManifestConfig {
     #[serde(default)]
     pub pod: PodMetaConfig,
     #[serde(default)]
-    pub provider: ProviderConfigPartial,
+    pub model: ModelConfigPartial,
     #[serde(default)]
     pub worker: WorkerManifestConfig,
     #[serde(default)]
@@ -41,16 +39,17 @@ pub struct PodMetaConfig {
     pub name: Option<String>,
 }
 
+/// Partial-form of [`ModelConfig`]. カスケード層で個別に与えられる。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ProviderConfigPartial {
+pub struct ModelConfigPartial {
     #[serde(default)]
-    pub kind: Option<ProviderKind>,
-    #[serde(default)]
-    pub model: Option<String>,
-    #[serde(default)]
-    pub api_key_file: Option<PathBuf>,
+    pub scheme: Option<SchemeKind>,
     #[serde(default)]
     pub base_url: Option<String>,
+    #[serde(default)]
+    pub model_id: Option<String>,
+    #[serde(default)]
+    pub auth: Option<AuthRef>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -92,7 +91,7 @@ pub struct CompactionConfigPartial {
     #[serde(default)]
     pub compact_worker_max_input_tokens: Option<u64>,
     #[serde(default)]
-    pub provider: Option<ProviderConfigPartial>,
+    pub model: Option<ModelConfigPartial>,
 }
 
 /// Errors raised when converting a [`PodManifestConfig`] to a validated
@@ -148,18 +147,16 @@ impl PodManifestConfig {
     /// rules from different layers do not accidentally inherit another
     /// layer's base.
     ///
-    /// Affected fields: `provider.api_key_file`,
+    /// Affected fields: `model.auth.file`,
     /// `scope.allow[].target`, `scope.deny[].target`,
-    /// `compaction.provider.api_key_file`.
+    /// `compaction.model.auth.file`.
     pub fn resolve_paths(mut self, base: &Path) -> Self {
         debug_assert!(
             base.is_absolute(),
             "resolve_paths base must be absolute: {}",
             base.display()
         );
-        if let Some(ref mut p) = self.provider.api_key_file {
-            *p = join_if_relative(base, p);
-        }
+        resolve_auth_file(&mut self.model.auth, base);
         for rule in &mut self.scope.allow {
             rule.target = join_if_relative(base, &rule.target);
         }
@@ -167,10 +164,9 @@ impl PodManifestConfig {
             rule.target = join_if_relative(base, &rule.target);
         }
         if let Some(ref mut compaction) = self.compaction
-            && let Some(ref mut cp) = compaction.provider
-            && let Some(ref mut p) = cp.api_key_file
+            && let Some(ref mut cp) = compaction.model
         {
-            *p = join_if_relative(base, p);
+            resolve_auth_file(&mut cp.auth, base);
         }
         self
     }
@@ -182,7 +178,7 @@ impl PodManifestConfig {
     pub fn merge(self, upper: PodManifestConfig) -> Self {
         Self {
             pod: self.pod.merge(upper.pod),
-            provider: self.provider.merge(upper.provider),
+            model: self.model.merge(upper.model),
             worker: self.worker.merge(upper.worker),
             scope: merge_scope(self.scope, upper.scope),
             compaction: merge_option(
@@ -202,13 +198,13 @@ impl PodMetaConfig {
     }
 }
 
-impl ProviderConfigPartial {
+impl ModelConfigPartial {
     fn merge(self, upper: Self) -> Self {
         Self {
-            kind: upper.kind.or(self.kind),
-            model: upper.model.or(self.model),
-            api_key_file: upper.api_key_file.or(self.api_key_file),
+            scheme: upper.scheme.or(self.scheme),
             base_url: upper.base_url.or(self.base_url),
+            model_id: upper.model_id.or(self.model_id),
+            auth: upper.auth.or(self.auth),
         }
     }
 }
@@ -254,7 +250,7 @@ impl CompactionConfigPartial {
             compact_worker_max_input_tokens: upper
                 .compact_worker_max_input_tokens
                 .or(self.compact_worker_max_input_tokens),
-            provider: merge_option(self.provider, upper.provider, ProviderConfigPartial::merge),
+            model: merge_option(self.model, upper.model, ModelConfigPartial::merge),
         }
     }
 }
@@ -295,23 +291,33 @@ fn ensure_absolute(field: &'static str, path: &Path) -> Result<(), ResolveError>
     }
 }
 
-fn resolve_provider(
-    cfg: ProviderConfigPartial,
-    kind_field: &'static str,
-    model_field: &'static str,
-    api_key_field: &'static str,
-) -> Result<ProviderConfig, ResolveError> {
-    let kind = cfg.kind.ok_or(ResolveError::MissingField(kind_field))?;
-    let model = cfg.model.ok_or(ResolveError::MissingField(model_field))?;
-    if let Some(ref p) = cfg.api_key_file {
-        ensure_absolute(api_key_field, p)?;
+fn resolve_model(
+    cfg: ModelConfigPartial,
+    scheme_field: &'static str,
+    model_id_field: &'static str,
+    auth_file_field: &'static str,
+) -> Result<ModelConfig, ResolveError> {
+    let scheme = cfg.scheme.ok_or(ResolveError::MissingField(scheme_field))?;
+    let model_id = cfg
+        .model_id
+        .ok_or(ResolveError::MissingField(model_id_field))?;
+    let auth = cfg.auth.unwrap_or_default();
+    if let AuthRef::ApiKey { file: Some(p), .. } = &auth {
+        ensure_absolute(auth_file_field, p)?;
     }
-    Ok(ProviderConfig {
-        kind,
-        model,
-        api_key_file: cfg.api_key_file,
+    Ok(ModelConfig {
+        scheme,
         base_url: cfg.base_url,
+        model_id,
+        auth,
     })
+}
+
+/// `AuthRef::ApiKey { file, .. }` が相対パスのとき `base` を前置する。
+fn resolve_auth_file(auth: &mut Option<AuthRef>, base: &Path) {
+    if let Some(AuthRef::ApiKey { file: Some(p), .. }) = auth.as_mut() {
+        *p = join_if_relative(base, p);
+    }
 }
 
 impl TryFrom<PodManifestConfig> for PodManifest {
@@ -323,11 +329,11 @@ impl TryFrom<PodManifestConfig> for PodManifest {
             .name
             .ok_or(ResolveError::MissingField("pod.name"))?;
 
-        let provider = resolve_provider(
-            cfg.provider,
-            "provider.kind",
-            "provider.model",
-            "provider.api_key_file",
+        let model = resolve_model(
+            cfg.model,
+            "model.scheme",
+            "model.model_id",
+            "model.auth.file",
         )?;
 
         let worker = WorkerManifest {
@@ -361,14 +367,14 @@ impl TryFrom<PodManifestConfig> for PodManifest {
         let compaction = cfg
             .compaction
             .map(|c| -> Result<CompactionConfig, ResolveError> {
-                let comp_provider = c
-                    .provider
+                let comp_model = c
+                    .model
                     .map(|p| {
-                        resolve_provider(
+                        resolve_model(
                             p,
-                            "compaction.provider.kind",
-                            "compaction.provider.model",
-                            "compaction.provider.api_key_file",
+                            "compaction.model.scheme",
+                            "compaction.model.model_id",
+                            "compaction.model.auth.file",
                         )
                     })
                     .transpose()?;
@@ -390,14 +396,14 @@ impl TryFrom<PodManifestConfig> for PodManifest {
                     compact_worker_max_input_tokens: c
                         .compact_worker_max_input_tokens
                         .unwrap_or(defaults::COMPACT_WORKER_MAX_INPUT_TOKENS),
-                    provider: comp_provider,
+                    model: comp_model,
                 })
             })
             .transpose()?;
 
         Ok(PodManifest {
             pod: PodMeta { name },
-            provider,
+            model,
             worker,
             scope: cfg.scope,
             compaction,
@@ -414,14 +420,21 @@ mod tests {
         PathBuf::from(format!("/tmp/insomnia-test{path}"))
     }
 
+    fn api_key_file_auth(path: PathBuf) -> AuthRef {
+        AuthRef::ApiKey {
+            env: None,
+            file: Some(path),
+        }
+    }
+
     fn minimal_valid() -> PodManifestConfig {
         PodManifestConfig {
             pod: PodMetaConfig {
                 name: Some("test".into()),
             },
-            provider: ProviderConfigPartial {
-                kind: Some(ProviderKind::Anthropic),
-                model: Some("claude-sonnet-4-20250514".into()),
+            model: ModelConfigPartial {
+                scheme: Some(SchemeKind::Anthropic),
+                model_id: Some("claude-sonnet-4-20250514".into()),
                 ..Default::default()
             },
             worker: WorkerManifestConfig::default(),
@@ -441,16 +454,20 @@ mod tests {
     fn resolve_minimal_succeeds() {
         let manifest: PodManifest = minimal_valid().try_into().unwrap();
         assert_eq!(manifest.pod.name, "test");
-        assert_eq!(manifest.provider.kind, ProviderKind::Anthropic);
+        assert_eq!(manifest.model.scheme, SchemeKind::Anthropic);
     }
 
     #[test]
-    fn resolve_paths_joins_relative_api_key_file() {
+    fn resolve_paths_joins_relative_auth_file() {
         let mut cfg = minimal_valid();
-        cfg.provider.api_key_file = Some(PathBuf::from("keys/anthropic"));
+        cfg.model.auth = Some(api_key_file_auth(PathBuf::from("keys/anthropic")));
         let resolved = cfg.resolve_paths(Path::new("/home/user/.config/insomnia"));
+        let file = match resolved.model.auth {
+            Some(AuthRef::ApiKey { file, .. }) => file,
+            _ => panic!("expected ApiKey"),
+        };
         assert_eq!(
-            resolved.provider.api_key_file.as_deref(),
+            file.as_deref(),
             Some(Path::new("/home/user/.config/insomnia/keys/anthropic"))
         );
     }
@@ -458,12 +475,13 @@ mod tests {
     #[test]
     fn resolve_paths_leaves_absolute_paths_untouched() {
         let mut cfg = minimal_valid();
-        cfg.provider.api_key_file = Some(PathBuf::from("/etc/already/abs"));
+        cfg.model.auth = Some(api_key_file_auth(PathBuf::from("/etc/already/abs")));
         let resolved = cfg.resolve_paths(Path::new("/home/user"));
-        assert_eq!(
-            resolved.provider.api_key_file.as_deref(),
-            Some(Path::new("/etc/already/abs"))
-        );
+        let file = match resolved.model.auth {
+            Some(AuthRef::ApiKey { file, .. }) => file,
+            _ => panic!("expected ApiKey"),
+        };
+        assert_eq!(file.as_deref(), Some(Path::new("/etc/already/abs")));
     }
 
     #[test]
@@ -484,16 +502,14 @@ mod tests {
     }
 
     #[test]
-    fn try_from_invariant_rejects_lingering_relative_api_key_file() {
+    fn try_from_invariant_rejects_lingering_relative_auth_file() {
         let mut cfg = minimal_valid();
-        cfg.provider.api_key_file = Some(PathBuf::from("keys/relative"));
-        // Skipping resolve_paths on purpose: TryFrom must catch the
-        // invariant violation.
+        cfg.model.auth = Some(api_key_file_auth(PathBuf::from("keys/relative")));
         let err = PodManifest::try_from(cfg).unwrap_err();
         assert!(matches!(
             err,
             ResolveError::RelativePath {
-                field: "provider.api_key_file",
+                field: "model.auth.file",
                 ..
             }
         ));
@@ -535,8 +551,8 @@ mod tests {
             pod: PodMetaConfig {
                 name: Some("lower".into()),
             },
-            provider: ProviderConfigPartial {
-                model: Some("lower-model".into()),
+            model: ModelConfigPartial {
+                model_id: Some("lower-model".into()),
                 ..Default::default()
             },
             ..Default::default()
@@ -549,8 +565,8 @@ mod tests {
         };
         let merged = lower.merge(upper);
         assert_eq!(merged.pod.name.as_deref(), Some("upper"));
-        // model not present in upper — retain lower
-        assert_eq!(merged.provider.model.as_deref(), Some("lower-model"));
+        // model_id not present in upper — retain lower
+        assert_eq!(merged.model.model_id.as_deref(), Some("lower-model"));
     }
 
     #[test]
@@ -706,9 +722,9 @@ permission = "write"
             pod: PodMetaConfig {
                 name: Some("x".into()),
             },
-            provider: ProviderConfigPartial {
-                kind: Some(ProviderKind::Anthropic),
-                model: Some("m".into()),
+            model: ModelConfigPartial {
+                scheme: Some(SchemeKind::Anthropic),
+                model_id: Some("m".into()),
                 ..Default::default()
             },
             scope: ScopeConfig {
@@ -734,9 +750,9 @@ permission = "write"
         let builtin = PodManifestConfig::default();
         let user = PodManifestConfig::from_toml(
             r#"
-[provider]
-kind = "anthropic"
-model = "claude-sonnet-4-20250514"
+[model]
+scheme = "anthropic"
+model_id = "claude-sonnet-4-20250514"
 "#,
         )
         .unwrap();
@@ -759,7 +775,7 @@ name = "dbg"
         let merged = builtin.merge(user).merge(project).merge(overlay);
         let manifest: PodManifest = merged.try_into().unwrap();
         assert_eq!(manifest.pod.name, "dbg");
-        assert_eq!(manifest.provider.kind, ProviderKind::Anthropic);
+        assert_eq!(manifest.model.scheme, SchemeKind::Anthropic);
         assert_eq!(manifest.scope.allow.len(), 1);
     }
 }

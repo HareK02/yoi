@@ -1,5 +1,9 @@
 # LLM モデル設定の再編
 
+> **レビュー中** — 詳細は [`llm-model-config.review.md`](llm-model-config.review.md)
+> 主な指摘: 要件 6 の `ModelConfig.capability` override 未実装、`validate_config` の機能退化（OpenAI top_k warning 消失）。どちらも判断待ち。
+
+
 ## 背景
 
 決定済みの LLM プロバイダサポート方針（`docs/plan/llm_providers.md`）に従って llm-worker のプロバイダ層を再編する。Pod 側で「使う LLM モデル」を宣言する構造にし、共通の通信層 + scheme の組合せで任意のプロバイダを収容できるようにする。

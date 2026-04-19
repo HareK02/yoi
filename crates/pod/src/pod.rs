@@ -818,7 +818,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     /// `[summary, ...recent_turns]` and creating a new session.
     ///
     /// The summary Worker uses:
-    /// - `compaction.provider` from the manifest if configured, or
+    /// - `compaction.model` from the manifest if configured, or
     /// - a clone of the main LlmClient via `clone_boxed()`.
     ///
     /// Returns the new session ID.
@@ -1056,12 +1056,12 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
 
     /// Build the LlmClient for the compactor Worker.
     ///
-    /// Uses `compaction.provider` from manifest if set, otherwise clones
+    /// Uses `compaction.model` from manifest if set, otherwise clones
     /// the main client.
     fn build_compactor_client(&self) -> Result<Box<dyn LlmClient>, PodError> {
         if let Some(ref compaction) = self.manifest.compaction {
-            if let Some(ref provider_config) = compaction.provider {
-                let client = provider::build_client(provider_config)?;
+            if let Some(ref model_config) = compaction.model {
+                let client = provider::build_client(model_config)?;
                 return Ok(client);
             }
         }
@@ -1109,7 +1109,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             scope.allow_rules(),
         )?;
 
-        let client = provider::build_client(&manifest.provider)?;
+        let client = provider::build_client(&manifest.model)?;
         let mut worker = Worker::new(client);
         apply_worker_manifest(&mut worker, &manifest.worker);
 
@@ -1176,7 +1176,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
         let scope_allocation =
             scope_lock::adopt_allocation(manifest.pod.name.clone(), std::process::id())?;
 
-        let client = provider::build_client(&manifest.provider)?;
+        let client = provider::build_client(&manifest.model)?;
         let mut worker = Worker::new(client);
         apply_worker_manifest(&mut worker, &manifest.worker);
 

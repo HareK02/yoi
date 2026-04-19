@@ -3,8 +3,10 @@
 //! - リクエストJSON生成
 //! - SSEイベントパース → Event変換
 
+mod capability;
 mod events;
 mod request;
+mod scheme_impl;
 
 /// Geminiスキーマ
 ///

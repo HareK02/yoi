@@ -7,6 +7,7 @@ use serde_json::Value;
 
 use crate::llm_client::{
     Request,
+    capability::{ModelCapability, ReasoningEffort, ReasoningSupport},
     types::{Item, Role, ToolDefinition, parse_tool_arguments},
 };
 
@@ -34,6 +35,9 @@ pub(crate) struct OpenAIRequest {
     pub tools: Vec<OpenAITool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<String>,
+    /// Reasoning effort（o1 / o3 / o4 / gpt-5 系で有効）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<&'static str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -110,7 +114,12 @@ pub(crate) struct OpenAIToolCallFunction {
 
 impl OpenAIScheme {
     /// Build OpenAI request from Request
-    pub(crate) fn build_request(&self, model: &str, request: &Request) -> OpenAIRequest {
+    pub(crate) fn build_request(
+        &self,
+        model: &str,
+        request: &Request,
+        capability: &ModelCapability,
+    ) -> OpenAIRequest {
         let mut messages = Vec::new();
 
         // Add system message if present
@@ -135,6 +144,24 @@ impl OpenAIScheme {
             (None, request.config.max_tokens)
         };
 
+        // Reasoning の投影: capability が Effort / Both をサポートし、
+        // request 側で effort が指定されているときだけ reasoning_effort を付ける。
+        let supports_effort = matches!(
+            capability.reasoning,
+            Some(ReasoningSupport::Effort | ReasoningSupport::Both),
+        );
+        let reasoning_effort = request
+            .config
+            .reasoning
+            .as_ref()
+            .and_then(|rc| rc.effort)
+            .filter(|_| supports_effort)
+            .map(|effort| match effort {
+                ReasoningEffort::Low => "low",
+                ReasoningEffort::Medium => "medium",
+                ReasoningEffort::High => "high",
+            });
+
         OpenAIRequest {
             model: model.to_string(),
             max_completion_tokens,
@@ -149,6 +176,7 @@ impl OpenAIScheme {
             messages,
             tools,
             tool_choice: None,
+            reasoning_effort,
         }
     }
 
@@ -294,13 +322,24 @@ impl OpenAIScheme {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm_client::capability::{CacheStrategy, StructuredOutput, ToolCallingSupport};
+
+    fn cap() -> ModelCapability {
+        ModelCapability {
+            tool_calling: ToolCallingSupport::Parallel,
+            structured_output: StructuredOutput::JsonSchema,
+            reasoning: None,
+            vision: false,
+            prompt_caching: CacheStrategy::Auto,
+        }
+    }
 
     #[test]
     fn test_build_simple_request() {
         let scheme = OpenAIScheme::new();
         let request = Request::new().system("System prompt").user("Hello");
 
-        let body = scheme.build_request("gpt-4o", &request);
+        let body = scheme.build_request("gpt-4o", &request, &cap());
 
         assert_eq!(body.model, "gpt-4o");
         assert_eq!(body.messages.len(), 2);
@@ -321,7 +360,7 @@ mod tests {
             .user("Check weather")
             .tool(ToolDefinition::new("weather").description("Get weather"));
 
-        let body = scheme.build_request("gpt-4o", &request);
+        let body = scheme.build_request("gpt-4o", &request, &cap());
         assert_eq!(body.tools.len(), 1);
         assert_eq!(body.tools[0].function.name, "weather");
     }
@@ -331,7 +370,7 @@ mod tests {
         let scheme = OpenAIScheme::new().with_legacy_max_tokens(true);
         let request = Request::new().user("Hello").max_tokens(100);
 
-        let body = scheme.build_request("llama3", &request);
+        let body = scheme.build_request("llama3", &request, &cap());
 
         assert_eq!(body.max_tokens, Some(100));
         assert!(body.max_completion_tokens.is_none());
@@ -342,7 +381,7 @@ mod tests {
         let scheme = OpenAIScheme::new();
         let request = Request::new().user("Hello").max_tokens(100);
 
-        let body = scheme.build_request("gpt-4o", &request);
+        let body = scheme.build_request("gpt-4o", &request, &cap());
 
         assert_eq!(body.max_completion_tokens, Some(100));
         assert!(body.max_tokens.is_none());
@@ -360,7 +399,7 @@ mod tests {
             ))
             .item(Item::tool_result("call_123", "Sunny, 25°C"));
 
-        let body = scheme.build_request("gpt-4o", &request);
+        let body = scheme.build_request("gpt-4o", &request, &cap());
 
         assert_eq!(body.messages.len(), 3);
         assert_eq!(body.messages[0].role, "user");

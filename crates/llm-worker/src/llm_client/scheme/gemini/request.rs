@@ -7,6 +7,7 @@ use serde_json::Value;
 
 use crate::llm_client::{
     Request,
+    capability::{ModelCapability, ReasoningSupport},
     types::{Item, Role, ToolDefinition, parse_tool_arguments},
 };
 
@@ -139,11 +140,26 @@ pub(crate) struct GeminiGenerationConfig {
     /// Stop sequences
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub stop_sequences: Vec<String>,
+    /// Thinking / reasoning 設定（Gemini 2.5 以降）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_config: Option<GeminiThinkingConfig>,
+}
+
+/// Gemini thinking config (gemini-2.5 以降)
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct GeminiThinkingConfig {
+    /// Token budget for thinking. `-1` means dynamic.
+    pub thinking_budget: i32,
 }
 
 impl GeminiScheme {
     /// Build Gemini request from Request
-    pub(crate) fn build_request(&self, request: &Request) -> GeminiRequest {
+    pub(crate) fn build_request(
+        &self,
+        request: &Request,
+        capability: &ModelCapability,
+    ) -> GeminiRequest {
         let contents = self.convert_items_to_contents(&request.items);
 
         // System prompt
@@ -177,6 +193,22 @@ impl GeminiScheme {
             None
         };
 
+        // Reasoning の投影: capability が BudgetTokens / Both をサポートし、
+        // request 側で budget_tokens が指定されているときだけ thinking_config を付ける。
+        let supports_budget = matches!(
+            capability.reasoning,
+            Some(ReasoningSupport::BudgetTokens | ReasoningSupport::Both),
+        );
+        let thinking_config = request
+            .config
+            .reasoning
+            .as_ref()
+            .and_then(|rc| rc.budget_tokens)
+            .filter(|_| supports_budget)
+            .map(|budget| GeminiThinkingConfig {
+                thinking_budget: budget as i32,
+            });
+
         // Generation config
         let generation_config = Some(GeminiGenerationConfig {
             max_output_tokens: request.config.max_tokens,
@@ -184,6 +216,7 @@ impl GeminiScheme {
             top_p: request.config.top_p,
             top_k: request.config.top_k,
             stop_sequences: request.config.stop_sequences.clone(),
+            thinking_config,
         });
 
         GeminiRequest {
@@ -341,6 +374,17 @@ impl GeminiScheme {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm_client::capability::{CacheStrategy, StructuredOutput, ToolCallingSupport};
+
+    fn cap() -> ModelCapability {
+        ModelCapability {
+            tool_calling: ToolCallingSupport::Parallel,
+            structured_output: StructuredOutput::JsonSchema,
+            reasoning: None,
+            vision: true,
+            prompt_caching: CacheStrategy::Auto,
+        }
+    }
 
     #[test]
     fn test_build_simple_request() {
@@ -349,7 +393,7 @@ mod tests {
             .system("You are a helpful assistant.")
             .user("Hello!");
 
-        let gemini_req = scheme.build_request(&request);
+        let gemini_req = scheme.build_request(&request, &cap());
 
         assert!(gemini_req.system_instruction.is_some());
         assert_eq!(gemini_req.contents.len(), 1);
@@ -371,7 +415,7 @@ mod tests {
                 })),
         );
 
-        let gemini_req = scheme.build_request(&request);
+        let gemini_req = scheme.build_request(&request, &cap());
 
         assert_eq!(gemini_req.tools.len(), 1);
         assert_eq!(gemini_req.tools[0].function_declarations.len(), 1);
@@ -387,7 +431,7 @@ mod tests {
         let scheme = GeminiScheme::new();
         let request = Request::new().user("Hello").assistant("Hi there!");
 
-        let gemini_req = scheme.build_request(&request);
+        let gemini_req = scheme.build_request(&request, &cap());
 
         assert_eq!(gemini_req.contents.len(), 2);
         assert_eq!(gemini_req.contents[0].role, "user");
@@ -406,7 +450,7 @@ mod tests {
             ))
             .item(Item::tool_result("call_123", "Sunny, 25°C"));
 
-        let gemini_req = scheme.build_request(&request);
+        let gemini_req = scheme.build_request(&request, &cap());
 
         assert_eq!(gemini_req.contents.len(), 3);
         assert_eq!(gemini_req.contents[0].role, "user");

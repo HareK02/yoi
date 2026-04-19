@@ -1,13 +1,14 @@
 # manifest
 
-Pod の宣言的設定を TOML マニフェストとして定義・パースするクレート。プロバイダ設定、ワーカー設定、ディレクトリスコープ制約を記述できる。
+Pod の宣言的設定を TOML マニフェストとして定義・パースするクレート。モデル設定、ワーカー設定、ディレクトリスコープ制約を記述できる。
 
 ## 公開型
 
 - `PodManifest` — Pod 設定全体（`from_toml()` でパース）
 - `PodMeta` — Pod メタデータ（名前、pwd）
-- `ProviderConfig` — LLM プロバイダ設定（種別、モデル、APIキー環境変数、ベースURL）
-- `ProviderKind` — プロバイダ種別（`Anthropic`, `Openai`, `Gemini`, `Ollama`）
+- `ModelConfig` — LLM モデル設定（scheme、base_url、model_id、auth）
+- `SchemeKind` — wire scheme 種別（`Anthropic`, `OpenaiChat`, `OpenaiResponses`, `Gemini`）
+- `AuthRef` — 認証参照（`None`, `ApiKey { env, file }`, `CodexOAuth`）
 - `WorkerManifest` — ワーカー設定（システムプロンプト、max_tokens、temperature）
 - `ScopeConfig` / `ScopeRule` / `Permission` — allow / deny の宣言的スコープ設定
 - `Scope` — 実行時スコープ。`from_config(&ScopeConfig, pwd)` で構築し、`is_readable` / `is_writable` / `permission_at` で問い合わせる

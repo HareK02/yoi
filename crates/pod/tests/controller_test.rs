@@ -110,9 +110,9 @@ const MANIFEST_TOML: &str = r#"
 name = "test-pod"
 pwd = "./"
 
-[provider]
-kind = "anthropic"
-model = "test-model"
+[model]
+scheme = "anthropic"
+model_id = "test-model"
 
 [worker]
 max_tokens = 100

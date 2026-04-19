@@ -8,6 +8,7 @@ use serde::Serialize;
 
 use crate::llm_client::{
     Request,
+    capability::{CacheStrategy, ModelCapability, ReasoningSupport},
     types::{ContentPart, Item, Role, ToolDefinition, parse_tool_arguments},
 };
 
@@ -32,6 +33,15 @@ pub(crate) struct AnthropicRequest {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub stop_sequences: Vec<String>,
     pub stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<AnthropicThinking>,
+}
+
+/// Anthropic extended thinking 指示。
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub(crate) enum AnthropicThinking {
+    Enabled { budget_tokens: u32 },
 }
 
 /// Anthropic message
@@ -130,11 +140,39 @@ pub(crate) struct AnthropicTool {
 }
 
 impl AnthropicScheme {
-    /// Build Anthropic request from Request
-    pub(crate) fn build_request(&self, model: &str, request: &Request) -> AnthropicRequest {
-        let breakpoints = compute_breakpoints(&request.items, request.cache_anchor);
+    /// Build Anthropic request from Request.
+    ///
+    /// `capability.prompt_caching` が [`CacheStrategy::Auto`] のときは
+    /// `cache_control` マーカーを一切挿入しない（Ollama の `/v1/messages`
+    /// 流用時など、サーバ側が `cache_control` を受け付けないケース）。
+    pub(crate) fn build_request(
+        &self,
+        model: &str,
+        request: &Request,
+        capability: &ModelCapability,
+    ) -> AnthropicRequest {
+        let breakpoints = if matches!(capability.prompt_caching, CacheStrategy::Explicit { .. }) {
+            compute_breakpoints(&request.items, request.cache_anchor)
+        } else {
+            BTreeSet::new()
+        };
         let messages = self.convert_items_to_messages(&request.items, &breakpoints);
         let tools = request.tools.iter().map(|t| self.convert_tool(t)).collect();
+
+        // Reasoning の投影: capability が BudgetTokens / Both をサポート
+        // していて、request 側で budget_tokens が指定されているときだけ
+        // thinking フィールドを付ける。
+        let supports_budget_tokens = matches!(
+            capability.reasoning,
+            Some(ReasoningSupport::BudgetTokens | ReasoningSupport::Both),
+        );
+        let thinking = request
+            .config
+            .reasoning
+            .as_ref()
+            .and_then(|rc| rc.budget_tokens)
+            .filter(|_| supports_budget_tokens)
+            .map(|budget_tokens| AnthropicThinking::Enabled { budget_tokens });
 
         AnthropicRequest {
             model: model.to_string(),
@@ -147,6 +185,7 @@ impl AnthropicScheme {
             top_k: request.config.top_k,
             stop_sequences: request.config.stop_sequences.clone(),
             stream: true,
+            thinking,
         }
     }
 
@@ -360,6 +399,28 @@ fn compute_breakpoints(items: &[Item], cache_anchor: Option<usize>) -> BTreeSet<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm_client::capability::{
+        CacheStrategy, StructuredOutput, ToolCallingSupport,
+    };
+
+    /// cache_control が有効になる既定の capability。
+    fn cap_explicit() -> ModelCapability {
+        ModelCapability {
+            tool_calling: ToolCallingSupport::Parallel,
+            structured_output: StructuredOutput::JsonSchema,
+            reasoning: None,
+            vision: false,
+            prompt_caching: CacheStrategy::Explicit { max_breakpoints: 4 },
+        }
+    }
+
+    /// cache_control を送らない capability（Ollama 等）。
+    fn cap_auto() -> ModelCapability {
+        ModelCapability {
+            prompt_caching: CacheStrategy::Auto,
+            ..cap_explicit()
+        }
+    }
 
     #[test]
     fn test_build_simple_request() {
@@ -368,7 +429,7 @@ mod tests {
             .system("You are a helpful assistant.")
             .user("Hello!");
 
-        let anthropic_req = scheme.build_request("claude-sonnet-4-20250514", &request);
+        let anthropic_req = scheme.build_request("claude-sonnet-4-20250514", &request, &cap_explicit());
 
         assert_eq!(anthropic_req.model, "claude-sonnet-4-20250514");
         assert_eq!(
@@ -394,7 +455,7 @@ mod tests {
                 })),
         );
 
-        let anthropic_req = scheme.build_request("claude-sonnet-4-20250514", &request);
+        let anthropic_req = scheme.build_request("claude-sonnet-4-20250514", &request, &cap_explicit());
 
         assert_eq!(anthropic_req.tools.len(), 1);
         assert_eq!(anthropic_req.tools[0].name, "get_weather");
@@ -412,7 +473,7 @@ mod tests {
             ))
             .item(Item::tool_result("call_123", "Sunny, 25°C"));
 
-        let anthropic_req = scheme.build_request("claude-sonnet-4-20250514", &request);
+        let anthropic_req = scheme.build_request("claude-sonnet-4-20250514", &request, &cap_explicit());
 
         assert_eq!(anthropic_req.messages.len(), 3);
         assert_eq!(anthropic_req.messages[0].role, "user");
@@ -469,7 +530,7 @@ mod tests {
         let mut request = Request::new().items(items);
         request.cache_anchor = Some(0);
 
-        let req = scheme.build_request("claude-sonnet-4-20250514", &request);
+        let req = scheme.build_request("claude-sonnet-4-20250514", &request, &cap_explicit());
         let bps = breakpoint_positions(&req);
         assert_eq!(bps.len(), 3, "expected 3 breakpoints, got {:?}", bps);
         for (_, _, cc) in bps {
@@ -485,7 +546,7 @@ mod tests {
         // cache_anchor=None, turn_end=4, head=5.
         let request = Request::new().items(items);
 
-        let req = scheme.build_request("claude-sonnet-4-20250514", &request);
+        let req = scheme.build_request("claude-sonnet-4-20250514", &request, &cap_explicit());
         let bps = breakpoint_positions(&req);
         assert_eq!(bps.len(), 2, "expected 2 breakpoints, got {:?}", bps);
     }
@@ -495,7 +556,7 @@ mod tests {
         let scheme = AnthropicScheme::new();
         let request = Request::new().user("first ever turn");
         // latest user at 0 → no turn_end; head=0; no anchor. Collapse → 1.
-        let req = scheme.build_request("claude-sonnet-4-20250514", &request);
+        let req = scheme.build_request("claude-sonnet-4-20250514", &request, &cap_explicit());
         let bps = breakpoint_positions(&req);
         assert_eq!(bps.len(), 1, "expected 1 breakpoint, got {:?}", bps);
     }
@@ -511,7 +572,7 @@ mod tests {
         ]);
         request.cache_anchor = Some(0);
 
-        let req = scheme.build_request("claude-sonnet-4-20250514", &request);
+        let req = scheme.build_request("claude-sonnet-4-20250514", &request, &cap_explicit());
         let bps = breakpoint_positions(&req);
         assert_eq!(bps.len(), 2, "expected collapse to 2, got {:?}", bps);
     }
@@ -525,7 +586,7 @@ mod tests {
             .user("run it")
             .item(Item::tool_call("c1", "t", "{}"))
             .item(Item::tool_result("c1", "result"));
-        let req = scheme.build_request("claude-sonnet-4-20250514", &request);
+        let req = scheme.build_request("claude-sonnet-4-20250514", &request, &cap_explicit());
         let bps = breakpoint_positions(&req);
         assert_eq!(bps.len(), 1);
         let (mi, pi, _) = bps[0];
@@ -549,7 +610,7 @@ mod tests {
         let request = Request::new()
             .user("hello")
             .assistant("hi there");
-        let req = scheme.build_request("claude-sonnet-4-20250514", &request);
+        let req = scheme.build_request("claude-sonnet-4-20250514", &request, &cap_explicit());
         assert!(
             matches!(req.messages[0].content, AnthropicContent::Text(_)),
             "non-breakpoint single-text message should use text shorthand",
@@ -563,7 +624,7 @@ mod tests {
         let scheme = AnthropicScheme::new();
         let mut request = Request::new().user("hello");
         request.cache_anchor = Some(0);
-        let req = scheme.build_request("claude-sonnet-4-20250514", &request);
+        let req = scheme.build_request("claude-sonnet-4-20250514", &request, &cap_explicit());
         match &req.messages[0].content {
             AnthropicContent::Parts(parts) => {
                 assert_eq!(parts.len(), 1);
@@ -583,7 +644,7 @@ mod tests {
         let scheme = AnthropicScheme::new();
         let mut request = Request::new().user("hello");
         request.cache_anchor = Some(0);
-        let req = scheme.build_request("claude-sonnet-4-20250514", &request);
+        let req = scheme.build_request("claude-sonnet-4-20250514", &request, &cap_explicit());
         let json = serde_json::to_value(&req).unwrap();
         let part = &json["messages"][0]["content"][0];
         assert_eq!(part["type"], "text");
@@ -598,7 +659,7 @@ mod tests {
         let scheme = AnthropicScheme::new();
         let mut request = Request::new().user("one");
         request.cache_anchor = Some(99);
-        let req = scheme.build_request("claude-sonnet-4-20250514", &request);
+        let req = scheme.build_request("claude-sonnet-4-20250514", &request, &cap_explicit());
         // Only the Head breakpoint survives.
         let bps = breakpoint_positions(&req);
         assert_eq!(bps.len(), 1);
@@ -607,8 +668,19 @@ mod tests {
     #[test]
     fn empty_items_produce_no_breakpoints() {
         let scheme = AnthropicScheme::new();
-        let req = scheme.build_request("claude-sonnet-4-20250514", &Request::new());
+        let req = scheme.build_request("claude-sonnet-4-20250514", &Request::new(), &cap_explicit());
         assert!(req.messages.is_empty());
+        assert!(breakpoint_positions(&req).is_empty());
+    }
+
+    #[test]
+    fn cache_auto_does_not_add_cache_control() {
+        // Ollama のように `CacheStrategy::Auto` のときは cache_control
+        // マーカーを一切付けない。breakpoint 計算も走らないこと。
+        let scheme = AnthropicScheme::new();
+        let mut request = Request::new().user("hello");
+        request.cache_anchor = Some(0);
+        let req = scheme.build_request("claude-sonnet-4-20250514", &request, &cap_auto());
         assert!(breakpoint_positions(&req).is_empty());
     }
 
@@ -623,7 +695,7 @@ mod tests {
                 "type": "object",
                 "properties": {}
             })));
-        let req = scheme.build_request("claude-sonnet-4-20250514", &request);
+        let req = scheme.build_request("claude-sonnet-4-20250514", &request, &cap_explicit());
         let json = serde_json::to_value(&req).unwrap();
         let tool = &json["tools"][0];
         assert!(tool.get("cache_control").is_none());

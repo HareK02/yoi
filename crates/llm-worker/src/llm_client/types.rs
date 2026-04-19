@@ -565,6 +565,12 @@ pub struct RequestConfig {
     pub top_k: Option<u32>,
     /// Stop sequences
     pub stop_sequences: Vec<String>,
+    /// Reasoning / extended-thinking 制御（共通型、scheme 側で各社形式に投影）。
+    ///
+    /// `None` のときは何も送らない。`Some` でも scheme の
+    /// `ModelCapability::reasoning` が `None` なら無視される。
+    #[serde(default)]
+    pub reasoning: Option<crate::llm_client::capability::ReasoningControl>,
 }
 
 impl RequestConfig {

@@ -1,99 +1,148 @@
-use llm_worker::llm_client::client::LlmClient;
-use llm_worker::llm_client::providers::anthropic::AnthropicClient;
-use llm_worker::llm_client::providers::gemini::GeminiClient;
-use llm_worker::llm_client::providers::ollama::OllamaClient;
-use llm_worker::llm_client::providers::openai::OpenAIClient;
+//! Pod マニフェストの [`ModelConfig`] を [`Box<dyn LlmClient>`]
+//! に落とすファクトリ。
+//!
+//! * `SchemeKind` を各 `Scheme` 実装にマップ
+//! * `AuthRef` を環境変数 / ファイルから解決して [`ResolvedAuth`] に
+//! * `scheme.required_auth()` と解決値を照合（非対応組合せは構築エラー）
+//! * `ModelCapability` は明示指定 → scheme 静的テーブル → 未知時はデフォルト
+//!
+//! llm-worker は低レベル基盤に留める方針なので、高レベル側で必要に
+//! なる認証ストア解決（Codex OAuth の `~/.codex/auth.json` 読取等）は
+//! このクレートに追加する。
 
-use manifest::{ProviderConfig, ProviderKind};
+use llm_worker::llm_client::{
+    LlmClient,
+    capability::{CacheStrategy, ModelCapability, StructuredOutput, ToolCallingSupport},
+    scheme::{
+        Scheme, anthropic::AnthropicScheme, gemini::GeminiScheme, openai_chat::OpenAIScheme,
+    },
+    transport::{HttpTransport, ResolvedAuth},
+};
 
-/// Errors from provider client construction.
+use manifest::{AuthRef, ModelConfig, SchemeKind};
+
+/// プロバイダ構築時のエラー。
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
-    #[error("provider configuration error: {0}")]
+    #[error("model configuration error: {0}")]
     Config(String),
 
-    #[error("API key not provided for {provider}")]
-    ApiKeyMissing { provider: String },
+    #[error("API key not provided for scheme {scheme:?}")]
+    ApiKeyMissing { scheme: SchemeKind },
+
+    #[error("scheme {scheme:?} does not support this auth")]
+    AuthMismatch { scheme: SchemeKind },
+
+    #[error("scheme {scheme:?} is not implemented yet")]
+    SchemeNotImplemented { scheme: SchemeKind },
 }
 
-/// Resolve the API key for the given provider configuration.
+/// `AuthRef` をランタイムで使える [`ResolvedAuth`] に解決する。
 ///
-/// Resolution order:
-/// 1. Environment variable `INSOMNIA_API_KEY_{KIND}`
-/// 2. File specified by `api_key_file` (must be an absolute path; the
-///    cascade layer is responsible for normalisation)
-/// 3. `None`
-fn resolve_api_key(config: &ProviderConfig) -> Result<Option<String>, ProviderError> {
-    let env_name = config.kind.env_var_name();
-    if let Ok(val) = std::env::var(&env_name) {
-        return Ok(Some(val));
-    }
-
-    if let Some(ref path) = config.api_key_file {
-        if !path.is_absolute() {
-            return Err(ProviderError::Config(format!(
-                "api_key_file must be absolute: {}",
-                path.display()
-            )));
+/// 解決順:
+/// 1. `AuthRef::ApiKey { env, .. }` で env が指定されていればその変数を参照
+/// 2. そうでなければ scheme 既定の環境変数 (`SchemeKind::default_env_var`)
+/// 3. それでも無ければ `file` を読む（絶対パスのみ）
+fn resolve_auth(
+    scheme: SchemeKind,
+    auth: &AuthRef,
+) -> Result<ResolvedAuth, ProviderError> {
+    match auth {
+        AuthRef::None => Ok(ResolvedAuth::None),
+        AuthRef::ApiKey { env, file } => {
+            let env_name = env.as_deref().unwrap_or(scheme.default_env_var());
+            if let Ok(val) = std::env::var(env_name)
+                && !val.is_empty()
+            {
+                return Ok(ResolvedAuth::ApiKey(val));
+            }
+            if let Some(path) = file {
+                if !path.is_absolute() {
+                    return Err(ProviderError::Config(format!(
+                        "auth.file must be absolute: {}",
+                        path.display()
+                    )));
+                }
+                let contents = std::fs::read_to_string(path).map_err(|e| {
+                    ProviderError::Config(format!(
+                        "failed to read auth.file {}: {e}",
+                        path.display()
+                    ))
+                })?;
+                return Ok(ResolvedAuth::ApiKey(contents.trim().to_owned()));
+            }
+            Err(ProviderError::ApiKeyMissing { scheme })
         }
-        let contents = std::fs::read_to_string(path).map_err(|e| {
-            ProviderError::Config(format!(
-                "failed to read api_key_file {}: {e}",
-                path.display()
-            ))
-        })?;
-        return Ok(Some(contents.trim().to_owned()));
+        AuthRef::CodexOAuth => Err(ProviderError::Config(
+            "codex_oauth auth not yet implemented (tickets/llm-auth-codex-oauth)".into(),
+        )),
     }
-
-    Ok(None)
 }
 
-/// Build an [`LlmClient`] from a [`ProviderConfig`].
-///
-/// `api_key_file` (if set) must already be an absolute path — relative
-/// paths are rejected because cascade resolution is the sole source of
-/// path normalisation.
-pub fn build_client(config: &ProviderConfig) -> Result<Box<dyn LlmClient>, ProviderError> {
-    let api_key = resolve_api_key(config)?;
+/// `SchemeKind` ごとに固定のデフォルト capability（未知モデル用）。
+fn default_capability(scheme: SchemeKind) -> ModelCapability {
+    match scheme {
+        SchemeKind::Anthropic => ModelCapability {
+            tool_calling: ToolCallingSupport::Parallel,
+            structured_output: StructuredOutput::JsonSchema,
+            reasoning: None,
+            vision: false,
+            // Ollama の /v1/messages 流用時に cache_control を拒否されないよう Auto
+            prompt_caching: CacheStrategy::Auto,
+        },
+        SchemeKind::OpenaiChat | SchemeKind::OpenaiResponses => ModelCapability {
+            tool_calling: ToolCallingSupport::Parallel,
+            structured_output: StructuredOutput::JsonSchema,
+            reasoning: None,
+            vision: false,
+            prompt_caching: CacheStrategy::Auto,
+        },
+        SchemeKind::Gemini => ModelCapability {
+            tool_calling: ToolCallingSupport::Parallel,
+            structured_output: StructuredOutput::JsonSchema,
+            reasoning: None,
+            vision: true,
+            prompt_caching: CacheStrategy::Auto,
+        },
+    }
+}
 
-    match config.kind {
-        ProviderKind::Anthropic => {
-            let key = api_key.ok_or_else(|| ProviderError::ApiKeyMissing {
-                provider: "anthropic".into(),
-            })?;
-            let mut client = AnthropicClient::new(key, &config.model);
-            if let Some(ref url) = config.base_url {
-                client = client.with_base_url(url);
-            }
-            Ok(Box::new(client))
-        }
-        ProviderKind::Openai => {
-            let key = api_key.ok_or_else(|| ProviderError::ApiKeyMissing {
-                provider: "openai".into(),
-            })?;
-            let mut client = OpenAIClient::new(key, &config.model);
-            if let Some(ref url) = config.base_url {
-                client = client.with_base_url(url);
-            }
-            Ok(Box::new(client))
-        }
-        ProviderKind::Gemini => {
-            let key = api_key.ok_or_else(|| ProviderError::ApiKeyMissing {
-                provider: "gemini".into(),
-            })?;
-            let mut client = GeminiClient::new(key, &config.model);
-            if let Some(ref url) = config.base_url {
-                client = client.with_base_url(url);
-            }
-            Ok(Box::new(client))
-        }
-        ProviderKind::Ollama => {
-            let mut client = OllamaClient::new(&config.model);
-            if let Some(ref url) = config.base_url {
-                client = client.with_base_url(url);
-            }
-            Ok(Box::new(client))
-        }
+fn build_transport<S: Scheme>(
+    scheme: S,
+    config: &ModelConfig,
+    resolved: ResolvedAuth,
+) -> Result<Box<dyn LlmClient>, ProviderError> {
+    if !resolved.matches(scheme.required_auth()) {
+        return Err(ProviderError::AuthMismatch {
+            scheme: config.scheme,
+        });
+    }
+    let capability = scheme
+        .capability_for(&config.model_id)
+        .unwrap_or_else(|| default_capability(config.scheme));
+    let base_url = config
+        .base_url
+        .clone()
+        .unwrap_or_else(|| scheme.default_base_url().to_string());
+    Ok(Box::new(HttpTransport::new(
+        scheme,
+        config.model_id.clone(),
+        base_url,
+        resolved,
+        capability,
+    )))
+}
+
+/// [`ModelConfig`] から [`LlmClient`] を構築する。
+pub fn build_client(config: &ModelConfig) -> Result<Box<dyn LlmClient>, ProviderError> {
+    let resolved = resolve_auth(config.scheme, &config.auth)?;
+    match config.scheme {
+        SchemeKind::Anthropic => build_transport(AnthropicScheme::new(), config, resolved),
+        SchemeKind::OpenaiChat => build_transport(OpenAIScheme::new(), config, resolved),
+        SchemeKind::Gemini => build_transport(GeminiScheme::new(), config, resolved),
+        SchemeKind::OpenaiResponses => Err(ProviderError::SchemeNotImplemented {
+            scheme: config.scheme,
+        }),
     }
 }
 
@@ -104,23 +153,29 @@ mod tests {
     use std::io::Write;
     use std::path::PathBuf;
 
-    fn anthropic_config() -> ProviderConfig {
-        ProviderConfig {
-            kind: ProviderKind::Anthropic,
-            model: "test-model".into(),
-            api_key_file: None,
+    fn anthropic_config() -> ModelConfig {
+        ModelConfig {
+            scheme: SchemeKind::Anthropic,
             base_url: None,
+            model_id: "claude-sonnet-4-20250514".into(),
+            auth: AuthRef::ApiKey {
+                env: None,
+                file: None,
+            },
         }
     }
 
     #[test]
     #[serial]
     fn resolve_from_env() {
-        let env_name = ProviderKind::Anthropic.env_var_name();
-        unsafe { std::env::set_var(&env_name, "sk-from-env") };
-        let key = resolve_api_key(&anthropic_config()).unwrap();
-        unsafe { std::env::remove_var(&env_name) };
-        assert_eq!(key.as_deref(), Some("sk-from-env"));
+        let env_name = SchemeKind::Anthropic.default_env_var();
+        unsafe { std::env::set_var(env_name, "sk-from-env") };
+        let auth = resolve_auth(SchemeKind::Anthropic, &anthropic_config().auth).unwrap();
+        unsafe { std::env::remove_var(env_name) };
+        match auth {
+            ResolvedAuth::ApiKey(k) => assert_eq!(k, "sk-from-env"),
+            _ => panic!("expected ApiKey"),
+        }
     }
 
     #[test]
@@ -129,14 +184,20 @@ mod tests {
         let key_path = dir.path().join("key.txt");
         {
             let mut f = std::fs::File::create(&key_path).unwrap();
-            write!(f, "  sk-from-file\n").unwrap();
+            writeln!(f, "  sk-from-file").unwrap();
         }
-        let config = ProviderConfig {
-            api_key_file: Some(key_path),
+        let config = ModelConfig {
+            auth: AuthRef::ApiKey {
+                env: Some("INSOMNIA_API_KEY_NONEXISTENT".into()),
+                file: Some(key_path),
+            },
             ..anthropic_config()
         };
-        let key = resolve_api_key(&config).unwrap();
-        assert_eq!(key.as_deref(), Some("sk-from-file"));
+        let auth = resolve_auth(config.scheme, &config.auth).unwrap();
+        match auth {
+            ResolvedAuth::ApiKey(k) => assert_eq!(k, "sk-from-file"),
+            _ => panic!("expected ApiKey"),
+        }
     }
 
     #[test]
@@ -146,43 +207,57 @@ mod tests {
         let key_path = dir.path().join("key.txt");
         std::fs::write(&key_path, "sk-from-file").unwrap();
 
-        let env_name = ProviderKind::Anthropic.env_var_name();
-        unsafe { std::env::set_var(&env_name, "sk-from-env") };
+        let env_name = SchemeKind::Anthropic.default_env_var();
+        unsafe { std::env::set_var(env_name, "sk-from-env") };
 
-        let config = ProviderConfig {
-            api_key_file: Some(key_path),
+        let config = ModelConfig {
+            auth: AuthRef::ApiKey {
+                env: None,
+                file: Some(key_path),
+            },
             ..anthropic_config()
         };
-        let key = resolve_api_key(&config).unwrap();
-        unsafe { std::env::remove_var(&env_name) };
-        assert_eq!(key.as_deref(), Some("sk-from-env"));
+        let auth = resolve_auth(config.scheme, &config.auth).unwrap();
+        unsafe { std::env::remove_var(env_name) };
+        match auth {
+            ResolvedAuth::ApiKey(k) => assert_eq!(k, "sk-from-env"),
+            _ => panic!("expected ApiKey"),
+        }
     }
 
     #[test]
-    fn relative_api_key_file_is_rejected() {
-        let config = ProviderConfig {
-            api_key_file: Some(PathBuf::from("keys/anthropic")),
+    fn relative_auth_file_is_rejected() {
+        let config = ModelConfig {
+            auth: AuthRef::ApiKey {
+                env: Some("INSOMNIA_API_KEY_NONEXISTENT".into()),
+                file: Some(PathBuf::from("keys/anthropic")),
+            },
             ..anthropic_config()
         };
-        let err = resolve_api_key(&config).unwrap_err();
+        let err = resolve_auth(config.scheme, &config.auth).unwrap_err();
         assert!(matches!(err, ProviderError::Config(_)));
     }
 
     #[test]
+    #[serial]
     fn missing_key_returns_api_key_missing() {
-        let config = anthropic_config();
-        let result = build_client(&config);
+        let env_name = SchemeKind::Anthropic.default_env_var();
+        unsafe { std::env::remove_var(env_name) };
+        let result = build_client(&anthropic_config());
         assert!(matches!(result, Err(ProviderError::ApiKeyMissing { .. })));
     }
 
     #[test]
     fn ollama_succeeds_without_key() {
-        let config = ProviderConfig {
-            kind: ProviderKind::Ollama,
-            model: "llama3".into(),
-            api_key_file: None,
-            base_url: None,
+        // Ollama = Anthropic scheme + base_url 差し替え + AuthRef::None
+        let config = ModelConfig {
+            scheme: SchemeKind::Anthropic,
+            base_url: Some("http://localhost:11434".into()),
+            model_id: "llama3".into(),
+            auth: AuthRef::None,
         };
+        // scheme.required_auth() が XApiKey でも ResolvedAuth::None は許容する
+        // （None は全 scheme で受け入れるため）
         assert!(build_client(&config).is_ok());
     }
 }

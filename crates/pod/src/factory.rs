@@ -317,9 +317,9 @@ mod tests {
 [pod]
 name = "solo"
 
-[provider]
-kind = "anthropic"
-model = "claude-sonnet-4-20250514"
+[model]
+scheme = "anthropic"
+model_id = "claude-sonnet-4-20250514"
 
 [[scope.allow]]
 target = "{pwd}"
@@ -342,9 +342,9 @@ permission = "write"
         let pwd = tmp.path().canonicalize().unwrap();
         let user_cfg = PodManifestConfig::from_toml(&format!(
             r#"
-[provider]
-kind = "anthropic"
-model = "user-model"
+[model]
+scheme = "anthropic"
+model_id = "user-model"
 
 [[scope.allow]]
 target = "{pwd}"
@@ -355,8 +355,8 @@ permission = "read"
         .unwrap();
         let project_cfg = PodManifestConfig::from_toml(&format!(
             r#"
-[provider]
-model = "project-model"
+[model]
+model_id = "project-model"
 
 [[scope.allow]]
 target = "{pwd}"
@@ -387,7 +387,7 @@ name = "overlay-name"
         // overlay layer so later calls win. This also exercises the
         // scope union across layers (two allow rules).
         assert_eq!(manifest.pod.name, "overlay-name");
-        assert_eq!(manifest.provider.model, "project-model");
+        assert_eq!(manifest.model.model_id, "project-model");
         assert_eq!(manifest.scope.allow.len(), 2);
     }
 
@@ -406,9 +406,9 @@ name = "overlay-name"
 [pod]
 name = "from-user"
 
-[provider]
-kind = "anthropic"
-model = "user-model"
+[model]
+scheme = "anthropic"
+model_id = "user-model"
 
 [[scope.allow]]
 target = "{pwd}"
@@ -423,8 +423,8 @@ permission = "write"
         write(
             &project_manifest,
             r#"
-[provider]
-model = "project-model"
+[model]
+model_id = "project-model"
 "#,
         );
 
@@ -436,8 +436,8 @@ model = "project-model"
             .resolve()
             .unwrap();
 
-        // project layer overrides user layer on provider.model
-        assert_eq!(manifest.provider.model, "project-model");
+        // project layer overrides user layer on model.model_id
+        assert_eq!(manifest.model.model_id, "project-model");
         // user layer provides the rest
         assert_eq!(manifest.pod.name, "from-user");
     }
@@ -454,9 +454,9 @@ model = "project-model"
 [pod]
 name = "walked-up"
 
-[provider]
-kind = "anthropic"
-model = "claude-sonnet-4-20250514"
+[model]
+scheme = "anthropic"
+model_id = "claude-sonnet-4-20250514"
 
 [[scope.allow]]
 target = "{root}"
@@ -487,9 +487,9 @@ permission = "write"
 [pod]
 name = "standalone"
 
-[provider]
-kind = "anthropic"
-model = "m"
+[model]
+scheme = "anthropic"
+model_id = "m"
 
 [[scope.allow]]
 target = "{pwd}"
@@ -529,9 +529,9 @@ permission = "write"
 [pod]
 name = "rel-user"
 
-[provider]
-kind = "anthropic"
-model = "m"
+[model]
+scheme = "anthropic"
+model_id = "m"
 
 [[scope.allow]]
 target = "./workspace"
@@ -565,9 +565,9 @@ permission = "write"
 [pod]
 name = "rel-project"
 
-[provider]
-kind = "anthropic"
-model = "m"
+[model]
+scheme = "anthropic"
+model_id = "m"
 
 [[scope.allow]]
 target = "."
@@ -604,9 +604,9 @@ permission = "write"
 [pod]
 name = "factory-pod"
 
-[provider]
-kind = "anthropic"
-model = "m"
+[model]
+scheme = "anthropic"
+model_id = "m"
 
 [[scope.allow]]
 target = "{root}"
@@ -661,9 +661,9 @@ permission = "write"
         // pod.name missing — resolver must reject.
         let overlay = format!(
             r#"
-[provider]
-kind = "anthropic"
-model = "m"
+[model]
+scheme = "anthropic"
+model_id = "m"
 
 [[scope.allow]]
 target = "{pwd}"

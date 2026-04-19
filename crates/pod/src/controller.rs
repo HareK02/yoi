@@ -113,7 +113,7 @@ impl PodController {
         let scope_for_tools = pod.scope().clone();
         let pwd_for_tools = pod.pwd().to_path_buf();
         let spawner_name = pod.manifest().pod.name.clone();
-        let spawner_provider = pod.manifest().provider.clone();
+        let spawner_model = pod.manifest().model.clone();
 
         // Parent callback socket (this Pod's own parent, used for
         // `PodEvent` upward reports). `None` for top-level Pods.
@@ -230,7 +230,7 @@ impl PodController {
                 pwd_for_tools,
                 spawned_registry.clone(),
                 self_parent_socket.clone(),
-                spawner_provider.clone(),
+                spawner_model.clone(),
             ));
             worker.register_tool(send_to_pod_tool(spawned_registry.clone()));
             worker.register_tool(read_pod_output_tool(spawned_registry.clone()));
@@ -663,11 +663,11 @@ where
     St: Store,
 {
     let manifest = pod.manifest();
-    let provider = match manifest.provider.kind {
-        manifest::ProviderKind::Anthropic => "anthropic",
-        manifest::ProviderKind::Openai => "openai",
-        manifest::ProviderKind::Gemini => "gemini",
-        manifest::ProviderKind::Ollama => "ollama",
+    let provider = match manifest.model.scheme {
+        manifest::SchemeKind::Anthropic => "anthropic",
+        manifest::SchemeKind::OpenaiChat => "openai_chat",
+        manifest::SchemeKind::OpenaiResponses => "openai_responses",
+        manifest::SchemeKind::Gemini => "gemini",
     };
     // The tool list mirrors what `spawn()` registers on the Worker:
     // builtin filesystem tools plus the pod-orchestration tools.
@@ -689,7 +689,7 @@ where
         pod_name: manifest.pod.name.clone(),
         cwd: pod.pwd().display().to_string(),
         provider: provider.into(),
-        model: manifest.provider.model.clone(),
+        model: manifest.model.model_id.clone(),
         scope_summary: pod.scope().summary(),
         tools: tool_names,
     }

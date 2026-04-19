@@ -1,30 +1,31 @@
 mod config;
 pub mod defaults;
+mod model;
 mod scope;
 
 pub use config::{
-    CompactionConfigPartial, PodManifestConfig, PodMetaConfig, ProviderConfigPartial, ResolveError,
+    CompactionConfigPartial, ModelConfigPartial, PodManifestConfig, PodMetaConfig, ResolveError,
     ToolOutputLimitsPartial, WorkerManifestConfig,
 };
+pub use model::{AuthRef, ModelConfig, SchemeKind};
 pub use protocol::{Permission, ScopeRule};
 pub use scope::{Scope, ScopeError};
 
 use std::collections::HashMap;
 use std::num::NonZeroU32;
-use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
 /// Declarative configuration for a Pod.
 ///
-/// Parsed from a TOML manifest file. Describes the provider, model,
-/// system prompt, and directory scope (required). The Pod's working
-/// directory is **not** part of the manifest — it is the process's
-/// `std::env::current_dir()` at construction time.
+/// Parsed from a TOML manifest file. Describes the model, system prompt,
+/// and directory scope (required). The Pod's working directory is **not**
+/// part of the manifest — it is the process's `std::env::current_dir()`
+/// at construction time.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PodManifest {
     pub pod: PodMeta,
-    pub provider: ProviderConfig,
+    pub model: ModelConfig,
     pub worker: WorkerManifest,
     pub scope: ScopeConfig,
     #[serde(default)]
@@ -35,44 +36,6 @@ pub struct PodManifest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PodMeta {
     pub name: String,
-}
-
-/// LLM provider configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProviderConfig {
-    pub kind: ProviderKind,
-    pub model: String,
-    /// Path to a file containing the API key (read and trimmed at startup).
-    #[serde(default)]
-    pub api_key_file: Option<PathBuf>,
-    /// Custom base URL for the provider API.
-    #[serde(default)]
-    pub base_url: Option<String>,
-}
-
-/// Supported LLM providers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ProviderKind {
-    Anthropic,
-    Openai,
-    Gemini,
-    Ollama,
-}
-
-impl ProviderKind {
-    /// Conventional environment variable name for the API key.
-    ///
-    /// Returns `INSOMNIA_API_KEY_{KIND}` (e.g. `INSOMNIA_API_KEY_ANTHROPIC`).
-    pub fn env_var_name(self) -> String {
-        let kind = match self {
-            Self::Anthropic => "ANTHROPIC",
-            Self::Openai => "OPENAI",
-            Self::Gemini => "GEMINI",
-            Self::Ollama => "OLLAMA",
-        };
-        format!("INSOMNIA_API_KEY_{kind}")
-    }
 }
 
 /// Worker-level configuration embedded in the manifest.
@@ -211,10 +174,10 @@ pub struct CompactionConfig {
     #[serde(default = "default_compact_worker_max_input_tokens")]
     pub compact_worker_max_input_tokens: u64,
 
-    /// Optional provider for the compactor (summary) LLM.
-    /// If omitted, the main provider is cloned via `clone_boxed()`.
+    /// Optional model for the compactor (summary) LLM.
+    /// If omitted, the main model is cloned via `clone_boxed()`.
     #[serde(default)]
-    pub provider: Option<ProviderConfig>,
+    pub model: Option<ModelConfig>,
 }
 
 fn default_prune_protected_turns() -> usize {
@@ -243,7 +206,7 @@ impl Default for CompactionConfig {
             compact_retained_tokens: default_compact_retained_tokens(),
             compact_auto_read_budget: default_compact_auto_read_budget(),
             compact_worker_max_input_tokens: default_compact_worker_max_input_tokens(),
-            provider: None,
+            model: None,
         }
     }
 }
@@ -263,9 +226,9 @@ mod tests {
 [pod]
 name = "test-agent"
 
-[provider]
-kind = "anthropic"
-model = "claude-sonnet-4-20250514"
+[model]
+scheme = "anthropic"
+model_id = "claude-sonnet-4-20250514"
 
 [worker]
 
@@ -278,9 +241,9 @@ permission = "write"
     fn parse_minimal_manifest() {
         let manifest = PodManifest::from_toml(MINIMAL_REQUIRED).unwrap();
         assert_eq!(manifest.pod.name, "test-agent");
-        assert_eq!(manifest.provider.kind, ProviderKind::Anthropic);
-        assert_eq!(manifest.provider.model, "claude-sonnet-4-20250514");
-        assert!(manifest.provider.api_key_file.is_none());
+        assert_eq!(manifest.model.scheme, SchemeKind::Anthropic);
+        assert_eq!(manifest.model.model_id, "claude-sonnet-4-20250514");
+        assert_eq!(manifest.model.auth, AuthRef::None);
         assert_eq!(manifest.scope.allow.len(), 1);
         assert!(manifest.scope.deny.is_empty());
         assert_eq!(manifest.worker.instruction, defaults::DEFAULT_INSTRUCTION);
@@ -292,10 +255,10 @@ permission = "write"
 [pod]
 name = "code-reviewer"
 
-[provider]
-kind = "anthropic"
-model = "claude-sonnet-4-20250514"
-api_key_file = "/abs/keys/anthropic"
+[model]
+scheme = "anthropic"
+model_id = "claude-sonnet-4-20250514"
+auth = { kind = "api_key", file = "/abs/keys/anthropic" }
 
 [worker]
 instruction = "$user/reviewer"
@@ -317,10 +280,11 @@ permission = "write"
 "#;
         let manifest = PodManifest::from_toml(toml).unwrap();
         assert_eq!(manifest.pod.name, "code-reviewer");
-        assert_eq!(
-            manifest.provider.api_key_file.as_deref(),
-            Some(std::path::Path::new("/abs/keys/anthropic"))
-        );
+        let file = match &manifest.model.auth {
+            AuthRef::ApiKey { file, .. } => file.as_deref(),
+            _ => panic!("expected ApiKey"),
+        };
+        assert_eq!(file, Some(std::path::Path::new("/abs/keys/anthropic")));
         assert_eq!(manifest.worker.instruction, "$user/reviewer");
         assert_eq!(manifest.worker.max_tokens, Some(4096));
         assert_eq!(manifest.worker.temperature, Some(0.3));
@@ -340,9 +304,9 @@ permission = "write"
 [pod]
 name = "missing-scope"
 
-[provider]
-kind = "anthropic"
-model = "claude-sonnet-4-20250514"
+[model]
+scheme = "anthropic"
+model_id = "claude-sonnet-4-20250514"
 
 [worker]
 "#;
@@ -408,20 +372,20 @@ model = "claude-sonnet-4-20250514"
     }
 
     #[test]
-    fn parse_compaction_with_provider() {
+    fn parse_compaction_with_model() {
         let toml = format!(
             "{MINIMAL_REQUIRED}\n\
              [compaction]\n\
              compact_threshold = 80000\n\n\
-             [compaction.provider]\n\
-             kind = \"gemini\"\n\
-             model = \"gemini-2.0-flash\"\n"
+             [compaction.model]\n\
+             scheme = \"gemini\"\n\
+             model_id = \"gemini-2.0-flash\"\n"
         );
         let manifest = PodManifest::from_toml(&toml).unwrap();
         let c = manifest.compaction.unwrap();
-        let p = c.provider.unwrap();
-        assert_eq!(p.kind, ProviderKind::Gemini);
-        assert_eq!(p.model, "gemini-2.0-flash");
+        let p = c.model.unwrap();
+        assert_eq!(p.scheme, SchemeKind::Gemini);
+        assert_eq!(p.model_id, "gemini-2.0-flash");
     }
 
     #[test]
@@ -431,8 +395,9 @@ model = "claude-sonnet-4-20250514"
     }
 
     #[test]
-    fn reject_unknown_provider() {
-        let toml = MINIMAL_REQUIRED.replace("kind = \"anthropic\"", "kind = \"unknown_provider\"");
+    fn reject_unknown_scheme() {
+        let toml =
+            MINIMAL_REQUIRED.replace("scheme = \"anthropic\"", "scheme = \"unknown_scheme\"");
         assert!(PodManifest::from_toml(&toml).is_err());
     }
 

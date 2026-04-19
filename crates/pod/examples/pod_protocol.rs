@@ -16,9 +16,9 @@ fn manifest_toml(pwd: &std::path::Path) -> String {
 name = "protocol-demo"
 pwd = "{pwd}"
 
-[provider]
-kind = "anthropic"
-model = "claude-sonnet-4-20250514"
+[model]
+scheme = "anthropic"
+model_id = "claude-sonnet-4-20250514"
 
 [worker]
 system_prompt = "You are a concise assistant. Reply in one or two sentences."
