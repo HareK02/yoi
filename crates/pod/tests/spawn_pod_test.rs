@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 
 use llm_worker::tool::{ToolError, ToolOutput};
-use manifest::{Permission, ScopeRule};
+use manifest::{Permission, ProviderConfig, ProviderKind, ScopeRule};
 use pod::runtime_dir::{RuntimeDir, SpawnedPodRecord};
 use pod::scope_lock::{self, LockFileGuard};
 use pod::spawn_pod::spawn_pod_tool;
@@ -132,6 +132,18 @@ fn which_true() -> String {
     "/bin/true".into()
 }
 
+/// Tests don't exercise the provider — they intercept the spawned
+/// child via a mock socket — but `spawn_pod_tool` needs a value to
+/// embed in the overlay TOML. Any well-formed `ProviderConfig` works.
+fn dummy_provider() -> ProviderConfig {
+    ProviderConfig {
+        kind: ProviderKind::Anthropic,
+        model: "claude-test".into(),
+        api_key_file: None,
+        base_url: None,
+    }
+}
+
 fn clear_env() {
     unsafe {
         std::env::remove_var("INSOMNIA_SCOPE_LOCK");
@@ -159,6 +171,7 @@ async fn spawn_pod_delegates_scope_and_sends_run() {
         allow_root.path().to_path_buf(),
         registry,
         None,
+        dummy_provider(),
     );
     let (_meta, tool) = def();
 
@@ -221,6 +234,7 @@ async fn spawn_pod_rejects_scope_outside_spawner() {
         allow_root.path().to_path_buf(),
         registry,
         None,
+        dummy_provider(),
     );
     let (_meta, tool) = def();
 
@@ -279,6 +293,7 @@ async fn spawn_pod_rolls_back_reservation_when_socket_never_appears() {
         allow_root.path().to_path_buf(),
         registry,
         None,
+        dummy_provider(),
     );
     let (_meta, tool) = def();
 

@@ -113,6 +113,7 @@ impl PodController {
         let scope_for_tools = pod.scope().clone();
         let pwd_for_tools = pod.pwd().to_path_buf();
         let spawner_name = pod.manifest().pod.name.clone();
+        let spawner_provider = pod.manifest().provider.clone();
 
         // Parent callback socket (this Pod's own parent, used for
         // `PodEvent` upward reports). `None` for top-level Pods.
@@ -229,6 +230,7 @@ impl PodController {
                 pwd_for_tools,
                 spawned_registry.clone(),
                 self_parent_socket.clone(),
+                spawner_provider.clone(),
             ));
             worker.register_tool(send_to_pod_tool(spawned_registry.clone()));
             worker.register_tool(read_pod_output_tool(spawned_registry.clone()));
