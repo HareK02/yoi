@@ -201,6 +201,16 @@ pub struct CompactionConfig {
     #[serde(default = "default_compact_retained_tokens")]
     pub compact_retained_tokens: u64,
 
+    /// Aggregate token budget for auto-read file contents injected into
+    /// the compacted session by the compact worker.
+    #[serde(default = "default_compact_auto_read_budget")]
+    pub compact_auto_read_budget: u64,
+
+    /// Cumulative input-token cap for the compact worker's own LLM
+    /// calls. Exceeding this aborts the compact run.
+    #[serde(default = "default_compact_worker_max_input_tokens")]
+    pub compact_worker_max_input_tokens: u64,
+
     /// Optional provider for the compactor (summary) LLM.
     /// If omitted, the main provider is cloned via `clone_boxed()`.
     #[serde(default)]
@@ -216,6 +226,12 @@ fn default_prune_min_savings() -> u64 {
 fn default_compact_retained_tokens() -> u64 {
     defaults::COMPACT_RETAINED_TOKENS
 }
+fn default_compact_auto_read_budget() -> u64 {
+    defaults::COMPACT_AUTO_READ_BUDGET
+}
+fn default_compact_worker_max_input_tokens() -> u64 {
+    defaults::COMPACT_WORKER_MAX_INPUT_TOKENS
+}
 
 impl Default for CompactionConfig {
     fn default() -> Self {
@@ -225,6 +241,8 @@ impl Default for CompactionConfig {
             compact_threshold: None,
             compact_request_threshold: None,
             compact_retained_tokens: default_compact_retained_tokens(),
+            compact_auto_read_budget: default_compact_auto_read_budget(),
+            compact_worker_max_input_tokens: default_compact_worker_max_input_tokens(),
             provider: None,
         }
     }

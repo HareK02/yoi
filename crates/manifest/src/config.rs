@@ -88,6 +88,10 @@ pub struct CompactionConfigPartial {
     #[serde(default)]
     pub compact_retained_tokens: Option<u64>,
     #[serde(default)]
+    pub compact_auto_read_budget: Option<u64>,
+    #[serde(default)]
+    pub compact_worker_max_input_tokens: Option<u64>,
+    #[serde(default)]
     pub provider: Option<ProviderConfigPartial>,
 }
 
@@ -244,6 +248,12 @@ impl CompactionConfigPartial {
             compact_retained_tokens: upper
                 .compact_retained_tokens
                 .or(self.compact_retained_tokens),
+            compact_auto_read_budget: upper
+                .compact_auto_read_budget
+                .or(self.compact_auto_read_budget),
+            compact_worker_max_input_tokens: upper
+                .compact_worker_max_input_tokens
+                .or(self.compact_worker_max_input_tokens),
             provider: merge_option(self.provider, upper.provider, ProviderConfigPartial::merge),
         }
     }
@@ -374,6 +384,12 @@ impl TryFrom<PodManifestConfig> for PodManifest {
                     compact_retained_tokens: c
                         .compact_retained_tokens
                         .unwrap_or(defaults::COMPACT_RETAINED_TOKENS),
+                    compact_auto_read_budget: c
+                        .compact_auto_read_budget
+                        .unwrap_or(defaults::COMPACT_AUTO_READ_BUDGET),
+                    compact_worker_max_input_tokens: c
+                        .compact_worker_max_input_tokens
+                        .unwrap_or(defaults::COMPACT_WORKER_MAX_INPUT_TOKENS),
                     provider: comp_provider,
                 })
             })

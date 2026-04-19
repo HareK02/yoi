@@ -28,3 +28,20 @@ pub const COMPACT_RETAINED_TOKENS: u64 = 8000;
 /// is omitted. See the `PromptLoader` prefix addressing scheme for the
 /// `$insomnia/` / `$user/` / `$workspace/` namespaces.
 pub const DEFAULT_INSTRUCTION: &str = "$insomnia/default";
+
+/// Token budget for auto-read file contents injected into the new
+/// session after compaction. Limits how much raw file text the
+/// compact worker can pull into the compacted context via
+/// `mark_read_required`. See
+/// [`crate::CompactionConfig::compact_auto_read_budget`].
+pub const COMPACT_AUTO_READ_BUDGET: u64 = 8000;
+
+/// Cumulative input-token cap for the compact worker's own LLM
+/// calls. Exceeding this aborts the compact run (circuit-breaker
+/// path). See
+/// [`crate::CompactionConfig::compact_worker_max_input_tokens`].
+pub const COMPACT_WORKER_MAX_INPUT_TOKENS: u64 = 50_000;
+
+/// Number of recently-touched files fed to the compact worker as
+/// default references.
+pub const COMPACT_DEFAULT_REFERENCE_COUNT: usize = 5;

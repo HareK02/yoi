@@ -47,18 +47,35 @@ impl Hook<PreLlmRequest> for UsageTrackingHook {
 }
 
 const SUMMARY_SYSTEM_PROMPT: &str = "\
-You are a context compaction assistant. \
-Summarise the conversation below into a structured summary. \
-Preserve concrete details: file paths, function names, error messages, decisions made. \
-Use the following format:\n\n\
-## Original Task\n\
-(the user's original request)\n\n\
-## Completed Work\n\
-- (what was done, with specifics)\n\n\
-## Key Discoveries\n\
-- (facts, constraints, errors found)\n\n\
-## Current State\n\
-- (files changed, remaining work)";
+You are a context compaction assistant. Your job is to hand the next session a \
+structured summary plus pointers to the files it actually needs.\n\n\
+Tools you can call:\n\
+- `read_file(file_path, offset?, limit?)` — inspect referenced files before deciding.\n\
+- `mark_read_required(file_path, offset?, limit?)` — inject a file's contents into the \
+  next session as an auto-read system message. Counts against `auto_read_budget`.\n\
+- `add_reference(file_path)` — record a file path the next session should know about \
+  without embedding its contents.\n\
+- `write_summary(text)` — deliver the final structured summary. May be called multiple \
+  times; only the last call is kept.\n\n\
+Always finish by calling `write_summary`. Produce the summary in this exact format:\n\n\
+## Completed Tasks\n\
+### (task name)\n\
+- what was done (use concrete type / file / function names)\n\
+- gotchas or facts that came up\n\n\
+## Active Task\n\
+### (task name)\n\
+- goal\n\
+- current state (what is done / not done)\n\
+- next step\n\n\
+## Key Decisions\n\
+- (decision) — (reason)\n\n\
+## User Directives\n\
+- \"verbatim user line\" — only include directives whose wording the next session \
+  should not lose.\n\n\
+## Current Work\n\
+(2–3 lines on what was happening just before compaction).\n\n\
+Keep code snippets and raw tool output OUT of the summary — that is what auto-read \
+and references are for. Target 1000–2000 tokens.";
 
 /// An independent agent execution unit.
 ///
@@ -792,6 +809,13 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     ///
     /// Returns the new session ID.
     pub async fn compact(&mut self, retained_tokens: u64) -> Result<SessionId, PodError> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        use crate::compact_worker::{
+            CompactWorkerContext, CompactWorkerInterceptor, add_reference_tool,
+            mark_read_required_tool, slice_lines, write_summary_tool,
+        };
+
         // Decide the cut point by projecting the UsageRecord timeline onto
         // the current history: keep the tail whose estimated token count is
         // within `retained_tokens`. Item-granular, turn boundaries ignored.
@@ -801,41 +825,179 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         let history = worker.history();
         let retain_from = cut.index.min(history.len());
         let retained_items = history[retain_from..].to_vec();
-        let items_to_summarise = &history[..retain_from];
+        let items_to_summarise = history[..retain_from].to_vec();
 
-        // Build summary prompt.
-        let summary_prompt = build_summary_prompt(items_to_summarise);
+        // Compaction-related knobs. Fall through to manifest defaults when
+        // `[compaction]` is omitted entirely.
+        let (auto_read_budget, compact_worker_max_input_tokens) = self
+            .manifest
+            .compaction
+            .as_ref()
+            .map(|c| (c.compact_auto_read_budget, c.compact_worker_max_input_tokens))
+            .unwrap_or((
+                manifest::defaults::COMPACT_AUTO_READ_BUDGET,
+                manifest::defaults::COMPACT_WORKER_MAX_INPUT_TOKENS,
+            ));
 
-        // Create a disposable summary Worker.
+        // Default references: the N most-recently-touched files in the
+        // session, surfaced so the compact worker can inspect them and
+        // decide which (if any) the next session needs.
+        let default_refs: Vec<PathBuf> = self
+            .tracker
+            .as_ref()
+            .map(|t| t.recent_files(manifest::defaults::COMPACT_DEFAULT_REFERENCE_COUNT))
+            .unwrap_or_default();
+
+        // Input text fed to the compact worker. Includes the default
+        // references and the (pruned) conversation text.
+        let summary_input = build_summary_input(&items_to_summarise, &default_refs);
+
+        // Worker-side state collected by the compact worker's tool calls.
+        let ctx = Arc::new(std::sync::Mutex::new(CompactWorkerContext::with_budget(
+            auto_read_budget,
+        )));
+
+        // Build an independent compact worker. Scope and pwd are shared
+        // with the main Pod (reads go through the same policy) but the
+        // Tracker is fresh — compact-time reads must not pollute the
+        // main session's recency list, which feeds `default_refs` above.
+        let scoped_fs = tools::ScopedFs::new(self.scope.clone(), self.pwd.clone());
+        let summary_tracker = tools::Tracker::new();
         let summary_client: Box<dyn LlmClient> = self.build_compactor_client()?;
         let mut summary_worker = Worker::new(summary_client)
             .system_prompt(SUMMARY_SYSTEM_PROMPT)
             .temperature(0.0);
-        summary_worker.set_max_tokens(2048);
+        summary_worker.set_max_tokens(4096);
+
+        // Cumulative input-token meter + interceptor. The meter is bumped
+        // from the on_usage callback and read on every pre_llm_request.
+        let input_so_far = Arc::new(AtomicU64::new(0));
+        {
+            let acc = input_so_far.clone();
+            summary_worker.on_usage(move |event| {
+                if let Some(tokens) = event.input_tokens {
+                    acc.fetch_add(tokens, Ordering::Relaxed);
+                }
+            });
+        }
+        summary_worker.set_interceptor(CompactWorkerInterceptor {
+            input_so_far: input_so_far.clone(),
+            max_input_tokens: compact_worker_max_input_tokens,
+        });
+
+        // Tools: read_file (shared scope, fresh tracker) + the three
+        // compact-specific tools that populate `ctx`.
+        summary_worker.register_tool(tools::read_tool(scoped_fs.clone(), summary_tracker));
+        summary_worker
+            .register_tool(mark_read_required_tool(scoped_fs.clone(), ctx.clone()));
+        summary_worker.register_tool(add_reference_tool(ctx.clone()));
+        summary_worker.register_tool(write_summary_tool(ctx.clone()));
 
         let out = summary_worker
-            .run(summary_prompt)
+            .run(summary_input)
             .await
             .map_err(PodError::Worker)?;
-        let summary_text = out
-            .worker
-            .history()
-            .iter()
-            .filter_map(|item| {
-                if item.is_assistant_message() {
-                    item.as_text().map(String::from)
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+        let mut locked_worker = out.worker;
 
-        // Build new history: [summary as user message, ...retained].
-        let mut new_history = Vec::with_capacity(retained_items.len() + 1);
+        // Guard: nudge the worker once more if the expected outputs
+        // (summary, and any auto-read nominations when default refs
+        // existed) were not produced on the first pass. `write_summary`
+        // is idempotent-by-overwrite so a second call is safe.
+        let nudge = {
+            let snapshot = ctx.lock().expect("compact ctx poisoned").clone();
+            if snapshot.summary.is_none() {
+                Some(
+                    "You have not called `write_summary` yet. Deliver the structured \
+                     summary now (Completed Tasks / Active Task / Key Decisions / \
+                     User Directives / Current Work) and nominate any files the next \
+                     session needs with `mark_read_required`."
+                        .to_string(),
+                )
+            } else if snapshot.read_required.is_empty() && !default_refs.is_empty() {
+                Some(
+                    "Summary received. If any of the referenced files are required \
+                     for the next session to continue the task, call \
+                     `mark_read_required` on them now. Otherwise reply briefly to \
+                     close out."
+                        .to_string(),
+                )
+            } else {
+                None
+            }
+        };
+        if let Some(prompt) = nudge {
+            let _ = locked_worker
+                .run(prompt)
+                .await
+                .map_err(PodError::Worker)?;
+        }
+
+        let final_ctx = ctx.lock().expect("compact ctx poisoned").clone();
+        let summary_text = final_ctx
+            .summary
+            .clone()
+            .ok_or(PodError::CompactSummaryMissing)?;
+
+        // Re-read each auto-read target through ScopedFs and render the
+        // requested slice. Errors are logged and skipped rather than
+        // aborting compaction — a missing / moved file should not fail
+        // the whole compact.
+        let mut auto_read_messages = Vec::new();
+        for req in &final_ctx.read_required {
+            match scoped_fs.read_bytes(&req.path) {
+                Ok(bytes) => {
+                    let text = String::from_utf8_lossy(&bytes).into_owned();
+                    let body = slice_lines(&text, req.offset.unwrap_or(0), req.limit);
+                    let range = match (req.offset, req.limit) {
+                        (None, None) => String::new(),
+                        (Some(off), None) => format!(":{}-", off + 1),
+                        (None, Some(lim)) => format!(":1-{lim}"),
+                        (Some(off), Some(lim)) => {
+                            format!(":{}-{}", off + 1, off.saturating_add(lim))
+                        }
+                    };
+                    auto_read_messages.push(Item::system_message(format!(
+                        "[Auto-read file: {}{range}]\n{body}",
+                        req.path.display()
+                    )));
+                }
+                Err(e) => {
+                    warn!(
+                        path = %req.path.display(),
+                        error = %e,
+                        "auto-read target could not be read; skipping",
+                    );
+                }
+            }
+        }
+
+        // Reference list as a single system message; omitted when empty.
+        let reference_message = (!final_ctx.references.is_empty()).then(|| {
+            let list = final_ctx
+                .references
+                .iter()
+                .map(|p| format!("- {}", p.display()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            Item::system_message(format!(
+                "[Referenced files — read before compaction, contents not included]\n\
+                 {list}\n\
+                 Use read_file to access current contents if needed."
+            ))
+        });
+
+        // Build new history: [summary, ...auto-read, references, ...retained].
+        let mut new_history = Vec::with_capacity(
+            1 + auto_read_messages.len() + reference_message.is_some() as usize
+                + retained_items.len(),
+        );
         new_history.push(Item::system_message(format!(
             "[Compacted context summary]\n\n{summary_text}"
         )));
+        new_history.extend(auto_read_messages);
+        if let Some(msg) = reference_message {
+            new_history.push(msg);
+        }
         new_history.extend(retained_items);
 
         // Persist as a new compacted session.
@@ -1087,6 +1249,37 @@ impl From<WorkerResult> for PodRunResult {
     }
 }
 
+/// Build the compact worker's input: default-reference instructions,
+/// the list of recently-touched files, and the pruned conversation
+/// produced by [`build_summary_prompt`].
+fn build_summary_input(items: &[Item], default_refs: &[PathBuf]) -> String {
+    let mut out = String::new();
+    out.push_str(
+        "Summarise the conversation below into a structured summary and nominate \
+         files the next session needs.\n\n",
+    );
+    if !default_refs.is_empty() {
+        out.push_str(
+            "These files were touched recently in this session. Use `read_file` \
+             on them as needed, then call `mark_read_required` for any whose \
+             contents the next session must have, and `add_reference` for files \
+             it should know about by name only.\n\n## Referenced files\n",
+        );
+        for p in default_refs {
+            out.push_str("- ");
+            out.push_str(&p.display().to_string());
+            out.push('\n');
+        }
+        out.push('\n');
+    }
+    out.push_str("## Conversation\n");
+    out.push_str(&build_summary_prompt(items));
+    out.push_str(
+        "\n\nWhen you are done, call `write_summary` with the final 5-section text.",
+    );
+    out
+}
+
 /// Format conversation items into a text prompt for the summary Worker.
 ///
 /// The summary should capture decisions and user intent, not recreate code.
@@ -1157,6 +1350,9 @@ pub enum PodError {
 
     #[error("compaction thrash: context still exceeds threshold immediately after compact")]
     CompactThrash,
+
+    #[error("compact worker did not produce a summary (write_summary was never called)")]
+    CompactSummaryMissing,
 
     #[error("invalid system prompt template: {source}")]
     InvalidSystemPromptTemplate {
