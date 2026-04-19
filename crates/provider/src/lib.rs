@@ -15,6 +15,7 @@ use llm_worker::llm_client::{
     capability::ModelCapability,
     scheme::{
         Scheme, anthropic::AnthropicScheme, gemini::GeminiScheme, openai_chat::OpenAIScheme,
+        openai_responses::OpenAIResponsesScheme,
     },
     transport::{HttpTransport, ResolvedAuth},
 };
@@ -119,9 +120,9 @@ pub fn build_client(config: &ModelConfig) -> Result<Box<dyn LlmClient>, Provider
         SchemeKind::Anthropic => build_transport(AnthropicScheme::new(), config, resolved),
         SchemeKind::OpenaiChat => build_transport(OpenAIScheme::new(), config, resolved),
         SchemeKind::Gemini => build_transport(GeminiScheme::new(), config, resolved),
-        SchemeKind::OpenaiResponses => Err(ProviderError::SchemeNotImplemented {
-            scheme: config.scheme,
-        }),
+        SchemeKind::OpenaiResponses => {
+            build_transport(OpenAIResponsesScheme::new(), config, resolved)
+        }
     }
 }
 

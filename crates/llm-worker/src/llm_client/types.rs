@@ -86,8 +86,16 @@ pub enum Item {
         /// Optional item ID
         #[serde(skip_serializing_if = "Option::is_none")]
         id: Option<ItemId>,
-        /// Reasoning text
+        /// Reasoning text（reasoning body, `reasoning_text.delta` の累積）
         text: String,
+        /// Reasoning summary（OpenAI Responses の `summary_text[]` を格納。
+        /// 他 scheme は空）
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        summary: Vec<String>,
+        /// サーバから返された暗号化済み reasoning blob。ZDR / `store=false`
+        /// 運用で stateless に再送するときそのまま添える必要がある。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        encrypted_content: Option<String>,
         /// Item status
         #[serde(skip_serializing_if = "Option::is_none")]
         status: Option<ItemStatus>,
@@ -214,8 +222,29 @@ impl Item {
         Self::Reasoning {
             id: None,
             text: text.into(),
+            summary: Vec::new(),
+            encrypted_content: None,
             status: None,
         }
+    }
+
+    /// Set reasoning summary on a `Reasoning` item. No-op on other variants.
+    pub fn with_reasoning_summary(mut self, new_summary: Vec<String>) -> Self {
+        if let Self::Reasoning { summary, .. } = &mut self {
+            *summary = new_summary;
+        }
+        self
+    }
+
+    /// Set `encrypted_content` on a `Reasoning` item. No-op on other variants.
+    pub fn with_encrypted_content(mut self, content: impl Into<String>) -> Self {
+        if let Self::Reasoning {
+            encrypted_content, ..
+        } = &mut self
+        {
+            *encrypted_content = Some(content.into());
+        }
+        self
     }
 
     // ========================================================================
