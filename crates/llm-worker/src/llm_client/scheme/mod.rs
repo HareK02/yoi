@@ -15,9 +15,10 @@ use serde_json::Value;
 
 use super::auth::AuthRequirement;
 use super::capability::ModelCapability;
+use super::client::ConfigWarning;
 use super::error::ClientError;
 use super::event::Event;
-use super::types::Request;
+use super::types::{Request, RequestConfig};
 
 /// wire scheme の抽象。各プロバイダの API 仕様ごとに 1 つ実装する。
 ///
@@ -44,7 +45,7 @@ pub trait Scheme: Clone + Send + Sync + 'static {
     fn path(&self, model_id: &str) -> String;
 
     /// この scheme が要求する認証形式。`build_client` 時に
-    /// [`AuthRef`](../../../manifest/enum.AuthRef.html) と照合する。
+    /// `manifest::AuthRef` と照合する。
     fn required_auth(&self) -> AuthRequirement;
 
     /// `Content-Type` 以外の追加ヘッダ。`anthropic-version` / `anthropic-beta` 等。
@@ -75,8 +76,20 @@ pub trait Scheme: Clone + Send + Sync + 'static {
     ) -> Result<Vec<Event>, ClientError>;
 
     /// 既知モデル ID の能力テーブル引き。未知なら `None` を返す
-    /// ので、呼び出し側は scheme ごとの安全側デフォルト
-    /// （[`ModelCapability::minimal`]）にフォールバックする。
+    /// ので、呼び出し側は [`Scheme::default_capability`] に
+    /// フォールバックする。
     fn capability_for(&self, model_id: &str) -> Option<ModelCapability>;
+
+    /// scheme 既定の capability。未知モデル ID や未明示モデルでの
+    /// フォールバックに使う。`capability_for` と違って必ず値を返す。
+    fn default_capability(&self) -> ModelCapability;
+
+    /// scheme 側でサポートしていない `RequestConfig` フィールドを
+    /// 警告として返す（例: OpenAI Chat は `top_k` 非対応）。
+    /// デフォルトは空 Vec。
+    fn validate_config(&self, config: &RequestConfig) -> Vec<ConfigWarning> {
+        let _ = config;
+        Vec::new()
+    }
 }
 

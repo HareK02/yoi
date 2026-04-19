@@ -12,7 +12,7 @@
 
 use llm_worker::llm_client::{
     LlmClient,
-    capability::{CacheStrategy, ModelCapability, StructuredOutput, ToolCallingSupport},
+    capability::ModelCapability,
     scheme::{
         Scheme, anthropic::AnthropicScheme, gemini::GeminiScheme, openai_chat::OpenAIScheme,
     },
@@ -79,34 +79,6 @@ fn resolve_auth(
     }
 }
 
-/// `SchemeKind` ごとに固定のデフォルト capability（未知モデル用）。
-fn default_capability(scheme: SchemeKind) -> ModelCapability {
-    match scheme {
-        SchemeKind::Anthropic => ModelCapability {
-            tool_calling: ToolCallingSupport::Parallel,
-            structured_output: StructuredOutput::JsonSchema,
-            reasoning: None,
-            vision: false,
-            // Ollama の /v1/messages 流用時に cache_control を拒否されないよう Auto
-            prompt_caching: CacheStrategy::Auto,
-        },
-        SchemeKind::OpenaiChat | SchemeKind::OpenaiResponses => ModelCapability {
-            tool_calling: ToolCallingSupport::Parallel,
-            structured_output: StructuredOutput::JsonSchema,
-            reasoning: None,
-            vision: false,
-            prompt_caching: CacheStrategy::Auto,
-        },
-        SchemeKind::Gemini => ModelCapability {
-            tool_calling: ToolCallingSupport::Parallel,
-            structured_output: StructuredOutput::JsonSchema,
-            reasoning: None,
-            vision: true,
-            prompt_caching: CacheStrategy::Auto,
-        },
-    }
-}
-
 fn build_transport<S: Scheme>(
     scheme: S,
     config: &ModelConfig,
@@ -117,9 +89,16 @@ fn build_transport<S: Scheme>(
             scheme: config.scheme,
         });
     }
-    let capability = scheme
-        .capability_for(&config.model_id)
-        .unwrap_or_else(|| default_capability(config.scheme));
+    // capability の優先順位:
+    //   1. `ModelConfig.capability` の明示指定（OpenAI 互換ルーターの
+    //      未知モデル等、マニフェストで完全に上書きしたいケース）
+    //   2. scheme 静的テーブル（既知モデル）
+    //   3. `Scheme::default_capability()`（scheme ごとの安全側デフォルト）
+    let capability: ModelCapability = config
+        .capability
+        .clone()
+        .or_else(|| scheme.capability_for(&config.model_id))
+        .unwrap_or_else(|| scheme.default_capability());
     let base_url = config
         .base_url
         .clone()
@@ -162,6 +141,7 @@ mod tests {
                 env: None,
                 file: None,
             },
+            capability: None,
         }
     }
 
@@ -248,6 +228,33 @@ mod tests {
     }
 
     #[test]
+    fn model_config_capability_overrides_scheme_default() {
+        // 未知モデル ID でも `ModelConfig.capability` が指定されていれば
+        // scheme の静的テーブル / デフォルトではなくその値が採用される。
+        use llm_worker::llm_client::capability::{
+            CacheStrategy, ModelCapability, ReasoningEffort, ReasoningSupport, StructuredOutput,
+            ToolCallingSupport,
+        };
+
+        let explicit = ModelCapability {
+            tool_calling: ToolCallingSupport::Parallel,
+            structured_output: StructuredOutput::JsonSchema,
+            reasoning: Some(ReasoningSupport::Effort),
+            vision: true,
+            prompt_caching: CacheStrategy::Auto,
+        };
+
+        // TOML 経由の往復（`[model.capability]` が正しくパースできる）
+        let toml_str = toml::to_string(&explicit).unwrap();
+        let round_trip: ModelCapability = toml::from_str(&toml_str).unwrap();
+        assert_eq!(round_trip, explicit);
+
+        // `_ = ReasoningEffort` は serde derive が欠けていると失敗する
+        // ほぼ確実なコンパイル時ガード。
+        let _ = ReasoningEffort::Medium;
+    }
+
+    #[test]
     fn ollama_succeeds_without_key() {
         // Ollama = Anthropic scheme + base_url 差し替え + AuthRef::None
         let config = ModelConfig {
@@ -255,6 +262,7 @@ mod tests {
             base_url: Some("http://localhost:11434".into()),
             model_id: "llama3".into(),
             auth: AuthRef::None,
+            capability: None,
         };
         // scheme.required_auth() が XApiKey でも ResolvedAuth::None は許容する
         // （None は全 scheme で受け入れるため）

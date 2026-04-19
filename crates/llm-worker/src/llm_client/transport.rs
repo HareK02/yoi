@@ -11,13 +11,13 @@ use eventsource_stream::Eventsource;
 use futures::{Stream, StreamExt, TryStreamExt};
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
 
+use super::auth::AuthRequirement;
 use super::capability::ModelCapability;
-use super::client::LlmClient;
+use super::client::{ConfigWarning, LlmClient};
 use super::error::ClientError;
 use super::event::Event;
-use super::auth::AuthRequirement;
 use super::scheme::Scheme;
-use super::types::Request;
+use super::types::{Request, RequestConfig};
 
 /// `AuthRef` を解決したランタイム表現。`crates/provider` が構築する。
 ///
@@ -153,6 +153,10 @@ impl<S: Scheme + Clone> Clone for HttpTransport<S> {
 impl<S: Scheme + Clone + 'static> LlmClient for HttpTransport<S> {
     fn clone_boxed(&self) -> Box<dyn LlmClient> {
         Box::new(self.clone())
+    }
+
+    fn validate_config(&self, config: &RequestConfig) -> Vec<ConfigWarning> {
+        self.scheme.validate_config(config)
     }
 
     async fn stream(

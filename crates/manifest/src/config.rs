@@ -50,6 +50,8 @@ pub struct ModelConfigPartial {
     pub model_id: Option<String>,
     #[serde(default)]
     pub auth: Option<AuthRef>,
+    #[serde(default)]
+    pub capability: Option<crate::model::ModelCapability>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -205,6 +207,7 @@ impl ModelConfigPartial {
             base_url: upper.base_url.or(self.base_url),
             model_id: upper.model_id.or(self.model_id),
             auth: upper.auth.or(self.auth),
+            capability: upper.capability.or(self.capability),
         }
     }
 }
@@ -310,6 +313,7 @@ fn resolve_model(
         base_url: cfg.base_url,
         model_id,
         auth,
+        capability: cfg.capability,
     })
 }
 

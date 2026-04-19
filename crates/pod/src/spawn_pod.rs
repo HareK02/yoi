@@ -361,6 +361,7 @@ fn build_overlay_toml(
             base_url: model.base_url.clone(),
             model_id: Some(model.model_id.clone()),
             auth: Some(model.auth.clone()),
+            capability: model.capability.clone(),
         },
         worker: WorkerManifestConfig {
             instruction: Some(instruction.to_string()),
@@ -494,6 +495,7 @@ mod tests {
                 env: None,
                 file: Some(PathBuf::from("/etc/keys/anthropic")),
             },
+            capability: None,
         };
 
         let toml_str = build_overlay_toml("child", "$insomnia/default", &[], &model).unwrap();

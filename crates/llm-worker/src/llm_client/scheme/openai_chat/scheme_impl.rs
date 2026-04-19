@@ -4,11 +4,12 @@ use serde_json::Value;
 
 use crate::llm_client::{
     ClientError,
-    capability::ModelCapability,
-    event::Event,
     auth::AuthRequirement,
+    capability::ModelCapability,
+    client::ConfigWarning,
+    event::Event,
     scheme::Scheme,
-    types::Request,
+    types::{Request, RequestConfig},
 };
 
 use super::OpenAIScheme;
@@ -53,5 +54,18 @@ impl Scheme for OpenAIScheme {
 
     fn capability_for(&self, model_id: &str) -> Option<ModelCapability> {
         super::capability::lookup(model_id)
+    }
+
+    fn default_capability(&self) -> ModelCapability {
+        super::capability::default_capability()
+    }
+
+    fn validate_config(&self, config: &RequestConfig) -> Vec<ConfigWarning> {
+        let mut warnings = Vec::new();
+        // OpenAI Chat Completions API は top_k を受け付けない
+        if config.top_k.is_some() {
+            warnings.push(ConfigWarning::unsupported("top_k", "OpenAI Chat"));
+        }
+        warnings
     }
 }

@@ -141,6 +141,7 @@ fn dummy_model() -> ModelConfig {
         base_url: None,
         model_id: "claude-test".into(),
         auth: AuthRef::None,
+        capability: None,
     }
 }
 

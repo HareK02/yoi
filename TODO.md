@@ -3,7 +3,6 @@
   - [ ] Bash ツール (Permission 層と統合) → [tickets/bash-tool.md](tickets/bash-tool.md)
 - [ ] Protocol の設計 → [tickets/protocol-design.md](tickets/protocol-design.md)
 - [ ] LLM プロバイダ統合
-  - [ ] モデル設定の構造再編（providers 層廃止 + Pod 宣言化） → [tickets/llm-model-config.md](tickets/llm-model-config.md)
   - [ ] OpenAI Responses scheme の新設 → [tickets/llm-scheme-openai-responses.md](tickets/llm-scheme-openai-responses.md)
   - [ ] Codex OAuth 認証の流用 → [tickets/llm-auth-codex-oauth.md](tickets/llm-auth-codex-oauth.md)
 - [ ] パーミッション: パターンベースのツール実行制御 → [tickets/permission-extension-point.md](tickets/permission-extension-point.md)

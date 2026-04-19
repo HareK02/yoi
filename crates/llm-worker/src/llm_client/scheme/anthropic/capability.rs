@@ -24,3 +24,17 @@ pub(crate) fn lookup(model_id: &str) -> Option<ModelCapability> {
     })
 }
 
+/// Scheme 既定の capability。
+///
+/// Ollama の `/v1/messages` 流用を想定して `cache_control` を送らない
+/// `CacheStrategy::Auto` にする。Anthropic 本家の未知モデル（新 Claude）
+/// も tool_calling / vision を備える想定で Parallel / true を返す。
+pub(crate) fn default_capability() -> ModelCapability {
+    ModelCapability {
+        tool_calling: ToolCallingSupport::Parallel,
+        structured_output: StructuredOutput::JsonSchema,
+        reasoning: None,
+        vision: false,
+        prompt_caching: CacheStrategy::Auto,
+    }
+}

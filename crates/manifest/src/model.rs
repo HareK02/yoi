@@ -8,6 +8,10 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+// `ModelCapability` は `llm-worker` 側に定義される runtime 構造だが、
+// マニフェストで任意に override できるよう型だけ再エクスポートする。
+pub use llm_worker::llm_client::capability::ModelCapability;
+
 /// Pod が使う LLM モデルの宣言。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ModelConfig {
@@ -21,6 +25,12 @@ pub struct ModelConfig {
     /// 認証方式
     #[serde(default)]
     pub auth: AuthRef,
+    /// モデル能力の明示指定。`None` のときは `crates/provider` が
+    /// scheme 静的テーブル → scheme 既定値の順でフォールバックする。
+    /// OpenAI 互換ルーター（OpenRouter / xAI / Groq 等）で scheme テーブル
+    /// に載っていないモデル ID を使うときに指定する。
+    #[serde(default)]
+    pub capability: Option<ModelCapability>,
 }
 
 /// サポートする wire scheme の種類。
