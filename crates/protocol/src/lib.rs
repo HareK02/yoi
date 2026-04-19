@@ -20,6 +20,13 @@ pub enum Method {
     PodEvent(PodEvent),
     Resume,
     Cancel,
+    /// Stop the in-flight turn and transition to `Paused`.
+    ///
+    /// Unlike `Cancel` (which discards and returns to `Idle`), a paused
+    /// Pod can resume the interrupted work via `Resume`, or start a
+    /// fresh turn via `Run` (orphan `tool_use` items are closed with a
+    /// synthetic tool result before the new user message is appended).
+    Pause,
     Shutdown,
     GetHistory,
 }
@@ -263,6 +270,15 @@ mod tests {
         let json = r#"{"method":"resume"}"#;
         let method: Method = serde_json::from_str(json).unwrap();
         assert!(matches!(method, Method::Resume));
+    }
+
+    #[test]
+    fn method_pause_roundtrip() {
+        let json = r#"{"method":"pause"}"#;
+        let method: Method = serde_json::from_str(json).unwrap();
+        assert!(matches!(method, Method::Pause));
+        let serialized = serde_json::to_string(&method).unwrap();
+        assert_eq!(serialized, json);
     }
 
     #[test]

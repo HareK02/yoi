@@ -141,14 +141,14 @@ async fn run_loop(
     Ok(())
 }
 
-fn run_disconnected(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
+fn run_disconnected(_app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
     loop {
         if event::poll(std::time::Duration::from_millis(100))? {
             if let TermEvent::Key(key) = event::read()? {
-                match key.code {
-                    KeyCode::Esc => break,
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
-                    _ => {}
+                if let KeyCode::Char('c') = key.code {
+                    if key.modifiers.contains(KeyModifiers::CONTROL) {
+                        break;
+                    }
                 }
             }
         }
@@ -158,16 +158,20 @@ fn run_disconnected(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
 
 fn handle_key(app: &mut App, key: KeyEvent) -> Option<Method> {
     match key.code {
-        KeyCode::Esc => {
-            app.quit = true;
-            None
-        }
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.quit = true;
-            None
+            handle_pause_or_quit(app)
         }
-        KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => Some(Method::Resume),
-        KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => Some(Method::Cancel),
+        KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if app.running {
+                Some(Method::Cancel)
+            } else {
+                app.output_queue.push(app::OutputItem::Padded(
+                    app::MessageKind::Error,
+                    "Nothing to cancel (Pod is not running).".into(),
+                ));
+                None
+            }
+        }
         KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             return handle_shutdown(app);
         }
@@ -204,14 +208,14 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Option<Method> {
     }
 }
 
-const SHUTDOWN_CONFIRM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+const CONFIRM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 fn handle_shutdown(app: &mut App) -> Option<Method> {
     if !app.running {
         return Some(Method::Shutdown);
     }
     if let Some(t) = app.shutdown_confirm {
-        if t.elapsed() < SHUTDOWN_CONFIRM_TIMEOUT {
+        if t.elapsed() < CONFIRM_TIMEOUT {
             app.shutdown_confirm = None;
             return Some(Method::Shutdown);
         }
@@ -220,6 +224,27 @@ fn handle_shutdown(app: &mut App) -> Option<Method> {
     app.output_queue.push(app::OutputItem::Padded(
         app::MessageKind::Error,
         "Turn is running. Press Ctrl-D again to cancel and shut down.".into(),
+    ));
+    None
+}
+
+/// Running → send `Method::Pause`.
+/// Idle / Paused → 2-tap to quit the TUI (the Pod keeps running).
+fn handle_pause_or_quit(app: &mut App) -> Option<Method> {
+    if app.running {
+        return Some(Method::Pause);
+    }
+    if let Some(t) = app.quit_confirm {
+        if t.elapsed() < CONFIRM_TIMEOUT {
+            app.quit_confirm = None;
+            app.quit = true;
+            return None;
+        }
+    }
+    app.quit_confirm = Some(std::time::Instant::now());
+    app.output_queue.push(app::OutputItem::Padded(
+        app::MessageKind::Error,
+        "Press Ctrl-C again within 3 s to exit the TUI (the Pod keeps running).".into(),
     ));
     None
 }

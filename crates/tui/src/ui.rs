@@ -170,6 +170,18 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         };
         spans.push(Span::raw(" | "));
         spans.push(Span::styled(status, Style::default().fg(Color::Yellow)));
+    } else if app.paused {
+        spans.push(Span::raw(" | "));
+        spans.push(Span::styled(
+            "paused",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(
+            " — Enter to resume, type to start new turn",
+            Style::default().fg(Color::DarkGray),
+        ));
     } else {
         spans.push(Span::styled(" idle", Style::default().fg(Color::DarkGray)));
     }

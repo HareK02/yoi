@@ -1,9 +1,13 @@
-use protocol::{Event, Greeting, Method, NotificationLevel, NotificationSource};
+use protocol::{Event, Greeting, Method, NotificationLevel, NotificationSource, RunResult};
 
 pub struct App {
     pub pod_name: String,
     pub connected: bool,
     pub running: bool,
+    /// True while the Pod is in `PodStatus::Paused`. Set on
+    /// `RunEnd::Paused` and cleared when a new turn starts (either via
+    /// `Resume` or a fresh `Run`).
+    pub paused: bool,
     pub run_requests: usize,
     pub run_input_tokens: u64,
     pub run_output_tokens: u64,
@@ -13,6 +17,10 @@ pub struct App {
     pub cursor: usize,
     pub quit: bool,
     pub shutdown_confirm: Option<std::time::Instant>,
+    /// 2-tap guard for `Ctrl-C` when the Pod is not running. First press
+    /// records the instant; a second press within the timeout exits the
+    /// TUI (the Pod itself stays alive).
+    pub quit_confirm: Option<std::time::Instant>,
     /// Lines waiting to be flushed to terminal via insert_before.
     pub output_queue: Vec<OutputItem>,
     /// Partial streaming text not yet terminated by newline.
@@ -48,6 +56,7 @@ impl App {
             pod_name,
             connected: false,
             running: false,
+            paused: false,
             run_requests: 0,
             run_input_tokens: 0,
             run_output_tokens: 0,
@@ -57,6 +66,7 @@ impl App {
             cursor: 0,
             quit: false,
             shutdown_confirm: None,
+            quit_confirm: None,
             output_queue: Vec::new(),
             pending_text: String::new(),
         }
@@ -65,6 +75,11 @@ impl App {
     pub fn submit_input(&mut self) -> Option<Method> {
         let text = self.input.trim().to_owned();
         if text.is_empty() {
+            // Empty Enter only does something meaningful when the Pod
+            // is paused: resume the interrupted turn. Otherwise no-op.
+            if self.paused {
+                return Some(Method::Resume);
+            }
             return None;
         }
         self.turn_index += 1;
@@ -83,6 +98,7 @@ impl App {
         match event {
             Event::TurnStart { .. } => {
                 self.running = true;
+                self.paused = false;
                 self.run_requests += 1;
                 self.current_tool = None;
             }
@@ -154,7 +170,7 @@ impl App {
                     format!("[{code:?}] {message}"),
                 ));
             }
-            Event::RunEnd { .. } => {
+            Event::RunEnd { result } => {
                 self.output_queue.push(OutputItem::PaddedRight(
                     MessageKind::TurnStats,
                     format!(
@@ -166,6 +182,7 @@ impl App {
                 ));
                 self.output_queue.push(OutputItem::Blank);
                 self.running = false;
+                self.paused = matches!(result, RunResult::Paused);
                 self.run_requests = 0;
                 self.run_input_tokens = 0;
                 self.run_output_tokens = 0;

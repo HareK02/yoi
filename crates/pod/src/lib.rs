@@ -14,6 +14,7 @@ mod agents_md;
 mod compact_state;
 mod compact_worker;
 mod factory;
+mod interrupt_and_run;
 mod notification_buffer;
 mod pod;
 mod pod_interceptor;

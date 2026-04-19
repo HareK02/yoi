@@ -256,18 +256,27 @@ impl PodController {
 
                 match method {
                     Method::Run { input } => {
-                        if shared_state.get_status() != PodStatus::Idle {
+                        let status_before = shared_state.get_status();
+                        if status_before == PodStatus::Running {
                             let _ = event_tx.send(Event::Error {
                                 code: ErrorCode::AlreadyRunning,
                                 message: "Pod is already executing a turn".into(),
                             });
                             continue;
                         }
+                        let was_paused = status_before == PodStatus::Paused;
                         shared_state.set_status(PodStatus::Running);
                         let _ = runtime_dir.write_status(&shared_state).await;
 
+                        let run_future = async {
+                            if was_paused {
+                                pod.interrupt_and_run(input).await
+                            } else {
+                                pod.run(input).await
+                            }
+                        };
                         let (new_status, shutdown) = run_with_cancel_support(
-                            pod.run(&input),
+                            run_future,
                             &mut method_rx,
                             &event_tx,
                             &cancel_tx,
@@ -406,6 +415,19 @@ impl PodController {
                         });
                     }
 
+                    Method::Pause => {
+                        // Already paused → idempotent no-op. Otherwise
+                        // the Pod is Idle (Running turns go through
+                        // `run_with_cancel_support`, not this outer
+                        // match), so there is nothing to pause.
+                        if shared_state.get_status() != PodStatus::Paused {
+                            let _ = event_tx.send(Event::Error {
+                                code: ErrorCode::NotRunning,
+                                message: "Pod is not running".into(),
+                            });
+                        }
+                    }
+
                     Method::Shutdown => {
                         let _ = event_tx.send(Event::Shutdown);
                         break;
@@ -529,6 +551,7 @@ where
 {
     tokio::pin!(pod_future);
     let mut shutdown_requested = false;
+    let mut pause_requested = false;
 
     loop {
         tokio::select! {
@@ -551,6 +574,15 @@ where
                         }
                         (status, shutdown_requested)
                     }
+                    Err(PodError::Worker(WorkerError::Cancelled)) if pause_requested => {
+                        // User-initiated Pause. Report the transition to
+                        // clients as a normal Paused run-end, and
+                        // intentionally skip `PodEvent::Errored` upward:
+                        // that channel is reserved for worker runtime
+                        // failures, not deliberate interruptions.
+                        let _ = event_tx.send(Event::RunEnd { result: RunResult::Paused });
+                        (PodStatus::Paused, shutdown_requested)
+                    }
                     Err(e) => {
                         let code = worker_error_code(&e);
                         let message = e.to_string();
@@ -572,6 +604,10 @@ where
             method = method_rx.recv() => {
                 match method {
                     Some(Method::Cancel) => {
+                        let _ = cancel_tx.try_send(());
+                    }
+                    Some(Method::Pause) => {
+                        pause_requested = true;
                         let _ = cancel_tx.try_send(());
                     }
                     Some(Method::Shutdown) => {
