@@ -189,10 +189,24 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         if let Some(ref prompt) = state.system_prompt {
             worker.set_system_prompt(prompt);
         }
+        // A leading `Role::System` item can only come from `compact`
+        // (the Pod's one and only write path that prepends a summary at
+        // history[0]). Restoring the anchor lets Anthropic re-use a
+        // stable cache prefix for long-lived restored sessions.
+        let anchored_on_summary = matches!(
+            state.history.first(),
+            Some(Item::Message {
+                role: llm_worker::Role::System,
+                ..
+            })
+        );
         worker.set_history(state.history);
         worker.set_request_config(state.config);
         worker.set_turn_count(state.turn_count);
         worker.set_last_run_interrupted(state.last_run_interrupted);
+        if anchored_on_summary {
+            worker.set_cache_anchor(Some(0));
+        }
 
         let mut pod = Self {
             manifest,
@@ -853,7 +867,12 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         // until its first LLM call.
         self.session_id = new_session_id;
         self.head_hash = Some(new_head_hash);
-        self.worker.as_mut().unwrap().set_history(new_history);
+        let worker = self.worker.as_mut().unwrap();
+        worker.set_history(new_history);
+        // Anchor the prompt cache at the summary item so that Anthropic
+        // can place a durable `cache_control` breakpoint there — our
+        // compact layout guarantees history[0] is the summary.
+        worker.set_cache_anchor(Some(0));
         self.usage_history
             .lock()
             .expect("usage_history poisoned")

@@ -419,6 +419,13 @@ pub struct Request {
     pub tools: Vec<ToolDefinition>,
     /// Request configuration
     pub config: RequestConfig,
+    /// Index into `items` marking the end of a stable, cacheable prefix.
+    ///
+    /// Higher layers that know about durable prefix boundaries (e.g. a
+    /// post-compaction summary) set this so that caching-aware providers
+    /// (Anthropic today) can place a long-lived cache breakpoint there.
+    /// Providers without prompt caching ignore the field.
+    pub cache_anchor: Option<usize>,
 }
 
 impl Request {

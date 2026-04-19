@@ -178,6 +178,9 @@ pub struct Worker<C: LlmClient, S: WorkerState = Mutable> {
     /// by higher layers that own usage measurements. `None` disables
     /// the prune projection.
     savings_estimator: Option<crate::prune::SavingsEstimator>,
+    /// Index of the last stable cache prefix item, set by higher layers.
+    /// Plumbed into [`Request::cache_anchor`] at request build time.
+    cache_anchor: Option<usize>,
     /// State marker
     _state: PhantomData<S>,
 }
@@ -338,6 +341,18 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
     /// "no data" or "refuse to prune".
     pub fn set_savings_estimator(&mut self, estimator: Option<crate::prune::SavingsEstimator>) {
         self.savings_estimator = estimator;
+    }
+
+    /// Mark an index into the current history as a stable, cacheable
+    /// prefix boundary. The value is included in each outgoing
+    /// [`Request`] via [`Request::cache_anchor`] — caching-aware
+    /// providers (Anthropic) place a long-lived breakpoint there.
+    ///
+    /// Pass `None` to clear. Typically set by layers that compact the
+    /// conversation: after a compaction rebuilds history starting with a
+    /// summary item, the anchor is `Some(0)`.
+    pub fn set_cache_anchor(&mut self, anchor: Option<usize>) {
+        self.cache_anchor = anchor;
     }
 
     /// Get a mutable reference to the timeline (for additional handler registration)
@@ -528,6 +543,13 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
 
         // Apply request configuration
         request = request.config(self.request_config.clone());
+
+        // Attach the cache prefix anchor (may be narrower than `context`
+        // if the prune projection trimmed items from the head — keep it
+        // in range).
+        request.cache_anchor = self
+            .cache_anchor
+            .filter(|&anchor| anchor < context.len());
 
         request
     }
@@ -1001,6 +1023,7 @@ impl<C: LlmClient> Worker<C, Mutable> {
             tool_output_limits: None,
             prune_config: None,
             savings_estimator: None,
+            cache_anchor: None,
             _state: PhantomData,
         }
     }
@@ -1255,6 +1278,7 @@ impl<C: LlmClient> Worker<C, Mutable> {
             tool_output_limits: self.tool_output_limits,
             prune_config: self.prune_config,
             savings_estimator: self.savings_estimator,
+            cache_anchor: self.cache_anchor,
             _state: PhantomData,
         }
     }
@@ -1328,6 +1352,7 @@ impl<C: LlmClient> Worker<C, Locked> {
             tool_output_limits: self.tool_output_limits,
             prune_config: self.prune_config,
             savings_estimator: self.savings_estimator,
+            cache_anchor: self.cache_anchor,
             _state: PhantomData,
         }
     }

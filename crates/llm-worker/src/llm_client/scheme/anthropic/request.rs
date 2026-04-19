@@ -2,6 +2,8 @@
 //!
 //! Converts Open Responses native Item model to Anthropic Messages API format.
 
+use std::collections::BTreeSet;
+
 use serde::Serialize;
 
 use crate::llm_client::{
@@ -47,23 +49,75 @@ pub(crate) enum AnthropicContent {
     Parts(Vec<AnthropicContentPart>),
 }
 
+/// `cache_control` marker attached to a content part, signalling that the
+/// prefix up to and including this part should be cached.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub(crate) enum CacheControl {
+    Ephemeral,
+}
+
 /// Anthropic content part
 #[derive(Debug, Serialize)]
 #[serde(tag = "type")]
 pub(crate) enum AnthropicContentPart {
     #[serde(rename = "text")]
-    Text { text: String },
+    Text {
+        text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
+    },
     #[serde(rename = "tool_use")]
     ToolUse {
         id: String,
         name: String,
         input: serde_json::Value,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
     },
     #[serde(rename = "tool_result")]
     ToolResult {
         tool_use_id: String,
         content: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
     },
+}
+
+impl AnthropicContentPart {
+    fn text(text: String) -> Self {
+        Self::Text {
+            text,
+            cache_control: None,
+        }
+    }
+
+    fn tool_use(id: String, name: String, input: serde_json::Value) -> Self {
+        Self::ToolUse {
+            id,
+            name,
+            input,
+            cache_control: None,
+        }
+    }
+
+    fn tool_result(tool_use_id: String, content: String) -> Self {
+        Self::ToolResult {
+            tool_use_id,
+            content,
+            cache_control: None,
+        }
+    }
+
+    fn set_cache_control(&mut self, cc: CacheControl) {
+        match self {
+            Self::Text { cache_control, .. }
+            | Self::ToolUse { cache_control, .. }
+            | Self::ToolResult { cache_control, .. } => {
+                *cache_control = Some(cc);
+            }
+        }
+    }
 }
 
 /// Anthropic tool definition
@@ -78,7 +132,8 @@ pub(crate) struct AnthropicTool {
 impl AnthropicScheme {
     /// Build Anthropic request from Request
     pub(crate) fn build_request(&self, model: &str, request: &Request) -> AnthropicRequest {
-        let messages = self.convert_items_to_messages(&request.items);
+        let breakpoints = compute_breakpoints(&request.items, request.cache_anchor);
+        let messages = self.convert_items_to_messages(&request.items, &breakpoints);
         let tools = request.tools.iter().map(|t| self.convert_tool(t)).collect();
 
         AnthropicRequest {
@@ -95,27 +150,37 @@ impl AnthropicScheme {
         }
     }
 
-    /// Convert Open Responses Items to Anthropic Messages
+    /// Convert Open Responses Items to Anthropic Messages and attach
+    /// `cache_control` markers at each breakpoint item's last content
+    /// part.
     ///
     /// Anthropic uses a message-based model where:
     /// - User messages have role "user"
     /// - Assistant messages have role "assistant"
     /// - Tool calls are content parts within assistant messages
     /// - Tool results are content parts within user messages
-    fn convert_items_to_messages(&self, items: &[Item]) -> Vec<AnthropicMessage> {
+    ///
+    /// Each non-`Message` item produces exactly one content part, so
+    /// "last part for the item" is always well-defined. For breakpoint
+    /// `Message` items the output is forced into the array form so a
+    /// marker has a part to attach to.
+    fn convert_items_to_messages(
+        &self,
+        items: &[Item],
+        breakpoints: &BTreeSet<usize>,
+    ) -> Vec<AnthropicMessage> {
         let mut messages = Vec::new();
-        let mut pending_assistant_parts: Vec<AnthropicContentPart> = Vec::new();
-        let mut pending_user_parts: Vec<AnthropicContentPart> = Vec::new();
+        // Pending parts carry their origin item index so we can record
+        // (msg_idx, part_idx) when we flush them into a message.
+        let mut pending_assistant: Vec<(usize, AnthropicContentPart)> = Vec::new();
+        let mut pending_user: Vec<(usize, AnthropicContentPart)> = Vec::new();
+        let mut locations: Vec<Option<(usize, usize)>> = vec![None; items.len()];
 
-        for item in items {
+        for (i, item) in items.iter().enumerate() {
             match item {
                 Item::Message { role, content, .. } => {
-                    // Flush pending parts before a new message
-                    self.flush_pending_parts(
-                        &mut messages,
-                        &mut pending_assistant_parts,
-                        &mut pending_user_parts,
-                    );
+                    flush_pending(&mut messages, &mut pending_assistant, "assistant", &mut locations);
+                    flush_pending(&mut messages, &mut pending_user, "user", &mut locations);
 
                     let anthropic_role = match role {
                         Role::User | Role::System => "user",
@@ -126,32 +191,35 @@ impl AnthropicScheme {
                         .iter()
                         .map(|p| match p {
                             ContentPart::Text { text } => {
-                                AnthropicContentPart::Text { text: text.clone() }
+                                AnthropicContentPart::text(text.clone())
                             }
-                            ContentPart::Refusal { refusal } => AnthropicContentPart::Text {
-                                text: refusal.clone(),
-                            },
+                            ContentPart::Refusal { refusal } => {
+                                AnthropicContentPart::text(refusal.clone())
+                            }
                         })
                         .collect();
 
-                    if parts.len() == 1 {
-                        if let AnthropicContentPart::Text { text } = &parts[0] {
+                    let force_parts = breakpoints.contains(&i);
+                    let msg_idx = messages.len();
+
+                    // Preserve the single-text shorthand unless a
+                    // breakpoint needs a concrete part to live on.
+                    if parts.len() == 1 && !force_parts {
+                        if let AnthropicContentPart::Text { text, .. } = &parts[0] {
                             messages.push(AnthropicMessage {
                                 role: anthropic_role.to_string(),
                                 content: AnthropicContent::Text(text.clone()),
                             });
-                        } else {
-                            messages.push(AnthropicMessage {
-                                role: anthropic_role.to_string(),
-                                content: AnthropicContent::Parts(parts),
-                            });
+                            continue;
                         }
-                    } else {
-                        messages.push(AnthropicMessage {
-                            role: anthropic_role.to_string(),
-                            content: AnthropicContent::Parts(parts),
-                        });
                     }
+
+                    let last_part_idx = parts.len().saturating_sub(1);
+                    messages.push(AnthropicMessage {
+                        role: anthropic_role.to_string(),
+                        content: AnthropicContent::Parts(parts),
+                    });
+                    locations[i] = Some((msg_idx, last_part_idx));
                 }
 
                 Item::ToolCall {
@@ -160,25 +228,15 @@ impl AnthropicScheme {
                     arguments,
                     ..
                 } => {
-                    // Flush pending user parts first
-                    if !pending_user_parts.is_empty() {
-                        messages.push(AnthropicMessage {
-                            role: "user".to_string(),
-                            content: AnthropicContent::Parts(std::mem::take(
-                                &mut pending_user_parts,
-                            )),
-                        });
-                    }
-
-                    // Parse arguments JSON string to Value (defensive: normalize
-                    // non-object / legacy "null" payloads to {} so Anthropic API accepts it)
+                    flush_pending(&mut messages, &mut pending_user, "user", &mut locations);
+                    // Parse arguments JSON string to Value (defensive:
+                    // normalize non-object / legacy "null" payloads to
+                    // `{}` so the Anthropic API accepts it).
                     let input = parse_tool_arguments(arguments);
-
-                    pending_assistant_parts.push(AnthropicContentPart::ToolUse {
-                        id: call_id.clone(),
-                        name: name.clone(),
-                        input,
-                    });
+                    pending_assistant.push((
+                        i,
+                        AnthropicContentPart::tool_use(call_id.clone(), name.clone(), input),
+                    ));
                 }
 
                 Item::ToolResult {
@@ -187,72 +245,42 @@ impl AnthropicScheme {
                     content,
                     ..
                 } => {
-                    // Flush pending assistant parts first
-                    if !pending_assistant_parts.is_empty() {
-                        messages.push(AnthropicMessage {
-                            role: "assistant".to_string(),
-                            content: AnthropicContent::Parts(std::mem::take(
-                                &mut pending_assistant_parts,
-                            )),
-                        });
-                    }
-
+                    flush_pending(&mut messages, &mut pending_assistant, "assistant", &mut locations);
                     let text = match content {
                         Some(c) => format!("{summary}\n{c}"),
                         None => summary.clone(),
                     };
-                    pending_user_parts.push(AnthropicContentPart::ToolResult {
-                        tool_use_id: call_id.clone(),
-                        content: text,
-                    });
+                    pending_user.push((
+                        i,
+                        AnthropicContentPart::tool_result(call_id.clone(), text),
+                    ));
                 }
 
                 Item::Reasoning { text, .. } => {
-                    // Flush pending user parts first
-                    if !pending_user_parts.is_empty() {
-                        messages.push(AnthropicMessage {
-                            role: "user".to_string(),
-                            content: AnthropicContent::Parts(std::mem::take(
-                                &mut pending_user_parts,
-                            )),
-                        });
-                    }
-
+                    flush_pending(&mut messages, &mut pending_user, "user", &mut locations);
                     // Reasoning is treated as assistant text in Anthropic
-                    // (actual thinking blocks are handled differently in streaming)
-                    pending_assistant_parts.push(AnthropicContentPart::Text { text: text.clone() });
+                    // (actual thinking blocks are handled differently in streaming).
+                    pending_assistant.push((i, AnthropicContentPart::text(text.clone())));
                 }
             }
         }
 
-        // Flush remaining pending parts
-        self.flush_pending_parts(
-            &mut messages,
-            &mut pending_assistant_parts,
-            &mut pending_user_parts,
-        );
+        flush_pending(&mut messages, &mut pending_assistant, "assistant", &mut locations);
+        flush_pending(&mut messages, &mut pending_user, "user", &mut locations);
+
+        // Apply cache_control markers at each breakpoint item's last part.
+        for &bp in breakpoints {
+            let Some((msg_idx, part_idx)) = locations.get(bp).copied().flatten() else {
+                continue;
+            };
+            if let AnthropicContent::Parts(parts) = &mut messages[msg_idx].content {
+                if let Some(part) = parts.get_mut(part_idx) {
+                    part.set_cache_control(CacheControl::Ephemeral);
+                }
+            }
+        }
 
         messages
-    }
-
-    fn flush_pending_parts(
-        &self,
-        messages: &mut Vec<AnthropicMessage>,
-        pending_assistant_parts: &mut Vec<AnthropicContentPart>,
-        pending_user_parts: &mut Vec<AnthropicContentPart>,
-    ) {
-        if !pending_assistant_parts.is_empty() {
-            messages.push(AnthropicMessage {
-                role: "assistant".to_string(),
-                content: AnthropicContent::Parts(std::mem::take(pending_assistant_parts)),
-            });
-        }
-        if !pending_user_parts.is_empty() {
-            messages.push(AnthropicMessage {
-                role: "user".to_string(),
-                content: AnthropicContent::Parts(std::mem::take(pending_user_parts)),
-            });
-        }
     }
 
     fn convert_tool(&self, tool: &ToolDefinition) -> AnthropicTool {
@@ -262,6 +290,71 @@ impl AnthropicScheme {
             input_schema: tool.input_schema.clone(),
         }
     }
+}
+
+/// Flush a pending parts buffer into a new message, recording the
+/// emitted `(msg_idx, part_idx)` for each originating item.
+fn flush_pending(
+    messages: &mut Vec<AnthropicMessage>,
+    pending: &mut Vec<(usize, AnthropicContentPart)>,
+    role: &str,
+    locations: &mut [Option<(usize, usize)>],
+) {
+    if pending.is_empty() {
+        return;
+    }
+    let msg_idx = messages.len();
+    let taken: Vec<(usize, AnthropicContentPart)> = std::mem::take(pending);
+    let mut parts = Vec::with_capacity(taken.len());
+    for (part_idx, (origin, part)) in taken.into_iter().enumerate() {
+        locations[origin] = Some((msg_idx, part_idx));
+        parts.push(part);
+    }
+    messages.push(AnthropicMessage {
+        role: role.to_string(),
+        content: AnthropicContent::Parts(parts),
+    });
+}
+
+/// Compute the set of item indices that should receive a cache_control
+/// breakpoint:
+///
+/// 1. `cache_anchor` (stable prefix boundary — typically a post-compact
+///    summary at index 0).
+/// 2. The item immediately preceding the most recent `Role::User`
+///    message (i.e. the end of the previous turn). This is the rewind
+///    boundary: if a user re-issues the turn from scratch, the cache up
+///    to here remains valid.
+/// 3. The final item (head of the outgoing request, for the next
+///    request in the same turn to read from).
+///
+/// Overlapping positions are collapsed to a single breakpoint.
+fn compute_breakpoints(items: &[Item], cache_anchor: Option<usize>) -> BTreeSet<usize> {
+    let mut bps = BTreeSet::new();
+    if items.is_empty() {
+        return bps;
+    }
+    if let Some(anchor) = cache_anchor {
+        if anchor < items.len() {
+            bps.insert(anchor);
+        }
+    }
+    let last_user = items.iter().rposition(|it| {
+        matches!(
+            it,
+            Item::Message {
+                role: Role::User,
+                ..
+            }
+        )
+    });
+    if let Some(i) = last_user {
+        if i > 0 {
+            bps.insert(i - 1);
+        }
+    }
+    bps.insert(items.len() - 1);
+    bps
 }
 
 #[cfg(test)]
@@ -325,5 +418,214 @@ mod tests {
         assert_eq!(anthropic_req.messages[0].role, "user");
         assert_eq!(anthropic_req.messages[1].role, "assistant");
         assert_eq!(anthropic_req.messages[2].role, "user");
+    }
+
+    /// Pull out the `cache_control` field from a part regardless of variant.
+    fn part_cache_control(part: &AnthropicContentPart) -> Option<CacheControl> {
+        match part {
+            AnthropicContentPart::Text { cache_control, .. }
+            | AnthropicContentPart::ToolUse { cache_control, .. }
+            | AnthropicContentPart::ToolResult { cache_control, .. } => *cache_control,
+        }
+    }
+
+    /// All `(msg_idx, part_idx, cache_control)` triples whose `cache_control`
+    /// is set, in iteration order over the output.
+    fn breakpoint_positions(req: &AnthropicRequest) -> Vec<(usize, usize, CacheControl)> {
+        let mut out = Vec::new();
+        for (mi, msg) in req.messages.iter().enumerate() {
+            if let AnthropicContent::Parts(parts) = &msg.content {
+                for (pi, part) in parts.iter().enumerate() {
+                    if let Some(cc) = part_cache_control(part) {
+                        out.push((mi, pi, cc));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Convenience: a turn that ends with one assistant text, one tool
+    /// call/result pair, and a final assistant text. Produced at
+    /// `history[head..]` indices shown alongside, so tests can reason
+    /// about breakpoint positions.
+    fn completed_turn() -> Vec<Item> {
+        vec![
+            Item::user_message("hello"),           // 0
+            Item::assistant_message("hi"),         // 1
+            Item::tool_call("c1", "tool_a", "{}"), // 2
+            Item::tool_result("c1", "ok"),         // 3
+            Item::assistant_message("done"),       // 4
+        ]
+    }
+
+    #[test]
+    fn three_breakpoints_when_compact_plus_prior_turn() {
+        let scheme = AnthropicScheme::new();
+        let mut items = vec![Item::system_message("[Compacted context summary]\n\nprior")];
+        items.extend(completed_turn()); // now indices 1..=5
+        items.push(Item::user_message("next turn"));
+        // anchor=0, last user idx=6 → turn_end=5, head=6.
+        let mut request = Request::new().items(items);
+        request.cache_anchor = Some(0);
+
+        let req = scheme.build_request("claude-sonnet-4-20250514", &request);
+        let bps = breakpoint_positions(&req);
+        assert_eq!(bps.len(), 3, "expected 3 breakpoints, got {:?}", bps);
+        for (_, _, cc) in bps {
+            assert_eq!(cc, CacheControl::Ephemeral);
+        }
+    }
+
+    #[test]
+    fn two_breakpoints_without_compaction() {
+        let scheme = AnthropicScheme::new();
+        let mut items = completed_turn();
+        items.push(Item::user_message("next turn")); // index 5 = latest user
+        // cache_anchor=None, turn_end=4, head=5.
+        let request = Request::new().items(items);
+
+        let req = scheme.build_request("claude-sonnet-4-20250514", &request);
+        let bps = breakpoint_positions(&req);
+        assert_eq!(bps.len(), 2, "expected 2 breakpoints, got {:?}", bps);
+    }
+
+    #[test]
+    fn single_breakpoint_when_only_first_user_message() {
+        let scheme = AnthropicScheme::new();
+        let request = Request::new().user("first ever turn");
+        // latest user at 0 → no turn_end; head=0; no anchor. Collapse → 1.
+        let req = scheme.build_request("claude-sonnet-4-20250514", &request);
+        let bps = breakpoint_positions(&req);
+        assert_eq!(bps.len(), 1, "expected 1 breakpoint, got {:?}", bps);
+    }
+
+    #[test]
+    fn overlap_collapses_anchor_and_turn_end() {
+        // items = [compact_summary(0, Role::System), user(1)]
+        // anchor=0, latest user=1 → turn_end=0, head=1. Anchor∩turn_end at 0.
+        let scheme = AnthropicScheme::new();
+        let mut request = Request::new().items(vec![
+            Item::system_message("[Compacted context summary]\n\nprior"),
+            Item::user_message("fresh user"),
+        ]);
+        request.cache_anchor = Some(0);
+
+        let req = scheme.build_request("claude-sonnet-4-20250514", &request);
+        let bps = breakpoint_positions(&req);
+        assert_eq!(bps.len(), 2, "expected collapse to 2, got {:?}", bps);
+    }
+
+    #[test]
+    fn breakpoint_on_tool_result_head() {
+        // Mid-turn second call: items end with a tool_result. Head must
+        // land on the ToolResult part.
+        let scheme = AnthropicScheme::new();
+        let request = Request::new()
+            .user("run it")
+            .item(Item::tool_call("c1", "t", "{}"))
+            .item(Item::tool_result("c1", "result"));
+        let req = scheme.build_request("claude-sonnet-4-20250514", &request);
+        let bps = breakpoint_positions(&req);
+        assert_eq!(bps.len(), 1);
+        let (mi, pi, _) = bps[0];
+        let part = match &req.messages[mi].content {
+            AnthropicContent::Parts(parts) => &parts[pi],
+            _ => panic!("expected Parts for breakpoint-bearing message"),
+        };
+        assert!(
+            matches!(part, AnthropicContentPart::ToolResult { .. }),
+            "expected ToolResult, got {:?}",
+            part,
+        );
+    }
+
+    #[test]
+    fn single_text_message_uses_text_shorthand_without_breakpoint() {
+        // Non-breakpoint single-text messages stay on the text shorthand
+        // so we don't bloat requests with wrapper arrays. Here the Head
+        // lands on items[1], leaving items[0] without a marker.
+        let scheme = AnthropicScheme::new();
+        let request = Request::new()
+            .user("hello")
+            .assistant("hi there");
+        let req = scheme.build_request("claude-sonnet-4-20250514", &request);
+        assert!(
+            matches!(req.messages[0].content, AnthropicContent::Text(_)),
+            "non-breakpoint single-text message should use text shorthand",
+        );
+    }
+
+    #[test]
+    fn single_text_message_is_forced_to_parts_when_breakpoint() {
+        // A breakpoint on a single-text message must be emitted in the
+        // array form so cache_control has a part to attach to.
+        let scheme = AnthropicScheme::new();
+        let mut request = Request::new().user("hello");
+        request.cache_anchor = Some(0);
+        let req = scheme.build_request("claude-sonnet-4-20250514", &request);
+        match &req.messages[0].content {
+            AnthropicContent::Parts(parts) => {
+                assert_eq!(parts.len(), 1);
+                assert_eq!(
+                    part_cache_control(&parts[0]),
+                    Some(CacheControl::Ephemeral)
+                );
+            }
+            AnthropicContent::Text(_) => panic!("breakpoint item should use Parts form"),
+        }
+    }
+
+    #[test]
+    fn serialized_json_shape_matches_anthropic_spec() {
+        // Single-sentence smoke test against the exact JSON key shape
+        // Anthropic expects for cache_control.
+        let scheme = AnthropicScheme::new();
+        let mut request = Request::new().user("hello");
+        request.cache_anchor = Some(0);
+        let req = scheme.build_request("claude-sonnet-4-20250514", &request);
+        let json = serde_json::to_value(&req).unwrap();
+        let part = &json["messages"][0]["content"][0];
+        assert_eq!(part["type"], "text");
+        assert_eq!(part["text"], "hello");
+        assert_eq!(part["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn cache_anchor_out_of_range_is_ignored() {
+        // Defensive: if a caller passes a stale anchor beyond items.len(),
+        // we drop it silently rather than panicking.
+        let scheme = AnthropicScheme::new();
+        let mut request = Request::new().user("one");
+        request.cache_anchor = Some(99);
+        let req = scheme.build_request("claude-sonnet-4-20250514", &request);
+        // Only the Head breakpoint survives.
+        let bps = breakpoint_positions(&req);
+        assert_eq!(bps.len(), 1);
+    }
+
+    #[test]
+    fn empty_items_produce_no_breakpoints() {
+        let scheme = AnthropicScheme::new();
+        let req = scheme.build_request("claude-sonnet-4-20250514", &Request::new());
+        assert!(req.messages.is_empty());
+        assert!(breakpoint_positions(&req).is_empty());
+    }
+
+    #[test]
+    fn tool_definitions_carry_no_cache_control() {
+        // Tool JSON schema must serialise unchanged — no sneak-in of
+        // cache_control at the tools-array level.
+        let scheme = AnthropicScheme::new();
+        let request = Request::new()
+            .user("hello")
+            .tool(ToolDefinition::new("noop").input_schema(serde_json::json!({
+                "type": "object",
+                "properties": {}
+            })));
+        let req = scheme.build_request("claude-sonnet-4-20250514", &request);
+        let json = serde_json::to_value(&req).unwrap();
+        let tool = &json["tools"][0];
+        assert!(tool.get("cache_control").is_none());
     }
 }

@@ -1,4 +1,5 @@
 - [ ] テスト設計 → [tickets/test-design.md](tickets/test-design.md)
+- [ ] Anthropic プロンプトキャッシュの有効化 → [tickets/anthropic-prompt-cache.md](tickets/anthropic-prompt-cache.md)
 - [ ] ツール設計
   - [ ] Bash ツール (Permission 層と統合) → [tickets/bash-tool.md](tickets/bash-tool.md)
 - [ ] Compact の改善（要約品質 + 挙動詳細） → [tickets/compact-improvements.md](tickets/compact-improvements.md)
