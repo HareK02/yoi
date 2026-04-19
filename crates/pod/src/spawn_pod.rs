@@ -194,7 +194,9 @@ impl Tool for SpawnPodTool {
             }
         };
 
-        let start_outcome = self.exec_child(&overlay_toml, &predicted_socket).await;
+        let start_outcome = self
+            .exec_child(&input.name, &overlay_toml, &predicted_socket)
+            .await;
         if let Err(e) = start_outcome {
             self.release_reservation(&lock_path, &input.name);
             return Err(e);
@@ -242,10 +244,30 @@ impl Tool for SpawnPodTool {
 impl SpawnPodTool {
     async fn exec_child(
         &self,
+        pod_name: &str,
         overlay_toml: &str,
         predicted_socket: &Path,
     ) -> Result<(), ToolError> {
         let pod_command = std::env::var("INSOMNIA_POD_COMMAND").unwrap_or_else(|_| "pod".into());
+
+        // Pre-create the child's runtime dir so we have a stable place to
+        // capture its stderr before it has had a chance to bind anything.
+        // The child's own `RuntimeDir::create` will `create_dir_all` the
+        // same path again — that's idempotent. On clean exit the child's
+        // RuntimeDir Drop tears the dir (and this log) down with it.
+        let pod_runtime_dir = self.runtime_base.join(pod_name);
+        tokio::fs::create_dir_all(&pod_runtime_dir)
+            .await
+            .map_err(|e| {
+                ToolError::ExecutionFailed(format!(
+                    "create runtime dir {}: {e}",
+                    pod_runtime_dir.display()
+                ))
+            })?;
+        let stderr_path = pod_runtime_dir.join("stderr.log");
+        let stderr_file = std::fs::File::create(&stderr_path).map_err(|e| {
+            ToolError::ExecutionFailed(format!("open {}: {e}", stderr_path.display()))
+        })?;
 
         let mut cmd = Command::new(&pod_command);
         cmd.arg("--adopt")
@@ -256,7 +278,7 @@ impl SpawnPodTool {
             .current_dir(&self.spawner_pwd)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::from(stderr_file))
             .process_group(0);
 
         let child = cmd
@@ -269,7 +291,10 @@ impl SpawnPodTool {
         // orphans. Lifecycle tracking lives in `spawned_pods.json`.
         drop(child);
 
-        wait_for_socket(predicted_socket, SOCKET_WAIT_TIMEOUT).await
+        match wait_for_socket(predicted_socket, SOCKET_WAIT_TIMEOUT).await {
+            Ok(()) => Ok(()),
+            Err(e) => Err(annotate_with_stderr(e, &stderr_path).await),
+        }
     }
 
     fn release_reservation(&self, lock_path: &Path, pod_name: &str) {
@@ -328,6 +353,33 @@ fn build_overlay_toml(
         ..Default::default()
     };
     toml::to_string(&overlay)
+}
+
+/// Tail of the spawned child's `stderr.log` to splice into a startup
+/// failure message. Capped so a chatty child can't blow up the LLM's
+/// tool-result budget — debugging beyond this should read the file
+/// directly.
+const STDERR_TAIL_BYTES: usize = 4 * 1024;
+
+async fn annotate_with_stderr(err: ToolError, stderr_path: &Path) -> ToolError {
+    let tail = match tokio::fs::read(stderr_path).await {
+        Ok(bytes) => {
+            let start = bytes.len().saturating_sub(STDERR_TAIL_BYTES);
+            String::from_utf8_lossy(&bytes[start..]).into_owned()
+        }
+        Err(_) => return err,
+    };
+    let trimmed = tail.trim();
+    if trimmed.is_empty() {
+        return err;
+    }
+    match err {
+        ToolError::ExecutionFailed(msg) => ToolError::ExecutionFailed(format!(
+            "{msg}\n--- child stderr ({}) ---\n{trimmed}",
+            stderr_path.display()
+        )),
+        other => other,
+    }
 }
 
 async fn wait_for_socket(path: &Path, timeout: Duration) -> Result<(), ToolError> {
