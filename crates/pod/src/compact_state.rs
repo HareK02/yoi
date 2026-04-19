@@ -1,24 +1,32 @@
 //! Shared state for compaction decisions.
 //!
-//! Holds atomic counters shared between:
-//! - `on_usage` callback (writes `last_input_tokens`)
-//! - `CompactInterceptor` (reads token count, checks thresholds)
-//! - `Pod::run()`/`resume()` (circuit breaker, thrash detection)
+//! Holds the two configured thresholds and circuit-breaker / thrash-detection
+//! flags shared between:
+//! - `PodInterceptor` (reads `request_threshold` — the *safety net* for
+//!   between-requests yielding)
+//! - `Pod::try_post_run_compact` (reads `post_run_threshold` — the
+//!   *proactive* check between turns)
+//! - `Pod::run()` / `resume()` (circuit breaker, thrash detection)
+//!
+//! Current occupancy (input-token count) is **not** stored here. The single
+//! source of truth is `session_store::UsageRecord` (persisted per LLM call)
+//! projected through `Pod::total_tokens()`. Callers pass the current
+//! occupancy to `exceeds_*` at check time.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 const MAX_COMPACT_FAILURES: usize = 3;
 
 /// Shared mutable state for compaction decisions.
 pub(crate) struct CompactState {
-    /// Last observed input_tokens from `on_usage` callback.
-    last_input_tokens: AtomicU64,
-    /// Proactive threshold — checked in `pre_llm_request` (between turns).
-    turn_threshold: u64,
-    /// Post-run threshold — checked by Controller after run completes.
-    post_run_threshold: u64,
-    /// Number of recent turns to retain after compaction.
-    retained_turns: usize,
+    /// Between-turns threshold (proactive). Checked by the Controller
+    /// after a run completes. `None` disables the post-run check.
+    post_run_threshold: Option<u64>,
+    /// Between-requests threshold (safety net). Checked inside a turn
+    /// before each LLM request. `None` disables the request check.
+    request_threshold: Option<u64>,
+    /// Token budget retained verbatim at the tail after compaction.
+    retained_tokens: u64,
     /// Consecutive compact failures. At `MAX_COMPACT_FAILURES`, compaction is disabled.
     consecutive_failures: AtomicUsize,
     /// `true` immediately after a successful compact, cleared on next normal completion.
@@ -28,40 +36,29 @@ pub(crate) struct CompactState {
 }
 
 impl CompactState {
-    /// Create a new CompactState.
-    ///
-    /// `turn_threshold` is the proactive (80%) threshold from the manifest.
-    /// `post_run_threshold` is derived as `turn_threshold * 9 / 8` (≈90%).
-    pub(crate) fn new(turn_threshold: u64, retained_turns: usize) -> Self {
+    pub(crate) fn new(
+        post_run_threshold: Option<u64>,
+        request_threshold: Option<u64>,
+        retained_tokens: u64,
+    ) -> Self {
         Self {
-            last_input_tokens: AtomicU64::new(0),
-            turn_threshold,
-            post_run_threshold: turn_threshold * 9 / 8,
-            retained_turns,
+            post_run_threshold,
+            request_threshold,
+            retained_tokens,
             consecutive_failures: AtomicUsize::new(0),
             just_compacted: AtomicBool::new(false),
             disabled: AtomicBool::new(false),
         }
     }
 
-    /// Update the last observed input_tokens (called from `on_usage`).
-    pub(crate) fn update_input_tokens(&self, tokens: u64) {
-        self.last_input_tokens.store(tokens, Ordering::Relaxed);
+    /// Configured between-requests threshold (if any).
+    pub(crate) fn request_threshold(&self) -> Option<u64> {
+        self.request_threshold
     }
 
-    /// Read the last observed input_tokens.
-    pub(crate) fn last_input_tokens(&self) -> u64 {
-        self.last_input_tokens.load(Ordering::Relaxed)
-    }
-
-    /// The between-turns threshold value.
-    pub(crate) fn turn_threshold(&self) -> u64 {
-        self.turn_threshold
-    }
-
-    /// Number of turns to retain after compaction.
-    pub(crate) fn retained_turns(&self) -> usize {
-        self.retained_turns
+    /// Token budget retained verbatim at the tail after compaction.
+    pub(crate) fn retained_tokens(&self) -> u64 {
+        self.retained_tokens
     }
 
     /// Whether compaction has been disabled by the circuit breaker.
@@ -69,14 +66,20 @@ impl CompactState {
         self.disabled.load(Ordering::Relaxed)
     }
 
-    /// Whether `last_input_tokens` exceeds the between-turns threshold.
-    pub(crate) fn exceeds_turn(&self) -> bool {
-        self.last_input_tokens() > self.turn_threshold
+    /// Whether `current_tokens` exceeds the between-requests threshold.
+    /// Returns `false` when `request_threshold` is unset.
+    pub(crate) fn exceeds_request(&self, current_tokens: u64) -> bool {
+        self.request_threshold
+            .map(|t| current_tokens > t)
+            .unwrap_or(false)
     }
 
-    /// Whether `last_input_tokens` exceeds the post-run threshold.
-    pub(crate) fn exceeds_post_run(&self) -> bool {
-        self.last_input_tokens() > self.post_run_threshold
+    /// Whether `current_tokens` exceeds the post-run threshold.
+    /// Returns `false` when `post_run_threshold` is unset.
+    pub(crate) fn exceeds_post_run(&self, current_tokens: u64) -> bool {
+        self.post_run_threshold
+            .map(|t| current_tokens > t)
+            .unwrap_or(false)
     }
 
     /// Whether a compact just completed (for thrash detection).
@@ -109,31 +112,46 @@ mod tests {
     use super::*;
 
     #[test]
-    fn threshold_derivation() {
-        let state = CompactState::new(80_000, 2);
-        assert_eq!(state.turn_threshold, 80_000);
-        assert_eq!(state.post_run_threshold, 90_000);
-        assert_eq!(state.retained_turns(), 2);
+    fn both_thresholds_configured() {
+        let state = CompactState::new(Some(80_000), Some(90_000), 8_000);
+        assert_eq!(state.request_threshold(), Some(90_000));
+        assert_eq!(state.retained_tokens(), 8_000);
+
+        assert!(!state.exceeds_request(70_000));
+        assert!(!state.exceeds_post_run(70_000));
+
+        assert!(!state.exceeds_request(85_000));
+        assert!(state.exceeds_post_run(85_000));
+
+        assert!(state.exceeds_request(95_000));
+        assert!(state.exceeds_post_run(95_000));
     }
 
     #[test]
-    fn exceeds_checks() {
-        let state = CompactState::new(80_000, 2);
-        assert!(!state.exceeds_turn());
-        assert!(!state.exceeds_post_run());
+    fn post_run_only() {
+        let state = CompactState::new(Some(80_000), None, 8_000);
+        // request check always false when threshold is None.
+        assert!(!state.exceeds_request(1_000_000));
+        assert!(state.exceeds_post_run(85_000));
+    }
 
-        state.update_input_tokens(85_000);
-        assert!(state.exceeds_turn());
-        assert!(!state.exceeds_post_run());
+    #[test]
+    fn request_only() {
+        let state = CompactState::new(None, Some(90_000), 8_000);
+        assert!(!state.exceeds_post_run(1_000_000));
+        assert!(state.exceeds_request(95_000));
+    }
 
-        state.update_input_tokens(95_000);
-        assert!(state.exceeds_turn());
-        assert!(state.exceeds_post_run());
+    #[test]
+    fn both_none_disables_all_checks() {
+        let state = CompactState::new(None, None, 8_000);
+        assert!(!state.exceeds_request(1_000_000));
+        assert!(!state.exceeds_post_run(1_000_000));
     }
 
     #[test]
     fn circuit_breaker_trips_after_max_failures() {
-        let state = CompactState::new(80_000, 2);
+        let state = CompactState::new(Some(80_000), Some(90_000), 8_000);
         assert!(!state.is_disabled());
 
         state.record_compact_failure();
@@ -146,7 +164,7 @@ mod tests {
 
     #[test]
     fn success_resets_failure_count() {
-        let state = CompactState::new(80_000, 2);
+        let state = CompactState::new(Some(80_000), Some(90_000), 8_000);
         state.record_compact_failure();
         state.record_compact_failure();
         assert!(!state.is_disabled());
@@ -154,7 +172,6 @@ mod tests {
         state.record_compact_success();
         assert!(state.just_compacted());
 
-        // After success + 2 more failures, still not disabled (count was reset).
         state.record_compact_failure();
         state.record_compact_failure();
         assert!(!state.is_disabled());
@@ -162,7 +179,7 @@ mod tests {
 
     #[test]
     fn just_compacted_lifecycle() {
-        let state = CompactState::new(80_000, 2);
+        let state = CompactState::new(Some(80_000), Some(90_000), 8_000);
         assert!(!state.just_compacted());
 
         state.record_compact_success();

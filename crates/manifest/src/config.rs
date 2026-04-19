@@ -84,7 +84,13 @@ pub struct CompactionConfigPartial {
     #[serde(default)]
     pub compact_threshold: Option<u64>,
     #[serde(default)]
-    pub compact_retained_turns: Option<usize>,
+    pub compact_request_threshold: Option<u64>,
+    #[serde(default)]
+    pub compact_retained_tokens: Option<u64>,
+    #[serde(default)]
+    pub compact_auto_read_budget: Option<u64>,
+    #[serde(default)]
+    pub compact_worker_max_input_tokens: Option<u64>,
     #[serde(default)]
     pub provider: Option<ProviderConfigPartial>,
 }
@@ -236,9 +242,18 @@ impl CompactionConfigPartial {
             prune_protected_turns: upper.prune_protected_turns.or(self.prune_protected_turns),
             prune_min_savings: upper.prune_min_savings.or(self.prune_min_savings),
             compact_threshold: upper.compact_threshold.or(self.compact_threshold),
-            compact_retained_turns: upper
-                .compact_retained_turns
-                .or(self.compact_retained_turns),
+            compact_request_threshold: upper
+                .compact_request_threshold
+                .or(self.compact_request_threshold),
+            compact_retained_tokens: upper
+                .compact_retained_tokens
+                .or(self.compact_retained_tokens),
+            compact_auto_read_budget: upper
+                .compact_auto_read_budget
+                .or(self.compact_auto_read_budget),
+            compact_worker_max_input_tokens: upper
+                .compact_worker_max_input_tokens
+                .or(self.compact_worker_max_input_tokens),
             provider: merge_option(self.provider, upper.provider, ProviderConfigPartial::merge),
         }
     }
@@ -365,9 +380,16 @@ impl TryFrom<PodManifestConfig> for PodManifest {
                         .prune_min_savings
                         .unwrap_or(defaults::PRUNE_MIN_SAVINGS),
                     compact_threshold: c.compact_threshold,
-                    compact_retained_turns: c
-                        .compact_retained_turns
-                        .unwrap_or(defaults::COMPACT_RETAINED_TURNS),
+                    compact_request_threshold: c.compact_request_threshold,
+                    compact_retained_tokens: c
+                        .compact_retained_tokens
+                        .unwrap_or(defaults::COMPACT_RETAINED_TOKENS),
+                    compact_auto_read_budget: c
+                        .compact_auto_read_budget
+                        .unwrap_or(defaults::COMPACT_AUTO_READ_BUDGET),
+                    compact_worker_max_input_tokens: c
+                        .compact_worker_max_input_tokens
+                        .unwrap_or(defaults::COMPACT_WORKER_MAX_INPUT_TOKENS),
                     provider: comp_provider,
                 })
             })

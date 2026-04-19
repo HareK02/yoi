@@ -61,6 +61,19 @@ fn single_text_events(text: &str) -> Vec<LlmEvent> {
     ]
 }
 
+/// Emit a single `write_summary(text=...)` tool call as one LLM response.
+fn write_summary_tool_use_events(call_id: &str, text: &str) -> Vec<LlmEvent> {
+    let input = serde_json::json!({ "text": text }).to_string();
+    vec![
+        LlmEvent::tool_use_start(0, call_id, "write_summary"),
+        LlmEvent::tool_input_delta(0, input),
+        LlmEvent::tool_use_stop(0),
+        LlmEvent::Status(StatusEvent {
+            status: ResponseStatus::Completed,
+        }),
+    ]
+}
+
 const MINIMAL_MANIFEST_TOML: &str = r#"
 [pod]
 name = "test-pod"
@@ -233,10 +246,11 @@ async fn agents_md_absent_omits_trailing_section() {
 #[tokio::test]
 async fn agents_md_not_reread_after_compact() {
     let client = MockClient::new(vec![
-        single_text_events("a"),
-        single_text_events("b"),
-        single_text_events("summary"),
-        single_text_events("c"),
+        single_text_events("a"),                                     // pod.run("first")
+        single_text_events("b"),                                     // pod.run("second")
+        write_summary_tool_use_events("call-1", "compacted summary"), // compact worker: tool_use
+        single_text_events("done"),                                  // compact worker: close
+        single_text_events("c"),                                     // pod.run("third")
     ]);
     let (mut pod, pwd) = make_pod_with_body("BODY", client).await.unwrap();
     let agents_path = pwd.join("AGENTS.md");
@@ -250,7 +264,7 @@ async fn agents_md_not_reread_after_compact() {
     // Mutate the file after the first turn — must not affect the cached
     // system prompt either on a subsequent turn or across compaction.
     std::fs::write(&agents_path, "mutated").unwrap();
-    pod.compact(1).await.unwrap();
+    pod.compact(0).await.unwrap();
     let after_compact = pod.worker().get_system_prompt().unwrap().to_string();
     assert!(after_compact.contains("original"));
     assert!(!after_compact.contains("mutated"));
@@ -264,10 +278,11 @@ async fn agents_md_not_reread_after_compact() {
 #[tokio::test]
 async fn compact_preserves_system_prompt() {
     let client = MockClient::new(vec![
-        single_text_events("a"),
-        single_text_events("b"),
-        single_text_events("summary"),
-        single_text_events("c"),
+        single_text_events("a"),                                     // pod.run("first")
+        single_text_events("b"),                                     // pod.run("second")
+        write_summary_tool_use_events("call-1", "compacted summary"), // compact worker: tool_use
+        single_text_events("done"),                                  // compact worker: close
+        single_text_events("c"),                                     // pod.run("third")
     ]);
     let (mut pod, _pwd) = make_pod_with_body("SP cwd={{ cwd }}", client)
         .await
@@ -277,7 +292,7 @@ async fn compact_preserves_system_prompt() {
     let before = pod.worker().get_system_prompt().unwrap().to_string();
     pod.run("second").await.unwrap();
 
-    pod.compact(1).await.unwrap();
+    pod.compact(0).await.unwrap();
 
     let after = pod.worker().get_system_prompt().unwrap().to_string();
     assert_eq!(before, after);
