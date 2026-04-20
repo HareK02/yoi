@@ -6,79 +6,111 @@
 機能が増えるにつれ、以下が不足している:
 
 - Compact 発生時のクライアント通知
-- Permission の ask/reply フロー
-- セッション切り替え（compact 後の新 session_id 通知）
+- Permission の ask/reply フロー（permission-extension-point の段階 3）
+- セッション切り替え（compact 後の新 `session_id` 通知）
 - クライアント→Pod の制御拡張（設定変更等）
 
-## 現状の Protocol
+## 現状（調査結果）
 
 ### Method (Client → Pod)
 
-```rust
-Method::Run { input }
-Method::Resume
-Method::Cancel
-Method::GetHistory  // request-response（socket 層で直接応答）
+`crates/protocol/src/lib.rs:11-32`
+
+```
+Run { input } | Notify { message } | PodEvent(PodEvent)
+Resume | Cancel | Pause | Shutdown | GetHistory
 ```
 
 ### Event (Pod → Client)
 
+`crates/protocol/src/lib.rs:85-134`
+
 ```
-TurnStart, TurnEnd, TextDelta, TextDone,
-ToolCallStart, ToolCallArgsDelta, ToolCallDone, ToolResult,
-Usage, RunEnd, Error, History
+TurnStart/TurnEnd, TextDelta/TextDone,
+ToolCallStart/ArgsDelta/Done, ToolResult,
+Usage, RunEnd, Error, History, Notification, Shutdown
 ```
 
-## 設計課題
+### 既存の request-response の扱い
 
-### 1. Broadcast vs Request-Response の区別
+`crates/pod/src/socket_server.rs:96-113` の `GetHistory` だけが
+「socket 層で即応答」。他の Method は `handle.send(method)` で
+Controller に fire-and-forget。
 
-現状:
-- Event は全て broadcast channel 経由
-- `GetHistory` だけ socket 層で直接応答（暗黙の request-response）
+Client (`crates/tui/src/client.rs`) は reader を単一の mpsc に流すだけで、
+応答と broadcast を区別しない。`GetHistory` は 1 回きりで競合しないため
+現状は動く。
 
-課題:
-- request-response が増えると socket_server の分岐が膨らむ
-- クライアント側で「この Event は自分のリクエストへの応答」と判別できない
+### Compact の現状
 
-選択肢:
-- **A. 現状維持**: request-response は socket 層で個別に処理。シンプルだがスケールしない
-- **B. request_id パターン**: Method に optional `id` を持たせ、応答 Event に同じ `id` を含める
-- **C. 型で分ける**: `Response` enum を Event とは別に定義
+`crates/pod/src/pod.rs:825` の `compact()` は新しい `SessionId` を戻すが、
+ネットワークに一切乗らない:
 
-### 2. Compact イベント
+- mid-turn: `do_compact_and_resume` (685行) — 失敗時のみ `Notification::Error`
+- post-turn: `try_post_run_compact` (715行) — 失敗時のみ `Notification::Warn`
 
-TUI が compact の進行を表示するために必要:
+成功時は完全にサイレント。`Event::History` / `Greeting` に `session_id` は入っていないため、
+TUI は現在の session_id を認識できない。
+
+## 決定事項
+
+### 1. request-response の扱い — 今は足さない
+
+- 現状 `GetHistory` が 1 回きりで競合しないため、新しい wire フィールドなしで動く。
+- 将来 Permission ask/reply などが入る時点で、**Method/Event 双方に `request_id: Option<String>` を追加**する方針を採る。既存実装は無視するだけで互換を保てる。
+- `Response` を別 enum にする案 (C) は採用しない:
+  - 先例として `PodEvent` が `Method::PodEvent(PodEvent)` で Method 側に包まれており、第 3 の wire 型を増やす理由がない。
+  - Reader の分岐が増え、`PodClient` の mpsc 設計を崩す。
+
+今回は **ドキュメントとしての宣言のみ**。フィールドは足さない。
+
+### 2. Compact イベント — 追加する
 
 ```rust
-Event::CompactStart  // compact 開始
-Event::CompactDone { new_session_id: String }  // 成功
-Event::CompactFailed { error: String }  // 失敗
+Event::CompactStart
+Event::CompactDone { new_session_id: SessionId }
+Event::CompactFailed { error: String }
 ```
 
-compact は Pod 内部で自律的に発火するので、broadcast で全クライアントに通知が自然。
-CompactDone 後、クライアントは GetHistory で新しい history を取得できる。
+- 発火点は `do_compact_and_resume` と `try_post_run_compact` の 2 箇所。
+  `event_tx.send(...)` を start / 成功 / 失敗に挟むだけ。
+- 既存の `Notification::Error/Warn`（compactor source）はイベント側に移行してよいが、
+  初期移行では重複して出しても害はない。先に Event を足し、Notification は後続チケットで整理。
+- Broadcast で全クライアントに通知（compact は Pod 自律発火で、特定リクエストへの応答ではない）。
 
-### 3. セッション情報の通知
+### 3. session_id 通知 — CompactDone に含める
 
-compact で session_id が変わる。クライアントに通知する方法:
+- `Event::CompactDone { new_session_id }` に載せる。
+- 汎用 `SessionChanged` は作らない（YAGNI — fork 等が実装される時まで判断を保留）。
+- TUI 側は現状 session_id を利用していないので、イベントを受け取るだけでよい（将来 GetHistory 再取得などに使う）。
 
-- **CompactDone に含める**: `Event::CompactDone { new_session_id }`
-- **汎用 SessionChanged イベント**: compact 以外でも session_id が変わるケース（fork 等）に対応
+### 4. Permission ask/reply — 別チケットで実装
 
-### 4. Permission の ask/reply（将来）
+- permission-extension-point の段階 3 で追加する。
+- Pod → Client は `Event::PermissionRequest { id, tool, args }`、
+  Client → Pod は `Method::PermissionReply { id, allow }` を想定。
+- ここで使う `id` は 1. の `request_id: Option<String>` パターンに従う。
+  protocol-design 本チケットでは足さず、permission-extension-point 側で導入する。
 
-permission-extension-point チケットで扱う。ここでは Protocol の拡張パターンだけ意識:
+## 本チケットで実装するもの
 
-```
-Pod → Client: Event::PermissionRequest { id, tool, args }
-Client → Pod: Method::PermissionReply { id, allow }
-```
+1. `Event::CompactStart` / `Event::CompactDone { new_session_id: SessionId }` / `Event::CompactFailed { error: String }` を追加する。
+   - `SessionId` の wire 表現は既存 `session_store::SessionId` をそのまま `Serialize` できれば使う。外部型に依存するなら `String` 化する。
+2. `crates/pod/src/pod.rs` の compact 発火 2 箇所で対応する Event を broadcast する。
+3. `crates/tui/src/app.rs` の `handle_pod_event` に 3 分岐を追加し、最低限の表示を行う（アイコン + メッセージ、詳細 UI は別チケット）。
+4. テスト:
+   - Event の JSON roundtrip（`protocol` クレート）
+   - 成功/失敗/mid-turn の各パスで Event が発行されることを確認する統合テスト（`pod` クレート）
 
-これは request-response の逆方向（Pod が要求元）。同じソケット上で双方向に使える。
+## 本チケットで実装しないもの
 
-## 検討事項
+- `request_id: Option<String>` フィールドの追加（将来、必要になったチケットで足す）
+- `Event::SessionChanged`（fork 実装時に再検討）
+- Notification と CompactFailed の重複整理（後続チケット）
+- Permission ask/reply の wire 定義（permission-extension-point 段階 3）
 
-- Event の肥大化をどう管理するか（カテゴリ分け？ネスト？）
-- Protocol のバージョニング（クライアント互換性）
-- イベントの順序保証（broadcast channel の特性）
+## 検討メモ（将来向け）
+
+- Event の肥大化が気になってきたら、`Event::Stream(StreamEvent)` のようにカテゴリ分けしてネストする余地はある。ただし現状 15 バリアントで破綻していないので先送り。
+- Protocol のバージョニングは未着手。クライアントの互換性問題が顕在化した時点で `Event::Hello { protocol_version }` のような握手を追加する。
+- Broadcast channel の特性上、遅い client では drop が起き得る。現状はログのみだが、compact 等の重要イベントを落とすとまずいので将来は per-client queue への置き換えを検討する。
