@@ -10,6 +10,10 @@
 //! なる認証ストア解決（Codex OAuth の `~/.codex/auth.json` 読取等）は
 //! このクレートに追加する。
 
+pub mod codex_oauth;
+
+use std::sync::Arc;
+
 use llm_worker::llm_client::{
     LlmClient,
     capability::ModelCapability,
@@ -74,10 +78,23 @@ fn resolve_auth(
             }
             Err(ProviderError::ApiKeyMissing { scheme })
         }
-        AuthRef::CodexOAuth => Err(ProviderError::Config(
-            "codex_oauth auth not yet implemented (tickets/llm-auth-codex-oauth)".into(),
-        )),
+        AuthRef::CodexOAuth => {
+            let provider = codex_oauth::CodexAuthProvider::from_default_home()
+                .map_err(|e| ProviderError::Config(e.to_string()))?;
+            Ok(ResolvedAuth::Custom(Arc::new(provider)))
+        }
     }
+}
+
+/// `AuthRef::CodexOAuth` 指定時、`base_url` 未指定なら ChatGPT backend を既定とする。
+fn effective_base_url<S: Scheme>(scheme: &S, config: &ModelConfig) -> String {
+    if let Some(b) = &config.base_url {
+        return b.clone();
+    }
+    if matches!(config.auth, AuthRef::CodexOAuth) {
+        return "https://chatgpt.com/backend-api".to_string();
+    }
+    scheme.default_base_url().to_string()
 }
 
 fn build_transport<S: Scheme>(
@@ -100,10 +117,7 @@ fn build_transport<S: Scheme>(
         .clone()
         .or_else(|| scheme.capability_for(&config.model_id))
         .unwrap_or_else(|| scheme.default_capability());
-    let base_url = config
-        .base_url
-        .clone()
-        .unwrap_or_else(|| scheme.default_base_url().to_string());
+    let base_url = effective_base_url(&scheme, config);
     Ok(Box::new(HttpTransport::new(
         scheme,
         config.model_id.clone(),

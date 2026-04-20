@@ -5,13 +5,14 @@
 //! scheme 固有の差分は [`Scheme`] trait 実装に委譲する。
 
 use std::pin::Pin;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use eventsource_stream::Eventsource;
 use futures::{Stream, StreamExt, TryStreamExt};
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
 
-use super::auth::AuthRequirement;
+use super::auth::{AuthProvider, AuthRequirement};
 use super::capability::ModelCapability;
 use super::client::{ConfigWarning, LlmClient};
 use super::error::ClientError;
@@ -21,24 +22,28 @@ use super::types::{Request, RequestConfig};
 
 /// `AuthRef` を解決したランタイム表現。`crates/provider` が構築する。
 ///
-/// `AuthRef::ApiKey` → 読み取った文字列、`AuthRef::None` → `None`。
-/// `CodexOAuth` 等、動的に更新される認証は別途 `Custom` バリアントを
-/// 追加する余地を残す（本チケットでは未実装）。
+/// - `None`: 認証ヘッダを送らない（Ollama 等の opt-out）
+/// - `ApiKey`: 静的な API key 文字列
+/// - `Custom`: リクエスト毎に動的にヘッダを組み立てる（Codex OAuth 等）
 #[derive(Debug, Clone)]
 pub enum ResolvedAuth {
     None,
     ApiKey(String),
+    Custom(Arc<dyn AuthProvider>),
 }
 
 impl ResolvedAuth {
     /// 認証要件と実際の解決値が噛み合うか検査する。構築時検証用。
     ///
-    /// `ResolvedAuth::None` は認証を付けないという宣言なので、どの
-    /// `AuthRequirement` でも受け入れる（Ollama の Anthropic scheme
-    /// 流用は `required_auth = XApiKey` だが認証ヘッダなしで動く）。
+    /// - `ResolvedAuth::None` は認証を付けない宣言なので、どの
+    ///   `AuthRequirement` でも受け入れる（Ollama の Anthropic scheme
+    ///   流用は `required_auth = XApiKey` だが認証ヘッダなしで動く）
+    /// - `ResolvedAuth::Custom` は「ヘッダ組立を全部こちらで行う」
+    ///   宣言なので、scheme が要求する形式によらず受け入れる
     pub fn matches(&self, req: AuthRequirement) -> bool {
         match (self, req) {
             (Self::None, _) => true,
+            (Self::Custom(_), _) => true,
             (
                 Self::ApiKey(_),
                 AuthRequirement::Bearer | AuthRequirement::XApiKey | AuthRequirement::QueryParam { .. },
@@ -100,29 +105,36 @@ impl<S: Scheme> HttpTransport<S> {
         }
     }
 
-    fn build_headers(&self) -> Result<HeaderMap, ClientError> {
+    async fn build_headers(&self) -> Result<HeaderMap, ClientError> {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
-        match (self.scheme.required_auth(), &self.auth) {
-            (AuthRequirement::None, _) | (_, ResolvedAuth::None) => {}
-            (AuthRequirement::Bearer, ResolvedAuth::ApiKey(key)) => {
+        match (&self.auth, self.scheme.required_auth()) {
+            (ResolvedAuth::None, _) | (_, AuthRequirement::None) => {}
+            (ResolvedAuth::Custom(provider), _) => {
+                for (name, mut value) in provider.headers().await? {
+                    value.set_sensitive(true);
+                    headers.insert(name, value);
+                }
+            }
+            (ResolvedAuth::ApiKey(key), AuthRequirement::Bearer) => {
                 let mut val = HeaderValue::from_str(&format!("Bearer {key}"))
                     .map_err(|e| ClientError::Config(format!("invalid api key: {e}")))?;
                 val.set_sensitive(true);
                 headers.insert("Authorization", val);
             }
-            (AuthRequirement::XApiKey, ResolvedAuth::ApiKey(key)) => {
+            (ResolvedAuth::ApiKey(key), AuthRequirement::XApiKey) => {
                 let mut val = HeaderValue::from_str(key.as_str())
                     .map_err(|e| ClientError::Config(format!("invalid api key: {e}")))?;
                 val.set_sensitive(true);
                 headers.insert("x-api-key", val);
             }
-            (AuthRequirement::QueryParam { .. }, _) => {
+            (_, AuthRequirement::QueryParam { .. }) => {
                 // クエリパラメータは `build_url` で付与済み
             }
-            (AuthRequirement::Custom, _) => {
-                // 今チケットでは Custom は使わない。Codex OAuth で追加予定
+            (ResolvedAuth::ApiKey(_), AuthRequirement::Custom) => {
+                // scheme が Custom を要求する組合せに ApiKey は流れてこない想定
+                // （`matches()` で弾かれる）。安全側で何もしない
             }
         }
 
@@ -164,7 +176,7 @@ impl<S: Scheme + Clone + 'static> LlmClient for HttpTransport<S> {
         request: Request,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<Event, ClientError>> + Send>>, ClientError> {
         let url = self.build_url();
-        let headers = self.build_headers()?;
+        let headers = self.build_headers().await?;
         let body = self
             .scheme
             .build_request_body(&self.model_id, &request, &self.capability);
