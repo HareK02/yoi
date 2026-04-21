@@ -1,10 +1,14 @@
-//! `model_id → ModelCapability` 静的テーブル（Google Gemini）。
+//! Gemini scheme の wire-level 既定 capability。
+//!
+//! モデル ID 固有のテーブル(`gemini-*` バージョン別の reasoning 有無)は
+//! 高レベル構築層(`provider::capability`)の責務。ここでは wire の
+//! 保守的 default のみ。
 
 use crate::llm_client::capability::{
-    CacheStrategy, ModelCapability, ReasoningSupport, StructuredOutput, ToolCallingSupport,
+    CacheStrategy, ModelCapability, StructuredOutput, ToolCallingSupport,
 };
 
-/// Scheme 既定の capability（未知モデル / 未明示モデル用）。
+/// Scheme 既定の capability(未知モデル / 未明示モデル用)。
 pub(crate) fn default_capability() -> ModelCapability {
     ModelCapability {
         tool_calling: ToolCallingSupport::Parallel,
@@ -13,25 +17,4 @@ pub(crate) fn default_capability() -> ModelCapability {
         vision: true,
         prompt_caching: CacheStrategy::Auto,
     }
-}
-
-pub(crate) fn lookup(model_id: &str) -> Option<ModelCapability> {
-    if !model_id.starts_with("gemini-") {
-        return None;
-    }
-    // 2.5 系以降は thinking / reasoning を持つ
-    let reasoning = if model_id.starts_with("gemini-2.5")
-        || model_id.starts_with("gemini-3")
-    {
-        Some(ReasoningSupport::BudgetTokens)
-    } else {
-        None
-    };
-    Some(ModelCapability {
-        tool_calling: ToolCallingSupport::Parallel,
-        structured_output: StructuredOutput::JsonSchema,
-        reasoning,
-        vision: true,
-        prompt_caching: CacheStrategy::Auto,
-    })
 }

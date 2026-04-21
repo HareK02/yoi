@@ -20,32 +20,17 @@ mod recorder;
 mod scenarios;
 
 use clap::{Parser, ValueEnum};
-use llm_worker::llm_client::capability::{
-    CacheStrategy, ModelCapability, StructuredOutput, ToolCallingSupport,
-};
 use llm_worker::llm_client::scheme::{
     Scheme, anthropic::AnthropicScheme, gemini::GeminiScheme, openai_chat::OpenAIScheme,
 };
 use llm_worker::llm_client::transport::{HttpTransport, ResolvedAuth};
-
-/// 既定の capability: fixture 記録には cache_control を付けない
-/// （既知モデルの静的テーブルを経由すると scheme 毎に自動設定される）。
-fn fallback_capability() -> ModelCapability {
-    ModelCapability {
-        tool_calling: ToolCallingSupport::Parallel,
-        structured_output: StructuredOutput::JsonSchema,
-        reasoning: None,
-        vision: false,
-        prompt_caching: CacheStrategy::Auto,
-    }
-}
 
 fn make_transport<S: Scheme>(
     scheme: S,
     model: &str,
     auth: ResolvedAuth,
 ) -> HttpTransport<S> {
-    let cap = scheme.capability_for(model).unwrap_or_else(fallback_capability);
+    let cap = scheme.default_capability();
     let base_url = scheme.default_base_url().to_string();
     HttpTransport::new(scheme, model.to_string(), base_url, auth, cap)
 }
@@ -138,7 +123,7 @@ async fn run_scenario_with_ollama(
         model.to_string(),
         "http://localhost:11434".to_string(),
         ResolvedAuth::None,
-        fallback_capability(),
+        AnthropicScheme::new().default_capability(),
     );
 
     recorder::record_request(

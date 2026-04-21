@@ -4,7 +4,7 @@
 //! item 配列で reasoning / function_call / function_call_output が
 //! first-class。`Item` を素に近い形で `input[]` に投影できる。
 
-use serde::Serialize;
+use serde::{Serialize, Serializer};
 use serde_json::Value;
 
 use crate::llm_client::{
@@ -125,9 +125,26 @@ pub(crate) struct ResponseTool {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// OpenAI Responses API は `type:"object"` のパラメータスキーマに
+    /// `properties` が存在することを要求する。schemars は引数なし struct
+    /// から `properties` を含まない最小スキーマを出すので、serialize
+    /// 時に空オブジェクトを補う。
+    #[serde(serialize_with = "serialize_parameters")]
     pub parameters: Value,
     /// Structured output モード制御。デフォルト false。
     pub strict: bool,
+}
+
+fn serialize_parameters<S: Serializer>(value: &Value, s: S) -> Result<S::Ok, S::Error> {
+    if let Some(obj) = value.as_object()
+        && obj.get("type").and_then(Value::as_str) == Some("object")
+        && !obj.contains_key("properties")
+    {
+        let mut patched = obj.clone();
+        patched.insert("properties".to_string(), Value::Object(Default::default()));
+        return Value::Object(patched).serialize(s);
+    }
+    value.serialize(s)
 }
 
 impl OpenAIResponsesScheme {
@@ -436,6 +453,46 @@ mod tests {
         let req = Request::new().user("hi").max_tokens(100);
         let body = scheme.build_request("gpt-5", &req, &cap_with_reasoning());
         assert_eq!(body.max_output_tokens, Some(100));
+    }
+
+    #[test]
+    fn tool_schema_without_properties_is_normalized() {
+        // schemars は引数なし struct から `type:"object"` だけのスキーマを
+        // 吐く。OpenAI Responses は `properties` 欠落を 400 で拒否するので
+        // 送る直前に空オブジェクトを補うのを確認。
+        let scheme = OpenAIResponsesScheme::new();
+        let raw_schema = serde_json::json!({ "type": "object" });
+        let req = Request::new().tool(
+            ToolDefinition::new("empty")
+                .description("no args")
+                .input_schema(raw_schema),
+        );
+        let body = scheme.build_request("gpt-5", &req, &cap_with_reasoning());
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(json["tools"][0]["parameters"]["type"], "object");
+        assert!(
+            json["tools"][0]["parameters"]["properties"].is_object(),
+            "properties must be present as an object, got: {}",
+            json["tools"][0]["parameters"]
+        );
+    }
+
+    #[test]
+    fn tool_schema_with_properties_is_untouched() {
+        let scheme = OpenAIResponsesScheme::new();
+        let raw_schema = serde_json::json!({
+            "type": "object",
+            "properties": { "path": { "type": "string" } },
+            "required": ["path"]
+        });
+        let req = Request::new().tool(
+            ToolDefinition::new("t")
+                .description("d")
+                .input_schema(raw_schema.clone()),
+        );
+        let body = scheme.build_request("gpt-5", &req, &cap_with_reasoning());
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(json["tools"][0]["parameters"], raw_schema);
     }
 
     #[test]

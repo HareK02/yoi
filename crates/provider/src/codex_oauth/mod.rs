@@ -143,7 +143,7 @@ impl CodexAuthProvider {
     }
 
     fn build_headers(snap: &AuthSnapshot) -> Result<Vec<(HeaderName, HeaderValue)>, CodexAuthError> {
-        let mut out = Vec::with_capacity(3);
+        let mut out = Vec::with_capacity(5);
 
         let auth_val = HeaderValue::from_str(&format!("Bearer {}", snap.access_token))
             .map_err(|e| CodexAuthError::InvalidHeader(format!("Authorization: {e}")))?;
@@ -154,6 +154,18 @@ impl CodexAuthProvider {
         out.push((
             HeaderName::from_static("chatgpt-account-id"),
             acc_val,
+        ));
+
+        // Cloudflare WAF は ChatGPT backend アクセス元を `originator` /
+        // `User-Agent` で識別する。Codex CLI が送る固定値を流用しないと
+        // HTML challenge (403) を返されて SSE に到達できない。
+        out.push((
+            HeaderName::from_static("originator"),
+            HeaderValue::from_static("codex_cli_rs"),
+        ));
+        out.push((
+            HeaderName::from_static("user-agent"),
+            HeaderValue::from_static("codex_cli_rs/0.60.0"),
         ));
 
         // FedRAMP 組織は id_token JWT 内の claim で判定

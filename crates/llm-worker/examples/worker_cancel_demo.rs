@@ -2,9 +2,6 @@
 //!
 //! Example of cancelling from another thread during streaming
 
-use llm_worker::llm_client::capability::{
-    CacheStrategy, ModelCapability, StructuredOutput, ToolCallingSupport,
-};
 use llm_worker::llm_client::scheme::{Scheme, anthropic::AnthropicScheme};
 use llm_worker::llm_client::transport::{HttpTransport, ResolvedAuth};
 use llm_worker::{Worker, WorkerResult};
@@ -28,13 +25,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let scheme = AnthropicScheme::new();
     let model = "claude-sonnet-4-20250514".to_string();
-    let cap = scheme.capability_for(&model).unwrap_or(ModelCapability {
-        tool_calling: ToolCallingSupport::Parallel,
-        structured_output: StructuredOutput::JsonSchema,
-        reasoning: None,
-        vision: false,
-        prompt_caching: CacheStrategy::Auto,
-    });
+    let cap = scheme.default_capability();
     let base_url = scheme.default_base_url().to_string();
     let client = HttpTransport::new(scheme, model, base_url, ResolvedAuth::ApiKey(api_key), cap);
     let worker = Worker::new(client);

@@ -10,6 +10,7 @@
 //! なる認証ストア解決（Codex OAuth の `~/.codex/auth.json` 読取等）は
 //! このクレートに追加する。
 
+pub mod capability;
 pub mod codex_oauth;
 
 use std::sync::Arc;
@@ -87,12 +88,14 @@ fn resolve_auth(
 }
 
 /// `AuthRef::CodexOAuth` 指定時、`base_url` 未指定なら ChatGPT backend を既定とする。
+/// Codex CLI が使う `/backend-api/codex` を base に取り、scheme 側の `/responses`
+/// path と結合して `https://chatgpt.com/backend-api/codex/responses` になる。
 fn effective_base_url<S: Scheme>(scheme: &S, config: &ModelConfig) -> String {
     if let Some(b) = &config.base_url {
         return b.clone();
     }
     if matches!(config.auth, AuthRef::CodexOAuth) {
-        return "https://chatgpt.com/backend-api".to_string();
+        return "https://chatgpt.com/backend-api/codex".to_string();
     }
     scheme.default_base_url().to_string()
 }
@@ -108,14 +111,15 @@ fn build_transport<S: Scheme>(
         });
     }
     // capability の優先順位:
-    //   1. `ModelConfig.capability` の明示指定（OpenAI 互換ルーターの
-    //      未知モデル等、マニフェストで完全に上書きしたいケース）
-    //   2. scheme 静的テーブル（既知モデル）
-    //   3. `Scheme::default_capability()`（scheme ごとの安全側デフォルト）
+    //   1. `ModelConfig.capability` の明示指定(OpenAI 互換ルーターの
+    //      未知モデル等、マニフェストで完全に上書きしたいケース)
+    //   2. `provider::capability::lookup` の既知モデルテーブル
+    //      (モデル ID の知識は高レベル構築層(ここ)の責務)
+    //   3. `Scheme::default_capability()`(scheme ごとの wire-level 安全側)
     let capability: ModelCapability = config
         .capability
         .clone()
-        .or_else(|| scheme.capability_for(&config.model_id))
+        .or_else(|| capability::lookup(config.scheme, &config.model_id))
         .unwrap_or_else(|| scheme.default_capability());
     let base_url = effective_base_url(&scheme, config);
     Ok(Box::new(HttpTransport::new(

@@ -1,3 +1,4 @@
 - [Event broadcast pattern](project_event_broadcast_pattern.md) — Pod は event_tx: Option<broadcast::Sender<Event>> を保持、Controller が attach_notifier と同タイミングで attach
 - [Test-path omission precedent](feedback_test_path_omission.md) — 要件に挙がったテストを「共通ヘルパ経由だから省略」した場合は Approve with follow-up が相場
 - [cargo add workspace pitfall](feedback_cargo_add_workspace_pitfall.md) — ルート Cargo.toml に [workspace.dependencies] が未定義、workspace = true 指定は現状使えない
+- [Out-of-scope diff mixing](feedback_out_of_scope_mixing.md) — スコープ外修正が ticket diff に同居 → [major] Non-blocking で指摘、コミット分割推奨、総合は Approve

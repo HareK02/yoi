@@ -67,6 +67,7 @@ pub enum AuthRef {
         file: Option<PathBuf>,
     },
     /// ChatGPT OAuth（`~/.codex/auth.json`）。実装は `llm-auth-codex-oauth` チケット
+    #[serde(rename = "codex_oauth")]
     CodexOAuth,
 }
 

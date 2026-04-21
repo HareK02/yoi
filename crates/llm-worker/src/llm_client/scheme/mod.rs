@@ -76,13 +76,10 @@ pub trait Scheme: Clone + Send + Sync + 'static {
         state: &mut Self::State,
     ) -> Result<Vec<Event>, ClientError>;
 
-    /// 既知モデル ID の能力テーブル引き。未知なら `None` を返す
-    /// ので、呼び出し側は [`Scheme::default_capability`] に
-    /// フォールバックする。
-    fn capability_for(&self, model_id: &str) -> Option<ModelCapability>;
-
-    /// scheme 既定の capability。未知モデル ID や未明示モデルでの
-    /// フォールバックに使う。`capability_for` と違って必ず値を返す。
+    /// scheme 既定の capability。モデル ID に関係なく、この wire で
+    /// 安全に送れる最小共通項を返す。既知モデル ID の能力テーブルは
+    /// `provider::capability::lookup` 側(高レベル構築層)の責務で、
+    /// scheme はここには関与しない。
     fn default_capability(&self) -> ModelCapability;
 
     /// scheme 側でサポートしていない `RequestConfig` フィールドを

@@ -19,11 +19,14 @@ impl Scheme for OpenAIResponsesScheme {
     type State = OpenAIResponsesState;
 
     fn default_base_url(&self) -> &'static str {
-        "https://api.openai.com"
+        // `/v1` は base_url 側に寄せる。ChatGPT OAuth 経由のときは
+        // `https://chatgpt.com/backend-api/codex` を base にすれば同じ
+        // `/responses` path で両系統を吸収できる（Codex CLI 準拠）。
+        "https://api.openai.com/v1"
     }
 
     fn path(&self, _model_id: &str) -> String {
-        "/v1/responses".to_string()
+        "/responses".to_string()
     }
 
     fn required_auth(&self) -> AuthRequirement {
@@ -47,10 +50,6 @@ impl Scheme for OpenAIResponsesScheme {
         state: &mut Self::State,
     ) -> Result<Vec<Event>, ClientError> {
         super::events::parse_sse(event_type, data, state)
-    }
-
-    fn capability_for(&self, model_id: &str) -> Option<ModelCapability> {
-        super::capability::lookup(model_id)
     }
 
     fn default_capability(&self) -> ModelCapability {

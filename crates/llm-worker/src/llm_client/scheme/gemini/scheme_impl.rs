@@ -47,10 +47,6 @@ impl Scheme for GeminiScheme {
         Ok(self.parse_event(data)?.unwrap_or_default())
     }
 
-    fn capability_for(&self, model_id: &str) -> Option<ModelCapability> {
-        super::capability::lookup(model_id)
-    }
-
     fn default_capability(&self) -> ModelCapability {
         super::capability::default_capability()
     }
