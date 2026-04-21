@@ -2,15 +2,15 @@
 
 ## Context
 
-Workflow は制約付きの強制的な作業フロー。`/workflow-name` で明示的に呼び出し、依存 Knowledge を context に inject してから実行する。Knowledge（`#knowledge-name`）は `docs/plan/memory.md` 側で定義。
+Workflow は制約付きの強制的な作業フロー。`/<slug>` で明示的に呼び出し、依存 Knowledge を context に inject してから実行する。Knowledge（`#<slug>`）は `docs/plan/memory.md` 側で定義。
 
 ## 決定事項
 
 ### 呼び出しと依存
 
-- 呼び出し: `/workflow-name`
-- 名前空間はフラット、name は slug（小文字英数とハイフン）
-- frontmatter `requires: [knowledge-name, ...]` で依存 Knowledge を name 参照
+- 呼び出し: `/<slug>`
+- 名前空間はフラット、slug は kebab-case（小文字英数とハイフン）
+- frontmatter `requires: [knowledge-slug, ...]` で依存 Knowledge を slug 参照
 - 実行時は依存 Knowledge 本文を context に inject してから Workflow 本文を実行
 
 ### 呼び出し制御フラグ
@@ -18,15 +18,15 @@ Workflow は制約付きの強制的な作業フロー。`/workflow-name` で明
 | フラグ           | 意味                                                    | デフォルト |
 | ---------------- | ------------------------------------------------------- | ---------- |
 | `auto_invoke`    | description が LLM context に載り、LLM が自発的に呼べる | **OFF**    |
-| `user_invocable` | ユーザーが `/` で明示的に呼べる                         | **ON**     |
+| `user_invocable` | ユーザーが `/<slug>` で明示的に呼べる                   | **ON**     |
 
 `auto_invoke` の ON 化は人間の判断、または consolidation からの offer 経由のみ。同じ制御は Knowledge 側（`memory.md`）でも採用。
 
 ### 格納先とファイル形式
 
-- `memory/workflow/<name>.md`
+- `memory/workflow/<slug>.md`（ファイル名 = slug がそのまま識別子、`name` field は持たない）
 - frontmatter + Markdown 本文
-- frontmatter フィールド: `name`, `description`, `auto_invoke`, `user_invocable`, `requires`
+- frontmatter フィールド: `description`, `auto_invoke`, `user_invocable`, `requires`
 
 ### 生成・更新ポリシー
 
