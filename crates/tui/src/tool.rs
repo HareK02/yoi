@@ -88,7 +88,6 @@ fn render_read_aggregate(blocks: &[Block], start: usize, mode: Mode) -> ToolRend
         format!("[tool] Read — {count} file{} read", plural(count))
     };
     lines.push(Line::from(vec![
-        Span::raw(" "),
         Span::styled(header, tool_style),
     ]));
 
@@ -106,13 +105,13 @@ fn render_read_aggregate(blocks: &[Block], start: usize, mode: Mode) -> ToolRend
     let start_idx = paths.len().saturating_sub(limit);
     for p in &paths[start_idx..] {
         lines.push(Line::from(vec![
-            Span::raw("   "),
+            Span::raw("  "),
             Span::styled(p.clone(), path_style),
         ]));
     }
     if in_progress && paths.len() > limit {
         lines.push(Line::from(vec![
-            Span::raw("   "),
+            Span::raw("  "),
             Span::styled(
                 format!("… ({} earlier)", paths.len() - limit),
                 Style::default().fg(Color::DarkGray),
@@ -162,7 +161,6 @@ fn render_write(cache: &FileCache, tc: &ToolCallBlock, mode: Mode) -> Vec<Line<'
 
     if matches!(mode, Mode::Overview) {
         return vec![Line::from(vec![
-            Span::raw(" "),
             Span::styled("[tool] Write — ".to_owned(), tool_style),
             Span::styled(format!("{label} "), label_style),
             Span::styled(path, Style::default().fg(Color::White)),
@@ -171,7 +169,6 @@ fn render_write(cache: &FileCache, tc: &ToolCallBlock, mode: Mode) -> Vec<Line<'
 
     let mut lines = vec![
         Line::from(vec![
-            Span::raw(" "),
             Span::styled("[tool] Write — ".to_owned(), tool_style),
             Span::styled(format!("{label} "), label_style),
             Span::styled(path.clone(), Style::default().fg(Color::White)),
@@ -193,13 +190,13 @@ fn render_write(cache: &FileCache, tc: &ToolCallBlock, mode: Mode) -> Vec<Line<'
     let body_style = Style::default().fg(Color::Gray);
     for l in &body_lines[..shown] {
         lines.push(Line::from(vec![
-            Span::raw("   "),
+            Span::raw("  "),
             Span::styled((*l).to_owned(), body_style),
         ]));
     }
     if body_lines.len() > shown {
         lines.push(Line::from(vec![
-            Span::raw("   "),
+            Span::raw("  "),
             Span::styled(
                 format!("… +{} more lines", body_lines.len() - shown),
                 Style::default().fg(Color::DarkGray),
@@ -232,7 +229,6 @@ fn render_edit(cache: &FileCache, tc: &ToolCallBlock, mode: Mode) -> Vec<Line<'s
 
     let tool_style = Style::default().fg(Color::Cyan);
     let header = Line::from(vec![
-        Span::raw(" "),
         Span::styled(format!("[tool] Edit — {}", path), tool_style),
         Span::styled(
             format!("  ({})", state_suffix(&tc.state)),
@@ -258,7 +254,7 @@ fn render_edit(cache: &FileCache, tc: &ToolCallBlock, mode: Mode) -> Vec<Line<'s
         }
     } else {
         lines.push(Line::from(vec![
-            Span::raw("   "),
+            Span::raw("  "),
             Span::styled(
                 "(no cached content — run Read first for a diff view)".to_owned(),
                 Style::default().fg(Color::DarkGray),
@@ -274,7 +270,7 @@ fn build_edit_diff(content: &str, old: &str, new: &str) -> Vec<Line<'static>> {
     // Locate the first (and typically only) match.
     let Some(idx) = content.find(old) else {
         return vec![Line::from(vec![
-            Span::raw("   "),
+            Span::raw("  "),
             Span::styled(
                 "(old_string not found in cached content)".to_owned(),
                 Style::default().fg(Color::DarkGray),
@@ -301,25 +297,25 @@ fn build_edit_diff(content: &str, old: &str, new: &str) -> Vec<Line<'static>> {
 
     for l in &all_lines[ctx_start..line_of_idx] {
         lines.push(Line::from(vec![
-            Span::raw("   "),
+            Span::raw("  "),
             Span::styled(format!(" {l}"), ctx_style),
         ]));
     }
     for l in old.lines() {
         lines.push(Line::from(vec![
-            Span::raw("   "),
+            Span::raw("  "),
             Span::styled(format!("-{l}"), minus_style),
         ]));
     }
     for l in new.lines() {
         lines.push(Line::from(vec![
-            Span::raw("   "),
+            Span::raw("  "),
             Span::styled(format!("+{l}"), plus_style),
         ]));
     }
     for l in &all_lines[line_of_idx + replaced_line_count..ctx_end] {
         lines.push(Line::from(vec![
-            Span::raw("   "),
+            Span::raw("  "),
             Span::styled(format!(" {l}"), ctx_style),
         ]));
     }
@@ -347,14 +343,12 @@ fn render_search(tc: &ToolCallBlock, mode: Mode, label: &str) -> Vec<Line<'stati
             .unwrap_or(state_suffix(&tc.state))
             .to_owned();
         return vec![Line::from(vec![
-            Span::raw(" "),
             Span::styled(format!("[tool] {label} — "), tool_style),
             Span::styled(first, Style::default().fg(Color::White)),
         ])];
     }
 
     let mut lines = vec![Line::from(vec![
-        Span::raw(" "),
         Span::styled(
             format!("[tool] {label} — {}", state_suffix(&tc.state)),
             tool_style,
@@ -371,13 +365,13 @@ fn render_search(tc: &ToolCallBlock, mode: Mode, label: &str) -> Vec<Line<'stati
     let body_style = Style::default().fg(Color::Gray);
     for l in &body_lines[..shown] {
         lines.push(Line::from(vec![
-            Span::raw("   "),
+            Span::raw("  "),
             Span::styled((*l).to_owned(), body_style),
         ]));
     }
     if body_lines.len() > shown {
         lines.push(Line::from(vec![
-            Span::raw("   "),
+            Span::raw("  "),
             Span::styled(
                 format!("… +{} more lines", body_lines.len() - shown),
                 Style::default().fg(Color::DarkGray),
@@ -408,13 +402,11 @@ fn render_default(tc: &ToolCallBlock, mode: Mode) -> Vec<Line<'static>> {
             format!("[tool] {} — {suffix}", tc.name)
         };
         return vec![Line::from(vec![
-            Span::raw(" "),
             Span::styled(label, tool_style),
         ])];
     }
 
     let mut lines = vec![Line::from(vec![
-        Span::raw(" "),
         Span::styled(
             format!("[tool] {} — {}", tc.name, state_suffix(&tc.state)),
             tool_style,
@@ -484,7 +476,7 @@ fn maybe_error_line(lines: &mut Vec<Line<'static>>, state: &ToolCallState) {
     match state {
         ToolCallState::Error { summary, .. } => {
             lines.push(Line::from(vec![
-                Span::raw("   "),
+                Span::raw("  "),
                 Span::styled(
                     format!("error: {}", first_line(summary)),
                     Style::default().fg(Color::Red),
@@ -493,7 +485,7 @@ fn maybe_error_line(lines: &mut Vec<Line<'static>>, state: &ToolCallState) {
         }
         ToolCallState::Incomplete => {
             lines.push(Line::from(vec![
-                Span::raw("   "),
+                Span::raw("  "),
                 Span::styled(
                     "(no result before turn ended)".to_owned(),
                     Style::default().fg(Color::Red),
@@ -514,13 +506,13 @@ fn emit_capped_lines(
     let shown = all.len().min(cap);
     for l in &all[..shown] {
         out.push(Line::from(vec![
-            Span::raw("   "),
+            Span::raw("  "),
             Span::styled((*l).to_owned(), style),
         ]));
     }
     if all.len() > shown {
         out.push(Line::from(vec![
-            Span::raw("   "),
+            Span::raw("  "),
             Span::styled(
                 format!("… +{} more lines", all.len() - shown),
                 Style::default().fg(Color::DarkGray),

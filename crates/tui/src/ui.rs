@@ -18,6 +18,7 @@ use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block as UiBlock, BorderType, Borders, Padding, Paragraph, Widget, Wrap};
+use unicode_width::UnicodeWidthChar;
 
 use protocol::{Greeting, NotificationLevel};
 
@@ -92,35 +93,57 @@ pub struct HistoryLayout {
 }
 
 pub fn compute_history(app: &App, width: u16) -> HistoryLayout {
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    let mut turn_starts: Vec<usize> = Vec::new();
+    // Step 1: collect logical lines from each block (unwrapped).
+    let mut logical: Vec<Line<'static>> = Vec::new();
+    let mut logical_turn_starts: Vec<usize> = Vec::new();
     let mut first = true;
     let mut i = 0;
     while i < app.blocks.len() {
         if !first {
-            lines.push(Line::from(""));
+            logical.push(Line::from(""));
         }
         first = false;
         let block = &app.blocks[i];
         if matches!(block, Block::TurnHeader { .. }) {
-            turn_starts.push(lines.len());
+            logical_turn_starts.push(logical.len());
         }
-        // Tool calls route through the per-tool renderer, which may
-        // consume multiple adjacent blocks (Read aggregation).
         if matches!(block, Block::ToolCall(_)) {
             let out = crate::tool::render_tool(&app.cache, &app.blocks, i, app.mode);
-            lines.extend(out.lines);
+            logical.extend(out.lines);
             i += out.consumed.max(1);
             continue;
         }
-        render_block_into(&mut lines, block, width, app.mode);
+        render_block_into(&mut logical, block, width, app.mode);
         i += 1;
     }
+
+    // Step 2: pre-wrap every logical line to char-based terminal rows so
+    // scroll math is exact. Track the logical → wrapped mapping so
+    // turn-start indices get translated into wrapped-row coordinates.
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(logical.len());
+    let mut logical_to_wrapped: Vec<usize> = Vec::with_capacity(logical.len() + 1);
+    for line in logical {
+        logical_to_wrapped.push(lines.len());
+        wrap_line_into(line, width, &mut lines);
+    }
+    logical_to_wrapped.push(lines.len());
+
+    let turn_starts = logical_turn_starts
+        .into_iter()
+        .map(|i| logical_to_wrapped.get(i).copied().unwrap_or(lines.len()))
+        .collect();
+
     HistoryLayout { lines, turn_starts }
 }
 
 /// Maximum body lines a normal-mode block may emit before truncation.
 const NORMAL_MAX_LINES: usize = 6;
+
+/// Horizontal gutter around the log area. Applied via a
+/// [`Block`](ratatui::widgets::Block)'s padding so *every* row — including
+/// continuation rows from wrapping — sits inside the same margin, no
+/// leading-space hacks in the content itself.
+const HISTORY_PADDING: u16 = 1;
 
 fn draw_history(frame: &mut Frame, app: &mut App, area: Rect) {
     if area.height == 0 || area.width == 0 {
@@ -130,16 +153,18 @@ fn draw_history(frame: &mut Frame, app: &mut App, area: Rect) {
         app.scroll.turn_starts.clear();
         return;
     }
-    let width = area.width;
-    let HistoryLayout { lines, turn_starts } = compute_history(app, width);
+    let outer_block = UiBlock::default().padding(Padding::horizontal(HISTORY_PADDING));
+    let inner = outer_block.inner(area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
 
-    // Cache for key handlers. Computing `tail_top_offset` wrap-aware
-    // — i.e. in post-wrap terminal rows — is what keeps long CJK
-    // responses visible at the tail; otherwise the naive
-    // `total_lines - area_height` formula under-counts rows and the
-    // viewport anchors too far up.
-    let tail_top = compute_tail_top_offset(&lines, area.height, width);
-    app.scroll.area_height = area.height;
+    let HistoryLayout { lines, turn_starts } = compute_history(app, inner.width);
+
+    // `lines` is already pre-wrapped: 1 entry == 1 terminal row. Scroll
+    // math degenerates to index arithmetic.
+    let tail_top = lines.len().saturating_sub(inner.height as usize);
+    app.scroll.area_height = inner.height;
     app.scroll.total_lines = lines.len();
     app.scroll.tail_top_offset = tail_top;
     app.scroll.turn_starts = turn_starts;
@@ -150,62 +175,97 @@ fn draw_history(frame: &mut Frame, app: &mut App, area: Rect) {
         app.scroll.top_offset = app.scroll.top_offset.min(tail_top);
     }
 
-    let visible = visible_slice(&lines, app.scroll.top_offset, area.height, width);
+    let end = (app.scroll.top_offset + inner.height as usize).min(lines.len());
+    let visible: Vec<Line<'static>> = lines[app.scroll.top_offset..end].to_vec();
+
+    // Pre-wrapped input → render without ratatui's word-wrap (which
+    // would otherwise re-wrap mid-row at word boundaries and desync the
+    // height count). The outer Block handles left/right padding
+    // uniformly for all rows.
     Paragraph::new(visible)
-        .wrap(Wrap { trim: false })
+        .block(outer_block)
         .render(area, frame.buffer_mut());
 }
 
-/// Smallest top offset that still keeps the last logical line on screen
-/// once wrapping is applied. Walks the lines from the tail and counts
-/// wrapped rows; returns the first line index that no longer fits.
-fn compute_tail_top_offset(lines: &[Line<'_>], area_height: u16, width: u16) -> usize {
-    if lines.is_empty() || area_height == 0 {
-        return 0;
-    }
-    let mut used: u32 = 0;
-    let cap = area_height as u32;
-    for (i, line) in lines.iter().enumerate().rev() {
-        let h = wrapped_line_height(line, width) as u32;
-        if used + h > cap {
-            return i + 1;
-        }
-        used += h;
-    }
-    0
-}
-
-fn visible_slice(
-    lines: &[Line<'static>],
-    top_offset: usize,
-    area_height: u16,
-    width: u16,
-) -> Vec<Line<'static>> {
-    if lines.is_empty() || area_height == 0 {
-        return Vec::new();
-    }
-    let mut out: Vec<Line<'static>> = Vec::new();
-    let mut used: u32 = 0;
-    for line in lines.iter().skip(top_offset) {
-        let h = wrapped_line_height(line, width) as u32;
-        if used + h > area_height as u32 {
-            break;
-        }
-        out.push(line.clone());
-        used += h;
-        if used >= area_height as u32 {
-            break;
-        }
-    }
-    out
-}
-
-fn wrapped_line_height(line: &Line, width: u16) -> u16 {
+/// Split one logical line into one-terminal-row `Line`s via char-aware
+/// wrapping. Preserves per-span styles and the source line's alignment.
+fn wrap_line_into(line: Line<'static>, width: u16, out: &mut Vec<Line<'static>>) {
     if width == 0 {
-        return 1;
+        out.push(line);
+        return;
     }
-    let w = line.width() as u16;
-    if w == 0 { 1 } else { w.div_ceil(width) }
+    let w = width as usize;
+    let alignment = line.alignment;
+
+    let mut current: Vec<Span<'static>> = Vec::new();
+    let mut row_width: usize = 0;
+    let mut pending = String::new();
+    let mut pending_width: usize = 0;
+    let mut pending_style = Style::default();
+
+    let commit_pending = |pending: &mut String,
+                          pending_width: &mut usize,
+                          pending_style: Style,
+                          current: &mut Vec<Span<'static>>,
+                          row_width: &mut usize| {
+        if pending.is_empty() {
+            return;
+        }
+        current.push(Span::styled(std::mem::take(pending), pending_style));
+        *row_width += *pending_width;
+        *pending_width = 0;
+    };
+
+    let push_row = |current: &mut Vec<Span<'static>>,
+                    row_width: &mut usize,
+                    out: &mut Vec<Line<'static>>| {
+        let mut l = Line::from(std::mem::take(current));
+        if let Some(a) = alignment {
+            l = l.alignment(a);
+        }
+        out.push(l);
+        *row_width = 0;
+    };
+
+    for span in line.spans {
+        if !pending.is_empty() && span.style != pending_style {
+            commit_pending(
+                &mut pending,
+                &mut pending_width,
+                pending_style,
+                &mut current,
+                &mut row_width,
+            );
+        }
+        pending_style = span.style;
+
+        for c in span.content.chars() {
+            let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+            if row_width + pending_width + cw > w && (row_width + pending_width) > 0 {
+                commit_pending(
+                    &mut pending,
+                    &mut pending_width,
+                    pending_style,
+                    &mut current,
+                    &mut row_width,
+                );
+                push_row(&mut current, &mut row_width, out);
+            }
+            pending.push(c);
+            pending_width += cw;
+        }
+
+        commit_pending(
+            &mut pending,
+            &mut pending_width,
+            pending_style,
+            &mut current,
+            &mut row_width,
+        );
+    }
+
+    // Always emit the final row (empty line stays empty).
+    push_row(&mut current, &mut row_width, out);
 }
 
 fn render_block_into(
@@ -285,10 +345,7 @@ fn render_block_into(
 fn push_padded_lines(lines: &mut Vec<Line<'static>>, text: &str, kind: MessageKind) {
     let style = kind_style(kind);
     for raw in text.lines() {
-        lines.push(Line::from(vec![
-            Span::raw(" "),
-            Span::styled(raw.to_owned(), style),
-        ]));
+        lines.push(Line::from(Span::styled(raw.to_owned(), style)));
     }
     if text.is_empty() {
         lines.push(Line::from(""));
@@ -311,20 +368,14 @@ fn push_padded_truncated(
     let all: Vec<&str> = text.lines().collect();
     let shown = all.len().min(NORMAL_MAX_LINES);
     for raw in &all[..shown] {
-        lines.push(Line::from(vec![
-            Span::raw(" "),
-            Span::styled((*raw).to_owned(), style),
-        ]));
+        lines.push(Line::from(Span::styled((*raw).to_owned(), style)));
     }
     if all.len() > shown {
         let hidden = all.len() - shown;
-        lines.push(Line::from(vec![
-            Span::raw(" "),
-            Span::styled(
-                format!("… +{hidden} more lines"),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]));
+        lines.push(Line::from(Span::styled(
+            format!("… +{hidden} more lines"),
+            Style::default().fg(Color::DarkGray),
+        )));
     }
     if text.is_empty() {
         lines.push(Line::from(""));
@@ -342,7 +393,7 @@ fn push_overview_line(
     let first = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
     let more = text.lines().count().saturating_sub(1);
     let style = kind_style(kind);
-    let mut spans = vec![Span::raw(" ")];
+    let mut spans: Vec<Span<'static>> = Vec::new();
     if !prefix.is_empty() {
         spans.push(Span::styled(prefix.to_owned(), style));
     }
