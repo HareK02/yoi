@@ -1,15 +1,26 @@
 mod app;
+mod block;
+mod cache;
 mod client;
+mod input;
+mod scroll;
+mod tool;
 mod ui;
 
 use std::io;
 use std::path::PathBuf;
 
-use crossterm::event::{self, Event as TermEvent, KeyCode, KeyEvent, KeyModifiers};
-use crossterm::terminal;
+use crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event as TermEvent, KeyCode, KeyEvent,
+    KeyModifiers,
+};
+use crossterm::execute;
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
 use protocol::Method;
+use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::{Terminal, TerminalOptions, Viewport};
 
 use crate::app::App;
 use crate::client::PodClient;
@@ -56,37 +67,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (pod_name, socket_override) = parse_args();
     let socket_path = resolve_socket(&pod_name, socket_override);
 
-    terminal::enable_raw_mode()?;
-    let stdout = io::stdout();
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::with_options(
-        backend,
-        TerminalOptions {
-            viewport: Viewport::Inline(3),
-        },
-    )?;
+    let mut terminal = Terminal::new(backend)?;
 
+    let result = run(&mut terminal, pod_name, &socket_path).await;
+
+    // Always restore the terminal, even on error.
+    let _ = execute!(
+        terminal.backend_mut(),
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    );
+    let _ = disable_raw_mode();
+    terminal.show_cursor().ok();
+
+    result
+}
+
+async fn run(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    pod_name: String,
+    socket_path: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut app = App::new(pod_name);
 
-    match PodClient::connect(&socket_path).await {
+    match PodClient::connect(socket_path).await {
         Ok(mut client) => {
             app.connected = true;
             let _ = client.send(&Method::GetHistory).await;
-            run_loop(&mut terminal, &mut app, client).await?;
+            run_loop(terminal, &mut app, client).await?;
         }
         Err(e) => {
-            app.output_queue.push(app::OutputItem::Padded(
-                app::MessageKind::Error,
-                format!("Failed to connect to {}: {e}", socket_path.display()),
-            ));
-            ui::flush_output(&mut terminal, &mut app)?;
-            terminal.draw(|f| ui::draw(f, &app))?;
+            app.push_error(format!("Failed to connect to {}: {e}", socket_path.display()));
+            terminal.draw(|f| ui::draw(f, &mut app))?;
             run_disconnected(&mut app)?;
         }
     }
-
-    terminal::disable_raw_mode()?;
-
     Ok(())
 }
 
@@ -95,7 +114,6 @@ async fn run_loop(
     app: &mut App,
     mut client: PodClient,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Initial draw of the viewport
     terminal.draw(|f| ui::draw(f, app))?;
 
     loop {
@@ -104,37 +122,38 @@ async fn run_loop(
         }
 
         tokio::select! {
-            // Terminal input
             _ = tokio::task::spawn_blocking(|| event::poll(std::time::Duration::from_millis(50))) => {
                 while event::poll(std::time::Duration::ZERO)? {
-                    if let TermEvent::Key(key) = event::read()? {
-                        if let Some(method) = handle_key(app, key) {
-                            client.send(&method).await?;
+                    match event::read()? {
+                        TermEvent::Key(key) => {
+                            if let Some(method) = handle_key(app, key) {
+                                client.send(&method).await?;
+                            }
                         }
-                        if app.quit {
-                            break;
+                        TermEvent::Paste(s) => {
+                            app.insert_paste(s);
                         }
+                        TermEvent::Resize(_, _) => {
+                            // No-op: next draw repaints in full.
+                        }
+                        _ => {}
+                    }
+                    if app.quit {
+                        break;
                     }
                 }
             }
-            // Pod events (disabled after disconnect)
             event = client.next_event(), if app.connected => {
                 match event {
                     Some(ev) => app.handle_pod_event(ev),
                     None => {
                         app.connected = false;
-                        app.output_queue.push(app::OutputItem::Padded(
-                            app::MessageKind::Error,
-                            "Connection lost".into(),
-                        ));
+                        app.push_error("Connection lost");
                     }
                 }
             }
         }
 
-        // Flush any queued output above the viewport
-        ui::flush_output(terminal, app)?;
-        // Redraw the fixed viewport (status + input)
         terminal.draw(|f| ui::draw(f, app))?;
     }
 
@@ -143,37 +162,77 @@ async fn run_loop(
 
 fn run_disconnected(_app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
     loop {
-        if event::poll(std::time::Duration::from_millis(100))? {
-            if let TermEvent::Key(key) = event::read()? {
-                if let KeyCode::Char('c') = key.code {
-                    if key.modifiers.contains(KeyModifiers::CONTROL) {
-                        break;
-                    }
-                }
-            }
+        if event::poll(std::time::Duration::from_millis(100))?
+            && let TermEvent::Key(key) = event::read()?
+            && let KeyCode::Char('c') = key.code
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            break;
         }
     }
     Ok(())
 }
 
 fn handle_key(app: &mut App, key: KeyEvent) -> Option<Method> {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+
+    // Scroll / navigation (history view).
     match key.code {
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            handle_pause_or_quit(app)
+        KeyCode::Up if shift => {
+            app.scroll.scroll_up(1);
+            return None;
         }
-        KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+        KeyCode::Down if shift => {
+            app.scroll.scroll_down(1);
+            return None;
+        }
+        KeyCode::PageUp => {
+            app.scroll.page_up();
+            return None;
+        }
+        KeyCode::PageDown => {
+            app.scroll.page_down();
+            return None;
+        }
+        KeyCode::Home if ctrl => {
+            app.scroll.to_top();
+            return None;
+        }
+        KeyCode::End if ctrl => {
+            app.scroll.to_bottom();
+            return None;
+        }
+        KeyCode::Char('[') if ctrl => {
+            app.scroll.jump_prev_turn();
+            return None;
+        }
+        KeyCode::Char(']') if ctrl => {
+            app.scroll.jump_next_turn();
+            return None;
+        }
+        KeyCode::Char('o') if ctrl => {
+            app.mode = app.mode.cycle();
+            return None;
+        }
+        _ => {}
+    }
+
+    match key.code {
+        KeyCode::Char('c') if ctrl => handle_pause_or_quit(app),
+        KeyCode::Char('x') if ctrl => {
             if app.running {
                 Some(Method::Cancel)
             } else {
-                app.output_queue.push(app::OutputItem::Padded(
-                    app::MessageKind::Error,
-                    "Nothing to cancel (Pod is not running).".into(),
-                ));
+                app.push_error("Nothing to cancel (Pod is not running).");
                 None
             }
         }
-        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            return handle_shutdown(app);
+        KeyCode::Char('d') if ctrl => handle_shutdown(app),
+        KeyCode::Enter if alt => {
+            app.insert_newline();
+            None
         }
         KeyCode::Enter => app.submit_input(),
         KeyCode::Backspace => {
@@ -190,6 +249,14 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Option<Method> {
         }
         KeyCode::Right => {
             app.move_cursor_right();
+            None
+        }
+        KeyCode::Up => {
+            app.move_cursor_up();
+            None
+        }
+        KeyCode::Down => {
+            app.move_cursor_down();
             None
         }
         KeyCode::Home => {
@@ -214,17 +281,14 @@ fn handle_shutdown(app: &mut App) -> Option<Method> {
     if !app.running {
         return Some(Method::Shutdown);
     }
-    if let Some(t) = app.shutdown_confirm {
-        if t.elapsed() < CONFIRM_TIMEOUT {
-            app.shutdown_confirm = None;
-            return Some(Method::Shutdown);
-        }
+    if let Some(t) = app.shutdown_confirm
+        && t.elapsed() < CONFIRM_TIMEOUT
+    {
+        app.shutdown_confirm = None;
+        return Some(Method::Shutdown);
     }
     app.shutdown_confirm = Some(std::time::Instant::now());
-    app.output_queue.push(app::OutputItem::Padded(
-        app::MessageKind::Error,
-        "Turn is running. Press Ctrl-D again to cancel and shut down.".into(),
-    ));
+    app.push_error("Turn is running. Press Ctrl-D again to cancel and shut down.");
     None
 }
 
@@ -234,17 +298,14 @@ fn handle_pause_or_quit(app: &mut App) -> Option<Method> {
     if app.running {
         return Some(Method::Pause);
     }
-    if let Some(t) = app.quit_confirm {
-        if t.elapsed() < CONFIRM_TIMEOUT {
-            app.quit_confirm = None;
-            app.quit = true;
-            return None;
-        }
+    if let Some(t) = app.quit_confirm
+        && t.elapsed() < CONFIRM_TIMEOUT
+    {
+        app.quit_confirm = None;
+        app.quit = true;
+        return None;
     }
     app.quit_confirm = Some(std::time::Instant::now());
-    app.output_queue.push(app::OutputItem::Padded(
-        app::MessageKind::Error,
-        "Press Ctrl-C again within 3 s to exit the TUI (the Pod keeps running).".into(),
-    ));
+    app.push_error("Press Ctrl-C again within 3 s to exit the TUI (the Pod keeps running).");
     None
 }

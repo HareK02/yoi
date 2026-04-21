@@ -1,4 +1,10 @@
-use protocol::{Event, Greeting, Method, NotificationLevel, NotificationSource, RunResult};
+use protocol::{Event, Method, NotificationLevel, NotificationSource, RunResult};
+
+use crate::block::{Block, CompactEvent, ToolCallBlock, ToolCallState};
+use crate::cache::FileCache;
+use crate::input::InputBuffer;
+use crate::scroll::Scroll;
+use crate::ui::Mode;
 
 pub struct App {
     pub pod_name: String,
@@ -13,41 +19,22 @@ pub struct App {
     pub run_output_tokens: u64,
     pub turn_index: usize,
     pub current_tool: Option<String>,
-    pub input: String,
-    pub cursor: usize,
+    pub input: InputBuffer,
     pub quit: bool,
     pub shutdown_confirm: Option<std::time::Instant>,
     /// 2-tap guard for `Ctrl-C` when the Pod is not running. First press
     /// records the instant; a second press within the timeout exits the
     /// TUI (the Pod itself stays alive).
     pub quit_confirm: Option<std::time::Instant>,
-    /// Lines waiting to be flushed to terminal via insert_before.
-    pub output_queue: Vec<OutputItem>,
-    /// Partial streaming text not yet terminated by newline.
-    pending_text: String,
-}
-
-/// A unit of output to push above the inline viewport.
-pub enum OutputItem {
-    TurnHeader(String),
-    Padded(MessageKind, String),
-    PaddedRight(MessageKind, String),
-    GreetingCard(Greeting),
-    Blank,
-}
-
-#[derive(Clone, Copy)]
-pub enum MessageKind {
-    TurnHeader,
-    User,
-    Assistant,
-    Tool,
-    Error,
-    TurnStats,
-    /// Pod → user notification, Warn level.
-    NoticeWarn,
-    /// Pod → user notification, Error level.
-    NoticeError,
+    /// Full display history in render order.
+    pub blocks: Vec<Block>,
+    pub scroll: Scroll,
+    pub mode: Mode,
+    pub cache: FileCache,
+    /// True when the latest AssistantText block is still being streamed
+    /// and future text deltas should append to it instead of starting a
+    /// fresh block.
+    assistant_streaming: bool,
 }
 
 impl App {
@@ -62,36 +49,44 @@ impl App {
             run_output_tokens: 0,
             turn_index: 0,
             current_tool: None,
-            input: String::new(),
-            cursor: 0,
+            input: InputBuffer::new(),
             quit: false,
             shutdown_confirm: None,
             quit_confirm: None,
-            output_queue: Vec::new(),
-            pending_text: String::new(),
+            blocks: Vec::new(),
+            scroll: Scroll::default(),
+            mode: Mode::Normal,
+            cache: FileCache::new(),
+            assistant_streaming: false,
         }
     }
 
     pub fn submit_input(&mut self) -> Option<Method> {
-        let text = self.input.trim().to_owned();
+        let text = self.input.submit_text().trim().to_owned();
         if text.is_empty() {
             // Empty Enter only does something meaningful when the Pod
             // is paused: resume the interrupted turn. Otherwise no-op.
             if self.paused {
+                self.input.clear();
                 return Some(Method::Resume);
             }
             return None;
         }
         self.turn_index += 1;
-        self.output_queue.push(OutputItem::Blank);
-        self.output_queue
-            .push(OutputItem::TurnHeader(format!("#{}", self.turn_index)));
-        self.output_queue
-            .push(OutputItem::Padded(MessageKind::User, text.clone()));
-        self.output_queue.push(OutputItem::Blank);
+        self.blocks.push(Block::TurnHeader {
+            turn: self.turn_index,
+        });
+        self.blocks.push(Block::UserMessage { text: text.clone() });
         self.input.clear();
-        self.cursor = 0;
         Some(Method::Run { input: text })
+    }
+
+    pub fn push_error(&mut self, message: impl Into<String>) {
+        self.blocks.push(Block::Notification {
+            level: NotificationLevel::Error,
+            source: NotificationSource::Pod,
+            message: message.into(),
+        });
     }
 
     pub fn handle_pod_event(&mut self, event: Event) {
@@ -101,56 +96,94 @@ impl App {
                 self.paused = false;
                 self.run_requests += 1;
                 self.current_tool = None;
+                self.assistant_streaming = false;
             }
             Event::TextDelta { text } => {
-                self.pending_text.push_str(&text);
-                self.flush_pending_lines();
+                self.append_assistant_text(&text);
             }
             Event::TextDone { .. } => {
-                // Flush any remaining partial line
-                if !self.pending_text.is_empty() {
-                    let text = std::mem::take(&mut self.pending_text);
-                    self.output_queue
-                        .push(OutputItem::Padded(MessageKind::Assistant, text));
-                }
+                self.assistant_streaming = false;
             }
             Event::TurnEnd { .. } => {
-                // Flush streaming text if TextDone wasn't received
-                if !self.pending_text.is_empty() {
-                    let text = std::mem::take(&mut self.pending_text);
-                    self.output_queue
-                        .push(OutputItem::Padded(MessageKind::Assistant, text));
-                }
+                self.assistant_streaming = false;
+                self.mark_orphan_tool_calls_incomplete();
                 self.current_tool = None;
             }
-            Event::ToolCallStart { name, .. } => {
+            Event::ToolCallStart { id, name } => {
                 self.current_tool = Some(name.clone());
-                self.output_queue.push(OutputItem::Padded(
-                    MessageKind::Tool,
-                    format!("[tool] {name}"),
-                ));
+                self.assistant_streaming = false;
+                self.blocks.push(Block::ToolCall(ToolCallBlock {
+                    id,
+                    name,
+                    args_stream: String::new(),
+                    arguments: None,
+                    state: ToolCallState::Pending,
+                }));
+            }
+            Event::ToolCallArgsDelta { id, json } => {
+                if let Some(b) = self.find_tool_call_mut(&id) {
+                    b.args_stream.push_str(&json);
+                    if matches!(b.state, ToolCallState::Pending) {
+                        b.state = ToolCallState::Streaming;
+                    }
+                }
             }
             Event::ToolCallDone {
-                name, arguments, ..
+                id, arguments, ..
             } => {
                 self.current_tool = None;
-                self.output_queue.push(OutputItem::Padded(
-                    MessageKind::Tool,
-                    format!("[tool] {name} done ({} bytes)", arguments.len()),
-                ));
+                if let Some(b) = self.find_tool_call_mut(&id) {
+                    b.arguments = Some(arguments);
+                    // Only advance the state when it's still in-flight.
+                    // If a ToolResult arrived out of order and already
+                    // transitioned us to Done/Error, keep that.
+                    if matches!(
+                        b.state,
+                        ToolCallState::Pending | ToolCallState::Streaming
+                    ) {
+                        b.state = ToolCallState::Executing;
+                    }
+                }
             }
             Event::ToolResult {
-                summary, is_error, ..
+                id,
+                summary,
+                output,
+                is_error,
             } => {
-                let prefix = if is_error {
-                    "[tool error]"
+                if let Some(b) = self.find_tool_call_mut(&id) {
+                    // Capture data we need for cache updates before we
+                    // move `output` into the new state.
+                    let name = b.name.clone();
+                    let args = b.arguments.clone();
+                    b.state = if is_error {
+                        ToolCallState::Error {
+                            summary,
+                            output: output.clone(),
+                        }
+                    } else {
+                        ToolCallState::Done {
+                            summary,
+                            output: output.clone(),
+                        }
+                    };
+                    if !is_error {
+                        apply_cache_update(&mut self.cache, &name, args.as_deref(), output.as_deref());
+                    }
                 } else {
-                    "[tool result]"
-                };
-                self.output_queue.push(OutputItem::Padded(
-                    MessageKind::Tool,
-                    format!("{prefix} {summary}"),
-                ));
+                    // Result for an unknown tool call. Surface it as a
+                    // notification so it isn't silently dropped.
+                    let level = if is_error {
+                        NotificationLevel::Error
+                    } else {
+                        NotificationLevel::Warn
+                    };
+                    self.blocks.push(Block::Notification {
+                        level,
+                        source: NotificationSource::Pod,
+                        message: format!("orphan tool result ({id}): {summary}"),
+                    });
+                }
             }
             Event::Usage {
                 input_tokens,
@@ -160,75 +193,42 @@ impl App {
                 self.run_output_tokens += output_tokens.unwrap_or(0);
             }
             Event::Error { code, message } => {
-                self.output_queue.push(OutputItem::Padded(
-                    MessageKind::Error,
-                    format!("[{code:?}] {message}"),
-                ));
+                self.push_error(format!("[{code:?}] {message}"));
             }
             Event::RunEnd { result } => {
-                self.output_queue.push(OutputItem::PaddedRight(
-                    MessageKind::TurnStats,
-                    format!(
-                        "{} reqs ↑{}/↓{}",
-                        self.run_requests,
-                        fmt_tokens(self.run_input_tokens),
-                        fmt_tokens(self.run_output_tokens),
-                    ),
-                ));
-                self.output_queue.push(OutputItem::Blank);
+                self.blocks.push(Block::TurnStats {
+                    requests: self.run_requests,
+                    input_tokens: self.run_input_tokens,
+                    output_tokens: self.run_output_tokens,
+                });
                 self.running = false;
                 self.paused = matches!(result, RunResult::Paused);
                 self.run_requests = 0;
                 self.run_input_tokens = 0;
                 self.run_output_tokens = 0;
                 self.current_tool = None;
+                self.assistant_streaming = false;
             }
-            Event::ToolCallArgsDelta { .. } => {}
             Event::CompactStart => {
-                self.output_queue.push(OutputItem::Padded(
-                    MessageKind::NoticeWarn,
-                    "[compact] starting".to_string(),
-                ));
+                self.blocks.push(Block::Compact(CompactEvent::Start));
             }
             Event::CompactDone { new_session_id } => {
-                let short = new_session_id
-                    .to_string()
-                    .chars()
-                    .take(8)
-                    .collect::<String>();
-                self.output_queue.push(OutputItem::Padded(
-                    MessageKind::NoticeWarn,
-                    format!("[compact] done (new session {short})"),
-                ));
+                self.blocks
+                    .push(Block::Compact(CompactEvent::Done { new_session_id }));
             }
             Event::CompactFailed { error } => {
-                self.output_queue.push(OutputItem::Padded(
-                    MessageKind::NoticeError,
-                    format!("[compact error] {error}"),
-                ));
+                self.blocks
+                    .push(Block::Compact(CompactEvent::Failed { error }));
             }
             Event::Notification(notification) => {
-                let kind = match notification.level {
-                    NotificationLevel::Warn => MessageKind::NoticeWarn,
-                    NotificationLevel::Error => MessageKind::NoticeError,
-                };
-                let prefix = match notification.level {
-                    NotificationLevel::Warn => "[notice]",
-                    NotificationLevel::Error => "[notice error]",
-                };
-                let source = notification_source_label(notification.source);
-                self.output_queue.push(OutputItem::Padded(
-                    kind,
-                    format!("{prefix} {source}: {}", notification.message),
-                ));
+                self.blocks.push(Block::Notification {
+                    level: notification.level,
+                    source: notification.source,
+                    message: notification.message,
+                });
             }
             Event::History { items, greeting } => {
-                self.restore_history(&items);
-                if self.turn_index == 0 {
-                    self.output_queue
-                        .insert(0, OutputItem::GreetingCard(greeting));
-                    self.output_queue.insert(1, OutputItem::Blank);
-                }
+                self.restore_history(&items, greeting);
             }
             Event::Shutdown => {
                 self.quit = true;
@@ -236,128 +236,186 @@ impl App {
         }
     }
 
-    /// Extract complete lines (ending with \n) from pending_text and queue them.
-    fn flush_pending_lines(&mut self) {
-        while let Some(pos) = self.pending_text.find('\n') {
-            let line = self.pending_text[..pos].to_owned();
-            self.pending_text = self.pending_text[pos + 1..].to_owned();
-            self.output_queue
-                .push(OutputItem::Padded(MessageKind::Assistant, line));
+    fn append_assistant_text(&mut self, text: &str) {
+        if self.assistant_streaming {
+            if let Some(Block::AssistantText { text: existing }) = self.blocks.last_mut() {
+                existing.push_str(text);
+                return;
+            }
+        }
+        self.blocks.push(Block::AssistantText {
+            text: text.to_owned(),
+        });
+        self.assistant_streaming = true;
+    }
+
+    fn find_tool_call_mut(&mut self, id: &str) -> Option<&mut ToolCallBlock> {
+        for b in self.blocks.iter_mut().rev() {
+            if let Block::ToolCall(tc) = b
+                && tc.id == id
+            {
+                return Some(tc);
+            }
+        }
+        None
+    }
+
+    /// Called on `TurnEnd`: mark any tool call still in an in-progress
+    /// state as `Incomplete` so the user sees something was left hanging
+    /// instead of a silently-truncated block.
+    fn mark_orphan_tool_calls_incomplete(&mut self) {
+        for b in self.blocks.iter_mut().rev() {
+            if let Block::ToolCall(tc) = b {
+                if matches!(
+                    tc.state,
+                    ToolCallState::Pending
+                        | ToolCallState::Streaming
+                        | ToolCallState::Executing
+                ) {
+                    tc.state = ToolCallState::Incomplete;
+                } else {
+                    // Earlier tool calls in the same list are already
+                    // finalized; stop walking.
+                    break;
+                }
+            } else if matches!(b, Block::TurnHeader { .. }) {
+                break;
+            }
         }
     }
 
+    // Input manipulation — thin forwarders so call sites in main.rs
+    // stay readable.
     pub fn insert_char(&mut self, c: char) {
-        self.input.insert(self.cursor, c);
-        self.cursor += c.len_utf8();
+        self.input.insert_char(c);
     }
-
+    pub fn insert_newline(&mut self) {
+        self.input.insert_newline();
+    }
+    pub fn insert_paste(&mut self, content: String) {
+        self.input.insert_paste(content);
+    }
     pub fn delete_char_before(&mut self) {
-        if self.cursor > 0 {
-            let prev = self.input[..self.cursor]
-                .char_indices()
-                .next_back()
-                .map(|(i, _)| i)
-                .unwrap_or(0);
-            self.input.drain(prev..self.cursor);
-            self.cursor = prev;
-        }
+        self.input.delete_before();
     }
-
     pub fn delete_char_after(&mut self) {
-        if self.cursor < self.input.len() {
-            let next = self.input[self.cursor..]
-                .char_indices()
-                .nth(1)
-                .map(|(i, _)| self.cursor + i)
-                .unwrap_or(self.input.len());
-            self.input.drain(self.cursor..next);
-        }
+        self.input.delete_after();
     }
-
     pub fn move_cursor_left(&mut self) {
-        if self.cursor > 0 {
-            self.cursor = self.input[..self.cursor]
-                .char_indices()
-                .next_back()
-                .map(|(i, _)| i)
-                .unwrap_or(0);
-        }
+        self.input.move_left();
     }
-
     pub fn move_cursor_right(&mut self) {
-        if self.cursor < self.input.len() {
-            self.cursor = self.input[self.cursor..]
-                .char_indices()
-                .nth(1)
-                .map(|(i, _)| self.cursor + i)
-                .unwrap_or(self.input.len());
-        }
+        self.input.move_right();
     }
-
     pub fn move_cursor_home(&mut self) {
-        self.cursor = 0;
+        self.input.move_home();
     }
-
     pub fn move_cursor_end(&mut self) {
-        self.cursor = self.input.len();
+        self.input.move_end();
+    }
+    pub fn move_cursor_up(&mut self) {
+        self.input.move_up();
+    }
+    pub fn move_cursor_down(&mut self) {
+        self.input.move_down();
     }
 
-    fn restore_history(&mut self, items: &[serde_json::Value]) {
+    fn restore_history(&mut self, items: &[serde_json::Value], greeting: protocol::Greeting) {
+        // Fresh session: greeting + any replayed items. Append-only — we
+        // don't try to merge with already-displayed live events because
+        // `History` only fires on an empty live state.
         self.turn_index = 0;
+        self.blocks.clear();
+        self.cache = FileCache::new();
+        self.blocks.push(Block::Greeting(greeting));
+        self.assistant_streaming = false;
+
         for item in items {
             let item_type = item["type"].as_str().unwrap_or("");
             match item_type {
                 "message" => {
                     let role = item["role"].as_str().unwrap_or("");
-                    let kind = match role {
-                        "user" => {
-                            self.turn_index += 1;
-                            self.output_queue.push(OutputItem::Blank);
-                            self.output_queue
-                                .push(OutputItem::TurnHeader(format!("#{}", self.turn_index)));
-                            MessageKind::User
-                        }
-                        "assistant" => MessageKind::Assistant,
-                        _ => continue,
-                    };
                     let text = item["content"]
                         .as_array()
                         .and_then(|parts| parts.iter().filter_map(|p| p["text"].as_str()).next())
-                        .unwrap_or("");
-                    if !text.is_empty() {
-                        self.output_queue
-                            .push(OutputItem::Padded(kind, text.to_owned()));
-                        if matches!(kind, MessageKind::User) {
-                            self.output_queue.push(OutputItem::Blank);
+                        .unwrap_or("")
+                        .to_owned();
+                    match role {
+                        "user" => {
+                            self.turn_index += 1;
+                            self.blocks.push(Block::TurnHeader {
+                                turn: self.turn_index,
+                            });
+                            if !text.is_empty() {
+                                self.blocks.push(Block::UserMessage { text });
+                            }
                         }
+                        "assistant" if !text.is_empty() => {
+                            self.blocks.push(Block::AssistantText { text });
+                        }
+                        _ => {}
                     }
                 }
                 "tool_call" => {
-                    let name = item["name"].as_str().unwrap_or("?");
-                    self.output_queue.push(OutputItem::Padded(
-                        MessageKind::Tool,
-                        format!("[tool] {name}"),
-                    ));
+                    // `Item::ToolCall` serializes the linking key as
+                    // `call_id`; `id` is a separate optional item-level
+                    // identifier. Use `call_id` so this matches how
+                    // Event::ToolCallStart populates the block.
+                    let id = item["call_id"].as_str().unwrap_or("").to_owned();
+                    let name = item["name"].as_str().unwrap_or("?").to_owned();
+                    let arguments = item["arguments"].as_str().map(|s| s.to_owned());
+                    self.blocks.push(Block::ToolCall(ToolCallBlock {
+                        id,
+                        name,
+                        args_stream: arguments.clone().unwrap_or_default(),
+                        arguments,
+                        state: ToolCallState::Executing,
+                    }));
                 }
                 "tool_result" => {
-                    let summary = item["summary"].as_str().unwrap_or("");
-                    self.output_queue.push(OutputItem::Padded(
-                        MessageKind::Tool,
-                        format!("[tool result] {summary}"),
-                    ));
+                    let id = item["call_id"].as_str().unwrap_or("").to_owned();
+                    let summary = item["summary"].as_str().unwrap_or("").to_owned();
+                    let output = item["content"].as_str().map(|s| s.to_owned());
+                    let is_error = item["is_error"].as_bool().unwrap_or(false);
+                    if let Some(tc) = self.find_tool_call_mut(&id) {
+                        let name = tc.name.clone();
+                        let args = tc.arguments.clone();
+                        tc.state = if is_error {
+                            ToolCallState::Error {
+                                summary,
+                                output: output.clone(),
+                            }
+                        } else {
+                            ToolCallState::Done {
+                                summary,
+                                output: output.clone(),
+                            }
+                        };
+                        if !is_error {
+                            apply_cache_update(
+                                &mut self.cache,
+                                &name,
+                                args.as_deref(),
+                                output.as_deref(),
+                            );
+                        }
+                    }
                 }
                 _ => {}
             }
         }
-    }
-}
 
-fn notification_source_label(source: NotificationSource) -> &'static str {
-    match source {
-        NotificationSource::Pod => "pod",
-        NotificationSource::Worker => "worker",
-        NotificationSource::Compactor => "compactor",
-        NotificationSource::AgentsMd => "AGENTS.md",
+        // Any tool_call entries that never got paired with a
+        // tool_result (truncated or racing mid-turn on the server side)
+        // stay as Executing up to this point. Surface them as
+        // Incomplete so the replay matches live semantics.
+        for b in self.blocks.iter_mut() {
+            if let Block::ToolCall(tc) = b
+                && matches!(tc.state, ToolCallState::Executing | ToolCallState::Pending | ToolCallState::Streaming)
+            {
+                tc.state = ToolCallState::Incomplete;
+            }
+        }
     }
 }
 
@@ -368,5 +426,63 @@ pub fn fmt_tokens(n: u64) -> String {
         format!("{:.1}k", n as f64 / 1_000.0)
     } else {
         n.to_string()
+    }
+}
+
+pub fn notification_source_label(source: NotificationSource) -> &'static str {
+    match source {
+        NotificationSource::Pod => "pod",
+        NotificationSource::Worker => "worker",
+        NotificationSource::Compactor => "compactor",
+        NotificationSource::AgentsMd => "AGENTS.md",
+    }
+}
+
+/// Seed / mutate the file-content cache based on a completed tool call.
+///
+/// Each built-in file tool has its own rule: Read copies the result body
+/// into the cache, Write replaces it with `args.content`, Edit applies
+/// the `old_string → new_string` swap in-place.
+fn apply_cache_update(
+    cache: &mut FileCache,
+    name: &str,
+    arguments: Option<&str>,
+    output: Option<&str>,
+) {
+    let args = arguments.and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
+    match name {
+        "Read" => {
+            let Some(args) = args.as_ref() else { return };
+            let Some(path) = args["file_path"].as_str() else {
+                return;
+            };
+            if let Some(content) = output {
+                cache.put(path, content.to_owned());
+            }
+        }
+        "Write" => {
+            let Some(args) = args.as_ref() else { return };
+            let Some(path) = args["file_path"].as_str() else {
+                return;
+            };
+            let Some(content) = args["content"].as_str() else {
+                return;
+            };
+            cache.put(path, content.to_owned());
+        }
+        "Edit" => {
+            let Some(args) = args.as_ref() else { return };
+            let Some(path) = args["file_path"].as_str() else {
+                return;
+            };
+            let Some(old) = args["old_string"].as_str() else {
+                return;
+            };
+            let Some(new) = args["new_string"].as_str() else {
+                return;
+            };
+            cache.apply_edit(path, old, new);
+        }
+        _ => {}
     }
 }
