@@ -48,6 +48,11 @@ pub struct ToolCallBlock {
     /// Final arguments text once `ToolCallDone` lands.
     pub arguments: Option<String>,
     pub state: ToolCallState,
+    /// For Edit tool calls: snapshot of the file content *before* the
+    /// edit was applied to the cache. Captured at result time so the
+    /// diff renderer can reproduce the old-content context even after
+    /// subsequent mutations have rolled the cache forward.
+    pub edit_snapshot: Option<String>,
 }
 
 pub enum ToolCallState {

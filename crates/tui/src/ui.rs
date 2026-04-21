@@ -18,7 +18,7 @@ use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block as UiBlock, BorderType, Borders, Padding, Paragraph, Widget, Wrap};
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use protocol::{Greeting, NotificationLevel};
 
@@ -108,7 +108,7 @@ pub fn compute_history(app: &App, width: u16) -> HistoryLayout {
             logical_turn_starts.push(logical.len());
         }
         if matches!(block, Block::ToolCall(_)) {
-            let out = crate::tool::render_tool(&app.cache, &app.blocks, i, app.mode);
+            let out = crate::tool::render_tool(&app.cache, &app.blocks, i, width, app.mode);
             logical.extend(out.lines);
             i += out.consumed.max(1);
             continue;
@@ -135,9 +135,6 @@ pub fn compute_history(app: &App, width: u16) -> HistoryLayout {
 
     HistoryLayout { lines, turn_starts }
 }
-
-/// Maximum body lines a normal-mode block may emit before truncation.
-const NORMAL_MAX_LINES: usize = 6;
 
 /// Horizontal gutter around the log area. Applied via a
 /// [`Block`](ratatui::widgets::Block)'s padding so *every* row — including
@@ -188,7 +185,11 @@ fn draw_history(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 /// Split one logical line into one-terminal-row `Line`s via char-aware
-/// wrapping. Preserves per-span styles and the source line's alignment.
+/// wrapping. Preserves per-span styles, the source line's alignment,
+/// and the source line's own style. If the source line carries a
+/// background color, each emitted row is padded to `width` with spaces
+/// styled by that line style — so diff-style row highlights (red/green
+/// backgrounds) extend cleanly to the right edge of the terminal.
 fn wrap_line_into(line: Line<'static>, width: u16, out: &mut Vec<Line<'static>>) {
     if width == 0 {
         out.push(line);
@@ -196,6 +197,8 @@ fn wrap_line_into(line: Line<'static>, width: u16, out: &mut Vec<Line<'static>>)
     }
     let w = width as usize;
     let alignment = line.alignment;
+    let line_style = line.style;
+    let fill_to_width = line_style.bg.is_some();
 
     let mut current: Vec<Span<'static>> = Vec::new();
     let mut row_width: usize = 0;
@@ -219,7 +222,12 @@ fn wrap_line_into(line: Line<'static>, width: u16, out: &mut Vec<Line<'static>>)
     let push_row = |current: &mut Vec<Span<'static>>,
                     row_width: &mut usize,
                     out: &mut Vec<Line<'static>>| {
-        let mut l = Line::from(std::mem::take(current));
+        if fill_to_width && *row_width < w {
+            let pad = w - *row_width;
+            current.push(Span::styled(" ".repeat(pad), line_style));
+            *row_width = w;
+        }
+        let mut l = Line::from(std::mem::take(current)).style(line_style);
         if let Some(a) = alignment {
             l = l.alignment(a);
         }
@@ -292,12 +300,15 @@ fn render_block_into(
             )));
         }
         Block::UserMessage { text } => match mode {
-            Mode::Overview => push_overview_line(lines, text, MessageKind::User, "> "),
-            _ => push_padded_truncated(lines, text, MessageKind::User, mode),
+            Mode::Overview => push_overview_line(lines, text, width, MessageKind::User, "> "),
+            // User input and assistant prose are the primary readable
+            // content of a turn — never compressed in detail / normal.
+            // Only `overview` folds them to a single line.
+            _ => push_padded_lines(lines, text, MessageKind::User),
         },
         Block::AssistantText { text } => match mode {
-            Mode::Overview => push_overview_line(lines, text, MessageKind::Assistant, ""),
-            _ => push_padded_truncated(lines, text, MessageKind::Assistant, mode),
+            Mode::Overview => push_overview_line(lines, text, width, MessageKind::Assistant, ""),
+            _ => push_padded_lines(lines, text, MessageKind::Assistant),
         },
         // ToolCall is dispatched in `compute_history` via `tool::render_tool`
         // so it can consume multiple adjacent blocks (Read aggregation).
@@ -318,11 +329,11 @@ fn render_block_into(
             let label = notification_source_label(*source);
             let text = format!("{prefix} {label}: {message}");
             match mode {
-                Mode::Overview => push_overview_line(lines, &text, kind, ""),
-                _ => push_padded_truncated(lines, &text, kind, mode),
+                Mode::Overview => push_overview_line(lines, &text, width, kind, ""),
+                _ => push_padded_lines(lines, &text, kind),
             }
         }
-        Block::Compact(evt) => render_compact(lines, evt, mode),
+        Block::Compact(evt) => render_compact(lines, evt, width, mode),
         Block::TurnStats {
             requests,
             input_tokens,
@@ -352,62 +363,119 @@ fn push_padded_lines(lines: &mut Vec<Line<'static>>, text: &str, kind: MessageKi
     }
 }
 
-/// Normal / detail padded text: detail prints every line; normal caps at
-/// `NORMAL_MAX_LINES` and appends a "+N more" footer.
-fn push_padded_truncated(
-    lines: &mut Vec<Line<'static>>,
-    text: &str,
-    kind: MessageKind,
-    mode: Mode,
-) {
-    if matches!(mode, Mode::Detail) {
-        push_padded_lines(lines, text, kind);
-        return;
-    }
-    let style = kind_style(kind);
-    let all: Vec<&str> = text.lines().collect();
-    let shown = all.len().min(NORMAL_MAX_LINES);
-    for raw in &all[..shown] {
-        lines.push(Line::from(Span::styled((*raw).to_owned(), style)));
-    }
-    if all.len() > shown {
-        let hidden = all.len() - shown;
-        lines.push(Line::from(Span::styled(
-            format!("… +{hidden} more lines"),
-            Style::default().fg(Color::DarkGray),
-        )));
-    }
-    if text.is_empty() {
-        lines.push(Line::from(""));
-    }
-}
-
-/// Single-line summary for overview mode. First non-empty line of the
-/// source text, with an optional prefix (e.g. "> " for user messages).
+/// Single-line summary for overview mode. The output is clipped to
+/// exactly one rendered terminal row at `width` columns — the first
+/// non-empty logical line is truncated (with `…`) to fit alongside an
+/// optional prefix and a `(+N lines)` tail that counts visual rows
+/// hidden by the fold (auto-wrap inclusive, so a single long paragraph
+/// that wraps to many rows correctly reports the hidden rows).
 fn push_overview_line(
     lines: &mut Vec<Line<'static>>,
     text: &str,
+    width: u16,
     kind: MessageKind,
     prefix: &str,
 ) {
     let first = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
-    let more = text.lines().count().saturating_sub(1);
+    let total_visual = count_visual_rows(text, width);
+    let first_visual = count_visual_rows(first, width);
+
+    // Budget for the first line's truncated content. Reserve columns
+    // for the prefix up front and for the "(+N lines)" tail if we'll
+    // emit one. `more` counts visual rows hidden by the fold; the one
+    // row we're about to render is subtracted.
+    let total_cols = width.max(1) as usize;
+    let prefix_width = UnicodeWidthStr::width(prefix);
+    let more = total_visual.saturating_sub(1);
+    let tentative_tail = if more > 0 {
+        format!(" (+{more} lines)")
+    } else {
+        String::new()
+    };
+    let avail = total_cols.saturating_sub(prefix_width);
+    // On very narrow widths where the tail alone would eat the row,
+    // drop it — keeping at least some of the actual content visible
+    // matters more than the hidden-rows label.
+    let (tail, budget) = {
+        let tw = UnicodeWidthStr::width(tentative_tail.as_str());
+        if !tentative_tail.is_empty() && tw >= avail {
+            (String::new(), avail)
+        } else {
+            (tentative_tail, avail.saturating_sub(tw))
+        }
+    };
+    let first_width = UnicodeWidthStr::width(first);
+    let needs_truncation = first_width > budget || first_visual > 1;
+    let shown = if needs_truncation {
+        truncate_with_ellipsis(first, budget)
+    } else {
+        first.to_owned()
+    };
+
     let style = kind_style(kind);
     let mut spans: Vec<Span<'static>> = Vec::new();
     if !prefix.is_empty() {
         spans.push(Span::styled(prefix.to_owned(), style));
     }
-    spans.push(Span::styled(first.to_owned(), style));
-    if more > 0 {
-        spans.push(Span::styled(
-            format!(" (+{more} lines)"),
-            Style::default().fg(Color::DarkGray),
-        ));
+    spans.push(Span::styled(shown, style));
+    if !tail.is_empty() {
+        spans.push(Span::styled(tail, Style::default().fg(Color::DarkGray)));
     }
     lines.push(Line::from(spans));
 }
 
-fn render_compact(lines: &mut Vec<Line<'static>>, evt: &CompactEvent, mode: Mode) {
+/// Truncate `s` so its display width fits within `max_width`, appending
+/// `…` when a cut is actually applied. A budget of 0 yields an empty
+/// string; a budget of 1 drops the ellipsis and returns at most one
+/// column of content so we never blow past the cap.
+fn truncate_with_ellipsis(s: &str, max_width: usize) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
+    let s_width = UnicodeWidthStr::width(s);
+    if s_width <= max_width {
+        return s.to_owned();
+    }
+    // Reserve 1 col for the ellipsis when we have room; on a 1-col
+    // budget there's no room for both content and the marker, so just
+    // clip to whatever single column fits.
+    let (inner_budget, append_ellipsis) = if max_width >= 2 {
+        (max_width - 1, true)
+    } else {
+        (max_width, false)
+    };
+    let mut out = String::new();
+    let mut w = 0usize;
+    for c in s.chars() {
+        let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+        if w + cw > inner_budget {
+            break;
+        }
+        out.push(c);
+        w += cw;
+    }
+    if append_ellipsis {
+        out.push('…');
+    }
+    out
+}
+
+/// Visual row count of `text` when rendered at `width` columns with
+/// simple char-based wrap. Each empty logical line counts as 1 row.
+fn count_visual_rows(text: &str, width: u16) -> usize {
+    if text.is_empty() {
+        return 0;
+    }
+    let w = width.max(1) as usize;
+    let mut total = 0usize;
+    for line in text.lines() {
+        let lw = UnicodeWidthStr::width(line);
+        total += if lw == 0 { 1 } else { lw.div_ceil(w) };
+    }
+    total.max(1)
+}
+
+fn render_compact(lines: &mut Vec<Line<'static>>, evt: &CompactEvent, width: u16, mode: Mode) {
     let (text, kind) = match evt {
         CompactEvent::Start => ("[compact] starting".to_owned(), MessageKind::NoticeWarn),
         CompactEvent::Done { new_session_id } => {
@@ -423,7 +491,7 @@ fn render_compact(lines: &mut Vec<Line<'static>>, evt: &CompactEvent, mode: Mode
         ),
     };
     match mode {
-        Mode::Overview => push_overview_line(lines, &text, kind, ""),
+        Mode::Overview => push_overview_line(lines, &text, width, kind, ""),
         _ => push_padded_lines(lines, &text, kind),
     }
 }

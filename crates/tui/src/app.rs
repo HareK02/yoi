@@ -125,6 +125,7 @@ impl App {
                     args_stream: String::new(),
                     arguments: None,
                     state: ToolCallState::Pending,
+                    edit_snapshot: None,
                 }));
             }
             Event::ToolCallArgsDelta { id, json } => {
@@ -158,11 +159,26 @@ impl App {
                 output,
                 is_error,
             } => {
+                // Pull the name / args out first so we can look at the
+                // (immutable) cache before taking the mutable block
+                // borrow below.
+                let (name, args) = self
+                    .find_tool_call_mut(&id)
+                    .map(|b| (b.name.clone(), b.arguments.clone()))
+                    .unwrap_or_default();
+                let edit_snapshot = if !is_error && name == "Edit" {
+                    args.as_deref()
+                        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                        .and_then(|v| v["file_path"].as_str().map(|s| s.to_owned()))
+                        .and_then(|path| self.cache.get(&path).map(|s| s.to_owned()))
+                } else {
+                    None
+                };
+
                 if let Some(b) = self.find_tool_call_mut(&id) {
-                    // Capture data we need for cache updates before we
-                    // move `output` into the new state.
-                    let name = b.name.clone();
-                    let args = b.arguments.clone();
+                    if edit_snapshot.is_some() {
+                        b.edit_snapshot = edit_snapshot;
+                    }
                     b.state = if is_error {
                         ToolCallState::Error {
                             summary,
@@ -377,6 +393,7 @@ impl App {
                         args_stream: arguments.clone().unwrap_or_default(),
                         arguments,
                         state: ToolCallState::Executing,
+                        edit_snapshot: None,
                     }));
                 }
                 "tool_result" => {
@@ -384,9 +401,22 @@ impl App {
                     let summary = item["summary"].as_str().unwrap_or("").to_owned();
                     let output = item["content"].as_str().map(|s| s.to_owned());
                     let is_error = item["is_error"].as_bool().unwrap_or(false);
+                    let (name, args) = self
+                        .find_tool_call_mut(&id)
+                        .map(|b| (b.name.clone(), b.arguments.clone()))
+                        .unwrap_or_default();
+                    let edit_snapshot = if !is_error && name == "Edit" {
+                        args.as_deref()
+                            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                            .and_then(|v| v["file_path"].as_str().map(|s| s.to_owned()))
+                            .and_then(|path| self.cache.get(&path).map(|s| s.to_owned()))
+                    } else {
+                        None
+                    };
                     if let Some(tc) = self.find_tool_call_mut(&id) {
-                        let name = tc.name.clone();
-                        let args = tc.arguments.clone();
+                        if edit_snapshot.is_some() {
+                            tc.edit_snapshot = edit_snapshot;
+                        }
                         tc.state = if is_error {
                             ToolCallState::Error {
                                 summary,
@@ -436,6 +466,28 @@ pub fn fmt_tokens(n: u64) -> String {
     }
 }
 
+/// Strip the `cat -n` line-number gutter that the Read tool prepends to
+/// its output (one `"{n:>6}\t{content}"` per line) and return the raw
+/// file body. Lines that don't match the pattern are kept verbatim, so
+/// unrelated payloads pass through unharmed.
+fn strip_cat_n_prefix(formatted: &str) -> String {
+    let mut out = String::with_capacity(formatted.len());
+    let mut first = true;
+    for line in formatted.split('\n') {
+        if !first {
+            out.push('\n');
+        }
+        first = false;
+        match line.split_once('\t') {
+            Some((prefix, rest)) if prefix.trim().chars().all(|c| c.is_ascii_digit()) => {
+                out.push_str(rest);
+            }
+            _ => out.push_str(line),
+        }
+    }
+    out
+}
+
 pub fn notification_source_label(source: NotificationSource) -> &'static str {
     match source {
         NotificationSource::Pod => "pod",
@@ -464,7 +516,11 @@ fn apply_cache_update(
                 return;
             };
             if let Some(content) = output {
-                cache.put(path, content.to_owned());
+                // The Read tool emits a `cat -n` style display: each
+                // line is "{lineno:>6}\tcontent". Strip that framing
+                // so the cache mirrors the real file body and the
+                // Edit diff renderer has a faithful "before" view.
+                cache.put(path, strip_cat_n_prefix(content));
             }
         }
         "Write" => {
