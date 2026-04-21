@@ -7,7 +7,8 @@
 - [ ] モデル capability の責務を llm-worker 外へ → [tickets/llm-capability-ownership.md](tickets/llm-capability-ownership.md)
 - [ ] Pod オーケストレーション
   - [ ] 動的 Scope 変更 → [tickets/dynamic-scope.md](tickets/dynamic-scope.md)
+- [ ] protocol: ToolResult に summary を分離 → [tickets/protocol-tool-result-shape.md](tickets/protocol-tool-result-shape.md)
 - [ ] ネイティブ GUI クライアント MVP → [tickets/native-gui-mvp.md](tickets/native-gui-mvp.md)
 - [ ] TUI 拡充
+  - [ ] フルスクリーン化によるオーバーホール → [tickets/tui-fullscreen-overhaul.md](tickets/tui-fullscreen-overhaul.md)
   - [ ] 新しい Pod を spawn する UI の設計 → [tickets/tui-pod-spawn-ui.md](tickets/tui-pod-spawn-ui.md)
-  - [ ] ツール呼び出しのフレーム更新型表示 → [tickets/tui-tool-call-ui.md](tickets/tui-tool-call-ui.md)
