@@ -83,6 +83,18 @@ pub enum PodEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event", content = "data", rename_all = "snake_case")]
 pub enum Event {
+    /// A user input message was accepted by the Pod and is about to
+    /// start a new turn. Broadcast to every subscribed client so
+    /// additional TUI / GUI instances show the same pending user line
+    /// that the submitter already sees — without this event, non-
+    /// submitting clients would see tool calls and assistant text
+    /// appear without any preceding user message.
+    ///
+    /// Fires exactly once per accepted `Method::Run`, before
+    /// `TurnStart`. Rejected runs (e.g. `AlreadyRunning`) do not emit.
+    UserMessage {
+        text: String,
+    },
     TurnStart {
         turn: usize,
     },
@@ -595,5 +607,22 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["event"], "error");
         assert_eq!(parsed["data"]["code"], "already_running");
+    }
+
+    #[test]
+    fn event_user_message_roundtrip() {
+        let event = Event::UserMessage {
+            text: "hello 世界".into(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["event"], "user_message");
+        assert_eq!(parsed["data"]["text"], "hello 世界");
+
+        let decoded: Event = serde_json::from_str(&json).unwrap();
+        match decoded {
+            Event::UserMessage { text } => assert_eq!(text, "hello 世界"),
+            other => panic!("expected UserMessage, got {other:?}"),
+        }
     }
 }

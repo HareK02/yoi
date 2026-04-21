@@ -279,6 +279,13 @@ impl PodController {
                             });
                             continue;
                         }
+                        // Broadcast the accepted user message so every
+                        // subscriber (including the submitter) can
+                        // render the turn header + user line from a
+                        // single source of truth.
+                        let _ = event_tx.send(Event::UserMessage {
+                            text: input.clone(),
+                        });
                         let was_paused = status_before == PodStatus::Paused;
                         shared_state.set_status(PodStatus::Running);
                         let _ = runtime_dir.write_status(&shared_state).await;

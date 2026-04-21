@@ -72,11 +72,10 @@ impl App {
             }
             return None;
         }
-        self.turn_index += 1;
-        self.blocks.push(Block::TurnHeader {
-            turn: self.turn_index,
-        });
-        self.blocks.push(Block::UserMessage { text: text.clone() });
+        // TurnHeader / UserMessage blocks are pushed in response to
+        // `Event::UserMessage` (single source of truth, shared by every
+        // client subscribed to the Pod). Locally we only clear the
+        // input buffer and forward the method.
         self.input.clear();
         Some(Method::Run { input: text })
     }
@@ -91,6 +90,14 @@ impl App {
 
     pub fn handle_pod_event(&mut self, event: Event) {
         match event {
+            Event::UserMessage { text } => {
+                self.turn_index += 1;
+                self.blocks.push(Block::TurnHeader {
+                    turn: self.turn_index,
+                });
+                self.blocks.push(Block::UserMessage { text });
+                self.assistant_streaming = false;
+            }
             Event::TurnStart { .. } => {
                 self.running = true;
                 self.paused = false;
