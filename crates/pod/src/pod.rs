@@ -27,7 +27,8 @@ use crate::runtime_dir;
 use crate::scope_lock::{self, ScopeAllocationGuard, ScopeLockError};
 use crate::system_prompt::{SystemPromptContext, SystemPromptError, SystemPromptTemplate};
 use crate::usage_tracker::UsageTracker;
-use protocol::{NotificationLevel, NotificationSource};
+use protocol::{Event, NotificationLevel, NotificationSource};
+use tokio::sync::broadcast;
 use async_trait::async_trait;
 use llm_worker::interceptor::PreRequestAction;
 
@@ -120,6 +121,11 @@ pub struct Pod<C: LlmClient, St: Store> {
     /// User-facing notification sink attached by the Controller at
     /// spawn time. `None` in tests / direct `Pod::new` usage.
     notifier: Option<Notifier>,
+    /// Broadcast sender for typed lifecycle `Event`s (compact progress,
+    /// etc.). Attached by the Controller alongside `notifier`. Unlike
+    /// notifications, events sent here are NOT replayed to clients that
+    /// connect after the fact — they are fire-and-forget broadcasts.
+    event_tx: Option<broadcast::Sender<Event>>,
     /// Queue of pending `Method::Notify` notifications awaiting
     /// injection into the next LLM request. Shared with the
     /// PodInterceptor installed in `ensure_interceptor_installed`.
@@ -176,6 +182,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             tracker: None,
             system_prompt_template: None,
             notifier: None,
+            event_tx: None,
             pending_notifications: NotificationBuffer::new(),
             scope_allocation: None,
             callback_socket: None,
@@ -241,6 +248,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             tracker: None,
             system_prompt_template: None,
             notifier: None,
+            event_tx: None,
             pending_notifications: NotificationBuffer::new(),
             scope_allocation: None,
             callback_socket: None,
@@ -343,9 +351,27 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         self.notifier = Some(notifier);
     }
 
+    /// Attach the broadcast sender used for typed lifecycle `Event`s.
+    ///
+    /// The Controller wires this alongside [`attach_notifier`] so that
+    /// Pod-internal operations (currently: compaction) can surface
+    /// progress to connected clients.
+    pub fn attach_event_tx(&mut self, event_tx: broadcast::Sender<Event>) {
+        self.event_tx = Some(event_tx);
+    }
+
     fn notify(&self, level: NotificationLevel, source: NotificationSource, message: String) {
         if let Some(n) = self.notifier.as_ref() {
             n.notify(level, source, message);
+        }
+    }
+
+    /// Broadcast a typed `Event` to connected clients. No-op when no
+    /// `event_tx` is attached (tests / direct `Pod::new` usage) or when
+    /// no clients are currently subscribed.
+    fn send_event(&self, event: Event) {
+        if let Some(tx) = self.event_tx.as_ref() {
+            let _ = tx.send(event);
         }
     }
 
@@ -682,12 +708,14 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 .map(|s| s.retained_tokens())
                 .unwrap_or(manifest::defaults::COMPACT_RETAINED_TOKENS);
 
+            self.send_event(Event::CompactStart);
             match self.compact(retained).await {
                 Ok(new_session_id) => {
                     info!(
                         new_session_id = %new_session_id,
                         "Compaction succeeded, resuming execution"
                     );
+                    self.send_event(Event::CompactDone { new_session_id });
                     if let Some(ref state) = self.compact_state {
                         state.record_compact_success();
                     }
@@ -695,6 +723,9 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 }
                 Err(e) => {
                     warn!(error = %e, "Compaction failed during run");
+                    self.send_event(Event::CompactFailed {
+                        error: e.to_string(),
+                    });
                     self.notify(
                         NotificationLevel::Error,
                         NotificationSource::Compactor,
@@ -723,17 +754,22 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         }
 
         let retained = state.retained_tokens();
+        self.send_event(Event::CompactStart);
         match self.compact(retained).await {
             Ok(new_session_id) => {
                 info!(
                     new_session_id = %new_session_id,
                     "Proactive post-run compaction succeeded"
                 );
+                self.send_event(Event::CompactDone { new_session_id });
                 state.record_compact_success();
                 Ok(())
             }
             Err(e) => {
                 warn!(error = %e, "Proactive post-run compaction failed");
+                self.send_event(Event::CompactFailed {
+                    error: e.to_string(),
+                });
                 self.notify(
                     NotificationLevel::Warn,
                     NotificationSource::Compactor,
@@ -1143,6 +1179,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             tracker: None,
             system_prompt_template,
             notifier: None,
+            event_tx: None,
             pending_notifications: NotificationBuffer::new(),
             scope_allocation: Some(scope_allocation),
             callback_socket: None,
@@ -1202,6 +1239,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             tracker: None,
             system_prompt_template,
             notifier: None,
+            event_tx: None,
             pending_notifications: NotificationBuffer::new(),
             scope_allocation: Some(scope_allocation),
             callback_socket: Some(callback_socket),

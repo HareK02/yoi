@@ -130,6 +130,23 @@ pub enum Event {
         greeting: Greeting,
     },
     Notification(Notification),
+    /// Pod has started compacting the current session.
+    ///
+    /// Fired immediately before a compaction run. Success is signalled by
+    /// `CompactDone` (with the new `SessionId`); failure by `CompactFailed`.
+    /// Broadcast to all clients; not replayed to late subscribers.
+    CompactStart,
+    /// Compaction completed and the session was rotated.
+    ///
+    /// `new_session_id` is the UUID of the freshly created session that
+    /// replaced the old history.
+    CompactDone {
+        new_session_id: uuid::Uuid,
+    },
+    /// Compaction failed. The session is unchanged.
+    CompactFailed {
+        error: String,
+    },
     Shutdown,
 }
 
@@ -440,6 +457,49 @@ mod tests {
         assert_eq!(parsed["data"]["source"], "compactor");
         assert_eq!(parsed["data"]["message"], "compaction failed");
         assert_eq!(parsed["data"]["timestamp_ms"], 1_700_000_000_000i64);
+    }
+
+    #[test]
+    fn event_compact_start_roundtrip() {
+        let event = Event::CompactStart;
+        let json = serde_json::to_string(&event).unwrap();
+        assert_eq!(json, r#"{"event":"compact_start"}"#);
+        let decoded: Event = serde_json::from_str(&json).unwrap();
+        assert!(matches!(decoded, Event::CompactStart));
+    }
+
+    #[test]
+    fn event_compact_done_roundtrip() {
+        let id = uuid::Uuid::parse_str("0192f0e8-4d84-7d6e-a000-000000000001").unwrap();
+        let event = Event::CompactDone { new_session_id: id };
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["event"], "compact_done");
+        assert_eq!(
+            parsed["data"]["new_session_id"],
+            "0192f0e8-4d84-7d6e-a000-000000000001"
+        );
+        let decoded: Event = serde_json::from_str(&json).unwrap();
+        match decoded {
+            Event::CompactDone { new_session_id } => assert_eq!(new_session_id, id),
+            other => panic!("expected CompactDone, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn event_compact_failed_roundtrip() {
+        let event = Event::CompactFailed {
+            error: "provider 429".into(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["event"], "compact_failed");
+        assert_eq!(parsed["data"]["error"], "provider 429");
+        let decoded: Event = serde_json::from_str(&json).unwrap();
+        match decoded {
+            Event::CompactFailed { error } => assert_eq!(error, "provider 429"),
+            other => panic!("expected CompactFailed, got {other:?}"),
+        }
     }
 
     #[test]

@@ -84,6 +84,28 @@ Event::CompactFailed { error: String }
 - 汎用 `SessionChanged` は作らない（YAGNI — fork 等が実装される時まで判断を保留）。
 - TUI 側は現状 session_id を利用していないので、イベントを受け取るだけでよい（将来 GetHistory 再取得などに使う）。
 
+### 5. wire 型 — `protocol` が `uuid::Uuid` を直接扱う
+
+- `SessionId` のパースは `protocol` クレートの責務。`protocol/Cargo.toml` に
+  `uuid = { workspace = true, features = ["serde"] }` を追加し、
+  `Event::CompactDone { new_session_id: uuid::Uuid }` として型付けする。
+- `session-store::SessionId` は `uuid::Uuid` のエイリアスなので、Pod 側は変換なしで渡せる。
+- 文字列経由にはしない（wire を弱く型付けして嬉しいことがない）。
+
+### 6. broadcast 手段 — Pod が `event_tx` を直接保持
+
+- `Notifier` は `Event::Notification` の replay バッファ専用のまま残し、compact 系イベントは
+  通さない（意味が噛み合わない）。
+- `Pod` に `event_tx: Option<broadcast::Sender<Event>>` を持たせ、
+  `attach_notifier` と同じタイミングで Controller 側から渡す。
+- compact 発火点では `self.event_tx.as_ref().map(|tx| tx.send(...))` で直接流す。
+
+### 7. late subscriber への再配信 — しない
+
+- compact イベントはバッファせず、broadcast 時点で購読していないクライアントには届かない。
+- TUI は現状 session_id を使っていないため、接続後に直近の compact を知る必要がない。
+- 必要になった時点（fork や複数クライアント同時接続が現実になった時）で別チケットで buffer 化。
+
 ### 4. Permission ask/reply — 別チケットで実装
 
 - permission-extension-point の段階 3 で追加する。
@@ -94,12 +116,20 @@ Event::CompactFailed { error: String }
 
 ## 本チケットで実装するもの
 
-1. `Event::CompactStart` / `Event::CompactDone { new_session_id: SessionId }` / `Event::CompactFailed { error: String }` を追加する。
-   - `SessionId` の wire 表現は既存 `session_store::SessionId` をそのまま `Serialize` できれば使う。外部型に依存するなら `String` 化する。
-2. `crates/pod/src/pod.rs` の compact 発火 2 箇所で対応する Event を broadcast する。
-3. `crates/tui/src/app.rs` の `handle_pod_event` に 3 分岐を追加し、最低限の表示を行う（アイコン + メッセージ、詳細 UI は別チケット）。
-4. テスト:
-   - Event の JSON roundtrip（`protocol` クレート）
+1. `protocol` クレートに `uuid = { workspace = true, features = ["serde"] }` を追加し、
+   `Event::CompactStart` / `Event::CompactDone { new_session_id: uuid::Uuid }` /
+   `Event::CompactFailed { error: String }` を追加する。
+2. `Pod` に `event_tx: Option<broadcast::Sender<Event>>` を持たせ、Controller 側から
+   `Notifier` と同じタイミングで渡す。
+3. `crates/pod/src/pod.rs` の compact 発火 2 箇所（`do_compact_and_resume` /
+   `try_post_run_compact`）で start / 成功（CompactDone） / 失敗（CompactFailed）を broadcast する。
+4. `crates/tui/src/app.rs` の `handle_pod_event` に 3 分岐を追加し、
+   既存の `NoticeWarn` / `NoticeError` と同じ枠で最低限のテキストを表示する。
+   - `[compact] starting`
+   - `[compact] done (new session <uuid先頭8字>)`
+   - `[compact error] <message>`
+5. テスト:
+   - Event の JSON roundtrip（`protocol` クレート）: 3 バリアント + uuid の shape
    - 成功/失敗/mid-turn の各パスで Event が発行されることを確認する統合テスト（`pod` クレート）
 
 ## 本チケットで実装しないもの
@@ -114,3 +144,9 @@ Event::CompactFailed { error: String }
 - Event の肥大化が気になってきたら、`Event::Stream(StreamEvent)` のようにカテゴリ分けしてネストする余地はある。ただし現状 15 バリアントで破綻していないので先送り。
 - Protocol のバージョニングは未着手。クライアントの互換性問題が顕在化した時点で `Event::Hello { protocol_version }` のような握手を追加する。
 - Broadcast channel の特性上、遅い client では drop が起き得る。現状はログのみだが、compact 等の重要イベントを落とすとまずいので将来は per-client queue への置き換えを検討する。
+
+## Review
+
+- 状態: Approve with follow-up
+- レビュー詳細: [./protocol-design.review.md](./protocol-design.review.md)
+- 日付: 2026-04-21

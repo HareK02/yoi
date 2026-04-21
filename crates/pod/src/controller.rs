@@ -102,6 +102,9 @@ impl PodController {
         // AGENTS.md ingestion during the first turn) can emit user-facing
         // notifications on the same channel.
         pod.attach_notifier(notifier.clone());
+        // Also hand the raw broadcast sender so Pod-internal operations
+        // can emit typed lifecycle `Event`s (currently: compact progress).
+        pod.attach_event_tx(event_tx.clone());
 
         // Start socket server (lives as a background task, cleaned up on drop via RuntimeDir)
         let _socket_server = SocketServer::start(&handle).await?;

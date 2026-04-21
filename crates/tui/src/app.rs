@@ -189,6 +189,29 @@ impl App {
                 self.current_tool = None;
             }
             Event::ToolCallArgsDelta { .. } => {}
+            Event::CompactStart => {
+                self.output_queue.push(OutputItem::Padded(
+                    MessageKind::NoticeWarn,
+                    "[compact] starting".to_string(),
+                ));
+            }
+            Event::CompactDone { new_session_id } => {
+                let short = new_session_id
+                    .to_string()
+                    .chars()
+                    .take(8)
+                    .collect::<String>();
+                self.output_queue.push(OutputItem::Padded(
+                    MessageKind::NoticeWarn,
+                    format!("[compact] done (new session {short})"),
+                ));
+            }
+            Event::CompactFailed { error } => {
+                self.output_queue.push(OutputItem::Padded(
+                    MessageKind::NoticeError,
+                    format!("[compact error] {error}"),
+                ));
+            }
             Event::Notification(notification) => {
                 let kind = match notification.level {
                     NotificationLevel::Warn => MessageKind::NoticeWarn,
