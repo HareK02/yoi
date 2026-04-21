@@ -32,3 +32,15 @@ TUI 側で「俯瞰ビュー」の 1 行サマリや status line の短縮表示
 - `ToolOutput.content` の protocol 化。現時点では不要。必要になったら別チケット
 - summary 文言の規格化や整形。各ツール側の責務
 - TUI の summary 利用 (`tickets/tui-fullscreen-overhaul.md` で扱う)
+
+## Review
+
+- 状態: Request changes
+- レビュー詳細: [./protocol-tool-result-shape.review.md](./protocol-tool-result-shape.review.md)
+- 日付: 2026-04-21
+
+### 指摘反映 (2026-04-21)
+
+- **Blocking**: `Event::ToolResult` の詳細本文フィールドをチケット本文どおり `output` 名で保持する形に修正。Option 化だけは残し `output: Option<String>` に落ち着けた（空文字列を wire に乗せない / worker の `ToolOutput { summary, content }` と意味論的に整合）。`content` という名前および意味（`ToolOutput.content` の protocol 化）は取り込まない、という範囲外条項は遵守している。
+- **Non-blocking**: `on_tool_result` の error-path カバレッジを `callback_test.rs::test_callback_tool_result_error_path` として追加。`ToolResult::error` 経由で `summary=エラーメッセージ / content=None / is_error=true` が emit されることを確認。
+- 再レビュー可。

@@ -162,6 +162,11 @@ pub struct Worker<C: LlmClient, S: WorkerState = Mutable> {
     /// can be forwarded to the user — distinct from `tracing::warn!`,
     /// which is for developer-facing logs.
     warning_cbs: Vec<Box<dyn Fn(&str) + Send + Sync>>,
+    /// Tool-result callbacks. Invoked once per completed tool call
+    /// after post-execution interceptors and the output byte-cap
+    /// truncation have been applied — i.e. on the same data that
+    /// enters history.
+    tool_result_cbs: Vec<Box<dyn Fn(&ToolResult) + Send + Sync>>,
     /// Request configuration (max_tokens, temperature, etc.)
     request_config: RequestConfig,
     /// Whether the previous run was interrupted
@@ -299,6 +304,22 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
     fn emit_warning(&self, message: &str) {
         for cb in &self.warning_cbs {
             cb(message);
+        }
+    }
+
+    /// Register a callback invoked once per completed tool execution.
+    ///
+    /// Fired after `post_tool_call` interceptors and any `content`
+    /// truncation from `tool_output_limits`, so the callback observes
+    /// exactly what is persisted to history. Intended for upper layers
+    /// (e.g. Pod) to forward tool results to clients.
+    pub fn on_tool_result(&mut self, callback: impl Fn(&ToolResult) + Send + Sync + 'static) {
+        self.tool_result_cbs.push(Box::new(callback));
+    }
+
+    fn emit_tool_result(&self, result: &ToolResult) {
+        for cb in &self.tool_result_cbs {
+            cb(result);
         }
     }
 
@@ -753,6 +774,11 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
             }
         }
 
+        // Emit per-result callbacks on the post-truncation payload.
+        for tool_result in &results {
+            self.emit_tool_result(tool_result);
+        }
+
         Ok(ToolExecutionResult::Completed(results))
     }
 
@@ -1016,6 +1042,7 @@ impl<C: LlmClient> Worker<C, Mutable> {
             turn_start_cbs: Vec::new(),
             turn_end_cbs: Vec::new(),
             warning_cbs: Vec::new(),
+            tool_result_cbs: Vec::new(),
             request_config: RequestConfig::default(),
             last_run_interrupted: false,
             cancel_tx,
@@ -1270,6 +1297,7 @@ impl<C: LlmClient> Worker<C, Mutable> {
             turn_start_cbs: self.turn_start_cbs,
             turn_end_cbs: self.turn_end_cbs,
             warning_cbs: self.warning_cbs,
+            tool_result_cbs: self.tool_result_cbs,
             request_config: self.request_config,
             last_run_interrupted: self.last_run_interrupted,
 
@@ -1344,6 +1372,7 @@ impl<C: LlmClient> Worker<C, Locked> {
             turn_start_cbs: self.turn_start_cbs,
             turn_end_cbs: self.turn_end_cbs,
             warning_cbs: self.warning_cbs,
+            tool_result_cbs: self.tool_result_cbs,
             request_config: self.request_config,
             last_run_interrupted: self.last_run_interrupted,
 

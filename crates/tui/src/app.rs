@@ -140,21 +140,16 @@ impl App {
                 ));
             }
             Event::ToolResult {
-                output, is_error, ..
+                summary, is_error, ..
             } => {
                 let prefix = if is_error {
                     "[tool error]"
                 } else {
                     "[tool result]"
                 };
-                let display = if output.len() > 200 {
-                    format!("{}...", &output[..200])
-                } else {
-                    output
-                };
                 self.output_queue.push(OutputItem::Padded(
                     MessageKind::Tool,
-                    format!("{prefix} {display}"),
+                    format!("{prefix} {summary}"),
                 ));
             }
             Event::Usage {
@@ -345,15 +340,10 @@ impl App {
                     ));
                 }
                 "tool_result" => {
-                    let output = item["output"].as_str().unwrap_or("");
-                    let display = if output.len() > 200 {
-                        format!("{}...", &output[..200])
-                    } else {
-                        output.to_owned()
-                    };
+                    let summary = item["summary"].as_str().unwrap_or("");
                     self.output_queue.push(OutputItem::Padded(
                         MessageKind::Tool,
-                        format!("[tool result] {display}"),
+                        format!("[tool result] {summary}"),
                     ));
                 }
                 _ => {}

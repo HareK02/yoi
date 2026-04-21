@@ -187,6 +187,16 @@ impl PodController {
             });
 
             let tx = event_tx.clone();
+            worker.on_tool_result(move |result| {
+                let _ = tx.send(Event::ToolResult {
+                    id: result.tool_use_id.clone(),
+                    summary: result.summary.clone(),
+                    output: result.content.clone(),
+                    is_error: result.is_error,
+                });
+            });
+
+            let tx = event_tx.clone();
             worker.on_usage(move |event| {
                 let _ = tx.send(Event::Usage {
                     input_tokens: event.input_tokens,

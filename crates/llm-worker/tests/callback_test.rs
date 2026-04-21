@@ -6,9 +6,11 @@ mod common;
 
 use std::sync::{Arc, Mutex};
 
+use async_trait::async_trait;
 use common::MockLlmClient;
 use llm_worker::Worker;
 use llm_worker::llm_client::event::{Event, ResponseStatus, StatusEvent as ClientStatusEvent};
+use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 
 // =============================================================================
 // Tests
@@ -147,6 +149,145 @@ async fn test_callback_turn_events() {
 
     assert_eq!(ends.len(), 1);
     assert_eq!(ends[0], 0);
+}
+
+/// Stub tool returning a fixed [`ToolOutput`] for result-callback tests.
+struct FixedOutputTool {
+    output: ToolOutput,
+}
+
+#[async_trait]
+impl Tool for FixedOutputTool {
+    async fn execute(&self, _input_json: &str) -> Result<ToolOutput, ToolError> {
+        Ok(self.output.clone())
+    }
+}
+
+fn fixed_tool(name: &'static str, output: ToolOutput) -> ToolDefinition {
+    Arc::new(move || {
+        let meta = ToolMeta::new(name).input_schema(serde_json::json!({"type":"object"}));
+        (
+            meta,
+            Arc::new(FixedOutputTool {
+                output: output.clone(),
+            }) as Arc<dyn Tool>,
+        )
+    })
+}
+
+/// Verify that on_tool_result fires once per executed tool with
+/// summary/content/is_error matching what the tool returned.
+#[tokio::test]
+async fn test_callback_tool_result_events() {
+    let events = vec![
+        Event::tool_use_start(0, "call_1", "fixed"),
+        Event::tool_input_delta(0, "{}"),
+        Event::tool_use_stop(0),
+        Event::Status(ClientStatusEvent {
+            status: ResponseStatus::Completed,
+        }),
+    ];
+
+    let client = MockLlmClient::new(events);
+    let mut worker = Worker::new(client);
+
+    worker.register_tool(fixed_tool(
+        "fixed",
+        ToolOutput {
+            summary: "did the thing".into(),
+            content: Some("full detail body".into()),
+        },
+    ));
+
+    let captured: Arc<Mutex<Vec<(String, String, Option<String>, bool)>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let sink = captured.clone();
+    worker.on_tool_result(move |result| {
+        sink.lock().unwrap().push((
+            result.tool_use_id.clone(),
+            result.summary.clone(),
+            result.content.clone(),
+            result.is_error,
+        ));
+    });
+
+    let _ = worker.run("call it").await;
+
+    let observed = captured.lock().unwrap();
+    assert_eq!(observed.len(), 1);
+    assert_eq!(observed[0].0, "call_1");
+    assert_eq!(observed[0].1, "did the thing");
+    assert_eq!(observed[0].2.as_deref(), Some("full detail body"));
+    assert!(!observed[0].3);
+}
+
+/// Stub tool that always fails, for exercising the error path through
+/// `on_tool_result`.
+struct ErroringTool {
+    message: String,
+}
+
+#[async_trait]
+impl Tool for ErroringTool {
+    async fn execute(&self, _input_json: &str) -> Result<ToolOutput, ToolError> {
+        Err(ToolError::ExecutionFailed(self.message.clone()))
+    }
+}
+
+fn erroring_tool(name: &'static str, message: &'static str) -> ToolDefinition {
+    Arc::new(move || {
+        let meta = ToolMeta::new(name).input_schema(serde_json::json!({"type":"object"}));
+        (
+            meta,
+            Arc::new(ErroringTool {
+                message: message.to_string(),
+            }) as Arc<dyn Tool>,
+        )
+    })
+}
+
+/// Verify on_tool_result also fires for failed executions with
+/// is_error=true, and that the ToolOutput content channel stays empty.
+#[tokio::test]
+async fn test_callback_tool_result_error_path() {
+    let events = vec![
+        Event::tool_use_start(0, "call_err", "erroring"),
+        Event::tool_input_delta(0, "{}"),
+        Event::tool_use_stop(0),
+        Event::Status(ClientStatusEvent {
+            status: ResponseStatus::Completed,
+        }),
+    ];
+
+    let client = MockLlmClient::new(events);
+    let mut worker = Worker::new(client);
+
+    worker.register_tool(erroring_tool("erroring", "boom"));
+
+    let captured: Arc<Mutex<Vec<(String, String, Option<String>, bool)>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let sink = captured.clone();
+    worker.on_tool_result(move |result| {
+        sink.lock().unwrap().push((
+            result.tool_use_id.clone(),
+            result.summary.clone(),
+            result.content.clone(),
+            result.is_error,
+        ));
+    });
+
+    let _ = worker.run("fail it").await;
+
+    let observed = captured.lock().unwrap();
+    assert_eq!(observed.len(), 1);
+    assert_eq!(observed[0].0, "call_err");
+    assert!(
+        observed[0].1.contains("boom"),
+        "summary should carry the error message: {}",
+        observed[0].1
+    );
+    assert!(observed[0].2.is_none());
+    assert!(observed[0].3);
 }
 
 /// Verify that on_usage callback receives usage events

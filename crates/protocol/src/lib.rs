@@ -111,7 +111,14 @@ pub enum Event {
     },
     ToolResult {
         id: String,
-        output: String,
+        /// Short human-readable summary. Always present; used by clients
+        /// that only want a 1-line rendering (e.g. collapsed views).
+        summary: String,
+        /// Full tool output. Absent when the tool chose to return
+        /// summary-only, or when the result was pruned.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output: Option<String>,
+        #[serde(default)]
         is_error: bool,
     },
     Usage {
@@ -499,6 +506,82 @@ mod tests {
         match decoded {
             Event::CompactFailed { error } => assert_eq!(error, "provider 429"),
             other => panic!("expected CompactFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn event_tool_result_roundtrip() {
+        let event = Event::ToolResult {
+            id: "call_1".into(),
+            summary: "Read 128 bytes".into(),
+            output: Some("hello world".into()),
+            is_error: false,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["event"], "tool_result");
+        assert_eq!(parsed["data"]["id"], "call_1");
+        assert_eq!(parsed["data"]["summary"], "Read 128 bytes");
+        assert_eq!(parsed["data"]["output"], "hello world");
+        assert_eq!(parsed["data"]["is_error"], false);
+
+        let decoded: Event = serde_json::from_str(&json).unwrap();
+        match decoded {
+            Event::ToolResult {
+                id,
+                summary,
+                output,
+                is_error,
+            } => {
+                assert_eq!(id, "call_1");
+                assert_eq!(summary, "Read 128 bytes");
+                assert_eq!(output.as_deref(), Some("hello world"));
+                assert!(!is_error);
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn event_tool_result_omits_absent_output() {
+        let event = Event::ToolResult {
+            id: "call_2".into(),
+            summary: "ok".into(),
+            output: None,
+            is_error: false,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(
+            !json.contains("\"output\""),
+            "absent output must not be serialized: {json}"
+        );
+    }
+
+    #[test]
+    fn event_tool_result_error_roundtrip() {
+        let event = Event::ToolResult {
+            id: "call_3".into(),
+            summary: "invalid argument".into(),
+            output: None,
+            is_error: true,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["data"]["is_error"], true);
+
+        let decoded: Event = serde_json::from_str(&json).unwrap();
+        match decoded {
+            Event::ToolResult {
+                summary,
+                output,
+                is_error,
+                ..
+            } => {
+                assert_eq!(summary, "invalid argument");
+                assert!(output.is_none());
+                assert!(is_error);
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
         }
     }
 
