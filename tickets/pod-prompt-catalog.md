@@ -138,3 +138,8 @@ auto-discovery は「ユーザー or プロジェクトの永続設定 (翻訳�
 6. 長文 variant (compact_system など) を `{% include "$insomnia/internal/..." %}` 形式に分離。`$user` / `$workspace` から include で override できることをテスト
 
 各ステップ終了時点でビルド通過・既存テスト合格を維持する。
+
+## Review
+- 状態: Approve
+- レビュー詳細: [./pod-prompt-catalog.review.md](./pod-prompt-catalog.review.md)
+- 日付: 2026-04-22

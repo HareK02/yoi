@@ -26,7 +26,9 @@ use crate::hook::{
     TurnEndInfo,
 };
 use crate::notification_buffer::{NotificationBuffer, format_notification};
+use crate::prompts::PromptCatalog;
 use crate::token_counter::total_tokens_impl;
+use tracing::warn;
 
 /// Maximum number of bytes copied into `TurnEndInfo::final_text_preview`.
 const FINAL_TEXT_PREVIEW_LIMIT: usize = 512;
@@ -41,6 +43,8 @@ pub(crate) struct PodInterceptor {
     /// Pending-notification buffer drained into the per-request
     /// context at the head of `pre_llm_request`.
     pending_notifications: NotificationBuffer,
+    /// Prompt catalog used to render the injected notification wrapper.
+    prompts: Arc<PromptCatalog>,
     /// Next turn index assigned by `on_prompt_submit`.
     next_turn_index: AtomicUsize,
     /// Tool calls observed in the current turn (reset on each new prompt).
@@ -53,12 +57,14 @@ impl PodInterceptor {
         compact_state: Option<Arc<CompactState>>,
         usage_history: Option<Arc<Mutex<Vec<UsageRecord>>>>,
         pending_notifications: NotificationBuffer,
+        prompts: Arc<PromptCatalog>,
     ) -> Self {
         Self {
             registry,
             compact_state,
             usage_history,
             pending_notifications,
+            prompts,
             next_turn_index: AtomicUsize::new(0),
             tool_calls_this_turn: AtomicUsize::new(0),
         }
@@ -122,7 +128,17 @@ impl Interceptor for PodInterceptor {
         // These are not persisted to the Worker history; they exist only
         // for this single LLM request.
         for notification in self.pending_notifications.drain() {
-            context.push(format_notification(&notification));
+            match format_notification(&notification, &self.prompts) {
+                Ok(item) => context.push(item),
+                Err(e) => {
+                    // A render failure here would starve the LLM of the
+                    // notification text. Fall back to the raw message —
+                    // it still carries the intent, just without the
+                    // wrapper phrasing.
+                    warn!(error = %e, "failed to render notify_wrapper; using raw message");
+                    context.push(Item::system_message(notification.message.clone()));
+                }
+            }
         }
 
         let info = PreRequestInfo {
@@ -281,6 +297,7 @@ mod tests {
             Some(state),
             Some(history),
             NotificationBuffer::new(),
+            PromptCatalog::builtins_only().unwrap(),
         );
         let mut ctx = ctx_items;
         let action = interceptor.pre_llm_request(&mut ctx).await;
@@ -304,6 +321,7 @@ mod tests {
             Some(state),
             Some(history),
             NotificationBuffer::new(),
+            PromptCatalog::builtins_only().unwrap(),
         );
         let mut ctx = ctx_items;
         let action = interceptor.pre_llm_request(&mut ctx).await;
@@ -328,6 +346,7 @@ mod tests {
             Some(state),
             Some(history),
             NotificationBuffer::new(),
+            PromptCatalog::builtins_only().unwrap(),
         );
         let mut ctx = ctx_items;
         let action = interceptor.pre_llm_request(&mut ctx).await;
@@ -341,7 +360,13 @@ mod tests {
         let count = Arc::new(AtomicUsize::new(0));
         let registry = registry_with_pre_llm_hook(count.clone());
 
-        let interceptor = PodInterceptor::new(registry, None, None, NotificationBuffer::new());
+        let interceptor = PodInterceptor::new(
+            registry,
+            None,
+            None,
+            NotificationBuffer::new(),
+            PromptCatalog::builtins_only().unwrap(),
+        );
         let mut ctx: Vec<Item> = Vec::new();
         let action = interceptor.pre_llm_request(&mut ctx).await;
 
@@ -366,7 +391,13 @@ mod tests {
         buffer.push("first".into());
         buffer.push("second".into());
 
-        let interceptor = PodInterceptor::new(registry, None, None, buffer.clone());
+        let interceptor = PodInterceptor::new(
+            registry,
+            None,
+            None,
+            buffer.clone(),
+            PromptCatalog::builtins_only().unwrap(),
+        );
         let mut ctx: Vec<Item> = vec![Item::user_message("hi")];
         let action = interceptor.pre_llm_request(&mut ctx).await;
 
@@ -395,8 +426,13 @@ mod tests {
         let ctx_items = vec![Item::user_message("hi")];
         let history = usage_handle_with(ctx_items.len(), 200);
 
-        let interceptor =
-            PodInterceptor::new(registry, Some(state), Some(history), buffer.clone());
+        let interceptor = PodInterceptor::new(
+            registry,
+            Some(state),
+            Some(history),
+            buffer.clone(),
+            PromptCatalog::builtins_only().unwrap(),
+        );
         let mut ctx = ctx_items;
         let action = interceptor.pre_llm_request(&mut ctx).await;
 
@@ -415,7 +451,13 @@ mod tests {
         builder.add_pre_llm_request(CountingHook(second_count.clone()));
         let registry = Arc::new(builder.build());
 
-        let interceptor = PodInterceptor::new(registry, None, None, NotificationBuffer::new());
+        let interceptor = PodInterceptor::new(
+            registry,
+            None,
+            None,
+            NotificationBuffer::new(),
+            PromptCatalog::builtins_only().unwrap(),
+        );
         let mut ctx: Vec<Item> = Vec::new();
         let action = interceptor.pre_llm_request(&mut ctx).await;
 

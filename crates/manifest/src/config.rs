@@ -37,6 +37,11 @@ pub struct PodManifestConfig {
 pub struct PodMetaConfig {
     #[serde(default)]
     pub name: Option<String>,
+    /// Optional `PromptCatalog` manifest pack override. See
+    /// [`crate::PodMeta::prompt_pack`] for semantics. Relative paths
+    /// are resolved through [`PodManifestConfig::resolve_paths`].
+    #[serde(default)]
+    pub prompt_pack: Option<PathBuf>,
 }
 
 /// Partial-form of [`ModelConfig`]. カスケード層で個別に与えられる。
@@ -159,6 +164,9 @@ impl PodManifestConfig {
             base.display()
         );
         resolve_auth_file(&mut self.model.auth, base);
+        if let Some(ref mut pack) = self.pod.prompt_pack {
+            *pack = join_if_relative(base, pack);
+        }
         for rule in &mut self.scope.allow {
             rule.target = join_if_relative(base, &rule.target);
         }
@@ -196,6 +204,7 @@ impl PodMetaConfig {
     fn merge(self, upper: Self) -> Self {
         Self {
             name: upper.name.or(self.name),
+            prompt_pack: upper.prompt_pack.or(self.prompt_pack),
         }
     }
 }
@@ -332,6 +341,10 @@ impl TryFrom<PodManifestConfig> for PodManifest {
             .pod
             .name
             .ok_or(ResolveError::MissingField("pod.name"))?;
+        let prompt_pack = cfg.pod.prompt_pack;
+        if let Some(ref p) = prompt_pack {
+            ensure_absolute("pod.prompt_pack", p)?;
+        }
 
         let model = resolve_model(
             cfg.model,
@@ -406,7 +419,7 @@ impl TryFrom<PodManifestConfig> for PodManifest {
             .transpose()?;
 
         Ok(PodManifest {
-            pod: PodMeta { name },
+            pod: PodMeta { name, prompt_pack },
             model,
             worker,
             scope: cfg.scope,
@@ -435,6 +448,7 @@ mod tests {
         PodManifestConfig {
             pod: PodMetaConfig {
                 name: Some("test".into()),
+                prompt_pack: None,
             },
             model: ModelConfigPartial {
                 scheme: Some(SchemeKind::Anthropic),
@@ -554,6 +568,7 @@ mod tests {
         let lower = PodManifestConfig {
             pod: PodMetaConfig {
                 name: Some("lower".into()),
+                prompt_pack: None,
             },
             model: ModelConfigPartial {
                 model_id: Some("lower-model".into()),
@@ -564,6 +579,7 @@ mod tests {
         let upper = PodManifestConfig {
             pod: PodMetaConfig {
                 name: Some("upper".into()),
+                prompt_pack: None,
             },
             ..Default::default()
         };
@@ -725,6 +741,7 @@ permission = "write"
         let overlay = PodManifestConfig {
             pod: PodMetaConfig {
                 name: Some("x".into()),
+                prompt_pack: None,
             },
             model: ModelConfigPartial {
                 scheme: Some(SchemeKind::Anthropic),

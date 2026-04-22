@@ -102,10 +102,18 @@ pub enum LoaderError {
 
 /// Loader that resolves [`PromptRef`]s against the configured prompt
 /// libraries. Cheap to clone.
+///
+/// Also carries the auto-discovered `prompts.toml` pack file paths so
+/// [`crate::prompts::PromptCatalog`] can read the same user/workspace
+/// layers without a separate plumbing channel. These fields do not
+/// affect `$prefix` asset resolution — they are purely metadata
+/// consulted by the catalog loader.
 #[derive(Debug, Clone)]
 pub struct PromptLoader {
     user_dir: Option<PathBuf>,
     workspace_dir: Option<PathBuf>,
+    user_pack_file: Option<PathBuf>,
+    workspace_pack_file: Option<PathBuf>,
 }
 
 impl PromptLoader {
@@ -116,6 +124,8 @@ impl PromptLoader {
         Self {
             user_dir: None,
             workspace_dir: None,
+            user_pack_file: None,
+            workspace_pack_file: None,
         }
     }
 
@@ -124,7 +134,42 @@ impl PromptLoader {
         Self {
             user_dir,
             workspace_dir,
+            user_pack_file: None,
+            workspace_pack_file: None,
         }
+    }
+
+    /// Override the auto-discovered pack file paths. Used by
+    /// [`crate::PodFactory`] to surface `<user_manifest_dir>/prompts.toml`
+    /// and `<project>/.insomnia/prompts.toml`.
+    pub fn with_pack_files(
+        mut self,
+        user_pack_file: Option<PathBuf>,
+        workspace_pack_file: Option<PathBuf>,
+    ) -> Self {
+        self.user_pack_file = user_pack_file;
+        self.workspace_pack_file = workspace_pack_file;
+        self
+    }
+
+    /// Root of the `$user` prompt library, if configured.
+    pub fn user_dir(&self) -> Option<&Path> {
+        self.user_dir.as_deref()
+    }
+
+    /// Root of the `$workspace` prompt library, if configured.
+    pub fn workspace_dir(&self) -> Option<&Path> {
+        self.workspace_dir.as_deref()
+    }
+
+    /// Auto-discovered path to the user-layer `prompts.toml` pack, if any.
+    pub fn user_pack_file(&self) -> Option<&Path> {
+        self.user_pack_file.as_deref()
+    }
+
+    /// Auto-discovered path to the workspace-layer `prompts.toml` pack, if any.
+    pub fn workspace_pack_file(&self) -> Option<&Path> {
+        self.workspace_pack_file.as_deref()
     }
 
     /// Parse a string reference into a [`PromptRef`]. Unqualified

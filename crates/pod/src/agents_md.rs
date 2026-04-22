@@ -16,16 +16,17 @@ use tracing::warn;
 /// well within typical provider rate limits.
 pub(crate) const AGENTS_MD_LIMIT: usize = 64 * 1024;
 
-const TRUNCATION_NOTICE: &str = "\n\n[truncated: AGENTS.md exceeded 64KB limit]";
-
 /// Outcome of an `AGENTS.md` ingestion attempt.
 ///
 /// `body` carries the text that should be handed to the template
-/// engine (if any); `warnings` are short human-readable messages that
-/// Pod forwards to the user-facing notification channel. The caller
-/// also gets `tracing::warn!` lines for the developer log.
+/// engine (if any); `truncated` signals that the caller should append
+/// the `PodPrompt::AgentsMdTruncationNotice` text. `warnings` are short
+/// human-readable messages that Pod forwards to the user-facing
+/// notification channel. The caller also gets `tracing::warn!` lines
+/// for the developer log.
 pub(crate) struct AgentsMdResult {
     pub body: Option<String>,
+    pub truncated: bool,
     pub warnings: Vec<String>,
 }
 
@@ -45,6 +46,7 @@ pub(crate) fn read_agents_md(cwd: &Path) -> AgentsMdResult {
         Err(e) if e.kind() == ErrorKind::NotFound => {
             return AgentsMdResult {
                 body: None,
+                truncated: false,
                 warnings,
             };
         }
@@ -53,6 +55,7 @@ pub(crate) fn read_agents_md(cwd: &Path) -> AgentsMdResult {
             warnings.push(format!("failed to open AGENTS.md ({}): {}", path.display(), e));
             return AgentsMdResult {
                 body: None,
+                truncated: false,
                 warnings,
             };
         }
@@ -67,6 +70,7 @@ pub(crate) fn read_agents_md(cwd: &Path) -> AgentsMdResult {
         warnings.push(format!("failed to read AGENTS.md ({}): {}", path.display(), e));
         return AgentsMdResult {
             body: None,
+            truncated: false,
             warnings,
         };
     }
@@ -102,12 +106,12 @@ pub(crate) fn read_agents_md(cwd: &Path) -> AgentsMdResult {
             ));
             return AgentsMdResult {
                 body: None,
+                truncated: false,
                 warnings,
             };
         }
     };
 
-    let mut text = text;
     if truncated {
         warn!(
             path = %path.display(),
@@ -119,11 +123,11 @@ pub(crate) fn read_agents_md(cwd: &Path) -> AgentsMdResult {
             path.display(),
             AGENTS_MD_LIMIT
         ));
-        text.push_str(TRUNCATION_NOTICE);
     }
 
     AgentsMdResult {
         body: Some(text),
+        truncated,
         warnings,
     }
 }
@@ -156,11 +160,10 @@ mod tests {
         fs::write(dir.path().join("AGENTS.md"), &body).unwrap();
 
         let result = read_agents_md(dir.path());
+        assert!(result.truncated);
         let got = result.body.expect("some");
-        assert!(got.ends_with(TRUNCATION_NOTICE));
-        let prefix = got.strip_suffix(TRUNCATION_NOTICE).unwrap();
-        assert_eq!(prefix.len(), AGENTS_MD_LIMIT);
-        assert!(prefix.chars().all(|c| c == 'a'));
+        assert_eq!(got.len(), AGENTS_MD_LIMIT);
+        assert!(got.chars().all(|c| c == 'a'));
         assert_eq!(result.warnings.len(), 1);
     }
 
@@ -171,9 +174,9 @@ mod tests {
         fs::write(dir.path().join("AGENTS.md"), &body).unwrap();
 
         let result = read_agents_md(dir.path());
+        assert!(!result.truncated);
         let got = result.body.expect("some");
         assert_eq!(got.len(), AGENTS_MD_LIMIT);
-        assert!(!got.contains("truncated"));
         assert!(result.warnings.is_empty());
     }
 
@@ -188,12 +191,11 @@ mod tests {
         fs::write(dir.path().join("AGENTS.md"), &body).unwrap();
 
         let result = read_agents_md(dir.path());
+        assert!(result.truncated);
         let got = result.body.expect("some");
-        assert!(got.ends_with(TRUNCATION_NOTICE));
-        let prefix = got.strip_suffix(TRUNCATION_NOTICE).unwrap();
         // The partial 'あ' must have been dropped, leaving only the ASCII prefix.
-        assert_eq!(prefix.len(), AGENTS_MD_LIMIT - 1);
-        assert!(prefix.chars().all(|c| c == 'a'));
+        assert_eq!(got.len(), AGENTS_MD_LIMIT - 1);
+        assert!(got.chars().all(|c| c == 'a'));
         assert_eq!(result.warnings.len(), 1);
     }
 

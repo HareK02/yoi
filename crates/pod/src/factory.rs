@@ -78,6 +78,12 @@ pub struct PodFactory {
     /// `<project_root>/.insomnia/prompts/` — co-located with the
     /// project manifest when loaded.
     project_prompts_dir: Option<PathBuf>,
+    /// `<user_manifest_dir>/prompts.toml`, sibling of the user
+    /// prompts library. Consumed by the prompt catalog's user layer.
+    user_pack_file: Option<PathBuf>,
+    /// `<project_root>/.insomnia/prompts.toml`, sibling of the project
+    /// prompts library. Consumed by the prompt catalog's workspace layer.
+    project_pack_file: Option<PathBuf>,
 }
 
 impl PodFactory {
@@ -97,6 +103,7 @@ impl PodFactory {
             let base = manifest_base(&path)?;
             self.user = Some((read_config_file(&path)?, base.clone()));
             self.user_prompts_dir = Some(base.join("prompts"));
+            self.user_pack_file = Some(base.join("prompts.toml"));
         }
         Ok(self)
     }
@@ -108,6 +115,7 @@ impl PodFactory {
         let base = manifest_base(path)?;
         self.user = Some((read_config_file(path)?, base.clone()));
         self.user_prompts_dir = Some(base.join("prompts"));
+        self.user_pack_file = Some(base.join("prompts.toml"));
         Ok(self)
     }
 
@@ -150,6 +158,7 @@ impl PodFactory {
             .unwrap_or_else(|| insomnia_dir.clone());
         self.project = Some((read_config_file(path)?, project_root));
         self.project_prompts_dir = Some(insomnia_dir.join("prompts"));
+        self.project_pack_file = Some(insomnia_dir.join("prompts.toml"));
         Ok(())
     }
 
@@ -185,7 +194,22 @@ impl PodFactory {
             .as_ref()
             .filter(|p| p.is_dir())
             .cloned();
-        PromptLoader::new(user, project)
+        // Pack file filters: `.is_file()` keeps the loader's view
+        // consistent with the catalog loader, which skips missing packs
+        // silently. An existing but non-file path (e.g. a directory
+        // named `prompts.toml`) is also elided here and will surface
+        // only when a manifest pack explicitly references it.
+        let user_pack = self
+            .user_pack_file
+            .as_ref()
+            .filter(|p| p.is_file())
+            .cloned();
+        let project_pack = self
+            .project_pack_file
+            .as_ref()
+            .filter(|p| p.is_file())
+            .cloned();
+        PromptLoader::new(user, project).with_pack_files(user_pack, project_pack)
     }
 
     /// Merge all installed layers, convert the result to a validated
@@ -640,12 +664,14 @@ permission = "write"
             deny: Vec::new(),
         };
         let scope = Scope::from_config(&scope_cfg).unwrap();
+        let catalog = crate::prompts::PromptCatalog::builtins_only().unwrap();
         let ctx = SystemPromptContext {
             now: chrono::Utc::now(),
             cwd: &root,
             scope: &scope,
             tool_names: Vec::new(),
             agents_md: None,
+            prompts: &catalog,
         };
         let rendered = tmpl.render(&ctx).unwrap();
         assert!(

@@ -11,6 +11,8 @@ use std::sync::{Arc, Mutex};
 use llm_worker::Item;
 use tracing::warn;
 
+use crate::prompts::{CatalogError, PromptCatalog};
+
 /// Maximum queued notifications. Oldest entries are dropped beyond this.
 const CAPACITY: usize = 128;
 
@@ -69,16 +71,15 @@ impl NotificationBuffer {
 }
 
 /// Format a single pending notification into the `Item::system_message`
-/// that gets injected into the per-request context.
-pub(crate) fn format_notification(n: &PendingNotification) -> Item {
-    let text = format!(
-        "[Notification]\n{message}\n\n\
-         This is a notification, not a blocking request. \
-         If you are in the middle of a task, continue your current work \
-         and address this at a natural stopping point.",
-        message = n.message,
-    );
-    Item::system_message(text)
+/// that gets injected into the per-request context. The wrapper body
+/// comes from `PodPrompt::NotifyWrapper` so the surrounding phrasing
+/// can be customised via a prompt pack (translation, tone, ...).
+pub(crate) fn format_notification(
+    n: &PendingNotification,
+    prompts: &PromptCatalog,
+) -> Result<Item, CatalogError> {
+    let text = prompts.notify_wrapper(&n.message)?;
+    Ok(Item::system_message(text))
 }
 
 #[cfg(test)]
@@ -115,7 +116,8 @@ mod tests {
         let n = PendingNotification {
             message: "hello".into(),
         };
-        let item = format_notification(&n);
+        let catalog = PromptCatalog::builtins_only().unwrap();
+        let item = format_notification(&n, &catalog).unwrap();
         let text = item.as_text().unwrap_or_default().to_string();
         assert!(text.contains("[Notification]"));
         assert!(text.contains("hello"));

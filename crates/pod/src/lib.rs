@@ -19,6 +19,7 @@ mod notification_buffer;
 mod pod;
 mod pod_interceptor;
 mod prompt_loader;
+mod prompts;
 mod prune;
 mod system_prompt;
 mod token_counter;
@@ -35,6 +36,7 @@ pub use manifest::{
 };
 pub use pod::{Pod, PodError, PodRunResult, apply_worker_manifest};
 pub use prompt_loader::PromptLoader;
+pub use prompts::{CatalogError, PodPrompt, PromptCatalog};
 pub use protocol::{ErrorCode, Event, Method, TurnResult};
 pub use provider::{ProviderError, build_client};
 pub use runtime_dir::RuntimeDir;

@@ -355,6 +355,7 @@ fn build_overlay_toml(
     let overlay = PodManifestConfig {
         pod: PodMetaConfig {
             name: Some(name.to_string()),
+            prompt_pack: None,
         },
         model: ModelConfigPartial {
             scheme: Some(model.scheme),

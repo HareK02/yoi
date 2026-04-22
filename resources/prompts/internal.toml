@@ -1,0 +1,38 @@
+# Pod internal prompts (builtin pack).
+#
+# Values are minijinja template strings. Use `{% include "$prefix/..." %}`
+# to pull in long text from the $insomnia / $user / $workspace prompt
+# libraries.
+#
+# Every key here MUST correspond to a `PodPrompt` variant; missing or
+# extra keys cause a build-time error (see `crates/pod/build.rs`).
+
+[prompt]
+compact_system = "{% include \"$insomnia/internal/compact_system\" %}"
+
+notify_wrapper = """\
+[Notification]
+{{ message }}
+
+This is a notification, not a blocking request. If you are in the middle of a task, continue your current work and address this at a natural stopping point.\
+"""
+
+interrupt_tool_result_summary = "[Interrupted by user]"
+
+interrupt_system_note = "[The previous turn was interrupted by the user. The user's next request follows.]"
+
+working_boundaries_section = """\
+---
+## Working boundaries
+
+{{ scope_summary }}\
+"""
+
+agents_md_section = """\
+---
+## Project instructions (AGENTS.md)
+
+{{ agents_md }}\
+"""
+
+agents_md_truncation_notice = "\n\n[truncated: AGENTS.md exceeded 64KB limit]"

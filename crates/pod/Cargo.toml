@@ -33,3 +33,6 @@ futures = "0.3.32"
 session-store = { path = "../session-store" }
 tempfile = "3.27.0"
 tokio = { version = "1.49", features = ["macros", "rt-multi-thread", "time"] }
+
+[build-dependencies]
+toml = "1.1.2"

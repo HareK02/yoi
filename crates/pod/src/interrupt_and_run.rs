@@ -14,10 +14,8 @@ use llm_worker::llm_client::client::LlmClient;
 use session_store::Store;
 
 use crate::pod::{Pod, PodError, PodRunResult};
-
-const INTERRUPT_TOOL_RESULT_SUMMARY: &str = "[Interrupted by user]";
-const INTERRUPT_SYSTEM_NOTE: &str =
-    "[The previous turn was interrupted by the user. The user's next request follows.]";
+#[cfg(test)]
+use crate::prompts::PromptCatalog;
 
 impl<C: LlmClient, St: Store> Pod<C, St> {
     /// Close out the current (paused) turn and start a new one with `input`.
@@ -29,19 +27,28 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         &mut self,
         input: impl Into<String>,
     ) -> Result<PodRunResult, PodError> {
-        let closures: Vec<Item> = orphan_tool_result_closures(self.worker().history());
+        let tool_result_summary = self
+            .prompts()
+            .interrupt_tool_result_summary()
+            .map_err(PodError::from)?;
+        let system_note = self
+            .prompts()
+            .interrupt_system_note()
+            .map_err(PodError::from)?;
+
+        let closures: Vec<Item> =
+            orphan_tool_result_closures(self.worker().history(), &tool_result_summary);
         if !closures.is_empty() {
             self.worker_mut().extend_history(closures);
         }
-        self.worker_mut()
-            .push_item(Item::system_message(INTERRUPT_SYSTEM_NOTE));
+        self.worker_mut().push_item(Item::system_message(system_note));
         self.run(input).await
     }
 }
 
 /// Build synthetic `Item::ToolResult` items for every unanswered
 /// `Item::ToolCall` in `history`, preserving order.
-fn orphan_tool_result_closures(history: &[Item]) -> Vec<Item> {
+fn orphan_tool_result_closures(history: &[Item], summary: &str) -> Vec<Item> {
     let mut answered: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for item in history {
         if let Item::ToolResult { call_id, .. } = item {
@@ -52,14 +59,22 @@ fn orphan_tool_result_closures(history: &[Item]) -> Vec<Item> {
     for item in history {
         if let Item::ToolCall { call_id, .. } = item {
             if !answered.contains(call_id.as_str()) {
-                out.push(Item::tool_result(
-                    call_id.clone(),
-                    INTERRUPT_TOOL_RESULT_SUMMARY,
-                ));
+                out.push(Item::tool_result(call_id.clone(), summary));
             }
         }
     }
     out
+}
+
+/// Test-only helper to surface the canonical interrupt tool-result
+/// summary without round-tripping through a Pod — used by tests in
+/// this module that validate the closure logic.
+#[cfg(test)]
+fn interrupt_tool_result_summary() -> String {
+    PromptCatalog::builtins_only()
+        .unwrap()
+        .interrupt_tool_result_summary()
+        .unwrap()
 }
 
 #[cfg(test)]
@@ -72,7 +87,8 @@ mod tests {
             Item::user_message("hi"),
             Item::assistant_message("hello"),
         ];
-        assert!(orphan_tool_result_closures(&history).is_empty());
+        let summary = interrupt_tool_result_summary();
+        assert!(orphan_tool_result_closures(&history, &summary).is_empty());
     }
 
     #[test]
@@ -81,20 +97,24 @@ mod tests {
             Item::tool_call("c1", "Read", "{}"),
             Item::tool_result("c1", "ok"),
         ];
-        assert!(orphan_tool_result_closures(&history).is_empty());
+        let summary = interrupt_tool_result_summary();
+        assert!(orphan_tool_result_closures(&history, &summary).is_empty());
     }
 
     #[test]
     fn unanswered_call_becomes_closure() {
         let history = vec![Item::tool_call("c1", "Read", "{}")];
-        let out = orphan_tool_result_closures(&history);
+        let summary = interrupt_tool_result_summary();
+        let out = orphan_tool_result_closures(&history, &summary);
         assert_eq!(out.len(), 1);
         match &out[0] {
             Item::ToolResult {
-                call_id, summary, ..
+                call_id,
+                summary: got,
+                ..
             } => {
                 assert_eq!(call_id, "c1");
-                assert_eq!(summary, INTERRUPT_TOOL_RESULT_SUMMARY);
+                assert_eq!(got, &summary);
             }
             other => panic!("expected ToolResult, got {other:?}"),
         }
@@ -108,7 +128,8 @@ mod tests {
             Item::tool_result("c1", "ok"),
             Item::tool_call("c3", "Grep", "{}"),
         ];
-        let out = orphan_tool_result_closures(&history);
+        let summary = interrupt_tool_result_summary();
+        let out = orphan_tool_result_closures(&history, &summary);
         let ids: Vec<&str> = out
             .iter()
             .map(|i| match i {

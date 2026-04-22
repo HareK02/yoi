@@ -23,6 +23,7 @@ use crate::notification_buffer::NotificationBuffer;
 use crate::notifier::Notifier;
 use crate::pod_interceptor::PodInterceptor;
 use crate::prompt_loader::PromptLoader;
+use crate::prompts::{CatalogError, PromptCatalog};
 use crate::runtime_dir;
 use crate::scope_lock::{self, ScopeAllocationGuard, ScopeLockError};
 use crate::system_prompt::{SystemPromptContext, SystemPromptError, SystemPromptTemplate};
@@ -46,37 +47,6 @@ impl Hook<PreLlmRequest> for UsageTrackingHook {
         PreRequestAction::Continue
     }
 }
-
-const SUMMARY_SYSTEM_PROMPT: &str = "\
-You are a context compaction assistant. Your job is to hand the next session a \
-structured summary plus pointers to the files it actually needs.\n\n\
-Tools you can call:\n\
-- `read_file(file_path, offset?, limit?)` — inspect referenced files before deciding.\n\
-- `mark_read_required(file_path, offset?, limit?)` — inject a file's contents into the \
-  next session as an auto-read system message. Counts against `auto_read_budget`.\n\
-- `add_reference(file_path)` — record a file path the next session should know about \
-  without embedding its contents.\n\
-- `write_summary(text)` — deliver the final structured summary. May be called multiple \
-  times; only the last call is kept.\n\n\
-Always finish by calling `write_summary`. Produce the summary in this exact format:\n\n\
-## Completed Tasks\n\
-### (task name)\n\
-- what was done (use concrete type / file / function names)\n\
-- gotchas or facts that came up\n\n\
-## Active Task\n\
-### (task name)\n\
-- goal\n\
-- current state (what is done / not done)\n\
-- next step\n\n\
-## Key Decisions\n\
-- (decision) — (reason)\n\n\
-## User Directives\n\
-- \"verbatim user line\" — only include directives whose wording the next session \
-  should not lose.\n\n\
-## Current Work\n\
-(2–3 lines on what was happening just before compaction).\n\n\
-Keep code snippets and raw tool output OUT of the summary — that is what auto-read \
-and references are for. Target 1000–2000 tokens.";
 
 /// An independent agent execution unit.
 ///
@@ -142,6 +112,12 @@ pub struct Pod<C: LlmClient, St: Store> {
     /// `Method::PodEvent` reports upward (turn end, error, shutdown,
     /// scope sub-delegation).
     callback_socket: Option<PathBuf>,
+    /// Central catalog of Pod-level prompt strings (compaction system
+    /// prompt, notification wrapper, interrupt notes, trailing system
+    /// sections, ...). Built from the 4-layer overlay in
+    /// [`Self::from_manifest`], or defaults to the builtin pack when a
+    /// Pod is constructed through lower-level paths that have no loader.
+    prompts: Arc<PromptCatalog>,
 }
 
 impl<C: LlmClient, St: Store> Pod<C, St> {
@@ -166,6 +142,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         // run so a later-installed system-prompt template (see
         // `set_system_prompt_template`) can be captured by `SessionStart`.
         let session_id = session_store::new_session_id();
+        let prompts = PromptCatalog::builtins_only()?;
         let mut pod = Self {
             manifest,
             worker: Some(worker),
@@ -186,6 +163,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             pending_notifications: NotificationBuffer::new(),
             scope_allocation: None,
             callback_socket: None,
+            prompts,
         };
         pod.apply_prune_from_manifest();
         Ok(pod)
@@ -200,6 +178,11 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     }
 
     /// Restore a Pod from a persisted session.
+    /// Shared handle to the prompt catalog. Cheap to clone (`Arc`).
+    pub fn prompts(&self) -> &Arc<PromptCatalog> {
+        &self.prompts
+    }
+
     pub async fn restore(
         session_id: SessionId,
         manifest: PodManifest,
@@ -232,6 +215,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             worker.set_cache_anchor(Some(0));
         }
 
+        let prompts = PromptCatalog::builtins_only()?;
         let mut pod = Self {
             manifest,
             worker: Some(worker),
@@ -252,6 +236,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             pending_notifications: NotificationBuffer::new(),
             scope_allocation: None,
             callback_socket: None,
+            prompts,
         };
         pod.apply_prune_from_manifest();
         Ok(pod)
@@ -513,6 +498,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 compact_state,
                 usage_history_handle,
                 self.pending_notifications.clone(),
+                self.prompts.clone(),
             );
             self.worker_mut().set_interceptor(interceptor);
             self.interceptor_installed = true;
@@ -552,12 +538,24 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 );
             }
         }
+        let agents_md_body = match agents_md_read.body {
+            Some(mut body) if agents_md_read.truncated => {
+                let notice = self
+                    .prompts
+                    .agents_md_truncation_notice()
+                    .map_err(PodError::PromptCatalog)?;
+                body.push_str(&notice);
+                Some(body)
+            }
+            other => other,
+        };
         let ctx = SystemPromptContext {
             now: chrono::Utc::now(),
             cwd: &self.pwd,
             scope: &self.scope,
             tool_names,
-            agents_md: agents_md_read.body,
+            agents_md: agents_md_body,
+            prompts: &self.prompts,
         };
         let rendered = template
             .render(&ctx)
@@ -914,8 +912,12 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         let scoped_fs = tools::ScopedFs::new(self.scope.clone(), self.pwd.clone());
         let summary_tracker = tools::Tracker::new();
         let summary_client: Box<dyn LlmClient> = self.build_compactor_client()?;
+        let summary_system_prompt = self
+            .prompts
+            .compact_system()
+            .map_err(PodError::PromptCatalog)?;
         let mut summary_worker = Worker::new(summary_client)
-            .system_prompt(SUMMARY_SYSTEM_PROMPT)
+            .system_prompt(summary_system_prompt)
             .temperature(0.0);
         summary_worker.set_max_tokens(4096);
 
@@ -1155,9 +1157,11 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
         // runtime values (date, tools, scope summary, ...) can be
         // injected.
         let system_prompt_template = Some(
-            SystemPromptTemplate::parse(&manifest.worker.instruction, loader)
+            SystemPromptTemplate::parse(&manifest.worker.instruction, loader.clone())
                 .map_err(|source| PodError::InvalidSystemPromptTemplate { source })?,
         );
+
+        let prompts = PromptCatalog::load(&loader, manifest.pod.prompt_pack.as_deref())?;
 
         // Session creation is deferred to the first run (see
         // `ensure_session_head`) so the SessionStart entry can capture
@@ -1183,6 +1187,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             pending_notifications: NotificationBuffer::new(),
             scope_allocation: Some(scope_allocation),
             callback_socket: None,
+            prompts,
         };
         pod.apply_prune_from_manifest();
         Ok(pod)
@@ -1218,9 +1223,11 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
         apply_worker_manifest(&mut worker, &manifest.worker);
 
         let system_prompt_template = Some(
-            SystemPromptTemplate::parse(&manifest.worker.instruction, loader)
+            SystemPromptTemplate::parse(&manifest.worker.instruction, loader.clone())
                 .map_err(|source| PodError::InvalidSystemPromptTemplate { source })?,
         );
+
+        let prompts = PromptCatalog::load(&loader, manifest.pod.prompt_pack.as_deref())?;
 
         let session_id = session_store::new_session_id();
         let mut pod = Self {
@@ -1243,6 +1250,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             pending_notifications: NotificationBuffer::new(),
             scope_allocation: Some(scope_allocation),
             callback_socket: Some(callback_socket),
+            prompts,
         };
         pod.apply_prune_from_manifest();
         Ok(pod)
@@ -1425,6 +1433,9 @@ pub enum PodError {
 
     #[error(transparent)]
     ScopeLock(#[from] ScopeLockError),
+
+    #[error(transparent)]
+    PromptCatalog(#[from] CatalogError),
 }
 
 /// Snapshot the process's current working directory as the Pod's pwd,

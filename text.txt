@@ -1,0 +1,4 @@
+test
+line 2
+this is a longer third line written as a single sentence to test editing an existing file in the workspace
+line 4

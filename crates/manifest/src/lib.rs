@@ -13,6 +13,7 @@ pub use scope::{Scope, ScopeError};
 
 use std::collections::HashMap;
 use std::num::NonZeroU32;
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
@@ -36,6 +37,19 @@ pub struct PodManifest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PodMeta {
     pub name: String,
+    /// Optional path to a TOML override file read as the top layer of
+    /// `pod::PromptCatalog`. Subject to the same relative-path
+    /// resolution as other manifest paths (joined against the
+    /// manifest's base directory). `None` leaves the 4th overlay layer
+    /// empty; auto-discovered user and workspace packs still apply.
+    ///
+    /// Note: unlike `worker.instruction`, this is a plain filesystem
+    /// path — not a `$prefix/` prompt reference. Pack files carry
+    /// structured TOML data, while `worker.instruction` points at a
+    /// minijinja `.md` template; the two use different addressing
+    /// conventions on purpose.
+    #[serde(default)]
+    pub prompt_pack: Option<PathBuf>,
 }
 
 /// Worker-level configuration embedded in the manifest.

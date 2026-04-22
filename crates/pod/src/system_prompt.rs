@@ -23,6 +23,7 @@ use minijinja::{Environment, ErrorKind, UndefinedBehavior};
 use thiserror::Error;
 
 use crate::prompt_loader::{LoaderError, PromptLoader, PromptRef};
+use crate::prompts::{CatalogError, PromptCatalog};
 
 #[derive(Debug, Error)]
 pub enum SystemPromptError {
@@ -32,6 +33,8 @@ pub enum SystemPromptError {
     Parse(String),
     #[error("system prompt template render error: {0}")]
     Render(String),
+    #[error("failed to render trailing section template: {0}")]
+    Catalog(#[from] CatalogError),
 }
 
 /// Parsed instruction template bound to a prompt loader.
@@ -114,7 +117,7 @@ impl SystemPromptTemplate {
         let body = tmpl
             .render(ctx.to_minijinja_value())
             .map_err(|e| SystemPromptError::Render(e.to_string()))?;
-        Ok(append_trailing_section(&body, ctx.scope, ctx.agents_md.as_deref()))
+        append_trailing_section(&body, ctx.prompts, ctx.scope, ctx.agents_md.as_deref())
     }
 }
 
@@ -140,6 +143,10 @@ pub struct SystemPromptContext<'a> {
     /// Not visible from the template; consumed by the trailing-section
     /// formatter in [`SystemPromptTemplate::render`].
     pub agents_md: Option<String>,
+    /// Catalog used to render the fixed trailing section headers.
+    /// Passed by reference so callers do not give up ownership across
+    /// the short-lived render borrow.
+    pub prompts: &'a PromptCatalog,
 }
 
 impl<'a> SystemPromptContext<'a> {
@@ -173,33 +180,39 @@ impl<'a> SystemPromptContext<'a> {
 }
 
 /// Build the final system prompt by appending the fixed trailing
-/// section to `body`. Exposed at the module level so callers that skip
-/// the template path (e.g. pre-rendered content in tests) can reuse the
-/// exact same formatter.
-pub fn append_trailing_section(body: &str, scope: &Scope, agents_md: Option<&str>) -> String {
+/// section to `body`. The Rust side owns the layout (blank-line
+/// separators, trailing-whitespace trim); each section's header + body
+/// comes from the prompt catalog (`PodPrompt::WorkingBoundariesSection`
+/// / `PodPrompt::AgentsMdSection`) so that wording can be overridden
+/// per-pack without touching this function.
+pub fn append_trailing_section(
+    body: &str,
+    prompts: &PromptCatalog,
+    scope: &Scope,
+    agents_md: Option<&str>,
+) -> Result<String, SystemPromptError> {
     let mut out = String::with_capacity(body.len() + 256);
     out.push_str(body);
     if !body.ends_with('\n') {
         out.push('\n');
     }
     out.push('\n');
-    out.push_str("---\n## Working boundaries\n\n");
-    out.push_str(&scope.summary());
+
+    let boundaries = prompts.working_boundaries_section(&scope.summary())?;
+    out.push_str(boundaries.trim_end_matches(&['\n', ' '][..]));
     out.push('\n');
     if let Some(agents) = agents_md {
         out.push('\n');
-        out.push_str("---\n## Project instructions (AGENTS.md)\n\n");
-        out.push_str(agents);
-        if !agents.ends_with('\n') {
-            out.push('\n');
-        }
+        let section = prompts.agents_md_section(agents)?;
+        out.push_str(section.trim_end_matches(&['\n', ' '][..]));
+        out.push('\n');
     }
-    // Trim trailing whitespace on the final line so the emitted prompt
-    // has a single canonical form regardless of input quirks.
+    // Canonicalise the tail so the emitted prompt has a single form
+    // regardless of how individual templates chose to end.
     while out.ends_with('\n') || out.ends_with(' ') {
         out.pop();
     }
-    out
+    Ok(out)
 }
 
 /// Bridge used by [`Pod::ensure_system_prompt_materialized`] so tests
@@ -244,7 +257,18 @@ mod tests {
             scope,
             tool_names: tools,
             agents_md,
+            prompts: test_prompts(),
         }
+    }
+
+    /// Lazily-initialised builtin catalog shared across system-prompt
+    /// tests, so every `ctx()` can hand out a `&'static PromptCatalog`
+    /// reference without forcing test bodies to create one per call.
+    fn test_prompts() -> &'static PromptCatalog {
+        use std::sync::OnceLock;
+        static CELL: OnceLock<Arc<PromptCatalog>> = OnceLock::new();
+        CELL.get_or_init(|| PromptCatalog::builtins_only().unwrap())
+            .as_ref()
     }
 
     fn user_loader_with(file_name: &str, body: &str) -> (TempDir, PromptLoader) {
