@@ -34,5 +34,3 @@ agents_md_section = """\
 
 {{ agents_md }}\
 """
-
-agents_md_truncation_notice = "\n\n[truncated: AGENTS.md exceeded 64KB limit]"

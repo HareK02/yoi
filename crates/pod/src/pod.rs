@@ -538,23 +538,12 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 );
             }
         }
-        let agents_md_body = match agents_md_read.body {
-            Some(mut body) if agents_md_read.truncated => {
-                let notice = self
-                    .prompts
-                    .agents_md_truncation_notice()
-                    .map_err(PodError::PromptCatalog)?;
-                body.push_str(&notice);
-                Some(body)
-            }
-            other => other,
-        };
         let ctx = SystemPromptContext {
             now: chrono::Utc::now(),
             cwd: &self.pwd,
             scope: &self.scope,
             tool_names,
-            agents_md: agents_md_body,
+            agents_md: agents_md_read.body,
             prompts: &self.prompts,
         };
         let rendered = template

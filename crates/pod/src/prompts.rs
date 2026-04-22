@@ -75,9 +75,6 @@ pub enum PodPrompt {
     /// Trailing `## Project instructions (AGENTS.md)` section, appended
     /// after the scope summary when an AGENTS.md is present.
     AgentsMdSection,
-    /// Tail note used when AGENTS.md exceeds the byte cap and is
-    /// truncated before being embedded in the system prompt.
-    AgentsMdTruncationNotice,
 }
 
 impl PodPrompt {
@@ -89,7 +86,6 @@ impl PodPrompt {
             Self::InterruptSystemNote => "interrupt_system_note",
             Self::WorkingBoundariesSection => "working_boundaries_section",
             Self::AgentsMdSection => "agents_md_section",
-            Self::AgentsMdTruncationNotice => "agents_md_truncation_notice",
         }
     }
 
@@ -103,7 +99,6 @@ impl PodPrompt {
         PodPrompt::InterruptSystemNote,
         PodPrompt::WorkingBoundariesSection,
         PodPrompt::AgentsMdSection,
-        PodPrompt::AgentsMdTruncationNotice,
     ];
 
     pub const KEYS: &'static [&'static str] = &[
@@ -113,7 +108,6 @@ impl PodPrompt {
         "interrupt_system_note",
         "working_boundaries_section",
         "agents_md_section",
-        "agents_md_truncation_notice",
     ];
 }
 
@@ -323,11 +317,6 @@ impl PromptCatalog {
     pub fn agents_md_section(&self, agents_md: &str) -> Result<String, CatalogError> {
         self.render(PodPrompt::AgentsMdSection, single("agents_md", agents_md))
     }
-
-    /// Render `PodPrompt::AgentsMdTruncationNotice` (no inputs).
-    pub fn agents_md_truncation_notice(&self) -> Result<String, CatalogError> {
-        self.render(PodPrompt::AgentsMdTruncationNotice, Value::UNDEFINED)
-    }
 }
 
 fn single(key: &'static str, value: &str) -> Value {
@@ -474,14 +463,6 @@ mod tests {
         let out = cat.agents_md_section("PROJECT DOCS").unwrap();
         assert!(out.contains("## Project instructions (AGENTS.md)"));
         assert!(out.contains("PROJECT DOCS"));
-    }
-
-    #[test]
-    fn agents_md_truncation_notice_matches_expected_form() {
-        let cat = PromptCatalog::builtins_only().unwrap();
-        let out = cat.agents_md_truncation_notice().unwrap();
-        assert!(out.contains("[truncated: AGENTS.md exceeded 64KB limit]"));
-        assert!(out.starts_with("\n\n"));
     }
 
     #[test]
