@@ -7,8 +7,5 @@
 
 ## 検討事項
 
-- `llm-worker`: LlmClient の mock 実装によるターンループ・ツール実行のテスト
-- `llm-worker-persistence`: FsStore / FsBlobStore のファイルシステムテスト（tempdir）
-- `pod`: PodController / SocketServer の結合テスト
-- `protocol`: シリアライズ/デシリアライズの往復テスト
-- `manifest`: パースのバリエーション（既存テストの拡充）
+低層部分のテストを信頼し、上層までモックデータを引っ張ってきてテストする必要は無いのか？
+実際の認証を使ったE2Eはどの様に結果を出すか？/

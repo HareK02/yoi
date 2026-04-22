@@ -33,6 +33,7 @@ Codex CLI に 2026-03 頃から追加された "Memories" 機能と、2026-04-15
 - `memory_summary.md` を中心に「summaries / durable entries / recent inputs / supporting evidence」の Markdown を束ねる構成。
 - Chronicle 派生メモリは `$CODEX_HOME/memories_extensions/chronicle/` に分離。
 - スクリーンキャプチャ中間物は `$TMPDIR/chronicle/screen_recording/` に置かれ、running 中 6h で自動削除。サーバー側には保存しない（法的義務時を除く）。
+- **Extension resource retention は決定論的 7 日 hard-coded**（`EXTENSION_RESOURCE_RETENTION_DAYS = 7`, `memories/extensions.rs:11`）。filename embedded timestamp (`%Y-%m-%dT%H-%M-%S`) が cutoff より古い `.md` リソースを Phase 2 直前に物理削除し、削除リストを `removed_extension_resources` として consolidation prompt に渡す（agent はそれを見て派生メモリを抹消）。
 
 ### 設定
 
@@ -93,7 +94,7 @@ Shann³ の構成は Karpathy が 2026-04 に公開した `llm-wiki` gist をそ
 - **query**: wiki を検索し citation 付きで答える。意義ある合成は `syntheses/` として保存。
 - **lint**: 矛盾・stale claim・孤立ページ・参照抜け・データ欠落の定期点検。
 
-`SamurAIGPT/llm-wiki-agent` がこのパターンを具体化しており、ディレクトリ構造が示唆的：
+`SamurAIGPT/llm-wiki-agent` がこのパターンを具体化しており、ディレクトリ構造が示唆的（なお `/wiki-lint` のプロダクション実装としては OpenClaw `memory-wiki` extension があり、§4 / §9 で触れる）：
 
 ```
 wiki/
@@ -168,6 +169,7 @@ Self-improving agent を名乗るフレーム。メモリ周りは **3 層 + ク
 
 - `skill_manage` tool: OpenAI function-calling schema。frontmatter YAML 検証、security scan、atomic write (temp + `os.replace()`)
 - `memory` tool: target = `memory | user`、action = `add | replace | remove`。fcntl/msvcrt で file lock、entry-based rewrite
+- **char limit 超過時は `add` を hard reject**（`memory_tool.py:248-259`）。エラーメッセージに `Memory at {current}/{limit} chars. Adding this entry would exceed the limit. Replace or remove existing entries first.` と明記し、LLM 側に「自分で削減してから再追加」を強制する。GC は完全に LLM agentic（決定論的 eviction は無い）、人間 offer や scoring も無い、非常にシンプルな設計
 - FTS5: `messages_fts` virtual table + INSERT/DELETE/UPDATE trigger で auto-sync、CJK は LIKE フォールバック
 
 ### 実装観点
@@ -197,13 +199,14 @@ Self-improving agent を名乗るフレーム。メモリ周りは **3 層 + ク
 - 4 区画: **Message Buffer**（直近）、**Core Memory**（in-context の編集可能 block: user prefs / persona）、**Recall Memory**（全履歴の検索）、**Archival Memory**（ベクトル or グラフ DB に外部化された宣言的知識）。
 - OS メタファ: context window = RAM、外部ストア = Disk。エージェントが function call で階層間を移動させる。
 - memory block = `{label, description, value, char_limit}`。
-- **sleep-time agent** が idle 中に非同期で block を書き換える。
-- context 限界近くで要約による eviction → 再帰要約で古いメッセージを累進圧縮。
+- **sleep-time agent** が idle 中に非同期で block を書き換える。主要 agent と **別 process で並列**に走り、`core_memory_replace` / `core_memory_append` / archival tool 群を呼んで **直接 memory block を書き換える**。主 agent のターン処理をブロックしないため、「mid-session で memory 品質を上げる」のが特徴。
+- context 限界近くで要約による eviction → 再帰要約で古いメッセージを累進圧縮。**eviction 判断は context window fill の決定論的しきい値**で発火するが、要約の内容生成は LLM。evicted message は recursive summary として memory block に残り、古いほど重みが相対的に下がる。
 
 ### Cloudflare Agent Memory (2026-04 Agents Week)
 
 - 分類: **Fact / Event / Instruction / Task**（Task のみベクトル索引除外）。
 - 基盤: Durable Objects（プロファイル毎の SQLite、FTS・supersession chain・tx write を担う）、Vectorize（セマンティック）、Workers AI（Llama 4 Scout: 構造化、Nemotron 3: 自然文合成）。
+- **Supersession chain は決定論的**（公式 blog 再確認）: Fact / Instruction は classification pipeline で **normalized topic key** が振られ、同 key の新 memory が来ると旧 memory を **supersede（物理削除せず forward pointer で版チェーン化）**。LLM 判断は入らない。superseded 側の vector は並行して削除され、新 vector が upsert される。SHA-256 content-addressed ID で `INSERT OR IGNORE` による冪等 dedupe も併用。
 - API:
   ```javascript
   const profile = await env.MEMORY.getProfile("my-project");
@@ -261,6 +264,17 @@ Agent Workspace（`~/.openclaw/workspace/`）構成:
 - **モデルが "覚えている" のはディスクに書かれた内容だけ**、という明示ポリシー。隠れた state 無し
 
 **insomnia にとって重要**: consolidation を LLM 依存から切り離せる見本。narrative は subagent が生成するが、promotion の判断は純機械（scoring）。insomnia の plan では Scope 外（Phase 2 は当面 agent 委任）だが、成熟したカテゴリから決定論的 promotion に差し替える upgrade path の参考になる。
+
+**GC 観点の追加詳細**（`extensions/memory-core/src/short-term-promotion.ts:1518-1652` 実装より）:
+
+- `applyShortTermPromotions()` は **append 専用**。gate 通過候補の snippet を `MEMORY.md` 末尾に `<!-- openclaw-memory-promotion:<hash> --> ` marker 付きで追記するだけで、既存 `MEMORY.md` ブロックの書き換えや削除は一切行わない
+- **重複回避**: marker set を先読みし、既に書かれた key はスキップ
+- **汚染検出**: `isContaminatedDreamingSnippet()` で dreaming narrative prompt が snippet に混入している候補を promotion 前に弾く（再帰汚染防止）
+- **日次ノートの decay は物理削除ではなく search score 減衰のみ**（`memory/temporal-decay.ts`）。`halfLifeDays = 30` で `exp(-ln2/HL * age)` を score に乗じる。対象は `memory/YYYY-MM-DD.md` 形式のファイル限定で、`MEMORY.md` や topic ファイルは evergreen 扱い（減衰しない）
+- **自己参照汚染の退避**: `dreaming-repair.ts` は dreaming narrative が session corpus や `DREAMS.md` に逆流した場合を検出し、該当ファイルを `.openclaw-repair/dreaming/<timestamp>/` に **rename で退避**（削除ではない）。lint と同じく audit-first の GC スタイル
+- `MEMORY.md` 側の GC（重複 block の統合、stale record の drop 等）は **この extension には存在しない**。書き込みは promotion の append のみで、ユーザーが手で消すか `memory-wiki` lint のレポート経由で扱う
+
+OpenClaw は「**削除は人間、script は append と退避まで**」という強い原則が貫かれている。
 
 設計上の示唆:
 
@@ -448,9 +462,108 @@ insomnia で意思決定すべきポイントはこの対応表：
 
 ---
 
-## 8. 未調査 / 次に掘るべき項目
+## 8. GC 機構の横断比較
+
+`docs/plan/memory.md` §GC は「Phase 2 とは別経路で memory を再評価し、drop / merge / split / `replaced` chain 整理を行う」ことを決めた段階で、判断主体と処理種別の仕様をこれから詰める。本節は他プロジェクトの GC 設計を共通の 6 軸で並べて、insomnia で採るべき型の材料とする。
+
+### 8.1 比較表
+
+対象の行は「その system が実装している GC 機構」単位で、同じプロジェクトが複数機構を持つ場合は複数行にした。
+
+| # | プロジェクト / 機構 | 対象 | トリガー | 判断主体 | 処理種別 | 人間介入点 | 履歴保持 |
+|---|---------------------|------|----------|----------|----------|-----------|---------|
+| 1 | Codex Phase 2 consolidation | `MEMORY.md` block / `memory_summary.md` / `skills/*` | session idle + age | **LLM agentic**（sub-agent） | drop / merge / split / rewrite、removed thread id に紐づく block を **部分削除**（block 丸ごとは消さない、thread-local 記述のみ除去） | 無し（`/memories` で thread 単位 opt-out のみ） | git 任意、memory_root は単なる Markdown |
+| 2 | Codex extension resource retention | `memories_extensions/<name>/resources/*.md` | Phase 2 実行直前に cron 相当 | **決定論** | **物理削除** （filename timestamp cutoff） | 無し | 完全消去、Phase 2 prompt に removed list を通知 |
+| 3 | Codex stage1 pruning | `stage1_outputs` SQLite row | Phase 2 後 / 容量超過 | **決定論** | `selected_for_phase2 = 0` の古い row を cutoff + `LIMIT` で DELETE | 無し | SQL 完全削除 |
+| 4 | Hermes `memory` tool | `MEMORY.md` / `USER.md` のエントリ | **char limit (2,200 / 1,375) 超過時の add 拒否** | **LLM agentic**（エラー受けて自分で `replace` / `remove` を呼ぶ） | drop / rewrite | 無し（all-agent） | ディスク消去（file lock で tx 化） |
+| 5 | Hermes background review | entry / skill | turn / iter カウンタ（10 デフォルト） | **LLM agentic**（fork agent、max_iterations = 8） | add / update / delete をレビュー判断、`Nothing to save.` で no-op | 無し | same as 4 |
+| 6 | OpenClaw `applyShortTermPromotions` | promotion candidate → `MEMORY.md` | Deep dreaming phase | **決定論**（6 重み合算 + 3 ゲート、LLM ゼロ） | **append のみ**（`<!-- openclaw-memory-promotion:<hash> -->` marker、既存 block は触らない） | 無し | 追記のみ、削除系統は別 |
+| 7 | OpenClaw temporal decay | `memory/YYYY-MM-DD.md` | search 呼び出し毎 | **決定論** | **物理削除せず search score 減衰**（half-life 30d） | 無し | ファイル残置、検索順位だけ沈む |
+| 8 | OpenClaw dreaming-repair | `DREAMS.md` / session-corpus / session-ingestion | 手動 + audit CLI | **決定論** | **archive 退避**（`.openclaw-repair/dreaming/<timestamp>/` に rename）、完全削除しない | 退避後は手動判断 | archive ディレクトリに rename で保持 |
+| 9 | memory-wiki `/wiki-lint`（OpenClaw extension、SamurAIGPT/llm-wiki-agent と Karpathy llm-wiki の production 実装） | wiki page / claim | `/wiki-lint` 手動 or cron 想定 | **決定論**（issue 検出ロジック） + その後の **human/LLM 任意判断** | **削除ゼロ**、`reports/lint.md` に issue を書き出すのみ。修正は別コマンド / 人間が行う | 全出力点が人間承認 | 原ファイル無変更、report は上書き |
+| 10 | Cloudflare Agent Memory supersession | Fact / Instruction row（Durable Object SQLite） | 新 memory ingest 時 | **決定論**（normalized topic key が一致した瞬間） | **supersede**（旧 row を forward pointer で版チェーン化、物理削除せず）、vector は非同期 delete + new upsert | 無し（全自動） | SQLite に旧版残置、version chain で参照可能 |
+| 11 | Letta sleep-time agent | in-context memory block | 非同期 idle process | **LLM agentic** | `core_memory_replace` / `core_memory_append` / archival 移動で block 書き換え | 無し | 書き換え後の block が保存、旧 block は失われる |
+| 12 | Letta recursive summarization | message buffer | **context window fill の決定論閾値** | 発火は決定論 / 要約内容は LLM | evict + 再帰要約（古いほど重み減） | 無し | 要約に畳み込まれる（原メッセージは消失） |
+| 13 | LinkedIn CMA（公開情報レベル） | Episodic / Semantic / Procedural 各層 | 未公開 | 未公開 | **summarization による compaction**（階層別の drop 仕様は非公開、"cache invalidation is one of the hardest problems" と明示） | **高 stake 用途は human validation** を挟む | 非公開 |
+
+### 8.2 軸別の知見
+
+**対象（何が GC されるか）の粒度差**:
+
+- 最小粒度の Hermes（entry）と Cloudflare（row）は、LLM がエントリ単位で `remove` / `replace` する設計に寄る。
+- 中粒度の Codex（`MEMORY.md` block）は、block 内を thread id で部分削除しながら必要なら split / rewrite する agentic 寄り。
+- 最大粒度の OpenClaw / memory-wiki は **ファイル単位でのみ削除 / 退避** し、file 中身は LLM / 人間に委ねる。`docs/plan/memory.md` の「1 件 1 ファイル」方針とは **OpenClaw の粒度が最も近い**。
+
+**トリガー（いつ GC するか）の 4 パターン**:
+
+1. **容量超過 hard reject**（Hermes）: 追加要求を失敗で返して LLM に自律対処を強制。**決定論的 trigger + agentic 処理**で、設計最小コスト。
+2. **session idle + age**（Codex Phase 2）: 人間の活動終了を待って非同期、最もユーザー体感を壊しにくい。
+3. **cron / scheduled sweep**（OpenClaw dreaming default `0 3 * * *`, Codex extension retention）: 定期的・予測可能。人間 review との組み合わせがしやすい。
+4. **ingest 時の即時**（Cloudflare supersession）: 書き込みの tx 内で完結、後続 GC 走査が要らない。topic key 設計が前提。
+
+insomnia の plan は (2) Phase 2 で rewrite 許可を置きつつ、GC は (3) 方向で別経路という構造。これは Codex / OpenClaw の両方と整合する。
+
+**判断主体の 3 系統**:
+
+- **決定論のみ**: Codex retention / stage1 pruning / OpenClaw temporal decay / Cloudflare supersession / lint 検出。条件がはっきりしているもの（age / key 一致 / 構造的 issue）は決定論が強い。
+- **決定論 scoring → 閾値 gate → 機械適用**: OpenClaw Deep promotion。LLM の揺れを除き、コストも LLM コールゼロ。ただし対象が append 側のみで、削除には使われていない。
+- **LLM agentic**: Codex Phase 2 / Hermes review / Letta sleep-time。判断の柔軟性（block 内部分削除、context 依存の merge）を LLM に委ねる。
+
+`docs/plan/memory.md` は Phase 2 が LLM agentic、GC も暫定的に **LLM agentic + Linter Warn 併用**としている。完全に一致する事例は **Codex Phase 2 の consolidation prompt**（836 行）で、「removed thread id を `MEMORY.md` から部分削除し、blockに他の thread が残っている場合は split / rewrite して保持」という手続きを自然言語で指示している。**insomnia は Linter 側に警告カテゴリ（類似 slug / `replaced` 滞留 / sources 過多 / stale）を先に定義し、GC 実行の agent プロンプトはそれを入力にする**構造が素直。
+
+**処理種別の選択肢**:
+
+- `drop / merge / split / rewrite` の組み合わせは Codex Phase 2 が最も自由度高く、Hermes もそれに近い（entry 粒度）。
+- `replaced` chain の整理は **Cloudflare だけが自動で版チェーン維持**、他は LLM 任せ。insomnia は decision record に `replaced_by` を入れているので、Cloudflare 方式の forward pointer 概念を **人間可読な `replaced_by:` frontmatter** で既に踏襲している。GC 時に chain をどこまで短く畳むか（長大な `a → b → c → d` を `a → d` に圧縮するか）は未決定論点で、Cloudflare は圧縮せず chain を保持する設計。
+- **`split` は Codex だけが明示**。block 内に複数 thread id が混ざった場合に thread id 単位で分ける。insomnia の「1 件 1 ファイル」方針では split = ファイル分割となり、主題の粒度判断は GC agent に委ねる必要がある。
+
+**人間介入点の 3 段**:
+
+- 完全無介入: Codex / Cloudflare / Letta / Hermes
+- audit-first（issue を surface し、人間が決断）: memory-wiki lint / OpenClaw dreaming-repair
+- high-stake 限定 gate: LinkedIn CMA
+
+insomnia の plan は「人間 offer 承認を併用」なので **audit-first に寄る**のが自然。lint 相当の Warn を Linter で出し、LLM Phase 2 / GC がそれを消費する前に人間が承認 / 拒否できる UI を提供する構造。memory-wiki lint は `reports/lint.md` というシンプルな Markdown 出力なので、そのまま `memory/reports/gc-lint.md` 相当を tick off する実装が参考になる。
+
+**履歴保持の 3 モデル**:
+
+1. **物理削除**: Codex retention / stage1 / Hermes / Letta（要約で畳む分は実質消失）
+2. **archive 退避（rename）**: OpenClaw dreaming-repair
+3. **forward pointer / tombstone**: Cloudflare supersession
+
+insomnia は **git 管理下に memory を置く**前提なので、物理削除を選んでも git log で復元できるのが強み。`replaced_by:` frontmatter が forward pointer の役割を果たしているので、Cloudflare 型と git を足した「**現物は物理削除、frontmatter pointer で chain を参照、git で history**」が最も設計コストに合う。archive 退避は git を前提にすると冗長。
+
+### 8.3 insomnia の GC 仕様を詰めるときの示唆
+
+1. **GC trigger は 2 系統に割る**。(a) 決定論: Linter Warn 群 + age / count / size 閾値の sweep、(b) LLM 判定: Phase 2 とは別 prompt で Linter の issue リストを入力に渡す。両方が `memory/reports/gc-*.md` 相当を書き、それを次回の GC run が読む、というフィードバックループが OpenClaw lint / Codex Phase 2 input selection の両方と整合する。
+2. **Linter に「GC 候補検出」カテゴリを足す**。memory-wiki の lint issue code が参考になる: `stale-page`（90d 超）/ `stale-claim` / `low-confidence` / `orphan` / `duplicate-id` / `broken-wikilink` / `contradiction-present` / `open-question`。insomnia 固有の追加候補: `similar-slug`（類似 slug 乱立、既に plan に記載）/ `replaced-chain-long`（`replaced_by` が 3 段以上）/ `sources-overflow`（1 record の sources が閾値超）/ `knowledge-invoke-frequency-low`（`user_invoke` が一定期間ゼロ）。
+3. **処理は rewrite 優先、削除は `status: replaced` 経由**（既に plan 方針と一致）。forward pointer は Cloudflare 流、ただし chain 圧縮ルール（例: 「chain が n 段超えたら中間を drop、端のみ残す」）を決めるかは別論点。Cloudflare は圧縮しない、insomnia は git があるので圧縮してよい。
+4. **char limit は採用しない方が筋が良い**。Hermes の hard limit + LLM self-rewrite は設計最小だが、insomnia は 1 record 1 file なのでファイル内 size 制約は薄く、file 数による grep コストの方が支配的になる。file 数閾値 → GC trigger の方が insomnia の形に合う。
+5. **決定論 scoring を後から差し込む余地を残す**。OpenClaw Deep phase のような「頻度 / 関連度 / 多様性 / 時間減衰 / 整合性 / 概念」の 6 重み + 閾値は、agent LLM の出力が運用で評価可能になった段階で部分的に差し替える upgrade path として最適。初期は Phase 2 LLM + Linter Warn で十分。
+6. **削除は git commit 単位で可逆**という前提を明示する。プロジェクトメモリは git 管理下なので、GC が誤って drop してもユーザーは revert できる。これは Codex が持っていない利点で、GC agent の判断を多少攻めても安全マージンがある。
+
+一次ソース:
+- Codex Phase 2 consolidation: `github.com/openai/codex/codex-rs/core/src/memories/phase2.rs`, `core/templates/memories/consolidation.md`
+- Codex retention / stage1 pruning: `github.com/openai/codex/codex-rs/core/src/memories/extensions.rs:11-139`, `codex-rs/state/src/runtime/memories.rs:290-331, 333-464`
+- Hermes char limit reject: `github.com/NousResearch/hermes-agent/tools/memory_tool.py:211-266`
+- Hermes review spawn: `github.com/NousResearch/hermes-agent/run_agent.py:2727-2830`
+- OpenClaw promotion apply: `github.com/openclaw/openclaw/extensions/memory-core/src/short-term-promotion.ts:1518-1652`
+- OpenClaw temporal decay: `github.com/openclaw/openclaw/extensions/memory-core/src/memory/temporal-decay.ts`
+- OpenClaw dreaming-repair: `github.com/openclaw/openclaw/extensions/memory-core/src/dreaming-repair.ts:70-165`
+- memory-wiki lint: `github.com/openclaw/openclaw/extensions/memory-wiki/src/lint.ts`, `claim-health.ts:6-7`（`WIKI_AGING_DAYS = 30`, `WIKI_STALE_DAYS = 90`）
+- Cloudflare supersession: https://blog.cloudflare.com/introducing-agent-memory/
+- Letta sleep-time: https://docs.letta.com/guides/agents/memory/, https://www.letta.com/blog/sleep-time-compute, arxiv 2504.13171
+- Letta recursive summary: https://www.letta.com/blog/agent-memory
+- Karpathy llm-wiki lint: https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f
+- SamurAIGPT/llm-wiki-agent `/wiki-lint`: https://github.com/SamurAIGPT/llm-wiki-agent
+- LinkedIn CMA: https://www.infoq.com/news/2026/04/linkedin-cognitive-memory-agent/
+
+---
+
+## 9. 未調査 / 次に掘るべき項目
 
 - Letta `memory block` の Rust 実装例・永続化形式。
-- Cloudflare Agent Memory の supersession chain の具体アルゴリズム（記事は概略のみ）。
 - `agentskills.io` の CRDT 的バージョニング方針（標準は version metadata を任意 key にしている。実運用でどう衝突解決するかは未整備）。
 - Hermes の Honcho 連携の実体（外部サービス API 越しの dialectic user modeling、repo には prompt と API 呼び出しのみ）。
+- LinkedIn CMA の層別 GC 仕様（公開情報では compaction-by-summarization までしか開示されていない）。
+- Cloudflare supersession chain の圧縮ポリシー（chain 長の上限、vector GC と row GC の tx 境界）。
