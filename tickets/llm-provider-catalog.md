@@ -100,3 +100,8 @@ Ollama `/api/tags` を叩いてモデル一覧を動的に取る機構は欲し�
 - `crates/provider/src/`: カタログ読取 + `ProviderEntry` 型 + 変換関数を追加
 - `crates/provider/assets/providers.toml`: 新設（builtin カタログ）
 - 他クレートに型は露出するが、既存 API に破壊的変更は入れない
+
+## Review
+- 状態: Approve
+- レビュー詳細: [./llm-provider-catalog.review.md](./llm-provider-catalog.review.md)
+- 日付: 2026-04-23

@@ -11,6 +11,7 @@
 //! このクレートに追加する。
 
 pub mod capability;
+pub mod catalog;
 pub mod codex_oauth;
 
 use std::sync::Arc;
