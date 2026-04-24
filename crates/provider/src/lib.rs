@@ -1,16 +1,19 @@
-//! Pod マニフェストの [`ModelConfig`] を [`Box<dyn LlmClient>`]
+//! Pod マニフェストの [`ModelManifest`] を [`Box<dyn LlmClient>`]
 //! に落とすファクトリ。
 //!
-//! * `SchemeKind` を各 `Scheme` 実装にマップ
-//! * `AuthRef` を環境変数 / ファイルから解決して [`ResolvedAuth`] に
-//! * `scheme.required_auth()` と解決値を照合（非対応組合せは構築エラー）
-//! * `ModelCapability` は明示指定 → scheme 静的テーブル → 未知時はデフォルト
+//! 段階:
+//! 1. `ModelManifest` を [`catalog::resolve_model_manifest`] で
+//!    カタログ込み [`ModelConfig`] に解決（ref → 展開 / inline → 検証）
+//! 2. `AuthRef` を環境変数 / ファイルから解決して [`ResolvedAuth`] に
+//! 3. `scheme.required_auth()` と解決値を照合（非対応組合せは構築エラー）
+//! 4. `ModelCapability` は manifest 明示 > model catalog > provider
+//!    default_capability > scheme 既定 の順でフォールバック（上位 3 段は
+//!    `catalog::resolve_model_manifest` が [`ModelConfig`] に詰め込む）
 //!
 //! llm-worker は低レベル基盤に留める方針なので、高レベル側で必要に
 //! なる認証ストア解決（Codex OAuth の `~/.codex/auth.json` 読取等）は
 //! このクレートに追加する。
 
-pub mod capability;
 pub mod catalog;
 pub mod codex_oauth;
 
@@ -26,7 +29,9 @@ use llm_worker::llm_client::{
     transport::{HttpTransport, ResolvedAuth},
 };
 
-use manifest::{AuthRef, ModelConfig, SchemeKind};
+use manifest::{AuthRef, ModelManifest, SchemeKind};
+
+pub use catalog::{ModelConfig, ResolveError as CatalogResolveError};
 
 /// プロバイダ構築時のエラー。
 #[derive(Debug, thiserror::Error)]
@@ -42,6 +47,9 @@ pub enum ProviderError {
 
     #[error("scheme {scheme:?} is not implemented yet")]
     SchemeNotImplemented { scheme: SchemeKind },
+
+    #[error("failed to resolve model manifest: {0}")]
+    ManifestResolve(#[from] catalog::ResolveError),
 }
 
 /// `AuthRef` をランタイムで使える [`ResolvedAuth`] に解決する。
@@ -111,16 +119,14 @@ fn build_transport<S: Scheme>(
             scheme: config.scheme,
         });
     }
-    // capability の優先順位:
-    //   1. `ModelConfig.capability` の明示指定(OpenAI 互換ルーターの
-    //      未知モデル等、マニフェストで完全に上書きしたいケース)
-    //   2. `provider::capability::lookup` の既知モデルテーブル
-    //      (モデル ID の知識は高レベル構築層(ここ)の責務)
-    //   3. `Scheme::default_capability()`(scheme ごとの wire-level 安全側)
+    // capability の優先順位 (上位 3 段は `ModelConfig` に既に反映済み):
+    //   1. manifest 明示
+    //   2. model catalog
+    //   3. provider.default_capability
+    //   4. `Scheme::default_capability()`（scheme ごとの wire-level 安全側）
     let capability: ModelCapability = config
         .capability
         .clone()
-        .or_else(|| capability::lookup(config.scheme, &config.model_id))
         .unwrap_or_else(|| scheme.default_capability());
     let base_url = effective_base_url(&scheme, config);
     Ok(Box::new(HttpTransport::new(
@@ -132,8 +138,7 @@ fn build_transport<S: Scheme>(
     )))
 }
 
-/// [`ModelConfig`] から [`LlmClient`] を構築する。
-pub fn build_client(config: &ModelConfig) -> Result<Box<dyn LlmClient>, ProviderError> {
+fn build_from_config(config: &ModelConfig) -> Result<Box<dyn LlmClient>, ProviderError> {
     let resolved = resolve_auth(config.scheme, &config.auth)?;
     match config.scheme {
         SchemeKind::Anthropic => build_transport(AnthropicScheme::new(), config, resolved),
@@ -143,6 +148,23 @@ pub fn build_client(config: &ModelConfig) -> Result<Box<dyn LlmClient>, Provider
             build_transport(OpenAIResponsesScheme::new(), config, resolved)
         }
     }
+}
+
+/// [`ModelManifest`] から [`LlmClient`] を構築する。ref / inline の
+/// いずれも受け取り、カタログ解決は内部で行う。
+pub fn build_client(manifest: &ModelManifest) -> Result<Box<dyn LlmClient>, ProviderError> {
+    let config = catalog::resolve_model_manifest(manifest)?;
+    build_from_config(&config)
+}
+
+/// 既に解決済みの [`ModelConfig`] から [`LlmClient`] を構築する。
+/// `ModelManifest` から既に `catalog::resolve_model_manifest` を通した
+/// ケース（factory / spawn 経路でカタログ引きを 1 回だけにしたい等）で
+/// 使う。
+pub fn build_client_from_config(
+    config: &ModelConfig,
+) -> Result<Box<dyn LlmClient>, ProviderError> {
+    build_from_config(config)
 }
 
 #[cfg(test)]
@@ -243,39 +265,45 @@ mod tests {
     fn missing_key_returns_api_key_missing() {
         let env_name = SchemeKind::Anthropic.default_env_var();
         unsafe { std::env::remove_var(env_name) };
-        let result = build_client(&anthropic_config());
+        let result = build_client_from_config(&anthropic_config());
         assert!(matches!(result, Err(ProviderError::ApiKeyMissing { .. })));
     }
 
     #[test]
-    fn model_config_capability_overrides_scheme_default() {
-        // 未知モデル ID でも `ModelConfig.capability` が指定されていれば
-        // scheme の静的テーブル / デフォルトではなくその値が採用される。
-        use llm_worker::llm_client::capability::{
-            CacheStrategy, ModelCapability, ReasoningEffort, ReasoningSupport, StructuredOutput,
-            ToolCallingSupport,
+    fn ref_manifest_builds_client() {
+        // Ollama は AuthRef::None で構築できる end-to-end path。
+        let manifest = ModelManifest {
+            ref_: Some("ollama-local/llama3.1".into()),
+            ..Default::default()
         };
-
-        let explicit = ModelCapability {
-            tool_calling: ToolCallingSupport::Parallel,
-            structured_output: StructuredOutput::JsonSchema,
-            reasoning: Some(ReasoningSupport::Effort),
-            vision: true,
-            prompt_caching: CacheStrategy::Auto,
-        };
-
-        // TOML 経由の往復（`[model.capability]` が正しくパースできる）
-        let toml_str = toml::to_string(&explicit).unwrap();
-        let round_trip: ModelCapability = toml::from_str(&toml_str).unwrap();
-        assert_eq!(round_trip, explicit);
-
-        // `_ = ReasoningEffort` は serde derive が欠けていると失敗する
-        // ほぼ確実なコンパイル時ガード。
-        let _ = ReasoningEffort::Medium;
+        let client = build_client(&manifest);
+        assert!(
+            client.is_ok(),
+            "ollama ref should build without credentials: {:?}",
+            client.err()
+        );
     }
 
     #[test]
-    fn ollama_succeeds_without_key() {
+    fn inline_manifest_builds_client() {
+        // Form C: 完全直書き。Ollama 相当を AuthRef::None で構築。
+        let manifest = ModelManifest {
+            scheme: Some(SchemeKind::Anthropic),
+            base_url: Some("http://localhost:11434".into()),
+            model_id: Some("llama3".into()),
+            auth: Some(AuthRef::None),
+            ..Default::default()
+        };
+        let client = build_client(&manifest);
+        assert!(
+            client.is_ok(),
+            "inline ollama config should build: {:?}",
+            client.err()
+        );
+    }
+
+    #[test]
+    fn ollama_config_succeeds_without_key() {
         // Ollama = Anthropic scheme + base_url 差し替え + AuthRef::None
         let config = ModelConfig {
             scheme: SchemeKind::Anthropic,
@@ -284,8 +312,6 @@ mod tests {
             auth: AuthRef::None,
             capability: None,
         };
-        // scheme.required_auth() が XApiKey でも ResolvedAuth::None は許容する
-        // （None は全 scheme で受け入れるため）
-        assert!(build_client(&config).is_ok());
+        assert!(build_client_from_config(&config).is_ok());
     }
 }

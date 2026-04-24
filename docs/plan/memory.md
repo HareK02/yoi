@@ -19,7 +19,7 @@ Workflow（`/<slug>` で呼び出される制約付き作業フロー）は別 p
 | Always-on サマリ | `memory/summary.md`          | 1-5k tokens 目安                                                                            |
 | Decisions        | `memory/decisions/<slug>.md` | `status: open \| resolved \| replaced` で未決議論も保持、置き換え時は `replaced_by: <slug>` |
 | Requests         | `memory/requests/<slug>.md`  | ユーザー submit の構造化要約                                                                |
-| Knowledge        | `memory/knowledge/<slug>.md` | `#slug` で注入。ノウハウ / 用語 / 運用方針 / ルール / 事実など型を設けず Markdown 自由記述  |
+| Knowledge        | `knowledge/<slug>.md`        | `#slug` で注入。`kind` で大まかな型だけ持ち、本文は Markdown 自由記述 |
 
 - `<slug>` は kebab-case（内容を要約した短い識別子）。**ファイル名そのものが ID**、frontmatter に別途 `id` field は持たない
 - **1 件 1 ファイル**。append-only な複数エントリログファイルは作らない
@@ -35,23 +35,54 @@ agentskills.io の `SKILL.md` 形式は採用しない。Knowledge は `#<slug>`
 
 | フラグ           | 意味                                                    | デフォルト |
 | ---------------- | ------------------------------------------------------- | ---------- |
-| `auto_invoke`    | description が LLM context に載り、LLM が自発的に呼べる | **OFF**    |
+| `model_invokation` | description が model context に載り、モデルが自発的に参照判断できる | **OFF**    |
 | `user_invocable` | ユーザーが `#<slug>` で明示的に呼べる                   | **ON**     |
 
 Knowledge は Phase 2 が自律的に新規作成 / 更新 / フラグ切替を行う前提。毎回の人間承認 gate は設けない（実効性が低い）。保護は 3 段で担保:
 
 - **採択 gate**: Knowledge 新規作成は使用頻度メトリクスの Knowledge 化候補レポート（後述）に載った source から派生する場合に限る。閾値未満のうちは decisions / requests に留める
-- **Linter + 監査 LLM**: 構造違反と意味破壊を watch（詳細は後述）
+- **Linter**: 構造違反を watch（詳細は後述）。意味破壊の自動検出は初期は持たず、挙動を見てから監査 LLM 層を追加する（将来検討）
 - **OS ファイル権限**: 人間が書き換えさせたくない record は `-r--` にしてロック。Phase 2 / GC の write は OS レベルで弾かれる
 
 Workflow も同じフラグ仕様（`workflow.md` 参照）。per-record 保護フラグを提供する拡張は将来検討、初期は OS 権限で足りる。
 
+### retrieval 経路
+
+Knowledge / memory を LLM に渡す経路は以下で固定。採択基準（次節）と表裏で、引ける前提がないと採択しても無意味になる。
+
+- **Knowledge 検索ツール**: frontmatter 含めた全文検索。通常 Pod と Phase 2 Pod の両方に渡す
+  - Input: `query`（自由文字列）。オプションで `slug`（完全一致 1 件返し、`#<slug>` 解決に使う）、`kind` filter
+  - Output: `{ slug, kind, description, model_invokation, excerpt }` の配列。`excerpt` はマッチ箇所の前後数行
+  - 対象は `knowledge/*.md`。派生 index ファイルは持たず実ファイルを都度スキャン
+  - ソートは初期 grep の出現順、FTS / vector 導入時に関連度へ切り替え（将来検討）
+  - ヒット件数上限と excerpt 行数は設定で tune
+- **memory 検索ツール**: `memory/{summary,decisions,requests}/*.md` 対象。spec は Knowledge 検索ツールと同型。§使用頻度メトリクスの観測経路と同一視する
+- **更新は既定の汎用 CRUD + Linter**: Knowledge / memory とも §書き込み経路と Linter の汎用 CRUD tool + post-write Linter Hook で済ませる。専用の create/update ツールは作らない
+- **常駐注入**: メモリを消費する主体は通常 Pod。`model_invokation: ON` な record の description を通常 Pod の system prompt に常駐注入する。Phase 2 prompt には入れない
+  - 予算はシステムプロンプト全体の予算に含める（`memory_summary.md` の 5k 枠とは別管理にしない）
+  - 超過時の件数キャップ / 優先順位ルールは、description 1024 chars 上限で通常は収まる前提。ON record 数が増えたら追加する
+- **Phase 2 の Knowledge アクセス**: 全 Knowledge 本文を prompt に埋めず、Knowledge 検索ツール + 汎用 CRUD を agent に渡して自律探索させる（詳細は §Phase 2）
+- **`#<slug>` 補完 / 自動呼び出し（大枠のみ、実装は段階的）**:
+  - `#<slug>` は検索ツールの slug 完全一致経路で本文が展開される
+  - 補完 UI（slug サジェスト）は TUI 側。`user_invocable: false` は候補除外
+  - 自動呼び出しは、常駐注入された description をモデルが見て必要と判断すれば検索ツールを呼ぶ形で成立する。専用の auto-invoke 経路は別途用意しない
+
+### Knowledge の採択基準
+
+Knowledge は「保存する価値があるか」だけでなく、「あとで見つけて再利用できるか」で評価する。最低限の基準は以下:
+
+- **slug は入口**。短く、何の知識か推測でき、`#<slug>` や検索で指名しやすいものを優先する
+- **description は discovery 面そのもの**。本文の要約ではなく、「何の知識で、どんな時に読むべきか」を短く示す
+- **1 file = 1 主題**。description だけで対象範囲が分かる粒度に寄せる。細分化しすぎる slug 乱立も避ける
+- **update 優先**。新情報は既存 slug に畳み込み、自然な適合先がない時だけ新規 slug を作る
+- **昇格ライン**は「このプロジェクト / ユーザーで再度参照する価値のある事実・ルール・ノウハウ」。一回限りの判断や議論は decisions / requests に留める
+- **`model_invokation` ON は別判断**。重要度だけでなく、description だけで「どんな時に読むべきか」が伝わるものに限る
+
 ### 書き込み経路と Linter
 
-人間も consolidation sub-Worker も**同じ CRUD tool（file read / write / edit）**で `memory/*` を触る。書き込み時の制約は 2 層で検証し、違反時は post-write Hook が turn を戻して sub-Worker に自己修正させる（N 回失敗で abort）:
+人間も consolidation sub-Worker も**同じ CRUD tool（file read / write / edit）**で `memory/*` を触る。書き込み時の制約は静的 Linter で検証し、違反時は post-write Hook が turn を戻して sub-Worker に自己修正させる（N 回失敗で abort）。Linter は frontmatter / slug / 参照整合などの機械的ルールを見る。
 
-1. **Linter（静的）**: frontmatter / slug / 参照整合などの機械的ルール
-2. **監査 LLM（意味的）**: rewrite が元の情報を壊していないかを別 prompt で check。特に Knowledge の意味損壊を watch する主経路
+意味破壊（rewrite で既存の主張・根拠が落ちる、Knowledge の記述主題がズレる等）の自動検出は初期範囲に含めない。Phase 2 prompt 側の情報損失最小化指示と git diff レビューで運用し、実使用で顕在化したら監査 LLM 層を後から挟む（将来検討）。
 
 Linter ルールは 2 系統:
 
@@ -59,14 +90,14 @@ Linter ルールは 2 系統:
 
 - frontmatter 必須 field
   - Decisions / Requests: `created_at`, `updated_at`, `sources`
-  - Knowledge: `description`, `auto_invoke`, `user_invocable`, `last_sources`, `created_at`, `updated_at`
+  - Knowledge: `kind`, `description`, `model_invokation`, `user_invocable`, `last_sources`, `created_at`, `updated_at`
   - Summary: `updated_at`（optional: `last_rewritten_from_range`）
 - `memory/workflow/` への書き込み禁止（sub-Worker context のみ、人間編集は除外）
 - 同 slug での新規作成禁止（既存があれば update に切り替えるサイン）
 - `#<slug>` 参照が実在ファイルを指す
 - `replaced_by: <slug>` が実在 record を指す
 - Decisions の `status` は enum `open | resolved | replaced`
-- `auto_invoke: true` の record は description 文字数上限（agentskills 準拠 1024 chars）
+- `model_invokation: true` の record は description 文字数上限（agentskills 準拠 1024 chars）
 - 種別ごとの char 硬上限（具体値は運用で調整、設定ファイルで tune）
 
 **膨張抑制 Warn**（error ではなく改善ヒント、sub-Worker は task 余力があれば対応）:
@@ -100,12 +131,12 @@ Workflow 保護は専用 tool schema のトリックではなく Linter ルー�
 
 - **Trigger**: staging の累積ファイル数 or bytes が閾値超過、または compact 発火時（必ず flush）
 - **実行主体**: Phase 1 を終えた pod が consolidation Worker を spawn。並走防止は staging 配下の進行状況ファイル（後述）で担保
-- **入力**: 起動時スナップショットで確定した consumed ID list 分の staging エントリ（活動ログ + `source`）+ 既存 `memory/*`（summary / decisions / requests / knowledge）+ **Knowledge 化候補レポート**（後述の使用頻度メトリクスから機械集計、閾値超過の source 一覧）
-- **処理**: sub-Worker に**汎用 CRUD tool（file read / write / edit）+ post-write Linter Hook** を渡し、agentic に以下を自律判断:
+- **入力**: 起動時スナップショットで確定した consumed ID list 分の staging エントリ（活動ログ + `source`）+ 既存 `memory/*`（summary / decisions / requests）の全文 + **Knowledge 化候補レポート**（後述の使用頻度メトリクスから機械集計、閾値超過の source 一覧）。既存 `knowledge/*` は全文を prompt に埋めず、Knowledge 検索ツール経由で agent が必要分を引く
+- **処理**: sub-Worker に**汎用 CRUD tool（file read / write / edit）+ Knowledge 検索ツール + memory 検索ツール + post-write Linter Hook** を渡し、agentic に以下を自律判断:
   - 新規 decisions / requests を 1 件 1 ファイルで追加。`sources` は staging の `source` をコピー（LLM 推論ではない）
-  - 活動ログから派生する Knowledge（用語定義 / 運用方針 / ルール / 事実 / ノウハウ）を新規作成 or 既存 patch。**新規作成は候補レポート掲載の source から派生する場合に限る**。`last_sources` を更新
+  - 活動ログから派生する Knowledge（用語定義 / 運用方針 / ルール / 事実 / ノウハウ）を新規作成 or 既存 patch。**新規作成は候補レポート掲載の source から派生する場合に限る**。`kind` を frontmatter に持ち、`last_sources` を更新
   - summary を必要に応じて rewrite
-- **書き込み先**: `memory/*` 配下。Workflow 禁止は Linter で担保（`workflow.md` 参照）
+- **書き込み先**: `memory/*` と `knowledge/*`。Workflow 禁止は Linter で担保（`workflow.md` 参照）
 - **完了処理**: consumed ID list の staging のみ cleanup（実行中に Phase 1 が追加した分は残す）。Phase 2 完了時に staging に新着があれば次を発火（Coalesce）
 - **モデル**: `memory.consolidation_model`。reasoning 系
 
@@ -126,13 +157,14 @@ Workflow 保護は専用 tool schema のトリックではなく Linter ルー�
 - **rewrite は許可**。既存内容と新規情報を統合・再構成して情報密度を上げることを優先。単純 append（追記で増やすだけ）は避ける
 - rewrite 時は**情報損失を最小化**する: 既存の主張・根拠・sources を保持。表現を整理・短縮しても、含まれている要素は落とさない
 - 削除は置き換え記録（`status: replaced` + `replaced_by: <slug>`）で表現、直接削除しない
+- Knowledge は既存 record 群の slug / description / kind / `model_invokation` を入口に適合先を探し、自然に統合できるなら新規 slug を増やさない
 - 人間編集は git diff で顕在化する前提。整合しない rewrite は避け、衝突時は git で解決
 
 #### Offer 経路
 
 Memory record の書き込みは Phase 2 が自律判断し、Offer は設けない（Knowledge 含む）。人間承認経路が必要なのは以下:
 
-- Workflow 関連の offer（新規作成 / 改善 / `auto_invoke` ON 化）は `workflow.md` 参照
+- Workflow 関連の offer（新規作成 / 改善 / `model_invokation` ON 化）は `workflow.md` 参照
 
 #### Compact との関係
 
@@ -146,7 +178,7 @@ Phase 2 とは別経路で memory を再評価する定期ジョブ。Phase 2 �
 - 類似 slug が乱立する（Linter Warn で検出したものをまとめて処理）
 - `replaced` が溜まり続けて grep / 注入時のノイズになる
 - sources 累積
-- 長期的に陳腐化した記録の drop
+- 現状と不整合になった record、実質的に置き換え済みの record、使われていない record、形がノイズ化した record の整理
 
 他プロジェクトの GC 設計の横断比較は `docs/ref/memory-systems.md` §8。
 
@@ -159,16 +191,27 @@ GC Agent は **drop / merge / split を自律実行**（削除まで含む）。
 
 Phase 2 と同じ CRUD tool + Linter Hook を使うので、operation 粒度は自然にサポートされる（専用 API は用意しない）。
 
+#### GC の評価カテゴリ
+
+GC は record を一律に「stale」とみなさず、少なくとも次の 4 カテゴリで評価する:
+
+- `outdated`: 以前は妥当だったが、現在の実装・方針・運用と不整合になっている
+- `superseded`: 別 record が実質的な正本になっており、元の record は置き換え済みに近い
+- `unused`: 誤りではないが、明示 invoke や検索でほとんど参照されずノイズ化している
+- `noisy`: 内容自体は有効でも、粒度・重複・冗長さ・sources 過多などで discovery / retrieval を悪化させている
+
+これらは **保護条件ではなく GC 理由の分類**。保護条件は別に持ち、その上で `drop / merge / split / trim / rewrite` のどれを選ぶかをこのカテゴリで説明可能にする。
+
 #### 使用頻度メトリクス
 
 時間単位は実時間を使わない（LLM スループット向上で陳腐化の意味が変わるため）、累積 input token で正規化する。
 
-**観測経路**: `memory/*` への読み取りは専用の memory 検索ツール（既存 built-in の grep / read とは別に用意）経由に揃える。invoke 計測はツール内でフックし、`#<slug>` / `/<slug>` / 明示検索呼び出しを同一経路に集約する。
+**観測経路**: `memory/*` / `knowledge/*` への読み取りは §retrieval 経路 で定義した memory 検索ツール / Knowledge 検索ツール（既存 built-in の grep / read とは別に用意）経由に揃える。invoke 計測はツール内でフックし、`#<slug>` / `/<slug>` / 明示検索呼び出しを同一経路に集約する。
 
 **カウント対象**:
 
 - **明示 invoke**: 検索ツール経由の読み取り / `#<slug>` / `/<slug>` を n回/Mtoken でスコア化
-- **auto_invoke 注入**: 注入は context 常駐コストで、「載っているだけ」か「使われた」かを統計上区別不能。明示 invoke の分子には含めず、**コスト側（注入した record に対する消費 input tokens）として別途記録**する。使われ率 ratio や ON/OFF 判断の材料として後段で使う
+- **`model_invokation` 注入**: 注入は context 常駐コストで、「載っているだけ」か「使われた」かを統計上区別不能。明示 invoke の分子には含めず、**コスト側（注入した record に対する消費 input tokens）として別途記録**する。使われ率 ratio や ON/OFF 判断の材料として後段で使う
 - ファイル token 数
 
 **記録先**: staging とは独立。invoke event を UUID + Stats 形式で workspace 側に記録し、session データが失われても統計が残るようにする。具体 schema・フォーマットは未定。
@@ -179,7 +222,8 @@ Phase 2 と同じ CRUD tool + Linter Hook を使うので、operation 粒度は�
 
 #### 判断ルール
 
-- 保護閾値: **明示 invoke** の `frequency >= 1.0 invokes/Mtoken` の record は drop / 大幅圧縮の対象外（初期値 1.0、workspace 設定でカスタマイズ可）。auto_invoke 注入による常駐は計数対象外（別指標として後段で参照）
+- 保護閾値: **明示 invoke** の `frequency >= 1.0 invokes/Mtoken` の record は drop / 大幅圧縮の対象外（初期値 1.0、workspace 設定でカスタマイズ可）。`model_invokation` 注入による常駐は計数対象外（別指標として後段で参照）
+- GC の評価カテゴリは `outdated | superseded | unused | noisy` を使う。単一 record が複数カテゴリに該当してもよい
 
 ### ファイル形式
 
@@ -189,7 +233,8 @@ Phase 2 と同じ CRUD tool + Linter Hook を使うので、operation 粒度は�
   - Decisions / Requests: `sources: [{session_id, range: [start, end]}, ...]` 永続化（update 時は追記累積）
   - Knowledge: `last_sources: [{session_id, range}, ...]`（最新更新時のみ、過去履歴は git log で追う）
   - Summary: optional `last_rewritten_from_range`（なしでも可）
-- Knowledge 固有: `description`, `auto_invoke`, `user_invocable`
+- Knowledge 固有: `kind`, `description`, `model_invokation`, `user_invocable`
+- Knowledge の保存先は `knowledge/<slug>.md`。`memory/` とは兄弟ディレクトリに分ける
 - Decisions 固有: `status: open | resolved | replaced`、置き換え時は `replaced_by: <slug>`
 - Phase 1 staging: `memory/_staging/<id>.json`（JSON、1 件 1 ファイル、Phase 2 完了で削除。短命なので UUIDv7 可）。pod 側ラッパーが `source` を機械付与して LLM 出力と wrap
 - Workflow の frontmatter は `workflow.md` 参照
@@ -200,8 +245,9 @@ Phase 2 と同じ CRUD tool + Linter Hook を使うので、operation 粒度は�
 
 ### 将来検討（運用で必要性が見えたら追加）
 
+- 監査 LLM 層（意味破壊検出）の導入 — 初期は静的 Linter のみで運用し、Phase 2 の rewrite で情報損失・主題ズレが実運用で顕在化したら post-write Hook の 2 層目として追加。入力 / check 項目 / pass-fail 返却形式は導入時に詰める
 - Vector index / FTS5 等の検索索引 — 初期は grep で足りる想定。ファイル数増加で検索が重くなったら検討
-- `auto_invoke` offer の自動判定ロジック — 初期は人間が手動で切り替え
+- `model_invokation` offer の自動判定ロジック — 初期は人間が手動で切り替え
 - 過去 session を cross-session で検索する UI
 - Phase 2 を担う常駐 daemon 化 — オンデマンド + lock 方式で始める。必要性が出たら upgrade path として daemon 化
 - Deterministic promotion（OpenClaw 型 scoring + ゲート）— 初期は Phase 2 agent の LLM 判断に委ねる。運用実績で出力を評価してから、成熟カテゴリから scoring 導入

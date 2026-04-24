@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::defaults;
-use crate::model::{AuthRef, ModelConfig, SchemeKind};
+use crate::model::{AuthRef, ModelManifest};
 use crate::{CompactionConfig, PodManifest, PodMeta, ScopeConfig, ToolOutputLimits, WorkerManifest};
 
 /// Partial-form Pod manifest. Every field is optional; one or more
@@ -23,8 +23,12 @@ use crate::{CompactionConfig, PodManifest, PodMeta, ScopeConfig, ToolOutputLimit
 pub struct PodManifestConfig {
     #[serde(default)]
     pub pod: PodMetaConfig,
+    /// `[model]` セクションは partial でも完成形でも同じ
+    /// [`ModelManifest`] を使う。ref / inline の両形を受け入れるための
+    /// 全 Optional 構造なので、カスケード層と最終マニフェストで型を
+    /// 分ける必要がない。
     #[serde(default)]
-    pub model: ModelConfigPartial,
+    pub model: ModelManifest,
     #[serde(default)]
     pub worker: WorkerManifestConfig,
     #[serde(default)]
@@ -42,21 +46,6 @@ pub struct PodMetaConfig {
     /// are resolved through [`PodManifestConfig::resolve_paths`].
     #[serde(default)]
     pub prompt_pack: Option<PathBuf>,
-}
-
-/// Partial-form of [`ModelConfig`]. カスケード層で個別に与えられる。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ModelConfigPartial {
-    #[serde(default)]
-    pub scheme: Option<SchemeKind>,
-    #[serde(default)]
-    pub base_url: Option<String>,
-    #[serde(default)]
-    pub model_id: Option<String>,
-    #[serde(default)]
-    pub auth: Option<AuthRef>,
-    #[serde(default)]
-    pub capability: Option<crate::model::ModelCapability>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -98,7 +87,7 @@ pub struct CompactionConfigPartial {
     #[serde(default)]
     pub compact_worker_max_input_tokens: Option<u64>,
     #[serde(default)]
-    pub model: Option<ModelConfigPartial>,
+    pub model: Option<ModelManifest>,
 }
 
 /// Errors raised when converting a [`PodManifestConfig`] to a validated
@@ -209,18 +198,6 @@ impl PodMetaConfig {
     }
 }
 
-impl ModelConfigPartial {
-    fn merge(self, upper: Self) -> Self {
-        Self {
-            scheme: upper.scheme.or(self.scheme),
-            base_url: upper.base_url.or(self.base_url),
-            model_id: upper.model_id.or(self.model_id),
-            auth: upper.auth.or(self.auth),
-            capability: upper.capability.or(self.capability),
-        }
-    }
-}
-
 impl WorkerManifestConfig {
     fn merge(self, upper: Self) -> Self {
         Self {
@@ -262,7 +239,7 @@ impl CompactionConfigPartial {
             compact_worker_max_input_tokens: upper
                 .compact_worker_max_input_tokens
                 .or(self.compact_worker_max_input_tokens),
-            model: merge_option(self.model, upper.model, ModelConfigPartial::merge),
+            model: merge_option(self.model, upper.model, ModelManifest::merge),
         }
     }
 }
@@ -303,34 +280,21 @@ fn ensure_absolute(field: &'static str, path: &Path) -> Result<(), ResolveError>
     }
 }
 
-fn resolve_model(
-    cfg: ModelConfigPartial,
-    scheme_field: &'static str,
-    model_id_field: &'static str,
-    auth_file_field: &'static str,
-) -> Result<ModelConfig, ResolveError> {
-    let scheme = cfg.scheme.ok_or(ResolveError::MissingField(scheme_field))?;
-    let model_id = cfg
-        .model_id
-        .ok_or(ResolveError::MissingField(model_id_field))?;
-    let auth = cfg.auth.unwrap_or_default();
-    if let AuthRef::ApiKey { file: Some(p), .. } = &auth {
-        ensure_absolute(auth_file_field, p)?;
-    }
-    Ok(ModelConfig {
-        scheme,
-        base_url: cfg.base_url,
-        model_id,
-        auth,
-        capability: cfg.capability,
-    })
-}
-
 /// `AuthRef::ApiKey { file, .. }` が相対パスのとき `base` を前置する。
 fn resolve_auth_file(auth: &mut Option<AuthRef>, base: &Path) {
     if let Some(AuthRef::ApiKey { file: Some(p), .. }) = auth.as_mut() {
         *p = join_if_relative(base, p);
     }
+}
+
+/// モデル宣言に含まれる `auth.file` が絶対パスであることを検証する。
+/// ref / scheme / model_id 等の論理的な有効性（ref があるか、inline が
+/// 揃っているか）の検証はカタログを知る `crates/provider` 側で行う。
+fn validate_model_paths(model: &ModelManifest, field: &'static str) -> Result<(), ResolveError> {
+    if let Some(AuthRef::ApiKey { file: Some(p), .. }) = &model.auth {
+        ensure_absolute(field, p)?;
+    }
+    Ok(())
 }
 
 impl TryFrom<PodManifestConfig> for PodManifest {
@@ -346,12 +310,7 @@ impl TryFrom<PodManifestConfig> for PodManifest {
             ensure_absolute("pod.prompt_pack", p)?;
         }
 
-        let model = resolve_model(
-            cfg.model,
-            "model.scheme",
-            "model.model_id",
-            "model.auth.file",
-        )?;
+        validate_model_paths(&cfg.model, "model.auth.file")?;
 
         let worker = WorkerManifest {
             instruction: cfg
@@ -384,17 +343,9 @@ impl TryFrom<PodManifestConfig> for PodManifest {
         let compaction = cfg
             .compaction
             .map(|c| -> Result<CompactionConfig, ResolveError> {
-                let comp_model = c
-                    .model
-                    .map(|p| {
-                        resolve_model(
-                            p,
-                            "compaction.model.scheme",
-                            "compaction.model.model_id",
-                            "compaction.model.auth.file",
-                        )
-                    })
-                    .transpose()?;
+                if let Some(ref cm) = c.model {
+                    validate_model_paths(cm, "compaction.model.auth.file")?;
+                }
                 Ok(CompactionConfig {
                     prune_protected_turns: c
                         .prune_protected_turns
@@ -413,14 +364,14 @@ impl TryFrom<PodManifestConfig> for PodManifest {
                     compact_worker_max_input_tokens: c
                         .compact_worker_max_input_tokens
                         .unwrap_or(defaults::COMPACT_WORKER_MAX_INPUT_TOKENS),
-                    model: comp_model,
+                    model: c.model,
                 })
             })
             .transpose()?;
 
         Ok(PodManifest {
             pod: PodMeta { name, prompt_pack },
-            model,
+            model: cfg.model,
             worker,
             scope: cfg.scope,
             compaction,
@@ -431,6 +382,7 @@ impl TryFrom<PodManifestConfig> for PodManifest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::SchemeKind;
     use crate::{Permission, ScopeRule};
 
     fn abs(path: &str) -> PathBuf {
@@ -450,7 +402,7 @@ mod tests {
                 name: Some("test".into()),
                 prompt_pack: None,
             },
-            model: ModelConfigPartial {
+            model: ModelManifest {
                 scheme: Some(SchemeKind::Anthropic),
                 model_id: Some("claude-sonnet-4-20250514".into()),
                 ..Default::default()
@@ -472,7 +424,7 @@ mod tests {
     fn resolve_minimal_succeeds() {
         let manifest: PodManifest = minimal_valid().try_into().unwrap();
         assert_eq!(manifest.pod.name, "test");
-        assert_eq!(manifest.model.scheme, SchemeKind::Anthropic);
+        assert_eq!(manifest.model.scheme, Some(SchemeKind::Anthropic));
     }
 
     #[test]
@@ -570,7 +522,7 @@ mod tests {
                 name: Some("lower".into()),
                 prompt_pack: None,
             },
-            model: ModelConfigPartial {
+            model: ModelManifest {
                 model_id: Some("lower-model".into()),
                 ..Default::default()
             },
@@ -743,7 +695,7 @@ permission = "write"
                 name: Some("x".into()),
                 prompt_pack: None,
             },
-            model: ModelConfigPartial {
+            model: ModelManifest {
                 scheme: Some(SchemeKind::Anthropic),
                 model_id: Some("m".into()),
                 ..Default::default()
@@ -796,7 +748,32 @@ name = "dbg"
         let merged = builtin.merge(user).merge(project).merge(overlay);
         let manifest: PodManifest = merged.try_into().unwrap();
         assert_eq!(manifest.pod.name, "dbg");
-        assert_eq!(manifest.model.scheme, SchemeKind::Anthropic);
+        assert_eq!(manifest.model.scheme, Some(SchemeKind::Anthropic));
         assert_eq!(manifest.scope.allow.len(), 1);
+    }
+
+    #[test]
+    fn merge_preserves_ref() {
+        let lower = PodManifestConfig {
+            model: ModelManifest {
+                ref_: Some("anthropic/claude-sonnet-4-6".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let upper = PodManifestConfig {
+            model: ModelManifest {
+                // only override auth
+                auth: Some(AuthRef::None),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let merged = lower.merge(upper);
+        assert_eq!(
+            merged.model.ref_.as_deref(),
+            Some("anthropic/claude-sonnet-4-6")
+        );
+        assert_eq!(merged.model.auth, Some(AuthRef::None));
     }
 }

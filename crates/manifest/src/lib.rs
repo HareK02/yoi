@@ -4,10 +4,10 @@ mod model;
 mod scope;
 
 pub use config::{
-    CompactionConfigPartial, ModelConfigPartial, PodManifestConfig, PodMetaConfig, ResolveError,
+    CompactionConfigPartial, PodManifestConfig, PodMetaConfig, ResolveError,
     ToolOutputLimitsPartial, WorkerManifestConfig,
 };
-pub use model::{AuthRef, ModelConfig, SchemeKind};
+pub use model::{AuthRef, ModelCapability, ModelManifest, SchemeKind};
 pub use protocol::{Permission, ScopeRule};
 pub use scope::{Scope, ScopeError};
 
@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PodManifest {
     pub pod: PodMeta,
-    pub model: ModelConfig,
+    pub model: ModelManifest,
     pub worker: WorkerManifest,
     pub scope: ScopeConfig,
     #[serde(default)]
@@ -191,7 +191,7 @@ pub struct CompactionConfig {
     /// Optional model for the compactor (summary) LLM.
     /// If omitted, the main model is cloned via `clone_boxed()`.
     #[serde(default)]
-    pub model: Option<ModelConfig>,
+    pub model: Option<ModelManifest>,
 }
 
 fn default_prune_protected_turns() -> usize {
@@ -255,9 +255,12 @@ permission = "write"
     fn parse_minimal_manifest() {
         let manifest = PodManifest::from_toml(MINIMAL_REQUIRED).unwrap();
         assert_eq!(manifest.pod.name, "test-agent");
-        assert_eq!(manifest.model.scheme, SchemeKind::Anthropic);
-        assert_eq!(manifest.model.model_id, "claude-sonnet-4-20250514");
-        assert_eq!(manifest.model.auth, AuthRef::None);
+        assert_eq!(manifest.model.scheme, Some(SchemeKind::Anthropic));
+        assert_eq!(
+            manifest.model.model_id.as_deref(),
+            Some("claude-sonnet-4-20250514")
+        );
+        assert!(manifest.model.auth.is_none());
         assert_eq!(manifest.scope.allow.len(), 1);
         assert!(manifest.scope.deny.is_empty());
         assert_eq!(manifest.worker.instruction, defaults::DEFAULT_INSTRUCTION);
@@ -294,8 +297,8 @@ permission = "write"
 "#;
         let manifest = PodManifest::from_toml(toml).unwrap();
         assert_eq!(manifest.pod.name, "code-reviewer");
-        let file = match &manifest.model.auth {
-            AuthRef::ApiKey { file, .. } => file.as_deref(),
+        let file = match manifest.model.auth.as_ref() {
+            Some(AuthRef::ApiKey { file, .. }) => file.as_deref(),
             _ => panic!("expected ApiKey"),
         };
         assert_eq!(file, Some(std::path::Path::new("/abs/keys/anthropic")));
@@ -398,8 +401,8 @@ model_id = "claude-sonnet-4-20250514"
         let manifest = PodManifest::from_toml(&toml).unwrap();
         let c = manifest.compaction.unwrap();
         let p = c.model.unwrap();
-        assert_eq!(p.scheme, SchemeKind::Gemini);
-        assert_eq!(p.model_id, "gemini-2.0-flash");
+        assert_eq!(p.scheme, Some(SchemeKind::Gemini));
+        assert_eq!(p.model_id.as_deref(), Some("gemini-2.0-flash"));
     }
 
     #[test]

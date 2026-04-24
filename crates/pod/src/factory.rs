@@ -411,7 +411,7 @@ name = "overlay-name"
         // overlay layer so later calls win. This also exercises the
         // scope union across layers (two allow rules).
         assert_eq!(manifest.pod.name, "overlay-name");
-        assert_eq!(manifest.model.model_id, "project-model");
+        assert_eq!(manifest.model.model_id.as_deref(), Some("project-model"));
         assert_eq!(manifest.scope.allow.len(), 2);
     }
 
@@ -461,7 +461,7 @@ model_id = "project-model"
             .unwrap();
 
         // project layer overrides user layer on model.model_id
-        assert_eq!(manifest.model.model_id, "project-model");
+        assert_eq!(manifest.model.model_id.as_deref(), Some("project-model"));
         // user layer provides the rest
         assert_eq!(manifest.pod.name, "from-user");
     }

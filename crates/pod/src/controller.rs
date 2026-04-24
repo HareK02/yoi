@@ -683,11 +683,28 @@ where
     St: Store,
 {
     let manifest = pod.manifest();
-    let provider = match manifest.model.scheme {
-        manifest::SchemeKind::Anthropic => "anthropic",
-        manifest::SchemeKind::OpenaiChat => "openai_chat",
-        manifest::SchemeKind::OpenaiResponses => "openai_responses",
-        manifest::SchemeKind::Gemini => "gemini",
+    // `build_client` がここに到達する前に同じマニフェストで成功している
+    // ため、カタログ解決も必ず通る。念のため失敗時は "unknown" に落とす。
+    let resolved = provider::catalog::resolve_model_manifest(&manifest.model).ok();
+    let (provider_name, model_id) = match resolved {
+        Some(cfg) => {
+            let name = match cfg.scheme {
+                manifest::SchemeKind::Anthropic => "anthropic",
+                manifest::SchemeKind::OpenaiChat => "openai_chat",
+                manifest::SchemeKind::OpenaiResponses => "openai_responses",
+                manifest::SchemeKind::Gemini => "gemini",
+            };
+            (name.to_string(), cfg.model_id)
+        }
+        None => (
+            "unknown".to_string(),
+            manifest
+                .model
+                .ref_
+                .clone()
+                .or_else(|| manifest.model.model_id.clone())
+                .unwrap_or_default(),
+        ),
     };
     // The tool list mirrors what `spawn()` registers on the Worker:
     // builtin filesystem tools plus the pod-orchestration tools.
@@ -708,8 +725,8 @@ where
     protocol::Greeting {
         pod_name: manifest.pod.name.clone(),
         cwd: pod.pwd().display().to_string(),
-        provider: provider.into(),
-        model: manifest.model.model_id.clone(),
+        provider: provider_name,
+        model: model_id,
         scope_summary: pod.scope().summary(),
         tools: tool_names,
     }

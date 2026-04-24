@@ -1,8 +1,14 @@
 //! LLM モデル宣言型
 //!
-//! Pod マニフェストの `[model]` セクションで記述する型。`scheme` と
-//! `auth` を直交軸として表現し、1 つの汎用アダプタ（`crates/provider`）
-//! で任意の wire / 認証組合せを受け止める。
+//! Pod マニフェストの `[model]` セクションで記述する型。`ref`（プロバイダ
+//! とモデルを両方指し示す短縮形）と inline 指定（`scheme` / `model_id`
+//! 直書き）の両方を受け入れるため、すべてのフィールドを `Option` として
+//! 持つ 1 つの型 [`ModelManifest`] に統合している。実解決（ref をプロバイダ
+//! カタログ / モデルカタログから引いて `scheme` や `model_id` を埋める）
+//! は `crates/provider` の責務で、本モジュールはデータ表現のみを提供する。
+//!
+//! 同じ型を partial（カスケード層）と完成形（最終マニフェスト）の両方で
+//! 使うことで、merge と最終変換の重複を避ける。
 
 use std::path::PathBuf;
 
@@ -12,25 +18,55 @@ use serde::{Deserialize, Serialize};
 // マニフェストで任意に override できるよう型だけ再エクスポートする。
 pub use llm_worker::llm_client::capability::ModelCapability;
 
-/// Pod が使う LLM モデルの宣言。
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ModelConfig {
-    /// wire format
-    pub scheme: SchemeKind,
-    /// API のベース URL。未指定なら scheme の既定値にフォールバック
-    #[serde(default)]
+/// Pod マニフェストの `[model]` セクション。
+///
+/// - ref だけ書く: `[model] ref = "anthropic/claude-sonnet-4-6"`
+/// - ref + 一部 override: ref で基底を引き、`auth` 等だけ書き換え
+/// - 完全 inline: `ref` を省略して `scheme` / `model_id` / `auth` を直書き
+///
+/// どの形が有効かの判定は `provider::resolve_model_manifest` が担う。
+/// 本クレートは「どこから取るか」を表現するだけで、未設定かどうかを
+/// 理由にした hard error は出さない。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ModelManifest {
+    /// `<provider_id>/<model_id_in_ref>` 形式のカタログ参照。`/` の
+    /// 最初の 1 文字目で split し provider カタログを引く。
+    /// OpenRouter の `anthropic/claude-sonnet-4` のように `/` を含む
+    /// model_id は `openrouter/anthropic/claude-sonnet-4` と書く
+    /// （provider 側で最初の `/` のみ split するため）。
+    #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]
+    pub ref_: Option<String>,
+    /// wire format の明示指定。ref 未指定時は必須、ref 指定時は override。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheme: Option<SchemeKind>,
+    /// API のベース URL。scheme の既定値を override する。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
-    /// プロバイダが受け付けるモデル ID
-    pub model_id: String,
-    /// 認証方式
-    #[serde(default)]
-    pub auth: AuthRef,
-    /// モデル能力の明示指定。`None` のときは `crates/provider` が
-    /// scheme 静的テーブル → scheme 既定値の順でフォールバックする。
-    /// OpenAI 互換ルーター（OpenRouter / xAI / Groq 等）で scheme テーブル
-    /// に載っていないモデル ID を使うときに指定する。
-    #[serde(default)]
+    /// プロバイダが受け付けるモデル ID。ref 未指定時は必須。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
+    /// 認証方式。ref 未指定時は必須、ref 指定時は override。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<AuthRef>,
+    /// モデル能力の明示指定。未指定時はモデルカタログ → provider
+    /// `default_capability` → scheme 既定の順で解決される。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capability: Option<ModelCapability>,
+}
+
+impl ModelManifest {
+    /// `upper` を `self` に上書きマージする。マニフェスト cascade 向け
+    /// （builtin → user → project → overlay の優先順位で呼ばれる）。
+    pub fn merge(self, upper: Self) -> Self {
+        Self {
+            ref_: upper.ref_.or(self.ref_),
+            scheme: upper.scheme.or(self.scheme),
+            base_url: upper.base_url.or(self.base_url),
+            model_id: upper.model_id.or(self.model_id),
+            auth: upper.auth.or(self.auth),
+            capability: upper.capability.or(self.capability),
+        }
+    }
 }
 
 /// サポートする wire scheme の種類。

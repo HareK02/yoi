@@ -1,21 +1,25 @@
-//! プロバイダ/モデルカタログ。
+//! プロバイダ / モデルカタログ。
 //!
-//! builtin (`assets/providers.toml`) と user override
-//! (`$XDG_CONFIG_HOME/insomnia/providers.toml`) を読み、
-//! `Vec<ProviderEntry>` を返す。user override がある場合は builtin を
-//! 置き換える（マージしない）。
+//! - builtin プロバイダ: `resources/providers/builtin.toml`
+//! - builtin モデル:    `resources/models/builtin.toml`
+//! - user override:     `$XDG_CONFIG_HOME/insomnia/{providers,models}.toml`
 //!
-//! `ProviderEntry` から [`ModelConfig`] への変換は
-//! [`ProviderEntry::to_model_config`] で行う。`auth_hint` はここでは
-//! UI 表示用のヒントで、実際の認証解決は従来通り [`crate::build_client`]
-//! が `AuthRef` から行う。
+//! どちらの override も「あれば builtin を置換、無ければ builtin」と
+//! いう一方向の差し替え（マージしない）。providers / models は独立に
+//! 読み、片方だけ user override も可。
+//!
+//! [`resolve_model_manifest`] が `manifest::ModelManifest`（ref / inline
+//! 両形）を最終的な [`ModelConfig`] に解決する単一の入口で、wire 層
+//! に渡す前のバリデーションもここで行う。
 
 use std::path::{Path, PathBuf};
 
-use manifest::{AuthRef, ModelConfig, SchemeKind};
+use llm_worker::llm_client::capability::ModelCapability;
+use manifest::{AuthRef, ModelManifest, SchemeKind};
 use serde::{Deserialize, Serialize};
 
-const BUILTIN_CATALOG: &str = include_str!("../assets/providers.toml");
+const BUILTIN_PROVIDERS: &str = include_str!("../../../resources/providers/builtin.toml");
+const BUILTIN_MODELS: &str = include_str!("../../../resources/models/builtin.toml");
 
 #[derive(Debug, thiserror::Error)]
 pub enum CatalogError {
@@ -35,11 +39,30 @@ pub enum CatalogError {
     BuiltinParse(#[source] toml::de::Error),
 }
 
+/// マニフェスト解決時のエラー。`ModelManifest` がカタログ参照を満たせ
+/// ない、あるいは inline フォームでも必須フィールドが揃わない場合に
+/// 返す。
+#[derive(Debug, thiserror::Error)]
+pub enum ResolveError {
+    #[error("failed to load provider catalog: {0}")]
+    LoadProviders(#[source] CatalogError),
+    #[error("failed to load model catalog: {0}")]
+    LoadModels(#[source] CatalogError),
+    #[error("invalid model.ref `{0}`: must be `<provider>/<model_id>`")]
+    MalformedRef(String),
+    #[error("model.ref points to unknown provider `{0}`")]
+    UnknownProvider(String),
+    #[error(
+        "model.ref omitted; manifest must specify scheme, model_id, and auth (missing: {0})"
+    )]
+    InlineMissing(&'static str),
+}
+
 /// UI 向けの認証ヒント。
 ///
 /// 「何を表示・要求するか」のメタ情報で、ランタイムの [`AuthRef`]
-/// とは責務が別。1:1 の対応関係にあり、
-/// [`ProviderEntry::to_model_config`] で相互変換される。
+/// とは責務が別。1:1 の対応関係にあり、[`auth_hint_to_ref`] / [`AuthHint`]
+/// 解決経路で相互変換される。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AuthHint {
@@ -55,10 +78,7 @@ pub enum AuthHint {
     CodexOAuth,
 }
 
-/// カタログ 1 エントリ。
-///
-/// 将来 `discover: Option<DiscoverMode>` を任意で追加予定（Ollama
-/// `/api/tags` 等の動的モデル列挙）。別チケットで実装する。
+/// プロバイダカタログの 1 エントリ。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProviderEntry {
     pub id: String,
@@ -67,78 +87,248 @@ pub struct ProviderEntry {
     #[serde(default)]
     pub base_url: Option<String>,
     pub auth_hint: AuthHint,
+    /// モデルカタログ未登録モデルでこの provider が使われたとき
+    /// （ref で provider はあるが model 行は無い等）のフォールバック。
+    /// 省略時は `Scheme::default_capability()` を最終フォールバックに
+    /// 使う。
     #[serde(default)]
-    pub default_models: Vec<String>,
+    pub default_capability: Option<ModelCapability>,
+}
+
+/// モデルカタログの 1 エントリ。
+///
+/// `id` は **provider 内ユニーク**。同じ `gpt-5` が異なる provider に
+/// 存在するのは OK で、ref が必ず `<provider>/<model_id>` を含むため
+/// 曖昧性が出ない。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ModelEntry {
+    pub id: String,
+    pub provider: String,
+    /// モデル単位の capability override。省略時は
+    /// `ProviderEntry::default_capability` にフォールバックする。
+    #[serde(default)]
+    pub capability: Option<ModelCapability>,
+}
+
+/// 解決済みモデル設定。`build_client` が消費する完成形。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelConfig {
+    pub scheme: SchemeKind,
+    pub base_url: Option<String>,
+    pub model_id: String,
+    pub auth: AuthRef,
+    pub capability: Option<ModelCapability>,
 }
 
 #[derive(Debug, Deserialize)]
-struct CatalogFile {
+struct ProviderCatalogFile {
     #[serde(default)]
     provider: Vec<ProviderEntry>,
 }
 
-impl ProviderEntry {
-    /// 選ばれた `model_id` と組み合わせて [`ModelConfig`] を構築する。
-    pub fn to_model_config(&self, model_id: impl Into<String>) -> ModelConfig {
-        let auth = match &self.auth_hint {
-            AuthHint::None => AuthRef::None,
-            AuthHint::ApiKey { env } => AuthRef::ApiKey {
-                env: env.clone(),
-                file: None,
-            },
-            AuthHint::CodexOAuth => AuthRef::CodexOAuth,
-        };
-        ModelConfig {
-            scheme: self.scheme,
-            base_url: self.base_url.clone(),
-            model_id: model_id.into(),
-            auth,
-            capability: None,
-        }
+#[derive(Debug, Deserialize)]
+struct ModelCatalogFile {
+    #[serde(default)]
+    model: Vec<ModelEntry>,
+}
+
+/// `auth_hint` に対応する [`AuthRef`] のひな型を返す。env / file は
+/// マニフェスト側で override 可能なので、ここでは hint そのままを
+/// 反映した最小形だけを返す（`AuthRef::ApiKey { env: hint_env, file: None }`）。
+fn auth_hint_to_ref(hint: &AuthHint) -> AuthRef {
+    match hint {
+        AuthHint::None => AuthRef::None,
+        AuthHint::ApiKey { env } => AuthRef::ApiKey {
+            env: env.clone(),
+            file: None,
+        },
+        AuthHint::CodexOAuth => AuthRef::CodexOAuth,
     }
 }
 
-/// builtin + user override を解決してカタログを返す。
+// --- providers ---------------------------------------------------------------
+
+/// builtin + user override を解決して provider カタログを返す。
 ///
 /// user override (`$XDG_CONFIG_HOME/insomnia/providers.toml`) が
 /// 存在すれば builtin を置き換える。存在しなければ builtin のみ。
 /// user override が存在するが壊れている場合はエラーを返す（silent
 /// fallback はしない — ユーザーが書いた設定が silent に無視されて
 /// builtin に戻る挙動は気付きにくいため）。
-pub fn load() -> Result<Vec<ProviderEntry>, CatalogError> {
-    if let Some(path) = user_override_path()
+pub fn load_providers() -> Result<Vec<ProviderEntry>, CatalogError> {
+    if let Some(path) = user_override_path("providers.toml")
         && path.is_file()
     {
-        return load_from_path(&path);
+        return load_providers_from(&path);
     }
-    load_builtin()
+    load_builtin_providers()
 }
 
-/// builtin カタログ (`assets/providers.toml`) のみを返す。
-pub fn load_builtin() -> Result<Vec<ProviderEntry>, CatalogError> {
-    let parsed: CatalogFile =
-        toml::from_str(BUILTIN_CATALOG).map_err(CatalogError::BuiltinParse)?;
+/// builtin provider カタログのみを返す。
+pub fn load_builtin_providers() -> Result<Vec<ProviderEntry>, CatalogError> {
+    let parsed: ProviderCatalogFile =
+        toml::from_str(BUILTIN_PROVIDERS).map_err(CatalogError::BuiltinParse)?;
     Ok(parsed.provider)
 }
 
-/// 指定パスから読む（テスト・明示指定用）。
-pub fn load_from_path(path: &Path) -> Result<Vec<ProviderEntry>, CatalogError> {
+/// 指定パスから provider カタログを読む。
+pub fn load_providers_from(path: &Path) -> Result<Vec<ProviderEntry>, CatalogError> {
     let text = std::fs::read_to_string(path).map_err(|source| CatalogError::Io {
         path: path.to_path_buf(),
         source,
     })?;
-    let parsed: CatalogFile = toml::from_str(&text).map_err(|source| CatalogError::Parse {
-        path: path.to_path_buf(),
-        source,
-    })?;
+    let parsed: ProviderCatalogFile =
+        toml::from_str(&text).map_err(|source| CatalogError::Parse {
+            path: path.to_path_buf(),
+            source,
+        })?;
     Ok(parsed.provider)
 }
 
-fn user_override_path() -> Option<PathBuf> {
+// --- models ------------------------------------------------------------------
+
+/// builtin + user override を解決してモデルカタログを返す。
+pub fn load_models() -> Result<Vec<ModelEntry>, CatalogError> {
+    if let Some(path) = user_override_path("models.toml")
+        && path.is_file()
+    {
+        return load_models_from(&path);
+    }
+    load_builtin_models()
+}
+
+/// builtin model カタログのみを返す。
+pub fn load_builtin_models() -> Result<Vec<ModelEntry>, CatalogError> {
+    let parsed: ModelCatalogFile =
+        toml::from_str(BUILTIN_MODELS).map_err(CatalogError::BuiltinParse)?;
+    Ok(parsed.model)
+}
+
+/// 指定パスからモデルカタログを読む。
+pub fn load_models_from(path: &Path) -> Result<Vec<ModelEntry>, CatalogError> {
+    let text = std::fs::read_to_string(path).map_err(|source| CatalogError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let parsed: ModelCatalogFile = toml::from_str(&text).map_err(|source| CatalogError::Parse {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(parsed.model)
+}
+
+// --- ref 解決 / マニフェスト → ModelConfig ---------------------------------
+
+/// `<provider_id>/<model_id>` の最初の `/` で 1 回だけ split する。
+/// OpenRouter の `openrouter/anthropic/claude-sonnet-4` のように
+/// model_id に `/` を含むケースは、provider=`openrouter`、
+/// model_id=`anthropic/claude-sonnet-4` として通る。
+fn split_ref(s: &str) -> Option<(&str, &str)> {
+    let (provider, rest) = s.split_once('/')?;
+    if provider.is_empty() || rest.is_empty() {
+        return None;
+    }
+    Some((provider, rest))
+}
+
+/// `ModelManifest` をカタログ込みで解決し、最終 [`ModelConfig`] を返す。
+///
+/// - **`ref` あり** → provider カタログを引き、未登録なら hard error。
+///   model カタログは未登録でも warn ログだけに留め、`provider.default_capability`
+///   にフォールバック（タイポで動く可能性は API 側 `model not found` で
+///   結果的に検出されるため）。
+/// - **`ref` なし** → `scheme` / `model_id` / `auth` の 3 つが揃って
+///   いることを検証し、そのまま `ModelConfig` を組む。
+///
+/// 各フィールドの解決順は ticket の表に準拠:
+/// scheme/base_url は manifest 明示 > provider、model_id は manifest 明示 > ref、
+/// auth は manifest 明示 > provider.auth_hint 由来、capability は
+/// manifest 明示 > model catalog > provider.default_capability >
+/// （`build_client` 側で）`Scheme::default_capability()`。
+pub fn resolve_model_manifest(manifest: &ModelManifest) -> Result<ModelConfig, ResolveError> {
+    let providers = load_providers().map_err(ResolveError::LoadProviders)?;
+    let models = load_models().map_err(ResolveError::LoadModels)?;
+    resolve_with_catalogs(manifest, &providers, &models)
+}
+
+/// テスト等で in-memory カタログを差し込む解決経路。
+pub fn resolve_with_catalogs(
+    manifest: &ModelManifest,
+    providers: &[ProviderEntry],
+    models: &[ModelEntry],
+) -> Result<ModelConfig, ResolveError> {
+    if let Some(ref_str) = &manifest.ref_ {
+        let (provider_id, ref_model_id) = split_ref(ref_str)
+            .ok_or_else(|| ResolveError::MalformedRef(ref_str.clone()))?;
+        let provider = providers
+            .iter()
+            .find(|p| p.id == provider_id)
+            .ok_or_else(|| ResolveError::UnknownProvider(provider_id.to_string()))?;
+
+        // model 行は無くても続行可（warn ログ + provider.default_capability）。
+        let model_entry = models
+            .iter()
+            .find(|m| m.provider == provider_id && m.id == ref_model_id);
+        if model_entry.is_none() {
+            tracing::warn!(
+                provider = provider_id,
+                model = ref_model_id,
+                "model.ref not found in model catalog; falling back to provider.default_capability"
+            );
+        }
+
+        let scheme = manifest.scheme.unwrap_or(provider.scheme);
+        let base_url = manifest
+            .base_url
+            .clone()
+            .or_else(|| provider.base_url.clone());
+        let model_id = manifest
+            .model_id
+            .clone()
+            .unwrap_or_else(|| ref_model_id.to_string());
+        let auth = manifest
+            .auth
+            .clone()
+            .unwrap_or_else(|| auth_hint_to_ref(&provider.auth_hint));
+        let capability = manifest.capability.clone().or_else(|| {
+            model_entry
+                .and_then(|m| m.capability.clone())
+                .or_else(|| provider.default_capability.clone())
+        });
+        Ok(ModelConfig {
+            scheme,
+            base_url,
+            model_id,
+            auth,
+            capability,
+        })
+    } else {
+        let scheme = manifest
+            .scheme
+            .ok_or(ResolveError::InlineMissing("scheme"))?;
+        let model_id = manifest
+            .model_id
+            .clone()
+            .ok_or(ResolveError::InlineMissing("model_id"))?;
+        let auth = manifest
+            .auth
+            .clone()
+            .ok_or(ResolveError::InlineMissing("auth"))?;
+        Ok(ModelConfig {
+            scheme,
+            base_url: manifest.base_url.clone(),
+            model_id,
+            auth,
+            capability: manifest.capability.clone(),
+        })
+    }
+}
+
+fn user_override_path(file_name: &str) -> Option<PathBuf> {
     if let Ok(dir) = std::env::var("XDG_CONFIG_HOME")
         && !dir.is_empty()
     {
-        return Some(PathBuf::from(dir).join("insomnia").join("providers.toml"));
+        return Some(PathBuf::from(dir).join("insomnia").join(file_name));
     }
     if let Ok(home) = std::env::var("HOME")
         && !home.is_empty()
@@ -147,7 +337,7 @@ fn user_override_path() -> Option<PathBuf> {
             PathBuf::from(home)
                 .join(".config")
                 .join("insomnia")
-                .join("providers.toml"),
+                .join(file_name),
         );
     }
     None
@@ -156,12 +346,11 @@ fn user_override_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::build_client;
     use serial_test::serial;
 
     #[test]
-    fn builtin_has_four_entries() {
-        let entries = load_builtin().unwrap();
+    fn builtin_has_four_providers() {
+        let entries = load_builtin_providers().unwrap();
         let ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
         assert_eq!(
             ids,
@@ -170,76 +359,157 @@ mod tests {
     }
 
     #[test]
-    fn builtin_ollama_shape() {
-        let entries = load_builtin().unwrap();
-        let ollama = entries.iter().find(|e| e.id == "ollama-local").unwrap();
-        assert_eq!(ollama.scheme, SchemeKind::Anthropic);
-        assert_eq!(
-            ollama.base_url.as_deref(),
-            Some("http://localhost:11434")
-        );
-        assert_eq!(ollama.auth_hint, AuthHint::None);
-        assert!(!ollama.default_models.is_empty());
+    fn builtin_provider_default_capability_present() {
+        let entries = load_builtin_providers().unwrap();
+        let anthropic = entries.iter().find(|e| e.id == "anthropic").unwrap();
+        assert!(anthropic.default_capability.is_some());
     }
 
     #[test]
-    fn builtin_codex_oauth_shape() {
-        let entries = load_builtin().unwrap();
-        let codex = entries.iter().find(|e| e.id == "codex-oauth").unwrap();
-        assert_eq!(codex.scheme, SchemeKind::OpenaiResponses);
-        assert_eq!(codex.auth_hint, AuthHint::CodexOAuth);
-        // base_url 未指定 → Codex OAuth のデフォルト backend に解決される
-        assert!(codex.base_url.is_none());
-    }
-
-    #[test]
-    fn builtin_openrouter_uses_explicit_env() {
-        let entries = load_builtin().unwrap();
-        let router = entries.iter().find(|e| e.id == "openrouter").unwrap();
-        match &router.auth_hint {
-            AuthHint::ApiKey { env } => {
-                assert_eq!(env.as_deref(), Some("INSOMNIA_API_KEY_OPENROUTER"));
-            }
-            _ => panic!("openrouter should use ApiKey hint"),
+    fn builtin_models_cover_each_provider() {
+        let entries = load_builtin_models().unwrap();
+        let providers: std::collections::BTreeSet<&str> =
+            entries.iter().map(|m| m.provider.as_str()).collect();
+        for p in ["anthropic", "ollama-local", "codex-oauth", "openrouter"] {
+            assert!(
+                providers.contains(p),
+                "model catalog should cover provider `{p}`"
+            );
         }
     }
 
     #[test]
-    fn to_model_config_maps_auth_hint() {
-        let entries = load_builtin().unwrap();
-
-        let ollama = entries.iter().find(|e| e.id == "ollama-local").unwrap();
-        let cfg = ollama.to_model_config("llama3");
-        assert_eq!(cfg.auth, AuthRef::None);
-        assert_eq!(cfg.model_id, "llama3");
-
-        let router = entries.iter().find(|e| e.id == "openrouter").unwrap();
-        let cfg = router.to_model_config("openai/gpt-5");
+    fn resolve_ref_pulls_provider_defaults() {
+        let providers = load_builtin_providers().unwrap();
+        let models = load_builtin_models().unwrap();
+        let manifest = ModelManifest {
+            ref_: Some("anthropic/claude-sonnet-4-6".into()),
+            ..Default::default()
+        };
+        let cfg = resolve_with_catalogs(&manifest, &providers, &models).unwrap();
+        assert_eq!(cfg.scheme, SchemeKind::Anthropic);
+        assert_eq!(cfg.model_id, "claude-sonnet-4-6");
+        assert_eq!(
+            cfg.base_url.as_deref(),
+            Some("https://api.anthropic.com")
+        );
         match cfg.auth {
             AuthRef::ApiKey { env, file } => {
-                assert_eq!(env.as_deref(), Some("INSOMNIA_API_KEY_OPENROUTER"));
+                assert_eq!(env.as_deref(), Some("INSOMNIA_API_KEY_ANTHROPIC"));
                 assert!(file.is_none());
             }
-            _ => panic!("expected ApiKey"),
+            _ => panic!("expected ApiKey auth from provider hint"),
         }
-
-        let codex = entries.iter().find(|e| e.id == "codex-oauth").unwrap();
-        let cfg = codex.to_model_config("gpt-5");
-        assert_eq!(cfg.auth, AuthRef::CodexOAuth);
+        assert!(cfg.capability.is_some(), "should fall back to provider.default_capability");
     }
 
     #[test]
-    fn ollama_entry_builds_client() {
-        // カタログ読取 → ProviderEntry 選択 → ModelConfig 生成 →
-        // build_client が成功する end-to-end path。
-        let entries = load_builtin().unwrap();
-        let ollama = entries.iter().find(|e| e.id == "ollama-local").unwrap();
-        let cfg = ollama.to_model_config("llama3");
-        assert!(build_client(&cfg).is_ok());
+    fn resolve_ref_with_inline_overrides() {
+        let providers = load_builtin_providers().unwrap();
+        let models = load_builtin_models().unwrap();
+        let manifest = ModelManifest {
+            ref_: Some("anthropic/claude-sonnet-4-6".into()),
+            auth: Some(AuthRef::ApiKey {
+                env: None,
+                file: Some(PathBuf::from("/tmp/sk-ant")),
+            }),
+            ..Default::default()
+        };
+        let cfg = resolve_with_catalogs(&manifest, &providers, &models).unwrap();
+        match cfg.auth {
+            AuthRef::ApiKey { env, file } => {
+                assert!(env.is_none());
+                assert_eq!(file.as_deref(), Some(Path::new("/tmp/sk-ant")));
+            }
+            _ => panic!("override auth should win"),
+        }
     }
 
     #[test]
-    fn load_from_path_reads_override() {
+    fn resolve_ref_with_nested_model_id() {
+        // OpenRouter: `<router>/<provider>/<model>` 形式の model_id を持つ
+        let providers = load_builtin_providers().unwrap();
+        let models = load_builtin_models().unwrap();
+        let manifest = ModelManifest {
+            ref_: Some("openrouter/anthropic/claude-sonnet-4".into()),
+            ..Default::default()
+        };
+        let cfg = resolve_with_catalogs(&manifest, &providers, &models).unwrap();
+        assert_eq!(cfg.scheme, SchemeKind::OpenaiChat);
+        assert_eq!(cfg.model_id, "anthropic/claude-sonnet-4");
+    }
+
+    #[test]
+    fn resolve_ref_unknown_provider_is_hard_error() {
+        let providers = load_builtin_providers().unwrap();
+        let models = load_builtin_models().unwrap();
+        let manifest = ModelManifest {
+            ref_: Some("nope/some-model".into()),
+            ..Default::default()
+        };
+        let err = resolve_with_catalogs(&manifest, &providers, &models).unwrap_err();
+        assert!(matches!(err, ResolveError::UnknownProvider(_)));
+    }
+
+    #[test]
+    fn resolve_ref_unknown_model_is_warn_not_error() {
+        let providers = load_builtin_providers().unwrap();
+        let models = load_builtin_models().unwrap();
+        let manifest = ModelManifest {
+            ref_: Some("anthropic/some-future-claude".into()),
+            ..Default::default()
+        };
+        let cfg = resolve_with_catalogs(&manifest, &providers, &models).unwrap();
+        assert_eq!(cfg.model_id, "some-future-claude");
+        assert!(cfg.capability.is_some(), "should use provider default");
+    }
+
+    #[test]
+    fn resolve_inline_full_form() {
+        let providers = load_builtin_providers().unwrap();
+        let models = load_builtin_models().unwrap();
+        let manifest = ModelManifest {
+            scheme: Some(SchemeKind::Anthropic),
+            model_id: Some("claude-sonnet-4-6".into()),
+            auth: Some(AuthRef::ApiKey {
+                env: None,
+                file: Some(PathBuf::from("/tmp/sk")),
+            }),
+            ..Default::default()
+        };
+        let cfg = resolve_with_catalogs(&manifest, &providers, &models).unwrap();
+        assert_eq!(cfg.scheme, SchemeKind::Anthropic);
+        assert_eq!(cfg.model_id, "claude-sonnet-4-6");
+        assert!(cfg.capability.is_none(), "no catalog hit for inline-only");
+    }
+
+    #[test]
+    fn resolve_inline_missing_auth_errors() {
+        let providers = load_builtin_providers().unwrap();
+        let models = load_builtin_models().unwrap();
+        let manifest = ModelManifest {
+            scheme: Some(SchemeKind::Anthropic),
+            model_id: Some("claude".into()),
+            ..Default::default()
+        };
+        let err = resolve_with_catalogs(&manifest, &providers, &models).unwrap_err();
+        assert!(matches!(err, ResolveError::InlineMissing("auth")));
+    }
+
+    #[test]
+    fn malformed_ref_errors() {
+        let providers = load_builtin_providers().unwrap();
+        let models = load_builtin_models().unwrap();
+        let manifest = ModelManifest {
+            ref_: Some("noslash".into()),
+            ..Default::default()
+        };
+        let err = resolve_with_catalogs(&manifest, &providers, &models).unwrap_err();
+        assert!(matches!(err, ResolveError::MalformedRef(_)));
+    }
+
+    #[test]
+    fn load_providers_from_path() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("providers.toml");
         std::fs::write(
@@ -251,27 +521,26 @@ display_name = "Custom"
 scheme = "anthropic"
 base_url = "http://example.com"
 auth_hint = { kind = "none" }
-default_models = ["model-x"]
 "#,
         )
         .unwrap();
-        let entries = load_from_path(&path).unwrap();
+        let entries = load_providers_from(&path).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].id, "custom");
     }
 
     #[test]
-    fn malformed_override_returns_parse_error() {
+    fn malformed_provider_override_returns_parse_error() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("providers.toml");
         std::fs::write(&path, "this is not valid ][ toml").unwrap();
-        let err = load_from_path(&path).unwrap_err();
+        let err = load_providers_from(&path).unwrap_err();
         assert!(matches!(err, CatalogError::Parse { .. }));
     }
 
     #[test]
     #[serial]
-    fn load_prefers_override_over_builtin() {
+    fn load_prefers_user_override() {
         let dir = tempfile::tempdir().unwrap();
         let insomnia_dir = dir.path().join("insomnia");
         std::fs::create_dir_all(&insomnia_dir).unwrap();
@@ -289,7 +558,7 @@ auth_hint = { kind = "none" }
 
         let prev_xdg = std::env::var("XDG_CONFIG_HOME").ok();
         unsafe { std::env::set_var("XDG_CONFIG_HOME", dir.path()) };
-        let entries = load().unwrap();
+        let entries = load_providers().unwrap();
         match prev_xdg {
             Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
             None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
@@ -306,7 +575,7 @@ auth_hint = { kind = "none" }
         // override ファイルは作らない
         let prev_xdg = std::env::var("XDG_CONFIG_HOME").ok();
         unsafe { std::env::set_var("XDG_CONFIG_HOME", dir.path()) };
-        let entries = load().unwrap();
+        let entries = load_providers().unwrap();
         match prev_xdg {
             Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
             None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },

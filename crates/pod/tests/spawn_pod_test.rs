@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 
 use llm_worker::tool::{ToolError, ToolOutput};
-use manifest::{AuthRef, ModelConfig, Permission, SchemeKind, ScopeRule};
+use manifest::{AuthRef, ModelManifest, Permission, SchemeKind, ScopeRule};
 use pod::runtime_dir::{RuntimeDir, SpawnedPodRecord};
 use pod::scope_lock::{self, LockFileGuard};
 use pod::spawn_pod::spawn_pod_tool;
@@ -134,14 +134,15 @@ fn which_true() -> String {
 
 /// Tests don't exercise the model — they intercept the spawned
 /// child via a mock socket — but `spawn_pod_tool` needs a value to
-/// embed in the overlay TOML. Any well-formed `ModelConfig` works.
-fn dummy_model() -> ModelConfig {
-    ModelConfig {
-        scheme: SchemeKind::Anthropic,
+/// embed in the overlay TOML. Any well-formed `ModelManifest` works.
+fn dummy_model() -> ModelManifest {
+    ModelManifest {
+        scheme: Some(SchemeKind::Anthropic),
         base_url: None,
-        model_id: "claude-test".into(),
-        auth: AuthRef::None,
+        model_id: Some("claude-test".into()),
+        auth: Some(AuthRef::None),
         capability: None,
+        ..Default::default()
     }
 }
 

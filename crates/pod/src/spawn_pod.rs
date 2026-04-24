@@ -14,8 +14,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use manifest::{
-    ModelConfig, ModelConfigPartial, Permission, PodManifestConfig, PodMetaConfig, ScopeConfig,
-    ScopeRule, WorkerManifestConfig,
+    ModelManifest, Permission, PodManifestConfig, PodMetaConfig, ScopeConfig, ScopeRule,
+    WorkerManifestConfig,
 };
 use protocol::Method;
 use protocol::stream::JsonLineWriter;
@@ -118,7 +118,7 @@ pub struct SpawnPodTool {
     /// Pod's overlay TOML so the child does not need its own provider
     /// configuration in the manifest cascade. Per-spawn override is
     /// out of scope here (see `tickets/spawn-inherit-provider.md`).
-    spawner_model: ModelConfig,
+    spawner_model: ModelManifest,
 }
 
 impl SpawnPodTool {
@@ -129,7 +129,7 @@ impl SpawnPodTool {
         spawner_pwd: PathBuf,
         registry: Arc<SpawnedPodRegistry>,
         parent_socket: Option<PathBuf>,
-        spawner_model: ModelConfig,
+        spawner_model: ModelManifest,
     ) -> Self {
         Self {
             spawner_name,
@@ -350,20 +350,14 @@ fn build_overlay_toml(
     name: &str,
     instruction: &str,
     scope_allow: &[ScopeRule],
-    model: &ModelConfig,
+    model: &ModelManifest,
 ) -> Result<String, toml::ser::Error> {
     let overlay = PodManifestConfig {
         pod: PodMetaConfig {
             name: Some(name.to_string()),
             prompt_pack: None,
         },
-        model: ModelConfigPartial {
-            scheme: Some(model.scheme),
-            base_url: model.base_url.clone(),
-            model_id: Some(model.model_id.clone()),
-            auth: Some(model.auth.clone()),
-            capability: model.capability.clone(),
-        },
+        model: model.clone(),
         worker: WorkerManifestConfig {
             instruction: Some(instruction.to_string()),
             ..Default::default()
@@ -460,7 +454,7 @@ pub fn spawn_pod_tool(
     spawner_pwd: PathBuf,
     registry: Arc<SpawnedPodRegistry>,
     parent_socket: Option<PathBuf>,
-    spawner_model: ModelConfig,
+    spawner_model: ModelManifest,
 ) -> ToolDefinition {
     Arc::new(move || {
         let schema = schemars::schema_for!(SpawnPodInput);
@@ -487,16 +481,16 @@ mod tests {
     use manifest::{AuthRef, SchemeKind};
 
     #[test]
-    fn overlay_inherits_spawner_model() {
-        let model = ModelConfig {
-            scheme: SchemeKind::Anthropic,
+    fn overlay_inherits_inline_spawner_model() {
+        let model = ModelManifest {
+            scheme: Some(SchemeKind::Anthropic),
             base_url: Some("https://example.test".into()),
-            model_id: "claude-sonnet-4".into(),
-            auth: AuthRef::ApiKey {
+            model_id: Some("claude-sonnet-4".into()),
+            auth: Some(AuthRef::ApiKey {
                 env: None,
                 file: Some(PathBuf::from("/etc/keys/anthropic")),
-            },
-            capability: None,
+            }),
+            ..Default::default()
         };
 
         let toml_str = build_overlay_toml("child", "$insomnia/default", &[], &model).unwrap();
@@ -510,5 +504,19 @@ mod tests {
             _ => panic!("expected ApiKey"),
         };
         assert_eq!(file.as_deref(), Some(Path::new("/etc/keys/anthropic")));
+    }
+
+    #[test]
+    fn overlay_inherits_ref_spawner_model() {
+        let model = ModelManifest {
+            ref_: Some("anthropic/claude-sonnet-4-6".into()),
+            ..Default::default()
+        };
+        let toml_str = build_overlay_toml("child", "$insomnia/default", &[], &model).unwrap();
+        let parsed = PodManifestConfig::from_toml(&toml_str).unwrap();
+        assert_eq!(
+            parsed.model.ref_.as_deref(),
+            Some("anthropic/claude-sonnet-4-6")
+        );
     }
 }
