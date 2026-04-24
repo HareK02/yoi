@@ -20,7 +20,7 @@ Ollama は独自 scheme を作らず `scheme/anthropic` を base_url 差し替�
 
 ### 二次サポート（OpenAI 互換共通枠）
 
-`provider_kind: openai_compatible` + `base_url` + API key + `available_models[]` の汎用アダプタ 1 本で以下を収容:
+`scheme = "openai_chat"` + `base_url` + API key を宣言するプロバイダカタログエントリ（`resources/providers/builtin.toml`）1 つで以下を収容。個別モデルはモデルカタログ（`resources/models/builtin.toml`）側で列挙する:
 
 - OpenRouter
 - xAI (Grok)
@@ -44,7 +44,7 @@ Ollama は独自 scheme を作らず `scheme/anthropic` を base_url 差し替�
 ## 実装原則
 
 - 認証ストアを読むアダプタ（`~/.codex/auth.json` 等）は **llm-worker 直下に置かず上位層に配置**。llm-worker は低レベル基盤に留める方針（`feedback_llm_worker_scope.md`）と整合
-- モデル列挙は **auto_discover と宣言型の両輪**。Ollama は `/api/tags` で自動、OpenAI 互換枠は `available_models[]` を宣言
+- モデル列挙は **auto_discover と宣言型の両輪**。Ollama は `/api/tags` で自動、OpenAI 互換枠はモデルカタログ（`resources/models/builtin.toml` + `$XDG_CONFIG_HOME/insomnia/models.toml` の user override）で宣言
 - UI のプロバイダ選択肢も第一級 → 二次の優先順位で並べる
 - **`ollama launch insomnia` 対応を視野に**、env 注入（`ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL` 等）で起動設定を受け入れる作り
 

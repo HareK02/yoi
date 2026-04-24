@@ -12,7 +12,7 @@
 
 ### 宣言した層が解決する
 
-ある層が構成を宣言として受け取ったなら、その解決もその層の責務。マニフェストに `provider.kind = "anthropic"` と書いた以上、`ProviderConfig` → `LlmClient` の変換は insomnia が行う。逆に llm-worker が `LlmClient` trait だけを受け取るのは正しい — llm-worker はプロバイダの選択を宣言として受け取っていないから。
+ある層が構成を宣言として受け取ったなら、その解決もその層の責務。マニフェストに `[model] ref = "anthropic/claude-sonnet-4-6"`（あるいは `scheme = "anthropic"` + `model_id = ...` の inline 形式）と書いた以上、`ModelManifest` → `LlmClient` の変換は insomnia 側（`crates/provider`）が行う。逆に llm-worker が `LlmClient` trait だけを受け取るのは正しい — llm-worker はプロバイダの選択を宣言として受け取っていないから。
 
 ### 概念の追加は不在が問題になってから
 
@@ -76,8 +76,7 @@ name = "agent"
 pwd = "/abs/path"
 
 [model]
-scheme = "anthropic"
-model_id = "claude-sonnet-4-20250514"
+ref = "anthropic/claude-sonnet-4-6"
 
 [worker]
 instruction = "$insomnia/default"
@@ -87,6 +86,8 @@ max_tokens = 4096
 target = "/abs/path"
 permission = "write"
 ```
+
+`[model]` は `ref = "<provider>/<model_id>"` でプロバイダ / モデルカタログを引く短縮形と、`scheme` / `model_id` / `auth` を直書きする inline 形式の両方を受ける。カタログは `resources/{providers,models}/builtin.toml` を builtin、`$XDG_CONFIG_HOME/insomnia/{providers,models}.toml` を user override として解決する。詳細は `docs/pod-factory.md` と `crates/provider/README.md`。
 
 ### PodFactory: カスケード設定
 

@@ -80,10 +80,15 @@ resolve 段を取りこぼしている証拠なので `ResolveError::RelativePat
 
 ```toml
 [model]
-scheme = "anthropic"
-model_id = "claude-sonnet-4-20250514"
+ref = "anthropic/claude-sonnet-4-6"
 auth = { kind = "api_key", file = "/home/you/.config/insomnia/keys/anthropic" }
 ```
+
+`ref = "<provider>/<model_id>"` はプロバイダ / モデルカタログを引く短縮形。
+`scheme` / `base_url` / `model_id` は provider 側の宣言から引かれ、`auth` も
+カタログの `auth_hint` を起点に解決する。ここでは env 既定（`INSOMNIA_API_KEY_ANTHROPIC`）
+ではなく file から読みたいので `auth` だけ override している。詳細は
+`crates/provider/README.md` と `resources/{providers,models}/builtin.toml` を参照。
 
 ### プロジェクト層（最小）
 
@@ -108,9 +113,20 @@ compact_threshold = 80000
 [pod]
 name = "reviewer"
 
+# Form A: ref のみ（カタログから scheme / base_url / auth_hint / capability を全部引く）
+#   [model]
+#   ref = "anthropic/claude-sonnet-4-6"
+#
+# Form B: ref + 部分 override（ここで示している形）
+#   カタログ起点に個別フィールドだけ上書き。ref 指定時は scheme / model_id / auth は任意 override。
+#
+# Form C: 完全 inline（カタログ無視。実験用 / カタログに無いモデル）
+#   [model]
+#   scheme = "anthropic"
+#   model_id = "claude-sonnet-4-6"
+#   auth = { kind = "api_key", file = "..." }
 [model]
-scheme = "anthropic"
-model_id = "claude-sonnet-4-20250514"
+ref = "anthropic/claude-sonnet-4-6"
 base_url = "https://api.anthropic.com"
 auth = { kind = "api_key", file = "/home/you/.config/insomnia/keys/anthropic" }
 
