@@ -104,7 +104,7 @@ pub enum LoaderError {
 /// libraries. Cheap to clone.
 ///
 /// Also carries the auto-discovered `prompts.toml` pack file paths so
-/// [`crate::prompts::PromptCatalog`] can read the same user/workspace
+/// [`crate::prompt::catalog::PromptCatalog`] can read the same user/workspace
 /// layers without a separate plumbing channel. These fields do not
 /// affect `$prefix` asset resolution — they are purely metadata
 /// consulted by the catalog loader.

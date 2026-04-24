@@ -7,6 +7,7 @@
 - [ ] LLM モデルカタログ + マニフェスト ref 解決 → [tickets/llm-model-catalog.md](tickets/llm-model-catalog.md)
 - [ ] Pod オーケストレーション
   - [ ] 動的 Scope 変更 → [tickets/dynamic-scope.md](tickets/dynamic-scope.md)
+  - [ ] pod クレートのモジュール分割 → [tickets/pod-module-layout.md](tickets/pod-module-layout.md)
 - [ ] ネイティブ GUI クライアント MVP → [tickets/native-gui-mvp.md](tickets/native-gui-mvp.md)
 - [ ] TUI 拡充
   - [ ] フルスクリーン化によるオーバーホール → [tickets/tui-fullscreen-overhaul.md](tickets/tui-fullscreen-overhaul.md)

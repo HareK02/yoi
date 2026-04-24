@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-use crate::runtime_dir::{RuntimeDir, SpawnedPodRecord};
+use crate::runtime::dir::{RuntimeDir, SpawnedPodRecord};
 
 pub struct SpawnedPodRegistry {
     records: Mutex<Vec<SpawnedPodRecord>>,

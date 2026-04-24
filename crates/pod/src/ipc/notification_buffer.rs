@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use llm_worker::Item;
 use tracing::warn;
 
-use crate::prompts::{CatalogError, PromptCatalog};
+use crate::prompt::catalog::{CatalogError, PromptCatalog};
 
 /// Maximum queued notifications. Oldest entries are dropped beyond this.
 const CAPACITY: usize = 128;

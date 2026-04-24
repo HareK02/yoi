@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 
 use manifest::{PodManifest, PodManifestConfig, ResolveError};
 
-use crate::prompt_loader::PromptLoader;
+use crate::prompt::loader::PromptLoader;
 
 /// Errors raised while building a [`PodManifest`] from cascade layers.
 #[derive(Debug, thiserror::Error)]
@@ -614,7 +614,7 @@ permission = "write"
 
     #[test]
     fn resolve_produces_loader_with_workspace_prompts_dir() {
-        use crate::system_prompt::{SystemPromptContext, SystemPromptTemplate};
+        use crate::prompt::system::{SystemPromptContext, SystemPromptTemplate};
         use manifest::{Permission, Scope, ScopeConfig, ScopeRule};
 
         let tmp = TempDir::new().unwrap();
@@ -664,7 +664,7 @@ permission = "write"
             deny: Vec::new(),
         };
         let scope = Scope::from_config(&scope_cfg).unwrap();
-        let catalog = crate::prompts::PromptCatalog::builtins_only().unwrap();
+        let catalog = crate::prompt::catalog::PromptCatalog::builtins_only().unwrap();
         let ctx = SystemPromptContext {
             now: chrono::Utc::now(),
             cwd: &root,

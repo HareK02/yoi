@@ -6,17 +6,17 @@ use llm_worker::llm_client::client::LlmClient;
 use session_store::Store;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
-use crate::notification_buffer::NotificationBuffer;
-use crate::notifier::Notifier;
+use crate::ipc::notification_buffer::NotificationBuffer;
+use crate::ipc::notifier::Notifier;
 use crate::pod::{Pod, PodError, PodRunResult};
-use crate::pod_comm_tools::{
+use crate::spawn::comm_tools::{
     list_pods_tool, read_pod_output_tool, send_to_pod_tool, stop_pod_tool,
 };
-use crate::runtime_dir::RuntimeDir;
+use crate::runtime::dir::RuntimeDir;
 use crate::shared_state::{PodSharedState, PodStatus};
-use crate::socket_server::SocketServer;
-use crate::spawn_pod::spawn_pod_tool;
-use crate::spawned_pod_registry::SpawnedPodRegistry;
+use crate::ipc::server::SocketServer;
+use crate::spawn::tool::spawn_pod_tool;
+use crate::spawn::registry::SpawnedPodRegistry;
 use protocol::{ErrorCode, Event, Method, NotificationLevel, NotificationSource, RunResult, TurnResult};
 
 // ---------------------------------------------------------------------------
@@ -463,7 +463,7 @@ impl PodController {
                         // (1) system side effects — idempotent and
                         // tolerant of out-of-order delivery (e.g.
                         // `TurnEnded` arriving after `ShutDown`).
-                        crate::pod_events::apply_event_side_effects(
+                        crate::ipc::event::apply_event_side_effects(
                             &event,
                             &spawned_registry,
                             &spawner_name,
@@ -474,7 +474,7 @@ impl PodController {
                         // into the notification buffer; the next LLM
                         // request will inject it as a system message
                         // via `PodInterceptor::pre_llm_request`.
-                        let text = crate::pod_events::render_event(&event);
+                        let text = crate::ipc::event::render_event(&event);
                         pod.push_notification(text);
                         // Auto-kick a turn if the Pod is idle so the
                         // notification is not stranded. Matches the
@@ -529,7 +529,7 @@ impl PodController {
             // `connect_and_send` helper enforces a 5 s timeout so a
             // stuck parent cannot block process exit indefinitely.
             if let Some(parent) = self_parent_socket.as_ref() {
-                if let Err(e) = crate::pod_events::send_pod_event(
+                if let Err(e) = crate::ipc::event::send_pod_event(
                     parent,
                     protocol::PodEvent::ShutDown {
                         pod_name: spawner_name.clone(),
@@ -587,7 +587,7 @@ where
                         };
                         let _ = event_tx.send(Event::RunEnd { result: run_result });
                         if matches!(run_result, RunResult::Finished) {
-                            crate::pod_events::fire_and_forget(
+                            crate::ipc::event::fire_and_forget(
                                 parent_socket.cloned(),
                                 protocol::PodEvent::TurnEnded {
                                     pod_name: self_name.to_string(),
@@ -612,7 +612,7 @@ where
                             code,
                             message: message.clone(),
                         });
-                        crate::pod_events::fire_and_forget(
+                        crate::ipc::event::fire_and_forget(
                             parent_socket.cloned(),
                             protocol::PodEvent::Errored {
                                 pod_name: self_name.to_string(),
@@ -657,14 +657,14 @@ where
                         // notification buffer so the in-flight turn's
                         // next `pre_llm_request` surfaces it.
                         let self_parent_socket = parent_socket.cloned();
-                        crate::pod_events::apply_event_side_effects(
+                        crate::ipc::event::apply_event_side_effects(
                             &event,
                             spawned_registry,
                             self_name,
                             &self_parent_socket,
                         )
                         .await;
-                        notification_buffer.push(crate::pod_events::render_event(&event));
+                        notification_buffer.push(crate::ipc::event::render_event(&event));
                     }
                     None => {
                         let _ = cancel_tx.try_send(());

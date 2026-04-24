@@ -26,10 +26,10 @@ use std::sync::Arc;
 
 use protocol::{Method, PodEvent, ScopeRule};
 
-use crate::pod_comm_tools::connect_and_send;
-use crate::runtime_dir::SpawnedPodRecord;
-use crate::scope_lock::{self, ScopeLockError};
-use crate::spawned_pod_registry::SpawnedPodRegistry;
+use crate::spawn::comm_tools::connect_and_send;
+use crate::runtime::dir::SpawnedPodRecord;
+use crate::runtime::scope_lock::{self, ScopeLockError};
+use crate::spawn::registry::SpawnedPodRegistry;
 
 /// Connect to `socket`, send a single `Method::PodEvent(event)`, and
 /// return. Used by children to report up to their parent.

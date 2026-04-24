@@ -12,10 +12,10 @@ use std::sync::{LazyLock, Mutex};
 
 use llm_worker::tool::{ToolError, ToolOutput};
 use manifest::{AuthRef, ModelManifest, Permission, SchemeKind, ScopeRule};
-use pod::runtime_dir::{RuntimeDir, SpawnedPodRecord};
-use pod::scope_lock::{self, LockFileGuard};
-use pod::spawn_pod::spawn_pod_tool;
-use pod::spawned_pod_registry::SpawnedPodRegistry;
+use pod::runtime::dir::{RuntimeDir, SpawnedPodRecord};
+use pod::runtime::scope_lock::{self, LockFileGuard};
+use pod::spawn::tool::spawn_pod_tool;
+use pod::spawn::registry::SpawnedPodRegistry;
 use protocol::Method;
 use protocol::stream::JsonLineReader;
 use serde_json::json;

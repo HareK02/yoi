@@ -9,10 +9,10 @@ use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
-use pod::pod_events::{apply_event_side_effects, fire_and_forget, render_event};
-use pod::runtime_dir::{RuntimeDir, SpawnedPodRecord};
-use pod::scope_lock::{self, LockFileGuard};
-use pod::spawned_pod_registry::SpawnedPodRegistry;
+use pod::ipc::event::{apply_event_side_effects, fire_and_forget, render_event};
+use pod::runtime::dir::{RuntimeDir, SpawnedPodRecord};
+use pod::runtime::scope_lock::{self, LockFileGuard};
+use pod::spawn::registry::SpawnedPodRegistry;
 use protocol::stream::JsonLineReader;
 use protocol::{Method, Permission, PodEvent, ScopeRule};
 use tempfile::TempDir;

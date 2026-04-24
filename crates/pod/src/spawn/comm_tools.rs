@@ -21,9 +21,9 @@ use protocol::{ErrorCode, Event, Method};
 use serde::Deserialize;
 use tokio::net::UnixStream;
 
-use crate::runtime_dir::SpawnedPodRecord;
-use crate::scope_lock::{self, LockFileGuard};
-use crate::spawned_pod_registry::SpawnedPodRegistry;
+use crate::runtime::dir::SpawnedPodRecord;
+use crate::runtime::scope_lock::{self, LockFileGuard};
+use crate::spawn::registry::SpawnedPodRegistry;
 
 /// Timeout applied to each socket-level operation — connect, write,
 /// read. Kept short so a stuck child doesn't block the spawner's turn.

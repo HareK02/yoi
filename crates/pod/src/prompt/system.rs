@@ -22,8 +22,8 @@ use minijinja::value::Value;
 use minijinja::{Environment, ErrorKind, UndefinedBehavior};
 use thiserror::Error;
 
-use crate::prompt_loader::{LoaderError, PromptLoader, PromptRef};
-use crate::prompts::{CatalogError, PromptCatalog};
+use crate::prompt::loader::{LoaderError, PromptLoader, PromptRef};
+use crate::prompt::catalog::{CatalogError, PromptCatalog};
 
 #[derive(Debug, Error)]
 pub enum SystemPromptError {

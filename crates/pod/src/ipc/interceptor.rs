@@ -20,14 +20,14 @@ use llm_worker::tool::ToolOutput;
 use session_store::UsageRecord;
 use tracing::info;
 
-use crate::compact_state::CompactState;
+use crate::compact::state::CompactState;
 use crate::hook::{
     AbortInfo, HookRegistry, PreRequestInfo, PromptSubmitInfo, ToolCallSummary, ToolResultSummary,
     TurnEndInfo,
 };
-use crate::notification_buffer::{NotificationBuffer, format_notification};
-use crate::prompts::PromptCatalog;
-use crate::token_counter::total_tokens_impl;
+use crate::ipc::notification_buffer::{NotificationBuffer, format_notification};
+use crate::prompt::catalog::PromptCatalog;
+use crate::compact::token_counter::total_tokens_impl;
 use tracing::warn;
 
 /// Maximum number of bytes copied into `TurnEndInfo::final_text_preview`.

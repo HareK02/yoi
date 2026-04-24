@@ -24,10 +24,10 @@ use tokio::net::UnixStream;
 use tokio::process::Command;
 use tokio::time::sleep;
 
-use crate::pod_events;
-use crate::runtime_dir::SpawnedPodRecord;
-use crate::scope_lock::{self, LockFileGuard, ScopeLockError};
-use crate::spawned_pod_registry::SpawnedPodRegistry;
+use crate::ipc::event;
+use crate::runtime::dir::SpawnedPodRecord;
+use crate::runtime::scope_lock::{self, LockFileGuard, ScopeLockError};
+use crate::spawn::registry::SpawnedPodRegistry;
 use protocol::PodEvent;
 
 const DESCRIPTION: &str = "Spawn a new Pod process to work on a delegated task. \
@@ -233,7 +233,7 @@ impl Tool for SpawnPodTool {
         // Notify this Pod's own parent so the grandparent can register
         // the new grandchild directly. Fire-and-forget; top-level Pods
         // (with no parent) skip the send inside `fire_and_forget`.
-        pod_events::fire_and_forget(
+        event::fire_and_forget(
             self.parent_socket.clone(),
             PodEvent::ScopeSubDelegated {
                 parent_pod: self.spawner_name.clone(),

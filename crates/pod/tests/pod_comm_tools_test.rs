@@ -14,12 +14,12 @@ use std::sync::{Arc, LazyLock, Mutex};
 use llm_worker::llm_client::types::{ContentPart, Item, Role};
 use llm_worker::tool::ToolOutput;
 use manifest::{Permission, ScopeRule};
-use pod::pod_comm_tools::{
+use pod::spawn::comm_tools::{
     list_pods_tool, read_pod_output_tool, send_to_pod_tool, stop_pod_tool,
 };
-use pod::runtime_dir::{RuntimeDir, SpawnedPodRecord};
-use pod::scope_lock::{self, LockFileGuard};
-use pod::spawned_pod_registry::SpawnedPodRegistry;
+use pod::runtime::dir::{RuntimeDir, SpawnedPodRecord};
+use pod::runtime::scope_lock::{self, LockFileGuard};
+use pod::spawn::registry::SpawnedPodRegistry;
 use protocol::stream::{JsonLineReader, JsonLineWriter};
 use protocol::{ErrorCode, Event, Greeting, Method};
 use serde_json::json;

@@ -12,7 +12,7 @@ use llm_worker::prune::{PruneConfig, SavingsEstimator};
 use session_store::Store;
 
 use crate::Pod;
-use crate::token_counter::{EstimateSource, savings_for_prune_impl};
+use crate::compact::token_counter::{EstimateSource, savings_for_prune_impl};
 
 impl<C: LlmClient, St: Store> Pod<C, St> {
     /// Enable prune projection on the underlying Worker.

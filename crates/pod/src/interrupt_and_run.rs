@@ -15,7 +15,7 @@ use session_store::Store;
 
 use crate::pod::{Pod, PodError, PodRunResult};
 #[cfg(test)]
-use crate::prompts::PromptCatalog;
+use crate::prompt::catalog::PromptCatalog;
 
 impl<C: LlmClient, St: Store> Pod<C, St> {
     /// Close out the current (paused) turn and start a new one with `input`.

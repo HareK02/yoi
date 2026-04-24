@@ -13,21 +13,21 @@ use tracing::{info, warn};
 
 use manifest::{PodManifest, PodManifestConfig, ResolveError, Scope, ScopeError, WorkerManifest};
 
-use crate::agents_md::read_agents_md;
-use crate::compact_state::CompactState;
+use crate::prompt::agents_md::read_agents_md;
+use crate::compact::state::CompactState;
 use crate::hook::{
     Hook, HookRegistryBuilder, OnAbort, OnPromptSubmit, OnTurnEnd, PostToolCall, PreLlmRequest,
     PreRequestInfo, PreToolCall,
 };
-use crate::notification_buffer::NotificationBuffer;
-use crate::notifier::Notifier;
-use crate::pod_interceptor::PodInterceptor;
-use crate::prompt_loader::PromptLoader;
-use crate::prompts::{CatalogError, PromptCatalog};
-use crate::runtime_dir;
-use crate::scope_lock::{self, ScopeAllocationGuard, ScopeLockError};
-use crate::system_prompt::{SystemPromptContext, SystemPromptError, SystemPromptTemplate};
-use crate::usage_tracker::UsageTracker;
+use crate::ipc::notification_buffer::NotificationBuffer;
+use crate::ipc::notifier::Notifier;
+use crate::ipc::interceptor::PodInterceptor;
+use crate::prompt::loader::PromptLoader;
+use crate::prompt::catalog::{CatalogError, PromptCatalog};
+use crate::runtime::dir;
+use crate::runtime::scope_lock::{self, ScopeAllocationGuard, ScopeLockError};
+use crate::prompt::system::{SystemPromptContext, SystemPromptError, SystemPromptTemplate};
+use crate::compact::usage_tracker::UsageTracker;
 use protocol::{Event, NotificationLevel, NotificationSource};
 use tokio::sync::broadcast;
 use async_trait::async_trait;
@@ -848,7 +848,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     pub async fn compact(&mut self, retained_tokens: u64) -> Result<SessionId, PodError> {
         use std::sync::atomic::{AtomicU64, Ordering};
 
-        use crate::compact_worker::{
+        use crate::compact::worker::{
             CompactWorkerContext, CompactWorkerInterceptor, add_reference_tool,
             mark_read_required_tool, slice_lines, write_summary_tool,
         };
@@ -1125,7 +1125,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
         // Register this Pod in the machine-wide scope-lock registry
         // before building anything else, so a spawn that conflicts on
         // scope fails fast (and without having paid for client setup).
-        let socket_path = runtime_dir::default_base()
+        let socket_path = dir::default_base()
             .map_err(ScopeLockError::from)?
             .join(&manifest.pod.name)
             .join("sock");
