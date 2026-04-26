@@ -62,17 +62,13 @@ async fn handle_connection(stream: tokio::net::UnixStream, handle: PodHandle) {
     let mut reader = JsonLineReader::new(reader);
     let mut writer = JsonLineWriter::new(writer);
 
-    // Atomically subscribe and snapshot buffered notifications so that
+    // Atomically subscribe and snapshot buffered alerts so that
     // warnings emitted before this client connected are replayed
-    // exactly once — they appear in the snapshot, and any notification
+    // exactly once — they appear in the snapshot, and any alert
     // arriving afterwards reaches us through `rx`.
-    let (notification_snapshot, mut rx) = handle.notifier.subscribe_with_snapshot();
-    for notification in notification_snapshot {
-        if writer
-            .write(&Event::Notification(notification))
-            .await
-            .is_err()
-        {
+    let (alert_snapshot, mut rx) = handle.alerter.subscribe_with_snapshot();
+    for alert in alert_snapshot {
+        if writer.write(&Event::Alert(alert)).await.is_err() {
             return;
         }
     }

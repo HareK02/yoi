@@ -19,8 +19,8 @@ use crate::hook::{
     Hook, HookRegistryBuilder, OnAbort, OnPromptSubmit, OnTurnEnd, PostToolCall, PreLlmRequest,
     PreRequestInfo, PreToolCall,
 };
-use crate::ipc::notification_buffer::NotificationBuffer;
-use crate::ipc::notifier::Notifier;
+use crate::ipc::alerter::Alerter;
+use crate::ipc::notify_buffer::NotifyBuffer;
 use crate::ipc::interceptor::PodInterceptor;
 use crate::prompt::loader::PromptLoader;
 use crate::prompt::catalog::{CatalogError, PromptCatalog};
@@ -28,7 +28,7 @@ use crate::runtime::dir;
 use crate::runtime::scope_lock::{self, ScopeAllocationGuard, ScopeLockError};
 use crate::prompt::system::{SystemPromptContext, SystemPromptError, SystemPromptTemplate};
 use crate::compact::usage_tracker::UsageTracker;
-use protocol::{Event, NotificationLevel, NotificationSource};
+use protocol::{Event, AlertLevel, AlertSource};
 use tokio::sync::broadcast;
 use async_trait::async_trait;
 use llm_worker::interceptor::PreRequestAction;
@@ -90,16 +90,16 @@ pub struct Pod<C: LlmClient, St: Store> {
     system_prompt_template: Option<SystemPromptTemplate>,
     /// User-facing notification sink attached by the Controller at
     /// spawn time. `None` in tests / direct `Pod::new` usage.
-    notifier: Option<Notifier>,
+    alerter: Option<Alerter>,
     /// Broadcast sender for typed lifecycle `Event`s (compact progress,
-    /// etc.). Attached by the Controller alongside `notifier`. Unlike
+    /// etc.). Attached by the Controller alongside `alerter`. Unlike
     /// notifications, events sent here are NOT replayed to clients that
     /// connect after the fact — they are fire-and-forget broadcasts.
     event_tx: Option<broadcast::Sender<Event>>,
     /// Queue of pending `Method::Notify` notifications awaiting
     /// injection into the next LLM request. Shared with the
     /// PodInterceptor installed in `ensure_interceptor_installed`.
-    pending_notifications: NotificationBuffer,
+    pending_notifies: NotifyBuffer,
     /// Scope allocation in the machine-wide lock file. `Some` for
     /// Pods built via `from_manifest` (production path); `None` for
     /// lower-level constructors (`Pod::new`, `Pod::restore`) that
@@ -158,9 +158,9 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             usage_history: Arc::new(Mutex::new(Vec::<UsageRecord>::new())),
             tracker: None,
             system_prompt_template: None,
-            notifier: None,
+            alerter: None,
             event_tx: None,
-            pending_notifications: NotificationBuffer::new(),
+            pending_notifies: NotifyBuffer::new(),
             scope_allocation: None,
             callback_socket: None,
             prompts,
@@ -231,9 +231,9 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             usage_history: Arc::new(Mutex::new(state.usage_history)),
             tracker: None,
             system_prompt_template: None,
-            notifier: None,
+            alerter: None,
             event_tx: None,
-            pending_notifications: NotificationBuffer::new(),
+            pending_notifies: NotifyBuffer::new(),
             scope_allocation: None,
             callback_socket: None,
             prompts,
@@ -332,22 +332,22 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     /// Called by the Controller immediately after spawning so that
     /// Pod-internal operations (compaction failures, AGENTS.md
     /// ingestion warnings) can surface messages to connected clients.
-    pub fn attach_notifier(&mut self, notifier: Notifier) {
-        self.notifier = Some(notifier);
+    pub fn attach_alerter(&mut self, alerter: Alerter) {
+        self.alerter = Some(alerter);
     }
 
     /// Attach the broadcast sender used for typed lifecycle `Event`s.
     ///
-    /// The Controller wires this alongside [`attach_notifier`] so that
+    /// The Controller wires this alongside [`attach_alerter`] so that
     /// Pod-internal operations (currently: compaction) can surface
     /// progress to connected clients.
     pub fn attach_event_tx(&mut self, event_tx: broadcast::Sender<Event>) {
         self.event_tx = Some(event_tx);
     }
 
-    fn notify(&self, level: NotificationLevel, source: NotificationSource, message: String) {
-        if let Some(n) = self.notifier.as_ref() {
-            n.notify(level, source, message);
+    fn alert(&self, level: AlertLevel, source: AlertSource, message: String) {
+        if let Some(n) = self.alerter.as_ref() {
+            n.alert(level, source, message);
         }
     }
 
@@ -364,17 +364,17 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     ///
     /// The notification will be injected as an `Item::system_message`
     /// into the next outgoing LLM request context (not into history).
-    /// See [`NotificationBuffer`] for overflow behaviour.
-    pub fn push_notification(&self, message: String) {
-        self.pending_notifications.push(message);
+    /// See [`NotifyBuffer`] for overflow behaviour.
+    pub fn push_notify(&self, message: String) {
+        self.pending_notifies.push(message);
     }
 
     /// Shared handle to the pending notification buffer.
     ///
     /// The Controller holds a clone so that `Method::Notify` arriving
     /// while `pod.run()` is in flight can still reach the interceptor.
-    pub fn notification_buffer_handle(&self) -> NotificationBuffer {
-        self.pending_notifications.clone()
+    pub fn notify_buffer_handle(&self) -> NotifyBuffer {
+        self.pending_notifies.clone()
     }
 
     /// Parent callback socket set by `from_manifest_spawned`.
@@ -497,7 +497,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 registry,
                 compact_state,
                 usage_history_handle,
-                self.pending_notifications.clone(),
+                self.pending_notifies.clone(),
                 self.prompts.clone(),
             );
             self.worker_mut().set_interceptor(interceptor);
@@ -516,7 +516,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         let Some(template) = self.system_prompt_template.take() else {
             return Ok(());
         };
-        let notifier = self.notifier.clone();
+        let alerter = self.alerter.clone();
         let worker = self.worker.as_mut().expect("worker present");
         // Materialise any pending tool factories so the template sees the
         // full list of tool names. Redundant with the flush inside
@@ -530,10 +530,10 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             .collect();
         let agents_md_read = read_agents_md(&self.pwd);
         for warning in agents_md_read.warnings {
-            if let Some(n) = notifier.as_ref() {
-                n.notify(
-                    NotificationLevel::Warn,
-                    NotificationSource::AgentsMd,
+            if let Some(n) = alerter.as_ref() {
+                n.alert(
+                    AlertLevel::Warn,
+                    AlertSource::AgentsMd,
                     warning,
                 );
             }
@@ -713,9 +713,9 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                     self.send_event(Event::CompactFailed {
                         error: e.to_string(),
                     });
-                    self.notify(
-                        NotificationLevel::Error,
-                        NotificationSource::Compactor,
+                    self.alert(
+                        AlertLevel::Error,
+                        AlertSource::Compactor,
                         format!("mid-run compaction failed: {e}"),
                     );
                     if let Some(ref state) = self.compact_state {
@@ -757,9 +757,9 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 self.send_event(Event::CompactFailed {
                     error: e.to_string(),
                 });
-                self.notify(
-                    NotificationLevel::Warn,
-                    NotificationSource::Compactor,
+                self.alert(
+                    AlertLevel::Warn,
+                    AlertSource::Compactor,
                     format!("post-run compaction failed: {e}"),
                 );
                 state.record_compact_failure();
@@ -1171,9 +1171,9 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             usage_history: Arc::new(Mutex::new(Vec::new())),
             tracker: None,
             system_prompt_template,
-            notifier: None,
+            alerter: None,
             event_tx: None,
-            pending_notifications: NotificationBuffer::new(),
+            pending_notifies: NotifyBuffer::new(),
             scope_allocation: Some(scope_allocation),
             callback_socket: None,
             prompts,
@@ -1234,9 +1234,9 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             usage_history: Arc::new(Mutex::new(Vec::new())),
             tracker: None,
             system_prompt_template,
-            notifier: None,
+            alerter: None,
             event_tx: None,
-            pending_notifications: NotificationBuffer::new(),
+            pending_notifies: NotifyBuffer::new(),
             scope_allocation: Some(scope_allocation),
             callback_socket: Some(callback_socket),
             prompts,

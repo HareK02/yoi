@@ -6,8 +6,8 @@ use llm_worker::llm_client::client::LlmClient;
 use session_store::Store;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
-use crate::ipc::notification_buffer::NotificationBuffer;
-use crate::ipc::notifier::Notifier;
+use crate::ipc::alerter::Alerter;
+use crate::ipc::notify_buffer::NotifyBuffer;
 use crate::pod::{Pod, PodError, PodRunResult};
 use crate::spawn::comm_tools::{
     list_pods_tool, read_pod_output_tool, send_to_pod_tool, stop_pod_tool,
@@ -17,7 +17,7 @@ use crate::shared_state::{PodSharedState, PodStatus};
 use crate::ipc::server::SocketServer;
 use crate::spawn::tool::spawn_pod_tool;
 use crate::spawn::registry::SpawnedPodRegistry;
-use protocol::{ErrorCode, Event, Method, NotificationLevel, NotificationSource, RunResult, TurnResult};
+use protocol::{ErrorCode, Event, Method, AlertLevel, AlertSource, RunResult, TurnResult};
 
 // ---------------------------------------------------------------------------
 // PodHandle — client-facing, Clone-able
@@ -29,7 +29,7 @@ pub struct PodHandle {
     event_tx: broadcast::Sender<Event>,
     pub shared_state: Arc<PodSharedState>,
     pub runtime_dir: Arc<RuntimeDir>,
-    pub notifier: Notifier,
+    pub alerter: Alerter,
 }
 
 impl PodHandle {
@@ -46,9 +46,9 @@ impl PodHandle {
         self.event_tx.send(event)
     }
 
-    /// Emit a user-facing notification. Thin wrapper over `Notifier::notify`.
-    pub fn notify(&self, level: NotificationLevel, source: NotificationSource, message: String) {
-        self.notifier.notify(level, source, message);
+    /// Emit a user-facing alert. Thin wrapper over `Alerter::alert`.
+    pub fn alert(&self, level: AlertLevel, source: AlertSource, message: String) {
+        self.alerter.alert(level, source, message);
     }
 }
 
@@ -72,7 +72,7 @@ impl PodController {
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let (method_tx, mut method_rx) = mpsc::channel::<Method>(32);
         let (event_tx, _) = broadcast::channel::<Event>(256);
-        let notifier = Notifier::new(event_tx.clone());
+        let alerter = Alerter::new(event_tx.clone());
 
         let manifest_toml = toml::to_string_pretty(pod.manifest()).unwrap_or_default();
         let greeting = build_greeting(&pod);
@@ -95,13 +95,13 @@ impl PodController {
             event_tx: event_tx.clone(),
             shared_state: shared_state.clone(),
             runtime_dir: runtime_dir.clone(),
-            notifier: notifier.clone(),
+            alerter: alerter.clone(),
         };
 
-        // Hand the notifier to the Pod so internal operations (compaction,
+        // Hand the alerter to the Pod so internal operations (compaction,
         // AGENTS.md ingestion during the first turn) can emit user-facing
         // notifications on the same channel.
-        pod.attach_notifier(notifier.clone());
+        pod.attach_alerter(alerter.clone());
         // Also hand the raw broadcast sender so Pod-internal operations
         // can emit typed lifecycle `Event`s (currently: compact progress).
         pod.attach_event_tx(event_tx.clone());
@@ -212,11 +212,11 @@ impl PodController {
                 });
             });
 
-            let notifier_for_worker = notifier.clone();
+            let alerter_for_worker = alerter.clone();
             worker.on_warning(move |message| {
-                notifier_for_worker.notify(
-                    NotificationLevel::Warn,
-                    NotificationSource::Worker,
+                alerter_for_worker.alert(
+                    AlertLevel::Warn,
+                    AlertSource::Worker,
                     message.to_owned(),
                 );
             });
@@ -257,7 +257,7 @@ impl PodController {
         // `Method::Notify` into the buffer even while `pod` is held by
         // an in-flight `run_for_notification` / `run` future.
         let cancel_tx = pod.worker_mut().cancel_sender();
-        let notification_buffer = pod.notification_buffer_handle();
+        let notify_buffer = pod.notify_buffer_handle();
 
         tokio::spawn(async move {
             // Hold socket server alive for the lifetime of the controller task
@@ -303,7 +303,7 @@ impl PodController {
                             &event_tx,
                             &cancel_tx,
                             &shared_state,
-                            &notification_buffer,
+                            &notify_buffer,
                             self_parent_socket.as_ref(),
                             &spawner_name,
                             &spawned_registry,
@@ -313,9 +313,9 @@ impl PodController {
                         if new_status == PodStatus::Idle {
                             if let Err(e) = pod.try_post_run_compact().await {
                                 tracing::warn!(error = %e, "Post-run compaction error");
-                                notifier.notify(
-                                    NotificationLevel::Warn,
-                                    NotificationSource::Compactor,
+                                alerter.alert(
+                                    AlertLevel::Warn,
+                                    AlertSource::Compactor,
                                     format!("post-run compaction error: {e}"),
                                 );
                             }
@@ -334,7 +334,7 @@ impl PodController {
                     }
 
                     Method::Notify { message } => {
-                        pod.push_notification(message);
+                        pod.push_notify(message);
                         if shared_state.get_status() != PodStatus::Idle {
                             // RUNNING / Paused: the buffer push is the
                             // entire operation; the in-flight turn (or
@@ -353,7 +353,7 @@ impl PodController {
                             &event_tx,
                             &cancel_tx,
                             &shared_state,
-                            &notification_buffer,
+                            &notify_buffer,
                             self_parent_socket.as_ref(),
                             &spawner_name,
                             &spawned_registry,
@@ -363,9 +363,9 @@ impl PodController {
                         if new_status == PodStatus::Idle {
                             if let Err(e) = pod.try_post_run_compact().await {
                                 tracing::warn!(error = %e, "Post-run compaction error");
-                                notifier.notify(
-                                    NotificationLevel::Warn,
-                                    NotificationSource::Compactor,
+                                alerter.alert(
+                                    AlertLevel::Warn,
+                                    AlertSource::Compactor,
                                     format!("post-run compaction error: {e}"),
                                 );
                             }
@@ -400,7 +400,7 @@ impl PodController {
                             &event_tx,
                             &cancel_tx,
                             &shared_state,
-                            &notification_buffer,
+                            &notify_buffer,
                             self_parent_socket.as_ref(),
                             &spawner_name,
                             &spawned_registry,
@@ -410,9 +410,9 @@ impl PodController {
                         if new_status == PodStatus::Idle {
                             if let Err(e) = pod.try_post_run_compact().await {
                                 tracing::warn!(error = %e, "Post-run compaction error");
-                                notifier.notify(
-                                    NotificationLevel::Warn,
-                                    NotificationSource::Compactor,
+                                alerter.alert(
+                                    AlertLevel::Warn,
+                                    AlertSource::Compactor,
                                     format!("post-run compaction error: {e}"),
                                 );
                             }
@@ -475,7 +475,7 @@ impl PodController {
                         // request will inject it as a system message
                         // via `PodInterceptor::pre_llm_request`.
                         let text = crate::ipc::event::render_event(&event);
-                        pod.push_notification(text);
+                        pod.push_notify(text);
                         // Auto-kick a turn if the Pod is idle so the
                         // notification is not stranded. Matches the
                         // `Method::Notify` idle path.
@@ -489,7 +489,7 @@ impl PodController {
                                 &event_tx,
                                 &cancel_tx,
                                 &shared_state,
-                                &notification_buffer,
+                                &notify_buffer,
                                 self_parent_socket.as_ref(),
                                 &spawner_name,
                                 &spawned_registry,
@@ -499,9 +499,9 @@ impl PodController {
                             if new_status == PodStatus::Idle {
                                 if let Err(e) = pod.try_post_run_compact().await {
                                     tracing::warn!(error = %e, "Post-run compaction error");
-                                    notifier.notify(
-                                        NotificationLevel::Warn,
-                                        NotificationSource::Compactor,
+                                    alerter.alert(
+                                        AlertLevel::Warn,
+                                        AlertSource::Compactor,
                                         format!("post-run compaction error: {e}"),
                                     );
                                 }
@@ -563,7 +563,7 @@ async fn run_with_cancel_support<F>(
     event_tx: &broadcast::Sender<Event>,
     cancel_tx: &mpsc::Sender<()>,
     shared_state: &Arc<PodSharedState>,
-    notification_buffer: &NotificationBuffer,
+    notify_buffer: &NotifyBuffer,
     parent_socket: Option<&std::path::PathBuf>,
     self_name: &str,
     spawned_registry: &Arc<SpawnedPodRegistry>,
@@ -645,7 +645,7 @@ where
                     Some(Method::Notify { message }) => {
                         // Route into the buffer; the in-flight turn will
                         // drain it at its next pre_llm_request.
-                        notification_buffer.push(message);
+                        notify_buffer.push(message);
                     }
                     Some(Method::GetHistory) => {}
                     Some(Method::PodEvent(event)) => {
@@ -664,7 +664,7 @@ where
                             &self_parent_socket,
                         )
                         .await;
-                        notification_buffer.push(crate::ipc::event::render_event(&event));
+                        notify_buffer.push(crate::ipc::event::render_event(&event));
                     }
                     None => {
                         let _ = cancel_tx.try_send(());

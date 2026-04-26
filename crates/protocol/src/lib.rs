@@ -148,7 +148,7 @@ pub enum Event {
         items: Vec<serde_json::Value>,
         greeting: Greeting,
     },
-    Notification(Notification),
+    Alert(Alert),
     /// Pod has started compacting the current session.
     ///
     /// Fired immediately before a compaction run. Success is signalled by
@@ -169,16 +169,16 @@ pub enum Event {
     Shutdown,
 }
 
-/// User-facing notification emitted from the Pod layer.
+/// User-facing alert emitted from the Pod layer.
 ///
 /// This is a separate channel from `tracing` (developer logs): entries
 /// here are assembled explicitly by the Pod when a condition should be
 /// surfaced to the person driving the client. Keep messages short and
 /// human-readable.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Notification {
-    pub level: NotificationLevel,
-    pub source: NotificationSource,
+pub struct Alert {
+    pub level: AlertLevel,
+    pub source: AlertSource,
     pub message: String,
     /// Milliseconds since the Unix epoch.
     pub timestamp_ms: i64,
@@ -186,14 +186,14 @@ pub struct Notification {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum NotificationLevel {
+pub enum AlertLevel {
     Warn,
     Error,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum NotificationSource {
+pub enum AlertSource {
     Pod,
     Worker,
     Compactor,
@@ -462,16 +462,16 @@ mod tests {
     }
 
     #[test]
-    fn event_notification_format() {
-        let event = Event::Notification(Notification {
-            level: NotificationLevel::Warn,
-            source: NotificationSource::Compactor,
+    fn event_alert_format() {
+        let event = Event::Alert(Alert {
+            level: AlertLevel::Warn,
+            source: AlertSource::Compactor,
             message: "compaction failed".into(),
             timestamp_ms: 1_700_000_000_000,
         });
         let json = serde_json::to_string(&event).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed["event"], "notification");
+        assert_eq!(parsed["event"], "alert");
         assert_eq!(parsed["data"]["level"], "warn");
         assert_eq!(parsed["data"]["source"], "compactor");
         assert_eq!(parsed["data"]["message"], "compaction failed");

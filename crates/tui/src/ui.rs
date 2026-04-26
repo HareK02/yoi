@@ -20,9 +20,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block as UiBlock, BorderType, Borders, Padding, Paragraph, Widget, Wrap};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use protocol::{Greeting, NotificationLevel};
+use protocol::{Greeting, AlertLevel};
 
-use crate::app::{App, fmt_tokens, notification_source_label};
+use crate::app::{App, fmt_tokens, alert_source_label};
 use crate::block::{Block, CompactEvent};
 
 /// Display density for the history view.
@@ -313,20 +313,20 @@ fn render_block_into(
         // ToolCall is dispatched in `compute_history` via `tool::render_tool`
         // so it can consume multiple adjacent blocks (Read aggregation).
         Block::ToolCall(_) => unreachable!("ToolCall handled by compute_history"),
-        Block::Notification {
+        Block::Alert {
             level,
             source,
             message,
         } => {
             let kind = match level {
-                NotificationLevel::Warn => MessageKind::NoticeWarn,
-                NotificationLevel::Error => MessageKind::NoticeError,
+                AlertLevel::Warn => MessageKind::NoticeWarn,
+                AlertLevel::Error => MessageKind::NoticeError,
             };
             let prefix = match level {
-                NotificationLevel::Warn => "[notice]",
-                NotificationLevel::Error => "[notice error]",
+                AlertLevel::Warn => "[notice]",
+                AlertLevel::Error => "[notice error]",
             };
-            let label = notification_source_label(*source);
+            let label = alert_source_label(*source);
             let text = format!("{prefix} {label}: {message}");
             match mode {
                 Mode::Overview => push_overview_line(lines, &text, width, kind, ""),

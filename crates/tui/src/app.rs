@@ -1,4 +1,4 @@
-use protocol::{Event, Method, NotificationLevel, NotificationSource, RunResult};
+use protocol::{Event, Method, AlertLevel, AlertSource, RunResult};
 
 use crate::block::{Block, CompactEvent, ToolCallBlock, ToolCallState};
 use crate::cache::FileCache;
@@ -81,9 +81,9 @@ impl App {
     }
 
     pub fn push_error(&mut self, message: impl Into<String>) {
-        self.blocks.push(Block::Notification {
-            level: NotificationLevel::Error,
-            source: NotificationSource::Pod,
+        self.blocks.push(Block::Alert {
+            level: AlertLevel::Error,
+            source: AlertSource::Pod,
             message: message.into(),
         });
     }
@@ -194,16 +194,16 @@ impl App {
                         apply_cache_update(&mut self.cache, &name, args.as_deref(), output.as_deref());
                     }
                 } else {
-                    // Result for an unknown tool call. Surface it as a
-                    // notification so it isn't silently dropped.
+                    // Result for an unknown tool call. Surface it as an
+                    // alert so it isn't silently dropped.
                     let level = if is_error {
-                        NotificationLevel::Error
+                        AlertLevel::Error
                     } else {
-                        NotificationLevel::Warn
+                        AlertLevel::Warn
                     };
-                    self.blocks.push(Block::Notification {
+                    self.blocks.push(Block::Alert {
                         level,
-                        source: NotificationSource::Pod,
+                        source: AlertSource::Pod,
                         message: format!("orphan tool result ({id}): {summary}"),
                     });
                 }
@@ -243,11 +243,11 @@ impl App {
                 self.blocks
                     .push(Block::Compact(CompactEvent::Failed { error }));
             }
-            Event::Notification(notification) => {
-                self.blocks.push(Block::Notification {
-                    level: notification.level,
-                    source: notification.source,
-                    message: notification.message,
+            Event::Alert(alert) => {
+                self.blocks.push(Block::Alert {
+                    level: alert.level,
+                    source: alert.source,
+                    message: alert.message,
                 });
             }
             Event::History { items, greeting } => {
@@ -488,12 +488,12 @@ fn strip_cat_n_prefix(formatted: &str) -> String {
     out
 }
 
-pub fn notification_source_label(source: NotificationSource) -> &'static str {
+pub fn alert_source_label(source: AlertSource) -> &'static str {
     match source {
-        NotificationSource::Pod => "pod",
-        NotificationSource::Worker => "worker",
-        NotificationSource::Compactor => "compactor",
-        NotificationSource::AgentsMd => "AGENTS.md",
+        AlertSource::Pod => "pod",
+        AlertSource::Worker => "worker",
+        AlertSource::Compactor => "compactor",
+        AlertSource::AgentsMd => "AGENTS.md",
     }
 }
 

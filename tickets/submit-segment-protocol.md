@@ -47,15 +47,16 @@ resolver の trait 化と memory / workflow 用 resolver 実装は別チケッ�
 
 text しか作れない client が引き続き存在しても良いことを protocol 仕様に明記する（`vec![Segment::Text(_)]` のみで動く）。
 
-### unknown variant / 未登録 resolver の扱い（要決定）
+### unknown variant / 未登録 resolver の扱い
 
-新 variant を持つ client が古い Pod に投げる、または resolver 未登録の variant を Pod が受けるケースの挙動を本チケットで決める。候補:
+新 variant を持つ client が古い Pod に投げる、または resolver 未登録の variant を Pod が受けた場合は **2 経路に同時に流す**:
 
-- (a) 黙って drop — 静かに情報が落ちて user/LLM 双方が気付けない
-- (b) `[unknown input: kind=foo]` 相当の placeholder を LLM context に差し込み、LLM が気づいて指摘できる
-- (c) hard error で submit 拒否
+1. **LLM context** に `[unknown input: kind=foo]` 相当の placeholder を `Item::system_message` で差し込む。LLM が「ユーザーは何かを送ろうとしたが Pod が解釈できなかった」と気づき、ユーザーに聞き返せる状態を作る。
+2. **ユーザー向け通知チャネル**（`Event::Alert` / リネーム前は `Event::Notification`）にも同時に送る。client 側で「このサーバはこの input type を解釈できません」とユーザーに直接出せる。
 
-(b) を仮の第一候補として実装方針を詰める。serde 側は unknown variant を吸収する形を初期から入れる。
+両経路に流すことで「user も LLM も気付けない silent drop」を避ける。serde 側は unknown variant を吸収する形（`#[serde(other)]` 相当）を初期から入れる。
+
+`Event::Alert` への rename は `tickets/notification-naming-cleanup.md` で扱う。本チケットの実装時点での名称（`Event::Notification` か `Event::Alert` か）はその時の repo 状態に従う。
 
 ## 範囲外
 

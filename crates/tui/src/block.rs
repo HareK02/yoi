@@ -7,7 +7,7 @@
 
 #![allow(dead_code)] // Phase 5 will consume `output` in detail mode.
 
-use protocol::{Greeting, NotificationLevel, NotificationSource};
+use protocol::{Greeting, AlertLevel, AlertSource};
 
 pub enum Block {
     Greeting(Greeting),
@@ -21,9 +21,9 @@ pub enum Block {
         text: String,
     },
     ToolCall(ToolCallBlock),
-    Notification {
-        level: NotificationLevel,
-        source: NotificationSource,
+    Alert {
+        level: AlertLevel,
+        source: AlertSource,
         message: String,
     },
     Compact(CompactEvent),

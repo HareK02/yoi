@@ -348,7 +348,7 @@ enum SendRunError {
 
 /// Write `Method::Run` to the target and read back events until we see
 /// either `TurnStart` (accepted) or `Error { AlreadyRunning }`
-/// (rejected). Any replayed notifications that precede the response are
+/// (rejected). Any replayed alerts that precede the response are
 /// skipped. Times out per-read so a stuck Pod doesn't hang the tool.
 async fn send_run_and_confirm(socket: &Path, input: String) -> Result<(), SendRunError> {
     let stream = tokio::time::timeout(SOCKET_OP_TIMEOUT, UnixStream::connect(socket))
@@ -373,9 +373,9 @@ async fn send_run_and_confirm(socket: &Path, input: String) -> Result<(), SendRu
                 ..
             }) => return Err(SendRunError::AlreadyRunning),
             Some(Event::TurnStart { .. }) => return Ok(()),
-            // Notifications and other pre-turn events are replayed to
-            // new subscribers; keep reading until the controller's
-            // response to our `Run` shows up.
+            // Alerts and other pre-turn events are replayed to new
+            // subscribers; keep reading until the controller's response
+            // to our `Run` shows up.
             Some(_) => continue,
             None => return Err(SendRunError::Io("connection closed before response".into())),
         }
@@ -383,7 +383,7 @@ async fn send_run_and_confirm(socket: &Path, input: String) -> Result<(), SendRu
 }
 
 /// Connect and ask the Pod for its conversation history. Skips
-/// pre-History events (such as buffered notifications replayed to new
+/// pre-History events (such as buffered alerts replayed to new
 /// clients). Returns the raw JSON items as `serde_json::Value` since
 /// the pod crate already round-trips via `Value` on the wire.
 async fn fetch_history(socket: &Path) -> std::io::Result<Vec<serde_json::Value>> {

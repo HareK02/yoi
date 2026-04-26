@@ -11,6 +11,7 @@
 - [ ] サブミット入力
   - [ ] protocol Segment 化 → [tickets/submit-segment-protocol.md](tickets/submit-segment-protocol.md)
   - [ ] TUI 補完 + 型付き atom 化 → [tickets/submit-tui-completion.md](tickets/submit-tui-completion.md)
+- [ ] Notification 用語リネーム (Event::Alert / Method::Notify) → [tickets/notification-naming-cleanup.md](tickets/notification-naming-cleanup.md)
 - [ ] メモリ機構
   - [ ] ファイル形式 + Linter 土台 → [tickets/memory-file-format.md](tickets/memory-file-format.md)
   - [ ] memory / Knowledge 検索ツール → [tickets/memory-search-tools.md](tickets/memory-search-tools.md)

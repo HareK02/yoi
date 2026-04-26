@@ -25,7 +25,7 @@ use crate::hook::{
     AbortInfo, HookRegistry, PreRequestInfo, PromptSubmitInfo, ToolCallSummary, ToolResultSummary,
     TurnEndInfo,
 };
-use crate::ipc::notification_buffer::{NotificationBuffer, format_notification};
+use crate::ipc::notify_buffer::{NotifyBuffer, format_notify};
 use crate::prompt::catalog::PromptCatalog;
 use crate::compact::token_counter::total_tokens_impl;
 use tracing::warn;
@@ -42,7 +42,7 @@ pub(crate) struct PodInterceptor {
     usage_history: Option<Arc<Mutex<Vec<UsageRecord>>>>,
     /// Pending-notification buffer drained into the per-request
     /// context at the head of `pre_llm_request`.
-    pending_notifications: NotificationBuffer,
+    pending_notifies: NotifyBuffer,
     /// Prompt catalog used to render the injected notification wrapper.
     prompts: Arc<PromptCatalog>,
     /// Next turn index assigned by `on_prompt_submit`.
@@ -56,14 +56,14 @@ impl PodInterceptor {
         registry: Arc<HookRegistry>,
         compact_state: Option<Arc<CompactState>>,
         usage_history: Option<Arc<Mutex<Vec<UsageRecord>>>>,
-        pending_notifications: NotificationBuffer,
+        pending_notifies: NotifyBuffer,
         prompts: Arc<PromptCatalog>,
     ) -> Self {
         Self {
             registry,
             compact_state,
             usage_history,
-            pending_notifications,
+            pending_notifies,
             prompts,
             next_turn_index: AtomicUsize::new(0),
             tool_calls_this_turn: AtomicUsize::new(0),
@@ -127,16 +127,16 @@ impl Interceptor for PodInterceptor {
         // into the per-request context as transient system messages.
         // These are not persisted to the Worker history; they exist only
         // for this single LLM request.
-        for notification in self.pending_notifications.drain() {
-            match format_notification(&notification, &self.prompts) {
+        for n in self.pending_notifies.drain() {
+            match format_notify(&n, &self.prompts) {
                 Ok(item) => context.push(item),
                 Err(e) => {
                     // A render failure here would starve the LLM of the
-                    // notification text. Fall back to the raw message —
+                    // notify text. Fall back to the raw message —
                     // it still carries the intent, just without the
                     // wrapper phrasing.
                     warn!(error = %e, "failed to render notify_wrapper; using raw message");
-                    context.push(Item::system_message(notification.message.clone()));
+                    context.push(Item::system_message(n.message.clone()));
                 }
             }
         }
@@ -296,7 +296,7 @@ mod tests {
             registry,
             Some(state),
             Some(history),
-            NotificationBuffer::new(),
+            NotifyBuffer::new(),
             PromptCatalog::builtins_only().unwrap(),
         );
         let mut ctx = ctx_items;
@@ -320,7 +320,7 @@ mod tests {
             registry,
             Some(state),
             Some(history),
-            NotificationBuffer::new(),
+            NotifyBuffer::new(),
             PromptCatalog::builtins_only().unwrap(),
         );
         let mut ctx = ctx_items;
@@ -345,7 +345,7 @@ mod tests {
             registry,
             Some(state),
             Some(history),
-            NotificationBuffer::new(),
+            NotifyBuffer::new(),
             PromptCatalog::builtins_only().unwrap(),
         );
         let mut ctx = ctx_items;
@@ -364,7 +364,7 @@ mod tests {
             registry,
             None,
             None,
-            NotificationBuffer::new(),
+            NotifyBuffer::new(),
             PromptCatalog::builtins_only().unwrap(),
         );
         let mut ctx: Vec<Item> = Vec::new();
@@ -385,9 +385,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pre_llm_request_drains_pending_notifications_into_context() {
+    async fn pre_llm_request_drains_pending_notifies_into_context() {
         let registry = Arc::new(HookRegistryBuilder::new().build());
-        let buffer = NotificationBuffer::new();
+        let buffer = NotifyBuffer::new();
         buffer.push("first".into());
         buffer.push("second".into());
 
@@ -419,7 +419,7 @@ mod tests {
         // When compaction yields, notifications remain in the buffer for
         // the next pre_llm_request (after compaction + resume).
         let registry = Arc::new(HookRegistryBuilder::new().build());
-        let buffer = NotificationBuffer::new();
+        let buffer = NotifyBuffer::new();
         buffer.push("msg".into());
 
         let state = Arc::new(CompactState::new(None, Some(100), 2));
@@ -455,7 +455,7 @@ mod tests {
             registry,
             None,
             None,
-            NotificationBuffer::new(),
+            NotifyBuffer::new(),
             PromptCatalog::builtins_only().unwrap(),
         );
         let mut ctx: Vec<Item> = Vec::new();

@@ -1,6 +1,6 @@
-//! Pending-notification buffer for `Method::Notify`.
+//! Pending-notify buffer for `Method::Notify`.
 //!
-//! Notifications are queued here by the Controller and drained by
+//! Notify entries are queued here by the Controller and drained by
 //! `PodInterceptor::pre_llm_request` into the per-request context
 //! (never into the Worker's persistent history). Each queued entry
 //! becomes one `Item::system_message` in the outgoing request.
@@ -13,56 +13,53 @@ use tracing::warn;
 
 use crate::prompt::catalog::{CatalogError, PromptCatalog};
 
-/// Maximum queued notifications. Oldest entries are dropped beyond this.
+/// Maximum queued notify entries. Oldest entries are dropped beyond this.
 const CAPACITY: usize = 128;
 
-/// One pending notification awaiting injection into the next LLM request.
+/// One pending notify entry awaiting injection into the next LLM request.
 #[derive(Debug, Clone)]
-pub struct PendingNotification {
+pub struct PendingNotify {
     pub message: String,
 }
 
-/// Shared, mutex-guarded buffer of pending notifications.
+/// Shared, mutex-guarded buffer of pending notify entries.
 ///
 /// Cloned between the Pod (producer) and PodInterceptor (consumer).
 #[derive(Clone, Default)]
-pub struct NotificationBuffer {
-    inner: Arc<Mutex<VecDeque<PendingNotification>>>,
+pub struct NotifyBuffer {
+    inner: Arc<Mutex<VecDeque<PendingNotify>>>,
 }
 
-impl NotificationBuffer {
+impl NotifyBuffer {
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Push a notification onto the queue. If the queue is full, the
+    /// Push a notify entry onto the queue. If the queue is full, the
     /// oldest entry is dropped and a `tracing::warn` is emitted — the
     /// caller should never hit this in normal operation.
     pub fn push(&self, message: String) {
-        let mut q = self.inner.lock().expect("notification buffer poisoned");
+        let mut q = self.inner.lock().expect("notify buffer poisoned");
         if q.len() >= CAPACITY {
             let dropped = q.pop_front();
             warn!(
                 capacity = CAPACITY,
                 dropped_message = dropped.as_ref().map(|n| n.message.as_str()),
-                "notification buffer overflow; dropped oldest"
+                "notify buffer overflow; dropped oldest"
             );
         }
-        q.push_back(PendingNotification { message });
+        q.push_back(PendingNotify { message });
     }
 
-    /// Remove and return all pending notifications in FIFO order.
-    pub fn drain(&self) -> Vec<PendingNotification> {
-        let mut q = self.inner.lock().expect("notification buffer poisoned");
+    /// Remove and return all pending notify entries in FIFO order.
+    pub fn drain(&self) -> Vec<PendingNotify> {
+        let mut q = self.inner.lock().expect("notify buffer poisoned");
         q.drain(..).collect()
     }
 
-    /// Number of pending notifications. Primarily for tests.
+    /// Number of pending notify entries. Primarily for tests.
     pub fn len(&self) -> usize {
-        self.inner
-            .lock()
-            .expect("notification buffer poisoned")
-            .len()
+        self.inner.lock().expect("notify buffer poisoned").len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -70,12 +67,12 @@ impl NotificationBuffer {
     }
 }
 
-/// Format a single pending notification into the `Item::system_message`
+/// Format a single pending notify entry into the `Item::system_message`
 /// that gets injected into the per-request context. The wrapper body
 /// comes from `PodPrompt::NotifyWrapper` so the surrounding phrasing
 /// can be customised via a prompt pack (translation, tone, ...).
-pub(crate) fn format_notification(
-    n: &PendingNotification,
+pub(crate) fn format_notify(
+    n: &PendingNotify,
     prompts: &PromptCatalog,
 ) -> Result<Item, CatalogError> {
     let text = prompts.notify_wrapper(&n.message)?;
@@ -88,7 +85,7 @@ mod tests {
 
     #[test]
     fn push_then_drain_preserves_order() {
-        let buf = NotificationBuffer::new();
+        let buf = NotifyBuffer::new();
         buf.push("one".into());
         buf.push("two".into());
         let drained = buf.drain();
@@ -100,7 +97,7 @@ mod tests {
 
     #[test]
     fn capacity_drops_oldest() {
-        let buf = NotificationBuffer::new();
+        let buf = NotifyBuffer::new();
         for i in 0..(CAPACITY + 5) {
             buf.push(format!("msg{i}"));
         }
@@ -112,12 +109,12 @@ mod tests {
     }
 
     #[test]
-    fn format_notification_includes_message_and_nonblocking_hint() {
-        let n = PendingNotification {
+    fn format_notify_includes_message_and_nonblocking_hint() {
+        let n = PendingNotify {
             message: "hello".into(),
         };
         let catalog = PromptCatalog::builtins_only().unwrap();
-        let item = format_notification(&n, &catalog).unwrap();
+        let item = format_notify(&n, &catalog).unwrap();
         let text = item.as_text().unwrap_or_default().to_string();
         assert!(text.contains("[Notification]"));
         assert!(text.contains("hello"));

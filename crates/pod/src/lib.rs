@@ -15,7 +15,7 @@ pub use compact::token_counter::{EstimateSource, SplitPoint, TokenEstimate};
 pub use controller::{PodController, PodHandle, ShutdownReceiver};
 pub use factory::{FactoryError, PodFactory};
 pub use hook::{Hook, HookEventKind, HookRegistryBuilder};
-pub use ipc::notifier::Notifier;
+pub use ipc::alerter::Alerter;
 pub use ipc::server::SocketServer;
 pub use manifest::{
     AuthRef, ModelManifest, PodManifest, PodManifestConfig, PodMetaConfig, Scope, SchemeKind,
