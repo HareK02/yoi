@@ -1,4 +1,3 @@
-- [ ] テスト設計 → [tickets/test-design.md](tickets/test-design.md)
 - [ ] Agent Skills サポート → [tickets/agent-skills.md](tickets/agent-skills.md)
 - [ ] ツール設計
   - [ ] Bash ツール (Permission 層と統合) → [tickets/bash-tool.md](tickets/bash-tool.md)
@@ -9,3 +8,14 @@
 - [ ] TUI 拡充
   - [ ] フルスクリーン化によるオーバーホール → [tickets/tui-fullscreen-overhaul.md](tickets/tui-fullscreen-overhaul.md)
   - [ ] 新しい Pod を spawn する UI の設計 → [tickets/tui-pod-spawn-ui.md](tickets/tui-pod-spawn-ui.md)
+- [ ] サブミット入力
+  - [ ] protocol Segment 化 → [tickets/submit-segment-protocol.md](tickets/submit-segment-protocol.md)
+  - [ ] TUI 補完 + 型付き atom 化 → [tickets/submit-tui-completion.md](tickets/submit-tui-completion.md)
+- [ ] メモリ機構
+  - [ ] ファイル形式 + Linter 土台 → [tickets/memory-file-format.md](tickets/memory-file-format.md)
+  - [ ] memory / Knowledge 検索ツール → [tickets/memory-search-tools.md](tickets/memory-search-tools.md)
+  - [ ] `model_invokation: ON` の常駐注入 → [tickets/memory-resident-injection.md](tickets/memory-resident-injection.md)
+  - [ ] Phase 1 活動抽出 → [tickets/memory-phase1-extract.md](tickets/memory-phase1-extract.md)
+  - [ ] Phase 2 consolidation → [tickets/memory-phase2-consolidation.md](tickets/memory-phase2-consolidation.md)
+  - [ ] 使用頻度メトリクス + Knowledge 化候補レポート → [tickets/memory-usage-metrics.md](tickets/memory-usage-metrics.md)
+  - [ ] GC（定期再評価） → [tickets/memory-gc.md](tickets/memory-gc.md)

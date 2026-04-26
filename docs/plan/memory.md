@@ -27,7 +27,7 @@ Workflow（`/<slug>` で呼び出される制約付き作業フロー）は別 p
   - 同主題の content 進化 = 上書き update + git log で履歴追跡
   - 別主題が古い主題を置き換える場合のみ、別 slug で新規作成し古い方に `status: replaced` + `replaced_by: <新 slug>` を記録
 - Phase 1 の中間ストアとして `memory/_staging/<id>.json` を使う（短命、P2 完了で cleanup。ここは衝突回避と順序のため UUIDv7 可）
-- Raw session log は既存 `llm-worker-persistence` で保持する。memory 対象外、参照経路のみ
+- Raw session log は既存 `session-store` で保持する。memory 対象外、参照経路のみ
 
 ### Knowledge の呼び出し制御
 
