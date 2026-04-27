@@ -135,6 +135,7 @@ pub async fn run() -> Result<SpawnOutcome, SpawnError> {
         name_cursor: default_name.chars().count(),
         name: default_name,
         message: None,
+        editing: true,
     };
 
     let mut terminal = make_inline_terminal()?;
@@ -153,6 +154,7 @@ pub async fn run() -> Result<SpawnOutcome, SpawnError> {
                 break;
             }
             Some(Action::Cancel) => {
+                form.editing = false;
                 form.message = Some(("cancelled".to_string(), MessageKind::Info));
                 terminal.draw(|f| draw_form(f, &form))?;
                 drop(terminal);
@@ -170,7 +172,11 @@ pub async fn run() -> Result<SpawnOutcome, SpawnError> {
 
     let overlay_toml = build_overlay_toml(&form);
 
-    // Phase 2: launch pod and wait for ready line.
+    // Phase 2: launch pod and wait for ready line. Drop the cursor
+    // out of the name field — subsequent frames are passive status
+    // updates, not input — so the cursor doesn't end up parked there
+    // when the inline terminal is finally dropped.
+    form.editing = false;
     form.message = Some(("starting pod...".to_string(), MessageKind::Progress));
     terminal.draw(|f| draw_form(f, &form))?;
 
@@ -425,6 +431,12 @@ struct Form {
     /// char-based bookkeeping in case we relax `is_safe_name_char`.
     name_cursor: usize,
     message: Option<(String, MessageKind)>,
+    /// True while the dialog is accepting name input. Drives whether
+    /// the rendered frame parks the terminal cursor inside the name
+    /// field — when false (post-confirm / cancel / failure frames) the
+    /// cursor stays out so it does not collide with the shell prompt
+    /// after the inline terminal is dropped.
+    editing: bool,
 }
 
 impl Form {
@@ -499,9 +511,16 @@ fn draw_form(f: &mut Frame<'_>, form: &Form) {
     f.render_widget(Paragraph::new(hint_line()), layout[3]);
     f.render_widget(Paragraph::new(message_line(form)), layout[4]);
 
-    // Place the cursor inside the name field (col 8 = "  name: ".len()).
-    let cursor_col = 2 + "name: ".len() + form.name_cursor;
-    f.set_cursor_position((layout[1].x + cursor_col as u16, layout[1].y));
+    if form.editing {
+        // Place the cursor inside the name field while the user is
+        // editing. Skipped on post-confirm frames so the inline
+        // viewport's drop leaves the cursor at the bottom of the
+        // rendered area rather than parked on the name line, which
+        // would let the shell prompt (or any later eprintln) clobber
+        // the rendered name field after exit.
+        let cursor_col = 2 + "name: ".len() + form.name_cursor;
+        f.set_cursor_position((layout[1].x + cursor_col as u16, layout[1].y));
+    }
 }
 
 fn name_line(form: &Form) -> Line<'_> {
@@ -578,6 +597,7 @@ mod tests {
             name: name.to_string(),
             name_cursor: name.chars().count(),
             message: None,
+            editing: true,
         }
     }
 

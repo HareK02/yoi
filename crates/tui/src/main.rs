@@ -10,6 +10,7 @@ mod ui;
 
 use std::io;
 use std::path::PathBuf;
+use std::process::ExitCode;
 use std::time::Duration;
 
 use crossterm::event::{
@@ -76,11 +77,18 @@ fn parse_args() -> Mode {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> ExitCode {
     let mode = parse_args();
 
-    enable_raw_mode()?;
-    execute!(io::stdout(), EnableBracketedPaste)?;
+    if let Err(e) = enable_raw_mode() {
+        eprintln!("tui: failed to enter raw mode: {e}");
+        return ExitCode::FAILURE;
+    }
+    if let Err(e) = execute!(io::stdout(), EnableBracketedPaste) {
+        let _ = disable_raw_mode();
+        eprintln!("tui: {e}");
+        return ExitCode::FAILURE;
+    }
 
     let result = match mode {
         Mode::Spawn => run_spawn().await,
@@ -90,13 +98,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => run_attach(pod_name, socket_override).await,
     };
 
-    // Always restore the terminal, even on error or panic-after-result.
+    // Always restore the terminal first so any pending eprintln below
+    // shows up cleanly in scrollback rather than inside an active
+    // alternate-screen buffer.
     let mut stdout = io::stdout();
     let _ = execute!(stdout, LeaveAlternateScreen, DisableBracketedPaste);
     let _ = disable_raw_mode();
     let _ = execute!(stdout, crossterm::cursor::Show);
 
-    result
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            // SpawnError has already been painted into the inline
+            // viewport's final frame, so it's already visible in the
+            // user's scrollback — printing it again would be a noisy
+            // duplicate. Other errors (attach-mode failures, terminal
+            // setup hiccups, etc.) need surfacing here.
+            if e.downcast_ref::<spawn::SpawnError>().is_none() {
+                eprintln!("tui: {e}");
+            }
+            ExitCode::FAILURE
+        }
+    }
 }
 
 async fn run_attach(
