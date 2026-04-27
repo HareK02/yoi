@@ -34,3 +34,12 @@ agents_md_section = """\
 
 {{ agents_md }}\
 """
+
+resident_knowledge_section = """\
+---
+## Resident knowledge
+
+The following knowledge records are advertised resident. Use the KnowledgeSearch / MemoryRead tools to fetch the full body when relevant.
+
+{{ entries }}\
+"""

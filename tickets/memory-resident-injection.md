@@ -30,3 +30,8 @@
 
 - `docs/plan/memory.md` §retrieval 経路 / §Knowledge の呼び出し制御
 - `tickets/memory-file-format.md`（依存: `model_invokation` frontmatter）
+
+## Review
+- 状態: Approve
+- レビュー詳細: [./memory-resident-injection.review.md](./memory-resident-injection.review.md)
+- 日付: 2026-04-27

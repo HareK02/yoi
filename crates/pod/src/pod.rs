@@ -118,6 +118,12 @@ pub struct Pod<C: LlmClient, St: Store> {
     /// [`Self::from_manifest`], or defaults to the builtin pack when a
     /// Pod is constructed through lower-level paths that have no loader.
     prompts: Arc<PromptCatalog>,
+    /// When true (default), the system-prompt assembler walks
+    /// `<workspace>/knowledge/*` and appends a `## Resident knowledge`
+    /// section listing records with `model_invokation: true`.
+    /// Phase 2 (consolidation) workers set this to false so the
+    /// agentic worker pulls knowledge through the search tools instead.
+    inject_resident_knowledge: bool,
 }
 
 impl<C: LlmClient, St: Store> Pod<C, St> {
@@ -164,6 +170,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             scope_allocation: None,
             callback_socket: None,
             prompts,
+            inject_resident_knowledge: true,
         };
         pod.apply_prune_from_manifest();
         Ok(pod)
@@ -175,6 +182,20 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     /// other callers that build a Pod without going through a manifest.
     pub fn set_system_prompt_template(&mut self, template: SystemPromptTemplate) {
         self.system_prompt_template = Some(template);
+    }
+
+    /// Toggle the resident-knowledge section of the system prompt.
+    ///
+    /// Default `true`: when memory is enabled in the manifest, the
+    /// assembler walks `<workspace>/knowledge/*` and lists records with
+    /// `model_invokation: true`. Phase 2 (consolidation) workers and
+    /// other agentic memory paths set this to `false` so the worker
+    /// pulls knowledge through the search tools instead of riding on
+    /// the resident system-prompt budget. Idempotent if called multiple
+    /// times before the first turn; ineffective once the system prompt
+    /// has been materialised.
+    pub fn set_resident_knowledge_injection(&mut self, enabled: bool) {
+        self.inject_resident_knowledge = enabled;
     }
 
     /// Restore a Pod from a persisted session.
@@ -237,6 +258,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             scope_allocation: None,
             callback_socket: None,
             prompts,
+            inject_resident_knowledge: true,
         };
         pod.apply_prune_from_manifest();
         Ok(pod)
@@ -538,12 +560,39 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 );
             }
         }
+        // Resident-injection collection: only when memory is enabled in
+        // the manifest AND this Pod opts in (Phase 2 workers opt out).
+        // Owned `Vec` lives for the duration of `render` below; the
+        // context borrows a slice into it.
+        let resident: Vec<memory::ResidentKnowledgeEntry> = if self.inject_resident_knowledge {
+            self.manifest
+                .memory
+                .as_ref()
+                .map(|mem| {
+                    let workspace_root = mem
+                        .workspace_root
+                        .clone()
+                        .unwrap_or_else(|| self.pwd.clone());
+                    let layout = memory::WorkspaceLayout::new(workspace_root);
+                    memory::collect_resident_knowledge(&layout)
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let resident_slice: Option<&[memory::ResidentKnowledgeEntry]> =
+            if self.inject_resident_knowledge && self.manifest.memory.is_some() {
+                Some(&resident)
+            } else {
+                None
+            };
         let ctx = SystemPromptContext {
             now: chrono::Utc::now(),
             cwd: &self.pwd,
             scope: &self.scope,
             tool_names,
             agents_md: agents_md_read.body,
+            resident_knowledge: resident_slice,
             prompts: &self.prompts,
         };
         let rendered = template
@@ -1257,6 +1306,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             scope_allocation: Some(scope_allocation),
             callback_socket: None,
             prompts,
+            inject_resident_knowledge: true,
         };
         pod.apply_prune_from_manifest();
         Ok(pod)
@@ -1320,6 +1370,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             scope_allocation: Some(scope_allocation),
             callback_socket: Some(callback_socket),
             prompts,
+            inject_resident_knowledge: true,
         };
         pod.apply_prune_from_manifest();
         Ok(pod)

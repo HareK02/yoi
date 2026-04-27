@@ -8,6 +8,7 @@
 
 pub mod error;
 pub mod linter;
+pub mod resident;
 pub mod schema;
 pub mod scope;
 pub mod slug;
@@ -16,6 +17,7 @@ pub mod workspace;
 
 pub use error::{LintError, LintWarning, MemoryError};
 pub use linter::{LintReport, Linter};
+pub use resident::{ResidentKnowledgeEntry, collect_resident_knowledge};
 pub use scope::deny_write_rules;
 pub use slug::Slug;
 pub use workspace::WorkspaceLayout;

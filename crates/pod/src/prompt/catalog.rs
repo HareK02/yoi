@@ -75,6 +75,10 @@ pub enum PodPrompt {
     /// Trailing `## Project instructions (AGENTS.md)` section, appended
     /// after the scope summary when an AGENTS.md is present.
     AgentsMdSection,
+    /// Trailing `## Resident knowledge` section, appended after the
+    /// AGENTS.md section when memory is enabled and at least one
+    /// `knowledge/*` record advertises `model_invokation: true`.
+    ResidentKnowledgeSection,
 }
 
 impl PodPrompt {
@@ -86,6 +90,7 @@ impl PodPrompt {
             Self::InterruptSystemNote => "interrupt_system_note",
             Self::WorkingBoundariesSection => "working_boundaries_section",
             Self::AgentsMdSection => "agents_md_section",
+            Self::ResidentKnowledgeSection => "resident_knowledge_section",
         }
     }
 
@@ -99,6 +104,7 @@ impl PodPrompt {
         PodPrompt::InterruptSystemNote,
         PodPrompt::WorkingBoundariesSection,
         PodPrompt::AgentsMdSection,
+        PodPrompt::ResidentKnowledgeSection,
     ];
 
     pub const KEYS: &'static [&'static str] = &[
@@ -108,6 +114,7 @@ impl PodPrompt {
         "interrupt_system_note",
         "working_boundaries_section",
         "agents_md_section",
+        "resident_knowledge_section",
     ];
 }
 
@@ -316,6 +323,15 @@ impl PromptCatalog {
     /// Render `PodPrompt::AgentsMdSection` with `{{ agents_md }}`.
     pub fn agents_md_section(&self, agents_md: &str) -> Result<String, CatalogError> {
         self.render(PodPrompt::AgentsMdSection, single("agents_md", agents_md))
+    }
+
+    /// Render `PodPrompt::ResidentKnowledgeSection` with `{{ entries }}`
+    /// (a pre-formatted list block authored by the caller).
+    pub fn resident_knowledge_section(&self, entries: &str) -> Result<String, CatalogError> {
+        self.render(
+            PodPrompt::ResidentKnowledgeSection,
+            single("entries", entries),
+        )
     }
 }
 

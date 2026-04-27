@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use manifest::Scope;
+use memory::ResidentKnowledgeEntry;
 use minijinja::value::Value;
 use minijinja::{Environment, ErrorKind, UndefinedBehavior};
 use thiserror::Error;
@@ -117,7 +118,13 @@ impl SystemPromptTemplate {
         let body = tmpl
             .render(ctx.to_minijinja_value())
             .map_err(|e| SystemPromptError::Render(e.to_string()))?;
-        append_trailing_section(&body, ctx.prompts, ctx.scope, ctx.agents_md.as_deref())
+        append_trailing_section(
+            &body,
+            ctx.prompts,
+            ctx.scope,
+            ctx.agents_md.as_deref(),
+            ctx.resident_knowledge,
+        )
     }
 }
 
@@ -143,6 +150,11 @@ pub struct SystemPromptContext<'a> {
     /// Not visible from the template; consumed by the trailing-section
     /// formatter in [`SystemPromptTemplate::render`].
     pub agents_md: Option<String>,
+    /// Resident-injection candidates from `<workspace>/knowledge/*` whose
+    /// frontmatter has `model_invokation: true`. `None` disables the
+    /// section entirely (memory disabled, or a Phase 2 worker that opts
+    /// out); `Some(&[])` also yields no section.
+    pub resident_knowledge: Option<&'a [ResidentKnowledgeEntry]>,
     /// Catalog used to render the fixed trailing section headers.
     /// Passed by reference so callers do not give up ownership across
     /// the short-lived render borrow.
@@ -190,6 +202,7 @@ pub fn append_trailing_section(
     prompts: &PromptCatalog,
     scope: &Scope,
     agents_md: Option<&str>,
+    resident_knowledge: Option<&[ResidentKnowledgeEntry]>,
 ) -> Result<String, SystemPromptError> {
     let mut out = String::with_capacity(body.len() + 256);
     out.push_str(body);
@@ -207,12 +220,43 @@ pub fn append_trailing_section(
         out.push_str(section.trim_end_matches(&['\n', ' '][..]));
         out.push('\n');
     }
+    if let Some(entries) = resident_knowledge {
+        if !entries.is_empty() {
+            out.push('\n');
+            let formatted = format_resident_knowledge_entries(entries);
+            let section = prompts.resident_knowledge_section(&formatted)?;
+            out.push_str(section.trim_end_matches(&['\n', ' '][..]));
+            out.push('\n');
+        }
+    }
     // Canonicalise the tail so the emitted prompt has a single form
     // regardless of how individual templates chose to end.
     while out.ends_with('\n') || out.ends_with(' ') {
         out.pop();
     }
     Ok(out)
+}
+
+/// `- <slug>: <description>` per line. Description newlines are folded
+/// to spaces so a single entry stays on one row in the rendered prompt.
+fn format_resident_knowledge_entries(entries: &[ResidentKnowledgeEntry]) -> String {
+    let mut out = String::new();
+    for (i, e) in entries.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        out.push_str("- ");
+        out.push_str(&e.slug);
+        out.push_str(": ");
+        for ch in e.description.chars() {
+            if ch == '\n' || ch == '\r' {
+                out.push(' ');
+            } else {
+                out.push(ch);
+            }
+        }
+    }
+    out
 }
 
 /// Bridge used by [`Pod::ensure_system_prompt_materialized`] so tests
@@ -257,6 +301,23 @@ mod tests {
             scope,
             tool_names: tools,
             agents_md,
+            resident_knowledge: None,
+            prompts: test_prompts(),
+        }
+    }
+
+    fn ctx_with_resident<'a>(
+        cwd: &'a Path,
+        scope: &'a Scope,
+        resident: &'a [ResidentKnowledgeEntry],
+    ) -> SystemPromptContext<'a> {
+        SystemPromptContext {
+            now: fixed_now(),
+            cwd,
+            scope,
+            tool_names: Vec::new(),
+            agents_md: None,
+            resident_knowledge: Some(resident),
             prompts: test_prompts(),
         }
     }
@@ -463,5 +524,56 @@ mod tests {
         let rendered = tmpl.render(&ctx(dir.path(), &scope, vec![], None)).unwrap();
         assert!(!rendered.contains("AGENTS.md"));
         assert!(!rendered.contains("Project instructions"));
+    }
+
+    #[test]
+    fn trailing_section_omits_resident_knowledge_when_none() {
+        let (_tmp, loader) = user_loader_with("body.md", "BODY");
+        let tmpl = SystemPromptTemplate::parse("$user/body", loader).unwrap();
+        let dir = TempDir::new().unwrap();
+        let scope = build_scope(dir.path());
+        let rendered = tmpl.render(&ctx(dir.path(), &scope, vec![], None)).unwrap();
+        assert!(!rendered.contains("Resident knowledge"));
+    }
+
+    #[test]
+    fn trailing_section_omits_resident_knowledge_when_empty_slice() {
+        let (_tmp, loader) = user_loader_with("body.md", "BODY");
+        let tmpl = SystemPromptTemplate::parse("$user/body", loader).unwrap();
+        let dir = TempDir::new().unwrap();
+        let scope = build_scope(dir.path());
+        let rendered = tmpl
+            .render(&ctx_with_resident(dir.path(), &scope, &[]))
+            .unwrap();
+        assert!(!rendered.contains("Resident knowledge"));
+    }
+
+    #[test]
+    fn trailing_section_renders_resident_knowledge_entries() {
+        let (_tmp, loader) = user_loader_with("body.md", "BODY");
+        let tmpl = SystemPromptTemplate::parse("$user/body", loader).unwrap();
+        let dir = TempDir::new().unwrap();
+        let scope = build_scope(dir.path());
+        let entries = vec![
+            ResidentKnowledgeEntry {
+                slug: "alpha".into(),
+                description: "first record".into(),
+            },
+            ResidentKnowledgeEntry {
+                slug: "beta".into(),
+                description: "second record\nwith newline".into(),
+            },
+        ];
+        let rendered = tmpl
+            .render(&ctx_with_resident(dir.path(), &scope, &entries))
+            .unwrap();
+        assert!(rendered.contains("## Resident knowledge"));
+        assert!(rendered.contains("- alpha: first record"));
+        // Newline in description is folded to a space (one entry per line).
+        assert!(rendered.contains("- beta: second record with newline"));
+        // Resident section sits *after* the working-boundaries header.
+        let pos_boundaries = rendered.find("## Working boundaries").unwrap();
+        let pos_resident = rendered.find("## Resident knowledge").unwrap();
+        assert!(pos_resident > pos_boundaries);
     }
 }
