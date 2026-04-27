@@ -6,86 +6,100 @@
 
 - `$XDG_CONFIG_HOME/insomnia/` (fallback `~/.config/insomnia/`)
   - `manifest.toml` (user manifest)
-  - `providers.toml` / `models.toml` (catalog user override、`crates/provider/src/catalog.rs`)
-  - `prompts/` / `prompts.toml` (user prompts、`crates/pod/src/prompt/loader.rs`)
+  - `providers.toml` / `models.toml` (catalog user override)
+  - `prompts/` / `prompts.toml` (user prompts)
 - `~/.insomnia/`
-  - `sessions/` (session store、`crates/pod/src/main.rs:default_store_dir`)
-  - `run/` (XDG_RUNTIME_DIR 不在時の socket fallback、`crates/pod/src/runtime/dir.rs:default_runtime_base`)
+  - `sessions/` (session store)
+  - `run/` (XDG_RUNTIME_DIR 不在時の socket fallback)
 
-config 系は XDG に従っているが、data / runtime 系は `~/.insomnia/` 直下に独自に積まれている。新しい機能（モデル設定 wizard 等）を足す前に、どこに何を置くかをはっきりさせたい。
+実態としては「config は XDG 尊重、data / runtime は `~/.insomnia/`」というハイブリッド構成だが、
 
-## 方針候補
+- ロジックが 11 箇所に分散していて (`pod/src/main.rs` / `pod/src/runtime/dir.rs` / `pod/src/runtime/scope_lock.rs` / `tui/src/main.rs` / `manifest/src/cascade.rs` / `provider/src/catalog.rs` / `pod/src/factory.rs` 等)、`default_runtime_dir` (main.rs) と `default_base` (dir.rs) のように完全重複しているものもある
+- すべて `std::env::var()` の手作業実装で、XDG 解決ライブラリ (`dirs` / `directories` 等) は未導入
+- どこに何を置くかが docs にも module comment にも明記されていない
+- テストでパス上書きの手段が統一されておらず、`unsafe std::env::set_var` を多用、`scope_lock.rs` には並行テスト用 `ENV_LOCK: Mutex` まで存在する
+- 既存の override 環境変数は `INSOMNIA_SCOPE_LOCK` （scope.lock 単体）しかなく、テスト/開発用に統一された口がない
 
-### 案 A: XDG 完全準拠
+新しい機能（モデル設定 wizard 等）を足す前に、レイアウトの規約と解決ロジックを 1 箇所に集約する。
 
-各ディレクトリを XDG Base Directory Specification に分ける:
+## 方針
 
-| 種別 | XDG 変数 | fallback | 内容 |
-|---|---|---|---|
-| config | `$XDG_CONFIG_HOME/insomnia/` | `~/.config/insomnia/` | manifest / catalog / prompts |
-| data | `$XDG_DATA_HOME/insomnia/` | `~/.local/share/insomnia/` | sessions |
-| state | `$XDG_STATE_HOME/insomnia/` | `~/.local/state/insomnia/` | logs (将来) |
-| runtime | `$XDG_RUNTIME_DIR/insomnia/` | `~/.cache/insomnia/run/` 等 | socket / scope lock |
+### レイアウト: 案 C （ハイブリッド、現状追認）
 
-**Pros**: 標準に従う。バックアップ対象（data）と捨てて良いもの（runtime）が分離する。
-**Cons**: ディレクトリが 3〜4 箇所に分散して把握しにくい。fallback 経路の選択も複雑。
-
-### 案 B: `~/.insomnia/` 一元化
-
-`~/.insomnia/` 配下に config も data も runtime も全部置く:
+config 系は XDG、data / runtime 系は `~/.insomnia/` 配下を維持。`XDG_CONFIG_HOME` / `XDG_RUNTIME_DIR` を既に尊重しており、現状の動作を壊さない:
 
 ```
-~/.insomnia/
-  manifest.toml          # 旧 ~/.config/insomnia/manifest.toml
-  providers.toml         # 旧 ~/.config/insomnia/providers.toml
-  models.toml
-  prompts/
-  sessions/
-  run/                   # XDG_RUNTIME_DIR があればそちら、無ければここ
-```
-
-XDG 系の env が設定されていればそれを優先、無ければ `~/.insomnia/` で完結。
-
-**Pros**: 全部同じ場所、ファイル探索 / バックアップ / 移行が楽。`~/.config/insomnia/` を見たときに「あれ、設定ここだっけ？」とならない。
-**Cons**: XDG 規約から外れる。Linux ユーザの期待とずれる可能性。
-
-### 案 C: ハイブリッド（現状の整理）
-
-config だけ XDG、data / runtime は `~/.insomnia/` 配下を維持。位置は変えず命名と responsibility を整理:
-
-```
-$XDG_CONFIG_HOME/insomnia/   # 永続的な設定（人間が手で書く / 編集する）
+$XDG_CONFIG_HOME/insomnia/    # 人が編集する設定 (fallback ~/.config/insomnia/)
   manifest.toml
   providers.toml
   models.toml
   prompts/
-~/.insomnia/                  # ランタイム & データ（プログラム生成・状態）
+  prompts.toml
+~/.insomnia/                  # プログラムが書くデータ・ランタイム
   sessions/
-  run/
-  cache/                     # 将来用
+  run/                        # XDG_RUNTIME_DIR があればそちら優先
 ```
 
-**Pros**: 「人が編集するもの」と「プロセスが書くもの」が物理的に分かれる。現状からの移行が小さい。
-**Cons**: XDG 半準拠なので、XDG_DATA_HOME を尊重したいユーザは別途設定が必要。
+`$XDG_DATA_HOME` / `$XDG_STATE_HOME` には対応しない（必要になったら別途検討）。
 
-## 設計で決めること
+### ロジック集約: paths モジュール
 
-- **どの案を採用するか** (A / B / C のどれか、または別案)
-- **環境変数による override**: `INSOMNIA_HOME` / `INSOMNIA_CONFIG_DIR` / `INSOMNIA_DATA_DIR` / `INSOMNIA_RUNTIME_DIR` のような上書き口を入れるか
-- **マイ採用しないション**: 既存の `~/.insomnia/sessions/` / `~/.config/insomnia/manifest.toml` 配置を持つユーザの data を新パスに引き継ぐか、初回起動時にメッセージだけ出して移動はユーザに任せるか
-- **socket / scope_lock の扱い**: runtime はマシン再起動で消えて良いものなので XDG_RUNTIME_DIR 優先で良いか、`~/.insomnia/run/` が常に唯一の置き場で良いか
-- **prompts / catalog override の置き場**: config に近いので config 側でほぼ確定だが、project ローカル prompts (`<project>/.insomnia/prompts/`) との対応関係を整理する
+パス解決を 1 箇所に集約する。crate は新設せず、`crates/manifest` 配下に `paths` module を追加して全 crate からそれを参照する形にする (manifest crate は既に pod / tui / provider から依存されている)。
+
+集約対象:
+
+- `pod/src/main.rs:default_store_dir` (sessions)
+- `pod/src/main.rs:default_runtime_dir` と `pod/src/runtime/dir.rs:default_base` (重複)
+- `pod/src/runtime/scope_lock.rs:default_lock_path`
+- `tui/src/main.rs:resolve_socket`
+- `manifest/src/cascade.rs:user_manifest_path`
+- `provider/src/catalog.rs:user_override_path`
+- `pod/src/factory.rs` の user/project prompts dir 導出
+
+`paths` module は以下のような API を提供する想定（命名は実装時に確定）:
+
+- `config_dir()` → `$XDG_CONFIG_HOME/insomnia` or `~/.config/insomnia`
+- `data_dir()` → `~/.insomnia`
+- `runtime_dir()` → `$XDG_RUNTIME_DIR/insomnia` or `~/.insomnia/run`
+- 各 well-known file への getter (`user_manifest_path()`, `sessions_dir()`, `scope_lock_path()`, `socket_path(pod_name)` 等)
+
+### 環境変数の整理
+
+現状散らばっている override を整理する:
+
+| 変数 | 現状 | 新方針 |
+|---|---|---|
+| `INSOMNIA_HOME` | 無し | **新設**。設定すると config_dir / data_dir / runtime_dir すべての base になる（テスト・開発・ポータブル運用向けの統一 override） |
+| `INSOMNIA_CONFIG_DIR` | 無し | **新設**。config_dir の個別 override (INSOMNIA_HOME より優先) |
+| `INSOMNIA_DATA_DIR` | 無し | **新設**。data_dir の個別 override |
+| `INSOMNIA_RUNTIME_DIR` | 無し | **新設**。runtime_dir の個別 override |
+| `INSOMNIA_SCOPE_LOCK` | scope.lock の path 直接指定 (テスト用) | **廃止**。`INSOMNIA_RUNTIME_DIR` で代替 |
+| `INSOMNIA_POD_COMMAND` | 子 Pod 起動コマンド | **存続**（パス系ではない） |
+| `INSOMNIA_API_KEY_*` | scheme 別の認証 env | **存続**（パス系ではない） |
+| `XDG_CONFIG_HOME` | 尊重 | 引き続き尊重 (INSOMNIA_* 系より低優先) |
+| `XDG_RUNTIME_DIR` | 尊重 | 引き続き尊重 (INSOMNIA_* 系より低優先) |
+
+優先順位: `INSOMNIA_<KIND>_DIR` > `INSOMNIA_HOME` > `XDG_*` > 既定 (`~/.config/insomnia` または `~/.insomnia`)
+
+`INSOMNIA_HOME` 導入によりテストでの `unsafe std::env::set_var("XDG_CONFIG_HOME", ...)` を `INSOMNIA_HOME=tempdir` で置き換えられるようになる（`scope_lock.rs:980` の `ENV_LOCK` Mutex も整理可）。
+
+### マイ採用しないション
+
+レイアウトは現状追認なので、既存ユーザの自動移行は不要。`INSOMNIA_SCOPE_LOCK` の廃止のみ、削除時に release notes で告知する（テスト用なので外部利用想定はほぼ無い）。
 
 ## 完了条件
 
-- 各ディレクトリの責務（config / data / state / runtime）と置き場が docs か module レベル comment に明記されている
-- pod / tui 各クレートの該当箇所（`pod/src/main.rs` / `pod/src/runtime/dir.rs` / `pod/src/runtime/scope_lock.rs` / `manifest/src/cascade.rs` / `provider/src/catalog.rs` / `pod/src/prompt/loader.rs`）が新規約に揃っている
-- 既存ユーザ向けのマイ採用しないションパスが決まっている（自動 / 手動 / 何もしないのいずれか明文化）
-- 新しいレイアウトで pod の起動と tui の spawn flow が引き続き動く
+- `crates/manifest/src/paths.rs` (仮) に config / data / runtime の各責務と解決ロジックがまとめられ、module コメントで「どこに何が置かれるか」が明記されている
+- 既存の 11 箇所のパス解決が新 module の API 呼び出しに置き換わっている（特に `default_runtime_dir` と `default_base` の重複が解消されている）
+- `INSOMNIA_HOME` / `INSOMNIA_CONFIG_DIR` / `INSOMNIA_DATA_DIR` / `INSOMNIA_RUNTIME_DIR` の override が動作し、優先順位が決まっている
+- `INSOMNIA_SCOPE_LOCK` が削除され、テストは `INSOMNIA_HOME` か `INSOMNIA_RUNTIME_DIR` 経由に書き換わっている
+- `unsafe std::env::set_var` を使っているテスト箇所が、新 override に対応した最小限の数まで減っている
+- pod の起動と tui の spawn flow が引き続き動作する
 
 ## 範囲外
 
 - Windows / macOS のネイティブ規約（`%APPDATA%` / `~/Library/Application Support` 等）への対応。本チケットは Linux / 一般的な Unix 想定
+- `$XDG_DATA_HOME` / `$XDG_STATE_HOME` への対応（必要になったら別途）
 - TUI 側で setup wizard が「どこに何を書く」表示するかの UX。本チケットの結論を `tickets/tui-user-model-setup.md` が前提として使う
 
 ## 後続チケット
