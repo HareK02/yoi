@@ -19,4 +19,3 @@
   - [ ] 使用頻度メトリクス + Knowledge 化候補レポート → [tickets/memory-usage-metrics.md](tickets/memory-usage-metrics.md)
   - [ ] GC（定期再評価） → [tickets/memory-gc.md](tickets/memory-gc.md)
 - [ ] LLM 生成設定の manifest 露出整理 → [tickets/worker-generation-settings.md](tickets/worker-generation-settings.md)
-- [ ] モデル reasoning/thinking 制御の内部抽象整理 → [tickets/model-reasoning-control.md](tickets/model-reasoning-control.md)

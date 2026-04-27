@@ -135,6 +135,7 @@ instruction = "$user/reviewer"
 max_tokens = 4096
 max_turns = 50
 temperature = 0.3
+reasoning = "medium"  # 文字列 = effort label / 整数 = thinking budget tokens。詳細は docs/reasoning.md
 
 [worker.tool_output]
 default_max_bytes = 16384
