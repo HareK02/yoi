@@ -13,7 +13,7 @@ overlay をマージして、検証済みの `PodManifest` と `PromptLoader` �
 | 優先度 | 層 | 位置 | 典型的な内容 |
 |---|---|---|---|
 | 1 | ビルトインのデフォルト | `manifest::defaults` モジュールの `pub const` 群を `PodManifestConfig::builtin_defaults()` が cascade 層として注入 | `tool_output.default_max_bytes = 16KB` など |
-| 2 | ユーザー manifest | `$XDG_CONFIG_HOME/insomnia/manifest.toml`（未設定時は `~/.config/insomnia/manifest.toml`） | プロバイダ指定、デフォルトモデル、常用ツール設定 |
+| 2 | ユーザー manifest | `<config_dir>/manifest.toml`（解決ルールは `manifest::paths`） | プロバイダ指定、デフォルトモデル、常用ツール設定 |
 | 3 | プロジェクト manifest | 起動ディレクトリから上方向に探索した最初の `<root>/.insomnia/manifest.toml` | scope、compaction、プロジェクト固有の instruction |
 | 4 | プログラマティック overlay | CLI / GUI / 別 Pod からの spawn 等 | `pod.name`、`pod.pwd` のような Pod 固有値 |
 
@@ -48,7 +48,7 @@ manifest 中のパス（`provider.api_key_file` / `scope.*.target` /
 
 | 層 | ベース |
 |---|---|
-| user manifest (`~/.config/insomnia/manifest.toml`) | そのファイルの親ディレクトリ |
+| user manifest (`<config_dir>/manifest.toml`) | そのファイルの親ディレクトリ |
 | project manifest (`<project>/.insomnia/manifest.toml`) | **プロジェクトルート**（`.insomnia/` の親）。`target = "."` がワークスペース全体を指すように |
 | overlay（inline TOML・programmatic） | プロセスの `current_dir()` |
 
@@ -76,7 +76,7 @@ resolve 段を取りこぼしている証拠なので `ResolveError::RelativePat
 
 ### ユーザー層（最小）
 
-`$XDG_CONFIG_HOME/insomnia/manifest.toml`:
+`<config_dir>/manifest.toml`:
 
 ```toml
 [model]
@@ -180,7 +180,7 @@ import-map 形式のプレフィックスで指定する:
 | プレフィックス | 解決先 |
 |---|---|
 | `$insomnia` | バイナリ同梱の `resources/prompts/`（`include_dir!`） |
-| `$user` | `$XDG_CONFIG_HOME/insomnia/prompts/` |
+| `$user` | `<config_dir>/prompts/`（`manifest::paths` で解決） |
 | `$workspace` | `<project>/.insomnia/prompts/` |
 
 - `.md` 拡張子は省略する（例: `$insomnia/default` → `resources/prompts/default.md`）
@@ -238,15 +238,15 @@ pod [--user-manifest <path>] [--project <path>] [--overlay <toml>]
 
 | フラグ | 説明 |
 |---|---|
-| `--user-manifest` | ユーザー manifest のパス。省略時は XDG から自動解決 |
+| `--user-manifest` | ユーザー manifest のパス。省略時は `manifest::paths::user_manifest_path()` で自動解決 |
 | `--project` | プロジェクト manifest 探索の起点。省略時は cwd から上方向に `.insomnia/` を探索 |
 | `--overlay` | 最上層の overlay を inline TOML 文字列で渡す（例: `--overlay 'worker.instruction = "$user/foo"'`） |
-| `-s, --store` | セッション永続化ディレクトリ（デフォルト: `~/.insomnia/sessions/`） |
+| `-s, --store` | セッション永続化ディレクトリ（デフォルト: `<data_dir>/sessions/`、`manifest::paths` で解決） |
 
 Pod の作業ディレクトリは `pod` 起動時の cwd が直接使われる。別ディレクトリで
 動かしたい場合は `cd <path> && pod ...` のように外側で `cd` してから起動する。
 
-引数無しで起動すると、cwd + XDG の自動解決だけで動く最小構成になる
+引数無しで起動すると、cwd + `manifest::paths` の自動解決だけで動く最小構成になる
 （overlay 無し、プロジェクトに `.insomnia/manifest.toml` があればそれを使う）。
 
 ---
@@ -257,7 +257,7 @@ Pod の作業ディレクトリは `pod` 起動時の cwd が直接使われる�
 use pod::{Pod, PodFactory};
 
 let (manifest, loader) = PodFactory::new()
-    .with_user_manifest_auto()?      // XDG から自動読み込み、不在 OK
+    .with_user_manifest_auto()?      // manifest::paths から自動読み込み、不在 OK
     .with_project_manifest_auto()?   // cwd から上方向に .insomnia/ を探索、不在 OK
     .with_overlay_toml(overlay)?     // programmatic な最上層 overlay
     .resolve()?;                     // -> (PodManifest, PromptLoader)

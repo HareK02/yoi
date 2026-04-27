@@ -2,11 +2,11 @@
 //!
 //! Three prefixes address three physical libraries:
 //!
-//! | prefix       | location                                           |
-//! |--------------|----------------------------------------------------|
-//! | `$insomnia`  | builtin, baked into the binary via `include_dir!`  |
-//! | `$user`      | `$XDG_CONFIG_HOME/insomnia/prompts/` (or similar)  |
-//! | `$workspace` | `<project>/.insomnia/prompts/`                     |
+//! | prefix       | location                                                |
+//! |--------------|---------------------------------------------------------|
+//! | `$insomnia`  | builtin, baked into the binary via `include_dir!`       |
+//! | `$user`      | `<config_dir>/prompts/` (resolved by `manifest::paths`) |
+//! | `$workspace` | `<project>/.insomnia/prompts/`                          |
 //!
 //! A reference is `$<prefix>/<path>` where `<path>` is a `/`-separated
 //! name without the `.md` extension (e.g. `$insomnia/common/header`).

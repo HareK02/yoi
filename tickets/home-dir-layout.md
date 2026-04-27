@@ -105,3 +105,9 @@ $XDG_CONFIG_HOME/insomnia/    # 人が編集する設定 (fallback ~/.config/ins
 ## 後続チケット
 
 - `tickets/tui-user-model-setup.md`: 本チケットで確定したレイアウトに従って user manifest を書き込む wizard を実装する
+
+## Review
+
+- 状態: Approve
+- レビュー詳細: [./home-dir-layout.review.md](./home-dir-layout.review.md)
+- 日付: 2026-04-27

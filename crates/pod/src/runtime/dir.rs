@@ -95,7 +95,9 @@ impl RuntimeDir {
         &self.path
     }
 
-    /// Path where the Unix socket should be created.
+    /// Path where the Unix socket should be created. External callers
+    /// that only know the pod name (e.g. the TUI's attach flow)
+    /// predict the same path via [`manifest::paths::pod_socket_path`].
     pub fn socket_path(&self) -> PathBuf {
         self.path.join("sock")
     }

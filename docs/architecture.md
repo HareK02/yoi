@@ -87,14 +87,14 @@ target = "/abs/path"
 permission = "write"
 ```
 
-`[model]` は `ref = "<provider>/<model_id>"` でプロバイダ / モデルカタログを引く短縮形と、`scheme` / `model_id` / `auth` を直書きする inline 形式の両方を受ける。カタログは `resources/{providers,models}/builtin.toml` を builtin、`$XDG_CONFIG_HOME/insomnia/{providers,models}.toml` を user override として解決する。詳細は `docs/pod-factory.md` と `crates/provider/README.md`。
+`[model]` は `ref = "<provider>/<model_id>"` でプロバイダ / モデルカタログを引く短縮形と、`scheme` / `model_id` / `auth` を直書きする inline 形式の両方を受ける。カタログは `resources/{providers,models}/builtin.toml` を builtin、`<config_dir>/{providers,models}.toml` を user override として解決する（`<config_dir>` の解決ルールは `manifest::paths` 参照）。詳細は `docs/pod-factory.md` と `crates/provider/README.md`。
 
 ### PodFactory: カスケード設定
 
 マニフェストを手書きせず、4 層のカスケードで `PodManifest` を組み立てる:
 
 1. **ビルトインデフォルト** — `manifest::defaults` の定数値
-2. **ユーザー manifest** — `$XDG_CONFIG_HOME/insomnia/manifest.toml`
+2. **ユーザー manifest** — `<config_dir>/manifest.toml`（`manifest::paths` で解決）
 3. **プロジェクト manifest** — `.insomnia/manifest.toml`（cwd から上方向に探索）
 4. **プログラマティック overlay** — CLI / GUI / spawn 時のインライン指定
 
@@ -105,7 +105,7 @@ permission = "write"
 `worker.instruction` はファイル参照。3 層の prefix addressing でプロンプト資産を解決:
 
 - `$insomnia/...` — バイナリ同梱（`resources/prompts/`、`include_dir!` で埋め込み）
-- `$user/...` — `$XDG_CONFIG_HOME/insomnia/prompts/`
+- `$user/...` — `<config_dir>/prompts/`（`manifest::paths` で解決）
 - `$workspace/...` — `<project>/.insomnia/prompts/`
 
 テンプレートは minijinja で評価。`{% include "$insomnia/common/tool-usage" %}` のようにプロンプト間で参照可能（prefix なしの include は現在のファイルからの相対解決）。

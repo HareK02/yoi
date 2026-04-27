@@ -95,10 +95,24 @@ async fn main() -> ExitCode {
         }
     };
 
-    // Initialize persistent store
-    let store_dir = cli.store.clone().unwrap_or_else(|| {
-        paths::sessions_dir().unwrap_or_else(|| PathBuf::from(".insomnia/sessions"))
-    });
+    // Initialize persistent store. `paths::sessions_dir()` only
+    // returns None when none of INSOMNIA_HOME / INSOMNIA_DATA_DIR /
+    // HOME is set — surface that as a hard error to match the
+    // runtime-dir resolution below, rather than silently writing to a
+    // relative path under cwd.
+    let store_dir = match cli.store.clone() {
+        Some(p) => p,
+        None => match paths::sessions_dir() {
+            Some(d) => d,
+            None => {
+                eprintln!(
+                    "error: could not resolve sessions directory \
+                     (set --store, INSOMNIA_HOME, INSOMNIA_DATA_DIR, or HOME)"
+                );
+                return ExitCode::FAILURE;
+            }
+        },
+    };
     let store = match FsStore::new(&store_dir).await {
         Ok(s) => s,
         Err(e) => {

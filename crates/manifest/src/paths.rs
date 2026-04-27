@@ -105,10 +105,12 @@ pub fn pod_runtime_dir(pod_name: &str) -> Option<PathBuf> {
     Some(runtime_dir()?.join(pod_name))
 }
 
-/// `<runtime_dir>/<pod_name>/sock` — Pod の Unix socket パス (TUI が
-/// attach 時に使う)。Pod プロセスが実際に socket を作成するのは
-/// `RuntimeDir::socket_path()` 経由だが、外部からの予測はこの関数で
-/// 行う。
+/// `<runtime_dir>/<pod_name>/sock` — Pod の Unix socket パス。
+///
+/// Pod プロセス内で実際に socket を作成するのは `pod` crate の
+/// `RuntimeDir::socket_path()` で、Pod 名が分かっている外部 (TUI の
+/// attach フロー等) からの**予測**はこの関数で行う。両者は同じパス
+/// を返すことが期待される。
 pub fn pod_socket_path(pod_name: &str) -> Option<PathBuf> {
     Some(pod_runtime_dir(pod_name)?.join("sock"))
 }
