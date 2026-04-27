@@ -6,9 +6,9 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::llm_client::{
-    capability::{ModelCapability, ReasoningControl, ReasoningSupport},
-    types::{parse_tool_arguments, Item, Role, ToolDefinition},
     Request,
+    capability::{ModelCapability, ReasoningControl, ReasoningSupport},
+    types::{Item, Role, ToolDefinition, parse_tool_arguments},
 };
 
 use super::OpenAIScheme;

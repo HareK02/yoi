@@ -11,11 +11,15 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "method", content = "params", rename_all = "snake_case")]
 pub enum Method {
-    Run { input: Vec<Segment> },
+    Run {
+        input: Vec<Segment>,
+    },
     /// Human-readable text injected into the target Pod's LLM context
     /// as a non-blocking system message. No side effects beyond LLM
     /// context; use `PodEvent` for typed lifecycle reports.
-    Notify { message: String },
+    Notify {
+        message: String,
+    },
     /// Typed lifecycle report from a child Pod to its direct parent.
     PodEvent(PodEvent),
     Resume,

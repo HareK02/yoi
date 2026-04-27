@@ -49,9 +49,7 @@ pub fn check_replaced_by(
             return;
         }
         chain.push(node.to_string());
-        cursor = existing
-            .decision(&node)
-            .and_then(|m| m.replaced_by.clone());
+        cursor = existing.decision(&node).and_then(|m| m.replaced_by.clone());
     }
 }
 

@@ -50,9 +50,8 @@ pub fn split_frontmatter(content: &str) -> Result<(&str, &str), LintError> {
         byte_offset += line.len();
     }
 
-    let (yaml_end_excl, body_start) = yaml_end.ok_or_else(|| {
-        LintError::MalformedFrontmatter("missing closing `---` line".to_string())
-    })?;
+    let (yaml_end_excl, body_start) = yaml_end
+        .ok_or_else(|| LintError::MalformedFrontmatter("missing closing `---` line".to_string()))?;
 
     let yaml = &after_open[..yaml_end_excl];
     let body = &after_open[body_start..];

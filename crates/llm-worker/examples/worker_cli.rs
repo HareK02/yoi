@@ -338,11 +338,7 @@ fn default_capability() -> ModelCapability {
     }
 }
 
-fn build_transport<S: Scheme>(
-    scheme: S,
-    model: String,
-    auth: ResolvedAuth,
-) -> Box<dyn LlmClient> {
+fn build_transport<S: Scheme>(scheme: S, model: String, auth: ResolvedAuth) -> Box<dyn LlmClient> {
     let cap = scheme.default_capability();
     let base_url = scheme.default_base_url().to_string();
     Box::new(HttpTransport::new(scheme, model, base_url, auth, cap))

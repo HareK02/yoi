@@ -25,11 +25,7 @@ use llm_worker::llm_client::scheme::{
 };
 use llm_worker::llm_client::transport::{HttpTransport, ResolvedAuth};
 
-fn make_transport<S: Scheme>(
-    scheme: S,
-    model: &str,
-    auth: ResolvedAuth,
-) -> HttpTransport<S> {
+fn make_transport<S: Scheme>(scheme: S, model: &str, auth: ResolvedAuth) -> HttpTransport<S> {
     let cap = scheme.default_capability();
     let base_url = scheme.default_base_url().to_string();
     HttpTransport::new(scheme, model.to_string(), base_url, auth, cap)
@@ -71,11 +67,7 @@ async fn run_scenario_with_anthropic(
     let api_key = std::env::var("ANTHROPIC_API_KEY")
         .expect("ANTHROPIC_API_KEY environment variable must be set");
     let model = model.as_deref().unwrap_or("claude-sonnet-4-20250514");
-    let client = make_transport(
-        AnthropicScheme::new(),
-        model,
-        ResolvedAuth::ApiKey(api_key),
-    );
+    let client = make_transport(AnthropicScheme::new(), model, ResolvedAuth::ApiKey(api_key));
 
     recorder::record_request(
         &client,

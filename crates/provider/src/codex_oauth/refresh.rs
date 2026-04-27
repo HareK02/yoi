@@ -97,7 +97,10 @@ fn extract_error_code(body: &str) -> Option<String> {
             return Some(s.to_string());
         }
     }
-    value.get("code").and_then(|v| v.as_str()).map(str::to_string)
+    value
+        .get("code")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
 }
 
 #[cfg(test)]

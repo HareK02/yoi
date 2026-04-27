@@ -568,9 +568,7 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
         // Attach the cache prefix anchor (may be narrower than `context`
         // if the prune projection trimmed items from the head — keep it
         // in range).
-        request.cache_anchor = self
-            .cache_anchor
-            .filter(|&anchor| anchor < context.len());
+        request.cache_anchor = self.cache_anchor.filter(|&anchor| anchor < context.len());
 
         request
     }

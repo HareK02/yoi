@@ -13,25 +13,25 @@ use tracing::{info, warn};
 
 use manifest::{PodManifest, PodManifestConfig, ResolveError, Scope, ScopeError, WorkerManifest};
 
-use crate::prompt::agents_md::read_agents_md;
 use crate::compact::state::CompactState;
+use crate::compact::usage_tracker::UsageTracker;
 use crate::hook::{
     Hook, HookRegistryBuilder, OnAbort, OnPromptSubmit, OnTurnEnd, PostToolCall, PreLlmRequest,
     PreRequestInfo, PreToolCall,
 };
 use crate::ipc::alerter::Alerter;
-use crate::ipc::notify_buffer::NotifyBuffer;
 use crate::ipc::interceptor::PodInterceptor;
-use crate::prompt::loader::PromptLoader;
+use crate::ipc::notify_buffer::NotifyBuffer;
+use crate::prompt::agents_md::read_agents_md;
 use crate::prompt::catalog::{CatalogError, PromptCatalog};
+use crate::prompt::loader::PromptLoader;
+use crate::prompt::system::{SystemPromptContext, SystemPromptError, SystemPromptTemplate};
 use crate::runtime::dir;
 use crate::runtime::scope_lock::{self, ScopeAllocationGuard, ScopeLockError};
-use crate::prompt::system::{SystemPromptContext, SystemPromptError, SystemPromptTemplate};
-use crate::compact::usage_tracker::UsageTracker;
-use protocol::{AlertLevel, AlertSource, Event, Segment};
-use tokio::sync::broadcast;
 use async_trait::async_trait;
 use llm_worker::interceptor::PreRequestAction;
+use protocol::{AlertLevel, AlertSource, Event, Segment};
+use tokio::sync::broadcast;
 
 /// Pre-LLM-request hook that records `history.len()` at send time into a
 /// shared `UsageTracker`. The on_usage callback later pairs this with the
@@ -511,9 +511,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 None
             };
 
-            let usage_history_handle = compact_state
-                .as_ref()
-                .map(|_| self.usage_history.clone());
+            let usage_history_handle = compact_state.as_ref().map(|_| self.usage_history.clone());
 
             let interceptor = PodInterceptor::new(
                 registry,
@@ -553,11 +551,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         let agents_md_read = read_agents_md(&self.pwd);
         for warning in agents_md_read.warnings {
             if let Some(n) = alerter.as_ref() {
-                n.alert(
-                    AlertLevel::Warn,
-                    AlertSource::AgentsMd,
-                    warning,
-                );
+                n.alert(AlertLevel::Warn, AlertSource::AgentsMd, warning);
             }
         }
         // Resident-injection collection: only when memory is enabled in
@@ -603,10 +597,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     /// Equivalent to `run(vec![Segment::text(s)])`. The dumb-client
     /// counterpart of [`protocol::Method::run_text`]; primarily for
     /// tests and tools that have only a string in hand.
-    pub async fn run_text(
-        &mut self,
-        s: impl Into<String>,
-    ) -> Result<PodRunResult, PodError> {
+    pub async fn run_text(&mut self, s: impl Into<String>) -> Result<PodRunResult, PodError> {
         self.run(vec![Segment::text(s)]).await
     }
 
@@ -995,7 +986,12 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             .manifest
             .compaction
             .as_ref()
-            .map(|c| (c.compact_auto_read_budget, c.compact_worker_max_input_tokens))
+            .map(|c| {
+                (
+                    c.compact_auto_read_budget,
+                    c.compact_worker_max_input_tokens,
+                )
+            })
             .unwrap_or((
                 manifest::defaults::COMPACT_AUTO_READ_BUDGET,
                 manifest::defaults::COMPACT_WORKER_MAX_INPUT_TOKENS,
@@ -1054,8 +1050,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         // Tools: read_file (shared scope, fresh tracker) + the three
         // compact-specific tools that populate `ctx`.
         summary_worker.register_tool(tools::read_tool(scoped_fs.clone(), summary_tracker));
-        summary_worker
-            .register_tool(mark_read_required_tool(scoped_fs.clone(), ctx.clone()));
+        summary_worker.register_tool(mark_read_required_tool(scoped_fs.clone(), ctx.clone()));
         summary_worker.register_tool(add_reference_tool(ctx.clone()));
         summary_worker.register_tool(write_summary_tool(ctx.clone()));
 
@@ -1092,10 +1087,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             }
         };
         if let Some(prompt) = nudge {
-            let _ = locked_worker
-                .run(prompt)
-                .await
-                .map_err(PodError::Worker)?;
+            let _ = locked_worker.run(prompt).await.map_err(PodError::Worker)?;
         }
 
         let final_ctx = ctx.lock().expect("compact ctx poisoned").clone();
@@ -1154,7 +1146,8 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
 
         // Build new history: [summary, ...auto-read, references, ...retained].
         let mut new_history = Vec::with_capacity(
-            1 + auto_read_messages.len() + reference_message.is_some() as usize
+            1 + auto_read_messages.len()
+                + reference_message.is_some() as usize
                 + retained_items.len(),
         );
         new_history.push(Item::system_message(format!(
@@ -1456,9 +1449,7 @@ fn build_summary_input(items: &[Item], default_refs: &[PathBuf]) -> String {
     }
     out.push_str("## Conversation\n");
     out.push_str(&build_summary_prompt(items));
-    out.push_str(
-        "\n\nWhen you are done, call `write_summary` with the final 5-section text.",
-    );
+    out.push_str("\n\nWhen you are done, call `write_summary` with the final 5-section text.");
     out
 }
 
@@ -1579,10 +1570,8 @@ fn current_pwd() -> Result<PathBuf, PodError> {
         pwd: PathBuf::from("."),
         source,
     })?;
-    cwd.canonicalize().map_err(|source| PodError::InvalidPwd {
-        pwd: cwd,
-        source,
-    })
+    cwd.canonicalize()
+        .map_err(|source| PodError::InvalidPwd { pwd: cwd, source })
 }
 
 #[cfg(test)]

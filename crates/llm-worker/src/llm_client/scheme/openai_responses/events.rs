@@ -38,11 +38,7 @@ impl OpenAIResponsesState {
     /// 既存 slot を取得。無ければ `block_type` で暗黙に確保し、
     /// 新規確保したかを併せて返す。delta 先行 / content_part.added が
     /// 抜けたときの防御。
-    fn get_or_allocate(
-        &mut self,
-        key: SlotKey,
-        block_type: BlockType,
-    ) -> (SlotInfo, bool) {
+    fn get_or_allocate(&mut self, key: SlotKey, block_type: BlockType) -> (SlotInfo, bool) {
         if let Some(info) = self.slots.get(&key).copied() {
             (info, false)
         } else {
@@ -303,15 +299,12 @@ pub(crate) fn parse_sse(
             match ev.item {
                 OutputItem::FunctionCall { call_id, name, .. }
                 | OutputItem::CustomToolCall { call_id, name, .. } => {
-                    let info = state
-                        .allocate(SlotKey::OutputItem(ev.output_index), BlockType::ToolUse);
+                    let info =
+                        state.allocate(SlotKey::OutputItem(ev.output_index), BlockType::ToolUse);
                     Ok(vec![Event::BlockStart(BlockStart {
                         index: info.flat_index,
                         block_type: BlockType::ToolUse,
-                        metadata: BlockMetadata::ToolUse {
-                            id: call_id,
-                            name,
-                        },
+                        metadata: BlockMetadata::ToolUse { id: call_id, name },
                     })])
                 }
                 _ => Ok(Vec::new()),
@@ -530,11 +523,7 @@ mod tests {
         (events, state)
     }
 
-    fn with(
-        state: &mut OpenAIResponsesState,
-        event_type: &str,
-        data: &str,
-    ) -> Vec<Event> {
+    fn with(state: &mut OpenAIResponsesState, event_type: &str, data: &str) -> Vec<Event> {
         parse_sse(event_type, data, state).unwrap()
     }
 
@@ -551,7 +540,8 @@ mod tests {
 
     #[test]
     fn completed_emits_usage_and_status() {
-        let data = r#"{"response":{"usage":{"input_tokens":10,"output_tokens":20,"total_tokens":30}}}"#;
+        let data =
+            r#"{"response":{"usage":{"input_tokens":10,"output_tokens":20,"total_tokens":30}}}"#;
         let (events, _) = run("response.completed", data);
         assert!(matches!(events[0], Event::Usage(_)));
         assert!(matches!(
@@ -761,8 +751,7 @@ mod tests {
 
     #[test]
     fn failed_response_emits_error_and_status() {
-        let data =
-            r#"{"response":{"error":{"type":"invalid_request_error","message":"bad"}}}"#;
+        let data = r#"{"response":{"error":{"type":"invalid_request_error","message":"bad"}}}"#;
         let (events, _) = run("response.failed", data);
         assert_eq!(events.len(), 2);
         assert!(matches!(events[0], Event::Error(_)));

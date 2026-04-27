@@ -45,9 +45,8 @@ struct EditTool {
 #[async_trait]
 impl Tool for EditTool {
     async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError> {
-        let params: EditParams = serde_json::from_str(input_json).map_err(|e| {
-            ToolError::InvalidArgument(format!("invalid MemoryEdit input: {e}"))
-        })?;
+        let params: EditParams = serde_json::from_str(input_json)
+            .map_err(|e| ToolError::InvalidArgument(format!("invalid MemoryEdit input: {e}")))?;
 
         if params.old_string.is_empty() {
             return Err(ToolError::InvalidArgument(
@@ -60,7 +59,9 @@ impl Tool for EditTool {
             ));
         }
 
-        let path = params.kind.resolve_path(&self.layout, params.slug.as_deref())?;
+        let path = params
+            .kind
+            .resolve_path(&self.layout, params.slug.as_deref())?;
 
         let current_bytes = std::fs::read(&path).map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => ToolError::ExecutionFailed(format!(

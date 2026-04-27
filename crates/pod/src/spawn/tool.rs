@@ -294,9 +294,9 @@ impl SpawnPodTool {
             .stderr(Stdio::from(stderr_file))
             .process_group(0);
 
-        let child = cmd
-            .spawn()
-            .map_err(|e| ToolError::ExecutionFailed(format!("failed to spawn `{pod_command}`: {e}")))?;
+        let child = cmd.spawn().map_err(|e| {
+            ToolError::ExecutionFailed(format!("failed to spawn `{pod_command}`: {e}"))
+        })?;
 
         // Default `kill_on_drop = false` keeps the process alive after
         // the `Child` is dropped. We intentionally do not `.wait()` —
@@ -498,7 +498,10 @@ mod tests {
 
         assert_eq!(parsed.model.scheme, Some(SchemeKind::Anthropic));
         assert_eq!(parsed.model.model_id.as_deref(), Some("claude-sonnet-4"));
-        assert_eq!(parsed.model.base_url.as_deref(), Some("https://example.test"));
+        assert_eq!(
+            parsed.model.base_url.as_deref(),
+            Some("https://example.test")
+        );
         let file = match parsed.model.auth {
             Some(AuthRef::ApiKey { file, .. }) => file,
             _ => panic!("expected ApiKey"),

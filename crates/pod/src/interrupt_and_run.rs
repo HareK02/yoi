@@ -42,7 +42,8 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         if !closures.is_empty() {
             self.worker_mut().extend_history(closures);
         }
-        self.worker_mut().push_item(Item::system_message(system_note));
+        self.worker_mut()
+            .push_item(Item::system_message(system_note));
         self.run(input).await
     }
 }
@@ -84,10 +85,7 @@ mod tests {
 
     #[test]
     fn no_orphans_returns_empty() {
-        let history = vec![
-            Item::user_message("hi"),
-            Item::assistant_message("hello"),
-        ];
+        let history = vec![Item::user_message("hi"), Item::assistant_message("hello")];
         let summary = interrupt_tool_result_summary();
         assert!(orphan_tool_result_closures(&history, &summary).is_empty());
     }

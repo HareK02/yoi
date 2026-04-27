@@ -77,9 +77,7 @@ fn clear_runtime_dir() {
 }
 
 /// Accept a single connection, read one `Method`, and return it.
-fn accept_one_method(
-    listener: UnixListener,
-) -> tokio::task::JoinHandle<Option<Method>> {
+fn accept_one_method(listener: UnixListener) -> tokio::task::JoinHandle<Option<Method>> {
     tokio::spawn(async move {
         let (stream, _) = listener.accept().await.ok()?;
         let (reader, _writer) = stream.into_split();

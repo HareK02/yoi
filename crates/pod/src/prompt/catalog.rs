@@ -310,10 +310,7 @@ impl PromptCatalog {
     }
 
     /// Render `PodPrompt::WorkingBoundariesSection` with `{{ scope_summary }}`.
-    pub fn working_boundaries_section(
-        &self,
-        scope_summary: &str,
-    ) -> Result<String, CatalogError> {
+    pub fn working_boundaries_section(&self, scope_summary: &str) -> Result<String, CatalogError> {
         self.render(
             PodPrompt::WorkingBoundariesSection,
             single("scope_summary", scope_summary),
@@ -343,8 +340,7 @@ fn single(key: &'static str, value: &str) -> Value {
 }
 
 fn parse_builtin_pack() -> Result<HashMap<String, String>, CatalogError> {
-    let parsed: PackFile =
-        toml::from_str(INTERNAL_TOML).map_err(CatalogError::ParseBuiltin)?;
+    let parsed: PackFile = toml::from_str(INTERNAL_TOML).map_err(CatalogError::ParseBuiltin)?;
     Ok(parsed.prompt)
 }
 

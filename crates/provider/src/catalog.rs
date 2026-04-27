@@ -53,9 +53,7 @@ pub enum ResolveError {
     MalformedRef(String),
     #[error("model.ref points to unknown provider `{0}`")]
     UnknownProvider(String),
-    #[error(
-        "model.ref omitted; manifest must specify scheme, model_id, and auth (missing: {0})"
-    )]
+    #[error("model.ref omitted; manifest must specify scheme, model_id, and auth (missing: {0})")]
     InlineMissing(&'static str),
 }
 
@@ -259,8 +257,8 @@ pub fn resolve_with_catalogs(
     models: &[ModelEntry],
 ) -> Result<ModelConfig, ResolveError> {
     if let Some(ref_str) = &manifest.ref_ {
-        let (provider_id, ref_model_id) = split_ref(ref_str)
-            .ok_or_else(|| ResolveError::MalformedRef(ref_str.clone()))?;
+        let (provider_id, ref_model_id) =
+            split_ref(ref_str).ok_or_else(|| ResolveError::MalformedRef(ref_str.clone()))?;
         let provider = providers
             .iter()
             .find(|p| p.id == provider_id)
@@ -371,10 +369,7 @@ mod tests {
         let cfg = resolve_with_catalogs(&manifest, &providers, &models).unwrap();
         assert_eq!(cfg.scheme, SchemeKind::Anthropic);
         assert_eq!(cfg.model_id, "claude-sonnet-4-6");
-        assert_eq!(
-            cfg.base_url.as_deref(),
-            Some("https://api.anthropic.com")
-        );
+        assert_eq!(cfg.base_url.as_deref(), Some("https://api.anthropic.com"));
         match cfg.auth {
             AuthRef::ApiKey { env, file } => {
                 assert_eq!(env.as_deref(), Some("INSOMNIA_API_KEY_ANTHROPIC"));
@@ -382,7 +377,10 @@ mod tests {
             }
             _ => panic!("expected ApiKey auth from provider hint"),
         }
-        assert!(cfg.capability.is_some(), "should fall back to provider.default_capability");
+        assert!(
+            cfg.capability.is_some(),
+            "should fall back to provider.default_capability"
+        );
     }
 
     #[test]

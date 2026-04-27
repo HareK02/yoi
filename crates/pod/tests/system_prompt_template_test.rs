@@ -246,11 +246,11 @@ async fn agents_md_absent_omits_trailing_section() {
 #[tokio::test]
 async fn agents_md_not_reread_after_compact() {
     let client = MockClient::new(vec![
-        single_text_events("a"),                                     // pod.run_text("first")
-        single_text_events("b"),                                     // pod.run_text("second")
+        single_text_events("a"), // pod.run_text("first")
+        single_text_events("b"), // pod.run_text("second")
         write_summary_tool_use_events("call-1", "compacted summary"), // compact worker: tool_use
-        single_text_events("done"),                                  // compact worker: close
-        single_text_events("c"),                                     // pod.run_text("third")
+        single_text_events("done"), // compact worker: close
+        single_text_events("c"), // pod.run_text("third")
     ]);
     let (mut pod, pwd) = make_pod_with_body("BODY", client).await.unwrap();
     let agents_path = pwd.join("AGENTS.md");
@@ -278,11 +278,11 @@ async fn agents_md_not_reread_after_compact() {
 #[tokio::test]
 async fn compact_preserves_system_prompt() {
     let client = MockClient::new(vec![
-        single_text_events("a"),                                     // pod.run_text("first")
-        single_text_events("b"),                                     // pod.run_text("second")
+        single_text_events("a"), // pod.run_text("first")
+        single_text_events("b"), // pod.run_text("second")
         write_summary_tool_use_events("call-1", "compacted summary"), // compact worker: tool_use
-        single_text_events("done"),                                  // compact worker: close
-        single_text_events("c"),                                     // pod.run_text("third")
+        single_text_events("done"), // compact worker: close
+        single_text_events("c"), // pod.run_text("third")
     ]);
     let (mut pod, _pwd) = make_pod_with_body("SP cwd={{ cwd }}", client)
         .await

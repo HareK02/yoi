@@ -43,11 +43,12 @@ struct ReadTool {
 #[async_trait]
 impl Tool for ReadTool {
     async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError> {
-        let params: ReadParams = serde_json::from_str(input_json).map_err(|e| {
-            ToolError::InvalidArgument(format!("invalid MemoryRead input: {e}"))
-        })?;
+        let params: ReadParams = serde_json::from_str(input_json)
+            .map_err(|e| ToolError::InvalidArgument(format!("invalid MemoryRead input: {e}")))?;
 
-        let path = params.kind.resolve_path(&self.layout, params.slug.as_deref())?;
+        let path = params
+            .kind
+            .resolve_path(&self.layout, params.slug.as_deref())?;
 
         let bytes = std::fs::read(&path).map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => {

@@ -15,10 +15,10 @@
 //! exposing the underlying mutable state.
 
 use async_trait::async_trait;
-use llm_worker::tool::ToolOutput;
 use llm_worker::interceptor::{
     PostToolAction, PreRequestAction, PreToolAction, PromptAction, TurnEndAction,
 };
+use llm_worker::tool::ToolOutput;
 use serde_json::Value;
 
 // =============================================================================

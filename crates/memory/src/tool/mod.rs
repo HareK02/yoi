@@ -20,7 +20,7 @@ use crate::workspace::{RecordKind, WorkspaceLayout};
 
 pub use edit::edit_tool;
 pub use read::read_tool;
-pub use search::{knowledge_search_tool, memory_search_tool, SearchConfig};
+pub use search::{SearchConfig, knowledge_search_tool, memory_search_tool};
 pub use write::write_tool;
 
 /// Kinds the memory tools accept as input. `Workflow` is intentionally
@@ -71,13 +71,10 @@ impl MemoryToolKind {
             }
             other => {
                 let raw = slug.ok_or_else(|| {
-                    ToolError::InvalidArgument(format!(
-                        "kind={} requires `slug`",
-                        other.as_str()
-                    ))
+                    ToolError::InvalidArgument(format!("kind={} requires `slug`", other.as_str()))
                 })?;
-                let parsed = Slug::parse(raw)
-                    .map_err(|e| ToolError::InvalidArgument(e.to_string()))?;
+                let parsed =
+                    Slug::parse(raw).map_err(|e| ToolError::InvalidArgument(e.to_string()))?;
                 Ok(match other {
                     Self::Decision => layout.decision_path(&parsed),
                     Self::Request => layout.request_path(&parsed),

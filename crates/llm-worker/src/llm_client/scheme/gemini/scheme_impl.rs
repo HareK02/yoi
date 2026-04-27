@@ -3,11 +3,7 @@
 use serde_json::Value;
 
 use crate::llm_client::{
-    ClientError,
-    capability::ModelCapability,
-    event::Event,
-    auth::AuthRequirement,
-    scheme::Scheme,
+    ClientError, auth::AuthRequirement, capability::ModelCapability, event::Event, scheme::Scheme,
     types::Request,
 };
 

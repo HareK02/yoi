@@ -206,10 +206,7 @@ pub fn is_within_effective_write(lock: &LockFile, parent: &str, rule: &ScopeRule
         return false;
     };
     if rule.permission != Permission::Write {
-        return alloc
-            .scope_allow
-            .iter()
-            .any(|r| covers_fully(r, rule));
+        return alloc.scope_allow.iter().any(|r| covers_fully(r, rule));
     }
     let covered = alloc
         .scope_allow
@@ -244,7 +241,11 @@ pub fn find_conflict_owner(
     if rule.permission != Permission::Write {
         return None;
     }
-    for alloc in lock.allocations.iter().filter(|a| a.delegated_from.is_none()) {
+    for alloc in lock
+        .allocations
+        .iter()
+        .filter(|a| a.delegated_from.is_none())
+    {
         if let Some(owner) = find_conflict_in_subtree(lock, alloc, rule) {
             if Some(owner.as_str()) == exempt {
                 continue;
@@ -526,18 +527,12 @@ pub enum ScopeLockError {
     #[error("pod name `{0}` is already registered")]
     DuplicatePodName(String),
     #[error("requested scope `{}` conflicts with pod `{competitor}`", .rule.target.display())]
-    WriteConflict {
-        competitor: String,
-        rule: ScopeRule,
-    },
+    WriteConflict { competitor: String, rule: ScopeRule },
     #[error(
         "requested scope `{}` is not within spawner `{spawner}`'s effective scope",
         .rule.target.display()
     )]
-    NotSubset {
-        spawner: String,
-        rule: ScopeRule,
-    },
+    NotSubset { spawner: String, rule: ScopeRule },
     #[error("pod `{0}` is not registered")]
     UnknownPod(String),
 }

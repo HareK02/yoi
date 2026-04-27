@@ -40,11 +40,12 @@ struct WriteTool {
 #[async_trait]
 impl Tool for WriteTool {
     async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError> {
-        let params: WriteParams = serde_json::from_str(input_json).map_err(|e| {
-            ToolError::InvalidArgument(format!("invalid MemoryWrite input: {e}"))
-        })?;
+        let params: WriteParams = serde_json::from_str(input_json)
+            .map_err(|e| ToolError::InvalidArgument(format!("invalid MemoryWrite input: {e}")))?;
 
-        let path = params.kind.resolve_path(&self.layout, params.slug.as_deref())?;
+        let path = params
+            .kind
+            .resolve_path(&self.layout, params.slug.as_deref())?;
 
         let already_exists = path.exists();
         let mode = if already_exists {
@@ -72,7 +73,11 @@ impl Tool for WriteTool {
 
         let summary = format!(
             "{} {}{}",
-            if already_exists { "Overwrote" } else { "Created" },
+            if already_exists {
+                "Overwrote"
+            } else {
+                "Created"
+            },
             path.display(),
             warning_tail(&report),
         );

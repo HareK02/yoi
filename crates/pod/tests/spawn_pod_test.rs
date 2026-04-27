@@ -14,8 +14,8 @@ use llm_worker::tool::{ToolError, ToolOutput};
 use manifest::{AuthRef, ModelManifest, Permission, SchemeKind, ScopeRule};
 use pod::runtime::dir::{RuntimeDir, SpawnedPodRecord};
 use pod::runtime::scope_lock::{self, LockFileGuard};
-use pod::spawn::tool::spawn_pod_tool;
 use pod::spawn::registry::SpawnedPodRegistry;
+use pod::spawn::tool::spawn_pod_tool;
 use protocol::Method;
 use protocol::stream::JsonLineReader;
 use serde_json::json;
@@ -99,9 +99,7 @@ async fn bind_mock_pod_socket(runtime_base: &Path, pod_name: &str) -> (PathBuf, 
 /// `Method` line, then returns it. `wait_for_socket` inside the tool
 /// makes a probe connection that carries no data, so the task must
 /// tolerate an empty connection and keep listening.
-fn accept_one_method(
-    listener: UnixListener,
-) -> tokio::task::JoinHandle<Option<Method>> {
+fn accept_one_method(listener: UnixListener) -> tokio::task::JoinHandle<Option<Method>> {
     tokio::spawn(async move {
         loop {
             let (stream, _) = listener.accept().await.ok()?;
@@ -192,7 +190,11 @@ async fn spawn_pod_delegates_scope_and_sends_run() {
     .to_string();
 
     let output: ToolOutput = tool.execute(&input).await.unwrap();
-    assert!(output.summary.contains("child"), "summary: {}", output.summary);
+    assert!(
+        output.summary.contains("child"),
+        "summary: {}",
+        output.summary
+    );
 
     // Verify the tool delivered Method::Run to the socket.
     let method = received.await.unwrap().expect("expected one Method line");
@@ -261,7 +263,10 @@ async fn spawn_pod_rejects_scope_outside_spawner() {
     let err = tool.execute(&input).await.unwrap_err();
     match err {
         ToolError::InvalidArgument(msg) => {
-            assert!(msg.contains("not within"), "expected NotSubset wording: {msg}");
+            assert!(
+                msg.contains("not within"),
+                "expected NotSubset wording: {msg}"
+            );
         }
         other => panic!("expected InvalidArgument, got {other:?}"),
     }

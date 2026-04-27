@@ -17,12 +17,8 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
-use crossterm::event::{
-    self, Event as TermEvent, KeyCode, KeyEventKind, KeyModifiers,
-};
-use manifest::{
-    PodManifestConfig, find_project_manifest_from, load_layer, user_manifest_path,
-};
+use crossterm::event::{self, Event as TermEvent, KeyCode, KeyEventKind, KeyModifiers};
+use manifest::{PodManifestConfig, find_project_manifest_from, load_layer, user_manifest_path};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout};
@@ -103,7 +99,10 @@ pub async fn run() -> Result<SpawnOutcome, SpawnError> {
     let project_layer = find_project_manifest_from(&cwd).and_then(|p| load_layer(&p).ok());
 
     let mut cascade = PodManifestConfig::builtin_defaults();
-    for layer in [user_layer.as_ref(), project_layer.as_ref()].into_iter().flatten() {
+    for layer in [user_layer.as_ref(), project_layer.as_ref()]
+        .into_iter()
+        .flatten()
+    {
         cascade = cascade.merge(layer.clone());
     }
     let cascade_has_scope = !cascade.scope.allow.is_empty();
@@ -147,8 +146,7 @@ pub async fn run() -> Result<SpawnOutcome, SpawnError> {
             None => continue,
             Some(Action::Submit) => {
                 if form.name.trim().is_empty() {
-                    form.message =
-                        Some(("name is required".to_string(), MessageKind::Error));
+                    form.message = Some(("name is required".to_string(), MessageKind::Error));
                     continue;
                 }
                 break;
@@ -358,7 +356,10 @@ fn build_overlay_toml(form: &Form) -> String {
         );
         rule.insert("permission".into(), toml::Value::String("write".into()));
         let mut scope = toml::value::Table::new();
-        scope.insert("allow".into(), toml::Value::Array(vec![toml::Value::Table(rule)]));
+        scope.insert(
+            "allow".into(),
+            toml::Value::Array(vec![toml::Value::Table(rule)]),
+        );
         root.insert("scope".into(), toml::Value::Table(scope));
     }
 
@@ -381,7 +382,6 @@ fn resolve_pod_command() -> PathBuf {
     }
     PathBuf::from("pod")
 }
-
 
 struct StderrTail {
     lines: std::collections::VecDeque<String>,
@@ -529,7 +529,9 @@ fn name_line(form: &Form) -> Line<'_> {
         Span::styled("name: ", Style::default().fg(Color::DarkGray)),
         Span::styled(
             form.name.as_str(),
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         ),
     ])
 }

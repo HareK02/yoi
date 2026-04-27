@@ -14,11 +14,11 @@ use std::sync::{Arc, LazyLock, Mutex};
 use llm_worker::llm_client::types::{ContentPart, Item, Role};
 use llm_worker::tool::ToolOutput;
 use manifest::{Permission, ScopeRule};
+use pod::runtime::dir::{RuntimeDir, SpawnedPodRecord};
+use pod::runtime::scope_lock::{self, LockFileGuard};
 use pod::spawn::comm_tools::{
     list_pods_tool, read_pod_output_tool, send_to_pod_tool, stop_pod_tool,
 };
-use pod::runtime::dir::{RuntimeDir, SpawnedPodRecord};
-use pod::runtime::scope_lock::{self, LockFileGuard};
 use pod::spawn::registry::SpawnedPodRegistry;
 use protocol::stream::{JsonLineReader, JsonLineWriter};
 use protocol::{ErrorCode, Event, Greeting, Method};
@@ -211,7 +211,11 @@ async fn send_to_pod_delivers_run_method() {
     let (_meta, tool) = def();
     let input = json!({ "name": "child", "message": "hello there" }).to_string();
     let output: ToolOutput = tool.execute(&input).await.unwrap();
-    assert!(output.summary.contains("child"), "summary: {}", output.summary);
+    assert!(
+        output.summary.contains("child"),
+        "summary: {}",
+        output.summary
+    );
 
     let method = received.await.unwrap().expect("expected a method");
     match method {
@@ -292,7 +296,11 @@ async fn read_pod_output_returns_new_assistant_text_then_empty_on_second_call() 
 
     // Cursor now points past all items — second call returns no new text.
     let second: ToolOutput = tool.execute(&input).await.unwrap();
-    assert!(second.content.is_none(), "unexpected content: {:?}", second.content);
+    assert!(
+        second.content.is_none(),
+        "unexpected content: {:?}",
+        second.content
+    );
     assert!(
         second.summary.contains("no new assistant text"),
         "summary: {}",
@@ -451,6 +459,10 @@ async fn list_pods_empty_when_nothing_registered() {
     let def = list_pods_tool(registry);
     let (_meta, tool) = def();
     let output: ToolOutput = tool.execute("{}").await.unwrap();
-    assert!(output.summary.contains("no spawned pods"), "{}", output.summary);
+    assert!(
+        output.summary.contains("no spawned pods"),
+        "{}",
+        output.summary
+    );
     assert!(output.content.is_none());
 }

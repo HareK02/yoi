@@ -208,23 +208,13 @@ impl Linter {
                     report.push_error(LintError::ReplacedBySelf);
                 }
             }
-            references::check_replaced_by(
-                cp.slug.as_ref(),
-                target,
-                existing,
-                report,
-            );
+            references::check_replaced_by(cp.slug.as_ref(), target, existing, report);
         }
 
         warnings::check_warnings_with_sources(parsed.body, fm.sources.len(), report);
     }
 
-    fn check_knowledge(
-        &self,
-        content: &str,
-        cp: &ClassifiedPath,
-        report: &mut LintReport,
-    ) {
+    fn check_knowledge(&self, content: &str, cp: &ClassifiedPath, report: &mut LintReport) {
         let parsed = match parse_frontmatter::<KnowledgeFrontmatter>(content) {
             Ok(p) => p,
             Err(e) => {
@@ -236,8 +226,7 @@ impl Linter {
         size::check_body::<KnowledgeFrontmatter>(parsed.body, report);
 
         if fm.model_invokation
-            && fm.description.chars().count()
-                > crate::schema::KNOWLEDGE_DESCRIPTION_HARD_CAP
+            && fm.description.chars().count() > crate::schema::KNOWLEDGE_DESCRIPTION_HARD_CAP
         {
             report.push_error(LintError::DescriptionTooLong {
                 actual: fm.description.chars().count(),
@@ -339,7 +328,12 @@ mod tests {
             now = iso_now()
         );
         let report = linter.lint(&path, &content, WriteMode::Create);
-        assert!(report.errors.iter().any(|e| matches!(e, LintError::WorkflowWriteForbidden)));
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| matches!(e, LintError::WorkflowWriteForbidden))
+        );
     }
 
     #[test]
@@ -347,7 +341,12 @@ mod tests {
         let (dir, linter) = workspace();
         let path = dir.path().join("src/main.rs");
         let report = linter.lint(&path, "ignored", WriteMode::Create);
-        assert!(report.errors.iter().any(|e| matches!(e, LintError::InvalidPath(_))));
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| matches!(e, LintError::InvalidPath(_)))
+        );
     }
 
     #[test]
@@ -359,10 +358,12 @@ mod tests {
             now = iso_now()
         );
         let report = linter.lint(&path, &content, WriteMode::Create);
-        assert!(report.errors.iter().any(|e| matches!(
-            e,
-            LintError::UnknownReference { .. }
-        )));
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| matches!(e, LintError::UnknownReference { .. }))
+        );
     }
 
     #[test]
@@ -374,7 +375,12 @@ mod tests {
             now = iso_now()
         );
         let report = linter.lint(&path, &content, WriteMode::Update);
-        assert!(report.errors.iter().any(|e| matches!(e, LintError::ReplacedBySelf)));
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| matches!(e, LintError::ReplacedBySelf))
+        );
     }
 
     #[test]
@@ -424,7 +430,12 @@ mod tests {
             now = iso_now()
         );
         let report = linter.lint(&path, &content, WriteMode::Create);
-        assert!(report.errors.iter().any(|e| matches!(e, LintError::DescriptionTooLong { .. })));
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| matches!(e, LintError::DescriptionTooLong { .. }))
+        );
     }
 
     #[test]
@@ -468,7 +479,12 @@ mod tests {
             now = iso_now()
         );
         let report = linter.lint(&path, &content, WriteMode::Create);
-        assert!(report.errors.iter().any(|e| matches!(e, LintError::SlugAlreadyExists(_))));
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| matches!(e, LintError::SlugAlreadyExists(_)))
+        );
     }
 
     #[test]
@@ -549,7 +565,11 @@ mod tests {
             .warnings
             .iter()
             .any(|w| matches!(w, LintWarning::SimilarSlugs(slugs) if slugs.len() >= 3));
-        assert!(warned, "expected SimilarSlugs warning, got {:?}", report.warnings);
+        assert!(
+            warned,
+            "expected SimilarSlugs warning, got {:?}",
+            report.warnings
+        );
     }
 
     #[test]
@@ -591,7 +611,12 @@ mod tests {
             body = big_body
         );
         let report = linter.lint(&path, &content, WriteMode::Create);
-        assert!(report.errors.iter().any(|e| matches!(e, LintError::BodyTooLong { .. })));
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| matches!(e, LintError::BodyTooLong { .. }))
+        );
         // Sanity: ensure path was treated as PathBuf consistently.
         let _ = PathBuf::from(path);
     }

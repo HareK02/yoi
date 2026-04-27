@@ -28,12 +28,7 @@ fn main() {
     let prompt_section = parsed
         .get("prompt")
         .and_then(|v| v.as_table())
-        .unwrap_or_else(|| {
-            panic!(
-                "{} must contain a `[prompt]` table",
-                toml_path.display()
-            )
-        });
+        .unwrap_or_else(|| panic!("{} must contain a `[prompt]` table", toml_path.display()));
 
     let mut keys: Vec<String> = prompt_section.keys().cloned().collect();
     keys.sort();

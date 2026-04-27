@@ -138,11 +138,7 @@ impl WorkspaceLayout {
         let knowledge = self.knowledge_dir();
 
         if let Ok(rel) = path.strip_prefix(&knowledge) {
-            return Ok(Some(classify_kinded_md(
-                rel,
-                RecordKind::Knowledge,
-                path,
-            )?));
+            return Ok(Some(classify_kinded_md(rel, RecordKind::Knowledge, path)?));
         }
         let rel = match path.strip_prefix(&memory) {
             Ok(r) => r,

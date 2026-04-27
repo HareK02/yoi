@@ -59,7 +59,8 @@ impl CompactWorkerContext {
     }
 
     fn remaining_budget(&self) -> u64 {
-        self.auto_read_budget.saturating_sub(self.auto_read_consumed)
+        self.auto_read_budget
+            .saturating_sub(self.auto_read_consumed)
     }
 }
 

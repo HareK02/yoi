@@ -74,9 +74,12 @@ fn render_read_aggregate(blocks: &[Block], start: usize, mode: Mode) -> ToolRend
         })
         .collect();
 
-    let in_progress = group
-        .iter()
-        .any(|tc| !matches!(tc.state, ToolCallState::Done { .. } | ToolCallState::Error { .. } | ToolCallState::Incomplete));
+    let in_progress = group.iter().any(|tc| {
+        !matches!(
+            tc.state,
+            ToolCallState::Done { .. } | ToolCallState::Error { .. } | ToolCallState::Incomplete
+        )
+    });
 
     let paths: Vec<String> = group.iter().map(|tc| read_path(tc)).collect();
     let count = paths.len();
@@ -89,9 +92,7 @@ fn render_read_aggregate(blocks: &[Block], start: usize, mode: Mode) -> ToolRend
     } else {
         format!("Read — {count} file{} read", plural(count))
     };
-    lines.push(Line::from(vec![
-        Span::styled(header, tool_style),
-    ]));
+    lines.push(Line::from(vec![Span::styled(header, tool_style)]));
 
     if matches!(mode, Mode::Overview) {
         return ToolRenderOutput {
@@ -169,17 +170,15 @@ fn render_write(cache: &FileCache, tc: &ToolCallBlock, mode: Mode) -> Vec<Line<'
         ])];
     }
 
-    let mut lines = vec![
-        Line::from(vec![
-            Span::styled("Write — ".to_owned(), tool_style),
-            Span::styled(format!("{label} "), label_style),
-            Span::styled(path.clone(), Style::default().fg(Color::White)),
-            Span::styled(
-                format!("  ({})", state_suffix(&tc.state)),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]),
-    ];
+    let mut lines = vec![Line::from(vec![
+        Span::styled("Write — ".to_owned(), tool_style),
+        Span::styled(format!("{label} "), label_style),
+        Span::styled(path.clone(), Style::default().fg(Color::White)),
+        Span::styled(
+            format!("  ({})", state_suffix(&tc.state)),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ])];
 
     // Body preview.
     let cap = match mode {
@@ -214,7 +213,12 @@ fn render_write(cache: &FileCache, tc: &ToolCallBlock, mode: Mode) -> Vec<Line<'
 // Edit
 // ---------------------------------------------------------------------
 
-fn render_edit(cache: &FileCache, tc: &ToolCallBlock, width: u16, mode: Mode) -> Vec<Line<'static>> {
+fn render_edit(
+    cache: &FileCache,
+    tc: &ToolCallBlock,
+    width: u16,
+    mode: Mode,
+) -> Vec<Line<'static>> {
     let args = parsed_args(tc);
     let path = args
         .as_ref()
@@ -296,9 +300,7 @@ fn build_edit_diff(content: &str, old: &str, new: &str, width: u16) -> Vec<Line<
 
     // Width for the line-number gutter: fit the largest number we'll
     // print across either file's version of this hunk.
-    let max_line = ctx_end
-        .max(line_of_idx + new_line_count)
-        .max(1);
+    let max_line = ctx_end.max(line_of_idx + new_line_count).max(1);
     let num_w = max_line.to_string().len();
 
     // BG-highlighted rows for -/+ so the change stripe extends full
@@ -512,12 +514,10 @@ fn render_search(tc: &ToolCallBlock, mode: Mode, label: &str) -> Vec<Line<'stati
         ])];
     }
 
-    let mut lines = vec![Line::from(vec![
-        Span::styled(
-            format!("{label} — {}", state_suffix(&tc.state)),
-            tool_style,
-        ),
-    ])];
+    let mut lines = vec![Line::from(vec![Span::styled(
+        format!("{label} — {}", state_suffix(&tc.state)),
+        tool_style,
+    )])];
 
     let cap = match mode {
         Mode::Normal => NORMAL_MAX_BODY,
@@ -565,17 +565,13 @@ fn render_default(tc: &ToolCallBlock, mode: Mode) -> Vec<Line<'static>> {
         } else {
             format!("{} — {suffix}", tc.name)
         };
-        return vec![Line::from(vec![
-            Span::styled(label, tool_style),
-        ])];
+        return vec![Line::from(vec![Span::styled(label, tool_style)])];
     }
 
-    let mut lines = vec![Line::from(vec![
-        Span::styled(
-            format!("{} — {}", tc.name, state_suffix(&tc.state)),
-            tool_style,
-        ),
-    ])];
+    let mut lines = vec![Line::from(vec![Span::styled(
+        format!("{} — {}", tc.name, state_suffix(&tc.state)),
+        tool_style,
+    )])];
 
     let args_pretty = parsed_args(tc)
         .and_then(|v| serde_json::to_string_pretty(&v).ok())
@@ -589,7 +585,9 @@ fn render_default(tc: &ToolCallBlock, mode: Mode) -> Vec<Line<'static>> {
         &mut lines,
         &args_pretty,
         arg_cap,
-        Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC),
     );
 
     let summary_source: String = match &tc.state {
@@ -660,12 +658,7 @@ fn maybe_error_line(lines: &mut Vec<Line<'static>>, state: &ToolCallState) {
     }
 }
 
-fn emit_capped_lines(
-    out: &mut Vec<Line<'static>>,
-    text: &str,
-    cap: usize,
-    style: Style,
-) {
+fn emit_capped_lines(out: &mut Vec<Line<'static>>, text: &str, cap: usize, style: Style) {
     let all: Vec<&str> = text.lines().collect();
     let shown = all.len().min(cap);
     for l in &all[..shown] {

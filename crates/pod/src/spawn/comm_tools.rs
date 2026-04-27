@@ -43,8 +43,7 @@ struct NameInput {
 // SendToPod
 // ---------------------------------------------------------------------------
 
-const SEND_TO_POD_DESCRIPTION: &str =
-    "Send a text message to a previously spawned Pod. The spawned Pod \
+const SEND_TO_POD_DESCRIPTION: &str = "Send a text message to a previously spawned Pod. The spawned Pod \
 processes it as a user turn. Fails if the Pod is already executing a \
 turn — retry after it finishes. Does not wait for the turn to complete; \
 use `ReadPodOutput` to fetch results afterwards.";
@@ -109,8 +108,7 @@ pub fn send_to_pod_tool(registry: Arc<SpawnedPodRegistry>) -> ToolDefinition {
 // ReadPodOutput
 // ---------------------------------------------------------------------------
 
-const READ_POD_OUTPUT_DESCRIPTION: &str =
-    "Fetch new assistant text from a spawned Pod since the last read. \
+const READ_POD_OUTPUT_DESCRIPTION: &str = "Fetch new assistant text from a spawned Pod since the last read. \
 Uses an internal cursor per-Pod so consecutive calls return only \
 newly-produced output. Returns the Pod's current status and the new \
 text, or reports `stopped` if the Pod can no longer be reached.";
@@ -122,9 +120,8 @@ struct ReadPodOutputTool {
 #[async_trait]
 impl Tool for ReadPodOutputTool {
     async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError> {
-        let input: NameInput = serde_json::from_str(input_json).map_err(|e| {
-            ToolError::InvalidArgument(format!("invalid ReadPodOutput input: {e}"))
-        })?;
+        let input: NameInput = serde_json::from_str(input_json)
+            .map_err(|e| ToolError::InvalidArgument(format!("invalid ReadPodOutput input: {e}")))?;
         let record = self
             .registry
             .get(&input.name)
@@ -154,7 +151,10 @@ impl Tool for ReadPodOutputTool {
             format!("pod `{}` running; no new assistant text", input.name)
         } else {
             let lines = new_text.lines().count();
-            format!("pod `{}`: {lines} new line(s) of assistant text", input.name)
+            format!(
+                "pod `{}`: {lines} new line(s) of assistant text",
+                input.name
+            )
         };
         let content = if new_text.is_empty() {
             None
@@ -183,8 +183,7 @@ pub fn read_pod_output_tool(registry: Arc<SpawnedPodRegistry>) -> ToolDefinition
 // StopPod
 // ---------------------------------------------------------------------------
 
-const STOP_POD_DESCRIPTION: &str =
-    "Terminate a spawned Pod and reclaim the delegated scope. The Pod \
+const STOP_POD_DESCRIPTION: &str = "Terminate a spawned Pod and reclaim the delegated scope. The Pod \
 receives `Shutdown`; its scope entry is released in the machine-wide \
 registry so the spawner can spawn a new Pod over the same paths.";
 
@@ -247,8 +246,7 @@ pub fn stop_pod_tool(registry: Arc<SpawnedPodRegistry>) -> ToolDefinition {
 // ListPods
 // ---------------------------------------------------------------------------
 
-const LIST_PODS_DESCRIPTION: &str =
-    "List all Pods spawned by this Pod along with their reachability \
+const LIST_PODS_DESCRIPTION: &str = "List all Pods spawned by this Pod along with their reachability \
 status (`alive` / `stopped`) and the scope each was granted.";
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -364,9 +362,9 @@ async fn send_run_and_confirm(socket: &Path, input: String) -> Result<(), SendRu
             input: vec![protocol::Segment::text(input)],
         }),
     )
-        .await
-        .map_err(|_| SendRunError::Io("write timed out".into()))?
-        .map_err(|e| SendRunError::Io(format!("write: {e}")))?;
+    .await
+    .map_err(|_| SendRunError::Io("write timed out".into()))?
+    .map_err(|e| SendRunError::Io(format!("write: {e}")))?;
     loop {
         let event = tokio::time::timeout(SOCKET_OP_TIMEOUT, reader.next::<Event>())
             .await

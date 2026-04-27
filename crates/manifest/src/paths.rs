@@ -161,10 +161,7 @@ mod tests {
                 "XDG_RUNTIME_DIR",
                 "HOME",
             ];
-            let saved: Vec<_> = names
-                .iter()
-                .map(|n| (*n, std::env::var(n).ok()))
-                .collect();
+            let saved: Vec<_> = names.iter().map(|n| (*n, std::env::var(n).ok())).collect();
             // SAFETY: env_lock() 取得済みなので env への並行アクセスは
             // この test バイナリ内では発生しない。
             unsafe {
@@ -206,10 +203,7 @@ mod tests {
 
     #[test]
     fn config_dir_uses_xdg_when_set() {
-        let _g = EnvGuard::new(&[
-            ("HOME", Some("/h")),
-            ("XDG_CONFIG_HOME", Some("/x")),
-        ]);
+        let _g = EnvGuard::new(&[("HOME", Some("/h")), ("XDG_CONFIG_HOME", Some("/x"))]);
         assert_eq!(config_dir().unwrap(), PathBuf::from("/x/insomnia"));
     }
 
@@ -241,10 +235,7 @@ mod tests {
 
     #[test]
     fn data_dir_insomnia_home_is_data_dir_itself() {
-        let _g = EnvGuard::new(&[
-            ("HOME", Some("/h")),
-            ("INSOMNIA_HOME", Some("/sand")),
-        ]);
+        let _g = EnvGuard::new(&[("HOME", Some("/h")), ("INSOMNIA_HOME", Some("/sand"))]);
         assert_eq!(data_dir().unwrap(), PathBuf::from("/sand"));
     }
 
@@ -278,10 +269,7 @@ mod tests {
 
     #[test]
     fn empty_env_treated_as_unset() {
-        let _g = EnvGuard::new(&[
-            ("HOME", Some("/h")),
-            ("XDG_CONFIG_HOME", Some("")),
-        ]);
+        let _g = EnvGuard::new(&[("HOME", Some("/h")), ("XDG_CONFIG_HOME", Some(""))]);
         assert_eq!(config_dir().unwrap(), PathBuf::from("/h/.config/insomnia"));
     }
 
@@ -312,10 +300,7 @@ mod tests {
             user_catalog_override("providers.toml").unwrap(),
             PathBuf::from("/sand/config/providers.toml")
         );
-        assert_eq!(
-            sessions_dir().unwrap(),
-            PathBuf::from("/sand/sessions")
-        );
+        assert_eq!(sessions_dir().unwrap(), PathBuf::from("/sand/sessions"));
         assert_eq!(
             scope_lock_path().unwrap(),
             PathBuf::from("/sand/run/scope.lock")

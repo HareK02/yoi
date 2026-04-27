@@ -61,13 +61,17 @@ pub enum LintError {
     #[error("Decisions `status` must be one of open|resolved|replaced (got `{0}`)")]
     InvalidStatus(String),
 
-    #[error("Knowledge with model_invokation: true cannot have description longer than {limit} chars (got {actual})")]
+    #[error(
+        "Knowledge with model_invokation: true cannot have description longer than {limit} chars (got {actual})"
+    )]
     DescriptionTooLong { actual: usize, limit: usize },
 
     #[error("body exceeds the size limit for this record kind: {actual} chars > {limit}")]
     BodyTooLong { actual: usize, limit: usize },
 
-    #[error("write to `memory/workflow/` is forbidden via the memory tool — Workflows are human-edited")]
+    #[error(
+        "write to `memory/workflow/` is forbidden via the memory tool — Workflows are human-edited"
+    )]
     WorkflowWriteForbidden,
 
     #[error("slug `{0}` already exists; use the edit tool instead of creating a new record")]

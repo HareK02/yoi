@@ -23,10 +23,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
-use llm_worker::llm_client::{
-    ClientError,
-    auth::AuthProvider,
-};
+use llm_worker::llm_client::{ClientError, auth::AuthProvider};
 use reqwest::header::{HeaderName, HeaderValue};
 use tokio::sync::Mutex;
 
@@ -66,8 +63,8 @@ impl CodexAuthProvider {
         let codex_home = if let Ok(p) = std::env::var("CODEX_HOME") {
             PathBuf::from(p)
         } else {
-            let home = std::env::var("HOME")
-                .map_err(|_| ClientError::Config("HOME not set".into()))?;
+            let home =
+                std::env::var("HOME").map_err(|_| ClientError::Config("HOME not set".into()))?;
             PathBuf::from(home).join(".codex")
         };
         Ok(Self::new(codex_home))
@@ -142,7 +139,9 @@ impl CodexAuthProvider {
         Ok(new_snap)
     }
 
-    fn build_headers(snap: &AuthSnapshot) -> Result<Vec<(HeaderName, HeaderValue)>, CodexAuthError> {
+    fn build_headers(
+        snap: &AuthSnapshot,
+    ) -> Result<Vec<(HeaderName, HeaderValue)>, CodexAuthError> {
         let mut out = Vec::with_capacity(5);
 
         let auth_val = HeaderValue::from_str(&format!("Bearer {}", snap.access_token))
@@ -151,10 +150,7 @@ impl CodexAuthProvider {
 
         let acc_val = HeaderValue::from_str(&snap.account_id)
             .map_err(|e| CodexAuthError::InvalidHeader(format!("ChatGPT-Account-Id: {e}")))?;
-        out.push((
-            HeaderName::from_static("chatgpt-account-id"),
-            acc_val,
-        ));
+        out.push((HeaderName::from_static("chatgpt-account-id"), acc_val));
 
         // Cloudflare WAF は ChatGPT backend アクセス元を `originator` /
         // `User-Agent` で識別する。Codex CLI が送る固定値を流用しないと
@@ -186,7 +182,10 @@ impl CodexAuthProvider {
 #[async_trait]
 impl AuthProvider for CodexAuthProvider {
     async fn headers(&self) -> Result<Vec<(HeaderName, HeaderValue)>, ClientError> {
-        let snap = self.ensure_fresh().await.map_err(CodexAuthError::to_client_error)?;
+        let snap = self
+            .ensure_fresh()
+            .await
+            .map_err(CodexAuthError::to_client_error)?;
         Self::build_headers(&snap).map_err(CodexAuthError::to_client_error)
     }
 }
@@ -247,7 +246,10 @@ mod tests {
         let provider = CodexAuthProvider::new(dir.path().to_path_buf());
 
         let headers = provider.headers().await.unwrap();
-        let names: Vec<_> = headers.iter().map(|(n, _)| n.as_str().to_string()).collect();
+        let names: Vec<_> = headers
+            .iter()
+            .map(|(n, _)| n.as_str().to_string())
+            .collect();
         assert!(names.contains(&"authorization".to_string()));
         assert!(names.contains(&"chatgpt-account-id".to_string()));
         assert!(!names.contains(&"x-openai-fedramp".to_string()));
@@ -276,7 +278,12 @@ mod tests {
     #[tokio::test]
     async fn refreshes_when_expired_and_persists() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write_auth(dir.path(), Utc::now().timestamp() - 60, false, "old-refresh");
+        let path = write_auth(
+            dir.path(),
+            Utc::now().timestamp() - 60,
+            false,
+            "old-refresh",
+        );
 
         // refresh エンドポイントを mock。新しい JWT (将来 exp) を返す
         let server = MockServer::start().await;
@@ -315,7 +322,12 @@ mod tests {
     #[tokio::test]
     async fn permanent_refresh_failure_surfaces_login_message() {
         let dir = tempfile::tempdir().unwrap();
-        write_auth(dir.path(), Utc::now().timestamp() - 60, false, "bad-refresh");
+        write_auth(
+            dir.path(),
+            Utc::now().timestamp() - 60,
+            false,
+            "bad-refresh",
+        );
 
         let server = MockServer::start().await;
         Mock::given(method("POST"))

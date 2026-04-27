@@ -22,7 +22,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use protocol::{AlertLevel, Greeting, Segment};
 
-use crate::app::{App, fmt_tokens, alert_source_label};
+use crate::app::{App, alert_source_label, fmt_tokens};
 use crate::block::{Block, CompactEvent};
 
 /// Display density for the history view.
@@ -64,10 +64,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let input_height = input_area_height(&input_render, area.height);
 
     let chunks = Layout::vertical([
-        Constraint::Min(0),                  // history view
-        Constraint::Length(1),               // separator
-        Constraint::Length(1),               // status
-        Constraint::Length(input_height),    // input area
+        Constraint::Min(0),               // history view
+        Constraint::Length(1),            // separator
+        Constraint::Length(1),            // status
+        Constraint::Length(input_height), // input area
     ])
     .split(area);
 
@@ -219,21 +219,20 @@ fn wrap_line_into(line: Line<'static>, width: u16, out: &mut Vec<Line<'static>>)
         *pending_width = 0;
     };
 
-    let push_row = |current: &mut Vec<Span<'static>>,
-                    row_width: &mut usize,
-                    out: &mut Vec<Line<'static>>| {
-        if fill_to_width && *row_width < w {
-            let pad = w - *row_width;
-            current.push(Span::styled(" ".repeat(pad), line_style));
-            *row_width = w;
-        }
-        let mut l = Line::from(std::mem::take(current)).style(line_style);
-        if let Some(a) = alignment {
-            l = l.alignment(a);
-        }
-        out.push(l);
-        *row_width = 0;
-    };
+    let push_row =
+        |current: &mut Vec<Span<'static>>, row_width: &mut usize, out: &mut Vec<Line<'static>>| {
+            if fill_to_width && *row_width < w {
+                let pad = w - *row_width;
+                current.push(Span::styled(" ".repeat(pad), line_style));
+                *row_width = w;
+            }
+            let mut l = Line::from(std::mem::take(current)).style(line_style);
+            if let Some(a) = alignment {
+                l = l.alignment(a);
+            }
+            out.push(l);
+            *row_width = 0;
+        };
 
     for span in line.spans {
         if !pending.is_empty() && span.style != pending_style {
@@ -276,12 +275,7 @@ fn wrap_line_into(line: Line<'static>, width: u16, out: &mut Vec<Line<'static>>)
     push_row(&mut current, &mut row_width, out);
 }
 
-fn render_block_into(
-    lines: &mut Vec<Line<'static>>,
-    block: &Block,
-    width: u16,
-    mode: Mode,
-) {
+fn render_block_into(lines: &mut Vec<Line<'static>>, block: &Block, width: u16, mode: Mode) {
     match block {
         Block::Greeting(g) => match mode {
             Mode::Overview => {
@@ -426,10 +420,7 @@ fn segment_display_text(seg: &Segment) -> String {
     match seg {
         Segment::Text { content } => content.replace('\n', " "),
         Segment::Paste {
-            id,
-            chars,
-            lines,
-            ..
+            id, chars, lines, ..
         } => format!("[Clipboard #{id} | {chars} chars, {lines} lines]"),
         Segment::FileRef { path } => format!("@{path}"),
         Segment::KnowledgeRef { slug } => format!("#{slug}"),
@@ -554,16 +545,19 @@ fn render_compact(lines: &mut Vec<Line<'static>>, evt: &CompactEvent, width: u16
     let (text, kind) = match evt {
         CompactEvent::Start => ("[compact] starting".to_owned(), MessageKind::NoticeWarn),
         CompactEvent::Done { new_session_id } => {
-            let short = new_session_id.to_string().chars().take(8).collect::<String>();
+            let short = new_session_id
+                .to_string()
+                .chars()
+                .take(8)
+                .collect::<String>();
             (
                 format!("[compact] done (new session {short})"),
                 MessageKind::NoticeWarn,
             )
         }
-        CompactEvent::Failed { error } => (
-            format!("[compact error] {error}"),
-            MessageKind::NoticeError,
-        ),
+        CompactEvent::Failed { error } => {
+            (format!("[compact error] {error}"), MessageKind::NoticeError)
+        }
     };
     match mode {
         Mode::Overview => push_overview_line(lines, &text, width, kind, ""),
@@ -772,4 +766,3 @@ pub fn kind_style(kind: MessageKind) -> Style {
             .add_modifier(Modifier::BOLD),
     }
 }
-

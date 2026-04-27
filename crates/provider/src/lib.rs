@@ -58,10 +58,7 @@ pub enum ProviderError {
 /// 1. `AuthRef::ApiKey { env, .. }` で env が指定されていればその変数を参照
 /// 2. そうでなければ scheme 既定の環境変数 (`SchemeKind::default_env_var`)
 /// 3. それでも無ければ `file` を読む（絶対パスのみ）
-fn resolve_auth(
-    scheme: SchemeKind,
-    auth: &AuthRef,
-) -> Result<ResolvedAuth, ProviderError> {
+fn resolve_auth(scheme: SchemeKind, auth: &AuthRef) -> Result<ResolvedAuth, ProviderError> {
     match auth {
         AuthRef::None => Ok(ResolvedAuth::None),
         AuthRef::ApiKey { env, file } => {
@@ -161,9 +158,7 @@ pub fn build_client(manifest: &ModelManifest) -> Result<Box<dyn LlmClient>, Prov
 /// `ModelManifest` から既に `catalog::resolve_model_manifest` を通した
 /// ケース（factory / spawn 経路でカタログ引きを 1 回だけにしたい等）で
 /// 使う。
-pub fn build_client_from_config(
-    config: &ModelConfig,
-) -> Result<Box<dyn LlmClient>, ProviderError> {
+pub fn build_client_from_config(config: &ModelConfig) -> Result<Box<dyn LlmClient>, ProviderError> {
     build_from_config(config)
 }
 

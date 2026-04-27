@@ -23,8 +23,7 @@ use std::path::{Path, PathBuf};
 use include_dir::{Dir, include_dir};
 use thiserror::Error;
 
-static BUILTIN_PROMPTS: Dir<'static> =
-    include_dir!("$CARGO_MANIFEST_DIR/../../resources/prompts");
+static BUILTIN_PROMPTS: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/../../resources/prompts");
 
 const PREFIX_INSOMNIA: &str = "$insomnia";
 const PREFIX_USER: &str = "$user";
@@ -190,10 +189,12 @@ impl PromptLoader {
         }
         if let Some(prefix) = trimmed.strip_prefix('$') {
             let (prefix_name, rest) =
-                prefix.split_once('/').ok_or_else(|| LoaderError::InvalidRef {
-                    raw: raw.to_string(),
-                    reason: "prefix must be followed by '/'".into(),
-                })?;
+                prefix
+                    .split_once('/')
+                    .ok_or_else(|| LoaderError::InvalidRef {
+                        raw: raw.to_string(),
+                        reason: "prefix must be followed by '/'".into(),
+                    })?;
             let prefix = parse_prefix(raw, prefix_name)?;
             let path = normalize_path(raw, rest)?;
             Ok(PromptRef { prefix, path })
@@ -293,10 +294,7 @@ fn load_from_dir(dir: &Path, reference: &PromptRef) -> Result<String, LoaderErro
     }
 }
 
-fn load_from_include_dir(
-    dir: &Dir<'static>,
-    reference: &PromptRef,
-) -> Result<String, LoaderError> {
+fn load_from_include_dir(dir: &Dir<'static>, reference: &PromptRef) -> Result<String, LoaderError> {
     let path = format!("{}.md", reference.path);
     dir.get_file(&path)
         .and_then(|f| f.contents_utf8())
@@ -349,7 +347,9 @@ mod tests {
     #[test]
     fn missing_file_is_hard_error() {
         let loader = PromptLoader::builtins_only();
-        let err = loader.resolve("$insomnia/definitely-missing", None).unwrap_err();
+        let err = loader
+            .resolve("$insomnia/definitely-missing", None)
+            .unwrap_err();
         assert!(matches!(err, LoaderError::NotFound { .. }));
     }
 
@@ -380,7 +380,9 @@ mod tests {
     #[test]
     fn unqualified_ref_resolves_relative_to_current() {
         let loader = PromptLoader::builtins_only();
-        let current = loader.parse_ref("$insomnia/common/tool-usage", None).unwrap();
+        let current = loader
+            .parse_ref("$insomnia/common/tool-usage", None)
+            .unwrap();
         // Sibling lookup under the same prefix and directory.
         let sibling = loader.parse_ref("workspace", Some(&current)).unwrap();
         assert_eq!(sibling.to_qualified_string(), "$insomnia/common/workspace");

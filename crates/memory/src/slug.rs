@@ -118,16 +118,7 @@ mod tests {
     #[test]
     fn rejects_bad_slugs() {
         for s in [
-            "",
-            "-",
-            "-foo",
-            "foo-",
-            "Foo",
-            "foo_bar",
-            "foo bar",
-            "foo--bar",
-            "foo.bar",
-            "ä",
+            "", "-", "-foo", "foo-", "Foo", "foo_bar", "foo bar", "foo--bar", "foo.bar", "ä",
         ] {
             assert!(!is_valid_slug(s), "expected `{s}` invalid");
             assert!(Slug::parse(s).is_err());

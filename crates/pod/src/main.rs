@@ -171,10 +171,7 @@ async fn main() -> ExitCode {
     // (e.g. the TUI's interactive `spawn` flow). Tab-separated so a
     // pod name with spaces still parses cleanly. Emit before the
     // human line so a stderr-watching parent sees it first.
-    eprintln!(
-        "INSOMNIA-READY\t{pod_name}\t{}",
-        socket_path.display()
-    );
+    eprintln!("INSOMNIA-READY\t{pod_name}\t{}", socket_path.display());
     eprintln!("pod: {pod_name} listening on {:?}", socket_path);
 
     tokio::select! {

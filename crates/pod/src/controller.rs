@@ -8,16 +8,16 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::ipc::alerter::Alerter;
 use crate::ipc::notify_buffer::NotifyBuffer;
+use crate::ipc::server::SocketServer;
 use crate::pod::{Pod, PodError, PodRunResult};
+use crate::runtime::dir::RuntimeDir;
+use crate::shared_state::{PodSharedState, PodStatus};
 use crate::spawn::comm_tools::{
     list_pods_tool, read_pod_output_tool, send_to_pod_tool, stop_pod_tool,
 };
-use crate::runtime::dir::RuntimeDir;
-use crate::shared_state::{PodSharedState, PodStatus};
-use crate::ipc::server::SocketServer;
-use crate::spawn::tool::spawn_pod_tool;
 use crate::spawn::registry::SpawnedPodRegistry;
-use protocol::{ErrorCode, Event, Method, AlertLevel, AlertSource, RunResult, TurnResult};
+use crate::spawn::tool::spawn_pod_tool;
+use protocol::{AlertLevel, AlertSource, ErrorCode, Event, Method, RunResult, TurnResult};
 
 // ---------------------------------------------------------------------------
 // PodHandle — client-facing, Clone-able
@@ -215,11 +215,7 @@ impl PodController {
 
             let alerter_for_worker = alerter.clone();
             worker.on_warning(move |message| {
-                alerter_for_worker.alert(
-                    AlertLevel::Warn,
-                    AlertSource::Worker,
-                    message.to_owned(),
-                );
+                alerter_for_worker.alert(AlertLevel::Warn, AlertSource::Worker, message.to_owned());
             });
 
             // Register the builtin file-manipulation tools (Read / Write /
@@ -735,9 +731,15 @@ where
         .map(|def| def().0.name)
         .collect();
     tool_names.extend(
-        ["SpawnPod", "SendToPod", "ReadPodOutput", "StopPod", "ListPods"]
-            .iter()
-            .map(|s| (*s).into()),
+        [
+            "SpawnPod",
+            "SendToPod",
+            "ReadPodOutput",
+            "StopPod",
+            "ListPods",
+        ]
+        .iter()
+        .map(|s| (*s).into()),
     );
     protocol::Greeting {
         pod_name: manifest.pod.name.clone(),

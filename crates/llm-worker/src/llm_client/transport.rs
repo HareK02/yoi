@@ -46,7 +46,9 @@ impl ResolvedAuth {
             (Self::Custom(_), _) => true,
             (
                 Self::ApiKey(_),
-                AuthRequirement::Bearer | AuthRequirement::XApiKey | AuthRequirement::QueryParam { .. },
+                AuthRequirement::Bearer
+                | AuthRequirement::XApiKey
+                | AuthRequirement::QueryParam { .. },
             ) => true,
             _ => false,
         }

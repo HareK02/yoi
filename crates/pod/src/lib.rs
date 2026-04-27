@@ -18,7 +18,7 @@ pub use hook::{Hook, HookEventKind, HookRegistryBuilder};
 pub use ipc::alerter::Alerter;
 pub use ipc::server::SocketServer;
 pub use manifest::{
-    AuthRef, ModelManifest, PodManifest, PodManifestConfig, PodMetaConfig, Scope, SchemeKind,
+    AuthRef, ModelManifest, PodManifest, PodManifestConfig, PodMetaConfig, SchemeKind, Scope,
 };
 pub use pod::{Pod, PodError, PodRunResult, apply_worker_manifest};
 pub use prompt::catalog::{CatalogError, PodPrompt, PromptCatalog};

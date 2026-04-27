@@ -7,9 +7,9 @@ use std::collections::BTreeSet;
 use serde::Serialize;
 
 use crate::llm_client::{
-    capability::{CacheStrategy, ModelCapability, ReasoningControl, ReasoningSupport},
-    types::{parse_tool_arguments, ContentPart, Item, Role, ToolDefinition},
     Request,
+    capability::{CacheStrategy, ModelCapability, ReasoningControl, ReasoningSupport},
+    types::{ContentPart, Item, Role, ToolDefinition, parse_tool_arguments},
 };
 
 use super::AnthropicScheme;
@@ -600,7 +600,7 @@ mod tests {
         let scheme = AnthropicScheme::new();
         let mut items = completed_turn();
         items.push(Item::user_message("next turn")); // index 5 = latest user
-                                                     // cache_anchor=None, turn_end=4, head=5.
+        // cache_anchor=None, turn_end=4, head=5.
         let request = Request::new().items(items);
 
         let req = scheme.build_request("claude-sonnet-4-20250514", &request, &cap_explicit());

@@ -105,7 +105,10 @@ mod tests {
         assert_eq!(drained.len(), CAPACITY);
         // Oldest 5 were dropped; first retained is msg5.
         assert_eq!(drained[0].message, "msg5");
-        assert_eq!(drained[CAPACITY - 1].message, format!("msg{}", CAPACITY + 4));
+        assert_eq!(
+            drained[CAPACITY - 1].message,
+            format!("msg{}", CAPACITY + 4)
+        );
     }
 
     #[test]

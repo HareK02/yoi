@@ -121,5 +121,4 @@ name = "from-disk"
             _ => panic!("expected Io variant"),
         }
     }
-
 }

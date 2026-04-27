@@ -1,6 +1,6 @@
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use futures::{Stream, StreamExt};
@@ -169,10 +169,7 @@ async fn run_updates_shared_state_to_idle_after_completion() {
     let pod = make_pod(client).await;
     let handle = spawn_controller(pod).await;
 
-    handle
-        .send(Method::run_text("Hello"))
-        .await
-        .unwrap();
+    handle.send(Method::run_text("Hello")).await.unwrap();
 
     // Wait for the run to complete
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -186,10 +183,7 @@ async fn run_populates_history() {
     let pod = make_pod(client).await;
     let handle = spawn_controller(pod).await;
 
-    handle
-        .send(Method::run_text("Hello"))
-        .await
-        .unwrap();
+    handle.send(Method::run_text("Hello")).await.unwrap();
 
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
@@ -207,10 +201,7 @@ async fn events_are_broadcast() {
     let handle = spawn_controller(pod).await;
     let mut rx = handle.subscribe();
 
-    handle
-        .send(Method::run_text("Hello"))
-        .await
-        .unwrap();
+    handle.send(Method::run_text("Hello")).await.unwrap();
 
     let mut saw_turn_start = false;
     let mut saw_text_delta = false;
@@ -258,16 +249,10 @@ async fn double_run_returns_error() {
     let mut rx = handle.subscribe();
 
     // Send first run
-    handle
-        .send(Method::run_text("first"))
-        .await
-        .unwrap();
+    handle.send(Method::run_text("first")).await.unwrap();
 
     // Immediately send second run (should get error)
-    handle
-        .send(Method::run_text("second"))
-        .await
-        .unwrap();
+    handle.send(Method::run_text("second")).await.unwrap();
 
     // Look for the error event
     let mut saw_already_running = false;
@@ -410,8 +395,14 @@ async fn run_with_paste_segment_inlines_content_and_emits_typed_user_message() {
         .iter()
         .find_map(|i| i.as_text().map(|s| s.to_string()))
         .unwrap_or_default();
-    assert!(user_text.contains("see line1\nline2 thanks"), "got: {user_text:?}");
-    assert!(!user_text.contains("[Clipboard"), "label must not leak: {user_text:?}");
+    assert!(
+        user_text.contains("see line1\nline2 thanks"),
+        "got: {user_text:?}"
+    );
+    assert!(
+        !user_text.contains("[Clipboard"),
+        "label must not leak: {user_text:?}"
+    );
 }
 
 #[tokio::test]
@@ -424,12 +415,11 @@ async fn run_with_unresolved_segment_emits_alert_and_placeholder() {
 
     let segments = vec![
         protocol::Segment::text("look at "),
-        protocol::Segment::FileRef { path: "src/lib.rs".into() },
+        protocol::Segment::FileRef {
+            path: "src/lib.rs".into(),
+        },
     ];
-    handle
-        .send(Method::Run { input: segments })
-        .await
-        .unwrap();
+    handle.send(Method::Run { input: segments }).await.unwrap();
 
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
     let mut saw_alert_for_file_ref = false;
@@ -527,10 +517,7 @@ async fn notify_while_running_does_not_emit_already_running_error() {
     let handle = spawn_controller(pod).await;
     let mut rx = handle.subscribe();
 
-    handle
-        .send(Method::run_text("start"))
-        .await
-        .unwrap();
+    handle.send(Method::run_text("start")).await.unwrap();
     handle
         .send(Method::Notify {
             message: "ping".into(),
@@ -591,10 +578,7 @@ async fn socket_run_receives_events() {
     let mut writer = JsonLineWriter::new(writer);
 
     // Send run method via socket
-    writer
-        .write(&Method::run_text("Hello"))
-        .await
-        .unwrap();
+    writer.write(&Method::run_text("Hello")).await.unwrap();
 
     // Collect events
     let mut saw_turn_start = false;
@@ -739,10 +723,7 @@ async fn pause_then_resume_transitions_and_preserves_history_consistency() {
     let handle = spawn_controller(pod).await;
     let mut rx = handle.subscribe();
 
-    handle
-        .send(Method::run_text("hello"))
-        .await
-        .unwrap();
+    handle.send(Method::run_text("hello")).await.unwrap();
 
     // Wait for the partial text_delta to confirm the first stream is
     // live before we pause.
@@ -794,10 +775,7 @@ async fn pause_then_resume_transitions_and_preserves_history_consistency() {
     // (partial text is not committed), no orphan tool_use.
     let history_json = handle.shared_state.history_json();
     let items: Vec<serde_json::Value> = serde_json::from_str(&history_json).unwrap();
-    let roles: Vec<&str> = items
-        .iter()
-        .filter_map(|i| i["role"].as_str())
-        .collect();
+    let roles: Vec<&str> = items.iter().filter_map(|i| i["role"].as_str()).collect();
     assert_eq!(
         roles,
         vec!["user", "assistant"],
@@ -850,10 +828,7 @@ async fn paused_then_run_closes_orphan_tool_use_for_next_request() {
     let handle = spawn_controller(pod).await;
     let mut rx = handle.subscribe();
 
-    handle
-        .send(Method::run_text("first"))
-        .await
-        .unwrap();
+    handle.send(Method::run_text("first")).await.unwrap();
 
     // Wait for ToolCallDone — the ToolCall is committed to history
     // right before the Worker enters tool execution and pends.
@@ -883,10 +858,7 @@ async fn paused_then_run_closes_orphan_tool_use_for_next_request() {
     // New user input while Paused → controller routes to
     // `Pod::interrupt_and_run`, which closes the orphan + injects a
     // system note before the fresh user message.
-    handle
-        .send(Method::run_text("new request"))
-        .await
-        .unwrap();
+    handle.send(Method::run_text("new request")).await.unwrap();
     assert!(
         drain_until(&mut rx, std::time::Duration::from_secs(2), |e| matches!(
             e,
@@ -925,9 +897,7 @@ async fn paused_then_run_closes_orphan_tool_use_for_next_request() {
                     saw_interruption_note = true;
                 }
             }
-            llm_worker::Item::Message { role, content, .. }
-                if *role == llm_worker::Role::User =>
-            {
+            llm_worker::Item::Message { role, content, .. } if *role == llm_worker::Role::User => {
                 let text: String = content.iter().map(|p| p.as_text()).collect();
                 if text.contains("new request") {
                     saw_new_user = true;
@@ -952,10 +922,10 @@ async fn paused_then_run_closes_orphan_tool_use_for_next_request() {
     // Also confirm the closure chain is ordered: tool_result for the
     // orphan precedes the system note, which precedes the new user
     // message.
-    let idx = |pred: &dyn Fn(&llm_worker::Item) -> bool| {
-        items.iter().position(pred).unwrap()
-    };
-    let tool_result_idx = idx(&|i| matches!(i, llm_worker::Item::ToolResult { call_id, .. } if call_id == "call_orphan"));
+    let idx = |pred: &dyn Fn(&llm_worker::Item) -> bool| items.iter().position(pred).unwrap();
+    let tool_result_idx = idx(
+        &|i| matches!(i, llm_worker::Item::ToolResult { call_id, .. } if call_id == "call_orphan"),
+    );
     let sys_idx = idx(&|i| match i {
         llm_worker::Item::Message {
             role: llm_worker::Role::System,
@@ -980,7 +950,12 @@ async fn paused_then_run_closes_orphan_tool_use_for_next_request() {
             .contains("new request"),
         _ => false,
     });
-    assert!(tool_result_idx < sys_idx, "tool_result must precede system note");
-    assert!(sys_idx < user_idx, "system note must precede new user message");
+    assert!(
+        tool_result_idx < sys_idx,
+        "tool_result must precede system note"
+    );
+    assert!(
+        sys_idx < user_idx,
+        "system note must precede new user message"
+    );
 }
-

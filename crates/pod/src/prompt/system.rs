@@ -23,8 +23,8 @@ use minijinja::value::Value;
 use minijinja::{Environment, ErrorKind, UndefinedBehavior};
 use thiserror::Error;
 
-use crate::prompt::loader::{LoaderError, PromptLoader, PromptRef};
 use crate::prompt::catalog::{CatalogError, PromptCatalog};
+use crate::prompt::loader::{LoaderError, PromptLoader, PromptRef};
 
 #[derive(Debug, Error)]
 pub enum SystemPromptError {
@@ -55,10 +55,7 @@ impl SystemPromptTemplate {
     /// Parse the instruction asset referenced by `instruction_ref`
     /// using the supplied [`PromptLoader`]. The reference is resolved
     /// at parse time so syntax errors surface immediately.
-    pub fn parse(
-        instruction_ref: &str,
-        loader: PromptLoader,
-    ) -> Result<Self, SystemPromptError> {
+    pub fn parse(instruction_ref: &str, loader: PromptLoader) -> Result<Self, SystemPromptError> {
         let root_ref = loader
             .parse_ref(instruction_ref, None)
             .map_err(SystemPromptError::LoaderResolve)?;
@@ -75,9 +72,7 @@ impl SystemPromptTemplate {
         // The joined name is then looked up via `set_loader` below.
         let loader_for_join = loader.clone();
         env.set_path_join_callback(move |name, parent| {
-            let parent_ref = loader_for_join
-                .parse_ref(parent, None)
-                .ok();
+            let parent_ref = loader_for_join.parse_ref(parent, None).ok();
             match loader_for_join.parse_ref(name, parent_ref.as_ref()) {
                 Ok(r) => r.to_qualified_string().into(),
                 // Propagate the raw name on error so set_loader surfaces
@@ -93,7 +88,10 @@ impl SystemPromptTemplate {
                 .map_err(|e| minijinja::Error::new(ErrorKind::TemplateNotFound, e.to_string()))?;
             match loader_for_src.load(&reference) {
                 Ok(source) => Ok(Some(source)),
-                Err(e) => Err(minijinja::Error::new(ErrorKind::TemplateNotFound, e.to_string())),
+                Err(e) => Err(minijinja::Error::new(
+                    ErrorKind::TemplateNotFound,
+                    e.to_string(),
+                )),
             }
         });
 
@@ -459,7 +457,9 @@ mod tests {
         let tmpl = SystemPromptTemplate::parse("$user/ghost", loader).unwrap();
         let dir = TempDir::new().unwrap();
         let scope = build_scope(dir.path());
-        let err = tmpl.render(&ctx(dir.path(), &scope, vec![], None)).unwrap_err();
+        let err = tmpl
+            .render(&ctx(dir.path(), &scope, vec![], None))
+            .unwrap_err();
         assert!(matches!(err, SystemPromptError::Render(_)));
     }
 

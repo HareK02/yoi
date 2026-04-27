@@ -136,19 +136,14 @@ impl App {
                     }
                 }
             }
-            Event::ToolCallDone {
-                id, arguments, ..
-            } => {
+            Event::ToolCallDone { id, arguments, .. } => {
                 self.current_tool = None;
                 if let Some(b) = self.find_tool_call_mut(&id) {
                     b.arguments = Some(arguments);
                     // Only advance the state when it's still in-flight.
                     // If a ToolResult arrived out of order and already
                     // transitioned us to Done/Error, keep that.
-                    if matches!(
-                        b.state,
-                        ToolCallState::Pending | ToolCallState::Streaming
-                    ) {
+                    if matches!(b.state, ToolCallState::Pending | ToolCallState::Streaming) {
                         b.state = ToolCallState::Executing;
                     }
                 }
@@ -191,7 +186,12 @@ impl App {
                         }
                     };
                     if !is_error {
-                        apply_cache_update(&mut self.cache, &name, args.as_deref(), output.as_deref());
+                        apply_cache_update(
+                            &mut self.cache,
+                            &name,
+                            args.as_deref(),
+                            output.as_deref(),
+                        );
                     }
                 } else {
                     // Result for an unknown tool call. Surface it as an
@@ -291,9 +291,7 @@ impl App {
             if let Block::ToolCall(tc) = b {
                 if matches!(
                     tc.state,
-                    ToolCallState::Pending
-                        | ToolCallState::Streaming
-                        | ToolCallState::Executing
+                    ToolCallState::Pending | ToolCallState::Streaming | ToolCallState::Executing
                 ) {
                     tc.state = ToolCallState::Incomplete;
                 } else {
@@ -450,7 +448,10 @@ impl App {
         // Incomplete so the replay matches live semantics.
         for b in self.blocks.iter_mut() {
             if let Block::ToolCall(tc) = b
-                && matches!(tc.state, ToolCallState::Executing | ToolCallState::Pending | ToolCallState::Streaming)
+                && matches!(
+                    tc.state,
+                    ToolCallState::Executing | ToolCallState::Pending | ToolCallState::Streaming
+                )
             {
                 tc.state = ToolCallState::Incomplete;
             }

@@ -33,8 +33,12 @@ fn resolve_socket(pod_name: &str, override_path: Option<PathBuf>) -> PathBuf {
     if let Some(p) = override_path {
         return p;
     }
-    manifest::paths::pod_socket_path(pod_name)
-        .unwrap_or_else(|| PathBuf::from("/tmp").join("insomnia").join(pod_name).join("sock"))
+    manifest::paths::pod_socket_path(pod_name).unwrap_or_else(|| {
+        PathBuf::from("/tmp")
+            .join("insomnia")
+            .join(pod_name)
+            .join("sock")
+    })
 }
 
 enum Mode {
@@ -172,7 +176,10 @@ async fn run(
             run_loop(terminal, &mut app, client, shutdown_pod_on_exit).await?;
         }
         Err(e) => {
-            app.push_error(format!("Failed to connect to {}: {e}", socket_path.display()));
+            app.push_error(format!(
+                "Failed to connect to {}: {e}",
+                socket_path.display()
+            ));
             terminal.draw(|f| ui::draw(f, &mut app))?;
             run_disconnected(&mut app)?;
         }

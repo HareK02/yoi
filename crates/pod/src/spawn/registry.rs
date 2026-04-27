@@ -43,7 +43,9 @@ impl SpawnedPodRegistry {
     pub async fn add(&self, record: SpawnedPodRecord) -> io::Result<()> {
         let mut records = self.records.lock().await;
         records.push(record);
-        self.runtime_dir.write_spawned_pods(records.as_slice()).await
+        self.runtime_dir
+            .write_spawned_pods(records.as_slice())
+            .await
     }
 
     /// Look up a record by pod name. Cloned so callers can drop the lock.
@@ -67,7 +69,9 @@ impl SpawnedPodRegistry {
             let mut records = self.records.lock().await;
             let idx = records.iter().position(|r| r.pod_name == pod_name);
             let removed = idx.map(|i| records.remove(i));
-            self.runtime_dir.write_spawned_pods(records.as_slice()).await?;
+            self.runtime_dir
+                .write_spawned_pods(records.as_slice())
+                .await?;
             removed
         };
         self.cursors.lock().await.remove(pod_name);

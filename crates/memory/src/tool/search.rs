@@ -116,9 +116,8 @@ struct KnowledgeSearchTool {
 #[async_trait]
 impl Tool for MemorySearchTool {
     async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError> {
-        let params: MemorySearchParams = serde_json::from_str(input_json).map_err(|e| {
-            ToolError::InvalidArgument(format!("invalid MemorySearch input: {e}"))
-        })?;
+        let params: MemorySearchParams = serde_json::from_str(input_json)
+            .map_err(|e| ToolError::InvalidArgument(format!("invalid MemorySearch input: {e}")))?;
         let needle = validate_query(&params.query)?;
 
         let mut hits: Vec<MemoryHit> = Vec::new();
@@ -241,9 +240,7 @@ impl Tool for KnowledgeSearchTool {
 
 fn validate_query(query: &str) -> Result<String, ToolError> {
     if query.trim().is_empty() {
-        return Err(ToolError::InvalidArgument(
-            "query must not be empty".into(),
-        ));
+        return Err(ToolError::InvalidArgument("query must not be empty".into()));
     }
     Ok(query.to_lowercase())
 }

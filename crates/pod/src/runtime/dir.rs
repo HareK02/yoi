@@ -82,10 +82,7 @@ impl RuntimeDir {
     /// Write `spawned_pods.json` atomically. The entries are the full
     /// set of spawned children known to this Pod — callers pass the
     /// replacement list, no incremental merge.
-    pub async fn write_spawned_pods(
-        &self,
-        records: &[SpawnedPodRecord],
-    ) -> Result<(), io::Error> {
+    pub async fn write_spawned_pods(&self, records: &[SpawnedPodRecord]) -> Result<(), io::Error> {
         let json = serde_json::to_vec_pretty(records).map_err(io::Error::other)?;
         atomic_write(&self.path.join("spawned_pods.json"), &json).await
     }

@@ -63,9 +63,15 @@ pub enum ToolCallState {
     /// `ToolCallDone` received, waiting on the tool result.
     Executing,
     /// `ToolResult { is_error: false, .. }` received.
-    Done { summary: String, output: Option<String> },
+    Done {
+        summary: String,
+        output: Option<String>,
+    },
     /// `ToolResult { is_error: true, .. }` received.
-    Error { summary: String, output: Option<String> },
+    Error {
+        summary: String,
+        output: Option<String>,
+    },
     /// Turn ended before a matching `ToolResult` arrived.
     Incomplete,
 }

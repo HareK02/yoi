@@ -21,13 +21,13 @@ use session_store::UsageRecord;
 use tracing::info;
 
 use crate::compact::state::CompactState;
+use crate::compact::token_counter::total_tokens_impl;
 use crate::hook::{
     AbortInfo, HookRegistry, PreRequestInfo, PromptSubmitInfo, ToolCallSummary, ToolResultSummary,
     TurnEndInfo,
 };
 use crate::ipc::notify_buffer::{NotifyBuffer, format_notify};
 use crate::prompt::catalog::PromptCatalog;
-use crate::compact::token_counter::total_tokens_impl;
 use tracing::warn;
 
 /// Maximum number of bytes copied into `TurnEndInfo::final_text_preview`.

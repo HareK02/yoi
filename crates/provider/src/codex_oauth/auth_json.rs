@@ -44,7 +44,9 @@ impl AuthSnapshot {
         let refresh_token = tokens
             .get("refresh_token")
             .and_then(Value::as_str)
-            .ok_or_else(|| CodexAuthError::MalformedAuthJson("missing tokens.refresh_token".into()))?
+            .ok_or_else(|| {
+                CodexAuthError::MalformedAuthJson("missing tokens.refresh_token".into())
+            })?
             .to_string();
 
         let id_token = tokens
@@ -58,9 +60,7 @@ impl AuthSnapshot {
             .get("account_id")
             .and_then(Value::as_str)
             .map(str::to_string)
-            .or_else(|| {
-                super::jwt::parse_chatgpt_claims(&id_token).and_then(|c| c.account_id)
-            })
+            .or_else(|| super::jwt::parse_chatgpt_claims(&id_token).and_then(|c| c.account_id))
             .ok_or_else(|| {
                 CodexAuthError::MalformedAuthJson(
                     "missing account_id in both tokens and id_token claims".into(),
@@ -131,7 +131,10 @@ pub async fn persist_refreshed(
     }
     raw.as_object_mut()
         .ok_or_else(|| CodexAuthError::MalformedAuthJson("auth.json not an object".into()))?
-        .insert("last_refresh".into(), Value::String(Utc::now().to_rfc3339()));
+        .insert(
+            "last_refresh".into(),
+            Value::String(Utc::now().to_rfc3339()),
+        );
 
     write_atomic(path, raw)?;
     AuthSnapshot::from_value(raw.clone())
@@ -139,9 +142,8 @@ pub async fn persist_refreshed(
 
 fn write_atomic(path: &Path, value: &Value) -> Result<(), CodexAuthError> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            CodexAuthError::Io(format!("create_dir_all {}: {e}", parent.display()))
-        })?;
+        std::fs::create_dir_all(parent)
+            .map_err(|e| CodexAuthError::Io(format!("create_dir_all {}: {e}", parent.display())))?;
     }
     let json = serde_json::to_vec_pretty(value)
         .map_err(|e| CodexAuthError::Io(format!("serialize: {e}")))?;
@@ -203,7 +205,10 @@ mod tests {
         assert_eq!(snap.account_id, "acc-1");
         assert!(snap.last_refresh.is_some());
         // 未知フィールドが raw に保持されている
-        assert_eq!(snap.raw.get("OPENAI_API_KEY").and_then(Value::as_str), Some("sk-extra"));
+        assert_eq!(
+            snap.raw.get("OPENAI_API_KEY").and_then(Value::as_str),
+            Some("sk-extra")
+        );
     }
 
     #[tokio::test]
@@ -238,7 +243,10 @@ mod tests {
               "agent_identity":{"workspace_id":"w","agent_runtime_id":"r","agent_private_key":"k","registered_at":"x"}
             }"#,
         );
-        let updated = persist_refreshed(&path, None, Some("new-acc".into()), Some("new-ref".into())).await.unwrap();
+        let updated =
+            persist_refreshed(&path, None, Some("new-acc".into()), Some("new-ref".into()))
+                .await
+                .unwrap();
         assert_eq!(updated.access_token, "new-acc");
         assert_eq!(updated.refresh_token, "new-ref");
         // 未知フィールド agent_identity が保たれる
@@ -258,7 +266,9 @@ mod tests {
         );
         // 既存ファイルを 644 に変えてから persist → 600 に直るか
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        persist_refreshed(&path, None, Some("a2".into()), None).await.unwrap();
+        persist_refreshed(&path, None, Some("a2".into()), None)
+            .await
+            .unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
     }

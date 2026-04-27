@@ -90,4 +90,3 @@ pub trait Scheme: Clone + Send + Sync + 'static {
         Vec::new()
     }
 }
-
