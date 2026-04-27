@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
+use manifest::paths;
 use pod::{Pod, PodController, PodFactory};
 use session_store::FsStore;
 
@@ -11,8 +12,8 @@ use session_store::FsStore;
     about = "Spawn a Pod process from cascaded manifest layers"
 )]
 struct Cli {
-    /// User manifest TOML. Defaults to
-    /// `$XDG_CONFIG_HOME/insomnia/manifest.toml`.
+    /// User manifest TOML. Defaults to `<config_dir>/manifest.toml`
+    /// (see `manifest::paths`).
     #[arg(long, value_name = "PATH")]
     user_manifest: Option<PathBuf>,
 
@@ -28,7 +29,7 @@ struct Cli {
     overlay: Option<String>,
 
     /// Directory for session persistence. Defaults to
-    /// `~/.insomnia/sessions/`.
+    /// `<data_dir>/sessions/` (see `manifest::paths`).
     #[arg(short, long)]
     store: Option<PathBuf>,
 
@@ -42,25 +43,6 @@ struct Cli {
     /// callbacks upward. Required alongside `--adopt`.
     #[arg(long, value_name = "PATH", requires = "adopt")]
     callback: Option<PathBuf>,
-}
-
-fn default_store_dir() -> Result<PathBuf, std::io::Error> {
-    let home = std::env::var("HOME")
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::NotFound, "HOME is not set"))?;
-    Ok(PathBuf::from(home).join(".insomnia").join("sessions"))
-}
-
-fn default_runtime_dir() -> Result<PathBuf, std::io::Error> {
-    if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
-        Ok(PathBuf::from(runtime_dir).join("insomnia"))
-    } else if let Ok(home) = std::env::var("HOME") {
-        Ok(PathBuf::from(home).join(".insomnia").join("run"))
-    } else {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "neither XDG_RUNTIME_DIR nor HOME is set",
-        ))
-    }
 }
 
 async fn build_factory(cli: &Cli) -> Result<PodFactory, String> {
@@ -115,7 +97,7 @@ async fn main() -> ExitCode {
 
     // Initialize persistent store
     let store_dir = cli.store.clone().unwrap_or_else(|| {
-        default_store_dir().unwrap_or_else(|_| PathBuf::from(".insomnia/sessions"))
+        paths::sessions_dir().unwrap_or_else(|| PathBuf::from(".insomnia/sessions"))
     });
     let store = match FsStore::new(&store_dir).await {
         Ok(s) => s,
@@ -152,10 +134,13 @@ async fn main() -> ExitCode {
     let pod_name = pod.manifest().pod.name.clone();
 
     // Spawn the controller (starts socket server)
-    let runtime_base = match default_runtime_dir() {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("error: {e}");
+    let runtime_base = match paths::runtime_dir() {
+        Some(d) => d,
+        None => {
+            eprintln!(
+                "error: could not resolve runtime directory \
+                 (set INSOMNIA_HOME, INSOMNIA_RUNTIME_DIR, XDG_RUNTIME_DIR, or HOME)"
+            );
             return ExitCode::FAILURE;
         }
     };

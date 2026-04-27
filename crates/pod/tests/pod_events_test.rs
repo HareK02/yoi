@@ -18,30 +18,61 @@ use protocol::{Method, Permission, PodEvent, ScopeRule};
 use tempfile::TempDir;
 use tokio::net::UnixListener;
 
-/// Serialises tests that mutate `INSOMNIA_SCOPE_LOCK`.
+/// Serialises tests that mutate `INSOMNIA_RUNTIME_DIR`.
 static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
+/// Take `ENV_LOCK` and clear any env vars that would outrank
+/// `INSOMNIA_RUNTIME_DIR`; restore previous values on drop.
 struct EnvGuard {
+    prev_home: Option<String>,
+    prev_xdg: Option<String>,
     _lock: std::sync::MutexGuard<'static, ()>,
 }
 
 impl EnvGuard {
     fn acquire() -> Self {
+        let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_home = std::env::var("INSOMNIA_HOME").ok();
+        let prev_xdg = std::env::var("XDG_RUNTIME_DIR").ok();
+        unsafe {
+            std::env::remove_var("INSOMNIA_HOME");
+            std::env::remove_var("XDG_RUNTIME_DIR");
+        }
         Self {
-            _lock: ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner()),
+            prev_home,
+            prev_xdg,
+            _lock: lock,
         }
     }
 }
 
-fn set_scope_lock_path(path: &std::path::Path) {
-    unsafe {
-        std::env::set_var("INSOMNIA_SCOPE_LOCK", path);
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        unsafe {
+            match &self.prev_home {
+                Some(v) => std::env::set_var("INSOMNIA_HOME", v),
+                None => std::env::remove_var("INSOMNIA_HOME"),
+            }
+            match &self.prev_xdg {
+                Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
+                None => std::env::remove_var("XDG_RUNTIME_DIR"),
+            }
+            std::env::remove_var("INSOMNIA_RUNTIME_DIR");
+        }
     }
 }
 
-fn clear_scope_lock_path() {
+/// Point `INSOMNIA_RUNTIME_DIR` at `dir`. The scope-lock then lives at
+/// `<dir>/scope.lock` and Pod runtime sub-dirs at `<dir>/{pod_name}/`.
+fn set_runtime_dir(dir: &std::path::Path) {
     unsafe {
-        std::env::remove_var("INSOMNIA_SCOPE_LOCK");
+        std::env::set_var("INSOMNIA_RUNTIME_DIR", dir);
+    }
+}
+
+fn clear_runtime_dir() {
+    unsafe {
+        std::env::remove_var("INSOMNIA_RUNTIME_DIR");
     }
 }
 
@@ -133,7 +164,7 @@ async fn fresh_registry(runtime_base: &std::path::Path, pod_name: &str) -> Arc<S
 async fn apply_shutdown_removes_from_registry_and_tolerates_missing() {
     let _env = EnvGuard::acquire();
     let scope_dir = TempDir::new().unwrap();
-    set_scope_lock_path(&scope_dir.path().join("scope.lock"));
+    set_runtime_dir(scope_dir.path());
 
     let runtime_base = TempDir::new().unwrap();
     let registry = fresh_registry(runtime_base.path(), "parent").await;
@@ -161,14 +192,14 @@ async fn apply_shutdown_removes_from_registry_and_tolerates_missing() {
     apply_event_side_effects(&event, &registry, "parent", &None).await;
     assert!(registry.get("child").await.is_none());
 
-    clear_scope_lock_path();
+    clear_runtime_dir();
 }
 
 #[tokio::test]
 async fn apply_scope_sub_delegated_adds_grandchild_then_duplicate_is_noop() {
     let _env = EnvGuard::acquire();
     let scope_dir = TempDir::new().unwrap();
-    set_scope_lock_path(&scope_dir.path().join("scope.lock"));
+    set_runtime_dir(scope_dir.path());
 
     let runtime_base = TempDir::new().unwrap();
     let registry = fresh_registry(runtime_base.path(), "grandparent").await;
@@ -208,14 +239,14 @@ async fn apply_scope_sub_delegated_adds_grandchild_then_duplicate_is_noop() {
     let gc2 = registry.get("grandchild").await.unwrap();
     assert_eq!(gc2.socket_path, PathBuf::from("/tmp/grandchild.sock"));
 
-    clear_scope_lock_path();
+    clear_runtime_dir();
 }
 
 #[tokio::test]
 async fn apply_scope_sub_delegated_reemits_to_own_parent() {
     let _env = EnvGuard::acquire();
     let scope_dir = TempDir::new().unwrap();
-    set_scope_lock_path(&scope_dir.path().join("scope.lock"));
+    set_runtime_dir(scope_dir.path());
 
     let runtime_base = TempDir::new().unwrap();
     let registry = fresh_registry(runtime_base.path(), "B").await;
@@ -268,14 +299,14 @@ async fn apply_scope_sub_delegated_reemits_to_own_parent() {
         other => panic!("expected re-emitted ScopeSubDelegated, got {other:?}"),
     }
 
-    clear_scope_lock_path();
+    clear_runtime_dir();
 }
 
 #[tokio::test]
 async fn apply_turn_ended_and_errored_are_system_noops() {
     let _env = EnvGuard::acquire();
     let scope_dir = TempDir::new().unwrap();
-    set_scope_lock_path(&scope_dir.path().join("scope.lock"));
+    set_runtime_dir(scope_dir.path());
 
     let runtime_base = TempDir::new().unwrap();
     let registry = fresh_registry(runtime_base.path(), "parent").await;
@@ -312,7 +343,7 @@ async fn apply_turn_ended_and_errored_are_system_noops() {
     .await;
 
     assert!(registry.get("child").await.is_some());
-    clear_scope_lock_path();
+    clear_runtime_dir();
 }
 
 #[tokio::test]
@@ -320,7 +351,7 @@ async fn shutdown_releases_scope_allocation_when_present() {
     let _env = EnvGuard::acquire();
     let scope_dir = TempDir::new().unwrap();
     let lock_path = scope_dir.path().join("scope.lock");
-    set_scope_lock_path(&lock_path);
+    set_runtime_dir(scope_dir.path());
 
     // Install a top-level allocation for "kid" so ShutDown has
     // something to release.
@@ -362,5 +393,5 @@ async fn shutdown_releases_scope_allocation_when_present() {
         "ShutDown should have released the scope allocation"
     );
 
-    clear_scope_lock_path();
+    clear_runtime_dir();
 }

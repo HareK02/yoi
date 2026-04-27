@@ -18,6 +18,8 @@
 //! the user or overlay layers lay out their own paths:
 //!
 //! - user manifest: base = the directory holding the manifest file
+//!   (which is `manifest::paths::config_dir()` when loaded via the
+//!   `_auto` variant)
 //! - project manifest: base = the **project root** (the parent of
 //!   `.insomnia/`, not `.insomnia/` itself) so that natural project
 //!   manifests with `target = "."` cover the whole workspace
@@ -29,7 +31,7 @@ use std::path::{Path, PathBuf};
 
 use manifest::{
     LayerLoadError, PodManifest, PodManifestConfig, ResolveError, find_project_manifest_from,
-    load_layer, user_manifest_path,
+    load_layer, paths,
 };
 
 use crate::prompt::loader::PromptLoader;
@@ -101,21 +103,19 @@ impl PodFactory {
         Self::default()
     }
 
-    /// Attempt to load the user manifest from the XDG config directory.
-    ///
-    /// Looks at `$XDG_CONFIG_HOME/insomnia/manifest.toml` first, then
-    /// falls back to `$HOME/.config/insomnia/manifest.toml`. If neither
-    /// env var is set, or the resolved file does not exist, the call
-    /// is a no-op — user manifests are optional.
+    /// Attempt to load the user manifest from the user's config
+    /// directory (see [`manifest::paths::config_dir`] for how the path
+    /// is resolved). If the resolved file does not exist, the call is a
+    /// no-op — user manifests are optional.
     pub fn with_user_manifest_auto(mut self) -> Result<Self, FactoryError> {
-        let Some(path) = user_manifest_path() else {
+        let Some(path) = paths::user_manifest_path() else {
             return Ok(self);
         };
         if path.exists() {
             let base = manifest_base(&path)?;
             self.user = Some((load_layer(&path)?, base.clone()));
-            self.user_prompts_dir = Some(base.join("prompts"));
-            self.user_pack_file = Some(base.join("prompts.toml"));
+            self.user_prompts_dir = paths::user_prompts_dir();
+            self.user_pack_file = paths::user_pack_file();
         }
         Ok(self)
     }

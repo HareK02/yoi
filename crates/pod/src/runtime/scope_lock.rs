@@ -1,9 +1,9 @@
 //! Machine-wide scope allocation registry.
 //!
-//! A single JSON file at `$XDG_RUNTIME_DIR/insomnia/scope.lock` records
-//! every live Pod's scope allocation. File-level `flock(2)` serialises
-//! access across processes so spawn sequences from unrelated Pods can't
-//! race.
+//! A single JSON file at `<runtime_dir>/scope.lock` records every live
+//! Pod's scope allocation (see [`manifest::paths::scope_lock_path`] for
+//! how the path is resolved). File-level `flock(2)` serialises access
+//! across processes so spawn sequences from unrelated Pods can't race.
 //!
 //! Each Pod, when starting, acquires the lock, reclaims stale entries
 //! (Pods whose PID has died), checks that its requested write scope
@@ -19,7 +19,7 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use fs4::fs_std::FileExt;
-use manifest::{Permission, ScopeRule};
+use manifest::{Permission, ScopeRule, paths};
 use serde::{Deserialize, Serialize};
 
 /// On-disk representation of the allocation table.
@@ -62,27 +62,18 @@ impl LockFile {
     }
 }
 
-/// Default on-disk path: `$XDG_RUNTIME_DIR/insomnia/scope.lock`,
-/// falling back to `~/.insomnia/run/scope.lock` when XDG is unset.
-///
-/// Honours `INSOMNIA_SCOPE_LOCK` as an explicit override, primarily so
-/// tests can point at a tempdir without polluting the user's runtime
-/// directory.
+/// Default on-disk path: `<runtime_dir>/scope.lock` resolved via
+/// [`manifest::paths::scope_lock_path`]. Tests should point this
+/// elsewhere by setting `INSOMNIA_HOME` or `INSOMNIA_RUNTIME_DIR` to a
+/// tempdir.
 pub fn default_lock_path() -> io::Result<PathBuf> {
-    if let Ok(custom) = std::env::var("INSOMNIA_SCOPE_LOCK") {
-        return Ok(PathBuf::from(custom));
-    }
-    let base = if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
-        PathBuf::from(dir).join("insomnia")
-    } else if let Ok(home) = std::env::var("HOME") {
-        PathBuf::from(home).join(".insomnia").join("run")
-    } else {
-        return Err(io::Error::new(
+    paths::scope_lock_path().ok_or_else(|| {
+        io::Error::new(
             io::ErrorKind::NotFound,
-            "neither XDG_RUNTIME_DIR nor HOME is set",
-        ));
-    };
-    Ok(base.join("scope.lock"))
+            "could not resolve scope.lock path (no INSOMNIA_HOME / \
+             INSOMNIA_RUNTIME_DIR / XDG_RUNTIME_DIR / HOME)",
+        )
+    })
 }
 
 /// RAII guard over an exclusively-locked lock file.
@@ -555,14 +546,66 @@ pub enum ScopeLockError {
 mod tests {
     use super::*;
     use manifest::Permission;
-    use std::sync::{LazyLock, Mutex};
+    use std::sync::{LazyLock, Mutex, MutexGuard};
     use tempfile::TempDir;
 
-    /// Serialises tests that mutate `INSOMNIA_SCOPE_LOCK`. The test
+    /// Serialises tests that mutate runtime-dir env vars. The test
     /// harness runs tests on multiple threads inside a single process,
     /// so env-var writes from one test would otherwise leak into a
     /// parallel test's `default_lock_path()` lookup.
     static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    /// Sandbox `INSOMNIA_RUNTIME_DIR` to a tempdir for the duration of
+    /// a test; restore the previous value (and any `INSOMNIA_HOME` /
+    /// `XDG_RUNTIME_DIR` that would otherwise outrank it) on drop.
+    struct RuntimeDirSandbox {
+        prev_runtime: Option<String>,
+        prev_home: Option<String>,
+        prev_xdg: Option<String>,
+        _guard: MutexGuard<'static, ()>,
+    }
+
+    impl RuntimeDirSandbox {
+        fn new(dir: &Path) -> Self {
+            let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let prev_runtime = std::env::var("INSOMNIA_RUNTIME_DIR").ok();
+            let prev_home = std::env::var("INSOMNIA_HOME").ok();
+            let prev_xdg = std::env::var("XDG_RUNTIME_DIR").ok();
+            // SAFETY: ENV_LOCK serialises env writes across this test
+            // module; other modules that touch env vars rely on their
+            // own lock or `serial_test`.
+            unsafe {
+                std::env::remove_var("INSOMNIA_HOME");
+                std::env::remove_var("XDG_RUNTIME_DIR");
+                std::env::set_var("INSOMNIA_RUNTIME_DIR", dir);
+            }
+            Self {
+                prev_runtime,
+                prev_home,
+                prev_xdg,
+                _guard: guard,
+            }
+        }
+    }
+
+    impl Drop for RuntimeDirSandbox {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.prev_runtime {
+                    Some(v) => std::env::set_var("INSOMNIA_RUNTIME_DIR", v),
+                    None => std::env::remove_var("INSOMNIA_RUNTIME_DIR"),
+                }
+                match &self.prev_home {
+                    Some(v) => std::env::set_var("INSOMNIA_HOME", v),
+                    None => std::env::remove_var("INSOMNIA_HOME"),
+                }
+                match &self.prev_xdg {
+                    Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
+                    None => std::env::remove_var("XDG_RUNTIME_DIR"),
+                }
+            }
+        }
+    }
 
     fn write_rule(path: &str, recursive: bool) -> ScopeRule {
         ScopeRule {
@@ -977,12 +1020,9 @@ mod tests {
 
     #[test]
     fn scope_allocation_guard_releases_on_drop() {
-        let _env = ENV_LOCK.lock().unwrap();
         let dir = TempDir::new().unwrap();
+        let _sandbox = RuntimeDirSandbox::new(dir.path());
         let lock_path = dir.path().join("scope.lock");
-        unsafe {
-            std::env::set_var("INSOMNIA_SCOPE_LOCK", &lock_path);
-        }
         let guard = install_top_level(
             "a".into(),
             std::process::id(),
@@ -999,19 +1039,13 @@ mod tests {
             let g = LockFileGuard::open(&lock_path).unwrap();
             assert!(g.data().find("a").is_none());
         }
-        unsafe {
-            std::env::remove_var("INSOMNIA_SCOPE_LOCK");
-        }
     }
 
     #[test]
     fn adopt_allocation_rewrites_pid_and_releases_on_drop() {
-        let _env = ENV_LOCK.lock().unwrap();
         let dir = TempDir::new().unwrap();
+        let _sandbox = RuntimeDirSandbox::new(dir.path());
         let lock_path = dir.path().join("scope.lock");
-        unsafe {
-            std::env::set_var("INSOMNIA_SCOPE_LOCK", &lock_path);
-        }
         // Pre-register an allocation under spawner's pid, as delegate_scope would.
         {
             let mut g = LockFileGuard::open(&lock_path).unwrap();
@@ -1029,24 +1063,14 @@ mod tests {
             let g = LockFileGuard::open(&lock_path).unwrap();
             assert!(g.data().find("child").is_none());
         }
-        unsafe {
-            std::env::remove_var("INSOMNIA_SCOPE_LOCK");
-        }
     }
 
     #[test]
     fn adopt_allocation_errors_on_unknown_pod() {
-        let _env = ENV_LOCK.lock().unwrap();
         let dir = TempDir::new().unwrap();
-        let lock_path = dir.path().join("scope.lock");
-        unsafe {
-            std::env::set_var("INSOMNIA_SCOPE_LOCK", &lock_path);
-        }
+        let _sandbox = RuntimeDirSandbox::new(dir.path());
         let err = adopt_allocation("ghost".into(), 42).unwrap_err();
         assert!(matches!(err, ScopeLockError::UnknownPod(ref n) if n == "ghost"));
-        unsafe {
-            std::env::remove_var("INSOMNIA_SCOPE_LOCK");
-        }
     }
 
     /// Mimic what the spawner does before the child comes up: push an

@@ -3,16 +3,13 @@
 //! Pod manifests are assembled from up to three on-disk layers (see
 //! `pod::PodFactory` for the full cascade story):
 //!
-//! 1. **User manifest** at `$XDG_CONFIG_HOME/insomnia/manifest.toml`,
-//!    falling back to `$HOME/.config/insomnia/manifest.toml`
+//! 1. **User manifest** — see [`crate::paths::user_manifest_path`]
 //! 2. **Project manifest** at the closest `.insomnia/manifest.toml`
 //!    found by walking up from a starting directory (typically `cwd`)
 //! 3. **Programmatic overlay** supplied at the call site
 //!
-//! This module owns the conventions for (1) and (2): where each file
-//! lives and how to parse it. Callers (pod's factory, the TUI's spawn
-//! UI, future GUI flows) all share these helpers so the conventions
-//! live in one place.
+//! This module owns the project-layer discovery and the parser glue.
+//! User-layer path resolution lives in [`crate::paths`].
 //!
 //! Cascade *merging* and final validation stay outside this module —
 //! that's the data layer's responsibility (`PodManifestConfig::merge`
@@ -38,28 +35,6 @@ pub enum LayerLoadError {
         #[source]
         source: toml::de::Error,
     },
-}
-
-/// Conventional path of the user manifest:
-/// `$XDG_CONFIG_HOME/insomnia/manifest.toml`, falling back to
-/// `$HOME/.config/insomnia/manifest.toml`. Returns `None` when neither
-/// env var is set to a non-empty value.
-///
-/// Existence of the file is **not** checked here — callers decide
-/// whether a missing file is an error or a silent skip.
-pub fn user_manifest_path() -> Option<PathBuf> {
-    if let Ok(dir) = std::env::var("XDG_CONFIG_HOME") {
-        if !dir.is_empty() {
-            return Some(PathBuf::from(dir).join("insomnia").join("manifest.toml"));
-        }
-    }
-    let home = std::env::var("HOME").ok().filter(|s| !s.is_empty())?;
-    Some(
-        PathBuf::from(home)
-            .join(".config")
-            .join("insomnia")
-            .join("manifest.toml"),
-    )
 }
 
 /// Walk up from `start` looking for `.insomnia/manifest.toml`. Returns
@@ -147,29 +122,4 @@ name = "from-disk"
         }
     }
 
-    #[test]
-    fn user_manifest_path_uses_xdg_when_set() {
-        let saved_xdg = std::env::var("XDG_CONFIG_HOME").ok();
-        let saved_home = std::env::var("HOME").ok();
-        // SAFETY: tests in this module are not run concurrently with
-        // env-mutating threads (cargo's default test harness already
-        // serialises tests inside one binary, and these helpers don't
-        // spawn threads of their own).
-        unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", "/tmp/xdg-conf");
-            std::env::remove_var("HOME");
-        }
-        let p = user_manifest_path().unwrap();
-        assert_eq!(p, PathBuf::from("/tmp/xdg-conf/insomnia/manifest.toml"));
-        unsafe {
-            match saved_xdg {
-                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-                None => std::env::remove_var("XDG_CONFIG_HOME"),
-            }
-            match saved_home {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
-            }
-        }
-    }
 }

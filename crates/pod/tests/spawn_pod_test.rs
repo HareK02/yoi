@@ -23,7 +23,7 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::net::UnixListener;
 
-/// Serialises tests that mutate `INSOMNIA_SCOPE_LOCK` /
+/// Serialises tests that mutate `INSOMNIA_RUNTIME_DIR` /
 /// `INSOMNIA_POD_COMMAND` across the thread-pooled test harness.
 static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
@@ -39,22 +39,26 @@ impl EnvGuard {
     }
 }
 
-/// Set up a tempdir, point `INSOMNIA_SCOPE_LOCK` + runtime-dir base at
-/// it, and install a live top-level "spawner" allocation so the tool
-/// has something to delegate from. Returns the tempdir (keeps it alive
-/// for the test's lifetime), runtime base, spawner socket, and the
-/// spawner's runtime dir.
+/// Set up a tempdir, point `INSOMNIA_RUNTIME_DIR` at it (so
+/// `scope.lock` and per-Pod runtime subdirs both land in the
+/// sandbox), and install a live top-level "spawner" allocation so the
+/// tool has something to delegate from. Returns the tempdir (keeps it
+/// alive for the test's lifetime), runtime base, spawner socket, and
+/// the spawner's runtime dir.
 async fn setup_spawner(
     spawner_name: &str,
     allow_root: &Path,
 ) -> (TempDir, PathBuf, PathBuf, Arc<RuntimeDir>) {
     let tmp = TempDir::new().unwrap();
-    let lock_path = tmp.path().join("scope.lock");
+    let runtime_base = tmp.path().to_path_buf();
     unsafe {
-        std::env::set_var("INSOMNIA_SCOPE_LOCK", &lock_path);
+        // Outranking env vars must be cleared so `paths::runtime_dir`
+        // resolves to our sandbox instead of the developer's real one.
+        std::env::remove_var("INSOMNIA_HOME");
+        std::env::remove_var("XDG_RUNTIME_DIR");
+        std::env::set_var("INSOMNIA_RUNTIME_DIR", &runtime_base);
     }
 
-    let runtime_base = tmp.path().join("runtime");
     let spawner_rd = RuntimeDir::create(&runtime_base, spawner_name)
         .await
         .unwrap();
@@ -148,7 +152,7 @@ fn dummy_model() -> ModelManifest {
 
 fn clear_env() {
     unsafe {
-        std::env::remove_var("INSOMNIA_SCOPE_LOCK");
+        std::env::remove_var("INSOMNIA_RUNTIME_DIR");
         std::env::remove_var("INSOMNIA_POD_COMMAND");
     }
 }

@@ -1,7 +1,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use manifest::ScopeRule;
+use manifest::{ScopeRule, paths};
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 
@@ -28,7 +28,7 @@ pub struct SpawnedPodRecord {
 /// Manages the Pod's runtime directory on tmpfs.
 ///
 /// ```text
-/// $XDG_RUNTIME_DIR/insomnia/{pod_name}/
+/// <runtime_dir>/{pod_name}/
 /// ├── pid
 /// ├── status.json
 /// ├── manifest.toml
@@ -36,6 +36,7 @@ pub struct SpawnedPodRecord {
 /// └── sock             (created by socket listener, not by RuntimeDir)
 /// ```
 ///
+/// `<runtime_dir>` is resolved via [`manifest::paths::runtime_dir`].
 /// Files are written atomically (write tmp → rename).
 /// The directory is removed on drop.
 pub struct RuntimeDir {
@@ -54,10 +55,8 @@ impl RuntimeDir {
         Ok(Self { path })
     }
 
-    /// Create in the default base directory.
-    ///
-    /// Uses `$XDG_RUNTIME_DIR/insomnia/` if available,
-    /// otherwise falls back to `~/.insomnia/run/`.
+    /// Create in the default base directory resolved via
+    /// [`manifest::paths::runtime_dir`].
     pub async fn create_default(pod_name: &str) -> Result<Self, io::Error> {
         let base = default_base()?;
         Self::create(&base, pod_name).await
@@ -118,20 +117,16 @@ async fn atomic_write(target: &Path, content: &[u8]) -> Result<(), io::Error> {
 
 /// Resolve the default base directory for runtime data.
 ///
-/// Public so the scope-lock registry (which lives outside the
-/// `RuntimeDir` instance lifecycle) can predict a Pod's socket path
-/// without constructing a `RuntimeDir` first.
+/// Thin wrapper over [`manifest::paths::runtime_dir`] that converts a
+/// missing-env situation into an `io::Error`.
 pub fn default_base() -> Result<PathBuf, io::Error> {
-    if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
-        Ok(PathBuf::from(runtime_dir).join("insomnia"))
-    } else if let Ok(home) = std::env::var("HOME") {
-        Ok(PathBuf::from(home).join(".insomnia").join("run"))
-    } else {
-        Err(io::Error::new(
+    paths::runtime_dir().ok_or_else(|| {
+        io::Error::new(
             io::ErrorKind::NotFound,
-            "neither XDG_RUNTIME_DIR nor HOME is set",
-        ))
-    }
+            "could not resolve runtime directory (no INSOMNIA_HOME / \
+             INSOMNIA_RUNTIME_DIR / XDG_RUNTIME_DIR / HOME)",
+        )
+    })
 }
 
 #[cfg(test)]

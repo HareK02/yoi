@@ -2,11 +2,11 @@ mod cascade;
 mod config;
 pub mod defaults;
 mod model;
+pub mod paths;
 mod scope;
 
-pub use cascade::{
-    LayerLoadError, find_project_manifest_from, load_layer, user_manifest_path,
-};
+pub use cascade::{LayerLoadError, find_project_manifest_from, load_layer};
+pub use paths::user_manifest_path;
 pub use config::{
     CompactionConfigPartial, PodManifestConfig, PodMetaConfig, ResolveError,
     ToolOutputLimitsPartial, WorkerManifestConfig,

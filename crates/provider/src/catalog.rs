@@ -2,8 +2,9 @@
 //!
 //! - builtin プロバイダ: `resources/providers/builtin.toml`
 //! - builtin モデル:    `resources/models/builtin.toml`
-//! - user override:     `$XDG_CONFIG_HOME/insomnia/{providers,models}.toml`
+//! - user override:     `<config_dir>/{providers,models}.toml`
 //!
+//! `<config_dir>` の解決は [`manifest::paths::config_dir`] を参照。
 //! どちらの override も「あれば builtin を置換、無ければ builtin」と
 //! いう一方向の差し替え（マージしない）。providers / models は独立に
 //! 読み、片方だけ user override も可。
@@ -150,13 +151,13 @@ fn auth_hint_to_ref(hint: &AuthHint) -> AuthRef {
 
 /// builtin + user override を解決して provider カタログを返す。
 ///
-/// user override (`$XDG_CONFIG_HOME/insomnia/providers.toml`) が
-/// 存在すれば builtin を置き換える。存在しなければ builtin のみ。
-/// user override が存在するが壊れている場合はエラーを返す（silent
-/// fallback はしない — ユーザーが書いた設定が silent に無視されて
-/// builtin に戻る挙動は気付きにくいため）。
+/// user override (`<config_dir>/providers.toml`) が存在すれば builtin
+/// を置き換える。存在しなければ builtin のみ。user override が存在
+/// するが壊れている場合はエラーを返す（silent fallback はしない —
+/// ユーザーが書いた設定が silent に無視されて builtin に戻る挙動は
+/// 気付きにくいため）。
 pub fn load_providers() -> Result<Vec<ProviderEntry>, CatalogError> {
-    if let Some(path) = user_override_path("providers.toml")
+    if let Some(path) = manifest::paths::user_catalog_override("providers.toml")
         && path.is_file()
     {
         return load_providers_from(&path);
@@ -189,7 +190,7 @@ pub fn load_providers_from(path: &Path) -> Result<Vec<ProviderEntry>, CatalogErr
 
 /// builtin + user override を解決してモデルカタログを返す。
 pub fn load_models() -> Result<Vec<ModelEntry>, CatalogError> {
-    if let Some(path) = user_override_path("models.toml")
+    if let Some(path) = manifest::paths::user_catalog_override("models.toml")
         && path.is_file()
     {
         return load_models_from(&path);
@@ -322,25 +323,6 @@ pub fn resolve_with_catalogs(
             capability: manifest.capability.clone(),
         })
     }
-}
-
-fn user_override_path(file_name: &str) -> Option<PathBuf> {
-    if let Ok(dir) = std::env::var("XDG_CONFIG_HOME")
-        && !dir.is_empty()
-    {
-        return Some(PathBuf::from(dir).join("insomnia").join(file_name));
-    }
-    if let Ok(home) = std::env::var("HOME")
-        && !home.is_empty()
-    {
-        return Some(
-            PathBuf::from(home)
-                .join(".config")
-                .join("insomnia")
-                .join(file_name),
-        );
-    }
-    None
 }
 
 #[cfg(test)]
@@ -538,14 +520,41 @@ auth_hint = { kind = "none" }
         assert!(matches!(err, CatalogError::Parse { .. }));
     }
 
+    /// `INSOMNIA_CONFIG_DIR` を tempdir に向けるテストガード。
+    /// `paths::config_dir` は他の env (INSOMNIA_HOME / XDG_CONFIG_HOME)
+    /// より高優先で `INSOMNIA_CONFIG_DIR` を尊重するため、これだけで
+    /// 開発機の env 設定に左右されないテストになる。
+    struct ConfigDirGuard {
+        prev: Option<String>,
+    }
+
+    impl ConfigDirGuard {
+        fn new(path: &Path) -> Self {
+            let prev = std::env::var("INSOMNIA_CONFIG_DIR").ok();
+            // SAFETY: serial_test の `#[serial]` 属性で env を弄るテスト
+            // 同士は直列化される。
+            unsafe { std::env::set_var("INSOMNIA_CONFIG_DIR", path) };
+            Self { prev }
+        }
+    }
+
+    impl Drop for ConfigDirGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var("INSOMNIA_CONFIG_DIR", v),
+                    None => std::env::remove_var("INSOMNIA_CONFIG_DIR"),
+                }
+            }
+        }
+    }
+
     #[test]
     #[serial]
     fn load_prefers_user_override() {
         let dir = tempfile::tempdir().unwrap();
-        let insomnia_dir = dir.path().join("insomnia");
-        std::fs::create_dir_all(&insomnia_dir).unwrap();
         std::fs::write(
-            insomnia_dir.join("providers.toml"),
+            dir.path().join("providers.toml"),
             r#"
 [[provider]]
 id = "only-one"
@@ -556,14 +565,8 @@ auth_hint = { kind = "none" }
         )
         .unwrap();
 
-        let prev_xdg = std::env::var("XDG_CONFIG_HOME").ok();
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", dir.path()) };
+        let _g = ConfigDirGuard::new(dir.path());
         let entries = load_providers().unwrap();
-        match prev_xdg {
-            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
-            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
-        }
-
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].id, "only-one");
     }
@@ -573,13 +576,8 @@ auth_hint = { kind = "none" }
     fn load_falls_back_to_builtin_when_override_absent() {
         let dir = tempfile::tempdir().unwrap();
         // override ファイルは作らない
-        let prev_xdg = std::env::var("XDG_CONFIG_HOME").ok();
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", dir.path()) };
+        let _g = ConfigDirGuard::new(dir.path());
         let entries = load_providers().unwrap();
-        match prev_xdg {
-            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
-            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
-        }
         assert_eq!(entries.len(), 4);
     }
 }

@@ -33,23 +33,8 @@ fn resolve_socket(pod_name: &str, override_path: Option<PathBuf>) -> PathBuf {
     if let Some(p) = override_path {
         return p;
     }
-    if let Ok(rd) = std::env::var("XDG_RUNTIME_DIR") {
-        PathBuf::from(rd)
-            .join("insomnia")
-            .join(pod_name)
-            .join("sock")
-    } else if let Ok(home) = std::env::var("HOME") {
-        PathBuf::from(home)
-            .join(".insomnia")
-            .join("run")
-            .join(pod_name)
-            .join("sock")
-    } else {
-        PathBuf::from("/tmp")
-            .join("insomnia")
-            .join(pod_name)
-            .join("sock")
-    }
+    manifest::paths::pod_socket_path(pod_name)
+        .unwrap_or_else(|| PathBuf::from("/tmp").join("insomnia").join(pod_name).join("sock"))
 }
 
 enum Mode {
