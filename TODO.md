@@ -19,3 +19,4 @@
   - [ ] Phase 2 consolidation → [tickets/memory-phase2-consolidation.md](tickets/memory-phase2-consolidation.md)
   - [ ] 使用頻度メトリクス + Knowledge 化候補レポート → [tickets/memory-usage-metrics.md](tickets/memory-usage-metrics.md)
   - [ ] GC（定期再評価） → [tickets/memory-gc.md](tickets/memory-gc.md)
+- [ ] モデル reasoning/thinking 制御の内部抽象整理 → [tickets/model-reasoning-control.md](tickets/model-reasoning-control.md)
