@@ -57,11 +57,11 @@ Knowledge / memory を LLM に渡す経路は以下で固定。採択基準（�
   - ソートは初期 grep の出現順、FTS / vector 導入時に関連度へ切り替え（将来検討）
   - ヒット件数上限と excerpt 行数は設定で tune
 - **memory 検索ツール**: `memory/{summary,decisions,requests}/*.md` 対象。spec は Knowledge 検索ツールと同型。§使用頻度メトリクスの観測経路と同一視する
-- **更新は既定の汎用 CRUD + Linter**: Knowledge / memory とも §書き込み経路と Linter の汎用 CRUD tool + post-write Linter Hook で済ませる。専用の create/update ツールは作らない
+- **更新は memory 専用 Tool + Linter**: Knowledge / memory への write/edit は `memory` クレートが提供する専用 Tool 経由のみ。汎用 CRUD（`tools` クレートの Write/Edit）は memory/knowledge 配下を触らない（Pod が Scope で deny）。Linter は memory tool 内で pre-write 検証として走り、違反は `ToolError::InvalidArgument` で LLM に返る。詳細は §書き込み経路と Linter
 - **常駐注入**: メモリを消費する主体は通常 Pod。`model_invokation: ON` な record の description を通常 Pod の system prompt に常駐注入する。Phase 2 prompt には入れない
   - 予算はシステムプロンプト全体の予算に含める（`memory_summary.md` の 5k 枠とは別管理にしない）
   - 超過時の件数キャップ / 優先順位ルールは、description 1024 chars 上限で通常は収まる前提。ON record 数が増えたら追加する
-- **Phase 2 の Knowledge アクセス**: 全 Knowledge 本文を prompt に埋めず、Knowledge 検索ツール + 汎用 CRUD を agent に渡して自律探索させる（詳細は §Phase 2）
+- **Phase 2 の Knowledge アクセス**: 全 Knowledge 本文を prompt に埋めず、Knowledge 検索ツール + memory 専用 Tool を agent に渡して自律探索させる（詳細は §Phase 2）
 - **`#<slug>` 補完 / 自動呼び出し（大枠のみ、実装は段階的）**:
   - `#<slug>` は検索ツールの slug 完全一致経路で本文が展開される
   - 補完 UI（slug サジェスト）は TUI 側。`user_invocable: false` は候補除外
@@ -80,13 +80,17 @@ Knowledge は「保存する価値があるか」だけでなく、「あとで�
 
 ### 書き込み経路と Linter
 
-人間も consolidation sub-Worker も**同じ CRUD tool（file read / write / edit）**で `memory/*` を触る。書き込み時の制約は静的 Linter で検証し、違反時は post-write Hook が turn を戻して sub-Worker に自己修正させる（N 回失敗で abort）。Linter は frontmatter / slug / 参照整合などの機械的ルールを見る。
+`memory/*` / `knowledge/*` への write/edit は **`memory` クレート提供の memory 専用 Tool（read / write / edit）** に集約する。汎用 CRUD（`tools` クレートの Write/Edit）はこれらのディレクトリに触らない（Pod が Scope で deny に落とすことで構造的に担保）。
+
+Linter は memory tool 内で **pre-write 検証** として走り、違反は `ToolError::InvalidArgument` で返す。LLM は通常の tool error フローで違反内容を読み、自己修正する。Interceptor 拡張・retry message 注入・違反カウンタは持たない（worker 層の max iteration が暴走を止める）。Linter は frontmatter / slug / 参照整合などの機械的ルールを見る。
+
+人間編集（エディタ / git commit）は tool 層を経由しないため Linter を通らない。`memory::Linter` は pure 関数として export し、CLI / pre-commit hook 経路を後で別チケットで用意する。
 
 意味破壊（rewrite で既存の主張・根拠が落ちる、Knowledge の記述主題がズレる等）の自動検出は初期範囲に含めない。Phase 2 prompt 側の情報損失最小化指示と git diff レビューで運用し、実使用で顕在化したら監査 LLM 層を後から挟む（将来検討）。
 
 Linter ルールは 2 系統:
 
-**静的 error**（post-write Hook で turn 戻し、sub-Worker が自己修正）:
+**静的 error**（memory tool が `ToolError::InvalidArgument` で返し、LLM が tool error フローで自己修正）:
 
 - frontmatter 必須 field
   - Decisions / Requests: `created_at`, `updated_at`, `sources`
@@ -132,7 +136,7 @@ Workflow 保護は専用 tool schema のトリックではなく Linter ルー�
 - **Trigger**: staging の累積ファイル数 or bytes が閾値超過、または compact 発火時（必ず flush）
 - **実行主体**: Phase 1 を終えた pod が consolidation Worker を spawn。並走防止は staging 配下の進行状況ファイル（後述）で担保
 - **入力**: 起動時スナップショットで確定した consumed ID list 分の staging エントリ（活動ログ + `source`）+ 既存 `memory/*`（summary / decisions / requests）の全文 + **Knowledge 化候補レポート**（後述の使用頻度メトリクスから機械集計、閾値超過の source 一覧）。既存 `knowledge/*` は全文を prompt に埋めず、Knowledge 検索ツール経由で agent が必要分を引く
-- **処理**: sub-Worker に**汎用 CRUD tool（file read / write / edit）+ Knowledge 検索ツール + memory 検索ツール + post-write Linter Hook** を渡し、agentic に以下を自律判断:
+- **処理**: sub-Worker に **memory 専用 Tool（read / write / edit、Linter 内蔵）+ Knowledge 検索ツール + memory 検索ツール** を渡し、agentic に以下を自律判断:
   - 新規 decisions / requests を 1 件 1 ファイルで追加。`sources` は staging の `source` をコピー（LLM 推論ではない）
   - 活動ログから派生する Knowledge（用語定義 / 運用方針 / ルール / 事実 / ノウハウ）を新規作成 or 既存 patch。**新規作成は候補レポート掲載の source から派生する場合に限る**。`kind` を frontmatter に持ち、`last_sources` を更新
   - summary を必要に応じて rewrite
@@ -245,7 +249,7 @@ GC は record を一律に「stale」とみなさず、少なくとも次の 4 �
 
 ### 将来検討（運用で必要性が見えたら追加）
 
-- 監査 LLM 層（意味破壊検出）の導入 — 初期は静的 Linter のみで運用し、Phase 2 の rewrite で情報損失・主題ズレが実運用で顕在化したら post-write Hook の 2 層目として追加。入力 / check 項目 / pass-fail 返却形式は導入時に詰める
+- 監査 LLM 層（意味破壊検出）の導入 — 初期は静的 Linter のみで運用し、Phase 2 の rewrite で情報損失・主題ズレが実運用で顕在化したら memory tool 内の検証パイプラインに 2 層目として追加。入力 / check 項目 / pass-fail 返却形式は導入時に詰める
 - Vector index / FTS5 等の検索索引 — 初期は grep で足りる想定。ファイル数増加で検索が重くなったら検討
 - `model_invokation` offer の自動判定ロジック — 初期は人間が手動で切り替え
 - 過去 session を cross-session で検索する UI

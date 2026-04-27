@@ -25,6 +25,7 @@ include_dir = "0.7.4"
 fs4 = { version = "0.13.1", features = ["sync"] }
 libc = "0.2.185"
 schemars = "1.2.1"
+memory = { version = "0.1.0", path = "../memory" }
 
 [dev-dependencies]
 async-trait = "0.1.89"

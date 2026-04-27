@@ -10,7 +10,7 @@ members = [
     "crates/protocol",
     "crates/provider",
     "crates/tools",
-    "crates/tui",
+    "crates/tui", "crates/memory",
 ]
 
 [workspace.package]

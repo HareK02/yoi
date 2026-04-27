@@ -14,7 +14,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::defaults;
 use crate::model::{AuthRef, ModelManifest};
-use crate::{CompactionConfig, PodManifest, PodMeta, ScopeConfig, ToolOutputLimits, WorkerManifest};
+use crate::{
+    CompactionConfig, MemoryConfig, PodManifest, PodMeta, ScopeConfig, ToolOutputLimits,
+    WorkerManifest,
+};
 
 /// Partial-form Pod manifest. Every field is optional; one or more
 /// instances merge via [`PodManifestConfig::merge`] before being
@@ -35,6 +38,9 @@ pub struct PodManifestConfig {
     pub scope: ScopeConfig,
     #[serde(default)]
     pub compaction: Option<CompactionConfigPartial>,
+    /// Memory subsystem opt-in. See [`MemoryConfig`].
+    #[serde(default)]
+    pub memory: Option<MemoryConfig>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -162,6 +168,11 @@ impl PodManifestConfig {
         for rule in &mut self.scope.deny {
             rule.target = join_if_relative(base, &rule.target);
         }
+        if let Some(ref mut memory) = self.memory
+            && let Some(ref mut root) = memory.workspace_root
+        {
+            *root = join_if_relative(base, root);
+        }
         if let Some(ref mut compaction) = self.compaction
             && let Some(ref mut cp) = compaction.model
         {
@@ -185,6 +196,15 @@ impl PodManifestConfig {
                 upper.compaction,
                 CompactionConfigPartial::merge,
             ),
+            memory: merge_option(self.memory, upper.memory, MemoryConfig::merge),
+        }
+    }
+}
+
+impl MemoryConfig {
+    fn merge(self, upper: Self) -> Self {
+        Self {
+            workspace_root: upper.workspace_root.or(self.workspace_root),
         }
     }
 }
@@ -375,6 +395,7 @@ impl TryFrom<PodManifestConfig> for PodManifest {
             worker,
             scope: cfg.scope,
             compaction,
+            memory: cfg.memory,
         })
     }
 }
@@ -417,6 +438,7 @@ mod tests {
                 deny: Vec::new(),
             },
             compaction: None,
+            memory: None,
         }
     }
 

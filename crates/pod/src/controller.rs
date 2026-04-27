@@ -117,6 +117,7 @@ impl PodController {
         let pwd_for_tools = pod.pwd().to_path_buf();
         let spawner_name = pod.manifest().pod.name.clone();
         let spawner_model = pod.manifest().model.clone();
+        let memory_config = pod.manifest().memory.clone();
 
         // Parent callback socket (this Pod's own parent, used for
         // `PodEvent` upward reports). `None` for top-level Pods.
@@ -232,6 +233,23 @@ impl PodController {
             let fs = tools::ScopedFs::new(scope_for_tools, pwd_for_tools.clone());
             let tracker = tools::Tracker::new();
             worker.register_tools(tools::builtin_tools(fs, tracker.clone()));
+
+            // Memory subsystem opt-in. When `[memory]` is present in
+            // the manifest, register the memory-specific Read/Write/Edit
+            // tools that target `<workspace>/memory/` and
+            // `<workspace>/knowledge/` with their built-in linter. The
+            // companion deny rules on the generic CRUD scope were
+            // already applied during `Pod::from_manifest`.
+            if let Some(mem) = memory_config.as_ref() {
+                let workspace_root = mem
+                    .workspace_root
+                    .clone()
+                    .unwrap_or_else(|| pwd_for_tools.clone());
+                let layout = memory::WorkspaceLayout::new(workspace_root);
+                worker.register_tool(memory::tool::read_tool(layout.clone()));
+                worker.register_tool(memory::tool::write_tool(layout.clone()));
+                worker.register_tool(memory::tool::edit_tool(layout));
+            }
 
             // Pod-orchestration tools (SpawnPod + the four comm tools)
             // share the Pod-scoped `SpawnedPodRegistry` hoisted above

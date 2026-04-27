@@ -31,6 +31,25 @@ pub struct PodManifest {
     pub scope: ScopeConfig,
     #[serde(default)]
     pub compaction: Option<CompactionConfig>,
+    /// Memory subsystem opt-in. Presence of `[memory]` in TOML enables
+    /// the memory tools (MemoryRead / MemoryWrite / MemoryEdit) and
+    /// causes Pod to deny generic write access to `<workspace>/memory/`
+    /// and `<workspace>/knowledge/`. Absent ⇒ legacy behaviour, no
+    /// memory tools registered.
+    #[serde(default)]
+    pub memory: Option<MemoryConfig>,
+}
+
+/// Memory subsystem configuration. Presence in the manifest enables
+/// memory; the workspace root defaults to the Pod's pwd unless an
+/// explicit override is given.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MemoryConfig {
+    /// Override for the workspace root. When `None`, the Pod's pwd
+    /// (resolved at construction time) is used. When set, must be an
+    /// absolute path.
+    #[serde(default)]
+    pub workspace_root: Option<PathBuf>,
 }
 
 /// Pod metadata.
@@ -409,6 +428,33 @@ model_id = "claude-sonnet-4-20250514"
     fn omitted_compaction_is_none() {
         let manifest = PodManifest::from_toml(MINIMAL_REQUIRED).unwrap();
         assert!(manifest.compaction.is_none());
+    }
+
+    #[test]
+    fn omitted_memory_is_none() {
+        let manifest = PodManifest::from_toml(MINIMAL_REQUIRED).unwrap();
+        assert!(manifest.memory.is_none());
+    }
+
+    #[test]
+    fn empty_memory_section_enables_with_default_root() {
+        let toml = format!("{MINIMAL_REQUIRED}\n[memory]\n");
+        let manifest = PodManifest::from_toml(&toml).unwrap();
+        let mem = manifest.memory.expect("memory section parsed");
+        assert!(mem.workspace_root.is_none());
+    }
+
+    #[test]
+    fn memory_section_with_explicit_root() {
+        let toml = format!(
+            "{MINIMAL_REQUIRED}\n[memory]\nworkspace_root = \"/some/where\"\n"
+        );
+        let manifest = PodManifest::from_toml(&toml).unwrap();
+        let mem = manifest.memory.unwrap();
+        assert_eq!(
+            mem.workspace_root.unwrap(),
+            std::path::PathBuf::from("/some/where")
+        );
     }
 
     #[test]

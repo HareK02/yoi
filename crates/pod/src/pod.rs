@@ -1197,7 +1197,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
         loader: PromptLoader,
     ) -> Result<Self, PodError> {
         let pwd = current_pwd()?;
-        let scope = Scope::from_config(&manifest.scope).map_err(PodError::Scope)?;
+        let scope = build_scope_with_memory(&manifest, &pwd)?;
         if !scope.is_readable(&pwd) {
             return Err(PodError::PwdOutsideScope { pwd });
         }
@@ -1279,7 +1279,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
         callback_socket: PathBuf,
     ) -> Result<Self, PodError> {
         let pwd = current_pwd()?;
-        let scope = Scope::from_config(&manifest.scope).map_err(PodError::Scope)?;
+        let scope = build_scope_with_memory(&manifest, &pwd)?;
         if !scope.is_readable(&pwd) {
             return Err(PodError::PwdOutsideScope { pwd });
         }
@@ -1505,6 +1505,25 @@ pub enum PodError {
 
     #[error(transparent)]
     PromptCatalog(#[from] CatalogError),
+}
+
+/// Build the Pod's runtime [`Scope`] from the manifest, layering the
+/// memory subsystem's deny-write rules on top when `[memory]` is
+/// present. The deny rules cap generic CRUD tools so they cannot
+/// touch `<workspace>/memory/` or `<workspace>/knowledge/` while the
+/// memory tools (registered separately) bypass `ScopedFs` and write
+/// through `std::fs` directly.
+fn build_scope_with_memory(manifest: &PodManifest, pwd: &Path) -> Result<Scope, PodError> {
+    let mut scope_config = manifest.scope.clone();
+    if let Some(mem) = manifest.memory.as_ref() {
+        let root = mem
+            .workspace_root
+            .clone()
+            .unwrap_or_else(|| pwd.to_path_buf());
+        let layout = memory::WorkspaceLayout::new(root);
+        scope_config.deny.extend(memory::deny_write_rules(&layout));
+    }
+    Scope::from_config(&scope_config).map_err(PodError::Scope)
 }
 
 /// Snapshot the process's current working directory as the Pod's pwd,
