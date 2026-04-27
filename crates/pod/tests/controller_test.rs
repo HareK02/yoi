@@ -170,9 +170,7 @@ async fn run_updates_shared_state_to_idle_after_completion() {
     let handle = spawn_controller(pod).await;
 
     handle
-        .send(Method::Run {
-            input: "Hello".into(),
-        })
+        .send(Method::run_text("Hello"))
         .await
         .unwrap();
 
@@ -189,9 +187,7 @@ async fn run_populates_history() {
     let handle = spawn_controller(pod).await;
 
     handle
-        .send(Method::Run {
-            input: "Hello".into(),
-        })
+        .send(Method::run_text("Hello"))
         .await
         .unwrap();
 
@@ -212,9 +208,7 @@ async fn events_are_broadcast() {
     let mut rx = handle.subscribe();
 
     handle
-        .send(Method::Run {
-            input: "Hello".into(),
-        })
+        .send(Method::run_text("Hello"))
         .await
         .unwrap();
 
@@ -265,17 +259,13 @@ async fn double_run_returns_error() {
 
     // Send first run
     handle
-        .send(Method::Run {
-            input: "first".into(),
-        })
+        .send(Method::run_text("first"))
         .await
         .unwrap();
 
     // Immediately send second run (should get error)
     handle
-        .send(Method::Run {
-            input: "second".into(),
-        })
+        .send(Method::run_text("second"))
         .await
         .unwrap();
 
@@ -364,6 +354,119 @@ async fn cancel_without_run_returns_error() {
 }
 
 #[tokio::test]
+async fn run_with_paste_segment_inlines_content_and_emits_typed_user_message() {
+    let client = MockClient::new(simple_text_events());
+    let client_for_assert = client.clone();
+    let pod = make_pod(client).await;
+    let handle = spawn_controller(pod).await;
+    let mut rx = handle.subscribe();
+
+    // Mixed input: plain text + a paste chip + trailing text. Pod must
+    // flatten this into one user-message string (paste content inlined,
+    // no `[Clipboard ...]` label leaking to the LLM); the
+    // `Event::UserMessage` re-broadcast must carry the typed segments
+    // unchanged so other clients can re-render the chip.
+    let segments = vec![
+        protocol::Segment::text("see "),
+        protocol::Segment::Paste {
+            id: 7,
+            chars: 11,
+            lines: 2,
+            content: "line1\nline2".into(),
+        },
+        protocol::Segment::text(" thanks"),
+    ];
+    handle
+        .send(Method::Run {
+            input: segments.clone(),
+        })
+        .await
+        .unwrap();
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    let mut user_event_segments: Option<Vec<protocol::Segment>> = None;
+    loop {
+        tokio::select! {
+            event = rx.recv() => match event {
+                Ok(Event::UserMessage { segments }) => user_event_segments = Some(segments),
+                Ok(Event::TurnEnd { .. }) => break,
+                Err(_) => break,
+                _ => {}
+            },
+            _ = tokio::time::sleep_until(deadline) => break,
+        }
+    }
+    let echoed = user_event_segments.expect("UserMessage event missing");
+    assert_eq!(echoed.len(), 3, "all three segments must round-trip");
+    assert!(matches!(echoed[1], protocol::Segment::Paste { id: 7, .. }));
+
+    // The Worker received a single user message whose text is the
+    // flattened body — paste content inlined, no chip label.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let requests = client_for_assert.captured_requests();
+    assert_eq!(requests.len(), 1, "one LLM call expected");
+    let user_text = requests[0]
+        .items
+        .iter()
+        .find_map(|i| i.as_text().map(|s| s.to_string()))
+        .unwrap_or_default();
+    assert!(user_text.contains("see line1\nline2 thanks"), "got: {user_text:?}");
+    assert!(!user_text.contains("[Clipboard"), "label must not leak: {user_text:?}");
+}
+
+#[tokio::test]
+async fn run_with_unresolved_segment_emits_alert_and_placeholder() {
+    let client = MockClient::new(simple_text_events());
+    let client_for_assert = client.clone();
+    let pod = make_pod(client).await;
+    let handle = spawn_controller(pod).await;
+    let mut rx = handle.subscribe();
+
+    let segments = vec![
+        protocol::Segment::text("look at "),
+        protocol::Segment::FileRef { path: "src/lib.rs".into() },
+    ];
+    handle
+        .send(Method::Run { input: segments })
+        .await
+        .unwrap();
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    let mut saw_alert_for_file_ref = false;
+    loop {
+        tokio::select! {
+            event = rx.recv() => match event {
+                Ok(Event::Alert(a)) if a.message.contains("file ref @src/lib.rs") => {
+                    saw_alert_for_file_ref = true;
+                }
+                Ok(Event::TurnEnd { .. }) => break,
+                Err(_) => break,
+                _ => {}
+            },
+            _ = tokio::time::sleep_until(deadline) => break,
+        }
+    }
+    assert!(
+        saw_alert_for_file_ref,
+        "an Alert mentioning the unresolved file ref must be emitted"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let requests = client_for_assert.captured_requests();
+    let user_text = requests[0]
+        .items
+        .iter()
+        .find_map(|i| i.as_text().map(|s| s.to_string()))
+        .unwrap_or_default();
+    // LLM context carries a placeholder so the model can ask for the
+    // missing content rather than silently miss the user's intent.
+    assert!(
+        user_text.contains("[unresolved file ref: src/lib.rs]"),
+        "placeholder missing, got: {user_text:?}"
+    );
+}
+
+#[tokio::test]
 async fn notify_while_idle_auto_starts_turn_and_injects_system_message() {
     let client = MockClient::new(simple_text_events());
     let client_for_assert = client.clone();
@@ -425,9 +528,7 @@ async fn notify_while_running_does_not_emit_already_running_error() {
     let mut rx = handle.subscribe();
 
     handle
-        .send(Method::Run {
-            input: "start".into(),
-        })
+        .send(Method::run_text("start"))
         .await
         .unwrap();
     handle
@@ -491,9 +592,7 @@ async fn socket_run_receives_events() {
 
     // Send run method via socket
     writer
-        .write(&Method::Run {
-            input: "Hello".into(),
-        })
+        .write(&Method::run_text("Hello"))
         .await
         .unwrap();
 
@@ -641,9 +740,7 @@ async fn pause_then_resume_transitions_and_preserves_history_consistency() {
     let mut rx = handle.subscribe();
 
     handle
-        .send(Method::Run {
-            input: "hello".into(),
-        })
+        .send(Method::run_text("hello"))
         .await
         .unwrap();
 
@@ -754,9 +851,7 @@ async fn paused_then_run_closes_orphan_tool_use_for_next_request() {
     let mut rx = handle.subscribe();
 
     handle
-        .send(Method::Run {
-            input: "first".into(),
-        })
+        .send(Method::run_text("first"))
         .await
         .unwrap();
 
@@ -789,9 +884,7 @@ async fn paused_then_run_closes_orphan_tool_use_for_next_request() {
     // `Pod::interrupt_and_run`, which closes the orphan + injects a
     // system note before the fresh user message.
     handle
-        .send(Method::Run {
-            input: "new request".into(),
-        })
+        .send(Method::run_text("new request"))
         .await
         .unwrap();
     assert!(

@@ -193,7 +193,10 @@ async fn spawn_pod_delegates_scope_and_sends_run() {
     // Verify the tool delivered Method::Run to the socket.
     let method = received.await.unwrap().expect("expected one Method line");
     match method {
-        Method::Run { input } => assert_eq!(input, "hello"),
+        Method::Run { input } => match input.as_slice() {
+            [protocol::Segment::Text { content }] => assert_eq!(content, "hello"),
+            other => panic!("expected single Text segment, got {other:?}"),
+        },
         other => panic!("expected Run, got {other:?}"),
     }
 

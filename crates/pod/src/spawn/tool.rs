@@ -424,7 +424,7 @@ async fn send_run(socket: &Path, task: &str) -> Result<(), ToolError> {
     let (_reader, writer) = stream.into_split();
     let mut w = JsonLineWriter::new(writer);
     w.write(&Method::Run {
-        input: task.to_string(),
+        input: vec![protocol::Segment::text(task)],
     })
     .await
     .map_err(|e| ToolError::ExecutionFailed(format!("send Method::Run: {e}")))?;

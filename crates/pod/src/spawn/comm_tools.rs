@@ -358,7 +358,12 @@ async fn send_run_and_confirm(socket: &Path, input: String) -> Result<(), SendRu
     let (r, w) = stream.into_split();
     let mut writer = JsonLineWriter::new(w);
     let mut reader = JsonLineReader::new(r);
-    tokio::time::timeout(SOCKET_OP_TIMEOUT, writer.write(&Method::Run { input }))
+    tokio::time::timeout(
+        SOCKET_OP_TIMEOUT,
+        writer.write(&Method::Run {
+            input: vec![protocol::Segment::text(input)],
+        }),
+    )
         .await
         .map_err(|_| SendRunError::Io("write timed out".into()))?
         .map_err(|e| SendRunError::Io(format!("write: {e}")))?;

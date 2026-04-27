@@ -80,3 +80,8 @@ text しか作れない client が引き続き存在しても良いことを pro
 - `crates/protocol/src/lib.rs`（`Method::Run`, `Event::UserMessage`）
 - `crates/tui/src/input.rs`（`Atom::Paste`, `submit_text`）
 - `crates/tui/src/app.rs`（`submit_input`, `Block::UserMessage` 描画）
+
+## Review
+- 状態: Approve
+- レビュー詳細: [./submit-segment-protocol.review.md](./submit-segment-protocol.review.md)
+- 日付: 2026-04-27

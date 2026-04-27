@@ -57,7 +57,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Session: {}", pod.session_id());
 
     // 4. Run a prompt
-    let result = pod.run("What is the capital of France?").await?;
+    let result = pod.run_text("What is the capital of France?").await?;
     match result {
         PodRunResult::Finished => println!("(finished)"),
         PodRunResult::Paused => println!("(paused)"),

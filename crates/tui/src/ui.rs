@@ -20,7 +20,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block as UiBlock, BorderType, Borders, Padding, Paragraph, Widget, Wrap};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use protocol::{Greeting, AlertLevel};
+use protocol::{AlertLevel, Greeting, Segment};
 
 use crate::app::{App, fmt_tokens, alert_source_label};
 use crate::block::{Block, CompactEvent};
@@ -299,13 +299,7 @@ fn render_block_into(
                 kind_style(MessageKind::TurnHeader),
             )));
         }
-        Block::UserMessage { text } => match mode {
-            Mode::Overview => push_overview_line(lines, text, width, MessageKind::User, "> "),
-            // User input and assistant prose are the primary readable
-            // content of a turn — never compressed in detail / normal.
-            // Only `overview` folds them to a single line.
-            _ => push_padded_lines(lines, text, MessageKind::User),
-        },
+        Block::UserMessage { segments } => render_user_message(lines, segments, width, mode),
         Block::AssistantText { text } => match mode {
             Mode::Overview => push_overview_line(lines, text, width, MessageKind::Assistant, ""),
             _ => push_padded_lines(lines, text, MessageKind::Assistant),
@@ -360,6 +354,87 @@ fn push_padded_lines(lines: &mut Vec<Line<'static>>, text: &str, kind: MessageKi
     }
     if text.is_empty() {
         lines.push(Line::from(""));
+    }
+}
+
+/// Render `Block::UserMessage` from typed segments. Paste atoms are
+/// reconstructed as `[Clipboard #N | X chars, Y lines]` chips in
+/// magenta — matching the input-area presentation — so the user can
+/// recognise their own paste in the scrollback. User-entered text uses
+/// the standard `MessageKind::User` style; other segment kinds (file /
+/// knowledge / workflow refs, unknown variants) render as inline
+/// identifiers in the user style and are expected to be rare until the
+/// completion ticket lands.
+fn render_user_message(
+    lines: &mut Vec<Line<'static>>,
+    segments: &[Segment],
+    width: u16,
+    mode: Mode,
+) {
+    if matches!(mode, Mode::Overview) {
+        let text = segments
+            .iter()
+            .map(segment_display_text)
+            .collect::<Vec<_>>()
+            .join("");
+        push_overview_line(lines, &text, width, MessageKind::User, "> ");
+        return;
+    }
+
+    let user_style = kind_style(MessageKind::User);
+    let paste_style = Style::default().fg(Color::Magenta);
+    let mut current: Vec<Span<'static>> = Vec::new();
+
+    for seg in segments {
+        match seg {
+            Segment::Text { content } => {
+                let mut iter = content.split('\n').peekable();
+                while let Some(line) = iter.next() {
+                    if !line.is_empty() {
+                        current.push(Span::styled(line.to_owned(), user_style));
+                    }
+                    if iter.peek().is_some() {
+                        lines.push(Line::from(std::mem::take(&mut current)));
+                    }
+                }
+            }
+            Segment::Paste {
+                id,
+                chars,
+                lines: line_count,
+                ..
+            } => {
+                current.push(Span::styled(
+                    format!("[Clipboard #{id} | {chars} chars, {line_count} lines]"),
+                    paste_style,
+                ));
+            }
+            other => {
+                current.push(Span::styled(segment_display_text(other), user_style));
+            }
+        }
+    }
+    if !current.is_empty() {
+        lines.push(Line::from(current));
+    }
+}
+
+/// One-line textual rendering of a segment, used by `Mode::Overview`
+/// (which collapses everything to a single string) and as the fallback
+/// inline rendering for non-paste, non-text segments.
+fn segment_display_text(seg: &Segment) -> String {
+    match seg {
+        Segment::Text { content } => content.replace('\n', " "),
+        Segment::Paste {
+            id,
+            chars,
+            lines,
+            ..
+        } => format!("[Clipboard #{id} | {chars} chars, {lines} lines]"),
+        Segment::FileRef { path } => format!("@{path}"),
+        Segment::KnowledgeRef { slug } => format!("#{slug}"),
+        Segment::WorkflowInvoke { slug } => format!("/{slug}"),
+        Segment::Unknown => "[unknown segment]".to_owned(),
     }
 }
 

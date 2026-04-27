@@ -192,7 +192,7 @@ async fn post_run_compact_success_broadcasts_start_and_done() {
     let (tx, mut rx) = broadcast::channel::<Event>(64);
     pod.attach_event_tx(tx);
 
-    pod.run("first").await.unwrap();
+    pod.run_text("first").await.unwrap();
     // Drain run events so only compact events remain in `rx`.
     let _ = drain(&mut rx);
 
@@ -248,12 +248,12 @@ async fn mid_turn_compact_success_broadcasts_start_and_done() {
     pod.attach_event_tx(tx);
 
     // First run populates usage_history above the request threshold.
-    pod.run("first").await.unwrap();
+    pod.run_text("first").await.unwrap();
     let _ = drain(&mut rx);
 
     // Second run: pre_llm_request yields immediately, Worker returns
     // Yielded, handle_worker_result routes into do_compact_and_resume.
-    pod.run("second").await.unwrap();
+    pod.run_text("second").await.unwrap();
 
     let events = drain(&mut rx);
     let kinds: Vec<&str> = events
@@ -291,7 +291,7 @@ async fn post_run_compact_failure_broadcasts_start_and_failed() {
     let (tx, mut rx) = broadcast::channel::<Event>(64);
     pod.attach_event_tx(tx);
 
-    pod.run("first").await.unwrap();
+    pod.run_text("first").await.unwrap();
     let _ = drain(&mut rx);
 
     // Best-effort: returns Ok(()) even on failure, but emits CompactFailed.

@@ -284,7 +284,7 @@ impl PodController {
                         // render the turn header + user line from a
                         // single source of truth.
                         let _ = event_tx.send(Event::UserMessage {
-                            text: input.clone(),
+                            segments: input.clone(),
                         });
                         let was_paused = status_before == PodStatus::Paused;
                         shared_state.set_status(PodStatus::Running);

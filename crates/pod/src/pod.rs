@@ -28,7 +28,7 @@ use crate::runtime::dir;
 use crate::runtime::scope_lock::{self, ScopeAllocationGuard, ScopeLockError};
 use crate::prompt::system::{SystemPromptContext, SystemPromptError, SystemPromptTemplate};
 use crate::compact::usage_tracker::UsageTracker;
-use protocol::{Event, AlertLevel, AlertSource};
+use protocol::{AlertLevel, AlertSource, Event, Segment};
 use tokio::sync::broadcast;
 use async_trait::async_trait;
 use llm_worker::interceptor::PreRequestAction;
@@ -553,25 +553,105 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         Ok(())
     }
 
+    /// Convenience: run with a single `Segment::Text`.
+    ///
+    /// Equivalent to `run(vec![Segment::text(s)])`. The dumb-client
+    /// counterpart of [`protocol::Method::run_text`]; primarily for
+    /// tests and tools that have only a string in hand.
+    pub async fn run_text(
+        &mut self,
+        s: impl Into<String>,
+    ) -> Result<PodRunResult, PodError> {
+        self.run(vec![Segment::text(s)]).await
+    }
+
     /// Send user input and run until the LLM turn completes.
+    ///
+    /// `input` is a typed segment list (see [`protocol::Segment`]). The
+    /// Pod flattens it into a single user-message string for the
+    /// underlying Worker, expanding paste content inline and surfacing
+    /// alerts for any segment kind the current Pod has no resolver for
+    /// (file refs, knowledge refs, workflow invocations, unknown
+    /// variants from a newer client).
     ///
     /// If the between-turns compaction threshold is exceeded mid-run,
     /// the Worker is aborted, history is compacted, and execution resumes
     /// automatically.
-    pub async fn run(&mut self, input: impl Into<String>) -> Result<PodRunResult, PodError> {
+    pub async fn run(&mut self, input: Vec<Segment>) -> Result<PodRunResult, PodError> {
         self.ensure_interceptor_installed();
         self.ensure_system_prompt_materialized()?;
         self.ensure_session_head().await?;
+
+        let flattened = self.flatten_segments(&input);
 
         let history_before = self.worker.as_ref().unwrap().history().len();
 
         // lock → run → unlock
         let worker = self.worker.take().expect("worker taken during run");
         let mut locked = worker.lock();
-        let result = locked.run(input).await;
+        let result = locked.run(flattened).await;
         self.worker = Some(locked.unlock());
 
         self.handle_worker_result(result, history_before).await
+    }
+
+    /// Flatten a typed segment list into the single string the Worker
+    /// receives as the user message. Inlines text and paste content;
+    /// substitutes `[unresolved <kind>: <key>]` placeholders for
+    /// segments that have no resolver, and emits a user-facing alert so
+    /// neither the LLM nor the human is blind to the dropped intent.
+    fn flatten_segments(&self, segments: &[Segment]) -> String {
+        let mut out = String::new();
+        for seg in segments {
+            match seg {
+                Segment::Text { content } => out.push_str(content),
+                Segment::Paste { content, .. } => out.push_str(content),
+                Segment::FileRef { path } => {
+                    self.alert(
+                        AlertLevel::Warn,
+                        AlertSource::Pod,
+                        format!(
+                            "file ref @{path} cannot be resolved \
+                             (resolver not yet implemented); passed to LLM as placeholder"
+                        ),
+                    );
+                    out.push_str(&format!("[unresolved file ref: {path}]"));
+                }
+                Segment::KnowledgeRef { slug } => {
+                    self.alert(
+                        AlertLevel::Warn,
+                        AlertSource::Pod,
+                        format!(
+                            "knowledge ref #{slug} cannot be resolved \
+                             (resolver not yet implemented); passed to LLM as placeholder"
+                        ),
+                    );
+                    out.push_str(&format!("[unresolved knowledge ref: {slug}]"));
+                }
+                Segment::WorkflowInvoke { slug } => {
+                    self.alert(
+                        AlertLevel::Warn,
+                        AlertSource::Pod,
+                        format!(
+                            "workflow /{slug} cannot be resolved \
+                             (resolver not yet implemented); passed to LLM as placeholder"
+                        ),
+                    );
+                    out.push_str(&format!("[unresolved workflow invoke: {slug}]"));
+                }
+                Segment::Unknown => {
+                    self.alert(
+                        AlertLevel::Warn,
+                        AlertSource::Pod,
+                        "received unknown segment kind from a newer client; \
+                         passed to LLM as placeholder"
+                            .into(),
+                    );
+                    out.push_str("[unknown input segment]");
+                }
+            }
+        }
+        out
     }
 
     /// Run a turn triggered by `Method::Notify` while the Pod is idle.

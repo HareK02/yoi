@@ -1,4 +1,4 @@
-use protocol::{Event, Method, AlertLevel, AlertSource, RunResult};
+use protocol::{AlertLevel, AlertSource, Event, Method, RunResult, Segment};
 
 use crate::block::{Block, CompactEvent, ToolCallBlock, ToolCallState};
 use crate::cache::FileCache;
@@ -62,8 +62,8 @@ impl App {
     }
 
     pub fn submit_input(&mut self) -> Option<Method> {
-        let text = self.input.submit_text().trim().to_owned();
-        if text.is_empty() {
+        let segments = self.input.submit_segments();
+        if segments_are_blank(&segments) {
             // Empty Enter only does something meaningful when the Pod
             // is paused: resume the interrupted turn. Otherwise no-op.
             if self.paused {
@@ -77,7 +77,7 @@ impl App {
         // client subscribed to the Pod). Locally we only clear the
         // input buffer and forward the method.
         self.input.clear();
-        Some(Method::Run { input: text })
+        Some(Method::Run { input: segments })
     }
 
     pub fn push_error(&mut self, message: impl Into<String>) {
@@ -90,12 +90,12 @@ impl App {
 
     pub fn handle_pod_event(&mut self, event: Event) {
         match event {
-            Event::UserMessage { text } => {
+            Event::UserMessage { segments } => {
                 self.turn_index += 1;
                 self.blocks.push(Block::TurnHeader {
                     turn: self.turn_index,
                 });
-                self.blocks.push(Block::UserMessage { text });
+                self.blocks.push(Block::UserMessage { segments });
                 self.assistant_streaming = false;
             }
             Event::TurnStart { .. } => {
@@ -370,7 +370,9 @@ impl App {
                                 turn: self.turn_index,
                             });
                             if !text.is_empty() {
-                                self.blocks.push(Block::UserMessage { text });
+                                self.blocks.push(Block::UserMessage {
+                                    segments: vec![Segment::text(text)],
+                                });
                             }
                         }
                         "assistant" if !text.is_empty() => {
@@ -486,6 +488,17 @@ fn strip_cat_n_prefix(formatted: &str) -> String {
         }
     }
     out
+}
+
+/// True if the submitted segment list carries no user-visible content
+/// (only whitespace / newlines, no paste, no typed atoms). Used to
+/// decide whether an empty Enter should be a no-op or trigger a
+/// `Resume` when the Pod is paused.
+fn segments_are_blank(segments: &[Segment]) -> bool {
+    segments.iter().all(|s| match s {
+        Segment::Text { content } => content.trim().is_empty(),
+        _ => false,
+    })
 }
 
 pub fn alert_source_label(source: AlertSource) -> &'static str {

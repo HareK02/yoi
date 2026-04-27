@@ -190,15 +190,32 @@ impl InputBuffer {
         (start, self.cursor - start)
     }
 
-    /// Flatten atoms into the text sent to the Pod: paste atoms expand
-    /// to their original content; no `[Clipboard ...]` labels survive.
-    pub fn submit_text(&self) -> String {
-        let mut out = String::new();
+    /// Build the typed `Vec<Segment>` sent over the protocol. Adjacent
+    /// `Atom::Char`s are concatenated into a single `Segment::Text`;
+    /// each `Atom::Paste` becomes a standalone `Segment::Paste` so the
+    /// `[Clipboard #N | X chars, Y lines]` chip can be reconstructed by
+    /// any client subscribed to the resulting `Event::UserMessage`.
+    pub fn submit_segments(&self) -> Vec<protocol::Segment> {
+        let mut out = Vec::new();
+        let mut buf = String::new();
         for a in &self.atoms {
             match a {
-                Atom::Char(c) => out.push(*c),
-                Atom::Paste(p) => out.push_str(&p.content),
+                Atom::Char(c) => buf.push(*c),
+                Atom::Paste(p) => {
+                    if !buf.is_empty() {
+                        out.push(protocol::Segment::text(std::mem::take(&mut buf)));
+                    }
+                    out.push(protocol::Segment::Paste {
+                        id: p.id,
+                        chars: p.chars as u32,
+                        lines: p.lines as u32,
+                        content: p.content.clone(),
+                    });
+                }
             }
+        }
+        if !buf.is_empty() {
+            out.push(protocol::Segment::text(buf));
         }
         out
     }
@@ -401,4 +418,74 @@ pub struct InputRender {
     pub lines: Vec<Line<'static>>,
     pub cursor_row: u16,
     pub cursor_col: u16,
+}
+
+#[cfg(test)]
+mod submit_segments_tests {
+    use super::*;
+    use protocol::Segment;
+
+    #[test]
+    fn pure_text_collapses_to_one_text_segment() {
+        let mut buf = InputBuffer::new();
+        for c in "hello".chars() {
+            buf.insert_char(c);
+        }
+        let segs = buf.submit_segments();
+        assert_eq!(segs.len(), 1);
+        match &segs[0] {
+            Segment::Text { content } => assert_eq!(content, "hello"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn paste_emits_separate_segment_with_metadata() {
+        let mut buf = InputBuffer::new();
+        for c in "see ".chars() {
+            buf.insert_char(c);
+        }
+        buf.insert_paste("line1\nline2".into());
+        for c in " end".chars() {
+            buf.insert_char(c);
+        }
+        let segs = buf.submit_segments();
+        assert_eq!(segs.len(), 3);
+        match &segs[0] {
+            Segment::Text { content } => assert_eq!(content, "see "),
+            other => panic!("expected Text, got {other:?}"),
+        }
+        match &segs[1] {
+            Segment::Paste {
+                chars,
+                lines,
+                content,
+                ..
+            } => {
+                assert_eq!(content, "line1\nline2");
+                assert_eq!(*chars, "line1\nline2".chars().count() as u32);
+                assert_eq!(*lines, 2);
+            }
+            other => panic!("expected Paste, got {other:?}"),
+        }
+        match &segs[2] {
+            Segment::Text { content } => assert_eq!(content, " end"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_buffer_yields_empty_segments() {
+        let buf = InputBuffer::new();
+        assert!(buf.submit_segments().is_empty());
+    }
+
+    #[test]
+    fn leading_paste_does_not_emit_empty_text() {
+        let mut buf = InputBuffer::new();
+        buf.insert_paste("X".into());
+        let segs = buf.submit_segments();
+        assert_eq!(segs.len(), 1);
+        assert!(matches!(segs[0], Segment::Paste { .. }));
+    }
 }

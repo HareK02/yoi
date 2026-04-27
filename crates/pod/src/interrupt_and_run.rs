@@ -11,6 +11,7 @@
 
 use llm_worker::Item;
 use llm_worker::llm_client::client::LlmClient;
+use protocol::Segment;
 use session_store::Store;
 
 use crate::pod::{Pod, PodError, PodRunResult};
@@ -25,7 +26,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     /// rationale around synthetic tool results.
     pub async fn interrupt_and_run(
         &mut self,
-        input: impl Into<String>,
+        input: Vec<Segment>,
     ) -> Result<PodRunResult, PodError> {
         let tool_result_summary = self
             .prompts()

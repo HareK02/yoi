@@ -185,7 +185,10 @@ async fn send_to_pod_delivers_run_method() {
 
     let method = received.await.unwrap().expect("expected a method");
     match method {
-        Method::Run { input } => assert_eq!(input, "hello there"),
+        Method::Run { input } => match input.as_slice() {
+            [protocol::Segment::Text { content }] => assert_eq!(content, "hello there"),
+            other => panic!("expected single Text segment, got {other:?}"),
+        },
         other => panic!("expected Run, got {other:?}"),
     }
 }

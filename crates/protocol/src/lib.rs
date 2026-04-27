@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "method", content = "params", rename_all = "snake_case")]
 pub enum Method {
-    Run { input: String },
+    Run { input: Vec<Segment> },
     /// Human-readable text injected into the target Pod's LLM context
     /// as a non-blocking system message. No side effects beyond LLM
     /// context; use `PodEvent` for typed lifecycle reports.
@@ -77,6 +77,72 @@ pub enum PodEvent {
 }
 
 // ---------------------------------------------------------------------------
+// Segment — typed pieces of a user submission
+// ---------------------------------------------------------------------------
+
+/// One typed piece of a user submission.
+///
+/// `Method::Run` and `Event::UserMessage` carry `Vec<Segment>`. Dumb
+/// clients (CLI piping, scripts) only need to produce a single
+/// `Segment::Text`; richer clients (TUI / GUI) construct typed atoms
+/// (paste chips, file refs, knowledge refs, workflow invocations) and
+/// send them through directly so the Pod side never has to re-parse a
+/// flattened string.
+///
+/// Forward compat: payloads with unknown `kind` deserialize to
+/// `Segment::Unknown`. Pod treats this the same as known-but-unresolved
+/// variants — emits an alert and inserts a `[unknown input segment]`
+/// placeholder into the LLM context so neither user nor LLM is blind to
+/// the dropped intent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Segment {
+    /// Free-form text. The fallback every client can produce.
+    Text { content: String },
+    /// Bracketed-paste capture from a TUI-style client. `id`, `chars`
+    /// and `lines` carry the metadata needed to re-render a
+    /// `[Clipboard #N | X chars, Y lines]` chip in `Event::UserMessage`
+    /// re-broadcast.
+    Paste {
+        id: u32,
+        chars: u32,
+        lines: u32,
+        content: String,
+    },
+    /// `@<path>` file reference. Pod resolves to scope-checked file
+    /// content when a resolver is registered (resolver implementation
+    /// out of scope for this ticket).
+    FileRef { path: String },
+    /// `#<slug>` Knowledge reference (see `docs/plan/memory.md`).
+    KnowledgeRef { slug: String },
+    /// `/<slug>` Workflow invocation (see `docs/plan/workflow.md`).
+    WorkflowInvoke { slug: String },
+    /// Unknown variant from a newer client. Pod treats this as an
+    /// unresolved input — surfaces an alert and inserts a placeholder.
+    /// Round-trip is lossy: re-serializing yields `{"kind":"unknown"}`.
+    #[serde(other)]
+    Unknown,
+}
+
+impl Segment {
+    /// Convenience constructor for the most common case.
+    pub fn text(s: impl Into<String>) -> Self {
+        Self::Text { content: s.into() }
+    }
+}
+
+impl Method {
+    /// Convenience: a `Run` carrying a single `Segment::Text`.
+    /// Used by dumb clients, inter-Pod tools, and tests that only have
+    /// a string to forward.
+    pub fn run_text(s: impl Into<String>) -> Self {
+        Self::Run {
+            input: vec![Segment::text(s)],
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Event (Pod → Client via Unix Socket broadcast)
 // ---------------------------------------------------------------------------
 
@@ -93,7 +159,7 @@ pub enum Event {
     /// Fires exactly once per accepted `Method::Run`, before
     /// `TurnStart`. Rejected runs (e.g. `AlreadyRunning`) do not emit.
     UserMessage {
-        text: String,
+        segments: Vec<Segment>,
     },
     TurnStart {
         turn: usize,
@@ -293,12 +359,82 @@ mod tests {
 
     #[test]
     fn method_run_json_roundtrip() {
-        let json = r#"{"method":"run","params":{"input":"Hello"}}"#;
+        let json = r#"{"method":"run","params":{"input":[{"kind":"text","content":"Hello"}]}}"#;
         let method: Method = serde_json::from_str(json).unwrap();
-        assert!(matches!(method, Method::Run { ref input } if input == "Hello"));
-
+        match &method {
+            Method::Run { input } => {
+                assert_eq!(input.len(), 1);
+                match &input[0] {
+                    Segment::Text { content } => assert_eq!(content, "Hello"),
+                    other => panic!("expected Text, got {other:?}"),
+                }
+            }
+            other => panic!("expected Run, got {other:?}"),
+        }
         let serialized = serde_json::to_string(&method).unwrap();
         assert_eq!(serialized, json);
+    }
+
+    #[test]
+    fn method_run_paste_segment_roundtrip() {
+        let method = Method::Run {
+            input: vec![
+                Segment::text("see "),
+                Segment::Paste {
+                    id: 7,
+                    chars: 12,
+                    lines: 2,
+                    content: "line1\nline2".into(),
+                },
+            ],
+        };
+        let json = serde_json::to_string(&method).unwrap();
+        let decoded: Method = serde_json::from_str(&json).unwrap();
+        match decoded {
+            Method::Run { input } => {
+                assert_eq!(input.len(), 2);
+                match &input[1] {
+                    Segment::Paste {
+                        id,
+                        chars,
+                        lines,
+                        content,
+                    } => {
+                        assert_eq!(*id, 7);
+                        assert_eq!(*chars, 12);
+                        assert_eq!(*lines, 2);
+                        assert_eq!(content, "line1\nline2");
+                    }
+                    other => panic!("expected Paste, got {other:?}"),
+                }
+            }
+            other => panic!("expected Run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn segment_unknown_variant_decodes_as_unknown() {
+        // A future client sends a segment kind this Pod has never heard of.
+        // Forward compat requirement: deserialization must succeed and the
+        // unknown payload must surface as `Segment::Unknown` so the Pod
+        // fallback path (placeholder + alert) can fire.
+        let json = r#"{"kind":"image_ref","url":"https://example.com/x.png"}"#;
+        let seg: Segment = serde_json::from_str(json).unwrap();
+        assert!(matches!(seg, Segment::Unknown));
+    }
+
+    #[test]
+    fn method_run_with_unknown_segment_decodes() {
+        let json = r#"{"method":"run","params":{"input":[{"kind":"text","content":"hi"},{"kind":"future_thing","x":1}]}}"#;
+        let method: Method = serde_json::from_str(json).unwrap();
+        match method {
+            Method::Run { input } => {
+                assert_eq!(input.len(), 2);
+                assert!(matches!(input[0], Segment::Text { .. }));
+                assert!(matches!(input[1], Segment::Unknown));
+            }
+            other => panic!("expected Run, got {other:?}"),
+        }
     }
 
     #[test]
@@ -612,16 +748,23 @@ mod tests {
     #[test]
     fn event_user_message_roundtrip() {
         let event = Event::UserMessage {
-            text: "hello 世界".into(),
+            segments: vec![Segment::text("hello 世界")],
         };
         let json = serde_json::to_string(&event).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["event"], "user_message");
-        assert_eq!(parsed["data"]["text"], "hello 世界");
+        assert_eq!(parsed["data"]["segments"][0]["kind"], "text");
+        assert_eq!(parsed["data"]["segments"][0]["content"], "hello 世界");
 
         let decoded: Event = serde_json::from_str(&json).unwrap();
         match decoded {
-            Event::UserMessage { text } => assert_eq!(text, "hello 世界"),
+            Event::UserMessage { segments } => {
+                assert_eq!(segments.len(), 1);
+                match &segments[0] {
+                    Segment::Text { content } => assert_eq!(content, "hello 世界"),
+                    other => panic!("expected Text, got {other:?}"),
+                }
+            }
             other => panic!("expected UserMessage, got {other:?}"),
         }
     }

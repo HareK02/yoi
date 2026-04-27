@@ -7,7 +7,7 @@
 
 #![allow(dead_code)] // Phase 5 will consume `output` in detail mode.
 
-use protocol::{Greeting, AlertLevel, AlertSource};
+use protocol::{AlertLevel, AlertSource, Greeting, Segment};
 
 pub enum Block {
     Greeting(Greeting),
@@ -15,7 +15,7 @@ pub enum Block {
         turn: usize,
     },
     UserMessage {
-        text: String,
+        segments: Vec<Segment>,
     },
     AssistantText {
         text: String,
