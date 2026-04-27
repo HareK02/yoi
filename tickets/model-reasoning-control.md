@@ -91,3 +91,9 @@ provider-native な値そのものの妥当性検証は最小限に留める。�
 - budget token 指定が signed integer として扱われ、Gemini の `-1` のような値を表現できる
 - OpenAI Chat / OpenAI Responses / Anthropic / Gemini の既存 reasoning 投影が enum 型に追従している
 - 既存の reasoning 無指定時は、従来通り wire request に reasoning/thinking パラメータを出さない
+
+## Review
+
+- 状態: Approve
+- レビュー詳細: [./model-reasoning-control.review.md](./model-reasoning-control.review.md)
+- 日付: 2026-04-27
