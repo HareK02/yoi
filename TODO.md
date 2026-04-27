@@ -9,7 +9,6 @@
   - [ ] フルスクリーン化によるオーバーホール → [tickets/tui-fullscreen-overhaul.md](tickets/tui-fullscreen-overhaul.md)
   - [ ] 新しい Pod を spawn する UI の設計 → [tickets/tui-pod-spawn-ui.md](tickets/tui-pod-spawn-ui.md)
 - [ ] サブミット入力
-  - [ ] protocol Segment 化 → [tickets/submit-segment-protocol.md](tickets/submit-segment-protocol.md)
   - [ ] TUI 補完 + 型付き atom 化 → [tickets/submit-tui-completion.md](tickets/submit-tui-completion.md)
 - [ ] メモリ機構
   - [ ] ファイル形式 + Linter 土台 → [tickets/memory-file-format.md](tickets/memory-file-format.md)
