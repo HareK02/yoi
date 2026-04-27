@@ -205,6 +205,8 @@ impl MemoryConfig {
     fn merge(self, upper: Self) -> Self {
         Self {
             workspace_root: upper.workspace_root.or(self.workspace_root),
+            search_hit_limit: upper.search_hit_limit.or(self.search_hit_limit),
+            search_excerpt_lines: upper.search_excerpt_lines.or(self.search_excerpt_lines),
         }
     }
 }

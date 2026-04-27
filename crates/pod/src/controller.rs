@@ -246,9 +246,18 @@ impl PodController {
                     .clone()
                     .unwrap_or_else(|| pwd_for_tools.clone());
                 let layout = memory::WorkspaceLayout::new(workspace_root);
+                let mut search_cfg = memory::tool::SearchConfig::default();
+                if let Some(n) = mem.search_hit_limit {
+                    search_cfg.hit_limit = n;
+                }
+                if let Some(n) = mem.search_excerpt_lines {
+                    search_cfg.excerpt_lines = n;
+                }
                 worker.register_tool(memory::tool::read_tool(layout.clone()));
                 worker.register_tool(memory::tool::write_tool(layout.clone()));
-                worker.register_tool(memory::tool::edit_tool(layout));
+                worker.register_tool(memory::tool::edit_tool(layout.clone()));
+                worker.register_tool(memory::tool::memory_search_tool(layout.clone(), search_cfg));
+                worker.register_tool(memory::tool::knowledge_search_tool(layout, search_cfg));
             }
 
             // Pod-orchestration tools (SpawnPod + the four comm tools)

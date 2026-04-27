@@ -1,29 +1,33 @@
 //! `MemoryRead` tool.
 //!
-//! Constrained to `<workspace>/memory/` and `<workspace>/knowledge/`
-//! paths. Returns line-numbered content (1-based), like the generic
-//! Read tool, but rejects anything outside the memory tree so the
-//! agent can't sneak in a non-memory read through this surface.
+//! Reads a memory or knowledge record by `(kind, slug)`. Returns
+//! line-numbered content (1-based), like the generic Read tool. The
+//! agent never names a path — `Search` returns `{kind, slug, ...}`
+//! and that pair feeds straight into Read.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use serde::Deserialize;
 
+use crate::tool::MemoryToolKind;
 use crate::workspace::WorkspaceLayout;
 
-const DESCRIPTION: &str = "Read a memory or knowledge record file under the \
-workspace's `memory/` or `knowledge/` tree. Returns line-numbered output \
-(1-based). Paths must be absolute and lie inside the memory tree.";
+const DESCRIPTION: &str = "Read a memory or knowledge record by `kind` + `slug`. \
+`kind` is one of: summary, decision, request, knowledge. \
+For `summary` omit `slug`; for the others `slug` is required. \
+Returns line-numbered output (1-based).";
 
 const DEFAULT_LIMIT: usize = 2000;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct ReadParams {
-    /// Absolute path to a file under the workspace's `memory/` or `knowledge/` tree.
-    file_path: PathBuf,
+    /// Record kind: `summary` | `decision` | `request` | `knowledge`.
+    kind: MemoryToolKind,
+    /// Slug. Required for everything except `summary`; forbidden for `summary`.
+    #[serde(default)]
+    slug: Option<String>,
     /// 0-based line offset from the start. Defaults to 0.
     #[serde(default)]
     offset: Option<usize>,
@@ -43,33 +47,13 @@ impl Tool for ReadTool {
             ToolError::InvalidArgument(format!("invalid MemoryRead input: {e}"))
         })?;
 
-        if !params.file_path.is_absolute() {
-            return Err(ToolError::InvalidArgument(format!(
-                "file_path must be absolute: {}",
-                params.file_path.display()
-            )));
-        }
-        if self
-            .layout
-            .classify(&params.file_path)
-            .map_err(|e| ToolError::InvalidArgument(e.to_string()))?
-            .is_none()
-        {
-            return Err(ToolError::InvalidArgument(format!(
-                "path is not under the memory tree: {}",
-                params.file_path.display()
-            )));
-        }
+        let path = params.kind.resolve_path(&self.layout, params.slug.as_deref())?;
 
-        let bytes = std::fs::read(&params.file_path).map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => ToolError::ExecutionFailed(format!(
-                "file not found: {}",
-                params.file_path.display()
-            )),
-            _ => ToolError::ExecutionFailed(format!(
-                "read failed at {}: {e}",
-                params.file_path.display()
-            )),
+        let bytes = std::fs::read(&path).map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => {
+                ToolError::ExecutionFailed(format!("record not found: {}", path.display()))
+            }
+            _ => ToolError::ExecutionFailed(format!("read failed at {}: {e}", path.display())),
         })?;
 
         let text = String::from_utf8_lossy(&bytes).into_owned();
@@ -84,13 +68,13 @@ impl Tool for ReadTool {
                 offset + 1,
                 offset + rendered.line_count,
                 rendered.total_lines,
-                params.file_path.display()
+                path.display()
             )
         } else {
             format!(
                 "Read {} line(s) from {}",
                 rendered.line_count,
-                params.file_path.display()
+                path.display()
             )
         };
 
@@ -157,14 +141,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_returns_numbered_lines() {
+    async fn read_decision_by_slug() {
         let (dir, layout) = setup();
         let path = dir.path().join("memory/decisions/foo.md");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "alpha\nbeta\n").unwrap();
 
         let (_meta, tool) = read_tool(layout)();
-        let inp = serde_json::json!({ "file_path": path.to_str().unwrap() });
+        let inp = serde_json::json!({ "kind": "decision", "slug": "foo" });
         let out = tool.execute(&inp.to_string()).await.unwrap();
         let body = out.content.unwrap();
         assert!(body.contains("     1\talpha"));
@@ -172,24 +156,64 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_outside_memory_tree() {
+    async fn read_summary_without_slug() {
         let (dir, layout) = setup();
-        let other = dir.path().join("src/main.rs");
-        std::fs::create_dir_all(other.parent().unwrap()).unwrap();
-        std::fs::write(&other, "fn main() {}").unwrap();
+        let path = dir.path().join("memory/summary.md");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "summary body\n").unwrap();
 
         let (_, tool) = read_tool(layout)();
-        let inp = serde_json::json!({ "file_path": other.to_str().unwrap() });
+        let inp = serde_json::json!({ "kind": "summary" });
+        let out = tool.execute(&inp.to_string()).await.unwrap();
+        assert!(out.content.unwrap().contains("summary body"));
+    }
+
+    #[tokio::test]
+    async fn summary_with_slug_rejected() {
+        let (_dir, layout) = setup();
+        let (_, tool) = read_tool(layout)();
+        let inp = serde_json::json!({ "kind": "summary", "slug": "x" });
         let err = tool.execute(&inp.to_string()).await.unwrap_err();
         assert!(matches!(err, ToolError::InvalidArgument(_)));
     }
 
     #[tokio::test]
-    async fn rejects_relative_path() {
+    async fn decision_without_slug_rejected() {
         let (_dir, layout) = setup();
         let (_, tool) = read_tool(layout)();
-        let inp = serde_json::json!({ "file_path": "memory/summary.md" });
+        let inp = serde_json::json!({ "kind": "decision" });
         let err = tool.execute(&inp.to_string()).await.unwrap_err();
         assert!(matches!(err, ToolError::InvalidArgument(_)));
+    }
+
+    #[tokio::test]
+    async fn invalid_slug_rejected() {
+        let (_dir, layout) = setup();
+        let (_, tool) = read_tool(layout)();
+        let inp = serde_json::json!({ "kind": "decision", "slug": "Bad-Slug" });
+        let err = tool.execute(&inp.to_string()).await.unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArgument(_)));
+    }
+
+    #[tokio::test]
+    async fn knowledge_path_resolution() {
+        let (dir, layout) = setup();
+        let path = dir.path().join("knowledge/policy.md");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "k\n").unwrap();
+
+        let (_, tool) = read_tool(layout)();
+        let inp = serde_json::json!({ "kind": "knowledge", "slug": "policy" });
+        let out = tool.execute(&inp.to_string()).await.unwrap();
+        assert!(out.content.unwrap().contains("k"));
+    }
+
+    #[tokio::test]
+    async fn missing_file_returns_execution_failed() {
+        let (_dir, layout) = setup();
+        let (_, tool) = read_tool(layout)();
+        let inp = serde_json::json!({ "kind": "decision", "slug": "missing" });
+        let err = tool.execute(&inp.to_string()).await.unwrap_err();
+        assert!(matches!(err, ToolError::ExecutionFailed(_)));
     }
 }

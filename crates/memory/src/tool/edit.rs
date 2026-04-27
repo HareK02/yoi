@@ -1,11 +1,11 @@
 //! `MemoryEdit` tool — partial string replacement on an existing memory record.
 //!
-//! Reads current content, applies the replacement, runs the Linter on
-//! the result, writes only on success. The current-then-write window
-//! is single-tool-call narrow; an external tracker is intentionally
-//! omitted (memory tools are self-contained, no `tools` crate dep).
+//! Reads current content by `(kind, slug)`, applies the replacement,
+//! runs the Linter on the result, writes only on success. The
+//! current-then-write window is single-tool-call narrow; an external
+//! tracker is intentionally omitted (memory tools are self-contained,
+//! no `tools` crate dep).
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -13,18 +13,21 @@ use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use serde::Deserialize;
 
 use crate::linter::{LintReport, Linter, WriteMode};
+use crate::tool::MemoryToolKind;
 use crate::workspace::WorkspaceLayout;
 
 const DESCRIPTION: &str = "Replace a substring in an existing memory or knowledge \
-record file. By default `old_string` must be unique in the file; set \
-`replace_all: true` to replace every occurrence. The resulting content is \
-re-validated by the memory linter; failure leaves the file untouched. Path \
-must be absolute and lie inside the workspace's `memory/` or `knowledge/` tree.";
+record selected by `kind` + `slug`. By default `old_string` must be unique in the \
+file; set `replace_all: true` to replace every occurrence. The resulting content \
+is re-validated by the memory linter; failure leaves the file untouched.";
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct EditParams {
-    /// Absolute path under the workspace's `memory/` or `knowledge/` tree.
-    file_path: PathBuf,
+    /// Record kind: `summary` | `decision` | `request` | `knowledge`.
+    kind: MemoryToolKind,
+    /// Slug. Required for everything except `summary`; forbidden for `summary`.
+    #[serde(default)]
+    slug: Option<String>,
     /// String to replace. Must be unique in the file unless `replace_all` is true.
     old_string: String,
     /// Replacement string. Must differ from `old_string`.
@@ -35,6 +38,7 @@ struct EditParams {
 }
 
 struct EditTool {
+    layout: WorkspaceLayout,
     linter: Linter,
 }
 
@@ -45,12 +49,6 @@ impl Tool for EditTool {
             ToolError::InvalidArgument(format!("invalid MemoryEdit input: {e}"))
         })?;
 
-        if !params.file_path.is_absolute() {
-            return Err(ToolError::InvalidArgument(format!(
-                "file_path must be absolute: {}",
-                params.file_path.display()
-            )));
-        }
         if params.old_string.is_empty() {
             return Err(ToolError::InvalidArgument(
                 "old_string must not be empty".into(),
@@ -62,49 +60,30 @@ impl Tool for EditTool {
             ));
         }
 
-        // Path-shape check; the layout::classify also runs inside the
-        // linter but we want a crisp error before reading the file.
-        if self
-            .linter
-            .layout()
-            .classify(&params.file_path)
-            .map_err(|e| ToolError::InvalidArgument(e.to_string()))?
-            .is_none()
-        {
-            return Err(ToolError::InvalidArgument(format!(
-                "path is not under the memory tree: {}",
-                params.file_path.display()
-            )));
-        }
+        let path = params.kind.resolve_path(&self.layout, params.slug.as_deref())?;
 
-        let current_bytes = std::fs::read(&params.file_path).map_err(|e| match e.kind() {
+        let current_bytes = std::fs::read(&path).map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => ToolError::ExecutionFailed(format!(
-                "file not found (use MemoryWrite to create): {}",
-                params.file_path.display()
+                "record not found (use MemoryWrite to create): {}",
+                path.display()
             )),
-            _ => ToolError::ExecutionFailed(format!(
-                "read failed at {}: {e}",
-                params.file_path.display()
-            )),
+            _ => ToolError::ExecutionFailed(format!("read failed at {}: {e}", path.display())),
         })?;
         let current_text = std::str::from_utf8(&current_bytes).map_err(|_| {
-            ToolError::InvalidArgument(format!(
-                "file is not valid UTF-8: {}",
-                params.file_path.display()
-            ))
+            ToolError::InvalidArgument(format!("file is not valid UTF-8: {}", path.display()))
         })?;
 
         let count = current_text.matches(&params.old_string).count();
         if count == 0 {
             return Err(ToolError::InvalidArgument(format!(
                 "old_string not found in {}",
-                params.file_path.display()
+                path.display()
             )));
         }
         if !params.replace_all && count > 1 {
             return Err(ToolError::InvalidArgument(format!(
                 "old_string occurs {count} times in {}; pass replace_all: true or narrow the snippet",
-                params.file_path.display()
+                path.display()
             )));
         }
 
@@ -115,21 +94,18 @@ impl Tool for EditTool {
         };
         let occurrences = if params.replace_all { count } else { 1 };
 
-        let report = self.linter.lint(&params.file_path, &new_text, WriteMode::Update);
+        let report = self.linter.lint(&path, &new_text, WriteMode::Update);
         if report.has_errors() {
             return Err(ToolError::InvalidArgument(format_report(&report)));
         }
 
-        std::fs::write(&params.file_path, new_text.as_bytes()).map_err(|e| {
-            ToolError::ExecutionFailed(format!(
-                "failed to write {}: {e}",
-                params.file_path.display()
-            ))
+        std::fs::write(&path, new_text.as_bytes()).map_err(|e| {
+            ToolError::ExecutionFailed(format!("failed to write {}: {e}", path.display()))
         })?;
 
         let summary = format!(
             "Edited {} ({} replacement{}){}",
-            params.file_path.display(),
+            path.display(),
             occurrences,
             if occurrences == 1 { "" } else { "s" },
             warning_tail(&report),
@@ -176,6 +152,7 @@ pub fn edit_tool(layout: WorkspaceLayout) -> ToolDefinition {
             .description(DESCRIPTION)
             .input_schema(schema_value);
         let tool: Arc<dyn Tool> = Arc::new(EditTool {
+            layout: layout.clone(),
             linter: Linter::new(layout.clone()),
         });
         (meta, tool)
@@ -186,6 +163,7 @@ pub fn edit_tool(layout: WorkspaceLayout) -> ToolDefinition {
 mod tests {
     use super::*;
     use chrono::Utc;
+    use std::path::PathBuf;
     use tempfile::TempDir;
 
     fn now() -> String {
@@ -212,7 +190,8 @@ mod tests {
         assert_eq!(meta.name, "MemoryEdit");
 
         let inp = serde_json::json!({
-            "file_path": path.to_str().unwrap(),
+            "kind": "decision",
+            "slug": "foo",
             "old_string": "body body",
             "new_string": "edited",
         });
@@ -230,7 +209,8 @@ mod tests {
 
         // Drop the `status` field by replacing it with nothing.
         let inp = serde_json::json!({
-            "file_path": path.to_str().unwrap(),
+            "kind": "decision",
+            "slug": "foo",
             "old_string": "status: open\n",
             "new_string": "",
         });
@@ -244,12 +224,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn edit_missing_file() {
-        let (dir, layout, _) = setup();
-        let other = dir.path().join("memory/decisions/ghost.md");
+    async fn edit_missing_record() {
+        let (_dir, layout, _) = setup();
         let (_, tool) = edit_tool(layout)();
         let inp = serde_json::json!({
-            "file_path": other.to_str().unwrap(),
+            "kind": "decision",
+            "slug": "ghost",
             "old_string": "x",
             "new_string": "y",
         });
@@ -258,42 +238,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn edit_outside_memory_tree_rejected() {
-        let (dir, layout, _) = setup();
-        let other = dir.path().join("src/lib.rs");
-        std::fs::create_dir_all(other.parent().unwrap()).unwrap();
-        std::fs::write(&other, "fn main() {}").unwrap();
+    async fn edit_workflow_kind_rejected() {
+        // Workflow is not exposed via MemoryToolKind, so deserialization fails.
+        let (_dir, layout, _) = setup();
         let (_, tool) = edit_tool(layout)();
         let inp = serde_json::json!({
-            "file_path": other.to_str().unwrap(),
-            "old_string": "fn",
-            "new_string": "pub fn",
+            "kind": "workflow",
+            "slug": "wf",
+            "old_string": "x",
+            "new_string": "y",
         });
         let err = tool.execute(&inp.to_string()).await.unwrap_err();
         assert!(matches!(err, ToolError::InvalidArgument(_)));
-    }
-
-    #[tokio::test]
-    async fn edit_workflow_path_rejected() {
-        let (dir, layout, _) = setup();
-        let path = dir.path().join("memory/workflow/wf.md");
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let initial = format!(
-            "---\nupdated_at: {n}\ndescription: x\nauto_invoke: false\nuser_invocable: true\n---\nbody\n",
-            n = now()
-        );
-        std::fs::write(&path, &initial).unwrap();
-
-        let (_, tool) = edit_tool(layout)();
-        let inp = serde_json::json!({
-            "file_path": path.to_str().unwrap(),
-            "old_string": "body",
-            "new_string": "edited",
-        });
-        let err = tool.execute(&inp.to_string()).await.unwrap_err();
-        let msg = format!("{err}");
-        assert!(msg.to_lowercase().contains("workflow"), "{msg}");
-        // Original untouched.
-        assert!(std::fs::read_to_string(&path).unwrap().contains("body"));
     }
 }

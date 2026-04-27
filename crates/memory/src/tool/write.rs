@@ -1,12 +1,11 @@
 //! `MemoryWrite` tool.
 //!
-//! Creates or overwrites a memory or knowledge record with full content.
+//! Creates or overwrites a memory or knowledge record by `(kind, slug)`.
 //! Pre-write Linter validates frontmatter, slug uniqueness (Create only),
 //! reference integrity, size limits, and the workflow-write ban. On any
 //! Linter error the tool returns `ToolError::InvalidArgument` with all
 //! violations aggregated and the file is **not** written.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -14,22 +13,27 @@ use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use serde::Deserialize;
 
 use crate::linter::{LintReport, Linter, WriteMode};
+use crate::tool::MemoryToolKind;
 use crate::workspace::WorkspaceLayout;
 
-const DESCRIPTION: &str = "Create or overwrite a memory or knowledge record file. \
-Path must be absolute and lie inside the workspace's `memory/` or `knowledge/` \
-tree. Frontmatter is validated before the file is written; on validation \
-failure no write occurs and every violation is returned in the error message.";
+const DESCRIPTION: &str = "Create or overwrite a memory or knowledge record by \
+`kind` + `slug`. `kind`: summary | decision | request | knowledge. For `summary` \
+omit `slug`. Frontmatter is validated before write; on validation failure no \
+write occurs and every violation is returned in the error message.";
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct WriteParams {
-    /// Absolute path under the workspace's `memory/` or `knowledge/` tree.
-    file_path: PathBuf,
+    /// Record kind: `summary` | `decision` | `request` | `knowledge`.
+    kind: MemoryToolKind,
+    /// Slug. Required for everything except `summary`; forbidden for `summary`.
+    #[serde(default)]
+    slug: Option<String>,
     /// Full file contents (frontmatter + body).
     content: String,
 }
 
 struct WriteTool {
+    layout: WorkspaceLayout,
     linter: Linter,
 }
 
@@ -40,26 +44,21 @@ impl Tool for WriteTool {
             ToolError::InvalidArgument(format!("invalid MemoryWrite input: {e}"))
         })?;
 
-        if !params.file_path.is_absolute() {
-            return Err(ToolError::InvalidArgument(format!(
-                "file_path must be absolute: {}",
-                params.file_path.display()
-            )));
-        }
+        let path = params.kind.resolve_path(&self.layout, params.slug.as_deref())?;
 
-        let already_exists = params.file_path.exists();
+        let already_exists = path.exists();
         let mode = if already_exists {
             WriteMode::Update
         } else {
             WriteMode::Create
         };
 
-        let report = self.linter.lint(&params.file_path, &params.content, mode);
+        let report = self.linter.lint(&path, &params.content, mode);
         if report.has_errors() {
             return Err(ToolError::InvalidArgument(format_report(&report)));
         }
 
-        if let Some(parent) = params.file_path.parent() {
+        if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
                 ToolError::ExecutionFailed(format!(
                     "failed to create directory {}: {e}",
@@ -67,17 +66,14 @@ impl Tool for WriteTool {
                 ))
             })?;
         }
-        std::fs::write(&params.file_path, params.content.as_bytes()).map_err(|e| {
-            ToolError::ExecutionFailed(format!(
-                "failed to write {}: {e}",
-                params.file_path.display()
-            ))
+        std::fs::write(&path, params.content.as_bytes()).map_err(|e| {
+            ToolError::ExecutionFailed(format!("failed to write {}: {e}", path.display()))
         })?;
 
         let summary = format!(
             "{} {}{}",
             if already_exists { "Overwrote" } else { "Created" },
-            params.file_path.display(),
+            path.display(),
             warning_tail(&report),
         );
         Ok(ToolOutput {
@@ -122,6 +118,7 @@ pub fn write_tool(layout: WorkspaceLayout) -> ToolDefinition {
             .description(DESCRIPTION)
             .input_schema(schema_value);
         let tool: Arc<dyn Tool> = Arc::new(WriteTool {
+            layout: layout.clone(),
             linter: Linter::new(layout.clone()),
         });
         (meta, tool)
@@ -154,7 +151,7 @@ mod tests {
         assert_eq!(meta.name, "MemoryWrite");
 
         let inp = serde_json::json!({
-            "file_path": path.to_str().unwrap(),
+            "kind": "summary",
             "content": content,
         });
         let out = tool.execute(&inp.to_string()).await.unwrap();
@@ -163,29 +160,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_rejects_workflow() {
-        let (dir, layout) = setup();
-        let path = dir.path().join("memory/workflow/wf.md");
-        let content = format!(
-            "---\nupdated_at: {n}\ndescription: x\nauto_invoke: false\nuser_invocable: true\n---\n",
-            n = now()
-        );
-        let (_, tool) = write_tool(layout)();
-        let inp = serde_json::json!({
-            "file_path": path.to_str().unwrap(),
-            "content": content,
-        });
-        let err = tool.execute(&inp.to_string()).await.unwrap_err();
-        let msg = format!("{err}");
-        assert!(msg.contains("workflow"), "unexpected error: {msg}");
-        assert!(!path.exists(), "workflow file must not be written");
-    }
-
-    #[tokio::test]
     async fn write_aggregates_multiple_errors() {
-        let (dir, layout) = setup();
-        let path = dir.path().join("memory/decisions/foo.md");
-        // Missing required `status` field AND body too long.
+        let (_dir, layout) = setup();
+        // Missing required `status` field for decisions.
         let huge = "x".repeat(8001);
         let content = format!(
             "---\ncreated_at: {n}\nupdated_at: {n}\nsources: []\n---\n{huge}",
@@ -193,7 +170,8 @@ mod tests {
         );
         let (_, tool) = write_tool(layout)();
         let inp = serde_json::json!({
-            "file_path": path.to_str().unwrap(),
+            "kind": "decision",
+            "slug": "foo",
             "content": content,
         });
         let err = tool.execute(&inp.to_string()).await.unwrap_err();
@@ -202,7 +180,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_blocks_create_when_existing() {
+    async fn write_update_existing() {
         let (dir, layout) = setup();
         let path = dir.path().join("memory/decisions/foo.md");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -212,10 +190,10 @@ mod tests {
         );
         std::fs::write(&path, &initial).unwrap();
 
-        // Same content as a re-write should pass (Update mode).
         let (_, tool) = write_tool(layout.clone())();
         let inp = serde_json::json!({
-            "file_path": path.to_str().unwrap(),
+            "kind": "decision",
+            "slug": "foo",
             "content": initial,
         });
         let out = tool.execute(&inp.to_string()).await.unwrap();
@@ -223,11 +201,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_rejects_non_absolute() {
+    async fn write_decision_requires_slug() {
         let (_dir, layout) = setup();
         let (_, tool) = write_tool(layout)();
         let inp = serde_json::json!({
-            "file_path": "memory/summary.md",
+            "kind": "decision",
             "content": "ignored",
         });
         let err = tool.execute(&inp.to_string()).await.unwrap_err();
@@ -241,10 +219,25 @@ mod tests {
         let bad = "no frontmatter at all";
         let (_, tool) = write_tool(layout)();
         let inp = serde_json::json!({
-            "file_path": path.to_str().unwrap(),
+            "kind": "decision",
+            "slug": "foo",
             "content": bad,
         });
         assert!(tool.execute(&inp.to_string()).await.is_err());
         assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn workflow_kind_not_acceptable() {
+        // The MemoryToolKind enum doesn't include Workflow, so deserialization fails.
+        let (_dir, layout) = setup();
+        let (_, tool) = write_tool(layout)();
+        let inp = serde_json::json!({
+            "kind": "workflow",
+            "slug": "wf",
+            "content": "---\n---\n",
+        });
+        let err = tool.execute(&inp.to_string()).await.unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArgument(_)));
     }
 }
