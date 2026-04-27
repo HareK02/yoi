@@ -27,7 +27,10 @@
 
 use std::path::{Path, PathBuf};
 
-use manifest::{PodManifest, PodManifestConfig, ResolveError};
+use manifest::{
+    LayerLoadError, PodManifest, PodManifestConfig, ResolveError, find_project_manifest_from,
+    load_layer, user_manifest_path,
+};
 
 use crate::prompt::loader::PromptLoader;
 
@@ -50,8 +53,15 @@ pub enum FactoryError {
     OverlayParse(#[source] toml::de::Error),
     #[error("failed to resolve manifest config: {0}")]
     Resolve(#[source] ResolveError),
-    #[error("cannot locate home directory for user manifest lookup")]
-    HomeDirUnavailable,
+}
+
+impl From<LayerLoadError> for FactoryError {
+    fn from(e: LayerLoadError) -> Self {
+        match e {
+            LayerLoadError::Io { path, source } => Self::Io { path, source },
+            LayerLoadError::Parse { path, source } => Self::Parse { path, source },
+        }
+    }
 }
 
 /// Builder that accumulates cascade layers and resolves them to a
@@ -94,14 +104,16 @@ impl PodFactory {
     /// Attempt to load the user manifest from the XDG config directory.
     ///
     /// Looks at `$XDG_CONFIG_HOME/insomnia/manifest.toml` first, then
-    /// falls back to `$HOME/.config/insomnia/manifest.toml`. If the
-    /// resolved file does not exist the call is a no-op — user
-    /// manifests are optional.
+    /// falls back to `$HOME/.config/insomnia/manifest.toml`. If neither
+    /// env var is set, or the resolved file does not exist, the call
+    /// is a no-op — user manifests are optional.
     pub fn with_user_manifest_auto(mut self) -> Result<Self, FactoryError> {
-        let path = user_manifest_path()?;
+        let Some(path) = user_manifest_path() else {
+            return Ok(self);
+        };
         if path.exists() {
             let base = manifest_base(&path)?;
-            self.user = Some((read_config_file(&path)?, base.clone()));
+            self.user = Some((load_layer(&path)?, base.clone()));
             self.user_prompts_dir = Some(base.join("prompts"));
             self.user_pack_file = Some(base.join("prompts.toml"));
         }
@@ -113,7 +125,7 @@ impl PodFactory {
     pub fn with_user_manifest(mut self, path: impl AsRef<Path>) -> Result<Self, FactoryError> {
         let path = path.as_ref();
         let base = manifest_base(path)?;
-        self.user = Some((read_config_file(path)?, base.clone()));
+        self.user = Some((load_layer(path)?, base.clone()));
         self.user_prompts_dir = Some(base.join("prompts"));
         self.user_pack_file = Some(base.join("prompts.toml"));
         Ok(self)
@@ -127,7 +139,7 @@ impl PodFactory {
             path: PathBuf::from("."),
             source,
         })?;
-        if let Some(path) = find_project_manifest(&cwd) {
+        if let Some(path) = find_project_manifest_from(&cwd) {
             self.install_project_manifest(&path)?;
         }
         Ok(self)
@@ -139,7 +151,7 @@ impl PodFactory {
         mut self,
         start: impl AsRef<Path>,
     ) -> Result<Self, FactoryError> {
-        if let Some(path) = find_project_manifest(start.as_ref()) {
+        if let Some(path) = find_project_manifest_from(start.as_ref()) {
             self.install_project_manifest(&path)?;
         }
         Ok(self)
@@ -156,7 +168,7 @@ impl PodFactory {
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| insomnia_dir.clone());
-        self.project = Some((read_config_file(path)?, project_root));
+        self.project = Some((load_layer(path)?, project_root));
         self.project_prompts_dir = Some(insomnia_dir.join("prompts"));
         self.project_pack_file = Some(insomnia_dir.join("prompts.toml"));
         Ok(())
@@ -280,43 +292,6 @@ fn resolve_and_merge_overlay(
     Ok(match existing {
         Some(prev) => prev.merge(resolved),
         None => resolved,
-    })
-}
-
-fn user_manifest_path() -> Result<PathBuf, FactoryError> {
-    if let Ok(dir) = std::env::var("XDG_CONFIG_HOME") {
-        if !dir.is_empty() {
-            return Ok(PathBuf::from(dir).join("insomnia").join("manifest.toml"));
-        }
-    }
-    let home = std::env::var("HOME").map_err(|_| FactoryError::HomeDirUnavailable)?;
-    Ok(PathBuf::from(home)
-        .join(".config")
-        .join("insomnia")
-        .join("manifest.toml"))
-}
-
-fn find_project_manifest(start: &Path) -> Option<PathBuf> {
-    let start = start.canonicalize().ok().unwrap_or_else(|| start.to_path_buf());
-    let mut cur: Option<&Path> = Some(start.as_path());
-    while let Some(dir) = cur {
-        let candidate = dir.join(".insomnia").join("manifest.toml");
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-        cur = dir.parent();
-    }
-    None
-}
-
-fn read_config_file(path: &Path) -> Result<PodManifestConfig, FactoryError> {
-    let toml = std::fs::read_to_string(path).map_err(|source| FactoryError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    PodManifestConfig::from_toml(&toml).map_err(|source| FactoryError::Parse {
-        path: path.to_path_buf(),
-        source,
     })
 }
 

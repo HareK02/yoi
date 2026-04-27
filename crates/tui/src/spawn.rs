@@ -13,14 +13,16 @@
 //! user has a record of what was spawned (or why a spawn failed).
 
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
 use crossterm::event::{
     self, Event as TermEvent, KeyCode, KeyEventKind, KeyModifiers,
 };
-use manifest::PodManifestConfig;
+use manifest::{
+    PodManifestConfig, find_project_manifest_from, load_layer, user_manifest_path,
+};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout};
@@ -95,8 +97,10 @@ pub async fn run() -> Result<SpawnOutcome, SpawnError> {
     // is intentionally an instance-level identifier and is always
     // taken from the dialog regardless of what (if anything) a layer
     // declared.
-    let user_layer = user_manifest_path().and_then(load_layer);
-    let project_layer = find_project_manifest(&cwd).and_then(load_layer);
+    let user_layer = user_manifest_path()
+        .filter(|p| p.is_file())
+        .and_then(|p| load_layer(&p).ok());
+    let project_layer = find_project_manifest_from(&cwd).and_then(|p| load_layer(&p).ok());
 
     let mut cascade = PodManifestConfig::builtin_defaults();
     for layer in [user_layer.as_ref(), project_layer.as_ref()].into_iter().flatten() {
@@ -372,44 +376,6 @@ fn resolve_pod_command() -> PathBuf {
     PathBuf::from("pod")
 }
 
-fn find_project_manifest(start: &Path) -> Option<PathBuf> {
-    let start = start
-        .canonicalize()
-        .ok()
-        .unwrap_or_else(|| start.to_path_buf());
-    let mut cur: Option<&Path> = Some(start.as_path());
-    while let Some(dir) = cur {
-        let candidate = dir.join(".insomnia").join("manifest.toml");
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-        cur = dir.parent();
-    }
-    None
-}
-
-fn load_layer(path: PathBuf) -> Option<PodManifestConfig> {
-    if !path.is_file() {
-        return None;
-    }
-    let s = std::fs::read_to_string(&path).ok()?;
-    PodManifestConfig::from_toml(&s).ok()
-}
-
-fn user_manifest_path() -> Option<PathBuf> {
-    if let Ok(dir) = std::env::var("XDG_CONFIG_HOME") {
-        if !dir.is_empty() {
-            return Some(PathBuf::from(dir).join("insomnia").join("manifest.toml"));
-        }
-    }
-    let home = std::env::var("HOME").ok()?;
-    Some(
-        PathBuf::from(home)
-            .join(".config")
-            .join("insomnia")
-            .join("manifest.toml"),
-    )
-}
 
 struct StderrTail {
     lines: std::collections::VecDeque<String>,

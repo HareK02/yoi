@@ -49,7 +49,17 @@ pod は `pod.name` / `model` / `scope.allow` がそろわないと起動しな�
 - **`model`**: user / project どちらかのレイヤから cascade 経由で取得。どこにも無ければ pod 側の resolve が失敗するので、その stderr エラー文を inline ダイアログに表示してキャンセル相当に倒す（user manifest の編集 UI までは本チケット外）
 - **`scope.allow`**: user / project どちらかのレイヤに既にあればそれをそのまま使う（overlay には追加しない）。両方とも無ければ `target = <cwd>, permission = "write"` をデフォルトとして overlay に追加する
 
-tui は `manifest` クレートの `PodManifestConfig::from_toml` / `merge` / `resolve_paths` を使って user + project の cascade を実際にマージし、その結果から「`scope.allow` が空かどうか」「`pod.name` のデフォルトは何か」を読み取る。実際の最終マージ + バリデーションは pod の `PodFactory::resolve()` 側で行われるので、tui は dialog 用の事前情報を取るためだけに同じ仕組みを再実行する形になる（重い `pod` クレート全体には依存しない）。
+tui は `manifest` クレートの `PodManifestConfig::from_toml` / `merge` を使って user + project の cascade を実際にマージし、その結果から「`scope.allow` が空かどうか」を読み取る。実際の最終マージ + バリデーションは pod の `PodFactory::resolve()` 側で行われるので、tui は dialog 用の事前情報を取るためだけに同じ仕組みを再実行する形になる（重い `pod` クレート全体には依存しない）。
+
+### `manifest` クレートへのカスケード収集 API 移管
+
+カスケードのファイルシステム規約（user manifest の XDG パス、project manifest の `.insomnia/manifest.toml` 上方探索、TOML 読み込み + パース）は、当初 pod の `factory.rs` 内 private に実装されていた。本チケットで tui が同じ規約を必要としたため、二箇所に重複させるのではなく **`manifest` クレートに公開 API として移管**する。
+
+- `manifest::user_manifest_path() -> Option<PathBuf>`
+- `manifest::find_project_manifest_from(start: &Path) -> Option<PathBuf>`
+- `manifest::load_layer(path: &Path) -> Result<PodManifestConfig, LayerLoadError>`
+
+pod の `PodFactory` も tui の spawn UI もこれらを呼ぶ形に統一し、規約は manifest に一箇所で持つ。`PodFactory` 自体（builder + PromptLoader 抱える型）は引き続き pod の責務として残す。
 
 確定時、ダイアログ入力 + デフォルト埋めから overlay TOML を組み、pod に `--overlay` で渡す。pod 側の cascade は user → project → overlay の順で merge されるので、project manifest に値があれば overlay の同名フィールドだけが上書きする形になる。
 
