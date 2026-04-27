@@ -14,7 +14,6 @@
   - [ ] TUI 補完 + 型付き atom 化 → [tickets/submit-tui-completion.md](tickets/submit-tui-completion.md)
   - [ ] セッションログの Segment 保持 → [tickets/session-log-segments.md](tickets/session-log-segments.md)
 - [ ] メモリ機構
-  - [ ] memory / Knowledge 検索ツール → [tickets/memory-search-tools.md](tickets/memory-search-tools.md)
   - [ ] `model_invokation: ON` の常駐注入 → [tickets/memory-resident-injection.md](tickets/memory-resident-injection.md)
   - [ ] Phase 1 活動抽出 → [tickets/memory-phase1-extract.md](tickets/memory-phase1-extract.md)
   - [ ] Phase 2 consolidation → [tickets/memory-phase2-consolidation.md](tickets/memory-phase2-consolidation.md)

@@ -29,15 +29,18 @@ const DEFAULT_HIT_LIMIT: usize = 20;
 const DEFAULT_EXCERPT_LINES: usize = 3;
 
 const MEMORY_SEARCH_DESCRIPTION: &str = "Search memory records (summary / decisions / \
-requests) for a substring. Returns up to `hit_limit` matches as `{slug, kind, excerpt}` \
-entries with line context. Use the returned `slug` + `kind` with MemoryRead to fetch \
-the full record. Workflow and staging directories are not searched.";
+requests) for a substring. Returns up to a hit cap (configurable via the manifest's \
+`[memory]` section) as `{slug, kind, excerpt}` entries with line context. Use the \
+returned `slug` + `kind` with MemoryRead to fetch the full record. Workflow and \
+staging directories are not searched.";
 
 const KNOWLEDGE_SEARCH_DESCRIPTION: &str = "Search knowledge records for a substring. \
-Optional `kind` filters by the Knowledge frontmatter's `kind` field. Returns up to \
-`hit_limit` matches as `{slug, kind, description, model_invokation, excerpt}` entries \
-with line context. Use the returned `slug` with MemoryRead (kind=knowledge) for the \
-full record.";
+Optional `kind` filters by the Knowledge frontmatter's `kind` field; records whose \
+frontmatter fails to parse are skipped when `kind` is given (the body is still \
+searched when `kind` is omitted). Returns up to a hit cap (configurable via the \
+manifest's `[memory]` section) as `{slug, kind, description, model_invokation, \
+excerpt}` entries with line context. Use the returned `slug` with MemoryRead \
+(kind=knowledge) for the full record.";
 
 /// Tunables passed in from the manifest.
 #[derive(Debug, Clone, Copy)]
@@ -53,6 +56,19 @@ impl Default for SearchConfig {
             hit_limit: DEFAULT_HIT_LIMIT,
             excerpt_lines: DEFAULT_EXCERPT_LINES,
         }
+    }
+}
+
+impl From<&manifest::MemoryConfig> for SearchConfig {
+    fn from(cfg: &manifest::MemoryConfig) -> Self {
+        let mut out = Self::default();
+        if let Some(n) = cfg.search_hit_limit {
+            out.hit_limit = n;
+        }
+        if let Some(n) = cfg.search_excerpt_lines {
+            out.excerpt_lines = n;
+        }
+        out
     }
 }
 
@@ -110,15 +126,17 @@ impl Tool for MemorySearchTool {
         let ctx = self.config.excerpt_lines;
 
         // summary
-        let summary_path = self.layout.summary_path();
-        if summary_path.is_file() {
-            scan_file(&summary_path, &needle, ctx, limit - hits.len(), |excerpt| {
-                hits.push(MemoryHit {
-                    slug: "summary".to_string(),
-                    kind: "summary",
-                    excerpt,
+        if hits.len() < limit {
+            let summary_path = self.layout.summary_path();
+            if summary_path.is_file() {
+                scan_file(&summary_path, &needle, ctx, limit - hits.len(), |excerpt| {
+                    hits.push(MemoryHit {
+                        slug: "summary".to_string(),
+                        kind: "summary",
+                        excerpt,
+                    });
                 });
-            });
+            }
         }
 
         // decisions
