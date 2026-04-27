@@ -167,10 +167,16 @@ async fn main() -> ExitCode {
         }
     };
 
+    let socket_path = handle.runtime_dir.socket_path();
+    // Machine-readable ready line for parents that spawned this Pod
+    // (e.g. the TUI's interactive `spawn` flow). Tab-separated so a
+    // pod name with spaces still parses cleanly. Emit before the
+    // human line so a stderr-watching parent sees it first.
     eprintln!(
-        "pod: {pod_name} listening on {:?}",
-        handle.runtime_dir.socket_path()
+        "INSOMNIA-READY\t{pod_name}\t{}",
+        socket_path.display()
     );
+    eprintln!("pod: {pod_name} listening on {:?}", socket_path);
 
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {

@@ -4,11 +4,13 @@ mod cache;
 mod client;
 mod input;
 mod scroll;
+mod spawn;
 mod tool;
 mod ui;
 
 use std::io;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event as TermEvent, KeyCode, KeyEvent,
@@ -24,6 +26,7 @@ use ratatui::backend::CrosstermBackend;
 
 use crate::app::App;
 use crate::client::PodClient;
+use crate::spawn::{SpawnOutcome, SpawnReady};
 
 fn resolve_socket(pod_name: &str, override_path: Option<PathBuf>) -> PathBuf {
     if let Some(p) = override_path {
@@ -48,49 +51,109 @@ fn resolve_socket(pod_name: &str, override_path: Option<PathBuf>) -> PathBuf {
     }
 }
 
-fn parse_args() -> (String, Option<PathBuf>) {
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() < 2 {
-        eprintln!("usage: tui <pod_name> [--socket <path>]");
-        std::process::exit(1);
+enum Mode {
+    Spawn,
+    Attach {
+        pod_name: String,
+        socket_override: Option<PathBuf>,
+    },
+}
+
+fn parse_args() -> Mode {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.is_empty() {
+        return Mode::Spawn;
     }
-    let pod_name = args[1].clone();
-    let socket = args
+    let pod_name = args[0].clone();
+    let socket_override = args
         .windows(2)
         .find(|w| w[0] == "--socket")
         .map(|w| PathBuf::from(&w[1]));
-    (pod_name, socket)
+    Mode::Attach {
+        pod_name,
+        socket_override,
+    }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let (pod_name, socket_override) = parse_args();
-    let socket_path = resolve_socket(&pod_name, socket_override);
+    let mode = parse_args();
 
     enable_raw_mode()?;
+    execute!(io::stdout(), EnableBracketedPaste)?;
+
+    let result = match mode {
+        Mode::Spawn => run_spawn().await,
+        Mode::Attach {
+            pod_name,
+            socket_override,
+        } => run_attach(pod_name, socket_override).await,
+    };
+
+    // Always restore the terminal, even on error or panic-after-result.
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-
-    let result = run(&mut terminal, pod_name, &socket_path).await;
-
-    // Always restore the terminal, even on error.
-    let _ = execute!(
-        terminal.backend_mut(),
-        DisableBracketedPaste,
-        LeaveAlternateScreen
-    );
+    let _ = execute!(stdout, LeaveAlternateScreen, DisableBracketedPaste);
     let _ = disable_raw_mode();
-    terminal.show_cursor().ok();
+    let _ = execute!(stdout, crossterm::cursor::Show);
 
     result
+}
+
+async fn run_attach(
+    pod_name: String,
+    socket_override: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let socket_path = resolve_socket(&pod_name, socket_override);
+    let mut terminal = enter_fullscreen()?;
+    run(&mut terminal, pod_name, &socket_path, false).await
+}
+
+async fn run_spawn() -> Result<(), Box<dyn std::error::Error>> {
+    let ready = match spawn::run().await? {
+        SpawnOutcome::Ready(r) => r,
+        SpawnOutcome::Cancelled => return Ok(()),
+    };
+
+    let SpawnReady {
+        pod_name,
+        socket_path,
+        mut child,
+        stderr_drain,
+    } = ready;
+
+    let mut terminal = enter_fullscreen()?;
+    let result = run(&mut terminal, pod_name, &socket_path, true).await;
+
+    // Leave alt-screen before reaping the child so any final pod stderr
+    // (drained off-line by `stderr_drain`) cannot collide with the
+    // restored scrollback.
+    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+
+    match tokio::time::timeout(Duration::from_secs(3), child.wait()).await {
+        Ok(Ok(_)) => {}
+        _ => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+        }
+    }
+    stderr_drain.abort();
+
+    result
+}
+
+fn enter_fullscreen() -> Result<Terminal<CrosstermBackend<io::Stdout>>, Box<dyn std::error::Error>>
+{
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    Ok(Terminal::new(backend)?)
 }
 
 async fn run(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     pod_name: String,
     socket_path: &std::path::Path,
+    shutdown_pod_on_exit: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut app = App::new(pod_name);
 
@@ -98,7 +161,7 @@ async fn run(
         Ok(mut client) => {
             app.connected = true;
             let _ = client.send(&Method::GetHistory).await;
-            run_loop(terminal, &mut app, client).await?;
+            run_loop(terminal, &mut app, client, shutdown_pod_on_exit).await?;
         }
         Err(e) => {
             app.push_error(format!("Failed to connect to {}: {e}", socket_path.display()));
@@ -113,11 +176,15 @@ async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
     mut client: PodClient,
+    shutdown_pod_on_exit: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     terminal.draw(|f| ui::draw(f, app))?;
 
     loop {
         if app.quit {
+            if shutdown_pod_on_exit {
+                let _ = client.send(&Method::Shutdown).await;
+            }
             break;
         }
 

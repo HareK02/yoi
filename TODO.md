@@ -7,7 +7,7 @@
 - [ ] ネイティブ GUI クライアント MVP → [tickets/native-gui-mvp.md](tickets/native-gui-mvp.md)
 - [ ] TUI 拡充
   - [ ] フルスクリーン化によるオーバーホール → [tickets/tui-fullscreen-overhaul.md](tickets/tui-fullscreen-overhaul.md)
-  - [ ] 新しい Pod を spawn する UI の設計 → [tickets/tui-pod-spawn-ui.md](tickets/tui-pod-spawn-ui.md)
+  - [ ] inline viewport で Pod を spawn する UX → [tickets/tui-pod-spawn-ui.md](tickets/tui-pod-spawn-ui.md)
   - [ ] Run 中の入力キューイング → [tickets/tui-input-queue.md](tickets/tui-input-queue.md)
 - [ ] サブミット入力
   - [ ] TUI 補完 + 型付き atom 化 → [tickets/submit-tui-completion.md](tickets/submit-tui-completion.md)

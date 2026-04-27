@@ -3570,10 +3570,12 @@ name = "tui"
 version = "0.1.0"
 dependencies = [
  "crossterm 0.28.1",
+ "manifest",
  "protocol",
  "ratatui",
  "serde_json",
  "tokio",
+ "toml",
  "unicode-width",
  "uuid",
 ]
