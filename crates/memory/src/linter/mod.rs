@@ -126,13 +126,18 @@ impl Linter {
             }
         }
 
+        // Similar-slug clustering warning. Skipped for Summary (no slug).
+        if let Some(slug) = &classified.slug {
+            warnings::check_similar_slugs(slug, classified.kind, &existing, &mut report);
+        }
+
         // Frontmatter parse dispatch by kind.
         match classified.kind {
             RecordKind::Decision => {
                 self.check_decision(content, &classified, &existing, &mut report);
             }
             RecordKind::Request => {
-                self.check_kind::<RequestFrontmatter>(content, &classified, &mut report);
+                self.check_request(content, &classified, &mut report);
             }
             RecordKind::Knowledge => {
                 self.check_knowledge(content, &classified, &mut report);
@@ -161,6 +166,22 @@ impl Linter {
         size::check_body::<F>(body, report);
         warnings::check_warnings_kindless(cp, body, report);
         let _ = parsed.frontmatter; // discarded after structural checks
+    }
+
+    fn check_request(&self, content: &str, _cp: &ClassifiedPath, report: &mut LintReport) {
+        let parsed = match parse_frontmatter::<RequestFrontmatter>(content) {
+            Ok(p) => p,
+            Err(e) => {
+                report.push_error(e);
+                return;
+            }
+        };
+        size::check_body::<RequestFrontmatter>(parsed.body, report);
+        warnings::check_warnings_with_sources(
+            parsed.body,
+            parsed.frontmatter.sources.len(),
+            report,
+        );
     }
 
     fn check_decision(
@@ -229,12 +250,45 @@ impl Linter {
     }
 }
 
-/// Workflow frontmatter validator exposed for human-edit paths
-/// (CLI / pre-commit). Not used by the memory tool, which rejects
-/// workflow writes outright.
-pub fn lint_workflow_frontmatter(content: &str) -> Result<WorkflowFrontmatter, LintError> {
-    let parsed = parse_frontmatter::<WorkflowFrontmatter>(content)?;
-    Ok(parsed.frontmatter)
+impl Linter {
+    /// Workflow record validator exposed for human-edit paths
+    /// (CLI / pre-commit). Not used by the memory tool, which rejects
+    /// workflow writes outright.
+    ///
+    /// Verifies frontmatter shape, body size, and that every slug in
+    /// `requires` points at an existing Knowledge record under the
+    /// workspace's `knowledge/` directory.
+    pub fn lint_workflow(&self, content: &str) -> LintReport {
+        let mut report = LintReport::default();
+        let parsed = match parse_frontmatter::<WorkflowFrontmatter>(content) {
+            Ok(p) => p,
+            Err(e) => {
+                report.push_error(e);
+                return report;
+            }
+        };
+        size::check_body::<WorkflowFrontmatter>(parsed.body, &mut report);
+
+        let existing = match existing::scan_existing(&self.layout) {
+            Ok(e) => e,
+            Err(e) => {
+                report.push_error(LintError::MalformedFrontmatter(format!(
+                    "failed to scan existing records: {e}"
+                )));
+                return report;
+            }
+        };
+        for slug in &parsed.frontmatter.requires {
+            if !existing.contains(crate::workspace::RecordKind::Knowledge, slug) {
+                report.push_error(LintError::UnknownReference {
+                    field: "requires",
+                    kind: "knowledge",
+                    slug: slug.to_string(),
+                });
+            }
+        }
+        report
+    }
 }
 
 struct Parsed<'a, F> {
@@ -415,6 +469,115 @@ mod tests {
         );
         let report = linter.lint(&path, &content, WriteMode::Create);
         assert!(report.errors.iter().any(|e| matches!(e, LintError::SlugAlreadyExists(_))));
+    }
+
+    #[test]
+    fn workflow_lint_accepts_valid_record() {
+        let (dir, linter) = workspace();
+        // Place a Knowledge record that the workflow will reference.
+        let kn = dir.path().join("knowledge/foo.md");
+        write(
+            &kn,
+            &format!(
+                "---\ncreated_at: {n}\nupdated_at: {n}\nkind: rule\ndescription: x\nmodel_invokation: false\nuser_invocable: true\nlast_sources: []\n---\n",
+                n = iso_now()
+            ),
+        );
+        let wf = format!(
+            "---\nupdated_at: {n}\ndescription: do thing\nauto_invoke: false\nuser_invocable: true\nrequires: [foo]\n---\nstep 1\n",
+            n = iso_now()
+        );
+        let report = linter.lint_workflow(&wf);
+        assert!(!report.has_errors(), "got errors: {:?}", report.errors);
+    }
+
+    #[test]
+    fn workflow_lint_flags_unknown_requires() {
+        let (_dir, linter) = workspace();
+        let wf = format!(
+            "---\nupdated_at: {n}\ndescription: x\nauto_invoke: false\nuser_invocable: true\nrequires: [missing-knowledge]\n---\n",
+            n = iso_now()
+        );
+        let report = linter.lint_workflow(&wf);
+        assert!(report.errors.iter().any(|e| matches!(
+            e,
+            LintError::UnknownReference {
+                field: "requires",
+                kind: "knowledge",
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn workflow_lint_collects_multiple_unknown_requires() {
+        let (_dir, linter) = workspace();
+        let wf = format!(
+            "---\nupdated_at: {n}\ndescription: x\nauto_invoke: false\nuser_invocable: true\nrequires: [a, b, c]\n---\n",
+            n = iso_now()
+        );
+        let report = linter.lint_workflow(&wf);
+        let unknown_count = report
+            .errors
+            .iter()
+            .filter(|e| matches!(e, LintError::UnknownReference { .. }))
+            .count();
+        assert_eq!(unknown_count, 3);
+    }
+
+    #[test]
+    fn similar_slugs_warns_on_cluster() {
+        let (dir, linter) = workspace();
+        // Two existing decisions within Levenshtein 2 of `db-pool`:
+        //   `db-pol` (1 deletion), `db-pools` (1 insertion).
+        for slug in ["db-pol", "db-pools"] {
+            write(
+                &dir.path().join(format!("memory/decisions/{slug}.md")),
+                &format!(
+                    "---\ncreated_at: {n}\nupdated_at: {n}\nsources: []\nstatus: open\n---\n",
+                    n = iso_now()
+                ),
+            );
+        }
+        let path = dir.path().join("memory/decisions/db-pool.md");
+        let content = format!(
+            "---\ncreated_at: {n}\nupdated_at: {n}\nsources: []\nstatus: open\n---\nbody\n",
+            n = iso_now()
+        );
+        let report = linter.lint(&path, &content, WriteMode::Create);
+        let warned = report
+            .warnings
+            .iter()
+            .any(|w| matches!(w, LintWarning::SimilarSlugs(slugs) if slugs.len() >= 3));
+        assert!(warned, "expected SimilarSlugs warning, got {:?}", report.warnings);
+    }
+
+    #[test]
+    fn similar_slugs_silent_when_distant() {
+        let (dir, linter) = workspace();
+        for slug in ["alpha", "bravo"] {
+            write(
+                &dir.path().join(format!("memory/decisions/{slug}.md")),
+                &format!(
+                    "---\ncreated_at: {n}\nupdated_at: {n}\nsources: []\nstatus: open\n---\n",
+                    n = iso_now()
+                ),
+            );
+        }
+        let path = dir.path().join("memory/decisions/charlie.md");
+        let content = format!(
+            "---\ncreated_at: {n}\nupdated_at: {n}\nsources: []\nstatus: open\n---\n",
+            n = iso_now()
+        );
+        let report = linter.lint(&path, &content, WriteMode::Create);
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|w| matches!(w, LintWarning::SimilarSlugs(_))),
+            "unexpected SimilarSlugs warning: {:?}",
+            report.warnings
+        );
     }
 
     #[test]

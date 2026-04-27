@@ -193,7 +193,7 @@ GC Agent は **drop / merge / split を自律実行**（削除まで含む）。
 - **ファイル単位**: 丸ごと drop、複数ファイルの merge、1 ファイルの分割（split）
 - **ファイル内の部分削除**: 本文の一部節・箇条を削除 or 圧縮。frontmatter の `sources` 古いエントリの trim も含む
 
-Phase 2 と同じ CRUD tool + Linter Hook を使うので、operation 粒度は自然にサポートされる（専用 API は用意しない）。
+Phase 2 と同じ memory 専用 Tool（read / write / edit、内部で pre-write Linter）を使うので、operation 粒度は自然にサポートされる（専用 API は用意しない）。
 
 #### GC の評価カテゴリ
 

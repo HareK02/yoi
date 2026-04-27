@@ -13,7 +13,6 @@
   - [ ] TUI 補完 + 型付き atom 化 → [tickets/submit-tui-completion.md](tickets/submit-tui-completion.md)
   - [ ] セッションログの Segment 保持 → [tickets/session-log-segments.md](tickets/session-log-segments.md)
 - [ ] メモリ機構
-  - [ ] ファイル形式 + Linter 土台 → [tickets/memory-file-format.md](tickets/memory-file-format.md)
   - [ ] memory / Knowledge 検索ツール → [tickets/memory-search-tools.md](tickets/memory-search-tools.md)
   - [ ] `model_invokation: ON` の常駐注入 → [tickets/memory-resident-injection.md](tickets/memory-resident-injection.md)
   - [ ] Phase 1 活動抽出 → [tickets/memory-phase1-extract.md](tickets/memory-phase1-extract.md)
