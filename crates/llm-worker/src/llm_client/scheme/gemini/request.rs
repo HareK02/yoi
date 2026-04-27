@@ -6,9 +6,9 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::llm_client::{
+    capability::{ModelCapability, ReasoningControl, ReasoningSupport},
+    types::{parse_tool_arguments, Item, Role, ToolDefinition},
     Request,
-    capability::{ModelCapability, ReasoningSupport},
-    types::{Item, Role, ToolDefinition, parse_tool_arguments},
 };
 
 use super::GeminiScheme;
@@ -203,10 +203,12 @@ impl GeminiScheme {
             .config
             .reasoning
             .as_ref()
-            .and_then(|rc| rc.budget_tokens)
             .filter(|_| supports_budget)
-            .map(|budget| GeminiThinkingConfig {
-                thinking_budget: budget as i32,
+            .and_then(|rc| match rc {
+                ReasoningControl::BudgetTokens(budget) => Some(GeminiThinkingConfig {
+                    thinking_budget: *budget,
+                }),
+                ReasoningControl::Effort(_) => None,
             });
 
         // Generation config
@@ -374,7 +376,9 @@ impl GeminiScheme {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm_client::capability::{CacheStrategy, StructuredOutput, ToolCallingSupport};
+    use crate::llm_client::capability::{
+        CacheStrategy, ReasoningEffort, StructuredOutput, ToolCallingSupport,
+    };
 
     fn cap() -> ModelCapability {
         ModelCapability {
@@ -383,6 +387,13 @@ mod tests {
             reasoning: None,
             vision: true,
             prompt_caching: CacheStrategy::Auto,
+        }
+    }
+
+    fn cap_budget_reasoning() -> ModelCapability {
+        ModelCapability {
+            reasoning: Some(ReasoningSupport::BudgetTokens),
+            ..cap()
         }
     }
 
@@ -456,5 +467,30 @@ mod tests {
         assert_eq!(gemini_req.contents[0].role, "user");
         assert_eq!(gemini_req.contents[1].role, "model");
         assert_eq!(gemini_req.contents[2].role, "user");
+    }
+
+    #[test]
+    fn thinking_budget_projected_when_supported() {
+        let scheme = GeminiScheme::new();
+        let mut request = Request::new().user("think");
+        request.config.reasoning = Some(ReasoningControl::BudgetTokens(-1));
+
+        let gemini_req = scheme.build_request(&request, &cap_budget_reasoning());
+        let config = gemini_req.generation_config.expect("generation config");
+        let thinking = config.thinking_config.expect("thinking config");
+
+        assert_eq!(thinking.thinking_budget, -1);
+    }
+
+    #[test]
+    fn effort_reasoning_not_projected_to_gemini() {
+        let scheme = GeminiScheme::new();
+        let mut request = Request::new().user("think");
+        request.config.reasoning = Some(ReasoningControl::Effort(ReasoningEffort::Medium));
+
+        let gemini_req = scheme.build_request(&request, &cap_budget_reasoning());
+        let config = gemini_req.generation_config.expect("generation config");
+
+        assert!(config.thinking_config.is_none());
     }
 }

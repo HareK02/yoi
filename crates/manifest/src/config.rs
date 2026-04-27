@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::defaults;
-use crate::model::{AuthRef, ModelManifest};
+use crate::model::{AuthRef, ModelManifest, ReasoningControl};
 use crate::{
     CompactionConfig, MemoryConfig, PodManifest, PodMeta, ScopeConfig, ToolOutputLimits,
     WorkerManifest,
@@ -65,6 +65,8 @@ pub struct WorkerManifestConfig {
     #[serde(default)]
     pub temperature: Option<f32>,
     #[serde(default)]
+    pub reasoning: Option<ReasoningControl>,
+    #[serde(default)]
     pub tool_output: ToolOutputLimitsPartial,
 }
 
@@ -103,10 +105,7 @@ pub enum ResolveError {
     #[error("missing required field: {0}")]
     MissingField(&'static str),
     #[error("path must be absolute ({field}): {}", .path.display())]
-    RelativePath {
-        field: &'static str,
-        path: PathBuf,
-    },
+    RelativePath { field: &'static str, path: PathBuf },
 }
 
 impl PodManifestConfig {
@@ -227,6 +226,7 @@ impl WorkerManifestConfig {
             max_tokens: upper.max_tokens.or(self.max_tokens),
             max_turns: upper.max_turns.or(self.max_turns),
             temperature: upper.temperature.or(self.temperature),
+            reasoning: upper.reasoning.or(self.reasoning),
             tool_output: self.tool_output.merge(upper.tool_output),
         }
     }
@@ -323,10 +323,7 @@ impl TryFrom<PodManifestConfig> for PodManifest {
     type Error = ResolveError;
 
     fn try_from(cfg: PodManifestConfig) -> Result<Self, Self::Error> {
-        let name = cfg
-            .pod
-            .name
-            .ok_or(ResolveError::MissingField("pod.name"))?;
+        let name = cfg.pod.name.ok_or(ResolveError::MissingField("pod.name"))?;
         let prompt_pack = cfg.pod.prompt_pack;
         if let Some(ref p) = prompt_pack {
             ensure_absolute("pod.prompt_pack", p)?;
@@ -342,6 +339,7 @@ impl TryFrom<PodManifestConfig> for PodManifest {
             max_tokens: cfg.worker.max_tokens,
             max_turns: cfg.worker.max_turns,
             temperature: cfg.worker.temperature,
+            reasoning: cfg.worker.reasoning,
             tool_output: ToolOutputLimits {
                 default_max_bytes: cfg
                     .worker
@@ -372,9 +370,7 @@ impl TryFrom<PodManifestConfig> for PodManifest {
                     prune_protected_turns: c
                         .prune_protected_turns
                         .unwrap_or(defaults::PRUNE_PROTECTED_TURNS),
-                    prune_min_savings: c
-                        .prune_min_savings
-                        .unwrap_or(defaults::PRUNE_MIN_SAVINGS),
+                    prune_min_savings: c.prune_min_savings.unwrap_or(defaults::PRUNE_MIN_SAVINGS),
                     compact_threshold: c.compact_threshold,
                     compact_request_threshold: c.compact_request_threshold,
                     compact_retained_tokens: c
@@ -406,7 +402,7 @@ impl TryFrom<PodManifestConfig> for PodManifest {
 mod tests {
     use super::*;
     use crate::model::SchemeKind;
-    use crate::{Permission, ScopeRule};
+    use crate::{Permission, ReasoningEffort, ScopeRule};
 
     fn abs(path: &str) -> PathBuf {
         PathBuf::from(format!("/tmp/insomnia-test{path}"))
@@ -566,6 +562,31 @@ mod tests {
     }
 
     #[test]
+    fn merge_worker_reasoning_upper_wins() {
+        let lower = PodManifestConfig {
+            worker: WorkerManifestConfig {
+                reasoning: Some(ReasoningControl::Effort(ReasoningEffort::Low)),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let upper = PodManifestConfig {
+            worker: WorkerManifestConfig {
+                reasoning: Some(ReasoningControl::BudgetTokens(4096)),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let merged = lower.merge(upper);
+
+        assert_eq!(
+            merged.worker.reasoning,
+            Some(ReasoningControl::BudgetTokens(4096))
+        );
+    }
+
+    #[test]
     fn merge_scope_accumulates_allow_and_deny() {
         let lower = PodManifestConfig {
             scope: ScopeConfig {
@@ -614,12 +635,9 @@ mod tests {
             worker: WorkerManifestConfig {
                 tool_output: ToolOutputLimitsPartial {
                     default_max_bytes: None,
-                    per_tool: [
-                        ("Read".to_string(), 2048),
-                        ("Grep".to_string(), 512),
-                    ]
-                    .into_iter()
-                    .collect(),
+                    per_tool: [("Read".to_string(), 2048), ("Grep".to_string(), 512)]
+                        .into_iter()
+                        .collect(),
                 },
                 ..Default::default()
             },
@@ -685,6 +703,33 @@ unknown_future_field = "tolerated"
 "#;
         let cfg = PodManifestConfig::from_toml(ok).unwrap();
         assert_eq!(cfg.worker.max_tokens, Some(1000));
+    }
+
+    #[test]
+    fn from_toml_accepts_worker_reasoning_string_or_integer() {
+        let effort = PodManifestConfig::from_toml(
+            r#"
+[worker]
+reasoning = "xhigh"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            effort.worker.reasoning,
+            Some(ReasoningControl::Effort(ReasoningEffort::XHigh))
+        );
+
+        let budget = PodManifestConfig::from_toml(
+            r#"
+[worker]
+reasoning = -1
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            budget.worker.reasoning,
+            Some(ReasoningControl::BudgetTokens(-1))
+        );
     }
 
     #[test]

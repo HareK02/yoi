@@ -6,9 +6,9 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::llm_client::{
+    capability::{ModelCapability, ReasoningControl, ReasoningSupport},
+    types::{parse_tool_arguments, Item, Role, ToolDefinition},
     Request,
-    capability::{ModelCapability, ReasoningEffort, ReasoningSupport},
-    types::{Item, Role, ToolDefinition, parse_tool_arguments},
 };
 
 use super::OpenAIScheme;
@@ -37,7 +37,7 @@ pub(crate) struct OpenAIRequest {
     pub tool_choice: Option<String>,
     /// Reasoning effort（o1 / o3 / o4 / gpt-5 系で有効）。
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub reasoning_effort: Option<&'static str>,
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -154,12 +154,10 @@ impl OpenAIScheme {
             .config
             .reasoning
             .as_ref()
-            .and_then(|rc| rc.effort)
             .filter(|_| supports_effort)
-            .map(|effort| match effort {
-                ReasoningEffort::Low => "low",
-                ReasoningEffort::Medium => "medium",
-                ReasoningEffort::High => "high",
+            .and_then(|rc| match rc {
+                ReasoningControl::Effort(effort) => Some(effort.as_str().to_string()),
+                ReasoningControl::BudgetTokens(_) => None,
             });
 
         OpenAIRequest {
@@ -322,7 +320,9 @@ impl OpenAIScheme {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm_client::capability::{CacheStrategy, StructuredOutput, ToolCallingSupport};
+    use crate::llm_client::capability::{
+        CacheStrategy, ReasoningEffort, StructuredOutput, ToolCallingSupport,
+    };
 
     fn cap() -> ModelCapability {
         ModelCapability {
@@ -385,6 +385,38 @@ mod tests {
 
         assert_eq!(body.max_completion_tokens, Some(100));
         assert!(body.max_tokens.is_none());
+    }
+
+    #[test]
+    fn reasoning_effort_projected_when_supported() {
+        let scheme = OpenAIScheme::new();
+        let mut request = Request::new().user("Hello");
+        request.config.reasoning = Some(ReasoningControl::Effort(ReasoningEffort::Other(
+            "provider-native".into(),
+        )));
+        let capability = ModelCapability {
+            reasoning: Some(ReasoningSupport::Effort),
+            ..cap()
+        };
+
+        let body = scheme.build_request("gpt-5", &request, &capability);
+
+        assert_eq!(body.reasoning_effort.as_deref(), Some("provider-native"));
+    }
+
+    #[test]
+    fn budget_reasoning_not_projected_to_openai_chat() {
+        let scheme = OpenAIScheme::new();
+        let mut request = Request::new().user("Hello");
+        request.config.reasoning = Some(ReasoningControl::BudgetTokens(4096));
+        let capability = ModelCapability {
+            reasoning: Some(ReasoningSupport::Both),
+            ..cap()
+        };
+
+        let body = scheme.build_request("gpt-5", &request, &capability);
+
+        assert!(body.reasoning_effort.is_none());
     }
 
     #[test]

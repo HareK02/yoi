@@ -1398,6 +1398,7 @@ pub fn apply_worker_manifest<C: LlmClient>(worker: &mut Worker<C>, wm: &WorkerMa
     if let Some(temperature) = wm.temperature {
         config.temperature = Some(temperature);
     }
+    config.reasoning = wm.reasoning.clone();
     worker.set_request_config(config);
     worker.set_max_turns(wm.max_turns.map(|n| n.get()));
     worker.set_tool_output_limits(Some(ToolOutputLimits {

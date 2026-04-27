@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use crate::llm_client::{
     Request,
-    capability::{ModelCapability, ReasoningEffort, ReasoningSupport},
+    capability::{ModelCapability, ReasoningControl, ReasoningSupport},
     types::{ContentPart, Item, Role, ToolDefinition, parse_tool_arguments},
 };
 
@@ -50,7 +50,7 @@ pub(crate) struct ResponsesRequest {
 #[derive(Debug, Serialize)]
 pub(crate) struct ReasoningConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub effort: Option<&'static str>,
+    pub effort: Option<String>,
     /// summary の出力制御。`"auto"` 固定で summary_text を受け取る。
     pub summary: &'static str,
 }
@@ -168,16 +168,15 @@ impl OpenAIResponsesScheme {
             .config
             .reasoning
             .as_ref()
-            .and_then(|rc| rc.effort)
             .filter(|_| supports_effort)
             .map(|effort| ReasoningConfig {
-                effort: Some(match effort {
-                    ReasoningEffort::Low => "low",
-                    ReasoningEffort::Medium => "medium",
-                    ReasoningEffort::High => "high",
-                }),
+                effort: match effort {
+                    ReasoningControl::Effort(effort) => Some(effort.as_str().to_string()),
+                    ReasoningControl::BudgetTokens(_) => None,
+                },
                 summary: "auto",
-            });
+            })
+            .filter(|reasoning| reasoning.effort.is_some());
 
         let include: Vec<&'static str> = if self.include_encrypted_content {
             vec!["reasoning.encrypted_content"]
@@ -209,12 +208,12 @@ fn convert_items_to_input(items: &[Item]) -> Vec<InputItem> {
     for item in items {
         match item {
             Item::Message { role, content, .. } => {
-                let (role_str, text_variant): (&'static str, fn(String) -> InputContent) = match role
-                {
-                    Role::User => ("user", |t| InputContent::InputText { text: t }),
-                    Role::Assistant => ("assistant", |t| InputContent::OutputText { text: t }),
-                    Role::System => ("system", |t| InputContent::InputText { text: t }),
-                };
+                let (role_str, text_variant): (&'static str, fn(String) -> InputContent) =
+                    match role {
+                        Role::User => ("user", |t| InputContent::InputText { text: t }),
+                        Role::Assistant => ("assistant", |t| InputContent::OutputText { text: t }),
+                        Role::System => ("system", |t| InputContent::InputText { text: t }),
+                    };
                 let parts: Vec<InputContent> = content
                     .iter()
                     .map(|p| match p {
@@ -395,7 +394,10 @@ mod tests {
             .item(Item::tool_result("c1", "ok"));
         let body = scheme.build_request("gpt-5", &req, &cap_with_reasoning());
         assert!(matches!(body.input[1], InputItem::FunctionCall { .. }));
-        assert!(matches!(body.input[2], InputItem::FunctionCallOutput { .. }));
+        assert!(matches!(
+            body.input[2],
+            InputItem::FunctionCallOutput { .. }
+        ));
     }
 
     #[test]
@@ -425,13 +427,10 @@ mod tests {
     fn reasoning_effort_projected_when_supported() {
         let scheme = OpenAIResponsesScheme::new();
         let mut req = Request::new().user("hi");
-        req.config.reasoning = Some(ReasoningControl {
-            effort: Some(ReasoningEffort::High),
-            budget_tokens: None,
-        });
+        req.config.reasoning = Some(ReasoningControl::Effort(ReasoningEffort::High));
         let body = scheme.build_request("gpt-5", &req, &cap_with_reasoning());
         let reasoning = body.reasoning.expect("reasoning should be set");
-        assert_eq!(reasoning.effort, Some("high"));
+        assert_eq!(reasoning.effort.as_deref(), Some("high"));
         assert_eq!(reasoning.summary, "auto");
     }
 
@@ -439,10 +438,7 @@ mod tests {
     fn reasoning_omitted_when_unsupported() {
         let scheme = OpenAIResponsesScheme::new();
         let mut req = Request::new().user("hi");
-        req.config.reasoning = Some(ReasoningControl {
-            effort: Some(ReasoningEffort::High),
-            budget_tokens: None,
-        });
+        req.config.reasoning = Some(ReasoningControl::Effort(ReasoningEffort::High));
         let body = scheme.build_request("gpt-4o", &req, &cap_no_reasoning());
         assert!(body.reasoning.is_none());
     }

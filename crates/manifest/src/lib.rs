@@ -6,12 +6,14 @@ pub mod paths;
 mod scope;
 
 pub use cascade::{LayerLoadError, find_project_manifest_from, load_layer};
-pub use paths::user_manifest_path;
 pub use config::{
     CompactionConfigPartial, PodManifestConfig, PodMetaConfig, ResolveError,
     ToolOutputLimitsPartial, WorkerManifestConfig,
 };
-pub use model::{AuthRef, ModelCapability, ModelManifest, SchemeKind};
+pub use model::{
+    AuthRef, ModelCapability, ModelManifest, ReasoningControl, ReasoningEffort, SchemeKind,
+};
+pub use paths::user_manifest_path;
 pub use protocol::{Permission, ScopeRule};
 pub use scope::{Scope, ScopeError};
 
@@ -99,6 +101,8 @@ pub struct WorkerManifest {
     pub max_turns: Option<NonZeroU32>,
     #[serde(default)]
     pub temperature: Option<f32>,
+    #[serde(default)]
+    pub reasoning: Option<ReasoningControl>,
     /// Byte-size caps applied to tool `content` before it reaches the
     /// conversation history. The section is optional in TOML — when
     /// omitted, `ToolOutputLimits::default()` (16KB default cap, no
@@ -312,6 +316,7 @@ auth = { kind = "api_key", file = "/abs/keys/anthropic" }
 instruction = "$user/reviewer"
 max_tokens = 4096
 temperature = 0.3
+reasoning = "medium"
 
 [[scope.allow]]
 target = "/abs/project"
@@ -336,6 +341,10 @@ permission = "write"
         assert_eq!(manifest.worker.instruction, "$user/reviewer");
         assert_eq!(manifest.worker.max_tokens, Some(4096));
         assert_eq!(manifest.worker.temperature, Some(0.3));
+        assert_eq!(
+            manifest.worker.reasoning,
+            Some(ReasoningControl::Effort(ReasoningEffort::Medium))
+        );
         let allow = &manifest.scope.allow;
         assert_eq!(allow.len(), 2);
         assert_eq!(allow[0].permission, Permission::Write);
@@ -366,6 +375,16 @@ model_id = "claude-sonnet-4-20250514"
         let toml = MINIMAL_REQUIRED.replace("[worker]\n", "[worker]\nmax_turns = 50\n");
         let manifest = PodManifest::from_toml(&toml).unwrap();
         assert_eq!(manifest.worker.max_turns.unwrap().get(), 50);
+    }
+
+    #[test]
+    fn parse_reasoning_budget() {
+        let toml = MINIMAL_REQUIRED.replace("[worker]\n", "[worker]\nreasoning = -1\n");
+        let manifest = PodManifest::from_toml(&toml).unwrap();
+        assert_eq!(
+            manifest.worker.reasoning,
+            Some(ReasoningControl::BudgetTokens(-1))
+        );
     }
 
     #[test]
@@ -458,9 +477,7 @@ model_id = "claude-sonnet-4-20250514"
 
     #[test]
     fn memory_section_with_explicit_root() {
-        let toml = format!(
-            "{MINIMAL_REQUIRED}\n[memory]\nworkspace_root = \"/some/where\"\n"
-        );
+        let toml = format!("{MINIMAL_REQUIRED}\n[memory]\nworkspace_root = \"/some/where\"\n");
         let manifest = PodManifest::from_toml(&toml).unwrap();
         let mem = manifest.memory.unwrap();
         assert_eq!(

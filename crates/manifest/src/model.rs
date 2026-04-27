@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 // `ModelCapability` は `llm-worker` 側に定義される runtime 構造だが、
 // マニフェストで任意に override できるよう型だけ再エクスポートする。
-pub use llm_worker::llm_client::capability::ModelCapability;
+pub use llm_worker::llm_client::capability::{ModelCapability, ReasoningControl, ReasoningEffort};
 
 /// Pod マニフェストの `[model]` セクション。
 ///

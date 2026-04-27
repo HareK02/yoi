@@ -8,7 +8,7 @@
 //! 1. scheme 実装側の `model_id → ModelCapability` 静的テーブル（既知モデル）
 //! 2. `ModelConfig::capability` での明示 override（未知モデル、または上書き）
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// モデル能力メタデータ
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -80,23 +80,90 @@ pub enum CacheStrategy {
     Auto,
 }
 
-/// Reasoning 制御（共通型、scheme 側で各社形式に投影）
+/// Reasoning 制御（共通型、scheme 側で各社形式に投影）。
 ///
-/// `effort` / `budget_tokens` はユーザー設定から任意で渡される。Scheme
-/// 側は自身の `ReasoningSupport` に応じて片方だけ使う。両方が宣言
-/// されている場合の優先順位は scheme 実装が決める。
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ReasoningControl {
-    #[serde(default)]
-    pub effort: Option<ReasoningEffort>,
-    #[serde(default)]
-    pub budget_tokens: Option<u32>,
+/// 文字列は provider-native な effort label、数値は provider-native な
+/// thinking budget token として扱う。どちらか一方だけを型で表現する。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum ReasoningControl {
+    Effort(ReasoningEffort),
+    BudgetTokens(i32),
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReasoningEffort {
+    Minimal,
     Low,
     Medium,
     High,
+    XHigh,
+    Other(String),
+}
+
+impl ReasoningEffort {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh => "xhigh",
+            Self::Other(label) => label.as_str(),
+        }
+    }
+}
+
+impl From<String> for ReasoningEffort {
+    fn from(value: String) -> Self {
+        match value.as_str() {
+            "minimal" => Self::Minimal,
+            "low" => Self::Low,
+            "medium" => Self::Medium,
+            "high" => Self::High,
+            "xhigh" => Self::XHigh,
+            _ => Self::Other(value),
+        }
+    }
+}
+
+impl Serialize for ReasoningEffort {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ReasoningEffort {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        String::deserialize(deserializer).map(Self::from)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ReasoningControl, ReasoningEffort};
+
+    #[test]
+    fn reasoning_control_deserializes_effort_labels() {
+        let known: ReasoningControl = serde_json::from_str(r#""xhigh""#).unwrap();
+        assert_eq!(known, ReasoningControl::Effort(ReasoningEffort::XHigh));
+
+        let unknown: ReasoningControl = serde_json::from_str(r#""provider-native""#).unwrap();
+        assert_eq!(
+            unknown,
+            ReasoningControl::Effort(ReasoningEffort::Other("provider-native".into()))
+        );
+    }
+
+    #[test]
+    fn reasoning_control_deserializes_signed_budget() {
+        let dynamic: ReasoningControl = serde_json::from_str("-1").unwrap();
+        assert_eq!(dynamic, ReasoningControl::BudgetTokens(-1));
+    }
 }

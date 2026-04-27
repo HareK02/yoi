@@ -7,9 +7,9 @@ use std::collections::BTreeSet;
 use serde::Serialize;
 
 use crate::llm_client::{
+    capability::{CacheStrategy, ModelCapability, ReasoningControl, ReasoningSupport},
+    types::{parse_tool_arguments, ContentPart, Item, Role, ToolDefinition},
     Request,
-    capability::{CacheStrategy, ModelCapability, ReasoningSupport},
-    types::{ContentPart, Item, Role, ToolDefinition, parse_tool_arguments},
 };
 
 use super::AnthropicScheme;
@@ -41,7 +41,7 @@ pub(crate) struct AnthropicRequest {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum AnthropicThinking {
-    Enabled { budget_tokens: u32 },
+    Enabled { budget_tokens: i32 },
 }
 
 /// Anthropic message
@@ -170,9 +170,13 @@ impl AnthropicScheme {
             .config
             .reasoning
             .as_ref()
-            .and_then(|rc| rc.budget_tokens)
             .filter(|_| supports_budget_tokens)
-            .map(|budget_tokens| AnthropicThinking::Enabled { budget_tokens });
+            .and_then(|rc| match rc {
+                ReasoningControl::BudgetTokens(budget_tokens) => Some(AnthropicThinking::Enabled {
+                    budget_tokens: *budget_tokens,
+                }),
+                ReasoningControl::Effort(_) => None,
+            });
 
         AnthropicRequest {
             model: model.to_string(),
@@ -218,7 +222,12 @@ impl AnthropicScheme {
         for (i, item) in items.iter().enumerate() {
             match item {
                 Item::Message { role, content, .. } => {
-                    flush_pending(&mut messages, &mut pending_assistant, "assistant", &mut locations);
+                    flush_pending(
+                        &mut messages,
+                        &mut pending_assistant,
+                        "assistant",
+                        &mut locations,
+                    );
                     flush_pending(&mut messages, &mut pending_user, "user", &mut locations);
 
                     let anthropic_role = match role {
@@ -229,9 +238,7 @@ impl AnthropicScheme {
                     let parts: Vec<AnthropicContentPart> = content
                         .iter()
                         .map(|p| match p {
-                            ContentPart::Text { text } => {
-                                AnthropicContentPart::text(text.clone())
-                            }
+                            ContentPart::Text { text } => AnthropicContentPart::text(text.clone()),
                             ContentPart::Refusal { refusal } => {
                                 AnthropicContentPart::text(refusal.clone())
                             }
@@ -284,15 +291,18 @@ impl AnthropicScheme {
                     content,
                     ..
                 } => {
-                    flush_pending(&mut messages, &mut pending_assistant, "assistant", &mut locations);
+                    flush_pending(
+                        &mut messages,
+                        &mut pending_assistant,
+                        "assistant",
+                        &mut locations,
+                    );
                     let text = match content {
                         Some(c) => format!("{summary}\n{c}"),
                         None => summary.clone(),
                     };
-                    pending_user.push((
-                        i,
-                        AnthropicContentPart::tool_result(call_id.clone(), text),
-                    ));
+                    pending_user
+                        .push((i, AnthropicContentPart::tool_result(call_id.clone(), text)));
                 }
 
                 Item::Reasoning { text, .. } => {
@@ -304,7 +314,12 @@ impl AnthropicScheme {
             }
         }
 
-        flush_pending(&mut messages, &mut pending_assistant, "assistant", &mut locations);
+        flush_pending(
+            &mut messages,
+            &mut pending_assistant,
+            "assistant",
+            &mut locations,
+        );
         flush_pending(&mut messages, &mut pending_user, "user", &mut locations);
 
         // Apply cache_control markers at each breakpoint item's last part.
@@ -400,7 +415,7 @@ fn compute_breakpoints(items: &[Item], cache_anchor: Option<usize>) -> BTreeSet<
 mod tests {
     use super::*;
     use crate::llm_client::capability::{
-        CacheStrategy, StructuredOutput, ToolCallingSupport,
+        CacheStrategy, ReasoningEffort, StructuredOutput, ToolCallingSupport,
     };
 
     /// cache_control が有効になる既定の capability。
@@ -422,6 +437,13 @@ mod tests {
         }
     }
 
+    fn cap_budget_reasoning() -> ModelCapability {
+        ModelCapability {
+            reasoning: Some(ReasoningSupport::BudgetTokens),
+            ..cap_explicit()
+        }
+    }
+
     #[test]
     fn test_build_simple_request() {
         let scheme = AnthropicScheme::new();
@@ -429,7 +451,8 @@ mod tests {
             .system("You are a helpful assistant.")
             .user("Hello!");
 
-        let anthropic_req = scheme.build_request("claude-sonnet-4-20250514", &request, &cap_explicit());
+        let anthropic_req =
+            scheme.build_request("claude-sonnet-4-20250514", &request, &cap_explicit());
 
         assert_eq!(anthropic_req.model, "claude-sonnet-4-20250514");
         assert_eq!(
@@ -455,10 +478,43 @@ mod tests {
                 })),
         );
 
-        let anthropic_req = scheme.build_request("claude-sonnet-4-20250514", &request, &cap_explicit());
+        let anthropic_req =
+            scheme.build_request("claude-sonnet-4-20250514", &request, &cap_explicit());
 
         assert_eq!(anthropic_req.tools.len(), 1);
         assert_eq!(anthropic_req.tools[0].name, "get_weather");
+    }
+
+    #[test]
+    fn thinking_budget_projected_when_supported() {
+        let scheme = AnthropicScheme::new();
+        let mut request = Request::new().user("think");
+        request.config.reasoning = Some(ReasoningControl::BudgetTokens(4096));
+
+        let req = scheme.build_request(
+            "claude-sonnet-4-20250514",
+            &request,
+            &cap_budget_reasoning(),
+        );
+        let json = serde_json::to_value(&req).unwrap();
+
+        assert_eq!(json["thinking"]["type"], "enabled");
+        assert_eq!(json["thinking"]["budget_tokens"], 4096);
+    }
+
+    #[test]
+    fn effort_reasoning_not_projected_to_anthropic() {
+        let scheme = AnthropicScheme::new();
+        let mut request = Request::new().user("think");
+        request.config.reasoning = Some(ReasoningControl::Effort(ReasoningEffort::High));
+
+        let req = scheme.build_request(
+            "claude-sonnet-4-20250514",
+            &request,
+            &cap_budget_reasoning(),
+        );
+
+        assert!(req.thinking.is_none());
     }
 
     #[test]
@@ -473,7 +529,8 @@ mod tests {
             ))
             .item(Item::tool_result("call_123", "Sunny, 25°C"));
 
-        let anthropic_req = scheme.build_request("claude-sonnet-4-20250514", &request, &cap_explicit());
+        let anthropic_req =
+            scheme.build_request("claude-sonnet-4-20250514", &request, &cap_explicit());
 
         assert_eq!(anthropic_req.messages.len(), 3);
         assert_eq!(anthropic_req.messages[0].role, "user");
@@ -543,7 +600,7 @@ mod tests {
         let scheme = AnthropicScheme::new();
         let mut items = completed_turn();
         items.push(Item::user_message("next turn")); // index 5 = latest user
-        // cache_anchor=None, turn_end=4, head=5.
+                                                     // cache_anchor=None, turn_end=4, head=5.
         let request = Request::new().items(items);
 
         let req = scheme.build_request("claude-sonnet-4-20250514", &request, &cap_explicit());
@@ -607,9 +664,7 @@ mod tests {
         // so we don't bloat requests with wrapper arrays. Here the Head
         // lands on items[1], leaving items[0] without a marker.
         let scheme = AnthropicScheme::new();
-        let request = Request::new()
-            .user("hello")
-            .assistant("hi there");
+        let request = Request::new().user("hello").assistant("hi there");
         let req = scheme.build_request("claude-sonnet-4-20250514", &request, &cap_explicit());
         assert!(
             matches!(req.messages[0].content, AnthropicContent::Text(_)),
@@ -628,10 +683,7 @@ mod tests {
         match &req.messages[0].content {
             AnthropicContent::Parts(parts) => {
                 assert_eq!(parts.len(), 1);
-                assert_eq!(
-                    part_cache_control(&parts[0]),
-                    Some(CacheControl::Ephemeral)
-                );
+                assert_eq!(part_cache_control(&parts[0]), Some(CacheControl::Ephemeral));
             }
             AnthropicContent::Text(_) => panic!("breakpoint item should use Parts form"),
         }
@@ -668,7 +720,8 @@ mod tests {
     #[test]
     fn empty_items_produce_no_breakpoints() {
         let scheme = AnthropicScheme::new();
-        let req = scheme.build_request("claude-sonnet-4-20250514", &Request::new(), &cap_explicit());
+        let req =
+            scheme.build_request("claude-sonnet-4-20250514", &Request::new(), &cap_explicit());
         assert!(req.messages.is_empty());
         assert!(breakpoint_positions(&req).is_empty());
     }
