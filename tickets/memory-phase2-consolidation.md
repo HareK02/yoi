@@ -30,6 +30,12 @@ Knowledge 新規作成は「候補レポート掲載の source から派生す�
 - Knowledge 検索ツール
 - post-write Linter Hook（違反時 turn 戻し、N 回失敗 abort）
 
+### 常駐注入の無効化
+
+- consolidation Worker の Pod 起動直後に `Pod::set_resident_knowledge_injection(false)` を呼ぶ
+- `model_invokation: ON` の Knowledge description を system prompt に載せず、Knowledge 検索ツール経由で agent に引かせる方針（本セクション「入力」と整合）
+- 仕組み自体は `tickets/memory-resident-injection.md` で導入済み。lever は用意されているが Phase 2 spawn 経路がまだないので、本チケットの実装範囲で必ず呼ぶこと
+
 ### 処理内容
 
 - 新規 decisions / requests を 1 件 1 ファイルで追加、`sources` は staging の `source` をコピー（LLM 推論ではない）

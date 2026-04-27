@@ -63,6 +63,20 @@ impl WorkspaceLayout {
         Self { root: root.into() }
     }
 
+    /// Resolve a layout from a `MemoryConfig`, falling back to
+    /// `default_root` (typically the Pod's pwd) when the manifest does
+    /// not pin `workspace_root` explicitly. Single source of truth for
+    /// the `workspace_root.unwrap_or(pwd)` convention used across the
+    /// codebase (controller wiring, scope-deny build, system-prompt
+    /// resident-injection).
+    pub fn resolve(cfg: &manifest::MemoryConfig, default_root: &Path) -> Self {
+        let root = cfg
+            .workspace_root
+            .clone()
+            .unwrap_or_else(|| default_root.to_path_buf());
+        Self::new(root)
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -294,5 +308,22 @@ mod tests {
             .classify(&PathBuf::from("/ws/memory/something/foo.md"))
             .unwrap_err();
         assert!(matches!(err, LintError::InvalidPath(_)));
+    }
+
+    #[test]
+    fn resolve_uses_workspace_root_when_set() {
+        let cfg = manifest::MemoryConfig {
+            workspace_root: Some(PathBuf::from("/explicit")),
+            ..Default::default()
+        };
+        let layout = WorkspaceLayout::resolve(&cfg, Path::new("/fallback"));
+        assert_eq!(layout.root(), Path::new("/explicit"));
+    }
+
+    #[test]
+    fn resolve_falls_back_to_default_when_workspace_root_missing() {
+        let cfg = manifest::MemoryConfig::default();
+        let layout = WorkspaceLayout::resolve(&cfg, Path::new("/fallback"));
+        assert_eq!(layout.root(), Path::new("/fallback"));
     }
 }

@@ -241,11 +241,7 @@ impl PodController {
             // companion deny rules on the generic CRUD scope were
             // already applied during `Pod::from_manifest`.
             if let Some(mem) = memory_config.as_ref() {
-                let workspace_root = mem
-                    .workspace_root
-                    .clone()
-                    .unwrap_or_else(|| pwd_for_tools.clone());
-                let layout = memory::WorkspaceLayout::new(workspace_root);
+                let layout = memory::WorkspaceLayout::resolve(mem, &pwd_for_tools);
                 let search_cfg = memory::tool::SearchConfig::from(mem);
                 worker.register_tool(memory::tool::read_tool(layout.clone()));
                 worker.register_tool(memory::tool::write_tool(layout.clone()));

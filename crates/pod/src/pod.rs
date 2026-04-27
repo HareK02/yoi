@@ -569,11 +569,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 .memory
                 .as_ref()
                 .map(|mem| {
-                    let workspace_root = mem
-                        .workspace_root
-                        .clone()
-                        .unwrap_or_else(|| self.pwd.clone());
-                    let layout = memory::WorkspaceLayout::new(workspace_root);
+                    let layout = memory::WorkspaceLayout::resolve(mem, &self.pwd);
                     memory::collect_resident_knowledge(&layout)
                 })
                 .unwrap_or_default()
@@ -1567,11 +1563,7 @@ pub enum PodError {
 fn build_scope_with_memory(manifest: &PodManifest, pwd: &Path) -> Result<Scope, PodError> {
     let mut scope_config = manifest.scope.clone();
     if let Some(mem) = manifest.memory.as_ref() {
-        let root = mem
-            .workspace_root
-            .clone()
-            .unwrap_or_else(|| pwd.to_path_buf());
-        let layout = memory::WorkspaceLayout::new(root);
+        let layout = memory::WorkspaceLayout::resolve(mem, pwd);
         scope_config.deny.extend(memory::deny_write_rules(&layout));
     }
     Scope::from_config(&scope_config).map_err(PodError::Scope)
