@@ -36,12 +36,13 @@ pub use event_trace::TraceEntry;
 pub use fs_store::FsStore;
 pub use session::{
     SessionStartState, create_compacted_session, create_session, create_session_with_id,
-    ensure_head_or_fork, fork, fork_at, restore, save_cache_locked, save_cache_unlocked,
-    save_config_changed, save_delta, save_extension, save_outcome, save_turn_end, save_usage,
+    ensure_head_or_fork, fork, fork_at, restore, save_config_changed, save_delta, save_extension,
+    save_run_completed, save_run_errored, save_turn_end, save_usage,
 };
+pub use llm_worker::UsageRecord;
 pub use session_log::{
-    EntryHash, HashedEntry, LogEntry, Outcome, RestoredState, SessionOrigin, UsageRecord,
-    build_chain, collect_state, compute_hash,
+    EntryHash, HashedEntry, LogEntry, RestoredState, SessionOrigin, build_chain, collect_state,
+    compute_hash,
 };
 pub use store::{Store, StoreError};
 

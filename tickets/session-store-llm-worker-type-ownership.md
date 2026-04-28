@@ -101,3 +101,8 @@ session-store の `LogEntry` 周りで「llm-worker の概念を session-store �
 - `crates/pod/src/compact/token_counter.rs` (移動元)
 - `crates/pod/src/pod.rs` (handle_worker_result の Outcome 構築箇所、Pod::total_tokens 経路)
 - `docs/persistence.md` (元設計の意図: RunOutcome は audit-only)
+
+## Review
+- 状態: Approve
+- レビュー詳細: [./session-store-llm-worker-type-ownership.review.md](./session-store-llm-worker-type-ownership.review.md)
+- 日付: 2026-04-28

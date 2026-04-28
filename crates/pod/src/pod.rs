@@ -6,10 +6,8 @@ use llm_worker::Item;
 use llm_worker::llm_client::RequestConfig;
 use llm_worker::llm_client::client::LlmClient;
 use llm_worker::state::Mutable;
-use llm_worker::{ToolOutputLimits, Worker, WorkerError, WorkerResult};
-use session_store::{
-    EntryHash, Outcome, SessionId, SessionStartState, Store, StoreError, UsageRecord,
-};
+use llm_worker::{ToolOutputLimits, UsageRecord, Worker, WorkerError, WorkerResult};
+use session_store::{EntryHash, SessionId, SessionStartState, Store, StoreError};
 use tracing::{info, warn};
 
 use manifest::{PodManifest, PodManifestConfig, ResolveError, Scope, ScopeError, WorkerManifest};
@@ -963,23 +961,28 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         }
 
         let interrupted = self.worker.as_ref().unwrap().last_run_interrupted();
-        let outcome = match result {
-            Ok(WorkerResult::Finished) => Outcome::Finished,
-            Ok(WorkerResult::Paused) => Outcome::Paused,
-            Ok(WorkerResult::LimitReached) => Outcome::LimitReached,
-            Ok(WorkerResult::Yielded) => Outcome::Yielded,
-            Err(e) => Outcome::Error {
-                message: e.to_string(),
-            },
-        };
-        session_store::save_outcome(
-            &self.store,
-            self.session_id,
-            &mut self.head_hash,
-            outcome,
-            interrupted,
-        )
-        .await?;
+        match result {
+            Ok(r) => {
+                session_store::save_run_completed(
+                    &self.store,
+                    self.session_id,
+                    &mut self.head_hash,
+                    r.clone(),
+                    interrupted,
+                )
+                .await?;
+            }
+            Err(e) => {
+                session_store::save_run_errored(
+                    &self.store,
+                    self.session_id,
+                    &mut self.head_hash,
+                    e.to_string(),
+                    interrupted,
+                )
+                .await?;
+            }
+        }
 
         Ok(())
     }

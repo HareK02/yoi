@@ -9,6 +9,7 @@
 //! enables safe fork detection when multiple writers share a session.
 
 use llm_worker::llm_client::types::{Item, RequestConfig};
+use llm_worker::{UsageRecord, WorkerResult};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -88,8 +89,7 @@ pub struct HashedEntry {
 /// - `SessionStart` — always the first entry; captures initial state
 /// - `UserInput` / `AssistantItems` / `ToolResults` / `HookInjectedItems` — history appends
 /// - `TurnEnd` — turn boundary marker
-/// - `Locked` / `CacheUnlocked` — KV cache state transitions
-/// - `RunOutcome` — marks end of a `run()` or `resume()` call
+/// - `RunCompleted` / `RunErrored` — marks end of a `run()` or `resume()` call
 /// - `ConfigChanged` — `RequestConfig` mutation
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -124,19 +124,21 @@ pub enum LogEntry {
     /// Turn boundary. Records the turn count after increment.
     TurnEnd { ts: u64, turn_count: usize },
 
-    /// KV cache locked. Records the history prefix length that is now immutable.
-    #[serde(alias = "cache_locked")]
-    Locked { ts: u64, locked_prefix_len: usize },
-
-    /// KV cache unlocked.
-    CacheUnlocked { ts: u64 },
-
-    /// Outcome of a `run()` or `resume()` call.
-    /// This is metadata for auditing; state collection does not branch on the outcome.
-    RunOutcome {
+    /// `run()` / `resume()` が `WorkerResult` で正常終了した。
+    /// Audit-only metadata: replay は `interrupted` のみ反映する。
+    RunCompleted {
         ts: u64,
-        outcome: Outcome,
         interrupted: bool,
+        result: WorkerResult,
+    },
+
+    /// `run()` / `resume()` が `WorkerError` で終了した。
+    /// `WorkerError` は `Serialize` 不可なので `message` のみ lossy 保持する。
+    /// Audit-only metadata: replay は `interrupted` のみ反映する。
+    RunErrored {
+        ts: u64,
+        interrupted: bool,
+        message: String,
     },
 
     /// `RequestConfig` changed.
@@ -188,21 +190,6 @@ pub struct SessionOrigin {
     pub at_hash: EntryHash,
 }
 
-/// Outcome of a run/resume call. Metadata for auditing only.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum Outcome {
-    Finished,
-    Paused,
-    LimitReached,
-    /// Worker yielded control to the caller for external processing.
-    /// Distinct from `Paused`: caller handles internally and resumes.
-    Yielded,
-    Error {
-        message: String,
-    },
-}
-
 /// State collected from log entries.
 #[derive(Debug, Clone)]
 pub struct RestoredState {
@@ -210,7 +197,6 @@ pub struct RestoredState {
     pub config: RequestConfig,
     pub history: Vec<Item>,
     pub turn_count: usize,
-    pub locked_prefix_len: usize,
     pub last_run_interrupted: bool,
     /// Hash of the last entry in the chain (None if empty).
     pub head_hash: Option<EntryHash>,
@@ -223,23 +209,6 @@ pub struct RestoredState {
     pub extensions: Vec<(String, serde_json::Value)>,
 }
 
-/// LLM リクエスト送信時点での占有量スナップショット。
-///
-/// `LogEntry::LlmUsage` の replay 時に `RestoredState.usage_history` に積まれる。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UsageRecord {
-    /// 送信時の history.len()
-    pub history_len: usize,
-    /// history[..history_len] の占有量（プロンプト全長、実測）
-    pub input_total_tokens: u64,
-    /// 上記のうちキャッシュから読み出された分
-    pub cache_read_tokens: u64,
-    /// 上記のうちこのリクエストでキャッシュに書かれた分
-    pub cache_write_tokens: u64,
-    /// このリクエストで生成された出力トークン数
-    pub output_tokens: u64,
-}
-
 /// Replay a sequence of hashed entries to reconstruct worker state.
 pub fn collect_state(entries: &[HashedEntry]) -> RestoredState {
     let mut state = RestoredState {
@@ -247,7 +216,6 @@ pub fn collect_state(entries: &[HashedEntry]) -> RestoredState {
         config: RequestConfig::default(),
         history: Vec::new(),
         turn_count: 0,
-        locked_prefix_len: 0,
         last_run_interrupted: false,
         head_hash: None,
         usage_history: Vec::new(),
@@ -283,15 +251,10 @@ pub fn collect_state(entries: &[HashedEntry]) -> RestoredState {
             LogEntry::TurnEnd { turn_count, .. } => {
                 state.turn_count = *turn_count;
             }
-            LogEntry::Locked {
-                locked_prefix_len, ..
-            } => {
-                state.locked_prefix_len = *locked_prefix_len;
+            LogEntry::RunCompleted { interrupted, .. } => {
+                state.last_run_interrupted = *interrupted;
             }
-            LogEntry::CacheUnlocked { .. } => {
-                state.locked_prefix_len = 0;
-            }
-            LogEntry::RunOutcome { interrupted, .. } => {
+            LogEntry::RunErrored { interrupted, .. } => {
                 state.last_run_interrupted = *interrupted;
             }
             LogEntry::ConfigChanged { config, .. } => {
@@ -361,7 +324,6 @@ mod tests {
         let state = collect_state(&[]);
         assert!(state.history.is_empty());
         assert_eq!(state.turn_count, 0);
-        assert_eq!(state.locked_prefix_len, 0);
         assert!(state.head_hash.is_none());
     }
 
@@ -405,10 +367,10 @@ mod tests {
                 ts: 3100,
                 turn_count: 1,
             },
-            LogEntry::RunOutcome {
+            LogEntry::RunCompleted {
                 ts: 3200,
-                outcome: Outcome::Finished,
                 interrupted: false,
+                result: WorkerResult::Finished,
             },
         ]);
         let state = collect_state(&entries);
@@ -457,31 +419,6 @@ mod tests {
         assert_eq!(state.history.len(), 4);
         assert!(state.history[1].is_tool_call());
         assert!(state.history[2].is_tool_result());
-    }
-
-    #[test]
-    fn replay_cache_lock_unlock() {
-        let entries = build_chain(&[
-            LogEntry::SessionStart {
-                ts: 1000,
-                system_prompt: None,
-                config: RequestConfig::default(),
-                history: vec![Item::user_message("a"), Item::assistant_message("b")],
-                forked_from: None,
-                compacted_from: None,
-            },
-            LogEntry::Locked {
-                ts: 2000,
-                locked_prefix_len: 2,
-            },
-            LogEntry::CacheUnlocked { ts: 3000 },
-        ]);
-        let state = collect_state(&entries);
-        assert_eq!(state.locked_prefix_len, 0);
-
-        // Check locked state before unlock
-        let state_locked = collect_state(&entries[..2]);
-        assert_eq!(state_locked.locked_prefix_len, 2);
     }
 
     #[test]

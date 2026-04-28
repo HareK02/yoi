@@ -9,9 +9,7 @@ use llm_worker::interceptor::{Interceptor, TurnEndAction};
 use llm_worker::llm_client::event::{Event, ResponseStatus, StatusEvent};
 use llm_worker::llm_client::types::{Item, RequestConfig};
 use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
-use session_store::{
-    EntryHash, FsStore, LogEntry, Outcome, SessionStartState, Store, collect_state,
-};
+use session_store::{EntryHash, FsStore, LogEntry, SessionStartState, Store, collect_state};
 
 // =============================================================================
 // Helpers
@@ -115,24 +113,30 @@ async fn run_and_persist(
         .await
         .unwrap();
 
-    let outcome = match &result {
-        Ok(llm_worker::WorkerResult::Finished) => Outcome::Finished,
-        Ok(llm_worker::WorkerResult::Paused) => Outcome::Paused,
-        Ok(llm_worker::WorkerResult::LimitReached) => Outcome::LimitReached,
-        Ok(llm_worker::WorkerResult::Yielded) => Outcome::Yielded,
-        Err(e) => Outcome::Error {
-            message: e.to_string(),
-        },
-    };
-    session_store::save_outcome(
-        store,
-        session_id,
-        head_hash,
-        outcome,
-        worker.last_run_interrupted(),
-    )
-    .await
-    .unwrap();
+    match &result {
+        Ok(r) => {
+            session_store::save_run_completed(
+                store,
+                session_id,
+                head_hash,
+                r.clone(),
+                worker.last_run_interrupted(),
+            )
+            .await
+            .unwrap();
+        }
+        Err(e) => {
+            session_store::save_run_errored(
+                store,
+                session_id,
+                head_hash,
+                e.to_string(),
+                worker.last_run_interrupted(),
+            )
+            .await
+            .unwrap();
+        }
+    }
 
     let r = result.unwrap();
     (worker, r)
@@ -165,7 +169,7 @@ async fn session_run_logs_entries() {
 
     let entries = store.read_all(sid).await.unwrap();
 
-    // SessionStart, UserInput, AssistantItems, TurnEnd, RunOutcome (at minimum)
+    // SessionStart, UserInput, AssistantItems, TurnEnd, RunCompleted (at minimum)
     assert!(
         entries.len() >= 4,
         "expected at least 4 entries, got {}",
@@ -175,12 +179,12 @@ async fn session_run_logs_entries() {
     // First entry is SessionStart
     assert!(matches!(&entries[0].entry, LogEntry::SessionStart { .. }));
 
-    // Has a RunOutcome with Finished
+    // Has a RunCompleted with Finished
     let has_finished = entries.iter().any(|e| {
         matches!(
             &e.entry,
-            LogEntry::RunOutcome {
-                outcome: Outcome::Finished,
+            LogEntry::RunCompleted {
+                result: llm_worker::WorkerResult::Finished,
                 ..
             }
         )
@@ -292,13 +296,13 @@ async fn session_resume_after_pause() {
     let (_worker, result) = run_and_persist(worker, &store, sid, &mut head_hash, "Weather?").await;
     assert!(matches!(result, llm_worker::WorkerResult::Paused));
 
-    // Check RunOutcome is Paused
+    // Check RunCompleted is Paused
     let entries = store.read_all(sid).await.unwrap();
     let has_paused = entries.iter().any(|e| {
         matches!(
             &e.entry,
-            LogEntry::RunOutcome {
-                outcome: Outcome::Paused,
+            LogEntry::RunCompleted {
+                result: llm_worker::WorkerResult::Paused,
                 ..
             }
         )
@@ -428,54 +432,6 @@ async fn session_config_changed_logged() {
         )
     });
     assert!(has_config_changed, "should have ConfigChanged entry");
-}
-
-#[tokio::test]
-async fn session_cache_lock_unlock_logged() {
-    let (_dir, store) = make_store().await;
-    let client = MockLlmClient::new(vec![]);
-    let worker = Worker::new(client);
-
-    let (sid, head_hash) = session_store::create_session(
-        &store,
-        SessionStartState {
-            system_prompt: worker.get_system_prompt(),
-            config: worker.request_config(),
-            history: worker.history(),
-        },
-    )
-    .await
-    .unwrap();
-    let mut head_hash = Some(head_hash);
-
-    session_store::save_cache_locked(&store, sid, &mut head_hash, 5)
-        .await
-        .unwrap();
-    session_store::save_cache_unlocked(&store, sid, &mut head_hash)
-        .await
-        .unwrap();
-
-    let entries = store.read_all(sid).await.unwrap();
-
-    let has_locked = entries.iter().any(|e| {
-        matches!(
-            &e.entry,
-            LogEntry::Locked {
-                locked_prefix_len: 5,
-                ..
-            }
-        )
-    });
-    assert!(has_locked, "should have Locked entry");
-
-    let has_unlocked = entries
-        .iter()
-        .any(|e| matches!(&e.entry, LogEntry::CacheUnlocked { .. }));
-    assert!(has_unlocked, "should have CacheUnlocked entry");
-
-    // State after all entries: unlocked
-    let state = collect_state(&entries);
-    assert_eq!(state.locked_prefix_len, 0);
 }
 
 #[tokio::test]

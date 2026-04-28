@@ -1,6 +1,7 @@
+use llm_worker::WorkerResult;
 use llm_worker::llm_client::types::{Item, RequestConfig};
 use session_store::{
-    FsStore, LogEntry, Outcome, Store, TraceEntry, build_chain, collect_state, new_session_id,
+    FsStore, LogEntry, Store, TraceEntry, build_chain, collect_state, new_session_id,
 };
 
 #[tokio::test]
@@ -30,10 +31,10 @@ async fn round_trip_write_and_read() {
             ts: 3100,
             turn_count: 1,
         },
-        LogEntry::RunOutcome {
+        LogEntry::RunCompleted {
             ts: 3200,
-            outcome: Outcome::Finished,
             interrupted: false,
+            result: WorkerResult::Finished,
         },
     ];
     let entries = build_chain(&raw);

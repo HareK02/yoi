@@ -48,12 +48,15 @@ pub mod llm_client;
 pub mod prune;
 pub mod state;
 pub mod timeline;
+pub mod token_counter;
 pub mod tool;
 pub mod tool_server;
+pub mod usage_record;
 
 pub use callback::{TextBlockScope, ToolUseBlockScope};
 pub use handler::ToolUseBlockStart;
 pub use interceptor::Interceptor;
 pub use message::{ContentPart, Item, Message, Role};
 pub use tool::{ToolCall, ToolOutputLimits, ToolResult};
+pub use usage_record::UsageRecord;
 pub use worker::{RunOutput, ToolRegistryError, Worker, WorkerConfig, WorkerError, WorkerResult};

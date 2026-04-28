@@ -16,12 +16,12 @@ use llm_worker::interceptor::{
     Interceptor, PostToolAction, PreRequestAction, PreToolAction, PromptAction, ToolCallInfo,
     ToolResultInfo, TurnEndAction,
 };
+use llm_worker::UsageRecord;
 use llm_worker::tool::ToolOutput;
-use session_store::UsageRecord;
 use tracing::info;
 
 use crate::compact::state::CompactState;
-use crate::compact::token_counter::total_tokens_impl;
+use llm_worker::token_counter::total_tokens;
 use crate::hook::{
     AbortInfo, HookRegistry, PreRequestInfo, PromptSubmitInfo, ToolCallSummary, ToolResultSummary,
     TurnEndInfo,
@@ -82,7 +82,7 @@ impl PodInterceptor {
     fn estimated_tokens(&self, context: &[Item]) -> Option<u64> {
         let handle = self.usage_history.as_ref()?;
         let records = handle.lock().expect("usage_history poisoned").clone();
-        Some(total_tokens_impl(context, &records).tokens)
+        Some(total_tokens(context, &records).tokens)
     }
 }
 

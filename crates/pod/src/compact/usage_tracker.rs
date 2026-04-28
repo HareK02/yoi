@@ -16,8 +16,8 @@
 
 use std::sync::Mutex;
 
+use llm_worker::UsageRecord;
 use llm_worker::timeline::event::UsageEvent;
-use session_store::UsageRecord;
 
 /// Shared between the pre-request hook, the `on_usage` callback, and Pod.
 pub(crate) struct UsageTracker {

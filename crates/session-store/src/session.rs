@@ -5,8 +5,9 @@
 //! functions after state-mutating operations.
 
 use crate::SessionId;
-use crate::session_log::{self, EntryHash, HashedEntry, LogEntry, Outcome, SessionOrigin};
+use crate::session_log::{self, EntryHash, HashedEntry, LogEntry, SessionOrigin};
 use crate::store::{Store, StoreError};
+use llm_worker::WorkerResult;
 use llm_worker::llm_client::RequestConfig;
 use llm_worker::llm_client::types::Item;
 
@@ -237,22 +238,46 @@ pub async fn save_turn_end(
     .await
 }
 
-/// Log a RunOutcome entry.
-pub async fn save_outcome(
+/// Log a `RunCompleted` entry — `run()` / `resume()` returned `Ok(WorkerResult)`.
+pub async fn save_run_completed(
     store: &impl Store,
     session_id: SessionId,
     head_hash: &mut Option<EntryHash>,
-    outcome: Outcome,
+    result: WorkerResult,
     interrupted: bool,
 ) -> Result<(), StoreError> {
     append_entry(
         store,
         session_id,
         head_hash,
-        LogEntry::RunOutcome {
+        LogEntry::RunCompleted {
             ts: session_log::now_millis(),
-            outcome,
             interrupted,
+            result,
+        },
+    )
+    .await
+}
+
+/// Log a `RunErrored` entry — `run()` / `resume()` returned `Err(WorkerError)`.
+///
+/// `WorkerError` is not `Serialize`, so the caller passes a lossy
+/// `to_string()` rendering as `message`.
+pub async fn save_run_errored(
+    store: &impl Store,
+    session_id: SessionId,
+    head_hash: &mut Option<EntryHash>,
+    message: String,
+    interrupted: bool,
+) -> Result<(), StoreError> {
+    append_entry(
+        store,
+        session_id,
+        head_hash,
+        LogEntry::RunErrored {
+            ts: session_log::now_millis(),
+            interrupted,
+            message,
         },
     )
     .await
@@ -285,42 +310,6 @@ pub async fn save_usage(
             cache_read_tokens,
             cache_write_tokens,
             output_tokens,
-        },
-    )
-    .await
-}
-
-/// Log a `Locked` entry (KV cache locked).
-pub async fn save_cache_locked(
-    store: &impl Store,
-    session_id: SessionId,
-    head_hash: &mut Option<EntryHash>,
-    locked_prefix_len: usize,
-) -> Result<(), StoreError> {
-    append_entry(
-        store,
-        session_id,
-        head_hash,
-        LogEntry::Locked {
-            ts: session_log::now_millis(),
-            locked_prefix_len,
-        },
-    )
-    .await
-}
-
-/// Log a `CacheUnlocked` entry.
-pub async fn save_cache_unlocked(
-    store: &impl Store,
-    session_id: SessionId,
-    head_hash: &mut Option<EntryHash>,
-) -> Result<(), StoreError> {
-    append_entry(
-        store,
-        session_id,
-        head_hash,
-        LogEntry::CacheUnlocked {
-            ts: session_log::now_millis(),
         },
     )
     .await
