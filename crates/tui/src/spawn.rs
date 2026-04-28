@@ -20,6 +20,7 @@ use std::time::Duration;
 use crossterm::event::{self, Event as TermEvent, KeyCode, KeyEventKind, KeyModifiers};
 use manifest::{PodManifestConfig, find_project_manifest_from, load_layer, user_manifest_path};
 use ratatui::Terminal;
+use session_store::SessionId;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
@@ -85,7 +86,10 @@ impl From<io::Error> for SpawnError {
 
 type InlineTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 
-pub async fn run() -> Result<SpawnOutcome, SpawnError> {
+/// Source session for a resume run. `None` = fresh spawn (current
+/// behaviour); `Some(id)` swaps the dialog into "Resume Pod" mode and
+/// passes `--session <id>` to the spawned `pod` child.
+pub async fn run(resume_from: Option<SessionId>) -> Result<SpawnOutcome, SpawnError> {
     let cwd = std::env::current_dir().map_err(SpawnError::Io)?;
 
     // Run the same merge pod itself uses, then read what's missing
@@ -135,6 +139,7 @@ pub async fn run() -> Result<SpawnOutcome, SpawnError> {
         name: default_name,
         message: None,
         editing: true,
+        resume_from,
     };
 
     let mut terminal = make_inline_terminal()?;
@@ -266,16 +271,19 @@ async fn wait_for_ready(
     let pod_bin = resolve_pod_command();
     let cwd = std::env::current_dir().map_err(SpawnError::Io)?;
 
-    let mut child = Command::new(&pod_bin)
+    let mut command = Command::new(&pod_bin);
+    command
         .arg("--overlay")
         .arg(overlay_toml)
         .current_dir(&cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(SpawnError::PodLaunchFailed)?;
+        .kill_on_drop(true);
+    if let Some(id) = form.resume_from {
+        command.arg("--session").arg(id.to_string());
+    }
+    let mut child = command.spawn().map_err(SpawnError::PodLaunchFailed)?;
 
     let stderr = child
         .stderr
@@ -437,6 +445,11 @@ struct Form {
     /// cursor stays out so it does not collide with the shell prompt
     /// after the inline terminal is dropped.
     editing: bool,
+    /// `Some(id)` flips the dialog into "Resume Pod" mode: the title
+    /// switches, the source session is shown to the user, and the
+    /// child pod is launched with `--session <id>` so it forks and
+    /// restores `id`.
+    resume_from: Option<SessionId>,
 }
 
 impl Form {
@@ -500,8 +513,12 @@ fn draw_form(f: &mut Frame<'_>, form: &Form) {
     ])
     .split(area);
 
+    let title_text = match form.resume_from {
+        Some(id) => format!("resume pod   session: {}", short_session(id)),
+        None => "spawn pod".to_string(),
+    };
     let title = Paragraph::new(Line::from(vec![Span::styled(
-        "spawn pod",
+        title_text,
         Style::default().add_modifier(Modifier::BOLD),
     )]));
     f.render_widget(title, layout[0]);
@@ -521,6 +538,13 @@ fn draw_form(f: &mut Frame<'_>, form: &Form) {
         let cursor_col = 2 + "name: ".len() + form.name_cursor;
         f.set_cursor_position((layout[1].x + cursor_col as u16, layout[1].y));
     }
+}
+
+/// First 8 hex digits of a UUID — short enough to skim, long enough
+/// to disambiguate inside a 10-row picker.
+pub(crate) fn short_session(id: SessionId) -> String {
+    let s = id.to_string();
+    s.chars().take(8).collect()
 }
 
 fn name_line(form: &Form) -> Line<'_> {
@@ -600,6 +624,7 @@ mod tests {
             name_cursor: name.chars().count(),
             message: None,
             editing: true,
+            resume_from: None,
         }
     }
 

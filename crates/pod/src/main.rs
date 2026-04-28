@@ -4,7 +4,7 @@ use std::process::ExitCode;
 use clap::Parser;
 use manifest::paths;
 use pod::{Pod, PodController, PodFactory};
-use session_store::FsStore;
+use session_store::{FsStore, SessionId};
 
 #[derive(Parser)]
 #[command(
@@ -43,6 +43,14 @@ struct Cli {
     /// callbacks upward. Required alongside `--adopt`.
     #[arg(long, value_name = "PATH", requires = "adopt")]
     callback: Option<PathBuf>,
+
+    /// Restore a Pod from an existing session. The source session log
+    /// is forked at its head into a new session id, so the original
+    /// jsonl is left untouched and double-write races are impossible.
+    /// Mutually exclusive with `--adopt` (spawned children always start
+    /// fresh).
+    #[arg(long, value_name = "UUID", conflicts_with = "adopt")]
+    session: Option<SessionId>,
 }
 
 async fn build_factory(cli: &Cli) -> Result<PodFactory, String> {
@@ -133,6 +141,14 @@ async fn main() -> ExitCode {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("error: failed to create spawned pod: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else if let Some(source_session_id) = cli.session {
+        match Pod::restore_from_manifest(source_session_id, manifest, store, loader).await {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("error: failed to restore pod: {e}");
                 return ExitCode::FAILURE;
             }
         }

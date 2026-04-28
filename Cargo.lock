@@ -3575,6 +3575,7 @@ dependencies = [
  "protocol",
  "ratatui",
  "serde_json",
+ "session-store",
  "tokio",
  "toml",
  "unicode-width",

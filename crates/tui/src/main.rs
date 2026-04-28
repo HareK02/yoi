@@ -3,6 +3,7 @@ mod block;
 mod cache;
 mod client;
 mod input;
+mod picker;
 mod scroll;
 mod spawn;
 mod tool;
@@ -24,9 +25,11 @@ use crossterm::terminal::{
 use protocol::Method;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use session_store::SessionId;
 
 use crate::app::App;
 use crate::client::PodClient;
+use crate::picker::PickerOutcome;
 use crate::spawn::{SpawnOutcome, SpawnReady};
 
 fn resolve_socket(pod_name: &str, override_path: Option<PathBuf>) -> PathBuf {
@@ -47,27 +50,101 @@ enum Mode {
         pod_name: String,
         socket_override: Option<PathBuf>,
     },
+    /// `tui -r` / `tui --resume`: open the session picker first, then
+    /// run the same name dialog as Spawn but in resume mode.
+    Resume,
+    /// `tui --session <UUID>`: skip the picker, go straight to the
+    /// resume name dialog with `id` baked in.
+    ResumeWithSession(SessionId),
 }
 
-fn parse_args() -> Mode {
+enum ParseError {
+    Conflict,
+    InvalidSession(String),
+    MissingValue(&'static str),
+}
+
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Conflict => write!(f, "--resume and --session are mutually exclusive"),
+            Self::InvalidSession(s) => write!(f, "invalid --session UUID: {s}"),
+            Self::MissingValue(flag) => write!(f, "{flag} requires a value"),
+        }
+    }
+}
+
+fn parse_args() -> Result<Mode, ParseError> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.is_empty() {
-        return Mode::Spawn;
+    let mut resume = false;
+    let mut session: Option<SessionId> = None;
+    let mut socket_override: Option<PathBuf> = None;
+    let mut positional: Option<String> = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-r" | "--resume" => {
+                resume = true;
+                i += 1;
+            }
+            "--session" => {
+                let raw = args
+                    .get(i + 1)
+                    .ok_or(ParseError::MissingValue("--session"))?;
+                session = Some(
+                    raw.parse::<SessionId>()
+                        .map_err(|_| ParseError::InvalidSession(raw.clone()))?,
+                );
+                i += 2;
+            }
+            "--socket" => {
+                let raw = args
+                    .get(i + 1)
+                    .ok_or(ParseError::MissingValue("--socket"))?;
+                socket_override = Some(PathBuf::from(raw));
+                i += 2;
+            }
+            other if positional.is_none() && !other.starts_with('-') => {
+                positional = Some(other.to_string());
+                i += 1;
+            }
+            _ => {
+                // Unknown flag or extra positional — keep older
+                // behaviour of ignoring unknowns rather than aborting.
+                i += 1;
+            }
+        }
     }
-    let pod_name = args[0].clone();
-    let socket_override = args
-        .windows(2)
-        .find(|w| w[0] == "--socket")
-        .map(|w| PathBuf::from(&w[1]));
-    Mode::Attach {
-        pod_name,
-        socket_override,
+
+    if resume && session.is_some() {
+        return Err(ParseError::Conflict);
     }
+
+    if let Some(id) = session {
+        return Ok(Mode::ResumeWithSession(id));
+    }
+    if resume {
+        return Ok(Mode::Resume);
+    }
+    if let Some(pod_name) = positional {
+        return Ok(Mode::Attach {
+            pod_name,
+            socket_override,
+        });
+    }
+    Ok(Mode::Spawn)
 }
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let mode = parse_args();
+    let mode = match parse_args() {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("tui: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     if let Err(e) = enable_raw_mode() {
         eprintln!("tui: failed to enter raw mode: {e}");
@@ -80,11 +157,13 @@ async fn main() -> ExitCode {
     }
 
     let result = match mode {
-        Mode::Spawn => run_spawn().await,
+        Mode::Spawn => run_spawn(None).await,
         Mode::Attach {
             pod_name,
             socket_override,
         } => run_attach(pod_name, socket_override).await,
+        Mode::Resume => run_resume().await,
+        Mode::ResumeWithSession(id) => run_spawn(Some(id)).await,
     };
 
     // Always restore the terminal first so any pending eprintln below
@@ -120,8 +199,19 @@ async fn run_attach(
     run(&mut terminal, pod_name, &socket_path, false).await
 }
 
-async fn run_spawn() -> Result<(), Box<dyn std::error::Error>> {
-    let ready = match spawn::run().await? {
+async fn run_resume() -> Result<(), Box<dyn std::error::Error>> {
+    // Phase 1: pick a session in its own inline viewport, dropping the
+    // viewport before the name dialog opens so each phase gets fresh
+    // vertical room.
+    let id = match picker::run().await? {
+        PickerOutcome::Picked(id) => id,
+        PickerOutcome::Cancelled => return Ok(()),
+    };
+    run_spawn(Some(id)).await
+}
+
+async fn run_spawn(resume_from: Option<SessionId>) -> Result<(), Box<dyn std::error::Error>> {
+    let ready = match spawn::run(resume_from).await? {
         SpawnOutcome::Ready(r) => r,
         SpawnOutcome::Cancelled => return Ok(()),
     };

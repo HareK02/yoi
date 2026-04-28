@@ -358,6 +358,7 @@ async fn shutdown_releases_scope_allocation_when_present() {
         std::process::id(),
         "/tmp/kid.sock".into(),
         vec![],
+        session_store::new_session_id(),
     )
     .unwrap();
     std::mem::forget(guard);

@@ -40,6 +40,7 @@ pub use session::{
     save_run_completed, save_run_errored, save_turn_end, save_usage,
 };
 pub use llm_worker::UsageRecord;
+pub use llm_worker::llm_client::types::{ContentPart, Item, Role};
 pub use session_log::{
     EntryHash, HashedEntry, LogEntry, RestoredState, SessionOrigin, build_chain, collect_state,
     compute_hash,

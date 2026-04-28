@@ -210,73 +210,9 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         self.inject_resident_knowledge = enabled;
     }
 
-    /// Restore a Pod from a persisted session.
     /// Shared handle to the prompt catalog. Cheap to clone (`Arc`).
     pub fn prompts(&self) -> &Arc<PromptCatalog> {
         &self.prompts
-    }
-
-    pub async fn restore(
-        session_id: SessionId,
-        manifest: PodManifest,
-        client: C,
-        store: St,
-        pwd: PathBuf,
-        scope: Scope,
-    ) -> Result<Self, PodError> {
-        let state = session_store::restore(&store, session_id).await?;
-        let mut worker = Worker::new(client);
-        if let Some(ref prompt) = state.system_prompt {
-            worker.set_system_prompt(prompt);
-        }
-        // A leading `Role::System` item can only come from `compact`
-        // (the Pod's one and only write path that prepends a summary at
-        // history[0]). Restoring the anchor lets Anthropic re-use a
-        // stable cache prefix for long-lived restored sessions.
-        let anchored_on_summary = matches!(
-            state.history.first(),
-            Some(Item::Message {
-                role: llm_worker::Role::System,
-                ..
-            })
-        );
-        worker.set_history(state.history);
-        worker.set_request_config(state.config);
-        worker.set_turn_count(state.turn_count);
-        worker.set_last_run_interrupted(state.last_run_interrupted);
-        if anchored_on_summary {
-            worker.set_cache_anchor(Some(0));
-        }
-
-        let prompts = PromptCatalog::builtins_only()?;
-        let extract_pointer = memory::extract::fold_pointer(&state.extensions);
-        let mut pod = Self {
-            manifest,
-            worker: Some(worker),
-            store,
-            session_id,
-            head_hash: state.head_hash,
-            pwd,
-            scope,
-            hook_builder: HookRegistryBuilder::new(),
-            interceptor_installed: false,
-            compact_state: None,
-            usage_tracker: Arc::new(UsageTracker::new()),
-            usage_history: Arc::new(Mutex::new(state.usage_history)),
-            tracker: None,
-            system_prompt_template: None,
-            alerter: None,
-            event_tx: None,
-            pending_notifies: NotifyBuffer::new(),
-            scope_allocation: None,
-            callback_socket: None,
-            prompts,
-            inject_resident_knowledge: true,
-            extract_in_flight: Arc::new(AtomicBool::new(false)),
-            extract_pointer: Mutex::new(extract_pointer),
-        };
-        pod.apply_prune_from_manifest();
-        Ok(pod)
     }
 
     /// The session ID used for persistence.
@@ -1534,15 +1470,18 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
         store: St,
         loader: PromptLoader,
     ) -> Result<Self, PodError> {
-        let pwd = current_pwd()?;
-        let scope = build_scope_with_memory(&manifest, &pwd)?;
-        if !scope.is_readable(&pwd) {
-            return Err(PodError::PwdOutsideScope { pwd });
-        }
+        let common = prepare_pod_common(&manifest, &loader, /* parse_template */ true)?;
+
+        // Session creation is deferred to the first run (see
+        // `ensure_session_head`) so the SessionStart entry can capture
+        // the rendered system prompt, not the raw template source. The
+        // session_id is allocated here so the scope-lock registration
+        // can record it from the start.
+        let session_id = session_store::new_session_id();
 
         // Register this Pod in the machine-wide scope-lock registry
         // before building anything else, so a spawn that conflicts on
-        // scope fails fast (and without having paid for client setup).
+        // scope fails fast.
         let socket_path = dir::default_base()
             .map_err(ScopeLockError::from)?
             .join(&manifest.pod.name)
@@ -1551,50 +1490,34 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             manifest.pod.name.clone(),
             std::process::id(),
             socket_path,
-            scope.allow_rules(),
+            common.scope.allow_rules(),
+            session_id,
         )?;
 
-        let client = provider::build_client(&manifest.model)?;
-        let mut worker = Worker::new(client);
+        let mut worker = Worker::new(common.client);
         apply_worker_manifest(&mut worker, &manifest.worker);
 
-        // Resolve the instruction reference and parse the resulting
-        // template eagerly (syntax check only). Rendering is deferred
-        // to `ensure_system_prompt_materialized` at first turn so
-        // runtime values (date, tools, scope summary, ...) can be
-        // injected.
-        let system_prompt_template = Some(
-            SystemPromptTemplate::parse(&manifest.worker.instruction, loader.clone())
-                .map_err(|source| PodError::InvalidSystemPromptTemplate { source })?,
-        );
-
-        let prompts = PromptCatalog::load(&loader, manifest.pod.prompt_pack.as_deref())?;
-
-        // Session creation is deferred to the first run (see
-        // `ensure_session_head`) so the SessionStart entry can capture
-        // the rendered system prompt, not the raw template source.
-        let session_id = session_store::new_session_id();
         let mut pod = Self {
             manifest,
             worker: Some(worker),
             store,
             session_id,
             head_hash: None,
-            pwd,
-            scope,
+            pwd: common.pwd,
+            scope: common.scope,
             hook_builder: HookRegistryBuilder::new(),
             interceptor_installed: false,
             compact_state: None,
             usage_tracker: Arc::new(UsageTracker::new()),
             usage_history: Arc::new(Mutex::new(Vec::new())),
             tracker: None,
-            system_prompt_template,
+            system_prompt_template: common.system_prompt_template,
             alerter: None,
             event_tx: None,
             pending_notifies: NotifyBuffer::new(),
             scope_allocation: Some(scope_allocation),
             callback_socket: None,
-            prompts,
+            prompts: common.prompts,
             inject_resident_knowledge: true,
             extract_in_flight: Arc::new(AtomicBool::new(false)),
             extract_pointer: Mutex::new(None),
@@ -1610,60 +1533,176 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
     /// [`scope_lock::delegate_scope`], rather than installing a new
     /// top-level entry. `callback_socket` carries the spawner's
     /// Unix-socket path so the spawned Pod can send `Method::Notify`
-    /// back to the spawner; it is stored but unused in the
-    /// `spawn-pod-tool` ticket — the receiving side lands in the
-    /// follow-up `pod-callback` ticket.
+    /// back to the spawner.
     pub async fn from_manifest_spawned(
         manifest: PodManifest,
         store: St,
         loader: PromptLoader,
         callback_socket: PathBuf,
     ) -> Result<Self, PodError> {
-        let pwd = current_pwd()?;
-        let scope = build_scope_with_memory(&manifest, &pwd)?;
-        if !scope.is_readable(&pwd) {
-            return Err(PodError::PwdOutsideScope { pwd });
-        }
-
-        let scope_allocation =
-            scope_lock::adopt_allocation(manifest.pod.name.clone(), std::process::id())?;
-
-        let client = provider::build_client(&manifest.model)?;
-        let mut worker = Worker::new(client);
-        apply_worker_manifest(&mut worker, &manifest.worker);
-
-        let system_prompt_template = Some(
-            SystemPromptTemplate::parse(&manifest.worker.instruction, loader.clone())
-                .map_err(|source| PodError::InvalidSystemPromptTemplate { source })?,
-        );
-
-        let prompts = PromptCatalog::load(&loader, manifest.pod.prompt_pack.as_deref())?;
+        let common = prepare_pod_common(&manifest, &loader, /* parse_template */ true)?;
 
         let session_id = session_store::new_session_id();
+        let scope_allocation =
+            scope_lock::adopt_allocation(manifest.pod.name.clone(), std::process::id(), session_id)?;
+
+        let mut worker = Worker::new(common.client);
+        apply_worker_manifest(&mut worker, &manifest.worker);
+
         let mut pod = Self {
             manifest,
             worker: Some(worker),
             store,
             session_id,
             head_hash: None,
-            pwd,
-            scope,
+            pwd: common.pwd,
+            scope: common.scope,
             hook_builder: HookRegistryBuilder::new(),
             interceptor_installed: false,
             compact_state: None,
             usage_tracker: Arc::new(UsageTracker::new()),
             usage_history: Arc::new(Mutex::new(Vec::new())),
             tracker: None,
-            system_prompt_template,
+            system_prompt_template: common.system_prompt_template,
             alerter: None,
             event_tx: None,
             pending_notifies: NotifyBuffer::new(),
             scope_allocation: Some(scope_allocation),
             callback_socket: Some(callback_socket),
-            prompts,
+            prompts: common.prompts,
             inject_resident_knowledge: true,
             extract_in_flight: Arc::new(AtomicBool::new(false)),
             extract_pointer: Mutex::new(None),
+        };
+        pod.apply_prune_from_manifest();
+        Ok(pod)
+    }
+
+    /// Restore a Pod from an existing session log.
+    ///
+    /// Resolves the manifest cascade exactly like [`Self::from_manifest`]
+    /// (pwd / scope / scope-lock / client / prompt catalog), then forks
+    /// the source session at its current head and seeds a fresh Worker
+    /// from the resulting `RestoredState`. The Pod writes to the new
+    /// fork session's jsonl; the source session's log is left intact.
+    ///
+    /// Refuses to resume if another live Pod is currently writing to
+    /// `source_session_id` (detected via `scope.lock`).
+    ///
+    /// `system_prompt` is replayed verbatim from the session log —
+    /// templates are not re-rendered on restore so a long-running
+    /// session keeps a stable cache prefix even when the manifest's
+    /// instruction template would render differently today.
+    pub async fn restore_from_manifest(
+        source_session_id: SessionId,
+        manifest: PodManifest,
+        store: St,
+        loader: PromptLoader,
+    ) -> Result<Self, PodError> {
+        // Refuse to resume into a session that's already being written.
+        if let Some(info) = scope_lock::lookup_session(source_session_id)? {
+            return Err(PodError::SessionInUse {
+                session_id: source_session_id,
+                pod_name: info.pod_name,
+                socket: info.socket,
+            });
+        }
+
+        // Read the source state, then fork it into a fresh session id.
+        // The fork's SessionStart captures the full history with
+        // `forked_from` provenance pointing back to the source, so the
+        // source jsonl stays untouched and double-write races are
+        // impossible by construction.
+        let state = session_store::restore(&store, source_session_id).await?;
+        let Some(source_head) = state.head_hash.clone() else {
+            return Err(PodError::SessionEmpty {
+                session_id: source_session_id,
+            });
+        };
+        let session_id = session_store::fork_at(&store, source_session_id, &source_head).await?;
+
+        let common = prepare_pod_common(&manifest, &loader, /* parse_template */ false)?;
+
+        let socket_path = dir::default_base()
+            .map_err(ScopeLockError::from)?
+            .join(&manifest.pod.name)
+            .join("sock");
+        let scope_allocation = scope_lock::install_top_level(
+            manifest.pod.name.clone(),
+            std::process::id(),
+            socket_path,
+            common.scope.allow_rules(),
+            session_id,
+        )?;
+
+        // Build the worker and apply the manifest defaults first, then
+        // overwrite the pieces the session log is authoritative for.
+        let mut worker = Worker::new(common.client);
+        apply_worker_manifest(&mut worker, &manifest.worker);
+        if let Some(ref prompt) = state.system_prompt {
+            worker.set_system_prompt(prompt);
+        }
+        // A leading `Role::System` item can only come from `compact`
+        // (the Pod's one and only write path that prepends a summary at
+        // history[0]). Restoring the anchor lets Anthropic re-use a
+        // stable cache prefix for long-lived restored sessions.
+        let anchored_on_summary = matches!(
+            state.history.first(),
+            Some(Item::Message {
+                role: llm_worker::Role::System,
+                ..
+            })
+        );
+        worker.set_history(state.history.clone());
+        worker.set_request_config(state.config.clone());
+        worker.set_turn_count(state.turn_count);
+        worker.set_last_run_interrupted(state.last_run_interrupted);
+        if anchored_on_summary {
+            worker.set_cache_anchor(Some(0));
+        }
+
+        let extract_pointer = memory::extract::fold_pointer(&state.extensions);
+
+        // The fork's SessionStart hash is the new head. We could
+        // recompute it by reading the new session log, but
+        // `session_store::fork_at` already returns the new session_id
+        // and we know the chain starts fresh. The next `save_delta`
+        // call will read head from store before appending, so leaving
+        // `head_hash = None` here is safe but less efficient — we
+        // refresh from the store to avoid a chain refresh on first
+        // append.
+        let head_hash = store
+            .read_head_hash(session_id)
+            .await
+            .ok()
+            .flatten();
+
+        let mut pod = Self {
+            manifest,
+            worker: Some(worker),
+            store,
+            session_id,
+            head_hash,
+            pwd: common.pwd,
+            scope: common.scope,
+            hook_builder: HookRegistryBuilder::new(),
+            interceptor_installed: false,
+            compact_state: None,
+            usage_tracker: Arc::new(UsageTracker::new()),
+            usage_history: Arc::new(Mutex::new(state.usage_history)),
+            tracker: None,
+            // Restore replays the saved system_prompt verbatim — no
+            // template re-render on resume.
+            system_prompt_template: None,
+            alerter: None,
+            event_tx: None,
+            pending_notifies: NotifyBuffer::new(),
+            scope_allocation: Some(scope_allocation),
+            callback_socket: None,
+            prompts: common.prompts,
+            inject_resident_knowledge: true,
+            extract_in_flight: Arc::new(AtomicBool::new(false)),
+            extract_pointer: Mutex::new(extract_pointer),
         };
         pod.apply_prune_from_manifest();
         Ok(pod)
@@ -1862,6 +1901,73 @@ pub enum PodError {
 
     #[error("memory Phase 1 staging write failed: {0}")]
     ExtractStaging(#[source] memory::extract::StagingError),
+
+    #[error(
+        "session {session_id} is currently in use by pod `{pod_name}` at {}",
+        .socket.display()
+    )]
+    SessionInUse {
+        session_id: SessionId,
+        pod_name: String,
+        socket: PathBuf,
+    },
+
+    #[error("session {session_id} has no entries to restore")]
+    SessionEmpty { session_id: SessionId },
+}
+
+/// Bundle of resources that every high-level Pod constructor needs:
+/// pwd, scope, an LLM client, the prompt catalog, and (optionally) a
+/// parsed system-prompt template. Built once by [`prepare_pod_common`]
+/// from the manifest cascade and then split into Pod fields.
+struct PodCommon {
+    pwd: PathBuf,
+    scope: Scope,
+    client: Box<dyn LlmClient>,
+    prompts: Arc<PromptCatalog>,
+    system_prompt_template: Option<SystemPromptTemplate>,
+}
+
+/// Resolve pwd / scope / LLM client / prompt catalog from a validated
+/// manifest cascade. Used by `from_manifest`, `from_manifest_spawned`,
+/// and `restore_from_manifest` so they share one definition of "what
+/// pieces fall out of a manifest".
+///
+/// `parse_template` controls whether the manifest's instruction is
+/// parsed as a system-prompt template. New Pods always parse so the
+/// template is rendered at first turn; restored Pods skip parsing
+/// because the saved session log replays a previously-rendered
+/// `system_prompt` verbatim.
+fn prepare_pod_common(
+    manifest: &PodManifest,
+    loader: &PromptLoader,
+    parse_template: bool,
+) -> Result<PodCommon, PodError> {
+    let pwd = current_pwd()?;
+    let scope = build_scope_with_memory(manifest, &pwd)?;
+    if !scope.is_readable(&pwd) {
+        return Err(PodError::PwdOutsideScope { pwd });
+    }
+
+    let client = provider::build_client(&manifest.model)?;
+    let prompts = PromptCatalog::load(loader, manifest.pod.prompt_pack.as_deref())?;
+
+    let system_prompt_template = if parse_template {
+        Some(
+            SystemPromptTemplate::parse(&manifest.worker.instruction, loader.clone())
+                .map_err(|source| PodError::InvalidSystemPromptTemplate { source })?,
+        )
+    } else {
+        None
+    };
+
+    Ok(PodCommon {
+        pwd,
+        scope,
+        client,
+        prompts,
+        system_prompt_template,
+    })
 }
 
 /// Build the Pod's runtime [`Scope`] from the manifest, layering the

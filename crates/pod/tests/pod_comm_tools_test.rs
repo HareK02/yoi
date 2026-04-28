@@ -351,6 +351,7 @@ async fn stop_pod_sends_shutdown_and_releases_scope() {
                 permission: Permission::Write,
                 recursive: true,
             }],
+            session_store::new_session_id(),
         )
         .unwrap();
         scope_lock::delegate_scope(

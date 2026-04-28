@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use fs4::fs_std::FileExt;
 use manifest::{Permission, ScopeRule, paths};
 use serde::{Deserialize, Serialize};
+use session_store::SessionId;
 
 /// On-disk representation of the allocation table.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -50,6 +51,12 @@ pub struct Allocation {
     /// Name of the Pod that delegated scope to this one, or `None` for
     /// a top-level Pod started directly by a human.
     pub delegated_from: Option<String>,
+    /// Session ID this Pod is currently writing to. `None` means this
+    /// is a pre-reservation made by a spawner via [`delegate_scope`]
+    /// before the child has come up; the child fills it in at
+    /// [`adopt_allocation`] time.
+    #[serde(default)]
+    pub session_id: Option<SessionId>,
 }
 
 impl LockFile {
@@ -59,6 +66,14 @@ impl LockFile {
 
     pub fn find_mut(&mut self, pod_name: &str) -> Option<&mut Allocation> {
         self.allocations.iter_mut().find(|a| a.pod_name == pod_name)
+    }
+
+    /// Find the allocation currently writing to `session_id`. Skips
+    /// pre-reservations whose `session_id` is still `None`.
+    pub fn find_by_session(&self, session_id: SessionId) -> Option<&Allocation> {
+        self.allocations
+            .iter()
+            .find(|a| a.session_id == Some(session_id))
     }
 }
 
@@ -294,6 +309,7 @@ pub fn register_pod(
     pid: u32,
     socket: PathBuf,
     scope_allow: Vec<ScopeRule>,
+    session_id: SessionId,
 ) -> Result<(), ScopeLockError> {
     reclaim_stale(guard);
     if guard.data().find(&pod_name).is_some() {
@@ -316,6 +332,7 @@ pub fn register_pod(
         socket,
         scope_allow,
         delegated_from: None,
+        session_id: Some(session_id),
     });
     guard.save()?;
     Ok(())
@@ -361,6 +378,9 @@ pub fn delegate_scope(
         socket,
         scope_allow,
         delegated_from: Some(spawner.into()),
+        // Pre-reservation. The child fills in its own session_id when
+        // it calls `adopt_allocation` after the worker is built.
+        session_id: None,
     });
     guard.save()?;
     Ok(())
@@ -483,10 +503,18 @@ pub fn install_top_level(
     pid: u32,
     socket: PathBuf,
     scope_allow: Vec<ScopeRule>,
+    session_id: SessionId,
 ) -> Result<ScopeAllocationGuard, ScopeLockError> {
     let lock_path = default_lock_path()?;
     let mut guard = LockFileGuard::open(&lock_path)?;
-    register_pod(&mut guard, pod_name.clone(), pid, socket, scope_allow)?;
+    register_pod(
+        &mut guard,
+        pod_name.clone(),
+        pid,
+        socket,
+        scope_allow,
+        session_id,
+    )?;
     Ok(ScopeAllocationGuard {
         pod_name,
         lock_path,
@@ -497,13 +525,15 @@ pub fn install_top_level(
 /// a spawning Pod.
 ///
 /// The spawning flow is two-stage: the spawner calls [`delegate_scope`]
-/// (with its own pid as a live placeholder), then exec's the child; the
-/// child, once running, calls this function to rewrite the allocation's
-/// pid to its own and claim the `ScopeAllocationGuard` so the entry is
-/// released when the child exits.
+/// (with its own pid as a live placeholder, `session_id = None`), then
+/// exec's the child; the child, once running, calls this function to
+/// rewrite the allocation's pid + session_id to its own and claim the
+/// `ScopeAllocationGuard` so the entry is released when the child
+/// exits.
 pub fn adopt_allocation(
     pod_name: String,
     new_pid: u32,
+    session_id: SessionId,
 ) -> Result<ScopeAllocationGuard, ScopeLockError> {
     let lock_path = default_lock_path()?;
     let mut guard = LockFileGuard::open(&lock_path)?;
@@ -512,11 +542,39 @@ pub fn adopt_allocation(
         .find_mut(&pod_name)
         .ok_or_else(|| ScopeLockError::UnknownPod(pod_name.clone()))?;
     alloc.pid = new_pid;
+    alloc.session_id = Some(session_id);
     guard.save()?;
     Ok(ScopeAllocationGuard {
         pod_name,
         lock_path,
     })
+}
+
+/// Information about a Pod that currently holds an allocation for a
+/// given session.
+#[derive(Debug, Clone)]
+pub struct SessionLockInfo {
+    pub pod_name: String,
+    pub socket: PathBuf,
+    pub pid: u32,
+}
+
+/// Open the default lock file, reclaim stale entries, and return the
+/// allocation currently writing to `session_id`, if any.
+///
+/// Used by `Pod::restore_from_manifest` to refuse a resume that would
+/// race a live writer on the same source session.
+pub fn lookup_session(session_id: SessionId) -> Result<Option<SessionLockInfo>, ScopeLockError> {
+    let lock_path = default_lock_path()?;
+    let mut guard = LockFileGuard::open(&lock_path)?;
+    reclaim_stale(&mut guard);
+    Ok(guard.data().find_by_session(session_id).map(|a| {
+        SessionLockInfo {
+            pod_name: a.pod_name.clone(),
+            socket: a.socket.clone(),
+            pid: a.pid,
+        }
+    }))
 }
 
 /// Errors raised by the mutating scope-lock operations.
@@ -548,6 +606,10 @@ mod tests {
     /// harness runs tests on multiple threads inside a single process,
     /// so env-var writes from one test would otherwise leak into a
     /// parallel test's `default_lock_path()` lookup.
+    fn sid() -> SessionId {
+        session_store::new_session_id()
+    }
+
     static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     /// Sandbox `INSOMNIA_RUNTIME_DIR` to a tempdir for the duration of
@@ -652,6 +714,7 @@ mod tests {
                 std::process::id(),
                 sock("a"),
                 vec![write_rule("/src", true)],
+                sid(),
             )
             .unwrap();
         }
@@ -699,6 +762,7 @@ mod tests {
             std::process::id(),
             sock("a"),
             vec![write_rule("/src", true)],
+            sid(),
         )
         .unwrap();
         let err = register_pod(
@@ -707,6 +771,7 @@ mod tests {
             std::process::id(),
             sock("b"),
             vec![write_rule("/src/core", true)],
+            sid(),
         )
         .unwrap_err();
         match err {
@@ -726,6 +791,7 @@ mod tests {
             std::process::id(),
             sock("a"),
             vec![write_rule("/src", true)],
+            sid(),
         )
         .unwrap();
         let err = register_pod(
@@ -734,6 +800,7 @@ mod tests {
             std::process::id(),
             sock("a2"),
             vec![write_rule("/docs", true)],
+            sid(),
         )
         .unwrap_err();
         assert!(matches!(err, ScopeLockError::DuplicatePodName(ref n) if n == "a"));
@@ -750,6 +817,7 @@ mod tests {
             std::process::id(),
             sock("a"),
             vec![write_rule("/src", true)],
+            sid(),
         )
         .unwrap();
         let err = delegate_scope(
@@ -775,6 +843,7 @@ mod tests {
             std::process::id(),
             sock("a"),
             vec![write_rule("/src", true)],
+            sid(),
         )
         .unwrap();
         delegate_scope(
@@ -812,6 +881,7 @@ mod tests {
             std::process::id(),
             sock("a"),
             vec![write_rule("/src", true)],
+            sid(),
         )
         .unwrap();
         delegate_scope(
@@ -848,6 +918,7 @@ mod tests {
             std::process::id(),
             sock("a"),
             vec![write_rule("/src", true)],
+            sid(),
         )
         .unwrap();
         delegate_scope(
@@ -886,6 +957,7 @@ mod tests {
             std::process::id(),
             sock("a"),
             vec![write_rule("/src", true)],
+            sid(),
         )
         .unwrap();
         delegate_scope(
@@ -939,6 +1011,7 @@ mod tests {
             std::process::id(),
             sock("a"),
             vec![write_rule("/src", true)],
+            sid(),
         )
         .unwrap();
         // B only reads under the same tree — allowed.
@@ -948,6 +1021,7 @@ mod tests {
             std::process::id(),
             sock("b"),
             vec![read_rule("/src", true)],
+            sid(),
         )
         .unwrap();
         assert_eq!(g.data().allocations.len(), 2);
@@ -964,6 +1038,7 @@ mod tests {
             std::process::id(),
             sock("a"),
             vec![write_rule("/src", true)],
+            sid(),
         )
         .unwrap();
         release_pod(&mut g, "a").unwrap();
@@ -973,6 +1048,7 @@ mod tests {
             std::process::id(),
             sock("b"),
             vec![write_rule("/src", true)],
+            sid(),
         )
         .unwrap();
     }
@@ -988,6 +1064,7 @@ mod tests {
             std::process::id(),
             sock("a"),
             vec![write_rule("/src", true)],
+            sid(),
         )
         .unwrap();
         delegate_scope(
@@ -1023,6 +1100,7 @@ mod tests {
             std::process::id(),
             sock("a"),
             vec![write_rule("/src", true)],
+            sid(),
         )
         .unwrap();
         {
@@ -1047,7 +1125,7 @@ mod tests {
             delegate_placeholder(&mut g, "child", std::process::id());
         }
         let child_pid = std::process::id().wrapping_add(1);
-        let guard = adopt_allocation("child".into(), child_pid).unwrap();
+        let guard = adopt_allocation("child".into(), child_pid, sid()).unwrap();
         {
             let g = LockFileGuard::open(&lock_path).unwrap();
             let alloc = g.data().find("child").unwrap();
@@ -1064,7 +1142,7 @@ mod tests {
     fn adopt_allocation_errors_on_unknown_pod() {
         let dir = TempDir::new().unwrap();
         let _sandbox = RuntimeDirSandbox::new(dir.path());
-        let err = adopt_allocation("ghost".into(), 42).unwrap_err();
+        let err = adopt_allocation("ghost".into(), 42, sid()).unwrap_err();
         assert!(matches!(err, ScopeLockError::UnknownPod(ref n) if n == "ghost"));
     }
 
@@ -1078,6 +1156,7 @@ mod tests {
             socket: sock(pod_name),
             scope_allow: vec![write_rule("/tmp/child", true)],
             delegated_from: None,
+            session_id: None,
         });
         g.save().unwrap();
     }
@@ -1093,6 +1172,7 @@ mod tests {
             std::process::id(),
             sock("a"),
             vec![write_rule("/src", true)],
+            sid(),
         )
         .unwrap();
         delegate_scope(
@@ -1112,6 +1192,7 @@ mod tests {
             std::process::id(),
             sock("x"),
             vec![write_rule("/src/core/x", true)],
+            sid(),
         )
         .unwrap_err();
         match err {
