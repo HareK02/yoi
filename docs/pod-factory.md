@@ -188,7 +188,7 @@ scheme 側が吸収する。
 | key | 型 | 既定 | 内容 |
 |---|---|---|---|
 | `instruction` | `String` | `$insomnia/default` | システムプロンプト本体として使う prompt asset 参照 |
-| `max_tokens` | `u32` | 未指定 | 1 request の最大出力 token。scheme が provider の該当 wire field に投影 |
+| `max_tokens` | `u32` | 未指定 | 1 request の最大出力 token。scheme が provider の該当 wire field に投影。scheme ごとのセマンティクス差は `docs/reasoning.md` |
 | `max_turns` | `NonZeroU32` | 未指定 | 1 run 内で Worker が進められる最大 turn 数 |
 | `temperature` | `f32` | 未指定 | sampling temperature |
 | `top_p` | `f32` | 未指定 | nucleus sampling |

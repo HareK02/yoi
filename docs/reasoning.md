@@ -67,6 +67,21 @@ ref = "gemini/gemini-2.5-pro"
 reasoning = -1
 ```
 
+## `max_tokens` との関係
+
+`[worker] max_tokens` は scheme ごとに wire field 名も意味論も異なる。reasoning モデルで併用するときは特に注意:
+
+| Provider / scheme | wire field | `max_tokens` の意味 |
+|---|---|---|
+| OpenAI Chat (`openai_chat`) | `max_completion_tokens`（Ollama 互換は legacy `max_tokens`） | reasoning tokens を **含む** 合計上限 |
+| OpenAI Responses (`openai_responses`) | `max_output_tokens` | reasoning tokens を **含む** 合計上限 |
+| Anthropic (`anthropic`) | `max_tokens`（必須） | thinking tokens を **含む** 合計上限 |
+| Gemini (`gemini`) | `generationConfig.maxOutputTokens` | visible のみ。thinking tokens は **別計上** |
+
+OpenAI / Anthropic で `max_tokens` を小さく取りつつ高 effort / 大 budget の reasoning を立てると、reasoning に枠を食われて visible output が空で返ることがある。Gemini は別計上なのでこの事故は起きない。
+
+codex-oauth (ChatGPT backend) 経路では `max_output_tokens` が `Unsupported parameter` で 400 を返すため、`openai_responses` scheme は `send_max_output_tokens=false` で wire に載せない。manifest に `max_tokens` を書いても黙って落ちるが、scheme の `validate_config` が `ConfigWarning` を返すので worker 起動時に通知される。
+
 ## 範囲外
 
 - UI プリセット（Low / Medium / High → 各 provider 値）の変換テーブル
