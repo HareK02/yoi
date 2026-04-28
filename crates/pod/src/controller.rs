@@ -142,6 +142,26 @@ impl PodController {
             });
 
             let tx = event_tx.clone();
+            worker.on_thinking_block(move |block| {
+                // Start fires unconditionally so the TUI can show
+                // "Thinking..." even when the provider doesn't emit
+                // plaintext deltas.
+                let _ = tx.send(Event::ThinkingStart);
+                let tx_d = tx.clone();
+                block.on_delta(move |text| {
+                    let _ = tx_d.send(Event::ThinkingDelta {
+                        text: text.to_owned(),
+                    });
+                });
+                let tx_s = tx.clone();
+                block.on_stop(move |text| {
+                    let _ = tx_s.send(Event::ThinkingDone {
+                        text: text.to_owned(),
+                    });
+                });
+            });
+
+            let tx = event_tx.clone();
             worker.on_tool_use_block(move |start, block| {
                 let _ = tx.send(Event::ToolCallStart {
                     id: start.id.clone(),

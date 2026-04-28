@@ -8,8 +8,8 @@ use tracing::{debug, info, trace, warn};
 use crate::{
     Item,
     callback::{
-        ClosureMetaHandler, ClosureTextBlockHandler, ClosureToolUseBlockHandler, TextBlockScope,
-        ToolUseBlockScope,
+        ClosureMetaHandler, ClosureTextBlockHandler, ClosureThinkingBlockHandler,
+        ClosureToolUseBlockHandler, TextBlockScope, ThinkingBlockScope, ToolUseBlockScope,
     },
     handler::{ErrorKind, StatusKind, ToolUseBlockStart, UsageKind},
     interceptor::{
@@ -235,6 +235,21 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
         self.timeline.on_text_block(ClosureTextBlockHandler {
             setup: Box::new(setup),
         });
+    }
+
+    /// Register a thinking block observer with scoped callbacks.
+    ///
+    /// Mirrors `on_text_block`. Some providers don't expose plaintext
+    /// reasoning content; in that case the block fires Start and Stop
+    /// with no Delta in between, and `on_stop` receives an empty string.
+    pub fn on_thinking_block(
+        &mut self,
+        setup: impl FnMut(&mut ThinkingBlockScope) + Send + Sync + 'static,
+    ) {
+        self.timeline
+            .on_thinking_block(ClosureThinkingBlockHandler {
+                setup: Box::new(setup),
+            });
     }
 
     /// Register a tool use block observer with scoped callbacks.

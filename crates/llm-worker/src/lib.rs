@@ -53,7 +53,7 @@ pub mod tool;
 pub mod tool_server;
 pub mod usage_record;
 
-pub use callback::{TextBlockScope, ToolUseBlockScope};
+pub use callback::{TextBlockScope, ThinkingBlockScope, ToolUseBlockScope};
 pub use handler::ToolUseBlockStart;
 pub use interceptor::Interceptor;
 pub use message::{ContentPart, Item, Message, Role};

@@ -178,6 +178,21 @@ pub enum Event {
     TextDone {
         text: String,
     },
+    /// A reasoning / thinking block has started.
+    ///
+    /// Always paired with a `ThinkingDone`. `ThinkingDelta` is optional:
+    /// some providers (or some configurations) emit thinking metadata
+    /// without plaintext, in which case Start → Done arrive with no
+    /// deltas in between. Multiple thinking blocks per turn are allowed.
+    ThinkingStart,
+    ThinkingDelta {
+        text: String,
+    },
+    /// Thinking block completed. `text` is the full accumulated body
+    /// (empty string when the provider didn't emit plaintext).
+    ThinkingDone {
+        text: String,
+    },
     ToolCallStart {
         id: String,
         name: String,
@@ -466,6 +481,34 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["event"], "text_delta");
         assert_eq!(parsed["data"]["text"], "Hello");
+    }
+
+    #[test]
+    fn event_thinking_roundtrip() {
+        for event in [
+            Event::ThinkingStart,
+            Event::ThinkingDelta {
+                text: "step 1".into(),
+            },
+            Event::ThinkingDone {
+                text: "step 1\nstep 2".into(),
+            },
+        ] {
+            let json = serde_json::to_string(&event).unwrap();
+            let decoded: Event = serde_json::from_str(&json).unwrap();
+            match (&event, &decoded) {
+                (Event::ThinkingStart, Event::ThinkingStart) => {}
+                (Event::ThinkingDelta { text: a }, Event::ThinkingDelta { text: b })
+                | (Event::ThinkingDone { text: a }, Event::ThinkingDone { text: b }) => {
+                    assert_eq!(a, b);
+                }
+                _ => panic!("variant mismatch: {event:?} vs {decoded:?}"),
+            }
+        }
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&Event::ThinkingStart).unwrap()).unwrap();
+        assert_eq!(parsed["event"], "thinking_start");
     }
 
     #[test]

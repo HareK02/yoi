@@ -23,7 +23,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use protocol::{AlertLevel, Greeting, Segment};
 
 use crate::app::{App, alert_source_label, fmt_tokens};
-use crate::block::{Block, CompactEvent};
+use crate::block::{Block, CompactEvent, ThinkingBlock, ThinkingState};
 
 /// Display density for the history view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -298,6 +298,7 @@ fn render_block_into(lines: &mut Vec<Line<'static>>, block: &Block, width: u16, 
             Mode::Overview => push_overview_line(lines, text, width, MessageKind::Assistant, ""),
             _ => push_padded_lines(lines, text, MessageKind::Assistant),
         },
+        Block::Thinking(t) => render_thinking(lines, t, width, mode),
         // ToolCall is dispatched in `compute_history` via `tool::render_tool`
         // so it can consume multiple adjacent blocks (Read aggregation).
         Block::ToolCall(_) => unreachable!("ToolCall handled by compute_history"),
@@ -541,6 +542,97 @@ fn count_visual_rows(text: &str, width: u16) -> usize {
     total.max(1)
 }
 
+fn render_thinking(lines: &mut Vec<Line<'static>>, t: &ThinkingBlock, width: u16, mode: Mode) {
+    let header_style = kind_style(MessageKind::Thinking);
+    let body_style = Style::default().fg(Color::DarkGray);
+
+    let header = match &t.state {
+        ThinkingState::Streaming { started_at } => {
+            let secs = started_at.elapsed().as_secs();
+            format!("Thinking... ({})", fmt_elapsed(secs))
+        }
+        ThinkingState::Finished { elapsed_secs } => match elapsed_secs {
+            Some(s) => format!("Thought for {}", fmt_elapsed(*s)),
+            None => "Thought".to_owned(),
+        },
+        ThinkingState::Incomplete { elapsed_secs } => match elapsed_secs {
+            Some(s) => format!("Thinking interrupted ({})", fmt_elapsed(*s)),
+            None => "Thinking interrupted".to_owned(),
+        },
+    };
+
+    if matches!(mode, Mode::Overview) {
+        push_overview_line(lines, &header, width, MessageKind::Thinking, "");
+        return;
+    }
+
+    lines.push(Line::from(Span::styled(header, header_style)));
+
+    if t.text.is_empty() {
+        return;
+    }
+
+    match mode {
+        Mode::Detail => {
+            for raw in t.text.lines() {
+                lines.push(Line::from(vec![
+                    Span::styled("  ", body_style),
+                    Span::styled(raw.to_owned(), body_style),
+                ]));
+            }
+        }
+        Mode::Normal => {
+            // Streaming: show the *latest* tail to keep the cursor of
+            // attention near where new tokens are appearing. Finished:
+            // show the first line as a static preview — collapsing it
+            // entirely would lose the only context most users want
+            // ("what was it thinking about").
+            let preview = match &t.state {
+                ThinkingState::Streaming { .. } => trailing_line_preview(&t.text),
+                _ => first_line_preview(&t.text),
+            };
+            if !preview.is_empty() {
+                let budget = width.saturating_sub(2) as usize;
+                let truncated = truncate_with_ellipsis(&preview, budget);
+                lines.push(Line::from(vec![
+                    Span::styled("  ", body_style),
+                    Span::styled(truncated, body_style),
+                ]));
+            }
+        }
+        Mode::Overview => unreachable!("handled above"),
+    }
+}
+
+/// Last segment of `text` after the final newline (or the whole string
+/// if it has no newline). Used as the live "what is it thinking now"
+/// 1-liner.
+fn trailing_line_preview(text: &str) -> String {
+    text.rsplit_once('\n')
+        .map(|(_, tail)| tail)
+        .unwrap_or(text)
+        .trim_end()
+        .to_owned()
+}
+
+/// First non-empty line of `text`. Used as the static preview after a
+/// thinking block finishes, mirroring the "first line + (+N lines)"
+/// idiom of the overview mode.
+fn first_line_preview(text: &str) -> String {
+    text.lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .to_owned()
+}
+
+fn fmt_elapsed(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    }
+}
+
 fn render_compact(lines: &mut Vec<Line<'static>>, evt: &CompactEvent, width: u16, mode: Mode) {
     let (text, kind) = match evt {
         CompactEvent::Start => ("[compact] starting".to_owned(), MessageKind::NoticeWarn),
@@ -745,6 +837,7 @@ pub enum MessageKind {
     TurnHeader,
     User,
     Assistant,
+    Thinking,
     TurnStats,
     NoticeWarn,
     NoticeError,
@@ -755,6 +848,9 @@ pub fn kind_style(kind: MessageKind) -> Style {
         MessageKind::TurnHeader => Style::default().fg(Color::DarkGray),
         MessageKind::User => Style::default().fg(Color::Green),
         MessageKind::Assistant => Style::default().fg(Color::White),
+        MessageKind::Thinking => Style::default()
+            .fg(Color::Magenta)
+            .add_modifier(Modifier::ITALIC),
         MessageKind::TurnStats => Style::default().fg(Color::DarkGray),
         MessageKind::NoticeWarn => Style::default()
             .fg(Color::Black)

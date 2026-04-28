@@ -7,6 +7,8 @@
 
 #![allow(dead_code)] // Phase 5 will consume `output` in detail mode.
 
+use std::time::Instant;
+
 use protocol::{AlertLevel, AlertSource, Greeting, Segment};
 
 pub enum Block {
@@ -20,6 +22,7 @@ pub enum Block {
     AssistantText {
         text: String,
     },
+    Thinking(ThinkingBlock),
     ToolCall(ToolCallBlock),
     Alert {
         level: AlertLevel,
@@ -32,6 +35,25 @@ pub enum Block {
         input_tokens: u64,
         output_tokens: u64,
     },
+}
+
+pub struct ThinkingBlock {
+    /// Accumulated reasoning body. Empty for providers that emit only
+    /// metadata (no plaintext deltas).
+    pub text: String,
+    pub state: ThinkingState,
+}
+
+pub enum ThinkingState {
+    /// Live block: actively streaming. `started_at` is `None` only for
+    /// blocks materialised from `Event::History`, which never enter the
+    /// streaming state.
+    Streaming { started_at: Instant },
+    /// Block ended cleanly with `ThinkingDone`.
+    Finished { elapsed_secs: Option<u64> },
+    /// `TurnEnd` arrived before `ThinkingDone`. Elapsed time is frozen
+    /// at the last observed instant.
+    Incomplete { elapsed_secs: Option<u64> },
 }
 
 pub enum CompactEvent {

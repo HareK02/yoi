@@ -1,6 +1,10 @@
+use std::time::Instant;
+
 use protocol::{AlertLevel, AlertSource, Event, Method, RunResult, Segment};
 
-use crate::block::{Block, CompactEvent, ToolCallBlock, ToolCallState};
+use crate::block::{
+    Block, CompactEvent, ThinkingBlock, ThinkingState, ToolCallBlock, ToolCallState,
+};
 use crate::cache::FileCache;
 use crate::input::InputBuffer;
 use crate::scroll::Scroll;
@@ -111,9 +115,40 @@ impl App {
             Event::TextDone { .. } => {
                 self.assistant_streaming = false;
             }
+            Event::ThinkingStart => {
+                self.assistant_streaming = false;
+                self.blocks.push(Block::Thinking(ThinkingBlock {
+                    text: String::new(),
+                    state: ThinkingState::Streaming {
+                        started_at: Instant::now(),
+                    },
+                }));
+            }
+            Event::ThinkingDelta { text } => {
+                if let Some(b) = self.last_streaming_thinking_mut() {
+                    b.text.push_str(&text);
+                }
+            }
+            Event::ThinkingDone { text } => {
+                if let Some(b) = self.last_streaming_thinking_mut() {
+                    if b.text.is_empty() {
+                        b.text = text;
+                    }
+                    let elapsed = match &b.state {
+                        ThinkingState::Streaming { started_at } => {
+                            Some(started_at.elapsed().as_secs())
+                        }
+                        _ => None,
+                    };
+                    b.state = ThinkingState::Finished {
+                        elapsed_secs: elapsed,
+                    };
+                }
+            }
             Event::TurnEnd { .. } => {
                 self.assistant_streaming = false;
                 self.mark_orphan_tool_calls_incomplete();
+                self.mark_orphan_thinking_incomplete();
                 self.current_tool = None;
             }
             Event::ToolCallStart { id, name } => {
@@ -272,6 +307,39 @@ impl App {
         self.assistant_streaming = true;
     }
 
+    /// Walk the most recently pushed blocks looking for a thinking
+    /// block that's still in `Streaming`. Stops at the current
+    /// `TurnHeader` to avoid latching onto a thinking block from a
+    /// previous turn after it was somehow left dangling.
+    fn last_streaming_thinking_mut(&mut self) -> Option<&mut ThinkingBlock> {
+        for b in self.blocks.iter_mut().rev() {
+            match b {
+                Block::Thinking(t) if matches!(t.state, ThinkingState::Streaming { .. }) => {
+                    return Some(t);
+                }
+                Block::TurnHeader { .. } => return None,
+                _ => continue,
+            }
+        }
+        None
+    }
+
+    fn mark_orphan_thinking_incomplete(&mut self) {
+        for b in self.blocks.iter_mut().rev() {
+            match b {
+                Block::Thinking(t) => {
+                    if let ThinkingState::Streaming { started_at } = t.state {
+                        t.state = ThinkingState::Incomplete {
+                            elapsed_secs: Some(started_at.elapsed().as_secs()),
+                        };
+                    }
+                }
+                Block::TurnHeader { .. } => break,
+                _ => {}
+            }
+        }
+    }
+
     fn find_tool_call_mut(&mut self, id: &str) -> Option<&mut ToolCallBlock> {
         for b in self.blocks.iter_mut().rev() {
             if let Block::ToolCall(tc) = b
@@ -394,6 +462,26 @@ impl App {
                         arguments,
                         state: ToolCallState::Executing,
                         edit_snapshot: None,
+                    }));
+                }
+                "reasoning" => {
+                    let text = item["text"].as_str().unwrap_or("").to_owned();
+                    let body = if text.is_empty() {
+                        item["summary"]
+                            .as_array()
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|v| v.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join("\n")
+                            })
+                            .unwrap_or_default()
+                    } else {
+                        text
+                    };
+                    self.blocks.push(Block::Thinking(ThinkingBlock {
+                        text: body,
+                        state: ThinkingState::Finished { elapsed_secs: None },
                     }));
                 }
                 "tool_result" => {

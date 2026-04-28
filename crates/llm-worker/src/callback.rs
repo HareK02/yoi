@@ -7,8 +7,8 @@
 use std::marker::PhantomData;
 
 use crate::handler::{
-    Handler, Kind, TextBlockEvent, TextBlockKind, ToolUseBlockEvent, ToolUseBlockKind,
-    ToolUseBlockStart,
+    Handler, Kind, TextBlockEvent, TextBlockKind, ThinkingBlockEvent, ThinkingBlockKind,
+    ToolUseBlockEvent, ToolUseBlockKind, ToolUseBlockStart,
 };
 use crate::tool::ToolCall;
 
@@ -87,6 +87,81 @@ impl Handler<TextBlockKind> for ClosureTextBlockHandler {
                 }
             }
             TextBlockEvent::Stop(_) => {
+                if let Some(f) = &mut scope.on_stop {
+                    f(&scope.buffer);
+                }
+            }
+        }
+    }
+}
+
+// =============================================================================
+// ThinkingBlock Closure Handler
+// =============================================================================
+
+/// Callback scope for a thinking block.
+///
+/// Mirrors `TextBlockScope`. Some providers (or some configurations)
+/// emit thinking metadata without plaintext deltas — in that case the
+/// block fires `Start` and `Stop` with no `Delta` in between, which is
+/// expected and not an error.
+pub struct ThinkingBlockScope {
+    pub(crate) on_delta: Option<Box<dyn FnMut(&str) + Send + Sync>>,
+    pub(crate) on_stop: Option<Box<dyn FnMut(&str) + Send + Sync>>,
+}
+
+impl ThinkingBlockScope {
+    fn new() -> Self {
+        Self {
+            on_delta: None,
+            on_stop: None,
+        }
+    }
+
+    /// Register a callback for each thinking text delta (streaming fragment).
+    pub fn on_delta(&mut self, f: impl FnMut(&str) + Send + Sync + 'static) {
+        self.on_delta = Some(Box::new(f));
+    }
+
+    /// Register a callback invoked when the block completes.
+    ///
+    /// Receives the full accumulated thinking text. May be empty when
+    /// the provider didn't emit any plaintext deltas.
+    pub fn on_stop(&mut self, f: impl FnMut(&str) + Send + Sync + 'static) {
+        self.on_stop = Some(Box::new(f));
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct ThinkingBlockClosureState {
+    on_delta: Option<Box<dyn FnMut(&str) + Send + Sync>>,
+    on_stop: Option<Box<dyn FnMut(&str) + Send + Sync>>,
+    buffer: String,
+}
+
+pub(crate) struct ClosureThinkingBlockHandler {
+    pub(crate) setup: Box<dyn FnMut(&mut ThinkingBlockScope) + Send + Sync>,
+}
+
+impl Handler<ThinkingBlockKind> for ClosureThinkingBlockHandler {
+    type Scope = ThinkingBlockClosureState;
+
+    fn on_event(&mut self, scope: &mut Self::Scope, event: &ThinkingBlockEvent) {
+        match event {
+            ThinkingBlockEvent::Start(_) => {
+                scope.buffer.clear();
+                let mut builder = ThinkingBlockScope::new();
+                (self.setup)(&mut builder);
+                scope.on_delta = builder.on_delta;
+                scope.on_stop = builder.on_stop;
+            }
+            ThinkingBlockEvent::Delta(text) => {
+                scope.buffer.push_str(text);
+                if let Some(f) = &mut scope.on_delta {
+                    f(text);
+                }
+            }
+            ThinkingBlockEvent::Stop(_) => {
                 if let Some(f) = &mut scope.on_stop {
                     f(&scope.buffer);
                 }
