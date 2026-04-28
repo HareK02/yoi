@@ -10,10 +10,17 @@ TUI には既に新規 Pod 起動用の spawn UI があるため、同じよう�
 
 ### 起動導線
 
-- TUI の起動時 UI に「新規 Pod を起動」と並ぶ選択肢として「既存セッションから復帰」を用意する
-- 復帰フローは現在の spawn UI と同様に alt-screen 内で完結し、選択後は復元された Pod に attach して通常のチャット画面へ遷移する
-- 直接起動用に、Pod CLI に session id を指定して復元起動するフラグを追加する（例: `pod --session <UUID>`）
-- TUI 復帰フローは最終的にこの Pod CLI 復元起動経路を使う
+- TUI の既存挙動は維持する:
+  - `tui`（引数なし）: 新規 Pod spawn。現在と同じ name 入力ダイアログから始める
+  - `tui <pod-name>`: 生存中 Pod への attach
+- 既存 session 復帰用に `tui -r` / `tui --resume` を追加する
+  - `--resume` はユーザー向けの「過去 session から復帰」入口であり、protocol の `Method::Resume`（Paused turn の続行）とは別概念として扱う
+  - `--resume` 指定時のみ、現在の name 入力ダイアログの前段に session 選択プロンプトを表示する
+- session id を直接指定するショートカットとして `tui --session <UUID>` を追加する
+  - `--session` は session picker をスキップし、指定 session を復元対象にした name 入力ダイアログから始める
+  - `--resume` と `--session` は併用不可
+- 直接起動用に、Pod CLI に session id を指定して復元起動するフラグを追加する（`pod --session <UUID>`）
+- TUI の `--resume` / `--session` 復帰フローは最終的にこの Pod CLI 復元起動経路を使う
 
 ### セッション一覧
 
@@ -41,15 +48,23 @@ TUI には既に新規 Pod 起動用の spawn UI があるため、同じよう�
 
 ### UI / 操作
 
-- 上下キーで session を選択し、Enter で復帰、Esc / Ctrl-C でキャンセルできる
+- `tui -r` / `tui --resume` では、name 入力の前に session picker を表示する
+- session picker は上下キーで session を選択し、Enter で決定、Esc / Ctrl-C でキャンセルできる
 - session が多い場合でも使えるよう、最低限のスクロールを備える
+- session 決定後は既存の name 入力ダイアログを再利用する
+  - 入力する name は、復元された session を載せる新しい Pod 実行インスタンス名（runtime dir / socket 名）
+  - default name は現行と同じ cwd 由来でよい
+  - 表示上は `Resume Pod` / `session: <short-id>` のように、新規 spawn ではなく復帰であることを明示する
+- `tui --session <UUID>` では session picker を省略し、指定 session を対象にした name 入力ダイアログから始める
 - 将来的な検索フィルタ追加を妨げない state 構造にするが、本チケットでは必須にしない
-- 復帰に失敗した場合、alt-screen 内にエラーを表示し、一覧へ戻るか終了できる
+- 復帰に失敗した場合、inline / alt-screen 内にエラーを表示し、一覧へ戻るか終了できる
 
 ## 完了条件
 
-- `pod --session <UUID>` 相当の CLI で既存 session から Pod を起動できる
-- TUI の起動導線から既存 session 一覧を表示し、選択した session を復元した Pod に attach できる
+- `pod --session <UUID>` で既存 session から Pod を起動できる
+- `tui -r` / `tui --resume` で既存 session 一覧を表示し、選択した session を復元対象にできる
+- `tui --session <UUID>` で session picker を経由せず、指定 session の復帰 name 入力へ進める
+- 復帰フローでは session 選択後または `--session` 指定後に name 入力ダイアログが表示され、その name の Pod として起動・attach できる
 - 復元直後の TUI に過去履歴が表示される
 - 復元後に新しい入力を送ると、既存履歴に続く turn として動作し、session log に追記される
 - interrupted / paused 状態の session では、復元直後に Resume 導線が動作する
