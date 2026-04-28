@@ -163,6 +163,20 @@ pub enum LogEntry {
         cache_write_tokens: u64,
         output_tokens: u64,
     },
+
+    /// 汎用拡張点。ドメイン名で名前空間を切って任意 JSON を載せる。
+    /// session-store は payload を不透明扱いし、replay 時は
+    /// `RestoredState.extensions` に `(domain, payload)` を順に積むだけ。
+    /// 各ドメイン側が自前で fold して最新値を取り出す前提。
+    ///
+    /// 想定用途: memory subsystem の Phase 1 処理境界 pointer 等、
+    /// 「session 寿命に縛りたいが session-store の型を汚したくない」
+    /// メタデータ。
+    Extension {
+        ts: u64,
+        domain: String,
+        payload: serde_json::Value,
+    },
 }
 
 /// Provenance reference to a parent session.
@@ -204,6 +218,9 @@ pub struct RestoredState {
     /// `LogEntry::LlmUsage` を replay して時系列順に積まれる。
     /// 任意位置のトークン数推定に使う。
     pub usage_history: Vec<UsageRecord>,
+    /// `LogEntry::Extension` を replay 順に積んだもの。`(domain, payload)`。
+    /// session-store は domain を不透明扱いし、各ドメインが自前で fold する。
+    pub extensions: Vec<(String, serde_json::Value)>,
 }
 
 /// LLM リクエスト送信時点での占有量スナップショット。
@@ -234,6 +251,7 @@ pub fn collect_state(entries: &[HashedEntry]) -> RestoredState {
         last_run_interrupted: false,
         head_hash: None,
         usage_history: Vec::new(),
+        extensions: Vec::new(),
     };
 
     for hashed in entries {
@@ -294,6 +312,11 @@ pub fn collect_state(entries: &[HashedEntry]) -> RestoredState {
                     cache_write_tokens: *cache_write_tokens,
                     output_tokens: *output_tokens,
                 });
+            }
+            LogEntry::Extension {
+                domain, payload, ..
+            } => {
+                state.extensions.push((domain.clone(), payload.clone()));
             }
         }
     }
@@ -615,6 +638,65 @@ mod tests {
                 assert_eq!(output_tokens, 42);
             }
             other => panic!("expected LlmUsage, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn replay_extension_collects_domain_payload_pairs() {
+        let entries = build_chain(&[
+            LogEntry::SessionStart {
+                ts: 1000,
+                system_prompt: None,
+                config: RequestConfig::default(),
+                history: vec![],
+                forked_from: None,
+                compacted_from: None,
+            },
+            LogEntry::Extension {
+                ts: 2000,
+                domain: "memory.extract".to_string(),
+                payload: serde_json::json!({ "processed_through_entry": 7 }),
+            },
+            LogEntry::Extension {
+                ts: 3000,
+                domain: "memory.extract".to_string(),
+                payload: serde_json::json!({ "processed_through_entry": 12 }),
+            },
+            LogEntry::Extension {
+                ts: 4000,
+                domain: "other.domain".to_string(),
+                payload: serde_json::json!({ "x": 1 }),
+            },
+        ]);
+        let state = collect_state(&entries);
+        // 順序保持で全件積まれる。fold は呼び出し側の責務。
+        assert_eq!(state.extensions.len(), 3);
+        assert_eq!(state.extensions[0].0, "memory.extract");
+        assert_eq!(state.extensions[1].1["processed_through_entry"], 12);
+        assert_eq!(state.extensions[2].0, "other.domain");
+    }
+
+    #[test]
+    fn extension_entry_round_trip_via_json() {
+        let entry = LogEntry::Extension {
+            ts: 9999,
+            domain: "memory.extract".to_string(),
+            payload: serde_json::json!({ "a": 1, "b": "two" }),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let parsed: LogEntry = serde_json::from_str(&json).unwrap();
+        match parsed {
+            LogEntry::Extension {
+                ts,
+                domain,
+                payload,
+            } => {
+                assert_eq!(ts, 9999);
+                assert_eq!(domain, "memory.extract");
+                assert_eq!(payload["a"], 1);
+                assert_eq!(payload["b"], "two");
+            }
+            other => panic!("expected Extension, got {:?}", other),
         }
     }
 

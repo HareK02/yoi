@@ -10,15 +10,29 @@ Pod を立てずに既存 compact と同じ Worker spawn 機構を再利用す�
 
 ### Trigger
 
-- activity tokens 累積閾値（設定ファイルで tune）
+- activity tokens 累積閾値（設定ファイルで tune）。input tokens cumulative since last pointer を使う
 - tool call カウントは不採用（ツールカスタマイズ非依存・大小重みづけのため）
+- 発火点は Pod の post-run hook で、**compact より前** に走らせる（compact は history を組み替えるため、extract の入力範囲を安定させたい）
 
 ### 実行主体と入出力
 
 - 既存 compact の Worker spawn 機構を再利用、Pod は立てない
-- 入力: 前回 Phase 1 以降の session log 範囲（処理済み境界 pointer は session 側に保持、寿命を session と揃える）
+- 入力: 前回 Phase 1 以降の session log 範囲
 - 出力 JSON schema: `decisions`, `discussions`, `attempts`, `requests` の候補配列。抽出対象なしは空配列
 - 出力に自由文の補足説明を入れさせない（schema 準拠のみ）
+
+### 処理境界の pointer 永続化
+
+- pointer は session log に書き、寿命を session と揃える
+- session-store のドメイン純度を保つため、汎用拡張点 `LogEntry::Extension { domain: String, payload: serde_json::Value }` を **本チケットで session-store に新設**し、`domain = "memory.extract"` で payload に `{ processed_through_entry: usize, staging_id: String }` を載せる
+- `RestoredState` には `extensions: Vec<(String, serde_json::Value)>` 形で raw 集積し、memory crate 側が `domain` で fold して最新 pointer を取り出す（session-store は memory のことを知らない）
+
+### 並走防止 (Phase 1 同士)
+
+- Pod 上の `extract_in_flight: AtomicBool` で in-flight 中の新規 trigger を skip
+- 完了時点で閾値再評価し、超過していれば直ちに次回を発火（新 pointer 以降の最大範囲を回収）
+- pending 状態は別途保持しない（完了時の再評価で coalesce 相当が自然に成立）
+- Phase 2 の進行状況ファイルとは別物（こちらは別チケット範囲外）
 
 ### 書き込み
 
@@ -29,6 +43,7 @@ Pod を立てずに既存 compact と同じ Worker spawn 機構を再利用す�
 ### モデル
 
 - 設定 key `memory.extract_model`（軽量だが文脈理解できる中堅クラス想定）
+- 副次設定: `memory.extract_threshold`（input tokens 累積閾値、未設定で disable）、`memory.extract_worker_max_input_tokens`（extract worker 自身の input cap）
 
 ### prompt
 
@@ -39,6 +54,7 @@ Pod を立てずに既存 compact と同じ Worker spawn 機構を再利用す�
 - Phase 2 による staging の消費・クリーンアップ（別チケット）
 - staging の cleanup 戦略の詳細（Phase 2 で完了時に消す、実行中追加分は残す、という契約だけ本チケットで守る）
 - compact Worker spawn 機構自体の拡張（既存をそのまま使う。共通化が必要になったら別途）
+- Phase 2 並走防止ファイル（別チケット）
 
 ## 完了条件
 

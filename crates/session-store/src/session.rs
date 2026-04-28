@@ -326,6 +326,31 @@ pub async fn save_cache_unlocked(
     .await
 }
 
+/// Log an `Extension` entry — domain-tagged opaque payload.
+///
+/// session-store treats `payload` as an unstructured `serde_json::Value`.
+/// Each domain is responsible for serializing into and folding out of it.
+/// Use `RestoredState.extensions` to read entries back at restore time.
+pub async fn save_extension(
+    store: &impl Store,
+    session_id: SessionId,
+    head_hash: &mut Option<EntryHash>,
+    domain: impl Into<String>,
+    payload: serde_json::Value,
+) -> Result<(), StoreError> {
+    append_entry(
+        store,
+        session_id,
+        head_hash,
+        LogEntry::Extension {
+            ts: session_log::now_millis(),
+            domain: domain.into(),
+            payload,
+        },
+    )
+    .await
+}
+
 /// Log a `ConfigChanged` entry.
 pub async fn save_config_changed(
     store: &impl Store,

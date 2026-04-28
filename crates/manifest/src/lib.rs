@@ -49,6 +49,10 @@ pub struct PodManifest {
 /// Memory subsystem configuration. Presence in the manifest enables
 /// memory; the workspace root defaults to the Pod's pwd unless an
 /// explicit override is given.
+///
+/// All fields are `Option`; defaults are applied at the consumer
+/// (`.unwrap_or(defaults::...)`). This keeps cascade `merge` simple
+/// (`upper.x.or(self.x)`) without a separate partial/resolved split.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MemoryConfig {
     /// Override for the workspace root. When `None`, the Pod's pwd
@@ -64,6 +68,23 @@ pub struct MemoryConfig {
     /// Ignored when the request omits `query`. `None` ⇒ tool default (3).
     #[serde(default)]
     pub query_excerpt_lines: Option<usize>,
+    /// Optional model for the Phase 1 (extract) worker. When `None`,
+    /// the main pod model is cloned via `clone_boxed()`. Lightweight
+    /// reasoning-capable models (Haiku / 4o-mini / Flash class) are
+    /// recommended.
+    #[serde(default)]
+    pub extract_model: Option<ModelManifest>,
+    /// Cumulative input-token threshold (since the last extract pointer)
+    /// that triggers a Phase 1 extract. `None` disables Phase 1
+    /// entirely; memory tools and resident injection still work, only
+    /// the auto-extract trigger is dormant.
+    #[serde(default)]
+    pub extract_threshold: Option<u64>,
+    /// Cumulative input-token cap for the extract worker's own LLM
+    /// calls. Exceeding this aborts the extract run. `None` ⇒
+    /// [`defaults::MEMORY_EXTRACT_WORKER_MAX_INPUT_TOKENS`].
+    #[serde(default)]
+    pub extract_worker_max_input_tokens: Option<u64>,
 }
 
 /// Pod metadata.

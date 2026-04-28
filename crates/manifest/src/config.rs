@@ -212,6 +212,11 @@ impl MemoryConfig {
             workspace_root: upper.workspace_root.or(self.workspace_root),
             query_result_limit: upper.query_result_limit.or(self.query_result_limit),
             query_excerpt_lines: upper.query_excerpt_lines.or(self.query_excerpt_lines),
+            extract_model: upper.extract_model.or(self.extract_model),
+            extract_threshold: upper.extract_threshold.or(self.extract_threshold),
+            extract_worker_max_input_tokens: upper
+                .extract_worker_max_input_tokens
+                .or(self.extract_worker_max_input_tokens),
         }
     }
 }

@@ -7,6 +7,7 @@
 //! denying them at the Scope level when memory is enabled.
 
 pub mod error;
+pub mod extract;
 pub mod linter;
 pub mod resident;
 pub mod schema;
@@ -16,6 +17,7 @@ pub mod tool;
 pub mod workspace;
 
 pub use error::{LintError, LintWarning, MemoryError};
+pub use extract::ExtractPointerPayload;
 pub use linter::{LintReport, Linter};
 pub use resident::{ResidentKnowledgeEntry, collect_resident_knowledge};
 pub use scope::deny_write_rules;

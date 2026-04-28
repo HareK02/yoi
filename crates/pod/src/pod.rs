@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use llm_worker::Item;
@@ -124,6 +125,17 @@ pub struct Pod<C: LlmClient, St: Store> {
     /// Phase 2 (consolidation) workers set this to false so the
     /// agentic worker pulls knowledge through the search tools instead.
     inject_resident_knowledge: bool,
+    /// Phase 1 (memory.extract) reentry guard. `true` while an extract
+    /// worker is running; subsequent triggers are skipped per spec
+    /// (`docs/plan/memory.md` §Phase 1 並走防止). `Arc<AtomicBool>` so
+    /// the flag survives across `try_post_run_extract` calls without a
+    /// `&mut self` race.
+    extract_in_flight: Arc<AtomicBool>,
+    /// Last completed Phase 1 boundary. `None` means no extract has
+    /// run yet on this session — next extract starts from entry 0.
+    /// Restored from `RestoredState.extensions` on `restore`, updated
+    /// after each successful extract via `save_extension`.
+    extract_pointer: Mutex<Option<memory::ExtractPointerPayload>>,
 }
 
 impl<C: LlmClient, St: Store> Pod<C, St> {
@@ -171,6 +183,8 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             callback_socket: None,
             prompts,
             inject_resident_knowledge: true,
+            extract_in_flight: Arc::new(AtomicBool::new(false)),
+            extract_pointer: Mutex::new(None),
         };
         pod.apply_prune_from_manifest();
         Ok(pod)
@@ -237,6 +251,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         }
 
         let prompts = PromptCatalog::builtins_only()?;
+        let extract_pointer = memory::extract::fold_pointer(&state.extensions);
         let mut pod = Self {
             manifest,
             worker: Some(worker),
@@ -259,6 +274,8 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             callback_socket: None,
             prompts,
             inject_resident_knowledge: true,
+            extract_in_flight: Arc::new(AtomicBool::new(false)),
+            extract_pointer: Mutex::new(extract_pointer),
         };
         pod.apply_prune_from_manifest();
         Ok(pod)
@@ -1213,6 +1230,256 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         let worker = self.worker.as_ref().expect("worker taken during run");
         Ok(worker.client().clone_boxed())
     }
+
+    /// Build the LlmClient for the Phase 1 (memory.extract) Worker.
+    ///
+    /// Uses `memory.extract_model` from manifest if set, otherwise clones
+    /// the main client.
+    fn build_extractor_client(
+        &self,
+        memory_cfg: &manifest::MemoryConfig,
+    ) -> Result<Box<dyn LlmClient>, PodError> {
+        if let Some(ref m) = memory_cfg.extract_model {
+            let client = provider::build_client(m)?;
+            return Ok(client);
+        }
+        let worker = self.worker.as_ref().expect("worker taken during run");
+        Ok(worker.client().clone_boxed())
+    }
+
+    /// Cumulative `input_total_tokens` of usage records added after the
+    /// item-count boundary `history_len_pointer`. Used by Phase 1 trigger.
+    ///
+    /// `history_len_pointer == 0` means "everything so far".
+    fn cumulative_input_tokens_since(&self, history_len_pointer: usize) -> u64 {
+        self.usage_history
+            .lock()
+            .expect("usage_history poisoned")
+            .iter()
+            .filter(|r| r.history_len > history_len_pointer)
+            .map(|r| r.input_total_tokens)
+            .sum()
+    }
+
+    /// Phase 1 (memory.extract) post-run trigger.
+    ///
+    /// Called by the Controller **before** [`try_post_run_compact`] so
+    /// the extract worker sees a stable session-log entry range
+    /// (compact rewrites history). Best-effort: failures are logged but
+    /// not propagated.
+    ///
+    /// Behaviour follows `docs/plan/memory.md` §Phase 1 並走防止:
+    /// in-flight 中の trigger は skip し、完了時点で閾値再評価する
+    /// (the loop below). Pending state is not retained — the
+    /// re-evaluation happens naturally because the in-memory pointer
+    /// has advanced.
+    pub async fn try_post_run_extract(&mut self) -> Result<(), PodError> {
+        let Some(memory_cfg) = self.manifest.memory.clone() else {
+            return Ok(());
+        };
+        let Some(threshold) = memory_cfg.extract_threshold else {
+            return Ok(());
+        };
+
+        loop {
+            // CAS the in-flight flag. If another task is already running
+            // an extract for this Pod, skip per spec.
+            if self
+                .extract_in_flight
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return Ok(());
+            }
+            let result = self.run_extract_once(&memory_cfg, threshold).await;
+            self.extract_in_flight.store(false, Ordering::Release);
+
+            match result {
+                Ok(ExtractDecision::Skipped) => return Ok(()),
+                Ok(ExtractDecision::Completed) => {
+                    // Re-evaluate threshold against the newly advanced
+                    // pointer. In the current synchronous architecture
+                    // this normally exits via Skipped on the next pass,
+                    // but the loop is forward-looking for the case
+                    // where new activity piles up while extract runs.
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Phase 1 extract failed");
+                    self.alert(
+                        AlertLevel::Warn,
+                        AlertSource::Pod,
+                        format!("memory Phase 1 extract failed: {e}"),
+                    );
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    /// Single extract iteration: snapshot pointer, decide whether to
+    /// fire, run the worker if so, persist results and the new pointer.
+    async fn run_extract_once(
+        &mut self,
+        memory_cfg: &manifest::MemoryConfig,
+        threshold: u64,
+    ) -> Result<ExtractDecision, PodError> {
+        use memory::extract;
+
+        let pointer_snapshot = self
+            .extract_pointer
+            .lock()
+            .expect("extract_pointer poisoned")
+            .clone();
+        let processed_history_len = pointer_snapshot
+            .as_ref()
+            .map(|p| p.processed_through_history_len)
+            .unwrap_or(0);
+
+        let tokens_since = self.cumulative_input_tokens_since(processed_history_len);
+        if tokens_since < threshold {
+            return Ok(ExtractDecision::Skipped);
+        }
+
+        let current_history_len = self.worker.as_ref().expect("worker present").history().len();
+        if current_history_len <= processed_history_len {
+            return Ok(ExtractDecision::Skipped);
+        }
+
+        // Read the session log to get the current entry count. This is
+        // the boundary for the source.range end_entry. Called once per
+        // extract, on a small local file.
+        let entries_now = self.store.read_all(self.session_id).await?.len();
+        if entries_now == 0 {
+            return Ok(ExtractDecision::Skipped);
+        }
+        let end_entry = entries_now - 1;
+        let start_entry = pointer_snapshot
+            .as_ref()
+            .map(|p| p.processed_through_entry + 1)
+            .unwrap_or(0);
+        if start_entry > end_entry {
+            return Ok(ExtractDecision::Skipped);
+        }
+
+        let items_to_extract = self
+            .worker
+            .as_ref()
+            .expect("worker present")
+            .history()[processed_history_len..current_history_len]
+            .to_vec();
+
+        let layout = memory::WorkspaceLayout::resolve(memory_cfg, &self.pwd);
+        let cap = memory_cfg
+            .extract_worker_max_input_tokens
+            .unwrap_or(manifest::defaults::MEMORY_EXTRACT_WORKER_MAX_INPUT_TOKENS);
+
+        let client = self.build_extractor_client(memory_cfg)?;
+        let mut extract_worker = Worker::new(client)
+            .system_prompt(extract::EXTRACT_SYSTEM_PROMPT)
+            .temperature(0.0);
+        extract_worker.set_max_tokens(4096);
+
+        // Cumulative input-token meter + interceptor (mirror of
+        // CompactWorkerInterceptor). Aborts the extract worker if its
+        // own input usage crosses the cap.
+        let input_so_far = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        {
+            let acc = input_so_far.clone();
+            extract_worker.on_usage(move |event| {
+                if let Some(tokens) = event.input_tokens {
+                    acc.fetch_add(tokens, Ordering::Relaxed);
+                }
+            });
+        }
+        extract_worker.set_interceptor(MemoryExtractWorkerInterceptor {
+            input_so_far: input_so_far.clone(),
+            max_input_tokens: cap,
+        });
+
+        let ctx = Arc::new(extract::ExtractWorkerContext::new());
+        extract_worker.register_tool(extract::write_extracted_tool(ctx.clone()));
+
+        let input_text = extract::build_extract_input(&items_to_extract);
+        extract_worker.run(input_text).await.map_err(PodError::Worker)?;
+
+        let payload = ctx.take_payload().unwrap_or_else(|| {
+            tracing::warn!(
+                "Phase 1 extract worker did not call write_extracted; \
+                 advancing pointer with empty payload"
+            );
+            extract::ExtractedPayload::default()
+        });
+
+        let staging_id = if payload.is_empty() {
+            String::new()
+        } else {
+            let source = memory::schema::SourceRef {
+                session_id: self.session_id.to_string(),
+                range: [start_entry as u64, end_entry as u64],
+            };
+            let (id, _) = extract::write_staging(&layout, source, payload)
+                .map_err(PodError::ExtractStaging)?;
+            id.to_string()
+        };
+
+        let pointer_payload = extract::ExtractPointerPayload {
+            processed_through_entry: end_entry,
+            processed_through_history_len: current_history_len,
+            staging_id,
+        };
+        let payload_value = serde_json::to_value(&pointer_payload)
+            .expect("ExtractPointerPayload is always JSON-serializable");
+        session_store::save_extension(
+            &self.store,
+            self.session_id,
+            &mut self.head_hash,
+            extract::EXTRACT_DOMAIN,
+            payload_value,
+        )
+        .await?;
+
+        *self
+            .extract_pointer
+            .lock()
+            .expect("extract_pointer poisoned") = Some(pointer_payload);
+
+        Ok(ExtractDecision::Completed)
+    }
+}
+
+/// Outcome of a single Phase 1 extract iteration. Internal to
+/// `try_post_run_extract` / `run_extract_once`.
+enum ExtractDecision {
+    /// Threshold not reached, or no items to extract.
+    Skipped,
+    /// Extract ran and pointer advanced. Caller re-evaluates threshold.
+    Completed,
+}
+
+/// Pre-request interceptor for the Phase 1 extract worker. Aborts when
+/// cumulative input tokens cross `max_input_tokens`. Mirror of
+/// `compact::worker::CompactWorkerInterceptor`; kept separate so each
+/// subsystem can tune its own message and budget.
+struct MemoryExtractWorkerInterceptor {
+    input_so_far: Arc<std::sync::atomic::AtomicU64>,
+    max_input_tokens: u64,
+}
+
+#[async_trait]
+impl llm_worker::interceptor::Interceptor for MemoryExtractWorkerInterceptor {
+    async fn pre_llm_request(
+        &self,
+        _context: &mut Vec<Item>,
+    ) -> llm_worker::interceptor::PreRequestAction {
+        if self.input_so_far.load(Ordering::Relaxed) > self.max_input_tokens {
+            return llm_worker::interceptor::PreRequestAction::Cancel(format!(
+                "Phase 1 extract worker input exceeded {} tokens",
+                self.max_input_tokens
+            ));
+        }
+        llm_worker::interceptor::PreRequestAction::Continue
+    }
 }
 
 impl<St: Store> Pod<Box<dyn LlmClient>, St> {
@@ -1296,6 +1563,8 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             callback_socket: None,
             prompts,
             inject_resident_knowledge: true,
+            extract_in_flight: Arc::new(AtomicBool::new(false)),
+            extract_pointer: Mutex::new(None),
         };
         pod.apply_prune_from_manifest();
         Ok(pod)
@@ -1360,6 +1629,8 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             callback_socket: Some(callback_socket),
             prompts,
             inject_resident_knowledge: true,
+            extract_in_flight: Arc::new(AtomicBool::new(false)),
+            extract_pointer: Mutex::new(None),
         };
         pod.apply_prune_from_manifest();
         Ok(pod)
@@ -1555,6 +1826,9 @@ pub enum PodError {
 
     #[error(transparent)]
     PromptCatalog(#[from] CatalogError),
+
+    #[error("memory Phase 1 staging write failed: {0}")]
+    ExtractStaging(#[source] memory::extract::StagingError),
 }
 
 /// Build the Pod's runtime [`Scope`] from the manifest, layering the

@@ -120,9 +120,9 @@ Workflow 保護は専用 tool schema のトリックではなく Linter ルー�
 
 #### Phase 1: 活動抽出
 
-- **Trigger**: activity tokens の累積閾値。tool call カウントは不採用（ツールカスタマイズ非依存・大小重みづけのため）
+- **Trigger**: activity tokens の累積閾値（cumulative input tokens since last pointer）。tool call カウントは不採用（ツールカスタマイズ非依存・大小重みづけのため）
 - **実行主体**: 既存 compact と同じ Worker spawn 機構を再利用。Pod は立てない
-- **入力**: 前回 Phase 1 以降の session log 範囲。処理済み境界の pointer は session 側に保持（寿命を session と揃える）
+- **入力**: 前回 Phase 1 以降の session log 範囲。処理済み境界の pointer は session log 側に保持し、寿命を session と揃える。session-store のドメイン純度を保つため、汎用拡張点 `LogEntry::Extension { domain, payload }`（domain = `"memory.extract"`）に寄せ、session-store は memory ドメインを知らない
 - **出力**: JSON schema で**活動ログ**の候補配列を返す。Knowledge 等の派生物は Phase 2 が活動ログから導出するので、Phase 1 では純粋な「起きたこと」に絞る
   - `decisions`: 判断したこと（選択肢 + 選んだ + 根拠）
   - `discussions`: 議論したこと（トピック + 論点）
@@ -132,6 +132,8 @@ Workflow 保護は専用 tool schema のトリックではなく Linter ルー�
 - **書き込み先**: `memory/_staging/<id>.json`
   - LLM 出力（活動ログ JSON）は pod 側ラッパーが `source: { session_id, range: [start_entry, end_entry] }` を**機械付与**して wrap。LLM には source を推論させない
 - **モデル**: `memory.extract_model`。軽量だが文脈理解できる中堅クラス（Haiku / 4o-mini / Flash 相当）を想定
+- **Compact との順序**: 同一 turn 完了後の post-run チェックで Phase 1 を **compact より前** に走らせる。compact は history を組み替えるので、extract の入力範囲（session log 上の entry index）は compact 前のほうが安定する
+- **並走防止 (Phase 1 同士)**: Pod 上の `extract_in_flight` フラグで in-flight 中の新規 trigger を skip。完了時点で閾値超過していれば直ちに次回を発火し、新 pointer 以降の最大範囲を回収する（pending 状態は保持しない＝完了時の閾値再評価で coalesce 相当の挙動を成立させる）
 
 #### Phase 2: 永続化への統合
 

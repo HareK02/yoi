@@ -332,6 +332,14 @@ impl PodController {
                         .await;
 
                         if new_status == PodStatus::Idle {
+                            if let Err(e) = pod.try_post_run_extract().await {
+                                tracing::warn!(error = %e, "Post-run memory extract error");
+                                alerter.alert(
+                                    AlertLevel::Warn,
+                                    AlertSource::Pod,
+                                    format!("post-run memory extract error: {e}"),
+                                );
+                            }
                             if let Err(e) = pod.try_post_run_compact().await {
                                 tracing::warn!(error = %e, "Post-run compaction error");
                                 alerter.alert(
@@ -382,6 +390,14 @@ impl PodController {
                         .await;
 
                         if new_status == PodStatus::Idle {
+                            if let Err(e) = pod.try_post_run_extract().await {
+                                tracing::warn!(error = %e, "Post-run memory extract error");
+                                alerter.alert(
+                                    AlertLevel::Warn,
+                                    AlertSource::Pod,
+                                    format!("post-run memory extract error: {e}"),
+                                );
+                            }
                             if let Err(e) = pod.try_post_run_compact().await {
                                 tracing::warn!(error = %e, "Post-run compaction error");
                                 alerter.alert(
@@ -429,6 +445,14 @@ impl PodController {
                         .await;
 
                         if new_status == PodStatus::Idle {
+                            if let Err(e) = pod.try_post_run_extract().await {
+                                tracing::warn!(error = %e, "Post-run memory extract error");
+                                alerter.alert(
+                                    AlertLevel::Warn,
+                                    AlertSource::Pod,
+                                    format!("post-run memory extract error: {e}"),
+                                );
+                            }
                             if let Err(e) = pod.try_post_run_compact().await {
                                 tracing::warn!(error = %e, "Post-run compaction error");
                                 alerter.alert(
@@ -518,6 +542,14 @@ impl PodController {
                             .await;
 
                             if new_status == PodStatus::Idle {
+                                if let Err(e) = pod.try_post_run_extract().await {
+                                    tracing::warn!(error = %e, "Post-run memory extract error");
+                                    alerter.alert(
+                                        AlertLevel::Warn,
+                                        AlertSource::Pod,
+                                        format!("post-run memory extract error: {e}"),
+                                    );
+                                }
                                 if let Err(e) = pod.try_post_run_compact().await {
                                     tracing::warn!(error = %e, "Post-run compaction error");
                                     alerter.alert(
