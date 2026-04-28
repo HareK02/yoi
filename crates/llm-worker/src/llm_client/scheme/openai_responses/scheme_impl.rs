@@ -3,8 +3,9 @@
 use serde_json::Value;
 
 use crate::llm_client::{
-    ClientError, auth::AuthRequirement, capability::ModelCapability, event::Event, scheme::Scheme,
-    types::Request,
+    ClientError, auth::AuthRequirement, capability::ModelCapability,
+    client::ConfigWarning, event::Event, scheme::Scheme,
+    types::{Request, RequestConfig},
 };
 
 use super::OpenAIResponsesScheme;
@@ -50,5 +51,19 @@ impl Scheme for OpenAIResponsesScheme {
 
     fn default_capability(&self) -> ModelCapability {
         super::capability::default_capability()
+    }
+
+    fn validate_config(&self, config: &RequestConfig) -> Vec<ConfigWarning> {
+        let mut warnings = Vec::new();
+        // ChatGPT backend (codex-oauth) は `max_output_tokens` を 400 で弾く。
+        // scheme 構築時に `send_max_output_tokens=false` で組まれていれば
+        // body 投影は止まっているので、ユーザの意図が落ちることだけを通知する。
+        if !self.send_max_output_tokens && config.max_tokens.is_some() {
+            warnings.push(ConfigWarning::unsupported(
+                "max_tokens",
+                "OpenAI Responses (ChatGPT backend)",
+            ));
+        }
+        warnings
     }
 }

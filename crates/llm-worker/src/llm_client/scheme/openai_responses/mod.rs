@@ -16,11 +16,12 @@ pub use scheme_impl::OpenAIResponsesState;
 
 /// OpenAI Responses scheme 本体。
 ///
-/// `store` / `include_encrypted_content` は scheme 固定の wire 設定で、
-/// デフォルトは stateless + ZDR 相当 (`store=false`, `include=[...]`)。
-/// 将来 ZDR 非対応環境で `store=true` にしたくなった場合に限り override
-/// する。`ModelCapability` には入れない（これはモデルの能力ではなく、
-/// クライアントの運用方針）。
+/// `store` / `include_encrypted_content` / `send_max_output_tokens` は
+/// scheme 固定の wire 設定で、デフォルトは公式 OpenAI Responses API
+/// 向け (stateless + ZDR + `max_output_tokens` 送出可)。ChatGPT backend
+/// (codex-oauth) のように受理パラメータが subset の経路では provider 層で
+/// `send_max_output_tokens=false` 等に上書きする。`ModelCapability` には
+/// 入れない（モデル能力ではなく wire policy）。
 #[derive(Debug, Clone)]
 pub struct OpenAIResponsesScheme {
     /// サーバ側に response を保存するか。ZDR/stateless 運用では `false`。
@@ -28,6 +29,10 @@ pub struct OpenAIResponsesScheme {
     /// `include: ["reasoning.encrypted_content"]` を付けるか。
     /// `store=false` で reasoning を使うなら必須。
     pub include_encrypted_content: bool,
+    /// `max_output_tokens` を body に載せるか。公式 OpenAI Responses API は
+    /// 受理するが、ChatGPT backend (codex-oauth) は `Unsupported parameter`
+    /// で 400 を返すため、その経路では `false` にする。
+    pub send_max_output_tokens: bool,
 }
 
 impl Default for OpenAIResponsesScheme {
@@ -35,12 +40,14 @@ impl Default for OpenAIResponsesScheme {
         Self {
             store: false,
             include_encrypted_content: true,
+            send_max_output_tokens: true,
         }
     }
 }
 
 impl OpenAIResponsesScheme {
-    /// デフォルト設定 (`store=false`, `include=["reasoning.encrypted_content"]`)。
+    /// デフォルト設定 (`store=false`, `include=["reasoning.encrypted_content"]`,
+    /// `send_max_output_tokens=true`)。
     pub fn new() -> Self {
         Self::default()
     }
@@ -54,6 +61,12 @@ impl OpenAIResponsesScheme {
     /// `include: ["reasoning.encrypted_content"]` の有無を上書き。
     pub fn with_include_encrypted_content(mut self, include: bool) -> Self {
         self.include_encrypted_content = include;
+        self
+    }
+
+    /// `max_output_tokens` を body に載せるかを上書き。
+    pub fn with_send_max_output_tokens(mut self, send: bool) -> Self {
+        self.send_max_output_tokens = send;
         self
     }
 }

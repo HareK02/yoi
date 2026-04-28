@@ -38,6 +38,9 @@ pub(crate) struct ResponsesRequest {
     /// `["reasoning.encrypted_content"]` 等。
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub include: Vec<&'static str>,
+    /// 公式 OpenAI Responses API では受理されるが、ChatGPT backend
+    /// (codex-oauth) は 400 で弾く。scheme の `send_max_output_tokens`
+    /// が `false` のときは `None` のまま送る (skip_serializing_if で除外)。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -195,7 +198,11 @@ impl OpenAIResponsesScheme {
             store: self.store,
             stream: true,
             include,
-            max_output_tokens: request.config.max_tokens,
+            max_output_tokens: if self.send_max_output_tokens {
+                request.config.max_tokens
+            } else {
+                None
+            },
             temperature: request.config.temperature,
             top_p: request.config.top_p,
         }
@@ -444,11 +451,24 @@ mod tests {
     }
 
     #[test]
-    fn max_output_tokens_passed_through() {
+    fn max_output_tokens_passed_through_by_default() {
         let scheme = OpenAIResponsesScheme::new();
         let req = Request::new().user("hi").max_tokens(100);
         let body = scheme.build_request("gpt-5", &req, &cap_with_reasoning());
         assert_eq!(body.max_output_tokens, Some(100));
+    }
+
+    #[test]
+    fn max_output_tokens_dropped_when_send_disabled() {
+        let scheme = OpenAIResponsesScheme::new().with_send_max_output_tokens(false);
+        let req = Request::new().user("hi").max_tokens(100);
+        let body = scheme.build_request("gpt-5", &req, &cap_with_reasoning());
+        assert_eq!(body.max_output_tokens, None);
+        let json = serde_json::to_value(&body).unwrap();
+        assert!(
+            json.get("max_output_tokens").is_none(),
+            "max_output_tokens key must not appear in serialised body, got: {json}"
+        );
     }
 
     #[test]

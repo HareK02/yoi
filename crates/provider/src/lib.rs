@@ -142,7 +142,12 @@ fn build_from_config(config: &ModelConfig) -> Result<Box<dyn LlmClient>, Provide
         SchemeKind::OpenaiChat => build_transport(OpenAIScheme::new(), config, resolved),
         SchemeKind::Gemini => build_transport(GeminiScheme::new(), config, resolved),
         SchemeKind::OpenaiResponses => {
-            build_transport(OpenAIResponsesScheme::new(), config, resolved)
+            // ChatGPT backend (codex-oauth) は `max_output_tokens` を
+            // 400 で弾くため、その経路では送出を止める。
+            let scheme = OpenAIResponsesScheme::new().with_send_max_output_tokens(
+                !matches!(config.auth, AuthRef::CodexOAuth),
+            );
+            build_transport(scheme, config, resolved)
         }
     }
 }
