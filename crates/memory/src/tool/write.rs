@@ -149,7 +149,7 @@ mod tests {
     #[tokio::test]
     async fn write_creates_summary() {
         let (dir, layout) = setup();
-        let path = dir.path().join("memory/summary.md");
+        let path = dir.path().join(".insomnia/memory/summary.md");
         let content = format!("---\nupdated_at: {n}\n---\nbody\n", n = now());
 
         let (meta, tool) = write_tool(layout)();
@@ -187,7 +187,7 @@ mod tests {
     #[tokio::test]
     async fn write_update_existing() {
         let (dir, layout) = setup();
-        let path = dir.path().join("memory/decisions/foo.md");
+        let path = dir.path().join(".insomnia/memory/decisions/foo.md");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let initial = format!(
             "---\ncreated_at: {n}\nupdated_at: {n}\nsources: []\nstatus: open\n---\nold\n",
@@ -220,7 +220,7 @@ mod tests {
     #[tokio::test]
     async fn write_does_not_persist_on_lint_failure() {
         let (dir, layout) = setup();
-        let path = dir.path().join("memory/decisions/foo.md");
+        let path = dir.path().join(".insomnia/memory/decisions/foo.md");
         let bad = "no frontmatter at all";
         let (_, tool) = write_tool(layout)();
         let inp = serde_json::json!({

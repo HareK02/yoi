@@ -144,7 +144,7 @@ mod tests {
     #[tokio::test]
     async fn read_decision_by_slug() {
         let (dir, layout) = setup();
-        let path = dir.path().join("memory/decisions/foo.md");
+        let path = dir.path().join(".insomnia/memory/decisions/foo.md");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "alpha\nbeta\n").unwrap();
 
@@ -159,7 +159,7 @@ mod tests {
     #[tokio::test]
     async fn read_summary_without_slug() {
         let (dir, layout) = setup();
-        let path = dir.path().join("memory/summary.md");
+        let path = dir.path().join(".insomnia/memory/summary.md");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "summary body\n").unwrap();
 
@@ -199,7 +199,7 @@ mod tests {
     #[tokio::test]
     async fn knowledge_path_resolution() {
         let (dir, layout) = setup();
-        let path = dir.path().join("knowledge/policy.md");
+        let path = dir.path().join(".insomnia/knowledge/policy.md");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "k\n").unwrap();
 

@@ -84,7 +84,7 @@ mod tests {
         model_invokation: bool,
         body: &str,
     ) {
-        let path = dir.join("knowledge").join(format!("{slug}.md"));
+        let path = dir.join(".insomnia/knowledge").join(format!("{slug}.md"));
         let content = format!(
             "---\ncreated_at: {n}\nupdated_at: {n}\nkind: policy\ndescription: \"{description}\"\nmodel_invokation: {flag}\nuser_invocable: true\nlast_sources: []\n---\n{body}",
             n = now(),
@@ -95,7 +95,7 @@ mod tests {
 
     fn setup() -> (TempDir, WorkspaceLayout) {
         let dir = TempDir::new().unwrap();
-        std::fs::create_dir_all(dir.path().join("knowledge")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".insomnia/knowledge")).unwrap();
         let layout = WorkspaceLayout::new(dir.path().to_path_buf());
         (dir, layout)
     }
@@ -141,7 +141,7 @@ mod tests {
         write_knowledge(dir.path(), "good", "ok", true, "");
         // Garbage in frontmatter — must be skipped, not panic.
         std::fs::write(
-            dir.path().join("knowledge/bad.md"),
+            dir.path().join(".insomnia/knowledge/bad.md"),
             "---\nthis is not yaml: : :\n---\nbody\n",
         )
         .unwrap();
@@ -155,7 +155,7 @@ mod tests {
     fn non_md_files_ignored() {
         let (dir, layout) = setup();
         write_knowledge(dir.path(), "good", "ok", true, "");
-        std::fs::write(dir.path().join("knowledge/note.txt"), "not markdown\n").unwrap();
+        std::fs::write(dir.path().join(".insomnia/knowledge/note.txt"), "not markdown\n").unwrap();
 
         let got = collect_resident_knowledge(&layout);
         assert_eq!(got.len(), 1);

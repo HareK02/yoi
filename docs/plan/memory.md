@@ -14,6 +14,8 @@ Workflow（`/<slug>` で呼び出される制約付き作業フロー）は別 p
 
 ### 記録対象の 4 種
 
+本ドキュメント以下のパスはすべて **`<workspace_root>/.insomnia/`** からの相対表記。`.insomnia/` は manifest / prompts と同じく workspace に紐付く insomnia コンテンツのルートで、memory もこの規約に従う。`workspace_root` 既定は Pod の pwd。
+
 | 種別             | パス                         | 備考                                                                                        |
 | ---------------- | ---------------------------- | ------------------------------------------------------------------------------------------- |
 | Always-on サマリ | `memory/summary.md`          | 1-5k tokens 目安                                                                            |
