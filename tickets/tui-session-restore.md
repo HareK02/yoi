@@ -36,13 +36,12 @@ TUI には既に新規 Pod 起動用の spawn UI があるため、同じよう�
 
 ### 復元 Pod の構築
 
-復元時はソース session を直接書き継がず、**fork** して新しい session を起こす。
+復元 Pod はソース session の **同じ session_id** を引き継ぎ、以降の turn を同じ jsonl に追記する。fork は行わない。
 
-- `session_store::fork_at(source_session_id, source_head_hash)` で新しい session を作成する。新 session の `SessionStart` には全履歴と `forked_from = SessionOrigin { source_session_id, source_head_hash }` を載せる。
-- Pod は新 session_id 上で動作し、ソース session の jsonl は不変のまま残る。
-- これにより同一 session への同時書き込みは構造的に発生しない。
+- 同一 session への同時書き込みは `scope.lock` の `session_id` で構造的に防止する（次節）ので、resume 時にあえて新しい session を起こす必要はない。fork すると `SessionStart` だけが入った空に近い session が picker に積み上がるため不適切。
 - manifest / scope / tool 登録 / prompt loader は、通常の新規 Pod 起動と同じ現在の cascade 解決結果を使う。
 - Worker の会話履歴・system prompt・request config・turn count・usage history 等は `session_store::restore` で得た `RestoredState` を使う。`system_prompt` は session に保存された値をそのまま使い、`SystemPromptTemplate` の再レンダリングはしない。
+- `head_hash` は `RestoredState.head_hash` をそのまま採用し、次回の append が正しい hash chain で繋がる。
 - 復元起動時、runtime の `history.json` / `status.json` / `Event::History` で TUI が初期履歴を正しく再構築できる。
 - 復元された session が interrupted / paused 相当の状態を持つ場合、起動直後に `Resume` 可能な状態として扱う。通常終了済みなら `Idle` として新しい入力を受け付ける。
 
@@ -82,12 +81,12 @@ TUI には既に新規 Pod 起動用の spawn UI があるため、同じよう�
 
 ## 完了条件
 
-- `pod --session <UUID>` で既存 session から Pod を起動でき、ソース session jsonl は不変のまま新しい fork session が作られる
+- `pod --session <UUID>` で既存 session から Pod を起動でき、以降の turn は同じ jsonl に追記される（fork 由来の空 session は生成されない）
 - `tui -r` / `tui --resume` で直近 10 件の既存 session 一覧を表示し、選択した session を復元対象にできる
 - `tui --session <UUID>` で session picker を経由せず、指定 session の復帰 name 入力へ進める
 - 復帰フローでは session 選択後または `--session` 指定後に name 入力ダイアログが表示され、その name の Pod として起動・attach できる
 - 復元直後の TUI に過去履歴が表示される
-- 復元後に新しい入力を送ると、既存履歴に続く turn として動作し、新しい fork session の jsonl に追記される
+- 復元後に新しい入力を送ると、既存履歴に続く turn として動作し、ソース session の jsonl にそのまま追記される
 - interrupted / paused 状態の session では、復元直後に Resume 導線が動作する
 - 同一 source session に対する live Pod が存在する場合、復元起動はエラーで終了し、既存 Pod の `pod_name` / socket がメッセージに表示される
 - `scope.lock` には各 Pod の `session_id` が記録される
@@ -95,8 +94,9 @@ TUI には既に新規 Pod 起動用の spawn UI があるため、同じよう�
 ## 範囲外
 
 - session log の全文検索 UI
-- compact 前後の session chain / fork チェーンを 1 つの論理スレッドとして束ねる UI
+- compact 前後の session chain を 1 つの論理スレッドとして束ねる UI
 - 過去 session の編集・削除・名前付け
 - spawn された子 Pod / scope delegation ツリー全体の復元
 - 別マシンから転送された session store の import UI
 - `tui` での picker 復帰や自動 attach 切替（live セッション選択時はエラー終了）
+- 任意位置からの fork 起動（`fork_at` を resume 経路に組み込まない。将来別フローとして扱う）

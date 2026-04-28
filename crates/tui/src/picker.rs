@@ -102,15 +102,39 @@ pub async fn run() -> Result<PickerOutcome, PickerError> {
                 }
             }
             Some(Action::Submit) => {
-                drop(terminal);
+                close_viewport(&mut terminal)?;
                 return Ok(PickerOutcome::Picked(rows[selected].id));
             }
             Some(Action::Cancel) => {
-                drop(terminal);
+                close_viewport(&mut terminal)?;
                 return Ok(PickerOutcome::Cancelled);
             }
         }
     }
+}
+
+/// Park the cursor at the very bottom of the picker's inline viewport
+/// and emit one newline before dropping the terminal. Without this the
+/// inline area is left with the cursor still inside it, so the next
+/// `Terminal::with_options(Inline(_))` call (the resume name dialog)
+/// computes its own area starting from inside the picker — drawing the
+/// new dialog on top of the lower picker rows.
+///
+/// Setting the cursor to `area.bottom() - 1` and writing `\r\n`
+/// scrolls the terminal up exactly one row, so the next inline
+/// viewport opens immediately below the picker rather than on top of
+/// it.
+fn close_viewport(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+) -> io::Result<()> {
+    let area = terminal.get_frame().area();
+    let last_row = area.bottom().saturating_sub(1);
+    terminal.set_cursor_position((0, last_row))?;
+    use std::io::Write;
+    let mut out = io::stdout();
+    out.write_all(b"\r\n")?;
+    out.flush()?;
+    Ok(())
 }
 
 async fn open_default_store() -> Result<FsStore, PickerError> {

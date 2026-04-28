@@ -1581,45 +1581,40 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
     /// Restore a Pod from an existing session log.
     ///
     /// Resolves the manifest cascade exactly like [`Self::from_manifest`]
-    /// (pwd / scope / scope-lock / client / prompt catalog), then forks
-    /// the source session at its current head and seeds a fresh Worker
-    /// from the resulting `RestoredState`. The Pod writes to the new
-    /// fork session's jsonl; the source session's log is left intact.
+    /// (pwd / scope / scope-lock / client / prompt catalog), seeds a
+    /// fresh Worker from the source session's `RestoredState`, and
+    /// reuses the same `session_id` so subsequent turns append to the
+    /// source jsonl as a continuation of the same conversation.
     ///
-    /// Refuses to resume if another live Pod is currently writing to
-    /// `source_session_id` (detected via `scope.lock`).
+    /// Concurrent writers are prevented by the `scope.lock` registry:
+    /// the registration carries `session_id`, and this constructor
+    /// refuses to start when `scope_lock::lookup_session` already finds
+    /// a live Pod writing to `session_id`. So there is no need to fork —
+    /// resume is "the same session, a different process owning it".
     ///
     /// `system_prompt` is replayed verbatim from the session log —
     /// templates are not re-rendered on restore so a long-running
     /// session keeps a stable cache prefix even when the manifest's
     /// instruction template would render differently today.
     pub async fn restore_from_manifest(
-        source_session_id: SessionId,
+        session_id: SessionId,
         manifest: PodManifest,
         store: St,
         loader: PromptLoader,
     ) -> Result<Self, PodError> {
         // Refuse to resume into a session that's already being written.
-        if let Some(info) = scope_lock::lookup_session(source_session_id)? {
+        if let Some(info) = scope_lock::lookup_session(session_id)? {
             return Err(PodError::SessionInUse {
-                session_id: source_session_id,
+                session_id,
                 pod_name: info.pod_name,
                 socket: info.socket,
             });
         }
 
-        // Read the source state, then fork it into a fresh session id.
-        // The fork's SessionStart captures the full history with
-        // `forked_from` provenance pointing back to the source, so the
-        // source jsonl stays untouched and double-write races are
-        // impossible by construction.
-        let state = session_store::restore(&store, source_session_id).await?;
-        let Some(source_head) = state.head_hash.clone() else {
-            return Err(PodError::SessionEmpty {
-                session_id: source_session_id,
-            });
-        };
-        let session_id = session_store::fork_at(&store, source_session_id, &source_head).await?;
+        let state = session_store::restore(&store, session_id).await?;
+        if state.head_hash.is_none() {
+            return Err(PodError::SessionEmpty { session_id });
+        }
 
         let common = prepare_pod_common(&manifest, &loader, /* parse_template */ false)?;
 
@@ -1663,26 +1658,12 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
 
         let extract_pointer = memory::extract::fold_pointer(&state.extensions);
 
-        // The fork's SessionStart hash is the new head. We could
-        // recompute it by reading the new session log, but
-        // `session_store::fork_at` already returns the new session_id
-        // and we know the chain starts fresh. The next `save_delta`
-        // call will read head from store before appending, so leaving
-        // `head_hash = None` here is safe but less efficient — we
-        // refresh from the store to avoid a chain refresh on first
-        // append.
-        let head_hash = store
-            .read_head_hash(session_id)
-            .await
-            .ok()
-            .flatten();
-
         let mut pod = Self {
             manifest,
             worker: Some(worker),
             store,
             session_id,
-            head_hash,
+            head_hash: state.head_hash,
             pwd: common.pwd,
             scope: common.scope,
             hook_builder: HookRegistryBuilder::new(),
