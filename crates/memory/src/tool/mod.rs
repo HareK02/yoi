@@ -6,8 +6,8 @@
 //! that pair feeds straight into Read / Edit.
 
 mod edit;
+mod query;
 mod read;
-mod search;
 mod write;
 
 use std::path::PathBuf;
@@ -19,8 +19,8 @@ use crate::slug::Slug;
 use crate::workspace::{RecordKind, WorkspaceLayout};
 
 pub use edit::edit_tool;
+pub use query::{QueryConfig, knowledge_query_tool, memory_query_tool};
 pub use read::read_tool;
-pub use search::{SearchConfig, knowledge_search_tool, memory_search_tool};
 pub use write::write_tool;
 
 /// Kinds the memory tools accept as input. `Workflow` is intentionally

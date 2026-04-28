@@ -74,45 +74,15 @@ impl PodController {
         let (event_tx, _) = broadcast::channel::<Event>(256);
         let alerter = Alerter::new(event_tx.clone());
 
-        let manifest_toml = toml::to_string_pretty(pod.manifest()).unwrap_or_default();
-        let greeting = build_greeting(&pod);
-        let shared_state = Arc::new(PodSharedState::new(
-            pod.manifest().pod.name.clone(),
-            pod.session_id(),
-            manifest_toml.clone(),
-            greeting,
-        ));
+        // Runtime directory is created before tool registration because
+        // the spawn-tool factories need its socket path, and before the
+        // initial status/history writes because those writes consume the
+        // greeting we build after registration is complete.
+        let runtime_dir =
+            Arc::new(RuntimeDir::create(runtime_base, &pod.manifest().pod.name).await?);
 
-        // Create runtime directory and write initial files
-        let runtime_dir = RuntimeDir::create(runtime_base, &pod.manifest().pod.name).await?;
-        runtime_dir.write_manifest(&manifest_toml).await?;
-        runtime_dir.write_status(&shared_state).await?;
-        runtime_dir.write_history(&shared_state).await?;
-        let runtime_dir = Arc::new(runtime_dir);
-
-        let handle = PodHandle {
-            method_tx,
-            event_tx: event_tx.clone(),
-            shared_state: shared_state.clone(),
-            runtime_dir: runtime_dir.clone(),
-            alerter: alerter.clone(),
-        };
-
-        // Hand the alerter to the Pod so internal operations (compaction,
-        // AGENTS.md ingestion during the first turn) can emit user-facing
-        // notifications on the same channel.
-        pod.attach_alerter(alerter.clone());
-        // Also hand the raw broadcast sender so Pod-internal operations
-        // can emit typed lifecycle `Event`s (currently: compact progress).
-        pod.attach_event_tx(event_tx.clone());
-
-        // Start socket server (lives as a background task, cleaned up on drop via RuntimeDir)
-        let _socket_server = SocketServer::start(&handle).await?;
-        // Keep the server alive by moving it into the controller task
-        // (it will be dropped when the task ends)
-
-        // Grab the scope/pwd before the mutable borrow of the worker so we
-        // can build a `ScopedFs` for the builtin tools.
+        // Snapshot pod-immutable values needed for tool factories so the
+        // mutable worker borrow below doesn't conflict with reads on `pod`.
         let scope_for_tools = pod.scope().clone();
         let pwd_for_tools = pod.pwd().to_path_buf();
         let spawner_name = pod.manifest().pod.name.clone();
@@ -129,6 +99,14 @@ impl PodController {
         // above the worker-borrow block.
         let spawner_socket = runtime_dir.socket_path();
         let spawned_registry = SpawnedPodRegistry::new(runtime_dir.clone());
+
+        // Hand the alerter to the Pod so internal operations (compaction,
+        // AGENTS.md ingestion during the first turn) can emit user-facing
+        // notifications on the same channel.
+        pod.attach_alerter(alerter.clone());
+        // Also hand the raw broadcast sender so Pod-internal operations
+        // can emit typed lifecycle `Event`s (currently: compact progress).
+        pod.attach_event_tx(event_tx.clone());
 
         // Register event bridge callbacks on the worker
         {
@@ -238,12 +216,12 @@ impl PodController {
             // already applied during `Pod::from_manifest`.
             if let Some(mem) = memory_config.as_ref() {
                 let layout = memory::WorkspaceLayout::resolve(mem, &pwd_for_tools);
-                let search_cfg = memory::tool::SearchConfig::from(mem);
+                let query_cfg = memory::tool::QueryConfig::from(mem);
                 worker.register_tool(memory::tool::read_tool(layout.clone()));
                 worker.register_tool(memory::tool::write_tool(layout.clone()));
                 worker.register_tool(memory::tool::edit_tool(layout.clone()));
-                worker.register_tool(memory::tool::memory_search_tool(layout.clone(), search_cfg));
-                worker.register_tool(memory::tool::knowledge_search_tool(layout, search_cfg));
+                worker.register_tool(memory::tool::memory_query_tool(layout.clone(), query_cfg));
+                worker.register_tool(memory::tool::knowledge_query_tool(layout, query_cfg));
             }
 
             // Pod-orchestration tools (SpawnPod + the four comm tools)
@@ -264,6 +242,36 @@ impl PodController {
             worker.register_tool(list_pods_tool(spawned_registry.clone()));
             pod.attach_tracker(tracker);
         }
+
+        // Materialise pending tool factories so the greeting reflects
+        // the actual registered set instead of a hand-maintained mirror.
+        pod.worker().tool_server_handle().flush_pending();
+
+        // Greeting + initial runtime files now that the tool list is final.
+        let manifest_toml = toml::to_string_pretty(pod.manifest()).unwrap_or_default();
+        let greeting = build_greeting(&pod);
+        let shared_state = Arc::new(PodSharedState::new(
+            pod.manifest().pod.name.clone(),
+            pod.session_id(),
+            manifest_toml.clone(),
+            greeting,
+        ));
+        runtime_dir.write_manifest(&manifest_toml).await?;
+        runtime_dir.write_status(&shared_state).await?;
+        runtime_dir.write_history(&shared_state).await?;
+
+        let handle = PodHandle {
+            method_tx,
+            event_tx: event_tx.clone(),
+            shared_state: shared_state.clone(),
+            runtime_dir: runtime_dir.clone(),
+            alerter: alerter.clone(),
+        };
+
+        // Start socket server (lives as a background task, cleaned up on
+        // drop via RuntimeDir). Kept alive by moving it into the
+        // controller task so it drops when that task ends.
+        let _socket_server = SocketServer::start(&handle).await?;
 
         // Clone cancel sender and notification buffer before moving pod
         // into the controller task so the main loop can route
@@ -719,28 +727,16 @@ where
                 .unwrap_or_default(),
         ),
     };
-    // The tool list mirrors what `spawn()` registers on the Worker:
-    // builtin filesystem tools plus the pod-orchestration tools.
-    // Orchestration tools are appended by name because constructing
-    // their factories here would require Pod-lifetime handles we
-    // haven't built yet (runtime_dir, socket).
-    let fs = tools::ScopedFs::new(pod.scope().clone(), pod.pwd().to_path_buf());
-    let tracker = tools::Tracker::new();
-    let mut tool_names: Vec<String> = tools::builtin_tools(fs, tracker)
-        .iter()
-        .map(|def| def().0.name)
+    // Tool list reflects whatever `spawn()` ended up registering on the
+    // Worker. Caller must have flushed pending factories first; without
+    // a flush the tool table is empty and this returns an empty vec.
+    let tool_names: Vec<String> = pod
+        .worker()
+        .tool_server_handle()
+        .tool_definitions_sorted()
+        .into_iter()
+        .map(|def| def.name)
         .collect();
-    tool_names.extend(
-        [
-            "SpawnPod",
-            "SendToPod",
-            "ReadPodOutput",
-            "StopPod",
-            "ListPods",
-        ]
-        .iter()
-        .map(|s| (*s).into()),
-    );
     protocol::Greeting {
         pod_name: manifest.pod.name.clone(),
         cwd: pod.pwd().display().to_string(),

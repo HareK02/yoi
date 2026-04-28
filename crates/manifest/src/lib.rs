@@ -56,14 +56,14 @@ pub struct MemoryConfig {
     /// absolute path.
     #[serde(default)]
     pub workspace_root: Option<PathBuf>,
-    /// Maximum number of hits returned by `MemorySearch` /
-    /// `KnowledgeSearch`. `None` ⇒ tool default (20).
+    /// Maximum number of records returned by `MemoryQuery` /
+    /// `KnowledgeQuery` per call. `None` ⇒ tool default (20).
     #[serde(default)]
-    pub search_hit_limit: Option<usize>,
-    /// Lines of context before and after each match in search excerpts.
-    /// `None` ⇒ tool default (3).
+    pub query_result_limit: Option<usize>,
+    /// Lines of context before and after each match in query excerpts.
+    /// Ignored when the request omits `query`. `None` ⇒ tool default (3).
     #[serde(default)]
-    pub search_excerpt_lines: Option<usize>,
+    pub query_excerpt_lines: Option<usize>,
 }
 
 /// Pod metadata.
