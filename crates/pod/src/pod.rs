@@ -1231,9 +1231,10 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         // session has a fresh log with no `LogEntry::Extension` entries
         // yet, so a cold restore here would set extract_pointer to None
         // via fold_pointer. The in-memory pointer must match — otherwise
-        // `cumulative_input_tokens_since(old_history_len)` filters out
-        // every record in the new (shorter) history and Phase 1 stops
-        // firing for the rest of the process's lifetime.
+        // `tokens_added_since(old_history_len)` would treat the new
+        // (shorter) history as if it had already been processed, and
+        // Phase 1 would stop firing for the rest of the process's
+        // lifetime.
         *self
             .extract_pointer
             .lock()
@@ -1273,18 +1274,23 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         Ok(worker.client().clone_boxed())
     }
 
-    /// Cumulative `input_total_tokens` of usage records added after the
-    /// item-count boundary `history_len_pointer`. Used by Phase 1 trigger.
+    /// pointer 以降に増えたプロンプト全長の推定。Phase 1 trigger が
+    /// 閾値判定に使う。
     ///
-    /// `history_len_pointer == 0` means "everything so far".
-    fn cumulative_input_tokens_since(&self, history_len_pointer: usize) -> u64 {
-        self.usage_history
-            .lock()
-            .expect("usage_history poisoned")
-            .iter()
-            .filter(|r| r.history_len > history_len_pointer)
-            .map(|r| r.input_total_tokens)
-            .sum()
+    /// `total_tokens_at(now) - total_tokens_at(pointer)` の差分で、
+    /// compact と同じ accounting (measured / interpolated / extrapolated)
+    /// に乗る。`history_len_pointer == 0` は「未抽出」扱いで現プロンプト
+    /// 全長そのものが返る。
+    ///
+    /// 素朴な `usage_history.input_total_tokens` の合計は使わない:
+    /// `input_total_tokens` は **送信時の prompt prefix 全長** であって
+    /// 増分ではないので、長い turn 内の連続 LLM call では super-set を
+    /// 何度も足し込んでしまい実消費の数倍に膨らむ。
+    fn tokens_added_since(&self, history_len_pointer: usize) -> u64 {
+        let now = self.history().len();
+        let total_now = self.total_tokens_at(now).tokens;
+        let total_at_pointer = self.total_tokens_at(history_len_pointer).tokens;
+        total_now.saturating_sub(total_at_pointer)
     }
 
     /// Phase 1 (memory.extract) post-run trigger.
@@ -1362,7 +1368,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             .map(|p| p.processed_through_history_len)
             .unwrap_or(0);
 
-        let tokens_since = self.cumulative_input_tokens_since(processed_history_len);
+        let tokens_since = self.tokens_added_since(processed_history_len);
         if tokens_since < threshold {
             return Ok(ExtractDecision::Skipped);
         }

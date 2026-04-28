@@ -174,6 +174,18 @@ pub(crate) fn total_tokens_impl(history: &[Item], records: &[UsageRecord]) -> To
     tokens_at(history, records, history.len(), &prefix)
 }
 
+/// 任意の history index 時点でのプロンプト全長推定。
+/// `history_len == 0` で 0 を返す。delta 計算 (extract trigger 等) で
+/// `total_tokens_at(now) - total_tokens_at(pointer)` の形で使う。
+pub(crate) fn total_tokens_at_impl(
+    history: &[Item],
+    records: &[UsageRecord],
+    history_len: usize,
+) -> TokenEstimate {
+    let prefix = prefix_bytes(history);
+    tokens_at(history, records, history_len.min(history.len()), &prefix)
+}
+
 fn split_for_retained_impl(history: &[Item], records: &[UsageRecord], retained: u64) -> SplitPoint {
     let prefix = prefix_bytes(history);
     let current = tokens_at(history, records, history.len(), &prefix);
@@ -289,6 +301,17 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     pub fn total_tokens(&self) -> TokenEstimate {
         let usage = self.usage_history();
         total_tokens_impl(self.history(), &usage)
+    }
+
+    /// 任意の history index 時点でのプロンプト全長推定。
+    ///
+    /// `total_tokens()` と同じ accounting を任意位置で評価する版。
+    /// memory phase 1 trigger が
+    /// `total_tokens_at(now) - total_tokens_at(pointer)` で
+    /// pointer 以降に増えたプロンプト長を測るのに使う。
+    pub fn total_tokens_at(&self, history_len: usize) -> TokenEstimate {
+        let usage = self.usage_history();
+        total_tokens_at_impl(self.history(), &usage, history_len)
     }
 
     /// 末尾から `retained` トークン以上を残すための分割位置。
