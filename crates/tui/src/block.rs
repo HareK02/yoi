@@ -45,9 +45,10 @@ pub struct ThinkingBlock {
 }
 
 pub enum ThinkingState {
-    /// Live block: actively streaming. `started_at` is `None` only for
-    /// blocks materialised from `Event::History`, which never enter the
-    /// streaming state.
+    /// Live block: actively streaming. `started_at` powers the
+    /// `Thinking... (Xs)` live timer. History-restored blocks never
+    /// enter this state — they materialise as `Finished { elapsed_secs:
+    /// None }` since the original duration is not persisted.
     Streaming { started_at: Instant },
     /// Block ended cleanly with `ThinkingDone`.
     Finished { elapsed_secs: Option<u64> },

@@ -87,3 +87,8 @@ provider ごとに本文を流せるかは異なる:
 - `Event::History` 再生で過去の thinking が `Block::Thinking { finished: true }` として復元される
 - `ThinkingDone` 欠落でも panic せず、Incomplete 相当の表示で残る
 - 既存のテキスト / ツール / notification / compact 表示が壊れない
+
+## Review
+- 状態: Approve
+- レビュー詳細: [./tui-thinking-display.review.md](./tui-thinking-display.review.md)
+- 日付: 2026-04-28

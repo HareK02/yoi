@@ -131,6 +131,9 @@ impl App {
             }
             Event::ThinkingDone { text } => {
                 if let Some(b) = self.last_streaming_thinking_mut() {
+                    // Delta-accumulated text wins. `text` here is the
+                    // Done payload (full body), used only as a fallback
+                    // for providers that don't stream deltas.
                     if b.text.is_empty() {
                         b.text = text;
                     }
@@ -325,6 +328,11 @@ impl App {
     }
 
     fn mark_orphan_thinking_incomplete(&mut self) {
+        // A turn can carry several thinking blocks; we walk all the way
+        // to `TurnHeader` and convert every still-Streaming one rather
+        // than breaking on the first Finished hit (which is what the
+        // tool-call equivalent does, since tool calls finalize in
+        // submission order).
         for b in self.blocks.iter_mut().rev() {
             match b {
                 Block::Thinking(t) => {
