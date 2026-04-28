@@ -20,4 +20,3 @@
   - [ ] 使用頻度メトリクス + Knowledge 化候補レポート → [tickets/memory-usage-metrics.md](tickets/memory-usage-metrics.md)
   - [ ] GC（定期再評価） → [tickets/memory-gc.md](tickets/memory-gc.md)
 - ワークスペースのメモリーをLintするヘッドレスCLI
-- [ ] Thinking ブロックの TUI 表示 → [tickets/tui-thinking-display.md](tickets/tui-thinking-display.md)
