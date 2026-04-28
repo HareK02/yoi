@@ -271,7 +271,7 @@ mod tests {
     }
 
     /// Build a usage_history handle with a single record pinned at the
-    /// current `context_len` so that `total_tokens_impl` returns exactly
+    /// current `context_len` so that `total_tokens` returns exactly
     /// `tokens` (Measured, no interpolation or byte-based fallback).
     fn usage_handle_with(context_len: usize, tokens: u64) -> Arc<Mutex<Vec<UsageRecord>>> {
         Arc::new(Mutex::new(vec![UsageRecord {
