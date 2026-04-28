@@ -102,6 +102,12 @@ pub struct WorkerManifest {
     #[serde(default)]
     pub temperature: Option<f32>,
     #[serde(default)]
+    pub top_p: Option<f32>,
+    #[serde(default)]
+    pub top_k: Option<u32>,
+    #[serde(default)]
+    pub stop_sequences: Vec<String>,
+    #[serde(default)]
     pub reasoning: Option<ReasoningControl>,
     /// Byte-size caps applied to tool `content` before it reaches the
     /// conversation history. The section is optional in TOML — when
@@ -299,6 +305,9 @@ permission = "write"
         assert_eq!(manifest.scope.allow.len(), 1);
         assert!(manifest.scope.deny.is_empty());
         assert_eq!(manifest.worker.instruction, defaults::DEFAULT_INSTRUCTION);
+        assert!(manifest.worker.top_p.is_none());
+        assert!(manifest.worker.top_k.is_none());
+        assert!(manifest.worker.stop_sequences.is_empty());
     }
 
     #[test]
@@ -316,6 +325,9 @@ auth = { kind = "api_key", file = "/abs/keys/anthropic" }
 instruction = "$user/reviewer"
 max_tokens = 4096
 temperature = 0.3
+top_p = 0.9
+top_k = 40
+stop_sequences = ["\n\n", "</stop>"]
 reasoning = "medium"
 
 [[scope.allow]]
@@ -341,6 +353,9 @@ permission = "write"
         assert_eq!(manifest.worker.instruction, "$user/reviewer");
         assert_eq!(manifest.worker.max_tokens, Some(4096));
         assert_eq!(manifest.worker.temperature, Some(0.3));
+        assert_eq!(manifest.worker.top_p, Some(0.9));
+        assert_eq!(manifest.worker.top_k, Some(40));
+        assert_eq!(manifest.worker.stop_sequences, vec!["\n\n", "</stop>"]);
         assert_eq!(
             manifest.worker.reasoning,
             Some(ReasoningControl::Effort(ReasoningEffort::Medium))

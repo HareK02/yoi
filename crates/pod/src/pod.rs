@@ -1384,6 +1384,15 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
 /// minijinja template that is parsed by `Pod::from_manifest` and
 /// rendered once at first turn in `ensure_system_prompt_materialized`.
 pub fn apply_worker_manifest<C: LlmClient>(worker: &mut Worker<C>, wm: &WorkerManifest) {
+    worker.set_request_config(request_config_from_worker_manifest(wm));
+    worker.set_max_turns(wm.max_turns.map(|n| n.get()));
+    worker.set_tool_output_limits(Some(ToolOutputLimits {
+        default_max_bytes: wm.tool_output.default_max_bytes,
+        per_tool: wm.tool_output.per_tool.clone(),
+    }));
+}
+
+fn request_config_from_worker_manifest(wm: &WorkerManifest) -> RequestConfig {
     let mut config = RequestConfig::new();
     if let Some(max_tokens) = wm.max_tokens {
         config.max_tokens = Some(max_tokens);
@@ -1391,13 +1400,15 @@ pub fn apply_worker_manifest<C: LlmClient>(worker: &mut Worker<C>, wm: &WorkerMa
     if let Some(temperature) = wm.temperature {
         config.temperature = Some(temperature);
     }
+    if let Some(top_p) = wm.top_p {
+        config.top_p = Some(top_p);
+    }
+    if let Some(top_k) = wm.top_k {
+        config.top_k = Some(top_k);
+    }
+    config.stop_sequences = wm.stop_sequences.clone();
     config.reasoning = wm.reasoning.clone();
-    worker.set_request_config(config);
-    worker.set_max_turns(wm.max_turns.map(|n| n.get()));
-    worker.set_tool_output_limits(Some(ToolOutputLimits {
-        default_max_bytes: wm.tool_output.default_max_bytes,
-        per_tool: wm.tool_output.per_tool.clone(),
-    }));
+    config
 }
 
 /// Result of a Pod run.
@@ -1614,6 +1625,29 @@ mod build_summary_prompt_tests {
         assert!(prompt.contains("[Assistant] hello"));
         assert!(!prompt.contains("Reasoning"));
         assert!(!prompt.contains("deliberation"));
+    }
+
+    #[test]
+    fn worker_manifest_generation_settings_become_request_config() {
+        let manifest = WorkerManifest {
+            instruction: "unused".into(),
+            max_tokens: Some(1024),
+            max_turns: None,
+            temperature: Some(0.2),
+            top_p: Some(0.9),
+            top_k: Some(40),
+            stop_sequences: vec!["\n\n".into(), "</stop>".into()],
+            reasoning: None,
+            tool_output: manifest::ToolOutputLimits::default(),
+        };
+
+        let config = request_config_from_worker_manifest(&manifest);
+
+        assert_eq!(config.max_tokens, Some(1024));
+        assert_eq!(config.temperature, Some(0.2));
+        assert_eq!(config.top_p, Some(0.9));
+        assert_eq!(config.top_k, Some(40));
+        assert_eq!(config.stop_sequences, vec!["\n\n", "</stop>"]);
     }
 
     #[test]

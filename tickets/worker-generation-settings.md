@@ -49,3 +49,8 @@ Provider / scheme によって効かない値がある場合でも、既存の s
 - `pod::apply_worker_manifest()` が `RequestConfig.top_p` / `top_k` / `stop_sequences` へ値を渡す
 - 未指定時の既存挙動が変わらない
 - manifest parse / merge / apply のテストが追加または更新されている
+
+## Review
+- 状態: Approve
+- レビュー詳細: [./worker-generation-settings.review.md](./worker-generation-settings.review.md)
+- 日付: 2026-04-28

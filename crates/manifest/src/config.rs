@@ -65,6 +65,12 @@ pub struct WorkerManifestConfig {
     #[serde(default)]
     pub temperature: Option<f32>,
     #[serde(default)]
+    pub top_p: Option<f32>,
+    #[serde(default)]
+    pub top_k: Option<u32>,
+    #[serde(default)]
+    pub stop_sequences: Option<Vec<String>>,
+    #[serde(default)]
     pub reasoning: Option<ReasoningControl>,
     #[serde(default)]
     pub tool_output: ToolOutputLimitsPartial,
@@ -226,6 +232,9 @@ impl WorkerManifestConfig {
             max_tokens: upper.max_tokens.or(self.max_tokens),
             max_turns: upper.max_turns.or(self.max_turns),
             temperature: upper.temperature.or(self.temperature),
+            top_p: upper.top_p.or(self.top_p),
+            top_k: upper.top_k.or(self.top_k),
+            stop_sequences: upper.stop_sequences.or(self.stop_sequences),
             reasoning: upper.reasoning.or(self.reasoning),
             tool_output: self.tool_output.merge(upper.tool_output),
         }
@@ -339,6 +348,9 @@ impl TryFrom<PodManifestConfig> for PodManifest {
             max_tokens: cfg.worker.max_tokens,
             max_turns: cfg.worker.max_turns,
             temperature: cfg.worker.temperature,
+            top_p: cfg.worker.top_p,
+            top_k: cfg.worker.top_k,
+            stop_sequences: cfg.worker.stop_sequences.unwrap_or_default(),
             reasoning: cfg.worker.reasoning,
             tool_output: ToolOutputLimits {
                 default_max_bytes: cfg
@@ -587,6 +599,33 @@ mod tests {
     }
 
     #[test]
+    fn merge_worker_generation_settings_upper_wins() {
+        let lower = PodManifestConfig {
+            worker: WorkerManifestConfig {
+                top_p: Some(0.8),
+                top_k: Some(20),
+                stop_sequences: Some(vec!["lower".into()]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let upper = PodManifestConfig {
+            worker: WorkerManifestConfig {
+                top_p: Some(0.9),
+                stop_sequences: Some(vec!["upper".into()]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let merged = lower.merge(upper);
+
+        assert_eq!(merged.worker.top_p, Some(0.9));
+        assert_eq!(merged.worker.top_k, Some(20));
+        assert_eq!(merged.worker.stop_sequences, Some(vec!["upper".into()]));
+    }
+
+    #[test]
     fn merge_scope_accumulates_allow_and_deny() {
         let lower = PodManifestConfig {
             scope: ScopeConfig {
@@ -729,6 +768,26 @@ reasoning = -1
         assert_eq!(
             budget.worker.reasoning,
             Some(ReasoningControl::BudgetTokens(-1))
+        );
+    }
+
+    #[test]
+    fn from_toml_accepts_worker_generation_settings() {
+        let cfg = PodManifestConfig::from_toml(
+            r#"
+[worker]
+top_p = 0.9
+top_k = 40
+stop_sequences = ["\n\n", "</stop>"]
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.worker.top_p, Some(0.9));
+        assert_eq!(cfg.worker.top_k, Some(40));
+        assert_eq!(
+            cfg.worker.stop_sequences,
+            Some(vec!["\n\n".into(), "</stop>".into()])
         );
     }
 

@@ -73,7 +73,6 @@ Pod の宣言的構成。TOML で記述。
 ```toml
 [pod]
 name = "agent"
-pwd = "/abs/path"
 
 [model]
 ref = "anthropic/claude-sonnet-4-6"
@@ -81,6 +80,7 @@ ref = "anthropic/claude-sonnet-4-6"
 [worker]
 instruction = "$insomnia/default"
 max_tokens = 4096
+temperature = 0.3
 
 [[scope.allow]]
 target = "/abs/path"

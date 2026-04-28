@@ -15,7 +15,7 @@ overlay をマージして、検証済みの `PodManifest` と `PromptLoader` �
 | 1 | ビルトインのデフォルト | `manifest::defaults` モジュールの `pub const` 群を `PodManifestConfig::builtin_defaults()` が cascade 層として注入 | `tool_output.default_max_bytes = 16KB` など |
 | 2 | ユーザー manifest | `<config_dir>/manifest.toml`（解決ルールは `manifest::paths`） | プロバイダ指定、デフォルトモデル、常用ツール設定 |
 | 3 | プロジェクト manifest | 起動ディレクトリから上方向に探索した最初の `<root>/.insomnia/manifest.toml` | scope、compaction、プロジェクト固有の instruction |
-| 4 | プログラマティック overlay | CLI / GUI / 別 Pod からの spawn 等 | `pod.name`、`pod.pwd` のような Pod 固有値 |
+| 4 | プログラマティック overlay | CLI / GUI / 別 Pod からの spawn 等 | `pod.name`、spawn 時の `worker.instruction` のような Pod 固有値 |
 
 デフォルト値はすべて `crates/manifest/src/defaults.rs` の `pub const` として集約
 されており、serde `#[default = "..."]` 経路（`PodManifest` の直接 deserialize）
@@ -31,6 +31,7 @@ overlay をマージして、検証済みの `PodManifest` と `PromptLoader` �
 |---|---|
 | スカラー（`String`, `u32`, `bool` 等） | 上層に値があれば丸ごと置換 |
 | `Option<T>` | 上層が `Some` なら置換、`None` なら据え置き |
+| 配列スカラー（`worker.stop_sequences` 等） | 上層に値があれば配列ごと置換。追記マージはしない |
 | マップ（`tool_output.per_tool` 等） | キー単位でマージ、同一キーは上層優先 |
 | `scope.allow` / `scope.deny` | **union**（各層から全部足す）。上位層は `deny` で下位層の `allow` を必ず削れる |
 
@@ -40,8 +41,8 @@ for PodManifest` が必須フィールド検証と絶対パス検証をかけて
 
 ## パス解決
 
-manifest 中のパス（`provider.api_key_file` / `scope.*.target` /
-`compaction.provider.api_key_file`）は相対記述を許容する。相対パスは
+manifest 中のパス（`model.auth.file` / `scope.*.target` /
+`compaction.model.auth.file`）は相対記述を許容する。相対パスは
 **各層のベース基準**で層ごとに絶対化され、そのあとで cascade merge に
 かかる。層をまたいだ相対の意味ブレ（user 層の `./keys` が project 層の
 どこを指すのか曖昧）を避けるための設計。
@@ -135,6 +136,9 @@ instruction = "$user/reviewer"
 max_tokens = 4096
 max_turns = 50
 temperature = 0.3
+top_p = 0.9
+top_k = 40
+stop_sequences = ["\n\n", "</stop>"]
 reasoning = "medium"  # 文字列 = effort label / 整数 = thinking budget tokens。詳細は docs/reasoning.md
 
 [worker.tool_output]
@@ -161,15 +165,41 @@ permission = "write"
 prune_protected_turns = 3
 prune_min_savings = 4096
 compact_threshold = 80000
-compact_retained_turns = 2
+compact_request_threshold = 90000
+compact_retained_tokens = 8000
+compact_auto_read_budget = 8000
+compact_worker_max_input_tokens = 50000
 
-[compaction.provider]
-kind = "gemini"
-model = "gemini-2.0-flash"
-api_key_file = "/home/you/.config/insomnia/keys/gemini"
+[compaction.model]
+scheme = "gemini"
+model_id = "gemini-2.0-flash"
+auth = { kind = "api_key", file = "/home/you/.config/insomnia/keys/gemini" }
 ```
 
 ---
+
+## `[worker]` 設定
+
+`[worker]` は Pod 内の `llm_worker::RequestConfig` とターン制御へ渡す設定を持つ。
+Provider ごとの wire 名の違い（OpenAI の `max_completion_tokens` /
+Responses の `max_output_tokens` / Gemini の `generation_config` など）は
+scheme 側が吸収する。
+
+| key | 型 | 既定 | 内容 |
+|---|---|---|---|
+| `instruction` | `String` | `$insomnia/default` | システムプロンプト本体として使う prompt asset 参照 |
+| `max_tokens` | `u32` | 未指定 | 1 request の最大出力 token。scheme が provider の該当 wire field に投影 |
+| `max_turns` | `NonZeroU32` | 未指定 | 1 run 内で Worker が進められる最大 turn 数 |
+| `temperature` | `f32` | 未指定 | sampling temperature |
+| `top_p` | `f32` | 未指定 | nucleus sampling |
+| `top_k` | `u32` | 未指定 | top-k sampling。未対応 scheme では warning または provider 側挙動に任せる |
+| `stop_sequences` | `Vec<String>` | `[]` | stop sequence。cascade では上層指定が配列ごと置換する |
+| `reasoning` | `String` または `i32` | 未指定 | reasoning / thinking 制御。詳細は `docs/reasoning.md` |
+| `tool_output.default_max_bytes` | `usize` | `16384` | tool result `content` の既定 byte cap |
+| `tool_output.per_tool` | `Map<String, usize>` | `{}` | tool 名ごとの byte cap override |
+
+生成設定は provider 別の値域検証を行わない。型が TOML と合わない場合は manifest
+parse error になるが、provider が受け付けない値や組み合わせは API 応答で検出する。
 
 ## instruction とプロンプト資産
 
