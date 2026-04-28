@@ -337,6 +337,21 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             .clone()
     }
 
+    /// Snapshot of the Phase 1 (memory.extract) boundary pointer.
+    ///
+    /// `None` means no extract has run yet on the current session — the
+    /// next extract will start from entry 0. Updated by
+    /// [`try_post_run_extract`](Self::try_post_run_extract) on success
+    /// and reset by [`compact`](Self::compact) (the new compacted
+    /// session has a fresh log with no `LogEntry::Extension` entries).
+    /// Cheap clone via `Option<Clone>`.
+    pub fn extract_pointer(&self) -> Option<memory::ExtractPointerPayload> {
+        self.extract_pointer
+            .lock()
+            .expect("extract_pointer poisoned")
+            .clone()
+    }
+
     /// Shared handle to the cumulative Usage history.
     ///
     /// Callbacks that need live access to the latest measurements (e.g.
@@ -1212,6 +1227,17 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             .lock()
             .expect("usage_history poisoned")
             .clear();
+        // Reset Phase 1 pointer alongside usage_history: the compacted
+        // session has a fresh log with no `LogEntry::Extension` entries
+        // yet, so a cold restore here would set extract_pointer to None
+        // via fold_pointer. The in-memory pointer must match — otherwise
+        // `cumulative_input_tokens_since(old_history_len)` filters out
+        // every record in the new (shorter) history and Phase 1 stops
+        // firing for the rest of the process's lifetime.
+        *self
+            .extract_pointer
+            .lock()
+            .expect("extract_pointer poisoned") = None;
 
         Ok(new_session_id)
     }

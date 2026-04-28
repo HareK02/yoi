@@ -70,3 +70,9 @@ Pod を立てずに既存 compact と同じ Worker spawn 機構を再利用す�
 - `docs/plan/memory-prompts.md` §共通原則 / §Phase 1: 活動抽出 prompt
 - 既存 `session-store` クレート（session log range 取得）
 - 既存 compact の Worker spawn 経路
+
+## Review
+
+- 状態: Request changes → 対応済み (2026-04-28、Blocking fix + 回帰テスト追加)
+- レビュー詳細: [./memory-phase1-extract.review.md](./memory-phase1-extract.review.md)
+- 日付: 2026-04-28

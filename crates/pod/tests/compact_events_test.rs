@@ -281,6 +281,93 @@ async fn mid_turn_compact_success_broadcasts_start_and_done() {
     assert_eq!(new_id_in_event, Some(pod.session_id()));
 }
 
+/// Regression: `Pod::compact()` must reset the in-memory
+/// `extract_pointer` so Phase 1 keeps firing on the new compacted
+/// session.
+///
+/// Without the reset, the pointer's `processed_through_history_len`
+/// holds the old (typically large) item count, while the new compacted
+/// session starts with a much shorter history (`[summary, ...]`).
+/// `cumulative_input_tokens_since` would then filter every new
+/// usage record out (their `history_len` is below the stale pointer)
+/// and Phase 1 would never re-fire for the rest of the process.
+const EXTRACT_PLUS_COMPACT_MANIFEST: &str = r#"
+[pod]
+name = "test-pod"
+pwd = "./"
+
+[model]
+scheme = "anthropic"
+model_id = "test-model"
+
+[worker]
+max_tokens = 100
+
+[memory]
+extract_threshold = 1
+
+[compaction]
+compact_threshold = 1
+compact_retained_tokens = 0
+
+[[scope.allow]]
+target = "./"
+permission = "write"
+"#;
+
+fn write_extracted_tool_use_events(call_id: &str) -> Vec<LlmEvent> {
+    let input = serde_json::json!({
+        "decisions": [],
+        "discussions": [],
+        "attempts": [],
+        "requests": []
+    })
+    .to_string();
+    vec![
+        LlmEvent::tool_use_start(0, call_id, "write_extracted"),
+        LlmEvent::tool_input_delta(0, input),
+        LlmEvent::tool_use_stop(0),
+        LlmEvent::Status(StatusEvent {
+            status: ResponseStatus::Completed,
+        }),
+    ]
+}
+
+#[tokio::test]
+async fn compact_resets_extract_pointer_so_phase1_can_fire_again() {
+    // Mock LLM responses, in call order:
+    //   [0] first run with usage(1000) so extract threshold (=1) fires.
+    //   [1] extract worker invokes write_extracted with empty payload.
+    //   [2] extract worker closes after the tool result.
+    //   [3] compact worker invokes write_summary.
+    //   [4] compact worker closes after the tool result.
+    let client = MockClient::new(vec![
+        text_events_with_usage("hi", 1000),
+        write_extracted_tool_use_events("ec1"),
+        single_text_events("done"),
+        write_summary_tool_use_events("sc1", "summary"),
+        single_text_events("done"),
+    ]);
+    let mut pod = make_pod_with_manifest(EXTRACT_PLUS_COMPACT_MANIFEST, client).await;
+
+    pod.run_text("first").await.unwrap();
+
+    // Phase 1 fires; pointer becomes Some.
+    pod.try_post_run_extract().await.unwrap();
+    assert!(
+        pod.extract_pointer().is_some(),
+        "extract_pointer should be Some after a successful extract"
+    );
+
+    // Compact runs. Without the fix the in-memory pointer would still
+    // reference the old session's history_len.
+    pod.try_post_run_compact().await.unwrap();
+    assert!(
+        pod.extract_pointer().is_none(),
+        "extract_pointer must be reset to None after compact (matches cold-restore on the new session)"
+    );
+}
+
 #[tokio::test]
 async fn post_run_compact_failure_broadcasts_start_and_failed() {
     // Only the first run has a response. Compaction will run the
