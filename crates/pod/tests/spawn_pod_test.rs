@@ -1,6 +1,6 @@
 //! Integration tests for the `SpawnPod` tool.
 //!
-//! These tests exercise the tool's scope-lock delegation, subprocess
+//! These tests exercise the tool's pod-registry delegation, subprocess
 //! launch, socket handoff, and `spawned_pods.json` write without relying
 //! on the real `pod` binary. `INSOMNIA_POD_COMMAND` is pointed at
 //! `/bin/true` (which exits immediately) while a test-owned Unix
@@ -13,7 +13,7 @@ use std::sync::{LazyLock, Mutex};
 use llm_worker::tool::{ToolError, ToolOutput};
 use manifest::{AuthRef, ModelManifest, Permission, SchemeKind, ScopeRule};
 use pod::runtime::dir::{RuntimeDir, SpawnedPodRecord};
-use pod::runtime::scope_lock::{self, LockFileGuard};
+use pod::runtime::pod_registry::{self, LockFileGuard};
 use pod::spawn::registry::SpawnedPodRegistry;
 use pod::spawn::tool::spawn_pod_tool;
 use protocol::Method;
@@ -40,7 +40,7 @@ impl EnvGuard {
 }
 
 /// Set up a tempdir, point `INSOMNIA_RUNTIME_DIR` at it (so
-/// `scope.lock` and per-Pod runtime subdirs both land in the
+/// `pods.json` and per-Pod runtime subdirs both land in the
 /// sandbox), and install a live top-level "spawner" allocation so the
 /// tool has something to delegate from. Returns the tempdir (keeps it
 /// alive for the test's lifetime), runtime base, spawner socket, and
@@ -64,7 +64,7 @@ async fn setup_spawner(
         .unwrap();
     let spawner_socket = spawner_rd.socket_path();
 
-    let _guard = scope_lock::install_top_level(
+    let _guard = pod_registry::install_top_level(
         spawner_name.into(),
         std::process::id(),
         spawner_socket.clone(),
@@ -207,8 +207,8 @@ async fn spawn_pod_delegates_scope_and_sends_run() {
         other => panic!("expected Run, got {other:?}"),
     }
 
-    // Verify scope_lock has the child allocation under `root`.
-    let lock_path = scope_lock::default_lock_path().unwrap();
+    // Verify pod_registry has the child allocation under `root`.
+    let lock_path = pod_registry::default_registry_path().unwrap();
     let guard = LockFileGuard::open(&lock_path).unwrap();
     let child = guard
         .data()
@@ -273,7 +273,7 @@ async fn spawn_pod_rejects_scope_outside_spawner() {
     }
 
     // The spawner's allocation is unchanged; no "child" appeared.
-    let lock_path = scope_lock::default_lock_path().unwrap();
+    let lock_path = pod_registry::default_registry_path().unwrap();
     let guard = LockFileGuard::open(&lock_path).unwrap();
     assert!(guard.data().find("child").is_none());
 
@@ -334,7 +334,7 @@ async fn spawn_pod_rolls_back_reservation_when_socket_never_appears() {
     }
 
     // Rollback assertion: the reserved "ghost" allocation is gone.
-    let lock_path = scope_lock::default_lock_path().unwrap();
+    let lock_path = pod_registry::default_registry_path().unwrap();
     let guard = LockFileGuard::open(&lock_path).unwrap();
     assert!(
         guard.data().find("ghost").is_none(),

@@ -142,7 +142,7 @@ impl Scope {
 
     /// Allow rules with their targets resolved to absolute paths.
     ///
-    /// Used by the scope-lock registry, where every Pod's allocation
+    /// Used by the pod-registry, where every Pod's allocation
     /// must be expressed in absolute terms so prefix comparisons are
     /// meaningful across processes.
     pub fn allow_rules(&self) -> Vec<ScopeRule> {

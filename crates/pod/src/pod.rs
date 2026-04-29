@@ -26,7 +26,7 @@ use crate::prompt::catalog::{CatalogError, PromptCatalog};
 use crate::prompt::loader::PromptLoader;
 use crate::prompt::system::{SystemPromptContext, SystemPromptError, SystemPromptTemplate};
 use crate::runtime::dir;
-use crate::runtime::scope_lock::{self, ScopeAllocationGuard, ScopeLockError};
+use crate::runtime::pod_registry::{self, ScopeAllocationGuard, ScopeLockError};
 use async_trait::async_trait;
 use llm_worker::interceptor::PreRequestAction;
 use protocol::{AlertLevel, AlertSource, Event, Segment};
@@ -727,11 +727,11 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         )
         .await?;
         // ensure_head_or_fork mints a fresh session_id when it auto-
-        // forks. Sync that to scope.lock so a concurrent
+        // forks. Sync that to pods.json so a concurrent
         // restore_from_manifest can't see "no live writer" for the new
         // session and grab it.
         if self.session_id != prev_session_id && self.scope_allocation.is_some() {
-            scope_lock::update_session(&self.manifest.pod.name, self.session_id)?;
+            pod_registry::update_session(&self.manifest.pod.name, self.session_id)?;
         }
         Ok(())
     }
@@ -1164,14 +1164,14 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         // until its first LLM call.
         self.session_id = new_session_id;
         self.head_hash = Some(new_head_hash);
-        // Keep scope.lock pointing at the live session_id. Without this
+        // Keep pods.json pointing at the live session_id. Without this
         // a concurrent `restore_from_manifest(new_session_id)` would
         // see no live writer and grab the session this Pod just moved
         // into, causing two writers to race on the same jsonl. Skipped
         // when no allocation is installed (e.g. compact under
         // `Pod::new` in tests).
         if self.scope_allocation.is_some() {
-            scope_lock::update_session(&self.manifest.pod.name, new_session_id)?;
+            pod_registry::update_session(&self.manifest.pod.name, new_session_id)?;
         }
         let worker = self.worker.as_mut().unwrap();
         worker.set_history(new_history);
@@ -1493,18 +1493,18 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
         // Session creation is deferred to the first run (see
         // `ensure_session_head`) so the SessionStart entry can capture
         // the rendered system prompt, not the raw template source. The
-        // session_id is allocated here so the scope-lock registration
+        // session_id is allocated here so the pod-registry registration
         // can record it from the start.
         let session_id = session_store::new_session_id();
 
-        // Register this Pod in the machine-wide scope-lock registry
+        // Register this Pod in the machine-wide pod-registry
         // before building anything else, so a spawn that conflicts on
         // scope fails fast.
         let socket_path = dir::default_base()
             .map_err(ScopeLockError::from)?
             .join(&manifest.pod.name)
             .join("sock");
-        let scope_allocation = scope_lock::install_top_level(
+        let scope_allocation = pod_registry::install_top_level(
             manifest.pod.name.clone(),
             std::process::id(),
             socket_path,
@@ -1548,7 +1548,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
     ///
     /// Behaves like [`Pod::from_manifest`] but claims the scope
     /// allocation that the spawner pre-registered via
-    /// [`scope_lock::delegate_scope`], rather than installing a new
+    /// [`pod_registry::delegate_scope`], rather than installing a new
     /// top-level entry. `callback_socket` carries the spawner's
     /// Unix-socket path so the spawned Pod can send `Method::Notify`
     /// back to the spawner.
@@ -1562,7 +1562,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
 
         let session_id = session_store::new_session_id();
         let scope_allocation =
-            scope_lock::adopt_allocation(manifest.pod.name.clone(), std::process::id(), session_id)?;
+            pod_registry::adopt_allocation(manifest.pod.name.clone(), std::process::id(), session_id)?;
 
         let mut worker = Worker::new(common.client);
         apply_worker_manifest(&mut worker, &manifest.worker);
@@ -1599,14 +1599,14 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
     /// Restore a Pod from an existing session log.
     ///
     /// Resolves the manifest cascade exactly like [`Self::from_manifest`]
-    /// (pwd / scope / scope-lock / client / prompt catalog), seeds a
+    /// (pwd / scope / pod-registry / client / prompt catalog), seeds a
     /// fresh Worker from the source session's `RestoredState`, and
     /// reuses the same `session_id` so subsequent turns append to the
     /// source jsonl as a continuation of the same conversation.
     ///
-    /// Concurrent writers are prevented by the `scope.lock` registry:
+    /// Concurrent writers are prevented by the pod-registry:
     /// the registration carries `session_id`, and this constructor
-    /// refuses to start when `scope_lock::lookup_session` already finds
+    /// refuses to start when `pod_registry::lookup_session` already finds
     /// a live Pod writing to `session_id`. So there is no need to fork —
     /// resume is "the same session, a different process owning it".
     ///
@@ -1636,7 +1636,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             .map_err(ScopeLockError::from)?
             .join(&manifest.pod.name)
             .join("sock");
-        let scope_allocation = scope_lock::install_top_level(
+        let scope_allocation = pod_registry::install_top_level(
             manifest.pod.name.clone(),
             std::process::id(),
             socket_path,

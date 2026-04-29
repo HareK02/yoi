@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use pod::ipc::event::{apply_event_side_effects, fire_and_forget, render_event};
 use pod::runtime::dir::{RuntimeDir, SpawnedPodRecord};
-use pod::runtime::scope_lock::{self, LockFileGuard};
+use pod::runtime::pod_registry::{self, LockFileGuard};
 use pod::spawn::registry::SpawnedPodRegistry;
 use protocol::stream::JsonLineReader;
 use protocol::{Method, Permission, PodEvent, ScopeRule};
@@ -62,8 +62,8 @@ impl Drop for EnvGuard {
     }
 }
 
-/// Point `INSOMNIA_RUNTIME_DIR` at `dir`. The scope-lock then lives at
-/// `<dir>/scope.lock` and Pod runtime sub-dirs at `<dir>/{pod_name}/`.
+/// Point `INSOMNIA_RUNTIME_DIR` at `dir`. The pod-registry then lives at
+/// `<dir>/pods.json` and Pod runtime sub-dirs at `<dir>/{pod_name}/`.
 fn set_runtime_dir(dir: &std::path::Path) {
     unsafe {
         std::env::set_var("INSOMNIA_RUNTIME_DIR", dir);
@@ -348,12 +348,12 @@ async fn apply_turn_ended_and_errored_are_system_noops() {
 async fn shutdown_releases_scope_allocation_when_present() {
     let _env = EnvGuard::acquire();
     let scope_dir = TempDir::new().unwrap();
-    let lock_path = scope_dir.path().join("scope.lock");
+    let lock_path = scope_dir.path().join("pods.json");
     set_runtime_dir(scope_dir.path());
 
     // Install a top-level allocation for "kid" so ShutDown has
     // something to release.
-    let guard = scope_lock::install_top_level(
+    let guard = pod_registry::install_top_level(
         "kid".into(),
         std::process::id(),
         "/tmp/kid.sock".into(),

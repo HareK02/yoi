@@ -1,7 +1,7 @@
-//! Machine-wide scope allocation registry.
+//! Machine-wide Pod allocation registry.
 //!
-//! A single JSON file at `<runtime_dir>/scope.lock` records every live
-//! Pod's scope allocation (see [`manifest::paths::scope_lock_path`] for
+//! A single JSON file at `<runtime_dir>/pods.json` records every live
+//! Pod's allocation (see [`manifest::paths::pod_registry_path`] for
 //! how the path is resolved). File-level `flock(2)` serialises access
 //! across processes so spawn sequences from unrelated Pods can't race.
 //!
@@ -77,15 +77,15 @@ impl LockFile {
     }
 }
 
-/// Default on-disk path: `<runtime_dir>/scope.lock` resolved via
-/// [`manifest::paths::scope_lock_path`]. Tests should point this
+/// Default on-disk path: `<runtime_dir>/pods.json` resolved via
+/// [`manifest::paths::pod_registry_path`]. Tests should point this
 /// elsewhere by setting `INSOMNIA_HOME` or `INSOMNIA_RUNTIME_DIR` to a
 /// tempdir.
-pub fn default_lock_path() -> io::Result<PathBuf> {
-    paths::scope_lock_path().ok_or_else(|| {
+pub fn default_registry_path() -> io::Result<PathBuf> {
+    paths::pod_registry_path().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
-            "could not resolve scope.lock path (no INSOMNIA_HOME / \
+            "could not resolve pods.json path (no INSOMNIA_HOME / \
              INSOMNIA_RUNTIME_DIR / XDG_RUNTIME_DIR / HOME)",
         )
     })
@@ -146,7 +146,7 @@ impl LockFileGuard {
             serde_json::from_str(&buf).map_err(|e| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("scope.lock parse error: {e}"),
+                    format!("pods.json parse error: {e}"),
                 )
             })?
         };
@@ -516,7 +516,7 @@ pub fn install_top_level(
     scope_allow: Vec<ScopeRule>,
     session_id: SessionId,
 ) -> Result<ScopeAllocationGuard, ScopeLockError> {
-    let lock_path = default_lock_path()?;
+    let lock_path = default_registry_path()?;
     let mut guard = LockFileGuard::open(&lock_path)?;
     register_pod(
         &mut guard,
@@ -546,7 +546,7 @@ pub fn adopt_allocation(
     new_pid: u32,
     session_id: SessionId,
 ) -> Result<ScopeAllocationGuard, ScopeLockError> {
-    let lock_path = default_lock_path()?;
+    let lock_path = default_registry_path()?;
     let mut guard = LockFileGuard::open(&lock_path)?;
     let alloc = guard
         .data_mut()
@@ -581,7 +581,7 @@ pub fn adopt_allocation(
 /// guard, so the session_id collision check is atomic with the
 /// rewrite.
 pub fn update_session(pod_name: &str, new_session_id: SessionId) -> Result<(), ScopeLockError> {
-    let lock_path = default_lock_path()?;
+    let lock_path = default_registry_path()?;
     let mut guard = LockFileGuard::open(&lock_path)?;
     if let Some(other) = guard.data().find_by_session(new_session_id) {
         if other.pod_name != pod_name {
@@ -616,7 +616,7 @@ pub struct SessionLockInfo {
 /// Used by `Pod::restore_from_manifest` to refuse a resume that would
 /// race a live writer on the same source session.
 pub fn lookup_session(session_id: SessionId) -> Result<Option<SessionLockInfo>, ScopeLockError> {
-    let lock_path = default_lock_path()?;
+    let lock_path = default_registry_path()?;
     let mut guard = LockFileGuard::open(&lock_path)?;
     reclaim_stale(&mut guard);
     Ok(guard.data().find_by_session(session_id).map(|a| {
@@ -628,10 +628,10 @@ pub fn lookup_session(session_id: SessionId) -> Result<Option<SessionLockInfo>, 
     }))
 }
 
-/// Errors raised by the mutating scope-lock operations.
+/// Errors raised by the mutating pod-registry operations.
 #[derive(Debug, thiserror::Error)]
 pub enum ScopeLockError {
-    #[error("I/O error on scope.lock: {0}")]
+    #[error("I/O error on pods.json: {0}")]
     Io(#[from] io::Error),
     #[error("pod name `{0}` is already registered")]
     DuplicatePodName(String),
@@ -743,7 +743,7 @@ mod tests {
     #[test]
     fn open_creates_empty_lock_file() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("scope.lock");
+        let path = dir.path().join("pods.json");
         let guard = LockFileGuard::open(&path).unwrap();
         assert!(guard.data().allocations.is_empty());
         assert!(path.exists());
@@ -754,7 +754,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = TempDir::new().unwrap();
         let parent = dir.path().join("insomnia");
-        let path = parent.join("scope.lock");
+        let path = parent.join("pods.json");
         let _guard = LockFileGuard::open(&path).unwrap();
         let file_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(file_mode, 0o600, "file mode = {file_mode:o}");
@@ -765,7 +765,7 @@ mod tests {
     #[test]
     fn save_and_reopen_roundtrip() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("scope.lock");
+        let path = dir.path().join("pods.json");
         {
             let mut g = open_empty(&path);
             register_pod(
@@ -814,7 +814,7 @@ mod tests {
     #[test]
     fn register_detects_write_conflict() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("scope.lock");
+        let path = dir.path().join("pods.json");
         let mut g = open_empty(&path);
         register_pod(
             &mut g,
@@ -843,7 +843,7 @@ mod tests {
     #[test]
     fn duplicate_pod_name_rejected() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("scope.lock");
+        let path = dir.path().join("pods.json");
         let mut g = open_empty(&path);
         register_pod(
             &mut g,
@@ -869,7 +869,7 @@ mod tests {
     #[test]
     fn delegate_must_be_subset() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("scope.lock");
+        let path = dir.path().join("pods.json");
         let mut g = open_empty(&path);
         register_pod(
             &mut g,
@@ -895,7 +895,7 @@ mod tests {
     #[test]
     fn delegate_succeeds_within_parent_scope() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("scope.lock");
+        let path = dir.path().join("pods.json");
         let mut g = open_empty(&path);
         register_pod(
             &mut g,
@@ -933,7 +933,7 @@ mod tests {
     #[test]
     fn delegate_rejects_sibling_overlap() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("scope.lock");
+        let path = dir.path().join("pods.json");
         let mut g = open_empty(&path);
         register_pod(
             &mut g,
@@ -970,7 +970,7 @@ mod tests {
     #[test]
     fn release_reparents_children() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("scope.lock");
+        let path = dir.path().join("pods.json");
         let mut g = open_empty(&path);
         register_pod(
             &mut g,
@@ -1009,7 +1009,7 @@ mod tests {
     #[test]
     fn reclaim_stale_reparents_and_removes_dead_entries() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("scope.lock");
+        let path = dir.path().join("pods.json");
         let mut g = open_empty(&path);
         register_pod(
             &mut g,
@@ -1063,7 +1063,7 @@ mod tests {
     #[test]
     fn read_rules_do_not_conflict_with_write() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("scope.lock");
+        let path = dir.path().join("pods.json");
         let mut g = open_empty(&path);
         register_pod(
             &mut g,
@@ -1090,7 +1090,7 @@ mod tests {
     #[test]
     fn releasing_pod_reopens_scope_for_fresh_registration() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("scope.lock");
+        let path = dir.path().join("pods.json");
         let mut g = open_empty(&path);
         register_pod(
             &mut g,
@@ -1116,7 +1116,7 @@ mod tests {
     #[test]
     fn delegated_scope_returns_to_parent_on_release() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("scope.lock");
+        let path = dir.path().join("pods.json");
         let mut g = open_empty(&path);
         register_pod(
             &mut g,
@@ -1154,7 +1154,7 @@ mod tests {
     fn scope_allocation_guard_releases_on_drop() {
         let dir = TempDir::new().unwrap();
         let _sandbox = RuntimeDirSandbox::new(dir.path());
-        let lock_path = dir.path().join("scope.lock");
+        let lock_path = dir.path().join("pods.json");
         let guard = install_top_level(
             "a".into(),
             std::process::id(),
@@ -1178,7 +1178,7 @@ mod tests {
     fn adopt_allocation_rewrites_pid_and_releases_on_drop() {
         let dir = TempDir::new().unwrap();
         let _sandbox = RuntimeDirSandbox::new(dir.path());
-        let lock_path = dir.path().join("scope.lock");
+        let lock_path = dir.path().join("pods.json");
         // Pre-register an allocation under spawner's pid, as delegate_scope would.
         {
             let mut g = LockFileGuard::open(&lock_path).unwrap();
@@ -1224,7 +1224,7 @@ mod tests {
     #[test]
     fn conflict_detection_descends_to_real_owner() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("scope.lock");
+        let path = dir.path().join("pods.json");
         let mut g = open_empty(&path);
         register_pod(
             &mut g,
@@ -1264,7 +1264,7 @@ mod tests {
     #[test]
     fn find_by_session_skips_none_placeholders() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("scope.lock");
+        let path = dir.path().join("pods.json");
         let mut g = open_empty(&path);
         // Pre-reservation: delegate_scope leaves session_id = None
         // until adopt_allocation rewrites it. find_by_session must not
@@ -1306,7 +1306,7 @@ mod tests {
     #[test]
     fn register_pod_rejects_session_id_collision() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("scope.lock");
+        let path = dir.path().join("pods.json");
         let mut g = open_empty(&path);
         let shared_session = sid();
         register_pod(

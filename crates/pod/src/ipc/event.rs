@@ -8,7 +8,7 @@
 //!   logging failures without blocking the child.
 //! - **Render** a variant into a human-readable string that the parent's
 //!   LLM sees via the notification buffer.
-//! - **Apply side effects** on the parent (registry / scope-lock
+//! - **Apply side effects** on the parent (registry / pod-registry
 //!   updates) so that the receive path is idempotent and tolerant of
 //!   out-of-order delivery.
 //!
@@ -27,7 +27,7 @@ use std::sync::Arc;
 use protocol::{Method, PodEvent, ScopeRule};
 
 use crate::runtime::dir::SpawnedPodRecord;
-use crate::runtime::scope_lock::{self, ScopeLockError};
+use crate::runtime::pod_registry::{self, ScopeLockError};
 use crate::spawn::comm_tools::connect_and_send;
 use crate::spawn::registry::SpawnedPodRegistry;
 
@@ -146,21 +146,21 @@ pub async fn apply_event_side_effects(
 }
 
 fn release_scope_silently(pod_name: &str) {
-    let lock_path = match scope_lock::default_lock_path() {
+    let lock_path = match pod_registry::default_registry_path() {
         Ok(p) => p,
         Err(e) => {
-            tracing::warn!(error = %e, "default_lock_path failed");
+            tracing::warn!(error = %e, "default_registry_path failed");
             return;
         }
     };
-    let mut guard = match scope_lock::LockFileGuard::open(&lock_path) {
+    let mut guard = match pod_registry::LockFileGuard::open(&lock_path) {
         Ok(g) => g,
         Err(e) => {
             tracing::warn!(error = %e, "LockFileGuard open failed");
             return;
         }
     };
-    match scope_lock::release_pod(&mut guard, pod_name) {
+    match pod_registry::release_pod(&mut guard, pod_name) {
         Ok(()) => {}
         Err(ScopeLockError::UnknownPod(_)) => {}
         Err(e) => tracing::warn!(error = ?e, pod = %pod_name, "release_pod failed"),

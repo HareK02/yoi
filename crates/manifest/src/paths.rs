@@ -6,7 +6,7 @@
 //!   `providers.toml`, `models.toml`, `prompts/`, `prompts.toml` 等
 //! - **`data_dir`** — プログラムが書く永続データ。`sessions/` 等
 //! - **`runtime_dir`** — 再起動で消えてよいランタイム状態。socket,
-//!   `scope.lock`, `pid` ファイル等
+//!   `pods.json`, `pid` ファイル等
 //!
 //! ## 解決順 (優先順位高 → 低)
 //!
@@ -52,7 +52,7 @@ pub fn data_dir() -> Option<PathBuf> {
     Some(env_path("HOME")?.join(".insomnia"))
 }
 
-/// ランタイムディレクトリ。socket, `scope.lock`, Pod ごとの `pid` /
+/// ランタイムディレクトリ。socket, `pods.json`, Pod ごとの `pid` /
 /// `status.json` 等が置かれる。再起動で消えて構わない。
 pub fn runtime_dir() -> Option<PathBuf> {
     if let Some(p) = env_path("INSOMNIA_RUNTIME_DIR") {
@@ -95,9 +95,9 @@ pub fn sessions_dir() -> Option<PathBuf> {
     Some(data_dir()?.join("sessions"))
 }
 
-/// `<runtime_dir>/scope.lock` — machine-wide scope allocation registry。
-pub fn scope_lock_path() -> Option<PathBuf> {
-    Some(runtime_dir()?.join("scope.lock"))
+/// `<runtime_dir>/pods.json` — machine-wide Pod allocation registry。
+pub fn pod_registry_path() -> Option<PathBuf> {
+    Some(runtime_dir()?.join("pods.json"))
 }
 
 /// `<runtime_dir>/<pod_name>/` — Pod ごとのランタイムディレクトリ。
@@ -302,8 +302,8 @@ mod tests {
         );
         assert_eq!(sessions_dir().unwrap(), PathBuf::from("/sand/sessions"));
         assert_eq!(
-            scope_lock_path().unwrap(),
-            PathBuf::from("/sand/run/scope.lock")
+            pod_registry_path().unwrap(),
+            PathBuf::from("/sand/run/pods.json")
         );
         assert_eq!(
             pod_runtime_dir("foo").unwrap(),

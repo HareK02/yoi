@@ -1,2 +1,2 @@
 pub mod dir;
-pub use ::scope_lock;
+pub use ::pod_registry;

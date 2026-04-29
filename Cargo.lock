@@ -2127,10 +2127,10 @@ dependencies = [
  "manifest",
  "memory",
  "minijinja",
+ "pod-registry",
  "protocol",
  "provider",
  "schemars",
- "scope-lock",
  "serde",
  "serde_json",
  "session-store",
@@ -2140,6 +2140,20 @@ dependencies = [
  "toml",
  "tools",
  "tracing",
+]
+
+[[package]]
+name = "pod-registry"
+version = "0.1.0"
+dependencies = [
+ "fs4",
+ "libc",
+ "manifest",
+ "serde",
+ "serde_json",
+ "session-store",
+ "tempfile",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -2745,20 +2759,6 @@ dependencies = [
  "quote",
  "serde_derive_internals",
  "syn 2.0.117",
-]
-
-[[package]]
-name = "scope-lock"
-version = "0.1.0"
-dependencies = [
- "fs4",
- "libc",
- "manifest",
- "serde",
- "serde_json",
- "session-store",
- "tempfile",
- "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -3587,9 +3587,9 @@ version = "0.1.0"
 dependencies = [
  "crossterm 0.28.1",
  "manifest",
+ "pod-registry",
  "protocol",
  "ratatui",
- "scope-lock",
  "serde_json",
  "session-store",
  "tokio",

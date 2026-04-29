@@ -15,4 +15,4 @@ uuid = "1.23"
 toml = "1.1.2"
 manifest = { version = "0.1.0", path = "../manifest" }
 session-store = { version = "0.1.0", path = "../session-store" }
-scope-lock = { version = "0.1.0", path = "../scope-lock" }
+pod-registry = { version = "0.1.0", path = "../pod-registry" }

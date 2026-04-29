@@ -1,9 +1,9 @@
 //! `SpawnPod` tool — launch a new Pod process as a child of this one.
 //!
-//! Wires scope-lock delegation, overlay-TOML construction, subprocess
+//! Wires pod-registry delegation, overlay-TOML construction, subprocess
 //! launch, and socket handoff into a single `Tool` implementation. When
 //! the LLM calls `SpawnPod`, a fresh `pod` binary is exec'd in its own
-//! process group, the scope lock is updated atomically, and the child's
+//! process group, the pod-registry is updated atomically, and the child's
 //! first turn is kicked off by handing its socket a `Method::Run`.
 
 use std::path::{Path, PathBuf};
@@ -26,7 +26,7 @@ use tokio::time::sleep;
 
 use crate::ipc::event;
 use crate::runtime::dir::SpawnedPodRecord;
-use crate::runtime::scope_lock::{self, LockFileGuard, ScopeLockError};
+use crate::runtime::pod_registry::{self, LockFileGuard, ScopeLockError};
 use crate::spawn::registry::SpawnedPodRegistry;
 use protocol::PodEvent;
 
@@ -93,7 +93,7 @@ impl From<PermissionInput> for Permission {
 /// controller once per Pod lifetime.
 pub struct SpawnPodTool {
     /// Spawner's own pod name — becomes the spawned Pod's
-    /// `delegated_from` in the scope-lock registry.
+    /// `delegated_from` in the pod-registry.
     spawner_name: String,
     /// Path to the spawner's Unix socket. Handed to the child via
     /// `--callback` so its `PodEvent` callbacks have somewhere to land.
@@ -167,7 +167,7 @@ impl Tool for SpawnPodTool {
             .unwrap_or_else(|| DEFAULT_INSTRUCTION.to_string());
 
         let predicted_socket = self.runtime_base.join(&input.name).join("sock");
-        let lock_path = scope_lock::default_lock_path()
+        let lock_path = pod_registry::default_registry_path()
             .map_err(|e| ToolError::ExecutionFailed(format!("scope lock path: {e}")))?;
 
         // Reserve the allocation up front. Spawner's pid is a live
@@ -175,7 +175,7 @@ impl Tool for SpawnPodTool {
         {
             let mut guard = LockFileGuard::open(&lock_path)
                 .map_err(|e| ToolError::ExecutionFailed(format!("scope lock open: {e}")))?;
-            scope_lock::delegate_scope(
+            pod_registry::delegate_scope(
                 &mut guard,
                 &self.spawner_name,
                 input.name.clone(),
@@ -183,7 +183,7 @@ impl Tool for SpawnPodTool {
                 predicted_socket.clone(),
                 scope_allow.clone(),
             )
-            .map_err(scope_lock_err_to_tool)?;
+            .map_err(pod_registry_err_to_tool)?;
         }
 
         // `start_outcome` covers steps that happen before the child is
@@ -312,7 +312,7 @@ impl SpawnPodTool {
 
     fn release_reservation(&self, lock_path: &Path, pod_name: &str) {
         if let Ok(mut g) = LockFileGuard::open(lock_path) {
-            let _ = scope_lock::release_pod(&mut g, pod_name);
+            let _ = pod_registry::release_pod(&mut g, pod_name);
         }
     }
 }
@@ -436,7 +436,7 @@ async fn send_run(socket: &Path, task: &str) -> Result<(), ToolError> {
     Ok(())
 }
 
-fn scope_lock_err_to_tool(e: ScopeLockError) -> ToolError {
+fn pod_registry_err_to_tool(e: ScopeLockError) -> ToolError {
     match e {
         ScopeLockError::NotSubset { .. }
         | ScopeLockError::WriteConflict { .. }

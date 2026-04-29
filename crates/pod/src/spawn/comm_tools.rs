@@ -22,7 +22,7 @@ use serde::Deserialize;
 use tokio::net::UnixStream;
 
 use crate::runtime::dir::SpawnedPodRecord;
-use crate::runtime::scope_lock::{self, LockFileGuard};
+use crate::runtime::pod_registry::{self, LockFileGuard};
 use crate::spawn::registry::SpawnedPodRegistry;
 
 /// Timeout applied to each socket-level operation — connect, write,
@@ -283,10 +283,10 @@ impl Tool for ListPodsTool {
         // allocation table doesn't keep growing indefinitely when
         // children crash without a clean exit path.
         if !stale_names.is_empty() {
-            if let Ok(lock_path) = scope_lock::default_lock_path()
+            if let Ok(lock_path) = pod_registry::default_registry_path()
                 && let Ok(mut guard) = LockFileGuard::open(&lock_path)
             {
-                scope_lock::reclaim_stale(&mut guard);
+                pod_registry::reclaim_stale(&mut guard);
             }
         }
 
@@ -475,11 +475,11 @@ fn summarize_scope(record: &SpawnedPodRecord) -> String {
 /// effects (Method::Shutdown was sent), and stale-reclaim will clean
 /// up whatever we couldn't.
 fn release_scope(pod_name: &str) {
-    let Ok(lock_path) = scope_lock::default_lock_path() else {
+    let Ok(lock_path) = pod_registry::default_registry_path() else {
         return;
     };
     let Ok(mut guard) = LockFileGuard::open(&lock_path) else {
         return;
     };
-    let _ = scope_lock::release_pod(&mut guard, pod_name);
+    let _ = pod_registry::release_pod(&mut guard, pod_name);
 }

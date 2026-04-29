@@ -5,7 +5,7 @@
 //! `SessionId`. Closes its inline viewport before returning so the
 //! caller can open a fresh viewport for the name dialog.
 //!
-//! The picker only handles selection. Forking, scope-lock checks, and
+//! The picker only handles selection. Forking, pod-registry checks, and
 //! actual `pod` launch happen later in the resume flow.
 
 use std::io;
@@ -19,7 +19,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::{Frame, TerminalOptions, Viewport};
-use scope_lock::lookup_session;
+use pod_registry::lookup_session;
 use session_store::{
     ContentPart, FsStore, HashedEntry, Item, LogEntry, SessionId, Store,
 };
@@ -73,7 +73,7 @@ struct Row {
     /// Last user / assistant snippet, or a `[corrupt]` placeholder.
     preview: String,
     /// `Some(pod_name)` when a live Pod currently holds an allocation
-    /// for this session in `scope.lock`. Picking such a row launches
+    /// for this session in `pods.json`. Picking such a row launches
     /// `pod --session <UUID>` which will fail with `SessionConflict` —
     /// the badge warns the user up-front.
     live_pod: Option<String>,
@@ -88,7 +88,7 @@ pub async fn run() -> Result<PickerOutcome, PickerError> {
     let mut rows: Vec<Row> = Vec::with_capacity(MAX_ROWS);
     for id in ids.into_iter().take(MAX_ROWS) {
         let preview = build_preview(&store, id).await;
-        // Best-effort live check. A scope.lock I/O hiccup downgrades
+        // Best-effort live check. A pods.json I/O hiccup downgrades
         // the row to "no badge" rather than killing the picker — the
         // user still gets to see the listing.
         let live_pod = lookup_session(id).ok().flatten().map(|info| info.pod_name);

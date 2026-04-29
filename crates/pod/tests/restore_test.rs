@@ -2,7 +2,7 @@
 //! validation paths.
 //!
 //! These cases all return before `prepare_pod_common` runs, so they
-//! do not need a real LLM client or scope-lock environment — only the
+//! do not need a real LLM client or pod-registry environment — only the
 //! session store needs to be present.
 
 use std::sync::{LazyLock, Mutex};

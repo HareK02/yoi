@@ -39,7 +39,7 @@ pub enum Method {
 ///
 /// Delivered as `Method::PodEvent` over the parent's Unix socket. The
 /// parent Controller applies variant-specific side effects (registry /
-/// scope-lock updates) and renders a human-readable string that is
+/// pod-registry updates) and renders a human-readable string that is
 /// injected into the parent's LLM context via the notification buffer.
 ///
 /// Transport is fire-and-forget; receivers must tolerate out-of-order

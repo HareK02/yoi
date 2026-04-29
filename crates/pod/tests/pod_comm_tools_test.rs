@@ -15,7 +15,7 @@ use llm_worker::llm_client::types::{ContentPart, Item, Role};
 use llm_worker::tool::ToolOutput;
 use manifest::{Permission, ScopeRule};
 use pod::runtime::dir::{RuntimeDir, SpawnedPodRecord};
-use pod::runtime::scope_lock::{self, LockFileGuard};
+use pod::runtime::pod_registry::{self, LockFileGuard};
 use pod::spawn::comm_tools::{
     list_pods_tool, read_pod_output_tool, send_to_pod_tool, stop_pod_tool,
 };
@@ -86,7 +86,7 @@ async fn setup_registry() -> (TempDir, Arc<SpawnedPodRegistry>, Arc<RuntimeDir>)
 
 /// Register a fake spawned-child record pointing at a given socket
 /// path, with a trivial write-scope for `scope_path`. Does not touch
-/// scope.lock.
+/// pods.json.
 async fn register_child(
     registry: &SpawnedPodRegistry,
     name: &str,
@@ -334,14 +334,14 @@ async fn stop_pod_sends_shutdown_and_releases_scope() {
     unsafe {
         std::env::set_var("INSOMNIA_RUNTIME_DIR", tmp.path());
     }
-    let lock_path = tmp.path().join("scope.lock");
+    let lock_path = tmp.path().join("pods.json");
 
-    // Seed scope.lock with a top-level `spawner` allocation plus a
+    // Seed pods.json with a top-level `spawner` allocation plus a
     // delegated `child` allocation — mimics what SpawnPod would have
     // done so StopPod has something to release.
     {
         let mut g = LockFileGuard::open(&lock_path).unwrap();
-        scope_lock::register_pod(
+        pod_registry::register_pod(
             &mut g,
             "spawner".into(),
             std::process::id(),
@@ -354,7 +354,7 @@ async fn stop_pod_sends_shutdown_and_releases_scope() {
             session_store::new_session_id(),
         )
         .unwrap();
-        scope_lock::delegate_scope(
+        pod_registry::delegate_scope(
             &mut g,
             "spawner",
             "child".into(),

@@ -46,7 +46,7 @@ struct Cli {
 
     /// Restore a Pod from an existing session. The Pod re-uses the
     /// given session id and appends new turns to the same jsonl;
-    /// concurrent writers are prevented by the `scope.lock` registry.
+    /// concurrent writers are prevented by the pod-registry.
     /// Mutually exclusive with `--adopt` (spawned children always start
     /// fresh).
     #[arg(long, value_name = "UUID", conflicts_with = "adopt")]

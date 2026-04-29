@@ -11,7 +11,7 @@ use crate::shared_state::PodSharedState;
 ///
 /// Written by the spawner after a successful `SpawnPod` tool call so
 /// `ListPods` (future ticket) and a restored spawner can enumerate
-/// their live children without re-querying `scope.lock`.
+/// their live children without re-querying `pods.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpawnedPodRecord {
     /// Spawned Pod's identity.
