@@ -14,6 +14,7 @@
   - [ ] ユーザーマニフェストのモデル設定 wizard → [tickets/tui-user-model-setup.md](tickets/tui-user-model-setup.md)
 - [ ] サブミット入力
   - [ ] TUI 補完 + 型付き atom 化 → [tickets/submit-tui-completion.md](tickets/submit-tui-completion.md)
+  - [ ] セッションログの Item 依存切り離し → [tickets/session-log-decouple-item.md](tickets/session-log-decouple-item.md)
   - [ ] セッションログの Segment 保持 → [tickets/session-log-segments.md](tickets/session-log-segments.md)
 - [ ] メモリ機構
   - [ ] Phase 2 consolidation → [tickets/memory-phase2-consolidation.md](tickets/memory-phase2-consolidation.md)

@@ -8,12 +8,25 @@
 
 LLM 側の入力は flatten 済み文字列のままで良い（worker / llm-client 層は変更しない）。永続化と client 復元経路にだけ segment を残す。
 
+## 前提チケット
+
+- `tickets/session-log-decouple-item.md` — session-store が llm-worker `Item` から独立した永続スキーマを持つようにする。本チケットはその上で `UserInput` を `Item` から `Vec<Segment>` に置き換える。
+
 ## 要件
 
-- セッションログに user message の元 `Vec<Segment>` を残す。worker の `Item` 表現や LLM 送信 payload は変更しない（`flatten_segments` の結果を引き続き食わせる）。
+- セッションログに user message を `Vec<Segment>` として残す。worker の `Item` 表現や LLM 送信 payload は変更しない（`flatten_segments` の結果を引き続き食わせる）。
+- `LogEntry::UserInput` から `item: Item` を取り除き、`segments: Vec<Segment>` のみ持つ形に置き換える。replay 時には `flatten_segments` で 1 文字列にして `Item::user_message(text)` を派生させ worker history に積む。
 - 復元経路で client が segments を取り戻せるようにする。最低限、TUI の `restore_history` が paste segment を典型の magenta `[Clipboard #N | ...]` チップとして再構築できること。
-- forward compat: 旧フォーマット（segments を持たないログ行）を読んでも panic / parse error にならず、従来通り text 1 個の segment として復元できること。
+- 後方互換は持たない。既存 jsonl ログは捨てる前提。
 - 現行の compaction / fork / restore のフローを壊さない。
+
+### Pod と save_delta の責務分割
+
+`save_delta` は worker history の差分を分類して `LogEntry::UserInput` を書いていたが、segments は worker history に存在しない。Pod 側で `Method::Run` 入口直後（`flatten_segments` 直前）に segments で `LogEntry::UserInput` を直接書き、`save_delta` からは user_message 分類を外す（assistant / tool_result / hook_injected のみ扱う）。
+
+### Event::History への segments 載せ方
+
+Pod が吐く `Event::History.items: Vec<serde_json::Value>` の user message オブジェクトに `segments` フィールドを embed する（既存の混合 JSON 表現を活かす）。TUI 側 `restore_history` は user 分岐で `segments` を読み出して `Block::UserMessage { segments }` を組む。
 
 ## 範囲外
 
@@ -23,15 +36,17 @@ LLM 側の入力は flatten 済み文字列のままで良い（worker / llm-cli
 
 ## 完了条件
 
-- セッションログに segment 情報が persist される（新規セッションから書かれる行は segments を含む）。
+- セッションログに segment 情報が persist される（`LogEntry::UserInput` が `{ ts, segments }` 形）。
 - TUI で paste を含むメッセージを送信 → セッションを開き直す → magenta チップが復元される。
-- segments を持たない旧ログ行も正常に restore でき、テキスト 1 segment として表示される。
-- 既存ビルド・テストを壊さない。新フォーマットに対する round-trip テスト 1 本は追加する。
+- 既存ビルド・テストが新スキーマで合格。
+- segments → flatten → Item の派生経路を round-trip テストで verify する。
 
 ## 参照
 
-- `tickets/submit-segment-protocol.md`（前提）
+- 前提: `tickets/session-log-decouple-item.md`
 - `crates/session-store/src/session_log.rs`（`LogEntry::UserInput`）
-- `crates/session-store/src/session.rs`（`restore`, `RestoredState`）
+- `crates/session-store/src/session.rs`（`save_delta`, `restore`, `RestoredState`）
+- `crates/pod/src/pod.rs`（`run`, `flatten_segments`, `persist_turn`）
+- `crates/pod/src/controller.rs`（`Event::UserMessage` broadcast 経路）
 - `crates/tui/src/app.rs`（`restore_history` — 現状 segment を捨てている地点）
-- `crates/protocol/src/lib.rs`（`Segment`）
+- `crates/protocol/src/lib.rs`（`Segment`, `Event::History`）
