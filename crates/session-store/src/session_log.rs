@@ -13,6 +13,8 @@ use llm_worker::{UsageRecord, WorkerResult};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::logged_item::LoggedItem;
+
 /// SHA-256 hash identifying a specific log entry in the chain.
 ///
 /// Computed as `sha256(prev_hash_bytes || canonical_json(entry))`.
@@ -100,7 +102,7 @@ pub enum LogEntry {
         ts: u64,
         system_prompt: Option<String>,
         config: RequestConfig,
-        history: Vec<Item>,
+        history: Vec<LoggedItem>,
         /// Origin: forked from another session at a specific entry.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         forked_from: Option<SessionOrigin>,
@@ -113,13 +115,13 @@ pub enum LogEntry {
     UserInput { ts: u64, item: Item },
 
     /// Assistant response items added to history (worker.rs:1040-1041).
-    AssistantItems { ts: u64, items: Vec<Item> },
+    AssistantItems { ts: u64, items: Vec<LoggedItem> },
 
     /// Tool execution results added to history (worker.rs:897-900, 1072-1076).
-    ToolResults { ts: u64, items: Vec<Item> },
+    ToolResults { ts: u64, items: Vec<LoggedItem> },
 
     /// Items injected by `on_turn_end` hook via `ContinueWithMessages` (worker.rs:1055).
-    HookInjectedItems { ts: u64, items: Vec<Item> },
+    HookInjectedItems { ts: u64, items: Vec<LoggedItem> },
 
     /// Turn boundary. Records the turn count after increment.
     TurnEnd { ts: u64, turn_count: usize },
@@ -234,19 +236,25 @@ pub fn collect_state(entries: &[HashedEntry]) -> RestoredState {
             } => {
                 state.system_prompt = system_prompt.clone();
                 state.config = config.clone();
-                state.history = history.clone();
+                state.history = history.iter().cloned().map(Item::from).collect();
             }
             LogEntry::UserInput { item, .. } => {
                 state.history.push(item.clone());
             }
             LogEntry::AssistantItems { items, .. } => {
-                state.history.extend(items.iter().cloned());
+                state
+                    .history
+                    .extend(items.iter().cloned().map(Item::from));
             }
             LogEntry::ToolResults { items, .. } => {
-                state.history.extend(items.iter().cloned());
+                state
+                    .history
+                    .extend(items.iter().cloned().map(Item::from));
             }
             LogEntry::HookInjectedItems { items, .. } => {
-                state.history.extend(items.iter().cloned());
+                state
+                    .history
+                    .extend(items.iter().cloned().map(Item::from));
             }
             LogEntry::TurnEnd { turn_count, .. } => {
                 state.turn_count = *turn_count;
@@ -333,7 +341,7 @@ mod tests {
             ts: 1000,
             system_prompt: Some("You are helpful.".into()),
             config: RequestConfig::default().with_max_tokens(1024),
-            history: vec![Item::user_message("seed")],
+            history: vec![Item::user_message("seed").into()],
             forked_from: None,
             compacted_from: None,
         }]);
@@ -361,7 +369,7 @@ mod tests {
             },
             LogEntry::AssistantItems {
                 ts: 3000,
-                items: vec![Item::assistant_message("Hi!")],
+                items: vec![Item::assistant_message("Hi!").into()],
             },
             LogEntry::TurnEnd {
                 ts: 3100,
@@ -396,19 +404,17 @@ mod tests {
             },
             LogEntry::AssistantItems {
                 ts: 3000,
-                items: vec![Item::tool_call(
-                    "call_1",
-                    "get_weather",
-                    r#"{"city":"Tokyo"}"#,
-                )],
+                items: vec![
+                    Item::tool_call("call_1", "get_weather", r#"{"city":"Tokyo"}"#).into(),
+                ],
             },
             LogEntry::ToolResults {
                 ts: 3500,
-                items: vec![Item::tool_result("call_1", "Sunny, 25C")],
+                items: vec![Item::tool_result("call_1", "Sunny, 25C").into()],
             },
             LogEntry::AssistantItems {
                 ts: 4000,
-                items: vec![Item::assistant_message("It's sunny in Tokyo!")],
+                items: vec![Item::assistant_message("It's sunny in Tokyo!").into()],
             },
             LogEntry::TurnEnd {
                 ts: 4100,
@@ -503,7 +509,7 @@ mod tests {
             },
             LogEntry::AssistantItems {
                 ts: 2200,
-                items: vec![Item::assistant_message("yo")],
+                items: vec![Item::assistant_message("yo").into()],
             },
             LogEntry::LlmUsage {
                 ts: 3100,

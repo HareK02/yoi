@@ -25,7 +25,7 @@ async fn round_trip_write_and_read() {
         },
         LogEntry::AssistantItems {
             ts: 3000,
-            items: vec![Item::assistant_message("Hi there!")],
+            items: vec![Item::assistant_message("Hi there!").into()],
         },
         LogEntry::TurnEnd {
             ts: 3100,
@@ -74,7 +74,10 @@ async fn create_session_writes_all_entries() {
         ts: 1000,
         system_prompt: None,
         config: RequestConfig::default(),
-        history: vec![Item::user_message("seed"), Item::assistant_message("ok")],
+        history: vec![
+            Item::user_message("seed").into(),
+            Item::assistant_message("ok").into(),
+        ],
         forked_from: None,
         compacted_from: None,
     }]);

@@ -5,6 +5,7 @@
 //! functions after state-mutating operations.
 
 use crate::SessionId;
+use crate::logged_item::{LoggedItem, to_logged};
 use crate::session_log::{self, EntryHash, HashedEntry, LogEntry, SessionOrigin};
 use crate::store::{Store, StoreError};
 use llm_worker::WorkerResult;
@@ -44,7 +45,7 @@ pub async fn create_session_with_id(
         ts: session_log::now_millis(),
         system_prompt: state.system_prompt.map(String::from),
         config: state.config.clone(),
-        history: state.history.to_vec(),
+        history: to_logged(state.history),
         forked_from: None,
         compacted_from: None,
     };
@@ -73,7 +74,7 @@ pub async fn create_compacted_session(
         ts: session_log::now_millis(),
         system_prompt: state.system_prompt.map(String::from),
         config: state.config.clone(),
-        history: state.history.to_vec(),
+        history: to_logged(state.history),
         forked_from: None,
         compacted_from: Some(SessionOrigin {
             session_id: source_session_id,
@@ -121,7 +122,7 @@ pub async fn ensure_head_or_fork(
         ts: session_log::now_millis(),
         system_prompt: state.system_prompt.map(String::from),
         config: state.config.clone(),
-        history: state.history.to_vec(),
+        history: to_logged(state.history),
         forked_from: None,
         compacted_from: None,
     };
@@ -179,7 +180,7 @@ pub async fn save_delta(
                 head_hash,
                 LogEntry::ToolResults {
                     ts,
-                    items: new_items[start..i].to_vec(),
+                    items: to_logged(&new_items[start..i]),
                 },
             )
             .await?;
@@ -198,7 +199,7 @@ pub async fn save_delta(
                 head_hash,
                 LogEntry::AssistantItems {
                     ts,
-                    items: new_items[start..i].to_vec(),
+                    items: to_logged(&new_items[start..i]),
                 },
             )
             .await?;
@@ -209,7 +210,7 @@ pub async fn save_delta(
                 head_hash,
                 LogEntry::HookInjectedItems {
                     ts,
-                    items: vec![new_items[i].clone()],
+                    items: vec![LoggedItem::from(&new_items[i])],
                 },
             )
             .await?;
@@ -369,7 +370,7 @@ pub async fn fork(
         ts: session_log::now_millis(),
         system_prompt: state.system_prompt.map(String::from),
         config: state.config.clone(),
-        history: state.history.to_vec(),
+        history: to_logged(state.history),
         forked_from: None,
         compacted_from: None,
     };
@@ -402,7 +403,7 @@ pub async fn fork_at(
         ts: session_log::now_millis(),
         system_prompt: state.system_prompt,
         config: state.config,
-        history: state.history,
+        history: to_logged(&state.history),
         forked_from: Some(session_log::SessionOrigin {
             session_id: source_id,
             at_hash: at_hash.clone(),

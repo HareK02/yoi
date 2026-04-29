@@ -28,12 +28,14 @@
 
 pub mod event_trace;
 pub mod fs_store;
+pub mod logged_item;
 pub mod session;
 pub mod session_log;
 pub mod store;
 
 pub use event_trace::TraceEntry;
 pub use fs_store::FsStore;
+pub use logged_item::{LoggedContentPart, LoggedItem, LoggedRole, from_logged, to_logged};
 pub use session::{
     SessionStartState, create_compacted_session, create_session, create_session_with_id,
     ensure_head_or_fork, fork, fork_at, restore, save_config_changed, save_delta, save_extension,

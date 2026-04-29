@@ -21,7 +21,8 @@ use ratatui::widgets::Paragraph;
 use ratatui::{Frame, TerminalOptions, Viewport};
 use pod_registry::lookup_session;
 use session_store::{
-    ContentPart, FsStore, HashedEntry, Item, LogEntry, SessionId, Store,
+    ContentPart, FsStore, HashedEntry, Item, LogEntry, LoggedContentPart, LoggedItem, SessionId,
+    Store,
 };
 
 const MAX_ROWS: usize = 10;
@@ -181,7 +182,7 @@ fn last_message_preview(entries: &[HashedEntry]) -> Option<String> {
                 }
             }
             LogEntry::AssistantItems { items, .. } => {
-                if let Some(text) = items.iter().find_map(first_text) {
+                if let Some(text) = items.iter().find_map(first_text_logged) {
                     return Some(format!("assistant: {}", trim_one_line(&text, 60)));
                 }
             }
@@ -195,6 +196,16 @@ fn first_text(item: &Item) -> Option<String> {
     match item {
         Item::Message { content, .. } => content.iter().find_map(|p| match p {
             ContentPart::Text { text } => Some(text.clone()),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
+fn first_text_logged(item: &LoggedItem) -> Option<String> {
+    match item {
+        LoggedItem::Message { content, .. } => content.iter().find_map(|p| match p {
+            LoggedContentPart::Text { text } => Some(text.clone()),
             _ => None,
         }),
         _ => None,
