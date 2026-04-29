@@ -10,7 +10,6 @@
   - [ ] フルスクリーン化によるオーバーホール → [tickets/tui-fullscreen-overhaul.md](tickets/tui-fullscreen-overhaul.md)
   - [ ] Run 中の入力キューイング → [tickets/tui-input-queue.md](tickets/tui-input-queue.md)
   - [ ] ユーザーマニフェストのモデル設定 wizard → [tickets/tui-user-model-setup.md](tickets/tui-user-model-setup.md)
-  - [ ] 既存セッションからの Pod 復帰 → [tickets/tui-session-restore.md](tickets/tui-session-restore.md)
 - [ ] サブミット入力
   - [ ] TUI 補完 + 型付き atom 化 → [tickets/submit-tui-completion.md](tickets/submit-tui-completion.md)
   - [ ] セッションログの Segment 保持 → [tickets/session-log-segments.md](tickets/session-log-segments.md)
