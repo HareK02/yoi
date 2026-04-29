@@ -5,6 +5,7 @@
 - [ ] Pod CLI: マニフェスト関連フラグの整理 → [tickets/pod-cli-manifest-flags.md](tickets/pod-cli-manifest-flags.md)
 - [ ] Pod オーケストレーション
   - [ ] 動的 Scope 変更 → [tickets/dynamic-scope.md](tickets/dynamic-scope.md)
+  - [ ] `scope-lock` → `pod-registry` リネーム → [tickets/pod-registry-rename.md](tickets/pod-registry-rename.md)
 - [ ] ネイティブ GUI クライアント MVP → [tickets/native-gui-mvp.md](tickets/native-gui-mvp.md)
 - [ ] TUI 拡充
   - [ ] フルスクリーン化によるオーバーホール → [tickets/tui-fullscreen-overhaul.md](tickets/tui-fullscreen-overhaul.md)
