@@ -257,19 +257,13 @@ pub fn collect_state(entries: &[HashedEntry]) -> RestoredState {
                 state.user_segments.push(segments.clone());
             }
             LogEntry::AssistantItems { items, .. } => {
-                state
-                    .history
-                    .extend(items.iter().cloned().map(Item::from));
+                state.history.extend(items.iter().cloned().map(Item::from));
             }
             LogEntry::ToolResults { items, .. } => {
-                state
-                    .history
-                    .extend(items.iter().cloned().map(Item::from));
+                state.history.extend(items.iter().cloned().map(Item::from));
             }
             LogEntry::HookInjectedItems { items, .. } => {
-                state
-                    .history
-                    .extend(items.iter().cloned().map(Item::from));
+                state.history.extend(items.iter().cloned().map(Item::from));
             }
             LogEntry::TurnEnd { turn_count, .. } => {
                 state.turn_count = *turn_count;
@@ -419,9 +413,7 @@ mod tests {
             },
             LogEntry::AssistantItems {
                 ts: 3000,
-                items: vec![
-                    Item::tool_call("call_1", "get_weather", r#"{"city":"Tokyo"}"#).into(),
-                ],
+                items: vec![Item::tool_call("call_1", "get_weather", r#"{"city":"Tokyo"}"#).into()],
             },
             LogEntry::ToolResults {
                 ts: 3500,
@@ -721,10 +713,7 @@ mod tests {
                 assert_eq!(content.len(), 1);
                 match &content[0] {
                     llm_worker::ContentPart::Text { text } => {
-                        assert_eq!(
-                            text,
-                            "see line1\nline2[unresolved file ref: src/main.rs]"
-                        );
+                        assert_eq!(text, "see line1\nline2[unresolved file ref: src/main.rs]");
                     }
                     other => panic!("unexpected content: {other:?}"),
                 }

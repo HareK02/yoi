@@ -12,22 +12,22 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use llm_worker::Item;
+use llm_worker::UsageRecord;
 use llm_worker::interceptor::{
     Interceptor, PostToolAction, PreRequestAction, PreToolAction, PromptAction, ToolCallInfo,
     ToolResultInfo, TurnEndAction,
 };
-use llm_worker::UsageRecord;
 use llm_worker::tool::ToolOutput;
 use tracing::info;
 
 use crate::compact::state::CompactState;
-use llm_worker::token_counter::total_tokens;
 use crate::hook::{
     AbortInfo, HookRegistry, PreRequestInfo, PromptSubmitInfo, ToolCallSummary, ToolResultSummary,
     TurnEndInfo,
 };
 use crate::ipc::notify_buffer::{NotifyBuffer, format_notify};
 use crate::prompt::catalog::PromptCatalog;
+use llm_worker::token_counter::total_tokens;
 use tracing::warn;
 
 /// Maximum number of bytes copied into `TurnEndInfo::final_text_preview`.

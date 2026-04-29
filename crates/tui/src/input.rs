@@ -71,9 +71,7 @@ fn char_class(c: char) -> AtomClass {
     let cp = c as u32;
     match cp {
         0x3040..=0x309F => AtomClass::Word(WordKind::Hiragana),
-        0x30A0..=0x30FF | 0x31F0..=0x31FF | 0xFF65..=0xFF9F => {
-            AtomClass::Word(WordKind::Katakana)
-        }
+        0x30A0..=0x30FF | 0x31F0..=0x31FF | 0xFF65..=0xFF9F => AtomClass::Word(WordKind::Katakana),
         0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF | 0x20000..=0x2FFFF => {
             AtomClass::Word(WordKind::Han)
         }

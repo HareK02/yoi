@@ -1207,10 +1207,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         // segments; only the user_messages surviving in retained_items
         // keep them. They are always the trailing K entries of
         // `self.user_segments` because submissions are appended in order.
-        let drop_n = self
-            .user_segments
-            .len()
-            .saturating_sub(retained_user_msgs);
+        let drop_n = self.user_segments.len().saturating_sub(retained_user_msgs);
         if drop_n > 0 {
             self.user_segments.drain(..drop_n);
         }
@@ -1371,7 +1368,12 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             return Ok(ExtractDecision::Skipped);
         }
 
-        let current_history_len = self.worker.as_ref().expect("worker present").history().len();
+        let current_history_len = self
+            .worker
+            .as_ref()
+            .expect("worker present")
+            .history()
+            .len();
         if current_history_len <= processed_history_len {
             return Ok(ExtractDecision::Skipped);
         }
@@ -1392,11 +1394,8 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             return Ok(ExtractDecision::Skipped);
         }
 
-        let items_to_extract = self
-            .worker
-            .as_ref()
-            .expect("worker present")
-            .history()[processed_history_len..current_history_len]
+        let items_to_extract = self.worker.as_ref().expect("worker present").history()
+            [processed_history_len..current_history_len]
             .to_vec();
 
         let layout = memory::WorkspaceLayout::resolve(memory_cfg, &self.pwd);
@@ -1428,7 +1427,10 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         extract_worker.register_tool(extract::write_extracted_tool(ctx.clone()));
 
         let input_text = extract::build_extract_input(&items_to_extract);
-        extract_worker.run(input_text).await.map_err(PodError::Worker)?;
+        extract_worker
+            .run(input_text)
+            .await
+            .map_err(PodError::Worker)?;
 
         let payload = ctx.take_payload().unwrap_or_else(|| {
             tracing::warn!(
@@ -1602,8 +1604,11 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
         let common = prepare_pod_common(&manifest, &loader, /* parse_template */ true)?;
 
         let session_id = session_store::new_session_id();
-        let scope_allocation =
-            pod_registry::adopt_allocation(manifest.pod.name.clone(), std::process::id(), session_id)?;
+        let scope_allocation = pod_registry::adopt_allocation(
+            manifest.pod.name.clone(),
+            std::process::id(),
+            session_id,
+        )?;
 
         let mut worker = Worker::new(common.client);
         apply_worker_manifest(&mut worker, &manifest.worker);

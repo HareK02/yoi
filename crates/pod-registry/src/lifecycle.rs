@@ -150,13 +150,14 @@ pub fn lookup_session(session_id: SessionId) -> Result<Option<SessionLockInfo>, 
     let lock_path = default_registry_path()?;
     let mut guard = LockFileGuard::open(&lock_path)?;
     crate::mutate::reclaim_stale(&mut guard);
-    Ok(guard.data().find_by_session(session_id).map(|a| {
-        SessionLockInfo {
+    Ok(guard
+        .data()
+        .find_by_session(session_id)
+        .map(|a| SessionLockInfo {
             pod_name: a.pod_name.clone(),
             socket: a.socket.clone(),
             pid: a.pid,
-        }
-    }))
+        }))
 }
 
 #[cfg(test)]

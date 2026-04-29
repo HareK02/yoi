@@ -84,7 +84,12 @@ mod tests {
         };
         let (id, path) = write_staging(&layout, source.clone(), payload).unwrap();
         assert_eq!(path.parent().unwrap(), layout.staging_dir());
-        assert!(path.file_name().unwrap().to_string_lossy().contains(&id.to_string()));
+        assert!(
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains(&id.to_string())
+        );
 
         let written: StagingRecord =
             serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
@@ -101,8 +106,7 @@ mod tests {
             session_id: "sess".into(),
             range: [0, 0],
         };
-        let (_, path) =
-            write_staging(&layout, source, ExtractedPayload::default()).unwrap();
+        let (_, path) = write_staging(&layout, source, ExtractedPayload::default()).unwrap();
         let written: StagingRecord =
             serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert!(written.payload.is_empty());

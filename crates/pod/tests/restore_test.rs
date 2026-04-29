@@ -43,13 +43,9 @@ async fn restore_from_manifest_rejects_unknown_session() {
     // NotFound, which `Pod::restore_from_manifest` surfaces verbatim
     // as `PodError::Store`.
     let unknown = session_store::new_session_id();
-    let result = Pod::restore_from_manifest(
-        unknown,
-        manifest,
-        store,
-        pod::PromptLoader::builtins_only(),
-    )
-    .await;
+    let result =
+        Pod::restore_from_manifest(unknown, manifest, store, pod::PromptLoader::builtins_only())
+            .await;
 
     match result {
         Err(PodError::Store(StoreError::NotFound(id))) => assert_eq!(id, unknown),

@@ -460,7 +460,9 @@ impl App {
                             // single text segment.
                             let segments = item
                                 .get("segments")
-                                .and_then(|v| serde_json::from_value::<Vec<Segment>>(v.clone()).ok())
+                                .and_then(|v| {
+                                    serde_json::from_value::<Vec<Segment>>(v.clone()).ok()
+                                })
                                 .unwrap_or_else(|| {
                                     if text.is_empty() {
                                         Vec::new()

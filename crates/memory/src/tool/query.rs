@@ -450,7 +450,9 @@ mod tests {
     }
 
     fn write_decision(dir: &Path, slug: &str, body: &str) {
-        let path = dir.join(".insomnia/memory/decisions").join(format!("{slug}.md"));
+        let path = dir
+            .join(".insomnia/memory/decisions")
+            .join(format!("{slug}.md"));
         let content = format!(
             "---\ncreated_at: {n}\nupdated_at: {n}\nsources: []\nstatus: open\n---\n{body}",
             n = now()
@@ -501,12 +503,14 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].slug, "alpha");
         assert_eq!(records[0].kind, "decision");
-        assert!(records[0]
-            .excerpt
-            .as_deref()
-            .unwrap()
-            .to_lowercase()
-            .contains("ollama"));
+        assert!(
+            records[0]
+                .excerpt
+                .as_deref()
+                .unwrap()
+                .to_lowercase()
+                .contains("ollama")
+        );
     }
 
     #[tokio::test]
@@ -634,12 +638,14 @@ mod tests {
         assert_eq!(records[0].kind.as_deref(), Some("policy"));
         assert_eq!(records[0].description.as_deref(), Some("the policy doc"));
         assert_eq!(records[0].model_invokation, Some(false));
-        assert!(records[0]
-            .excerpt
-            .as_deref()
-            .unwrap()
-            .to_lowercase()
-            .contains("ollama"));
+        assert!(
+            records[0]
+                .excerpt
+                .as_deref()
+                .unwrap()
+                .to_lowercase()
+                .contains("ollama")
+        );
     }
 
     #[tokio::test]

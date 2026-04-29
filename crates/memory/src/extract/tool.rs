@@ -134,8 +134,9 @@ mod tests {
         let ctx = Arc::new(ExtractWorkerContext::new());
         let tool: Arc<dyn Tool> = Arc::new(WriteExtractedTool { ctx: ctx.clone() });
 
-        let first = serde_json::json!({"decisions": [], "discussions": [], "attempts": [], "requests": []})
-            .to_string();
+        let first =
+            serde_json::json!({"decisions": [], "discussions": [], "attempts": [], "requests": []})
+                .to_string();
         tool.execute(&first).await.unwrap();
 
         let second = serde_json::json!({

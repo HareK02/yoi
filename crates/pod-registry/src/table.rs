@@ -249,10 +249,7 @@ mod tests {
         assert!(g.data().find_by_session(target_session).is_none());
 
         // After adopt-style rewrite, the same allocation is now found.
-        g.data_mut()
-            .find_mut("child")
-            .unwrap()
-            .session_id = Some(target_session);
+        g.data_mut().find_mut("child").unwrap().session_id = Some(target_session);
         let found = g.data().find_by_session(target_session).unwrap();
         assert_eq!(found.pod_name, "child");
     }

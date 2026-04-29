@@ -23,9 +23,7 @@ pub struct ExtractPointerPayload {
 
 /// `RestoredState.extensions` から最新の Phase 1 pointer を取り出す。
 /// 未抽出セッションでは `None`。
-pub fn fold_pointer(
-    extensions: &[(String, serde_json::Value)],
-) -> Option<ExtractPointerPayload> {
+pub fn fold_pointer(extensions: &[(String, serde_json::Value)]) -> Option<ExtractPointerPayload> {
     extensions
         .iter()
         .rev()
@@ -48,10 +46,7 @@ mod tests {
                     "staging_id": "old"
                 }),
             ),
-            (
-                "other.domain".to_string(),
-                serde_json::json!({ "x": 1 }),
-            ),
+            ("other.domain".to_string(), serde_json::json!({ "x": 1 })),
             (
                 EXTRACT_DOMAIN.to_string(),
                 serde_json::json!({
@@ -69,21 +64,16 @@ mod tests {
 
     #[test]
     fn fold_returns_none_when_absent() {
-        let exts = vec![(
-            "other.domain".to_string(),
-            serde_json::json!({ "x": 1 }),
-        )];
+        let exts = vec![("other.domain".to_string(), serde_json::json!({ "x": 1 }))];
         assert!(fold_pointer(&exts).is_none());
     }
 
     #[test]
     fn fold_skips_malformed_entries() {
-        let exts = vec![
-            (
-                EXTRACT_DOMAIN.to_string(),
-                serde_json::json!({ "wrong_shape": true }),
-            ),
-        ];
+        let exts = vec![(
+            EXTRACT_DOMAIN.to_string(),
+            serde_json::json!({ "wrong_shape": true }),
+        )];
         // 現状は最新を取り出して JSON 不一致なら None。古いものに fallback
         // しないのは、壊れた最新を黙って無視すると意図しない再抽出を招くため。
         assert!(fold_pointer(&exts).is_none());

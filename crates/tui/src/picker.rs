@@ -12,6 +12,7 @@ use std::io;
 use std::time::Duration;
 
 use crossterm::event::{self, Event as TermEvent, KeyCode, KeyEventKind, KeyModifiers};
+use pod_registry::lookup_session;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout};
@@ -19,7 +20,6 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::{Frame, TerminalOptions, Viewport};
-use pod_registry::lookup_session;
 use session_store::{
     FsStore, HashedEntry, LogEntry, LoggedContentPart, LoggedItem, SessionId, Store,
 };
@@ -138,9 +138,7 @@ pub async fn run() -> Result<PickerOutcome, PickerError> {
 /// scrolls the terminal up exactly one row, so the next inline
 /// viewport opens immediately below the picker rather than on top of
 /// it.
-fn close_viewport(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-) -> io::Result<()> {
+fn close_viewport(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
     let area = terminal.get_frame().area();
     let last_row = area.bottom().saturating_sub(1);
     terminal.set_cursor_position((0, last_row))?;
@@ -253,8 +251,7 @@ fn poll_event() -> io::Result<Option<Action>> {
 
 fn draw(f: &mut Frame<'_>, rows: &[Row], selected: usize) {
     let area = f.area();
-    let mut constraints: Vec<Constraint> =
-        Vec::with_capacity(rows.len() + 3);
+    let mut constraints: Vec<Constraint> = Vec::with_capacity(rows.len() + 3);
     constraints.push(Constraint::Length(1)); // title
     for _ in rows {
         constraints.push(Constraint::Length(1));
@@ -272,10 +269,7 @@ fn draw(f: &mut Frame<'_>, rows: &[Row], selected: usize) {
     );
 
     for (i, row) in rows.iter().enumerate() {
-        f.render_widget(
-            Paragraph::new(row_line(row, i == selected)),
-            layout[i + 1],
-        );
+        f.render_widget(Paragraph::new(row_line(row, i == selected)), layout[i + 1]);
     }
 
     f.render_widget(
@@ -325,4 +319,3 @@ fn short_session(id: SessionId) -> String {
     let s = id.to_string();
     s.chars().take(8).collect()
 }
-

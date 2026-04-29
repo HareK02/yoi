@@ -548,7 +548,8 @@ mod tests {
         //   `db-pol` (1 deletion), `db-pools` (1 insertion).
         for slug in ["db-pol", "db-pools"] {
             write(
-                &dir.path().join(format!(".insomnia/memory/decisions/{slug}.md")),
+                &dir.path()
+                    .join(format!(".insomnia/memory/decisions/{slug}.md")),
                 &format!(
                     "---\ncreated_at: {n}\nupdated_at: {n}\nsources: []\nstatus: open\n---\n",
                     n = iso_now()
@@ -577,7 +578,8 @@ mod tests {
         let (dir, linter) = workspace();
         for slug in ["alpha", "bravo"] {
             write(
-                &dir.path().join(format!(".insomnia/memory/decisions/{slug}.md")),
+                &dir.path()
+                    .join(format!(".insomnia/memory/decisions/{slug}.md")),
                 &format!(
                     "---\ncreated_at: {n}\nupdated_at: {n}\nsources: []\nstatus: open\n---\n",
                     n = iso_now()

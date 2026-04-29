@@ -155,7 +155,11 @@ mod tests {
     fn non_md_files_ignored() {
         let (dir, layout) = setup();
         write_knowledge(dir.path(), "good", "ok", true, "");
-        std::fs::write(dir.path().join(".insomnia/knowledge/note.txt"), "not markdown\n").unwrap();
+        std::fs::write(
+            dir.path().join(".insomnia/knowledge/note.txt"),
+            "not markdown\n",
+        )
+        .unwrap();
 
         let got = collect_resident_knowledge(&layout);
         assert_eq!(got.len(), 1);
