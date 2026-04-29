@@ -276,6 +276,7 @@ impl PodController {
             manifest_toml.clone(),
             greeting,
         ));
+        shared_state.update_history(pod.worker().history().to_vec());
         shared_state.set_user_segments(pod.user_segments().to_vec());
         runtime_dir.write_manifest(&manifest_toml).await?;
         runtime_dir.write_status(&shared_state).await?;
