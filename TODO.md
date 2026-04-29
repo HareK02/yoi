@@ -1,4 +1,6 @@
-- [ ] Agent Skills サポート → [tickets/agent-skills.md](tickets/agent-skills.md)
+- [ ] Workflow / Skills
+  - [ ] Workflow 実装 → [tickets/workflow.md](tickets/workflow.md)
+  - [ ] Agent Skills を Workflow として ingest → [tickets/agent-skills.md](tickets/agent-skills.md)
 - [ ] ツール設計
   - [ ] Bash ツール (Permission 層と統合) → [tickets/bash-tool.md](tickets/bash-tool.md)
 - [ ] パーミッション: パターンベースのツール実行制御 → [tickets/permission-extension-point.md](tickets/permission-extension-point.md)
@@ -10,6 +12,7 @@
   - [ ] フルスクリーン化によるオーバーホール → [tickets/tui-fullscreen-overhaul.md](tickets/tui-fullscreen-overhaul.md)
   - [ ] Run 中の入力キューイング → [tickets/tui-input-queue.md](tickets/tui-input-queue.md)
   - [ ] ユーザーマニフェストのモデル設定 wizard → [tickets/tui-user-model-setup.md](tickets/tui-user-model-setup.md)
+  - [ ] 入力欄の単語単位カーソル移動 → [tickets/tui-input-word-motion.md](tickets/tui-input-word-motion.md)
 - [ ] サブミット入力
   - [ ] TUI 補完 + 型付き atom 化 → [tickets/submit-tui-completion.md](tickets/submit-tui-completion.md)
   - [ ] セッションログの Segment 保持 → [tickets/session-log-segments.md](tickets/session-log-segments.md)
