@@ -13,7 +13,7 @@ TUI の入力欄では現在、`Left/Right` で1文字単位の移動、`Home/En
 - 「単語」の境界は文字種ベースで判定する：
   - **ASCII**: 英数字とアンダースコア (`_`)
   - **ひらがな** (U+3040..U+309F)
-  - **カタカナ** (U+30A0..U+30FF, U+31F0..U+31FF)
+  - **カタカナ** (U+30A0..U+30FF, U+31F0..U+31FF, 半角カナ U+FF65..U+FF9F)
   - **漢字** (CJK Unified Ideographs: U+3400..U+4DBF, U+4E00..U+9FFF, U+F900..U+FAFF, U+20000..U+2FFFF)
   - **その他の単語文字**: 上記に該当せず `char::is_alphanumeric()` が true（アクセント付きラテン、キリル、ハングル等をひとまとめ）
   - 上記以外（空白・句読点・改行）は区切り。
@@ -35,3 +35,8 @@ TUI の入力欄では現在、`Left/Right` で1文字単位の移動、`Home/En
 - `Ctrl+Delete` / `Alt+d` などによる単語単位の前方削除（別チケット候補）。
 - `Alt+Left/Right` など他の単語移動キーバインドの追加。
 - 形態素解析による日本語の単語分割（辞書サイズ・起動コストの観点で TUI には過剰）。送り仮名や複合語の途中で切れる挙動は許容する。
+
+## Review
+- 状態: Approve
+- レビュー詳細: [./tui-input-word-motion.review.md](./tui-input-word-motion.review.md)
+- 日付: 2026-04-29

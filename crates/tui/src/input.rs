@@ -71,7 +71,9 @@ fn char_class(c: char) -> AtomClass {
     let cp = c as u32;
     match cp {
         0x3040..=0x309F => AtomClass::Word(WordKind::Hiragana),
-        0x30A0..=0x30FF | 0x31F0..=0x31FF => AtomClass::Word(WordKind::Katakana),
+        0x30A0..=0x30FF | 0x31F0..=0x31FF | 0xFF65..=0xFF9F => {
+            AtomClass::Word(WordKind::Katakana)
+        }
         0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF | 0x20000..=0x2FFFF => {
             AtomClass::Word(WordKind::Han)
         }
@@ -717,6 +719,23 @@ mod word_motion_tests {
         assert_eq!(cursor(&buf), 3); // start of "の"
         buf.move_word_left();
         assert_eq!(cursor(&buf), 0); // start of "日本語"
+    }
+
+    #[test]
+    fn halfwidth_katakana_is_treated_as_katakana() {
+        // 半角カナ「ｱｲｳｴｵ」は5 atom、すべて Katakana 種別。
+        let mut buf = buf_from("ｱｲｳｴｵfoo");
+        buf.cursor = 0;
+        buf.move_word_right();
+        assert_eq!(cursor(&buf), 5); // after "ｱｲｳｴｵ"
+        buf.move_word_right();
+        assert_eq!(cursor(&buf), 8); // after "foo"
+
+        // 全角と半角のカタカナは同じ Katakana 種別なので1単語につながる。
+        let mut buf2 = buf_from("カタｶﾅ");
+        buf2.cursor = 0;
+        buf2.move_word_right();
+        assert_eq!(cursor(&buf2), 4);
     }
 
     #[test]
