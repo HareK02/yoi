@@ -14,7 +14,6 @@
   - [ ] TUI 補完 + 型付き atom 化 → [tickets/submit-tui-completion.md](tickets/submit-tui-completion.md)
   - [ ] セッションログの Segment 保持 → [tickets/session-log-segments.md](tickets/session-log-segments.md)
 - [ ] メモリ機構
-  - [ ] Phase 1 活動抽出 → [tickets/memory-phase1-extract.md](tickets/memory-phase1-extract.md)
   - [ ] Phase 2 consolidation → [tickets/memory-phase2-consolidation.md](tickets/memory-phase2-consolidation.md)
   - [ ] 使用頻度メトリクス + Knowledge 化候補レポート → [tickets/memory-usage-metrics.md](tickets/memory-usage-metrics.md)
   - [ ] GC（定期再評価） → [tickets/memory-gc.md](tickets/memory-gc.md)
