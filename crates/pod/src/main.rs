@@ -44,9 +44,9 @@ struct Cli {
     #[arg(long, value_name = "PATH", requires = "adopt")]
     callback: Option<PathBuf>,
 
-    /// Restore a Pod from an existing session. The source session log
-    /// is forked at its head into a new session id, so the original
-    /// jsonl is left untouched and double-write races are impossible.
+    /// Restore a Pod from an existing session. The Pod re-uses the
+    /// given session id and appends new turns to the same jsonl;
+    /// concurrent writers are prevented by the `scope.lock` registry.
     /// Mutually exclusive with `--adopt` (spawned children always start
     /// fresh).
     #[arg(long, value_name = "UUID", conflicts_with = "adopt")]

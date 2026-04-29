@@ -100,10 +100,11 @@ pub struct Pod<C: LlmClient, St: Store> {
     /// PodInterceptor installed in `ensure_interceptor_installed`.
     pending_notifies: NotifyBuffer,
     /// Scope allocation in the machine-wide lock file. `Some` for
-    /// Pods built via `from_manifest` (production path); `None` for
-    /// lower-level constructors (`Pod::new`, `Pod::restore`) that
-    /// bypass the registry. Kept purely for its `Drop` impl, which
-    /// releases the allocation when the Pod is dropped.
+    /// Pods built via `from_manifest` / `from_manifest_spawned` /
+    /// `restore_from_manifest` (production paths); `None` for the
+    /// low-level `Pod::new` constructor used in tests, which bypasses
+    /// the registry. Kept purely for its `Drop` impl, which releases
+    /// the allocation when the Pod is dropped.
     #[allow(dead_code)]
     scope_allocation: Option<ScopeAllocationGuard>,
     /// Socket path of the spawning Pod. `Some` only for Pods built via
@@ -717,6 +718,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             self.head_hash = Some(hash);
             return Ok(());
         }
+        let prev_session_id = self.session_id;
         session_store::ensure_head_or_fork(
             &self.store,
             &mut self.session_id,
@@ -724,6 +726,13 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             state,
         )
         .await?;
+        // ensure_head_or_fork mints a fresh session_id when it auto-
+        // forks. Sync that to scope.lock so a concurrent
+        // restore_from_manifest can't see "no live writer" for the new
+        // session and grab it.
+        if self.session_id != prev_session_id && self.scope_allocation.is_some() {
+            scope_lock::update_session(&self.manifest.pod.name, self.session_id)?;
+        }
         Ok(())
     }
 
@@ -1155,6 +1164,15 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         // until its first LLM call.
         self.session_id = new_session_id;
         self.head_hash = Some(new_head_hash);
+        // Keep scope.lock pointing at the live session_id. Without this
+        // a concurrent `restore_from_manifest(new_session_id)` would
+        // see no live writer and grab the session this Pod just moved
+        // into, causing two writers to race on the same jsonl. Skipped
+        // when no allocation is installed (e.g. compact under
+        // `Pod::new` in tests).
+        if self.scope_allocation.is_some() {
+            scope_lock::update_session(&self.manifest.pod.name, new_session_id)?;
+        }
         let worker = self.worker.as_mut().unwrap();
         worker.set_history(new_history);
         // Anchor the prompt cache at the summary item so that Anthropic
@@ -1602,15 +1620,6 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
         store: St,
         loader: PromptLoader,
     ) -> Result<Self, PodError> {
-        // Refuse to resume into a session that's already being written.
-        if let Some(info) = scope_lock::lookup_session(session_id)? {
-            return Err(PodError::SessionInUse {
-                session_id,
-                pod_name: info.pod_name,
-                socket: info.socket,
-            });
-        }
-
         let state = session_store::restore(&store, session_id).await?;
         if state.head_hash.is_none() {
             return Err(PodError::SessionEmpty { session_id });
@@ -1618,6 +1627,11 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
 
         let common = prepare_pod_common(&manifest, &loader, /* parse_template */ false)?;
 
+        // Atomic: register_pod inside install_top_level rejects when
+        // another live allocation already holds `session_id`. Wrapping
+        // the lookup + install inside a single `LockFileGuard` is what
+        // makes "no two live Pods write to the same session log"
+        // actually structural rather than a hopeful pre-check.
         let socket_path = dir::default_base()
             .map_err(ScopeLockError::from)?
             .join(&manifest.pod.name)
@@ -1882,16 +1896,6 @@ pub enum PodError {
 
     #[error("memory Phase 1 staging write failed: {0}")]
     ExtractStaging(#[source] memory::extract::StagingError),
-
-    #[error(
-        "session {session_id} is currently in use by pod `{pod_name}` at {}",
-        .socket.display()
-    )]
-    SessionInUse {
-        session_id: SessionId,
-        pod_name: String,
-        socket: PathBuf,
-    },
 
     #[error("session {session_id} has no entries to restore")]
     SessionEmpty { session_id: SessionId },

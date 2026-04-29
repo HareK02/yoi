@@ -1,2 +1,2 @@
 pub mod dir;
-pub mod scope_lock;
+pub use ::scope_lock;

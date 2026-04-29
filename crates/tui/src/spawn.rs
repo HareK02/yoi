@@ -447,8 +447,8 @@ struct Form {
     editing: bool,
     /// `Some(id)` flips the dialog into "Resume Pod" mode: the title
     /// switches, the source session is shown to the user, and the
-    /// child pod is launched with `--session <id>` so it forks and
-    /// restores `id`.
+    /// child pod is launched with `--session <id>` so it restores
+    /// from `id` and appends to the same session log.
     resume_from: Option<SessionId>,
 }
 

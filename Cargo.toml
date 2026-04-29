@@ -9,6 +9,7 @@ members = [
     "crates/pod",
     "crates/protocol",
     "crates/provider",
+    "crates/scope-lock",
     "crates/tools",
     "crates/tui", "crates/memory",
 ]

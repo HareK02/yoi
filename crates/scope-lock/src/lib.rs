@@ -303,6 +303,10 @@ fn find_conflict_in_subtree(
 /// Register a top-level Pod (started directly by a human, no
 /// delegation parent). Reclaims stale entries before checking
 /// conflicts so a crashed Pod's allocation doesn't block the new one.
+///
+/// Rejects when another live allocation is already writing to
+/// `session_id`, so two `restore_from_manifest` calls under different
+/// `pod_name`s cannot both grab the same session log.
 pub fn register_pod(
     guard: &mut LockFileGuard,
     pod_name: String,
@@ -314,6 +318,13 @@ pub fn register_pod(
     reclaim_stale(guard);
     if guard.data().find(&pod_name).is_some() {
         return Err(ScopeLockError::DuplicatePodName(pod_name));
+    }
+    if let Some(existing) = guard.data().find_by_session(session_id) {
+        return Err(ScopeLockError::SessionConflict {
+            session_id,
+            pod_name: existing.pod_name.clone(),
+            socket: existing.socket.clone(),
+        });
     }
     for rule in scope_allow
         .iter()
@@ -550,6 +561,46 @@ pub fn adopt_allocation(
     })
 }
 
+/// Rewrite the `session_id` recorded for `pod_name` to
+/// `new_session_id`.
+///
+/// The Pod's in-memory `session_id` can change underneath the
+/// allocation in two normal places:
+///
+/// - `Pod::compact` mints a fresh session and swaps it in.
+/// - `session_store::ensure_head_or_fork` auto-forks when another
+///   writer has advanced the store head behind our back.
+///
+/// Both paths must call this so subsequent `lookup_session` queries
+/// find the live session id, not the old one. Without this update a
+/// concurrent `restore_from_manifest(new_id)` would see "no live
+/// writer" and proceed to register a competing allocation on the
+/// session this Pod just moved into.
+///
+/// The lock is opened once and the allocation is rewritten inside the
+/// guard, so the session_id collision check is atomic with the
+/// rewrite.
+pub fn update_session(pod_name: &str, new_session_id: SessionId) -> Result<(), ScopeLockError> {
+    let lock_path = default_lock_path()?;
+    let mut guard = LockFileGuard::open(&lock_path)?;
+    if let Some(other) = guard.data().find_by_session(new_session_id) {
+        if other.pod_name != pod_name {
+            return Err(ScopeLockError::SessionConflict {
+                session_id: new_session_id,
+                pod_name: other.pod_name.clone(),
+                socket: other.socket.clone(),
+            });
+        }
+    }
+    let alloc = guard
+        .data_mut()
+        .find_mut(pod_name)
+        .ok_or_else(|| ScopeLockError::UnknownPod(pod_name.into()))?;
+    alloc.session_id = Some(new_session_id);
+    guard.save()?;
+    Ok(())
+}
+
 /// Information about a Pod that currently holds an allocation for a
 /// given session.
 #[derive(Debug, Clone)]
@@ -593,6 +644,15 @@ pub enum ScopeLockError {
     NotSubset { spawner: String, rule: ScopeRule },
     #[error("pod `{0}` is not registered")]
     UnknownPod(String),
+    #[error(
+        "session {session_id} is already held by pod `{pod_name}` at {}",
+        .socket.display()
+    )]
+    SessionConflict {
+        session_id: SessionId,
+        pod_name: String,
+        socket: PathBuf,
+    },
 }
 
 #[cfg(test)]
@@ -1198,6 +1258,166 @@ mod tests {
         match err {
             ScopeLockError::WriteConflict { competitor, .. } => assert_eq!(competitor, "b"),
             other => panic!("expected WriteConflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn find_by_session_skips_none_placeholders() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("scope.lock");
+        let mut g = open_empty(&path);
+        // Pre-reservation: delegate_scope leaves session_id = None
+        // until adopt_allocation rewrites it. find_by_session must not
+        // match those placeholders, otherwise a freshly-spawning child
+        // would shadow itself before it has even chosen a session.
+        register_pod(
+            &mut g,
+            "parent".into(),
+            std::process::id(),
+            sock("parent"),
+            vec![write_rule("/p", true)],
+            sid(),
+        )
+        .unwrap();
+        delegate_scope(
+            &mut g,
+            "parent",
+            "child".into(),
+            std::process::id(),
+            sock("child"),
+            vec![write_rule("/p/sub", true)],
+        )
+        .unwrap();
+
+        let target_session = sid();
+        // The placeholder allocation has session_id = None and must
+        // not be returned for any lookup.
+        assert!(g.data().find_by_session(target_session).is_none());
+
+        // After adopt-style rewrite, the same allocation is now found.
+        g.data_mut()
+            .find_mut("child")
+            .unwrap()
+            .session_id = Some(target_session);
+        let found = g.data().find_by_session(target_session).unwrap();
+        assert_eq!(found.pod_name, "child");
+    }
+
+    #[test]
+    fn register_pod_rejects_session_id_collision() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("scope.lock");
+        let mut g = open_empty(&path);
+        let shared_session = sid();
+        register_pod(
+            &mut g,
+            "first".into(),
+            std::process::id(),
+            sock("first"),
+            vec![write_rule("/work/a", true)],
+            shared_session,
+        )
+        .unwrap();
+        // Second registration tries to grab the same session_id under
+        // a different pod_name. Without the SessionConflict check both
+        // would succeed and race on the same jsonl.
+        let err = register_pod(
+            &mut g,
+            "second".into(),
+            std::process::id(),
+            sock("second"),
+            vec![write_rule("/work/b", true)],
+            shared_session,
+        )
+        .unwrap_err();
+        match err {
+            ScopeLockError::SessionConflict {
+                session_id,
+                pod_name,
+                ..
+            } => {
+                assert_eq!(session_id, shared_session);
+                assert_eq!(pod_name, "first");
+            }
+            other => panic!("expected SessionConflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lookup_session_returns_live_writer_info() {
+        let dir = TempDir::new().unwrap();
+        let _sandbox = RuntimeDirSandbox::new(dir.path());
+        let s = sid();
+        let guard = install_top_level(
+            "live".into(),
+            std::process::id(),
+            sock("live"),
+            vec![write_rule("/work", true)],
+            s,
+        )
+        .unwrap();
+        let info = lookup_session(s).unwrap().expect("expected live writer");
+        assert_eq!(info.pod_name, "live");
+        assert_eq!(info.socket, sock("live"));
+        drop(guard);
+        // After the guard's release, the lookup goes back to None.
+        assert!(lookup_session(s).unwrap().is_none());
+    }
+
+    #[test]
+    fn update_session_rewrites_allocation_session_id() {
+        let dir = TempDir::new().unwrap();
+        let _sandbox = RuntimeDirSandbox::new(dir.path());
+        let original = sid();
+        let updated = sid();
+        let _guard = install_top_level(
+            "p".into(),
+            std::process::id(),
+            sock("p"),
+            vec![write_rule("/work", true)],
+            original,
+        )
+        .unwrap();
+        update_session("p", updated).unwrap();
+        // lookup against the original is now empty, the updated id wins.
+        assert!(lookup_session(original).unwrap().is_none());
+        assert_eq!(lookup_session(updated).unwrap().unwrap().pod_name, "p");
+    }
+
+    #[test]
+    fn update_session_rejects_when_target_already_held() {
+        let dir = TempDir::new().unwrap();
+        let _sandbox = RuntimeDirSandbox::new(dir.path());
+        let s_a = sid();
+        let s_b = sid();
+        let _g_a = install_top_level(
+            "a".into(),
+            std::process::id(),
+            sock("a"),
+            vec![write_rule("/work/a", true)],
+            s_a,
+        )
+        .unwrap();
+        let _g_b = install_top_level(
+            "b".into(),
+            std::process::id(),
+            sock("b"),
+            vec![write_rule("/work/b", true)],
+            s_b,
+        )
+        .unwrap();
+        // `a` cannot adopt b's live session id.
+        let err = update_session("a", s_b).unwrap_err();
+        match err {
+            ScopeLockError::SessionConflict {
+                pod_name,
+                session_id,
+                ..
+            } => {
+                assert_eq!(pod_name, "b");
+                assert_eq!(session_id, s_b);
+            }
+            other => panic!("expected SessionConflict, got {other:?}"),
         }
     }
 }

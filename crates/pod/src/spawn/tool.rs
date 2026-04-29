@@ -441,7 +441,8 @@ fn scope_lock_err_to_tool(e: ScopeLockError) -> ToolError {
         ScopeLockError::NotSubset { .. }
         | ScopeLockError::WriteConflict { .. }
         | ScopeLockError::DuplicatePodName(_)
-        | ScopeLockError::UnknownPod(_) => ToolError::InvalidArgument(e.to_string()),
+        | ScopeLockError::UnknownPod(_)
+        | ScopeLockError::SessionConflict { .. } => ToolError::InvalidArgument(e.to_string()),
         ScopeLockError::Io(_) => ToolError::ExecutionFailed(e.to_string()),
     }
 }

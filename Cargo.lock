@@ -2130,6 +2130,7 @@ dependencies = [
  "protocol",
  "provider",
  "schemars",
+ "scope-lock",
  "serde",
  "serde_json",
  "session-store",
@@ -2744,6 +2745,20 @@ dependencies = [
  "quote",
  "serde_derive_internals",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "scope-lock"
+version = "0.1.0"
+dependencies = [
+ "fs4",
+ "libc",
+ "manifest",
+ "serde",
+ "serde_json",
+ "session-store",
+ "tempfile",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -3574,6 +3589,7 @@ dependencies = [
  "manifest",
  "protocol",
  "ratatui",
+ "scope-lock",
  "serde_json",
  "session-store",
  "tokio",

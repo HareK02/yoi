@@ -19,6 +19,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::{Frame, TerminalOptions, Viewport};
+use scope_lock::lookup_session;
 use session_store::{
     ContentPart, FsStore, HashedEntry, Item, LogEntry, SessionId, Store,
 };
@@ -71,6 +72,11 @@ struct Row {
     id: SessionId,
     /// Last user / assistant snippet, or a `[corrupt]` placeholder.
     preview: String,
+    /// `Some(pod_name)` when a live Pod currently holds an allocation
+    /// for this session in `scope.lock`. Picking such a row launches
+    /// `pod --session <UUID>` which will fail with `SessionConflict` —
+    /// the badge warns the user up-front.
+    live_pod: Option<String>,
 }
 
 pub async fn run() -> Result<PickerOutcome, PickerError> {
@@ -82,7 +88,15 @@ pub async fn run() -> Result<PickerOutcome, PickerError> {
     let mut rows: Vec<Row> = Vec::with_capacity(MAX_ROWS);
     for id in ids.into_iter().take(MAX_ROWS) {
         let preview = build_preview(&store, id).await;
-        rows.push(Row { id, preview });
+        // Best-effort live check. A scope.lock I/O hiccup downgrades
+        // the row to "no badge" rather than killing the picker — the
+        // user still gets to see the listing.
+        let live_pod = lookup_session(id).ok().flatten().map(|info| info.pod_name);
+        rows.push(Row {
+            id,
+            preview,
+            live_pod,
+        });
     }
 
     let mut selected = 0usize;
@@ -291,12 +305,19 @@ fn row_line(row: &Row, selected: bool) -> Line<'_> {
     } else {
         Style::default().fg(Color::DarkGray)
     };
-    Line::from(vec![
+    let mut spans = vec![
         Span::raw(marker),
         Span::styled(short_session(row.id), id_style),
         Span::raw("  "),
-        Span::styled(row.preview.clone(), preview_style),
-    ])
+    ];
+    if let Some(ref pod_name) = row.live_pod {
+        spans.push(Span::styled(
+            format!("[live: {pod_name}] "),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ));
+    }
+    spans.push(Span::styled(row.preview.clone(), preview_style));
+    Line::from(spans)
 }
 
 fn short_session(id: SessionId) -> String {

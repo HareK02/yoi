@@ -100,3 +100,8 @@ TUI には既に新規 Pod 起動用の spawn UI があるため、同じよう�
 - 別マシンから転送された session store の import UI
 - `tui` での picker 復帰や自動 attach 切替（live セッション選択時はエラー終了）
 - 任意位置からの fork 起動（`fork_at` を resume 経路に組み込まない。将来別フローとして扱う）
+
+## Review
+- 状態: Approve with follow-up
+- レビュー詳細: [./tui-session-restore.review.md](./tui-session-restore.review.md)
+- 日付: 2026-04-28
