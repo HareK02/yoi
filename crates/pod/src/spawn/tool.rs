@@ -168,13 +168,13 @@ impl Tool for SpawnPodTool {
 
         let predicted_socket = self.runtime_base.join(&input.name).join("sock");
         let lock_path = pod_registry::default_registry_path()
-            .map_err(|e| ToolError::ExecutionFailed(format!("scope lock path: {e}")))?;
+            .map_err(|e| ToolError::ExecutionFailed(format!("pod-registry path: {e}")))?;
 
         // Reserve the allocation up front. Spawner's pid is a live
         // placeholder; the child will rewrite it via `adopt_allocation`.
         {
             let mut guard = LockFileGuard::open(&lock_path)
-                .map_err(|e| ToolError::ExecutionFailed(format!("scope lock open: {e}")))?;
+                .map_err(|e| ToolError::ExecutionFailed(format!("pod-registry open: {e}")))?;
             pod_registry::delegate_scope(
                 &mut guard,
                 &self.spawner_name,

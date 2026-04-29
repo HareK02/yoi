@@ -385,7 +385,7 @@ async fn shutdown_releases_scope_allocation_when_present() {
     )
     .await;
 
-    // Allocation is gone from the scope lock.
+    // Allocation is gone from the pod-registry.
     let g = LockFileGuard::open(&lock_path).unwrap();
     assert!(
         g.data().find("kid").is_none(),

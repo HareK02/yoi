@@ -33,3 +33,8 @@
 - `<runtime_dir>/pods.json` が新しいレジストリの保存先として使われる
 - 既存テスト（pod / pod-registry / tui 関連）がすべて緑
 - ドキュメンテーション・チケット本文中の参照（`tickets/dynamic-scope.md` 等）が新名に揃っている
+
+## Review
+- 状態: Approve
+- レビュー詳細: [./pod-registry-rename.review.md](./pod-registry-rename.review.md)
+- 日付: 2026-04-29
