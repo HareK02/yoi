@@ -64,6 +64,21 @@ impl Scheme for OpenAIResponsesScheme {
                 "OpenAI Responses (ChatGPT backend)",
             ));
         }
+        // 同上、`temperature` / `top_p` も ChatGPT backend では 400 で弾かれる。
+        if !self.send_sampling_params {
+            if config.temperature.is_some() {
+                warnings.push(ConfigWarning::unsupported(
+                    "temperature",
+                    "OpenAI Responses (ChatGPT backend)",
+                ));
+            }
+            if config.top_p.is_some() {
+                warnings.push(ConfigWarning::unsupported(
+                    "top_p",
+                    "OpenAI Responses (ChatGPT backend)",
+                ));
+            }
+        }
         warnings
     }
 }

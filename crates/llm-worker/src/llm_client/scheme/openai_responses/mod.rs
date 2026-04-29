@@ -16,12 +16,13 @@ pub use scheme_impl::OpenAIResponsesState;
 
 /// OpenAI Responses scheme 本体。
 ///
-/// `store` / `include_encrypted_content` / `send_max_output_tokens` は
-/// scheme 固定の wire 設定で、デフォルトは公式 OpenAI Responses API
-/// 向け (stateless + ZDR + `max_output_tokens` 送出可)。ChatGPT backend
-/// (codex-oauth) のように受理パラメータが subset の経路では provider 層で
-/// `send_max_output_tokens=false` 等に上書きする。`ModelCapability` には
-/// 入れない（モデル能力ではなく wire policy）。
+/// `store` / `include_encrypted_content` / `send_max_output_tokens` /
+/// `send_sampling_params` は scheme 固定の wire 設定で、デフォルトは
+/// 公式 OpenAI Responses API 向け (stateless + ZDR + `max_output_tokens`
+/// / `temperature` / `top_p` 送出可)。ChatGPT backend (codex-oauth) の
+/// ように受理パラメータが subset の経路では provider 層で
+/// `send_max_output_tokens=false` / `send_sampling_params=false` に
+/// 上書きする。`ModelCapability` には入れない（モデル能力ではなく wire policy）。
 #[derive(Debug, Clone)]
 pub struct OpenAIResponsesScheme {
     /// サーバ側に response を保存するか。ZDR/stateless 運用では `false`。
@@ -33,6 +34,10 @@ pub struct OpenAIResponsesScheme {
     /// 受理するが、ChatGPT backend (codex-oauth) は `Unsupported parameter`
     /// で 400 を返すため、その経路では `false` にする。
     pub send_max_output_tokens: bool,
+    /// `temperature` / `top_p` を body に載せるか。公式 OpenAI Responses API
+    /// は受理するが、ChatGPT backend (codex-oauth) は `Unsupported parameter`
+    /// で 400 を返すため、その経路では `false` にする。
+    pub send_sampling_params: bool,
 }
 
 impl Default for OpenAIResponsesScheme {
@@ -41,13 +46,14 @@ impl Default for OpenAIResponsesScheme {
             store: false,
             include_encrypted_content: true,
             send_max_output_tokens: true,
+            send_sampling_params: true,
         }
     }
 }
 
 impl OpenAIResponsesScheme {
     /// デフォルト設定 (`store=false`, `include=["reasoning.encrypted_content"]`,
-    /// `send_max_output_tokens=true`)。
+    /// `send_max_output_tokens=true`, `send_sampling_params=true`)。
     pub fn new() -> Self {
         Self::default()
     }
@@ -67,6 +73,12 @@ impl OpenAIResponsesScheme {
     /// `max_output_tokens` を body に載せるかを上書き。
     pub fn with_send_max_output_tokens(mut self, send: bool) -> Self {
         self.send_max_output_tokens = send;
+        self
+    }
+
+    /// `temperature` / `top_p` を body に載せるかを上書き。
+    pub fn with_send_sampling_params(mut self, send: bool) -> Self {
+        self.send_sampling_params = send;
         self
     }
 }

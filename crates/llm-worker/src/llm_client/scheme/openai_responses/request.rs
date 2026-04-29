@@ -43,6 +43,9 @@ pub(crate) struct ResponsesRequest {
     /// が `false` のときは `None` のまま送る (skip_serializing_if で除外)。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u32>,
+    /// 公式 OpenAI Responses API では受理されるが、ChatGPT backend
+    /// (codex-oauth) は `temperature` / `top_p` を 400 で弾く。scheme の
+    /// `send_sampling_params` が `false` のときは `None` のまま送る。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -203,8 +206,16 @@ impl OpenAIResponsesScheme {
             } else {
                 None
             },
-            temperature: request.config.temperature,
-            top_p: request.config.top_p,
+            temperature: if self.send_sampling_params {
+                request.config.temperature
+            } else {
+                None
+            },
+            top_p: if self.send_sampling_params {
+                request.config.top_p
+            } else {
+                None
+            },
         }
     }
 }
@@ -468,6 +479,29 @@ mod tests {
         assert!(
             json.get("max_output_tokens").is_none(),
             "max_output_tokens key must not appear in serialised body, got: {json}"
+        );
+    }
+
+    #[test]
+    fn sampling_params_passed_through_by_default() {
+        let scheme = OpenAIResponsesScheme::new();
+        let req = Request::new().user("hi").temperature(0.4).top_p(0.9);
+        let body = scheme.build_request("gpt-5", &req, &cap_with_reasoning());
+        assert_eq!(body.temperature, Some(0.4));
+        assert_eq!(body.top_p, Some(0.9));
+    }
+
+    #[test]
+    fn sampling_params_dropped_when_send_disabled() {
+        let scheme = OpenAIResponsesScheme::new().with_send_sampling_params(false);
+        let req = Request::new().user("hi").temperature(0.4).top_p(0.9);
+        let body = scheme.build_request("gpt-5", &req, &cap_with_reasoning());
+        assert_eq!(body.temperature, None);
+        assert_eq!(body.top_p, None);
+        let json = serde_json::to_value(&body).unwrap();
+        assert!(
+            json.get("temperature").is_none() && json.get("top_p").is_none(),
+            "temperature/top_p keys must not appear in serialised body, got: {json}"
         );
     }
 

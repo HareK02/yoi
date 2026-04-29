@@ -47,9 +47,11 @@ model, input, instructions, stream, store, include,
 tools, tool_choice, reasoning, previous_response_id, truncation
 ```
 
-`max_output_tokens`, `max_tokens`, `max_completion_tokens`, `temperature`, `user`, `metadata`, `context_management` はすべて拒否される。
+`max_output_tokens`, `max_tokens`, `max_completion_tokens`, `temperature`, `top_p`, `user`, `metadata`, `context_management` はすべて拒否される（実観測でも `temperature` 同梱リクエストは `{"detail":"Unsupported parameter: temperature"}` を返す）。
 
-Codex CLI 自身も `config.toml` の `model_max_output_tokens` を API リクエストに載せない実装になっており (https://github.com/openai/codex/issues/4138)、これはバグではなく ChatGPT backend の制約に対する回避策と解釈できる。
+Codex CLI 自身も `config.toml` の `model_max_output_tokens` を API リクエストに載せない実装になっており (https://github.com/openai/codex/issues/4138)、これはバグではなく ChatGPT backend の制約に対する回避策と解釈できる。同 CLI は `temperature` / `top_p` も送出しない。
+
+本リポジトリでは `OpenAIResponsesScheme` の `send_max_output_tokens` / `send_sampling_params` フラグでこれらの送出を一括制御し、`provider/src/lib.rs` 内で `AuthRef::CodexOAuth` 指定時に両方 `false` にする。
 
 ## 6. ドキュメント URL
 

@@ -1030,9 +1030,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             .prompts
             .compact_system()
             .map_err(PodError::PromptCatalog)?;
-        let mut summary_worker = Worker::new(summary_client)
-            .system_prompt(summary_system_prompt)
-            .temperature(0.0);
+        let mut summary_worker = Worker::new(summary_client).system_prompt(summary_system_prompt);
 
         // Cumulative input-token meter + interceptor. The meter is bumped
         // from the on_usage callback and read on every pre_llm_request.
@@ -1407,9 +1405,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             .unwrap_or(manifest::defaults::MEMORY_EXTRACT_WORKER_MAX_INPUT_TOKENS);
 
         let client = self.build_extractor_client(memory_cfg)?;
-        let mut extract_worker = Worker::new(client)
-            .system_prompt(extract::EXTRACT_SYSTEM_PROMPT)
-            .temperature(0.0);
+        let mut extract_worker = Worker::new(client).system_prompt(extract::EXTRACT_SYSTEM_PROMPT);
 
         // Cumulative input-token meter + interceptor (mirror of
         // CompactWorkerInterceptor). Aborts the extract worker if its
