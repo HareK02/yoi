@@ -50,3 +50,9 @@ Pod が吐く `Event::History.items: Vec<serde_json::Value>` の user message �
 - `crates/pod/src/controller.rs`（`Event::UserMessage` broadcast 経路）
 - `crates/tui/src/app.rs`（`restore_history` — 現状 segment を捨てている地点）
 - `crates/protocol/src/lib.rs`（`Segment`, `Event::History`）
+
+## Review
+
+- 状態: Request changes
+- レビュー詳細: [./session-log-segments.review.md](./session-log-segments.review.md)
+- 日付: 2026-04-29

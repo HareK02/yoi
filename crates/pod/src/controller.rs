@@ -324,11 +324,9 @@ impl PodController {
                         // Broadcast the accepted user message so every
                         // subscriber (including the submitter) can
                         // render the turn header + user line from a
-                        // single source of truth. Mirror the segments
-                        // into shared_state so subsequent History fetches
-                        // can re-attach them to the corresponding worker
-                        // user_message item.
-                        shared_state.push_user_segments(input.clone());
+                        // single source of truth. shared_state's
+                        // `user_segments` is re-synced from `pod` after
+                        // the run completes, so we don't push here.
                         let _ = event_tx.send(Event::UserMessage {
                             segments: input.clone(),
                         });
@@ -377,6 +375,7 @@ impl PodController {
 
                         let items = pod.worker().history().to_vec();
                         shared_state.update_history(items);
+                        shared_state.set_user_segments(pod.user_segments().to_vec());
                         shared_state.set_status(new_status);
                         let _ = runtime_dir.write_status(&shared_state).await;
                         let _ = runtime_dir.write_history(&shared_state).await;
@@ -435,6 +434,7 @@ impl PodController {
 
                         let items = pod.worker().history().to_vec();
                         shared_state.update_history(items);
+                        shared_state.set_user_segments(pod.user_segments().to_vec());
                         shared_state.set_status(new_status);
                         let _ = runtime_dir.write_status(&shared_state).await;
                         let _ = runtime_dir.write_history(&shared_state).await;
@@ -490,6 +490,7 @@ impl PodController {
 
                         let items = pod.worker().history().to_vec();
                         shared_state.update_history(items);
+                        shared_state.set_user_segments(pod.user_segments().to_vec());
                         shared_state.set_status(new_status);
                         let _ = runtime_dir.write_status(&shared_state).await;
                         let _ = runtime_dir.write_history(&shared_state).await;
@@ -587,6 +588,7 @@ impl PodController {
 
                             let items = pod.worker().history().to_vec();
                             shared_state.update_history(items);
+                            shared_state.set_user_segments(pod.user_segments().to_vec());
                             shared_state.set_status(new_status);
                             let _ = runtime_dir.write_status(&shared_state).await;
                             let _ = runtime_dir.write_history(&shared_state).await;

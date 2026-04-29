@@ -80,3 +80,9 @@ worker → logged の変換で落ちる field が出るのは構わない（永�
 - 後続: `tickets/session-log-segments.md`
 - 影響範囲: `crates/session-store/src/session_log.rs`, `crates/session-store/src/session.rs`, `crates/session-store/tests/*`
 - 不変: `crates/llm-worker/src/llm_client/types.rs`（`Item` / `ContentPart` 等）、`crates/pod`（`save_delta` の呼び出し側）
+
+## Review
+
+- 状態: Approve
+- レビュー詳細: [./session-log-decouple-item.review.md](./session-log-decouple-item.review.md)
+- 日付: 2026-04-29

@@ -276,6 +276,37 @@ async fn agents_md_not_reread_after_compact() {
 }
 
 #[tokio::test]
+async fn compact_aligns_user_segments_with_retained_history() {
+    // retained_tokens=0 folds the entire conversation into the summary,
+    // so retained_items has zero user_messages and self.user_segments
+    // must be drained to match. A subsequent run() then appends fresh
+    // segments cleanly without ghost entries from the pre-compaction era.
+    let client = MockClient::new(vec![
+        single_text_events("a"),
+        single_text_events("b"),
+        write_summary_tool_use_events("call-1", "compacted summary"),
+        single_text_events("done"),
+        single_text_events("c"),
+    ]);
+    let (mut pod, _pwd) = make_pod_with_body("BODY", client).await.unwrap();
+
+    pod.run_text("first").await.unwrap();
+    pod.run_text("second").await.unwrap();
+    assert_eq!(pod.user_segments().len(), 2);
+
+    pod.compact(0).await.unwrap();
+    assert_eq!(
+        pod.user_segments().len(),
+        0,
+        "compact(0) folds every user_message into the summary, so segments \
+         must be drained to match retained_items"
+    );
+
+    pod.run_text("third").await.unwrap();
+    assert_eq!(pod.user_segments().len(), 1);
+}
+
+#[tokio::test]
 async fn compact_preserves_system_prompt() {
     let client = MockClient::new(vec![
         single_text_events("a"), // pod.run_text("first")

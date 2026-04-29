@@ -1147,6 +1147,13 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             ))
         });
 
+        // Count surviving user_messages before consuming `retained_items`
+        // — needed to align `self.user_segments` after the swap below.
+        let retained_user_msgs = retained_items
+            .iter()
+            .filter(|i| i.is_user_message())
+            .count();
+
         // Build new history: [summary, ...auto-read, references, ...retained].
         let mut new_history = Vec::with_capacity(
             1 + auto_read_messages.len()
@@ -1197,6 +1204,19 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         if self.scope_allocation.is_some() {
             pod_registry::update_session(&self.manifest.pod.name, new_session_id)?;
         }
+        // Align user_segments with the post-compaction history. Items
+        // before `retain_from` (now folded into the summary) lose their
+        // segments; only the user_messages surviving in retained_items
+        // keep them. They are always the trailing K entries of
+        // `self.user_segments` because submissions are appended in order.
+        let drop_n = self
+            .user_segments
+            .len()
+            .saturating_sub(retained_user_msgs);
+        if drop_n > 0 {
+            self.user_segments.drain(..drop_n);
+        }
+
         let worker = self.worker.as_mut().unwrap();
         worker.set_history(new_history);
         // Anchor the prompt cache at the summary item so that Anthropic
