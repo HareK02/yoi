@@ -407,6 +407,10 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Option<Method> {
             None
         }
         KeyCode::Enter => app.submit_input(),
+        KeyCode::Backspace if ctrl => {
+            app.delete_word_before();
+            None
+        }
         KeyCode::Backspace => {
             app.delete_char_before();
             None

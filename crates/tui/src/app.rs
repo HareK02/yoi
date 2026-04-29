@@ -398,6 +398,9 @@ impl App {
     pub fn delete_char_after(&mut self) {
         self.input.delete_after();
     }
+    pub fn delete_word_before(&mut self) {
+        self.input.delete_word_before();
+    }
     pub fn move_cursor_left(&mut self) {
         self.input.move_left();
     }

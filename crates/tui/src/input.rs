@@ -148,6 +148,15 @@ impl InputBuffer {
         }
     }
 
+    /// Delete one word backward — the same span [`move_word_left`] would
+    /// jump over.
+    pub fn delete_word_before(&mut self) {
+        let end = self.cursor;
+        self.move_word_left();
+        let start = self.cursor;
+        self.atoms.drain(start..end);
+    }
+
     pub fn move_left(&mut self) {
         self.cursor = self.cursor.saturating_sub(1);
     }
@@ -722,6 +731,84 @@ mod word_motion_tests {
         assert_eq!(cursor(&buf), 4);
         buf.move_word_left();
         assert_eq!(cursor(&buf), 0);
+    }
+
+    /// Render atoms as a string for assertions; pastes become `<P>`.
+    fn as_text(buf: &InputBuffer) -> String {
+        let mut out = String::new();
+        for a in &buf.atoms {
+            match a {
+                Atom::Char(c) => out.push(*c),
+                Atom::Paste(_) => out.push_str("<P>"),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn delete_word_removes_trailing_word_at_end() {
+        let mut buf = buf_from("foo bar");
+        buf.delete_word_before();
+        assert_eq!(as_text(&buf), "foo ");
+        assert_eq!(cursor(&buf), 4);
+    }
+
+    #[test]
+    fn delete_word_removes_word_at_cursor() {
+        let mut buf = buf_from("foo bar");
+        buf.cursor = 3; // right after "foo"
+        buf.delete_word_before();
+        assert_eq!(as_text(&buf), " bar");
+        assert_eq!(cursor(&buf), 0);
+    }
+
+    #[test]
+    fn delete_word_swallows_trailing_separators() {
+        let mut buf = buf_from("foo   ");
+        buf.delete_word_before();
+        assert_eq!(as_text(&buf), "");
+        assert_eq!(cursor(&buf), 0);
+    }
+
+    #[test]
+    fn delete_word_at_start_is_noop() {
+        let mut buf = buf_from("foo");
+        buf.cursor = 0;
+        buf.delete_word_before();
+        assert_eq!(as_text(&buf), "foo");
+        assert_eq!(cursor(&buf), 0);
+    }
+
+    #[test]
+    fn delete_word_respects_script_boundary() {
+        // 「日本語の」末尾から1回削除すると、ひらがな部分「の」だけ消える
+        let mut buf = buf_from("日本語の");
+        buf.delete_word_before();
+        assert_eq!(as_text(&buf), "日本語");
+        assert_eq!(cursor(&buf), 3);
+        buf.delete_word_before();
+        assert_eq!(as_text(&buf), "");
+        assert_eq!(cursor(&buf), 0);
+    }
+
+    #[test]
+    fn delete_word_treats_paste_as_one_unit() {
+        let mut buf = InputBuffer::new();
+        for c in "foo ".chars() {
+            buf.insert_char(c);
+        }
+        buf.insert_paste("anything".into());
+        for c in " bar".chars() {
+            buf.insert_char(c);
+        }
+        // atoms: f o o ' ' [P] ' ' b a r  (cursor at end = 9)
+        buf.delete_word_before();
+        assert_eq!(as_text(&buf), "foo <P> ");
+        assert_eq!(cursor(&buf), 6);
+        // Next deletion: trailing space then the paste atom (kind=Paste)
+        buf.delete_word_before();
+        assert_eq!(as_text(&buf), "foo ");
+        assert_eq!(cursor(&buf), 4);
     }
 
     #[test]
