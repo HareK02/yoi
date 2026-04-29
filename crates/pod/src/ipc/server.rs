@@ -91,9 +91,40 @@ async fn handle_connection(stream: tokio::net::UnixStream, handle: PodHandle) {
                 match method {
                     Ok(Some(Method::GetHistory)) => {
                         let items = handle.shared_state.history();
+                        let segments_per_user = handle.shared_state.user_segments();
+                        // Embed `segments` on user-message JSON values so
+                        // the TUI can re-render typed atoms on restore.
+                        // Alignment: segments are recorded only for
+                        // submissions made during the live session, never
+                        // for seed history loaded via `SessionStart.history`
+                        // (post-compaction). The seed user_messages always
+                        // come first in worker history, so the last
+                        // `segments_per_user.len()` user_messages are the
+                        // ones that map 1:1 to the segments list.
+                        let total_user_msgs =
+                            items.iter().filter(|i| i.is_user_message()).count();
+                        let skip = total_user_msgs.saturating_sub(segments_per_user.len());
+                        let mut user_idx = 0usize;
                         let values = items
                             .iter()
-                            .map(|item| serde_json::to_value(item).expect("Item is Serialize"))
+                            .map(|item| {
+                                let mut value =
+                                    serde_json::to_value(item).expect("Item is Serialize");
+                                if item.is_user_message() {
+                                    if user_idx >= skip {
+                                        let seg_idx = user_idx - skip;
+                                        if let Some(obj) = value.as_object_mut() {
+                                            let segs = serde_json::to_value(
+                                                &segments_per_user[seg_idx],
+                                            )
+                                            .expect("Segment is Serialize");
+                                            obj.insert("segments".into(), segs);
+                                        }
+                                    }
+                                    user_idx += 1;
+                                }
+                                value
+                            })
                             .collect();
                         let greeting = handle.shared_state.greeting.clone();
                         if writer

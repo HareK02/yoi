@@ -10,6 +10,7 @@
 
 use llm_worker::llm_client::types::{Item, RequestConfig};
 use llm_worker::{UsageRecord, WorkerResult};
+use protocol::Segment;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -111,8 +112,12 @@ pub enum LogEntry {
         compacted_from: Option<SessionOrigin>,
     },
 
-    /// User input pushed to history (worker.rs:229).
-    UserInput { ts: u64, item: Item },
+    /// User input accepted at submit time. Carries the original typed
+    /// `Vec<Segment>` so clients can re-render typed atoms (paste chips,
+    /// file/knowledge refs, workflow invocations) on session restore.
+    /// Replay flattens these into a `Item::user_message` for the worker
+    /// history; the worker layer never sees segments directly.
+    UserInput { ts: u64, segments: Vec<Segment> },
 
     /// Assistant response items added to history (worker.rs:1040-1041).
     AssistantItems { ts: u64, items: Vec<LoggedItem> },
@@ -209,6 +214,13 @@ pub struct RestoredState {
     /// `LogEntry::Extension` を replay 順に積んだもの。`(domain, payload)`。
     /// session-store は domain を不透明扱いし、各ドメインが自前で fold する。
     pub extensions: Vec<(String, serde_json::Value)>,
+    /// User submissions in original typed form, in submit order.
+    /// One entry per `LogEntry::UserInput`; the K-th entry corresponds to
+    /// the K-th `Item::user_message` derived during replay (modulo
+    /// pre-compaction history seeded via `SessionStart.history`, whose
+    /// original segments are not preserved). Used by clients to re-render
+    /// typed atoms (paste chips, refs) on session restore.
+    pub user_segments: Vec<Vec<Segment>>,
 }
 
 /// Replay a sequence of hashed entries to reconstruct worker state.
@@ -222,6 +234,7 @@ pub fn collect_state(entries: &[HashedEntry]) -> RestoredState {
         head_hash: None,
         usage_history: Vec::new(),
         extensions: Vec::new(),
+        user_segments: Vec::new(),
     };
 
     for hashed in entries {
@@ -238,8 +251,10 @@ pub fn collect_state(entries: &[HashedEntry]) -> RestoredState {
                 state.config = config.clone();
                 state.history = history.iter().cloned().map(Item::from).collect();
             }
-            LogEntry::UserInput { item, .. } => {
-                state.history.push(item.clone());
+            LogEntry::UserInput { segments, .. } => {
+                let text = Segment::flatten_to_text(segments);
+                state.history.push(Item::user_message(text));
+                state.user_segments.push(segments.clone());
             }
             LogEntry::AssistantItems { items, .. } => {
                 state
@@ -365,7 +380,7 @@ mod tests {
             },
             LogEntry::UserInput {
                 ts: 2000,
-                item: Item::user_message("Hello"),
+                segments: vec![Segment::text("Hello")],
             },
             LogEntry::AssistantItems {
                 ts: 3000,
@@ -400,7 +415,7 @@ mod tests {
             },
             LogEntry::UserInput {
                 ts: 2000,
-                item: Item::user_message("Check weather"),
+                segments: vec![Segment::text("Check weather")],
             },
             LogEntry::AssistantItems {
                 ts: 3000,
@@ -460,7 +475,7 @@ mod tests {
             },
             LogEntry::UserInput {
                 ts: 2000,
-                item: Item::user_message("Hello"),
+                segments: vec![Segment::text("Hello")],
             },
         ];
         let chain_a = build_chain(&raw);
@@ -473,11 +488,11 @@ mod tests {
     fn different_content_produces_different_hash() {
         let entry_a = LogEntry::UserInput {
             ts: 1000,
-            item: Item::user_message("Hello"),
+            segments: vec![Segment::text("Hello")],
         };
         let entry_b = LogEntry::UserInput {
             ts: 1000,
-            item: Item::user_message("World"),
+            segments: vec![Segment::text("World")],
         };
         let hash_a = compute_hash(None, &entry_a);
         let hash_b = compute_hash(None, &entry_b);
@@ -497,7 +512,7 @@ mod tests {
             },
             LogEntry::UserInput {
                 ts: 2000,
-                item: Item::user_message("hi"),
+                segments: vec![Segment::text("hi")],
             },
             LogEntry::LlmUsage {
                 ts: 2100,
@@ -545,7 +560,7 @@ mod tests {
             },
             LogEntry::UserInput {
                 ts: 2000,
-                item: Item::user_message("hi"),
+                segments: vec![Segment::text("hi")],
             },
         ]);
         let state = collect_state(&entries);
@@ -657,5 +672,81 @@ mod tests {
         let hex = hash.to_hex();
         let parsed = EntryHash::from_hex(&hex).unwrap();
         assert_eq!(hash, parsed);
+    }
+
+    /// Mixed segments survive a JSON round-trip through `LogEntry::UserInput`,
+    /// and `collect_state` derives `Item::user_message` from the flattened
+    /// text while preserving the original segments separately. This covers
+    /// the segments → flatten → Item replay path from the ticket.
+    #[test]
+    fn replay_user_input_segments_round_trip() {
+        let segments = vec![
+            Segment::Text {
+                content: "see ".into(),
+            },
+            Segment::Paste {
+                id: 1,
+                chars: 12,
+                lines: 2,
+                content: "line1\nline2".into(),
+            },
+            Segment::FileRef {
+                path: "src/main.rs".into(),
+            },
+        ];
+        let entry = LogEntry::UserInput {
+            ts: 4242,
+            segments: segments.clone(),
+        };
+        // Hash + JSON round-trip preserves the variant byte-for-byte.
+        let json = serde_json::to_string(&entry).unwrap();
+        let parsed: LogEntry = serde_json::from_str(&json).unwrap();
+        let entries = build_chain(&[
+            LogEntry::SessionStart {
+                ts: 1,
+                system_prompt: None,
+                config: RequestConfig::default(),
+                history: vec![],
+                forked_from: None,
+                compacted_from: None,
+            },
+            parsed,
+        ]);
+        let state = collect_state(&entries);
+        // Worker history gets a flattened user_message item.
+        assert_eq!(state.history.len(), 1);
+        match &state.history[0] {
+            Item::Message { role, content, .. } => {
+                assert!(matches!(role, llm_worker::Role::User));
+                assert_eq!(content.len(), 1);
+                match &content[0] {
+                    llm_worker::ContentPart::Text { text } => {
+                        assert_eq!(
+                            text,
+                            "see line1\nline2[unresolved file ref: src/main.rs]"
+                        );
+                    }
+                    other => panic!("unexpected content: {other:?}"),
+                }
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+        // Segments survive verbatim for client-side restore.
+        assert_eq!(state.user_segments.len(), 1);
+        assert_eq!(state.user_segments[0].len(), 3);
+        match &state.user_segments[0][1] {
+            Segment::Paste {
+                id,
+                chars,
+                lines,
+                content,
+            } => {
+                assert_eq!(*id, 1);
+                assert_eq!(*chars, 12);
+                assert_eq!(*lines, 2);
+                assert_eq!(content, "line1\nline2");
+            }
+            other => panic!("expected Paste, got {other:?}"),
+        }
     }
 }

@@ -1,6 +1,7 @@
 use std::sync::RwLock;
 
 use llm_worker::llm_client::types::Item;
+use protocol::Segment;
 use serde::{Deserialize, Serialize};
 use session_store::SessionId;
 
@@ -15,6 +16,12 @@ pub struct PodSharedState {
     pub greeting: protocol::Greeting,
     pub status: RwLock<PodStatus>,
     pub history: RwLock<Vec<Item>>,
+    /// Typed user submissions in submit order. The K-th entry corresponds
+    /// to the K-th `Item::user_message` in `history` (modulo seed history
+    /// loaded from a pre-compaction `SessionStart.history`, whose original
+    /// segments are not preserved). Surfaced via `Event::History` so
+    /// clients can re-render typed atoms on session restore.
+    pub user_segments: RwLock<Vec<Vec<Segment>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,6 +46,26 @@ impl PodSharedState {
             greeting,
             status: RwLock::new(PodStatus::Idle),
             history: RwLock::new(Vec::new()),
+            user_segments: RwLock::new(Vec::new()),
+        }
+    }
+
+    pub fn user_segments(&self) -> Vec<Vec<Segment>> {
+        self.user_segments
+            .read()
+            .map(|s| s.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn set_user_segments(&self, segments: Vec<Vec<Segment>>) {
+        if let Ok(mut s) = self.user_segments.write() {
+            *s = segments;
+        }
+    }
+
+    pub fn push_user_segments(&self, segments: Vec<Segment>) {
+        if let Ok(mut s) = self.user_segments.write() {
+            s.push(segments);
         }
     }
 

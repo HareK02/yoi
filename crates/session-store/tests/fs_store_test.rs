@@ -21,7 +21,7 @@ async fn round_trip_write_and_read() {
         },
         LogEntry::UserInput {
             ts: 2000,
-            item: Item::user_message("Hello"),
+            segments: vec![protocol::Segment::text("Hello")],
         },
         LogEntry::AssistantItems {
             ts: 3000,
@@ -210,7 +210,7 @@ async fn read_head_hash_returns_last_entry_hash() {
         },
         LogEntry::UserInput {
             ts: 2000,
-            item: Item::user_message("Hello"),
+            segments: vec![protocol::Segment::text("Hello")],
         },
     ]);
 

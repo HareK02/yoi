@@ -276,6 +276,7 @@ impl PodController {
             manifest_toml.clone(),
             greeting,
         ));
+        shared_state.set_user_segments(pod.user_segments().to_vec());
         runtime_dir.write_manifest(&manifest_toml).await?;
         runtime_dir.write_status(&shared_state).await?;
         runtime_dir.write_history(&shared_state).await?;
@@ -323,7 +324,11 @@ impl PodController {
                         // Broadcast the accepted user message so every
                         // subscriber (including the submitter) can
                         // render the turn header + user line from a
-                        // single source of truth.
+                        // single source of truth. Mirror the segments
+                        // into shared_state so subsequent History fetches
+                        // can re-attach them to the corresponding worker
+                        // user_message item.
+                        shared_state.push_user_segments(input.clone());
                         let _ = event_tx.send(Event::UserMessage {
                             segments: input.clone(),
                         });

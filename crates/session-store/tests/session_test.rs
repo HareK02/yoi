@@ -99,6 +99,18 @@ async fn run_and_persist(
     head_hash: &mut Option<EntryHash>,
     input: &str,
 ) -> (Worker<MockLlmClient>, llm_worker::WorkerResult) {
+    // Mirror Pod's run-entry contract: log the user input as segments
+    // before the worker pushes its flattened user_message; save_delta
+    // skips the resulting user_message item to avoid double-write.
+    session_store::save_user_input(
+        store,
+        session_id,
+        head_hash,
+        vec![protocol::Segment::text(input)],
+    )
+    .await
+    .unwrap();
+
     let history_before = worker.history().len();
 
     let mut locked = worker.lock();
@@ -458,7 +470,7 @@ async fn session_auto_forks_on_conflict() {
     // Simulate another Pod writing to the same session behind our back
     let extra_entry = LogEntry::UserInput {
         ts: 9999,
-        item: Item::user_message("Interloper"),
+        segments: vec![protocol::Segment::text("Interloper")],
     };
     let current_head = store.read_head_hash(original_sid).await.unwrap();
     let hash = session_store::compute_hash(current_head.as_ref(), &extra_entry);
@@ -492,12 +504,8 @@ async fn session_auto_forks_on_conflict() {
 
     // Original session should still have the interloper entry
     let original_entries = store.read_all(original_sid).await.unwrap();
-    let has_interloper = original_entries.iter().any(|e| {
-        if let LogEntry::UserInput { item, .. } = &e.entry {
-            item.is_user_message()
-        } else {
-            false
-        }
-    });
+    let has_interloper = original_entries
+        .iter()
+        .any(|e| matches!(&e.entry, LogEntry::UserInput { .. }));
     assert!(has_interloper);
 }

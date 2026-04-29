@@ -21,8 +21,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::{Frame, TerminalOptions, Viewport};
 use pod_registry::lookup_session;
 use session_store::{
-    ContentPart, FsStore, HashedEntry, Item, LogEntry, LoggedContentPart, LoggedItem, SessionId,
-    Store,
+    FsStore, HashedEntry, LogEntry, LoggedContentPart, LoggedItem, SessionId, Store,
 };
 
 const MAX_ROWS: usize = 10;
@@ -176,8 +175,9 @@ async fn build_preview(store: &FsStore, id: SessionId) -> String {
 fn last_message_preview(entries: &[HashedEntry]) -> Option<String> {
     for hashed in entries.iter().rev() {
         match &hashed.entry {
-            LogEntry::UserInput { item, .. } => {
-                if let Some(text) = first_text(item) {
+            LogEntry::UserInput { segments, .. } => {
+                let text = protocol::Segment::flatten_to_text(segments);
+                if !text.is_empty() {
                     return Some(format!("user: {}", trim_one_line(&text, 60)));
                 }
             }
@@ -190,16 +190,6 @@ fn last_message_preview(entries: &[HashedEntry]) -> Option<String> {
         }
     }
     None
-}
-
-fn first_text(item: &Item) -> Option<String> {
-    match item {
-        Item::Message { content, .. } => content.iter().find_map(|p| match p {
-            ContentPart::Text { text } => Some(text.clone()),
-            _ => None,
-        }),
-        _ => None,
-    }
 }
 
 fn first_text_logged(item: &LoggedItem) -> Option<String> {

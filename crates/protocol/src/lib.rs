@@ -133,6 +133,37 @@ impl Segment {
     pub fn text(s: impl Into<String>) -> Self {
         Self::Text { content: s.into() }
     }
+
+    /// Flatten a segment slice into the single string the LLM receives
+    /// as a user message. Pure — no I/O, no alerts. Callers that need
+    /// to surface user-visible alerts for unresolved refs should do so
+    /// alongside this call (Pod does so at submit time).
+    ///
+    /// Unresolved variants (`FileRef` / `KnowledgeRef` / `WorkflowInvoke`)
+    /// and `Unknown` map to `[unresolved <kind>: <key>]` placeholders so
+    /// the LLM sees an explicit token rather than silent omission.
+    pub fn flatten_to_text(segments: &[Segment]) -> String {
+        let mut out = String::new();
+        for seg in segments {
+            match seg {
+                Segment::Text { content } => out.push_str(content),
+                Segment::Paste { content, .. } => out.push_str(content),
+                Segment::FileRef { path } => {
+                    out.push_str(&format!("[unresolved file ref: {path}]"));
+                }
+                Segment::KnowledgeRef { slug } => {
+                    out.push_str(&format!("[unresolved knowledge ref: {slug}]"));
+                }
+                Segment::WorkflowInvoke { slug } => {
+                    out.push_str(&format!("[unresolved workflow invoke: {slug}]"));
+                }
+                Segment::Unknown => {
+                    out.push_str("[unknown input segment]");
+                }
+            }
+        }
+        out
+    }
 }
 
 impl Method {

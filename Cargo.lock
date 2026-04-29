@@ -2922,6 +2922,7 @@ dependencies = [
  "futures",
  "hex",
  "llm-worker",
+ "protocol",
  "serde",
  "serde_json",
  "sha2 0.11.0",

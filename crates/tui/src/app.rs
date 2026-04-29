@@ -452,10 +452,24 @@ impl App {
                             self.blocks.push(Block::TurnHeader {
                                 turn: self.turn_index,
                             });
-                            if !text.is_empty() {
-                                self.blocks.push(Block::UserMessage {
-                                    segments: vec![Segment::text(text)],
+                            // Pod attaches the original `Vec<Segment>` to
+                            // user messages from live submissions, so we
+                            // can rebuild typed atoms (paste chips, refs)
+                            // here. Seed history loaded post-compaction
+                            // has no `segments` field — fall back to a
+                            // single text segment.
+                            let segments = item
+                                .get("segments")
+                                .and_then(|v| serde_json::from_value::<Vec<Segment>>(v.clone()).ok())
+                                .unwrap_or_else(|| {
+                                    if text.is_empty() {
+                                        Vec::new()
+                                    } else {
+                                        vec![Segment::text(text.clone())]
+                                    }
                                 });
+                            if !segments.is_empty() {
+                                self.blocks.push(Block::UserMessage { segments });
                             }
                         }
                         "assistant" if !text.is_empty() => {

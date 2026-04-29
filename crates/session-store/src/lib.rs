@@ -39,7 +39,7 @@ pub use logged_item::{LoggedContentPart, LoggedItem, LoggedRole, from_logged, to
 pub use session::{
     SessionStartState, create_compacted_session, create_session, create_session_with_id,
     ensure_head_or_fork, fork, fork_at, restore, save_config_changed, save_delta, save_extension,
-    save_run_completed, save_run_errored, save_turn_end, save_usage,
+    save_run_completed, save_run_errored, save_turn_end, save_usage, save_user_input,
 };
 pub use llm_worker::UsageRecord;
 pub use llm_worker::llm_client::types::{ContentPart, Item, Role};

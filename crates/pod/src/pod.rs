@@ -135,6 +135,13 @@ pub struct Pod<C: LlmClient, St: Store> {
     /// Restored from `RestoredState.extensions` on `restore`, updated
     /// after each successful extract via `save_extension`.
     extract_pointer: Mutex<Option<memory::ExtractPointerPayload>>,
+    /// Typed user submissions in submit order. K-th entry corresponds to
+    /// the K-th `Item::user_message` in `worker.history()` (modulo seed
+    /// history loaded via `SessionStart.history`, whose original segments
+    /// are not preserved). Populated from log on `restore_from_manifest`,
+    /// appended after `save_user_input` on each `run`. Mirrored to
+    /// `PodSharedState` by the controller for `Event::History` use.
+    user_segments: Vec<Vec<Segment>>,
 }
 
 impl<C: LlmClient, St: Store> Pod<C, St> {
@@ -184,6 +191,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             inject_resident_knowledge: true,
             extract_in_flight: Arc::new(AtomicBool::new(false)),
             extract_pointer: Mutex::new(None),
+            user_segments: Vec::new(),
         };
         pod.apply_prune_from_manifest();
         Ok(pod)
@@ -280,6 +288,15 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     /// and reset by [`compact`](Self::compact) (the new compacted
     /// session has a fresh log with no `LogEntry::Extension` entries).
     /// Cheap clone via `Option<Clone>`.
+    /// Snapshot of the typed user segments tracked alongside worker
+    /// history. The K-th entry corresponds to the K-th `Item::user_message`
+    /// derived from `LogEntry::UserInput` entries (post-compaction); seed
+    /// history loaded via `SessionStart.history` does not contribute,
+    /// which is acceptable because the original segments are unrecoverable.
+    pub fn user_segments(&self) -> &[Vec<Segment>] {
+        &self.user_segments
+    }
+
     pub fn extract_pointer(&self) -> Option<memory::ExtractPointerPayload> {
         self.extract_pointer
             .lock()
@@ -585,6 +602,18 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         self.ensure_system_prompt_materialized()?;
         self.ensure_session_head().await?;
 
+        // Persist the user input as typed segments before the worker
+        // pushes its flattened copy into history. save_delta deliberately
+        // skips the resulting `is_user_message()` item to avoid double-write.
+        session_store::save_user_input(
+            &self.store,
+            self.session_id,
+            &mut self.head_hash,
+            input.clone(),
+        )
+        .await?;
+        self.user_segments.push(input.clone());
+
         let flattened = self.flatten_segments(&input);
 
         let history_before = self.worker.as_ref().unwrap().history().len();
@@ -599,16 +628,15 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     }
 
     /// Flatten a typed segment list into the single string the Worker
-    /// receives as the user message. Inlines text and paste content;
-    /// substitutes `[unresolved <kind>: <key>]` placeholders for
-    /// segments that have no resolver, and emits a user-facing alert so
-    /// neither the LLM nor the human is blind to the dropped intent.
+    /// receives as the user message, and emit user-facing alerts for
+    /// segments that fall through to placeholder (file/knowledge/workflow
+    /// refs without a resolver, or unknown variants from a newer client).
+    /// The text reconstruction itself comes from `Segment::flatten_to_text`,
+    /// shared with replay paths that should not re-alert.
     fn flatten_segments(&self, segments: &[Segment]) -> String {
-        let mut out = String::new();
         for seg in segments {
             match seg {
-                Segment::Text { content } => out.push_str(content),
-                Segment::Paste { content, .. } => out.push_str(content),
+                Segment::Text { .. } | Segment::Paste { .. } => {}
                 Segment::FileRef { path } => {
                     self.alert(
                         AlertLevel::Warn,
@@ -618,7 +646,6 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                              (resolver not yet implemented); passed to LLM as placeholder"
                         ),
                     );
-                    out.push_str(&format!("[unresolved file ref: {path}]"));
                 }
                 Segment::KnowledgeRef { slug } => {
                     self.alert(
@@ -629,7 +656,6 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                              (resolver not yet implemented); passed to LLM as placeholder"
                         ),
                     );
-                    out.push_str(&format!("[unresolved knowledge ref: {slug}]"));
                 }
                 Segment::WorkflowInvoke { slug } => {
                     self.alert(
@@ -640,7 +666,6 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                              (resolver not yet implemented); passed to LLM as placeholder"
                         ),
                     );
-                    out.push_str(&format!("[unresolved workflow invoke: {slug}]"));
                 }
                 Segment::Unknown => {
                     self.alert(
@@ -650,11 +675,10 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                          passed to LLM as placeholder"
                             .into(),
                     );
-                    out.push_str("[unknown input segment]");
                 }
             }
         }
-        out
+        Segment::flatten_to_text(segments)
     }
 
     /// Run a turn triggered by `Method::Notify` while the Pod is idle.
@@ -1539,6 +1563,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             inject_resident_knowledge: true,
             extract_in_flight: Arc::new(AtomicBool::new(false)),
             extract_pointer: Mutex::new(None),
+            user_segments: Vec::new(),
         };
         pod.apply_prune_from_manifest();
         Ok(pod)
@@ -1591,6 +1616,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             inject_resident_knowledge: true,
             extract_in_flight: Arc::new(AtomicBool::new(false)),
             extract_pointer: Mutex::new(None),
+            user_segments: Vec::new(),
         };
         pod.apply_prune_from_manifest();
         Ok(pod)
@@ -1698,6 +1724,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             inject_resident_knowledge: true,
             extract_in_flight: Arc::new(AtomicBool::new(false)),
             extract_pointer: Mutex::new(extract_pointer),
+            user_segments: state.user_segments,
         };
         pod.apply_prune_from_manifest();
         Ok(pod)

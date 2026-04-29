@@ -11,6 +11,7 @@ use crate::store::{Store, StoreError};
 use llm_worker::WorkerResult;
 use llm_worker::llm_client::RequestConfig;
 use llm_worker::llm_client::types::Item;
+use protocol::Segment;
 
 /// State snapshot for creating a SessionStart entry.
 pub struct SessionStartState<'a> {
@@ -138,10 +139,37 @@ pub async fn ensure_head_or_fork(
     Ok(())
 }
 
+/// Log a `UserInput` entry from the original typed `Vec<Segment>`.
+///
+/// Submit-time entry. Pod calls this at the head of a `Run` turn before
+/// the worker pushes its flattened user message into history; replay
+/// derives the worker `Item::user_message` from these segments via
+/// [`Segment::flatten_to_text`].
+pub async fn save_user_input(
+    store: &impl Store,
+    session_id: SessionId,
+    head_hash: &mut Option<EntryHash>,
+    segments: Vec<Segment>,
+) -> Result<(), StoreError> {
+    append_entry(
+        store,
+        session_id,
+        head_hash,
+        LogEntry::UserInput {
+            ts: session_log::now_millis(),
+            segments,
+        },
+    )
+    .await
+}
+
 /// Log the history delta — new items added since the previous snapshot.
 ///
-/// Classifies items into UserInput, AssistantItems, ToolResults, and
-/// HookInjectedItems entries automatically.
+/// Classifies items into AssistantItems, ToolResults, and HookInjectedItems
+/// entries automatically. User messages are skipped because they are
+/// persisted upfront via [`save_user_input`] at submit time; the worker
+/// pushes a flattened copy into its history that arrives here in
+/// `new_items` and would otherwise produce a duplicate `UserInput` entry.
 pub async fn save_delta(
     store: &impl Store,
     session_id: SessionId,
@@ -158,16 +186,7 @@ pub async fn save_delta(
     while i < new_items.len() {
         let item = &new_items[i];
         if item.is_user_message() {
-            append_entry(
-                store,
-                session_id,
-                head_hash,
-                LogEntry::UserInput {
-                    ts,
-                    item: new_items[i].clone(),
-                },
-            )
-            .await?;
+            // Already persisted by save_user_input at submit time.
             i += 1;
         } else if item.is_tool_result() {
             let start = i;
