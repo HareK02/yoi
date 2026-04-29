@@ -415,8 +415,16 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Option<Method> {
             app.delete_char_after();
             None
         }
+        KeyCode::Left if ctrl => {
+            app.move_cursor_word_left();
+            None
+        }
         KeyCode::Left => {
             app.move_cursor_left();
+            None
+        }
+        KeyCode::Right if ctrl => {
+            app.move_cursor_word_right();
             None
         }
         KeyCode::Right => {

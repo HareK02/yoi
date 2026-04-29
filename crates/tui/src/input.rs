@@ -38,6 +38,48 @@ pub enum Atom {
     Paste(PasteRef),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AtomClass {
+    Word(WordKind),
+    Sep,
+    Paste,
+}
+
+/// Sub-classification of word atoms. A run of equal `WordKind` is one word;
+/// a kind switch is a word boundary. Lets `Ctrl+Left/Right` step over
+/// runs of hiragana/katakana/han/ASCII independently when they sit adjacent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WordKind {
+    Ascii,
+    Hiragana,
+    Katakana,
+    Han,
+    Other,
+}
+
+fn atom_class(atom: &Atom) -> AtomClass {
+    match atom {
+        Atom::Paste(_) => AtomClass::Paste,
+        Atom::Char(c) => char_class(*c),
+    }
+}
+
+fn char_class(c: char) -> AtomClass {
+    if c.is_ascii_alphanumeric() || c == '_' {
+        return AtomClass::Word(WordKind::Ascii);
+    }
+    let cp = c as u32;
+    match cp {
+        0x3040..=0x309F => AtomClass::Word(WordKind::Hiragana),
+        0x30A0..=0x30FF | 0x31F0..=0x31FF => AtomClass::Word(WordKind::Katakana),
+        0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF | 0x20000..=0x2FFFF => {
+            AtomClass::Word(WordKind::Han)
+        }
+        _ if c.is_alphanumeric() => AtomClass::Word(WordKind::Other),
+        _ => AtomClass::Sep,
+    }
+}
+
 pub struct InputBuffer {
     atoms: Vec<Atom>,
     /// Insertion point in `0..=atoms.len()`.
@@ -112,6 +154,38 @@ impl InputBuffer {
 
     pub fn move_right(&mut self) {
         self.cursor = (self.cursor + 1).min(self.atoms.len());
+    }
+
+    /// Move backward by one word. Skips a run of separators, then a run of
+    /// atoms sharing the same [`AtomClass`] — so `Word(Hiragana)` next to
+    /// `Word(Han)` are separate blocks, and a `Paste` atom is its own block.
+    pub fn move_word_left(&mut self) {
+        while self.cursor > 0 && atom_class(&self.atoms[self.cursor - 1]) == AtomClass::Sep {
+            self.cursor -= 1;
+        }
+        if self.cursor == 0 {
+            return;
+        }
+        let kind = atom_class(&self.atoms[self.cursor - 1]);
+        while self.cursor > 0 && atom_class(&self.atoms[self.cursor - 1]) == kind {
+            self.cursor -= 1;
+        }
+    }
+
+    /// Move forward by one word. Mirror of [`move_word_left`].
+    pub fn move_word_right(&mut self) {
+        while self.cursor < self.atoms.len()
+            && atom_class(&self.atoms[self.cursor]) == AtomClass::Sep
+        {
+            self.cursor += 1;
+        }
+        if self.cursor == self.atoms.len() {
+            return;
+        }
+        let kind = atom_class(&self.atoms[self.cursor]);
+        while self.cursor < self.atoms.len() && atom_class(&self.atoms[self.cursor]) == kind {
+            self.cursor += 1;
+        }
     }
 
     pub fn move_home(&mut self) {
@@ -487,5 +561,182 @@ mod submit_segments_tests {
         let segs = buf.submit_segments();
         assert_eq!(segs.len(), 1);
         assert!(matches!(segs[0], Segment::Paste { .. }));
+    }
+}
+
+#[cfg(test)]
+mod word_motion_tests {
+    use super::*;
+
+    fn buf_from(text: &str) -> InputBuffer {
+        let mut buf = InputBuffer::new();
+        for c in text.chars() {
+            buf.insert_char(c);
+        }
+        buf
+    }
+
+    fn cursor(buf: &InputBuffer) -> usize {
+        buf.cursor
+    }
+
+    #[test]
+    fn empty_buffer_is_noop() {
+        let mut buf = InputBuffer::new();
+        buf.move_word_left();
+        assert_eq!(cursor(&buf), 0);
+        buf.move_word_right();
+        assert_eq!(cursor(&buf), 0);
+    }
+
+    #[test]
+    fn forward_from_start_lands_after_first_word() {
+        let mut buf = buf_from("foo bar baz");
+        buf.cursor = 0;
+        buf.move_word_right();
+        assert_eq!(cursor(&buf), 3); // after "foo"
+        buf.move_word_right();
+        assert_eq!(cursor(&buf), 7); // after "foo bar"
+        buf.move_word_right();
+        assert_eq!(cursor(&buf), 11); // after "foo bar baz"
+        buf.move_word_right();
+        assert_eq!(cursor(&buf), 11); // end stays put
+    }
+
+    #[test]
+    fn backward_from_end_lands_at_last_word_start() {
+        let mut buf = buf_from("foo bar baz");
+        buf.move_word_left();
+        assert_eq!(cursor(&buf), 8); // start of "baz"
+        buf.move_word_left();
+        assert_eq!(cursor(&buf), 4); // start of "bar"
+        buf.move_word_left();
+        assert_eq!(cursor(&buf), 0); // start of "foo"
+        buf.move_word_left();
+        assert_eq!(cursor(&buf), 0);
+    }
+
+    #[test]
+    fn skips_runs_of_separators() {
+        let mut buf = buf_from("a  ,  b");
+        buf.cursor = 1; // just after "a"
+        buf.move_word_right();
+        assert_eq!(cursor(&buf), 7); // after "b"
+        buf.move_word_left();
+        assert_eq!(cursor(&buf), 6); // start of "b"
+        buf.move_word_left();
+        assert_eq!(cursor(&buf), 0); // start of "a"
+    }
+
+    #[test]
+    fn newline_is_a_separator() {
+        let mut buf = buf_from("foo\nbar");
+        buf.cursor = 0;
+        buf.move_word_right();
+        assert_eq!(cursor(&buf), 3);
+        buf.move_word_right();
+        assert_eq!(cursor(&buf), 7);
+        buf.move_word_left();
+        assert_eq!(cursor(&buf), 4);
+        buf.move_word_left();
+        assert_eq!(cursor(&buf), 0);
+    }
+
+    #[test]
+    fn paste_counts_as_one_word() {
+        let mut buf = InputBuffer::new();
+        for c in "foo ".chars() {
+            buf.insert_char(c);
+        }
+        buf.insert_paste("anything".into());
+        for c in " bar".chars() {
+            buf.insert_char(c);
+        }
+        // atoms: f o o ' ' [P] ' ' b a r  → 9 atoms, paste at index 4
+        let end = 9;
+        buf.cursor = end;
+        buf.move_word_left();
+        assert_eq!(cursor(&buf), 6); // start of "bar"
+        buf.move_word_left();
+        assert_eq!(cursor(&buf), 4); // before paste
+        buf.move_word_left();
+        assert_eq!(cursor(&buf), 0); // start of "foo"
+
+        buf.cursor = 0;
+        buf.move_word_right();
+        assert_eq!(cursor(&buf), 3); // after "foo"
+        buf.move_word_right();
+        assert_eq!(cursor(&buf), 5); // after paste
+        buf.move_word_right();
+        assert_eq!(cursor(&buf), 9); // after "bar"
+    }
+
+    #[test]
+    fn underscore_is_a_word_char() {
+        let mut buf = buf_from("foo_bar baz");
+        buf.cursor = 0;
+        buf.move_word_right();
+        assert_eq!(cursor(&buf), 7); // "foo_bar" is one word
+    }
+
+    #[test]
+    fn hiragana_run_is_one_word() {
+        // "こんにちは" — 5 hiragana atoms, no separators.
+        let mut buf = buf_from("こんにちは");
+        buf.cursor = 0;
+        buf.move_word_right();
+        assert_eq!(cursor(&buf), 5);
+        buf.move_word_left();
+        assert_eq!(cursor(&buf), 0);
+    }
+
+    #[test]
+    fn script_switch_is_a_word_boundary() {
+        // 漢字 | ひらがな | ASCII
+        let mut buf = buf_from("日本語のtest");
+        buf.cursor = 0;
+        buf.move_word_right();
+        assert_eq!(cursor(&buf), 3); // after "日本語"
+        buf.move_word_right();
+        assert_eq!(cursor(&buf), 4); // after "の"
+        buf.move_word_right();
+        assert_eq!(cursor(&buf), 8); // after "test"
+
+        buf.move_word_left();
+        assert_eq!(cursor(&buf), 4); // start of "test"
+        buf.move_word_left();
+        assert_eq!(cursor(&buf), 3); // start of "の"
+        buf.move_word_left();
+        assert_eq!(cursor(&buf), 0); // start of "日本語"
+    }
+
+    #[test]
+    fn katakana_separates_from_ascii() {
+        let mut buf = buf_from("カタカナsecret");
+        buf.cursor = 0;
+        buf.move_word_right();
+        assert_eq!(cursor(&buf), 4); // after "カタカナ"
+        buf.move_word_right();
+        assert_eq!(cursor(&buf), 10); // after "secret"
+        buf.move_word_left();
+        assert_eq!(cursor(&buf), 4);
+        buf.move_word_left();
+        assert_eq!(cursor(&buf), 0);
+    }
+
+    #[test]
+    fn japanese_punctuation_is_a_separator() {
+        // 「、」 (U+3001) and 「。」 (U+3002) are not word chars.
+        let mut buf = buf_from("読んだ、走った。");
+        buf.cursor = 0;
+        buf.move_word_right();
+        assert_eq!(cursor(&buf), 1); // after "読" (han run of 1)
+        buf.move_word_right();
+        assert_eq!(cursor(&buf), 3); // after "んだ" (hiragana run)
+        // "、" is sep — skipped, then han "走"
+        buf.move_word_right();
+        assert_eq!(cursor(&buf), 5); // after "走"
+        buf.move_word_right();
+        assert_eq!(cursor(&buf), 7); // after "った"
     }
 }
