@@ -1,2 +1,2 @@
 [memory]
-extract_threshold = 4000
+extract_threshold = 10000
