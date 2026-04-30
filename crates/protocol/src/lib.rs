@@ -33,6 +33,17 @@ pub enum Method {
     Pause,
     Shutdown,
     GetHistory,
+    /// Request a list of completion candidates from the Pod.
+    ///
+    /// Reply is sent on the same socket as `Event::Completions` (not
+    /// broadcast). Same shape as `GetHistory` / `Event::History`:
+    /// the IPC server handles this directly and writes the response
+    /// straight back to the requesting socket. Empty results for
+    /// resolvers that are not yet wired up (Knowledge / Workflow).
+    ListCompletions {
+        kind: CompletionKind,
+        prefix: String,
+    },
 }
 
 /// Typed lifecycle events sent from a child Pod to its parent.
@@ -264,6 +275,14 @@ pub enum Event {
         items: Vec<serde_json::Value>,
         greeting: Greeting,
     },
+    /// Reply to `Method::ListCompletions`. Delivered only to the
+    /// requesting socket (not broadcast). `entries` is empty when no
+    /// candidates match or when the requested kind has no resolver
+    /// wired up.
+    Completions {
+        kind: CompletionKind,
+        entries: Vec<CompletionEntry>,
+    },
     Alert(Alert),
     /// Pod has started compacting the current session.
     ///
@@ -314,6 +333,34 @@ pub enum AlertSource {
     Worker,
     Compactor,
     AgentsMd,
+}
+
+/// Kind of completion requested by `Method::ListCompletions`.
+///
+/// Mirrors the TUI prefix sigils: `@` → `File`, `#` → `Knowledge`,
+/// `/` → `Workflow`. Knowledge and Workflow resolvers are currently
+/// stubs (always reply with empty `entries`); the wire shape is
+/// nailed down here so the TUI side can ship without waiting for
+/// the memory / workflow tickets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompletionKind {
+    File,
+    Knowledge,
+    Workflow,
+}
+
+/// One candidate returned in `Event::Completions::entries`.
+///
+/// `value` is a path (file kind) or a slug (knowledge / workflow).
+/// `is_dir` is meaningful only for the file kind — it lets the TUI
+/// keep a trailing `/` after a directory selection so the user can
+/// drill in without re-typing the prefix.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompletionEntry {
+    pub value: String,
+    #[serde(default)]
+    pub is_dir: bool,
 }
 
 /// Pod self-description rendered by the TUI when a session starts empty.
@@ -570,6 +617,57 @@ mod tests {
         let json = r#"{"method":"get_history"}"#;
         let method: Method = serde_json::from_str(json).unwrap();
         assert!(matches!(method, Method::GetHistory));
+    }
+
+    #[test]
+    fn method_list_completions_roundtrip() {
+        let method = Method::ListCompletions {
+            kind: CompletionKind::File,
+            prefix: "src/".into(),
+        };
+        let json = serde_json::to_string(&method).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["method"], "list_completions");
+        assert_eq!(parsed["params"]["kind"], "file");
+        assert_eq!(parsed["params"]["prefix"], "src/");
+
+        let decoded: Method = serde_json::from_str(&json).unwrap();
+        match decoded {
+            Method::ListCompletions { kind, prefix } => {
+                assert_eq!(kind, CompletionKind::File);
+                assert_eq!(prefix, "src/");
+            }
+            other => panic!("expected ListCompletions, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn event_completions_format_and_default_is_dir() {
+        let event = Event::Completions {
+            kind: CompletionKind::Workflow,
+            entries: vec![CompletionEntry {
+                value: "clear".into(),
+                is_dir: false,
+            }],
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["event"], "completions");
+        assert_eq!(parsed["data"]["kind"], "workflow");
+        assert_eq!(parsed["data"]["entries"][0]["value"], "clear");
+
+        // is_dir defaults to false on inbound payloads that omit it.
+        let inbound = r#"{"event":"completions","data":{"kind":"file","entries":[{"value":"main.rs"}]}}"#;
+        let decoded: Event = serde_json::from_str(inbound).unwrap();
+        match decoded {
+            Event::Completions { kind, entries } => {
+                assert_eq!(kind, CompletionKind::File);
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].value, "main.rs");
+                assert!(!entries[0].is_dir);
+            }
+            other => panic!("expected Completions, got {other:?}"),
+        }
     }
 
     #[test]

@@ -1,9 +1,11 @@
-use std::sync::RwLock;
+use std::sync::{OnceLock, RwLock};
 
 use llm_worker::llm_client::types::Item;
 use protocol::Segment;
 use serde::{Deserialize, Serialize};
 use session_store::SessionId;
+
+use crate::fs_view::PodFsView;
 
 /// Shared state between PodController and runtime directory.
 ///
@@ -22,6 +24,13 @@ pub struct PodSharedState {
     /// segments are not preserved). Surfaced via `Event::History` so
     /// clients can re-render typed atoms on session restore.
     pub user_segments: RwLock<Vec<Vec<Segment>>>,
+    /// Pod-from-the-inside view of the filesystem. Set once in
+    /// `PodController::start` after the `ScopedFs` is materialised, and
+    /// read from the IPC server layer to answer `ListCompletions`
+    /// queries without going through the controller. `None` until set
+    /// (only relevant for unit tests that build a `PodSharedState`
+    /// directly without spinning up a controller).
+    fs_view: OnceLock<PodFsView>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,7 +56,20 @@ impl PodSharedState {
             status: RwLock::new(PodStatus::Idle),
             history: RwLock::new(Vec::new()),
             user_segments: RwLock::new(Vec::new()),
+            fs_view: OnceLock::new(),
         }
+    }
+
+    /// Attach the Pod's filesystem view. Called once during controller
+    /// startup. Subsequent calls are silently ignored (`OnceLock`).
+    pub fn set_fs_view(&self, view: PodFsView) {
+        let _ = self.fs_view.set(view);
+    }
+
+    /// Borrow the attached `PodFsView`, if any. Returns `None` for unit
+    /// tests that didn't wire one up.
+    pub fn fs_view(&self) -> Option<&PodFsView> {
+        self.fs_view.get()
     }
 
     pub fn user_segments(&self) -> Vec<Vec<Segment>> {

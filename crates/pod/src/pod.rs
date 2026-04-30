@@ -970,8 +970,9 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
 
         use crate::compact::worker::{
             CompactWorkerContext, CompactWorkerInterceptor, add_reference_tool,
-            mark_read_required_tool, slice_lines, write_summary_tool,
+            mark_read_required_tool, write_summary_tool,
         };
+        use crate::fs_view::PodFsView;
 
         // Decide the cut point by projecting the UsageRecord timeline onto
         // the current history: keep the tail whose estimated token count is
@@ -1097,38 +1098,12 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             .clone()
             .ok_or(PodError::CompactSummaryMissing)?;
 
-        // Re-read each auto-read target through ScopedFs and render the
-        // requested slice. Errors are logged and skipped rather than
+        // Re-read each auto-read target via the Pod FS view. Errors are
+        // logged and skipped inside `render_auto_read` rather than
         // aborting compaction — a missing / moved file should not fail
         // the whole compact.
-        let mut auto_read_messages = Vec::new();
-        for req in &final_ctx.read_required {
-            match scoped_fs.read_bytes(&req.path) {
-                Ok(bytes) => {
-                    let text = String::from_utf8_lossy(&bytes).into_owned();
-                    let body = slice_lines(&text, req.offset.unwrap_or(0), req.limit);
-                    let range = match (req.offset, req.limit) {
-                        (None, None) => String::new(),
-                        (Some(off), None) => format!(":{}-", off + 1),
-                        (None, Some(lim)) => format!(":1-{lim}"),
-                        (Some(off), Some(lim)) => {
-                            format!(":{}-{}", off + 1, off.saturating_add(lim))
-                        }
-                    };
-                    auto_read_messages.push(Item::system_message(format!(
-                        "[Auto-read file: {}{range}]\n{body}",
-                        req.path.display()
-                    )));
-                }
-                Err(e) => {
-                    warn!(
-                        path = %req.path.display(),
-                        error = %e,
-                        "auto-read target could not be read; skipping",
-                    );
-                }
-            }
-        }
+        let auto_read_messages =
+            PodFsView::new(scoped_fs.clone()).render_auto_read(&final_ctx.read_required);
 
         // Reference list as a single system message; omitted when empty.
         let reference_message = (!final_ctx.references.is_empty()).then(|| {

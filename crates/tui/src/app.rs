@@ -1,6 +1,8 @@
 use std::time::Instant;
 
-use protocol::{AlertLevel, AlertSource, Event, Method, RunResult, Segment};
+use protocol::{
+    AlertLevel, AlertSource, CompletionEntry, CompletionKind, Event, Method, RunResult, Segment,
+};
 
 use crate::block::{
     Block, CompactEvent, ThinkingBlock, ThinkingState, ToolCallBlock, ToolCallState,
@@ -9,6 +11,32 @@ use crate::cache::FileCache;
 use crate::input::InputBuffer;
 use crate::scroll::Scroll;
 use crate::ui::Mode;
+
+/// In-flight completion popup state. Lives on `App` while the user is
+/// typing inside a `@` / `#` / `/` token. Cleared whenever the trigger
+/// is invalidated (cursor moved out, whitespace landed inside the
+/// token, the sigil was deleted, or the candidate was confirmed).
+pub struct CompletionState {
+    pub kind: CompletionKind,
+    /// Atom index of the leading sigil (`@` / `#` / `/`).
+    pub prefix_start: usize,
+    /// Text typed after the sigil (sigil itself excluded).
+    pub prefix: String,
+    /// Latest candidate set returned by the Pod for `(kind, prefix)`.
+    /// Initially empty until `Event::Completions` lands.
+    pub entries: Vec<CompletionEntry>,
+    pub selected: usize,
+}
+
+impl CompletionState {
+    pub fn is_active(&self) -> bool {
+        !self.entries.is_empty()
+    }
+
+    /// Maximum rows the popup ever renders. Caller can clip to fewer
+    /// rows if vertical space is tight.
+    pub const MAX_VISIBLE: usize = 6;
+}
 
 pub struct App {
     pub pod_name: String,
@@ -39,6 +67,9 @@ pub struct App {
     /// and future text deltas should append to it instead of starting a
     /// fresh block.
     assistant_streaming: bool,
+    /// Completion popup state, when an `@` / `#` / `/` token is in
+    /// flight. `None` whenever the trigger conditions don't hold.
+    pub completion: Option<CompletionState>,
 }
 
 impl App {
@@ -62,7 +93,91 @@ impl App {
             mode: Mode::Normal,
             cache: FileCache::new(),
             assistant_streaming: false,
+            completion: None,
         }
+    }
+
+    /// Re-evaluate the completion popup against the current input.
+    /// Returns a `Method::ListCompletions` to send when the
+    /// `(kind, prefix_start, prefix)` triple changed; otherwise `None`.
+    /// Callers should invoke this after every input mutation that could
+    /// move the cursor or change atoms.
+    pub fn refresh_completion(&mut self) -> Option<Method> {
+        match self.input.pending_completion_prefix() {
+            Some((kind, start, prefix)) => {
+                let need_query = match &self.completion {
+                    Some(c) => c.kind != kind || c.prefix_start != start || c.prefix != prefix,
+                    None => true,
+                };
+                let entries = match self.completion.take() {
+                    Some(c) if c.kind == kind && c.prefix_start == start => c.entries,
+                    _ => Vec::new(),
+                };
+                self.completion = Some(CompletionState {
+                    kind,
+                    prefix_start: start,
+                    prefix: prefix.clone(),
+                    entries,
+                    selected: 0,
+                });
+                if need_query {
+                    Some(Method::ListCompletions { kind, prefix })
+                } else {
+                    None
+                }
+            }
+            None => {
+                self.completion = None;
+                None
+            }
+        }
+    }
+
+    pub fn move_completion_up(&mut self) {
+        if let Some(c) = self.completion.as_mut()
+            && !c.entries.is_empty()
+        {
+            c.selected = if c.selected == 0 {
+                c.entries.len() - 1
+            } else {
+                c.selected - 1
+            };
+        }
+    }
+
+    pub fn move_completion_down(&mut self) {
+        if let Some(c) = self.completion.as_mut()
+            && !c.entries.is_empty()
+        {
+            c.selected = (c.selected + 1) % c.entries.len();
+        }
+    }
+
+    pub fn cancel_completion(&mut self) {
+        self.completion = None;
+    }
+
+    /// Confirm the currently selected completion entry by replacing the
+    /// in-flight token with a chip atom. Returns `true` when something
+    /// was confirmed; `false` when there was no active candidate (so
+    /// the caller can fall through to the default key behaviour).
+    pub fn confirm_completion(&mut self) -> bool {
+        let Some(state) = self.completion.as_ref() else {
+            return false;
+        };
+        if state.entries.is_empty() {
+            return false;
+        }
+        let entry = state.entries[state.selected].clone();
+        let kind = state.kind;
+        let start = state.prefix_start;
+        match kind {
+            CompletionKind::File => self.input.replace_with_file_ref(start, entry.value),
+            CompletionKind::Knowledge => self.input.replace_with_knowledge_ref(start, entry.value),
+            CompletionKind::Workflow => self.input.replace_with_workflow_invoke(start, entry.value),
+        }
+        self.completion = None;
+        true
     }
 
     pub fn submit_input(&mut self) -> Option<Method> {
@@ -290,6 +405,17 @@ impl App {
             }
             Event::History { items, greeting } => {
                 self.restore_history(&items, greeting);
+            }
+            Event::Completions { kind, entries } => {
+                // Apply only if the popup is still on the same
+                // (kind, prefix) the request was issued for; an
+                // out-of-date reply (the user typed past it) is dropped.
+                if let Some(state) = self.completion.as_mut()
+                    && state.kind == kind
+                {
+                    state.entries = entries;
+                    state.selected = 0;
+                }
             }
             Event::Shutdown => {
                 self.quit = true;
@@ -629,6 +755,105 @@ pub fn alert_source_label(source: AlertSource) -> &'static str {
         AlertSource::Worker => "worker",
         AlertSource::Compactor => "compactor",
         AlertSource::AgentsMd => "AGENTS.md",
+    }
+}
+
+#[cfg(test)]
+mod completion_flow_tests {
+    use super::*;
+
+    #[test]
+    fn typing_at_creates_completion_state_and_emits_query() {
+        let mut app = App::new("test".into());
+        app.insert_char('@');
+        let method = app.refresh_completion();
+        match method {
+            Some(Method::ListCompletions { kind, prefix }) => {
+                assert_eq!(kind, CompletionKind::File);
+                assert_eq!(prefix, "");
+            }
+            other => panic!("expected ListCompletions, got {other:?}"),
+        }
+        assert!(app.completion.is_some());
+    }
+
+    #[test]
+    fn appending_to_token_emits_updated_query() {
+        let mut app = App::new("test".into());
+        app.insert_char('@');
+        let _ = app.refresh_completion();
+        app.insert_char('s');
+        let method = app.refresh_completion();
+        match method {
+            Some(Method::ListCompletions { kind, prefix }) => {
+                assert_eq!(kind, CompletionKind::File);
+                assert_eq!(prefix, "s");
+            }
+            other => panic!("expected ListCompletions, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn space_after_token_clears_completion_state() {
+        let mut app = App::new("test".into());
+        for c in "@x".chars() {
+            app.insert_char(c);
+        }
+        let _ = app.refresh_completion();
+        assert!(app.completion.is_some());
+        app.insert_char(' ');
+        let method = app.refresh_completion();
+        assert!(method.is_none());
+        assert!(app.completion.is_none());
+    }
+
+    #[test]
+    fn confirm_replaces_token_with_chip_and_clears_popup() {
+        let mut app = App::new("test".into());
+        for c in "@s".chars() {
+            app.insert_char(c);
+        }
+        let _ = app.refresh_completion();
+        // Pretend the Pod replied with a single candidate.
+        app.completion.as_mut().unwrap().entries = vec![CompletionEntry {
+            value: "src/main.rs".into(),
+            is_dir: false,
+        }];
+        assert!(app.confirm_completion());
+        assert!(app.completion.is_none());
+        let segs = app.input.submit_segments();
+        assert_eq!(segs.len(), 1);
+        assert!(matches!(&segs[0], Segment::FileRef { path } if path == "src/main.rs"));
+    }
+
+    #[test]
+    fn confirm_with_no_entries_is_a_noop() {
+        let mut app = App::new("test".into());
+        for c in "@x".chars() {
+            app.insert_char(c);
+        }
+        let _ = app.refresh_completion();
+        // No `Event::Completions` arrived yet — entries is still empty.
+        assert!(!app.confirm_completion());
+        assert!(app.completion.is_some());
+    }
+
+    #[test]
+    fn outdated_completions_event_is_dropped() {
+        let mut app = App::new("test".into());
+        for c in "@x".chars() {
+            app.insert_char(c);
+        }
+        let _ = app.refresh_completion();
+        // Reply for a different kind shouldn't overwrite state.
+        app.handle_pod_event(Event::Completions {
+            kind: CompletionKind::Workflow,
+            entries: vec![CompletionEntry {
+                value: "stale".into(),
+                is_dir: false,
+            }],
+        });
+        assert!(app.completion.as_ref().unwrap().entries.is_empty());
     }
 }
 

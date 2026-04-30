@@ -17,12 +17,14 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block as UiBlock, BorderType, Borders, Padding, Paragraph, Widget, Wrap};
+use ratatui::widgets::{
+    Block as UiBlock, BorderType, Borders, Clear, Padding, Paragraph, Widget, Wrap,
+};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use protocol::{AlertLevel, Greeting, Segment};
+use protocol::{AlertLevel, CompletionEntry, Greeting, Segment};
 
-use crate::app::{App, alert_source_label, fmt_tokens};
+use crate::app::{App, CompletionState, alert_source_label, fmt_tokens};
 use crate::block::{Block, CompactEvent, ThinkingBlock, ThinkingState};
 
 /// Display density for the history view.
@@ -75,6 +77,71 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_separator(frame, chunks[1]);
     draw_status(frame, app, chunks[2]);
     draw_input(frame, &input_render, chunks[3]);
+    if let Some(state) = app.completion.as_ref().filter(|c| c.is_active()) {
+        draw_completion_popup(frame, state, chunks[3]);
+    }
+}
+
+/// Render the candidate list directly above the input area. The popup
+/// overlays the status row (and history's bottom rows when it grows
+/// taller than that single row); `Clear` blanks the cells first so
+/// underlying text doesn't bleed through. The popup width matches the
+/// widest visible label, capped at the input-area width.
+fn draw_completion_popup(frame: &mut Frame, state: &CompletionState, input_area: Rect) {
+    let entries = &state.entries;
+    if entries.is_empty() || input_area.y == 0 {
+        return;
+    }
+    let visible = entries.len().min(CompletionState::MAX_VISIBLE);
+    // Scroll window keeps the selected item in view.
+    let view_start = if state.selected + 1 <= visible {
+        0
+    } else {
+        state.selected + 1 - visible
+    };
+    let view_end = (view_start + visible).min(entries.len());
+
+    let label_for = |entry: &CompletionEntry| {
+        let mut s = entry.value.clone();
+        if entry.is_dir {
+            s.push('/');
+        }
+        s
+    };
+    let max_label = entries[view_start..view_end]
+        .iter()
+        .map(|e| label_for(e).chars().count() as u16)
+        .max()
+        .unwrap_or(0);
+    let popup_w = max_label.saturating_add(2).min(input_area.width).max(1);
+    let popup_h = (visible as u16).min(input_area.y);
+    let popup_area = Rect::new(
+        input_area.x,
+        input_area.y.saturating_sub(popup_h),
+        popup_w,
+        popup_h,
+    );
+
+    let highlight = Style::default()
+        .bg(Color::DarkGray)
+        .add_modifier(Modifier::BOLD);
+    let dir_style = Style::default().fg(Color::Cyan);
+    let plain = Style::default();
+
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(popup_h as usize);
+    for (i, entry) in entries[view_start..view_end].iter().enumerate() {
+        let abs = view_start + i;
+        let text = label_for(entry);
+        let base = if entry.is_dir { dir_style } else { plain };
+        let style = if abs == state.selected {
+            highlight.patch(base)
+        } else {
+            base
+        };
+        lines.push(Line::from(Span::styled(text, style)));
+    }
+    frame.render_widget(Clear, popup_area);
+    frame.render_widget(Paragraph::new(lines), popup_area);
 }
 
 /// Cap the input area so it doesn't eat the history view: grows with the
@@ -352,14 +419,11 @@ fn push_padded_lines(lines: &mut Vec<Line<'static>>, text: &str, kind: MessageKi
     }
 }
 
-/// Render `Block::UserMessage` from typed segments. Paste atoms are
-/// reconstructed as `[Clipboard #N | X chars, Y lines]` chips in
-/// magenta — matching the input-area presentation — so the user can
-/// recognise their own paste in the scrollback. User-entered text uses
-/// the standard `MessageKind::User` style; other segment kinds (file /
-/// knowledge / workflow refs, unknown variants) render as inline
-/// identifiers in the user style and are expected to be rare until the
-/// completion ticket lands.
+/// Render `Block::UserMessage` from typed segments. Each non-text
+/// segment renders as a one-piece chip whose colour matches the input
+/// area's chip presentation (paste = magenta, `@` file = cyan,
+/// `#` knowledge = green, `/` workflow = yellow), so the user
+/// recognises their own typed atoms in the scrollback.
 fn render_user_message(
     lines: &mut Vec<Line<'static>>,
     segments: &[Segment],
@@ -377,7 +441,6 @@ fn render_user_message(
     }
 
     let user_style = kind_style(MessageKind::User);
-    let paste_style = Style::default().fg(Color::Magenta);
     let mut current: Vec<Span<'static>> = Vec::new();
 
     for seg in segments {
@@ -393,24 +456,38 @@ fn render_user_message(
                     }
                 }
             }
-            Segment::Paste {
-                id,
-                chars,
-                lines: line_count,
-                ..
-            } => {
-                current.push(Span::styled(
-                    format!("[Clipboard #{id} | {chars} chars, {line_count} lines]"),
-                    paste_style,
-                ));
-            }
             other => {
-                current.push(Span::styled(segment_display_text(other), user_style));
+                let (style, text) = chip_span_for(other, user_style);
+                current.push(Span::styled(text, style));
             }
         }
     }
     if !current.is_empty() {
         lines.push(Line::from(current));
+    }
+}
+
+/// Style + display text for a single chip-style `Segment`. `fallback`
+/// is used for `Segment::Text` (which the caller handles inline) and
+/// for `Segment::Unknown` so future variants degrade gracefully.
+fn chip_span_for(seg: &Segment, fallback: Style) -> (Style, String) {
+    match seg {
+        Segment::Text { content } => (fallback, content.clone()),
+        Segment::Paste {
+            id,
+            chars,
+            lines: line_count,
+            ..
+        } => (
+            Style::default().fg(Color::Magenta),
+            format!("[Clipboard #{id} | {chars} chars, {line_count} lines]"),
+        ),
+        Segment::FileRef { path } => (Style::default().fg(Color::Cyan), format!("@{path}")),
+        Segment::KnowledgeRef { slug } => (Style::default().fg(Color::Green), format!("#{slug}")),
+        Segment::WorkflowInvoke { slug } => {
+            (Style::default().fg(Color::Yellow), format!("/{slug}"))
+        }
+        Segment::Unknown => (fallback, "[unknown segment]".to_owned()),
     }
 }
 

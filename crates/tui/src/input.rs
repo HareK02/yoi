@@ -32,17 +32,73 @@ impl PasteRef {
     }
 }
 
+/// `@<path>` chip — confirmed completion of a file reference.
+#[derive(Debug, Clone)]
+pub struct FileRefAtom {
+    pub path: String,
+}
+
+impl FileRefAtom {
+    pub fn label(&self) -> String {
+        format!("@{}", self.path)
+    }
+}
+
+/// `#<slug>` chip — confirmed completion of a Knowledge reference.
+#[derive(Debug, Clone)]
+pub struct KnowledgeRefAtom {
+    pub slug: String,
+}
+
+impl KnowledgeRefAtom {
+    pub fn label(&self) -> String {
+        format!("#{}", self.slug)
+    }
+}
+
+/// `/<slug>` chip — confirmed completion of a Workflow invocation.
+#[derive(Debug, Clone)]
+pub struct WorkflowInvokeAtom {
+    pub slug: String,
+}
+
+impl WorkflowInvokeAtom {
+    pub fn label(&self) -> String {
+        format!("/{}", self.slug)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Atom {
     Char(char),
     Paste(PasteRef),
+    FileRef(FileRefAtom),
+    KnowledgeRef(KnowledgeRefAtom),
+    WorkflowInvoke(WorkflowInvokeAtom),
+}
+
+impl Atom {
+    /// Style + visible label for atoms that render as a single
+    /// indivisible chip. Returns `None` for `Atom::Char`.
+    fn chip(&self) -> Option<(Style, String)> {
+        match self {
+            Atom::Char(_) => None,
+            Atom::Paste(p) => Some((Style::default().fg(Color::Magenta), p.label())),
+            Atom::FileRef(r) => Some((Style::default().fg(Color::Cyan), r.label())),
+            Atom::KnowledgeRef(r) => Some((Style::default().fg(Color::Green), r.label())),
+            Atom::WorkflowInvoke(r) => Some((Style::default().fg(Color::Yellow), r.label())),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AtomClass {
     Word(WordKind),
     Sep,
-    Paste,
+    /// Indivisible chip — paste / file ref / knowledge ref / workflow
+    /// invocation. Word motion treats one chip as one unit; deletion
+    /// removes the whole atom.
+    Chip,
 }
 
 /// Sub-classification of word atoms. A run of equal `WordKind` is one word;
@@ -59,8 +115,11 @@ enum WordKind {
 
 fn atom_class(atom: &Atom) -> AtomClass {
     match atom {
-        Atom::Paste(_) => AtomClass::Paste,
         Atom::Char(c) => char_class(*c),
+        Atom::Paste(_)
+        | Atom::FileRef(_)
+        | Atom::KnowledgeRef(_)
+        | Atom::WorkflowInvoke(_) => AtomClass::Chip,
     }
 }
 
@@ -132,6 +191,83 @@ impl InputBuffer {
             }),
         );
         self.cursor += 1;
+    }
+
+    /// Replace `atoms[start..self.cursor]` (the in-flight `@<typed>` /
+    /// `#<typed>` / `/<typed>` token) with the corresponding chip atom
+    /// and place the cursor right after the chip. Used by the completion
+    /// confirm path.
+    pub fn replace_with_file_ref(&mut self, start: usize, path: String) {
+        self.atoms.drain(start..self.cursor);
+        self.atoms
+            .insert(start, Atom::FileRef(FileRefAtom { path }));
+        self.cursor = start + 1;
+    }
+
+    pub fn replace_with_knowledge_ref(&mut self, start: usize, slug: String) {
+        self.atoms.drain(start..self.cursor);
+        self.atoms
+            .insert(start, Atom::KnowledgeRef(KnowledgeRefAtom { slug }));
+        self.cursor = start + 1;
+    }
+
+    pub fn replace_with_workflow_invoke(&mut self, start: usize, slug: String) {
+        self.atoms.drain(start..self.cursor);
+        self.atoms.insert(
+            start,
+            Atom::WorkflowInvoke(WorkflowInvokeAtom { slug }),
+        );
+        self.cursor = start + 1;
+    }
+
+    /// If the cursor is currently inside a `@<typed>` / `#<typed>` /
+    /// `/<typed>` token that satisfies the trigger rules, return the
+    /// kind, the index of the leading sigil atom, and the typed text
+    /// after the sigil (sigil itself excluded).
+    ///
+    /// Trigger rules:
+    /// - The sigil (`@` / `#` / `/`) must be preceded by start-of-input,
+    ///   whitespace, or another chip atom — otherwise this is normal
+    ///   text (e.g. the `/` in `src/main.rs` is not a workflow trigger).
+    /// - Whitespace, newlines and chip atoms invalidate an in-flight
+    ///   token — `@foo /` closes the `@foo` candidate as soon as the
+    ///   space lands.
+    pub fn pending_completion_prefix(&self) -> Option<(protocol::CompletionKind, usize, String)> {
+        if self.cursor == 0 {
+            return None;
+        }
+        let mut typed = String::new();
+        for i in (0..self.cursor).rev() {
+            match &self.atoms[i] {
+                Atom::Char(c) => {
+                    if c.is_whitespace() {
+                        return None;
+                    }
+                    let kind = match c {
+                        '@' => Some(protocol::CompletionKind::File),
+                        '#' => Some(protocol::CompletionKind::Knowledge),
+                        '/' => Some(protocol::CompletionKind::Workflow),
+                        _ => None,
+                    };
+                    if let Some(k) = kind {
+                        let leading_ok = match self.atoms.get(i.wrapping_sub(1)).filter(|_| i > 0) {
+                            None => true, // start of input
+                            Some(Atom::Char(prev)) => prev.is_whitespace(),
+                            Some(_) => true, // chip
+                        };
+                        if leading_ok {
+                            return Some((k, i, typed));
+                        }
+                    }
+                    typed.insert(0, *c);
+                }
+                _ => {
+                    // Chip atoms cannot appear inside a candidate token.
+                    return None;
+                }
+            }
+        }
+        None
     }
 
     pub fn delete_before(&mut self) {
@@ -274,25 +410,47 @@ impl InputBuffer {
     }
 
     /// Build the typed `Vec<Segment>` sent over the protocol. Adjacent
-    /// `Atom::Char`s are concatenated into a single `Segment::Text`;
-    /// each `Atom::Paste` becomes a standalone `Segment::Paste` so the
-    /// `[Clipboard #N | X chars, Y lines]` chip can be reconstructed by
-    /// any client subscribed to the resulting `Event::UserMessage`.
+    /// `Atom::Char`s are concatenated into a single `Segment::Text`; each
+    /// chip atom (`Paste` / `FileRef` / `KnowledgeRef` / `WorkflowInvoke`)
+    /// becomes a standalone `Segment` so that clients re-rendering an
+    /// `Event::UserMessage` see the same indivisible chip rather than a
+    /// flattened string.
     pub fn submit_segments(&self) -> Vec<protocol::Segment> {
         let mut out = Vec::new();
         let mut buf = String::new();
+        let flush_text = |buf: &mut String, out: &mut Vec<protocol::Segment>| {
+            if !buf.is_empty() {
+                out.push(protocol::Segment::text(std::mem::take(buf)));
+            }
+        };
         for a in &self.atoms {
             match a {
                 Atom::Char(c) => buf.push(*c),
                 Atom::Paste(p) => {
-                    if !buf.is_empty() {
-                        out.push(protocol::Segment::text(std::mem::take(&mut buf)));
-                    }
+                    flush_text(&mut buf, &mut out);
                     out.push(protocol::Segment::Paste {
                         id: p.id,
                         chars: p.chars as u32,
                         lines: p.lines as u32,
                         content: p.content.clone(),
+                    });
+                }
+                Atom::FileRef(r) => {
+                    flush_text(&mut buf, &mut out);
+                    out.push(protocol::Segment::FileRef {
+                        path: r.path.clone(),
+                    });
+                }
+                Atom::KnowledgeRef(r) => {
+                    flush_text(&mut buf, &mut out);
+                    out.push(protocol::Segment::KnowledgeRef {
+                        slug: r.slug.clone(),
+                    });
+                }
+                Atom::WorkflowInvoke(r) => {
+                    flush_text(&mut buf, &mut out);
+                    out.push(protocol::Segment::WorkflowInvoke {
+                        slug: r.slug.clone(),
                     });
                 }
             }
@@ -308,7 +466,6 @@ impl InputBuffer {
     /// within the wrapped layout.
     pub fn render(&self, content_width: u16) -> InputRender {
         let w = content_width.max(1) as usize;
-        let paste_style = Style::default().fg(Color::Magenta);
         let text_style = Style::default();
 
         // Row-builder state. `pending` + `pending_width` batch consecutive
@@ -347,10 +504,9 @@ impl InputBuffer {
                 let leading = match atom {
                     Atom::Char('\n') => 0,
                     Atom::Char(c) => UnicodeWidthChar::width(*c).unwrap_or(0),
-                    Atom::Paste(p) => p
-                        .label()
-                        .chars()
-                        .next()
+                    other => other
+                        .chip()
+                        .and_then(|(_, label)| label.chars().next())
                         .and_then(UnicodeWidthChar::width)
                         .unwrap_or(0),
                 };
@@ -395,8 +551,9 @@ impl InputBuffer {
                         w,
                     );
                 }
-                Atom::Paste(p) => {
-                    if pending_style != paste_style && !pending.is_empty() {
+                other => {
+                    let (chip_style, label) = other.chip().expect("non-char atom has a chip");
+                    if pending_style != chip_style && !pending.is_empty() {
                         flush_pending(
                             &mut pending,
                             &mut pending_width,
@@ -405,8 +562,8 @@ impl InputBuffer {
                             &mut row_width,
                         );
                     }
-                    pending_style = paste_style;
-                    for c in p.label().chars() {
+                    pending_style = chip_style;
+                    for c in label.chars() {
                         let cw = UnicodeWidthChar::width(c).unwrap_or(0);
                         place_char(
                             c,
@@ -570,6 +727,160 @@ mod submit_segments_tests {
         let segs = buf.submit_segments();
         assert_eq!(segs.len(), 1);
         assert!(matches!(segs[0], Segment::Paste { .. }));
+    }
+
+    #[test]
+    fn file_ref_chip_emits_file_ref_segment() {
+        let mut buf = InputBuffer::new();
+        for c in "see @sr".chars() {
+            buf.insert_char(c);
+        }
+        buf.replace_with_file_ref(4, "src/main.rs".into());
+        let segs = buf.submit_segments();
+        assert_eq!(segs.len(), 2);
+        assert!(matches!(&segs[0], Segment::Text { content } if content == "see "));
+        match &segs[1] {
+            Segment::FileRef { path } => assert_eq!(path, "src/main.rs"),
+            other => panic!("expected FileRef, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn replace_with_file_ref_swallows_in_flight_token() {
+        let mut buf = InputBuffer::new();
+        for c in "see @sr".chars() {
+            buf.insert_char(c);
+        }
+        // pending_completion_prefix returns the sigil index (4 = '@').
+        let (_, start, prefix) = buf.pending_completion_prefix().unwrap();
+        assert_eq!(start, 4);
+        assert_eq!(prefix, "sr");
+        buf.replace_with_file_ref(start, "src/main.rs".into());
+        let segs = buf.submit_segments();
+        assert_eq!(segs.len(), 2);
+        assert!(matches!(&segs[0], Segment::Text { content } if content == "see "));
+        assert!(matches!(&segs[1], Segment::FileRef { path } if path == "src/main.rs"));
+    }
+
+    #[test]
+    fn knowledge_and_workflow_chips_emit_typed_segments() {
+        let mut buf = InputBuffer::new();
+        for c in "#r".chars() {
+            buf.insert_char(c);
+        }
+        buf.replace_with_knowledge_ref(0, "rust-style".into());
+        buf.insert_char(' ');
+        for c in "/p".chars() {
+            buf.insert_char(c);
+        }
+        buf.replace_with_workflow_invoke(2, "plan".into());
+        let segs = buf.submit_segments();
+        assert_eq!(segs.len(), 3);
+        match &segs[0] {
+            Segment::KnowledgeRef { slug } => assert_eq!(slug, "rust-style"),
+            other => panic!("expected KnowledgeRef, got {other:?}"),
+        }
+        match &segs[1] {
+            Segment::Text { content } => assert_eq!(content, " "),
+            other => panic!("expected Text, got {other:?}"),
+        }
+        match &segs[2] {
+            Segment::WorkflowInvoke { slug } => assert_eq!(slug, "plan"),
+            other => panic!("expected WorkflowInvoke, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod completion_prefix_tests {
+    use super::*;
+    use protocol::CompletionKind;
+
+    fn buf_from(text: &str) -> InputBuffer {
+        let mut buf = InputBuffer::new();
+        for c in text.chars() {
+            buf.insert_char(c);
+        }
+        buf
+    }
+
+    #[test]
+    fn at_sigil_at_start_triggers_file_completion() {
+        let buf = buf_from("@sr");
+        let (kind, start, prefix) = buf.pending_completion_prefix().unwrap();
+        assert_eq!(kind, CompletionKind::File);
+        assert_eq!(start, 0);
+        assert_eq!(prefix, "sr");
+    }
+
+    #[test]
+    fn sigil_after_space_triggers() {
+        let buf = buf_from("see @x");
+        let (kind, start, prefix) = buf.pending_completion_prefix().unwrap();
+        assert_eq!(kind, CompletionKind::File);
+        assert_eq!(start, 4);
+        assert_eq!(prefix, "x");
+    }
+
+    #[test]
+    fn slash_inside_path_is_not_a_workflow_trigger() {
+        // After `@src/m`, the only valid trigger is `@`, not the `/`.
+        let buf = buf_from("@src/m");
+        let (kind, start, prefix) = buf.pending_completion_prefix().unwrap();
+        assert_eq!(kind, CompletionKind::File);
+        assert_eq!(start, 0);
+        assert_eq!(prefix, "src/m");
+    }
+
+    #[test]
+    fn space_after_sigil_invalidates_token() {
+        // `@x ` — once a space lands after the typed text, the candidate
+        // is gone (until the user types another sigil).
+        let buf = buf_from("@x ");
+        assert!(buf.pending_completion_prefix().is_none());
+    }
+
+    #[test]
+    fn sigil_glued_to_word_is_not_a_trigger() {
+        // `foo@bar` — `@` is preceded by a word char, so it stays plain
+        // text (covers the case of email addresses and similar).
+        let buf = buf_from("foo@bar");
+        assert!(buf.pending_completion_prefix().is_none());
+    }
+
+    #[test]
+    fn trigger_after_chip_atom() {
+        let mut buf = InputBuffer::new();
+        buf.insert_paste("X".into());
+        for c in "@sr".chars() {
+            buf.insert_char(c);
+        }
+        let (kind, start, prefix) = buf.pending_completion_prefix().unwrap();
+        assert_eq!(kind, CompletionKind::File);
+        assert_eq!(start, 1); // chip at 0, sigil at 1
+        assert_eq!(prefix, "sr");
+    }
+
+    #[test]
+    fn hash_sigil_triggers_knowledge_completion() {
+        let buf = buf_from("#abc");
+        let (kind, _, prefix) = buf.pending_completion_prefix().unwrap();
+        assert_eq!(kind, CompletionKind::Knowledge);
+        assert_eq!(prefix, "abc");
+    }
+
+    #[test]
+    fn slash_at_start_triggers_workflow_completion() {
+        let buf = buf_from("/cl");
+        let (kind, _, prefix) = buf.pending_completion_prefix().unwrap();
+        assert_eq!(kind, CompletionKind::Workflow);
+        assert_eq!(prefix, "cl");
+    }
+
+    #[test]
+    fn newline_before_cursor_invalidates_trigger() {
+        let buf = buf_from("@a\nbc");
+        assert!(buf.pending_completion_prefix().is_none());
     }
 }
 
@@ -750,13 +1061,16 @@ mod word_motion_tests {
         assert_eq!(cursor(&buf), 0);
     }
 
-    /// Render atoms as a string for assertions; pastes become `<P>`.
+    /// Render atoms as a string for assertions; chip atoms become `<P>`.
     fn as_text(buf: &InputBuffer) -> String {
         let mut out = String::new();
         for a in &buf.atoms {
             match a {
                 Atom::Char(c) => out.push(*c),
-                Atom::Paste(_) => out.push_str("<P>"),
+                Atom::Paste(_)
+                | Atom::FileRef(_)
+                | Atom::KnowledgeRef(_)
+                | Atom::WorkflowInvoke(_) => out.push_str("<P>"),
             }
         }
         out

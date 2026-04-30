@@ -108,6 +108,10 @@ impl PodController {
         // can emit typed lifecycle `Event`s (currently: compact progress).
         pod.attach_event_tx(event_tx.clone());
 
+        // Stashed during tool registration below so we can attach a
+        // `PodFsView` to the shared state once the latter exists.
+        let fs_for_view: tools::ScopedFs;
+
         // Register event bridge callbacks on the worker
         {
             let worker = pod.worker_mut();
@@ -226,6 +230,10 @@ impl PodController {
             // touching.
             let fs = tools::ScopedFs::new(scope_for_tools, pwd_for_tools.clone());
             let tracker = tools::Tracker::new();
+            // The same ScopedFs also powers the IPC `ListCompletions`
+            // query — keep a clone for the FS view we attach below,
+            // since the tools consume `fs` itself.
+            fs_for_view = fs.clone();
             worker.register_tools(tools::builtin_tools(fs, tracker.clone()));
 
             // Memory subsystem opt-in. When `[memory]` is present in
@@ -278,6 +286,7 @@ impl PodController {
         ));
         shared_state.update_history(pod.worker().history().to_vec());
         shared_state.set_user_segments(pod.user_segments().to_vec());
+        shared_state.set_fs_view(crate::fs_view::PodFsView::new(fs_for_view));
         runtime_dir.write_manifest(&manifest_toml).await?;
         runtime_dir.write_status(&shared_state).await?;
         runtime_dir.write_history(&shared_state).await?;
@@ -527,9 +536,10 @@ impl PodController {
                         break;
                     }
 
-                    // GetHistory is handled at the socket layer (direct response).
-                    // If it somehow reaches the controller, ignore it.
-                    Method::GetHistory => {}
+                    // GetHistory / ListCompletions are handled at the socket
+                    // layer (direct response). If they somehow reach the
+                    // controller, ignore them.
+                    Method::GetHistory | Method::ListCompletions { .. } => {}
 
                     Method::PodEvent(event) => {
                         // (1) system side effects — idempotent and
@@ -728,7 +738,7 @@ where
                         // drain it at its next pre_llm_request.
                         notify_buffer.push(message);
                     }
-                    Some(Method::GetHistory) => {}
+                    Some(Method::GetHistory | Method::ListCompletions { .. }) => {}
                     Some(Method::PodEvent(event)) => {
                         // mpsc is consume-once, so we cannot defer this
                         // to the next main-loop iteration — drop here

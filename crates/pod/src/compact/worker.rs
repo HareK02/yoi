@@ -28,15 +28,7 @@ use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use serde::Deserialize;
 use tools::ScopedFs;
 
-/// A file the compact worker has marked for auto-read in the new session.
-#[derive(Debug, Clone)]
-pub(crate) struct ReadRequirement {
-    pub path: PathBuf,
-    /// 0-based line offset. `None` means from the start of the file.
-    pub offset: Option<usize>,
-    /// Maximum number of lines. `None` means to the end of the file.
-    pub limit: Option<usize>,
-}
+use crate::fs_view::{ReadRequirement, slice_lines};
 
 /// Aggregated output of a compact worker run.
 #[derive(Debug, Default, Clone)]
@@ -279,18 +271,6 @@ impl Interceptor for CompactWorkerInterceptor {
 /// Crude bytes→tokens estimate; good enough for budget accounting.
 fn estimate_tokens(bytes: usize) -> u64 {
     (bytes as u64).div_ceil(4)
-}
-
-/// Return the slice of `text` covered by `offset` (line index) and
-/// optional `limit` (line count), preserving the original newline
-/// separation. Returns the whole file when both defaults apply.
-pub(crate) fn slice_lines(text: &str, offset: usize, limit: Option<usize>) -> String {
-    let lines: Vec<&str> = text.lines().collect();
-    let start = offset.min(lines.len());
-    let end = limit
-        .map(|n| start.saturating_add(n).min(lines.len()))
-        .unwrap_or(lines.len());
-    lines[start..end].join("\n")
 }
 
 #[cfg(test)]

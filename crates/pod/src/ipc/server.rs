@@ -89,6 +89,33 @@ async fn handle_connection(stream: tokio::net::UnixStream, handle: PodHandle) {
             // Client methods → handle or forward to controller
             method = reader.next::<Method>() => {
                 match method {
+                    Ok(Some(Method::ListCompletions { kind, prefix })) => {
+                        let entries = match kind {
+                            protocol::CompletionKind::File => handle
+                                .shared_state
+                                .fs_view()
+                                .map(|view| view.list_file_completions(&prefix))
+                                .unwrap_or_default()
+                                .into_iter()
+                                .map(|c| protocol::CompletionEntry {
+                                    value: c.path,
+                                    is_dir: c.is_dir,
+                                })
+                                .collect(),
+                            // Knowledge / Workflow resolvers are not wired
+                            // up yet — reply empty so the TUI sees a
+                            // consistent shape regardless of kind.
+                            protocol::CompletionKind::Knowledge
+                            | protocol::CompletionKind::Workflow => Vec::new(),
+                        };
+                        if writer
+                            .write(&Event::Completions { kind, entries })
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
                     Ok(Some(Method::GetHistory)) => {
                         let items = handle.shared_state.history();
                         let segments_per_user = handle.shared_state.user_segments();

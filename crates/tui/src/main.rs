@@ -391,6 +391,32 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Option<Method> {
         _ => {}
     }
 
+    // Completion popup overrides — only when there's something to
+    // confirm / navigate. An empty popup (request in flight) falls
+    // through to the default behaviour.
+    if app.completion.as_ref().is_some_and(|c| c.is_active()) {
+        match key.code {
+            KeyCode::Tab | KeyCode::Enter if !alt => {
+                if app.confirm_completion() {
+                    return None;
+                }
+            }
+            KeyCode::Up => {
+                app.move_completion_up();
+                return None;
+            }
+            KeyCode::Down => {
+                app.move_completion_down();
+                return None;
+            }
+            KeyCode::Esc => {
+                app.cancel_completion();
+                return None;
+            }
+            _ => {}
+        }
+    }
+
     match key.code {
         KeyCode::Char('c') if ctrl => handle_pause_or_quit(app),
         KeyCode::Char('x') if ctrl => {
@@ -402,58 +428,64 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Option<Method> {
             }
         }
         KeyCode::Char('d') if ctrl => handle_shutdown(app),
+        KeyCode::Esc => {
+            // Close the popup if it's still showing (covers the
+            // request-in-flight case where `is_active()` was false).
+            app.cancel_completion();
+            None
+        }
         KeyCode::Enter if alt => {
             app.insert_newline();
-            None
+            app.refresh_completion()
         }
         KeyCode::Enter => app.submit_input(),
         KeyCode::Backspace if ctrl => {
             app.delete_word_before();
-            None
+            app.refresh_completion()
         }
         KeyCode::Backspace => {
             app.delete_char_before();
-            None
+            app.refresh_completion()
         }
         KeyCode::Delete => {
             app.delete_char_after();
-            None
+            app.refresh_completion()
         }
         KeyCode::Left if ctrl => {
             app.move_cursor_word_left();
-            None
+            app.refresh_completion()
         }
         KeyCode::Left => {
             app.move_cursor_left();
-            None
+            app.refresh_completion()
         }
         KeyCode::Right if ctrl => {
             app.move_cursor_word_right();
-            None
+            app.refresh_completion()
         }
         KeyCode::Right => {
             app.move_cursor_right();
-            None
+            app.refresh_completion()
         }
         KeyCode::Up => {
             app.move_cursor_up();
-            None
+            app.refresh_completion()
         }
         KeyCode::Down => {
             app.move_cursor_down();
-            None
+            app.refresh_completion()
         }
         KeyCode::Home => {
             app.move_cursor_home();
-            None
+            app.refresh_completion()
         }
         KeyCode::End => {
             app.move_cursor_end();
-            None
+            app.refresh_completion()
         }
         KeyCode::Char(c) => {
             app.insert_char(c);
-            None
+            app.refresh_completion()
         }
         _ => None,
     }
