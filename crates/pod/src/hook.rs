@@ -21,6 +21,30 @@ use llm_worker::interceptor::{
 use llm_worker::tool::ToolOutput;
 use serde_json::Value;
 
+/// Hook-facing prompt-submit action.
+///
+/// A strict subset of [`PromptAction`]: Hooks may continue or cancel
+/// the submit, but cannot inject items into history. The
+/// `ContinueWith(Vec<Item>)` variant is reserved for the internal
+/// `Interceptor` so that Hook (the public extension surface) stays
+/// read-only by construction (see module-level doc).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HookPromptAction {
+    /// Proceed normally.
+    Continue,
+    /// Cancel with a reason.
+    Cancel(String),
+}
+
+impl From<HookPromptAction> for PromptAction {
+    fn from(action: HookPromptAction) -> Self {
+        match action {
+            HookPromptAction::Continue => PromptAction::Continue,
+            HookPromptAction::Cancel(reason) => PromptAction::Cancel(reason),
+        }
+    }
+}
+
 // =============================================================================
 // Hook input summary types (read-only)
 // =============================================================================
@@ -121,7 +145,7 @@ pub struct OnAbort;
 
 impl HookEventKind for OnPromptSubmit {
     type Input = PromptSubmitInfo;
-    type Output = PromptAction;
+    type Output = HookPromptAction;
 }
 
 impl HookEventKind for PreLlmRequest {

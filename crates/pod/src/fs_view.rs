@@ -13,7 +13,7 @@
 use std::path::{Path, PathBuf};
 
 use llm_worker::Item;
-use tools::ScopedFs;
+use tools::{ScopedFs, ToolsError};
 use tracing::warn;
 
 /// 補完候補1件の最大数。`list_file_completions` がこの値を超えたら打ち切り。
@@ -44,6 +44,29 @@ pub struct FileCandidate {
     pub path: String,
     pub is_dir: bool,
 }
+
+/// `resolve_file_ref` の失敗理由。Pod 側で Alert に振り分けるために
+/// ScopedFs / 内部判定の両方を区別できるよう保持する。
+#[derive(Debug)]
+pub enum ResolveError {
+    /// Path resolution / scope check failed via `ScopedFs`.
+    Fs(ToolsError),
+    /// File contents are not valid UTF-8 (binary / non-text).
+    Binary { path: PathBuf },
+}
+
+impl std::fmt::Display for ResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ResolveError::Fs(e) => write!(f, "{e}"),
+            ResolveError::Binary { path } => {
+                write!(f, "file is not valid UTF-8 text: {}", path.display())
+            }
+        }
+    }
+}
+
+impl std::error::Error for ResolveError {}
 
 impl PodFsView {
     pub fn new(fs: ScopedFs) -> Self {
@@ -81,6 +104,41 @@ impl PodFsView {
             }
         }
         out
+    }
+
+    /// `path` を ScopedFs 経由で読み、`[File: <path>]\n<body>` 形式の
+    /// system message を返す。submit 時の `Segment::FileRef` リゾルバが
+    /// 使う経路。
+    ///
+    /// - `path` は relative なら pwd 相対、absolute なら absolute として解釈
+    /// - `max_bytes` を超える本文は切り詰め、末尾に
+    ///   `[...truncated, <total> bytes total — use read_file for the rest]`
+    ///   を付与する
+    /// - 非 UTF-8 (バイナリ) は `ResolveError::Binary` で拒否
+    /// - スコープ外 / NotFound 等は `ResolveError::Fs` で返す
+    pub fn resolve_file_ref(&self, path: &str, max_bytes: usize) -> Result<Item, ResolveError> {
+        let p = Path::new(path);
+        let abs = if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            self.fs.pwd().join(p)
+        };
+        let bytes = self.fs.read_bytes(&abs).map_err(ResolveError::Fs)?;
+        let total = bytes.len();
+        let (body_bytes, truncated) = if total > max_bytes {
+            (&bytes[..max_bytes], true)
+        } else {
+            (bytes.as_slice(), false)
+        };
+        let body = std::str::from_utf8(body_bytes)
+            .map_err(|_| ResolveError::Binary { path: abs.clone() })?;
+        let mut text = format!("[File: {path}]\n{body}");
+        if truncated {
+            text.push_str(&format!(
+                "\n[...truncated, {total} bytes total — use read_file for the rest]"
+            ));
+        }
+        Ok(Item::system_message(text))
     }
 
     /// `prefix` にマッチするファイル / ディレクトリを scope 内で浅く列挙する。
@@ -225,6 +283,61 @@ mod tests {
         assert!(rendered.contains(":2-2"));
         assert!(rendered.contains("beta"));
         assert!(!rendered.contains("alpha"));
+    }
+
+    #[test]
+    fn resolve_file_ref_emits_system_message_with_path_header() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("hello.txt"), "hello world").unwrap();
+        let view = PodFsView::new(fs_for(&dir));
+
+        let item = view.resolve_file_ref("hello.txt", 1024).unwrap();
+        let text = format!("{item:?}");
+        assert!(text.contains("[File: hello.txt]"));
+        assert!(text.contains("hello world"));
+        assert!(!text.contains("truncated"));
+    }
+
+    #[test]
+    fn resolve_file_ref_truncates_with_hint_when_over_cap() {
+        let dir = TempDir::new().unwrap();
+        let body = "x".repeat(2048);
+        std::fs::write(dir.path().join("big.txt"), &body).unwrap();
+        let view = PodFsView::new(fs_for(&dir));
+
+        let item = view.resolve_file_ref("big.txt", 256).unwrap();
+        let text = format!("{item:?}");
+        assert!(text.contains("[File: big.txt]"));
+        assert!(text.contains("truncated"));
+        assert!(text.contains("2048 bytes total"));
+    }
+
+    #[test]
+    fn resolve_file_ref_rejects_binary_with_binary_error() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("blob.bin"), [0xff, 0xfe, 0x00, 0x80]).unwrap();
+        let view = PodFsView::new(fs_for(&dir));
+
+        let err = view.resolve_file_ref("blob.bin", 1024).unwrap_err();
+        assert!(matches!(err, ResolveError::Binary { .. }));
+    }
+
+    #[test]
+    fn resolve_file_ref_returns_fs_error_for_out_of_scope() {
+        let outer = TempDir::new().unwrap();
+        let inner = outer.path().join("scoped");
+        std::fs::create_dir(&inner).unwrap();
+        std::fs::write(outer.path().join("secret.txt"), "nope").unwrap();
+        let scope = Scope::writable(&inner).unwrap();
+        let fs = ScopedFs::new(scope, inner.clone());
+        let view = PodFsView::new(fs);
+
+        // Absolute path outside of scope.
+        let outside = outer.path().join("secret.txt");
+        let err = view
+            .resolve_file_ref(outside.to_str().unwrap(), 1024)
+            .unwrap_err();
+        assert!(matches!(err, ResolveError::Fs(_)));
     }
 
     #[test]

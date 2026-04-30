@@ -22,8 +22,8 @@ use tracing::info;
 
 use crate::compact::state::CompactState;
 use crate::hook::{
-    AbortInfo, HookRegistry, PreRequestInfo, PromptSubmitInfo, ToolCallSummary, ToolResultSummary,
-    TurnEndInfo,
+    AbortInfo, HookPromptAction, HookRegistry, PreRequestInfo, PromptSubmitInfo, ToolCallSummary,
+    ToolResultSummary, TurnEndInfo,
 };
 use crate::ipc::notify_buffer::{NotifyBuffer, format_notify};
 use crate::prompt::catalog::PromptCatalog;
@@ -43,6 +43,11 @@ pub(crate) struct PodInterceptor {
     /// Pending-notification buffer drained into the per-request
     /// context at the head of `pre_llm_request`.
     pending_notifies: NotifyBuffer,
+    /// Submit-scoped stash of resolver-produced system messages.
+    /// Drained inside `on_prompt_submit` and returned via
+    /// `PromptAction::ContinueWith`. Populated by `Pod::run` immediately
+    /// before handing off to the worker.
+    pending_attachments: Arc<Mutex<Vec<Item>>>,
     /// Prompt catalog used to render the injected notification wrapper.
     prompts: Arc<PromptCatalog>,
     /// Next turn index assigned by `on_prompt_submit`.
@@ -57,6 +62,7 @@ impl PodInterceptor {
         compact_state: Option<Arc<CompactState>>,
         usage_history: Option<Arc<Mutex<Vec<UsageRecord>>>>,
         pending_notifies: NotifyBuffer,
+        pending_attachments: Arc<Mutex<Vec<Item>>>,
         prompts: Arc<PromptCatalog>,
     ) -> Self {
         Self {
@@ -64,6 +70,7 @@ impl PodInterceptor {
             compact_state,
             usage_history,
             pending_notifies,
+            pending_attachments,
             prompts,
             next_turn_index: AtomicUsize::new(0),
             tool_calls_this_turn: AtomicUsize::new(0),
@@ -98,11 +105,21 @@ impl Interceptor for PodInterceptor {
         };
         for hook in &self.registry.on_prompt_submit {
             let action = hook.call(&info).await;
-            if !matches!(action, PromptAction::Continue) {
-                return action;
+            if !matches!(action, HookPromptAction::Continue) {
+                return action.into();
             }
         }
-        PromptAction::Continue
+        let extras = std::mem::take(
+            &mut *self
+                .pending_attachments
+                .lock()
+                .expect("pending_attachments poisoned"),
+        );
+        if extras.is_empty() {
+            PromptAction::Continue
+        } else {
+            PromptAction::ContinueWith(extras)
+        }
     }
 
     async fn pre_llm_request(&self, context: &mut Vec<Item>) -> PreRequestAction {
@@ -297,6 +314,7 @@ mod tests {
             Some(state),
             Some(history),
             NotifyBuffer::new(),
+            Arc::new(Mutex::new(Vec::new())),
             PromptCatalog::builtins_only().unwrap(),
         );
         let mut ctx = ctx_items;
@@ -321,6 +339,7 @@ mod tests {
             Some(state),
             Some(history),
             NotifyBuffer::new(),
+            Arc::new(Mutex::new(Vec::new())),
             PromptCatalog::builtins_only().unwrap(),
         );
         let mut ctx = ctx_items;
@@ -346,6 +365,7 @@ mod tests {
             Some(state),
             Some(history),
             NotifyBuffer::new(),
+            Arc::new(Mutex::new(Vec::new())),
             PromptCatalog::builtins_only().unwrap(),
         );
         let mut ctx = ctx_items;
@@ -365,6 +385,7 @@ mod tests {
             None,
             None,
             NotifyBuffer::new(),
+            Arc::new(Mutex::new(Vec::new())),
             PromptCatalog::builtins_only().unwrap(),
         );
         let mut ctx: Vec<Item> = Vec::new();
@@ -396,6 +417,7 @@ mod tests {
             None,
             None,
             buffer.clone(),
+            Arc::new(Mutex::new(Vec::new())),
             PromptCatalog::builtins_only().unwrap(),
         );
         let mut ctx: Vec<Item> = vec![Item::user_message("hi")];
@@ -431,6 +453,7 @@ mod tests {
             Some(state),
             Some(history),
             buffer.clone(),
+            Arc::new(Mutex::new(Vec::new())),
             PromptCatalog::builtins_only().unwrap(),
         );
         let mut ctx = ctx_items;
@@ -456,6 +479,7 @@ mod tests {
             None,
             None,
             NotifyBuffer::new(),
+            Arc::new(Mutex::new(Vec::new())),
             PromptCatalog::builtins_only().unwrap(),
         );
         let mut ctx: Vec<Item> = Vec::new();

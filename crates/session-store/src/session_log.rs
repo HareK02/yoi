@@ -713,7 +713,7 @@ mod tests {
                 assert_eq!(content.len(), 1);
                 match &content[0] {
                     llm_worker::ContentPart::Text { text } => {
-                        assert_eq!(text, "see line1\nline2[unresolved file ref: src/main.rs]");
+                        assert_eq!(text, "see line1\nline2@src/main.rs");
                     }
                     other => panic!("unexpected content: {other:?}"),
                 }

@@ -15,6 +15,7 @@
   - [ ] ユーザーマニフェストのモデル設定 wizard → [tickets/tui-user-model-setup.md](tickets/tui-user-model-setup.md)
 - [ ] サブミット入力
   - [ ] TUI 補完 + 型付き atom 化 → [tickets/submit-tui-completion.md](tickets/submit-tui-completion.md)
+  - [ ] FileRef リゾルバ → [tickets/submit-file-ref-resolver.md](tickets/submit-file-ref-resolver.md)
 - [ ] メモリ機構
   - [ ] Phase 2 consolidation → [tickets/memory-phase2-consolidation.md](tickets/memory-phase2-consolidation.md)
   - [ ] 使用頻度メトリクス + Knowledge 化候補レポート → [tickets/memory-usage-metrics.md](tickets/memory-usage-metrics.md)

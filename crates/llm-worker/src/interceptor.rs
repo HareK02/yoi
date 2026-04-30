@@ -17,12 +17,18 @@ use crate::tool::{Tool, ToolCall, ToolMeta, ToolResult};
 // =============================================================================
 
 /// Action after prompt submission.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum PromptAction {
     /// Proceed normally.
     Continue,
     /// Cancel with a reason.
     Cancel(String),
+    /// Proceed, and append these items to history right after the user
+    /// message. Mirrors [`TurnEndAction::ContinueWithMessages`] for the
+    /// submit edge: lets the upper layer attach resolver-produced
+    /// system messages (e.g. `@<path>` file content) so they sit
+    /// adjacent to the user message that referenced them.
+    ContinueWith(Vec<Item>),
 }
 
 /// Action before an LLM request.

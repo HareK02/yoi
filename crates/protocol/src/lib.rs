@@ -150,9 +150,13 @@ impl Segment {
     /// to surface user-visible alerts for unresolved refs should do so
     /// alongside this call (Pod does so at submit time).
     ///
-    /// Unresolved variants (`FileRef` / `KnowledgeRef` / `WorkflowInvoke`)
-    /// and `Unknown` map to `[unresolved <kind>: <key>]` placeholders so
-    /// the LLM sees an explicit token rather than silent omission.
+    /// Sigil-prefixed variants (`FileRef` / `KnowledgeRef` / `WorkflowInvoke`)
+    /// flatten back to their literal sigil form (`@<path>`, `#<slug>`,
+    /// `/<slug>`) — matching what the user originally typed. Resolved
+    /// content (e.g. file body for `FileRef`) is delivered as separate
+    /// `Item::system_message`s adjacent to the user message; the
+    /// resolution itself is the caller's job. `Unknown` falls back to
+    /// a bracketed placeholder since there is no sigil to render.
     pub fn flatten_to_text(segments: &[Segment]) -> String {
         let mut out = String::new();
         for seg in segments {
@@ -160,13 +164,16 @@ impl Segment {
                 Segment::Text { content } => out.push_str(content),
                 Segment::Paste { content, .. } => out.push_str(content),
                 Segment::FileRef { path } => {
-                    out.push_str(&format!("[unresolved file ref: {path}]"));
+                    out.push('@');
+                    out.push_str(path);
                 }
                 Segment::KnowledgeRef { slug } => {
-                    out.push_str(&format!("[unresolved knowledge ref: {slug}]"));
+                    out.push('#');
+                    out.push_str(slug);
                 }
                 Segment::WorkflowInvoke { slug } => {
-                    out.push_str(&format!("[unresolved workflow invoke: {slug}]"));
+                    out.push('/');
+                    out.push_str(slug);
                 }
                 Segment::Unknown => {
                     out.push_str("[unknown input segment]");

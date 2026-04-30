@@ -1338,16 +1338,20 @@ impl<C: LlmClient> Worker<C, Locked> {
         self.reset_interruption_state();
         // Interceptor: on_prompt_submit
         let mut user_item = Item::user_message(user_input);
-        match self.interceptor.on_prompt_submit(&mut user_item).await {
+        let extras = match self.interceptor.on_prompt_submit(&mut user_item).await {
             PromptAction::Cancel(reason) => {
                 self.last_run_interrupted = true;
                 return self
                     .finalize_interruption(Err(WorkerError::Aborted(reason)))
                     .await;
             }
-            PromptAction::Continue => {}
-        }
+            PromptAction::Continue => Vec::new(),
+            PromptAction::ContinueWith(items) => items,
+        };
         self.history.push(user_item);
+        if !extras.is_empty() {
+            self.history.extend(extras);
+        }
         let result = self.run_turn_loop().await;
         self.finalize_interruption(result).await
     }

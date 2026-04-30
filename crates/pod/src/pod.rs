@@ -99,6 +99,12 @@ pub struct Pod<C: LlmClient, St: Store> {
     /// injection into the next LLM request. Shared with the
     /// PodInterceptor installed in `ensure_interceptor_installed`.
     pending_notifies: NotifyBuffer,
+    /// Submit-scoped stash for resolver-produced system messages
+    /// (currently `@<path>` file content). `Pod::run` fills this
+    /// before handing off to the worker; `PodInterceptor::on_prompt_submit`
+    /// drains it and returns `ContinueWith` so the items land in
+    /// history right after the user message that referenced them.
+    pending_attachments: Arc<Mutex<Vec<Item>>>,
     /// Scope allocation in the machine-wide lock file. `Some` for
     /// Pods built via `from_manifest` / `from_manifest_spawned` /
     /// `restore_from_manifest` (production paths); `None` for the
@@ -185,6 +191,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             alerter: None,
             event_tx: None,
             pending_notifies: NotifyBuffer::new(),
+            pending_attachments: Arc::new(Mutex::new(Vec::new())),
             scope_allocation: None,
             callback_socket: None,
             prompts,
@@ -502,6 +509,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 compact_state,
                 usage_history_handle,
                 self.pending_notifies.clone(),
+                self.pending_attachments.clone(),
                 self.prompts.clone(),
             );
             self.worker_mut().set_interceptor(interceptor);
@@ -614,6 +622,18 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         .await?;
         self.user_segments.push(input.clone());
 
+        // Resolve `@<path>` refs to system messages stashed for the
+        // PodInterceptor to attach right after the user message. Failures
+        // surface as user-facing Alerts and the placeholder remains in
+        // the flattened text so the LLM sees the unresolved intent.
+        let attachments = self.resolve_file_refs(&input);
+        if !attachments.is_empty() {
+            *self
+                .pending_attachments
+                .lock()
+                .expect("pending_attachments poisoned") = attachments;
+        }
+
         let flattened = self.flatten_segments(&input);
 
         let history_before = self.worker.as_ref().unwrap().history().len();
@@ -627,26 +647,46 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         self.handle_worker_result(result, history_before).await
     }
 
+    /// Resolve every `Segment::FileRef` in `segments` to a `[File: <path>]`
+    /// system message via `PodFsView`. Resolution failures (out-of-scope,
+    /// not-found, binary, I/O) surface as `AlertLevel::Warn` Alerts and
+    /// are skipped — the unresolved placeholder stays in the flattened
+    /// user message so the LLM still sees the intent.
+    fn resolve_file_refs(&self, segments: &[Segment]) -> Vec<Item> {
+        let view = crate::fs_view::PodFsView::new(tools::ScopedFs::new(
+            self.scope.clone(),
+            self.pwd.clone(),
+        ));
+        let mut out = Vec::new();
+        for seg in segments {
+            let Segment::FileRef { path } = seg else {
+                continue;
+            };
+            match view.resolve_file_ref(path, manifest::defaults::TOOL_OUTPUT_MAX_BYTES) {
+                Ok(item) => out.push(item),
+                Err(e) => {
+                    self.alert(
+                        AlertLevel::Warn,
+                        AlertSource::Pod,
+                        format!("file ref @{path} could not be resolved: {e}"),
+                    );
+                }
+            }
+        }
+        out
+    }
+
     /// Flatten a typed segment list into the single string the Worker
     /// receives as the user message, and emit user-facing alerts for
-    /// segments that fall through to placeholder (file/knowledge/workflow
+    /// segments that fall through to placeholder (knowledge / workflow
     /// refs without a resolver, or unknown variants from a newer client).
-    /// The text reconstruction itself comes from `Segment::flatten_to_text`,
+    /// `FileRef` is handled separately by `resolve_file_refs`. The text
+    /// reconstruction itself comes from `Segment::flatten_to_text`,
     /// shared with replay paths that should not re-alert.
     fn flatten_segments(&self, segments: &[Segment]) -> String {
         for seg in segments {
             match seg {
-                Segment::Text { .. } | Segment::Paste { .. } => {}
-                Segment::FileRef { path } => {
-                    self.alert(
-                        AlertLevel::Warn,
-                        AlertSource::Pod,
-                        format!(
-                            "file ref @{path} cannot be resolved \
-                             (resolver not yet implemented); passed to LLM as placeholder"
-                        ),
-                    );
-                }
+                Segment::Text { .. } | Segment::Paste { .. } | Segment::FileRef { .. } => {}
                 Segment::KnowledgeRef { slug } => {
                     self.alert(
                         AlertLevel::Warn,
@@ -1550,6 +1590,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             alerter: None,
             event_tx: None,
             pending_notifies: NotifyBuffer::new(),
+            pending_attachments: Arc::new(Mutex::new(Vec::new())),
             scope_allocation: Some(scope_allocation),
             callback_socket: None,
             prompts: common.prompts,
@@ -1606,6 +1647,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             alerter: None,
             event_tx: None,
             pending_notifies: NotifyBuffer::new(),
+            pending_attachments: Arc::new(Mutex::new(Vec::new())),
             scope_allocation: Some(scope_allocation),
             callback_socket: Some(callback_socket),
             prompts: common.prompts,
@@ -1714,6 +1756,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             alerter: None,
             event_tx: None,
             pending_notifies: NotifyBuffer::new(),
+            pending_attachments: Arc::new(Mutex::new(Vec::new())),
             scope_allocation: Some(scope_allocation),
             callback_socket: None,
             prompts: common.prompts,

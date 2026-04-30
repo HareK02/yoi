@@ -123,6 +123,10 @@ permission = "write"
 "#;
 
 async fn make_pod(client: MockClient) -> Pod<MockClient, FsStore> {
+    make_pod_with_pwd(client).await.0
+}
+
+async fn make_pod_with_pwd(client: MockClient) -> (Pod<MockClient, FsStore>, std::path::PathBuf) {
     let manifest = PodManifest::from_toml(MANIFEST_TOML).unwrap();
     let store_tmp = tempfile::tempdir().unwrap();
     let store = FsStore::new(store_tmp.path()).await.unwrap();
@@ -137,7 +141,10 @@ async fn make_pod(client: MockClient) -> Pod<MockClient, FsStore> {
     std::mem::forget(pwd_tmp);
 
     let worker = Worker::new(client);
-    Pod::new(manifest, worker, store, pwd, scope).await.unwrap()
+    let pod = Pod::new(manifest, worker, store, pwd.clone(), scope)
+        .await
+        .unwrap();
+    (pod, pwd)
 }
 
 use pod::PodHandle;
@@ -406,6 +413,58 @@ async fn run_with_paste_segment_inlines_content_and_emits_typed_user_message() {
 }
 
 #[tokio::test]
+async fn run_with_resolvable_file_ref_attaches_system_message_after_user() {
+    let client = MockClient::new(simple_text_events());
+    let client_for_assert = client.clone();
+    let (pod, pwd) = make_pod_with_pwd(client).await;
+    std::fs::write(pwd.join("notes.md"), "alpha\nbeta\n").unwrap();
+    let handle = spawn_controller(pod).await;
+
+    let segments = vec![
+        protocol::Segment::text("see "),
+        protocol::Segment::FileRef {
+            path: "notes.md".into(),
+        },
+    ];
+    handle.send(Method::Run { input: segments }).await.unwrap();
+
+    // Wait for the turn to complete.
+    let mut rx = handle.subscribe();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        tokio::select! {
+            event = rx.recv() => match event {
+                Ok(Event::TurnEnd { .. }) => break,
+                Err(_) => break,
+                _ => {}
+            },
+            _ = tokio::time::sleep_until(deadline) => break,
+        }
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let requests = client_for_assert.captured_requests();
+    let items = &requests[0].items;
+    // The submit produces 2 history items: user message then file content.
+    let user_idx = items
+        .iter()
+        .position(|i| i.is_user_message())
+        .expect("user message present");
+    let next = items
+        .get(user_idx + 1)
+        .expect("attachment item present after user");
+    let next_text = next.as_text().unwrap_or_default();
+    assert!(
+        next_text.contains("[File: notes.md]"),
+        "expected file header, got: {next_text:?}"
+    );
+    assert!(
+        next_text.contains("alpha"),
+        "expected file body, got: {next_text:?}"
+    );
+}
+
+#[tokio::test]
 async fn run_with_unresolved_segment_emits_alert_and_placeholder() {
     let client = MockClient::new(simple_text_events());
     let client_for_assert = client.clone();
@@ -448,11 +507,12 @@ async fn run_with_unresolved_segment_emits_alert_and_placeholder() {
         .iter()
         .find_map(|i| i.as_text().map(|s| s.to_string()))
         .unwrap_or_default();
-    // LLM context carries a placeholder so the model can ask for the
-    // missing content rather than silently miss the user's intent.
+    // The user message keeps the literal `@<path>` token (matching what
+    // the user typed). Resolution failure surfaces via the Alert above;
+    // the LLM still sees the intent as a sigil-prefixed reference.
     assert!(
-        user_text.contains("[unresolved file ref: src/lib.rs]"),
-        "placeholder missing, got: {user_text:?}"
+        user_text.contains("@src/lib.rs"),
+        "literal sigil missing, got: {user_text:?}"
     );
 }
 
