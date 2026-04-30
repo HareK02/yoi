@@ -392,14 +392,33 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Option<Method> {
     }
 
     // Completion popup overrides — only when there's something to
-    // confirm / navigate. An empty popup (request in flight) falls
+    // navigate / commit. An empty popup (request in flight) falls
     // through to the default behaviour.
     if app.completion.as_ref().is_some_and(|c| c.is_active()) {
         match key.code {
-            KeyCode::Tab | KeyCode::Enter if !alt => {
-                if app.confirm_completion() {
+            KeyCode::Tab if !alt => {
+                // Insert the selected entry as raw text and let the
+                // re-triggered popup fetch fresh candidates (drill-in
+                // for directories, narrow-to-exact for files).
+                return app.apply_completion_text();
+            }
+            KeyCode::Enter if !alt => {
+                // While the popup has selectable entries, Enter
+                // commits the selection rather than submitting the
+                // message. The selected entry wins regardless of how
+                // much of its value the user has typed — Enter on a
+                // popup entry is "accept this suggestion". Directory
+                // entries are the exception: they fall through to
+                // text insertion so the popup re-fetches children
+                // for drill-in. After a successful chip we append a
+                // trailing space so the user can keep writing without
+                // a manual separator (the Space path already has the
+                // space the user typed, so it's not needed there).
+                if app.chipify_selected_completion_if_committable() {
+                    app.insert_char(' ');
                     return None;
                 }
+                return app.apply_completion_text();
             }
             KeyCode::Up => {
                 app.move_completion_up();
@@ -484,6 +503,15 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Option<Method> {
             app.refresh_completion()
         }
         KeyCode::Char(c) => {
+            // Whitespace ends an in-flight completion token. Try the
+            // auto-confirm path first so an exact match (e.g. typed
+            // `@src/main.rs` matches the only popup entry) becomes a
+            // chip on the way out. Directories also commit here —
+            // ending with a space is an explicit "I want this dir"
+            // signal, not a drill-in.
+            if c.is_whitespace() {
+                app.chipify_completion_if_exact_match();
+            }
             app.insert_char(c);
             app.refresh_completion()
         }

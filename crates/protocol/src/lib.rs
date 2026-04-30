@@ -657,7 +657,8 @@ mod tests {
         assert_eq!(parsed["data"]["entries"][0]["value"], "clear");
 
         // is_dir defaults to false on inbound payloads that omit it.
-        let inbound = r#"{"event":"completions","data":{"kind":"file","entries":[{"value":"main.rs"}]}}"#;
+        let inbound =
+            r#"{"event":"completions","data":{"kind":"file","entries":[{"value":"main.rs"}]}}"#;
         let decoded: Event = serde_json::from_str(inbound).unwrap();
         match decoded {
             Event::Completions { kind, entries } => {

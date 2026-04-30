@@ -157,24 +157,119 @@ impl App {
         self.completion = None;
     }
 
-    /// Confirm the currently selected completion entry by replacing the
-    /// in-flight token with a chip atom. Returns `true` when something
-    /// was confirmed; `false` when there was no active candidate (so
-    /// the caller can fall through to the default key behaviour).
-    pub fn confirm_completion(&mut self) -> bool {
+    /// Tab path: insert the popup-selected entry's value (with a
+    /// trailing `/` when it's a directory) as raw text replacing the
+    /// in-flight `@<typed>` portion. The popup state is preserved so
+    /// the re-evaluated trigger can fetch fresh candidates for the new
+    /// prefix (drill-in for directories, narrow-to-one for files).
+    /// Returns the follow-up `Method::ListCompletions` to send when
+    /// the new prefix differs from the old one.
+    pub fn apply_completion_text(&mut self) -> Option<Method> {
+        let state = self.completion.as_ref()?;
+        if state.entries.is_empty() {
+            return None;
+        }
+        let entry = &state.entries[state.selected];
+        let text = if entry.is_dir {
+            format!("{}/", entry.value)
+        } else {
+            entry.value.clone()
+        };
+        // `prefix_start` indexes the sigil atom; the text we want to
+        // replace lives just after it (sigil itself stays).
+        let typed_start = state.prefix_start + 1;
+        self.input.replace_with_text_at(typed_start, &text);
+        self.refresh_completion()
+    }
+
+    /// Space path: replace the `@<typed>` range with a chip atom and
+    /// clear the popup if `prefix` (= the text the user has typed
+    /// after the sigil) resolves to a confirmable target. Three
+    /// matching modes:
+    ///
+    /// 1. **Direct value match**: some entry's `value` equals `prefix`
+    ///    (covers files and slash-less directory form).
+    /// 2. **Slashed directory match**: some directory entry's
+    ///    `value + "/"` equals `prefix` (the form Tab inserts).
+    /// 3. **Drilled-into-directory match**: `prefix` ends with `/`
+    ///    and at least one entry lives under it.
+    ///
+    /// Directory chips always carry a trailing `/` so the rendered
+    /// label reads `@crates/`.
+    ///
+    /// `selected` is intentionally ignored — terminating with a
+    /// space is a typed-based "I'm done with this token" signal,
+    /// so a race-y top entry shouldn't block confirmation when the
+    /// typed text matches another entry.
+    pub fn chipify_completion_if_exact_match(&mut self) -> bool {
+        let Some(state) = self.completion.as_ref() else {
+            return false;
+        };
+        let direct = state
+            .entries
+            .iter()
+            .find(|e| {
+                state.prefix == e.value || (e.is_dir && state.prefix == format!("{}/", e.value))
+            })
+            .map(|e| {
+                if e.is_dir {
+                    format!("{}/", e.value)
+                } else {
+                    e.value.clone()
+                }
+            });
+        let drilled = (direct.is_none() && state.prefix.ends_with('/'))
+            .then(|| {
+                state
+                    .entries
+                    .iter()
+                    .any(|e| e.value.starts_with(&state.prefix))
+                    .then(|| state.prefix.clone())
+            })
+            .flatten();
+        let Some(value) = direct.or(drilled) else {
+            return false;
+        };
+        let kind = state.kind;
+        let start = state.prefix_start;
+        match kind {
+            CompletionKind::File => self.input.replace_with_file_ref(start, value),
+            CompletionKind::Knowledge => self.input.replace_with_knowledge_ref(start, value),
+            CompletionKind::Workflow => self.input.replace_with_workflow_invoke(start, value),
+        }
+        self.completion = None;
+        true
+    }
+
+    /// Enter path: commit the currently *selected* popup entry,
+    /// regardless of how much of its value the user has typed. This
+    /// is the popup-UI sense of "Enter accepts the highlighted
+    /// suggestion" — partial typing like `@README.` followed by
+    /// Enter should chip when the popup is on `README.md`.
+    ///
+    /// Files (and Knowledge / Workflow entries, which have no dir
+    /// concept) chipify here. Directory file entries return `false`
+    /// so the caller can fall through to `apply_completion_text`
+    /// for drill-in — chip-ifying a directory on Enter would strand
+    /// the user with no way to inspect children.
+    pub fn chipify_selected_completion_if_committable(&mut self) -> bool {
         let Some(state) = self.completion.as_ref() else {
             return false;
         };
         if state.entries.is_empty() {
             return false;
         }
-        let entry = state.entries[state.selected].clone();
+        let entry = &state.entries[state.selected];
+        if state.kind == CompletionKind::File && entry.is_dir {
+            return false;
+        }
         let kind = state.kind;
         let start = state.prefix_start;
+        let value = entry.value.clone();
         match kind {
-            CompletionKind::File => self.input.replace_with_file_ref(start, entry.value),
-            CompletionKind::Knowledge => self.input.replace_with_knowledge_ref(start, entry.value),
-            CompletionKind::Workflow => self.input.replace_with_workflow_invoke(start, entry.value),
+            CompletionKind::File => self.input.replace_with_file_ref(start, value),
+            CompletionKind::Knowledge => self.input.replace_with_knowledge_ref(start, value),
+            CompletionKind::Workflow => self.input.replace_with_workflow_invoke(start, value),
         }
         self.completion = None;
         true
@@ -808,18 +903,58 @@ mod completion_flow_tests {
     }
 
     #[test]
-    fn confirm_replaces_token_with_chip_and_clears_popup() {
+    fn tab_inserts_entry_value_as_text_for_file() {
         let mut app = App::new("test".into());
         for c in "@s".chars() {
             app.insert_char(c);
         }
         let _ = app.refresh_completion();
-        // Pretend the Pod replied with a single candidate.
         app.completion.as_mut().unwrap().entries = vec![CompletionEntry {
             value: "src/main.rs".into(),
             is_dir: false,
         }];
-        assert!(app.confirm_completion());
+        // Tab path: text inserted, popup re-triggered with new prefix
+        // (still File kind since the typed range stays after `@`).
+        let _ = app.apply_completion_text();
+        // The input now reads `@src/main.rs` as plain Char atoms; no
+        // chip yet.
+        let segs = app.input.submit_segments();
+        assert_eq!(segs.len(), 1);
+        assert!(matches!(&segs[0], Segment::Text { content } if content == "@src/main.rs"));
+        assert!(app.completion.is_some());
+    }
+
+    #[test]
+    fn tab_appends_trailing_slash_for_directory() {
+        let mut app = App::new("test".into());
+        for c in "@cr".chars() {
+            app.insert_char(c);
+        }
+        let _ = app.refresh_completion();
+        app.completion.as_mut().unwrap().entries = vec![CompletionEntry {
+            value: "crates".into(),
+            is_dir: true,
+        }];
+        let _ = app.apply_completion_text();
+        // Typed prefix advances to `crates/` so the next query can
+        // descend into the directory.
+        assert_eq!(app.completion.as_ref().unwrap().prefix, "crates/");
+        let segs = app.input.submit_segments();
+        assert!(matches!(&segs[0], Segment::Text { content } if content == "@crates/"));
+    }
+
+    #[test]
+    fn space_chipifies_on_exact_match() {
+        let mut app = App::new("test".into());
+        for c in "@src/main.rs".chars() {
+            app.insert_char(c);
+        }
+        let _ = app.refresh_completion();
+        app.completion.as_mut().unwrap().entries = vec![CompletionEntry {
+            value: "src/main.rs".into(),
+            is_dir: false,
+        }];
+        assert!(app.chipify_completion_if_exact_match());
         assert!(app.completion.is_none());
         let segs = app.input.submit_segments();
         assert_eq!(segs.len(), 1);
@@ -827,14 +962,197 @@ mod completion_flow_tests {
     }
 
     #[test]
-    fn confirm_with_no_entries_is_a_noop() {
+    fn space_does_not_chipify_on_partial_match() {
+        let mut app = App::new("test".into());
+        for c in "@s".chars() {
+            app.insert_char(c);
+        }
+        let _ = app.refresh_completion();
+        app.completion.as_mut().unwrap().entries = vec![CompletionEntry {
+            value: "src/main.rs".into(),
+            is_dir: false,
+        }];
+        // typed = "s", expected = "src/main.rs" → no match, no chip.
+        assert!(!app.chipify_completion_if_exact_match());
+        let segs = app.input.submit_segments();
+        assert_eq!(segs.len(), 1);
+        assert!(matches!(&segs[0], Segment::Text { content } if content == "@s"));
+    }
+
+    #[test]
+    fn space_chipifies_directory_with_or_without_trailing_slash() {
+        // Slash-less typed form chipifies the directory; the chip's
+        // path keeps a trailing slash so the rendered label is `@crates/`.
+        let mut app = App::new("test".into());
+        for c in "@crates".chars() {
+            app.insert_char(c);
+        }
+        let _ = app.refresh_completion();
+        app.completion.as_mut().unwrap().entries = vec![CompletionEntry {
+            value: "crates".into(),
+            is_dir: true,
+        }];
+        assert!(app.chipify_completion_if_exact_match());
+        let segs = app.input.submit_segments();
+        assert!(matches!(&segs[0], Segment::FileRef { path } if path == "crates/"));
+
+        // Slashed typed form (the shape Tab inserts) — same chip.
+        let mut app = App::new("test".into());
+        for c in "@crates/".chars() {
+            app.insert_char(c);
+        }
+        let _ = app.refresh_completion();
+        app.completion.as_mut().unwrap().entries = vec![CompletionEntry {
+            value: "crates".into(),
+            is_dir: true,
+        }];
+        assert!(app.chipify_completion_if_exact_match());
+        let segs = app.input.submit_segments();
+        assert!(matches!(&segs[0], Segment::FileRef { path } if path == "crates/"));
+    }
+
+    #[test]
+    fn space_chipifies_directory_when_popup_shows_its_children() {
+        // `@crates/` is the form Tab leaves you in after picking a
+        // directory; the popup is showing the children of `crates/`.
+        // Hitting space at this point should chipify `crates`, not
+        // require the user to back up and remove the trailing slash.
+        let mut app = App::new("test".into());
+        for c in "@crates/".chars() {
+            app.insert_char(c);
+        }
+        let _ = app.refresh_completion();
+        app.completion.as_mut().unwrap().entries = vec![
+            CompletionEntry {
+                value: "crates/daemon".into(),
+                is_dir: true,
+            },
+            CompletionEntry {
+                value: "crates/llm-worker".into(),
+                is_dir: true,
+            },
+        ];
+        assert!(app.chipify_completion_if_exact_match());
+        let segs = app.input.submit_segments();
+        assert!(matches!(&segs[0], Segment::FileRef { path } if path == "crates/"));
+    }
+
+    #[test]
+    fn enter_does_not_chipify_directory_so_drill_in_works() {
+        // Enter on a selected directory entry must NOT chipify —
+        // otherwise the user can never drill into the dir to see
+        // its children.
+        let mut app = App::new("test".into());
+        for c in "@crates".chars() {
+            app.insert_char(c);
+        }
+        let _ = app.refresh_completion();
+        app.completion.as_mut().unwrap().entries = vec![CompletionEntry {
+            value: "crates".into(),
+            is_dir: true,
+        }];
+        assert!(!app.chipify_selected_completion_if_committable());
+        // Popup is still active so the caller can fall through to
+        // apply_completion_text.
+        assert!(app.completion.is_some());
+    }
+
+    #[test]
+    fn enter_path_appends_trailing_space_after_file_chip() {
+        // Mirrors the main.rs Enter handler sequence: chipify the
+        // selected entry, then insert a space so the cursor is ready
+        // for the next token without a manual separator.
+        let mut app = App::new("test".into());
+        for c in "@README.".chars() {
+            app.insert_char(c);
+        }
+        let _ = app.refresh_completion();
+        app.completion.as_mut().unwrap().entries = vec![CompletionEntry {
+            value: "README.md".into(),
+            is_dir: false,
+        }];
+        assert!(app.chipify_selected_completion_if_committable());
+        app.insert_char(' ');
+        let segs = app.input.submit_segments();
+        assert_eq!(segs.len(), 2);
+        assert!(matches!(&segs[0], Segment::FileRef { path } if path == "README.md"));
+        assert!(matches!(&segs[1], Segment::Text { content } if content == " "));
+    }
+
+    #[test]
+    fn enter_chipifies_selected_file_even_when_typed_is_partial() {
+        // Enter respects the selected entry: typed text may be a
+        // prefix of the entry's value, but the popup-highlighted
+        // file should still chipify on Enter.
+        let mut app = App::new("test".into());
+        for c in "@README.".chars() {
+            app.insert_char(c);
+        }
+        let _ = app.refresh_completion();
+        app.completion.as_mut().unwrap().entries = vec![CompletionEntry {
+            value: "README.md".into(),
+            is_dir: false,
+        }];
+        assert!(app.chipify_selected_completion_if_committable());
+        assert!(app.completion.is_none());
+        let segs = app.input.submit_segments();
+        assert!(matches!(&segs[0], Segment::FileRef { path } if path == "README.md"));
+    }
+
+    #[test]
+    fn space_does_not_chipify_drilled_state_with_unrelated_entries() {
+        // Stale entries that don't live under the typed prefix should
+        // not satisfy the drilled-into-directory rule.
+        let mut app = App::new("test".into());
+        for c in "@xyz/".chars() {
+            app.insert_char(c);
+        }
+        let _ = app.refresh_completion();
+        app.completion.as_mut().unwrap().entries = vec![CompletionEntry {
+            value: "crates/daemon".into(),
+            is_dir: true,
+        }];
+        assert!(!app.chipify_completion_if_exact_match());
+        let segs = app.input.submit_segments();
+        assert!(matches!(&segs[0], Segment::Text { content } if content == "@xyz/"));
+    }
+
+    #[test]
+    fn chipify_finds_match_outside_selected_index() {
+        // Regression guard for the race where a stale reply leaves a
+        // non-matching entry at index 0 but an entry deeper in the
+        // list does match the current typed text.
+        let mut app = App::new("test".into());
+        for c in "@src/main.rs".chars() {
+            app.insert_char(c);
+        }
+        let _ = app.refresh_completion();
+        app.completion.as_mut().unwrap().entries = vec![
+            CompletionEntry {
+                value: "src/main.rs.bak".into(),
+                is_dir: false,
+            },
+            CompletionEntry {
+                value: "src/main.rs".into(),
+                is_dir: false,
+            },
+        ];
+        // selected stays at 0 (the non-matching one) but find() should
+        // still locate the match.
+        assert!(app.chipify_completion_if_exact_match());
+        let segs = app.input.submit_segments();
+        assert!(matches!(&segs[0], Segment::FileRef { path } if path == "src/main.rs"));
+    }
+
+    #[test]
+    fn apply_completion_text_with_no_entries_is_a_noop() {
         let mut app = App::new("test".into());
         for c in "@x".chars() {
             app.insert_char(c);
         }
         let _ = app.refresh_completion();
         // No `Event::Completions` arrived yet — entries is still empty.
-        assert!(!app.confirm_completion());
+        assert!(app.apply_completion_text().is_none());
         assert!(app.completion.is_some());
     }
 

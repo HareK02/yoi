@@ -116,10 +116,9 @@ enum WordKind {
 fn atom_class(atom: &Atom) -> AtomClass {
     match atom {
         Atom::Char(c) => char_class(*c),
-        Atom::Paste(_)
-        | Atom::FileRef(_)
-        | Atom::KnowledgeRef(_)
-        | Atom::WorkflowInvoke(_) => AtomClass::Chip,
+        Atom::Paste(_) | Atom::FileRef(_) | Atom::KnowledgeRef(_) | Atom::WorkflowInvoke(_) => {
+            AtomClass::Chip
+        }
     }
 }
 
@@ -213,11 +212,24 @@ impl InputBuffer {
 
     pub fn replace_with_workflow_invoke(&mut self, start: usize, slug: String) {
         self.atoms.drain(start..self.cursor);
-        self.atoms.insert(
-            start,
-            Atom::WorkflowInvoke(WorkflowInvokeAtom { slug }),
-        );
+        self.atoms
+            .insert(start, Atom::WorkflowInvoke(WorkflowInvokeAtom { slug }));
         self.cursor = start + 1;
+    }
+
+    /// Replace `atoms[start..self.cursor]` with the chars of `text`,
+    /// leaving cursor at the end of the inserted run. Used by the Tab
+    /// completion path: the popup-selected entry is inserted as raw
+    /// text (not a chip) so the user can keep typing — e.g. drill into
+    /// a directory whose value ends with `/`.
+    pub fn replace_with_text_at(&mut self, start: usize, text: &str) {
+        self.atoms.drain(start..self.cursor);
+        let mut idx = start;
+        for c in text.chars() {
+            self.atoms.insert(idx, Atom::Char(c));
+            idx += 1;
+        }
+        self.cursor = idx;
     }
 
     /// If the cursor is currently inside a `@<typed>` / `#<typed>` /
