@@ -11,9 +11,40 @@ members = [
     "crates/provider",
     "crates/pod-registry",
     "crates/tools",
-    "crates/tui", "crates/memory",
+    "crates/tui",
+    "crates/memory",
 ]
 
 [workspace.package]
 edition = "2024"
 license = "MIT"
+
+[workspace.dependencies]
+# Internal crates
+llm-worker = { path = "crates/llm-worker", version = "0.2" }
+llm-worker-macros = { path = "crates/llm-worker-macros", version = "0.2" }
+manifest = { path = "crates/manifest" }
+memory = { path = "crates/memory" }
+pod-registry = { path = "crates/pod-registry" }
+protocol = { path = "crates/protocol" }
+provider = { path = "crates/provider" }
+session-store = { path = "crates/session-store" }
+tools = { path = "crates/tools" }
+
+# External
+# Note: `reqwest` and `chrono` are not aggregated here because some crates
+# need `default-features = false`, which workspace inheritance cannot override.
+async-trait = "0.1"
+fs4 = "0.13"
+futures = "0.3"
+libc = "0.2"
+schemars = "1.2"
+serde = "1.0"
+serde_json = "1.0"
+sha2 = "0.11"
+tempfile = "3.27"
+thiserror = "2.0"
+tokio = "1.52"
+toml = "1.1"
+tracing = "0.1"
+uuid = "1.23"
