@@ -2,7 +2,7 @@
 
 ## 背景
 
-`docs/plan/memory.md` §使用頻度メトリクス の実装。memory 検索ツール / Knowledge 検索ツール内に invoke 計測フックを入れ、時間単位ではなく累積 input token で正規化した頻度を算出する。Phase 2 の Knowledge 新規作成 gate と GC の保護閾値の両方で使われる。
+`docs/plan/memory.md` §使用頻度メトリクス の実装。memory 検索ツール / Knowledge 検索ツール内に invoke 計測フックを入れ、時間単位ではなく累積 input token で正規化した頻度を算出する。Phase 2 統合 phase の Knowledge 新規作成 gate と Phase 2 整理 phase の保護閾値の両方で使われる。
 
 ## 要件
 
@@ -36,12 +36,12 @@
 
 ### 消費者
 
-- Phase 2 Worker の入力として候補レポートを渡す
-- GC Agent の保護閾値判定（明示 invoke frequency >= 1.0 invokes/Mtoken）
+- Phase 2 Worker の統合 phase 入力として候補レポートを渡す
+- Phase 2 Worker の整理 phase で保護閾値判定（明示 invoke frequency >= 1.0 invokes/Mtoken）に使う
 
 ## 範囲外
 
-- GC の実装本体（別チケット。本チケットは保護閾値判定に必要なメトリクスの提供まで）
+- Phase 2 整理 phase の実装本体（`memory-phase2-consolidation` 側。本チケットは保護閾値判定に必要なメトリクスの提供まで）
 - `model_invokation` ON/OFF の自動判定ロジック（将来検討）
 - Shallow request の自動除外（将来検討）
 
@@ -57,4 +57,4 @@
 
 - `docs/plan/memory.md` §使用頻度メトリクス / §判断ルール / §retrieval 経路
 - `tickets/memory-search-tools.md`（hook 挿入点）
-- `tickets/memory-phase2-consolidation.md`（消費者）
+- `tickets/memory-phase2-consolidation.md`（統合 / 整理 両 phase の消費者）

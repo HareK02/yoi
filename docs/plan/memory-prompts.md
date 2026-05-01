@@ -29,17 +29,30 @@ Phase 1 は「派生物を作る」段階ではなく、「起きたことを抽
 - 出力は schema 準拠の構造化データのみ。自由文の補足説明で schema 外情報を足さない
 - 対象が無ければ空配列を返す
 
-### Phase 2: 統合 prompt
+### Phase 2: 統合 + 整理 prompt
 
-Phase 2 は既存 `memory/*`、`knowledge/*`、staging を見て、追加・更新・統合を agentic に判断する:
+Phase 2 は既存 `memory/*`、`knowledge/*`、staging を見て、統合 phase と整理 phase を 1 セッション内で続けて回す。両 phase に共通する原則:
 
-- 入力には staging の活動ログ、既存 `memory/*`（summary / decisions / requests）の全文、Knowledge 化候補レポートを含める
+- 入力には staging の活動ログ、既存 `memory/*`（summary / decisions / requests）の全文、Knowledge 化候補レポート、整理材料（使用頻度メトリクス、Linter Warn、`replaced` chain、sources 過多情報）を含める
 - 既存 `knowledge/*` は prompt に埋めず、Knowledge 検索ツール経由で agent が必要分を引く。まず候補レポートの source や staging の話題に近い slug を検索し、ヒットした slug / description / kind / `model_invokation` を見て適合先を探す
 - 新規作成より update を優先し、既存 slug に自然に統合できる場合は新規 file を増やさない
 - Decisions / Requests は staging の `source` をそのまま使い、LLM が `sources` を組み立てない
 - summary は必要なときだけ rewrite し、常に 1-5k tokens 目安に圧縮する
-- 削除は直接行わず、Decision の置き換えは `status: replaced` と `replaced_by` で表現する
+- Decision の置き換えは `status: replaced` と `replaced_by` で表現する
 - 人間編集との不整合が見える rewrite は避け、衝突しそうなら保守的に統合する
+
+統合 phase の追加指示:
+
+- staging の活動ログを decisions / requests / summary / Knowledge update に落とし込む
+- Knowledge 新規作成は候補レポート掲載 source 由来に限る（詳細は §Phase 2: Knowledge 書き込み prompt）
+
+整理 phase の追加指示（統合 phase 完了後、余力で実行）:
+
+- 既存 record 群を `outdated`、`superseded`、`unused`、`noisy` の観点で評価し、なぜ整理対象なのかを分類する
+- 明示 invoke の保護閾値超過 record は drop / 大幅圧縮の対象外とする
+- `similar-slug`、`sources-overflow`、`replaced` 滞留は主に `superseded` または `noisy` の材料として扱う
+- merge / split / trim / drop の理由を git diff から読める形で残す
+- 直接削除してよいが、git で可逆である前提に甘えすぎず、誤判定しやすいものは merge / trim を優先する
 
 ### Phase 2: Knowledge 書き込み prompt
 
@@ -62,17 +75,6 @@ Knowledge の新規作成 / 更新では、Phase 2 全体の原則に加えて�
 ### 監査 LLM prompt
 
 初期範囲では専用の監査 LLM は持たない（`memory.md` §書き込み経路と Linter / §将来検討 参照）。意味破壊の抑制は Phase 2 prompt 側の情報損失最小化指示と git diff レビューに寄せる。後から 2 層目として挟む際の入力・check 項目・pass-fail 返却形式はそのときに詰める。
-
-### GC prompt
-
-GC は Phase 2 より攻撃的に整理してよいが、可逆性と説明可能性を保つ:
-
-- 入力には GC 対象 record 群に加えて、Linter Warn、使用頻度メトリクス、`replaced` chain、sources 過多情報を含める
-- 明示 invoke 保護閾値を超える record は drop / 大幅圧縮の対象外とする
-- 各 record を `outdated`、`superseded`、`unused`、`noisy` の観点で評価し、なぜ GC 対象なのかを分類する
-- `similar-slug`、`sources-overflow`、`replaced` 滞留は主に `superseded` または `noisy` の材料として扱う
-- merge / split / trim / drop の理由を diff から読める形で残す
-- 直接削除してよいが、git で可逆である前提に甘えすぎず、誤判定しやすいものは merge / trim を優先する
 
 ## 関連
 

@@ -44,7 +44,7 @@ Knowledge は Phase 2 が自律的に新規作成 / 更新 / フラグ切替を�
 
 - **採択 gate**: Knowledge 新規作成は使用頻度メトリクスの Knowledge 化候補レポート（後述）に載った source から派生する場合に限る。閾値未満のうちは decisions / requests に留める
 - **Linter**: 構造違反を watch（詳細は後述）。意味破壊の自動検出は初期は持たず、挙動を見てから監査 LLM 層を追加する（将来検討）
-- **OS ファイル権限**: 人間が書き換えさせたくない record は `-r--` にしてロック。Phase 2 / GC の write は OS レベルで弾かれる
+- **OS ファイル権限**: 人間が書き換えさせたくない record は `-r--` にしてロック。Phase 2 の write は OS レベルで弾かれる
 
 Workflow も同じフラグ仕様（`workflow.md` 参照）。per-record 保護フラグを提供する拡張は将来検討、初期は OS 権限で足りる。
 
@@ -135,15 +135,16 @@ Workflow 保護は専用 tool schema のトリックではなく Linter ルー�
 - **Compact との順序**: 同一 turn 完了後の post-run チェックで Phase 1 を **compact より前** に走らせる。compact は history を組み替えるので、extract の入力範囲（session log 上の entry index）は compact 前のほうが安定する
 - **並走防止 (Phase 1 同士)**: Pod 上の `extract_in_flight` フラグで in-flight 中の新規 trigger を skip。完了時点で閾値超過していれば直ちに次回を発火し、新 pointer 以降の最大範囲を回収する（pending 状態は保持しない＝完了時の閾値再評価で coalesce 相当の挙動を成立させる）
 
-#### Phase 2: 永続化への統合
+#### Phase 2: 永続化への統合 + 整理
 
-- **Trigger**: staging の累積ファイル数 or bytes が閾値超過、または compact 発火時（必ず flush）
+- **Trigger**: staging の累積ファイル数 or bytes が閾値超過
 - **実行主体**: Phase 1 を終えた pod が consolidation Worker を spawn。並走防止は staging 配下の進行状況ファイル（後述）で担保
-- **入力**: 起動時スナップショットで確定した consumed ID list 分の staging エントリ（活動ログ + `source`）+ 既存 `memory/*`（summary / decisions / requests）の全文 + **Knowledge 化候補レポート**（後述の使用頻度メトリクスから機械集計、閾値超過の source 一覧）。既存 `knowledge/*` は全文を prompt に埋めず、Knowledge 検索ツール経由で agent が必要分を引く
+- **入力**: 起動時スナップショットで確定した consumed ID list 分の staging エントリ（活動ログ + `source`）+ 既存 `memory/*`（summary / decisions / requests）の全文 + **Knowledge 化候補レポート**（後述の使用頻度メトリクスから機械集計、閾値超過の source 一覧）+ **整理材料**（明示 invoke の使用頻度メトリクス、Linter Warn、`replaced` chain、sources 過多情報）。既存 `knowledge/*` は全文を prompt に埋めず、Knowledge 検索ツール経由で agent が必要分を引く
 - **処理**: sub-Worker に **memory 専用 Tool（read / write / edit、Linter 内蔵）+ Knowledge 検索ツール + memory 検索ツール** を渡し、agentic に以下を自律判断:
-  - 新規 decisions / requests を 1 件 1 ファイルで追加。`sources` は staging の `source` をコピー（LLM 推論ではない）
+  - **統合**: 新規 decisions / requests を 1 件 1 ファイルで追加。`sources` は staging の `source` をコピー（LLM 推論ではない）
   - 活動ログから派生する Knowledge（用語定義 / 運用方針 / ルール / 事実 / ノウハウ）を新規作成 or 既存 patch。**新規作成は候補レポート掲載の source から派生する場合に限る**。`kind` を frontmatter に持ち、`last_sources` を更新
   - summary を必要に応じて rewrite
+  - **整理（余力 phase）**: 既存 record 群を §評価カテゴリ で評価し、保護閾値外の対象を drop / merge / split / trim / rewrite。Linter Warn で検出した類似 slug 乱立 / sources 過多 / `replaced` 滞留はここで収斂させる
 - **書き込み先**: `memory/*` と `knowledge/*`。Workflow 禁止は Linter で担保（`workflow.md` 参照）
 - **完了処理**: consumed ID list の staging のみ cleanup（実行中に Phase 1 が追加した分は残す）。Phase 2 完了時に staging に新着があれば次を発火（Coalesce）
 - **モデル**: `memory.consolidation_model`。reasoning 系
@@ -164,7 +165,9 @@ Workflow 保護は専用 tool schema のトリックではなく Linter ルー�
 
 - **rewrite は許可**。既存内容と新規情報を統合・再構成して情報密度を上げることを優先。単純 append（追記で増やすだけ）は避ける
 - rewrite 時は**情報損失を最小化**する: 既存の主張・根拠・sources を保持。表現を整理・短縮しても、含まれている要素は落とさない
-- 削除は置き換え記録（`status: replaced` + `replaced_by: <slug>`）で表現、直接削除しない
+- Decision の置き換えは `status: replaced` + `replaced_by: <slug>` で表現、直接削除しない
+- 整理 phase での drop は許可。ただし保護閾値（§判断ルール）超過 record は drop / 大幅圧縮の対象外。誤判定しやすいものは merge / trim を優先
+- 各 record の整理理由は `outdated | superseded | unused | noisy` の §評価カテゴリ で説明可能にし、git diff から読み取れる粒度の操作にする
 - Knowledge は既存 record 群の slug / description / kind / `model_invokation` を入口に適合先を探し、自然に統合できるなら新規 slug を増やさない
 - 人間編集は git diff で顕在化する前提。整合しない rewrite は避け、衝突時は git で解決
 
@@ -176,11 +179,11 @@ Memory record の書き込みは Phase 2 が自律判断し、Offer は設けな
 
 #### Compact との関係
 
-基本分離（memory は独立トリガー、compact は `input_tokens` 既存閾値のまま）。ただし **compact 発火時は Phase 2 を必ず同時 flush**（compact で失われる raw を漏らさないため）。
+基本分離（memory は独立トリガー、compact は `input_tokens` 既存閾値のまま）。compact で失われる session log の raw は **Phase 1 が compact より前に走ることで staging に保全**される（§Phase 1 §Compact との順序 参照）。Phase 2 を compact に同期させる義務はなく、staging 累積閾値で独立に発火する。
 
-### GC（定期再評価）
+### 整理（GC 相当）の扱い
 
-Phase 2 とは別経路で memory を再評価する定期ジョブ。Phase 2 は rewrite 許可で情報統合寄りの働きをするが、それでも残る以下の課題の出口として機能する:
+Phase 2 は rewrite 許可で情報統合寄りの働きをするが、それでも残る以下の課題は **Phase 2 の余力 phase で同じ agent が処理**する（独立 trigger / 独立 Agent は持たない）:
 
 - 重要度の低い record が累積する
 - 類似 slug が乱立する（Linter Warn で検出したものをまとめて処理）
@@ -190,25 +193,23 @@ Phase 2 とは別経路で memory を再評価する定期ジョブ。Phase 2 �
 
 他プロジェクトの GC 設計の横断比較は `docs/ref/memory-systems.md` §8。
 
-#### 権限と操作粒度
+#### 操作粒度
 
-GC Agent は **drop / merge / split を自律実行**（削除まで含む）。人間 offer はかけず、結果は git diff で検証する建て付け。operation 粒度は以下の両方:
+整理 phase は Phase 2 統合 phase と同じ memory 専用 Tool（read / write / edit、内部で pre-write Linter）を使う。operation 粒度は自然にサポートされる（専用 API は用意しない）:
 
 - **ファイル単位**: 丸ごと drop、複数ファイルの merge、1 ファイルの分割（split）
 - **ファイル内の部分削除**: 本文の一部節・箇条を削除 or 圧縮。frontmatter の `sources` 古いエントリの trim も含む
 
-Phase 2 と同じ memory 専用 Tool（read / write / edit、内部で pre-write Linter）を使うので、operation 粒度は自然にサポートされる（専用 API は用意しない）。
+#### 評価カテゴリ
 
-#### GC の評価カテゴリ
-
-GC は record を一律に「stale」とみなさず、少なくとも次の 4 カテゴリで評価する:
+整理対象 record は一律に「stale」とみなさず、少なくとも次の 4 カテゴリで評価する:
 
 - `outdated`: 以前は妥当だったが、現在の実装・方針・運用と不整合になっている
 - `superseded`: 別 record が実質的な正本になっており、元の record は置き換え済みに近い
 - `unused`: 誤りではないが、明示 invoke や検索でほとんど参照されずノイズ化している
 - `noisy`: 内容自体は有効でも、粒度・重複・冗長さ・sources 過多などで discovery / retrieval を悪化させている
 
-これらは **保護条件ではなく GC 理由の分類**。保護条件は別に持ち、その上で `drop / merge / split / trim / rewrite` のどれを選ぶかをこのカテゴリで説明可能にする。
+これらは **保護条件ではなく整理理由の分類**。保護条件は別に持ち、その上で `drop / merge / split / trim / rewrite` のどれを選ぶかをこのカテゴリで説明可能にする。
 
 #### 使用頻度メトリクス
 
@@ -226,12 +227,12 @@ GC は record を一律に「stale」とみなさず、少なくとも次の 4 �
 
 **累積方式**（後集計アプローチ）: 上記 invoke 記録に対して最大 10 回前の invoke から現在までの時系列窓でフィルタして集計する。
 
-**Knowledge 化候補レポート**: Phase 2 が入力に受け取る、Knowledge 新規作成 gate 用の機械集計。対象は `memory/*` 配下の record（Phase 1 成果物である decisions / requests / 既存 knowledge）で、明示 invoke 頻度が閾値超過のものを列挙する。spike 除外のため、同一 session 内の連続参照は 1 count に丸め、複数 session での再参照を要件とする。閾値の具体値は運用で調整、設定ファイルで tune。
+**Knowledge 化候補レポート**: Phase 2 統合 phase が入力に受け取る、Knowledge 新規作成 gate 用の機械集計。対象は `memory/*` 配下の record（Phase 1 成果物である decisions / requests / 既存 knowledge）で、明示 invoke 頻度が閾値超過のものを列挙する。spike 除外のため、同一 session 内の連続参照は 1 count に丸め、複数 session での再参照を要件とする。閾値の具体値は運用で調整、設定ファイルで tune。
 
 #### 判断ルール
 
 - 保護閾値: **明示 invoke** の `frequency >= 1.0 invokes/Mtoken` の record は drop / 大幅圧縮の対象外（初期値 1.0、workspace 設定でカスタマイズ可）。`model_invokation` 注入による常駐は計数対象外（別指標として後段で参照）
-- GC の評価カテゴリは `outdated | superseded | unused | noisy` を使う。単一 record が複数カテゴリに該当してもよい
+- 整理 phase の評価カテゴリは `outdated | superseded | unused | noisy` を使う。単一 record が複数カテゴリに該当してもよい
 
 ### ファイル形式
 

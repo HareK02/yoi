@@ -4,7 +4,7 @@
 
 `docs/plan/workflow.md` で決まった「制約付きの強制的な作業フロー」を `/<slug>` で呼び出せるようにする。Knowledge (`#<slug>`) を依存として inject できる経路を持つことで、procedural な能力を再利用可能な単位に固定する。
 
-memory 機構（`docs/plan/memory.md`）からは独立してスタートできる: Workflow は人間が書く / consolidation の offer 経由でしか作られず、自動書き込み禁止のため Phase 2 / GC の前提に依存しない。Knowledge resolver は `requires` の inject 経路として相互依存する。
+memory 機構（`docs/plan/memory.md`）からは独立してスタートできる: Workflow は人間が書く / consolidation の offer 経由でしか作られず、自動書き込み禁止のため Phase 2 の前提に依存しない。Knowledge resolver は `requires` の inject 経路として相互依存する。
 
 agent-skills (agentskills.io 形式) は本チケットの ingest 経路を再利用して Workflow として読み込む側になる（`tickets/agent-skills.md` 参照）。
 
