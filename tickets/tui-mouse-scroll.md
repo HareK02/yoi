@@ -26,3 +26,8 @@ TUIのヒストリービューはキー操作（Shift+↑/↓、PageUp/PageDown�
 - ホイール以外のマウス操作（クリックでフォーカス移動、ドラッグ選択、スクロールバー表示など）
 - picker / spawn のインラインフェーズでのマウス対応
 - ホイール感度の設定可能化
+
+## Review
+- 状態: Approve
+- レビュー詳細: [./tui-mouse-scroll.review.md](./tui-mouse-scroll.review.md)
+- 日付: 2026-05-01
