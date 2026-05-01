@@ -74,3 +74,10 @@ agent-skills (agentskills.io 形式) は本チケットの ingest 経路を再�
 - Knowledge / `#<slug>` の retrieval: `docs/plan/memory.md` §retrieval 経路
 - Submit segment: `tickets/submit-tui-completion.md`（`Atom::WorkflowInvoke`）、`tickets/session-log-segments.md`
 - 後続: `tickets/agent-skills.md`（外部 SKILL を Workflow として ingest する経路）
+
+## Review
+
+- 状態: Approve
+- レビュー詳細: [./workflow.review.md](./workflow.review.md)
+- 日付: 2026-05-02
+- 主要指摘: なし（フォローアップ／nit レベルのみ）。

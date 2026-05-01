@@ -48,7 +48,7 @@ resident_workflows_section = """\
 ---
 ## Resident workflows
 
-The following workflows are advertised resident. Invoke one with /<slug> when its description matches the task.
+The following workflows are advertised resident. When a user request matches one, follow its procedure as authoritative instead of improvising. User-invocable workflows can additionally be triggered by the user typing /<slug>; you cannot invoke any of them yourself.
 
 {{ entries }}\
 """
