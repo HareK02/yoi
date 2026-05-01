@@ -1,5 +1,4 @@
 - [ ] Workflow / Skills
-  - [ ] Workflow 実装 → [tickets/workflow.md](tickets/workflow.md)
   - [ ] 内部 Worker / 内部 Pod の Workflow 化 → [tickets/internal-worker-workflow.md](tickets/internal-worker-workflow.md)
   - [ ] Agent Skills を Workflow として ingest → [tickets/agent-skills.md](tickets/agent-skills.md)
 - [ ] ツール設計
