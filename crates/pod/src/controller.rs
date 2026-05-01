@@ -108,6 +108,28 @@ impl PodController {
         // can emit typed lifecycle `Event`s (currently: compact progress).
         pod.attach_event_tx(event_tx.clone());
 
+        // Bash spills long outputs to a per-pod subdir under the runtime
+        // dir. Push a recursive `allow(Read)` for that path into the
+        // Pod's runtime scope so the agent can `Read` saved files
+        // without polluting the workspace. The Pod's SharedScope is the
+        // single source of truth — every ScopedFs (builtin tools,
+        // fs_view, compact worker) reads from it, and any future scope
+        // mutation (SpawnPod-style revoke, future GrantScope)
+        // propagates through it.
+        let bash_output_dir = runtime_dir.path().join("bash-output");
+        std::fs::create_dir_all(&bash_output_dir).map_err(|e| {
+            std::io::Error::other(format!(
+                "create bash output dir {}: {e}",
+                bash_output_dir.display()
+            ))
+        })?;
+        pod.add_scope_rules([manifest::ScopeRule {
+            target: bash_output_dir.clone(),
+            permission: manifest::Permission::Read,
+            recursive: true,
+        }])
+        .map_err(std::io::Error::other)?;
+
         // Stashed during tool registration below so we can attach a
         // `PodFsView` to the shared state once the latter exists.
         let fs_for_view: tools::ScopedFs;
@@ -229,31 +251,12 @@ impl PodController {
             // context compaction) can ask which files the agent has been
             // touching.
             //
-            // Bash spills long outputs to a per-pod subdir under the
-            // runtime dir. Push a recursive `allow(Read)` for that path
-            // into the Pod's runtime scope so the agent can `Read` the
-            // saved files without polluting the workspace. The Pod's
-            // SharedScope is the single source of truth — the same
-            // handle backs every ScopedFs (builtin tools, fs_view,
-            // compact worker), and any future scope mutation
+            // The Pod's SharedScope (already augmented with the
+            // bash-output Read rule above) is the single source of
+            // truth — every ScopedFs (builtin tools, fs_view, compact
+            // worker) reads from it, and any future scope mutation
             // (SpawnPod-style revoke, future GrantScope) propagates
             // through it.
-            let bash_output_dir = runtime_dir.path().join("bash-output");
-            std::fs::create_dir_all(&bash_output_dir).map_err(|e| {
-                std::io::Error::other(format!(
-                    "create bash output dir {}: {e}",
-                    bash_output_dir.display()
-                ))
-            })?;
-            scope_handle
-                .update(|cur| {
-                    cur.with_added_allow_rules([manifest::ScopeRule {
-                        target: bash_output_dir.clone(),
-                        permission: manifest::Permission::Read,
-                        recursive: true,
-                    }])
-                })
-                .map_err(std::io::Error::other)?;
             let fs = tools::ScopedFs::with_shared_scope(scope_handle.clone(), pwd_for_tools.clone());
             let tracker = tools::Tracker::new();
             // The same ScopedFs also powers the IPC `ListCompletions`

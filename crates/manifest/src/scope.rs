@@ -313,16 +313,6 @@ impl SharedScope {
         self.inner.scope.load_full()
     }
 
-    /// Replace the current scope wholesale. Equivalent to building a
-    /// fresh [`Scope`] from a [`ScopeConfig`] and storing it. Concurrent
-    /// `update` callers in the middle of a read-modify-write will see
-    /// this store reflected on their next iteration if their derived
-    /// scope cannot be built from the now-stale snapshot.
-    pub fn store(&self, scope: Scope) {
-        let _guard = self.inner.write_lock.lock().expect("scope mutex poisoned");
-        self.inner.scope.store(Arc::new(scope));
-    }
-
     /// Read-modify-write transaction. `f` is called with the current
     /// scope and returns a derived one (or an error). The internal
     /// write lock ensures that two concurrent `update` calls see each

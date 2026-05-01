@@ -43,3 +43,9 @@ Pod の実行中に scope を追加・縮小でき、変更が即座にツール
 
 - protocol 経由の外部からの scope 付与 / 剥奪（必要になったら追加）
 - scope 変更の履歴追跡・監査ログ
+
+## Review
+
+- 状態: Approve with follow-up
+- レビュー詳細: [./dynamic-scope.review.md](./dynamic-scope.review.md)
+- 日付: 2026-05-02
