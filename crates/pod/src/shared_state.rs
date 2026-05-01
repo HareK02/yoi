@@ -7,6 +7,11 @@ use session_store::SessionId;
 
 use crate::fs_view::PodFsView;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowCandidate {
+    pub slug: String,
+}
+
 /// Shared state between PodController and runtime directory.
 ///
 /// Controller updates this in-memory; RuntimeDir writes it to disk.
@@ -31,6 +36,7 @@ pub struct PodSharedState {
     /// (only relevant for unit tests that build a `PodSharedState`
     /// directly without spinning up a controller).
     fs_view: OnceLock<PodFsView>,
+    workflows: OnceLock<Vec<WorkflowCandidate>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,6 +63,7 @@ impl PodSharedState {
             history: RwLock::new(Vec::new()),
             user_segments: RwLock::new(Vec::new()),
             fs_view: OnceLock::new(),
+            workflows: OnceLock::new(),
         }
     }
 
@@ -70,6 +77,23 @@ impl PodSharedState {
     /// tests that didn't wire one up.
     pub fn fs_view(&self) -> Option<&PodFsView> {
         self.fs_view.get()
+    }
+
+    pub fn set_workflows(&self, workflows: Vec<WorkflowCandidate>) {
+        let _ = self.workflows.set(workflows);
+    }
+
+    pub fn list_workflow_completions(&self, prefix: &str) -> Vec<WorkflowCandidate> {
+        self.workflows
+            .get()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter(|candidate| candidate.slug.starts_with(prefix))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     pub fn user_segments(&self) -> Vec<Vec<Segment>> {

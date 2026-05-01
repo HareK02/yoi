@@ -25,6 +25,7 @@ use crate::schema::{
     DecisionFrontmatter, KnowledgeFrontmatter, RequestFrontmatter, SummaryFrontmatter,
     WorkflowFrontmatter, split_frontmatter,
 };
+use crate::workflow::WORKFLOW_DESCRIPTION_HARD_CAP;
 use crate::workspace::{ClassifiedPath, RecordKind, WorkspaceLayout};
 
 pub use existing::{ExistingRecords, scan_existing};
@@ -258,6 +259,18 @@ impl Linter {
         };
         size::check_body::<WorkflowFrontmatter>(parsed.body, &mut report);
 
+        // Mirror the loader's cap so human-edit paths fail fast instead
+        // of surfacing the same error only at Pod startup.
+        if parsed.frontmatter.model_invokation {
+            let actual = parsed.frontmatter.description.chars().count();
+            if actual > WORKFLOW_DESCRIPTION_HARD_CAP {
+                report.push_error(LintError::DescriptionTooLong {
+                    actual,
+                    limit: WORKFLOW_DESCRIPTION_HARD_CAP,
+                });
+            }
+        }
+
         let existing = match existing::scan_existing(&self.layout) {
             Ok(e) => e,
             Err(e) => {
@@ -323,10 +336,9 @@ mod tests {
     fn workflow_write_rejected() {
         let (dir, linter) = workspace();
         let path = dir.path().join(".insomnia/memory/workflow/wf.md");
-        let content = format!(
-            "---\nupdated_at: {now}\ndescription: x\nauto_invoke: false\nuser_invocable: true\n---\nbody",
-            now = iso_now()
-        );
+        let content =
+            "---\ndescription: x\nmodel_invokation: false\nuser_invocable: true\n---\nbody"
+                .to_string();
         let report = linter.lint(&path, &content, WriteMode::Create);
         assert!(
             report
@@ -499,10 +511,7 @@ mod tests {
                 n = iso_now()
             ),
         );
-        let wf = format!(
-            "---\nupdated_at: {n}\ndescription: do thing\nauto_invoke: false\nuser_invocable: true\nrequires: [foo]\n---\nstep 1\n",
-            n = iso_now()
-        );
+        let wf = "---\ndescription: do thing\nmodel_invokation: false\nuser_invocable: true\nrequires: [foo]\n---\nstep 1\n".to_string();
         let report = linter.lint_workflow(&wf);
         assert!(!report.has_errors(), "got errors: {:?}", report.errors);
     }
@@ -510,10 +519,7 @@ mod tests {
     #[test]
     fn workflow_lint_flags_unknown_requires() {
         let (_dir, linter) = workspace();
-        let wf = format!(
-            "---\nupdated_at: {n}\ndescription: x\nauto_invoke: false\nuser_invocable: true\nrequires: [missing-knowledge]\n---\n",
-            n = iso_now()
-        );
+        let wf = "---\ndescription: x\nmodel_invokation: false\nuser_invocable: true\nrequires: [missing-knowledge]\n---\n".to_string();
         let report = linter.lint_workflow(&wf);
         assert!(report.errors.iter().any(|e| matches!(
             e,
@@ -526,12 +532,41 @@ mod tests {
     }
 
     #[test]
+    fn workflow_lint_flags_long_description_when_model_invokation() {
+        let (_dir, linter) = workspace();
+        let desc = "x".repeat(crate::workflow::WORKFLOW_DESCRIPTION_HARD_CAP + 1);
+        let wf = format!(
+            "---\ndescription: {desc}\nmodel_invokation: true\nuser_invocable: true\n---\n"
+        );
+        let report = linter.lint_workflow(&wf);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| matches!(e, LintError::DescriptionTooLong { .. })),
+        );
+    }
+
+    #[test]
+    fn workflow_lint_allows_long_description_when_not_model_invokation() {
+        let (_dir, linter) = workspace();
+        let desc = "x".repeat(crate::workflow::WORKFLOW_DESCRIPTION_HARD_CAP + 1);
+        let wf = format!(
+            "---\ndescription: {desc}\nmodel_invokation: false\nuser_invocable: true\n---\n"
+        );
+        let report = linter.lint_workflow(&wf);
+        assert!(
+            !report
+                .errors
+                .iter()
+                .any(|e| matches!(e, LintError::DescriptionTooLong { .. })),
+        );
+    }
+
+    #[test]
     fn workflow_lint_collects_multiple_unknown_requires() {
         let (_dir, linter) = workspace();
-        let wf = format!(
-            "---\nupdated_at: {n}\ndescription: x\nauto_invoke: false\nuser_invocable: true\nrequires: [a, b, c]\n---\n",
-            n = iso_now()
-        );
+        let wf = "---\ndescription: x\nmodel_invokation: false\nuser_invocable: true\nrequires: [a, b, c]\n---\n".to_string();
         let report = linter.lint_workflow(&wf);
         let unknown_count = report
             .errors

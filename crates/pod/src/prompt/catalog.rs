@@ -79,6 +79,10 @@ pub enum PodPrompt {
     /// AGENTS.md section when memory is enabled and at least one
     /// `knowledge/*` record advertises `model_invokation: true`.
     ResidentKnowledgeSection,
+    /// Trailing `## Resident workflows` section, appended after resident
+    /// knowledge when memory is enabled and at least one workflow advertises
+    /// `model_invokation: true`.
+    ResidentWorkflowsSection,
 }
 
 impl PodPrompt {
@@ -91,6 +95,7 @@ impl PodPrompt {
             Self::WorkingBoundariesSection => "working_boundaries_section",
             Self::AgentsMdSection => "agents_md_section",
             Self::ResidentKnowledgeSection => "resident_knowledge_section",
+            Self::ResidentWorkflowsSection => "resident_workflows_section",
         }
     }
 
@@ -105,6 +110,7 @@ impl PodPrompt {
         PodPrompt::WorkingBoundariesSection,
         PodPrompt::AgentsMdSection,
         PodPrompt::ResidentKnowledgeSection,
+        PodPrompt::ResidentWorkflowsSection,
     ];
 
     pub const KEYS: &'static [&'static str] = &[
@@ -115,6 +121,7 @@ impl PodPrompt {
         "working_boundaries_section",
         "agents_md_section",
         "resident_knowledge_section",
+        "resident_workflows_section",
     ];
 }
 
@@ -327,6 +334,15 @@ impl PromptCatalog {
     pub fn resident_knowledge_section(&self, entries: &str) -> Result<String, CatalogError> {
         self.render(
             PodPrompt::ResidentKnowledgeSection,
+            single("entries", entries),
+        )
+    }
+
+    /// Render `PodPrompt::ResidentWorkflowsSection` with `{{ entries }}`
+    /// (a pre-formatted list block authored by the caller).
+    pub fn resident_workflows_section(&self, entries: &str) -> Result<String, CatalogError> {
+        self.render(
+            PodPrompt::ResidentWorkflowsSection,
             single("entries", entries),
         )
     }

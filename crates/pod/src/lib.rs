@@ -7,6 +7,7 @@ pub mod prompt;
 pub mod runtime;
 pub mod shared_state;
 pub mod spawn;
+pub mod workflow;
 
 mod factory;
 mod interrupt_and_run;

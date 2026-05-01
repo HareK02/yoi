@@ -15,7 +15,7 @@ use crate::workspace::WorkspaceLayout;
 
 /// Build deny rules that strip Write permission from `<workspace>/memory/`
 /// and `<workspace>/knowledge/`. Recursive — every descendant is capped
-/// at Read for the generic tools.
+/// at Read for the generic tools, including `memory/workflow/`.
 pub fn deny_write_rules(layout: &WorkspaceLayout) -> Vec<ScopeRule> {
     vec![
         deny_write(layout.memory_dir().as_path()),
