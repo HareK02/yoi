@@ -15,8 +15,8 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use crossterm::event::{
-    self, DisableBracketedPaste, EnableBracketedPaste, Event as TermEvent, KeyCode, KeyEvent,
-    KeyModifiers,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event as TermEvent, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -170,7 +170,12 @@ async fn main() -> ExitCode {
     // shows up cleanly in scrollback rather than inside an active
     // alternate-screen buffer.
     let mut stdout = io::stdout();
-    let _ = execute!(stdout, LeaveAlternateScreen, DisableBracketedPaste);
+    let _ = execute!(
+        stdout,
+        DisableMouseCapture,
+        LeaveAlternateScreen,
+        DisableBracketedPaste
+    );
     let _ = disable_raw_mode();
     let _ = execute!(stdout, crossterm::cursor::Show);
 
@@ -229,7 +234,11 @@ async fn run_spawn(resume_from: Option<SessionId>) -> Result<(), Box<dyn std::er
     // Leave alt-screen before reaping the child so any final pod stderr
     // (drained off-line by `stderr_drain`) cannot collide with the
     // restored scrollback.
-    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+    let _ = execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    );
 
     match tokio::time::timeout(Duration::from_secs(3), child.wait()).await {
         Ok(Ok(_)) => {}
@@ -246,7 +255,7 @@ async fn run_spawn(resume_from: Option<SessionId>) -> Result<(), Box<dyn std::er
 fn enter_fullscreen() -> Result<Terminal<CrosstermBackend<io::Stdout>>, Box<dyn std::error::Error>>
 {
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     Ok(Terminal::new(backend)?)
 }
@@ -302,6 +311,9 @@ async fn run_loop(
                                 client.send(&method).await?;
                             }
                         }
+                        TermEvent::Mouse(mouse) => {
+                            handle_mouse(app, mouse);
+                        }
                         TermEvent::Paste(s) => {
                             app.insert_paste(s);
                         }
@@ -343,6 +355,20 @@ fn run_disconnected(_app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+/// Lines per wheel notch. Faster than Shift+↑/↓ (which is 1 line) so
+/// hand-rolling through long histories isn't tedious, but slow enough
+/// that a single notch doesn't blow past the section the user is
+/// looking for.
+const WHEEL_LINES: usize = 3;
+
+fn handle_mouse(app: &mut App, mouse: MouseEvent) {
+    match mouse.kind {
+        MouseEventKind::ScrollUp => app.scroll.scroll_up(WHEEL_LINES),
+        MouseEventKind::ScrollDown => app.scroll.scroll_down(WHEEL_LINES),
+        _ => {}
+    }
 }
 
 fn handle_key(app: &mut App, key: KeyEvent) -> Option<Method> {
