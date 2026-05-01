@@ -590,22 +590,31 @@ fn render_default(tc: &ToolCallBlock, mode: Mode) -> Vec<Line<'static>> {
             .add_modifier(Modifier::ITALIC),
     );
 
-    let summary_source: String = match &tc.state {
+    // Body source: prefer the full output (e.g. Bash's stdout/stderr) so
+    // Detail mode can expose it. Fall back to the summary when the tool
+    // didn't emit any content.
+    let body_source: String = match &tc.state {
+        ToolCallState::Done {
+            output: Some(out), ..
+        }
+        | ToolCallState::Error {
+            output: Some(out), ..
+        } => out.clone(),
         ToolCallState::Done { summary, .. } | ToolCallState::Error { summary, .. } => {
             summary.clone()
         }
         _ => String::new(),
     };
-    let summary_cap = match mode {
+    let body_cap = match mode {
         Mode::Normal => 3,
         Mode::Detail => usize::MAX,
         Mode::Overview => unreachable!(),
     };
-    if !summary_source.is_empty() {
+    if !body_source.is_empty() {
         emit_capped_lines(
             &mut lines,
-            &summary_source,
-            summary_cap,
+            &body_source,
+            body_cap,
             Style::default().fg(Color::Gray),
         );
     }

@@ -25,3 +25,8 @@ Bash の子プロセスは ScopedFs を経由しない。Scope による保護�
 ## 依存チケット
 
 - [permission-extension-point.md](permission-extension-point.md) — deny/allow ルールによる Bash コマンド制御
+
+## Review
+- 状態: Approve with follow-up
+- レビュー詳細: [./bash-tool.review.md](./bash-tool.review.md)
+- 日付: 2026-05-01

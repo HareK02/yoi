@@ -31,7 +31,8 @@
 //! let scope = Scope::writable("/workspace").unwrap();
 //! let fs = ScopedFs::new(scope, PathBuf::from("/workspace")); // pod lifetime
 //! let tracker = Tracker::new();    // session lifetime
-//! let defs = builtin_tools(fs, tracker);
+//! let bash_outputs = PathBuf::from("/run/insomnia/bash-output");
+//! let defs = builtin_tools(fs, tracker, bash_outputs);
 //! ```
 
 use std::collections::{HashMap, VecDeque};

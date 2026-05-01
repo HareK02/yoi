@@ -156,6 +156,23 @@ impl Scope {
             .collect()
     }
 
+    /// Deny rules with their targets resolved to absolute paths.
+    ///
+    /// Counterpart to [`allow_rules`](Self::allow_rules); together they
+    /// round-trip through [`ScopeConfig`] for callers that need to
+    /// rebuild a scope after layering extra rules on top of an
+    /// already-constructed [`Scope`].
+    pub fn deny_rules(&self) -> Vec<ScopeRule> {
+        self.deny
+            .iter()
+            .map(|r| ScopeRule {
+                target: r.target.clone(),
+                permission: r.permission,
+                recursive: r.recursive,
+            })
+            .collect()
+    }
+
     /// Iterate over absolute paths granted `Write` by an allow rule.
     /// Subset of [`readable_paths`](Self::readable_paths).
     pub fn writable_paths(&self) -> impl Iterator<Item = &Path> {

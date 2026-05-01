@@ -8,10 +8,24 @@ use std::path::Path;
 use std::sync::Arc;
 
 use llm_worker::tool::{Tool, ToolDefinition, ToolMeta};
-use manifest::Scope;
+use manifest::{Permission, Scope, ScopeConfig, ScopeRule};
 use serde_json::json;
 use tempfile::TempDir;
 use tools::{ScopedFs, Tracker, builtin_tools};
+
+fn scope_with_spill(workspace: &Path, spill: &Path) -> Scope {
+    let base = Scope::writable(workspace).unwrap();
+    let mut config = ScopeConfig {
+        allow: base.allow_rules(),
+        deny: base.deny_rules(),
+    };
+    config.allow.push(ScopeRule {
+        target: spill.to_path_buf(),
+        permission: Permission::Read,
+        recursive: true,
+    });
+    Scope::from_config(&config).unwrap()
+}
 
 struct Registry {
     entries: Vec<(ToolMeta, Arc<dyn Tool>)>,
@@ -36,15 +50,14 @@ impl Registry {
     }
 }
 
-fn setup() -> (TempDir, Registry) {
+fn setup() -> (TempDir, TempDir, Registry) {
     let dir = TempDir::new().unwrap();
-    let fs = ScopedFs::new(
-        Scope::writable(dir.path()).unwrap(),
-        dir.path().to_path_buf(),
-    );
+    let spill = TempDir::new().unwrap();
+    let scope = scope_with_spill(dir.path(), spill.path());
+    let fs = ScopedFs::new(scope, dir.path().to_path_buf());
     let tracker = Tracker::new();
-    let reg = Registry::new(builtin_tools(fs, tracker));
-    (dir, reg)
+    let reg = Registry::new(builtin_tools(fs, tracker, spill.path().to_path_buf()));
+    (dir, spill, reg)
 }
 
 async fn call(tool: &Arc<dyn Tool>, input: serde_json::Value) -> llm_worker::tool::ToolOutput {
@@ -60,16 +73,16 @@ async fn call_err(tool: &Arc<dyn Tool>, input: serde_json::Value) -> llm_worker:
 }
 
 #[test]
-fn builtin_tools_registers_all_five() {
-    let (_dir, reg) = setup();
+fn builtin_tools_registers_full_set() {
+    let (_dir, _spill, reg) = setup();
     let mut names = reg.names();
     names.sort();
-    assert_eq!(names, vec!["Edit", "Glob", "Grep", "Read", "Write"]);
+    assert_eq!(names, vec!["Bash", "Edit", "Glob", "Grep", "Read", "Write"]);
 }
 
 #[test]
 fn meta_has_description_and_schema() {
-    let (_dir, reg) = setup();
+    let (_dir, _spill, reg) = setup();
     for (meta, _) in &reg.entries {
         assert!(
             !meta.description.is_empty(),
@@ -87,7 +100,7 @@ fn meta_has_description_and_schema() {
 
 #[tokio::test]
 async fn read_then_edit_then_read_roundtrip() {
-    let (dir, reg) = setup();
+    let (dir, _spill, reg) = setup();
     let file = dir.path().join("a.txt");
     std::fs::write(&file, "hello world\n").unwrap();
     let p = file.to_str().unwrap();
@@ -119,7 +132,7 @@ async fn read_then_edit_then_read_roundtrip() {
 
 #[tokio::test]
 async fn write_then_grep_finds_content() {
-    let (dir, reg) = setup();
+    let (dir, _spill, reg) = setup();
     let write = reg.get("Write");
     let grep = reg.get("Grep");
 
@@ -148,7 +161,7 @@ async fn write_then_grep_finds_content() {
 
 #[tokio::test]
 async fn glob_finds_written_files() {
-    let (dir, reg) = setup();
+    let (dir, _spill, reg) = setup();
     let write = reg.get("Write");
     let glob = reg.get("Glob");
 
@@ -172,7 +185,7 @@ async fn glob_finds_written_files() {
 
 #[tokio::test]
 async fn out_of_scope_write_is_rejected() {
-    let (_dir, reg) = setup();
+    let (_dir, _spill, reg) = setup();
     let outside = TempDir::new().unwrap();
     let write = reg.get("Write");
 
@@ -191,7 +204,7 @@ async fn out_of_scope_write_is_rejected() {
 
 #[tokio::test]
 async fn write_to_existing_without_read_fails() {
-    let (dir, reg) = setup();
+    let (dir, _spill, reg) = setup();
     let file = dir.path().join("exists.txt");
     std::fs::write(&file, "preexisting").unwrap();
 
@@ -212,7 +225,7 @@ async fn write_to_existing_without_read_fails() {
 async fn shared_scoped_fs_across_tools() {
     // The key invariant: all builtin tools share the same ScopedFs instance,
     // so read-history set by Read is visible to Edit and Write.
-    let (dir, reg) = setup();
+    let (dir, _spill, reg) = setup();
     let file = dir.path().join("shared.txt");
     std::fs::write(&file, "one\n").unwrap();
 
@@ -235,7 +248,7 @@ async fn shared_scoped_fs_across_tools() {
 
 #[tokio::test]
 async fn edit_requires_read_across_tools() {
-    let (dir, reg) = setup();
+    let (dir, _spill, reg) = setup();
     let file = dir.path().join("a.txt");
     std::fs::write(&file, "foo\n").unwrap();
 
@@ -256,17 +269,17 @@ async fn edit_requires_read_across_tools() {
 
 #[tokio::test]
 async fn deterministic_tool_order_is_registration_order() {
-    let (_dir, reg) = setup();
-    // Registration order from builtin_tools(): Read, Write, Edit, Glob, Grep
+    let (_dir, _spill, reg) = setup();
+    // Registration order from builtin_tools(): Read, Write, Edit, Glob, Grep, Bash
     let names: Vec<&str> = reg.entries.iter().map(|(m, _)| m.name.as_str()).collect();
-    assert_eq!(names, vec!["Read", "Write", "Edit", "Glob", "Grep"]);
+    assert_eq!(names, vec!["Read", "Write", "Edit", "Glob", "Grep", "Bash"]);
 }
 
 // Regression: tool name capitalization matches Claude Code reference
 #[test]
 fn tool_names_match_reference_spec() {
-    let (_dir, reg) = setup();
-    for expected in ["Read", "Write", "Edit", "Glob", "Grep"] {
+    let (_dir, _spill, reg) = setup();
+    for expected in ["Read", "Write", "Edit", "Glob", "Grep", "Bash"] {
         assert!(
             reg.entries.iter().any(|(m, _)| m.name == expected),
             "missing tool {expected}"
@@ -278,12 +291,11 @@ fn tool_names_match_reference_spec() {
 async fn tracker_recent_files_tracks_read_write_edit() {
     // Build a fresh registry that shares a tracker we can query afterwards.
     let dir = TempDir::new().unwrap();
-    let fs = ScopedFs::new(
-        Scope::writable(dir.path()).unwrap(),
-        dir.path().to_path_buf(),
-    );
+    let spill = TempDir::new().unwrap();
+    let scope = scope_with_spill(dir.path(), spill.path());
+    let fs = ScopedFs::new(scope, dir.path().to_path_buf());
     let tracker = Tracker::new();
-    let reg = Registry::new(builtin_tools(fs, tracker.clone()));
+    let reg = Registry::new(builtin_tools(fs, tracker.clone(), spill.path().to_path_buf()));
 
     let a = dir.path().join("a.txt");
     let b = dir.path().join("b.txt");
@@ -322,6 +334,53 @@ async fn tracker_recent_files_tracks_read_write_edit() {
         recent[1].ends_with("b.txt"),
         "second should be b.txt: {recent:?}"
     );
+}
+
+#[tokio::test]
+async fn bash_inherits_scoped_fs_pwd() {
+    // The Bash tool starts at the ScopedFs's pwd. Without any `cd`, its
+    // `pwd` should canonicalize to the workspace root we set up.
+    let (dir, _spill, reg) = setup();
+    let bash = reg.get("Bash");
+    let out = call(&bash, json!({ "command": "pwd" })).await;
+    let body = out.content.unwrap();
+    let actual = std::fs::canonicalize(body.trim()).unwrap();
+    let expected = std::fs::canonicalize(dir.path()).unwrap();
+    assert_eq!(actual, expected);
+}
+
+#[tokio::test]
+async fn bash_spilled_file_is_readable_via_read_tool() {
+    // Long Bash output spills to a path that the controller has added to
+    // the readable scope. The agent should be able to Read that path
+    // exactly like any in-scope file.
+    let (_dir, spill, reg) = setup();
+    let bash = reg.get("Bash");
+    let out = call(
+        &bash,
+        json!({ "command": "for i in $(seq 1 200); do echo line $i; done" }),
+    )
+    .await;
+    let body = out.content.unwrap();
+    let spill_str = spill.path().to_str().unwrap();
+
+    // Extract the spilled path from the marker line.
+    let marker = body.lines().next().unwrap();
+    let prefix_pos = marker
+        .find(spill_str)
+        .expect("marker should reference the spill dir");
+    let path_end_rel = marker[prefix_pos..]
+        .find(".log")
+        .expect("marker should end the path with .log");
+    let spilled = &marker[prefix_pos..prefix_pos + path_end_rel + 4];
+
+    // Read the file via the Read tool — must succeed (in scope).
+    let read_out = call(&reg.get("Read"), json!({ "file_path": spilled })).await;
+    let read_body = read_out.content.expect("Read returned content");
+    // The full 200 lines should be in the saved file even though Bash
+    // returned only the tail of 80.
+    assert!(read_body.contains("line 1\n"), "missing line 1: {read_body}");
+    assert!(read_body.contains("line 200"), "missing line 200");
 }
 
 // Sanity: unused Path import guard

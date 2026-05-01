@@ -1,8 +1,8 @@
 //! Built-in tools for the Insomnia LLM agent.
 //!
-//! Implements Read / Write / Edit / Glob / Grep on top of the `llm-worker`
-//! `Tool` infrastructure. Filesystem access is mediated by two orthogonal
-//! concerns:
+//! Implements Read / Write / Edit / Glob / Grep / Bash on top of the
+//! `llm-worker` `Tool` infrastructure. Filesystem access is mediated by
+//! two orthogonal concerns:
 //!
 //! - [`ScopedFs`] — pod-lifetime, expresses the write-block boundary for
 //!   the current scope. Derived from the manifest and shareable across
@@ -13,17 +13,23 @@
 //!
 //! The Pod layer owns both instances and passes them to
 //! [`builtin_tools`] when registering tools on a `Worker`.
+//!
+//! `Bash` is the lone exception — its child processes bypass `ScopedFs`
+//! entirely. Safety for arbitrary command execution is delegated to the
+//! Permission layer (deny/allow rules on the command string).
 
 pub mod error;
 pub mod scoped_fs;
 pub mod tracker;
 
+mod bash;
 mod edit;
 mod glob;
 mod grep;
 mod read;
 mod write;
 
+pub use bash::bash_tool;
 pub use edit::edit_tool;
 pub use error::ToolsError;
 pub use glob::glob_tool;
@@ -39,12 +45,22 @@ pub use write::write_tool;
 /// All returned factories share the same tracker instance so that
 /// `Read` / `Write` / `Edit` see a consistent history across tool
 /// invocations within a single session.
-pub fn builtin_tools(fs: ScopedFs, tracker: Tracker) -> Vec<llm_worker::tool::ToolDefinition> {
+///
+/// `bash_output_dir` is where the Bash tool spills long outputs. The
+/// caller is responsible for adding that path to the readable scope
+/// (see [`manifest::Scope::with_extra_read`]) so the agent can `Read`
+/// the saved files.
+pub fn builtin_tools(
+    fs: ScopedFs,
+    tracker: Tracker,
+    bash_output_dir: std::path::PathBuf,
+) -> Vec<llm_worker::tool::ToolDefinition> {
     vec![
         read_tool(fs.clone(), tracker.clone()),
         write_tool(fs.clone(), tracker.clone()),
-        edit_tool(fs.clone(), tracker.clone()),
+        edit_tool(fs.clone(), tracker),
         glob_tool(fs.clone()),
-        grep_tool(fs),
+        grep_tool(fs.clone()),
+        bash_tool(fs, bash_output_dir),
     ]
 }

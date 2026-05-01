@@ -221,20 +221,49 @@ impl PodController {
             });
 
             // Register the builtin file-manipulation tools (Read / Write /
-            // Edit / Glob / Grep). `ScopedFs` carries the pod-lifetime
-            // scope/pwd; `Tracker` is session-scoped — a fresh instance per
-            // controller spawn ensures state from a previous process
-            // lifetime cannot be reused after a resume. The tracker is
-            // also handed to the Pod itself so Pod-level operations (e.g.
+            // Edit / Glob / Grep / Bash). `ScopedFs` carries the pod-
+            // lifetime scope/pwd; `Tracker` is session-scoped — a fresh
+            // instance per controller spawn ensures state from a previous
+            // process lifetime cannot be reused after a resume. The tracker
+            // is also handed to the Pod itself so Pod-level operations (e.g.
             // context compaction) can ask which files the agent has been
             // touching.
-            let fs = tools::ScopedFs::new(scope_for_tools, pwd_for_tools.clone());
+            //
+            // Bash spills long outputs to a per-pod subdir under the
+            // runtime dir. We layer a recursive `allow(Read)` rule for
+            // that path on top of the user-facing scope so the agent can
+            // `Read` the saved files without polluting the workspace.
+            // Same approach memory takes for its deny rules: round-trip
+            // through `ScopeConfig` and rebuild via `from_config`.
+            let bash_output_dir = runtime_dir.path().join("bash-output");
+            std::fs::create_dir_all(&bash_output_dir).map_err(|e| {
+                std::io::Error::other(format!(
+                    "create bash output dir {}: {e}",
+                    bash_output_dir.display()
+                ))
+            })?;
+            let mut scope_config = manifest::ScopeConfig {
+                allow: scope_for_tools.allow_rules(),
+                deny: scope_for_tools.deny_rules(),
+            };
+            scope_config.allow.push(manifest::ScopeRule {
+                target: bash_output_dir.clone(),
+                permission: manifest::Permission::Read,
+                recursive: true,
+            });
+            let scope_with_bash = manifest::Scope::from_config(&scope_config)
+                .map_err(std::io::Error::other)?;
+            let fs = tools::ScopedFs::new(scope_with_bash, pwd_for_tools.clone());
             let tracker = tools::Tracker::new();
             // The same ScopedFs also powers the IPC `ListCompletions`
             // query — keep a clone for the FS view we attach below,
             // since the tools consume `fs` itself.
             fs_for_view = fs.clone();
-            worker.register_tools(tools::builtin_tools(fs, tracker.clone()));
+            worker.register_tools(tools::builtin_tools(
+                fs,
+                tracker.clone(),
+                bash_output_dir,
+            ));
 
             // Memory subsystem opt-in. When `[memory]` is present in
             // the manifest, register the memory-specific Read/Write/Edit

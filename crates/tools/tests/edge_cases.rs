@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use llm_worker::tool::{Tool, ToolDefinition};
-use manifest::Scope;
+use manifest::{Permission, Scope, ScopeConfig, ScopeRule};
 use serde_json::json;
 use tempfile::TempDir;
 use tools::{ScopedFs, Tracker, builtin_tools};
@@ -27,19 +27,29 @@ impl Registry {
     }
 }
 
-fn setup() -> (TempDir, Registry) {
+fn setup() -> (TempDir, TempDir, Registry) {
     let dir = TempDir::new().unwrap();
-    let fs = ScopedFs::new(
-        Scope::writable(dir.path()).unwrap(),
-        dir.path().to_path_buf(),
-    );
+    let spill = TempDir::new().unwrap();
+    let base = Scope::writable(dir.path()).unwrap();
+    let mut config = ScopeConfig {
+        allow: base.allow_rules(),
+        deny: base.deny_rules(),
+    };
+    config.allow.push(ScopeRule {
+        target: spill.path().to_path_buf(),
+        permission: Permission::Read,
+        recursive: true,
+    });
+    let scope = Scope::from_config(&config).unwrap();
+    let fs = ScopedFs::new(scope, dir.path().to_path_buf());
     let tracker = Tracker::new();
-    (dir, Registry::new(builtin_tools(fs, tracker)))
+    let reg = Registry::new(builtin_tools(fs, tracker, spill.path().to_path_buf()));
+    (dir, spill, reg)
 }
 
 #[tokio::test]
 async fn unicode_path_and_content() {
-    let (dir, reg) = setup();
+    let (dir, _spill, reg) = setup();
     let file = dir.path().join("日本語ファイル.txt");
     let content = "こんにちは 🦀 世界\nabc\n";
 
@@ -70,7 +80,7 @@ async fn unicode_path_and_content() {
 async fn symlink_to_outside_scope_is_rejected_for_write() {
     use std::os::unix::fs::symlink;
 
-    let (dir, reg) = setup();
+    let (dir, _spill, reg) = setup();
     let outside = TempDir::new().unwrap();
     let outside_target = outside.path().join("secret.txt");
     std::fs::write(&outside_target, "secret").unwrap();
@@ -114,7 +124,7 @@ async fn symlink_to_outside_scope_is_rejected_for_write() {
 
 #[tokio::test]
 async fn empty_file_read_and_edit() {
-    let (dir, reg) = setup();
+    let (dir, _spill, reg) = setup();
     let file = dir.path().join("empty.txt");
     std::fs::write(&file, "").unwrap();
 
@@ -144,7 +154,7 @@ async fn empty_file_read_and_edit() {
 
 #[tokio::test]
 async fn very_long_single_line() {
-    let (dir, reg) = setup();
+    let (dir, _spill, reg) = setup();
     let file = dir.path().join("long.txt");
     let big: String = "x".repeat(1024 * 1024); // 1 MiB, no newlines
     std::fs::write(&file, &big).unwrap();
@@ -160,7 +170,7 @@ async fn very_long_single_line() {
 
 #[tokio::test]
 async fn relative_path_is_rejected() {
-    let (_dir, reg) = setup();
+    let (_dir, _spill, reg) = setup();
     let read = reg.get("Read");
     let err = read
         .execute(&json!({ "file_path": "relative.txt" }).to_string())
@@ -171,7 +181,7 @@ async fn relative_path_is_rejected() {
 
 #[tokio::test]
 async fn directory_target_is_rejected_for_read() {
-    let (dir, reg) = setup();
+    let (dir, _spill, reg) = setup();
     let read = reg.get("Read");
     let err = read
         .execute(&json!({ "file_path": dir.path().to_str().unwrap() }).to_string())
@@ -182,7 +192,7 @@ async fn directory_target_is_rejected_for_read() {
 
 #[tokio::test]
 async fn deeply_nested_new_file_is_created() {
-    let (dir, reg) = setup();
+    let (dir, _spill, reg) = setup();
     let deep = dir.path().join("a/b/c/d/e/deep.txt");
     let write = reg.get("Write");
     write
@@ -200,7 +210,7 @@ async fn deeply_nested_new_file_is_created() {
 
 #[tokio::test]
 async fn replace_preserves_unicode() {
-    let (dir, reg) = setup();
+    let (dir, _spill, reg) = setup();
     let file = dir.path().join("u.txt");
     std::fs::write(&file, "🦀 rust 🦀\n").unwrap();
 
@@ -225,7 +235,7 @@ async fn replace_preserves_unicode() {
 
 #[tokio::test]
 async fn grep_handles_unicode_pattern() {
-    let (dir, reg) = setup();
+    let (dir, _spill, reg) = setup();
     let file = dir.path().join("u.txt");
     std::fs::write(&file, "English\n日本語\nрусский\n").unwrap();
 
