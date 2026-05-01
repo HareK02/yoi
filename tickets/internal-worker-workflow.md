@@ -24,7 +24,7 @@ INSOMNIA が内部で固定 prompt を持って disposable Worker / 専用 Pod �
 
 - 同じファイル形式（`memory/workflow/<slug>.md`）、同じ frontmatter / Linter
 - `user_invocable: false` で `/<slug>` 経路から見えなくする
-- `auto_invoke` は通常 Pod 用の system prompt 注入仕様のまま（内部 Workflow は通常 OFF）
+- `model_invokation` は通常 Pod 用の system prompt 注入仕様のまま（内部 Workflow は通常 OFF）
 - 内部 Workflow を識別するキー（例: `internal_role`）と、必要なツール surface を表明する手段を frontmatter に追加する。具体 schema は実装で詰める
 
 ### 内部呼び出し経路
@@ -54,7 +54,7 @@ Pod 側の既存トリガー（Phase 1 post-run / Phase 2 staging 閾値 / Compa
 - Workflow 仕様自体の本体実装（`tickets/workflow.md`）
 - 内部 Workflow の自動生成（consolidation の offer 等。`docs/plan/memory.md` §Offer 経路 / 将来検討）
 - 既存 `&str` 定数の物理削除タイミング（移行が完了した role ごとに削除する運用）
-- `auto_invoke` 注入予算の最適化（既存 Knowledge 常駐注入予算と合算する規約は `docs/plan/memory.md` 側）
+- `model_invokation` 注入予算の最適化（既存 Knowledge 常駐注入予算と合算する規約は `docs/plan/memory.md` 側）
 
 ## 完了条件
 

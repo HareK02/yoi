@@ -31,7 +31,7 @@ SKILL.md frontmatter:
 
 ## 前提チケット
 
-- `tickets/workflow.md` — Workflow loader / `/<slug>` resolve / `auto_invoke` 注入の本実装。本チケットはその ingest 経路を増やすだけで、Workflow 側の意味論には手を入れない
+- `tickets/workflow.md` — Workflow loader / `/<slug>` resolve / `model_invokation` 注入の本実装。本チケットはその ingest 経路を増やすだけで、Workflow 側の意味論には手を入れない
 
 ## 方針
 
@@ -55,7 +55,7 @@ SKILL.md frontmatter:
 |---|---|---|
 | `name` | （ファイル名 = slug として扱う） | `name` がディレクトリ名と一致することは仕様上の不変。slug としてはディレクトリ名を使用 |
 | `description` | `description` | そのまま |
-| —             | `auto_invoke` | **`true` 固定**。agentskills の progressive disclosure（メタデータ常時注入）と整合 |
+| —             | `model_invokation` | **`true` 固定**。agentskills の progressive disclosure（メタデータ常時注入）と整合 |
 | —             | `user_invocable` | **`true` 固定** |
 | —             | `requires` | **空配列**。SKILL 側に概念がない |
 | `license` / `compatibility` / `metadata` | — | 保持はするが Workflow 実行には影響しない |

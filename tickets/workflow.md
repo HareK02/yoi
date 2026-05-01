@@ -14,7 +14,7 @@ agent-skills (agentskills.io 形式) は本チケットの ingest 経路を再�
 
 - 呼び出し: `/<slug>`、フラットな名前空間、kebab-case
 - 配置: `<workspace_root>/.insomnia/memory/workflow/<slug>.md`（ファイル名 = slug、frontmatter に `name` を持たない）
-- frontmatter: `description` / `auto_invoke` (default OFF) / `user_invocable` (default ON) / `requires: [knowledge-slug, ...]`
+- frontmatter: `description` / `model_invokation` (default OFF) / `user_invocable` (default ON) / `requires: [knowledge-slug, ...]`
 - 実行: `requires` の Knowledge 本文を context に inject してから Workflow 本文を実行
 - 自動書き込み禁止（consolidation の write tool schema に `workflow` カテゴリを含めないことで構造的に担保。Linter で人間にも見える形で再保証）
 
@@ -34,8 +34,8 @@ agent-skills (agentskills.io 形式) は本チケットの ingest 経路を再�
    - `requires` の Knowledge 本文を Knowledge 検索ツールの slug 完全一致経路で取得し、Workflow 本文の前に context へ inject
    - Workflow 本文は Markdown のままサブミット内容として扱う（DSL 化はしない）
 
-3. **`auto_invoke` 注入**
-   - `auto_invoke: true` な Workflow の `description` を通常 Pod の system prompt に常駐注入する。Phase 2 prompt には入れない
+3. **`model_invokation` 注入**
+   - `model_invokation: true` な Workflow の `description` を通常 Pod の system prompt に常駐注入する。Phase 2 prompt には入れない
    - 予算は Knowledge の常駐注入（`memory.md` §retrieval 経路）と合算管理。description 上限は agentskills 準拠の 1024 chars に揃える
 
 4. **Linter ルール**
@@ -55,14 +55,14 @@ agent-skills (agentskills.io 形式) は本チケットの ingest 経路を再�
 
 - `<workspace_root>/.insomnia/memory/workflow/*.md` をロードし、frontmatter 違反は Pod 起動エラーになる
 - `/<slug>` を含む submit が `Segment::WorkflowInvoke` として送られ、Pod 側で `requires` Knowledge を inject した上で本文が実行される
-- `auto_invoke: true` の Workflow description が通常 Pod の system prompt に列挙される
+- `model_invokation: true` の Workflow description が通常 Pod の system prompt に列挙される
 - `user_invocable: false` の Workflow は `/<slug>` 補完候補から除外され、明示呼び出しもエラーになる
 - 単体テストで frontmatter 検証の正常 / 異常系、`requires` 解決、フラグ別の挙動が verify される
 
 ## 実装順序
 
 1. `manifest` または既存 memory クレートに `Workflow` 構造体と `WorkflowDirectoryLoader` を置く。frontmatter パースと検証のみでテスト完結
-2. Pod に Workflow registry を持たせ、`auto_invoke` description の system prompt 注入を組む
+2. Pod に Workflow registry を持たせ、`model_invokation` description の system prompt 注入を組む
 3. `Segment::WorkflowInvoke` の resolver を Pod 側に実装。Knowledge 検索ツールの slug 完全一致経路で `requires` を inject
 4. 汎用 Write/Edit に対する `memory/workflow/` deny を Scope に追加、Linter 仕上げ
 
