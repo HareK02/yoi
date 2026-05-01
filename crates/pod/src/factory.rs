@@ -647,6 +647,7 @@ permission = "write"
             tool_names: Vec::new(),
             agents_md: None,
             resident_knowledge: None,
+            resident_workflows: None,
             prompts: &catalog,
         };
         let rendered = tmpl.render(&ctx).unwrap();

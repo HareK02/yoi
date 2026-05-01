@@ -412,6 +412,7 @@ pub enum ErrorCode {
     NotPaused,
     ProviderError,
     ToolError,
+    InvalidRequest,
     Internal,
 }
 

@@ -15,6 +15,7 @@ pub mod schema;
 pub mod scope;
 pub mod slug;
 pub mod tool;
+pub mod workflow;
 pub mod workspace;
 
 pub use error::{LintError, LintWarning, MemoryError};
@@ -23,4 +24,8 @@ pub use linter::{LintReport, Linter};
 pub use resident::{ResidentKnowledgeEntry, collect_resident_knowledge};
 pub use scope::deny_write_rules;
 pub use slug::Slug;
+pub use workflow::{
+    ResidentWorkflowEntry, WORKFLOW_DESCRIPTION_HARD_CAP, WorkflowLoadError, WorkflowRecord,
+    WorkflowRegistry, load_workflows,
+};
 pub use workspace::WorkspaceLayout;

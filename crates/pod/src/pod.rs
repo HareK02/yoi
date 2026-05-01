@@ -27,6 +27,7 @@ use crate::prompt::loader::PromptLoader;
 use crate::prompt::system::{SystemPromptContext, SystemPromptError, SystemPromptTemplate};
 use crate::runtime::dir;
 use crate::runtime::pod_registry::{self, ScopeAllocationGuard, ScopeLockError};
+use crate::workflow::WorkflowResolveError;
 use async_trait::async_trait;
 use llm_worker::interceptor::PreRequestAction;
 use protocol::{AlertLevel, AlertSource, Event, Segment};
@@ -124,6 +125,12 @@ pub struct Pod<C: LlmClient, St: Store> {
     /// [`Self::from_manifest`], or defaults to the builtin pack when a
     /// Pod is constructed through lower-level paths that have no loader.
     prompts: Arc<PromptCatalog>,
+    /// Registry loaded from `<workspace>/.insomnia/memory/workflow/*.md`
+    /// when memory is enabled. Missing memory config keeps this empty.
+    workflow_registry: memory::WorkflowRegistry,
+    /// Memory workspace layout used by the workflow resolver to load required
+    /// Knowledge records by exact slug.
+    memory_layout: Option<memory::WorkspaceLayout>,
     /// When true (default), the system-prompt assembler walks
     /// `<workspace>/knowledge/*` and appends a `## Resident knowledge`
     /// section listing records with `model_invokation: true`.
@@ -200,6 +207,8 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             scope_allocation: None,
             callback_socket: None,
             prompts,
+            workflow_registry: memory::WorkflowRegistry::empty(),
+            memory_layout: None,
             inject_resident_knowledge: true,
             extract_in_flight: Arc::new(AtomicBool::new(false)),
             consolidation_in_flight: Arc::new(AtomicBool::new(false)),
@@ -565,20 +574,28 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         // Owned `Vec` lives for the duration of `render` below; the
         // context borrows a slice into it.
         let resident: Vec<memory::ResidentKnowledgeEntry> = if self.inject_resident_knowledge {
-            self.manifest
-                .memory
+            self.memory_layout
                 .as_ref()
-                .map(|mem| {
-                    let layout = memory::WorkspaceLayout::resolve(mem, &self.pwd);
-                    memory::collect_resident_knowledge(&layout)
-                })
+                .map(memory::collect_resident_knowledge)
                 .unwrap_or_default()
         } else {
             Vec::new()
         };
         let resident_slice: Option<&[memory::ResidentKnowledgeEntry]> =
-            if self.inject_resident_knowledge && self.manifest.memory.is_some() {
+            if self.inject_resident_knowledge && self.memory_layout.is_some() {
                 Some(&resident)
+            } else {
+                None
+            };
+        let resident_workflows: Vec<memory::ResidentWorkflowEntry> =
+            if self.inject_resident_knowledge && self.memory_layout.is_some() {
+                self.workflow_registry.resident_entries()
+            } else {
+                Vec::new()
+            };
+        let resident_workflow_slice: Option<&[memory::ResidentWorkflowEntry]> =
+            if self.inject_resident_knowledge && self.memory_layout.is_some() {
+                Some(&resident_workflows)
             } else {
                 None
             };
@@ -589,6 +606,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             tool_names,
             agents_md: agents_md_read.body,
             resident_knowledge: resident_slice,
+            resident_workflows: resident_workflow_slice,
             prompts: &self.prompts,
         };
         let rendered = template
@@ -636,11 +654,12 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         .await?;
         self.user_segments.push(input.clone());
 
-        // Resolve `@<path>` refs to system messages stashed for the
-        // PodInterceptor to attach right after the user message. Failures
-        // surface as user-facing Alerts and the placeholder remains in
-        // the flattened text so the LLM sees the unresolved intent.
-        let attachments = self.resolve_file_refs(&input);
+        // Resolve `@<path>` refs and `/<slug>` workflow invocations to
+        // system messages stashed for the PodInterceptor to attach right
+        // after the user message. File failures are non-fatal alerts; explicit
+        // workflow invocation failures abort before the Worker sees the turn.
+        let mut attachments = self.resolve_file_refs(&input);
+        attachments.extend(self.resolve_workflow_invocations(&input)?);
         if !attachments.is_empty() {
             *self
                 .pending_attachments
@@ -690,6 +709,63 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         out
     }
 
+    fn resolve_workflow_invocations(
+        &self,
+        segments: &[Segment],
+    ) -> Result<Vec<Item>, WorkflowResolveError> {
+        let Some(layout) = self.memory_layout.as_ref() else {
+            if let Some(slug) = segments.iter().find_map(|seg| match seg {
+                Segment::WorkflowInvoke { slug } => Some(slug.clone()),
+                _ => None,
+            }) {
+                return Err(WorkflowResolveError::NotFound { slug });
+            }
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::new();
+        for seg in segments {
+            let Segment::WorkflowInvoke { slug } = seg else {
+                continue;
+            };
+            let items = crate::workflow::resolve_workflow_invocation(
+                &self.workflow_registry,
+                layout,
+                slug,
+            )?;
+            out.extend(items);
+        }
+        Ok(out)
+    }
+
+    /// Validate explicit workflow invocations without reading dependency
+    /// bodies. Used by the controller before broadcasting `UserMessage` so
+    /// user-invocation errors are returned immediately and never reach the
+    /// Worker or client history.
+    pub fn validate_workflow_invocations(
+        &self,
+        segments: &[Segment],
+    ) -> Result<(), WorkflowResolveError> {
+        for seg in segments {
+            let Segment::WorkflowInvoke { slug } = seg else {
+                continue;
+            };
+            let parsed =
+                memory::Slug::parse(slug.clone()).map_err(WorkflowResolveError::InvalidSlug)?;
+            let record = self
+                .workflow_registry
+                .get(&parsed)
+                .ok_or_else(|| WorkflowResolveError::NotFound { slug: slug.clone() })?;
+            if !record.user_invocable {
+                return Err(WorkflowResolveError::NotUserInvocable { slug: slug.clone() });
+            }
+        }
+        Ok(())
+    }
+
+    pub fn workflow_completions(&self) -> Vec<String> {
+        self.workflow_registry.list_user_invocable("")
+    }
+
     /// Flatten a typed segment list into the single string the Worker
     /// receives as the user message, and emit user-facing alerts for
     /// segments that fall through to placeholder (knowledge / workflow
@@ -711,16 +787,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                         ),
                     );
                 }
-                Segment::WorkflowInvoke { slug } => {
-                    self.alert(
-                        AlertLevel::Warn,
-                        AlertSource::Pod,
-                        format!(
-                            "workflow /{slug} cannot be resolved \
-                             (resolver not yet implemented); passed to LLM as placeholder"
-                        ),
-                    );
-                }
+                Segment::WorkflowInvoke { .. } => {}
                 Segment::Unknown => {
                     self.alert(
                         AlertLevel::Warn,
@@ -1652,7 +1719,10 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         worker.register_tool(memory::tool::write_tool(layout.clone()));
         worker.register_tool(memory::tool::edit_tool(layout.clone()));
         worker.register_tool(memory::tool::memory_query_tool(layout.clone(), query_cfg));
-        worker.register_tool(memory::tool::knowledge_query_tool(layout.clone(), query_cfg));
+        worker.register_tool(memory::tool::knowledge_query_tool(
+            layout.clone(),
+            query_cfg,
+        ));
 
         let tidy = consolidate::collect_tidy_hints(&layout);
         let candidates = consolidate::KnowledgeCandidateReport::empty();
@@ -1809,6 +1879,8 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             scope_allocation: Some(scope_allocation),
             callback_socket: None,
             prompts: common.prompts,
+            workflow_registry: common.workflow_registry,
+            memory_layout: common.memory_layout,
             inject_resident_knowledge: true,
             extract_in_flight: Arc::new(AtomicBool::new(false)),
             consolidation_in_flight: Arc::new(AtomicBool::new(false)),
@@ -1867,6 +1939,8 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             scope_allocation: Some(scope_allocation),
             callback_socket: Some(callback_socket),
             prompts: common.prompts,
+            workflow_registry: common.workflow_registry,
+            memory_layout: common.memory_layout,
             inject_resident_knowledge: true,
             extract_in_flight: Arc::new(AtomicBool::new(false)),
             consolidation_in_flight: Arc::new(AtomicBool::new(false)),
@@ -1977,6 +2051,8 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             scope_allocation: Some(scope_allocation),
             callback_socket: None,
             prompts: common.prompts,
+            workflow_registry: common.workflow_registry,
+            memory_layout: common.memory_layout,
             inject_resident_knowledge: true,
             extract_in_flight: Arc::new(AtomicBool::new(false)),
             consolidation_in_flight: Arc::new(AtomicBool::new(false)),
@@ -2184,6 +2260,12 @@ pub enum PodError {
     #[error("memory Phase 2 lock acquisition failed: {0}")]
     ConsolidationLock(#[source] memory::consolidate::LockError),
 
+    #[error("workflow load failed: {0}")]
+    WorkflowLoad(#[source] memory::WorkflowLoadError),
+
+    #[error("workflow invocation failed: {0}")]
+    WorkflowResolve(#[from] WorkflowResolveError),
+
     #[error("session {session_id} has no entries to restore")]
     SessionEmpty { session_id: SessionId },
 }
@@ -2197,6 +2279,8 @@ struct PodCommon {
     scope: Scope,
     client: Box<dyn LlmClient>,
     prompts: Arc<PromptCatalog>,
+    workflow_registry: memory::WorkflowRegistry,
+    memory_layout: Option<memory::WorkspaceLayout>,
     system_prompt_template: Option<SystemPromptTemplate>,
 }
 
@@ -2223,6 +2307,14 @@ fn prepare_pod_common(
 
     let client = provider::build_client(&manifest.model)?;
     let prompts = PromptCatalog::load(loader, manifest.pod.prompt_pack.as_deref())?;
+    let memory_layout = manifest
+        .memory
+        .as_ref()
+        .map(|mem| memory::WorkspaceLayout::resolve(mem, &pwd));
+    let workflow_registry = match memory_layout.as_ref() {
+        Some(layout) => memory::load_workflows(layout).map_err(PodError::WorkflowLoad)?,
+        None => memory::WorkflowRegistry::empty(),
+    };
 
     let system_prompt_template = if parse_template {
         Some(
@@ -2238,6 +2330,8 @@ fn prepare_pod_common(
         scope,
         client,
         prompts,
+        workflow_registry,
+        memory_layout,
         system_prompt_template,
     })
 }

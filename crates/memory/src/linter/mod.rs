@@ -323,10 +323,9 @@ mod tests {
     fn workflow_write_rejected() {
         let (dir, linter) = workspace();
         let path = dir.path().join(".insomnia/memory/workflow/wf.md");
-        let content = format!(
-            "---\nupdated_at: {now}\ndescription: x\nauto_invoke: false\nuser_invocable: true\n---\nbody",
-            now = iso_now()
-        );
+        let content =
+            "---\ndescription: x\nmodel_invokation: false\nuser_invocable: true\n---\nbody"
+                .to_string();
         let report = linter.lint(&path, &content, WriteMode::Create);
         assert!(
             report
@@ -499,10 +498,7 @@ mod tests {
                 n = iso_now()
             ),
         );
-        let wf = format!(
-            "---\nupdated_at: {n}\ndescription: do thing\nauto_invoke: false\nuser_invocable: true\nrequires: [foo]\n---\nstep 1\n",
-            n = iso_now()
-        );
+        let wf = "---\ndescription: do thing\nmodel_invokation: false\nuser_invocable: true\nrequires: [foo]\n---\nstep 1\n".to_string();
         let report = linter.lint_workflow(&wf);
         assert!(!report.has_errors(), "got errors: {:?}", report.errors);
     }
@@ -510,10 +506,7 @@ mod tests {
     #[test]
     fn workflow_lint_flags_unknown_requires() {
         let (_dir, linter) = workspace();
-        let wf = format!(
-            "---\nupdated_at: {n}\ndescription: x\nauto_invoke: false\nuser_invocable: true\nrequires: [missing-knowledge]\n---\n",
-            n = iso_now()
-        );
+        let wf = "---\ndescription: x\nmodel_invokation: false\nuser_invocable: true\nrequires: [missing-knowledge]\n---\n".to_string();
         let report = linter.lint_workflow(&wf);
         assert!(report.errors.iter().any(|e| matches!(
             e,
@@ -528,10 +521,7 @@ mod tests {
     #[test]
     fn workflow_lint_collects_multiple_unknown_requires() {
         let (_dir, linter) = workspace();
-        let wf = format!(
-            "---\nupdated_at: {n}\ndescription: x\nauto_invoke: false\nuser_invocable: true\nrequires: [a, b, c]\n---\n",
-            n = iso_now()
-        );
+        let wf = "---\ndescription: x\nmodel_invokation: false\nuser_invocable: true\nrequires: [a, b, c]\n---\n".to_string();
         let report = linter.lint_workflow(&wf);
         let unknown_count = report
             .errors

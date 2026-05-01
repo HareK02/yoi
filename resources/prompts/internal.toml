@@ -43,3 +43,12 @@ The following knowledge records are advertised resident. Use the KnowledgeQuery 
 
 {{ entries }}\
 """
+
+resident_workflows_section = """\
+---
+## Resident workflows
+
+The following workflows are advertised resident. Invoke one with /<slug> when its description matches the task.
+
+{{ entries }}\
+"""

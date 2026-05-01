@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use manifest::Scope;
-use memory::ResidentKnowledgeEntry;
+use memory::{ResidentKnowledgeEntry, ResidentWorkflowEntry};
 use minijinja::value::Value;
 use minijinja::{Environment, ErrorKind, UndefinedBehavior};
 use thiserror::Error;
@@ -122,6 +122,7 @@ impl SystemPromptTemplate {
             ctx.scope,
             ctx.agents_md.as_deref(),
             ctx.resident_knowledge,
+            ctx.resident_workflows,
         )
     }
 }
@@ -153,6 +154,10 @@ pub struct SystemPromptContext<'a> {
     /// section entirely (memory disabled, or a Phase 2 worker that opts
     /// out); `Some(&[])` also yields no section.
     pub resident_knowledge: Option<&'a [ResidentKnowledgeEntry]>,
+    /// Resident workflow descriptions from `<workspace>/memory/workflow/*`
+    /// whose frontmatter has `model_invokation: true`. `None` disables the
+    /// section; Phase 2 workers opt out together with resident Knowledge.
+    pub resident_workflows: Option<&'a [ResidentWorkflowEntry]>,
     /// Catalog used to render the fixed trailing section headers.
     /// Passed by reference so callers do not give up ownership across
     /// the short-lived render borrow.
@@ -201,6 +206,7 @@ pub fn append_trailing_section(
     scope: &Scope,
     agents_md: Option<&str>,
     resident_knowledge: Option<&[ResidentKnowledgeEntry]>,
+    resident_workflows: Option<&[ResidentWorkflowEntry]>,
 ) -> Result<String, SystemPromptError> {
     let mut out = String::with_capacity(body.len() + 256);
     out.push_str(body);
@@ -227,6 +233,15 @@ pub fn append_trailing_section(
             out.push('\n');
         }
     }
+    if let Some(entries) = resident_workflows {
+        if !entries.is_empty() {
+            out.push('\n');
+            let formatted = format_resident_workflow_entries(entries);
+            let section = prompts.resident_workflows_section(&formatted)?;
+            out.push_str(section.trim_end_matches(&['\n', ' '][..]));
+            out.push('\n');
+        }
+    }
     // Canonicalise the tail so the emitted prompt has a single form
     // regardless of how individual templates chose to end.
     while out.ends_with('\n') || out.ends_with(' ') {
@@ -238,15 +253,31 @@ pub fn append_trailing_section(
 /// `- <slug>: <description>` per line. Description newlines are folded
 /// to spaces so a single entry stays on one row in the rendered prompt.
 fn format_resident_knowledge_entries(entries: &[ResidentKnowledgeEntry]) -> String {
+    format_resident_entries(
+        entries
+            .iter()
+            .map(|e| (e.slug.as_str(), e.description.as_str())),
+    )
+}
+
+fn format_resident_workflow_entries(entries: &[ResidentWorkflowEntry]) -> String {
+    format_resident_entries(
+        entries
+            .iter()
+            .map(|e| (e.slug.as_str(), e.description.as_str())),
+    )
+}
+
+fn format_resident_entries<'a>(entries: impl Iterator<Item = (&'a str, &'a str)>) -> String {
     let mut out = String::new();
-    for (i, e) in entries.iter().enumerate() {
+    for (i, (slug, description)) in entries.enumerate() {
         if i > 0 {
             out.push('\n');
         }
         out.push_str("- ");
-        out.push_str(&e.slug);
+        out.push_str(slug);
         out.push_str(": ");
-        for ch in e.description.chars() {
+        for ch in description.chars() {
             if ch == '\n' || ch == '\r' {
                 out.push(' ');
             } else {
@@ -300,6 +331,7 @@ mod tests {
             tool_names: tools,
             agents_md,
             resident_knowledge: None,
+            resident_workflows: None,
             prompts: test_prompts(),
         }
     }
@@ -316,6 +348,7 @@ mod tests {
             tool_names: Vec::new(),
             agents_md: None,
             resident_knowledge: Some(resident),
+            resident_workflows: None,
             prompts: test_prompts(),
         }
     }

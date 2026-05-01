@@ -251,19 +251,15 @@ impl PodController {
                 permission: manifest::Permission::Read,
                 recursive: true,
             });
-            let scope_with_bash = manifest::Scope::from_config(&scope_config)
-                .map_err(std::io::Error::other)?;
+            let scope_with_bash =
+                manifest::Scope::from_config(&scope_config).map_err(std::io::Error::other)?;
             let fs = tools::ScopedFs::new(scope_with_bash, pwd_for_tools.clone());
             let tracker = tools::Tracker::new();
             // The same ScopedFs also powers the IPC `ListCompletions`
             // query — keep a clone for the FS view we attach below,
             // since the tools consume `fs` itself.
             fs_for_view = fs.clone();
-            worker.register_tools(tools::builtin_tools(
-                fs,
-                tracker.clone(),
-                bash_output_dir,
-            ));
+            worker.register_tools(tools::builtin_tools(fs, tracker.clone(), bash_output_dir));
 
             // Memory subsystem opt-in. When `[memory]` is present in
             // the manifest, register the memory-specific Read/Write/Edit
@@ -316,6 +312,12 @@ impl PodController {
         shared_state.update_history(pod.worker().history().to_vec());
         shared_state.set_user_segments(pod.user_segments().to_vec());
         shared_state.set_fs_view(crate::fs_view::PodFsView::new(fs_for_view));
+        shared_state.set_workflows(
+            pod.workflow_completions()
+                .into_iter()
+                .map(|slug| crate::shared_state::WorkflowCandidate { slug })
+                .collect(),
+        );
         runtime_dir.write_manifest(&manifest_toml).await?;
         runtime_dir.write_status(&shared_state).await?;
         runtime_dir.write_history(&shared_state).await?;
@@ -360,6 +362,14 @@ impl PodController {
                             });
                             continue;
                         }
+                        let was_paused = status_before == PodStatus::Paused;
+                        if let Err(e) = pod.validate_workflow_invocations(&input) {
+                            let _ = event_tx.send(Event::Error {
+                                code: ErrorCode::InvalidRequest,
+                                message: e.to_string(),
+                            });
+                            continue;
+                        }
                         // Broadcast the accepted user message so every
                         // subscriber (including the submitter) can
                         // render the turn header + user line from a
@@ -369,7 +379,6 @@ impl PodController {
                         let _ = event_tx.send(Event::UserMessage {
                             segments: input.clone(),
                         });
-                        let was_paused = status_before == PodStatus::Paused;
                         shared_state.set_status(PodStatus::Running);
                         let _ = runtime_dir.write_status(&shared_state).await;
 
