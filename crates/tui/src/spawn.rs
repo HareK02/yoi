@@ -268,12 +268,11 @@ async fn wait_for_ready(
     form: &mut Form,
     overlay_toml: &str,
 ) -> Result<SpawnReady, SpawnError> {
-    let (pod_bin, pod_args) = resolve_pod_command();
+    let pod_bin = resolve_pod_command();
     let cwd = std::env::current_dir().map_err(SpawnError::Io)?;
 
     let mut command = Command::new(&pod_bin);
     command
-        .args(&pod_args)
         .arg("--overlay")
         .arg(overlay_toml)
         .current_dir(&cwd)
@@ -375,28 +374,21 @@ fn build_overlay_toml(form: &Form) -> String {
     toml::to_string(&toml::Value::Table(root)).expect("overlay serialisation cannot fail")
 }
 
-/// Resolves the program (and any leading args) used to launch a child Pod.
+/// Resolves the binary used to launch a child Pod. Must point at a
+/// `pod`-compatible executable — the parent reads the child's stderr
+/// directly looking for `INSOMNIA-READY`, so any wrapper that emits
+/// extra lines on stderr will pollute that handshake.
 ///
-/// `INSOMNIA_POD_COMMAND` is split on whitespace so devshells can point it
-/// at e.g. `cargo run -p pod --quiet --`; the first token is the program
-/// and the rest are prepended before `--overlay` and friends.
-fn resolve_pod_command() -> (PathBuf, Vec<String>) {
+/// `INSOMNIA_POD_COMMAND` overrides the lookup (used by tests to inject
+/// a mock binary). Otherwise we defer to `PATH` — missing binary
+/// surfaces as the spawn `io::Error`.
+fn resolve_pod_command() -> PathBuf {
     if let Ok(cmd) = std::env::var("INSOMNIA_POD_COMMAND") {
-        let mut tokens = cmd.split_whitespace();
-        if let Some(program) = tokens.next() {
-            let args = tokens.map(str::to_owned).collect();
-            return (PathBuf::from(program), args);
+        if !cmd.is_empty() {
+            return PathBuf::from(cmd);
         }
     }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let candidate = dir.join("pod");
-            if candidate.is_file() {
-                return (candidate, Vec::new());
-            }
-        }
-    }
-    (PathBuf::from("pod"), Vec::new())
+    PathBuf::from("pod")
 }
 
 struct StderrTail {
