@@ -68,7 +68,11 @@ pub(crate) struct ReasoningConfig {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum InputItem {
-    /// 会話メッセージ。user / assistant / system のいずれか。
+    /// 会話メッセージ。user / assistant / developer のいずれか。
+    /// `Role::System` items は `developer` として投影する（ChatGPT
+    /// backend が `role: "system"` を拒否するため。Codex CLI も
+    /// system 相当の挿入には DeveloperInstructions = `role: "developer"`
+    /// を使う）。
     Message {
         role: &'static str,
         content: Vec<InputContent>,
@@ -104,7 +108,7 @@ pub(crate) enum InputItem {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum InputContent {
-    /// user / system 側のテキスト
+    /// user / developer 側のテキスト
     InputText { text: String },
     /// assistant 側のテキスト
     OutputText { text: String },
@@ -230,7 +234,7 @@ fn convert_items_to_input(items: &[Item]) -> Vec<InputItem> {
                     match role {
                         Role::User => ("user", |t| InputContent::InputText { text: t }),
                         Role::Assistant => ("assistant", |t| InputContent::OutputText { text: t }),
-                        Role::System => ("system", |t| InputContent::InputText { text: t }),
+                        Role::System => ("developer", |t| InputContent::InputText { text: t }),
                     };
                 let parts: Vec<InputContent> = content
                     .iter()
@@ -382,6 +386,28 @@ mod tests {
                 assert_eq!(*role, "user");
                 assert_eq!(content.len(), 1);
                 assert!(matches!(&content[0], InputContent::InputText { text } if text == "hi"));
+            }
+            _ => panic!("expected message"),
+        }
+    }
+
+    #[test]
+    fn system_role_item_is_projected_as_developer() {
+        // ChatGPT backend (codex-oauth) は input[] の `role: "system"` を
+        // "System messages are not allowed" で 400 拒否する。in-conversation
+        // な system note (notify / fs_view auto-read / compaction summary) は
+        // `role: "developer"` として投影し、両 backend で受理されるようにする。
+        let scheme = OpenAIResponsesScheme::new();
+        let req = Request::new()
+            .user("hi")
+            .item(Item::system_message("[notify] hello"));
+        let body = scheme.build_request("gpt-5", &req, &cap_with_reasoning());
+        match &body.input[1] {
+            InputItem::Message { role, content } => {
+                assert_eq!(*role, "developer");
+                assert!(
+                    matches!(&content[0], InputContent::InputText { text } if text == "[notify] hello"),
+                );
             }
             _ => panic!("expected message"),
         }
