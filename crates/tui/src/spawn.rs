@@ -268,11 +268,12 @@ async fn wait_for_ready(
     form: &mut Form,
     overlay_toml: &str,
 ) -> Result<SpawnReady, SpawnError> {
-    let pod_bin = resolve_pod_command();
+    let (pod_bin, pod_args) = resolve_pod_command();
     let cwd = std::env::current_dir().map_err(SpawnError::Io)?;
 
     let mut command = Command::new(&pod_bin);
     command
+        .args(&pod_args)
         .arg("--overlay")
         .arg(overlay_toml)
         .current_dir(&cwd)
@@ -374,21 +375,28 @@ fn build_overlay_toml(form: &Form) -> String {
     toml::to_string(&toml::Value::Table(root)).expect("overlay serialisation cannot fail")
 }
 
-fn resolve_pod_command() -> PathBuf {
+/// Resolves the program (and any leading args) used to launch a child Pod.
+///
+/// `INSOMNIA_POD_COMMAND` is split on whitespace so devshells can point it
+/// at e.g. `cargo run -p pod --quiet --`; the first token is the program
+/// and the rest are prepended before `--overlay` and friends.
+fn resolve_pod_command() -> (PathBuf, Vec<String>) {
     if let Ok(cmd) = std::env::var("INSOMNIA_POD_COMMAND") {
-        if !cmd.is_empty() {
-            return PathBuf::from(cmd);
+        let mut tokens = cmd.split_whitespace();
+        if let Some(program) = tokens.next() {
+            let args = tokens.map(str::to_owned).collect();
+            return (PathBuf::from(program), args);
         }
     }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             let candidate = dir.join("pod");
             if candidate.is_file() {
-                return candidate;
+                return (candidate, Vec::new());
             }
         }
     }
-    PathBuf::from("pod")
+    (PathBuf::from("pod"), Vec::new())
 }
 
 struct StderrTail {

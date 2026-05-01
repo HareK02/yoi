@@ -11,6 +11,7 @@ pkgs.mkShell {
     pkg-config
     openssl
   ];
+  INSOMNIA_POD_COMMAND = "cargo run -p pod --quiet --";
   shellHook = ''
     echo "dev-shell-loaded"
   '';
