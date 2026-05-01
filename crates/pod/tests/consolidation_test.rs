@@ -130,6 +130,26 @@ target = "./"
 permission = "write"
 "#;
 
+const ZERO_THRESHOLDS_TOML: &str = r#"
+[pod]
+name = "test-pod"
+
+[model]
+scheme = "anthropic"
+model_id = "test-model"
+
+[worker]
+max_tokens = 100
+
+[memory]
+consolidation_threshold_files = 0
+consolidation_threshold_bytes = 0
+
+[[scope.allow]]
+target = "./"
+permission = "write"
+"#;
+
 async fn make_pod_with(
     manifest_toml: &str,
     pwd: std::path::PathBuf,
@@ -190,6 +210,30 @@ async fn no_thresholds_is_a_noop() {
         memory::consolidate::list_staging_entries(&layout).len(),
         5
     );
+}
+
+#[tokio::test]
+async fn zero_thresholds_treated_as_disabled() {
+    // Without the `Some(0) → None` collapse, `total_files >= 0` and
+    // `total_bytes >= 0` would always evaluate true and Phase 2 would
+    // fire on every post-run with any staging activity.
+    let pwd = tempfile::tempdir().unwrap();
+    let layout = WorkspaceLayout::new(pwd.path().to_path_buf());
+    write_n_staging(&layout, 5);
+
+    let client = MockClient::new(vec![]);
+    let mut pod = make_pod_with(ZERO_THRESHOLDS_TOML, pwd.path().to_path_buf(), client).await;
+    pod.try_post_run_consolidate()
+        .await
+        .expect("zero thresholds must collapse to disabled, not fire on every staging entry");
+
+    assert_eq!(
+        memory::consolidate::list_staging_entries(&layout).len(),
+        5,
+        "staging must be untouched when both thresholds are zero"
+    );
+    let lock_path = layout.staging_dir().join(".consolidation.lock");
+    assert!(!lock_path.exists(), "no lock should be acquired");
 }
 
 #[tokio::test]

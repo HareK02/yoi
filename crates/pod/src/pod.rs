@@ -1333,7 +1333,9 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         let Some(memory_cfg) = self.manifest.memory.clone() else {
             return Ok(());
         };
-        let Some(threshold) = memory_cfg.extract_threshold else {
+        // `Some(0)` means disabled, same as `None`. Otherwise the
+        // `tokens_since >= 0` comparison would fire on every post-run.
+        let Some(threshold) = memory_cfg.extract_threshold.filter(|n| *n > 0) else {
             return Ok(());
         };
 
@@ -1538,8 +1540,13 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         let Some(memory_cfg) = self.manifest.memory.clone() else {
             return Ok(());
         };
-        let files_threshold = memory_cfg.consolidation_threshold_files;
-        let bytes_threshold = memory_cfg.consolidation_threshold_bytes;
+        // `Some(0)` collapses to `None` — staging count / bytes always
+        // satisfies `>= 0`, which would fire Phase 2 on every post-run.
+        // Treating zero as disabled lines up with `extract_threshold` and
+        // matches the "no threshold ⇒ Phase 2 off" invariant in the
+        // ticket's §Trigger.
+        let files_threshold = memory_cfg.consolidation_threshold_files.filter(|n| *n > 0);
+        let bytes_threshold = memory_cfg.consolidation_threshold_bytes.filter(|n| *n > 0);
         if files_threshold.is_none() && bytes_threshold.is_none() {
             return Ok(());
         }

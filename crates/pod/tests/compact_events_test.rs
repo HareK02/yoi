@@ -368,6 +368,49 @@ async fn compact_resets_extract_pointer_so_phase1_can_fire_again() {
     );
 }
 
+/// `extract_threshold = 0` is treated as "disabled" — without this, a
+/// raw `>=` comparison against `tokens_since` would fire Phase 1 on
+/// every post-run regardless of activity. Mirrors the Phase 2
+/// zero-threshold convention so users have a single way to opt out
+/// without removing the `[memory]` section.
+const EXTRACT_THRESHOLD_ZERO_MANIFEST: &str = r#"
+[pod]
+name = "test-pod"
+pwd = "./"
+
+[model]
+scheme = "anthropic"
+model_id = "test-model"
+
+[worker]
+max_tokens = 100
+
+[memory]
+extract_threshold = 0
+
+[[scope.allow]]
+target = "./"
+permission = "write"
+"#;
+
+#[tokio::test]
+async fn extract_threshold_zero_is_disabled() {
+    // Mock provides exactly one response — the first run. If Phase 1
+    // were treated as "fire on any change" because of `tokens_since >= 0`,
+    // it would call into the extract worker and exhaust the mock.
+    let client = MockClient::new(vec![text_events_with_usage("hi", 1000)]);
+    let mut pod = make_pod_with_manifest(EXTRACT_THRESHOLD_ZERO_MANIFEST, client).await;
+
+    pod.run_text("first").await.unwrap();
+    pod.try_post_run_extract()
+        .await
+        .expect("extract_threshold=0 must skip silently, not fail");
+    assert!(
+        pod.extract_pointer().is_none(),
+        "no extract should have run — pointer must remain None"
+    );
+}
+
 #[tokio::test]
 async fn post_run_compact_failure_broadcasts_start_and_failed() {
     // Only the first run has a response. Compaction will run the
