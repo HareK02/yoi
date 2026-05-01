@@ -187,6 +187,10 @@ pub struct Worker<C: LlmClient, S: WorkerState = Mutable> {
     /// Index of the last stable cache prefix item, set by higher layers.
     /// Plumbed into [`Request::cache_anchor`] at request build time.
     cache_anchor: Option<usize>,
+    /// Conversation-scoped cache key, set by higher layers. Plumbed into
+    /// [`Request::cache_key`] at request build time. Pod 側では
+    /// `SessionId` を渡す。
+    cache_key: Option<String>,
     /// State marker
     _state: PhantomData<S>,
 }
@@ -392,6 +396,14 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
         self.cache_anchor = anchor;
     }
 
+    /// Set the conversation-scoped cache key. Plumbed into each outgoing
+    /// [`Request`] via [`Request::cache_key`] — caching-aware providers
+    /// that scope cache by an explicit key (OpenAI Responses) read it as
+    /// `prompt_cache_key`. Pass `None` to clear.
+    pub fn set_cache_key(&mut self, key: Option<String>) {
+        self.cache_key = key;
+    }
+
     /// Get a mutable reference to the timeline (for additional handler registration)
     pub fn timeline_mut(&mut self) -> &mut Timeline {
         &mut self.timeline
@@ -585,6 +597,7 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
         // if the prune projection trimmed items from the head — keep it
         // in range).
         request.cache_anchor = self.cache_anchor.filter(|&anchor| anchor < context.len());
+        request.cache_key = self.cache_key.clone();
 
         request
     }
@@ -1065,6 +1078,7 @@ impl<C: LlmClient> Worker<C, Mutable> {
             prune_config: None,
             savings_estimator: None,
             cache_anchor: None,
+            cache_key: None,
             _state: PhantomData,
         }
     }
@@ -1321,6 +1335,7 @@ impl<C: LlmClient> Worker<C, Mutable> {
             prune_config: self.prune_config,
             savings_estimator: self.savings_estimator,
             cache_anchor: self.cache_anchor,
+            cache_key: self.cache_key,
             _state: PhantomData,
         }
     }
@@ -1400,6 +1415,7 @@ impl<C: LlmClient> Worker<C, Locked> {
             prune_config: self.prune_config,
             savings_estimator: self.savings_estimator,
             cache_anchor: self.cache_anchor,
+            cache_key: self.cache_key,
             _state: PhantomData,
         }
     }

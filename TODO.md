@@ -5,6 +5,7 @@
 - [ ] Resume 時の Scope claim の改善 → [tickets/resume-scope-claim.md](tickets/resume-scope-claim.md)
 - [ ] Pod CLI: マニフェスト関連フラグの整理 → [tickets/pod-cli-manifest-flags.md](tickets/pod-cli-manifest-flags.md)
 - [ ] OpenAI Responses: sampling パラメータの取り扱い → [tickets/responses-sampling-params.md](tickets/responses-sampling-params.md)
+- [ ] OpenAI Responses: prompt_cache_key 送出 → [tickets/responses-prompt-cache-key.md](tickets/responses-prompt-cache-key.md)
 - [ ] llm-worker のエラー耐性
   - [ ] HTTP transient リトライ → [tickets/llm-worker-transient-retry.md](tickets/llm-worker-transient-retry.md)
   - [ ] ストリーム途中失敗時の継続 → [tickets/llm-worker-stream-continuation.md](tickets/llm-worker-stream-continuation.md)

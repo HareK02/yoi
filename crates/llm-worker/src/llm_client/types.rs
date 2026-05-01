@@ -455,6 +455,14 @@ pub struct Request {
     /// (Anthropic today) can place a long-lived cache breakpoint there.
     /// Providers without prompt caching ignore the field.
     pub cache_anchor: Option<usize>,
+    /// 会話単位の安定キー。`prompt_cache_key` として送られる
+    /// (OpenAI Responses)。ChatGPT backend (codex-oauth) は明示キーが
+    /// 無いと org/project ハッシュ衝突でプロンプトキャッシュが
+    /// ほぼヒットしないため、pod 側で `SessionId` を渡す運用を想定。
+    /// `cache_anchor` と違い名前空間キーであり、`prefix anchor` とは
+    /// 別の概念。`cache_anchor` を読まない provider と同じく、
+    /// `prompt_cache_key` を持たない provider は無視する。
+    pub cache_key: Option<String>,
 }
 
 impl Request {
@@ -532,6 +540,14 @@ impl Request {
     /// Add a stop sequence
     pub fn stop_sequence(mut self, sequence: impl Into<String>) -> Self {
         self.config.stop_sequences.push(sequence.into());
+        self
+    }
+
+    /// Set the conversation cache key.
+    ///
+    /// 詳細は [`Request::cache_key`] のフィールドコメント参照。
+    pub fn cache_key(mut self, key: impl Into<String>) -> Self {
+        self.cache_key = Some(key.into());
         self
     }
 }

@@ -210,6 +210,15 @@ struct ResponsesUsage {
     output_tokens: Option<u64>,
     #[serde(default)]
     total_tokens: Option<u64>,
+    /// `input_tokens` の内訳。`cached_tokens` がプロンプトキャッシュヒット分。
+    #[serde(default)]
+    input_tokens_details: Option<InputTokensDetails>,
+}
+
+#[derive(Debug, Deserialize)]
+struct InputTokensDetails {
+    #[serde(default)]
+    cached_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -270,7 +279,10 @@ pub(crate) fn parse_sse(
                     total_tokens: usage.total_tokens.or_else(|| {
                         Some(usage.input_tokens.unwrap_or(0) + usage.output_tokens.unwrap_or(0))
                     }),
-                    cache_read_input_tokens: None,
+                    cache_read_input_tokens: usage
+                        .input_tokens_details
+                        .and_then(|d| d.cached_tokens),
+                    // Responses API は cache 書き込みを別計上しない（input_tokens に含まれる）
                     cache_creation_input_tokens: None,
                 }));
             }
@@ -554,7 +566,29 @@ mod tests {
             assert_eq!(u.input_tokens, Some(10));
             assert_eq!(u.output_tokens, Some(20));
             assert_eq!(u.total_tokens, Some(30));
+            assert_eq!(u.cache_read_input_tokens, None);
+            assert_eq!(u.cache_creation_input_tokens, None);
         }
+    }
+
+    #[test]
+    fn completed_extracts_cached_tokens_from_input_tokens_details() {
+        let data = r#"{"response":{"usage":{
+            "input_tokens":12345,
+            "input_tokens_details":{"cached_tokens":11000},
+            "output_tokens":50,
+            "total_tokens":12395
+        }}}"#;
+        let (events, _) = run("response.completed", data);
+        let Event::Usage(u) = &events[0] else {
+            panic!("expected usage")
+        };
+        assert_eq!(u.input_tokens, Some(12345));
+        assert_eq!(u.output_tokens, Some(50));
+        assert_eq!(u.total_tokens, Some(12395));
+        assert_eq!(u.cache_read_input_tokens, Some(11000));
+        // OpenAI Responses は cache 書き込みを別計上しない
+        assert_eq!(u.cache_creation_input_tokens, None);
     }
 
     #[test]

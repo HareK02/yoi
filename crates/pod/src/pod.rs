@@ -1195,6 +1195,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             .compact_system()
             .map_err(PodError::PromptCatalog)?;
         let mut summary_worker = Worker::new(summary_client).system_prompt(summary_system_prompt);
+        summary_worker.set_cache_key(Some(self.session_id.to_string()));
 
         // Cumulative input-token meter + interceptor. The meter is bumped
         // from the on_usage callback and read on every pre_llm_request.
@@ -1356,6 +1357,10 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         // can place a durable `cache_control` breakpoint there — our
         // compact layout guarantees history[0] is the summary.
         worker.set_cache_anchor(Some(0));
+        // Re-key the OpenAI Responses prompt cache namespace to the new
+        // session_id so post-compact turns share a key with extract /
+        // consolidate workers running in the same session.
+        worker.set_cache_key(Some(new_session_id.to_string()));
         self.usage_history
             .lock()
             .expect("usage_history poisoned")
@@ -1545,6 +1550,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
 
         let client = self.build_extractor_client(memory_cfg)?;
         let mut extract_worker = Worker::new(client).system_prompt(extract::EXTRACT_SYSTEM_PROMPT);
+        extract_worker.set_cache_key(Some(self.session_id.to_string()));
 
         // Cumulative input-token meter + interceptor (mirror of
         // CompactWorkerInterceptor). Aborts the extract worker if its
@@ -1741,6 +1747,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         };
         let mut worker =
             Worker::new(client).system_prompt(consolidate::CONSOLIDATION_SYSTEM_PROMPT);
+        worker.set_cache_key(Some(self.session_id.to_string()));
 
         let input_so_far = Arc::new(std::sync::atomic::AtomicU64::new(0));
         {
@@ -1905,6 +1912,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
 
         let mut worker = Worker::new(common.client);
         apply_worker_manifest(&mut worker, &manifest.worker);
+        worker.set_cache_key(Some(session_id.to_string()));
 
         let mut pod = Self {
             manifest,
@@ -1965,6 +1973,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
 
         let mut worker = Worker::new(common.client);
         apply_worker_manifest(&mut worker, &manifest.worker);
+        worker.set_cache_key(Some(session_id.to_string()));
 
         let mut pod = Self {
             manifest,
@@ -2052,6 +2061,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
         // overwrite the pieces the session log is authoritative for.
         let mut worker = Worker::new(common.client);
         apply_worker_manifest(&mut worker, &manifest.worker);
+        worker.set_cache_key(Some(session_id.to_string()));
         if let Some(ref prompt) = state.system_prompt {
             worker.set_system_prompt(prompt);
         }

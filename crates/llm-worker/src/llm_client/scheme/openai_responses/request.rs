@@ -50,6 +50,11 @@ pub(crate) struct ResponsesRequest {
     pub temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f32>,
+    /// 会話単位の安定キー。ChatGPT backend (codex-oauth) は明示キーが
+    /// 無いとプロンプトキャッシュがほぼ効かない。pod 側は `SessionId`
+    /// を渡す。`Request::cache_key` が `None` のときはキー自体を送らない。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key: Option<String>,
 }
 
 /// reasoning 制御。
@@ -220,6 +225,7 @@ impl OpenAIResponsesScheme {
             } else {
                 None
             },
+            prompt_cache_key: request.cache_key.clone(),
         }
     }
 }
@@ -528,6 +534,29 @@ mod tests {
         assert!(
             json.get("temperature").is_none() && json.get("top_p").is_none(),
             "temperature/top_p keys must not appear in serialised body, got: {json}"
+        );
+    }
+
+    #[test]
+    fn prompt_cache_key_passed_through_when_set() {
+        let scheme = OpenAIResponsesScheme::new();
+        let req = Request::new().user("hi").cache_key("session-abc");
+        let body = scheme.build_request("gpt-5", &req, &cap_with_reasoning());
+        assert_eq!(body.prompt_cache_key.as_deref(), Some("session-abc"));
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(json["prompt_cache_key"], "session-abc");
+    }
+
+    #[test]
+    fn prompt_cache_key_omitted_when_none() {
+        let scheme = OpenAIResponsesScheme::new();
+        let req = Request::new().user("hi");
+        let body = scheme.build_request("gpt-5", &req, &cap_with_reasoning());
+        assert!(body.prompt_cache_key.is_none());
+        let json = serde_json::to_value(&body).unwrap();
+        assert!(
+            json.get("prompt_cache_key").is_none(),
+            "prompt_cache_key key must not appear in serialised body, got: {json}"
         );
     }
 
