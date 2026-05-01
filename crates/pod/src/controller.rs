@@ -83,7 +83,7 @@ impl PodController {
 
         // Snapshot pod-immutable values needed for tool factories so the
         // mutable worker borrow below doesn't conflict with reads on `pod`.
-        let scope_for_tools = pod.scope().clone();
+        let scope_handle = pod.scope().clone();
         let pwd_for_tools = pod.pwd().to_path_buf();
         let spawner_name = pod.manifest().pod.name.clone();
         let spawner_model = pod.manifest().model.clone();
@@ -230,11 +230,14 @@ impl PodController {
             // touching.
             //
             // Bash spills long outputs to a per-pod subdir under the
-            // runtime dir. We layer a recursive `allow(Read)` rule for
-            // that path on top of the user-facing scope so the agent can
-            // `Read` the saved files without polluting the workspace.
-            // Same approach memory takes for its deny rules: round-trip
-            // through `ScopeConfig` and rebuild via `from_config`.
+            // runtime dir. Push a recursive `allow(Read)` for that path
+            // into the Pod's runtime scope so the agent can `Read` the
+            // saved files without polluting the workspace. The Pod's
+            // SharedScope is the single source of truth — the same
+            // handle backs every ScopedFs (builtin tools, fs_view,
+            // compact worker), and any future scope mutation
+            // (SpawnPod-style revoke, future GrantScope) propagates
+            // through it.
             let bash_output_dir = runtime_dir.path().join("bash-output");
             std::fs::create_dir_all(&bash_output_dir).map_err(|e| {
                 std::io::Error::other(format!(
@@ -242,18 +245,16 @@ impl PodController {
                     bash_output_dir.display()
                 ))
             })?;
-            let mut scope_config = manifest::ScopeConfig {
-                allow: scope_for_tools.allow_rules(),
-                deny: scope_for_tools.deny_rules(),
-            };
-            scope_config.allow.push(manifest::ScopeRule {
-                target: bash_output_dir.clone(),
-                permission: manifest::Permission::Read,
-                recursive: true,
-            });
-            let scope_with_bash = manifest::Scope::from_config(&scope_config)
+            scope_handle
+                .update(|cur| {
+                    cur.with_added_allow_rules([manifest::ScopeRule {
+                        target: bash_output_dir.clone(),
+                        permission: manifest::Permission::Read,
+                        recursive: true,
+                    }])
+                })
                 .map_err(std::io::Error::other)?;
-            let fs = tools::ScopedFs::new(scope_with_bash, pwd_for_tools.clone());
+            let fs = tools::ScopedFs::with_shared_scope(scope_handle.clone(), pwd_for_tools.clone());
             let tracker = tools::Tracker::new();
             // The same ScopedFs also powers the IPC `ListCompletions`
             // query — keep a clone for the FS view we attach below,
@@ -292,6 +293,7 @@ impl PodController {
                 spawned_registry.clone(),
                 self_parent_socket.clone(),
                 spawner_model.clone(),
+                scope_handle.clone(),
             ));
             worker.register_tool(send_to_pod_tool(spawned_registry.clone()));
             worker.register_tool(read_pod_output_tool(spawned_registry.clone()));
@@ -873,7 +875,7 @@ where
         cwd: pod.pwd().display().to_string(),
         provider: provider_name,
         model: model_id,
-        scope_summary: pod.scope().summary(),
+        scope_summary: pod.scope_snapshot().summary(),
         tools: tool_names,
     }
 }

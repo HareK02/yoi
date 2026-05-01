@@ -15,7 +15,7 @@ pub use model::{
 };
 pub use paths::user_manifest_path;
 pub use protocol::{Permission, ScopeRule};
-pub use scope::{Scope, ScopeError};
+pub use scope::{Scope, ScopeError, SharedScope};
 
 use std::collections::HashMap;
 use std::num::NonZeroU32;

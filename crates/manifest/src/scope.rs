@@ -8,6 +8,9 @@
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+use arc_swap::{ArcSwap, Guard};
 
 use crate::{Permission, ScopeConfig, ScopeRule};
 
@@ -182,6 +185,38 @@ impl Scope {
             .map(|r| r.target.as_path())
     }
 
+    /// Build a new [`Scope`] equal to `self` with `extra_allow` appended
+    /// to the allow set. Used by dynamic-scope grow paths
+    /// (e.g. controller adding the bash-output Read rule, future
+    /// external `GrantScope`).
+    pub fn with_added_allow_rules(
+        &self,
+        extra_allow: impl IntoIterator<Item = ScopeRule>,
+    ) -> Result<Self, ScopeError> {
+        let mut config = ScopeConfig {
+            allow: self.allow_rules(),
+            deny: self.deny_rules(),
+        };
+        config.allow.extend(extra_allow);
+        Self::from_config(&config)
+    }
+
+    /// Build a new [`Scope`] equal to `self` with `extra_deny` appended
+    /// to the deny set. Used by dynamic-scope shrink paths
+    /// (e.g. SpawnPod-style delegation that strips Write from the
+    /// spawner without touching its allow rules).
+    pub fn with_added_deny_rules(
+        &self,
+        extra_deny: impl IntoIterator<Item = ScopeRule>,
+    ) -> Result<Self, ScopeError> {
+        let mut config = ScopeConfig {
+            allow: self.allow_rules(),
+            deny: self.deny_rules(),
+        };
+        config.deny.extend(extra_deny);
+        Self::from_config(&config)
+    }
+
     /// Human-readable grouping of allow rules, suitable for embedding in
     /// LLM system prompts. Deny rules are intentionally omitted — they
     /// only cap effective permission and surface them would mislead the
@@ -227,6 +262,81 @@ impl Scope {
             out.pop();
         }
         out
+    }
+}
+
+/// Shared, atomically-swappable view of a [`Scope`].
+///
+/// Built around [`ArcSwap`] so the hot path (permission checks inside
+/// `ScopedFs`) reads the current scope lock-free. Mutators are
+/// serialised by an internal `Mutex` so concurrent `update` calls do
+/// not lose each other's contributions.
+///
+/// All clones share the same underlying state — a `SharedScope` cloned
+/// out to multiple consumers (Pod, ScopedFs, future grant/revoke
+/// callers) sees every update.
+#[derive(Debug, Clone)]
+pub struct SharedScope {
+    inner: Arc<SharedScopeInner>,
+}
+
+#[derive(Debug)]
+struct SharedScopeInner {
+    scope: ArcSwap<Scope>,
+    /// Serialises read-modify-write update transactions so a producer
+    /// can read the current scope, build a derived one, and store it
+    /// without losing concurrent updates.
+    write_lock: Mutex<()>,
+}
+
+impl SharedScope {
+    /// Wrap an owned [`Scope`] in a shared, atomically-swappable handle.
+    pub fn new(scope: Scope) -> Self {
+        Self {
+            inner: Arc::new(SharedScopeInner {
+                scope: ArcSwap::from_pointee(scope),
+                write_lock: Mutex::new(()),
+            }),
+        }
+    }
+
+    /// Snapshot the current scope. Cheap and lock-free; the returned
+    /// guard borrows the live scope for as long as it is held.
+    pub fn load(&self) -> Guard<Arc<Scope>> {
+        self.inner.scope.load()
+    }
+
+    /// Snapshot the current scope into an owned `Arc<Scope>`. Useful
+    /// when the caller needs a value that outlives the load guard
+    /// (e.g. cloning into another struct).
+    pub fn snapshot(&self) -> Arc<Scope> {
+        self.inner.scope.load_full()
+    }
+
+    /// Replace the current scope wholesale. Equivalent to building a
+    /// fresh [`Scope`] from a [`ScopeConfig`] and storing it. Concurrent
+    /// `update` callers in the middle of a read-modify-write will see
+    /// this store reflected on their next iteration if their derived
+    /// scope cannot be built from the now-stale snapshot.
+    pub fn store(&self, scope: Scope) {
+        let _guard = self.inner.write_lock.lock().expect("scope mutex poisoned");
+        self.inner.scope.store(Arc::new(scope));
+    }
+
+    /// Read-modify-write transaction. `f` is called with the current
+    /// scope and returns a derived one (or an error). The internal
+    /// write lock ensures that two concurrent `update` calls see each
+    /// other's results — the second observes the first's output as its
+    /// input.
+    pub fn update<F>(&self, f: F) -> Result<(), ScopeError>
+    where
+        F: FnOnce(&Scope) -> Result<Scope, ScopeError>,
+    {
+        let _guard = self.inner.write_lock.lock().expect("scope mutex poisoned");
+        let current = self.inner.scope.load();
+        let new = f(&current)?;
+        self.inner.scope.store(Arc::new(new));
+        Ok(())
     }
 }
 
@@ -544,5 +654,88 @@ mod tests {
         let scope = Scope::writable(dir.path()).unwrap();
         let deep = dir.path().join("a/b/c/new.txt");
         assert!(scope.is_writable(&deep));
+    }
+
+    #[test]
+    fn with_added_allow_rules_grows_readable_set() {
+        let dir = TempDir::new().unwrap();
+        let extra = TempDir::new().unwrap();
+        let base = Scope::writable(dir.path()).unwrap();
+        assert!(!base.is_readable(&extra.path().join("x")));
+        let extended = base
+            .with_added_allow_rules([ScopeRule {
+                target: extra.path().to_path_buf(),
+                permission: Permission::Read,
+                recursive: true,
+            }])
+            .unwrap();
+        assert!(extended.is_readable(&extra.path().join("x")));
+        assert!(extended.is_writable(&dir.path().join("y")));
+    }
+
+    #[test]
+    fn with_added_deny_rules_demotes_write_to_read() {
+        let dir = TempDir::new().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let base = Scope::writable(dir.path()).unwrap();
+        let demoted = base
+            .with_added_deny_rules([ScopeRule {
+                target: sub.clone(),
+                permission: Permission::Write,
+                recursive: true,
+            }])
+            .unwrap();
+        let f = sub.join("a.txt");
+        assert_eq!(demoted.permission_at(&f), Some(Permission::Read));
+        assert_eq!(
+            demoted.permission_at(&dir.path().join("top.txt")),
+            Some(Permission::Write)
+        );
+    }
+
+    #[test]
+    fn shared_scope_load_returns_current_value() {
+        let dir = TempDir::new().unwrap();
+        let shared = SharedScope::new(Scope::writable(dir.path()).unwrap());
+        assert!(shared.load().is_writable(&dir.path().join("a.txt")));
+    }
+
+    #[test]
+    fn shared_scope_update_replaces_view_atomically() {
+        let dir = TempDir::new().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let shared = SharedScope::new(Scope::writable(dir.path()).unwrap());
+        let target = sub.join("a.txt");
+        assert_eq!(shared.load().permission_at(&target), Some(Permission::Write));
+        shared
+            .update(|cur| {
+                cur.with_added_deny_rules([ScopeRule {
+                    target: sub.clone(),
+                    permission: Permission::Write,
+                    recursive: true,
+                }])
+            })
+            .unwrap();
+        assert_eq!(shared.load().permission_at(&target), Some(Permission::Read));
+    }
+
+    #[test]
+    fn shared_scope_clones_share_state() {
+        let dir = TempDir::new().unwrap();
+        let extra = TempDir::new().unwrap();
+        let a = SharedScope::new(Scope::writable(dir.path()).unwrap());
+        let b = a.clone();
+        assert!(!b.load().is_readable(&extra.path().join("x")));
+        a.update(|cur| {
+            cur.with_added_allow_rules([ScopeRule {
+                target: extra.path().to_path_buf(),
+                permission: Permission::Read,
+                recursive: true,
+            }])
+        })
+        .unwrap();
+        assert!(b.load().is_readable(&extra.path().join("x")));
     }
 }

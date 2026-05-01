@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 
 use llm_worker::tool::{ToolError, ToolOutput};
-use manifest::{AuthRef, ModelManifest, Permission, SchemeKind, ScopeRule};
+use manifest::{AuthRef, ModelManifest, Permission, SchemeKind, Scope, ScopeRule, SharedScope};
 use pod::runtime::dir::{RuntimeDir, SpawnedPodRecord};
 use pod::runtime::pod_registry::{self, LockFileGuard};
 use pod::spawn::registry::SpawnedPodRegistry;
@@ -149,6 +149,14 @@ fn dummy_model() -> ModelManifest {
     }
 }
 
+/// Spawner-side `SharedScope` mirroring the `allow_root` granted by
+/// `setup_spawner`. The tool revokes Write rules from this scope on
+/// successful spawn — tests can `load()` it to assert the
+/// revocation took effect.
+fn shared_scope_for(allow_root: &Path) -> SharedScope {
+    SharedScope::new(Scope::writable(allow_root).unwrap())
+}
+
 fn clear_env() {
     unsafe {
         std::env::remove_var("INSOMNIA_RUNTIME_DIR");
@@ -169,6 +177,7 @@ async fn spawn_pod_delegates_scope_and_sends_run() {
     let received = accept_one_method(listener);
 
     let registry = SpawnedPodRegistry::new(spawner_rd.clone());
+    let spawner_scope = shared_scope_for(allow_root.path());
     let def = spawn_pod_tool(
         "root".into(),
         spawner_socket.clone(),
@@ -177,6 +186,7 @@ async fn spawn_pod_delegates_scope_and_sends_run() {
         registry,
         None,
         dummy_model(),
+        spawner_scope.clone(),
     );
     let (_meta, tool) = def();
 
@@ -189,6 +199,13 @@ async fn spawn_pod_delegates_scope_and_sends_run() {
         }]
     })
     .to_string();
+
+    // Pre-spawn: the spawner can write to the delegated path.
+    assert!(
+        spawner_scope
+            .load()
+            .is_writable(&allow_root.path().join("a.txt"))
+    );
 
     let output: ToolOutput = tool.execute(&input).await.unwrap();
     assert!(
@@ -225,6 +242,15 @@ async fn spawn_pod_delegates_scope_and_sends_run() {
     assert_eq!(records[0].pod_name, "child");
     assert_eq!(records[0].callback_address, spawner_socket);
 
+    // Post-spawn: the spawner's runtime scope has been demoted on the
+    // delegated path. Write is gone, Read remains.
+    let post = spawner_scope.load();
+    assert_eq!(
+        post.permission_at(&allow_root.path().join("a.txt")),
+        Some(Permission::Read),
+        "spawner should still be able to read delegated path"
+    );
+
     clear_env();
 }
 
@@ -239,6 +265,7 @@ async fn spawn_pod_rejects_scope_outside_spawner() {
     point_pod_command_at_true();
 
     let registry = SpawnedPodRegistry::new(spawner_rd);
+    let spawner_scope = shared_scope_for(allow_root.path());
     let def = spawn_pod_tool(
         "root".into(),
         spawner_socket,
@@ -247,6 +274,7 @@ async fn spawn_pod_rejects_scope_outside_spawner() {
         registry,
         None,
         dummy_model(),
+        spawner_scope.clone(),
     );
     let (_meta, tool) = def();
 
@@ -277,6 +305,13 @@ async fn spawn_pod_rejects_scope_outside_spawner() {
     let guard = LockFileGuard::open(&lock_path).unwrap();
     assert!(guard.data().find("child").is_none());
 
+    // Failed spawn must not have demoted the spawner's scope either.
+    assert!(
+        spawner_scope
+            .load()
+            .is_writable(&allow_root.path().join("a.txt"))
+    );
+
     clear_env();
 }
 
@@ -301,6 +336,7 @@ async fn spawn_pod_rolls_back_reservation_when_socket_never_appears() {
     // by running this test alone when iterating.
 
     let registry = SpawnedPodRegistry::new(spawner_rd);
+    let spawner_scope = shared_scope_for(allow_root.path());
     let def = spawn_pod_tool(
         "root".into(),
         spawner_socket,
@@ -309,6 +345,7 @@ async fn spawn_pod_rolls_back_reservation_when_socket_never_appears() {
         registry,
         None,
         dummy_model(),
+        spawner_scope.clone(),
     );
     let (_meta, tool) = def();
 
@@ -339,6 +376,14 @@ async fn spawn_pod_rolls_back_reservation_when_socket_never_appears() {
     assert!(
         guard.data().find("ghost").is_none(),
         "allocation was not rolled back after socket wait timed out"
+    );
+
+    // Spawner's runtime scope must also be untouched — revoke is
+    // performed only after exec_child succeeds.
+    assert!(
+        spawner_scope
+            .load()
+            .is_writable(&allow_root.path().join("a.txt"))
     );
 
     clear_env();

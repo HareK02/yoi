@@ -10,7 +10,10 @@ use llm_worker::{ToolOutputLimits, UsageRecord, Worker, WorkerError, WorkerResul
 use session_store::{EntryHash, SessionId, SessionStartState, Store, StoreError};
 use tracing::{info, warn};
 
-use manifest::{PodManifest, PodManifestConfig, ResolveError, Scope, ScopeError, WorkerManifest};
+use manifest::{
+    PodManifest, PodManifestConfig, ResolveError, Scope, ScopeError, ScopeRule, SharedScope,
+    WorkerManifest,
+};
 
 use crate::compact::state::CompactState;
 use crate::compact::usage_tracker::UsageTracker;
@@ -60,8 +63,11 @@ pub struct Pod<C: LlmClient, St: Store> {
     head_hash: Option<EntryHash>,
     /// Absolute working directory of the Pod.
     pwd: PathBuf,
-    /// Resolved scope — always present.
-    scope: Scope,
+    /// Shared, atomically-swappable view of the Pod's resolved scope.
+    /// Cloned out to `ScopedFs` instances (builtin tools, fs_view,
+    /// compact worker) so scope updates propagate to every consumer
+    /// at the next permission check.
+    scope: SharedScope,
     hook_builder: HookRegistryBuilder,
     interceptor_installed: bool,
     /// Shared compaction state (present when compact_threshold is configured).
@@ -185,7 +191,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             session_id,
             head_hash: None,
             pwd,
-            scope,
+            scope: SharedScope::new(scope),
             hook_builder: HookRegistryBuilder::new(),
             interceptor_installed: false,
             compact_state: None,
@@ -252,9 +258,44 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         &self.pwd
     }
 
-    /// The Pod's directory scope.
-    pub fn scope(&self) -> &Scope {
+    /// The Pod's directory scope, as a shared atomically-swappable
+    /// handle. Clone it to share scope state with another consumer
+    /// (e.g. a tool that needs to mutate scope dynamically).
+    pub fn scope(&self) -> &SharedScope {
         &self.scope
+    }
+
+    /// Snapshot the current scope as an owned `Arc<Scope>`. Subsequent
+    /// scope mutations do not affect the returned snapshot.
+    pub fn scope_snapshot(&self) -> Arc<Scope> {
+        self.scope.snapshot()
+    }
+
+    /// Apply `extra_allow` to the Pod's runtime scope. Future tool
+    /// permission checks (read/write/glob/grep) reflect the broadened
+    /// scope; in-flight tool calls keep the snapshot they captured at
+    /// invocation time.
+    pub fn add_scope_rules(
+        &self,
+        extra_allow: impl IntoIterator<Item = ScopeRule>,
+    ) -> Result<(), ScopeError> {
+        let extra: Vec<ScopeRule> = extra_allow.into_iter().collect();
+        self.scope
+            .update(|cur| cur.with_added_allow_rules(extra.clone()))
+    }
+
+    /// Strip `revoke` rules from the Pod's runtime scope by adding
+    /// matching deny rules. A `Permission::Write` revoke caps effective
+    /// access at `Read` (mirroring the pod-registry `effective_write`
+    /// semantics — Write is the only permission tracked across Pods).
+    /// A `Permission::Read` revoke removes access entirely.
+    pub fn revoke_scope_rules(
+        &self,
+        revoke: impl IntoIterator<Item = ScopeRule>,
+    ) -> Result<(), ScopeError> {
+        let revoke: Vec<ScopeRule> = revoke.into_iter().collect();
+        self.scope
+            .update(|cur| cur.with_added_deny_rules(revoke.clone()))
     }
 
     /// Direct access to the underlying Worker.
@@ -582,10 +623,11 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             } else {
                 None
             };
+        let scope_snapshot = self.scope.snapshot();
         let ctx = SystemPromptContext {
             now: chrono::Utc::now(),
             cwd: &self.pwd,
-            scope: &self.scope,
+            scope: &scope_snapshot,
             tool_names,
             agents_md: agents_md_read.body,
             resident_knowledge: resident_slice,
@@ -667,7 +709,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     /// are skipped — the unresolved placeholder stays in the flattened
     /// user message so the LLM still sees the intent.
     fn resolve_file_refs(&self, segments: &[Segment]) -> Vec<Item> {
-        let view = crate::fs_view::PodFsView::new(tools::ScopedFs::new(
+        let view = crate::fs_view::PodFsView::new(tools::ScopedFs::with_shared_scope(
             self.scope.clone(),
             self.pwd.clone(),
         ));
@@ -1078,7 +1120,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         // with the main Pod (reads go through the same policy) but the
         // Tracker is fresh — compact-time reads must not pollute the
         // main session's recency list, which feeds `default_refs` above.
-        let scoped_fs = tools::ScopedFs::new(self.scope.clone(), self.pwd.clone());
+        let scoped_fs = tools::ScopedFs::with_shared_scope(self.scope.clone(), self.pwd.clone());
         let summary_tracker = tools::Tracker::new();
         let summary_client: Box<dyn LlmClient> = self.build_compactor_client()?;
         let summary_system_prompt = self
@@ -1801,7 +1843,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             session_id,
             head_hash: None,
             pwd: common.pwd,
-            scope: common.scope,
+            scope: SharedScope::new(common.scope),
             hook_builder: HookRegistryBuilder::new(),
             interceptor_installed: false,
             compact_state: None,
@@ -1859,7 +1901,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             session_id,
             head_hash: None,
             pwd: common.pwd,
-            scope: common.scope,
+            scope: SharedScope::new(common.scope),
             hook_builder: HookRegistryBuilder::new(),
             interceptor_installed: false,
             compact_state: None,
@@ -1967,7 +2009,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             session_id,
             head_hash: state.head_hash,
             pwd: common.pwd,
-            scope: common.scope,
+            scope: SharedScope::new(common.scope),
             hook_builder: HookRegistryBuilder::new(),
             interceptor_installed: false,
             compact_state: None,

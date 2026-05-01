@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use manifest::{
     ModelManifest, Permission, PodManifestConfig, PodMetaConfig, ScopeConfig, ScopeRule,
-    WorkerManifestConfig,
+    SharedScope, WorkerManifestConfig,
 };
 use protocol::Method;
 use protocol::stream::JsonLineWriter;
@@ -119,6 +119,14 @@ pub struct SpawnPodTool {
     /// configuration in the manifest cascade. Per-spawn override is
     /// out of scope here (see `tickets/spawn-inherit-provider.md`).
     spawner_model: ModelManifest,
+    /// Spawner's runtime scope. After a successful spawn, the
+    /// `Permission::Write` rules in the delegated scope are revoked
+    /// from the spawner's in-memory view (a `deny(Write, target)` is
+    /// pushed on top, downgrading the spawner's effective access on
+    /// those paths to `Read`). Mirrors the pod-registry's
+    /// `effective_write` semantics: Write is the only permission
+    /// tracked across Pods, so revocation only touches Write.
+    spawner_scope: SharedScope,
 }
 
 impl SpawnPodTool {
@@ -130,6 +138,7 @@ impl SpawnPodTool {
         registry: Arc<SpawnedPodRegistry>,
         parent_socket: Option<PathBuf>,
         spawner_model: ModelManifest,
+        spawner_scope: SharedScope,
     ) -> Self {
         Self {
             spawner_name,
@@ -139,6 +148,7 @@ impl SpawnPodTool {
             registry,
             parent_socket,
             spawner_model,
+            spawner_scope,
         }
     }
 }
@@ -217,6 +227,27 @@ impl Tool for SpawnPodTool {
 
         // Child is live. Post-start errors propagate but do not roll
         // back the scope allocation — the child already owns it.
+        //
+        // Mirror that ownership transfer in the spawner's in-memory
+        // scope: every `Permission::Write` rule in the delegated scope
+        // is shadowed by a `deny(Write, target)` so subsequent tool
+        // calls (Edit/Write) on the delegated paths fail with
+        // `ReadOnly`. Read access is left intact — the registry only
+        // arbitrates Write, and keeping Read lets the spawner observe
+        // the child's intermediate output through Read/Glob/Grep.
+        let revoke_write: Vec<ScopeRule> = scope_allow
+            .iter()
+            .filter(|r| r.permission == Permission::Write)
+            .cloned()
+            .collect();
+        if !revoke_write.is_empty() {
+            self.spawner_scope
+                .update(|cur| cur.with_added_deny_rules(revoke_write.clone()))
+                .map_err(|e| {
+                    ToolError::ExecutionFailed(format!("revoke spawner scope: {e}"))
+                })?;
+        }
+
         send_run(&predicted_socket, &input.task).await?;
 
         let record = SpawnedPodRecord {
@@ -456,6 +487,7 @@ pub fn spawn_pod_tool(
     registry: Arc<SpawnedPodRegistry>,
     parent_socket: Option<PathBuf>,
     spawner_model: ModelManifest,
+    spawner_scope: SharedScope,
 ) -> ToolDefinition {
     Arc::new(move || {
         let schema = schemars::schema_for!(SpawnPodInput);
@@ -471,6 +503,7 @@ pub fn spawn_pod_tool(
             registry.clone(),
             parent_socket.clone(),
             spawner_model.clone(),
+            spawner_scope.clone(),
         ));
         (meta, tool)
     })
