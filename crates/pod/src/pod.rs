@@ -136,6 +136,11 @@ pub struct Pod<C: LlmClient, St: Store> {
     /// the flag survives across `try_post_run_extract` calls without a
     /// `&mut self` race.
     extract_in_flight: Arc<AtomicBool>,
+    /// Phase 2 (memory.consolidation) in-process reentry guard. The
+    /// staging-side `StagingLock` already provides cross-process
+    /// exclusion, but this AtomicBool keeps a careless concurrent caller
+    /// inside the same Pod from racing on the staging snapshot.
+    consolidation_in_flight: Arc<AtomicBool>,
     /// Last completed Phase 1 boundary. `None` means no extract has
     /// run yet on this session — next extract starts from entry 0.
     /// Restored from `RestoredState.extensions` on `restore`, updated
@@ -197,6 +202,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             prompts,
             inject_resident_knowledge: true,
             extract_in_flight: Arc::new(AtomicBool::new(false)),
+            consolidation_in_flight: Arc::new(AtomicBool::new(false)),
             extract_pointer: Mutex::new(None),
             user_segments: Vec::new(),
         };
@@ -1490,6 +1496,173 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
 
         Ok(ExtractDecision::Completed)
     }
+
+    /// Build the LlmClient for the Phase 2 (memory.consolidation) Worker.
+    ///
+    /// Uses `memory.consolidation_model` from manifest if set, otherwise
+    /// clones the main client. Mirrors [`build_extractor_client`].
+    fn build_consolidator_client(
+        &self,
+        memory_cfg: &manifest::MemoryConfig,
+    ) -> Result<Box<dyn LlmClient>, PodError> {
+        if let Some(ref m) = memory_cfg.consolidation_model {
+            let client = provider::build_client(m)?;
+            return Ok(client);
+        }
+        let worker = self.worker.as_ref().expect("worker taken during run");
+        Ok(worker.client().clone_boxed())
+    }
+
+    /// Phase 2 (memory.consolidation) post-run trigger.
+    ///
+    /// Called by the Controller **after** [`try_post_run_extract`] and
+    /// **before** [`try_post_run_compact`]: extract feeds staging, compact
+    /// rewrites history. Phase 2 must consume staging before compact
+    /// reshapes the session.
+    ///
+    /// Behaviour follows `docs/plan/memory.md` §Phase 2 / §並走防止:
+    /// the staging-side `StagingLock` enforces cross-process exclusion;
+    /// `consolidation_in_flight` keeps in-process callers honest. On
+    /// success, the lock is released *with* consumed-id cleanup; on
+    /// worker failure, only the lock file is unlinked so the staging
+    /// entries remain for a future retry.
+    pub async fn try_post_run_consolidate(&mut self) -> Result<(), PodError> {
+        let Some(memory_cfg) = self.manifest.memory.clone() else {
+            return Ok(());
+        };
+        let files_threshold = memory_cfg.consolidation_threshold_files;
+        let bytes_threshold = memory_cfg.consolidation_threshold_bytes;
+        if files_threshold.is_none() && bytes_threshold.is_none() {
+            return Ok(());
+        }
+
+        loop {
+            if self
+                .consolidation_in_flight
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return Ok(());
+            }
+            let result = self
+                .run_consolidate_once(&memory_cfg, files_threshold, bytes_threshold)
+                .await;
+            self.consolidation_in_flight.store(false, Ordering::Release);
+
+            match result {
+                Ok(ConsolidateDecision::Skipped) => return Ok(()),
+                Ok(ConsolidateDecision::Completed) => continue,
+                Err(e) => {
+                    tracing::warn!(error = %e, "Phase 2 consolidation failed");
+                    self.alert(
+                        AlertLevel::Warn,
+                        AlertSource::Pod,
+                        format!("memory Phase 2 consolidation failed: {e}"),
+                    );
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    /// Single consolidation iteration: snapshot staging, decide whether to
+    /// fire, run the worker if so, release the lock and clean up consumed
+    /// IDs.
+    async fn run_consolidate_once(
+        &mut self,
+        memory_cfg: &manifest::MemoryConfig,
+        files_threshold: Option<usize>,
+        bytes_threshold: Option<u64>,
+    ) -> Result<ConsolidateDecision, PodError> {
+        use memory::consolidate;
+
+        let layout = memory::WorkspaceLayout::resolve(memory_cfg, &self.pwd);
+
+        let entries = consolidate::list_staging_entries(&layout);
+        if entries.is_empty() {
+            return Ok(ConsolidateDecision::Skipped);
+        }
+
+        let total_files = entries.len();
+        let total_bytes: u64 = entries.iter().map(|e| e.bytes).sum();
+        let files_hit = files_threshold.is_some_and(|n| total_files >= n);
+        let bytes_hit = bytes_threshold.is_some_and(|n| total_bytes >= n);
+        if !files_hit && !bytes_hit {
+            return Ok(ConsolidateDecision::Skipped);
+        }
+
+        let consumed_ids: Vec<uuid::Uuid> = entries.iter().map(|e| e.id).collect();
+        let lock = match consolidate::StagingLock::acquire(
+            &layout,
+            std::process::id(),
+            self.manifest.pod.name.clone(),
+            consumed_ids,
+        ) {
+            Ok(l) => l,
+            Err(memory::consolidate::LockError::InUse { .. }) => {
+                return Ok(ConsolidateDecision::Skipped);
+            }
+            Err(e) => return Err(PodError::ConsolidationLock(e)),
+        };
+
+        let cap = memory_cfg
+            .consolidation_worker_max_input_tokens
+            .unwrap_or(manifest::defaults::MEMORY_CONSOLIDATION_WORKER_MAX_INPUT_TOKENS);
+        let client = match self.build_consolidator_client(memory_cfg) {
+            Ok(c) => c,
+            Err(e) => {
+                lock.release_only();
+                return Err(e);
+            }
+        };
+        let mut worker =
+            Worker::new(client).system_prompt(consolidate::CONSOLIDATION_SYSTEM_PROMPT);
+
+        let input_so_far = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        {
+            let acc = input_so_far.clone();
+            worker.on_usage(move |event| {
+                if let Some(tokens) = event.input_tokens {
+                    acc.fetch_add(tokens, Ordering::Relaxed);
+                }
+            });
+        }
+        worker.set_interceptor(MemoryConsolidationWorkerInterceptor {
+            input_so_far: input_so_far.clone(),
+            max_input_tokens: cap,
+        });
+
+        // Memory tools are self-contained — they bypass ScopedFs and write
+        // directly under the workspace via WorkspaceLayout. Resident
+        // knowledge injection (`Pod::set_resident_knowledge_injection`) is
+        // a Pod-level concern; this disposable Worker is built without it
+        // by construction, in keeping with `docs/plan/memory.md` §Phase 2
+        // のKnowledgeアクセス (agent pulls knowledge through the search
+        // tool instead of via system-prompt residency).
+        let query_cfg = memory::tool::QueryConfig::from(memory_cfg);
+        worker.register_tool(memory::tool::read_tool(layout.clone()));
+        worker.register_tool(memory::tool::write_tool(layout.clone()));
+        worker.register_tool(memory::tool::edit_tool(layout.clone()));
+        worker.register_tool(memory::tool::memory_query_tool(layout.clone(), query_cfg));
+        worker.register_tool(memory::tool::knowledge_query_tool(layout.clone(), query_cfg));
+
+        let tidy = consolidate::collect_tidy_hints(&layout);
+        let candidates = consolidate::KnowledgeCandidateReport::empty();
+        let input_text =
+            consolidate::build_consolidate_input(&layout, &entries, &tidy, &candidates);
+
+        let run_result = worker.run(input_text).await;
+        match run_result {
+            Ok(_) => {
+                lock.release_with_cleanup(&layout);
+                Ok(ConsolidateDecision::Completed)
+            }
+            Err(e) => {
+                lock.release_only();
+                Err(PodError::Worker(e))
+            }
+        }
+    }
 }
 
 /// Outcome of a single Phase 1 extract iteration. Internal to
@@ -1519,6 +1692,40 @@ impl llm_worker::interceptor::Interceptor for MemoryExtractWorkerInterceptor {
         if self.input_so_far.load(Ordering::Relaxed) > self.max_input_tokens {
             return llm_worker::interceptor::PreRequestAction::Cancel(format!(
                 "Phase 1 extract worker input exceeded {} tokens",
+                self.max_input_tokens
+            ));
+        }
+        llm_worker::interceptor::PreRequestAction::Continue
+    }
+}
+
+/// Outcome of a single Phase 2 consolidation iteration. Internal to
+/// `try_post_run_consolidate` / `run_consolidate_once`.
+enum ConsolidateDecision {
+    /// Either threshold not met, no staging, or another Pod holds the lock.
+    Skipped,
+    /// Consolidation ran. Caller re-evaluates threshold against any
+    /// staging entries that arrived during the run (Coalesce).
+    Completed,
+}
+
+/// Pre-request interceptor for the Phase 2 consolidation worker. Same
+/// shape as the extract interceptor; kept separate so the abort message
+/// names the right subsystem.
+struct MemoryConsolidationWorkerInterceptor {
+    input_so_far: Arc<std::sync::atomic::AtomicU64>,
+    max_input_tokens: u64,
+}
+
+#[async_trait]
+impl llm_worker::interceptor::Interceptor for MemoryConsolidationWorkerInterceptor {
+    async fn pre_llm_request(
+        &self,
+        _context: &mut Vec<Item>,
+    ) -> llm_worker::interceptor::PreRequestAction {
+        if self.input_so_far.load(Ordering::Relaxed) > self.max_input_tokens {
+            return llm_worker::interceptor::PreRequestAction::Cancel(format!(
+                "Phase 2 consolidation worker input exceeded {} tokens",
                 self.max_input_tokens
             ));
         }
@@ -1596,6 +1803,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             prompts: common.prompts,
             inject_resident_knowledge: true,
             extract_in_flight: Arc::new(AtomicBool::new(false)),
+            consolidation_in_flight: Arc::new(AtomicBool::new(false)),
             extract_pointer: Mutex::new(None),
             user_segments: Vec::new(),
         };
@@ -1653,6 +1861,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             prompts: common.prompts,
             inject_resident_knowledge: true,
             extract_in_flight: Arc::new(AtomicBool::new(false)),
+            consolidation_in_flight: Arc::new(AtomicBool::new(false)),
             extract_pointer: Mutex::new(None),
             user_segments: Vec::new(),
         };
@@ -1762,6 +1971,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             prompts: common.prompts,
             inject_resident_knowledge: true,
             extract_in_flight: Arc::new(AtomicBool::new(false)),
+            consolidation_in_flight: Arc::new(AtomicBool::new(false)),
             extract_pointer: Mutex::new(extract_pointer),
             user_segments: state.user_segments,
         };
@@ -1962,6 +2172,9 @@ pub enum PodError {
 
     #[error("memory Phase 1 staging write failed: {0}")]
     ExtractStaging(#[source] memory::extract::StagingError),
+
+    #[error("memory Phase 2 lock acquisition failed: {0}")]
+    ConsolidationLock(#[source] memory::consolidate::LockError),
 
     #[error("session {session_id} has no entries to restore")]
     SessionEmpty { session_id: SessionId },

@@ -85,6 +85,27 @@ pub struct MemoryConfig {
     /// [`defaults::MEMORY_EXTRACT_WORKER_MAX_INPUT_TOKENS`].
     #[serde(default)]
     pub extract_worker_max_input_tokens: Option<u64>,
+    /// Optional model for the Phase 2 (consolidation) worker. When
+    /// `None`, the main pod model is cloned via `clone_boxed()`.
+    /// Reasoning-class models are recommended.
+    #[serde(default)]
+    pub consolidation_model: Option<ModelManifest>,
+    /// Cumulative input-token cap for the consolidation worker's own
+    /// LLM calls. Exceeding this aborts the consolidation run. `None` ⇒
+    /// [`defaults::MEMORY_CONSOLIDATION_WORKER_MAX_INPUT_TOKENS`].
+    #[serde(default)]
+    pub consolidation_worker_max_input_tokens: Option<u64>,
+    /// Phase 2 trigger: file-count threshold of `_staging/`. Phase 2
+    /// fires when the staging directory has at least this many entries.
+    /// Either threshold reaching its limit fires Phase 2 (logical OR).
+    /// `None` for both thresholds ⇒ Phase 2 disabled.
+    #[serde(default)]
+    pub consolidation_threshold_files: Option<usize>,
+    /// Phase 2 trigger: byte-size threshold across all `_staging/`
+    /// entries. Either threshold reaching its limit fires Phase 2.
+    /// `None` for both thresholds ⇒ Phase 2 disabled.
+    #[serde(default)]
+    pub consolidation_threshold_bytes: Option<u64>,
 }
 
 /// Pod metadata.

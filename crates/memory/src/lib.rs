@@ -6,6 +6,7 @@
 //! crate) must not touch these directories — Pod is responsible for
 //! denying them at the Scope level when memory is enabled.
 
+pub mod consolidate;
 pub mod error;
 pub mod extract;
 pub mod linter;
