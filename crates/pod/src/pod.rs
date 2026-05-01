@@ -317,6 +317,14 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             .clone()
     }
 
+    /// Test/diagnostic handle to the Phase 2 in-flight guard. Production
+    /// callers do not need this; tests use it to assert that the reentry
+    /// guard skips an in-progress consolidation without losing data.
+    #[doc(hidden)]
+    pub fn consolidation_in_flight_handle(&self) -> Arc<AtomicBool> {
+        self.consolidation_in_flight.clone()
+    }
+
     /// Shared handle to the cumulative Usage history.
     ///
     /// Callbacks that need live access to the latest measurements (e.g.

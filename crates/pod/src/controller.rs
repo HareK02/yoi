@@ -640,6 +640,14 @@ impl PodController {
                                         format!("post-run memory extract error: {e}"),
                                     );
                                 }
+                                if let Err(e) = pod.try_post_run_consolidate().await {
+                                    tracing::warn!(error = %e, "Post-run memory consolidate error");
+                                    alerter.alert(
+                                        AlertLevel::Warn,
+                                        AlertSource::Pod,
+                                        format!("post-run memory consolidate error: {e}"),
+                                    );
+                                }
                                 if let Err(e) = pod.try_post_run_compact().await {
                                     tracing::warn!(error = %e, "Post-run compaction error");
                                     alerter.alert(

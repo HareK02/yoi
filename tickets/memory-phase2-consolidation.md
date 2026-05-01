@@ -100,3 +100,9 @@ Knowledge 新規作成は「候補レポート掲載の source から派生す�
 - `tickets/memory-search-tools.md`（検索ツール）
 - `tickets/memory-phase1-extract.md`（staging 生産）
 - `tickets/memory-usage-metrics.md`（候補レポート / 保護閾値の供給）
+
+## Review
+
+- 状態: Approve with follow-up
+- レビュー詳細: [./memory-phase2-consolidation.review.md](./memory-phase2-consolidation.review.md)
+- 日付: 2026-05-01

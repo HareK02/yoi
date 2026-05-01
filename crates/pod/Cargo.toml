@@ -24,7 +24,7 @@ minijinja = "2.19.0"
 chrono = "0.4.44"
 include_dir = "0.7.4"
 fs4 = { version = "0.13.1", features = ["sync"] }
-libc = "0.2.185"
+libc = "0.2.186"
 schemars = "1.2.1"
 memory = { version = "0.1.0", path = "../memory" }
 uuid = { version = "1.23.1", features = ["v7"] }

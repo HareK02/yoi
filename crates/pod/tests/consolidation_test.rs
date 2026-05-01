@@ -248,6 +248,85 @@ async fn fires_on_threshold_and_cleans_up_consumed_entries() {
 }
 
 #[tokio::test]
+async fn in_flight_guard_skips_reentry_without_clearing() {
+    use std::sync::atomic::Ordering;
+
+    let pwd = tempfile::tempdir().unwrap();
+    let layout = WorkspaceLayout::new(pwd.path().to_path_buf());
+    write_n_staging(&layout, 2);
+
+    let client = MockClient::new(vec![]);
+    let mut pod = make_pod_with(FILES_THRESHOLD_TOML, pwd.path().to_path_buf(), client.clone()).await;
+
+    // Pre-set the in-flight flag as if another concurrent caller had
+    // entered run_consolidate_once. The CAS at the top of
+    // try_post_run_consolidate must take the early return without
+    // touching staging or the LLM, and must leave the flag intact for
+    // the holder to clear.
+    let in_flight = pod.consolidation_in_flight_handle();
+    in_flight.store(true, Ordering::Release);
+
+    pod.try_post_run_consolidate().await.unwrap();
+
+    assert!(
+        in_flight.load(Ordering::Acquire),
+        "reentry skip must not clear the in-flight flag — that's the holder's job"
+    );
+    assert_eq!(
+        memory::consolidate::list_staging_entries(&layout).len(),
+        2,
+        "staging must remain untouched on reentry skip"
+    );
+    assert_eq!(
+        client.call_count.load(Ordering::SeqCst),
+        0,
+        "no LLM calls should fire on reentry skip"
+    );
+
+    // Sanity: when the flag is cleared, the same pod fires normally and
+    // resets the flag itself (i.e. it isn't accidentally sticky).
+    in_flight.store(false, Ordering::Release);
+    let client2 = MockClient::new(vec![done("ok")]);
+    let mut pod2 = make_pod_with(FILES_THRESHOLD_TOML, pwd.path().to_path_buf(), client2).await;
+    pod2.try_post_run_consolidate().await.unwrap();
+    assert!(
+        !pod2.consolidation_in_flight_handle().load(Ordering::Acquire),
+        "in-flight flag must be cleared after a normal run"
+    );
+}
+
+#[tokio::test]
+async fn coalesce_loop_terminates_with_one_iteration_when_snapshot_drains_staging() {
+    use std::sync::atomic::Ordering;
+
+    // Coalesce semantics from `docs/plan/memory.md` §並走防止: a single
+    // run consumes the snapshot taken at acquire time; the loop
+    // re-evaluates against any post-snapshot Phase 1 additions. With no
+    // concurrent additions, the second iteration sees an empty staging
+    // and bails out — exercised here by counting LLM calls.
+    let pwd = tempfile::tempdir().unwrap();
+    let layout = WorkspaceLayout::new(pwd.path().to_path_buf());
+    write_n_staging(&layout, 4);
+
+    // Provide just one mock response. If the loop wrongly re-enters
+    // run_consolidate_once after Completed, the second sub-worker run
+    // would exhaust the mock and surface as an error.
+    let client = MockClient::new(vec![done("ok")]);
+    let mut pod = make_pod_with(FILES_THRESHOLD_TOML, pwd.path().to_path_buf(), client.clone()).await;
+    pod.try_post_run_consolidate().await.unwrap();
+
+    assert_eq!(
+        client.call_count.load(Ordering::SeqCst),
+        1,
+        "Coalesce must terminate once the staging snapshot is drained — got an extra LLM call"
+    );
+    assert!(
+        memory::consolidate::list_staging_entries(&layout).is_empty(),
+        "staging must be empty after the single iteration"
+    );
+}
+
+#[tokio::test]
 async fn live_lock_held_by_other_pod_skips() {
     let pwd = tempfile::tempdir().unwrap();
     let layout = WorkspaceLayout::new(pwd.path().to_path_buf());

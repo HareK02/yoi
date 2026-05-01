@@ -20,3 +20,7 @@ git worktree add .worktree/<task-name> -n <task-name>
 ## flake.nixの無効化
 
 基本的に、CWDを変更できない場合、.envrcによる自動アクティベートは効かないので無視で構わない。
+
+## 完了時
+
+マージウィンドウからこのスキルがinvokeされた際は、ブランチのマージ・worktreeの削除まで行う。対して、実装者がマージしてクローズしてはならない。
