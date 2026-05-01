@@ -30,12 +30,9 @@ memory = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
 
 [dev-dependencies]
-async-trait = { workspace = true }
 dotenv = "0.15.0"
 futures = { workspace = true }
-session-store = { workspace = true }
 tempfile = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 
 [build-dependencies]
 toml = { workspace = true }
