@@ -1,27 +1,27 @@
-- [ ] Workflow / Skills
-  - [ ] 内部 Worker / 内部 Pod の Workflow 化 → [tickets/internal-worker-workflow.md](tickets/internal-worker-workflow.md)
-  - [ ] Agent Skills を Workflow として ingest → [tickets/agent-skills.md](tickets/agent-skills.md)
-- [ ] パーミッション: パターンベースのツール実行制御 → [tickets/permission-extension-point.md](tickets/permission-extension-point.md)
-- [ ] Resume 時の Scope claim の改善 → [tickets/resume-scope-claim.md](tickets/resume-scope-claim.md)
-- [ ] Pod CLI: マニフェスト関連フラグの整理 → [tickets/pod-cli-manifest-flags.md](tickets/pod-cli-manifest-flags.md)
-- [ ] OpenAI Responses: sampling パラメータの取り扱い → [tickets/responses-sampling-params.md](tickets/responses-sampling-params.md)
-- [ ] OpenAI Responses: prompt_cache_key 送出 → [tickets/responses-prompt-cache-key.md](tickets/responses-prompt-cache-key.md)
-- [ ] llm-worker のエラー耐性
-  - [ ] HTTP transient リトライ → [tickets/llm-worker-transient-retry.md](tickets/llm-worker-transient-retry.md)
-  - [ ] ストリーム途中失敗時の継続 → [tickets/llm-worker-stream-continuation.md](tickets/llm-worker-stream-continuation.md)
-- [ ] ネイティブ GUI クライアント MVP → [tickets/native-gui-mvp.md](tickets/native-gui-mvp.md)
-- [ ] TUI 拡充
-  - [ ] フルスクリーン化によるオーバーホール → [tickets/tui-fullscreen-overhaul.md](tickets/tui-fullscreen-overhaul.md)
-  - [ ] Run 中の入力キューイング → [tickets/tui-input-queue.md](tickets/tui-input-queue.md)
-  - [ ] ユーザーマニフェストのモデル設定 wizard → [tickets/tui-user-model-setup.md](tickets/tui-user-model-setup.md)
-  - [ ] auto-kick 由来ターンが描画されない → [tickets/tui-pod-event-render.md](tickets/tui-pod-event-render.md)
-- [ ] サブミット入力
-  - [ ] FileRef リゾルバ → [tickets/submit-file-ref-resolver.md](tickets/submit-file-ref-resolver.md)
-- [ ] Manifest: Tool Output / File Upload 上限の分離とデフォルト緩和 → [tickets/manifest-output-upload-limits.md](tickets/manifest-output-upload-limits.md)
-- [ ] メモリ機構
-  - [ ] 使用頻度メトリクス + Knowledge 化候補レポート → [tickets/memory-usage-metrics.md](tickets/memory-usage-metrics.md)
-  - [ ] Phase 2 累積入力トークン上限の撤去 → [tickets/memory-consolidation-drop-input-cap.md](tickets/memory-consolidation-drop-input-cap.md)
-- [ ] セッション内 TODO ツール（注意機構付き） → [tickets/session-todo.md](tickets/session-todo.md)
-- [ ] セッションメトリクス: Extension 経由の汎用計測レーン（最初の利用者は Prune） → [tickets/session-metrics.md](tickets/session-metrics.md)
+- Workflow / Skills
+  - 内部 Worker / 内部 Pod の Workflow 化 → [tickets/internal-worker-workflow.md](tickets/internal-worker-workflow.md)
+  - Agent Skills を Workflow として ingest → [tickets/agent-skills.md](tickets/agent-skills.md)
+- パーミッション: パターンベースのツール実行制御 → [tickets/permission-extension-point.md](tickets/permission-extension-point.md)
+- Resume 時の Scope claim の改善 → [tickets/resume-scope-claim.md](tickets/resume-scope-claim.md)
+- Pod CLI: マニフェスト関連フラグの整理 → [tickets/pod-cli-manifest-flags.md](tickets/pod-cli-manifest-flags.md)
+- OpenAI Responses: sampling パラメータの取り扱い → [tickets/responses-sampling-params.md](tickets/responses-sampling-params.md)
+- OpenAI Responses: prompt_cache_key 送出 → [tickets/responses-prompt-cache-key.md](tickets/responses-prompt-cache-key.md)
+- llm-worker のエラー耐性
+  - HTTP transient リトライ → [tickets/llm-worker-transient-retry.md](tickets/llm-worker-transient-retry.md)
+  - ストリーム途中失敗時の継続 → [tickets/llm-worker-stream-continuation.md](tickets/llm-worker-stream-continuation.md)
+- ネイティブ GUI クライアント MVP → [tickets/native-gui-mvp.md](tickets/native-gui-mvp.md)
+- TUI 拡充
+  - フルスクリーン化によるオーバーホール → [tickets/tui-fullscreen-overhaul.md](tickets/tui-fullscreen-overhaul.md)
+  - Run 中の入力キューイング → [tickets/tui-input-queue.md](tickets/tui-input-queue.md)
+  - ユーザーマニフェストのモデル設定 wizard → [tickets/tui-user-model-setup.md](tickets/tui-user-model-setup.md)
+  - auto-kick 由来ターンが描画されない → [tickets/tui-pod-event-render.md](tickets/tui-pod-event-render.md)
+- サブミット入力
+  - FileRef リゾルバ → [tickets/submit-file-ref-resolver.md](tickets/submit-file-ref-resolver.md)
+- Manifest: Tool Output / File Upload 上限の分離とデフォルト緩和 → [tickets/manifest-output-upload-limits.md](tickets/manifest-output-upload-limits.md)
+- メモリ機構
+  - 使用頻度メトリクス + Knowledge 化候補レポート → [tickets/memory-usage-metrics.md](tickets/memory-usage-metrics.md)
+  - Phase 2 累積入力トークン上限の撤去 → [tickets/memory-consolidation-drop-input-cap.md](tickets/memory-consolidation-drop-input-cap.md)
+- セッション内 TODO ツール（注意機構付き） → [tickets/session-todo.md](tickets/session-todo.md)
+- セッションメトリクス: Extension 経由の汎用計測レーン（最初の利用者は Prune） → [tickets/session-metrics.md](tickets/session-metrics.md)
 - ワークスペースのメモリーをLintするヘッドレスCLI
 - system-reminder 注入機構の汎用化（2件目の利用者が出た時に検討。タグ形式と「履歴を汚さない」原則は session-todo で先行確立）

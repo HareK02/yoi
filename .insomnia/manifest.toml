@@ -1,5 +1,5 @@
 [memory]
-extract_threshold = 20000
+extract_threshold = 50000
 
 consolidation_threshold_files = 10
 # consolidation_threshold_bytes = 0
