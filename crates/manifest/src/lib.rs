@@ -90,11 +90,6 @@ pub struct MemoryConfig {
     /// Reasoning-class models are recommended.
     #[serde(default)]
     pub consolidation_model: Option<ModelManifest>,
-    /// Cumulative input-token cap for the consolidation worker's own
-    /// LLM calls. Exceeding this aborts the consolidation run. `None` ⇒
-    /// [`defaults::MEMORY_CONSOLIDATION_WORKER_MAX_INPUT_TOKENS`].
-    #[serde(default)]
-    pub consolidation_worker_max_input_tokens: Option<u64>,
     /// Phase 2 trigger: file-count threshold of `_staging/`. Phase 2
     /// fires when the staging directory has at least this many entries.
     /// Either threshold reaching its limit fires Phase 2 (logical OR).

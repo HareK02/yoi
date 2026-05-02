@@ -218,9 +218,6 @@ impl MemoryConfig {
                 .extract_worker_max_input_tokens
                 .or(self.extract_worker_max_input_tokens),
             consolidation_model: upper.consolidation_model.or(self.consolidation_model),
-            consolidation_worker_max_input_tokens: upper
-                .consolidation_worker_max_input_tokens
-                .or(self.consolidation_worker_max_input_tokens),
             consolidation_threshold_files: upper
                 .consolidation_threshold_files
                 .or(self.consolidation_threshold_files),

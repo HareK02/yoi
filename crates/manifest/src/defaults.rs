@@ -50,8 +50,3 @@ pub const COMPACT_DEFAULT_REFERENCE_COUNT: usize = 5;
 /// own LLM calls. Exceeding this aborts the extract run.
 /// See [`crate::MemoryConfig::extract_worker_max_input_tokens`].
 pub const MEMORY_EXTRACT_WORKER_MAX_INPUT_TOKENS: u64 = 30_000;
-
-/// Cumulative input-token cap for the memory Phase 2 (consolidation)
-/// worker's own LLM calls. Exceeding this aborts the consolidation run.
-/// See [`crate::MemoryConfig::consolidation_worker_max_input_tokens`].
-pub const MEMORY_CONSOLIDATION_WORKER_MAX_INPUT_TOKENS: u64 = 80_000;

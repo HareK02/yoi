@@ -1735,9 +1735,6 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             Err(e) => return Err(PodError::ConsolidationLock(e)),
         };
 
-        let cap = memory_cfg
-            .consolidation_worker_max_input_tokens
-            .unwrap_or(manifest::defaults::MEMORY_CONSOLIDATION_WORKER_MAX_INPUT_TOKENS);
         let client = match self.build_consolidator_client(memory_cfg) {
             Ok(c) => c,
             Err(e) => {
@@ -1748,20 +1745,6 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         let mut worker =
             Worker::new(client).system_prompt(consolidate::CONSOLIDATION_SYSTEM_PROMPT);
         worker.set_cache_key(Some(self.session_id.to_string()));
-
-        let input_so_far = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        {
-            let acc = input_so_far.clone();
-            worker.on_usage(move |event| {
-                if let Some(tokens) = event.input_tokens {
-                    acc.fetch_add(tokens, Ordering::Relaxed);
-                }
-            });
-        }
-        worker.set_interceptor(MemoryConsolidationWorkerInterceptor {
-            input_so_far: input_so_far.clone(),
-            max_input_tokens: cap,
-        });
 
         // Memory tools are self-contained — they bypass ScopedFs and write
         // directly under the workspace via WorkspaceLayout. Resident
@@ -1841,30 +1824,6 @@ enum ConsolidateDecision {
     /// Consolidation ran. Caller re-evaluates threshold against any
     /// staging entries that arrived during the run (Coalesce).
     Completed,
-}
-
-/// Pre-request interceptor for the Phase 2 consolidation worker. Same
-/// shape as the extract interceptor; kept separate so the abort message
-/// names the right subsystem.
-struct MemoryConsolidationWorkerInterceptor {
-    input_so_far: Arc<std::sync::atomic::AtomicU64>,
-    max_input_tokens: u64,
-}
-
-#[async_trait]
-impl llm_worker::interceptor::Interceptor for MemoryConsolidationWorkerInterceptor {
-    async fn pre_llm_request(
-        &self,
-        _context: &mut Vec<Item>,
-    ) -> llm_worker::interceptor::PreRequestAction {
-        if self.input_so_far.load(Ordering::Relaxed) > self.max_input_tokens {
-            return llm_worker::interceptor::PreRequestAction::Cancel(format!(
-                "Phase 2 consolidation worker input exceeded {} tokens",
-                self.max_input_tokens
-            ));
-        }
-        llm_worker::interceptor::PreRequestAction::Continue
-    }
 }
 
 impl<St: Store> Pod<Box<dyn LlmClient>, St> {
