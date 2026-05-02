@@ -15,7 +15,6 @@
   - [ ] Run 中の入力キューイング → [tickets/tui-input-queue.md](tickets/tui-input-queue.md)
   - [ ] ユーザーマニフェストのモデル設定 wizard → [tickets/tui-user-model-setup.md](tickets/tui-user-model-setup.md)
   - [ ] auto-kick 由来ターンが描画されない → [tickets/tui-pod-event-render.md](tickets/tui-pod-event-render.md)
-- [ ] 子 Pod の PodEvent::TurnEnded が親に届かない → [tickets/pod-event-delivery.md](tickets/pod-event-delivery.md)
 - [ ] サブミット入力
   - [ ] FileRef リゾルバ → [tickets/submit-file-ref-resolver.md](tickets/submit-file-ref-resolver.md)
 - [ ] Manifest: Tool Output / File Upload 上限の分離とデフォルト緩和 → [tickets/manifest-output-upload-limits.md](tickets/manifest-output-upload-limits.md)
@@ -23,5 +22,6 @@
   - [ ] 使用頻度メトリクス + Knowledge 化候補レポート → [tickets/memory-usage-metrics.md](tickets/memory-usage-metrics.md)
   - [ ] Phase 2 累積入力トークン上限の撤去 → [tickets/memory-consolidation-drop-input-cap.md](tickets/memory-consolidation-drop-input-cap.md)
 - [ ] セッション内 TODO ツール（注意機構付き） → [tickets/session-todo.md](tickets/session-todo.md)
+- [ ] セッションメトリクス: Extension 経由の汎用計測レーン（最初の利用者は Prune） → [tickets/session-metrics.md](tickets/session-metrics.md)
 - ワークスペースのメモリーをLintするヘッドレスCLI
 - system-reminder 注入機構の汎用化（2件目の利用者が出た時に検討。タグ形式と「履歴を汚さない」原則は session-todo で先行確立）
