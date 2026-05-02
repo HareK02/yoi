@@ -345,6 +345,10 @@ impl InputBuffer {
         }
     }
 
+    pub fn move_start(&mut self) {
+        self.cursor = 0;
+    }
+
     pub fn move_home(&mut self) {
         while self.cursor > 0 {
             if matches!(self.atoms[self.cursor - 1], Atom::Char('\n')) {
@@ -918,6 +922,14 @@ mod word_motion_tests {
         buf.move_word_left();
         assert_eq!(cursor(&buf), 0);
         buf.move_word_right();
+        assert_eq!(cursor(&buf), 0);
+    }
+
+    #[test]
+    fn move_start_lands_at_beginning_of_buffer() {
+        let mut buf = buf_from("foo\nbar");
+        assert_eq!(cursor(&buf), 7);
+        buf.move_start();
         assert_eq!(cursor(&buf), 0);
     }
 

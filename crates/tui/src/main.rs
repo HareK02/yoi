@@ -376,42 +376,71 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Option<Method> {
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
 
-    // Scroll / navigation (history view).
-    match key.code {
+    // Modifier-key bindings.
+    if let Some(method) = match key.code {
         KeyCode::Up if shift => {
             app.scroll.scroll_up(1);
-            return None;
+            Some(None)
         }
         KeyCode::Down if shift => {
             app.scroll.scroll_down(1);
-            return None;
+            Some(None)
         }
+        KeyCode::Home if ctrl => {
+            app.scroll.to_top();
+            Some(None)
+        }
+        KeyCode::End if ctrl => {
+            app.scroll.to_bottom();
+            Some(None)
+        }
+        KeyCode::Char('[') if ctrl => {
+            app.scroll.jump_prev_turn();
+            Some(None)
+        }
+        KeyCode::Char(']') if ctrl => {
+            app.scroll.jump_next_turn();
+            Some(None)
+        }
+        KeyCode::Char('o') if ctrl => {
+            app.mode = app.mode.cycle();
+            Some(None)
+        }
+        KeyCode::Char('a') if ctrl => {
+            app.move_cursor_start();
+            Some(app.refresh_completion())
+        }
+        KeyCode::Char('c') if ctrl => Some(handle_pause_or_quit(app)),
+        KeyCode::Char('x') if ctrl => Some(if app.running {
+            Some(Method::Cancel)
+        } else {
+            app.push_error("Nothing to cancel (Pod is not running).");
+            None
+        }),
+        KeyCode::Char('d') if ctrl => Some(handle_shutdown(app)),
+        KeyCode::Enter if alt => {
+            app.insert_newline();
+            Some(app.refresh_completion())
+        }
+        _ => None,
+    } {
+        return method;
+    }
+
+    // Unbound Ctrl+Char keys are ignored before the text-input path so
+    // holding Ctrl while typing never inserts control characters.
+    if ctrl && matches!(key.code, KeyCode::Char(_)) {
+        return None;
+    }
+
+    // Scroll / navigation (history view).
+    match key.code {
         KeyCode::PageUp => {
             app.scroll.page_up();
             return None;
         }
         KeyCode::PageDown => {
             app.scroll.page_down();
-            return None;
-        }
-        KeyCode::Home if ctrl => {
-            app.scroll.to_top();
-            return None;
-        }
-        KeyCode::End if ctrl => {
-            app.scroll.to_bottom();
-            return None;
-        }
-        KeyCode::Char('[') if ctrl => {
-            app.scroll.jump_prev_turn();
-            return None;
-        }
-        KeyCode::Char(']') if ctrl => {
-            app.scroll.jump_next_turn();
-            return None;
-        }
-        KeyCode::Char('o') if ctrl => {
-            app.mode = app.mode.cycle();
             return None;
         }
         _ => {}
@@ -463,31 +492,13 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Option<Method> {
     }
 
     match key.code {
-        KeyCode::Char('c') if ctrl => handle_pause_or_quit(app),
-        KeyCode::Char('x') if ctrl => {
-            if app.running {
-                Some(Method::Cancel)
-            } else {
-                app.push_error("Nothing to cancel (Pod is not running).");
-                None
-            }
-        }
-        KeyCode::Char('d') if ctrl => handle_shutdown(app),
         KeyCode::Esc => {
             // Close the popup if it's still showing (covers the
             // request-in-flight case where `is_active()` was false).
             app.cancel_completion();
             None
         }
-        KeyCode::Enter if alt => {
-            app.insert_newline();
-            app.refresh_completion()
-        }
         KeyCode::Enter => app.submit_input(),
-        KeyCode::Backspace if ctrl => {
-            app.delete_word_before();
-            app.refresh_completion()
-        }
         KeyCode::Backspace => {
             app.delete_char_before();
             app.refresh_completion()
@@ -496,16 +507,8 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Option<Method> {
             app.delete_char_after();
             app.refresh_completion()
         }
-        KeyCode::Left if ctrl => {
-            app.move_cursor_word_left();
-            app.refresh_completion()
-        }
         KeyCode::Left => {
             app.move_cursor_left();
-            app.refresh_completion()
-        }
-        KeyCode::Right if ctrl => {
-            app.move_cursor_word_right();
             app.refresh_completion()
         }
         KeyCode::Right => {

@@ -14,6 +14,8 @@
   - [ ] フルスクリーン化によるオーバーホール → [tickets/tui-fullscreen-overhaul.md](tickets/tui-fullscreen-overhaul.md)
   - [ ] Run 中の入力キューイング → [tickets/tui-input-queue.md](tickets/tui-input-queue.md)
   - [ ] ユーザーマニフェストのモデル設定 wizard → [tickets/tui-user-model-setup.md](tickets/tui-user-model-setup.md)
+  - [ ] auto-kick 由来ターンが描画されない → [tickets/tui-pod-event-render.md](tickets/tui-pod-event-render.md)
+- [ ] 子 Pod の PodEvent::TurnEnded が親に届かない → [tickets/pod-event-delivery.md](tickets/pod-event-delivery.md)
 - [ ] サブミット入力
   - [ ] FileRef リゾルバ → [tickets/submit-file-ref-resolver.md](tickets/submit-file-ref-resolver.md)
 - [ ] Manifest: Tool Output / File Upload 上限の分離とデフォルト緩和 → [tickets/manifest-output-upload-limits.md](tickets/manifest-output-upload-limits.md)

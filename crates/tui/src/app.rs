@@ -619,20 +619,14 @@ impl App {
     pub fn delete_char_after(&mut self) {
         self.input.delete_after();
     }
-    pub fn delete_word_before(&mut self) {
-        self.input.delete_word_before();
-    }
     pub fn move_cursor_left(&mut self) {
         self.input.move_left();
     }
     pub fn move_cursor_right(&mut self) {
         self.input.move_right();
     }
-    pub fn move_cursor_word_left(&mut self) {
-        self.input.move_word_left();
-    }
-    pub fn move_cursor_word_right(&mut self) {
-        self.input.move_word_right();
+    pub fn move_cursor_start(&mut self) {
+        self.input.move_start();
     }
     pub fn move_cursor_home(&mut self) {
         self.input.move_home();
