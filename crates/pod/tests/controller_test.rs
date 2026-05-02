@@ -571,6 +571,64 @@ async fn notify_while_idle_auto_starts_turn_and_injects_system_message() {
 }
 
 #[tokio::test]
+async fn pod_event_turn_ended_while_idle_auto_starts_turn_and_injects_system_message() {
+    let client = MockClient::new(simple_text_events());
+    let client_for_assert = client.clone();
+    let pod = make_pod(client).await;
+    let handle = spawn_controller(pod).await;
+    let mut rx = handle.subscribe();
+
+    handle
+        .send(Method::PodEvent(protocol::PodEvent::TurnEnded {
+            pod_name: "child".into(),
+        }))
+        .await
+        .unwrap();
+
+    let mut saw_turn_end = false;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        tokio::select! {
+            event = rx.recv() => {
+                match event {
+                    Ok(Event::TurnEnd { .. }) => { saw_turn_end = true; break; }
+                    Err(_) => break,
+                    _ => {}
+                }
+            }
+            _ = tokio::time::sleep_until(deadline) => break,
+        }
+    }
+    assert!(
+        saw_turn_end,
+        "PodEvent::TurnEnded on idle Pod should auto-start a turn"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(handle.shared_state.get_status(), PodStatus::Idle);
+
+    let requests = client_for_assert.captured_requests();
+    assert_eq!(
+        requests.len(),
+        1,
+        "auto-kick should issue exactly one LLM request"
+    );
+    let last_item_text = requests[0]
+        .items
+        .last()
+        .and_then(|i| i.as_text())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        last_item_text.contains("[Notification]"),
+        "injected system message missing, got: {last_item_text:?}"
+    );
+    assert!(
+        last_item_text.contains("child") && last_item_text.contains("finished a turn"),
+        "rendered TurnEnded text missing, got: {last_item_text:?}"
+    );
+}
+
+#[tokio::test]
 async fn notify_while_running_does_not_emit_already_running_error() {
     let client = MockClient::new(simple_text_events());
     let pod = make_pod(client).await;
@@ -667,6 +725,61 @@ async fn socket_run_receives_events() {
     assert!(saw_turn_start, "should see turn_start via socket");
     assert!(saw_text_delta, "should see text_delta via socket");
     assert!(saw_turn_end, "should see turn_end via socket");
+}
+
+#[tokio::test]
+async fn socket_pod_event_turn_ended_while_idle_auto_starts_turn() {
+    use protocol::stream::{JsonLineReader, JsonLineWriter};
+    use tokio::net::UnixStream;
+
+    let client = MockClient::new(simple_text_events());
+    let pod = make_pod(client).await;
+    let handle = spawn_controller(pod).await;
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let sock_path = handle.runtime_dir.socket_path();
+    let stream = UnixStream::connect(&sock_path).await.unwrap();
+    let (reader, writer) = stream.into_split();
+    let mut reader = JsonLineReader::new(reader);
+    let mut writer = JsonLineWriter::new(writer);
+
+    writer
+        .write(&Method::PodEvent(protocol::PodEvent::TurnEnded {
+            pod_name: "child".into(),
+        }))
+        .await
+        .unwrap();
+
+    let mut saw_turn_start = false;
+    let mut saw_turn_end = false;
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        tokio::select! {
+            event = reader.next::<Event>() => {
+                match event {
+                    Ok(Some(Event::TurnStart { .. })) => saw_turn_start = true,
+                    Ok(Some(Event::TurnEnd { .. })) => {
+                        saw_turn_end = true;
+                        break;
+                    }
+                    Ok(None) | Err(_) => break,
+                    _ => {}
+                }
+            }
+            _ = tokio::time::sleep_until(deadline) => break,
+        }
+    }
+
+    assert!(
+        saw_turn_start,
+        "PodEvent::TurnEnded via socket should auto-start a turn"
+    );
+    assert!(
+        saw_turn_end,
+        "auto-triggered turn should reach turn_end via socket"
+    );
 }
 
 #[tokio::test]

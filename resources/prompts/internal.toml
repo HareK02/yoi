@@ -10,6 +10,10 @@
 [prompt]
 compact_system = "{% include \"$insomnia/internal/compact_system\" %}"
 
+memory_extract_system = "{% include \"$insomnia/internal/memory_extract_system\" %}"
+
+memory_consolidation_system = "{% include \"$insomnia/internal/memory_consolidation_system\" %}"
+
 notify_wrapper = """\
 [Notification]
 {{ message }}

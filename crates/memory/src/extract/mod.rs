@@ -4,13 +4,14 @@
 //! 出力を `<workspace>/.insomnia/memory/_staging/<id>.json` に書き出す
 //! ヘルパーを提供する。Pod 側はこのモジュールから:
 //!
-//! - [`EXTRACT_SYSTEM_PROMPT`] を sub-Worker の system prompt に
 //! - [`build_extract_input`] を sub-Worker の最初の user 入力に
 //! - [`write_extracted_tool`] を唯一のツールとして
 //! - [`write_staging`] で受け取った JSON を staging に書き出し
 //!
-//! の順で組み立てる。pointer 永続化（session-store の
-//! `LogEntry::Extension`、domain `"memory.extract"`）は Pod 側が責務を持つ。
+//! の順で組み立てる。system prompt は Pod の `PromptCatalog`
+//! (`PodPrompt::MemoryExtractSystem`) で管理される。pointer 永続化
+//! （session-store の `LogEntry::Extension`、domain `"memory.extract"`）は
+//! Pod 側が責務を持つ。
 //!
 //! 出力 JSON の wrap は [`write_staging`] が `source: { session_id, range }`
 //! を機械付与する形で担当し、LLM には source を推論させない。
@@ -18,7 +19,6 @@
 mod input;
 mod payload;
 mod pointer;
-mod prompt;
 mod staging;
 mod tool;
 
@@ -27,7 +27,6 @@ pub use payload::{
     AttemptEntry, DecisionEntry, DiscussionEntry, ExtractedPayload, RequestEntry, StagingRecord,
 };
 pub use pointer::{ExtractPointerPayload, fold_pointer};
-pub use prompt::EXTRACT_SYSTEM_PROMPT;
 pub use staging::{StagingError, write_staging};
 pub use tool::{ExtractWorkerContext, write_extracted_tool};
 

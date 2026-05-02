@@ -1549,7 +1549,11 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             .unwrap_or(manifest::defaults::MEMORY_EXTRACT_WORKER_MAX_INPUT_TOKENS);
 
         let client = self.build_extractor_client(memory_cfg)?;
-        let mut extract_worker = Worker::new(client).system_prompt(extract::EXTRACT_SYSTEM_PROMPT);
+        let extract_system_prompt = self
+            .prompts
+            .memory_extract_system()
+            .map_err(PodError::PromptCatalog)?;
+        let mut extract_worker = Worker::new(client).system_prompt(extract_system_prompt);
         extract_worker.set_cache_key(Some(self.session_id.to_string()));
 
         // Cumulative input-token meter + interceptor (mirror of
@@ -1742,8 +1746,14 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 return Err(e);
             }
         };
-        let mut worker =
-            Worker::new(client).system_prompt(consolidate::CONSOLIDATION_SYSTEM_PROMPT);
+        let consolidation_system_prompt = match self.prompts.memory_consolidation_system() {
+            Ok(p) => p,
+            Err(e) => {
+                lock.release_only();
+                return Err(PodError::PromptCatalog(e));
+            }
+        };
+        let mut worker = Worker::new(client).system_prompt(consolidation_system_prompt);
         worker.set_cache_key(Some(self.session_id.to_string()));
 
         // Memory tools are self-contained — they bypass ScopedFs and write

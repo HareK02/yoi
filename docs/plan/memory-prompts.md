@@ -17,6 +17,7 @@ memory 関連 prompt は種別を問わず、最低限以下を共有する:
 - **単純 append を優先しない**。既存 record に統合できるなら update を優先する
 - **session 固有の進行状態を書かない**。長期参照価値のある内容だけを memory に残す
 - **既存 docs と重複保存しない**。`AGENTS.md`、`docs/plan/*`、固定運用文書に既にある内容を再保存しない
+- **git で追える事実を memory に書かない**。ticket file の作成・編集、TODO 更新、branch / worktree 操作、commit / merge / push、「commit X で実装した」「ticket Y を作った」「worker Pod を spawn した」等は git diff / log が真実で、memory に写すと陳腐化する。commit ハッシュ・branch 名・worktree パス・ticket file 名・PR 番号と組み合わせないと意味を成さない記録は採用しない
 - **空出力を許容**する。保存価値が無ければ「何も追加しない」を正当な結果として扱う
 
 ### Phase 1: 活動抽出 prompt
@@ -28,6 +29,13 @@ Phase 1 は「派生物を作る」段階ではなく、「起きたことを抽
 - 一回限りの雑談、浅い質問、長期参照価値の薄い進行ログは返さなくてよい
 - 出力は schema 準拠の構造化データのみ。自由文の補足説明で schema 外情報を足さない
 - 対象が無ければ空配列を返す
+
+ノイズ防御として、抽出時点で以下を除外する:
+
+- `attempts`: git で追える操作 (ticket file / TODO 編集、branch / worktree 作成、commit / merge / push、既知 ticket への worker Pod spawn) は除外。残すのは git からは復元できない情報 (ビルド/テスト結果、外部 API 応答、観測されたバグ再現、後段の判断材料となる設計実験結果) に限る
+- `discussions`: 当日中に陳腐化する一過性 triage (「次に着手するチケットはどれか」「いま review すべきか後でか」など) は除外。session を越えて意味を持つ論点 (アーキテクチャの trade-off、恒常的な制約、再来する問い) のみ残す
+- `decisions`: rationale が「この session で X をした」になるものは除外。設計 / 方針 / 取り組み方の根拠でない記録は decision ではなく作業ログ
+- 本文中に commit ハッシュ・branch 名・worktree パス・ticket file 名・PR 番号など陳腐化する identifier を埋め込まない
 
 ### Phase 2: 統合 + 整理 prompt
 
@@ -44,6 +52,11 @@ Phase 2 は既存 `memory/*`、`knowledge/*`、staging を見て、統合 phase 
 統合 phase の追加指示:
 
 - staging の活動ログを decisions / requests / summary / Knowledge update に落とし込む
+- staging の field ごとに宛先を分ける:
+  - `decisions` (staging) → `memory/decisions/`。設計 / 方針 / 取り組み方の判断のみ。「この session で X をした」型は drop
+  - `requests` (staging) → `memory/requests/`
+  - `attempts` (staging) → 既定は drop。memory に `attempts/` フォルダは設けない。複数 attempts に通底する持続的な傾向だけ `summary.md` に 1 行で圧縮する例外あり
+  - `discussions` (staging) → 設計 / 方針に決着していれば `decisions/` に統合、未決着でも問い自体が持続的なら `summary.md` に 1 行、それ以外は drop。`decisions/` に「議論した」だけの未決着メモを作らない
 - Knowledge 新規作成は候補レポート掲載 source 由来に限る（詳細は §Phase 2: Knowledge 書き込み prompt）
 
 整理 phase の追加指示（統合 phase 完了後、余力で実行）:
