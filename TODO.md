@@ -15,6 +15,8 @@
 - Manifest: Tool Output / File Upload 上限の分離とデフォルト緩和 → [tickets/manifest-output-upload-limits.md](tickets/manifest-output-upload-limits.md)
 - メモリ機構
   - 使用頻度メトリクス + Knowledge 化候補レポート → [tickets/memory-usage-metrics.md](tickets/memory-usage-metrics.md)
-- セッション内 TODO ツール（注意機構付き） → [tickets/session-todo.md](tickets/session-todo.md)
+- セッション内 Task ツール
+  - ツール本体（TaskCreate / TaskUpdate / TaskList / TaskGet + 永続化 / compact 跨ぎ） → [tickets/session-todo.md](tickets/session-todo.md)
+  - 注意機構（無アクティビティで `<system-reminder>` ナッジ） → [tickets/session-todo-reminder.md](tickets/session-todo-reminder.md)
 - ワークスペースのメモリーをLintするヘッドレスCLI
 - system-reminder 注入機構の汎用化（2件目の利用者が出た時に検討。タグ形式と「履歴を汚さない」原則は session-todo で先行確立）
