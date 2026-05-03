@@ -39,3 +39,8 @@ cache_creation は「このリクエストで新たにキャッシュに書い�
 - 料金計算・課金表示の追加（あくまで「アップロード量」の意味付け修正）。
 - セッション全体（複数ターン）の累積表示。
 - cache hit 率のような追加指標の表示。
+
+## Review
+- 状態: Approve
+- レビュー詳細: [./tui-upload-tokens-net.review.md](./tui-upload-tokens-net.review.md)
+- 日付: 2026-05-03
