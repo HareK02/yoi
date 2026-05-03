@@ -454,6 +454,28 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         }
     }
 
+    /// Append a metric, swallowing errors so observability writes never
+    /// fail the surrounding turn. On failure the head hash stays put
+    /// (the entry is dropped) and a `Warn` alert + `tracing::warn!` are
+    /// emitted so the failure isn't completely silent.
+    async fn try_record_metric(&mut self, metric: &session_metrics::Metric) {
+        if let Err(err) = session_metrics::record_metric(
+            &self.store,
+            self.session_id,
+            &mut self.head_hash,
+            metric,
+        )
+        .await
+        {
+            warn!(name = %metric.name, error = %err, "failed to record session metric; dropping");
+            self.alert(
+                AlertLevel::Warn,
+                AlertSource::Pod,
+                format!("failed to record metric `{}`: {}", metric.name, err),
+            );
+        }
+    }
+
     /// Broadcast a typed `Event` to connected clients. No-op when no
     /// `event_tx` is attached (tests / direct `Pod::new` usage) or when
     /// no clients are currently subscribed.
@@ -1099,15 +1121,16 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         // Ordered before LlmUsage so that a `prune.fire` and the
         // `prune.post_request` derived from the matching usage record
         // appear in the log close together.
+        //
+        // Metric writes are intentionally non-fatal: a failure here
+        // surfaces as a `Warn` alert + `tracing::warn!` and the loop
+        // continues. Metrics are observability data, not load-bearing
+        // for run correctness, so a transient FS error must not poison
+        // the turn record (`save_delta` / `save_turn_end` already landed
+        // by this point, and `save_run_completed` still needs to land).
         let pending_metrics = self.metrics_tracker.drain();
         for metric in pending_metrics {
-            session_metrics::record_metric(
-                &self.store,
-                self.session_id,
-                &mut self.head_hash,
-                &metric,
-            )
-            .await?;
+            self.try_record_metric(&metric).await;
         }
 
         // Persist any LLM Usage measurements collected during this run.
@@ -1141,13 +1164,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                     .with_value(record.cache_read_tokens as f64)
                     .with_dimension("cache_write_tokens", record.cache_write_tokens.to_string())
                     .with_dimension("history_len", record.history_len.to_string());
-                session_metrics::record_metric(
-                    &self.store,
-                    self.session_id,
-                    &mut self.head_hash,
-                    &metric,
-                )
-                .await?;
+                self.try_record_metric(&metric).await;
             }
             self.usage_history
                 .lock()

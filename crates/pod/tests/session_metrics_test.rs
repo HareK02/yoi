@@ -28,7 +28,9 @@ use llm_worker::llm_client::event::{
 use llm_worker::llm_client::{ClientError, LlmClient, Request};
 use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use session_metrics::{DOMAIN, Metric, metrics_from_extensions};
-use session_store::FsStore;
+use session_store::{
+    EntryHash, FsStore, HashedEntry, LogEntry, SessionId, Store, StoreError, TraceEntry,
+};
 
 use pod::{Pod, PodManifest};
 
@@ -315,6 +317,104 @@ async fn prune_metrics_record_below_min_savings_skip() {
     assert!(metrics.iter().all(|m| m.name != "prune.fire"));
     // No prune.post_request either (no fire to join with).
     assert!(metrics.iter().all(|m| m.name != "prune.post_request"));
+}
+
+/// `Store` wrapper that delegates to an inner `FsStore` for everything
+/// except `LogEntry::Extension { domain: "metrics", .. }` appends, which
+/// it rejects with an `Io` error. Lets us drive the `try_record_metric`
+/// failure path without affecting any other persistence write.
+#[derive(Clone)]
+struct MetricFailingStore {
+    inner: FsStore,
+}
+
+impl Store for MetricFailingStore {
+    async fn append(&self, id: SessionId, entry: &HashedEntry) -> Result<(), StoreError> {
+        if let LogEntry::Extension { domain, .. } = &entry.entry {
+            if domain == DOMAIN {
+                return Err(StoreError::Io(std::io::Error::other("synthetic failure")));
+            }
+        }
+        self.inner.append(id, entry).await
+    }
+    async fn read_all(&self, id: SessionId) -> Result<Vec<HashedEntry>, StoreError> {
+        self.inner.read_all(id).await
+    }
+    async fn list_sessions(&self) -> Result<Vec<SessionId>, StoreError> {
+        self.inner.list_sessions().await
+    }
+    async fn create_session(
+        &self,
+        id: SessionId,
+        entries: &[HashedEntry],
+    ) -> Result<(), StoreError> {
+        self.inner.create_session(id, entries).await
+    }
+    async fn exists(&self, id: SessionId) -> Result<bool, StoreError> {
+        self.inner.exists(id).await
+    }
+    async fn read_head_hash(&self, id: SessionId) -> Result<Option<EntryHash>, StoreError> {
+        self.inner.read_head_hash(id).await
+    }
+    async fn append_trace(&self, id: SessionId, entry: &TraceEntry) -> Result<(), StoreError> {
+        self.inner.append_trace(id, entry).await
+    }
+}
+
+/// Metric write failures are non-fatal: the run still completes, the
+/// session log carries no metric entries (drops), but a `Warn` alert
+/// fires on the alerter so the TUI surface picks it up.
+#[tokio::test]
+async fn metric_write_failure_emits_warn_alert_and_does_not_abort_run() {
+    use protocol::{AlertLevel, AlertSource, Event};
+    use tokio::sync::broadcast;
+
+    let manifest_toml = manifest_toml(1, 1);
+    let manifest = PodManifest::from_toml(&manifest_toml).unwrap();
+    let store_tmp = tempfile::tempdir().unwrap();
+    let inner = FsStore::new(store_tmp.path()).await.unwrap();
+    let store = MetricFailingStore { inner };
+    let pwd_tmp = tempfile::tempdir().unwrap();
+    let pwd = pwd_tmp.path().to_path_buf();
+    let scope = pod::Scope::writable(&pwd).unwrap();
+
+    // Even with a tool registered, this run will only emit
+    // `prune.skip { reason: "no_candidates" }` (one user message,
+    // protected_turns=1 covers everything). That is enough to drive
+    // the failure path: at least one metric attempts to write.
+    let client = MockClient::new(vec![text_response_with_cache("hi", 0, 0)]);
+    let worker = Worker::new(client);
+    let mut pod = Pod::new(manifest, worker, store.clone(), pwd, scope)
+        .await
+        .unwrap();
+
+    let (tx, mut rx) = broadcast::channel::<Event>(64);
+    let alerter = pod::Alerter::new(tx);
+    pod.attach_alerter(alerter);
+
+    let session_id = pod.session_id();
+    // Run completes successfully despite metric failure.
+    pod.run_text("hello").await.unwrap();
+
+    // No metrics ended up in the log (writes were rejected).
+    let state = session_store::restore(&store, session_id).await.unwrap();
+    let metrics = metrics_from_extensions(&state.extensions);
+    assert!(metrics.is_empty(), "metrics must drop on write failure");
+
+    // The alerter saw at least one Warn from AlertSource::Pod.
+    let mut saw_warn = false;
+    while let Ok(ev) = rx.try_recv() {
+        if let Event::Alert(a) = ev {
+            if a.level == AlertLevel::Warn
+                && a.source == AlertSource::Pod
+                && a.message.contains("metric")
+            {
+                saw_warn = true;
+                break;
+            }
+        }
+    }
+    assert!(saw_warn, "expected Warn/Pod alert about metric failure");
 }
 
 /// Sessions that have no metrics in the log restore cleanly: the
