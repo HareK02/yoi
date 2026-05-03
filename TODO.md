@@ -11,6 +11,7 @@
   - Run 中の入力キューイング → [tickets/tui-input-queue.md](tickets/tui-input-queue.md)
   - ユーザーマニフェストのモデル設定 wizard → [tickets/tui-user-model-setup.md](tickets/tui-user-model-setup.md)
   - auto-kick 由来ターンが描画されない → [tickets/tui-pod-event-render.md](tickets/tui-pod-event-render.md)
+  - spawn 失敗時、Pod の stderr 末尾（同名衝突など）が TUI に出ず "pod exited before becoming ready" だけになる
 - Manifest: Tool Output / File Upload 上限の分離とデフォルト緩和 → [tickets/manifest-output-upload-limits.md](tickets/manifest-output-upload-limits.md)
 - メモリ機構
   - 使用頻度メトリクス + Knowledge 化候補レポート → [tickets/memory-usage-metrics.md](tickets/memory-usage-metrics.md)

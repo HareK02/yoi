@@ -75,3 +75,9 @@
 - 設計指針: `CLAUDE.md`
 - 関連: `crates/pod/src/ipc/notify_buffer.rs`、`crates/pod/src/ipc/interceptor.rs`、`crates/pod/src/ipc/event.rs`、`crates/pod/src/controller.rs`（受信ハンドリング）、`crates/llm-worker/src/worker.rs:862, 913, 946`（clone する側）
 - 方針反転対象: `tickets/session-todo-reminder.md`（「履歴を汚さない」前提を本ticketで撤回）
+
+## Review
+- 状態: Approve
+- レビュー詳細: [./notify-history-persist.review.md](./notify-history-persist.review.md)
+- 対象コミット: `e804577 feat: notify-history-persist実装`
+- 日付: 2026-05-03
