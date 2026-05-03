@@ -5,6 +5,15 @@
 - プロンプトはすべて resources/promptsに集約している。管理効率の工場と同時に、ユーザーがオーバーライドする形式でもある。
 - E2E(実プロセスをスポーンさせてのテスト)は未設計。
 
+### LLM コンテキストの加工原則
+
+LLM に投げる context への割り込みは、大きく2種類に分かれる。**前者は許されるが、後者は禁止**。
+
+- **許される**: 既存 history から純粋に再現可能な変換器（pruning、compaction による要約、tool result の content 切り詰め、prompt cache anchor の付与等）。同じ history を入力すれば同じ結果が出る決定的な加工で、history そのものを書き換えるわけでもなく、外から新しい情報を持ち込まない。
+- **禁止**: Pod の現在状態（受信した notification、active な内部キュー、time-of-day、外部イベント等）に基づいて、history に commit せずに context だけに新規 input を差し込むこと。これをやると LLM はそれに反応して history を変化させる一方、トリガーは worker.history に残らないため、次ターン以降「自分がなぜその発言/tool call をしたか」の根拠が消える。resume 時にはさらに露骨に再現不能になる。prompt cache の prefix も毎回ズレる。
+
+新しい input を context に乗せたいなら、必ず先に `worker.history` に append して commit すること。`history.json` への永続化はそこから自動的についてくる。Notify / PodEvent / `<system-reminder>` 系はこの原則で扱う（→ `tickets/notify-history-persist.md`）。
+
 ---
 
 Gitは基本的にすべてユーザーが操作している。書き込みが必要な操作は明示的に許可されない限り行わないこと
