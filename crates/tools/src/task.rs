@@ -4,8 +4,6 @@
 //! is reconstructed on resume by replaying TaskCreate / TaskUpdate tool-call
 //! arguments from persisted history.
 
-use std::collections::HashMap;
-use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -375,77 +373,25 @@ pub fn snapshot_overview(tasks: &[TaskEntry]) -> String {
 }
 
 pub fn render_snapshot(tasks: &[TaskEntry]) -> String {
-    if tasks.is_empty() {
-        return "TaskStore is empty.".to_string();
-    }
-    let mut out = String::new();
-    let _ = writeln!(&mut out, "{}", snapshot_overview(tasks));
-    for task in tasks {
-        let _ = writeln!(
-            &mut out,
-            "\n- taskid: {}\n  status: {}\n  subject: {}\n  description: {}",
-            task.taskid, task.status, task.subject, task.description
-        );
-    }
-    out
+    let snapshot = TaskSnapshot {
+        tasks: tasks.to_vec(),
+    };
+    let json = serde_json::to_string_pretty(&snapshot)
+        .unwrap_or_else(|_| String::from("{\"tasks\":[]}"));
+    format!("{}\n\n```json\n{}\n```\n", snapshot_overview(tasks), json)
 }
 
 fn parse_compact_snapshot_text(text: &str) -> Option<Vec<TaskEntry>> {
     if !text.starts_with("[Session TaskStore snapshot]") {
         return None;
     }
-    let body = text.split_once("\n\n")?.1;
-    parse_rendered_snapshot(body).or_else(|| {
-        if body.contains("TaskStore is empty.") {
-            Some(Vec::new())
-        } else {
-            None
-        }
-    })
-}
-
-fn parse_rendered_snapshot(text: &str) -> Option<Vec<TaskEntry>> {
-    if text.contains("TaskStore is empty.") {
-        return Some(Vec::new());
-    }
-    let mut tasks = Vec::new();
-    let mut current: HashMap<&str, String> = HashMap::new();
-    for line in text.lines() {
-        let line = line.trim_start();
-        if let Some(value) = line.strip_prefix("- taskid: ") {
-            if !current.is_empty() {
-                tasks.push(task_from_fields(&current)?);
-                current.clear();
-            }
-            current.insert("taskid", value.to_string());
-        } else if let Some(value) = line.strip_prefix("status: ") {
-            current.insert("status", value.to_string());
-        } else if let Some(value) = line.strip_prefix("subject: ") {
-            current.insert("subject", value.to_string());
-        } else if let Some(value) = line.strip_prefix("description: ") {
-            current.insert("description", value.to_string());
-        }
-    }
-    if !current.is_empty() {
-        tasks.push(task_from_fields(&current)?);
-    }
-    Some(tasks)
-}
-
-fn task_from_fields(fields: &HashMap<&str, String>) -> Option<TaskEntry> {
-    let status = match fields.get("status")?.as_str() {
-        "pending" => TaskStatus::Pending,
-        "inprogress" => TaskStatus::Inprogress,
-        "completed" => TaskStatus::Completed,
-        "deleted" => TaskStatus::Deleted,
-        _ => return None,
-    };
-    Some(TaskEntry {
-        taskid: fields.get("taskid")?.parse().ok()?,
-        status,
-        subject: fields.get("subject")?.clone(),
-        description: fields.get("description")?.clone(),
-    })
+    let start_marker = "```json\n";
+    let end_marker = "\n```";
+    let start = text.find(start_marker)? + start_marker.len();
+    let rest = &text[start..];
+    let end = rest.find(end_marker)?;
+    let snapshot: TaskSnapshot = serde_json::from_str(&rest[..end]).ok()?;
+    Some(snapshot.tasks)
 }
 
 fn task_create_tool(store: TaskStore) -> ToolDefinition {
@@ -552,7 +498,9 @@ mod tests {
 
         let out = list.execute("{}").await.unwrap();
         assert!(out.summary.contains("1 task(s)"));
-        assert!(out.content.unwrap().contains("taskid: 1"));
+        let content = out.content.unwrap();
+        assert!(content.contains("\"taskid\": 1"));
+        assert!(content.contains("```json"));
     }
 
     #[tokio::test]
@@ -589,11 +537,23 @@ mod tests {
         assert_eq!(tasks[1].status, TaskStatus::Completed);
     }
 
+    /// Wrap snapshot text the way `Pod::try_post_run_compact` does, so tests
+    /// exercise the exact format that goes through the session log.
+    fn wrap_snapshot_system_message(snapshot: &str) -> String {
+        format!(
+            "[Session TaskStore snapshot]\n\n{snapshot}\n\n\
+             This is the complete session task list preserved across compaction. \
+             The following TaskList tool result presents the same state through the tool lane."
+        )
+    }
+
     #[test]
     fn replay_history_uses_compact_snapshot_and_continues_updates() {
-        let snapshot = "[Session TaskStore snapshot]\n\nTaskStore: 1 task(s) (pending: 0, inprogress: 1, completed: 0, deleted: 0)\n\n- taskid: 1\n  status: inprogress\n  subject: kept\n  description: from compact\n";
+        let pre = TaskStore::new();
+        pre.create("kept".into(), "from compact".into());
+        pre.update(1, Some(TaskStatus::Inprogress), None, None).unwrap();
         let history = vec![
-            Item::system_message(snapshot),
+            Item::system_message(wrap_snapshot_system_message(&pre.snapshot_text())),
             Item::tool_call("u1", "TaskUpdate", r#"{"taskid":1,"status":"completed"}"#),
             Item::tool_call(
                 "c2",
@@ -616,13 +576,17 @@ mod tests {
         // preserved verbatim in retained_items, and the snapshot trails them.
         // The trailing snapshot must reset the store to the captured state so
         // pre-compact `TaskCreate`s do not surface as duplicates.
-        let snapshot = "[Session TaskStore snapshot]\n\nTaskStore: 2 task(s) (pending: 0, inprogress: 1, completed: 1, deleted: 0)\n\n- taskid: 1\n  status: completed\n  subject: A\n  description: A-desc\n\n- taskid: 2\n  status: inprogress\n  subject: B\n  description: B-desc\n";
+        let pre = TaskStore::new();
+        pre.create("A".into(), "A-desc".into());
+        pre.update(1, Some(TaskStatus::Completed), None, None).unwrap();
+        pre.create("B".into(), "B-desc".into());
+        pre.update(2, Some(TaskStatus::Inprogress), None, None).unwrap();
         let history = vec![
             Item::tool_call("c1", "TaskCreate", r#"{"subject":"A","description":"A-desc"}"#),
             Item::tool_call("u1", "TaskUpdate", r#"{"taskid":1,"status":"completed"}"#),
             Item::tool_call("c2", "TaskCreate", r#"{"subject":"B","description":"B-desc"}"#),
             Item::tool_call("u2", "TaskUpdate", r#"{"taskid":2,"status":"inprogress"}"#),
-            Item::system_message(snapshot),
+            Item::system_message(wrap_snapshot_system_message(&pre.snapshot_text())),
             Item::tool_call("compact-tasklist", "TaskList", "{}"),
             Item::tool_call(
                 "c3",
@@ -641,5 +605,84 @@ mod tests {
         assert_eq!(tasks[1].status, TaskStatus::Inprogress);
         assert_eq!(tasks[2].taskid, 3);
         assert_eq!(tasks[2].subject, "C");
+    }
+
+    #[test]
+    fn snapshot_round_trips_multiline_subject_and_description() {
+        // Subject / description with embedded newlines and shape-breaking
+        // characters must survive snapshot serialization unchanged.
+        let pre = TaskStore::new();
+        pre.create(
+            "subject with\nembedded newline\n- bullet".into(),
+            "desc:\n  status: not-actually-a-field\n  ```code fence```".into(),
+        );
+        pre.update(1, Some(TaskStatus::Inprogress), None, None).unwrap();
+
+        let history = vec![Item::system_message(wrap_snapshot_system_message(
+            &pre.snapshot_text(),
+        ))];
+        let store = TaskStore::from_history(&history);
+        let tasks = store.list();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].subject, "subject with\nembedded newline\n- bullet");
+        assert_eq!(
+            tasks[0].description,
+            "desc:\n  status: not-actually-a-field\n  ```code fence```"
+        );
+        assert_eq!(tasks[0].status, TaskStatus::Inprogress);
+    }
+
+    #[test]
+    fn synthetic_compact_tasklist_pair_is_well_formed() {
+        // Mirrors `Pod::try_post_run_compact`'s synthetic insertion:
+        // a system snapshot message followed by a TaskList tool_call/tool_result
+        // pair sharing the `compact-tasklist` id. Verify the structural
+        // contract every provider request builder relies on (matched call_id,
+        // tool name, content recoverable to the same TaskStore state).
+        let pre = TaskStore::new();
+        pre.create("plan".into(), "do A then B".into());
+
+        let snapshot_text = pre.snapshot_text();
+        let system = Item::system_message(wrap_snapshot_system_message(&snapshot_text));
+        let call = Item::tool_call("compact-tasklist", "TaskList", "{}");
+        let result = Item::tool_result_with_content(
+            "compact-tasklist",
+            snapshot_overview(&pre.list()),
+            snapshot_text.clone(),
+        );
+
+        // The system message embeds a parseable snapshot.
+        let extracted = system
+            .as_text()
+            .and_then(parse_compact_snapshot_text)
+            .expect("system message should parse as snapshot");
+        assert_eq!(extracted, pre.list());
+
+        // The synthetic call/result pair shares one call_id and carries the
+        // expected tool name + detailed content.
+        match (&call, &result) {
+            (
+                Item::ToolCall {
+                    call_id: c_id,
+                    name,
+                    ..
+                },
+                Item::ToolResult {
+                    call_id: r_id,
+                    content,
+                    ..
+                },
+            ) => {
+                assert_eq!(c_id.as_str(), r_id.as_str());
+                assert_eq!(c_id.as_str(), "compact-tasklist");
+                assert_eq!(name, "TaskList");
+                assert_eq!(content.as_deref(), Some(snapshot_text.as_str()));
+            }
+            other => panic!("unexpected synthetic pair shape: {other:?}"),
+        }
+
+        // Replaying the full triple reconstructs the same TaskStore.
+        let store = TaskStore::from_history(&[system, call, result]);
+        assert_eq!(store.list(), pre.list());
     }
 }
