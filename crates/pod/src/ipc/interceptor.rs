@@ -150,7 +150,7 @@ impl Interceptor for PodInterceptor {
 
         // Internal mechanism: between-requests compaction trigger (safety net).
         if let Some(state) = self.compact_state.as_ref() {
-            if !state.is_disabled() {
+            if !state.is_disabled() && !state.just_compacted() {
                 let current = current_tokens.unwrap_or(0);
                 if state.exceeds_request(current) {
                     info!(

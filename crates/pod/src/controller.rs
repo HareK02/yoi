@@ -133,6 +133,7 @@ impl PodController {
         // Stashed during tool registration below so we can attach a
         // `PodFsView` to the shared state once the latter exists.
         let fs_for_view: tools::ScopedFs;
+        let task_store = pod.task_store();
 
         let scope_change_sink = pod.scope_change_sink();
 
@@ -266,7 +267,12 @@ impl PodController {
             // query — keep a clone for the FS view we attach below,
             // since the tools consume `fs` itself.
             fs_for_view = fs.clone();
-            worker.register_tools(tools::builtin_tools(fs, tracker.clone(), bash_output_dir));
+            worker.register_tools(tools::builtin_tools(
+                fs,
+                tracker.clone(),
+                task_store.clone(),
+                bash_output_dir,
+            ));
 
             // Memory subsystem opt-in. When `[memory]` is present in
             // the manifest, register the memory-specific Read/Write/Edit

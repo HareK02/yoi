@@ -20,6 +20,7 @@
 
 pub mod error;
 pub mod scoped_fs;
+pub mod task;
 pub mod tracker;
 
 mod bash;
@@ -36,6 +37,7 @@ pub use glob::glob_tool;
 pub use grep::grep_tool;
 pub use read::read_tool;
 pub use scoped_fs::ScopedFs;
+pub use task::{TaskEntry, TaskSnapshot, TaskStatus, TaskStore, task_tools};
 pub use tracker::Tracker;
 pub use write::write_tool;
 
@@ -53,14 +55,17 @@ pub use write::write_tool;
 pub fn builtin_tools(
     fs: ScopedFs,
     tracker: Tracker,
+    task_store: TaskStore,
     bash_output_dir: std::path::PathBuf,
 ) -> Vec<llm_worker::tool::ToolDefinition> {
-    vec![
+    let mut defs = vec![
         read_tool(fs.clone(), tracker.clone()),
         write_tool(fs.clone(), tracker.clone()),
         edit_tool(fs.clone(), tracker),
         glob_tool(fs.clone()),
         grep_tool(fs.clone()),
         bash_tool(fs, bash_output_dir),
-    ]
+    ];
+    defs.extend(task_tools(task_store));
+    defs
 }

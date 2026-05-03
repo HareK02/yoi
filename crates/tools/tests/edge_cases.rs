@@ -6,7 +6,7 @@ use llm_worker::tool::{Tool, ToolDefinition};
 use manifest::{Permission, Scope, ScopeConfig, ScopeRule};
 use serde_json::json;
 use tempfile::TempDir;
-use tools::{ScopedFs, Tracker, builtin_tools};
+use tools::{ScopedFs, TaskStore, Tracker, builtin_tools};
 
 struct Registry {
     entries: Vec<(llm_worker::tool::ToolMeta, Arc<dyn Tool>)>,
@@ -43,7 +43,12 @@ fn setup() -> (TempDir, TempDir, Registry) {
     let scope = Scope::from_config(&config).unwrap();
     let fs = ScopedFs::new(scope, dir.path().to_path_buf());
     let tracker = Tracker::new();
-    let reg = Registry::new(builtin_tools(fs, tracker, spill.path().to_path_buf()));
+    let reg = Registry::new(builtin_tools(
+        fs,
+        tracker,
+        TaskStore::new(),
+        spill.path().to_path_buf(),
+    ));
     (dir, spill, reg)
 }
 
