@@ -53,7 +53,6 @@ pub struct App {
     pub current_tool: Option<String>,
     pub input: InputBuffer,
     pub quit: bool,
-    pub shutdown_confirm: Option<std::time::Instant>,
     /// 2-tap guard for `Ctrl-C` when the Pod is not running. First press
     /// records the instant; a second press within the timeout exits the
     /// TUI (the Pod itself stays alive).
@@ -86,7 +85,6 @@ impl App {
             current_tool: None,
             input: InputBuffer::new(),
             quit: false,
-            shutdown_confirm: None,
             quit_confirm: None,
             blocks: Vec::new(),
             scroll: Scroll::default(),

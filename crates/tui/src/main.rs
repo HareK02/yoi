@@ -12,7 +12,6 @@ mod ui;
 use std::io;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::time::Duration;
 
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -201,7 +200,7 @@ async fn run_attach(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let socket_path = resolve_socket(&pod_name, socket_override);
     let mut terminal = enter_fullscreen()?;
-    run(&mut terminal, pod_name, &socket_path, false).await
+    run(&mut terminal, pod_name, &socket_path).await
 }
 
 async fn run_resume() -> Result<(), Box<dyn std::error::Error>> {
@@ -224,30 +223,17 @@ async fn run_spawn(resume_from: Option<SessionId>) -> Result<(), Box<dyn std::er
     let SpawnReady {
         pod_name,
         socket_path,
-        mut child,
-        stderr_drain,
     } = ready;
 
     let mut terminal = enter_fullscreen()?;
-    let result = run(&mut terminal, pod_name, &socket_path, true).await;
+    let result = run(&mut terminal, pod_name, &socket_path).await;
 
-    // Leave alt-screen before reaping the child so any final pod stderr
-    // (drained off-line by `stderr_drain`) cannot collide with the
-    // restored scrollback.
+    // Leave alt-screen explicitly before `main`'s terminal restore path.
     let _ = execute!(
         terminal.backend_mut(),
         DisableMouseCapture,
         LeaveAlternateScreen
     );
-
-    match tokio::time::timeout(Duration::from_secs(3), child.wait()).await {
-        Ok(Ok(_)) => {}
-        _ => {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-        }
-    }
-    stderr_drain.abort();
 
     result
 }
@@ -264,7 +250,6 @@ async fn run(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     pod_name: String,
     socket_path: &std::path::Path,
-    shutdown_pod_on_exit: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut app = App::new(pod_name);
 
@@ -272,7 +257,7 @@ async fn run(
         Ok(mut client) => {
             app.connected = true;
             let _ = client.send(&Method::GetHistory).await;
-            run_loop(terminal, &mut app, client, shutdown_pod_on_exit).await?;
+            run_loop(terminal, &mut app, client).await?;
         }
         Err(e) => {
             app.push_error(format!(
@@ -290,15 +275,11 @@ async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
     mut client: PodClient,
-    shutdown_pod_on_exit: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     terminal.draw(|f| ui::draw(f, app))?;
 
     loop {
         if app.quit {
-            if shutdown_pod_on_exit {
-                let _ = client.send(&Method::Shutdown).await;
-            }
             break;
         }
 
@@ -414,10 +395,12 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Option<Method> {
         KeyCode::Char('x') if ctrl => Some(if app.running {
             Some(Method::Cancel)
         } else {
-            app.push_error("Nothing to cancel (Pod is not running).");
-            None
+            Some(Method::Shutdown)
         }),
-        KeyCode::Char('d') if ctrl => Some(handle_shutdown(app)),
+        KeyCode::Char('d') if ctrl => {
+            app.quit = true;
+            Some(None)
+        }
         KeyCode::Enter if alt => {
             app.insert_newline();
             Some(app.refresh_completion())
@@ -549,21 +532,6 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Option<Method> {
 }
 
 const CONFIRM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
-
-fn handle_shutdown(app: &mut App) -> Option<Method> {
-    if !app.running {
-        return Some(Method::Shutdown);
-    }
-    if let Some(t) = app.shutdown_confirm
-        && t.elapsed() < CONFIRM_TIMEOUT
-    {
-        app.shutdown_confirm = None;
-        return Some(Method::Shutdown);
-    }
-    app.shutdown_confirm = Some(std::time::Instant::now());
-    app.push_error("Turn is running. Press Ctrl-D again to cancel and shut down.");
-    None
-}
 
 /// Running → send `Method::Pause`.
 /// Idle / Paused → 2-tap to quit the TUI (the Pod keeps running).

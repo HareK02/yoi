@@ -3,9 +3,9 @@
 //! Rendered at the user's current cursor position when `tui` is invoked
 //! with no positional argument. Walks the cwd for a `.insomnia/manifest.toml`
 //! to seed defaults, prompts for the Pod's name, and on confirmation
-//! launches the `pod` binary as a subprocess with a freshly built
+//! launches the `pod` binary as an independent process with a freshly built
 //! overlay (name + cwd scope when no project manifest exists). Once
-//! the child reports its socket via the `INSOMNIA-READY` stderr line,
+//! the process reports its socket via the `INSOMNIA-READY` stderr line,
 //! the dialog hands control back so main can switch the terminal to
 //! alternate-screen mode.
 //!
@@ -29,9 +29,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::{Frame, TerminalOptions, Viewport};
 use session_store::SessionId;
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::{Child, Command};
-use tokio::task::JoinHandle;
+use tokio::process::Command;
 
 const READY_PREFIX: &str = "INSOMNIA-READY\t";
 const VIEWPORT_LINES: u16 = 6;
@@ -40,8 +38,6 @@ const READY_TIMEOUT: Duration = Duration::from_secs(20);
 pub struct SpawnReady {
     pub pod_name: String,
     pub socket_path: PathBuf,
-    pub child: Child,
-    pub stderr_drain: JoinHandle<()>,
 }
 
 pub enum SpawnOutcome {
@@ -290,6 +286,16 @@ async fn wait_for_ready(
     let pod_bin = resolve_pod_command();
     let cwd = std::env::current_dir().map_err(SpawnError::Io)?;
 
+    let pod_runtime_dir = manifest::paths::pod_runtime_dir(&form.name).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "could not resolve runtime directory (set INSOMNIA_HOME, INSOMNIA_RUNTIME_DIR, XDG_RUNTIME_DIR, or HOME)",
+        )
+    })?;
+    std::fs::create_dir_all(&pod_runtime_dir).map_err(SpawnError::Io)?;
+    let stderr_path = pod_runtime_dir.join("stderr.log");
+    let stderr_file = std::fs::File::create(&stderr_path).map_err(SpawnError::Io)?;
+
     let mut command = Command::new(&pod_bin);
     command
         .arg("--overlay")
@@ -297,75 +303,149 @@ async fn wait_for_ready(
         .current_dir(&cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+        .stderr(Stdio::from(stderr_file))
+        .process_group(0);
     if let Some(id) = form.resume_from {
         command.arg("--session").arg(id.to_string());
     }
     let mut child = command.spawn().map_err(SpawnError::PodLaunchFailed)?;
 
-    let stderr = child
-        .stderr
-        .take()
-        .expect("stderr is piped; take() must succeed");
-    let mut reader = BufReader::new(stderr).lines();
-    let mut tail = StderrTail::new();
+    // Default `kill_on_drop = false` plus `process_group(0)` makes this
+    // a detached Pod for TUI lifecycle purposes once startup succeeds:
+    // dropping the handle does not terminate it, and terminal-generated
+    // signals for the TUI's process group do not hit the Pod. Runtime
+    // state/socket files are the source of truth after that point.
+    let ready = match wait_for_ready_file(terminal, form, &stderr_path, &mut child).await {
+        Ok(ready) => ready,
+        Err(e) => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return Err(e);
+        }
+    };
+    tokio::spawn(async move {
+        let _ = child.wait().await;
+    });
+    Ok(ready)
+}
 
-    let timeout = tokio::time::sleep(READY_TIMEOUT);
-    tokio::pin!(timeout);
+async fn wait_for_ready_file(
+    terminal: &mut InlineTerminal,
+    form: &mut Form,
+    stderr_path: &std::path::Path,
+    child: &mut tokio::process::Child,
+) -> Result<SpawnReady, SpawnError> {
+    let mut tail = StderrTail::new();
+    let deadline = tokio::time::Instant::now() + READY_TIMEOUT;
+    let mut offset = 0usize;
 
     loop {
-        tokio::select! {
-            line = reader.next_line() => {
-                match line {
-                    Ok(Some(line)) => {
-                        if let Some(rest) = line.strip_prefix(READY_PREFIX) {
-                            let mut parts = rest.splitn(2, '\t');
-                            let pod_name = parts.next().unwrap_or("").to_string();
-                            let socket_str = parts.next().unwrap_or("").to_string();
-                            if pod_name.is_empty() || socket_str.is_empty() {
-                                return Err(SpawnError::PodExitedEarly {
-                                    stderr_tail: format!("malformed ready line: {line}"),
-                                });
-                            }
-                            let socket_path = PathBuf::from(socket_str);
-
-                            let stderr_drain = tokio::spawn(async move {
-                                while let Ok(Some(_)) = reader.next_line().await {}
-                            });
-
-                            return Ok(SpawnReady {
-                                pod_name,
-                                socket_path,
-                                child,
-                                stderr_drain,
-                            });
-                        }
-                        tail.push(&line);
-                        form.message = Some((line, MessageKind::Progress));
-                        let _ = terminal.draw(|f| draw_form(f, form));
-                    }
-                    Ok(None) => {
-                        let _ = child.wait().await;
+        let content = match tokio::fs::read_to_string(stderr_path).await {
+            Ok(content) => content,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(SpawnError::Io(e)),
+        };
+        if content.len() > offset {
+            for line in content[offset..].lines() {
+                if let Some(rest) = line.strip_prefix(READY_PREFIX) {
+                    let mut parts = rest.splitn(2, '\t');
+                    let pod_name = parts.next().unwrap_or("").to_string();
+                    let socket_str = parts.next().unwrap_or("").to_string();
+                    if pod_name.is_empty() || socket_str.is_empty() {
                         return Err(SpawnError::PodExitedEarly {
-                            stderr_tail: tail.into_string(),
+                            stderr_tail: format!("malformed ready line: {line}"),
                         });
                     }
-                    Err(e) => return Err(SpawnError::Io(e)),
+                    let socket_path = PathBuf::from(socket_str);
+                    wait_for_socket(
+                        &socket_path,
+                        deadline,
+                        child,
+                        stderr_path,
+                        &mut tail,
+                        &mut offset,
+                    )
+                    .await?;
+                    return Ok(SpawnReady {
+                        pod_name,
+                        socket_path,
+                    });
                 }
+                tail.push(line);
+                form.message = Some((line.to_string(), MessageKind::Progress));
+                let _ = terminal.draw(|f| draw_form(f, form));
             }
+            offset = content.len();
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            return Err(SpawnError::Timeout);
+        }
+        tokio::select! {
             status = child.wait() => {
                 let _ = status;
+                // Pod は exit 直前に最終 stderr 行を flush することがある。
+                // child.wait() が解決した後に再読みして、原因行を取りこ
+                // ぼさず PodExitedEarly に載せる。
+                drain_stderr_into_tail(stderr_path, &mut tail, &mut offset).await;
                 return Err(SpawnError::PodExitedEarly {
                     stderr_tail: tail.into_string(),
                 });
             }
-            _ = &mut timeout => {
-                let _ = child.start_kill();
-                return Err(SpawnError::Timeout);
-            }
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {}
         }
     }
+}
+
+async fn wait_for_socket(
+    socket_path: &std::path::Path,
+    deadline: tokio::time::Instant,
+    child: &mut tokio::process::Child,
+    stderr_path: &std::path::Path,
+    tail: &mut StderrTail,
+    offset: &mut usize,
+) -> Result<(), SpawnError> {
+    loop {
+        match tokio::net::UnixStream::connect(socket_path).await {
+            Ok(_) => return Ok(()),
+            Err(e)
+                if e.kind() == io::ErrorKind::NotFound
+                    || e.kind() == io::ErrorKind::ConnectionRefused => {}
+            Err(e) => return Err(SpawnError::Io(e)),
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(SpawnError::Timeout);
+        }
+        tokio::select! {
+            status = child.wait() => {
+                let _ = status;
+                drain_stderr_into_tail(stderr_path, tail, offset).await;
+                return Err(SpawnError::PodExitedEarly {
+                    stderr_tail: tail.as_string(),
+                });
+            }
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+    }
+}
+
+async fn drain_stderr_into_tail(
+    stderr_path: &std::path::Path,
+    tail: &mut StderrTail,
+    offset: &mut usize,
+) {
+    let Ok(content) = tokio::fs::read_to_string(stderr_path).await else {
+        return;
+    };
+    if content.len() <= *offset {
+        return;
+    }
+    for line in content[*offset..].lines() {
+        if !line.starts_with(READY_PREFIX) {
+            tail.push(line);
+        }
+    }
+    *offset = content.len();
 }
 
 fn build_overlay_toml(form: &Form) -> String {
@@ -448,6 +528,9 @@ impl StderrTail {
             self.lines.pop_front();
         }
         self.lines.push_back(line.to_string());
+    }
+    fn as_string(&self) -> String {
+        self.lines.iter().cloned().collect::<Vec<_>>().join(" | ")
     }
     fn into_string(self) -> String {
         self.lines.into_iter().collect::<Vec<_>>().join(" | ")

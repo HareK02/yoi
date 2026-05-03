@@ -90,32 +90,34 @@ Paused 中に Enter すると、入力の有無で 2 通り：
 
 | キー | Running 中 | Idle / Paused |
 |---|---|---|
-| `Ctrl-X` | `Method::Cancel`（進行中ターンを破棄 → Idle） | no-op（エラー表示のみ） |
+| `Ctrl-X` | `Method::Cancel`（進行中ターンを破棄 → Idle） | `Method::Shutdown`（Pod を終了） |
 | `Ctrl-C` | `Method::Pause`（進行中ターンを中断 → Paused） | 1 回目 warn、3 秒以内の 2 回目で TUI 終了（Pod は残る） |
-| `Ctrl-D` | 1 回目 warn、3 秒以内の 2 回目で `Method::Shutdown` | `Method::Shutdown`（Pod を終了） |
+| `Ctrl-D` | TUI 終了（Pod は残る、Pause しない） | TUI 終了（Pod は残る） |
 
 ### Cancel と Pause の違い
 
 - **Cancel** は「ターンを捨てる」: 進行中の LLM リクエスト・未完了 tool を打ち切り、状態は Idle。続きは Resume できない
 - **Pause** は「止めるけど続けられるように」: 同じく打ち切るが状態は Paused、空 Enter で Resume 可能
 
-Running 中に割り込みたい場合、ほとんどのケースで `Ctrl-C`（Pause）が自然。Ctrl-X（Cancel）は明示的に破棄したい時（LLM が暴走した時など）用。
+Running 中に割り込みたい場合、ほとんどのケースで `Ctrl-C`（Pause）が自然。Ctrl-X（Cancel）は明示的に破棄したい時（LLM が暴走した時など）用。Pod を終了したい場合は、先に Running ではない状態（Idle / Paused）にしてから `Ctrl-X` で Shutdown する。
 
-### Ctrl-C と Ctrl-D の 2 段階 UX
+### Ctrl-C と Ctrl-D の終了 UX
 
-どちらも「破壊的に見える操作」は確認を挟む：
-
+- Ctrl-X Running 中: `Method::Cancel`。終了したい場合は、明示的にターンを止めて Idle に戻してからもう一度 `Ctrl-X`
+- Ctrl-X Idle / Paused: `Method::Shutdown` を送って Pod を終了
 - Ctrl-C Running 中: 1 回目で即 Pause（破壊的ではない）
 - Ctrl-C Idle / Paused: 1 回目で warn メッセージ、3 秒以内の 2 回目で TUI 終了（Pod は残る）
-- Ctrl-D Running 中: 1 回目で warn、3 秒以内の 2 回目で Shutdown
-- Ctrl-D Idle / Paused: 1 回目で即 Shutdown
+- Ctrl-D: 状態に関わらず即 TUI 終了（Pod は残る）。Running 中でも Pause / Cancel / Shutdown は送らない
 
-`Ctrl-C` は Pod は落とさず TUI プロセスだけ抜ける。`Ctrl-D` は Pod 自体に `Method::Shutdown` を送って終了させる（Pod プロセスが消える）。
+`Ctrl-X` は Running 中だけ Cancel、Idle / Paused では Shutdown。`Ctrl-C` は Running 中だけ Pod に `Method::Pause` を送り、それ以外では Pod は落とさず TUI プロセスだけ抜ける。`Ctrl-D` は常に Pod へ制御メソッドを送らず TUI プロセスだけ抜ける。
+
+TUI のダイアログから Pod を起動する経路では、起動した Pod は TUI の子プロセスとして管理・終了されず、独立したプロセスとして残る。TUI 終了後は `tui <pod-name>` で再接続できる。
 
 ## 履歴メモ
 
 - かつて存在した `Ctrl-R`（Resume 専用）は、空 Enter での Resume に統合されたため廃止
 - かつて存在した `Esc`（TUI 終了）は、`Ctrl-C` の 2 連打 UX に統合されたため廃止
+- かつて `Ctrl-D` は Pod に `Method::Shutdown` を送っていたが、TUI だけを抜けるデタッチ操作に変更された
 - 旧 inline viewport 時代は履歴スクロールを端末側スクロールバックに
   任せていたため TUI 内のスクロールキーは存在しなかった。全画面 alt screen
   への移行（`tickets/tui-fullscreen-overhaul.md`）で `Shift-Up/Down` ほか
