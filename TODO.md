@@ -10,7 +10,6 @@
 - TUI 拡充
   - Run 中の入力キューイング → [tickets/tui-input-queue.md](tickets/tui-input-queue.md)
   - ユーザーマニフェストのモデル設定 wizard → [tickets/tui-user-model-setup.md](tickets/tui-user-model-setup.md)
-  - auto-kick 由来ターンが描画されない → [tickets/tui-pod-event-render.md](tickets/tui-pod-event-render.md)
   - spawn 失敗時に Pod の stderr が TUI に表示されない → [tickets/tui-spawn-error-surface.md](tickets/tui-spawn-error-surface.md)
 - Manifest: Tool Output / File Upload 上限の分離とデフォルト緩和 → [tickets/manifest-output-upload-limits.md](tickets/manifest-output-upload-limits.md)
 - メモリ機構
