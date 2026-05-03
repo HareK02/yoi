@@ -103,3 +103,9 @@
 - 参考実装: Claude Code の TodoWrite、OpenCode の todo tool
 - 関連: `crates/tools/src/tracker.rs`（session-lifetime 状態の前例）、`crates/pod/src/compact/worker.rs`（auto-injection レーン）
 - 後続: `tickets/session-todo-reminder.md`（注意機構）
+
+## Review
+
+- 状態: Approve (再レビュー済み、blocking 解消・non-blocking 対応反映)
+- レビュー詳細: [./session-todo.review.md](./session-todo.review.md)
+- 日付: 2026-05-03

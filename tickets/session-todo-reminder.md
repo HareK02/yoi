@@ -58,3 +58,10 @@ Insomnia でも同方針を採り、active Task が残っているのに `TaskCr
 - 設計指針: `CLAUDE.md`（最小の構造化 / 概念の追加は不在が問題になってから）
 - 前提: `tickets/session-todo.md`（Tool 群と TaskStore）
 - 参考実装: Claude Code の `task_reminder`（local reminder helper functions、閾値 `a local reminder threshold`）
+
+## Review
+
+- 状態: Approve (spec 段階)
+- レビュー詳細: [./session-todo-reminder.review.md](./session-todo-reminder.review.md)
+- 日付: 2026-05-03
+- 補足: 実装着手前に Non-blocking で挙げた 4 点 (TaskCreate/Update のカウンタリセット契機 / active 取得経路 / reminder 本文 fmt / resume 時のカウンタ扱い) を spec に追記してから実装するとブレが減る。実装完了時に完了条件を再確認。
