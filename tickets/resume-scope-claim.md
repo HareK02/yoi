@@ -38,3 +38,9 @@ resume の意図は「過去のセッションの続きを取る」であって�
 - 自動的に既存 Pod を kill / reclaim して claim を通す挙動
 - protocol 経由の外部からの GrantScope / RevokeScope（`tickets/dynamic-scope.md` の範囲外宣言を継承）
 - registry 側のエラー型の全面再設計（rule 情報を含めるための最小限の拡張のみで足りる想定）
+
+## Review
+
+- 状態: Approve
+- レビュー詳細: [./resume-scope-claim.review.md](./resume-scope-claim.review.md)
+- 日付: 2026-05-03
