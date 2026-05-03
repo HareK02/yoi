@@ -7,12 +7,12 @@ use llm_worker::llm_client::RequestConfig;
 use llm_worker::llm_client::client::LlmClient;
 use llm_worker::state::Mutable;
 use llm_worker::{ToolOutputLimits, UsageRecord, Worker, WorkerError, WorkerResult};
-use session_store::{EntryHash, SessionId, SessionStartState, Store, StoreError};
+use session_store::{EntryHash, PodScopeSnapshot, SessionId, SessionStartState, Store, StoreError};
 use tracing::{info, warn};
 
 use manifest::{
-    PodManifest, PodManifestConfig, ResolveError, Scope, ScopeError, ScopeRule, SharedScope,
-    WorkerManifest,
+    PodManifest, PodManifestConfig, ResolveError, Scope, ScopeConfig, ScopeError, ScopeRule,
+    SharedScope, WorkerManifest,
 };
 
 use crate::compact::state::CompactState;
@@ -143,6 +143,10 @@ pub struct Pod<C: LlmClient, St: Store> {
     /// Phase 2 (consolidation) workers set this to false so the
     /// agentic worker pulls knowledge through the search tools instead.
     inject_resident_knowledge: bool,
+    /// Latest runtime scope snapshot queued by dynamic scope changes.
+    /// Drained into the session log before the next turn result is
+    /// persisted, so resume never silently reclaims delegated writes.
+    pending_scope_snapshot: Arc<Mutex<Option<PodScopeSnapshot>>>,
     /// Phase 1 (memory.extract) reentry guard. `true` while an extract
     /// worker is running; subsequent triggers are skipped per spec
     /// (`docs/plan/memory.md` §Phase 1 並走防止). `Arc<AtomicBool>` so
@@ -216,6 +220,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             workflow_registry: memory::WorkflowRegistry::empty(),
             memory_layout: None,
             inject_resident_knowledge: true,
+            pending_scope_snapshot: Arc::new(Mutex::new(None)),
             extract_in_flight: Arc::new(AtomicBool::new(false)),
             consolidation_in_flight: Arc::new(AtomicBool::new(false)),
             extract_pointer: Mutex::new(None),
@@ -305,6 +310,55 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         let revoke: Vec<ScopeRule> = revoke.into_iter().collect();
         self.scope
             .update(|cur| cur.with_added_deny_rules(revoke.clone()))
+    }
+
+    /// Snapshot the current runtime scope in the session log. The entry
+    /// is intentionally appended as soon as a session head exists: if the
+    /// process later exits while children keep their allocations, resume
+    /// can restore the narrowed scope instead of reclaiming delegated
+    /// writes.
+    pub async fn persist_scope_snapshot(&mut self) -> Result<(), StoreError> {
+        if self.head_hash.is_none() {
+            return Ok(());
+        }
+        let snapshot = {
+            let scope = self.scope.snapshot();
+            PodScopeSnapshot {
+                allow: scope.allow_rules(),
+                deny: scope.deny_rules(),
+            }
+        };
+        session_store::save_pod_scope(&self.store, self.session_id, &mut self.head_hash, &snapshot)
+            .await
+    }
+
+    /// Cloneable callback handed to dynamic-scope tools. It cannot append
+    /// directly to the async store from a sync tool callback, so it records
+    /// the latest snapshot and the controller flushes it after the tool
+    /// turn completes.
+    pub fn scope_change_sink(&self) -> Arc<dyn Fn(PodScopeSnapshot) + Send + Sync> {
+        let pending = self.pending_scope_snapshot.clone();
+        Arc::new(move |snapshot| {
+            *pending.lock().expect("pending_scope_snapshot poisoned") = Some(snapshot);
+        })
+    }
+
+    async fn flush_pending_scope_snapshot(&mut self) -> Result<(), StoreError> {
+        let snapshot = self
+            .pending_scope_snapshot
+            .lock()
+            .expect("pending_scope_snapshot poisoned")
+            .take();
+        if let Some(snapshot) = snapshot {
+            session_store::save_pod_scope(
+                &self.store,
+                self.session_id,
+                &mut self.head_hash,
+                &snapshot,
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     /// Direct access to the underlying Worker.
@@ -903,6 +957,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             let hash =
                 session_store::create_session_with_id(&self.store, self.session_id, state).await?;
             self.head_hash = Some(hash);
+            self.persist_scope_snapshot().await?;
             return Ok(());
         }
         let prev_session_id = self.session_id;
@@ -1058,6 +1113,8 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         let new_items = &w.history()[history_before..];
         session_store::save_delta(&self.store, self.session_id, &mut self.head_hash, new_items)
             .await?;
+
+        self.flush_pending_scope_snapshot().await?;
 
         let turn_count = self.worker.as_ref().unwrap().turn_count();
         session_store::save_turn_end(
@@ -1365,6 +1422,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             .lock()
             .expect("usage_history poisoned")
             .clear();
+        self.persist_scope_snapshot().await?;
         // Reset Phase 1 pointer alongside usage_history: the compacted
         // session has a fresh log with no `LogEntry::Extension` entries
         // yet, so a cold restore here would set extract_pointer to None
@@ -1939,6 +1997,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             workflow_registry: common.workflow_registry,
             memory_layout: common.memory_layout,
             inject_resident_knowledge: true,
+            pending_scope_snapshot: Arc::new(Mutex::new(None)),
             extract_in_flight: Arc::new(AtomicBool::new(false)),
             consolidation_in_flight: Arc::new(AtomicBool::new(false)),
             extract_pointer: Mutex::new(None),
@@ -2000,6 +2059,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             workflow_registry: common.workflow_registry,
             memory_layout: common.memory_layout,
             inject_resident_knowledge: true,
+            pending_scope_snapshot: Arc::new(Mutex::new(None)),
             extract_in_flight: Arc::new(AtomicBool::new(false)),
             consolidation_in_flight: Arc::new(AtomicBool::new(false)),
             extract_pointer: Mutex::new(None),
@@ -2037,8 +2097,20 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
         if state.head_hash.is_none() {
             return Err(PodError::SessionEmpty { session_id });
         }
+        let scope_snapshot = state
+            .pod_scope
+            .clone()
+            .ok_or(PodError::SessionScopeMissing { session_id })?;
 
-        let common = prepare_pod_common(&manifest, &loader, /* parse_template */ false)?;
+        let common = prepare_pod_common_with_scope(
+            &manifest,
+            &loader,
+            /* parse_template */ false,
+            ScopeConfig {
+                allow: scope_snapshot.allow,
+                deny: scope_snapshot.deny,
+            },
+        )?;
 
         // Atomic: register_pod inside install_top_level rejects when
         // another live allocation already holds `session_id`. Wrapping
@@ -2049,11 +2121,12 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             .map_err(ScopeLockError::from)?
             .join(&manifest.pod.name)
             .join("sock");
-        let scope_allocation = pod_registry::install_top_level(
+        let scope_allocation = pod_registry::install_top_level_with_deny(
             manifest.pod.name.clone(),
             std::process::id(),
             socket_path,
             common.scope.allow_rules(),
+            common.scope.deny_rules(),
             session_id,
         )?;
 
@@ -2113,6 +2186,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             workflow_registry: common.workflow_registry,
             memory_layout: common.memory_layout,
             inject_resident_knowledge: true,
+            pending_scope_snapshot: Arc::new(Mutex::new(None)),
             extract_in_flight: Arc::new(AtomicBool::new(false)),
             consolidation_in_flight: Arc::new(AtomicBool::new(false)),
             extract_pointer: Mutex::new(extract_pointer),
@@ -2327,6 +2401,11 @@ pub enum PodError {
 
     #[error("session {session_id} has no entries to restore")]
     SessionEmpty { session_id: SessionId },
+
+    #[error(
+        "session {session_id} has no persisted scope snapshot; refusing resume without explicit scope"
+    )]
+    SessionScopeMissing { session_id: SessionId },
 }
 
 /// Bundle of resources that every high-level Pod constructor needs:
@@ -2360,6 +2439,27 @@ fn prepare_pod_common(
 ) -> Result<PodCommon, PodError> {
     let pwd = current_pwd()?;
     let scope = build_scope_with_memory(manifest, &pwd)?;
+    prepare_pod_common_from_scope(manifest, loader, parse_template, pwd, scope)
+}
+
+fn prepare_pod_common_with_scope(
+    manifest: &PodManifest,
+    loader: &PromptLoader,
+    parse_template: bool,
+    scope_config: ScopeConfig,
+) -> Result<PodCommon, PodError> {
+    let pwd = current_pwd()?;
+    let scope = Scope::from_config(&scope_config).map_err(PodError::Scope)?;
+    prepare_pod_common_from_scope(manifest, loader, parse_template, pwd, scope)
+}
+
+fn prepare_pod_common_from_scope(
+    manifest: &PodManifest,
+    loader: &PromptLoader,
+    parse_template: bool,
+    pwd: PathBuf,
+    scope: Scope,
+) -> Result<PodCommon, PodError> {
     if !scope.is_readable(&pwd) {
         return Err(PodError::PwdOutsideScope { pwd });
     }

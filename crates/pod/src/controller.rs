@@ -134,6 +134,8 @@ impl PodController {
         // `PodFsView` to the shared state once the latter exists.
         let fs_for_view: tools::ScopedFs;
 
+        let scope_change_sink = pod.scope_change_sink();
+
         // Register event bridge callbacks on the worker
         {
             let worker = pod.worker_mut();
@@ -257,7 +259,8 @@ impl PodController {
             // worker) reads from it, and any future scope mutation
             // (SpawnPod-style revoke, future GrantScope) propagates
             // through it.
-            let fs = tools::ScopedFs::with_shared_scope(scope_handle.clone(), pwd_for_tools.clone());
+            let fs =
+                tools::ScopedFs::with_shared_scope(scope_handle.clone(), pwd_for_tools.clone());
             let tracker = tools::Tracker::new();
             // The same ScopedFs also powers the IPC `ListCompletions`
             // query — keep a clone for the FS view we attach below,
@@ -293,6 +296,7 @@ impl PodController {
                 self_parent_socket.clone(),
                 spawner_model.clone(),
                 scope_handle.clone(),
+                scope_change_sink.clone(),
             ));
             worker.register_tool(send_to_pod_tool(spawned_registry.clone()));
             worker.register_tool(read_pod_output_tool(spawned_registry.clone()));

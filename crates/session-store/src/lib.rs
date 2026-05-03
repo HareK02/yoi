@@ -41,11 +41,12 @@ pub use logged_item::{LoggedContentPart, LoggedItem, LoggedRole, from_logged, to
 pub use session::{
     SessionStartState, create_compacted_session, create_session, create_session_with_id,
     ensure_head_or_fork, fork, fork_at, restore, save_config_changed, save_delta, save_extension,
-    save_run_completed, save_run_errored, save_turn_end, save_usage, save_user_input,
+    save_pod_scope, save_run_completed, save_run_errored, save_turn_end, save_usage,
+    save_user_input,
 };
 pub use session_log::{
-    EntryHash, HashedEntry, LogEntry, RestoredState, SessionOrigin, build_chain, collect_state,
-    compute_hash,
+    EntryHash, HashedEntry, LogEntry, POD_SCOPE_EXTENSION_DOMAIN, PodScopeSnapshot, RestoredState,
+    SessionOrigin, build_chain, collect_state, compute_hash,
 };
 pub use store::{Store, StoreError};
 

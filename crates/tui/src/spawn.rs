@@ -18,7 +18,9 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use crossterm::event::{self, Event as TermEvent, KeyCode, KeyEventKind, KeyModifiers};
-use manifest::{PodManifestConfig, find_project_manifest_from, load_layer, user_manifest_path};
+use manifest::{
+    PodManifestConfig, ScopeConfig, find_project_manifest_from, load_layer, user_manifest_path,
+};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout};
@@ -50,6 +52,8 @@ pub enum SpawnOutcome {
 #[derive(Debug)]
 pub enum SpawnError {
     Io(io::Error),
+    Store(session_store::StoreError),
+    MissingResumeScope { session_id: SessionId },
     PodLaunchFailed(io::Error),
     PodExitedEarly { stderr_tail: String },
     Timeout,
@@ -59,6 +63,11 @@ impl std::fmt::Display for SpawnError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(e) => write!(f, "io error: {e}"),
+            Self::Store(e) => write!(f, "failed to read session log: {e}"),
+            Self::MissingResumeScope { session_id } => write!(
+                f,
+                "session {session_id} has no persisted scope snapshot; refusing resume without explicit scope"
+            ),
             Self::PodLaunchFailed(e) => write!(f, "failed to launch pod: {e}"),
             Self::PodExitedEarly { stderr_tail } => {
                 if stderr_tail.is_empty() {
@@ -81,6 +90,12 @@ impl std::error::Error for SpawnError {}
 impl From<io::Error> for SpawnError {
     fn from(e: io::Error) -> Self {
         Self::Io(e)
+    }
+}
+
+impl From<session_store::StoreError> for SpawnError {
+    fn from(e: session_store::StoreError) -> Self {
+        Self::Store(e)
     }
 }
 
@@ -140,6 +155,7 @@ pub async fn run(resume_from: Option<SessionId>) -> Result<SpawnOutcome, SpawnEr
         message: None,
         editing: true,
         resume_from,
+        resume_scope: None,
     };
 
     let mut terminal = make_inline_terminal()?;
@@ -173,6 +189,9 @@ pub async fn run(resume_from: Option<SessionId>) -> Result<SpawnOutcome, SpawnEr
         }
     }
 
+    if let Some(id) = form.resume_from {
+        form.resume_scope = Some(load_resume_scope(id).await?);
+    }
     let overlay_toml = build_overlay_toml(&form);
 
     // Phase 2: launch pod and wait for ready line. Drop the cursor
@@ -356,7 +375,12 @@ fn build_overlay_toml(form: &Form) -> String {
     pod.insert("name".into(), toml::Value::String(form.name.clone()));
     root.insert("pod".into(), toml::Value::Table(pod));
 
-    if !form.cascade_has_scope {
+    if let Some(scope_config) = form.resume_scope.as_ref() {
+        root.insert(
+            "scope".into(),
+            toml::Value::try_from(scope_config).expect("scope serialisation cannot fail"),
+        );
+    } else if !form.cascade_has_scope {
         let mut rule = toml::value::Table::new();
         rule.insert(
             "target".into(),
@@ -372,6 +396,24 @@ fn build_overlay_toml(form: &Form) -> String {
     }
 
     toml::to_string(&toml::Value::Table(root)).expect("overlay serialisation cannot fail")
+}
+
+async fn load_resume_scope(session_id: SessionId) -> Result<ScopeConfig, SpawnError> {
+    let store_dir = manifest::paths::sessions_dir().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "could not resolve sessions directory (set INSOMNIA_HOME, INSOMNIA_DATA_DIR, or HOME)",
+        )
+    })?;
+    let store = session_store::FsStore::new(&store_dir).await?;
+    let state = session_store::restore(&store, session_id).await?;
+    let snapshot = state
+        .pod_scope
+        .ok_or(SpawnError::MissingResumeScope { session_id })?;
+    Ok(ScopeConfig {
+        allow: snapshot.allow,
+        deny: snapshot.deny,
+    })
 }
 
 /// Resolves the binary used to launch a child Pod. Must point at a
@@ -450,6 +492,10 @@ struct Form {
     /// child pod is launched with `--session <id>` so it restores
     /// from `id` and appends to the same session log.
     resume_from: Option<SessionId>,
+    /// Scope snapshot recovered from the source session log. Set only for
+    /// resume runs, and serialized into the overlay instead of cwd-default
+    /// scope so resume does not silently broaden access.
+    resume_scope: Option<ScopeConfig>,
 }
 
 impl Form {
@@ -625,6 +671,7 @@ mod tests {
             message: None,
             editing: true,
             resume_from: None,
+            resume_scope: None,
         }
     }
 
@@ -647,6 +694,30 @@ mod tests {
         let parsed: toml::Value = toml::from_str(&toml_str).unwrap();
         assert_eq!(parsed["pod"]["name"].as_str(), Some("agent-2"));
         assert!(parsed.get("scope").is_none());
+    }
+
+    #[test]
+    fn overlay_uses_resume_scope_snapshot() {
+        let mut f = form("agent-r", false);
+        f.resume_from = Some(session_store::new_session_id());
+        f.resume_scope = Some(ScopeConfig {
+            allow: vec![manifest::ScopeRule {
+                target: PathBuf::from("/work/example"),
+                permission: manifest::Permission::Write,
+                recursive: true,
+            }],
+            deny: vec![manifest::ScopeRule {
+                target: PathBuf::from("/work/example/child"),
+                permission: manifest::Permission::Write,
+                recursive: true,
+            }],
+        });
+        let toml_str = build_overlay_toml(&f);
+        let parsed: toml::Value = toml::from_str(&toml_str).unwrap();
+        assert_eq!(parsed["pod"]["name"].as_str(), Some("agent-r"));
+        assert_eq!(parsed["scope"]["allow"].as_array().unwrap().len(), 1);
+        let deny = parsed["scope"]["deny"].as_array().unwrap();
+        assert_eq!(deny[0]["target"].as_str(), Some("/work/example/child"));
     }
 
     #[test]

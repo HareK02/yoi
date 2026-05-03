@@ -6,7 +6,7 @@
 
 use crate::SessionId;
 use crate::logged_item::{LoggedItem, to_logged};
-use crate::session_log::{self, EntryHash, HashedEntry, LogEntry, SessionOrigin};
+use crate::session_log::{self, EntryHash, HashedEntry, LogEntry, PodScopeSnapshot, SessionOrigin};
 use crate::store::{Store, StoreError};
 use llm_worker::WorkerResult;
 use llm_worker::llm_client::RequestConfig;
@@ -356,6 +356,24 @@ pub async fn save_extension(
             domain: domain.into(),
             payload,
         },
+    )
+    .await
+}
+
+/// Log the Pod's latest runtime scope snapshot.
+pub async fn save_pod_scope(
+    store: &impl Store,
+    session_id: SessionId,
+    head_hash: &mut Option<EntryHash>,
+    snapshot: &PodScopeSnapshot,
+) -> Result<(), StoreError> {
+    let payload = serde_json::to_value(snapshot)?;
+    save_extension(
+        store,
+        session_id,
+        head_hash,
+        session_log::POD_SCOPE_EXTENSION_DOMAIN,
+        payload,
     )
     .await
 }

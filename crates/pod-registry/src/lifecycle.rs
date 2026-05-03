@@ -8,7 +8,7 @@ use manifest::ScopeRule;
 use session_store::SessionId;
 
 use crate::error::ScopeLockError;
-use crate::mutate::{register_pod, release_pod};
+use crate::mutate::release_pod;
 use crate::table::{LockFileGuard, default_registry_path};
 
 /// Owned allocation: on drop, opens the lock file and releases this
@@ -47,14 +47,29 @@ pub fn install_top_level(
     scope_allow: Vec<ScopeRule>,
     session_id: SessionId,
 ) -> Result<ScopeAllocationGuard, ScopeLockError> {
+    install_top_level_with_deny(pod_name, pid, socket, scope_allow, Vec::new(), session_id)
+}
+
+/// Open the default lock file, register a top-level Pod with explicit
+/// deny rules, and return a guard that will release the allocation on
+/// drop.
+pub fn install_top_level_with_deny(
+    pod_name: String,
+    pid: u32,
+    socket: PathBuf,
+    scope_allow: Vec<ScopeRule>,
+    scope_deny: Vec<ScopeRule>,
+    session_id: SessionId,
+) -> Result<ScopeAllocationGuard, ScopeLockError> {
     let lock_path = default_registry_path()?;
     let mut guard = LockFileGuard::open(&lock_path)?;
-    register_pod(
+    crate::mutate::register_pod_with_deny(
         &mut guard,
         pod_name.clone(),
         pid,
         socket,
         scope_allow,
+        scope_deny,
         session_id,
     )?;
     Ok(ScopeAllocationGuard {
@@ -176,6 +191,7 @@ mod tests {
             pid: placeholder_pid,
             socket: sock(pod_name),
             scope_allow: vec![write_rule("/tmp/child", true)],
+            scope_deny: Vec::new(),
             delegated_from: None,
             session_id: None,
         });

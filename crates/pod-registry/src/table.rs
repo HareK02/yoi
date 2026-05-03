@@ -35,6 +35,11 @@ pub struct Allocation {
     pub socket: PathBuf,
     /// Allow rules granted to this Pod (write + read).
     pub scope_allow: Vec<ScopeRule>,
+    /// Deny rules that cap this Pod's effective scope. Normally empty for
+    /// fresh allocations; restored Pods use this to avoid reclaiming
+    /// previously delegated write regions.
+    #[serde(default)]
+    pub scope_deny: Vec<ScopeRule>,
     /// Name of the Pod that delegated scope to this one, or `None` for
     /// a top-level Pod started directly by a human.
     pub delegated_from: Option<String>,
