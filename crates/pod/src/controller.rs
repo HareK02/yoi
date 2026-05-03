@@ -133,6 +133,7 @@ impl PodController {
         // Stashed during tool registration below so we can attach a
         // `PodFsView` to the shared state once the latter exists.
         let fs_for_view: tools::ScopedFs;
+        let task_store = pod.task_store();
 
         // Register event bridge callbacks on the worker
         {
@@ -257,13 +258,19 @@ impl PodController {
             // worker) reads from it, and any future scope mutation
             // (SpawnPod-style revoke, future GrantScope) propagates
             // through it.
-            let fs = tools::ScopedFs::with_shared_scope(scope_handle.clone(), pwd_for_tools.clone());
+            let fs =
+                tools::ScopedFs::with_shared_scope(scope_handle.clone(), pwd_for_tools.clone());
             let tracker = tools::Tracker::new();
             // The same ScopedFs also powers the IPC `ListCompletions`
             // query — keep a clone for the FS view we attach below,
             // since the tools consume `fs` itself.
             fs_for_view = fs.clone();
-            worker.register_tools(tools::builtin_tools(fs, tracker.clone(), bash_output_dir));
+            worker.register_tools(tools::builtin_tools(
+                fs,
+                tracker.clone(),
+                task_store.clone(),
+                bash_output_dir,
+            ));
 
             // Memory subsystem opt-in. When `[memory]` is present in
             // the manifest, register the memory-specific Read/Write/Edit

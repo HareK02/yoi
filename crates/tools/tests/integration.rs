@@ -11,7 +11,7 @@ use llm_worker::tool::{Tool, ToolDefinition, ToolMeta};
 use manifest::{Permission, Scope, ScopeConfig, ScopeRule};
 use serde_json::json;
 use tempfile::TempDir;
-use tools::{ScopedFs, Tracker, builtin_tools};
+use tools::{ScopedFs, TaskStore, Tracker, builtin_tools};
 
 fn scope_with_spill(workspace: &Path, spill: &Path) -> Scope {
     let base = Scope::writable(workspace).unwrap();
@@ -56,7 +56,12 @@ fn setup() -> (TempDir, TempDir, Registry) {
     let scope = scope_with_spill(dir.path(), spill.path());
     let fs = ScopedFs::new(scope, dir.path().to_path_buf());
     let tracker = Tracker::new();
-    let reg = Registry::new(builtin_tools(fs, tracker, spill.path().to_path_buf()));
+    let reg = Registry::new(builtin_tools(
+        fs,
+        tracker,
+        TaskStore::new(),
+        spill.path().to_path_buf(),
+    ));
     (dir, spill, reg)
 }
 
@@ -77,7 +82,21 @@ fn builtin_tools_registers_full_set() {
     let (_dir, _spill, reg) = setup();
     let mut names = reg.names();
     names.sort();
-    assert_eq!(names, vec!["Bash", "Edit", "Glob", "Grep", "Read", "Write"]);
+    assert_eq!(
+        names,
+        vec![
+            "Bash",
+            "Edit",
+            "Glob",
+            "Grep",
+            "Read",
+            "TaskCreate",
+            "TaskGet",
+            "TaskList",
+            "TaskUpdate",
+            "Write"
+        ]
+    );
 }
 
 #[test]
@@ -270,16 +289,41 @@ async fn edit_requires_read_across_tools() {
 #[tokio::test]
 async fn deterministic_tool_order_is_registration_order() {
     let (_dir, _spill, reg) = setup();
-    // Registration order from builtin_tools(): Read, Write, Edit, Glob, Grep, Bash
+    // Registration order from builtin_tools(): Read, Write, Edit, Glob, Grep, Bash, TaskCreate, TaskList, TaskGet, TaskUpdate
     let names: Vec<&str> = reg.entries.iter().map(|(m, _)| m.name.as_str()).collect();
-    assert_eq!(names, vec!["Read", "Write", "Edit", "Glob", "Grep", "Bash"]);
+    assert_eq!(
+        names,
+        vec![
+            "Read",
+            "Write",
+            "Edit",
+            "Glob",
+            "Grep",
+            "Bash",
+            "TaskCreate",
+            "TaskList",
+            "TaskGet",
+            "TaskUpdate"
+        ]
+    );
 }
 
 // Regression: tool name capitalization matches Claude Code reference
 #[test]
 fn tool_names_match_reference_spec() {
     let (_dir, _spill, reg) = setup();
-    for expected in ["Read", "Write", "Edit", "Glob", "Grep", "Bash"] {
+    for expected in [
+        "Read",
+        "Write",
+        "Edit",
+        "Glob",
+        "Grep",
+        "Bash",
+        "TaskCreate",
+        "TaskList",
+        "TaskGet",
+        "TaskUpdate",
+    ] {
         assert!(
             reg.entries.iter().any(|(m, _)| m.name == expected),
             "missing tool {expected}"
@@ -295,7 +339,12 @@ async fn tracker_recent_files_tracks_read_write_edit() {
     let scope = scope_with_spill(dir.path(), spill.path());
     let fs = ScopedFs::new(scope, dir.path().to_path_buf());
     let tracker = Tracker::new();
-    let reg = Registry::new(builtin_tools(fs, tracker.clone(), spill.path().to_path_buf()));
+    let reg = Registry::new(builtin_tools(
+        fs,
+        tracker.clone(),
+        TaskStore::new(),
+        spill.path().to_path_buf(),
+    ));
 
     let a = dir.path().join("a.txt");
     let b = dir.path().join("b.txt");
@@ -379,7 +428,10 @@ async fn bash_spilled_file_is_readable_via_read_tool() {
     let read_body = read_out.content.expect("Read returned content");
     // The full 200 lines should be in the saved file even though Bash
     // returned only the tail of 80.
-    assert!(read_body.contains("line 1\n"), "missing line 1: {read_body}");
+    assert!(
+        read_body.contains("line 1\n"),
+        "missing line 1: {read_body}"
+    );
     assert!(read_body.contains("line 200"), "missing line 200");
 }
 

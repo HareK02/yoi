@@ -95,6 +95,11 @@ pub struct Pod<C: LlmClient, St: Store> {
     /// tools so that Pod-owned operations (e.g. compaction) can consult
     /// the recency of touched files.
     tracker: Option<tools::Tracker>,
+    /// Session-lifetime task store from the builtin `tools` crate. Shared by
+    /// TaskCreate / TaskUpdate / TaskList / TaskGet and preserved across
+    /// compaction by keeping the same handle while the Worker history is
+    /// replaced. Restored Pods reconstruct it by replaying Task* tool calls.
+    task_store: tools::TaskStore,
     /// Parsed system-prompt template awaiting first-turn materialisation.
     /// `Some` until `ensure_system_prompt_materialized` renders it once,
     /// then `None` forever — including after compaction.
@@ -211,6 +216,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             metrics_tracker: Arc::new(crate::compact::metrics_tracker::MetricsTracker::new()),
             usage_history: Arc::new(Mutex::new(Vec::<UsageRecord>::new())),
             tracker: None,
+            task_store: tools::TaskStore::new(),
             system_prompt_template: None,
             alerter: None,
             event_tx: None,
@@ -423,6 +429,18 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     /// previously attached tracker.
     pub fn attach_tracker(&mut self, tracker: tools::Tracker) {
         self.tracker = Some(tracker);
+    }
+
+    /// Attach the session-scoped TaskStore from the builtin `tools` crate.
+    /// Called by the Controller before registering builtin tools so the Pod
+    /// and Worker share one store.
+    pub fn attach_task_store(&mut self, task_store: tools::TaskStore) {
+        self.task_store = task_store;
+    }
+
+    /// Shared TaskStore handle.
+    pub fn task_store(&self) -> tools::TaskStore {
+        self.task_store.clone()
     }
 
     /// The attached session-scoped file-operation tracker, if any.
@@ -1255,8 +1273,14 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             .unwrap_or_default();
 
         // Input text fed to the compact worker. Includes the default
-        // references and the (pruned) conversation text.
-        let summary_input = build_summary_input(&items_to_summarise, &default_refs);
+        // references, current TaskStore snapshot, and the (pruned)
+        // conversation text.
+        let task_snapshot_text = self.task_store.snapshot_text();
+        let summary_input = build_summary_input(
+            &items_to_summarise,
+            &default_refs,
+            Some(task_snapshot_text.as_str()),
+        );
 
         // Worker-side state collected by the compact worker's tool calls.
         let ctx = Arc::new(std::sync::Mutex::new(CompactWorkerContext::with_budget(
@@ -1371,9 +1395,10 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             .filter(|i| i.is_user_message())
             .count();
 
-        // Build new history: [summary, ...auto-read, references, ...retained].
+        // Build new history: [summary, ...auto-read, task snapshot, TaskList result, references, ...retained].
         let mut new_history = Vec::with_capacity(
             1 + auto_read_messages.len()
+                + 3
                 + reference_message.is_some() as usize
                 + retained_items.len(),
         );
@@ -1381,6 +1406,17 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             "[Compacted context summary]\n\n{summary_text}"
         )));
         new_history.extend(auto_read_messages);
+        new_history.push(Item::system_message(format!(
+            "[Session TaskStore snapshot]\n\n{task_snapshot_text}\n\n\
+             This is the complete session task list preserved across compaction. \
+             The following TaskList tool result presents the same state through the tool lane."
+        )));
+        new_history.push(Item::tool_call("compact-tasklist", "TaskList", "{}"));
+        new_history.push(Item::tool_result_with_content(
+            "compact-tasklist",
+            tools::task::snapshot_overview(&self.task_store.list()),
+            task_snapshot_text.clone(),
+        ));
         if let Some(msg) = reference_message {
             new_history.push(msg);
         }
@@ -1978,6 +2014,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             metrics_tracker: Arc::new(crate::compact::metrics_tracker::MetricsTracker::new()),
             usage_history: Arc::new(Mutex::new(Vec::new())),
             tracker: None,
+            task_store: tools::TaskStore::new(),
             system_prompt_template: common.system_prompt_template,
             alerter: None,
             event_tx: None,
@@ -2040,6 +2077,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             metrics_tracker: Arc::new(crate::compact::metrics_tracker::MetricsTracker::new()),
             usage_history: Arc::new(Mutex::new(Vec::new())),
             tracker: None,
+            task_store: tools::TaskStore::new(),
             system_prompt_template: common.system_prompt_template,
             alerter: None,
             event_tx: None,
@@ -2136,6 +2174,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
         }
 
         let extract_pointer = memory::extract::fold_pointer(&state.extensions);
+        let task_store = tools::TaskStore::from_history(&state.history);
 
         let mut pod = Self {
             manifest,
@@ -2152,6 +2191,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             metrics_tracker: Arc::new(crate::compact::metrics_tracker::MetricsTracker::new()),
             usage_history: Arc::new(Mutex::new(state.usage_history)),
             tracker: None,
+            task_store,
             // Restore replays the saved system_prompt verbatim — no
             // template re-render on resume.
             system_prompt_template: None,
@@ -2247,7 +2287,11 @@ impl From<WorkerResult> for PodRunResult {
 /// Build the compact worker's input: default-reference instructions,
 /// the list of recently-touched files, and the pruned conversation
 /// produced by [`build_summary_prompt`].
-fn build_summary_input(items: &[Item], default_refs: &[PathBuf]) -> String {
+fn build_summary_input(
+    items: &[Item],
+    default_refs: &[PathBuf],
+    task_snapshot: Option<&str>,
+) -> String {
     let mut out = String::new();
     out.push_str(
         "Summarise the conversation below into a structured summary and nominate \
@@ -2266,6 +2310,16 @@ fn build_summary_input(items: &[Item], default_refs: &[PathBuf]) -> String {
             out.push('\n');
         }
         out.push('\n');
+    }
+    if let Some(task_snapshot) = task_snapshot {
+        out.push_str(
+            "## Current Session TaskStore\n\
+             This is the full current task list. Use it as source material for the \
+             summary, especially active (pending/inprogress) tasks, but do not edit tasks \
+             from the compact worker.\n",
+        );
+        out.push_str(task_snapshot);
+        out.push_str("\n\n");
     }
     out.push_str("## Conversation\n");
     out.push_str(&build_summary_prompt(items));
