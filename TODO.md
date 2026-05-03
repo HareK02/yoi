@@ -5,6 +5,7 @@
 - Pod CLI: マニフェスト関連フラグの整理 → [tickets/pod-cli-manifest-flags.md](tickets/pod-cli-manifest-flags.md)
 - Pod: 空応答ターン (Submit 後 AI 応答ゼロで Pause/Cancel) を自動巻き戻し → [tickets/pod-empty-turn-rollback.md](tickets/pod-empty-turn-rollback.md)
 - Pod: 任意ターンからの Fork（複数ターン巻き戻しを汎用化） → [tickets/pod-session-fork.md](tickets/pod-session-fork.md)
+- Pod: 子→親の TurnEnded/Errored callback を親由来ターンのみに絞る → [tickets/pod-parent-turn-callback.md](tickets/pod-parent-turn-callback.md)
 - llm-worker のエラー耐性
   - HTTP transient リトライ → [tickets/llm-worker-transient-retry.md](tickets/llm-worker-transient-retry.md)
   - ストリーム途中失敗時の継続 → [tickets/llm-worker-stream-continuation.md](tickets/llm-worker-stream-continuation.md)
@@ -15,6 +16,7 @@
   - spawn 失敗時に Pod の stderr が TUI に表示されない → [tickets/tui-spawn-error-surface.md](tickets/tui-spawn-error-surface.md)
   - role:system の system message を TUI に表示する仕組み → [tickets/tui-system-message-render.md](tickets/tui-system-message-render.md)
   - 巻き戻されたターンの入力テキストを編集領域に復元 → [tickets/tui-empty-turn-restore.md](tickets/tui-empty-turn-restore.md)
+  - ステータスライン `↑` をキャッシュ控除後の純アップロード量に → [tickets/tui-upload-tokens-net.md](tickets/tui-upload-tokens-net.md)
 - Manifest: Tool Output / File Upload 上限の分離とデフォルト緩和 → [tickets/manifest-output-upload-limits.md](tickets/manifest-output-upload-limits.md)
 - メモリ機構
   - 使用頻度メトリクス + Knowledge 化候補レポート → [tickets/memory-usage-metrics.md](tickets/memory-usage-metrics.md)
