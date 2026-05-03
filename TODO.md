@@ -2,7 +2,6 @@
   - 内部 Worker / 内部 Pod の Workflow 化 → [tickets/internal-worker-workflow.md](tickets/internal-worker-workflow.md)
   - Agent Skills を Workflow として ingest → [tickets/agent-skills.md](tickets/agent-skills.md)
 - パーミッション: パターンベースのツール実行制御 → [tickets/permission-extension-point.md](tickets/permission-extension-point.md)
-- Resume 時の Scope claim の改善 → [tickets/resume-scope-claim.md](tickets/resume-scope-claim.md)
 - Pod CLI: マニフェスト関連フラグの整理 → [tickets/pod-cli-manifest-flags.md](tickets/pod-cli-manifest-flags.md)
 - llm-worker のエラー耐性
   - HTTP transient リトライ → [tickets/llm-worker-transient-retry.md](tickets/llm-worker-transient-retry.md)

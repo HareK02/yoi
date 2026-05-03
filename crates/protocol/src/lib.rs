@@ -439,7 +439,7 @@ pub enum ErrorCode {
 // ---------------------------------------------------------------------------
 
 /// A single allow or deny rule inside a scope configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ScopeRule {
     /// Target path. Must be absolute by the time a `Scope` is built from
     /// this rule — relative paths are resolved per-layer against the

@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use manifest::{Permission, ScopeRule};
 use session_store::SessionId;
 
-use crate::conflict::{find_conflict_owner, is_within_effective_write};
+use crate::conflict::{find_conflict_owner, find_conflict_owners, is_within_effective_write};
 use crate::error::ScopeLockError;
 use crate::table::{Allocation, LockFileGuard};
 
@@ -26,6 +26,38 @@ pub fn register_pod(
     scope_allow: Vec<ScopeRule>,
     session_id: SessionId,
 ) -> Result<(), ScopeLockError> {
+    register_pod_with_deny(
+        guard,
+        pod_name,
+        pid,
+        socket,
+        scope_allow,
+        Vec::new(),
+        session_id,
+    )
+}
+
+/// Register a top-level Pod with explicit deny rules that reduce the
+/// claimed effective write scope.
+///
+/// Conflict semantics: if every Pod overlapping a requested allow rule
+/// is fully covered by one of `scope_deny`, the conflict is suppressed
+/// and the registration proceeds. The check is structural (deny ⊇
+/// competitor.rule), not relational — it does not verify that the
+/// competitor actually descends from this Pod's prior delegations.
+/// In practice this is safe because the canonical caller is `restore`,
+/// which derives `scope_deny` from the session's own snapshot, so any
+/// covered competitor is guaranteed to be a descendant of the original
+/// allocation. Direct callers must uphold the same invariant.
+pub fn register_pod_with_deny(
+    guard: &mut LockFileGuard,
+    pod_name: String,
+    pid: u32,
+    socket: PathBuf,
+    scope_allow: Vec<ScopeRule>,
+    scope_deny: Vec<ScopeRule>,
+    session_id: SessionId,
+) -> Result<(), ScopeLockError> {
     reclaim_stale(guard);
     if guard.data().find(&pod_name).is_some() {
         return Err(ScopeLockError::DuplicatePodName(pod_name));
@@ -41,10 +73,22 @@ pub fn register_pod(
         .iter()
         .filter(|r| r.permission == Permission::Write)
     {
-        if let Some(competitor) = find_conflict_owner(guard.data(), rule, None) {
+        let conflicts = find_conflict_owners(guard.data(), rule, None);
+        let all_denied = !conflicts.is_empty()
+            && conflicts.iter().all(|owner| {
+                scope_deny
+                    .iter()
+                    .filter(|r| r.permission == Permission::Write)
+                    .any(|deny| crate::conflict::covers_fully(deny, &owner.rule))
+            });
+        if all_denied {
+            continue;
+        }
+        if let Some(competitor) = conflicts.into_iter().next() {
             return Err(ScopeLockError::WriteConflict {
-                competitor,
+                competitor: competitor.pod_name,
                 rule: rule.clone(),
+                competitor_rule: competitor.rule,
             });
         }
     }
@@ -53,6 +97,7 @@ pub fn register_pod(
         pid,
         socket,
         scope_allow,
+        scope_deny,
         delegated_from: None,
         session_id: Some(session_id),
     });
@@ -88,8 +133,9 @@ pub fn delegate_scope(
         if rule.permission == Permission::Write {
             if let Some(competitor) = find_conflict_owner(guard.data(), rule, Some(spawner)) {
                 return Err(ScopeLockError::WriteConflict {
-                    competitor,
+                    competitor: competitor.pod_name,
                     rule: rule.clone(),
+                    competitor_rule: competitor.rule,
                 });
             }
         }
@@ -99,6 +145,7 @@ pub fn delegate_scope(
         pid,
         socket,
         scope_allow,
+        scope_deny: Vec::new(),
         delegated_from: Some(spawner.into()),
         // Pre-reservation. The child fills in its own session_id when
         // it calls `adopt_allocation` after the worker is built.

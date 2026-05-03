@@ -13,8 +13,12 @@ pub enum ScopeLockError {
     Io(#[from] io::Error),
     #[error("pod name `{0}` is already registered")]
     DuplicatePodName(String),
-    #[error("requested scope `{}` conflicts with pod `{competitor}`", .rule.target.display())]
-    WriteConflict { competitor: String, rule: ScopeRule },
+    #[error("requested scope `{}` conflicts with pod `{competitor}` rule `{}`", .rule.target.display(), .competitor_rule.target.display())]
+    WriteConflict {
+        competitor: String,
+        rule: ScopeRule,
+        competitor_rule: ScopeRule,
+    },
     #[error(
         "requested scope `{}` is not within spawner `{spawner}`'s effective scope",
         .rule.target.display()

@@ -80,3 +80,31 @@ async fn restore_from_manifest_rejects_empty_session_log() {
         Ok(_) => panic!("expected empty session log to fail"),
     }
 }
+
+#[tokio::test]
+async fn restore_from_manifest_rejects_session_without_scope_snapshot() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let store_tmp = tempfile::tempdir().unwrap();
+    let store = FsStore::new(store_tmp.path()).await.unwrap();
+    let manifest = pod::PodManifest::from_toml(MINIMAL_MANIFEST_TOML).unwrap();
+
+    let id = session_store::new_session_id();
+    let state = session_store::SessionStartState {
+        system_prompt: None,
+        config: &Default::default(),
+        history: &[],
+    };
+    session_store::create_session_with_id(&store, id, state)
+        .await
+        .unwrap();
+
+    let result =
+        Pod::restore_from_manifest(id, manifest, store, pod::PromptLoader::builtins_only()).await;
+
+    match result {
+        Err(PodError::SessionScopeMissing { session_id }) => assert_eq!(session_id, id),
+        Err(other) => panic!("expected SessionScopeMissing, got {other:?}"),
+        Ok(_) => panic!("expected missing scope snapshot to fail"),
+    }
+}

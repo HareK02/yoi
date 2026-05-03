@@ -22,11 +22,16 @@ mod table;
 #[cfg(test)]
 mod test_util;
 
-pub use conflict::{find_conflict_owner, is_within_effective_write};
+pub use conflict::{
+    ConflictOwner, find_conflict_owner, find_conflict_owners, is_within_effective_write,
+};
 pub use error::ScopeLockError;
 pub use lifecycle::{
-    ScopeAllocationGuard, SessionLockInfo, adopt_allocation, install_top_level, lookup_session,
-    update_session,
+    ScopeAllocationGuard, SessionLockInfo, adopt_allocation, install_top_level,
+    install_top_level_with_deny, lookup_session, update_session,
 };
-pub use mutate::{delegate_scope, reclaim_stale, reclaim_stale_with, register_pod, release_pod};
+pub use mutate::{
+    delegate_scope, reclaim_stale, reclaim_stale_with, register_pod, register_pod_with_deny,
+    release_pod,
+};
 pub use table::{Allocation, LockFile, LockFileGuard, default_registry_path};
