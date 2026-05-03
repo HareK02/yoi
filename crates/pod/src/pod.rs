@@ -1395,7 +1395,12 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             .filter(|i| i.is_user_message())
             .count();
 
-        // Build new history: [summary, ...auto-read, task snapshot, TaskList result, references, ...retained].
+        // Build new history: [summary, ...auto-read, references, ...retained, task snapshot, TaskList synthetic call/result].
+        // The TaskStore snapshot trails the retained items so that, on resume,
+        // `replay_history` walks any pre-compact Task* calls preserved verbatim
+        // in retained_items first and the trailing snapshot's `replace_with`
+        // is the final word — pre-compact `TaskCreate` calls cannot leak as
+        // duplicate entries.
         let mut new_history = Vec::with_capacity(
             1 + auto_read_messages.len()
                 + 3
@@ -1406,6 +1411,10 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             "[Compacted context summary]\n\n{summary_text}"
         )));
         new_history.extend(auto_read_messages);
+        if let Some(msg) = reference_message {
+            new_history.push(msg);
+        }
+        new_history.extend(retained_items);
         new_history.push(Item::system_message(format!(
             "[Session TaskStore snapshot]\n\n{task_snapshot_text}\n\n\
              This is the complete session task list preserved across compaction. \
@@ -1417,10 +1426,6 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             tools::task::snapshot_overview(&self.task_store.list()),
             task_snapshot_text.clone(),
         ));
-        if let Some(msg) = reference_message {
-            new_history.push(msg);
-        }
-        new_history.extend(retained_items);
 
         // Persist as a new compacted session.
         let old_session_id = self.session_id;

@@ -609,4 +609,37 @@ mod tests {
         assert_eq!(tasks[1].taskid, 2);
         assert_eq!(tasks[1].subject, "new");
     }
+
+    #[test]
+    fn trailing_snapshot_supersedes_pre_compact_taskcreates_in_retained() {
+        // Mirrors the post-compact layout: pre-compact `TaskCreate` calls are
+        // preserved verbatim in retained_items, and the snapshot trails them.
+        // The trailing snapshot must reset the store to the captured state so
+        // pre-compact `TaskCreate`s do not surface as duplicates.
+        let snapshot = "[Session TaskStore snapshot]\n\nTaskStore: 2 task(s) (pending: 0, inprogress: 1, completed: 1, deleted: 0)\n\n- taskid: 1\n  status: completed\n  subject: A\n  description: A-desc\n\n- taskid: 2\n  status: inprogress\n  subject: B\n  description: B-desc\n";
+        let history = vec![
+            Item::tool_call("c1", "TaskCreate", r#"{"subject":"A","description":"A-desc"}"#),
+            Item::tool_call("u1", "TaskUpdate", r#"{"taskid":1,"status":"completed"}"#),
+            Item::tool_call("c2", "TaskCreate", r#"{"subject":"B","description":"B-desc"}"#),
+            Item::tool_call("u2", "TaskUpdate", r#"{"taskid":2,"status":"inprogress"}"#),
+            Item::system_message(snapshot),
+            Item::tool_call("compact-tasklist", "TaskList", "{}"),
+            Item::tool_call(
+                "c3",
+                "TaskCreate",
+                r#"{"subject":"C","description":"after compact"}"#,
+            ),
+        ];
+        let store = TaskStore::from_history(&history);
+        let tasks = store.list();
+        assert_eq!(tasks.len(), 3);
+        assert_eq!(tasks[0].taskid, 1);
+        assert_eq!(tasks[0].subject, "A");
+        assert_eq!(tasks[0].status, TaskStatus::Completed);
+        assert_eq!(tasks[1].taskid, 2);
+        assert_eq!(tasks[1].subject, "B");
+        assert_eq!(tasks[1].status, TaskStatus::Inprogress);
+        assert_eq!(tasks[2].taskid, 3);
+        assert_eq!(tasks[2].subject, "C");
+    }
 }
