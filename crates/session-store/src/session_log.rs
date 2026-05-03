@@ -311,7 +311,15 @@ pub fn collect_state(entries: &[HashedEntry]) -> RestoredState {
                 domain, payload, ..
             } => {
                 if domain == POD_SCOPE_EXTENSION_DOMAIN {
-                    state.pod_scope = serde_json::from_value(payload.clone()).ok();
+                    match serde_json::from_value::<PodScopeSnapshot>(payload.clone()) {
+                        Ok(snapshot) => state.pod_scope = Some(snapshot),
+                        Err(err) => {
+                            tracing::warn!(
+                                error = %err,
+                                "discarding malformed pod.scope snapshot from session log"
+                            );
+                        }
+                    }
                 }
                 state.extensions.push((domain.clone(), payload.clone()));
             }

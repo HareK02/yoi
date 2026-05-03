@@ -39,6 +39,16 @@ pub fn register_pod(
 
 /// Register a top-level Pod with explicit deny rules that reduce the
 /// claimed effective write scope.
+///
+/// Conflict semantics: if every Pod overlapping a requested allow rule
+/// is fully covered by one of `scope_deny`, the conflict is suppressed
+/// and the registration proceeds. The check is structural (deny ⊇
+/// competitor.rule), not relational — it does not verify that the
+/// competitor actually descends from this Pod's prior delegations.
+/// In practice this is safe because the canonical caller is `restore`,
+/// which derives `scope_deny` from the session's own snapshot, so any
+/// covered competitor is guaranteed to be a descendant of the original
+/// allocation. Direct callers must uphold the same invariant.
 pub fn register_pod_with_deny(
     guard: &mut LockFileGuard,
     pod_name: String,
