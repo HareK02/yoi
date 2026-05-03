@@ -72,3 +72,8 @@
 - `crates/session-store/src/session_log.rs`（`LogEntry::Extension` と `RestoredState.extensions` の既存仕様）
 - `crates/llm-worker/src/usage_record.rs`、`crates/llm-worker/src/llm_client/event.rs`（cache_read / cache_write の取得経路）
 - `crates/pod/src/compact/prune.rs`、`crates/llm-worker/src/prune.rs`（最初の利用者の挿入点）
+
+## Review
+- 状態: Approve with follow-up
+- レビュー詳細: [./session-metrics.review.md](./session-metrics.review.md)
+- 日付: 2026-05-03

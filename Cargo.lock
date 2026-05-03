@@ -2144,6 +2144,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "session-metrics",
  "session-store",
  "tempfile",
  "thiserror 2.0.18",
@@ -2924,6 +2925,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "session-metrics"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "session-store",
 ]
 
 [[package]]

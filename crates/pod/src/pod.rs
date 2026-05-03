@@ -77,6 +77,11 @@ pub struct Pod<C: LlmClient, St: Store> {
     /// Captures `(history_len, UsageEvent)` pairs during a run; drained
     /// in `persist_turn` and persisted as `LogEntry::LlmUsage` entries.
     usage_tracker: Arc<UsageTracker>,
+    /// Sync-side buffer for `Metric` values queued from inside Worker
+    /// callbacks (currently the prune observer). Drained in `persist_turn`
+    /// and written via `session_metrics::record_metric` alongside
+    /// `LogEntry::LlmUsage`. Always present after construction.
+    metrics_tracker: Arc<crate::compact::metrics_tracker::MetricsTracker>,
     /// Cumulative Usage measurement timeline, one entry per LLM call.
     /// Restored from session log on `restore`, appended on each persist.
     /// Read by token-accounting APIs (`Pod::total_tokens`, etc.).
@@ -203,6 +208,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             interceptor_installed: false,
             compact_state: None,
             usage_tracker: Arc::new(UsageTracker::new()),
+            metrics_tracker: Arc::new(crate::compact::metrics_tracker::MetricsTracker::new()),
             usage_history: Arc::new(Mutex::new(Vec::<UsageRecord>::new())),
             tracker: None,
             system_prompt_template: None,
@@ -389,6 +395,26 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     /// non-contended at every Pod lifecycle event.
     pub fn usage_history_handle(&self) -> Arc<Mutex<Vec<UsageRecord>>> {
         self.usage_history.clone()
+    }
+
+    /// Handle to the per-LLM-request `UsageTracker`.
+    ///
+    /// Sibling modules (e.g. the prune observer) clone this `Arc` to stash
+    /// per-request side state (e.g. a `correlation_id`) that pairs with
+    /// the next `LlmUsage`.
+    pub(crate) fn usage_tracker_handle(&self) -> Arc<UsageTracker> {
+        self.usage_tracker.clone()
+    }
+
+    /// Handle to the synchronous `MetricsTracker` buffer.
+    ///
+    /// Worker callbacks (e.g. the prune observer) clone this `Arc` and
+    /// `.push(metric)` into it; Pod drains it in `persist_turn` and
+    /// writes each metric via `session_metrics::record_metric`.
+    pub(crate) fn metrics_tracker_handle(
+        &self,
+    ) -> Arc<crate::compact::metrics_tracker::MetricsTracker> {
+        self.metrics_tracker.clone()
     }
 
     /// Attach the session-scoped file-operation tracker from the builtin
@@ -1068,13 +1094,36 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         )
         .await?;
 
+        // Flush any sync-buffered metrics from this run first
+        // (currently `prune.fire` / `prune.skip` from the prune observer).
+        // Ordered before LlmUsage so that a `prune.fire` and the
+        // `prune.post_request` derived from the matching usage record
+        // appear in the log close together.
+        let pending_metrics = self.metrics_tracker.drain();
+        for metric in pending_metrics {
+            session_metrics::record_metric(
+                &self.store,
+                self.session_id,
+                &mut self.head_hash,
+                &metric,
+            )
+            .await?;
+        }
+
         // Persist any LLM Usage measurements collected during this run.
         // One LogEntry::LlmUsage per LLM call (the tool loop may have run
         // many calls within a single Pod::run). Each is also appended to
         // the in-memory `usage_history` so token-accounting APIs see it
-        // before the next run.
+        // before the next run. Records carrying a `correlation_id` (set
+        // by an upstream observer such as the prune projection) also get
+        // a paired `prune.post_request` metric so cache_read/write can be
+        // joined back to the originating event.
         let usage_records = self.usage_tracker.drain();
-        for record in usage_records {
+        for recorded in usage_records {
+            let crate::compact::usage_tracker::RecordedUsage {
+                record,
+                correlation_id,
+            } = recorded;
             session_store::save_usage(
                 &self.store,
                 self.session_id,
@@ -1086,6 +1135,20 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 record.output_tokens,
             )
             .await?;
+            if let Some(id) = correlation_id {
+                let metric = session_metrics::Metric::now("prune.post_request")
+                    .with_correlation_id(&id)
+                    .with_value(record.cache_read_tokens as f64)
+                    .with_dimension("cache_write_tokens", record.cache_write_tokens.to_string())
+                    .with_dimension("history_len", record.history_len.to_string());
+                session_metrics::record_metric(
+                    &self.store,
+                    self.session_id,
+                    &mut self.head_hash,
+                    &metric,
+                )
+                .await?;
+            }
             self.usage_history
                 .lock()
                 .expect("usage_history poisoned")
@@ -1895,6 +1958,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             interceptor_installed: false,
             compact_state: None,
             usage_tracker: Arc::new(UsageTracker::new()),
+            metrics_tracker: Arc::new(crate::compact::metrics_tracker::MetricsTracker::new()),
             usage_history: Arc::new(Mutex::new(Vec::new())),
             tracker: None,
             system_prompt_template: common.system_prompt_template,
@@ -1956,6 +2020,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             interceptor_installed: false,
             compact_state: None,
             usage_tracker: Arc::new(UsageTracker::new()),
+            metrics_tracker: Arc::new(crate::compact::metrics_tracker::MetricsTracker::new()),
             usage_history: Arc::new(Mutex::new(Vec::new())),
             tracker: None,
             system_prompt_template: common.system_prompt_template,
@@ -2067,6 +2132,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             interceptor_installed: false,
             compact_state: None,
             usage_tracker: Arc::new(UsageTracker::new()),
+            metrics_tracker: Arc::new(crate::compact::metrics_tracker::MetricsTracker::new()),
             usage_history: Arc::new(Mutex::new(state.usage_history)),
             tracker: None,
             // Restore replays the saved system_prompt verbatim — no

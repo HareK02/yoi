@@ -10,6 +10,7 @@ members = [
     "crates/protocol",
     "crates/provider",
     "crates/pod-registry",
+    "crates/session-metrics",
     "crates/tools",
     "crates/tui",
     "crates/memory",
@@ -28,6 +29,7 @@ memory = { path = "crates/memory" }
 pod-registry = { path = "crates/pod-registry" }
 protocol = { path = "crates/protocol" }
 provider = { path = "crates/provider" }
+session-metrics = { path = "crates/session-metrics" }
 session-store = { path = "crates/session-store" }
 tools = { path = "crates/tools" }
 

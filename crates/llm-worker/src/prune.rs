@@ -30,6 +30,43 @@ use crate::llm_client::types::Item;
 /// 実際の projection と一致する savings を返す必要がある。
 pub type SavingsEstimator = Box<dyn Fn(&[Item], &[usize]) -> u64 + Send + Sync>;
 
+/// Result of one prune evaluation pass, surfaced to the optional
+/// [`PruneObserver`] for instrumentation.
+///
+/// Worker は LLM リクエストごとに 1 回 prune の評価をし、その結果を
+/// （observer が登録されていれば）この値で通知する。fire/skip の判定
+/// 結果と、判定材料になった候補数 / 推定 savings / 境界ターン位置を持つ。
+#[derive(Debug, Clone)]
+pub struct PruneEvaluation {
+    /// `prunable_indices` の長さ。`Skipped::NoCandidates` の時は 0。
+    pub candidate_count: usize,
+    /// 推定された savings (tokens)。`NoCandidates` の時は 0。
+    pub estimated_savings: u64,
+    /// `protected_turns` 境界に当たる turn-start アイテムの index。
+    /// turn 数が `protected_turns` 以下で境界が決まらない場合は `None`。
+    pub border_turn: Option<usize>,
+    /// 判定結果。
+    pub decision: PruneDecision,
+}
+
+/// Outcome of one prune evaluation. Each variant is one branch of the
+/// "fire vs skip" decision tree the Worker walks before each LLM request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PruneDecision {
+    /// `prunable_indices` が空 → 何もしない。
+    SkippedNoCandidates,
+    /// 候補はあったが推定 savings が `min_savings` 未満 → 何もしない。
+    SkippedBelowMinSavings,
+    /// 候補があり savings >= min_savings → projection を適用した。
+    /// `pruned_count` は `project()` が実際に書き換えた item 数
+    /// （既に content=None だった候補は 0 計上）。
+    Fired { pruned_count: usize },
+}
+
+/// Optional observer invoked after each prune evaluation, regardless of
+/// branch. Pod 等の上位層が install して metrics を発行する。
+pub type PruneObserver = Box<dyn Fn(&PruneEvaluation) + Send + Sync>;
+
 /// Configuration for the Prune algorithm.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PruneConfig {
@@ -100,12 +137,20 @@ pub fn project(items: &mut [Item], indices: &[usize]) -> usize {
 /// Returns an empty vector when there are too few turns or no prunable
 /// candidates.
 pub fn prunable_indices(items: &[Item], protected_turns: usize) -> Vec<usize> {
+    evaluate_candidates(items, protected_turns).0
+}
+
+/// Same as [`prunable_indices`] but also returns the index of the
+/// `protected_turns` boundary (the turn-start item whose tail is
+/// protected). `None` when too few turns exist for a boundary to be
+/// defined.
+pub fn evaluate_candidates(items: &[Item], protected_turns: usize) -> (Vec<usize>, Option<usize>) {
     let turn_starts = find_turn_starts(items);
     if turn_starts.len() <= protected_turns {
-        return Vec::new();
+        return (Vec::new(), None);
     }
     let boundary = turn_starts[turn_starts.len() - protected_turns];
-    items[..boundary]
+    let candidates = items[..boundary]
         .iter()
         .enumerate()
         .filter_map(|(i, item)| match item {
@@ -114,7 +159,8 @@ pub fn prunable_indices(items: &[Item], protected_turns: usize) -> Vec<usize> {
             } => Some(i),
             _ => None,
         })
-        .collect()
+        .collect();
+    (candidates, Some(boundary))
 }
 
 #[cfg(test)]
@@ -237,6 +283,30 @@ mod tests {
         assert_eq!(project(&mut items, &candidates), 1);
         // 2 周目: 候補は一度の prunable_indices 結果を使い回しても 0 件。
         assert_eq!(project(&mut items, &candidates), 0);
+    }
+
+    #[test]
+    fn evaluate_candidates_returns_boundary_index() {
+        let big = "x".repeat(64);
+        let items = make_history(&[
+            ("turn1", vec![("s1", Some(&big))]),
+            ("turn2", vec![("s2", Some(&big))]),
+            ("turn3", vec![("s3", Some("keep"))]),
+            ("turn4", vec![("s4", Some("keep too"))]),
+        ]);
+        let (candidates, border) = evaluate_candidates(&items, 2);
+        assert_eq!(candidates.len(), 2);
+        // protected_turns=2 → boundary は turn3 の user message 位置。
+        // turn1: u/a/c/r (4) + turn2: u/a/c/r (4) = index 8 (turn3 の user)。
+        assert_eq!(border, Some(8));
+    }
+
+    #[test]
+    fn evaluate_candidates_no_boundary_when_too_few_turns() {
+        let items = make_history(&[("only", vec![("s", Some("x"))])]);
+        let (candidates, border) = evaluate_candidates(&items, 2);
+        assert!(candidates.is_empty());
+        assert!(border.is_none());
     }
 
     #[test]

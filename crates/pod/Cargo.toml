@@ -28,6 +28,7 @@ libc = { workspace = true }
 schemars = { workspace = true }
 memory = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
+session-metrics = { workspace = true }
 
 [dev-dependencies]
 dotenv = "0.15.0"

@@ -184,6 +184,9 @@ pub struct Worker<C: LlmClient, S: WorkerState = Mutable> {
     /// by higher layers that own usage measurements. `None` disables
     /// the prune projection.
     savings_estimator: Option<crate::prune::SavingsEstimator>,
+    /// Optional observer fired once per prune evaluation (regardless of
+    /// whether projection actually fired). `None` disables instrumentation.
+    prune_observer: Option<crate::prune::PruneObserver>,
     /// Index of the last stable cache prefix item, set by higher layers.
     /// Plumbed into [`Request::cache_anchor`] at request build time.
     cache_anchor: Option<usize>,
@@ -382,6 +385,16 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
     /// "no data" or "refuse to prune".
     pub fn set_savings_estimator(&mut self, estimator: Option<crate::prune::SavingsEstimator>) {
         self.savings_estimator = estimator;
+    }
+
+    /// Install an observer notified after each prune evaluation pass.
+    ///
+    /// Fires once per outgoing LLM request (the same point as the
+    /// `prune_config` / `savings_estimator` pair), regardless of whether
+    /// projection actually applied. Intended for upper layers that want
+    /// to instrument fire/skip rates without owning the prune logic.
+    pub fn set_prune_observer(&mut self, observer: Option<crate::prune::PruneObserver>) {
+        self.prune_observer = observer;
     }
 
     /// Mark an index into the current history as a stable, cacheable
@@ -854,9 +867,16 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
             // threshold. Worker does not own usage history itself; the
             // estimator is injected by the layer that does.
             if let (Some(config), Some(estimator)) = (&self.prune_config, &self.savings_estimator) {
-                let candidates =
-                    crate::prune::prunable_indices(&request_context, config.protected_turns);
-                if !candidates.is_empty() {
+                let (candidates, border_turn) =
+                    crate::prune::evaluate_candidates(&request_context, config.protected_turns);
+                let evaluation = if candidates.is_empty() {
+                    crate::prune::PruneEvaluation {
+                        candidate_count: 0,
+                        estimated_savings: 0,
+                        border_turn,
+                        decision: crate::prune::PruneDecision::SkippedNoCandidates,
+                    }
+                } else {
                     let savings = estimator(&request_context, &candidates);
                     if savings >= config.min_savings {
                         let pruned = crate::prune::project(&mut request_context, &candidates);
@@ -867,7 +887,25 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
                                 "Projected old tool-result content out of request context"
                             );
                         }
+                        crate::prune::PruneEvaluation {
+                            candidate_count: candidates.len(),
+                            estimated_savings: savings,
+                            border_turn,
+                            decision: crate::prune::PruneDecision::Fired {
+                                pruned_count: pruned,
+                            },
+                        }
+                    } else {
+                        crate::prune::PruneEvaluation {
+                            candidate_count: candidates.len(),
+                            estimated_savings: savings,
+                            border_turn,
+                            decision: crate::prune::PruneDecision::SkippedBelowMinSavings,
+                        }
                     }
+                };
+                if let Some(observer) = &self.prune_observer {
+                    observer(&evaluation);
                 }
             }
 
@@ -1077,6 +1115,7 @@ impl<C: LlmClient> Worker<C, Mutable> {
             tool_output_limits: None,
             prune_config: None,
             savings_estimator: None,
+            prune_observer: None,
             cache_anchor: None,
             cache_key: None,
             _state: PhantomData,
@@ -1334,6 +1373,7 @@ impl<C: LlmClient> Worker<C, Mutable> {
             tool_output_limits: self.tool_output_limits,
             prune_config: self.prune_config,
             savings_estimator: self.savings_estimator,
+            prune_observer: self.prune_observer,
             cache_anchor: self.cache_anchor,
             cache_key: self.cache_key,
             _state: PhantomData,
@@ -1414,6 +1454,7 @@ impl<C: LlmClient> Worker<C, Locked> {
             tool_output_limits: self.tool_output_limits,
             prune_config: self.prune_config,
             savings_estimator: self.savings_estimator,
+            prune_observer: self.prune_observer,
             cache_anchor: self.cache_anchor,
             cache_key: self.cache_key,
             _state: PhantomData,
