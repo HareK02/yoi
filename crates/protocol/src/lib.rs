@@ -214,6 +214,20 @@ pub enum Event {
     UserMessage {
         segments: Vec<Segment>,
     },
+    /// Echo of `Method::Notify` received by this Pod. Broadcast on
+    /// receipt so subscribers can render the external input as a log
+    /// element. The same `message` is independently pushed into the
+    /// notification buffer for LLM injection (with prompt-pack
+    /// wrapping); this echo carries the raw payload and does not
+    /// imply any turn-boundary semantics.
+    Notify {
+        message: String,
+    },
+    /// Echo of `Method::PodEvent` received by this Pod. Same rationale
+    /// as `Notify`: subscribers render the event as a log element,
+    /// while a rendered summary is independently injected into the LLM
+    /// context via the notification buffer.
+    PodEvent(PodEvent),
     TurnStart {
         turn: usize,
     },
@@ -928,6 +942,43 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["event"], "error");
         assert_eq!(parsed["data"]["code"], "already_running");
+    }
+
+    #[test]
+    fn event_notify_roundtrip() {
+        let event = Event::Notify {
+            message: "child-pod finished".into(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["event"], "notify");
+        assert_eq!(parsed["data"]["message"], "child-pod finished");
+
+        let decoded: Event = serde_json::from_str(&json).unwrap();
+        match decoded {
+            Event::Notify { message } => assert_eq!(message, "child-pod finished"),
+            other => panic!("expected Notify, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn event_pod_event_roundtrip() {
+        let event = Event::PodEvent(PodEvent::TurnEnded {
+            pod_name: "child".into(),
+        });
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["event"], "pod_event");
+        assert_eq!(parsed["data"]["kind"], "turn_ended");
+        assert_eq!(parsed["data"]["pod_name"], "child");
+
+        let decoded: Event = serde_json::from_str(&json).unwrap();
+        match decoded {
+            Event::PodEvent(PodEvent::TurnEnded { pod_name }) => {
+                assert_eq!(pod_name, "child");
+            }
+            other => panic!("expected PodEvent::TurnEnded, got {other:?}"),
+        }
     }
 
     #[test]

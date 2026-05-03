@@ -22,7 +22,7 @@ use ratatui::widgets::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use protocol::{AlertLevel, CompletionEntry, Greeting, Segment};
+use protocol::{AlertLevel, CompletionEntry, Greeting, PodEvent, Segment};
 
 use crate::app::{App, CompletionState, alert_source_label, fmt_tokens};
 use crate::block::{Block, CompactEvent, ThinkingBlock, ThinkingState};
@@ -361,6 +361,20 @@ fn render_block_into(lines: &mut Vec<Line<'static>>, block: &Block, width: u16, 
             )));
         }
         Block::UserMessage { segments } => render_user_message(lines, segments, width, mode),
+        Block::Notify { message } => {
+            let text = format!("[notify] {message}");
+            match mode {
+                Mode::Overview => push_overview_line(lines, &text, width, MessageKind::Notify, ""),
+                _ => push_padded_lines(lines, &text, MessageKind::Notify),
+            }
+        }
+        Block::PodEvent { event } => {
+            let text = format_pod_event(event);
+            match mode {
+                Mode::Overview => push_overview_line(lines, &text, width, MessageKind::Notify, ""),
+                _ => push_padded_lines(lines, &text, MessageKind::Notify),
+            }
+        }
         Block::AssistantText { text } => match mode {
             Mode::Overview => push_overview_line(lines, text, width, MessageKind::Assistant, ""),
             _ => push_padded_lines(lines, text, MessageKind::Assistant),
@@ -913,6 +927,10 @@ fn greeting_lines(g: &Greeting) -> Vec<Line<'static>> {
 pub enum MessageKind {
     TurnHeader,
     User,
+    /// External-input echoes (`Method::Notify` / `Method::PodEvent`).
+    /// Visually distinct from User / Assistant / Notice so it's clear
+    /// the line came from another Pod or operator, not the local user.
+    Notify,
     Assistant,
     Thinking,
     TurnStats,
@@ -924,6 +942,7 @@ pub fn kind_style(kind: MessageKind) -> Style {
     match kind {
         MessageKind::TurnHeader => Style::default().fg(Color::DarkGray),
         MessageKind::User => Style::default().fg(Color::Green),
+        MessageKind::Notify => Style::default().fg(Color::Yellow),
         MessageKind::Assistant => Style::default().fg(Color::White),
         MessageKind::Thinking => Style::default()
             .fg(Color::Magenta)
@@ -937,5 +956,28 @@ pub fn kind_style(kind: MessageKind) -> Style {
             .fg(Color::White)
             .bg(Color::Red)
             .add_modifier(Modifier::BOLD),
+    }
+}
+
+/// One-line summary of a `PodEvent` for display in the activity log.
+/// Independent from the LLM-injection wrapper (`crate::ipc::event::render_event`
+/// in the pod crate) — that path applies prompt-pack wrapping, while
+/// this is the human-facing rendering of the raw structured event.
+fn format_pod_event(event: &PodEvent) -> String {
+    match event {
+        PodEvent::TurnEnded { pod_name } => {
+            format!("[pod_event] {pod_name} → turn_ended")
+        }
+        PodEvent::Errored { pod_name, message } => {
+            format!("[pod_event] {pod_name} → errored: {message}")
+        }
+        PodEvent::ShutDown { pod_name } => {
+            format!("[pod_event] {pod_name} → shut_down")
+        }
+        PodEvent::ScopeSubDelegated {
+            parent_pod, sub_pod, ..
+        } => {
+            format!("[pod_event] {parent_pod} → scope_sub_delegated: {sub_pod}")
+        }
     }
 }

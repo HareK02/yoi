@@ -448,6 +448,9 @@ impl PodController {
                     }
 
                     Method::Notify { message } => {
+                        let _ = event_tx.send(Event::Notify {
+                            message: message.clone(),
+                        });
                         pod.push_notify(message);
                         if shared_state.get_status() != PodStatus::Idle {
                             // RUNNING / Paused: the buffer push is the
@@ -609,6 +612,10 @@ impl PodController {
                     Method::GetHistory | Method::ListCompletions { .. } => {}
 
                     Method::PodEvent(event) => {
+                        // Echo the received event to all subscribers so
+                        // every client sees the input that drove any
+                        // following auto-kicked turn.
+                        let _ = event_tx.send(Event::PodEvent(event.clone()));
                         // (1) system side effects — idempotent and
                         // tolerant of out-of-order delivery (e.g.
                         // `TurnEnded` arriving after `ShutDown`).
@@ -809,12 +816,16 @@ where
                         });
                     }
                     Some(Method::Notify { message }) => {
+                        let _ = event_tx.send(Event::Notify {
+                            message: message.clone(),
+                        });
                         // Route into the buffer; the in-flight turn will
                         // drain it at its next pre_llm_request.
                         notify_buffer.push(message);
                     }
                     Some(Method::GetHistory | Method::ListCompletions { .. }) => {}
                     Some(Method::PodEvent(event)) => {
+                        let _ = event_tx.send(Event::PodEvent(event.clone()));
                         // mpsc is consume-once, so we cannot defer this
                         // to the next main-loop iteration — drop here
                         // would lose the event entirely (children fire

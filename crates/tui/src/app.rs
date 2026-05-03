@@ -312,6 +312,14 @@ impl App {
                 self.blocks.push(Block::UserMessage { segments });
                 self.assistant_streaming = false;
             }
+            Event::Notify { message } => {
+                self.blocks.push(Block::Notify { message });
+                self.assistant_streaming = false;
+            }
+            Event::PodEvent(event) => {
+                self.blocks.push(Block::PodEvent { event });
+                self.assistant_streaming = false;
+            }
             Event::TurnStart { .. } => {
                 self.running = true;
                 self.paused = false;
