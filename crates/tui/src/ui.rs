@@ -406,13 +406,13 @@ fn render_block_into(lines: &mut Vec<Line<'static>>, block: &Block, width: u16, 
         Block::Compact(evt) => render_compact(lines, evt, width, mode),
         Block::TurnStats {
             requests,
-            input_tokens,
+            upload_tokens,
             output_tokens,
         } => {
             let text = format!(
                 "{} reqs ↑{}/↓{}",
                 requests,
-                fmt_tokens(*input_tokens),
+                fmt_tokens(*upload_tokens),
                 fmt_tokens(*output_tokens),
             );
             lines.push(
@@ -780,14 +780,14 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
             format!(
                 "request: {} | ↑{}/↓{} | tool: {tool}",
                 app.run_requests,
-                fmt_tokens(app.run_input_tokens),
+                fmt_tokens(app.run_upload_tokens),
                 fmt_tokens(app.run_output_tokens),
             )
         } else {
             format!(
                 "request: {} | ↑{}/↓{}",
                 app.run_requests,
-                fmt_tokens(app.run_input_tokens),
+                fmt_tokens(app.run_upload_tokens),
                 fmt_tokens(app.run_output_tokens),
             )
         };

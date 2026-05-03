@@ -281,9 +281,19 @@ pub enum Event {
         #[serde(default)]
         is_error: bool,
     },
+    /// Token accounting for one LLM request.
+    ///
+    /// `input_tokens` is the prompt prefix occupancy (cache reads /
+    /// cache writes included), as normalised by the worker layer.
+    /// `cache_read_input_tokens` is the cache-hit subset of that
+    /// occupancy; subtracting it yields the "net upload" the client
+    /// actually paid full price to send on this request, which is what
+    /// the TUI status line accumulates per turn.
     Usage {
         input_tokens: Option<u64>,
         output_tokens: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_read_input_tokens: Option<u64>,
     },
     RunEnd {
         result: RunResult,

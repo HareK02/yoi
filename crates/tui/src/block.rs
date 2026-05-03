@@ -43,7 +43,10 @@ pub enum Block {
     Compact(CompactEvent),
     TurnStats {
         requests: usize,
-        input_tokens: u64,
+        /// Net tokens uploaded across the turn's LLM requests
+        /// (cache reads excluded; cache writes included). Same value
+        /// the status line accumulates while the turn is in flight.
+        upload_tokens: u64,
         output_tokens: u64,
     },
 }

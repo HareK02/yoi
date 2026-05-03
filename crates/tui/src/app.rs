@@ -47,7 +47,11 @@ pub struct App {
     /// `Resume` or a fresh `Run`).
     pub paused: bool,
     pub run_requests: usize,
-    pub run_input_tokens: u64,
+    /// Sum of `input_tokens - cache_read_input_tokens` across the
+    /// current turn's LLM requests — i.e. the net tokens this turn
+    /// actually had to upload at full price (cache writes included,
+    /// cache reads excluded). Reset on `RunEnd`.
+    pub run_upload_tokens: u64,
     pub run_output_tokens: u64,
     pub turn_index: usize,
     pub current_tool: Option<String>,
@@ -79,7 +83,7 @@ impl App {
             running: false,
             paused: false,
             run_requests: 0,
-            run_input_tokens: 0,
+            run_upload_tokens: 0,
             run_output_tokens: 0,
             turn_index: 0,
             current_tool: None,
@@ -465,8 +469,16 @@ impl App {
             Event::Usage {
                 input_tokens,
                 output_tokens,
+                cache_read_input_tokens,
             } => {
-                self.run_input_tokens += input_tokens.unwrap_or(0);
+                // Subtract the cache-hit portion so a tool loop that
+                // re-sends the same prefix on every request doesn't
+                // re-count it. cache_creation stays in (it is full
+                // price on this request).
+                let net_input = input_tokens
+                    .unwrap_or(0)
+                    .saturating_sub(cache_read_input_tokens.unwrap_or(0));
+                self.run_upload_tokens += net_input;
                 self.run_output_tokens += output_tokens.unwrap_or(0);
             }
             Event::Error { code, message } => {
@@ -475,13 +487,13 @@ impl App {
             Event::RunEnd { result } => {
                 self.blocks.push(Block::TurnStats {
                     requests: self.run_requests,
-                    input_tokens: self.run_input_tokens,
+                    upload_tokens: self.run_upload_tokens,
                     output_tokens: self.run_output_tokens,
                 });
                 self.running = false;
                 self.paused = matches!(result, RunResult::Paused);
                 self.run_requests = 0;
-                self.run_input_tokens = 0;
+                self.run_upload_tokens = 0;
                 self.run_output_tokens = 0;
                 self.current_tool = None;
                 self.assistant_streaming = false;

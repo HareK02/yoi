@@ -76,10 +76,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Event::Usage {
                     input_tokens,
                     output_tokens,
+                    cache_read_input_tokens,
                 } => {
                     println!(
-                        "[usage] in={} out={}",
+                        "[usage] in={} (cache_read={}) out={}",
                         input_tokens.unwrap_or(0),
+                        cache_read_input_tokens.unwrap_or(0),
                         output_tokens.unwrap_or(0)
                     );
                 }

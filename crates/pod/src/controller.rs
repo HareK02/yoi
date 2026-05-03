@@ -229,6 +229,7 @@ impl PodController {
                 let _ = tx.send(Event::Usage {
                     input_tokens: event.input_tokens,
                     output_tokens: event.output_tokens,
+                    cache_read_input_tokens: event.cache_read_input_tokens,
                 });
             });
 
