@@ -120,8 +120,35 @@ pub trait Interceptor: Send + Sync {
         PromptAction::Continue
     }
 
-    /// Called before each LLM request. The context can be modified
-    /// (e.g. for context compaction).
+    /// Items that should be **committed to `worker.history`** just
+    /// before the next LLM request. Returned items are `extend`ed into
+    /// the persistent history (and therefore picked up by the per-turn
+    /// clone that backs the LLM request, plus the usual
+    /// history-persistence path).
+    ///
+    /// Use this for inputs that arrive from outside the LLM and need
+    /// to be reflected in the on-disk history — notifications,
+    /// cross-Pod events, system reminders. Do **not** use
+    /// [`Self::pre_llm_request`] for that purpose: it mutates a
+    /// per-request clone, so any committed assistant response that
+    /// reacts to the injection would have no visible trigger on the
+    /// next turn (or after resume / compaction).
+    ///
+    /// `pre_llm_request` remains the right place for purely
+    /// reproducible per-request transformations (pruning, content
+    /// trimming, cache anchors) that depend only on the existing
+    /// history.
+    async fn pending_history_appends(&self) -> Vec<Item> {
+        Vec::new()
+    }
+
+    /// Called before each LLM request. The context starts as a clone
+    /// of `worker.history` (after `pending_history_appends` and the
+    /// Worker's own prune projection have been applied) and can be
+    /// further modified for that single request only — mutations here
+    /// are **not** persisted back to history. Use
+    /// [`Self::pending_history_appends`] for inputs that need to land
+    /// in history.
     async fn pre_llm_request(&self, _context: &mut Vec<Item>) -> PreRequestAction {
         PreRequestAction::Continue
     }

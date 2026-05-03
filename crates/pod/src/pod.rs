@@ -539,11 +539,13 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         }
     }
 
-    /// Push a `Method::Notify` entry onto the pending buffer.
+    /// Push a `Method::Notify` (or rendered `Method::PodEvent`) entry
+    /// onto the pending buffer.
     ///
-    /// The notification will be injected as an `Item::system_message`
-    /// into the next outgoing LLM request context (not into history).
-    /// See [`NotifyBuffer`] for overflow behaviour.
+    /// The notification will be appended to `worker.history` as an
+    /// `Item::system_message` just before the next LLM request, via
+    /// `PodInterceptor::pending_history_appends`. See [`NotifyBuffer`]
+    /// for overflow behaviour and the lane-of-record rationale.
     pub fn push_notify(&self, message: String) {
         self.pending_notifies.push(message);
     }

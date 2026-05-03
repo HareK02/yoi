@@ -560,22 +560,37 @@ async fn notify_while_idle_auto_starts_turn_and_injects_system_message() {
     assert_eq!(handle.shared_state.get_status(), PodStatus::Idle);
 
     // Exactly one request was made; it must contain the formatted
-    // notification as the last item (injected into request_context by
-    // PodInterceptor::pre_llm_request).
+    // notification as one of the items (committed to history by
+    // PodInterceptor::pending_history_appends and cloned into the
+    // request context for that turn).
     let requests = client_for_assert.captured_requests();
     assert_eq!(requests.len(), 1, "one LLM call expected");
-    let last_item_text = requests[0]
+    let notify_in_request = requests[0]
         .items
-        .last()
-        .and_then(|i| i.as_text())
-        .unwrap_or_default()
-        .to_string();
+        .iter()
+        .any(|i| i.as_text().is_some_and(|t| t.contains("[Notification]") && t.contains("turn finished")));
     assert!(
-        last_item_text.contains("[Notification]"),
-        "injected system message missing, got: {last_item_text:?}"
+        notify_in_request,
+        "injected system message missing from request, got items: {:?}",
+        requests[0]
+            .items
+            .iter()
+            .filter_map(|i| i.as_text())
+            .collect::<Vec<_>>()
     );
-    assert!(last_item_text.contains("turn finished"));
-    assert!(last_item_text.contains("not a blocking request"));
+
+    // The notification must also be persisted into the Worker history
+    // (and therefore eventually into history.json), per
+    // tickets/notify-history-persist.md.
+    let history = handle.shared_state.history();
+    let notify_in_history = history
+        .iter()
+        .any(|i| i.as_text().is_some_and(|t| t.contains("[Notification]") && t.contains("turn finished")));
+    assert!(
+        notify_in_history,
+        "notify must be committed to worker.history, got items: {:?}",
+        history.iter().filter_map(|i| i.as_text()).collect::<Vec<_>>()
+    );
 }
 
 #[tokio::test]
@@ -630,19 +645,33 @@ async fn pod_event_turn_ended_while_idle_auto_starts_turn_and_injects_system_mes
         1,
         "auto-kick should issue exactly one LLM request"
     );
-    let last_item_text = requests[0]
-        .items
-        .last()
-        .and_then(|i| i.as_text())
-        .unwrap_or_default()
-        .to_string();
+    let event_in_request = requests[0].items.iter().any(|i| {
+        i.as_text().is_some_and(|t| {
+            t.contains("[Notification]") && t.contains("child") && t.contains("finished a turn")
+        })
+    });
     assert!(
-        last_item_text.contains("[Notification]"),
-        "injected system message missing, got: {last_item_text:?}"
+        event_in_request,
+        "rendered TurnEnded text missing from request, got items: {:?}",
+        requests[0]
+            .items
+            .iter()
+            .filter_map(|i| i.as_text())
+            .collect::<Vec<_>>()
     );
+
+    // Same item must be present in worker.history (persisted lane),
+    // not just the per-request clone — see tickets/notify-history-persist.md.
+    let history = handle.shared_state.history();
+    let event_in_history = history.iter().any(|i| {
+        i.as_text().is_some_and(|t| {
+            t.contains("[Notification]") && t.contains("child") && t.contains("finished a turn")
+        })
+    });
     assert!(
-        last_item_text.contains("child") && last_item_text.contains("finished a turn"),
-        "rendered TurnEnded text missing, got: {last_item_text:?}"
+        event_in_history,
+        "PodEvent must be committed to worker.history, got items: {:?}",
+        history.iter().filter_map(|i| i.as_text()).collect::<Vec<_>>()
     );
 }
 

@@ -1,9 +1,22 @@
-//! Pending-notify buffer for `Method::Notify`.
+//! Pending-notify buffer for `Method::Notify` and `Method::PodEvent`.
 //!
-//! Notify entries are queued here by the Controller and drained by
-//! `PodInterceptor::pre_llm_request` into the per-request context
-//! (never into the Worker's persistent history). Each queued entry
-//! becomes one `Item::system_message` in the outgoing request.
+//! Entries are queued here by the Controller (on receipt of the
+//! corresponding IPC method) and drained by
+//! `PodInterceptor::pending_history_appends`, which the Worker calls
+//! at the head of each turn loop iteration to `extend` them into the
+//! persistent `worker.history`. Each queued entry becomes one
+//! `Item::system_message`.
+//!
+//! This is the **single lane** for "system messages produced by Pod
+//! state that should land in the next LLM request": Notify, PodEvent,
+//! and any future `<system-reminder>` injection all ride this queue
+//! (or a sibling queue with the same lifecycle). Per
+//! `tickets/notify-history-persist.md` and `AGENTS.md` (LLM コンテキスト
+//! の加工原則), there is **no** "transient, history-skipping" lane —
+//! everything injected into a request is also committed to history so
+//! that any LLM reaction has a visible trigger across turns, resume,
+//! and compaction, and so the Anthropic prompt cache prefix stays
+//! stable across requests.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -68,9 +81,10 @@ impl NotifyBuffer {
 }
 
 /// Format a single pending notify entry into the `Item::system_message`
-/// that gets injected into the per-request context. The wrapper body
-/// comes from `PodPrompt::NotifyWrapper` so the surrounding phrasing
-/// can be customised via a prompt pack (translation, tone, ...).
+/// that gets appended to `worker.history` just before the next LLM
+/// request. The wrapper body comes from `PodPrompt::NotifyWrapper` so
+/// the surrounding phrasing can be customised via a prompt pack
+/// (translation, tone, ...).
 pub(crate) fn format_notify(
     n: &PendingNotify,
     prompts: &PromptCatalog,

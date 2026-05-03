@@ -14,8 +14,8 @@
 
 - **保存先は `tools` 層の session-lifetime 状態**。`Tracker` と同じ生存スコープで `Pod` が所有。`Arc<Mutex<Vec<TodoItem>>>` ベースの `TodoStore` を tool に注入する
 - **永続化は専用レーンを持たない**。`tool_call.arguments` がセッションログに既に乗っているため、resume 時には履歴 replay の中で最後の `todo_write` 引数を `TodoStore` に再適用すれば状態が復元される
-- **注意機構は `pre_llm_request` Interceptor**。直近の user message に `<system-reminder>` ブロックを揮発的に append するだけ。履歴・ログには載せない
-- **system-reminder 注入の汎用化はやらない**。利用者が TODO 1個しかない段階で抽象を立てない（CLAUDE.md「概念の追加は不在が問題になってから」）。ただし「タグ形式は `<system-reminder>...</system-reminder>` で揃える」「履歴は汚さない」の2点は本実装で確立し、将来の追加機構が同じ規約に乗れるようにする
+- **注意機構は `Interceptor::pending_history_appends`**。未完了 TODO がある場合に新規 system message Item として `worker.history` に append する。Notify / PodEvent と同じ lane に乗せ、`history.json` への永続化と resume 後の読み戻しは worker.history 経由で自動的についてくる（→ `tickets/notify-history-persist.md`）
+- **system-reminder 注入の汎用化はやらない**。利用者が TODO 1個しかない段階で抽象を立てない（CLAUDE.md「概念の追加は不在が問題になってから」）。ただし「タグ形式は `<system-reminder>...</system-reminder>` で揃える」点は本実装で確立し、将来の追加機構が同じ規約に乗れるようにする
 
 ## 要件
 
@@ -43,19 +43,19 @@
 
 ### 注意機構（Interceptor）
 
-- `pre_llm_request` で `Vec<Item>` を受け取り、未完了 TODO（`pending` または `in_progress`）が 1 件でも存在する場合に発動
-- 直近の user message の content（または content[最終 text part]）の末尾に `<system-reminder>` ブロックを append
-- ブロック内には現在の TODO リストを、status を含む簡潔な形式で列挙
-- 履歴 (`Worker` の保持する `Vec<Item>`) は変更しない。リクエスト送信時の Vec のみ加工
-- TODO が空の場合は何も差し込まない
+- `pending_history_appends` で未完了 TODO（`pending` または `in_progress`）が 1 件でも存在する場合に発動し、`<system-reminder>` ブロックを含む新規 system message Item を返す
+- Worker はこれを `worker.history` に append し、その後の per-request clone でリクエストにも含める。永続化 / resume / compaction は通常 Item と同じ扱い
+- ブロック内には現在の TODO リストを、status を含む簡潔な形式で列挙する
+- TODO が空の場合は空の `Vec<Item>` を返し、何も差し込まない
+- cooldown は idle 期間に1回 + 反応で counter リセットの設計上、reminder の連続注入は構造的に起きない（仮に複数回出ても、それぞれが「その時点での active TODO snapshot」として履歴に並ぶのは因果として正しい）
 
 ## 完了条件
 
 - `todo_write` ツールが builtin tool として登録され、Pod で利用できる
-- LLM が `todo_write` を呼ぶと TodoStore が更新され、その後の `pre_llm_request` で system-reminder として LLM に再提示される
+- LLM が `todo_write` を呼ぶと TodoStore が更新され、その後の `pending_history_appends` で system-reminder Item として `worker.history` に append され、リクエストにも含まれる
 - セッションを resume すると、最後の `todo_write` の状態から再開される
 - compact を跨いでも、未完了 TODO が新セッション冒頭の system message として残る
-- system-reminder の注入は揮発的で、`get_history` / セッションログには現れない
+- 注入された system-reminder Item は `worker.history` / `history.json` / `get_history` のいずれにも現れる（揮発レーンは持たない方針 → `tickets/notify-history-persist.md`）
 - 単体テストで `todo_write` の更新挙動 / replay 復元 / Interceptor の差し込みがカバーされる
 
 ## 範囲外

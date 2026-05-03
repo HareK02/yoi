@@ -856,6 +856,16 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
                 cb(current_turn);
             }
 
+            // Drain interceptor-side inputs that are meant to land in
+            // history (notifications, cross-Pod events, system
+            // reminders). These are committed *before* the per-request
+            // clone so they participate in the LLM request below and
+            // get persisted by the upper layer that owns history.json.
+            let pending = self.interceptor.pending_history_appends().await;
+            if !pending.is_empty() {
+                self.history.extend(pending);
+            }
+
             // Clone the history into a per-request context. Everything
             // below (prune projection, interceptor hooks) mutates only
             // this clone, so the persistent `self.history` stays intact.

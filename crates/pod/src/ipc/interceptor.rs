@@ -17,6 +17,7 @@ use llm_worker::interceptor::{
     Interceptor, PostToolAction, PreRequestAction, PreToolAction, PromptAction, ToolCallInfo,
     ToolResultInfo, TurnEndAction,
 };
+use tracing::warn;
 use llm_worker::tool::ToolOutput;
 use tracing::info;
 
@@ -28,7 +29,6 @@ use crate::hook::{
 use crate::ipc::notify_buffer::{NotifyBuffer, format_notify};
 use crate::prompt::catalog::PromptCatalog;
 use llm_worker::token_counter::total_tokens;
-use tracing::warn;
 
 /// Maximum number of bytes copied into `TurnEndInfo::final_text_preview`.
 const FINAL_TEXT_PREVIEW_LIMIT: usize = 512;
@@ -40,8 +40,10 @@ pub(crate) struct PodInterceptor {
     /// per-request `context` to estimate current occupancy for threshold
     /// checks. `None` when compaction is disabled (both thresholds unset).
     usage_history: Option<Arc<Mutex<Vec<UsageRecord>>>>,
-    /// Pending-notification buffer drained into the per-request
-    /// context at the head of `pre_llm_request`.
+    /// Pending-notification buffer drained into `worker.history`
+    /// via [`Self::pending_history_appends`] just before the next LLM
+    /// request. The Worker `extend`s these into its persistent history
+    /// so the LLM has a visible trigger for any reaction it commits.
     pending_notifies: NotifyBuffer,
     /// Submit-scoped stash of resolver-produced system messages.
     /// Drained inside `on_prompt_submit` and returned via
@@ -122,6 +124,27 @@ impl Interceptor for PodInterceptor {
         }
     }
 
+    async fn pending_history_appends(&self) -> Vec<Item> {
+        let drained = self.pending_notifies.drain();
+        if drained.is_empty() {
+            return Vec::new();
+        }
+        let mut items = Vec::with_capacity(drained.len());
+        for n in drained {
+            match format_notify(&n, &self.prompts) {
+                Ok(item) => items.push(item),
+                Err(e) => {
+                    // A render failure here would starve the LLM of
+                    // the notify text. Fall back to the raw message
+                    // so the trigger still lands in history.
+                    warn!(error = %e, "failed to render notify_wrapper; using raw message");
+                    items.push(Item::system_message(n.message.clone()));
+                }
+            }
+        }
+        items
+    }
+
     async fn pre_llm_request(&self, context: &mut Vec<Item>) -> PreRequestAction {
         let current_tokens = self.estimated_tokens(context);
 
@@ -136,24 +159,6 @@ impl Interceptor for PodInterceptor {
                         "Between-requests compaction threshold exceeded, yielding"
                     );
                     return PreRequestAction::Yield;
-                }
-            }
-        }
-
-        // Internal mechanism: drain pending `Method::Notify` notifications
-        // into the per-request context as transient system messages.
-        // These are not persisted to the Worker history; they exist only
-        // for this single LLM request.
-        for n in self.pending_notifies.drain() {
-            match format_notify(&n, &self.prompts) {
-                Ok(item) => context.push(item),
-                Err(e) => {
-                    // A render failure here would starve the LLM of the
-                    // notify text. Fall back to the raw message —
-                    // it still carries the intent, just without the
-                    // wrapper phrasing.
-                    warn!(error = %e, "failed to render notify_wrapper; using raw message");
-                    context.push(Item::system_message(n.message.clone()));
                 }
             }
         }
@@ -406,7 +411,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pre_llm_request_drains_pending_notifies_into_context() {
+    async fn pending_history_appends_drains_buffer_into_items() {
         let registry = Arc::new(HookRegistryBuilder::new().build());
         let buffer = NotifyBuffer::new();
         buffer.push("first".into());
@@ -420,49 +425,52 @@ mod tests {
             Arc::new(Mutex::new(Vec::new())),
             PromptCatalog::builtins_only().unwrap(),
         );
-        let mut ctx: Vec<Item> = vec![Item::user_message("hi")];
-        let action = interceptor.pre_llm_request(&mut ctx).await;
 
-        assert!(matches!(action, PreRequestAction::Continue));
-        // Original user message preserved, two notifications appended in order.
-        assert_eq!(ctx.len(), 3);
-        let second = ctx[1].as_text().unwrap_or_default();
-        let third = ctx[2].as_text().unwrap_or_default();
+        let items = interceptor.pending_history_appends().await;
+        assert_eq!(items.len(), 2);
+        let first = items[0].as_text().unwrap_or_default();
+        let second = items[1].as_text().unwrap_or_default();
+        assert!(first.contains("[Notification]"));
+        assert!(first.contains("first"));
         assert!(second.contains("[Notification]"));
-        assert!(second.contains("first"));
-        assert!(third.contains("[Notification]"));
-        assert!(third.contains("second"));
-        // Buffer is drained after a single pre_llm_request call.
-        assert!(buffer.is_empty());
+        assert!(second.contains("second"));
+        assert!(
+            buffer.is_empty(),
+            "buffer must be drained after pending_history_appends"
+        );
+
+        // Empty buffer → empty Vec (no synthesised items).
+        let again = interceptor.pending_history_appends().await;
+        assert!(again.is_empty());
     }
 
     #[tokio::test]
-    async fn pre_llm_request_skips_notification_injection_when_yielding() {
-        // When compaction yields, notifications remain in the buffer for
-        // the next pre_llm_request (after compaction + resume).
+    async fn pre_llm_request_does_not_touch_pending_notifies() {
+        // The drain lane has moved to `pending_history_appends`;
+        // `pre_llm_request` must leave the buffer alone and not inject
+        // anything itself.
         let registry = Arc::new(HookRegistryBuilder::new().build());
         let buffer = NotifyBuffer::new();
         buffer.push("msg".into());
 
-        let state = Arc::new(CompactState::new(None, Some(100), 2));
-        let ctx_items = vec![Item::user_message("hi")];
-        let history = usage_handle_with(ctx_items.len(), 200);
-
         let interceptor = PodInterceptor::new(
             registry,
-            Some(state),
-            Some(history),
+            None,
+            None,
             buffer.clone(),
             Arc::new(Mutex::new(Vec::new())),
             PromptCatalog::builtins_only().unwrap(),
         );
-        let mut ctx = ctx_items;
+        let mut ctx: Vec<Item> = vec![Item::user_message("hi")];
         let action = interceptor.pre_llm_request(&mut ctx).await;
 
-        assert!(matches!(action, PreRequestAction::Yield));
-        // Notifications were not drained (still held for post-compact resume).
-        assert_eq!(ctx.len(), 1);
-        assert_eq!(buffer.len(), 1);
+        assert!(matches!(action, PreRequestAction::Continue));
+        assert_eq!(ctx.len(), 1, "pre_llm_request must not append notifies");
+        assert_eq!(
+            buffer.len(),
+            1,
+            "pre_llm_request must not drain the notify buffer"
+        );
     }
 
     #[tokio::test]
