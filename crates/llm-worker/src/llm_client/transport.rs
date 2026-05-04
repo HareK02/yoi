@@ -6,17 +6,21 @@
 
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use eventsource_stream::Eventsource;
 use futures::{Stream, StreamExt, TryStreamExt};
-use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
+use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue, RETRY_AFTER};
+use tokio::time::Instant;
+use tracing::warn;
 
 use super::auth::{AuthProvider, AuthRequirement};
 use super::capability::ModelCapability;
 use super::client::{ConfigWarning, LlmClient};
-use super::error::ClientError;
+use super::error::{ClientError, is_retryable};
 use super::event::Event;
+use super::retry::RetryPolicy;
 use super::scheme::Scheme;
 use super::types::{Request, RequestConfig};
 
@@ -63,6 +67,7 @@ pub struct HttpTransport<S: Scheme> {
     base_url: String,
     auth: ResolvedAuth,
     capability: ModelCapability,
+    retry_policy: RetryPolicy,
 }
 
 impl<S: Scheme> HttpTransport<S> {
@@ -84,12 +89,19 @@ impl<S: Scheme> HttpTransport<S> {
             base_url,
             auth,
             capability,
+            retry_policy: RetryPolicy::default(),
         }
     }
 
     /// カスタム HTTP クライアントを差し込む（テスト等）。
     pub fn with_http_client(mut self, client: reqwest::Client) -> Self {
         self.http_client = client;
+        self
+    }
+
+    /// リトライポリシーを差し替える（テスト用 / 将来の manifest 化フック）。
+    pub fn with_retry_policy(mut self, policy: RetryPolicy) -> Self {
+        self.retry_policy = policy;
         self
     }
 
@@ -159,8 +171,43 @@ impl<S: Scheme + Clone> Clone for HttpTransport<S> {
             base_url: self.base_url.clone(),
             auth: self.auth.clone(),
             capability: self.capability.clone(),
+            retry_policy: self.retry_policy.clone(),
         }
     }
+}
+
+/// エラーレスポンスを `ClientError::Api` に変換し、`Retry-After` の秒数を
+/// 同時に取り出す。リトライループで wait の上書きに使う。
+async fn classify_error_response(resp: reqwest::Response) -> (ClientError, Option<Duration>) {
+    let status = resp.status().as_u16();
+    let retry_after = resp
+        .headers()
+        .get(RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(Duration::from_secs);
+    let text = resp.text().await.unwrap_or_default();
+    let err = if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+        let error = json.get("error").unwrap_or(&json);
+        let code = error.get("type").and_then(|v| v.as_str()).map(String::from);
+        let message = error
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&text)
+            .to_string();
+        ClientError::Api {
+            status: Some(status),
+            code,
+            message,
+        }
+    } else {
+        ClientError::Api {
+            status: Some(status),
+            code: None,
+            message: text,
+        }
+    };
+    (err, retry_after)
 }
 
 #[async_trait]
@@ -183,37 +230,41 @@ impl<S: Scheme + Clone + 'static> LlmClient for HttpTransport<S> {
             .scheme
             .build_request_body(&self.model_id, &request, &self.capability);
 
-        let response = self
-            .http_client
-            .post(&url)
-            .headers(headers)
-            .json(&body)
-            .send()
-            .await?;
+        let policy = &self.retry_policy;
+        let started = Instant::now();
+        let mut attempt: u32 = 0;
+        let response = loop {
+            let send_result = self
+                .http_client
+                .post(&url)
+                .headers(headers.clone())
+                .json(&body)
+                .send()
+                .await;
 
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let text = response.text().await.unwrap_or_default();
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
-                let error = json.get("error").unwrap_or(&json);
-                let code = error.get("type").and_then(|v| v.as_str()).map(String::from);
-                let message = error
-                    .get("message")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(&text)
-                    .to_string();
-                return Err(ClientError::Api {
-                    status: Some(status),
-                    code,
-                    message,
-                });
+            let (err, retry_after) = match send_result {
+                Ok(resp) if resp.status().is_success() => break resp,
+                Ok(resp) => classify_error_response(resp).await,
+                Err(e) => (ClientError::Http(e), None),
+            };
+
+            let next_attempt = attempt + 1;
+            if next_attempt >= policy.max_attempts || !is_retryable(&err) {
+                return Err(err);
             }
-            return Err(ClientError::Api {
-                status: Some(status),
-                code: None,
-                message: text,
-            });
-        }
+            let wait = retry_after.unwrap_or_else(|| policy.backoff(attempt));
+            if started.elapsed() + wait > policy.total_timeout {
+                return Err(err);
+            }
+            warn!(
+                error = %err,
+                attempt = next_attempt,
+                wait_ms = wait.as_millis() as u64,
+                "transient HTTP error, retrying"
+            );
+            tokio::time::sleep(wait).await;
+            attempt = next_attempt;
+        };
 
         let scheme = self.scheme.clone();
         let byte_stream = response.bytes_stream().map_err(std::io::Error::other);

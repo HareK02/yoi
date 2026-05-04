@@ -23,6 +23,7 @@ pub mod error;
 pub mod event;
 pub mod types;
 
+pub mod retry;
 pub mod scheme;
 pub mod transport;
 

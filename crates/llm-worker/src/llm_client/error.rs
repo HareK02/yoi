@@ -67,3 +67,69 @@ impl From<serde_json::Error> for ClientError {
         ClientError::Json(err)
     }
 }
+
+/// transient な失敗としてリトライ対象になるかを判定する。
+///
+/// 対象:
+/// - `Api { status }` のうち 408 / 425 / 429 / 500 / 502 / 503 / 504 / 529
+/// - `Http(reqwest::Error)` のうち `is_connect()` または `is_timeout()`
+///
+/// それ以外（Json、Sse、Config、上記以外の Api ステータス）は false。
+/// SSE 読み出し開始後の失敗は呼び出し側で `Sse` として上に流すため、
+/// ここで対象外にしておけば自動的に弾かれる。
+pub fn is_retryable(error: &ClientError) -> bool {
+    match error {
+        ClientError::Api {
+            status: Some(code), ..
+        } => matches!(*code, 408 | 425 | 429 | 500 | 502 | 503 | 504 | 529),
+        ClientError::Api { status: None, .. } => false,
+        ClientError::Http(e) => e.is_connect() || e.is_timeout(),
+        ClientError::Json(_) | ClientError::Sse(_) | ClientError::Config(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn api_err(status: Option<u16>) -> ClientError {
+        ClientError::Api {
+            status,
+            code: None,
+            message: String::new(),
+        }
+    }
+
+    #[test]
+    fn retryable_status_codes() {
+        for code in [408u16, 425, 429, 500, 502, 503, 504, 529] {
+            assert!(
+                is_retryable(&api_err(Some(code))),
+                "status {code} should be retryable",
+            );
+        }
+    }
+
+    #[test]
+    fn non_retryable_status_codes() {
+        for code in [400u16, 401, 403, 404, 409, 410, 422, 501] {
+            assert!(
+                !is_retryable(&api_err(Some(code))),
+                "status {code} should not be retryable",
+            );
+        }
+    }
+
+    #[test]
+    fn api_without_status_not_retryable() {
+        assert!(!is_retryable(&api_err(None)));
+    }
+
+    #[test]
+    fn json_sse_config_not_retryable() {
+        let json_err = serde_json::from_str::<serde_json::Value>("not json").unwrap_err();
+        assert!(!is_retryable(&ClientError::Json(json_err)));
+        assert!(!is_retryable(&ClientError::Sse("boom".into())));
+        assert!(!is_retryable(&ClientError::Config("boom".into())));
+    }
+}
