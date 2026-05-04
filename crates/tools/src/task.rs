@@ -546,7 +546,7 @@ mod tests {
         assert_eq!(tasks[1].status, TaskStatus::Completed);
     }
 
-    /// Wrap snapshot text the way `Pod::try_post_run_compact` does, so tests
+    /// Wrap snapshot text the way `Pod::try_pre_run_compact` does, so tests
     /// exercise the exact format that goes through the session log.
     fn wrap_snapshot_system_message(snapshot: &str) -> String {
         format!(
@@ -655,7 +655,7 @@ mod tests {
 
     #[test]
     fn synthetic_compact_tasklist_pair_is_well_formed() {
-        // Mirrors `Pod::try_post_run_compact`'s synthetic insertion:
+        // Mirrors `Pod::try_pre_run_compact`'s synthetic insertion:
         // a system snapshot message followed by a TaskList tool_call/tool_result
         // pair sharing the `compact-tasklist` id. Verify the structural
         // contract every provider request builder relies on (matched call_id,

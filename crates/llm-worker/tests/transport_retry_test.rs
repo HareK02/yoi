@@ -45,7 +45,9 @@ impl Scheme for DummyScheme {
     }
     fn parse_sse(&self, _: &str, _: &str, _: &mut ()) -> Result<Vec<Event>, ClientError> {
         if self.parse_fail {
-            Err(ClientError::Sse("simulated mid-stream parse failure".into()))
+            Err(ClientError::Sse(
+                "simulated mid-stream parse failure".into(),
+            ))
         } else {
             Ok(vec![])
         }

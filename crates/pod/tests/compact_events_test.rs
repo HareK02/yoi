@@ -1,8 +1,8 @@
 //! Compact lifecycle `Event` broadcasting.
 //!
 //! Covers three paths:
-//! - `try_post_run_compact` success → `CompactStart + CompactDone`
-//! - `try_post_run_compact` failure → `CompactStart + CompactFailed`
+//! - `try_pre_run_compact` success → `CompactStart + CompactDone`
+//! - `try_pre_run_compact` failure → `CompactStart + CompactFailed`
 //! - mid-turn `do_compact_and_resume` success → `CompactStart + CompactDone`
 //!   (driven by `compact_request_threshold` → `PreRequestAction::Yield`)
 
@@ -96,7 +96,7 @@ fn write_summary_tool_use_events(call_id: &str, text: &str) -> Vec<LlmEvent> {
     ]
 }
 
-// A low compact_threshold guarantees `try_post_run_compact` will fire
+// A low compact_threshold guarantees `try_pre_run_compact` will fire
 // the first time we check after a run.
 const POST_RUN_MANIFEST_TOML: &str = r#"
 [pod]
@@ -228,7 +228,7 @@ async fn compact_broadcasts_only_new_system_messages_not_retained_ones() {
 }
 
 #[tokio::test]
-async fn post_run_compact_success_broadcasts_start_and_done() {
+async fn pre_run_compact_success_broadcasts_start_and_done() {
     // Responses: (1) first run returns short text, (2) compact worker
     // emits write_summary then closes (two LLM calls inside the compact
     // worker: one for write_summary, one that the compact loop consumes
@@ -247,7 +247,7 @@ async fn post_run_compact_success_broadcasts_start_and_done() {
     // Drain run events so only compact events remain in `rx`.
     let _ = drain(&mut rx);
 
-    pod.try_post_run_compact().await.unwrap();
+    pod.try_pre_run_compact().await;
 
     let events = drain(&mut rx);
     let kinds: Vec<&str> = events
@@ -412,7 +412,7 @@ async fn compact_resets_extract_pointer_so_phase1_can_fire_again() {
 
     // Compact runs. Without the fix the in-memory pointer would still
     // reference the old session's history_len.
-    pod.try_post_run_compact().await.unwrap();
+    pod.try_pre_run_compact().await;
     assert!(
         pod.extract_pointer().is_none(),
         "extract_pointer must be reset to None after compact (matches cold-restore on the new session)"
@@ -463,7 +463,7 @@ async fn extract_threshold_zero_is_disabled() {
 }
 
 #[tokio::test]
-async fn post_run_compact_failure_broadcasts_start_and_failed() {
+async fn pre_run_compact_failure_broadcasts_start_and_failed() {
     // Only the first run has a response. Compaction will run the
     // compact worker which immediately exhausts the mock → failure.
     let client = MockClient::new(vec![single_text_events("hi")]);
@@ -476,7 +476,7 @@ async fn post_run_compact_failure_broadcasts_start_and_failed() {
     let _ = drain(&mut rx);
 
     // Best-effort: returns Ok(()) even on failure, but emits CompactFailed.
-    pod.try_post_run_compact().await.unwrap();
+    pod.try_pre_run_compact().await;
 
     let events = drain(&mut rx);
     let kinds: Vec<&str> = events
@@ -495,5 +495,87 @@ async fn post_run_compact_failure_broadcasts_start_and_failed() {
     assert!(
         !kinds.contains(&"done"),
         "unexpected CompactDone in {kinds:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Detached post-run memory jobs (`spawn_post_run_memory_jobs` /
+// `wait_for_memory_jobs`). Covers the detach round-trip and the structural
+// invariant that the cloned memory-task Pod shares `SessionHead` with the
+// source Pod, so that `save_extension` from the background extract does not
+// leave the next turn's `save_user_input` looking at a stale head_hash.
+
+const EXTRACT_NO_COMPACT_MANIFEST: &str = r#"
+[pod]
+name = "test-pod"
+pwd = "./"
+
+[model]
+scheme = "anthropic"
+model_id = "test-model"
+
+[worker]
+max_tokens = 100
+
+[memory]
+extract_threshold = 1
+
+[[scope.allow]]
+target = "./"
+permission = "write"
+"#;
+
+#[tokio::test]
+async fn spawn_and_wait_drives_extract_to_completion() {
+    let client = MockClient::new(vec![
+        text_events_with_usage("hi", 1000),
+        write_extracted_tool_use_events("ec1"),
+        single_text_events("done"),
+    ]);
+    let mut pod = make_pod_with_manifest(EXTRACT_NO_COMPACT_MANIFEST, client).await;
+
+    pod.run_text("first").await.unwrap();
+    assert!(
+        pod.extract_pointer().is_none(),
+        "extract has not run yet — pointer must be None"
+    );
+
+    pod.spawn_post_run_memory_jobs();
+    pod.wait_for_memory_jobs().await;
+
+    assert!(
+        pod.extract_pointer().is_some(),
+        "spawn + wait must complete extract; pointer should be set"
+    );
+}
+
+#[tokio::test]
+async fn detached_extract_does_not_fork_session_log() {
+    // Source pod and the cloned memory-task pod share `SessionHead` via
+    // `Arc<AsyncMutex<_>>`. The detached extract advances head_hash through
+    // `save_extension`; the next `run` must see that same head_hash so
+    // `ensure_head_or_fork` does not spawn a new session.
+    let client = MockClient::new(vec![
+        text_events_with_usage("hi", 1000),
+        write_extracted_tool_use_events("ec1"),
+        single_text_events("done"),
+        text_events_with_usage("ok", 1000),
+    ]);
+    let mut pod = make_pod_with_manifest(EXTRACT_NO_COMPACT_MANIFEST, client).await;
+
+    pod.run_text("first").await.unwrap();
+    let session_before = pod.session_id();
+
+    pod.spawn_post_run_memory_jobs();
+    pod.wait_for_memory_jobs().await;
+
+    pod.run_text("second").await.unwrap();
+    let session_after = pod.session_id();
+
+    assert_eq!(
+        session_before, session_after,
+        "detached extract's save_extension and the next turn's save_user_input \
+         must share head_hash through SessionHead — a fork here means the clone \
+         carried its own head_hash"
     );
 }

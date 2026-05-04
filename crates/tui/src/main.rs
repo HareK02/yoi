@@ -435,10 +435,6 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Option<Method> {
         KeyCode::Char('x') if ctrl => Some(match app.pod_status {
             PodStatus::Running => Some(Method::Cancel),
             PodStatus::Paused | PodStatus::Idle => Some(Method::Shutdown),
-            PodStatus::Busy => {
-                app.push_error("Pod is finishing post-run work; wait for idle or press Ctrl-C twice to exit the TUI.");
-                None
-            }
         }),
         KeyCode::Char('d') if ctrl => {
             app.quit = true;
@@ -577,7 +573,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Option<Method> {
 const CONFIRM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Running → send `Method::Pause`.
-/// Idle / Paused / Busy → 2-tap to quit the TUI (the Pod keeps running).
+/// Idle / Paused → 2-tap to quit the TUI (the Pod keeps running).
 fn handle_pause_or_quit(app: &mut App) -> Option<Method> {
     if app.pod_status == PodStatus::Running {
         return Some(Method::Pause);

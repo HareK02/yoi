@@ -76,68 +76,22 @@ async fn set_controller_status(
     let _ = event_tx.send(Event::Status { status });
 }
 
-async fn run_post_run_jobs<C, St>(pod: &mut Pod<C, St>, alerter: &Alerter)
-where
-    C: LlmClient,
-    St: Store,
-{
-    if let Err(e) = pod.try_post_run_extract().await {
-        tracing::warn!(error = %e, "Post-run memory extract error");
-        alerter.alert(
-            AlertLevel::Warn,
-            AlertSource::Pod,
-            format!("post-run memory extract error: {e}"),
-        );
-    }
-    if let Err(e) = pod.try_post_run_consolidate().await {
-        tracing::warn!(error = %e, "Post-run memory consolidate error");
-        alerter.alert(
-            AlertLevel::Warn,
-            AlertSource::Pod,
-            format!("post-run memory consolidate error: {e}"),
-        );
-    }
-    if let Err(e) = pod.try_post_run_compact().await {
-        tracing::warn!(error = %e, "Post-run compaction error");
-        alerter.alert(
-            AlertLevel::Warn,
-            AlertSource::Compactor,
-            format!("post-run compaction error: {e}"),
-        );
-    }
-}
-
 async fn finish_controller_run<C, St>(
     pod: &mut Pod<C, St>,
     shared_state: &Arc<PodSharedState>,
     runtime_dir: &RuntimeDir,
     event_tx: &broadcast::Sender<Event>,
-    alerter: &Alerter,
     new_status: PodStatus,
 ) where
-    C: LlmClient,
-    St: Store,
+    C: LlmClient + Clone + 'static,
+    St: Store + Clone + 'static,
 {
-    if new_status == PodStatus::Busy {
-        // Surface the post-run busy window before kicking off the jobs so
-        // TUI / external observers see Busy regardless of whether the
-        // worker turn ended via success or error. Both branches in
-        // `run_with_cancel_support` return `PodStatus::Busy` for this
-        // path; emitting here keeps the two unified.
-        set_controller_status(shared_state, runtime_dir, event_tx, PodStatus::Busy).await;
-        run_post_run_jobs(pod, alerter).await;
-    }
-
     let items = pod.worker().history().to_vec();
     shared_state.update_history(items);
     shared_state.set_user_segments(pod.user_segments().to_vec());
-    let final_status = if new_status == PodStatus::Busy {
-        PodStatus::Idle
-    } else {
-        new_status
-    };
-    set_controller_status(shared_state, runtime_dir, event_tx, final_status).await;
+    set_controller_status(shared_state, runtime_dir, event_tx, new_status).await;
     let _ = runtime_dir.write_history(shared_state).await;
+    pod.spawn_post_run_memory_jobs();
 }
 
 // ---------------------------------------------------------------------------
@@ -154,8 +108,8 @@ impl PodController {
         runtime_base: &Path,
     ) -> Result<(PodHandle, ShutdownReceiver), std::io::Error>
     where
-        C: LlmClient + 'static,
-        St: Store + 'static,
+        C: LlmClient + Clone + 'static,
+        St: Store + Clone + 'static,
     {
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let (method_tx, mut method_rx) = mpsc::channel::<Method>(32);
@@ -524,7 +478,6 @@ impl PodController {
                             &shared_state,
                             &runtime_dir,
                             &event_tx,
-                            &alerter,
                             new_status,
                         )
                         .await;
@@ -542,9 +495,9 @@ impl PodController {
                         pod.push_notify(message);
                         let status = shared_state.get_status();
                         if status != PodStatus::Idle {
-                            // RUNNING / Paused / Busy: the buffer push is the
+                            // RUNNING / Paused: the buffer push is the
                             // entire operation; an in-flight turn (or the
-                            // next Resume/Run after Busy) will drain the buffer
+                            // next Resume/Run) will drain the buffer
                             // at its next pre_llm_request.
                             continue;
                         }
@@ -576,7 +529,6 @@ impl PodController {
                             &shared_state,
                             &runtime_dir,
                             &event_tx,
-                            &alerter,
                             new_status,
                         )
                         .await;
@@ -621,7 +573,6 @@ impl PodController {
                             &shared_state,
                             &runtime_dir,
                             &event_tx,
-                            &alerter,
                             new_status,
                         )
                         .await;
@@ -640,12 +591,12 @@ impl PodController {
                     }
 
                     Method::Pause => {
-                        // Already paused or post-run busy → idempotent no-op.
-                        // Otherwise the Pod is Idle (Running turns go through
+                        // Already paused → idempotent no-op. Otherwise the
+                        // Pod is Idle (Running turns go through
                         // `run_with_cancel_support`, not this outer match), so
                         // there is nothing to pause.
                         let status = shared_state.get_status();
-                        if !matches!(status, PodStatus::Paused | PodStatus::Busy) {
+                        if status != PodStatus::Paused {
                             let _ = event_tx.send(Event::Error {
                                 code: ErrorCode::NotRunning,
                                 message: "Pod is not running".into(),
@@ -714,7 +665,6 @@ impl PodController {
                                 &shared_state,
                                 &runtime_dir,
                                 &event_tx,
-                                &alerter,
                                 new_status,
                             )
                             .await;
@@ -727,6 +677,11 @@ impl PodController {
                     }
                 }
             }
+
+            // Background memory jobs own extract/consolidate workers after a
+            // turn completes. Join them before the controller task exits so
+            // staging writes and consolidation cleanups are not abandoned.
+            pod.wait_for_memory_jobs().await;
 
             // Report upward that this Pod is stopping before the
             // controller task exits. Awaited (not fire-and-forget):
@@ -787,9 +742,9 @@ where
                 return match result {
                     Ok(r) => {
                         let (status, run_result) = match r {
-                            PodRunResult::Finished => (PodStatus::Busy, RunResult::Finished),
+                            PodRunResult::Finished => (PodStatus::Idle, RunResult::Finished),
                             PodRunResult::Paused => (PodStatus::Paused, RunResult::Paused),
-                            PodRunResult::LimitReached => (PodStatus::Busy, RunResult::LimitReached),
+                            PodRunResult::LimitReached => (PodStatus::Idle, RunResult::LimitReached),
                         };
                         let _ = event_tx.send(Event::RunEnd { result: run_result });
                         if matches!(run_result, RunResult::Finished) {
@@ -825,7 +780,7 @@ where
                                 message,
                             },
                         );
-                        (PodStatus::Busy, shutdown_requested)
+                        (PodStatus::Idle, shutdown_requested)
                     }
                 };
             }

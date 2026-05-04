@@ -877,18 +877,6 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
             " — Enter to resume, type to start new turn",
             Style::default().fg(Color::DarkGray),
         ));
-    } else if app.busy {
-        spans.push(Span::raw(" | "));
-        spans.push(Span::styled(
-            "busy",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ));
-        spans.push(Span::styled(
-            " — finishing post-run work",
-            Style::default().fg(Color::DarkGray),
-        ));
     } else {
         spans.push(Span::styled(" idle", Style::default().fg(Color::DarkGray)));
     }

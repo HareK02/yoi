@@ -49,9 +49,6 @@ pub struct App {
     pub running: bool,
     /// True while the Pod is in `PodStatus::Paused`.
     pub paused: bool,
-    /// True after worker `RunEnd` while controller post-run work is still
-    /// blocking the next method.
-    pub busy: bool,
     pub run_requests: usize,
     /// Sum of `input_tokens - cache_read_input_tokens` across the
     /// current turn's LLM requests — i.e. the net tokens this turn
@@ -89,7 +86,6 @@ impl App {
             pod_status: PodStatus::Idle,
             running: false,
             paused: false,
-            busy: false,
             run_requests: 0,
             run_upload_tokens: 0,
             run_output_tokens: 0,
@@ -111,8 +107,7 @@ impl App {
         self.pod_status = status;
         self.running = status == PodStatus::Running;
         self.paused = status == PodStatus::Paused;
-        self.busy = status == PodStatus::Busy;
-        if self.running || self.busy {
+        if self.running {
             self.quit_confirm = None;
         }
     }
@@ -296,10 +291,6 @@ impl App {
     }
 
     pub fn submit_input(&mut self) -> Option<Method> {
-        if self.busy {
-            self.push_error("Pod is finishing post-run work; wait for idle before submitting.");
-            return None;
-        }
         let segments = self.input.submit_segments();
         if segments_are_blank(&segments) {
             // Empty Enter only does something meaningful when the Pod
@@ -640,7 +631,7 @@ impl App {
                 });
                 self.set_pod_status(match result {
                     RunResult::Paused => PodStatus::Paused,
-                    RunResult::Finished | RunResult::LimitReached => PodStatus::Busy,
+                    RunResult::Finished | RunResult::LimitReached => PodStatus::Idle,
                 });
                 self.run_requests = 0;
                 self.run_upload_tokens = 0;

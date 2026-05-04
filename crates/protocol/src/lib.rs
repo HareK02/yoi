@@ -440,10 +440,6 @@ pub enum PodStatus {
     Idle,
     Running,
     Paused,
-    /// The worker turn has ended, but the controller is still performing
-    /// post-run jobs (memory extract / consolidate / compact) and cannot
-    /// accept a new turn immediately.
-    Busy,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -763,18 +759,18 @@ mod tests {
     #[test]
     fn event_status_format() {
         let event = Event::Status {
-            status: PodStatus::Busy,
+            status: PodStatus::Running,
         };
         let json = serde_json::to_string(&event).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["event"], "status");
-        assert_eq!(parsed["data"]["status"], "busy");
+        assert_eq!(parsed["data"]["status"], "running");
 
         let decoded: Event = serde_json::from_str(&json).unwrap();
         assert!(matches!(
             decoded,
             Event::Status {
-                status: PodStatus::Busy
+                status: PodStatus::Running
             }
         ));
     }

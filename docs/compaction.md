@@ -23,8 +23,8 @@ Pod::handle_worker_result
   → persist_turn（旧セッションに記録）
   → compact() → resume()
 
-[ターンの合間 — Pod::run 完了後]
-Controller::try_post_run_compact  ← proactive
+[ターンの合間 — 次の Pod::run 冒頭]
+Pod::try_pre_run_compact  ← proactive
   → input_tokens > post_run_threshold なら compact() (best-effort)
 ```
 
@@ -66,7 +66,7 @@ pub struct ToolOutput {
 
 ### トリガー（2段階の閾値）
 
-1. **ターンの合間 (Controller)**: `try_post_run_compact()` で `input_tokens > post_run_threshold` → best-effort
+1. **ターンの合間 (次 turn 冒頭)**: `try_pre_run_compact()` で `input_tokens > post_run_threshold` → best-effort
 2. **リクエストの合間 (CompactInterceptor)**: `pre_llm_request` で `input_tokens > request_threshold` → `PreRequestAction::Yield`
 
 **ターンの合間が proactive (小さい閾値)**:

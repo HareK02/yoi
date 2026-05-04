@@ -173,7 +173,7 @@ async fn wait_for_status(handle: &PodHandle, status: PodStatus) {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn run_end_enters_busy_until_post_run_finishes_and_broadcasts_status() {
+async fn run_end_returns_to_idle_without_busy_status() {
     let client = MockClient::new(simple_text_events());
     let pod = make_pod(client).await;
     let handle = spawn_controller(pod).await;
@@ -182,7 +182,7 @@ async fn run_end_enters_busy_until_post_run_finishes_and_broadcasts_status() {
     handle.send(Method::run_text("Hello")).await.unwrap();
 
     let mut saw_run_end = false;
-    let mut saw_busy_status = false;
+    let mut saw_idle_status = false;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
     loop {
         tokio::select! {
@@ -191,10 +191,8 @@ async fn run_end_enters_busy_until_post_run_finishes_and_broadcasts_status() {
                     Ok(Event::RunEnd { result: protocol::RunResult::Finished }) => {
                         saw_run_end = true;
                     }
-                    Ok(Event::Status {
-                        status: PodStatus::Busy,
-                    }) if saw_run_end => {
-                        saw_busy_status = true;
+                    Ok(Event::Status { status: PodStatus::Idle }) if saw_run_end => {
+                        saw_idle_status = true;
                         break;
                     }
                     Ok(_) => {}
@@ -207,10 +205,10 @@ async fn run_end_enters_busy_until_post_run_finishes_and_broadcasts_status() {
 
     assert!(saw_run_end, "expected RunEnd::Finished");
     assert!(
-        saw_busy_status,
-        "expected busy status immediately after RunEnd"
+        saw_idle_status,
+        "expected idle status immediately after RunEnd"
     );
-    wait_for_status(&handle, PodStatus::Idle).await;
+    assert_eq!(handle.shared_state.get_status(), PodStatus::Idle);
 }
 
 #[tokio::test]
@@ -235,51 +233,6 @@ async fn attach_history_includes_current_status() {
         Event::History { status, .. } => assert_eq!(status, PodStatus::Running),
         other => panic!("expected History, got {other:?}"),
     }
-}
-
-#[tokio::test]
-async fn pause_while_busy_is_idempotent_not_not_running() {
-    let client = MockClient::new(simple_text_events());
-    let pod = make_pod(client).await;
-    let handle = spawn_controller(pod).await;
-    let mut rx = handle.subscribe();
-
-    handle.send(Method::run_text("Hello")).await.unwrap();
-
-    let mut saw_busy = false;
-    let mut saw_idle = false;
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-    loop {
-        tokio::select! {
-            event = rx.recv() => {
-                match event {
-                    Ok(Event::RunEnd { .. }) => {
-                        handle.send(Method::Pause).await.unwrap();
-                    }
-                    Ok(Event::Status { status: PodStatus::Busy }) => {
-                        saw_busy = true;
-                    }
-                    Ok(Event::Status { status: PodStatus::Idle }) if saw_busy => {
-                        saw_idle = true;
-                        break;
-                    }
-                    Ok(Event::Error {
-                        code: protocol::ErrorCode::NotRunning,
-                        ..
-                    }) if saw_busy && !saw_idle => {
-                        panic!("Pause while Busy should be an idempotent no-op");
-                    }
-                    Ok(_) => {}
-                    Err(_) => break,
-                }
-            }
-            _ = tokio::time::sleep_until(deadline) => break,
-        }
-    }
-
-    assert!(saw_busy, "expected Busy status");
-    assert!(saw_idle, "expected final Idle status");
-    assert_eq!(handle.shared_state.get_status(), PodStatus::Idle);
 }
 
 #[tokio::test]

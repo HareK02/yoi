@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use tokio::sync::Mutex as AsyncMutex;
 
 use llm_worker::Item;
 use llm_worker::llm_client::RequestConfig;
@@ -35,6 +36,12 @@ use async_trait::async_trait;
 use llm_worker::interceptor::PreRequestAction;
 use protocol::{AlertLevel, AlertSource, Event, Segment};
 use tokio::sync::broadcast;
+use tokio::task::JoinHandle;
+
+struct SessionHead {
+    session_id: SessionId,
+    head_hash: Option<EntryHash>,
+}
 
 /// Pre-LLM-request hook that records `history.len()` at send time into a
 /// shared `UsageTracker`. The on_usage callback later pairs this with the
@@ -61,7 +68,7 @@ pub struct Pod<C: LlmClient, St: Store> {
     worker: Option<Worker<C, Mutable>>,
     store: St,
     session_id: SessionId,
-    head_hash: Option<EntryHash>,
+    session_head: Arc<AsyncMutex<SessionHead>>,
     /// Absolute working directory of the Pod.
     pwd: PathBuf,
     /// Shared, atomically-swappable view of the Pod's resolved scope.
@@ -172,7 +179,13 @@ pub struct Pod<C: LlmClient, St: Store> {
     /// run yet on this session — next extract starts from entry 0.
     /// Restored from `RestoredState.extensions` on `restore`, updated
     /// after each successful extract via `save_extension`.
-    extract_pointer: Mutex<Option<memory::ExtractPointerPayload>>,
+    extract_pointer: Arc<Mutex<Option<memory::ExtractPointerPayload>>>,
+    /// Phase 1/2 memory job running outside the controller method loop.
+    /// The task owns the extract/consolidate worker execution and is joined
+    /// at shutdown. A single slot is enough: Phase 1/2 implementations loop
+    /// until thresholds fall below their trigger points, and concurrent
+    /// triggers are coalesced by skipping when this handle is still active.
+    memory_task: Option<JoinHandle<()>>,
     /// Typed user submissions in submit order. K-th entry corresponds to
     /// the K-th `Item::user_message` in `worker.history()` (modulo seed
     /// history loaded via `SessionStart.history`, whose original segments
@@ -180,6 +193,84 @@ pub struct Pod<C: LlmClient, St: Store> {
     /// appended after `save_user_input` on each `run`. Mirrored to
     /// `PodSharedState` by the controller for `Event::History` use.
     user_segments: Vec<Vec<Segment>>,
+}
+
+impl<C: LlmClient + 'static, St: Store + 'static> Pod<C, St> {
+    pub async fn wait_for_memory_jobs(&mut self) {
+        if let Some(handle) = self.memory_task.take()
+            && let Err(e) = handle.await
+        {
+            tracing::warn!(error = %e, "Post-run memory task join failed");
+        }
+    }
+}
+
+impl<C: LlmClient + Clone + 'static, St: Store + Clone + 'static> Pod<C, St> {
+    fn clone_for_memory_task(&self) -> Self {
+        // The cloned Pod's worker exists only as a snapshot for the memory
+        // task: `run_extract_once` reads `worker.history()`, and the
+        // extract/consolidate workers are built fresh inside their own
+        // methods using `worker.client()` as fallback when no override
+        // model is configured. system_prompt / request_config / cache_key
+        // are unused on this path, so we deliberately skip copying them.
+        let source_worker = self.worker.as_ref().expect("worker present");
+        let mut worker = Worker::new(source_worker.client().clone());
+        worker.set_history(source_worker.history().to_vec());
+        Self {
+            manifest: self.manifest.clone(),
+            worker: Some(worker),
+            store: self.store.clone(),
+            session_id: self.session_id,
+            session_head: self.session_head.clone(),
+            pwd: self.pwd.clone(),
+            scope: self.scope.clone(),
+            hook_builder: HookRegistryBuilder::new(),
+            interceptor_installed: false,
+            compact_state: None,
+            usage_tracker: Arc::new(UsageTracker::new()),
+            metrics_tracker: Arc::new(crate::compact::metrics_tracker::MetricsTracker::new()),
+            usage_history: self.usage_history.clone(),
+            tracker: None,
+            task_store: self.task_store.clone(),
+            system_prompt_template: None,
+            alerter: self.alerter.clone(),
+            event_tx: self.event_tx.clone(),
+            pending_notifies: NotifyBuffer::new(),
+            pending_attachments: Arc::new(Mutex::new(Vec::new())),
+            scope_allocation: None,
+            callback_socket: None,
+            prompts: self.prompts.clone(),
+            workflow_registry: self.workflow_registry.clone(),
+            memory_layout: self.memory_layout.clone(),
+            inject_resident_knowledge: self.inject_resident_knowledge,
+            pending_scope_snapshot: self.pending_scope_snapshot.clone(),
+            extract_in_flight: self.extract_in_flight.clone(),
+            consolidation_in_flight: self.consolidation_in_flight.clone(),
+            extract_pointer: self.extract_pointer.clone(),
+            memory_task: None,
+            user_segments: self.user_segments.clone(),
+        }
+    }
+
+    pub fn spawn_post_run_memory_jobs(&mut self) {
+        // Drop a finished prior handle so we can spawn a fresh task.
+        // If the prior task is still running, coalesce by skipping —
+        // Phase 1/2 implementations re-evaluate thresholds on completion.
+        self.cleanup_finished_memory_task();
+        if self.memory_task.is_some() {
+            return;
+        }
+
+        let mut pod = self.clone_for_memory_task();
+        self.memory_task = Some(tokio::spawn(async move {
+            if let Err(e) = pod.try_post_run_extract().await {
+                tracing::warn!(error = %e, "Post-run memory extract task error");
+            }
+            if let Err(e) = pod.try_post_run_consolidate().await {
+                tracing::warn!(error = %e, "Post-run memory consolidate task error");
+            }
+        }));
+    }
 }
 
 impl<C: LlmClient, St: Store> Pod<C, St> {
@@ -210,7 +301,10 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             worker: Some(worker),
             store,
             session_id,
-            head_hash: None,
+            session_head: Arc::new(AsyncMutex::new(SessionHead {
+                session_id,
+                head_hash: None,
+            })),
             pwd,
             scope: SharedScope::new(scope),
             hook_builder: HookRegistryBuilder::new(),
@@ -235,7 +329,8 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             pending_scope_snapshot: Arc::new(Mutex::new(None)),
             extract_in_flight: Arc::new(AtomicBool::new(false)),
             consolidation_in_flight: Arc::new(AtomicBool::new(false)),
-            extract_pointer: Mutex::new(None),
+            extract_pointer: Arc::new(Mutex::new(None)),
+            memory_task: None,
             user_segments: Vec::new(),
         };
         pod.apply_prune_from_manifest();
@@ -330,7 +425,8 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     /// can restore the narrowed scope instead of reclaiming delegated
     /// writes.
     pub async fn persist_scope_snapshot(&mut self) -> Result<(), StoreError> {
-        if self.head_hash.is_none() {
+        let mut head = self.session_head.lock().await;
+        if head.head_hash.is_none() {
             return Ok(());
         }
         let snapshot = {
@@ -340,7 +436,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 deny: scope.deny_rules(),
             }
         };
-        session_store::save_pod_scope(&self.store, self.session_id, &mut self.head_hash, &snapshot)
+        session_store::save_pod_scope(&self.store, head.session_id, &mut head.head_hash, &snapshot)
             .await
     }
 
@@ -362,10 +458,11 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             .expect("pending_scope_snapshot poisoned")
             .take();
         if let Some(snapshot) = snapshot {
+            let mut head = self.session_head.lock().await;
             session_store::save_pod_scope(
                 &self.store,
-                self.session_id,
-                &mut self.head_hash,
+                head.session_id,
+                &mut head.head_hash,
                 &snapshot,
             )
             .await?;
@@ -531,10 +628,11 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     /// (the entry is dropped) and a `Warn` alert + `tracing::warn!` are
     /// emitted so the failure isn't completely silent.
     async fn try_record_metric(&mut self, metric: &session_metrics::Metric) {
+        let mut head = self.session_head.lock().await;
         if let Err(err) = session_metrics::record_metric(
             &self.store,
-            self.session_id,
-            &mut self.head_hash,
+            head.session_id,
+            &mut head.head_hash,
             metric,
         )
         .await
@@ -803,6 +901,52 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         self.run(vec![Segment::text(s)]).await
     }
 
+    /// Drop the prior memory_task handle if it has finished. Keep it if
+    /// still running so callers can decide whether to wait or coalesce.
+    fn cleanup_finished_memory_task(&mut self) {
+        if self.memory_task.as_ref().is_some_and(|h| h.is_finished()) {
+            self.memory_task = None;
+        }
+    }
+
+    /// Wait for the in-flight memory task (if any) to finish. Used before
+    /// compact rewrites history (extract reads the same history).
+    async fn join_memory_task(&mut self) {
+        if let Some(handle) = self.memory_task.take()
+            && let Err(e) = handle.await
+        {
+            tracing::warn!(error = %e, "Memory task join failed");
+        }
+    }
+
+    /// Whether `try_pre_run_compact` would actually compact. The same
+    /// check is duplicated inside `try_pre_run_compact` itself for
+    /// defensive reasons; this is the gate for joining the memory task
+    /// before the compact runs.
+    fn should_pre_run_compact(&self) -> bool {
+        self.compact_state.as_ref().is_some_and(|s| {
+            !s.is_disabled()
+                && !s.just_compacted()
+                && s.exceeds_post_run(self.total_tokens().tokens)
+        })
+    }
+
+    /// Prelude shared by `run` / `run_for_notification` / `resume`.
+    /// Wires up worker hooks, ensures the session is materialized on the
+    /// store, and runs pre-run compact (joining any in-flight memory task
+    /// first so extract sees a stable history range).
+    async fn prepare_for_run(&mut self) -> Result<(), PodError> {
+        self.ensure_interceptor_installed();
+        self.ensure_system_prompt_materialized()?;
+        self.cleanup_finished_memory_task();
+        self.ensure_session_head().await?;
+        if self.should_pre_run_compact() {
+            self.join_memory_task().await;
+        }
+        self.try_pre_run_compact().await;
+        Ok(())
+    }
+
     /// Send user input and run until the LLM turn completes.
     ///
     /// `input` is a typed segment list (see [`protocol::Segment`]). The
@@ -816,20 +960,22 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     /// the Worker is aborted, history is compacted, and execution resumes
     /// automatically.
     pub async fn run(&mut self, input: Vec<Segment>) -> Result<PodRunResult, PodError> {
-        self.ensure_interceptor_installed();
-        self.ensure_system_prompt_materialized()?;
-        self.ensure_session_head().await?;
+        self.prepare_for_run().await?;
 
         // Persist the user input as typed segments before the worker
         // pushes its flattened copy into history. save_delta deliberately
         // skips the resulting `is_user_message()` item to avoid double-write.
-        session_store::save_user_input(
-            &self.store,
-            self.session_id,
-            &mut self.head_hash,
-            input.clone(),
-        )
-        .await?;
+        {
+            let mut head = self.session_head.lock().await;
+            self.session_id = head.session_id;
+            session_store::save_user_input(
+                &self.store,
+                head.session_id,
+                &mut head.head_hash,
+                input.clone(),
+            )
+            .await?;
+        }
         self.user_segments.push(input.clone());
 
         // Resolve `@<path>` refs and `/<slug>` workflow invocations to
@@ -989,9 +1135,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     /// Worker's resume path issues the LLM request without a new
     /// user turn.
     pub async fn run_for_notification(&mut self) -> Result<PodRunResult, PodError> {
-        self.ensure_interceptor_installed();
-        self.ensure_system_prompt_materialized()?;
-        self.ensure_session_head().await?;
+        self.prepare_for_run().await?;
 
         let history_before = self.worker.as_ref().unwrap().history().len();
 
@@ -1005,9 +1149,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
 
     /// Resume from a paused state.
     pub async fn resume(&mut self) -> Result<PodRunResult, PodError> {
-        self.ensure_interceptor_installed();
-        self.ensure_system_prompt_materialized()?;
-        self.ensure_session_head().await?;
+        self.prepare_for_run().await?;
 
         let history_before = self.worker.as_ref().unwrap().history().len();
 
@@ -1035,27 +1177,29 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             config: w.request_config(),
             history: w.history(),
         };
-        if self.head_hash.is_none() {
+        let mut head = self.session_head.lock().await;
+        if head.head_hash.is_none() {
             let hash =
-                session_store::create_session_with_id(&self.store, self.session_id, state).await?;
-            self.head_hash = Some(hash);
+                session_store::create_session_with_id(&self.store, head.session_id, state).await?;
+            head.head_hash = Some(hash);
+            drop(head);
             self.persist_scope_snapshot().await?;
             return Ok(());
         }
-        let prev_session_id = self.session_id;
-        session_store::ensure_head_or_fork(
-            &self.store,
-            &mut self.session_id,
-            &mut self.head_hash,
-            state,
-        )
-        .await?;
+        let prev_session_id = head.session_id;
+        let mut session_id = head.session_id;
+        let mut head_hash = head.head_hash.clone();
+        session_store::ensure_head_or_fork(&self.store, &mut session_id, &mut head_hash, state)
+            .await?;
+        head.session_id = session_id;
+        head.head_hash = head_hash;
+        self.session_id = session_id;
         // ensure_head_or_fork mints a fresh session_id when it auto-
         // forks. Sync that to pods.json so a concurrent
         // restore_from_manifest can't see "no live writer" for the new
         // session and grab it.
-        if self.session_id != prev_session_id && self.scope_allocation.is_some() {
-            pod_registry::update_session(&self.manifest.pod.name, self.session_id)?;
+        if session_id != prev_session_id && self.scope_allocation.is_some() {
+            pod_registry::update_session(&self.manifest.pod.name, session_id)?;
         }
         Ok(())
     }
@@ -1142,17 +1286,21 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         })
     }
 
-    /// Attempt proactive compaction (called by Controller after run).
+    /// Attempt proactive compaction at the beginning of a controller Run.
     ///
-    /// Best-effort: failures are logged but do not propagate.
-    pub async fn try_post_run_compact(&mut self) -> Result<(), PodError> {
+    /// This used to run in the controller's post-run path. Keeping it here
+    /// preserves the ordering requirement that the next turn starts with a
+    /// compacted history, without introducing a separate Busy controller state.
+    /// Best-effort: failures are logged and surfaced, but do not abort the
+    /// user turn that triggered the check.
+    pub async fn try_pre_run_compact(&mut self) {
         let state = match self.compact_state.as_ref() {
             Some(s) if !s.is_disabled() && !s.just_compacted() => s.clone(),
-            _ => return Ok(()),
+            _ => return,
         };
         let current_tokens = self.total_tokens().tokens;
         if !state.exceeds_post_run(current_tokens) {
-            return Ok(());
+            return;
         }
 
         let retained = state.retained_tokens();
@@ -1161,24 +1309,22 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             Ok(new_session_id) => {
                 info!(
                     new_session_id = %new_session_id,
-                    "Proactive post-run compaction succeeded"
+                    "Proactive pre-run compaction succeeded"
                 );
                 self.send_event(Event::CompactDone { new_session_id });
                 state.record_compact_success();
-                Ok(())
             }
             Err(e) => {
-                warn!(error = %e, "Proactive post-run compaction failed");
+                warn!(error = %e, "Proactive pre-run compaction failed");
                 self.send_event(Event::CompactFailed {
                     error: e.to_string(),
                 });
                 self.alert(
                     AlertLevel::Warn,
                     AlertSource::Compactor,
-                    format!("post-run compaction failed: {e}"),
+                    format!("pre-run compaction failed: {e}"),
                 );
                 state.record_compact_failure();
-                Ok(())
             }
         }
     }
@@ -1193,19 +1339,24 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         // head_hash mutable).
         let w = self.worker.as_ref().unwrap();
         let new_items = &w.history()[history_before..];
-        session_store::save_delta(&self.store, self.session_id, &mut self.head_hash, new_items)
+        let mut head = self.session_head.lock().await;
+        self.session_id = head.session_id;
+        session_store::save_delta(&self.store, head.session_id, &mut head.head_hash, new_items)
             .await?;
 
+        drop(head);
         self.flush_pending_scope_snapshot().await?;
 
         let turn_count = self.worker.as_ref().unwrap().turn_count();
+        let mut head = self.session_head.lock().await;
         session_store::save_turn_end(
             &self.store,
-            self.session_id,
-            &mut self.head_hash,
+            head.session_id,
+            &mut head.head_hash,
             turn_count,
         )
         .await?;
+        drop(head);
 
         // Flush any sync-buffered metrics from this run first
         // (currently `prune.fire` / `prune.skip` from the prune observer).
@@ -1238,10 +1389,11 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 record,
                 correlation_id,
             } = recorded;
+            let mut head = self.session_head.lock().await;
             session_store::save_usage(
                 &self.store,
-                self.session_id,
-                &mut self.head_hash,
+                head.session_id,
+                &mut head.head_hash,
                 record.history_len,
                 record.input_total_tokens,
                 record.cache_read_tokens,
@@ -1249,6 +1401,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 record.output_tokens,
             )
             .await?;
+            drop(head);
             if let Some(id) = correlation_id {
                 let metric = session_metrics::Metric::now("prune.post_request")
                     .with_correlation_id(&id)
@@ -1266,20 +1419,22 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         let interrupted = self.worker.as_ref().unwrap().last_run_interrupted();
         match result {
             Ok(r) => {
+                let mut head = self.session_head.lock().await;
                 session_store::save_run_completed(
                     &self.store,
-                    self.session_id,
-                    &mut self.head_hash,
+                    head.session_id,
+                    &mut head.head_hash,
                     r.clone(),
                     interrupted,
                 )
                 .await?;
             }
             Err(e) => {
+                let mut head = self.session_head.lock().await;
                 session_store::save_run_errored(
                     &self.store,
-                    self.session_id,
-                    &mut self.head_hash,
+                    head.session_id,
+                    &mut head.head_hash,
                     e.to_string(),
                     interrupted,
                 )
@@ -1511,8 +1666,9 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         ));
 
         // Persist as a new compacted session.
-        let old_session_id = self.session_id;
-        let old_head_hash = self
+        let mut head = self.session_head.lock().await;
+        let old_session_id = head.session_id;
+        let old_head_hash = head
             .head_hash
             .clone()
             .expect("head_hash should be set after at least one entry");
@@ -1535,7 +1691,8 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         // session — the new compacted session starts with no measurements
         // until its first LLM call.
         self.session_id = new_session_id;
-        self.head_hash = Some(new_head_hash);
+        head.session_id = new_session_id;
+        head.head_hash = Some(new_head_hash);
         // Keep pods.json pointing at the live session_id. Without this
         // a concurrent `restore_from_manifest(new_session_id)` would
         // see no live writer and grab the session this Pod just moved
@@ -1545,6 +1702,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         if self.scope_allocation.is_some() {
             pod_registry::update_session(&self.manifest.pod.name, new_session_id)?;
         }
+        drop(head);
         // Align user_segments with the post-compaction history. Items
         // before `retain_from` (now folded into the summary) lose their
         // segments; only the user_messages surviving in retained_items
@@ -1641,10 +1799,10 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
 
     /// Phase 1 (memory.extract) post-run trigger.
     ///
-    /// Called by the Controller **before** [`try_post_run_compact`] so
-    /// the extract worker sees a stable session-log entry range
-    /// (compact rewrites history). Best-effort: failures are logged but
-    /// not propagated.
+    /// Called by the Controller before spawning the background memory task so
+    /// the extract worker sees a stable session-log entry range while compact
+    /// is deferred until the next turn starts. Best-effort: failures are
+    /// logged but not propagated.
     ///
     /// Behaviour follows `docs/plan/memory.md` §Phase 1 並走防止:
     /// in-flight 中の trigger は skip し、完了時点で閾値再評価する
@@ -1798,11 +1956,12 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             extract::ExtractedPayload::default()
         });
 
+        let source_session_id = self.session_head.lock().await.session_id;
         let staging_id = if payload.is_empty() {
             String::new()
         } else {
             let source = memory::schema::SourceRef {
-                session_id: self.session_id.to_string(),
+                session_id: source_session_id.to_string(),
                 range: [start_entry as u64, end_entry as u64],
             };
             let (id, _) = extract::write_staging(&layout, source, payload)
@@ -1817,14 +1976,18 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         };
         let payload_value = serde_json::to_value(&pointer_payload)
             .expect("ExtractPointerPayload is always JSON-serializable");
-        session_store::save_extension(
-            &self.store,
-            self.session_id,
-            &mut self.head_hash,
-            extract::EXTRACT_DOMAIN,
-            payload_value,
-        )
-        .await?;
+        {
+            let mut head = self.session_head.lock().await;
+            session_store::save_extension(
+                &self.store,
+                head.session_id,
+                &mut head.head_hash,
+                extract::EXTRACT_DOMAIN,
+                payload_value,
+            )
+            .await?;
+            self.session_id = head.session_id;
+        }
 
         *self
             .extract_pointer
@@ -1850,12 +2013,11 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         Ok(worker.client().clone_boxed())
     }
 
-    /// Phase 2 (memory.consolidation) post-run trigger.
+    /// Phase 2 (memory.consolidation) trigger.
     ///
-    /// Called by the Controller **after** [`try_post_run_extract`] and
-    /// **before** [`try_post_run_compact`]: extract feeds staging, compact
-    /// rewrites history. Phase 2 must consume staging before compact
-    /// reshapes the session.
+    /// Intended to run from a background memory task after Phase 1 may have
+    /// added staging entries. Compact is deferred until the next turn starts,
+    /// so consolidation no longer blocks the controller's post-run path.
     ///
     /// Behaviour follows `docs/plan/memory.md` §Phase 2 / §並走防止:
     /// the staging-side `StagingLock` enforces cross-process exclusion;
@@ -2096,7 +2258,10 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             worker: Some(worker),
             store,
             session_id,
-            head_hash: None,
+            session_head: Arc::new(AsyncMutex::new(SessionHead {
+                session_id,
+                head_hash: None,
+            })),
             pwd: common.pwd,
             scope: SharedScope::new(common.scope),
             hook_builder: HookRegistryBuilder::new(),
@@ -2121,7 +2286,8 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             pending_scope_snapshot: Arc::new(Mutex::new(None)),
             extract_in_flight: Arc::new(AtomicBool::new(false)),
             consolidation_in_flight: Arc::new(AtomicBool::new(false)),
-            extract_pointer: Mutex::new(None),
+            extract_pointer: Arc::new(Mutex::new(None)),
+            memory_task: None,
             user_segments: Vec::new(),
         };
         pod.apply_prune_from_manifest();
@@ -2160,7 +2326,10 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             worker: Some(worker),
             store,
             session_id,
-            head_hash: None,
+            session_head: Arc::new(AsyncMutex::new(SessionHead {
+                session_id,
+                head_hash: None,
+            })),
             pwd: common.pwd,
             scope: SharedScope::new(common.scope),
             hook_builder: HookRegistryBuilder::new(),
@@ -2185,7 +2354,8 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             pending_scope_snapshot: Arc::new(Mutex::new(None)),
             extract_in_flight: Arc::new(AtomicBool::new(false)),
             consolidation_in_flight: Arc::new(AtomicBool::new(false)),
-            extract_pointer: Mutex::new(None),
+            extract_pointer: Arc::new(Mutex::new(None)),
+            memory_task: None,
             user_segments: Vec::new(),
         };
         pod.apply_prune_from_manifest();
@@ -2288,7 +2458,10 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             worker: Some(worker),
             store,
             session_id,
-            head_hash: state.head_hash,
+            session_head: Arc::new(AsyncMutex::new(SessionHead {
+                session_id,
+                head_hash: state.head_hash,
+            })),
             pwd: common.pwd,
             scope: SharedScope::new(common.scope),
             hook_builder: HookRegistryBuilder::new(),
@@ -2315,7 +2488,8 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             pending_scope_snapshot: Arc::new(Mutex::new(None)),
             extract_in_flight: Arc::new(AtomicBool::new(false)),
             consolidation_in_flight: Arc::new(AtomicBool::new(false)),
-            extract_pointer: Mutex::new(extract_pointer),
+            extract_pointer: Arc::new(Mutex::new(extract_pointer)),
+            memory_task: None,
             user_segments: state.user_segments,
         };
         pod.apply_prune_from_manifest();

@@ -66,3 +66,9 @@
 - `crates/pod/src/controller.rs` `run_post_run_jobs` / `finish_controller_run`
 - `crates/pod/src/pod.rs` `try_post_run_extract` / `try_post_run_consolidate` / `try_post_run_compact`
 - `crates/protocol/src/lib.rs` `PodStatus` 定義
+
+## Review
+
+- 状態: Approve
+- レビュー詳細: [./pod-post-run-detach.review.md](./pod-post-run-detach.review.md)
+- 日付: 2026-05-04 (Round 3)

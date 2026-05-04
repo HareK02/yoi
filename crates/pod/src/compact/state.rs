@@ -4,8 +4,8 @@
 //! flags shared between:
 //! - `PodInterceptor` (reads `request_threshold` — the *safety net* for
 //!   between-requests yielding)
-//! - `Pod::try_post_run_compact` (reads `post_run_threshold` — the
-//!   *proactive* check between turns)
+//! - `Pod::try_pre_run_compact` (reads `post_run_threshold` — the
+//!   *proactive* check before the next turn starts)
 //! - `Pod::run()` / `resume()` (circuit breaker, thrash detection)
 //!
 //! Current occupancy (input-token count) is **not** stored here. The single
@@ -19,8 +19,8 @@ const MAX_COMPACT_FAILURES: usize = 3;
 
 /// Shared mutable state for compaction decisions.
 pub(crate) struct CompactState {
-    /// Between-turns threshold (proactive). Checked by the Controller
-    /// after a run completes. `None` disables the post-run check.
+    /// Between-turns threshold (proactive). Checked before the next turn
+    /// starts. `None` disables the pre-run check.
     post_run_threshold: Option<u64>,
     /// Between-requests threshold (safety net). Checked inside a turn
     /// before each LLM request. `None` disables the request check.

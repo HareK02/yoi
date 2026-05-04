@@ -74,6 +74,12 @@ pub trait LlmClient: Send + Sync {
     }
 }
 
+impl Clone for Box<dyn LlmClient> {
+    fn clone(&self) -> Self {
+        self.clone_boxed()
+    }
+}
+
 /// `Box<dyn LlmClient>` に対する `LlmClient` の実装
 ///
 /// これにより、動的ディスパッチを使用するクライアントも `Worker` で利用可能になる。
