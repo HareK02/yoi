@@ -16,6 +16,7 @@
   - 巻き戻されたターンの入力テキストを編集領域に復元 → [tickets/tui-empty-turn-restore.md](tickets/tui-empty-turn-restore.md)
   - セッションコンテキスト長 / ウィンドウ占有率の常時表示 → [tickets/tui-context-usage-indicator.md](tickets/tui-context-usage-indicator.md)
   - Task ストア状態の表示（入力欄上ミニビュー + サイドペイン） → [tickets/tui-task-display.md](tickets/tui-task-display.md)
+  - Compaction 進行中のライブ表示 → [tickets/tui-compact-progress.md](tickets/tui-compact-progress.md)
 - Manifest: Tool Output / File Upload 上限の分離とデフォルト緩和 → [tickets/manifest-output-upload-limits.md](tickets/manifest-output-upload-limits.md)
 - メモリ機構
   - 使用頻度メトリクス + Knowledge 化候補レポート → [tickets/memory-usage-metrics.md](tickets/memory-usage-metrics.md)
