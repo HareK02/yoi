@@ -252,21 +252,23 @@ struct TaskUpdateTool {
 }
 
 const CREATE_DESCRIPTION: &str = "Create a session-lifetime task for short-term current-work \
-tracking, not project management. Tasks are user-visible real-time status. Use this whenever you \
-set a goal and work through steps, including implementation. Input only `subject` and \
-`description`; `taskid` is assigned automatically and initial `status` is `pending`.";
+tracking, not project management. Tasks are user-visible real-time status for work with a \
+concrete goal that needs multiple meaningful steps, such as implementation, debugging, \
+investigation, or structured review. Do not create tasks for simple questions, brief answers, or \
+single-step actions. Input only `subject` and `description`; `taskid` is assigned automatically \
+and initial `status` is `pending`.";
 const LIST_DESCRIPTION: &str = "List every session-lifetime task, including completed and \
 deleted entries. Tasks are user-visible real-time status for short-term current-work tracking. \
 Takes an empty object as input.";
 const GET_DESCRIPTION: &str = "Get one session-lifetime task by `taskid`. Tasks are \
 user-visible real-time status for short-term current-work tracking. Returns an error if the task \
 does not exist.";
-const UPDATE_DESCRIPTION: &str = "Update an existing session-lifetime task before moving to the \
-next step. Tasks are user-visible real-time status; when working through steps, keep status \
-current with `pending`, `inprogress`, `completed`, or `deleted`. Provide `taskid` and at least \
-one of `status`, `subject`, or `description`; deletion is logical (`status = deleted`). If an \
-unexpected problem blocks progress, do not force the next step: leave the task as-is, summarize \
-the problem to the user, and end the turn.";
+const UPDATE_DESCRIPTION: &str = "Update an existing session-lifetime task as progress changes \
+between meaningful steps. Tasks are user-visible real-time status for multi-step work; keep \
+status current with `pending`, `inprogress`, `completed`, or `deleted`. Provide `taskid` and at \
+least one of `status`, `subject`, or `description`; deletion is logical (`status = deleted`). If \
+an unexpected problem blocks progress, do not force the next step: leave the task as-is, \
+summarize the problem to the user, and end the turn.";
 
 #[async_trait]
 impl Tool for TaskCreateTool {
