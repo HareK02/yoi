@@ -94,8 +94,15 @@ pub enum Item {
         summary: Vec<String>,
         /// サーバから返された暗号化済み reasoning blob。ZDR / `store=false`
         /// 運用で stateless に再送するときそのまま添える必要がある。
+        /// Anthropic の `redacted_thinking.data` もここに格納する。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         encrypted_content: Option<String>,
+        /// Anthropic extended thinking の `signature`。新世代 Claude
+        /// (Opus 4.5+/Sonnet 4.6+) では同一論理ターン内の `thinking`
+        /// ブロックを送り返す際に必須。改ざん検知に使われる。他 scheme
+        /// では `None`。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
         /// Item status
         #[serde(skip_serializing_if = "Option::is_none")]
         status: Option<ItemStatus>,
@@ -224,6 +231,7 @@ impl Item {
             text: text.into(),
             summary: Vec::new(),
             encrypted_content: None,
+            signature: None,
             status: None,
         }
     }
@@ -243,6 +251,14 @@ impl Item {
         } = &mut self
         {
             *encrypted_content = Some(content.into());
+        }
+        self
+    }
+
+    /// Set Anthropic `signature` on a `Reasoning` item. No-op on other variants.
+    pub fn with_signature(mut self, sig: impl Into<String>) -> Self {
+        if let Self::Reasoning { signature, .. } = &mut self {
+            *signature = Some(sig.into());
         }
         self
     }

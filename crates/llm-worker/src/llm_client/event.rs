@@ -17,6 +17,9 @@ use serde::{Deserialize, Serialize};
 ///
 /// - **メタイベント**: `Ping`, `Usage`, `Status`, `Error`
 /// - **ブロックイベント**: `BlockStart`, `BlockDelta`, `BlockStop`, `BlockAbort`
+/// - **永続化イベント**: `ReasoningItem` (history に commit すべき完成済み
+///   reasoning item。streaming 表示用の Thinking BlockStart/Delta/Stop と
+///   は別経路で発火する)
 ///
 /// # ブロックのライフサイクル
 ///
@@ -41,6 +44,18 @@ pub enum Event {
     BlockStop(BlockStop),
     /// ブロック中断
     BlockAbort(BlockAbort),
+
+    /// Reasoning item の完成。scheme が「次の request に送り返すための
+    /// reasoning material が揃った」点で 1 度だけ発火する。
+    ///
+    /// - Anthropic: 1 つの `thinking` content_block 完了ごと
+    /// - OpenAI Responses: 1 つの reasoning output_item 完了ごと
+    ///
+    /// 上位層（Worker / ReasoningItemCollector）はこれを `Item::Reasoning`
+    /// として `worker.history` に append する。streaming 表示用の
+    /// `BlockStart(Thinking)` / `BlockDelta(Thinking)` / `BlockStop(Thinking)`
+    /// は依然として並行発火する（live display と round-trip persist の責務分離）。
+    ReasoningItem(ReasoningItemEvent),
 }
 
 // =============================================================================
@@ -210,6 +225,31 @@ impl BlockAbort {
     pub fn block_type(&self) -> BlockType {
         self.block_type
     }
+}
+
+// =============================================================================
+// Reasoning Item Event
+// =============================================================================
+
+/// 完成済み reasoning item。scheme が round-trip に必要なすべての
+/// material（text, summary, encrypted_content, signature, id）を揃えて
+/// 1 度だけ発火する。
+///
+/// `Item::Reasoning` のフィールドを 1:1 に持つ。
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct ReasoningItemEvent {
+    /// scheme 側で観測した item id（OpenAI Responses の `id`）。
+    pub id: Option<String>,
+    /// reasoning 本体テキスト。Anthropic は `thinking` 累積、OpenAI は
+    /// `reasoning_text` 累積。redacted_thinking では空。
+    pub text: String,
+    /// summary (OpenAI Responses の `summary_text[]`)。他 scheme は空。
+    pub summary: Vec<String>,
+    /// 暗号化された opaque blob（Anthropic `redacted_thinking.data` /
+    /// OpenAI Responses `encrypted_content`）。
+    pub encrypted_content: Option<String>,
+    /// Anthropic extended thinking signature。round-trip 必須。
+    pub signature: Option<String>,
 }
 
 /// 停止理由

@@ -12,6 +12,7 @@ use crate::llm_client::{
 use serde::Deserialize;
 
 use super::AnthropicScheme;
+use super::scheme_impl::{AnthropicState, PendingThinking};
 
 /// Anthropic SSEイベントタイプ
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,7 +76,21 @@ pub(crate) enum ContentBlock {
     #[serde(rename = "text")]
     Text { text: String },
     #[serde(rename = "thinking")]
-    Thinking { thinking: String },
+    Thinking {
+        #[serde(default)]
+        thinking: String,
+        /// 非ストリーミングレスポンス由来の初期 signature（通常はストリームでは
+        /// 空 → `signature_delta` で埋まる）。
+        #[serde(default)]
+        signature: Option<String>,
+    },
+    #[serde(rename = "redacted_thinking")]
+    RedactedThinking {
+        /// 暗号化された opaque blob。signature ではなく、まるごと
+        /// `redacted_thinking.data` として送り返す必要がある。
+        #[serde(default)]
+        data: String,
+    },
     #[serde(rename = "tool_use")]
     ToolUse {
         id: String,
@@ -228,7 +243,9 @@ impl AnthropicScheme {
     fn convert_block_start(&self, event: &ContentBlockStartEvent) -> Event {
         let (block_type, metadata) = match &event.content_block {
             ContentBlock::Text { .. } => (BlockType::Text, BlockMetadata::Text),
-            ContentBlock::Thinking { .. } => (BlockType::Thinking, BlockMetadata::Thinking),
+            ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => {
+                (BlockType::Thinking, BlockMetadata::Thinking)
+            }
             ContentBlock::ToolUse { id, name, .. } => (
                 BlockType::ToolUse,
                 BlockMetadata::ToolUse {
@@ -262,6 +279,123 @@ impl AnthropicScheme {
             index: event.index,
             delta,
         }))
+    }
+
+    /// state を持ち回す上位パース。
+    ///
+    /// `parse_event` の単発 Event に加えて、以下を行う:
+    /// - `content_block_stop` の `block_type` を直前の Start 値で書き戻す
+    /// - `thinking` / `redacted_thinking` ブロックの本体・signature・data を
+    ///   `state.pending_thinking` に蓄積し、`content_block_stop` で
+    ///   `Event::ReasoningItem` を追加発火する
+    /// - `signature_delta` を蓄積（Stream channel には流さず、reasoning event
+    ///   にだけ反映する）
+    pub(crate) fn parse_with_state(
+        &self,
+        event_type: &str,
+        data: &str,
+        state: &mut AnthropicState,
+    ) -> Result<Vec<Event>, ClientError> {
+        let Some(parsed_event_type) = AnthropicEventType::parse(event_type) else {
+            return Ok(Vec::new());
+        };
+
+        // signature_delta はストリーム表示には流さず、state にだけ蓄積。
+        // それ以外は parse_event で標準 Event 化する。
+        let mut emitted: Vec<Event> = Vec::new();
+
+        match parsed_event_type {
+            AnthropicEventType::ContentBlockStart => {
+                let raw: ContentBlockStartEvent = serde_json::from_str(data)?;
+                state.current_block_type = Some(match &raw.content_block {
+                    ContentBlock::Text { .. } => BlockType::Text,
+                    ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => {
+                        BlockType::Thinking
+                    }
+                    ContentBlock::ToolUse { .. } => BlockType::ToolUse,
+                });
+                match &raw.content_block {
+                    ContentBlock::Thinking {
+                        thinking, signature,
+                    } => {
+                        state.pending_thinking = Some(PendingThinking {
+                            text: thinking.clone(),
+                            signature: signature.clone(),
+                            redacted_data: None,
+                        });
+                    }
+                    ContentBlock::RedactedThinking { data: blob } => {
+                        state.pending_thinking = Some(PendingThinking {
+                            text: String::new(),
+                            signature: None,
+                            redacted_data: Some(blob.clone()),
+                        });
+                    }
+                    _ => {}
+                }
+                emitted.push(self.convert_block_start(&raw));
+            }
+            AnthropicEventType::ContentBlockDelta => {
+                let raw: ContentBlockDeltaEvent = serde_json::from_str(data)?;
+                match &raw.delta {
+                    DeltaBlock::ThinkingDelta { thinking } => {
+                        if let Some(pending) = state.pending_thinking.as_mut() {
+                            pending.text.push_str(thinking);
+                        }
+                        emitted.push(Event::BlockDelta(BlockDelta {
+                            index: raw.index,
+                            delta: DeltaContent::Thinking(thinking.clone()),
+                        }));
+                    }
+                    DeltaBlock::SignatureDelta { signature } => {
+                        if let Some(pending) = state.pending_thinking.as_mut() {
+                            // 通常 1 回しか来ないが、複数 fragment 来ても連結しておく
+                            match &mut pending.signature {
+                                Some(acc) => acc.push_str(signature),
+                                None => pending.signature = Some(signature.clone()),
+                            }
+                        }
+                    }
+                    DeltaBlock::TextDelta { text } => {
+                        emitted.push(Event::BlockDelta(BlockDelta {
+                            index: raw.index,
+                            delta: DeltaContent::Text(text.clone()),
+                        }));
+                    }
+                    DeltaBlock::InputJsonDelta { partial_json } => {
+                        emitted.push(Event::BlockDelta(BlockDelta {
+                            index: raw.index,
+                            delta: DeltaContent::InputJson(partial_json.clone()),
+                        }));
+                    }
+                }
+            }
+            AnthropicEventType::ContentBlockStop => {
+                let raw: ContentBlockStopEvent = serde_json::from_str(data)?;
+                let block_type = state
+                    .current_block_type
+                    .take()
+                    .unwrap_or(BlockType::Text);
+                emitted.push(Event::BlockStop(BlockStop {
+                    index: raw.index,
+                    block_type,
+                    stop_reason: None,
+                }));
+                if matches!(block_type, BlockType::Thinking) {
+                    if let Some(pending) = state.pending_thinking.take() {
+                        emitted.push(Event::ReasoningItem(pending.into_event()));
+                    }
+                }
+            }
+            // 残りは state を必要としない。既存 parse_event に委譲。
+            _ => {
+                if let Some(event) = self.parse_event(event_type, data)? {
+                    emitted.push(event);
+                }
+            }
+        }
+
+        Ok(emitted)
     }
 
     fn convert_usage(&self, usage: &UsageData) -> UsageEvent {
@@ -389,6 +523,117 @@ mod tests {
             }
             _ => panic!("Expected BlockStart event"),
         }
+    }
+
+    #[test]
+    fn thinking_block_emits_reasoning_item_with_signature() {
+        // thinking ブロックが完了したら ReasoningItem に text+signature が乗ること
+        let scheme = AnthropicScheme::new();
+        let mut state = AnthropicState::default();
+
+        let evs = scheme
+            .parse_with_state(
+                "content_block_start",
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+                &mut state,
+            )
+            .unwrap();
+        assert!(matches!(evs[0], Event::BlockStart(_)));
+
+        scheme
+            .parse_with_state(
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"hello "}}"#,
+                &mut state,
+            )
+            .unwrap();
+        scheme
+            .parse_with_state(
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"world"}}"#,
+                &mut state,
+            )
+            .unwrap();
+        scheme
+            .parse_with_state(
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"SIG-XYZ"}}"#,
+                &mut state,
+            )
+            .unwrap();
+
+        let stop_evs = scheme
+            .parse_with_state(
+                "content_block_stop",
+                r#"{"type":"content_block_stop","index":0}"#,
+                &mut state,
+            )
+            .unwrap();
+        // BlockStop と ReasoningItem の 2 件が並ぶ
+        assert!(matches!(stop_evs[0], Event::BlockStop(_)));
+        let Event::ReasoningItem(reasoning) = &stop_evs[1] else {
+            panic!("expected ReasoningItem, got {:?}", stop_evs[1]);
+        };
+        assert_eq!(reasoning.text, "hello world");
+        assert_eq!(reasoning.signature.as_deref(), Some("SIG-XYZ"));
+        assert!(reasoning.encrypted_content.is_none());
+    }
+
+    #[test]
+    fn redacted_thinking_emits_reasoning_item_with_data() {
+        let scheme = AnthropicScheme::new();
+        let mut state = AnthropicState::default();
+
+        scheme
+            .parse_with_state(
+                "content_block_start",
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"redacted_thinking","data":"opaque-blob"}}"#,
+                &mut state,
+            )
+            .unwrap();
+        let stop_evs = scheme
+            .parse_with_state(
+                "content_block_stop",
+                r#"{"type":"content_block_stop","index":0}"#,
+                &mut state,
+            )
+            .unwrap();
+        let Event::ReasoningItem(reasoning) = &stop_evs[1] else {
+            panic!("expected ReasoningItem");
+        };
+        assert!(reasoning.text.is_empty());
+        assert!(reasoning.signature.is_none());
+        assert_eq!(reasoning.encrypted_content.as_deref(), Some("opaque-blob"));
+    }
+
+    #[test]
+    fn text_block_does_not_emit_reasoning_item() {
+        let scheme = AnthropicScheme::new();
+        let mut state = AnthropicState::default();
+
+        scheme
+            .parse_with_state(
+                "content_block_start",
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+                &mut state,
+            )
+            .unwrap();
+        scheme
+            .parse_with_state(
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#,
+                &mut state,
+            )
+            .unwrap();
+        let stop_evs = scheme
+            .parse_with_state(
+                "content_block_stop",
+                r#"{"type":"content_block_stop","index":0}"#,
+                &mut state,
+            )
+            .unwrap();
+        assert_eq!(stop_evs.len(), 1);
+        assert!(matches!(stop_evs[0], Event::BlockStop(_)));
     }
 
     #[test]

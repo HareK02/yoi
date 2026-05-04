@@ -22,7 +22,7 @@ use crate::{
     },
     state::{Locked, Mutable, WorkerState},
     timeline::event::{ErrorEvent, StatusEvent, UsageEvent},
-    timeline::{TextBlockCollector, Timeline, ToolCallCollector},
+    timeline::{ReasoningItemCollector, TextBlockCollector, Timeline, ToolCallCollector},
     tool::{
         ToolCall, ToolDefinition as WorkerToolDefinition, ToolError, ToolOutputLimits, ToolResult,
         truncate_content,
@@ -140,6 +140,9 @@ pub struct Worker<C: LlmClient, S: WorkerState = Mutable> {
     text_block_collector: TextBlockCollector,
     /// Tool call collector (Timeline handler)
     tool_call_collector: ToolCallCollector,
+    /// Reasoning item collector (Timeline handler)。完成済み reasoning
+    /// item を 1 ターン分バッファし、history に append する。
+    reasoning_item_collector: ReasoningItemCollector,
     /// Tool server handle
     tool_server: ToolServerHandle,
     /// Interceptor for control-flow decisions
@@ -587,9 +590,36 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
         self.tool_server.tool_definitions_sorted()
     }
 
-    /// Build assistant response items from text blocks and tool calls
-    fn build_assistant_items(&self, text_blocks: &[String], tool_calls: &[ToolCall]) -> Vec<Item> {
+    /// Build assistant response items from reasoning items, text blocks, and tool calls.
+    ///
+    /// Reasoning items come first (Anthropic / OpenAI Responses 双方ともに
+    /// アシスタント応答内で reasoning は先頭に並ぶ仕様)。これは Anthropic
+    /// が新世代モデルで thinking ブロックを assistant メッセージの先頭に
+    /// 置くことを要求するためでもある。
+    fn build_assistant_items(
+        &self,
+        reasoning_items: &[crate::llm_client::event::ReasoningItemEvent],
+        text_blocks: &[String],
+        tool_calls: &[ToolCall],
+    ) -> Vec<Item> {
         let mut items = Vec::new();
+
+        for r in reasoning_items {
+            let mut item = Item::reasoning(r.text.clone());
+            if let Some(id) = &r.id {
+                item = item.with_id(id);
+            }
+            if !r.summary.is_empty() {
+                item = item.with_reasoning_summary(r.summary.clone());
+            }
+            if let Some(enc) = &r.encrypted_content {
+                item = item.with_encrypted_content(enc);
+            }
+            if let Some(sig) = &r.signature {
+                item = item.with_signature(sig);
+            }
+            items.push(item);
+        }
 
         // Add text as assistant message if present
         let text = text_blocks.join("");
@@ -973,9 +1003,11 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
             self.turn_count += 1;
 
             // Collect and commit assistant items
+            let reasoning_items = self.reasoning_item_collector.take_collected();
             let text_blocks = self.text_block_collector.take_collected();
             let tool_calls = self.tool_call_collector.take_collected();
-            let assistant_items = self.build_assistant_items(&text_blocks, &tool_calls);
+            let assistant_items =
+                self.build_assistant_items(&reasoning_items, &text_blocks, &tool_calls);
             self.history.extend(assistant_items);
 
             if tool_calls.is_empty() {
@@ -1118,18 +1150,21 @@ impl<C: LlmClient> Worker<C, Mutable> {
     pub fn new(client: C) -> Self {
         let text_block_collector = TextBlockCollector::new();
         let tool_call_collector = ToolCallCollector::new();
+        let reasoning_item_collector = ReasoningItemCollector::new();
         let mut timeline = Timeline::new();
         let (cancel_tx, cancel_rx) = mpsc::channel(1);
 
         // Register collectors with Timeline
         timeline.on_text_block(text_block_collector.clone());
         timeline.on_tool_use_block(tool_call_collector.clone());
+        timeline.on_reasoning_item(reasoning_item_collector.clone());
 
         Self {
             client,
             timeline,
             text_block_collector,
             tool_call_collector,
+            reasoning_item_collector,
             tool_server: ToolServer::new().handle(),
             interceptor: Box::new(DefaultInterceptor),
             system_prompt: None,
@@ -1388,6 +1423,7 @@ impl<C: LlmClient> Worker<C, Mutable> {
             timeline: self.timeline,
             text_block_collector: self.text_block_collector,
             tool_call_collector: self.tool_call_collector,
+            reasoning_item_collector: self.reasoning_item_collector,
             tool_server: self.tool_server,
             interceptor: self.interceptor,
             system_prompt: self.system_prompt,
@@ -1470,6 +1506,7 @@ impl<C: LlmClient> Worker<C, Locked> {
             timeline: self.timeline,
             text_block_collector: self.text_block_collector,
             tool_call_collector: self.tool_call_collector,
+            reasoning_item_collector: self.reasoning_item_collector,
             tool_server: self.tool_server,
             interceptor: self.interceptor,
             system_prompt: self.system_prompt,

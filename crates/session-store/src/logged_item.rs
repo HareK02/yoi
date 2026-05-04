@@ -39,6 +39,10 @@ pub enum LoggedItem {
         summary: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         encrypted_content: Option<String>,
+        /// Anthropic extended thinking signature。新世代 Claude で round-trip
+        /// 必須。OpenAI Responses など他 scheme では `None`。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
     },
 }
 
@@ -92,11 +96,13 @@ impl From<&Item> for LoggedItem {
                 text,
                 summary,
                 encrypted_content,
+                signature,
                 ..
             } => Self::Reasoning {
                 text: text.clone(),
                 summary: summary.clone(),
                 encrypted_content: encrypted_content.clone(),
+                signature: signature.clone(),
             },
         }
     }
@@ -142,11 +148,13 @@ impl From<LoggedItem> for Item {
                 text,
                 summary,
                 encrypted_content,
+                signature,
             } => Item::Reasoning {
                 id: None,
                 text,
                 summary,
                 encrypted_content,
+                signature,
                 status: None,
             },
         }

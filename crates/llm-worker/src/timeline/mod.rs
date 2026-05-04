@@ -10,12 +10,14 @@
 //! - [`ToolCallCollector`] - ツール呼び出しを収集するHandler
 
 pub mod event;
+mod reasoning_item_collector;
 mod text_block_collector;
 mod timeline;
 mod tool_call_collector;
 
 // 公開API
 pub use event::*;
+pub use reasoning_item_collector::ReasoningItemCollector;
 pub use text_block_collector::TextBlockCollector;
 pub use timeline::Timeline;
 pub use tool_call_collector::ToolCallCollector;
@@ -28,6 +30,7 @@ pub use crate::handler::{
     Handler,
     Kind,
     PingKind,
+    ReasoningItemKind,
     StatusKind,
     // Block Events
     TextBlockEvent,

@@ -77,6 +77,21 @@ pub(crate) enum AnthropicContentPart {
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControl>,
     },
+    #[serde(rename = "thinking")]
+    Thinking {
+        thinking: String,
+        signature: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
+    },
+    #[serde(rename = "redacted_thinking")]
+    RedactedThinking {
+        /// 暗号化済み reasoning blob。`Item::Reasoning::encrypted_content`
+        /// から渡る。
+        data: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
+    },
     #[serde(rename = "tool_use")]
     ToolUse {
         id: String,
@@ -102,6 +117,21 @@ impl AnthropicContentPart {
         }
     }
 
+    fn thinking(thinking: String, signature: String) -> Self {
+        Self::Thinking {
+            thinking,
+            signature,
+            cache_control: None,
+        }
+    }
+
+    fn redacted_thinking(data: String) -> Self {
+        Self::RedactedThinking {
+            data,
+            cache_control: None,
+        }
+    }
+
     fn tool_use(id: String, name: String, input: serde_json::Value) -> Self {
         Self::ToolUse {
             id,
@@ -122,6 +152,8 @@ impl AnthropicContentPart {
     fn set_cache_control(&mut self, cc: CacheControl) {
         match self {
             Self::Text { cache_control, .. }
+            | Self::Thinking { cache_control, .. }
+            | Self::RedactedThinking { cache_control, .. }
             | Self::ToolUse { cache_control, .. }
             | Self::ToolResult { cache_control, .. } => {
                 *cache_control = Some(cc);
@@ -305,11 +337,33 @@ impl AnthropicScheme {
                         .push((i, AnthropicContentPart::tool_result(call_id.clone(), text)));
                 }
 
-                Item::Reasoning { text, .. } => {
+                Item::Reasoning {
+                    text,
+                    encrypted_content,
+                    signature,
+                    ..
+                } => {
                     flush_pending(&mut messages, &mut pending_user, "user", &mut locations);
-                    // Reasoning is treated as assistant text in Anthropic
-                    // (actual thinking blocks are handled differently in streaming).
-                    pending_assistant.push((i, AnthropicContentPart::text(text.clone())));
+                    // Anthropic はアシスタントターン中の `thinking` /
+                    // `redacted_thinking` ブロックを必ず assistant role の
+                    // content_part として送り返す必要がある。
+                    //
+                    // - signature あり: `thinking` content_part を投影
+                    // - signature 無し + encrypted_content あり:
+                    //   `redacted_thinking` content_part を投影
+                    // - どちらも無い: 他 scheme（OpenAI 等）から流入した
+                    //   素の reasoning text。Anthropic に投げる意味も
+                    //   round-trip の根拠も無いので drop。
+                    if let Some(sig) = signature.clone() {
+                        pending_assistant.push((
+                            i,
+                            AnthropicContentPart::thinking(text.clone(), sig),
+                        ));
+                    } else if let Some(data) = encrypted_content.clone() {
+                        pending_assistant
+                            .push((i, AnthropicContentPart::redacted_thinking(data)));
+                    }
+                    // どちらも None なら何も pend せず、本 item は無視。
                 }
             }
         }
@@ -542,6 +596,8 @@ mod tests {
     fn part_cache_control(part: &AnthropicContentPart) -> Option<CacheControl> {
         match part {
             AnthropicContentPart::Text { cache_control, .. }
+            | AnthropicContentPart::Thinking { cache_control, .. }
+            | AnthropicContentPart::RedactedThinking { cache_control, .. }
             | AnthropicContentPart::ToolUse { cache_control, .. }
             | AnthropicContentPart::ToolResult { cache_control, .. } => *cache_control,
         }
@@ -735,6 +791,81 @@ mod tests {
         request.cache_anchor = Some(0);
         let req = scheme.build_request("claude-sonnet-4-20250514", &request, &cap_auto());
         assert!(breakpoint_positions(&req).is_empty());
+    }
+
+    fn collect_assistant_thinking_parts(req: &AnthropicRequest) -> Vec<&AnthropicContentPart> {
+        let mut out = Vec::new();
+        for msg in &req.messages {
+            if msg.role != "assistant" {
+                continue;
+            }
+            if let AnthropicContent::Parts(parts) = &msg.content {
+                for part in parts {
+                    if matches!(
+                        part,
+                        AnthropicContentPart::Thinking { .. }
+                            | AnthropicContentPart::RedactedThinking { .. }
+                    ) {
+                        out.push(part);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn reasoning_with_signature_projects_thinking_part() {
+        // Item::Reasoning に signature があれば assistant role の
+        // `thinking` content_part として送る。
+        let scheme = AnthropicScheme::new();
+        let request = Request::new()
+            .user("hi")
+            .item(Item::reasoning("step-by-step").with_signature("SIG-A"))
+            .item(Item::assistant_message("done"));
+        let req = scheme.build_request("claude-sonnet-4-20250514", &request, &cap_explicit());
+        let thinking_parts = collect_assistant_thinking_parts(&req);
+        assert_eq!(thinking_parts.len(), 1);
+        match thinking_parts[0] {
+            AnthropicContentPart::Thinking {
+                thinking, signature, ..
+            } => {
+                assert_eq!(thinking, "step-by-step");
+                assert_eq!(signature, "SIG-A");
+            }
+            other => panic!("expected Thinking part, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reasoning_with_only_encrypted_content_projects_redacted_thinking() {
+        let scheme = AnthropicScheme::new();
+        let request = Request::new()
+            .user("hi")
+            .item(Item::reasoning("").with_encrypted_content("opaque"))
+            .item(Item::assistant_message("done"));
+        let req = scheme.build_request("claude-sonnet-4-20250514", &request, &cap_explicit());
+        let parts = collect_assistant_thinking_parts(&req);
+        assert_eq!(parts.len(), 1);
+        match parts[0] {
+            AnthropicContentPart::RedactedThinking { data, .. } => {
+                assert_eq!(data, "opaque");
+            }
+            other => panic!("expected RedactedThinking, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reasoning_without_signature_or_encrypted_is_dropped() {
+        // 他 scheme から流入した素の reasoning は Anthropic に投げない。
+        let scheme = AnthropicScheme::new();
+        let request = Request::new()
+            .user("hi")
+            .item(Item::reasoning("plain text"))
+            .item(Item::assistant_message("done"));
+        let req = scheme.build_request("claude-sonnet-4-20250514", &request, &cap_explicit());
+        // thinking part は 1 つも乗らない
+        assert!(collect_assistant_thinking_parts(&req).is_empty());
     }
 
     #[test]

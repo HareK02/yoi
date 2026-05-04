@@ -13,7 +13,7 @@ use crate::llm_client::{
     ClientError,
     event::{
         BlockDelta, BlockMetadata, BlockStart, BlockStop, BlockType, DeltaContent, ErrorEvent,
-        Event, ResponseStatus, StatusEvent, UsageEvent,
+        Event, ReasoningItemEvent, ResponseStatus, StatusEvent, UsageEvent,
     },
 };
 
@@ -22,6 +22,21 @@ use crate::llm_client::{
 pub struct OpenAIResponsesState {
     slots: HashMap<SlotKey, SlotInfo>,
     next_index: usize,
+    /// 蓄積中の reasoning output_item。`output_item.added`(Reasoning) で
+    /// 確保し、`reasoning_text.delta` / `reasoning_summary_text.delta` で
+    /// 蓄積、`output_item.done`(Reasoning) で `Event::ReasoningItem` を
+    /// 発火してエントリを除去する。
+    pending_reasoning: HashMap<usize, PendingReasoning>,
+}
+
+/// 1 つの reasoning output_item の蓄積バッファ。
+#[derive(Debug, Default)]
+struct PendingReasoning {
+    id: Option<String>,
+    /// `reasoning_text.delta` の累積。複数 content_part あれば順に concat。
+    text: String,
+    /// `reasoning_summary_text.delta` を summary_index 順に蓄積。
+    summary: Vec<String>,
 }
 
 impl OpenAIResponsesState {
@@ -44,6 +59,18 @@ impl OpenAIResponsesState {
         } else {
             (self.allocate(key, block_type), true)
         }
+    }
+
+    fn ensure_reasoning(&mut self, output_index: usize) -> &mut PendingReasoning {
+        self.pending_reasoning.entry(output_index).or_default()
+    }
+
+    fn extend_reasoning_summary(&mut self, output_index: usize, summary_index: usize, text: &str) {
+        let entry = self.ensure_reasoning(output_index);
+        if entry.summary.len() <= summary_index {
+            entry.summary.resize(summary_index + 1, String::new());
+        }
+        entry.summary[summary_index].push_str(text);
     }
 }
 
@@ -89,8 +116,12 @@ enum OutputItem {
         id: Option<String>,
     },
     Reasoning {
-        #[allow(dead_code)]
+        #[serde(default)]
         id: Option<String>,
+        /// `output_item.done` で初めて埋まる。`include=["reasoning.encrypted_content"]`
+        /// 指定時に opaque blob が乗る。
+        #[serde(default)]
+        encrypted_content: Option<String>,
     },
     FunctionCall {
         #[allow(dead_code)]
@@ -319,12 +350,49 @@ pub(crate) fn parse_sse(
                         metadata: BlockMetadata::ToolUse { id: call_id, name },
                     })])
                 }
+                OutputItem::Reasoning { id, .. } => {
+                    // wrapper を確保。中身の content_part / summary_part は
+                    // 別 SlotKey で扱われ続ける（Streaming 表示は維持）。
+                    let entry = state.ensure_reasoning(ev.output_index);
+                    if id.is_some() {
+                        entry.id = id;
+                    }
+                    Ok(Vec::new())
+                }
                 _ => Ok(Vec::new()),
             }
         }
 
         "response.output_item.done" => {
             let ev: OutputItemDone = from_json(data)?;
+            // Reasoning wrapper の done で蓄積分を ReasoningItem として発火。
+            // これは `slots` の OutputItem slot とは独立している
+            // (FunctionCall は slots、Reasoning は pending_reasoning)。
+            if let OutputItem::Reasoning {
+                id,
+                encrypted_content,
+                ..
+            } = ev.item
+            {
+                let mut pending = state
+                    .pending_reasoning
+                    .remove(&ev.output_index)
+                    .unwrap_or_default();
+                if pending.id.is_none() {
+                    pending.id = id;
+                }
+                return Ok(vec![Event::ReasoningItem(ReasoningItemEvent {
+                    id: pending.id,
+                    text: pending.text,
+                    summary: pending
+                        .summary
+                        .into_iter()
+                        .filter(|s| !s.is_empty())
+                        .collect(),
+                    encrypted_content,
+                    signature: None,
+                })]);
+            }
             if let Some(info) = state.slots.remove(&SlotKey::OutputItem(ev.output_index)) {
                 Ok(vec![Event::BlockStop(BlockStop {
                     index: info.flat_index,
@@ -389,6 +457,8 @@ pub(crate) fn parse_sse(
 
         "response.reasoning_text.delta" => {
             let ev: ReasoningTextDelta = from_json(data)?;
+            // round-trip 用に蓄積
+            state.ensure_reasoning(ev.output_index).text.push_str(&ev.delta);
             Ok(ensure_and_delta(
                 state,
                 SlotKey::ContentPart {
@@ -419,6 +489,8 @@ pub(crate) fn parse_sse(
 
         "response.reasoning_summary_text.delta" => {
             let ev: ReasoningSummaryTextDelta = from_json(data)?;
+            // round-trip 用に蓄積
+            state.extend_reasoning_summary(ev.output_index, ev.summary_index, &ev.delta);
             Ok(ensure_and_delta(
                 state,
                 SlotKey::Summary {
@@ -795,6 +867,98 @@ mod tests {
                 status: ResponseStatus::Failed
             })
         ));
+    }
+
+    #[test]
+    fn reasoning_output_item_emits_reasoning_item_with_text_summary_encrypted() {
+        // 完成済み reasoning wrapper が text + summary[] + encrypted_content を持って
+        // ReasoningItem として届くこと。
+        let mut state = OpenAIResponsesState::default();
+
+        // wrapper added (id だけ持つ)
+        with(
+            &mut state,
+            "response.output_item.added",
+            r#"{"output_index":0,"item":{"type":"reasoning","id":"r1"}}"#,
+        );
+        // 内側の reasoning_text 用 content_part
+        with(
+            &mut state,
+            "response.content_part.added",
+            r#"{"output_index":0,"content_index":0,"item_id":"r1","part":{"type":"reasoning_text","text":""}}"#,
+        );
+        with(
+            &mut state,
+            "response.reasoning_text.delta",
+            r#"{"output_index":0,"content_index":0,"item_id":"r1","delta":"hello "}"#,
+        );
+        with(
+            &mut state,
+            "response.reasoning_text.delta",
+            r#"{"output_index":0,"content_index":0,"item_id":"r1","delta":"world"}"#,
+        );
+        with(
+            &mut state,
+            "response.content_part.done",
+            r#"{"output_index":0,"content_index":0,"item_id":"r1","part":{"type":"reasoning_text","text":"hello world"}}"#,
+        );
+        // summary 1 件
+        with(
+            &mut state,
+            "response.reasoning_summary_part.added",
+            r#"{"output_index":0,"summary_index":0,"item_id":"r1","part":{"type":"summary_text","text":""}}"#,
+        );
+        with(
+            &mut state,
+            "response.reasoning_summary_text.delta",
+            r#"{"output_index":0,"summary_index":0,"item_id":"r1","delta":"sum-A"}"#,
+        );
+        with(
+            &mut state,
+            "response.reasoning_summary_part.done",
+            r#"{"output_index":0,"summary_index":0,"item_id":"r1"}"#,
+        );
+
+        // wrapper done (encrypted_content が乗る)
+        let evs = with(
+            &mut state,
+            "response.output_item.done",
+            r#"{"output_index":0,"item":{"type":"reasoning","id":"r1","encrypted_content":"ENC-XYZ"}}"#,
+        );
+        assert_eq!(evs.len(), 1);
+        let Event::ReasoningItem(reasoning) = &evs[0] else {
+            panic!("expected ReasoningItem, got {:?}", evs[0]);
+        };
+        assert_eq!(reasoning.id.as_deref(), Some("r1"));
+        assert_eq!(reasoning.text, "hello world");
+        assert_eq!(reasoning.summary, vec!["sum-A".to_string()]);
+        assert_eq!(reasoning.encrypted_content.as_deref(), Some("ENC-XYZ"));
+        assert!(reasoning.signature.is_none());
+        // pending_reasoning は drain されていること
+        assert!(state.pending_reasoning.is_empty());
+    }
+
+    #[test]
+    fn reasoning_wrapper_without_inner_content_emits_empty_text() {
+        // encrypted_content だけ届く（reasoning_text 無し）ケースでも
+        // ReasoningItem は発火する。
+        let mut state = OpenAIResponsesState::default();
+        with(
+            &mut state,
+            "response.output_item.added",
+            r#"{"output_index":2,"item":{"type":"reasoning","id":"r9"}}"#,
+        );
+        let evs = with(
+            &mut state,
+            "response.output_item.done",
+            r#"{"output_index":2,"item":{"type":"reasoning","id":"r9","encrypted_content":"BLOB"}}"#,
+        );
+        let Event::ReasoningItem(r) = &evs[0] else {
+            panic!()
+        };
+        assert!(r.text.is_empty());
+        assert!(r.summary.is_empty());
+        assert_eq!(r.encrypted_content.as_deref(), Some("BLOB"));
     }
 
     #[test]

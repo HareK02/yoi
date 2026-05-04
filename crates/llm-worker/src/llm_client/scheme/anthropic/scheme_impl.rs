@@ -9,7 +9,7 @@ use crate::llm_client::{
     ClientError,
     auth::AuthRequirement,
     capability::ModelCapability,
-    event::{BlockStop, BlockType, Event},
+    event::{BlockType, Event, ReasoningItemEvent},
     scheme::Scheme,
     types::Request,
 };
@@ -18,12 +18,37 @@ use super::AnthropicScheme;
 
 /// Anthropic の SSE パースで必要な状態。
 ///
-/// `content_block_stop` イベントは `block_type` を持たない仕様なので、
-/// 直前の `content_block_start` で観測した `block_type` を保持して
-/// `BlockStop` に書き戻す。
+/// 1. `content_block_stop` イベントは `block_type` を持たない仕様なので、
+///    直前の `content_block_start` で観測した `block_type` を保持して
+///    `BlockStop` に書き戻す。
+/// 2. `thinking` ブロック中の `thinking_delta` テキストと `signature_delta`
+///    署名、および `redacted_thinking` ブロックの `data` を蓄積し、
+///    `content_block_stop` で `Event::ReasoningItem` を発火する
+///    （round-trip 永続化のため）。
 #[derive(Debug, Default)]
 pub struct AnthropicState {
-    current_block_type: Option<BlockType>,
+    pub(crate) current_block_type: Option<BlockType>,
+    pub(crate) pending_thinking: Option<PendingThinking>,
+}
+
+/// 1 つの `thinking` または `redacted_thinking` content_block の蓄積バッファ。
+#[derive(Debug, Default)]
+pub(crate) struct PendingThinking {
+    pub(crate) text: String,
+    pub(crate) signature: Option<String>,
+    pub(crate) redacted_data: Option<String>,
+}
+
+impl PendingThinking {
+    pub(crate) fn into_event(self) -> ReasoningItemEvent {
+        ReasoningItemEvent {
+            id: None,
+            text: self.text,
+            summary: Vec::new(),
+            encrypted_content: self.redacted_data,
+            signature: self.signature,
+        }
+    }
 }
 
 impl Scheme for AnthropicScheme {
@@ -73,24 +98,7 @@ impl Scheme for AnthropicScheme {
         data: &str,
         state: &mut Self::State,
     ) -> Result<Vec<Event>, ClientError> {
-        let Some(mut event) = self.parse_event(event_type, data)? else {
-            return Ok(Vec::new());
-        };
-        match &event {
-            Event::BlockStart(start) => {
-                state.current_block_type = Some(start.block_type);
-            }
-            Event::BlockStop(stop) => {
-                if let Some(block_type) = state.current_block_type.take() {
-                    event = Event::BlockStop(BlockStop {
-                        block_type,
-                        ..stop.clone()
-                    });
-                }
-            }
-            _ => {}
-        }
-        Ok(vec![event])
+        self.parse_with_state(event_type, data, state)
     }
 
     fn default_capability(&self) -> ModelCapability {
