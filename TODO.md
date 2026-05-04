@@ -10,7 +10,6 @@
 - 永続化層のセマンティック整理 → [tickets/persistence-semantics.md](tickets/persistence-semantics.md)
 - llm-worker のエラー耐性
   - ストリーム途中失敗時の継続 → [tickets/llm-worker-stream-continuation.md](tickets/llm-worker-stream-continuation.md)
-- llm-worker: reasoning ブロックを history に永続化 (Anthropic signature 保持・ツール使用ループでの round-trip) → [tickets/reasoning-history-persist.md](tickets/reasoning-history-persist.md)
 - llm-worker: Anthropic projection で assistant ターン内ブロックを 1 message に束ねる → [tickets/anthropic-assistant-burst-bundling.md](tickets/anthropic-assistant-burst-bundling.md)
 - ネイティブ GUI クライアント MVP → [tickets/native-gui-mvp.md](tickets/native-gui-mvp.md)
 - TUI 拡充
