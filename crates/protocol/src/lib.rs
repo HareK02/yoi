@@ -223,6 +223,15 @@ pub enum Event {
     Notify {
         message: String,
     },
+    /// Persisted `role:system` history item that should be rendered by
+    /// clients through the same path used for `Event::History` replay.
+    ///
+    /// The payload is the serialized history item, not an ad-hoc display
+    /// DTO, so live subscribers and late subscribers have the same source
+    /// of truth: worker history / history.json.
+    SystemMessage {
+        item: serde_json::Value,
+    },
     /// Echo of `Method::PodEvent` received by this Pod. Same rationale
     /// as `Notify`: subscribers render the event as a log element,
     /// while a rendered summary is independently injected into the LLM

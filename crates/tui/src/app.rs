@@ -304,6 +304,129 @@ impl App {
         });
     }
 
+    fn push_history_item(&mut self, item: &serde_json::Value) {
+        let item_type = item["type"].as_str().unwrap_or("");
+        match item_type {
+            "message" => {
+                let role = item["role"].as_str().unwrap_or("");
+                let text = message_text(item);
+                match role {
+                    "user" => {
+                        self.turn_index += 1;
+                        self.blocks.push(Block::TurnHeader {
+                            turn: self.turn_index,
+                        });
+                        // Pod attaches the original `Vec<Segment>` to user
+                        // messages from live submissions, so we can rebuild
+                        // typed atoms (paste chips, refs) here. Seed history
+                        // loaded post-compaction has no `segments` field —
+                        // fall back to a single text segment.
+                        let segments = item
+                            .get("segments")
+                            .and_then(|v| serde_json::from_value::<Vec<Segment>>(v.clone()).ok())
+                            .unwrap_or_else(|| {
+                                if text.is_empty() {
+                                    Vec::new()
+                                } else {
+                                    vec![Segment::text(text.clone())]
+                                }
+                            });
+                        if !segments.is_empty() {
+                            self.blocks.push(Block::UserMessage { segments });
+                        }
+                    }
+                    "assistant" if !text.is_empty() => {
+                        self.blocks.push(Block::AssistantText { text });
+                    }
+                    "system" if !text.is_empty() => {
+                        self.blocks.push(Block::SystemMessage { text });
+                    }
+                    _ => {}
+                }
+            }
+            "tool_call" => {
+                // `Item::ToolCall` serializes the linking key as
+                // `call_id`; `id` is a separate optional item-level
+                // identifier. Use `call_id` so this matches how
+                // Event::ToolCallStart populates the block.
+                let id = item["call_id"].as_str().unwrap_or("").to_owned();
+                let name = item["name"].as_str().unwrap_or("?").to_owned();
+                let arguments = item["arguments"].as_str().map(|s| s.to_owned());
+                self.blocks.push(Block::ToolCall(ToolCallBlock {
+                    id,
+                    name,
+                    args_stream: arguments.clone().unwrap_or_default(),
+                    arguments,
+                    state: ToolCallState::Executing,
+                    edit_snapshot: None,
+                }));
+            }
+            "reasoning" => {
+                let text = item["text"].as_str().unwrap_or("").to_owned();
+                let body = if text.is_empty() {
+                    item["summary"]
+                        .as_array()
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str())
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        })
+                        .unwrap_or_default()
+                } else {
+                    text
+                };
+                self.blocks.push(Block::Thinking(ThinkingBlock {
+                    text: body,
+                    state: ThinkingState::Finished { elapsed_secs: None },
+                }));
+            }
+            "tool_result" => {
+                let id = item["call_id"].as_str().unwrap_or("").to_owned();
+                let summary = item["summary"].as_str().unwrap_or("").to_owned();
+                let output = item["content"].as_str().map(|s| s.to_owned());
+                let is_error = item["is_error"].as_bool().unwrap_or(false);
+                let (name, args) = self
+                    .find_tool_call_mut(&id)
+                    .map(|b| (b.name.clone(), b.arguments.clone()))
+                    .unwrap_or_default();
+                let edit_snapshot = if !is_error && name == "Edit" {
+                    args.as_deref()
+                        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                        .and_then(|v| v["file_path"].as_str().map(|s| s.to_owned()))
+                        .and_then(|path| self.cache.get(&path).map(|s| s.to_owned()))
+                } else {
+                    None
+                };
+                if let Some(tc) = self.find_tool_call_mut(&id) {
+                    if edit_snapshot.is_some() {
+                        tc.edit_snapshot = edit_snapshot;
+                    }
+                    tc.state = if is_error {
+                        ToolCallState::Error {
+                            summary,
+                            output: output.clone(),
+                        }
+                    } else {
+                        ToolCallState::Done {
+                            summary,
+                            output: output.clone(),
+                        }
+                    };
+                    if !is_error {
+                        apply_cache_update(
+                            &mut self.cache,
+                            &name,
+                            args.as_deref(),
+                            output.as_deref(),
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     pub fn handle_pod_event(&mut self, event: Event) {
         match event {
             Event::UserMessage { segments } => {
@@ -320,6 +443,10 @@ impl App {
             }
             Event::PodEvent(event) => {
                 self.blocks.push(Block::PodEvent { event });
+                self.assistant_streaming = false;
+            }
+            Event::SystemMessage { item } => {
+                self.push_history_item(&item);
                 self.assistant_streaming = false;
             }
             Event::TurnStart { .. } => {
@@ -670,130 +797,7 @@ impl App {
         self.assistant_streaming = false;
 
         for item in items {
-            let item_type = item["type"].as_str().unwrap_or("");
-            match item_type {
-                "message" => {
-                    let role = item["role"].as_str().unwrap_or("");
-                    let text = item["content"]
-                        .as_array()
-                        .and_then(|parts| parts.iter().filter_map(|p| p["text"].as_str()).next())
-                        .unwrap_or("")
-                        .to_owned();
-                    match role {
-                        "user" => {
-                            self.turn_index += 1;
-                            self.blocks.push(Block::TurnHeader {
-                                turn: self.turn_index,
-                            });
-                            // Pod attaches the original `Vec<Segment>` to
-                            // user messages from live submissions, so we
-                            // can rebuild typed atoms (paste chips, refs)
-                            // here. Seed history loaded post-compaction
-                            // has no `segments` field — fall back to a
-                            // single text segment.
-                            let segments = item
-                                .get("segments")
-                                .and_then(|v| {
-                                    serde_json::from_value::<Vec<Segment>>(v.clone()).ok()
-                                })
-                                .unwrap_or_else(|| {
-                                    if text.is_empty() {
-                                        Vec::new()
-                                    } else {
-                                        vec![Segment::text(text.clone())]
-                                    }
-                                });
-                            if !segments.is_empty() {
-                                self.blocks.push(Block::UserMessage { segments });
-                            }
-                        }
-                        "assistant" if !text.is_empty() => {
-                            self.blocks.push(Block::AssistantText { text });
-                        }
-                        _ => {}
-                    }
-                }
-                "tool_call" => {
-                    // `Item::ToolCall` serializes the linking key as
-                    // `call_id`; `id` is a separate optional item-level
-                    // identifier. Use `call_id` so this matches how
-                    // Event::ToolCallStart populates the block.
-                    let id = item["call_id"].as_str().unwrap_or("").to_owned();
-                    let name = item["name"].as_str().unwrap_or("?").to_owned();
-                    let arguments = item["arguments"].as_str().map(|s| s.to_owned());
-                    self.blocks.push(Block::ToolCall(ToolCallBlock {
-                        id,
-                        name,
-                        args_stream: arguments.clone().unwrap_or_default(),
-                        arguments,
-                        state: ToolCallState::Executing,
-                        edit_snapshot: None,
-                    }));
-                }
-                "reasoning" => {
-                    let text = item["text"].as_str().unwrap_or("").to_owned();
-                    let body = if text.is_empty() {
-                        item["summary"]
-                            .as_array()
-                            .map(|arr| {
-                                arr.iter()
-                                    .filter_map(|v| v.as_str())
-                                    .collect::<Vec<_>>()
-                                    .join("\n")
-                            })
-                            .unwrap_or_default()
-                    } else {
-                        text
-                    };
-                    self.blocks.push(Block::Thinking(ThinkingBlock {
-                        text: body,
-                        state: ThinkingState::Finished { elapsed_secs: None },
-                    }));
-                }
-                "tool_result" => {
-                    let id = item["call_id"].as_str().unwrap_or("").to_owned();
-                    let summary = item["summary"].as_str().unwrap_or("").to_owned();
-                    let output = item["content"].as_str().map(|s| s.to_owned());
-                    let is_error = item["is_error"].as_bool().unwrap_or(false);
-                    let (name, args) = self
-                        .find_tool_call_mut(&id)
-                        .map(|b| (b.name.clone(), b.arguments.clone()))
-                        .unwrap_or_default();
-                    let edit_snapshot = if !is_error && name == "Edit" {
-                        args.as_deref()
-                            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
-                            .and_then(|v| v["file_path"].as_str().map(|s| s.to_owned()))
-                            .and_then(|path| self.cache.get(&path).map(|s| s.to_owned()))
-                    } else {
-                        None
-                    };
-                    if let Some(tc) = self.find_tool_call_mut(&id) {
-                        if edit_snapshot.is_some() {
-                            tc.edit_snapshot = edit_snapshot;
-                        }
-                        tc.state = if is_error {
-                            ToolCallState::Error {
-                                summary,
-                                output: output.clone(),
-                            }
-                        } else {
-                            ToolCallState::Done {
-                                summary,
-                                output: output.clone(),
-                            }
-                        };
-                        if !is_error {
-                            apply_cache_update(
-                                &mut self.cache,
-                                &name,
-                                args.as_deref(),
-                                output.as_deref(),
-                            );
-                        }
-                    }
-                }
-                _ => {}
-            }
+            self.push_history_item(item);
         }
 
         // Any tool_call entries that never got paired with a
@@ -821,6 +825,19 @@ pub fn fmt_tokens(n: u64) -> String {
     } else {
         n.to_string()
     }
+}
+
+fn message_text(item: &serde_json::Value) -> String {
+    item["content"]
+        .as_array()
+        .map(|parts| {
+            parts
+                .iter()
+                .filter_map(|p| p["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
 }
 
 /// Strip the `cat -n` line-number gutter that the Read tool prepends to
@@ -1184,6 +1201,58 @@ mod completion_flow_tests {
             }],
         });
         assert!(app.completion.as_ref().unwrap().entries.is_empty());
+    }
+
+    #[test]
+    fn history_restore_renders_system_message_block() {
+        let mut app = App::new("test".into());
+        app.handle_pod_event(Event::History {
+            greeting: test_greeting(),
+            items: vec![serde_json::json!({
+                "type": "message",
+                "role": "system",
+                "content": [{
+                    "type": "text",
+                    "text": "[File: src/main.rs]\nfn main() {}",
+                }],
+            })],
+        });
+
+        assert!(matches!(
+            app.blocks.get(1),
+            Some(Block::SystemMessage { text }) if text == "[File: src/main.rs]\nfn main() {}"
+        ));
+    }
+
+    #[test]
+    fn live_system_message_event_uses_history_item_path() {
+        let mut app = App::new("test".into());
+        app.handle_pod_event(Event::SystemMessage {
+            item: serde_json::json!({
+                "type": "message",
+                "role": "system",
+                "content": [{
+                    "type": "text",
+                    "text": "[Workflow /build]\nRun the build",
+                }],
+            }),
+        });
+
+        assert!(matches!(
+            app.blocks.as_slice(),
+            [Block::SystemMessage { text }] if text == "[Workflow /build]\nRun the build"
+        ));
+    }
+
+    fn test_greeting() -> protocol::Greeting {
+        protocol::Greeting {
+            pod_name: "test".into(),
+            cwd: "/tmp".into(),
+            provider: "test-provider".into(),
+            model: "test-model".into(),
+            scope_summary: String::new(),
+            tools: Vec::new(),
+        }
     }
 }
 

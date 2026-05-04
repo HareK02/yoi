@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use llm_worker::WorkerError;
 use llm_worker::llm_client::client::LlmClient;
+use llm_worker::llm_client::types::{Item, Role};
 use session_store::Store;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
@@ -18,6 +19,16 @@ use crate::spawn::comm_tools::{
 use crate::spawn::registry::SpawnedPodRegistry;
 use crate::spawn::tool::spawn_pod_tool;
 use protocol::{AlertLevel, AlertSource, ErrorCode, Event, Method, RunResult, TurnResult};
+
+fn is_system_message_item(item: &Item) -> bool {
+    matches!(
+        item,
+        Item::Message {
+            role: Role::System,
+            ..
+        }
+    )
+}
 
 // ---------------------------------------------------------------------------
 // PodHandle — client-facing, Clone-able
@@ -244,6 +255,14 @@ impl PodController {
             let alerter_for_worker = alerter.clone();
             worker.on_warning(move |message| {
                 alerter_for_worker.alert(AlertLevel::Warn, AlertSource::Worker, message.to_owned());
+            });
+
+            let tx = event_tx.clone();
+            worker.on_history_append(move |item| {
+                if is_system_message_item(item) {
+                    let value = serde_json::to_value(item).expect("Item is Serialize");
+                    let _ = tx.send(Event::SystemMessage { item: value });
+                }
             });
 
             // Register the builtin file-manipulation tools (Read / Write /

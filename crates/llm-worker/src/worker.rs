@@ -168,6 +168,10 @@ pub struct Worker<C: LlmClient, S: WorkerState = Mutable> {
     /// truncation have been applied — i.e. on the same data that
     /// enters history.
     tool_result_cbs: Vec<Box<dyn Fn(&ToolResult) + Send + Sync>>,
+    /// History-append callbacks. Invoked for non-streamed items when they
+    /// are appended to persistent worker history, so upper layers can
+    /// broadcast those items using history itself as the source of truth.
+    history_append_cbs: Vec<Box<dyn Fn(&Item) + Send + Sync>>,
     /// Request configuration (max_tokens, temperature, etc.)
     request_config: RequestConfig,
     /// Whether the previous run was interrupted
@@ -343,6 +347,25 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
     fn emit_tool_result(&self, result: &ToolResult) {
         for cb in &self.tool_result_cbs {
             cb(result);
+        }
+    }
+
+    /// Register a callback invoked for items appended directly to worker
+    /// history outside streaming timeline callbacks.
+    pub fn on_history_append(&mut self, callback: impl Fn(&Item) + Send + Sync + 'static) {
+        self.history_append_cbs.push(Box::new(callback));
+    }
+
+    fn emit_history_append(&self, item: &Item) {
+        for cb in &self.history_append_cbs {
+            cb(item);
+        }
+    }
+
+    fn extend_history_with_callbacks(&mut self, items: impl IntoIterator<Item = Item>) {
+        for item in items {
+            self.emit_history_append(&item);
+            self.history.push(item);
         }
     }
 
@@ -863,7 +886,7 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
             // get persisted by the upper layer that owns history.json.
             let pending = self.interceptor.pending_history_appends().await;
             if !pending.is_empty() {
-                self.history.extend(pending);
+                self.extend_history_with_callbacks(pending);
             }
 
             // Clone the history into a per-request context. Everything
@@ -962,7 +985,7 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
                         return Ok(WorkerResult::Finished);
                     }
                     TurnEndAction::ContinueWithMessages(additional) => {
-                        self.history.extend(additional);
+                        self.extend_history_with_callbacks(additional);
                         continue;
                     }
                     TurnEndAction::Pause => {
@@ -1118,6 +1141,7 @@ impl<C: LlmClient> Worker<C, Mutable> {
             turn_end_cbs: Vec::new(),
             warning_cbs: Vec::new(),
             tool_result_cbs: Vec::new(),
+            history_append_cbs: Vec::new(),
             request_config: RequestConfig::default(),
             last_run_interrupted: false,
             cancel_tx,
@@ -1375,6 +1399,7 @@ impl<C: LlmClient> Worker<C, Mutable> {
             turn_end_cbs: self.turn_end_cbs,
             warning_cbs: self.warning_cbs,
             tool_result_cbs: self.tool_result_cbs,
+            history_append_cbs: self.history_append_cbs,
             request_config: self.request_config,
             last_run_interrupted: self.last_run_interrupted,
 
@@ -1415,7 +1440,7 @@ impl<C: LlmClient> Worker<C, Locked> {
         };
         self.history.push(user_item);
         if !extras.is_empty() {
-            self.history.extend(extras);
+            self.extend_history_with_callbacks(extras);
         }
         let result = self.run_turn_loop().await;
         self.finalize_interruption(result).await
@@ -1456,6 +1481,7 @@ impl<C: LlmClient> Worker<C, Locked> {
             turn_end_cbs: self.turn_end_cbs,
             warning_cbs: self.warning_cbs,
             tool_result_cbs: self.tool_result_cbs,
+            history_append_cbs: self.history_append_cbs,
             request_config: self.request_config,
             last_run_interrupted: self.last_run_interrupted,
 

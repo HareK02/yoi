@@ -19,6 +19,12 @@ pub enum Block {
     UserMessage {
         segments: Vec<Segment>,
     },
+    /// Persisted `role:system` history item rendered as an ordinary log
+    /// element. File refs, auto-read snippets, workflow bodies, and future
+    /// system-message injections all share this lane.
+    SystemMessage {
+        text: String,
+    },
     /// Echo of `Method::Notify` received by this Pod, surfaced as a log
     /// element so subscribers see the external input that drove any
     /// following auto-kicked turn.
