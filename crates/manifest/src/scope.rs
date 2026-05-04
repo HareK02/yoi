@@ -698,7 +698,10 @@ mod tests {
         std::fs::create_dir(&sub).unwrap();
         let shared = SharedScope::new(Scope::writable(dir.path()).unwrap());
         let target = sub.join("a.txt");
-        assert_eq!(shared.load().permission_at(&target), Some(Permission::Write));
+        assert_eq!(
+            shared.load().permission_at(&target),
+            Some(Permission::Write)
+        );
         shared
             .update(|cur| {
                 cur.with_added_deny_rules([ScopeRule {

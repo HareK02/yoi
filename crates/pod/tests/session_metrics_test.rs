@@ -22,9 +22,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use async_trait::async_trait;
 use futures::Stream;
 use llm_worker::Worker;
-use llm_worker::llm_client::event::{
-    Event as LlmEvent, ResponseStatus, StatusEvent, UsageEvent,
-};
+use llm_worker::llm_client::event::{Event as LlmEvent, ResponseStatus, StatusEvent, UsageEvent};
 use llm_worker::llm_client::{ClientError, LlmClient, Request};
 use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use session_metrics::{DOMAIN, Metric, metrics_from_extensions};
@@ -169,7 +167,11 @@ async fn make_pod(
     manifest_toml: String,
     client: MockClient,
     tool_name: &'static str,
-) -> (Pod<MockClient, FsStore>, tempfile::TempDir, tempfile::TempDir) {
+) -> (
+    Pod<MockClient, FsStore>,
+    tempfile::TempDir,
+    tempfile::TempDir,
+) {
     let manifest = PodManifest::from_toml(&manifest_toml).unwrap();
     let store_tmp = tempfile::tempdir().unwrap();
     let store = FsStore::new(store_tmp.path()).await.unwrap();
@@ -199,8 +201,7 @@ async fn prune_metrics_emit_skip_then_fire_with_post_request_join() {
         text_response_with_cache("ok", 0, 200),
         text_response_with_cache("done", 1234, 50),
     ]);
-    let (mut pod, _store_tmp, _pwd_tmp) =
-        make_pod(manifest_toml(1, 1), client, "big_tool").await;
+    let (mut pod, _store_tmp, _pwd_tmp) = make_pod(manifest_toml(1, 1), client, "big_tool").await;
     let session_id = pod.session_id();
     // Cloning the store handle to read the session log back after the
     // runs complete — the Pod retains its own copy.
@@ -253,10 +254,7 @@ async fn prune_metrics_emit_skip_then_fire_with_post_request_join() {
         fire.dimensions.contains_key("border_turn"),
         "fire missing border_turn: {fire:?}"
     );
-    assert!(
-        fire.value.is_some(),
-        "fire missing estimated_savings value"
-    );
+    assert!(fire.value.is_some(), "fire missing estimated_savings value");
     let fire_id = fire
         .correlation_id
         .as_ref()
@@ -272,7 +270,9 @@ async fn prune_metrics_emit_skip_then_fire_with_post_request_join() {
     assert_eq!(post.correlation_id.as_ref(), Some(fire_id));
     assert_eq!(post.value, Some(1234.0));
     assert_eq!(
-        post.dimensions.get("cache_write_tokens").map(String::as_str),
+        post.dimensions
+            .get("cache_write_tokens")
+            .map(String::as_str),
         Some("50")
     );
     assert!(post.dimensions.contains_key("history_len"));
@@ -457,7 +457,10 @@ permission = "write"
 
     let state = session_store::restore(&store, session_id).await.unwrap();
     let metrics = metrics_from_extensions(&state.extensions);
-    assert!(metrics.is_empty(), "no metrics should be recorded: {metrics:?}");
+    assert!(
+        metrics.is_empty(),
+        "no metrics should be recorded: {metrics:?}"
+    );
     // And no extension entries at all in the metrics domain.
     assert!(state.extensions.iter().all(|(d, _)| d != DOMAIN));
 

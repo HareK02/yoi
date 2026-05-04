@@ -1,7 +1,8 @@
 use std::time::Instant;
 
 use protocol::{
-    AlertLevel, AlertSource, CompletionEntry, CompletionKind, Event, Method, RunResult, Segment,
+    AlertLevel, AlertSource, CompletionEntry, CompletionKind, Event, Method, PodStatus, RunResult,
+    Segment,
 };
 
 use crate::block::{
@@ -41,11 +42,16 @@ impl CompletionState {
 pub struct App {
     pub pod_name: String,
     pub connected: bool,
+    /// Last controller status reported by the Pod. Drives the status line
+    /// and Ctrl-key routing; do not infer this solely from replayed history.
+    pub pod_status: PodStatus,
+    /// True while the Pod is in `PodStatus::Running`.
     pub running: bool,
-    /// True while the Pod is in `PodStatus::Paused`. Set on
-    /// `RunEnd::Paused` and cleared when a new turn starts (either via
-    /// `Resume` or a fresh `Run`).
+    /// True while the Pod is in `PodStatus::Paused`.
     pub paused: bool,
+    /// True after worker `RunEnd` while controller post-run work is still
+    /// blocking the next method.
+    pub busy: bool,
     pub run_requests: usize,
     /// Sum of `input_tokens - cache_read_input_tokens` across the
     /// current turn's LLM requests — i.e. the net tokens this turn
@@ -80,8 +86,10 @@ impl App {
         Self {
             pod_name,
             connected: false,
+            pod_status: PodStatus::Idle,
             running: false,
             paused: false,
+            busy: false,
             run_requests: 0,
             run_upload_tokens: 0,
             run_output_tokens: 0,
@@ -96,6 +104,16 @@ impl App {
             cache: FileCache::new(),
             assistant_streaming: false,
             completion: None,
+        }
+    }
+
+    pub fn set_pod_status(&mut self, status: PodStatus) {
+        self.pod_status = status;
+        self.running = status == PodStatus::Running;
+        self.paused = status == PodStatus::Paused;
+        self.busy = status == PodStatus::Busy;
+        if self.running || self.busy {
+            self.quit_confirm = None;
         }
     }
 
@@ -278,6 +296,10 @@ impl App {
     }
 
     pub fn submit_input(&mut self) -> Option<Method> {
+        if self.busy {
+            self.push_error("Pod is finishing post-run work; wait for idle before submitting.");
+            return None;
+        }
         let segments = self.input.submit_segments();
         if segments_are_blank(&segments) {
             // Empty Enter only does something meaningful when the Pod
@@ -450,8 +472,7 @@ impl App {
                 self.assistant_streaming = false;
             }
             Event::TurnStart { .. } => {
-                self.running = true;
-                self.paused = false;
+                self.set_pod_status(PodStatus::Running);
                 self.run_requests += 1;
                 self.current_tool = None;
                 self.assistant_streaming = false;
@@ -617,8 +638,10 @@ impl App {
                     upload_tokens: self.run_upload_tokens,
                     output_tokens: self.run_output_tokens,
                 });
-                self.running = false;
-                self.paused = matches!(result, RunResult::Paused);
+                self.set_pod_status(match result {
+                    RunResult::Paused => PodStatus::Paused,
+                    RunResult::Finished | RunResult::LimitReached => PodStatus::Busy,
+                });
                 self.run_requests = 0;
                 self.run_upload_tokens = 0;
                 self.run_output_tokens = 0;
@@ -643,8 +666,16 @@ impl App {
                     message: alert.message,
                 });
             }
-            Event::History { items, greeting } => {
+            Event::History {
+                items,
+                greeting,
+                status,
+            } => {
                 self.restore_history(&items, greeting);
+                self.set_pod_status(status);
+            }
+            Event::Status { status } => {
+                self.set_pod_status(status);
             }
             Event::Completions { kind, entries } => {
                 // Apply only if the popup is still on the same
@@ -1216,8 +1247,11 @@ mod completion_flow_tests {
                     "text": "[File: src/main.rs]\nfn main() {}",
                 }],
             })],
+            status: PodStatus::Running,
         });
 
+        assert!(matches!(app.pod_status, PodStatus::Running));
+        assert!(app.running);
         assert!(matches!(
             app.blocks.get(1),
             Some(Block::SystemMessage { text }) if text == "[File: src/main.rs]\nfn main() {}"

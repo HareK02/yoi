@@ -295,8 +295,7 @@ mod tests {
     fn release_is_resilient_to_missing_consumed_entries() {
         let (_dir, layout) = make_layout();
         let phantom = uuid::Uuid::now_v7();
-        let lock =
-            StagingLock::acquire(&layout, std::process::id(), "pod", vec![phantom]).unwrap();
+        let lock = StagingLock::acquire(&layout, std::process::id(), "pod", vec![phantom]).unwrap();
         let lock_path = lock.path().to_path_buf();
         // No file at <staging>/<phantom>.json — release must not panic.
         lock.release_with_cleanup(&layout);

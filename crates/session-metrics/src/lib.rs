@@ -89,9 +89,7 @@ pub async fn record_metric(
 /// `Metric` 列に fold する。
 ///
 /// schema 変更で deserialize できない payload は無視する（後方互換）。
-pub fn metrics_from_extensions(
-    extensions: &[(String, serde_json::Value)],
-) -> Vec<Metric> {
+pub fn metrics_from_extensions(extensions: &[(String, serde_json::Value)]) -> Vec<Metric> {
     extensions
         .iter()
         .filter(|(domain, _)| domain == DOMAIN)

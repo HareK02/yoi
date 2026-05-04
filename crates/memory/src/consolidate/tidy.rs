@@ -74,10 +74,7 @@ pub fn collect_tidy_hints(layout: &WorkspaceLayout) -> TidyHints {
     for (slug, content) in &decisions {
         let fm = parse_yaml::<DecisionFrontmatter>(content);
         if let Some(fm) = fm.as_ref() {
-            if matches!(
-                fm.status,
-                crate::schema::DecisionStatus::Replaced
-            ) {
+            if matches!(fm.status, crate::schema::DecisionStatus::Replaced) {
                 hints
                     .replaced_decisions
                     .insert(slug.clone(), fm.replaced_by.as_ref().map(|s| s.to_string()));
@@ -113,9 +110,9 @@ pub fn collect_tidy_hints(layout: &WorkspaceLayout) -> TidyHints {
             }
         }
     }
-    hints
-        .sources_overflow
-        .sort_by(|a, b| (a.kind.as_str(), a.slug.as_str()).cmp(&(b.kind.as_str(), b.slug.as_str())));
+    hints.sources_overflow.sort_by(|a, b| {
+        (a.kind.as_str(), a.slug.as_str()).cmp(&(b.kind.as_str(), b.slug.as_str()))
+    });
 
     let decision_slugs: Vec<&str> = decisions.keys().map(|s| s.as_str()).collect();
     let request_slugs: Vec<&str> = requests.keys().map(|s| s.as_str()).collect();
@@ -139,10 +136,7 @@ pub fn collect_tidy_hints(layout: &WorkspaceLayout) -> TidyHints {
 /// `<root>/.insomnia/memory/<kind>/*.md` (Knowledge は
 /// `<root>/.insomnia/knowledge/*.md`) を slug ごとに `(slug, full content)`
 /// 化して返す。
-fn read_kind_records(
-    layout: &WorkspaceLayout,
-    kind: RecordKind,
-) -> BTreeMap<String, String> {
+fn read_kind_records(layout: &WorkspaceLayout, kind: RecordKind) -> BTreeMap<String, String> {
     let dir = match kind {
         RecordKind::Decision => layout.decisions_dir(),
         RecordKind::Request => layout.requests_dir(),

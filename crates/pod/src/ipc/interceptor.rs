@@ -17,9 +17,9 @@ use llm_worker::interceptor::{
     Interceptor, PostToolAction, PreRequestAction, PreToolAction, PromptAction, ToolCallInfo,
     ToolResultInfo, TurnEndAction,
 };
-use tracing::warn;
 use llm_worker::tool::ToolOutput;
 use tracing::info;
+use tracing::warn;
 
 use crate::compact::state::CompactState;
 use crate::hook::{

@@ -21,7 +21,7 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use protocol::Method;
+use protocol::{Method, PodStatus};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use session_store::SessionId;
@@ -283,29 +283,44 @@ async fn run_loop(
             break;
         }
 
+        // Drain any already-buffered Pod events in a bounded batch before
+        // polling the terminal. This keeps status fresh without letting a
+        // busy event stream starve Ctrl-C / Ctrl-X input.
+        for _ in 0..32 {
+            match client.try_next_event() {
+                Some(ev) => app.handle_pod_event(ev),
+                None => break,
+            }
+        }
+
+        // Always give the terminal queue a non-blocking pass each frame.
+        // The awaited select below only waits after this pass found nothing.
+        let mut handled_term_event = false;
+        while event::poll(std::time::Duration::ZERO)? {
+            handled_term_event = true;
+            handle_terminal_event(app, &mut client, event::read()?).await?;
+            if app.quit {
+                break;
+            }
+        }
+        if app.quit {
+            break;
+        }
+        if handled_term_event {
+            terminal.draw(|f| ui::draw(f, app))?;
+            continue;
+        }
+
         tokio::select! {
-            _ = tokio::task::spawn_blocking(|| event::poll(std::time::Duration::from_millis(50))) => {
-                while event::poll(std::time::Duration::ZERO)? {
-                    match event::read()? {
-                        TermEvent::Key(key) => {
-                            if let Some(method) = handle_key(app, key) {
-                                client.send(&method).await?;
-                            }
-                        }
-                        TermEvent::Mouse(mouse) => {
-                            handle_mouse(app, mouse);
-                        }
-                        TermEvent::Paste(s) => {
-                            app.insert_paste(s);
-                        }
-                        TermEvent::Resize(_, _) => {
-                            // No-op: next draw repaints in full.
-                        }
-                        _ => {}
-                    }
-                    if app.quit {
-                        break;
-                    }
+            term_event = tokio::task::spawn_blocking(|| {
+                if event::poll(std::time::Duration::from_millis(50))? {
+                    event::read().map(Some)
+                } else {
+                    Ok(None)
+                }
+            }) => {
+                if let Some(term_event) = term_event?? {
+                    handle_terminal_event(app, &mut client, term_event).await?;
                 }
             }
             event = client.next_event(), if app.connected => {
@@ -322,6 +337,31 @@ async fn run_loop(
         terminal.draw(|f| ui::draw(f, app))?;
     }
 
+    Ok(())
+}
+
+async fn handle_terminal_event(
+    app: &mut App,
+    client: &mut PodClient,
+    event: TermEvent,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match event {
+        TermEvent::Key(key) => {
+            if let Some(method) = handle_key(app, key) {
+                client.send(&method).await?;
+            }
+        }
+        TermEvent::Mouse(mouse) => {
+            handle_mouse(app, mouse);
+        }
+        TermEvent::Paste(s) => {
+            app.insert_paste(s);
+        }
+        TermEvent::Resize(_, _) => {
+            // No-op: next draw repaints in full.
+        }
+        _ => {}
+    }
     Ok(())
 }
 
@@ -392,10 +432,13 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Option<Method> {
             Some(app.refresh_completion())
         }
         KeyCode::Char('c') if ctrl => Some(handle_pause_or_quit(app)),
-        KeyCode::Char('x') if ctrl => Some(if app.running {
-            Some(Method::Cancel)
-        } else {
-            Some(Method::Shutdown)
+        KeyCode::Char('x') if ctrl => Some(match app.pod_status {
+            PodStatus::Running => Some(Method::Cancel),
+            PodStatus::Paused | PodStatus::Idle => Some(Method::Shutdown),
+            PodStatus::Busy => {
+                app.push_error("Pod is finishing post-run work; wait for idle or press Ctrl-C twice to exit the TUI.");
+                None
+            }
         }),
         KeyCode::Char('d') if ctrl => {
             app.quit = true;
@@ -534,9 +577,9 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Option<Method> {
 const CONFIRM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Running → send `Method::Pause`.
-/// Idle / Paused → 2-tap to quit the TUI (the Pod keeps running).
+/// Idle / Paused / Busy → 2-tap to quit the TUI (the Pod keeps running).
 fn handle_pause_or_quit(app: &mut App) -> Option<Method> {
-    if app.running {
+    if app.pod_status == PodStatus::Running {
         return Some(Method::Pause);
     }
     if let Some(t) = app.quit_confirm

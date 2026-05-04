@@ -385,8 +385,8 @@ pub fn render_snapshot(tasks: &[TaskEntry]) -> String {
     let snapshot = TaskSnapshot {
         tasks: tasks.to_vec(),
     };
-    let json = serde_json::to_string_pretty(&snapshot)
-        .unwrap_or_else(|_| String::from("{\"tasks\":[]}"));
+    let json =
+        serde_json::to_string_pretty(&snapshot).unwrap_or_else(|_| String::from("{\"tasks\":[]}"));
     format!("{}\n\n```json\n{}\n```\n", snapshot_overview(tasks), json)
 }
 
@@ -560,7 +560,8 @@ mod tests {
     fn replay_history_uses_compact_snapshot_and_continues_updates() {
         let pre = TaskStore::new();
         pre.create("kept".into(), "from compact".into());
-        pre.update(1, Some(TaskStatus::Inprogress), None, None).unwrap();
+        pre.update(1, Some(TaskStatus::Inprogress), None, None)
+            .unwrap();
         let history = vec![
             Item::system_message(wrap_snapshot_system_message(&pre.snapshot_text())),
             Item::tool_call("u1", "TaskUpdate", r#"{"taskid":1,"status":"completed"}"#),
@@ -587,13 +588,23 @@ mod tests {
         // pre-compact `TaskCreate`s do not surface as duplicates.
         let pre = TaskStore::new();
         pre.create("A".into(), "A-desc".into());
-        pre.update(1, Some(TaskStatus::Completed), None, None).unwrap();
+        pre.update(1, Some(TaskStatus::Completed), None, None)
+            .unwrap();
         pre.create("B".into(), "B-desc".into());
-        pre.update(2, Some(TaskStatus::Inprogress), None, None).unwrap();
+        pre.update(2, Some(TaskStatus::Inprogress), None, None)
+            .unwrap();
         let history = vec![
-            Item::tool_call("c1", "TaskCreate", r#"{"subject":"A","description":"A-desc"}"#),
+            Item::tool_call(
+                "c1",
+                "TaskCreate",
+                r#"{"subject":"A","description":"A-desc"}"#,
+            ),
             Item::tool_call("u1", "TaskUpdate", r#"{"taskid":1,"status":"completed"}"#),
-            Item::tool_call("c2", "TaskCreate", r#"{"subject":"B","description":"B-desc"}"#),
+            Item::tool_call(
+                "c2",
+                "TaskCreate",
+                r#"{"subject":"B","description":"B-desc"}"#,
+            ),
             Item::tool_call("u2", "TaskUpdate", r#"{"taskid":2,"status":"inprogress"}"#),
             Item::system_message(wrap_snapshot_system_message(&pre.snapshot_text())),
             Item::tool_call("compact-tasklist", "TaskList", "{}"),
@@ -625,7 +636,8 @@ mod tests {
             "subject with\nembedded newline\n- bullet".into(),
             "desc:\n  status: not-actually-a-field\n  ```code fence```".into(),
         );
-        pre.update(1, Some(TaskStatus::Inprogress), None, None).unwrap();
+        pre.update(1, Some(TaskStatus::Inprogress), None, None)
+            .unwrap();
 
         let history = vec![Item::system_message(wrap_snapshot_system_message(
             &pre.snapshot_text(),

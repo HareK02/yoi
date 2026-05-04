@@ -49,33 +49,29 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
 
         let metrics = self.metrics_tracker_handle();
         let usage_tracker = self.usage_tracker_handle();
-        let observer: PruneObserver = Box::new(move |eval| {
-            match &eval.decision {
-                PruneDecision::Fired { .. } => {
-                    let correlation_id = uuid::Uuid::now_v7().to_string();
-                    let mut metric = Metric::now("prune.fire")
-                        .with_value(eval.estimated_savings as f64)
-                        .with_correlation_id(&correlation_id)
-                        .with_dimension("candidate_count", eval.candidate_count.to_string());
-                    if let Some(border) = eval.border_turn {
-                        metric = metric.with_dimension("border_turn", border.to_string());
-                    }
-                    metrics.push(metric);
-                    usage_tracker.note_correlation_id(correlation_id);
+        let observer: PruneObserver = Box::new(move |eval| match &eval.decision {
+            PruneDecision::Fired { .. } => {
+                let correlation_id = uuid::Uuid::now_v7().to_string();
+                let mut metric = Metric::now("prune.fire")
+                    .with_value(eval.estimated_savings as f64)
+                    .with_correlation_id(&correlation_id)
+                    .with_dimension("candidate_count", eval.candidate_count.to_string());
+                if let Some(border) = eval.border_turn {
+                    metric = metric.with_dimension("border_turn", border.to_string());
                 }
-                PruneDecision::SkippedNoCandidates => {
-                    metrics.push(
-                        Metric::now("prune.skip").with_dimension("reason", "no_candidates"),
-                    );
-                }
-                PruneDecision::SkippedBelowMinSavings => {
-                    metrics.push(
-                        Metric::now("prune.skip")
-                            .with_dimension("reason", "below_min_savings")
-                            .with_dimension("candidate_count", eval.candidate_count.to_string())
-                            .with_value(eval.estimated_savings as f64),
-                    );
-                }
+                metrics.push(metric);
+                usage_tracker.note_correlation_id(correlation_id);
+            }
+            PruneDecision::SkippedNoCandidates => {
+                metrics.push(Metric::now("prune.skip").with_dimension("reason", "no_candidates"));
+            }
+            PruneDecision::SkippedBelowMinSavings => {
+                metrics.push(
+                    Metric::now("prune.skip")
+                        .with_dimension("reason", "below_min_savings")
+                        .with_dimension("candidate_count", eval.candidate_count.to_string())
+                        .with_value(eval.estimated_savings as f64),
+                );
             }
         });
 

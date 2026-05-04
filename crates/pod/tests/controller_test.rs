@@ -10,7 +10,7 @@ use llm_worker::llm_client::{ClientError, LlmClient, Request};
 use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use session_store::FsStore;
 
-use pod::{Event, Method, Pod, PodController, PodManifest, PodStatus};
+use pod::{Event, Method, Pod, PodController, PodHandle, PodManifest, PodStatus};
 
 // ---------------------------------------------------------------------------
 // Mock LLM Client
@@ -147,8 +147,6 @@ async fn make_pod_with_pwd(client: MockClient) -> (Pod<MockClient, FsStore>, std
     (pod, pwd)
 }
 
-use pod::PodHandle;
-
 async fn spawn_controller(pod: Pod<MockClient, FsStore>) -> PodHandle {
     let tmp = tempfile::tempdir().unwrap();
     let runtime_base = tmp.path().to_owned();
@@ -157,9 +155,132 @@ async fn spawn_controller(pod: Pod<MockClient, FsStore>) -> PodHandle {
     handle
 }
 
+async fn wait_for_status(handle: &PodHandle, status: PodStatus) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        if handle.shared_state.get_status() == status {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for status {status:?}; current={:?}",
+            handle.shared_state.get_status()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
 // ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn run_end_enters_busy_until_post_run_finishes_and_broadcasts_status() {
+    let client = MockClient::new(simple_text_events());
+    let pod = make_pod(client).await;
+    let handle = spawn_controller(pod).await;
+    let mut rx = handle.subscribe();
+
+    handle.send(Method::run_text("Hello")).await.unwrap();
+
+    let mut saw_run_end = false;
+    let mut saw_busy_status = false;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        tokio::select! {
+            event = rx.recv() => {
+                match event {
+                    Ok(Event::RunEnd { result: protocol::RunResult::Finished }) => {
+                        saw_run_end = true;
+                    }
+                    Ok(Event::Status {
+                        status: PodStatus::Busy,
+                    }) if saw_run_end => {
+                        saw_busy_status = true;
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+            _ = tokio::time::sleep_until(deadline) => break,
+        }
+    }
+
+    assert!(saw_run_end, "expected RunEnd::Finished");
+    assert!(
+        saw_busy_status,
+        "expected busy status immediately after RunEnd"
+    );
+    wait_for_status(&handle, PodStatus::Idle).await;
+}
+
+#[tokio::test]
+async fn attach_history_includes_current_status() {
+    let client = MockClient::sequential(vec![MockResponse::Hang(simple_text_events())]);
+    let pod = make_pod(client).await;
+    let handle = spawn_controller(pod).await;
+
+    handle.send(Method::run_text("Hello")).await.unwrap();
+    wait_for_status(&handle, PodStatus::Running).await;
+
+    let stream = tokio::net::UnixStream::connect(handle.runtime_dir.socket_path())
+        .await
+        .unwrap();
+    let (reader, writer) = stream.into_split();
+    let mut reader = protocol::stream::JsonLineReader::new(reader);
+    let mut writer = protocol::stream::JsonLineWriter::new(writer);
+    writer.write(&Method::GetHistory).await.unwrap();
+
+    let event = reader.next::<Event>().await.unwrap().unwrap();
+    match event {
+        Event::History { status, .. } => assert_eq!(status, PodStatus::Running),
+        other => panic!("expected History, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn pause_while_busy_is_idempotent_not_not_running() {
+    let client = MockClient::new(simple_text_events());
+    let pod = make_pod(client).await;
+    let handle = spawn_controller(pod).await;
+    let mut rx = handle.subscribe();
+
+    handle.send(Method::run_text("Hello")).await.unwrap();
+
+    let mut saw_busy = false;
+    let mut saw_idle = false;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        tokio::select! {
+            event = rx.recv() => {
+                match event {
+                    Ok(Event::RunEnd { .. }) => {
+                        handle.send(Method::Pause).await.unwrap();
+                    }
+                    Ok(Event::Status { status: PodStatus::Busy }) => {
+                        saw_busy = true;
+                    }
+                    Ok(Event::Status { status: PodStatus::Idle }) if saw_busy => {
+                        saw_idle = true;
+                        break;
+                    }
+                    Ok(Event::Error {
+                        code: protocol::ErrorCode::NotRunning,
+                        ..
+                    }) if saw_busy && !saw_idle => {
+                        panic!("Pause while Busy should be an idempotent no-op");
+                    }
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+            _ = tokio::time::sleep_until(deadline) => break,
+        }
+    }
+
+    assert!(saw_busy, "expected Busy status");
+    assert!(saw_idle, "expected final Idle status");
+    assert_eq!(handle.shared_state.get_status(), PodStatus::Idle);
+}
 
 #[tokio::test]
 async fn shared_state_starts_idle() {
@@ -565,10 +686,10 @@ async fn notify_while_idle_auto_starts_turn_and_injects_system_message() {
     // request context for that turn).
     let requests = client_for_assert.captured_requests();
     assert_eq!(requests.len(), 1, "one LLM call expected");
-    let notify_in_request = requests[0]
-        .items
-        .iter()
-        .any(|i| i.as_text().is_some_and(|t| t.contains("[Notification]") && t.contains("turn finished")));
+    let notify_in_request = requests[0].items.iter().any(|i| {
+        i.as_text()
+            .is_some_and(|t| t.contains("[Notification]") && t.contains("turn finished"))
+    });
     assert!(
         notify_in_request,
         "injected system message missing from request, got items: {:?}",
@@ -583,13 +704,17 @@ async fn notify_while_idle_auto_starts_turn_and_injects_system_message() {
     // (and therefore eventually into history.json), per
     // tickets/notify-history-persist.md.
     let history = handle.shared_state.history();
-    let notify_in_history = history
-        .iter()
-        .any(|i| i.as_text().is_some_and(|t| t.contains("[Notification]") && t.contains("turn finished")));
+    let notify_in_history = history.iter().any(|i| {
+        i.as_text()
+            .is_some_and(|t| t.contains("[Notification]") && t.contains("turn finished"))
+    });
     assert!(
         notify_in_history,
         "notify must be committed to worker.history, got items: {:?}",
-        history.iter().filter_map(|i| i.as_text()).collect::<Vec<_>>()
+        history
+            .iter()
+            .filter_map(|i| i.as_text())
+            .collect::<Vec<_>>()
     );
 }
 
@@ -671,7 +796,10 @@ async fn pod_event_turn_ended_while_idle_auto_starts_turn_and_injects_system_mes
     assert!(
         event_in_history,
         "PodEvent must be committed to worker.history, got items: {:?}",
-        history.iter().filter_map(|i| i.as_text()).collect::<Vec<_>>()
+        history
+            .iter()
+            .filter_map(|i| i.as_text())
+            .collect::<Vec<_>>()
     );
 }
 

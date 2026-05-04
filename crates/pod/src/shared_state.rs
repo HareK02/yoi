@@ -1,8 +1,8 @@
 use std::sync::{OnceLock, RwLock};
 
 use llm_worker::llm_client::types::Item;
-use protocol::Segment;
-use serde::{Deserialize, Serialize};
+use protocol::{PodStatus, Segment};
+use serde_json::json;
 use session_store::SessionId;
 
 use crate::fs_view::PodFsView;
@@ -37,14 +37,6 @@ pub struct PodSharedState {
     /// directly without spinning up a controller).
     fs_view: OnceLock<PodFsView>,
     workflows: OnceLock<Vec<WorkflowCandidate>>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PodStatus {
-    Idle,
-    Running,
-    Paused,
 }
 
 impl PodSharedState {
@@ -138,7 +130,7 @@ impl PodSharedState {
     /// Serialize status as JSON.
     pub fn status_json(&self) -> String {
         let status = self.get_status();
-        serde_json::json!({
+        json!({
             "state": status,
             "session_id": self.session_id.to_string(),
             "pod_name": self.pod_name,

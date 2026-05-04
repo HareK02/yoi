@@ -174,6 +174,7 @@ fn serve_history(listener: UnixListener, items: Vec<Item>) -> JoinHandle<()> {
                             scope_summary: String::new(),
                             tools: Vec::new(),
                         },
+                        status: protocol::PodStatus::Idle,
                     };
                     let _ = writer.write(&event).await;
                 }

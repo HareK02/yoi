@@ -159,10 +159,12 @@ async fn handle_connection(stream: tokio::net::UnixStream, handle: PodHandle) {
                             })
                             .collect();
                         let greeting = handle.shared_state.greeting.clone();
+                        let status = handle.shared_state.get_status();
                         if writer
                             .write(&Event::History {
                                 items: values,
                                 greeting,
+                                status,
                             })
                             .await
                             .is_err()

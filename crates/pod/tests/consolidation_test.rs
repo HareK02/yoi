@@ -206,10 +206,7 @@ async fn no_thresholds_is_a_noop() {
         .expect("phase 2 disabled when both thresholds are None");
 
     // No staging entries removed.
-    assert_eq!(
-        memory::consolidate::list_staging_entries(&layout).len(),
-        5
-    );
+    assert_eq!(memory::consolidate::list_staging_entries(&layout).len(), 5);
 }
 
 #[tokio::test]
@@ -256,10 +253,7 @@ async fn below_threshold_skips_and_does_not_take_lock() {
     pod.try_post_run_consolidate().await.unwrap();
 
     // Staging untouched.
-    assert_eq!(
-        memory::consolidate::list_staging_entries(&layout).len(),
-        1
-    );
+    assert_eq!(memory::consolidate::list_staging_entries(&layout).len(), 1);
     // Lock file must not exist.
     let lock_path = layout.staging_dir().join(".consolidation.lock");
     assert!(!lock_path.exists(), "lock file should not be created");
@@ -285,10 +279,7 @@ async fn fires_on_threshold_and_cleans_up_consumed_entries() {
     );
     // Lock removed too.
     let lock_path = layout.staging_dir().join(".consolidation.lock");
-    assert!(
-        !lock_path.exists(),
-        "lock file must be removed on success"
-    );
+    assert!(!lock_path.exists(), "lock file must be removed on success");
 }
 
 #[tokio::test]
@@ -300,7 +291,12 @@ async fn in_flight_guard_skips_reentry_without_clearing() {
     write_n_staging(&layout, 2);
 
     let client = MockClient::new(vec![]);
-    let mut pod = make_pod_with(FILES_THRESHOLD_TOML, pwd.path().to_path_buf(), client.clone()).await;
+    let mut pod = make_pod_with(
+        FILES_THRESHOLD_TOML,
+        pwd.path().to_path_buf(),
+        client.clone(),
+    )
+    .await;
 
     // Pre-set the in-flight flag as if another concurrent caller had
     // entered run_consolidate_once. The CAS at the top of
@@ -334,7 +330,9 @@ async fn in_flight_guard_skips_reentry_without_clearing() {
     let mut pod2 = make_pod_with(FILES_THRESHOLD_TOML, pwd.path().to_path_buf(), client2).await;
     pod2.try_post_run_consolidate().await.unwrap();
     assert!(
-        !pod2.consolidation_in_flight_handle().load(Ordering::Acquire),
+        !pod2
+            .consolidation_in_flight_handle()
+            .load(Ordering::Acquire),
         "in-flight flag must be cleared after a normal run"
     );
 }
@@ -356,7 +354,12 @@ async fn coalesce_loop_terminates_with_one_iteration_when_snapshot_drains_stagin
     // run_consolidate_once after Completed, the second sub-worker run
     // would exhaust the mock and surface as an error.
     let client = MockClient::new(vec![done("ok")]);
-    let mut pod = make_pod_with(FILES_THRESHOLD_TOML, pwd.path().to_path_buf(), client.clone()).await;
+    let mut pod = make_pod_with(
+        FILES_THRESHOLD_TOML,
+        pwd.path().to_path_buf(),
+        client.clone(),
+    )
+    .await;
     pod.try_post_run_consolidate().await.unwrap();
 
     assert_eq!(
@@ -393,8 +396,5 @@ async fn live_lock_held_by_other_pod_skips() {
         .expect("InUse lock must surface as graceful skip");
 
     // Staging untouched: lock holder owns the snapshot, not us.
-    assert_eq!(
-        memory::consolidate::list_staging_entries(&layout).len(),
-        3
-    );
+    assert_eq!(memory::consolidate::list_staging_entries(&layout).len(), 3);
 }

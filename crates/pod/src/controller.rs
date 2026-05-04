@@ -12,13 +12,15 @@ use crate::ipc::notify_buffer::NotifyBuffer;
 use crate::ipc::server::SocketServer;
 use crate::pod::{Pod, PodError, PodRunResult};
 use crate::runtime::dir::RuntimeDir;
-use crate::shared_state::{PodSharedState, PodStatus};
+use crate::shared_state::PodSharedState;
 use crate::spawn::comm_tools::{
     list_pods_tool, read_pod_output_tool, send_to_pod_tool, stop_pod_tool,
 };
 use crate::spawn::registry::SpawnedPodRegistry;
 use crate::spawn::tool::spawn_pod_tool;
-use protocol::{AlertLevel, AlertSource, ErrorCode, Event, Method, RunResult, TurnResult};
+use protocol::{
+    AlertLevel, AlertSource, ErrorCode, Event, Method, PodStatus, RunResult, TurnResult,
+};
 
 fn is_system_message_item(item: &Item) -> bool {
     matches!(
@@ -61,6 +63,75 @@ impl PodHandle {
     pub fn alert(&self, level: AlertLevel, source: AlertSource, message: String) {
         self.alerter.alert(level, source, message);
     }
+}
+
+async fn set_controller_status(
+    shared_state: &Arc<PodSharedState>,
+    runtime_dir: &RuntimeDir,
+    event_tx: &broadcast::Sender<Event>,
+    status: PodStatus,
+) {
+    shared_state.set_status(status);
+    let _ = runtime_dir.write_status(shared_state).await;
+    let _ = event_tx.send(Event::Status { status });
+}
+
+async fn run_post_run_jobs<C, St>(pod: &mut Pod<C, St>, alerter: &Alerter)
+where
+    C: LlmClient,
+    St: Store,
+{
+    if let Err(e) = pod.try_post_run_extract().await {
+        tracing::warn!(error = %e, "Post-run memory extract error");
+        alerter.alert(
+            AlertLevel::Warn,
+            AlertSource::Pod,
+            format!("post-run memory extract error: {e}"),
+        );
+    }
+    if let Err(e) = pod.try_post_run_consolidate().await {
+        tracing::warn!(error = %e, "Post-run memory consolidate error");
+        alerter.alert(
+            AlertLevel::Warn,
+            AlertSource::Pod,
+            format!("post-run memory consolidate error: {e}"),
+        );
+    }
+    if let Err(e) = pod.try_post_run_compact().await {
+        tracing::warn!(error = %e, "Post-run compaction error");
+        alerter.alert(
+            AlertLevel::Warn,
+            AlertSource::Compactor,
+            format!("post-run compaction error: {e}"),
+        );
+    }
+}
+
+async fn finish_controller_run<C, St>(
+    pod: &mut Pod<C, St>,
+    shared_state: &Arc<PodSharedState>,
+    runtime_dir: &RuntimeDir,
+    event_tx: &broadcast::Sender<Event>,
+    alerter: &Alerter,
+    new_status: PodStatus,
+) where
+    C: LlmClient,
+    St: Store,
+{
+    if new_status == PodStatus::Busy {
+        run_post_run_jobs(pod, alerter).await;
+    }
+
+    let items = pod.worker().history().to_vec();
+    shared_state.update_history(items);
+    shared_state.set_user_segments(pod.user_segments().to_vec());
+    let final_status = if new_status == PodStatus::Busy {
+        PodStatus::Idle
+    } else {
+        new_status
+    };
+    set_controller_status(shared_state, runtime_dir, event_tx, final_status).await;
+    let _ = runtime_dir.write_history(shared_state).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -414,8 +485,13 @@ impl PodController {
                         let _ = event_tx.send(Event::UserMessage {
                             segments: input.clone(),
                         });
-                        shared_state.set_status(PodStatus::Running);
-                        let _ = runtime_dir.write_status(&shared_state).await;
+                        set_controller_status(
+                            &shared_state,
+                            &runtime_dir,
+                            &event_tx,
+                            PodStatus::Running,
+                        )
+                        .await;
 
                         let run_future = async {
                             if was_paused {
@@ -430,6 +506,7 @@ impl PodController {
                             &event_tx,
                             &cancel_tx,
                             &shared_state,
+                            &runtime_dir,
                             &notify_buffer,
                             self_parent_socket.as_ref(),
                             &spawner_name,
@@ -437,39 +514,15 @@ impl PodController {
                         )
                         .await;
 
-                        if new_status == PodStatus::Idle {
-                            if let Err(e) = pod.try_post_run_extract().await {
-                                tracing::warn!(error = %e, "Post-run memory extract error");
-                                alerter.alert(
-                                    AlertLevel::Warn,
-                                    AlertSource::Pod,
-                                    format!("post-run memory extract error: {e}"),
-                                );
-                            }
-                            if let Err(e) = pod.try_post_run_consolidate().await {
-                                tracing::warn!(error = %e, "Post-run memory consolidate error");
-                                alerter.alert(
-                                    AlertLevel::Warn,
-                                    AlertSource::Pod,
-                                    format!("post-run memory consolidate error: {e}"),
-                                );
-                            }
-                            if let Err(e) = pod.try_post_run_compact().await {
-                                tracing::warn!(error = %e, "Post-run compaction error");
-                                alerter.alert(
-                                    AlertLevel::Warn,
-                                    AlertSource::Compactor,
-                                    format!("post-run compaction error: {e}"),
-                                );
-                            }
-                        }
-
-                        let items = pod.worker().history().to_vec();
-                        shared_state.update_history(items);
-                        shared_state.set_user_segments(pod.user_segments().to_vec());
-                        shared_state.set_status(new_status);
-                        let _ = runtime_dir.write_status(&shared_state).await;
-                        let _ = runtime_dir.write_history(&shared_state).await;
+                        finish_controller_run(
+                            &mut pod,
+                            &shared_state,
+                            &runtime_dir,
+                            &event_tx,
+                            &alerter,
+                            new_status,
+                        )
+                        .await;
 
                         if shutdown {
                             let _ = event_tx.send(Event::Shutdown);
@@ -482,17 +535,23 @@ impl PodController {
                             message: message.clone(),
                         });
                         pod.push_notify(message);
-                        if shared_state.get_status() != PodStatus::Idle {
-                            // RUNNING / Paused: the buffer push is the
-                            // entire operation; the in-flight turn (or
-                            // next Resume) will drain the buffer at its
-                            // next pre_llm_request.
+                        let status = shared_state.get_status();
+                        if status != PodStatus::Idle {
+                            // RUNNING / Paused / Busy: the buffer push is the
+                            // entire operation; an in-flight turn (or the
+                            // next Resume/Run after Busy) will drain the buffer
+                            // at its next pre_llm_request.
                             continue;
                         }
                         // IDLE: auto-start a turn so the LLM sees the
                         // buffered notification(s) without a human Run.
-                        shared_state.set_status(PodStatus::Running);
-                        let _ = runtime_dir.write_status(&shared_state).await;
+                        set_controller_status(
+                            &shared_state,
+                            &runtime_dir,
+                            &event_tx,
+                            PodStatus::Running,
+                        )
+                        .await;
 
                         let (new_status, shutdown) = run_with_cancel_support(
                             pod.run_for_notification(),
@@ -500,6 +559,7 @@ impl PodController {
                             &event_tx,
                             &cancel_tx,
                             &shared_state,
+                            &runtime_dir,
                             &notify_buffer,
                             self_parent_socket.as_ref(),
                             &spawner_name,
@@ -507,39 +567,15 @@ impl PodController {
                         )
                         .await;
 
-                        if new_status == PodStatus::Idle {
-                            if let Err(e) = pod.try_post_run_extract().await {
-                                tracing::warn!(error = %e, "Post-run memory extract error");
-                                alerter.alert(
-                                    AlertLevel::Warn,
-                                    AlertSource::Pod,
-                                    format!("post-run memory extract error: {e}"),
-                                );
-                            }
-                            if let Err(e) = pod.try_post_run_consolidate().await {
-                                tracing::warn!(error = %e, "Post-run memory consolidate error");
-                                alerter.alert(
-                                    AlertLevel::Warn,
-                                    AlertSource::Pod,
-                                    format!("post-run memory consolidate error: {e}"),
-                                );
-                            }
-                            if let Err(e) = pod.try_post_run_compact().await {
-                                tracing::warn!(error = %e, "Post-run compaction error");
-                                alerter.alert(
-                                    AlertLevel::Warn,
-                                    AlertSource::Compactor,
-                                    format!("post-run compaction error: {e}"),
-                                );
-                            }
-                        }
-
-                        let items = pod.worker().history().to_vec();
-                        shared_state.update_history(items);
-                        shared_state.set_user_segments(pod.user_segments().to_vec());
-                        shared_state.set_status(new_status);
-                        let _ = runtime_dir.write_status(&shared_state).await;
-                        let _ = runtime_dir.write_history(&shared_state).await;
+                        finish_controller_run(
+                            &mut pod,
+                            &shared_state,
+                            &runtime_dir,
+                            &event_tx,
+                            &alerter,
+                            new_status,
+                        )
+                        .await;
 
                         if shutdown {
                             let _ = event_tx.send(Event::Shutdown);
@@ -555,8 +591,13 @@ impl PodController {
                             });
                             continue;
                         }
-                        shared_state.set_status(PodStatus::Running);
-                        let _ = runtime_dir.write_status(&shared_state).await;
+                        set_controller_status(
+                            &shared_state,
+                            &runtime_dir,
+                            &event_tx,
+                            PodStatus::Running,
+                        )
+                        .await;
 
                         let (new_status, shutdown) = run_with_cancel_support(
                             pod.resume(),
@@ -564,6 +605,7 @@ impl PodController {
                             &event_tx,
                             &cancel_tx,
                             &shared_state,
+                            &runtime_dir,
                             &notify_buffer,
                             self_parent_socket.as_ref(),
                             &spawner_name,
@@ -571,39 +613,15 @@ impl PodController {
                         )
                         .await;
 
-                        if new_status == PodStatus::Idle {
-                            if let Err(e) = pod.try_post_run_extract().await {
-                                tracing::warn!(error = %e, "Post-run memory extract error");
-                                alerter.alert(
-                                    AlertLevel::Warn,
-                                    AlertSource::Pod,
-                                    format!("post-run memory extract error: {e}"),
-                                );
-                            }
-                            if let Err(e) = pod.try_post_run_consolidate().await {
-                                tracing::warn!(error = %e, "Post-run memory consolidate error");
-                                alerter.alert(
-                                    AlertLevel::Warn,
-                                    AlertSource::Pod,
-                                    format!("post-run memory consolidate error: {e}"),
-                                );
-                            }
-                            if let Err(e) = pod.try_post_run_compact().await {
-                                tracing::warn!(error = %e, "Post-run compaction error");
-                                alerter.alert(
-                                    AlertLevel::Warn,
-                                    AlertSource::Compactor,
-                                    format!("post-run compaction error: {e}"),
-                                );
-                            }
-                        }
-
-                        let items = pod.worker().history().to_vec();
-                        shared_state.update_history(items);
-                        shared_state.set_user_segments(pod.user_segments().to_vec());
-                        shared_state.set_status(new_status);
-                        let _ = runtime_dir.write_status(&shared_state).await;
-                        let _ = runtime_dir.write_history(&shared_state).await;
+                        finish_controller_run(
+                            &mut pod,
+                            &shared_state,
+                            &runtime_dir,
+                            &event_tx,
+                            &alerter,
+                            new_status,
+                        )
+                        .await;
 
                         if shutdown {
                             let _ = event_tx.send(Event::Shutdown);
@@ -619,11 +637,12 @@ impl PodController {
                     }
 
                     Method::Pause => {
-                        // Already paused → idempotent no-op. Otherwise
-                        // the Pod is Idle (Running turns go through
-                        // `run_with_cancel_support`, not this outer
-                        // match), so there is nothing to pause.
-                        if shared_state.get_status() != PodStatus::Paused {
+                        // Already paused or post-run busy → idempotent no-op.
+                        // Otherwise the Pod is Idle (Running turns go through
+                        // `run_with_cancel_support`, not this outer match), so
+                        // there is nothing to pause.
+                        let status = shared_state.get_status();
+                        if !matches!(status, PodStatus::Paused | PodStatus::Busy) {
                             let _ = event_tx.send(Event::Error {
                                 code: ErrorCode::NotRunning,
                                 message: "Pod is not running".into(),
@@ -666,8 +685,13 @@ impl PodController {
                         // notification is not stranded. Matches the
                         // `Method::Notify` idle path.
                         if shared_state.get_status() == PodStatus::Idle {
-                            shared_state.set_status(PodStatus::Running);
-                            let _ = runtime_dir.write_status(&shared_state).await;
+                            set_controller_status(
+                                &shared_state,
+                                &runtime_dir,
+                                &event_tx,
+                                PodStatus::Running,
+                            )
+                            .await;
 
                             let (new_status, shutdown) = run_with_cancel_support(
                                 pod.run_for_notification(),
@@ -675,6 +699,7 @@ impl PodController {
                                 &event_tx,
                                 &cancel_tx,
                                 &shared_state,
+                                &runtime_dir,
                                 &notify_buffer,
                                 self_parent_socket.as_ref(),
                                 &spawner_name,
@@ -682,39 +707,15 @@ impl PodController {
                             )
                             .await;
 
-                            if new_status == PodStatus::Idle {
-                                if let Err(e) = pod.try_post_run_extract().await {
-                                    tracing::warn!(error = %e, "Post-run memory extract error");
-                                    alerter.alert(
-                                        AlertLevel::Warn,
-                                        AlertSource::Pod,
-                                        format!("post-run memory extract error: {e}"),
-                                    );
-                                }
-                                if let Err(e) = pod.try_post_run_consolidate().await {
-                                    tracing::warn!(error = %e, "Post-run memory consolidate error");
-                                    alerter.alert(
-                                        AlertLevel::Warn,
-                                        AlertSource::Pod,
-                                        format!("post-run memory consolidate error: {e}"),
-                                    );
-                                }
-                                if let Err(e) = pod.try_post_run_compact().await {
-                                    tracing::warn!(error = %e, "Post-run compaction error");
-                                    alerter.alert(
-                                        AlertLevel::Warn,
-                                        AlertSource::Compactor,
-                                        format!("post-run compaction error: {e}"),
-                                    );
-                                }
-                            }
-
-                            let items = pod.worker().history().to_vec();
-                            shared_state.update_history(items);
-                            shared_state.set_user_segments(pod.user_segments().to_vec());
-                            shared_state.set_status(new_status);
-                            let _ = runtime_dir.write_status(&shared_state).await;
-                            let _ = runtime_dir.write_history(&shared_state).await;
+                            finish_controller_run(
+                                &mut pod,
+                                &shared_state,
+                                &runtime_dir,
+                                &event_tx,
+                                &alerter,
+                                new_status,
+                            )
+                            .await;
 
                             if shutdown {
                                 let _ = event_tx.send(Event::Shutdown);
@@ -766,6 +767,7 @@ async fn run_with_cancel_support<F>(
     event_tx: &broadcast::Sender<Event>,
     cancel_tx: &mpsc::Sender<()>,
     shared_state: &Arc<PodSharedState>,
+    runtime_dir: &RuntimeDir,
     notify_buffer: &NotifyBuffer,
     parent_socket: Option<&std::path::PathBuf>,
     self_name: &str,
@@ -784,11 +786,18 @@ where
                 return match result {
                     Ok(r) => {
                         let (status, run_result) = match r {
-                            PodRunResult::Finished => (PodStatus::Idle, RunResult::Finished),
+                            PodRunResult::Finished => (PodStatus::Busy, RunResult::Finished),
                             PodRunResult::Paused => (PodStatus::Paused, RunResult::Paused),
-                            PodRunResult::LimitReached => (PodStatus::Idle, RunResult::LimitReached),
+                            PodRunResult::LimitReached => (PodStatus::Busy, RunResult::LimitReached),
                         };
                         let _ = event_tx.send(Event::RunEnd { result: run_result });
+                        if status == PodStatus::Busy {
+                            shared_state.set_status(PodStatus::Busy);
+                            let _ = runtime_dir.write_status(shared_state).await;
+                            let _ = event_tx.send(Event::Status {
+                                status: PodStatus::Busy,
+                            });
+                        }
                         if matches!(run_result, RunResult::Finished) {
                             crate::ipc::event::fire_and_forget(
                                 parent_socket.cloned(),
@@ -822,7 +831,7 @@ where
                                 message,
                             },
                         );
-                        (PodStatus::Idle, shutdown_requested)
+                        (PodStatus::Busy, shutdown_requested)
                     }
                 };
             }

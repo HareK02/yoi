@@ -203,7 +203,13 @@ pub fn render_tidy_hints(tidy: &TidyHints) -> String {
             "**Sources overflow** — consider trimming to the most recent entries (git log keeps the rest):\n",
         );
         for s in &tidy.sources_overflow {
-            let _ = writeln!(&mut out, "- {} `{}` ({} sources)", s.kind.as_str(), s.slug, s.count);
+            let _ = writeln!(
+                &mut out,
+                "- {} `{}` ({} sources)",
+                s.kind.as_str(),
+                s.slug,
+                s.count
+            );
         }
         out.push('\n');
     }
@@ -276,12 +282,9 @@ mod tests {
         .unwrap();
         let staging = crate::consolidate::staging::list_staging_entries(&layout);
         let tidy = TidyHints {
-            replaced_decisions: [(
-                "old".to_string(),
-                Some("new".to_string()),
-            )]
-            .into_iter()
-            .collect(),
+            replaced_decisions: [("old".to_string(), Some("new".to_string()))]
+                .into_iter()
+                .collect(),
             sources_overflow: vec![SourcesOverflow {
                 kind: RecordKind::Decision,
                 slug: "dec".into(),

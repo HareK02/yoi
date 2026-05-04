@@ -35,6 +35,10 @@ impl PodClient {
         self.writer.write(method).await
     }
 
+    pub fn try_next_event(&mut self) -> Option<Event> {
+        self.event_rx.try_recv().ok()
+    }
+
     pub async fn next_event(&mut self) -> Option<Event> {
         self.event_rx.recv().await
     }

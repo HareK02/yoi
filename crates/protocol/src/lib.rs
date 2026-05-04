@@ -314,6 +314,17 @@ pub enum Event {
     History {
         items: Vec<serde_json::Value>,
         greeting: Greeting,
+        /// Current Pod controller status at the moment the history snapshot
+        /// was taken. This lets late-attaching clients render and route
+        /// controls from the real controller state instead of inferring from
+        /// replayed history.
+        #[serde(default)]
+        status: PodStatus,
+    },
+    /// Current Pod controller status. Broadcast on every controller-level
+    /// transition and included in `History` snapshots for late attach.
+    Status {
+        status: PodStatus,
     },
     /// Reply to `Method::ListCompletions`. Delivered only to the
     /// requesting socket (not broadcast). `entries` is empty when no
@@ -421,6 +432,19 @@ pub struct Greeting {
 // ---------------------------------------------------------------------------
 // Supporting types
 // ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PodStatus {
+    #[default]
+    Idle,
+    Running,
+    Paused,
+    /// The worker turn has ended, but the controller is still performing
+    /// post-run jobs (memory extract / consolidate / compact) and cannot
+    /// accept a new turn immediately.
+    Busy,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -724,6 +748,7 @@ mod tests {
                 scope_summary: "Writable:\n  - /tmp".into(),
                 tools: vec!["Read".into()],
             },
+            status: PodStatus::Paused,
         };
         let json = serde_json::to_string(&event).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -732,6 +757,36 @@ mod tests {
         assert_eq!(parsed["data"]["items"][0]["role"], "user");
         assert_eq!(parsed["data"]["greeting"]["pod_name"], "test");
         assert_eq!(parsed["data"]["greeting"]["tools"][0], "Read");
+        assert_eq!(parsed["data"]["status"], "paused");
+    }
+
+    #[test]
+    fn event_status_format() {
+        let event = Event::Status {
+            status: PodStatus::Busy,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["event"], "status");
+        assert_eq!(parsed["data"]["status"], "busy");
+
+        let decoded: Event = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            decoded,
+            Event::Status {
+                status: PodStatus::Busy
+            }
+        ));
+    }
+
+    #[test]
+    fn event_history_legacy_without_status_defaults_to_idle() {
+        let json = r#"{"event":"history","data":{"items":[],"greeting":{"pod_name":"test","cwd":"/tmp","provider":"anthropic","model":"claude","scope_summary":"","tools":[]}}}"#;
+        let decoded: Event = serde_json::from_str(json).unwrap();
+        match decoded {
+            Event::History { status, .. } => assert_eq!(status, PodStatus::Idle),
+            other => panic!("expected History, got {other:?}"),
+        }
     }
 
     #[test]

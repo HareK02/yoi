@@ -131,7 +131,8 @@ pub fn default_base() -> Result<PathBuf, io::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shared_state::{PodSharedState, PodStatus};
+    use crate::shared_state::PodSharedState;
+    use protocol::PodStatus;
 
     fn test_state() -> PodSharedState {
         PodSharedState::new(
