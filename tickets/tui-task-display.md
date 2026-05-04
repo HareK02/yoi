@@ -78,3 +78,8 @@
 - TUI 側受信パス: `crates/tui/src/app.rs`（`Event::ToolCallDone` / `Event::SystemMessage` / `Event::History`）、`crates/tui/src/ui.rs`、`crates/tui/src/block.rs`（`ToolCallBlock` / `SystemMessage`）
 - 設計指針: `AGENTS.md`「LLM コンテキストの加工原則」（history からの決定的再構成は許容変換）
 - 関連チケット: `tickets/session-todo.md`（Task ツール本体）、`tickets/session-todo-reminder.md`（LLM 側ナッジ）
+
+## Review
+- 状態: Approve
+- レビュー詳細: [./tui-task-display.review.md](./tui-task-display.review.md)
+- 日付: 2026-05-04

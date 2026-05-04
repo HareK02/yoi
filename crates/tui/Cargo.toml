@@ -17,3 +17,6 @@ manifest = { workspace = true }
 session-store = { workspace = true }
 pod-registry = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
+
+[dev-dependencies]
+tools = { workspace = true }

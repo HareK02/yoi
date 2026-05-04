@@ -66,25 +66,30 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let input_render = app.input.render(input_content_width);
     let input_height = input_area_height(&input_render, area.height);
     let mini_view_h = task_mini_view_height(&app.task_store);
+    // One blank row separates the history tail from the mini-view so
+    // the latest message doesn't visually crash into the task summary.
+    // Folds away with the mini-view when there are no tasks.
+    let mini_view_gap = if mini_view_h > 0 { 1 } else { 0 };
 
     let chunks = Layout::vertical([
-        Constraint::Min(0),               // history view
-        Constraint::Length(mini_view_h),  // task mini-view (0 when empty)
-        Constraint::Length(1),            // separator
-        Constraint::Length(1),            // status
-        Constraint::Length(input_height), // input area
+        Constraint::Min(0),                // history view
+        Constraint::Length(mini_view_gap), // gap above mini-view
+        Constraint::Length(mini_view_h),   // task mini-view (0 when empty)
+        Constraint::Length(1),             // separator
+        Constraint::Length(1),             // status
+        Constraint::Length(input_height),  // input area
     ])
     .split(area);
 
     draw_history(frame, app, chunks[0]);
     if mini_view_h > 0 {
-        draw_task_mini_view(frame, &app.task_store, chunks[1]);
+        draw_task_mini_view(frame, &app.task_store, chunks[2]);
     }
-    draw_separator(frame, chunks[2]);
-    draw_status(frame, app, chunks[3]);
-    draw_input(frame, &input_render, chunks[4]);
+    draw_separator(frame, chunks[3]);
+    draw_status(frame, app, chunks[4]);
+    draw_input(frame, &input_render, chunks[5]);
     if let Some(state) = app.completion.as_ref().filter(|c| c.is_active()) {
-        draw_completion_popup(frame, state, chunks[4]);
+        draw_completion_popup(frame, state, chunks[5]);
     }
 }
 

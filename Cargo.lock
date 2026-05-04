@@ -3620,6 +3620,7 @@ dependencies = [
  "session-store",
  "tokio",
  "toml",
+ "tools",
  "unicode-width",
  "uuid",
 ]
