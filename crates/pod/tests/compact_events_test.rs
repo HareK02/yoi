@@ -14,6 +14,7 @@ use async_trait::async_trait;
 use futures::Stream;
 use llm_worker::Worker;
 use llm_worker::llm_client::event::{Event as LlmEvent, ResponseStatus, StatusEvent};
+use llm_worker::llm_client::types::Item;
 use llm_worker::llm_client::{ClientError, LlmClient, Request};
 use protocol::Event;
 use session_store::FsStore;
@@ -174,6 +175,56 @@ fn drain(rx: &mut broadcast::Receiver<Event>) -> Vec<Event> {
         }
     }
     out
+}
+
+fn system_event_text(event: &Event) -> Option<&str> {
+    match event {
+        Event::SystemMessage { item } => item["content"]
+            .as_array()
+            .and_then(|parts| parts.iter().filter_map(|p| p["text"].as_str()).next()),
+        _ => None,
+    }
+}
+
+#[tokio::test]
+async fn compact_broadcasts_only_new_system_messages_not_retained_ones() {
+    let client = MockClient::new(vec![
+        single_text_events("hi"),
+        write_summary_tool_use_events("call-1", "summary"),
+        single_text_events("done"),
+    ]);
+    let mut pod = make_pod(client).await;
+
+    let (tx, mut rx) = broadcast::channel::<Event>(64);
+    pod.attach_event_tx(tx);
+
+    pod.run_text("first").await.unwrap();
+    let retained_message = Item::system_message("[Retained system]\nold");
+    pod.worker_mut().push_item(retained_message);
+    let _ = drain(&mut rx);
+
+    pod.compact(10_000).await.unwrap();
+
+    let events = drain(&mut rx);
+    let system_texts: Vec<&str> = events.iter().filter_map(system_event_text).collect();
+    assert!(
+        system_texts
+            .iter()
+            .any(|text| text.starts_with("[Compacted context summary]")),
+        "summary system message missing from {system_texts:?}"
+    );
+    assert!(
+        system_texts
+            .iter()
+            .any(|text| text.starts_with("[Session TaskStore snapshot]")),
+        "task snapshot system message missing from {system_texts:?}"
+    );
+    assert!(
+        !system_texts
+            .iter()
+            .any(|text| text.starts_with("[Retained system]")),
+        "retained system message should not be rebroadcast: {system_texts:?}"
+    );
 }
 
 #[tokio::test]

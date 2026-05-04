@@ -45,3 +45,8 @@ LLM のコンテキストには乗っているが TUI には何も出ない。TU
 - 別 client が後から subscribe して `Event::History` を受けた場合も、同じログ要素として描画される。
 - ライブ event と history 復元の表示が一致する（同じ Block バリアントを通る）。
 - 解決失敗時の従来経路（`Alert` / user-invocation エラー）は維持される。
+
+## Review
+- 状態: Approve
+- レビュー詳細: [./tui-system-message-render.review.md](./tui-system-message-render.review.md)
+- 日付: 2026-05-04

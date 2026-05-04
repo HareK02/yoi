@@ -361,6 +361,7 @@ fn render_block_into(lines: &mut Vec<Line<'static>>, block: &Block, width: u16, 
             )));
         }
         Block::UserMessage { segments } => render_user_message(lines, segments, width, mode),
+        Block::SystemMessage { text } => render_system_message(lines, text, width, mode),
         Block::Notify { message } => {
             let text = format!("[notify] {message}");
             match mode {
@@ -478,6 +479,77 @@ fn render_user_message(
     }
     if !current.is_empty() {
         lines.push(Line::from(current));
+    }
+}
+
+fn render_system_message(lines: &mut Vec<Line<'static>>, text: &str, width: u16, mode: Mode) {
+    let header_style = kind_style(MessageKind::System);
+    let body_style = Style::default().fg(Color::DarkGray);
+    let (header, body) = split_system_message(text);
+    let overview_text = if body.is_empty() {
+        header.to_owned()
+    } else {
+        format!("{header} {body}")
+    };
+
+    match mode {
+        Mode::Overview => push_overview_line(lines, &overview_text, width, MessageKind::System, ""),
+        Mode::Detail => {
+            lines.push(Line::from(Span::styled(header.to_owned(), header_style)));
+            for raw in body.lines() {
+                lines.push(Line::from(vec![
+                    Span::styled("  ", body_style),
+                    Span::styled(raw.to_owned(), body_style),
+                ]));
+            }
+            if body.is_empty() && header.is_empty() {
+                lines.push(Line::from(""));
+            }
+        }
+        Mode::Normal => {
+            lines.push(Line::from(Span::styled(header.to_owned(), header_style)));
+            let preview = system_message_preview(body, 4);
+            for line in preview.lines {
+                lines.push(Line::from(vec![
+                    Span::styled("  ", body_style),
+                    Span::styled(line, body_style),
+                ]));
+            }
+            if preview.omitted_lines > 0 {
+                lines.push(Line::from(vec![
+                    Span::styled("  ", body_style),
+                    Span::styled(
+                        format!("… ({} more lines)", preview.omitted_lines),
+                        body_style.add_modifier(Modifier::ITALIC),
+                    ),
+                ]));
+            }
+        }
+    }
+}
+
+fn split_system_message(text: &str) -> (&str, &str) {
+    match text.split_once('\n') {
+        Some((header, body)) => (header, body.trim_start_matches('\n')),
+        None => (text, ""),
+    }
+}
+
+struct SystemMessagePreview {
+    lines: Vec<String>,
+    omitted_lines: usize,
+}
+
+fn system_message_preview(body: &str, max_lines: usize) -> SystemMessagePreview {
+    let all: Vec<&str> = body.lines().collect();
+    let lines = all
+        .iter()
+        .take(max_lines)
+        .map(|line| (*line).to_owned())
+        .collect();
+    SystemMessagePreview {
+        lines,
+        omitted_lines: all.len().saturating_sub(max_lines),
     }
 }
 
@@ -931,6 +1003,8 @@ pub enum MessageKind {
     /// Visually distinct from User / Assistant / Notice so it's clear
     /// the line came from another Pod or operator, not the local user.
     Notify,
+    /// Persisted role:system history item preview.
+    System,
     Assistant,
     Thinking,
     TurnStats,
@@ -943,6 +1017,7 @@ pub fn kind_style(kind: MessageKind) -> Style {
         MessageKind::TurnHeader => Style::default().fg(Color::DarkGray),
         MessageKind::User => Style::default().fg(Color::Green),
         MessageKind::Notify => Style::default().fg(Color::Yellow),
+        MessageKind::System => Style::default().fg(Color::Cyan),
         MessageKind::Assistant => Style::default().fg(Color::White),
         MessageKind::Thinking => Style::default()
             .fg(Color::Magenta)
@@ -975,7 +1050,9 @@ fn format_pod_event(event: &PodEvent) -> String {
             format!("[pod_event] {pod_name} → shut_down")
         }
         PodEvent::ScopeSubDelegated {
-            parent_pod, sub_pod, ..
+            parent_pod,
+            sub_pod,
+            ..
         } => {
             format!("[pod_event] {parent_pod} → scope_sub_delegated: {sub_pod}")
         }

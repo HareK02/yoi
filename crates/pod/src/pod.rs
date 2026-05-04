@@ -6,7 +6,7 @@ use llm_worker::Item;
 use llm_worker::llm_client::RequestConfig;
 use llm_worker::llm_client::client::LlmClient;
 use llm_worker::state::Mutable;
-use llm_worker::{ToolOutputLimits, UsageRecord, Worker, WorkerError, WorkerResult};
+use llm_worker::{Role, ToolOutputLimits, UsageRecord, Worker, WorkerError, WorkerResult};
 use session_store::{EntryHash, PodScopeSnapshot, SessionId, SessionStartState, Store, StoreError};
 use tracing::{info, warn};
 
@@ -555,6 +555,20 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         if let Some(tx) = self.event_tx.as_ref() {
             let _ = tx.send(event);
         }
+    }
+
+    fn broadcast_system_message_item(&self, item: &Item) {
+        if !matches!(
+            item,
+            Item::Message {
+                role: Role::System,
+                ..
+            }
+        ) {
+            return;
+        }
+        let value = serde_json::to_value(item).expect("Item is Serialize");
+        self.send_event(Event::SystemMessage { item: value });
     }
 
     /// Push a `Method::Notify` (or rendered `Method::PodEvent`) entry
@@ -1466,19 +1480,29 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 + reference_message.is_some() as usize
                 + retained_items.len(),
         );
-        new_history.push(Item::system_message(format!(
-            "[Compacted context summary]\n\n{summary_text}"
-        )));
+        let mut compact_introduced_system_messages =
+            Vec::with_capacity(2 + auto_read_messages.len() + reference_message.is_some() as usize);
+        let summary_message =
+            Item::system_message(format!("[Compacted context summary]\n\n{summary_text}"));
+        compact_introduced_system_messages.push(summary_message.clone());
+        compact_introduced_system_messages.extend(auto_read_messages.iter().cloned());
+        if let Some(msg) = reference_message.as_ref() {
+            compact_introduced_system_messages.push(msg.clone());
+        }
+        let task_snapshot_message = Item::system_message(format!(
+            "[Session TaskStore snapshot]\n\n{task_snapshot_text}\n\n\
+             This is the complete session task list preserved across compaction. \
+             The following TaskList tool result presents the same state through the tool lane."
+        ));
+        compact_introduced_system_messages.push(task_snapshot_message.clone());
+
+        new_history.push(summary_message);
         new_history.extend(auto_read_messages);
         if let Some(msg) = reference_message {
             new_history.push(msg);
         }
         new_history.extend(retained_items);
-        new_history.push(Item::system_message(format!(
-            "[Session TaskStore snapshot]\n\n{task_snapshot_text}\n\n\
-             This is the complete session task list preserved across compaction. \
-             The following TaskList tool result presents the same state through the tool lane."
-        )));
+        new_history.push(task_snapshot_message);
         new_history.push(Item::tool_call("compact-tasklist", "TaskList", "{}"));
         new_history.push(Item::tool_result_with_content(
             "compact-tasklist",
@@ -1531,8 +1555,11 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             self.user_segments.drain(..drop_n);
         }
 
+        self.worker.as_mut().unwrap().set_history(new_history);
+        for item in &compact_introduced_system_messages {
+            self.broadcast_system_message_item(item);
+        }
         let worker = self.worker.as_mut().unwrap();
-        worker.set_history(new_history);
         // Anchor the prompt cache at the summary item so that Anthropic
         // can place a durable `cache_control` breakpoint there — our
         // compact layout guarantees history[0] is the summary.
