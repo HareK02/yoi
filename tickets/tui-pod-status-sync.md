@@ -38,3 +38,9 @@ TUI 利用中、notice / alert / compact 表示が出た前後で `Ctrl-C` / `Ct
 - TUI の入力キューイング（`tickets/tui-input-queue.md`）。本チケットは状態同期と Ctrl 系操作の安定化に限定する。
 - native GUI 側の状態管理。
 - notice / alert の文言や見た目の全面 redesign。
+
+## Review
+
+- 状態: Approve with follow-up
+- レビュー詳細: [./tui-pod-status-sync.review.md](./tui-pod-status-sync.review.md)
+- 日付: 2026-05-04

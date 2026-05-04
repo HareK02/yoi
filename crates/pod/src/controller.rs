@@ -119,6 +119,12 @@ async fn finish_controller_run<C, St>(
     St: Store,
 {
     if new_status == PodStatus::Busy {
+        // Surface the post-run busy window before kicking off the jobs so
+        // TUI / external observers see Busy regardless of whether the
+        // worker turn ended via success or error. Both branches in
+        // `run_with_cancel_support` return `PodStatus::Busy` for this
+        // path; emitting here keeps the two unified.
+        set_controller_status(shared_state, runtime_dir, event_tx, PodStatus::Busy).await;
         run_post_run_jobs(pod, alerter).await;
     }
 
@@ -506,7 +512,6 @@ impl PodController {
                             &event_tx,
                             &cancel_tx,
                             &shared_state,
-                            &runtime_dir,
                             &notify_buffer,
                             self_parent_socket.as_ref(),
                             &spawner_name,
@@ -559,7 +564,6 @@ impl PodController {
                             &event_tx,
                             &cancel_tx,
                             &shared_state,
-                            &runtime_dir,
                             &notify_buffer,
                             self_parent_socket.as_ref(),
                             &spawner_name,
@@ -605,7 +609,6 @@ impl PodController {
                             &event_tx,
                             &cancel_tx,
                             &shared_state,
-                            &runtime_dir,
                             &notify_buffer,
                             self_parent_socket.as_ref(),
                             &spawner_name,
@@ -699,7 +702,6 @@ impl PodController {
                                 &event_tx,
                                 &cancel_tx,
                                 &shared_state,
-                                &runtime_dir,
                                 &notify_buffer,
                                 self_parent_socket.as_ref(),
                                 &spawner_name,
@@ -767,7 +769,6 @@ async fn run_with_cancel_support<F>(
     event_tx: &broadcast::Sender<Event>,
     cancel_tx: &mpsc::Sender<()>,
     shared_state: &Arc<PodSharedState>,
-    runtime_dir: &RuntimeDir,
     notify_buffer: &NotifyBuffer,
     parent_socket: Option<&std::path::PathBuf>,
     self_name: &str,
@@ -791,13 +792,6 @@ where
                             PodRunResult::LimitReached => (PodStatus::Busy, RunResult::LimitReached),
                         };
                         let _ = event_tx.send(Event::RunEnd { result: run_result });
-                        if status == PodStatus::Busy {
-                            shared_state.set_status(PodStatus::Busy);
-                            let _ = runtime_dir.write_status(shared_state).await;
-                            let _ = event_tx.send(Event::Status {
-                                status: PodStatus::Busy,
-                            });
-                        }
                         if matches!(run_result, RunResult::Finished) {
                             crate::ipc::event::fire_and_forget(
                                 parent_socket.cloned(),
