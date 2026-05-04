@@ -11,7 +11,6 @@
   - ストリーム途中失敗時の継続 → [tickets/llm-worker-stream-continuation.md](tickets/llm-worker-stream-continuation.md)
 - ネイティブ GUI クライアント MVP → [tickets/native-gui-mvp.md](tickets/native-gui-mvp.md)
 - TUI 拡充
-  - Run/notice 前後の Pod 状態同期と Ctrl 系操作の安定化 → [tickets/tui-pod-status-sync.md](tickets/tui-pod-status-sync.md)
   - Run 中の入力キューイング → [tickets/tui-input-queue.md](tickets/tui-input-queue.md)
   - ユーザーマニフェストのモデル設定 wizard → [tickets/tui-user-model-setup.md](tickets/tui-user-model-setup.md)
   - spawn 失敗時に Pod の stderr が TUI に表示されない → [tickets/tui-spawn-error-surface.md](tickets/tui-spawn-error-surface.md)
