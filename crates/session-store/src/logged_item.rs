@@ -287,6 +287,48 @@ mod tests {
     }
 
     #[test]
+    fn round_trip_reasoning_preserves_signature() {
+        // 新世代 Claude の thinking signature が history.json に永続化され、
+        // resume 後の Item::Reasoning に復元されること。
+        let original = Item::reasoning("inner thought").with_signature("SIG-OPUS-XYZ");
+        let logged: LoggedItem = (&original).into();
+        let json = serde_json::to_string(&logged).unwrap();
+        // wire 形式に signature キーが乗ること（古い形式との互換のため
+        // 値が None のときは省略される。Some の値は載る）
+        assert!(
+            json.contains("SIG-OPUS-XYZ"),
+            "serialised JSON must carry signature: {json}",
+        );
+        let parsed: LoggedItem = serde_json::from_str(&json).unwrap();
+        match Item::from(parsed) {
+            Item::Reasoning {
+                text, signature, ..
+            } => {
+                assert_eq!(text, "inner thought");
+                assert_eq!(signature.as_deref(), Some("SIG-OPUS-XYZ"));
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn legacy_reasoning_without_signature_field_deserializes() {
+        // signature フィールドが無い旧形式の history.json を読み込んでも
+        // None としてロードできる（後方互換性）。
+        let legacy_json = r#"{"kind":"reasoning","text":"old","summary":[],"encrypted_content":null}"#;
+        let parsed: LoggedItem = serde_json::from_str(legacy_json).unwrap();
+        match Item::from(parsed) {
+            Item::Reasoning {
+                text, signature, ..
+            } => {
+                assert_eq!(text, "old");
+                assert!(signature.is_none());
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
     fn round_trip_tool_result_with_content() {
         let original = Item::tool_result_with_content("call_1", "ok", "full output");
         let logged: LoggedItem = (&original).into();

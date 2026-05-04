@@ -869,6 +869,88 @@ mod tests {
     }
 
     #[test]
+    fn thinking_part_lands_in_assistant_role_message() {
+        // wire 構造の position 検証: thinking part は assistant role の
+        // message 配列に並ぶ（user role には絶対に入らない）。
+        let scheme = AnthropicScheme::new();
+        let request = Request::new()
+            .user("question?")
+            .item(Item::reasoning("thinking inside").with_signature("SIG-A"))
+            .item(Item::tool_call("c1", "tool_a", "{}"))
+            .item(Item::tool_result("c1", "result"))
+            .user("follow up");
+        let req = scheme.build_request("claude-sonnet-4-20250514", &request, &cap_explicit());
+
+        // 全 thinking part が assistant role の message に存在すること
+        let mut thinking_msg_indices = Vec::new();
+        for (i, msg) in req.messages.iter().enumerate() {
+            if let AnthropicContent::Parts(parts) = &msg.content {
+                if parts
+                    .iter()
+                    .any(|p| matches!(p, AnthropicContentPart::Thinking { .. }))
+                {
+                    assert_eq!(
+                        msg.role, "assistant",
+                        "thinking part must be in assistant role, got {} at msg {}",
+                        msg.role, i,
+                    );
+                    thinking_msg_indices.push(i);
+                }
+            }
+        }
+        assert!(
+            !thinking_msg_indices.is_empty(),
+            "expected at least one thinking part in messages: {:?}",
+            req.messages,
+        );
+
+        // thinking part を含む assistant message は、それに続く tool_use を含む
+        // assistant message より前 (= 先頭側) に位置すること
+        // (Anthropic 仕様: 同一論理ターン内で thinking → tool_use の順)
+        let mut tool_use_msg_indices = Vec::new();
+        for (i, msg) in req.messages.iter().enumerate() {
+            if let AnthropicContent::Parts(parts) = &msg.content {
+                if parts
+                    .iter()
+                    .any(|p| matches!(p, AnthropicContentPart::ToolUse { .. }))
+                {
+                    tool_use_msg_indices.push(i);
+                }
+            }
+        }
+        assert!(!tool_use_msg_indices.is_empty(), "expected tool_use part");
+        let first_thinking = thinking_msg_indices[0];
+        let first_tool_use = tool_use_msg_indices[0];
+        assert!(
+            first_thinking <= first_tool_use,
+            "thinking msg ({}) must precede tool_use msg ({})",
+            first_thinking,
+            first_tool_use,
+        );
+    }
+
+    #[test]
+    fn redacted_thinking_part_lands_in_assistant_role_message() {
+        // RedactedThinking も同様に assistant role に置かれること。
+        let scheme = AnthropicScheme::new();
+        let request = Request::new()
+            .user("ask")
+            .item(Item::reasoning("").with_encrypted_content("opaque"))
+            .item(Item::tool_call("c1", "tool_a", "{}"))
+            .item(Item::tool_result("c1", "ok"));
+        let req = scheme.build_request("claude-sonnet-4-20250514", &request, &cap_explicit());
+        for msg in &req.messages {
+            if let AnthropicContent::Parts(parts) = &msg.content {
+                for part in parts {
+                    if matches!(part, AnthropicContentPart::RedactedThinking { .. }) {
+                        assert_eq!(msg.role, "assistant");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn tool_definitions_carry_no_cache_control() {
         // Tool JSON schema must serialise unchanged — no sneak-in of
         // cache_control at the tools-array level.

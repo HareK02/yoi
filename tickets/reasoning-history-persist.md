@@ -32,3 +32,8 @@ CLAUDE.md の「LLM コンテキスト加工原則」に照らしても、thinki
 - Anthropic `clear_thinking_20251015` context-editing 戦略の実装
 - `prune.rs` の reasoning aware 化 (古い reasoning の選択的剥離)
 - Ollama scheme の `think` パラメータ対応 (そもそも Ollama scheme 自体が未実装)
+
+## Review
+- 状態: Approve with follow-up
+- レビュー詳細: [./reasoning-history-persist.review.md](./reasoning-history-persist.review.md)
+- 日付: 2026-05-04
