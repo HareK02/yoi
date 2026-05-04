@@ -7,7 +7,6 @@
 - Pod: 任意ターンからの Fork（複数ターン巻き戻しを汎用化） → [tickets/pod-session-fork.md](tickets/pod-session-fork.md)
 - Pod: 子→親の TurnEnded/Errored callback を親由来ターンのみに絞る → [tickets/pod-parent-turn-callback.md](tickets/pod-parent-turn-callback.md)
 - llm-worker のエラー耐性
-  - HTTP transient リトライ → [tickets/llm-worker-transient-retry.md](tickets/llm-worker-transient-retry.md)
   - ストリーム途中失敗時の継続 → [tickets/llm-worker-stream-continuation.md](tickets/llm-worker-stream-continuation.md)
 - ネイティブ GUI クライアント MVP → [tickets/native-gui-mvp.md](tickets/native-gui-mvp.md)
 - TUI 拡充
