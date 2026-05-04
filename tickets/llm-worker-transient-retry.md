@@ -68,3 +68,10 @@ scheme（OpenAI / Anthropic / Responses 等）に依存しない共通処理と�
 - mid-stream（SSE 読み中）の継続再開 → `llm-worker-stream-continuation`
 - プロバイダ別の細かい retry policy（共通既定で十分）
 - リトライ上限値の manifest からの上書き（必要になったら別ticket）
+
+## Review
+
+- 状態: Approve
+- レビュー詳細: [./llm-worker-transient-retry.review.md](./llm-worker-transient-retry.review.md)
+- 対象 commit: `7183847`
+- 日付: 2026-05-04
