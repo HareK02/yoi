@@ -20,31 +20,33 @@
   - resume / 再接続時はサーバから来る history replay 経路に乗っかれば自動で復元される
   - 単一情報源（history）に揃うため、Pod と TUI で snapshot がズレない
 - TUI 上の表示は 2 ヶ所
-  - **入力欄直上のミニビュー（3〜4 行）**: 常時表示。active（`pending` + `inprogress`）優先で最大 2〜3 件を `状態マーク + subject` 1 行ずつ、加えて件数サマリ 1 行
+  - **history 直下のミニビュー**: history と separator の間に挟む段。タスクが 1 件以上あるときだけ描画し、0 件なら領域ごと畳む。active（`pending` + `inprogress`）優先で最大 2〜3 件を `状態マーク + subject` 1 行ずつ、加えて件数サマリ 1 行
   - **サイドペイン（全件）**: トグルキーで右側に開閉。`pending` / `inprogress` / `completed` / `deleted` を区別して全件列挙、`description` も含める
-- `tools` クレートに依存させる（または replay 部分のみを薄いヘルパとして切り出して共有する）。LLM コンテキスト加工原則との整合は自明（history の純粋な再現変換であり context への割り込みではない）
+- **`tools` クレートには依存させない**。TUI は表示専門レイヤなので、依存すると `llm-worker` や全ファイルツール一式まで引き込んで割に合わない。TUI 内に薄い mirror（`TaskEntry` / `TaskStatus` / 小さい `TaskStore`）を持ち、`TaskCreate` / `TaskUpdate` の引数 JSON と `[Session TaskStore snapshot]` system message を直接 parse する。snapshot のフォーマットは `tools` 側 `render_snapshot` が source of truth で、resume 時に `tools` 自身が再 parse する契約になっているので、TUI 側もこの契約に乗る形になる。LLM コンテキスト加工原則との整合は自明（history の純粋な再現変換であり context への割り込みではない）
 
 ## 要件
 
 ### TUI 側の TaskStore 取り回し
 
-- `App` に最新 `TaskStore`（または `TaskSnapshot`）を保持するフィールドを追加する
+- `App` に最新 `TaskStore`（または `TaskSnapshot`）を保持するフィールドを追加する。型は TUI 内 mirror（`tools` 依存なし）
 - 受信パスで以下を観測して TaskStore に反映する
-  - `ToolCall` 完了時、`name == "TaskCreate"` / `"TaskUpdate"` なら `arguments` を `TaskStore::from_history` と同じパースで適用
-  - `SystemMessage` 観測時、本文が `[Session TaskStore snapshot]` で始まるなら `parse_compact_snapshot_text` 相当で snapshot に置き換え
+  - `ToolCall` 完了時、`name == "TaskCreate"` / `"TaskUpdate"` なら `arguments` を `tools` 側と同じスキーマで parse し、create / update を適用
+  - `SystemMessage` 観測時、本文が `[Session TaskStore snapshot]` で始まるなら埋め込み JSON ブロックを抽出して snapshot に置き換え
 - 初回 history replay の際も同じ経路を通せば、TUI 起動時点の状態が自動的に復元される
 - 部分的引数（streaming 中）は適用しない。tool_call が完了して `arguments` が確定したタイミングだけ反映する
+- 不正な JSON や未知のフィールドは黙って無視する（`tools` 側 `replay_history` と同じく落ちない）
 
 ### TUI ミニビュー
 
-- 入力欄の直上に固定で 3〜4 行の領域を確保
+- 配置は `history / mini-view / separator / status / input` の縦積み（history 直下、separator より上）
+- タスクが 1 件以上あるときだけ描画する。0 件なら領域ごと畳んで既存レイアウトと同じ高さに戻る
 - active（`pending` + `inprogress`）を優先して最大 2〜3 件、`状態マーク + subject` を 1 行ずつ表示。`subject` が改行を含む場合は先頭行のみ
 - 件数サマリ 1 行（`pending` / `inprogress` / `completed` / `deleted` の内訳）
-- active 0 件のときの見せ方は実装時に決める（サマリ行のみ残すか、領域ごと畳むか）
 
 ### TUI サイドペイン
 
-- トグルキーで右側に開閉する横分割レイアウト（割当キーは実装時に決める）
+- トグルキー: `Ctrl-T`
+- 横分割レイアウトは history 領域内で行う。status / input / separator は引き続き全幅で残し、completion popup や入力体験への影響を最小化する
 - 開いている間は全件を表示。各エントリは `taskid` / `status` / `subject` / `description` を含める
 - スクロール対応（タスク数が画面高を超えてもよい）
 
@@ -72,6 +74,7 @@
 
 ## 参照
 
-- 実装: `crates/tools/src/task.rs`（`TaskStore::from_history` / `parse_compact_snapshot_text` / `TaskStatus` / `TaskEntry`）、`crates/tui/src/ui.rs`、`crates/tui/src/block.rs`（`ToolCallBlock` / `SystemMessage`）
+- 参考実装: `crates/tools/src/task.rs`（`TaskStore::from_history` / `parse_compact_snapshot_text` / `TaskStatus` / `TaskEntry` / `render_snapshot`）。TUI 側はこれらを依存として取り込まず、同等のロジックを薄く再実装する
+- TUI 側受信パス: `crates/tui/src/app.rs`（`Event::ToolCallDone` / `Event::SystemMessage` / `Event::History`）、`crates/tui/src/ui.rs`、`crates/tui/src/block.rs`（`ToolCallBlock` / `SystemMessage`）
 - 設計指針: `AGENTS.md`「LLM コンテキストの加工原則」（history からの決定的再構成は許容変換）
 - 関連チケット: `tickets/session-todo.md`（Task ツール本体）、`tickets/session-todo-reminder.md`（LLM 側ナッジ）

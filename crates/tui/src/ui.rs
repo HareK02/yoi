@@ -26,6 +26,7 @@ use protocol::{AlertLevel, CompletionEntry, Greeting, PodEvent, Segment};
 
 use crate::app::{App, CompletionState, alert_source_label, fmt_tokens};
 use crate::block::{Block, CompactEvent, ThinkingBlock, ThinkingState};
+use crate::task::{TaskCounts, TaskEntry, TaskStatus, TaskStore};
 
 /// Display density for the history view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,9 +65,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let input_content_width = area.width.saturating_sub(2).max(1);
     let input_render = app.input.render(input_content_width);
     let input_height = input_area_height(&input_render, area.height);
+    let mini_view_h = task_mini_view_height(&app.task_store);
 
     let chunks = Layout::vertical([
         Constraint::Min(0),               // history view
+        Constraint::Length(mini_view_h),  // task mini-view (0 when empty)
         Constraint::Length(1),            // separator
         Constraint::Length(1),            // status
         Constraint::Length(input_height), // input area
@@ -74,11 +77,109 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     .split(area);
 
     draw_history(frame, app, chunks[0]);
-    draw_separator(frame, chunks[1]);
-    draw_status(frame, app, chunks[2]);
-    draw_input(frame, &input_render, chunks[3]);
+    if mini_view_h > 0 {
+        draw_task_mini_view(frame, &app.task_store, chunks[1]);
+    }
+    draw_separator(frame, chunks[2]);
+    draw_status(frame, app, chunks[3]);
+    draw_input(frame, &input_render, chunks[4]);
     if let Some(state) = app.completion.as_ref().filter(|c| c.is_active()) {
-        draw_completion_popup(frame, state, chunks[3]);
+        draw_completion_popup(frame, state, chunks[4]);
+    }
+}
+
+/// Maximum number of active (pending / inprogress) tasks the mini-view
+/// shows above the summary line. Exceeding tasks are still counted in
+/// the summary.
+const MINI_VIEW_MAX_ACTIVE: usize = 3;
+
+/// Height the mini-view section occupies. Returns 0 when there are no
+/// tasks at all, so the section collapses cleanly into surrounding
+/// layout — there's no point reserving rows for an empty store.
+fn task_mini_view_height(store: &TaskStore) -> u16 {
+    if store.is_empty() {
+        return 0;
+    }
+    let active_shown = store.counts().active().min(MINI_VIEW_MAX_ACTIVE);
+    // active rows + 1 summary line
+    (active_shown as u16).saturating_add(1)
+}
+
+fn draw_task_mini_view(frame: &mut Frame, store: &TaskStore, area: Rect) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let outer_block = UiBlock::default().padding(Padding::horizontal(HISTORY_PADDING));
+    let inner = outer_block.inner(area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(area.height as usize);
+    let mut shown = 0usize;
+    for entry in store.tasks() {
+        if shown >= MINI_VIEW_MAX_ACTIVE {
+            break;
+        }
+        if !matches!(entry.status, TaskStatus::Pending | TaskStatus::Inprogress) {
+            continue;
+        }
+        lines.push(mini_view_active_line(entry, inner.width));
+        shown += 1;
+    }
+    lines.push(mini_view_summary_line(store.counts(), inner.width));
+
+    Paragraph::new(lines)
+        .block(outer_block)
+        .render(area, frame.buffer_mut());
+}
+
+fn mini_view_active_line(entry: &TaskEntry, width: u16) -> Line<'static> {
+    let mark = task_status_mark(entry.status);
+    // Subject's first line only; embedded newlines would otherwise
+    // wreck the one-row-per-task layout.
+    let subject = entry.subject.lines().next().unwrap_or("");
+    let mark_width = UnicodeWidthStr::width(mark.0);
+    // Reserve mark + space.
+    let budget = (width as usize).saturating_sub(mark_width + 1);
+    let shown = truncate_with_ellipsis(subject, budget);
+    Line::from(vec![
+        Span::styled(mark.0.to_owned(), mark.1),
+        Span::raw(" "),
+        Span::raw(shown),
+    ])
+}
+
+fn mini_view_summary_line(counts: TaskCounts, width: u16) -> Line<'static> {
+    let text = format!(
+        "{} task(s) — pending: {}, inprogress: {}, completed: {}, deleted: {}",
+        counts.total(),
+        counts.pending,
+        counts.inprogress,
+        counts.completed,
+        counts.deleted,
+    );
+    let shown = truncate_with_ellipsis(&text, width as usize);
+    Line::from(Span::styled(
+        shown,
+        Style::default().fg(Color::DarkGray),
+    ))
+}
+
+/// Two-character status marker + the style to render it with. Mirrors
+/// the four `TaskStatus` values; deleted ones never appear in the
+/// mini-view but are listed in the side pane.
+fn task_status_mark(status: TaskStatus) -> (&'static str, Style) {
+    match status {
+        TaskStatus::Pending => ("[ ]", Style::default().fg(Color::DarkGray)),
+        TaskStatus::Inprogress => (
+            "[~]",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        TaskStatus::Completed => ("[x]", Style::default().fg(Color::Green)),
+        TaskStatus::Deleted => ("[-]", Style::default().fg(Color::Red)),
     }
 }
 
@@ -217,8 +318,23 @@ fn draw_history(frame: &mut Frame, app: &mut App, area: Rect) {
         app.scroll.turn_starts.clear();
         return;
     }
+
+    // When the task pane is open and the area is wide enough, carve a
+    // vertical strip on the right for it. Side pane lives inside the
+    // history rect only — separator / status / input stay full width to
+    // keep the input experience and completion popup geometry intact.
+    let pane_w = task_side_pane_width(area.width, app.task_pane_open);
+    let history_area = if pane_w > 0 {
+        let split =
+            Layout::horizontal([Constraint::Min(1), Constraint::Length(pane_w)]).split(area);
+        draw_task_side_pane(frame, app, split[1]);
+        split[0]
+    } else {
+        area
+    };
+
     let outer_block = UiBlock::default().padding(Padding::horizontal(HISTORY_PADDING));
-    let inner = outer_block.inner(area);
+    let inner = outer_block.inner(history_area);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -248,6 +364,98 @@ fn draw_history(frame: &mut Frame, app: &mut App, area: Rect) {
     // uniformly for all rows.
     Paragraph::new(visible)
         .block(outer_block)
+        .render(history_area, frame.buffer_mut());
+}
+
+/// Width to reserve for the task side pane within the history rect.
+/// Returns 0 when the pane is closed or the rect is too narrow to host
+/// it without crushing the history view.
+fn task_side_pane_width(area_width: u16, open: bool) -> u16 {
+    if !open {
+        return 0;
+    }
+    // Need a reasonable history column on the left, and enough room on
+    // the right for taskid + status mark + a few words of subject. Skip
+    // entirely on narrow terminals.
+    if area_width < 60 {
+        return 0;
+    }
+    (area_width / 3).clamp(28, 44)
+}
+
+fn draw_task_side_pane(frame: &mut Frame, app: &mut App, area: Rect) {
+    if area.width < 4 || area.height < 1 {
+        return;
+    }
+    let pane_block = UiBlock::default()
+        .borders(Borders::LEFT)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .padding(Padding::horizontal(1));
+    let inner = pane_block.inner(area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let store = &app.task_store;
+    let counts = store.counts();
+    let title_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let body_style = Style::default().fg(Color::DarkGray);
+    let muted_style = Style::default().fg(Color::DarkGray);
+
+    let mut logical: Vec<Line<'static>> = Vec::new();
+    logical.push(Line::from(Span::styled(
+        format!("Tasks ({})", counts.total()),
+        title_style,
+    )));
+    logical.push(Line::from(""));
+
+    if store.is_empty() {
+        logical.push(Line::from(Span::styled("(no tasks)", muted_style)));
+    } else {
+        for entry in store.tasks() {
+            let mark = task_status_mark(entry.status);
+            let subject_first = entry.subject.lines().next().unwrap_or("");
+            logical.push(Line::from(vec![
+                Span::styled(format!("#{} ", entry.taskid), muted_style),
+                Span::styled(mark.0.to_owned(), mark.1),
+                Span::raw(" "),
+                Span::raw(subject_first.to_owned()),
+            ]));
+            // Subject continuations (multiline subjects).
+            for cont in entry.subject.lines().skip(1) {
+                logical.push(Line::from(vec![
+                    Span::raw("    "),
+                    Span::raw(cont.to_owned()),
+                ]));
+            }
+            for raw in entry.description.lines() {
+                logical.push(Line::from(vec![
+                    Span::styled("    ", body_style),
+                    Span::styled(raw.to_owned(), body_style),
+                ]));
+            }
+            logical.push(Line::from(""));
+        }
+    }
+
+    // Pre-wrap to inner width so scroll math degenerates to row indices.
+    let mut wrapped: Vec<Line<'static>> = Vec::with_capacity(logical.len());
+    for line in logical {
+        wrap_line_into(line, inner.width, &mut wrapped);
+    }
+
+    let max_scroll = wrapped.len().saturating_sub(inner.height as usize);
+    if app.task_pane_scroll > max_scroll {
+        app.task_pane_scroll = max_scroll;
+    }
+    let start = app.task_pane_scroll;
+    let end = (start + inner.height as usize).min(wrapped.len());
+    let visible: Vec<Line<'static>> = wrapped[start..end].to_vec();
+
+    Paragraph::new(visible)
+        .block(pane_block)
         .render(area, frame.buffer_mut());
 }
 

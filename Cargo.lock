@@ -3615,6 +3615,7 @@ dependencies = [
  "pod-registry",
  "protocol",
  "ratatui",
+ "serde",
  "serde_json",
  "session-store",
  "tokio",

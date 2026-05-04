@@ -11,6 +11,7 @@ use crate::block::{
 use crate::cache::FileCache;
 use crate::input::InputBuffer;
 use crate::scroll::Scroll;
+use crate::task::TaskStore;
 use crate::ui::Mode;
 
 /// In-flight completion popup state. Lives on `App` while the user is
@@ -76,6 +77,16 @@ pub struct App {
     /// Completion popup state, when an `@` / `#` / `/` token is in
     /// flight. `None` whenever the trigger conditions don't hold.
     pub completion: Option<CompletionState>,
+    /// In-TUI mirror of the Pod's session task store, reconstructed
+    /// directly from observed `TaskCreate` / `TaskUpdate` tool calls and
+    /// `[Session TaskStore snapshot]` system messages — no protocol
+    /// surface added on the Pod side.
+    pub task_store: TaskStore,
+    /// Whether the right-side task pane is currently open.
+    pub task_pane_open: bool,
+    /// Top entry index of the task pane's visible window. Clamped on
+    /// render so it never points past the end of the list.
+    pub task_pane_scroll: usize,
 }
 
 impl App {
@@ -100,7 +111,25 @@ impl App {
             cache: FileCache::new(),
             assistant_streaming: false,
             completion: None,
+            task_store: TaskStore::new(),
+            task_pane_open: false,
+            task_pane_scroll: 0,
         }
+    }
+
+    pub fn toggle_task_pane(&mut self) {
+        self.task_pane_open = !self.task_pane_open;
+        if !self.task_pane_open {
+            self.task_pane_scroll = 0;
+        }
+    }
+
+    pub fn scroll_task_pane_up(&mut self, n: usize) {
+        self.task_pane_scroll = self.task_pane_scroll.saturating_sub(n);
+    }
+
+    pub fn scroll_task_pane_down(&mut self, n: usize) {
+        self.task_pane_scroll = self.task_pane_scroll.saturating_add(n);
     }
 
     pub fn set_pod_status(&mut self, status: PodStatus) {
@@ -352,6 +381,7 @@ impl App {
                         self.blocks.push(Block::AssistantText { text });
                     }
                     "system" if !text.is_empty() => {
+                        self.task_store.apply_system_message_text(&text);
                         self.blocks.push(Block::SystemMessage { text });
                     }
                     _ => {}
@@ -365,6 +395,9 @@ impl App {
                 let id = item["call_id"].as_str().unwrap_or("").to_owned();
                 let name = item["name"].as_str().unwrap_or("?").to_owned();
                 let arguments = item["arguments"].as_str().map(|s| s.to_owned());
+                if let Some(args) = arguments.as_deref() {
+                    self.task_store.apply_tool_call(&name, args);
+                }
                 self.blocks.push(Block::ToolCall(ToolCallBlock {
                     id,
                     name,
@@ -535,6 +568,12 @@ impl App {
             }
             Event::ToolCallDone { id, arguments, .. } => {
                 self.current_tool = None;
+                let name = self
+                    .find_tool_call_mut(&id)
+                    .map(|b| b.name.clone());
+                if let Some(name) = name.as_deref() {
+                    self.task_store.apply_tool_call(name, &arguments);
+                }
                 if let Some(b) = self.find_tool_call_mut(&id) {
                     b.arguments = Some(arguments);
                     // Only advance the state when it's still in-flight.
@@ -815,6 +854,8 @@ impl App {
         self.turn_index = 0;
         self.blocks.clear();
         self.cache = FileCache::new();
+        self.task_store = TaskStore::new();
+        self.task_pane_scroll = 0;
         self.blocks.push(Block::Greeting(greeting));
         self.assistant_streaming = false;
 
@@ -1278,6 +1319,147 @@ mod completion_flow_tests {
             scope_summary: String::new(),
             tools: Vec::new(),
         }
+    }
+
+    #[test]
+    fn live_task_create_updates_task_store() {
+        let mut app = App::new("test".into());
+        app.handle_pod_event(Event::ToolCallStart {
+            id: "c1".into(),
+            name: "TaskCreate".into(),
+        });
+        app.handle_pod_event(Event::ToolCallDone {
+            id: "c1".into(),
+            name: "TaskCreate".into(),
+            arguments: r#"{"subject":"impl tasks","description":"do it"}"#.into(),
+        });
+        let tasks = app.task_store.tasks();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].subject, "impl tasks");
+        assert_eq!(tasks[0].status, crate::task::TaskStatus::Pending);
+    }
+
+    #[test]
+    fn live_task_update_advances_status() {
+        let mut app = App::new("test".into());
+        for (id, args) in [
+            ("c1", r#"{"subject":"a","description":"A"}"#),
+            ("u1", r#"{"taskid":1,"status":"completed"}"#),
+        ] {
+            let name = if id.starts_with('c') {
+                "TaskCreate"
+            } else {
+                "TaskUpdate"
+            };
+            app.handle_pod_event(Event::ToolCallStart {
+                id: id.into(),
+                name: name.into(),
+            });
+            app.handle_pod_event(Event::ToolCallDone {
+                id: id.into(),
+                name: name.into(),
+                arguments: args.into(),
+            });
+        }
+        assert_eq!(
+            app.task_store.tasks()[0].status,
+            crate::task::TaskStatus::Completed
+        );
+    }
+
+    #[test]
+    fn live_system_snapshot_replaces_task_store() {
+        let mut app = App::new("test".into());
+        // Stale entry that the snapshot must wipe out.
+        app.handle_pod_event(Event::ToolCallStart {
+            id: "c1".into(),
+            name: "TaskCreate".into(),
+        });
+        app.handle_pod_event(Event::ToolCallDone {
+            id: "c1".into(),
+            name: "TaskCreate".into(),
+            arguments: r#"{"subject":"stale","description":""}"#.into(),
+        });
+
+        let snapshot = "[Session TaskStore snapshot]\n\n\
+            TaskStore: 1 task(s)\n\n\
+            ```json\n{\n  \"tasks\": [\n    {\n      \"taskid\": 4,\n      \
+            \"status\": \"inprogress\",\n      \"subject\": \"from snapshot\",\n      \
+            \"description\": \"d\"\n    }\n  ]\n}\n```\n";
+        app.handle_pod_event(Event::SystemMessage {
+            item: serde_json::json!({
+                "type": "message",
+                "role": "system",
+                "content": [{ "type": "text", "text": snapshot }],
+            }),
+        });
+
+        let tasks = app.task_store.tasks();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].taskid, 4);
+        assert_eq!(tasks[0].subject, "from snapshot");
+    }
+
+    #[test]
+    fn history_replay_reconstructs_task_store() {
+        let mut app = App::new("test".into());
+        // Live tool call before history lands — restore_history must
+        // wipe this so it doesn't double-count after replay.
+        app.handle_pod_event(Event::ToolCallStart {
+            id: "live".into(),
+            name: "TaskCreate".into(),
+        });
+        app.handle_pod_event(Event::ToolCallDone {
+            id: "live".into(),
+            name: "TaskCreate".into(),
+            arguments: r#"{"subject":"live","description":""}"#.into(),
+        });
+
+        app.handle_pod_event(Event::History {
+            greeting: test_greeting(),
+            items: vec![
+                serde_json::json!({
+                    "type": "tool_call",
+                    "call_id": "c1",
+                    "name": "TaskCreate",
+                    "arguments": r#"{"subject":"a","description":"A"}"#,
+                }),
+                serde_json::json!({
+                    "type": "tool_call",
+                    "call_id": "c2",
+                    "name": "TaskCreate",
+                    "arguments": r#"{"subject":"b","description":"B"}"#,
+                }),
+                serde_json::json!({
+                    "type": "tool_call",
+                    "call_id": "u1",
+                    "name": "TaskUpdate",
+                    "arguments": r#"{"taskid":2,"status":"inprogress"}"#,
+                }),
+            ],
+            status: PodStatus::Running,
+        });
+
+        let tasks = app.task_store.tasks();
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].subject, "a");
+        assert_eq!(tasks[1].subject, "b");
+        assert_eq!(tasks[1].status, crate::task::TaskStatus::Inprogress);
+    }
+
+    #[test]
+    fn task_pane_toggle_flips_state_and_resets_scroll() {
+        let mut app = App::new("test".into());
+        app.task_pane_scroll = 7;
+        assert!(!app.task_pane_open);
+        app.toggle_task_pane();
+        assert!(app.task_pane_open);
+        // Scroll position is preserved on open so the user keeps their
+        // place if they re-open after closing.
+        assert_eq!(app.task_pane_scroll, 7);
+        app.toggle_task_pane();
+        assert!(!app.task_pane_open);
+        assert_eq!(app.task_pane_scroll, 0);
     }
 }
 

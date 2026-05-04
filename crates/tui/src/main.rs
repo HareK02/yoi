@@ -6,6 +6,7 @@ mod input;
 mod picker;
 mod scroll;
 mod spawn;
+mod task;
 mod tool;
 mod ui;
 
@@ -384,6 +385,11 @@ fn run_disconnected(_app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
 /// looking for.
 const WHEEL_LINES: usize = 3;
 
+/// Lines to advance per PageUp / PageDown when the task side pane is
+/// open. Calibrated so a couple of presses moves through one entry's
+/// subject + description block.
+const PANE_SCROLL_LINES: usize = 5;
+
 fn handle_mouse(app: &mut App, mouse: MouseEvent) {
     match mouse.kind {
         MouseEventKind::ScrollUp => app.scroll.scroll_up(WHEEL_LINES),
@@ -427,6 +433,10 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Option<Method> {
             app.mode = app.mode.cycle();
             Some(None)
         }
+        KeyCode::Char('t') if ctrl => {
+            app.toggle_task_pane();
+            Some(None)
+        }
         KeyCode::Char('a') if ctrl => {
             app.move_cursor_start();
             Some(app.refresh_completion())
@@ -455,14 +465,24 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Option<Method> {
         return None;
     }
 
-    // Scroll / navigation (history view).
+    // Scroll / navigation. PageUp / PageDown defaults to history; while
+    // the task pane is open it scrolls the pane instead so the user can
+    // browse past entries without first closing the pane.
     match key.code {
         KeyCode::PageUp => {
-            app.scroll.page_up();
+            if app.task_pane_open {
+                app.scroll_task_pane_up(PANE_SCROLL_LINES);
+            } else {
+                app.scroll.page_up();
+            }
             return None;
         }
         KeyCode::PageDown => {
-            app.scroll.page_down();
+            if app.task_pane_open {
+                app.scroll_task_pane_down(PANE_SCROLL_LINES);
+            } else {
+                app.scroll.page_down();
+            }
             return None;
         }
         _ => {}
