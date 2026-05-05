@@ -100,7 +100,11 @@ pub(crate) enum InputItem {
     Reasoning {
         #[serde(skip_serializing_if = "Option::is_none")]
         id: Option<String>,
-        #[serde(skip_serializing_if = "Vec::is_empty")]
+        /// Responses API は reasoning item に `summary` フィールドを必須で
+        /// 要求する（中身が空でも `[]` として送る必要がある）。GPT-5 など
+        /// summary を返さないモデル + reasoning effort 指定なしのターンでは
+        /// summary text が一切付かないので、ここを skip すると 400
+        /// "Missing required parameter: 'input[N].summary'" で弾かれる。
         summary: Vec<ReasoningSummaryPart>,
         #[serde(skip_serializing_if = "Vec::is_empty")]
         content: Vec<ReasoningContentPart>,
@@ -471,6 +475,29 @@ mod tests {
             }
             _ => panic!("expected reasoning"),
         }
+    }
+
+    #[test]
+    fn reasoning_summary_field_is_always_serialized() {
+        // Responses API は reasoning item に `summary` を必須で要求する。
+        // summary が空でも wire 上に `summary: []` として残らないと、
+        // ChatGPT backend (codex-oauth) が
+        //   400 invalid_request_error: Missing required parameter:
+        //   'input[N].summary'.
+        // で弾く。GPT-5 + reasoning effort 未指定のターンでは summary text
+        // が付かないことがあるため、空のままでも skip しないこと。
+        let scheme = OpenAIResponsesScheme::new();
+        let item = Item::reasoning("").with_encrypted_content("ENC");
+        let req = Request::new().user("hi").item(item);
+        let body = scheme.build_request("gpt-5", &req, &cap_with_reasoning());
+        let json = serde_json::to_value(&body).unwrap();
+        let reasoning_item = &json["input"][1];
+        assert_eq!(reasoning_item["type"], "reasoning");
+        assert!(
+            reasoning_item.get("summary").is_some(),
+            "summary key must be present even when empty, got: {reasoning_item}"
+        );
+        assert_eq!(reasoning_item["summary"], serde_json::json!([]));
     }
 
     #[test]
