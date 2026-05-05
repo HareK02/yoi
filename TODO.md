@@ -19,6 +19,7 @@
   - 巻き戻されたターンの入力テキストを編集領域に復元 → [tickets/tui-empty-turn-restore.md](tickets/tui-empty-turn-restore.md)
   - セッションコンテキスト長 / ウィンドウ占有率の常時表示 → [tickets/tui-context-usage-indicator.md](tickets/tui-context-usage-indicator.md)
   - Compaction 進行中のライブ表示 → [tickets/tui-compact-progress.md](tickets/tui-compact-progress.md)
+  - Assistant 応答の Markdown スタイル表示 → [tickets/tui-assistant-markdown.md](tickets/tui-assistant-markdown.md)
 - Manifest: Tool Output / File Upload 上限の分離とデフォルト緩和 → [tickets/manifest-output-upload-limits.md](tickets/manifest-output-upload-limits.md)
 - Prune: 保護境界を turn 数から末尾 token budget に置き換え → [tickets/prune-token-budget.md](tickets/prune-token-budget.md)
 - メモリ機構

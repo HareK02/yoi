@@ -1,0 +1,285 @@
+# ============================================================================
+# Pod Manifest リファレンス
+# ============================================================================
+# Pod の宣言的設定 (`PodManifest` / `PodManifestConfig`)。
+#
+# カスケード層は下から順に
+#   1. builtin defaults (`manifest::defaults`)
+#   2. user manifest    (`<config_dir>/manifest.toml`)
+#   3. project manifest (cwd から上方向に探す `.insomnia/manifest.toml`)
+#   4. programmatic overlay (呼び出し側が差し込む)
+# 上の層が同名フィールドを上書き、scope rule と skills.directories は
+# 累積マージ、tool_output.per_tool は key 単位でマージ。
+#
+# パス解決: 相対パスは「その層の manifest ファイルが置かれているディレクトリ」
+# を base に絶対パスへ解決される (overlay 層は cwd)。マージは絶対化済みの
+# 値同士で行われる。
+#
+# 凡例:
+#   - 必須        … 値が無いと resolve エラー
+#   - 任意        … 省略可
+#   - デフォルト  … 省略時に採用される値 (None なら "なし")
+#   - 値          … enum 等で取り得る値
+# ----------------------------------------------------------------------------
+
+
+# ===== [pod] ================================================================
+# Pod メタデータ。
+[pod]
+
+# 必須。Pod の表示名 (ResolveError::MissingField("pod.name") の対象)。
+name = "example-agent"
+
+# 任意。デフォルト: なし。
+# PromptCatalog の 4 つ目の overlay 層として読み込む TOML pack のパス。
+# 相対パスは manifest base 起点で解決。`worker.instruction` (`$prefix/...`)
+# とは別系統の単なるファイルパス。
+# prompt_pack = "./prompts.local.toml"
+
+
+# ===== [model] ==============================================================
+# LLM モデル設定。次の 3 形態を受ける:
+#   (a) `ref` 単独                — カタログから全部解決
+#   (b) `ref` + 一部 override     — auth など個別差し替え
+#   (c) `scheme` + `model_id` 直書き — カタログを使わない inline 指定
+# (b) / (c) では `ref` 未指定なら `scheme` / `model_id` / `auth` が必須。
+# (実際の必須判定は `crates/provider` の resolve 側で行う)
+[model]
+
+# 任意。形式: "<provider_id>/<model_id_in_ref>"。
+# 最初の `/` だけで split されるので、`openrouter/anthropic/claude-sonnet-4`
+# のように内部 model_id に `/` が含まれる場合もそのまま書ける。
+ref = "anthropic/claude-sonnet-4-6"
+
+# 任意 (ただし ref 未指定時は実質必須)。デフォルト: なし。
+# 値: "anthropic" | "openai_chat" | "openai_responses" | "gemini"
+# scheme = "anthropic"
+
+# 任意 (ref 未指定時は実質必須)。デフォルト: なし。
+# プロバイダが受け付けるモデル ID 文字列。
+# model_id = "claude-sonnet-4-20250514"
+
+# 任意。デフォルト: scheme ごとの組み込み既定 URL。
+# base_url = "https://api.anthropic.com"
+
+# 任意 (ref 未指定時は実質必須)。デフォルト: なし。
+# kind の値: "none" | "api_key" | "codex_oauth"
+#   - "none"        … 認証不要 (ローカル Ollama 等)
+#   - "api_key"     … env / file のいずれかで key を渡す。両方指定なら env 優先。
+#                     env 未指定時は scheme ごとの既定環境変数:
+#                       Anthropic                    -> INSOMNIA_API_KEY_ANTHROPIC
+#                       OpenaiChat / OpenaiResponses -> INSOMNIA_API_KEY_OPENAI
+#                       Gemini                       -> INSOMNIA_API_KEY_GEMINI
+#                     file 指定時、相対パスは manifest base 起点で解決。
+#   - "codex_oauth" … ChatGPT OAuth (`~/.codex/auth.json`)。追加フィールドなし。
+# auth = { kind = "none" }
+# auth = { kind = "api_key" }                                          # env のみ既定使用
+# auth = { kind = "api_key", env = "MY_ANTHROPIC_KEY" }
+# auth = { kind = "api_key", file = "./sk-ant.local" }
+# auth = { kind = "codex_oauth" }
+
+# 任意。デフォルト: モデルカタログ → provider.default_capability → scheme 既定
+# の順で解決される。明示 override したいときだけ書く。
+# [model.capability]
+# # 値: "none" | "sequential" | "parallel"
+# tool_calling      = "parallel"
+# # 値: "none" | "json_object" | "json_schema"
+# structured_output = "json_schema"
+# # 任意。値: 省略 (= None) | "effort" | "budget_tokens" | "both"
+# reasoning         = "both"
+# # 任意。デフォルト: false
+# vision            = false
+# # 値: { kind = "explicit", max_breakpoints = <u8> } | { kind = "auto" }
+# prompt_caching    = { kind = "explicit", max_breakpoints = 4 }
+
+
+# ===== [worker] =============================================================
+# ワーカーの生成パラメータ等。セクション自体省略可 (全フィールド任意)。
+[worker]
+
+# 任意。デフォルト: "$insomnia/default" (`defaults::DEFAULT_INSTRUCTION`)。
+# システムプロンプト本体の `PromptLoader` 参照。
+# プレフィクス: "$insomnia/..." | "$user/..." | "$workspace/..."
+# instruction = "$insomnia/default"
+
+# 任意。デフォルト: なし (プロバイダ任せ)。
+# 1 レスポンスあたりの出力 token 上限。
+# max_tokens = 4096
+
+# 任意。デフォルト: なし (無制限)。
+# 1 セッションの最大ターン数。NonZeroU32 — 0 は parse エラー。
+# max_turns = 50
+
+# 任意。デフォルト: なし (プロバイダ既定)。
+# temperature = 0.3
+
+# 任意。デフォルト: なし (プロバイダ既定)。
+# top_p = 0.9
+
+# 任意。デフォルト: なし (プロバイダ既定)。
+# top_k = 40
+
+# 任意。デフォルト: 空配列。
+# stop_sequences = ["\n\n", "</stop>"]
+
+# 任意。デフォルト: なし。
+# 値:
+#   - 文字列 effort: "minimal" | "low" | "medium" | "high" | "xhigh"
+#                    あるいは provider-native な任意ラベル文字列
+#   - 整数: Anthropic 系 thinking.budget_tokens (-1 で dynamic)
+# reasoning = "medium"
+# reasoning = -1
+
+# 任意。tool 実行 content の byte 長キャップ。
+# セクション省略時は default_max_bytes = 16 * 1024、per_tool 空。
+# [worker.tool_output]
+# # 任意。デフォルト: 16384 (`defaults::TOOL_OUTPUT_MAX_BYTES` = 16 KiB)。
+# default_max_bytes = 16384
+#
+# # 任意。デフォルト: 空マップ。tool 名キーで個別キャップ上書き。
+# # キーは tool の登録名 ("Read", "Grep", "Glob", ...)。
+# [worker.tool_output.per_tool]
+# Read = 32768
+# Grep = 4096
+
+
+# ===== [scope] ==============================================================
+# Pod がアクセスできるディレクトリ／ファイル範囲。
+#   - allow: 最低 1 件必要 (空だと ResolveError / ScopeError::EmptyAllow)。
+#            複数 allow がマッチした場合は最大の permission が採用される。
+#   - deny : 任意。マッチした deny の最小 permission *未満* に effective を
+#            押し下げる (deny.read で完全遮断、deny.write で Read 止まり)。
+# `target` は最終的に絶対パスでなければならない。manifest 内では相対 OK
+# (manifest base 起点で resolve)。
+
+# 必須: 最低 1 件の allow ルール。
+[[scope.allow]]
+# 必須。manifest 内では相対 OK (base 起点で絶対化)。
+target = "./"
+# 必須。値: "read" | "write"
+permission = "write"
+# 任意。デフォルト: true (再帰的にマッチ)。
+# false の場合、ルール自身および直下の child のみマッチ。
+# recursive = true
+
+# allow は何件でも書ける。
+# [[scope.allow]]
+# target = "/abs/docs"
+# permission = "read"
+# recursive = false
+
+# 任意。アクセスを *ルール内 permission 未満* に押し下げる。
+# [[scope.deny]]
+# target = "./secrets"
+# permission = "write"   # write を禁止 → 該当パスは Read までに降格
+# recursive = true
+#
+# [[scope.deny]]
+# target = "./secrets/key"
+# permission = "read"    # read 自体を禁止 → アクセス完全遮断
+# recursive = true
+
+
+# ===== [compaction] =========================================================
+# コンテキスト圧縮 (Prune / Compact)。セクション省略で両方無効。
+# セクションを書いた時点で Prune は有効化、Compact は閾値が None なら無効。
+# [compaction]
+#
+# # 任意。デフォルト: 3 (`defaults::PRUNE_PROTECTED_TURNS`)。
+# # pruning から保護する末尾ターン数。
+# prune_protected_turns = 3
+#
+# # 任意。デフォルト: 4096 (`defaults::PRUNE_MIN_SAVINGS`)。
+# # prune が発火するための最低節約 token 推定値。
+# prune_min_savings = 4096
+#
+# # 任意。デフォルト: なし (proactive compact 無効)。
+# # ターン間チェック (Controller post-run)。占有 token > これ で次ターン前に compact。
+# compact_threshold = 80000
+#
+# # 任意。デフォルト: なし (safety-net compact 無効)。
+# # ターン中チェック (PodInterceptor::pre_llm_request)。期待される関係:
+# #   compact_threshold < compact_request_threshold (proactive を先に発火)。
+# # 逆順設定は許容するが warn ログを出す。
+# compact_request_threshold = 90000
+#
+# # 任意。デフォルト: 8000 (`defaults::COMPACT_RETAINED_TOKENS`)。
+# # compaction 後の history 末尾に verbatim で残す token budget。
+# compact_retained_tokens = 8000
+#
+# # 任意。デフォルト: 8000 (`defaults::COMPACT_AUTO_READ_BUDGET`)。
+# # compact worker が `mark_read_required` で取り込める累計 token。
+# compact_auto_read_budget = 8000
+#
+# # 任意。デフォルト: 50000 (`defaults::COMPACT_WORKER_MAX_INPUT_TOKENS`)。
+# # compact worker 自身の累積入力 token cap。超過で abort (circuit breaker)。
+# compact_worker_max_input_tokens = 50000
+#
+# # 任意。デフォルト: メインモデルを `clone_boxed()` で複製。
+# # compact 専用モデルを使う場合のみ書く ([model] と同じ形式)。
+# # [compaction.model]
+# # ref = "anthropic/claude-haiku-4-5"
+
+
+# ===== [memory] =============================================================
+# Memory subsystem の opt-in。
+#   - セクションが *ある*    … memory tools (MemoryRead/Write/Edit) を登録、
+#                              `<workspace>/memory/` と `<workspace>/knowledge/`
+#                              の通常 write を Pod 自体に対して deny する。
+#   - セクションが *無い*    … 何も起きない (legacy 動作)。
+# `[memory]` だけ書いて中身を省略するのも有効 (全フィールド既定値で有効化)。
+# [memory]
+#
+# # 任意。デフォルト: Pod の pwd (構築時)。
+# # 必ず絶対パス (相対なら manifest base 起点で resolve)。
+# workspace_root = "/abs/path/to/workspace"
+#
+# # 任意。デフォルト: tool 側既定 = 20。
+# # MemoryQuery / KnowledgeQuery が 1 回に返す最大件数。
+# query_result_limit = 20
+#
+# # 任意。デフォルト: tool 側既定 = 3。
+# # 各マッチ前後に表示するコンテキスト行数。`query` 省略時は無視。
+# query_excerpt_lines = 3
+#
+# # 任意。デフォルト: メインモデルを `clone_boxed()` で複製。
+# # Phase 1 (extract) ワーカーのモデル ([model] と同じ形式)。
+# # Haiku / 4o-mini / Flash クラスの軽量 reasoning モデル推奨。
+# # [memory.extract_model]
+# # ref = "anthropic/claude-haiku-4-5"
+#
+# # 任意。デフォルト: なし (Phase 1 自動発火を完全停止)。
+# # 前回 extract pointer 以降の累積入力 token がこの値を超えると Phase 1 起動。
+# # ※ memory tools と resident injection は extract_threshold が None でも動く。
+# extract_threshold = 30000
+#
+# # 任意。デフォルト: 30000 (`defaults::MEMORY_EXTRACT_WORKER_MAX_INPUT_TOKENS`)。
+# # extract worker 自身の累積入力 token cap (超過で abort)。
+# extract_worker_max_input_tokens = 30000
+#
+# # 任意。デフォルト: メインモデルを `clone_boxed()` で複製。
+# # Phase 2 (consolidation) ワーカーのモデル。reasoning クラス推奨。
+# # [memory.consolidation_model]
+# # ref = "anthropic/claude-sonnet-4-6"
+#
+# # 任意。デフォルト: なし。
+# # `_staging/` のエントリ数がこの値以上で Phase 2 発火 (files / bytes は OR)。
+# consolidation_threshold_files = 50
+#
+# # 任意。デフォルト: なし。
+# # `_staging/` の総バイト数がこの値以上で Phase 2 発火 (files / bytes は OR)。
+# # files / bytes の両方が None だと Phase 2 完全無効。
+# consolidation_threshold_bytes = 1048576
+
+
+# ===== [skills] =============================================================
+# 外部 Agent Skills (`SKILL.md`) を Workflow として読み込むディレクトリ群。
+# セクション省略 = 何もロードしない (implicit な `$config_dir/skills/` 検索や
+# builtin probe は存在しない)。
+# [skills]
+#
+# # 任意。デフォルト: 空配列。
+# # 各エントリは skills *root* (root の child 各々が `<name>/SKILL.md` を持つ
+# # skill バンドル)。root 自身は skill ではない。
+# # 相対パスは manifest base 起点で解決。マージ時は層を跨いで concat される。
+# directories = [".claude/skills", ".cursor/skills"]
