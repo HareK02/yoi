@@ -3,6 +3,7 @@ mod block;
 mod cache;
 mod client;
 mod input;
+mod markdown;
 mod picker;
 mod scroll;
 mod spawn;

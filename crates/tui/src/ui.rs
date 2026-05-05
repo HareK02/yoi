@@ -591,7 +591,7 @@ fn render_block_into(lines: &mut Vec<Line<'static>>, block: &Block, width: u16, 
         }
         Block::AssistantText { text } => match mode {
             Mode::Overview => push_overview_line(lines, text, width, MessageKind::Assistant, ""),
-            _ => push_padded_lines(lines, text, MessageKind::Assistant),
+            _ => lines.extend(crate::markdown::render(text, kind_style(MessageKind::Assistant))),
         },
         Block::Thinking(t) => render_thinking(lines, t, width, mode),
         // ToolCall is dispatched in `compute_history` via `tool::render_tool`

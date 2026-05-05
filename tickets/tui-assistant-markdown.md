@@ -80,3 +80,9 @@ span 単位のラップを既に実装しているため、Markdown レンダラ
 - `crates/tui/src/ui.rs`: `Block::AssistantText` 分岐で Markdown
   レンダラを呼ぶ。`Mode::Overview` は現行のまま。
 - `crates/tui/src/main.rs` または `lib.rs`: 新モジュールの宣言。
+
+## Review
+
+- 状態: Approve
+- レビュー詳細: [./tui-assistant-markdown.review.md](./tui-assistant-markdown.review.md)
+- 日付: 2026-05-05
