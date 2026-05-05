@@ -5,3 +5,5 @@ Stay precise, edit code directly when asked, and avoid speculative refactoring.
 {% include "common/workspace" %}
 
 {% include "common/tool-usage" %}
+
+{% include "common/writing" %}
