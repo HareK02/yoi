@@ -2824,36 +2824,23 @@ fn prepare_pod_common_from_scope(
 
 /// Ingest external SKILL.md sources into the workflow registry.
 ///
-/// Sources are tried in descending priority so the registry's "first
-/// insert wins" semantics line up with the spec's collision order:
-/// 1. workspace-authored Workflows (already in `registry` from
-///    [`memory::load_workflows`])
-/// 2. workspace skills declared by the manifest's `[skills] directories`
-/// 3. user skills under `$config_dir/skills/`
-///
-/// Returns the list of shadowed-skill events the Pod should later push
-/// onto its notification buffer.
+/// Skills come exclusively from the manifest's `[skills] directories`
+/// list (resolved against the manifest base directory). Internal
+/// Workflows already loaded via [`memory::load_workflows`] take priority
+/// over skills sharing the same slug; collisions are surfaced as
+/// [`memory::ShadowedSkill`] events that the caller pushes onto the
+/// Pod's notification buffer.
 fn ingest_skills(
     registry: &mut memory::WorkflowRegistry,
     manifest: &PodManifest,
 ) -> Vec<memory::ShadowedSkill> {
     let mut shadows = Vec::new();
-    if let Some(skills_cfg) = manifest.skills.as_ref() {
-        for dir in &skills_cfg.directories {
-            for skill in memory::load_skills_from_dir(dir) {
-                let source = memory::WorkflowSource::WorkspaceSkill { dir: dir.clone() };
-                let record = skill.into_workflow_record(source);
-                if let Some(shadow) = registry.merge_skill(record) {
-                    shadows.push(shadow);
-                }
-            }
-        }
-    }
-    if let Some(user_dir) = manifest::paths::user_skills_dir() {
-        for skill in memory::load_skills_from_dir(&user_dir) {
-            let source = memory::WorkflowSource::UserSkill {
-                dir: user_dir.clone(),
-            };
+    let Some(skills_cfg) = manifest.skills.as_ref() else {
+        return shadows;
+    };
+    for dir in &skills_cfg.directories {
+        for skill in memory::load_skills_from_dir(dir) {
+            let source = memory::WorkflowSource::Skill { dir: dir.clone() };
             let record = skill.into_workflow_record(source);
             if let Some(shadow) = registry.merge_skill(record) {
                 shadows.push(shadow);
@@ -2895,29 +2882,22 @@ fn build_scope_with_memory(manifest: &PodManifest, pwd: &Path) -> Result<Scope, 
 }
 
 /// Allow-rules granting `Read` access to every skill directory the Pod
-/// will ingest: the `[skills] directories` from the manifest plus the
-/// user-level `$config_dir/skills/`. Returned rules are recursive so
-/// the entire skill bundle (`SKILL.md` + `scripts/` + `references/` +
-/// `assets/`) is readable.
+/// will ingest from the manifest's `[skills] directories`. Returned
+/// rules are recursive so the entire skill bundle (`SKILL.md` +
+/// `scripts/` + `references/` + `assets/`) is readable.
 fn skill_dir_read_rules(manifest: &PodManifest) -> Vec<ScopeRule> {
-    let mut rules = Vec::new();
-    if let Some(skills_cfg) = manifest.skills.as_ref() {
-        for dir in &skills_cfg.directories {
-            rules.push(ScopeRule {
-                target: dir.clone(),
-                permission: Permission::Read,
-                recursive: true,
-            });
-        }
-    }
-    if let Some(user_dir) = manifest::paths::user_skills_dir() {
-        rules.push(ScopeRule {
-            target: user_dir,
+    let Some(skills_cfg) = manifest.skills.as_ref() else {
+        return Vec::new();
+    };
+    skills_cfg
+        .directories
+        .iter()
+        .map(|dir| ScopeRule {
+            target: dir.clone(),
             permission: Permission::Read,
             recursive: true,
-        });
-    }
-    rules
+        })
+        .collect()
 }
 
 /// Snapshot the process's current working directory as the Pod's pwd,
@@ -3054,15 +3034,19 @@ permission = "write"
     }
 
     #[test]
-    fn skill_dir_read_rules_ignores_missing_skills_section() {
+    fn skill_dir_read_rules_empty_when_skills_section_missing() {
         let manifest = minimal_manifest_with_skills(vec![]);
         let rules = skill_dir_read_rules(&manifest);
-        // Whatever rules we get must all be Read+recursive (the user
-        // skills directory may or may not resolve depending on env).
-        for rule in &rules {
-            assert_eq!(rule.permission, Permission::Read);
-            assert!(rule.recursive);
-        }
+        assert!(rules.is_empty());
+    }
+
+    #[test]
+    fn ingest_skills_returns_empty_when_skills_section_missing() {
+        let manifest = minimal_manifest_with_skills(vec![]);
+        let mut registry = memory::WorkflowRegistry::empty();
+        let shadows = ingest_skills(&mut registry, &manifest);
+        assert!(shadows.is_empty());
+        assert!(registry.is_empty());
     }
 
     #[test]

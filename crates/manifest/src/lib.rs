@@ -45,21 +45,21 @@ pub struct PodManifest {
     #[serde(default)]
     pub memory: Option<MemoryConfig>,
     /// External Agent Skills (`SKILL.md`) directories to ingest as
-    /// Workflows in addition to the user-level `$config_dir/skills/`.
-    /// Each entry is a path to a skills *root* (i.e. a directory whose
-    /// children are individual `<name>/SKILL.md` skill bundles). Paths
-    /// are resolved against the manifest's base directory like other
-    /// path fields.
+    /// Workflows. Each entry is a path to a skills *root* (i.e. a
+    /// directory whose children are individual `<name>/SKILL.md` skill
+    /// bundles). Paths are resolved against the manifest's base
+    /// directory like other path fields. Absent ⇒ no skills loaded;
+    /// there is no implicit `$config_dir/skills/` or builtin probe.
     #[serde(default)]
     pub skills: Option<SkillsConfig>,
 }
 
-/// External Agent Skills (`SKILL.md`) ingest configuration. Off by
-/// default at the workspace level; user-level `$config_dir/skills/` is
-/// always probed regardless of this field. The intent of `directories`
-/// is to surface skills that already live in `.claude/skills/`,
-/// `.cursor/skills/`, etc. without duplicating them under the insomnia
-/// memory tree.
+/// External Agent Skills (`SKILL.md`) ingest configuration. Skills are
+/// loaded *only* from the directories listed here — there is no
+/// implicit `$config_dir/skills/` or builtin probe. Cascade-merged
+/// across manifest layers, so a user-level manifest can declare a
+/// shared skill root once while a project manifest adds its own
+/// `.claude/skills/` / `.cursor/skills/` paths on top.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SkillsConfig {
     /// Skills *roots*. Children of each root must be individual

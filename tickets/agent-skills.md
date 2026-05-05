@@ -37,17 +37,19 @@ SKILL.md frontmatter:
 
 ### ロードソース
 
-- **`$user/skills/<name>/SKILL.md`** — `$XDG_CONFIG_HOME/insomnia/skills/` 配下。**デフォルトで有効**
-- **`$workspace/skills/`** — **デフォルトで無効**。manifest の `[skills]` セクションで明示指定したパスのみ ingest する
+skill は **manifest の `[skills] directories` で明示指定したパスのみ** ingest する。`$config_dir/skills/` の自動ロードや builtin skills は持たない — manifest に書かれていないディレクトリは決して読まれない。
 
-  ```toml
-  [skills]
-  directories = [".claude/skills", ".cursor/skills"]
-  ```
+```toml
+[skills]
+directories = ["~/skills", ".claude/skills", ".cursor/skills"]
+```
 
-  各パスは workspace root からの相対 or 絶対。manifest の base directory に対して resolve する（既存 path 解決と同方針）。Claude Code / Cursor 等が既に書いている `.claude/skills/` `.cursor/skills/` をそのまま流用できることが目的。
+各パスは manifest の base directory に対して resolve する（既存 `scope.allow.target` 等と同方針）。絶対パスでも相対パスでもよく:
 
-- ビルトイン `$insomnia/skills/` は不要になるまで作らない（前ガイドラインのまま）
+- user manifest layer (`$config_dir/manifest.toml`) に書けば全 workspace 共通で使う skill 集を持てる
+- project manifest layer に書けば workspace 固有の `.claude/skills/` `.cursor/skills/` をそのまま流用できる
+
+ビルトイン `$insomnia/skills/` は不要になるまで作らない（前ガイドラインのまま）。
 
 ### SKILL → Workflow マッピング
 
@@ -72,8 +74,7 @@ skill ディレクトリ全体（`SKILL.md` 本体だけでなく `scripts/` `re
 同一 slug が複数ソースから来た場合の優先順位:
 
 1. `<workspace>/.insomnia/memory/workflow/<slug>.md`（内製 Workflow）
-2. workspace skills（manifest 指定パス）
-3. user skills（`$user/skills/`）
+2. manifest `[skills] directories` の各エントリ（**列挙順**で解決。先に書かれたディレクトリが上位）
 
 衝突時は上位を採用し、shadow した側について `Event::Notification` を発行する。「明示的に書かれた内製 Workflow が外部資産より強い」順に並べる。
 
@@ -93,20 +94,19 @@ skill ディレクトリ全体（`SKILL.md` 本体だけでなく `scripts/` `re
 
 ## 完了条件
 
-- `$user/skills/` 配下の SKILL.md が Workflow として登録され、`/<name>` で呼び出せる
-- manifest で `[skills] directories = [...]` を指定した workspace では、そのパス配下の SKILL.md だけが追加で ingest される。指定しない workspace では workspace 側 skill は 0 件
+- manifest の `[skills] directories = [...]` で指定したパス配下の SKILL.md が Workflow として登録され、`/<name>` で呼び出せる
+- `[skills]` セクションが無い manifest では skill 由来の Workflow は 0 件 (`$config_dir/skills/` 等の暗黙ロードはしない)
 - 内製 Workflow と同 slug の skill は内製優先で shadow され、Notification が発行される
 - skill ディレクトリ（SKILL.md 本体・`scripts/`・`references/`・`assets/`）が scope readable に含まれ、agent が Read ツールでアクセスできる
 - frontmatter 違反の skill は warn でスキップされ、他の skill / Pod 起動は影響を受けない
-- 単体テストで frontmatter 検証、Workflow へのマッピング、衝突解決（内製 > workspace > user）、manifest 未指定時の workspace skip が verify される
+- 単体テストで frontmatter 検証、Workflow へのマッピング、衝突解決（内製 > skill）、manifest 未指定時の skill 0 件が verify される
 
 ## 実装順序
 
 1. SKILL.md パーサと frontmatter 検証を実装。Workflow frontmatter への変換器を含めてテスト完結
-2. `$user/skills/` の loader を Workflow registry に接続
-3. manifest に `[skills] directories: Vec<PathBuf>` を追加し、workspace 側 ingest を実装
-4. 衝突解決と Notification 発行を乗せる
-5. skill ディレクトリの Scope union（read 自動 allow）
+2. manifest に `[skills] directories: Vec<PathBuf>` を追加し、ingest 経路を実装
+3. 衝突解決と Notification 発行を乗せる
+4. skill ディレクトリの Scope union（read 自動 allow）
 
 各ステップ終了時点でビルド通過・既存テスト合格を維持する。
 
@@ -121,6 +121,9 @@ skill ディレクトリ全体（`SKILL.md` 本体だけでなく `scripts/` `re
 
 ## Review
 
-- 状態: Approve
+- 状態: Approve (Round 2)
 - レビュー詳細: [./agent-skills.review.md](./agent-skills.review.md)
-- 日付: 2026-05-04
+- 経緯:
+  - 2026-05-04: 初回レビュー Approve (旧仕様: 2 ソース構成)
+  - 2026-05-05: `$config_dir/skills/` の自動 ingest を廃止、skill ロードソースを manifest `[skills] directories` のみに統合する設計変更。実装も `WorkflowSource::WorkspaceSkill` / `UserSkill` 2 バリアントから単一の `Skill { dir }` に簡略化済み
+  - 2026-05-04: Round 2 レビュー Approve。新設計の完了条件をすべて満たし、Round 1 で挙げた user_skills_dir 関連の懸念は設計変更で構造的に解消。non-blocking として manifest crate の stale doc コメント (`crates/manifest/src/lib.rs:47-62`) と受け皿チケット (`tickets/permission-extension-point.md:61`) の旧バリアント名参照が残るのみ

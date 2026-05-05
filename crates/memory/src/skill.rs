@@ -422,7 +422,7 @@ mod tests {
             "Steps\n",
         );
         let record = parse_skill_md(&path).unwrap();
-        let wf = record.into_workflow_record(WorkflowSource::UserSkill {
+        let wf = record.into_workflow_record(WorkflowSource::Skill {
             dir: dir.path().to_path_buf(),
         });
         assert_eq!(wf.slug.as_str(), "x");
@@ -431,7 +431,7 @@ mod tests {
         assert!(wf.user_invocable);
         assert!(wf.requires.is_empty());
         assert_eq!(wf.body, "Steps\n");
-        assert!(matches!(wf.source, WorkflowSource::UserSkill { .. }));
+        assert!(matches!(wf.source, WorkflowSource::Skill { .. }));
     }
 
     #[test]

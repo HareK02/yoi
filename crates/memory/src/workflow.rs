@@ -23,19 +23,16 @@ pub const WORKFLOW_DESCRIPTION_HARD_CAP: usize = 1024;
 
 /// Origin of a [`WorkflowRecord`]. Used to break ties when the same slug
 /// is provided by multiple sources: workspace-authored Workflows always
-/// win over external skills, and workspace skills win over user skills.
+/// win over external skills.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkflowSource {
     /// `<workspace>/.insomnia/memory/workflow/<slug>.md`. Authored
     /// in-tree by the project.
     WorkspaceWorkflow,
     /// SKILL.md ingested from a `[skills] directories` entry in the
-    /// project manifest. `dir` is the skills root that contained
+    /// manifest. `dir` is the skills root that contained
     /// `<slug>/SKILL.md`.
-    WorkspaceSkill { dir: PathBuf },
-    /// SKILL.md ingested from `$user/skills/`. `dir` is the user-level
-    /// skills root.
-    UserSkill { dir: PathBuf },
+    Skill { dir: PathBuf },
 }
 
 impl WorkflowSource {
@@ -43,8 +40,7 @@ impl WorkflowSource {
     pub fn label(&self) -> &'static str {
         match self {
             Self::WorkspaceWorkflow => "workspace workflow",
-            Self::WorkspaceSkill { .. } => "workspace skill",
-            Self::UserSkill { .. } => "user skill",
+            Self::Skill { .. } => "skill",
         }
     }
 }
@@ -138,11 +134,11 @@ impl WorkflowRegistry {
     }
 
     /// Insert a skill-derived record. If an existing record (internal
-    /// Workflow or higher-priority skill) already owns the slug, the
+    /// Workflow or earlier-fed skill) already owns the slug, the
     /// incoming record is dropped and a [`ShadowedSkill`] describing the
-    /// collision is returned. Callers must invoke this in
-    /// **descending-priority order** (workspace skills before user
-    /// skills); the registry does not re-rank afterwards.
+    /// collision is returned. Callers feed records in priority order
+    /// (highest first); the registry is "first-insert wins" and does
+    /// not re-rank.
     pub fn merge_skill(&mut self, record: WorkflowRecord) -> Option<ShadowedSkill> {
         if let Some(existing) = self.records.get(&record.slug) {
             return Some(ShadowedSkill {
@@ -386,7 +382,7 @@ mod tests {
             requires: Vec::new(),
             body: format!("body for {slug}"),
             path: path.to_path_buf(),
-            source: WorkflowSource::WorkspaceSkill {
+            source: WorkflowSource::Skill {
                 dir: path.parent().unwrap().parent().unwrap().to_path_buf(),
             },
         }
@@ -417,14 +413,14 @@ mod tests {
             requires: Vec::new(),
             body: "skill body".into(),
             path: skill_path.clone(),
-            source: WorkflowSource::UserSkill {
+            source: WorkflowSource::Skill {
                 dir: dir.path().join("user-skills"),
             },
         };
         let shadow = reg.merge_skill(incoming).expect("expected shadow");
         assert_eq!(shadow.slug.as_str(), "shared");
         assert!(matches!(shadow.kept_source, WorkflowSource::WorkspaceWorkflow));
-        assert!(matches!(shadow.shadowed_source, WorkflowSource::UserSkill { .. }));
+        assert!(matches!(shadow.shadowed_source, WorkflowSource::Skill { .. }));
         // The kept record is still the workspace workflow.
         let kept = reg.get(&Slug::parse("shared").unwrap()).unwrap();
         assert!(matches!(kept.source, WorkflowSource::WorkspaceWorkflow));
@@ -432,40 +428,42 @@ mod tests {
     }
 
     #[test]
-    fn merge_skill_priority_workspace_over_user() {
+    fn merge_skill_first_fed_wins_on_collision() {
         let mut reg = WorkflowRegistry::empty();
-        let ws_path = std::path::PathBuf::from("/ws/skills/x/SKILL.md");
-        let user_path = std::path::PathBuf::from("/user/skills/x/SKILL.md");
-        let ws_record = WorkflowRecord {
+        let first_path = std::path::PathBuf::from("/a/skills/x/SKILL.md");
+        let second_path = std::path::PathBuf::from("/b/skills/x/SKILL.md");
+        let first = WorkflowRecord {
             slug: Slug::parse("x").unwrap(),
-            description: "ws".into(),
+            description: "first".into(),
             model_invokation: true,
             user_invocable: true,
             requires: Vec::new(),
-            body: "ws body".into(),
-            path: ws_path.clone(),
-            source: WorkflowSource::WorkspaceSkill {
-                dir: std::path::PathBuf::from("/ws/skills"),
+            body: "first body".into(),
+            path: first_path.clone(),
+            source: WorkflowSource::Skill {
+                dir: std::path::PathBuf::from("/a/skills"),
             },
         };
-        let user_record = WorkflowRecord {
+        let second = WorkflowRecord {
             slug: Slug::parse("x").unwrap(),
-            description: "user".into(),
+            description: "second".into(),
             model_invokation: true,
             user_invocable: true,
             requires: Vec::new(),
-            body: "user body".into(),
-            path: user_path.clone(),
-            source: WorkflowSource::UserSkill {
-                dir: std::path::PathBuf::from("/user/skills"),
+            body: "second body".into(),
+            path: second_path.clone(),
+            source: WorkflowSource::Skill {
+                dir: std::path::PathBuf::from("/b/skills"),
             },
         };
-        // Caller is required to feed in priority order: workspace first,
-        // user second. The user-side record then gets shadowed.
-        assert!(reg.merge_skill(ws_record).is_none());
-        let shadow = reg.merge_skill(user_record).expect("user should shadow");
-        assert_eq!(shadow.kept_path, ws_path);
-        assert!(matches!(shadow.kept_source, WorkflowSource::WorkspaceSkill { .. }));
+        // Caller is responsible for feeding in priority order; the
+        // registry just keeps whichever arrives first.
+        assert!(reg.merge_skill(first).is_none());
+        let shadow = reg
+            .merge_skill(second)
+            .expect("later-fed skill must shadow");
+        assert_eq!(shadow.kept_path, first_path);
+        assert!(matches!(shadow.kept_source, WorkflowSource::Skill { .. }));
     }
 
     #[test]
@@ -474,15 +472,15 @@ mod tests {
             slug: Slug::parse("x").unwrap(),
             kept_source: WorkflowSource::WorkspaceWorkflow,
             kept_path: std::path::PathBuf::from("/ws/.insomnia/memory/workflow/x.md"),
-            shadowed_source: WorkflowSource::UserSkill {
-                dir: std::path::PathBuf::from("/user/skills"),
+            shadowed_source: WorkflowSource::Skill {
+                dir: std::path::PathBuf::from("/skills"),
             },
-            shadowed_path: std::path::PathBuf::from("/user/skills/x/SKILL.md"),
+            shadowed_path: std::path::PathBuf::from("/skills/x/SKILL.md"),
         };
         let msg = s.message();
         assert!(msg.contains("/x"));
         assert!(msg.contains("workspace workflow"));
-        assert!(msg.contains("user skill"));
+        assert!(msg.contains("skill"));
     }
 
     #[test]

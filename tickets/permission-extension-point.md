@@ -58,7 +58,7 @@ action = "allow"
 本チケットの Permission 層が固まった時点で、Skill 由来 Workflow を実行中のみ当該 skill の `allowed-tools` リストに含まれるツールしか走れない形で反映する。スコープは「Workflow 実行中」相当 (Workflow の system message が context に乗っているターン) に限定する想定。skill 単位で local な permission 集合を持つので、グローバルな `[[permission]]` ルールとは独立に評価する。
 
 実装上の足がかり:
-- `WorkflowRecord` の出所は `WorkflowSource::WorkspaceSkill { dir }` / `UserSkill { dir }` で識別済み (`crates/memory/src/workflow.rs`)
+- `WorkflowRecord` の出所は `WorkflowSource::Skill { dir }` で識別済み (`crates/memory/src/workflow.rs`)。`dir` は manifest `[skills] directories` に書かれた skill ルートそのもの
 - 受け皿実装時に `SkillFrontmatter::allowed_tools` の保持先を `WorkflowRecord` に伸ばすか、別の SkillRecord registry を持つかは本チケット内で決める
 - 現状の `tracing::warn!` は受け皿実装と同時に消す
 
