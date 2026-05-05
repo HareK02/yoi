@@ -79,6 +79,12 @@ pub fn user_prompts_dir() -> Option<PathBuf> {
     Some(config_dir()?.join("prompts"))
 }
 
+/// `<config_dir>/skills/` — user-level Agent Skills ライブラリ。
+/// 配下は `<name>/SKILL.md` の集合として読まれる。
+pub fn user_skills_dir() -> Option<PathBuf> {
+    Some(config_dir()?.join("skills"))
+}
+
 /// `<config_dir>/prompts.toml` — user prompt pack。
 pub fn user_pack_file() -> Option<PathBuf> {
     Some(config_dir()?.join("prompts.toml"))

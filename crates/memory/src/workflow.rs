@@ -21,6 +21,34 @@ use crate::workspace::WorkspaceLayout;
 /// Mirrors agent-skills and resident Knowledge descriptions.
 pub const WORKFLOW_DESCRIPTION_HARD_CAP: usize = 1024;
 
+/// Origin of a [`WorkflowRecord`]. Used to break ties when the same slug
+/// is provided by multiple sources: workspace-authored Workflows always
+/// win over external skills, and workspace skills win over user skills.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkflowSource {
+    /// `<workspace>/.insomnia/memory/workflow/<slug>.md`. Authored
+    /// in-tree by the project.
+    WorkspaceWorkflow,
+    /// SKILL.md ingested from a `[skills] directories` entry in the
+    /// project manifest. `dir` is the skills root that contained
+    /// `<slug>/SKILL.md`.
+    WorkspaceSkill { dir: PathBuf },
+    /// SKILL.md ingested from `$user/skills/`. `dir` is the user-level
+    /// skills root.
+    UserSkill { dir: PathBuf },
+}
+
+impl WorkflowSource {
+    /// Human-readable label used in shadow-notification messages.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::WorkspaceWorkflow => "workspace workflow",
+            Self::WorkspaceSkill { .. } => "workspace skill",
+            Self::UserSkill { .. } => "user skill",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkflowRecord {
     pub slug: Slug,
@@ -31,6 +59,37 @@ pub struct WorkflowRecord {
     /// Markdown body after the closing frontmatter delimiter.
     pub body: String,
     pub path: PathBuf,
+    /// Where this record was loaded from. Determines shadowing priority
+    /// when [`WorkflowRegistry::merge_skill`] encounters a slug
+    /// collision.
+    pub source: WorkflowSource,
+}
+
+/// Returned by [`WorkflowRegistry::merge_skill`] when an incoming skill is
+/// shadowed by an existing record (either an internal Workflow or a
+/// higher-priority skill). Carries enough context for a `Notification` to
+/// explain which side won.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShadowedSkill {
+    pub slug: Slug,
+    pub kept_source: WorkflowSource,
+    pub kept_path: PathBuf,
+    pub shadowed_source: WorkflowSource,
+    pub shadowed_path: PathBuf,
+}
+
+impl ShadowedSkill {
+    /// One-line message for `Notification` payloads.
+    pub fn message(&self) -> String {
+        format!(
+            "skill /{slug} from {shadowed_label} ({shadowed_path}) was shadowed by existing {kept_label} ({kept_path})",
+            slug = self.slug,
+            shadowed_label = self.shadowed_source.label(),
+            shadowed_path = self.shadowed_path.display(),
+            kept_label = self.kept_source.label(),
+            kept_path = self.kept_path.display(),
+        )
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -76,6 +135,26 @@ impl WorkflowRegistry {
             .filter(|record| record.user_invocable && record.slug.as_str().starts_with(prefix))
             .map(|record| record.slug.to_string())
             .collect()
+    }
+
+    /// Insert a skill-derived record. If an existing record (internal
+    /// Workflow or higher-priority skill) already owns the slug, the
+    /// incoming record is dropped and a [`ShadowedSkill`] describing the
+    /// collision is returned. Callers must invoke this in
+    /// **descending-priority order** (workspace skills before user
+    /// skills); the registry does not re-rank afterwards.
+    pub fn merge_skill(&mut self, record: WorkflowRecord) -> Option<ShadowedSkill> {
+        if let Some(existing) = self.records.get(&record.slug) {
+            return Some(ShadowedSkill {
+                slug: record.slug.clone(),
+                kept_source: existing.source.clone(),
+                kept_path: existing.path.clone(),
+                shadowed_source: record.source,
+                shadowed_path: record.path,
+            });
+        }
+        self.records.insert(record.slug.clone(), record);
+        None
     }
 }
 
@@ -176,6 +255,7 @@ pub fn load_workflows(layout: &WorkspaceLayout) -> Result<WorkflowRegistry, Work
             requires: frontmatter.requires,
             body: body.to_string(),
             path: path.clone(),
+            source: WorkflowSource::WorkspaceWorkflow,
         };
         records.insert(slug.clone(), record);
     }
@@ -295,6 +375,114 @@ mod tests {
         write_workflow(dir.path(), "bad", "model_invokation: false", "Body");
         let err = load_workflows(&layout).unwrap_err();
         assert!(matches!(err, WorkflowLoadError::Frontmatter { .. }));
+    }
+
+    fn skill_record(slug: &str, path: &Path) -> WorkflowRecord {
+        WorkflowRecord {
+            slug: Slug::parse(slug).unwrap(),
+            description: format!("desc {slug}"),
+            model_invokation: true,
+            user_invocable: true,
+            requires: Vec::new(),
+            body: format!("body for {slug}"),
+            path: path.to_path_buf(),
+            source: WorkflowSource::WorkspaceSkill {
+                dir: path.parent().unwrap().parent().unwrap().to_path_buf(),
+            },
+        }
+    }
+
+    #[test]
+    fn merge_skill_inserts_when_no_collision() {
+        let mut reg = WorkflowRegistry::empty();
+        let path = std::path::PathBuf::from("/tmp/skills/x/SKILL.md");
+        let shadow = reg.merge_skill(skill_record("x", &path));
+        assert!(shadow.is_none());
+        assert_eq!(reg.len(), 1);
+    }
+
+    #[test]
+    fn merge_skill_shadows_existing_workflow() {
+        let (dir, layout) = setup();
+        write_workflow(dir.path(), "shared", "description: Internal", "internal body");
+        let mut reg = load_workflows(&layout).unwrap();
+        let skill_path = dir.path().join("user-skills").join("shared").join("SKILL.md");
+        std::fs::create_dir_all(skill_path.parent().unwrap()).unwrap();
+        std::fs::write(&skill_path, "ignored").unwrap();
+        let incoming = WorkflowRecord {
+            slug: Slug::parse("shared").unwrap(),
+            description: "From skill".into(),
+            model_invokation: true,
+            user_invocable: true,
+            requires: Vec::new(),
+            body: "skill body".into(),
+            path: skill_path.clone(),
+            source: WorkflowSource::UserSkill {
+                dir: dir.path().join("user-skills"),
+            },
+        };
+        let shadow = reg.merge_skill(incoming).expect("expected shadow");
+        assert_eq!(shadow.slug.as_str(), "shared");
+        assert!(matches!(shadow.kept_source, WorkflowSource::WorkspaceWorkflow));
+        assert!(matches!(shadow.shadowed_source, WorkflowSource::UserSkill { .. }));
+        // The kept record is still the workspace workflow.
+        let kept = reg.get(&Slug::parse("shared").unwrap()).unwrap();
+        assert!(matches!(kept.source, WorkflowSource::WorkspaceWorkflow));
+        assert_eq!(kept.body, "internal body");
+    }
+
+    #[test]
+    fn merge_skill_priority_workspace_over_user() {
+        let mut reg = WorkflowRegistry::empty();
+        let ws_path = std::path::PathBuf::from("/ws/skills/x/SKILL.md");
+        let user_path = std::path::PathBuf::from("/user/skills/x/SKILL.md");
+        let ws_record = WorkflowRecord {
+            slug: Slug::parse("x").unwrap(),
+            description: "ws".into(),
+            model_invokation: true,
+            user_invocable: true,
+            requires: Vec::new(),
+            body: "ws body".into(),
+            path: ws_path.clone(),
+            source: WorkflowSource::WorkspaceSkill {
+                dir: std::path::PathBuf::from("/ws/skills"),
+            },
+        };
+        let user_record = WorkflowRecord {
+            slug: Slug::parse("x").unwrap(),
+            description: "user".into(),
+            model_invokation: true,
+            user_invocable: true,
+            requires: Vec::new(),
+            body: "user body".into(),
+            path: user_path.clone(),
+            source: WorkflowSource::UserSkill {
+                dir: std::path::PathBuf::from("/user/skills"),
+            },
+        };
+        // Caller is required to feed in priority order: workspace first,
+        // user second. The user-side record then gets shadowed.
+        assert!(reg.merge_skill(ws_record).is_none());
+        let shadow = reg.merge_skill(user_record).expect("user should shadow");
+        assert_eq!(shadow.kept_path, ws_path);
+        assert!(matches!(shadow.kept_source, WorkflowSource::WorkspaceSkill { .. }));
+    }
+
+    #[test]
+    fn shadow_message_is_human_readable() {
+        let s = ShadowedSkill {
+            slug: Slug::parse("x").unwrap(),
+            kept_source: WorkflowSource::WorkspaceWorkflow,
+            kept_path: std::path::PathBuf::from("/ws/.insomnia/memory/workflow/x.md"),
+            shadowed_source: WorkflowSource::UserSkill {
+                dir: std::path::PathBuf::from("/user/skills"),
+            },
+            shadowed_path: std::path::PathBuf::from("/user/skills/x/SKILL.md"),
+        };
+        let msg = s.message();
+        assert!(msg.contains("/x"));
+        assert!(msg.contains("workspace workflow"));
+        assert!(msg.contains("user skill"));
     }
 
     #[test]

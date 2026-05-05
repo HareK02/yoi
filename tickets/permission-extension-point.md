@@ -49,6 +49,19 @@ action = "allow"
 2. **deny/allow の実装**（ツール実装時）: PreToolCall Hook でパターン評価
 3. **ask の実装**（Protocol 拡張時）: Method/Event に Permission 関連メッセージを追加
 
+## 受け皿になる外部仕様
+
+### Agent Skills `allowed-tools`
+
+`tickets/agent-skills.md` で ingest した SKILL.md の frontmatter には agent-skills 仕様の experimental field である `allowed-tools` (例: `["Read", "Bash"]`) が含まれる場合がある。`crates/memory/src/skill.rs::parse_skill_md` 時点では `tracing::warn!` で受け流しているだけで、実効化していない。
+
+本チケットの Permission 層が固まった時点で、Skill 由来 Workflow を実行中のみ当該 skill の `allowed-tools` リストに含まれるツールしか走れない形で反映する。スコープは「Workflow 実行中」相当 (Workflow の system message が context に乗っているターン) に限定する想定。skill 単位で local な permission 集合を持つので、グローバルな `[[permission]]` ルールとは独立に評価する。
+
+実装上の足がかり:
+- `WorkflowRecord` の出所は `WorkflowSource::WorkspaceSkill { dir }` / `UserSkill { dir }` で識別済み (`crates/memory/src/workflow.rs`)
+- 受け皿実装時に `SkillFrontmatter::allowed_tools` の保持先を `WorkflowRecord` に伸ばすか、別の SkillRecord registry を持つかは本チケット内で決める
+- 現状の `tracing::warn!` は受け皿実装と同時に消す
+
 ## 依存チケット
 
 - ~~[remove-hook-module.md](remove-hook-module.md)~~ — 完了。PreToolCall は Pod 層の `hook::Hook<PreToolCall>` として利用可能

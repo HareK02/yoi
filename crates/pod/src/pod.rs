@@ -12,7 +12,7 @@ use session_store::{EntryHash, PodScopeSnapshot, SessionId, SessionStartState, S
 use tracing::{info, warn};
 
 use manifest::{
-    PodManifest, PodManifestConfig, ResolveError, Scope, ScopeConfig, ScopeError, ScopeRule,
+    Permission, PodManifest, PodManifestConfig, ResolveError, Scope, ScopeConfig, ScopeError, ScopeRule,
     SharedScope, WorkerManifest,
 };
 
@@ -2225,7 +2225,8 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
         store: St,
         loader: PromptLoader,
     ) -> Result<Self, PodError> {
-        let common = prepare_pod_common(&manifest, &loader, /* parse_template */ true)?;
+        let mut common = prepare_pod_common(&manifest, &loader, /* parse_template */ true)?;
+        let skill_shadows = std::mem::take(&mut common.skill_shadows);
 
         // Session creation is deferred to the first run (see
         // `ensure_session_head`) so the SessionStart entry can capture
@@ -2291,6 +2292,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             user_segments: Vec::new(),
         };
         pod.apply_prune_from_manifest();
+        drain_skill_shadows(&pod, skill_shadows);
         Ok(pod)
     }
 
@@ -2308,7 +2310,8 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
         loader: PromptLoader,
         callback_socket: PathBuf,
     ) -> Result<Self, PodError> {
-        let common = prepare_pod_common(&manifest, &loader, /* parse_template */ true)?;
+        let mut common = prepare_pod_common(&manifest, &loader, /* parse_template */ true)?;
+        let skill_shadows = std::mem::take(&mut common.skill_shadows);
 
         let session_id = session_store::new_session_id();
         let scope_allocation = pod_registry::adopt_allocation(
@@ -2359,6 +2362,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             user_segments: Vec::new(),
         };
         pod.apply_prune_from_manifest();
+        drain_skill_shadows(&pod, skill_shadows);
         Ok(pod)
     }
 
@@ -2395,7 +2399,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             .clone()
             .ok_or(PodError::SessionScopeMissing { session_id })?;
 
-        let common = prepare_pod_common_with_scope(
+        let mut common = prepare_pod_common_with_scope(
             &manifest,
             &loader,
             /* parse_template */ false,
@@ -2404,6 +2408,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
                 deny: scope_snapshot.deny,
             },
         )?;
+        let skill_shadows = std::mem::take(&mut common.skill_shadows);
 
         // Atomic: register_pod inside install_top_level rejects when
         // another live allocation already holds `session_id`. Wrapping
@@ -2493,6 +2498,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             user_segments: state.user_segments,
         };
         pod.apply_prune_from_manifest();
+        drain_skill_shadows(&pod, skill_shadows);
         Ok(pod)
     }
 
@@ -2734,6 +2740,11 @@ struct PodCommon {
     workflow_registry: memory::WorkflowRegistry,
     memory_layout: Option<memory::WorkspaceLayout>,
     system_prompt_template: Option<SystemPromptTemplate>,
+    /// SKILL.md shadow events surfaced during workflow-registry build.
+    /// The Pod constructor drains these into the notify buffer right
+    /// after the Pod is materialised so the first LLM request observes
+    /// any skill ↔ workflow collisions.
+    skill_shadows: Vec<memory::ShadowedSkill>,
 }
 
 /// Resolve pwd / scope / LLM client / prompt catalog from a validated
@@ -2784,10 +2795,11 @@ fn prepare_pod_common_from_scope(
         .memory
         .as_ref()
         .map(|mem| memory::WorkspaceLayout::resolve(mem, &pwd));
-    let workflow_registry = match memory_layout.as_ref() {
+    let mut workflow_registry = match memory_layout.as_ref() {
         Some(layout) => memory::load_workflows(layout).map_err(PodError::WorkflowLoad)?,
         None => memory::WorkflowRegistry::empty(),
     };
+    let skill_shadows = ingest_skills(&mut workflow_registry, manifest);
 
     let system_prompt_template = if parse_template {
         Some(
@@ -2806,22 +2818,106 @@ fn prepare_pod_common_from_scope(
         workflow_registry,
         memory_layout,
         system_prompt_template,
+        skill_shadows,
     })
+}
+
+/// Ingest external SKILL.md sources into the workflow registry.
+///
+/// Sources are tried in descending priority so the registry's "first
+/// insert wins" semantics line up with the spec's collision order:
+/// 1. workspace-authored Workflows (already in `registry` from
+///    [`memory::load_workflows`])
+/// 2. workspace skills declared by the manifest's `[skills] directories`
+/// 3. user skills under `$config_dir/skills/`
+///
+/// Returns the list of shadowed-skill events the Pod should later push
+/// onto its notification buffer.
+fn ingest_skills(
+    registry: &mut memory::WorkflowRegistry,
+    manifest: &PodManifest,
+) -> Vec<memory::ShadowedSkill> {
+    let mut shadows = Vec::new();
+    if let Some(skills_cfg) = manifest.skills.as_ref() {
+        for dir in &skills_cfg.directories {
+            for skill in memory::load_skills_from_dir(dir) {
+                let source = memory::WorkflowSource::WorkspaceSkill { dir: dir.clone() };
+                let record = skill.into_workflow_record(source);
+                if let Some(shadow) = registry.merge_skill(record) {
+                    shadows.push(shadow);
+                }
+            }
+        }
+    }
+    if let Some(user_dir) = manifest::paths::user_skills_dir() {
+        for skill in memory::load_skills_from_dir(&user_dir) {
+            let source = memory::WorkflowSource::UserSkill {
+                dir: user_dir.clone(),
+            };
+            let record = skill.into_workflow_record(source);
+            if let Some(shadow) = registry.merge_skill(record) {
+                shadows.push(shadow);
+            }
+        }
+    }
+    shadows
+}
+
+/// Drain skill-ingest shadow events into the Pod's notify buffer so the
+/// first LLM request renders them as system-message attachments.
+fn drain_skill_shadows<C, S>(pod: &Pod<C, S>, shadows: Vec<memory::ShadowedSkill>)
+where
+    C: LlmClient,
+    S: Store,
+{
+    for shadow in shadows {
+        pod.push_notify(format!("[Skill shadowed] {}", shadow.message()));
+    }
 }
 
 /// Build the Pod's runtime [`Scope`] from the manifest, layering the
 /// memory subsystem's deny-write rules on top when `[memory]` is
-/// present. The deny rules cap generic CRUD tools so they cannot
-/// touch `<workspace>/memory/` or `<workspace>/knowledge/` while the
-/// memory tools (registered separately) bypass `ScopedFs` and write
-/// through `std::fs` directly.
+/// present, and read-allow rules for any external Agent Skills
+/// directories ingested. The deny rules cap generic CRUD tools so they
+/// cannot touch `<workspace>/memory/` or `<workspace>/knowledge/` while
+/// the memory tools (registered separately) bypass `ScopedFs` and write
+/// through `std::fs` directly. Skill directories are added at
+/// `Permission::Read` so the agent can `Read` `scripts/` / `references/`
+/// / `assets/` referenced by the Workflow body.
 fn build_scope_with_memory(manifest: &PodManifest, pwd: &Path) -> Result<Scope, PodError> {
     let mut scope_config = manifest.scope.clone();
     if let Some(mem) = manifest.memory.as_ref() {
         let layout = memory::WorkspaceLayout::resolve(mem, pwd);
         scope_config.deny.extend(memory::deny_write_rules(&layout));
     }
+    scope_config.allow.extend(skill_dir_read_rules(manifest));
     Scope::from_config(&scope_config).map_err(PodError::Scope)
+}
+
+/// Allow-rules granting `Read` access to every skill directory the Pod
+/// will ingest: the `[skills] directories` from the manifest plus the
+/// user-level `$config_dir/skills/`. Returned rules are recursive so
+/// the entire skill bundle (`SKILL.md` + `scripts/` + `references/` +
+/// `assets/`) is readable.
+fn skill_dir_read_rules(manifest: &PodManifest) -> Vec<ScopeRule> {
+    let mut rules = Vec::new();
+    if let Some(skills_cfg) = manifest.skills.as_ref() {
+        for dir in &skills_cfg.directories {
+            rules.push(ScopeRule {
+                target: dir.clone(),
+                permission: Permission::Read,
+                recursive: true,
+            });
+        }
+    }
+    if let Some(user_dir) = manifest::paths::user_skills_dir() {
+        rules.push(ScopeRule {
+            target: user_dir,
+            permission: Permission::Read,
+            recursive: true,
+        });
+    }
+    rules
 }
 
 /// Snapshot the process's current working directory as the Pod's pwd,
@@ -2910,5 +3006,83 @@ mod build_summary_prompt_tests {
         ];
         let prompt = build_summary_prompt(&items);
         assert_eq!(prompt, "[User] fix the bug\n\n[Assistant] done");
+    }
+
+    fn minimal_manifest_with_skills(dirs: Vec<PathBuf>) -> PodManifest {
+        // Construct the smallest possible PodManifest that resolves; only
+        // the `skills` field matters for `skill_dir_read_rules`.
+        let toml_str = r#"
+[pod]
+name = "x"
+
+[model]
+scheme = "anthropic"
+model_id = "claude-sonnet-4-20250514"
+
+[worker]
+
+[[scope.allow]]
+target = "/abs/scope"
+permission = "write"
+"#;
+        let mut manifest = PodManifest::from_toml(toml_str).unwrap();
+        if !dirs.is_empty() {
+            manifest.skills = Some(manifest::SkillsConfig { directories: dirs });
+        }
+        manifest
+    }
+
+    #[test]
+    fn skill_dir_read_rules_lists_workspace_skill_directories() {
+        let manifest = minimal_manifest_with_skills(vec![
+            PathBuf::from("/abs/skills-a"),
+            PathBuf::from("/abs/skills-b"),
+        ]);
+        let rules = skill_dir_read_rules(&manifest);
+        let workspace_rules: Vec<_> = rules
+            .iter()
+            .filter(|r| {
+                r.target == PathBuf::from("/abs/skills-a")
+                    || r.target == PathBuf::from("/abs/skills-b")
+            })
+            .collect();
+        assert_eq!(workspace_rules.len(), 2);
+        for rule in &workspace_rules {
+            assert_eq!(rule.permission, Permission::Read);
+            assert!(rule.recursive);
+        }
+    }
+
+    #[test]
+    fn skill_dir_read_rules_ignores_missing_skills_section() {
+        let manifest = minimal_manifest_with_skills(vec![]);
+        let rules = skill_dir_read_rules(&manifest);
+        // Whatever rules we get must all be Read+recursive (the user
+        // skills directory may or may not resolve depending on env).
+        for rule in &rules {
+            assert_eq!(rule.permission, Permission::Read);
+            assert!(rule.recursive);
+        }
+    }
+
+    #[test]
+    fn ingest_skills_loads_from_workspace_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let skills_root = dir.path().join("skills");
+        std::fs::create_dir_all(skills_root.join("alpha")).unwrap();
+        std::fs::write(
+            skills_root.join("alpha").join("SKILL.md"),
+            "---\nname: alpha\ndescription: Alpha skill\n---\nbody\n",
+        )
+        .unwrap();
+
+        let manifest = minimal_manifest_with_skills(vec![skills_root.clone()]);
+        let mut registry = memory::WorkflowRegistry::empty();
+        let shadows = ingest_skills(&mut registry, &manifest);
+
+        // workspace skill `alpha` should be registered (no collision).
+        assert!(registry.get(&memory::Slug::parse("alpha").unwrap()).is_some());
+        // No workflow exists to shadow `alpha`, so no shadow event for it.
+        assert!(shadows.iter().all(|s| s.slug.as_str() != "alpha"));
     }
 }

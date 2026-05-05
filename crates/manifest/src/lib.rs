@@ -44,6 +44,30 @@ pub struct PodManifest {
     /// memory tools registered.
     #[serde(default)]
     pub memory: Option<MemoryConfig>,
+    /// External Agent Skills (`SKILL.md`) directories to ingest as
+    /// Workflows in addition to the user-level `$config_dir/skills/`.
+    /// Each entry is a path to a skills *root* (i.e. a directory whose
+    /// children are individual `<name>/SKILL.md` skill bundles). Paths
+    /// are resolved against the manifest's base directory like other
+    /// path fields.
+    #[serde(default)]
+    pub skills: Option<SkillsConfig>,
+}
+
+/// External Agent Skills (`SKILL.md`) ingest configuration. Off by
+/// default at the workspace level; user-level `$config_dir/skills/` is
+/// always probed regardless of this field. The intent of `directories`
+/// is to surface skills that already live in `.claude/skills/`,
+/// `.cursor/skills/`, etc. without duplicating them under the insomnia
+/// memory tree.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SkillsConfig {
+    /// Skills *roots*. Children of each root must be individual
+    /// `<name>/SKILL.md` bundles; the directory itself is not a skill.
+    /// Resolved against the manifest base directory before
+    /// [`PodManifest`] is materialised.
+    #[serde(default)]
+    pub directories: Vec<PathBuf>,
 }
 
 /// Memory subsystem configuration. Presence in the manifest enables

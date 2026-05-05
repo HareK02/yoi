@@ -15,8 +15,8 @@ use serde::{Deserialize, Serialize};
 use crate::defaults;
 use crate::model::{AuthRef, ModelManifest, ReasoningControl};
 use crate::{
-    CompactionConfig, MemoryConfig, PodManifest, PodMeta, ScopeConfig, ToolOutputLimits,
-    WorkerManifest,
+    CompactionConfig, MemoryConfig, PodManifest, PodMeta, ScopeConfig, SkillsConfig,
+    ToolOutputLimits, WorkerManifest,
 };
 
 /// Partial-form Pod manifest. Every field is optional; one or more
@@ -41,6 +41,9 @@ pub struct PodManifestConfig {
     /// Memory subsystem opt-in. See [`MemoryConfig`].
     #[serde(default)]
     pub memory: Option<MemoryConfig>,
+    /// External Agent Skills directories. See [`crate::SkillsConfig`].
+    #[serde(default)]
+    pub skills: Option<SkillsConfig>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -183,6 +186,11 @@ impl PodManifestConfig {
         {
             resolve_auth_file(&mut cp.auth, base);
         }
+        if let Some(ref mut skills) = self.skills {
+            for dir in &mut skills.directories {
+                *dir = join_if_relative(base, dir);
+            }
+        }
         self
     }
 
@@ -202,7 +210,15 @@ impl PodManifestConfig {
                 CompactionConfigPartial::merge,
             ),
             memory: merge_option(self.memory, upper.memory, MemoryConfig::merge),
+            skills: merge_option(self.skills, upper.skills, SkillsConfig::merge),
         }
+    }
+}
+
+impl SkillsConfig {
+    fn merge(mut self, upper: Self) -> Self {
+        self.directories.extend(upper.directories);
+        self
     }
 }
 
@@ -411,6 +427,12 @@ impl TryFrom<PodManifestConfig> for PodManifest {
             })
             .transpose()?;
 
+        if let Some(ref skills) = cfg.skills {
+            for dir in &skills.directories {
+                ensure_absolute("skills.directories", dir)?;
+            }
+        }
+
         Ok(PodManifest {
             pod: PodMeta { name, prompt_pack },
             model: cfg.model,
@@ -418,6 +440,7 @@ impl TryFrom<PodManifestConfig> for PodManifest {
             scope: cfg.scope,
             compaction,
             memory: cfg.memory,
+            skills: cfg.skills,
         })
     }
 }
@@ -461,6 +484,7 @@ mod tests {
             },
             compaction: None,
             memory: None,
+            skills: None,
         }
     }
 
@@ -890,6 +914,73 @@ name = "dbg"
         assert_eq!(manifest.pod.name, "dbg");
         assert_eq!(manifest.model.scheme, Some(SchemeKind::Anthropic));
         assert_eq!(manifest.scope.allow.len(), 1);
+    }
+
+    #[test]
+    fn skills_directories_resolved_against_base() {
+        let mut cfg = minimal_valid();
+        cfg.skills = Some(SkillsConfig {
+            directories: vec![PathBuf::from(".claude/skills"), PathBuf::from("/abs/elsewhere")],
+        });
+        let resolved = cfg.resolve_paths(Path::new("/workspace/proj"));
+        let dirs = resolved.skills.as_ref().unwrap().directories.clone();
+        assert_eq!(dirs[0], PathBuf::from("/workspace/proj/.claude/skills"));
+        assert_eq!(dirs[1], PathBuf::from("/abs/elsewhere"));
+    }
+
+    #[test]
+    fn skills_relative_path_rejected_post_resolve() {
+        let mut cfg = minimal_valid();
+        cfg.skills = Some(SkillsConfig {
+            directories: vec![PathBuf::from("relative/skills")],
+        });
+        let err = PodManifest::try_from(cfg).unwrap_err();
+        assert!(matches!(
+            err,
+            ResolveError::RelativePath {
+                field: "skills.directories",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn skills_merge_extends_directories() {
+        let lower = PodManifestConfig {
+            skills: Some(SkillsConfig {
+                directories: vec![PathBuf::from("/a")],
+            }),
+            ..Default::default()
+        };
+        let upper = PodManifestConfig {
+            skills: Some(SkillsConfig {
+                directories: vec![PathBuf::from("/b")],
+            }),
+            ..Default::default()
+        };
+        let merged = lower.merge(upper);
+        let dirs = merged.skills.unwrap().directories;
+        assert_eq!(dirs, vec![PathBuf::from("/a"), PathBuf::from("/b")]);
+    }
+
+    #[test]
+    fn from_toml_parses_skills_section() {
+        let toml = r#"
+[pod]
+name = "x"
+
+[skills]
+directories = [".claude/skills", ".cursor/skills"]
+"#;
+        let cfg = PodManifestConfig::from_toml(toml).unwrap();
+        let dirs = cfg.skills.unwrap().directories;
+        assert_eq!(
+            dirs,
+            vec![
+                PathBuf::from(".claude/skills"),
+                PathBuf::from(".cursor/skills"),
+            ]
+        );
     }
 
     #[test]

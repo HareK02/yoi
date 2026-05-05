@@ -118,3 +118,9 @@ skill ディレクトリ全体（`SKILL.md` 本体だけでなく `scripts/` `re
 - 検証 CLI: https://github.com/agentskills/agentskills/tree/main/skills-ref
 - 前提: `tickets/workflow.md`
 - 関連: `tickets/permission-extension-point.md`（`allowed-tools` 実効化の受け皿）、`docs/plan/workflow.md`、`docs/plan/memory.md`、`docs/ref/memory-systems.md` §Skill Library
+
+## Review
+
+- 状態: Approve
+- レビュー詳細: [./agent-skills.review.md](./agent-skills.review.md)
+- 日付: 2026-05-04
