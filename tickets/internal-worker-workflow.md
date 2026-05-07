@@ -8,7 +8,7 @@ INSOMNIA が内部で固定 prompt を持って disposable Worker / 専用 Pod �
 - Phase 2 統合 + 整理（`tickets/memory-phase2-consolidation.md`、本チケット時点では実装中 / 直前）
 - Compact（`PromptCatalog::compact_system`）
 
-これらは実装内 `&str` 定数や `PromptCatalog` の overlay で管理されており、prompt の調整や運用カスタマイズが「コード変更 + 再ビルド」を要する。一方、ユーザー向け `/<slug>` Workflow（`tickets/workflow.md`）は `<workspace_root>/.insomnia/memory/workflow/<slug>.md` に住み、frontmatter + Markdown 本文 + `requires` Knowledge inject を持つ宣言形式で運用できる。
+これらは実装内 `&str` 定数や `PromptCatalog` の overlay で管理されており、prompt の調整や運用カスタマイズが「コード変更 + 再ビルド」を要する。一方、ユーザー向け `/<slug>` Workflow（`tickets/workflow.md`）は `<workspace_root>/.insomnia/workflow/<slug>.md` に住み、frontmatter + Markdown 本文 + `requires` Knowledge inject を持つ宣言形式で運用できる。
 
 両者を寄せ、内部 Worker / 内部 Pod の prompt + ツール surface + Knowledge 依存を **Workflow と同一仕様で記述** できる経路を用意する。これにより:
 
@@ -22,7 +22,7 @@ INSOMNIA が内部で固定 prompt を持って disposable Worker / 専用 Pod �
 
 `tickets/workflow.md` の Workflow 仕様は「ユーザーが `/<slug>` で submit する制約付き作業」だが、本チケットでは **内部トリガー（Pod 内部の状態遷移）から呼び出される Workflow** を一級扱いに広げる。
 
-- 同じファイル形式（`memory/workflow/<slug>.md`）、同じ frontmatter / Linter
+- 同じファイル形式（`.insomnia/workflow/<slug>.md`）、同じ frontmatter / Linter
 - `user_invocable: false` で `/<slug>` 経路から見えなくする
 - `model_invokation` は通常 Pod 用の system prompt 注入仕様のまま（内部 Workflow は通常 OFF）
 - 内部 Workflow を識別するキー（例: `internal_role`）と、必要なツール surface を表明する手段を frontmatter に追加する。具体 schema は実装で詰める
@@ -59,7 +59,7 @@ Pod 側の既存トリガー（Phase 1 post-run / Phase 2 staging 閾値 / Compa
 ## 完了条件
 
 - 各内部 Worker / 内部 Pod（少なくとも Phase 1 / Phase 2 / Compact のうち、本チケット着手時点で実装済みのもの）が内部識別キー付き Workflow を解決して prompt とツール surface を組み立てる
-- workspace で `memory/workflow/<slug>.md` を上書きすれば内部 Worker の prompt が変わる
+- workspace で `.insomnia/workflow/<slug>.md` を上書きすれば内部 Worker の prompt が変わる
 - workspace に該当 Workflow が無い場合、bundled default が使われる
 - `user_invocable: false` の内部 Workflow は `/<slug>` 候補から除外され、ユーザーからは呼べない
 - 内部 Workflow も consolidation の自動書き込み禁止対象のまま（Linter で構造的担保、`workflow.md` と整合）

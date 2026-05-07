@@ -443,8 +443,8 @@ mod tests {
         let layout = WorkspaceLayout::new(dir.path().to_path_buf());
         std::fs::create_dir_all(dir.path().join(".insomnia/memory/decisions")).unwrap();
         std::fs::create_dir_all(dir.path().join(".insomnia/memory/requests")).unwrap();
-        std::fs::create_dir_all(dir.path().join(".insomnia/memory/workflow")).unwrap();
         std::fs::create_dir_all(dir.path().join(".insomnia/memory/_staging")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".insomnia/workflow")).unwrap();
         std::fs::create_dir_all(dir.path().join(".insomnia/knowledge")).unwrap();
         (dir, layout)
     }
@@ -556,7 +556,7 @@ mod tests {
     #[tokio::test]
     async fn memory_query_excludes_workflow_and_staging() {
         let (dir, layout) = setup();
-        let wf = dir.path().join(".insomnia/memory/workflow/wf.md");
+        let wf = dir.path().join(".insomnia/workflow/wf.md");
         std::fs::write(&wf, "needle in workflow\n").unwrap();
         let stg = dir.path().join(".insomnia/memory/_staging/abc.json");
         std::fs::write(&stg, "needle in staging\n").unwrap();

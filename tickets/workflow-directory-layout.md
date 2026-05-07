@@ -113,3 +113,9 @@ workspace に既存 Workflow がある場合、新配置へ移す。
 - `crates/pod/src/workflow/mod.rs`
 - `tickets/auto-maintain-workflow.md`
 - `tickets/internal-worker-workflow.md`
+
+## Review
+
+- 状態: Approve
+- レビュー詳細: [./workflow-directory-layout.review.md](./workflow-directory-layout.review.md)
+- 日付: 2026-05-08
