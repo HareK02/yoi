@@ -15,7 +15,7 @@ use manifest::Scope;
 use serde::Deserialize;
 
 use crate::error::ToolsError;
-use crate::scoped_fs::ScopedFs;
+use crate::scoped_fs::{ScopedFs, direct_symlink};
 
 const DESCRIPTION: &str = "Recursive regex search across files, powered by \
 ripgrep. Supports file filtering (`glob`, `type`), context lines, multiline \
@@ -255,8 +255,52 @@ fn run_grep(default_base: PathBuf, p: GrepParams, scope: &Scope) -> Result<GrepR
     if !base.is_absolute() {
         return Err(ToolsError::RelativePath(base));
     }
-    if !base.exists() {
-        return Err(ToolsError::NotFound(base));
+    let symlink = direct_symlink(&base);
+    if !scope.is_readable(&base) {
+        return Err(if let Some(info) = symlink.as_ref() {
+            let link_parent_readable = info
+                .link_path
+                .parent()
+                .map(|parent| scope.is_readable(parent))
+                .unwrap_or(false);
+            if info.target_exists && link_parent_readable {
+                ToolsError::SymlinkOutOfScope {
+                    path: base.clone(),
+                    target: info.resolved_path.clone(),
+                    required_permission: "read",
+                }
+            } else {
+                ToolsError::OutOfScope(base.clone())
+            }
+        } else {
+            ToolsError::OutOfScope(base.clone())
+        });
+    }
+    if let Some(info) = symlink.as_ref() {
+        if !info.target_exists {
+            return Err(ToolsError::BrokenSymlink {
+                path: base.clone(),
+                link: info.link_path.clone(),
+                target: info.target_path.clone(),
+            });
+        }
+    }
+    let base_meta = std::fs::metadata(&base).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => ToolsError::NotFound(base.clone()),
+        _ => ToolsError::io(&base, e),
+    })?;
+    if !base_meta.is_dir() {
+        return Err(ToolsError::InvalidArgument(format!(
+            "grep search path is not a directory: {}",
+            base.display()
+        )));
+    }
+    if let Some(info) = symlink.as_ref() {
+        return Err(ToolsError::SymlinkDirectoryNotTraversed {
+            tool: "Grep",
+            path: base.clone(),
+            target: info.resolved_path.clone(),
+        });
     }
 
     let mut wb = WalkBuilder::new(&base);

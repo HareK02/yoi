@@ -10,7 +10,7 @@ use manifest::Scope;
 use serde::Deserialize;
 
 use crate::error::ToolsError;
-use crate::scoped_fs::ScopedFs;
+use crate::scoped_fs::{ScopedFs, direct_symlink};
 
 const DESCRIPTION: &str = "Recursively find files matching a glob pattern \
 (e.g. \"**/*.rs\"). Results are sorted by modification time, newest first, \
@@ -98,8 +98,52 @@ fn run_glob(base: &Path, pattern: &str, scope: &Scope) -> Result<Vec<PathBuf>, T
     if !base.is_absolute() {
         return Err(ToolsError::RelativePath(base.to_path_buf()));
     }
-    if !base.exists() {
-        return Err(ToolsError::NotFound(base.to_path_buf()));
+    let symlink = direct_symlink(base);
+    if !scope.is_readable(base) {
+        return Err(if let Some(info) = symlink.as_ref() {
+            let link_parent_readable = info
+                .link_path
+                .parent()
+                .map(|parent| scope.is_readable(parent))
+                .unwrap_or(false);
+            if info.target_exists && link_parent_readable {
+                ToolsError::SymlinkOutOfScope {
+                    path: base.to_path_buf(),
+                    target: info.resolved_path.clone(),
+                    required_permission: "read",
+                }
+            } else {
+                ToolsError::OutOfScope(base.to_path_buf())
+            }
+        } else {
+            ToolsError::OutOfScope(base.to_path_buf())
+        });
+    }
+    if let Some(info) = symlink.as_ref() {
+        if !info.target_exists {
+            return Err(ToolsError::BrokenSymlink {
+                path: base.to_path_buf(),
+                link: info.link_path.clone(),
+                target: info.target_path.clone(),
+            });
+        }
+    }
+    let base_meta = std::fs::metadata(base).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => ToolsError::NotFound(base.to_path_buf()),
+        _ => ToolsError::io(base, e),
+    })?;
+    if !base_meta.is_dir() {
+        return Err(ToolsError::InvalidArgument(format!(
+            "glob search path is not a directory: {}",
+            base.display()
+        )));
+    }
+    if let Some(info) = symlink.as_ref() {
+        return Err(ToolsError::SymlinkDirectoryNotTraversed {
+            tool: "Glob",
+            path: base.to_path_buf(),
+            target: info.resolved_path.clone(),
+        });
     }
 
     let glob = globset::Glob::new(pattern)
@@ -295,5 +339,35 @@ mod tests {
         let body = out.content.unwrap();
         assert!(body.contains(".hidden.rs"));
         assert!(body.contains("visible.rs"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn glob_reports_scope_inside_symlink_directory_is_not_traversed() {
+        use std::os::unix::fs::symlink;
+
+        let (dir, fs) = setup();
+        let target = dir.path().join("target-dir");
+        touch(&target.join("visible.rs"), "");
+        let link = dir.path().join("external-project");
+        symlink(&target, &link).unwrap();
+
+        let def = glob_tool(fs);
+        let (_, tool) = def();
+        let inp = serde_json::json!({
+            "path": link.to_str().unwrap(),
+            "pattern": "**/*.rs",
+        });
+        let err = tool.execute(&inp.to_string()).await.unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("Glob does not follow symlink directories"),
+            "{msg}"
+        );
+        assert!(msg.contains(&link.display().to_string()), "{msg}");
+        assert!(
+            msg.contains(&target.canonicalize().unwrap().display().to_string()),
+            "{msg}"
+        );
     }
 }

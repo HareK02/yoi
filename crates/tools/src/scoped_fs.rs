@@ -42,6 +42,23 @@ pub struct WriteOutcome {
     pub created: bool,
 }
 
+/// First symlink encountered while resolving a path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymlinkInfo {
+    /// The symlink path as it appears in the original path chain.
+    pub link_path: PathBuf,
+    /// The symlink target resolved relative to the symlink's parent when the
+    /// link stores a relative target.
+    pub target_path: PathBuf,
+    /// Best-effort resolved form of the full requested path after replacing
+    /// the symlink component with its target and rejoining any remaining tail.
+    /// Existing targets are canonicalized; broken targets are left absolute.
+    pub resolved_path: PathBuf,
+    /// Whether the symlink target itself exists. A missing target is a broken
+    /// symlink even when the symlink lives inside an allowed scope.
+    pub target_exists: bool,
+}
+
 impl ScopedFs {
     /// Create a new [`ScopedFs`] wrapping `scope` and `pwd` in a fresh
     /// [`SharedScope`]. Use [`ScopedFs::with_shared_scope`] when you
@@ -92,15 +109,34 @@ impl ScopedFs {
         if !path.is_absolute() {
             return Err(ToolsError::RelativePath(path.to_path_buf()));
         }
-        if !self.inner.scope.load().is_readable(path) {
-            return Err(ToolsError::OutOfScope(path.to_path_buf()));
+        let symlink = first_symlink(path);
+        let scope = self.inner.scope.load();
+        if !scope.is_readable(path) {
+            return Err(symlink_out_of_scope_or_plain(
+                path,
+                symlink.as_ref(),
+                "read",
+                &scope,
+            ));
+        }
+        if let Some(info) = symlink.as_ref() {
+            if !info.target_exists {
+                return Err(broken_symlink_error(path, info));
+            }
         }
         let meta = std::fs::metadata(path).map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => ToolsError::NotFound(path.to_path_buf()),
             _ => ToolsError::io(path, e),
         })?;
         if meta.is_dir() {
-            return Err(ToolsError::IsDirectory(path.to_path_buf()));
+            return Err(if let Some(info) = symlink.as_ref() {
+                ToolsError::SymlinkTargetIsDirectory {
+                    path: path.to_path_buf(),
+                    target: info.resolved_path.clone(),
+                }
+            } else {
+                ToolsError::IsDirectory(path.to_path_buf())
+            });
         }
         std::fs::read(path).map_err(|e| ToolsError::io(path, e))
     }
@@ -125,28 +161,50 @@ impl ScopedFs {
         if !path.is_absolute() {
             return Err(ToolsError::RelativePath(path.to_path_buf()));
         }
+        let symlink = first_symlink(path);
         let scope = self.inner.scope.load();
         if !scope.is_writable(path) {
             return Err(if scope.is_readable(path) {
                 ToolsError::ReadOnly(path.to_path_buf())
             } else {
-                ToolsError::OutOfScope(path.to_path_buf())
+                symlink_out_of_scope_or_plain(path, symlink.as_ref(), "write", &scope)
             });
         }
         drop(scope);
 
+        if let Some(info) = symlink.as_ref() {
+            if !info.target_exists {
+                return Err(broken_symlink_error(path, info));
+            }
+        }
+
         // Reject existing directory targets.
         match std::fs::metadata(path) {
             Ok(meta) if meta.is_dir() => {
-                return Err(ToolsError::IsDirectory(path.to_path_buf()));
+                return Err(if let Some(info) = symlink.as_ref() {
+                    ToolsError::SymlinkTargetIsDirectory {
+                        path: path.to_path_buf(),
+                        target: info.resolved_path.clone(),
+                    }
+                } else {
+                    ToolsError::IsDirectory(path.to_path_buf())
+                });
             }
             _ => {}
         }
 
         let existed = path.exists();
+        let write_target = if existed {
+            path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+        } else {
+            path.to_path_buf()
+        };
 
-        let parent = path.parent().ok_or_else(|| {
-            ToolsError::InvalidArgument(format!("path has no parent directory: {}", path.display()))
+        let parent = write_target.parent().ok_or_else(|| {
+            ToolsError::InvalidArgument(format!(
+                "path has no parent directory: {}",
+                write_target.display()
+            ))
         })?;
         if !parent.as_os_str().is_empty() && !parent.exists() {
             std::fs::create_dir_all(parent).map_err(|e| ToolsError::io(parent, e))?;
@@ -160,17 +218,104 @@ impl ScopedFs {
         let mut tmp = tempfile::NamedTempFile::new_in(tmp_parent)
             .map_err(|e| ToolsError::io(tmp_parent, e))?;
         tmp.write_all(content)
-            .map_err(|e| ToolsError::io(path, e))?;
+            .map_err(|e| ToolsError::io(&write_target, e))?;
         tmp.as_file()
             .sync_all()
-            .map_err(|e| ToolsError::io(path, e))?;
-        tmp.persist(path)
-            .map_err(|e| ToolsError::io(path, e.error))?;
+            .map_err(|e| ToolsError::io(&write_target, e))?;
+        tmp.persist(&write_target)
+            .map_err(|e| ToolsError::io(&write_target, e.error))?;
 
         Ok(WriteOutcome {
             bytes_written: content.len(),
             created: !existed,
         })
+    }
+}
+
+/// Return the first symlink component in `path`, if one exists.
+///
+/// The function only inspects existing path components. It intentionally uses
+/// `symlink_metadata` so the symlink itself can be diagnosed before any later
+/// `metadata` call follows it and collapses the reason into `NotFound` or
+/// `OutOfScope`.
+pub fn first_symlink(path: &Path) -> Option<SymlinkInfo> {
+    if !path.is_absolute() {
+        return None;
+    }
+
+    let mut cur = PathBuf::new();
+    let mut components = path.components().peekable();
+    while let Some(component) = components.next() {
+        cur.push(component.as_os_str());
+        let meta = std::fs::symlink_metadata(&cur).ok()?;
+        if !meta.file_type().is_symlink() {
+            continue;
+        }
+
+        let raw_target = std::fs::read_link(&cur).ok()?;
+        let target_path = if raw_target.is_absolute() {
+            raw_target
+        } else {
+            cur.parent()
+                .unwrap_or_else(|| Path::new("/"))
+                .join(raw_target)
+        };
+        let target_exists = target_path.exists();
+        let mut resolved_path = target_path
+            .canonicalize()
+            .unwrap_or_else(|_| target_path.clone());
+        for remaining in components {
+            resolved_path.push(remaining.as_os_str());
+        }
+
+        return Some(SymlinkInfo {
+            link_path: cur,
+            target_path,
+            resolved_path,
+            target_exists,
+        });
+    }
+
+    None
+}
+
+pub fn direct_symlink(path: &Path) -> Option<SymlinkInfo> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if meta.file_type().is_symlink() {
+        first_symlink(path)
+    } else {
+        None
+    }
+}
+
+fn symlink_out_of_scope_or_plain(
+    path: &Path,
+    symlink: Option<&SymlinkInfo>,
+    required_permission: &'static str,
+    scope: &Scope,
+) -> ToolsError {
+    if let Some(info) = symlink {
+        let link_parent_readable = info
+            .link_path
+            .parent()
+            .map(|parent| scope.is_readable(parent))
+            .unwrap_or(false);
+        if info.target_exists && link_parent_readable {
+            return ToolsError::SymlinkOutOfScope {
+                path: path.to_path_buf(),
+                target: info.resolved_path.clone(),
+                required_permission,
+            };
+        }
+    }
+    ToolsError::OutOfScope(path.to_path_buf())
+}
+
+fn broken_symlink_error(path: &Path, info: &SymlinkInfo) -> ToolsError {
+    ToolsError::BrokenSymlink {
+        path: path.to_path_buf(),
+        link: info.link_path.clone(),
+        target: info.target_path.clone(),
     }
 }
 
@@ -241,6 +386,90 @@ mod tests {
         assert!(matches!(err, ToolsError::OutOfScope(_)));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn read_bytes_reports_broken_symlink_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        let fs = make_fs(&dir);
+        let link = dir.path().join("external-project");
+        let target = dir.path().join("missing-target");
+        symlink(&target, &link).unwrap();
+
+        let err = fs.read_bytes(&link).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ToolsError::BrokenSymlink { ref path, link: ref err_link, target: ref err_target }
+                    if path == &link && err_link == &link && err_target == &target
+            ),
+            "expected broken symlink diagnostic, got {err:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_bytes_reports_symlink_target_outside_scope() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let target = outside.path().join("target.txt");
+        fs::write(&target, b"secret").unwrap();
+        let link = dir.path().join("outside-repo.txt");
+        symlink(&target, &link).unwrap();
+
+        let fs = make_fs(&dir);
+        let err = fs.read_bytes(&link).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ToolsError::SymlinkOutOfScope { ref path, target: ref err_target, required_permission: "read" }
+                    if path == &link && err_target == &target.canonicalize().unwrap()
+            ),
+            "expected symlink out-of-scope diagnostic, got {err:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_bytes_allows_symlink_file_when_target_is_inside_scope() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("target.txt");
+        fs::write(&target, b"visible").unwrap();
+        let link = dir.path().join("link.txt");
+        symlink(&target, &link).unwrap();
+
+        let fs = make_fs(&dir);
+        assert_eq!(fs.read_bytes(&link).unwrap(), b"visible");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_bytes_reports_symlink_to_directory_as_wrong_file_type() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        let target_dir = dir.path().join("target-dir");
+        fs::create_dir(&target_dir).unwrap();
+        let link = dir.path().join("dir-link");
+        symlink(&target_dir, &link).unwrap();
+
+        let fs = make_fs(&dir);
+        let err = fs.read_bytes(&link).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ToolsError::SymlinkTargetIsDirectory { ref path, ref target }
+                    if path == &link && target == &target_dir.canonicalize().unwrap()
+            ),
+            "expected symlink directory type diagnostic, got {err:?}"
+        );
+    }
+
     // -------------------------------------------------------------------------
     // write
     // -------------------------------------------------------------------------
@@ -265,6 +494,53 @@ mod tests {
         let out = fs.write(&file, b"new").unwrap();
         assert!(!out.created);
         assert_eq!(fs::read(&file).unwrap(), b"new");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_existing_symlink_file_updates_in_scope_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        let fs = make_fs(&dir);
+        let target = dir.path().join("target.txt");
+        fs::write(&target, b"old").unwrap();
+        let link = dir.path().join("link.txt");
+        symlink(&target, &link).unwrap();
+
+        let out = fs.write(&link, b"new").unwrap();
+        assert!(!out.created);
+        assert_eq!(fs::read(&target).unwrap(), b"new");
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_reports_symlink_target_outside_scope() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let target = outside.path().join("target.txt");
+        fs::write(&target, b"secret").unwrap();
+        let link = dir.path().join("outside-repo.txt");
+        symlink(&target, &link).unwrap();
+
+        let fs = make_fs(&dir);
+        let err = fs.write(&link, b"new").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ToolsError::SymlinkOutOfScope { ref path, target: ref err_target, required_permission: "write" }
+                    if path == &link && err_target == &target.canonicalize().unwrap()
+            ),
+            "expected write symlink out-of-scope diagnostic, got {err:?}"
+        );
     }
 
     #[test]

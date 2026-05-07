@@ -16,6 +16,47 @@ pub enum ToolsError {
     #[error("path is outside allowed scope: {}", .0.display())]
     OutOfScope(PathBuf),
 
+    #[error(
+        "path resolves through a symlink outside allowed {required_permission} scope: {} -> {}; add the symlink target to the Pod {required_permission} scope, copy it into the workspace, or recreate the symlink with the correct target",
+        .path.display(),
+        .target.display()
+    )]
+    SymlinkOutOfScope {
+        path: PathBuf,
+        target: PathBuf,
+        required_permission: &'static str,
+    },
+
+    #[error(
+        "broken symlink while resolving {}: {} -> {} (target does not exist); recreate the symlink with an absolute target or a correct relative target",
+        .path.display(),
+        .link.display(),
+        .target.display()
+    )]
+    BrokenSymlink {
+        path: PathBuf,
+        link: PathBuf,
+        target: PathBuf,
+    },
+
+    #[error(
+        "path resolves through a symlink to a directory, not a file: {} -> {}",
+        .path.display(),
+        .target.display()
+    )]
+    SymlinkTargetIsDirectory { path: PathBuf, target: PathBuf },
+
+    #[error(
+        "{tool} does not follow symlink directories: {} -> {}; use the resolved target path directly, or add the target to read scope and reference it without the symlink",
+        .path.display(),
+        .target.display()
+    )]
+    SymlinkDirectoryNotTraversed {
+        tool: &'static str,
+        path: PathBuf,
+        target: PathBuf,
+    },
+
     #[error("path is read-only in this scope: {}", .0.display())]
     ReadOnly(PathBuf),
 
@@ -73,6 +114,10 @@ impl From<ToolsError> for ToolError {
         match err {
             RelativePath(_)
             | OutOfScope(_)
+            | SymlinkOutOfScope { .. }
+            | BrokenSymlink { .. }
+            | SymlinkTargetIsDirectory { .. }
+            | SymlinkDirectoryNotTraversed { .. }
             | ReadOnly(_)
             | IsDirectory(_)
             | NotRead(_)

@@ -102,8 +102,12 @@ async fn symlink_to_outside_scope_is_rejected_for_write() {
         .await
         .unwrap_err();
     assert!(
-        format!("{read_err}").contains("outside allowed scope"),
+        format!("{read_err}").contains("outside allowed read scope"),
         "symlink read escape not rejected: {read_err}"
+    );
+    assert!(
+        format!("{read_err}").contains(&outside_target.display().to_string()),
+        "symlink read diagnostic should include resolved target: {read_err}"
     );
 
     // Write through the symlink must be rejected for the same reason.
@@ -120,11 +124,37 @@ async fn symlink_to_outside_scope_is_rejected_for_write() {
         .unwrap_err();
     let msg = format!("{err}");
     assert!(
-        msg.contains("outside allowed scope"),
+        msg.contains("outside allowed read scope") || msg.contains("outside allowed write scope"),
         "symlink escape not rejected: {msg}"
+    );
+    assert!(
+        msg.contains("add the symlink target"),
+        "symlink escape diagnostic should include remediation: {msg}"
     );
     // Outside file must not have been touched.
     assert_eq!(std::fs::read_to_string(&outside_target).unwrap(), "secret");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn broken_symlink_reports_target_and_repair_hint() {
+    use std::os::unix::fs::symlink;
+
+    let (dir, _spill, reg) = setup();
+    let link = dir.path().join("external-project");
+    let target = dir.path().join("missing-target");
+    symlink(&target, &link).unwrap();
+
+    let read = reg.get("Read");
+    let err = read
+        .execute(&json!({ "file_path": link.to_str().unwrap() }).to_string())
+        .await
+        .unwrap_err();
+    let msg = format!("{err}");
+    assert!(msg.contains("broken symlink"), "{msg}");
+    assert!(msg.contains(&link.display().to_string()), "{msg}");
+    assert!(msg.contains(&target.display().to_string()), "{msg}");
+    assert!(msg.contains("correct relative target"), "{msg}");
 }
 
 #[tokio::test]
