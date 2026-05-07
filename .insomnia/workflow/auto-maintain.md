@@ -10,6 +10,8 @@ requires: []
 
 この Workflow は常駐 scheduler ではない。ユーザーが `/auto-maintain` を明示的に呼んだ時だけ動く。
 
+この Workflow は親 Pod / orchestrator 専用である。実装 Pod に `/auto-maintain` を渡してはならない。実装 Pod には、親 Pod が選んだ ticket、既に用意した child worktree、許可された write scope、禁止事項を具体的に渡す。
+
 ## 基本方針
 
 - main workspace は制御面として扱う。
@@ -69,7 +71,7 @@ TODO と tickets の不整合を見つけた場合は、勝手に ticket を作�
 
 ## Worktree 作成
 
-実装差分を隔離する必要がある場合、`/worktree-workflow` の手順を使う。要点は以下。
+実装差分を隔離する必要がある場合、親 Pod が `/worktree-workflow` の手順を使う。実装 Pod に worktree 作成を任せてはならない。要点は以下。
 
 ```bash
 git worktree add .worktree/<task-name> -b <task-name>
@@ -85,7 +87,7 @@ git -C .worktree/<task-name> sparse-checkout set --no-cone \
 
 ## 実装 Pod の spawn
 
-実装 Pod を使う場合は、対象 ticket、child worktree path、write scope、禁止事項を明示する。
+実装 Pod を使う場合は、対象 ticket、既に作成済みの child worktree path、write scope、禁止事項を明示する。実装 Pod は `/auto-maintain` や `/worktree-workflow` を実行せず、与えられた worktree 内で実装・確認・報告だけを行う。
 
 推奨 scope:
 

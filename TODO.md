@@ -1,6 +1,7 @@
 - Workflow / Skills
   - 内部 Worker / 内部 Pod の Workflow 化 → [tickets/internal-worker-workflow.md](tickets/internal-worker-workflow.md)
   - 半自動開発運用 Workflow → [tickets/auto-maintain-workflow.md](tickets/auto-maintain-workflow.md)
+  - Workflow を memory crate から独立させる → [tickets/workflow-crate-extraction.md](tickets/workflow-crate-extraction.md)
 - パーミッション: パターンベースのツール実行制御 → [tickets/permission-extension-point.md](tickets/permission-extension-point.md)
 - Pod CLI: マニフェスト関連フラグの整理 → [tickets/pod-cli-manifest-flags.md](tickets/pod-cli-manifest-flags.md)
 - Pod: 空応答ターン (Submit 後 AI 応答ゼロで Pause/Cancel) を自動巻き戻し → [tickets/pod-empty-turn-rollback.md](tickets/pod-empty-turn-rollback.md)
@@ -22,6 +23,7 @@
   - Compaction 進行中のライブ表示 → [tickets/tui-compact-progress.md](tickets/tui-compact-progress.md)
   - Assistant 応答の Markdown スタイル表示 → [tickets/tui-assistant-markdown.md](tickets/tui-assistant-markdown.md)
 - Manifest: Tool Output / File Upload 上限の分離とデフォルト緩和 → [tickets/manifest-output-upload-limits.md](tickets/manifest-output-upload-limits.md)
+- FileRef / file tools の symlink 診断と外部参照導線 → [tickets/file-ref-symlink-diagnostics.md](tickets/file-ref-symlink-diagnostics.md)
 - Prune: 保護境界を turn 数から末尾 token budget に置き換え → [tickets/prune-token-budget.md](tickets/prune-token-budget.md)
 - メモリ機構
   - 使用頻度メトリクス + Knowledge 化候補レポート → [tickets/memory-usage-metrics.md](tickets/memory-usage-metrics.md)

@@ -10,6 +10,8 @@ Git worktree を使って、実装差分を main workspace から分離して進
 
 この Workflow は `.claude/skills/worktree-workflow/SKILL.md` の運用を insomnia 向けに移植したもの。insomnia では Pod の write scope が排他的に委譲されるため、子 worktree に `.insomnia` を置かず、親 Pod が main workspace 側の管理ファイルを書ける状態を保つ。
 
+この Workflow は親 Pod / orchestrator が worktree を用意するための手順である。実装 Pod にこの Workflow を渡して worktree を作らせてはならない。実装 Pod は親 Pod から既存 child worktree を受け取り、その中で実装・build・test・報告だけを行う。
+
 ## 原則
 
 - 1 セッション / 1 ticket / 1 task につき 1 worktree を作る。
