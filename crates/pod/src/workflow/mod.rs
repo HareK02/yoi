@@ -147,7 +147,7 @@ mod tests {
             "---\ncreated_at: 2026-01-01T00:00:00Z\nupdated_at: 2026-01-01T00:00:00Z\nkind: policy\ndescription: p\nmodel_invokation: false\nuser_invocable: true\nlast_sources: []\n---\npolicy body\n",
         );
         write(
-            &dir.path().join(".insomnia/memory/workflow/run-it.md"),
+            &dir.path().join(".insomnia/workflow/run-it.md"),
             "---\ndescription: run\nrequires: [policy]\n---\nworkflow body\n",
         );
         let registry = memory::load_workflows(&layout).unwrap();
@@ -171,7 +171,7 @@ mod tests {
     fn user_invocable_false_errors() {
         let (dir, layout, _registry) = setup();
         write(
-            &dir.path().join(".insomnia/memory/workflow/hidden.md"),
+            &dir.path().join(".insomnia/workflow/hidden.md"),
             "---\ndescription: hidden\nuser_invocable: false\n---\nbody\n",
         );
         let registry = memory::load_workflows(&layout).unwrap();
@@ -184,7 +184,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let layout = WorkspaceLayout::new(dir.path().to_path_buf());
         write(
-            &dir.path().join(".insomnia/memory/workflow/bad.md"),
+            &dir.path().join(".insomnia/workflow/bad.md"),
             "---\ndescription: bad\nrequires: [ghost]\n---\nbody\n",
         );
         let registry = memory::load_workflows(&layout).unwrap();

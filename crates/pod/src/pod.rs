@@ -148,8 +148,8 @@ pub struct Pod<C: LlmClient, St: Store> {
     /// [`Self::from_manifest`], or defaults to the builtin pack when a
     /// Pod is constructed through lower-level paths that have no loader.
     prompts: Arc<PromptCatalog>,
-    /// Registry loaded from `<workspace>/.insomnia/memory/workflow/*.md`
-    /// when memory is enabled. Missing memory config keeps this empty.
+    /// Registry loaded from `<workspace>/.insomnia/workflow/*.md` when
+    /// memory is enabled. Missing memory config keeps this empty.
     workflow_registry: memory::WorkflowRegistry,
     /// Memory workspace layout used by the workflow resolver to load required
     /// Knowledge records by exact slug.

@@ -335,7 +335,7 @@ mod tests {
     #[test]
     fn workflow_write_rejected() {
         let (dir, linter) = workspace();
-        let path = dir.path().join(".insomnia/memory/workflow/wf.md");
+        let path = dir.path().join(".insomnia/workflow/wf.md");
         let content =
             "---\ndescription: x\nmodel_invokation: false\nuser_invocable: true\n---\nbody"
                 .to_string();

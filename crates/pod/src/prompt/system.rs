@@ -154,7 +154,7 @@ pub struct SystemPromptContext<'a> {
     /// section entirely (memory disabled, or a Phase 2 worker that opts
     /// out); `Some(&[])` also yields no section.
     pub resident_knowledge: Option<&'a [ResidentKnowledgeEntry]>,
-    /// Resident workflow descriptions from `<workspace>/memory/workflow/*`
+    /// Resident workflow descriptions from `<workspace>/.insomnia/workflow/*`
     /// whose frontmatter has `model_invokation: true`. `None` disables the
     /// section; Phase 2 workers opt out together with resident Knowledge.
     pub resident_workflows: Option<&'a [ResidentWorkflowEntry]>,

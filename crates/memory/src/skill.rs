@@ -9,7 +9,7 @@
 //!
 //! Parsing is intentionally lenient at the directory-scan level — one
 //! malformed SKILL.md emits `tracing::warn!` and is skipped, leaving sibling
-//! skills loadable. Internal Workflows (`memory/workflow/<slug>.md`) keep
+//! skills loadable. Internal Workflows (`.insomnia/workflow/<slug>.md`) keep
 //! their hard-error semantics.
 
 use std::io;

@@ -7,8 +7,8 @@
 //! enumerate what records exist without knowing what's inside them.
 //!
 //! - `MemoryQuery` walks `.insomnia/memory/{summary.md,decisions/,
-//!   requests/}`. `.insomnia/memory/workflow/` and
-//!   `.insomnia/memory/_staging/` are excluded by construction.
+//!   requests/}`. `.insomnia/workflow/` and `.insomnia/memory/_staging/`
+//!   are excluded by construction.
 //! - `KnowledgeQuery` walks `.insomnia/knowledge/*.md` and supports a
 //!   `kind` filter against the Knowledge frontmatter's `kind` field.
 //!

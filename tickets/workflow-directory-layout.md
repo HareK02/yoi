@@ -26,25 +26,14 @@ Workflow の標準配置を以下に変更する。
 <workspace>/.insomnia/memory/workflow/<slug>.md
 ```
 
-新規作成・ドキュメント・補完・resolver の説明は新配置を使う。
-
-### 互換読み取り
-
-移行期間のため、loader は当面旧配置も読む。
-
-- 新配置 `.insomnia/workflow/<slug>.md` を優先する
-- 旧配置 `.insomnia/memory/workflow/<slug>.md` も fallback として読む
-- 同じ slug が両方にある場合は新配置を採用する
-- 旧配置を読んだ場合、可能なら warning / notification / log のいずれかで migration hint を出す
-
-旧配置の完全廃止は本チケットでは行わない。廃止が必要になったら別 ticket とする。
+新規作成・ドキュメント・補完・resolver の説明は新配置を使う。旧配置の互換読み取りは行わない（このリポジトリ内で完結する移行であり、外部利用者の互換配慮は不要との判断）。旧配置にファイルが残っていても loader は読まないし、linter / scope deny も新配置のみを対象にする。
 
 ### linter / registry / completion
 
 - Workflow linter は新配置を検査できる
 - `requires` の Knowledge 参照検査は従来通り維持する
-- `WorkflowRegistry` は source path として新旧どちらも保持できる
-- `/<slug>` completion / invocation は新配置・旧配置の双方から読める
+- `WorkflowRegistry` は新配置の source path を保持する
+- `/<slug>` completion / invocation は新配置から読める
 - resident workflow (`model_invokation: true`) の広告も新配置を対象にする
 
 ### memory state との分離
@@ -104,15 +93,13 @@ workspace に既存 Workflow がある場合、新配置へ移す。
 - Workflow の自動生成ポリシー変更
 - Workflow frontmatter schema の大幅変更
 - Workflow DSL 化
-- 旧配置の即時廃止
 - memory tool で Workflow を書けるようにする変更
 - 内部 Worker Workflow 化そのもの（`tickets/internal-worker-workflow.md` の対象）
 
 ## 完了条件
 
 - Workflow の canonical path が `.insomnia/workflow/<slug>.md` として実装・文書化されている
-- 既存の `.insomnia/memory/workflow/<slug>.md` も互換読み取りできる
-- 新旧両方に同じ slug がある場合、新配置が優先される
+- loader / linter / scope deny / completion / invocation が新配置のみを対象にしている
 - Workflow linter / loader / completion / invocation のテストが新配置をカバーしている
 - `.insomnia/.gitignore` が generated memory state のみを ignore し、`.insomnia/workflow/*.md` を Git 管理できる
 - この workspace の既存 Workflow が `.insomnia/workflow/` に移されている

@@ -1,8 +1,8 @@
 //! Workflow loader and registry.
 //!
-//! Workflows live under `<workspace>/.insomnia/memory/workflow/<slug>.md`.
-//! They are human-authored Markdown documents with YAML frontmatter. The loader
-//! is intentionally strict about malformed records because Pod startup should
+//! Workflows live under `<workspace>/.insomnia/workflow/<slug>.md`. They are
+//! human-authored Markdown documents with YAML frontmatter. The loader is
+//! intentionally strict about malformed records because Pod startup should
 //! fail rather than silently ignoring a broken procedural instruction.
 
 use std::collections::BTreeMap;
@@ -26,8 +26,8 @@ pub const WORKFLOW_DESCRIPTION_HARD_CAP: usize = 1024;
 /// win over external skills.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkflowSource {
-    /// `<workspace>/.insomnia/memory/workflow/<slug>.md`. Authored
-    /// in-tree by the project.
+    /// `<workspace>/.insomnia/workflow/<slug>.md`. Authored in-tree by
+    /// the project.
     WorkspaceWorkflow,
     /// SKILL.md ingested from a `[skills] directories` entry in the
     /// manifest. `dir` is the skills root that contained
@@ -309,15 +309,13 @@ mod tests {
 
     fn setup() -> (TempDir, WorkspaceLayout) {
         let dir = TempDir::new().unwrap();
-        std::fs::create_dir_all(dir.path().join(".insomnia/memory/workflow")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".insomnia/workflow")).unwrap();
         let layout = WorkspaceLayout::new(dir.path().to_path_buf());
         (dir, layout)
     }
 
     fn write_workflow(root: &Path, slug: &str, frontmatter: &str, body: &str) {
-        let path = root
-            .join(".insomnia/memory/workflow")
-            .join(format!("{slug}.md"));
+        let path = root.join(".insomnia/workflow").join(format!("{slug}.md"));
         std::fs::write(path, format!("---\n{frontmatter}\n---\n{body}")).unwrap();
     }
 
@@ -371,6 +369,24 @@ mod tests {
         write_workflow(dir.path(), "bad", "model_invokation: false", "Body");
         let err = load_workflows(&layout).unwrap_err();
         assert!(matches!(err, WorkflowLoadError::Frontmatter { .. }));
+    }
+
+    #[test]
+    fn workflow_under_memory_is_ignored() {
+        // The legacy `.insomnia/memory/workflow/` location is no longer
+        // a Workflow source. Files placed there must be ignored (the
+        // loader is rooted at `.insomnia/workflow/` only).
+        let dir = TempDir::new().unwrap();
+        let layout = WorkspaceLayout::new(dir.path().to_path_buf());
+        let legacy = dir.path().join(".insomnia/memory/workflow");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(
+            legacy.join("ghost.md"),
+            "---\ndescription: ghost\n---\nbody\n",
+        )
+        .unwrap();
+        let got = load_workflows(&layout).unwrap();
+        assert!(got.is_empty());
     }
 
     fn skill_record(slug: &str, path: &Path) -> WorkflowRecord {
@@ -471,7 +487,7 @@ mod tests {
         let s = ShadowedSkill {
             slug: Slug::parse("x").unwrap(),
             kept_source: WorkflowSource::WorkspaceWorkflow,
-            kept_path: std::path::PathBuf::from("/ws/.insomnia/memory/workflow/x.md"),
+            kept_path: std::path::PathBuf::from("/ws/.insomnia/workflow/x.md"),
             shadowed_source: WorkflowSource::Skill {
                 dir: std::path::PathBuf::from("/skills"),
             },

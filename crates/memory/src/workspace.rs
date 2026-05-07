@@ -3,15 +3,18 @@
 //! `WorkspaceLayout` carries the workspace root (typically the Pod's
 //! pwd). All insomnia-managed content lives under the conventional
 //! `<root>/.insomnia/` subdirectory — the same place that holds
-//! `manifest.toml` and `prompts/`. The memory subsystem nests its
-//! trees inside it:
+//! `manifest.toml` and `prompts/`. The trees inside it:
 //!
+//! - `<root>/.insomnia/workflow/<slug>.md`
+//! - `<root>/.insomnia/knowledge/<slug>.md`
 //! - `<root>/.insomnia/memory/summary.md`
 //! - `<root>/.insomnia/memory/decisions/<slug>.md`
 //! - `<root>/.insomnia/memory/requests/<slug>.md`
-//! - `<root>/.insomnia/memory/workflow/<slug>.md`
 //! - `<root>/.insomnia/memory/_staging/<id>.json`
-//! - `<root>/.insomnia/knowledge/<slug>.md`
+//!
+//! `memory/` is reserved for session-derived / generated state;
+//! Workflows are human-managed and live one level up under
+//! `.insomnia/workflow/`.
 //!
 //! Configuring `[memory]` with an empty body is therefore sufficient
 //! for any workspace that already uses the `.insomnia/` convention; no
@@ -25,10 +28,10 @@ use crate::slug::Slug;
 const INSOMNIA_DIR: &str = ".insomnia";
 const MEMORY_DIR: &str = "memory";
 const KNOWLEDGE_DIR: &str = "knowledge";
+const WORKFLOW_DIR: &str = "workflow";
 const SUMMARY_FILE: &str = "summary.md";
 const DECISIONS_DIR: &str = "decisions";
 const REQUESTS_DIR: &str = "requests";
-const WORKFLOW_DIR: &str = "workflow";
 const STAGING_DIR: &str = "_staging";
 
 /// What kind of record a path under the memory tree represents.
@@ -114,8 +117,9 @@ impl WorkspaceLayout {
         self.memory_dir().join(REQUESTS_DIR)
     }
 
+    /// Workflow directory: `<root>/.insomnia/workflow/`.
     pub fn workflow_dir(&self) -> PathBuf {
-        self.memory_dir().join(WORKFLOW_DIR)
+        self.insomnia_dir().join(WORKFLOW_DIR)
     }
 
     pub fn staging_dir(&self) -> PathBuf {
@@ -139,9 +143,9 @@ impl WorkspaceLayout {
     }
 
     /// Classify a path under the memory tree. Returns `None` if the
-    /// path is not under `.insomnia/memory/` or `.insomnia/knowledge/`
-    /// of this workspace, or if it lives in `_staging/` (which is
-    /// opaque to the linter).
+    /// path is not under `.insomnia/memory/`, `.insomnia/knowledge/`,
+    /// or `.insomnia/workflow/` of this workspace, or if it lives in
+    /// `_staging/` (which is opaque to the linter).
     ///
     /// On a conventional path that's *almost* a record but malformed
     /// (e.g. `.insomnia/memory/decisions/Foo.md` with an invalid slug),
@@ -150,9 +154,13 @@ impl WorkspaceLayout {
     pub fn classify(&self, path: &Path) -> Result<Option<ClassifiedPath>, LintError> {
         let memory = self.memory_dir();
         let knowledge = self.knowledge_dir();
+        let workflow = self.workflow_dir();
 
         if let Ok(rel) = path.strip_prefix(&knowledge) {
             return Ok(Some(classify_kinded_md(rel, RecordKind::Knowledge, path)?));
+        }
+        if let Ok(rel) = path.strip_prefix(&workflow) {
+            return Ok(Some(classify_kinded_md(rel, RecordKind::Workflow, path)?));
         }
         let rel = match path.strip_prefix(&memory) {
             Ok(r) => r,
@@ -183,8 +191,6 @@ impl WorkspaceLayout {
             RecordKind::Decision
         } else if first == REQUESTS_DIR {
             RecordKind::Request
-        } else if first == WORKFLOW_DIR {
-            RecordKind::Workflow
         } else {
             return Err(LintError::InvalidPath(path.to_path_buf()));
         };
@@ -264,10 +270,19 @@ mod tests {
     #[test]
     fn classifies_workflow() {
         let cp = layout()
-            .classify(&PathBuf::from("/ws/.insomnia/memory/workflow/wf.md"))
+            .classify(&PathBuf::from("/ws/.insomnia/workflow/wf.md"))
             .unwrap()
             .unwrap();
         assert_eq!(cp.kind, RecordKind::Workflow);
+        assert_eq!(cp.slug.unwrap().as_str(), "wf");
+    }
+
+    #[test]
+    fn workflow_under_memory_is_invalid_path() {
+        let err = layout()
+            .classify(&PathBuf::from("/ws/.insomnia/memory/workflow/wf.md"))
+            .unwrap_err();
+        assert!(matches!(err, LintError::InvalidPath(_)));
     }
 
     #[test]

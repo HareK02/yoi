@@ -70,7 +70,7 @@ pub enum LintError {
     BodyTooLong { actual: usize, limit: usize },
 
     #[error(
-        "write to `memory/workflow/` is forbidden via the memory tool — Workflows are human-edited"
+        "write to a Workflow path is forbidden via the memory tool — Workflows are human-edited"
     )]
     WorkflowWriteForbidden,
 

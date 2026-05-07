@@ -1,6 +1,7 @@
-//! Walks `<workspace>/memory/{decisions,requests}/`, `memory/workflow/`,
-//! and `<workspace>/knowledge/` to collect the slug set the linter
-//! needs for reference-integrity and same-slug-duplication checks.
+//! Walks `<workspace>/memory/{decisions,requests}/`,
+//! `<workspace>/workflow/`, and `<workspace>/knowledge/` to collect
+//! the slug set the linter needs for reference-integrity and
+//! same-slug-duplication checks.
 //!
 //! No caching: each lint call walks fresh. Tree size is expected to
 //! stay small (hundreds of files, not thousands).

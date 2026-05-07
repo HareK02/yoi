@@ -98,7 +98,7 @@ Linter ルールは 2 系統:
   - Decisions / Requests: `created_at`, `updated_at`, `sources`
   - Knowledge: `kind`, `description`, `model_invokation`, `user_invocable`, `last_sources`, `created_at`, `updated_at`
   - Summary: `updated_at`（optional: `last_rewritten_from_range`）
-- `memory/workflow/` への書き込み禁止（sub-Worker context のみ、人間編集は除外）
+- Workflow パス（`.insomnia/workflow/`）への書き込み禁止（sub-Worker context のみ、人間編集は除外）
 - 同 slug での新規作成禁止（既存があれば update に切り替えるサイン）
 - `#<slug>` 参照が実在ファイルを指す
 - `replaced_by: <slug>` が実在 record を指す

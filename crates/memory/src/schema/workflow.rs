@@ -3,7 +3,8 @@
 //! NOTE: Workflows are written by humans, not by the memory tool. The
 //! linter only validates frontmatter when invoked directly (e.g. by a
 //! future CLI / pre-commit hook). The memory write/edit tool rejects
-//! `memory/workflow/` paths outright via [`LintError::WorkflowWriteForbidden`].
+//! `.insomnia/workflow/` paths outright via
+//! [`LintError::WorkflowWriteForbidden`].
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
