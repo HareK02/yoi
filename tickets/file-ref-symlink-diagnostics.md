@@ -75,3 +75,8 @@ symlink は canonicalize 後の target で scope 判定する。
 - `crates/pod/src/pod.rs` `resolve_file_refs`
 - `crates/pod/src/fs_view.rs`
 - `crates/manifest/src/scope.rs`
+
+## Review
+- 状態: Approve with follow-up
+- レビュー詳細: [./file-ref-symlink-diagnostics.review.md](./file-ref-symlink-diagnostics.review.md)
+- 日付: 2026-05-07
