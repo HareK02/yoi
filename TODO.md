@@ -15,6 +15,8 @@
   - ストリーム途中失敗時の継続 → [tickets/llm-worker-stream-continuation.md](tickets/llm-worker-stream-continuation.md)
 - llm-worker: Anthropic projection で assistant ターン内ブロックを 1 message に束ねる → [tickets/anthropic-assistant-burst-bundling.md](tickets/anthropic-assistant-burst-bundling.md)
 - ネイティブ GUI クライアント MVP → [tickets/native-gui-mvp.md](tickets/native-gui-mvp.md)
+- Client crate の切り出し（TUI/GUI/E2E 共通の protocol クライアント） → [tickets/client-crate.md](tickets/client-crate.md)
+- E2E テストハーネス（`tests/e2e/`、opt-in） → [tickets/e2e-harness.md](tickets/e2e-harness.md)
 - TUI 拡充
   - Run 中の入力キューイング → [tickets/tui-input-queue.md](tickets/tui-input-queue.md)
   - ユーザーマニフェストのモデル設定 wizard → [tickets/tui-user-model-setup.md](tickets/tui-user-model-setup.md)
