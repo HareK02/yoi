@@ -14,6 +14,10 @@ use crate::llm_client::{
 
 use super::AnthropicScheme;
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// Anthropic API request body
 #[derive(Debug, Serialize)]
 pub(crate) struct AnthropicRequest {
@@ -104,6 +108,8 @@ pub(crate) enum AnthropicContentPart {
     ToolResult {
         tool_use_id: String,
         content: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        is_error: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControl>,
     },
@@ -141,10 +147,11 @@ impl AnthropicContentPart {
         }
     }
 
-    fn tool_result(tool_use_id: String, content: String) -> Self {
+    fn tool_result(tool_use_id: String, content: String, is_error: bool) -> Self {
         Self::ToolResult {
             tool_use_id,
             content,
+            is_error,
             cache_control: None,
         }
     }
@@ -321,6 +328,7 @@ impl AnthropicScheme {
                     call_id,
                     summary,
                     content,
+                    is_error,
                     ..
                 } => {
                     flush_pending(
@@ -333,8 +341,10 @@ impl AnthropicScheme {
                         Some(c) => format!("{summary}\n{c}"),
                         None => summary.clone(),
                     };
-                    pending_user
-                        .push((i, AnthropicContentPart::tool_result(call_id.clone(), text)));
+                    pending_user.push((
+                        i,
+                        AnthropicContentPart::tool_result(call_id.clone(), text, *is_error),
+                    ));
                 }
 
                 Item::Reasoning {
@@ -355,13 +365,10 @@ impl AnthropicScheme {
                     //   素の reasoning text。Anthropic に投げる意味も
                     //   round-trip の根拠も無いので drop。
                     if let Some(sig) = signature.clone() {
-                        pending_assistant.push((
-                            i,
-                            AnthropicContentPart::thinking(text.clone(), sig),
-                        ));
-                    } else if let Some(data) = encrypted_content.clone() {
                         pending_assistant
-                            .push((i, AnthropicContentPart::redacted_thinking(data)));
+                            .push((i, AnthropicContentPart::thinking(text.clone(), sig)));
+                    } else if let Some(data) = encrypted_content.clone() {
+                        pending_assistant.push((i, AnthropicContentPart::redacted_thinking(data)));
                     }
                     // どちらも None なら何も pend せず、本 item は無視。
                 }
@@ -828,7 +835,9 @@ mod tests {
         assert_eq!(thinking_parts.len(), 1);
         match thinking_parts[0] {
             AnthropicContentPart::Thinking {
-                thinking, signature, ..
+                thinking,
+                signature,
+                ..
             } => {
                 assert_eq!(thinking, "step-by-step");
                 assert_eq!(signature, "SIG-A");

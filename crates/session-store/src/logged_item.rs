@@ -15,6 +15,10 @@
 use llm_worker::llm_client::types::{ContentPart, Item, Role};
 use serde::{Deserialize, Serialize};
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum LoggedItem {
@@ -32,6 +36,8 @@ pub enum LoggedItem {
         summary: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         content: Option<String>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        is_error: bool,
     },
     Reasoning {
         text: String,
@@ -86,11 +92,13 @@ impl From<&Item> for LoggedItem {
                 call_id,
                 summary,
                 content,
+                is_error,
                 ..
             } => Self::ToolResult {
                 call_id: call_id.clone(),
                 summary: summary.clone(),
                 content: content.clone(),
+                is_error: *is_error,
             },
             Item::Reasoning {
                 text,
@@ -138,11 +146,13 @@ impl From<LoggedItem> for Item {
                 call_id,
                 summary,
                 content,
+                is_error,
             } => Item::ToolResult {
                 id: None,
                 call_id,
                 summary,
                 content,
+                is_error,
             },
             LoggedItem::Reasoning {
                 text,
@@ -343,6 +353,18 @@ mod tests {
                 assert_eq!(summary, "ok");
                 assert_eq!(content.as_deref(), Some("full output"));
             }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn round_trip_tool_result_error_flag() {
+        let original = Item::tool_result_error("call_1", "permission denied");
+        let logged: LoggedItem = (&original).into();
+        let value = serde_json::to_value(&logged).unwrap();
+        assert_eq!(value["is_error"], true);
+        match Item::from(logged) {
+            Item::ToolResult { is_error, .. } => assert!(is_error),
             other => panic!("unexpected variant: {other:?}"),
         }
     }

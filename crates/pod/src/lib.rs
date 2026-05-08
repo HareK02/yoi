@@ -11,6 +11,7 @@ pub mod workflow;
 
 mod factory;
 mod interrupt_and_run;
+mod permission;
 mod pod;
 
 pub use compact::token_counter::{EstimateSource, SplitPoint, TokenEstimate};

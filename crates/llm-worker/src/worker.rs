@@ -742,8 +742,9 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
         // Map from tool call ID to (ToolCall, Meta, Tool)
         // Retained because it's needed for PostToolCall hooks
         let mut call_info_map = HashMap::new();
+        let mut synthetic_results = Vec::new();
 
-        // Phase 1: Apply pre_tool_call interceptor (determine skip/abort)
+        // Phase 1: Apply pre_tool_call interceptor (determine skip/abort/synthetic result)
         let mut approved_calls = Vec::new();
         for mut tool_call in tool_calls {
             if let Some((meta, tool)) = self.tool_server.get_tool(&tool_call.name) {
@@ -756,6 +757,15 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
                 match self.interceptor.pre_tool_call(&mut info).await {
                     PreToolAction::Continue => {}
                     PreToolAction::Skip => {
+                        continue;
+                    }
+                    PreToolAction::SyntheticResult(result) => {
+                        let tool_call = info.call;
+                        call_info_map.insert(
+                            tool_call.id.clone(),
+                            (tool_call, info.meta.clone(), info.tool.clone()),
+                        );
+                        synthetic_results.push(result);
                         continue;
                     }
                     PreToolAction::Abort(reason) => {
@@ -809,6 +819,7 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
                 return Err(WorkerError::Cancelled);
             }
         };
+        results.extend(synthetic_results);
 
         // Phase 3: Apply post_tool_call interceptor
         for tool_result in &mut results {
@@ -1124,16 +1135,12 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
             }
             Ok(ToolExecutionResult::Completed(results)) => {
                 for result in results {
-                    if let Some(ref content) = result.content {
-                        self.history.push(Item::tool_result_with_content(
-                            &result.tool_use_id,
-                            &result.summary,
-                            content,
-                        ));
-                    } else {
-                        self.history
-                            .push(Item::tool_result(&result.tool_use_id, &result.summary));
-                    }
+                    self.history.push(Item::tool_result_item(
+                        &result.tool_use_id,
+                        &result.summary,
+                        result.content,
+                        result.is_error,
+                    ));
                 }
                 Ok(None)
             }

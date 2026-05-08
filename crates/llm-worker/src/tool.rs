@@ -275,7 +275,7 @@ pub struct ToolCall {
 ///
 /// Intermediate representation between tool execution and history.
 /// Carries `summary` + optional `content` from [`ToolOutput`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolResult {
     /// Corresponding tool call ID
     pub tool_use_id: String,

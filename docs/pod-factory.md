@@ -34,6 +34,7 @@ overlay をマージして、検証済みの `PodManifest` と `PromptLoader` �
 | 配列スカラー（`worker.stop_sequences` 等） | 上層に値があれば配列ごと置換。追記マージはしない |
 | マップ（`tool_output.per_tool` 等） | キー単位でマージ、同一キーは上層優先 |
 | `scope.allow` / `scope.deny` | **union**（各層から全部足す）。上位層は `deny` で下位層の `allow` を必ず削れる |
+| `permissions.rule` | **union**（下位層の rule → 上位層の rule の順に評価）。`permissions.default_action` は上位層があれば上書き |
 
 各層をマージした結果（`PodManifestConfig`）を `TryFrom<PodManifestConfig>
 for PodManifest` が必須フィールド検証と絶対パス検証をかけて `PodManifest`
@@ -161,6 +162,19 @@ recursive = false
 target = "/abs/path/to/project/secrets"
 permission = "write"
 
+[permissions]
+default_action = "allow" # allow | deny | ask
+
+[[permissions.rule]]
+tool = "Bash"
+pattern = "rm *"
+action = "deny"
+
+[[permissions.rule]]
+tool = "Write"
+pattern = "*.env"
+action = "deny"
+
 [compaction]
 prune_protected_turns = 3
 prune_min_savings = 4096
@@ -200,6 +214,24 @@ scheme 側が吸収する。
 
 生成設定は provider 別の値域検証を行わない。型が TOML と合わない場合は manifest
 parse error になるが、provider が受け付けない値や組み合わせは API 応答で検出する。
+
+## `[permissions]` 設定
+
+`[permissions]` が無い場合、ツール permission 層は無効で従来通り実行する。`[permissions]` を書く場合は `default_action = "allow" | "deny" | "ask"` が必須で、`[[permissions.rule]]` は宣言順に最初に一致した rule が採用される。一致しなければ `default_action` を使う。
+
+```toml
+[permissions]
+default_action = "allow"
+
+[[permissions.rule]]
+tool = "Bash"
+pattern = "rm *"
+action = "deny"
+```
+
+`tool` は実行時に登録されているツール名（`Bash`, `Read`, `Write`, `Edit`, `Glob`, `Grep` 等）に対して大小文字を無視して照合する。`pattern` は built-in tool では主に `command` / `file_path` / `path` / `pattern` 引数に対する `*` / `?` ワイルドカードとして評価される。
+
+`allow` は通常実行、`deny` はその tool call を実行せず `is_error = true` の synthetic tool result を履歴へ追加してターンを継続する。`ask` は型として受け付けるが、承認 protocol は未実装のため現在は headless に待機せず fail-closed（synthetic error result）になる。
 
 ## instruction とプロンプト資産
 

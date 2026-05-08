@@ -12,7 +12,7 @@ use llm_worker::interceptor::{
     Interceptor, PostToolAction, PreToolAction, ToolCallInfo, ToolResultInfo,
 };
 use llm_worker::llm_client::event::{Event, ResponseStatus, StatusEvent};
-use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
+use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput, ToolResult};
 
 mod common;
 use common::MockLlmClient;
@@ -267,4 +267,60 @@ async fn test_post_tool_call_modification() {
         content.unwrap().contains("[Modified]"),
         "Result should be modified"
     );
+}
+
+/// Hook: pre_tool_call synthetic result - skipped tool gets an error result in history.
+#[tokio::test]
+async fn test_before_tool_call_synthetic_result_committed() {
+    let events = vec![
+        Event::tool_use_start(0, "call_1", "blocked_tool"),
+        Event::tool_input_delta(0, r#"{}"#),
+        Event::tool_use_stop(0),
+        Event::Status(StatusEvent {
+            status: ResponseStatus::Completed,
+        }),
+    ];
+
+    let client = MockLlmClient::with_responses(vec![
+        events,
+        vec![
+            Event::text_block_start(0),
+            Event::text_delta(0, "Denied."),
+            Event::text_block_stop(0, None),
+            Event::Status(StatusEvent {
+                status: ResponseStatus::Completed,
+            }),
+        ],
+    ]);
+    let mut worker = Worker::new(client);
+    let blocked_tool = SlowTool::new("blocked_tool", 10);
+    let blocked_clone = blocked_tool.clone();
+    worker.register_tool(blocked_tool.definition());
+
+    struct SyntheticPolicy;
+
+    #[async_trait]
+    impl Interceptor for SyntheticPolicy {
+        async fn pre_tool_call(&self, info: &mut ToolCallInfo) -> PreToolAction {
+            PreToolAction::SyntheticResult(ToolResult::error(
+                info.call.id.clone(),
+                "permission denied",
+            ))
+        }
+    }
+
+    worker.set_interceptor(SyntheticPolicy);
+
+    let result = worker.run("Test synthetic result").await.unwrap();
+
+    assert_eq!(blocked_clone.call_count(), 0, "Blocked tool should not run");
+    assert!(result.worker.history().iter().any(|item| matches!(
+        item,
+        llm_worker::Item::ToolResult {
+            call_id,
+            summary,
+            is_error: true,
+            ..
+        } if call_id == "call_1" && summary == "permission denied"
+    )));
 }

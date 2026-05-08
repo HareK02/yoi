@@ -7,8 +7,8 @@ mod scope;
 
 pub use cascade::{LayerLoadError, find_project_manifest_from, load_layer};
 pub use config::{
-    CompactionConfigPartial, PodManifestConfig, PodMetaConfig, ResolveError,
-    ToolOutputLimitsPartial, WorkerManifestConfig,
+    CompactionConfigPartial, PermissionConfigPartial, PodManifestConfig, PodMetaConfig,
+    ResolveError, ToolOutputLimitsPartial, WorkerManifestConfig,
 };
 pub use model::{
     AuthRef, ModelCapability, ModelManifest, ReasoningControl, ReasoningEffort, SchemeKind,
@@ -35,6 +35,10 @@ pub struct PodManifest {
     pub model: ModelManifest,
     pub worker: WorkerManifest,
     pub scope: ScopeConfig,
+    /// Optional manifest-level tool permission policy. Absent means the
+    /// permission layer is disabled and tool calls run as before.
+    #[serde(default)]
+    pub permissions: Option<ToolPermissionConfig>,
     #[serde(default)]
     pub compaction: Option<CompactionConfig>,
     /// Memory subsystem opt-in. Presence of `[memory]` in TOML enables
@@ -237,6 +241,38 @@ pub struct ScopeConfig {
     /// default.
     #[serde(default)]
     pub deny: Vec<ScopeRule>,
+}
+
+/// Manifest-level pattern-based tool permission policy.
+///
+/// Presence of `[permissions]` enables this layer. Rules are evaluated
+/// in declaration order; if none match, [`Self::default_action`] is used.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolPermissionConfig {
+    pub default_action: ToolPermissionAction,
+    #[serde(default, rename = "rule")]
+    pub rules: Vec<ToolPermissionRule>,
+}
+
+/// One `[[permissions.rule]]` entry.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolPermissionRule {
+    /// Tool registration name. Matching is case-insensitive at runtime so
+    /// manifests may use either `Bash` or `bash`.
+    pub tool: String,
+    /// Glob-like pattern matched against the tool's permission target
+    /// (for built-in tools, commonly `command`, `file_path`, or `pattern`).
+    pub pattern: String,
+    pub action: ToolPermissionAction,
+}
+
+/// Tool permission decision.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolPermissionAction {
+    Allow,
+    Deny,
+    Ask,
 }
 
 /// Context compaction configuration.

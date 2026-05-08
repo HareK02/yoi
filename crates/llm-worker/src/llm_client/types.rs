@@ -9,6 +9,10 @@
 
 use serde::{Deserialize, Serialize};
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 // ============================================================================
 // Item - The core unit of conversation
 // ============================================================================
@@ -79,6 +83,9 @@ pub enum Item {
         /// Detailed output (removed by pruning when old enough)
         #[serde(default, skip_serializing_if = "Option::is_none")]
         content: Option<String>,
+        /// Whether the tool result represents an execution error.
+        #[serde(default, skip_serializing_if = "is_false")]
+        is_error: bool,
     },
 
     /// Reasoning/thinking item
@@ -198,11 +205,27 @@ impl Item {
 
     /// Create a tool result item with summary only (no content).
     pub fn tool_result(call_id: impl Into<String>, summary: impl Into<String>) -> Self {
+        Self::tool_result_item(call_id, summary, None, false)
+    }
+
+    /// Create an error tool result item with summary only (no content).
+    pub fn tool_result_error(call_id: impl Into<String>, summary: impl Into<String>) -> Self {
+        Self::tool_result_item(call_id, summary, None, true)
+    }
+
+    /// Create a tool result item with summary, optional content, and error flag.
+    pub fn tool_result_item(
+        call_id: impl Into<String>,
+        summary: impl Into<String>,
+        content: Option<String>,
+        is_error: bool,
+    ) -> Self {
         Self::ToolResult {
             id: None,
             call_id: call_id.into(),
             summary: summary.into(),
-            content: None,
+            content,
+            is_error,
         }
     }
 
@@ -212,12 +235,7 @@ impl Item {
         summary: impl Into<String>,
         content: impl Into<String>,
     ) -> Self {
-        Self::ToolResult {
-            id: None,
-            call_id: call_id.into(),
-            summary: summary.into(),
-            content: Some(content.into()),
-        }
+        Self::tool_result_item(call_id, summary, Some(content.into()), false)
     }
 
     // ========================================================================

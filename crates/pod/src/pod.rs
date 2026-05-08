@@ -333,6 +333,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             memory_task: None,
             user_segments: Vec::new(),
         };
+        pod.apply_permissions_from_manifest();
         pod.apply_prune_from_manifest();
         Ok(pod)
     }
@@ -2291,6 +2292,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             memory_task: None,
             user_segments: Vec::new(),
         };
+        pod.apply_permissions_from_manifest();
         pod.apply_prune_from_manifest();
         drain_skill_shadows(&pod, skill_shadows);
         Ok(pod)
@@ -2361,6 +2363,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             memory_task: None,
             user_segments: Vec::new(),
         };
+        pod.apply_permissions_from_manifest();
         pod.apply_prune_from_manifest();
         drain_skill_shadows(&pod, skill_shadows);
         Ok(pod)
@@ -2497,6 +2500,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             memory_task: None,
             user_segments: state.user_segments,
         };
+        pod.apply_permissions_from_manifest();
         pod.apply_prune_from_manifest();
         drain_skill_shadows(&pod, skill_shadows);
         Ok(pod)

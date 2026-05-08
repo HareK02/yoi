@@ -103,3 +103,8 @@ action = "deny"
 ## 依存チケット
 
 - ~~[remove-hook-module.md](remove-hook-module.md)~~ — 完了。PreToolCall は Pod 層の `hook::Hook<PreToolCall>` として利用可能
+
+## Review
+- 状態: Approve with follow-up
+- レビュー詳細: [./permission-extension-point.review.md](./permission-extension-point.review.md)
+- 日付: 2026-05-05

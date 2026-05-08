@@ -52,6 +52,11 @@ pub enum PreToolAction {
     Continue,
     /// Skip this tool call (do not execute).
     Skip,
+    /// Do not execute the tool call; commit this synthetic result instead.
+    ///
+    /// This preserves provider-visible `tool_use` / `tool_result` pairing
+    /// without aborting the whole turn.
+    SyntheticResult(ToolResult),
     /// Abort the entire run.
     Abort(String),
     /// Pause execution (can be resumed later).

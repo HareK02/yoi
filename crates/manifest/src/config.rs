@@ -16,7 +16,7 @@ use crate::defaults;
 use crate::model::{AuthRef, ModelManifest, ReasoningControl};
 use crate::{
     CompactionConfig, MemoryConfig, PodManifest, PodMeta, ScopeConfig, SkillsConfig,
-    ToolOutputLimits, WorkerManifest,
+    ToolOutputLimits, ToolPermissionConfig, ToolPermissionRule, WorkerManifest,
 };
 
 /// Partial-form Pod manifest. Every field is optional; one or more
@@ -36,6 +36,10 @@ pub struct PodManifestConfig {
     pub worker: WorkerManifestConfig,
     #[serde(default)]
     pub scope: ScopeConfig,
+    /// Optional `[permissions]` section. `None` means the permission layer
+    /// is disabled; `Some` requires `default_action` during final resolve.
+    #[serde(default)]
+    pub permissions: Option<PermissionConfigPartial>,
     #[serde(default)]
     pub compaction: Option<CompactionConfigPartial>,
     /// Memory subsystem opt-in. See [`MemoryConfig`].
@@ -85,6 +89,14 @@ pub struct ToolOutputLimitsPartial {
     pub default_max_bytes: Option<usize>,
     #[serde(default)]
     pub per_tool: HashMap<String, usize>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PermissionConfigPartial {
+    #[serde(default)]
+    pub default_action: Option<crate::ToolPermissionAction>,
+    #[serde(default, rename = "rule")]
+    pub rules: Vec<ToolPermissionRule>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -204,6 +216,11 @@ impl PodManifestConfig {
             model: self.model.merge(upper.model),
             worker: self.worker.merge(upper.worker),
             scope: merge_scope(self.scope, upper.scope),
+            permissions: merge_option(
+                self.permissions,
+                upper.permissions,
+                PermissionConfigPartial::merge,
+            ),
             compaction: merge_option(
                 self.compaction,
                 upper.compaction,
@@ -276,6 +293,16 @@ impl ToolOutputLimitsPartial {
         Self {
             default_max_bytes: upper.default_max_bytes.or(self.default_max_bytes),
             per_tool,
+        }
+    }
+}
+
+impl PermissionConfigPartial {
+    fn merge(mut self, upper: Self) -> Self {
+        self.rules.extend(upper.rules);
+        Self {
+            default_action: upper.default_action.or(self.default_action),
+            rules: self.rules,
         }
     }
 }
@@ -400,6 +427,18 @@ impl TryFrom<PodManifestConfig> for PodManifest {
             ensure_absolute("scope.deny.target", &rule.target)?;
         }
 
+        let permissions = cfg
+            .permissions
+            .map(|p| {
+                Ok(ToolPermissionConfig {
+                    default_action: p
+                        .default_action
+                        .ok_or(ResolveError::MissingField("permissions.default_action"))?,
+                    rules: p.rules,
+                })
+            })
+            .transpose()?;
+
         let compaction = cfg
             .compaction
             .map(|c| -> Result<CompactionConfig, ResolveError> {
@@ -438,6 +477,7 @@ impl TryFrom<PodManifestConfig> for PodManifest {
             model: cfg.model,
             worker,
             scope: cfg.scope,
+            permissions,
             compaction,
             memory: cfg.memory,
             skills: cfg.skills,
@@ -482,6 +522,7 @@ mod tests {
                 }],
                 deny: Vec::new(),
             },
+            permissions: None,
             compaction: None,
             memory: None,
             skills: None,
@@ -493,6 +534,51 @@ mod tests {
         let manifest: PodManifest = minimal_valid().try_into().unwrap();
         assert_eq!(manifest.pod.name, "test");
         assert_eq!(manifest.model.scheme, Some(SchemeKind::Anthropic));
+        assert!(manifest.permissions.is_none());
+    }
+
+    #[test]
+    fn resolve_permissions_requires_default_action_when_present() {
+        let mut cfg = minimal_valid();
+        cfg.permissions = Some(PermissionConfigPartial {
+            default_action: None,
+            rules: Vec::new(),
+        });
+
+        let err = PodManifest::try_from(cfg).unwrap_err();
+
+        assert!(matches!(
+            err,
+            ResolveError::MissingField("permissions.default_action")
+        ));
+    }
+
+    #[test]
+    fn resolve_permissions_preserves_actions_and_rule_order() {
+        let mut cfg = minimal_valid();
+        cfg.permissions = Some(PermissionConfigPartial {
+            default_action: Some(crate::ToolPermissionAction::Ask),
+            rules: vec![
+                ToolPermissionRule {
+                    tool: "Bash".into(),
+                    pattern: "rm *".into(),
+                    action: crate::ToolPermissionAction::Deny,
+                },
+                ToolPermissionRule {
+                    tool: "Read".into(),
+                    pattern: "*".into(),
+                    action: crate::ToolPermissionAction::Allow,
+                },
+            ],
+        });
+
+        let manifest: PodManifest = cfg.try_into().unwrap();
+        let permissions = manifest.permissions.unwrap();
+
+        assert_eq!(permissions.default_action, crate::ToolPermissionAction::Ask);
+        assert_eq!(permissions.rules.len(), 2);
+        assert_eq!(permissions.rules[0].tool, "Bash");
+        assert_eq!(permissions.rules[1].tool, "Read");
     }
 
     #[test]
@@ -692,6 +778,42 @@ mod tests {
         let merged = lower.merge(upper);
         assert_eq!(merged.scope.allow.len(), 2);
         assert_eq!(merged.scope.deny.len(), 1);
+    }
+
+    #[test]
+    fn merge_permissions_accumulates_rules_and_upper_default_wins() {
+        let lower = PodManifestConfig {
+            permissions: Some(PermissionConfigPartial {
+                default_action: Some(crate::ToolPermissionAction::Allow),
+                rules: vec![ToolPermissionRule {
+                    tool: "Bash".into(),
+                    pattern: "git *".into(),
+                    action: crate::ToolPermissionAction::Allow,
+                }],
+            }),
+            ..Default::default()
+        };
+        let upper = PodManifestConfig {
+            permissions: Some(PermissionConfigPartial {
+                default_action: Some(crate::ToolPermissionAction::Deny),
+                rules: vec![ToolPermissionRule {
+                    tool: "Bash".into(),
+                    pattern: "rm *".into(),
+                    action: crate::ToolPermissionAction::Deny,
+                }],
+            }),
+            ..Default::default()
+        };
+
+        let merged = lower.merge(upper).permissions.unwrap();
+
+        assert_eq!(
+            merged.default_action,
+            Some(crate::ToolPermissionAction::Deny)
+        );
+        assert_eq!(merged.rules.len(), 2);
+        assert_eq!(merged.rules[0].pattern, "git *");
+        assert_eq!(merged.rules[1].pattern, "rm *");
     }
 
     #[test]
