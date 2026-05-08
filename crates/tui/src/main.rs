@@ -330,6 +330,7 @@ async fn run_loop(
                     Some(ev) => app.handle_pod_event(ev),
                     None => {
                         app.connected = false;
+                        app.mark_orphan_compacts_incomplete();
                         app.push_error("Connection lost");
                     }
                 }

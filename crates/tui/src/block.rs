@@ -78,9 +78,21 @@ pub enum ThinkingState {
 }
 
 pub enum CompactEvent {
-    Start,
-    Done { new_session_id: uuid::Uuid },
-    Failed { error: String },
+    /// Live block: compaction worker is running. `started_at` powers the
+    /// `Compacting... (Xs)` live timer.
+    Streaming { started_at: Instant },
+    /// Compaction ended cleanly with `CompactDone`.
+    Done {
+        new_session_id: uuid::Uuid,
+        elapsed_secs: Option<u64>,
+    },
+    /// Compaction ended with `CompactFailed`.
+    Failed {
+        error: String,
+        elapsed_secs: Option<u64>,
+    },
+    /// The TUI stopped observing events before a terminal compact event.
+    Incomplete { elapsed_secs: Option<u64> },
 }
 
 pub struct ToolCallBlock {

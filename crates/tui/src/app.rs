@@ -568,9 +568,7 @@ impl App {
             }
             Event::ToolCallDone { id, arguments, .. } => {
                 self.current_tool = None;
-                let name = self
-                    .find_tool_call_mut(&id)
-                    .map(|b| b.name.clone());
+                let name = self.find_tool_call_mut(&id).map(|b| b.name.clone());
                 if let Some(name) = name.as_deref() {
                     self.task_store.apply_tool_call(name, &arguments);
                 }
@@ -679,15 +677,47 @@ impl App {
                 self.assistant_streaming = false;
             }
             Event::CompactStart => {
-                self.blocks.push(Block::Compact(CompactEvent::Start));
+                self.blocks.push(Block::Compact(CompactEvent::Streaming {
+                    started_at: Instant::now(),
+                }));
             }
             Event::CompactDone { new_session_id } => {
-                self.blocks
-                    .push(Block::Compact(CompactEvent::Done { new_session_id }));
+                if let Some(evt) = self.last_streaming_compact_mut() {
+                    let elapsed_secs = match evt {
+                        CompactEvent::Streaming { started_at } => {
+                            Some(started_at.elapsed().as_secs())
+                        }
+                        _ => None,
+                    };
+                    *evt = CompactEvent::Done {
+                        new_session_id,
+                        elapsed_secs,
+                    };
+                } else {
+                    self.blocks.push(Block::Compact(CompactEvent::Done {
+                        new_session_id,
+                        elapsed_secs: None,
+                    }));
+                }
             }
             Event::CompactFailed { error } => {
-                self.blocks
-                    .push(Block::Compact(CompactEvent::Failed { error }));
+                if let Some(evt) = self.last_streaming_compact_mut() {
+                    let elapsed_secs = match evt {
+                        CompactEvent::Streaming { started_at } => {
+                            Some(started_at.elapsed().as_secs())
+                        }
+                        _ => None,
+                    };
+                    *evt = CompactEvent::Failed {
+                        error,
+                        elapsed_secs,
+                    };
+                } else {
+                    self.blocks.push(Block::Compact(CompactEvent::Failed {
+                        error,
+                        elapsed_secs: None,
+                    }));
+                }
             }
             Event::Alert(alert) => {
                 self.blocks.push(Block::Alert {
@@ -719,6 +749,7 @@ impl App {
                 }
             }
             Event::Shutdown => {
+                self.mark_orphan_compacts_incomplete();
                 self.quit = true;
             }
         }
@@ -771,6 +802,33 @@ impl App {
                 }
                 Block::TurnHeader { .. } => break,
                 _ => {}
+            }
+        }
+    }
+
+    fn last_streaming_compact_mut(&mut self) -> Option<&mut CompactEvent> {
+        for b in self.blocks.iter_mut().rev() {
+            match b {
+                Block::Compact(evt) if matches!(evt, CompactEvent::Streaming { .. }) => {
+                    return Some(evt);
+                }
+                Block::Compact(_) => return None,
+                _ => continue,
+            }
+        }
+        None
+    }
+
+    pub(crate) fn mark_orphan_compacts_incomplete(&mut self) {
+        for b in self.blocks.iter_mut().rev() {
+            if let Block::Compact(evt) = b {
+                if let CompactEvent::Streaming { started_at } = evt {
+                    *evt = CompactEvent::Incomplete {
+                        elapsed_secs: Some(started_at.elapsed().as_secs()),
+                    };
+                } else {
+                    break;
+                }
             }
         }
     }
@@ -1308,6 +1366,66 @@ mod completion_flow_tests {
             app.blocks.as_slice(),
             [Block::SystemMessage { text }] if text == "[Workflow /build]\nRun the build"
         ));
+    }
+
+    #[test]
+    fn compact_done_replaces_live_block() {
+        let mut app = App::new("test".into());
+        let id = uuid::Uuid::parse_str("12345678-1234-5678-1234-567812345678").unwrap();
+
+        app.handle_pod_event(Event::CompactStart);
+        app.handle_pod_event(Event::CompactDone { new_session_id: id });
+
+        assert_eq!(compact_block_count(&app), 1);
+        assert!(matches!(
+            app.blocks.as_slice(),
+            [Block::Compact(CompactEvent::Done {
+                new_session_id,
+                elapsed_secs: Some(_),
+            })] if *new_session_id == id
+        ));
+    }
+
+    #[test]
+    fn compact_failed_replaces_live_block() {
+        let mut app = App::new("test".into());
+
+        app.handle_pod_event(Event::CompactStart);
+        app.handle_pod_event(Event::CompactFailed {
+            error: "provider 429".into(),
+        });
+
+        assert_eq!(compact_block_count(&app), 1);
+        assert!(matches!(
+            app.blocks.as_slice(),
+            [Block::Compact(CompactEvent::Failed {
+                error,
+                elapsed_secs: Some(_),
+            })] if error == "provider 429"
+        ));
+    }
+
+    #[test]
+    fn shutdown_marks_live_compact_incomplete() {
+        let mut app = App::new("test".into());
+
+        app.handle_pod_event(Event::CompactStart);
+        app.handle_pod_event(Event::Shutdown);
+
+        assert!(app.quit);
+        assert!(matches!(
+            app.blocks.as_slice(),
+            [Block::Compact(CompactEvent::Incomplete {
+                elapsed_secs: Some(_),
+            })]
+        ));
+    }
+
+    fn compact_block_count(app: &App) -> usize {
+        app.blocks
+            .iter()
+            .filter(|block| matches!(block, Block::Compact(_)))
+            .count()
     }
 
     fn test_greeting() -> protocol::Greeting {

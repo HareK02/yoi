@@ -1011,26 +1011,56 @@ fn fmt_elapsed(secs: u64) -> String {
 
 fn render_compact(lines: &mut Vec<Line<'static>>, evt: &CompactEvent, width: u16, mode: Mode) {
     let (text, kind) = match evt {
-        CompactEvent::Start => ("[compact] starting".to_owned(), MessageKind::NoticeWarn),
-        CompactEvent::Done { new_session_id } => {
+        CompactEvent::Streaming { started_at } => {
+            let secs = started_at.elapsed().as_secs();
+            (
+                format!("Compacting... ({})", fmt_elapsed(secs)),
+                MessageKind::NoticeWarn,
+            )
+        }
+        CompactEvent::Done {
+            new_session_id,
+            elapsed_secs,
+        } => {
             let short = new_session_id
                 .to_string()
                 .chars()
                 .take(8)
                 .collect::<String>();
+            let elapsed = elapsed_suffix(*elapsed_secs);
             (
-                format!("[compact] done (new session {short})"),
+                format!("[compact] done (new session {short}){elapsed}"),
                 MessageKind::NoticeWarn,
             )
         }
-        CompactEvent::Failed { error } => {
-            (format!("[compact error] {error}"), MessageKind::NoticeError)
+        CompactEvent::Failed {
+            error,
+            elapsed_secs,
+        } => {
+            let elapsed = elapsed_suffix(*elapsed_secs);
+            (
+                format!("[compact error] {error}{elapsed}"),
+                MessageKind::NoticeError,
+            )
         }
+        CompactEvent::Incomplete { elapsed_secs } => match elapsed_secs {
+            Some(s) => (
+                format!("[compact] interrupted ({})", fmt_elapsed(*s)),
+                MessageKind::NoticeError,
+            ),
+            None => ("[compact] interrupted".to_owned(), MessageKind::NoticeError),
+        },
     };
     match mode {
         Mode::Overview => push_overview_line(lines, &text, width, kind, ""),
         _ => push_padded_lines(lines, &text, kind),
     }
+}
+
+fn elapsed_suffix(elapsed_secs: Option<u64>) -> String {
+    elapsed_secs
+        .map(|s| format!(" ({})", fmt_elapsed(s)))
+        .unwrap_or_default()
 }
 
 fn draw_separator(frame: &mut Frame, area: Rect) {
