@@ -2,6 +2,7 @@
   - 内部 Worker / 内部 Pod の Workflow 化 → [tickets/internal-worker-workflow.md](tickets/internal-worker-workflow.md)
   - 半自動開発運用 Workflow → [tickets/auto-maintain-workflow.md](tickets/auto-maintain-workflow.md)
   - Workflow を memory crate から独立させる → [tickets/workflow-crate-extraction.md](tickets/workflow-crate-extraction.md)
+  - Prompt / Workflow 評価メトリクスと改善 Offer → [tickets/prompt-eval-metrics.md](tickets/prompt-eval-metrics.md)
 - パーミッション: パターンベースのツール実行制御 → [tickets/permission-extension-point.md](tickets/permission-extension-point.md)
 - Pod CLI: マニフェスト関連フラグの整理 → [tickets/pod-cli-manifest-flags.md](tickets/pod-cli-manifest-flags.md)
 - Pod: 空応答ターン (Submit 後 AI 応答ゼロで Pause/Cancel) を自動巻き戻し → [tickets/pod-empty-turn-rollback.md](tickets/pod-empty-turn-rollback.md)

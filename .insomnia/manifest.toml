@@ -1,3 +1,9 @@
+[scope]
+allow = [
+    { target = ".", permission = "write", recursive = true },
+    { target = "<external-checkouts>", permission = "read", recursive = true },
+]
+
 [memory]
 extract_threshold = 50000
 

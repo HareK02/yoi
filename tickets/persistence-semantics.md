@@ -38,6 +38,11 @@
   - Pod が過去に辿った session / log の順序付き履歴をどこに持つべきか。
 - runtime state と persistent state の境界。
   - `history.json` / `status.json` / `spawned_pods.json` を永続正本として扱わない方針の確認。
+- session log の `pod.scope` extension entry を撤廃するか（要検討）。
+  - 現状: session log に `PodScopeSnapshot` を extension として append し、session 復元時に scope も復元できる。
+  - Pod 単位永続化（`tickets/pod-persistent-state.md`）が入ると、scope の正本を Pod state に持つほうが責務が明確で、session log との重複も解消できる。
+  - ただし scope は session 内で動的に変化し得るため、「最新 snapshot は Pod state 」「変化履歴は session log の event として残す」のような分割もあり得る。conversation timeline 上の scope 変化を session 単独で再現する必要があるかが論点。
+  - 撤廃の選択肢: (a) session log から完全に削除し Pod state を唯一の正本にする / (b) snapshot 保持責務だけ Pod state に寄せ、scope 変更 event は session log に残す / (c) 現状維持で Pod state は session への参照のみ。
 - DB backend を想定した場合のテーブル / relation 相当の構造。
   - append-only entry log
   - lineage / origin
