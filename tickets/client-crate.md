@@ -49,3 +49,8 @@ TUI 内に置いたまま GUI と E2E から再利用しようとすると、TUI
 - `tickets/e2e-harness.md`
 - `crates/tui/src/client.rs`
 - `crates/protocol/`
+
+## Review
+- 状態: Approve
+- レビュー詳細: [./client-crate.review.md](./client-crate.review.md)
+- 日付: 2026-05-09

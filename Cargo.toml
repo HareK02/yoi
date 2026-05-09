@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/client",
     "crates/daemon",
     "crates/llm-worker",
     "crates/llm-worker-macros",
@@ -22,6 +23,7 @@ license = "MIT"
 
 [workspace.dependencies]
 # Internal crates
+client = { path = "crates/client" }
 llm-worker = { path = "crates/llm-worker", version = "0.2" }
 llm-worker-macros = { path = "crates/llm-worker-macros", version = "0.2" }
 manifest = { path = "crates/manifest" }

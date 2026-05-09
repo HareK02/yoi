@@ -1,7 +1,6 @@
 mod app;
 mod block;
 mod cache;
-mod client;
 mod input;
 mod markdown;
 mod picker;
@@ -28,8 +27,9 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use session_store::SessionId;
 
+use client::PodClient;
+
 use crate::app::App;
-use crate::client::PodClient;
 use crate::picker::PickerOutcome;
 use crate::spawn::{SpawnOutcome, SpawnReady};
 
