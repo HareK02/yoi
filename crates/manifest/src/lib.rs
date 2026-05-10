@@ -321,10 +321,15 @@ pub struct CompactionConfig {
     #[serde(default = "default_compact_auto_read_budget")]
     pub compact_auto_read_budget: u64,
 
-    /// Cumulative input-token cap for the compact worker's own LLM
-    /// calls. Exceeding this aborts the compact run.
+    /// Current prompt-occupancy cap for the compact worker's own LLM
+    /// requests. Exceeding this aborts the compact run.
     #[serde(default = "default_compact_worker_max_input_tokens")]
     pub compact_worker_max_input_tokens: u64,
+
+    /// Optional maximum compact-worker tool-loop depth. `None` leaves the
+    /// worker unlimited; the default bounds runaway short-context loops.
+    #[serde(default = "default_compact_worker_max_turns")]
+    pub compact_worker_max_turns: Option<u32>,
 
     /// Optional model for the compactor (summary) LLM.
     /// If omitted, the main model is cloned via `clone_boxed()`.
@@ -347,6 +352,9 @@ fn default_compact_auto_read_budget() -> u64 {
 fn default_compact_worker_max_input_tokens() -> u64 {
     defaults::COMPACT_WORKER_MAX_INPUT_TOKENS
 }
+fn default_compact_worker_max_turns() -> Option<u32> {
+    defaults::COMPACT_WORKER_MAX_TURNS
+}
 
 impl Default for CompactionConfig {
     fn default() -> Self {
@@ -358,6 +366,7 @@ impl Default for CompactionConfig {
             compact_retained_tokens: default_compact_retained_tokens(),
             compact_auto_read_budget: default_compact_auto_read_budget(),
             compact_worker_max_input_tokens: default_compact_worker_max_input_tokens(),
+            compact_worker_max_turns: default_compact_worker_max_turns(),
             model: None,
         }
     }
@@ -521,6 +530,19 @@ model_id = "claude-sonnet-4-20250514"
         assert_eq!(c.compact_threshold, Some(80000));
         assert_eq!(c.compact_request_threshold, None);
         assert_eq!(c.compact_retained_tokens, 8000);
+        assert_eq!(c.compact_worker_max_turns, Some(20));
+    }
+
+    #[test]
+    fn parse_compaction_worker_max_turns() {
+        let toml = format!(
+            "{MINIMAL_REQUIRED}\n\
+             [compaction]\n\
+             compact_worker_max_turns = 7\n"
+        );
+        let manifest = PodManifest::from_toml(&toml).unwrap();
+        let c = manifest.compaction.unwrap();
+        assert_eq!(c.compact_worker_max_turns, Some(7));
     }
 
     #[test]

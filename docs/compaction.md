@@ -140,7 +140,8 @@ compact_threshold = 80000              # ターンの合間 (proactive)
 compact_request_threshold = 90000      # リクエストの合間 (safety net)
 retained_tokens = 8000                 # 直近保護トークン数 (Prune 済みで計測)
 auto_read_budget = 8000                # compact worker の mark_read_required 合計上限
-compact_worker_max_input_tokens = 50000 # compact worker 自身の累計入力トークン上限
+compact_worker_max_input_tokens = 50000 # compact worker 自身の現在占有トークン上限
+compact_worker_max_turns = 20           # compact worker 自身の tool loop 上限
 ```
 
 ### Auto-Read とリファレンス

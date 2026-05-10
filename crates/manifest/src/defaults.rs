@@ -36,11 +36,15 @@ pub const DEFAULT_INSTRUCTION: &str = "$insomnia/default";
 /// [`crate::CompactionConfig::compact_auto_read_budget`].
 pub const COMPACT_AUTO_READ_BUDGET: u64 = 8000;
 
-/// Cumulative input-token cap for the compact worker's own LLM
+/// Current prompt-occupancy cap for the compact worker's own LLM
 /// calls. Exceeding this aborts the compact run (circuit-breaker
 /// path). See
 /// [`crate::CompactionConfig::compact_worker_max_input_tokens`].
 pub const COMPACT_WORKER_MAX_INPUT_TOKENS: u64 = 50_000;
+
+/// Optional maximum compact-worker tool-loop depth. `None` means unlimited.
+/// See [`crate::CompactionConfig::compact_worker_max_turns`].
+pub const COMPACT_WORKER_MAX_TURNS: Option<u32> = Some(20);
 
 /// Number of recently-touched files fed to the compact worker as
 /// default references.
