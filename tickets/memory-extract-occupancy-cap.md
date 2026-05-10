@@ -53,3 +53,8 @@ extract worker は compact ほどツールループが深くない（`extract.wr
 - `crates/manifest/src/defaults.rs`: `MEMORY_EXTRACT_WORKER_MAX_INPUT_TOKENS` の doc 更新、`MEMORY_EXTRACT_WORKER_MAX_TURNS` 定数の追加。
 - `docs/manifest.toml` 等の memory 設定例: 新フィールドと意味の更新。
 - `crates/pod/src/pod.rs` 周辺もしくは新規モジュールでのユニットテスト（compact 側で追加した 2 パターンを extract 用に）。
+
+## Review
+- 状態: Approve
+- レビュー詳細: [./memory-extract-occupancy-cap.review.md](./memory-extract-occupancy-cap.review.md)
+- 日付: 2026-05-11
