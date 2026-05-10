@@ -44,3 +44,8 @@
 - `resources/prompts/internal/memory_consolidation_system.md`
 - `docs/plan/memory-prompts.md`
 - `docs/plan/memory.md`
+
+## Review
+- 状態: Approve
+- レビュー詳細: [./memory-prompts-remove-ticket-policy.review.md](./memory-prompts-remove-ticket-policy.review.md)
+- 日付: 2026-05-09

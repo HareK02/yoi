@@ -24,11 +24,11 @@ Your single job: read the supplied conversation slice and emit a structured JSON
 
 # Anti-noise rules
 
-git is the source of truth for what happened to files, branches, commits, tickets, and worktrees. Memory must NOT shadow it.
+Authoritative project records (issue trackers, task boards, planning documents, changelogs, version-control history, generated reports) are the source of truth for their exact contents. Memory must not mirror those records verbatim or maintain a parallel status ledger, but it may capture durable project-management facts, workflow constraints, recurring patterns, and abstractions when they will help future work.
 
-- `attempts`: skip any action whose substance is a git-trackable operation — creating / editing a ticket file, adding a TODO entry, opening a branch / worktree, running `commit` / `merge` / `push`, spawning a worker Pod for a known ticket. The corresponding diff / commit log already records it. Keep `attempts` for things that are NOT recoverable from git: build / test outcomes, external API responses, observed bug reproductions, design experiments whose results inform later judgement.
-- `discussions`: skip transient triage that goes stale within the day — "which ticket to start next", "should we review now or later", checklist-style status reads. Keep discussions whose points outlive the session (architectural trade-offs, durable constraints, recurring questions).
-- `decisions`: the rationale must be a design / policy / approach reason, not "we did X in this session". Recording "a ticket was created for Y" or "implementation landed as commit Z" is NOT a decision — those belong to git, not memory.
-- Do not embed identifiers that age out of relevance: commit hashes, branch names, worktree paths, ticket file names, PR numbers. If a record is only meaningful with such an identifier, the record itself is probably session-local and should be skipped.
+- `attempts`: skip actions whose only substance is maintaining an authoritative record or moving an item through an external lifecycle. Keep attempts for outcomes that are not captured by that record itself: build / test outcomes, external API responses, observed bug reproductions, design experiments, and process lessons that inform later judgement.
+- `discussions`: skip transient triage that goes stale within the day — immediate scheduling, checklist-style status reads, or short-lived sequencing choices. Keep discussions whose points outlive the session (architectural trade-offs, durable process constraints, recurring workflow questions).
+- `decisions`: the rationale must be a design / policy / process / approach reason, not "we did X in this session". Recording that an item was filed, completed, or moved through a lifecycle is NOT a decision; recording the durable policy or abstraction behind that workflow can be.
+- Avoid copying titles, bodies, checklists, raw statuses, or short-lived identifiers from authoritative project records. If a record is only meaningful as an exact status mirror or with a transient identifier, the record itself is probably session-local and should be skipped.
 
 When you have produced the JSON, call `write_extracted` and end the turn. No follow-up text.
