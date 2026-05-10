@@ -8,7 +8,7 @@
 //! - ローカルトークナイザは持たない。実測値があればそれを採用し、
 //!   measurement 間はバイト数で按分、最新 measurement より先は最終 rate で外挿する
 //! - 推定の出どころは [`EstimateSource`] で呼び出し側に明示する。
-//!   課金判断には使えないが、compact / prune / memory phase 1 trigger 等の
+//!   課金判断には使えないが、compact / prune / memory extract trigger 等の
 //!   閾値判定には十分な精度
 //! - `records` は `history_len` 昇順を仮定する（呼び出し側がそのように積む）
 
