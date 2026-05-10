@@ -18,7 +18,6 @@
 //! compacted session's opening system messages.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -28,6 +27,7 @@ use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use serde::Deserialize;
 use tools::ScopedFs;
 
+use crate::compact::usage_tracker::UsageTracker;
 use crate::fs_view::{ReadRequirement, slice_lines};
 
 /// Aggregated output of a compact worker run.
@@ -246,24 +246,29 @@ pub(crate) fn write_summary_tool(ctx: Arc<Mutex<CompactWorkerContext>>) -> ToolD
     })
 }
 
-/// Interceptor that aborts the compact worker as soon as its cumulative
-/// input-token count crosses `max_input_tokens`. Pairs with the
-/// `on_usage` callback registered by `Pod::compact`, which is what
-/// actually accumulates `input_so_far`.
+/// Interceptor that aborts the compact worker when its current prompt
+/// occupancy estimate crosses `max_input_tokens`. The estimate uses the same
+/// `UsageRecord` + `llm_worker::token_counter::total_tokens` path as the main
+/// Pod compaction thresholds, so prompt-cache hits are not counted cumulatively
+/// across turns.
 pub(crate) struct CompactWorkerInterceptor {
-    pub input_so_far: Arc<AtomicU64>,
+    pub usage_tracker: Arc<UsageTracker>,
     pub max_input_tokens: u64,
 }
 
 #[async_trait]
 impl Interceptor for CompactWorkerInterceptor {
-    async fn pre_llm_request(&self, _context: &mut Vec<Item>) -> PreRequestAction {
-        if self.input_so_far.load(Ordering::Relaxed) > self.max_input_tokens {
+    async fn pre_llm_request(&self, context: &mut Vec<Item>) -> PreRequestAction {
+        let records = self.usage_tracker.records();
+        let estimate = llm_worker::token_counter::total_tokens(context, &records);
+        if estimate.tokens > self.max_input_tokens {
             return PreRequestAction::Cancel(format!(
-                "compact worker input exceeded {} tokens",
+                "compact worker input occupancy exceeded {} tokens",
                 self.max_input_tokens
             ));
         }
+
+        self.usage_tracker.note_request(context.len());
         PreRequestAction::Continue
     }
 }
@@ -281,6 +286,66 @@ mod tests {
     fn make_fs(tmp: &std::path::Path) -> ScopedFs {
         let scope = Scope::writable(tmp.to_path_buf()).unwrap();
         ScopedFs::new(scope, tmp.to_path_buf())
+    }
+
+    fn make_usage(input: u64) -> llm_worker::timeline::event::UsageEvent {
+        llm_worker::timeline::event::UsageEvent {
+            input_tokens: Some(input),
+            output_tokens: Some(0),
+            total_tokens: Some(input),
+            cache_read_input_tokens: None,
+            cache_creation_input_tokens: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn compact_worker_interceptor_uses_occupancy_not_cumulative_usage() {
+        let tracker = Arc::new(UsageTracker::new());
+        let interceptor = CompactWorkerInterceptor {
+            usage_tracker: tracker.clone(),
+            max_input_tokens: 150,
+        };
+        let mut context = vec![Item::user_message("hello")];
+
+        assert!(matches!(
+            interceptor.pre_llm_request(&mut context).await,
+            PreRequestAction::Continue
+        ));
+        tracker.record_usage(&make_usage(100));
+
+        assert!(matches!(
+            interceptor.pre_llm_request(&mut context).await,
+            PreRequestAction::Continue
+        ));
+        tracker.record_usage(&make_usage(100));
+
+        // Two 100-token requests would exceed a cumulative 150-token cap, but
+        // current occupancy is still the latest 100-token measurement.
+        assert!(matches!(
+            interceptor.pre_llm_request(&mut context).await,
+            PreRequestAction::Continue
+        ));
+    }
+
+    #[tokio::test]
+    async fn compact_worker_interceptor_cancels_when_occupancy_exceeds_cap() {
+        let tracker = Arc::new(UsageTracker::new());
+        let interceptor = CompactWorkerInterceptor {
+            usage_tracker: tracker.clone(),
+            max_input_tokens: 99,
+        };
+        let mut context = vec![Item::user_message("hello")];
+
+        assert!(matches!(
+            interceptor.pre_llm_request(&mut context).await,
+            PreRequestAction::Continue
+        ));
+        tracker.record_usage(&make_usage(100));
+
+        assert!(matches!(
+            interceptor.pre_llm_request(&mut context).await,
+            PreRequestAction::Cancel(message) if message.contains("occupancy")
+        ));
     }
 
     #[tokio::test]

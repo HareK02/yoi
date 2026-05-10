@@ -183,6 +183,7 @@ compact_request_threshold = 90000
 compact_retained_tokens = 8000
 compact_auto_read_budget = 8000
 compact_worker_max_input_tokens = 50000
+compact_worker_max_turns = 20
 
 [compaction.model]
 scheme = "gemini"

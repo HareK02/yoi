@@ -12,8 +12,8 @@ use session_store::{EntryHash, PodScopeSnapshot, SessionId, SessionStartState, S
 use tracing::{info, warn};
 
 use manifest::{
-    Permission, PodManifest, PodManifestConfig, ResolveError, Scope, ScopeConfig, ScopeError, ScopeRule,
-    SharedScope, WorkerManifest,
+    Permission, PodManifest, PodManifestConfig, ResolveError, Scope, ScopeConfig, ScopeError,
+    ScopeRule, SharedScope, WorkerManifest,
 };
 
 use crate::compact::state::CompactState;
@@ -1456,8 +1456,6 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     ///
     /// Returns the new session ID.
     pub async fn compact(&mut self, retained_tokens: u64) -> Result<SessionId, PodError> {
-        use std::sync::atomic::{AtomicU64, Ordering};
-
         use crate::compact::worker::{
             CompactWorkerContext, CompactWorkerInterceptor, add_reference_tool,
             mark_read_required_tool, write_summary_tool,
@@ -1477,7 +1475,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
 
         // Compaction-related knobs. Fall through to manifest defaults when
         // `[compaction]` is omitted entirely.
-        let (auto_read_budget, compact_worker_max_input_tokens) = self
+        let (auto_read_budget, compact_worker_max_input_tokens, compact_worker_max_turns) = self
             .manifest
             .compaction
             .as_ref()
@@ -1485,11 +1483,13 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 (
                     c.compact_auto_read_budget,
                     c.compact_worker_max_input_tokens,
+                    c.compact_worker_max_turns,
                 )
             })
             .unwrap_or((
                 manifest::defaults::COMPACT_AUTO_READ_BUDGET,
                 manifest::defaults::COMPACT_WORKER_MAX_INPUT_TOKENS,
+                manifest::defaults::COMPACT_WORKER_MAX_TURNS,
             ));
 
         // Default references: the N most-recently-touched files in the
@@ -1530,21 +1530,24 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         let mut summary_worker = Worker::new(summary_client).system_prompt(summary_system_prompt);
         summary_worker.set_cache_key(Some(self.session_id.to_string()));
 
-        // Cumulative input-token meter + interceptor. The meter is bumped
-        // from the on_usage callback and read on every pre_llm_request.
-        let input_so_far = Arc::new(AtomicU64::new(0));
+        // Occupancy-based input-token meter + interceptor. The tracker pairs
+        // each pre-request history length with the following UsageEvent, then
+        // the interceptor projects current prompt occupancy with the same
+        // UsageRecord counter used by the main Pod thresholds.
+        let summary_usage_tracker = Arc::new(UsageTracker::new());
         {
-            let acc = input_so_far.clone();
+            let tracker = summary_usage_tracker.clone();
             summary_worker.on_usage(move |event| {
-                if let Some(tokens) = event.input_tokens {
-                    acc.fetch_add(tokens, Ordering::Relaxed);
-                }
+                tracker.record_usage(event);
             });
         }
         summary_worker.set_interceptor(CompactWorkerInterceptor {
-            input_so_far: input_so_far.clone(),
+            usage_tracker: summary_usage_tracker,
             max_input_tokens: compact_worker_max_input_tokens,
         });
+        if compact_worker_max_turns.is_some() {
+            summary_worker.set_max_turns(compact_worker_max_turns);
+        }
 
         // Tools: read_file (shared scope, fresh tracker) + the three
         // compact-specific tools that populate `ctx`.
@@ -3069,7 +3072,11 @@ permission = "write"
         let shadows = ingest_skills(&mut registry, &manifest);
 
         // workspace skill `alpha` should be registered (no collision).
-        assert!(registry.get(&memory::Slug::parse("alpha").unwrap()).is_some());
+        assert!(
+            registry
+                .get(&memory::Slug::parse("alpha").unwrap())
+                .is_some()
+        );
         // No workflow exists to shadow `alpha`, so no shadow event for it.
         assert!(shadows.iter().all(|s| s.slug.as_str() != "alpha"));
     }

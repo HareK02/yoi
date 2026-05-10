@@ -212,8 +212,12 @@ permission = "write"
 # compact_auto_read_budget = 8000
 #
 # # 任意。デフォルト: 50000 (`defaults::COMPACT_WORKER_MAX_INPUT_TOKENS`)。
-# # compact worker 自身の累積入力 token cap。超過で abort (circuit breaker)。
+# # compact worker 自身の現在占有 token cap。超過で abort (circuit breaker)。
 # compact_worker_max_input_tokens = 50000
+#
+# # 任意。デフォルト: 20 (`defaults::COMPACT_WORKER_MAX_TURNS`)。
+# # compact worker 自身の tool loop 上限。Rust config で None の場合のみ無制限。
+# compact_worker_max_turns = 20
 #
 # # 任意。デフォルト: メインモデルを `clone_boxed()` で複製。
 # # compact 専用モデルを使う場合のみ書く ([model] と同じ形式)。

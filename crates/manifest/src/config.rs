@@ -116,6 +116,8 @@ pub struct CompactionConfigPartial {
     #[serde(default)]
     pub compact_worker_max_input_tokens: Option<u64>,
     #[serde(default)]
+    pub compact_worker_max_turns: Option<u32>,
+    #[serde(default)]
     pub model: Option<ModelManifest>,
 }
 
@@ -325,6 +327,9 @@ impl CompactionConfigPartial {
             compact_worker_max_input_tokens: upper
                 .compact_worker_max_input_tokens
                 .or(self.compact_worker_max_input_tokens),
+            compact_worker_max_turns: upper
+                .compact_worker_max_turns
+                .or(self.compact_worker_max_turns),
             model: merge_option(self.model, upper.model, ModelManifest::merge),
         }
     }
@@ -461,6 +466,9 @@ impl TryFrom<PodManifestConfig> for PodManifest {
                     compact_worker_max_input_tokens: c
                         .compact_worker_max_input_tokens
                         .unwrap_or(defaults::COMPACT_WORKER_MAX_INPUT_TOKENS),
+                    compact_worker_max_turns: c
+                        .compact_worker_max_turns
+                        .or(defaults::COMPACT_WORKER_MAX_TURNS),
                     model: c.model,
                 })
             })
@@ -950,6 +958,32 @@ stop_sequences = ["\n\n", "</stop>"]
     }
 
     #[test]
+    fn from_toml_accepts_compact_worker_max_turns() {
+        let cfg = PodManifestConfig::from_toml(
+            r#"
+[compaction]
+compact_worker_max_turns = 7
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.compaction.unwrap().compact_worker_max_turns, Some(7));
+    }
+
+    #[test]
+    fn try_from_compaction_defaults_compact_worker_max_turns() {
+        let mut cfg = minimal_valid();
+        cfg.compaction = Some(CompactionConfigPartial::default());
+
+        let manifest = PodManifest::try_from(cfg).unwrap();
+
+        assert_eq!(
+            manifest.compaction.unwrap().compact_worker_max_turns,
+            defaults::COMPACT_WORKER_MAX_TURNS
+        );
+    }
+
+    #[test]
     fn from_toml_partial_layer_succeeds() {
         // A project-layer manifest with only scope set must parse fine.
         let toml = r#"
@@ -1042,7 +1076,10 @@ name = "dbg"
     fn skills_directories_resolved_against_base() {
         let mut cfg = minimal_valid();
         cfg.skills = Some(SkillsConfig {
-            directories: vec![PathBuf::from(".claude/skills"), PathBuf::from("/abs/elsewhere")],
+            directories: vec![
+                PathBuf::from(".claude/skills"),
+                PathBuf::from("/abs/elsewhere"),
+            ],
         });
         let resolved = cfg.resolve_paths(Path::new("/workspace/proj"));
         let dirs = resolved.skills.as_ref().unwrap().directories.clone();

@@ -99,6 +99,18 @@ impl UsageTracker {
         });
     }
 
+    /// Return a clone of the accumulated `UsageRecord`s without clearing them.
+    /// Used by request-time circuit breakers that need the same occupancy
+    /// projection as Pod persistence while the run is still active.
+    pub(crate) fn records(&self) -> Vec<UsageRecord> {
+        self.pending_records
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| r.record.clone())
+            .collect()
+    }
+
     /// Drain accumulated records. Called by Pod after a run completes,
     /// before persisting the turn.
     pub(crate) fn drain(&self) -> Vec<RecordedUsage> {
@@ -134,6 +146,19 @@ mod tests {
         assert_eq!(records[0].record.cache_write_tokens, 100);
         assert_eq!(records[0].record.output_tokens, 42);
         assert!(records[0].correlation_id.is_none());
+    }
+
+    #[test]
+    fn records_clones_without_clearing() {
+        let tracker = UsageTracker::new();
+        tracker.note_request(1);
+        tracker.record_usage(&make_event(10, 0, 0, 5));
+
+        let records = tracker.records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].history_len, 1);
+        assert_eq!(records[0].input_total_tokens, 10);
+        assert_eq!(tracker.records().len(), 1);
     }
 
     #[test]
