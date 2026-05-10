@@ -20,9 +20,9 @@ memory 関連 prompt は種別を問わず、最低限以下を共有する:
 - **特定の project-management 手法を前提にしない**。既定 prompt は issue tracker / task board / planning doc / changelog / version-control history / generated report などを「正確な内容の authoritative record」として一般化して扱う。memory はそれらの本文・status 変化・短命 identifier をそのまま複製する parallel ledger にはしない。一方で、今後の作業に役立つ持続的な project-management 事実、workflow 制約、優先度判断の根拠、複数 item にまたがる学びは採用してよい
 - **空出力を許容**する。保存価値が無ければ「何も追加しない」を正当な結果として扱う
 
-### Phase 1: 活動抽出 prompt
+### extract: 活動抽出 prompt
 
-Phase 1 は「派生物を作る」段階ではなく、「起きたことを抽出する」段階として縛る:
+extract は「派生物を作る」段階ではなく、「起きたことを抽出する」段階として縛る:
 
 - 対象は `decisions`、`discussions`、`attempts`、`requests` の候補に限る
 - Knowledge 化、summary rewrite、slug 命名、`model_invokation` 判断は行わない
@@ -37,9 +37,9 @@ Phase 1 は「派生物を作る」段階ではなく、「起きたことを抽
 - `decisions`: rationale が「この session で X をした」になるものは除外。設計 / 方針 / process / 取り組み方の根拠でない記録は decision ではなく作業ログ。ただし、作業管理上の持続的な方針や抽象化は decision として扱える
 - authoritative project record の title / body / checklist / raw status / 短命 identifier を本文に複製しない。正確な status mirror や identifier と組み合わせないと意味を成さない記録は採用しない
 
-### Phase 2: 統合 + 整理 prompt
+### consolidation: 統合 + 整理 prompt
 
-Phase 2 は既存 `memory/*`、`knowledge/*`、staging を見て、統合 phase と整理 phase を 1 セッション内で続けて回す。両 phase に共通する原則:
+consolidation は既存 `memory/*`、`knowledge/*`、staging を見て、統合 step と整理 step を 1 セッション内で続けて回す。両 step に共通する原則:
 
 - 入力には staging の活動ログ、既存 `memory/*`（summary / decisions / requests）の全文、Knowledge 化候補レポート、整理材料（使用頻度メトリクス、Linter Warn、`replaced` chain、sources 過多情報）を含める
 - 既存 `knowledge/*` は prompt に埋めず、Knowledge 検索ツール経由で agent が必要分を引く。まず候補レポートの source や staging の話題に近い slug を検索し、ヒットした slug / description / kind / `model_invokation` を見て適合先を探す
@@ -49,7 +49,7 @@ Phase 2 は既存 `memory/*`、`knowledge/*`、staging を見て、統合 phase 
 - Decision の置き換えは `status: replaced` と `replaced_by` で表現する
 - 人間編集との不整合が見える rewrite は避け、衝突しそうなら保守的に統合する
 
-統合 phase の追加指示:
+統合 step の追加指示:
 
 - staging の活動ログを decisions / requests / summary / Knowledge update に落とし込む
 - staging の field ごとに宛先を分ける:
@@ -57,9 +57,9 @@ Phase 2 は既存 `memory/*`、`knowledge/*`、staging を見て、統合 phase 
   - `requests` (staging) → `memory/requests/`
   - `attempts` (staging) → 既定は drop。memory に `attempts/` フォルダは設けない。複数 attempts に通底する持続的な傾向だけ `summary.md` に 1 行で圧縮する例外あり
   - `discussions` (staging) → 設計 / 方針に決着していれば `decisions/` に統合、未決着でも問い自体が持続的なら `summary.md` に 1 行、それ以外は drop。`decisions/` に「議論した」だけの未決着メモを作らない
-- Knowledge 新規作成は候補レポート掲載 source 由来に限る（詳細は §Phase 2: Knowledge 書き込み prompt）
+- Knowledge 新規作成は候補レポート掲載 source 由来に限る（詳細は §Consolidation: Knowledge 書き込み prompt）
 
-整理 phase の追加指示（統合 phase 完了後、余力で実行）:
+整理 step の追加指示（統合 step 完了後、余力で実行）:
 
 - 既存 record 群を `outdated`、`superseded`、`unused`、`noisy` の観点で評価し、なぜ整理対象なのかを分類する
 - 明示 invoke の保護閾値超過 record は drop / 大幅圧縮の対象外とする
@@ -67,9 +67,9 @@ Phase 2 は既存 `memory/*`、`knowledge/*`、staging を見て、統合 phase 
 - merge / split / trim / drop の理由を git diff から読める形で残す
 - 直接削除してよいが、git で可逆である前提に甘えすぎず、誤判定しやすいものは merge / trim を優先する
 
-### Phase 2: Knowledge 書き込み prompt
+### consolidation: Knowledge 書き込み prompt
 
-Knowledge の新規作成 / 更新では、Phase 2 全体の原則に加えて以下を明示する:
+Knowledge の新規作成 / 更新では、consolidation 全体の原則に加えて以下を明示する:
 
 - 採択ラインは「このプロジェクト / ユーザーに対して再度参照価値のある事実・ルール・ノウハウ」に限る
 - 一回限りの判断や議論は Decisions に留め、繰り返し参照される抽象化だけを Knowledge に上げる
@@ -87,7 +87,7 @@ Knowledge の新規作成 / 更新では、Phase 2 全体の原則に加えて�
 
 ### 監査 LLM prompt
 
-初期範囲では専用の監査 LLM は持たない（`memory.md` §書き込み経路と Linter / §将来検討 参照）。意味破壊の抑制は Phase 2 prompt 側の情報損失最小化指示と git diff レビューに寄せる。後から 2 層目として挟む際の入力・check 項目・pass-fail 返却形式はそのときに詰める。
+初期範囲では専用の監査 LLM は持たない（`memory.md` §書き込み経路と Linter / §将来検討 参照）。意味破壊の抑制は consolidation prompt 側の情報損失最小化指示と git diff レビューに寄せる。後から 2 層目として挟む際の入力・check 項目・pass-fail 返却形式はそのときに詰める。
 
 ## 関連
 

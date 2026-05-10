@@ -157,32 +157,32 @@ pub struct Pod<C: LlmClient, St: Store> {
     /// When true (default), the system-prompt assembler walks
     /// `<workspace>/knowledge/*` and appends a `## Resident knowledge`
     /// section listing records with `model_invokation: true`.
-    /// Phase 2 (consolidation) workers set this to false so the
+    /// consolidation workers set this to false so the
     /// agentic worker pulls knowledge through the search tools instead.
     inject_resident_knowledge: bool,
     /// Latest runtime scope snapshot queued by dynamic scope changes.
     /// Drained into the session log before the next turn result is
     /// persisted, so resume never silently reclaims delegated writes.
     pending_scope_snapshot: Arc<Mutex<Option<PodScopeSnapshot>>>,
-    /// Phase 1 (memory.extract) reentry guard. `true` while an extract
+    /// extract (memory.extract) reentry guard. `true` while an extract
     /// worker is running; subsequent triggers are skipped per spec
-    /// (`docs/plan/memory.md` §Phase 1 並走防止). `Arc<AtomicBool>` so
+    /// (`docs/plan/memory.md` §Extract 並走防止). `Arc<AtomicBool>` so
     /// the flag survives across `try_post_run_extract` calls without a
     /// `&mut self` race.
     extract_in_flight: Arc<AtomicBool>,
-    /// Phase 2 (memory.consolidation) in-process reentry guard. The
+    /// consolidation (memory.consolidation) in-process reentry guard. The
     /// staging-side `StagingLock` already provides cross-process
     /// exclusion, but this AtomicBool keeps a careless concurrent caller
     /// inside the same Pod from racing on the staging snapshot.
     consolidation_in_flight: Arc<AtomicBool>,
-    /// Last completed Phase 1 boundary. `None` means no extract has
+    /// Last completed extract boundary. `None` means no extract has
     /// run yet on this session — next extract starts from entry 0.
     /// Restored from `RestoredState.extensions` on `restore`, updated
     /// after each successful extract via `save_extension`.
     extract_pointer: Arc<Mutex<Option<memory::ExtractPointerPayload>>>,
-    /// Phase 1/2 memory job running outside the controller method loop.
+    /// extract/consolidation memory job running outside the controller method loop.
     /// The task owns the extract/consolidate worker execution and is joined
-    /// at shutdown. A single slot is enough: Phase 1/2 implementations loop
+    /// at shutdown. A single slot is enough: extract/consolidation implementations loop
     /// until thresholds fall below their trigger points, and concurrent
     /// triggers are coalesced by skipping when this handle is still active.
     memory_task: Option<JoinHandle<()>>,
@@ -255,7 +255,7 @@ impl<C: LlmClient + Clone + 'static, St: Store + Clone + 'static> Pod<C, St> {
     pub fn spawn_post_run_memory_jobs(&mut self) {
         // Drop a finished prior handle so we can spawn a fresh task.
         // If the prior task is still running, coalesce by skipping —
-        // Phase 1/2 implementations re-evaluate thresholds on completion.
+        // extract/consolidation implementations re-evaluate thresholds on completion.
         self.cleanup_finished_memory_task();
         if self.memory_task.is_some() {
             return;
@@ -350,7 +350,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     ///
     /// Default `true`: when memory is enabled in the manifest, the
     /// assembler walks `<workspace>/knowledge/*` and lists records with
-    /// `model_invokation: true`. Phase 2 (consolidation) workers and
+    /// `model_invokation: true`. consolidation workers and
     /// other agentic memory paths set this to `false` so the worker
     /// pulls knowledge through the search tools instead of riding on
     /// the resident system-prompt budget. Idempotent if called multiple
@@ -507,7 +507,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             .clone()
     }
 
-    /// Snapshot of the Phase 1 (memory.extract) boundary pointer.
+    /// Snapshot of the extract (memory.extract) boundary pointer.
     ///
     /// `None` means no extract has run yet on the current session — the
     /// next extract will start from entry 0. Updated by
@@ -531,7 +531,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             .clone()
     }
 
-    /// Test/diagnostic handle to the Phase 2 in-flight guard. Production
+    /// Test/diagnostic handle to the consolidation in-flight guard. Production
     /// callers do not need this; tests use it to assert that the reentry
     /// guard skips an in-progress consolidation without losing data.
     #[doc(hidden)]
@@ -846,7 +846,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             }
         }
         // Resident-injection collection: only when memory is enabled in
-        // the manifest AND this Pod opts in (Phase 2 workers opt out).
+        // the manifest AND this Pod opts in (consolidation workers opt out).
         // Owned `Vec` lives for the duration of `render` below; the
         // context borrows a slice into it.
         let resident: Vec<memory::ResidentKnowledgeEntry> = if self.inject_resident_knowledge {
@@ -1733,13 +1733,13 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             .expect("usage_history poisoned")
             .clear();
         self.persist_scope_snapshot().await?;
-        // Reset Phase 1 pointer alongside usage_history: the compacted
+        // Reset extract pointer alongside usage_history: the compacted
         // session has a fresh log with no `LogEntry::Extension` entries
         // yet, so a cold restore here would set extract_pointer to None
         // via fold_pointer. The in-memory pointer must match — otherwise
         // `tokens_added_since(old_history_len)` would treat the new
         // (shorter) history as if it had already been processed, and
-        // Phase 1 would stop firing for the rest of the process's
+        // extract would stop firing for the rest of the process's
         // lifetime.
         *self
             .extract_pointer
@@ -1764,7 +1764,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         Ok(worker.client().clone_boxed())
     }
 
-    /// Build the LlmClient for the Phase 1 (memory.extract) Worker.
+    /// Build the LlmClient for the extract (memory.extract) Worker.
     ///
     /// Uses `memory.extract_model` from manifest if set, otherwise clones
     /// the main client.
@@ -1780,7 +1780,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         Ok(worker.client().clone_boxed())
     }
 
-    /// pointer 以降に増えたプロンプト全長の推定。Phase 1 trigger が
+    /// pointer 以降に増えたプロンプト全長の推定。extract trigger が
     /// 閾値判定に使う。
     ///
     /// `total_tokens_at(now) - total_tokens_at(pointer)` の差分で、
@@ -1799,14 +1799,14 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         total_now.saturating_sub(total_at_pointer)
     }
 
-    /// Phase 1 (memory.extract) post-run trigger.
+    /// extract (memory.extract) post-run trigger.
     ///
     /// Called by the Controller before spawning the background memory task so
     /// the extract worker sees a stable session-log entry range while compact
     /// is deferred until the next turn starts. Best-effort: failures are
     /// logged but not propagated.
     ///
-    /// Behaviour follows `docs/plan/memory.md` §Phase 1 並走防止:
+    /// Behaviour follows `docs/plan/memory.md` §Extract 並走防止:
     /// in-flight 中の trigger は skip し、完了時点で閾値再評価する
     /// (the loop below). Pending state is not retained — the
     /// re-evaluation happens naturally because the in-memory pointer
@@ -1845,11 +1845,11 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                     continue;
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, "Phase 1 extract failed");
+                    tracing::warn!(error = %e, "extract failed");
                     self.alert(
                         AlertLevel::Warn,
                         AlertSource::Pod,
-                        format!("memory Phase 1 extract failed: {e}"),
+                        format!("memory extract failed: {e}"),
                     );
                     return Ok(());
                 }
@@ -1955,7 +1955,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
 
         let payload = ctx.take_payload().unwrap_or_else(|| {
             tracing::warn!(
-                "Phase 1 extract worker did not call write_extracted; \
+                "extract worker did not call write_extracted; \
                  advancing pointer with empty payload"
             );
             extract::ExtractedPayload::default()
@@ -2002,7 +2002,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         Ok(ExtractDecision::Completed)
     }
 
-    /// Build the LlmClient for the Phase 2 (memory.consolidation) Worker.
+    /// Build the LlmClient for the consolidation (memory.consolidation) Worker.
     ///
     /// Uses `memory.consolidation_model` from manifest if set, otherwise
     /// clones the main client. Mirrors [`build_extractor_client`].
@@ -2018,13 +2018,13 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         Ok(worker.client().clone_boxed())
     }
 
-    /// Phase 2 (memory.consolidation) trigger.
+    /// consolidation (memory.consolidation) trigger.
     ///
-    /// Intended to run from a background memory task after Phase 1 may have
+    /// Intended to run from a background memory task after extract may have
     /// added staging entries. Compact is deferred until the next turn starts,
     /// so consolidation no longer blocks the controller's post-run path.
     ///
-    /// Behaviour follows `docs/plan/memory.md` §Phase 2 / §並走防止:
+    /// Behaviour follows `docs/plan/memory.md` §Consolidation / §並走防止:
     /// the staging-side `StagingLock` enforces cross-process exclusion;
     /// `consolidation_in_flight` keeps in-process callers honest. On
     /// success, the lock is released *with* consumed-id cleanup; on
@@ -2035,9 +2035,9 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             return Ok(());
         };
         // `Some(0)` collapses to `None` — staging count / bytes always
-        // satisfies `>= 0`, which would fire Phase 2 on every post-run.
+        // satisfies `>= 0`, which would fire consolidation on every post-run.
         // Treating zero as disabled lines up with `extract_threshold` and
-        // matches the "no threshold ⇒ Phase 2 off" invariant in the
+        // matches the "no threshold ⇒ consolidation off" invariant in the
         // ticket's §Trigger.
         let files_threshold = memory_cfg.consolidation_threshold_files.filter(|n| *n > 0);
         let bytes_threshold = memory_cfg.consolidation_threshold_bytes.filter(|n| *n > 0);
@@ -2062,11 +2062,11 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 Ok(ConsolidateDecision::Skipped) => return Ok(()),
                 Ok(ConsolidateDecision::Completed) => continue,
                 Err(e) => {
-                    tracing::warn!(error = %e, "Phase 2 consolidation failed");
+                    tracing::warn!(error = %e, "consolidation failed");
                     self.alert(
                         AlertLevel::Warn,
                         AlertSource::Pod,
-                        format!("memory Phase 2 consolidation failed: {e}"),
+                        format!("memory consolidation failed: {e}"),
                     );
                     return Ok(());
                 }
@@ -2135,7 +2135,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         // directly under the workspace via WorkspaceLayout. Resident
         // knowledge injection (`Pod::set_resident_knowledge_injection`) is
         // a Pod-level concern; this disposable Worker is built without it
-        // by construction, in keeping with `docs/plan/memory.md` §Phase 2
+        // by construction, in keeping with `docs/plan/memory.md` §Consolidation
         // のKnowledgeアクセス (agent pulls knowledge through the search
         // tool instead of via system-prompt residency).
         let query_cfg = memory::tool::QueryConfig::from(memory_cfg);
@@ -2167,7 +2167,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     }
 }
 
-/// Outcome of a single Phase 1 extract iteration. Internal to
+/// Outcome of a single extract iteration. Internal to
 /// `try_post_run_extract` / `run_extract_once`.
 enum ExtractDecision {
     /// Threshold not reached, or no items to extract.
@@ -2208,7 +2208,7 @@ impl llm_worker::interceptor::Interceptor for MemoryExtractWorkerInterceptor {
     }
 }
 
-/// Outcome of a single Phase 2 consolidation iteration. Internal to
+/// Outcome of a single consolidation iteration. Internal to
 /// `try_post_run_consolidate` / `run_consolidate_once`.
 enum ConsolidateDecision {
     /// Either threshold not met, no staging, or another Pod holds the lock.
@@ -2722,10 +2722,10 @@ pub enum PodError {
     #[error(transparent)]
     PromptCatalog(#[from] CatalogError),
 
-    #[error("memory Phase 1 staging write failed: {0}")]
+    #[error("memory extract staging write failed: {0}")]
     ExtractStaging(#[source] memory::extract::StagingError),
 
-    #[error("memory Phase 2 lock acquisition failed: {0}")]
+    #[error("memory consolidation lock acquisition failed: {0}")]
     ConsolidationLock(#[source] memory::consolidate::LockError),
 
     #[error("workflow load failed: {0}")]

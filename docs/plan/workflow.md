@@ -33,7 +33,7 @@ Workflow は制約付きの強制的な作業フロー。`/<slug>` で明示的�
 
 Workflow は**人間が書く**、または consolidation が offer して人間が承認する。自動書き込みは禁止:
 
-- consolidation Phase 2（`memory.md` 参照）の write tool schema に `workflow` カテゴリを含めないことで構造的に担保
+- consolidation（`memory.md` 参照）の write tool schema に `workflow` カテゴリを含めないことで構造的に担保
 - 新規作成 / 手順追加・更新は `Event::Notification` で提案し、人間承認で反映
 
 ### Offer 契機
@@ -58,4 +58,4 @@ consolidation が以下を検出した場合、Client に Notification を投げ
 
 ## 関連
 
-- `memory.md`: Knowledge 定義、consolidation Phase 1/2、Offer の配送経路
+- `memory.md`: Knowledge 定義、extract/consolidation、Offer の配送経路

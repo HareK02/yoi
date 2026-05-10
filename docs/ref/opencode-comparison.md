@@ -133,11 +133,11 @@ Insomnia の方が洗練されている（要約生成まで組み込み済み�
 **取り込み案:**
 
 ```
-Phase 1: Prune（Hook ベース）
+extract: Prune（Hook ベース）
   PreLlmRequest Hook で古いツール出力を削除
   設計原則3に従い、新しい抽象は作らない
 
-Phase 2: Compact（Agent ベース）
+consolidation: Compact（Agent ベース）
   OnTurnEnd Hook でトークン数をチェック
   閾値超過時に要約生成を挿入
   Workerのresume機構で作業を継続

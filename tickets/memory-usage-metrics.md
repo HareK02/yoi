@@ -2,7 +2,7 @@
 
 ## 背景
 
-`docs/plan/memory.md` §使用頻度メトリクス の実装。memory 検索ツール / Knowledge 検索ツール内に invoke 計測フックを入れ、時間単位ではなく累積 input token で正規化した頻度を算出する。Phase 2 統合 phase の Knowledge 新規作成 gate と Phase 2 整理 phase の保護閾値の両方で使われる。
+`docs/plan/memory.md` §使用頻度メトリクス の実装。memory 検索ツール / Knowledge 検索ツール内に invoke 計測フックを入れ、時間単位ではなく累積 input token で正規化した頻度を算出する。consolidation 統合 step の Knowledge 新規作成 gate と consolidation 整理 step の保護閾値の両方で使われる。
 
 ## 要件
 
@@ -28,7 +28,7 @@
 
 - 累積方式: 最大 10 回前の invoke から現在までの時系列窓でフィルタして集計
 - **Knowledge 化候補レポート**:
-  - 対象は `memory/*` 配下の record（Phase 1 成果物の decisions / requests + 既存 knowledge）
+  - 対象は `memory/*` 配下の record（extract 成果物の decisions / requests + 既存 knowledge）
   - 明示 invoke 頻度が閾値超過のものを列挙
   - 同一 session 内の連続参照は 1 count に丸める
   - 複数 session での再参照を要件とする（spike 除外）
@@ -36,12 +36,12 @@
 
 ### 消費者
 
-- Phase 2 Worker の統合 phase 入力として候補レポートを渡す
-- Phase 2 Worker の整理 phase で保護閾値判定（明示 invoke frequency >= 1.0 invokes/Mtoken）に使う
+- consolidation Worker の統合 step 入力として候補レポートを渡す
+- consolidation Worker の整理 step で保護閾値判定（明示 invoke frequency >= 1.0 invokes/Mtoken）に使う
 
 ## 範囲外
 
-- Phase 2 整理 phase の実装本体（`memory-phase2-consolidation` 側。本チケットは保護閾値判定に必要なメトリクスの提供まで）
+- consolidation 整理 step の実装本体（`memory-consolidation` 側。本チケットは保護閾値判定に必要なメトリクスの提供まで）
 - `model_invokation` ON/OFF の自動判定ロジック（将来検討）
 - Shallow request の自動除外（将来検討）
 
@@ -49,7 +49,7 @@
 
 - 検索ツール呼び出しで invoke event が workspace 側に積まれる
 - `model_invokation` 注入のコスト側集計が別口で積まれる
-- 候補レポート API が Phase 2 Worker の起動時に呼べる
+- 候補レポート API が consolidation Worker の起動時に呼べる
 - 閾値未満の record は候補レポートに載らない
 - 同一 session 内連続参照は 1 count に丸まる
 
@@ -57,4 +57,4 @@
 
 - `docs/plan/memory.md` §使用頻度メトリクス / §判断ルール / §retrieval 経路
 - `tickets/memory-search-tools.md`（hook 挿入点）
-- `tickets/memory-phase2-consolidation.md`（統合 / 整理 両 phase の消費者）
+- `tickets/memory-consolidation.md`（統合 / 整理 両 step の消費者）

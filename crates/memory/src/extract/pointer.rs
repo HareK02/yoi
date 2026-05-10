@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use super::EXTRACT_DOMAIN;
 
-/// Phase 1 完了境界の永続化 payload。session log の Extension entry
+/// extract 完了境界の永続化 payload。session log の Extension entry
 /// として 1 回ずつ書かれ、最新の 1 件が現行 pointer として有効になる。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExtractPointerPayload {
@@ -21,7 +21,7 @@ pub struct ExtractPointerPayload {
     pub staging_id: String,
 }
 
-/// `RestoredState.extensions` から最新の Phase 1 pointer を取り出す。
+/// `RestoredState.extensions` から最新の extract pointer を取り出す。
 /// 未抽出セッションでは `None`。
 pub fn fold_pointer(extensions: &[(String, serde_json::Value)]) -> Option<ExtractPointerPayload> {
     extensions

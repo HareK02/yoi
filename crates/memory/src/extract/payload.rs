@@ -1,8 +1,8 @@
-//! Phase 1 抽出の出力 schema。
+//! extract 抽出の出力 schema。
 //!
 //! LLM は [`ExtractedPayload`] そのもの（source 抜き）を返し、Pod 側
 //! ラッパーが [`StagingRecord`] に組み立てて staging へ書き出す。
-//! source は機械付与する契約 (`docs/plan/memory.md` §Phase 1)。
+//! source は機械付与する契約 (`docs/plan/memory.md` §Extract)。
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};

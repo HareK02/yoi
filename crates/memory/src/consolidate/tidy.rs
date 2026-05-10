@@ -1,7 +1,7 @@
-//! 整理 phase が prompt 入力に乗せる「整理材料」スキャナ。
+//! 整理 step が prompt 入力に乗せる「整理材料」スキャナ。
 //!
 //! `docs/plan/memory.md` §整理（GC 相当）の扱い と
-//! `tickets/memory-phase2-consolidation.md` の整理材料リストに従い、
+//! `tickets/memory-consolidation.md` の整理材料リストに従い、
 //! メトリクス未完の現状で機械的に拾えるヒントだけを集める:
 //!
 //! - `replaced` chain: `status: replaced` の Decision とその `replaced_by`
@@ -21,13 +21,13 @@ use crate::workspace::{RecordKind, WorkspaceLayout};
 
 /// `sources` overflow を flag する閾値。`linter::warnings::SOURCES_OVERFLOW_THRESHOLD`
 /// と同値（10）を踏襲する。Linter Warn で sources 過多が検出されるラインと
-/// 整理 phase で勧告するラインを揃える狙い。
+/// 整理 step で勧告するラインを揃える狙い。
 pub const SOURCES_OVERFLOW_THRESHOLD: usize = 10;
 /// 類似 slug クラスタリングの距離。`linter::warnings::SIMILAR_SLUG_DISTANCE`
 /// と同値。
 pub const SIMILAR_SLUG_DISTANCE: usize = 2;
 
-/// 整理 phase 用の機械集計ヒント。空フィールドは「対象なし」を意味する。
+/// 整理 step 用の機械集計ヒント。空フィールドは「対象なし」を意味する。
 #[derive(Debug, Default, Clone)]
 pub struct TidyHints {
     /// `status: replaced` で残っている Decision の slug → `replaced_by` map。
@@ -179,7 +179,7 @@ fn parse_yaml<F: serde::de::DeserializeOwned>(content: &str) -> Option<F> {
 
 /// Connected-component clustering over the `levenshtein <= SIMILAR_SLUG_DISTANCE`
 /// graph among same-kind slugs. Returns each cluster of size >= 2 (singleton
-/// clusters are not interesting for the integration phase). Returns `None`
+/// clusters are not interesting for the integration step). Returns `None`
 /// when there are no clusters at all.
 fn cluster_similar(slugs: &[&str], kind: RecordKind) -> Option<Vec<SimilarSlugCluster>> {
     if slugs.len() < 2 {

@@ -61,9 +61,9 @@ const INTERNAL_TOML: &str = include_str!("../../../../resources/prompts/internal
 pub enum PodPrompt {
     /// System prompt of the compaction (summary) Worker.
     CompactSystem,
-    /// System prompt of the memory Phase 1 (extract) Worker.
+    /// System prompt of the memory extract Worker.
     MemoryExtractSystem,
-    /// System prompt of the memory Phase 2 (consolidation + tidy) Worker.
+    /// System prompt of the memory consolidation (integration + tidy) Worker.
     MemoryConsolidationSystem,
     /// Wrapper around an incoming `Method::Notify` message injected into
     /// the next LLM request context as a transient system message.

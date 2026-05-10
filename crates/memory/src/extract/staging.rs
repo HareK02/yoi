@@ -35,7 +35,7 @@ pub enum StagingError {
 ///
 /// 戻り値は割り当てられた staging file の (id, path)。`payload` が
 /// 完全に空の場合は呼び出し側が事前に `is_empty()` で skip 推奨だが、
-/// この関数は空でも正規に書き出す（仕様 §Phase 1 で空配列許容と
+/// この関数は空でも正規に書き出す（仕様 §Extract で空配列許容と
 /// 明記されており、書く / 書かないの判断は呼び出し側に委ねる）。
 pub fn write_staging(
     layout: &WorkspaceLayout,

@@ -1,8 +1,8 @@
-//! Phase 2 sub-Worker への最初のユーザー入力を組み立てる。
+//! consolidation sub-Worker への最初のユーザー入力を組み立てる。
 //!
-//! Phase 1 (`extract::build_extract_input`) と同じ方針で、固定 schema の
+//! extract (`extract::build_extract_input`) と同じ方針で、固定 schema の
 //! markdown セクション列にしてサブWorker に渡す。`docs/plan/memory.md`
-//! §Phase 2 入力 / §整理材料 の項目に従い:
+//! §Consolidation 入力 / §整理材料 の項目に従い:
 //!
 //! 1. consumed staging エントリ全文（`source` 込み）
 //! 2. 既存 `memory/*` 全文（summary / decisions / requests）
@@ -10,7 +10,7 @@
 //! 4. 整理材料（Linter Warn ベース、メトリクス未完なら明示 invoke 頻度なし）
 //!
 //! 既存 `knowledge/*` 本文は埋めず、agent に `KnowledgeQuery` 経由で引かせる
-//! 設計（`docs/plan/memory.md` §retrieval 経路 / §Phase 2 の Knowledge アクセス）。
+//! 設計（`docs/plan/memory.md` §retrieval 経路 / §Consolidation の Knowledge アクセス）。
 
 use std::fmt::Write;
 
@@ -20,7 +20,7 @@ use crate::workspace::{RecordKind, WorkspaceLayout};
 
 /// Knowledge 化候補レポート。`tickets/memory-usage-metrics.md` の成果物が
 /// 出るまでは空で渡す前提（`docs/plan/memory.md` §Knowledge 化候補レポート）。
-/// 空入力時、統合 phase は新規 Knowledge を作らず decisions / requests /
+/// 空入力時、統合 step は新規 Knowledge を作らず decisions / requests /
 /// summary / 既存 Knowledge update に留まる。
 #[derive(Debug, Default, Clone)]
 pub struct KnowledgeCandidateReport {
@@ -45,7 +45,7 @@ impl KnowledgeCandidateReport {
     }
 }
 
-/// Phase 2 sub-Worker の最初の user 入力。
+/// consolidation sub-Worker の最初の user 入力。
 pub fn build_consolidate_input(
     layout: &WorkspaceLayout,
     staging: &[StagingEntry],
@@ -54,9 +54,9 @@ pub fn build_consolidate_input(
 ) -> String {
     let mut out = String::new();
     out.push_str(
-        "Phase 2 consolidation input. Run the consolidation phase first \
+        "consolidation input. Run the integration step first \
          (fold the staging activity logs into memory and knowledge), then the \
-         tidy phase (clean up existing records). Use the memory tools for \
+         tidy step (clean up existing records). Use the memory tools for \
          every write — direct file writes are denied by the pod scope.\n\n",
     );
 

@@ -17,7 +17,7 @@ Pass an object with `decisions`, `discussions`, `attempts`, and `requests` array
 Call this exactly once and end the turn. Do not include `source`, session metadata, or free-form prose — \
 the wrapper attaches provenance mechanically.";
 
-/// Phase 1 sub-Worker の出力受け口。`ExtractedPayload` 1 件をホストする。
+/// extract sub-Worker の出力受け口。`ExtractedPayload` 1 件をホストする。
 #[derive(Debug, Default)]
 pub struct ExtractWorkerContext {
     payload: Mutex<Option<ExtractedPayload>>,

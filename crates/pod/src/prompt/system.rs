@@ -151,12 +151,12 @@ pub struct SystemPromptContext<'a> {
     pub agents_md: Option<String>,
     /// Resident-injection candidates from `<workspace>/knowledge/*` whose
     /// frontmatter has `model_invokation: true`. `None` disables the
-    /// section entirely (memory disabled, or a Phase 2 worker that opts
+    /// section entirely (memory disabled, or a consolidation worker that opts
     /// out); `Some(&[])` also yields no section.
     pub resident_knowledge: Option<&'a [ResidentKnowledgeEntry]>,
     /// Resident workflow descriptions from `<workspace>/.insomnia/workflow/*`
     /// whose frontmatter has `model_invokation: true`. `None` disables the
-    /// section; Phase 2 workers opt out together with resident Knowledge.
+    /// section; consolidation workers opt out together with resident Knowledge.
     pub resident_workflows: Option<&'a [ResidentWorkflowEntry]>,
     /// Catalog used to render the fixed trailing section headers.
     /// Passed by reference so callers do not give up ownership across

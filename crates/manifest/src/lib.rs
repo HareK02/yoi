@@ -96,14 +96,14 @@ pub struct MemoryConfig {
     /// Ignored when the request omits `query`. `None` ⇒ tool default (3).
     #[serde(default)]
     pub query_excerpt_lines: Option<usize>,
-    /// Optional model for the Phase 1 (extract) worker. When `None`,
+    /// Optional model for the extract worker. When `None`,
     /// the main pod model is cloned via `clone_boxed()`. Lightweight
     /// reasoning-capable models (Haiku / 4o-mini / Flash class) are
     /// recommended.
     #[serde(default)]
     pub extract_model: Option<ModelManifest>,
     /// Cumulative input-token threshold (since the last extract pointer)
-    /// that triggers a Phase 1 extract. `None` disables Phase 1
+    /// that triggers an extract run. `None` disables the extract trigger
     /// entirely; memory tools and resident injection still work, only
     /// the auto-extract trigger is dormant.
     #[serde(default)]
@@ -119,20 +119,21 @@ pub struct MemoryConfig {
     /// [`defaults::MEMORY_EXTRACT_WORKER_MAX_TURNS`] when unset.
     #[serde(default)]
     pub extract_worker_max_turns: Option<u32>,
-    /// Optional model for the Phase 2 (consolidation) worker. When
+    /// Optional model for the consolidation worker. When
     /// `None`, the main pod model is cloned via `clone_boxed()`.
     /// Reasoning-class models are recommended.
     #[serde(default)]
     pub consolidation_model: Option<ModelManifest>,
-    /// Phase 2 trigger: file-count threshold of `_staging/`. Phase 2
-    /// fires when the staging directory has at least this many entries.
-    /// Either threshold reaching its limit fires Phase 2 (logical OR).
-    /// `None` for both thresholds ⇒ Phase 2 disabled.
+    /// Consolidation trigger: file-count threshold of `_staging/`. The
+    /// consolidation run fires when the staging directory has at least
+    /// this many entries. Either threshold reaching its limit fires
+    /// consolidation (logical OR). `None` for both thresholds ⇒
+    /// consolidation disabled.
     #[serde(default)]
     pub consolidation_threshold_files: Option<usize>,
-    /// Phase 2 trigger: byte-size threshold across all `_staging/`
-    /// entries. Either threshold reaching its limit fires Phase 2.
-    /// `None` for both thresholds ⇒ Phase 2 disabled.
+    /// Consolidation trigger: byte-size threshold across all `_staging/`
+    /// entries. Either threshold reaching its limit fires consolidation.
+    /// `None` for both thresholds ⇒ consolidation disabled.
     #[serde(default)]
     pub consolidation_threshold_bytes: Option<u64>,
 }

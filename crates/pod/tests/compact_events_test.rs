@@ -333,7 +333,7 @@ async fn mid_turn_compact_success_broadcasts_start_and_done() {
 }
 
 /// Regression: `Pod::compact()` must reset the in-memory
-/// `extract_pointer` so Phase 1 keeps firing on the new compacted
+/// `extract_pointer` so extract keeps firing on the new compacted
 /// session.
 ///
 /// Without the reset, the pointer's `processed_through_history_len`
@@ -341,7 +341,7 @@ async fn mid_turn_compact_success_broadcasts_start_and_done() {
 /// session starts with a much shorter history (`[summary, ...]`).
 /// `cumulative_input_tokens_since` would then filter every new
 /// usage record out (their `history_len` is below the stale pointer)
-/// and Phase 1 would never re-fire for the rest of the process.
+/// and extract would never re-fire for the rest of the process.
 const EXTRACT_PLUS_COMPACT_MANIFEST: &str = r#"
 [pod]
 name = "test-pod"
@@ -385,7 +385,7 @@ fn write_extracted_tool_use_events(call_id: &str) -> Vec<LlmEvent> {
 }
 
 #[tokio::test]
-async fn compact_resets_extract_pointer_so_phase1_can_fire_again() {
+async fn compact_resets_extract_pointer_so_extract_can_fire_again() {
     // Mock LLM responses, in call order:
     //   [0] first run with usage(1000) so extract threshold (=1) fires.
     //   [1] extract worker invokes write_extracted with empty payload.
@@ -403,7 +403,7 @@ async fn compact_resets_extract_pointer_so_phase1_can_fire_again() {
 
     pod.run_text("first").await.unwrap();
 
-    // Phase 1 fires; pointer becomes Some.
+    // extract fires; pointer becomes Some.
     pod.try_post_run_extract().await.unwrap();
     assert!(
         pod.extract_pointer().is_some(),
@@ -420,8 +420,8 @@ async fn compact_resets_extract_pointer_so_phase1_can_fire_again() {
 }
 
 /// `extract_threshold = 0` is treated as "disabled" — without this, a
-/// raw `>=` comparison against `tokens_since` would fire Phase 1 on
-/// every post-run regardless of activity. Mirrors the Phase 2
+/// raw `>=` comparison against `tokens_since` would fire extract on
+/// every post-run regardless of activity. Mirrors the consolidation
 /// zero-threshold convention so users have a single way to opt out
 /// without removing the `[memory]` section.
 const EXTRACT_THRESHOLD_ZERO_MANIFEST: &str = r#"
@@ -446,7 +446,7 @@ permission = "write"
 
 #[tokio::test]
 async fn extract_threshold_zero_is_disabled() {
-    // Mock provides exactly one response — the first run. If Phase 1
+    // Mock provides exactly one response — the first run. If extract
     // were treated as "fire on any change" because of `tokens_since >= 0`,
     // it would call into the extract worker and exhaust the mock.
     let client = MockClient::new(vec![text_events_with_usage("hi", 1000)]);

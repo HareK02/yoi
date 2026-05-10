@@ -1,11 +1,11 @@
-//! `_staging/.consolidation.lock` による Phase 2 占有ファイル。
+//! `_staging/.consolidation.lock` による consolidation 占有ファイル。
 //!
 //! `docs/plan/memory.md` §並走防止 に従い:
 //!
 //! - ファイルが存在し、記録された Pod が動作している間、その Pod が排他占有
 //! - クラッシュで残った stale lock は、所有者 PID が死んでいれば次回 spawn
 //!   時に上書き取得できる
-//! - cleanup は consumed ID の staging エントリのみ削除し、実行中に Phase 1
+//! - cleanup は consumed ID の staging エントリのみ削除し、実行中に extract
 //!   が追加した分は残す
 //!
 //! 占有判定は Linux/macOS の `kill(pid, 0)` 経由で行う（`ESRCH` で死亡判定）。
@@ -29,7 +29,7 @@ pub struct LockRecord {
     pub pid: u32,
     pub pod_name: String,
     pub started_at: DateTime<Utc>,
-    /// この Phase 2 run が起動時スナップショットで確定した consumed staging
+    /// この consolidation run が起動時スナップショットで確定した consumed staging
     /// entry の UUIDv7 列。完了時はこの列のみ削除し、追加分は残す。
     pub consumed_ids: Vec<Uuid>,
 }
@@ -38,7 +38,7 @@ pub struct LockRecord {
 #[derive(Debug, thiserror::Error)]
 pub enum LockError {
     /// 占有ファイルが既にあり、所有者 PID が生きているのでスキップ。
-    #[error("Phase 2 lock held by live pid {pid} (pod {pod_name:?})")]
+    #[error("consolidation lock held by live pid {pid} (pod {pod_name:?})")]
     InUse { pid: u32, pod_name: String },
     #[error("io error at {}: {source}", .path.display())]
     Io {
@@ -59,7 +59,7 @@ impl LockError {
     }
 }
 
-/// Phase 2 が走っている間 RAII で持つ占有ハンドル。`Drop` では何もしない —
+/// consolidation が走っている間 RAII で持つ占有ハンドル。`Drop` では何もしない —
 /// 完了時の cleanup は consumed ID 列削除と一緒に行う必要があるため、明示
 /// 解放 [`StagingLock::release_with_cleanup`] を使う。明示解放しないまま
 /// drop された場合は占有ファイルがそのまま残り、次回 spawn 時に PID が
@@ -105,10 +105,10 @@ impl StagingLock {
                 tracing::warn!(
                     stale_pid = existing.pid,
                     stale_pod = %existing.pod_name,
-                    "Phase 2 stale lock detected, taking over"
+                    "consolidation stale lock detected, taking over"
                 );
             } else {
-                tracing::warn!(path = %path.display(), "Phase 2 lock unparseable, treating as stale");
+                tracing::warn!(path = %path.display(), "consolidation lock unparseable, treating as stale");
             }
         }
 
@@ -146,7 +146,7 @@ impl StagingLock {
         self.unlink_lock_only();
     }
 
-    /// 占有ファイルだけ削除し、staging エントリには触らない。Phase 2
+    /// 占有ファイルだけ削除し、staging エントリには触らない。consolidation
     /// sub-Worker が途中で失敗した場合に使う: 入力 staging を残したまま
     /// 次回再評価で再処理させる（`docs/plan/memory.md` §並走防止 の
     /// 「重複作成は同一 slug update に自然収束」運用）。
@@ -160,7 +160,7 @@ impl StagingLock {
                 tracing::warn!(
                     path = %self.path.display(),
                     error = %e,
-                    "failed to remove Phase 2 lock"
+                    "failed to remove consolidation lock"
                 );
             }
         }
@@ -193,7 +193,7 @@ fn pid_is_alive(pid: u32) -> bool {
 #[cfg(not(unix))]
 fn pid_is_alive(_pid: u32) -> bool {
     // Unsupported platforms: assume the lock is live so we never overwrite
-    // someone else's claim. Phase 2 will skip and try again next post-run.
+    // someone else's claim. consolidation will skip and try again next post-run.
     true
 }
 

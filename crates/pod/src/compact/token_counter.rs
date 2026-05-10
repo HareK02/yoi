@@ -151,7 +151,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     /// 任意の history index 時点でのプロンプト全長推定。
     ///
     /// `total_tokens()` と同じ accounting を任意位置で評価する版。
-    /// memory phase 1 trigger が
+    /// memory extract trigger が
     /// `total_tokens_at(now) - total_tokens_at(pointer)` で
     /// pointer 以降に増えたプロンプト長を測るのに使う。
     pub fn total_tokens_at(&self, history_len: usize) -> TokenEstimate {

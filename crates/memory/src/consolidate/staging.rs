@@ -1,10 +1,10 @@
 //! `_staging/*.json` を列挙して [`StagingRecord`] に展開する読み込みヘルパー。
 //!
-//! Phase 2 起動時のスナップショット（consumed ID list 確定）と、整理 phase
+//! consolidation 起動時のスナップショット（consumed ID list 確定）と、整理 step
 //! が終わった後の cleanup の双方で使う。`.consolidation.lock` のような
 //! 占有ファイルは UUIDv7 として parse できないので自然に除外される。
 //!
-//! [`StagingRecord`] のスキーマは Phase 1 が書き出す側 (`crate::extract`)
+//! [`StagingRecord`] のスキーマは extract が書き出す側 (`crate::extract`)
 //! と単一の真実源 — ここでは読み出す側だけを担当する。
 
 use std::path::PathBuf;
@@ -29,7 +29,7 @@ pub struct StagingEntry {
 /// `<staging_dir>/*.json` を読んで UUIDv7 順に並べた [`StagingEntry`]
 /// 配列を返す。staging_dir が存在しなければ空配列。読めないファイルや
 /// JSON parse 失敗は `tracing::warn!` してスキップ（壊れた個別ファイルが
-/// Phase 2 全体を止めないように）。
+/// consolidation 全体を止めないように）。
 pub fn list_staging_entries(layout: &WorkspaceLayout) -> Vec<StagingEntry> {
     let dir = layout.staging_dir();
     let entries = match std::fs::read_dir(&dir) {

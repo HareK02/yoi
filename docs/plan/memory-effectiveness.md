@@ -2,13 +2,13 @@
 
 ## Context
 
-`docs/plan/memory.md` で定義した永続化・検索・Phase 1 / Phase 2 の基盤は実装済みだが、現状の workspace memory を見る限り、実用上の効果はまだ弱い。
+`docs/plan/memory.md` で定義した永続化・検索・extract / consolidation の基盤は実装済みだが、現状の workspace memory を見る限り、実用上の効果はまだ弱い。
 
 現在の主要な症状:
 
 - `knowledge/*` が空で、通常 Pod が自発的に参照できる discovery 面がない
 - `memory/summary.md` は「Always-on サマリ」と設計されているが、通常 Pod の system prompt へ常駐注入されていない
-- Phase 2 は `KnowledgeCandidateReport::empty()` を受け取り、prompt 上も「候補レポートが空なら新規 Knowledge を作るな」としているため、Knowledge の cold-start が起きない
+- consolidation は `KnowledgeCandidateReport::empty()` を受け取り、prompt 上も「候補レポートが空なら新規 Knowledge を作るな」としているため、Knowledge の cold-start が起きない
 - `decisions/*` と `requests/*` は記録としては残るが、description / resident injection を持たず、後続 turn で自然に読まれにくい
 - bundled prompt に INSOMNIA 開発固有の ticket / TODO 運用を前提にした shadow 禁止が入り、一般ユーザー workspace の管理文脈を過剰に落とす可能性がある
 
@@ -39,7 +39,7 @@ Usage metrics の前に、memory effectiveness の最小改善として以下を
 通常 Pod の system prompt trailing section に `summary.md` の本文または圧縮表示を載せる。
 
 - `[memory]` が有効で、`memory/summary.md` が存在する場合だけ注入する
-- Phase 2 / internal disposable Worker には注入しない
+- consolidation / internal disposable Worker には注入しない
 - 既存の `Resident knowledge` とは別 section にする
 - summary の frontmatter は除外し、本文のみを載せる
 - summary 本文の linter 上限は 20,000 chars だが、resident 注入では別途 soft cap を持つか、当初は summary 自体を 1-5k tokens に保つ prompt 方針に依存する
@@ -52,14 +52,14 @@ Usage metrics の前に、memory effectiveness の最小改善として以下を
 
 ### Problem
 
-現行 Phase 2 は `KnowledgeCandidateReport::empty()` を渡し、prompt も空レポート時の新規 Knowledge 作成を禁止している。これは usage metrics 完成後の gate としては妥当だが、cold-start では永久に Knowledge が生まれない。
+現行 consolidation は `KnowledgeCandidateReport::empty()` を渡し、prompt も空レポート時の新規 Knowledge 作成を禁止している。これは usage metrics 完成後の gate としては妥当だが、cold-start では永久に Knowledge が生まれない。
 
 ### Direction
 
 Knowledge 作成 gate と resident injection gate を分離する。
 
 - 新規 Knowledge 作成:
-  - Phase 2 が high-confidence に再利用価値を判断できる場合は許可する
+  - consolidation が high-confidence に再利用価値を判断できる場合は許可する
   - default は `model_invokation: false`
   - `description` は「本文要約」ではなく「何の知識で、いつ読むべきか」を書かせる
 - `model_invokation: true` への昇格:
@@ -124,7 +124,7 @@ Memory extraction / consolidation が、ユーザー workspace の管理文脈�
 
 ### Direction
 
-Phase 2 の tidy / consolidation に、既存 `decisions/*` / `requests/*` を Knowledge へ昇格する経路を追加する。
+consolidation の tidy / consolidation に、既存 `decisions/*` / `requests/*` を Knowledge へ昇格する経路を追加する。
 
 - 同一内容を copy するのではなく、Knowledge として再利用可能な抽象に rewrite する
 - 元 decision は必要なら残す。Knowledge 側には `last_sources` として直近 source を持つ
@@ -145,7 +145,7 @@ Phase 2 の tidy / consolidation に、既存 `decisions/*` / `requests/*` を K
 2. Summary resident injection
    - 既存 `summary.md` が即座に通常 Pod へ効く
 3. Knowledge cold-start gate
-   - Phase 2 が Knowledge を生めるようにする
+   - consolidation が Knowledge を生めるようにする
 4. Existing record promotion
    - 既存 decisions / requests から Knowledge を立ち上げる
 5. Explicit slug invocation path
@@ -170,14 +170,14 @@ Usage metrics は不要ではない。役割を以下に限定すると妥当性
 
 `summary.md` を常駐させると system prompt budget を消費する。summary が肥大化した場合に備え、以下のどちらかを選ぶ必要がある。
 
-- linter / Phase 2 prompt で summary を 1-5k tokens に保つ運用を先行する
+- linter / consolidation prompt で summary を 1-5k tokens に保つ運用を先行する
 - resident injection 側に hard truncation / warning を入れる
 
 初期は前者でよいが、truncation されるなら LLM に明示した方がよい。
 
 ### Knowledge noise
 
-cold-start gate を緩めると Knowledge が増えすぎる可能性がある。対策として、新規作成時の `model_invokation: false` default、update 優先、description 品質指示、tidy phase の noisy 分類を使う。
+cold-start gate を緩めると Knowledge が増えすぎる可能性がある。対策として、新規作成時の `model_invokation: false` default、update 優先、description 品質指示、tidy step の noisy 分類を使う。
 
 ### Prompt override boundary
 

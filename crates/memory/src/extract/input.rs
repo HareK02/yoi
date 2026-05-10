@@ -1,4 +1,4 @@
-//! Phase 1 sub-Worker への入力テキスト組み立て。
+//! extract sub-Worker への入力テキスト組み立て。
 //!
 //! `crates/pod/src/pod.rs::build_summary_prompt` と同じ方針で
 //! Item 列を flat な行に落とす（reasoning は省く、tool call は名前のみ、
@@ -7,7 +7,7 @@
 
 use llm_worker::Item;
 
-/// 与えられた `items` を Phase 1 sub-Worker の最初の user 入力に整形する。
+/// 与えられた `items` を extract sub-Worker の最初の user 入力に整形する。
 pub fn build_extract_input(items: &[Item]) -> String {
     let mut out = String::new();
     out.push_str(

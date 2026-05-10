@@ -178,7 +178,7 @@ pub enum LogEntry {
     /// `RestoredState.extensions` に `(domain, payload)` を順に積むだけ。
     /// 各ドメイン側が自前で fold して最新値を取り出す前提。
     ///
-    /// 想定用途: memory subsystem の Phase 1 処理境界 pointer 等、
+    /// 想定用途: memory subsystem の extract 処理境界 pointer 等、
     /// 「session 寿命に縛りたいが session-store の型を汚したくない」
     /// メタデータ。
     Extension {

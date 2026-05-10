@@ -247,13 +247,13 @@ permission = "write"
 # query_excerpt_lines = 3
 #
 # # 任意。デフォルト: メインモデルを `clone_boxed()` で複製。
-# # Phase 1 (extract) ワーカーのモデル ([model] と同じ形式)。
+# # extract ワーカーのモデル ([model] と同じ形式)。
 # # Haiku / 4o-mini / Flash クラスの軽量 reasoning モデル推奨。
 # # [memory.extract_model]
 # # ref = "anthropic/claude-haiku-4-5"
 #
-# # 任意。デフォルト: なし (Phase 1 自動発火を完全停止)。
-# # 前回 extract pointer 以降の累積入力 token がこの値を超えると Phase 1 起動。
+# # 任意。デフォルト: なし (extract 自動発火を完全停止)。
+# # 前回 extract pointer 以降の累積入力 token がこの値を超えると extract 起動。
 # # ※ memory tools と resident injection は extract_threshold が None でも動く。
 # extract_threshold = 30000
 #
@@ -266,17 +266,17 @@ permission = "write"
 # extract_worker_max_turns = 8
 #
 # # 任意。デフォルト: メインモデルを `clone_boxed()` で複製。
-# # Phase 2 (consolidation) ワーカーのモデル。reasoning クラス推奨。
+# # consolidation ワーカーのモデル。reasoning クラス推奨。
 # # [memory.consolidation_model]
 # # ref = "anthropic/claude-sonnet-4-6"
 #
 # # 任意。デフォルト: なし。
-# # `_staging/` のエントリ数がこの値以上で Phase 2 発火 (files / bytes は OR)。
+# # `_staging/` のエントリ数がこの値以上で consolidation 発火 (files / bytes は OR)。
 # consolidation_threshold_files = 50
 #
 # # 任意。デフォルト: なし。
-# # `_staging/` の総バイト数がこの値以上で Phase 2 発火 (files / bytes は OR)。
-# # files / bytes の両方が None だと Phase 2 完全無効。
+# # `_staging/` の総バイト数がこの値以上で consolidation 発火 (files / bytes は OR)。
+# # files / bytes の両方が None だと consolidation 完全無効。
 # consolidation_threshold_bytes = 1048576
 
 

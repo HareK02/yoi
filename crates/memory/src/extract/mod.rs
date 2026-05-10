@@ -1,4 +1,4 @@
-//! Phase 1: 活動抽出。
+//! extract: 活動抽出。
 //!
 //! 通常 Pod の post-run hook で発火する disposable Worker と、その
 //! 出力を `<workspace>/.insomnia/memory/_staging/<id>.json` に書き出す

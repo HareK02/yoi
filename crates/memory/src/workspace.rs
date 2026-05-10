@@ -183,7 +183,7 @@ impl WorkspaceLayout {
             }));
         }
         if first == STAGING_DIR {
-            // Linter opts out of `_staging/`; Phase 1 handles its schema.
+            // Linter opts out of `_staging/`; extract handles its schema.
             return Ok(None);
         }
 

@@ -8,16 +8,16 @@
 
 ## 1. OpenAI Codex — Memories & Chronicle
 
-Codex CLI に 2026-03 頃から追加された "Memories" 機能と、2026-04-15 頃に macOS 向け研究プレビューとして乗った "Chronicle"。スクリーン内容まで観測対象に広げた点が目新しいが、**コアは素朴な 2 フェーズの要約パイプライン**で、実装の示唆が多い。
+Codex CLI に 2026-03 頃から追加された "Memories" 機能と、2026-04-15 頃に macOS 向け研究プレビューとして乗った "Chronicle"。スクリーン内容まで観測対象に広げた点が目新しいが、**コアは素朴な extract / consolidation の 2 段パイプライン**で、実装の示唆が多い。
 
 ### データフロー（memories 本体）
 
-セッション開始時に走る 2-phase パイプライン。`codex-rs/core/src/memories/` を直接読み確認した挙動:
+セッション開始時に走る 2-step パイプライン。`codex-rs/core/src/memories/` を直接読み確認した挙動:
 
-- **Phase 1 — Extraction**（`phase1.rs`）: 対象 rollout ごとにモデル呼び出しで **JSON schema 強制**の `StageOneOutput { raw_memory, rollout_summary, rollout_slug }` を返させる（`#[serde(deny_unknown_fields)]`）。`CONCURRENCY_LIMIT = 8` で並列実行、結果は SQLite の `stage1_outputs` テーブルに格納。`StateRuntime` の job leasing で duplicate work 防止
+- **extract — Extraction**（`extraction implementation`）: 対象 rollout ごとにモデル呼び出しで **JSON schema 強制**の `StageOneOutput { raw_memory, rollout_summary, rollout_slug }` を返させる（`#[serde(deny_unknown_fields)]`）。`CONCURRENCY_LIMIT = 8` で並列実行、結果は SQLite の `stage1_outputs` テーブルに格納。`StateRuntime` の job leasing で duplicate work 防止
   - モデル: `gpt-5.4-mini` / Low reasoning（`memories.extract_model` で override 可）
   - テンプレ: `codex-rs/core/templates/memories/stage_one_system.md` + `stage_one_input.md`
-- **Phase 2 — Consolidation**（`phase2.rs`）: **singleton** として走る（`jobs` テーブルで `kind = 'memory_consolidate_global'`, `job_key = 'global'` を `wx` 相当に claim）。`Phase2InputSelection` で前回 baseline との **added / retained / removed** 差分を計算し、その差分を prompt に埋めて sub-agent に投入
+- **consolidation — Consolidation**（`consolidation implementation`）: **singleton** として走る（`jobs` テーブルで `kind = 'memory_consolidate_global'`, `job_key = 'global'` を `wx` 相当に claim）。`ConsolidationInputSelection` で前回 baseline との **added / retained / removed** 差分を計算し、その差分を prompt に埋めて sub-agent に投入
   - 出力は **自由形式 Markdown**（JSON schema なし）。sub-agent が memory_root を cwd に持ち、`MEMORY.md` / `memory_summary.md` / `skills/<name>/` を直接書き換える
   - モデル: `gpt-5.4` / Medium reasoning（`memories.consolidation_model` で override 可）
   - Heartbeat 90s / lease 3600s、失敗時 `retry_remaining` デフォルト 3
@@ -25,7 +25,7 @@ Codex CLI に 2026-03 頃から追加された "Memories" 機能と、2026-04-15
 - 生成タイミングは「スレッドが十分アイドルになってから」（age + idle window で判定）
 - `memory_summary.md` が **5,000 tokens cap** で system prompt に注入される（`MEMORY_TOOL_DEVELOPER_INSTRUCTIONS_SUMMARY_TOKEN_LIMIT`）
 
-**非対称の肝**: 抽出 (Phase 1) は structured output で分類を強制、統合 (Phase 2) は sub-agent に自由書き込みさせる。分類ブレを Phase 1 で封じ、統合の柔軟性は Phase 2 の agentic 判断に委ねる、という役割分担。insomnia の 2 フェーズ設計の直接の元ネタ。
+**非対称の肝**: 抽出 (extract) は structured output で分類を強制、統合 (consolidation) は sub-agent に自由書き込みさせる。分類ブレを extract で封じ、統合の柔軟性は consolidation の agentic 判断に委ねる、という役割分担。insomnia の extract / consolidation 設計の直接の元ネタ。
 
 ### 保存場所 / 形式
 
@@ -33,13 +33,13 @@ Codex CLI に 2026-03 頃から追加された "Memories" 機能と、2026-04-15
 - `memory_summary.md` を中心に「summaries / durable entries / recent inputs / supporting evidence」の Markdown を束ねる構成。
 - Chronicle 派生メモリは `$CODEX_HOME/memories_extensions/chronicle/` に分離。
 - スクリーンキャプチャ中間物は `$TMPDIR/chronicle/screen_recording/` に置かれ、running 中 6h で自動削除。サーバー側には保存しない（法的義務時を除く）。
-- **Extension resource retention は決定論的 7 日 hard-coded**（`EXTENSION_RESOURCE_RETENTION_DAYS = 7`, `memories/extensions.rs:11`）。filename embedded timestamp (`%Y-%m-%dT%H-%M-%S`) が cutoff より古い `.md` リソースを Phase 2 直前に物理削除し、削除リストを `removed_extension_resources` として consolidation prompt に渡す（agent はそれを見て派生メモリを抹消）。
+- **Extension resource retention は決定論的 7 日 hard-coded**（`EXTENSION_RESOURCE_RETENTION_DAYS = 7`, `memories/extensions.rs:11`）。filename embedded timestamp (`%Y-%m-%dT%H-%M-%S`) が cutoff より古い `.md` リソースを consolidation 直前に物理削除し、削除リストを `removed_extension_resources` として consolidation prompt に渡す（agent はそれを見て派生メモリを抹消）。
 
 ### 設定
 
 - `memories.generate_memories` / `memories.use_memories`: 生成 / 注入の on-off。
-- `memories.extract_model`: Phase 1 に使う軽量モデル。
-- `memories.consolidation_model`: Phase 2 のマージ側モデル（既定で reasoning 系）。
+- `memories.extract_model`: extract に使う軽量モデル。
+- `memories.consolidation_model`: consolidation のマージ側モデル（既定で reasoning 系）。
 - セッション内 `/memories` コマンドでスレッド単位に無効化可能。
 - シークレットは生成時に自動 redaction。
 
@@ -163,7 +163,7 @@ Self-improving agent を名乗るフレーム。メモリ周りは **3 層 + ク
   > Review the conversation above and consider saving or updating a skill if appropriate.
   > Focus on: was a non-trivial approach used to complete a task that required trial and error...
   > **If nothing is worth saving, just say 'Nothing to save.' and stop.**
-- 末尾の "Nothing to save." 指示が肝。頻繁発火でも中身ゼロの場合は NOP で抜ける設計。insomnia Phase 1 の「空配列許容」の直接ソース
+- 末尾の "Nothing to save." 指示が肝。頻繁発火でも中身ゼロの場合は NOP で抜ける設計。insomnia extract の「空配列許容」の直接ソース
 
 ### 書き込み機構
 
@@ -252,10 +252,10 @@ Agent Workspace（`~/.openclaw/workspace/`）構成:
 メモリ更新のタイミング（`extensions/memory-core/src/` 実装より）:
 
 - **Compaction 前の silent turn**: `before_agent_reply` フックで `DREAMING_SYSTEM_EVENT_TEXT` を検出、`runShortTermDreamingPromotionIfTriggered` が発火。エージェントへの write-back 指示ではなく、**後述の dreaming pass をインラインで走らせる**仕組み
-- **Dreaming pass (optional)**: 実体は **3 phase** (Light + Deep + REM)、cron default `"0 3 * * *"` UTC
+- **Dreaming pass (optional)**: 実体は **3 passes** (Light + Deep + REM)、cron default `"0 3 * * *"` UTC
   - **Light**: 最近の recall / daily / session signals を short-term store に ingest + narrative 生成（**subagent LLM call 1 回**、`NARRATIVE_SYSTEM_PROMPT` で poetic な dream diary）
   - **Deep**: `applyShortTermPromotions()` が promotion を決定。**LLM call ゼロ**、以下の 6 重みスコアと 3 ゲートで機械判断
-    - 重み: frequency (0.24) / relevance (0.30) / diversity (0.15) / recency (0.15) / consolidation (0.10) / conceptual (0.06) + phase boost
+    - 重み: frequency (0.24) / relevance (0.30) / diversity (0.15) / recency (0.15) / consolidation (0.10) / conceptual (0.06) + pass boost
     - ゲート: `minScore 0.8` / `minRecallCount 3` / `minUniqueQueries 3`
   - **REM**: テーマ反映 + narrative LLM call 1 回
   - promotion 通過項目のみ `MEMORY.md` に append、`DREAMS.md` に人間レビュー用 diary
@@ -263,7 +263,7 @@ Agent Workspace（`~/.openclaw/workspace/`）構成:
 - **Lock**: `memory/.dreams/short-term-promotion.lock` を `wx` フラグで exclusive create、60s stale 検出 + 10s wait timeout、in-process の Map も併用
 - **モデルが "覚えている" のはディスクに書かれた内容だけ**、という明示ポリシー。隠れた state 無し
 
-**insomnia にとって重要**: consolidation を LLM 依存から切り離せる見本。narrative は subagent が生成するが、promotion の判断は純機械（scoring）。insomnia の plan では Scope 外（Phase 2 は当面 agent 委任）だが、成熟したカテゴリから決定論的 promotion に差し替える upgrade path の参考になる。
+**insomnia にとって重要**: consolidation を LLM 依存から切り離せる見本。narrative は subagent が生成するが、promotion の判断は純機械（scoring）。insomnia の plan では Scope 外（consolidation は当面 agent 委任）だが、成熟したカテゴリから決定論的 promotion に差し替える upgrade path の参考になる。
 
 **GC 観点の追加詳細**（`extensions/memory-core/src/short-term-promotion.ts:1518-1652` 実装より）:
 
@@ -464,7 +464,7 @@ insomnia で意思決定すべきポイントはこの対応表：
 
 ## 8. GC 機構の横断比較
 
-`docs/plan/memory.md` §GC は「Phase 2 とは別経路で memory を再評価し、drop / merge / split / `replaced` chain 整理を行う」ことを決めた段階で、判断主体と処理種別の仕様をこれから詰める。本節は他プロジェクトの GC 設計を共通の 6 軸で並べて、insomnia で採るべき型の材料とする。
+`docs/plan/memory.md` §GC は「consolidation とは別経路で memory を再評価し、drop / merge / split / `replaced` chain 整理を行う」ことを決めた段階で、判断主体と処理種別の仕様をこれから詰める。本節は他プロジェクトの GC 設計を共通の 6 軸で並べて、insomnia で採るべき型の材料とする。
 
 ### 8.1 比較表
 
@@ -472,9 +472,9 @@ insomnia で意思決定すべきポイントはこの対応表：
 
 | # | プロジェクト / 機構 | 対象 | トリガー | 判断主体 | 処理種別 | 人間介入点 | 履歴保持 |
 |---|---------------------|------|----------|----------|----------|-----------|---------|
-| 1 | Codex Phase 2 consolidation | `MEMORY.md` block / `memory_summary.md` / `skills/*` | session idle + age | **LLM agentic**（sub-agent） | drop / merge / split / rewrite、removed thread id に紐づく block を **部分削除**（block 丸ごとは消さない、thread-local 記述のみ除去） | 無し（`/memories` で thread 単位 opt-out のみ） | git 任意、memory_root は単なる Markdown |
-| 2 | Codex extension resource retention | `memories_extensions/<name>/resources/*.md` | Phase 2 実行直前に cron 相当 | **決定論** | **物理削除** （filename timestamp cutoff） | 無し | 完全消去、Phase 2 prompt に removed list を通知 |
-| 3 | Codex stage1 pruning | `stage1_outputs` SQLite row | Phase 2 後 / 容量超過 | **決定論** | `selected_for_phase2 = 0` の古い row を cutoff + `LIMIT` で DELETE | 無し | SQL 完全削除 |
+| 1 | Codex consolidation | `MEMORY.md` block / `memory_summary.md` / `skills/*` | session idle + age | **LLM agentic**（sub-agent） | drop / merge / split / rewrite、removed thread id に紐づく block を **部分削除**（block 丸ごとは消さない、thread-local 記述のみ除去） | 無し（`/memories` で thread 単位 opt-out のみ） | git 任意、memory_root は単なる Markdown |
+| 2 | Codex extension resource retention | `memories_extensions/<name>/resources/*.md` | consolidation 実行直前に cron 相当 | **決定論** | **物理削除** （filename timestamp cutoff） | 無し | 完全消去、consolidation prompt に removed list を通知 |
+| 3 | Codex stage1 pruning | `stage1_outputs` SQLite row | consolidation 後 / 容量超過 | **決定論** | `selected_for_consolidation = 0` の古い row を cutoff + `LIMIT` で DELETE | 無し | SQL 完全削除 |
 | 4 | Hermes `memory` tool | `MEMORY.md` / `USER.md` のエントリ | **char limit (2,200 / 1,375) 超過時の add 拒否** | **LLM agentic**（エラー受けて自分で `replace` / `remove` を呼ぶ） | drop / rewrite | 無し（all-agent） | ディスク消去（file lock で tx 化） |
 | 5 | Hermes background review | entry / skill | turn / iter カウンタ（10 デフォルト） | **LLM agentic**（fork agent、max_iterations = 8） | add / update / delete をレビュー判断、`Nothing to save.` で no-op | 無し | same as 4 |
 | 6 | OpenClaw `applyShortTermPromotions` | promotion candidate → `MEMORY.md` | Deep dreaming phase | **決定論**（6 重み合算 + 3 ゲート、LLM ゼロ） | **append のみ**（`<!-- openclaw-memory-promotion:<hash> -->` marker、既存 block は触らない） | 無し | 追記のみ、削除系統は別 |
@@ -497,23 +497,23 @@ insomnia で意思決定すべきポイントはこの対応表：
 **トリガー（いつ GC するか）の 4 パターン**:
 
 1. **容量超過 hard reject**（Hermes）: 追加要求を失敗で返して LLM に自律対処を強制。**決定論的 trigger + agentic 処理**で、設計最小コスト。
-2. **session idle + age**（Codex Phase 2）: 人間の活動終了を待って非同期、最もユーザー体感を壊しにくい。
+2. **session idle + age**（Codex consolidation）: 人間の活動終了を待って非同期、最もユーザー体感を壊しにくい。
 3. **cron / scheduled sweep**（OpenClaw dreaming default `0 3 * * *`, Codex extension retention）: 定期的・予測可能。人間 review との組み合わせがしやすい。
 4. **ingest 時の即時**（Cloudflare supersession）: 書き込みの tx 内で完結、後続 GC 走査が要らない。topic key 設計が前提。
 
-insomnia の plan は (2) Phase 2 で rewrite 許可を置きつつ、GC は (3) 方向で別経路という構造。これは Codex / OpenClaw の両方と整合する。
+insomnia の plan は (2) consolidation で rewrite 許可を置きつつ、GC は (3) 方向で別経路という構造。これは Codex / OpenClaw の両方と整合する。
 
 **判断主体の 3 系統**:
 
 - **決定論のみ**: Codex retention / stage1 pruning / OpenClaw temporal decay / Cloudflare supersession / lint 検出。条件がはっきりしているもの（age / key 一致 / 構造的 issue）は決定論が強い。
 - **決定論 scoring → 閾値 gate → 機械適用**: OpenClaw Deep promotion。LLM の揺れを除き、コストも LLM コールゼロ。ただし対象が append 側のみで、削除には使われていない。
-- **LLM agentic**: Codex Phase 2 / Hermes review / Letta sleep-time。判断の柔軟性（block 内部分削除、context 依存の merge）を LLM に委ねる。
+- **LLM agentic**: Codex consolidation / Hermes review / Letta sleep-time。判断の柔軟性（block 内部分削除、context 依存の merge）を LLM に委ねる。
 
-`docs/plan/memory.md` は Phase 2 が LLM agentic、GC も暫定的に **LLM agentic + Linter Warn 併用**としている。完全に一致する事例は **Codex Phase 2 の consolidation prompt**（836 行）で、「removed thread id を `MEMORY.md` から部分削除し、blockに他の thread が残っている場合は split / rewrite して保持」という手続きを自然言語で指示している。**insomnia は Linter 側に警告カテゴリ（類似 slug / `replaced` 滞留 / sources 過多 / stale）を先に定義し、GC 実行の agent プロンプトはそれを入力にする**構造が素直。
+`docs/plan/memory.md` は consolidation が LLM agentic、GC も暫定的に **LLM agentic + Linter Warn 併用**としている。完全に一致する事例は **Codex consolidation の consolidation prompt**（836 行）で、「removed thread id を `MEMORY.md` から部分削除し、blockに他の thread が残っている場合は split / rewrite して保持」という手続きを自然言語で指示している。**insomnia は Linter 側に警告カテゴリ（類似 slug / `replaced` 滞留 / sources 過多 / stale）を先に定義し、GC 実行の agent プロンプトはそれを入力にする**構造が素直。
 
 **処理種別の選択肢**:
 
-- `drop / merge / split / rewrite` の組み合わせは Codex Phase 2 が最も自由度高く、Hermes もそれに近い（entry 粒度）。
+- `drop / merge / split / rewrite` の組み合わせは Codex consolidation が最も自由度高く、Hermes もそれに近い（entry 粒度）。
 - `replaced` chain の整理は **Cloudflare だけが自動で版チェーン維持**、他は LLM 任せ。insomnia は decision record に `replaced_by` を入れているので、Cloudflare 方式の forward pointer 概念を **人間可読な `replaced_by:` frontmatter** で既に踏襲している。GC 時に chain をどこまで短く畳むか（長大な `a → b → c → d` を `a → d` に圧縮するか）は未決定論点で、Cloudflare は圧縮せず chain を保持する設計。
 - **`split` は Codex だけが明示**。block 内に複数 thread id が混ざった場合に thread id 単位で分ける。insomnia の「1 件 1 ファイル」方針では split = ファイル分割となり、主題の粒度判断は GC agent に委ねる必要がある。
 
@@ -523,7 +523,7 @@ insomnia の plan は (2) Phase 2 で rewrite 許可を置きつつ、GC は (3)
 - audit-first（issue を surface し、人間が決断）: memory-wiki lint / OpenClaw dreaming-repair
 - high-stake 限定 gate: LinkedIn CMA
 
-insomnia の plan は「人間 offer 承認を併用」なので **audit-first に寄る**のが自然。lint 相当の Warn を Linter で出し、LLM Phase 2 / GC がそれを消費する前に人間が承認 / 拒否できる UI を提供する構造。memory-wiki lint は `reports/lint.md` というシンプルな Markdown 出力なので、そのまま `memory/reports/gc-lint.md` 相当を tick off する実装が参考になる。
+insomnia の plan は「人間 offer 承認を併用」なので **audit-first に寄る**のが自然。lint 相当の Warn を Linter で出し、LLM consolidation / GC がそれを消費する前に人間が承認 / 拒否できる UI を提供する構造。memory-wiki lint は `reports/lint.md` というシンプルな Markdown 出力なので、そのまま `memory/reports/gc-lint.md` 相当を tick off する実装が参考になる。
 
 **履歴保持の 3 モデル**:
 
@@ -535,15 +535,15 @@ insomnia は **git 管理下に memory を置く**前提なので、物理削除
 
 ### 8.3 insomnia の GC 仕様を詰めるときの示唆
 
-1. **GC trigger は 2 系統に割る**。(a) 決定論: Linter Warn 群 + age / count / size 閾値の sweep、(b) LLM 判定: Phase 2 とは別 prompt で Linter の issue リストを入力に渡す。両方が `memory/reports/gc-*.md` 相当を書き、それを次回の GC run が読む、というフィードバックループが OpenClaw lint / Codex Phase 2 input selection の両方と整合する。
+1. **GC trigger は 2 系統に割る**。(a) 決定論: Linter Warn 群 + age / count / size 閾値の sweep、(b) LLM 判定: consolidation とは別 prompt で Linter の issue リストを入力に渡す。両方が `memory/reports/gc-*.md` 相当を書き、それを次回の GC run が読む、というフィードバックループが OpenClaw lint / Codex consolidation input selection の両方と整合する。
 2. **Linter に「GC 候補検出」カテゴリを足す**。memory-wiki の lint issue code が参考になる: `stale-page`（90d 超）/ `stale-claim` / `low-confidence` / `orphan` / `duplicate-id` / `broken-wikilink` / `contradiction-present` / `open-question`。insomnia 固有の追加候補: `similar-slug`（類似 slug 乱立、既に plan に記載）/ `replaced-chain-long`（`replaced_by` が 3 段以上）/ `sources-overflow`（1 record の sources が閾値超）/ `knowledge-invoke-frequency-low`（`user_invoke` が一定期間ゼロ）。
 3. **処理は rewrite 優先、削除は `status: replaced` 経由**（既に plan 方針と一致）。forward pointer は Cloudflare 流、ただし chain 圧縮ルール（例: 「chain が n 段超えたら中間を drop、端のみ残す」）を決めるかは別論点。Cloudflare は圧縮しない、insomnia は git があるので圧縮してよい。
 4. **char limit は採用しない方が筋が良い**。Hermes の hard limit + LLM self-rewrite は設計最小だが、insomnia は 1 record 1 file なのでファイル内 size 制約は薄く、file 数による grep コストの方が支配的になる。file 数閾値 → GC trigger の方が insomnia の形に合う。
-5. **決定論 scoring を後から差し込む余地を残す**。OpenClaw Deep phase のような「頻度 / 関連度 / 多様性 / 時間減衰 / 整合性 / 概念」の 6 重み + 閾値は、agent LLM の出力が運用で評価可能になった段階で部分的に差し替える upgrade path として最適。初期は Phase 2 LLM + Linter Warn で十分。
+5. **決定論 scoring を後から差し込む余地を残す**。OpenClaw Deep pass のような「頻度 / 関連度 / 多様性 / 時間減衰 / 整合性 / 概念」の 6 重み + 閾値は、agent LLM の出力が運用で評価可能になった段階で部分的に差し替える upgrade path として最適。初期は consolidation LLM + Linter Warn で十分。
 6. **削除は git commit 単位で可逆**という前提を明示する。プロジェクトメモリは git 管理下なので、GC が誤って drop してもユーザーは revert できる。これは Codex が持っていない利点で、GC agent の判断を多少攻めても安全マージンがある。
 
 一次ソース:
-- Codex Phase 2 consolidation: `github.com/openai/codex/codex-rs/core/src/memories/phase2.rs`, `core/templates/memories/consolidation.md`
+- Codex consolidation: `github.com/openai/codex/codex-rs/core/src/memories/consolidation implementation`, `core/templates/memories/consolidation.md`
 - Codex retention / stage1 pruning: `github.com/openai/codex/codex-rs/core/src/memories/extensions.rs:11-139`, `codex-rs/state/src/runtime/memories.rs:290-331, 333-464`
 - Hermes char limit reject: `github.com/NousResearch/hermes-agent/tools/memory_tool.py:211-266`
 - Hermes review spawn: `github.com/NousResearch/hermes-agent/run_agent.py:2727-2830`

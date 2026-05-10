@@ -1,6 +1,6 @@
-//! Phase 2: 統合 + 整理。
+//! consolidation: 統合 + 整理。
 //!
-//! Phase 1 が staging に残した活動ログを `memory/*` / `knowledge/*` に
+//! extract が staging に残した活動ログを `memory/*` / `knowledge/*` に
 //! 統合し、続けて既存 record を `outdated | superseded | unused | noisy`
 //! の観点で整理する disposable Worker を、Pod 側が組み立てるための
 //! ヘルパー群を提供する。Pod は次の手順で sub-Worker を構築する:
@@ -15,7 +15,7 @@
 //! (`PodPrompt::MemoryConsolidationSystem`) で管理される。Knowledge 化候補
 //! レポートと使用頻度メトリクスは別チケットで供給される想定。本モジュール
 //! 時点では空入力として扱い、prompt 側の説明だけ残しておく
-//! （`docs/plan/memory.md` §Phase 2 / 整理材料）。
+//! （`docs/plan/memory.md` §Consolidation / 整理材料）。
 
 mod input;
 mod lock;

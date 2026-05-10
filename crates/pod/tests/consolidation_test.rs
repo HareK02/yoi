@@ -1,4 +1,4 @@
-//! Phase 2 (memory.consolidation) post-run trigger.
+//! consolidation (memory.consolidation) post-run trigger.
 //!
 //! Covers the gating, lock and cleanup behaviour without exercising the
 //! full sub-worker tool loop:
@@ -203,7 +203,7 @@ async fn no_thresholds_is_a_noop() {
     let mut pod = make_pod_with(MEMORY_NO_THRESHOLDS_TOML, pwd.path().to_path_buf(), client).await;
     pod.try_post_run_consolidate()
         .await
-        .expect("phase 2 disabled when both thresholds are None");
+        .expect("consolidation disabled when both thresholds are None");
 
     // No staging entries removed.
     assert_eq!(memory::consolidate::list_staging_entries(&layout).len(), 5);
@@ -212,7 +212,7 @@ async fn no_thresholds_is_a_noop() {
 #[tokio::test]
 async fn zero_thresholds_treated_as_disabled() {
     // Without the `Some(0) → None` collapse, `total_files >= 0` and
-    // `total_bytes >= 0` would always evaluate true and Phase 2 would
+    // `total_bytes >= 0` would always evaluate true and consolidation would
     // fire on every post-run with any staging activity.
     let pwd = tempfile::tempdir().unwrap();
     let layout = WorkspaceLayout::new(pwd.path().to_path_buf());
@@ -265,7 +265,7 @@ async fn fires_on_threshold_and_cleans_up_consumed_entries() {
     let layout = WorkspaceLayout::new(pwd.path().to_path_buf());
     write_n_staging(&layout, 2); // threshold is 2 — fires.
 
-    // Sub-worker is given a single text-only response. The Phase 2 prompt
+    // Sub-worker is given a single text-only response. The consolidation prompt
     // tells it to call memory tools; the mock skips those, but `Worker::run`
     // returns Ok regardless once the LLM closes with a final text.
     let client = MockClient::new(vec![done("ok")]);
@@ -343,7 +343,7 @@ async fn coalesce_loop_terminates_with_one_iteration_when_snapshot_drains_stagin
 
     // Coalesce semantics from `docs/plan/memory.md` §並走防止: a single
     // run consumes the snapshot taken at acquire time; the loop
-    // re-evaluates against any post-snapshot Phase 1 additions. With no
+    // re-evaluates against any post-snapshot extract additions. With no
     // concurrent additions, the second iteration sees an empty staging
     // and bails out — exercised here by counting LLM calls.
     let pwd = tempfile::tempdir().unwrap();
@@ -380,7 +380,7 @@ async fn live_lock_held_by_other_pod_skips() {
     write_n_staging(&layout, 3);
 
     // Pre-acquire lock with this test's PID — definitely alive — and
-    // *don't* release it. The Phase 2 path must skip without error.
+    // *don't* release it. The consolidation path must skip without error.
     let _live_lock = memory::consolidate::StagingLock::acquire(
         &layout,
         std::process::id(),

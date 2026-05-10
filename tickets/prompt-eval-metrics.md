@@ -11,7 +11,7 @@ external author の empirical-prompt-tuning は、agent-facing な指示（Skill
 - usage tokens
 - workflow / knowledge の明示 invoke 頻度（`tickets/memory-usage-metrics.md`）
 - `model_invokation` 常駐注入のコスト側指標
-- Phase 1 / Phase 2 memory consolidation による recurring pattern 抽出
+- extract / consolidation による recurring pattern 抽出
 - Workflow 自動書き込み禁止に基づく improvement offer
 
 したがって、`/empirical-prompt-tuning` 相当の Workflow は、評価実行を orchestration するだけでなく、評価結果を構造化 event として残し、将来的に memory consolidation / usage metrics / Workflow improvement offer / `model_invokation` 判断へ接続するべきである。
@@ -91,8 +91,8 @@ retries
 
 接続方針:
 
-- evaluator self-report は Phase 1 の活動抽出対象になる
-- repeated `General Fix Rule` は Phase 2 が recurring failure pattern として統合できる
+- evaluator self-report は consolidation extract の活動抽出対象になる
+- repeated `General Fix Rule` は consolidation が recurring failure pattern として統合できる
 - recurring pattern は即 Knowledge 化せず、使用頻度メトリクス gate を通す
 - Workflow 改善は `.insomnia/workflow/*.md` へ自動書き込みせず、Notification / report / ticket などの offer に留める
 - `model_invokation` ON 判断では、明示 invoke 頻度と常駐コストに加えて、eval success rate / unclear point count / description-body consistency を判断材料にする
@@ -116,7 +116,7 @@ Claude Code 版の `tool_uses` を、insomnia では tool 種別ごとの偏り�
 手書き台帳だけにせず、eval event から抽出可能な failure pattern として扱う。
 
 - `General Fix Rule` を class-level pattern として正規化する
-- 同じ pattern が複数 scenario / 複数 iteration / 複数 target で再発した場合、Phase 2 が decision / knowledge candidate / workflow improvement offer に統合できる
+- 同じ pattern が複数 scenario / 複数 iteration / 複数 target で再発した場合、consolidation が decision / knowledge candidate / workflow improvement offer に統合できる
 - 同じ pattern が 3 回以上再発した場合、局所 patch ではなく target prompt の構造変更を提案する
 
 ## 範囲外
