@@ -49,3 +49,8 @@ Compact worker のサーキットブレーカー (`crates/pod/src/compact/worker
 - `crates/pod/src/compact/usage_tracker.rs`: 既存 `UsageTracker` を compact worker からも使うため、必要なら可視性 / API の調整。
 - `crates/manifest/src/lib.rs`, `crates/manifest/src/config.rs`, `crates/manifest/src/defaults.rs`: `compact_worker_max_input_tokens` のドキュメント更新、`compact_worker_max_turns` の追加とカスケード。
 - `crates/pod/src/compact/worker.rs` のユニットテスト、および compact 関連の統合テスト。
+
+## Review
+- 状態: Approve with follow-up
+- レビュー詳細: [./compact-worker-occupancy-cap.review.md](./compact-worker-occupancy-cap.review.md)
+- 日付: 2026-05-11

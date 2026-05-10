@@ -1545,9 +1545,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             usage_tracker: summary_usage_tracker,
             max_input_tokens: compact_worker_max_input_tokens,
         });
-        if compact_worker_max_turns.is_some() {
-            summary_worker.set_max_turns(compact_worker_max_turns);
-        }
+        summary_worker.set_max_turns(compact_worker_max_turns);
 
         // Tools: read_file (shared scope, fresh tracker) + the three
         // compact-specific tools that populate `ctx`.
