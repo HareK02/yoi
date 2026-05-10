@@ -17,7 +17,7 @@ memory 関連 prompt は種別を問わず、最低限以下を共有する:
 - **単純 append を優先しない**。既存 record に統合できるなら update を優先する
 - **session 固有の進行状態を書かない**。長期参照価値のある内容だけを memory に残す
 - **既存 docs と重複保存しない**。`AGENTS.md`、`docs/plan/*`、固定運用文書に既にある内容を再保存しない
-- **git で追える事実を memory に書かない**。ticket file の作成・編集、TODO 更新、branch / worktree 操作、commit / merge / push、「commit X で実装した」「ticket Y を作った」「worker Pod を spawn した」等は git diff / log が真実で、memory に写すと陳腐化する。commit ハッシュ・branch 名・worktree パス・ticket file 名・PR 番号と組み合わせないと意味を成さない記録は採用しない
+- **特定の project-management 手法を前提にしない**。既定 prompt は issue tracker / task board / planning doc / changelog / version-control history / generated report などを「正確な内容の authoritative record」として一般化して扱う。memory はそれらの本文・status 変化・短命 identifier をそのまま複製する parallel ledger にはしない。一方で、今後の作業に役立つ持続的な project-management 事実、workflow 制約、優先度判断の根拠、複数 item にまたがる学びは採用してよい
 - **空出力を許容**する。保存価値が無ければ「何も追加しない」を正当な結果として扱う
 
 ### Phase 1: 活動抽出 prompt
@@ -32,10 +32,10 @@ Phase 1 は「派生物を作る」段階ではなく、「起きたことを抽
 
 ノイズ防御として、抽出時点で以下を除外する:
 
-- `attempts`: git で追える操作 (ticket file / TODO 編集、branch / worktree 作成、commit / merge / push、既知 ticket への worker Pod spawn) は除外。残すのは git からは復元できない情報 (ビルド/テスト結果、外部 API 応答、観測されたバグ再現、後段の判断材料となる設計実験結果) に限る
-- `discussions`: 当日中に陳腐化する一過性 triage (「次に着手するチケットはどれか」「いま review すべきか後でか」など) は除外。session を越えて意味を持つ論点 (アーキテクチャの trade-off、恒常的な制約、再来する問い) のみ残す
-- `decisions`: rationale が「この session で X をした」になるものは除外。設計 / 方針 / 取り組み方の根拠でない記録は decision ではなく作業ログ
-- 本文中に commit ハッシュ・branch 名・worktree パス・ticket file 名・PR 番号など陳腐化する identifier を埋め込まない
+- `attempts`: authoritative record の保守や外部 lifecycle の移動そのものだけを表す操作は除外。残すのはその record 自体からは復元できない情報 (ビルド/テスト結果、外部 API 応答、観測されたバグ再現、後段の判断材料となる設計実験結果、持続的な process lesson) に限る
+- `discussions`: 当日中に陳腐化する一過性 triage (直近の scheduling、status 確認、短命な順序決めなど) は除外。session を越えて意味を持つ論点 (アーキテクチャの trade-off、恒常的な workflow 制約、再来する問い) のみ残す
+- `decisions`: rationale が「この session で X をした」になるものは除外。設計 / 方針 / process / 取り組み方の根拠でない記録は decision ではなく作業ログ。ただし、作業管理上の持続的な方針や抽象化は decision として扱える
+- authoritative project record の title / body / checklist / raw status / 短命 identifier を本文に複製しない。正確な status mirror や identifier と組み合わせないと意味を成さない記録は採用しない
 
 ### Phase 2: 統合 + 整理 prompt
 
