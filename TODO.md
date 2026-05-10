@@ -24,9 +24,12 @@
   - セッションコンテキスト長 / ウィンドウ占有率の常時表示 → [tickets/tui-context-usage-indicator.md](tickets/tui-context-usage-indicator.md)
 - Manifest: Tool Output / File Upload 上限の分離とデフォルト緩和 → [tickets/manifest-output-upload-limits.md](tickets/manifest-output-upload-limits.md)
 - Prune: 保護境界を turn 数から末尾 token budget に置き換え → [tickets/prune-token-budget.md](tickets/prune-token-budget.md)
+- Compact worker サーキットブレーカーを占有量ベースに統一 → [tickets/compact-worker-occupancy-cap.md](tickets/compact-worker-occupancy-cap.md)
 - メモリ機構
   - 使用頻度メトリクス + Knowledge 化候補レポート → [tickets/memory-usage-metrics.md](tickets/memory-usage-metrics.md)
+  - Phase 1/2 呼称を extract/consolidation に統一 → [tickets/memory-phase-naming.md](tickets/memory-phase-naming.md)
   - extract / consolidation 監査ログ → [tickets/memory-audit-log.md](tickets/memory-audit-log.md)
+  - extract worker サーキットブレーカーを占有量ベースに統一 → [tickets/memory-extract-occupancy-cap.md](tickets/memory-extract-occupancy-cap.md)
 - セッション内 Task ツールの注意機構（無アクティビティで `<system-reminder>` ナッジ） → [tickets/session-todo-reminder.md](tickets/session-todo-reminder.md)
 - ワークスペースのメモリーをLintするヘッドレスCLI
 - system-reminder 注入機構の汎用化（2件目の利用者が出た時に検討。タグ形式 `<system-reminder>...</system-reminder>` の規約は session-todo-reminder で先行確立。注入された Item は worker.history に append する方針）
