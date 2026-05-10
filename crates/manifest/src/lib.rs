@@ -108,11 +108,17 @@ pub struct MemoryConfig {
     /// the auto-extract trigger is dormant.
     #[serde(default)]
     pub extract_threshold: Option<u64>,
-    /// Cumulative input-token cap for the extract worker's own LLM
-    /// calls. Exceeding this aborts the extract run. `None` ⇒
+    /// Current prompt-occupancy cap for the extract worker's own LLM
+    /// requests. Exceeding this aborts the extract run. `None` ⇒
     /// [`defaults::MEMORY_EXTRACT_WORKER_MAX_INPUT_TOKENS`].
     #[serde(default)]
     pub extract_worker_max_input_tokens: Option<u64>,
+    /// Optional maximum extract-worker tool-loop depth. `None` leaves
+    /// the worker unlimited; the default bounds runaway short-context
+    /// loops. Falls through to
+    /// [`defaults::MEMORY_EXTRACT_WORKER_MAX_TURNS`] when unset.
+    #[serde(default)]
+    pub extract_worker_max_turns: Option<u32>,
     /// Optional model for the Phase 2 (consolidation) worker. When
     /// `None`, the main pod model is cloned via `clone_boxed()`.
     /// Reasoning-class models are recommended.
