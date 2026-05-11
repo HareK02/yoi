@@ -9,8 +9,8 @@ external author の empirical-prompt-tuning は、agent-facing な指示（Skill
 - evaluator Pod の session id / history
 - tool call / tool result
 - usage tokens
-- workflow / knowledge の明示 invoke 頻度（`tickets/memory-usage-metrics.md`）
-- `model_invokation` 常駐注入のコスト側指標
+- workflow / knowledge の明示使用ログ（use 回数、last used、source breakdown。`tickets/memory-usage-metrics.md`）
+- `model_invokation` 常駐注入の exposure cost 指標
 - extract / consolidation による recurring pattern 抽出
 - Workflow 自動書き込み禁止に基づく improvement offer
 
@@ -93,9 +93,9 @@ retries
 
 - evaluator self-report は consolidation extract の活動抽出対象になる
 - repeated `General Fix Rule` は consolidation が recurring failure pattern として統合できる
-- recurring pattern は即 Knowledge 化せず、使用頻度メトリクス gate を通す
+- recurring pattern は即 Knowledge 化せず、明示使用ログと Doctor / prompt-eval の事後評価を通す
 - Workflow 改善は `.insomnia/workflow/*.md` へ自動書き込みせず、Notification / report / ticket などの offer に留める
-- `model_invokation` ON 判断では、明示 invoke 頻度と常駐コストに加えて、eval success rate / unclear point count / description-body consistency を判断材料にする
+- `model_invokation` ON 判断では、明示使用ログと resident exposure cost に加えて、eval success rate / unclear point count / description-body consistency を判断材料にする
 
 ### 評価指標の解釈
 
@@ -140,7 +140,6 @@ Claude Code 版の `tool_uses` を、insomnia では tool 種別ごとの偏り�
 
 ## 参照
 
-- `docs/external/zenn-external author-empirical-prompt-tuning.md`
 - `external skill reference/empirical-prompt-tuning/SKILL.md`（外部参照。取り込み時は必要最小限に一般化する）
 - `docs/plan/workflow.md`
 - `docs/plan/memory.md`
