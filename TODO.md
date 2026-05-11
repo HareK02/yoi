@@ -1,6 +1,7 @@
 - Workflow / Skills
   - 内部 Worker / 内部 Pod の Workflow 化 → [tickets/internal-worker-workflow.md](tickets/internal-worker-workflow.md)
   - 半自動開発運用 Workflow → [tickets/auto-maintain-workflow.md](tickets/auto-maintain-workflow.md)
+  - AI maintainer 用 WorkItem / Thread 抽象 → [tickets/maintainer-work-items.md](tickets/maintainer-work-items.md)
   - Prompt / Workflow 評価メトリクスと改善 Offer → [tickets/prompt-eval-metrics.md](tickets/prompt-eval-metrics.md)
   - memory / workflow 共通基盤（Slug / frontmatter helpers）を別 crate に切り出す → [tickets/lint-common-crate.md](tickets/lint-common-crate.md)
 - Permission: allow-all 既定 policy への整理 → [tickets/permission-default-policy.md](tickets/permission-default-policy.md)
