@@ -6,7 +6,7 @@
 
 特に、設計相談、実装 Pod の作業報告、review 指摘、修正依頼、完了判断、Pod run、lease、artifact が ticket file / review file / 会話 / git log に分散し、thread として扱いづらい。
 
-repository-managed issue directory example の `issues/` directory のように、repository 内に issue / work item を置く運用は参考になる。一方で、将来的な network 越し workspace / remote coordination も想定すると、最初から Git directory 前提で API を固めるべきではない。
+repository-managed issue directory example の `issues/` directory のように、repository 内に issue / work item を置く運用は参考になる。一方で、同 repository の owner も指摘している通り、中央の `SEQUENCE` ファイルによる連番採番は並列 branch / worktree で conflict しやすい。将来的な network 越し workspace / remote coordination も想定すると、最初から Git directory や中央採番前提で API を固めるべきではない。
 
 本チケットでは、`tickets/` を直ちに置き換えるのではなく、AI maintainer が扱う上位の **WorkItem / Thread / Event / Lease / Artifact** 抽象を設計し、最小 file backend を導入できる状態にする。
 
@@ -15,6 +15,7 @@ repository-managed issue directory example の `issues/` directory のように�
 - WorkItem / Thread の正本は `.insomnia` ではなく、project-visible な repo-managed 領域に置く
 - `.insomnia` は local runtime state / memory / workflow / Pod run / lease cache の領域として分離する
 - API / domain model は Git に依存しない形にする
+- WorkItem ID は中央 `SEQUENCE` 連番ではなく、作成時刻ベースの衝突しにくい ID にする
 - 初期 backend は repo 内 directory（例: `work-items/` または `issues/`）でよい
 - network 越し workspace / remote hub は後回しにするが、将来差し替え可能な interface を先に切る
 - 既存 `tickets/` は当面維持し、WorkItem から link するか、file backend の一 view として扱えるようにする
@@ -56,6 +57,33 @@ repo/
 - temporary inbox
 - local-only trial log
 - model / role runtime state
+
+## WorkItem ID
+
+WorkItem ID は identity のためだけに使い、priority や処理順序を背負わせない。`SEQUENCE` のような中央連番ファイルは、複数 branch / worktree / Pod が同時に WorkItem を作ると conflict しやすいため採用しない。
+
+初期 file backend では、directory name を immutable ID として扱う。
+
+```text
+YYYYMMDD-HHMMSS-<slug>
+YYYYMMDD-HHMMSS-<short-rand>-<slug>  # 同一秒衝突を避けたい場合
+```
+
+例:
+
+```text
+20260510-184233-maintainer-work-items
+20260510-184233-a1b2-maintainer-work-items
+```
+
+要件:
+
+- lexical sort で概ね作成順になる
+- 中央採番ファイルを更新しない
+- collision 時は backend が短い random suffix や retry で解決する
+- human-visible `slug` / `title` と immutable `id` を分ける
+- priority / status / scheduling は `id` ではなく metadata で表す
+- 将来 remote backend に移る場合も ID 生成責務は backend 側に閉じ込める
 
 ## WorkItem model
 
@@ -138,17 +166,27 @@ LeaseStore
 
 ```text
 work-items/
-  WI-0001-workflow-crate-extraction/
-    item.toml
-    description.md
-    acceptance.md
-    thread.jsonl
-    artifacts/
-      review.md
-      test-log.txt
+  open/
+    20260510-184233-maintainer-work-items/
+      item.md
+      thread.jsonl
+      artifacts/
+        review.md
+        test-log.txt
+  pending/
+    20260510-190102-transport-parameter-api/
+      item.md
+      thread.jsonl
+      artifacts/
+  closed/
+    20260510-201522-anthropic-burst-bundling/
+      item.md
+      thread.jsonl
+      resolution.md
+      artifacts/
 ```
 
-`thread.jsonl` は append-only を基本にし、AI maintainer が conversation / decision / review / status change を追いやすい形にする。
+`item.md` は human-readable な issue 本文（背景、根拠、完了条件、非目標など）を持つ。`thread.jsonl` は append-only を基本にし、AI maintainer が conversation / decision / review / status change を追いやすい形にする。`resolution.md` は close 時の解決方法や検証結果を、人間が読みやすい形でまとめる任意ファイルとする。
 
 ## `/auto-maintain` との関係
 
@@ -176,6 +214,7 @@ work-items/
 - WorkItem / Thread / Event / Lease / Artifact の domain model が docs に定義されている
 - repo-managed coordination data と `.insomnia` local runtime state の分担が明文化されている
 - `WorkItemStore` / `LeaseStore` 相当の interface 方針が決まっている
+- WorkItem ID scheme が中央連番ではなく timestamp-based になっている
 - 初期 file backend の directory schema が決まっている
 - `/auto-maintain` / AI maintainer が将来 WorkItemStore を入口にできる移行方針が書かれている
 - network 越し workspace / remote hub は後回しにしつつ、backend 差し替え可能性を潰していない
