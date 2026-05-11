@@ -242,10 +242,13 @@ impl AnthropicScheme {
     /// - Tool calls are content parts within assistant messages
     /// - Tool results are content parts within user messages
     ///
-    /// Each non-`Message` item produces exactly one content part, so
-    /// "last part for the item" is always well-defined. For breakpoint
-    /// `Message` items the output is forced into the array form so a
-    /// marker has a part to attach to.
+    /// Assistant-side items are accumulated until a user/system message or
+    /// tool result boundary so one logical assistant burst becomes one
+    /// Anthropic assistant message content array. Pending parts carry their
+    /// origin item index; when flushed, the final part for each item records
+    /// the `(msg_idx, part_idx)` used by breakpoint attachment. User/system
+    /// `Message` items keep the single-text shorthand unless a breakpoint
+    /// needs a concrete part to live on.
     fn convert_items_to_messages(
         &self,
         items: &[Item],
@@ -261,19 +264,6 @@ impl AnthropicScheme {
         for (i, item) in items.iter().enumerate() {
             match item {
                 Item::Message { role, content, .. } => {
-                    flush_pending(
-                        &mut messages,
-                        &mut pending_assistant,
-                        "assistant",
-                        &mut locations,
-                    );
-                    flush_pending(&mut messages, &mut pending_user, "user", &mut locations);
-
-                    let anthropic_role = match role {
-                        Role::User | Role::System => "user",
-                        Role::Assistant => "assistant",
-                    };
-
                     let parts: Vec<AnthropicContentPart> = content
                         .iter()
                         .map(|p| match p {
@@ -284,27 +274,43 @@ impl AnthropicScheme {
                         })
                         .collect();
 
-                    let force_parts = breakpoints.contains(&i);
-                    let msg_idx = messages.len();
+                    match role {
+                        Role::Assistant => {
+                            flush_pending(&mut messages, &mut pending_user, "user", &mut locations);
+                            pending_assistant.extend(parts.into_iter().map(|part| (i, part)));
+                        }
+                        Role::User | Role::System => {
+                            flush_pending(
+                                &mut messages,
+                                &mut pending_assistant,
+                                "assistant",
+                                &mut locations,
+                            );
+                            flush_pending(&mut messages, &mut pending_user, "user", &mut locations);
 
-                    // Preserve the single-text shorthand unless a
-                    // breakpoint needs a concrete part to live on.
-                    if parts.len() == 1 && !force_parts {
-                        if let AnthropicContentPart::Text { text, .. } = &parts[0] {
+                            let force_parts = breakpoints.contains(&i);
+                            let msg_idx = messages.len();
+
+                            // Preserve the single-text shorthand unless a
+                            // breakpoint needs a concrete part to live on.
+                            if parts.len() == 1 && !force_parts {
+                                if let AnthropicContentPart::Text { text, .. } = &parts[0] {
+                                    messages.push(AnthropicMessage {
+                                        role: "user".to_string(),
+                                        content: AnthropicContent::Text(text.clone()),
+                                    });
+                                    continue;
+                                }
+                            }
+
+                            let last_part_idx = parts.len().saturating_sub(1);
                             messages.push(AnthropicMessage {
-                                role: anthropic_role.to_string(),
-                                content: AnthropicContent::Text(text.clone()),
+                                role: "user".to_string(),
+                                content: AnthropicContent::Parts(parts),
                             });
-                            continue;
+                            locations[i] = Some((msg_idx, last_part_idx));
                         }
                     }
-
-                    let last_part_idx = parts.len().saturating_sub(1);
-                    messages.push(AnthropicMessage {
-                        role: anthropic_role.to_string(),
-                        content: AnthropicContent::Parts(parts),
-                    });
-                    locations[i] = Some((msg_idx, last_part_idx));
                 }
 
                 Item::ToolCall {
@@ -624,6 +630,109 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn assistant_burst_bundles_reasoning_text_and_tool_call() {
+        let scheme = AnthropicScheme::new();
+        let request = Request::new()
+            .user("question?")
+            .item(Item::reasoning("thinking").with_signature("SIG-A"))
+            .item(Item::assistant_message("answer"))
+            .item(Item::tool_call("c1", "tool_a", r#"{"x":1}"#));
+
+        let req = scheme.build_request("claude-sonnet-4-20250514", &request, &cap_explicit());
+
+        assert_eq!(req.messages.len(), 2, "messages: {:?}", req.messages);
+        assert_eq!(req.messages[0].role, "user");
+        assert_eq!(req.messages[1].role, "assistant");
+        let AnthropicContent::Parts(parts) = &req.messages[1].content else {
+            panic!("assistant burst must be emitted as content parts");
+        };
+        assert_eq!(parts.len(), 3, "parts: {:?}", parts);
+        assert!(matches!(parts[0], AnthropicContentPart::Thinking { .. }));
+        assert!(matches!(parts[1], AnthropicContentPart::Text { .. }));
+        assert!(matches!(parts[2], AnthropicContentPart::ToolUse { .. }));
+    }
+
+    #[test]
+    fn tool_result_and_user_messages_bound_assistant_bursts() {
+        let scheme = AnthropicScheme::new();
+        let request = Request::new()
+            .user("question?")
+            .item(Item::reasoning("thinking").with_signature("SIG-A"))
+            .item(Item::assistant_message("answer"))
+            .item(Item::tool_call("c1", "tool_a", "{}"))
+            .item(Item::tool_result("c1", "result"))
+            .item(Item::assistant_message("final"))
+            .user("follow up");
+
+        let req = scheme.build_request("claude-sonnet-4-20250514", &request, &cap_explicit());
+
+        let roles: Vec<&str> = req.messages.iter().map(|msg| msg.role.as_str()).collect();
+        assert_eq!(
+            roles,
+            vec!["user", "assistant", "user", "assistant", "user"]
+        );
+
+        let AnthropicContent::Parts(first_assistant) = &req.messages[1].content else {
+            panic!("first assistant burst must be content parts");
+        };
+        assert_eq!(first_assistant.len(), 3);
+        assert!(matches!(
+            first_assistant[0],
+            AnthropicContentPart::Thinking { .. }
+        ));
+        assert!(matches!(
+            first_assistant[1],
+            AnthropicContentPart::Text { .. }
+        ));
+        assert!(matches!(
+            first_assistant[2],
+            AnthropicContentPart::ToolUse { .. }
+        ));
+
+        let AnthropicContent::Parts(tool_result) = &req.messages[2].content else {
+            panic!("tool result must be content parts");
+        };
+        assert_eq!(tool_result.len(), 1);
+        assert!(matches!(
+            tool_result[0],
+            AnthropicContentPart::ToolResult { .. }
+        ));
+
+        let AnthropicContent::Parts(second_assistant) = &req.messages[3].content else {
+            panic!("second assistant burst must be content parts");
+        };
+        assert_eq!(second_assistant.len(), 1);
+        assert!(matches!(
+            second_assistant[0],
+            AnthropicContentPart::Text { .. }
+        ));
+    }
+
+    #[test]
+    fn assistant_message_breakpoint_maps_to_text_part_inside_burst() {
+        let scheme = AnthropicScheme::new();
+        let mut request = Request::new().items(vec![
+            Item::user_message("question?"),
+            Item::reasoning("thinking").with_signature("SIG-A"),
+            Item::assistant_message("answer"),
+            Item::tool_call("c1", "tool_a", "{}"),
+            Item::user_message("next"),
+        ]);
+        request.cache_anchor = Some(2);
+
+        let req = scheme.build_request("claude-sonnet-4-20250514", &request, &cap_explicit());
+        let AnthropicContent::Parts(parts) = &req.messages[1].content else {
+            panic!("assistant burst must be content parts");
+        };
+
+        assert!(matches!(parts[0], AnthropicContentPart::Thinking { .. }));
+        assert!(matches!(parts[1], AnthropicContentPart::Text { .. }));
+        assert!(matches!(parts[2], AnthropicContentPart::ToolUse { .. }));
+        assert_eq!(part_cache_control(&parts[1]), Some(CacheControl::Ephemeral));
+        assert_eq!(part_cache_control(&parts[2]), Some(CacheControl::Ephemeral));
     }
 
     /// Convenience: a turn that ends with one assistant text, one tool

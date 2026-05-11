@@ -13,7 +13,6 @@
 - Exchange / Turn / Call セマンティクス整理 → [tickets/exchange-turn-call-semantics.md](tickets/exchange-turn-call-semantics.md)
 - llm-worker のエラー耐性
   - ストリーム途中失敗時の継続 → [tickets/llm-worker-stream-continuation.md](tickets/llm-worker-stream-continuation.md)
-- llm-worker: Anthropic projection で assistant ターン内ブロックを 1 message に束ねる → [tickets/anthropic-assistant-burst-bundling.md](tickets/anthropic-assistant-burst-bundling.md)
 - ネイティブ GUI クライアント MVP → [tickets/native-gui-mvp.md](tickets/native-gui-mvp.md)
 - E2E テストハーネス（`tests/e2e/`、opt-in） → [tickets/e2e-harness.md](tickets/e2e-harness.md)
 - TUI 拡充
