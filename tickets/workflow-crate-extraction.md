@@ -66,3 +66,8 @@ memory crate のドメインは「decisions / requests / summary / knowledge / s
 - 直前: `tickets/workflow-directory-layout.md`（git log）
 - 後続: `tickets/internal-worker-workflow.md`
 - 関連: `docs/plan/workflow.md`
+
+## レビュー状態
+
+- `7db4146 refactor: extract workflow crate` を review 済み。結果は `tickets/workflow-crate-extraction.review.md`。
+- 判断: approve / merge 可。
