@@ -25,7 +25,6 @@
 - Manifest: Tool Output / File Upload 上限の分離とデフォルト緩和 → [tickets/manifest-output-upload-limits.md](tickets/manifest-output-upload-limits.md)
 - Prune: 保護境界を turn 数から末尾 token budget に置き換え → [tickets/prune-token-budget.md](tickets/prune-token-budget.md)
 - メモリ機構
-  - 明示使用回数ログ → [tickets/memory-usage-metrics.md](tickets/memory-usage-metrics.md)
   - extract / consolidation 監査ログ → [tickets/memory-audit-log.md](tickets/memory-audit-log.md)
 - セッション内 Task ツールの注意機構（無アクティビティで `<system-reminder>` ナッジ） → [tickets/session-todo-reminder.md](tickets/session-todo-reminder.md)
 - ワークスペースのメモリーをLintするヘッドレスCLI
