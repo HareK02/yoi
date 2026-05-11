@@ -132,6 +132,12 @@ estimated_total_resident_exposure_tokens
 - consolidation / Doctor 側から report API を呼べる
 - `n/Mtoken` や session 浮上率を Knowledge 化候補や tidy protection の主判断として使っていない
 
+## レビュー状態
+
+- `d581a35 feat: add memory usage event metrics` を review 済み。結果は `tickets/memory-usage-metrics.review.md`。
+- 指摘 1 件（tidy hints の古い未接続文言）は amend 済み。
+- 判断: approve / merge 可。
+
 ## 参照
 
 - `docs/plan/memory.md` §使用頻度メトリクス / §判断ルール / §retrieval 経路
