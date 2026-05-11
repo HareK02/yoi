@@ -27,6 +27,7 @@ fs4 = { workspace = true, features = ["sync"] }
 libc = { workspace = true }
 schemars = { workspace = true }
 memory = { workspace = true }
+workflow-crate = { package = "workflow", path = "../workflow" }
 uuid = { workspace = true, features = ["v7"] }
 session-metrics = { workspace = true }
 

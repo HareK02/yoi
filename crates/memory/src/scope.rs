@@ -13,17 +13,13 @@ use manifest::{Permission, ScopeRule};
 
 use crate::workspace::WorkspaceLayout;
 
-/// Build deny rules that strip Write permission from `<workspace>/memory/`,
-/// `<workspace>/knowledge/`, and `<workspace>/workflow/`. Recursive —
-/// every descendant is capped at Read for the generic tools.
-///
-/// Workflow files are human-edited on the host side; the generic CRUD
-/// tools must not touch them.
+/// Build deny rules that strip Write permission from `<workspace>/memory/`
+/// and `<workspace>/knowledge/`. Recursive — every descendant is capped at
+/// Read for the generic tools.
 pub fn deny_write_rules(layout: &WorkspaceLayout) -> Vec<ScopeRule> {
     vec![
         deny_write(layout.memory_dir().as_path()),
         deny_write(layout.knowledge_dir().as_path()),
-        deny_write(layout.workflow_dir().as_path()),
     ]
 }
 
@@ -41,14 +37,13 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn deny_targets_memory_knowledge_and_workflow() {
+    fn deny_targets_memory_and_knowledge() {
         let layout = WorkspaceLayout::new(PathBuf::from("/ws"));
         let rules = deny_write_rules(&layout);
-        assert_eq!(rules.len(), 3);
+        assert_eq!(rules.len(), 2);
         assert_eq!(rules[0].target, PathBuf::from("/ws/.insomnia/memory"));
         assert_eq!(rules[0].permission, Permission::Write);
         assert!(rules[0].recursive);
         assert_eq!(rules[1].target, PathBuf::from("/ws/.insomnia/knowledge"));
-        assert_eq!(rules[2].target, PathBuf::from("/ws/.insomnia/workflow"));
     }
 }

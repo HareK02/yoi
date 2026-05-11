@@ -18,10 +18,11 @@ use std::sync::Arc;
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use manifest::Scope;
-use memory::{ResidentKnowledgeEntry, ResidentWorkflowEntry};
+use memory::ResidentKnowledgeEntry;
 use minijinja::value::Value;
 use minijinja::{Environment, ErrorKind, UndefinedBehavior};
 use thiserror::Error;
+use workflow_crate::ResidentWorkflowEntry;
 
 use crate::prompt::catalog::{CatalogError, PromptCatalog};
 use crate::prompt::loader::{LoaderError, PromptLoader, PromptRef};

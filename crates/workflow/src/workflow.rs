@@ -12,10 +12,10 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 use tracing::warn;
 
-use crate::error::LintError;
 use crate::schema::{WorkflowFrontmatter, split_frontmatter};
-use crate::slug::Slug;
-use crate::workspace::WorkspaceLayout;
+use memory::WorkspaceLayout;
+
+use crate::{Slug, WorkflowLintError};
 
 /// Hard cap on Workflow descriptions that are advertised resident.
 /// Mirrors agent-skills and resident Knowledge descriptions.
@@ -167,9 +167,15 @@ pub enum WorkflowLoadError {
     #[error("failed to read workflow file {}: {source}", .path.display())]
     ReadFile { path: PathBuf, source: io::Error },
     #[error("invalid workflow file name {}: {source}", .path.display())]
-    InvalidSlug { path: PathBuf, source: LintError },
+    InvalidSlug {
+        path: PathBuf,
+        source: WorkflowLintError,
+    },
     #[error("invalid workflow frontmatter in {}: {source}", .path.display())]
-    Frontmatter { path: PathBuf, source: LintError },
+    Frontmatter {
+        path: PathBuf,
+        source: WorkflowLintError,
+    },
     #[error(
         "Workflow {} with model_invokation: true cannot have description longer than {limit} chars (got {actual})",
         .path.display()
@@ -281,12 +287,12 @@ fn warn_unknown_workflow_fields(path: &Path, yaml: &str) {
     }
 }
 
-fn map_serde_workflow_error(err: serde_yaml::Error) -> LintError {
+fn map_serde_workflow_error(err: serde_yaml::Error) -> WorkflowLintError {
     let msg = err.to_string();
     if let Some(field) = parse_missing_field(&msg) {
-        return LintError::MissingField(field);
+        return WorkflowLintError::MissingField(field);
     }
-    LintError::MalformedFrontmatter(msg)
+    WorkflowLintError::MalformedFrontmatter(msg)
 }
 
 fn parse_missing_field(msg: &str) -> Option<&'static str> {
@@ -416,9 +422,18 @@ mod tests {
     #[test]
     fn merge_skill_shadows_existing_workflow() {
         let (dir, layout) = setup();
-        write_workflow(dir.path(), "shared", "description: Internal", "internal body");
+        write_workflow(
+            dir.path(),
+            "shared",
+            "description: Internal",
+            "internal body",
+        );
         let mut reg = load_workflows(&layout).unwrap();
-        let skill_path = dir.path().join("user-skills").join("shared").join("SKILL.md");
+        let skill_path = dir
+            .path()
+            .join("user-skills")
+            .join("shared")
+            .join("SKILL.md");
         std::fs::create_dir_all(skill_path.parent().unwrap()).unwrap();
         std::fs::write(&skill_path, "ignored").unwrap();
         let incoming = WorkflowRecord {
@@ -435,8 +450,14 @@ mod tests {
         };
         let shadow = reg.merge_skill(incoming).expect("expected shadow");
         assert_eq!(shadow.slug.as_str(), "shared");
-        assert!(matches!(shadow.kept_source, WorkflowSource::WorkspaceWorkflow));
-        assert!(matches!(shadow.shadowed_source, WorkflowSource::Skill { .. }));
+        assert!(matches!(
+            shadow.kept_source,
+            WorkflowSource::WorkspaceWorkflow
+        ));
+        assert!(matches!(
+            shadow.shadowed_source,
+            WorkflowSource::Skill { .. }
+        ));
         // The kept record is still the workspace workflow.
         let kept = reg.get(&Slug::parse("shared").unwrap()).unwrap();
         assert!(matches!(kept.source, WorkflowSource::WorkspaceWorkflow));

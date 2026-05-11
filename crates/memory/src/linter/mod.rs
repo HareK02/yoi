@@ -23,9 +23,8 @@ use serde::de::DeserializeOwned;
 use crate::error::{LintError, LintWarning};
 use crate::schema::{
     DecisionFrontmatter, KnowledgeFrontmatter, RequestFrontmatter, SummaryFrontmatter,
-    WorkflowFrontmatter, split_frontmatter,
+    split_frontmatter,
 };
-use crate::workflow::WORKFLOW_DESCRIPTION_HARD_CAP;
 use crate::workspace::{ClassifiedPath, RecordKind, WorkspaceLayout};
 
 pub use existing::{ExistingRecords, scan_existing};
@@ -99,12 +98,6 @@ impl Linter {
             }
         };
 
-        // 2. Workflow paths are sub-Worker-forbidden at the tool layer.
-        if classified.kind == RecordKind::Workflow {
-            report.push_error(LintError::WorkflowWriteForbidden);
-            return report;
-        }
-
         // 3. Frontmatter parse + kind-specific structural checks +
         //    size limits. Reference-integrity needs the existing
         //    record set, fetched once below.
@@ -146,7 +139,9 @@ impl Linter {
             RecordKind::Summary => {
                 self.check_kind::<SummaryFrontmatter>(content, &classified, &mut report);
             }
-            RecordKind::Workflow => unreachable!("guarded above"),
+            RecordKind::Workflow => {
+                unreachable!("workflow paths are not classified by memory linter")
+            }
         }
 
         report
@@ -240,59 +235,6 @@ impl Linter {
     }
 }
 
-impl Linter {
-    /// Workflow record validator exposed for human-edit paths
-    /// (CLI / pre-commit). Not used by the memory tool, which rejects
-    /// workflow writes outright.
-    ///
-    /// Verifies frontmatter shape, body size, and that every slug in
-    /// `requires` points at an existing Knowledge record under the
-    /// workspace's `knowledge/` directory.
-    pub fn lint_workflow(&self, content: &str) -> LintReport {
-        let mut report = LintReport::default();
-        let parsed = match parse_frontmatter::<WorkflowFrontmatter>(content) {
-            Ok(p) => p,
-            Err(e) => {
-                report.push_error(e);
-                return report;
-            }
-        };
-        size::check_body::<WorkflowFrontmatter>(parsed.body, &mut report);
-
-        // Mirror the loader's cap so human-edit paths fail fast instead
-        // of surfacing the same error only at Pod startup.
-        if parsed.frontmatter.model_invokation {
-            let actual = parsed.frontmatter.description.chars().count();
-            if actual > WORKFLOW_DESCRIPTION_HARD_CAP {
-                report.push_error(LintError::DescriptionTooLong {
-                    actual,
-                    limit: WORKFLOW_DESCRIPTION_HARD_CAP,
-                });
-            }
-        }
-
-        let existing = match existing::scan_existing(&self.layout) {
-            Ok(e) => e,
-            Err(e) => {
-                report.push_error(LintError::MalformedFrontmatter(format!(
-                    "failed to scan existing records: {e}"
-                )));
-                return report;
-            }
-        };
-        for slug in &parsed.frontmatter.requires {
-            if !existing.contains(crate::workspace::RecordKind::Knowledge, slug) {
-                report.push_error(LintError::UnknownReference {
-                    field: "requires",
-                    kind: "knowledge",
-                    slug: slug.to_string(),
-                });
-            }
-        }
-        report
-    }
-}
-
 struct Parsed<'a, F> {
     frontmatter: F,
     body: &'a str,
@@ -330,22 +272,6 @@ mod tests {
         let layout = WorkspaceLayout::new(dir.path().to_path_buf());
         let linter = Linter::new(layout);
         (dir, linter)
-    }
-
-    #[test]
-    fn workflow_write_rejected() {
-        let (dir, linter) = workspace();
-        let path = dir.path().join(".insomnia/workflow/wf.md");
-        let content =
-            "---\ndescription: x\nmodel_invokation: false\nuser_invocable: true\n---\nbody"
-                .to_string();
-        let report = linter.lint(&path, &content, WriteMode::Create);
-        assert!(
-            report
-                .errors
-                .iter()
-                .any(|e| matches!(e, LintError::WorkflowWriteForbidden))
-        );
     }
 
     #[test]
@@ -497,83 +423,6 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, LintError::SlugAlreadyExists(_)))
         );
-    }
-
-    #[test]
-    fn workflow_lint_accepts_valid_record() {
-        let (dir, linter) = workspace();
-        // Place a Knowledge record that the workflow will reference.
-        let kn = dir.path().join(".insomnia/knowledge/foo.md");
-        write(
-            &kn,
-            &format!(
-                "---\ncreated_at: {n}\nupdated_at: {n}\nkind: rule\ndescription: x\nmodel_invokation: false\nuser_invocable: true\nlast_sources: []\n---\n",
-                n = iso_now()
-            ),
-        );
-        let wf = "---\ndescription: do thing\nmodel_invokation: false\nuser_invocable: true\nrequires: [foo]\n---\nstep 1\n".to_string();
-        let report = linter.lint_workflow(&wf);
-        assert!(!report.has_errors(), "got errors: {:?}", report.errors);
-    }
-
-    #[test]
-    fn workflow_lint_flags_unknown_requires() {
-        let (_dir, linter) = workspace();
-        let wf = "---\ndescription: x\nmodel_invokation: false\nuser_invocable: true\nrequires: [missing-knowledge]\n---\n".to_string();
-        let report = linter.lint_workflow(&wf);
-        assert!(report.errors.iter().any(|e| matches!(
-            e,
-            LintError::UnknownReference {
-                field: "requires",
-                kind: "knowledge",
-                ..
-            }
-        )));
-    }
-
-    #[test]
-    fn workflow_lint_flags_long_description_when_model_invokation() {
-        let (_dir, linter) = workspace();
-        let desc = "x".repeat(crate::workflow::WORKFLOW_DESCRIPTION_HARD_CAP + 1);
-        let wf = format!(
-            "---\ndescription: {desc}\nmodel_invokation: true\nuser_invocable: true\n---\n"
-        );
-        let report = linter.lint_workflow(&wf);
-        assert!(
-            report
-                .errors
-                .iter()
-                .any(|e| matches!(e, LintError::DescriptionTooLong { .. })),
-        );
-    }
-
-    #[test]
-    fn workflow_lint_allows_long_description_when_not_model_invokation() {
-        let (_dir, linter) = workspace();
-        let desc = "x".repeat(crate::workflow::WORKFLOW_DESCRIPTION_HARD_CAP + 1);
-        let wf = format!(
-            "---\ndescription: {desc}\nmodel_invokation: false\nuser_invocable: true\n---\n"
-        );
-        let report = linter.lint_workflow(&wf);
-        assert!(
-            !report
-                .errors
-                .iter()
-                .any(|e| matches!(e, LintError::DescriptionTooLong { .. })),
-        );
-    }
-
-    #[test]
-    fn workflow_lint_collects_multiple_unknown_requires() {
-        let (_dir, linter) = workspace();
-        let wf = "---\ndescription: x\nmodel_invokation: false\nuser_invocable: true\nrequires: [a, b, c]\n---\n".to_string();
-        let report = linter.lint_workflow(&wf);
-        let unknown_count = report
-            .errors
-            .iter()
-            .filter(|e| matches!(e, LintError::UnknownReference { .. }))
-            .count();
-        assert_eq!(unknown_count, 3);
     }
 
     #[test]

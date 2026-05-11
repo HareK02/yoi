@@ -1,0 +1,18 @@
+[package]
+name = "workflow"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+manifest = { workspace = true }
+memory = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_yaml = "0.9.34"
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+serde_json = { workspace = true }

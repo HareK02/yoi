@@ -19,10 +19,9 @@ use serde::Deserialize;
 use thiserror::Error;
 use tracing::warn;
 
-use crate::error::LintError;
 use crate::schema::split_frontmatter;
-use crate::slug::Slug;
 use crate::workflow::{WORKFLOW_DESCRIPTION_HARD_CAP, WorkflowRecord, WorkflowSource};
+use crate::{Slug, WorkflowLintError};
 
 /// Filename within a skill directory carrying the frontmatter + body.
 pub const SKILL_FILENAME: &str = "SKILL.md";
@@ -34,6 +33,7 @@ pub const SKILL_FILENAME: &str = "SKILL.md";
 /// `metadata` are documentary, while `allowed-tools` is recognised and
 /// emits a warning until [`permission-extension-point.md`] lands.
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct SkillFrontmatter {
     pub name: String,
     pub description: String,
@@ -49,7 +49,7 @@ pub struct SkillFrontmatter {
 
 /// Validated skill record. Constructed by [`parse_skill_md`] and converted
 /// to a `WorkflowRecord` by the caller via the `Skill → Workflow`
-/// projection in [`crate::workflow`].
+/// projection in [`crate::WorkflowRecord`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkillRecord {
     pub slug: Slug,
@@ -94,7 +94,7 @@ pub enum SkillParseError {
     Frontmatter {
         path: PathBuf,
         #[source]
-        source: LintError,
+        source: WorkflowLintError,
     },
     #[error(
         "SKILL.md `name` `{name}` does not match its directory name `{dir_name}` (at {})",
@@ -109,7 +109,7 @@ pub enum SkillParseError {
     InvalidName {
         skill_md_path: PathBuf,
         #[source]
-        source: LintError,
+        source: WorkflowLintError,
     },
     #[error("SKILL.md `description` must be non-empty (at {})", .skill_md_path.display())]
     DescriptionEmpty { skill_md_path: PathBuf },
@@ -150,7 +150,7 @@ pub fn parse_skill_md(skill_md_path: &Path) -> Result<SkillRecord, SkillParseErr
     let frontmatter: SkillFrontmatter =
         serde_yaml::from_str(yaml).map_err(|err| SkillParseError::Frontmatter {
             path: skill_md_path.to_path_buf(),
-            source: LintError::MalformedFrontmatter(err.to_string()),
+            source: WorkflowLintError::MalformedFrontmatter(err.to_string()),
         })?;
 
     if frontmatter.allowed_tools.is_some() {
@@ -344,7 +344,10 @@ mod tests {
             "body",
         );
         let record = parse_skill_md(&path).unwrap();
-        assert_eq!(record.description.chars().count(), WORKFLOW_DESCRIPTION_HARD_CAP);
+        assert_eq!(
+            record.description.chars().count(),
+            WORKFLOW_DESCRIPTION_HARD_CAP
+        );
     }
 
     #[test]

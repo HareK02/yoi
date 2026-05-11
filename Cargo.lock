@@ -2164,6 +2164,7 @@ dependencies = [
  "tools",
  "tracing",
  "uuid",
+ "workflow",
 ]
 
 [[package]]
@@ -4396,6 +4397,21 @@ dependencies = [
  "serde_json",
  "unicode-xid",
  "wasmparser",
+]
+
+[[package]]
+name = "workflow"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "manifest",
+ "memory",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]

@@ -9,12 +9,13 @@
 use std::fmt;
 
 use llm_worker::Item;
+use memory::WorkspaceLayout;
 use memory::schema::split_frontmatter;
-use memory::{Slug, WorkflowRegistry, WorkspaceLayout};
+use workflow_crate::{Slug, WorkflowRegistry};
 
 #[derive(Debug)]
 pub enum WorkflowResolveError {
-    InvalidSlug(memory::LintError),
+    InvalidSlug(workflow_crate::WorkflowLintError),
     NotFound {
         slug: String,
     },
@@ -90,7 +91,7 @@ pub fn resolve_workflow_invocation(
 
     let mut out = Vec::new();
     for req in &record.requires {
-        let path = layout.knowledge_path(req);
+        let path = layout.knowledge_dir().join(format!("{req}.md"));
         let raw = std::fs::read_to_string(&path).map_err(|source| {
             if source.kind() == std::io::ErrorKind::NotFound {
                 WorkflowResolveError::KnowledgeNotFound {
@@ -150,7 +151,7 @@ mod tests {
             &dir.path().join(".insomnia/workflow/run-it.md"),
             "---\ndescription: run\nrequires: [policy]\n---\nworkflow body\n",
         );
-        let registry = memory::load_workflows(&layout).unwrap();
+        let registry = workflow_crate::load_workflows(&layout).unwrap();
         (dir, layout, registry)
     }
 
@@ -174,7 +175,7 @@ mod tests {
             &dir.path().join(".insomnia/workflow/hidden.md"),
             "---\ndescription: hidden\nuser_invocable: false\n---\nbody\n",
         );
-        let registry = memory::load_workflows(&layout).unwrap();
+        let registry = workflow_crate::load_workflows(&layout).unwrap();
         let err = resolve_workflow_invocation(&registry, &layout, "hidden").unwrap_err();
         assert!(matches!(err, WorkflowResolveError::NotUserInvocable { .. }));
     }
@@ -187,7 +188,7 @@ mod tests {
             &dir.path().join(".insomnia/workflow/bad.md"),
             "---\ndescription: bad\nrequires: [ghost]\n---\nbody\n",
         );
-        let registry = memory::load_workflows(&layout).unwrap();
+        let registry = workflow_crate::load_workflows(&layout).unwrap();
         let err = resolve_workflow_invocation(&registry, &layout, "bad").unwrap_err();
         assert!(matches!(
             err,
