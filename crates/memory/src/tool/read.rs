@@ -12,6 +12,7 @@ use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use serde::Deserialize;
 
 use crate::tool::MemoryToolKind;
+use crate::usage::{self, UsageSource};
 use crate::workspace::WorkspaceLayout;
 
 const DESCRIPTION: &str = "Read a memory or knowledge record by `kind` + `slug`. \
@@ -38,6 +39,7 @@ struct ReadParams {
 
 struct ReadTool {
     layout: WorkspaceLayout,
+    usage_session_id: Option<String>,
 }
 
 #[async_trait]
@@ -58,6 +60,22 @@ impl Tool for ReadTool {
         })?;
 
         let text = String::from_utf8_lossy(&bytes).into_owned();
+        if let Some(session_id) = self.usage_session_id.as_deref() {
+            let usage_slug = params.slug.as_deref().unwrap_or("summary");
+            let snapshot = usage::snapshot_record_from_bytes(
+                params.kind.record_kind(),
+                usage_slug.to_string(),
+                &bytes,
+            );
+            if let Err(err) = usage::append_use_event(
+                &self.layout,
+                session_id.to_string(),
+                UsageSource::MemoryRead,
+                vec![snapshot],
+            ) {
+                tracing::warn!(error = %err, "failed to append MemoryRead usage event");
+            }
+        }
         let offset = params.offset.unwrap_or(0);
         let limit = params.limit.unwrap_or(DEFAULT_LIMIT).max(1);
         let rendered = render_numbered(&text, offset, limit);
@@ -117,6 +135,17 @@ fn render_numbered(text: &str, offset: usize, limit: usize) -> Rendered {
 }
 
 pub fn read_tool(layout: WorkspaceLayout) -> ToolDefinition {
+    read_tool_inner(layout, None)
+}
+
+pub fn read_tool_with_usage(
+    layout: WorkspaceLayout,
+    session_id: impl Into<String>,
+) -> ToolDefinition {
+    read_tool_inner(layout, Some(session_id.into()))
+}
+
+fn read_tool_inner(layout: WorkspaceLayout, usage_session_id: Option<String>) -> ToolDefinition {
     Arc::new(move || {
         let schema = schemars::schema_for!(ReadParams);
         let schema_value = serde_json::to_value(schema).unwrap_or(serde_json::json!({}));
@@ -125,6 +154,7 @@ pub fn read_tool(layout: WorkspaceLayout) -> ToolDefinition {
             .input_schema(schema_value);
         let tool: Arc<dyn Tool> = Arc::new(ReadTool {
             layout: layout.clone(),
+            usage_session_id: usage_session_id.clone(),
         });
         (meta, tool)
     })
@@ -207,6 +237,27 @@ mod tests {
         let inp = serde_json::json!({ "kind": "knowledge", "slug": "policy" });
         let out = tool.execute(&inp.to_string()).await.unwrap();
         assert!(out.content.unwrap().contains("k"));
+    }
+
+    #[tokio::test]
+    async fn read_logs_explicit_use_when_usage_session_is_set() {
+        let (dir, layout) = setup();
+        let path = dir.path().join(".insomnia/memory/decisions/foo.md");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "alpha\n").unwrap();
+
+        let (_, tool) = read_tool_with_usage(layout.clone(), "session-1")();
+        let inp = serde_json::json!({ "kind": "decision", "slug": "foo" });
+        tool.execute(&inp.to_string()).await.unwrap();
+
+        let report = usage::build_usage_report(&layout).unwrap();
+        assert_eq!(report.records.len(), 1);
+        let record = &report.records[0];
+        assert_eq!(record.kind, "decision");
+        assert_eq!(record.slug, "foo");
+        assert_eq!(record.use_count, 1);
+        assert_eq!(record.source_breakdown["MemoryRead"], 1);
+        assert_eq!(record.resident_exposure_count, 0);
     }
 
     #[tokio::test]

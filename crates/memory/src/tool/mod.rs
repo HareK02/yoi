@@ -20,7 +20,7 @@ use crate::workspace::{RecordKind, WorkspaceLayout};
 
 pub use edit::edit_tool;
 pub use query::{QueryConfig, knowledge_query_tool, memory_query_tool};
-pub use read::read_tool;
+pub use read::{read_tool, read_tool_with_usage};
 pub use write::write_tool;
 
 /// Kinds the memory tools accept as input. `Workflow` is intentionally

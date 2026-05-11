@@ -12,9 +12,8 @@
 //!   consumed ID 分の staging のみ削除し、占有ファイルを解放
 //!
 //! system prompt は Pod の `PromptCatalog`
-//! (`PodPrompt::MemoryConsolidationSystem`) で管理される。Knowledge 化候補
-//! レポートと使用頻度メトリクスは別チケットで供給される想定。本モジュール
-//! 時点では空入力として扱い、prompt 側の説明だけ残しておく
+//! (`PodPrompt::MemoryConsolidationSystem`) で管理される。Usage report は
+//! 判断材料として渡すだけで、ここでは Knowledge 化や protection の hard decision はしない
 //! （`docs/plan/memory.md` §Consolidation / 整理材料）。
 
 mod input;
@@ -23,8 +22,8 @@ mod staging;
 mod tidy;
 
 pub use input::{
-    KnowledgeCandidateReport, build_consolidate_input, render_existing_memory_records,
-    render_staging_records, render_tidy_hints,
+    build_consolidate_input, render_existing_memory_records, render_staging_records,
+    render_tidy_hints,
 };
 pub use lock::{LockError, LockRecord, StagingLock};
 pub use staging::{StagingEntry, list_staging_entries};

@@ -16,6 +16,7 @@ pub mod scope;
 pub mod skill;
 pub mod slug;
 pub mod tool;
+pub mod usage;
 pub mod workflow;
 pub mod workspace;
 
@@ -24,8 +25,15 @@ pub use extract::ExtractPointerPayload;
 pub use linter::{LintReport, Linter};
 pub use resident::{ResidentKnowledgeEntry, collect_resident_knowledge};
 pub use scope::deny_write_rules;
-pub use skill::{SKILL_FILENAME, SkillParseError, SkillRecord, load_skills_from_dir, parse_skill_md};
+pub use skill::{
+    SKILL_FILENAME, SkillParseError, SkillRecord, load_skills_from_dir, parse_skill_md,
+};
 pub use slug::Slug;
+pub use usage::{
+    UsageEvent, UsageEventKind, UsageRecordSnapshot, UsageReport, UsageReportRecord, UsageSource,
+    append_resident_exposure_event, append_usage_event, append_use_event, build_usage_report,
+    snapshot_record_from_bytes, snapshot_record_from_layout,
+};
 pub use workflow::{
     ResidentWorkflowEntry, ShadowedSkill, WORKFLOW_DESCRIPTION_HARD_CAP, WorkflowLoadError,
     WorkflowRecord, WorkflowRegistry, WorkflowSource, load_workflows,

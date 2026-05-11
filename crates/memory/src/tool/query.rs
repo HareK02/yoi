@@ -569,6 +569,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn query_hits_do_not_log_usage() {
+        let (dir, layout) = setup();
+        write_decision(dir.path(), "alpha", "needle line\n");
+        write_knowledge(
+            dir.path(),
+            "policy",
+            "policy",
+            "needle desc",
+            "needle body\n",
+        );
+
+        let (_, memory_tool) = memory_query_tool(layout.clone(), QueryConfig::default())();
+        let (_, knowledge_tool) = knowledge_query_tool(layout.clone(), QueryConfig::default())();
+        let inp = serde_json::json!({ "query": "needle" });
+        memory_tool.execute(&inp.to_string()).await.unwrap();
+        knowledge_tool.execute(&inp.to_string()).await.unwrap();
+
+        let report = crate::usage::build_usage_report(&layout).unwrap();
+        assert!(report.records.is_empty());
+        assert!(!layout.usage_events_path().exists());
+    }
+
+    #[tokio::test]
     async fn memory_query_respects_result_limit() {
         let (dir, layout) = setup();
         for i in 0..10 {

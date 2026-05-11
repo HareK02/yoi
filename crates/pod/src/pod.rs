@@ -828,17 +828,19 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             return Ok(());
         };
         let alerter = self.alerter.clone();
-        let worker = self.worker.as_mut().expect("worker present");
-        // Materialise any pending tool factories so the template sees the
-        // full list of tool names. Redundant with the flush inside
-        // `Worker::lock()`; safe because `flush_pending` is idempotent.
-        worker.tool_server_handle().flush_pending();
-        let tool_names: Vec<String> = worker
-            .tool_server_handle()
-            .tool_definitions_sorted()
-            .into_iter()
-            .map(|d| d.name)
-            .collect();
+        let tool_names: Vec<String> = {
+            let worker = self.worker.as_mut().expect("worker present");
+            // Materialise any pending tool factories so the template sees the
+            // full list of tool names. Redundant with the flush inside
+            // `Worker::lock()`; safe because `flush_pending` is idempotent.
+            worker.tool_server_handle().flush_pending();
+            worker
+                .tool_server_handle()
+                .tool_definitions_sorted()
+                .into_iter()
+                .map(|d| d.name)
+                .collect()
+        };
         let agents_md_read = read_agents_md(&self.pwd);
         for warning in agents_md_read.warnings {
             if let Some(n) = alerter.as_ref() {
@@ -875,6 +877,8 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             } else {
                 None
             };
+        let resident_exposure_snapshots =
+            self.resident_exposure_snapshots(&resident, &resident_workflows);
         let scope_snapshot = self.scope.snapshot();
         let ctx = SystemPromptContext {
             now: chrono::Utc::now(),
@@ -889,7 +893,11 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         let rendered = template
             .render(&ctx)
             .map_err(|source| PodError::SystemPromptRender { source })?;
-        worker.set_system_prompt(rendered);
+        self.worker
+            .as_mut()
+            .expect("worker present")
+            .set_system_prompt(rendered);
+        self.append_resident_exposure_event(resident_exposure_snapshots);
         Ok(())
     }
 
@@ -979,11 +987,13 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         }
         self.user_segments.push(input.clone());
 
-        // Resolve `@<path>` refs and `/<slug>` workflow invocations to
-        // system messages stashed for the PodInterceptor to attach right
-        // after the user message. File failures are non-fatal alerts; explicit
-        // workflow invocation failures abort before the Worker sees the turn.
+        // Resolve `@<path>` refs, `#<slug>` Knowledge refs, and `/<slug>`
+        // workflow invocations to system messages stashed for the
+        // PodInterceptor to attach right after the user message. File and
+        // Knowledge failures are non-fatal alerts; explicit workflow invocation
+        // failures abort before the Worker sees the turn.
         let mut attachments = self.resolve_file_refs(&input);
+        attachments.extend(self.resolve_knowledge_refs(&input));
         attachments.extend(self.resolve_workflow_invocations(&input)?);
         if !attachments.is_empty() {
             *self
@@ -1034,6 +1044,127 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         out
     }
 
+    fn resolve_knowledge_refs(&self, segments: &[Segment]) -> Vec<Item> {
+        let Some(layout) = self.memory_layout.as_ref() else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for seg in segments {
+            let Segment::KnowledgeRef { slug } = seg else {
+                continue;
+            };
+            let parsed = match memory::Slug::parse(slug.clone()) {
+                Ok(slug) => slug,
+                Err(e) => {
+                    self.alert(
+                        AlertLevel::Warn,
+                        AlertSource::Pod,
+                        format!("knowledge ref #{slug} has invalid slug: {e}"),
+                    );
+                    continue;
+                }
+            };
+            let path = layout.knowledge_path(&parsed);
+            let bytes = match std::fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    self.alert(
+                        AlertLevel::Warn,
+                        AlertSource::Pod,
+                        format!("knowledge ref #{slug} could not be read: {e}"),
+                    );
+                    continue;
+                }
+            };
+            let raw = String::from_utf8_lossy(&bytes).into_owned();
+            let body = match memory::schema::split_frontmatter(&raw) {
+                Ok((_yaml, body)) => body,
+                Err(e) => {
+                    self.alert(
+                        AlertLevel::Warn,
+                        AlertSource::Pod,
+                        format!("knowledge ref #{slug} has invalid frontmatter: {e}"),
+                    );
+                    continue;
+                }
+            };
+            let snapshot = memory::snapshot_record_from_bytes(
+                memory::workspace::RecordKind::Knowledge,
+                slug.clone(),
+                &bytes,
+            );
+            self.append_memory_use_event(memory::UsageSource::KnowledgeRef, vec![snapshot]);
+            out.push(Item::system_message(format!(
+                "[Knowledge #{}]\n{}",
+                slug,
+                body.trim_end()
+            )));
+        }
+        out
+    }
+
+    fn resident_exposure_snapshots(
+        &self,
+        knowledge: &[memory::ResidentKnowledgeEntry],
+        workflows: &[memory::ResidentWorkflowEntry],
+    ) -> Vec<memory::UsageRecordSnapshot> {
+        let Some(layout) = self.memory_layout.as_ref() else {
+            return Vec::new();
+        };
+        let mut snapshots = Vec::new();
+        for entry in knowledge {
+            match memory::snapshot_record_from_layout(
+                layout,
+                memory::workspace::RecordKind::Knowledge,
+                &entry.slug,
+            ) {
+                Ok(snapshot) => snapshots.push(snapshot),
+                Err(err) => {
+                    warn!(knowledge = %entry.slug, error = %err, "failed to snapshot resident knowledge exposure")
+                }
+            }
+        }
+        for entry in workflows {
+            match memory::snapshot_record_from_layout(
+                layout,
+                memory::workspace::RecordKind::Workflow,
+                &entry.slug,
+            ) {
+                Ok(snapshot) => snapshots.push(snapshot),
+                Err(err) => {
+                    warn!(workflow = %entry.slug, error = %err, "failed to snapshot resident workflow exposure")
+                }
+            }
+        }
+        snapshots
+    }
+
+    fn append_memory_use_event(
+        &self,
+        source: memory::UsageSource,
+        records: Vec<memory::UsageRecordSnapshot>,
+    ) {
+        let Some(layout) = self.memory_layout.as_ref() else {
+            return;
+        };
+        if let Err(err) =
+            memory::append_use_event(layout, self.session_id.to_string(), source, records)
+        {
+            warn!(error = %err, "failed to append memory usage event");
+        }
+    }
+
+    fn append_resident_exposure_event(&self, records: Vec<memory::UsageRecordSnapshot>) {
+        let Some(layout) = self.memory_layout.as_ref() else {
+            return;
+        };
+        if let Err(err) =
+            memory::append_resident_exposure_event(layout, self.session_id.to_string(), records)
+        {
+            warn!(error = %err, "failed to append resident exposure event");
+        }
+    }
+
     fn resolve_workflow_invocations(
         &self,
         segments: &[Segment],
@@ -1057,6 +1188,21 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 layout,
                 slug,
             )?;
+            match memory::snapshot_record_from_layout(
+                layout,
+                memory::workspace::RecordKind::Workflow,
+                slug,
+            ) {
+                Ok(snapshot) => {
+                    self.append_memory_use_event(
+                        memory::UsageSource::WorkflowInvoke,
+                        vec![snapshot],
+                    );
+                }
+                Err(err) => {
+                    warn!(workflow = %slug, error = %err, "failed to snapshot workflow usage");
+                }
+            }
             out.extend(items);
         }
         Ok(out)
@@ -1103,14 +1249,16 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             match seg {
                 Segment::Text { .. } | Segment::Paste { .. } | Segment::FileRef { .. } => {}
                 Segment::KnowledgeRef { slug } => {
-                    self.alert(
-                        AlertLevel::Warn,
-                        AlertSource::Pod,
-                        format!(
-                            "knowledge ref #{slug} cannot be resolved \
-                             (resolver not yet implemented); passed to LLM as placeholder"
-                        ),
-                    );
+                    if self.memory_layout.is_none() {
+                        self.alert(
+                            AlertLevel::Warn,
+                            AlertSource::Pod,
+                            format!(
+                                "knowledge ref #{slug} cannot be resolved \
+                                 because memory is disabled; passed to LLM as placeholder"
+                            ),
+                        );
+                    }
                 }
                 Segment::WorkflowInvoke { .. } => {}
                 Segment::Unknown => {
@@ -2139,7 +2287,10 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         // のKnowledgeアクセス (agent pulls knowledge through the search
         // tool instead of via system-prompt residency).
         let query_cfg = memory::tool::QueryConfig::from(memory_cfg);
-        worker.register_tool(memory::tool::read_tool(layout.clone()));
+        worker.register_tool(memory::tool::read_tool_with_usage(
+            layout.clone(),
+            self.session_id.to_string(),
+        ));
         worker.register_tool(memory::tool::write_tool(layout.clone()));
         worker.register_tool(memory::tool::edit_tool(layout.clone()));
         worker.register_tool(memory::tool::memory_query_tool(layout.clone(), query_cfg));
@@ -2149,9 +2300,15 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         ));
 
         let tidy = consolidate::collect_tidy_hints(&layout);
-        let candidates = consolidate::KnowledgeCandidateReport::empty();
+        let usage_report = match memory::build_usage_report(&layout) {
+            Ok(report) => report,
+            Err(err) => {
+                warn!(error = %err, "failed to build memory usage report for consolidation");
+                memory::UsageReport::empty()
+            }
+        };
         let input_text =
-            consolidate::build_consolidate_input(&layout, &entries, &tidy, &candidates);
+            consolidate::build_consolidate_input(&layout, &entries, &tidy, &usage_report);
 
         let run_result = worker.run(input_text).await;
         match run_result {
