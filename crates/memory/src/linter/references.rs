@@ -1,8 +1,4 @@
 //! Reference-integrity checks: `replaced_by` existence + cycle detection.
-//!
-//! `requires` (Workflow) is checked symmetrically when/if the Workflow
-//! linter is invoked from a human-edit path; the memory tool itself
-//! never writes Workflow records.
 
 use std::collections::HashSet;
 

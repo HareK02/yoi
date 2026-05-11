@@ -153,8 +153,8 @@ impl WorkspaceLayout {
     }
 
     /// Classify a path under the memory tree. Returns `None` if the
-    /// path is not under `.insomnia/memory/`, `.insomnia/knowledge/`,
-    /// or `.insomnia/workflow/` of this workspace, or if it lives in
+    /// path is not under `.insomnia/memory/` or `.insomnia/knowledge/`
+    /// of this workspace, or if it lives in
     /// `_staging/` / `_usage/` (opaque subsystem-owned trees).
     ///
     /// On a conventional path that's *almost* a record but malformed
@@ -164,13 +164,9 @@ impl WorkspaceLayout {
     pub fn classify(&self, path: &Path) -> Result<Option<ClassifiedPath>, LintError> {
         let memory = self.memory_dir();
         let knowledge = self.knowledge_dir();
-        let workflow = self.workflow_dir();
 
         if let Ok(rel) = path.strip_prefix(&knowledge) {
             return Ok(Some(classify_kinded_md(rel, RecordKind::Knowledge, path)?));
-        }
-        if let Ok(rel) = path.strip_prefix(&workflow) {
-            return Ok(Some(classify_kinded_md(rel, RecordKind::Workflow, path)?));
         }
         let rel = match path.strip_prefix(&memory) {
             Ok(r) => r,
@@ -275,16 +271,6 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(cp.kind, RecordKind::Knowledge);
-    }
-
-    #[test]
-    fn classifies_workflow() {
-        let cp = layout()
-            .classify(&PathBuf::from("/ws/.insomnia/workflow/wf.md"))
-            .unwrap()
-            .unwrap();
-        assert_eq!(cp.kind, RecordKind::Workflow);
-        assert_eq!(cp.slug.unwrap().as_str(), "wf");
     }
 
     #[test]

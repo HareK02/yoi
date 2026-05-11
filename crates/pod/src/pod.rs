@@ -150,7 +150,7 @@ pub struct Pod<C: LlmClient, St: Store> {
     prompts: Arc<PromptCatalog>,
     /// Registry loaded from `<workspace>/.insomnia/workflow/*.md` when
     /// memory is enabled. Missing memory config keeps this empty.
-    workflow_registry: memory::WorkflowRegistry,
+    workflow_registry: workflow_crate::WorkflowRegistry,
     /// Memory workspace layout used by the workflow resolver to load required
     /// Knowledge records by exact slug.
     memory_layout: Option<memory::WorkspaceLayout>,
@@ -323,7 +323,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             scope_allocation: None,
             callback_socket: None,
             prompts,
-            workflow_registry: memory::WorkflowRegistry::empty(),
+            workflow_registry: workflow_crate::WorkflowRegistry::empty(),
             memory_layout: None,
             inject_resident_knowledge: true,
             pending_scope_snapshot: Arc::new(Mutex::new(None)),
@@ -865,13 +865,13 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             } else {
                 None
             };
-        let resident_workflows: Vec<memory::ResidentWorkflowEntry> =
+        let resident_workflows: Vec<workflow_crate::ResidentWorkflowEntry> =
             if self.inject_resident_knowledge && self.memory_layout.is_some() {
                 self.workflow_registry.resident_entries()
             } else {
                 Vec::new()
             };
-        let resident_workflow_slice: Option<&[memory::ResidentWorkflowEntry]> =
+        let resident_workflow_slice: Option<&[workflow_crate::ResidentWorkflowEntry]> =
             if self.inject_resident_knowledge && self.memory_layout.is_some() {
                 Some(&resident_workflows)
             } else {
@@ -1106,7 +1106,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     fn resident_exposure_snapshots(
         &self,
         knowledge: &[memory::ResidentKnowledgeEntry],
-        workflows: &[memory::ResidentWorkflowEntry],
+        workflows: &[workflow_crate::ResidentWorkflowEntry],
     ) -> Vec<memory::UsageRecordSnapshot> {
         let Some(layout) = self.memory_layout.as_ref() else {
             return Vec::new();
@@ -1220,8 +1220,8 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             let Segment::WorkflowInvoke { slug } = seg else {
                 continue;
             };
-            let parsed =
-                memory::Slug::parse(slug.clone()).map_err(WorkflowResolveError::InvalidSlug)?;
+            let parsed = workflow_crate::Slug::parse(slug.clone())
+                .map_err(WorkflowResolveError::InvalidSlug)?;
             let record = self
                 .workflow_registry
                 .get(&parsed)
@@ -2886,7 +2886,7 @@ pub enum PodError {
     ConsolidationLock(#[source] memory::consolidate::LockError),
 
     #[error("workflow load failed: {0}")]
-    WorkflowLoad(#[source] memory::WorkflowLoadError),
+    WorkflowLoad(#[source] workflow_crate::WorkflowLoadError),
 
     #[error("workflow invocation failed: {0}")]
     WorkflowResolve(#[from] WorkflowResolveError),
@@ -2909,14 +2909,14 @@ struct PodCommon {
     scope: Scope,
     client: Box<dyn LlmClient>,
     prompts: Arc<PromptCatalog>,
-    workflow_registry: memory::WorkflowRegistry,
+    workflow_registry: workflow_crate::WorkflowRegistry,
     memory_layout: Option<memory::WorkspaceLayout>,
     system_prompt_template: Option<SystemPromptTemplate>,
     /// SKILL.md shadow events surfaced during workflow-registry build.
     /// The Pod constructor drains these into the notify buffer right
     /// after the Pod is materialised so the first LLM request observes
     /// any skill ↔ workflow collisions.
-    skill_shadows: Vec<memory::ShadowedSkill>,
+    skill_shadows: Vec<workflow_crate::ShadowedSkill>,
 }
 
 /// Resolve pwd / scope / LLM client / prompt catalog from a validated
@@ -2968,8 +2968,8 @@ fn prepare_pod_common_from_scope(
         .as_ref()
         .map(|mem| memory::WorkspaceLayout::resolve(mem, &pwd));
     let mut workflow_registry = match memory_layout.as_ref() {
-        Some(layout) => memory::load_workflows(layout).map_err(PodError::WorkflowLoad)?,
-        None => memory::WorkflowRegistry::empty(),
+        Some(layout) => workflow_crate::load_workflows(layout).map_err(PodError::WorkflowLoad)?,
+        None => workflow_crate::WorkflowRegistry::empty(),
     };
     let skill_shadows = ingest_skills(&mut workflow_registry, manifest);
 
@@ -2998,21 +2998,21 @@ fn prepare_pod_common_from_scope(
 ///
 /// Skills come exclusively from the manifest's `[skills] directories`
 /// list (resolved against the manifest base directory). Internal
-/// Workflows already loaded via [`memory::load_workflows`] take priority
+/// Workflows already loaded via [`workflow_crate::load_workflows`] take priority
 /// over skills sharing the same slug; collisions are surfaced as
-/// [`memory::ShadowedSkill`] events that the caller pushes onto the
+/// [`workflow_crate::ShadowedSkill`] events that the caller pushes onto the
 /// Pod's notification buffer.
 fn ingest_skills(
-    registry: &mut memory::WorkflowRegistry,
+    registry: &mut workflow_crate::WorkflowRegistry,
     manifest: &PodManifest,
-) -> Vec<memory::ShadowedSkill> {
+) -> Vec<workflow_crate::ShadowedSkill> {
     let mut shadows = Vec::new();
     let Some(skills_cfg) = manifest.skills.as_ref() else {
         return shadows;
     };
     for dir in &skills_cfg.directories {
-        for skill in memory::load_skills_from_dir(dir) {
-            let source = memory::WorkflowSource::Skill { dir: dir.clone() };
+        for skill in workflow_crate::load_skills_from_dir(dir) {
+            let source = workflow_crate::WorkflowSource::Skill { dir: dir.clone() };
             let record = skill.into_workflow_record(source);
             if let Some(shadow) = registry.merge_skill(record) {
                 shadows.push(shadow);
@@ -3024,7 +3024,7 @@ fn ingest_skills(
 
 /// Drain skill-ingest shadow events into the Pod's notify buffer so the
 /// first LLM request renders them as system-message attachments.
-fn drain_skill_shadows<C, S>(pod: &Pod<C, S>, shadows: Vec<memory::ShadowedSkill>)
+fn drain_skill_shadows<C, S>(pod: &Pod<C, S>, shadows: Vec<workflow_crate::ShadowedSkill>)
 where
     C: LlmClient,
     S: Store,
@@ -3048,6 +3048,9 @@ fn build_scope_with_memory(manifest: &PodManifest, pwd: &Path) -> Result<Scope, 
     if let Some(mem) = manifest.memory.as_ref() {
         let layout = memory::WorkspaceLayout::resolve(mem, pwd);
         scope_config.deny.extend(memory::deny_write_rules(&layout));
+        scope_config
+            .deny
+            .extend(workflow_crate::deny_write_rules(&layout));
     }
     scope_config.allow.extend(skill_dir_read_rules(manifest));
     Scope::from_config(&scope_config).map_err(PodError::Scope)
@@ -3215,7 +3218,7 @@ permission = "write"
     #[test]
     fn ingest_skills_returns_empty_when_skills_section_missing() {
         let manifest = minimal_manifest_with_skills(vec![]);
-        let mut registry = memory::WorkflowRegistry::empty();
+        let mut registry = workflow_crate::WorkflowRegistry::empty();
         let shadows = ingest_skills(&mut registry, &manifest);
         assert!(shadows.is_empty());
         assert!(registry.is_empty());
@@ -3233,13 +3236,13 @@ permission = "write"
         .unwrap();
 
         let manifest = minimal_manifest_with_skills(vec![skills_root.clone()]);
-        let mut registry = memory::WorkflowRegistry::empty();
+        let mut registry = workflow_crate::WorkflowRegistry::empty();
         let shadows = ingest_skills(&mut registry, &manifest);
 
         // workspace skill `alpha` should be registered (no collision).
         assert!(
             registry
-                .get(&memory::Slug::parse("alpha").unwrap())
+                .get(&workflow_crate::Slug::parse("alpha").unwrap())
                 .is_some()
         );
         // No workflow exists to shadow `alpha`, so no shadow event for it.

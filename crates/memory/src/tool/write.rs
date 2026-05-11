@@ -2,7 +2,7 @@
 //!
 //! Creates or overwrites a memory or knowledge record by `(kind, slug)`.
 //! Pre-write Linter validates frontmatter, slug uniqueness (Create only),
-//! reference integrity, size limits, and the workflow-write ban. On any
+//! reference integrity, size limits. On any
 //! Linter error the tool returns `ToolError::InvalidArgument` with all
 //! violations aggregated and the file is **not** written.
 

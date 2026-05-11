@@ -69,11 +69,6 @@ pub enum LintError {
     #[error("body exceeds the size limit for this record kind: {actual} chars > {limit}")]
     BodyTooLong { actual: usize, limit: usize },
 
-    #[error(
-        "write to a Workflow path is forbidden via the memory tool — Workflows are human-edited"
-    )]
-    WorkflowWriteForbidden,
-
     #[error("slug `{0}` already exists; use the edit tool instead of creating a new record")]
     SlugAlreadyExists(String),
 

@@ -1,5 +1,4 @@
-//! Walks `<workspace>/memory/{decisions,requests}/`,
-//! `<workspace>/workflow/`, and `<workspace>/knowledge/` to collect
+//! Walks `<workspace>/memory/{decisions,requests}/` and `<workspace>/knowledge/` to collect
 //! the slug set the linter needs for reference-integrity and
 //! same-slug-duplication checks.
 //!
@@ -11,8 +10,7 @@ use std::io;
 use std::path::Path;
 
 use crate::schema::{
-    DecisionFrontmatter, KnowledgeFrontmatter, RequestFrontmatter, WorkflowFrontmatter,
-    split_frontmatter,
+    DecisionFrontmatter, KnowledgeFrontmatter, RequestFrontmatter, split_frontmatter,
 };
 use crate::slug::Slug;
 use crate::workspace::{RecordKind, WorkspaceLayout};
@@ -28,7 +26,6 @@ pub struct ExistingRecords {
     decisions: HashMap<Slug, DecisionMeta>,
     requests: HashSet<Slug>,
     knowledge: HashSet<Slug>,
-    workflow: HashSet<Slug>,
 }
 
 #[derive(Debug, Clone)]
@@ -42,7 +39,7 @@ impl ExistingRecords {
             RecordKind::Decision => self.decisions.contains_key(slug),
             RecordKind::Request => self.requests.contains(slug),
             RecordKind::Knowledge => self.knowledge.contains(slug),
-            RecordKind::Workflow => self.workflow.contains(slug),
+            RecordKind::Workflow => false,
             RecordKind::Summary => false,
         }
     }
@@ -56,7 +53,7 @@ impl ExistingRecords {
             RecordKind::Decision => self.decisions.keys().collect(),
             RecordKind::Request => self.requests.iter().collect(),
             RecordKind::Knowledge => self.knowledge.iter().collect(),
-            RecordKind::Workflow => self.workflow.iter().collect(),
+            RecordKind::Workflow => Vec::new(),
             RecordKind::Summary => Vec::new(),
         }
     }
@@ -81,10 +78,6 @@ pub fn scan_existing(layout: &WorkspaceLayout) -> io::Result<ExistingRecords> {
     scan_dir(&layout.knowledge_dir(), |path, slug| {
         let _ = parse_silent::<KnowledgeFrontmatter>(path);
         out.knowledge.insert(slug);
-    })?;
-    scan_dir(&layout.workflow_dir(), |path, slug| {
-        let _ = parse_silent::<WorkflowFrontmatter>(path);
-        out.workflow.insert(slug);
     })?;
 
     Ok(out)
