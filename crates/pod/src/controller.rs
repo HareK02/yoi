@@ -176,6 +176,7 @@ impl PodController {
         // `PodFsView` to the shared state once the latter exists.
         let fs_for_view: tools::ScopedFs;
         let task_store = pod.task_store();
+        let session_id_for_usage = pod.session_id().to_string();
 
         let scope_change_sink = pod.scope_change_sink();
 
@@ -334,7 +335,10 @@ impl PodController {
             if let Some(mem) = memory_config.as_ref() {
                 let layout = memory::WorkspaceLayout::resolve(mem, &pwd_for_tools);
                 let query_cfg = memory::tool::QueryConfig::from(mem);
-                worker.register_tool(memory::tool::read_tool(layout.clone()));
+                worker.register_tool(memory::tool::read_tool_with_usage(
+                    layout.clone(),
+                    session_id_for_usage.clone(),
+                ));
                 worker.register_tool(memory::tool::write_tool(layout.clone()));
                 worker.register_tool(memory::tool::edit_tool(layout.clone()));
                 worker.register_tool(memory::tool::memory_query_tool(layout.clone(), query_cfg));

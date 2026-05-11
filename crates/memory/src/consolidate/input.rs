@@ -6,8 +6,8 @@
 //!
 //! 1. consumed staging エントリ全文（`source` 込み）
 //! 2. 既存 `memory/*` 全文（summary / decisions / requests）
-//! 3. Knowledge 化候補レポート（メトリクス未完なら空）
-//! 4. 整理材料（Linter Warn ベース、メトリクス未完なら明示 invoke 頻度なし）
+//! 3. Usage evidence report（明示使用回数 + resident exposure cost）
+//! 4. 整理材料（Linter Warn ベース、hard protection 判定はしない）
 //!
 //! 既存 `knowledge/*` 本文は埋めず、agent に `KnowledgeQuery` 経由で引かせる
 //! 設計（`docs/plan/memory.md` §retrieval 経路 / §Consolidation の Knowledge アクセス）。
@@ -16,41 +16,15 @@ use std::fmt::Write;
 
 use crate::consolidate::staging::StagingEntry;
 use crate::consolidate::tidy::TidyHints;
+use crate::usage::UsageReport;
 use crate::workspace::{RecordKind, WorkspaceLayout};
-
-/// Knowledge 化候補レポート。`tickets/memory-usage-metrics.md` の成果物が
-/// 出るまでは空で渡す前提（`docs/plan/memory.md` §Knowledge 化候補レポート）。
-/// 空入力時、統合 step は新規 Knowledge を作らず decisions / requests /
-/// summary / 既存 Knowledge update に留まる。
-#[derive(Debug, Default, Clone)]
-pub struct KnowledgeCandidateReport {
-    /// 候補に上がった `(kind, slug, frequency_per_mtoken)` の三つ組。
-    /// 空配列を渡すと「候補なし」を意味する。
-    pub entries: Vec<KnowledgeCandidateEntry>,
-}
-
-#[derive(Debug, Clone)]
-pub struct KnowledgeCandidateEntry {
-    pub source_kind: &'static str,
-    pub source_slug: String,
-    pub frequency_per_mtoken: f64,
-}
-
-impl KnowledgeCandidateReport {
-    pub fn empty() -> Self {
-        Self::default()
-    }
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-}
 
 /// consolidation sub-Worker の最初の user 入力。
 pub fn build_consolidate_input(
     layout: &WorkspaceLayout,
     staging: &[StagingEntry],
     tidy: &TidyHints,
-    candidates: &KnowledgeCandidateReport,
+    usage_report: &UsageReport,
 ) -> String {
     let mut out = String::new();
     out.push_str(
@@ -68,8 +42,8 @@ pub fn build_consolidate_input(
     out.push_str(&render_existing_memory_records(layout));
     out.push('\n');
 
-    out.push_str("## Knowledge candidate report\n\n");
-    out.push_str(&render_candidate_report(candidates));
+    out.push_str("## Usage evidence report\n\n");
+    out.push_str(&render_usage_report(usage_report));
     out.push('\n');
 
     out.push_str("## Tidy hints\n\n");
@@ -159,21 +133,16 @@ fn push_kind_records(out: &mut String, layout: &WorkspaceLayout, kind: RecordKin
     }
 }
 
-fn render_candidate_report(report: &KnowledgeCandidateReport) -> String {
+fn render_usage_report(report: &UsageReport) -> String {
     if report.is_empty() {
-        return "(empty — usage metrics pipeline not populated. \
-                Do not create new Knowledge records this run.)\n"
+        return "(empty — no explicit memory/knowledge usage events recorded yet. \
+                Treat this as lack of evidence, not proof that records are unused.)\n"
             .to_string();
     }
-    let mut out = String::new();
-    for c in &report.entries {
-        let _ = writeln!(
-            &mut out,
-            "- {} `{}` — frequency {:.3} invokes/Mtoken",
-            c.source_kind, c.source_slug, c.frequency_per_mtoken
-        );
-    }
-    out
+    let json = serde_json::to_string_pretty(report).unwrap_or_else(|_| "{}".to_string());
+    format!(
+        "This report is evidence only. Do not make hard Knowledge-creation or tidy-protection decisions from it alone.\n\n```json\n{json}\n```\n"
+    )
 }
 
 /// Tidy hints の Markdown 描画。空ヒントなら "(none)" 1 行。
@@ -229,8 +198,8 @@ pub fn render_tidy_hints(tidy: &TidyHints) -> String {
     }
 
     out.push_str(
-        "Explicit-invoke metrics (protection threshold) are not yet wired up; \
-         skip drop on long-standing records when uncertain.\n",
+        "Use the Usage evidence report as soft context only; \
+         require an explicit reason before deleting or heavily compressing records with recent use.\n",
     );
     out
 }
@@ -295,31 +264,27 @@ mod tests {
                 slugs: vec!["a".into(), "ab".into()],
             }],
         };
-        let report = KnowledgeCandidateReport::empty();
+        let report = UsageReport::empty();
 
         let out = build_consolidate_input(&layout, &staging, &tidy, &report);
         assert!(out.contains("Staging entries"));
         assert!(out.contains("Existing memory records"));
-        assert!(out.contains("Knowledge candidate report"));
+        assert!(out.contains("Usage evidence report"));
         assert!(out.contains("Tidy hints"));
         assert!(out.contains("state of the world"));
         assert!(out.contains("decision:dec"));
         assert!(out.contains("Replaced decisions"));
         assert!(out.contains("Sources overflow"));
         assert!(out.contains("Similar slug clusters"));
-        assert!(out.contains("usage metrics pipeline not populated"));
+        assert!(out.contains("no explicit memory/knowledge usage events"));
     }
 
     #[test]
     fn empty_inputs_render_placeholders() {
         let dir = tempfile::TempDir::new().unwrap();
         let layout = WorkspaceLayout::new(dir.path().to_path_buf());
-        let out = build_consolidate_input(
-            &layout,
-            &[],
-            &TidyHints::default(),
-            &KnowledgeCandidateReport::empty(),
-        );
+        let out =
+            build_consolidate_input(&layout, &[], &TidyHints::default(), &UsageReport::empty());
         // Both staging and tidy show "(none)"; existing memory records too.
         assert!(out.contains("Staging entries"));
         assert!(out.contains("(none)"));
