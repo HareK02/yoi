@@ -162,6 +162,60 @@ LeaseStore
 - `http://maintainer-hub/...`
 - `github://owner/repo/issues`
 
+## Query / listing
+
+初期 file backend の list / query は、index や DB を作らず全 `item.md` frontmatter scan で行う。
+
+対象:
+
+```text
+work-items/{open,pending,closed}/*/item.md
+```
+
+`item.md` の frontmatter に query 用 metadata を集約する。
+
+```yaml
+---
+id: 20260510-184233-a1b2-maintainer-work-items
+slug: maintainer-work-items
+title: AI maintainer 用 WorkItem / Thread 抽象
+status: open
+kind: design
+priority: P2
+labels: [maintainer, workflow]
+created_at: 2026-05-10T18:42:33Z
+updated_at: 2026-05-10T19:10:00Z
+assignee: null
+---
+```
+
+`WorkItemStore::list` / `query` は frontmatter だけを読み、summary を返す。
+
+- status / kind / labels / priority / assignee で filter する
+- title / slug / description excerpt の軽い substring query を提供する
+- sort は priority / updated_at / created_at を metadata で行う
+- `thread.jsonl` は一覧では読まず、`get(id)` / thread read 時だけ読む
+- `updated_at` は item metadata として持ち、必要なら thread append 時に更新する
+
+当面の件数では全件 scan で十分であり、AI に directory を探索させて候補を推測させない。index / SQLite / search daemon は件数増加、全文検索、remote backend 同期が必要になった時点で検討する。
+
+### status の二重管理
+
+file backend では directory と frontmatter の両方に status が出る。
+
+```text
+work-items/open/<id>/item.md
+frontmatter: status: open
+```
+
+これは人間の `ls` と backend abstraction の両方を成立させるため許容する。ただし linter / doctor で一致確認する。
+
+- `work-items/open/*/item.md` は `status: open`
+- `work-items/pending/*/item.md` は `status: pending`
+- `work-items/closed/*/item.md` は `status: closed`
+
+不一致は warning ではなく error とする。
+
 ## 初期 file backend 案
 
 ```text
@@ -198,12 +252,13 @@ work-items/
 2. WorkItem 抽象と file backend schema を設計する
 3. 新しい設計相談・並列作業・長い thread が必要な作業だけ WorkItem 化する
 4. ticket は WorkItem の linked artifact として扱う
-5. 十分に安定したら `tickets/` を WorkItem backend の view に寄せる
+5. `work-items/open/` が安定したら、`TODO.md` は generated view または廃止候補にする
+6. 十分に安定したら `tickets/` を WorkItem backend の view に寄せる
 
 ## 範囲外
 
 - remote maintainer hub の実装
-- GitHub Issues backend の実装
+- index / SQLite / search daemon による query 最適化
 - 既存 `tickets/` の即時移行
 - 常駐 scheduler
 - Pod lifecycle / completion tracking の完全実装
@@ -214,6 +269,9 @@ work-items/
 - WorkItem / Thread / Event / Lease / Artifact の domain model が docs に定義されている
 - repo-managed coordination data と `.insomnia` local runtime state の分担が明文化されている
 - `WorkItemStore` / `LeaseStore` 相当の interface 方針が決まっている
+- list / query は初期実装では全 `item.md` frontmatter scan で行う方針になっている
+- `thread.jsonl` は一覧では読まず、詳細 read 時だけ読む方針になっている
+- directory status と frontmatter status の一致を linter / doctor で確認する方針になっている
 - WorkItem ID scheme が中央連番ではなく timestamp-based になっている
 - 初期 file backend の directory schema が決まっている
 - `/auto-maintain` / AI maintainer が将来 WorkItemStore を入口にできる移行方針が書かれている
