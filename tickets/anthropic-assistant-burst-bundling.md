@@ -29,3 +29,8 @@ Anthropic Messages API は user/assistant の交互を要求し、同一論理 t
 - モデル世代別の thinking keep/strip デフォルト分岐（reasoning-history-persist のフォローアップ候補と同じ扱い）
 - `clear_thinking_20251015` context-edit
 - prune.rs の reasoning aware 化
+
+## レビュー状態
+
+- `19badfe fix: bundle anthropic assistant bursts` を review 済み。結果は `tickets/anthropic-assistant-burst-bundling.review.md`。
+- 判断: approve / merge 可。
