@@ -23,55 +23,129 @@
 - 将来 DB backend を追加しても歪みにくいデータ構造を設計する。
 - 既存の session-store JSONL 実装から段階的に移行できる命名・API 境界を決める。
 
-## 検討事項
+## 結論: Session / Segment / Entry の 3 階層
 
-- 会話継続単位と append-only log 単位を分けるべきか。
-  - 例: user-visible conversation/thread と、internal log segment の分離。
-- compaction の扱い。
-  - compaction 後の履歴を新しい低レベル log として扱うのは自然か。
-  - その場合、ユーザー視点では同じ会話の継続としてどう表現するか。
-- fork の扱い。
-  - fork は新しい会話単位を作るのか、同一会話内の branch とするのか。
-  - fork 起点を entry hash / turn boundary / checkpoint など、どの抽象度で表すか。
-- Pod state の責務。
-  - Pod 名から active な会話 / log を復元するために何を持つべきか。
-  - Pod が過去に辿った session / log の順序付き履歴をどこに持つべきか。
-- runtime state と persistent state の境界。
-  - `history.json` / `status.json` / `spawned_pods.json` を永続正本として扱わない方針の確認。
-- session log の `pod.scope` extension entry を撤廃するか（要検討）。
-  - 現状: session log に `PodScopeSnapshot` を extension として append し、session 復元時に scope も復元できる。
-  - Pod 単位永続化（`tickets/pod-persistent-state.md`）が入ると、scope の正本を Pod state に持つほうが責務が明確で、session log との重複も解消できる。
-  - ただし scope は session 内で動的に変化し得るため、「最新 snapshot は Pod state 」「変化履歴は session log の event として残す」のような分割もあり得る。conversation timeline 上の scope 変化を session 単独で再現する必要があるかが論点。
-  - 撤廃の選択肢: (a) session log から完全に削除し Pod state を唯一の正本にする / (b) snapshot 保持責務だけ Pod state に寄せ、scope 変更 event は session log に残す / (c) 現状維持で Pod state は session への参照のみ。
-- DB backend を想定した場合のテーブル / relation 相当の構造。
-  - append-only entry log
-  - lineage / origin
-  - active pointer
-  - Pod / child Pod registry
-  - index / listing / GC の余地
-- 既存 API / CLI 名称の移行方針。
-  - `--session` の扱い
-  - debug 用 ID とユーザー向け ID の分離
+```
+Session  ← ユーザー視点の会話の家系（fork tree 全体。Segment 群の grouping）
+  └── Segment  ← Compaction / Fork で切れる物理 append-only 単位（現在の SessionId 相当）
+        └── Entry  ← 1 永続化イベント
+```
 
-## 一案: Thread / Segment / Checkpoint に分ける案
+セマンティクスの対応:
 
-これは現時点の決定ではなく、検討材料の一案として置く。
+- **resume** = 同 Session 内の指定 leaf Segment に append
+- **compaction** = 同 Session, new Segment（lineage: `compacted_from`）
+- **fork** (live / 過去いずれも) = 同 Session, new Segment（lineage: `forked_from`）
+- **branching は Session 内で完結**する。Segment 間が DAG、Segment 内は完全 linear。
+- **Session は分岐ツリーを持つ静的な構造**。「今どの Segment に書いているか」(current active Segment) は Pod state 側が動的に保持する。
 
-- `Pod`: agent 実行主体 / process identity。
-- `Thread`: ユーザー視点の会話・作業継続単位。compaction しても同じ Thread と見なす。
-- `Segment`: append-only log の物理的 / 復元上の単位。現在の `SessionId` に近い。compaction / fork で新しい Segment が生まれる。
-- `Entry`: Segment 内の 1 永続化イベント。
-- `Checkpoint`: fork / rollback / UI 選択などの起点を表す抽象境界。内部的には Segment + EntryHash を指してもよいが、表層 API では entry pointer を直接露出しすぎない。
+文脈合成 (merge / cherry-pick) は今後の要件として想定しないため、entry レベルの DAG（任意の親 pointer）は採用しない。Segment 内 linear + Segment 間 DAG の 2 階層に閉じることで、同 Segment 内は `(segment_id, seq)` の連番 PK で直線探索でき、Segment 間の lineage は粗粒度な DAG として軽量に管理できる。
 
-この案では:
+fork で新しい Session を切らないのは、compaction で Segment を切るのと fork で Segment を切るのが対称な操作であり、ユーザー視点でも「同じ起源から派生した枝」として 1 つの単位で扱う方が自然なため。これにより Session 数が分岐で爆発せず、`WHERE session_id = ?` だけで fork tree 全体が取れる。
 
-- compaction = same Thread, new Segment
-- fork = new Thread または branch, new Segment
-- resume = same Thread の active Segment に append
-- Pod state = active Thread / spawned children / 必要な runtime 復元メタデータを保持
-- lineage = Segment origin または Checkpoint reference として保持
+### Restore / Resume の API
 
-この案を採用するかは本チケット内で改めて比較・判断する。
+Session が分岐を含むため、resume の指定は **(SessionId, leaf SegmentId) の組** で行う:
+
+- TUI 経路: ユーザーは **Session を選択 → その Session 内の leaf を選択**。
+- 内部 API: restore は `(SessionId, SegmentId)` を取り、指定 Segment から replay する。leaf 以外を指定すれば read-only な過去状態の参照も可能。
+- 「最後に active だった leaf」は Pod state が保持するので、TUI が初期選択候補として使える。
+
+### 既存コードとの対応
+
+| 既存 | 新名称 |
+|---|---|
+| `SessionId` | `SegmentId` にリネーム |
+| (なし) | `SessionId` 新設（Segment 群をまとめる、ユーザー視点 ID） |
+
+`session-store` crate の型・関数は Segment 中心の命名に揃える。crate 名自体を変えるかは別論点（中身は引き続き Segment 単位の append-only log を扱う）。
+
+### llm-worker への影響
+
+llm-worker は session 概念を持たない（`Worker` は `history` / `turn_count` / `RequestConfig` を持つだけで永続化への hook も無い）。Session / Segment 階層の導入は llm-worker 層に染み出さず、影響範囲は `session-store` / `pod` / `pod-registry` / `pod-cli` に閉じる。
+
+## Entry hash の廃止
+
+現状、各 entry は SHA-256 hash chain (`prev_hash` → `hash`) を持つが、実際に効いている用途は 2 つだけ:
+
+1. `ensure_head_or_fork` (pod.rs:1348) — store の末尾と Pod の保持する `head_hash` を比較し、不一致なら auto-fork。**末尾識別子があれば良い**（hash chain そのものは要らない）。
+2. `fork_at(source_id, at_hash)` (session.rs:425) — 過去 entry pointer から fork。`pod-session-fork.md` の入口仕様は turn number で、entry hash は内部 pointer に過ぎない。turn boundary (TurnEnd entry の index) で代替可能。
+
+改竄検知 (tamper-evident chain) は宣伝されているがコード上は walk して verify するルートが無いため、削除しても regression にならない。
+
+廃止に伴う対応:
+
+- `HashedEntry` 廃止、JSONL は 1 行 1 `LogEntry`。
+- `SessionOrigin.at_hash` → `at_turn_index` (TurnEnd 由来) に置換。
+- `ensure_head_or_fork` の検知ロジックは、Segment 末尾の terminal marker entry または末尾 seq 比較に置換（形式は実装時に決める）。
+
+## Fork: 2 種類の書き込み方
+
+Session 境界の話ではなく **元 Segment への marker 書き込みの有無**で 2 種類を分ける。Session はどちらの場合も同じで、新 Segment が同 Session 内に生える。
+
+- **live auto-fork**（concurrent writer 検知）
+  - 元 Segment の末尾に terminal marker (`Forked { to: SegmentId }` 等) を append → 以降の writer は marker を見て新 Segment へ自動移動。
+  - CoW semantics: 元 Segment は immutable、生まれた Segment 同士は対等な兄弟。
+- **過去 fork**（UI で turn 選択）
+  - 元 Segment は **無変更**、replay して新 Segment を生やすだけ。
+  - 起点は `(source_segment_id, at_turn_index)`。
+  - 元 Segment に書き込まないため、過去 fork を nested に重ねても解釈が単純。
+
+両者を同じ marker で扱おうとすると、過去 fork から更に過去で fork した場合に元 Segment への marker 位置解釈が複雑化して破綻するため、過去 fork 側は元 Segment に触れない方針で固定する。
+
+### fork の物理操作（物理コピーは不要）
+
+「fork = 同 Session 内に Segment を増やす」と言っても、過去 Segment を丸ごとコピーする必要は無い:
+
+- source segment の seq=N までを replay して得られた `Vec<Item>` を、新 Segment の seed entry (`SessionStart` 相当) に 1 回書き込む。
+- compaction の transitive な圧縮効果がここに乗る（source segment の `SessionStart.history` に過去 Segment の compaction 結果が既に埋まっている）ので、**source segment 1 本だけ replay すれば fork seed が作れる**。さらに過去の Segment は touch しない。
+- 新 Segment が持つ lineage 情報は `(parent_segment_id, fork_at_turn)` のメタデータのみ。
+
+これは現状の `fork_at` (`session.rs:430-456`) の挙動と同じで、Session 階層が乗っても操作は変わらない。
+
+## RDB backend を想定した概念モデル
+
+将来 DB backend を追加しても歪みにくい形として、以下の関係を仮定する:
+
+```
+sessions (
+  id PK,
+  ...                                  -- ユーザー視点 metadata
+)
+
+segments (
+  id PK,
+  session_id FK,
+  parent_segment_id FK NULL,           -- compaction / fork の元
+  fork_at_turn INT NULL,
+  origin_kind ENUM (new | compact | fork),
+  lineage_path ltree,                  -- 祖先・子孫の逆引き用 (materialized path)
+  ...
+)
+
+entries (
+  segment_id FK,
+  seq INT,
+  kind, payload, ts,
+  PRIMARY KEY (segment_id, seq)        -- 同 Segment 内 linear scan
+)
+```
+
+- 同 Segment 内 entry は `(segment_id, seq)` PK で linear scan、surrogate identity なので hash 不要。
+- Segment 間 lineage は `parent_segment_id` chain。深さは compaction / fork 回数のみ（Session あたり数〜数十）。
+- Segment lineage の祖先・子孫逆引きは `lineage_path` の `<@` / `@>` で 1 index 引き。entry 単位の DAG ではないため materialized path のメンテコストも軽い。
+- 通常 append は `lineage_path` 更新を伴わない（Segment 生成時に確定）。
+- 「Session の fork tree 全体」は `WHERE session_id = ?` で取れる。Session 単位の listing / GC が自然。
+
+FsStore 実装はこの構造のサブセット相当として位置付ける（1 Segment = 1 jsonl、`session_id` は Segment の metadata に持たせるか別ファイルに index する）。
+
+## 残る検討事項
+
+- pod.scope extension entry を Pod state 側に寄せるか、Segment log に残すか（`tickets/pod-persistent-state.md` 側と合わせて決定）。
+  - 撤廃の選択肢: (a) Segment log から削除し Pod state を唯一の正本にする / (b) snapshot 保持責務だけ Pod state に寄せ、scope 変更 event は Segment log に残す / (c) 現状維持で Pod state は Segment への参照のみ。
+- live auto-fork の marker 形式 (terminal entry vs Segment 末尾 seq 比較)。
+- pod-cli / TUI の `--session` 引数を Session 単位にするか Segment 単位にするか。debug 用 ID とユーザー向け ID の分離。
+- `session-store` crate 名のリネーム要否。
 
 ## 完了条件
 
@@ -87,6 +161,7 @@
 - DB backend の実装。
 - UI の履歴表示 / branch 表示の詳細 UX。
 - GC / retention policy の実装。
+- Session を跨ぐ merge / cherry-pick。
 
 ## 関連
 

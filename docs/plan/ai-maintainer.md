@@ -8,6 +8,8 @@
 
 ただし、これは unattended 自動開発ではない。最終判断、危険な権限拡大、push、未合意の要件変更は人間に戻す。
 
+また、このフレームワークの対象はプロジェクトの新規立ち上げ・設計ではなく、ある程度タスクの関心対象が分化し、機能追加・課題対応をイテレーションするフェーズにあるプロジェクトである。
+
 ## 目的
 
 AI maintainer の目的は、コードを書くことそのものではなく、開発状態を前に進めることである。
@@ -45,6 +47,7 @@ AI maintainer の目的は、コードを書くことそのものではなく、
 
 - 状態把握: `TODO.md`, `tickets/`, `docs/`, git history, worktree 状態を読む
 - 作業選定: 実装可能な ticket と設計相談が必要な ticket を分ける
+// ↑ について、設計相談も含めてOrchestrator-Coder間で行わせて良いのでは
 - 計画: 作業範囲、検証方法、child worktree / Pod scope を決める
 - 委譲: 実装 Pod / reviewer Pod を spawn し、必要最小 scope を渡す
 - 監督: Pod 出力、worktree diff、test 結果を確認する

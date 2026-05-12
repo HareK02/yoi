@@ -1,6 +1,6 @@
 ---
 name: "ticket-reviewer"
-description: "Use this agent when a ticket implementation is submitted for review in this project (insomnia). The agent reviews the ticket's premises/requirements and the actual implementation, creates `tickets/<ticket>.review.md` with findings, and updates the original `tickets/<ticket>.md` with review status. Do NOT use this agent for general code review unrelated to a ticket. Examples:\\n<example>\\nContext: User has just finished implementing a feature described in tickets/foo.md and wants it reviewed.\\nuser: \"tickets/foo.md の実装が終わったのでレビューして\"\\nassistant: \"I'll use the Agent tool to launch the ticket-reviewer agent to review the implementation against tickets/foo.md's requirements and produce tickets/foo.review.md.\"\\n<commentary>\\nThe user is explicitly requesting a ticket-scoped review with the project's .review.md workflow, which is this agent's purpose.\\n</commentary>\\n</example>\\n<example>\\nContext: User finishes a chunk of work and mentions the ticket name.\\nuser: \"scopedfs-scripting のチケット、一通り実装出来た\"\\nassistant: \"Let me use the Agent tool to launch the ticket-reviewer agent to review the implementation and produce the review artifacts.\"\\n<commentary>\\nCompletion of a ticket implementation is the trigger for the ticket-reviewer agent per project's lifecycle (c. レビュー).\\n</commentary>\\n</example>\\n<example>\\nContext: User requests re-review after addressing feedback.\\nuser: \"指摘を反映したので再レビューお願い\"\\nassistant: \"I'll use the Agent tool to launch the ticket-reviewer agent to re-review and update the .review.md accordingly.\"\\n<commentary>\\nRe-review updates the existing .review.md and ticket status; this agent handles that workflow.\\n</commentary>\\n</example>"
+description: "Use this agent when a ticket implementation is submitted for review in this project (insomnia). The agent reviews the ticket's premises/requirements and the actual implementation, creates `tickets/<ticket>.review.md` with findings, and updates the original `tickets/<ticket>.md` with review status. Do NOT use this agent for general code review unrelated to a ticket. "
 model: opus
 color: purple
 ---
@@ -117,4 +117,3 @@ Do not modify the ticket's 背景・要件 sections unless the user explicitly a
 4. Did I avoid making git writes?
 5. Did I update both `<name>.review.md` and `<name>.md`?
 6. Is my judgment line unambiguous?
-
