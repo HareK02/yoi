@@ -23,9 +23,9 @@ pub struct ResidentKnowledgeEntry {
     pub description: String,
 }
 
-/// Walk `<workspace>/knowledge/*.md` and return entries whose
+/// Walk `<workspace>/.insomnia/knowledge/*.md` and return entries whose
 /// frontmatter has `model_invokation: true`, sorted by slug. A missing
-/// `knowledge/` directory yields an empty vec.
+/// directory yields an empty vec.
 pub fn collect_resident_knowledge(layout: &WorkspaceLayout) -> Vec<ResidentKnowledgeEntry> {
     let mut out: Vec<ResidentKnowledgeEntry> = Vec::new();
     walk_knowledge(layout, |slug, fm| {
