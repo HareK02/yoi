@@ -1,10 +1,14 @@
-//! Collect resident-injection candidates from the workspace.
+//! Workspace knowledge enumeration helpers.
 //!
-//! Walks `<workspace>/knowledge/*.md`, returns the records whose
-//! frontmatter has `model_invokation: true` as `(slug, description)`
-//! pairs sorted by slug. The Pod system-prompt assembler appends them
-//! into the trailing section so descriptions sit next to the scope
-//! summary and AGENTS.md.
+//! Two surfaces, both walking `<workspace>/.insomnia/knowledge/*.md`:
+//!
+//! - [`collect_resident_knowledge`] — resident-injection candidates
+//!   (`model_invokation: true`) returned as `(slug, description)` pairs
+//!   for the Pod system-prompt assembler.
+//! - [`list_knowledge_slugs`] — every slug whose file parses, regardless
+//!   of `model_invokation`. Used by the Pod IPC layer to answer TUI `#`
+//!   completion (`model_invokation` is a resident-injection flag, not a
+//!   user-visibility flag).
 //!
 //! Files that fail to read or parse are skipped silently — the Linter
 //! enforces shape on write, so a malformed file here means external
@@ -23,13 +27,36 @@ pub struct ResidentKnowledgeEntry {
 /// frontmatter has `model_invokation: true`, sorted by slug. A missing
 /// `knowledge/` directory yields an empty vec.
 pub fn collect_resident_knowledge(layout: &WorkspaceLayout) -> Vec<ResidentKnowledgeEntry> {
+    let mut out: Vec<ResidentKnowledgeEntry> = Vec::new();
+    walk_knowledge(layout, |slug, fm| {
+        if fm.model_invokation {
+            out.push(ResidentKnowledgeEntry {
+                slug,
+                description: fm.description,
+            });
+        }
+    });
+    out.sort_by(|a, b| a.slug.cmp(&b.slug));
+    out
+}
+
+/// Walk `<workspace>/knowledge/*.md` and return every slug whose
+/// frontmatter parses, sorted ascending. Does not filter on
+/// `model_invokation`. A missing `knowledge/` directory yields an empty
+/// vec.
+pub fn list_knowledge_slugs(layout: &WorkspaceLayout) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    walk_knowledge(layout, |slug, _fm| out.push(slug));
+    out.sort();
+    out
+}
+
+fn walk_knowledge(layout: &WorkspaceLayout, mut visit: impl FnMut(String, KnowledgeFrontmatter)) {
     let dir = layout.knowledge_dir();
     let entries = match std::fs::read_dir(&dir) {
         Ok(it) => it,
-        Err(_) => return Vec::new(),
+        Err(_) => return,
     };
-
-    let mut out: Vec<ResidentKnowledgeEntry> = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
         if !path.is_file() {
@@ -55,15 +82,8 @@ pub fn collect_resident_knowledge(layout: &WorkspaceLayout) -> Vec<ResidentKnowl
             Ok(f) => f,
             Err(_) => continue,
         };
-        if fm.model_invokation {
-            out.push(ResidentKnowledgeEntry {
-                slug,
-                description: fm.description,
-            });
-        }
+        visit(slug, fm);
     }
-    out.sort_by(|a, b| a.slug.cmp(&b.slug));
-    out
 }
 
 #[cfg(test)]
@@ -163,5 +183,42 @@ mod tests {
 
         let got = collect_resident_knowledge(&layout);
         assert_eq!(got.len(), 1);
+    }
+
+    #[test]
+    fn list_slugs_missing_dir_returns_empty() {
+        let dir = TempDir::new().unwrap();
+        let layout = WorkspaceLayout::new(dir.path().to_path_buf());
+        assert!(list_knowledge_slugs(&layout).is_empty());
+    }
+
+    #[test]
+    fn list_slugs_returns_all_regardless_of_model_invokation() {
+        let (dir, layout) = setup();
+        write_knowledge(dir.path(), "alpha", "a", true, "");
+        write_knowledge(dir.path(), "beta", "b", false, "");
+        write_knowledge(dir.path(), "gamma", "g", true, "");
+
+        let got = list_knowledge_slugs(&layout);
+        assert_eq!(got, vec!["alpha", "beta", "gamma"]);
+    }
+
+    #[test]
+    fn list_slugs_skips_malformed_and_non_md() {
+        let (dir, layout) = setup();
+        write_knowledge(dir.path(), "good", "ok", true, "");
+        std::fs::write(
+            dir.path().join(".insomnia/knowledge/bad.md"),
+            "---\nthis is not yaml: : :\n---\nbody\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join(".insomnia/knowledge/note.txt"),
+            "not markdown\n",
+        )
+        .unwrap();
+
+        let got = list_knowledge_slugs(&layout);
+        assert_eq!(got, vec!["good"]);
     }
 }

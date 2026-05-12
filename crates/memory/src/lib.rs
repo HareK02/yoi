@@ -21,7 +21,7 @@ pub mod workspace;
 pub use error::{LintError, LintWarning, MemoryError};
 pub use extract::ExtractPointerPayload;
 pub use linter::{LintReport, Linter};
-pub use resident::{ResidentKnowledgeEntry, collect_resident_knowledge};
+pub use resident::{ResidentKnowledgeEntry, collect_resident_knowledge, list_knowledge_slugs};
 pub use scope::deny_write_rules;
 pub use slug::Slug;
 pub use usage::{

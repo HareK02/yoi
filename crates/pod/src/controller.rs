@@ -388,6 +388,12 @@ impl PodController {
                 .map(|slug| crate::shared_state::WorkflowCandidate { slug })
                 .collect(),
         );
+        shared_state.set_knowledge(
+            pod.knowledge_completions()
+                .into_iter()
+                .map(|slug| crate::shared_state::KnowledgeCandidate { slug })
+                .collect(),
+        );
         runtime_dir.write_manifest(&manifest_toml).await?;
         runtime_dir.write_status(&shared_state).await?;
         runtime_dir.write_history(&shared_state).await?;

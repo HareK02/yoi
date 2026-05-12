@@ -1237,6 +1237,13 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         self.workflow_registry.list_user_invocable("")
     }
 
+    pub fn knowledge_completions(&self) -> Vec<String> {
+        self.memory_layout
+            .as_ref()
+            .map(memory::list_knowledge_slugs)
+            .unwrap_or_default()
+    }
+
     /// Flatten a typed segment list into the single string the Worker
     /// receives as the user message, and emit user-facing alerts for
     /// segments that fall through to placeholder (knowledge / workflow
