@@ -299,17 +299,36 @@ import-map 形式のプレフィックスで指定する:
 
 ## `pod` CLI
 
+`pod` は通常、builtin default → user manifest → project manifest → overlay の cascade で manifest を解決して起動する。
+
 ```
-pod [--user-manifest <path>] [--project <path>] [--overlay <toml>]
-    [-s/--store <path>]
+pod [--project <path>] [--overlay <toml>] [-s/--store <path>] [--session <uuid>]
 ```
 
 | フラグ | 説明 |
 |---|---|
-| `--user-manifest` | ユーザー manifest のパス。省略時は `manifest::paths::user_manifest_path()` で自動解決 |
-| `--project` | プロジェクト manifest 探索の起点。省略時は cwd から上方向に `.insomnia/` を探索 |
-| `--overlay` | 最上層の overlay を inline TOML 文字列で渡す（例: `--overlay 'worker.instruction = "$user/foo"'`） |
-| `-s, --store` | セッション永続化ディレクトリ（デフォルト: `<data_dir>/sessions/`、`manifest::paths` で解決） |
+| `--project <path>` | プロジェクト manifest 探索の起点。省略時は cwd から上方向に `.insomnia/manifest.toml` を探索 |
+| `--overlay <toml>` | 最上層の overlay を inline TOML 文字列で渡す（例: `--overlay 'worker.instruction = "$user/foo"'`） |
+| `-s, --store <path>` | セッション永続化ディレクトリ（デフォルト: `<data_dir>/sessions/`、`manifest::paths` で解決） |
+| `--session <uuid>` | 既存 session id から Pod を復元し、同じ jsonl に後続 turn を追記する |
+
+user manifest は CLI フラグではなく、以下の規則で解決する。
+
+| 入力 | 挙動 |
+|---|---|
+| `INSOMNIA_USER_MANIFEST=<path>` | 指定 path を user manifest として読む。ファイル不在や parse error は起動エラー |
+| `INSOMNIA_USER_MANIFEST=` | 空文字列は未指定扱い |
+| env 未指定 | `manifest::paths::user_manifest_path()` で自動探索し、存在すれば読む |
+
+単一ファイルだけで起動したい場合は cascade を使わず、`--manifest` を指定する。
+
+```
+pod --manifest <path> [-s/--store <path>] [--session <uuid>]
+```
+
+`--manifest` は指定 TOML 1 枚だけを `PodManifest::from_toml` で読み、user / project / overlay layer は一切読まない。したがって `--project`、`--overlay`、非空の `INSOMNIA_USER_MANIFEST` とは併用不可。
+
+spawn 子 Pod 用の内部フラグとして `--adopt` と `--callback <path>` がある。これらは `SpawnPod` が scope allocation と親 callback socket を引き継がせるために使うもので、通常の手動起動では使わない。
 
 Pod の作業ディレクトリは `pod` 起動時の cwd が直接使われる。別ディレクトリで
 動かしたい場合は `cd <path> && pod ...` のように外側で `cd` してから起動する。
