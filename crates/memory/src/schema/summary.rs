@@ -23,10 +23,10 @@ impl Frontmatter for SummaryFrontmatter {
     /// than per-record kinds (~5k tokens at the upper end).
     const BODY_LIMIT: usize = 20000;
 
-    fn created_at(&self) -> DateTime<Utc> {
-        self.created_at.unwrap_or(self.updated_at)
+    fn created_at(&self) -> Option<DateTime<Utc>> {
+        Some(self.created_at.unwrap_or(self.updated_at))
     }
-    fn updated_at(&self) -> DateTime<Utc> {
-        self.updated_at
+    fn updated_at(&self) -> Option<DateTime<Utc>> {
+        Some(self.updated_at)
     }
 }

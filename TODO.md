@@ -3,7 +3,6 @@
   - 半自動開発運用 Workflow → [tickets/auto-maintain-workflow.md](tickets/auto-maintain-workflow.md)
   - AI maintainer 用 WorkItem / Thread 抽象 → [tickets/maintainer-work-items.md](tickets/maintainer-work-items.md)
   - Prompt / Workflow 評価メトリクスと改善 Offer → [tickets/prompt-eval-metrics.md](tickets/prompt-eval-metrics.md)
-  - memory / workflow 共通基盤（Slug / frontmatter helpers）を別 crate に切り出す → [tickets/lint-common-crate.md](tickets/lint-common-crate.md)
 - Permission: allow-all 既定 policy への整理 → [tickets/permission-default-policy.md](tickets/permission-default-policy.md)
 - Pod CLI: マニフェスト関連フラグの整理 → [tickets/pod-cli-manifest-flags.md](tickets/pod-cli-manifest-flags.md)
 - Pod: 空応答ターン (Submit 後 AI 応答ゼロで Pause/Cancel) を自動巻き戻し → [tickets/pod-empty-turn-rollback.md](tickets/pod-empty-turn-rollback.md)

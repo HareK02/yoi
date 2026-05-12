@@ -22,8 +22,9 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::Slug;
 use crate::error::LintError;
-use crate::slug::Slug;
+use lint_common::RecordLintError;
 
 const INSOMNIA_DIR: &str = ".insomnia";
 const MEMORY_DIR: &str = "memory";
@@ -159,7 +160,7 @@ impl WorkspaceLayout {
     ///
     /// On a conventional path that's *almost* a record but malformed
     /// (e.g. `.insomnia/memory/decisions/Foo.md` with an invalid slug),
-    /// returns `Err(LintError::InvalidSlug | InvalidPath)` so the caller
+    /// returns `Err(LintError::Record(InvalidSlug) | InvalidPath)` so the caller
     /// can surface it as a write violation.
     pub fn classify(&self, path: &Path) -> Result<Option<ClassifiedPath>, LintError> {
         let memory = self.memory_dir();
@@ -320,7 +321,10 @@ mod tests {
         let err = layout()
             .classify(&PathBuf::from("/ws/.insomnia/memory/decisions/Foo.md"))
             .unwrap_err();
-        assert!(matches!(err, LintError::InvalidSlug(_)));
+        assert!(matches!(
+            err,
+            LintError::Record(RecordLintError::InvalidSlug(_))
+        ));
     }
 
     #[test]

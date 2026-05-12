@@ -12,6 +12,7 @@ members = [
     "crates/provider",
     "crates/pod-registry",
     "crates/session-metrics",
+    "crates/lint-common",
     "crates/tools",
     "crates/tui",
     "crates/memory",
@@ -28,6 +29,7 @@ client = { path = "crates/client" }
 llm-worker = { path = "crates/llm-worker", version = "0.2" }
 llm-worker-macros = { path = "crates/llm-worker-macros", version = "0.2" }
 manifest = { path = "crates/manifest" }
+lint-common = { path = "crates/lint-common" }
 memory = { path = "crates/memory" }
 workflow = { path = "crates/workflow" }
 pod-registry = { path = "crates/pod-registry" }

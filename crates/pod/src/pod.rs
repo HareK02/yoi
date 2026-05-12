@@ -1221,7 +1221,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 continue;
             };
             let parsed = workflow_crate::Slug::parse(slug.clone())
-                .map_err(WorkflowResolveError::InvalidSlug)?;
+                .map_err(|source| WorkflowResolveError::InvalidSlug(source.into()))?;
             let record = self
                 .workflow_registry
                 .get(&parsed)

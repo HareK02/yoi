@@ -18,6 +18,7 @@ mod warnings;
 
 use std::path::Path;
 
+use lint_common::RecordLintError;
 use serde::de::DeserializeOwned;
 
 use crate::error::{LintError, LintWarning};
@@ -104,8 +105,8 @@ impl Linter {
         let existing = match existing::scan_existing(&self.layout) {
             Ok(e) => e,
             Err(e) => {
-                report.push_error(LintError::MalformedFrontmatter(format!(
-                    "failed to scan existing records: {e}"
+                report.push_error(LintError::Record(RecordLintError::MalformedFrontmatter(
+                    format!("failed to scan existing records: {e}"),
                 )));
                 return report;
             }
@@ -354,7 +355,8 @@ mod tests {
         let report = linter.lint(&path, &content, WriteMode::Create);
         assert!(report.errors.iter().any(|e| matches!(
             e,
-            LintError::MissingField(_) | LintError::MalformedFrontmatter(_)
+            LintError::MissingField(_)
+                | LintError::Record(RecordLintError::MalformedFrontmatter(_))
         )));
     }
 

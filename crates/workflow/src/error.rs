@@ -2,19 +2,14 @@
 
 use std::path::PathBuf;
 
+use lint_common::RecordLintError;
 use thiserror::Error;
 
 /// A single Workflow linter violation.
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum WorkflowLintError {
-    #[error("invalid slug `{0}`: must match ^[a-z0-9](?:[a-z0-9-]{{0,62}}[a-z0-9])?$")]
-    InvalidSlug(String),
-
-    #[error("malformed frontmatter: {0}")]
-    MalformedFrontmatter(String),
-
-    #[error("frontmatter is missing or document is empty")]
-    MissingFrontmatter,
+    #[error(transparent)]
+    Record(#[from] RecordLintError),
 
     #[error("missing required frontmatter field: `{0}`")]
     MissingField(&'static str),

@@ -2,10 +2,10 @@
 
 use std::collections::HashSet;
 
+use crate::Slug;
 use crate::error::LintError;
 use crate::linter::ExistingRecords;
 use crate::linter::LintReport;
-use crate::slug::Slug;
 use crate::workspace::RecordKind;
 
 /// Validate a Decision's `replaced_by` against the existing record set.

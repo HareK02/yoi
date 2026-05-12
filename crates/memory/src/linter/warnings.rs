@@ -4,10 +4,10 @@
 //! integrated into the main linter pass when implemented; this file
 //! covers per-write checks that only need the proposed content.
 
+use crate::Slug;
 use crate::error::LintWarning;
 use crate::linter::LintReport;
 use crate::linter::existing::ExistingRecords;
-use crate::slug::Slug;
 use crate::workspace::{ClassifiedPath, RecordKind};
 
 const LARGE_BODY_THRESHOLD: usize = 1500;

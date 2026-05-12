@@ -15,10 +15,10 @@ pub struct RequestFrontmatter {
 impl Frontmatter for RequestFrontmatter {
     const BODY_LIMIT: usize = 8000;
 
-    fn created_at(&self) -> DateTime<Utc> {
-        self.created_at
+    fn created_at(&self) -> Option<DateTime<Utc>> {
+        Some(self.created_at)
     }
-    fn updated_at(&self) -> DateTime<Utc> {
-        self.updated_at
+    fn updated_at(&self) -> Option<DateTime<Utc>> {
+        Some(self.updated_at)
     }
 }

@@ -1,5 +1,6 @@
 //! YAML frontmatter parsing helpers shared by every kind.
 
+use lint_common::RecordLintError;
 use serde::de::DeserializeOwned;
 
 use crate::error::LintError;
@@ -26,7 +27,7 @@ fn map_serde_error(err: serde_yaml::Error) -> LintError {
         }
         return LintError::InvalidField { field, message };
     }
-    LintError::MalformedFrontmatter(msg)
+    LintError::Record(RecordLintError::MalformedFrontmatter(msg))
 }
 
 fn parse_missing_field(msg: &str) -> Option<&'static str> {
