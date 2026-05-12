@@ -50,3 +50,8 @@
 - `--manifest` を `--project` / `--overlay` と併用しようとすると clap が拒否する
 - `INSOMNIA_USER_MANIFEST` がセットされた状態で `--manifest` を使おうとするとエラーになる
 - 既存の `pod --overlay <toml>` 起動（`start_pod.local.fish` 経由）が引き続き動く
+
+## Review
+- 状態: Approve with follow-up
+- レビュー詳細: [./pod-cli-manifest-flags.review.md](./pod-cli-manifest-flags.review.md)
+- 日付: 2026-05-12
