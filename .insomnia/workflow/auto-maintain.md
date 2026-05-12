@@ -16,9 +16,6 @@ requires: []
 
 - main workspace は制御面として扱う。
   - `.insomnia/`
-  - `TODO.md`
-  - `tickets/`
-  - `docs/report/`
   - maintainer inbox / trial log
 - 実装差分は原則 child git worktree に隔離する。
 - child worktree には `.insomnia` を置かない。必要なら `/worktree-workflow` の手順に従い sparse checkout で `.insomnia` を除外する。

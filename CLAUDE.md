@@ -18,6 +18,12 @@ LLM に投げる context への割り込みは、大きく2種類に分かれる
 
 ---
 
+## 実際のセッションを読んでデバッグする
+
+`~/.insomnia/sessions`にすべてのセッションがある。jsonlなので、いい感じにBashで読むこと。
+
+---
+
 ## Git操作
 
 Gitはpush以外のすべての操作が許可されている。
@@ -52,6 +58,8 @@ a. 作成: `tickets/foo.md` を作成してcommit
 b. 詳細化や前提の変化: `tickets/foo.md` を更新してcommit
 c. レビュー: `tickets/foo.md` にレビュー状態を追記 + `tickets/foo.review.md` を作成してcommit
 d. 完了: `tickets/foo.md` と `tickets/foo.review.md` を両方削除してcommit
+
+worktreeと併用して作業を進める場合、必ずブランチを切る前に対象のチケットをコミットしてから切ること。
 
 TODO.mdのリンクは完了後に切れるが、そのリンクを元にgitで消されたファイルを読み、内容を把握できる。
 `.review.md` にはレビューの指摘事項と判断結果を記載する。
