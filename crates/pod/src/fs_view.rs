@@ -13,11 +13,16 @@
 use std::path::{Path, PathBuf};
 
 use llm_worker::Item;
+use manifest::Scope;
+use tools::scoped_fs::first_symlink;
 use tools::{ScopedFs, ToolsError};
 use tracing::warn;
 
 /// 補完候補1件の最大数。`list_file_completions` がこの値を超えたら打ち切り。
 const COMPLETION_LIMIT: usize = 100;
+/// submit-time directory FileRef の shallow listing で返す最大 entry 数。
+/// TUI completion と同じ浅い一覧という意味論に揃えるため、同じ上限を使う。
+const DIR_FILE_REF_ENTRY_LIMIT: usize = COMPLETION_LIMIT;
 
 /// Compact worker が `mark_read_required` で nominate した「次セッション開始時に
 /// 自動で再読すべきファイル」のエントリ。
@@ -106,16 +111,16 @@ impl PodFsView {
         out
     }
 
-    /// `path` を ScopedFs 経由で読み、`[File: <path>]\n<body>` 形式の
-    /// system message を返す。submit 時の `Segment::FileRef` リゾルバが
-    /// 使う経路。
+    /// `path` を ScopedFs 経由で解決し、submit 時の `Segment::FileRef`
+    /// attachment 用 system message を返す。
     ///
     /// - `path` は relative なら pwd 相対、absolute なら absolute として解釈
-    /// - `max_bytes` を超える本文は切り詰め、末尾に
-    ///   `[...truncated, <total> bytes total — use read_file for the rest]`
-    ///   を付与する
+    /// - 通常ディレクトリは浅い entry listing として `[Dir: <path>]\n<body>` に展開する
+    /// - ディレクトリ listing は hidden / gitignore を特別扱いせず、scope 上 readable な
+    ///   直下 entry だけを最大 `DIR_FILE_REF_ENTRY_LIMIT` 件返す
+    /// - ファイル本文またはディレクトリ listing 本文が `max_bytes` を超える場合は切り詰める
     /// - 非 UTF-8 (バイナリ) は `ResolveError::Binary` で拒否
-    /// - スコープ外 / NotFound 等は `ResolveError::Fs` で返す
+    /// - スコープ外 / NotFound / symlink directory 等は `ResolveError::Fs` で返す
     pub fn resolve_file_ref(&self, path: &str, max_bytes: usize) -> Result<Item, ResolveError> {
         let p = Path::new(path);
         let abs = if p.is_absolute() {
@@ -123,6 +128,21 @@ impl PodFsView {
         } else {
             self.fs.pwd().join(p)
         };
+
+        // 通常ディレクトリだけを FileRef listing として扱う。symlink を含むパスは
+        // `ScopedFs::read_bytes` に委ね、既存の symlink 診断
+        // (`SymlinkTargetIsDirectory` / `SymlinkOutOfScope` 等) を保つ。
+        if first_symlink(&abs).is_none() {
+            let scope = self.fs.scope();
+            if !scope.is_readable(&abs) {
+                return Err(ResolveError::Fs(ToolsError::OutOfScope(abs)));
+            }
+            let meta = metadata_for_file_ref(&abs).map_err(ResolveError::Fs)?;
+            if meta.is_dir() {
+                return render_dir_file_ref(path, &abs, max_bytes, scope.as_ref());
+            }
+        }
+
         let bytes = self.fs.read_bytes(&abs).map_err(ResolveError::Fs)?;
         let total = bytes.len();
         let (body_bytes, truncated) = if total > max_bytes {
@@ -204,6 +224,116 @@ pub fn slice_lines(text: &str, offset: usize, limit: Option<usize>) -> String {
     lines[start..end].join("\n")
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DirListingEntry {
+    display: String,
+    kind_rank: u8,
+}
+
+fn metadata_for_file_ref(path: &Path) -> Result<std::fs::Metadata, ToolsError> {
+    std::fs::metadata(path).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => ToolsError::NotFound(path.to_path_buf()),
+        _ => ToolsError::io(path, e),
+    })
+}
+
+fn render_dir_file_ref(
+    original_path: &str,
+    abs: &Path,
+    max_bytes: usize,
+    scope: &Scope,
+) -> Result<Item, ResolveError> {
+    let read_dir = std::fs::read_dir(abs).map_err(|e| ResolveError::Fs(ToolsError::io(abs, e)))?;
+    let mut entries = Vec::new();
+
+    for entry in read_dir {
+        let entry = entry.map_err(|e| ResolveError::Fs(ToolsError::io(abs, e)))?;
+        let path = entry.path();
+        if !scope.is_readable(&path) {
+            continue;
+        }
+        let file_type = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(e) => return Err(ResolveError::Fs(ToolsError::io(&path, e))),
+        };
+        let mut display = entry.file_name().to_string_lossy().into_owned();
+        let kind_rank = if file_type.is_dir() {
+            display.push('/');
+            0
+        } else if file_type.is_symlink() {
+            display.push('@');
+            1
+        } else {
+            2
+        };
+        entries.push(DirListingEntry { display, kind_rank });
+    }
+
+    entries.sort_by(|a, b| {
+        a.kind_rank
+            .cmp(&b.kind_rank)
+            .then_with(|| a.display.cmp(&b.display))
+    });
+
+    let total_entries = entries.len();
+    let entry_truncated = total_entries > DIR_FILE_REF_ENTRY_LIMIT;
+    let body = if total_entries == 0 {
+        "(empty directory)".to_string()
+    } else {
+        entries
+            .iter()
+            .take(DIR_FILE_REF_ENTRY_LIMIT)
+            .map(|e| e.display.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let body_total_bytes = body.len();
+    let (body, byte_truncated) = truncate_utf8_bytes(&body, max_bytes);
+
+    let mut text = format!("[Dir: {original_path}]\n{body}");
+    if entry_truncated || byte_truncated {
+        text.push('\n');
+        text.push_str(&dir_listing_truncation_hint(
+            entry_truncated,
+            byte_truncated,
+            total_entries,
+            body_total_bytes,
+        ));
+    }
+    Ok(Item::system_message(text))
+}
+
+fn truncate_utf8_bytes(s: &str, max_bytes: usize) -> (&str, bool) {
+    if s.len() <= max_bytes {
+        return (s, false);
+    }
+    let mut end = max_bytes;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    (&s[..end], true)
+}
+
+fn dir_listing_truncation_hint(
+    entry_truncated: bool,
+    byte_truncated: bool,
+    total_entries: usize,
+    body_total_bytes: usize,
+) -> String {
+    match (entry_truncated, byte_truncated) {
+        (true, true) => format!(
+            "[...truncated, {total_entries} readable entries total; first {DIR_FILE_REF_ENTRY_LIMIT} entries were {body_total_bytes} bytes before byte cap — use Glob for more]"
+        ),
+        (true, false) => {
+            format!("[...truncated, {total_entries} readable entries total — use Glob for more]")
+        }
+        (false, true) => {
+            format!("[...truncated, {body_total_bytes} bytes total — use Glob or Read for more]")
+        }
+        (false, false) => String::new(),
+    }
+}
+
 fn format_range(offset: Option<usize>, limit: Option<usize>) -> String {
     match (offset, limit) {
         (None, None) => String::new(),
@@ -239,6 +369,7 @@ fn split_prefix(prefix: &str, pwd: &Path) -> (PathBuf, String, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use llm_worker::ContentPart;
     use manifest::{Permission, Scope, ScopeConfig, ScopeRule};
     use tempfile::TempDir;
 
@@ -254,6 +385,16 @@ mod tests {
             std::fs::create_dir_all(parent).unwrap();
         }
         std::fs::write(path, content).unwrap();
+    }
+
+    fn system_text(item: &Item) -> &str {
+        let Item::Message { content, .. } = item else {
+            panic!("expected message item");
+        };
+        let Some(ContentPart::Text { text }) = content.first() else {
+            panic!("expected text content");
+        };
+        text
     }
 
     #[test]
@@ -310,6 +451,115 @@ mod tests {
         assert!(text.contains("[File: big.txt]"));
         assert!(text.contains("truncated"));
         assert!(text.contains("2048 bytes total"));
+    }
+
+    #[test]
+    fn resolve_file_ref_lists_directory_shallow_entries() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("docs/sub")).unwrap();
+        touch(&dir.path().join("docs/.hidden"), "hidden");
+        touch(&dir.path().join("docs/.gitignore"), "ignored.txt\n");
+        touch(
+            &dir.path().join("docs/ignored.txt"),
+            "not ignored for FileRef",
+        );
+        let view = PodFsView::new(fs_for(&dir));
+
+        let item = view.resolve_file_ref("docs", 4096).unwrap();
+        let text = system_text(&item);
+        assert!(text.starts_with("[Dir: docs]\n"));
+        assert!(text.contains("sub/"));
+        assert!(text.contains(".hidden"));
+        assert!(text.contains(".gitignore"));
+        assert!(text.contains("ignored.txt"));
+
+        let sub_pos = text.find("sub/").unwrap();
+        let hidden_pos = text.find(".hidden").unwrap();
+        assert!(
+            sub_pos < hidden_pos,
+            "directories should sort before files:\n{text}"
+        );
+    }
+
+    #[test]
+    fn resolve_file_ref_directory_listing_filters_unreadable_entries() {
+        let dir = TempDir::new().unwrap();
+        let docs = dir.path().join("docs");
+        let secret = docs.join("secret");
+        std::fs::create_dir_all(&secret).unwrap();
+        touch(&docs.join("visible.txt"), "ok");
+        touch(&secret.join("hidden.txt"), "nope");
+
+        let cfg = ScopeConfig {
+            allow: vec![ScopeRule {
+                target: dir.path().to_path_buf(),
+                permission: Permission::Write,
+                recursive: true,
+            }],
+            deny: vec![ScopeRule {
+                target: secret.clone(),
+                permission: Permission::Read,
+                recursive: true,
+            }],
+        };
+        let scope = Scope::from_config(&cfg).unwrap();
+        let fs = ScopedFs::new(scope, dir.path().to_path_buf());
+        let view = PodFsView::new(fs);
+
+        let item = view.resolve_file_ref("docs", 4096).unwrap();
+        let text = system_text(&item);
+        assert!(text.contains("visible.txt"));
+        assert!(!text.contains("secret"));
+        assert!(!text.contains("hidden.txt"));
+    }
+
+    #[test]
+    fn resolve_file_ref_directory_listing_uses_upload_byte_cap() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join("docs")).unwrap();
+        touch(&dir.path().join("docs/very-long-file-name.txt"), "");
+        touch(&dir.path().join("docs/another-long-file-name.txt"), "");
+        let view = PodFsView::new(fs_for(&dir));
+
+        let item = view.resolve_file_ref("docs", 10).unwrap();
+        let text = system_text(&item);
+        assert!(text.starts_with("[Dir: docs]\n"));
+        assert!(text.contains("truncated"));
+        assert!(text.contains("bytes total"));
+        assert!(text.contains("use Glob or Read for more"));
+    }
+
+    #[test]
+    fn resolve_file_ref_directory_listing_uses_completion_entry_limit() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join("docs")).unwrap();
+        for i in 0..(DIR_FILE_REF_ENTRY_LIMIT + 5) {
+            touch(&dir.path().join(format!("docs/file-{i:03}.txt")), "");
+        }
+        let view = PodFsView::new(fs_for(&dir));
+
+        let item = view.resolve_file_ref("docs", 4096).unwrap();
+        let text = system_text(&item);
+        assert!(text.contains("105 readable entries total"));
+        assert!(text.contains("file-099.txt"));
+        assert!(!text.contains("file-100.txt"));
+        assert!(text.contains("use Glob for more"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_file_ref_directory_listing_marks_readable_symlink_entries() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join("docs")).unwrap();
+        touch(&dir.path().join("docs/target.txt"), "target");
+        symlink("target.txt", dir.path().join("docs/link.txt")).unwrap();
+        let view = PodFsView::new(fs_for(&dir));
+
+        let item = view.resolve_file_ref("docs", 4096).unwrap();
+        let text = system_text(&item);
+        assert!(text.contains("link.txt@"));
     }
 
     #[test]

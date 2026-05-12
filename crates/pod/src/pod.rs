@@ -962,10 +962,9 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     ///
     /// `input` is a typed segment list (see [`protocol::Segment`]). The
     /// Pod flattens it into a single user-message string for the
-    /// underlying Worker, expanding paste content inline and surfacing
-    /// alerts for any segment kind the current Pod has no resolver for
-    /// (file refs, knowledge refs, workflow invocations, unknown
-    /// variants from a newer client).
+    /// underlying Worker, expanding paste content inline, resolving file refs
+    /// into adjacent attachments where possible, and surfacing alerts for
+    /// unresolved refs / unsupported segment kinds.
     ///
     /// If the between-turns compaction threshold is exceeded mid-run,
     /// the Worker is aborted, history is compacted, and execution resumes
@@ -1018,10 +1017,11 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     }
 
     /// Resolve every `Segment::FileRef` in `segments` to a `[File: <path>]`
-    /// system message via `PodFsView`. Resolution failures (out-of-scope,
-    /// not-found, binary, I/O) surface as `AlertLevel::Warn` Alerts and
-    /// are skipped — the unresolved placeholder stays in the flattened
-    /// user message so the LLM still sees the intent.
+    /// or shallow `[Dir: <path>]` system message via `PodFsView`. Resolution
+    /// failures (out-of-scope, not-found, binary, I/O, unsupported symlink
+    /// directory) surface as `AlertLevel::Warn` Alerts and are skipped — the
+    /// unresolved placeholder stays in the flattened user message so the LLM
+    /// still sees the intent.
     fn resolve_file_refs(&self, segments: &[Segment]) -> Vec<Item> {
         let view = crate::fs_view::PodFsView::new(tools::ScopedFs::with_shared_scope(
             self.scope.clone(),

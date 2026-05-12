@@ -32,7 +32,9 @@ impl PasteRef {
     }
 }
 
-/// `@<path>` chip — confirmed completion of a file reference.
+/// `@<path>` chip — confirmed completion of a file-system reference.
+/// Directories remain valid chips because Pod resolves normal directory refs
+/// to shallow `[Dir: <path>]` listings at submit time.
 #[derive(Debug, Clone)]
 pub struct FileRefAtom {
     pub path: String,
