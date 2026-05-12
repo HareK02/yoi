@@ -33,6 +33,11 @@ pub const COMPACT_RETAINED_TOKENS: u64 = 8000;
 /// `$insomnia/` / `$user/` / `$workspace/` namespaces.
 pub const DEFAULT_INSTRUCTION: &str = "$insomnia/default";
 
+/// Default language policy used by the main worker for normal prose
+/// responses. See [`crate::WorkerManifest::language`].
+pub const WORKER_LANGUAGE: &str =
+    "match the user's language unless they explicitly request another language";
+
 /// Token budget for auto-read file contents injected into the new
 /// session after compaction. Limits how much raw file text the
 /// compact worker can pull into the compacted context via

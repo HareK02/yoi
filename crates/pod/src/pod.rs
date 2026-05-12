@@ -879,10 +879,12 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             };
         let resident_exposure_snapshots =
             self.resident_exposure_snapshots(&resident, &resident_workflows);
+        let worker_language = worker_language(&self.manifest.worker);
         let scope_snapshot = self.scope.snapshot();
         let ctx = SystemPromptContext {
             now: chrono::Utc::now(),
             cwd: &self.pwd,
+            language: worker_language,
             scope: &scope_snapshot,
             tool_names,
             agents_md: agents_md_read.body,
@@ -2342,6 +2344,15 @@ fn memory_language(cfg: &manifest::MemoryConfig) -> &str {
         .unwrap_or(manifest::defaults::MEMORY_LANGUAGE)
 }
 
+fn worker_language(cfg: &manifest::WorkerManifest) -> &str {
+    let language = cfg.language.trim();
+    if language.is_empty() {
+        manifest::defaults::WORKER_LANGUAGE
+    } else {
+        language
+    }
+}
+
 /// Outcome of a single extract iteration. Internal to
 /// `try_post_run_extract` / `run_extract_once`.
 enum ExtractDecision {
@@ -3152,6 +3163,7 @@ mod build_summary_prompt_tests {
     fn worker_manifest_generation_settings_become_request_config() {
         let manifest = WorkerManifest {
             instruction: "unused".into(),
+            language: manifest::defaults::WORKER_LANGUAGE.into(),
             max_tokens: Some(1024),
             max_turns: None,
             temperature: Some(0.2),

@@ -144,6 +144,8 @@ impl std::fmt::Debug for SystemPromptTemplate {
 pub struct SystemPromptContext<'a> {
     pub now: DateTime<Utc>,
     pub cwd: &'a Path,
+    /// Language policy exposed to instruction templates as `{{ language }}`.
+    pub language: &'a str,
     pub scope: &'a Scope,
     pub tool_names: Vec<String>,
     /// Project-level instructions read from the nearest `AGENTS.md`.
@@ -181,6 +183,7 @@ impl<'a> SystemPromptContext<'a> {
             Value::from(self.now.to_rfc3339_opts(SecondsFormat::Secs, true)),
         );
         root.insert("cwd".into(), Value::from(self.cwd.display().to_string()));
+        root.insert("language".into(), Value::from(self.language));
         root.insert(
             "tools".into(),
             Value::from(
@@ -328,6 +331,7 @@ mod tests {
         SystemPromptContext {
             now: fixed_now(),
             cwd,
+            language: manifest::defaults::WORKER_LANGUAGE,
             scope,
             tool_names: tools,
             agents_md,
@@ -345,6 +349,7 @@ mod tests {
         SystemPromptContext {
             now: fixed_now(),
             cwd,
+            language: manifest::defaults::WORKER_LANGUAGE,
             scope,
             tool_names: Vec::new(),
             agents_md: None,
@@ -380,6 +385,9 @@ mod tests {
         let rendered = tmpl
             .render(&ctx(dir.path(), &scope, vec!["Read".into()], None))
             .unwrap();
+        // Builtin default body must expose the language policy.
+        assert!(rendered.contains("## Language"));
+        assert!(rendered.contains("`language`: `match the user's language"));
         // Trailing section must be present.
         assert!(rendered.contains("## Working boundaries"));
         assert!(rendered.contains("Readable:"));

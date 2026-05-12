@@ -643,6 +643,7 @@ permission = "write"
         let ctx = SystemPromptContext {
             now: chrono::Utc::now(),
             cwd: &root,
+            language: manifest::defaults::WORKER_LANGUAGE,
             scope: &scope,
             tool_names: Vec::new(),
             agents_md: None,

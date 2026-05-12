@@ -66,6 +66,8 @@ pub struct WorkerManifestConfig {
     #[serde(default)]
     pub instruction: Option<String>,
     #[serde(default)]
+    pub language: Option<String>,
+    #[serde(default)]
     pub max_tokens: Option<u32>,
     #[serde(default)]
     pub max_turns: Option<NonZeroU32>,
@@ -291,6 +293,7 @@ impl WorkerManifestConfig {
     fn merge(self, upper: Self) -> Self {
         Self {
             instruction: upper.instruction.or(self.instruction),
+            language: upper.language.or(self.language),
             max_tokens: upper.max_tokens.or(self.max_tokens),
             max_turns: upper.max_turns.or(self.max_turns),
             temperature: upper.temperature.or(self.temperature),
@@ -429,6 +432,10 @@ impl TryFrom<PodManifestConfig> for PodManifest {
                 .worker
                 .instruction
                 .unwrap_or_else(|| defaults::DEFAULT_INSTRUCTION.to_string()),
+            language: cfg
+                .worker
+                .language
+                .unwrap_or_else(|| defaults::WORKER_LANGUAGE.to_string()),
             max_tokens: cfg.worker.max_tokens,
             max_turns: cfg.worker.max_turns,
             temperature: cfg.worker.temperature,

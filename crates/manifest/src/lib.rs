@@ -173,6 +173,12 @@ pub struct WorkerManifest {
     /// unset manifests fall through to [`defaults::DEFAULT_INSTRUCTION`].
     #[serde(default = "default_instruction")]
     pub instruction: String,
+    /// Language policy used by the main worker for normal prose responses.
+    /// Free-form so workspaces can use names like `English`, `Japanese`,
+    /// locale tags, or a policy phrase. Unset manifests fall through to
+    /// [`defaults::WORKER_LANGUAGE`].
+    #[serde(default = "default_worker_language")]
+    pub language: String,
     #[serde(default)]
     pub max_tokens: Option<u32>,
     #[serde(default)]
@@ -239,6 +245,10 @@ fn default_file_upload_max_bytes() -> usize {
 
 fn default_instruction() -> String {
     defaults::DEFAULT_INSTRUCTION.to_string()
+}
+
+fn default_worker_language() -> String {
+    defaults::WORKER_LANGUAGE.to_string()
 }
 
 impl Default for ToolOutputLimits {
@@ -687,6 +697,16 @@ model_id = "claude-sonnet-4-20250514"
             manifest.worker.file_upload.max_bytes,
             defaults::FILE_UPLOAD_MAX_BYTES
         );
+    }
+
+    #[test]
+    fn worker_language_defaults_and_parses() {
+        let manifest = PodManifest::from_toml(MINIMAL_REQUIRED).unwrap();
+        assert_eq!(manifest.worker.language, defaults::WORKER_LANGUAGE);
+
+        let toml = MINIMAL_REQUIRED.replace("[worker]\n", "[worker]\nlanguage = \"Japanese\"\n");
+        let manifest = PodManifest::from_toml(&toml).unwrap();
+        assert_eq!(manifest.worker.language, "Japanese");
     }
 
     #[test]
