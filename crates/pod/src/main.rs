@@ -1,21 +1,24 @@
-use std::path::PathBuf;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
-use manifest::paths;
-use pod::{Pod, PodController, PodFactory};
+use manifest::{PodManifest, paths};
+use pod::{Pod, PodController, PodFactory, PromptLoader};
 use session_store::{FsStore, SessionId};
 
-#[derive(Parser)]
+const USER_MANIFEST_ENV: &str = "INSOMNIA_USER_MANIFEST";
+
+#[derive(Debug, Parser)]
 #[command(
     name = "pod",
-    about = "Spawn a Pod process from cascaded manifest layers"
+    about = "Spawn a Pod process from manifest layers or a single manifest file"
 )]
 struct Cli {
-    /// User manifest TOML. Defaults to `<config_dir>/manifest.toml`
-    /// (see `manifest::paths`).
-    #[arg(long, value_name = "PATH")]
-    user_manifest: Option<PathBuf>,
+    /// Manifest TOML to use directly, without loading user, project, or
+    /// overlay layers.
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["project", "overlay"])]
+    manifest: Option<PathBuf>,
 
     /// Start the project-manifest walk from this directory. When
     /// omitted, the factory walks up from the current working
@@ -53,10 +56,56 @@ struct Cli {
     session: Option<SessionId>,
 }
 
-async fn build_factory(cli: &Cli) -> Result<PodFactory, String> {
+fn resolve_manifest(cli: &Cli) -> Result<(PodManifest, PromptLoader), String> {
+    resolve_manifest_with_user_manifest_env(cli, std::env::var_os(USER_MANIFEST_ENV))
+}
+
+fn resolve_manifest_with_user_manifest_env(
+    cli: &Cli,
+    user_manifest_env: Option<OsString>,
+) -> Result<(PodManifest, PromptLoader), String> {
+    let user_manifest = user_manifest_path_from_env(user_manifest_env);
+
+    if let Some(path) = &cli.manifest {
+        if user_manifest.is_some() {
+            return Err(format!(
+                "--manifest cannot be used when {USER_MANIFEST_ENV} is set"
+            ));
+        }
+        return load_single_manifest(path);
+    }
+
+    let factory = build_factory_with_user_manifest_path(cli, user_manifest)?;
+    factory
+        .resolve()
+        .map_err(|e| format!("failed to resolve manifest cascade: {e}"))
+}
+
+fn user_manifest_path_from_env(value: Option<OsString>) -> Option<PathBuf> {
+    value.and_then(|value| {
+        if value.is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(value))
+        }
+    })
+}
+
+fn load_single_manifest(path: &Path) -> Result<(PodManifest, PromptLoader), String> {
+    let toml = std::fs::read_to_string(path)
+        .map_err(|e| format!("failed to read manifest {}: {e}", path.display()))?;
+    let manifest = PodManifest::from_toml(&toml)
+        .map_err(|e| format!("failed to parse manifest {}: {e}", path.display()))?;
+    Ok((manifest, PromptLoader::builtins_only()))
+}
+
+fn build_factory_with_user_manifest_path(
+    cli: &Cli,
+    user_manifest: Option<PathBuf>,
+) -> Result<PodFactory, String> {
     let mut factory = PodFactory::new();
 
-    factory = match &cli.user_manifest {
+    factory = match user_manifest {
         Some(path) => factory
             .with_user_manifest(path)
             .map_err(|e| format!("failed to load user manifest: {e}"))?,
@@ -87,18 +136,10 @@ async fn build_factory(cli: &Cli) -> Result<PodFactory, String> {
 async fn main() -> ExitCode {
     let cli = Cli::parse();
 
-    let factory = match build_factory(&cli).await {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("error: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    let (manifest, loader) = match factory.resolve() {
+    let (manifest, loader) = match resolve_manifest(&cli) {
         Ok(pair) => pair,
         Err(e) => {
-            eprintln!("error: failed to resolve manifest cascade: {e}");
+            eprintln!("error: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -201,4 +242,128 @@ async fn main() -> ExitCode {
 
     drop(handle);
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn write(path: &Path, contents: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, contents).unwrap();
+    }
+
+    fn manifest_toml(name: &str, scope: &Path) -> String {
+        format!(
+            r#"
+[pod]
+name = "{name}"
+
+[model]
+scheme = "anthropic"
+model_id = "test-model"
+
+[worker]
+
+[[scope.allow]]
+target = "{scope}"
+permission = "write"
+"#,
+            scope = scope.display()
+        )
+    }
+
+    #[test]
+    fn user_manifest_flag_is_not_accepted() {
+        let err = Cli::try_parse_from(["pod", "--user-manifest", "manifest.toml"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+
+    #[test]
+    fn manifest_conflicts_with_project_and_overlay() {
+        let project_err =
+            Cli::try_parse_from(["pod", "--manifest", "manifest.toml", "--project", "."])
+                .unwrap_err();
+        assert_eq!(project_err.kind(), clap::error::ErrorKind::ArgumentConflict);
+
+        let overlay_err = Cli::try_parse_from([
+            "pod",
+            "--manifest",
+            "manifest.toml",
+            "--overlay",
+            "pod.name = 'x'",
+        ])
+        .unwrap_err();
+        assert_eq!(overlay_err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn manifest_conflicts_with_user_manifest_env_when_env_is_non_empty() {
+        let tmp = TempDir::new().unwrap();
+        let manifest = tmp.path().join("manifest.toml");
+        write(&manifest, &manifest_toml("single", tmp.path()));
+        let cli = Cli::try_parse_from(["pod", "--manifest", manifest.to_str().unwrap()]).unwrap();
+
+        let err = resolve_manifest_with_user_manifest_env(&cli, Some(OsString::from("user.toml")))
+            .unwrap_err();
+
+        assert!(err.contains("--manifest cannot be used"));
+        assert!(err.contains(USER_MANIFEST_ENV));
+    }
+
+    #[test]
+    fn manifest_allows_empty_user_manifest_env() {
+        let tmp = TempDir::new().unwrap();
+        let manifest = tmp.path().join("manifest.toml");
+        write(&manifest, &manifest_toml("single", tmp.path()));
+        let cli = Cli::try_parse_from(["pod", "--manifest", manifest.to_str().unwrap()]).unwrap();
+
+        let (manifest, loader) =
+            resolve_manifest_with_user_manifest_env(&cli, Some(OsString::new())).unwrap();
+
+        assert_eq!(manifest.pod.name, "single");
+        assert!(loader.user_dir().is_none());
+        assert!(loader.workspace_dir().is_none());
+    }
+
+    #[test]
+    fn user_manifest_env_overrides_auto_user_manifest_path() {
+        let tmp = TempDir::new().unwrap();
+        let user_manifest = tmp.path().join("custom-user.toml");
+        write(&user_manifest, &manifest_toml("from-env", tmp.path()));
+        let no_project_root = tmp.path().join("no-project");
+        std::fs::create_dir_all(&no_project_root).unwrap();
+        let cli =
+            Cli::try_parse_from(["pod", "--project", no_project_root.to_str().unwrap()]).unwrap();
+
+        let (manifest, _loader) = resolve_manifest_with_user_manifest_env(
+            &cli,
+            Some(user_manifest.as_os_str().to_os_string()),
+        )
+        .unwrap();
+
+        assert_eq!(manifest.pod.name, "from-env");
+    }
+
+    #[test]
+    fn manifest_mode_loads_single_file_with_minimal_prompt_loader() {
+        let tmp = TempDir::new().unwrap();
+        let single_manifest = tmp.path().join("single.toml");
+        write(&single_manifest, &manifest_toml("single-file", tmp.path()));
+        std::fs::create_dir_all(tmp.path().join("prompts")).unwrap();
+        std::fs::create_dir_all(tmp.path().join(".insomnia").join("prompts")).unwrap();
+        let cli =
+            Cli::try_parse_from(["pod", "--manifest", single_manifest.to_str().unwrap()]).unwrap();
+
+        let (manifest, loader) = resolve_manifest_with_user_manifest_env(&cli, None).unwrap();
+
+        assert_eq!(manifest.pod.name, "single-file");
+        assert!(loader.user_dir().is_none());
+        assert!(loader.workspace_dir().is_none());
+        assert!(loader.user_pack_file().is_none());
+        assert!(loader.workspace_pack_file().is_none());
+    }
 }
