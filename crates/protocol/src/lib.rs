@@ -124,9 +124,10 @@ pub enum Segment {
         lines: u32,
         content: String,
     },
-    /// `@<path>` file reference. Pod resolves to scope-checked file
-    /// content when a resolver is registered (resolver implementation
-    /// out of scope for this ticket).
+    /// `@<path>` file-system reference. Pod resolves readable files to
+    /// `[File: <path>]` attachments and readable normal directories to shallow
+    /// `[Dir: <path>]` listings; the flattened user text keeps the literal
+    /// `@<path>` placeholder either way.
     FileRef { path: String },
     /// `#<slug>` Knowledge reference (see `docs/plan/memory.md`).
     KnowledgeRef { slug: String },
@@ -153,9 +154,9 @@ impl Segment {
     /// Sigil-prefixed variants (`FileRef` / `KnowledgeRef` / `WorkflowInvoke`)
     /// flatten back to their literal sigil form (`@<path>`, `#<slug>`,
     /// `/<slug>`) — matching what the user originally typed. Resolved
-    /// content (e.g. file body for `FileRef`) is delivered as separate
-    /// `Item::system_message`s adjacent to the user message; the
-    /// resolution itself is the caller's job. `Unknown` falls back to
+    /// content (e.g. file body or shallow directory listing for `FileRef`) is
+    /// delivered as separate `Item::system_message`s adjacent to the user
+    /// message; the resolution itself is the caller's job. `Unknown` falls back to
     /// a bracketed placeholder since there is no sigil to render.
     pub fn flatten_to_text(segments: &[Segment]) -> String {
         let mut out = String::new();

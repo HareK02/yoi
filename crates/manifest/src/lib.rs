@@ -200,6 +200,8 @@ pub struct WorkerManifest {
     #[serde(default)]
     pub tool_output: ToolOutputLimits,
     /// Byte-size cap applied to submit-time FileRef uploads / attachments.
+    /// For file refs this caps the file body; for normal directory refs this
+    /// caps the rendered shallow listing body.
     /// This is intentionally separate from tool-output truncation because
     /// user-requested file attachments can usually tolerate a larger budget.
     #[serde(default)]
@@ -226,11 +228,13 @@ pub struct ToolOutputLimits {
 /// Byte-size cap for submit-time FileRef uploads / attachments.
 ///
 /// This governs the `[File: <path>]` system-message attachment produced
-/// when a user explicitly submits a `@<path>` reference. It does not affect
-/// tool result truncation; see [`ToolOutputLimits`] for that path.
+/// when a user explicitly submits a `@<path>` file reference, and the
+/// rendered body of a shallow `[Dir: <path>]` listing for a normal directory
+/// reference. It does not affect tool result truncation; see
+/// [`ToolOutputLimits`] for that path.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileUploadLimits {
-    /// Cap applied to each resolved FileRef body.
+    /// Cap applied to each resolved FileRef file body or directory-listing body.
     #[serde(default = "default_file_upload_max_bytes")]
     pub max_bytes: usize,
 }
