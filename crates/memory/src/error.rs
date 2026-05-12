@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 
+use lint_common::RecordLintError;
 use thiserror::Error;
 
 /// Top-level error for memory operations that don't fit the lint flow.
@@ -40,14 +41,8 @@ pub enum LintError {
     #[error("path is for a different record kind than expected at this location: {}", .0.display())]
     WrongRecordKind(PathBuf),
 
-    #[error("invalid slug `{0}`: must match ^[a-z0-9](?:[a-z0-9-]{{0,62}}[a-z0-9])?$")]
-    InvalidSlug(String),
-
-    #[error("malformed frontmatter: {0}")]
-    MalformedFrontmatter(String),
-
-    #[error("frontmatter is missing or document is empty")]
-    MissingFrontmatter,
+    #[error(transparent)]
+    Record(#[from] RecordLintError),
 
     #[error("missing required frontmatter field: `{0}`")]
     MissingField(&'static str),

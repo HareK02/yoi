@@ -9,10 +9,10 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::Path;
 
+use crate::Slug;
 use crate::schema::{
     DecisionFrontmatter, KnowledgeFrontmatter, RequestFrontmatter, split_frontmatter,
 };
-use crate::slug::Slug;
 use crate::workspace::{RecordKind, WorkspaceLayout};
 
 /// Snapshot of every record currently on disk under the workspace.

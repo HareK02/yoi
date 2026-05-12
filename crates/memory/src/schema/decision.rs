@@ -3,8 +3,8 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::Slug;
 use crate::schema::common::{Frontmatter, SourceRef};
-use crate::slug::Slug;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -27,10 +27,10 @@ pub struct DecisionFrontmatter {
 impl Frontmatter for DecisionFrontmatter {
     const BODY_LIMIT: usize = 8000;
 
-    fn created_at(&self) -> DateTime<Utc> {
-        self.created_at
+    fn created_at(&self) -> Option<DateTime<Utc>> {
+        Some(self.created_at)
     }
-    fn updated_at(&self) -> DateTime<Utc> {
-        self.updated_at
+    fn updated_at(&self) -> Option<DateTime<Utc>> {
+        Some(self.updated_at)
     }
 }

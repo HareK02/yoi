@@ -15,6 +15,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
+use lint_common::RecordLintError;
 use serde::Deserialize;
 use thiserror::Error;
 use tracing::warn;
@@ -150,7 +151,9 @@ pub fn parse_skill_md(skill_md_path: &Path) -> Result<SkillRecord, SkillParseErr
     let frontmatter: SkillFrontmatter =
         serde_yaml::from_str(yaml).map_err(|err| SkillParseError::Frontmatter {
             path: skill_md_path.to_path_buf(),
-            source: WorkflowLintError::MalformedFrontmatter(err.to_string()),
+            source: WorkflowLintError::Record(RecordLintError::MalformedFrontmatter(
+                err.to_string(),
+            )),
         })?;
 
     if frontmatter.allowed_tools.is_some() {
@@ -183,7 +186,7 @@ pub fn parse_skill_md(skill_md_path: &Path) -> Result<SkillRecord, SkillParseErr
     }
     let slug = Slug::parse(frontmatter.name).map_err(|source| SkillParseError::InvalidName {
         skill_md_path: skill_md_path.to_path_buf(),
-        source,
+        source: source.into(),
     })?;
 
     Ok(SkillRecord {

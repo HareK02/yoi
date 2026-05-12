@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use llm_worker::tool::ToolError;
 use serde::Deserialize;
 
-use crate::slug::Slug;
+use crate::Slug;
 use crate::workspace::{RecordKind, WorkspaceLayout};
 
 pub use edit::edit_tool;

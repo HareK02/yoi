@@ -13,10 +13,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::Slug;
 use crate::schema::{
     DecisionFrontmatter, KnowledgeFrontmatter, RequestFrontmatter, split_frontmatter,
 };
-use crate::slug::Slug;
 use crate::workspace::{RecordKind, WorkspaceLayout};
 
 /// `sources` overflow を flag する閾値。`linter::warnings::SOURCES_OVERFLOW_THRESHOLD`

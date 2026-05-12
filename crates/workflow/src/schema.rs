@@ -1,6 +1,7 @@
 //! Workflow frontmatter schema and frontmatter splitting helpers.
 
 use chrono::{DateTime, Utc};
+use lint_common::Frontmatter;
 use serde::{Deserialize, Serialize};
 
 use crate::{Slug, WorkflowLintError};
@@ -24,42 +25,31 @@ pub struct WorkflowFrontmatter {
     pub requires: Vec<Slug>,
 }
 
+impl Frontmatter for WorkflowFrontmatter {
+    const BODY_LIMIT: usize = WORKFLOW_BODY_LIMIT;
+
+    fn created_at(&self) -> Option<DateTime<Utc>> {
+        self.created_at
+    }
+
+    fn updated_at(&self) -> Option<DateTime<Utc>> {
+        self.updated_at
+    }
+}
+
 fn default_user_invocable() -> bool {
     true
 }
 
-const FRONTMATTER_DELIM: &str = "---";
-
 /// Split a markdown document into `(yaml_frontmatter, body)`.
 pub fn split_frontmatter(content: &str) -> Result<(&str, &str), WorkflowLintError> {
-    let after_open = content
-        .strip_prefix(FRONTMATTER_DELIM)
-        .and_then(|s| s.strip_prefix('\n').or(Some(s)))
-        .ok_or(WorkflowLintError::MissingFrontmatter)?;
-
-    let mut yaml_end = None;
-    let mut byte_offset = 0usize;
-    for line in after_open.split_inclusive('\n') {
-        let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
-        if trimmed == FRONTMATTER_DELIM {
-            yaml_end = Some((byte_offset, byte_offset + line.len()));
-            break;
-        }
-        byte_offset += line.len();
-    }
-
-    let (yaml_end_excl, body_start) = yaml_end.ok_or_else(|| {
-        WorkflowLintError::MalformedFrontmatter("missing closing `---` line".to_string())
-    })?;
-
-    let yaml = &after_open[..yaml_end_excl];
-    let body = &after_open[body_start..];
-    Ok((yaml, body))
+    lint_common::split_frontmatter(content).map_err(Into::into)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lint_common::RecordLintError;
 
     #[test]
     fn splits_simple() {
@@ -72,13 +62,19 @@ mod tests {
     #[test]
     fn no_leading_delim_errors() {
         let err = split_frontmatter("hello").unwrap_err();
-        assert!(matches!(err, WorkflowLintError::MissingFrontmatter));
+        assert!(matches!(
+            err,
+            WorkflowLintError::Record(RecordLintError::MissingFrontmatter)
+        ));
     }
 
     #[test]
     fn no_closing_delim_errors() {
         let err = split_frontmatter("---\nfoo: 1\nno close\n").unwrap_err();
-        assert!(matches!(err, WorkflowLintError::MalformedFrontmatter(_)));
+        assert!(matches!(
+            err,
+            WorkflowLintError::Record(RecordLintError::MalformedFrontmatter(_))
+        ));
     }
 
     #[test]

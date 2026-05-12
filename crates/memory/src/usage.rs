@@ -227,7 +227,7 @@ fn record_path(
     }
 }
 
-fn invalid_slug_error(err: crate::LintError) -> io::Error {
+fn invalid_slug_error(err: lint_common::RecordLintError) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, err)
 }
 

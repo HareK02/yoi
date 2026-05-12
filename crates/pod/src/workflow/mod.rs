@@ -77,7 +77,8 @@ pub fn resolve_workflow_invocation(
     layout: &WorkspaceLayout,
     raw_slug: &str,
 ) -> Result<Vec<Item>, WorkflowResolveError> {
-    let slug = Slug::parse(raw_slug.to_string()).map_err(WorkflowResolveError::InvalidSlug)?;
+    let slug = Slug::parse(raw_slug.to_string())
+        .map_err(|source| WorkflowResolveError::InvalidSlug(source.into()))?;
     let record = registry
         .get(&slug)
         .ok_or_else(|| WorkflowResolveError::NotFound {

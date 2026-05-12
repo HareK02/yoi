@@ -13,6 +13,7 @@ use thiserror::Error;
 use tracing::warn;
 
 use crate::schema::{WorkflowFrontmatter, split_frontmatter};
+use lint_common::RecordLintError;
 use memory::WorkspaceLayout;
 
 use crate::{Slug, WorkflowLintError};
@@ -218,7 +219,7 @@ pub fn load_workflows(layout: &WorkspaceLayout) -> Result<WorkflowRegistry, Work
         let slug =
             Slug::parse(stem.to_string()).map_err(|source| WorkflowLoadError::InvalidSlug {
                 path: path.clone(),
-                source,
+                source: source.into(),
             })?;
         if records.contains_key(&slug) {
             warn!(slug = %slug, path = %path.display(), "duplicate workflow slug encountered; keeping first record");
@@ -292,7 +293,7 @@ fn map_serde_workflow_error(err: serde_yaml::Error) -> WorkflowLintError {
     if let Some(field) = parse_missing_field(&msg) {
         return WorkflowLintError::MissingField(field);
     }
-    WorkflowLintError::MalformedFrontmatter(msg)
+    WorkflowLintError::Record(RecordLintError::MalformedFrontmatter(msg))
 }
 
 fn parse_missing_field(msg: &str) -> Option<&'static str> {

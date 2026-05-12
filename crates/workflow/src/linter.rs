@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use memory::WorkspaceLayout;
 
 use crate::{Slug, WorkflowLintError};
+use lint_common::RecordLintError;
 use serde::de::DeserializeOwned;
 
 use crate::schema::{WORKFLOW_BODY_LIMIT, WorkflowFrontmatter, split_frontmatter};
@@ -74,9 +75,11 @@ impl WorkflowLinter {
         let knowledge = match scan_knowledge_slugs(&self.layout) {
             Ok(knowledge) => knowledge,
             Err(err) => {
-                report.push_error(WorkflowLintError::MalformedFrontmatter(format!(
-                    "failed to scan existing Knowledge records: {err}"
-                )));
+                report.push_error(WorkflowLintError::Record(
+                    RecordLintError::MalformedFrontmatter(format!(
+                        "failed to scan existing Knowledge records: {err}"
+                    )),
+                ));
                 return report;
             }
         };
@@ -109,7 +112,7 @@ fn parse_frontmatter<F: DeserializeOwned>(
         if let Some(field) = parse_missing_field(&msg) {
             WorkflowLintError::MissingField(field)
         } else {
-            WorkflowLintError::MalformedFrontmatter(msg)
+            WorkflowLintError::Record(RecordLintError::MalformedFrontmatter(msg))
         }
     })?;
     Ok(Parsed { frontmatter, body })

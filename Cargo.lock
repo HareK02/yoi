@@ -1616,6 +1616,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "lint-common"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.4.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1779,6 +1789,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "libc",
+ "lint-common",
  "llm-worker",
  "manifest",
  "schemars",
@@ -4404,6 +4415,7 @@ name = "workflow"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "lint-common",
  "manifest",
  "memory",
  "serde",

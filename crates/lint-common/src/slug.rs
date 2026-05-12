@@ -12,7 +12,7 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::WorkflowLintError;
+use crate::RecordLintError;
 
 const MIN_LEN: usize = 1;
 const MAX_LEN: usize = 64;
@@ -23,13 +23,13 @@ const MAX_LEN: usize = 64;
 pub struct Slug(String);
 
 impl Slug {
-    /// Parse and validate. Returns [`WorkflowLintError::InvalidSlug`] on rejection.
-    pub fn parse(s: impl Into<String>) -> Result<Self, WorkflowLintError> {
+    /// Parse and validate. Returns [`RecordLintError::InvalidSlug`] on rejection.
+    pub fn parse(s: impl Into<String>) -> Result<Self, RecordLintError> {
         let s = s.into();
         if is_valid_slug(&s) {
             Ok(Self(s))
         } else {
-            Err(WorkflowLintError::InvalidSlug(s))
+            Err(RecordLintError::InvalidSlug(s))
         }
     }
 
@@ -55,7 +55,7 @@ impl AsRef<str> for Slug {
 }
 
 impl FromStr for Slug {
-    type Err = WorkflowLintError;
+    type Err = RecordLintError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Self::parse(s)
