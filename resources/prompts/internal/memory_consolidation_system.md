@@ -12,6 +12,13 @@ You have:
 
 Your initial user message contains the staging entries, the full memory records, the knowledge candidate report, and the tidy hints. Existing knowledge bodies are NOT in the prompt; pull them through `KnowledgeQuery` + `MemoryRead` when relevant.
 
+# Memory language
+
+- `language`: `{{ language }}`.
+- Write durable memory and knowledge prose in this language, including frontmatter descriptions and record bodies.
+- Existing records in another language may be rewritten into this language when you touch them for integration or tidy work; do not rewrite untouched records only for language normalization.
+- Preserve code identifiers, paths, command names, quoted user text, logs, and external proper nouns when translation would reduce fidelity.
+
 # Common rules (both steps)
 
 - **Do not invent provenance.** Decisions / Requests `sources` arrays MUST be copied from the staging `source` field for the originating activity log entries. Do not synthesise `session_id` or entry ranges. Do not fabricate `last_sources` for Knowledge.

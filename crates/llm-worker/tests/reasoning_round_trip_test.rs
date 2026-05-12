@@ -16,9 +16,7 @@ mod common;
 use common::MockLlmClient;
 use llm_worker::Item;
 use llm_worker::Worker;
-use llm_worker::llm_client::event::{
-    Event, ReasoningItemEvent, ResponseStatus, StatusEvent,
-};
+use llm_worker::llm_client::event::{Event, ReasoningItemEvent, ResponseStatus, StatusEvent};
 
 /// Anthropic 風: thinking ブロック → text → 終了 のシーケンス。
 /// Worker history に Reasoning(signature 付き) → assistant_message が並ぶ。

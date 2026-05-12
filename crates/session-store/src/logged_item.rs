@@ -325,7 +325,8 @@ mod tests {
     fn legacy_reasoning_without_signature_field_deserializes() {
         // signature フィールドが無い旧形式の history.json を読み込んでも
         // None としてロードできる（後方互換性）。
-        let legacy_json = r#"{"kind":"reasoning","text":"old","summary":[],"encrypted_content":null}"#;
+        let legacy_json =
+            r#"{"kind":"reasoning","text":"old","summary":[],"encrypted_content":null}"#;
         let parsed: LoggedItem = serde_json::from_str(legacy_json).unwrap();
         match Item::from(parsed) {
             Item::Reasoning {

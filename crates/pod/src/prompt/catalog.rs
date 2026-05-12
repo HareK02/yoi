@@ -311,14 +311,17 @@ impl PromptCatalog {
         self.render(PodPrompt::CompactSystem, Value::UNDEFINED)
     }
 
-    /// Render `PodPrompt::MemoryExtractSystem` (no inputs).
-    pub fn memory_extract_system(&self) -> Result<String, CatalogError> {
-        self.render(PodPrompt::MemoryExtractSystem, Value::UNDEFINED)
+    /// Render `PodPrompt::MemoryExtractSystem` with `{{ language }}`.
+    pub fn memory_extract_system(&self, language: &str) -> Result<String, CatalogError> {
+        self.render(PodPrompt::MemoryExtractSystem, single("language", language))
     }
 
-    /// Render `PodPrompt::MemoryConsolidationSystem` (no inputs).
-    pub fn memory_consolidation_system(&self) -> Result<String, CatalogError> {
-        self.render(PodPrompt::MemoryConsolidationSystem, Value::UNDEFINED)
+    /// Render `PodPrompt::MemoryConsolidationSystem` with `{{ language }}`.
+    pub fn memory_consolidation_system(&self, language: &str) -> Result<String, CatalogError> {
+        self.render(
+            PodPrompt::MemoryConsolidationSystem,
+            single("language", language),
+        )
     }
 
     /// Render `PodPrompt::NotifyWrapper` with `{{ message }}`.
@@ -486,6 +489,15 @@ mod tests {
         let rendered = cat.compact_system().unwrap();
         assert!(rendered.contains("write_summary"));
         assert!(rendered.contains("mark_read_required"));
+    }
+
+    #[test]
+    fn memory_worker_prompts_include_language() {
+        let cat = PromptCatalog::builtins_only().unwrap();
+        let extract = cat.memory_extract_system("Japanese").unwrap();
+        let consolidate = cat.memory_consolidation_system("Japanese").unwrap();
+        assert!(extract.contains("`language`: `Japanese`"));
+        assert!(consolidate.contains("`language`: `Japanese`"));
     }
 
     #[test]

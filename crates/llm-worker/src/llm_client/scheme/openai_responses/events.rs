@@ -458,7 +458,10 @@ pub(crate) fn parse_sse(
         "response.reasoning_text.delta" => {
             let ev: ReasoningTextDelta = from_json(data)?;
             // round-trip 用に蓄積
-            state.ensure_reasoning(ev.output_index).text.push_str(&ev.delta);
+            state
+                .ensure_reasoning(ev.output_index)
+                .text
+                .push_str(&ev.delta);
             Ok(ensure_and_delta(
                 state,
                 SlotKey::ContentPart {

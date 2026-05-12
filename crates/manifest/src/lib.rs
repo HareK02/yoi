@@ -96,6 +96,12 @@ pub struct MemoryConfig {
     /// Ignored when the request omits `query`. `None` ⇒ tool default (3).
     #[serde(default)]
     pub query_excerpt_lines: Option<usize>,
+    /// Language used by memory extraction / consolidation workers for durable
+    /// memory and knowledge text. Free-form so workspaces can use names like
+    /// `English`, `Japanese`, or locale tags. `None` ⇒
+    /// [`defaults::MEMORY_LANGUAGE`].
+    #[serde(default)]
+    pub language: Option<String>,
     /// Optional model for the extract worker. When `None`,
     /// the main pod model is cloned via `clone_boxed()`. Lightweight
     /// reasoning-capable models (Haiku / 4o-mini / Flash class) are
@@ -654,6 +660,14 @@ model_id = "claude-sonnet-4-20250514"
             mem.workspace_root.unwrap(),
             std::path::PathBuf::from("/some/where")
         );
+    }
+
+    #[test]
+    fn memory_section_with_language() {
+        let toml = format!("{MINIMAL_REQUIRED}\n[memory]\nlanguage = \"Japanese\"\n");
+        let manifest = PodManifest::from_toml(&toml).unwrap();
+        let mem = manifest.memory.unwrap();
+        assert_eq!(mem.language.as_deref(), Some("Japanese"));
     }
 
     #[test]

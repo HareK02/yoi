@@ -47,7 +47,9 @@ pub enum SpawnError {
     /// runtime ディレクトリが解決できなかった (環境変数未設定等)。
     RuntimeDirUnavailable,
     PodLaunchFailed(io::Error),
-    PodExitedEarly { stderr_tail: String },
+    PodExitedEarly {
+        stderr_tail: String,
+    },
     Timeout,
 }
 
@@ -88,10 +90,7 @@ impl From<io::Error> for SpawnError {
 ///
 /// `progress` は ready 行を見つけるまでに観測した stderr の各行で呼ばれる
 /// (ready 行自体は除外される)。UI の表示更新や E2E ログ取得に使う。
-pub async fn spawn_pod<F>(
-    config: SpawnConfig,
-    mut progress: F,
-) -> Result<SpawnReady, SpawnError>
+pub async fn spawn_pod<F>(config: SpawnConfig, mut progress: F) -> Result<SpawnReady, SpawnError>
 where
     F: FnMut(&str),
 {

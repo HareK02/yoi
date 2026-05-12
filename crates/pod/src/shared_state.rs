@@ -280,10 +280,7 @@ mod tests {
         assert_eq!(all.len(), 3);
         let alpha = state.list_knowledge_completions("alpha");
         assert_eq!(
-            alpha
-                .iter()
-                .map(|c| c.slug.as_str())
-                .collect::<Vec<_>>(),
+            alpha.iter().map(|c| c.slug.as_str()).collect::<Vec<_>>(),
             vec!["alpha", "alphabet"]
         );
         assert!(state.list_knowledge_completions("zzz").is_empty());

@@ -316,7 +316,8 @@ impl AnthropicScheme {
                 });
                 match &raw.content_block {
                     ContentBlock::Thinking {
-                        thinking, signature,
+                        thinking,
+                        signature,
                     } => {
                         state.pending_thinking = Some(PendingThinking {
                             text: thinking.clone(),
@@ -372,10 +373,7 @@ impl AnthropicScheme {
             }
             AnthropicEventType::ContentBlockStop => {
                 let raw: ContentBlockStopEvent = serde_json::from_str(data)?;
-                let block_type = state
-                    .current_block_type
-                    .take()
-                    .unwrap_or(BlockType::Text);
+                let block_type = state.current_block_type.take().unwrap_or(BlockType::Text);
                 emitted.push(Event::BlockStop(BlockStop {
                     index: raw.index,
                     block_type,

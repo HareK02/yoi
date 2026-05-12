@@ -309,10 +309,7 @@ mod tests {
         s.apply_system_message_text(&text);
         let t = &s.tasks()[0];
         assert_eq!(t.subject, "subject with\nembedded newline");
-        assert_eq!(
-            t.description,
-            "desc:\n  status: not-actually-a-field"
-        );
+        assert_eq!(t.description, "desc:\n  status: not-actually-a-field");
     }
 }
 

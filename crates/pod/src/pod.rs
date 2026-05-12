@@ -2075,9 +2075,10 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             .or(manifest::defaults::MEMORY_EXTRACT_WORKER_MAX_TURNS);
 
         let client = self.build_extractor_client(memory_cfg)?;
+        let memory_language = memory_language(memory_cfg);
         let extract_system_prompt = self
             .prompts
-            .memory_extract_system()
+            .memory_extract_system(memory_language)
             .map_err(PodError::PromptCatalog)?;
         let mut extract_worker = Worker::new(client).system_prompt(extract_system_prompt);
         extract_worker.set_cache_key(Some(self.session_id.to_string()));
@@ -2276,13 +2277,15 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 return Err(e);
             }
         };
-        let consolidation_system_prompt = match self.prompts.memory_consolidation_system() {
-            Ok(p) => p,
-            Err(e) => {
-                lock.release_only();
-                return Err(PodError::PromptCatalog(e));
-            }
-        };
+        let memory_language = memory_language(memory_cfg);
+        let consolidation_system_prompt =
+            match self.prompts.memory_consolidation_system(memory_language) {
+                Ok(p) => p,
+                Err(e) => {
+                    lock.release_only();
+                    return Err(PodError::PromptCatalog(e));
+                }
+            };
         let mut worker = Worker::new(client).system_prompt(consolidation_system_prompt);
         worker.set_cache_key(Some(self.session_id.to_string()));
 
@@ -2329,6 +2332,14 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             }
         }
     }
+}
+
+fn memory_language(cfg: &manifest::MemoryConfig) -> &str {
+    cfg.language
+        .as_deref()
+        .map(str::trim)
+        .filter(|language| !language.is_empty())
+        .unwrap_or(manifest::defaults::MEMORY_LANGUAGE)
 }
 
 /// Outcome of a single extract iteration. Internal to

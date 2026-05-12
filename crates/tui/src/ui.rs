@@ -165,10 +165,7 @@ fn mini_view_summary_line(counts: TaskCounts, width: u16) -> Line<'static> {
         counts.deleted,
     );
     let shown = truncate_with_ellipsis(&text, width as usize);
-    Line::from(Span::styled(
-        shown,
-        Style::default().fg(Color::DarkGray),
-    ))
+    Line::from(Span::styled(shown, Style::default().fg(Color::DarkGray)))
 }
 
 /// Two-character status marker + the style to render it with. Mirrors
@@ -591,7 +588,10 @@ fn render_block_into(lines: &mut Vec<Line<'static>>, block: &Block, width: u16, 
         }
         Block::AssistantText { text } => match mode {
             Mode::Overview => push_overview_line(lines, text, width, MessageKind::Assistant, ""),
-            _ => lines.extend(crate::markdown::render(text, kind_style(MessageKind::Assistant))),
+            _ => lines.extend(crate::markdown::render(
+                text,
+                kind_style(MessageKind::Assistant),
+            )),
         },
         Block::Thinking(t) => render_thinking(lines, t, width, mode),
         // ToolCall is dispatched in `compute_history` via `tool::render_tool`

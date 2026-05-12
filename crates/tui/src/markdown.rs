@@ -69,7 +69,9 @@ impl Renderer {
 
     fn span_style(&self) -> Style {
         if self.in_inline_code > 0 {
-            return Style::default().fg(Color::Yellow).bg(Color::Rgb(40, 40, 40));
+            return Style::default()
+                .fg(Color::Yellow)
+                .bg(Color::Rgb(40, 40, 40));
         }
         if self.in_code_block {
             return Style::default().fg(Color::Cyan);
@@ -211,10 +213,8 @@ impl Renderer {
             }
             Tag::BlockQuote(_) => {
                 self.emit_blank(out);
-                self.line_prefix.push(Span::styled(
-                    "│ ",
-                    Style::default().fg(Color::DarkGray),
-                ));
+                self.line_prefix
+                    .push(Span::styled("│ ", Style::default().fg(Color::DarkGray)));
             }
             Tag::Strong => self.bold += 1,
             Tag::Emphasis => self.italic += 1,
