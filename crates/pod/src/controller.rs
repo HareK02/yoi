@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use llm_worker::WorkerError;
@@ -19,7 +19,7 @@ use crate::spawn::comm_tools::{
 use crate::spawn::registry::SpawnedPodRegistry;
 use crate::spawn::tool::spawn_pod_tool;
 use protocol::{
-    AlertLevel, AlertSource, ErrorCode, Event, Method, PodStatus, RunResult, TurnResult,
+    AlertLevel, AlertSource, ErrorCode, Event, Method, PodStatus, RunResult, Segment, TurnResult,
 };
 
 fn is_system_message_item(item: &Item) -> bool {
@@ -94,6 +94,17 @@ async fn finish_controller_run<C, St>(
     pod.spawn_post_run_memory_jobs();
 }
 
+/// Pending turn launch staged by an event handler for the next outer-loop
+/// iteration. Each variant carries the input needed by the corresponding
+/// `Pod::*` entry point — `RunForNotification` carries none because
+/// `pod.run_for_notification()` drains the NotifyBuffer on its own.
+enum PendingRun {
+    Run(Vec<Segment>),
+    InterruptAndRun(Vec<Segment>),
+    RunForNotification,
+    Resume,
+}
+
 // ---------------------------------------------------------------------------
 // PodController — actor that owns a Pod
 // ---------------------------------------------------------------------------
@@ -111,35 +122,23 @@ impl PodController {
         C: LlmClient + Clone + 'static,
         St: Store + Clone + 'static,
     {
+        // === 1. Initialization (channels / RuntimeDir / pod-immutable
+        //         snapshots / SpawnedPodRegistry / alerter attach /
+        //         bash-output scope) ===
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-        let (method_tx, mut method_rx) = mpsc::channel::<Method>(32);
+        let (method_tx, method_rx) = mpsc::channel::<Method>(32);
         let (event_tx, _) = broadcast::channel::<Event>(256);
         let alerter = Alerter::new(event_tx.clone());
 
         // Runtime directory is created before tool registration because
         // the spawn-tool factories need its socket path, and before the
-        // initial status/history writes because those writes consume the
-        // greeting we build after registration is complete.
+        // initial status/history writes consume the greeting we build
+        // after registration is complete.
         let runtime_dir =
             Arc::new(RuntimeDir::create(runtime_base, &pod.manifest().pod.name).await?);
 
-        // Snapshot pod-immutable values needed for tool factories so the
-        // mutable worker borrow below doesn't conflict with reads on `pod`.
-        let scope_handle = pod.scope().clone();
-        let pwd_for_tools = pod.pwd().to_path_buf();
         let spawner_name = pod.manifest().pod.name.clone();
-        let spawner_model = pod.manifest().model.clone();
-        let memory_config = pod.manifest().memory.clone();
-
-        // Parent callback socket (this Pod's own parent, used for
-        // `PodEvent` upward reports). `None` for top-level Pods.
         let self_parent_socket = pod.callback_socket().cloned();
-
-        // `SpawnedPodRegistry` is shared between the Pod-orchestration
-        // tools (registered below) and the main loop's `PodEvent`
-        // handler (added later in this function), so hoist its creation
-        // above the worker-borrow block.
-        let spawner_socket = runtime_dir.socket_path();
         let spawned_registry = SpawnedPodRegistry::new(runtime_dir.clone());
 
         // Hand the alerter to the Pod so internal operations (compaction,
@@ -153,11 +152,7 @@ impl PodController {
         // Bash spills long outputs to a per-pod subdir under the runtime
         // dir. Push a recursive `allow(Read)` for that path into the
         // Pod's runtime scope so the agent can `Read` saved files
-        // without polluting the workspace. The Pod's SharedScope is the
-        // single source of truth — every ScopedFs (builtin tools,
-        // fs_view, compact worker) reads from it, and any future scope
-        // mutation (SpawnPod-style revoke, future GrantScope)
-        // propagates through it.
+        // without polluting the workspace.
         let bash_output_dir = runtime_dir.path().join("bash-output");
         std::fs::create_dir_all(&bash_output_dir).map_err(|e| {
             std::io::Error::other(format!(
@@ -172,205 +167,24 @@ impl PodController {
         }])
         .map_err(std::io::Error::other)?;
 
-        // Stashed during tool registration below so we can attach a
-        // `PodFsView` to the shared state once the latter exists.
-        let fs_for_view: tools::ScopedFs;
-        let task_store = pod.task_store();
-        let session_id_for_usage = pod.session_id().to_string();
+        // === 2. Worker event bridge wiring ===
+        wire_event_bridges_on_worker(&mut pod, &event_tx, &alerter);
 
-        let scope_change_sink = pod.scope_change_sink();
-
-        // Register event bridge callbacks on the worker
-        {
-            let worker = pod.worker_mut();
-
-            let tx = event_tx.clone();
-            worker.on_turn_start(move |turn| {
-                let _ = tx.send(Event::TurnStart { turn });
-            });
-
-            let tx = event_tx.clone();
-            worker.on_turn_end(move |turn| {
-                let _ = tx.send(Event::TurnEnd {
-                    turn,
-                    result: TurnResult::Finished,
-                });
-            });
-
-            let tx = event_tx.clone();
-            worker.on_text_block(move |block| {
-                let tx_d = tx.clone();
-                block.on_delta(move |text| {
-                    let _ = tx_d.send(Event::TextDelta {
-                        text: text.to_owned(),
-                    });
-                });
-                let tx_s = tx.clone();
-                block.on_stop(move |text| {
-                    let _ = tx_s.send(Event::TextDone {
-                        text: text.to_owned(),
-                    });
-                });
-            });
-
-            let tx = event_tx.clone();
-            worker.on_thinking_block(move |block| {
-                // Start fires unconditionally so the TUI can show
-                // "Thinking..." even when the provider doesn't emit
-                // plaintext deltas.
-                let _ = tx.send(Event::ThinkingStart);
-                let tx_d = tx.clone();
-                block.on_delta(move |text| {
-                    let _ = tx_d.send(Event::ThinkingDelta {
-                        text: text.to_owned(),
-                    });
-                });
-                let tx_s = tx.clone();
-                block.on_stop(move |text| {
-                    let _ = tx_s.send(Event::ThinkingDone {
-                        text: text.to_owned(),
-                    });
-                });
-            });
-
-            let tx = event_tx.clone();
-            worker.on_tool_use_block(move |start, block| {
-                let _ = tx.send(Event::ToolCallStart {
-                    id: start.id.clone(),
-                    name: start.name.clone(),
-                });
-                let id_for_delta = start.id.clone();
-                let tx_d = tx.clone();
-                block.on_delta(move |json| {
-                    let _ = tx_d.send(Event::ToolCallArgsDelta {
-                        id: id_for_delta.clone(),
-                        json: json.to_owned(),
-                    });
-                });
-                let tx_s = tx.clone();
-                block.on_stop(move |call| {
-                    let _ = tx_s.send(Event::ToolCallDone {
-                        id: call.id.clone(),
-                        name: call.name.clone(),
-                        arguments: call.input.to_string(),
-                    });
-                });
-            });
-
-            let tx = event_tx.clone();
-            worker.on_tool_result(move |result| {
-                let _ = tx.send(Event::ToolResult {
-                    id: result.tool_use_id.clone(),
-                    summary: result.summary.clone(),
-                    output: result.content.clone(),
-                    is_error: result.is_error,
-                });
-            });
-
-            let tx = event_tx.clone();
-            worker.on_usage(move |event| {
-                let _ = tx.send(Event::Usage {
-                    input_tokens: event.input_tokens,
-                    output_tokens: event.output_tokens,
-                    cache_read_input_tokens: event.cache_read_input_tokens,
-                });
-            });
-
-            let tx = event_tx.clone();
-            worker.on_error(move |event| {
-                let _ = tx.send(Event::Error {
-                    code: ErrorCode::ProviderError,
-                    message: event.message.clone(),
-                });
-            });
-
-            let alerter_for_worker = alerter.clone();
-            worker.on_warning(move |message| {
-                alerter_for_worker.alert(AlertLevel::Warn, AlertSource::Worker, message.to_owned());
-            });
-
-            let tx = event_tx.clone();
-            worker.on_history_append(move |item| {
-                if is_system_message_item(item) {
-                    let value = serde_json::to_value(item).expect("Item is Serialize");
-                    let _ = tx.send(Event::SystemMessage { item: value });
-                }
-            });
-
-            // Register the builtin file-manipulation tools (Read / Write /
-            // Edit / Glob / Grep / Bash). `ScopedFs` carries the pod-
-            // lifetime scope/pwd; `Tracker` is session-scoped — a fresh
-            // instance per controller spawn ensures state from a previous
-            // process lifetime cannot be reused after a resume. The tracker
-            // is also handed to the Pod itself so Pod-level operations (e.g.
-            // context compaction) can ask which files the agent has been
-            // touching.
-            //
-            // The Pod's SharedScope (already augmented with the
-            // bash-output Read rule above) is the single source of
-            // truth — every ScopedFs (builtin tools, fs_view, compact
-            // worker) reads from it, and any future scope mutation
-            // (SpawnPod-style revoke, future GrantScope) propagates
-            // through it.
-            let fs =
-                tools::ScopedFs::with_shared_scope(scope_handle.clone(), pwd_for_tools.clone());
-            let tracker = tools::Tracker::new();
-            // The same ScopedFs also powers the IPC `ListCompletions`
-            // query — keep a clone for the FS view we attach below,
-            // since the tools consume `fs` itself.
-            fs_for_view = fs.clone();
-            worker.register_tools(tools::builtin_tools(
-                fs,
-                tracker.clone(),
-                task_store.clone(),
-                bash_output_dir,
-            ));
-
-            // Memory subsystem opt-in. When `[memory]` is present in
-            // the manifest, register the memory-specific Read/Write/Edit
-            // tools that target `<workspace>/memory/` and
-            // `<workspace>/knowledge/` with their built-in linter. The
-            // companion deny rules on the generic CRUD scope were
-            // already applied during `Pod::from_manifest`.
-            if let Some(mem) = memory_config.as_ref() {
-                let layout = memory::WorkspaceLayout::resolve(mem, &pwd_for_tools);
-                let query_cfg = memory::tool::QueryConfig::from(mem);
-                worker.register_tool(memory::tool::read_tool_with_usage(
-                    layout.clone(),
-                    session_id_for_usage.clone(),
-                ));
-                worker.register_tool(memory::tool::write_tool(layout.clone()));
-                worker.register_tool(memory::tool::edit_tool(layout.clone()));
-                worker.register_tool(memory::tool::memory_query_tool(layout.clone(), query_cfg));
-                worker.register_tool(memory::tool::knowledge_query_tool(layout, query_cfg));
-            }
-
-            // Pod-orchestration tools (SpawnPod + the four comm tools)
-            // share the Pod-scoped `SpawnedPodRegistry` hoisted above
-            // (also consumed by the main loop's `PodEvent` handler).
-            worker.register_tool(spawn_pod_tool(
-                spawner_name.clone(),
-                spawner_socket.clone(),
-                runtime_base.to_path_buf(),
-                pwd_for_tools,
-                spawned_registry.clone(),
-                self_parent_socket.clone(),
-                spawner_model.clone(),
-                scope_handle.clone(),
-                scope_change_sink.clone(),
-            ));
-            worker.register_tool(send_to_pod_tool(spawned_registry.clone()));
-            worker.register_tool(read_pod_output_tool(spawned_registry.clone()));
-            worker.register_tool(stop_pod_tool(spawned_registry.clone()));
-            worker.register_tool(list_pods_tool(spawned_registry.clone()));
-            pod.attach_tracker(tracker);
-        }
+        // === 3. Tool registration (builtin / memory / spawn-orchestration) ===
+        let fs_for_view = register_pod_tools(
+            &mut pod,
+            bash_output_dir,
+            runtime_dir.socket_path(),
+            runtime_base.to_path_buf(),
+            spawned_registry.clone(),
+        );
 
         // Materialise pending tool factories so the greeting reflects
         // the actual registered set instead of a hand-maintained mirror.
         pod.worker().tool_server_handle().flush_pending();
 
-        // Greeting + initial runtime files now that the tool list is final.
+        // === 4. Initial runtime files + PodSharedState + PodHandle +
+        //         SocketServer ===
         let manifest_toml = toml::to_string_pretty(pod.manifest()).unwrap_or_default();
         let greeting = build_greeting(&pod);
         let shared_state = Arc::new(PodSharedState::new(
@@ -406,336 +220,521 @@ impl PodController {
             alerter: alerter.clone(),
         };
 
-        // Start socket server (lives as a background task, cleaned up on
-        // drop via RuntimeDir). Kept alive by moving it into the
-        // controller task so it drops when that task ends.
-        let _socket_server = SocketServer::start(&handle).await?;
+        let socket_server = SocketServer::start(&handle).await?;
 
+        // === 5. controller_loop ===
         // Clone cancel sender and notification buffer before moving pod
-        // into the controller task so the main loop can route
-        // `Method::Notify` into the buffer even while `pod` is held by
-        // an in-flight `run_for_notification` / `run` future.
+        // into the controller task so the in-flight turn can be reached
+        // via these handles while pod itself is borrowed by drive_turn.
         let cancel_tx = pod.worker_mut().cancel_sender();
         let notify_buffer = pod.notify_buffer_handle();
 
-        tokio::spawn(async move {
-            // Hold socket server alive for the lifetime of the controller task
-            let _socket_server = _socket_server;
-
-            loop {
-                let method = match method_rx.recv().await {
-                    Some(m) => m,
-                    None => break,
-                };
-
-                match method {
-                    Method::Run { input } => {
-                        let status_before = shared_state.get_status();
-                        if status_before == PodStatus::Running {
-                            let _ = event_tx.send(Event::Error {
-                                code: ErrorCode::AlreadyRunning,
-                                message: "Pod is already executing a turn".into(),
-                            });
-                            continue;
-                        }
-                        let was_paused = status_before == PodStatus::Paused;
-                        if let Err(e) = pod.validate_workflow_invocations(&input) {
-                            let _ = event_tx.send(Event::Error {
-                                code: ErrorCode::InvalidRequest,
-                                message: e.to_string(),
-                            });
-                            continue;
-                        }
-                        // Broadcast the accepted user message so every
-                        // subscriber (including the submitter) can
-                        // render the turn header + user line from a
-                        // single source of truth. shared_state's
-                        // `user_segments` is re-synced from `pod` after
-                        // the run completes, so we don't push here.
-                        let _ = event_tx.send(Event::UserMessage {
-                            segments: input.clone(),
-                        });
-                        set_controller_status(
-                            &shared_state,
-                            &runtime_dir,
-                            &event_tx,
-                            PodStatus::Running,
-                        )
-                        .await;
-
-                        let run_future = async {
-                            if was_paused {
-                                pod.interrupt_and_run(input).await
-                            } else {
-                                pod.run(input).await
-                            }
-                        };
-                        let (new_status, shutdown) = run_with_cancel_support(
-                            run_future,
-                            &mut method_rx,
-                            &event_tx,
-                            &cancel_tx,
-                            &shared_state,
-                            &notify_buffer,
-                            self_parent_socket.as_ref(),
-                            &spawner_name,
-                            &spawned_registry,
-                        )
-                        .await;
-
-                        finish_controller_run(
-                            &mut pod,
-                            &shared_state,
-                            &runtime_dir,
-                            &event_tx,
-                            new_status,
-                        )
-                        .await;
-
-                        if shutdown {
-                            let _ = event_tx.send(Event::Shutdown);
-                            break;
-                        }
-                    }
-
-                    Method::Notify { message } => {
-                        let _ = event_tx.send(Event::Notify {
-                            message: message.clone(),
-                        });
-                        pod.push_notify(message);
-                        let status = shared_state.get_status();
-                        if status != PodStatus::Idle {
-                            // RUNNING / Paused: the buffer push is the
-                            // entire operation; an in-flight turn (or the
-                            // next Resume/Run) will drain the buffer
-                            // at its next pre_llm_request.
-                            continue;
-                        }
-                        // IDLE: auto-start a turn so the LLM sees the
-                        // buffered notification(s) without a human Run.
-                        set_controller_status(
-                            &shared_state,
-                            &runtime_dir,
-                            &event_tx,
-                            PodStatus::Running,
-                        )
-                        .await;
-
-                        let (new_status, shutdown) = run_with_cancel_support(
-                            pod.run_for_notification(),
-                            &mut method_rx,
-                            &event_tx,
-                            &cancel_tx,
-                            &shared_state,
-                            &notify_buffer,
-                            self_parent_socket.as_ref(),
-                            &spawner_name,
-                            &spawned_registry,
-                        )
-                        .await;
-
-                        finish_controller_run(
-                            &mut pod,
-                            &shared_state,
-                            &runtime_dir,
-                            &event_tx,
-                            new_status,
-                        )
-                        .await;
-
-                        if shutdown {
-                            let _ = event_tx.send(Event::Shutdown);
-                            break;
-                        }
-                    }
-
-                    Method::Resume => {
-                        if shared_state.get_status() != PodStatus::Paused {
-                            let _ = event_tx.send(Event::Error {
-                                code: ErrorCode::NotPaused,
-                                message: "Pod is not paused".into(),
-                            });
-                            continue;
-                        }
-                        set_controller_status(
-                            &shared_state,
-                            &runtime_dir,
-                            &event_tx,
-                            PodStatus::Running,
-                        )
-                        .await;
-
-                        let (new_status, shutdown) = run_with_cancel_support(
-                            pod.resume(),
-                            &mut method_rx,
-                            &event_tx,
-                            &cancel_tx,
-                            &shared_state,
-                            &notify_buffer,
-                            self_parent_socket.as_ref(),
-                            &spawner_name,
-                            &spawned_registry,
-                        )
-                        .await;
-
-                        finish_controller_run(
-                            &mut pod,
-                            &shared_state,
-                            &runtime_dir,
-                            &event_tx,
-                            new_status,
-                        )
-                        .await;
-
-                        if shutdown {
-                            let _ = event_tx.send(Event::Shutdown);
-                            break;
-                        }
-                    }
-
-                    Method::Cancel => {
-                        let _ = event_tx.send(Event::Error {
-                            code: ErrorCode::NotRunning,
-                            message: "Pod is not running".into(),
-                        });
-                    }
-
-                    Method::Pause => {
-                        // Already paused → idempotent no-op. Otherwise the
-                        // Pod is Idle (Running turns go through
-                        // `run_with_cancel_support`, not this outer match), so
-                        // there is nothing to pause.
-                        let status = shared_state.get_status();
-                        if status != PodStatus::Paused {
-                            let _ = event_tx.send(Event::Error {
-                                code: ErrorCode::NotRunning,
-                                message: "Pod is not running".into(),
-                            });
-                        }
-                    }
-
-                    Method::Shutdown => {
-                        let _ = event_tx.send(Event::Shutdown);
-                        break;
-                    }
-
-                    // GetHistory / ListCompletions are handled at the socket
-                    // layer (direct response). If they somehow reach the
-                    // controller, ignore them.
-                    Method::GetHistory | Method::ListCompletions { .. } => {}
-
-                    Method::PodEvent(event) => {
-                        // Echo the received event to all subscribers so
-                        // every client sees the input that drove any
-                        // following auto-kicked turn.
-                        let _ = event_tx.send(Event::PodEvent(event.clone()));
-                        // (1) system side effects — idempotent and
-                        // tolerant of out-of-order delivery (e.g.
-                        // `TurnEnded` arriving after `ShutDown`).
-                        crate::ipc::event::apply_event_side_effects(
-                            &event,
-                            &spawned_registry,
-                            &spawner_name,
-                            &self_parent_socket,
-                        )
-                        .await;
-                        // (2) render a one-line summary and push it
-                        // into the notification buffer; the next LLM
-                        // request will inject it as a system message
-                        // via `PodInterceptor::pre_llm_request`.
-                        let text = crate::ipc::event::render_event(&event);
-                        pod.push_notify(text);
-                        // Auto-kick a turn if the Pod is idle so the
-                        // notification is not stranded. Matches the
-                        // `Method::Notify` idle path.
-                        if shared_state.get_status() == PodStatus::Idle {
-                            set_controller_status(
-                                &shared_state,
-                                &runtime_dir,
-                                &event_tx,
-                                PodStatus::Running,
-                            )
-                            .await;
-
-                            let (new_status, shutdown) = run_with_cancel_support(
-                                pod.run_for_notification(),
-                                &mut method_rx,
-                                &event_tx,
-                                &cancel_tx,
-                                &shared_state,
-                                &notify_buffer,
-                                self_parent_socket.as_ref(),
-                                &spawner_name,
-                                &spawned_registry,
-                            )
-                            .await;
-
-                            finish_controller_run(
-                                &mut pod,
-                                &shared_state,
-                                &runtime_dir,
-                                &event_tx,
-                                new_status,
-                            )
-                            .await;
-
-                            if shutdown {
-                                let _ = event_tx.send(Event::Shutdown);
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Background memory jobs own extract/consolidate workers after a
-            // turn completes. Join them before the controller task exits so
-            // staging writes and consolidation cleanups are not abandoned.
-            pod.wait_for_memory_jobs().await;
-
-            // Report upward that this Pod is stopping before the
-            // controller task exits. Awaited (not fire-and-forget):
-            // after `shutdown_tx.send` the process may exit quickly,
-            // and a spawned task would be killed mid-send. The
-            // `connect_and_send` helper enforces a 5 s timeout so a
-            // stuck parent cannot block process exit indefinitely.
-            if let Some(parent) = self_parent_socket.as_ref() {
-                if let Err(e) = crate::ipc::event::send_pod_event(
-                    parent,
-                    protocol::PodEvent::ShutDown {
-                        pod_name: spawner_name.clone(),
-                    },
-                )
-                .await
-                {
-                    tracing::warn!(error = %e, "ShutDown PodEvent send failed");
-                }
-            }
-
-            let _ = shutdown_tx.send(());
-        });
+        tokio::spawn(controller_loop(
+            pod,
+            method_rx,
+            event_tx,
+            shared_state,
+            runtime_dir,
+            cancel_tx,
+            notify_buffer,
+            self_parent_socket,
+            spawner_name,
+            spawned_registry,
+            shutdown_tx,
+            socket_server,
+        ));
 
         Ok((handle, shutdown_rx))
     }
 }
 
-/// Runs a Pod future while concurrently processing incoming methods.
-///
-/// Returns `(final_status, shutdown_requested)`.
+/// Wire the per-event broadcast bridges on the Pod's Worker. Each callback
+/// re-publishes a worker-level signal as a `protocol::Event` on `event_tx`
+/// so subscribers (TUI, socket clients) get a single typed stream.
+fn wire_event_bridges_on_worker<C, St>(
+    pod: &mut Pod<C, St>,
+    event_tx: &broadcast::Sender<Event>,
+    alerter: &Alerter,
+) where
+    C: LlmClient + Clone + 'static,
+    St: Store + Clone + 'static,
+{
+    let worker = pod.worker_mut();
+
+    let tx = event_tx.clone();
+    worker.on_turn_start(move |turn| {
+        let _ = tx.send(Event::TurnStart { turn });
+    });
+
+    let tx = event_tx.clone();
+    worker.on_turn_end(move |turn| {
+        let _ = tx.send(Event::TurnEnd {
+            turn,
+            result: TurnResult::Finished,
+        });
+    });
+
+    let tx = event_tx.clone();
+    worker.on_text_block(move |block| {
+        let tx_d = tx.clone();
+        block.on_delta(move |text| {
+            let _ = tx_d.send(Event::TextDelta {
+                text: text.to_owned(),
+            });
+        });
+        let tx_s = tx.clone();
+        block.on_stop(move |text| {
+            let _ = tx_s.send(Event::TextDone {
+                text: text.to_owned(),
+            });
+        });
+    });
+
+    let tx = event_tx.clone();
+    worker.on_thinking_block(move |block| {
+        // Start fires unconditionally so the TUI can show "Thinking..."
+        // even when the provider doesn't emit plaintext deltas.
+        let _ = tx.send(Event::ThinkingStart);
+        let tx_d = tx.clone();
+        block.on_delta(move |text| {
+            let _ = tx_d.send(Event::ThinkingDelta {
+                text: text.to_owned(),
+            });
+        });
+        let tx_s = tx.clone();
+        block.on_stop(move |text| {
+            let _ = tx_s.send(Event::ThinkingDone {
+                text: text.to_owned(),
+            });
+        });
+    });
+
+    let tx = event_tx.clone();
+    worker.on_tool_use_block(move |start, block| {
+        let _ = tx.send(Event::ToolCallStart {
+            id: start.id.clone(),
+            name: start.name.clone(),
+        });
+        let id_for_delta = start.id.clone();
+        let tx_d = tx.clone();
+        block.on_delta(move |json| {
+            let _ = tx_d.send(Event::ToolCallArgsDelta {
+                id: id_for_delta.clone(),
+                json: json.to_owned(),
+            });
+        });
+        let tx_s = tx.clone();
+        block.on_stop(move |call| {
+            let _ = tx_s.send(Event::ToolCallDone {
+                id: call.id.clone(),
+                name: call.name.clone(),
+                arguments: call.input.to_string(),
+            });
+        });
+    });
+
+    let tx = event_tx.clone();
+    worker.on_tool_result(move |result| {
+        let _ = tx.send(Event::ToolResult {
+            id: result.tool_use_id.clone(),
+            summary: result.summary.clone(),
+            output: result.content.clone(),
+            is_error: result.is_error,
+        });
+    });
+
+    let tx = event_tx.clone();
+    worker.on_usage(move |event| {
+        let _ = tx.send(Event::Usage {
+            input_tokens: event.input_tokens,
+            output_tokens: event.output_tokens,
+            cache_read_input_tokens: event.cache_read_input_tokens,
+        });
+    });
+
+    let tx = event_tx.clone();
+    worker.on_error(move |event| {
+        let _ = tx.send(Event::Error {
+            code: ErrorCode::ProviderError,
+            message: event.message.clone(),
+        });
+    });
+
+    let alerter_for_worker = alerter.clone();
+    worker.on_warning(move |message| {
+        alerter_for_worker.alert(AlertLevel::Warn, AlertSource::Worker, message.to_owned());
+    });
+
+    let tx = event_tx.clone();
+    worker.on_history_append(move |item| {
+        if is_system_message_item(item) {
+            let value = serde_json::to_value(item).expect("Item is Serialize");
+            let _ = tx.send(Event::SystemMessage { item: value });
+        }
+    });
+}
+
+/// Register the builtin file-manipulation tools, optional memory tools,
+/// and the Pod-orchestration tools (SpawnPod + comm) on the Pod's
+/// Worker. Returns the `ScopedFs` clone used to attach a `PodFsView` to
+/// the shared state.
+fn register_pod_tools<C, St>(
+    pod: &mut Pod<C, St>,
+    bash_output_dir: PathBuf,
+    spawner_socket: PathBuf,
+    runtime_base: PathBuf,
+    spawned_registry: Arc<SpawnedPodRegistry>,
+) -> tools::ScopedFs
+where
+    C: LlmClient + Clone + 'static,
+    St: Store + Clone + 'static,
+{
+    // Pod-immutable snapshots taken before the mutable worker borrow
+    // below so the worker borrow doesn't conflict with reads on `pod`.
+    let scope_handle = pod.scope().clone();
+    let pwd = pod.pwd().to_path_buf();
+    let task_store = pod.task_store();
+    let session_id_for_usage = pod.session_id().to_string();
+    let scope_change_sink = pod.scope_change_sink();
+    let memory_config = pod.manifest().memory.clone();
+    let spawner_name = pod.manifest().pod.name.clone();
+    let spawner_model = pod.manifest().model.clone();
+    let self_parent_socket = pod.callback_socket().cloned();
+
+    let worker = pod.worker_mut();
+
+    // The Pod's SharedScope (already augmented with the bash-output
+    // Read rule by the caller) is the single source of truth — every
+    // ScopedFs (builtin tools, fs_view, compact worker) reads from it,
+    // and any future scope mutation (SpawnPod-style revoke, future
+    // GrantScope) propagates through it.
+    let fs = tools::ScopedFs::with_shared_scope(scope_handle.clone(), pwd.clone());
+    let tracker = tools::Tracker::new();
+    // Same ScopedFs also powers the IPC `ListCompletions` query — keep
+    // a clone for the FS view we attach below, since the tools consume
+    // `fs` itself.
+    let fs_for_view = fs.clone();
+    worker.register_tools(tools::builtin_tools(
+        fs,
+        tracker.clone(),
+        task_store,
+        bash_output_dir,
+    ));
+
+    // Memory subsystem opt-in. When `[memory]` is present in the
+    // manifest, register the memory-specific Read/Write/Edit tools that
+    // target `<workspace>/memory/` and `<workspace>/knowledge/` with
+    // their built-in linter. Companion deny rules on the generic CRUD
+    // scope were already applied during `Pod::from_manifest`.
+    if let Some(mem) = memory_config.as_ref() {
+        let layout = memory::WorkspaceLayout::resolve(mem, &pwd);
+        let query_cfg = memory::tool::QueryConfig::from(mem);
+        worker.register_tool(memory::tool::read_tool_with_usage(
+            layout.clone(),
+            session_id_for_usage,
+        ));
+        worker.register_tool(memory::tool::write_tool(layout.clone()));
+        worker.register_tool(memory::tool::edit_tool(layout.clone()));
+        worker.register_tool(memory::tool::memory_query_tool(layout.clone(), query_cfg));
+        worker.register_tool(memory::tool::knowledge_query_tool(layout, query_cfg));
+    }
+
+    // Pod-orchestration tools (SpawnPod + the four comm tools) share
+    // the Pod-scoped `SpawnedPodRegistry` (also consumed by the main
+    // loop's `PodEvent` handler).
+    worker.register_tool(spawn_pod_tool(
+        spawner_name,
+        spawner_socket,
+        runtime_base,
+        pwd,
+        spawned_registry.clone(),
+        self_parent_socket,
+        spawner_model,
+        scope_handle,
+        scope_change_sink,
+    ));
+    worker.register_tool(send_to_pod_tool(spawned_registry.clone()));
+    worker.register_tool(read_pod_output_tool(spawned_registry.clone()));
+    worker.register_tool(stop_pod_tool(spawned_registry.clone()));
+    worker.register_tool(list_pods_tool(spawned_registry));
+    pod.attach_tracker(tracker);
+    fs_for_view
+}
+
+/// Idle/Paused event loop. Each iteration either fires a staged
+/// `PendingRun` (delegating to [`drive_turn`] for the Running phase) or
+/// waits for the next `Method`. Method handlers stop at "update state +
+/// stage `pending`"; the loop's top-of-iteration block owns the
+/// status-flip → run → finish sequence so it lives in exactly one
+/// place.
+#[allow(clippy::too_many_arguments)]
+async fn controller_loop<C, St>(
+    mut pod: Pod<C, St>,
+    mut method_rx: mpsc::Receiver<Method>,
+    event_tx: broadcast::Sender<Event>,
+    shared_state: Arc<PodSharedState>,
+    runtime_dir: Arc<RuntimeDir>,
+    cancel_tx: mpsc::Sender<()>,
+    notify_buffer: NotifyBuffer,
+    self_parent_socket: Option<PathBuf>,
+    spawner_name: String,
+    spawned_registry: Arc<SpawnedPodRegistry>,
+    shutdown_tx: oneshot::Sender<()>,
+    socket_server: SocketServer,
+) where
+    C: LlmClient + Clone + 'static,
+    St: Store + Clone + 'static,
+{
+    // Hold socket server alive for the lifetime of the controller task.
+    let _socket_server = socket_server;
+
+    let mut pending: Option<PendingRun> = None;
+
+    loop {
+        // Top-of-iteration: if an event handler staged a run, fire it
+        // here so the status flip → drive_turn → finish sequence lives
+        // in one place, regardless of which Method caused it.
+        if let Some(run) = pending.take() {
+            set_controller_status(&shared_state, &runtime_dir, &event_tx, PodStatus::Running).await;
+            let (new_status, shutdown) = match run {
+                PendingRun::Run(input) => {
+                    drive_turn(
+                        pod.run(input),
+                        &mut method_rx,
+                        &event_tx,
+                        &cancel_tx,
+                        &shared_state,
+                        &notify_buffer,
+                        self_parent_socket.as_ref(),
+                        &spawner_name,
+                        &spawned_registry,
+                    )
+                    .await
+                }
+                PendingRun::InterruptAndRun(input) => {
+                    drive_turn(
+                        pod.interrupt_and_run(input),
+                        &mut method_rx,
+                        &event_tx,
+                        &cancel_tx,
+                        &shared_state,
+                        &notify_buffer,
+                        self_parent_socket.as_ref(),
+                        &spawner_name,
+                        &spawned_registry,
+                    )
+                    .await
+                }
+                PendingRun::RunForNotification => {
+                    drive_turn(
+                        pod.run_for_notification(),
+                        &mut method_rx,
+                        &event_tx,
+                        &cancel_tx,
+                        &shared_state,
+                        &notify_buffer,
+                        self_parent_socket.as_ref(),
+                        &spawner_name,
+                        &spawned_registry,
+                    )
+                    .await
+                }
+                PendingRun::Resume => {
+                    drive_turn(
+                        pod.resume(),
+                        &mut method_rx,
+                        &event_tx,
+                        &cancel_tx,
+                        &shared_state,
+                        &notify_buffer,
+                        self_parent_socket.as_ref(),
+                        &spawner_name,
+                        &spawned_registry,
+                    )
+                    .await
+                }
+            };
+            finish_controller_run(&mut pod, &shared_state, &runtime_dir, &event_tx, new_status)
+                .await;
+            if shutdown {
+                let _ = event_tx.send(Event::Shutdown);
+                break;
+            }
+            continue;
+        }
+
+        let method = match method_rx.recv().await {
+            Some(m) => m,
+            None => break,
+        };
+
+        match method {
+            Method::Run { input } => {
+                let status_before = shared_state.get_status();
+                if status_before == PodStatus::Running {
+                    // Defensive: the inner select! inside drive_turn
+                    // already rejects `Run` while a turn is live, so
+                    // this branch is only reachable across a race window
+                    // around status flips.
+                    let _ = event_tx.send(Event::Error {
+                        code: ErrorCode::AlreadyRunning,
+                        message: "Pod is already executing a turn".into(),
+                    });
+                    continue;
+                }
+                if let Err(e) = pod.validate_workflow_invocations(&input) {
+                    let _ = event_tx.send(Event::Error {
+                        code: ErrorCode::InvalidRequest,
+                        message: e.to_string(),
+                    });
+                    continue;
+                }
+                // Broadcast the accepted user message so every
+                // subscriber (including the submitter) can render the
+                // turn header + user line from a single source of
+                // truth. shared_state's `user_segments` is re-synced
+                // from `pod` after the run completes, so we don't push
+                // here.
+                let _ = event_tx.send(Event::UserMessage {
+                    segments: input.clone(),
+                });
+                pending = Some(if status_before == PodStatus::Paused {
+                    PendingRun::InterruptAndRun(input)
+                } else {
+                    PendingRun::Run(input)
+                });
+            }
+
+            Method::Notify { message } => {
+                let _ = event_tx.send(Event::Notify {
+                    message: message.clone(),
+                });
+                pod.push_notify(message);
+                // RUNNING / Paused: the buffer push is the entire
+                // operation; an in-flight turn (or the next
+                // Resume/Run) will drain it at its next
+                // pre_llm_request. IDLE: auto-start a turn so the LLM
+                // sees the buffered notification(s) without a human
+                // Run.
+                if shared_state.get_status() == PodStatus::Idle {
+                    pending = Some(PendingRun::RunForNotification);
+                }
+            }
+
+            Method::Resume => {
+                if shared_state.get_status() != PodStatus::Paused {
+                    let _ = event_tx.send(Event::Error {
+                        code: ErrorCode::NotPaused,
+                        message: "Pod is not paused".into(),
+                    });
+                    continue;
+                }
+                pending = Some(PendingRun::Resume);
+            }
+
+            Method::Cancel => {
+                let _ = event_tx.send(Event::Error {
+                    code: ErrorCode::NotRunning,
+                    message: "Pod is not running".into(),
+                });
+            }
+
+            Method::Pause => {
+                // Already paused → idempotent no-op. Otherwise the
+                // Pod is Idle (Running turns go through `drive_turn`,
+                // not this outer match), so there is nothing to pause.
+                if shared_state.get_status() != PodStatus::Paused {
+                    let _ = event_tx.send(Event::Error {
+                        code: ErrorCode::NotRunning,
+                        message: "Pod is not running".into(),
+                    });
+                }
+            }
+
+            Method::Shutdown => {
+                let _ = event_tx.send(Event::Shutdown);
+                break;
+            }
+
+            // GetHistory / ListCompletions are handled at the socket
+            // layer (direct response). If they reach the controller,
+            // ignore them.
+            Method::GetHistory | Method::ListCompletions { .. } => {}
+
+            Method::PodEvent(event) => {
+                // Echo the received event to all subscribers so every
+                // client sees the input that drove any following
+                // auto-kicked turn.
+                let _ = event_tx.send(Event::PodEvent(event.clone()));
+                // (1) system side effects — idempotent and tolerant of
+                // out-of-order delivery (e.g. `TurnEnded` arriving
+                // after `ShutDown`).
+                crate::ipc::event::apply_event_side_effects(
+                    &event,
+                    &spawned_registry,
+                    &spawner_name,
+                    &self_parent_socket,
+                )
+                .await;
+                // (2) render a one-line summary and push it into the
+                // notification buffer; the next LLM request will
+                // inject it as a system message via
+                // `PodInterceptor::pre_llm_request`.
+                pod.push_notify(crate::ipc::event::render_event(&event));
+                // Auto-kick a turn if the Pod is idle so the
+                // notification is not stranded. Matches the
+                // `Method::Notify` idle path.
+                if shared_state.get_status() == PodStatus::Idle {
+                    pending = Some(PendingRun::RunForNotification);
+                }
+            }
+        }
+    }
+
+    // Background memory jobs own extract/consolidate workers after a
+    // turn completes. Join them before the controller task exits so
+    // staging writes and consolidation cleanups are not abandoned.
+    pod.wait_for_memory_jobs().await;
+
+    // Report upward that this Pod is stopping before the controller
+    // task exits. Awaited (not fire-and-forget): after `shutdown_tx.send`
+    // the process may exit quickly, and a spawned task would be killed
+    // mid-send. The `connect_and_send` helper enforces a 5 s timeout so
+    // a stuck parent cannot block process exit indefinitely.
+    if let Some(parent) = self_parent_socket.as_ref() {
+        if let Err(e) = crate::ipc::event::send_pod_event(
+            parent,
+            protocol::PodEvent::ShutDown {
+                pod_name: spawner_name.clone(),
+            },
+        )
+        .await
+        {
+            tracing::warn!(error = %e, "ShutDown PodEvent send failed");
+        }
+    }
+
+    let _ = shutdown_tx.send(());
+}
+
+/// Drives a Pod future (one in-flight turn) while concurrently
+/// processing incoming methods through an inner select! arm. Returns
+/// `(final_status, shutdown_requested)`.
 ///
 /// `parent_socket` / `self_name` drive upward `PodEvent` reports
 /// (`TurnEnded` on a clean Finished, `Errored` on a worker failure).
 /// `None` parent skips the send (top-level Pod). Transient method
 /// rejections such as `AlreadyRunning` are intentionally NOT reported
 /// as `Errored` — only the worker-execution `Err` branch below fires.
-async fn run_with_cancel_support<F>(
+#[allow(clippy::too_many_arguments)]
+async fn drive_turn<F>(
     pod_future: F,
     method_rx: &mut mpsc::Receiver<Method>,
     event_tx: &broadcast::Sender<Event>,
     cancel_tx: &mpsc::Sender<()>,
     shared_state: &Arc<PodSharedState>,
     notify_buffer: &NotifyBuffer,
-    parent_socket: Option<&std::path::PathBuf>,
+    parent_socket: Option<&PathBuf>,
     self_name: &str,
     spawned_registry: &Arc<SpawnedPodRegistry>,
 ) -> (PodStatus, bool)
