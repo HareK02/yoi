@@ -62,3 +62,8 @@ submit 時に `Segment::FileRef` がディレクトリを指している場合�
 - `crates/tools/src/scoped_fs.rs` `read_bytes`
 - `tickets/file-ref-symlink-diagnostics.md`
 - `tickets/manifest-output-upload-limits.md`
+
+## Review
+- 状態: Approve
+- レビュー詳細: [./file-ref-directory.review.md](./file-ref-directory.review.md)
+- 日付: 2026-05-12
