@@ -127,7 +127,14 @@ async fn make_pod(client: MockClient) -> Pod<MockClient, FsStore> {
 }
 
 async fn make_pod_with_pwd(client: MockClient) -> (Pod<MockClient, FsStore>, std::path::PathBuf) {
-    let manifest = PodManifest::from_toml(MANIFEST_TOML).unwrap();
+    make_pod_with_pwd_and_manifest(client, MANIFEST_TOML).await
+}
+
+async fn make_pod_with_pwd_and_manifest(
+    client: MockClient,
+    manifest_toml: &str,
+) -> (Pod<MockClient, FsStore>, std::path::PathBuf) {
+    let manifest = PodManifest::from_toml(manifest_toml).unwrap();
     let store_tmp = tempfile::tempdir().unwrap();
     let store = FsStore::new(store_tmp.path()).await.unwrap();
     std::mem::forget(store_tmp);
@@ -535,6 +542,55 @@ async fn run_with_resolvable_file_ref_attaches_system_message_after_user() {
     assert!(
         next_text.contains("alpha"),
         "expected file body, got: {next_text:?}"
+    );
+}
+
+#[tokio::test]
+async fn run_with_file_ref_uses_manifest_file_upload_limit() {
+    let client = MockClient::new(simple_text_events());
+    let client_for_assert = client.clone();
+    let manifest_toml = format!("{MANIFEST_TOML}\n[worker.file_upload]\nmax_bytes = 5\n");
+    let (pod, pwd) = make_pod_with_pwd_and_manifest(client, &manifest_toml).await;
+    std::fs::write(pwd.join("long.txt"), "abcdefghij").unwrap();
+    let handle = spawn_controller(pod).await;
+
+    handle
+        .send(Method::Run {
+            input: vec![protocol::Segment::FileRef {
+                path: "long.txt".into(),
+            }],
+        })
+        .await
+        .unwrap();
+
+    let mut rx = handle.subscribe();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        tokio::select! {
+            event = rx.recv() => match event {
+                Ok(Event::TurnEnd { .. }) => break,
+                Err(_) => break,
+                _ => {}
+            },
+            _ = tokio::time::sleep_until(deadline) => break,
+        }
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let requests = client_for_assert.captured_requests();
+    let attachment = requests[0]
+        .items
+        .iter()
+        .find_map(|i| {
+            let text = i.as_text()?;
+            text.contains("[File: long.txt]").then_some(text)
+        })
+        .expect("file attachment present");
+    assert!(attachment.contains("abcde"), "got: {attachment:?}");
+    assert!(!attachment.contains("abcdef"), "got: {attachment:?}");
+    assert!(
+        attachment.contains("truncated, 10 bytes total"),
+        "got: {attachment:?}"
     );
 }
 

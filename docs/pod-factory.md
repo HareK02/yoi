@@ -12,7 +12,7 @@ overlay をマージして、検証済みの `PodManifest` と `PromptLoader` �
 
 | 優先度 | 層 | 位置 | 典型的な内容 |
 |---|---|---|---|
-| 1 | ビルトインのデフォルト | `manifest::defaults` モジュールの `pub const` 群を `PodManifestConfig::builtin_defaults()` が cascade 層として注入 | `tool_output.default_max_bytes = 16KB` など |
+| 1 | ビルトインのデフォルト | `manifest::defaults` モジュールの `pub const` 群を `PodManifestConfig::builtin_defaults()` が cascade 層として注入 | `tool_output.default_max_bytes = 64 KiB`, `file_upload.max_bytes = 256 KiB` など |
 | 2 | ユーザー manifest | `<config_dir>/manifest.toml`（解決ルールは `manifest::paths`） | プロバイダ指定、デフォルトモデル、常用ツール設定 |
 | 3 | プロジェクト manifest | 起動ディレクトリから上方向に探索した最初の `<root>/.insomnia/manifest.toml` | scope、compaction、プロジェクト固有の instruction |
 | 4 | プログラマティック overlay | CLI / GUI / 別 Pod からの spawn 等 | `pod.name`、spawn 時の `worker.instruction` のような Pod 固有値 |
@@ -143,11 +143,14 @@ stop_sequences = ["\n\n", "</stop>"]
 reasoning = "medium"  # 文字列 = effort label / 整数 = thinking budget tokens。詳細は docs/reasoning.md
 
 [worker.tool_output]
-default_max_bytes = 16384
+default_max_bytes = 65536
 
 [worker.tool_output.per_tool]
-Read = 32768
-Grep = 4096
+Read = 131072
+Grep = 8192
+
+[worker.file_upload]
+max_bytes = 262144
 
 [[scope.allow]]
 target = "/abs/path/to/project"
@@ -210,8 +213,9 @@ scheme 側が吸収する。
 | `top_k` | `u32` | 未指定 | top-k sampling。未対応 scheme では warning または provider 側挙動に任せる |
 | `stop_sequences` | `Vec<String>` | `[]` | stop sequence。cascade では上層指定が配列ごと置換する |
 | `reasoning` | `String` または `i32` | 未指定 | reasoning / thinking 制御。詳細は `docs/reasoning.md` |
-| `tool_output.default_max_bytes` | `usize` | `16384` | tool result `content` の既定 byte cap |
+| `tool_output.default_max_bytes` | `usize` | `65536` | tool result `content` の既定 byte cap |
 | `tool_output.per_tool` | `Map<String, usize>` | `{}` | tool 名ごとの byte cap override |
+| `file_upload.max_bytes` | `usize` | `262144` | submit 時の FileRef (`@<path>`) upload / attachment の byte cap |
 
 生成設定は provider 別の値域検証を行わない。型が TOML と合わない場合は manifest
 parse error になるが、provider が受け付けない値や組み合わせは API 応答で検出する。

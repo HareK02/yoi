@@ -15,8 +15,8 @@ use serde::{Deserialize, Serialize};
 use crate::defaults;
 use crate::model::{AuthRef, ModelManifest, ReasoningControl};
 use crate::{
-    CompactionConfig, MemoryConfig, PodManifest, PodMeta, ScopeConfig, SkillsConfig,
-    ToolOutputLimits, ToolPermissionConfig, ToolPermissionRule, WorkerManifest,
+    CompactionConfig, FileUploadLimits, MemoryConfig, PodManifest, PodMeta, ScopeConfig,
+    SkillsConfig, ToolOutputLimits, ToolPermissionConfig, ToolPermissionRule, WorkerManifest,
 };
 
 /// Partial-form Pod manifest. Every field is optional; one or more
@@ -81,6 +81,8 @@ pub struct WorkerManifestConfig {
     pub reasoning: Option<ReasoningControl>,
     #[serde(default)]
     pub tool_output: ToolOutputLimitsPartial,
+    #[serde(default)]
+    pub file_upload: FileUploadLimitsPartial,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -89,6 +91,12 @@ pub struct ToolOutputLimitsPartial {
     pub default_max_bytes: Option<usize>,
     #[serde(default)]
     pub per_tool: HashMap<String, usize>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FileUploadLimitsPartial {
+    #[serde(default)]
+    pub max_bytes: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -157,6 +165,9 @@ impl PodManifestConfig {
                 tool_output: ToolOutputLimitsPartial {
                     default_max_bytes: Some(defaults::TOOL_OUTPUT_MAX_BYTES),
                     per_tool: HashMap::new(),
+                },
+                file_upload: FileUploadLimitsPartial {
+                    max_bytes: Some(defaults::FILE_UPLOAD_MAX_BYTES),
                 },
                 ..Default::default()
             },
@@ -287,6 +298,7 @@ impl WorkerManifestConfig {
             stop_sequences: upper.stop_sequences.or(self.stop_sequences),
             reasoning: upper.reasoning.or(self.reasoning),
             tool_output: self.tool_output.merge(upper.tool_output),
+            file_upload: self.file_upload.merge(upper.file_upload),
         }
     }
 }
@@ -298,6 +310,14 @@ impl ToolOutputLimitsPartial {
         Self {
             default_max_bytes: upper.default_max_bytes.or(self.default_max_bytes),
             per_tool,
+        }
+    }
+}
+
+impl FileUploadLimitsPartial {
+    fn merge(self, upper: Self) -> Self {
+        Self {
+            max_bytes: upper.max_bytes.or(self.max_bytes),
         }
     }
 }
@@ -422,6 +442,13 @@ impl TryFrom<PodManifestConfig> for PodManifest {
                     .default_max_bytes
                     .unwrap_or(defaults::TOOL_OUTPUT_MAX_BYTES),
                 per_tool: cfg.worker.tool_output.per_tool,
+            },
+            file_upload: FileUploadLimits {
+                max_bytes: cfg
+                    .worker
+                    .file_upload
+                    .max_bytes
+                    .unwrap_or(defaults::FILE_UPLOAD_MAX_BYTES),
             },
         };
 
@@ -859,6 +886,29 @@ mod tests {
     }
 
     #[test]
+    fn merge_file_upload_max_bytes_upper_wins() {
+        let lower = PodManifestConfig {
+            worker: WorkerManifestConfig {
+                file_upload: FileUploadLimitsPartial {
+                    max_bytes: Some(8192),
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let upper = PodManifestConfig {
+            worker: WorkerManifestConfig {
+                file_upload: FileUploadLimitsPartial {
+                    max_bytes: Some(54_321),
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let merged = lower.merge(upper);
+        assert_eq!(merged.worker.file_upload.max_bytes, Some(54_321));
+    }
+    #[test]
     fn merge_option_struct_field_wise() {
         let lower = PodManifestConfig {
             compaction: Some(CompactionConfigPartial {
@@ -1000,11 +1050,15 @@ permission = "write"
     }
 
     #[test]
-    fn builtin_defaults_populates_tool_output_max_bytes() {
+    fn builtin_defaults_populates_worker_limit_defaults() {
         let cfg = PodManifestConfig::builtin_defaults();
         assert_eq!(
             cfg.worker.tool_output.default_max_bytes,
             Some(defaults::TOOL_OUTPUT_MAX_BYTES)
+        );
+        assert_eq!(
+            cfg.worker.file_upload.max_bytes,
+            Some(defaults::FILE_UPLOAD_MAX_BYTES)
         );
     }
 
@@ -1038,6 +1092,10 @@ permission = "write"
         assert_eq!(
             manifest.worker.tool_output.default_max_bytes,
             defaults::TOOL_OUTPUT_MAX_BYTES
+        );
+        assert_eq!(
+            manifest.worker.file_upload.max_bytes,
+            defaults::FILE_UPLOAD_MAX_BYTES
         );
     }
 

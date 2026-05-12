@@ -11,7 +11,7 @@
 //! returned inline and the file is cleaned up. When it is longer the
 //! full output is left on disk and only the **last 80 lines** are
 //! returned, prefixed with the saved file's path. This sidesteps the
-//! Worker's blanket `ToolOutputLimits` (default 16 KiB), which would
+//! Worker's blanket `ToolOutputLimits` (default 64 KiB), which would
 //! otherwise drop the *tail* of the output — usually the most useful
 //! part (errors, exit messages, summary). The saved file lives under
 //! a caller-supplied directory that the parent has added to the
@@ -56,7 +56,7 @@ const TAIL_LINES: usize = 80;
 
 /// Inline-return budget. Outputs at or below this are returned in full;
 /// above it triggers the spill-to-file path. Sized to leave headroom under
-/// the Worker's 16 KiB default `ToolOutputLimits` cap so the inline path
+/// the Worker's 64 KiB default `ToolOutputLimits` cap so the inline path
 /// reliably reaches the model intact.
 const INLINE_BYTE_BUDGET: usize = 12 * 1024;
 

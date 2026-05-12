@@ -7,8 +7,8 @@ mod scope;
 
 pub use cascade::{LayerLoadError, find_project_manifest_from, load_layer};
 pub use config::{
-    CompactionConfigPartial, PermissionConfigPartial, PodManifestConfig, PodMetaConfig,
-    ResolveError, ToolOutputLimitsPartial, WorkerManifestConfig,
+    CompactionConfigPartial, FileUploadLimitsPartial, PermissionConfigPartial, PodManifestConfig,
+    PodMetaConfig, ResolveError, ToolOutputLimitsPartial, WorkerManifestConfig,
 };
 pub use model::{
     AuthRef, ModelCapability, ModelManifest, ReasoningControl, ReasoningEffort, SchemeKind,
@@ -183,10 +183,15 @@ pub struct WorkerManifest {
     pub reasoning: Option<ReasoningControl>,
     /// Byte-size caps applied to tool `content` before it reaches the
     /// conversation history. The section is optional in TOML — when
-    /// omitted, `ToolOutputLimits::default()` (16KB default cap, no
+    /// omitted, `ToolOutputLimits::default()` (64 KiB default cap, no
     /// per-tool overrides) is applied so truncation is on by default.
     #[serde(default)]
     pub tool_output: ToolOutputLimits,
+    /// Byte-size cap applied to submit-time FileRef uploads / attachments.
+    /// This is intentionally separate from tool-output truncation because
+    /// user-requested file attachments can usually tolerate a larger budget.
+    #[serde(default)]
+    pub file_upload: FileUploadLimits,
 }
 
 /// Byte-size caps applied to tool execution `content` before it enters
@@ -206,8 +211,24 @@ pub struct ToolOutputLimits {
     pub per_tool: HashMap<String, usize>,
 }
 
+/// Byte-size cap for submit-time FileRef uploads / attachments.
+///
+/// This governs the `[File: <path>]` system-message attachment produced
+/// when a user explicitly submits a `@<path>` reference. It does not affect
+/// tool result truncation; see [`ToolOutputLimits`] for that path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileUploadLimits {
+    /// Cap applied to each resolved FileRef body.
+    #[serde(default = "default_file_upload_max_bytes")]
+    pub max_bytes: usize,
+}
+
 fn default_tool_output_max_bytes() -> usize {
     defaults::TOOL_OUTPUT_MAX_BYTES
+}
+
+fn default_file_upload_max_bytes() -> usize {
+    defaults::FILE_UPLOAD_MAX_BYTES
 }
 
 fn default_instruction() -> String {
@@ -219,6 +240,14 @@ impl Default for ToolOutputLimits {
         Self {
             default_max_bytes: default_tool_output_max_bytes(),
             per_tool: HashMap::new(),
+        }
+    }
+}
+
+impl Default for FileUploadLimits {
+    fn default() -> Self {
+        Self {
+            max_bytes: default_file_upload_max_bytes(),
         }
     }
 }
@@ -635,15 +664,19 @@ model_id = "claude-sonnet-4-20250514"
     }
 
     #[test]
-    fn omitted_tool_output_falls_back_to_default_16k() {
+    fn omitted_limits_fall_back_to_defaults() {
         let manifest = PodManifest::from_toml(MINIMAL_REQUIRED).unwrap();
         let limits = &manifest.worker.tool_output;
-        assert_eq!(limits.default_max_bytes, 16 * 1024);
+        assert_eq!(limits.default_max_bytes, defaults::TOOL_OUTPUT_MAX_BYTES);
         assert!(limits.per_tool.is_empty());
+        assert_eq!(
+            manifest.worker.file_upload.max_bytes,
+            defaults::FILE_UPLOAD_MAX_BYTES
+        );
     }
 
     #[test]
-    fn parse_tool_output_limits() {
+    fn parse_worker_output_limits() {
         let toml = MINIMAL_REQUIRED.replace(
             "[worker]\n",
             "[worker]\n\
@@ -651,7 +684,9 @@ model_id = "claude-sonnet-4-20250514"
              default_max_bytes = 8192\n\n\
              [worker.tool_output.per_tool]\n\
              Read = 32768\n\
-             Grep = 4096\n",
+             Grep = 4096\n\n\
+             [worker.file_upload]\n\
+             max_bytes = 12345\n",
         );
         let manifest = PodManifest::from_toml(&toml).unwrap();
         let limits = &manifest.worker.tool_output;
@@ -659,6 +694,7 @@ model_id = "claude-sonnet-4-20250514"
         assert_eq!(limits.limit_for("Read"), 32768);
         assert_eq!(limits.limit_for("Grep"), 4096);
         assert_eq!(limits.limit_for("Unknown"), 8192);
+        assert_eq!(manifest.worker.file_upload.max_bytes, 12345);
     }
 
     #[test]
@@ -670,7 +706,7 @@ model_id = "claude-sonnet-4-20250514"
         );
         let manifest = PodManifest::from_toml(&toml).unwrap();
         let limits = &manifest.worker.tool_output;
-        assert_eq!(limits.default_max_bytes, 16 * 1024);
+        assert_eq!(limits.default_max_bytes, defaults::TOOL_OUTPUT_MAX_BYTES);
         assert!(limits.per_tool.is_empty());
     }
 

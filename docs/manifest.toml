@@ -131,16 +131,22 @@ ref = "anthropic/claude-sonnet-4-6"
 # reasoning = -1
 
 # 任意。tool 実行 content の byte 長キャップ。
-# セクション省略時は default_max_bytes = 16 * 1024、per_tool 空。
+# セクション省略時は default_max_bytes = 64 * 1024、per_tool 空。
 # [worker.tool_output]
-# # 任意。デフォルト: 16384 (`defaults::TOOL_OUTPUT_MAX_BYTES` = 16 KiB)。
-# default_max_bytes = 16384
+# # 任意。デフォルト: 65536 (`defaults::TOOL_OUTPUT_MAX_BYTES` = 64 KiB)。
+# default_max_bytes = 65536
 #
 # # 任意。デフォルト: 空マップ。tool 名キーで個別キャップ上書き。
 # # キーは tool の登録名 ("Read", "Grep", "Glob", ...)。
 # [worker.tool_output.per_tool]
-# Read = 32768
-# Grep = 4096
+# Read = 131072
+# Grep = 8192
+
+# 任意。submit 時の FileRef (`@<path>`) upload / attachment byte 長キャップ。
+# Tool Output の truncation とは独立している。
+# [worker.file_upload]
+# # 任意。デフォルト: 262144 (`defaults::FILE_UPLOAD_MAX_BYTES` = 256 KiB)。
+# max_bytes = 262144
 
 
 # ===== [scope] ==============================================================

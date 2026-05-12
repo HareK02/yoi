@@ -1030,7 +1030,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             let Segment::FileRef { path } = seg else {
                 continue;
             };
-            match view.resolve_file_ref(path, manifest::defaults::TOOL_OUTPUT_MAX_BYTES) {
+            match view.resolve_file_ref(path, self.manifest.worker.file_upload.max_bytes) {
                 Ok(item) => out.push(item),
                 Err(e) => {
                     self.alert(
@@ -3149,6 +3149,7 @@ mod build_summary_prompt_tests {
             stop_sequences: vec!["\n\n".into(), "</stop>".into()],
             reasoning: None,
             tool_output: manifest::ToolOutputLimits::default(),
+            file_upload: manifest::FileUploadLimits::default(),
         };
 
         let config = request_config_from_worker_manifest(&manifest);

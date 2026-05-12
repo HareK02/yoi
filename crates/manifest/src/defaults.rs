@@ -8,7 +8,11 @@
 
 /// Byte-size cap applied to any tool's `content` output when no
 /// per-tool override is set. See [`crate::ToolOutputLimits`].
-pub const TOOL_OUTPUT_MAX_BYTES: usize = 16 * 1024;
+pub const TOOL_OUTPUT_MAX_BYTES: usize = 64 * 1024;
+
+/// Byte-size cap applied to each submit-time FileRef upload / attachment.
+/// See [`crate::FileUploadLimits`].
+pub const FILE_UPLOAD_MAX_BYTES: usize = 256 * 1024;
 
 /// Number of most-recent turns protected from pruning. See
 /// [`crate::CompactionConfig::prune_protected_turns`].
