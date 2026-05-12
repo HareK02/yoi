@@ -4,7 +4,6 @@
   - AI maintainer 用 WorkItem / Thread 抽象 → [tickets/maintainer-work-items.md](tickets/maintainer-work-items.md)
   - Prompt / Workflow 評価メトリクスと改善 Offer → [tickets/prompt-eval-metrics.md](tickets/prompt-eval-metrics.md)
 - Permission: allow-all 既定 policy への整理 → [tickets/permission-default-policy.md](tickets/permission-default-policy.md)
-- Pod CLI: マニフェスト関連フラグの整理 → [tickets/pod-cli-manifest-flags.md](tickets/pod-cli-manifest-flags.md)
 - Pod: 空応答ターン (Submit 後 AI 応答ゼロで Pause/Cancel) を自動巻き戻し → [tickets/pod-empty-turn-rollback.md](tickets/pod-empty-turn-rollback.md)
 - Pod: 任意ターンからの Fork（複数ターン巻き戻しを汎用化） → [tickets/pod-session-fork.md](tickets/pod-session-fork.md)
 - Pod: 子→親の TurnEnded/Errored callback を親由来ターンのみに絞る → [tickets/pod-parent-turn-callback.md](tickets/pod-parent-turn-callback.md)
@@ -21,7 +20,6 @@
   - spawn 失敗時に Pod の stderr が TUI に表示されない → [tickets/tui-spawn-error-surface.md](tickets/tui-spawn-error-surface.md)
   - 巻き戻されたターンの入力テキストを編集領域に復元 → [tickets/tui-empty-turn-restore.md](tickets/tui-empty-turn-restore.md)
   - セッションコンテキスト長 / ウィンドウ占有率の常時表示 → [tickets/tui-context-usage-indicator.md](tickets/tui-context-usage-indicator.md)
-- Submit 時 FileRef でディレクトリを参照したときの挙動 → [tickets/file-ref-directory.md](tickets/file-ref-directory.md)
 - Prune: 保護境界を turn 数から末尾 token budget に置き換え → [tickets/prune-token-budget.md](tickets/prune-token-budget.md)
 - メモリ機構
   - extract / consolidation 監査ログ → [tickets/memory-audit-log.md](tickets/memory-audit-log.md)
