@@ -56,3 +56,8 @@ Knowledge も同じ形に揃えれば足りる。
 - mirror 対象: `crates/pod/src/pod.rs:1236`（`workflow_completions`）、`crates/pod/src/shared_state.rs:74-89`、`crates/pod/src/controller.rs:385-390`
 - TUI 側既存導線: `crates/tui/src/input.rs:260`、`crates/tui/src/app.rs:281,315`
 - 列挙対象: `crates/memory/src/workspace.rs`（`knowledge_dir`）、`crates/memory/src/resident.rs`（参考）
+
+## Review
+- 状態: Approve
+- レビュー詳細: [./tui-knowledge-completion.review.md](./tui-knowledge-completion.review.md)
+- 日付: 2026-05-12
