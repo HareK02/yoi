@@ -22,7 +22,6 @@
   - spawn 失敗時に Pod の stderr が TUI に表示されない → [tickets/tui-spawn-error-surface.md](tickets/tui-spawn-error-surface.md)
   - 巻き戻されたターンの入力テキストを編集領域に復元 → [tickets/tui-empty-turn-restore.md](tickets/tui-empty-turn-restore.md)
   - セッションコンテキスト長 / ウィンドウ占有率の常時表示 → [tickets/tui-context-usage-indicator.md](tickets/tui-context-usage-indicator.md)
-- Manifest: Tool Output / File Upload 上限の分離とデフォルト緩和 → [tickets/manifest-output-upload-limits.md](tickets/manifest-output-upload-limits.md)
 - Prune: 保護境界を turn 数から末尾 token budget に置き換え → [tickets/prune-token-budget.md](tickets/prune-token-budget.md)
 - メモリ機構
   - extract / consolidation 監査ログ → [tickets/memory-audit-log.md](tickets/memory-audit-log.md)
