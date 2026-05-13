@@ -73,12 +73,6 @@ impl RuntimeDir {
         atomic_write(&self.path.join("manifest.toml"), toml.as_bytes()).await
     }
 
-    /// Write history.json atomically.
-    pub async fn write_history(&self, state: &PodSharedState) -> Result<(), io::Error> {
-        let content = state.history_json();
-        atomic_write(&self.path.join("history.json"), content.as_bytes()).await
-    }
-
     /// Write `spawned_pods.json` atomically. The entries are the full
     /// set of spawned children known to this Pod — callers pass the
     /// replacement list, no incremental merge.
@@ -221,18 +215,6 @@ mod tests {
         let parsed: Vec<SpawnedPodRecord> = serde_json::from_str(&content).unwrap();
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].pod_name, "child");
-    }
-
-    #[tokio::test]
-    async fn write_history_creates_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        let rt = RuntimeDir::create(tmp.path(), "my-pod").await.unwrap();
-        let state = test_state();
-
-        rt.write_history(&state).await.unwrap();
-
-        let content = std::fs::read_to_string(rt.path().join("history.json")).unwrap();
-        assert_eq!(content, "[]");
     }
 
     #[tokio::test]

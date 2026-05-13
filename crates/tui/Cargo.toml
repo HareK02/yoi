@@ -19,6 +19,7 @@ session-store = { workspace = true }
 pod-registry = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 pulldown-cmark = { version = "0.13.3", default-features = false }
+llm-worker.workspace = true
 
 [dev-dependencies]
 tools = { workspace = true }

@@ -3,15 +3,19 @@ use std::sync::Arc;
 
 use llm_worker::WorkerError;
 use llm_worker::llm_client::client::LlmClient;
-use llm_worker::llm_client::types::{Item, Role};
 use session_store::Store;
 use tokio::sync::{broadcast, mpsc, oneshot};
+
+use llm_worker::Item;
+use session_store::LogEntry;
+use session_store::session_log;
 
 use crate::ipc::alerter::Alerter;
 use crate::ipc::notify_buffer::NotifyBuffer;
 use crate::ipc::server::SocketServer;
-use crate::pod::{Pod, PodError, PodRunResult};
+use crate::pod::{LogCommand, LogDrainHandle, Pod, PodError, PodRunResult};
 use crate::runtime::dir::RuntimeDir;
+use crate::session_log_sink::SessionLogSink;
 use crate::shared_state::PodSharedState;
 use crate::spawn::comm_tools::{
     list_pods_tool, read_pod_output_tool, send_to_pod_tool, stop_pod_tool,
@@ -21,16 +25,6 @@ use crate::spawn::tool::spawn_pod_tool;
 use protocol::{
     AlertLevel, AlertSource, ErrorCode, Event, Method, PodStatus, RunResult, Segment, TurnResult,
 };
-
-fn is_system_message_item(item: &Item) -> bool {
-    matches!(
-        item,
-        Item::Message {
-            role: Role::System,
-            ..
-        }
-    )
-}
 
 // ---------------------------------------------------------------------------
 // PodHandle — client-facing, Clone-able
@@ -43,6 +37,10 @@ pub struct PodHandle {
     pub shared_state: Arc<PodSharedState>,
     pub runtime_dir: Arc<RuntimeDir>,
     pub alerter: Alerter,
+    /// Session-log mirror + broadcast handle. The IPC server snapshots
+    /// it on every new connection (Event::Snapshot) and forwards
+    /// subsequent commits (Event::Entry) on the receiver.
+    pub sink: SessionLogSink,
 }
 
 impl PodHandle {
@@ -86,11 +84,11 @@ async fn finish_controller_run<C, St>(
     C: LlmClient + Clone + 'static,
     St: Store + Clone + 'static,
 {
-    let items = pod.worker().history().to_vec();
-    shared_state.update_history(items);
-    shared_state.set_user_segments(pod.user_segments().to_vec());
+    // history / user_segments are no longer mirrored on PodSharedState —
+    // clients reconstruct them from `Event::Snapshot` + live
+    // `Event::Entry` deliveries driven by the session-log sink. We
+    // only flip the status and kick post-run memory jobs here.
     set_controller_status(shared_state, runtime_dir, event_tx, new_status).await;
-    let _ = runtime_dir.write_history(shared_state).await;
     pod.spawn_post_run_memory_jobs();
 }
 
@@ -167,8 +165,23 @@ impl PodController {
         }])
         .map_err(std::io::Error::other)?;
 
+        // === 1.5. Per-item history-commit drain task ===
+        //
+        // Worker callbacks fire `on_history_append` for each assistant
+        // item / tool result / hook-injected item that lands in
+        // history. The drain task picks them up off an unbounded mpsc
+        // and commits each as a typed `LogEntry` through the sink,
+        // serialised against the same `session_head` lock the Pod uses
+        // for its own commits. This gives mid-turn snapshot visibility:
+        // a late-attaching client sees in-flight tool calls + completed
+        // assistant blocks without waiting for the turn-end persist.
+        let (log_cmd_tx, log_cmd_rx) = mpsc::unbounded_channel::<LogCommand>();
+        let drain_ctx = pod.log_drain_handle();
+        let _drain_task = tokio::spawn(run_log_drain(log_cmd_rx, drain_ctx));
+        pod.attach_log_cmd_tx(log_cmd_tx.clone());
+
         // === 2. Worker event bridge wiring ===
-        wire_event_bridges_on_worker(&mut pod, &event_tx, &alerter);
+        wire_event_bridges_on_worker(&mut pod, &event_tx, &alerter, log_cmd_tx);
 
         // === 3. Tool registration (builtin / memory / spawn-orchestration) ===
         let fs_for_view = register_pod_tools(
@@ -193,8 +206,6 @@ impl PodController {
             manifest_toml.clone(),
             greeting,
         ));
-        shared_state.update_history(pod.worker().history().to_vec());
-        shared_state.set_user_segments(pod.user_segments().to_vec());
         shared_state.set_fs_view(crate::fs_view::PodFsView::new(fs_for_view));
         shared_state.set_workflows(
             pod.workflow_completions()
@@ -210,7 +221,6 @@ impl PodController {
         );
         runtime_dir.write_manifest(&manifest_toml).await?;
         runtime_dir.write_status(&shared_state).await?;
-        runtime_dir.write_history(&shared_state).await?;
 
         let handle = PodHandle {
             method_tx,
@@ -218,6 +228,7 @@ impl PodController {
             shared_state: shared_state.clone(),
             runtime_dir: runtime_dir.clone(),
             alerter: alerter.clone(),
+            sink: pod.sink(),
         };
 
         let socket_server = SocketServer::start(&handle).await?;
@@ -251,15 +262,29 @@ impl PodController {
 /// Wire the per-event broadcast bridges on the Pod's Worker. Each callback
 /// re-publishes a worker-level signal as a `protocol::Event` on `event_tx`
 /// so subscribers (TUI, socket clients) get a single typed stream.
+///
+/// Also wires `on_history_append` into the per-item drain channel so
+/// every history append observed by the worker becomes a typed
+/// `LogEntry` commit (via the drain task).
 fn wire_event_bridges_on_worker<C, St>(
     pod: &mut Pod<C, St>,
     event_tx: &broadcast::Sender<Event>,
     alerter: &Alerter,
+    log_cmd_tx: mpsc::UnboundedSender<LogCommand>,
 ) where
     C: LlmClient + Clone + 'static,
     St: Store + Clone + 'static,
 {
     let worker = pod.worker_mut();
+
+    // Per-history-append → drain channel. Sends are infallible-by-design
+    // here (UnboundedSender never blocks); a closed receiver just means
+    // the controller is shutting down, in which case dropping the item
+    // is acceptable.
+    let drain_tx = log_cmd_tx.clone();
+    worker.on_history_append(move |item| {
+        let _ = drain_tx.send(LogCommand::Item(item.clone()));
+    });
 
     let tx = event_tx.clone();
     worker.on_turn_start(move |turn| {
@@ -365,13 +390,80 @@ fn wire_event_bridges_on_worker<C, St>(
         alerter_for_worker.alert(AlertLevel::Warn, AlertSource::Worker, message.to_owned());
     });
 
-    let tx = event_tx.clone();
-    worker.on_history_append(move |item| {
-        if is_system_message_item(item) {
-            let value = serde_json::to_value(item).expect("Item is Serialize");
-            let _ = tx.send(Event::SystemMessage { item: value });
+    // History-append broadcasts (previously `Event::SystemMessage`)
+    // have been removed: every persistent history item is now committed
+    // through the session-log sink as a typed `LogEntry`, and clients
+    // see it via `Event::Snapshot` + live `Event::Entry`. The
+    // per-item commit channel is wired at the top of this function.
+}
+
+/// Drain task: consumes `LogCommand::Item` and `LogCommand::Flush`
+/// off the channel and commits each item as a typed `LogEntry` through
+/// the supplied store + sink. Lives as long as the controller; exits
+/// when the sender is dropped (controller shutdown).
+async fn run_log_drain<St>(
+    mut rx: mpsc::UnboundedReceiver<LogCommand>,
+    ctx: LogDrainHandle<St>,
+) where
+    St: session_store::Store + Clone + Send + 'static,
+{
+    while let Some(cmd) = rx.recv().await {
+        match cmd {
+            LogCommand::Item(item) => {
+                let Some(entry) = classify_history_item(item) else {
+                    continue;
+                };
+                let mut head = ctx.session_head.lock().await;
+                match session_store::append_entry_with_hash(
+                    &ctx.store,
+                    head.session_id,
+                    &mut head.head_hash,
+                    entry.clone(),
+                )
+                .await
+                {
+                    Ok(_) => {
+                        // Publish under the same critical section view
+                        // a `subscribe_with_snapshot` would observe.
+                        ctx.sink.publish(entry);
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "drain: append_entry failed; entry dropped");
+                    }
+                }
+            }
+            LogCommand::Flush(ack) => {
+                let _ = ack.send(());
+            }
         }
-    });
+    }
+}
+
+/// Map a single worker-history `Item` to its corresponding `LogEntry`
+/// classification. `None` is the skip signal for `user_message` items —
+/// those are committed via `LogEntry::UserInput` by `Pod::run` at
+/// submit time and would otherwise produce a duplicate entry here.
+fn classify_history_item(item: Item) -> Option<LogEntry> {
+    let ts = session_log::now_millis();
+    if item.is_user_message() {
+        return None;
+    }
+    if item.is_tool_result() {
+        return Some(LogEntry::ToolResults {
+            ts,
+            items: vec![session_store::LoggedItem::from(&item)],
+        });
+    }
+    if item.is_assistant_message() || item.is_tool_call() || item.is_reasoning() {
+        return Some(LogEntry::AssistantItems {
+            ts,
+            items: vec![session_store::LoggedItem::from(&item)],
+        });
+    }
+    Some(LogEntry::HookInjectedItems {
+        ts,
+        items: vec![session_store::LoggedItem::from(&item)],
+    })
 }
 
 /// Register the builtin file-manipulation tools, optional memory tools,
@@ -656,10 +748,9 @@ async fn controller_loop<C, St>(
                 break;
             }
 
-            // GetHistory / ListCompletions are handled at the socket
-            // layer (direct response). If they reach the controller,
-            // ignore them.
-            Method::GetHistory | Method::ListCompletions { .. } => {}
+            // ListCompletions is handled at the socket layer (direct
+            // response). If it reaches the controller, ignore it.
+            Method::ListCompletions { .. } => {}
 
             Method::PodEvent(event) => {
                 // Echo the received event to all subscribers so every
@@ -820,7 +911,7 @@ where
                         // drain it at its next pre_llm_request.
                         notify_buffer.push(message);
                     }
-                    Some(Method::GetHistory | Method::ListCompletions { .. }) => {}
+                    Some(Method::ListCompletions { .. }) => {}
                     Some(Method::PodEvent(event)) => {
                         let _ = event_tx.send(Event::PodEvent(event.clone()));
                         // mpsc is consume-once, so we cannot defer this

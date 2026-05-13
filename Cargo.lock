@@ -3645,6 +3645,7 @@ version = "0.1.0"
 dependencies = [
  "client",
  "crossterm 0.28.1",
+ "llm-worker",
  "manifest",
  "pod-registry",
  "protocol",

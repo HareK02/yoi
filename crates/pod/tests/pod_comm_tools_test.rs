@@ -144,44 +144,41 @@ fn accept_method_and_respond(
     })
 }
 
-/// Pretend to be a spawned Pod that responds to `GetHistory` with a
-/// fixed set of items. Accepts connections until the first one that
-/// delivers a `GetHistory` method; earlier probes (empty accepts) and
-/// non-history methods are ignored. Returns nothing — tests await the
-/// handle only to keep the listener alive until shutdown.
+/// Pretend to be a spawned Pod whose connect-time snapshot carries a
+/// fixed set of assistant items. Sends `Event::Snapshot` immediately on
+/// every accept — the real Pod does the same, so `ReadPodOutput`'s
+/// `fetch_history` just consumes the first non-Alert event.
 fn serve_history(listener: UnixListener, items: Vec<Item>) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             let Ok((stream, _)) = listener.accept().await else {
                 return;
             };
-            let (r, w) = stream.into_split();
-            let mut reader = JsonLineReader::new(r);
+            let (_r, w) = stream.into_split();
             let mut writer = JsonLineWriter::new(w);
-            match reader.next::<Method>().await {
-                Ok(Some(Method::GetHistory)) => {
-                    let values: Vec<serde_json::Value> = items
-                        .iter()
-                        .map(|i| serde_json::to_value(i).unwrap())
-                        .collect();
-                    let event = Event::History {
-                        items: values,
-                        greeting: Greeting {
-                            pod_name: "child".into(),
-                            cwd: "/tmp".into(),
-                            provider: "anthropic".into(),
-                            model: "x".into(),
-                            scope_summary: String::new(),
-                            tools: Vec::new(),
-                        },
-                        status: protocol::PodStatus::Idle,
-                    };
-                    let _ = writer.write(&event).await;
-                }
-                Ok(Some(_)) | Ok(None) | Err(_) => {
-                    // Ignore: loop accepts another connection.
-                }
-            }
+            // Wrap the assistant items in a single
+            // `LogEntry::AssistantItems` entry — that's the only kind
+            // that contributes assistant text via `extract_assistant_text`.
+            let logged: Vec<session_store::LoggedItem> =
+                items.iter().map(session_store::LoggedItem::from).collect();
+            let entry = session_store::LogEntry::AssistantItems {
+                ts: 0,
+                items: logged,
+            };
+            let entry_value = serde_json::to_value(&entry).unwrap();
+            let event = Event::Snapshot {
+                entries: vec![entry_value],
+                greeting: Greeting {
+                    pod_name: "child".into(),
+                    cwd: "/tmp".into(),
+                    provider: "anthropic".into(),
+                    model: "x".into(),
+                    scope_summary: String::new(),
+                    tools: Vec::new(),
+                },
+                status: protocol::PodStatus::Idle,
+            };
+            let _ = writer.write(&event).await;
         }
     })
 }

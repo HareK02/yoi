@@ -491,9 +491,8 @@ impl App {
                 self.blocks.push(Block::PodEvent { event });
                 self.assistant_streaming = false;
             }
-            Event::SystemMessage { item } => {
-                self.push_history_item(&item);
-                self.assistant_streaming = false;
+            Event::Entry { entry } => {
+                self.apply_log_entry(&entry);
             }
             Event::TurnStart { .. } => {
                 self.set_pod_status(PodStatus::Running);
@@ -726,12 +725,12 @@ impl App {
                     message: alert.message,
                 });
             }
-            Event::History {
-                items,
+            Event::Snapshot {
+                entries,
                 greeting,
                 status,
             } => {
-                self.restore_history(&items, greeting);
+                self.restore_snapshot(&entries, greeting);
                 self.set_pod_status(status);
             }
             Event::Status { status } => {
@@ -905,10 +904,13 @@ impl App {
         self.input.move_down();
     }
 
-    fn restore_history(&mut self, items: &[serde_json::Value], greeting: protocol::Greeting) {
-        // Fresh session: greeting + any replayed items. Append-only — we
-        // don't try to merge with already-displayed live events because
-        // `History` only fires on an empty live state.
+    /// Reset the block list and replay a connect-time `Event::Snapshot`.
+    ///
+    /// Walks the session-log entries in commit order, expanding each
+    /// LogEntry variant into the same blocks live events would have
+    /// produced. Followed by `Event::Entry` updates for anything
+    /// committed after the snapshot.
+    fn restore_snapshot(&mut self, entries: &[serde_json::Value], greeting: protocol::Greeting) {
         self.turn_index = 0;
         self.blocks.clear();
         self.cache = FileCache::new();
@@ -917,14 +919,86 @@ impl App {
         self.blocks.push(Block::Greeting(greeting));
         self.assistant_streaming = false;
 
-        for item in items {
-            self.push_history_item(item);
+        for entry in entries {
+            self.apply_log_entry_raw(entry);
         }
 
-        // Any tool_call entries that never got paired with a
-        // tool_result (truncated or racing mid-turn on the server side)
-        // stay as Executing up to this point. Surface them as
-        // Incomplete so the replay matches live semantics.
+        self.mark_orphan_tool_calls_incomplete_pass();
+    }
+
+    /// Apply a single live `Event::Entry`.
+    ///
+    /// `SessionStart` entries that arrive live (compaction / fork)
+    /// reset the block list to a freshly seeded view, matching what a
+    /// reconnect's `Event::Snapshot` would produce.
+    fn apply_log_entry(&mut self, entry: &serde_json::Value) {
+        if entry.get("kind").and_then(|k| k.as_str()) == Some("session_start") {
+            // Compaction / fork on the server side. Reset our derived
+            // view but keep the greeting (identity hasn't changed).
+            let greeting = self
+                .blocks
+                .iter()
+                .find_map(|b| match b {
+                    Block::Greeting(g) => Some(g.clone()),
+                    _ => None,
+                });
+            self.turn_index = 0;
+            self.blocks.clear();
+            self.cache = FileCache::new();
+            self.task_store = TaskStore::new();
+            self.task_pane_scroll = 0;
+            if let Some(g) = greeting {
+                self.blocks.push(Block::Greeting(g));
+            }
+        }
+        self.apply_log_entry_raw(entry);
+        self.assistant_streaming = false;
+    }
+
+    /// Walk a single `LogEntry` JSON value and translate it into blocks
+    /// the live event path would have produced. Shared between
+    /// `restore_snapshot` (replay path) and `apply_log_entry` (live
+    /// path).
+    fn apply_log_entry_raw(&mut self, value: &serde_json::Value) {
+        let Ok(entry) = serde_json::from_value::<session_store::LogEntry>(value.clone()) else {
+            return;
+        };
+        match entry {
+            session_store::LogEntry::SessionStart { history, .. } => {
+                for logged in history {
+                    let item: llm_worker::Item = logged.into();
+                    let item_value = serde_json::to_value(&item).expect("Item is Serialize");
+                    self.push_history_item(&item_value);
+                }
+            }
+            session_store::LogEntry::UserInput { segments, .. } => {
+                self.turn_index += 1;
+                self.blocks.push(Block::TurnHeader {
+                    turn: self.turn_index,
+                });
+                if !segments.is_empty() {
+                    self.blocks.push(Block::UserMessage { segments });
+                }
+            }
+            session_store::LogEntry::AssistantItems { items, .. }
+            | session_store::LogEntry::ToolResults { items, .. }
+            | session_store::LogEntry::HookInjectedItems { items, .. } => {
+                for logged in items {
+                    let item: llm_worker::Item = logged.into();
+                    let item_value = serde_json::to_value(&item).expect("Item is Serialize");
+                    self.push_history_item(&item_value);
+                }
+            }
+            // Non-history-bearing variants don't affect the block view.
+            _ => {}
+        }
+    }
+
+    /// Sweep all current tool-call blocks: any that never resolved into
+    /// a Done / Error state get marked Incomplete. Called after a
+    /// snapshot replay so dangling in-flight tool calls in the seed
+    /// log match live semantics.
+    fn mark_orphan_tool_calls_incomplete_pass(&mut self) {
         for b in self.blocks.iter_mut() {
             if let Block::ToolCall(tc) = b
                 && matches!(
@@ -1325,18 +1399,22 @@ mod completion_flow_tests {
     }
 
     #[test]
-    fn history_restore_renders_system_message_block() {
+    fn snapshot_renders_system_message_block_from_session_start() {
         let mut app = App::new("test".into());
-        app.handle_pod_event(Event::History {
+        let session_start = session_store::LogEntry::SessionStart {
+            ts: 1,
+            system_prompt: None,
+            config: Default::default(),
+            history: vec![session_store::LoggedItem::from(
+                &llm_worker::Item::system_message("[File: src/main.rs]\nfn main() {}"),
+            )],
+            forked_from: None,
+            compacted_from: None,
+        };
+        let session_start_value = serde_json::to_value(&session_start).unwrap();
+        app.handle_pod_event(Event::Snapshot {
             greeting: test_greeting(),
-            items: vec![serde_json::json!({
-                "type": "message",
-                "role": "system",
-                "content": [{
-                    "type": "text",
-                    "text": "[File: src/main.rs]\nfn main() {}",
-                }],
-            })],
+            entries: vec![session_start_value],
             status: PodStatus::Running,
         });
 
@@ -1349,18 +1427,18 @@ mod completion_flow_tests {
     }
 
     #[test]
-    fn live_system_message_event_uses_history_item_path() {
+    fn live_entry_routes_system_message_via_hook_injected_items() {
         let mut app = App::new("test".into());
-        app.handle_pod_event(Event::SystemMessage {
-            item: serde_json::json!({
-                "type": "message",
+        let entry = serde_json::json!({
+            "kind": "hook_injected_items",
+            "ts": 1,
+            "items": [{
+                "kind": "message",
                 "role": "system",
-                "content": [{
-                    "type": "text",
-                    "text": "[Workflow /build]\nRun the build",
-                }],
-            }),
+                "content": [{ "kind": "text", "text": "[Workflow /build]\nRun the build" }],
+            }],
         });
+        app.handle_pod_event(Event::Entry { entry });
 
         assert!(matches!(
             app.blocks.as_slice(),
@@ -1504,11 +1582,15 @@ mod completion_flow_tests {
             ```json\n{\n  \"tasks\": [\n    {\n      \"taskid\": 4,\n      \
             \"status\": \"inprogress\",\n      \"subject\": \"from snapshot\",\n      \
             \"description\": \"d\"\n    }\n  ]\n}\n```\n";
-        app.handle_pod_event(Event::SystemMessage {
-            item: serde_json::json!({
-                "type": "message",
-                "role": "system",
-                "content": [{ "type": "text", "text": snapshot }],
+        app.handle_pod_event(Event::Entry {
+            entry: serde_json::json!({
+                "kind": "hook_injected_items",
+                "ts": 1,
+                "items": [{
+                    "kind": "message",
+                    "role": "system",
+                    "content": [{ "kind": "text", "text": snapshot }],
+                }],
             }),
         });
 
@@ -1519,10 +1601,10 @@ mod completion_flow_tests {
     }
 
     #[test]
-    fn history_replay_reconstructs_task_store() {
+    fn snapshot_reconstructs_task_store() {
         let mut app = App::new("test".into());
-        // Live tool call before history lands — restore_history must
-        // wipe this so it doesn't double-count after replay.
+        // Live tool call before the snapshot lands — restore must wipe
+        // this so it doesn't double-count after replay.
         app.handle_pod_event(Event::ToolCallStart {
             id: "live".into(),
             name: "TaskCreate".into(),
@@ -1533,28 +1615,33 @@ mod completion_flow_tests {
             arguments: r#"{"subject":"live","description":""}"#.into(),
         });
 
-        app.handle_pod_event(Event::History {
-            greeting: test_greeting(),
-            items: vec![
-                serde_json::json!({
-                    "type": "tool_call",
+        let assistant_items_entry = serde_json::json!({
+            "kind": "assistant_items",
+            "ts": 1,
+            "items": [
+                {
+                    "kind": "tool_call",
                     "call_id": "c1",
                     "name": "TaskCreate",
                     "arguments": r#"{"subject":"a","description":"A"}"#,
-                }),
-                serde_json::json!({
-                    "type": "tool_call",
+                },
+                {
+                    "kind": "tool_call",
                     "call_id": "c2",
                     "name": "TaskCreate",
                     "arguments": r#"{"subject":"b","description":"B"}"#,
-                }),
-                serde_json::json!({
-                    "type": "tool_call",
+                },
+                {
+                    "kind": "tool_call",
                     "call_id": "u1",
                     "name": "TaskUpdate",
                     "arguments": r#"{"taskid":2,"status":"inprogress"}"#,
-                }),
+                },
             ],
+        });
+        app.handle_pod_event(Event::Snapshot {
+            greeting: test_greeting(),
+            entries: vec![assistant_items_entry],
             status: PodStatus::Running,
         });
 

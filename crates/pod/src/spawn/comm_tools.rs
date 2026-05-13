@@ -19,6 +19,7 @@ use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use protocol::stream::{JsonLineReader, JsonLineWriter};
 use protocol::{ErrorCode, Event, Method};
 use serde::Deserialize;
+use session_store::LogEntry;
 use tokio::net::UnixStream;
 
 use crate::runtime::dir::SpawnedPodRecord;
@@ -385,33 +386,31 @@ async fn send_run_and_confirm(socket: &Path, input: String) -> Result<(), SendRu
     }
 }
 
-/// Connect and ask the Pod for its conversation history. Skips
-/// pre-History events (such as buffered alerts replayed to new
-/// clients). Returns the raw JSON items as `serde_json::Value` since
-/// the pod crate already round-trips via `Value` on the wire.
+/// Connect to a Pod's socket and read the connect-time `Event::Snapshot`.
+///
+/// Pods deliver the session-log mirror as the first non-Alert event on
+/// every new connection, so consuming it is sufficient — no explicit
+/// `GetHistory` method round trip. Returns the entries as raw JSON
+/// values; callers deserialize as `session_store::LogEntry` if they
+/// need typed access.
 async fn fetch_history(socket: &Path) -> std::io::Result<Vec<serde_json::Value>> {
     let stream = tokio::time::timeout(SOCKET_OP_TIMEOUT, UnixStream::connect(socket))
         .await
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timed out"))??;
-    let (r, w) = stream.into_split();
-    let mut writer = JsonLineWriter::new(w);
+    let (r, _w) = stream.into_split();
     let mut reader = JsonLineReader::new(r);
-
-    tokio::time::timeout(SOCKET_OP_TIMEOUT, writer.write(&Method::GetHistory))
-        .await
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "write timed out"))??;
 
     loop {
         let event = tokio::time::timeout(SOCKET_OP_TIMEOUT, reader.next::<Event>())
             .await
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "read timed out"))??;
         match event {
-            Some(Event::History { items, .. }) => return Ok(items),
+            Some(Event::Snapshot { entries, .. }) => return Ok(entries),
             Some(_) => continue,
             None => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
-                    "pod closed connection before History event",
+                    "pod closed connection before Snapshot event",
                 ));
             }
         }
@@ -426,24 +425,36 @@ async fn is_reachable(socket: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn extract_assistant_text(items: &[serde_json::Value]) -> String {
+fn extract_assistant_text(entries: &[serde_json::Value]) -> String {
     let mut out = String::new();
-    for value in items {
-        let Ok(item) = serde_json::from_value::<Item>(value.clone()) else {
+    for value in entries {
+        // The wire payload is the JSON form of `session_store::LogEntry`.
+        // Walk Assistant items inside each entry that can carry them:
+        // post-compaction `SessionStart.history` (seed) and per-LLM-call
+        // `AssistantItems` deltas.
+        let Ok(entry) = serde_json::from_value::<LogEntry>(value.clone()) else {
             continue;
         };
-        if let Item::Message {
-            role: Role::Assistant,
-            content,
-            ..
-        } = item
-        {
-            for part in content {
-                if let ContentPart::Text { text } = part {
-                    if !out.is_empty() {
-                        out.push_str("\n\n");
+        let logged_items = match entry {
+            LogEntry::SessionStart { history, .. } => history,
+            LogEntry::AssistantItems { items, .. } => items,
+            _ => continue,
+        };
+        for logged in logged_items {
+            let item: Item = logged.into();
+            if let Item::Message {
+                role: Role::Assistant,
+                content,
+                ..
+            } = item
+            {
+                for part in content {
+                    if let ContentPart::Text { text } = part {
+                        if !out.is_empty() {
+                            out.push_str("\n\n");
+                        }
+                        out.push_str(&text);
                     }
-                    out.push_str(&text);
                 }
             }
         }

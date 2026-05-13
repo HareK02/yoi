@@ -177,17 +177,39 @@ fn drain(rx: &mut broadcast::Receiver<Event>) -> Vec<Event> {
     out
 }
 
-fn system_event_text(event: &Event) -> Option<&str> {
-    match event {
-        Event::SystemMessage { item } => item["content"]
-            .as_array()
-            .and_then(|parts| parts.iter().filter_map(|p| p["text"].as_str()).next()),
-        _ => None,
+/// Collect every system-message text that the post-compaction
+/// `SessionStart.history` carries, by reading the sink mirror directly.
+fn system_texts_in_sink_session_start(pod: &pod::Pod<impl llm_worker::llm_client::client::LlmClient + Clone + 'static, impl session_store::Store + Clone + 'static>) -> Vec<String> {
+    let (entries, _rx) = pod.sink().subscribe_with_snapshot();
+    for entry in entries.into_iter().rev() {
+        if let session_store::LogEntry::SessionStart { history, .. } = entry {
+            return history
+                .into_iter()
+                .filter_map(|logged| {
+                    let item: Item = logged.into();
+                    match item {
+                        Item::Message {
+                            role: llm_worker::Role::System,
+                            content,
+                            ..
+                        } => Some(
+                            content
+                                .iter()
+                                .map(|p| p.as_text().to_owned())
+                                .collect::<Vec<_>>()
+                                .join(""),
+                        ),
+                        _ => None,
+                    }
+                })
+                .collect();
+        }
     }
+    Vec::new()
 }
 
 #[tokio::test]
-async fn compact_broadcasts_only_new_system_messages_not_retained_ones() {
+async fn compact_emits_session_start_carrying_summary_and_task_snapshot() {
     let client = MockClient::new(vec![
         single_text_events("hi"),
         write_summary_tool_use_events("call-1", "summary"),
@@ -195,18 +217,16 @@ async fn compact_broadcasts_only_new_system_messages_not_retained_ones() {
     ]);
     let mut pod = make_pod(client).await;
 
-    let (tx, mut rx) = broadcast::channel::<Event>(64);
+    let (tx, _rx_keep) = broadcast::channel::<Event>(64);
     pod.attach_event_tx(tx);
 
     pod.run_text("first").await.unwrap();
-    let retained_message = Item::system_message("[Retained system]\nold");
-    pod.worker_mut().push_item(retained_message);
-    let _ = drain(&mut rx);
-
     pod.compact(10_000).await.unwrap();
 
-    let events = drain(&mut rx);
-    let system_texts: Vec<&str> = events.iter().filter_map(system_event_text).collect();
+    let system_texts = system_texts_in_sink_session_start(&pod);
+    // The post-compaction `SessionStart.history` carries the new system
+    // messages introduced by the compactor. Clients re-seed their view
+    // from this entry alone, so it is the load-bearing payload.
     assert!(
         system_texts
             .iter()
@@ -218,12 +238,6 @@ async fn compact_broadcasts_only_new_system_messages_not_retained_ones() {
             .iter()
             .any(|text| text.starts_with("[Session TaskStore snapshot]")),
         "task snapshot system message missing from {system_texts:?}"
-    );
-    assert!(
-        !system_texts
-            .iter()
-            .any(|text| text.starts_with("[Retained system]")),
-        "retained system message should not be rebroadcast: {system_texts:?}"
     );
 }
 

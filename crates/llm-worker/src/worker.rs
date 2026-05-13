@@ -1013,13 +1013,16 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
             }
             self.turn_count += 1;
 
-            // Collect and commit assistant items
+            // Collect and commit assistant items. Routed through
+            // `extend_history_with_callbacks` so observers (e.g. the
+            // Pod-side per-item session-log committer) see each item
+            // as it lands.
             let reasoning_items = self.reasoning_item_collector.take_collected();
             let text_blocks = self.text_block_collector.take_collected();
             let tool_calls = self.tool_call_collector.take_collected();
             let assistant_items =
                 self.build_assistant_items(&reasoning_items, &text_blocks, &tool_calls);
-            self.history.extend(assistant_items);
+            self.extend_history_with_callbacks(assistant_items);
 
             if tool_calls.is_empty() {
                 match self.interceptor.on_turn_end(&self.history).await {
@@ -1134,14 +1137,18 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
                 Ok(Some(WorkerResult::Paused))
             }
             Ok(ToolExecutionResult::Completed(results)) => {
-                for result in results {
-                    self.history.push(Item::tool_result_item(
+                // Route per-result pushes through the callback path so
+                // observers (e.g. the Pod-side per-item session-log
+                // committer) see each tool result as it lands.
+                let items = results.into_iter().map(|result| {
+                    Item::tool_result_item(
                         &result.tool_use_id,
                         &result.summary,
                         result.content,
                         result.is_error,
-                    ));
-                }
+                    )
+                });
+                self.extend_history_with_callbacks(items);
                 Ok(None)
             }
             Err(err) => {

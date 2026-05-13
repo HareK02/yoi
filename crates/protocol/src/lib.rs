@@ -32,14 +32,13 @@ pub enum Method {
     /// synthetic tool result before the new user message is appended).
     Pause,
     Shutdown,
-    GetHistory,
     /// Request a list of completion candidates from the Pod.
     ///
     /// Reply is sent on the same socket as `Event::Completions` (not
-    /// broadcast). Same shape as `GetHistory` / `Event::History`:
-    /// the IPC server handles this directly and writes the response
-    /// straight back to the requesting socket. Empty results for
-    /// resolvers that are not yet wired up (Knowledge / Workflow).
+    /// broadcast). The IPC server handles this directly and writes
+    /// the response straight back to the requesting socket. Empty
+    /// results for resolvers that are not yet wired up
+    /// (Knowledge / Workflow).
     ListCompletions {
         kind: CompletionKind,
         prefix: String,
@@ -224,15 +223,6 @@ pub enum Event {
     Notify {
         message: String,
     },
-    /// Persisted `role:system` history item that should be rendered by
-    /// clients through the same path used for `Event::History` replay.
-    ///
-    /// The payload is the serialized history item, not an ad-hoc display
-    /// DTO, so live subscribers and late subscribers have the same source
-    /// of truth: worker history / history.json.
-    SystemMessage {
-        item: serde_json::Value,
-    },
     /// Echo of `Method::PodEvent` received by this Pod. Same rationale
     /// as `Notify`: subscribers render the event as a log element,
     /// while a rendered summary is independently injected into the LLM
@@ -312,15 +302,33 @@ pub enum Event {
         code: ErrorCode,
         message: String,
     },
-    History {
-        items: Vec<serde_json::Value>,
+    /// Sent exactly once at the start of every client connection.
+    ///
+    /// `entries` is the session-log mirror at subscribe time, serialised
+    /// as the JSON form of `session_store::LogEntry`. Late attachers
+    /// reconstruct view state by replaying entries through their own
+    /// `LogEntry → block` mapping, then continue applying live
+    /// `Event::Entry` updates received after the snapshot.
+    ///
+    /// `greeting` and `status` accompany the snapshot so clients render
+    /// pod identity and current controller state without an extra round
+    /// trip.
+    Snapshot {
+        entries: Vec<serde_json::Value>,
         greeting: Greeting,
-        /// Current Pod controller status at the moment the history snapshot
-        /// was taken. This lets late-attaching clients render and route
-        /// controls from the real controller state instead of inferring from
-        /// replayed history.
         #[serde(default)]
         status: PodStatus,
+    },
+    /// A single session-log entry committed atomically with the disk
+    /// write. Streamed as the suffix following the connect-time
+    /// `Snapshot`; the prefix/suffix boundary is gap-free and
+    /// duplicate-free per `SessionLogSink` semantics.
+    ///
+    /// Payload is the JSON form of `session_store::LogEntry`. Clients
+    /// deserialize as needed to render typed atoms (e.g.
+    /// `UserInput.segments`).
+    Entry {
+        entry: serde_json::Value,
     },
     /// Current Pod controller status. Broadcast on every controller-level
     /// transition and included in `History` snapshots for late attach.
@@ -418,8 +426,8 @@ pub struct CompletionEntry {
 /// Pod self-description rendered by the TUI when a session starts empty.
 ///
 /// Built once in the Pod controller from the resolved manifest and
-/// transmitted alongside `Event::History` so clients don't need their
-/// own view of the manifest.
+/// transmitted alongside `Event::Snapshot` so clients don't need
+/// their own view of the manifest.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Greeting {
     pub pod_name: String,
@@ -675,13 +683,6 @@ mod tests {
     }
 
     #[test]
-    fn method_get_history() {
-        let json = r#"{"method":"get_history"}"#;
-        let method: Method = serde_json::from_str(json).unwrap();
-        assert!(matches!(method, Method::GetHistory));
-    }
-
-    #[test]
     fn method_list_completions_roundtrip() {
         let method = Method::ListCompletions {
             kind: CompletionKind::File,
@@ -734,9 +735,9 @@ mod tests {
     }
 
     #[test]
-    fn event_history_format() {
-        let event = Event::History {
-            items: vec![serde_json::json!({"type": "message", "role": "user"})],
+    fn event_snapshot_format() {
+        let event = Event::Snapshot {
+            entries: vec![serde_json::json!({"kind": "user_input", "ts": 1, "segments": []})],
             greeting: Greeting {
                 pod_name: "test".into(),
                 cwd: "/tmp".into(),
@@ -749,12 +750,28 @@ mod tests {
         };
         let json = serde_json::to_string(&event).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed["event"], "history");
-        assert!(parsed["data"]["items"].is_array());
-        assert_eq!(parsed["data"]["items"][0]["role"], "user");
+        assert_eq!(parsed["event"], "snapshot");
+        assert!(parsed["data"]["entries"].is_array());
+        assert_eq!(parsed["data"]["entries"][0]["kind"], "user_input");
         assert_eq!(parsed["data"]["greeting"]["pod_name"], "test");
         assert_eq!(parsed["data"]["greeting"]["tools"][0], "Read");
         assert_eq!(parsed["data"]["status"], "paused");
+    }
+
+    #[test]
+    fn event_entry_roundtrip() {
+        let event = Event::Entry {
+            entry: serde_json::json!({"kind": "assistant_items", "ts": 42, "items": []}),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["event"], "entry");
+        assert_eq!(parsed["data"]["entry"]["kind"], "assistant_items");
+        let decoded: Event = serde_json::from_str(&json).unwrap();
+        match decoded {
+            Event::Entry { entry } => assert_eq!(entry["kind"], "assistant_items"),
+            other => panic!("expected Entry, got {other:?}"),
+        }
     }
 
     #[test]
@@ -777,12 +794,12 @@ mod tests {
     }
 
     #[test]
-    fn event_history_legacy_without_status_defaults_to_idle() {
-        let json = r#"{"event":"history","data":{"items":[],"greeting":{"pod_name":"test","cwd":"/tmp","provider":"anthropic","model":"claude","scope_summary":"","tools":[]}}}"#;
+    fn event_snapshot_legacy_without_status_defaults_to_idle() {
+        let json = r#"{"event":"snapshot","data":{"entries":[],"greeting":{"pod_name":"test","cwd":"/tmp","provider":"anthropic","model":"claude","scope_summary":"","tools":[]}}}"#;
         let decoded: Event = serde_json::from_str(json).unwrap();
         match decoded {
-            Event::History { status, .. } => assert_eq!(status, PodStatus::Idle),
-            other => panic!("expected History, got {other:?}"),
+            Event::Snapshot { status, .. } => assert_eq!(status, PodStatus::Idle),
+            other => panic!("expected Snapshot, got {other:?}"),
         }
     }
 

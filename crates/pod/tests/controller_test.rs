@@ -6,11 +6,39 @@ use async_trait::async_trait;
 use futures::{Stream, StreamExt};
 use llm_worker::Worker;
 use llm_worker::llm_client::event::{Event as LlmEvent, ResponseStatus, StatusEvent};
+use llm_worker::llm_client::types::Item;
 use llm_worker::llm_client::{ClientError, LlmClient, Request};
 use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
-use session_store::FsStore;
+use session_store::{FsStore, LogEntry};
 
 use pod::{Event, Method, Pod, PodController, PodHandle, PodManifest, PodStatus};
+
+/// Reconstruct a worker-history-like `Vec<Item>` from the live session
+/// log mirror held by the Pod's broadcast sink. Replaces the previous
+/// `PodSharedState.history()` test helper now that the mirror lives in
+/// the sink.
+fn history_from_sink(handle: &PodHandle) -> Vec<Item> {
+    let (entries, _rx) = handle.sink.subscribe_with_snapshot();
+    let mut items = Vec::new();
+    for entry in entries {
+        match entry {
+            LogEntry::SessionStart { history, .. } => {
+                items.extend(history.into_iter().map(Item::from));
+            }
+            LogEntry::UserInput { segments, .. } => {
+                let text = protocol::Segment::flatten_to_text(&segments);
+                items.push(Item::user_message(text));
+            }
+            LogEntry::AssistantItems { items: i, .. }
+            | LogEntry::ToolResults { items: i, .. }
+            | LogEntry::HookInjectedItems { items: i, .. } => {
+                items.extend(i.into_iter().map(Item::from));
+            }
+            _ => {}
+        }
+    }
+    items
+}
 
 // ---------------------------------------------------------------------------
 // Mock LLM Client
@@ -218,8 +246,61 @@ async fn run_end_returns_to_idle_without_busy_status() {
     assert_eq!(handle.shared_state.get_status(), PodStatus::Idle);
 }
 
+/// Mid-turn re-attach: a client connecting while the worker is still
+/// running observes the in-flight `UserInput` entry in the connect-time
+/// `Event::Snapshot`. This is the load-bearing property of the new
+/// session-log-driven IPC: a late attacher reconstructs the running
+/// view without needing the prior client's diff.
 #[tokio::test]
-async fn attach_history_includes_current_status() {
+async fn snapshot_includes_user_input_for_in_flight_turn() {
+    let client = MockClient::sequential(vec![MockResponse::Hang(simple_text_events())]);
+    let pod = make_pod(client).await;
+    let handle = spawn_controller(pod).await;
+
+    handle
+        .send(Method::run_text("hello in-flight"))
+        .await
+        .unwrap();
+    wait_for_status(&handle, PodStatus::Running).await;
+
+    let stream = tokio::net::UnixStream::connect(handle.runtime_dir.socket_path())
+        .await
+        .unwrap();
+    let (reader, _writer) = stream.into_split();
+    let mut reader = protocol::stream::JsonLineReader::new(reader);
+
+    loop {
+        let event = reader.next::<Event>().await.unwrap().unwrap();
+        match event {
+            Event::Snapshot { entries, .. } => {
+                // Walk the entries, find a `LogEntry::UserInput` and
+                // confirm its segments flatten to our submitted text.
+                let mut found = false;
+                for value in entries {
+                    let entry: session_store::LogEntry =
+                        serde_json::from_value(value).expect("LogEntry deserialise");
+                    if let session_store::LogEntry::UserInput { segments, .. } = entry {
+                        let text = protocol::Segment::flatten_to_text(&segments);
+                        if text == "hello in-flight" {
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+                assert!(
+                    found,
+                    "snapshot must carry the in-flight UserInput entry"
+                );
+                return;
+            }
+            Event::Alert(_) => continue,
+            other => panic!("expected Snapshot first, got {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn attach_snapshot_includes_current_status() {
     let client = MockClient::sequential(vec![MockResponse::Hang(simple_text_events())]);
     let pod = make_pod(client).await;
     let handle = spawn_controller(pod).await;
@@ -230,15 +311,20 @@ async fn attach_history_includes_current_status() {
     let stream = tokio::net::UnixStream::connect(handle.runtime_dir.socket_path())
         .await
         .unwrap();
-    let (reader, writer) = stream.into_split();
+    let (reader, _writer) = stream.into_split();
     let mut reader = protocol::stream::JsonLineReader::new(reader);
-    let mut writer = protocol::stream::JsonLineWriter::new(writer);
-    writer.write(&Method::GetHistory).await.unwrap();
 
-    let event = reader.next::<Event>().await.unwrap().unwrap();
-    match event {
-        Event::History { status, .. } => assert_eq!(status, PodStatus::Running),
-        other => panic!("expected History, got {other:?}"),
+    // First event after connect is the snapshot — it carries the current status.
+    loop {
+        let event = reader.next::<Event>().await.unwrap().unwrap();
+        match event {
+            Event::Snapshot { status, .. } => {
+                assert_eq!(status, PodStatus::Running);
+                return;
+            }
+            Event::Alert(_) => continue,
+            other => panic!("expected Snapshot, got {other:?}"),
+        }
     }
 }
 
@@ -275,11 +361,11 @@ async fn run_populates_history() {
 
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-    let history = handle.shared_state.history_json();
-    assert_ne!(history, "[]");
-    let parsed: serde_json::Value = serde_json::from_str(&history).unwrap();
-    assert!(parsed.is_array());
-    assert!(parsed.as_array().unwrap().len() >= 2); // user + assistant
+    let history = history_from_sink(&handle);
+    assert!(
+        history.len() >= 2,
+        "history must include user + assistant items, got {history:?}"
+    );
 }
 
 #[tokio::test]
@@ -712,7 +798,7 @@ async fn notify_while_idle_auto_starts_turn_and_injects_system_message() {
     // The notification must also be persisted into the Worker history
     // (and therefore eventually into history.json), per
     // tickets/notify-history-persist.md.
-    let history = handle.shared_state.history();
+    let history = history_from_sink(&handle);
     let notify_in_history = history.iter().any(|i| {
         i.as_text()
             .is_some_and(|t| t.contains("[Notification]") && t.contains("turn finished"))
@@ -796,7 +882,7 @@ async fn pod_event_turn_ended_while_idle_auto_starts_turn_and_injects_system_mes
 
     // Same item must be present in worker.history (persisted lane),
     // not just the per-request clone — see tickets/notify-history-persist.md.
-    let history = handle.shared_state.history();
+    let history = history_from_sink(&handle);
     let event_in_history = history.iter().any(|i| {
         i.as_text().is_some_and(|t| {
             t.contains("[Notification]") && t.contains("child") && t.contains("finished a turn")
@@ -1149,22 +1235,42 @@ async fn pause_then_resume_transitions_and_preserves_history_consistency() {
     // History consistency: exactly [user "hello", assistant
     // "resumed output"]. No artifacts from the aborted stream
     // (partial text is not committed), no orphan tool_use.
-    let history_json = handle.shared_state.history_json();
-    let items: Vec<serde_json::Value> = serde_json::from_str(&history_json).unwrap();
-    let roles: Vec<&str> = items.iter().filter_map(|i| i["role"].as_str()).collect();
+    let history = history_from_sink(&handle);
+    let roles: Vec<&str> = history
+        .iter()
+        .filter_map(|i| match i {
+            Item::Message { role, .. } => match role {
+                llm_worker::Role::User => Some("user"),
+                llm_worker::Role::Assistant => Some("assistant"),
+                llm_worker::Role::System => Some("system"),
+            },
+            _ => None,
+        })
+        .collect();
     assert_eq!(
         roles,
         vec!["user", "assistant"],
-        "history = user + assistant only; got {items:?}"
+        "history = user + assistant only; got {history:?}"
     );
-    let assistant_text = items[1]["content"]
-        .as_array()
-        .and_then(|parts| parts.iter().filter_map(|p| p["text"].as_str()).next())
-        .unwrap_or("");
-    assert_eq!(assistant_text, "resumed output");
-    let has_tool_call = items
+    let assistant_text = history
         .iter()
-        .any(|i| i["type"].as_str() == Some("tool_call"));
+        .find_map(|i| match i {
+            Item::Message {
+                role: llm_worker::Role::Assistant,
+                content,
+                ..
+            } => Some(
+                content
+                    .iter()
+                    .map(|p: &llm_worker::ContentPart| p.as_text().to_owned())
+                    .collect::<Vec<_>>()
+                    .join(""),
+            ),
+            _ => None,
+        })
+        .unwrap_or_default();
+    assert_eq!(assistant_text, "resumed output");
+    let has_tool_call = history.iter().any(|i| i.is_tool_call());
     assert!(!has_tool_call, "no orphan tool_call in history");
 }
 

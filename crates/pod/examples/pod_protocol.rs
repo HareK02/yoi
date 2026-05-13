@@ -104,10 +104,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "\n[shared_state] final: {}",
         handle.shared_state.status_json()
     );
-    println!(
-        "[history] {} bytes",
-        handle.shared_state.history_json().len()
-    );
+    println!("[session log] {} entries", handle.sink.len());
 
     drop(handle);
     let _ = listener.await;

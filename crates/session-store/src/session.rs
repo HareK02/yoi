@@ -457,14 +457,31 @@ pub async fn fork_at(
     Ok(fork_id)
 }
 
-// ── Private helper ──────────────────────────────────────────────────────
-
-async fn append_entry(
+/// Append a single `LogEntry`, chaining the hash and updating `head_hash`.
+///
+/// Lower-level dual of the `save_*` convenience wrappers in this module.
+/// Use when the caller already builds the typed entry itself (e.g. when
+/// it needs the same value for an in-memory mirror + broadcast).
+pub async fn append_entry(
     store: &impl Store,
     session_id: SessionId,
     head_hash: &mut Option<EntryHash>,
     entry: LogEntry,
 ) -> Result<(), StoreError> {
+    append_entry_with_hash(store, session_id, head_hash, entry).await?;
+    Ok(())
+}
+
+/// Same as [`append_entry`] but returns the freshly computed entry hash.
+///
+/// Used by paths that need the hash for downstream broadcast or mirror
+/// updates (e.g. the Pod's `SessionLogSink`).
+pub async fn append_entry_with_hash(
+    store: &impl Store,
+    session_id: SessionId,
+    head_hash: &mut Option<EntryHash>,
+    entry: LogEntry,
+) -> Result<EntryHash, StoreError> {
     let hash = session_log::compute_hash(head_hash.as_ref(), &entry);
     let hashed_entry = HashedEntry {
         hash: hash.clone(),
@@ -472,6 +489,6 @@ async fn append_entry(
         entry,
     };
     store.append(session_id, &hashed_entry).await?;
-    *head_hash = Some(hash);
-    Ok(())
+    *head_hash = Some(hash.clone());
+    Ok(hash)
 }

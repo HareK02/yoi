@@ -62,6 +62,13 @@ async fn handle_connection(stream: tokio::net::UnixStream, handle: PodHandle) {
     let mut reader = JsonLineReader::new(reader);
     let mut writer = JsonLineWriter::new(writer);
 
+    // Atomically subscribe to the session-log mirror first. The
+    // returned (snapshot, rx) pair partitions the entry timeline:
+    // entries committed before this call appear in `entries`, every
+    // entry after lands on `entry_rx`. Doing this before the alert
+    // snapshot keeps both ordering pairs internally consistent.
+    let (entries_snapshot, mut entry_rx) = handle.sink.subscribe_with_snapshot();
+
     // Atomically subscribe and snapshot buffered alerts so that
     // warnings emitted before this client connected are replayed
     // exactly once — they appear in the snapshot, and any alert
@@ -73,8 +80,41 @@ async fn handle_connection(stream: tokio::net::UnixStream, handle: PodHandle) {
         }
     }
 
+    // Send the typed snapshot up front so late attachers can
+    // reconstruct view state without an extra round trip.
+    let snapshot_event = Event::Snapshot {
+        entries: entries_snapshot
+            .into_iter()
+            .map(|e| serde_json::to_value(&e).expect("LogEntry is Serialize"))
+            .collect(),
+        greeting: handle.shared_state.greeting.clone(),
+        status: handle.shared_state.get_status(),
+    };
+    if writer.write(&snapshot_event).await.is_err() {
+        return;
+    }
+
     loop {
         tokio::select! {
+            // Live session-log entries → this client as Event::Entry.
+            entry = entry_rx.recv() => {
+                match entry {
+                    Ok(entry) => {
+                        let value = serde_json::to_value(&entry)
+                            .expect("LogEntry is Serialize");
+                        if writer.write(&Event::Entry { entry: value }).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        // Slow client fell behind the broadcast buffer.
+                        // Drop the connection so the next reconnect
+                        // re-seeds the prefix via subscribe_with_snapshot.
+                        break;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
             // Broadcast events → this client
             event = rx.recv() => {
                 match event {
@@ -123,57 +163,6 @@ async fn handle_connection(stream: tokio::net::UnixStream, handle: PodHandle) {
                         };
                         if writer
                             .write(&Event::Completions { kind, entries })
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    Ok(Some(Method::GetHistory)) => {
-                        let items = handle.shared_state.history();
-                        let segments_per_user = handle.shared_state.user_segments();
-                        // Embed `segments` on user-message JSON values so
-                        // the TUI can re-render typed atoms on restore.
-                        // Alignment: segments are recorded only for
-                        // submissions made during the live session, never
-                        // for seed history loaded via `SessionStart.history`
-                        // (post-compaction). The seed user_messages always
-                        // come first in worker history, so the last
-                        // `segments_per_user.len()` user_messages are the
-                        // ones that map 1:1 to the segments list.
-                        let total_user_msgs =
-                            items.iter().filter(|i| i.is_user_message()).count();
-                        let skip = total_user_msgs.saturating_sub(segments_per_user.len());
-                        let mut user_idx = 0usize;
-                        let values = items
-                            .iter()
-                            .map(|item| {
-                                let mut value =
-                                    serde_json::to_value(item).expect("Item is Serialize");
-                                if item.is_user_message() {
-                                    if user_idx >= skip {
-                                        let seg_idx = user_idx - skip;
-                                        if let Some(obj) = value.as_object_mut() {
-                                            let segs = serde_json::to_value(
-                                                &segments_per_user[seg_idx],
-                                            )
-                                            .expect("Segment is Serialize");
-                                            obj.insert("segments".into(), segs);
-                                        }
-                                    }
-                                    user_idx += 1;
-                                }
-                                value
-                            })
-                            .collect();
-                        let greeting = handle.shared_state.greeting.clone();
-                        let status = handle.shared_state.get_status();
-                        if writer
-                            .write(&Event::History {
-                                items: values,
-                                greeting,
-                                status,
-                            })
                             .await
                             .is_err()
                         {

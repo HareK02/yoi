@@ -256,9 +256,10 @@ async fn run(
     let mut app = App::new(pod_name);
 
     match PodClient::connect(socket_path).await {
-        Ok(mut client) => {
+        Ok(client) => {
             app.connected = true;
-            let _ = client.send(&Method::GetHistory).await;
+            // The Pod sends `Event::Snapshot` automatically on connect;
+            // no explicit method call is required to fetch history.
             run_loop(terminal, &mut app, client).await?;
         }
         Err(e) => {
