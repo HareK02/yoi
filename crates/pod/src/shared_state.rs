@@ -188,7 +188,6 @@ mod tests {
         assert_eq!(parsed["state"], "running");
     }
 
-
     #[test]
     fn knowledge_completions_empty_when_unset() {
         let state = test_state();

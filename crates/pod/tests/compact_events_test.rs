@@ -179,7 +179,12 @@ fn drain(rx: &mut broadcast::Receiver<Event>) -> Vec<Event> {
 
 /// Collect every system-message text that the post-compaction
 /// `SessionStart.history` carries, by reading the sink mirror directly.
-fn system_texts_in_sink_session_start(pod: &pod::Pod<impl llm_worker::llm_client::client::LlmClient + Clone + 'static, impl session_store::Store + Clone + 'static>) -> Vec<String> {
+fn system_texts_in_sink_session_start(
+    pod: &pod::Pod<
+        impl llm_worker::llm_client::client::LlmClient + Clone + 'static,
+        impl session_store::Store + Clone + 'static,
+    >,
+) -> Vec<String> {
     let (entries, _rx) = pod.sink().subscribe_with_snapshot();
     for entry in entries.into_iter().rev() {
         if let session_store::LogEntry::SessionStart { history, .. } = entry {

@@ -420,7 +420,10 @@ mod tests {
         let (snapshot, mut rx) = sink.subscribe_with_snapshot();
         assert_eq!(snapshot.len(), 2);
         assert!(matches!(snapshot[0], LogEntry::SessionStart { .. }));
-        assert!(matches!(snapshot[1], LogEntry::TurnEnd { turn_count: 1, .. }));
+        assert!(matches!(
+            snapshot[1],
+            LogEntry::TurnEnd { turn_count: 1, .. }
+        ));
         assert!(rx.try_recv().is_err());
     }
 
@@ -443,10 +446,7 @@ mod tests {
 
         // TurnEnd is mirror-only — no live broadcast.
         sink.publish(turn_end(1));
-        assert!(
-            rx.try_recv().is_err(),
-            "TurnEnd must not be broadcast live"
-        );
+        assert!(rx.try_recv().is_err(), "TurnEnd must not be broadcast live");
 
         // HookInjectedItems is live-relevant.
         sink.publish(hook_injected("[Notify] hi"));

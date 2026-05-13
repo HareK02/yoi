@@ -511,10 +511,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     /// broadcast sink. Holds the session-head async lock across the
     /// disk write and the sink publish so subscribers see a gap-free
     /// `(snapshot, live)` stream consistent with what's on disk.
-    pub(crate) async fn commit_entry(
-        &self,
-        entry: LogEntry,
-    ) -> Result<EntryHash, StoreError> {
+    pub(crate) async fn commit_entry(&self, entry: LogEntry) -> Result<EntryHash, StoreError> {
         let mut head = self.session_head.lock().await;
         let hash = session_store::append_entry_with_hash(
             &self.store,
@@ -1643,10 +1640,9 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                         .iter()
                         .map(session_store::LoggedItem::from)
                         .collect();
-                    self.commit_entry(LogEntry::ToolResults { ts, items }).await?;
-                } else if item.is_assistant_message()
-                    || item.is_tool_call()
-                    || item.is_reasoning()
+                    self.commit_entry(LogEntry::ToolResults { ts, items })
+                        .await?;
+                } else if item.is_assistant_message() || item.is_tool_call() || item.is_reasoning()
                 {
                     let start = i;
                     while i < new_items.len()
@@ -2766,8 +2762,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
         if state.head_hash.is_none() {
             return Err(PodError::SessionEmpty { session_id });
         }
-        let mirror_entries: Vec<LogEntry> =
-            raw_entries.iter().map(|e| e.entry.clone()).collect();
+        let mirror_entries: Vec<LogEntry> = raw_entries.iter().map(|e| e.entry.clone()).collect();
         let scope_snapshot = state
             .pod_scope
             .clone()

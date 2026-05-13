@@ -401,10 +401,8 @@ fn wire_event_bridges_on_worker<C, St>(
 /// off the channel and commits each item as a typed `LogEntry` through
 /// the supplied store + sink. Lives as long as the controller; exits
 /// when the sender is dropped (controller shutdown).
-async fn run_log_drain<St>(
-    mut rx: mpsc::UnboundedReceiver<LogCommand>,
-    ctx: LogDrainHandle<St>,
-) where
+async fn run_log_drain<St>(mut rx: mpsc::UnboundedReceiver<LogCommand>, ctx: LogDrainHandle<St>)
+where
     St: session_store::Store + Clone + Send + 'static,
 {
     while let Some(cmd) = rx.recv().await {

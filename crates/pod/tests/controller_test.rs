@@ -287,10 +287,7 @@ async fn snapshot_includes_user_input_for_in_flight_turn() {
                         }
                     }
                 }
-                assert!(
-                    found,
-                    "snapshot must carry the in-flight UserInput entry"
-                );
+                assert!(found, "snapshot must carry the in-flight UserInput entry");
                 return;
             }
             Event::Alert(_) => continue,
