@@ -96,13 +96,30 @@ async fn handle_connection(stream: tokio::net::UnixStream, handle: PodHandle) {
 
     loop {
         tokio::select! {
-            // Live session-log entries → this client as Event::Entry.
+            // Live session-log entries → dispatched as the role-specific
+            // wire events. The sink only broadcasts entries that the
+            // streaming-event lane doesn't cover; everything else is
+            // already on the wire via TextDelta / ToolCall* / etc., so we
+            // never see (and never need to forward) other variants here.
             entry = entry_rx.recv() => {
                 match entry {
                     Ok(entry) => {
                         let value = serde_json::to_value(&entry)
                             .expect("LogEntry is Serialize");
-                        if writer.write(&Event::Entry { entry: value }).await.is_err() {
+                        let outbound = match &entry {
+                            session_store::LogEntry::SessionStart { .. } => {
+                                Some(Event::SessionRotated { entry: value })
+                            }
+                            session_store::LogEntry::HookInjectedItems { .. } => {
+                                Some(Event::HookInjectedItems { entry: value })
+                            }
+                            // Defensive: should never reach here per
+                            // `SessionLogSink::is_live_relevant`.
+                            _ => None,
+                        };
+                        if let Some(event) = outbound
+                            && writer.write(&event).await.is_err()
+                        {
                             break;
                         }
                     }

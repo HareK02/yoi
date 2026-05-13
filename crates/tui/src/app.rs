@@ -491,8 +491,14 @@ impl App {
                 self.blocks.push(Block::PodEvent { event });
                 self.assistant_streaming = false;
             }
-            Event::Entry { entry } => {
-                self.apply_log_entry(&entry);
+            Event::SessionRotated { entry } => {
+                self.reset_for_rotation();
+                self.apply_log_entry_raw(&entry);
+                self.assistant_streaming = false;
+            }
+            Event::HookInjectedItems { entry } => {
+                self.apply_log_entry_raw(&entry);
+                self.assistant_streaming = false;
             }
             Event::TurnStart { .. } => {
                 self.set_pod_status(PodStatus::Running);
@@ -926,33 +932,22 @@ impl App {
         self.mark_orphan_tool_calls_incomplete_pass();
     }
 
-    /// Apply a single live `Event::Entry`.
-    ///
-    /// `SessionStart` entries that arrive live (compaction / fork)
-    /// reset the block list to a freshly seeded view, matching what a
-    /// reconnect's `Event::Snapshot` would produce.
-    fn apply_log_entry(&mut self, entry: &serde_json::Value) {
-        if entry.get("kind").and_then(|k| k.as_str()) == Some("session_start") {
-            // Compaction / fork on the server side. Reset our derived
-            // view but keep the greeting (identity hasn't changed).
-            let greeting = self
-                .blocks
-                .iter()
-                .find_map(|b| match b {
-                    Block::Greeting(g) => Some(g.clone()),
-                    _ => None,
-                });
-            self.turn_index = 0;
-            self.blocks.clear();
-            self.cache = FileCache::new();
-            self.task_store = TaskStore::new();
-            self.task_pane_scroll = 0;
-            if let Some(g) = greeting {
-                self.blocks.push(Block::Greeting(g));
-            }
+    /// Drop the derived view in preparation for replaying a new
+    /// `SessionStart` (compaction / fork). Greeting is preserved
+    /// because the Pod identity hasn't changed.
+    fn reset_for_rotation(&mut self) {
+        let greeting = self.blocks.iter().find_map(|b| match b {
+            Block::Greeting(g) => Some(g.clone()),
+            _ => None,
+        });
+        self.turn_index = 0;
+        self.blocks.clear();
+        self.cache = FileCache::new();
+        self.task_store = TaskStore::new();
+        self.task_pane_scroll = 0;
+        if let Some(g) = greeting {
+            self.blocks.push(Block::Greeting(g));
         }
-        self.apply_log_entry_raw(entry);
-        self.assistant_streaming = false;
     }
 
     /// Walk a single `LogEntry` JSON value and translate it into blocks
@@ -1427,7 +1422,7 @@ mod completion_flow_tests {
     }
 
     #[test]
-    fn live_entry_routes_system_message_via_hook_injected_items() {
+    fn live_hook_injected_items_event_appends_system_message_block() {
         let mut app = App::new("test".into());
         let entry = serde_json::json!({
             "kind": "hook_injected_items",
@@ -1438,7 +1433,7 @@ mod completion_flow_tests {
                 "content": [{ "kind": "text", "text": "[Workflow /build]\nRun the build" }],
             }],
         });
-        app.handle_pod_event(Event::Entry { entry });
+        app.handle_pod_event(Event::HookInjectedItems { entry });
 
         assert!(matches!(
             app.blocks.as_slice(),
@@ -1582,7 +1577,7 @@ mod completion_flow_tests {
             ```json\n{\n  \"tasks\": [\n    {\n      \"taskid\": 4,\n      \
             \"status\": \"inprogress\",\n      \"subject\": \"from snapshot\",\n      \
             \"description\": \"d\"\n    }\n  ]\n}\n```\n";
-        app.handle_pod_event(Event::Entry {
+        app.handle_pod_event(Event::HookInjectedItems {
             entry: serde_json::json!({
                 "kind": "hook_injected_items",
                 "ts": 1,

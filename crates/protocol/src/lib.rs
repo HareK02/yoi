@@ -305,29 +305,45 @@ pub enum Event {
     /// Sent exactly once at the start of every client connection.
     ///
     /// `entries` is the session-log mirror at subscribe time, serialised
-    /// as the JSON form of `session_store::LogEntry`. Late attachers
-    /// reconstruct view state by replaying entries through their own
-    /// `LogEntry → block` mapping, then continue applying live
-    /// `Event::Entry` updates received after the snapshot.
+    /// as the JSON form of `session_store::LogEntry`. This is the
+    /// bulk-reconstruction lane: clients walk the entries to seed their
+    /// derived view.
     ///
     /// `greeting` and `status` accompany the snapshot so clients render
     /// pod identity and current controller state without an extra round
     /// trip.
+    ///
+    /// Live updates after the snapshot arrive through the streaming
+    /// events (`TextDelta` / `ToolCall*` / `ToolResult` / etc.) plus
+    /// the two role-specific entry events
+    /// (`SessionRotated` / `HookInjectedItems`) — there is no generic
+    /// "every committed entry" broadcast.
     Snapshot {
         entries: Vec<serde_json::Value>,
         greeting: Greeting,
         #[serde(default)]
         status: PodStatus,
     },
-    /// A single session-log entry committed atomically with the disk
-    /// write. Streamed as the suffix following the connect-time
-    /// `Snapshot`; the prefix/suffix boundary is gap-free and
-    /// duplicate-free per `SessionLogSink` semantics.
+    /// Server-side session log rotated to a fresh `SessionStart`.
     ///
-    /// Payload is the JSON form of `session_store::LogEntry`. Clients
-    /// deserialize as needed to render typed atoms (e.g.
-    /// `UserInput.segments`).
-    Entry {
+    /// Fires on compaction and on auto-fork when the store head drifts
+    /// from the live writer's cached head. Clients drop their derived
+    /// view and reseed from `entry.history` exactly the way they would
+    /// from a connect-time `Snapshot`.
+    ///
+    /// Payload is the JSON form of `session_store::LogEntry::SessionStart`.
+    SessionRotated {
+        entry: serde_json::Value,
+    },
+    /// A non-LLM-driven history append landed in the worker history.
+    ///
+    /// Carries the JSON form of `session_store::LogEntry::HookInjectedItems`.
+    /// This is the live counterpart of items that the streaming lane
+    /// never broadcasts — `Method::Notify` echoes, `@<path>` attachment
+    /// resolutions, `<system-reminder>` injections — so a connected
+    /// client can render them in time order without waiting for the
+    /// next reconnect's `Snapshot`.
+    HookInjectedItems {
         entry: serde_json::Value,
     },
     /// Current Pod controller status. Broadcast on every controller-level
@@ -759,18 +775,36 @@ mod tests {
     }
 
     #[test]
-    fn event_entry_roundtrip() {
-        let event = Event::Entry {
-            entry: serde_json::json!({"kind": "assistant_items", "ts": 42, "items": []}),
+    fn event_session_rotated_roundtrip() {
+        let event = Event::SessionRotated {
+            entry: serde_json::json!({"kind": "session_start", "ts": 1, "history": []}),
         };
         let json = serde_json::to_string(&event).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed["event"], "entry");
-        assert_eq!(parsed["data"]["entry"]["kind"], "assistant_items");
+        assert_eq!(parsed["event"], "session_rotated");
+        assert_eq!(parsed["data"]["entry"]["kind"], "session_start");
         let decoded: Event = serde_json::from_str(&json).unwrap();
         match decoded {
-            Event::Entry { entry } => assert_eq!(entry["kind"], "assistant_items"),
-            other => panic!("expected Entry, got {other:?}"),
+            Event::SessionRotated { entry } => assert_eq!(entry["kind"], "session_start"),
+            other => panic!("expected SessionRotated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn event_hook_injected_items_roundtrip() {
+        let event = Event::HookInjectedItems {
+            entry: serde_json::json!({"kind": "hook_injected_items", "ts": 42, "items": []}),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["event"], "hook_injected_items");
+        assert_eq!(parsed["data"]["entry"]["kind"], "hook_injected_items");
+        let decoded: Event = serde_json::from_str(&json).unwrap();
+        match decoded {
+            Event::HookInjectedItems { entry } => {
+                assert_eq!(entry["kind"], "hook_injected_items")
+            }
+            other => panic!("expected HookInjectedItems, got {other:?}"),
         }
     }
 

@@ -83,11 +83,23 @@ impl SessionLogSink {
         }
     }
 
-    /// Push `entry` to the mirror and broadcast it.
+    /// Push `entry` to the mirror; selectively broadcast it.
     ///
     /// MUST be called only after the Pod has successfully persisted the
     /// entry to the underlying `Store` — disk write is the gate. Failed
     /// disk writes must not call `publish`.
+    ///
+    /// Live broadcast fires only for entries that the streaming-event
+    /// lane does not cover:
+    ///   - `LogEntry::SessionStart` → `Event::SessionRotated` on the wire.
+    ///   - `LogEntry::HookInjectedItems` → `Event::HookInjectedItems`.
+    /// Everything else (AssistantItems, ToolResults, UserInput, TurnEnd,
+    /// RunCompleted, RunErrored, LlmUsage, Extension, ConfigChanged) is
+    /// reflected in the mirror so reconnect snapshots stay accurate,
+    /// but is not sent live — the streaming events (TextDelta /
+    /// ToolCallStart / ToolResult / UserMessage / TurnEnd / etc.)
+    /// already provide that data, and re-broadcasting it as a typed
+    /// entry would just double-render every block on the client side.
     pub fn publish(&self, entry: LogEntry) {
         let mut mirror = self
             .inner
@@ -95,10 +107,21 @@ impl SessionLogSink {
             .lock()
             .expect("session log mirror mutex poisoned");
         mirror.push(entry.clone());
-        // SendError means there are zero subscribers; harmless. We hold
-        // the mirror lock across `send` so that `subscribe_with_snapshot`
-        // cannot observe an inconsistent (snapshot, receiver) pair.
-        let _ = self.inner.broadcast_tx.send(entry);
+        if Self::is_live_relevant(&entry) {
+            // SendError means there are zero subscribers; harmless. The
+            // mirror lock is held across `send` so subscribers cannot
+            // observe an inconsistent (snapshot, receiver) pair.
+            let _ = self.inner.broadcast_tx.send(entry);
+        }
+    }
+
+    /// `true` for entry kinds that the IPC layer forwards to clients
+    /// as a typed live event.
+    fn is_live_relevant(entry: &LogEntry) -> bool {
+        matches!(
+            entry,
+            LogEntry::SessionStart { .. } | LogEntry::HookInjectedItems { .. }
+        )
     }
 
     /// Atomically swap the mirror to `[initial]` and broadcast the new
@@ -401,20 +424,40 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
+    fn hook_injected(text: &str) -> LogEntry {
+        LogEntry::HookInjectedItems {
+            ts: now_millis(),
+            items: vec![session_store::LoggedItem::from(
+                &llm_worker::Item::system_message(text),
+            )],
+        }
+    }
+
     #[test]
-    fn subscribe_then_publish_delivers_live_entries() {
+    fn subscribe_then_publish_delivers_only_live_relevant_entries() {
         let sink = SessionLogSink::new();
         sink.publish(session_start());
 
         let (snapshot, mut rx) = sink.subscribe_with_snapshot();
         assert_eq!(snapshot.len(), 1);
 
+        // TurnEnd is mirror-only — no live broadcast.
         sink.publish(turn_end(1));
+        assert!(
+            rx.try_recv().is_err(),
+            "TurnEnd must not be broadcast live"
+        );
+
+        // HookInjectedItems is live-relevant.
+        sink.publish(hook_injected("[Notify] hi"));
         match rx.try_recv() {
-            Ok(LogEntry::TurnEnd { turn_count: 1, .. }) => {}
-            other => panic!("unexpected: {other:?}"),
+            Ok(LogEntry::HookInjectedItems { .. }) => {}
+            other => panic!("expected HookInjectedItems, got {other:?}"),
         }
-        assert!(rx.try_recv().is_err());
+
+        // Mirror still grew with both entries (snapshot completeness).
+        let (after_snapshot, _) = sink.subscribe_with_snapshot();
+        assert_eq!(after_snapshot.len(), 3);
     }
 
     #[test]
@@ -422,11 +465,11 @@ mod tests {
         let sink = SessionLogSink::new();
         sink.publish(session_start());
         let (snapshot, mut rx) = sink.subscribe_with_snapshot();
-        sink.publish(turn_end(1));
+        sink.publish(hook_injected("post-snapshot"));
 
         assert_eq!(snapshot.len(), 1);
         match rx.try_recv() {
-            Ok(LogEntry::TurnEnd { turn_count: 1, .. }) => {}
+            Ok(LogEntry::HookInjectedItems { .. }) => {}
             other => panic!("unexpected: {other:?}"),
         }
         assert!(rx.try_recv().is_err());
