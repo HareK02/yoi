@@ -8,8 +8,9 @@
 //! `kind` instead of parsing text prefixes like `[Notification] …` or
 //! `[File: …]`.
 //!
-//! Persisted as the payload of [`crate::LogEntry::SystemItems`], and
-//! broadcast live as the payload of `Event::SystemItem` on the wire.
+//! Persisted as the payload of [`crate::LogEntry::SystemItem`] (one
+//! entry per item), and broadcast live as the payload of
+//! `Event::SystemItem` on the wire.
 //!
 //! For LLM context replay, each `SystemItem` reduces to an
 //! `Item::system_message(...)` whose body matches the legacy free-text

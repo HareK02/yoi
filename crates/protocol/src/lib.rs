@@ -224,10 +224,10 @@ pub enum Event {
     /// of parsing free-text prefixes like `[Notification] …` or
     /// `[File: …]`.
     ///
-    /// Fired per-item, even when the underlying
-    /// `LogEntry::SystemItems` entry batched several together — the
-    /// IPC layer fans the batch out at broadcast time so subscribers
-    /// observe one event per item.
+    /// One event per `LogEntry::SystemItem` commit. Disk-side and
+    /// wire-side are 1:1 (singular variant); legacy `SystemItems`
+    /// entries from older sessions are read-only and never emitted on
+    /// this lane.
     SystemItem {
         item: serde_json::Value,
     },

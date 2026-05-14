@@ -967,6 +967,16 @@ impl App {
                     self.blocks.push(Block::UserMessage { segments });
                 }
             }
+            session_store::LogEntry::AssistantItem { item, .. }
+            | session_store::LogEntry::ToolResult { item, .. } => {
+                let it: llm_worker::Item = item.into();
+                let item_value = serde_json::to_value(&it).expect("Item is Serialize");
+                self.push_history_item(&item_value);
+            }
+            session_store::LogEntry::SystemItem { item, .. } => {
+                let value = serde_json::to_value(&item).expect("SystemItem is Serialize");
+                self.apply_system_item(&value);
+            }
             session_store::LogEntry::AssistantItems { items, .. }
             | session_store::LogEntry::ToolResults { items, .. }
             | session_store::LogEntry::HookInjectedItems { items, .. } => {

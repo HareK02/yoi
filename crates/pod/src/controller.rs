@@ -616,7 +616,7 @@ async fn controller_loop<C, St>(
             Method::Notify { message } => {
                 // Client-side live echo is delivered as `Event::SystemItem`
                 // once the interceptor commits the corresponding
-                // `LogEntry::SystemItems` entry — drained out of the
+                // `LogEntry::SystemItem` entry — drained out of the
                 // notify buffer + broadcast through the sink. No
                 // separate echo here.
                 pod.push_notify(message);
@@ -674,8 +674,8 @@ async fn controller_loop<C, St>(
                 // Live echo travels through the SystemItem lane: once
                 // the interceptor drains the notify buffer, the
                 // typed `SystemItem::PodEvent` lands as a
-                // `LogEntry::SystemItems` entry and the sink fans it
-                // out to clients as `Event::SystemItem`.
+                // `LogEntry::SystemItem` entry and the sink forwards it
+                // to clients as `Event::SystemItem`.
                 //
                 // (1) system side effects — idempotent and tolerant of
                 // out-of-order delivery (e.g. `TurnEnded` arriving

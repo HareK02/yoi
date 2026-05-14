@@ -115,9 +115,20 @@ async fn handle_connection(stream: tokio::net::UnixStream, handle: PodHandle) {
                                     .expect("SystemItem is Serialize");
                                 Some(Event::SystemItem { item: value })
                             }
-                            // Defensive: should never reach here per
-                            // `SessionLogSink::is_live_relevant`.
-                            _ => None,
+                            other => {
+                                // `SessionLogSink::is_live_relevant` keeps
+                                // non-live-relevant variants off the
+                                // broadcast lane; reaching here means the
+                                // two are out of sync and we silently
+                                // dropped a wire event. Log so a future
+                                // regression surfaces instead of vanishing.
+                                tracing::error!(
+                                    entry_kind = ?std::mem::discriminant(&other),
+                                    "session-log broadcast emitted a non-live-relevant entry; \
+                                     sink filter and IPC dispatch are out of sync"
+                                );
+                                None
+                            }
                         };
                         if let Some(event) = outbound {
                             if writer.write(&event).await.is_err() {

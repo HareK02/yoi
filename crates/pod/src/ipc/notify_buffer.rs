@@ -5,8 +5,8 @@
 //! `PodInterceptor::pending_history_appends`, which the Worker calls
 //! at the head of each turn loop iteration. The drain renders each
 //! pending entry into a typed `SystemItem` (with the `notify_wrapper`
-//! prompt applied), commits a `LogEntry::SystemItems` through the
-//! session-log sink, and returns the corresponding
+//! prompt applied), commits a `LogEntry::SystemItem` per entry through
+//! the session-log sink, and returns the corresponding
 //! `Item::system_message`s for the worker to append to its
 //! persistent history.
 //!

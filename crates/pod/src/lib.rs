@@ -31,5 +31,5 @@ pub use prompt::system::{SystemPromptContext, SystemPromptError, SystemPromptTem
 pub use protocol::{ErrorCode, Event, Method, PodStatus, TurnResult};
 pub use provider::{ProviderError, build_client};
 pub use runtime::dir::RuntimeDir;
-pub use session_log_sink::{SessionLogSink, SessionLogWriter};
+pub use session_log_sink::SessionLogSink;
 pub use shared_state::PodSharedState;

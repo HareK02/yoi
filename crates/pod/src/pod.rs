@@ -55,20 +55,11 @@ pub struct SessionHead {
 /// All three fields are `Clone` (the latter two as `Arc` clones, the
 /// store per its `Clone` impl) so the handle itself is a flat triple of
 /// cheap copies.
-pub struct LogWriterHandle<St> {
+#[derive(Clone)]
+pub struct LogWriterHandle<St: Clone> {
     pub store: St,
     pub session_head: Arc<SyncMutex<SessionHead>>,
     pub sink: SessionLogSink,
-}
-
-impl<St: Clone> Clone for LogWriterHandle<St> {
-    fn clone(&self) -> Self {
-        Self {
-            store: self.store.clone(),
-            session_head: self.session_head.clone(),
-            sink: self.sink.clone(),
-        }
-    }
 }
 
 impl<St> LogWriterHandle<St>
@@ -1125,7 +1116,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         self.ensure_interceptor_installed();
         self.ensure_system_prompt_materialized()?;
         self.cleanup_finished_memory_task();
-        self.ensure_session_head().await?;
+        self.ensure_session_head()?;
         if self.should_pre_run_compact() {
             self.join_memory_task().await;
         }
@@ -1520,7 +1511,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     /// `ensure_system_prompt_materialized` has just rendered. Subsequent
     /// calls fall through to `ensure_head_or_fork`, which auto-forks when
     /// another writer has advanced the store head behind our back.
-    async fn ensure_session_head(&mut self) -> Result<(), PodError> {
+    fn ensure_session_head(&mut self) -> Result<(), PodError> {
         let w = self.worker.as_ref().unwrap();
         let prev_session_id;
         let initial_state = {
@@ -1545,7 +1536,6 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         let store_head = self
             .store
             .read_head_hash(prev_session_id)
-            
             .map_err(PodError::from)?;
         let mut head = self.session_head.lock();
         if store_head == head.head_hash {
@@ -1571,7 +1561,6 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         };
         self.store
             .create_session(fork_id, &[hashed])
-            
             .map_err(PodError::from)?;
         head.session_id = fork_id;
         head.head_hash = Some(hash);
@@ -1715,22 +1704,12 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         history_before: usize,
         result: &Result<WorkerResult, WorkerError>,
     ) -> Result<(), StoreError> {
-        // Per-item commits for AssistantItems / ToolResults /
-        // HookInjectedItems already landed mid-turn through the
-        // controller-spawned drain task, fed by
-        // `Worker::on_history_append`. Drain the queue here so every
-        // in-flight item has actually been committed before the
-        // trailing `TurnEnd` entry. When no drain is wired (low-level
-        // tests / direct `Pod::new` usage) we fall back to a synchronous
-        // pass that replicates the legacy `save_delta` classification —
-        // those code paths don't fire `on_history_append`, so the items
-        // would otherwise be lost.
         // Per-item commits for AssistantItem / ToolResult / SystemItem
         // entries are expected to have landed synchronously: the
         // worker `on_history_append` callback (wired by the controller
         // via `wire_history_persistence`) commits each appended item
         // directly through the writer, and the interceptor commits
-        // SystemItems up-front in `on_prompt_submit` /
+        // SystemItem entries up-front in `on_prompt_submit` /
         // `pending_history_appends` before returning the matching
         // `Item::system_message`s.
         //
