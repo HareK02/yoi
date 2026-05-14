@@ -91,6 +91,7 @@ impl SessionLogSink {
     /// lane does not cover:
     ///   - `LogEntry::SessionStart` → `Event::SessionRotated` on the wire.
     ///   - `LogEntry::SystemItem`   → `Event::SystemItem`.
+    ///   - `LogEntry::Invoke`       → `Event::InvokeStart`.
     /// Everything else (AssistantItem, ToolResult, UserInput, TurnEnd,
     /// RunCompleted, RunErrored, LlmUsage, Extension, ConfigChanged) is
     /// reflected in the mirror so reconnect snapshots stay accurate,
@@ -118,7 +119,9 @@ impl SessionLogSink {
     fn is_live_relevant(entry: &LogEntry) -> bool {
         matches!(
             entry,
-            LogEntry::SessionStart { .. } | LogEntry::SystemItem { .. }
+            LogEntry::SessionStart { .. }
+                | LogEntry::SystemItem { .. }
+                | LogEntry::Invoke { .. }
         )
     }
 

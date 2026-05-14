@@ -10,7 +10,7 @@
 
 use llm_worker::llm_client::types::{Item, RequestConfig};
 use llm_worker::{UsageRecord, WorkerResult};
-use protocol::{ScopeRule, Segment};
+use protocol::{InvokeKind, ScopeRule, Segment};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -91,8 +91,13 @@ pub struct HashedEntry {
 ///
 /// Variants correspond to specific mutation points in `Worker`:
 /// - `SessionStart` — always the first entry; captures initial state
+/// - `Invoke` — IDLE → active marker (start of a new self-driving cycle)
 /// - `UserInput` / `AssistantItems` / `ToolResults` / `HookInjectedItems` — history appends
-/// - `TurnEnd` — turn boundary marker
+/// - `TurnEnd` — AgentTurn boundary marker; carries the post-increment
+///   `turn_count`. With retry unimplemented today this fires once per
+///   `run()`/`resume()` (current callers persist a single TurnEnd at
+///   run completion); the fork-point seq for `at_turn_index` is the
+///   preceding `Invoke` entry, not the TurnEnd.
 /// - `RunCompleted` / `RunErrored` — marks end of a `run()` or `resume()` call
 /// - `ConfigChanged` — `RequestConfig` mutation
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -112,6 +117,23 @@ pub enum LogEntry {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         compacted_from: Option<SessionOrigin>,
     },
+
+    /// IDLE → active marker. Records the start of a new self-driving
+    /// cycle (Invoke range). The range extends implicitly until the
+    /// next `Invoke` entry; this entry carries the trigger only — the
+    /// actual payload (user text / notify message / pod event body) is
+    /// in the immediately following Turn entry (`UserInput` / `SystemItem`).
+    ///
+    /// Used by `pod-session-fork` style operations: the fork-point seq
+    /// (`at_turn_index` in persistence-semantics) points at one of these
+    /// `Invoke` entries so "back to N-th send" maps cleanly to the
+    /// IDLE-break boundary the user sees.
+    ///
+    /// Field name is `trigger` (not `kind`) because the LogEntry
+    /// serde tag already occupies `"kind"`.
+    ///
+    /// Marker only — replay does not mutate `RestoredState`.
+    Invoke { ts: u64, trigger: InvokeKind },
 
     /// User input accepted at submit time. Carries the original typed
     /// `Vec<Segment>` so clients can re-render typed atoms (paste chips,
@@ -289,6 +311,11 @@ pub fn collect_state(entries: &[HashedEntry]) -> RestoredState {
                 state.system_prompt = system_prompt.clone();
                 state.config = config.clone();
                 state.history = history.iter().cloned().map(Item::from).collect();
+            }
+            LogEntry::Invoke { .. } => {
+                // Marker only; no state mutation. The trailing
+                // UserInput / SystemItem / TurnEnd entries carry all
+                // replay-relevant data.
             }
             LogEntry::UserInput { segments, .. } => {
                 let text = Segment::flatten_to_text(segments);
@@ -653,6 +680,59 @@ mod tests {
             }
             other => panic!("expected LlmUsage, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn invoke_entry_round_trip_via_json() {
+        let entry = LogEntry::Invoke {
+            ts: 12345,
+            trigger: InvokeKind::UserSend,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["kind"], "invoke");
+        assert_eq!(parsed["trigger"], "user_send");
+        let decoded: LogEntry = serde_json::from_str(&json).unwrap();
+        match decoded {
+            LogEntry::Invoke { ts, trigger } => {
+                assert_eq!(ts, 12345);
+                assert_eq!(trigger, InvokeKind::UserSend);
+            }
+            other => panic!("expected Invoke, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn replay_invoke_marker_does_not_mutate_state() {
+        let entries = build_chain(&[
+            LogEntry::SessionStart {
+                ts: 0,
+                system_prompt: None,
+                config: RequestConfig::default(),
+                history: vec![],
+                forked_from: None,
+                compacted_from: None,
+            },
+            LogEntry::Invoke {
+                ts: 100,
+                trigger: InvokeKind::UserSend,
+            },
+            LogEntry::UserInput {
+                ts: 101,
+                segments: vec![Segment::text("hi")],
+            },
+            LogEntry::TurnEnd {
+                ts: 200,
+                turn_count: 1,
+            },
+            LogEntry::Invoke {
+                ts: 300,
+                trigger: InvokeKind::Notify,
+            },
+        ]);
+        let state = collect_state(&entries);
+        assert_eq!(state.history.len(), 1);
+        assert_eq!(state.turn_count, 1);
     }
 
     #[test]

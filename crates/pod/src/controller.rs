@@ -95,7 +95,11 @@ async fn finish_controller_run<C, St>(
 enum PendingRun {
     Run(Vec<Segment>),
     InterruptAndRun(Vec<Segment>),
-    RunForNotification,
+    /// Self-initiated turn kicked from the notify buffer. The carried
+    /// `InvokeKind` is the trigger that flipped the Pod from IDLE
+    /// (Notify or PodEvent) and is recorded by the Invoke marker
+    /// committed at the start of `pod.run_for_notification`.
+    RunForNotification(protocol::InvokeKind),
     Resume,
 }
 
@@ -109,7 +113,7 @@ impl PendingRun {
     fn is_parent_originated(&self) -> bool {
         match self {
             PendingRun::Run(_) | PendingRun::InterruptAndRun(_) | PendingRun::Resume => true,
-            PendingRun::RunForNotification => false,
+            PendingRun::RunForNotification(_) => false,
         }
     }
 }
@@ -297,6 +301,16 @@ fn wire_event_bridges_on_worker<C, St>(
             turn,
             result: TurnResult::Finished,
         });
+    });
+
+    let tx = event_tx.clone();
+    worker.on_llm_call_start(move |llm_call| {
+        let _ = tx.send(Event::LlmCallStart { llm_call });
+    });
+
+    let tx = event_tx.clone();
+    worker.on_llm_call_end(move |llm_call| {
+        let _ = tx.send(Event::LlmCallEnd { llm_call });
     });
 
     let tx = event_tx.clone();
@@ -551,9 +565,9 @@ async fn controller_loop<C, St>(
                     )
                     .await
                 }
-                PendingRun::RunForNotification => {
+                PendingRun::RunForNotification(kind) => {
                     drive_turn(
-                        pod.run_for_notification(),
+                        pod.run_for_notification(kind),
                         &mut method_rx,
                         &event_tx,
                         &cancel_tx,
@@ -643,7 +657,9 @@ async fn controller_loop<C, St>(
                 // sees the buffered notification(s) without a human
                 // Run.
                 if shared_state.get_status() == PodStatus::Idle {
-                    pending = Some(PendingRun::RunForNotification);
+                    pending = Some(PendingRun::RunForNotification(
+                        protocol::InvokeKind::Notify,
+                    ));
                 }
             }
 
@@ -711,7 +727,9 @@ async fn controller_loop<C, St>(
                 // notification is not stranded. Matches the
                 // `Method::Notify` idle path.
                 if shared_state.get_status() == PodStatus::Idle {
-                    pending = Some(PendingRun::RunForNotification);
+                    pending = Some(PendingRun::RunForNotification(
+                        protocol::InvokeKind::PodEvent,
+                    ));
                 }
             }
         }
@@ -960,7 +978,9 @@ mod tests {
         assert!(PendingRun::Run(Vec::new()).is_parent_originated());
         assert!(PendingRun::InterruptAndRun(Vec::new()).is_parent_originated());
         assert!(PendingRun::Resume.is_parent_originated());
-        assert!(!PendingRun::RunForNotification.is_parent_originated());
+        assert!(
+            !PendingRun::RunForNotification(protocol::InvokeKind::Notify).is_parent_originated()
+        );
     }
 
     struct DriveTurnEnv {

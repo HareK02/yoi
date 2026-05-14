@@ -153,14 +153,28 @@ pub struct Worker<C: LlmClient, S: WorkerState = Mutable> {
     history: Vec<Item>,
     /// History length at lock time (only meaningful in Locked state)
     locked_prefix_len: usize,
-    /// Turn count
+    /// AgentTurn count.
+    ///
+    /// Once retry (`llm-worker-stream-continuation`) is implemented, an
+    /// AgentTurn collapses N retried `LlmCall`s with identical input;
+    /// today retry is not implemented so AgentTurn and LlmCall fire 1:1
+    /// and the increment site (the LLM-call loop) is shared.
+    /// `max_turns` is interpreted as a per-`run()` AgentTurn cap.
     turn_count: usize,
-    /// Maximum number of turns (None = unlimited)
+    /// LlmCall count (per-Worker running counter, monotonic). Unlike
+    /// `turn_count` this never collapses retries.
+    llm_call_count: usize,
+    /// Maximum number of AgentTurns (None = unlimited)
     max_turns: Option<u32>,
-    /// Turn-start callbacks
+    /// AgentTurn-start callbacks (1:1 with LlmCall today)
     turn_start_cbs: Vec<Box<dyn Fn(usize) + Send + Sync>>,
-    /// Turn-end callbacks
+    /// AgentTurn-end callbacks (1:1 with LlmCall today)
     turn_end_cbs: Vec<Box<dyn Fn(usize) + Send + Sync>>,
+    /// LlmCall-start callbacks (per individual LLM generation request,
+    /// retries included once retry lands)
+    llm_call_start_cbs: Vec<Box<dyn Fn(usize) + Send + Sync>>,
+    /// LlmCall-end callbacks
+    llm_call_end_cbs: Vec<Box<dyn Fn(usize) + Send + Sync>>,
     /// Non-fatal warning callbacks. Invoked when the Worker wants to
     /// surface an advisory message to the upper layer (e.g. Pod) so it
     /// can be forwarded to the user — distinct from `tracing::warn!`,
@@ -315,9 +329,26 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
         });
     }
 
-    /// Register a turn-start callback (receives 0-based turn number).
+    /// Register an AgentTurn-start callback (receives the AgentTurn
+    /// index from `turn_count`).
+    ///
+    /// Today fires 1:1 with the per-LLM-call boundary because retry is
+    /// not yet implemented. Once retry lands, this will fire only once
+    /// per AgentTurn (= retried LlmCall group with identical input).
     pub fn on_turn_start(&mut self, callback: impl Fn(usize) + Send + Sync + 'static) {
         self.turn_start_cbs.push(Box::new(callback));
+    }
+
+    /// Register an LlmCall-start callback (receives the LlmCall index
+    /// from `llm_call_count`). Fires once per LLM generation request,
+    /// retries included.
+    pub fn on_llm_call_start(&mut self, callback: impl Fn(usize) + Send + Sync + 'static) {
+        self.llm_call_start_cbs.push(Box::new(callback));
+    }
+
+    /// Register an LlmCall-end callback.
+    pub fn on_llm_call_end(&mut self, callback: impl Fn(usize) + Send + Sync + 'static) {
+        self.llm_call_end_cbs.push(Box::new(callback));
     }
 
     /// Register a non-fatal warning callback.
@@ -372,7 +403,8 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
         }
     }
 
-    /// Register a turn-end callback (receives 0-based turn number).
+    /// Register an AgentTurn-end callback. See [`on_turn_start`](Self::on_turn_start)
+    /// for the 1:1-vs-N relation with `LlmCall*`.
     pub fn on_turn_end(&mut self, callback: impl Fn(usize) + Send + Sync + 'static) {
         self.turn_end_cbs.push(Box::new(callback));
     }
@@ -463,9 +495,20 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
         self.system_prompt.as_deref()
     }
 
-    /// Get the current turn count
+    /// Get the current AgentTurn count.
+    ///
+    /// AgentTurn is a maximal run of LLM generation calls with identical
+    /// input; today retry is unimplemented so this is also the LLM call
+    /// count. Use [`llm_call_count`](Self::llm_call_count) when the
+    /// caller specifically needs the per-LLM-call number.
     pub fn turn_count(&self) -> usize {
         self.turn_count
+    }
+
+    /// Get the current LlmCall count (per-Worker running counter, never
+    /// collapsed by retry).
+    pub fn llm_call_count(&self) -> usize {
+        self.llm_call_count
     }
 
     /// Get a reference to the current request configuration
@@ -1004,9 +1047,22 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
                 PreRequestAction::Continue => {}
             }
 
+            // LlmCall boundary fires per LLM generation request — today
+            // 1:1 with AgentTurn, but retry (`llm-worker-stream-continuation`)
+            // will multiply this within a single AgentTurn.
+            let current_llm_call = self.llm_call_count;
+            for cb in &self.llm_call_start_cbs {
+                cb(current_llm_call);
+            }
+
             // Stream LLM response
             let request = self.build_request(&tool_definitions, &request_context);
             self.stream_response(request).await?;
+
+            for cb in &self.llm_call_end_cbs {
+                cb(current_llm_call);
+            }
+            self.llm_call_count += 1;
 
             for cb in &self.turn_end_cbs {
                 cb(current_turn);
@@ -1185,9 +1241,12 @@ impl<C: LlmClient> Worker<C, Mutable> {
             history: Vec::new(),
             locked_prefix_len: 0,
             turn_count: 0,
+            llm_call_count: 0,
             max_turns: None,
             turn_start_cbs: Vec::new(),
             turn_end_cbs: Vec::new(),
+            llm_call_start_cbs: Vec::new(),
+            llm_call_end_cbs: Vec::new(),
             warning_cbs: Vec::new(),
             tool_result_cbs: Vec::new(),
             history_append_cbs: Vec::new(),
@@ -1444,9 +1503,12 @@ impl<C: LlmClient> Worker<C, Mutable> {
             history: self.history,
             locked_prefix_len,
             turn_count: self.turn_count,
+            llm_call_count: self.llm_call_count,
             max_turns: self.max_turns,
             turn_start_cbs: self.turn_start_cbs,
             turn_end_cbs: self.turn_end_cbs,
+            llm_call_start_cbs: self.llm_call_start_cbs,
+            llm_call_end_cbs: self.llm_call_end_cbs,
             warning_cbs: self.warning_cbs,
             tool_result_cbs: self.tool_result_cbs,
             history_append_cbs: self.history_append_cbs,
@@ -1527,9 +1589,12 @@ impl<C: LlmClient> Worker<C, Locked> {
             history: self.history,
             locked_prefix_len: 0,
             turn_count: self.turn_count,
+            llm_call_count: self.llm_call_count,
             max_turns: self.max_turns,
             turn_start_cbs: self.turn_start_cbs,
             turn_end_cbs: self.turn_end_cbs,
+            llm_call_start_cbs: self.llm_call_start_cbs,
+            llm_call_end_cbs: self.llm_call_end_cbs,
             warning_cbs: self.warning_cbs,
             tool_result_cbs: self.tool_result_cbs,
             history_append_cbs: self.history_append_cbs,
