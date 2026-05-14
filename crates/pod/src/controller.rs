@@ -99,6 +99,21 @@ enum PendingRun {
     Resume,
 }
 
+impl PendingRun {
+    /// Whether this turn was kicked off by the parent (via `Method::Run`
+    /// or `Method::Resume`). Used by [`drive_turn`] to gate upward
+    /// `PodEvent::TurnEnded` / `PodEvent::Errored` reports so the parent
+    /// only sees completion signals for work it actually delegated.
+    /// `RunForNotification` covers self-initiated turns kicked from the
+    /// notify buffer (Notify / inbound PodEvent) and stays silent.
+    fn is_parent_originated(&self) -> bool {
+        match self {
+            PendingRun::Run(_) | PendingRun::InterruptAndRun(_) | PendingRun::Resume => true,
+            PendingRun::RunForNotification => false,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // PodController — actor that owns a Pod
 // ---------------------------------------------------------------------------
@@ -504,6 +519,7 @@ async fn controller_loop<C, St>(
         // in one place, regardless of which Method caused it.
         if let Some(run) = pending.take() {
             set_controller_status(&shared_state, &runtime_dir, &event_tx, PodStatus::Running).await;
+            let parent_originated = run.is_parent_originated();
             let (new_status, shutdown) = match run {
                 PendingRun::Run(input) => {
                     drive_turn(
@@ -516,6 +532,7 @@ async fn controller_loop<C, St>(
                         self_parent_socket.as_ref(),
                         &spawner_name,
                         &spawned_registry,
+                        parent_originated,
                     )
                     .await
                 }
@@ -530,6 +547,7 @@ async fn controller_loop<C, St>(
                         self_parent_socket.as_ref(),
                         &spawner_name,
                         &spawned_registry,
+                        parent_originated,
                     )
                     .await
                 }
@@ -544,6 +562,7 @@ async fn controller_loop<C, St>(
                         self_parent_socket.as_ref(),
                         &spawner_name,
                         &spawned_registry,
+                        parent_originated,
                     )
                     .await
                 }
@@ -558,6 +577,7 @@ async fn controller_loop<C, St>(
                         self_parent_socket.as_ref(),
                         &spawner_name,
                         &spawned_registry,
+                        parent_originated,
                     )
                     .await
                 }
@@ -736,6 +756,12 @@ async fn controller_loop<C, St>(
 /// `None` parent skips the send (top-level Pod). Transient method
 /// rejections such as `AlreadyRunning` are intentionally NOT reported
 /// as `Errored` — only the worker-execution `Err` branch below fires.
+///
+/// `parent_originated` further restricts both upward reports to turns
+/// the parent actually delegated (`Method::Run` / `Method::Resume`).
+/// `Method::Notify` / inbound `PodEvent` auto-kicks complete silently
+/// so the parent's history does not get flooded with child-internal
+/// turn boundaries.
 #[allow(clippy::too_many_arguments)]
 async fn drive_turn<F>(
     pod_future: F,
@@ -747,6 +773,7 @@ async fn drive_turn<F>(
     parent_socket: Option<&PathBuf>,
     self_name: &str,
     spawned_registry: &Arc<SpawnedPodRegistry>,
+    parent_originated: bool,
 ) -> (PodStatus, bool)
 where
     F: std::future::Future<Output = Result<PodRunResult, PodError>>,
@@ -766,7 +793,7 @@ where
                             PodRunResult::LimitReached => (PodStatus::Idle, RunResult::LimitReached),
                         };
                         let _ = event_tx.send(Event::RunEnd { result: run_result });
-                        if matches!(run_result, RunResult::Finished) {
+                        if parent_originated && matches!(run_result, RunResult::Finished) {
                             crate::ipc::event::fire_and_forget(
                                 parent_socket.cloned(),
                                 protocol::PodEvent::TurnEnded {
@@ -792,13 +819,15 @@ where
                             code,
                             message: message.clone(),
                         });
-                        crate::ipc::event::fire_and_forget(
-                            parent_socket.cloned(),
-                            protocol::PodEvent::Errored {
-                                pod_name: self_name.to_string(),
-                                message,
-                            },
-                        );
+                        if parent_originated {
+                            crate::ipc::event::fire_and_forget(
+                                parent_socket.cloned(),
+                                protocol::PodEvent::Errored {
+                                    pod_name: self_name.to_string(),
+                                    message,
+                                },
+                            );
+                        }
                         (PodStatus::Idle, shutdown_requested)
                     }
                 };
@@ -917,5 +946,224 @@ fn worker_error_code(e: &PodError) -> ErrorCode {
         },
         PodError::Provider(_) => ErrorCode::ProviderError,
         _ => ErrorCode::Internal,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use protocol::PodEvent;
+    use protocol::stream::JsonLineReader;
+    use std::time::Duration;
+    use tempfile::TempDir;
+    use tokio::net::UnixListener;
+
+    #[test]
+    fn pending_run_parent_origin_table() {
+        assert!(PendingRun::Run(Vec::new()).is_parent_originated());
+        assert!(PendingRun::InterruptAndRun(Vec::new()).is_parent_originated());
+        assert!(PendingRun::Resume.is_parent_originated());
+        assert!(!PendingRun::RunForNotification.is_parent_originated());
+    }
+
+    struct DriveTurnEnv {
+        // Held to keep the channel alive; without this `method_rx.recv()`
+        // would observe channel-closed and confuse the select! arm.
+        _method_tx: mpsc::Sender<Method>,
+        method_rx: mpsc::Receiver<Method>,
+        event_tx: broadcast::Sender<Event>,
+        cancel_tx: mpsc::Sender<()>,
+        _cancel_rx: mpsc::Receiver<()>,
+        shared_state: Arc<PodSharedState>,
+        notify_buffer: NotifyBuffer,
+        spawned_registry: Arc<SpawnedPodRegistry>,
+        parent_socket_path: PathBuf,
+        _runtime_dir: Arc<RuntimeDir>,
+        _temp: TempDir,
+    }
+
+    async fn make_env() -> DriveTurnEnv {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime_dir = Arc::new(
+            RuntimeDir::create(temp.path(), "child-pod")
+                .await
+                .expect("runtime dir create"),
+        );
+        let (method_tx, method_rx) = mpsc::channel::<Method>(16);
+        let (event_tx, _) = broadcast::channel::<Event>(16);
+        let (cancel_tx, cancel_rx) = mpsc::channel::<()>(1);
+        let shared_state = Arc::new(PodSharedState::new(
+            "child-pod".to_string(),
+            session_store::new_session_id(),
+            String::new(),
+            protocol::Greeting {
+                pod_name: "child-pod".to_string(),
+                cwd: String::new(),
+                provider: String::new(),
+                model: String::new(),
+                scope_summary: String::new(),
+                tools: Vec::new(),
+            },
+        ));
+        let notify_buffer = NotifyBuffer::new();
+        let spawned_registry = SpawnedPodRegistry::new(runtime_dir.clone());
+        let parent_socket_path = temp.path().join("parent.sock");
+
+        DriveTurnEnv {
+            _method_tx: method_tx,
+            method_rx,
+            event_tx,
+            cancel_tx,
+            _cancel_rx: cancel_rx,
+            shared_state,
+            notify_buffer,
+            spawned_registry,
+            parent_socket_path,
+            _runtime_dir: runtime_dir,
+            _temp: temp,
+        }
+    }
+
+    /// Listen on a bound UnixListener for one inbound connection and
+    /// return the first `Method::PodEvent` read from it. Returns `None`
+    /// on timeout / EOF / non-PodEvent.
+    async fn recv_pod_event(listener: UnixListener, timeout: Duration) -> Option<PodEvent> {
+        let accept = async {
+            let (stream, _) = listener.accept().await.ok()?;
+            let mut reader = JsonLineReader::new(stream);
+            match reader.next::<Method>().await {
+                Ok(Some(Method::PodEvent(e))) => Some(e),
+                _ => None,
+            }
+        };
+        tokio::time::timeout(timeout, accept).await.ok().flatten()
+    }
+
+    #[tokio::test]
+    async fn parent_originated_finished_fires_turn_ended() {
+        let mut env = make_env().await;
+        let listener = UnixListener::bind(&env.parent_socket_path).expect("bind listener");
+        let recv = tokio::spawn(recv_pod_event(listener, Duration::from_secs(2)));
+
+        let pod_future = async { Ok::<_, PodError>(PodRunResult::Finished) };
+        let (status, shutdown) = drive_turn(
+            pod_future,
+            &mut env.method_rx,
+            &env.event_tx,
+            &env.cancel_tx,
+            &env.shared_state,
+            &env.notify_buffer,
+            Some(&env.parent_socket_path),
+            "child-pod",
+            &env.spawned_registry,
+            true,
+        )
+        .await;
+        assert_eq!(status, PodStatus::Idle);
+        assert!(!shutdown);
+
+        let event = recv.await.expect("recv task").expect("PodEvent received");
+        match event {
+            PodEvent::TurnEnded { pod_name } => assert_eq!(pod_name, "child-pod"),
+            other => panic!("expected TurnEnded, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn non_parent_originated_finished_stays_silent() {
+        let mut env = make_env().await;
+        let listener = UnixListener::bind(&env.parent_socket_path).expect("bind listener");
+
+        let pod_future = async { Ok::<_, PodError>(PodRunResult::Finished) };
+        let (status, _) = drive_turn(
+            pod_future,
+            &mut env.method_rx,
+            &env.event_tx,
+            &env.cancel_tx,
+            &env.shared_state,
+            &env.notify_buffer,
+            Some(&env.parent_socket_path),
+            "child-pod",
+            &env.spawned_registry,
+            false,
+        )
+        .await;
+        assert_eq!(status, PodStatus::Idle);
+
+        // Wait long enough for any (incorrect) fire-and-forget send to
+        // land; expect the accept to time out.
+        let accept = tokio::time::timeout(Duration::from_millis(200), listener.accept()).await;
+        assert!(
+            accept.is_err(),
+            "expected no PodEvent for non-parent-originated turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn parent_originated_worker_error_fires_errored() {
+        let mut env = make_env().await;
+        let listener = UnixListener::bind(&env.parent_socket_path).expect("bind listener");
+        let recv = tokio::spawn(recv_pod_event(listener, Duration::from_secs(2)));
+
+        let pod_future = async {
+            Err::<PodRunResult, _>(PodError::Worker(WorkerError::Aborted(
+                "boom from test".into(),
+            )))
+        };
+        let (status, _) = drive_turn(
+            pod_future,
+            &mut env.method_rx,
+            &env.event_tx,
+            &env.cancel_tx,
+            &env.shared_state,
+            &env.notify_buffer,
+            Some(&env.parent_socket_path),
+            "child-pod",
+            &env.spawned_registry,
+            true,
+        )
+        .await;
+        assert_eq!(status, PodStatus::Idle);
+
+        let event = recv.await.expect("recv task").expect("PodEvent received");
+        match event {
+            PodEvent::Errored { pod_name, message } => {
+                assert_eq!(pod_name, "child-pod");
+                assert!(message.contains("boom from test"), "got message: {message}");
+            }
+            other => panic!("expected Errored, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn non_parent_originated_worker_error_stays_silent() {
+        let mut env = make_env().await;
+        let listener = UnixListener::bind(&env.parent_socket_path).expect("bind listener");
+
+        let pod_future = async {
+            Err::<PodRunResult, _>(PodError::Worker(WorkerError::Aborted(
+                "boom from notify".into(),
+            )))
+        };
+        let (status, _) = drive_turn(
+            pod_future,
+            &mut env.method_rx,
+            &env.event_tx,
+            &env.cancel_tx,
+            &env.shared_state,
+            &env.notify_buffer,
+            Some(&env.parent_socket_path),
+            "child-pod",
+            &env.spawned_registry,
+            false,
+        )
+        .await;
+        assert_eq!(status, PodStatus::Idle);
+
+        let accept = tokio::time::timeout(Duration::from_millis(200), listener.accept()).await;
+        assert!(
+            accept.is_err(),
+            "expected no PodEvent for notification-originated worker error"
+        );
     }
 }
