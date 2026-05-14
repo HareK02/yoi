@@ -41,3 +41,9 @@
 - Pod プロセス自体の永続化/復元（別途検討）
 - `ShutDown` / `ScopeSubDelegated` の発火条件変更
 - 親が投げた個々の Run を ID で識別して相関させる仕組み（現状は「届いた / 届かない」で十分なので導入しない）
+
+## Review
+
+- 状態: Approve
+- レビュー詳細: [./pod-parent-turn-callback.review.md](./pod-parent-turn-callback.review.md)
+- 日付: 2026-05-15
