@@ -7,7 +7,6 @@
 - Pod: 空応答ターン (Submit 後 AI 応答ゼロで Pause/Cancel) を自動巻き戻し → [tickets/pod-empty-turn-rollback.md](tickets/pod-empty-turn-rollback.md)
 - Pod: 任意ターンからの Fork（複数ターン巻き戻しを汎用化） → [tickets/pod-session-fork.md](tickets/pod-session-fork.md)
 - Pod: Paused→Run の interrupt 前処理を Pod 内部に閉じる → [tickets/pod-interrupt-prep-internalize.md](tickets/pod-interrupt-prep-internalize.md)
-- Pod: Run 入力の事前 validate を Pod 内部に閉じる → [tickets/pod-input-validate-internalize.md](tickets/pod-input-validate-internalize.md)
 - Pod: Inbound PodEvent ハンドリングの重複を統合 → [tickets/pod-inbound-pod-event-dedup.md](tickets/pod-inbound-pod-event-dedup.md)
 - Pod: セッションログをバックエンドにした Pod 単位の永続化 → [tickets/pod-persistent-state.md](tickets/pod-persistent-state.md)
 - 永続化層のセマンティック整理 → [tickets/persistence-semantics.md](tickets/persistence-semantics.md)
