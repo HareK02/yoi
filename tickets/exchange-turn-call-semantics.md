@@ -23,18 +23,18 @@
 構造としては以下を基本にする。
 
 ```text
-Thread
-  └─ Segment
-      └─ Exchange
-          ├─ UserTurn
-          ├─ AssistantTurn
-          │   └─ LlmCall
-          ├─ ToolTurn
-          │   └─ ToolExecution
-          ├─ AssistantTurn
-          │   └─ LlmCall
-          └─ ...
+Exchange
+  ├─ UserTurn
+  ├─ AssistantTurn
+  │   └─ LlmCall
+  ├─ ToolTurn
+  │   └─ ToolExecution
+  ├─ AssistantTurn
+  │   └─ LlmCall
+  └─ ...
 ```
+
+Exchange 列をまとめる外側の階層（会話の家系や永続化単位）は永続化層の責務であり、本チケットの範囲外。
 
 ## 要件
 
@@ -56,14 +56,12 @@ Thread
   - LLM Call ごとの表示を残す場合は `CallHeader` 相当に名称を変える。
 - `WorkerResult` / `RunResult` / `TurnResult` の責務境界。
   - Exchange の結果、actor Turn の結果、LlmCall の結果を混同しない。
-- compaction / resume により Exchange が複数 Segment または複数 runtime attempt にまたがる場合の扱い。
-- `persistence-semantics.md` の `Thread` / `Segment` / `Entry` / `Checkpoint` モデルへの反映。
+- compaction / resume により Exchange が複数の永続化単位 / runtime attempt にまたがる場合の扱い。
 - `Notify` / `PodEvent` / `SystemReminder` など user input ではない起点を Exchange と呼ぶことが適切か、または `ExchangeKind` のような分類で表すか。
 
 ## 完了条件
 
 - `Exchange` / `Turn` / `Call` / `Request` / `Run` の定義が文書化されている。
-- `persistence-semantics.md` に反映すべき前提が整理されている。
 - worker / protocol / TUI / usage accounting で rename または互換 alias が必要な箇所が洗い出されている。
 - 実装変更を行う場合、外側 Exchange、actor Turn、内側 LlmCall の境界がコード上で判別できる。
 - 既存 API / event 名をすぐ壊さない段階移行方針が決まっている。
@@ -77,9 +75,7 @@ Thread
 
 ## 関連
 
-- `tickets/persistence-semantics.md`
-- `tickets/pod-persistent-state.md`
-- `tickets/pod-session-fork.md`
+- `tickets/persistence-semantics.md` — 外側の永続化単位を定義する別チケット。本チケットは論理単位 (Exchange / Turn / LlmCall) の定義に閉じる。
 - `crates/llm-worker/`
 - `crates/protocol/`
 - `crates/tui/`
