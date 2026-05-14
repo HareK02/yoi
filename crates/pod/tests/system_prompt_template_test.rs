@@ -103,7 +103,7 @@ async fn make_pod_with_body(
     let manifest = pod::PodManifest::from_toml(MINIMAL_MANIFEST_TOML).unwrap();
 
     let store_tmp = tempfile::tempdir().unwrap();
-    let store = FsStore::new(store_tmp.path()).await.unwrap();
+    let store = FsStore::new(store_tmp.path()).unwrap();
     std::mem::forget(store_tmp);
 
     let pwd_tmp = tempfile::tempdir().unwrap();
@@ -182,7 +182,7 @@ async fn session_start_state_captures_rendered_prompt() {
         .unwrap();
     pod.run_text("hi").await.unwrap();
 
-    let entries = pod.store().read_all(pod.session_id()).await.unwrap();
+    let entries = pod.store().read_all(pod.session_id()).unwrap();
     let first = entries.first().expect("at least one entry");
     match &first.entry {
         LogEntry::SessionStart { system_prompt, .. } => {

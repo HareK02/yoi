@@ -8,6 +8,7 @@ use crate::SessionId;
 use crate::logged_item::{LoggedItem, to_logged};
 use crate::session_log::{self, EntryHash, HashedEntry, LogEntry, PodScopeSnapshot, SessionOrigin};
 use crate::store::{Store, StoreError};
+use crate::system_item::SystemItem;
 use llm_worker::WorkerResult;
 use llm_worker::llm_client::RequestConfig;
 use llm_worker::llm_client::types::Item;
@@ -23,12 +24,12 @@ pub struct SessionStartState<'a> {
 /// Create a new session, writing the initial `SessionStart` entry.
 ///
 /// Returns the new session ID and head hash.
-pub async fn create_session(
+pub fn create_session(
     store: &impl Store,
     state: SessionStartState<'_>,
 ) -> Result<(SessionId, EntryHash), StoreError> {
     let session_id = crate::new_session_id();
-    let hash = create_session_with_id(store, session_id, state).await?;
+    let hash = create_session_with_id(store, session_id, state)?;
     Ok((session_id, hash))
 }
 
@@ -37,7 +38,7 @@ pub async fn create_session(
 /// Used by callers that need to reserve a session ID synchronously but
 /// defer the initial log append (e.g. Pod, which resolves a templated
 /// system prompt only at first turn). Returns the resulting head hash.
-pub async fn create_session_with_id(
+pub fn create_session_with_id(
     store: &impl Store,
     session_id: SessionId,
     state: SessionStartState<'_>,
@@ -56,7 +57,7 @@ pub async fn create_session_with_id(
         prev_hash: None,
         entry,
     };
-    store.append(session_id, &hashed_entry).await?;
+    store.append(session_id, &hashed_entry)?;
     Ok(hash)
 }
 
@@ -64,7 +65,7 @@ pub async fn create_session_with_id(
 ///
 /// Records `compacted_from` provenance linking back to the source session.
 /// Returns the new session ID and head hash.
-pub async fn create_compacted_session(
+pub fn create_compacted_session(
     store: &impl Store,
     state: SessionStartState<'_>,
     source_session_id: SessionId,
@@ -88,7 +89,7 @@ pub async fn create_compacted_session(
         prev_hash: None,
         entry,
     };
-    store.append(session_id, &hashed_entry).await?;
+    store.append(session_id, &hashed_entry)?;
     Ok((session_id, hash))
 }
 
@@ -96,11 +97,11 @@ pub async fn create_compacted_session(
 ///
 /// Returns the reconstructed state. The caller is responsible for
 /// applying it to a Worker.
-pub async fn restore(
+pub fn restore(
     store: &impl Store,
     session_id: SessionId,
 ) -> Result<crate::session_log::RestoredState, StoreError> {
-    let entries = store.read_all(session_id).await?;
+    let entries = store.read_all(session_id)?;
     Ok(session_log::collect_state(&entries))
 }
 
@@ -108,13 +109,13 @@ pub async fn restore(
 /// If not, auto-fork into a new session.
 ///
 /// Updates `session_id` and `head_hash` in place when a fork occurs.
-pub async fn ensure_head_or_fork(
+pub fn ensure_head_or_fork(
     store: &impl Store,
     session_id: &mut SessionId,
     head_hash: &mut Option<EntryHash>,
     state: SessionStartState<'_>,
 ) -> Result<(), StoreError> {
-    let store_head = store.read_head_hash(*session_id).await?;
+    let store_head = store.read_head_hash(*session_id)?;
     if store_head == *head_hash {
         return Ok(());
     }
@@ -133,7 +134,7 @@ pub async fn ensure_head_or_fork(
         prev_hash: None,
         entry,
     };
-    store.create_session(fork_id, &[hashed_entry]).await?;
+    store.create_session(fork_id, &[hashed_entry])?;
     *session_id = fork_id;
     *head_hash = Some(hash);
     Ok(())
@@ -145,7 +146,7 @@ pub async fn ensure_head_or_fork(
 /// the worker pushes its flattened user message into history; replay
 /// derives the worker `Item::user_message` from these segments via
 /// [`Segment::flatten_to_text`].
-pub async fn save_user_input(
+pub fn save_user_input(
     store: &impl Store,
     session_id: SessionId,
     head_hash: &mut Option<EntryHash>,
@@ -160,17 +161,17 @@ pub async fn save_user_input(
             segments,
         },
     )
-    .await
 }
 
 /// Log the history delta — new items added since the previous snapshot.
 ///
-/// Classifies items into AssistantItems, ToolResults, and HookInjectedItems
-/// entries automatically. User messages are skipped because they are
-/// persisted upfront via [`save_user_input`] at submit time; the worker
-/// pushes a flattened copy into its history that arrives here in
-/// `new_items` and would otherwise produce a duplicate `UserInput` entry.
-pub async fn save_delta(
+/// Classifies items into AssistantItem / ToolResult / HookInjectedItems
+/// entries automatically (one entry per item). User messages are skipped
+/// because they are persisted upfront via [`save_user_input`] at submit
+/// time; the worker pushes a flattened copy into its history that
+/// arrives here in `new_items` and would otherwise produce a duplicate
+/// `UserInput` entry.
+pub fn save_delta(
     store: &impl Store,
     session_id: SessionId,
     head_hash: &mut Option<EntryHash>,
@@ -181,66 +182,63 @@ pub async fn save_delta(
     }
 
     let ts = session_log::now_millis();
-    let mut i = 0;
-
-    while i < new_items.len() {
-        let item = &new_items[i];
+    for item in new_items {
         if item.is_user_message() {
             // Already persisted by save_user_input at submit time.
-            i += 1;
-        } else if item.is_tool_result() {
-            let start = i;
-            while i < new_items.len() && new_items[i].is_tool_result() {
-                i += 1;
-            }
-            append_entry(
-                store,
-                session_id,
-                head_hash,
-                LogEntry::ToolResults {
-                    ts,
-                    items: to_logged(&new_items[start..i]),
-                },
-            )
-            .await?;
-        } else if item.is_assistant_message() || item.is_tool_call() || item.is_reasoning() {
-            let start = i;
-            while i < new_items.len()
-                && (new_items[i].is_assistant_message()
-                    || new_items[i].is_tool_call()
-                    || new_items[i].is_reasoning())
-            {
-                i += 1;
-            }
-            append_entry(
-                store,
-                session_id,
-                head_hash,
-                LogEntry::AssistantItems {
-                    ts,
-                    items: to_logged(&new_items[start..i]),
-                },
-            )
-            .await?;
-        } else {
-            append_entry(
-                store,
-                session_id,
-                head_hash,
-                LogEntry::HookInjectedItems {
-                    ts,
-                    items: vec![LoggedItem::from(&new_items[i])],
-                },
-            )
-            .await?;
-            i += 1;
+            continue;
         }
+        let entry = classify_history_item(item, ts);
+        append_entry(store, session_id, head_hash, entry)?;
     }
     Ok(())
 }
 
+/// Map one history item to its singular `LogEntry` form. Used by the
+/// fallback `save_delta` path and the controller's worker-callback
+/// classifier so write classification lives in one place.
+pub fn classify_history_item(item: &Item, ts: u64) -> LogEntry {
+    if item.is_tool_result() {
+        LogEntry::ToolResult {
+            ts,
+            item: LoggedItem::from(item),
+        }
+    } else if item.is_assistant_message() || item.is_tool_call() || item.is_reasoning() {
+        LogEntry::AssistantItem {
+            ts,
+            item: LoggedItem::from(item),
+        }
+    } else {
+        // Defensive: anything else (future Item kinds) routes through
+        // AssistantItem rather than getting silently dropped.
+        LogEntry::AssistantItem {
+            ts,
+            item: LoggedItem::from(item),
+        }
+    }
+}
+
+/// Append a single typed system item as `LogEntry::SystemItem`. Helper
+/// for the Pod-side interceptor commit path; mirrors the per-item
+/// commit shape used for assistant / tool result entries.
+pub fn append_system_item(
+    store: &impl Store,
+    session_id: SessionId,
+    head_hash: &mut Option<EntryHash>,
+    item: SystemItem,
+) -> Result<EntryHash, StoreError> {
+    append_entry_with_hash(
+        store,
+        session_id,
+        head_hash,
+        LogEntry::SystemItem {
+            ts: session_log::now_millis(),
+            item,
+        },
+    )
+}
+
 /// Log a TurnEnd entry.
-pub async fn save_turn_end(
+pub fn save_turn_end(
     store: &impl Store,
     session_id: SessionId,
     head_hash: &mut Option<EntryHash>,
@@ -255,11 +253,10 @@ pub async fn save_turn_end(
             turn_count,
         },
     )
-    .await
 }
 
 /// Log a `RunCompleted` entry — `run()` / `resume()` returned `Ok(WorkerResult)`.
-pub async fn save_run_completed(
+pub fn save_run_completed(
     store: &impl Store,
     session_id: SessionId,
     head_hash: &mut Option<EntryHash>,
@@ -276,14 +273,13 @@ pub async fn save_run_completed(
             result,
         },
     )
-    .await
 }
 
 /// Log a `RunErrored` entry — `run()` / `resume()` returned `Err(WorkerError)`.
 ///
 /// `WorkerError` is not `Serialize`, so the caller passes a lossy
 /// `to_string()` rendering as `message`.
-pub async fn save_run_errored(
+pub fn save_run_errored(
     store: &impl Store,
     session_id: SessionId,
     head_hash: &mut Option<EntryHash>,
@@ -300,7 +296,6 @@ pub async fn save_run_errored(
             message,
         },
     )
-    .await
 }
 
 /// Log an `LlmUsage` entry — 1 LLM リクエスト分の Usage スナップショット。
@@ -309,7 +304,7 @@ pub async fn save_run_errored(
 /// その prefix をプロバイダが実測した占有量（プロンプト全長）で、
 /// プロバイダ別の正規化（Anthropic では `input + cache_read + cache_creation`）を
 /// 済ませた値を渡す。
-pub async fn save_usage(
+pub fn save_usage(
     store: &impl Store,
     session_id: SessionId,
     head_hash: &mut Option<EntryHash>,
@@ -332,7 +327,6 @@ pub async fn save_usage(
             output_tokens,
         },
     )
-    .await
 }
 
 /// Log an `Extension` entry — domain-tagged opaque payload.
@@ -340,7 +334,7 @@ pub async fn save_usage(
 /// session-store treats `payload` as an unstructured `serde_json::Value`.
 /// Each domain is responsible for serializing into and folding out of it.
 /// Use `RestoredState.extensions` to read entries back at restore time.
-pub async fn save_extension(
+pub fn save_extension(
     store: &impl Store,
     session_id: SessionId,
     head_hash: &mut Option<EntryHash>,
@@ -357,11 +351,10 @@ pub async fn save_extension(
             payload,
         },
     )
-    .await
 }
 
 /// Log the Pod's latest runtime scope snapshot.
-pub async fn save_pod_scope(
+pub fn save_pod_scope(
     store: &impl Store,
     session_id: SessionId,
     head_hash: &mut Option<EntryHash>,
@@ -375,11 +368,10 @@ pub async fn save_pod_scope(
         session_log::POD_SCOPE_EXTENSION_DOMAIN,
         payload,
     )
-    .await
 }
 
 /// Log a `ConfigChanged` entry.
-pub async fn save_config_changed(
+pub fn save_config_changed(
     store: &impl Store,
     session_id: SessionId,
     head_hash: &mut Option<EntryHash>,
@@ -394,14 +386,10 @@ pub async fn save_config_changed(
             config: config.clone(),
         },
     )
-    .await
 }
 
 /// Fork the current state into a new session.
-pub async fn fork(
-    store: &impl Store,
-    state: SessionStartState<'_>,
-) -> Result<SessionId, StoreError> {
+pub fn fork(store: &impl Store, state: SessionStartState<'_>) -> Result<SessionId, StoreError> {
     let fork_id = crate::new_session_id();
     let entry = LogEntry::SessionStart {
         ts: session_log::now_millis(),
@@ -417,17 +405,17 @@ pub async fn fork(
         prev_hash: None,
         entry,
     };
-    store.create_session(fork_id, &[hashed_entry]).await?;
+    store.create_session(fork_id, &[hashed_entry])?;
     Ok(fork_id)
 }
 
 /// Fork from an arbitrary point in a stored session's log.
-pub async fn fork_at(
+pub fn fork_at(
     store: &impl Store,
     source_id: SessionId,
     at_hash: &EntryHash,
 ) -> Result<SessionId, StoreError> {
-    let entries = store.read_all(source_id).await?;
+    let entries = store.read_all(source_id)?;
     let cut = entries
         .iter()
         .position(|e| &e.hash == at_hash)
@@ -453,7 +441,7 @@ pub async fn fork_at(
         prev_hash: None,
         entry,
     };
-    store.create_session(fork_id, &[hashed_entry]).await?;
+    store.create_session(fork_id, &[hashed_entry])?;
     Ok(fork_id)
 }
 
@@ -462,13 +450,13 @@ pub async fn fork_at(
 /// Lower-level dual of the `save_*` convenience wrappers in this module.
 /// Use when the caller already builds the typed entry itself (e.g. when
 /// it needs the same value for an in-memory mirror + broadcast).
-pub async fn append_entry(
+pub fn append_entry(
     store: &impl Store,
     session_id: SessionId,
     head_hash: &mut Option<EntryHash>,
     entry: LogEntry,
 ) -> Result<(), StoreError> {
-    append_entry_with_hash(store, session_id, head_hash, entry).await?;
+    append_entry_with_hash(store, session_id, head_hash, entry)?;
     Ok(())
 }
 
@@ -476,7 +464,7 @@ pub async fn append_entry(
 ///
 /// Used by paths that need the hash for downstream broadcast or mirror
 /// updates (e.g. the Pod's `SessionLogSink`).
-pub async fn append_entry_with_hash(
+pub fn append_entry_with_hash(
     store: &impl Store,
     session_id: SessionId,
     head_hash: &mut Option<EntryHash>,
@@ -488,7 +476,7 @@ pub async fn append_entry_with_hash(
         prev_hash: head_hash.clone(),
         entry,
     };
-    store.append(session_id, &hashed_entry).await?;
+    store.append(session_id, &hashed_entry)?;
     *head_hash = Some(hash.clone());
     Ok(hash)
 }

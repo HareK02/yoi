@@ -120,24 +120,37 @@ pub enum LogEntry {
     /// history; the worker layer never sees segments directly.
     UserInput { ts: u64, segments: Vec<Segment> },
 
-    /// Assistant response items added to history (worker.rs:1040-1041).
+    /// One assistant-side item appended to history — assistant message,
+    /// reasoning, or tool call. Singular: one entry per history item so
+    /// the wire-side `Event::*` lane and on-disk LogEntry stay 1:1.
+    AssistantItem { ts: u64, item: LoggedItem },
+
+    /// One tool-execution result appended to history.
+    ToolResult { ts: u64, item: LoggedItem },
+
+    /// One typed agent-injected system item: notification, child-Pod
+    /// lifecycle event, `@<path>` / `#<slug>` / `/<slug>` resolution
+    /// payload. Each `SystemItem` carries kind metadata that the LLM
+    /// itself never sees (the LLM gets `Item::system_message` with the
+    /// item's denormalised `body`), but live clients and replay paths
+    /// dispatch on `kind` for typed rendering.
+    SystemItem { ts: u64, item: SystemItem },
+
+    /// Legacy plural form: kept **read-only** so old session logs still
+    /// open. New writes always use the singular `AssistantItem`. Items
+    /// are flattened on replay.
     AssistantItems { ts: u64, items: Vec<LoggedItem> },
 
-    /// Tool execution results added to history (worker.rs:897-900, 1072-1076).
+    /// Legacy plural form: kept **read-only**. New writes use the
+    /// singular `ToolResult`.
     ToolResults { ts: u64, items: Vec<LoggedItem> },
 
-    /// Typed agent-injected system items: notifications, child-Pod
-    /// lifecycle events, `@<path>` / `#<slug>` / `/<slug>` resolution
-    /// payloads. Each `SystemItem` carries kind metadata that the LLM
-    /// itself never sees (the LLM gets `Item::system_message` with the
-    /// item's `history_text()`), but live clients and replay paths
-    /// dispatch on `kind` for typed rendering.
+    /// Legacy plural form: kept **read-only**. New writes use the
+    /// singular `SystemItem`.
     SystemItems { ts: u64, items: Vec<SystemItem> },
 
-    /// Legacy pre-`SystemItems` form. Deserialize-only — new writes
-    /// always use `SystemItems`. Items are flattened to
-    /// `Item::system_message` on replay, matching how the original
-    /// path worked.
+    /// Legacy pre-`SystemItem*` form. Deserialize-only. Items are
+    /// flattened to `Item::system_message` on replay.
     HookInjectedItems { ts: u64, items: Vec<LoggedItem> },
 
     /// Turn boundary. Records the turn count after increment.
@@ -281,6 +294,15 @@ pub fn collect_state(entries: &[HashedEntry]) -> RestoredState {
                 let text = Segment::flatten_to_text(segments);
                 state.history.push(Item::user_message(text));
                 state.user_segments.push(segments.clone());
+            }
+            LogEntry::AssistantItem { item, .. } => {
+                state.history.push(Item::from(item.clone()));
+            }
+            LogEntry::ToolResult { item, .. } => {
+                state.history.push(Item::from(item.clone()));
+            }
+            LogEntry::SystemItem { item, .. } => {
+                state.history.push(item.to_history_item());
             }
             LogEntry::AssistantItems { items, .. } => {
                 state.history.extend(items.iter().cloned().map(Item::from));

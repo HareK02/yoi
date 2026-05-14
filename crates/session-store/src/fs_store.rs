@@ -8,9 +8,9 @@ use crate::SessionId;
 use crate::event_trace::TraceEntry;
 use crate::session_log::{EntryHash, HashedEntry};
 use crate::store::{Store, StoreError};
+use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use tokio::fs;
-use tokio::io::AsyncWriteExt;
 
 /// Filesystem-backed JSONL store.
 ///
@@ -24,9 +24,9 @@ pub struct FsStore {
 impl FsStore {
     /// Create a new `FsStore` rooted at the given directory.
     /// Creates the directory if it does not exist.
-    pub async fn new(root: impl Into<PathBuf>) -> Result<Self, StoreError> {
+    pub fn new(root: impl Into<PathBuf>) -> Result<Self, StoreError> {
         let root = root.into();
-        fs::create_dir_all(&root).await?;
+        fs::create_dir_all(&root)?;
         Ok(Self { root })
     }
 
@@ -38,15 +38,13 @@ impl FsStore {
         self.root.join(format!("{id}.trace.jsonl"))
     }
 
-    async fn append_line(&self, path: &Path, line: &str) -> Result<(), StoreError> {
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .await?;
-        file.write_all(line.as_bytes()).await?;
-        file.write_all(b"\n").await?;
-        file.flush().await?;
+    fn append_line(&self, path: &Path, line: &str) -> Result<(), StoreError> {
+        let mut file = fs::OpenOptions::new().create(true).append(true).open(path)?;
+        file.write_all(line.as_bytes())?;
+        file.write_all(b"\n")?;
+        // Append-mode write is the durability boundary; an explicit
+        // `sync_all` here would multiply latency by ~10× for no gain
+        // since the kernel already orders concurrent `O_APPEND` writes.
         Ok(())
     }
 
@@ -67,24 +65,24 @@ impl FsStore {
 }
 
 impl Store for FsStore {
-    async fn append(&self, id: SessionId, entry: &HashedEntry) -> Result<(), StoreError> {
+    fn append(&self, id: SessionId, entry: &HashedEntry) -> Result<(), StoreError> {
         let line = serde_json::to_string(entry)?;
-        self.append_line(&self.log_path(id), &line).await
+        self.append_line(&self.log_path(id), &line)
     }
 
-    async fn read_all(&self, id: SessionId) -> Result<Vec<HashedEntry>, StoreError> {
+    fn read_all(&self, id: SessionId) -> Result<Vec<HashedEntry>, StoreError> {
         let path = self.log_path(id);
         if !path.exists() {
             return Err(StoreError::NotFound(id));
         }
-        let content = fs::read_to_string(&path).await?;
+        let content = fs::read_to_string(&path)?;
         Self::parse_jsonl(&content)
     }
 
-    async fn list_sessions(&self) -> Result<Vec<SessionId>, StoreError> {
+    fn list_sessions(&self) -> Result<Vec<SessionId>, StoreError> {
         let mut sessions = Vec::new();
-        let mut dir = fs::read_dir(&self.root).await?;
-        while let Some(entry) = dir.next_entry().await? {
+        for entry in fs::read_dir(&self.root)? {
+            let entry = entry?;
             let path = entry.path();
             // Only match .jsonl files, not .trace.jsonl
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
@@ -100,31 +98,27 @@ impl Store for FsStore {
         Ok(sessions)
     }
 
-    async fn create_session(
-        &self,
-        id: SessionId,
-        entries: &[HashedEntry],
-    ) -> Result<(), StoreError> {
+    fn create_session(&self, id: SessionId, entries: &[HashedEntry]) -> Result<(), StoreError> {
         let path = self.log_path(id);
         let mut content = String::new();
         for entry in entries {
             content.push_str(&serde_json::to_string(entry)?);
             content.push('\n');
         }
-        fs::write(&path, content.as_bytes()).await?;
+        fs::write(&path, content.as_bytes())?;
         Ok(())
     }
 
-    async fn exists(&self, id: SessionId) -> Result<bool, StoreError> {
+    fn exists(&self, id: SessionId) -> Result<bool, StoreError> {
         Ok(self.log_path(id).exists())
     }
 
-    async fn read_head_hash(&self, id: SessionId) -> Result<Option<EntryHash>, StoreError> {
+    fn read_head_hash(&self, id: SessionId) -> Result<Option<EntryHash>, StoreError> {
         let path = self.log_path(id);
         if !path.exists() {
             return Err(StoreError::NotFound(id));
         }
-        let content = fs::read_to_string(&path).await?;
+        let content = fs::read_to_string(&path)?;
         let last_line = content.lines().rev().find(|l| !l.trim().is_empty());
         match last_line {
             Some(line) => {
@@ -139,8 +133,8 @@ impl Store for FsStore {
         }
     }
 
-    async fn append_trace(&self, id: SessionId, entry: &TraceEntry) -> Result<(), StoreError> {
+    fn append_trace(&self, id: SessionId, entry: &TraceEntry) -> Result<(), StoreError> {
         let line = serde_json::to_string(entry)?;
-        self.append_line(&self.trace_path(id), &line).await
+        self.append_line(&self.trace_path(id), &line)
     }
 }

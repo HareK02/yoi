@@ -7,7 +7,7 @@
 //! Pod (which still owns the `Store` handle); the sink stays focused on
 //! the wire-side fan-out.
 //!
-//! Atomicity contract (see ticket `tickets/pod-state-from-session-log.md`):
+//! Atomicity contract:
 //!
 //! 1. Pod writes the entry to disk via the `Store`.
 //! 2. Pod calls [`SessionLogSink::publish`] which acquires the mirror
@@ -24,10 +24,11 @@
 
 use std::sync::{Arc, Mutex as StdMutex};
 
+use parking_lot::{Mutex, MutexGuard};
 use session_store::{
     EntryHash, HashedEntry, LogEntry, SessionId, SessionStartState, Store, StoreError, session_log,
 };
-use tokio::sync::{Mutex as AsyncMutex, MutexGuard, broadcast};
+use tokio::sync::broadcast;
 
 /// Broadcast capacity for the live receiver. Slow subscribers that
 /// fall behind will see `RecvError::Lagged` and are expected to drop
@@ -92,8 +93,8 @@ impl SessionLogSink {
     /// Live broadcast fires only for entries that the streaming-event
     /// lane does not cover:
     ///   - `LogEntry::SessionStart` → `Event::SessionRotated` on the wire.
-    ///   - `LogEntry::HookInjectedItems` → `Event::HookInjectedItems`.
-    /// Everything else (AssistantItems, ToolResults, UserInput, TurnEnd,
+    ///   - `LogEntry::SystemItem`   → `Event::SystemItem`.
+    /// Everything else (AssistantItem, ToolResult, UserInput, TurnEnd,
     /// RunCompleted, RunErrored, LlmUsage, Extension, ConfigChanged) is
     /// reflected in the mirror so reconnect snapshots stay accurate,
     /// but is not sent live — the streaming events (TextDelta /
@@ -120,7 +121,7 @@ impl SessionLogSink {
     fn is_live_relevant(entry: &LogEntry) -> bool {
         matches!(
             entry,
-            LogEntry::SessionStart { .. } | LogEntry::SystemItems { .. }
+            LogEntry::SessionStart { .. } | LogEntry::SystemItem { .. }
         )
     }
 
@@ -194,10 +195,9 @@ impl Default for SessionLogSink {
 }
 
 /// Active session head for the Pod's persistent log: session id +
-/// last-committed entry hash. Replaces the previous `SessionHead`
-/// struct local to `Pod`; bundled here so the writer can hand a
-/// cloneable handle to background tasks (e.g. the per-item drain
-/// task spawned by the controller).
+/// last-committed entry hash. Bundled with the store + sink in a
+/// `SessionLogWriter` so the worker callback / interceptor can share
+/// one cheap `Clone` handle for direct sync appends.
 #[derive(Debug, Clone)]
 pub struct SessionHeadState {
     pub session_id: SessionId,
@@ -209,20 +209,26 @@ pub struct SessionHeadState {
 /// Bundles the (1) persistent store, (2) the in-memory session-head
 /// state (id + hash), and (3) the broadcast sink. `append_entry`
 /// chains the hash on disk, advances the head, then publishes the
-/// entry through the sink — under a single async mutex so two writers
+/// entry through the sink — under a single sync mutex so two writers
 /// cannot interleave the chain.
+///
+/// All append paths run synchronously: a local-fs `<1 KiB` JSONL line
+/// completes well below a millisecond, and going through an async
+/// `tokio::fs` ferry would re-introduce the `LogCommand` / drain task
+/// we removed. `parking_lot::Mutex` is safe to hold across the disk
+/// write since the lock is never crossed by an `.await`.
 ///
 /// `Clone` is a cheap `Arc` clone. The Pod keeps one writer for its
 /// inline commits (UserInput, TurnEnd, Usage, RunCompleted/Errored,
-/// scope snapshots, metrics) and hands clones to background tasks
-/// (e.g. the controller's per-item history drain task).
+/// scope snapshots, metrics) and hands clones to every other commit
+/// site (worker callback, interceptor).
 pub struct SessionLogWriter<St> {
     inner: Arc<WriterInner<St>>,
 }
 
 struct WriterInner<St> {
     store: St,
-    head: AsyncMutex<SessionHeadState>,
+    head: Mutex<SessionHeadState>,
     sink: SessionLogSink,
 }
 
@@ -245,7 +251,7 @@ where
         Self {
             inner: Arc::new(WriterInner {
                 store,
-                head: AsyncMutex::new(SessionHeadState {
+                head: Mutex::new(SessionHeadState {
                     session_id,
                     head_hash: None,
                 }),
@@ -267,7 +273,7 @@ where
         Self {
             inner: Arc::new(WriterInner {
                 store,
-                head: AsyncMutex::new(SessionHeadState {
+                head: Mutex::new(SessionHeadState {
                     session_id,
                     head_hash,
                 }),
@@ -278,15 +284,14 @@ where
 
     /// Append `entry` to the log: disk write → in-memory mirror push →
     /// broadcast — atomic w.r.t. `subscribe_with_snapshot` callers.
-    pub async fn append_entry(&self, entry: LogEntry) -> Result<EntryHash, StoreError> {
-        let mut head = self.inner.head.lock().await;
+    pub fn append_entry(&self, entry: LogEntry) -> Result<EntryHash, StoreError> {
+        let mut head = self.inner.head.lock();
         let hash = session_store::append_entry_with_hash(
             &self.inner.store,
             head.session_id,
             &mut head.head_hash,
             entry.clone(),
-        )
-        .await?;
+        )?;
         self.inner.sink.publish(entry);
         Ok(hash)
     }
@@ -299,7 +304,7 @@ where
     /// subscribers observe the swap as a freshly broadcast
     /// `SessionStart` (with `compacted_from` set), which is their
     /// signal to reset their derived view.
-    pub async fn swap_session(
+    pub fn swap_session(
         &self,
         new_session_id: SessionId,
         initial: LogEntry,
@@ -310,11 +315,8 @@ where
             prev_hash: None,
             entry: initial.clone(),
         };
-        self.inner
-            .store
-            .create_session(new_session_id, &[hashed])
-            .await?;
-        let mut head = self.inner.head.lock().await;
+        self.inner.store.create_session(new_session_id, &[hashed])?;
+        let mut head = self.inner.head.lock();
         head.session_id = new_session_id;
         head.head_hash = Some(hash.clone());
         self.inner.sink.reset_with_initial(initial);
@@ -324,12 +326,9 @@ where
     /// If the store's head no longer matches our cached head, mint a
     /// fresh session that forks from the current state and switch to
     /// it. Returns `true` when a fork happened.
-    pub async fn ensure_head_or_fork(
-        &self,
-        state: SessionStartState<'_>,
-    ) -> Result<bool, StoreError> {
-        let mut head = self.inner.head.lock().await;
-        let store_head = self.inner.store.read_head_hash(head.session_id).await?;
+    pub fn ensure_head_or_fork(&self, state: SessionStartState<'_>) -> Result<bool, StoreError> {
+        let mut head = self.inner.head.lock();
+        let store_head = self.inner.store.read_head_hash(head.session_id)?;
         if store_head == head.head_hash {
             return Ok(false);
         }
@@ -348,7 +347,7 @@ where
             prev_hash: None,
             entry: entry.clone(),
         };
-        self.inner.store.create_session(fork_id, &[hashed]).await?;
+        self.inner.store.create_session(fork_id, &[hashed])?;
         head.session_id = fork_id;
         head.head_hash = Some(hash);
         self.inner.sink.reset_with_initial(entry);
@@ -370,20 +369,19 @@ where
     }
 
     /// Cheap snapshot of the current session id.
-    pub async fn current_session_id(&self) -> SessionId {
-        self.inner.head.lock().await.session_id
+    pub fn current_session_id(&self) -> SessionId {
+        self.inner.head.lock().session_id
     }
 
     /// Cheap snapshot of the current head hash.
-    pub async fn current_head_hash(&self) -> Option<EntryHash> {
-        self.inner.head.lock().await.head_hash.clone()
+    pub fn current_head_hash(&self) -> Option<EntryHash> {
+        self.inner.head.lock().head_hash.clone()
     }
 
     /// Direct lock on the head. Used by paths that need to coordinate
-    /// custom writes with the hash chain (currently
-    /// `session_metrics::record_metric`).
-    pub async fn lock_head(&self) -> MutexGuard<'_, SessionHeadState> {
-        self.inner.head.lock().await
+    /// custom writes with the hash chain.
+    pub fn lock_head(&self) -> MutexGuard<'_, SessionHeadState> {
+        self.inner.head.lock()
     }
 }
 
@@ -428,12 +426,12 @@ mod tests {
     }
 
     fn notification_entry(text: &str) -> LogEntry {
-        LogEntry::SystemItems {
+        LogEntry::SystemItem {
             ts: now_millis(),
-            items: vec![session_store::SystemItem::Notification {
+            item: session_store::SystemItem::Notification {
                 message: text.to_owned(),
                 body: format!("[Notification] {text}"),
-            }],
+            },
         }
     }
 
@@ -449,11 +447,11 @@ mod tests {
         sink.publish(turn_end(1));
         assert!(rx.try_recv().is_err(), "TurnEnd must not be broadcast live");
 
-        // SystemItems is live-relevant.
+        // SystemItem is live-relevant.
         sink.publish(notification_entry("hi"));
         match rx.try_recv() {
-            Ok(LogEntry::SystemItems { .. }) => {}
-            other => panic!("expected SystemItems, got {other:?}"),
+            Ok(LogEntry::SystemItem { .. }) => {}
+            other => panic!("expected SystemItem, got {other:?}"),
         }
 
         // Mirror still grew with both entries (snapshot completeness).
@@ -470,7 +468,7 @@ mod tests {
 
         assert_eq!(snapshot.len(), 1);
         match rx.try_recv() {
-            Ok(LogEntry::SystemItems { .. }) => {}
+            Ok(LogEntry::SystemItem { .. }) => {}
             other => panic!("unexpected: {other:?}"),
         }
         assert!(rx.try_recv().is_err());

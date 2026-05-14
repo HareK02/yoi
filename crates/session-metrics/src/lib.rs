@@ -75,14 +75,14 @@ impl Metric {
 ///
 /// `save_extension` の薄い wrapper。書き込み失敗は呼び出し側に返す
 /// （メトリクスのために本体処理を止めるかは呼び出し側の判断）。
-pub async fn record_metric(
+pub fn record_metric(
     store: &impl Store,
     session_id: SessionId,
     head_hash: &mut Option<EntryHash>,
     metric: &Metric,
 ) -> Result<(), StoreError> {
     let payload = serde_json::to_value(metric).expect("Metric serialization cannot fail");
-    save_extension(store, session_id, head_hash, DOMAIN, payload).await
+    save_extension(store, session_id, head_hash, DOMAIN, payload)
 }
 
 /// `RestoredState.extensions` から metrics domain の payload を順に取り出し、

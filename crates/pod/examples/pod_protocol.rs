@@ -39,7 +39,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pwd = std::env::current_dir()?;
     let toml = manifest_toml(&pwd);
     let tmp = tempfile::tempdir()?;
-    let store = FsStore::new(tmp.path()).await?;
+    let store = FsStore::new(tmp.path())?;
     let pod = pod::Pod::from_manifest_toml(&toml, store).await?;
 
     let runtime_tmp = tempfile::tempdir()?;

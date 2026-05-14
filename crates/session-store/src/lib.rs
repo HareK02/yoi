@@ -40,10 +40,11 @@ pub use llm_worker::UsageRecord;
 pub use llm_worker::llm_client::types::{ContentPart, Item, Role};
 pub use logged_item::{LoggedContentPart, LoggedItem, LoggedRole, from_logged, to_logged};
 pub use session::{
-    SessionStartState, append_entry, append_entry_with_hash, create_compacted_session,
-    create_session, create_session_with_id, ensure_head_or_fork, fork, fork_at, restore,
-    save_config_changed, save_delta, save_extension, save_pod_scope, save_run_completed,
-    save_run_errored, save_turn_end, save_usage, save_user_input,
+    SessionStartState, append_entry, append_entry_with_hash, append_system_item,
+    classify_history_item, create_compacted_session, create_session, create_session_with_id,
+    ensure_head_or_fork, fork, fork_at, restore, save_config_changed, save_delta, save_extension,
+    save_pod_scope, save_run_completed, save_run_errored, save_turn_end, save_usage,
+    save_user_input,
 };
 pub use session_log::{
     EntryHash, HashedEntry, LogEntry, POD_SCOPE_EXTENSION_DOMAIN, PodScopeSnapshot, RestoredState,

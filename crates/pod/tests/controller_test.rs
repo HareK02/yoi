@@ -29,6 +29,12 @@ fn history_from_sink(handle: &PodHandle) -> Vec<Item> {
                 let text = protocol::Segment::flatten_to_text(&segments);
                 items.push(Item::user_message(text));
             }
+            LogEntry::AssistantItem { item, .. } | LogEntry::ToolResult { item, .. } => {
+                items.push(Item::from(item));
+            }
+            LogEntry::SystemItem { item, .. } => {
+                items.push(item.to_history_item());
+            }
             LogEntry::AssistantItems { items: i, .. }
             | LogEntry::ToolResults { items: i, .. }
             | LogEntry::HookInjectedItems { items: i, .. } => {
@@ -167,7 +173,7 @@ async fn make_pod_with_pwd_and_manifest(
 ) -> (Pod<MockClient, FsStore>, std::path::PathBuf) {
     let manifest = PodManifest::from_toml(manifest_toml).unwrap();
     let store_tmp = tempfile::tempdir().unwrap();
-    let store = FsStore::new(store_tmp.path()).await.unwrap();
+    let store = FsStore::new(store_tmp.path()).unwrap();
     std::mem::forget(store_tmp);
 
     // Separate tempdir to serve as the Pod's pwd/scope — these tests
@@ -773,12 +779,10 @@ async fn notify_while_idle_auto_starts_turn_and_injects_system_message() {
     let (entries, _) = handle.sink.subscribe_with_snapshot();
     let saw_notify_in_mirror = entries.iter().any(|e| matches!(
         e,
-        session_store::LogEntry::SystemItems { items, .. }
-            if items.iter().any(|si| matches!(
-                si,
-                session_store::SystemItem::Notification { message, .. }
-                    if message == "turn finished"
-            ))
+        session_store::LogEntry::SystemItem {
+            item: session_store::SystemItem::Notification { message, .. },
+            ..
+        } if message == "turn finished"
     ));
     assert!(
         saw_notify_in_mirror,
@@ -863,12 +867,13 @@ async fn pod_event_turn_ended_while_idle_auto_starts_turn_and_injects_system_mes
     let (entries, _) = handle.sink.subscribe_with_snapshot();
     let saw_pod_event_in_mirror = entries.iter().any(|e| matches!(
         e,
-        session_store::LogEntry::SystemItems { items, .. }
-            if items.iter().any(|si| matches!(
-                si,
-                session_store::SystemItem::PodEvent { event: protocol::PodEvent::TurnEnded { pod_name }, .. }
-                    if pod_name == "child"
-            ))
+        session_store::LogEntry::SystemItem {
+            item: session_store::SystemItem::PodEvent {
+                event: protocol::PodEvent::TurnEnded { pod_name },
+                ..
+            },
+            ..
+        } if pod_name == "child"
     ));
     assert!(
         saw_pod_event_in_mirror,

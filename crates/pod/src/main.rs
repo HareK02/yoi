@@ -162,7 +162,7 @@ async fn main() -> ExitCode {
             }
         },
     };
-    let store = match FsStore::new(&store_dir).await {
+    let store = match FsStore::new(&store_dir) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("error: failed to initialize store at {store_dir:?}: {e}");

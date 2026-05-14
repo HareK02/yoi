@@ -23,14 +23,13 @@ use tracing::warn;
 
 use crate::compact::state::CompactState;
 use session_store::SystemItem;
-use tokio::sync::mpsc;
 
 use crate::hook::{
     AbortInfo, HookPromptAction, HookRegistry, PreRequestInfo, PromptSubmitInfo, ToolCallSummary,
     ToolResultSummary, TurnEndInfo,
 };
 use crate::ipc::notify_buffer::{NotifyBuffer, build_system_item};
-use crate::pod::LogCommand;
+use crate::pod::SystemItemCommitter;
 use crate::prompt::catalog::PromptCatalog;
 use llm_worker::token_counter::total_tokens;
 
@@ -50,19 +49,20 @@ pub(crate) struct PodInterceptor {
     /// so the LLM has a visible trigger for any reaction it commits.
     pending_notifies: NotifyBuffer,
     /// Submit-scoped stash of resolver-produced typed system items.
-    /// Drained inside `on_prompt_submit`, committed as a
-    /// `LogEntry::SystemItems` through `log_cmd_tx`, and returned to
-    /// the worker as `Item::system_message` via
+    /// Drained inside `on_prompt_submit`, committed as
+    /// `LogEntry::SystemItem` entries through `log_writer`, and
+    /// returned to the worker as `Item::system_message` via
     /// `PromptAction::ContinueWith`. Populated by `Pod::run`
     /// immediately before handing off to the worker.
     pending_attachments: Arc<Mutex<Vec<SystemItem>>>,
     /// Prompt catalog used to render the injected notification wrapper.
     prompts: Arc<PromptCatalog>,
-    /// Sender into the Pod's history-drain task. The interceptor uses
-    /// it to commit `LogCommand::SystemItems` batches before returning
-    /// the corresponding `Item::system_message`s up to the worker.
-    /// `None` in tests / `Pod::new` paths where no drain is wired.
-    log_cmd_tx: Option<mpsc::UnboundedSender<LogCommand>>,
+    /// Type-erased commit handle. The interceptor uses it to commit
+    /// `LogEntry::SystemItem` entries directly (sync) before
+    /// returning the corresponding `Item::system_message`s up to the
+    /// worker. `None` in tests / `Pod::new` paths where no writer is
+    /// attached.
+    log_writer: Option<Arc<dyn SystemItemCommitter>>,
     /// Next turn index assigned by `on_prompt_submit`.
     next_turn_index: AtomicUsize,
     /// Tool calls observed in the current turn (reset on each new prompt).
@@ -77,7 +77,7 @@ impl PodInterceptor {
         pending_notifies: NotifyBuffer,
         pending_attachments: Arc<Mutex<Vec<SystemItem>>>,
         prompts: Arc<PromptCatalog>,
-        log_cmd_tx: Option<mpsc::UnboundedSender<LogCommand>>,
+        log_writer: Option<Arc<dyn SystemItemCommitter>>,
     ) -> Self {
         Self {
             registry,
@@ -86,23 +86,24 @@ impl PodInterceptor {
             pending_notifies,
             pending_attachments,
             prompts,
-            log_cmd_tx,
+            log_writer,
             next_turn_index: AtomicUsize::new(0),
             tool_calls_this_turn: AtomicUsize::new(0),
         }
     }
 
-    /// Send a `LogCommand::SystemItems` batch down the drain channel
-    /// (no-op if no drain is wired). The drain task commits the entry
-    /// before the corresponding `Item::system_message`s reach the
-    /// worker via `ContinueWith` / `pending_history_appends`, so the
-    /// drain barrier in `persist_turn` covers system commits too.
-    fn send_system_items(&self, items: Vec<SystemItem>) {
-        if items.is_empty() {
+    /// Commit each `SystemItem` as its own `LogEntry::SystemItem`
+    /// entry through the attached writer (no-op when no writer is
+    /// wired). Sync — writes complete before the matching
+    /// `Item::system_message`s reach the worker via
+    /// `ContinueWith` / `pending_history_appends`, so on-disk order
+    /// matches worker-history order.
+    fn commit_system_items(&self, items: &[SystemItem]) {
+        let Some(writer) = self.log_writer.as_ref() else {
             return;
-        }
-        if let Some(tx) = self.log_cmd_tx.as_ref() {
-            let _ = tx.send(LogCommand::SystemItems(items));
+        };
+        for item in items {
+            writer.commit_system_item(item.clone());
         }
     }
 
@@ -148,12 +149,12 @@ impl Interceptor for PodInterceptor {
             PromptAction::Continue
         } else {
             // Commit the typed system items first, then hand the
-            // matching `Item::system_message`s to the worker. The
-            // drain task processes the `SystemItems` command BEFORE
-            // any subsequent `Item` commands from `on_history_append`,
-            // so on-disk order matches worker-history order.
+            // matching `Item::system_message`s to the worker. Sync
+            // commits land BEFORE the worker pushes its
+            // `Item::system_message`s, so on-disk order matches
+            // worker-history order.
             let items: Vec<Item> = extras.iter().map(SystemItem::to_history_item).collect();
-            self.send_system_items(extras);
+            self.commit_system_items(&extras);
             PromptAction::ContinueWith(items)
         }
     }
@@ -175,7 +176,7 @@ impl Interceptor for PodInterceptor {
                     // A render failure here would starve the LLM of
                     // the notify text. Fall back to a raw item so the
                     // trigger still lands in history; the entry will
-                    // simply be skipped from the SystemItems batch.
+                    // simply be skipped from the SystemItem batch.
                     warn!(error = %e, "failed to render notify_wrapper; using raw message");
                     let fallback = match &entry {
                         super::notify_buffer::PendingNotify::Notify { message } => message.clone(),
@@ -187,7 +188,7 @@ impl Interceptor for PodInterceptor {
                 }
             }
         }
-        self.send_system_items(system_items);
+        self.commit_system_items(&system_items);
         items
     }
 

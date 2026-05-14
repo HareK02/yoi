@@ -36,7 +36,7 @@ async fn restore_from_manifest_rejects_unknown_session() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     let store_tmp = tempfile::tempdir().unwrap();
-    let store = FsStore::new(store_tmp.path()).await.unwrap();
+    let store = FsStore::new(store_tmp.path()).unwrap();
     let manifest = pod::PodManifest::from_toml(MINIMAL_MANIFEST_TOML).unwrap();
 
     // A freshly-minted id with no jsonl file at all → store returns
@@ -59,7 +59,7 @@ async fn restore_from_manifest_rejects_empty_session_log() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     let store_tmp = tempfile::tempdir().unwrap();
-    let store = FsStore::new(store_tmp.path()).await.unwrap();
+    let store = FsStore::new(store_tmp.path()).unwrap();
     let manifest = pod::PodManifest::from_toml(MINIMAL_MANIFEST_TOML).unwrap();
 
     // Pre-create an empty `<id>.jsonl` so `read_all` succeeds with no
@@ -86,7 +86,7 @@ async fn restore_from_manifest_rejects_session_without_scope_snapshot() {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     let store_tmp = tempfile::tempdir().unwrap();
-    let store = FsStore::new(store_tmp.path()).await.unwrap();
+    let store = FsStore::new(store_tmp.path()).unwrap();
     let manifest = pod::PodManifest::from_toml(MINIMAL_MANIFEST_TOML).unwrap();
 
     let id = session_store::new_session_id();
@@ -95,9 +95,7 @@ async fn restore_from_manifest_rejects_session_without_scope_snapshot() {
         config: &Default::default(),
         history: &[],
     };
-    session_store::create_session_with_id(&store, id, state)
-        .await
-        .unwrap();
+    session_store::create_session_with_id(&store, id, state).unwrap();
 
     let result =
         Pod::restore_from_manifest(id, manifest, store, pod::PromptLoader::builtins_only()).await;

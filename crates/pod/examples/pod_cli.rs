@@ -48,7 +48,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 2. Create a persistent store (temp dir for demo)
     let tmp = tempfile::tempdir()?;
-    let store = FsStore::new(tmp.path()).await?;
+    let store = FsStore::new(tmp.path())?;
 
     // 3. Build the Pod from the single-layer manifest TOML
     let mut pod = Pod::from_manifest_toml(&toml, store).await?;

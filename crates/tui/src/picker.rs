@@ -80,14 +80,14 @@ struct Row {
 }
 
 pub async fn run() -> Result<PickerOutcome, PickerError> {
-    let store = open_default_store().await?;
-    let ids = store.list_sessions().await?;
+    let store = open_default_store()?;
+    let ids = store.list_sessions()?;
     if ids.is_empty() {
         return Err(PickerError::NoSessions);
     }
     let mut rows: Vec<Row> = Vec::with_capacity(MAX_ROWS);
     for id in ids.into_iter().take(MAX_ROWS) {
-        let preview = build_preview(&store, id).await;
+        let preview = build_preview(&store, id);
         // Best-effort live check. A pods.json I/O hiccup downgrades
         // the row to "no badge" rather than killing the picker — the
         // user still gets to see the listing.
@@ -149,7 +149,7 @@ fn close_viewport(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
     Ok(())
 }
 
-async fn open_default_store() -> Result<FsStore, PickerError> {
+fn open_default_store() -> Result<FsStore, PickerError> {
     let dir = manifest::paths::sessions_dir().ok_or_else(|| {
         PickerError::Io(io::Error::new(
             io::ErrorKind::NotFound,
@@ -157,11 +157,11 @@ async fn open_default_store() -> Result<FsStore, PickerError> {
              (set INSOMNIA_HOME, INSOMNIA_DATA_DIR, or HOME)",
         ))
     })?;
-    Ok(FsStore::new(&dir).await?)
+    Ok(FsStore::new(&dir)?)
 }
 
-async fn build_preview(store: &FsStore, id: SessionId) -> String {
-    match store.read_all(id).await {
+fn build_preview(store: &FsStore, id: SessionId) -> String {
+    match store.read_all(id) {
         Ok(entries) => last_message_preview(&entries).unwrap_or_else(|| "[empty]".to_string()),
         Err(_) => "[corrupt]".to_string(),
     }

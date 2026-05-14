@@ -149,7 +149,7 @@ async fn make_pod_with_manifest(
     let manifest = pod::PodManifest::from_toml(manifest_toml).unwrap();
 
     let store_tmp = tempfile::tempdir().unwrap();
-    let store = FsStore::new(store_tmp.path()).await.unwrap();
+    let store = FsStore::new(store_tmp.path()).unwrap();
     std::mem::forget(store_tmp);
 
     let pwd_tmp = tempfile::tempdir().unwrap();

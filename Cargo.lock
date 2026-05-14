@@ -2160,6 +2160,7 @@ dependencies = [
  "manifest",
  "memory",
  "minijinja",
+ "parking_lot",
  "pod-registry",
  "protocol",
  "provider",

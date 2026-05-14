@@ -328,8 +328,8 @@ async fn load_resume_scope(session_id: SessionId) -> Result<ScopeConfig, SpawnEr
             "could not resolve sessions directory (set INSOMNIA_HOME, INSOMNIA_DATA_DIR, or HOME)",
         )
     })?;
-    let store = session_store::FsStore::new(&store_dir).await?;
-    let state = session_store::restore(&store, session_id).await?;
+    let store = session_store::FsStore::new(&store_dir)?;
+    let state = session_store::restore(&store, session_id)?;
     let snapshot = state
         .pod_scope
         .ok_or(SpawnError::MissingResumeScope { session_id })?;

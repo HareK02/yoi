@@ -174,7 +174,7 @@ async fn make_pod(
 ) {
     let manifest = PodManifest::from_toml(&manifest_toml).unwrap();
     let store_tmp = tempfile::tempdir().unwrap();
-    let store = FsStore::new(store_tmp.path()).await.unwrap();
+    let store = FsStore::new(store_tmp.path()).unwrap();
     let pwd_tmp = tempfile::tempdir().unwrap();
     let pwd = pwd_tmp.path().to_path_buf();
     let scope = pod::Scope::writable(&pwd).unwrap();
@@ -210,7 +210,7 @@ async fn prune_metrics_emit_skip_then_fire_with_post_request_join() {
     pod.run_text("first").await.unwrap();
     pod.run_text("second").await.unwrap();
 
-    let state = session_store::restore(&store, session_id).await.unwrap();
+    let state = session_store::restore(&store, session_id).unwrap();
     let metrics = metrics_from_extensions(&state.extensions);
 
     // Run 1 has 2 LLM iterations (tool loop), each evaluates prune with
@@ -296,7 +296,7 @@ async fn prune_metrics_record_below_min_savings_skip() {
     pod.run_text("first").await.unwrap();
     pod.run_text("second").await.unwrap();
 
-    let state = session_store::restore(&store, session_id).await.unwrap();
+    let state = session_store::restore(&store, session_id).unwrap();
     let metrics = metrics_from_extensions(&state.extensions);
     let below = metrics
         .iter()
@@ -329,35 +329,35 @@ struct MetricFailingStore {
 }
 
 impl Store for MetricFailingStore {
-    async fn append(&self, id: SessionId, entry: &HashedEntry) -> Result<(), StoreError> {
+    fn append(&self, id: SessionId, entry: &HashedEntry) -> Result<(), StoreError> {
         if let LogEntry::Extension { domain, .. } = &entry.entry {
             if domain == DOMAIN {
                 return Err(StoreError::Io(std::io::Error::other("synthetic failure")));
             }
         }
-        self.inner.append(id, entry).await
+        self.inner.append(id, entry)
     }
-    async fn read_all(&self, id: SessionId) -> Result<Vec<HashedEntry>, StoreError> {
-        self.inner.read_all(id).await
+    fn read_all(&self, id: SessionId) -> Result<Vec<HashedEntry>, StoreError> {
+        self.inner.read_all(id)
     }
-    async fn list_sessions(&self) -> Result<Vec<SessionId>, StoreError> {
-        self.inner.list_sessions().await
+    fn list_sessions(&self) -> Result<Vec<SessionId>, StoreError> {
+        self.inner.list_sessions()
     }
-    async fn create_session(
+    fn create_session(
         &self,
         id: SessionId,
         entries: &[HashedEntry],
     ) -> Result<(), StoreError> {
-        self.inner.create_session(id, entries).await
+        self.inner.create_session(id, entries)
     }
-    async fn exists(&self, id: SessionId) -> Result<bool, StoreError> {
-        self.inner.exists(id).await
+    fn exists(&self, id: SessionId) -> Result<bool, StoreError> {
+        self.inner.exists(id)
     }
-    async fn read_head_hash(&self, id: SessionId) -> Result<Option<EntryHash>, StoreError> {
-        self.inner.read_head_hash(id).await
+    fn read_head_hash(&self, id: SessionId) -> Result<Option<EntryHash>, StoreError> {
+        self.inner.read_head_hash(id)
     }
-    async fn append_trace(&self, id: SessionId, entry: &TraceEntry) -> Result<(), StoreError> {
-        self.inner.append_trace(id, entry).await
+    fn append_trace(&self, id: SessionId, entry: &TraceEntry) -> Result<(), StoreError> {
+        self.inner.append_trace(id, entry)
     }
 }
 
@@ -372,7 +372,7 @@ async fn metric_write_failure_emits_warn_alert_and_does_not_abort_run() {
     let manifest_toml = manifest_toml(1, 1);
     let manifest = PodManifest::from_toml(&manifest_toml).unwrap();
     let store_tmp = tempfile::tempdir().unwrap();
-    let inner = FsStore::new(store_tmp.path()).await.unwrap();
+    let inner = FsStore::new(store_tmp.path()).unwrap();
     let store = MetricFailingStore { inner };
     let pwd_tmp = tempfile::tempdir().unwrap();
     let pwd = pwd_tmp.path().to_path_buf();
@@ -397,7 +397,7 @@ async fn metric_write_failure_emits_warn_alert_and_does_not_abort_run() {
     pod.run_text("hello").await.unwrap();
 
     // No metrics ended up in the log (writes were rejected).
-    let state = session_store::restore(&store, session_id).await.unwrap();
+    let state = session_store::restore(&store, session_id).unwrap();
     let metrics = metrics_from_extensions(&state.extensions);
     assert!(metrics.is_empty(), "metrics must drop on write failure");
 
@@ -444,7 +444,7 @@ permission = "write"
     let client = MockClient::new(vec![text_response_with_cache("hi", 0, 0)]);
     let manifest = PodManifest::from_toml(manifest_toml).unwrap();
     let store_tmp = tempfile::tempdir().unwrap();
-    let store = FsStore::new(store_tmp.path()).await.unwrap();
+    let store = FsStore::new(store_tmp.path()).unwrap();
     let pwd_tmp = tempfile::tempdir().unwrap();
     let pwd = pwd_tmp.path().to_path_buf();
     let scope = pod::Scope::writable(&pwd).unwrap();
@@ -455,7 +455,7 @@ permission = "write"
     let session_id = pod.session_id();
     pod.run_text("hello").await.unwrap();
 
-    let state = session_store::restore(&store, session_id).await.unwrap();
+    let state = session_store::restore(&store, session_id).unwrap();
     let metrics = metrics_from_extensions(&state.extensions);
     assert!(
         metrics.is_empty(),

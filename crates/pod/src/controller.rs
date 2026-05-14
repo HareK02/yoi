@@ -6,14 +6,10 @@ use llm_worker::llm_client::client::LlmClient;
 use session_store::Store;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
-use llm_worker::Item;
-use session_store::LogEntry;
-use session_store::session_log;
-
 use crate::ipc::alerter::Alerter;
 use crate::ipc::notify_buffer::NotifyBuffer;
 use crate::ipc::server::SocketServer;
-use crate::pod::{LogCommand, LogDrainHandle, Pod, PodError, PodRunResult};
+use crate::pod::{Pod, PodError, PodRunResult, SystemItemCommitter};
 use crate::runtime::dir::RuntimeDir;
 use crate::session_log_sink::SessionLogSink;
 use crate::shared_state::PodSharedState;
@@ -165,23 +161,21 @@ impl PodController {
         }])
         .map_err(std::io::Error::other)?;
 
-        // === 1.5. Per-item history-commit drain task ===
+        // === 1.5. Direct writer wiring ===
         //
         // Worker callbacks fire `on_history_append` for each assistant
-        // item / tool result / hook-injected item that lands in
-        // history. The drain task picks them up off an unbounded mpsc
-        // and commits each as a typed `LogEntry` through the sink,
-        // serialised against the same `session_head` lock the Pod uses
-        // for its own commits. This gives mid-turn snapshot visibility:
-        // a late-attaching client sees in-flight tool calls + completed
-        // assistant blocks without waiting for the turn-end persist.
-        let (log_cmd_tx, log_cmd_rx) = mpsc::unbounded_channel::<LogCommand>();
-        let drain_ctx = pod.log_drain_handle();
-        let _drain_task = tokio::spawn(run_log_drain(log_cmd_rx, drain_ctx));
-        pod.attach_log_cmd_tx(log_cmd_tx.clone());
+        // item / tool result that lands in history. With the sync
+        // writer in place, the callback commits each item directly
+        // through a `LogWriterHandle` (no mpsc ferry, no drain task).
+        // The same handle is type-erased into a `SystemItemCommitter`
+        // and handed to the interceptor for `SystemItem` commits, so
+        // assistant / tool / system items all share one commit path.
+        let writer_for_system: Arc<dyn SystemItemCommitter> = Arc::new(pod.log_writer_handle());
+        pod.attach_log_writer(writer_for_system);
+        pod.wire_history_persistence();
 
         // === 2. Worker event bridge wiring ===
-        wire_event_bridges_on_worker(&mut pod, &event_tx, &alerter, log_cmd_tx);
+        wire_event_bridges_on_worker(&mut pod, &event_tx, &alerter);
 
         // === 3. Tool registration (builtin / memory / spawn-orchestration) ===
         let fs_for_view = register_pod_tools(
@@ -263,28 +257,19 @@ impl PodController {
 /// re-publishes a worker-level signal as a `protocol::Event` on `event_tx`
 /// so subscribers (TUI, socket clients) get a single typed stream.
 ///
-/// Also wires `on_history_append` into the per-item drain channel so
-/// every history append observed by the worker becomes a typed
-/// `LogEntry` commit (via the drain task).
+/// `Pod::wire_history_persistence` is called separately to wire the
+/// per-item history commit callback so every assistant / tool item
+/// landing in `worker.history` becomes a singular `LogEntry::AssistantItem`
+/// / `ToolResult` commit through the sync writer.
 fn wire_event_bridges_on_worker<C, St>(
     pod: &mut Pod<C, St>,
     event_tx: &broadcast::Sender<Event>,
     alerter: &Alerter,
-    log_cmd_tx: mpsc::UnboundedSender<LogCommand>,
 ) where
     C: LlmClient + Clone + 'static,
     St: Store + Clone + 'static,
 {
     let worker = pod.worker_mut();
-
-    // Per-history-append → drain channel. Sends are infallible-by-design
-    // here (UnboundedSender never blocks); a closed receiver just means
-    // the controller is shutting down, in which case dropping the item
-    // is acceptable.
-    let drain_tx = log_cmd_tx.clone();
-    worker.on_history_append(move |item| {
-        let _ = drain_tx.send(LogCommand::Item(item.clone()));
-    });
 
     let tx = event_tx.clone();
     worker.on_turn_start(move |turn| {
@@ -395,105 +380,6 @@ fn wire_event_bridges_on_worker<C, St>(
     // through the session-log sink as a typed `LogEntry`, and clients
     // see it via `Event::Snapshot` + live `Event::Entry`. The
     // per-item commit channel is wired at the top of this function.
-}
-
-/// Drain task: consumes `LogCommand::Item` and `LogCommand::Flush`
-/// off the channel and commits each item as a typed `LogEntry` through
-/// the supplied store + sink. Lives as long as the controller; exits
-/// when the sender is dropped (controller shutdown).
-async fn run_log_drain<St>(mut rx: mpsc::UnboundedReceiver<LogCommand>, ctx: LogDrainHandle<St>)
-where
-    St: session_store::Store + Clone + Send + 'static,
-{
-    while let Some(cmd) = rx.recv().await {
-        match cmd {
-            LogCommand::Item(item) => {
-                let Some(entry) = classify_history_item(item) else {
-                    continue;
-                };
-                commit_via_drain(&ctx, entry).await;
-            }
-            LogCommand::SystemItems(items) => {
-                if items.is_empty() {
-                    continue;
-                }
-                let entry = LogEntry::SystemItems {
-                    ts: session_log::now_millis(),
-                    items,
-                };
-                commit_via_drain(&ctx, entry).await;
-            }
-            LogCommand::Flush(ack) => {
-                let _ = ack.send(());
-            }
-        }
-    }
-}
-
-async fn commit_via_drain<St>(ctx: &LogDrainHandle<St>, entry: LogEntry)
-where
-    St: session_store::Store + Clone + Send + 'static,
-{
-    let mut head = ctx.session_head.lock().await;
-    match session_store::append_entry_with_hash(
-        &ctx.store,
-        head.session_id,
-        &mut head.head_hash,
-        entry.clone(),
-    )
-    .await
-    {
-        Ok(_) => {
-            // Publish under the same critical section view a
-            // `subscribe_with_snapshot` would observe.
-            ctx.sink.publish(entry);
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "drain: append_entry failed; entry dropped");
-        }
-    }
-}
-
-/// Map one LLM-driven worker-history append to its `LogEntry` form.
-///
-/// `None` is the skip signal for items that the drain must not commit:
-/// - `user_message` items are committed by `Pod::run` up-front as
-///   `LogEntry::UserInput { segments }`.
-/// - `system_message` items are committed by `PodInterceptor` as part
-///   of a `LogEntry::SystemItems` batch (with typed kind metadata)
-///   before they reach the worker's history.
-fn classify_history_item(item: Item) -> Option<LogEntry> {
-    let ts = session_log::now_millis();
-    if item.is_user_message() {
-        return None;
-    }
-    if matches!(
-        item,
-        Item::Message {
-            role: llm_worker::Role::System,
-            ..
-        }
-    ) {
-        return None;
-    }
-    if item.is_tool_result() {
-        return Some(LogEntry::ToolResults {
-            ts,
-            items: vec![session_store::LoggedItem::from(&item)],
-        });
-    }
-    if item.is_assistant_message() || item.is_tool_call() || item.is_reasoning() {
-        return Some(LogEntry::AssistantItems {
-            ts,
-            items: vec![session_store::LoggedItem::from(&item)],
-        });
-    }
-    // Defensive: anything else (future Item kinds) routes through
-    // AssistantItems rather than getting silently dropped.
-    Some(LogEntry::AssistantItems {
-        ts,
-        items: vec![session_store::LoggedItem::from(&item)],
-    })
 }
 
 /// Register the builtin file-manipulation tools, optional memory tools,
