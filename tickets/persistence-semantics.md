@@ -79,6 +79,23 @@ llm-worker は session 概念を持たない（`Worker` は `history` / `turn_co
 - `SessionOrigin.at_hash` → `at_turn_index` (TurnEnd 由来) に置換。
 - `ensure_head_or_fork` の検知ロジックは、Segment 末尾の terminal marker entry または末尾 seq 比較に置換（形式は実装時に決める）。
 
+### 廃止前の足場 (前提)
+
+本セクションを実装に移すタイミングでは、log writer が既に sync 化されていることを前提にする (`tickets/log-entry-singular-and-direct-commit.md`)。具体的には:
+
+- `Store::append` / `read_all` 等が `std::fs` ベースの sync API
+- `SessionLogWriter::append_entry()` が sync 関数
+- `session_head` mutex は `parking_lot::Mutex` / `std::sync::Mutex`
+- `LogCommand` / drain task / Flush バリアは既に撤廃済み
+
+この状態で hash chain を廃止すると追加で取れる単純化:
+
+- **`session_head` mutex そのものを撤去できる**。 hash chain が無いので「`head_hash` を直前 entry から取得して次に渡す」 という serialize 必須の依存が消える。 1 行 < `PIPE_BUF` (Linux 4KB) の `O_APPEND` write は kernel 側で atomic に直列化されるので、 user space で mutex を持つ必要が無い
+- `session_head` が消えると Pod / interceptor / worker callback が writer ハンドルだけ持てば良くなる。 `Arc<SessionLogWriter>` は単に `Arc<Store> + sink` を抱えるだけの値で、 hot-path の競合がない
+- `compute_hash` 呼び出しが消える分、 append が serialize + open + write + close の 3 syscall まで詰まる
+
+つまり「sync 化」 が先に来て、 「hash 廃止」 で mutex まで消える、 という 2 段階の単純化になる。
+
 ## Fork: 2 種類の書き込み方
 
 Session 境界の話ではなく **元 Segment への marker 書き込みの有無**で 2 種類を分ける。Session はどちらの場合も同じで、新 Segment が同 Session 内に生える。
