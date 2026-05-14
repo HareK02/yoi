@@ -113,28 +113,39 @@ AgentTurn 内に LlmCall を 1:N で持たせる際、retry の境界線を以�
 - fork 起点の `at_turn_index` は **Invoke marker の seq** に揃える。TUI で見る "Send #N" 境界と fork 起点が一致し、ユーザーが "N 回目の send まで戻る" と素直に認識できる。
 - compaction の境界も Invoke 境界で取るのが自然 (途中 LlmCall や AgentTurn の中間では切らない)。
 
-## 検討事項
+## 決定事項
 
-- `Worker::history` への追記タイミングが Invoke 境界と一致しているかの確認。一致しない箇所があれば marker entry の挿入箇所を整理する。
-- `SystemTurn` の sub-kind 化: Hook / Notify / system-reminder を SystemTurn 内で細分するか、SystemTurn は単一 actor として平坦に持つか。
-- `Wakeup` InvokeKind の必要性: Cron / RemoteTrigger 起因の発火を `Invoke(Wakeup)` として記録するか、`Invoke(Notify)` に丸めるか。
-- 既存 protocol 互換: `Event::TurnStart` / `Event::TurnEnd` を意味繰り上げするか、新 event 名で完全分離するか (案 A / 案 B の選択)。
-- `Worker::turn_count` の意味の置き換え: AgentTurn 数か、Invoke 数か、LlmCall 数か。
+- **Event 移行**: 案 A 採用。`Event::TurnStart` / `Event::TurnEnd` を **AgentTurn 境界** (retry 集約後) の意味に doc 再定義し、LLM call 境界の発火タイミングは **新規** `Event::LlmCallStart` / `Event::LlmCallEnd` に移す。protocol は新 variant 追加のみで既存 variant は破壊しない (互換維持)。
+- **`Worker::turn_count` の意味**: **AgentTurn 数**。現状 retry が実装されていないため LLM call 数と 1:1 だが、`llm-worker-stream-continuation` 等で retry が入った時に意味が分岐する想定。
+- **LlmCall 通し番号**: 新規 `llm_call_count: usize` を `Worker` に追加し、`Event::LlmCallStart` / `End` で通知。
+- **`InvokeKind`**: `UserSend` / `Notify` / `PodEvent` / `SystemReminder` / `Wakeup` の 5 variants を初期セットに含める。Wakeup は実体未登場だが将来追加コストを下げるため最初から枠を切る。配置は `protocol` crate (`session-store` が依存する向き)。
+- **`LogEntry::TurnEnd` の扱い**: **位置・形式そのまま維持**。新規 `LogEntry::Invoke { ts, kind: InvokeKind }` を **追加** (run / run_for_notification の開始時に commit)。TurnEnd の commit 位置を AgentTurn 単位に動かすのは互換破壊になるため、本チケット範囲外とする。`persistence-semantics` の `at_turn_index` は新 `Invoke` entry の seq を指すように後続で整合させる。
+- **`SystemTurn` の sub-kind 化**: 行わない。SystemTurn は actor キャッチオール枠の単一分類として平坦に扱う。Hook / Notify / system-reminder の区別は **対応する Invoke の `kind`** で取れるため重複しない。
+- **`Worker::history` への追記タイミング**: 実装中に Invoke 境界 (= run / run_for_notification 開始) と Invoke marker commit が同タイミングであることを確認する。ずれていれば marker 側を Worker 入口に揃える。
 
 ## 完了条件
 
 - `Invoke` / `Turn` / `LlmCall` / `Request` / `Run` の定義が文書化されている。
 - AgentTurn における retry の境界線が明確化されている。
 - SystemTurn が actor キャッチオールとして定義され、Hook / Notify / system-reminder がそこに含まれることが示されている。
-- 既存 `Event::TurnStart` / `Event::TurnEnd` の段階移行方針 (案 A / 案 B) が決まっている。
+- 既存 `Event::TurnStart` / `Event::TurnEnd` の段階移行方針 (案 A) が決まっている。
 - persistence-semantics の `at_turn_index` 等が Invoke seq を指すことが整合している。
+- **コード反映**: 以下が実装されている。
+  - `protocol::Event::InvokeStart { kind: InvokeKind }` / `Event::LlmCallStart` / `Event::LlmCallEnd` が追加されている。
+  - `protocol::InvokeKind` enum が定義されている。
+  - `Worker` に `llm_call_count` フィールドと `on_llm_call_start` / `on_llm_call_end` callback が追加されている。
+  - `Worker::turn_count` の doc が AgentTurn 数の意味に更新されている。
+  - `session_store::LogEntry::Invoke { ts, kind }` が追加され、run / run_for_notification 開始時に commit されている。
+  - controller が新 callback を wire し、新 Event を broadcast している。
 
 ## 範囲外
 
-- このチケット単体での大規模 rename 実装。
+- このチケット単体での大規模 rename 実装 (具体的には `Hook::OnTurnEnd` の名前変更、`TUI Block::TurnHeader` の名前変更、`Pod::add_on_turn_end_hook` 等の API rename)。
+- `LogEntry::TurnEnd` の commit 位置を AgentTurn 単位に動かすこと (互換破壊)。
+- retry の実体実装 (`llm-worker-stream-continuation` の領分)。
 - 永続化 DB backend の実装。
-- TUI の詳細 UX 設計。
-- protocol の互換破壊的変更。
+- TUI の詳細 UX 設計 (Invoke 境界での kind 別表示、LlmCall の UI 露出など)。
+- protocol の互換破壊的変更 (既存 variant の変更・削除)。
 
 ## 関連
 
