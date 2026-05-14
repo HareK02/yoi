@@ -11,7 +11,7 @@ pub mod spawn;
 pub mod workflow;
 
 mod factory;
-mod interrupt_and_run;
+mod interrupt_prep;
 mod permission;
 mod pod;
 

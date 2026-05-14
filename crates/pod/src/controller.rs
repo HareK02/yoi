@@ -94,7 +94,6 @@ async fn finish_controller_run<C, St>(
 /// `pod.run_for_notification()` drains the NotifyBuffer on its own.
 enum PendingRun {
     Run(Vec<Segment>),
-    InterruptAndRun(Vec<Segment>),
     RunForNotification,
     Resume,
 }
@@ -108,7 +107,7 @@ impl PendingRun {
     /// notify buffer (Notify / inbound PodEvent) and stays silent.
     fn is_parent_originated(&self) -> bool {
         match self {
-            PendingRun::Run(_) | PendingRun::InterruptAndRun(_) | PendingRun::Resume => true,
+            PendingRun::Run(_) | PendingRun::Resume => true,
             PendingRun::RunForNotification => false,
         }
     }
@@ -536,21 +535,6 @@ async fn controller_loop<C, St>(
                     )
                     .await
                 }
-                PendingRun::InterruptAndRun(input) => {
-                    drive_turn(
-                        pod.interrupt_and_run(input),
-                        &mut method_rx,
-                        &event_tx,
-                        &cancel_tx,
-                        &shared_state,
-                        &notify_buffer,
-                        self_parent_socket.as_ref(),
-                        &spawner_name,
-                        &spawned_registry,
-                        parent_originated,
-                    )
-                    .await
-                }
                 PendingRun::RunForNotification => {
                     drive_turn(
                         pod.run_for_notification(),
@@ -598,8 +582,7 @@ async fn controller_loop<C, St>(
 
         match method {
             Method::Run { input } => {
-                let status_before = shared_state.get_status();
-                if status_before == PodStatus::Running {
+                if shared_state.get_status() == PodStatus::Running {
                     // Defensive: the inner select! inside drive_turn
                     // already rejects `Run` while a turn is live, so
                     // this branch is only reachable across a race window
@@ -616,17 +599,16 @@ async fn controller_loop<C, St>(
                 // shared_state's `user_segments` is re-synced from
                 // `pod` after the run completes, so we don't push
                 // here. Workflow-invocation validation happens inside
-                // `Pod::run` / `Pod::interrupt_and_run`; on failure the
-                // turn errors out via `Event::Error { InvalidRequest }`
-                // before any UserInput is committed.
+                // `Pod::run`; on failure the turn errors out via
+                // `Event::Error { InvalidRequest }` before any
+                // UserInput is committed. Paused→Run cleanup (orphan
+                // tool_result closure + interrupt system note) is
+                // applied inside `Pod::run` itself when the worker's
+                // `last_run_interrupted` flag is set.
                 let _ = event_tx.send(Event::UserMessage {
                     segments: input.clone(),
                 });
-                pending = Some(if status_before == PodStatus::Paused {
-                    PendingRun::InterruptAndRun(input)
-                } else {
-                    PendingRun::Run(input)
-                });
+                pending = Some(PendingRun::Run(input));
             }
 
             Method::Notify { message } => {
@@ -958,7 +940,6 @@ mod tests {
     #[test]
     fn pending_run_parent_origin_table() {
         assert!(PendingRun::Run(Vec::new()).is_parent_originated());
-        assert!(PendingRun::InterruptAndRun(Vec::new()).is_parent_originated());
         assert!(PendingRun::Resume.is_parent_originated());
         assert!(!PendingRun::RunForNotification.is_parent_originated());
     }

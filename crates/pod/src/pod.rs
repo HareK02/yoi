@@ -1138,9 +1138,23 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     pub async fn run(&mut self, input: Vec<Segment>) -> Result<PodRunResult, PodError> {
         // Validate workflow invocations up front so an invalid slug
         // never commits a UserInput entry, never triggers pre-run
-        // compaction, and never half-applies interrupt prep when run
-        // from `interrupt_and_run`. Read-only against `workflow_registry`.
+        // compaction, and never half-applies interrupt prep when the
+        // previous turn was interrupted. Read-only against
+        // `workflow_registry`.
         self.validate_workflow_invocations(&input)?;
+
+        // Paused→Run transition: if the previous turn was cut short,
+        // any `Item::ToolCall` whose tool never produced a matching
+        // `ToolResult` is closed with a synthetic one, and a short
+        // system note explaining the interruption is appended — so the
+        // next request is wire-valid (Anthropic) and the LLM knows
+        // prior work was abandoned. Driven by the worker's own
+        // `last_run_interrupted` flag; `Pod::resume` reuses the prior
+        // context via a different entry point and never triggers this
+        // path.
+        if self.worker.as_ref().unwrap().last_run_interrupted() {
+            self.apply_interrupt_prep()?;
+        }
 
         self.prepare_for_run().await?;
 
@@ -1399,11 +1413,40 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         Ok(out)
     }
 
+    /// Stage the post-interruption cleanup at the front of worker
+    /// history: close every unanswered `Item::ToolCall` with a synthetic
+    /// `Item::ToolResult` (Anthropic wire-validity), then append a
+    /// system note so the LLM understands the prior turn was cut
+    /// short. Called from `Pod::run` when the worker's
+    /// `last_run_interrupted` flag is set (i.e. the Pod just transitioned
+    /// out of Paused via a new user input).
+    fn apply_interrupt_prep(&mut self) -> Result<(), PodError> {
+        let tool_result_summary = self
+            .prompts()
+            .interrupt_tool_result_summary()
+            .map_err(PodError::from)?;
+        let system_note = self
+            .prompts()
+            .interrupt_system_note()
+            .map_err(PodError::from)?;
+
+        let closures = crate::interrupt_prep::orphan_tool_result_closures(
+            self.worker().history(),
+            &tool_result_summary,
+        );
+        if !closures.is_empty() {
+            self.worker_mut().extend_history(closures);
+        }
+        self.worker_mut()
+            .push_item(llm_worker::Item::system_message(system_note));
+        Ok(())
+    }
+
     /// Validate explicit workflow invocations without reading dependency
-    /// bodies. Called from `Pod::run` / `Pod::interrupt_and_run` entry so
-    /// an invalid slug aborts the turn before any session-log commit or
-    /// interrupt-prep side effects; `pub` so completion / preview paths
-    /// can also dry-check inputs.
+    /// bodies. Called from `Pod::run` entry so an invalid slug aborts
+    /// the turn before any session-log commit or interrupt-prep side
+    /// effects; `pub` so completion / preview paths can also dry-check
+    /// inputs.
     pub fn validate_workflow_invocations(
         &self,
         segments: &[Segment],

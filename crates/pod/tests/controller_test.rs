@@ -1367,9 +1367,10 @@ async fn paused_then_run_closes_orphan_tool_use_for_next_request() {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     assert_eq!(handle.shared_state.get_status(), PodStatus::Paused);
 
-    // New user input while Paused → controller routes to
-    // `Pod::interrupt_and_run`, which closes the orphan + injects a
-    // system note before the fresh user message.
+    // New user input while Paused → `Pod::run` observes
+    // `last_run_interrupted` and runs its interrupt-prep step, which
+    // closes the orphan + injects a system note before the fresh user
+    // message.
     handle.send(Method::run_text("new request")).await.unwrap();
     assert!(
         drain_until(&mut rx, std::time::Duration::from_secs(2), |e| matches!(
