@@ -9,8 +9,8 @@ use llm_worker::llm_client::client::LlmClient;
 use llm_worker::state::Mutable;
 use llm_worker::{ToolOutputLimits, UsageRecord, Worker, WorkerError, WorkerResult};
 use session_store::{
-    EntryHash, HashedEntry, LogEntry, PodScopeSnapshot, SessionId, Store, StoreError, session_log,
-    to_logged,
+    EntryHash, HashedEntry, LogEntry, PodScopeSnapshot, SessionId, Store, StoreError, SystemItem,
+    session_log, to_logged,
 };
 use tracing::{info, warn};
 
@@ -18,16 +18,21 @@ use crate::session_log_sink::SessionLogSink;
 
 /// Command sent to the per-Pod history-drain task.
 ///
-/// `Item` carries one worker-history append observed via
-/// `Worker::on_history_append`; the drain classifies it into a
-/// `LogEntry::AssistantItems` / `LogEntry::ToolResults` /
-/// `LogEntry::HookInjectedItems` and commits it through the sink.
-/// `Flush(ack)` is the barrier used by `persist_turn` to ensure every
-/// in-flight item is committed before the trailing `TurnEnd` entry
-/// lands.
+/// - `Item`: one worker-history append observed via
+///   `Worker::on_history_append`; the drain classifies it into
+///   `LogEntry::AssistantItems` / `LogEntry::ToolResults` and commits
+///   through the sink. `role:system` items are explicitly skipped
+///   because they are committed up-front through `SystemItems`.
+/// - `SystemItems`: typed agent-injected items committed as a single
+///   `LogEntry::SystemItems` entry. Used by the interceptor when it
+///   drains the notify buffer or pending attachments.
+/// - `Flush(ack)`: barrier used by `persist_turn` to ensure every
+///   queued command has been processed before the trailing `TurnEnd`
+///   entry lands.
 #[derive(Debug)]
 pub enum LogCommand {
     Item(Item),
+    SystemItems(Vec<SystemItem>),
     Flush(tokio::sync::oneshot::Sender<()>),
 }
 
@@ -158,7 +163,7 @@ pub struct Pod<C: LlmClient, St: Store> {
     /// before handing off to the worker; `PodInterceptor::on_prompt_submit`
     /// drains it and returns `ContinueWith` so the items land in
     /// history right after the user message that referenced them.
-    pending_attachments: Arc<Mutex<Vec<Item>>>,
+    pending_attachments: Arc<Mutex<Vec<SystemItem>>>,
     /// Scope allocation in the machine-wide lock file. `Some` for
     /// Pods built via `from_manifest` / `from_manifest_spawned` /
     /// `restore_from_manifest` (production paths); `None` for the
@@ -279,7 +284,7 @@ impl<C: LlmClient + Clone + 'static, St: Store + Clone + 'static> Pod<C, St> {
             alerter: self.alerter.clone(),
             event_tx: self.event_tx.clone(),
             pending_notifies: NotifyBuffer::new(),
-            pending_attachments: Arc::new(Mutex::new(Vec::new())),
+            pending_attachments: Arc::new(Mutex::new(Vec::<SystemItem>::new())),
             scope_allocation: None,
             callback_socket: None,
             prompts: self.prompts.clone(),
@@ -378,7 +383,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             alerter: None,
             event_tx: None,
             pending_notifies: NotifyBuffer::new(),
-            pending_attachments: Arc::new(Mutex::new(Vec::new())),
+            pending_attachments: Arc::new(Mutex::new(Vec::<SystemItem>::new())),
             scope_allocation: None,
             callback_socket: None,
             prompts,
@@ -760,7 +765,17 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     /// `PodInterceptor::pending_history_appends`. See [`NotifyBuffer`]
     /// for overflow behaviour and the lane-of-record rationale.
     pub fn push_notify(&self, message: String) {
-        self.pending_notifies.push(message);
+        self.pending_notifies.push_notify(message);
+    }
+
+    /// Push a typed `PodEvent` entry onto the pending buffer.
+    ///
+    /// Same lifecycle as [`push_notify`](Self::push_notify) but
+    /// preserves the typed `PodEvent` payload so the IPC layer can
+    /// emit `SystemItem::PodEvent { event, body }` with structured
+    /// data for clients.
+    pub fn push_pod_event_notify(&self, event: protocol::PodEvent) {
+        self.pending_notifies.push_pod_event(event);
     }
 
     /// Shared handle to the pending notification buffer.
@@ -892,6 +907,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 self.pending_notifies.clone(),
                 self.pending_attachments.clone(),
                 self.prompts.clone(),
+                self.log_cmd_tx.clone(),
             );
             self.worker_mut().set_interceptor(interceptor);
             self.interceptor_installed = true;
@@ -1099,7 +1115,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     /// directory) surface as `AlertLevel::Warn` Alerts and are skipped — the
     /// unresolved placeholder stays in the flattened user message so the LLM
     /// still sees the intent.
-    fn resolve_file_refs(&self, segments: &[Segment]) -> Vec<Item> {
+    fn resolve_file_refs(&self, segments: &[Segment]) -> Vec<SystemItem> {
         let view = crate::fs_view::PodFsView::new(tools::ScopedFs::with_shared_scope(
             self.scope.clone(),
             self.pwd.clone(),
@@ -1110,7 +1126,19 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 continue;
             };
             match view.resolve_file_ref(path, self.manifest.worker.file_upload.max_bytes) {
-                Ok(item) => out.push(item),
+                Ok(item) => {
+                    // `resolve_file_ref` returns an `Item::system_message`
+                    // whose text already carries the `[File: <path>]` or
+                    // `[Dir: <path>]` header (plus any truncation hint).
+                    // Persist that body verbatim — it is what the LLM
+                    // actually saw, so resume produces byte-identical
+                    // history.
+                    let body = item.as_text().unwrap_or_default().to_string();
+                    out.push(SystemItem::FileAttachment {
+                        path: path.clone(),
+                        body,
+                    });
+                }
                 Err(e) => {
                     self.alert(
                         AlertLevel::Warn,
@@ -1123,7 +1151,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         out
     }
 
-    fn resolve_knowledge_refs(&self, segments: &[Segment]) -> Vec<Item> {
+    fn resolve_knowledge_refs(&self, segments: &[Segment]) -> Vec<SystemItem> {
         let Some(layout) = self.memory_layout.as_ref() else {
             return Vec::new();
         };
@@ -1156,7 +1184,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 }
             };
             let raw = String::from_utf8_lossy(&bytes).into_owned();
-            let body = match memory::schema::split_frontmatter(&raw) {
+            let body_text = match memory::schema::split_frontmatter(&raw) {
                 Ok((_yaml, body)) => body,
                 Err(e) => {
                     self.alert(
@@ -1173,11 +1201,11 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 &bytes,
             );
             self.append_memory_use_event(memory::UsageSource::KnowledgeRef, vec![snapshot]);
-            out.push(Item::system_message(format!(
-                "[Knowledge #{}]\n{}",
-                slug,
-                body.trim_end()
-            )));
+            let body = format!("[Knowledge #{}]\n{}", slug, body_text.trim_end());
+            out.push(SystemItem::Knowledge {
+                slug: slug.clone(),
+                body,
+            });
         }
         out
     }
@@ -1247,7 +1275,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     fn resolve_workflow_invocations(
         &self,
         segments: &[Segment],
-    ) -> Result<Vec<Item>, WorkflowResolveError> {
+    ) -> Result<Vec<SystemItem>, WorkflowResolveError> {
         let Some(layout) = self.memory_layout.as_ref() else {
             if let Some(slug) = segments.iter().find_map(|seg| match seg {
                 Segment::WorkflowInvoke { slug } => Some(slug.clone()),
@@ -1282,7 +1310,17 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                     warn!(workflow = %slug, error = %err, "failed to snapshot workflow usage");
                 }
             }
-            out.extend(items);
+            // `resolve_workflow_invocation` returns Item::system_message
+            // entries (potentially multiple — body + dependency knowledge
+            // bodies). Persist each as a SystemItem::Workflow keyed on
+            // the invocation slug.
+            for item in items {
+                let body = item.as_text().unwrap_or_default().to_string();
+                out.push(SystemItem::Workflow {
+                    slug: slug.clone(),
+                    body,
+                });
+            }
         }
         Ok(out)
     }
@@ -2635,7 +2673,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             alerter: None,
             event_tx: None,
             pending_notifies: NotifyBuffer::new(),
-            pending_attachments: Arc::new(Mutex::new(Vec::new())),
+            pending_attachments: Arc::new(Mutex::new(Vec::<SystemItem>::new())),
             scope_allocation: Some(scope_allocation),
             callback_socket: None,
             prompts: common.prompts,
@@ -2708,7 +2746,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             alerter: None,
             event_tx: None,
             pending_notifies: NotifyBuffer::new(),
-            pending_attachments: Arc::new(Mutex::new(Vec::new())),
+            pending_attachments: Arc::new(Mutex::new(Vec::<SystemItem>::new())),
             scope_allocation: Some(scope_allocation),
             callback_socket: Some(callback_socket),
             prompts: common.prompts,
@@ -2852,7 +2890,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             alerter: None,
             event_tx: None,
             pending_notifies: NotifyBuffer::new(),
-            pending_attachments: Arc::new(Mutex::new(Vec::new())),
+            pending_attachments: Arc::new(Mutex::new(Vec::<SystemItem>::new())),
             scope_allocation: Some(scope_allocation),
             callback_socket: None,
             prompts: common.prompts,

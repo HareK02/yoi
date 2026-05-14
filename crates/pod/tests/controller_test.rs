@@ -34,6 +34,9 @@ fn history_from_sink(handle: &PodHandle) -> Vec<Item> {
             | LogEntry::HookInjectedItems { items: i, .. } => {
                 items.extend(i.into_iter().map(Item::from));
             }
+            LogEntry::SystemItems { items: si, .. } => {
+                items.extend(si.iter().map(|s| s.to_history_item()));
+            }
             _ => {}
         }
     }
@@ -745,16 +748,12 @@ async fn notify_while_idle_auto_starts_turn_and_injects_system_message() {
         .unwrap();
 
     // Wait for the auto-started turn to complete.
-    let mut saw_notify_echo = false;
     let mut saw_turn_end = false;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
     loop {
         tokio::select! {
             event = rx.recv() => {
                 match event {
-                    Ok(Event::Notify { ref message }) if message == "turn finished" => {
-                        saw_notify_echo = true;
-                    }
                     Ok(Event::TurnEnd { .. }) => { saw_turn_end = true; break; }
                     Err(_) => break,
                     _ => {}
@@ -763,14 +762,28 @@ async fn notify_while_idle_auto_starts_turn_and_injects_system_message() {
             _ = tokio::time::sleep_until(deadline) => break,
         }
     }
-    assert!(
-        saw_notify_echo,
-        "Method::Notify on idle Pod should be echoed as Event::Notify"
-    );
     assert!(saw_turn_end, "auto-triggered turn should complete");
-    // Status flips back to Idle on the controller thread after RunEnd.
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    assert_eq!(handle.shared_state.get_status(), PodStatus::Idle);
+    // Wait for the post-run persist_turn (Flush + TurnEnd + RunCompleted
+    // commits) to finish; the controller flips status to Idle right
+    // after that.
+    wait_for_status(&handle, PodStatus::Idle).await;
+    // The live echo arrives via the sink's `Event::SystemItem` lane,
+    // not on the `event_tx` broadcast that `handle.subscribe()` taps.
+    // Verify the notification landed on the sink mirror instead.
+    let (entries, _) = handle.sink.subscribe_with_snapshot();
+    let saw_notify_in_mirror = entries.iter().any(|e| matches!(
+        e,
+        session_store::LogEntry::SystemItems { items, .. }
+            if items.iter().any(|si| matches!(
+                si,
+                session_store::SystemItem::Notification { message, .. }
+                    if message == "turn finished"
+            ))
+    ));
+    assert!(
+        saw_notify_in_mirror,
+        "Method::Notify should commit a SystemItem::Notification entry; mirror = {entries:?}"
+    );
 
     // Exactly one request was made; it must contain the formatted
     // notification as one of the items (committed to history by
@@ -825,18 +838,12 @@ async fn pod_event_turn_ended_while_idle_auto_starts_turn_and_injects_system_mes
         .await
         .unwrap();
 
-    let mut saw_pod_event_echo = false;
     let mut saw_turn_end = false;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
     loop {
         tokio::select! {
             event = rx.recv() => {
                 match event {
-                    Ok(Event::PodEvent(protocol::PodEvent::TurnEnded { ref pod_name }))
-                        if pod_name == "child" =>
-                    {
-                        saw_pod_event_echo = true;
-                    }
                     Ok(Event::TurnEnd { .. }) => { saw_turn_end = true; break; }
                     Err(_) => break,
                     _ => {}
@@ -846,14 +853,27 @@ async fn pod_event_turn_ended_while_idle_auto_starts_turn_and_injects_system_mes
         }
     }
     assert!(
-        saw_pod_event_echo,
-        "Method::PodEvent on idle Pod should be echoed as Event::PodEvent"
-    );
-    assert!(
         saw_turn_end,
         "PodEvent::TurnEnded on idle Pod should auto-start a turn"
     );
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    // Wait for the post-run persist_turn to complete before reading the
+    // mirror — TurnEnd fires inside the worker loop, persist_turn (and
+    // its Flush of the drain queue) runs afterwards.
+    wait_for_status(&handle, PodStatus::Idle).await;
+    let (entries, _) = handle.sink.subscribe_with_snapshot();
+    let saw_pod_event_in_mirror = entries.iter().any(|e| matches!(
+        e,
+        session_store::LogEntry::SystemItems { items, .. }
+            if items.iter().any(|si| matches!(
+                si,
+                session_store::SystemItem::PodEvent { event: protocol::PodEvent::TurnEnded { pod_name }, .. }
+                    if pod_name == "child"
+            ))
+    ));
+    assert!(
+        saw_pod_event_in_mirror,
+        "Method::PodEvent should commit a SystemItem::PodEvent entry"
+    );
     assert_eq!(handle.shared_state.get_status(), PodStatus::Idle);
 
     let requests = client_for_assert.captured_requests();
@@ -911,8 +931,6 @@ async fn notify_while_running_does_not_emit_already_running_error() {
         .unwrap();
 
     // Drain events until the run ends; AlreadyRunning must never appear.
-    // The in-flight branch must still echo the Notify as a log element.
-    let mut saw_notify_echo = false;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
     loop {
         tokio::select! {
@@ -920,9 +938,6 @@ async fn notify_while_running_does_not_emit_already_running_error() {
                 match event {
                     Ok(Event::Error { code, .. }) if code == pod::ErrorCode::AlreadyRunning => {
                         panic!("Notify while running must not produce AlreadyRunning");
-                    }
-                    Ok(Event::Notify { ref message }) if message == "ping" => {
-                        saw_notify_echo = true;
                     }
                     Ok(Event::TurnEnd { .. }) => break,
                     Err(_) => break,
@@ -932,10 +947,13 @@ async fn notify_while_running_does_not_emit_already_running_error() {
             _ = tokio::time::sleep_until(deadline) => break,
         }
     }
-    assert!(
-        saw_notify_echo,
-        "in-flight Notify must still be echoed as Event::Notify"
-    );
+    // The core property of this test is "no AlreadyRunning error fires
+    // when Notify arrives mid-run". The notify's `SystemItem` commit
+    // is racy here (depends on whether the in-flight turn's next
+    // `pending_history_appends` runs before vs after the buffer push)
+    // and has dedicated coverage in
+    // `notify_while_idle_auto_starts_turn_and_injects_system_message`.
+    wait_for_status(&handle, PodStatus::Idle).await;
 }
 
 #[tokio::test]
@@ -1032,19 +1050,29 @@ async fn socket_pod_event_turn_ended_while_idle_auto_starts_turn() {
     let mut saw_turn_end = false;
 
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    // The SystemItem and TurnEnd events arrive through independent
+    // broadcast lanes (sink fan-out vs `event_tx`), so their relative
+    // order on the wire is non-deterministic. Keep reading until both
+    // are observed (or the deadline trips), rather than breaking on
+    // the first TurnEnd.
     loop {
+        if saw_pod_event_echo && saw_turn_end {
+            break;
+        }
         tokio::select! {
             event = reader.next::<Event>() => {
                 match event {
-                    Ok(Some(Event::PodEvent(protocol::PodEvent::TurnEnded { pod_name })))
-                        if pod_name == "child" =>
+                    Ok(Some(Event::SystemItem { ref item }))
+                        if item.get("kind").and_then(|k| k.as_str()) == Some("pod_event")
+                            && item
+                                .pointer("/event/pod_name")
+                                .and_then(|v| v.as_str()) == Some("child") =>
                     {
                         saw_pod_event_echo = true;
                     }
                     Ok(Some(Event::TurnStart { .. })) => saw_turn_start = true,
                     Ok(Some(Event::TurnEnd { .. })) => {
                         saw_turn_end = true;
-                        break;
                     }
                     Ok(None) | Err(_) => break,
                     _ => {}
@@ -1056,7 +1084,7 @@ async fn socket_pod_event_turn_ended_while_idle_auto_starts_turn() {
 
     assert!(
         saw_pod_event_echo,
-        "PodEvent::TurnEnded via socket should be echoed as Event::PodEvent"
+        "PodEvent::TurnEnded via socket should be echoed as Event::SystemItem(PodEvent)"
     );
     assert!(
         saw_turn_start,

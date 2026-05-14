@@ -483,21 +483,13 @@ impl App {
                 self.blocks.push(Block::UserMessage { segments });
                 self.assistant_streaming = false;
             }
-            Event::Notify { message } => {
-                self.blocks.push(Block::Notify { message });
-                self.assistant_streaming = false;
-            }
-            Event::PodEvent(event) => {
-                self.blocks.push(Block::PodEvent { event });
-                self.assistant_streaming = false;
-            }
             Event::SessionRotated { entry } => {
                 self.reset_for_rotation();
                 self.apply_log_entry_raw(&entry);
                 self.assistant_streaming = false;
             }
-            Event::HookInjectedItems { entry } => {
-                self.apply_log_entry_raw(&entry);
+            Event::SystemItem { item } => {
+                self.apply_system_item(&item);
                 self.assistant_streaming = false;
             }
             Event::TurnStart { .. } => {
@@ -984,8 +976,48 @@ impl App {
                     self.push_history_item(&item_value);
                 }
             }
+            session_store::LogEntry::SystemItems { items, .. } => {
+                for system_item in items {
+                    let value =
+                        serde_json::to_value(&system_item).expect("SystemItem is Serialize");
+                    self.apply_system_item(&value);
+                }
+            }
             // Non-history-bearing variants don't affect the block view.
             _ => {}
+        }
+    }
+
+    /// Dispatch one `SystemItem` JSON value into the appropriate block.
+    ///
+    /// Kind-based routing replaces the old free-text `[Notification]` /
+    /// `[File: …]` parsing path: each kind maps directly to a typed
+    /// block (`Block::Notify`, `Block::PodEvent`, …).
+    fn apply_system_item(&mut self, value: &serde_json::Value) {
+        let Ok(item) = serde_json::from_value::<session_store::SystemItem>(value.clone()) else {
+            // Unknown / forward-compat shape: fall back to rendering the
+            // raw text payload (if any) as a generic system message.
+            if let Some(text) = value.get("body").and_then(|b| b.as_str()) {
+                self.task_store.apply_system_message_text(text);
+                self.blocks.push(Block::SystemMessage {
+                    text: text.to_owned(),
+                });
+            }
+            return;
+        };
+        match item {
+            session_store::SystemItem::Notification { message, .. } => {
+                self.blocks.push(Block::Notify { message });
+            }
+            session_store::SystemItem::PodEvent { event, .. } => {
+                self.blocks.push(Block::PodEvent { event });
+            }
+            session_store::SystemItem::FileAttachment { body, .. }
+            | session_store::SystemItem::Knowledge { body, .. }
+            | session_store::SystemItem::Workflow { body, .. } => {
+                self.task_store.apply_system_message_text(&body);
+                self.blocks.push(Block::SystemMessage { text: body });
+            }
         }
     }
 
@@ -1422,23 +1454,52 @@ mod completion_flow_tests {
     }
 
     #[test]
-    fn live_hook_injected_items_event_appends_system_message_block() {
+    fn live_system_item_workflow_appends_system_message_block() {
         let mut app = App::new("test".into());
-        let entry = serde_json::json!({
-            "kind": "hook_injected_items",
-            "ts": 1,
-            "items": [{
-                "kind": "message",
-                "role": "system",
-                "content": [{ "kind": "text", "text": "[Workflow /build]\nRun the build" }],
-            }],
+        let item = serde_json::json!({
+            "kind": "workflow",
+            "slug": "build",
+            "body": "[Workflow /build]\nRun the build",
         });
-        app.handle_pod_event(Event::HookInjectedItems { entry });
+        app.handle_pod_event(Event::SystemItem { item });
 
         assert!(matches!(
             app.blocks.as_slice(),
             [Block::SystemMessage { text }] if text == "[Workflow /build]\nRun the build"
         ));
+    }
+
+    #[test]
+    fn live_system_item_notification_appends_notify_block() {
+        let mut app = App::new("test".into());
+        let item = serde_json::json!({
+            "kind": "notification",
+            "message": "hi",
+            "body": "[Notification] hi",
+        });
+        app.handle_pod_event(Event::SystemItem { item });
+        assert!(matches!(
+            app.blocks.as_slice(),
+            [Block::Notify { message }] if message == "hi"
+        ));
+    }
+
+    #[test]
+    fn live_system_item_pod_event_appends_pod_event_block() {
+        let mut app = App::new("test".into());
+        let item = serde_json::json!({
+            "kind": "pod_event",
+            "event": { "kind": "turn_ended", "pod_name": "child" },
+            "body": "[Notification] pod `child` finished a turn",
+        });
+        app.handle_pod_event(Event::SystemItem { item });
+        assert_eq!(app.blocks.len(), 1);
+        match &app.blocks[0] {
+            Block::PodEvent {
+                event: protocol::PodEvent::TurnEnded { pod_name },
+            } => assert_eq!(pod_name, "child"),
+            _ => panic!("expected a PodEvent block"),
+        }
     }
 
     #[test]
@@ -1577,15 +1638,13 @@ mod completion_flow_tests {
             ```json\n{\n  \"tasks\": [\n    {\n      \"taskid\": 4,\n      \
             \"status\": \"inprogress\",\n      \"subject\": \"from snapshot\",\n      \
             \"description\": \"d\"\n    }\n  ]\n}\n```\n";
-        app.handle_pod_event(Event::HookInjectedItems {
-            entry: serde_json::json!({
-                "kind": "hook_injected_items",
-                "ts": 1,
-                "items": [{
-                    "kind": "message",
-                    "role": "system",
-                    "content": [{ "kind": "text", "text": snapshot }],
-                }],
+        // Snapshot text injected as a workflow body (kind doesn't matter
+        // for task-store parsing, only the text contents do).
+        app.handle_pod_event(Event::SystemItem {
+            item: serde_json::json!({
+                "kind": "workflow",
+                "slug": "task-snapshot",
+                "body": snapshot,
             }),
         });
 

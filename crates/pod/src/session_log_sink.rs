@@ -120,7 +120,7 @@ impl SessionLogSink {
     fn is_live_relevant(entry: &LogEntry) -> bool {
         matches!(
             entry,
-            LogEntry::SessionStart { .. } | LogEntry::HookInjectedItems { .. }
+            LogEntry::SessionStart { .. } | LogEntry::SystemItems { .. }
         )
     }
 
@@ -427,12 +427,13 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
-    fn hook_injected(text: &str) -> LogEntry {
-        LogEntry::HookInjectedItems {
+    fn notification_entry(text: &str) -> LogEntry {
+        LogEntry::SystemItems {
             ts: now_millis(),
-            items: vec![session_store::LoggedItem::from(
-                &llm_worker::Item::system_message(text),
-            )],
+            items: vec![session_store::SystemItem::Notification {
+                message: text.to_owned(),
+                body: format!("[Notification] {text}"),
+            }],
         }
     }
 
@@ -448,11 +449,11 @@ mod tests {
         sink.publish(turn_end(1));
         assert!(rx.try_recv().is_err(), "TurnEnd must not be broadcast live");
 
-        // HookInjectedItems is live-relevant.
-        sink.publish(hook_injected("[Notify] hi"));
+        // SystemItems is live-relevant.
+        sink.publish(notification_entry("hi"));
         match rx.try_recv() {
-            Ok(LogEntry::HookInjectedItems { .. }) => {}
-            other => panic!("expected HookInjectedItems, got {other:?}"),
+            Ok(LogEntry::SystemItems { .. }) => {}
+            other => panic!("expected SystemItems, got {other:?}"),
         }
 
         // Mirror still grew with both entries (snapshot completeness).
@@ -465,11 +466,11 @@ mod tests {
         let sink = SessionLogSink::new();
         sink.publish(session_start());
         let (snapshot, mut rx) = sink.subscribe_with_snapshot();
-        sink.publish(hook_injected("post-snapshot"));
+        sink.publish(notification_entry("post-snapshot"));
 
         assert_eq!(snapshot.len(), 1);
         match rx.try_recv() {
-            Ok(LogEntry::HookInjectedItems { .. }) => {}
+            Ok(LogEntry::SystemItems { .. }) => {}
             other => panic!("unexpected: {other:?}"),
         }
         assert!(rx.try_recv().is_err());

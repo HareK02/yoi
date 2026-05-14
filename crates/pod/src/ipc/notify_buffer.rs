@@ -3,39 +3,48 @@
 //! Entries are queued here by the Controller (on receipt of the
 //! corresponding IPC method) and drained by
 //! `PodInterceptor::pending_history_appends`, which the Worker calls
-//! at the head of each turn loop iteration to `extend` them into the
-//! persistent `worker.history`. Each queued entry becomes one
-//! `Item::system_message`.
+//! at the head of each turn loop iteration. The drain renders each
+//! pending entry into a typed `SystemItem` (with the `notify_wrapper`
+//! prompt applied), commits a `LogEntry::SystemItems` through the
+//! session-log sink, and returns the corresponding
+//! `Item::system_message`s for the worker to append to its
+//! persistent history.
 //!
 //! This is the **single lane** for "system messages produced by Pod
 //! state that should land in the next LLM request": Notify, PodEvent,
-//! and any future `<system-reminder>` injection all ride this queue
-//! (or a sibling queue with the same lifecycle). Per
-//! `tickets/notify-history-persist.md` and `AGENTS.md` (LLM コンテキスト
-//! の加工原則), there is **no** "transient, history-skipping" lane —
-//! everything injected into a request is also committed to history so
-//! that any LLM reaction has a visible trigger across turns, resume,
-//! and compaction, and so the Anthropic prompt cache prefix stays
-//! stable across requests.
+//! and any future `<system-reminder>` injection all ride this queue.
+//! Per `tickets/notify-history-persist.md` and `AGENTS.md` (LLM
+//! context の加工原則), there is **no** "transient, history-skipping"
+//! lane — everything injected into a request is also committed to
+//! history so any LLM reaction has a visible trigger across turns,
+//! resume, and compaction, and so the Anthropic prompt cache prefix
+//! stays stable across requests.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-use llm_worker::Item;
+use protocol::PodEvent;
+use session_store::SystemItem;
 use tracing::warn;
 
 use crate::prompt::catalog::{CatalogError, PromptCatalog};
 
-/// Maximum queued notify entries. Oldest entries are dropped beyond this.
+/// Maximum queued pending entries. Oldest entries are dropped beyond this.
 const CAPACITY: usize = 128;
 
-/// One pending notify entry awaiting injection into the next LLM request.
+/// One pending entry awaiting drain into the next LLM request.
+///
+/// The buffer keeps the raw input shape so the drain step can decide
+/// the right `SystemItem` kind (and apply `notify_wrapper` to the
+/// rendered body) at the moment of commit, when the prompt catalog
+/// is available.
 #[derive(Debug, Clone)]
-pub struct PendingNotify {
-    pub message: String,
+pub enum PendingNotify {
+    Notify { message: String },
+    PodEvent { event: PodEvent },
 }
 
-/// Shared, mutex-guarded buffer of pending notify entries.
+/// Shared, mutex-guarded buffer of pending entries.
 ///
 /// Cloned between the Pod (producer) and PodInterceptor (consumer).
 #[derive(Clone, Default)]
@@ -51,26 +60,35 @@ impl NotifyBuffer {
     /// Push a notify entry onto the queue. If the queue is full, the
     /// oldest entry is dropped and a `tracing::warn` is emitted — the
     /// caller should never hit this in normal operation.
-    pub fn push(&self, message: String) {
+    pub fn push_notify(&self, message: String) {
+        self.push_entry(PendingNotify::Notify { message });
+    }
+
+    /// Push a typed pod-event entry onto the queue.
+    pub fn push_pod_event(&self, event: PodEvent) {
+        self.push_entry(PendingNotify::PodEvent { event });
+    }
+
+    fn push_entry(&self, entry: PendingNotify) {
         let mut q = self.inner.lock().expect("notify buffer poisoned");
         if q.len() >= CAPACITY {
             let dropped = q.pop_front();
             warn!(
                 capacity = CAPACITY,
-                dropped_message = dropped.as_ref().map(|n| n.message.as_str()),
+                dropped = ?dropped,
                 "notify buffer overflow; dropped oldest"
             );
         }
-        q.push_back(PendingNotify { message });
+        q.push_back(entry);
     }
 
-    /// Remove and return all pending notify entries in FIFO order.
+    /// Remove and return all pending entries in FIFO order.
     pub fn drain(&self) -> Vec<PendingNotify> {
         let mut q = self.inner.lock().expect("notify buffer poisoned");
         q.drain(..).collect()
     }
 
-    /// Number of pending notify entries. Primarily for tests.
+    /// Number of pending entries. Primarily for tests.
     pub fn len(&self) -> usize {
         self.inner.lock().expect("notify buffer poisoned").len()
     }
@@ -80,17 +98,30 @@ impl NotifyBuffer {
     }
 }
 
-/// Format a single pending notify entry into the `Item::system_message`
-/// that gets appended to `worker.history` just before the next LLM
-/// request. The wrapper body comes from `PodPrompt::NotifyWrapper` so
-/// the surrounding phrasing can be customised via a prompt pack
-/// (translation, tone, ...).
-pub(crate) fn format_notify(
-    n: &PendingNotify,
+/// Render one pending entry into a typed `SystemItem`. The
+/// `notify_wrapper` prompt produces the LLM-context body for both
+/// `Notify` (raw message) and `PodEvent` (rendered event line).
+pub(crate) fn build_system_item(
+    entry: &PendingNotify,
     prompts: &PromptCatalog,
-) -> Result<Item, CatalogError> {
-    let text = prompts.notify_wrapper(&n.message)?;
-    Ok(Item::system_message(text))
+) -> Result<SystemItem, CatalogError> {
+    match entry {
+        PendingNotify::Notify { message } => {
+            let body = prompts.notify_wrapper(message)?;
+            Ok(SystemItem::Notification {
+                message: message.clone(),
+                body,
+            })
+        }
+        PendingNotify::PodEvent { event } => {
+            let rendered = session_store::render_pod_event(event);
+            let body = prompts.notify_wrapper(&rendered)?;
+            Ok(SystemItem::PodEvent {
+                event: event.clone(),
+                body,
+            })
+        }
+    }
 }
 
 #[cfg(test)]
@@ -100,12 +131,14 @@ mod tests {
     #[test]
     fn push_then_drain_preserves_order() {
         let buf = NotifyBuffer::new();
-        buf.push("one".into());
-        buf.push("two".into());
+        buf.push_notify("one".into());
+        buf.push_notify("two".into());
         let drained = buf.drain();
         assert_eq!(drained.len(), 2);
-        assert_eq!(drained[0].message, "one");
-        assert_eq!(drained[1].message, "two");
+        match &drained[0] {
+            PendingNotify::Notify { message } => assert_eq!(message, "one"),
+            other => panic!("unexpected: {other:?}"),
+        }
         assert!(buf.is_empty());
     }
 
@@ -113,28 +146,50 @@ mod tests {
     fn capacity_drops_oldest() {
         let buf = NotifyBuffer::new();
         for i in 0..(CAPACITY + 5) {
-            buf.push(format!("msg{i}"));
+            buf.push_notify(format!("msg{i}"));
         }
         let drained = buf.drain();
         assert_eq!(drained.len(), CAPACITY);
-        // Oldest 5 were dropped; first retained is msg5.
-        assert_eq!(drained[0].message, "msg5");
-        assert_eq!(
-            drained[CAPACITY - 1].message,
-            format!("msg{}", CAPACITY + 4)
-        );
+        match &drained[0] {
+            PendingNotify::Notify { message } => assert_eq!(message, "msg5"),
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 
     #[test]
-    fn format_notify_includes_message_and_nonblocking_hint() {
-        let n = PendingNotify {
+    fn build_system_item_for_notify_carries_wrapper_body() {
+        let entry = PendingNotify::Notify {
             message: "hello".into(),
         };
         let catalog = PromptCatalog::builtins_only().unwrap();
-        let item = format_notify(&n, &catalog).unwrap();
-        let text = item.as_text().unwrap_or_default().to_string();
-        assert!(text.contains("[Notification]"));
-        assert!(text.contains("hello"));
-        assert!(text.contains("not a blocking request"));
+        let item = build_system_item(&entry, &catalog).unwrap();
+        match item {
+            SystemItem::Notification { message, body } => {
+                assert_eq!(message, "hello");
+                assert!(body.contains("[Notification]"));
+                assert!(body.contains("hello"));
+                assert!(body.contains("not a blocking request"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_system_item_for_pod_event_wraps_rendered_event_text() {
+        let entry = PendingNotify::PodEvent {
+            event: PodEvent::TurnEnded {
+                pod_name: "child".into(),
+            },
+        };
+        let catalog = PromptCatalog::builtins_only().unwrap();
+        let item = build_system_item(&entry, &catalog).unwrap();
+        match item {
+            SystemItem::PodEvent { event, body } => {
+                assert!(matches!(event, PodEvent::TurnEnded { ref pod_name } if pod_name == "child"));
+                assert!(body.contains("[Notification]"));
+                assert!(body.contains("`child`"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 }

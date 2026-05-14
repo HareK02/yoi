@@ -411,24 +411,17 @@ where
                 let Some(entry) = classify_history_item(item) else {
                     continue;
                 };
-                let mut head = ctx.session_head.lock().await;
-                match session_store::append_entry_with_hash(
-                    &ctx.store,
-                    head.session_id,
-                    &mut head.head_hash,
-                    entry.clone(),
-                )
-                .await
-                {
-                    Ok(_) => {
-                        // Publish under the same critical section view
-                        // a `subscribe_with_snapshot` would observe.
-                        ctx.sink.publish(entry);
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "drain: append_entry failed; entry dropped");
-                    }
+                commit_via_drain(&ctx, entry).await;
+            }
+            LogCommand::SystemItems(items) => {
+                if items.is_empty() {
+                    continue;
                 }
+                let entry = LogEntry::SystemItems {
+                    ts: session_log::now_millis(),
+                    items,
+                };
+                commit_via_drain(&ctx, entry).await;
             }
             LogCommand::Flush(ack) => {
                 let _ = ack.send(());
@@ -437,13 +430,50 @@ where
     }
 }
 
-/// Map a single worker-history `Item` to its corresponding `LogEntry`
-/// classification. `None` is the skip signal for `user_message` items —
-/// those are committed via `LogEntry::UserInput` by `Pod::run` at
-/// submit time and would otherwise produce a duplicate entry here.
+async fn commit_via_drain<St>(ctx: &LogDrainHandle<St>, entry: LogEntry)
+where
+    St: session_store::Store + Clone + Send + 'static,
+{
+    let mut head = ctx.session_head.lock().await;
+    match session_store::append_entry_with_hash(
+        &ctx.store,
+        head.session_id,
+        &mut head.head_hash,
+        entry.clone(),
+    )
+    .await
+    {
+        Ok(_) => {
+            // Publish under the same critical section view a
+            // `subscribe_with_snapshot` would observe.
+            ctx.sink.publish(entry);
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "drain: append_entry failed; entry dropped");
+        }
+    }
+}
+
+/// Map one LLM-driven worker-history append to its `LogEntry` form.
+///
+/// `None` is the skip signal for items that the drain must not commit:
+/// - `user_message` items are committed by `Pod::run` up-front as
+///   `LogEntry::UserInput { segments }`.
+/// - `system_message` items are committed by `PodInterceptor` as part
+///   of a `LogEntry::SystemItems` batch (with typed kind metadata)
+///   before they reach the worker's history.
 fn classify_history_item(item: Item) -> Option<LogEntry> {
     let ts = session_log::now_millis();
     if item.is_user_message() {
+        return None;
+    }
+    if matches!(
+        item,
+        Item::Message {
+            role: llm_worker::Role::System,
+            ..
+        }
+    ) {
         return None;
     }
     if item.is_tool_result() {
@@ -458,7 +488,9 @@ fn classify_history_item(item: Item) -> Option<LogEntry> {
             items: vec![session_store::LoggedItem::from(&item)],
         });
     }
-    Some(LogEntry::HookInjectedItems {
+    // Defensive: anything else (future Item kinds) routes through
+    // AssistantItems rather than getting silently dropped.
+    Some(LogEntry::AssistantItems {
         ts,
         items: vec![session_store::LoggedItem::from(&item)],
     })
@@ -696,9 +728,11 @@ async fn controller_loop<C, St>(
             }
 
             Method::Notify { message } => {
-                let _ = event_tx.send(Event::Notify {
-                    message: message.clone(),
-                });
+                // Client-side live echo is delivered as `Event::SystemItem`
+                // once the interceptor commits the corresponding
+                // `LogEntry::SystemItems` entry — drained out of the
+                // notify buffer + broadcast through the sink. No
+                // separate echo here.
                 pod.push_notify(message);
                 // RUNNING / Paused: the buffer push is the entire
                 // operation; an in-flight turn (or the next
@@ -751,10 +785,12 @@ async fn controller_loop<C, St>(
             Method::ListCompletions { .. } => {}
 
             Method::PodEvent(event) => {
-                // Echo the received event to all subscribers so every
-                // client sees the input that drove any following
-                // auto-kicked turn.
-                let _ = event_tx.send(Event::PodEvent(event.clone()));
+                // Live echo travels through the SystemItem lane: once
+                // the interceptor drains the notify buffer, the
+                // typed `SystemItem::PodEvent` lands as a
+                // `LogEntry::SystemItems` entry and the sink fans it
+                // out to clients as `Event::SystemItem`.
+                //
                 // (1) system side effects — idempotent and tolerant of
                 // out-of-order delivery (e.g. `TurnEnded` arriving
                 // after `ShutDown`).
@@ -765,11 +801,10 @@ async fn controller_loop<C, St>(
                     &self_parent_socket,
                 )
                 .await;
-                // (2) render a one-line summary and push it into the
-                // notification buffer; the next LLM request will
-                // inject it as a system message via
-                // `PodInterceptor::pre_llm_request`.
-                pod.push_notify(crate::ipc::event::render_event(&event));
+                // (2) queue the typed event in the notification buffer;
+                // the next LLM request will inject it as a typed
+                // `SystemItem::PodEvent` via the interceptor drain.
+                pod.push_pod_event_notify(event);
                 // Auto-kick a turn if the Pod is idle so the
                 // notification is not stranded. Matches the
                 // `Method::Notify` idle path.
@@ -902,23 +937,21 @@ where
                         });
                     }
                     Some(Method::Notify { message }) => {
-                        let _ = event_tx.send(Event::Notify {
-                            message: message.clone(),
-                        });
-                        // Route into the buffer; the in-flight turn will
-                        // drain it at its next pre_llm_request.
-                        notify_buffer.push(message);
+                        // Live echo arrives via `Event::SystemItem` once
+                        // the in-flight turn's next `pre_llm_request`
+                        // drains this entry through the interceptor.
+                        notify_buffer.push_notify(message);
                     }
                     Some(Method::ListCompletions { .. }) => {}
                     Some(Method::PodEvent(event)) => {
-                        let _ = event_tx.send(Event::PodEvent(event.clone()));
                         // mpsc is consume-once, so we cannot defer this
                         // to the next main-loop iteration — drop here
                         // would lose the event entirely (children fire
                         // and forget). Apply the side effects inline
-                        // and stage the rendered string on the
-                        // notification buffer so the in-flight turn's
-                        // next `pre_llm_request` surfaces it.
+                        // and stage the typed event on the notification
+                        // buffer so the in-flight turn's next
+                        // `pre_llm_request` surfaces it as a typed
+                        // `SystemItem::PodEvent`.
                         let self_parent_socket = parent_socket.cloned();
                         crate::ipc::event::apply_event_side_effects(
                             &event,
@@ -927,7 +960,7 @@ where
                             &self_parent_socket,
                         )
                         .await;
-                        notify_buffer.push(crate::ipc::event::render_event(&event));
+                        notify_buffer.push_pod_event(event);
                     }
                     None => {
                         let _ = cancel_tx.try_send(());

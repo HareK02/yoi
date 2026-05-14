@@ -22,11 +22,15 @@ use tracing::info;
 use tracing::warn;
 
 use crate::compact::state::CompactState;
+use session_store::SystemItem;
+use tokio::sync::mpsc;
+
 use crate::hook::{
     AbortInfo, HookPromptAction, HookRegistry, PreRequestInfo, PromptSubmitInfo, ToolCallSummary,
     ToolResultSummary, TurnEndInfo,
 };
-use crate::ipc::notify_buffer::{NotifyBuffer, format_notify};
+use crate::ipc::notify_buffer::{NotifyBuffer, build_system_item};
+use crate::pod::LogCommand;
 use crate::prompt::catalog::PromptCatalog;
 use llm_worker::token_counter::total_tokens;
 
@@ -45,13 +49,20 @@ pub(crate) struct PodInterceptor {
     /// request. The Worker `extend`s these into its persistent history
     /// so the LLM has a visible trigger for any reaction it commits.
     pending_notifies: NotifyBuffer,
-    /// Submit-scoped stash of resolver-produced system messages.
-    /// Drained inside `on_prompt_submit` and returned via
-    /// `PromptAction::ContinueWith`. Populated by `Pod::run` immediately
-    /// before handing off to the worker.
-    pending_attachments: Arc<Mutex<Vec<Item>>>,
+    /// Submit-scoped stash of resolver-produced typed system items.
+    /// Drained inside `on_prompt_submit`, committed as a
+    /// `LogEntry::SystemItems` through `log_cmd_tx`, and returned to
+    /// the worker as `Item::system_message` via
+    /// `PromptAction::ContinueWith`. Populated by `Pod::run`
+    /// immediately before handing off to the worker.
+    pending_attachments: Arc<Mutex<Vec<SystemItem>>>,
     /// Prompt catalog used to render the injected notification wrapper.
     prompts: Arc<PromptCatalog>,
+    /// Sender into the Pod's history-drain task. The interceptor uses
+    /// it to commit `LogCommand::SystemItems` batches before returning
+    /// the corresponding `Item::system_message`s up to the worker.
+    /// `None` in tests / `Pod::new` paths where no drain is wired.
+    log_cmd_tx: Option<mpsc::UnboundedSender<LogCommand>>,
     /// Next turn index assigned by `on_prompt_submit`.
     next_turn_index: AtomicUsize,
     /// Tool calls observed in the current turn (reset on each new prompt).
@@ -64,8 +75,9 @@ impl PodInterceptor {
         compact_state: Option<Arc<CompactState>>,
         usage_history: Option<Arc<Mutex<Vec<UsageRecord>>>>,
         pending_notifies: NotifyBuffer,
-        pending_attachments: Arc<Mutex<Vec<Item>>>,
+        pending_attachments: Arc<Mutex<Vec<SystemItem>>>,
         prompts: Arc<PromptCatalog>,
+        log_cmd_tx: Option<mpsc::UnboundedSender<LogCommand>>,
     ) -> Self {
         Self {
             registry,
@@ -74,8 +86,23 @@ impl PodInterceptor {
             pending_notifies,
             pending_attachments,
             prompts,
+            log_cmd_tx,
             next_turn_index: AtomicUsize::new(0),
             tool_calls_this_turn: AtomicUsize::new(0),
+        }
+    }
+
+    /// Send a `LogCommand::SystemItems` batch down the drain channel
+    /// (no-op if no drain is wired). The drain task commits the entry
+    /// before the corresponding `Item::system_message`s reach the
+    /// worker via `ContinueWith` / `pending_history_appends`, so the
+    /// drain barrier in `persist_turn` covers system commits too.
+    fn send_system_items(&self, items: Vec<SystemItem>) {
+        if items.is_empty() {
+            return;
+        }
+        if let Some(tx) = self.log_cmd_tx.as_ref() {
+            let _ = tx.send(LogCommand::SystemItems(items));
         }
     }
 
@@ -111,7 +138,7 @@ impl Interceptor for PodInterceptor {
                 return action.into();
             }
         }
-        let extras = std::mem::take(
+        let extras: Vec<SystemItem> = std::mem::take(
             &mut *self
                 .pending_attachments
                 .lock()
@@ -120,7 +147,14 @@ impl Interceptor for PodInterceptor {
         if extras.is_empty() {
             PromptAction::Continue
         } else {
-            PromptAction::ContinueWith(extras)
+            // Commit the typed system items first, then hand the
+            // matching `Item::system_message`s to the worker. The
+            // drain task processes the `SystemItems` command BEFORE
+            // any subsequent `Item` commands from `on_history_append`,
+            // so on-disk order matches worker-history order.
+            let items: Vec<Item> = extras.iter().map(SystemItem::to_history_item).collect();
+            self.send_system_items(extras);
+            PromptAction::ContinueWith(items)
         }
     }
 
@@ -129,19 +163,31 @@ impl Interceptor for PodInterceptor {
         if drained.is_empty() {
             return Vec::new();
         }
-        let mut items = Vec::with_capacity(drained.len());
-        for n in drained {
-            match format_notify(&n, &self.prompts) {
-                Ok(item) => items.push(item),
+        let mut system_items: Vec<SystemItem> = Vec::with_capacity(drained.len());
+        let mut items: Vec<Item> = Vec::with_capacity(drained.len());
+        for entry in drained {
+            match build_system_item(&entry, &self.prompts) {
+                Ok(system_item) => {
+                    items.push(system_item.to_history_item());
+                    system_items.push(system_item);
+                }
                 Err(e) => {
                     // A render failure here would starve the LLM of
-                    // the notify text. Fall back to the raw message
-                    // so the trigger still lands in history.
+                    // the notify text. Fall back to a raw item so the
+                    // trigger still lands in history; the entry will
+                    // simply be skipped from the SystemItems batch.
                     warn!(error = %e, "failed to render notify_wrapper; using raw message");
-                    items.push(Item::system_message(n.message.clone()));
+                    let fallback = match &entry {
+                        super::notify_buffer::PendingNotify::Notify { message } => message.clone(),
+                        super::notify_buffer::PendingNotify::PodEvent { event } => {
+                            session_store::render_pod_event(event)
+                        }
+                    };
+                    items.push(Item::system_message(fallback));
                 }
             }
         }
+        self.send_system_items(system_items);
         items
     }
 
@@ -321,6 +367,7 @@ mod tests {
             NotifyBuffer::new(),
             Arc::new(Mutex::new(Vec::new())),
             PromptCatalog::builtins_only().unwrap(),
+            None,
         );
         let mut ctx = ctx_items;
         let action = interceptor.pre_llm_request(&mut ctx).await;
@@ -346,6 +393,7 @@ mod tests {
             NotifyBuffer::new(),
             Arc::new(Mutex::new(Vec::new())),
             PromptCatalog::builtins_only().unwrap(),
+            None,
         );
         let mut ctx = ctx_items;
         let action = interceptor.pre_llm_request(&mut ctx).await;
@@ -372,6 +420,7 @@ mod tests {
             NotifyBuffer::new(),
             Arc::new(Mutex::new(Vec::new())),
             PromptCatalog::builtins_only().unwrap(),
+            None,
         );
         let mut ctx = ctx_items;
         let action = interceptor.pre_llm_request(&mut ctx).await;
@@ -392,6 +441,7 @@ mod tests {
             NotifyBuffer::new(),
             Arc::new(Mutex::new(Vec::new())),
             PromptCatalog::builtins_only().unwrap(),
+            None,
         );
         let mut ctx: Vec<Item> = Vec::new();
         let action = interceptor.pre_llm_request(&mut ctx).await;
@@ -414,8 +464,8 @@ mod tests {
     async fn pending_history_appends_drains_buffer_into_items() {
         let registry = Arc::new(HookRegistryBuilder::new().build());
         let buffer = NotifyBuffer::new();
-        buffer.push("first".into());
-        buffer.push("second".into());
+        buffer.push_notify("first".into());
+        buffer.push_notify("second".into());
 
         let interceptor = PodInterceptor::new(
             registry,
@@ -424,6 +474,7 @@ mod tests {
             buffer.clone(),
             Arc::new(Mutex::new(Vec::new())),
             PromptCatalog::builtins_only().unwrap(),
+            None,
         );
 
         let items = interceptor.pending_history_appends().await;
@@ -451,7 +502,7 @@ mod tests {
         // anything itself.
         let registry = Arc::new(HookRegistryBuilder::new().build());
         let buffer = NotifyBuffer::new();
-        buffer.push("msg".into());
+        buffer.push_notify("msg".into());
 
         let interceptor = PodInterceptor::new(
             registry,
@@ -460,6 +511,7 @@ mod tests {
             buffer.clone(),
             Arc::new(Mutex::new(Vec::new())),
             PromptCatalog::builtins_only().unwrap(),
+            None,
         );
         let mut ctx: Vec<Item> = vec![Item::user_message("hi")];
         let action = interceptor.pre_llm_request(&mut ctx).await;
@@ -489,6 +541,7 @@ mod tests {
             NotifyBuffer::new(),
             Arc::new(Mutex::new(Vec::new())),
             PromptCatalog::builtins_only().unwrap(),
+            None,
         );
         let mut ctx: Vec<Item> = Vec::new();
         let action = interceptor.pre_llm_request(&mut ctx).await;

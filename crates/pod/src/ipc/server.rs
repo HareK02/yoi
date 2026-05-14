@@ -104,22 +104,39 @@ async fn handle_connection(stream: tokio::net::UnixStream, handle: PodHandle) {
             entry = entry_rx.recv() => {
                 match entry {
                     Ok(entry) => {
-                        let value = serde_json::to_value(&entry)
-                            .expect("LogEntry is Serialize");
-                        let outbound = match &entry {
+                        let outbound = match entry {
                             session_store::LogEntry::SessionStart { .. } => {
-                                Some(Event::SessionRotated { entry: value })
+                                let value = serde_json::to_value(&entry)
+                                    .expect("LogEntry is Serialize");
+                                vec![Event::SessionRotated { entry: value }]
                             }
-                            session_store::LogEntry::HookInjectedItems { .. } => {
-                                Some(Event::HookInjectedItems { entry: value })
+                            session_store::LogEntry::SystemItems { items, .. } => {
+                                // Fan out per-item so each `SystemItem`
+                                // arrives as its own `Event::SystemItem`
+                                // on the wire. Batching on disk is an
+                                // implementation detail of the drain
+                                // task; clients see them one at a time.
+                                items
+                                    .into_iter()
+                                    .map(|si| {
+                                        let value = serde_json::to_value(&si)
+                                            .expect("SystemItem is Serialize");
+                                        Event::SystemItem { item: value }
+                                    })
+                                    .collect()
                             }
                             // Defensive: should never reach here per
                             // `SessionLogSink::is_live_relevant`.
-                            _ => None,
+                            _ => Vec::new(),
                         };
-                        if let Some(event) = outbound
-                            && writer.write(&event).await.is_err()
-                        {
+                        let mut hit_error = false;
+                        for event in outbound {
+                            if writer.write(&event).await.is_err() {
+                                hit_error = true;
+                                break;
+                            }
+                        }
+                        if hit_error {
                             break;
                         }
                     }

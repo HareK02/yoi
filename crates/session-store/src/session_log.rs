@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::logged_item::LoggedItem;
+use crate::system_item::SystemItem;
 
 /// SHA-256 hash identifying a specific log entry in the chain.
 ///
@@ -125,7 +126,18 @@ pub enum LogEntry {
     /// Tool execution results added to history (worker.rs:897-900, 1072-1076).
     ToolResults { ts: u64, items: Vec<LoggedItem> },
 
-    /// Items injected by `on_turn_end` hook via `ContinueWithMessages` (worker.rs:1055).
+    /// Typed agent-injected system items: notifications, child-Pod
+    /// lifecycle events, `@<path>` / `#<slug>` / `/<slug>` resolution
+    /// payloads. Each `SystemItem` carries kind metadata that the LLM
+    /// itself never sees (the LLM gets `Item::system_message` with the
+    /// item's `history_text()`), but live clients and replay paths
+    /// dispatch on `kind` for typed rendering.
+    SystemItems { ts: u64, items: Vec<SystemItem> },
+
+    /// Legacy pre-`SystemItems` form. Deserialize-only — new writes
+    /// always use `SystemItems`. Items are flattened to
+    /// `Item::system_message` on replay, matching how the original
+    /// path worked.
     HookInjectedItems { ts: u64, items: Vec<LoggedItem> },
 
     /// Turn boundary. Records the turn count after increment.
@@ -275,6 +287,11 @@ pub fn collect_state(entries: &[HashedEntry]) -> RestoredState {
             }
             LogEntry::ToolResults { items, .. } => {
                 state.history.extend(items.iter().cloned().map(Item::from));
+            }
+            LogEntry::SystemItems { items, .. } => {
+                state
+                    .history
+                    .extend(items.iter().map(|si| si.to_history_item()));
             }
             LogEntry::HookInjectedItems { items, .. } => {
                 state.history.extend(items.iter().cloned().map(Item::from));

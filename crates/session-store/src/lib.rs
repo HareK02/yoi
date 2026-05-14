@@ -32,6 +32,7 @@ pub mod logged_item;
 pub mod session;
 pub mod session_log;
 pub mod store;
+pub mod system_item;
 
 pub use event_trace::TraceEntry;
 pub use fs_store::FsStore;
@@ -48,6 +49,7 @@ pub use session_log::{
     EntryHash, HashedEntry, LogEntry, POD_SCOPE_EXTENSION_DOMAIN, PodScopeSnapshot, RestoredState,
     SessionOrigin, build_chain, collect_state, compute_hash,
 };
+pub use system_item::{SystemItem, render_pod_event};
 pub use store::{Store, StoreError};
 
 /// Session identifier. UUID v7 (time-ordered, lexicographically sortable).
