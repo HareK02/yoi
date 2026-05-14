@@ -28,6 +28,14 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         &mut self,
         input: Vec<Segment>,
     ) -> Result<PodRunResult, PodError> {
+        // Validate before any side effects so a bad workflow slug does
+        // not leave half-applied interrupt prep (orphan closure +
+        // system note) in worker history. `Pod::run` validates again at
+        // its own entry; the duplicate call is cheap (read-only) and
+        // collapses naturally once `interrupt_and_run` folds into
+        // `Pod::run` (see ticket pod-interrupt-prep-internalize).
+        self.validate_workflow_invocations(&input)?;
+
         let tool_result_summary = self
             .prompts()
             .interrupt_tool_result_summary()

@@ -1136,6 +1136,12 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     /// the Worker is aborted, history is compacted, and execution resumes
     /// automatically.
     pub async fn run(&mut self, input: Vec<Segment>) -> Result<PodRunResult, PodError> {
+        // Validate workflow invocations up front so an invalid slug
+        // never commits a UserInput entry, never triggers pre-run
+        // compaction, and never half-applies interrupt prep when run
+        // from `interrupt_and_run`. Read-only against `workflow_registry`.
+        self.validate_workflow_invocations(&input)?;
+
         self.prepare_for_run().await?;
 
         // Persist the user input as typed segments before the worker
@@ -1394,9 +1400,10 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     }
 
     /// Validate explicit workflow invocations without reading dependency
-    /// bodies. Used by the controller before broadcasting `UserMessage` so
-    /// user-invocation errors are returned immediately and never reach the
-    /// Worker or client history.
+    /// bodies. Called from `Pod::run` / `Pod::interrupt_and_run` entry so
+    /// an invalid slug aborts the turn before any session-log commit or
+    /// interrupt-prep side effects; `pub` so completion / preview paths
+    /// can also dry-check inputs.
     pub fn validate_workflow_invocations(
         &self,
         segments: &[Segment],

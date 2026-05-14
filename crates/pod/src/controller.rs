@@ -610,19 +610,15 @@ async fn controller_loop<C, St>(
                     });
                     continue;
                 }
-                if let Err(e) = pod.validate_workflow_invocations(&input) {
-                    let _ = event_tx.send(Event::Error {
-                        code: ErrorCode::InvalidRequest,
-                        message: e.to_string(),
-                    });
-                    continue;
-                }
-                // Broadcast the accepted user message so every
-                // subscriber (including the submitter) can render the
-                // turn header + user line from a single source of
-                // truth. shared_state's `user_segments` is re-synced
-                // from `pod` after the run completes, so we don't push
-                // here.
+                // Broadcast the user message so every subscriber
+                // (including the submitter) can render the turn header
+                // + user line from a single source of truth.
+                // shared_state's `user_segments` is re-synced from
+                // `pod` after the run completes, so we don't push
+                // here. Workflow-invocation validation happens inside
+                // `Pod::run` / `Pod::interrupt_and_run`; on failure the
+                // turn errors out via `Event::Error { InvalidRequest }`
+                // before any UserInput is committed.
                 let _ = event_tx.send(Event::UserMessage {
                     segments: input.clone(),
                 });
@@ -945,6 +941,7 @@ fn worker_error_code(e: &PodError) -> ErrorCode {
             _ => ErrorCode::Internal,
         },
         PodError::Provider(_) => ErrorCode::ProviderError,
+        PodError::WorkflowResolve(_) => ErrorCode::InvalidRequest,
         _ => ErrorCode::Internal,
     }
 }

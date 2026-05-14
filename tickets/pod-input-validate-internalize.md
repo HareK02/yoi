@@ -48,3 +48,8 @@ attachments.extend(self.resolve_workflow_invocations(&input)?);
 - `resolve_workflow_invocations` 側のロジック変更。
 - `validate_workflow_invocations` の判定基準変更（user_invocable / slug parse 等）。
 - `Method::Run` 以外の経路（Resume / RunForNotification）からの入力検証。Resume は入力を取らず、RunForNotification の入力は notify buffer drain で system message として入るため workflow invocation の経路に乗らない。
+
+## Review
+- 状態: Approve with follow-up
+- レビュー詳細: [./pod-input-validate-internalize.review.md](./pod-input-validate-internalize.review.md)
+- 日付: 2026-05-15
