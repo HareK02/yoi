@@ -48,3 +48,8 @@ pending = Some(if status_before == PodStatus::Paused {
 - `[[pod-parent-turn-callback]]` の `is_parent_originated` 判定ロジック自体の変更（本チケット完了後は `Run` / `Resume` の 2 variant が true になる形に自然に整理されるが、本チケットの目的ではない）。
 - `worker.last_run_interrupted` のセマンティクス変更。
 - TUI 側で Paused 中の送信を `Run` / `Resume` どちらにマップするかの UX 議論。
+
+## Review
+- 状態: Approve with follow-up
+- レビュー詳細: [./pod-interrupt-prep-internalize.review.md](./pod-interrupt-prep-internalize.review.md)
+- 日付: 2026-05-15
