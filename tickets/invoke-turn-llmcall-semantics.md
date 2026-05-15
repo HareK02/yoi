@@ -153,3 +153,9 @@ AgentTurn 内に LlmCall を 1:N で持たせる際、retry の境界線を以�
 - `crates/llm-worker/`
 - `crates/protocol/`
 - `crates/tui/`
+
+## Review
+
+- 状態: Approve (`UserMessage` doc 順序、Resume 経路 Invoke 不要の注記、Invoke 統合テストは non-blocking follow-up)
+- レビュー詳細: [./invoke-turn-llmcall-semantics.review.md](./invoke-turn-llmcall-semantics.review.md)
+- 日付: 2026-05-15
