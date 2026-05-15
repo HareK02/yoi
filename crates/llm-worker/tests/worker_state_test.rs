@@ -352,14 +352,18 @@ async fn test_turn_count_increment() -> Result<(), WorkerError> {
     let worker = Worker::new(client);
 
     assert_eq!(worker.turn_count(), 0);
+    assert_eq!(worker.llm_call_count(), 0);
 
     // First run consumes Mutable, returns RunOutput
     let mut worker = worker.run("First").await?.worker;
     assert_eq!(worker.turn_count(), 1);
+    // Retry not yet implemented → AgentTurn:LlmCall is 1:1.
+    assert_eq!(worker.llm_call_count(), 1);
 
     // Subsequent runs on Locked take &mut self
     worker.run("Second").await?;
     assert_eq!(worker.turn_count(), 2);
+    assert_eq!(worker.llm_call_count(), 2);
 
     Ok(())
 }

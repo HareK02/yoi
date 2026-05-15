@@ -115,6 +115,9 @@ async fn handle_connection(stream: tokio::net::UnixStream, handle: PodHandle) {
                                     .expect("SystemItem is Serialize");
                                 Some(Event::SystemItem { item: value })
                             }
+                            session_store::LogEntry::Invoke { trigger, .. } => {
+                                Some(Event::InvokeStart { kind: trigger })
+                            }
                             other => {
                                 // `SessionLogSink::is_live_relevant` keeps
                                 // non-live-relevant variants off the

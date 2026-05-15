@@ -1158,10 +1158,17 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
 
         self.prepare_for_run().await?;
 
+        // IDLE → active marker. Commits first so the next UserInput entry
+        // is contained inside this Invoke range. See `tickets/invoke-turn-llmcall-semantics.md`.
+        self.session_id = self.session_head.lock().session_id;
+        self.commit_entry(LogEntry::Invoke {
+            ts: session_log::now_millis(),
+            trigger: protocol::InvokeKind::UserSend,
+        })?;
+
         // Persist the user input as typed segments before the worker
         // pushes its flattened copy into history. save_delta deliberately
         // skips the resulting `is_user_message()` item to avoid double-write.
-        self.session_id = self.session_head.lock().session_id;
         self.commit_entry(LogEntry::UserInput {
             ts: session_log::now_millis(),
             segments: input.clone(),
@@ -1525,8 +1532,30 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     /// `Item::system_message` into the per-request context, then the
     /// Worker's resume path issues the LLM request without a new
     /// user turn.
-    pub async fn run_for_notification(&mut self) -> Result<PodRunResult, PodError> {
+    pub async fn run_for_notification(
+        &mut self,
+        kind: protocol::InvokeKind,
+    ) -> Result<PodRunResult, PodError> {
+        debug_assert!(
+            matches!(
+                kind,
+                protocol::InvokeKind::Notify
+                    | protocol::InvokeKind::PodEvent
+                    | protocol::InvokeKind::SystemReminder
+                    | protocol::InvokeKind::Wakeup
+            ),
+            "run_for_notification expects a non-UserSend InvokeKind; got {kind:?}"
+        );
         self.prepare_for_run().await?;
+
+        // IDLE → active marker for the buffered notification / pod-event
+        // drain. The trailing SystemItem entries (drained by the
+        // PodInterceptor) carry the actual payload.
+        self.session_id = self.session_head.lock().session_id;
+        self.commit_entry(LogEntry::Invoke {
+            ts: session_log::now_millis(),
+            trigger: kind,
+        })?;
 
         let history_before = self.worker.as_ref().unwrap().history().len();
 

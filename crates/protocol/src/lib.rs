@@ -209,7 +209,8 @@ pub enum Event {
     /// submitting clients would see tool calls and assistant text
     /// appear without any preceding user message.
     ///
-    /// Fires exactly once per accepted `Method::Run`, before
+    /// Fires exactly once per accepted `Method::Run`, after
+    /// `InvokeStart { kind: UserSend }` and before the first
     /// `TurnStart`. Rejected runs (e.g. `AlreadyRunning`) do not emit.
     UserMessage {
         segments: Vec<Segment>,
@@ -231,12 +232,56 @@ pub enum Event {
     SystemItem {
         item: serde_json::Value,
     },
+    /// A new self-driving cycle has begun (IDLE → active transition).
+    ///
+    /// Marker event for the start of an Invoke range; the range extends
+    /// implicitly until the next `InvokeStart`. Fires for every accepted
+    /// `Method::Run` (kind=`UserSend`), `Method::Notify` (kind=`Notify`),
+    /// `Method::PodEvent` re-injection (kind=`PodEvent`), and any other
+    /// IDLE-breaking trigger. Mid-run interrupts (e.g. hook output,
+    /// `<system-reminder>` injection that doesn't break IDLE) do not
+    /// emit `InvokeStart` — they appear as `SystemItem` only.
+    ///
+    /// Carries `kind` only; the payload (user text / notify message /
+    /// pod event body) is delivered separately via the immediately
+    /// following `UserMessage` / `SystemItem` event.
+    InvokeStart {
+        kind: InvokeKind,
+    },
+    /// One AgentTurn boundary opened. An AgentTurn is a maximal run of
+    /// LLM generation calls whose input messages are identical (i.e.
+    /// retries from network errors / 5xx / stream disconnects collapse
+    /// into the same AgentTurn). When the input changes (a new tool
+    /// result lands, a user interrupts, etc.), the next LLM call belongs
+    /// to a new AgentTurn.
+    ///
+    /// `turn` is the AgentTurn index from `Worker::turn_count`.
+    ///
+    /// Currently retry is not yet implemented (`llm-worker-stream-continuation`)
+    /// so AgentTurn and `LlmCall` fire 1:1, but the contract here is
+    /// the AgentTurn boundary; consumers that want per-LLM-call signals
+    /// must subscribe to `LlmCallStart` / `LlmCallEnd` instead.
     TurnStart {
         turn: usize,
     },
+    /// AgentTurn closed.
     TurnEnd {
         turn: usize,
         result: TurnResult,
+    },
+    /// One LLM generation call started (1 request → 1 generation, retry
+    /// included). Multiple `LlmCall*` pairs may fire inside a single
+    /// `TurnStart` / `TurnEnd` pair when a request is retried; today
+    /// they fire 1:1 because retry is not implemented.
+    ///
+    /// `llm_call` is the worker-wide running counter from
+    /// `Worker::llm_call_count`.
+    LlmCallStart {
+        llm_call: usize,
+    },
+    /// LLM generation call ended.
+    LlmCallEnd {
+        llm_call: usize,
     },
     TextDelta {
         text: String,
@@ -466,6 +511,31 @@ pub enum TurnResult {
     Paused,
 }
 
+/// Kind of trigger that opened a new Invoke (IDLE → active) range.
+///
+/// One Invoke groups all entries from this trigger up to the next
+/// `Invoke` marker. The kind is the only payload — content (user text,
+/// notify message, pod event body) is delivered by the immediately
+/// following Turn entry, not by the marker itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InvokeKind {
+    /// `Method::Run` — a user submission.
+    UserSend,
+    /// `Method::Notify` — free-text notification injected into history.
+    Notify,
+    /// `Method::PodEvent` — typed lifecycle report from a child Pod.
+    PodEvent,
+    /// `<system-reminder>` etc. that crosses an IDLE boundary (mid-run
+    /// reminders that don't break IDLE are SystemItem-only and do not
+    /// open a new Invoke).
+    SystemReminder,
+    /// Cron / RemoteTrigger style scheduled wake-up. Reserved; no
+    /// producer is wired today but the variant is part of the initial
+    /// set so future schedulers don't have to amend the wire enum.
+    Wakeup,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunResult {
@@ -676,6 +746,59 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["event"], "run_end");
         assert_eq!(parsed["data"]["result"], "limit_reached");
+    }
+
+    #[test]
+    fn event_invoke_start_roundtrip() {
+        for kind in [
+            InvokeKind::UserSend,
+            InvokeKind::Notify,
+            InvokeKind::PodEvent,
+            InvokeKind::SystemReminder,
+            InvokeKind::Wakeup,
+        ] {
+            let event = Event::InvokeStart { kind };
+            let json = serde_json::to_string(&event).unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed["event"], "invoke_start");
+            let decoded: Event = serde_json::from_str(&json).unwrap();
+            match decoded {
+                Event::InvokeStart { kind: k } => assert_eq!(k, kind),
+                other => panic!("expected InvokeStart, got {other:?}"),
+            }
+        }
+        let parsed: serde_json::Value = serde_json::from_str(
+            &serde_json::to_string(&Event::InvokeStart {
+                kind: InvokeKind::UserSend,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(parsed["data"]["kind"], "user_send");
+    }
+
+    #[test]
+    fn event_llm_call_start_end_roundtrip() {
+        for event in [
+            Event::LlmCallStart { llm_call: 0 },
+            Event::LlmCallEnd { llm_call: 7 },
+        ] {
+            let json = serde_json::to_string(&event).unwrap();
+            let decoded: Event = serde_json::from_str(&json).unwrap();
+            match (&event, &decoded) {
+                (Event::LlmCallStart { llm_call: a }, Event::LlmCallStart { llm_call: b })
+                | (Event::LlmCallEnd { llm_call: a }, Event::LlmCallEnd { llm_call: b }) => {
+                    assert_eq!(a, b);
+                }
+                _ => panic!("variant mismatch: {event:?} vs {decoded:?}"),
+            }
+        }
+        let parsed: serde_json::Value = serde_json::from_str(
+            &serde_json::to_string(&Event::LlmCallStart { llm_call: 3 }).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(parsed["event"], "llm_call_start");
+        assert_eq!(parsed["data"]["llm_call"], 3);
     }
 
     #[test]
