@@ -33,3 +33,9 @@
 - `tickets/session-grouping-introduce.md` (後続)
 - `crates/session-store/`
 - `crates/pod/src/pod.rs`
+
+## Review
+
+- 状態: Approve with follow-up
+- レビュー詳細: [./segment-rename.review.md](./segment-rename.review.md)
+- 日付: 2026-05-20

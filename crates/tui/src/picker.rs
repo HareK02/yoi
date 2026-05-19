@@ -72,7 +72,7 @@ struct Row {
     preview: String,
     /// `Some(pod_name)` when a live Pod currently holds an allocation
     /// for this session in `pods.json`. Picking such a row launches
-    /// `pod --session <UUID>` which will fail with `SessionConflict` —
+    /// `pod --session <UUID>` which will fail with `SegmentConflict` —
     /// the badge warns the user up-front.
     live_pod: Option<String>,
 }
@@ -300,7 +300,7 @@ fn row_line(row: &Row, selected: bool) -> Line<'_> {
     };
     let mut spans = vec![
         Span::raw(marker),
-        Span::styled(short_session(row.id), id_style),
+        Span::styled(short_segment(row.id), id_style),
         Span::raw("  "),
     ];
     if let Some(ref pod_name) = row.live_pod {
@@ -313,7 +313,7 @@ fn row_line(row: &Row, selected: bool) -> Line<'_> {
     Line::from(spans)
 }
 
-fn short_session(id: SegmentId) -> String {
+fn short_segment(id: SegmentId) -> String {
     let s = id.to_string();
     s.chars().take(8).collect()
 }

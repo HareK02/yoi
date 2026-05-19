@@ -131,7 +131,7 @@ pub fn update_segment(pod_name: &str, new_segment_id: SegmentId) -> Result<(), S
     let mut guard = LockFileGuard::open(&lock_path)?;
     if let Some(other) = guard.data().find_by_segment(new_segment_id) {
         if other.pod_name != pod_name {
-            return Err(ScopeLockError::SessionConflict {
+            return Err(ScopeLockError::SegmentConflict {
                 segment_id: new_segment_id,
                 pod_name: other.pod_name.clone(),
                 socket: other.socket.clone(),
@@ -320,7 +320,7 @@ mod tests {
         // `a` cannot adopt b's live session id.
         let err = update_segment("a", s_b).unwrap_err();
         match err {
-            ScopeLockError::SessionConflict {
+            ScopeLockError::SegmentConflict {
                 pod_name,
                 segment_id,
                 ..
@@ -328,7 +328,7 @@ mod tests {
                 assert_eq!(pod_name, "b");
                 assert_eq!(segment_id, s_b);
             }
-            other => panic!("expected SessionConflict, got {other:?}"),
+            other => panic!("expected SegmentConflict, got {other:?}"),
         }
     }
 }

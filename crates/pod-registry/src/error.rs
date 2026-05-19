@@ -30,7 +30,7 @@ pub enum ScopeLockError {
         "session {segment_id} is already held by pod `{pod_name}` at {}",
         .socket.display()
     )]
-    SessionConflict {
+    SegmentConflict {
         segment_id: SegmentId,
         pod_name: String,
         socket: PathBuf,

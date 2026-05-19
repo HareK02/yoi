@@ -76,7 +76,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 6. Session ID for potential restore
-    println!("\nSession ID: {}", pod.segment_id());
+    println!("\nSegment ID: {}", pod.segment_id());
 
     Ok(())
 }

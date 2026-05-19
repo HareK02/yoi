@@ -80,7 +80,7 @@ impl Store for FsStore {
     }
 
     fn list_segments(&self) -> Result<Vec<SegmentId>, StoreError> {
-        let mut sessions = Vec::new();
+        let mut segments = Vec::new();
         for entry in fs::read_dir(&self.root)? {
             let entry = entry?;
             let path = entry.path();
@@ -89,13 +89,13 @@ impl Store for FsStore {
             if name.ends_with(".jsonl") && !name.ends_with(".trace.jsonl") {
                 let stem = name.trim_end_matches(".jsonl");
                 if let Ok(id) = stem.parse::<SegmentId>() {
-                    sessions.push(id);
+                    segments.push(id);
                 }
             }
         }
         // UUID v7: lexicographic sort = chronological sort, newest first
-        sessions.sort_by(|a, b| b.cmp(a));
-        Ok(sessions)
+        segments.sort_by(|a, b| b.cmp(a));
+        Ok(segments)
     }
 
     fn create_segment(&self, id: SegmentId, entries: &[LogEntry]) -> Result<(), StoreError> {

@@ -185,8 +185,8 @@ async fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         }
-    } else if let Some(source_session_id) = cli.session {
-        match Pod::restore_from_manifest(source_session_id, manifest, store, loader).await {
+    } else if let Some(source_segment_id) = cli.session {
+        match Pod::restore_from_manifest(source_segment_id, manifest, store, loader).await {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("error: failed to restore pod: {e}");

@@ -60,7 +60,7 @@ pub fn create_segment_with_id(
 pub fn create_compacted_segment(
     store: &impl Store,
     state: SegmentStartState<'_>,
-    source_session_id: SegmentId,
+    source_segment_id: SegmentId,
     source_turn_count: usize,
 ) -> Result<SegmentId, StoreError> {
     let segment_id = crate::new_segment_id();
@@ -71,7 +71,7 @@ pub fn create_compacted_segment(
         history: to_logged(state.history),
         forked_from: None,
         compacted_from: Some(SegmentOrigin {
-            segment_id: source_session_id,
+            segment_id: source_segment_id,
             at_turn_index: source_turn_count,
         }),
     };

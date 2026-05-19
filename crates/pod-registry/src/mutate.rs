@@ -63,7 +63,7 @@ pub fn register_pod_with_deny(
         return Err(ScopeLockError::DuplicatePodName(pod_name));
     }
     if let Some(existing) = guard.data().find_by_segment(segment_id) {
-        return Err(ScopeLockError::SessionConflict {
+        return Err(ScopeLockError::SegmentConflict {
             segment_id,
             pod_name: existing.pod_name.clone(),
             socket: existing.socket.clone(),
@@ -588,7 +588,7 @@ mod tests {
         )
         .unwrap();
         // Second registration tries to grab the same segment_id under
-        // a different pod_name. Without the SessionConflict check both
+        // a different pod_name. Without the SegmentConflict check both
         // would succeed and race on the same jsonl.
         let err = register_pod(
             &mut g,
@@ -600,7 +600,7 @@ mod tests {
         )
         .unwrap_err();
         match err {
-            ScopeLockError::SessionConflict {
+            ScopeLockError::SegmentConflict {
                 segment_id,
                 pod_name,
                 ..
@@ -608,7 +608,7 @@ mod tests {
                 assert_eq!(segment_id, shared_session);
                 assert_eq!(pod_name, "first");
             }
-            other => panic!("expected SessionConflict, got {other:?}"),
+            other => panic!("expected SegmentConflict, got {other:?}"),
         }
     }
 }

@@ -64,7 +64,7 @@ async fn restore_from_manifest_rejects_empty_session_log() {
 
     // Pre-create an empty `<id>.jsonl` so `read_all` succeeds with no
     // entries. `collect_state` returns `entries_count = 0`, which
-    // `restore_from_manifest` rejects with `SessionEmpty` *before* it
+    // `restore_from_manifest` rejects with `SegmentEmpty` *before* it
     // gets as far as building the LLM client — so the test does not
     // need credentials or a runtime sandbox.
     let id: SegmentId = session_store::new_segment_id();
@@ -75,8 +75,8 @@ async fn restore_from_manifest_rejects_empty_session_log() {
         Pod::restore_from_manifest(id, manifest, store, pod::PromptLoader::builtins_only()).await;
 
     match result {
-        Err(PodError::SessionEmpty { segment_id }) => assert_eq!(segment_id, id),
-        Err(other) => panic!("expected SessionEmpty, got {other:?}"),
+        Err(PodError::SegmentEmpty { segment_id }) => assert_eq!(segment_id, id),
+        Err(other) => panic!("expected SegmentEmpty, got {other:?}"),
         Ok(_) => panic!("expected empty session log to fail"),
     }
 }
@@ -101,8 +101,8 @@ async fn restore_from_manifest_rejects_session_without_scope_snapshot() {
         Pod::restore_from_manifest(id, manifest, store, pod::PromptLoader::builtins_only()).await;
 
     match result {
-        Err(PodError::SessionScopeMissing { segment_id }) => assert_eq!(segment_id, id),
-        Err(other) => panic!("expected SessionScopeMissing, got {other:?}"),
+        Err(PodError::SegmentScopeMissing { segment_id }) => assert_eq!(segment_id, id),
+        Err(other) => panic!("expected SegmentScopeMissing, got {other:?}"),
         Ok(_) => panic!("expected missing scope snapshot to fail"),
     }
 }

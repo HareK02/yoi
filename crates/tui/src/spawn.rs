@@ -445,7 +445,7 @@ fn draw_form(f: &mut Frame<'_>, form: &Form) {
     .split(area);
 
     let title_text = match form.resume_from {
-        Some(id) => format!("resume pod   session: {}", short_session(id)),
+        Some(id) => format!("resume pod   session: {}", short_segment(id)),
         None => "spawn pod".to_string(),
     };
     let title = Paragraph::new(Line::from(vec![Span::styled(
@@ -473,7 +473,7 @@ fn draw_form(f: &mut Frame<'_>, form: &Form) {
 
 /// First 8 hex digits of a UUID — short enough to skim, long enough
 /// to disambiguate inside a 10-row picker.
-pub(crate) fn short_session(id: SegmentId) -> String {
+pub(crate) fn short_segment(id: SegmentId) -> String {
     let s = id.to_string();
     s.chars().take(8).collect()
 }
