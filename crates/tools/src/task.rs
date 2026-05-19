@@ -1,4 +1,4 @@
-//! Session-scoped TaskStore and builtin task tools.
+//! Pod-lifetime TaskStore and builtin task tools.
 //!
 //! The store is Pod/session-lifetime state shared by the four Task* tools. It
 //! is reconstructed on resume by replaying TaskCreate / TaskUpdate tool-call

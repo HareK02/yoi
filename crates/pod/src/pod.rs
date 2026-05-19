@@ -193,12 +193,12 @@ pub struct Pod<C: LlmClient, St: Store> {
     /// Worker (e.g. the savings estimator used by the prune projection)
     /// can share the same view via [`Pod::usage_history_handle`].
     usage_history: Arc<Mutex<Vec<UsageRecord>>>,
-    /// Session-lifetime file-operation tracker from the builtin `tools`
+    /// Pod-lifetime file-operation tracker from the builtin `tools`
     /// crate. Populated by the Controller when it registers the builtin
     /// tools so that Pod-owned operations (e.g. compaction) can consult
     /// the recency of touched files.
     tracker: Option<tools::Tracker>,
-    /// Session-lifetime task store from the builtin `tools` crate. Shared by
+    /// Pod-lifetime task store from the builtin `tools` crate. Shared by
     /// TaskCreate / TaskUpdate / TaskList / TaskGet and preserved across
     /// compaction by keeping the same handle while the Worker history is
     /// replaced. Restored Pods reconstruct it by replaying Task* tool calls.

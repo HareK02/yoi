@@ -54,7 +54,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut pod = Pod::from_manifest_toml(&toml, store).await?;
     let manifest: &PodManifest = pod.manifest();
     println!("Pod: {}", manifest.pod.name);
-    println!("Session: {}", pod.segment_id());
+    println!("Segment: {}", pod.segment_id());
 
     // 4. Run a prompt
     let result = pod.run_text("What is the capital of France?").await?;
