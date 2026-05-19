@@ -30,7 +30,7 @@ memory = { workspace = true }
 workflow-crate = { package = "workflow", path = "../workflow" }
 uuid = { workspace = true, features = ["v7"] }
 session-metrics = { workspace = true }
-parking_lot = "0.12.5"
+arc-swap = "1.9.1"
 
 [dev-dependencies]
 dotenv = "0.15.0"

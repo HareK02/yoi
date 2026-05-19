@@ -520,9 +520,9 @@ async fn pre_run_compact_failure_broadcasts_start_and_failed() {
 // ---------------------------------------------------------------------------
 // Detached post-run memory jobs (`spawn_post_run_memory_jobs` /
 // `wait_for_memory_jobs`). Covers the detach round-trip and the structural
-// invariant that the cloned memory-task Pod shares `SessionHead` with the
+// invariant that the cloned memory-task Pod shares `SessionState` with the
 // source Pod, so that `save_extension` from the background extract does not
-// leave the next turn's `save_user_input` looking at a stale head_hash.
+// leave the next turn's `save_user_input` looking at a stale session pointer.
 
 const EXTRACT_NO_COMPACT_MANIFEST: &str = r#"
 [pod]
@@ -570,9 +570,9 @@ async fn spawn_and_wait_drives_extract_to_completion() {
 
 #[tokio::test]
 async fn detached_extract_does_not_fork_session_log() {
-    // Source pod and the cloned memory-task pod share `SessionHead` via
-    // `Arc<AsyncMutex<_>>`. The detached extract advances head_hash through
-    // `save_extension`; the next `run` must see that same head_hash so
+    // Source pod and the cloned memory-task pod share `SessionState` via
+    // `Arc<_>`. The detached extract advances the entry tally through
+    // `save_extension`; the next `run` must see that same tally so
     // `ensure_head_or_fork` does not spawn a new session.
     let client = MockClient::new(vec![
         text_events_with_usage("hi", 1000),
@@ -594,7 +594,7 @@ async fn detached_extract_does_not_fork_session_log() {
     assert_eq!(
         session_before, session_after,
         "detached extract's save_extension and the next turn's save_user_input \
-         must share head_hash through SessionHead — a fork here means the clone \
-         carried its own head_hash"
+         must share the entry tally through SessionState — a fork here means the \
+         clone carried its own counter"
     );
 }

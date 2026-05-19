@@ -6,7 +6,7 @@
 
 use crate::SessionId;
 use crate::logged_item::{LoggedItem, to_logged};
-use crate::session_log::{self, EntryHash, HashedEntry, LogEntry, PodScopeSnapshot, SessionOrigin};
+use crate::session_log::{self, LogEntry, PodScopeSnapshot, SessionOrigin};
 use crate::store::{Store, StoreError};
 use crate::system_item::SystemItem;
 use llm_worker::WorkerResult;
@@ -22,27 +22,25 @@ pub struct SessionStartState<'a> {
 }
 
 /// Create a new session, writing the initial `SessionStart` entry.
-///
-/// Returns the new session ID and head hash.
 pub fn create_session(
     store: &impl Store,
     state: SessionStartState<'_>,
-) -> Result<(SessionId, EntryHash), StoreError> {
+) -> Result<SessionId, StoreError> {
     let session_id = crate::new_session_id();
-    let hash = create_session_with_id(store, session_id, state)?;
-    Ok((session_id, hash))
+    create_session_with_id(store, session_id, state)?;
+    Ok(session_id)
 }
 
 /// Write a fresh `SessionStart` entry using a pre-generated session ID.
 ///
 /// Used by callers that need to reserve a session ID synchronously but
 /// defer the initial log append (e.g. Pod, which resolves a templated
-/// system prompt only at first turn). Returns the resulting head hash.
+/// system prompt only at first turn).
 pub fn create_session_with_id(
     store: &impl Store,
     session_id: SessionId,
     state: SessionStartState<'_>,
-) -> Result<EntryHash, StoreError> {
+) -> Result<(), StoreError> {
     let entry = LogEntry::SessionStart {
         ts: session_log::now_millis(),
         system_prompt: state.system_prompt.map(String::from),
@@ -51,26 +49,20 @@ pub fn create_session_with_id(
         forked_from: None,
         compacted_from: None,
     };
-    let hash = session_log::compute_hash(None, &entry);
-    let hashed_entry = HashedEntry {
-        hash: hash.clone(),
-        prev_hash: None,
-        entry,
-    };
-    store.append(session_id, &hashed_entry)?;
-    Ok(hash)
+    store.append(session_id, &entry)
 }
 
 /// Create a compacted session from an existing one.
 ///
-/// Records `compacted_from` provenance linking back to the source session.
-/// Returns the new session ID and head hash.
+/// Records `compacted_from` provenance linking back to the source session
+/// at the turn boundary captured by `source_turn_count` (the most recent
+/// completed turn in the source).
 pub fn create_compacted_session(
     store: &impl Store,
     state: SessionStartState<'_>,
     source_session_id: SessionId,
-    source_head_hash: EntryHash,
-) -> Result<(SessionId, EntryHash), StoreError> {
+    source_turn_count: usize,
+) -> Result<SessionId, StoreError> {
     let session_id = crate::new_session_id();
     let entry = LogEntry::SessionStart {
         ts: session_log::now_millis(),
@@ -80,17 +72,11 @@ pub fn create_compacted_session(
         forked_from: None,
         compacted_from: Some(SessionOrigin {
             session_id: source_session_id,
-            at_hash: source_head_hash,
+            at_turn_index: source_turn_count,
         }),
     };
-    let hash = session_log::compute_hash(None, &entry);
-    let hashed_entry = HashedEntry {
-        hash: hash.clone(),
-        prev_hash: None,
-        entry,
-    };
-    store.append(session_id, &hashed_entry)?;
-    Ok((session_id, hash))
+    store.append(session_id, &entry)?;
+    Ok(session_id)
 }
 
 /// Restore session state from a stored log.
@@ -105,18 +91,18 @@ pub fn restore(
     Ok(session_log::collect_state(&entries))
 }
 
-/// Check if the store's head still matches the expected head hash.
+/// Check if the store's entry count still matches the writer's tally.
 /// If not, auto-fork into a new session.
 ///
-/// Updates `session_id` and `head_hash` in place when a fork occurs.
+/// Updates `session_id` and `entries_written` in place when a fork occurs.
 pub fn ensure_head_or_fork(
     store: &impl Store,
     session_id: &mut SessionId,
-    head_hash: &mut Option<EntryHash>,
+    entries_written: &mut usize,
     state: SessionStartState<'_>,
 ) -> Result<(), StoreError> {
-    let store_head = store.read_head_hash(*session_id)?;
-    if store_head == *head_hash {
+    let store_count = store.read_entry_count(*session_id)?;
+    if store_count == *entries_written {
         return Ok(());
     }
     let fork_id = crate::new_session_id();
@@ -128,15 +114,9 @@ pub fn ensure_head_or_fork(
         forked_from: None,
         compacted_from: None,
     };
-    let hash = session_log::compute_hash(None, &entry);
-    let hashed_entry = HashedEntry {
-        hash: hash.clone(),
-        prev_hash: None,
-        entry,
-    };
-    store.create_session(fork_id, &[hashed_entry])?;
+    store.create_session(fork_id, &[entry])?;
     *session_id = fork_id;
-    *head_hash = Some(hash);
+    *entries_written = 1;
     Ok(())
 }
 
@@ -149,13 +129,11 @@ pub fn ensure_head_or_fork(
 pub fn save_user_input(
     store: &impl Store,
     session_id: SessionId,
-    head_hash: &mut Option<EntryHash>,
     segments: Vec<Segment>,
 ) -> Result<(), StoreError> {
     append_entry(
         store,
         session_id,
-        head_hash,
         LogEntry::UserInput {
             ts: session_log::now_millis(),
             segments,
@@ -174,7 +152,6 @@ pub fn save_user_input(
 pub fn save_delta(
     store: &impl Store,
     session_id: SessionId,
-    head_hash: &mut Option<EntryHash>,
     new_items: &[Item],
 ) -> Result<(), StoreError> {
     if new_items.is_empty() {
@@ -188,7 +165,7 @@ pub fn save_delta(
             continue;
         }
         let entry = classify_history_item(item, ts);
-        append_entry(store, session_id, head_hash, entry)?;
+        append_entry(store, session_id, entry)?;
     }
     Ok(())
 }
@@ -223,13 +200,11 @@ pub fn classify_history_item(item: &Item, ts: u64) -> LogEntry {
 pub fn append_system_item(
     store: &impl Store,
     session_id: SessionId,
-    head_hash: &mut Option<EntryHash>,
     item: SystemItem,
-) -> Result<EntryHash, StoreError> {
-    append_entry_with_hash(
+) -> Result<(), StoreError> {
+    append_entry(
         store,
         session_id,
-        head_hash,
         LogEntry::SystemItem {
             ts: session_log::now_millis(),
             item,
@@ -241,13 +216,11 @@ pub fn append_system_item(
 pub fn save_turn_end(
     store: &impl Store,
     session_id: SessionId,
-    head_hash: &mut Option<EntryHash>,
     turn_count: usize,
 ) -> Result<(), StoreError> {
     append_entry(
         store,
         session_id,
-        head_hash,
         LogEntry::TurnEnd {
             ts: session_log::now_millis(),
             turn_count,
@@ -259,14 +232,12 @@ pub fn save_turn_end(
 pub fn save_run_completed(
     store: &impl Store,
     session_id: SessionId,
-    head_hash: &mut Option<EntryHash>,
     result: WorkerResult,
     interrupted: bool,
 ) -> Result<(), StoreError> {
     append_entry(
         store,
         session_id,
-        head_hash,
         LogEntry::RunCompleted {
             ts: session_log::now_millis(),
             interrupted,
@@ -282,14 +253,12 @@ pub fn save_run_completed(
 pub fn save_run_errored(
     store: &impl Store,
     session_id: SessionId,
-    head_hash: &mut Option<EntryHash>,
     message: String,
     interrupted: bool,
 ) -> Result<(), StoreError> {
     append_entry(
         store,
         session_id,
-        head_hash,
         LogEntry::RunErrored {
             ts: session_log::now_millis(),
             interrupted,
@@ -307,7 +276,6 @@ pub fn save_run_errored(
 pub fn save_usage(
     store: &impl Store,
     session_id: SessionId,
-    head_hash: &mut Option<EntryHash>,
     history_len: usize,
     input_total_tokens: u64,
     cache_read_tokens: u64,
@@ -317,7 +285,6 @@ pub fn save_usage(
     append_entry(
         store,
         session_id,
-        head_hash,
         LogEntry::LlmUsage {
             ts: session_log::now_millis(),
             history_len,
@@ -337,14 +304,12 @@ pub fn save_usage(
 pub fn save_extension(
     store: &impl Store,
     session_id: SessionId,
-    head_hash: &mut Option<EntryHash>,
     domain: impl Into<String>,
     payload: serde_json::Value,
 ) -> Result<(), StoreError> {
     append_entry(
         store,
         session_id,
-        head_hash,
         LogEntry::Extension {
             ts: session_log::now_millis(),
             domain: domain.into(),
@@ -357,14 +322,12 @@ pub fn save_extension(
 pub fn save_pod_scope(
     store: &impl Store,
     session_id: SessionId,
-    head_hash: &mut Option<EntryHash>,
     snapshot: &PodScopeSnapshot,
 ) -> Result<(), StoreError> {
     let payload = serde_json::to_value(snapshot)?;
     save_extension(
         store,
         session_id,
-        head_hash,
         session_log::POD_SCOPE_EXTENSION_DOMAIN,
         payload,
     )
@@ -374,13 +337,11 @@ pub fn save_pod_scope(
 pub fn save_config_changed(
     store: &impl Store,
     session_id: SessionId,
-    head_hash: &mut Option<EntryHash>,
     config: &RequestConfig,
 ) -> Result<(), StoreError> {
     append_entry(
         store,
         session_id,
-        head_hash,
         LogEntry::ConfigChanged {
             ts: session_log::now_millis(),
             config: config.clone(),
@@ -399,28 +360,36 @@ pub fn fork(store: &impl Store, state: SessionStartState<'_>) -> Result<SessionI
         forked_from: None,
         compacted_from: None,
     };
-    let hash = session_log::compute_hash(None, &entry);
-    let hashed_entry = HashedEntry {
-        hash,
-        prev_hash: None,
-        entry,
-    };
-    store.create_session(fork_id, &[hashed_entry])?;
+    store.create_session(fork_id, &[entry])?;
     Ok(fork_id)
 }
 
-/// Fork from an arbitrary point in a stored session's log.
+/// Fork from a turn boundary in a stored session's log.
+///
+/// `at_turn_index` is the `turn_count` of the most recent completed
+/// `TurnEnd` in the source segment that the fork should branch from.
+/// Replay collects state up to and including that `TurnEnd`; entries
+/// after it are not carried into the new segment.
 pub fn fork_at(
     store: &impl Store,
     source_id: SessionId,
-    at_hash: &EntryHash,
+    at_turn_index: usize,
 ) -> Result<SessionId, StoreError> {
     let entries = store.read_all(source_id)?;
-    let cut = entries
-        .iter()
-        .position(|e| &e.hash == at_hash)
-        .map(|i| i + 1)
-        .unwrap_or(entries.len());
+    let cut = if at_turn_index == 0 {
+        // Branch directly after the SessionStart (or whatever opens the
+        // segment), before any turn completes.
+        entries
+            .iter()
+            .position(|e| !matches!(e, LogEntry::SessionStart { .. }))
+            .unwrap_or(entries.len())
+    } else {
+        entries
+            .iter()
+            .position(|e| matches!(e, LogEntry::TurnEnd { turn_count, .. } if *turn_count == at_turn_index))
+            .map(|i| i + 1)
+            .unwrap_or(entries.len())
+    };
     let state = session_log::collect_state(&entries[..cut]);
 
     let fork_id = crate::new_session_id();
@@ -429,23 +398,17 @@ pub fn fork_at(
         system_prompt: state.system_prompt,
         config: state.config,
         history: to_logged(&state.history),
-        forked_from: Some(session_log::SessionOrigin {
+        forked_from: Some(SessionOrigin {
             session_id: source_id,
-            at_hash: at_hash.clone(),
+            at_turn_index,
         }),
         compacted_from: None,
     };
-    let hash = session_log::compute_hash(None, &entry);
-    let hashed_entry = HashedEntry {
-        hash,
-        prev_hash: None,
-        entry,
-    };
-    store.create_session(fork_id, &[hashed_entry])?;
+    store.create_session(fork_id, &[entry])?;
     Ok(fork_id)
 }
 
-/// Append a single `LogEntry`, chaining the hash and updating `head_hash`.
+/// Append a single `LogEntry`.
 ///
 /// Lower-level dual of the `save_*` convenience wrappers in this module.
 /// Use when the caller already builds the typed entry itself (e.g. when
@@ -453,30 +416,7 @@ pub fn fork_at(
 pub fn append_entry(
     store: &impl Store,
     session_id: SessionId,
-    head_hash: &mut Option<EntryHash>,
     entry: LogEntry,
 ) -> Result<(), StoreError> {
-    append_entry_with_hash(store, session_id, head_hash, entry)?;
-    Ok(())
-}
-
-/// Same as [`append_entry`] but returns the freshly computed entry hash.
-///
-/// Used by paths that need the hash for downstream broadcast or mirror
-/// updates (e.g. the Pod's `SessionLogSink`).
-pub fn append_entry_with_hash(
-    store: &impl Store,
-    session_id: SessionId,
-    head_hash: &mut Option<EntryHash>,
-    entry: LogEntry,
-) -> Result<EntryHash, StoreError> {
-    let hash = session_log::compute_hash(head_hash.as_ref(), &entry);
-    let hashed_entry = HashedEntry {
-        hash: hash.clone(),
-        prev_hash: head_hash.clone(),
-        entry,
-    };
-    store.append(session_id, &hashed_entry)?;
-    *head_hash = Some(hash.clone());
-    Ok(hash)
+    store.append(session_id, &entry)
 }

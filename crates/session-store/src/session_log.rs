@@ -4,88 +4,17 @@
 //! serialized as one line in a `.jsonl` file. Reading all entries and
 //! collecting them via [`collect_state`] reconstructs the full [`Worker`] state.
 //!
-//! Entries are chained via [`EntryHash`]: each [`HashedEntry`] records the hash
-//! of the previous entry, forming a tamper-evident append-only chain. This
-//! enables safe fork detection when multiple writers share a session.
+//! The on-disk format is one `LogEntry` per line — entries are positionally
+//! ordered. Fork lineage references between segments use turn-number indices
+//! (`SessionOrigin.at_turn_index`) rather than per-entry hashes.
 
 use llm_worker::llm_client::types::{Item, RequestConfig};
 use llm_worker::{UsageRecord, WorkerResult};
 use protocol::{InvokeKind, ScopeRule, Segment};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::logged_item::LoggedItem;
 use crate::system_item::SystemItem;
-
-/// SHA-256 hash identifying a specific log entry in the chain.
-///
-/// Computed as `sha256(prev_hash_bytes || canonical_json(entry))`.
-/// Displayed and serialized as a lowercase hex string.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct EntryHash([u8; 32]);
-
-impl EntryHash {
-    pub fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
-    }
-
-    pub fn to_hex(&self) -> String {
-        hex::encode(self.0)
-    }
-
-    pub fn from_hex(s: &str) -> Result<Self, hex::FromHexError> {
-        let mut buf = [0u8; 32];
-        hex::decode_to_slice(s, &mut buf)?;
-        Ok(Self(buf))
-    }
-}
-
-impl std::fmt::Display for EntryHash {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.to_hex())
-    }
-}
-
-impl Serialize for EntryHash {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&self.to_hex())
-    }
-}
-
-impl<'de> Deserialize<'de> for EntryHash {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let s = String::deserialize(deserializer)?;
-        Self::from_hex(&s).map_err(serde::de::Error::custom)
-    }
-}
-
-/// Compute the hash for a log entry given its predecessor's hash.
-pub fn compute_hash(prev: Option<&EntryHash>, entry: &LogEntry) -> EntryHash {
-    let mut hasher = Sha256::new();
-
-    // Feed prev_hash bytes (32 zero bytes if None).
-    match prev {
-        Some(h) => hasher.update(h.as_bytes()),
-        None => hasher.update([0u8; 32]),
-    }
-
-    // Canonical JSON of the entry.
-    let json = serde_json::to_string(entry).expect("LogEntry serialization cannot fail");
-    hasher.update(json.as_bytes());
-
-    EntryHash(hasher.finalize().into())
-}
-
-/// A [`LogEntry`] with hash-chain metadata.
-///
-/// This is the unit persisted to JSONL — one line per `HashedEntry`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HashedEntry {
-    pub hash: EntryHash,
-    pub prev_hash: Option<EntryHash>,
-    #[serde(flatten)]
-    pub entry: LogEntry,
-}
 
 /// A single session log entry, serialized as one JSONL line.
 ///
@@ -110,10 +39,10 @@ pub enum LogEntry {
         system_prompt: Option<String>,
         config: RequestConfig,
         history: Vec<LoggedItem>,
-        /// Origin: forked from another session at a specific entry.
+        /// Origin: forked from another session at a specific turn boundary.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         forked_from: Option<SessionOrigin>,
-        /// Origin: compacted from another session at a specific entry.
+        /// Origin: compacted from another session at a specific turn boundary.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         compacted_from: Option<SessionOrigin>,
     },
@@ -235,13 +164,16 @@ pub enum LogEntry {
     },
 }
 
-/// Provenance reference to a parent session.
+/// Provenance reference to a parent segment.
+///
+/// `at_turn_index` is the `turn_count` value of the most recent
+/// `TurnEnd` entry preceding the split point in the source segment.
+/// A value of `0` means the split happened before any turn completed
+/// (e.g. immediately after `SessionStart`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionOrigin {
-    /// Session ID of the source session.
     pub session_id: crate::SessionId,
-    /// Hash of the entry in the source session at the point of fork/compact.
-    pub at_hash: EntryHash,
+    pub at_turn_index: usize,
 }
 
 /// Domain used by Pod to persist its latest effective runtime scope.
@@ -262,8 +194,10 @@ pub struct RestoredState {
     pub history: Vec<Item>,
     pub turn_count: usize,
     pub last_run_interrupted: bool,
-    /// Hash of the last entry in the chain (None if empty).
-    pub head_hash: Option<EntryHash>,
+    /// Number of entries replayed. `0` means the session log was empty.
+    /// Writers track their own append count via the same counter so
+    /// `ensure_head_or_fork` can compare it with the on-disk count.
+    pub entries_count: usize,
     /// LLM リクエストごとの Usage スナップショット時系列。
     /// `LogEntry::LlmUsage` を replay して時系列順に積まれる。
     /// 任意位置のトークン数推定に使う。
@@ -283,25 +217,25 @@ pub struct RestoredState {
     pub user_segments: Vec<Vec<Segment>>,
 }
 
-/// Replay a sequence of hashed entries to reconstruct worker state.
-pub fn collect_state(entries: &[HashedEntry]) -> RestoredState {
+/// Replay a sequence of log entries to reconstruct worker state.
+pub fn collect_state(entries: &[LogEntry]) -> RestoredState {
     let mut state = RestoredState {
         system_prompt: None,
         config: RequestConfig::default(),
         history: Vec::new(),
         turn_count: 0,
         last_run_interrupted: false,
-        head_hash: None,
+        entries_count: 0,
         usage_history: Vec::new(),
         extensions: Vec::new(),
         pod_scope: None,
         user_segments: Vec::new(),
     };
 
-    for hashed in entries {
-        state.head_hash = Some(hashed.hash.clone());
+    for entry in entries {
+        state.entries_count += 1;
 
-        match &hashed.entry {
+        match entry {
             LogEntry::SessionStart {
                 system_prompt,
                 config,
@@ -403,26 +337,6 @@ pub fn now_millis() -> u64 {
         .as_millis() as u64
 }
 
-/// Build a hash chain from plain `LogEntry` values.
-///
-/// Useful for tests and for seeding new sessions from a list of entries.
-pub fn build_chain(entries: &[LogEntry]) -> Vec<HashedEntry> {
-    let mut chain = Vec::with_capacity(entries.len());
-    let mut prev: Option<EntryHash> = None;
-
-    for entry in entries {
-        let hash = compute_hash(prev.as_ref(), entry);
-        chain.push(HashedEntry {
-            hash: hash.clone(),
-            prev_hash: prev,
-            entry: entry.clone(),
-        });
-        prev = Some(hash);
-    }
-
-    chain
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -432,12 +346,12 @@ mod tests {
         let state = collect_state(&[]);
         assert!(state.history.is_empty());
         assert_eq!(state.turn_count, 0);
-        assert!(state.head_hash.is_none());
+        assert_eq!(state.entries_count, 0);
     }
 
     #[test]
     fn replay_session_start_sets_initial_state() {
-        let entries = build_chain(&[LogEntry::SessionStart {
+        let state = collect_state(&[LogEntry::SessionStart {
             ts: 1000,
             system_prompt: Some("You are helpful.".into()),
             config: RequestConfig::default().with_max_tokens(1024),
@@ -445,16 +359,15 @@ mod tests {
             forked_from: None,
             compacted_from: None,
         }]);
-        let state = collect_state(&entries);
         assert_eq!(state.system_prompt.as_deref(), Some("You are helpful."));
         assert_eq!(state.config.max_tokens, Some(1024));
         assert_eq!(state.history.len(), 1);
-        assert!(state.head_hash.is_some());
+        assert_eq!(state.entries_count, 1);
     }
 
     #[test]
     fn replay_full_turn() {
-        let entries = build_chain(&[
+        let state = collect_state(&[
             LogEntry::SessionStart {
                 ts: 1000,
                 system_prompt: None,
@@ -481,7 +394,6 @@ mod tests {
                 result: WorkerResult::Finished,
             },
         ]);
-        let state = collect_state(&entries);
         assert_eq!(state.history.len(), 2);
         assert_eq!(state.turn_count, 1);
         assert!(!state.last_run_interrupted);
@@ -489,7 +401,7 @@ mod tests {
 
     #[test]
     fn replay_with_tool_calls() {
-        let entries = build_chain(&[
+        let state = collect_state(&[
             LogEntry::SessionStart {
                 ts: 1000,
                 system_prompt: None,
@@ -519,7 +431,6 @@ mod tests {
                 turn_count: 1,
             },
         ]);
-        let state = collect_state(&entries);
         assert_eq!(state.history.len(), 4);
         assert!(state.history[1].is_tool_call());
         assert!(state.history[2].is_tool_result());
@@ -527,7 +438,7 @@ mod tests {
 
     #[test]
     fn replay_config_changed() {
-        let entries = build_chain(&[
+        let state = collect_state(&[
             LogEntry::SessionStart {
                 ts: 1000,
                 system_prompt: None,
@@ -541,50 +452,12 @@ mod tests {
                 config: RequestConfig::default().with_temperature(0.5),
             },
         ]);
-        let state = collect_state(&entries);
         assert_eq!(state.config.temperature, Some(0.5));
     }
 
     #[test]
-    fn hash_chain_is_deterministic() {
-        let raw = vec![
-            LogEntry::SessionStart {
-                ts: 1000,
-                system_prompt: None,
-                config: RequestConfig::default(),
-                history: vec![],
-                forked_from: None,
-                compacted_from: None,
-            },
-            LogEntry::UserInput {
-                ts: 2000,
-                segments: vec![Segment::text("Hello")],
-            },
-        ];
-        let chain_a = build_chain(&raw);
-        let chain_b = build_chain(&raw);
-        assert_eq!(chain_a[0].hash, chain_b[0].hash);
-        assert_eq!(chain_a[1].hash, chain_b[1].hash);
-    }
-
-    #[test]
-    fn different_content_produces_different_hash() {
-        let entry_a = LogEntry::UserInput {
-            ts: 1000,
-            segments: vec![Segment::text("Hello")],
-        };
-        let entry_b = LogEntry::UserInput {
-            ts: 1000,
-            segments: vec![Segment::text("World")],
-        };
-        let hash_a = compute_hash(None, &entry_a);
-        let hash_b = compute_hash(None, &entry_b);
-        assert_ne!(hash_a, hash_b);
-    }
-
-    #[test]
     fn replay_llm_usage_appends_to_usage_history() {
-        let entries = build_chain(&[
+        let state = collect_state(&[
             LogEntry::SessionStart {
                 ts: 1000,
                 system_prompt: None,
@@ -618,7 +491,6 @@ mod tests {
                 output_tokens: 5,
             },
         ]);
-        let state = collect_state(&entries);
         // history は LlmUsage で変化しない
         assert_eq!(state.history.len(), 2);
         // usage_history は時系列順
@@ -631,8 +503,7 @@ mod tests {
 
     #[test]
     fn replay_without_llm_usage_keeps_usage_history_empty() {
-        // 既存ログ互換: LlmUsage entry が無くても collect_state は壊れない
-        let entries = build_chain(&[
+        let state = collect_state(&[
             LogEntry::SessionStart {
                 ts: 1000,
                 system_prompt: None,
@@ -646,7 +517,6 @@ mod tests {
                 segments: vec![Segment::text("hi")],
             },
         ]);
-        let state = collect_state(&entries);
         assert!(state.usage_history.is_empty());
     }
 
@@ -704,7 +574,7 @@ mod tests {
 
     #[test]
     fn replay_invoke_marker_does_not_mutate_state() {
-        let entries = build_chain(&[
+        let state = collect_state(&[
             LogEntry::SessionStart {
                 ts: 0,
                 system_prompt: None,
@@ -730,14 +600,13 @@ mod tests {
                 trigger: InvokeKind::Notify,
             },
         ]);
-        let state = collect_state(&entries);
         assert_eq!(state.history.len(), 1);
         assert_eq!(state.turn_count, 1);
     }
 
     #[test]
     fn replay_extension_collects_domain_payload_pairs() {
-        let entries = build_chain(&[
+        let state = collect_state(&[
             LogEntry::SessionStart {
                 ts: 1000,
                 system_prompt: None,
@@ -762,7 +631,6 @@ mod tests {
                 payload: serde_json::json!({ "x": 1 }),
             },
         ]);
-        let state = collect_state(&entries);
         // 順序保持で全件積まれる。fold は呼び出し側の責務。
         assert_eq!(state.extensions.len(), 3);
         assert_eq!(state.extensions[0].0, "memory.extract");
@@ -794,22 +662,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn hash_hex_round_trip() {
-        let entry = LogEntry::SessionStart {
-            ts: 1000,
-            system_prompt: None,
-            config: RequestConfig::default(),
-            history: vec![],
-            forked_from: None,
-            compacted_from: None,
-        };
-        let hash = compute_hash(None, &entry);
-        let hex = hash.to_hex();
-        let parsed = EntryHash::from_hex(&hex).unwrap();
-        assert_eq!(hash, parsed);
-    }
-
     /// Mixed segments survive a JSON round-trip through `LogEntry::UserInput`,
     /// and `collect_state` derives `Item::user_message` from the flattened
     /// text while preserving the original segments separately. This covers
@@ -834,10 +686,10 @@ mod tests {
             ts: 4242,
             segments: segments.clone(),
         };
-        // Hash + JSON round-trip preserves the variant byte-for-byte.
+        // JSON round-trip preserves the variant byte-for-byte.
         let json = serde_json::to_string(&entry).unwrap();
         let parsed: LogEntry = serde_json::from_str(&json).unwrap();
-        let entries = build_chain(&[
+        let state = collect_state(&[
             LogEntry::SessionStart {
                 ts: 1,
                 system_prompt: None,
@@ -848,7 +700,6 @@ mod tests {
             },
             parsed,
         ]);
-        let state = collect_state(&entries);
         // Worker history gets a flattened user_message item.
         assert_eq!(state.history.len(), 1);
         match &state.history[0] {

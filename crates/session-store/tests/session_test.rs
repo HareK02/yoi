@@ -9,7 +9,7 @@ use llm_worker::interceptor::{Interceptor, TurnEndAction};
 use llm_worker::llm_client::event::{Event, ResponseStatus, StatusEvent};
 use llm_worker::llm_client::types::{Item, RequestConfig};
 use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
-use session_store::{EntryHash, FsStore, LogEntry, SessionStartState, Store, collect_state};
+use session_store::{FsStore, LogEntry, SessionStartState, Store, collect_state};
 
 // =============================================================================
 // Helpers
@@ -96,20 +96,13 @@ async fn run_and_persist(
     worker: Worker<MockLlmClient>,
     store: &FsStore,
     session_id: session_store::SessionId,
-    head_hash: &mut Option<EntryHash>,
     input: &str,
 ) -> (Worker<MockLlmClient>, llm_worker::WorkerResult) {
     // Mirror Pod's run-entry contract: log the user input as segments
     // before the worker pushes its flattened user_message; save_delta
     // skips the resulting user_message item to avoid double-write.
-    session_store::save_user_input(
-        store,
-        session_id,
-        head_hash,
-        vec![protocol::Segment::text(input)],
-    )
-    
-    .unwrap();
+    session_store::save_user_input(store, session_id, vec![protocol::Segment::text(input)])
+        .unwrap();
 
     let history_before = worker.history().len();
 
@@ -118,34 +111,26 @@ async fn run_and_persist(
     let worker = locked.unlock();
 
     let new_items = &worker.history()[history_before..];
-    session_store::save_delta(store, session_id, head_hash, new_items)
-        
-        .unwrap();
-    session_store::save_turn_end(store, session_id, head_hash, worker.turn_count())
-        
-        .unwrap();
+    session_store::save_delta(store, session_id, new_items).unwrap();
+    session_store::save_turn_end(store, session_id, worker.turn_count()).unwrap();
 
     match &result {
         Ok(r) => {
             session_store::save_run_completed(
                 store,
                 session_id,
-                head_hash,
                 r.clone(),
                 worker.last_run_interrupted(),
             )
-            
             .unwrap();
         }
         Err(e) => {
             session_store::save_run_errored(
                 store,
                 session_id,
-                head_hash,
                 e.to_string(),
                 worker.last_run_interrupted(),
             )
-            
             .unwrap();
         }
     }
@@ -164,7 +149,7 @@ async fn session_run_logs_entries() {
     let client = MockLlmClient::new(simple_text_events());
     let worker = Worker::new(client);
 
-    let (sid, head_hash) = session_store::create_session(
+    let sid = session_store::create_session(
         &store,
         SessionStartState {
             system_prompt: worker.get_system_prompt(),
@@ -172,11 +157,9 @@ async fn session_run_logs_entries() {
             history: worker.history(),
         },
     )
-    
     .unwrap();
 
-    let mut head_hash = Some(head_hash);
-    let (worker, _) = run_and_persist(worker, &store, sid, &mut head_hash, "Hi").await;
+    let (worker, _) = run_and_persist(worker, &store, sid, "Hi").await;
     let _ = &worker;
 
     let entries = store.read_all(sid).unwrap();
@@ -189,12 +172,12 @@ async fn session_run_logs_entries() {
     );
 
     // First entry is SessionStart
-    assert!(matches!(&entries[0].entry, LogEntry::SessionStart { .. }));
+    assert!(matches!(&entries[0], LogEntry::SessionStart { .. }));
 
     // Has a RunCompleted with Finished
     let has_finished = entries.iter().any(|e| {
         matches!(
-            &e.entry,
+            e,
             LogEntry::RunCompleted {
                 result: llm_worker::WorkerResult::Finished,
                 ..
@@ -202,17 +185,6 @@ async fn session_run_logs_entries() {
         )
     });
     assert!(has_finished, "should have a Finished outcome");
-
-    // Verify hash chain integrity
-    assert!(entries[0].prev_hash.is_none());
-    for i in 1..entries.len() {
-        assert_eq!(
-            entries[i].prev_hash.as_ref(),
-            Some(&entries[i - 1].hash),
-            "hash chain broken at entry {}",
-            i
-        );
-    }
 }
 
 #[tokio::test]
@@ -222,7 +194,7 @@ async fn session_restore_round_trip() {
     let mut worker = Worker::new(client);
     worker.set_system_prompt("You are helpful.");
 
-    let (sid, head_hash) = session_store::create_session(
+    let sid = session_store::create_session(
         &store,
         SessionStartState {
             system_prompt: worker.get_system_prompt(),
@@ -230,11 +202,9 @@ async fn session_restore_round_trip() {
             history: worker.history(),
         },
     )
-    
     .unwrap();
-    let mut head_hash = Some(head_hash);
 
-    let (worker, _) = run_and_persist(worker, &store, sid, &mut head_hash, "Hi").await;
+    let (worker, _) = run_and_persist(worker, &store, sid, "Hi").await;
 
     let original_history_len = worker.history().len();
     let original_turn_count = worker.turn_count();
@@ -245,7 +215,7 @@ async fn session_restore_round_trip() {
     assert_eq!(state.history.len(), original_history_len);
     assert_eq!(state.turn_count, original_turn_count);
     assert_eq!(state.system_prompt.as_deref(), Some("You are helpful."));
-    assert_eq!(state.head_hash, head_hash);
+    assert_eq!(state.entries_count, store.read_entry_count(sid).unwrap());
 }
 
 #[tokio::test]
@@ -255,7 +225,7 @@ async fn session_run_with_tool_call() {
     let mut worker = Worker::new(client);
     worker.register_tool(weather_tool_definition());
 
-    let (sid, head_hash) = session_store::create_session(
+    let sid = session_store::create_session(
         &store,
         SessionStartState {
             system_prompt: worker.get_system_prompt(),
@@ -263,23 +233,20 @@ async fn session_run_with_tool_call() {
             history: worker.history(),
         },
     )
-    
     .unwrap();
-    let mut head_hash = Some(head_hash);
 
-    let (_worker, _) =
-        run_and_persist(worker, &store, sid, &mut head_hash, "What's the weather?").await;
+    let (_worker, _) = run_and_persist(worker, &store, sid, "What's the weather?").await;
 
     let entries = store.read_all(sid).unwrap();
 
     let has_tool_results = entries
         .iter()
-        .any(|e| matches!(&e.entry, LogEntry::ToolResult { .. }));
+        .any(|e| matches!(e, LogEntry::ToolResult { .. }));
     assert!(has_tool_results, "should have ToolResult entry");
 
     let has_assistant = entries
         .iter()
-        .any(|e| matches!(&e.entry, LogEntry::AssistantItem { .. }));
+        .any(|e| matches!(e, LogEntry::AssistantItem { .. }));
     assert!(has_assistant, "should have AssistantItem entry");
 }
 
@@ -293,7 +260,7 @@ async fn session_resume_after_pause() {
     worker.register_tool(weather_tool_definition());
     worker.set_interceptor(PausePolicy);
 
-    let (sid, head_hash) = session_store::create_session(
+    let sid = session_store::create_session(
         &store,
         SessionStartState {
             system_prompt: worker.get_system_prompt(),
@@ -301,18 +268,16 @@ async fn session_resume_after_pause() {
             history: worker.history(),
         },
     )
-    
     .unwrap();
-    let mut head_hash = Some(head_hash);
 
-    let (_worker, result) = run_and_persist(worker, &store, sid, &mut head_hash, "Weather?").await;
+    let (_worker, result) = run_and_persist(worker, &store, sid, "Weather?").await;
     assert!(matches!(result, llm_worker::WorkerResult::Paused));
 
     // Check RunCompleted is Paused
     let entries = store.read_all(sid).unwrap();
     let has_paused = entries.iter().any(|e| {
         matches!(
-            &e.entry,
+            e,
             LogEntry::RunCompleted {
                 result: llm_worker::WorkerResult::Paused,
                 ..
@@ -333,7 +298,7 @@ async fn session_fork_preserves_state() {
     let mut worker = Worker::new(client);
     worker.set_system_prompt("System prompt");
 
-    let (sid, head_hash) = session_store::create_session(
+    let sid = session_store::create_session(
         &store,
         SessionStartState {
             system_prompt: worker.get_system_prompt(),
@@ -341,11 +306,9 @@ async fn session_fork_preserves_state() {
             history: worker.history(),
         },
     )
-    
     .unwrap();
-    let mut head_hash = Some(head_hash);
 
-    let (worker, _) = run_and_persist(worker, &store, sid, &mut head_hash, "Hello").await;
+    let (worker, _) = run_and_persist(worker, &store, sid, "Hello").await;
 
     let original_history_len = worker.history().len();
     let fork_id = session_store::fork(
@@ -356,16 +319,12 @@ async fn session_fork_preserves_state() {
             history: worker.history(),
         },
     )
-    
     .unwrap();
 
     // Fork should have a SessionStart with the current history
     let fork_entries = store.read_all(fork_id).unwrap();
     assert_eq!(fork_entries.len(), 1);
-    assert!(matches!(
-        &fork_entries[0].entry,
-        LogEntry::SessionStart { .. }
-    ));
+    assert!(matches!(&fork_entries[0], LogEntry::SessionStart { .. }));
 
     let fork_state = collect_state(&fork_entries);
     assert_eq!(fork_state.history.len(), original_history_len);
@@ -378,7 +337,7 @@ async fn session_fork_at_truncates() {
     let client = MockLlmClient::new(simple_text_events());
     let worker = Worker::new(client);
 
-    let (sid, head_hash) = session_store::create_session(
+    let sid = session_store::create_session(
         &store,
         SessionStartState {
             system_prompt: worker.get_system_prompt(),
@@ -386,29 +345,28 @@ async fn session_fork_at_truncates() {
             history: worker.history(),
         },
     )
-    
     .unwrap();
-    let mut head_hash = Some(head_hash);
 
-    let (_worker, _) = run_and_persist(worker, &store, sid, &mut head_hash, "Hello").await;
+    let (worker, _) = run_and_persist(worker, &store, sid, "Hello").await;
 
     let all_entries = store.read_all(sid).unwrap();
     assert!(all_entries.len() > 2);
 
-    // Fork at the hash of the 2nd entry (SessionStart + UserInput)
-    let at_hash = &all_entries[1].hash;
-    let fork_id = session_store::fork_at(&store, sid, at_hash).unwrap();
+    // Fork at turn 1 (one completed turn).
+    let fork_id = session_store::fork_at(&store, sid, worker.turn_count()).unwrap();
 
     let fork_entries = store.read_all(fork_id).unwrap();
     assert_eq!(fork_entries.len(), 1); // Just the new SessionStart
 
     let fork_state = collect_state(&fork_entries);
-    // Should have the state from replaying only the first 2 entries
-    let original_truncated_state = collect_state(&all_entries[..2]);
-    assert_eq!(
-        fork_state.history.len(),
-        original_truncated_state.history.len()
-    );
+    // History at fork point should match history right after the TurnEnd in
+    // the source session.
+    let turn_end_pos = all_entries
+        .iter()
+        .position(|e| matches!(e, LogEntry::TurnEnd { turn_count, .. } if *turn_count == worker.turn_count()))
+        .expect("source session has the matching TurnEnd");
+    let source_state_at_fork = collect_state(&all_entries[..=turn_end_pos]);
+    assert_eq!(fork_state.history.len(), source_state_at_fork.history.len());
 }
 
 #[tokio::test]
@@ -417,7 +375,7 @@ async fn session_config_changed_logged() {
     let client = MockLlmClient::new(vec![]);
     let mut worker = Worker::new(client);
 
-    let (sid, head_hash) = session_store::create_session(
+    let sid = session_store::create_session(
         &store,
         SessionStartState {
             system_prompt: worker.get_system_prompt(),
@@ -425,21 +383,17 @@ async fn session_config_changed_logged() {
             history: worker.history(),
         },
     )
-    
     .unwrap();
-    let mut head_hash = Some(head_hash);
 
     // Modify config and log it
     let new_config = RequestConfig::default().with_temperature(0.7);
     worker.set_request_config(new_config.clone());
-    session_store::save_config_changed(&store, sid, &mut head_hash, &new_config)
-        
-        .unwrap();
+    session_store::save_config_changed(&store, sid, &new_config).unwrap();
 
     let entries = store.read_all(sid).unwrap();
     let has_config_changed = entries.iter().any(|e| {
         matches!(
-            &e.entry,
+            e,
             LogEntry::ConfigChanged { config, .. } if config.temperature == Some(0.7)
         )
     });
@@ -454,7 +408,7 @@ async fn session_auto_forks_on_conflict() {
     let client_a = MockLlmClient::new(simple_text_events());
     let worker_a = Worker::new(client_a);
 
-    let (original_sid, head_hash) = session_store::create_session(
+    let original_sid = session_store::create_session(
         &store,
         SessionStartState {
             system_prompt: worker_a.get_system_prompt(),
@@ -462,37 +416,29 @@ async fn session_auto_forks_on_conflict() {
             history: worker_a.history(),
         },
     )
-    
     .unwrap();
     let mut session_id = original_sid;
-    let mut head_hash = Some(head_hash);
+    // Writer tracked: just the SessionStart we wrote.
+    let mut entries_written: usize = 1;
 
-    // Simulate another Pod writing to the same session behind our back
+    // Simulate another Pod writing to the same session behind our back.
     let extra_entry = LogEntry::UserInput {
         ts: 9999,
         segments: vec![protocol::Segment::text("Interloper")],
     };
-    let current_head = store.read_head_hash(original_sid).unwrap();
-    let hash = session_store::compute_hash(current_head.as_ref(), &extra_entry);
-    let hashed = session_store::HashedEntry {
-        hash,
-        prev_hash: current_head,
-        entry: extra_entry,
-    };
-    store.append(original_sid, &hashed).unwrap();
+    store.append(original_sid, &extra_entry).unwrap();
 
-    // Now head_hash is stale — ensure_head_or_fork should auto-fork
+    // Now the on-disk count exceeds our tally — ensure_head_or_fork should auto-fork.
     session_store::ensure_head_or_fork(
         &store,
         &mut session_id,
-        &mut head_hash,
+        &mut entries_written,
         SessionStartState {
             system_prompt: worker_a.get_system_prompt(),
             config: worker_a.request_config(),
             history: worker_a.history(),
         },
     )
-    
     .unwrap();
 
     // session_id should now be different
@@ -506,6 +452,6 @@ async fn session_auto_forks_on_conflict() {
     let original_entries = store.read_all(original_sid).unwrap();
     let has_interloper = original_entries
         .iter()
-        .any(|e| matches!(&e.entry, LogEntry::UserInput { .. }));
+        .any(|e| matches!(e, LogEntry::UserInput { .. }));
     assert!(has_interloper);
 }

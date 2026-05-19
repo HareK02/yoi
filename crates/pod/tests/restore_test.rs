@@ -63,7 +63,7 @@ async fn restore_from_manifest_rejects_empty_session_log() {
     let manifest = pod::PodManifest::from_toml(MINIMAL_MANIFEST_TOML).unwrap();
 
     // Pre-create an empty `<id>.jsonl` so `read_all` succeeds with no
-    // entries. `collect_state` returns `head_hash = None`, which
+    // entries. `collect_state` returns `entries_count = 0`, which
     // `restore_from_manifest` rejects with `SessionEmpty` *before* it
     // gets as far as building the LLM client — so the test does not
     // need credentials or a runtime sandbox.

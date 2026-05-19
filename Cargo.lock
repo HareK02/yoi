@@ -2148,6 +2148,7 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 name = "pod"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "async-trait",
  "chrono",
  "clap",
@@ -2160,7 +2161,6 @@ dependencies = [
  "manifest",
  "memory",
  "minijinja",
- "parking_lot",
  "pod-registry",
  "protocol",
  "provider",
@@ -2977,12 +2977,10 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "futures",
- "hex",
  "llm-worker",
  "protocol",
  "serde",
  "serde_json",
- "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

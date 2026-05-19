@@ -18,7 +18,7 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use session_store::{EntryHash, SessionId, Store, StoreError, save_extension, session_log};
+use session_store::{SessionId, Store, StoreError, save_extension, session_log};
 
 /// Domain tag used in `LogEntry::Extension` for all metrics records.
 pub const DOMAIN: &str = "metrics";
@@ -78,11 +78,10 @@ impl Metric {
 pub fn record_metric(
     store: &impl Store,
     session_id: SessionId,
-    head_hash: &mut Option<EntryHash>,
     metric: &Metric,
 ) -> Result<(), StoreError> {
     let payload = serde_json::to_value(metric).expect("Metric serialization cannot fail");
-    save_extension(store, session_id, head_hash, DOMAIN, payload)
+    save_extension(store, session_id, DOMAIN, payload)
 }
 
 /// `RestoredState.extensions` から metrics domain の payload を順に取り出し、
