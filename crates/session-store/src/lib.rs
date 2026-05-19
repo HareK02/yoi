@@ -18,12 +18,12 @@
 //! ```ignore
 //! use session_store::{create_session, restore, save_delta, FsStore, SessionStartState};
 //!
-//! let store = FsStore::new("./sessions").await?;
-//! let (session_id, head_hash) = create_session(&store, SessionStartState {
+//! let store = FsStore::new("./sessions")?;
+//! let session_id = create_session(&store, SessionStartState {
 //!     system_prompt: None,
 //!     config: &config,
 //!     history: &[],
-//! }).await?;
+//! })?;
 //! ```
 
 pub mod event_trace;
