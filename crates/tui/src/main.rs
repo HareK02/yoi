@@ -210,7 +210,7 @@ async fn run_resume() -> Result<(), Box<dyn std::error::Error>> {
     // viewport before the name dialog opens so each phase gets fresh
     // vertical room.
     let leaf_segment_id = match picker::run().await? {
-        PickerOutcome::Picked { segment_id, .. } => segment_id,
+        PickerOutcome::Picked { segment_id } => segment_id,
         PickerOutcome::Cancelled => return Ok(()),
     };
     run_spawn(Some(leaf_segment_id)).await

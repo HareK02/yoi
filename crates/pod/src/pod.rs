@@ -570,7 +570,9 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     }
 
     /// The Session this Pod belongs to. Stable across compaction and
-    /// in-Session fork — only `fork` (a brand-new Session) changes it.
+    /// auto-fork (both stay within the same Session); there is no
+    /// Pod-level operation today that moves a running Pod to a different
+    /// Session.
     pub fn session_id(&self) -> SessionId {
         self.segment_state.session_id()
     }
@@ -2864,6 +2866,8 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
         let mut common = prepare_pod_common(&manifest, &loader, /* parse_template */ true)?;
         let skill_shadows = std::mem::take(&mut common.skill_shadows);
 
+        // A spawned child starts its own conversation, so it mints a
+        // fresh Session rather than joining the spawner's.
         let session_id = session_store::new_session_id();
         let segment_id = session_store::new_segment_id();
         let scope_allocation = pod_registry::adopt_allocation(

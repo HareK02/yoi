@@ -4,12 +4,12 @@
 //! `llm-worker` `Tool` infrastructure. Filesystem access is mediated by
 //! two orthogonal concerns:
 //!
-//! - [`ScopedFs`] — pod-lifetime, expresses the write-block boundary for
-//!   the current scope. Derived from the manifest and shareable across
-//!   sessions.
-//! - [`Tracker`] — session-lifetime, enforces the "read before edit"
+//! - [`ScopedFs`] — Pod-process lifetime, expresses the write-block
+//!   boundary for the current scope. Derived from the manifest; not
+//!   persisted across Pod restart.
+//! - [`Tracker`] — Pod-process lifetime, enforces the "read before edit"
 //!   policy via content hashes and tracks the recency of touched files.
-//!   Recreated fresh per session.
+//!   Recreated fresh on each Pod start (including resume).
 //!
 //! The Pod layer owns both instances and passes them to
 //! [`builtin_tools`] when registering tools on a `Worker`.
@@ -42,11 +42,11 @@ pub use tracker::Tracker;
 pub use write::write_tool;
 
 /// Register all builtin tools, wiring them to a shared `ScopedFs`
-/// (pod-lifetime) and `Tracker` (session-lifetime).
+/// (Pod-process lifetime) and `Tracker` (Pod-process lifetime).
 ///
 /// All returned factories share the same tracker instance so that
 /// `Read` / `Write` / `Edit` see a consistent history across tool
-/// invocations within a single session.
+/// invocations within a single Pod run.
 ///
 /// `bash_output_dir` is where the Bash tool spills long outputs. The
 /// caller is responsible for adding that path to the readable scope

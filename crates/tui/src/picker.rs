@@ -62,11 +62,10 @@ impl From<session_store::StoreError> for PickerError {
 }
 
 pub enum PickerOutcome {
-    /// User picked a session; resume at its leaf segment.
-    Picked {
-        session_id: SessionId,
-        segment_id: SegmentId,
-    },
+    /// User picked a session; resume at its leaf segment. The pod-cli
+    /// rehydrates `session_id` via `Store::lookup_session_of` so we only
+    /// need to surface the segment here.
+    Picked { segment_id: SegmentId },
     Cancelled,
 }
 
@@ -134,10 +133,8 @@ pub async fn run() -> Result<PickerOutcome, PickerError> {
             }
             Some(Action::Submit) => {
                 close_viewport(&mut terminal)?;
-                let row = &rows[selected];
                 return Ok(PickerOutcome::Picked {
-                    session_id: row.session_id,
-                    segment_id: row.leaf_segment_id,
+                    segment_id: rows[selected].leaf_segment_id,
                 });
             }
             Some(Action::Cancel) => {
@@ -198,6 +195,11 @@ fn last_message_preview(entries: &[LogEntry]) -> Option<String> {
                 let text = protocol::Segment::flatten_to_text(segments);
                 if !text.is_empty() {
                     return Some(format!("user: {}", trim_one_line(&text, 60)));
+                }
+            }
+            LogEntry::AssistantItem { item, .. } => {
+                if let Some(text) = first_text_logged(item) {
+                    return Some(format!("assistant: {}", trim_one_line(&text, 60)));
                 }
             }
             LogEntry::AssistantItems { items, .. } => {

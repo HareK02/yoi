@@ -46,3 +46,9 @@
 - `tickets/live-fork-marker.md`
 - `tickets/pod-state-backend.md`
 - `crates/session-store/`
+
+## Review
+
+- 状態: Approve with follow-up
+- レビュー詳細: [./session-grouping-introduce.review.md](./session-grouping-introduce.review.md)
+- 日付: 2026-05-20

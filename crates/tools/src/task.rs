@@ -1,8 +1,9 @@
-//! Pod-lifetime TaskStore and builtin task tools.
+//! Session-lifetime TaskStore and builtin task tools.
 //!
-//! The store is Pod/session-lifetime state shared by the four Task* tools. It
-//! is reconstructed on resume by replaying TaskCreate / TaskUpdate tool-call
-//! arguments from persisted history.
+//! The store survives compaction and Pod restart — it is reconstructed
+//! on resume by replaying TaskCreate / TaskUpdate tool-call arguments
+//! from persisted history, so its effective lifetime is the
+//! [`session_store::SessionId`] (the conversation), not the Pod process.
 
 use std::sync::{Arc, Mutex};
 

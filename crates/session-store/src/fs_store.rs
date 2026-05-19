@@ -6,6 +6,14 @@
 //!
 //! The per-Session directory makes `list_segments(session_id)` an O(dir)
 //! scan and gives the fork tree a visible grouping in the filesystem.
+//!
+//! Migration: this layout is incompatible with the pre-`session-grouping`
+//! flat `{root}/{segment_id}.jsonl` form. Project policy is no
+//! backward compatibility — discard `~/.insomnia/sessions/` (or whatever
+//! `root` resolved to) before running the new code. `list_sessions`
+//! ignores top-level files outside session directories, so leftover
+//! flat files do not corrupt new sessions, but they are no longer
+//! enumerable by the picker.
 
 use crate::event_trace::TraceEntry;
 use crate::segment_log::LogEntry;
