@@ -64,7 +64,7 @@ impl UsageRecordSnapshot {
 pub struct UsageEvent {
     pub id: Uuid,
     pub occurred_at: DateTime<Utc>,
-    pub session_id: String,
+    pub segment_id: String,
     pub event: UsageEventKind,
     pub source: UsageSource,
     pub records: Vec<UsageRecordSnapshot>,
@@ -72,7 +72,7 @@ pub struct UsageEvent {
 
 impl UsageEvent {
     pub fn new(
-        session_id: impl Into<String>,
+        segment_id: impl Into<String>,
         event: UsageEventKind,
         source: UsageSource,
         records: Vec<UsageRecordSnapshot>,
@@ -80,7 +80,7 @@ impl UsageEvent {
         Self {
             id: Uuid::now_v7(),
             occurred_at: Utc::now(),
-            session_id: session_id.into(),
+            segment_id: segment_id.into(),
             event,
             source,
             records,
@@ -144,7 +144,7 @@ pub fn append_usage_event(layout: &WorkspaceLayout, event: &UsageEvent) -> io::R
 /// Convenience for a successful explicit record read.
 pub fn append_use_event(
     layout: &WorkspaceLayout,
-    session_id: impl Into<String>,
+    segment_id: impl Into<String>,
     source: UsageSource,
     records: Vec<UsageRecordSnapshot>,
 ) -> io::Result<()> {
@@ -153,14 +153,14 @@ pub fn append_use_event(
     }
     append_usage_event(
         layout,
-        &UsageEvent::new(session_id, UsageEventKind::Use, source, records),
+        &UsageEvent::new(segment_id, UsageEventKind::Use, source, records),
     )
 }
 
 /// Convenience for resident model-invocation exposure cost telemetry.
 pub fn append_resident_exposure_event(
     layout: &WorkspaceLayout,
-    session_id: impl Into<String>,
+    segment_id: impl Into<String>,
     records: Vec<UsageRecordSnapshot>,
 ) -> io::Result<()> {
     if records.is_empty() {
@@ -169,7 +169,7 @@ pub fn append_resident_exposure_event(
     append_usage_event(
         layout,
         &UsageEvent::new(
-            session_id,
+            segment_id,
             UsageEventKind::ResidentExposure,
             UsageSource::ResidentInjection,
             records,

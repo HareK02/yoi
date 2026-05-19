@@ -22,7 +22,7 @@ fn history_from_sink(handle: &PodHandle) -> Vec<Item> {
     let mut items = Vec::new();
     for entry in entries {
         match entry {
-            LogEntry::SessionStart { history, .. } => {
+            LogEntry::SegmentStart { history, .. } => {
                 items.extend(history.into_iter().map(Item::from));
             }
             LogEntry::UserInput { segments, .. } => {

@@ -1,15 +1,15 @@
 use llm_worker::WorkerResult;
 use llm_worker::llm_client::types::{Item, RequestConfig};
-use session_store::{FsStore, LogEntry, Store, TraceEntry, collect_state, new_session_id};
+use session_store::{FsStore, LogEntry, Store, TraceEntry, collect_state, new_segment_id};
 
 #[test]
 fn round_trip_write_and_read() {
     let dir = tempfile::tempdir().unwrap();
     let store = FsStore::new(dir.path()).unwrap();
-    let id = new_session_id();
+    let id = new_segment_id();
 
     let entries = vec![
-        LogEntry::SessionStart {
+        LogEntry::SegmentStart {
             ts: 1000,
             system_prompt: Some("You are helpful.".into()),
             config: RequestConfig::default().with_max_tokens(1024),
@@ -56,9 +56,9 @@ fn round_trip_write_and_read() {
 fn create_session_writes_all_entries() {
     let dir = tempfile::tempdir().unwrap();
     let store = FsStore::new(dir.path()).unwrap();
-    let id = new_session_id();
+    let id = new_segment_id();
 
-    let entries = [LogEntry::SessionStart {
+    let entries = [LogEntry::SegmentStart {
         ts: 1000,
         system_prompt: None,
         config: RequestConfig::default(),
@@ -70,7 +70,7 @@ fn create_session_writes_all_entries() {
         compacted_from: None,
     }];
 
-    store.create_session(id, &entries).unwrap();
+    store.create_segment(id, &entries).unwrap();
     let read_back = store.read_all(id).unwrap();
     assert_eq!(read_back.len(), 1);
 
@@ -83,12 +83,12 @@ fn list_sessions_returns_newest_first() {
     let dir = tempfile::tempdir().unwrap();
     let store = FsStore::new(dir.path()).unwrap();
 
-    let id1 = new_session_id();
+    let id1 = new_segment_id();
     // Small delay to ensure different UUID v7 timestamps
     std::thread::sleep(std::time::Duration::from_millis(2));
-    let id2 = new_session_id();
+    let id2 = new_segment_id();
 
-    let entry = LogEntry::SessionStart {
+    let entry = LogEntry::SegmentStart {
         ts: 1000,
         system_prompt: None,
         config: RequestConfig::default(),
@@ -100,7 +100,7 @@ fn list_sessions_returns_newest_first() {
     store.append(id1, &entry).unwrap();
     store.append(id2, &entry).unwrap();
 
-    let sessions = store.list_sessions().unwrap();
+    let sessions = store.list_segments().unwrap();
     assert_eq!(sessions.len(), 2);
     assert_eq!(sessions[0], id2); // newest first
     assert_eq!(sessions[1], id1);
@@ -110,14 +110,14 @@ fn list_sessions_returns_newest_first() {
 fn exists_returns_correct_state() {
     let dir = tempfile::tempdir().unwrap();
     let store = FsStore::new(dir.path()).unwrap();
-    let id = new_session_id();
+    let id = new_segment_id();
 
     assert!(!store.exists(id).unwrap());
 
     store
         .append(
             id,
-            &LogEntry::SessionStart {
+            &LogEntry::SegmentStart {
                 ts: 1000,
                 system_prompt: None,
                 config: RequestConfig::default(),
@@ -135,7 +135,7 @@ fn exists_returns_correct_state() {
 fn not_found_error_for_missing_session() {
     let dir = tempfile::tempdir().unwrap();
     let store = FsStore::new(dir.path()).unwrap();
-    let id = new_session_id();
+    let id = new_segment_id();
 
     let result = store.read_all(id);
     assert!(result.is_err());
@@ -145,12 +145,12 @@ fn not_found_error_for_missing_session() {
 fn trace_entries_in_separate_file() {
     let dir = tempfile::tempdir().unwrap();
     let store = FsStore::new(dir.path()).unwrap();
-    let id = new_session_id();
+    let id = new_segment_id();
 
     store
         .append(
             id,
-            &LogEntry::SessionStart {
+            &LogEntry::SegmentStart {
                 ts: 1000,
                 system_prompt: None,
                 config: RequestConfig::default(),
@@ -183,10 +183,10 @@ fn trace_entries_in_separate_file() {
 fn read_entry_count_matches_append_tally() {
     let dir = tempfile::tempdir().unwrap();
     let store = FsStore::new(dir.path()).unwrap();
-    let id = new_session_id();
+    let id = new_segment_id();
 
     let entries = [
-        LogEntry::SessionStart {
+        LogEntry::SegmentStart {
             ts: 1000,
             system_prompt: None,
             config: RequestConfig::default(),

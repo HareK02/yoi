@@ -10,11 +10,11 @@
 //! Atomicity contract:
 //!
 //! 1. Pod writes the entry to disk via the `Store`.
-//! 2. Pod calls [`SessionLogSink::publish`] which acquires the mirror
+//! 2. Pod calls [`SegmentLogSink::publish`] which acquires the mirror
 //!    mutex, pushes the entry, and fires `broadcast::send` — all under
 //!    the same critical section.
 //!
-//! [`SessionLogSink::subscribe_with_snapshot`] takes the same mutex,
+//! [`SegmentLogSink::subscribe_with_snapshot`] takes the same mutex,
 //! so the `(snapshot, receiver)` pair returned to a connecting client
 //! splits the entry sequence cleanly: every entry shows up in exactly
 //! one of `snapshot` or on `receiver`.
@@ -39,24 +39,24 @@ const BROADCAST_CAPACITY: usize = 256;
 /// for read-only `subscribe_with_snapshot` access and keeps one for
 /// its own write path.
 #[derive(Clone)]
-pub struct SessionLogSink {
+pub struct SegmentLogSink {
     inner: Arc<SinkInner>,
 }
 
 struct SinkInner {
     /// Full session log mirror in commit order. Reset on session swap
-    /// (compaction / fork) via [`SessionLogSink::reset_with_initial`].
+    /// (compaction / fork) via [`SegmentLogSink::reset_with_initial`].
     mirror: StdMutex<Vec<LogEntry>>,
     /// Broadcast channel for live entry updates. The same `Sender`
     /// survives session swaps so existing subscribers keep their
     /// receiver — they observe the swap as a freshly broadcast
-    /// `LogEntry::SessionStart` and reset their view accordingly.
+    /// `LogEntry::SegmentStart` and reset their view accordingly.
     broadcast_tx: broadcast::Sender<LogEntry>,
 }
 
-impl SessionLogSink {
+impl SegmentLogSink {
     /// Create a fresh sink with an empty mirror. Used before any entry
-    /// has been written (deferred SessionStart) or as a placeholder in
+    /// has been written (deferred SegmentStart) or as a placeholder in
     /// tests.
     pub fn new() -> Self {
         let (broadcast_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
@@ -89,7 +89,7 @@ impl SessionLogSink {
     ///
     /// Live broadcast fires only for entries that the streaming-event
     /// lane does not cover:
-    ///   - `LogEntry::SessionStart` → `Event::SessionRotated` on the wire.
+    ///   - `LogEntry::SegmentStart` → `Event::SegmentRotated` on the wire.
     ///   - `LogEntry::SystemItem`   → `Event::SystemItem`.
     ///   - `LogEntry::Invoke`       → `Event::InvokeStart`.
     /// Everything else (AssistantItem, ToolResult, UserInput, TurnEnd,
@@ -119,7 +119,7 @@ impl SessionLogSink {
     fn is_live_relevant(entry: &LogEntry) -> bool {
         matches!(
             entry,
-            LogEntry::SessionStart { .. }
+            LogEntry::SegmentStart { .. }
                 | LogEntry::SystemItem { .. }
                 | LogEntry::Invoke { .. }
         )
@@ -127,12 +127,12 @@ impl SessionLogSink {
 
     /// Atomically swap the mirror to `[initial]` and broadcast the new
     /// session-start entry. Used during compaction / fork: the new
-    /// `LogEntry::SessionStart` is the first entry of the replacement
+    /// `LogEntry::SegmentStart` is the first entry of the replacement
     /// session, and existing subscribers transition by replaying it
     /// like any other live entry.
     ///
     /// Existing snapshot prefixes seen by old subscribers stay valid
-    /// for the prior session; the new `SessionStart` on the broadcast
+    /// for the prior session; the new `SegmentStart` on the broadcast
     /// is the signal to reset their derived view.
     pub fn reset_with_initial(&self, initial: LogEntry) {
         let mut mirror = self
@@ -188,7 +188,7 @@ impl SessionLogSink {
     }
 }
 
-impl Default for SessionLogSink {
+impl Default for SegmentLogSink {
     fn default() -> Self {
         Self::new()
     }
@@ -198,10 +198,10 @@ impl Default for SessionLogSink {
 mod tests {
     use super::*;
     use llm_worker::llm_client::RequestConfig;
-    use session_store::session_log::now_millis;
+    use session_store::segment_log::now_millis;
 
     fn session_start() -> LogEntry {
-        LogEntry::SessionStart {
+        LogEntry::SegmentStart {
             ts: now_millis(),
             system_prompt: None,
             config: RequestConfig::default(),
@@ -220,13 +220,13 @@ mod tests {
 
     #[test]
     fn publish_then_subscribe_returns_history_in_snapshot() {
-        let sink = SessionLogSink::new();
+        let sink = SegmentLogSink::new();
         sink.publish(session_start());
         sink.publish(turn_end(1));
 
         let (snapshot, mut rx) = sink.subscribe_with_snapshot();
         assert_eq!(snapshot.len(), 2);
-        assert!(matches!(snapshot[0], LogEntry::SessionStart { .. }));
+        assert!(matches!(snapshot[0], LogEntry::SegmentStart { .. }));
         assert!(matches!(
             snapshot[1],
             LogEntry::TurnEnd { turn_count: 1, .. }
@@ -246,7 +246,7 @@ mod tests {
 
     #[test]
     fn subscribe_then_publish_delivers_only_live_relevant_entries() {
-        let sink = SessionLogSink::new();
+        let sink = SegmentLogSink::new();
         sink.publish(session_start());
 
         let (snapshot, mut rx) = sink.subscribe_with_snapshot();
@@ -270,7 +270,7 @@ mod tests {
 
     #[test]
     fn snapshot_and_live_never_overlap() {
-        let sink = SessionLogSink::new();
+        let sink = SegmentLogSink::new();
         sink.publish(session_start());
         let (snapshot, mut rx) = sink.subscribe_with_snapshot();
         sink.publish(notification_entry("post-snapshot"));
@@ -285,7 +285,7 @@ mod tests {
 
     #[test]
     fn reset_with_initial_clears_and_broadcasts() {
-        let sink = SessionLogSink::new();
+        let sink = SegmentLogSink::new();
         sink.publish(session_start());
         sink.publish(turn_end(1));
 
@@ -293,18 +293,18 @@ mod tests {
         sink.reset_with_initial(session_start());
 
         match rx.try_recv() {
-            Ok(LogEntry::SessionStart { .. }) => {}
-            other => panic!("expected SessionStart broadcast, got {other:?}"),
+            Ok(LogEntry::SegmentStart { .. }) => {}
+            other => panic!("expected SegmentStart broadcast, got {other:?}"),
         }
 
         let (post_snapshot, _) = sink.subscribe_with_snapshot();
         assert_eq!(post_snapshot.len(), 1);
-        assert!(matches!(post_snapshot[0], LogEntry::SessionStart { .. }));
+        assert!(matches!(post_snapshot[0], LogEntry::SegmentStart { .. }));
     }
 
     #[test]
     fn replace_silent_does_not_broadcast() {
-        let sink = SessionLogSink::new();
+        let sink = SegmentLogSink::new();
         sink.publish(session_start());
         let (_pre_snapshot, mut rx) = sink.subscribe_with_snapshot();
 
@@ -318,7 +318,7 @@ mod tests {
 
     #[test]
     fn with_initial_seeds_the_mirror() {
-        let sink = SessionLogSink::with_initial(vec![session_start(), turn_end(1)]);
+        let sink = SegmentLogSink::with_initial(vec![session_start(), turn_end(1)]);
         let (snapshot, _) = sink.subscribe_with_snapshot();
         assert_eq!(snapshot.len(), 2);
     }

@@ -26,7 +26,7 @@ use llm_worker::llm_client::event::{Event as LlmEvent, ResponseStatus, StatusEve
 use llm_worker::llm_client::{ClientError, LlmClient, Request};
 use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use session_metrics::{DOMAIN, Metric, metrics_from_extensions};
-use session_store::{FsStore, LogEntry, SessionId, Store, StoreError, TraceEntry};
+use session_store::{FsStore, LogEntry, SegmentId, Store, StoreError, TraceEntry};
 
 use pod::{Pod, PodManifest};
 
@@ -200,7 +200,7 @@ async fn prune_metrics_emit_skip_then_fire_with_post_request_join() {
         text_response_with_cache("done", 1234, 50),
     ]);
     let (mut pod, _store_tmp, _pwd_tmp) = make_pod(manifest_toml(1, 1), client, "big_tool").await;
-    let session_id = pod.session_id();
+    let segment_id = pod.segment_id();
     // Cloning the store handle to read the session log back after the
     // runs complete — the Pod retains its own copy.
     let store = pod.store().clone();
@@ -208,7 +208,7 @@ async fn prune_metrics_emit_skip_then_fire_with_post_request_join() {
     pod.run_text("first").await.unwrap();
     pod.run_text("second").await.unwrap();
 
-    let state = session_store::restore(&store, session_id).unwrap();
+    let state = session_store::restore(&store, segment_id).unwrap();
     let metrics = metrics_from_extensions(&state.extensions);
 
     // Run 1 has 2 LLM iterations (tool loop), each evaluates prune with
@@ -288,13 +288,13 @@ async fn prune_metrics_record_below_min_savings_skip() {
     ]);
     let (mut pod, _store_tmp, _pwd_tmp) =
         make_pod(manifest_toml(1, u64::MAX), client, "big_tool").await;
-    let session_id = pod.session_id();
+    let segment_id = pod.segment_id();
     let store = pod.store().clone();
 
     pod.run_text("first").await.unwrap();
     pod.run_text("second").await.unwrap();
 
-    let state = session_store::restore(&store, session_id).unwrap();
+    let state = session_store::restore(&store, segment_id).unwrap();
     let metrics = metrics_from_extensions(&state.extensions);
     let below = metrics
         .iter()
@@ -327,7 +327,7 @@ struct MetricFailingStore {
 }
 
 impl Store for MetricFailingStore {
-    fn append(&self, id: SessionId, entry: &LogEntry) -> Result<(), StoreError> {
+    fn append(&self, id: SegmentId, entry: &LogEntry) -> Result<(), StoreError> {
         if let LogEntry::Extension { domain, .. } = entry {
             if domain == DOMAIN {
                 return Err(StoreError::Io(std::io::Error::other("synthetic failure")));
@@ -335,22 +335,22 @@ impl Store for MetricFailingStore {
         }
         self.inner.append(id, entry)
     }
-    fn read_all(&self, id: SessionId) -> Result<Vec<LogEntry>, StoreError> {
+    fn read_all(&self, id: SegmentId) -> Result<Vec<LogEntry>, StoreError> {
         self.inner.read_all(id)
     }
-    fn list_sessions(&self) -> Result<Vec<SessionId>, StoreError> {
-        self.inner.list_sessions()
+    fn list_segments(&self) -> Result<Vec<SegmentId>, StoreError> {
+        self.inner.list_segments()
     }
-    fn create_session(&self, id: SessionId, entries: &[LogEntry]) -> Result<(), StoreError> {
-        self.inner.create_session(id, entries)
+    fn create_segment(&self, id: SegmentId, entries: &[LogEntry]) -> Result<(), StoreError> {
+        self.inner.create_segment(id, entries)
     }
-    fn exists(&self, id: SessionId) -> Result<bool, StoreError> {
+    fn exists(&self, id: SegmentId) -> Result<bool, StoreError> {
         self.inner.exists(id)
     }
-    fn read_entry_count(&self, id: SessionId) -> Result<usize, StoreError> {
+    fn read_entry_count(&self, id: SegmentId) -> Result<usize, StoreError> {
         self.inner.read_entry_count(id)
     }
-    fn append_trace(&self, id: SessionId, entry: &TraceEntry) -> Result<(), StoreError> {
+    fn append_trace(&self, id: SegmentId, entry: &TraceEntry) -> Result<(), StoreError> {
         self.inner.append_trace(id, entry)
     }
 }
@@ -386,12 +386,12 @@ async fn metric_write_failure_emits_warn_alert_and_does_not_abort_run() {
     let alerter = pod::Alerter::new(tx);
     pod.attach_alerter(alerter);
 
-    let session_id = pod.session_id();
+    let segment_id = pod.segment_id();
     // Run completes successfully despite metric failure.
     pod.run_text("hello").await.unwrap();
 
     // No metrics ended up in the log (writes were rejected).
-    let state = session_store::restore(&store, session_id).unwrap();
+    let state = session_store::restore(&store, segment_id).unwrap();
     let metrics = metrics_from_extensions(&state.extensions);
     assert!(metrics.is_empty(), "metrics must drop on write failure");
 
@@ -446,10 +446,10 @@ permission = "write"
     let mut pod = Pod::new(manifest, worker, store.clone(), pwd, scope)
         .await
         .unwrap();
-    let session_id = pod.session_id();
+    let segment_id = pod.segment_id();
     pod.run_text("hello").await.unwrap();
 
-    let state = session_store::restore(&store, session_id).unwrap();
+    let state = session_store::restore(&store, segment_id).unwrap();
     let metrics = metrics_from_extensions(&state.extensions);
     assert!(
         metrics.is_empty(),

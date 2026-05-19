@@ -51,7 +51,7 @@ pub(crate) struct ResponsesRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f32>,
     /// 会話単位の安定キー。ChatGPT backend (codex-oauth) は明示キーが
-    /// 無いとプロンプトキャッシュがほぼ効かない。pod 側は `SessionId`
+    /// 無いとプロンプトキャッシュがほぼ効かない。pod 側は `SegmentId`
     /// を渡す。`Request::cache_key` が `None` のときはキー自体を送らない。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_cache_key: Option<String>,

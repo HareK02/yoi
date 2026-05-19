@@ -4,7 +4,7 @@ use std::io;
 use std::path::PathBuf;
 
 use manifest::ScopeRule;
-use session_store::SessionId;
+use session_store::SegmentId;
 
 /// Errors raised by the mutating pod-registry operations.
 #[derive(Debug, thiserror::Error)]
@@ -27,11 +27,11 @@ pub enum ScopeLockError {
     #[error("pod `{0}` is not registered")]
     UnknownPod(String),
     #[error(
-        "session {session_id} is already held by pod `{pod_name}` at {}",
+        "session {segment_id} is already held by pod `{pod_name}` at {}",
         .socket.display()
     )]
     SessionConflict {
-        session_id: SessionId,
+        segment_id: SegmentId,
         pod_name: String,
         socket: PathBuf,
     },

@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 /// path / knowledge slug / workflow slug / etc.), plus a pre-rendered
 /// `body` (where applicable) that is the exact `role:system` text the
 /// LLM actually saw at commit time. `body` is denormalised so that
-/// session log replay reconstructs worker history byte-identical to
+/// segment log replay reconstructs worker history byte-identical to
 /// what was on the wire — even when prompt overrides (e.g. custom
 /// `notify_wrapper` template) re-shape the live rendering on a later
 /// resume.

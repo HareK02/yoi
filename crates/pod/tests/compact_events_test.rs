@@ -178,7 +178,7 @@ fn drain(rx: &mut broadcast::Receiver<Event>) -> Vec<Event> {
 }
 
 /// Collect every system-message text that the post-compaction
-/// `SessionStart.history` carries, by reading the sink mirror directly.
+/// `SegmentStart.history` carries, by reading the sink mirror directly.
 fn system_texts_in_sink_session_start(
     pod: &pod::Pod<
         impl llm_worker::llm_client::client::LlmClient + Clone + 'static,
@@ -187,7 +187,7 @@ fn system_texts_in_sink_session_start(
 ) -> Vec<String> {
     let (entries, _rx) = pod.sink().subscribe_with_snapshot();
     for entry in entries.into_iter().rev() {
-        if let session_store::LogEntry::SessionStart { history, .. } = entry {
+        if let session_store::LogEntry::SegmentStart { history, .. } = entry {
             return history
                 .into_iter()
                 .filter_map(|logged| {
@@ -229,7 +229,7 @@ async fn compact_emits_session_start_carrying_summary_and_task_snapshot() {
     pod.compact(10_000).await.unwrap();
 
     let system_texts = system_texts_in_sink_session_start(&pod);
-    // The post-compaction `SessionStart.history` carries the new system
+    // The post-compaction `SegmentStart.history` carries the new system
     // messages introduced by the compactor. Clients re-seed their view
     // from this entry alone, so it is the load-bearing payload.
     assert!(
@@ -289,11 +289,11 @@ async fn pre_run_compact_success_broadcasts_start_and_done() {
 
     // CompactDone carries the new session id.
     let new_id_in_event = events.iter().find_map(|e| match e {
-        Event::CompactDone { new_session_id } => Some(*new_session_id),
+        Event::CompactDone { new_segment_id } => Some(*new_segment_id),
         _ => None,
     });
     assert!(new_id_in_event.is_some(), "CompactDone missing");
-    assert_eq!(new_id_in_event.unwrap(), pod.session_id());
+    assert_eq!(new_id_in_event.unwrap(), pod.segment_id());
 }
 
 #[tokio::test]
@@ -345,10 +345,10 @@ async fn mid_turn_compact_success_broadcasts_start_and_done() {
     );
 
     let new_id_in_event = events.iter().find_map(|e| match e {
-        Event::CompactDone { new_session_id } => Some(*new_session_id),
+        Event::CompactDone { new_segment_id } => Some(*new_segment_id),
         _ => None,
     });
-    assert_eq!(new_id_in_event, Some(pod.session_id()));
+    assert_eq!(new_id_in_event, Some(pod.segment_id()));
 }
 
 /// Regression: `Pod::compact()` must reset the in-memory
@@ -520,7 +520,7 @@ async fn pre_run_compact_failure_broadcasts_start_and_failed() {
 // ---------------------------------------------------------------------------
 // Detached post-run memory jobs (`spawn_post_run_memory_jobs` /
 // `wait_for_memory_jobs`). Covers the detach round-trip and the structural
-// invariant that the cloned memory-task Pod shares `SessionState` with the
+// invariant that the cloned memory-task Pod shares `SegmentState` with the
 // source Pod, so that `save_extension` from the background extract does not
 // leave the next turn's `save_user_input` looking at a stale session pointer.
 
@@ -570,7 +570,7 @@ async fn spawn_and_wait_drives_extract_to_completion() {
 
 #[tokio::test]
 async fn detached_extract_does_not_fork_session_log() {
-    // Source pod and the cloned memory-task pod share `SessionState` via
+    // Source pod and the cloned memory-task pod share `SegmentState` via
     // `Arc<_>`. The detached extract advances the entry tally through
     // `save_extension`; the next `run` must see that same tally so
     // `ensure_head_or_fork` does not spawn a new session.
@@ -583,18 +583,18 @@ async fn detached_extract_does_not_fork_session_log() {
     let mut pod = make_pod_with_manifest(EXTRACT_NO_COMPACT_MANIFEST, client).await;
 
     pod.run_text("first").await.unwrap();
-    let session_before = pod.session_id();
+    let session_before = pod.segment_id();
 
     pod.spawn_post_run_memory_jobs();
     pod.wait_for_memory_jobs().await;
 
     pod.run_text("second").await.unwrap();
-    let session_after = pod.session_id();
+    let session_after = pod.segment_id();
 
     assert_eq!(
         session_before, session_after,
         "detached extract's save_extension and the next turn's save_user_input \
-         must share the entry tally through SessionState — a fork here means the \
+         must share the entry tally through SegmentState — a fork here means the \
          clone carried its own counter"
     );
 }

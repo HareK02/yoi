@@ -1019,10 +1019,10 @@ fn render_compact(lines: &mut Vec<Line<'static>>, evt: &CompactEvent, width: u16
             )
         }
         CompactEvent::Done {
-            new_session_id,
+            new_segment_id,
             elapsed_secs,
         } => {
-            let short = new_session_id
+            let short = new_segment_id
                 .to_string()
                 .chars()
                 .take(8)

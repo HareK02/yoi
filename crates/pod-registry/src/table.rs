@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use fs4::fs_std::FileExt;
 use manifest::{ScopeRule, paths};
 use serde::{Deserialize, Serialize};
-use session_store::SessionId;
+use session_store::SegmentId;
 
 /// On-disk representation of the allocation table.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -43,12 +43,12 @@ pub struct Allocation {
     /// Name of the Pod that delegated scope to this one, or `None` for
     /// a top-level Pod started directly by a human.
     pub delegated_from: Option<String>,
-    /// Session ID this Pod is currently writing to. `None` means this
+    /// Segment ID this Pod is currently writing to. `None` means this
     /// is a pre-reservation made by a spawner via [`crate::delegate_scope`]
     /// before the child has come up; the child fills it in at
     /// [`crate::adopt_allocation`] time.
     #[serde(default)]
-    pub session_id: Option<SessionId>,
+    pub segment_id: Option<SegmentId>,
 }
 
 impl LockFile {
@@ -60,12 +60,12 @@ impl LockFile {
         self.allocations.iter_mut().find(|a| a.pod_name == pod_name)
     }
 
-    /// Find the allocation currently writing to `session_id`. Skips
-    /// pre-reservations whose `session_id` is still `None`.
-    pub fn find_by_session(&self, session_id: SessionId) -> Option<&Allocation> {
+    /// Find the allocation currently writing to `segment_id`. Skips
+    /// pre-reservations whose `segment_id` is still `None`.
+    pub fn find_by_segment(&self, segment_id: SegmentId) -> Option<&Allocation> {
         self.allocations
             .iter()
-            .find(|a| a.session_id == Some(session_id))
+            .find(|a| a.segment_id == Some(segment_id))
     }
 }
 
@@ -225,8 +225,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("pods.json");
         let mut g = open_empty(&path);
-        // Pre-reservation: delegate_scope leaves session_id = None
-        // until adopt_allocation rewrites it. find_by_session must not
+        // Pre-reservation: delegate_scope leaves segment_id = None
+        // until adopt_allocation rewrites it. find_by_segment must not
         // match those placeholders, otherwise a freshly-spawning child
         // would shadow itself before it has even chosen a session.
         register_pod(
@@ -249,13 +249,13 @@ mod tests {
         .unwrap();
 
         let target_session = sid();
-        // The placeholder allocation has session_id = None and must
+        // The placeholder allocation has segment_id = None and must
         // not be returned for any lookup.
-        assert!(g.data().find_by_session(target_session).is_none());
+        assert!(g.data().find_by_segment(target_session).is_none());
 
         // After adopt-style rewrite, the same allocation is now found.
-        g.data_mut().find_mut("child").unwrap().session_id = Some(target_session);
-        let found = g.data().find_by_session(target_session).unwrap();
+        g.data_mut().find_mut("child").unwrap().segment_id = Some(target_session);
+        let found = g.data().find_by_segment(target_session).unwrap();
         assert_eq!(found.pod_name, "child");
     }
 }

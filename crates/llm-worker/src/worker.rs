@@ -213,7 +213,7 @@ pub struct Worker<C: LlmClient, S: WorkerState = Mutable> {
     cache_anchor: Option<usize>,
     /// Conversation-scoped cache key, set by higher layers. Plumbed into
     /// [`Request::cache_key`] at request build time. Pod 側では
-    /// `SessionId` を渡す。
+    /// `SegmentId` を渡す。
     cache_key: Option<String>,
     /// State marker
     _state: PhantomData<S>,

@@ -5,7 +5,7 @@ use std::process::ExitCode;
 use clap::Parser;
 use manifest::{PodManifest, paths};
 use pod::{Pod, PodController, PodFactory, PromptLoader};
-use session_store::{FsStore, SessionId};
+use session_store::{FsStore, SegmentId};
 
 const USER_MANIFEST_ENV: &str = "INSOMNIA_USER_MANIFEST";
 
@@ -53,7 +53,7 @@ struct Cli {
     /// Mutually exclusive with `--adopt` (spawned children always start
     /// fresh).
     #[arg(long, value_name = "UUID", conflicts_with = "adopt")]
-    session: Option<SessionId>,
+    session: Option<SegmentId>,
 }
 
 fn resolve_manifest(cli: &Cli) -> Result<(PodManifest, PromptLoader), String> {

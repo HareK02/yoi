@@ -182,16 +182,16 @@ async fn session_start_state_captures_rendered_prompt() {
         .unwrap();
     pod.run_text("hi").await.unwrap();
 
-    let entries = pod.store().read_all(pod.session_id()).unwrap();
+    let entries = pod.store().read_all(pod.segment_id()).unwrap();
     let first = entries.first().expect("at least one entry");
     match first {
-        LogEntry::SessionStart { system_prompt, .. } => {
+        LogEntry::SegmentStart { system_prompt, .. } => {
             let sp = system_prompt.as_deref().expect("system prompt set");
             assert!(sp.starts_with("hello cwd="));
             assert!(sp.contains(&pwd.display().to_string()));
             assert!(sp.contains("## Working boundaries"));
         }
-        other => panic!("expected SessionStart as first entry, got {other:?}"),
+        other => panic!("expected SegmentStart as first entry, got {other:?}"),
     }
 }
 

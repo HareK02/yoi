@@ -78,7 +78,7 @@ pub struct RequestEntry {
 
 /// staging に書き出される 1 ファイル分のレコード。
 ///
-/// `source` は Pod 側ラッパーが session_id と log entry range を
+/// `source` は Pod 側ラッパーが segment_id と log entry range を
 /// 機械付与する。LLM はこのフィールドを見ない / 推論しない。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StagingRecord {

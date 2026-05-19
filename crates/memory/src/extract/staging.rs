@@ -71,7 +71,7 @@ mod tests {
         let layout = WorkspaceLayout::new(tmp.path().to_path_buf());
 
         let source = SourceRef {
-            session_id: "sess-1".into(),
+            segment_id: "sess-1".into(),
             range: [3, 7],
         };
         let payload = ExtractedPayload {
@@ -93,7 +93,7 @@ mod tests {
 
         let written: StagingRecord =
             serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(written.source.session_id, "sess-1");
+        assert_eq!(written.source.segment_id, "sess-1");
         assert_eq!(written.source.range, [3, 7]);
         assert_eq!(written.payload.decisions.len(), 1);
     }
@@ -103,7 +103,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let layout = WorkspaceLayout::new(tmp.path().to_path_buf());
         let source = SourceRef {
-            session_id: "sess".into(),
+            segment_id: "sess".into(),
             range: [0, 0],
         };
         let (_, path) = write_staging(&layout, source, ExtractedPayload::default()).unwrap();

@@ -105,10 +105,10 @@ async fn handle_connection(stream: tokio::net::UnixStream, handle: PodHandle) {
                 match entry {
                     Ok(entry) => {
                         let outbound = match entry {
-                            session_store::LogEntry::SessionStart { .. } => {
+                            session_store::LogEntry::SegmentStart { .. } => {
                                 let value = serde_json::to_value(&entry)
                                     .expect("LogEntry is Serialize");
-                                Some(Event::SessionRotated { entry: value })
+                                Some(Event::SegmentRotated { entry: value })
                             }
                             session_store::LogEntry::SystemItem { item, .. } => {
                                 let value = serde_json::to_value(&item)
@@ -119,7 +119,7 @@ async fn handle_connection(stream: tokio::net::UnixStream, handle: PodHandle) {
                                 Some(Event::InvokeStart { kind: trigger })
                             }
                             other => {
-                                // `SessionLogSink::is_live_relevant` keeps
+                                // `SegmentLogSink::is_live_relevant` keeps
                                 // non-live-relevant variants off the
                                 // broadcast lane; reaching here means the
                                 // two are out of sync and we silently

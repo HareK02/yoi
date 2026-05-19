@@ -243,7 +243,7 @@ mod tests {
         let (_id, _) = write_staging(
             &layout,
             SourceRef {
-                session_id: "s".into(),
+                segment_id: "s".into(),
                 range: [0, 1],
             },
             ExtractedPayload::default(),

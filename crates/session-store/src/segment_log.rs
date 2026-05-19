@@ -1,12 +1,13 @@
-//! Session log types for append-only JSONL persistence.
+//! Segment log types for append-only JSONL persistence.
 //!
-//! Each [`LogEntry`] represents a single state transition in a session,
-//! serialized as one line in a `.jsonl` file. Reading all entries and
-//! collecting them via [`collect_state`] reconstructs the full [`Worker`] state.
+//! Each [`LogEntry`] represents a single state transition within one
+//! segment, serialized as one line in a `.jsonl` file. Reading all
+//! entries and collecting them via [`collect_state`] reconstructs the
+//! full [`Worker`] state at that segment.
 //!
 //! The on-disk format is one `LogEntry` per line — entries are positionally
 //! ordered. Fork lineage references between segments use turn-number indices
-//! (`SessionOrigin.at_turn_index`) rather than per-entry hashes.
+//! (`SegmentOrigin.at_turn_index`) rather than per-entry hashes.
 
 use llm_worker::llm_client::types::{Item, RequestConfig};
 use llm_worker::{UsageRecord, WorkerResult};
@@ -16,10 +17,10 @@ use serde::{Deserialize, Serialize};
 use crate::logged_item::LoggedItem;
 use crate::system_item::SystemItem;
 
-/// A single session log entry, serialized as one JSONL line.
+/// A single segment log entry, serialized as one JSONL line.
 ///
 /// Variants correspond to specific mutation points in `Worker`:
-/// - `SessionStart` — always the first entry; captures initial state
+/// - `SegmentStart` — always the first entry; captures initial state
 /// - `Invoke` — IDLE → active marker (start of a new self-driving cycle)
 /// - `UserInput` / `AssistantItems` / `ToolResults` / `HookInjectedItems` — history appends
 /// - `TurnEnd` — AgentTurn boundary marker; carries the post-increment
@@ -32,19 +33,19 @@ use crate::system_item::SystemItem;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum LogEntry {
-    /// Session start. Always the first entry in a log.
-    /// For forked sessions, `history` contains the seed state from the parent.
-    SessionStart {
+    /// Segment start. Always the first entry in a segment log.
+    /// For forked segments, `history` contains the seed state from the parent.
+    SegmentStart {
         ts: u64,
         system_prompt: Option<String>,
         config: RequestConfig,
         history: Vec<LoggedItem>,
-        /// Origin: forked from another session at a specific turn boundary.
+        /// Origin: forked from another segment at a specific turn boundary.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        forked_from: Option<SessionOrigin>,
-        /// Origin: compacted from another session at a specific turn boundary.
+        forked_from: Option<SegmentOrigin>,
+        /// Origin: compacted from another segment at a specific turn boundary.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        compacted_from: Option<SessionOrigin>,
+        compacted_from: Option<SegmentOrigin>,
     },
 
     /// IDLE → active marker. Records the start of a new self-driving
@@ -66,7 +67,7 @@ pub enum LogEntry {
 
     /// User input accepted at submit time. Carries the original typed
     /// `Vec<Segment>` so clients can re-render typed atoms (paste chips,
-    /// file/knowledge refs, workflow invocations) on session restore.
+    /// file/knowledge refs, workflow invocations) on segment restore.
     /// Replay flattens these into a `Item::user_message` for the worker
     /// history; the worker layer never sees segments directly.
     UserInput { ts: u64, segments: Vec<Segment> },
@@ -87,7 +88,7 @@ pub enum LogEntry {
     /// dispatch on `kind` for typed rendering.
     SystemItem { ts: u64, item: SystemItem },
 
-    /// Legacy plural form: kept **read-only** so old session logs still
+    /// Legacy plural form: kept **read-only** so old segment logs still
     /// open. New writes always use the singular `AssistantItem`. Items
     /// are flattened on replay.
     AssistantItems { ts: u64, items: Vec<LoggedItem> },
@@ -169,10 +170,10 @@ pub enum LogEntry {
 /// `at_turn_index` is the `turn_count` value of the most recent
 /// `TurnEnd` entry preceding the split point in the source segment.
 /// A value of `0` means the split happened before any turn completed
-/// (e.g. immediately after `SessionStart`).
+/// (e.g. immediately after `SegmentStart`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SessionOrigin {
-    pub session_id: crate::SessionId,
+pub struct SegmentOrigin {
+    pub segment_id: crate::SegmentId,
     pub at_turn_index: usize,
 }
 
@@ -194,7 +195,7 @@ pub struct RestoredState {
     pub history: Vec<Item>,
     pub turn_count: usize,
     pub last_run_interrupted: bool,
-    /// Number of entries replayed. `0` means the session log was empty.
+    /// Number of entries replayed. `0` means the segment log was empty.
     /// Writers track their own append count via the same counter so
     /// `ensure_head_or_fork` can compare it with the on-disk count.
     pub entries_count: usize,
@@ -206,14 +207,14 @@ pub struct RestoredState {
     /// session-store は domain を不透明扱いし、各ドメインが自前で fold する。
     pub extensions: Vec<(String, serde_json::Value)>,
     /// Latest runtime scope snapshot persisted by the Pod. `None` means
-    /// the session predates scope persistence or the payload was corrupt.
+    /// the segment predates scope persistence or the payload was corrupt.
     pub pod_scope: Option<PodScopeSnapshot>,
     /// User submissions in original typed form, in submit order.
     /// One entry per `LogEntry::UserInput`; the K-th entry corresponds to
     /// the K-th `Item::user_message` derived during replay (modulo
-    /// pre-compaction history seeded via `SessionStart.history`, whose
+    /// pre-compaction history seeded via `SegmentStart.history`, whose
     /// original segments are not preserved). Used by clients to re-render
-    /// typed atoms (paste chips, refs) on session restore.
+    /// typed atoms (paste chips, refs) on segment restore.
     pub user_segments: Vec<Vec<Segment>>,
 }
 
@@ -236,7 +237,7 @@ pub fn collect_state(entries: &[LogEntry]) -> RestoredState {
         state.entries_count += 1;
 
         match entry {
-            LogEntry::SessionStart {
+            LogEntry::SegmentStart {
                 system_prompt,
                 config,
                 history,
@@ -316,7 +317,7 @@ pub fn collect_state(entries: &[LogEntry]) -> RestoredState {
                         Err(err) => {
                             tracing::warn!(
                                 error = %err,
-                                "discarding malformed pod.scope snapshot from session log"
+                                "discarding malformed pod.scope snapshot from segment log"
                             );
                         }
                     }
@@ -350,8 +351,8 @@ mod tests {
     }
 
     #[test]
-    fn replay_session_start_sets_initial_state() {
-        let state = collect_state(&[LogEntry::SessionStart {
+    fn replay_segment_start_sets_initial_state() {
+        let state = collect_state(&[LogEntry::SegmentStart {
             ts: 1000,
             system_prompt: Some("You are helpful.".into()),
             config: RequestConfig::default().with_max_tokens(1024),
@@ -368,7 +369,7 @@ mod tests {
     #[test]
     fn replay_full_turn() {
         let state = collect_state(&[
-            LogEntry::SessionStart {
+            LogEntry::SegmentStart {
                 ts: 1000,
                 system_prompt: None,
                 config: RequestConfig::default(),
@@ -402,7 +403,7 @@ mod tests {
     #[test]
     fn replay_with_tool_calls() {
         let state = collect_state(&[
-            LogEntry::SessionStart {
+            LogEntry::SegmentStart {
                 ts: 1000,
                 system_prompt: None,
                 config: RequestConfig::default(),
@@ -439,7 +440,7 @@ mod tests {
     #[test]
     fn replay_config_changed() {
         let state = collect_state(&[
-            LogEntry::SessionStart {
+            LogEntry::SegmentStart {
                 ts: 1000,
                 system_prompt: None,
                 config: RequestConfig::default(),
@@ -458,7 +459,7 @@ mod tests {
     #[test]
     fn replay_llm_usage_appends_to_usage_history() {
         let state = collect_state(&[
-            LogEntry::SessionStart {
+            LogEntry::SegmentStart {
                 ts: 1000,
                 system_prompt: None,
                 config: RequestConfig::default(),
@@ -504,7 +505,7 @@ mod tests {
     #[test]
     fn replay_without_llm_usage_keeps_usage_history_empty() {
         let state = collect_state(&[
-            LogEntry::SessionStart {
+            LogEntry::SegmentStart {
                 ts: 1000,
                 system_prompt: None,
                 config: RequestConfig::default(),
@@ -575,7 +576,7 @@ mod tests {
     #[test]
     fn replay_invoke_marker_does_not_mutate_state() {
         let state = collect_state(&[
-            LogEntry::SessionStart {
+            LogEntry::SegmentStart {
                 ts: 0,
                 system_prompt: None,
                 config: RequestConfig::default(),
@@ -607,7 +608,7 @@ mod tests {
     #[test]
     fn replay_extension_collects_domain_payload_pairs() {
         let state = collect_state(&[
-            LogEntry::SessionStart {
+            LogEntry::SegmentStart {
                 ts: 1000,
                 system_prompt: None,
                 config: RequestConfig::default(),
@@ -690,7 +691,7 @@ mod tests {
         let json = serde_json::to_string(&entry).unwrap();
         let parsed: LogEntry = serde_json::from_str(&json).unwrap();
         let state = collect_state(&[
-            LogEntry::SessionStart {
+            LogEntry::SegmentStart {
                 ts: 1,
                 system_prompt: None,
                 config: RequestConfig::default(),

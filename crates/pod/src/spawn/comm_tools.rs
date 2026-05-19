@@ -430,13 +430,13 @@ fn extract_assistant_text(entries: &[serde_json::Value]) -> String {
     for value in entries {
         // The wire payload is the JSON form of `session_store::LogEntry`.
         // Walk Assistant items inside each entry that can carry them:
-        // post-compaction `SessionStart.history` (seed) and per-LLM-call
+        // post-compaction `SegmentStart.history` (seed) and per-LLM-call
         // `AssistantItems` deltas.
         let Ok(entry) = serde_json::from_value::<LogEntry>(value.clone()) else {
             continue;
         };
         let logged_items = match entry {
-            LogEntry::SessionStart { history, .. } => history,
+            LogEntry::SegmentStart { history, .. } => history,
             LogEntry::AssistantItems { items, .. } => items,
             _ => continue,
         };

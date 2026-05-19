@@ -73,7 +73,7 @@ async fn setup_spawner(
             permission: Permission::Write,
             recursive: true,
         }],
-        session_store::new_session_id(),
+        session_store::new_segment_id(),
     )
     .unwrap();
     // Leak the guard — the spawner allocation needs to outlive the

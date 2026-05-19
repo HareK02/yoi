@@ -1,12 +1,12 @@
 //! Filesystem-backed JSONL store.
 //!
 //! Layout:
-//! - Session log: `{root}/{session_id}.jsonl`
-//! - Event trace: `{root}/{session_id}.trace.jsonl`
+//! - Segment log: `{root}/{segment_id}.jsonl`
+//! - Event trace: `{root}/{segment_id}.trace.jsonl`
 
-use crate::SessionId;
+use crate::SegmentId;
 use crate::event_trace::TraceEntry;
-use crate::session_log::LogEntry;
+use crate::segment_log::LogEntry;
 use crate::store::{Store, StoreError};
 use std::fs;
 use std::io::Write;
@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 /// Filesystem-backed JSONL store.
 ///
-/// Each session is stored as a single `.jsonl` file with one [`LogEntry`]
+/// Each segment is stored as a single `.jsonl` file with one [`LogEntry`]
 /// per line. Writes use append mode for crash safety.
 #[derive(Clone)]
 pub struct FsStore {
@@ -30,11 +30,11 @@ impl FsStore {
         Ok(Self { root })
     }
 
-    fn log_path(&self, id: SessionId) -> PathBuf {
+    fn log_path(&self, id: SegmentId) -> PathBuf {
         self.root.join(format!("{id}.jsonl"))
     }
 
-    fn trace_path(&self, id: SessionId) -> PathBuf {
+    fn trace_path(&self, id: SegmentId) -> PathBuf {
         self.root.join(format!("{id}.trace.jsonl"))
     }
 
@@ -65,12 +65,12 @@ impl FsStore {
 }
 
 impl Store for FsStore {
-    fn append(&self, id: SessionId, entry: &LogEntry) -> Result<(), StoreError> {
+    fn append(&self, id: SegmentId, entry: &LogEntry) -> Result<(), StoreError> {
         let line = serde_json::to_string(entry)?;
         self.append_line(&self.log_path(id), &line)
     }
 
-    fn read_all(&self, id: SessionId) -> Result<Vec<LogEntry>, StoreError> {
+    fn read_all(&self, id: SegmentId) -> Result<Vec<LogEntry>, StoreError> {
         let path = self.log_path(id);
         if !path.exists() {
             return Err(StoreError::NotFound(id));
@@ -79,7 +79,7 @@ impl Store for FsStore {
         Self::parse_jsonl(&content)
     }
 
-    fn list_sessions(&self) -> Result<Vec<SessionId>, StoreError> {
+    fn list_segments(&self) -> Result<Vec<SegmentId>, StoreError> {
         let mut sessions = Vec::new();
         for entry in fs::read_dir(&self.root)? {
             let entry = entry?;
@@ -88,7 +88,7 @@ impl Store for FsStore {
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             if name.ends_with(".jsonl") && !name.ends_with(".trace.jsonl") {
                 let stem = name.trim_end_matches(".jsonl");
-                if let Ok(id) = stem.parse::<SessionId>() {
+                if let Ok(id) = stem.parse::<SegmentId>() {
                     sessions.push(id);
                 }
             }
@@ -98,7 +98,7 @@ impl Store for FsStore {
         Ok(sessions)
     }
 
-    fn create_session(&self, id: SessionId, entries: &[LogEntry]) -> Result<(), StoreError> {
+    fn create_segment(&self, id: SegmentId, entries: &[LogEntry]) -> Result<(), StoreError> {
         let path = self.log_path(id);
         let mut content = String::new();
         for entry in entries {
@@ -109,11 +109,11 @@ impl Store for FsStore {
         Ok(())
     }
 
-    fn exists(&self, id: SessionId) -> Result<bool, StoreError> {
+    fn exists(&self, id: SegmentId) -> Result<bool, StoreError> {
         Ok(self.log_path(id).exists())
     }
 
-    fn read_entry_count(&self, id: SessionId) -> Result<usize, StoreError> {
+    fn read_entry_count(&self, id: SegmentId) -> Result<usize, StoreError> {
         let path = self.log_path(id);
         if !path.exists() {
             return Err(StoreError::NotFound(id));
@@ -122,7 +122,7 @@ impl Store for FsStore {
         Ok(content.lines().filter(|l| !l.trim().is_empty()).count())
     }
 
-    fn append_trace(&self, id: SessionId, entry: &TraceEntry) -> Result<(), StoreError> {
+    fn append_trace(&self, id: SegmentId, entry: &TraceEntry) -> Result<(), StoreError> {
         let line = serde_json::to_string(entry)?;
         self.append_line(&self.trace_path(id), &line)
     }
