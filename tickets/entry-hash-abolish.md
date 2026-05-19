@@ -40,3 +40,9 @@ write 経路は既に sync 化済み (`6e5b148`)。前提足場は揃ってい�
 - `crates/session-store/src/session.rs`
 - `crates/pod/src/pod.rs:1591` `ensure_head_or_fork` 経路
 - `tickets/segment-rename.md` (後続)
+
+## Review
+
+- 状態: Approve
+- レビュー詳細: [./entry-hash-abolish.review.md](./entry-hash-abolish.review.md)
+- 日付: 2026-05-20
