@@ -38,3 +38,10 @@ live auto-fork（concurrent writer 検知）と過去 fork（UI から turn 選�
 - `tickets/entry-hash-abolish.md` (前提)
 - `tickets/session-grouping-introduce.md` (前提、Session 単位の lineage と整合)
 - `tickets/pod-session-fork.md`
+
+## Review
+
+- 状態: Approve（完了可）
+- レビュー詳細: [./live-fork-marker.review.md](./live-fork-marker.review.md)
+- 日付: 2026-05-20
+- フォローアップ: auto-fork ロジックの二重実装（`ensure_head_or_fork` free fn と `Pod::ensure_segment_head` inline）の一本化、または KNOWN_ISSUES 登録を推奨（本チケット範囲外・両経路テスト済み）。
