@@ -5,7 +5,7 @@ use std::process::ExitCode;
 use clap::Parser;
 use manifest::{PodManifest, paths};
 use pod::{Pod, PodController, PodFactory, PromptLoader};
-use session_store::{FsStore, SegmentId};
+use session_store::{FsStore, SegmentId, Store};
 
 const USER_MANIFEST_ENV: &str = "INSOMNIA_USER_MANIFEST";
 
@@ -186,7 +186,28 @@ async fn main() -> ExitCode {
             }
         }
     } else if let Some(source_segment_id) = cli.session {
-        match Pod::restore_from_manifest(source_segment_id, manifest, store, loader).await {
+        let source_session_id = match store.lookup_session_of(source_segment_id) {
+            Ok(Some(sid)) => sid,
+            Ok(None) => {
+                eprintln!(
+                    "error: --session {source_segment_id}: segment is not registered to any session"
+                );
+                return ExitCode::FAILURE;
+            }
+            Err(e) => {
+                eprintln!("error: lookup_session_of failed: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        match Pod::restore_from_manifest(
+            source_session_id,
+            source_segment_id,
+            manifest,
+            store,
+            loader,
+        )
+        .await
+        {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("error: failed to restore pod: {e}");

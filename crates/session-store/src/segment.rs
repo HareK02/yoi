@@ -4,7 +4,7 @@
 //! The caller (typically Pod) holds the Worker directly and calls these
 //! functions after state-mutating operations.
 
-use crate::SegmentId;
+use crate::{SegmentId, SessionId};
 use crate::logged_item::{LoggedItem, to_logged};
 use crate::segment_log::{self, LogEntry, PodScopeSnapshot, SegmentOrigin};
 use crate::store::{Store, StoreError};
@@ -21,38 +21,43 @@ pub struct SegmentStartState<'a> {
     pub history: &'a [Item],
 }
 
-/// Create a new segment, writing the initial `SegmentStart` entry.
+/// Create a new session + initial segment, writing the initial
+/// `SegmentStart` entry. Returns the freshly minted `(session_id, segment_id)`.
 pub fn create_segment(
     store: &impl Store,
     state: SegmentStartState<'_>,
-) -> Result<SegmentId, StoreError> {
+) -> Result<(SessionId, SegmentId), StoreError> {
+    let session_id = crate::new_session_id();
     let segment_id = crate::new_segment_id();
-    create_segment_with_id(store, segment_id, state)?;
-    Ok(segment_id)
+    create_segment_with_ids(store, session_id, segment_id, state)?;
+    Ok((session_id, segment_id))
 }
 
-/// Write a fresh `SegmentStart` entry using a pre-generated segment ID.
+/// Write a fresh `SegmentStart` entry using pre-generated IDs.
 ///
-/// Used by callers that need to reserve a segment ID synchronously but
-/// defer the initial log append (e.g. Pod, which resolves a templated
-/// system prompt only at first turn).
-pub fn create_segment_with_id(
+/// Used by callers that need to reserve `(session_id, segment_id)`
+/// synchronously but defer the initial log append (e.g. Pod, which
+/// resolves a templated system prompt only at first turn).
+pub fn create_segment_with_ids(
     store: &impl Store,
+    session_id: SessionId,
     segment_id: SegmentId,
     state: SegmentStartState<'_>,
 ) -> Result<(), StoreError> {
     let entry = LogEntry::SegmentStart {
         ts: segment_log::now_millis(),
+        session_id,
         system_prompt: state.system_prompt.map(String::from),
         config: state.config.clone(),
         history: to_logged(state.history),
         forked_from: None,
         compacted_from: None,
     };
-    store.append(segment_id, &entry)
+    store.append(session_id, segment_id, &entry)
 }
 
-/// Create a compacted segment from an existing one.
+/// Create a compacted segment from an existing one. Inherits the source's
+/// `session_id` so the compacted lineage stays within the same Session.
 ///
 /// Records `compacted_from` provenance linking back to the source segment
 /// at the turn boundary captured by `source_turn_count` (the most recent
@@ -60,12 +65,14 @@ pub fn create_segment_with_id(
 pub fn create_compacted_segment(
     store: &impl Store,
     state: SegmentStartState<'_>,
+    source_session_id: SessionId,
     source_segment_id: SegmentId,
     source_turn_count: usize,
 ) -> Result<SegmentId, StoreError> {
     let segment_id = crate::new_segment_id();
     let entry = LogEntry::SegmentStart {
         ts: segment_log::now_millis(),
+        session_id: source_session_id,
         system_prompt: state.system_prompt.map(String::from),
         config: state.config.clone(),
         history: to_logged(state.history),
@@ -75,7 +82,7 @@ pub fn create_compacted_segment(
             at_turn_index: source_turn_count,
         }),
     };
-    store.append(segment_id, &entry)?;
+    store.append(source_session_id, segment_id, &entry)?;
     Ok(segment_id)
 }
 
@@ -85,36 +92,54 @@ pub fn create_compacted_segment(
 /// applying it to a Worker.
 pub fn restore(
     store: &impl Store,
+    session_id: SessionId,
     segment_id: SegmentId,
 ) -> Result<crate::segment_log::RestoredState, StoreError> {
-    let entries = store.read_all(segment_id)?;
+    let entries = store.read_all(session_id, segment_id)?;
     Ok(segment_log::collect_state(&entries))
 }
 
+/// Restore segment state when only the segment ID is known. Uses
+/// [`Store::lookup_session_of`] to resolve the parent Session.
+///
+/// Shim for legacy entry points (`pod-cli --session <UUID>` etc.) that
+/// receive a Segment ID without a Session ID.
+pub fn restore_by_segment(
+    store: &impl Store,
+    segment_id: SegmentId,
+) -> Result<crate::segment_log::RestoredState, StoreError> {
+    let session_id = store
+        .lookup_session_of(segment_id)?
+        .ok_or(StoreError::NotFound(segment_id))?;
+    restore(store, session_id, segment_id)
+}
+
 /// Check if the store's entry count still matches the writer's tally.
-/// If not, auto-fork into a new segment.
+/// If not, auto-fork into a new segment within the same Session.
 ///
 /// Updates `segment_id` and `entries_written` in place when a fork occurs.
 pub fn ensure_head_or_fork(
     store: &impl Store,
+    session_id: SessionId,
     segment_id: &mut SegmentId,
     entries_written: &mut usize,
     state: SegmentStartState<'_>,
 ) -> Result<(), StoreError> {
-    let store_count = store.read_entry_count(*segment_id)?;
+    let store_count = store.read_entry_count(session_id, *segment_id)?;
     if store_count == *entries_written {
         return Ok(());
     }
     let fork_id = crate::new_segment_id();
     let entry = LogEntry::SegmentStart {
         ts: segment_log::now_millis(),
+        session_id,
         system_prompt: state.system_prompt.map(String::from),
         config: state.config.clone(),
         history: to_logged(state.history),
         forked_from: None,
         compacted_from: None,
     };
-    store.create_segment(fork_id, &[entry])?;
+    store.create_segment(session_id, fork_id, &[entry])?;
     *segment_id = fork_id;
     *entries_written = 1;
     Ok(())
@@ -128,11 +153,13 @@ pub fn ensure_head_or_fork(
 /// [`Segment::flatten_to_text`].
 pub fn save_user_input(
     store: &impl Store,
+    session_id: SessionId,
     segment_id: SegmentId,
     segments: Vec<Segment>,
 ) -> Result<(), StoreError> {
     append_entry(
         store,
+        session_id,
         segment_id,
         LogEntry::UserInput {
             ts: segment_log::now_millis(),
@@ -151,6 +178,7 @@ pub fn save_user_input(
 /// `UserInput` entry.
 pub fn save_delta(
     store: &impl Store,
+    session_id: SessionId,
     segment_id: SegmentId,
     new_items: &[Item],
 ) -> Result<(), StoreError> {
@@ -165,7 +193,7 @@ pub fn save_delta(
             continue;
         }
         let entry = classify_history_item(item, ts);
-        append_entry(store, segment_id, entry)?;
+        append_entry(store, session_id, segment_id, entry)?;
     }
     Ok(())
 }
@@ -199,11 +227,13 @@ pub fn classify_history_item(item: &Item, ts: u64) -> LogEntry {
 /// commit shape used for assistant / tool result entries.
 pub fn append_system_item(
     store: &impl Store,
+    session_id: SessionId,
     segment_id: SegmentId,
     item: SystemItem,
 ) -> Result<(), StoreError> {
     append_entry(
         store,
+        session_id,
         segment_id,
         LogEntry::SystemItem {
             ts: segment_log::now_millis(),
@@ -215,11 +245,13 @@ pub fn append_system_item(
 /// Log a TurnEnd entry.
 pub fn save_turn_end(
     store: &impl Store,
+    session_id: SessionId,
     segment_id: SegmentId,
     turn_count: usize,
 ) -> Result<(), StoreError> {
     append_entry(
         store,
+        session_id,
         segment_id,
         LogEntry::TurnEnd {
             ts: segment_log::now_millis(),
@@ -231,12 +263,14 @@ pub fn save_turn_end(
 /// Log a `RunCompleted` entry — `run()` / `resume()` returned `Ok(WorkerResult)`.
 pub fn save_run_completed(
     store: &impl Store,
+    session_id: SessionId,
     segment_id: SegmentId,
     result: WorkerResult,
     interrupted: bool,
 ) -> Result<(), StoreError> {
     append_entry(
         store,
+        session_id,
         segment_id,
         LogEntry::RunCompleted {
             ts: segment_log::now_millis(),
@@ -252,12 +286,14 @@ pub fn save_run_completed(
 /// `to_string()` rendering as `message`.
 pub fn save_run_errored(
     store: &impl Store,
+    session_id: SessionId,
     segment_id: SegmentId,
     message: String,
     interrupted: bool,
 ) -> Result<(), StoreError> {
     append_entry(
         store,
+        session_id,
         segment_id,
         LogEntry::RunErrored {
             ts: segment_log::now_millis(),
@@ -275,6 +311,7 @@ pub fn save_run_errored(
 /// 済ませた値を渡す。
 pub fn save_usage(
     store: &impl Store,
+    session_id: SessionId,
     segment_id: SegmentId,
     history_len: usize,
     input_total_tokens: u64,
@@ -284,6 +321,7 @@ pub fn save_usage(
 ) -> Result<(), StoreError> {
     append_entry(
         store,
+        session_id,
         segment_id,
         LogEntry::LlmUsage {
             ts: segment_log::now_millis(),
@@ -303,12 +341,14 @@ pub fn save_usage(
 /// Use `RestoredState.extensions` to read entries back at restore time.
 pub fn save_extension(
     store: &impl Store,
+    session_id: SessionId,
     segment_id: SegmentId,
     domain: impl Into<String>,
     payload: serde_json::Value,
 ) -> Result<(), StoreError> {
     append_entry(
         store,
+        session_id,
         segment_id,
         LogEntry::Extension {
             ts: segment_log::now_millis(),
@@ -321,12 +361,14 @@ pub fn save_extension(
 /// Log the Pod's latest runtime scope snapshot.
 pub fn save_pod_scope(
     store: &impl Store,
+    session_id: SessionId,
     segment_id: SegmentId,
     snapshot: &PodScopeSnapshot,
 ) -> Result<(), StoreError> {
     let payload = serde_json::to_value(snapshot)?;
     save_extension(
         store,
+        session_id,
         segment_id,
         segment_log::POD_SCOPE_EXTENSION_DOMAIN,
         payload,
@@ -336,11 +378,13 @@ pub fn save_pod_scope(
 /// Log a `ConfigChanged` entry.
 pub fn save_config_changed(
     store: &impl Store,
+    session_id: SessionId,
     segment_id: SegmentId,
     config: &RequestConfig,
 ) -> Result<(), StoreError> {
     append_entry(
         store,
+        session_id,
         segment_id,
         LogEntry::ConfigChanged {
             ts: segment_log::now_millis(),
@@ -349,22 +393,33 @@ pub fn save_config_changed(
     )
 }
 
-/// Fork the current state into a new segment.
-pub fn fork(store: &impl Store, state: SegmentStartState<'_>) -> Result<SegmentId, StoreError> {
+/// Fork the current state into a brand-new Session (no parent lineage).
+///
+/// Use this for "start a fresh conversation from this state" — the
+/// returned segment does not share `session_id` with any prior segment.
+/// In-Session forks (live auto-fork / past-turn fork) go through
+/// [`fork_at`] or [`ensure_head_or_fork`] instead.
+pub fn fork(
+    store: &impl Store,
+    state: SegmentStartState<'_>,
+) -> Result<(SessionId, SegmentId), StoreError> {
+    let session_id = crate::new_session_id();
     let fork_id = crate::new_segment_id();
     let entry = LogEntry::SegmentStart {
         ts: segment_log::now_millis(),
+        session_id,
         system_prompt: state.system_prompt.map(String::from),
         config: state.config.clone(),
         history: to_logged(state.history),
         forked_from: None,
         compacted_from: None,
     };
-    store.create_segment(fork_id, &[entry])?;
-    Ok(fork_id)
+    store.create_segment(session_id, fork_id, &[entry])?;
+    Ok((session_id, fork_id))
 }
 
-/// Fork from a turn boundary in a stored segment log.
+/// Fork from a turn boundary in a stored segment log, keeping the new
+/// segment in the same Session as `source_id`.
 ///
 /// `at_turn_index` is the `turn_count` of the most recent completed
 /// `TurnEnd` in the source segment that the fork should branch from.
@@ -372,10 +427,11 @@ pub fn fork(store: &impl Store, state: SegmentStartState<'_>) -> Result<SegmentI
 /// after it are not carried into the new segment.
 pub fn fork_at(
     store: &impl Store,
+    source_session_id: SessionId,
     source_id: SegmentId,
     at_turn_index: usize,
 ) -> Result<SegmentId, StoreError> {
-    let entries = store.read_all(source_id)?;
+    let entries = store.read_all(source_session_id, source_id)?;
     let cut = if at_turn_index == 0 {
         // Branch directly after the SegmentStart (or whatever opens the
         // segment), before any turn completes.
@@ -395,6 +451,7 @@ pub fn fork_at(
     let fork_id = crate::new_segment_id();
     let entry = LogEntry::SegmentStart {
         ts: segment_log::now_millis(),
+        session_id: source_session_id,
         system_prompt: state.system_prompt,
         config: state.config,
         history: to_logged(&state.history),
@@ -404,7 +461,7 @@ pub fn fork_at(
         }),
         compacted_from: None,
     };
-    store.create_segment(fork_id, &[entry])?;
+    store.create_segment(source_session_id, fork_id, &[entry])?;
     Ok(fork_id)
 }
 
@@ -415,8 +472,9 @@ pub fn fork_at(
 /// it needs the same value for an in-memory mirror + broadcast).
 pub fn append_entry(
     store: &impl Store,
+    session_id: SessionId,
     segment_id: SegmentId,
     entry: LogEntry,
 ) -> Result<(), StoreError> {
-    store.append(segment_id, &entry)
+    store.append(session_id, segment_id, &entry)
 }

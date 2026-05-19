@@ -18,11 +18,13 @@
 //!
 //! # Lifetime
 //!
-//! A `Tracker` is **session-scoped**: the Pod layer creates a fresh
-//! instance at the start of each agent session and discards it when the
-//! session ends. The `ScopedFs` write boundary, by contrast, is
-//! pod-lifetime (derived from the manifest). The two are orthogonal and
-//! the Pod wires them together when registering builtin tools.
+//! A `Tracker` is **Pod-process scoped**: the Pod layer creates a fresh
+//! instance at the start of each Pod run (including resume) and discards
+//! it when the process exits — it is not persisted, so a resumed
+//! conversation starts with an empty read/edit history. The `ScopedFs`
+//! write boundary is likewise Pod-process scoped (derived from the
+//! manifest). The two are orthogonal and the Pod wires them together
+//! when registering builtin tools.
 //!
 //! ```no_run
 //! # use std::path::PathBuf;

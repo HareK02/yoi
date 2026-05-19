@@ -209,11 +209,11 @@ async fn run_resume() -> Result<(), Box<dyn std::error::Error>> {
     // Phase 1: pick a session in its own inline viewport, dropping the
     // viewport before the name dialog opens so each phase gets fresh
     // vertical room.
-    let id = match picker::run().await? {
-        PickerOutcome::Picked(id) => id,
+    let leaf_segment_id = match picker::run().await? {
+        PickerOutcome::Picked { segment_id } => segment_id,
         PickerOutcome::Cancelled => return Ok(()),
     };
-    run_spawn(Some(id)).await
+    run_spawn(Some(leaf_segment_id)).await
 }
 
 async fn run_spawn(resume_from: Option<SegmentId>) -> Result<(), Box<dyn std::error::Error>> {

@@ -1447,6 +1447,7 @@ mod completion_flow_tests {
         let mut app = App::new("test".into());
         let session_start = session_store::LogEntry::SegmentStart {
             ts: 1,
+            session_id: uuid::Uuid::nil(),
             system_prompt: None,
             config: Default::default(),
             history: vec![session_store::LoggedItem::from(

@@ -37,13 +37,19 @@ pub enum LogEntry {
     /// For forked segments, `history` contains the seed state from the parent.
     SegmentStart {
         ts: u64,
+        /// Session this segment belongs to. Compaction / fork inherits
+        /// the source segment's session_id; only fresh "new conversation"
+        /// segments mint a new session_id.
+        session_id: crate::SessionId,
         system_prompt: Option<String>,
         config: RequestConfig,
         history: Vec<LoggedItem>,
-        /// Origin: forked from another segment at a specific turn boundary.
+        /// Origin: forked from a sibling segment at a specific turn boundary.
+        /// The referenced segment is guaranteed to share `session_id`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         forked_from: Option<SegmentOrigin>,
-        /// Origin: compacted from another segment at a specific turn boundary.
+        /// Origin: compacted from a sibling segment at a specific turn boundary.
+        /// The referenced segment is guaranteed to share `session_id`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         compacted_from: Option<SegmentOrigin>,
     },
@@ -190,6 +196,10 @@ pub struct PodScopeSnapshot {
 /// State collected from log entries.
 #[derive(Debug, Clone)]
 pub struct RestoredState {
+    /// Session the replayed segment belongs to. Sourced from the
+    /// `SegmentStart` entry; `None` only if the log was empty (in which
+    /// case `entries_count == 0`).
+    pub session_id: Option<crate::SessionId>,
     pub system_prompt: Option<String>,
     pub config: RequestConfig,
     pub history: Vec<Item>,
@@ -221,6 +231,7 @@ pub struct RestoredState {
 /// Replay a sequence of log entries to reconstruct worker state.
 pub fn collect_state(entries: &[LogEntry]) -> RestoredState {
     let mut state = RestoredState {
+        session_id: None,
         system_prompt: None,
         config: RequestConfig::default(),
         history: Vec::new(),
@@ -238,11 +249,13 @@ pub fn collect_state(entries: &[LogEntry]) -> RestoredState {
 
         match entry {
             LogEntry::SegmentStart {
+                session_id,
                 system_prompt,
                 config,
                 history,
                 ..
             } => {
+                state.session_id = Some(*session_id);
                 state.system_prompt = system_prompt.clone();
                 state.config = config.clone();
                 state.history = history.iter().cloned().map(Item::from).collect();
@@ -354,6 +367,7 @@ mod tests {
     fn replay_segment_start_sets_initial_state() {
         let state = collect_state(&[LogEntry::SegmentStart {
             ts: 1000,
+            session_id: uuid::Uuid::nil(),
             system_prompt: Some("You are helpful.".into()),
             config: RequestConfig::default().with_max_tokens(1024),
             history: vec![Item::user_message("seed").into()],
@@ -371,6 +385,7 @@ mod tests {
         let state = collect_state(&[
             LogEntry::SegmentStart {
                 ts: 1000,
+                session_id: uuid::Uuid::nil(),
                 system_prompt: None,
                 config: RequestConfig::default(),
                 history: vec![],
@@ -405,6 +420,7 @@ mod tests {
         let state = collect_state(&[
             LogEntry::SegmentStart {
                 ts: 1000,
+                session_id: uuid::Uuid::nil(),
                 system_prompt: None,
                 config: RequestConfig::default(),
                 history: vec![],
@@ -442,6 +458,7 @@ mod tests {
         let state = collect_state(&[
             LogEntry::SegmentStart {
                 ts: 1000,
+                session_id: uuid::Uuid::nil(),
                 system_prompt: None,
                 config: RequestConfig::default(),
                 history: vec![],
@@ -461,6 +478,7 @@ mod tests {
         let state = collect_state(&[
             LogEntry::SegmentStart {
                 ts: 1000,
+                session_id: uuid::Uuid::nil(),
                 system_prompt: None,
                 config: RequestConfig::default(),
                 history: vec![],
@@ -507,6 +525,7 @@ mod tests {
         let state = collect_state(&[
             LogEntry::SegmentStart {
                 ts: 1000,
+                session_id: uuid::Uuid::nil(),
                 system_prompt: None,
                 config: RequestConfig::default(),
                 history: vec![],
@@ -578,6 +597,7 @@ mod tests {
         let state = collect_state(&[
             LogEntry::SegmentStart {
                 ts: 0,
+                session_id: uuid::Uuid::nil(),
                 system_prompt: None,
                 config: RequestConfig::default(),
                 history: vec![],
@@ -610,6 +630,7 @@ mod tests {
         let state = collect_state(&[
             LogEntry::SegmentStart {
                 ts: 1000,
+                session_id: uuid::Uuid::nil(),
                 system_prompt: None,
                 config: RequestConfig::default(),
                 history: vec![],
@@ -693,6 +714,7 @@ mod tests {
         let state = collect_state(&[
             LogEntry::SegmentStart {
                 ts: 1,
+                session_id: uuid::Uuid::nil(),
                 system_prompt: None,
                 config: RequestConfig::default(),
                 history: vec![],

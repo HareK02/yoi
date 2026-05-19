@@ -182,7 +182,10 @@ async fn session_start_state_captures_rendered_prompt() {
         .unwrap();
     pod.run_text("hi").await.unwrap();
 
-    let entries = pod.store().read_all(pod.segment_id()).unwrap();
+    let entries = pod
+        .store()
+        .read_all(pod.session_id(), pod.segment_id())
+        .unwrap();
     let first = entries.first().expect("at least one entry");
     match first {
         LogEntry::SegmentStart { system_prompt, .. } => {
