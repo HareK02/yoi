@@ -459,6 +459,7 @@ async fn session_auto_forks_on_conflict() {
         sid,
         &mut segment_id,
         &mut entries_written,
+        /* at_turn_index */ 0,
         SegmentStartState {
             system_prompt: worker_a.get_system_prompt(),
             config: worker_a.request_config(),
@@ -476,10 +477,81 @@ async fn session_auto_forks_on_conflict() {
     let fork_state = collect_state(&fork_entries);
     assert_eq!(fork_state.session_id, Some(sid), "auto-fork inherits Session");
 
-    // Original segment should still have the interloper entry
+    // The new segment records its lineage forward via forked_from; the
+    // source segment is left immutable (no terminal marker written back).
+    match &fork_entries[0] {
+        LogEntry::SegmentStart {
+            forked_from: Some(origin),
+            ..
+        } => {
+            assert_eq!(origin.segment_id, original_segid);
+            assert_eq!(origin.at_turn_index, 0);
+        }
+        other => panic!("expected SegmentStart with forked_from, got {other:?}"),
+    }
+
+    // Original segment should still have the interloper entry and NO
+    // terminal fork marker — it is byte-for-byte unchanged.
     let original_entries = store.read_all(sid, original_segid).unwrap();
+    assert_eq!(
+        original_entries.len(),
+        2,
+        "source segment holds only SegmentStart + interloper UserInput"
+    );
     let has_interloper = original_entries
         .iter()
         .any(|e| matches!(e, LogEntry::UserInput { .. }));
     assert!(has_interloper);
+}
+
+/// Nested past-fork: forking a segment that is itself a fork must not
+/// require touching any ancestor. Each `fork_at` only reads its direct
+/// source and seeds a new segment, so a chain of forks composes cleanly.
+#[tokio::test]
+async fn nested_past_fork_leaves_ancestors_immutable() {
+    let (_dir, store) = make_store();
+    let client = MockLlmClient::new(simple_text_events());
+    let worker = Worker::new(client);
+
+    let (sid, root_segid) = session_store::create_segment(
+        &store,
+        SegmentStartState {
+            system_prompt: worker.get_system_prompt(),
+            config: worker.request_config(),
+            history: worker.history(),
+        },
+    )
+    .unwrap();
+
+    let (worker, _) = run_and_persist(worker, &store, sid, root_segid, "Hello").await;
+    let root_before = store.read_all(sid, root_segid).unwrap();
+
+    // First past-fork at the completed turn.
+    let fork1 = session_store::fork_at(&store, sid, root_segid, worker.turn_count()).unwrap();
+    // Fork the fork (turn 0 = right after its SegmentStart seed).
+    let fork2 = session_store::fork_at(&store, sid, fork1, 0).unwrap();
+
+    // All three are distinct, all in the same Session.
+    assert_ne!(fork1, root_segid);
+    assert_ne!(fork2, fork1);
+    for seg in [root_segid, fork1, fork2] {
+        assert_eq!(
+            collect_state(&store.read_all(sid, seg).unwrap()).session_id,
+            Some(sid)
+        );
+    }
+
+    // The root and fork1 are untouched by forking their descendants.
+    assert_eq!(store.read_all(sid, root_segid).unwrap().len(), root_before.len());
+    let fork1_entries = store.read_all(sid, fork1).unwrap();
+    assert_eq!(fork1_entries.len(), 1, "fork1 is just its SegmentStart seed");
+
+    // fork2's lineage points at fork1, not the root.
+    match &store.read_all(sid, fork2).unwrap()[0] {
+        LogEntry::SegmentStart {
+            forked_from: Some(origin),
+            ..
+        } => assert_eq!(origin.segment_id, fork1),
+        other => panic!("expected SegmentStart with forked_from, got {other:?}"),
+    }
 }

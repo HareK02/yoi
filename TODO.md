@@ -7,8 +7,6 @@
 - Pod: 空応答ターン (Submit 後 AI 応答ゼロで Pause/Cancel) を自動巻き戻し → [tickets/pod-empty-turn-rollback.md](tickets/pod-empty-turn-rollback.md)
 - Pod: 任意ターンからの Fork（複数ターン巻き戻しを汎用化） → [tickets/pod-session-fork.md](tickets/pod-session-fork.md)
 - Pod: Inbound PodEvent ハンドリングの重複を統合 → [tickets/pod-inbound-pod-event-dedup.md](tickets/pod-inbound-pod-event-dedup.md)
-- 永続化層整理 (Storage)
-  - live auto-fork の marker 形式確定 → [tickets/live-fork-marker.md](tickets/live-fork-marker.md)
 - Pod 単位永続化
   - Pod state backend と FsStore 実装 → [tickets/pod-state-backend.md](tickets/pod-state-backend.md)
   - Pod lifecycle 各点での write 配線 → [tickets/pod-state-write-points.md](tickets/pod-state-write-points.md)

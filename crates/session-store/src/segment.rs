@@ -114,8 +114,30 @@ pub fn restore_by_segment(
     restore(store, session_id, segment_id)
 }
 
-/// Check if the store's entry count still matches the writer's tally.
-/// If not, auto-fork into a new segment within the same Session.
+/// Live auto-fork on concurrent-writer detection.
+///
+/// Checks whether the store's on-disk entry count still matches the
+/// writer's own append tally. If they match, the writer still owns the
+/// segment tail and nothing happens. If the store has grown behind the
+/// writer's back, another process appended to the same segment — so we
+/// branch into a fresh segment within the same Session.
+///
+/// # Marker form
+///
+/// Detection is by **tail entry-count comparison**, not by writing a
+/// terminal marker into the source segment. The source segment is left
+/// completely immutable — identical to the past-fork ([`fork_at`])
+/// invariant. The fork relationship is instead recorded forward on the
+/// *new* segment's `SegmentStart.forked_from`, so the lineage is still
+/// reconstructable from the logs alone (read each segment's
+/// `SegmentStart`; follow `forked_from` / `compacted_from` backward).
+/// Listing a parent's children is a cheap `list_segments(session_id)`
+/// scan filtered on `forked_from.segment_id`.
+///
+/// `at_turn_index` is the writer's current `turn_count`: the fork seeds
+/// the new segment with the writer's in-memory history (which reflects
+/// state up to that turn), so that is the divergence point relative to
+/// the now-diverged source segment.
 ///
 /// Updates `segment_id` and `entries_written` in place when a fork occurs.
 pub fn ensure_head_or_fork(
@@ -123,12 +145,14 @@ pub fn ensure_head_or_fork(
     session_id: SessionId,
     segment_id: &mut SegmentId,
     entries_written: &mut usize,
+    at_turn_index: usize,
     state: SegmentStartState<'_>,
 ) -> Result<(), StoreError> {
     let store_count = store.read_entry_count(session_id, *segment_id)?;
     if store_count == *entries_written {
         return Ok(());
     }
+    let source_segment_id = *segment_id;
     let fork_id = crate::new_segment_id();
     let entry = LogEntry::SegmentStart {
         ts: segment_log::now_millis(),
@@ -136,7 +160,10 @@ pub fn ensure_head_or_fork(
         system_prompt: state.system_prompt.map(String::from),
         config: state.config.clone(),
         history: to_logged(state.history),
-        forked_from: None,
+        forked_from: Some(SegmentOrigin {
+            segment_id: source_segment_id,
+            at_turn_index,
+        }),
         compacted_from: None,
     };
     store.create_segment(session_id, fork_id, &[entry])?;
@@ -425,6 +452,14 @@ pub fn fork(
 /// `TurnEnd` in the source segment that the fork should branch from.
 /// Replay collects state up to and including that `TurnEnd`; entries
 /// after it are not carried into the new segment.
+///
+/// # Invariant: the source segment is never mutated
+///
+/// Past-fork only reads the source and seeds a brand-new segment. It
+/// writes no marker back into the source — exactly like live auto-fork
+/// ([`ensure_head_or_fork`]). This keeps nested past-forks simple: a
+/// fork of a fork just reads its own source and branches again, with no
+/// marker-position bookkeeping to reconcile across the chain.
 pub fn fork_at(
     store: &impl Store,
     source_session_id: SessionId,

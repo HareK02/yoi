@@ -1672,9 +1672,13 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             return Ok(());
         }
         // Auto-fork within the same Session: mint a fresh Segment and
-        // switch to it. The new SegmentStart entry replaces the mirror
-        // and is broadcast through the sink so existing subscribers
-        // reset their view.
+        // switch to it. The source segment is left immutable (no terminal
+        // marker is written back); the fork relationship is recorded
+        // forward on the new segment's `forked_from`, with `at_turn_index`
+        // = the writer's current turn (its in-memory history reflects
+        // state up to that turn). The new SegmentStart replaces the mirror
+        // and is broadcast through the sink so existing subscribers reset
+        // their view.
         let fork_segment_id = session_store::new_segment_id();
         let entry = LogEntry::SegmentStart {
             ts: segment_log::now_millis(),
@@ -1682,7 +1686,10 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             system_prompt: w.get_system_prompt().map(String::from),
             config: w.request_config().clone(),
             history: to_logged(w.history()),
-            forked_from: None,
+            forked_from: Some(session_store::SegmentOrigin {
+                segment_id: loc.segment_id,
+                at_turn_index: w.turn_count(),
+            }),
             compacted_from: None,
         };
         self.store
