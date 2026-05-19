@@ -6,7 +6,7 @@
 
 use crate::SessionId;
 use crate::event_trace::TraceEntry;
-use crate::session_log::{EntryHash, HashedEntry};
+use crate::session_log::LogEntry;
 use crate::store::{Store, StoreError};
 use std::fs;
 use std::io::Write;
@@ -65,12 +65,12 @@ impl FsStore {
 }
 
 impl Store for FsStore {
-    fn append(&self, id: SessionId, entry: &HashedEntry) -> Result<(), StoreError> {
+    fn append(&self, id: SessionId, entry: &LogEntry) -> Result<(), StoreError> {
         let line = serde_json::to_string(entry)?;
         self.append_line(&self.log_path(id), &line)
     }
 
-    fn read_all(&self, id: SessionId) -> Result<Vec<HashedEntry>, StoreError> {
+    fn read_all(&self, id: SessionId) -> Result<Vec<LogEntry>, StoreError> {
         let path = self.log_path(id);
         if !path.exists() {
             return Err(StoreError::NotFound(id));
@@ -98,7 +98,7 @@ impl Store for FsStore {
         Ok(sessions)
     }
 
-    fn create_session(&self, id: SessionId, entries: &[HashedEntry]) -> Result<(), StoreError> {
+    fn create_session(&self, id: SessionId, entries: &[LogEntry]) -> Result<(), StoreError> {
         let path = self.log_path(id);
         let mut content = String::new();
         for entry in entries {
@@ -113,24 +113,13 @@ impl Store for FsStore {
         Ok(self.log_path(id).exists())
     }
 
-    fn read_head_hash(&self, id: SessionId) -> Result<Option<EntryHash>, StoreError> {
+    fn read_entry_count(&self, id: SessionId) -> Result<usize, StoreError> {
         let path = self.log_path(id);
         if !path.exists() {
             return Err(StoreError::NotFound(id));
         }
         let content = fs::read_to_string(&path)?;
-        let last_line = content.lines().rev().find(|l| !l.trim().is_empty());
-        match last_line {
-            Some(line) => {
-                let entry: HashedEntry =
-                    serde_json::from_str(line).map_err(|e| StoreError::Corrupt {
-                        line: content.lines().count(),
-                        message: e.to_string(),
-                    })?;
-                Ok(Some(entry.hash))
-            }
-            None => Ok(None),
-        }
+        Ok(content.lines().filter(|l| !l.trim().is_empty()).count())
     }
 
     fn append_trace(&self, id: SessionId, entry: &TraceEntry) -> Result<(), StoreError> {

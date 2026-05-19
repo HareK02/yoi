@@ -20,9 +20,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::{Frame, TerminalOptions, Viewport};
-use session_store::{
-    FsStore, HashedEntry, LogEntry, LoggedContentPart, LoggedItem, SessionId, Store,
-};
+use session_store::{FsStore, LogEntry, LoggedContentPart, LoggedItem, SessionId, Store};
 
 const MAX_ROWS: usize = 10;
 const VIEWPORT_LINES: u16 = MAX_ROWS as u16 + 4;
@@ -170,9 +168,9 @@ fn build_preview(store: &FsStore, id: SessionId) -> String {
 /// Walk the log from the tail looking for the most recent user-message
 /// or assistant-message entry, then render its first text fragment in
 /// a single line.
-fn last_message_preview(entries: &[HashedEntry]) -> Option<String> {
-    for hashed in entries.iter().rev() {
-        match &hashed.entry {
+fn last_message_preview(entries: &[LogEntry]) -> Option<String> {
+    for entry in entries.iter().rev() {
+        match entry {
             LogEntry::UserInput { segments, .. } => {
                 let text = protocol::Segment::flatten_to_text(segments);
                 if !text.is_empty() {

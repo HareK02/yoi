@@ -26,9 +26,7 @@ use llm_worker::llm_client::event::{Event as LlmEvent, ResponseStatus, StatusEve
 use llm_worker::llm_client::{ClientError, LlmClient, Request};
 use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use session_metrics::{DOMAIN, Metric, metrics_from_extensions};
-use session_store::{
-    EntryHash, FsStore, HashedEntry, LogEntry, SessionId, Store, StoreError, TraceEntry,
-};
+use session_store::{FsStore, LogEntry, SessionId, Store, StoreError, TraceEntry};
 
 use pod::{Pod, PodManifest};
 
@@ -329,32 +327,28 @@ struct MetricFailingStore {
 }
 
 impl Store for MetricFailingStore {
-    fn append(&self, id: SessionId, entry: &HashedEntry) -> Result<(), StoreError> {
-        if let LogEntry::Extension { domain, .. } = &entry.entry {
+    fn append(&self, id: SessionId, entry: &LogEntry) -> Result<(), StoreError> {
+        if let LogEntry::Extension { domain, .. } = entry {
             if domain == DOMAIN {
                 return Err(StoreError::Io(std::io::Error::other("synthetic failure")));
             }
         }
         self.inner.append(id, entry)
     }
-    fn read_all(&self, id: SessionId) -> Result<Vec<HashedEntry>, StoreError> {
+    fn read_all(&self, id: SessionId) -> Result<Vec<LogEntry>, StoreError> {
         self.inner.read_all(id)
     }
     fn list_sessions(&self) -> Result<Vec<SessionId>, StoreError> {
         self.inner.list_sessions()
     }
-    fn create_session(
-        &self,
-        id: SessionId,
-        entries: &[HashedEntry],
-    ) -> Result<(), StoreError> {
+    fn create_session(&self, id: SessionId, entries: &[LogEntry]) -> Result<(), StoreError> {
         self.inner.create_session(id, entries)
     }
     fn exists(&self, id: SessionId) -> Result<bool, StoreError> {
         self.inner.exists(id)
     }
-    fn read_head_hash(&self, id: SessionId) -> Result<Option<EntryHash>, StoreError> {
-        self.inner.read_head_hash(id)
+    fn read_entry_count(&self, id: SessionId) -> Result<usize, StoreError> {
+        self.inner.read_entry_count(id)
     }
     fn append_trace(&self, id: SessionId, entry: &TraceEntry) -> Result<(), StoreError> {
         self.inner.append_trace(id, entry)

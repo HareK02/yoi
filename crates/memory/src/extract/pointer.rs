@@ -10,7 +10,7 @@ use super::EXTRACT_DOMAIN;
 /// として 1 回ずつ書かれ、最新の 1 件が現行 pointer として有効になる。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExtractPointerPayload {
-    /// 直近 extract が処理した最後の session-store HashedEntry の index。
+    /// 直近 extract が処理した最後の session-store LogEntry の index。
     /// 次回の `source.range.start` はこの値 + 1。
     pub processed_through_entry: usize,
     /// 直近 extract 時点の `history.len()`。次回入力は

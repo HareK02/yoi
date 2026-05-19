@@ -1,16 +1,15 @@
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use arc_swap::ArcSwap;
 use llm_worker::Item;
 use llm_worker::llm_client::RequestConfig;
 use llm_worker::llm_client::client::LlmClient;
 use llm_worker::state::Mutable;
 use llm_worker::{ToolOutputLimits, UsageRecord, Worker, WorkerError, WorkerResult};
-use parking_lot::Mutex as SyncMutex;
 use session_store::{
-    EntryHash, HashedEntry, LogEntry, PodScopeSnapshot, SessionId, Store, StoreError, SystemItem,
-    session_log, to_logged,
+    LogEntry, PodScopeSnapshot, SessionId, Store, StoreError, SystemItem, session_log, to_logged,
 };
 use tracing::{info, warn};
 
@@ -43,22 +42,59 @@ use protocol::{AlertLevel, AlertSource, Event, Segment};
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
-pub struct SessionHead {
-    pub session_id: SessionId,
-    pub head_hash: Option<EntryHash>,
+/// Lock-free shared session pointer.
+///
+/// Holds the current `(session_id, entries_written)` pair so that the
+/// Pod and every `LogWriterHandle` clone see a consistent view through
+/// `Arc`-shared lock-free reads. `session_id` is wrapped in `ArcSwap`
+/// so fork (a rare, run-start-only event) can atomically swap it
+/// without taking a mutex on the append hot path. `entries_written` is
+/// an `AtomicUsize` bumped on every successful append; the writer's
+/// tally is compared against the store's on-disk count to detect
+/// concurrent writers in `ensure_session_head`.
+pub struct SessionState {
+    session_id: ArcSwap<SessionId>,
+    entries_written: AtomicUsize,
 }
 
-/// Cheap-cloneable bundle of (store + session-head lock + sink) handed
-/// to the worker callback and the interceptor so they can commit
-/// `LogEntry` values directly without going through an mpsc ferry.
-///
-/// All three fields are `Clone` (the latter two as `Arc` clones, the
-/// store per its `Clone` impl) so the handle itself is a flat triple of
-/// cheap copies.
+impl SessionState {
+    pub fn new(session_id: SessionId, entries_written: usize) -> Arc<Self> {
+        Arc::new(Self {
+            session_id: ArcSwap::from_pointee(session_id),
+            entries_written: AtomicUsize::new(entries_written),
+        })
+    }
+
+    pub fn session_id(&self) -> SessionId {
+        **self.session_id.load()
+    }
+
+    pub fn set_session_id(&self, id: SessionId) {
+        self.session_id.store(Arc::new(id));
+    }
+
+    pub fn entries_written(&self) -> usize {
+        self.entries_written.load(Ordering::Acquire)
+    }
+
+    pub fn set_entries_written(&self, n: usize) {
+        self.entries_written.store(n, Ordering::Release);
+    }
+
+    fn increment_entries(&self) {
+        self.entries_written.fetch_add(1, Ordering::Release);
+    }
+}
+
+/// Cheap-cloneable bundle of (store + shared session pointer + sink)
+/// handed to the worker callback and the interceptor so they can
+/// commit `LogEntry` values directly without going through an mpsc
+/// ferry. All fields are `Clone` (`store` per its `Clone` impl,
+/// `state` and `sink` as `Arc` clones).
 #[derive(Clone)]
 pub struct LogWriterHandle<St: Clone> {
     pub store: St,
-    pub session_head: Arc<SyncMutex<SessionHead>>,
+    pub state: Arc<SessionState>,
     pub sink: SessionLogSink,
 }
 
@@ -66,18 +102,16 @@ impl<St> LogWriterHandle<St>
 where
     St: Store + Clone,
 {
-    /// Append `entry` to the log: disk write → in-memory mirror push →
-    /// broadcast — atomic w.r.t. `subscribe_with_snapshot` callers.
-    pub fn append_entry(&self, entry: LogEntry) -> Result<EntryHash, StoreError> {
-        let mut head = self.session_head.lock();
-        let hash = session_store::append_entry_with_hash(
-            &self.store,
-            head.session_id,
-            &mut head.head_hash,
-            entry.clone(),
-        )?;
+    /// Append `entry` to the log: disk write → counter bump → in-memory
+    /// mirror push → broadcast. The kernel orders concurrent `O_APPEND`
+    /// writes for `< PIPE_BUF` lines, so no user-space serialization is
+    /// needed across appenders.
+    pub fn append_entry(&self, entry: LogEntry) -> Result<(), StoreError> {
+        let session_id = self.state.session_id();
+        self.store.append(session_id, &entry)?;
+        self.state.increment_entries();
         self.sink.publish(entry);
-        Ok(hash)
+        Ok(())
     }
 }
 
@@ -127,8 +161,10 @@ pub struct Pod<C: LlmClient, St: Store> {
     /// Always `Some` outside of `run()`/`resume()`.
     worker: Option<Worker<C, Mutable>>,
     store: St,
-    session_id: SessionId,
-    session_head: Arc<SyncMutex<SessionHead>>,
+    /// Shared session pointer. Source of truth for the Pod's current
+    /// `session_id` and append tally. `self.session_id()` is a thin
+    /// wrapper over `session_state.session_id()`.
+    session_state: Arc<SessionState>,
     /// Absolute working directory of the Pod.
     pwd: PathBuf,
     /// Shared, atomically-swappable view of the Pod's resolved scope.
@@ -302,8 +338,7 @@ impl<C: LlmClient + Clone + 'static, St: Store + Clone + 'static> Pod<C, St> {
             manifest: self.manifest.clone(),
             worker: Some(worker),
             store: self.store.clone(),
-            session_id: self.session_id,
-            session_head: self.session_head.clone(),
+            session_state: self.session_state.clone(),
             pwd: self.pwd.clone(),
             scope: self.scope.clone(),
             hook_builder: HookRegistryBuilder::new(),
@@ -342,12 +377,12 @@ impl<C: LlmClient + Clone + 'static, St: Store + Clone + 'static> Pod<C, St> {
 
     /// Build a `LogWriterHandle` carrying everything the worker
     /// callback / interceptor needs to commit `LogEntry` values
-    /// directly: store handle, the shared session-head lock, and the
+    /// directly: store handle, the shared session pointer, and the
     /// broadcast sink. All three are cheap clones.
     pub fn log_writer_handle(&self) -> LogWriterHandle<St> {
         LogWriterHandle {
             store: self.store.clone(),
-            session_head: self.session_head.clone(),
+            state: self.session_state.clone(),
             sink: self.sink.clone(),
         }
     }
@@ -443,11 +478,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             manifest,
             worker: Some(worker),
             store,
-            session_id,
-            session_head: Arc::new(SyncMutex::new(SessionHead {
-                session_id,
-                head_hash: None,
-            })),
+            session_state: SessionState::new(session_id, 0),
             pwd,
             scope: SharedScope::new(scope),
             hook_builder: HookRegistryBuilder::new(),
@@ -511,9 +542,10 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         &self.prompts
     }
 
-    /// The session ID used for persistence.
+    /// The session ID used for persistence. Read lock-free from the
+    /// shared session pointer so fork-time swaps are observed immediately.
     pub fn session_id(&self) -> SessionId {
-        self.session_id
+        self.session_state.session_id()
     }
 
     /// The Pod's manifest.
@@ -567,12 +599,12 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     }
 
     /// Snapshot the current runtime scope in the session log. The entry
-    /// is intentionally appended as soon as a session head exists: if the
+    /// is intentionally appended as soon as a session log exists: if the
     /// process later exits while children keep their allocations, resume
     /// can restore the narrowed scope instead of reclaiming delegated
     /// writes.
     pub fn persist_scope_snapshot(&mut self) -> Result<(), StoreError> {
-        if self.session_head.lock().head_hash.is_none() {
+        if self.session_state.entries_written() == 0 {
             return Ok(());
         }
         let snapshot = {
@@ -588,23 +620,18 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             domain: session_store::POD_SCOPE_EXTENSION_DOMAIN.into(),
             payload,
         })
-        .map(|_| ())
     }
 
     /// Append `entry` to the session log AND publish it through the
-    /// broadcast sink. Holds the session-head sync lock across the
-    /// disk write and the sink publish so subscribers see a gap-free
-    /// `(snapshot, live)` stream consistent with what's on disk.
-    pub(crate) fn commit_entry(&self, entry: LogEntry) -> Result<EntryHash, StoreError> {
-        let mut head = self.session_head.lock();
-        let hash = session_store::append_entry_with_hash(
-            &self.store,
-            head.session_id,
-            &mut head.head_hash,
-            entry.clone(),
-        )?;
+    /// broadcast sink. No user-space serialization is needed across
+    /// concurrent appenders — the kernel orders `O_APPEND` writes for
+    /// lines smaller than `PIPE_BUF`.
+    pub(crate) fn commit_entry(&self, entry: LogEntry) -> Result<(), StoreError> {
+        let session_id = self.session_state.session_id();
+        self.store.append(session_id, &entry)?;
+        self.session_state.increment_entries();
         self.sink.publish(entry);
-        Ok(hash)
+        Ok(())
     }
 
     /// Cloneable sink handle. Exposed to the controller so the IPC
@@ -1160,7 +1187,6 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
 
         // IDLE → active marker. Commits first so the next UserInput entry
         // is contained inside this Invoke range. See `tickets/invoke-turn-llmcall-semantics.md`.
-        self.session_id = self.session_head.lock().session_id;
         self.commit_entry(LogEntry::Invoke {
             ts: session_log::now_millis(),
             trigger: protocol::InvokeKind::UserSend,
@@ -1350,7 +1376,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             return;
         };
         if let Err(err) =
-            memory::append_use_event(layout, self.session_id.to_string(), source, records)
+            memory::append_use_event(layout, self.session_id().to_string(), source, records)
         {
             warn!(error = %err, "failed to append memory usage event");
         }
@@ -1361,7 +1387,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             return;
         };
         if let Err(err) =
-            memory::append_resident_exposure_event(layout, self.session_id.to_string(), records)
+            memory::append_resident_exposure_event(layout, self.session_id().to_string(), records)
         {
             warn!(error = %err, "failed to append resident exposure event");
         }
@@ -1551,7 +1577,6 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         // IDLE → active marker for the buffered notification / pod-event
         // drain. The trailing SystemItem entries (drained by the
         // PodInterceptor) carry the actual payload.
-        self.session_id = self.session_head.lock().session_id;
         self.commit_entry(LogEntry::Invoke {
             ts: session_log::now_millis(),
             trigger: kind,
@@ -1582,23 +1607,20 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         self.handle_worker_result(result, history_before).await
     }
 
-    /// Ensure the session exists and its head still matches ours.
+    /// Ensure the session exists and the writer's tally still matches
+    /// the on-disk entry count.
     ///
     /// On the first call for a Pod built via `from_manifest`, the session
     /// has not been written to the store yet — this is when we append the
     /// initial `SessionStart` entry, carrying the system prompt that
     /// `ensure_system_prompt_materialized` has just rendered. Subsequent
-    /// calls fall through to `ensure_head_or_fork`, which auto-forks when
-    /// another writer has advanced the store head behind our back.
+    /// calls fall through to entry-count comparison, which auto-forks
+    /// when another writer has appended behind our back.
     fn ensure_session_head(&mut self) -> Result<(), PodError> {
         let w = self.worker.as_ref().unwrap();
-        let prev_session_id;
-        let initial_state = {
-            let head = self.session_head.lock();
-            prev_session_id = head.session_id;
-            head.head_hash.is_none()
-        };
-        if initial_state {
+        let prev_session_id = self.session_state.session_id();
+        let entries_written = self.session_state.entries_written();
+        if entries_written == 0 {
             let initial = LogEntry::SessionStart {
                 ts: session_log::now_millis(),
                 system_prompt: w.get_system_prompt().map(String::from),
@@ -1611,13 +1633,12 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             self.persist_scope_snapshot()?;
             return Ok(());
         }
-        // Check store head + auto-fork if it drifted.
-        let store_head = self
+        // Check store count + auto-fork if it drifted.
+        let store_count = self
             .store
-            .read_head_hash(prev_session_id)
+            .read_entry_count(prev_session_id)
             .map_err(PodError::from)?;
-        let mut head = self.session_head.lock();
-        if store_head == head.head_hash {
+        if store_count == entries_written {
             return Ok(());
         }
         // Fork: mint a fresh session and switch to it. The new
@@ -1632,20 +1653,12 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             forked_from: None,
             compacted_from: None,
         };
-        let hash = session_log::compute_hash(None, &entry);
-        let hashed = HashedEntry {
-            hash: hash.clone(),
-            prev_hash: None,
-            entry: entry.clone(),
-        };
         self.store
-            .create_session(fork_id, &[hashed])
+            .create_session(fork_id, &[entry.clone()])
             .map_err(PodError::from)?;
-        head.session_id = fork_id;
-        head.head_hash = Some(hash);
-        self.session_id = fork_id;
+        self.session_state.set_session_id(fork_id);
+        self.session_state.set_entries_written(1);
         self.sink.reset_with_initial(entry);
-        drop(head);
         if self.scope_allocation.is_some() {
             pod_registry::update_session(&self.manifest.pod.name, fork_id)?;
         }
@@ -1796,7 +1809,6 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         // the callback fall through this branch: they classify the
         // slice from `history_before` inline so the test's
         // `restore`-style assertions still see entries on disk.
-        self.session_id = self.session_head.lock().session_id;
         if !self.history_persistence_wired {
             let new_items: Vec<Item> = self.worker.as_ref().unwrap().history()[history_before..]
                 .iter()
@@ -1989,7 +2001,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             .compact_system()
             .map_err(PodError::PromptCatalog)?;
         let mut summary_worker = Worker::new(summary_client).system_prompt(summary_system_prompt);
-        summary_worker.set_cache_key(Some(self.session_id.to_string()));
+        summary_worker.set_cache_key(Some(self.session_id().to_string()));
 
         // Occupancy-based input-token meter + interceptor. The tracker pairs
         // each pre-request history length with the following UsageEvent, then
@@ -2133,37 +2145,24 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         // the broadcast sink so existing subscribers see the new
         // `SessionStart { compacted_from }` and reset their view.
         let new_session_id = session_store::new_session_id();
-        let session_start = {
-            let mut head = self.session_head.lock();
-            let old_session_id = head.session_id;
-            let old_head_hash = head
-                .head_hash
-                .clone()
-                .expect("head_hash should be set after at least one entry");
-            let w = self.worker.as_ref().unwrap();
-            let entry = LogEntry::SessionStart {
-                ts: session_log::now_millis(),
-                system_prompt: w.get_system_prompt().map(String::from),
-                config: w.request_config().clone(),
-                history: to_logged(&new_history),
-                forked_from: None,
-                compacted_from: Some(session_store::SessionOrigin {
-                    session_id: old_session_id,
-                    at_hash: old_head_hash,
-                }),
-            };
-            let hash = session_log::compute_hash(None, &entry);
-            let hashed = HashedEntry {
-                hash: hash.clone(),
-                prev_hash: None,
-                entry: entry.clone(),
-            };
-            self.store.create_session(new_session_id, &[hashed])?;
-            head.session_id = new_session_id;
-            head.head_hash = Some(hash);
-            self.session_id = new_session_id;
-            entry
+        let old_session_id = self.session_state.session_id();
+        let source_turn_count = self.worker.as_ref().unwrap().turn_count();
+        let w = self.worker.as_ref().unwrap();
+        let entry = LogEntry::SessionStart {
+            ts: session_log::now_millis(),
+            system_prompt: w.get_system_prompt().map(String::from),
+            config: w.request_config().clone(),
+            history: to_logged(&new_history),
+            forked_from: None,
+            compacted_from: Some(session_store::SessionOrigin {
+                session_id: old_session_id,
+                at_turn_index: source_turn_count,
+            }),
         };
+        self.store.create_session(new_session_id, &[entry.clone()])?;
+        self.session_state.set_session_id(new_session_id);
+        self.session_state.set_entries_written(1);
+        let session_start = entry;
         // Broadcast the SessionStart through the sink. This atomically
         // resets the mirror to `[SessionStart]` so any subscriber
         // querying after this point sees the post-compaction prefix.
@@ -2368,7 +2367,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         // Read the session log to get the current entry count. This is
         // the boundary for the source.range end_entry. Called once per
         // extract, on a small local file.
-        let entries_now = self.store.read_all(self.session_id)?.len();
+        let entries_now = self.store.read_all(self.session_id())?.len();
         if entries_now == 0 {
             return Ok(ExtractDecision::Skipped);
         }
@@ -2400,7 +2399,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             .memory_extract_system(memory_language)
             .map_err(PodError::PromptCatalog)?;
         let mut extract_worker = Worker::new(client).system_prompt(extract_system_prompt);
-        extract_worker.set_cache_key(Some(self.session_id.to_string()));
+        extract_worker.set_cache_key(Some(self.session_id().to_string()));
 
         // Occupancy-based input-token meter + interceptor. The tracker pairs
         // each pre-request history length with the following UsageEvent, then
@@ -2436,7 +2435,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             extract::ExtractedPayload::default()
         });
 
-        let source_session_id = self.session_head.lock().session_id;
+        let source_session_id = self.session_state.session_id();
         let staging_id = if payload.is_empty() {
             String::new()
         } else {
@@ -2460,9 +2459,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             ts: session_log::now_millis(),
             domain: extract::EXTRACT_DOMAIN.into(),
             payload: payload_value,
-        })
-        ?;
-        self.session_id = self.session_head.lock().session_id;
+        })?;
 
         *self
             .extract_pointer
@@ -2601,7 +2598,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 }
             };
         let mut worker = Worker::new(client).system_prompt(consolidation_system_prompt);
-        worker.set_cache_key(Some(self.session_id.to_string()));
+        worker.set_cache_key(Some(self.session_id().to_string()));
 
         // Memory tools are self-contained — they bypass ScopedFs and write
         // directly under the workspace via WorkspaceLayout. Resident
@@ -2613,7 +2610,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         let query_cfg = memory::tool::QueryConfig::from(memory_cfg);
         worker.register_tool(memory::tool::read_tool_with_usage(
             layout.clone(),
-            self.session_id.to_string(),
+            self.session_id().to_string(),
         ));
         worker.register_tool(memory::tool::write_tool(layout.clone()));
         worker.register_tool(memory::tool::edit_tool(layout.clone()));
@@ -2768,11 +2765,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             manifest,
             worker: Some(worker),
             store,
-            session_id,
-            session_head: Arc::new(SyncMutex::new(SessionHead {
-                session_id,
-                head_hash: None,
-            })),
+            session_state: SessionState::new(session_id, 0),
             pwd: common.pwd,
             scope: SharedScope::new(common.scope),
             hook_builder: HookRegistryBuilder::new(),
@@ -2842,11 +2835,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             manifest,
             worker: Some(worker),
             store,
-            session_id,
-            session_head: Arc::new(SyncMutex::new(SessionHead {
-                session_id,
-                head_hash: None,
-            })),
+            session_state: SessionState::new(session_id, 0),
             pwd: common.pwd,
             scope: SharedScope::new(common.scope),
             hook_builder: HookRegistryBuilder::new(),
@@ -2913,10 +2902,10 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
         // sits on disk.
         let raw_entries = store.read_all(session_id)?;
         let state = session_store::collect_state(&raw_entries);
-        if state.head_hash.is_none() {
+        if state.entries_count == 0 {
             return Err(PodError::SessionEmpty { session_id });
         }
-        let mirror_entries: Vec<LogEntry> = raw_entries.iter().map(|e| e.entry.clone()).collect();
+        let mirror_entries: Vec<LogEntry> = raw_entries.clone();
         let scope_snapshot = state
             .pod_scope
             .clone()
@@ -2985,11 +2974,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             manifest,
             worker: Some(worker),
             store,
-            session_id,
-            session_head: Arc::new(SyncMutex::new(SessionHead {
-                session_id,
-                head_hash: state.head_hash,
-            })),
+            session_state: SessionState::new(session_id, state.entries_count),
             pwd: common.pwd,
             scope: SharedScope::new(common.scope),
             hook_builder: HookRegistryBuilder::new(),

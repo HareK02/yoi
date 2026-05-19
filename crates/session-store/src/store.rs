@@ -12,7 +12,7 @@
 
 use crate::SessionId;
 use crate::event_trace::TraceEntry;
-use crate::session_log::{EntryHash, HashedEntry};
+use crate::session_log::LogEntry;
 
 /// Errors from the persistence store.
 #[derive(Debug, thiserror::Error)]
@@ -35,25 +35,30 @@ pub enum StoreError {
 /// All methods take `&self` — implementations should use interior mutability
 /// (e.g., append-mode file handles) when needed.
 pub trait Store: Send + Sync {
-    /// Append a single hashed entry to the session log.
-    fn append(&self, id: SessionId, entry: &HashedEntry) -> Result<(), StoreError>;
+    /// Append a single log entry to the session log.
+    ///
+    /// One line per call. The kernel orders concurrent `O_APPEND` writes
+    /// for lines < `PIPE_BUF`, so user-space serialization is unnecessary.
+    fn append(&self, id: SessionId, entry: &LogEntry) -> Result<(), StoreError>;
 
-    /// Read all hashed entries for a session, in order.
-    fn read_all(&self, id: SessionId) -> Result<Vec<HashedEntry>, StoreError>;
+    /// Read all log entries for a session, in order.
+    fn read_all(&self, id: SessionId) -> Result<Vec<LogEntry>, StoreError>;
 
     /// List all session IDs, most recent first.
     fn list_sessions(&self) -> Result<Vec<SessionId>, StoreError>;
 
     /// Create a new session with initial entries.
-    fn create_session(&self, id: SessionId, entries: &[HashedEntry]) -> Result<(), StoreError>;
+    fn create_session(&self, id: SessionId, entries: &[LogEntry]) -> Result<(), StoreError>;
 
     /// Check if a session exists.
     fn exists(&self, id: SessionId) -> Result<bool, StoreError>;
 
-    /// Read the hash of the last entry in a session (the head).
+    /// Count entries currently stored for a session.
     ///
-    /// Returns `None` if the session is empty.
-    fn read_head_hash(&self, id: SessionId) -> Result<Option<EntryHash>, StoreError>;
+    /// Used by `ensure_head_or_fork` to detect concurrent writers:
+    /// if the on-disk count exceeds the writer's own append tally,
+    /// another process has extended the log.
+    fn read_entry_count(&self, id: SessionId) -> Result<usize, StoreError>;
 
     /// Append a trace entry to the debug event trace file.
     fn append_trace(&self, id: SessionId, entry: &TraceEntry) -> Result<(), StoreError>;

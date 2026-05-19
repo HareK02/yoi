@@ -184,7 +184,7 @@ async fn session_start_state_captures_rendered_prompt() {
 
     let entries = pod.store().read_all(pod.session_id()).unwrap();
     let first = entries.first().expect("at least one entry");
-    match &first.entry {
+    match first {
         LogEntry::SessionStart { system_prompt, .. } => {
             let sp = system_prompt.as_deref().expect("system prompt set");
             assert!(sp.starts_with("hello cwd="));

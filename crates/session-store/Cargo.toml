@@ -11,8 +11,6 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 uuid = { workspace = true, features = ["v7", "serde"] }
 thiserror = { workspace = true }
-sha2 = { workspace = true }
-hex = "0.4.3"
 protocol = { workspace = true }
 tracing.workspace = true
 
