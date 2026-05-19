@@ -7,8 +7,16 @@
 - Pod: 空応答ターン (Submit 後 AI 応答ゼロで Pause/Cancel) を自動巻き戻し → [tickets/pod-empty-turn-rollback.md](tickets/pod-empty-turn-rollback.md)
 - Pod: 任意ターンからの Fork（複数ターン巻き戻しを汎用化） → [tickets/pod-session-fork.md](tickets/pod-session-fork.md)
 - Pod: Inbound PodEvent ハンドリングの重複を統合 → [tickets/pod-inbound-pod-event-dedup.md](tickets/pod-inbound-pod-event-dedup.md)
-- Pod: セッションログをバックエンドにした Pod 単位の永続化 → [tickets/pod-persistent-state.md](tickets/pod-persistent-state.md)
-- 永続化層のセマンティック整理 → [tickets/persistence-semantics.md](tickets/persistence-semantics.md)
+- 永続化層整理 (Storage)
+  - Entry hash chain 廃止 → [tickets/entry-hash-abolish.md](tickets/entry-hash-abolish.md)
+  - SessionId → SegmentId リネーム → [tickets/segment-rename.md](tickets/segment-rename.md)
+  - Session (Segment 群の grouping) 導入 → [tickets/session-grouping-introduce.md](tickets/session-grouping-introduce.md)
+  - live auto-fork の marker 形式確定 → [tickets/live-fork-marker.md](tickets/live-fork-marker.md)
+- Pod 単位永続化
+  - Pod state backend と FsStore 実装 → [tickets/pod-state-backend.md](tickets/pod-state-backend.md)
+  - Pod lifecycle 各点での write 配線 → [tickets/pod-state-write-points.md](tickets/pod-state-write-points.md)
+  - Pod 名単位の resume / attach 導線 → [tickets/pod-name-resume.md](tickets/pod-name-resume.md)
+  - SpawnedPodRegistry の永続化と復元 → [tickets/spawned-registry-persist.md](tickets/spawned-registry-persist.md)
 - llm-worker のエラー耐性
   - ストリーム途中失敗時の継続 → [tickets/llm-worker-stream-continuation.md](tickets/llm-worker-stream-continuation.md)
 - llm-worker: history append を callback 経由の単一経路に閉じる → [tickets/worker-history-append-contract.md](tickets/worker-history-append-contract.md)
