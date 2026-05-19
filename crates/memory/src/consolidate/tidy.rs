@@ -305,7 +305,7 @@ mod tests {
     fn flags_sources_overflow() {
         let (dir, layout) = workspace();
         let many_sources: String = (0..15)
-            .map(|i| format!("  - session_id: s{i}\n    range: [{i}, {i}]\n"))
+            .map(|i| format!("  - segment_id: s{i}\n    range: [{i}, {i}]\n"))
             .collect();
         write(
             &dir.path().join(".insomnia/memory/decisions/big.md"),

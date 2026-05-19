@@ -2,7 +2,7 @@ use std::sync::{OnceLock, RwLock};
 
 use protocol::PodStatus;
 use serde_json::json;
-use session_store::SessionId;
+use session_store::SegmentId;
 
 use crate::fs_view::PodFsView;
 
@@ -28,7 +28,7 @@ pub struct KnowledgeCandidate {
 /// greeting, and completion lookup hubs.
 pub struct PodSharedState {
     pub pod_name: String,
-    pub session_id: SessionId,
+    pub segment_id: SegmentId,
     pub manifest_toml: String,
     pub greeting: protocol::Greeting,
     pub status: RwLock<PodStatus>,
@@ -46,13 +46,13 @@ pub struct PodSharedState {
 impl PodSharedState {
     pub fn new(
         pod_name: String,
-        session_id: SessionId,
+        segment_id: SegmentId,
         manifest_toml: String,
         greeting: protocol::Greeting,
     ) -> Self {
         Self {
             pod_name,
-            session_id,
+            segment_id,
             manifest_toml,
             greeting,
             status: RwLock::new(PodStatus::Idle),
@@ -123,7 +123,7 @@ impl PodSharedState {
         let status = self.get_status();
         json!({
             "state": status,
-            "session_id": self.session_id.to_string(),
+            "segment_id": self.segment_id.to_string(),
             "pod_name": self.pod_name,
         })
         .to_string()
@@ -137,7 +137,7 @@ mod tests {
     fn test_state() -> PodSharedState {
         PodSharedState::new(
             "test-pod".into(),
-            session_store::new_session_id(),
+            session_store::new_segment_id(),
             "[pod]\nname = \"test-pod\"".into(),
             test_greeting(),
         )
@@ -176,7 +176,7 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["state"], "idle");
         assert_eq!(parsed["pod_name"], "test-pod");
-        assert!(parsed["session_id"].is_string());
+        assert!(parsed["segment_id"].is_string());
     }
 
     #[test]

@@ -13,7 +13,7 @@
 //! （session-store の `LogEntry::Extension`、domain `"memory.extract"`）は
 //! Pod 側が責務を持つ。
 //!
-//! 出力 JSON の wrap は [`write_staging`] が `source: { session_id, range }`
+//! 出力 JSON の wrap は [`write_staging`] が `source: { segment_id, range }`
 //! を機械付与する形で担当し、LLM には source を推論させない。
 
 mod input;

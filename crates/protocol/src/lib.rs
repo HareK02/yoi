@@ -364,7 +364,7 @@ pub enum Event {
     /// Live updates after the snapshot arrive through the streaming
     /// events (`TextDelta` / `ToolCall*` / `ToolResult` / etc.) plus
     /// the two role-specific entry events
-    /// (`SessionRotated` / `HookInjectedItems`) — there is no generic
+    /// (`SegmentRotated` / `HookInjectedItems`) — there is no generic
     /// "every committed entry" broadcast.
     Snapshot {
         entries: Vec<serde_json::Value>,
@@ -372,15 +372,15 @@ pub enum Event {
         #[serde(default)]
         status: PodStatus,
     },
-    /// Server-side session log rotated to a fresh `SessionStart`.
+    /// Server-side segment log rotated to a fresh `SegmentStart`.
     ///
     /// Fires on compaction and on auto-fork when the store head drifts
     /// from the live writer's cached head. Clients drop their derived
     /// view and reseed from `entry.history` exactly the way they would
     /// from a connect-time `Snapshot`.
     ///
-    /// Payload is the JSON form of `session_store::LogEntry::SessionStart`.
-    SessionRotated {
+    /// Payload is the JSON form of `session_store::LogEntry::SegmentStart`.
+    SegmentRotated {
         entry: serde_json::Value,
     },
     /// Current Pod controller status. Broadcast on every controller-level
@@ -400,15 +400,15 @@ pub enum Event {
     /// Pod has started compacting the current session.
     ///
     /// Fired immediately before a compaction run. Success is signalled by
-    /// `CompactDone` (with the new `SessionId`); failure by `CompactFailed`.
+    /// `CompactDone` (with the new `SegmentId`); failure by `CompactFailed`.
     /// Broadcast to all clients; not replayed to late subscribers.
     CompactStart,
     /// Compaction completed and the session was rotated.
     ///
-    /// `new_session_id` is the UUID of the freshly created session that
+    /// `new_segment_id` is the UUID of the freshly created session that
     /// replaced the old history.
     CompactDone {
-        new_session_id: uuid::Uuid,
+        new_segment_id: uuid::Uuid,
     },
     /// Compaction failed. The session is unchanged.
     CompactFailed {
@@ -890,18 +890,18 @@ mod tests {
     }
 
     #[test]
-    fn event_session_rotated_roundtrip() {
-        let event = Event::SessionRotated {
-            entry: serde_json::json!({"kind": "session_start", "ts": 1, "history": []}),
+    fn event_segment_rotated_roundtrip() {
+        let event = Event::SegmentRotated {
+            entry: serde_json::json!({"kind": "segment_start", "ts": 1, "history": []}),
         };
         let json = serde_json::to_string(&event).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed["event"], "session_rotated");
-        assert_eq!(parsed["data"]["entry"]["kind"], "session_start");
+        assert_eq!(parsed["event"], "segment_rotated");
+        assert_eq!(parsed["data"]["entry"]["kind"], "segment_start");
         let decoded: Event = serde_json::from_str(&json).unwrap();
         match decoded {
-            Event::SessionRotated { entry } => assert_eq!(entry["kind"], "session_start"),
-            other => panic!("expected SessionRotated, got {other:?}"),
+            Event::SegmentRotated { entry } => assert_eq!(entry["kind"], "segment_start"),
+            other => panic!("expected SegmentRotated, got {other:?}"),
         }
     }
 
@@ -1060,17 +1060,17 @@ mod tests {
     #[test]
     fn event_compact_done_roundtrip() {
         let id = uuid::Uuid::parse_str("0192f0e8-4d84-7d6e-a000-000000000001").unwrap();
-        let event = Event::CompactDone { new_session_id: id };
+        let event = Event::CompactDone { new_segment_id: id };
         let json = serde_json::to_string(&event).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["event"], "compact_done");
         assert_eq!(
-            parsed["data"]["new_session_id"],
+            parsed["data"]["new_segment_id"],
             "0192f0e8-4d84-7d6e-a000-000000000001"
         );
         let decoded: Event = serde_json::from_str(&json).unwrap();
         match decoded {
-            Event::CompactDone { new_session_id } => assert_eq!(new_session_id, id),
+            Event::CompactDone { new_segment_id } => assert_eq!(new_segment_id, id),
             other => panic!("expected CompactDone, got {other:?}"),
         }
     }

@@ -260,7 +260,7 @@ mod tests {
         let (id_a, _) = write_staging(
             &layout,
             SourceRef {
-                session_id: "s".into(),
+                segment_id: "s".into(),
                 range: [0, 0],
             },
             ExtractedPayload::default(),
@@ -269,7 +269,7 @@ mod tests {
         let (id_b, _) = write_staging(
             &layout,
             SourceRef {
-                session_id: "s".into(),
+                segment_id: "s".into(),
                 range: [1, 1],
             },
             ExtractedPayload::default(),

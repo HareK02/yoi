@@ -483,7 +483,7 @@ impl App {
                 self.blocks.push(Block::UserMessage { segments });
                 self.assistant_streaming = false;
             }
-            Event::SessionRotated { entry } => {
+            Event::SegmentRotated { entry } => {
                 self.reset_for_rotation();
                 self.apply_log_entry_raw(&entry);
                 self.assistant_streaming = false;
@@ -685,7 +685,7 @@ impl App {
                     started_at: Instant::now(),
                 }));
             }
-            Event::CompactDone { new_session_id } => {
+            Event::CompactDone { new_segment_id } => {
                 if let Some(evt) = self.last_streaming_compact_mut() {
                     let elapsed_secs = match evt {
                         CompactEvent::Streaming { started_at } => {
@@ -694,12 +694,12 @@ impl App {
                         _ => None,
                     };
                     *evt = CompactEvent::Done {
-                        new_session_id,
+                        new_segment_id,
                         elapsed_secs,
                     };
                 } else {
                     self.blocks.push(Block::Compact(CompactEvent::Done {
-                        new_session_id,
+                        new_segment_id,
                         elapsed_secs: None,
                     }));
                 }
@@ -932,7 +932,7 @@ impl App {
     }
 
     /// Drop the derived view in preparation for replaying a new
-    /// `SessionStart` (compaction / fork). Greeting is preserved
+    /// `SegmentStart` (compaction / fork). Greeting is preserved
     /// because the Pod identity hasn't changed.
     fn reset_for_rotation(&mut self) {
         let greeting = self.blocks.iter().find_map(|b| match b {
@@ -958,7 +958,7 @@ impl App {
             return;
         };
         match entry {
-            session_store::LogEntry::SessionStart { history, .. } => {
+            session_store::LogEntry::SegmentStart { history, .. } => {
                 for logged in history {
                     let item: llm_worker::Item = logged.into();
                     let item_value = serde_json::to_value(&item).expect("Item is Serialize");
@@ -1445,7 +1445,7 @@ mod completion_flow_tests {
     #[test]
     fn snapshot_renders_system_message_block_from_session_start() {
         let mut app = App::new("test".into());
-        let session_start = session_store::LogEntry::SessionStart {
+        let session_start = session_store::LogEntry::SegmentStart {
             ts: 1,
             system_prompt: None,
             config: Default::default(),
@@ -1525,15 +1525,15 @@ mod completion_flow_tests {
         let id = uuid::Uuid::parse_str("12345678-1234-5678-1234-567812345678").unwrap();
 
         app.handle_pod_event(Event::CompactStart);
-        app.handle_pod_event(Event::CompactDone { new_session_id: id });
+        app.handle_pod_event(Event::CompactDone { new_segment_id: id });
 
         assert_eq!(compact_block_count(&app), 1);
         assert!(matches!(
             app.blocks.as_slice(),
             [Block::Compact(CompactEvent::Done {
-                new_session_id,
+                new_segment_id,
                 elapsed_secs: Some(_),
-            })] if *new_session_id == id
+            })] if *new_segment_id == id
         ));
     }
 

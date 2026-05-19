@@ -349,7 +349,7 @@ async fn stop_pod_sends_shutdown_and_releases_scope() {
                 permission: Permission::Write,
                 recursive: true,
             }],
-            session_store::new_session_id(),
+            session_store::new_segment_id(),
         )
         .unwrap();
         pod_registry::delegate_scope(

@@ -1,4 +1,4 @@
-//! Session-scoped tracker for file operations performed by the builtin
+//! Pod-lifetime tracker for file operations performed by the builtin
 //! file-manipulation tools.
 //!
 //! A `Tracker` serves two orthogonal purposes:

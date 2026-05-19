@@ -8,7 +8,7 @@
 use std::sync::{LazyLock, Mutex};
 
 use pod::{Pod, PodError};
-use session_store::{FsStore, SessionId, StoreError};
+use session_store::{FsStore, SegmentId, StoreError};
 
 const MINIMAL_MANIFEST_TOML: &str = r#"
 [pod]
@@ -42,7 +42,7 @@ async fn restore_from_manifest_rejects_unknown_session() {
     // A freshly-minted id with no jsonl file at all → store returns
     // NotFound, which `Pod::restore_from_manifest` surfaces verbatim
     // as `PodError::Store`.
-    let unknown = session_store::new_session_id();
+    let unknown = session_store::new_segment_id();
     let result =
         Pod::restore_from_manifest(unknown, manifest, store, pod::PromptLoader::builtins_only())
             .await;
@@ -64,10 +64,10 @@ async fn restore_from_manifest_rejects_empty_session_log() {
 
     // Pre-create an empty `<id>.jsonl` so `read_all` succeeds with no
     // entries. `collect_state` returns `entries_count = 0`, which
-    // `restore_from_manifest` rejects with `SessionEmpty` *before* it
+    // `restore_from_manifest` rejects with `SegmentEmpty` *before* it
     // gets as far as building the LLM client — so the test does not
     // need credentials or a runtime sandbox.
-    let id: SessionId = session_store::new_session_id();
+    let id: SegmentId = session_store::new_segment_id();
     let path = store_tmp.path().join(format!("{id}.jsonl"));
     std::fs::write(&path, b"").unwrap();
 
@@ -75,8 +75,8 @@ async fn restore_from_manifest_rejects_empty_session_log() {
         Pod::restore_from_manifest(id, manifest, store, pod::PromptLoader::builtins_only()).await;
 
     match result {
-        Err(PodError::SessionEmpty { session_id }) => assert_eq!(session_id, id),
-        Err(other) => panic!("expected SessionEmpty, got {other:?}"),
+        Err(PodError::SegmentEmpty { segment_id }) => assert_eq!(segment_id, id),
+        Err(other) => panic!("expected SegmentEmpty, got {other:?}"),
         Ok(_) => panic!("expected empty session log to fail"),
     }
 }
@@ -89,20 +89,20 @@ async fn restore_from_manifest_rejects_session_without_scope_snapshot() {
     let store = FsStore::new(store_tmp.path()).unwrap();
     let manifest = pod::PodManifest::from_toml(MINIMAL_MANIFEST_TOML).unwrap();
 
-    let id = session_store::new_session_id();
-    let state = session_store::SessionStartState {
+    let id = session_store::new_segment_id();
+    let state = session_store::SegmentStartState {
         system_prompt: None,
         config: &Default::default(),
         history: &[],
     };
-    session_store::create_session_with_id(&store, id, state).unwrap();
+    session_store::create_segment_with_id(&store, id, state).unwrap();
 
     let result =
         Pod::restore_from_manifest(id, manifest, store, pod::PromptLoader::builtins_only()).await;
 
     match result {
-        Err(PodError::SessionScopeMissing { session_id }) => assert_eq!(session_id, id),
-        Err(other) => panic!("expected SessionScopeMissing, got {other:?}"),
+        Err(PodError::SegmentScopeMissing { segment_id }) => assert_eq!(segment_id, id),
+        Err(other) => panic!("expected SegmentScopeMissing, got {other:?}"),
         Ok(_) => panic!("expected missing scope snapshot to fail"),
     }
 }

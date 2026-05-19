@@ -482,7 +482,7 @@ fn pod_registry_err_to_tool(e: ScopeLockError) -> ToolError {
         | ScopeLockError::WriteConflict { .. }
         | ScopeLockError::DuplicatePodName(_)
         | ScopeLockError::UnknownPod(_)
-        | ScopeLockError::SessionConflict { .. } => ToolError::InvalidArgument(e.to_string()),
+        | ScopeLockError::SegmentConflict { .. } => ToolError::InvalidArgument(e.to_string()),
         ScopeLockError::Io(_) => ToolError::ExecutionFailed(e.to_string()),
     }
 }

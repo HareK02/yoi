@@ -6,12 +6,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
 use manifest::{Permission, ScopeRule};
-use session_store::SessionId;
+use session_store::SegmentId;
 
 use crate::table::LockFileGuard;
 
-pub(crate) fn sid() -> SessionId {
-    session_store::new_session_id()
+pub(crate) fn sid() -> SegmentId {
+    session_store::new_segment_id()
 }
 
 /// Serialises tests that mutate runtime-dir env vars. The test

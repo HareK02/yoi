@@ -9,7 +9,7 @@ use llm_worker::interceptor::{Interceptor, TurnEndAction};
 use llm_worker::llm_client::event::{Event, ResponseStatus, StatusEvent};
 use llm_worker::llm_client::types::{Item, RequestConfig};
 use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
-use session_store::{FsStore, LogEntry, SessionStartState, Store, collect_state};
+use session_store::{FsStore, LogEntry, SegmentStartState, Store, collect_state};
 
 // =============================================================================
 // Helpers
@@ -95,13 +95,13 @@ fn make_store() -> (tempfile::TempDir, FsStore) {
 async fn run_and_persist(
     worker: Worker<MockLlmClient>,
     store: &FsStore,
-    session_id: session_store::SessionId,
+    segment_id: session_store::SegmentId,
     input: &str,
 ) -> (Worker<MockLlmClient>, llm_worker::WorkerResult) {
     // Mirror Pod's run-entry contract: log the user input as segments
     // before the worker pushes its flattened user_message; save_delta
     // skips the resulting user_message item to avoid double-write.
-    session_store::save_user_input(store, session_id, vec![protocol::Segment::text(input)])
+    session_store::save_user_input(store, segment_id, vec![protocol::Segment::text(input)])
         .unwrap();
 
     let history_before = worker.history().len();
@@ -111,14 +111,14 @@ async fn run_and_persist(
     let worker = locked.unlock();
 
     let new_items = &worker.history()[history_before..];
-    session_store::save_delta(store, session_id, new_items).unwrap();
-    session_store::save_turn_end(store, session_id, worker.turn_count()).unwrap();
+    session_store::save_delta(store, segment_id, new_items).unwrap();
+    session_store::save_turn_end(store, segment_id, worker.turn_count()).unwrap();
 
     match &result {
         Ok(r) => {
             session_store::save_run_completed(
                 store,
-                session_id,
+                segment_id,
                 r.clone(),
                 worker.last_run_interrupted(),
             )
@@ -127,7 +127,7 @@ async fn run_and_persist(
         Err(e) => {
             session_store::save_run_errored(
                 store,
-                session_id,
+                segment_id,
                 e.to_string(),
                 worker.last_run_interrupted(),
             )
@@ -149,9 +149,9 @@ async fn session_run_logs_entries() {
     let client = MockLlmClient::new(simple_text_events());
     let worker = Worker::new(client);
 
-    let sid = session_store::create_session(
+    let sid = session_store::create_segment(
         &store,
-        SessionStartState {
+        SegmentStartState {
             system_prompt: worker.get_system_prompt(),
             config: worker.request_config(),
             history: worker.history(),
@@ -164,15 +164,15 @@ async fn session_run_logs_entries() {
 
     let entries = store.read_all(sid).unwrap();
 
-    // SessionStart, UserInput, AssistantItems, TurnEnd, RunCompleted (at minimum)
+    // SegmentStart, UserInput, AssistantItems, TurnEnd, RunCompleted (at minimum)
     assert!(
         entries.len() >= 4,
         "expected at least 4 entries, got {}",
         entries.len()
     );
 
-    // First entry is SessionStart
-    assert!(matches!(&entries[0], LogEntry::SessionStart { .. }));
+    // First entry is SegmentStart
+    assert!(matches!(&entries[0], LogEntry::SegmentStart { .. }));
 
     // Has a RunCompleted with Finished
     let has_finished = entries.iter().any(|e| {
@@ -194,9 +194,9 @@ async fn session_restore_round_trip() {
     let mut worker = Worker::new(client);
     worker.set_system_prompt("You are helpful.");
 
-    let sid = session_store::create_session(
+    let sid = session_store::create_segment(
         &store,
-        SessionStartState {
+        SegmentStartState {
             system_prompt: worker.get_system_prompt(),
             config: worker.request_config(),
             history: worker.history(),
@@ -225,9 +225,9 @@ async fn session_run_with_tool_call() {
     let mut worker = Worker::new(client);
     worker.register_tool(weather_tool_definition());
 
-    let sid = session_store::create_session(
+    let sid = session_store::create_segment(
         &store,
-        SessionStartState {
+        SegmentStartState {
             system_prompt: worker.get_system_prompt(),
             config: worker.request_config(),
             history: worker.history(),
@@ -260,9 +260,9 @@ async fn session_resume_after_pause() {
     worker.register_tool(weather_tool_definition());
     worker.set_interceptor(PausePolicy);
 
-    let sid = session_store::create_session(
+    let sid = session_store::create_segment(
         &store,
-        SessionStartState {
+        SegmentStartState {
             system_prompt: worker.get_system_prompt(),
             config: worker.request_config(),
             history: worker.history(),
@@ -298,9 +298,9 @@ async fn session_fork_preserves_state() {
     let mut worker = Worker::new(client);
     worker.set_system_prompt("System prompt");
 
-    let sid = session_store::create_session(
+    let sid = session_store::create_segment(
         &store,
-        SessionStartState {
+        SegmentStartState {
             system_prompt: worker.get_system_prompt(),
             config: worker.request_config(),
             history: worker.history(),
@@ -313,7 +313,7 @@ async fn session_fork_preserves_state() {
     let original_history_len = worker.history().len();
     let fork_id = session_store::fork(
         &store,
-        SessionStartState {
+        SegmentStartState {
             system_prompt: worker.get_system_prompt(),
             config: worker.request_config(),
             history: worker.history(),
@@ -321,10 +321,10 @@ async fn session_fork_preserves_state() {
     )
     .unwrap();
 
-    // Fork should have a SessionStart with the current history
+    // Fork should have a SegmentStart with the current history
     let fork_entries = store.read_all(fork_id).unwrap();
     assert_eq!(fork_entries.len(), 1);
-    assert!(matches!(&fork_entries[0], LogEntry::SessionStart { .. }));
+    assert!(matches!(&fork_entries[0], LogEntry::SegmentStart { .. }));
 
     let fork_state = collect_state(&fork_entries);
     assert_eq!(fork_state.history.len(), original_history_len);
@@ -337,9 +337,9 @@ async fn session_fork_at_truncates() {
     let client = MockLlmClient::new(simple_text_events());
     let worker = Worker::new(client);
 
-    let sid = session_store::create_session(
+    let sid = session_store::create_segment(
         &store,
-        SessionStartState {
+        SegmentStartState {
             system_prompt: worker.get_system_prompt(),
             config: worker.request_config(),
             history: worker.history(),
@@ -356,7 +356,7 @@ async fn session_fork_at_truncates() {
     let fork_id = session_store::fork_at(&store, sid, worker.turn_count()).unwrap();
 
     let fork_entries = store.read_all(fork_id).unwrap();
-    assert_eq!(fork_entries.len(), 1); // Just the new SessionStart
+    assert_eq!(fork_entries.len(), 1); // Just the new SegmentStart
 
     let fork_state = collect_state(&fork_entries);
     // History at fork point should match history right after the TurnEnd in
@@ -375,9 +375,9 @@ async fn session_config_changed_logged() {
     let client = MockLlmClient::new(vec![]);
     let mut worker = Worker::new(client);
 
-    let sid = session_store::create_session(
+    let sid = session_store::create_segment(
         &store,
-        SessionStartState {
+        SegmentStartState {
             system_prompt: worker.get_system_prompt(),
             config: worker.request_config(),
             history: worker.history(),
@@ -408,17 +408,17 @@ async fn session_auto_forks_on_conflict() {
     let client_a = MockLlmClient::new(simple_text_events());
     let worker_a = Worker::new(client_a);
 
-    let original_sid = session_store::create_session(
+    let original_sid = session_store::create_segment(
         &store,
-        SessionStartState {
+        SegmentStartState {
             system_prompt: worker_a.get_system_prompt(),
             config: worker_a.request_config(),
             history: worker_a.history(),
         },
     )
     .unwrap();
-    let mut session_id = original_sid;
-    // Writer tracked: just the SessionStart we wrote.
+    let mut segment_id = original_sid;
+    // Writer tracked: just the SegmentStart we wrote.
     let mut entries_written: usize = 1;
 
     // Simulate another Pod writing to the same session behind our back.
@@ -431,9 +431,9 @@ async fn session_auto_forks_on_conflict() {
     // Now the on-disk count exceeds our tally — ensure_head_or_fork should auto-fork.
     session_store::ensure_head_or_fork(
         &store,
-        &mut session_id,
+        &mut segment_id,
         &mut entries_written,
-        SessionStartState {
+        SegmentStartState {
             system_prompt: worker_a.get_system_prompt(),
             config: worker_a.request_config(),
             history: worker_a.history(),
@@ -441,11 +441,11 @@ async fn session_auto_forks_on_conflict() {
     )
     .unwrap();
 
-    // session_id should now be different
-    assert_ne!(session_id, original_sid);
+    // segment_id should now be different
+    assert_ne!(segment_id, original_sid);
 
     // The fork session should exist and have entries
-    let fork_entries = store.read_all(session_id).unwrap();
+    let fork_entries = store.read_all(segment_id).unwrap();
     assert!(!fork_entries.is_empty());
 
     // Original session should still have the interloper entry

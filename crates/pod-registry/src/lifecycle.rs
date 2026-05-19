@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 
 use manifest::ScopeRule;
-use session_store::SessionId;
+use session_store::SegmentId;
 
 use crate::error::ScopeLockError;
 use crate::mutate::release_pod;
@@ -45,9 +45,9 @@ pub fn install_top_level(
     pid: u32,
     socket: PathBuf,
     scope_allow: Vec<ScopeRule>,
-    session_id: SessionId,
+    segment_id: SegmentId,
 ) -> Result<ScopeAllocationGuard, ScopeLockError> {
-    install_top_level_with_deny(pod_name, pid, socket, scope_allow, Vec::new(), session_id)
+    install_top_level_with_deny(pod_name, pid, socket, scope_allow, Vec::new(), segment_id)
 }
 
 /// Open the default lock file, register a top-level Pod with explicit
@@ -59,7 +59,7 @@ pub fn install_top_level_with_deny(
     socket: PathBuf,
     scope_allow: Vec<ScopeRule>,
     scope_deny: Vec<ScopeRule>,
-    session_id: SessionId,
+    segment_id: SegmentId,
 ) -> Result<ScopeAllocationGuard, ScopeLockError> {
     let lock_path = default_registry_path()?;
     let mut guard = LockFileGuard::open(&lock_path)?;
@@ -70,7 +70,7 @@ pub fn install_top_level_with_deny(
         socket,
         scope_allow,
         scope_deny,
-        session_id,
+        segment_id,
     )?;
     Ok(ScopeAllocationGuard {
         pod_name,
@@ -83,14 +83,14 @@ pub fn install_top_level_with_deny(
 ///
 /// The spawning flow is two-stage: the spawner calls
 /// [`crate::delegate_scope`] (with its own pid as a live placeholder,
-/// `session_id = None`), then exec's the child; the child, once
+/// `segment_id = None`), then exec's the child; the child, once
 /// running, calls this function to rewrite the allocation's pid +
-/// session_id to its own and claim the [`ScopeAllocationGuard`] so
+/// segment_id to its own and claim the [`ScopeAllocationGuard`] so
 /// the entry is released when the child exits.
 pub fn adopt_allocation(
     pod_name: String,
     new_pid: u32,
-    session_id: SessionId,
+    segment_id: SegmentId,
 ) -> Result<ScopeAllocationGuard, ScopeLockError> {
     let lock_path = default_registry_path()?;
     let mut guard = LockFileGuard::open(&lock_path)?;
@@ -99,7 +99,7 @@ pub fn adopt_allocation(
         .find_mut(&pod_name)
         .ok_or_else(|| ScopeLockError::UnknownPod(pod_name.clone()))?;
     alloc.pid = new_pid;
-    alloc.session_id = Some(session_id);
+    alloc.segment_id = Some(segment_id);
     guard.save()?;
     Ok(ScopeAllocationGuard {
         pod_name,
@@ -107,32 +107,32 @@ pub fn adopt_allocation(
     })
 }
 
-/// Rewrite the `session_id` recorded for `pod_name` to
-/// `new_session_id`.
+/// Rewrite the `segment_id` recorded for `pod_name` to
+/// `new_segment_id`.
 ///
-/// The Pod's in-memory `session_id` can change underneath the
+/// The Pod's in-memory `segment_id` can change underneath the
 /// allocation in two normal places:
 ///
 /// - `Pod::compact` mints a fresh session and swaps it in.
 /// - `session_store::ensure_head_or_fork` auto-forks when another
 ///   writer has advanced the store head behind our back.
 ///
-/// Both paths must call this so subsequent [`lookup_session`] queries
+/// Both paths must call this so subsequent [`lookup_segment`] queries
 /// find the live session id, not the old one. Without this update a
 /// concurrent `restore_from_manifest(new_id)` would see "no live
 /// writer" and proceed to register a competing allocation on the
 /// session this Pod just moved into.
 ///
 /// The lock is opened once and the allocation is rewritten inside the
-/// guard, so the session_id collision check is atomic with the
+/// guard, so the segment_id collision check is atomic with the
 /// rewrite.
-pub fn update_session(pod_name: &str, new_session_id: SessionId) -> Result<(), ScopeLockError> {
+pub fn update_segment(pod_name: &str, new_segment_id: SegmentId) -> Result<(), ScopeLockError> {
     let lock_path = default_registry_path()?;
     let mut guard = LockFileGuard::open(&lock_path)?;
-    if let Some(other) = guard.data().find_by_session(new_session_id) {
+    if let Some(other) = guard.data().find_by_segment(new_segment_id) {
         if other.pod_name != pod_name {
-            return Err(ScopeLockError::SessionConflict {
-                session_id: new_session_id,
+            return Err(ScopeLockError::SegmentConflict {
+                segment_id: new_segment_id,
                 pod_name: other.pod_name.clone(),
                 socket: other.socket.clone(),
             });
@@ -142,7 +142,7 @@ pub fn update_session(pod_name: &str, new_session_id: SessionId) -> Result<(), S
         .data_mut()
         .find_mut(pod_name)
         .ok_or_else(|| ScopeLockError::UnknownPod(pod_name.into()))?;
-    alloc.session_id = Some(new_session_id);
+    alloc.segment_id = Some(new_segment_id);
     guard.save()?;
     Ok(())
 }
@@ -150,25 +150,25 @@ pub fn update_session(pod_name: &str, new_session_id: SessionId) -> Result<(), S
 /// Information about a Pod that currently holds an allocation for a
 /// given session.
 #[derive(Debug, Clone)]
-pub struct SessionLockInfo {
+pub struct SegmentLockInfo {
     pub pod_name: String,
     pub socket: PathBuf,
     pub pid: u32,
 }
 
 /// Open the default lock file, reclaim stale entries, and return the
-/// allocation currently writing to `session_id`, if any.
+/// allocation currently writing to `segment_id`, if any.
 ///
 /// Used by `Pod::restore_from_manifest` to refuse a resume that would
 /// race a live writer on the same source session.
-pub fn lookup_session(session_id: SessionId) -> Result<Option<SessionLockInfo>, ScopeLockError> {
+pub fn lookup_segment(segment_id: SegmentId) -> Result<Option<SegmentLockInfo>, ScopeLockError> {
     let lock_path = default_registry_path()?;
     let mut guard = LockFileGuard::open(&lock_path)?;
     crate::mutate::reclaim_stale(&mut guard);
     Ok(guard
         .data()
-        .find_by_session(session_id)
-        .map(|a| SessionLockInfo {
+        .find_by_segment(segment_id)
+        .map(|a| SegmentLockInfo {
             pod_name: a.pod_name.clone(),
             socket: a.socket.clone(),
             pid: a.pid,
@@ -193,7 +193,7 @@ mod tests {
             scope_allow: vec![write_rule("/tmp/child", true)],
             scope_deny: Vec::new(),
             delegated_from: None,
-            session_id: None,
+            segment_id: None,
         });
         g.save().unwrap();
     }
@@ -267,12 +267,12 @@ mod tests {
             s,
         )
         .unwrap();
-        let info = lookup_session(s).unwrap().expect("expected live writer");
+        let info = lookup_segment(s).unwrap().expect("expected live writer");
         assert_eq!(info.pod_name, "live");
         assert_eq!(info.socket, sock("live"));
         drop(guard);
         // After the guard's release, the lookup goes back to None.
-        assert!(lookup_session(s).unwrap().is_none());
+        assert!(lookup_segment(s).unwrap().is_none());
     }
 
     #[test]
@@ -289,10 +289,10 @@ mod tests {
             original,
         )
         .unwrap();
-        update_session("p", updated).unwrap();
+        update_segment("p", updated).unwrap();
         // lookup against the original is now empty, the updated id wins.
-        assert!(lookup_session(original).unwrap().is_none());
-        assert_eq!(lookup_session(updated).unwrap().unwrap().pod_name, "p");
+        assert!(lookup_segment(original).unwrap().is_none());
+        assert_eq!(lookup_segment(updated).unwrap().unwrap().pod_name, "p");
     }
 
     #[test]
@@ -318,17 +318,17 @@ mod tests {
         )
         .unwrap();
         // `a` cannot adopt b's live session id.
-        let err = update_session("a", s_b).unwrap_err();
+        let err = update_segment("a", s_b).unwrap_err();
         match err {
-            ScopeLockError::SessionConflict {
+            ScopeLockError::SegmentConflict {
                 pod_name,
-                session_id,
+                segment_id,
                 ..
             } => {
                 assert_eq!(pod_name, "b");
-                assert_eq!(session_id, s_b);
+                assert_eq!(segment_id, s_b);
             }
-            other => panic!("expected SessionConflict, got {other:?}"),
+            other => panic!("expected SegmentConflict, got {other:?}"),
         }
     }
 }

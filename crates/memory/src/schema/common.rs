@@ -10,7 +10,7 @@ pub use lint_common::Frontmatter;
 /// `last_sources` arrays for traceability back to raw session logs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceRef {
-    pub session_id: String,
+    pub segment_id: String,
     /// `[start_entry, end_entry]` inclusive range of session-store entry indices.
     pub range: [u64; 2],
 }

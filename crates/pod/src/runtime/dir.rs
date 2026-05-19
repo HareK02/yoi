@@ -131,7 +131,7 @@ mod tests {
     fn test_state() -> PodSharedState {
         PodSharedState::new(
             "test-pod".into(),
-            session_store::new_session_id(),
+            session_store::new_segment_id(),
             "[pod]\nname = \"test-pod\"".into(),
             protocol::Greeting {
                 pod_name: "test-pod".into(),

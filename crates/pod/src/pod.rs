@@ -9,11 +9,11 @@ use llm_worker::llm_client::client::LlmClient;
 use llm_worker::state::Mutable;
 use llm_worker::{ToolOutputLimits, UsageRecord, Worker, WorkerError, WorkerResult};
 use session_store::{
-    LogEntry, PodScopeSnapshot, SessionId, Store, StoreError, SystemItem, session_log, to_logged,
+    LogEntry, PodScopeSnapshot, SegmentId, Store, StoreError, SystemItem, segment_log, to_logged,
 };
 use tracing::{info, warn};
 
-use crate::session_log_sink::SessionLogSink;
+use crate::segment_log_sink::SegmentLogSink;
 
 use manifest::{
     Permission, PodManifest, PodManifestConfig, ResolveError, Scope, ScopeConfig, ScopeError,
@@ -44,33 +44,33 @@ use tokio::task::JoinHandle;
 
 /// Lock-free shared session pointer.
 ///
-/// Holds the current `(session_id, entries_written)` pair so that the
+/// Holds the current `(segment_id, entries_written)` pair so that the
 /// Pod and every `LogWriterHandle` clone see a consistent view through
-/// `Arc`-shared lock-free reads. `session_id` is wrapped in `ArcSwap`
+/// `Arc`-shared lock-free reads. `segment_id` is wrapped in `ArcSwap`
 /// so fork (a rare, run-start-only event) can atomically swap it
 /// without taking a mutex on the append hot path. `entries_written` is
 /// an `AtomicUsize` bumped on every successful append; the writer's
 /// tally is compared against the store's on-disk count to detect
-/// concurrent writers in `ensure_session_head`.
-pub struct SessionState {
-    session_id: ArcSwap<SessionId>,
+/// concurrent writers in `ensure_segment_head`.
+pub struct SegmentState {
+    segment_id: ArcSwap<SegmentId>,
     entries_written: AtomicUsize,
 }
 
-impl SessionState {
-    pub fn new(session_id: SessionId, entries_written: usize) -> Arc<Self> {
+impl SegmentState {
+    pub fn new(segment_id: SegmentId, entries_written: usize) -> Arc<Self> {
         Arc::new(Self {
-            session_id: ArcSwap::from_pointee(session_id),
+            segment_id: ArcSwap::from_pointee(segment_id),
             entries_written: AtomicUsize::new(entries_written),
         })
     }
 
-    pub fn session_id(&self) -> SessionId {
-        **self.session_id.load()
+    pub fn segment_id(&self) -> SegmentId {
+        **self.segment_id.load()
     }
 
-    pub fn set_session_id(&self, id: SessionId) {
-        self.session_id.store(Arc::new(id));
+    pub fn set_segment_id(&self, id: SegmentId) {
+        self.segment_id.store(Arc::new(id));
     }
 
     pub fn entries_written(&self) -> usize {
@@ -94,8 +94,8 @@ impl SessionState {
 #[derive(Clone)]
 pub struct LogWriterHandle<St: Clone> {
     pub store: St,
-    pub state: Arc<SessionState>,
-    pub sink: SessionLogSink,
+    pub state: Arc<SegmentState>,
+    pub sink: SegmentLogSink,
 }
 
 impl<St> LogWriterHandle<St>
@@ -107,8 +107,8 @@ where
     /// writes for `< PIPE_BUF` lines, so no user-space serialization is
     /// needed across appenders.
     pub fn append_entry(&self, entry: LogEntry) -> Result<(), StoreError> {
-        let session_id = self.state.session_id();
-        self.store.append(session_id, &entry)?;
+        let segment_id = self.state.segment_id();
+        self.store.append(segment_id, &entry)?;
         self.state.increment_entries();
         self.sink.publish(entry);
         Ok(())
@@ -128,7 +128,7 @@ where
 {
     fn commit_system_item(&self, item: SystemItem) {
         let entry = LogEntry::SystemItem {
-            ts: session_log::now_millis(),
+            ts: segment_log::now_millis(),
             item,
         };
         if let Err(err) = self.append_entry(entry) {
@@ -162,9 +162,9 @@ pub struct Pod<C: LlmClient, St: Store> {
     worker: Option<Worker<C, Mutable>>,
     store: St,
     /// Shared session pointer. Source of truth for the Pod's current
-    /// `session_id` and append tally. `self.session_id()` is a thin
-    /// wrapper over `session_state.session_id()`.
-    session_state: Arc<SessionState>,
+    /// `segment_id` and append tally. `self.segment_id()` is a thin
+    /// wrapper over `segment_state.segment_id()`.
+    segment_state: Arc<SegmentState>,
     /// Absolute working directory of the Pod.
     pwd: PathBuf,
     /// Shared, atomically-swappable view of the Pod's resolved scope.
@@ -193,12 +193,12 @@ pub struct Pod<C: LlmClient, St: Store> {
     /// Worker (e.g. the savings estimator used by the prune projection)
     /// can share the same view via [`Pod::usage_history_handle`].
     usage_history: Arc<Mutex<Vec<UsageRecord>>>,
-    /// Session-lifetime file-operation tracker from the builtin `tools`
+    /// Pod-lifetime file-operation tracker from the builtin `tools`
     /// crate. Populated by the Controller when it registers the builtin
     /// tools so that Pod-owned operations (e.g. compaction) can consult
     /// the recency of touched files.
     tracker: Option<tools::Tracker>,
-    /// Session-lifetime task store from the builtin `tools` crate. Shared by
+    /// Pod-lifetime task store from the builtin `tools` crate. Shared by
     /// TaskCreate / TaskUpdate / TaskList / TaskGet and preserved across
     /// compaction by keeping the same handle while the Worker history is
     /// replaced. Restored Pods reconstruct it by replaying Task* tool calls.
@@ -284,7 +284,7 @@ pub struct Pod<C: LlmClient, St: Store> {
     memory_task: Option<JoinHandle<()>>,
     /// Typed user submissions in submit order. K-th entry corresponds to
     /// the K-th `Item::user_message` in `worker.history()` (modulo seed
-    /// history loaded via `SessionStart.history`, whose original segments
+    /// history loaded via `SegmentStart.history`, whose original segments
     /// are not preserved). Populated from log on `restore_from_manifest`,
     /// appended after `save_user_input` on each `run`. Pre-`Event::Snapshot`
     /// this fed `PodSharedState.user_segments`; the new wire format
@@ -295,7 +295,7 @@ pub struct Pod<C: LlmClient, St: Store> {
     /// every successful `session_store::append_entry` write so connected
     /// clients see a `(snapshot, live)` stream consistent with what's
     /// on disk.
-    sink: SessionLogSink,
+    sink: SegmentLogSink,
     /// `true` once `wire_history_persistence` has installed the
     /// `Worker::on_history_append` callback that commits each appended
     /// item as a singular `LogEntry::AssistantItem` / `ToolResult`
@@ -338,7 +338,7 @@ impl<C: LlmClient + Clone + 'static, St: Store + Clone + 'static> Pod<C, St> {
             manifest: self.manifest.clone(),
             worker: Some(worker),
             store: self.store.clone(),
-            session_state: self.session_state.clone(),
+            segment_state: self.segment_state.clone(),
             pwd: self.pwd.clone(),
             scope: self.scope.clone(),
             hook_builder: HookRegistryBuilder::new(),
@@ -369,7 +369,7 @@ impl<C: LlmClient + Clone + 'static, St: Store + Clone + 'static> Pod<C, St> {
             // The memory-task clone never appends to the session log
             // (it only reads `worker.history()`), so a fresh sink is
             // fine — nothing observes its broadcast.
-            sink: SessionLogSink::new(),
+            sink: SegmentLogSink::new(),
             history_persistence_wired: false,
             log_writer: None,
         }
@@ -382,7 +382,7 @@ impl<C: LlmClient + Clone + 'static, St: Store + Clone + 'static> Pod<C, St> {
     pub fn log_writer_handle(&self) -> LogWriterHandle<St> {
         LogWriterHandle {
             store: self.store.clone(),
-            state: self.session_state.clone(),
+            state: self.segment_state.clone(),
             sink: self.sink.clone(),
         }
     }
@@ -422,7 +422,7 @@ impl<C: LlmClient + Clone + 'static, St: Store + Clone + 'static> Pod<C, St> {
             ) {
                 return;
             }
-            let entry = session_store::classify_history_item(item, session_log::now_millis());
+            let entry = session_store::classify_history_item(item, segment_log::now_millis());
             if let Err(err) = writer.append_entry(entry) {
                 warn!(error = %err, "history append commit failed; dropping");
             }
@@ -469,16 +469,16 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         pwd: PathBuf,
         scope: Scope,
     ) -> Result<Self, PodError> {
-        // Session creation is deferred to `ensure_session_head` at first
+        // Segment creation is deferred to `ensure_segment_head` at first
         // run so a later-installed system-prompt template (see
-        // `set_system_prompt_template`) can be captured by `SessionStart`.
-        let session_id = session_store::new_session_id();
+        // `set_system_prompt_template`) can be captured by `SegmentStart`.
+        let segment_id = session_store::new_segment_id();
         let prompts = PromptCatalog::builtins_only()?;
         let mut pod = Self {
             manifest,
             worker: Some(worker),
             store,
-            session_state: SessionState::new(session_id, 0),
+            segment_state: SegmentState::new(segment_id, 0),
             pwd,
             scope: SharedScope::new(scope),
             hook_builder: HookRegistryBuilder::new(),
@@ -506,7 +506,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             extract_pointer: Arc::new(Mutex::new(None)),
             memory_task: None,
             user_segments: Vec::new(),
-            sink: SessionLogSink::new(),
+            sink: SegmentLogSink::new(),
             history_persistence_wired: false,
             log_writer: None,
         };
@@ -544,8 +544,8 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
 
     /// The session ID used for persistence. Read lock-free from the
     /// shared session pointer so fork-time swaps are observed immediately.
-    pub fn session_id(&self) -> SessionId {
-        self.session_state.session_id()
+    pub fn segment_id(&self) -> SegmentId {
+        self.segment_state.segment_id()
     }
 
     /// The Pod's manifest.
@@ -604,7 +604,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     /// can restore the narrowed scope instead of reclaiming delegated
     /// writes.
     pub fn persist_scope_snapshot(&mut self) -> Result<(), StoreError> {
-        if self.session_state.entries_written() == 0 {
+        if self.segment_state.entries_written() == 0 {
             return Ok(());
         }
         let snapshot = {
@@ -616,7 +616,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         };
         let payload = serde_json::to_value(&snapshot).expect("PodScopeSnapshot is Serialize");
         self.commit_entry(LogEntry::Extension {
-            ts: session_log::now_millis(),
+            ts: segment_log::now_millis(),
             domain: session_store::POD_SCOPE_EXTENSION_DOMAIN.into(),
             payload,
         })
@@ -627,9 +627,9 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     /// concurrent appenders — the kernel orders `O_APPEND` writes for
     /// lines smaller than `PIPE_BUF`.
     pub(crate) fn commit_entry(&self, entry: LogEntry) -> Result<(), StoreError> {
-        let session_id = self.session_state.session_id();
-        self.store.append(session_id, &entry)?;
-        self.session_state.increment_entries();
+        let segment_id = self.segment_state.segment_id();
+        self.store.append(segment_id, &entry)?;
+        self.segment_state.increment_entries();
         self.sink.publish(entry);
         Ok(())
     }
@@ -637,7 +637,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     /// Cloneable sink handle. Exposed to the controller so the IPC
     /// layer can `subscribe_with_snapshot` and stream entries to
     /// clients without consulting any other state.
-    pub fn sink(&self) -> SessionLogSink {
+    pub fn sink(&self) -> SegmentLogSink {
         self.sink.clone()
     }
 
@@ -661,7 +661,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         if let Some(snapshot) = snapshot {
             let payload = serde_json::to_value(&snapshot).expect("PodScopeSnapshot is Serialize");
             self.commit_entry(LogEntry::Extension {
-                ts: session_log::now_millis(),
+                ts: segment_log::now_millis(),
                 domain: session_store::POD_SCOPE_EXTENSION_DOMAIN.into(),
                 payload,
             })?;
@@ -716,7 +716,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     /// Snapshot of the typed user segments tracked alongside worker
     /// history. The K-th entry corresponds to the K-th `Item::user_message`
     /// derived from `LogEntry::UserInput` entries (post-compaction); seed
-    /// history loaded via `SessionStart.history` does not contribute,
+    /// history loaded via `SegmentStart.history` does not contribute,
     /// which is acceptable because the original segments are unrecoverable.
     pub fn user_segments(&self) -> &[Vec<Segment>] {
         &self.user_segments
@@ -829,7 +829,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     fn try_record_metric(&mut self, metric: &session_metrics::Metric) {
         let payload = serde_json::to_value(metric).expect("Metric is Serialize");
         let entry = LogEntry::Extension {
-            ts: session_log::now_millis(),
+            ts: segment_log::now_millis(),
             domain: session_metrics::DOMAIN.into(),
             payload,
         };
@@ -1143,7 +1143,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         self.ensure_interceptor_installed();
         self.ensure_system_prompt_materialized()?;
         self.cleanup_finished_memory_task();
-        self.ensure_session_head()?;
+        self.ensure_segment_head()?;
         if self.should_pre_run_compact() {
             self.join_memory_task().await;
         }
@@ -1188,7 +1188,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         // IDLE → active marker. Commits first so the next UserInput entry
         // is contained inside this Invoke range. See `tickets/invoke-turn-llmcall-semantics.md`.
         self.commit_entry(LogEntry::Invoke {
-            ts: session_log::now_millis(),
+            ts: segment_log::now_millis(),
             trigger: protocol::InvokeKind::UserSend,
         })?;
 
@@ -1196,7 +1196,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         // pushes its flattened copy into history. save_delta deliberately
         // skips the resulting `is_user_message()` item to avoid double-write.
         self.commit_entry(LogEntry::UserInput {
-            ts: session_log::now_millis(),
+            ts: segment_log::now_millis(),
             segments: input.clone(),
         })
         ?;
@@ -1376,7 +1376,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             return;
         };
         if let Err(err) =
-            memory::append_use_event(layout, self.session_id().to_string(), source, records)
+            memory::append_use_event(layout, self.segment_id().to_string(), source, records)
         {
             warn!(error = %err, "failed to append memory usage event");
         }
@@ -1387,7 +1387,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             return;
         };
         if let Err(err) =
-            memory::append_resident_exposure_event(layout, self.session_id().to_string(), records)
+            memory::append_resident_exposure_event(layout, self.segment_id().to_string(), records)
         {
             warn!(error = %err, "failed to append resident exposure event");
         }
@@ -1578,7 +1578,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         // drain. The trailing SystemItem entries (drained by the
         // PodInterceptor) carry the actual payload.
         self.commit_entry(LogEntry::Invoke {
-            ts: session_log::now_millis(),
+            ts: segment_log::now_millis(),
             trigger: kind,
         })?;
 
@@ -1612,17 +1612,17 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     ///
     /// On the first call for a Pod built via `from_manifest`, the session
     /// has not been written to the store yet — this is when we append the
-    /// initial `SessionStart` entry, carrying the system prompt that
+    /// initial `SegmentStart` entry, carrying the system prompt that
     /// `ensure_system_prompt_materialized` has just rendered. Subsequent
     /// calls fall through to entry-count comparison, which auto-forks
     /// when another writer has appended behind our back.
-    fn ensure_session_head(&mut self) -> Result<(), PodError> {
+    fn ensure_segment_head(&mut self) -> Result<(), PodError> {
         let w = self.worker.as_ref().unwrap();
-        let prev_session_id = self.session_state.session_id();
-        let entries_written = self.session_state.entries_written();
+        let prev_segment_id = self.segment_state.segment_id();
+        let entries_written = self.segment_state.entries_written();
         if entries_written == 0 {
-            let initial = LogEntry::SessionStart {
-                ts: session_log::now_millis(),
+            let initial = LogEntry::SegmentStart {
+                ts: segment_log::now_millis(),
                 system_prompt: w.get_system_prompt().map(String::from),
                 config: w.request_config().clone(),
                 history: to_logged(w.history()),
@@ -1636,17 +1636,17 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         // Check store count + auto-fork if it drifted.
         let store_count = self
             .store
-            .read_entry_count(prev_session_id)
+            .read_entry_count(prev_segment_id)
             .map_err(PodError::from)?;
         if store_count == entries_written {
             return Ok(());
         }
         // Fork: mint a fresh session and switch to it. The new
-        // SessionStart entry replaces the mirror and is broadcast
+        // SegmentStart entry replaces the mirror and is broadcast
         // through the sink so existing subscribers reset their view.
-        let fork_id = session_store::new_session_id();
-        let entry = LogEntry::SessionStart {
-            ts: session_log::now_millis(),
+        let fork_id = session_store::new_segment_id();
+        let entry = LogEntry::SegmentStart {
+            ts: segment_log::now_millis(),
             system_prompt: w.get_system_prompt().map(String::from),
             config: w.request_config().clone(),
             history: to_logged(w.history()),
@@ -1654,13 +1654,13 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             compacted_from: None,
         };
         self.store
-            .create_session(fork_id, &[entry.clone()])
+            .create_segment(fork_id, &[entry.clone()])
             .map_err(PodError::from)?;
-        self.session_state.set_session_id(fork_id);
-        self.session_state.set_entries_written(1);
+        self.segment_state.set_segment_id(fork_id);
+        self.segment_state.set_entries_written(1);
         self.sink.reset_with_initial(entry);
         if self.scope_allocation.is_some() {
-            pod_registry::update_session(&self.manifest.pod.name, fork_id)?;
+            pod_registry::update_segment(&self.manifest.pod.name, fork_id)?;
         }
         Ok(())
     }
@@ -1717,12 +1717,12 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
 
             self.send_event(Event::CompactStart);
             match self.compact(retained).await {
-                Ok(new_session_id) => {
+                Ok(new_segment_id) => {
                     info!(
-                        new_session_id = %new_session_id,
+                        new_segment_id = %new_segment_id,
                         "Compaction succeeded, resuming execution"
                     );
-                    self.send_event(Event::CompactDone { new_session_id });
+                    self.send_event(Event::CompactDone { new_segment_id });
                     if let Some(ref state) = self.compact_state {
                         state.record_compact_success();
                     }
@@ -1767,12 +1767,12 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         let retained = state.retained_tokens();
         self.send_event(Event::CompactStart);
         match self.compact(retained).await {
-            Ok(new_session_id) => {
+            Ok(new_segment_id) => {
                 info!(
-                    new_session_id = %new_session_id,
+                    new_segment_id = %new_segment_id,
                     "Proactive pre-run compaction succeeded"
                 );
-                self.send_event(Event::CompactDone { new_session_id });
+                self.send_event(Event::CompactDone { new_segment_id });
                 state.record_compact_success();
             }
             Err(e) => {
@@ -1814,7 +1814,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 .iter()
                 .cloned()
                 .collect();
-            let ts = session_log::now_millis();
+            let ts = segment_log::now_millis();
             for item in &new_items {
                 if item.is_user_message() {
                     continue;
@@ -1837,7 +1837,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
 
         let turn_count = self.worker.as_ref().unwrap().turn_count();
         self.commit_entry(LogEntry::TurnEnd {
-            ts: session_log::now_millis(),
+            ts: segment_log::now_millis(),
             turn_count,
         })
         ?;
@@ -1874,7 +1874,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 correlation_id,
             } = recorded;
             self.commit_entry(LogEntry::LlmUsage {
-                ts: session_log::now_millis(),
+                ts: segment_log::now_millis(),
                 history_len: record.history_len,
                 input_total_tokens: record.input_total_tokens,
                 cache_read_tokens: record.cache_read_tokens,
@@ -1900,7 +1900,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         match result {
             Ok(r) => {
                 self.commit_entry(LogEntry::RunCompleted {
-                    ts: session_log::now_millis(),
+                    ts: segment_log::now_millis(),
                     interrupted,
                     result: r.clone(),
                 })
@@ -1908,7 +1908,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             }
             Err(e) => {
                 self.commit_entry(LogEntry::RunErrored {
-                    ts: session_log::now_millis(),
+                    ts: segment_log::now_millis(),
                     interrupted,
                     message: e.to_string(),
                 })
@@ -1928,7 +1928,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     /// - a clone of the main LlmClient via `clone_boxed()`.
     ///
     /// Returns the new session ID.
-    pub async fn compact(&mut self, retained_tokens: u64) -> Result<SessionId, PodError> {
+    pub async fn compact(&mut self, retained_tokens: u64) -> Result<SegmentId, PodError> {
         use crate::compact::worker::{
             CompactWorkerContext, CompactWorkerInterceptor, add_reference_tool,
             mark_read_required_tool, write_summary_tool,
@@ -2001,7 +2001,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             .compact_system()
             .map_err(PodError::PromptCatalog)?;
         let mut summary_worker = Worker::new(summary_client).system_prompt(summary_system_prompt);
-        summary_worker.set_cache_key(Some(self.session_id().to_string()));
+        summary_worker.set_cache_key(Some(self.segment_id().to_string()));
 
         // Occupancy-based input-token meter + interceptor. The tracker pairs
         // each pre-request history length with the following UsageEvent, then
@@ -2140,41 +2140,41 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             task_snapshot_text.clone(),
         ));
 
-        // Build the SessionStart entry for the new compacted session,
+        // Build the SegmentStart entry for the new compacted session,
         // then atomically rotate to it: create on disk, swap head, reset
         // the broadcast sink so existing subscribers see the new
-        // `SessionStart { compacted_from }` and reset their view.
-        let new_session_id = session_store::new_session_id();
-        let old_session_id = self.session_state.session_id();
+        // `SegmentStart { compacted_from }` and reset their view.
+        let new_segment_id = session_store::new_segment_id();
+        let old_session_id = self.segment_state.segment_id();
         let source_turn_count = self.worker.as_ref().unwrap().turn_count();
         let w = self.worker.as_ref().unwrap();
-        let entry = LogEntry::SessionStart {
-            ts: session_log::now_millis(),
+        let entry = LogEntry::SegmentStart {
+            ts: segment_log::now_millis(),
             system_prompt: w.get_system_prompt().map(String::from),
             config: w.request_config().clone(),
             history: to_logged(&new_history),
             forked_from: None,
-            compacted_from: Some(session_store::SessionOrigin {
-                session_id: old_session_id,
+            compacted_from: Some(session_store::SegmentOrigin {
+                segment_id: old_session_id,
                 at_turn_index: source_turn_count,
             }),
         };
-        self.store.create_session(new_session_id, &[entry.clone()])?;
-        self.session_state.set_session_id(new_session_id);
-        self.session_state.set_entries_written(1);
+        self.store.create_segment(new_segment_id, &[entry.clone()])?;
+        self.segment_state.set_segment_id(new_segment_id);
+        self.segment_state.set_entries_written(1);
         let session_start = entry;
-        // Broadcast the SessionStart through the sink. This atomically
-        // resets the mirror to `[SessionStart]` so any subscriber
+        // Broadcast the SegmentStart through the sink. This atomically
+        // resets the mirror to `[SegmentStart]` so any subscriber
         // querying after this point sees the post-compaction prefix.
         self.sink.reset_with_initial(session_start);
-        // Keep pods.json pointing at the live session_id. Without this
-        // a concurrent `restore_from_manifest(new_session_id)` would
+        // Keep pods.json pointing at the live segment_id. Without this
+        // a concurrent `restore_from_manifest(new_segment_id)` would
         // see no live writer and grab the session this Pod just moved
         // into, causing two writers to race on the same jsonl. Skipped
         // when no allocation is installed (e.g. compact under
         // `Pod::new` in tests).
         if self.scope_allocation.is_some() {
-            pod_registry::update_session(&self.manifest.pod.name, new_session_id)?;
+            pod_registry::update_segment(&self.manifest.pod.name, new_segment_id)?;
         }
         // Align user_segments with the post-compaction history. Items
         // before `retain_from` (now folded into the summary) lose their
@@ -2188,8 +2188,8 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
 
         self.worker.as_mut().unwrap().set_history(new_history);
         // Compaction-introduced system messages are part of the new
-        // SessionStart's history (broadcast above) — clients derive
-        // their blocks from `SessionStart.history`. No per-item
+        // SegmentStart's history (broadcast above) — clients derive
+        // their blocks from `SegmentStart.history`. No per-item
         // broadcast is required.
         let _ = &compact_introduced_system_messages;
         let worker = self.worker.as_mut().unwrap();
@@ -2198,9 +2198,9 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         // compact layout guarantees history[0] is the summary.
         worker.set_cache_anchor(Some(0));
         // Re-key the OpenAI Responses prompt cache namespace to the new
-        // session_id so post-compact turns share a key with extract /
+        // segment_id so post-compact turns share a key with extract /
         // consolidate workers running in the same session.
-        worker.set_cache_key(Some(new_session_id.to_string()));
+        worker.set_cache_key(Some(new_segment_id.to_string()));
         self.usage_history
             .lock()
             .expect("usage_history poisoned")
@@ -2219,7 +2219,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             .lock()
             .expect("extract_pointer poisoned") = None;
 
-        Ok(new_session_id)
+        Ok(new_segment_id)
     }
 
     /// Build the LlmClient for the compactor Worker.
@@ -2367,7 +2367,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         // Read the session log to get the current entry count. This is
         // the boundary for the source.range end_entry. Called once per
         // extract, on a small local file.
-        let entries_now = self.store.read_all(self.session_id())?.len();
+        let entries_now = self.store.read_all(self.segment_id())?.len();
         if entries_now == 0 {
             return Ok(ExtractDecision::Skipped);
         }
@@ -2399,7 +2399,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             .memory_extract_system(memory_language)
             .map_err(PodError::PromptCatalog)?;
         let mut extract_worker = Worker::new(client).system_prompt(extract_system_prompt);
-        extract_worker.set_cache_key(Some(self.session_id().to_string()));
+        extract_worker.set_cache_key(Some(self.segment_id().to_string()));
 
         // Occupancy-based input-token meter + interceptor. The tracker pairs
         // each pre-request history length with the following UsageEvent, then
@@ -2435,12 +2435,12 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             extract::ExtractedPayload::default()
         });
 
-        let source_session_id = self.session_state.session_id();
+        let source_segment_id = self.segment_state.segment_id();
         let staging_id = if payload.is_empty() {
             String::new()
         } else {
             let source = memory::schema::SourceRef {
-                session_id: source_session_id.to_string(),
+                segment_id: source_segment_id.to_string(),
                 range: [start_entry as u64, end_entry as u64],
             };
             let (id, _) = extract::write_staging(&layout, source, payload)
@@ -2456,7 +2456,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         let payload_value = serde_json::to_value(&pointer_payload)
             .expect("ExtractPointerPayload is always JSON-serializable");
         self.commit_entry(LogEntry::Extension {
-            ts: session_log::now_millis(),
+            ts: segment_log::now_millis(),
             domain: extract::EXTRACT_DOMAIN.into(),
             payload: payload_value,
         })?;
@@ -2598,7 +2598,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 }
             };
         let mut worker = Worker::new(client).system_prompt(consolidation_system_prompt);
-        worker.set_cache_key(Some(self.session_id().to_string()));
+        worker.set_cache_key(Some(self.segment_id().to_string()));
 
         // Memory tools are self-contained — they bypass ScopedFs and write
         // directly under the workspace via WorkspaceLayout. Resident
@@ -2610,7 +2610,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         let query_cfg = memory::tool::QueryConfig::from(memory_cfg);
         worker.register_tool(memory::tool::read_tool_with_usage(
             layout.clone(),
-            self.session_id().to_string(),
+            self.segment_id().to_string(),
         ));
         worker.register_tool(memory::tool::write_tool(layout.clone()));
         worker.register_tool(memory::tool::edit_tool(layout.clone()));
@@ -2735,12 +2735,12 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
         let mut common = prepare_pod_common(&manifest, &loader, /* parse_template */ true)?;
         let skill_shadows = std::mem::take(&mut common.skill_shadows);
 
-        // Session creation is deferred to the first run (see
-        // `ensure_session_head`) so the SessionStart entry can capture
+        // Segment creation is deferred to the first run (see
+        // `ensure_segment_head`) so the SegmentStart entry can capture
         // the rendered system prompt, not the raw template source. The
-        // session_id is allocated here so the pod-registry registration
+        // segment_id is allocated here so the pod-registry registration
         // can record it from the start.
-        let session_id = session_store::new_session_id();
+        let segment_id = session_store::new_segment_id();
 
         // Register this Pod in the machine-wide pod-registry
         // before building anything else, so a spawn that conflicts on
@@ -2754,18 +2754,18 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             std::process::id(),
             socket_path,
             common.scope.allow_rules(),
-            session_id,
+            segment_id,
         )?;
 
         let mut worker = Worker::new(common.client);
         apply_worker_manifest(&mut worker, &manifest.worker);
-        worker.set_cache_key(Some(session_id.to_string()));
+        worker.set_cache_key(Some(segment_id.to_string()));
 
         let mut pod = Self {
             manifest,
             worker: Some(worker),
             store,
-            session_state: SessionState::new(session_id, 0),
+            segment_state: SegmentState::new(segment_id, 0),
             pwd: common.pwd,
             scope: SharedScope::new(common.scope),
             hook_builder: HookRegistryBuilder::new(),
@@ -2793,7 +2793,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             extract_pointer: Arc::new(Mutex::new(None)),
             memory_task: None,
             user_segments: Vec::new(),
-            sink: SessionLogSink::new(),
+            sink: SegmentLogSink::new(),
             history_persistence_wired: false,
             log_writer: None,
         };
@@ -2820,22 +2820,22 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
         let mut common = prepare_pod_common(&manifest, &loader, /* parse_template */ true)?;
         let skill_shadows = std::mem::take(&mut common.skill_shadows);
 
-        let session_id = session_store::new_session_id();
+        let segment_id = session_store::new_segment_id();
         let scope_allocation = pod_registry::adopt_allocation(
             manifest.pod.name.clone(),
             std::process::id(),
-            session_id,
+            segment_id,
         )?;
 
         let mut worker = Worker::new(common.client);
         apply_worker_manifest(&mut worker, &manifest.worker);
-        worker.set_cache_key(Some(session_id.to_string()));
+        worker.set_cache_key(Some(segment_id.to_string()));
 
         let mut pod = Self {
             manifest,
             worker: Some(worker),
             store,
-            session_state: SessionState::new(session_id, 0),
+            segment_state: SegmentState::new(segment_id, 0),
             pwd: common.pwd,
             scope: SharedScope::new(common.scope),
             hook_builder: HookRegistryBuilder::new(),
@@ -2863,7 +2863,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             extract_pointer: Arc::new(Mutex::new(None)),
             memory_task: None,
             user_segments: Vec::new(),
-            sink: SessionLogSink::new(),
+            sink: SegmentLogSink::new(),
             history_persistence_wired: false,
             log_writer: None,
         };
@@ -2878,13 +2878,13 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
     /// Resolves the manifest cascade exactly like [`Self::from_manifest`]
     /// (pwd / scope / pod-registry / client / prompt catalog), seeds a
     /// fresh Worker from the source session's `RestoredState`, and
-    /// reuses the same `session_id` so subsequent turns append to the
+    /// reuses the same `segment_id` so subsequent turns append to the
     /// source jsonl as a continuation of the same conversation.
     ///
     /// Concurrent writers are prevented by the pod-registry:
-    /// the registration carries `session_id`, and this constructor
-    /// refuses to start when `pod_registry::lookup_session` already finds
-    /// a live Pod writing to `session_id`. So there is no need to fork —
+    /// the registration carries `segment_id`, and this constructor
+    /// refuses to start when `pod_registry::lookup_segment` already finds
+    /// a live Pod writing to `segment_id`. So there is no need to fork —
     /// resume is "the same session, a different process owning it".
     ///
     /// `system_prompt` is replayed verbatim from the session log —
@@ -2892,7 +2892,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
     /// session keeps a stable cache prefix even when the manifest's
     /// instruction template would render differently today.
     pub async fn restore_from_manifest(
-        session_id: SessionId,
+        segment_id: SegmentId,
         manifest: PodManifest,
         store: St,
         loader: PromptLoader,
@@ -2900,16 +2900,16 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
         // Read raw entries once so we can both reconstruct state and
         // seed the broadcast sink's mirror with the same prefix that
         // sits on disk.
-        let raw_entries = store.read_all(session_id)?;
+        let raw_entries = store.read_all(segment_id)?;
         let state = session_store::collect_state(&raw_entries);
         if state.entries_count == 0 {
-            return Err(PodError::SessionEmpty { session_id });
+            return Err(PodError::SegmentEmpty { segment_id });
         }
         let mirror_entries: Vec<LogEntry> = raw_entries.clone();
         let scope_snapshot = state
             .pod_scope
             .clone()
-            .ok_or(PodError::SessionScopeMissing { session_id })?;
+            .ok_or(PodError::SegmentScopeMissing { segment_id })?;
 
         let mut common = prepare_pod_common_with_scope(
             &manifest,
@@ -2923,7 +2923,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
         let skill_shadows = std::mem::take(&mut common.skill_shadows);
 
         // Atomic: register_pod inside install_top_level rejects when
-        // another live allocation already holds `session_id`. Wrapping
+        // another live allocation already holds `segment_id`. Wrapping
         // the lookup + install inside a single `LockFileGuard` is what
         // makes "no two live Pods write to the same session log"
         // actually structural rather than a hopeful pre-check.
@@ -2937,14 +2937,14 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             socket_path,
             common.scope.allow_rules(),
             common.scope.deny_rules(),
-            session_id,
+            segment_id,
         )?;
 
         // Build the worker and apply the manifest defaults first, then
         // overwrite the pieces the session log is authoritative for.
         let mut worker = Worker::new(common.client);
         apply_worker_manifest(&mut worker, &manifest.worker);
-        worker.set_cache_key(Some(session_id.to_string()));
+        worker.set_cache_key(Some(segment_id.to_string()));
         if let Some(ref prompt) = state.system_prompt {
             worker.set_system_prompt(prompt);
         }
@@ -2974,7 +2974,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             manifest,
             worker: Some(worker),
             store,
-            session_state: SessionState::new(session_id, state.entries_count),
+            segment_state: SegmentState::new(segment_id, state.entries_count),
             pwd: common.pwd,
             scope: SharedScope::new(common.scope),
             hook_builder: HookRegistryBuilder::new(),
@@ -3007,7 +3007,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
             // Seed the mirror with the entries we just replayed so a
             // late-attaching client sees the full prefix without an
             // extra round trip.
-            sink: SessionLogSink::with_initial(mirror_entries),
+            sink: SegmentLogSink::with_initial(mirror_entries),
             history_persistence_wired: false,
             log_writer: None,
         };
@@ -3234,13 +3234,13 @@ pub enum PodError {
     #[error("workflow invocation failed: {0}")]
     WorkflowResolve(#[from] WorkflowResolveError),
 
-    #[error("session {session_id} has no entries to restore")]
-    SessionEmpty { session_id: SessionId },
+    #[error("session {segment_id} has no entries to restore")]
+    SegmentEmpty { segment_id: SegmentId },
 
     #[error(
-        "session {session_id} has no persisted scope snapshot; refusing resume without explicit scope"
+        "session {segment_id} has no persisted scope snapshot; refusing resume without explicit scope"
     )]
-    SessionScopeMissing { session_id: SessionId },
+    SegmentScopeMissing { segment_id: SegmentId },
 }
 
 /// Bundle of resources that every high-level Pod constructor needs:

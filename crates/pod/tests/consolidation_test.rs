@@ -172,7 +172,7 @@ fn write_n_staging(layout: &WorkspaceLayout, n: usize) -> Vec<uuid::Uuid> {
         let (id, _) = write_staging(
             layout,
             SourceRef {
-                session_id: format!("s-{i}"),
+                segment_id: format!("s-{i}"),
                 range: [i as u64, i as u64],
             },
             ExtractedPayload::default(),

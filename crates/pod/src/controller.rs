@@ -11,7 +11,7 @@ use crate::ipc::notify_buffer::NotifyBuffer;
 use crate::ipc::server::SocketServer;
 use crate::pod::{Pod, PodError, PodRunResult, SystemItemCommitter};
 use crate::runtime::dir::RuntimeDir;
-use crate::session_log_sink::SessionLogSink;
+use crate::segment_log_sink::SegmentLogSink;
 use crate::shared_state::PodSharedState;
 use crate::spawn::comm_tools::{
     list_pods_tool, read_pod_output_tool, send_to_pod_tool, stop_pod_tool,
@@ -33,10 +33,10 @@ pub struct PodHandle {
     pub shared_state: Arc<PodSharedState>,
     pub runtime_dir: Arc<RuntimeDir>,
     pub alerter: Alerter,
-    /// Session-log mirror + broadcast handle. The IPC server snapshots
+    /// Segment-log mirror + broadcast handle. The IPC server snapshots
     /// it on every new connection (Event::Snapshot) and forwards
     /// subsequent commits (Event::Entry) on the receiver.
-    pub sink: SessionLogSink,
+    pub sink: SegmentLogSink,
 }
 
 impl PodHandle {
@@ -214,7 +214,7 @@ impl PodController {
         let greeting = build_greeting(&pod);
         let shared_state = Arc::new(PodSharedState::new(
             pod.manifest().pod.name.clone(),
-            pod.session_id(),
+            pod.segment_id(),
             manifest_toml.clone(),
             greeting,
         ));
@@ -430,7 +430,7 @@ where
     let scope_handle = pod.scope().clone();
     let pwd = pod.pwd().to_path_buf();
     let task_store = pod.task_store();
-    let session_id_for_usage = pod.session_id().to_string();
+    let session_id_for_usage = pod.segment_id().to_string();
     let scope_change_sink = pod.scope_change_sink();
     let memory_config = pod.manifest().memory.clone();
     let spawner_name = pod.manifest().pod.name.clone();
@@ -992,7 +992,7 @@ mod tests {
         let (cancel_tx, cancel_rx) = mpsc::channel::<()>(1);
         let shared_state = Arc::new(PodSharedState::new(
             "child-pod".to_string(),
-            session_store::new_session_id(),
+            session_store::new_segment_id(),
             String::new(),
             protocol::Greeting {
                 pod_name: "child-pod".to_string(),

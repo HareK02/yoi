@@ -8,7 +8,6 @@
 - Pod: 任意ターンからの Fork（複数ターン巻き戻しを汎用化） → [tickets/pod-session-fork.md](tickets/pod-session-fork.md)
 - Pod: Inbound PodEvent ハンドリングの重複を統合 → [tickets/pod-inbound-pod-event-dedup.md](tickets/pod-inbound-pod-event-dedup.md)
 - 永続化層整理 (Storage)
-  - SessionId → SegmentId リネーム → [tickets/segment-rename.md](tickets/segment-rename.md)
   - Session (Segment 群の grouping) 導入 → [tickets/session-grouping-introduce.md](tickets/session-grouping-introduce.md)
   - live auto-fork の marker 形式確定 → [tickets/live-fork-marker.md](tickets/live-fork-marker.md)
 - Pod 単位永続化

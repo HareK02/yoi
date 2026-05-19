@@ -28,7 +28,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::{Frame, TerminalOptions, Viewport};
-use session_store::SessionId;
+use session_store::SegmentId;
 
 const VIEWPORT_LINES: u16 = 6;
 
@@ -46,7 +46,7 @@ pub enum SpawnOutcome {
 pub enum SpawnError {
     Io(io::Error),
     Store(session_store::StoreError),
-    MissingResumeScope { session_id: SessionId },
+    MissingResumeScope { segment_id: SegmentId },
     Spawn(client::SpawnError),
 }
 
@@ -55,9 +55,9 @@ impl std::fmt::Display for SpawnError {
         match self {
             Self::Io(e) => write!(f, "io error: {e}"),
             Self::Store(e) => write!(f, "failed to read session log: {e}"),
-            Self::MissingResumeScope { session_id } => write!(
+            Self::MissingResumeScope { segment_id } => write!(
                 f,
-                "session {session_id} has no persisted scope snapshot; refusing resume without explicit scope"
+                "session {segment_id} has no persisted scope snapshot; refusing resume without explicit scope"
             ),
             Self::Spawn(e) => write!(f, "{e}"),
         }
@@ -89,7 +89,7 @@ type InlineTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 /// Source session for a resume run. `None` = fresh spawn (current
 /// behaviour); `Some(id)` swaps the dialog into "Resume Pod" mode and
 /// passes `--session <id>` to the spawned `pod` child.
-pub async fn run(resume_from: Option<SessionId>) -> Result<SpawnOutcome, SpawnError> {
+pub async fn run(resume_from: Option<SegmentId>) -> Result<SpawnOutcome, SpawnError> {
     let cwd = std::env::current_dir().map_err(SpawnError::Io)?;
 
     // Run the same merge pod itself uses, then read what's missing
@@ -321,7 +321,7 @@ fn build_overlay_toml(form: &Form) -> String {
     toml::to_string(&toml::Value::Table(root)).expect("overlay serialisation cannot fail")
 }
 
-async fn load_resume_scope(session_id: SessionId) -> Result<ScopeConfig, SpawnError> {
+async fn load_resume_scope(segment_id: SegmentId) -> Result<ScopeConfig, SpawnError> {
     let store_dir = manifest::paths::sessions_dir().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
@@ -329,10 +329,10 @@ async fn load_resume_scope(session_id: SessionId) -> Result<ScopeConfig, SpawnEr
         )
     })?;
     let store = session_store::FsStore::new(&store_dir)?;
-    let state = session_store::restore(&store, session_id)?;
+    let state = session_store::restore(&store, segment_id)?;
     let snapshot = state
         .pod_scope
-        .ok_or(SpawnError::MissingResumeScope { session_id })?;
+        .ok_or(SpawnError::MissingResumeScope { segment_id })?;
     Ok(ScopeConfig {
         allow: snapshot.allow,
         deny: snapshot.deny,
@@ -376,7 +376,7 @@ struct Form {
     /// switches, the source session is shown to the user, and the
     /// child pod is launched with `--session <id>` so it restores
     /// from `id` and appends to the same session log.
-    resume_from: Option<SessionId>,
+    resume_from: Option<SegmentId>,
     /// Scope snapshot recovered from the source session log. Set only for
     /// resume runs, and serialized into the overlay instead of cwd-default
     /// scope so resume does not silently broaden access.
@@ -445,7 +445,7 @@ fn draw_form(f: &mut Frame<'_>, form: &Form) {
     .split(area);
 
     let title_text = match form.resume_from {
-        Some(id) => format!("resume pod   session: {}", short_session(id)),
+        Some(id) => format!("resume pod   session: {}", short_segment(id)),
         None => "spawn pod".to_string(),
     };
     let title = Paragraph::new(Line::from(vec![Span::styled(
@@ -473,7 +473,7 @@ fn draw_form(f: &mut Frame<'_>, form: &Form) {
 
 /// First 8 hex digits of a UUID — short enough to skim, long enough
 /// to disambiguate inside a 10-row picker.
-pub(crate) fn short_session(id: SessionId) -> String {
+pub(crate) fn short_segment(id: SegmentId) -> String {
     let s = id.to_string();
     s.chars().take(8).collect()
 }
@@ -584,7 +584,7 @@ mod tests {
     #[test]
     fn overlay_uses_resume_scope_snapshot() {
         let mut f = form("agent-r", false);
-        f.resume_from = Some(session_store::new_session_id());
+        f.resume_from = Some(session_store::new_segment_id());
         f.resume_scope = Some(ScopeConfig {
             allow: vec![manifest::ScopeRule {
                 target: PathBuf::from("/work/example"),

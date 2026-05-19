@@ -94,9 +94,9 @@ mod tests {
         ExtractedPayload::default()
     }
 
-    fn source(session_id: &str, range: [u64; 2]) -> SourceRef {
+    fn source(segment_id: &str, range: [u64; 2]) -> SourceRef {
         SourceRef {
-            session_id: session_id.into(),
+            segment_id: segment_id.into(),
             range,
         }
     }

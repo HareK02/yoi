@@ -83,7 +83,7 @@ pub enum CompactEvent {
     Streaming { started_at: Instant },
     /// Compaction ended cleanly with `CompactDone`.
     Done {
-        new_session_id: uuid::Uuid,
+        new_segment_id: uuid::Uuid,
         elapsed_secs: Option<u64>,
     },
     /// Compaction ended with `CompactFailed`.

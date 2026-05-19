@@ -25,7 +25,7 @@ use crossterm::terminal::{
 use protocol::{Method, PodStatus};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use session_store::SessionId;
+use session_store::SegmentId;
 
 use client::PodClient;
 
@@ -56,7 +56,7 @@ enum Mode {
     Resume,
     /// `tui --session <UUID>`: skip the picker, go straight to the
     /// resume name dialog with `id` baked in.
-    ResumeWithSession(SessionId),
+    ResumeWithSession(SegmentId),
 }
 
 enum ParseError {
@@ -78,7 +78,7 @@ impl std::fmt::Display for ParseError {
 fn parse_args() -> Result<Mode, ParseError> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut resume = false;
-    let mut session: Option<SessionId> = None;
+    let mut session: Option<SegmentId> = None;
     let mut socket_override: Option<PathBuf> = None;
     let mut positional: Option<String> = None;
 
@@ -94,7 +94,7 @@ fn parse_args() -> Result<Mode, ParseError> {
                     .get(i + 1)
                     .ok_or(ParseError::MissingValue("--session"))?;
                 session = Some(
-                    raw.parse::<SessionId>()
+                    raw.parse::<SegmentId>()
                         .map_err(|_| ParseError::InvalidSession(raw.clone()))?,
                 );
                 i += 2;
@@ -216,7 +216,7 @@ async fn run_resume() -> Result<(), Box<dyn std::error::Error>> {
     run_spawn(Some(id)).await
 }
 
-async fn run_spawn(resume_from: Option<SessionId>) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_spawn(resume_from: Option<SegmentId>) -> Result<(), Box<dyn std::error::Error>> {
     let ready = match spawn::run(resume_from).await? {
         SpawnOutcome::Ready(r) => r,
         SpawnOutcome::Cancelled => return Ok(()),

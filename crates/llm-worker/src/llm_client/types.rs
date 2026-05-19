@@ -492,7 +492,7 @@ pub struct Request {
     /// 会話単位の安定キー。`prompt_cache_key` として送られる
     /// (OpenAI Responses)。ChatGPT backend (codex-oauth) は明示キーが
     /// 無いと org/project ハッシュ衝突でプロンプトキャッシュが
-    /// ほぼヒットしないため、pod 側で `SessionId` を渡す運用を想定。
+    /// ほぼヒットしないため、pod 側で `SegmentId` を渡す運用を想定。
     /// `cache_anchor` と違い名前空間キーであり、`prefix anchor` とは
     /// 別の概念。`cache_anchor` を読まない provider と同じく、
     /// `prompt_cache_key` を持たない provider は無視する。

@@ -5,7 +5,7 @@ use std::process::ExitCode;
 use clap::Parser;
 use manifest::{PodManifest, paths};
 use pod::{Pod, PodController, PodFactory, PromptLoader};
-use session_store::{FsStore, SessionId};
+use session_store::{FsStore, SegmentId};
 
 const USER_MANIFEST_ENV: &str = "INSOMNIA_USER_MANIFEST";
 
@@ -53,7 +53,7 @@ struct Cli {
     /// Mutually exclusive with `--adopt` (spawned children always start
     /// fresh).
     #[arg(long, value_name = "UUID", conflicts_with = "adopt")]
-    session: Option<SessionId>,
+    session: Option<SegmentId>,
 }
 
 fn resolve_manifest(cli: &Cli) -> Result<(PodManifest, PromptLoader), String> {
@@ -185,8 +185,8 @@ async fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         }
-    } else if let Some(source_session_id) = cli.session {
-        match Pod::restore_from_manifest(source_session_id, manifest, store, loader).await {
+    } else if let Some(source_segment_id) = cli.session {
+        match Pod::restore_from_manifest(source_segment_id, manifest, store, loader).await {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("error: failed to restore pod: {e}");

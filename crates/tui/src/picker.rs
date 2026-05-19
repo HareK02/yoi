@@ -2,7 +2,7 @@
 //!
 //! Reads the most recent sessions from the configured store, lets the
 //! user pick one with the arrow keys, and returns the chosen
-//! `SessionId`. Closes its inline viewport before returning so the
+//! `SegmentId`. Closes its inline viewport before returning so the
 //! caller can open a fresh viewport for the name dialog.
 //!
 //! The picker only handles selection. Forking, pod-registry checks, and
@@ -12,7 +12,7 @@ use std::io;
 use std::time::Duration;
 
 use crossterm::event::{self, Event as TermEvent, KeyCode, KeyEventKind, KeyModifiers};
-use pod_registry::lookup_session;
+use pod_registry::lookup_segment;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout};
@@ -20,7 +20,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::{Frame, TerminalOptions, Viewport};
-use session_store::{FsStore, LogEntry, LoggedContentPart, LoggedItem, SessionId, Store};
+use session_store::{FsStore, LogEntry, LoggedContentPart, LoggedItem, SegmentId, Store};
 
 const MAX_ROWS: usize = 10;
 const VIEWPORT_LINES: u16 = MAX_ROWS as u16 + 4;
@@ -60,26 +60,26 @@ impl From<session_store::StoreError> for PickerError {
 }
 
 pub enum PickerOutcome {
-    Picked(SessionId),
+    Picked(SegmentId),
     Cancelled,
 }
 
 /// One row in the picker view. Rendered from the session log so the
 /// user can recognise their session at a glance without parsing UUIDs.
 struct Row {
-    id: SessionId,
+    id: SegmentId,
     /// Last user / assistant snippet, or a `[corrupt]` placeholder.
     preview: String,
     /// `Some(pod_name)` when a live Pod currently holds an allocation
     /// for this session in `pods.json`. Picking such a row launches
-    /// `pod --session <UUID>` which will fail with `SessionConflict` —
+    /// `pod --session <UUID>` which will fail with `SegmentConflict` —
     /// the badge warns the user up-front.
     live_pod: Option<String>,
 }
 
 pub async fn run() -> Result<PickerOutcome, PickerError> {
     let store = open_default_store()?;
-    let ids = store.list_sessions()?;
+    let ids = store.list_segments()?;
     if ids.is_empty() {
         return Err(PickerError::NoSessions);
     }
@@ -89,7 +89,7 @@ pub async fn run() -> Result<PickerOutcome, PickerError> {
         // Best-effort live check. A pods.json I/O hiccup downgrades
         // the row to "no badge" rather than killing the picker — the
         // user still gets to see the listing.
-        let live_pod = lookup_session(id).ok().flatten().map(|info| info.pod_name);
+        let live_pod = lookup_segment(id).ok().flatten().map(|info| info.pod_name);
         rows.push(Row {
             id,
             preview,
@@ -158,7 +158,7 @@ fn open_default_store() -> Result<FsStore, PickerError> {
     Ok(FsStore::new(&dir)?)
 }
 
-fn build_preview(store: &FsStore, id: SessionId) -> String {
+fn build_preview(store: &FsStore, id: SegmentId) -> String {
     match store.read_all(id) {
         Ok(entries) => last_message_preview(&entries).unwrap_or_else(|| "[empty]".to_string()),
         Err(_) => "[corrupt]".to_string(),
@@ -300,7 +300,7 @@ fn row_line(row: &Row, selected: bool) -> Line<'_> {
     };
     let mut spans = vec![
         Span::raw(marker),
-        Span::styled(short_session(row.id), id_style),
+        Span::styled(short_segment(row.id), id_style),
         Span::raw("  "),
     ];
     if let Some(ref pod_name) = row.live_pod {
@@ -313,7 +313,7 @@ fn row_line(row: &Row, selected: bool) -> Line<'_> {
     Line::from(spans)
 }
 
-fn short_session(id: SessionId) -> String {
+fn short_segment(id: SegmentId) -> String {
     let s = id.to_string();
     s.chars().take(8).collect()
 }

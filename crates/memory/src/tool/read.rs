@@ -60,7 +60,7 @@ impl Tool for ReadTool {
         })?;
 
         let text = String::from_utf8_lossy(&bytes).into_owned();
-        if let Some(session_id) = self.usage_session_id.as_deref() {
+        if let Some(segment_id) = self.usage_session_id.as_deref() {
             let usage_slug = params.slug.as_deref().unwrap_or("summary");
             let snapshot = usage::snapshot_record_from_bytes(
                 params.kind.record_kind(),
@@ -69,7 +69,7 @@ impl Tool for ReadTool {
             );
             if let Err(err) = usage::append_use_event(
                 &self.layout,
-                session_id.to_string(),
+                segment_id.to_string(),
                 UsageSource::MemoryRead,
                 vec![snapshot],
             ) {
@@ -140,9 +140,9 @@ pub fn read_tool(layout: WorkspaceLayout) -> ToolDefinition {
 
 pub fn read_tool_with_usage(
     layout: WorkspaceLayout,
-    session_id: impl Into<String>,
+    segment_id: impl Into<String>,
 ) -> ToolDefinition {
-    read_tool_inner(layout, Some(session_id.into()))
+    read_tool_inner(layout, Some(segment_id.into()))
 }
 
 fn read_tool_inner(layout: WorkspaceLayout, usage_session_id: Option<String>) -> ToolDefinition {

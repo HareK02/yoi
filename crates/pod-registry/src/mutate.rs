@@ -5,7 +5,7 @@ use std::io;
 use std::path::PathBuf;
 
 use manifest::{Permission, ScopeRule};
-use session_store::SessionId;
+use session_store::SegmentId;
 
 use crate::conflict::{find_conflict_owner, find_conflict_owners, is_within_effective_write};
 use crate::error::ScopeLockError;
@@ -16,7 +16,7 @@ use crate::table::{Allocation, LockFileGuard};
 /// conflicts so a crashed Pod's allocation doesn't block the new one.
 ///
 /// Rejects when another live allocation is already writing to
-/// `session_id`, so two `restore_from_manifest` calls under different
+/// `segment_id`, so two `restore_from_manifest` calls under different
 /// `pod_name`s cannot both grab the same session log.
 pub fn register_pod(
     guard: &mut LockFileGuard,
@@ -24,7 +24,7 @@ pub fn register_pod(
     pid: u32,
     socket: PathBuf,
     scope_allow: Vec<ScopeRule>,
-    session_id: SessionId,
+    segment_id: SegmentId,
 ) -> Result<(), ScopeLockError> {
     register_pod_with_deny(
         guard,
@@ -33,7 +33,7 @@ pub fn register_pod(
         socket,
         scope_allow,
         Vec::new(),
-        session_id,
+        segment_id,
     )
 }
 
@@ -56,15 +56,15 @@ pub fn register_pod_with_deny(
     socket: PathBuf,
     scope_allow: Vec<ScopeRule>,
     scope_deny: Vec<ScopeRule>,
-    session_id: SessionId,
+    segment_id: SegmentId,
 ) -> Result<(), ScopeLockError> {
     reclaim_stale(guard);
     if guard.data().find(&pod_name).is_some() {
         return Err(ScopeLockError::DuplicatePodName(pod_name));
     }
-    if let Some(existing) = guard.data().find_by_session(session_id) {
-        return Err(ScopeLockError::SessionConflict {
-            session_id,
+    if let Some(existing) = guard.data().find_by_segment(segment_id) {
+        return Err(ScopeLockError::SegmentConflict {
+            segment_id,
             pod_name: existing.pod_name.clone(),
             socket: existing.socket.clone(),
         });
@@ -99,7 +99,7 @@ pub fn register_pod_with_deny(
         scope_allow,
         scope_deny,
         delegated_from: None,
-        session_id: Some(session_id),
+        segment_id: Some(segment_id),
     });
     guard.save()?;
     Ok(())
@@ -147,9 +147,9 @@ pub fn delegate_scope(
         scope_allow,
         scope_deny: Vec::new(),
         delegated_from: Some(spawner.into()),
-        // Pre-reservation. The child fills in its own session_id when
+        // Pre-reservation. The child fills in its own segment_id when
         // it calls `adopt_allocation` after the worker is built.
-        session_id: None,
+        segment_id: None,
     });
     guard.save()?;
     Ok(())
@@ -587,8 +587,8 @@ mod tests {
             shared_session,
         )
         .unwrap();
-        // Second registration tries to grab the same session_id under
-        // a different pod_name. Without the SessionConflict check both
+        // Second registration tries to grab the same segment_id under
+        // a different pod_name. Without the SegmentConflict check both
         // would succeed and race on the same jsonl.
         let err = register_pod(
             &mut g,
@@ -600,15 +600,15 @@ mod tests {
         )
         .unwrap_err();
         match err {
-            ScopeLockError::SessionConflict {
-                session_id,
+            ScopeLockError::SegmentConflict {
+                segment_id,
                 pod_name,
                 ..
             } => {
-                assert_eq!(session_id, shared_session);
+                assert_eq!(segment_id, shared_session);
                 assert_eq!(pod_name, "first");
             }
-            other => panic!("expected SessionConflict, got {other:?}"),
+            other => panic!("expected SegmentConflict, got {other:?}"),
         }
     }
 }
