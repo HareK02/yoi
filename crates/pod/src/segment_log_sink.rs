@@ -203,6 +203,7 @@ mod tests {
     fn session_start() -> LogEntry {
         LogEntry::SegmentStart {
             ts: now_millis(),
+            session_id: uuid::Uuid::nil(),
             system_prompt: None,
             config: RequestConfig::default(),
             history: vec![],

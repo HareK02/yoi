@@ -20,7 +20,9 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::{Frame, TerminalOptions, Viewport};
-use session_store::{FsStore, LogEntry, LoggedContentPart, LoggedItem, SegmentId, Store};
+use session_store::{
+    FsStore, LogEntry, LoggedContentPart, LoggedItem, SegmentId, SessionId, Store,
+};
 
 const MAX_ROWS: usize = 10;
 const VIEWPORT_LINES: u16 = MAX_ROWS as u16 + 4;
@@ -60,38 +62,55 @@ impl From<session_store::StoreError> for PickerError {
 }
 
 pub enum PickerOutcome {
-    Picked(SegmentId),
+    /// User picked a session; resume at its leaf segment.
+    Picked {
+        session_id: SessionId,
+        segment_id: SegmentId,
+    },
     Cancelled,
 }
 
-/// One row in the picker view. Rendered from the session log so the
-/// user can recognise their session at a glance without parsing UUIDs.
+/// One row in the picker view. Rendered from the leaf segment of a
+/// Session so the user can recognise their conversation at a glance
+/// without parsing UUIDs.
 struct Row {
-    id: SegmentId,
+    session_id: SessionId,
+    leaf_segment_id: SegmentId,
     /// Last user / assistant snippet, or a `[corrupt]` placeholder.
     preview: String,
     /// `Some(pod_name)` when a live Pod currently holds an allocation
-    /// for this session in `pods.json`. Picking such a row launches
-    /// `pod --session <UUID>` which will fail with `SegmentConflict` —
-    /// the badge warns the user up-front.
+    /// for this session's leaf segment in `pods.json`. Picking such a
+    /// row launches `pod --session <UUID>` which will fail with
+    /// `SegmentConflict` — the badge warns the user up-front.
     live_pod: Option<String>,
 }
 
 pub async fn run() -> Result<PickerOutcome, PickerError> {
     let store = open_default_store()?;
-    let ids = store.list_segments()?;
-    if ids.is_empty() {
+    let sessions = store.list_sessions()?;
+    if sessions.is_empty() {
         return Err(PickerError::NoSessions);
     }
     let mut rows: Vec<Row> = Vec::with_capacity(MAX_ROWS);
-    for id in ids.into_iter().take(MAX_ROWS) {
-        let preview = build_preview(&store, id);
+    for session_id in sessions.into_iter().take(MAX_ROWS) {
+        let Some(leaf_segment_id) = store
+            .list_segments(session_id)?
+            .into_iter()
+            .next()
+        else {
+            continue;
+        };
+        let preview = build_preview(&store, session_id, leaf_segment_id);
         // Best-effort live check. A pods.json I/O hiccup downgrades
         // the row to "no badge" rather than killing the picker — the
         // user still gets to see the listing.
-        let live_pod = lookup_segment(id).ok().flatten().map(|info| info.pod_name);
+        let live_pod = lookup_segment(leaf_segment_id)
+            .ok()
+            .flatten()
+            .map(|info| info.pod_name);
         rows.push(Row {
-            id,
+            session_id,
+            leaf_segment_id,
             preview,
             live_pod,
         });
@@ -115,7 +134,11 @@ pub async fn run() -> Result<PickerOutcome, PickerError> {
             }
             Some(Action::Submit) => {
                 close_viewport(&mut terminal)?;
-                return Ok(PickerOutcome::Picked(rows[selected].id));
+                let row = &rows[selected];
+                return Ok(PickerOutcome::Picked {
+                    session_id: row.session_id,
+                    segment_id: row.leaf_segment_id,
+                });
             }
             Some(Action::Cancel) => {
                 close_viewport(&mut terminal)?;
@@ -158,8 +181,8 @@ fn open_default_store() -> Result<FsStore, PickerError> {
     Ok(FsStore::new(&dir)?)
 }
 
-fn build_preview(store: &FsStore, id: SegmentId) -> String {
-    match store.read_all(id) {
+fn build_preview(store: &FsStore, session_id: SessionId, segment_id: SegmentId) -> String {
+    match store.read_all(session_id, segment_id) {
         Ok(entries) => last_message_preview(&entries).unwrap_or_else(|| "[empty]".to_string()),
         Err(_) => "[corrupt]".to_string(),
     }
@@ -300,7 +323,7 @@ fn row_line(row: &Row, selected: bool) -> Line<'_> {
     };
     let mut spans = vec![
         Span::raw(marker),
-        Span::styled(short_segment(row.id), id_style),
+        Span::styled(short_segment(row.session_id), id_style),
         Span::raw("  "),
     ];
     if let Some(ref pod_name) = row.live_pod {
@@ -313,7 +336,7 @@ fn row_line(row: &Row, selected: bool) -> Line<'_> {
     Line::from(spans)
 }
 
-fn short_segment(id: SegmentId) -> String {
+fn short_segment(id: SessionId) -> String {
     let s = id.to_string();
     s.chars().take(8).collect()
 }

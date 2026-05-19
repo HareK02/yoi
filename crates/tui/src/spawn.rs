@@ -329,7 +329,7 @@ async fn load_resume_scope(segment_id: SegmentId) -> Result<ScopeConfig, SpawnEr
         )
     })?;
     let store = session_store::FsStore::new(&store_dir)?;
-    let state = session_store::restore(&store, segment_id)?;
+    let state = session_store::restore_by_segment(&store, segment_id)?;
     let snapshot = state
         .pod_scope
         .ok_or(SpawnError::MissingResumeScope { segment_id })?;

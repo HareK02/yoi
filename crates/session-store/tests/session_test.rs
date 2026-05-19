@@ -95,14 +95,20 @@ fn make_store() -> (tempfile::TempDir, FsStore) {
 async fn run_and_persist(
     worker: Worker<MockLlmClient>,
     store: &FsStore,
+    session_id: session_store::SessionId,
     segment_id: session_store::SegmentId,
     input: &str,
 ) -> (Worker<MockLlmClient>, llm_worker::WorkerResult) {
     // Mirror Pod's run-entry contract: log the user input as segments
     // before the worker pushes its flattened user_message; save_delta
     // skips the resulting user_message item to avoid double-write.
-    session_store::save_user_input(store, segment_id, vec![protocol::Segment::text(input)])
-        .unwrap();
+    session_store::save_user_input(
+        store,
+        session_id,
+        segment_id,
+        vec![protocol::Segment::text(input)],
+    )
+    .unwrap();
 
     let history_before = worker.history().len();
 
@@ -111,13 +117,14 @@ async fn run_and_persist(
     let worker = locked.unlock();
 
     let new_items = &worker.history()[history_before..];
-    session_store::save_delta(store, segment_id, new_items).unwrap();
-    session_store::save_turn_end(store, segment_id, worker.turn_count()).unwrap();
+    session_store::save_delta(store, session_id, segment_id, new_items).unwrap();
+    session_store::save_turn_end(store, session_id, segment_id, worker.turn_count()).unwrap();
 
     match &result {
         Ok(r) => {
             session_store::save_run_completed(
                 store,
+                session_id,
                 segment_id,
                 r.clone(),
                 worker.last_run_interrupted(),
@@ -127,6 +134,7 @@ async fn run_and_persist(
         Err(e) => {
             session_store::save_run_errored(
                 store,
+                session_id,
                 segment_id,
                 e.to_string(),
                 worker.last_run_interrupted(),
@@ -149,7 +157,7 @@ async fn session_run_logs_entries() {
     let client = MockLlmClient::new(simple_text_events());
     let worker = Worker::new(client);
 
-    let sid = session_store::create_segment(
+    let (sid, segid) = session_store::create_segment(
         &store,
         SegmentStartState {
             system_prompt: worker.get_system_prompt(),
@@ -159,10 +167,10 @@ async fn session_run_logs_entries() {
     )
     .unwrap();
 
-    let (worker, _) = run_and_persist(worker, &store, sid, "Hi").await;
+    let (worker, _) = run_and_persist(worker, &store, sid, segid, "Hi").await;
     let _ = &worker;
 
-    let entries = store.read_all(sid).unwrap();
+    let entries = store.read_all(sid, segid).unwrap();
 
     // SegmentStart, UserInput, AssistantItems, TurnEnd, RunCompleted (at minimum)
     assert!(
@@ -194,7 +202,7 @@ async fn session_restore_round_trip() {
     let mut worker = Worker::new(client);
     worker.set_system_prompt("You are helpful.");
 
-    let sid = session_store::create_segment(
+    let (sid, segid) = session_store::create_segment(
         &store,
         SegmentStartState {
             system_prompt: worker.get_system_prompt(),
@@ -204,18 +212,26 @@ async fn session_restore_round_trip() {
     )
     .unwrap();
 
-    let (worker, _) = run_and_persist(worker, &store, sid, "Hi").await;
+    let (worker, _) = run_and_persist(worker, &store, sid, segid, "Hi").await;
 
     let original_history_len = worker.history().len();
     let original_turn_count = worker.turn_count();
 
     // Restore
-    let state = session_store::restore(&store, sid).unwrap();
+    let state = session_store::restore(&store, sid, segid).unwrap();
 
+    assert_eq!(state.session_id, Some(sid));
     assert_eq!(state.history.len(), original_history_len);
     assert_eq!(state.turn_count, original_turn_count);
     assert_eq!(state.system_prompt.as_deref(), Some("You are helpful."));
-    assert_eq!(state.entries_count, store.read_entry_count(sid).unwrap());
+    assert_eq!(
+        state.entries_count,
+        store.read_entry_count(sid, segid).unwrap()
+    );
+
+    // Shim by segment ID alone.
+    let by_segment = session_store::restore_by_segment(&store, segid).unwrap();
+    assert_eq!(by_segment.session_id, Some(sid));
 }
 
 #[tokio::test]
@@ -225,7 +241,7 @@ async fn session_run_with_tool_call() {
     let mut worker = Worker::new(client);
     worker.register_tool(weather_tool_definition());
 
-    let sid = session_store::create_segment(
+    let (sid, segid) = session_store::create_segment(
         &store,
         SegmentStartState {
             system_prompt: worker.get_system_prompt(),
@@ -235,9 +251,9 @@ async fn session_run_with_tool_call() {
     )
     .unwrap();
 
-    let (_worker, _) = run_and_persist(worker, &store, sid, "What's the weather?").await;
+    let (_worker, _) = run_and_persist(worker, &store, sid, segid, "What's the weather?").await;
 
-    let entries = store.read_all(sid).unwrap();
+    let entries = store.read_all(sid, segid).unwrap();
 
     let has_tool_results = entries
         .iter()
@@ -260,7 +276,7 @@ async fn session_resume_after_pause() {
     worker.register_tool(weather_tool_definition());
     worker.set_interceptor(PausePolicy);
 
-    let sid = session_store::create_segment(
+    let (sid, segid) = session_store::create_segment(
         &store,
         SegmentStartState {
             system_prompt: worker.get_system_prompt(),
@@ -270,11 +286,11 @@ async fn session_resume_after_pause() {
     )
     .unwrap();
 
-    let (_worker, result) = run_and_persist(worker, &store, sid, "Weather?").await;
+    let (_worker, result) = run_and_persist(worker, &store, sid, segid, "Weather?").await;
     assert!(matches!(result, llm_worker::WorkerResult::Paused));
 
     // Check RunCompleted is Paused
-    let entries = store.read_all(sid).unwrap();
+    let entries = store.read_all(sid, segid).unwrap();
     let has_paused = entries.iter().any(|e| {
         matches!(
             e,
@@ -287,18 +303,18 @@ async fn session_resume_after_pause() {
     assert!(has_paused, "should have Paused outcome");
 
     // Restore state and verify
-    let state = session_store::restore(&store, sid).unwrap();
+    let state = session_store::restore(&store, sid, segid).unwrap();
     assert!(state.last_run_interrupted);
 }
 
 #[tokio::test]
-async fn session_fork_preserves_state() {
+async fn session_fork_creates_new_session() {
     let (_dir, store) = make_store();
     let client = MockLlmClient::new(simple_text_events());
     let mut worker = Worker::new(client);
     worker.set_system_prompt("System prompt");
 
-    let sid = session_store::create_segment(
+    let (sid, segid) = session_store::create_segment(
         &store,
         SegmentStartState {
             system_prompt: worker.get_system_prompt(),
@@ -308,10 +324,10 @@ async fn session_fork_preserves_state() {
     )
     .unwrap();
 
-    let (worker, _) = run_and_persist(worker, &store, sid, "Hello").await;
+    let (worker, _) = run_and_persist(worker, &store, sid, segid, "Hello").await;
 
     let original_history_len = worker.history().len();
-    let fork_id = session_store::fork(
+    let (fork_sid, fork_segid) = session_store::fork(
         &store,
         SegmentStartState {
             system_prompt: worker.get_system_prompt(),
@@ -320,24 +336,26 @@ async fn session_fork_preserves_state() {
         },
     )
     .unwrap();
+    assert_ne!(fork_sid, sid, "`fork` mints a fresh Session");
 
     // Fork should have a SegmentStart with the current history
-    let fork_entries = store.read_all(fork_id).unwrap();
+    let fork_entries = store.read_all(fork_sid, fork_segid).unwrap();
     assert_eq!(fork_entries.len(), 1);
     assert!(matches!(&fork_entries[0], LogEntry::SegmentStart { .. }));
 
     let fork_state = collect_state(&fork_entries);
+    assert_eq!(fork_state.session_id, Some(fork_sid));
     assert_eq!(fork_state.history.len(), original_history_len);
     assert_eq!(fork_state.system_prompt.as_deref(), Some("System prompt"));
 }
 
 #[tokio::test]
-async fn session_fork_at_truncates() {
+async fn session_fork_at_truncates_within_session() {
     let (_dir, store) = make_store();
     let client = MockLlmClient::new(simple_text_events());
     let worker = Worker::new(client);
 
-    let sid = session_store::create_segment(
+    let (sid, segid) = session_store::create_segment(
         &store,
         SegmentStartState {
             system_prompt: worker.get_system_prompt(),
@@ -347,26 +365,33 @@ async fn session_fork_at_truncates() {
     )
     .unwrap();
 
-    let (worker, _) = run_and_persist(worker, &store, sid, "Hello").await;
+    let (worker, _) = run_and_persist(worker, &store, sid, segid, "Hello").await;
 
-    let all_entries = store.read_all(sid).unwrap();
+    let all_entries = store.read_all(sid, segid).unwrap();
     assert!(all_entries.len() > 2);
 
-    // Fork at turn 1 (one completed turn).
-    let fork_id = session_store::fork_at(&store, sid, worker.turn_count()).unwrap();
+    // Fork at turn 1 (one completed turn). Stays in same Session.
+    let fork_segid = session_store::fork_at(&store, sid, segid, worker.turn_count()).unwrap();
 
-    let fork_entries = store.read_all(fork_id).unwrap();
+    let fork_entries = store.read_all(sid, fork_segid).unwrap();
     assert_eq!(fork_entries.len(), 1); // Just the new SegmentStart
 
     let fork_state = collect_state(&fork_entries);
+    assert_eq!(fork_state.session_id, Some(sid), "fork_at inherits Session");
+
     // History at fork point should match history right after the TurnEnd in
-    // the source session.
+    // the source segment.
     let turn_end_pos = all_entries
         .iter()
         .position(|e| matches!(e, LogEntry::TurnEnd { turn_count, .. } if *turn_count == worker.turn_count()))
-        .expect("source session has the matching TurnEnd");
+        .expect("source segment has the matching TurnEnd");
     let source_state_at_fork = collect_state(&all_entries[..=turn_end_pos]);
     assert_eq!(fork_state.history.len(), source_state_at_fork.history.len());
+
+    // list_segments should show both source and fork in the same Session.
+    let segs = store.list_segments(sid).unwrap();
+    assert!(segs.contains(&segid));
+    assert!(segs.contains(&fork_segid));
 }
 
 #[tokio::test]
@@ -375,7 +400,7 @@ async fn session_config_changed_logged() {
     let client = MockLlmClient::new(vec![]);
     let mut worker = Worker::new(client);
 
-    let sid = session_store::create_segment(
+    let (sid, segid) = session_store::create_segment(
         &store,
         SegmentStartState {
             system_prompt: worker.get_system_prompt(),
@@ -388,9 +413,9 @@ async fn session_config_changed_logged() {
     // Modify config and log it
     let new_config = RequestConfig::default().with_temperature(0.7);
     worker.set_request_config(new_config.clone());
-    session_store::save_config_changed(&store, sid, &new_config).unwrap();
+    session_store::save_config_changed(&store, sid, segid, &new_config).unwrap();
 
-    let entries = store.read_all(sid).unwrap();
+    let entries = store.read_all(sid, segid).unwrap();
     let has_config_changed = entries.iter().any(|e| {
         matches!(
             e,
@@ -404,11 +429,11 @@ async fn session_config_changed_logged() {
 async fn session_auto_forks_on_conflict() {
     let (_dir, store) = make_store();
 
-    // Create a session
+    // Create a segment
     let client_a = MockLlmClient::new(simple_text_events());
     let worker_a = Worker::new(client_a);
 
-    let original_sid = session_store::create_segment(
+    let (sid, original_segid) = session_store::create_segment(
         &store,
         SegmentStartState {
             system_prompt: worker_a.get_system_prompt(),
@@ -417,20 +442,21 @@ async fn session_auto_forks_on_conflict() {
         },
     )
     .unwrap();
-    let mut segment_id = original_sid;
+    let mut segment_id = original_segid;
     // Writer tracked: just the SegmentStart we wrote.
     let mut entries_written: usize = 1;
 
-    // Simulate another Pod writing to the same session behind our back.
+    // Simulate another Pod writing to the same segment behind our back.
     let extra_entry = LogEntry::UserInput {
         ts: 9999,
         segments: vec![protocol::Segment::text("Interloper")],
     };
-    store.append(original_sid, &extra_entry).unwrap();
+    store.append(sid, original_segid, &extra_entry).unwrap();
 
     // Now the on-disk count exceeds our tally — ensure_head_or_fork should auto-fork.
     session_store::ensure_head_or_fork(
         &store,
+        sid,
         &mut segment_id,
         &mut entries_written,
         SegmentStartState {
@@ -441,15 +467,17 @@ async fn session_auto_forks_on_conflict() {
     )
     .unwrap();
 
-    // segment_id should now be different
-    assert_ne!(segment_id, original_sid);
+    // segment_id should now be different but live in the same Session.
+    assert_ne!(segment_id, original_segid);
 
-    // The fork session should exist and have entries
-    let fork_entries = store.read_all(segment_id).unwrap();
+    // The fork segment should exist and have entries
+    let fork_entries = store.read_all(sid, segment_id).unwrap();
     assert!(!fork_entries.is_empty());
+    let fork_state = collect_state(&fork_entries);
+    assert_eq!(fork_state.session_id, Some(sid), "auto-fork inherits Session");
 
-    // Original session should still have the interloper entry
-    let original_entries = store.read_all(original_sid).unwrap();
+    // Original segment should still have the interloper entry
+    let original_entries = store.read_all(sid, original_segid).unwrap();
     let has_interloper = original_entries
         .iter()
         .any(|e| matches!(e, LogEntry::UserInput { .. }));
