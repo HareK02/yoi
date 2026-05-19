@@ -17,7 +17,7 @@ use llm_worker::llm_client::event::{Event as LlmEvent, ResponseStatus, StatusEve
 use llm_worker::llm_client::types::Item;
 use llm_worker::llm_client::{ClientError, LlmClient, Request};
 use protocol::Event;
-use session_store::FsStore;
+use session_store::{FsStore, LogEntry, Store};
 use tokio::sync::broadcast;
 
 use pod::Pod;
@@ -211,6 +211,89 @@ fn system_texts_in_sink_session_start(
         }
     }
     Vec::new()
+}
+
+/// Live auto-fork: when another writer extends the segment behind the
+/// Pod's back, the next run's `ensure_segment_head` detects the
+/// entry-count drift and branches into a fresh segment **within the same
+/// Session**. The source segment is left immutable (no terminal marker
+/// written back); the new segment records its parentage forward via
+/// `SegmentStart.forked_from`.
+#[tokio::test]
+async fn concurrent_writer_drift_auto_forks_with_forked_from() {
+    // No compaction: keep run → run deterministic so each run consumes
+    // exactly one mock response and ensure_segment_head is the only fork
+    // trigger.
+    const NO_COMPACT_MANIFEST_TOML: &str = r#"
+[pod]
+name = "test-pod"
+pwd = "./"
+
+[model]
+scheme = "anthropic"
+model_id = "test-model"
+
+[worker]
+max_tokens = 100
+
+[[scope.allow]]
+target = "./"
+permission = "write"
+"#;
+    let client = MockClient::new(vec![single_text_events("first"), single_text_events("second")]);
+    let mut pod = make_pod_with_manifest(NO_COMPACT_MANIFEST_TOML, client).await;
+
+    pod.run_text("first").await.unwrap();
+
+    let store = pod.store().clone();
+    let session_id = pod.session_id();
+    let source_segment_id = pod.segment_id();
+    let source_len_before = store.read_all(session_id, source_segment_id).unwrap().len();
+
+    // Simulate a foreign writer appending to the same segment. This bumps
+    // the on-disk entry count past the Pod's own append tally without
+    // updating the Pod's `entries_written`.
+    store
+        .append(
+            session_id,
+            source_segment_id,
+            &LogEntry::UserInput {
+                ts: 9999,
+                segments: vec![protocol::Segment::text("interloper")],
+            },
+        )
+        .unwrap();
+
+    // Next run triggers ensure_segment_head, which sees the drift.
+    pod.run_text("second").await.unwrap();
+
+    // The Pod moved to a new segment in the same Session.
+    let new_segment_id = pod.segment_id();
+    assert_ne!(new_segment_id, source_segment_id);
+    assert_eq!(pod.session_id(), session_id, "auto-fork stays in-Session");
+
+    // New segment records forked_from pointing at the source.
+    let new_entries = store.read_all(session_id, new_segment_id).unwrap();
+    match &new_entries[0] {
+        LogEntry::SegmentStart {
+            session_id: seg_session,
+            forked_from: Some(origin),
+            ..
+        } => {
+            assert_eq!(*seg_session, session_id);
+            assert_eq!(origin.segment_id, source_segment_id);
+        }
+        other => panic!("expected SegmentStart with forked_from, got {other:?}"),
+    }
+
+    // Source segment is unchanged except for the foreign append — the
+    // auto-fork wrote no terminal marker back into it.
+    let source_after = store.read_all(session_id, source_segment_id).unwrap();
+    assert_eq!(source_after.len(), source_len_before + 1);
+    assert!(matches!(
+        source_after.last(),
+        Some(LogEntry::UserInput { .. })
+    ));
 }
 
 #[tokio::test]
