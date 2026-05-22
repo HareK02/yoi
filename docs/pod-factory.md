@@ -179,7 +179,7 @@ pattern = "*.env"
 action = "deny"
 
 [compaction]
-prune_protected_turns = 3
+prune_protected_tokens = 8000
 prune_min_savings = 4096
 compact_threshold = 80000
 compact_request_threshold = 90000

@@ -14,9 +14,9 @@ pub const TOOL_OUTPUT_MAX_BYTES: usize = 64 * 1024;
 /// See [`crate::FileUploadLimits`].
 pub const FILE_UPLOAD_MAX_BYTES: usize = 256 * 1024;
 
-/// Number of most-recent turns protected from pruning. See
-/// [`crate::CompactionConfig::prune_protected_turns`].
-pub const PRUNE_PROTECTED_TURNS: usize = 3;
+/// Token budget at the history tail protected from pruning. See
+/// [`crate::CompactionConfig::prune_protected_tokens`].
+pub const PRUNE_PROTECTED_TOKENS: u64 = 8000;
 
 /// Minimum estimated token savings required to trigger a prune. See
 /// [`crate::CompactionConfig::prune_min_savings`].

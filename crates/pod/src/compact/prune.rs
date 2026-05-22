@@ -13,19 +13,24 @@
 
 use llm_worker::Item;
 use llm_worker::llm_client::client::LlmClient;
-use llm_worker::prune::{PruneConfig, PruneDecision, PruneObserver, SavingsEstimator};
+use llm_worker::prune::{
+    PruneConfig, PruneDecision, PruneObserver, SavingsEstimator, TokenEstimator,
+};
 use session_metrics::Metric;
 use session_store::Store;
 
 use crate::Pod;
-use crate::compact::token_counter::{EstimateSource, savings_for_prune_impl};
+use crate::compact::token_counter::{
+    EstimateSource, savings_for_prune_impl, token_estimates_for_prune_impl,
+};
 
 impl<C: LlmClient, St: Store> Pod<C, St> {
     /// Enable prune projection on the underlying Worker.
     ///
-    /// Registers the config and a savings-estimator closure on the Worker.
-    /// The estimator captures a shared handle to [`Pod::usage_history_handle`]
-    /// so that every LLM request sees the latest measurements.
+    /// Registers the config and token/savings-estimator closures on the Worker.
+    /// The estimators combine persisted [`Pod::usage_history_handle`] records
+    /// with in-flight `UsageTracker` records so multi-request tool loops can
+    /// prune before the surrounding Pod run finishes.
     ///
     /// Measurement-less estimates (before the first LLM call, or immediately
     /// after a compact) return `0` from the estimator, which naturally
@@ -37,9 +42,25 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     /// [`UsageTracker`] so the next `LlmUsage` can be paired with a
     /// `prune.post_request` metric carrying the same id.
     pub fn attach_prune(&mut self, config: PruneConfig) {
-        let usage = self.usage_history_handle();
+        let usage_history_for_tokens = self.usage_history_handle();
+        let usage_tracker_for_tokens = self.usage_tracker_handle();
+        let token_estimator: TokenEstimator = Box::new(move |history: &[Item]| {
+            let mut snapshot = usage_history_for_tokens
+                .lock()
+                .expect("usage_history poisoned")
+                .clone();
+            snapshot.extend(usage_tracker_for_tokens.records());
+            token_estimates_for_prune_impl(history, &snapshot)
+        });
+
+        let usage_history_for_savings = self.usage_history_handle();
+        let usage_tracker_for_savings = self.usage_tracker_handle();
         let estimator: SavingsEstimator = Box::new(move |history: &[Item], indices| {
-            let snapshot = usage.lock().expect("usage_history poisoned").clone();
+            let mut snapshot = usage_history_for_savings
+                .lock()
+                .expect("usage_history poisoned")
+                .clone();
+            snapshot.extend(usage_tracker_for_savings.records());
             let est = savings_for_prune_impl(history, &snapshot, indices);
             match est.source {
                 EstimateSource::NoData => 0,
@@ -56,8 +77,9 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                     .with_value(eval.estimated_savings as f64)
                     .with_correlation_id(&correlation_id)
                     .with_dimension("candidate_count", eval.candidate_count.to_string());
-                if let Some(border) = eval.border_turn {
-                    metric = metric.with_dimension("border_turn", border.to_string());
+                if let Some(protected_start) = eval.protected_start_index {
+                    metric =
+                        metric.with_dimension("protected_start_index", protected_start.to_string());
                 }
                 metrics.push(metric);
                 usage_tracker.note_correlation_id(correlation_id);
@@ -66,17 +88,21 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 metrics.push(Metric::now("prune.skip").with_dimension("reason", "no_candidates"));
             }
             PruneDecision::SkippedBelowMinSavings => {
-                metrics.push(
-                    Metric::now("prune.skip")
-                        .with_dimension("reason", "below_min_savings")
-                        .with_dimension("candidate_count", eval.candidate_count.to_string())
-                        .with_value(eval.estimated_savings as f64),
-                );
+                let mut metric = Metric::now("prune.skip")
+                    .with_dimension("reason", "below_min_savings")
+                    .with_dimension("candidate_count", eval.candidate_count.to_string())
+                    .with_value(eval.estimated_savings as f64);
+                if let Some(protected_start) = eval.protected_start_index {
+                    metric =
+                        metric.with_dimension("protected_start_index", protected_start.to_string());
+                }
+                metrics.push(metric);
             }
         });
 
         let worker = self.worker_mut();
         worker.set_prune_config(Some(config));
+        worker.set_token_estimator(Some(token_estimator));
         worker.set_savings_estimator(Some(estimator));
         worker.set_prune_observer(Some(observer));
     }
@@ -90,7 +116,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             return;
         };
         let config = PruneConfig {
-            protected_turns: compaction.prune_protected_turns,
+            protected_tokens: compaction.prune_protected_tokens,
             min_savings: compaction.prune_min_savings,
         };
         self.attach_prune(config);

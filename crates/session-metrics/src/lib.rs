@@ -104,7 +104,7 @@ mod tests {
     #[test]
     fn metric_round_trip_via_json() {
         let metric = Metric::now("prune.fire")
-            .with_dimension("border_turn", "3")
+            .with_dimension("protected_start_index", "3")
             .with_dimension("candidate_count", "2")
             .with_value(4096.0)
             .with_correlation_id("abc-123");

@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 
+use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
 
 use crate::defaults;
@@ -112,7 +113,7 @@ pub struct PermissionConfigPartial {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CompactionConfigPartial {
     #[serde(default)]
-    pub prune_protected_turns: Option<usize>,
+    pub prune_protected_tokens: Option<u64>,
     #[serde(default)]
     pub prune_min_savings: Option<u64>,
     #[serde(default)]
@@ -141,12 +142,31 @@ pub enum ResolveError {
     RelativePath { field: &'static str, path: PathBuf },
 }
 
+/// Reject manifest fields that were intentionally removed and must not be
+/// silently swallowed by the general warn-and-ignore unknown-field policy.
+pub(crate) fn reject_removed_manifest_fields(s: &str) -> Result<(), toml::de::Error> {
+    let value: toml::Value = toml::from_str(s)?;
+    if value
+        .get("compaction")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|table| table.contains_key("prune_protected_turns"))
+    {
+        return Err(toml::de::Error::custom(
+            "unknown field in manifest: compaction.prune_protected_turns \
+             (removed; use compaction.prune_protected_tokens)",
+        ));
+    }
+    Ok(())
+}
+
 impl PodManifestConfig {
     /// Parse a partial manifest from a TOML string. Unknown top-level or
     /// nested fields emit a `tracing::warn!` and are ignored; use
     /// `tracing_subscriber` with `WARN` enabled to surface them to the
-    /// operator.
+    /// operator. Removed fields that must not be silently ignored (currently
+    /// `compaction.prune_protected_turns`) are rejected before deserialization.
     pub fn from_toml(s: &str) -> Result<Self, toml::de::Error> {
+        reject_removed_manifest_fields(s)?;
         let de = toml::Deserializer::parse(s)?;
         serde_ignored::deserialize(de, |path| {
             tracing::warn!("unknown field in manifest: {}", path);
@@ -339,7 +359,7 @@ impl PermissionConfigPartial {
 impl CompactionConfigPartial {
     fn merge(self, upper: Self) -> Self {
         Self {
-            prune_protected_turns: upper.prune_protected_turns.or(self.prune_protected_turns),
+            prune_protected_tokens: upper.prune_protected_tokens.or(self.prune_protected_tokens),
             prune_min_savings: upper.prune_min_savings.or(self.prune_min_savings),
             compact_threshold: upper.compact_threshold.or(self.compact_threshold),
             compact_request_threshold: upper
@@ -489,9 +509,9 @@ impl TryFrom<PodManifestConfig> for PodManifest {
                     validate_model_paths(cm, "compaction.model.auth.file")?;
                 }
                 Ok(CompactionConfig {
-                    prune_protected_turns: c
-                        .prune_protected_turns
-                        .unwrap_or(defaults::PRUNE_PROTECTED_TURNS),
+                    prune_protected_tokens: c
+                        .prune_protected_tokens
+                        .unwrap_or(defaults::PRUNE_PROTECTED_TOKENS),
                     prune_min_savings: c.prune_min_savings.unwrap_or(defaults::PRUNE_MIN_SAVINGS),
                     compact_threshold: c.compact_threshold,
                     compact_request_threshold: c.compact_request_threshold,
@@ -921,7 +941,7 @@ mod tests {
         let lower = PodManifestConfig {
             compaction: Some(CompactionConfigPartial {
                 compact_threshold: Some(50_000),
-                prune_protected_turns: Some(5),
+                prune_protected_tokens: Some(5_000),
                 ..Default::default()
             }),
             ..Default::default()
@@ -937,7 +957,7 @@ mod tests {
         let c = merged.compaction.unwrap();
         assert_eq!(c.compact_threshold, Some(80_000));
         // field from lower retained when upper has None
-        assert_eq!(c.prune_protected_turns, Some(5));
+        assert_eq!(c.prune_protected_tokens, Some(5_000));
     }
 
     #[test]
@@ -969,6 +989,19 @@ unknown_future_field = "tolerated"
 "#;
         let cfg = PodManifestConfig::from_toml(ok).unwrap();
         assert_eq!(cfg.worker.max_tokens, Some(1000));
+    }
+
+    #[test]
+    fn from_toml_rejects_removed_prune_protected_turns_field() {
+        let bad = r#"
+[compaction]
+prune_protected_turns = 3
+"#;
+        let err = PodManifestConfig::from_toml(bad).unwrap_err();
+        assert!(
+            err.to_string().contains("compaction.prune_protected_turns"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
