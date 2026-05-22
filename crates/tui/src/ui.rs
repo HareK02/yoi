@@ -7,6 +7,7 @@
 //!   ──────────── separator ──────────
 //!   status line (1 row)
 //!   > input area (1 row in Phase 1)
+//!   actionbar (1 row)
 //! ```
 //!
 //! Every frame we walk the entire `App::blocks` vector, produce styled
@@ -78,6 +79,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Constraint::Length(1),             // separator
         Constraint::Length(1),             // status
         Constraint::Length(input_height),  // input area
+        Constraint::Length(1),             // actionbar
     ])
     .split(area);
 
@@ -88,6 +90,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_separator(frame, chunks[3]);
     draw_status(frame, app, chunks[4]);
     draw_input(frame, &input_render, chunks[5]);
+    draw_actionbar(frame, app, chunks[6]);
     if let Some(state) = app.completion.as_ref().filter(|c| c.is_active()) {
         draw_completion_popup(frame, state, chunks[5]);
     }
@@ -1074,6 +1077,20 @@ fn draw_separator(frame: &mut Frame, area: Rect) {
     );
 }
 
+fn context_usage_text(app: &App) -> String {
+    let pct = if app.context_window == 0 {
+        0
+    } else {
+        ((app.session_context_tokens as f64 / app.context_window as f64) * 100.0).round() as u64
+    };
+    format!(
+        "{} / {} ({}%)",
+        fmt_tokens(app.session_context_tokens),
+        fmt_tokens(app.context_window),
+        pct
+    )
+}
+
 fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     let conn = if app.connected {
         Span::styled("●", Style::default().fg(Color::Green))
@@ -1124,7 +1141,15 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         spans.push(Span::styled(" idle", Style::default().fg(Color::DarkGray)));
     }
 
-    // Right-aligned mode / scroll indicator.
+    let right_text = context_usage_text(app);
+    let right_line = Line::from(Span::styled(right_text, Style::default().fg(Color::Gray)))
+        .alignment(ratatui::layout::Alignment::Right);
+
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    frame.render_widget(Paragraph::new(right_line), area);
+}
+
+fn draw_actionbar(frame: &mut Frame, app: &App, area: Rect) {
     let mut right: Vec<Span<'static>> = Vec::new();
     if !app.scroll.follow_tail {
         right.push(Span::styled(
@@ -1137,8 +1162,6 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         Style::default().fg(Color::DarkGray),
     ));
     let right_line = Line::from(right).alignment(ratatui::layout::Alignment::Right);
-
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
     frame.render_widget(Paragraph::new(right_line), area);
 }
 

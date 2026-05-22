@@ -52,6 +52,10 @@ pub struct ModelManifest {
     /// `default_capability` → scheme 既定の順で解決される。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capability: Option<ModelCapability>,
+    /// モデルのコンテキストウィンドウ上限（tokens）。カタログ未掲載 / inline
+    /// モデルでもここで明示 override できる。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
 }
 
 impl ModelManifest {
@@ -65,6 +69,7 @@ impl ModelManifest {
             model_id: upper.model_id.or(self.model_id),
             auth: upper.auth.or(self.auth),
             capability: upper.capability.or(self.capability),
+            context_window: upper.context_window.or(self.context_window),
         }
     }
 }

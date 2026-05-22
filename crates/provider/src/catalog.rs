@@ -22,6 +22,11 @@ use serde::{Deserialize, Serialize};
 const BUILTIN_PROVIDERS: &str = include_str!("../../../resources/providers/builtin.toml");
 const BUILTIN_MODELS: &str = include_str!("../../../resources/models/builtin.toml");
 
+/// Conservative fallback used when neither the manifest nor catalogs specify
+/// a model context window. Greeting still carries a concrete number, while
+/// catalog / manifest metadata can override unknown or inline models.
+pub const DEFAULT_CONTEXT_WINDOW: u64 = 200_000;
+
 #[derive(Debug, thiserror::Error)]
 pub enum CatalogError {
     #[error("failed to read catalog at {path}: {source}")]
@@ -92,6 +97,10 @@ pub struct ProviderEntry {
     /// 使う。
     #[serde(default)]
     pub default_capability: Option<ModelCapability>,
+    /// モデルカタログ未登録モデルで使う既定の context window。省略時は
+    /// [`DEFAULT_CONTEXT_WINDOW`] を使う。
+    #[serde(default)]
+    pub default_context_window: Option<u64>,
 }
 
 /// モデルカタログの 1 エントリ。
@@ -107,6 +116,10 @@ pub struct ModelEntry {
     /// `ProviderEntry::default_capability` にフォールバックする。
     #[serde(default)]
     pub capability: Option<ModelCapability>,
+    /// モデル単位の context window。省略時は provider default → builtin
+    /// fallback にフォールバックする。
+    #[serde(default)]
+    pub context_window: Option<u64>,
 }
 
 /// 解決済みモデル設定。`build_client` が消費する完成形。
@@ -117,6 +130,7 @@ pub struct ModelConfig {
     pub model_id: String,
     pub auth: AuthRef,
     pub capability: Option<ModelCapability>,
+    pub context_window: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -244,6 +258,8 @@ fn split_ref(s: &str) -> Option<(&str, &str)> {
 /// auth は manifest 明示 > provider.auth_hint 由来、capability は
 /// manifest 明示 > model catalog > provider.default_capability >
 /// （`build_client` 側で）`Scheme::default_capability()`。
+/// context_window は manifest 明示 > model catalog > provider default >
+/// [`DEFAULT_CONTEXT_WINDOW`]。
 pub fn resolve_model_manifest(manifest: &ModelManifest) -> Result<ModelConfig, ResolveError> {
     let providers = load_providers().map_err(ResolveError::LoadProviders)?;
     let models = load_models().map_err(ResolveError::LoadModels)?;
@@ -294,12 +310,18 @@ pub fn resolve_with_catalogs(
                 .and_then(|m| m.capability.clone())
                 .or_else(|| provider.default_capability.clone())
         });
+        let context_window = manifest
+            .context_window
+            .or_else(|| model_entry.and_then(|m| m.context_window))
+            .or(provider.default_context_window)
+            .unwrap_or(DEFAULT_CONTEXT_WINDOW);
         Ok(ModelConfig {
             scheme,
             base_url,
             model_id,
             auth,
             capability,
+            context_window,
         })
     } else {
         let scheme = manifest
@@ -319,6 +341,7 @@ pub fn resolve_with_catalogs(
             model_id,
             auth,
             capability: manifest.capability.clone(),
+            context_window: manifest.context_window.unwrap_or(DEFAULT_CONTEXT_WINDOW),
         })
     }
 }
@@ -381,6 +404,20 @@ mod tests {
             cfg.capability.is_some(),
             "should fall back to provider.default_capability"
         );
+        assert_eq!(cfg.context_window, 200_000);
+    }
+
+    #[test]
+    fn context_window_manifest_overrides_catalog() {
+        let providers = load_builtin_providers().unwrap();
+        let models = load_builtin_models().unwrap();
+        let manifest = ModelManifest {
+            ref_: Some("anthropic/claude-sonnet-4-6".into()),
+            context_window: Some(123_456),
+            ..Default::default()
+        };
+        let cfg = resolve_with_catalogs(&manifest, &providers, &models).unwrap();
+        assert_eq!(cfg.context_window, 123_456);
     }
 
     #[test]
@@ -461,6 +498,25 @@ mod tests {
         assert_eq!(cfg.scheme, SchemeKind::Anthropic);
         assert_eq!(cfg.model_id, "claude-sonnet-4-6");
         assert!(cfg.capability.is_none(), "no catalog hit for inline-only");
+        assert_eq!(cfg.context_window, DEFAULT_CONTEXT_WINDOW);
+    }
+
+    #[test]
+    fn resolve_inline_context_window_override() {
+        let providers = load_builtin_providers().unwrap();
+        let models = load_builtin_models().unwrap();
+        let manifest = ModelManifest {
+            scheme: Some(SchemeKind::Anthropic),
+            model_id: Some("claude-sonnet-4-6".into()),
+            auth: Some(AuthRef::ApiKey {
+                env: None,
+                file: Some(PathBuf::from("/tmp/sk")),
+            }),
+            context_window: Some(777_000),
+            ..Default::default()
+        };
+        let cfg = resolve_with_catalogs(&manifest, &providers, &models).unwrap();
+        assert_eq!(cfg.context_window, 777_000);
     }
 
     #[test]

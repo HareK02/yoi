@@ -486,6 +486,12 @@ pub struct Greeting {
     pub model: String,
     pub scope_summary: String,
     pub tools: Vec<String>,
+    /// Model context window in tokens. Always filled by the Pod greeting.
+    #[serde(default)]
+    pub context_window: u64,
+    /// Estimated current session context tokens at connect time.
+    #[serde(default)]
+    pub context_tokens: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -873,6 +879,8 @@ mod tests {
                 model: "claude".into(),
                 scope_summary: "Writable:\n  - /tmp".into(),
                 tools: vec!["Read".into()],
+                context_window: 200_000,
+                context_tokens: 42_000,
             },
             status: PodStatus::Paused,
         };
@@ -883,6 +891,8 @@ mod tests {
         assert_eq!(parsed["data"]["entries"][0]["kind"], "user_input");
         assert_eq!(parsed["data"]["greeting"]["pod_name"], "test");
         assert_eq!(parsed["data"]["greeting"]["tools"][0], "Read");
+        assert_eq!(parsed["data"]["greeting"]["context_window"], 200_000);
+        assert_eq!(parsed["data"]["greeting"]["context_tokens"], 42_000);
         assert_eq!(parsed["data"]["status"], "paused");
     }
 
@@ -942,7 +952,13 @@ mod tests {
         let json = r#"{"event":"snapshot","data":{"entries":[],"greeting":{"pod_name":"test","cwd":"/tmp","provider":"anthropic","model":"claude","scope_summary":"","tools":[]}}}"#;
         let decoded: Event = serde_json::from_str(json).unwrap();
         match decoded {
-            Event::Snapshot { status, .. } => assert_eq!(status, PodStatus::Idle),
+            Event::Snapshot {
+                status, greeting, ..
+            } => {
+                assert_eq!(status, PodStatus::Idle);
+                assert_eq!(greeting.context_window, 0);
+                assert_eq!(greeting.context_tokens, 0);
+            }
             other => panic!("expected Snapshot, got {other:?}"),
         }
     }

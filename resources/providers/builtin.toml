@@ -5,6 +5,7 @@ scheme = "anthropic"
 base_url = "https://api.anthropic.com"
 auth_hint = { kind = "api_key", env = "INSOMNIA_API_KEY_ANTHROPIC" }
 default_capability = { tool_calling = "parallel", structured_output = "json_schema", reasoning = "budget_tokens", vision = true, prompt_caching = { kind = "explicit", max_breakpoints = 4 } }
+default_context_window = 200000
 
 [[provider]]
 id = "ollama-local"
@@ -13,6 +14,7 @@ scheme = "anthropic"
 base_url = "http://localhost:11434"
 auth_hint = { kind = "none" }
 default_capability = { tool_calling = "parallel", structured_output = "json_schema", vision = false, prompt_caching = { kind = "auto" } }
+default_context_window = 128000
 
 [[provider]]
 id = "codex-oauth"
@@ -20,6 +22,7 @@ display_name = "ChatGPT (Codex OAuth)"
 scheme = "openai_responses"
 auth_hint = { kind = "codex_oauth" }
 default_capability = { tool_calling = "parallel", structured_output = "json_schema", reasoning = "effort", vision = true, prompt_caching = { kind = "auto" } }
+default_context_window = 400000
 
 [[provider]]
 id = "openrouter"
@@ -28,3 +31,4 @@ scheme = "openai_chat"
 base_url = "https://openrouter.ai/api/v1"
 auth_hint = { kind = "api_key", env = "INSOMNIA_API_KEY_OPENROUTER" }
 default_capability = { tool_calling = "parallel", structured_output = "json_schema", vision = true, prompt_caching = { kind = "auto" } }
+default_context_window = 200000

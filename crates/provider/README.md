@@ -18,3 +18,4 @@
 - `AuthRef::None` / `AuthRef::CodexOAuth` の解決
 - `Scheme::required_auth()` と `ResolvedAuth` の妥当性検証（非対応組合せは構築エラー）
 - capability は manifest 明示 > model catalog > provider.default_capability > `Scheme::default_capability()` の順で解決
+- context window は manifest 明示 > model catalog > provider.default_context_window > builtin fallback の順で解決し、inline model でも `context_window` で override できる

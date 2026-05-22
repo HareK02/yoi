@@ -186,6 +186,7 @@ mod tests {
                 file: None,
             },
             capability: None,
+            context_window: 200_000,
         }
     }
 
@@ -313,6 +314,7 @@ mod tests {
             model_id: "llama3".into(),
             auth: AuthRef::None,
             capability: None,
+            context_window: 200_000,
         };
         assert!(build_client_from_config(&config).is_ok());
     }
