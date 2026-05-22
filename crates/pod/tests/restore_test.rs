@@ -8,7 +8,7 @@
 use std::sync::{LazyLock, Mutex};
 
 use pod::{Pod, PodError};
-use session_store::{FsStore, StoreError};
+use session_store::{FsStore, PodActiveSegmentRef, PodMetadata, PodMetadataStore, StoreError};
 
 const MINIMAL_MANIFEST_TOML: &str = r#"
 [pod]
@@ -30,6 +30,96 @@ permission = "write"
 /// Serialises tests that mutate runtime-dir env vars, mirroring the
 /// pattern used by other integration tests in this crate.
 static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+#[tokio::test]
+async fn restore_from_pod_metadata_rejects_missing_metadata() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let store_tmp = tempfile::tempdir().unwrap();
+    let store = FsStore::new(store_tmp.path()).unwrap();
+    let manifest = pod::PodManifest::from_toml(MINIMAL_MANIFEST_TOML).unwrap();
+
+    let result = Pod::restore_from_pod_metadata(
+        "restore-test",
+        manifest,
+        store,
+        pod::PromptLoader::builtins_only(),
+    )
+    .await;
+
+    match result {
+        Err(PodError::PodMetadataMissing { pod_name }) => assert_eq!(pod_name, "restore-test"),
+        Err(other) => panic!("expected PodMetadataMissing, got {other:?}"),
+        Ok(_) => panic!("expected missing pod metadata to fail"),
+    }
+}
+
+#[tokio::test]
+async fn restore_from_pod_metadata_rejects_pending_segment() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let store_tmp = tempfile::tempdir().unwrap();
+    let store = FsStore::new(store_tmp.path()).unwrap();
+    let manifest = pod::PodManifest::from_toml(MINIMAL_MANIFEST_TOML).unwrap();
+    let session_id = session_store::new_session_id();
+    store
+        .write(&PodMetadata::new(
+            "restore-test",
+            Some(PodActiveSegmentRef::pending_segment(session_id)),
+        ))
+        .unwrap();
+
+    let result = Pod::restore_from_pod_metadata(
+        "restore-test",
+        manifest,
+        store,
+        pod::PromptLoader::builtins_only(),
+    )
+    .await;
+
+    match result {
+        Err(PodError::PodMetadataPending {
+            pod_name,
+            session_id: actual,
+        }) => {
+            assert_eq!(pod_name, "restore-test");
+            assert_eq!(actual, session_id);
+        }
+        Err(other) => panic!("expected PodMetadataPending, got {other:?}"),
+        Ok(_) => panic!("expected pending pod metadata to fail"),
+    }
+}
+
+#[tokio::test]
+async fn restore_from_pod_metadata_resolves_active_pointer_through_session_log() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let store_tmp = tempfile::tempdir().unwrap();
+    let store = FsStore::new(store_tmp.path()).unwrap();
+    let manifest = pod::PodManifest::from_toml(MINIMAL_MANIFEST_TOML).unwrap();
+    let session_id = session_store::new_session_id();
+    let segment_id = session_store::new_segment_id();
+    store
+        .write(&PodMetadata::new(
+            "restore-test",
+            Some(PodActiveSegmentRef::active_segment(session_id, segment_id)),
+        ))
+        .unwrap();
+
+    let result = Pod::restore_from_pod_metadata(
+        "restore-test",
+        manifest,
+        store,
+        pod::PromptLoader::builtins_only(),
+    )
+    .await;
+
+    match result {
+        Err(PodError::Store(StoreError::NotFound(id))) => assert_eq!(id, segment_id),
+        Err(other) => panic!("expected Store(NotFound) from resolved segment, got {other:?}"),
+        Ok(_) => panic!("expected unknown resolved segment to fail"),
+    }
+}
 
 #[tokio::test]
 async fn restore_from_manifest_rejects_unknown_segment() {

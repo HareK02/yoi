@@ -417,21 +417,23 @@ async fn events_are_broadcast() {
 
 #[tokio::test]
 async fn double_run_returns_error() {
-    // Create a client that streams slowly
+    // Keep the first turn in-flight until the test drops the handle. A
+    // finite stream can finish before the second Method reaches the
+    // controller in the full test suite, making this assertion racy.
     let events = vec![
         LlmEvent::text_block_start(0),
         LlmEvent::text_delta(0, "slow..."),
-        // No stop/completed — the stream will end but without proper completion
     ];
-    let client = MockClient::new(events);
+    let client = MockClient::sequential(vec![MockResponse::Hang(events)]);
     let pod = make_pod(client).await;
     let handle = spawn_controller(pod).await;
     let mut rx = handle.subscribe();
 
-    // Send first run
+    // Send first run and wait until the controller has entered Running.
     handle.send(Method::run_text("first")).await.unwrap();
+    wait_for_status(&handle, PodStatus::Running).await;
 
-    // Immediately send second run (should get error)
+    // Now the second run must be rejected by drive_turn's live Method arm.
     handle.send(Method::run_text("second")).await.unwrap();
 
     // Look for the error event
