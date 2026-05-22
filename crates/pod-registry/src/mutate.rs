@@ -178,6 +178,55 @@ pub fn release_pod(guard: &mut LockFileGuard, pod_name: &str) -> Result<(), Scop
     Ok(())
 }
 
+/// Reclaim a child delegation back into its parent allocation.
+///
+/// This is idempotent: missing child allocations and missing deny entries are
+/// ignored. For each delegated Write rule, at most one exact matching deny rule
+/// is removed from the parent's `scope_deny`, preserving any duplicate explicit
+/// base deny that was not owned by this child delegation.
+pub fn reclaim_delegated_scope(
+    guard: &mut LockFileGuard,
+    parent: &str,
+    child: &str,
+    delegated_scope: &[ScopeRule],
+) -> Result<(), ScopeLockError> {
+    let child_idx = guard
+        .data()
+        .allocations
+        .iter()
+        .position(|a| a.pod_name == child);
+    let removed_child_parent = child_idx
+        .map(|idx| guard.data().allocations[idx].delegated_from.clone())
+        .unwrap_or(None);
+
+    let child_exists = child_idx.is_some();
+
+    if child_exists {
+        if let Some(parent_alloc) = guard.data_mut().find_mut(parent) {
+            for rule in delegated_scope
+                .iter()
+                .filter(|rule| rule.permission == Permission::Write)
+            {
+                if let Some(idx) = parent_alloc.scope_deny.iter().position(|deny| deny == rule) {
+                    parent_alloc.scope_deny.remove(idx);
+                }
+            }
+        }
+    }
+
+    if let Some(idx) = child_idx {
+        for alloc in guard.data_mut().allocations.iter_mut() {
+            if alloc.delegated_from.as_deref() == Some(child) {
+                alloc.delegated_from.clone_from(&removed_child_parent);
+            }
+        }
+        guard.data_mut().allocations.remove(idx);
+    }
+
+    guard.save()?;
+    Ok(())
+}
+
 /// Remove allocations whose PID is dead, reparenting children to the
 /// dead Pod's `delegated_from`. Idempotent and best-effort — I/O
 /// errors on save are swallowed so a crashed Pod's entry never blocks
@@ -434,6 +483,46 @@ mod tests {
         let d = g.data().find("d").unwrap();
         assert_eq!(d.delegated_from.as_deref(), Some("a"));
         assert!(g.data().find("b").is_none());
+    }
+
+    #[test]
+    fn reclaim_delegated_scope_removes_child_and_one_parent_deny_layer() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("pods.json");
+        let mut g = open_empty(&path);
+        let delegated_rule = write_rule("/src/core", true);
+        register_pod_with_deny(
+            &mut g,
+            "a".into(),
+            std::process::id(),
+            sock("a"),
+            vec![write_rule("/src", true)],
+            vec![delegated_rule.clone(), delegated_rule.clone()],
+            sid(),
+        )
+        .unwrap();
+        register_pod(
+            &mut g,
+            "b".into(),
+            std::process::id(),
+            sock("b"),
+            vec![delegated_rule.clone()],
+            sid(),
+        )
+        .unwrap();
+
+        reclaim_delegated_scope(&mut g, "a", "b", std::slice::from_ref(&delegated_rule)).unwrap();
+        let a = g.data().find("a").unwrap();
+        assert_eq!(a.scope_deny, vec![delegated_rule.clone()]);
+        assert!(g.data().find("b").is_none());
+
+        reclaim_delegated_scope(&mut g, "a", "b", &[delegated_rule.clone()]).unwrap();
+        let a = g.data().find("a").unwrap();
+        assert_eq!(
+            a.scope_deny,
+            vec![delegated_rule],
+            "a repeated reclaim with no child allocation must not broaden an explicit duplicate base deny"
+        );
     }
 
     #[test]

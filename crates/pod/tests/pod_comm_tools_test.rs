@@ -13,7 +13,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 use llm_worker::llm_client::types::{ContentPart, Item, Role};
 use llm_worker::tool::ToolOutput;
-use manifest::{Permission, ScopeRule};
+use manifest::{Permission, Scope, ScopeRule, SharedScope};
 use pod::runtime::dir::{RuntimeDir, SpawnedPodRecord};
 use pod::runtime::pod_registry::{self, LockFileGuard};
 use pod::spawn::comm_tools::{
@@ -383,44 +383,66 @@ async fn read_pod_output_reports_stopped_on_dead_socket() {
 #[tokio::test]
 async fn stop_pod_sends_shutdown_and_releases_scope() {
     let _env = EnvGuard::acquire();
-    let (tmp, registry, rd) = setup_registry().await;
+    let tmp = TempDir::new().unwrap();
+    let store_tmp = TempDir::new().unwrap();
+    let store = FsStore::new(store_tmp.path()).unwrap();
+    let rd = Arc::new(RuntimeDir::create(tmp.path(), "spawner").await.unwrap());
+    let parent_scope = SharedScope::new(
+        Scope::writable(tmp.path())
+            .unwrap()
+            .with_added_deny_rules([ScopeRule {
+                target: tmp.path().to_path_buf(),
+                permission: Permission::Write,
+                recursive: true,
+            }])
+            .unwrap(),
+    );
     unsafe {
         std::env::set_var("INSOMNIA_RUNTIME_DIR", tmp.path());
     }
     let lock_path = tmp.path().join("pods.json");
 
-    // Seed pods.json with a top-level `spawner` allocation plus a
-    // delegated `child` allocation — mimics what SpawnPod would have
-    // done so StopPod has something to release.
+    // Seed pods.json with a restored top-level `spawner` allocation whose
+    // scope_deny contains the delegated child path plus the live child
+    // allocation — mimics a parent resumed after SpawnPod.
     {
         let mut g = LockFileGuard::open(&lock_path).unwrap();
-        pod_registry::register_pod(
+        let rule = ScopeRule {
+            target: tmp.path().to_path_buf(),
+            permission: Permission::Write,
+            recursive: true,
+        };
+        pod_registry::register_pod_with_deny(
             &mut g,
             "spawner".into(),
             std::process::id(),
             "/tmp/spawner.sock".into(),
-            vec![ScopeRule {
-                target: tmp.path().to_path_buf(),
-                permission: Permission::Write,
-                recursive: true,
-            }],
+            vec![rule.clone()],
+            vec![rule.clone()],
             session_store::new_segment_id(),
         )
         .unwrap();
-        pod_registry::delegate_scope(
+        pod_registry::register_pod(
             &mut g,
-            "spawner",
             "child".into(),
             std::process::id(),
             "/tmp/child.sock".into(),
-            vec![ScopeRule {
-                target: tmp.path().to_path_buf(),
-                permission: Permission::Write,
-                recursive: true,
-            }],
+            vec![rule],
+            session_store::new_segment_id(),
         )
         .unwrap();
     }
+
+    let loaded = SpawnedPodRegistry::load_from_pod_state_with_reclaim(
+        rd.clone(),
+        store.clone(),
+        "spawner".into(),
+        Some(parent_scope.clone()),
+        None,
+    )
+    .await
+    .unwrap();
+    let registry = loaded.registry;
 
     let (socket, listener) = bind_mock_socket(tmp.path(), "child").await;
     let received = accept_one_method(listener);
@@ -436,12 +458,20 @@ async fn stop_pod_sends_shutdown_and_releases_scope() {
     let method = received.await.unwrap().expect("expected shutdown");
     assert!(matches!(method, Method::Shutdown));
 
-    // Allocation for `child` is gone; `spawner` remains.
+    // Allocation for `child` is gone; `spawner` remains and its restored
+    // dynamic deny layer has been reclaimed.
     {
         let g = LockFileGuard::open(&lock_path).unwrap();
         assert!(g.data().find("child").is_none(), "child still allocated");
-        assert!(g.data().find("spawner").is_some(), "spawner missing");
+        let spawner = g.data().find("spawner").expect("spawner missing");
+        assert!(spawner.scope_deny.is_empty(), "deny not reclaimed");
     }
+    assert_eq!(
+        parent_scope
+            .snapshot()
+            .permission_at(&tmp.path().join("file.txt")),
+        Some(Permission::Write)
+    );
 
     // spawned_pods.json now lists zero children.
     let spawned = rd.path().join("spawned_pods.json");
@@ -587,6 +617,98 @@ async fn load_from_pod_state_prunes_children_with_missing_sockets() {
         .expect("spawner metadata should be written");
     assert_eq!(metadata.spawned_children.len(), 1);
     assert_eq!(metadata.spawned_children[0].pod_name, "alive");
+}
+
+#[tokio::test]
+async fn load_from_pod_state_reclaims_pruned_child_scope_and_registry_deny() {
+    let _env = EnvGuard::acquire();
+    let runtime_tmp = TempDir::new().unwrap();
+    let store_tmp = TempDir::new().unwrap();
+    let store = FsStore::new(store_tmp.path()).unwrap();
+    unsafe {
+        std::env::set_var("INSOMNIA_RUNTIME_DIR", runtime_tmp.path());
+    }
+    let rd = Arc::new(
+        RuntimeDir::create(runtime_tmp.path(), "spawner")
+            .await
+            .unwrap(),
+    );
+    let missing_rule = ScopeRule {
+        target: runtime_tmp.path().to_path_buf(),
+        permission: Permission::Write,
+        recursive: true,
+    };
+
+    {
+        let mut g = LockFileGuard::open(&runtime_tmp.path().join("pods.json")).unwrap();
+        pod_registry::register_pod_with_deny(
+            &mut g,
+            "spawner".into(),
+            std::process::id(),
+            "/tmp/spawner.sock".into(),
+            vec![missing_rule.clone()],
+            vec![missing_rule.clone()],
+            session_store::new_segment_id(),
+        )
+        .unwrap();
+        pod_registry::register_pod(
+            &mut g,
+            "missing".into(),
+            std::process::id(),
+            "/tmp/missing.sock".into(),
+            vec![missing_rule.clone()],
+            session_store::new_segment_id(),
+        )
+        .unwrap();
+    }
+
+    let parent_scope = SharedScope::new(
+        Scope::writable(runtime_tmp.path())
+            .unwrap()
+            .with_added_deny_rules([missing_rule.clone()])
+            .unwrap(),
+    );
+    let seed = SpawnedPodRegistry::load_from_pod_state(rd.clone(), store.clone(), "spawner".into())
+        .await
+        .unwrap();
+    seed.add(SpawnedPodRecord {
+        pod_name: "missing".into(),
+        socket_path: runtime_tmp.path().join("missing.sock"),
+        scope_delegated: vec![missing_rule.clone()],
+        callback_address: "/dev/null".into(),
+    })
+    .await
+    .unwrap();
+
+    let loaded = SpawnedPodRegistry::load_from_pod_state_with_reclaim(
+        rd.clone(),
+        store.clone(),
+        "spawner".into(),
+        Some(parent_scope.clone()),
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(loaded.reclaimed_unreachable);
+    assert!(loaded.registry.get("missing").await.is_none());
+    assert_eq!(
+        parent_scope
+            .snapshot()
+            .permission_at(&runtime_tmp.path().join("file.txt")),
+        Some(Permission::Write)
+    );
+
+    let g = LockFileGuard::open(&runtime_tmp.path().join("pods.json")).unwrap();
+    assert!(g.data().find("missing").is_none());
+    assert!(g.data().find("spawner").unwrap().scope_deny.is_empty());
+    let metadata = store
+        .read_by_name("spawner")
+        .unwrap()
+        .expect("spawner metadata should remain");
+    assert!(metadata.spawned_children.is_empty());
+    let runtime_contents = std::fs::read_to_string(rd.path().join("spawned_pods.json")).unwrap();
+    let runtime_records: Vec<SpawnedPodRecord> = serde_json::from_str(&runtime_contents).unwrap();
+    assert!(runtime_records.is_empty());
 }
 
 // ---------------------------------------------------------------------------

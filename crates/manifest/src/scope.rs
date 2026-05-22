@@ -24,7 +24,7 @@ pub struct Scope {
     deny: Vec<ResolvedRule>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolvedRule {
     /// Absolute, canonicalized-or-normalized target directory/file.
     target: PathBuf,
@@ -215,6 +215,32 @@ impl Scope {
         };
         config.deny.extend(extra_deny);
         Self::from_config(&config)
+    }
+
+    /// Build a new [`Scope`] with one matching deny rule removed for each
+    /// rule in `remove_deny`.
+    ///
+    /// This is intentionally exact (after the same target resolution used
+    /// by [`Scope::from_config`]) rather than geometric: reclaiming a
+    /// delegated child must remove the deny layer that was added for that
+    /// child without broadening any explicit base deny that merely overlaps
+    /// the delegated path. Missing rules are ignored, making repeated
+    /// reclaim calls harmless.
+    pub fn with_removed_deny_rules(
+        &self,
+        remove_deny: impl IntoIterator<Item = ScopeRule>,
+    ) -> Result<Self, ScopeError> {
+        let mut deny = self.deny.clone();
+        for rule in remove_deny {
+            let resolved = resolve_rule(&rule)?;
+            if let Some(idx) = deny.iter().position(|existing| existing == &resolved) {
+                deny.remove(idx);
+            }
+        }
+        Ok(Self {
+            allow: self.allow.clone(),
+            deny,
+        })
     }
 
     /// Human-readable grouping of allow rules, suitable for embedding in
@@ -681,6 +707,44 @@ mod tests {
         assert_eq!(
             demoted.permission_at(&dir.path().join("top.txt")),
             Some(Permission::Write)
+        );
+    }
+
+    #[test]
+    fn with_removed_deny_rules_reclaims_one_matching_layer() {
+        let dir = TempDir::new().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let rule = ScopeRule {
+            target: sub.clone(),
+            permission: Permission::Write,
+            recursive: true,
+        };
+        let base = Scope::writable(dir.path())
+            .unwrap()
+            .with_added_deny_rules([rule.clone(), rule.clone()])
+            .unwrap();
+
+        let reclaimed_once = base.with_removed_deny_rules([rule.clone()]).unwrap();
+        assert_eq!(
+            reclaimed_once.permission_at(&sub.join("a.txt")),
+            Some(Permission::Read),
+            "one duplicate deny layer must remain"
+        );
+
+        let reclaimed_twice = reclaimed_once
+            .with_removed_deny_rules([rule.clone()])
+            .unwrap();
+        assert_eq!(
+            reclaimed_twice.permission_at(&sub.join("a.txt")),
+            Some(Permission::Write)
+        );
+
+        let reclaimed_again = reclaimed_twice.with_removed_deny_rules([rule]).unwrap();
+        assert_eq!(
+            reclaimed_again.permission_at(&sub.join("a.txt")),
+            Some(Permission::Write),
+            "missing rules are ignored for idempotent reclaim"
         );
     }
 
