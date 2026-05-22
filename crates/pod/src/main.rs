@@ -3,9 +3,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
-use manifest::{PodManifest, paths};
+use manifest::{PodManifest, PodManifestConfig, paths};
 use pod::{Pod, PodController, PodFactory, PromptLoader};
-use session_store::{FsStore, SegmentId, Store};
+use session_store::{FsStore, PodMetadataStore, SegmentId, Store};
 
 const USER_MANIFEST_ENV: &str = "INSOMNIA_USER_MANIFEST";
 
@@ -47,12 +47,18 @@ struct Cli {
     #[arg(long, value_name = "PATH", requires = "adopt")]
     callback: Option<PathBuf>,
 
+    /// Resume or create a Pod by name. If name-keyed Pod state exists,
+    /// the active session/segment recorded there is restored; otherwise a
+    /// fresh top-level Pod is created with this name.
+    #[arg(long, value_name = "NAME", conflicts_with_all = ["session", "adopt"])]
+    pod: Option<String>,
+
     /// Restore a Pod from an existing session. The Pod re-uses the
     /// given session id and appends new turns to the same jsonl;
     /// concurrent writers are prevented by the pod-registry.
     /// Mutually exclusive with `--adopt` (spawned children always start
     /// fresh).
-    #[arg(long, value_name = "UUID", conflicts_with = "adopt")]
+    #[arg(long, value_name = "UUID", conflicts_with_all = ["adopt", "pod"])]
     session: Option<SegmentId>,
 }
 
@@ -72,7 +78,7 @@ fn resolve_manifest_with_user_manifest_env(
                 "--manifest cannot be used when {USER_MANIFEST_ENV} is set"
             ));
         }
-        return load_single_manifest(path);
+        return load_single_manifest(path, cli.pod.as_deref());
     }
 
     let factory = build_factory_with_user_manifest_path(cli, user_manifest)?;
@@ -91,12 +97,43 @@ fn user_manifest_path_from_env(value: Option<OsString>) -> Option<PathBuf> {
     })
 }
 
-fn load_single_manifest(path: &Path) -> Result<(PodManifest, PromptLoader), String> {
+fn load_single_manifest(
+    path: &Path,
+    pod_name_override: Option<&str>,
+) -> Result<(PodManifest, PromptLoader), String> {
     let toml = std::fs::read_to_string(path)
         .map_err(|e| format!("failed to read manifest {}: {e}", path.display()))?;
-    let manifest = PodManifest::from_toml(&toml)
-        .map_err(|e| format!("failed to parse manifest {}: {e}", path.display()))?;
+    let manifest = match pod_name_override {
+        Some(pod_name) => match PodManifest::from_toml(&toml) {
+            Ok(mut manifest) => {
+                manifest.pod.name = pod_name.to_string();
+                manifest
+            }
+            Err(_) => {
+                let base = PodManifestConfig::from_toml(&toml)
+                    .map_err(|e| format!("failed to parse manifest {}: {e}", path.display()))?;
+                let overlay = PodManifestConfig::from_toml(&pod_name_overlay_toml(pod_name))
+                    .expect("pod name overlay TOML is generated");
+                PodManifest::try_from(base.merge(overlay)).map_err(|e| {
+                    format!(
+                        "failed to resolve manifest {} with --pod: {e}",
+                        path.display()
+                    )
+                })?
+            }
+        },
+        None => PodManifest::from_toml(&toml)
+            .map_err(|e| format!("failed to parse manifest {}: {e}", path.display()))?,
+    };
     Ok((manifest, PromptLoader::builtins_only()))
+}
+
+fn pod_name_overlay_toml(pod_name: &str) -> String {
+    let mut pod = toml::value::Table::new();
+    pod.insert("name".into(), toml::Value::String(pod_name.to_string()));
+    let mut root = toml::value::Table::new();
+    root.insert("pod".into(), toml::Value::Table(pod));
+    toml::to_string(&toml::Value::Table(root)).expect("pod name overlay serialisation cannot fail")
 }
 
 fn build_factory_with_user_manifest_path(
@@ -129,6 +166,12 @@ fn build_factory_with_user_manifest_path(
             .map_err(|e| format!("failed to parse overlay TOML: {e}"))?;
     }
 
+    if let Some(pod_name) = cli.pod.as_deref() {
+        factory = factory
+            .with_overlay_toml(&pod_name_overlay_toml(pod_name))
+            .map_err(|e| format!("failed to apply --pod overlay: {e}"))?;
+    }
+
     Ok(factory)
 }
 
@@ -136,7 +179,7 @@ fn build_factory_with_user_manifest_path(
 async fn main() -> ExitCode {
     let cli = Cli::parse();
 
-    let (manifest, loader) = match resolve_manifest(&cli) {
+    let (mut manifest, loader) = match resolve_manifest(&cli) {
         Ok(pair) => pair,
         Err(e) => {
             eprintln!("error: {e}");
@@ -211,6 +254,30 @@ async fn main() -> ExitCode {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("error: failed to restore pod: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else if let Some(pod_name) = cli.pod.as_deref() {
+        manifest.pod.name = pod_name.to_string();
+        match store.read_by_name(pod_name) {
+            Ok(Some(_)) => {
+                match Pod::restore_from_pod_metadata(pod_name, manifest, store, loader).await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("error: failed to restore pod {pod_name}: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+            Ok(None) => match Pod::from_manifest(manifest, store, loader).await {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("error: failed to create pod {pod_name}: {e}");
+                    return ExitCode::FAILURE;
+                }
+            },
+            Err(e) => {
+                eprintln!("error: failed to read pod state for {pod_name}: {e}");
                 return ExitCode::FAILURE;
             }
         }
@@ -367,6 +434,56 @@ permission = "write"
         .unwrap();
 
         assert_eq!(manifest.pod.name, "from-env");
+    }
+
+    #[test]
+    fn pod_flag_conflicts_with_session() {
+        let segment_id = session_store::new_segment_id();
+        let segment_id = segment_id.to_string();
+        let err =
+            Cli::try_parse_from(["pod", "--pod", "agent", "--session", &segment_id]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn pod_flag_sets_requested_name_after_manifest_resolution() {
+        let tmp = TempDir::new().unwrap();
+        let manifest = tmp.path().join("manifest.toml");
+        write(&manifest, &manifest_toml("from-file", tmp.path()));
+        let cli = Cli::try_parse_from([
+            "pod",
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--pod",
+            "from-flag",
+        ])
+        .unwrap();
+
+        let (manifest, _loader) = resolve_manifest_with_user_manifest_env(&cli, None).unwrap();
+
+        assert_eq!(manifest.pod.name, "from-flag");
+    }
+
+    #[test]
+    fn pod_flag_supplies_missing_name_for_single_manifest() {
+        let tmp = TempDir::new().unwrap();
+        let manifest = tmp.path().join("manifest.toml");
+        write(
+            &manifest,
+            &manifest_toml("unused", tmp.path()).replace("name = \"unused\"\n", ""),
+        );
+        let cli = Cli::try_parse_from([
+            "pod",
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--pod",
+            "from-flag",
+        ])
+        .unwrap();
+
+        let (manifest, _loader) = resolve_manifest_with_user_manifest_env(&cli, None).unwrap();
+
+        assert_eq!(manifest.pod.name, "from-flag");
     }
 
     #[test]

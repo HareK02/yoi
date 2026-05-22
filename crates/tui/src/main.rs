@@ -45,9 +45,17 @@ fn resolve_socket(pod_name: &str, override_path: Option<PathBuf>) -> PathBuf {
     })
 }
 
+#[derive(Debug)]
 enum Mode {
     Spawn,
     Attach {
+        pod_name: String,
+        socket_override: Option<PathBuf>,
+    },
+    /// `tui --pod <name>`: attach to a live Pod by name if possible;
+    /// otherwise launch `pod --pod <name>` so the pod process resumes from
+    /// name-keyed state or creates a fresh same-name Pod.
+    PodName {
         pod_name: String,
         socket_override: Option<PathBuf>,
     },
@@ -59,8 +67,9 @@ enum Mode {
     ResumeWithSession(SegmentId),
 }
 
+#[derive(Debug)]
 enum ParseError {
-    Conflict,
+    Conflict(&'static str),
     InvalidSession(String),
     MissingValue(&'static str),
 }
@@ -68,7 +77,7 @@ enum ParseError {
 impl std::fmt::Display for ParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Conflict => write!(f, "--resume and --session are mutually exclusive"),
+            Self::Conflict(message) => write!(f, "{message}"),
             Self::InvalidSession(s) => write!(f, "invalid --session UUID: {s}"),
             Self::MissingValue(flag) => write!(f, "{flag} requires a value"),
         }
@@ -76,9 +85,18 @@ impl std::fmt::Display for ParseError {
 }
 
 fn parse_args() -> Result<Mode, ParseError> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    parse_args_from(std::env::args().skip(1))
+}
+
+fn parse_args_from<I, S>(args: I) -> Result<Mode, ParseError>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let args: Vec<String> = args.into_iter().map(Into::into).collect();
     let mut resume = false;
     let mut session: Option<SegmentId> = None;
+    let mut pod: Option<String> = None;
     let mut socket_override: Option<PathBuf> = None;
     let mut positional: Option<String> = None;
 
@@ -97,6 +115,11 @@ fn parse_args() -> Result<Mode, ParseError> {
                     raw.parse::<SegmentId>()
                         .map_err(|_| ParseError::InvalidSession(raw.clone()))?,
                 );
+                i += 2;
+            }
+            "--pod" => {
+                let raw = args.get(i + 1).ok_or(ParseError::MissingValue("--pod"))?;
+                pod = Some(raw.clone());
                 i += 2;
             }
             "--socket" => {
@@ -119,9 +142,27 @@ fn parse_args() -> Result<Mode, ParseError> {
     }
 
     if resume && session.is_some() {
-        return Err(ParseError::Conflict);
+        return Err(ParseError::Conflict(
+            "--resume and --session are mutually exclusive",
+        ));
+    }
+    if pod.is_some() && session.is_some() {
+        return Err(ParseError::Conflict(
+            "--pod and --session are mutually exclusive",
+        ));
+    }
+    if pod.is_some() && resume {
+        return Err(ParseError::Conflict(
+            "--pod and --resume are mutually exclusive",
+        ));
     }
 
+    if let Some(pod_name) = pod {
+        return Ok(Mode::PodName {
+            pod_name,
+            socket_override,
+        });
+    }
     if let Some(id) = session {
         return Ok(Mode::ResumeWithSession(id));
     }
@@ -163,6 +204,10 @@ async fn main() -> ExitCode {
             pod_name,
             socket_override,
         } => run_attach(pod_name, socket_override).await,
+        Mode::PodName {
+            pod_name,
+            socket_override,
+        } => run_pod_name(pod_name, socket_override).await,
         Mode::Resume => run_resume().await,
         Mode::ResumeWithSession(id) => run_spawn(Some(id)).await,
     };
@@ -203,6 +248,37 @@ async fn run_attach(
     let socket_path = resolve_socket(&pod_name, socket_override);
     let mut terminal = enter_fullscreen()?;
     run(&mut terminal, pod_name, &socket_path).await
+}
+
+async fn run_pod_name(
+    pod_name: String,
+    socket_override: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let socket_path = resolve_socket(&pod_name, socket_override);
+    if let Ok(client) = PodClient::connect(&socket_path).await {
+        let mut terminal = enter_fullscreen()?;
+        let mut app = App::new(pod_name);
+        app.connected = true;
+        return run_loop(&mut terminal, &mut app, client).await;
+    }
+
+    let ready = match spawn::run_pod_name(pod_name).await? {
+        SpawnOutcome::Ready(r) => r,
+        SpawnOutcome::Cancelled => return Ok(()),
+    };
+    let SpawnReady {
+        pod_name,
+        socket_path,
+    } = ready;
+
+    let mut terminal = enter_fullscreen()?;
+    let result = run(&mut terminal, pod_name, &socket_path).await;
+    let _ = execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    );
+    result
 }
 
 async fn run_resume() -> Result<(), Box<dyn std::error::Error>> {
@@ -611,4 +687,33 @@ fn handle_pause_or_quit(app: &mut App) -> Option<Method> {
     app.quit_confirm = Some(std::time::Instant::now());
     app.push_error("Press Ctrl-C again within 3 s to exit the TUI (the Pod keeps running).");
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_pod_name_mode() {
+        match parse_args_from(["--pod", "agent", "--socket", "/tmp/agent.sock"]).unwrap() {
+            Mode::PodName {
+                pod_name,
+                socket_override,
+            } => {
+                assert_eq!(pod_name, "agent");
+                assert_eq!(socket_override, Some(PathBuf::from("/tmp/agent.sock")));
+            }
+            _ => panic!("expected PodName mode"),
+        }
+    }
+
+    #[test]
+    fn parse_rejects_pod_and_session() {
+        let segment_id = session_store::new_segment_id().to_string();
+        let err = parse_args_from(["--pod", "agent", "--session", &segment_id]).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "--pod and --session are mutually exclusive"
+        );
+    }
 }

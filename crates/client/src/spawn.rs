@@ -34,6 +34,9 @@ pub struct SpawnConfig {
     /// `Some(id)` のとき `--session <id>` を付与し、当該セッションから
     /// resume させる。
     pub resume_from: Option<Uuid>,
+    /// true のとき `--pod <pod_name>` を付与し、pod 側で name-keyed state
+    /// があれば resume、なければ同名の新規 Pod として起動させる。
+    pub resume_by_pod_name: bool,
 }
 
 pub struct SpawnReady {
@@ -111,6 +114,9 @@ where
         .stdout(Stdio::null())
         .stderr(Stdio::from(stderr_file))
         .process_group(0);
+    if config.resume_by_pod_name {
+        command.arg("--pod").arg(&config.pod_name);
+    }
     if let Some(id) = config.resume_from {
         command.arg("--session").arg(id.to_string());
     }
