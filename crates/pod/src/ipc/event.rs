@@ -27,7 +27,6 @@ use std::sync::Arc;
 use protocol::{Method, PodEvent, ScopeRule};
 
 use crate::runtime::dir::SpawnedPodRecord;
-use crate::runtime::pod_registry::{self, ScopeLockError};
 use crate::spawn::comm_tools::connect_and_send;
 use crate::spawn::registry::SpawnedPodRegistry;
 
@@ -86,8 +85,8 @@ pub fn render_event(event: &PodEvent) -> String {
 ///
 /// - `TurnEnded` / `Errored`: no system work; the LLM handles the
 ///   semantic response.
-/// - `ShutDown`: remove the child from `spawned_pods.json` and release
-///   its scope allocation. Missing entries are swallowed.
+/// - `ShutDown`: remove the child from `spawned_pods.json`, Pod state,
+///   and reclaim its delegated scope/allocation. Missing entries are swallowed.
 /// - `ScopeSubDelegated`: register the grandchild locally and re-emit
 ///   upward to our own parent if we have one. Duplicate grandchild
 ///   entries (re-delivery) are swallowed.
@@ -104,7 +103,6 @@ pub async fn apply_event_side_effects(
             if let Err(e) = registry.remove(pod_name).await {
                 tracing::warn!(error = %e, pod = %pod_name, "registry remove on ShutDown failed");
             }
-            release_scope_silently(pod_name);
         }
 
         PodEvent::ScopeSubDelegated {
@@ -142,28 +140,6 @@ pub async fn apply_event_side_effects(
                 scope.clone(),
             );
         }
-    }
-}
-
-fn release_scope_silently(pod_name: &str) {
-    let lock_path = match pod_registry::default_registry_path() {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!(error = %e, "default_registry_path failed");
-            return;
-        }
-    };
-    let mut guard = match pod_registry::LockFileGuard::open(&lock_path) {
-        Ok(g) => g,
-        Err(e) => {
-            tracing::warn!(error = %e, "LockFileGuard open failed");
-            return;
-        }
-    };
-    match pod_registry::release_pod(&mut guard, pod_name) {
-        Ok(()) => {}
-        Err(ScopeLockError::UnknownPod(_)) => {}
-        Err(e) => tracing::warn!(error = ?e, pod = %pod_name, "release_pod failed"),
     }
 }
 

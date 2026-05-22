@@ -151,12 +151,20 @@ impl PodController {
 
         let spawner_name = pod.manifest().pod.name.clone();
         let self_parent_socket = pod.callback_socket().cloned();
-        let spawned_registry = SpawnedPodRegistry::load_from_pod_state(
+        let loaded_registry = SpawnedPodRegistry::load_from_pod_state_with_reclaim(
             runtime_dir.clone(),
             pod.store().clone(),
             spawner_name.clone(),
+            Some(pod.scope().clone()),
+            Some(pod.scope_change_sink()),
         )
         .await?;
+        let reclaimed_unreachable = loaded_registry.reclaimed_unreachable;
+        let spawned_registry = loaded_registry.registry;
+        if reclaimed_unreachable {
+            pod.persist_scope_snapshot()
+                .map_err(std::io::Error::other)?;
+        }
 
         // Hand the alerter to the Pod so internal operations (compaction,
         // AGENTS.md ingestion during the first turn) can emit user-facing

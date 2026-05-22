@@ -19,17 +19,21 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use manifest::{Permission, ScopeRule};
+use manifest::{Permission, ScopeRule, SharedScope};
 use session_store::{
-    PodMetadata, PodMetadataStore, PodSpawnedChild, PodSpawnedScopeRule, StoreError,
+    PodMetadata, PodMetadataStore, PodScopeSnapshot, PodSpawnedChild, PodSpawnedScopeRule,
+    StoreError,
 };
 use tokio::net::UnixStream;
 use tokio::sync::Mutex;
 use tracing::warn;
 
 use crate::runtime::dir::{RuntimeDir, SpawnedPodRecord};
+use crate::runtime::pod_registry;
 
 type RegistryStateWriter = Arc<dyn Fn(&[SpawnedPodRecord]) -> io::Result<()> + Send + Sync>;
+type ScopeChangeSink = Arc<dyn Fn(PodScopeSnapshot) + Send + Sync>;
+
 const RESTORE_REACHABILITY_TIMEOUT: Duration = Duration::from_millis(500);
 
 pub struct SpawnedPodRegistry {
@@ -37,6 +41,14 @@ pub struct SpawnedPodRegistry {
     cursors: Mutex<HashMap<String, usize>>,
     runtime_dir: Arc<RuntimeDir>,
     state_writer: Option<RegistryStateWriter>,
+    parent_name: Option<String>,
+    parent_scope: Option<SharedScope>,
+    scope_change_sink: Option<ScopeChangeSink>,
+}
+
+pub struct SpawnedPodRegistryLoad {
+    pub registry: Arc<SpawnedPodRegistry>,
+    pub reclaimed_unreachable: bool,
 }
 
 impl SpawnedPodRegistry {
@@ -46,6 +58,9 @@ impl SpawnedPodRegistry {
             cursors: Mutex::new(HashMap::new()),
             runtime_dir,
             state_writer: None,
+            parent_name: None,
+            parent_scope: None,
+            scope_change_sink: None,
         })
     }
 
@@ -61,6 +76,22 @@ impl SpawnedPodRegistry {
     where
         St: PodMetadataStore + Clone + Send + Sync + 'static,
     {
+        let loaded =
+            Self::load_from_pod_state_with_reclaim(runtime_dir, store, pod_name, None, None)
+                .await?;
+        Ok(loaded.registry)
+    }
+
+    pub async fn load_from_pod_state_with_reclaim<St>(
+        runtime_dir: Arc<RuntimeDir>,
+        store: St,
+        pod_name: String,
+        parent_scope: Option<SharedScope>,
+        scope_change_sink: Option<ScopeChangeSink>,
+    ) -> io::Result<SpawnedPodRegistryLoad>
+    where
+        St: PodMetadataStore + Clone + Send + Sync + 'static,
+    {
         let metadata = store.read_by_name(&pod_name).map_err(store_error_to_io)?;
         let persisted_children = metadata
             .as_ref()
@@ -69,6 +100,7 @@ impl SpawnedPodRegistry {
 
         let mut records = Vec::with_capacity(persisted_children.len());
         let mut pruned = false;
+        let mut pruned_records = Vec::new();
         for child in &persisted_children {
             let record = match record_from_pod_state(child) {
                 Ok(record) => record,
@@ -91,21 +123,36 @@ impl SpawnedPodRegistry {
                     socket = %record.socket_path.display(),
                     "dropping unreachable persisted spawned-pod record"
                 );
+                pruned_records.push(record);
             }
         }
 
         runtime_dir.write_spawned_pods(&records).await?;
-        let state_writer = pod_state_writer(store, pod_name);
+        let state_writer = pod_state_writer(store, pod_name.clone());
         if pruned || metadata.is_some() {
             state_writer(&records)?;
         }
 
-        Ok(Arc::new(Self {
-            records: Mutex::new(records),
-            cursors: Mutex::new(HashMap::new()),
-            runtime_dir,
-            state_writer: Some(state_writer),
-        }))
+        let mut reclaimed_unreachable = false;
+        if parent_scope.is_some() {
+            for record in &pruned_records {
+                reclaim_record(&pod_name, parent_scope.as_ref(), None, record)?;
+                reclaimed_unreachable = true;
+            }
+        }
+
+        Ok(SpawnedPodRegistryLoad {
+            registry: Arc::new(Self {
+                records: Mutex::new(records),
+                cursors: Mutex::new(HashMap::new()),
+                runtime_dir,
+                state_writer: Some(state_writer),
+                parent_name: Some(pod_name),
+                parent_scope,
+                scope_change_sink,
+            }),
+            reclaimed_unreachable,
+        })
     }
 
     /// Append a new record and persist the full list. Returns an I/O
@@ -131,8 +178,9 @@ impl SpawnedPodRegistry {
         self.records.lock().await.clone()
     }
 
-    /// Remove the record for `pod_name`, persist, and clear its cursor.
-    /// Returns the removed record (if any).
+    /// Remove the record for `pod_name`, persist, clear its cursor, and
+    /// reclaim any delegated Write scope owned by that child. Returns the
+    /// removed record (if any).
     pub async fn remove(&self, pod_name: &str) -> io::Result<Option<SpawnedPodRecord>> {
         let removed = {
             let mut records = self.records.lock().await;
@@ -142,7 +190,23 @@ impl SpawnedPodRegistry {
             removed
         };
         self.cursors.lock().await.remove(pod_name);
+        if let Some(record) = &removed {
+            self.reclaim_record(record)?;
+        }
         Ok(removed)
+    }
+
+    fn reclaim_record(&self, record: &SpawnedPodRecord) -> io::Result<()> {
+        let Some(parent_name) = &self.parent_name else {
+            release_child_allocation(&record.pod_name)?;
+            return Ok(());
+        };
+        reclaim_record(
+            parent_name,
+            self.parent_scope.as_ref(),
+            self.scope_change_sink.as_ref(),
+            record,
+        )
     }
 
     /// Read-only cursor lookup. Returns 0 when no cursor has been set.
@@ -178,6 +242,58 @@ where
     Arc::new(move |records| {
         write_records_to_pod_state(&store, &pod_name, records).map_err(store_error_to_io)
     })
+}
+
+fn reclaim_record(
+    parent_name: &str,
+    parent_scope: Option<&SharedScope>,
+    scope_change_sink: Option<&ScopeChangeSink>,
+    record: &SpawnedPodRecord,
+) -> io::Result<()> {
+    let write_rules = record
+        .scope_delegated
+        .iter()
+        .filter(|rule| rule.permission == Permission::Write)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let lock_path = pod_registry::default_registry_path()
+        .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
+    let mut guard = pod_registry::LockFileGuard::open(&lock_path)
+        .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
+    pod_registry::reclaim_delegated_scope(
+        &mut guard,
+        parent_name,
+        &record.pod_name,
+        &record.scope_delegated,
+    )
+    .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
+
+    if let Some(scope) = parent_scope {
+        scope
+            .update(|current| current.with_removed_deny_rules(write_rules))
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+        if let Some(sink) = scope_change_sink {
+            let snapshot = scope.snapshot();
+            sink(PodScopeSnapshot {
+                allow: snapshot.allow_rules(),
+                deny: snapshot.deny_rules(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn release_child_allocation(pod_name: &str) -> io::Result<()> {
+    let lock_path = pod_registry::default_registry_path()
+        .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
+    let mut guard = pod_registry::LockFileGuard::open(&lock_path)
+        .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
+    match pod_registry::release_pod(&mut guard, pod_name) {
+        Ok(()) | Err(pod_registry::ScopeLockError::UnknownPod(_)) => Ok(()),
+        Err(err) => Err(io::Error::new(io::ErrorKind::Other, err)),
+    }
 }
 
 fn write_records_to_pod_state<St>(

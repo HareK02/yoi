@@ -204,15 +204,12 @@ impl Tool for StopPodTool {
             .ok_or_else(|| unknown_pod_err(&input.name))?;
 
         // Best-effort Shutdown. The child's own `ScopeAllocationGuard`
-        // releases the entry on clean exit; we also release explicitly
-        // below so callers can't observe a window where the scope is
-        // still registered but StopPod has returned. Duplicate release
-        // is harmless — `ScopeAllocationGuard`'s drop path swallows
-        // `UnknownPod` errors.
+        // releases its entry on clean exit; the parent reclaim below is the
+        // authoritative operation for removing the child record and returning
+        // delegated Write scope to the spawner.
         let _ = connect_and_send(&record.socket_path, &Method::Shutdown).await;
 
         let scope_summary = summarize_scope(&record);
-        release_scope(&record.pod_name);
 
         self.registry
             .remove(&record.pod_name)
@@ -514,20 +511,6 @@ fn summarize_scope(record: &SpawnedPodRecord) -> String {
         })
         .collect();
     parts.join(", ")
-}
-
-/// Best-effort release of the pod's scope allocation. Swallows every
-/// error: the caller has already completed its user-visible side
-/// effects (Method::Shutdown was sent), and stale-reclaim will clean
-/// up whatever we couldn't.
-fn release_scope(pod_name: &str) {
-    let Ok(lock_path) = pod_registry::default_registry_path() else {
-        return;
-    };
-    let Ok(mut guard) = LockFileGuard::open(&lock_path) else {
-        return;
-    };
-    let _ = pod_registry::release_pod(&mut guard, pod_name);
 }
 
 #[cfg(test)]

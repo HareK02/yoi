@@ -31,7 +31,7 @@ pub use lifecycle::{
     install_top_level_with_deny, lookup_segment, update_segment,
 };
 pub use mutate::{
-    delegate_scope, reclaim_stale, reclaim_stale_with, register_pod, register_pod_with_deny,
-    release_pod,
+    delegate_scope, reclaim_delegated_scope, reclaim_stale, reclaim_stale_with, register_pod,
+    register_pod_with_deny, release_pod,
 };
 pub use table::{Allocation, LockFile, LockFileGuard, default_registry_path};
