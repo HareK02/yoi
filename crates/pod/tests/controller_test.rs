@@ -777,13 +777,15 @@ async fn notify_while_idle_auto_starts_turn_and_injects_system_message() {
     // not on the `event_tx` broadcast that `handle.subscribe()` taps.
     // Verify the notification landed on the sink mirror instead.
     let (entries, _) = handle.sink.subscribe_with_snapshot();
-    let saw_notify_in_mirror = entries.iter().any(|e| matches!(
-        e,
-        session_store::LogEntry::SystemItem {
-            item: session_store::SystemItem::Notification { message, .. },
-            ..
-        } if message == "turn finished"
-    ));
+    let saw_notify_in_mirror = entries.iter().any(|e| {
+        matches!(
+            e,
+            session_store::LogEntry::SystemItem {
+                item: session_store::SystemItem::Notification { message, .. },
+                ..
+            } if message == "turn finished"
+        )
+    });
     assert!(
         saw_notify_in_mirror,
         "Method::Notify should commit a SystemItem::Notification entry; mirror = {entries:?}"
@@ -865,16 +867,18 @@ async fn pod_event_turn_ended_while_idle_auto_starts_turn_and_injects_system_mes
     // its Flush of the drain queue) runs afterwards.
     wait_for_status(&handle, PodStatus::Idle).await;
     let (entries, _) = handle.sink.subscribe_with_snapshot();
-    let saw_pod_event_in_mirror = entries.iter().any(|e| matches!(
-        e,
-        session_store::LogEntry::SystemItem {
-            item: session_store::SystemItem::PodEvent {
-                event: protocol::PodEvent::TurnEnded { pod_name },
+    let saw_pod_event_in_mirror = entries.iter().any(|e| {
+        matches!(
+            e,
+            session_store::LogEntry::SystemItem {
+                item: session_store::SystemItem::PodEvent {
+                    event: protocol::PodEvent::TurnEnded { pod_name },
+                    ..
+                },
                 ..
-            },
-            ..
-        } if pod_name == "child"
-    ));
+            } if pod_name == "child"
+        )
+    });
     assert!(
         saw_pod_event_in_mirror,
         "Method::PodEvent should commit a SystemItem::PodEvent entry"

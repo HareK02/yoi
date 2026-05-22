@@ -475,7 +475,11 @@ async fn session_auto_forks_on_conflict() {
     let fork_entries = store.read_all(sid, segment_id).unwrap();
     assert!(!fork_entries.is_empty());
     let fork_state = collect_state(&fork_entries);
-    assert_eq!(fork_state.session_id, Some(sid), "auto-fork inherits Session");
+    assert_eq!(
+        fork_state.session_id,
+        Some(sid),
+        "auto-fork inherits Session"
+    );
 
     // The new segment records its lineage forward via forked_from; the
     // source segment is left immutable (no terminal marker written back).
@@ -542,9 +546,16 @@ async fn nested_past_fork_leaves_ancestors_immutable() {
     }
 
     // The root and fork1 are untouched by forking their descendants.
-    assert_eq!(store.read_all(sid, root_segid).unwrap().len(), root_before.len());
+    assert_eq!(
+        store.read_all(sid, root_segid).unwrap().len(),
+        root_before.len()
+    );
     let fork1_entries = store.read_all(sid, fork1).unwrap();
-    assert_eq!(fork1_entries.len(), 1, "fork1 is just its SegmentStart seed");
+    assert_eq!(
+        fork1_entries.len(),
+        1,
+        "fork1 is just its SegmentStart seed"
+    );
 
     // fork2's lineage points at fork1, not the root.
     match &store.read_all(sid, fork2).unwrap()[0] {

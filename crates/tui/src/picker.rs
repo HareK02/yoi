@@ -65,7 +65,9 @@ pub enum PickerOutcome {
     /// User picked a session; resume at its leaf segment. The pod-cli
     /// rehydrates `session_id` via `Store::lookup_session_of` so we only
     /// need to surface the segment here.
-    Picked { segment_id: SegmentId },
+    Picked {
+        segment_id: SegmentId,
+    },
     Cancelled,
 }
 
@@ -92,11 +94,7 @@ pub async fn run() -> Result<PickerOutcome, PickerError> {
     }
     let mut rows: Vec<Row> = Vec::with_capacity(MAX_ROWS);
     for session_id in sessions.into_iter().take(MAX_ROWS) {
-        let Some(leaf_segment_id) = store
-            .list_segments(session_id)?
-            .into_iter()
-            .next()
-        else {
+        let Some(leaf_segment_id) = store.list_segments(session_id)?.into_iter().next() else {
             continue;
         };
         let preview = build_preview(&store, session_id, leaf_segment_id);

@@ -639,9 +639,7 @@ async fn controller_loop<C, St>(
                 // sees the buffered notification(s) without a human
                 // Run.
                 if shared_state.get_status() == PodStatus::Idle {
-                    pending = Some(PendingRun::RunForNotification(
-                        protocol::InvokeKind::Notify,
-                    ));
+                    pending = Some(PendingRun::RunForNotification(protocol::InvokeKind::Notify));
                 }
             }
 

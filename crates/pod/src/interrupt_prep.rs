@@ -11,9 +11,9 @@
 //! happen at the front of `Pod::run` when
 //! `worker.last_run_interrupted()` is set; see `Pod::apply_interrupt_prep`.
 
-use llm_worker::Item;
 #[cfg(test)]
 use crate::prompt::catalog::PromptCatalog;
+use llm_worker::Item;
 
 /// Build synthetic `Item::ToolResult` items for every unanswered
 /// `Item::ToolCall` in `history`, preserving order.

@@ -56,8 +56,8 @@ pub use segment_log::{
     LogEntry, POD_SCOPE_EXTENSION_DOMAIN, PodScopeSnapshot, RestoredState, SegmentOrigin,
     collect_state,
 };
-pub use system_item::{SystemItem, render_pod_event};
 pub use store::{Store, StoreError};
+pub use system_item::{SystemItem, render_pod_event};
 
 /// Session identifier — the fork-tree root. UUID v7 (time-ordered).
 ///

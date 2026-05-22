@@ -78,9 +78,14 @@ async fn restore_from_manifest_rejects_empty_segment_log() {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join(format!("{segid}.jsonl")), b"").unwrap();
 
-    let result =
-        Pod::restore_from_manifest(sid, segid, manifest, store, pod::PromptLoader::builtins_only())
-            .await;
+    let result = Pod::restore_from_manifest(
+        sid,
+        segid,
+        manifest,
+        store,
+        pod::PromptLoader::builtins_only(),
+    )
+    .await;
 
     match result {
         Err(PodError::SegmentEmpty { segment_id }) => assert_eq!(segment_id, segid),
@@ -106,9 +111,14 @@ async fn restore_from_manifest_rejects_segment_without_scope_snapshot() {
     };
     session_store::create_segment_with_ids(&store, sid, segid, state).unwrap();
 
-    let result =
-        Pod::restore_from_manifest(sid, segid, manifest, store, pod::PromptLoader::builtins_only())
-            .await;
+    let result = Pod::restore_from_manifest(
+        sid,
+        segid,
+        manifest,
+        store,
+        pod::PromptLoader::builtins_only(),
+    )
+    .await;
 
     match result {
         Err(PodError::SegmentScopeMissing { segment_id }) => assert_eq!(segment_id, segid),

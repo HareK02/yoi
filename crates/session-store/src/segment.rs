@@ -4,11 +4,11 @@
 //! The caller (typically Pod) holds the Worker directly and calls these
 //! functions after state-mutating operations.
 
-use crate::{SegmentId, SessionId};
 use crate::logged_item::{LoggedItem, to_logged};
 use crate::segment_log::{self, LogEntry, PodScopeSnapshot, SegmentOrigin};
 use crate::store::{Store, StoreError};
 use crate::system_item::SystemItem;
+use crate::{SegmentId, SessionId};
 use llm_worker::WorkerResult;
 use llm_worker::llm_client::RequestConfig;
 use llm_worker::llm_client::types::Item;

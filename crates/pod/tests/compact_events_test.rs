@@ -240,7 +240,10 @@ max_tokens = 100
 target = "./"
 permission = "write"
 "#;
-    let client = MockClient::new(vec![single_text_events("first"), single_text_events("second")]);
+    let client = MockClient::new(vec![
+        single_text_events("first"),
+        single_text_events("second"),
+    ]);
     let mut pod = make_pod_with_manifest(NO_COMPACT_MANIFEST_TOML, client).await;
 
     pod.run_text("first").await.unwrap();

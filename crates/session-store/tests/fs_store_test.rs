@@ -112,9 +112,15 @@ fn list_sessions_and_segments() {
     let seg_a2 = new_segment_id();
     let seg_b1 = new_segment_id();
 
-    store.append(sid_a, seg_a1, &nil_session_start(1, sid_a)).unwrap();
-    store.append(sid_a, seg_a2, &nil_session_start(2, sid_a)).unwrap();
-    store.append(sid_b, seg_b1, &nil_session_start(3, sid_b)).unwrap();
+    store
+        .append(sid_a, seg_a1, &nil_session_start(1, sid_a))
+        .unwrap();
+    store
+        .append(sid_a, seg_a2, &nil_session_start(2, sid_a))
+        .unwrap();
+    store
+        .append(sid_b, seg_b1, &nil_session_start(3, sid_b))
+        .unwrap();
 
     let sessions = store.list_sessions().unwrap();
     assert_eq!(sessions, vec![sid_b, sid_a]); // newest first
@@ -136,7 +142,9 @@ fn exists_returns_correct_state() {
 
     assert!(!store.exists(sid, segid).unwrap());
 
-    store.append(sid, segid, &nil_session_start(1000, sid)).unwrap();
+    store
+        .append(sid, segid, &nil_session_start(1000, sid))
+        .unwrap();
 
     assert!(store.exists(sid, segid).unwrap());
 }
@@ -159,7 +167,9 @@ fn trace_entries_in_separate_file() {
     let sid = new_session_id();
     let segid = new_segment_id();
 
-    store.append(sid, segid, &nil_session_start(1000, sid)).unwrap();
+    store
+        .append(sid, segid, &nil_session_start(1000, sid))
+        .unwrap();
 
     let trace = TraceEntry {
         ts: 1500,
@@ -221,7 +231,9 @@ fn lookup_session_of_finds_owning_session() {
 
     assert_eq!(store.lookup_session_of(segid).unwrap(), None);
 
-    store.append(sid, segid, &nil_session_start(1, sid)).unwrap();
+    store
+        .append(sid, segid, &nil_session_start(1, sid))
+        .unwrap();
 
     assert_eq!(store.lookup_session_of(segid).unwrap(), Some(sid));
 }

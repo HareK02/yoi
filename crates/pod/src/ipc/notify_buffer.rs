@@ -185,7 +185,9 @@ mod tests {
         let item = build_system_item(&entry, &catalog).unwrap();
         match item {
             SystemItem::PodEvent { event, body } => {
-                assert!(matches!(event, PodEvent::TurnEnded { ref pod_name } if pod_name == "child"));
+                assert!(
+                    matches!(event, PodEvent::TurnEnded { ref pod_name } if pod_name == "child")
+                );
                 assert!(body.contains("[Notification]"));
                 assert!(body.contains("`child`"));
             }

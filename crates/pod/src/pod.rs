@@ -1227,8 +1227,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         self.commit_entry(LogEntry::UserInput {
             ts: segment_log::now_millis(),
             segments: input.clone(),
-        })
-        ?;
+        })?;
         self.user_segments.push(input.clone());
 
         // Resolve `@<path>` refs, `#<slug>` Knowledge refs, and `/<slug>`
@@ -1881,8 +1880,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         self.commit_entry(LogEntry::TurnEnd {
             ts: segment_log::now_millis(),
             turn_count,
-        })
-        ?;
+        })?;
 
         // Flush any sync-buffered metrics from this run first
         // (currently `prune.fire` / `prune.skip` from the prune observer).
@@ -1922,8 +1920,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 cache_read_tokens: record.cache_read_tokens,
                 cache_write_tokens: record.cache_write_tokens,
                 output_tokens: record.output_tokens,
-            })
-            ?;
+            })?;
             if let Some(id) = correlation_id {
                 let metric = session_metrics::Metric::now("prune.post_request")
                     .with_correlation_id(&id)
@@ -1945,16 +1942,14 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                     ts: segment_log::now_millis(),
                     interrupted,
                     result: r.clone(),
-                })
-                ?;
+                })?;
             }
             Err(e) => {
                 self.commit_entry(LogEntry::RunErrored {
                     ts: segment_log::now_millis(),
                     interrupted,
                     message: e.to_string(),
-                })
-                ?;
+                })?;
             }
         }
 

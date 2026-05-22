@@ -74,7 +74,10 @@ impl FsStore {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let mut file = fs::OpenOptions::new().create(true).append(true).open(path)?;
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
         file.write_all(line.as_bytes())?;
         file.write_all(b"\n")?;
         // Append-mode write is the durability boundary; an explicit

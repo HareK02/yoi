@@ -119,9 +119,7 @@ impl SegmentLogSink {
     fn is_live_relevant(entry: &LogEntry) -> bool {
         matches!(
             entry,
-            LogEntry::SegmentStart { .. }
-                | LogEntry::SystemItem { .. }
-                | LogEntry::Invoke { .. }
+            LogEntry::SegmentStart { .. } | LogEntry::SystemItem { .. } | LogEntry::Invoke { .. }
         )
     }
 

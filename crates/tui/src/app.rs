@@ -502,9 +502,7 @@ impl App {
             // for `tickets/invoke-turn-llmcall-semantics.md`; events flow
             // through to subscribers but the TUI currently derives its
             // turn header from `UserMessage` / `SystemItem` arrivals.
-            Event::InvokeStart { .. }
-            | Event::LlmCallStart { .. }
-            | Event::LlmCallEnd { .. } => {}
+            Event::InvokeStart { .. } | Event::LlmCallStart { .. } | Event::LlmCallEnd { .. } => {}
             Event::TextDelta { text } => {
                 self.append_assistant_text(&text);
             }
