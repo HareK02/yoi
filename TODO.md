@@ -16,6 +16,7 @@
 - E2E テストハーネス（`tests/e2e/`、opt-in） → [tickets/e2e-harness.md](tickets/e2e-harness.md)
 - TUI 拡充
   - TUI から任意タイミングで Compact を発火する system command → [tickets/tui-system-command-compact.md](tickets/tui-system-command-compact.md)
+  - Session 直接 resume を廃止し Pod 単位の attach / restore に寄せる → [tickets/tui-pod-restore-picker.md](tickets/tui-pod-restore-picker.md)
   - user manifest env override 時の spawn scope overlay 前提ズレ → [tickets/tui-user-manifest-env-overlay.md](tickets/tui-user-manifest-env-overlay.md)
   - Run 中の入力キューイング → [tickets/tui-input-queue.md](tickets/tui-input-queue.md)
   - ユーザーマニフェストのモデル設定 wizard → [tickets/tui-user-model-setup.md](tickets/tui-user-model-setup.md)
