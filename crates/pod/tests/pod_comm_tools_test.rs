@@ -23,8 +23,10 @@ use pod::spawn::registry::SpawnedPodRegistry;
 use protocol::stream::{JsonLineReader, JsonLineWriter};
 use protocol::{ErrorCode, Event, Greeting, Method};
 use serde_json::json;
+use session_store::{FsStore, PodMetadataStore};
 use tempfile::TempDir;
 use tokio::net::UnixListener;
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 /// Serialises env-mutating tests. The test harness runs tasks across
@@ -181,6 +183,31 @@ fn serve_history(listener: UnixListener, items: Vec<Item>) -> JoinHandle<()> {
             let _ = writer.write(&event).await;
         }
     })
+}
+
+fn serve_pod_methods(listener: UnixListener) -> mpsc::Receiver<Method> {
+    let (tx, rx) = mpsc::channel(8);
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let (r, w) = stream.into_split();
+            let mut reader = JsonLineReader::new(r);
+            let mut writer = JsonLineWriter::new(w);
+            let Some(method) = reader.next::<Method>().await.ok().flatten() else {
+                continue;
+            };
+            let is_shutdown = matches!(method, Method::Shutdown);
+            if matches!(method, Method::Run { .. }) {
+                let _ = writer.write(&Event::TurnStart { turn: 1 }).await;
+            }
+            if tx.send(method).await.is_err() || is_shutdown {
+                return;
+            }
+        }
+    });
+    rx
 }
 
 fn assistant(text: &str) -> Item {
@@ -416,6 +443,122 @@ async fn stop_pod_succeeds_even_when_child_unreachable() {
 
     // Registry no longer knows about the child.
     assert!(registry.get("child").await.is_none());
+}
+
+// ---------------------------------------------------------------------------
+// Persistence / restore
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn restored_registry_uses_pod_state_without_runtime_file() {
+    let _env = EnvGuard::acquire();
+    let runtime_tmp = TempDir::new().unwrap();
+    let store_tmp = TempDir::new().unwrap();
+    let store = FsStore::new(store_tmp.path()).unwrap();
+    unsafe {
+        std::env::set_var("INSOMNIA_RUNTIME_DIR", runtime_tmp.path());
+    }
+
+    let rd = Arc::new(
+        RuntimeDir::create(runtime_tmp.path(), "spawner")
+            .await
+            .unwrap(),
+    );
+    let registry =
+        SpawnedPodRegistry::load_from_pod_state(rd.clone(), store.clone(), "spawner".to_string())
+            .await
+            .unwrap();
+
+    let (socket, listener) = bind_mock_socket(runtime_tmp.path(), "child").await;
+    let mut received = serve_pod_methods(listener);
+    register_child(&registry, "child", &socket, runtime_tmp.path()).await;
+
+    std::fs::remove_file(rd.path().join("spawned_pods.json")).unwrap();
+
+    let restored =
+        SpawnedPodRegistry::load_from_pod_state(rd.clone(), store.clone(), "spawner".to_string())
+            .await
+            .unwrap();
+
+    let def = list_pods_tool(restored.clone());
+    let (_meta, tool) = def();
+    let output: ToolOutput = tool.execute("{}").await.unwrap();
+    assert!(output.summary.contains("1 pod"), "{}", output.summary);
+    let body = output.content.expect("restored ListPods should list child");
+    assert!(body.contains("child [alive]"), "body: {body}");
+
+    let def = send_to_pod_tool(restored.clone());
+    let (_meta, tool) = def();
+    let input = json!({ "name": "child", "message": "after restart" }).to_string();
+    tool.execute(&input).await.unwrap();
+    match received.recv().await.expect("expected Run") {
+        Method::Run { input } => match input.as_slice() {
+            [protocol::Segment::Text { content }] => assert_eq!(content, "after restart"),
+            other => panic!("expected single Text segment, got {other:?}"),
+        },
+        other => panic!("expected Run, got {other:?}"),
+    }
+
+    let def = stop_pod_tool(restored.clone());
+    let (_meta, tool) = def();
+    tool.execute(&json!({ "name": "child" }).to_string())
+        .await
+        .unwrap();
+    assert!(matches!(
+        received.recv().await.expect("expected Shutdown"),
+        Method::Shutdown
+    ));
+    assert!(restored.get("child").await.is_none());
+
+    let metadata = store
+        .read_by_name("spawner")
+        .unwrap()
+        .expect("spawner metadata should remain");
+    assert!(metadata.spawned_children.is_empty());
+    let runtime_contents = std::fs::read_to_string(rd.path().join("spawned_pods.json")).unwrap();
+    let runtime_records: Vec<SpawnedPodRecord> = serde_json::from_str(&runtime_contents).unwrap();
+    assert!(runtime_records.is_empty());
+}
+
+#[tokio::test]
+async fn load_from_pod_state_prunes_children_with_missing_sockets() {
+    let runtime_tmp = TempDir::new().unwrap();
+    let store_tmp = TempDir::new().unwrap();
+    let store = FsStore::new(store_tmp.path()).unwrap();
+    let rd = Arc::new(
+        RuntimeDir::create(runtime_tmp.path(), "spawner")
+            .await
+            .unwrap(),
+    );
+    let registry =
+        SpawnedPodRegistry::load_from_pod_state(rd.clone(), store.clone(), "spawner".to_string())
+            .await
+            .unwrap();
+
+    let (live_socket, listener) = bind_mock_socket(runtime_tmp.path(), "alive").await;
+    let _server = serve_pod_methods(listener);
+    register_child(&registry, "alive", &live_socket, runtime_tmp.path()).await;
+    register_child(
+        &registry,
+        "missing",
+        &runtime_tmp.path().join("missing.sock"),
+        runtime_tmp.path(),
+    )
+    .await;
+
+    let restored =
+        SpawnedPodRegistry::load_from_pod_state(rd.clone(), store.clone(), "spawner".to_string())
+            .await
+            .unwrap();
+
+    assert!(restored.get("alive").await.is_some());
+    assert!(restored.get("missing").await.is_none());
+    let metadata = store
+        .read_by_name("spawner")
+        .unwrap()
+        .expect("spawner metadata should be written");
+    assert_eq!(metadata.spawned_children.len(), 1);
+    assert_eq!(metadata.spawned_children[0].pod_name, "alive");
 }
 
 // ---------------------------------------------------------------------------

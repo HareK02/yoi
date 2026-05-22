@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use llm_worker::WorkerError;
 use llm_worker::llm_client::client::LlmClient;
-use session_store::Store;
+use session_store::{PodMetadataStore, Store};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::ipc::alerter::Alerter;
@@ -132,7 +132,7 @@ impl PodController {
     ) -> Result<(PodHandle, ShutdownReceiver), std::io::Error>
     where
         C: LlmClient + Clone + 'static,
-        St: Store + Clone + 'static,
+        St: Store + PodMetadataStore + Clone + Send + Sync + 'static,
     {
         // === 1. Initialization (channels / RuntimeDir / pod-immutable
         //         snapshots / SpawnedPodRegistry / alerter attach /
@@ -151,7 +151,12 @@ impl PodController {
 
         let spawner_name = pod.manifest().pod.name.clone();
         let self_parent_socket = pod.callback_socket().cloned();
-        let spawned_registry = SpawnedPodRegistry::new(runtime_dir.clone());
+        let spawned_registry = SpawnedPodRegistry::load_from_pod_state(
+            runtime_dir.clone(),
+            pod.store().clone(),
+            spawner_name.clone(),
+        )
+        .await?;
 
         // Hand the alerter to the Pod so internal operations (compaction,
         // AGENTS.md ingestion during the first turn) can emit user-facing
