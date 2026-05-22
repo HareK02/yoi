@@ -22,4 +22,5 @@ pulldown-cmark = { version = "0.13.3", default-features = false }
 llm-worker.workspace = true
 
 [dev-dependencies]
+tempfile = { workspace = true }
 tools = { workspace = true }

@@ -3653,6 +3653,7 @@ dependencies = [
  "serde",
  "serde_json",
  "session-store",
+ "tempfile",
  "tokio",
  "toml",
  "tools",
