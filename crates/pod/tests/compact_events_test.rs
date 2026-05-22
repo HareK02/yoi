@@ -17,7 +17,7 @@ use llm_worker::llm_client::event::{Event as LlmEvent, ResponseStatus, StatusEve
 use llm_worker::llm_client::types::Item;
 use llm_worker::llm_client::{ClientError, LlmClient, Request};
 use protocol::Event;
-use session_store::{FsStore, LogEntry, Store};
+use session_store::{FsStore, LogEntry, PodMetadataStore, Store};
 use tokio::sync::broadcast;
 
 use pod::Pod;
@@ -158,7 +158,9 @@ async fn make_pod_with_manifest(
     std::mem::forget(pwd_tmp);
 
     let worker = Worker::new(client);
-    Pod::new(manifest, worker, store, pwd, scope).await.unwrap()
+    let mut pod = Pod::new(manifest, worker, store, pwd, scope).await.unwrap();
+    pod.enable_pod_metadata_write_through().unwrap();
+    pod
 }
 
 async fn make_pod(client: MockClient) -> Pod<MockClient, FsStore> {
@@ -211,6 +213,36 @@ fn system_texts_in_sink_session_start(
         }
     }
     Vec::new()
+}
+
+/// Pod metadata starts with a reserved Session and no Segment, then becomes
+/// active once the first SegmentStart is materialized by `run`.
+#[tokio::test]
+async fn pod_metadata_moves_from_pending_to_active_on_first_run() {
+    let client = MockClient::new(vec![single_text_events("hi")]);
+    let mut pod = make_pod(client).await;
+    let store = pod.store().clone();
+    let session_id = pod.session_id();
+    let initial_segment_id = pod.segment_id();
+
+    let pending = store
+        .read_by_name("test-pod")
+        .unwrap()
+        .expect("metadata should be initialized at Pod construction");
+    assert_eq!(pending.pod_name, "test-pod");
+    let pending_active = pending.active.expect("active session pointer missing");
+    assert_eq!(pending_active.session_id, session_id);
+    assert_eq!(pending_active.segment_id, None);
+
+    pod.run_text("first").await.unwrap();
+
+    let resolved = store
+        .read_by_name("test-pod")
+        .unwrap()
+        .expect("metadata should still exist after first run");
+    let active = resolved.active.expect("active session pointer missing");
+    assert_eq!(active.session_id, session_id);
+    assert_eq!(active.segment_id, Some(initial_segment_id));
 }
 
 /// Live auto-fork: when another writer extends the segment behind the
@@ -274,6 +306,13 @@ permission = "write"
     let new_segment_id = pod.segment_id();
     assert_ne!(new_segment_id, source_segment_id);
     assert_eq!(pod.session_id(), session_id, "auto-fork stays in-Session");
+    let metadata = store
+        .read_by_name("test-pod")
+        .unwrap()
+        .expect("metadata should exist after auto-fork");
+    let active = metadata.active.expect("active session pointer missing");
+    assert_eq!(active.session_id, session_id);
+    assert_eq!(active.segment_id, Some(new_segment_id));
 
     // New segment records forked_from pointing at the source.
     let new_entries = store.read_all(session_id, new_segment_id).unwrap();
@@ -312,7 +351,17 @@ async fn compact_emits_session_start_carrying_summary_and_task_snapshot() {
     pod.attach_event_tx(tx);
 
     pod.run_text("first").await.unwrap();
+    let session_id = pod.session_id();
     pod.compact(10_000).await.unwrap();
+    let compacted_segment_id = pod.segment_id();
+    let metadata = pod
+        .store()
+        .read_by_name("test-pod")
+        .unwrap()
+        .expect("metadata should exist after compaction");
+    let active = metadata.active.expect("active session pointer missing");
+    assert_eq!(active.session_id, session_id);
+    assert_eq!(active.segment_id, Some(compacted_segment_id));
 
     let system_texts = system_texts_in_sink_session_start(&pod);
     // The post-compaction `SegmentStart.history` carries the new system

@@ -9,8 +9,8 @@ use llm_worker::llm_client::client::LlmClient;
 use llm_worker::state::Mutable;
 use llm_worker::{ToolOutputLimits, UsageRecord, Worker, WorkerError, WorkerResult};
 use session_store::{
-    LogEntry, PodScopeSnapshot, SegmentId, SessionId, Store, StoreError, SystemItem, segment_log,
-    to_logged,
+    LogEntry, PodActiveSegmentRef, PodMetadata, PodMetadataStore, PodScopeSnapshot, SegmentId,
+    SessionId, Store, StoreError, SystemItem, segment_log, to_logged,
 };
 use tracing::{info, warn};
 
@@ -48,6 +48,16 @@ use tokio::task::JoinHandle;
 pub struct SegmentLocation {
     pub session_id: SessionId,
     pub segment_id: SegmentId,
+}
+
+type PodMetadataWriter = Arc<dyn Fn(PodMetadata) -> Result<(), StoreError> + Send + Sync>;
+
+fn pod_metadata_writer_for_store<St>(store: &St) -> PodMetadataWriter
+where
+    St: PodMetadataStore + Clone + Send + Sync + 'static,
+{
+    let store = store.clone();
+    Arc::new(move |metadata| store.write(&metadata))
 }
 
 /// Lock-free shared session/segment pointer.
@@ -181,6 +191,10 @@ pub struct Pod<C: LlmClient, St: Store> {
     /// Always `Some` outside of `run()`/`resume()`.
     worker: Option<Worker<C, Mutable>>,
     store: St,
+    /// Optional write-through hook for name-keyed Pod metadata. Production
+    /// constructors install this from the same FsStore that owns the session
+    /// logs; low-level `Pod::new` tests leave it absent.
+    pod_metadata_writer: Option<PodMetadataWriter>,
     /// Shared session pointer. Source of truth for the Pod's current
     /// `segment_id` and append tally. `self.segment_id()` is a thin
     /// wrapper over `segment_state.segment_id()`.
@@ -358,6 +372,7 @@ impl<C: LlmClient + Clone + 'static, St: Store + Clone + 'static> Pod<C, St> {
             manifest: self.manifest.clone(),
             worker: Some(worker),
             store: self.store.clone(),
+            pod_metadata_writer: None,
             segment_state: self.segment_state.clone(),
             pwd: self.pwd.clone(),
             scope: self.scope.clone(),
@@ -499,6 +514,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             manifest,
             worker: Some(worker),
             store,
+            pod_metadata_writer: None,
             segment_state: SegmentState::new(session_id, segment_id, 0),
             pwd,
             scope: SharedScope::new(scope),
@@ -714,6 +730,41 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     /// Reference to the store.
     pub fn store(&self) -> &St {
         &self.store
+    }
+
+    fn write_pod_metadata_pending(&self) -> Result<(), StoreError> {
+        let Some(writer) = &self.pod_metadata_writer else {
+            return Ok(());
+        };
+        writer(PodMetadata::new(
+            self.manifest.pod.name.clone(),
+            Some(PodActiveSegmentRef::pending_segment(self.session_id())),
+        ))
+    }
+
+    fn write_pod_metadata_active(&self, loc: SegmentLocation) -> Result<(), StoreError> {
+        let Some(writer) = &self.pod_metadata_writer else {
+            return Ok(());
+        };
+        writer(PodMetadata::new(
+            self.manifest.pod.name.clone(),
+            Some(PodActiveSegmentRef::active_segment(
+                loc.session_id,
+                loc.segment_id,
+            )),
+        ))
+    }
+
+    /// Enable name-keyed Pod metadata write-through for Pods built through
+    /// the low-level constructor. High-level manifest constructors enable it
+    /// automatically; this hook lets tests and custom embedders opt into the
+    /// same persistence behavior without changing `Pod::new`'s minimal bounds.
+    pub fn enable_pod_metadata_write_through(&mut self) -> Result<(), StoreError>
+    where
+        St: PodMetadataStore + Clone + Send + Sync + 'static,
+    {
+        self.pod_metadata_writer = Some(pod_metadata_writer_for_store(&self.store));
+        self.write_pod_metadata_pending()
     }
 
     /// Current history items held by the underlying Worker.
@@ -1660,6 +1711,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             };
             self.commit_entry(initial)?;
             self.persist_scope_snapshot()?;
+            self.write_pod_metadata_active(loc)?;
             return Ok(());
         }
         // Check store count + auto-fork if it drifted.
@@ -1703,6 +1755,10 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         if self.scope_allocation.is_some() {
             pod_registry::update_segment(&self.manifest.pod.name, fork_segment_id)?;
         }
+        self.write_pod_metadata_active(SegmentLocation {
+            session_id: loc.session_id,
+            segment_id: fork_segment_id,
+        })?;
         Ok(())
     }
 
@@ -2220,6 +2276,10 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         if self.scope_allocation.is_some() {
             pod_registry::update_segment(&self.manifest.pod.name, new_segment_id)?;
         }
+        self.write_pod_metadata_active(SegmentLocation {
+            session_id: old_loc.session_id,
+            segment_id: new_segment_id,
+        })?;
         // Align user_segments with the post-compaction history. Items
         // before `retain_from` (now folded into the summary) lose their
         // segments; only the user_messages surviving in retained_items
@@ -2760,7 +2820,10 @@ enum ConsolidateDecision {
     Completed,
 }
 
-impl<St: Store> Pod<Box<dyn LlmClient>, St> {
+impl<St> Pod<Box<dyn LlmClient>, St>
+where
+    St: Store + PodMetadataStore + Clone + Send + Sync + 'static,
+{
     /// Create a Pod entirely from a validated manifest.
     ///
     /// The Pod's working directory is captured once here from the
@@ -2808,11 +2871,13 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
         let mut worker = Worker::new(common.client);
         apply_worker_manifest(&mut worker, &manifest.worker);
         worker.set_cache_key(Some(segment_id.to_string()));
+        let pod_metadata_writer = Some(pod_metadata_writer_for_store(&store));
 
         let mut pod = Self {
             manifest,
             worker: Some(worker),
             store,
+            pod_metadata_writer,
             segment_state: SegmentState::new(session_id, segment_id, 0),
             pwd: common.pwd,
             scope: SharedScope::new(common.scope),
@@ -2847,6 +2912,7 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
         };
         pod.apply_permissions_from_manifest();
         pod.apply_prune_from_manifest();
+        pod.write_pod_metadata_pending()?;
         drain_skill_shadows(&pod, skill_shadows);
         Ok(pod)
     }
@@ -2881,11 +2947,13 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
         let mut worker = Worker::new(common.client);
         apply_worker_manifest(&mut worker, &manifest.worker);
         worker.set_cache_key(Some(segment_id.to_string()));
+        let pod_metadata_writer = Some(pod_metadata_writer_for_store(&store));
 
         let mut pod = Self {
             manifest,
             worker: Some(worker),
             store,
+            pod_metadata_writer,
             segment_state: SegmentState::new(session_id, segment_id, 0),
             pwd: common.pwd,
             scope: SharedScope::new(common.scope),
@@ -2920,8 +2988,39 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
         };
         pod.apply_permissions_from_manifest();
         pod.apply_prune_from_manifest();
+        pod.write_pod_metadata_pending()?;
         drain_skill_shadows(&pod, skill_shadows);
         Ok(pod)
+    }
+
+    /// Restore a Pod by resolving its name-keyed metadata to an active
+    /// `(SessionId, SegmentId)` and then using the normal session-log restore
+    /// path. The metadata stores only the active pointer; lineage and origin
+    /// remain authoritative in the session log.
+    pub async fn restore_from_pod_metadata(
+        pod_name: &str,
+        manifest: PodManifest,
+        store: St,
+        loader: PromptLoader,
+    ) -> Result<Self, PodError> {
+        let metadata =
+            store
+                .read_by_name(pod_name)?
+                .ok_or_else(|| PodError::PodMetadataMissing {
+                    pod_name: pod_name.to_string(),
+                })?;
+        let active = metadata
+            .active
+            .ok_or_else(|| PodError::PodMetadataInactive {
+                pod_name: pod_name.to_string(),
+            })?;
+        let segment_id = active
+            .segment_id
+            .ok_or_else(|| PodError::PodMetadataPending {
+                pod_name: pod_name.to_string(),
+                session_id: active.session_id,
+            })?;
+        Self::restore_from_manifest(active.session_id, segment_id, manifest, store, loader).await
     }
 
     /// Restore a Pod from an existing session log.
@@ -3021,11 +3120,13 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
 
         let extract_pointer = memory::extract::fold_pointer(&state.extensions);
         let task_store = tools::TaskStore::from_history(&state.history);
+        let pod_metadata_writer = Some(pod_metadata_writer_for_store(&store));
 
         let mut pod = Self {
             manifest,
             worker: Some(worker),
             store,
+            pod_metadata_writer,
             segment_state: SegmentState::new(session_id, segment_id, state.entries_count),
             pwd: common.pwd,
             scope: SharedScope::new(common.scope),
@@ -3065,6 +3166,10 @@ impl<St: Store> Pod<Box<dyn LlmClient>, St> {
         };
         pod.apply_permissions_from_manifest();
         pod.apply_prune_from_manifest();
+        pod.write_pod_metadata_active(SegmentLocation {
+            session_id,
+            segment_id,
+        })?;
         drain_skill_shadows(&pod, skill_shadows);
         Ok(pod)
     }
@@ -3293,6 +3398,20 @@ pub enum PodError {
         "session {segment_id} has no persisted scope snapshot; refusing resume without explicit scope"
     )]
     SegmentScopeMissing { segment_id: SegmentId },
+
+    #[error("pod metadata for {pod_name} was not found")]
+    PodMetadataMissing { pod_name: String },
+
+    #[error("pod metadata for {pod_name} has no active session")]
+    PodMetadataInactive { pod_name: String },
+
+    #[error(
+        "pod metadata for {pod_name} points to session {session_id} but no segment is materialized yet"
+    )]
+    PodMetadataPending {
+        pod_name: String,
+        session_id: SessionId,
+    },
 }
 
 /// Bundle of resources that every high-level Pod constructor needs:
