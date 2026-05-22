@@ -226,9 +226,7 @@ pub enum Event {
     /// `[File: …]`.
     ///
     /// One event per `LogEntry::SystemItem` commit. Disk-side and
-    /// wire-side are 1:1 (singular variant); legacy `SystemItems`
-    /// entries from older sessions are read-only and never emitted on
-    /// this lane.
+    /// wire-side are 1:1.
     SystemItem {
         item: serde_json::Value,
     },
@@ -363,9 +361,8 @@ pub enum Event {
     ///
     /// Live updates after the snapshot arrive through the streaming
     /// events (`TextDelta` / `ToolCall*` / `ToolResult` / etc.) plus
-    /// the two role-specific entry events
-    /// (`SegmentRotated` / `HookInjectedItems`) — there is no generic
-    /// "every committed entry" broadcast.
+    /// role-specific entry events (`SegmentRotated` / `SystemItem`) —
+    /// there is no generic "every committed entry" broadcast.
     Snapshot {
         entries: Vec<serde_json::Value>,
         greeting: Greeting,

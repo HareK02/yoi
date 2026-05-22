@@ -20,7 +20,7 @@ Worker のセッション永続化を提供するクレート。追記専用の 
 
 ### ログ
 
-- `LogEntry` — セッションログのエントリ型（`SessionStart`, `UserInput`, `AssistantItems`, `TurnEnd` など）
+- `LogEntry` — セッションログのエントリ型（`SegmentStart`, `UserInput`, `AssistantItem`, `ToolResult`, `SystemItem`, `TurnEnd` など）
 - `RestoredState` — ログ再生で復元された状態
 - `collect_state()` — ログエントリ列から状態を復元する関数
 

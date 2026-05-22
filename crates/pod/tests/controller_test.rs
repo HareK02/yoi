@@ -35,14 +35,6 @@ fn history_from_sink(handle: &PodHandle) -> Vec<Item> {
             LogEntry::SystemItem { item, .. } => {
                 items.push(item.to_history_item());
             }
-            LogEntry::AssistantItems { items: i, .. }
-            | LogEntry::ToolResults { items: i, .. }
-            | LogEntry::HookInjectedItems { items: i, .. } => {
-                items.extend(i.into_iter().map(Item::from));
-            }
-            LogEntry::SystemItems { items: si, .. } => {
-                items.extend(si.iter().map(|s| s.to_history_item()));
-            }
             _ => {}
         }
     }

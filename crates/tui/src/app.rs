@@ -982,22 +982,6 @@ impl App {
                 let value = serde_json::to_value(&item).expect("SystemItem is Serialize");
                 self.apply_system_item(&value);
             }
-            session_store::LogEntry::AssistantItems { items, .. }
-            | session_store::LogEntry::ToolResults { items, .. }
-            | session_store::LogEntry::HookInjectedItems { items, .. } => {
-                for logged in items {
-                    let item: llm_worker::Item = logged.into();
-                    let item_value = serde_json::to_value(&item).expect("Item is Serialize");
-                    self.push_history_item(&item_value);
-                }
-            }
-            session_store::LogEntry::SystemItems { items, .. } => {
-                for system_item in items {
-                    let value =
-                        serde_json::to_value(&system_item).expect("SystemItem is Serialize");
-                    self.apply_system_item(&value);
-                }
-            }
             // Non-history-bearing variants don't affect the block view.
             _ => {}
         }
@@ -1685,33 +1669,41 @@ mod completion_flow_tests {
             arguments: r#"{"subject":"live","description":""}"#.into(),
         });
 
-        let assistant_items_entry = serde_json::json!({
-            "kind": "assistant_items",
-            "ts": 1,
-            "items": [
-                {
+        let assistant_item_entries = vec![
+            serde_json::json!({
+                "kind": "assistant_item",
+                "ts": 1,
+                "item": {
                     "kind": "tool_call",
                     "call_id": "c1",
                     "name": "TaskCreate",
                     "arguments": r#"{"subject":"a","description":"A"}"#,
                 },
-                {
+            }),
+            serde_json::json!({
+                "kind": "assistant_item",
+                "ts": 2,
+                "item": {
                     "kind": "tool_call",
                     "call_id": "c2",
                     "name": "TaskCreate",
                     "arguments": r#"{"subject":"b","description":"B"}"#,
                 },
-                {
+            }),
+            serde_json::json!({
+                "kind": "assistant_item",
+                "ts": 3,
+                "item": {
                     "kind": "tool_call",
                     "call_id": "u1",
                     "name": "TaskUpdate",
                     "arguments": r#"{"taskid":2,"status":"inprogress"}"#,
                 },
-            ],
-        });
+            }),
+        ];
         app.handle_pod_event(Event::Snapshot {
             greeting: test_greeting(),
-            entries: vec![assistant_items_entry],
+            entries: assistant_item_entries,
             status: PodStatus::Running,
         });
 

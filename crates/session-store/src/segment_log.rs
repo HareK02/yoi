@@ -22,7 +22,7 @@ use crate::system_item::SystemItem;
 /// Variants correspond to specific mutation points in `Worker`:
 /// - `SegmentStart` — always the first entry; captures initial state
 /// - `Invoke` — IDLE → active marker (start of a new self-driving cycle)
-/// - `UserInput` / `AssistantItems` / `ToolResults` / `HookInjectedItems` — history appends
+/// - `UserInput` / `AssistantItem` / `ToolResult` / `SystemItem` — history appends
 /// - `TurnEnd` — AgentTurn boundary marker; carries the post-increment
 ///   `turn_count`. With retry unimplemented today this fires once per
 ///   `run()`/`resume()` (current callers persist a single TurnEnd at
@@ -93,23 +93,6 @@ pub enum LogEntry {
     /// item's denormalised `body`), but live clients and replay paths
     /// dispatch on `kind` for typed rendering.
     SystemItem { ts: u64, item: SystemItem },
-
-    /// Legacy plural form: kept **read-only** so old segment logs still
-    /// open. New writes always use the singular `AssistantItem`. Items
-    /// are flattened on replay.
-    AssistantItems { ts: u64, items: Vec<LoggedItem> },
-
-    /// Legacy plural form: kept **read-only**. New writes use the
-    /// singular `ToolResult`.
-    ToolResults { ts: u64, items: Vec<LoggedItem> },
-
-    /// Legacy plural form: kept **read-only**. New writes use the
-    /// singular `SystemItem`.
-    SystemItems { ts: u64, items: Vec<SystemItem> },
-
-    /// Legacy pre-`SystemItem*` form. Deserialize-only. Items are
-    /// flattened to `Item::system_message` on replay.
-    HookInjectedItems { ts: u64, items: Vec<LoggedItem> },
 
     /// Turn boundary. Records the turn count after increment.
     TurnEnd { ts: u64, turn_count: usize },
@@ -279,20 +262,6 @@ pub fn collect_state(entries: &[LogEntry]) -> RestoredState {
             LogEntry::SystemItem { item, .. } => {
                 state.history.push(item.to_history_item());
             }
-            LogEntry::AssistantItems { items, .. } => {
-                state.history.extend(items.iter().cloned().map(Item::from));
-            }
-            LogEntry::ToolResults { items, .. } => {
-                state.history.extend(items.iter().cloned().map(Item::from));
-            }
-            LogEntry::SystemItems { items, .. } => {
-                state
-                    .history
-                    .extend(items.iter().map(|si| si.to_history_item()));
-            }
-            LogEntry::HookInjectedItems { items, .. } => {
-                state.history.extend(items.iter().cloned().map(Item::from));
-            }
             LogEntry::TurnEnd { turn_count, .. } => {
                 state.turn_count = *turn_count;
             }
@@ -396,9 +365,9 @@ mod tests {
                 ts: 2000,
                 segments: vec![Segment::text("Hello")],
             },
-            LogEntry::AssistantItems {
+            LogEntry::AssistantItem {
                 ts: 3000,
-                items: vec![Item::assistant_message("Hi!").into()],
+                item: Item::assistant_message("Hi!").into(),
             },
             LogEntry::TurnEnd {
                 ts: 3100,
@@ -431,17 +400,17 @@ mod tests {
                 ts: 2000,
                 segments: vec![Segment::text("Check weather")],
             },
-            LogEntry::AssistantItems {
+            LogEntry::AssistantItem {
                 ts: 3000,
-                items: vec![Item::tool_call("call_1", "get_weather", r#"{"city":"Tokyo"}"#).into()],
+                item: Item::tool_call("call_1", "get_weather", r#"{"city":"Tokyo"}"#).into(),
             },
-            LogEntry::ToolResults {
+            LogEntry::ToolResult {
                 ts: 3500,
-                items: vec![Item::tool_result("call_1", "Sunny, 25C").into()],
+                item: Item::tool_result("call_1", "Sunny, 25C").into(),
             },
-            LogEntry::AssistantItems {
+            LogEntry::AssistantItem {
                 ts: 4000,
-                items: vec![Item::assistant_message("It's sunny in Tokyo!").into()],
+                item: Item::assistant_message("It's sunny in Tokyo!").into(),
             },
             LogEntry::TurnEnd {
                 ts: 4100,
@@ -497,9 +466,9 @@ mod tests {
                 cache_write_tokens: 0,
                 output_tokens: 10,
             },
-            LogEntry::AssistantItems {
+            LogEntry::AssistantItem {
                 ts: 2200,
-                items: vec![Item::assistant_message("yo").into()],
+                item: Item::assistant_message("yo").into(),
             },
             LogEntry::LlmUsage {
                 ts: 3100,

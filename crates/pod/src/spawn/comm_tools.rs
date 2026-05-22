@@ -429,37 +429,41 @@ fn extract_assistant_text(entries: &[serde_json::Value]) -> String {
     let mut out = String::new();
     for value in entries {
         // The wire payload is the JSON form of `session_store::LogEntry`.
-        // Walk Assistant items inside each entry that can carry them:
-        // post-compaction `SegmentStart.history` (seed) and per-LLM-call
-        // `AssistantItems` deltas.
+        // Walk current singular assistant items and the seeded history in
+        // post-compaction `SegmentStart` entries.
         let Ok(entry) = serde_json::from_value::<LogEntry>(value.clone()) else {
             continue;
         };
-        let logged_items = match entry {
-            LogEntry::SegmentStart { history, .. } => history,
-            LogEntry::AssistantItems { items, .. } => items,
-            _ => continue,
-        };
-        for logged in logged_items {
-            let item: Item = logged.into();
-            if let Item::Message {
-                role: Role::Assistant,
-                content,
-                ..
-            } = item
-            {
-                for part in content {
-                    if let ContentPart::Text { text } = part {
-                        if !out.is_empty() {
-                            out.push_str("\n\n");
-                        }
-                        out.push_str(&text);
-                    }
+        match entry {
+            LogEntry::SegmentStart { history, .. } => {
+                for logged in history {
+                    push_assistant_text(&mut out, logged);
                 }
             }
+            LogEntry::AssistantItem { item, .. } => push_assistant_text(&mut out, item),
+            _ => continue,
         }
     }
     out
+}
+
+fn push_assistant_text(out: &mut String, logged: session_store::LoggedItem) {
+    let item: Item = logged.into();
+    if let Item::Message {
+        role: Role::Assistant,
+        content,
+        ..
+    } = item
+    {
+        for part in content {
+            if let ContentPart::Text { text } = part {
+                if !out.is_empty() {
+                    out.push_str("\n\n");
+                }
+                out.push_str(&text);
+            }
+        }
+    }
 }
 
 fn summarize_scope(record: &SpawnedPodRecord) -> String {

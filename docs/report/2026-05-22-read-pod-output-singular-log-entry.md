@@ -1,20 +1,15 @@
-# ReadPodOutput が新しい LogEntry 形式を読めず no new assistant text になる
+# ReadPodOutput が LogEntry schema の分岐に取り残され no new assistant text になる
 
 ## 観測
 
 spawned Pod のレビュー出力について、operator が attach すると assistant 出力が見える一方、spawner 側の `ReadPodOutput` は `pod ... running; no new assistant text` を返した。
 
-## 原因候補
+## 原因
 
-`crates/pod/src/spawn/comm_tools.rs` の `extract_assistant_text` は、`Event::Snapshot` 内の `LogEntry` から assistant text を抽出する際に以下だけを対象にしている。
+`crates/pod/src/spawn/comm_tools.rs` の `extract_assistant_text` が、`Event::Snapshot` 内の `LogEntry` を独自に解釈していた。session log の標準形は `LogEntry::AssistantItem { item, .. }` だが、`ReadPodOutput` 側の抽出対象が古い複数 item 形式に寄ったままになっていたため、新しい assistant 出力が snapshot に存在しても取りこぼした。
 
-- `LogEntry::SegmentStart { history, .. }`
-- legacy plural の `LogEntry::AssistantItems { items, .. }`
-
-現在の session log は新規書き込みで singular の `LogEntry::AssistantItem { item, .. }` を使うため、新しい assistant 出力が snapshot に存在しても抽出対象にならない。その結果、`ReadPodOutput` は cursor を進めつつ text は空と判断し、以後の read でも見えなくなる。
-
-これは entry hash の問題ではなく、session-store の新しい singular LogEntry 形式への tool 側追従漏れと見られる。
+これは entry hash の問題ではなく、`LogEntry` に対する派生操作が各所で独自実装され、後方互換 variant が残ったことで標準形への追従漏れを型で検出できなかった問題。
 
 ## 対応
 
-`tickets/read-pod-output-singular-log-entry.md` を追加した。`extract_assistant_text` に `LogEntry::AssistantItem` 対応を追加し、singular entry の snapshot から text を返す test を追加する。
+`LogEntry` から古い複数 item 形式の後方互換 variant を削除し、`ReadPodOutput` / TUI / picker / tests を現在の singular entry だけに揃える。これにより schema 変更時に独自 match の取り残しが compile error として表面化する。

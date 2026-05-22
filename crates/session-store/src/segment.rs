@@ -197,8 +197,8 @@ pub fn save_user_input(
 
 /// Log the history delta — new items added since the previous snapshot.
 ///
-/// Classifies items into AssistantItem / ToolResult / HookInjectedItems
-/// entries automatically (one entry per item). User messages are skipped
+/// Classifies items into AssistantItem / ToolResult entries automatically
+/// (one entry per item). User messages are skipped
 /// because they are persisted upfront via [`save_user_input`] at submit
 /// time; the worker pushes a flattened copy into its history that
 /// arrives here in `new_items` and would otherwise produce a duplicate

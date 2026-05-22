@@ -200,11 +200,6 @@ fn last_message_preview(entries: &[LogEntry]) -> Option<String> {
                     return Some(format!("assistant: {}", trim_one_line(&text, 60)));
                 }
             }
-            LogEntry::AssistantItems { items, .. } => {
-                if let Some(text) = items.iter().find_map(first_text_logged) {
-                    return Some(format!("assistant: {}", trim_one_line(&text, 60)));
-                }
-            }
             _ => {}
         }
     }

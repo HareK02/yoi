@@ -172,7 +172,7 @@ async fn session_run_logs_entries() {
 
     let entries = store.read_all(sid, segid).unwrap();
 
-    // SegmentStart, UserInput, AssistantItems, TurnEnd, RunCompleted (at minimum)
+    // SegmentStart, UserInput, AssistantItem, TurnEnd, RunCompleted (at minimum)
     assert!(
         entries.len() >= 4,
         "expected at least 4 entries, got {}",

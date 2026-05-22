@@ -99,13 +99,13 @@ pub enum LogEntry {
     UserInput { ts: u64, item: Item },
 
     // アシスタント応答（worker.rs:1040-1041 に対応）
-    AssistantItems { ts: u64, items: Vec<Item> },
+    AssistantItem { ts: u64, item: Item },
 
     // ツール実行結果（worker.rs:897-900, 1072-1076 に対応）
-    ToolResults { ts: u64, items: Vec<Item> },
+    ToolResult { ts: u64, item: Item },
 
-    // Hook 注入 Items（worker.rs:1055 ContinueWithMessages に対応）
-    HookInjectedItems { ts: u64, items: Vec<Item> },
+    // typed system injection
+    SystemItem { ts: u64, item: SystemItem },
 
     // ターン境界
     TurnEnd { ts: u64, turn_count: usize },
@@ -126,7 +126,7 @@ pub enum LogEntry {
 pub enum Outcome { Finished, Paused, Error { message: String } }
 ```
 
-**Replay ロジック**: 全エントリ種別を走査し、`*Items` / `UserInput` → history に append、
+**Replay ロジック**: 全エントリ種別を走査し、`AssistantItem` / `ToolResult` / `SystemItem` / `UserInput` → history に append、
 `TurnEnd` → turn_count 更新、`CacheLocked` → locked_prefix_len 設定。
 
 ### TraceEntry（event_trace.rs）

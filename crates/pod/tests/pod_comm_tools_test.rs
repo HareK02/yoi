@@ -158,18 +158,18 @@ fn serve_history(listener: UnixListener, items: Vec<Item>) -> JoinHandle<()> {
             };
             let (_r, w) = stream.into_split();
             let mut writer = JsonLineWriter::new(w);
-            // Wrap the assistant items in a single
-            // `LogEntry::AssistantItems` entry — that's the only kind
-            // that contributes assistant text via `extract_assistant_text`.
-            let logged: Vec<session_store::LoggedItem> =
-                items.iter().map(session_store::LoggedItem::from).collect();
-            let entry = session_store::LogEntry::AssistantItems {
-                ts: 0,
-                items: logged,
-            };
-            let entry_value = serde_json::to_value(&entry).unwrap();
+            let entries: Vec<serde_json::Value> = items
+                .iter()
+                .map(|item| {
+                    let entry = session_store::LogEntry::AssistantItem {
+                        ts: 0,
+                        item: session_store::LoggedItem::from(item),
+                    };
+                    serde_json::to_value(&entry).unwrap()
+                })
+                .collect();
             let event = Event::Snapshot {
-                entries: vec![entry_value],
+                entries,
                 greeting: Greeting {
                     pod_name: "child".into(),
                     cwd: "/tmp".into(),
