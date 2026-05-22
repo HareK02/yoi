@@ -7,6 +7,7 @@
 use crate::store::StoreError;
 use crate::{SegmentId, SessionId};
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 /// Active Session/Segment pointer for a Pod.
 ///
@@ -38,12 +39,34 @@ impl PodActiveSegmentRef {
     }
 }
 
+/// One delegated scope rule for a spawned child, kept local to
+/// `session-store` so the persistence crate does not depend on manifest
+/// scope types.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PodSpawnedScopeRule {
+    pub target: PathBuf,
+    pub permission: String,
+    pub recursive: bool,
+}
+
+/// One child Pod spawned by this Pod and persisted with the spawner's
+/// name-keyed Pod state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PodSpawnedChild {
+    pub pod_name: String,
+    pub socket_path: PathBuf,
+    pub scope_delegated: Vec<PodSpawnedScopeRule>,
+    pub callback_address: PathBuf,
+}
+
 /// Persistent metadata for a Pod name.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PodMetadata {
     pub pod_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active: Option<PodActiveSegmentRef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spawned_children: Vec<PodSpawnedChild>,
 }
 
 impl PodMetadata {
@@ -52,6 +75,7 @@ impl PodMetadata {
         Self {
             pod_name: pod_name.into(),
             active,
+            spawned_children: Vec::new(),
         }
     }
 }

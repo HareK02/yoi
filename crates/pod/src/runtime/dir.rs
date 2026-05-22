@@ -7,11 +7,11 @@ use tokio::fs;
 
 use crate::shared_state::PodSharedState;
 
-/// One spawned-child record persisted to `spawned_pods.json`.
+/// One spawned-child record mirrored to `spawned_pods.json`.
 ///
-/// Written by the spawner after a successful `SpawnPod` tool call so
-/// `ListPods` (future ticket) and a restored spawner can enumerate
-/// their live children without re-querying `pods.json`.
+/// Written by the spawner after registry changes so runtime-local tools
+/// have a materialised snapshot. Durable restore uses Pod state metadata;
+/// this file is not the authoritative source.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpawnedPodRecord {
     /// Spawned Pod's identity.

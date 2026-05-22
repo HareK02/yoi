@@ -57,7 +57,12 @@ where
     St: PodMetadataStore + Clone + Send + Sync + 'static,
 {
     let store = store.clone();
-    Arc::new(move |metadata| store.write(&metadata))
+    Arc::new(move |mut metadata| {
+        if let Some(existing) = store.read_by_name(&metadata.pod_name)? {
+            metadata.spawned_children = existing.spawned_children;
+        }
+        store.write(&metadata)
+    })
 }
 
 /// Lock-free shared session/segment pointer.

@@ -107,7 +107,8 @@ pub struct SpawnPodTool {
     spawner_pwd: PathBuf,
     /// Shared registry of spawned children, also used by the
     /// pod-comm tools (`SendToPod` / `ReadPodOutput` / `StopPod` /
-    /// `ListPods`). Writes the list to `spawned_pods.json` on each add.
+    /// `ListPods`). Writes the list to runtime and durable Pod state on
+    /// each add.
     registry: Arc<SpawnedPodRegistry>,
     /// THIS Pod's own parent-callback socket, if any. After a
     /// successful spawn we fire `PodEvent::ScopeSubDelegated` upward
@@ -268,7 +269,7 @@ impl Tool for SpawnPodTool {
         self.registry
             .add(record)
             .await
-            .map_err(|e| ToolError::ExecutionFailed(format!("write spawned_pods.json: {e}")))?;
+            .map_err(|e| ToolError::ExecutionFailed(format!("write spawned pod registry: {e}")))?;
 
         // Notify this Pod's own parent so the grandparent can register
         // the new grandchild directly. Fire-and-forget; top-level Pods

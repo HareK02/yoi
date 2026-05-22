@@ -6,7 +6,7 @@
 //! target's Unix socket, perform one method exchange, disconnect.
 //!
 //! These tools only touch Pods listed in the spawner's
-//! `spawned_pods.json`; there is no machine-wide directory lookup, so
+//! `SpawnedPodRegistry`; there is no machine-wide directory lookup, so
 //! the spawner can only reach its own descendants.
 
 use std::path::Path;
@@ -217,7 +217,7 @@ impl Tool for StopPodTool {
         self.registry
             .remove(&record.pod_name)
             .await
-            .map_err(|e| ToolError::ExecutionFailed(format!("update spawned_pods.json: {e}")))?;
+            .map_err(|e| ToolError::ExecutionFailed(format!("update spawned pod registry: {e}")))?;
 
         Ok(ToolOutput {
             summary: format!(
