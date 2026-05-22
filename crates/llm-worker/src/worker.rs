@@ -201,6 +201,10 @@ pub struct Worker<C: LlmClient, S: WorkerState = Mutable> {
     tool_output_limits: Option<ToolOutputLimits>,
     /// Prune configuration. `None` disables the prune projection.
     prune_config: Option<crate::prune::PruneConfig>,
+    /// Callback that estimates prefix token counts, injected by higher
+    /// layers that own usage measurements. `None` disables the prune
+    /// projection.
+    token_estimator: Option<crate::prune::TokenEstimator>,
     /// Callback that estimates token savings for a drop range, injected
     /// by higher layers that own usage measurements. `None` disables
     /// the prune projection.
@@ -432,6 +436,17 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
     /// semantics.
     pub fn set_prune_config(&mut self, config: Option<crate::prune::PruneConfig>) {
         self.prune_config = config;
+    }
+
+    /// Inject the callback used to estimate prefix token counts for prune's
+    /// protected-token boundary.
+    ///
+    /// The callback is invoked with the *request context* (a clone of
+    /// history). It must be pure/idempotent since it may be called once per
+    /// LLM request. Returning `NoData` estimates makes prune skip as if no
+    /// candidates existed.
+    pub fn set_token_estimator(&mut self, estimator: Option<crate::prune::TokenEstimator>) {
+        self.token_estimator = estimator;
     }
 
     /// Inject the callback used to estimate token savings for a prune
@@ -983,18 +998,26 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
             // prunable candidates whose estimated savings meet the
             // threshold. Worker does not own usage history itself; the
             // estimator is injected by the layer that does.
-            if let (Some(config), Some(estimator)) = (&self.prune_config, &self.savings_estimator) {
-                let (candidates, border_turn) =
-                    crate::prune::evaluate_candidates(&request_context, config.protected_turns);
+            if let (Some(config), Some(token_estimator), Some(savings_estimator)) = (
+                &self.prune_config,
+                &self.token_estimator,
+                &self.savings_estimator,
+            ) {
+                let token_estimates = token_estimator(&request_context);
+                let (candidates, protected_start_index) = crate::prune::evaluate_candidates(
+                    &request_context,
+                    config.protected_tokens,
+                    &token_estimates,
+                );
                 let evaluation = if candidates.is_empty() {
                     crate::prune::PruneEvaluation {
                         candidate_count: 0,
                         estimated_savings: 0,
-                        border_turn,
+                        protected_start_index,
                         decision: crate::prune::PruneDecision::SkippedNoCandidates,
                     }
                 } else {
-                    let savings = estimator(&request_context, &candidates);
+                    let savings = savings_estimator(&request_context, &candidates);
                     if savings >= config.min_savings {
                         let pruned = crate::prune::project(&mut request_context, &candidates);
                         if pruned > 0 {
@@ -1007,7 +1030,7 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
                         crate::prune::PruneEvaluation {
                             candidate_count: candidates.len(),
                             estimated_savings: savings,
-                            border_turn,
+                            protected_start_index,
                             decision: crate::prune::PruneDecision::Fired {
                                 pruned_count: pruned,
                             },
@@ -1016,7 +1039,7 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
                         crate::prune::PruneEvaluation {
                             candidate_count: candidates.len(),
                             estimated_savings: savings,
-                            border_turn,
+                            protected_start_index,
                             decision: crate::prune::PruneDecision::SkippedBelowMinSavings,
                         }
                     }
@@ -1256,6 +1279,7 @@ impl<C: LlmClient> Worker<C, Mutable> {
             cancel_rx,
             tool_output_limits: None,
             prune_config: None,
+            token_estimator: None,
             savings_estimator: None,
             prune_observer: None,
             cache_anchor: None,
@@ -1519,6 +1543,7 @@ impl<C: LlmClient> Worker<C, Mutable> {
             cancel_rx: self.cancel_rx,
             tool_output_limits: self.tool_output_limits,
             prune_config: self.prune_config,
+            token_estimator: self.token_estimator,
             savings_estimator: self.savings_estimator,
             prune_observer: self.prune_observer,
             cache_anchor: self.cache_anchor,
@@ -1605,6 +1630,7 @@ impl<C: LlmClient> Worker<C, Locked> {
             cancel_rx: self.cancel_rx,
             tool_output_limits: self.tool_output_limits,
             prune_config: self.prune_config,
+            token_estimator: self.token_estimator,
             savings_estimator: self.savings_estimator,
             prune_observer: self.prune_observer,
             cache_anchor: self.cache_anchor,

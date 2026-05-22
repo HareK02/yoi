@@ -4,10 +4,10 @@
 //! returns a long `ToolOutput.content`, then inspects the persisted
 //! session log to verify:
 //!
-//! - `prune.skip { reason: "no_candidates" }` lands when the protected-turn
-//!   window covers the entire history.
-//! - `prune.fire` lands once enough turns + usage measurements exist for
-//!   the projection to actually apply.
+//! - `prune.skip { reason: "no_candidates" }` lands when usage estimates are
+//!   unavailable or the protected-token window covers all tool results.
+//! - `prune.fire` lands once enough measured history exceeds the protected-token
+//!   budget for the projection to actually apply.
 //! - The fire metric and the immediately-following `prune.post_request`
 //!   metric share the same `correlation_id`, so cache_read / cache_write
 //!   from the LlmUsage that triggered the projection can be joined back
@@ -136,7 +136,7 @@ fn text_response_with_cache(text: &str, cache_read: u64, cache_write: u64) -> Ve
     ]
 }
 
-fn manifest_toml(prune_protected_turns: usize, prune_min_savings: u64) -> String {
+fn manifest_toml(prune_protected_tokens: u64, prune_min_savings: u64) -> String {
     format!(
         r#"
 [pod]
@@ -151,7 +151,7 @@ model_id = "test-model"
 max_tokens = 100
 
 [compaction]
-prune_protected_turns = {prune_protected_turns}
+prune_protected_tokens = {prune_protected_tokens}
 prune_min_savings = {prune_min_savings}
 
 [[scope.allow]]
@@ -192,7 +192,7 @@ async fn prune_metrics_emit_skip_then_fire_with_post_request_join() {
     // Run 1 (request 0): tool_use → triggers tool execution → request 1
     //   on the second iteration to produce the assistant reply.
     // Run 2 (request 2): plain assistant text. Prune evaluation here
-    //   sees user1's tool_result outside the 1-protected-turn window and
+    //   sees user1's tool_result outside the protected-token suffix and
     //   should fire.
     let client = MockClient::new(vec![
         tool_use_response("call-1", "big_tool"),
@@ -250,8 +250,8 @@ async fn prune_metrics_emit_skip_then_fire_with_post_request_join() {
         "fire missing candidate_count: {fire:?}"
     );
     assert!(
-        fire.dimensions.contains_key("border_turn"),
-        "fire missing border_turn: {fire:?}"
+        fire.dimensions.contains_key("protected_start_index"),
+        "fire missing protected_start_index: {fire:?}"
     );
     assert!(fire.value.is_some(), "fire missing estimated_savings value");
     let fire_id = fire
@@ -277,6 +277,36 @@ async fn prune_metrics_emit_skip_then_fire_with_post_request_join() {
     assert!(post.dimensions.contains_key("history_len"));
 }
 
+#[tokio::test]
+async fn prune_metrics_fire_during_single_long_task_without_multiple_user_turns() {
+    let client = MockClient::new(vec![
+        tool_use_response("call-1", "big_tool"),
+        tool_use_response("call-2", "big_tool"),
+        tool_use_response("call-3", "big_tool"),
+        tool_use_response("call-4", "big_tool"),
+        text_response_with_cache("done", 100, 20),
+    ]);
+    let (mut pod, _store_tmp, _pwd_tmp) = make_pod(manifest_toml(1, 1), client, "big_tool").await;
+    let session_id = pod.session_id();
+    let segment_id = pod.segment_id();
+    let store = pod.store().clone();
+
+    pod.run_text("one long task").await.unwrap();
+
+    let state = session_store::restore(&store, session_id, segment_id).unwrap();
+    let metrics = metrics_from_extensions(&state.extensions);
+    let fire_count = metrics.iter().filter(|m| m.name == "prune.fire").count();
+    assert!(
+        fire_count > 0,
+        "single-turn tool loop should produce prune.fire once old heavy ToolResults fall outside the protected-token suffix: {metrics:?}"
+    );
+    assert!(
+        metrics.iter().any(|m| {
+            m.name == "prune.fire" && m.dimensions.contains_key("protected_start_index")
+        })
+    );
+}
+
 /// `min_savings` set high enough that candidates exist but the estimated
 /// savings always fall short → the second run should record
 /// `prune.skip { reason: "below_min_savings" }`.
@@ -288,7 +318,7 @@ async fn prune_metrics_record_below_min_savings_skip() {
         text_response_with_cache("done", 0, 0),
     ]);
     let (mut pod, _store_tmp, _pwd_tmp) =
-        make_pod(manifest_toml(1, u64::MAX), client, "big_tool").await;
+        make_pod(manifest_toml(1, 1_000_000), client, "big_tool").await;
     let session_id = pod.session_id();
     let segment_id = pod.segment_id();
     let store = pod.store().clone();
@@ -405,7 +435,7 @@ async fn metric_write_failure_emits_warn_alert_and_does_not_abort_run() {
 
     // Even with a tool registered, this run will only emit
     // `prune.skip { reason: "no_candidates" }` (one user message,
-    // protected_turns=1 covers everything). That is enough to drive
+    // protected token budget covers the only user message). That is enough to drive
     // the failure path: at least one metric attempts to write.
     let client = MockClient::new(vec![text_response_with_cache("hi", 0, 0)]);
     let worker = Worker::new(client);

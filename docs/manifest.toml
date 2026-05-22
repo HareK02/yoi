@@ -191,9 +191,9 @@ permission = "write"
 # セクションを書いた時点で Prune は有効化、Compact は閾値が None なら無効。
 # [compaction]
 #
-# # 任意。デフォルト: 3 (`defaults::PRUNE_PROTECTED_TURNS`)。
-# # pruning から保護する末尾ターン数。
-# prune_protected_turns = 3
+# # 任意。デフォルト: 8000 (`defaults::PRUNE_PROTECTED_TOKENS`)。
+# # pruning から保護する末尾 token budget。turn 数ではなく usage estimate で境界を引く。
+# prune_protected_tokens = 8000
 #
 # # 任意。デフォルト: 4096 (`defaults::PRUNE_MIN_SAVINGS`)。
 # # prune が発火するための最低節約 token 推定値。

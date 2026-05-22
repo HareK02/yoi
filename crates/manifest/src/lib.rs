@@ -337,9 +337,9 @@ pub enum ToolPermissionAction {
 /// (full history summarisation). Omitting `[compaction]` disables both.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompactionConfig {
-    /// Number of recent turns protected from pruning.
-    #[serde(default = "default_prune_protected_turns")]
-    pub prune_protected_turns: usize,
+    /// Token budget at the history tail protected from pruning.
+    #[serde(default = "default_prune_protected_tokens")]
+    pub prune_protected_tokens: u64,
 
     /// Minimum estimated token savings to trigger a prune.
     #[serde(default = "default_prune_min_savings")]
@@ -393,8 +393,8 @@ pub struct CompactionConfig {
     pub model: Option<ModelManifest>,
 }
 
-fn default_prune_protected_turns() -> usize {
-    defaults::PRUNE_PROTECTED_TURNS
+fn default_prune_protected_tokens() -> u64 {
+    defaults::PRUNE_PROTECTED_TOKENS
 }
 fn default_prune_min_savings() -> u64 {
     defaults::PRUNE_MIN_SAVINGS
@@ -415,7 +415,7 @@ fn default_compact_worker_max_turns() -> Option<u32> {
 impl Default for CompactionConfig {
     fn default() -> Self {
         Self {
-            prune_protected_turns: default_prune_protected_turns(),
+            prune_protected_tokens: default_prune_protected_tokens(),
             prune_min_savings: default_prune_min_savings(),
             compact_threshold: None,
             compact_request_threshold: None,
@@ -431,6 +431,7 @@ impl Default for CompactionConfig {
 impl PodManifest {
     /// Parse a manifest from a TOML string.
     pub fn from_toml(s: &str) -> Result<Self, toml::de::Error> {
+        config::reject_removed_manifest_fields(s)?;
         toml::from_str(s)
     }
 }
@@ -581,12 +582,22 @@ model_id = "claude-sonnet-4-20250514"
         let toml = format!("{MINIMAL_REQUIRED}\n[compaction]\ncompact_threshold = 80000\n");
         let manifest = PodManifest::from_toml(&toml).unwrap();
         let c = manifest.compaction.unwrap();
-        assert_eq!(c.prune_protected_turns, 3);
+        assert_eq!(c.prune_protected_tokens, 8000);
         assert_eq!(c.prune_min_savings, 4096);
         assert_eq!(c.compact_threshold, Some(80000));
         assert_eq!(c.compact_request_threshold, None);
         assert_eq!(c.compact_retained_tokens, 8000);
         assert_eq!(c.compact_worker_max_turns, Some(20));
+    }
+
+    #[test]
+    fn reject_removed_prune_protected_turns_field() {
+        let toml = format!("{MINIMAL_REQUIRED}\n[compaction]\nprune_protected_turns = 3\n");
+        let err = PodManifest::from_toml(&toml).unwrap_err();
+        assert!(
+            err.to_string().contains("compaction.prune_protected_turns"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

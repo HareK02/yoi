@@ -132,6 +132,21 @@ fn tool_result_content_bytes(item: &Item) -> u64 {
     item_bytes(item).saturating_sub(item_bytes(&cleared))
 }
 
+/// Prefix-boundary token estimates used by Prune to find its protected suffix.
+///
+/// Returns `history.len() + 1` entries where entry `i` estimates
+/// `history[..i]`. This shares the same [`tokens_at`] accounting as compact's
+/// retained-tail split and prune's savings estimate.
+pub(crate) fn token_estimates_for_prune_impl(
+    history: &[Item],
+    records: &[UsageRecord],
+) -> Vec<TokenEstimate> {
+    let prefix = prefix_bytes(history);
+    (0..=history.len())
+        .map(|idx| tokens_at(history, records, idx, &prefix))
+        .collect()
+}
+
 /// Prune 射影（`ToolResult.content = None`）で節約されるトークン数の推定。
 ///
 /// `indices` は [`llm_worker::prune::prunable_indices`] が返す候補列を
@@ -276,6 +291,26 @@ mod tests {
             Some(c) => Item::tool_result_with_content("call", summary, c),
             None => Item::tool_result("call", summary),
         }
+    }
+
+    #[test]
+    fn token_estimates_for_prune_returns_every_prefix_boundary() {
+        let history = vec![msg("a"), msg("b"), msg("c")];
+        let estimates = token_estimates_for_prune_impl(&history, &[record(3, 300)]);
+        assert_eq!(estimates.len(), history.len() + 1);
+        assert_eq!(estimates[0].tokens, 0);
+        assert_eq!(estimates[3].tokens, 300);
+        assert_eq!(estimates[3].source, EstimateSource::Measured);
+    }
+
+    #[test]
+    fn token_estimates_for_prune_propagates_no_data() {
+        let history = vec![msg("a"), msg("b")];
+        let estimates = token_estimates_for_prune_impl(&history, &[]);
+        assert_eq!(estimates.len(), history.len() + 1);
+        assert_eq!(estimates[0].source, EstimateSource::Measured);
+        assert_eq!(estimates[1].source, EstimateSource::NoData);
+        assert_eq!(estimates[2].source, EstimateSource::NoData);
     }
 
     #[test]

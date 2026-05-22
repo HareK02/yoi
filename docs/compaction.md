@@ -38,6 +38,7 @@ Pod::try_pre_run_compact  ← proactive
 
 - **条件付き実行**: 推定トークン節約量が `min_savings` を超えた場合のみ。KV キャッシュの無駄な無効化を避ける
 - **リクエストコンテキストのみ操作**: history 本体は変更しない。Prune 状態を Pod が保持し、LLM リクエスト構築時に反映する
+- **保護境界**: 直近 `prune_protected_tokens` 相当の suffix は残す。turn 数ではなく usage history 由来の token estimate で境界を引くため、単発の長い tool loop でも古い `ToolResult.content` が候補になる
 - **冪等**: `content: None` のアイテムはスキップ
 
 ### ToolOutput の構造
@@ -138,8 +139,9 @@ compact は fork と同じ構造。旧セッションを保全し、新 SessionI
 [compaction]
 compact_threshold = 80000              # ターンの合間 (proactive)
 compact_request_threshold = 90000      # リクエストの合間 (safety net)
-retained_tokens = 8000                 # 直近保護トークン数 (Prune 済みで計測)
-auto_read_budget = 8000                # compact worker の mark_read_required 合計上限
+prune_protected_tokens = 8000       # prune から保護する末尾 token budget
+compact_retained_tokens = 8000      # compact 後に生のまま残す末尾 token budget
+compact_auto_read_budget = 8000     # compact worker の mark_read_required 合計上限
 compact_worker_max_input_tokens = 50000 # compact worker 自身の現在占有トークン上限
 compact_worker_max_turns = 20           # compact worker 自身の tool loop 上限
 ```

@@ -11,12 +11,23 @@
 //! 射影の適用は上位層（`pod::prune_hook` 等）が LLM に送る一時コンテキスト
 //! に対してだけ行う。Worker の永続履歴は決して変更されない。
 //!
-//! `min_savings` 判定や savings 推定もこの crate には置かず、上位層が
-//! usage 履歴ベースのトークン会計と組み合わせて行う。
+//! 保護境界は末尾 token budget で決めるが、この crate は usage 履歴を
+//! 所有しない。prefix ごとの token 推定値と savings 推定は上位層から
+//! callback で注入される。
 
 use serde::{Deserialize, Serialize};
 
 use crate::llm_client::types::Item;
+use crate::token_counter::{EstimateSource, TokenEstimate};
+
+/// Callback that returns token estimates for every prefix boundary of the
+/// supplied request history.
+///
+/// The returned slice must have `history.len() + 1` entries where entry `i`
+/// estimates the token count of `history[..i]`. Returning a malformed vector,
+/// or estimates whose source is [`EstimateSource::NoData`], makes prune treat
+/// the request as having no candidates.
+pub type TokenEstimator = Box<dyn Fn(&[Item]) -> Vec<TokenEstimate> + Send + Sync>;
 
 /// Callback that estimates the token savings for projecting the
 /// `ToolResult.content` out of `history[i]` for each `i` in `indices`.
@@ -35,16 +46,16 @@ pub type SavingsEstimator = Box<dyn Fn(&[Item], &[usize]) -> u64 + Send + Sync>;
 ///
 /// Worker は LLM リクエストごとに 1 回 prune の評価をし、その結果を
 /// （observer が登録されていれば）この値で通知する。fire/skip の判定
-/// 結果と、判定材料になった候補数 / 推定 savings / 境界ターン位置を持つ。
+/// 結果と、判定材料になった候補数 / 推定 savings / 保護領域の先頭 index を持つ。
 #[derive(Debug, Clone)]
 pub struct PruneEvaluation {
     /// `prunable_indices` の長さ。`Skipped::NoCandidates` の時は 0。
     pub candidate_count: usize,
     /// 推定された savings (tokens)。`NoCandidates` の時は 0。
     pub estimated_savings: u64,
-    /// `protected_turns` 境界に当たる turn-start アイテムの index。
-    /// turn 数が `protected_turns` 以下で境界が決まらない場合は `None`。
-    pub border_turn: Option<usize>,
+    /// Token budget で保護される suffix の先頭 item index。
+    /// usage 推定が `NoData` で境界が決まらない場合は `None`。
+    pub protected_start_index: Option<usize>,
     /// 判定結果。
     pub decision: PruneDecision,
 }
@@ -70,10 +81,9 @@ pub type PruneObserver = Box<dyn Fn(&PruneEvaluation) + Send + Sync>;
 /// Configuration for the Prune algorithm.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PruneConfig {
-    /// Number of recent turns to protect from pruning.
-    /// A "turn" starts at each user message.
-    #[serde(default = "default_protected_turns")]
-    pub protected_turns: usize,
+    /// Token budget at the history tail protected from pruning.
+    #[serde(default = "default_protected_tokens")]
+    pub protected_tokens: u64,
 
     /// Minimum token savings required to actually prune. If the prunable
     /// content is smaller than this, the caller should skip to avoid
@@ -84,8 +94,8 @@ pub struct PruneConfig {
     pub min_savings: u64,
 }
 
-fn default_protected_turns() -> usize {
-    3
+fn default_protected_tokens() -> u64 {
+    8000
 }
 fn default_min_savings() -> u64 {
     4096
@@ -94,23 +104,10 @@ fn default_min_savings() -> u64 {
 impl Default for PruneConfig {
     fn default() -> Self {
         Self {
-            protected_turns: default_protected_turns(),
+            protected_tokens: default_protected_tokens(),
             min_savings: default_min_savings(),
         }
     }
-}
-
-/// Find indices where each "turn" begins.
-///
-/// A turn starts at every user message. Returns the indices of those
-/// user messages in ascending order.
-fn find_turn_starts(items: &[Item]) -> Vec<usize> {
-    items
-        .iter()
-        .enumerate()
-        .filter(|(_, item)| item.is_user_message())
-        .map(|(i, _)| i)
-        .collect()
 }
 
 /// Set `content = None` on each `Item::ToolResult` at the given indices.
@@ -121,36 +118,43 @@ fn find_turn_starts(items: &[Item]) -> Vec<usize> {
 pub fn project(items: &mut [Item], indices: &[usize]) -> usize {
     let mut count = 0;
     for &i in indices {
-        if let Item::ToolResult { content, .. } = &mut items[i] {
-            if content.is_some() {
-                *content = None;
-                count += 1;
-            }
+        if let Item::ToolResult { content, .. } = &mut items[i]
+            && content.is_some()
+        {
+            *content = None;
+            count += 1;
         }
     }
     count
 }
 
-/// Indices of `Item::ToolResult { content: Some(_), .. }` that lie outside
-/// the last `protected_turns` turns. Pure: does not mutate `items`.
+/// Indices of `Item::ToolResult { content: Some(_), .. }` that lie before
+/// the suffix protected by `protected_tokens`. Pure: does not mutate `items`.
 ///
-/// Returns an empty vector when there are too few turns or no prunable
-/// candidates.
-pub fn prunable_indices(items: &[Item], protected_turns: usize) -> Vec<usize> {
-    evaluate_candidates(items, protected_turns).0
+/// Returns an empty vector when token estimates are unavailable (`NoData`) or
+/// no prunable candidates exist.
+pub fn prunable_indices(
+    items: &[Item],
+    protected_tokens: u64,
+    token_estimates: &[TokenEstimate],
+) -> Vec<usize> {
+    evaluate_candidates(items, protected_tokens, token_estimates).0
 }
 
-/// Same as [`prunable_indices`] but also returns the index of the
-/// `protected_turns` boundary (the turn-start item whose tail is
-/// protected). `None` when too few turns exist for a boundary to be
-/// defined.
-pub fn evaluate_candidates(items: &[Item], protected_turns: usize) -> (Vec<usize>, Option<usize>) {
-    let turn_starts = find_turn_starts(items);
-    if turn_starts.len() <= protected_turns {
+/// Same as [`prunable_indices`] but also returns the start index of the
+/// protected suffix. `None` means the token boundary could not be determined
+/// (currently because usage estimates were `NoData` or malformed).
+pub fn evaluate_candidates(
+    items: &[Item],
+    protected_tokens: u64,
+    token_estimates: &[TokenEstimate],
+) -> (Vec<usize>, Option<usize>) {
+    let Some(protected_start) = protected_start_index(items, protected_tokens, token_estimates)
+    else {
         return (Vec::new(), None);
-    }
-    let boundary = turn_starts[turn_starts.len() - protected_turns];
-    let candidates = items[..boundary]
+    };
+
+    let candidates = items[..protected_start]
         .iter()
         .enumerate()
         .filter_map(|(i, item)| match item {
@@ -160,7 +164,38 @@ pub fn evaluate_candidates(items: &[Item], protected_turns: usize) -> (Vec<usize
             _ => None,
         })
         .collect();
-    (candidates, Some(boundary))
+    (candidates, Some(protected_start))
+}
+
+fn protected_start_index(
+    items: &[Item],
+    protected_tokens: u64,
+    token_estimates: &[TokenEstimate],
+) -> Option<usize> {
+    if token_estimates.len() != items.len() + 1 {
+        return None;
+    }
+    let total = token_estimates[items.len()];
+    if total.source == EstimateSource::NoData {
+        return None;
+    }
+    if protected_tokens == 0 {
+        return Some(items.len());
+    }
+
+    let mut protected_start = items.len();
+    for idx in (0..items.len()).rev() {
+        let prefix = token_estimates[idx];
+        if prefix.source == EstimateSource::NoData {
+            return None;
+        }
+        protected_start = idx;
+        let tail_tokens = total.tokens.saturating_sub(prefix.tokens);
+        if tail_tokens >= protected_tokens {
+            break;
+        }
+    }
+    Some(protected_start)
 }
 
 #[cfg(test)]
@@ -185,17 +220,70 @@ mod tests {
         items
     }
 
+    fn measured_prefix(tokens: &[u64]) -> Vec<TokenEstimate> {
+        tokens
+            .iter()
+            .copied()
+            .map(|tokens| TokenEstimate {
+                tokens,
+                source: EstimateSource::Measured,
+            })
+            .collect()
+    }
+
+    fn uniform_estimates(items: &[Item], item_tokens: u64) -> Vec<TokenEstimate> {
+        let mut tokens = Vec::with_capacity(items.len() + 1);
+        for i in 0..=items.len() {
+            tokens.push(i as u64 * item_tokens);
+        }
+        measured_prefix(&tokens)
+    }
+
+    fn estimates_from_item_tokens(item_tokens: &[u64]) -> Vec<TokenEstimate> {
+        let mut prefix = Vec::with_capacity(item_tokens.len() + 1);
+        let mut acc = 0;
+        prefix.push(acc);
+        for tokens in item_tokens {
+            acc += tokens;
+            prefix.push(acc);
+        }
+        measured_prefix(&prefix)
+    }
+
+    fn no_data_estimates(items: &[Item]) -> Vec<TokenEstimate> {
+        (0..=items.len())
+            .map(|i| TokenEstimate {
+                tokens: i as u64,
+                source: if i == 0 {
+                    EstimateSource::Measured
+                } else {
+                    EstimateSource::NoData
+                },
+            })
+            .collect()
+    }
+
     #[test]
-    fn no_candidates_when_too_few_turns() {
+    fn no_candidates_when_estimate_has_no_data() {
+        let items = make_history(&[("turn1", vec![("summary1", Some("big content here"))])]);
+        let estimates = no_data_estimates(&items);
+        let (candidates, protected_start) = evaluate_candidates(&items, 10, &estimates);
+        assert!(candidates.is_empty());
+        assert_eq!(protected_start, None);
+    }
+
+    #[test]
+    fn no_candidates_when_history_fits_in_protected_tokens() {
         let items = make_history(&[
             ("turn1", vec![("summary1", Some("big content here"))]),
             ("turn2", vec![("summary2", Some("more content"))]),
         ]);
-        assert!(prunable_indices(&items, 3).is_empty());
+        let estimates = uniform_estimates(&items, 10);
+        assert!(prunable_indices(&items, 10_000, &estimates).is_empty());
     }
 
     #[test]
-    fn candidates_in_unprotected_turns() {
+    fn candidates_before_token_protected_suffix() {
         let big = "x".repeat(4096 * 4);
         let items = make_history(&[
             ("turn1", vec![("s1", Some(&big))]),
@@ -203,9 +291,39 @@ mod tests {
             ("turn3", vec![("s3", Some("keep me"))]),
             ("turn4", vec![("s4", Some("keep me too"))]),
         ]);
-        let candidates = prunable_indices(&items, 2);
+        let estimates = uniform_estimates(&items, 10);
+        let candidates = prunable_indices(&items, 80, &estimates);
         assert_eq!(candidates.len(), 2);
-        // 候補は turn1 と turn2 の ToolResult のみ
+        // suffix budget 80 tokens protects turn3+turn4 (8 items), so only s1/s2 are candidates.
+        for &i in &candidates {
+            if let Item::ToolResult { summary, .. } = &items[i] {
+                assert!(summary == "s1" || summary == "s2");
+            } else {
+                panic!("non tool-result selected");
+            }
+        }
+    }
+
+    #[test]
+    fn single_long_task_gets_candidates_without_multiple_user_turns() {
+        let big = "x".repeat(4096 * 8);
+        let items = make_history(&[(
+            "one long task",
+            vec![
+                ("s1", Some(&big)),
+                ("s2", Some(&big)),
+                ("s3", Some(&big)),
+                ("s4", Some(&big)),
+            ],
+        )]);
+        // user + assistant are cheap; every ToolCall is cheap; every ToolResult is heavy.
+        let item_tokens = vec![1, 1, 1, 5_000, 1, 5_000, 1, 5_000, 1, 5_000];
+        let estimates = estimates_from_item_tokens(&item_tokens);
+
+        let (candidates, protected_start) = evaluate_candidates(&items, 8_000, &estimates);
+
+        assert_eq!(protected_start, Some(7));
+        assert_eq!(candidates.len(), 2);
         for &i in &candidates {
             if let Item::ToolResult { summary, .. } = &items[i] {
                 assert!(summary == "s1" || summary == "s2");
@@ -223,7 +341,8 @@ mod tests {
             ("turn3", vec![]),
             ("turn4", vec![]),
         ]);
-        assert!(prunable_indices(&items, 2).is_empty());
+        let estimates = uniform_estimates(&items, 10);
+        assert!(prunable_indices(&items, 20, &estimates).is_empty());
     }
 
     #[test]
@@ -235,7 +354,8 @@ mod tests {
             ("turn3", vec![("s3", Some("keep me"))]),
             ("turn4", vec![("s4", Some("keep me too"))]),
         ]);
-        let candidates = prunable_indices(&items, 2);
+        let estimates = uniform_estimates(&items, 10);
+        let candidates = prunable_indices(&items, 80, &estimates);
         let count = project(&mut items, &candidates);
         assert_eq!(count, 2);
 
@@ -261,7 +381,7 @@ mod tests {
             ("turn1", vec![("s1", None)]),
             ("turn2", vec![("s2", Some("hello"))]),
         ]);
-        // Manually target s1 (index 3) even though it's already None.
+        // Manually target s1 even though it's already None.
         let target = items
             .iter()
             .position(|it| matches!(it, Item::ToolResult { summary, .. } if summary == "s1"))
@@ -279,14 +399,15 @@ mod tests {
             ("turn3", vec![]),
             ("turn4", vec![]),
         ]);
-        let candidates = prunable_indices(&items, 2);
+        let estimates = uniform_estimates(&items, 10);
+        let candidates = prunable_indices(&items, 20, &estimates);
         assert_eq!(project(&mut items, &candidates), 1);
         // 2 周目: 候補は一度の prunable_indices 結果を使い回しても 0 件。
         assert_eq!(project(&mut items, &candidates), 0);
     }
 
     #[test]
-    fn evaluate_candidates_returns_boundary_index() {
+    fn evaluate_candidates_returns_protected_start_index() {
         let big = "x".repeat(64);
         let items = make_history(&[
             ("turn1", vec![("s1", Some(&big))]),
@@ -294,36 +415,37 @@ mod tests {
             ("turn3", vec![("s3", Some("keep"))]),
             ("turn4", vec![("s4", Some("keep too"))]),
         ]);
-        let (candidates, border) = evaluate_candidates(&items, 2);
+        let estimates = uniform_estimates(&items, 10);
+        let (candidates, protected_start) = evaluate_candidates(&items, 80, &estimates);
         assert_eq!(candidates.len(), 2);
-        // protected_turns=2 → boundary は turn3 の user message 位置。
-        // turn1: u/a/c/r (4) + turn2: u/a/c/r (4) = index 8 (turn3 の user)。
-        assert_eq!(border, Some(8));
+        // protected_tokens=80 → protected suffix is turn3+turn4, starting at index 8.
+        assert_eq!(protected_start, Some(8));
     }
 
     #[test]
-    fn evaluate_candidates_no_boundary_when_too_few_turns() {
+    fn evaluate_candidates_reports_zero_start_when_everything_is_protected() {
         let items = make_history(&[("only", vec![("s", Some("x"))])]);
-        let (candidates, border) = evaluate_candidates(&items, 2);
+        let estimates = uniform_estimates(&items, 10);
+        let (candidates, protected_start) = evaluate_candidates(&items, 10_000, &estimates);
         assert!(candidates.is_empty());
-        assert!(border.is_none());
+        assert_eq!(protected_start, Some(0));
     }
 
     #[test]
-    fn protected_turns_boundary_exact() {
-        // 3 turns with protected_turns=2: only turn 1 is a candidate.
+    fn zero_protected_tokens_allows_all_tool_results_as_candidates() {
         let big = "x".repeat(64);
-        let items = make_history(&[
-            ("turn1", vec![("s1", Some(&big))]),
-            ("turn2", vec![("s2", Some("protected"))]),
-            ("turn3", vec![("s3", Some("also protected"))]),
-        ]);
-        let candidates = prunable_indices(&items, 2);
-        assert_eq!(candidates.len(), 1);
-        if let Item::ToolResult { summary, .. } = &items[candidates[0]] {
-            assert_eq!(summary, "s1");
-        } else {
-            panic!("expected ToolResult at candidate index");
-        }
+        let items = make_history(&[("turn1", vec![("s1", Some(&big)), ("s2", Some(&big))])]);
+        let estimates = uniform_estimates(&items, 10);
+        let (candidates, protected_start) = evaluate_candidates(&items, 0, &estimates);
+        assert_eq!(protected_start, Some(items.len()));
+        assert_eq!(candidates.len(), 2);
+    }
+
+    #[test]
+    fn malformed_estimate_vector_is_treated_as_no_boundary() {
+        let items = make_history(&[("turn1", vec![("s1", Some("x"))])]);
+        let (candidates, protected_start) = evaluate_candidates(&items, 10, &[]);
+        assert!(candidates.is_empty());
+        assert_eq!(protected_start, None);
     }
 }
