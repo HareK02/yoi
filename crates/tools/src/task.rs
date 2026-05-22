@@ -252,24 +252,25 @@ struct TaskUpdateTool {
     store: TaskStore,
 }
 
-const CREATE_DESCRIPTION: &str = "Create a session-lifetime task for short-term current-work \
-tracking, not project management. Tasks are user-visible real-time status for work with a \
-concrete goal that needs multiple meaningful steps, such as implementation, debugging, \
-investigation, or structured review. Do not create tasks for simple questions, brief answers, or \
-single-step actions. Input only `subject` and `description`; `taskid` is assigned automatically \
-and initial `status` is `pending`.";
+const CREATE_DESCRIPTION: &str = "Create a session-lifetime task only when user-visible \
+progress tracking is genuinely useful: multiple active tasks must be remembered, or the work \
+will involve long edits, long-running commands, extended investigation, or interruption-prone \
+coordination. Do not create a task just because a request has several steps, and do not create \
+one for short questions, quick checks, single reviews, or one-off commands. Prefer updating an \
+existing active task over creating a duplicate. Input only `subject` and `description`; `taskid` \
+is assigned automatically and initial `status` is `pending`.";
 const LIST_DESCRIPTION: &str = "List every session-lifetime task, including completed and \
 deleted entries. Tasks are user-visible real-time status for short-term current-work tracking. \
 Takes an empty object as input.";
 const GET_DESCRIPTION: &str = "Get one session-lifetime task by `taskid`. Tasks are \
 user-visible real-time status for short-term current-work tracking. Returns an error if the task \
 does not exist.";
-const UPDATE_DESCRIPTION: &str = "Update an existing session-lifetime task as progress changes \
-between meaningful steps. Tasks are user-visible real-time status for multi-step work; keep \
-status current with `pending`, `inprogress`, `completed`, or `deleted`. Provide `taskid` and at \
-least one of `status`, `subject`, or `description`; deletion is logical (`status = deleted`). If \
-an unexpected problem blocks progress, do not force the next step: leave the task as-is, \
-summarize the problem to the user, and end the turn.";
+const UPDATE_DESCRIPTION: &str = "Update an existing session-lifetime task when meaningful \
+progress changes between substantial steps. Tasks are user-visible real-time status, so avoid \
+churn for trivial substeps. Keep status current with `pending`, `inprogress`, `completed`, or \
+`deleted`. Provide `taskid` and at least one of `status`, `subject`, or `description`; deletion is \
+logical (`status = deleted`). If an unexpected problem blocks progress, do not force the next \
+step: leave the task as-is, summarize the problem to the user, and end the turn.";
 
 #[async_trait]
 impl Tool for TaskCreateTool {
