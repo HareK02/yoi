@@ -8,7 +8,6 @@
 - Pod: 任意ターンからの Fork（複数ターン巻き戻しを汎用化） → [tickets/pod-session-fork.md](tickets/pod-session-fork.md)
 - Pod: Inbound PodEvent ハンドリングの重複を統合 → [tickets/pod-inbound-pod-event-dedup.md](tickets/pod-inbound-pod-event-dedup.md)
 - Pod 単位永続化
-  - Pod 名単位の resume / attach 導線 → [tickets/pod-name-resume.md](tickets/pod-name-resume.md)
   - SpawnedPodRegistry の永続化と復元 → [tickets/spawned-registry-persist.md](tickets/spawned-registry-persist.md)
 - llm-worker のエラー耐性
   - ストリーム途中失敗時の継続 → [tickets/llm-worker-stream-continuation.md](tickets/llm-worker-stream-continuation.md)
