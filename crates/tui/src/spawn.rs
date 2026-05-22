@@ -90,56 +90,18 @@ type InlineTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 /// behaviour); `Some(id)` swaps the dialog into "Resume Pod" mode and
 /// passes `--session <id>` to the spawned `pod` child.
 pub async fn run(resume_from: Option<SegmentId>) -> Result<SpawnOutcome, SpawnError> {
-    let cwd = std::env::current_dir().map_err(SpawnError::Io)?;
-
-    // Run the same merge pod itself uses, then read what's missing
-    // off the result. We only look at `scope.allow` here — `pod.name`
-    // is intentionally an instance-level identifier and is always
-    // taken from the dialog regardless of what (if anything) a layer
-    // declared.
-    let user_layer = user_manifest_path()
-        .filter(|p| p.is_file())
-        .and_then(|p| load_layer(&p).ok());
-    let project_layer = find_project_manifest_from(&cwd).and_then(|p| load_layer(&p).ok());
-
-    let mut cascade = PodManifestConfig::builtin_defaults();
-    for layer in [user_layer.as_ref(), project_layer.as_ref()]
-        .into_iter()
-        .flatten()
-    {
-        cascade = cascade.merge(layer.clone());
-    }
-    let cascade_has_scope = !cascade.scope.allow.is_empty();
-
-    let scope_origin = match (
-        project_layer
-            .as_ref()
-            .is_some_and(|l| !l.scope.allow.is_empty()),
-        user_layer
-            .as_ref()
-            .is_some_and(|l| !l.scope.allow.is_empty()),
-    ) {
-        (true, _) => ScopeOrigin::FromProject,
-        (false, true) => ScopeOrigin::FromUser,
-        (false, false) => ScopeOrigin::CwdDefault,
-    };
-
-    let default_name = cwd
-        .file_name()
-        .and_then(|s| s.to_str())
-        .map(sanitise_default_name)
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "pod".to_string());
+    let defaults = load_spawn_defaults()?;
 
     let mut form = Form {
-        cwd: cwd.clone(),
-        cascade_has_scope,
-        scope_origin,
-        name_cursor: default_name.chars().count(),
-        name: default_name,
+        cwd: defaults.cwd.clone(),
+        cascade_has_scope: defaults.cascade_has_scope,
+        scope_origin: defaults.scope_origin,
+        name_cursor: defaults.default_name.chars().count(),
+        name: defaults.default_name,
         message: None,
         editing: true,
         resume_from,
+        resume_by_pod_name: false,
         resume_scope: None,
     };
 
@@ -204,6 +166,101 @@ pub async fn run(resume_from: Option<SegmentId>) -> Result<SpawnOutcome, SpawnEr
             Err(e)
         }
     }
+}
+
+/// Launch `pod --pod <name>` without opening the name dialog. The child Pod
+/// resolves persisted Pod metadata if present, or creates a fresh same-name Pod
+/// with the usual TUI cwd-scope fallback.
+pub async fn run_pod_name(pod_name: String) -> Result<SpawnOutcome, SpawnError> {
+    let defaults = load_spawn_defaults()?;
+    let mut form = Form {
+        cwd: defaults.cwd,
+        cascade_has_scope: defaults.cascade_has_scope,
+        scope_origin: defaults.scope_origin,
+        name_cursor: pod_name.chars().count(),
+        name: pod_name,
+        message: Some(("resuming pod...".to_string(), MessageKind::Progress)),
+        editing: false,
+        resume_from: None,
+        resume_by_pod_name: true,
+        resume_scope: None,
+    };
+    let overlay_toml = build_overlay_toml(&form);
+    let mut terminal = make_inline_terminal()?;
+    terminal.draw(|f| draw_form(f, &form))?;
+
+    match wait_for_ready(&mut terminal, &mut form, &overlay_toml).await {
+        Ok(ready) => {
+            form.message = Some((
+                format!("ready: {}  attaching...", ready.pod_name),
+                MessageKind::Ok,
+            ));
+            terminal.draw(|f| draw_form(f, &form))?;
+            drop(terminal);
+            Ok(SpawnOutcome::Ready(ready))
+        }
+        Err(e) => {
+            form.message = Some((e.to_string(), MessageKind::Error));
+            let _ = terminal.draw(|f| draw_form(f, &form));
+            drop(terminal);
+            Err(e)
+        }
+    }
+}
+
+struct SpawnDefaults {
+    cwd: PathBuf,
+    cascade_has_scope: bool,
+    scope_origin: ScopeOrigin,
+    default_name: String,
+}
+
+fn load_spawn_defaults() -> Result<SpawnDefaults, SpawnError> {
+    let cwd = std::env::current_dir().map_err(SpawnError::Io)?;
+
+    // Run the same merge pod itself uses, then read what's missing off the
+    // result. We only look at `scope.allow` here — `pod.name` is an
+    // instance-level identifier and is supplied by the dialog or `--pod`.
+    let user_layer = user_manifest_path()
+        .filter(|p| p.is_file())
+        .and_then(|p| load_layer(&p).ok());
+    let project_layer = find_project_manifest_from(&cwd).and_then(|p| load_layer(&p).ok());
+
+    let mut cascade = PodManifestConfig::builtin_defaults();
+    for layer in [user_layer.as_ref(), project_layer.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        cascade = cascade.merge(layer.clone());
+    }
+    let cascade_has_scope = !cascade.scope.allow.is_empty();
+
+    let scope_origin = match (
+        project_layer
+            .as_ref()
+            .is_some_and(|l| !l.scope.allow.is_empty()),
+        user_layer
+            .as_ref()
+            .is_some_and(|l| !l.scope.allow.is_empty()),
+    ) {
+        (true, _) => ScopeOrigin::FromProject,
+        (false, true) => ScopeOrigin::FromUser,
+        (false, false) => ScopeOrigin::CwdDefault,
+    };
+
+    let default_name = cwd
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(sanitise_default_name)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "pod".to_string());
+
+    Ok(SpawnDefaults {
+        cwd,
+        cascade_has_scope,
+        scope_origin,
+        default_name,
+    })
 }
 
 fn make_inline_terminal() -> io::Result<InlineTerminal> {
@@ -279,6 +336,7 @@ async fn wait_for_ready(
         overlay_toml: overlay_toml.to_string(),
         cwd,
         resume_from: form.resume_from,
+        resume_by_pod_name: form.resume_by_pod_name,
     };
     let ready = spawn_pod(config, |line| {
         form.message = Some((line.to_string(), MessageKind::Progress));
@@ -377,6 +435,9 @@ struct Form {
     /// child pod is launched with `--session <id>` so it restores
     /// from `id` and appends to the same session log.
     resume_from: Option<SegmentId>,
+    /// When true, launch the child with `--pod <name>` so the pod process
+    /// resolves name-keyed state before falling back to fresh creation.
+    resume_by_pod_name: bool,
     /// Scope snapshot recovered from the source session log. Set only for
     /// resume runs, and serialized into the overlay instead of cwd-default
     /// scope so resume does not silently broaden access.
@@ -556,6 +617,7 @@ mod tests {
             message: None,
             editing: true,
             resume_from: None,
+            resume_by_pod_name: false,
             resume_scope: None,
         }
     }
