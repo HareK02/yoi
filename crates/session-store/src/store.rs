@@ -29,6 +29,9 @@ pub enum StoreError {
 
     #[error("log corrupted at line {line}: {message}")]
     Corrupt { line: usize, message: String },
+
+    #[error("invalid pod name: {0}")]
+    InvalidPodName(String),
 }
 
 /// Sync persistence backend for segment logs.
