@@ -2,11 +2,11 @@
 //! `ReadPodOutput`, `StopPod`, `ListPods`).
 //!
 //! The real child Pod binary is not started. Instead each test stands
-//! up a mock `UnixListener` that speaks the socket protocol directly
-//! (accepting `Method::Run` / `Method::GetHistory` / `Method::Shutdown`
-//! and responding with `Event::History` when asked). This keeps the
-//! tests fast and independent of the LLM layer — the tools are exercised
-//! for their wire behaviour alone.
+//! up a mock `UnixListener` that speaks the socket protocol directly:
+//! it emits the connect-time `Event::Snapshot`, accepts methods such as
+//! `Method::Run` / `Method::Shutdown`, and responds with the relevant
+//! events when needed. This keeps the tests fast and independent of the
+//! LLM layer — the tools are exercised for their wire behaviour alone.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -115,20 +115,40 @@ async fn bind_mock_socket(dir: &Path, name: &str) -> (PathBuf, UnixListener) {
     (socket, listener)
 }
 
-/// Accept one connection and read exactly one `Method` line from it.
+/// Minimal connect-time snapshot used by mock socket servers.
+fn empty_snapshot() -> Event {
+    Event::Snapshot {
+        entries: Vec::new(),
+        greeting: Greeting {
+            pod_name: "child".into(),
+            cwd: "/tmp".into(),
+            provider: "anthropic".into(),
+            model: "x".into(),
+            scope_summary: String::new(),
+            tools: Vec::new(),
+        },
+        status: protocol::PodStatus::Idle,
+    }
+}
+
+/// Accept one connection, send the protocol's connect-time snapshot,
+/// and read exactly one `Method` line from it.
 /// The reader half is kept open; caller awaits the returned handle.
 fn accept_one_method(listener: UnixListener) -> JoinHandle<Option<Method>> {
     tokio::spawn(async move {
         let (stream, _) = listener.accept().await.ok()?;
-        let (r, _w) = stream.into_split();
+        let (r, w) = stream.into_split();
         let mut reader = JsonLineReader::new(r);
+        let mut writer = JsonLineWriter::new(w);
+        writer.write(&empty_snapshot()).await.ok()?;
         reader.next::<Method>().await.ok().flatten()
     })
 }
 
-/// Accept one connection, read one `Method`, then write `response`
-/// back. Used by `SendToPod` tests to mock the real controller's
-/// `TurnStart` acknowledgement (or its `AlreadyRunning` rejection).
+/// Accept one connection, send the protocol's connect-time snapshot,
+/// read one `Method`, then write `response` back. Used by `SendToPod`
+/// tests to mock the real controller's `TurnStart` acknowledgement (or
+/// its `AlreadyRunning` rejection).
 fn accept_method_and_respond(
     listener: UnixListener,
     response: Event,
@@ -138,6 +158,7 @@ fn accept_method_and_respond(
         let (r, w) = stream.into_split();
         let mut reader = JsonLineReader::new(r);
         let mut writer = JsonLineWriter::new(w);
+        writer.write(&empty_snapshot()).await.ok()?;
         let method = reader.next::<Method>().await.ok().flatten();
         if method.is_some() {
             let _ = writer.write(&response).await;
@@ -195,6 +216,9 @@ fn serve_pod_methods(listener: UnixListener) -> mpsc::Receiver<Method> {
             let (r, w) = stream.into_split();
             let mut reader = JsonLineReader::new(r);
             let mut writer = JsonLineWriter::new(w);
+            if writer.write(&empty_snapshot()).await.is_err() {
+                continue;
+            }
             let Some(method) = reader.next::<Method>().await.ok().flatten() else {
                 continue;
             };

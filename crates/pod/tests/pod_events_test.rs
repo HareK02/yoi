@@ -13,8 +13,8 @@ use pod::ipc::event::{apply_event_side_effects, fire_and_forget, render_event};
 use pod::runtime::dir::{RuntimeDir, SpawnedPodRecord};
 use pod::runtime::pod_registry::{self, LockFileGuard};
 use pod::spawn::registry::SpawnedPodRegistry;
-use protocol::stream::JsonLineReader;
-use protocol::{Method, Permission, PodEvent, ScopeRule};
+use protocol::stream::{JsonLineReader, JsonLineWriter};
+use protocol::{Event, Greeting, Method, Permission, PodEvent, PodStatus, ScopeRule};
 use tempfile::TempDir;
 use tokio::net::UnixListener;
 
@@ -76,11 +76,30 @@ fn clear_runtime_dir() {
     }
 }
 
-/// Accept a single connection, read one `Method`, and return it.
+/// Minimal connect-time snapshot used by mock parent sockets.
+fn empty_snapshot() -> Event {
+    Event::Snapshot {
+        entries: Vec::new(),
+        greeting: Greeting {
+            pod_name: "parent".into(),
+            cwd: "/tmp".into(),
+            provider: "test".into(),
+            model: "test".into(),
+            scope_summary: String::new(),
+            tools: Vec::new(),
+        },
+        status: PodStatus::Idle,
+    }
+}
+
+/// Accept a single connection, send the protocol's connect-time snapshot,
+/// read one `Method`, and return it.
 fn accept_one_method(listener: UnixListener) -> tokio::task::JoinHandle<Option<Method>> {
     tokio::spawn(async move {
         let (stream, _) = listener.accept().await.ok()?;
-        let (reader, _writer) = stream.into_split();
+        let (reader, writer) = stream.into_split();
+        let mut w = JsonLineWriter::new(writer);
+        w.write(&empty_snapshot()).await.ok()?;
         let mut r = JsonLineReader::new(reader);
         r.next::<Method>().await.ok().flatten()
     })

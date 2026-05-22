@@ -953,7 +953,7 @@ fn worker_error_code(e: &PodError) -> ErrorCode {
 mod tests {
     use super::*;
     use protocol::PodEvent;
-    use protocol::stream::JsonLineReader;
+    use protocol::stream::{JsonLineReader, JsonLineWriter};
     use std::time::Duration;
     use tempfile::TempDir;
     use tokio::net::UnixListener;
@@ -1031,7 +1031,24 @@ mod tests {
     async fn recv_pod_event(listener: UnixListener, timeout: Duration) -> Option<PodEvent> {
         let accept = async {
             let (stream, _) = listener.accept().await.ok()?;
-            let mut reader = JsonLineReader::new(stream);
+            let (r, w) = stream.into_split();
+            let mut writer = JsonLineWriter::new(w);
+            writer
+                .write(&Event::Snapshot {
+                    entries: Vec::new(),
+                    greeting: protocol::Greeting {
+                        pod_name: "parent".into(),
+                        cwd: "/tmp".into(),
+                        provider: "test".into(),
+                        model: "test".into(),
+                        scope_summary: String::new(),
+                        tools: Vec::new(),
+                    },
+                    status: PodStatus::Idle,
+                })
+                .await
+                .ok()?;
+            let mut reader = JsonLineReader::new(r);
             match reader.next::<Method>().await {
                 Ok(Some(Method::PodEvent(e))) => Some(e),
                 _ => None,
