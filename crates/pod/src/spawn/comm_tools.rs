@@ -321,19 +321,50 @@ fn unknown_pod_err(name: &str) -> ToolError {
     ToolError::InvalidArgument(format!("no spawned pod named `{name}`"))
 }
 
-/// Connect with a timeout, write one `Method` line, flush, and close.
-/// Any socket error maps to an `io::Error`; the caller decides whether
-/// to surface it to the LLM or treat it as "pod stopped".
+/// Connect with a timeout, drain the server's connect-time snapshot,
+/// write one `Method` line, flush, and close.
+///
+/// The Pod socket protocol sends replayed alerts and an initial
+/// `Event::Snapshot` before it starts reading client methods. Send-only
+/// callers must consume that prefix; otherwise a large snapshot can block
+/// the server's writer before it reaches the method-read branch. Any
+/// socket error maps to an `io::Error`; the caller decides whether to
+/// surface it to the LLM or treat it as "pod stopped".
 pub(crate) async fn connect_and_send(socket: &Path, method: &Method) -> std::io::Result<()> {
     let stream = tokio::time::timeout(SOCKET_OP_TIMEOUT, UnixStream::connect(socket))
         .await
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timed out"))??;
-    let (_r, w) = stream.into_split();
+    let (r, w) = stream.into_split();
+    let mut reader = JsonLineReader::new(r);
     let mut writer = JsonLineWriter::new(w);
+
+    drain_initial_snapshot(&mut reader).await?;
+
     tokio::time::timeout(SOCKET_OP_TIMEOUT, writer.write(method))
         .await
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "write timed out"))??;
     Ok(())
+}
+
+async fn drain_initial_snapshot<R>(reader: &mut JsonLineReader<R>) -> std::io::Result<()>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    loop {
+        let event = tokio::time::timeout(SOCKET_OP_TIMEOUT, reader.next::<Event>())
+            .await
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "read timed out"))??;
+        match event {
+            Some(Event::Snapshot { .. }) => return Ok(()),
+            Some(_) => continue,
+            None => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "pod closed connection before Snapshot event",
+                ));
+            }
+        }
+    }
 }
 
 /// Failure modes distinguished by `SendToPod`.
@@ -497,4 +528,94 @@ fn release_scope(pod_name: &str) {
         return;
     };
     let _ = pod_registry::release_pod(&mut guard, pod_name);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use protocol::{Alert, AlertLevel, AlertSource, Greeting, PodEvent, PodStatus};
+    use tempfile::TempDir;
+    use tokio::net::UnixListener;
+    use tokio::task::JoinHandle;
+
+    fn snapshot(entries: Vec<serde_json::Value>) -> Event {
+        Event::Snapshot {
+            entries,
+            greeting: Greeting {
+                pod_name: "server".into(),
+                cwd: "/tmp".into(),
+                provider: "test".into(),
+                model: "test".into(),
+                scope_summary: String::new(),
+                tools: Vec::new(),
+            },
+            status: PodStatus::Idle,
+        }
+    }
+
+    fn serve_initial_events_then_method(
+        listener: UnixListener,
+        events: Vec<Event>,
+    ) -> JoinHandle<Option<Method>> {
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.ok()?;
+            let (r, w) = stream.into_split();
+            let mut reader = JsonLineReader::new(r);
+            let mut writer = JsonLineWriter::new(w);
+            for event in events {
+                writer.write(&event).await.ok()?;
+            }
+            reader.next::<Method>().await.ok().flatten()
+        })
+    }
+
+    #[tokio::test]
+    async fn connect_and_send_drains_initial_alert_and_snapshot_before_method() {
+        let tmp = TempDir::new().unwrap();
+        let socket = tmp.path().join("pod.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let received = serve_initial_events_then_method(
+            listener,
+            vec![
+                Event::Alert(Alert {
+                    level: AlertLevel::Warn,
+                    source: AlertSource::Pod,
+                    message: "replayed alert".into(),
+                    timestamp_ms: 0,
+                }),
+                snapshot(Vec::new()),
+            ],
+        );
+
+        connect_and_send(&socket, &Method::Shutdown).await.unwrap();
+
+        let method = received.await.unwrap().expect("expected method");
+        assert!(matches!(method, Method::Shutdown));
+    }
+
+    #[tokio::test]
+    async fn connect_and_send_delivers_method_after_large_initial_snapshot() {
+        let tmp = TempDir::new().unwrap();
+        let socket = tmp.path().join("pod.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let large_payload = "x".repeat(2 * 1024 * 1024);
+        let received = serve_initial_events_then_method(
+            listener,
+            vec![snapshot(vec![
+                serde_json::json!({ "payload": large_payload }),
+            ])],
+        );
+        let expected = Method::PodEvent(PodEvent::TurnEnded {
+            pod_name: "child".into(),
+        });
+
+        connect_and_send(&socket, &expected).await.unwrap();
+
+        let method = received.await.unwrap().expect("expected method");
+        match method {
+            Method::PodEvent(PodEvent::TurnEnded { pod_name }) => assert_eq!(pod_name, "child"),
+            other => panic!("expected TurnEnded PodEvent, got {other:?}"),
+        }
+    }
 }
