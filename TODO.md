@@ -8,7 +8,6 @@
 - Pod: 任意ターンからの Fork（複数ターン巻き戻しを汎用化） → [tickets/pod-session-fork.md](tickets/pod-session-fork.md)
 - Pod: Inbound PodEvent ハンドリングの重複を統合 → [tickets/pod-inbound-pod-event-dedup.md](tickets/pod-inbound-pod-event-dedup.md)
 - Pod 単位永続化
-  - Pod state backend と FsStore 実装 → [tickets/pod-state-backend.md](tickets/pod-state-backend.md)
   - Pod lifecycle 各点での write 配線 → [tickets/pod-state-write-points.md](tickets/pod-state-write-points.md)
   - Pod 名単位の resume / attach 導線 → [tickets/pod-name-resume.md](tickets/pod-name-resume.md)
   - SpawnedPodRegistry の永続化と復元 → [tickets/spawned-registry-persist.md](tickets/spawned-registry-persist.md)
