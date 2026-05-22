@@ -33,6 +33,7 @@
 pub mod event_trace;
 pub mod fs_store;
 pub mod logged_item;
+pub mod pod_metadata;
 pub mod segment;
 pub mod segment_log;
 pub mod store;
@@ -43,6 +44,7 @@ pub use fs_store::FsStore;
 pub use llm_worker::UsageRecord;
 pub use llm_worker::llm_client::types::{ContentPart, Item, Role};
 pub use logged_item::{LoggedContentPart, LoggedItem, LoggedRole, from_logged, to_logged};
+pub use pod_metadata::{PodActiveSegmentRef, PodMetadata, PodMetadataStore};
 pub use segment::{
     SegmentStartState, append_entry, append_system_item, classify_history_item,
     create_compacted_segment, create_segment, create_segment_with_ids, ensure_head_or_fork, fork,
