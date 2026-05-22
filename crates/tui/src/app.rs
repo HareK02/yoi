@@ -57,6 +57,10 @@ pub struct App {
     /// cache reads excluded). Reset on `RunEnd`.
     pub run_upload_tokens: u64,
     pub run_output_tokens: u64,
+    /// Latest session context tokens reported by the Pod. This is the raw
+    /// `input_tokens` value and is independent from per-run upload totals.
+    pub session_context_tokens: u64,
+    pub context_window: u64,
     pub turn_index: usize,
     pub current_tool: Option<String>,
     pub input: InputBuffer,
@@ -100,6 +104,8 @@ impl App {
             run_requests: 0,
             run_upload_tokens: 0,
             run_output_tokens: 0,
+            session_context_tokens: 0,
+            context_window: 0,
             turn_index: 0,
             current_tool: None,
             input: InputBuffer::new(),
@@ -649,6 +655,7 @@ impl App {
                 output_tokens,
                 cache_read_input_tokens,
             } => {
+                self.session_context_tokens = input_tokens.unwrap_or(0);
                 // Subtract the cache-hit portion so a tool loop that
                 // re-sends the same prefix on every request doesn't
                 // re-count it. cache_creation stays in (it is full
@@ -684,6 +691,7 @@ impl App {
                 }));
             }
             Event::CompactDone { new_segment_id } => {
+                self.session_context_tokens = 0;
                 if let Some(evt) = self.last_streaming_compact_mut() {
                     let elapsed_secs = match evt {
                         CompactEvent::Streaming { started_at } => {
@@ -914,6 +922,8 @@ impl App {
     /// produced. Followed by `Event::Entry` updates for anything
     /// committed after the snapshot.
     fn restore_snapshot(&mut self, entries: &[serde_json::Value], greeting: protocol::Greeting) {
+        self.context_window = greeting.context_window;
+        self.session_context_tokens = greeting.context_tokens;
         self.turn_index = 0;
         self.blocks.clear();
         self.cache = FileCache::new();
@@ -1570,7 +1580,66 @@ mod completion_flow_tests {
             model: "test-model".into(),
             scope_summary: String::new(),
             tools: Vec::new(),
+            context_window: 200_000,
+            context_tokens: 0,
         }
+    }
+
+    #[test]
+    fn snapshot_initializes_context_usage() {
+        let mut app = App::new("test".into());
+        let mut greeting = test_greeting();
+        greeting.context_window = 123_000;
+        greeting.context_tokens = 45_000;
+
+        app.handle_pod_event(Event::Snapshot {
+            entries: Vec::new(),
+            greeting,
+            status: PodStatus::Idle,
+        });
+
+        assert_eq!(app.context_window, 123_000);
+        assert_eq!(app.session_context_tokens, 45_000);
+    }
+
+    #[test]
+    fn usage_updates_session_context_tokens_without_cache_discount() {
+        let mut app = App::new("test".into());
+
+        app.handle_pod_event(Event::Usage {
+            input_tokens: Some(42_000),
+            output_tokens: Some(9),
+            cache_read_input_tokens: Some(40_000),
+        });
+
+        assert_eq!(app.session_context_tokens, 42_000);
+        assert_eq!(app.run_upload_tokens, 2_000);
+        assert_eq!(app.run_output_tokens, 9);
+    }
+
+    #[test]
+    fn compact_done_resets_session_context_tokens() {
+        let mut app = App::new("test".into());
+        app.session_context_tokens = 42_000;
+
+        app.handle_pod_event(Event::CompactDone {
+            new_segment_id: uuid::Uuid::nil(),
+        });
+
+        assert_eq!(app.session_context_tokens, 0);
+    }
+
+    #[test]
+    fn turn_start_and_run_end_do_not_reset_session_context_tokens() {
+        let mut app = App::new("test".into());
+        app.session_context_tokens = 42_000;
+
+        app.handle_pod_event(Event::TurnStart { turn: 1 });
+        app.handle_pod_event(Event::RunEnd {
+            result: RunResult::Finished,
+        });
+
+        assert_eq!(app.session_context_tokens, 42_000);
     }
 
     #[test]

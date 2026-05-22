@@ -549,6 +549,8 @@ mod tests {
                 model: "test".into(),
                 scope_summary: String::new(),
                 tools: Vec::new(),
+                context_window: 200_000,
+                context_tokens: 0,
             },
             status: PodStatus::Idle,
         }

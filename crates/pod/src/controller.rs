@@ -896,6 +896,10 @@ where
     // `build_client` がここに到達する前に同じマニフェストで成功している
     // ため、カタログ解決も必ず通る。念のため失敗時は "unknown" に落とす。
     let resolved = provider::catalog::resolve_model_manifest(&manifest.model).ok();
+    let context_window = resolved
+        .as_ref()
+        .map(|cfg| cfg.context_window)
+        .unwrap_or(provider::catalog::DEFAULT_CONTEXT_WINDOW);
     let (provider_name, model_id) = match resolved {
         Some(cfg) => {
             let name = match cfg.scheme {
@@ -933,6 +937,8 @@ where
         model: model_id,
         scope_summary: pod.scope_snapshot().summary(),
         tools: tool_names,
+        context_window,
+        context_tokens: pod.total_tokens().tokens,
     }
 }
 
@@ -1004,6 +1010,8 @@ mod tests {
                 model: String::new(),
                 scope_summary: String::new(),
                 tools: Vec::new(),
+                context_window: 200_000,
+                context_tokens: 0,
             },
         ));
         let notify_buffer = NotifyBuffer::new();
@@ -1043,6 +1051,8 @@ mod tests {
                         model: "test".into(),
                         scope_summary: String::new(),
                         tools: Vec::new(),
+                        context_window: 200_000,
+                        context_tokens: 0,
                     },
                     status: PodStatus::Idle,
                 })

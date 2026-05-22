@@ -126,6 +126,8 @@ fn empty_snapshot() -> Event {
             model: "x".into(),
             scope_summary: String::new(),
             tools: Vec::new(),
+            context_window: 200_000,
+            context_tokens: 0,
         },
         status: protocol::PodStatus::Idle,
     }
@@ -198,6 +200,8 @@ fn serve_history(listener: UnixListener, items: Vec<Item>) -> JoinHandle<()> {
                     model: "x".into(),
                     scope_summary: String::new(),
                     tools: Vec::new(),
+                    context_window: 200_000,
+                    context_tokens: 0,
                 },
                 status: protocol::PodStatus::Idle,
             };
