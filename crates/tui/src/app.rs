@@ -758,6 +758,9 @@ impl App {
                     state.selected = 0;
                 }
             }
+            Event::VisiblePods { .. }
+            | Event::PodInspection { .. }
+            | Event::PodAttachRestore { .. } => {}
             Event::Shutdown => {
                 self.mark_orphan_compacts_incomplete();
                 self.quit = true;

@@ -129,7 +129,11 @@ impl SpawnedPodRegistry {
 
         runtime_dir.write_spawned_pods(&records).await?;
         let state_writer = pod_state_writer(store, pod_name.clone());
-        if pruned || metadata.is_some() {
+        // Runtime spawned-pod records are a live registry for ListPods and
+        // cursor/scope cleanup; durable Pod state remains the discovery source
+        // for later attach/restore, so do not delete unreachable children from
+        // Pod state just because their sockets are gone.
+        if metadata.is_none() || !pruned {
             state_writer(&records)?;
         }
 

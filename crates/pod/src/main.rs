@@ -53,6 +53,11 @@ struct Cli {
     #[arg(long, value_name = "NAME", conflicts_with_all = ["session", "adopt"])]
     pod: Option<String>,
 
+    /// Require `--pod` to restore existing Pod state instead of creating a
+    /// fresh Pod when no state exists. Used by Pod discovery restore flows.
+    #[arg(long, requires = "pod")]
+    require_pod_state: bool,
+
     /// Restore a Pod from an existing session. The Pod re-uses the
     /// given session id and appends new turns to the same jsonl;
     /// concurrent writers are prevented by the pod-registry.
@@ -268,6 +273,10 @@ async fn main() -> ExitCode {
                         return ExitCode::FAILURE;
                     }
                 }
+            }
+            Ok(None) if cli.require_pod_state => {
+                eprintln!("error: pod state missing for {pod_name}");
+                return ExitCode::FAILURE;
             }
             Ok(None) => match Pod::from_manifest(manifest, store, loader).await {
                 Ok(p) => p,

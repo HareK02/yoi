@@ -6,6 +6,9 @@ use llm_worker::llm_client::client::LlmClient;
 use session_store::{PodMetadataStore, Store};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
+use crate::discovery::{
+    PodDiscovery, attach_or_restore_pod_tool, inspect_pod_tool, list_visible_pods_tool,
+};
 use crate::ipc::alerter::Alerter;
 use crate::ipc::notify_buffer::NotifyBuffer;
 use crate::ipc::server::SocketServer;
@@ -78,7 +81,7 @@ async fn finish_controller_run<C, St>(
     new_status: PodStatus,
 ) where
     C: LlmClient + Clone + 'static,
-    St: Store + Clone + 'static,
+    St: Store + PodMetadataStore + Clone + 'static,
 {
     // history / user_segments are no longer mirrored on PodSharedState —
     // clients reconstruct them from `Event::Snapshot` + live
@@ -298,7 +301,7 @@ fn wire_event_bridges_on_worker<C, St>(
     alerter: &Alerter,
 ) where
     C: LlmClient + Clone + 'static,
-    St: Store + Clone + 'static,
+    St: Store + PodMetadataStore + Clone + 'static,
 {
     let worker = pod.worker_mut();
 
@@ -436,7 +439,7 @@ fn register_pod_tools<C, St>(
 ) -> tools::ScopedFs
 where
     C: LlmClient + Clone + 'static,
-    St: Store + Clone + 'static,
+    St: Store + PodMetadataStore + Clone + 'static,
 {
     // Pod-immutable snapshots taken before the mutable worker borrow
     // below so the worker borrow doesn't conflict with reads on `pod`.
@@ -448,6 +451,7 @@ where
     let memory_config = pod.manifest().memory.clone();
     let spawner_name = pod.manifest().pod.name.clone();
     let spawner_model = pod.manifest().model.clone();
+    let pod_store = pod.store().clone();
     let self_parent_socket = pod.callback_socket().cloned();
 
     let worker = pod.worker_mut();
@@ -492,10 +496,10 @@ where
     // the Pod-scoped `SpawnedPodRegistry` (also consumed by the main
     // loop's `PodEvent` handler).
     worker.register_tool(spawn_pod_tool(
-        spawner_name,
+        spawner_name.clone(),
         spawner_socket,
-        runtime_base,
-        pwd,
+        runtime_base.clone(),
+        pwd.clone(),
         spawned_registry.clone(),
         self_parent_socket,
         spawner_model,
@@ -505,7 +509,12 @@ where
     worker.register_tool(send_to_pod_tool(spawned_registry.clone()));
     worker.register_tool(read_pod_output_tool(spawned_registry.clone()));
     worker.register_tool(stop_pod_tool(spawned_registry.clone()));
-    worker.register_tool(list_pods_tool(spawned_registry));
+    worker.register_tool(list_pods_tool(spawned_registry.clone()));
+
+    let discovery = PodDiscovery::new(pod_store, spawner_name, runtime_base, pwd, spawned_registry);
+    worker.register_tool(list_visible_pods_tool(discovery.clone()));
+    worker.register_tool(inspect_pod_tool(discovery.clone()));
+    worker.register_tool(attach_or_restore_pod_tool(discovery));
     pod.attach_tracker(tracker);
     fs_for_view
 }
@@ -532,11 +541,23 @@ async fn controller_loop<C, St>(
     socket_server: SocketServer,
 ) where
     C: LlmClient + Clone + 'static,
-    St: Store + Clone + 'static,
+    St: Store + PodMetadataStore + Clone + 'static,
 {
     // Hold socket server alive for the lifetime of the controller task.
     let _socket_server = socket_server;
 
+    let discovery_runtime_base = runtime_dir
+        .path()
+        .parent()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| runtime_dir.path().to_path_buf());
+    let discovery = PodDiscovery::new(
+        pod.store().clone(),
+        spawner_name.clone(),
+        discovery_runtime_base,
+        pod.pwd().to_path_buf(),
+        spawned_registry.clone(),
+    );
     let mut pending: Option<PendingRun> = None;
 
     loop {
@@ -690,6 +711,66 @@ async fn controller_loop<C, St>(
                 let _ = event_tx.send(Event::Shutdown);
                 break;
             }
+
+            Method::ListVisiblePods => match discovery.list_visible().await {
+                Ok(pods) => match serde_json::to_value(pods) {
+                    Ok(pods) => {
+                        let _ = event_tx.send(Event::VisiblePods { pods });
+                    }
+                    Err(error) => {
+                        let _ = event_tx.send(Event::Error {
+                            code: ErrorCode::Internal,
+                            message: format!("serialize visible pods: {error}"),
+                        });
+                    }
+                },
+                Err(error) => {
+                    let _ = event_tx.send(Event::Error {
+                        code: ErrorCode::InvalidRequest,
+                        message: error.to_string(),
+                    });
+                }
+            },
+
+            Method::InspectPod { name } => match discovery.inspect(&name).await {
+                Ok(pod) => match serde_json::to_value(pod) {
+                    Ok(pod) => {
+                        let _ = event_tx.send(Event::PodInspection { pod });
+                    }
+                    Err(error) => {
+                        let _ = event_tx.send(Event::Error {
+                            code: ErrorCode::Internal,
+                            message: format!("serialize pod inspection: {error}"),
+                        });
+                    }
+                },
+                Err(error) => {
+                    let _ = event_tx.send(Event::Error {
+                        code: ErrorCode::InvalidRequest,
+                        message: error.to_string(),
+                    });
+                }
+            },
+
+            Method::AttachOrRestorePod { name } => match discovery.attach_or_restore(&name).await {
+                Ok(result) => match serde_json::to_value(result) {
+                    Ok(result) => {
+                        let _ = event_tx.send(Event::PodAttachRestore { result });
+                    }
+                    Err(error) => {
+                        let _ = event_tx.send(Event::Error {
+                            code: ErrorCode::Internal,
+                            message: format!("serialize pod attach/restore result: {error}"),
+                        });
+                    }
+                },
+                Err(error) => {
+                    let _ = event_tx.send(Event::Error {
+                        code: ErrorCode::InvalidRequest,
+                        message: error.to_string(),
+                    });
+                }
+            },
 
             // ListCompletions is handled at the socket layer (direct
             // response). If it reaches the controller, ignore it.
@@ -865,6 +946,17 @@ where
                         notify_buffer.push_notify(message);
                     }
                     Some(Method::ListCompletions { .. }) => {}
+                    Some(
+                        Method::ListVisiblePods
+                        | Method::InspectPod { .. }
+                        | Method::AttachOrRestorePod { .. },
+                    ) => {
+                        let _ = event_tx.send(Event::Error {
+                            code: ErrorCode::AlreadyRunning,
+                            message: "Pod discovery requests are only handled while the Pod is idle or paused"
+                                .into(),
+                        });
+                    }
                     Some(Method::PodEvent(event)) => {
                         // mpsc is consume-once, so we cannot defer this
                         // to the next main-loop iteration — drop here

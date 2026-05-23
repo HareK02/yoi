@@ -92,6 +92,16 @@ pub trait PodMetadataStore: Send + Sync {
     /// Read metadata by Pod name. Returns `None` when no metadata exists.
     fn read_by_name(&self, pod_name: &str) -> Result<Option<PodMetadata>, StoreError>;
 
+    /// List persisted Pod metadata keys. Implementations return names only;
+    /// callers can then read each item independently so a corrupt metadata
+    /// file does not make the whole discovery result fail.
+    fn list_names(&self) -> Result<Vec<String>, StoreError>;
+
+    /// Return the metadata root directory when this backend is path-backed.
+    fn root_dir(&self) -> Option<PathBuf> {
+        None
+    }
+
     /// Delete metadata by Pod name. Missing metadata is a successful no-op.
     fn delete_by_name(&self, pod_name: &str) -> Result<(), StoreError>;
 }
