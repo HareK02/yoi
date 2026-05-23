@@ -4,7 +4,6 @@
   - AI maintainer 用 WorkItem / Thread 抽象 → [tickets/maintainer-work-items.md](tickets/maintainer-work-items.md)
   - Prompt / Workflow 評価メトリクスと改善 Offer → [tickets/prompt-eval-metrics.md](tickets/prompt-eval-metrics.md)
 - Permission: allow-all 既定 policy への整理 → [tickets/permission-default-policy.md](tickets/permission-default-policy.md)
-- Pod: 空応答ターン (Submit 後 AI 応答ゼロで Pause/Cancel) を自動巻き戻し → [tickets/pod-empty-turn-rollback.md](tickets/pod-empty-turn-rollback.md)
 - Pod: 任意ターンからの Fork（複数ターン巻き戻しを汎用化） → [tickets/pod-session-fork.md](tickets/pod-session-fork.md)
 - Pod: Inbound PodEvent ハンドリングの重複を統合 → [tickets/pod-inbound-pod-event-dedup.md](tickets/pod-inbound-pod-event-dedup.md)
 - llm-worker のエラー耐性
