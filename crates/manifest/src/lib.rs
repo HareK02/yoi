@@ -114,11 +114,6 @@ pub struct MemoryConfig {
     /// the auto-extract trigger is dormant.
     #[serde(default)]
     pub extract_threshold: Option<u64>,
-    /// Current prompt-occupancy cap for the extract worker's own LLM
-    /// requests. Exceeding this aborts the extract run. `None` ⇒
-    /// [`defaults::MEMORY_EXTRACT_WORKER_MAX_INPUT_TOKENS`].
-    #[serde(default)]
-    pub extract_worker_max_input_tokens: Option<u64>,
     /// Optional maximum extract-worker tool-loop depth. `None` leaves
     /// the worker unlimited; the default bounds runaway short-context
     /// loops. Falls through to

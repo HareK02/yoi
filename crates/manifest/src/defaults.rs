@@ -59,11 +59,6 @@ pub const COMPACT_WORKER_MAX_TURNS: Option<u32> = Some(20);
 /// default references.
 pub const COMPACT_DEFAULT_REFERENCE_COUNT: usize = 5;
 
-/// Current prompt-occupancy cap for the memory extract worker's own
-/// LLM requests. Exceeding this aborts the extract run (circuit-breaker
-/// path). See [`crate::MemoryConfig::extract_worker_max_input_tokens`].
-pub const MEMORY_EXTRACT_WORKER_MAX_INPUT_TOKENS: u64 = 30_000;
-
 /// Optional maximum extract-worker tool-loop depth. `None` means unlimited.
 /// See [`crate::MemoryConfig::extract_worker_max_turns`].
 pub const MEMORY_EXTRACT_WORKER_MAX_TURNS: Option<u32> = Some(8);

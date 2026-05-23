@@ -156,6 +156,15 @@ pub(crate) fn reject_removed_manifest_fields(s: &str) -> Result<(), toml::de::Er
              (removed; use compaction.prune_protected_tokens)",
         ));
     }
+    if value
+        .get("memory")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|table| table.contains_key("extract_worker_max_input_tokens"))
+    {
+        return Err(toml::de::Error::custom(
+            "unknown field in manifest: memory.extract_worker_max_input_tokens (removed)",
+        ));
+    }
     Ok(())
 }
 
@@ -283,9 +292,6 @@ impl MemoryConfig {
             language: upper.language.or(self.language),
             extract_model: upper.extract_model.or(self.extract_model),
             extract_threshold: upper.extract_threshold.or(self.extract_threshold),
-            extract_worker_max_input_tokens: upper
-                .extract_worker_max_input_tokens
-                .or(self.extract_worker_max_input_tokens),
             extract_worker_max_turns: upper
                 .extract_worker_max_turns
                 .or(self.extract_worker_max_turns),
@@ -1002,6 +1008,32 @@ prune_protected_turns = 3
             err.to_string().contains("compaction.prune_protected_turns"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn from_toml_rejects_removed_extract_worker_max_input_tokens_field() {
+        let bad = r#"
+[memory]
+extract_worker_max_input_tokens = 30000
+"#;
+        let err = PodManifestConfig::from_toml(bad).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("memory.extract_worker_max_input_tokens"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn from_toml_accepts_extract_worker_max_turns() {
+        let cfg = PodManifestConfig::from_toml(
+            r#"
+[memory]
+extract_worker_max_turns = 2
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.memory.unwrap().extract_worker_max_turns, Some(2));
     }
 
     #[test]
