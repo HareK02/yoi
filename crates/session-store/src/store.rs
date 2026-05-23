@@ -82,6 +82,33 @@ pub trait Store: Send + Sync {
     /// Check if a segment exists.
     fn exists(&self, session_id: SessionId, segment_id: SegmentId) -> Result<bool, StoreError>;
 
+    /// Truncate a segment log to `entries_len` entries.
+    ///
+    /// Used by Pod's submit-time empty-turn rollback after it has proven
+    /// that no LLM output from the accepted turn was materialized. The
+    /// default implementation rewrites the retained prefix through
+    /// `create_segment`, matching the append-only logical model while still
+    /// allowing concrete stores to provide a more direct truncate.
+    fn truncate(
+        &self,
+        session_id: SessionId,
+        segment_id: SegmentId,
+        entries_len: usize,
+    ) -> Result<(), StoreError> {
+        let mut entries = self.read_all(session_id, segment_id)?;
+        if entries_len > entries.len() {
+            return Err(StoreError::Corrupt {
+                line: entries_len,
+                message: format!(
+                    "cannot truncate segment {segment_id} to {entries_len} entries; only {} entries stored",
+                    entries.len()
+                ),
+            });
+        }
+        entries.truncate(entries_len);
+        self.create_segment(session_id, segment_id, &entries)
+    }
+
     /// Count entries currently stored for a segment.
     ///
     /// Used by `ensure_head_or_fork` to detect concurrent writers:

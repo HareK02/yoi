@@ -677,7 +677,9 @@ impl App {
                 });
                 self.set_pod_status(match result {
                     RunResult::Paused => PodStatus::Paused,
-                    RunResult::Finished | RunResult::LimitReached => PodStatus::Idle,
+                    RunResult::Finished | RunResult::LimitReached | RunResult::RolledBack => {
+                        PodStatus::Idle
+                    }
                 });
                 self.run_requests = 0;
                 self.run_upload_tokens = 0;

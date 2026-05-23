@@ -6,6 +6,7 @@ use arc_swap::ArcSwap;
 use llm_worker::Item;
 use llm_worker::llm_client::RequestConfig;
 use llm_worker::llm_client::client::LlmClient;
+use llm_worker::llm_client::types::Role;
 use llm_worker::state::Mutable;
 use llm_worker::{ToolOutputLimits, UsageRecord, Worker, WorkerError, WorkerResult};
 use session_store::{
@@ -118,6 +119,24 @@ impl SegmentState {
 
     fn increment_entries(&self) {
         self.entries_written.fetch_add(1, Ordering::Release);
+    }
+}
+
+struct EmptyTurnRollbackSnapshot {
+    history_len: usize,
+    user_segments_len: usize,
+    entries_written: usize,
+    sink_len: usize,
+    pending_attachments: Vec<SystemItem>,
+    usage_history_len: usize,
+    ai_activity_count: usize,
+    last_run_interrupted: bool,
+}
+
+fn is_ai_materialized_item(item: &Item) -> bool {
+    match item {
+        Item::Message { role, .. } => *role == Role::Assistant,
+        Item::ToolCall { .. } | Item::ToolResult { .. } | Item::Reasoning { .. } => true,
     }
 }
 
@@ -254,6 +273,12 @@ pub struct Pod<C: LlmClient, St: Store> {
     /// notifications, events sent here are NOT replayed to clients that
     /// connect after the fact — they are fire-and-forget broadcasts.
     event_tx: Option<broadcast::Sender<Event>>,
+    /// Monotonic counter incremented by worker event bridges when an
+    /// assistant-side execution artifact becomes visible to clients before
+    /// it is necessarily committed to history (e.g. streaming text deltas).
+    /// `Pod::run` uses it to avoid rolling back a turn after the UI has
+    /// already observed AI output.
+    ai_activity_counter: Arc<AtomicUsize>,
     /// Queue of pending `Method::Notify` notifications awaiting
     /// injection into the next LLM request. Shared with the
     /// PodInterceptor installed in `ensure_interceptor_installed`.
@@ -392,6 +417,7 @@ impl<C: LlmClient + Clone + 'static, St: Store + Clone + 'static> Pod<C, St> {
             system_prompt_template: None,
             alerter: self.alerter.clone(),
             event_tx: self.event_tx.clone(),
+            ai_activity_counter: self.ai_activity_counter.clone(),
             pending_notifies: NotifyBuffer::new(),
             pending_attachments: Arc::new(Mutex::new(Vec::<SystemItem>::new())),
             scope_allocation: None,
@@ -534,6 +560,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             system_prompt_template: None,
             alerter: None,
             event_tx: None,
+            ai_activity_counter: Arc::new(AtomicUsize::new(0)),
             pending_notifies: NotifyBuffer::new(),
             pending_attachments: Arc::new(Mutex::new(Vec::<SystemItem>::new())),
             scope_allocation: None,
@@ -901,6 +928,12 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         self.event_tx = Some(event_tx);
     }
 
+    /// Shared activity counter incremented by worker event bridges when any
+    /// assistant-side output is surfaced before history persistence.
+    pub fn ai_activity_counter(&self) -> Arc<AtomicUsize> {
+        self.ai_activity_counter.clone()
+    }
+
     fn alert(&self, level: AlertLevel, source: AlertSource, message: String) {
         if let Some(n) = self.alerter.as_ref() {
             n.alert(level, source, message);
@@ -1236,6 +1269,75 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         Ok(())
     }
 
+    fn capture_empty_turn_rollback_snapshot(&self) -> EmptyTurnRollbackSnapshot {
+        let pending_attachments = self
+            .pending_attachments
+            .lock()
+            .expect("pending_attachments poisoned")
+            .clone();
+        let usage_history_len = self
+            .usage_history
+            .lock()
+            .expect("usage_history poisoned")
+            .len();
+        EmptyTurnRollbackSnapshot {
+            history_len: self.worker().history().len(),
+            user_segments_len: self.user_segments.len(),
+            entries_written: self.segment_state.entries_written(),
+            sink_len: self.sink.len(),
+            pending_attachments,
+            usage_history_len,
+            ai_activity_count: self.ai_activity_counter.load(Ordering::SeqCst),
+            last_run_interrupted: self.worker().last_run_interrupted(),
+        }
+    }
+
+    fn should_rollback_empty_turn(
+        &self,
+        result: &Result<WorkerResult, WorkerError>,
+        snapshot: &EmptyTurnRollbackSnapshot,
+    ) -> bool {
+        if !matches!(result, Err(WorkerError::Cancelled)) {
+            return false;
+        }
+        if self.ai_activity_counter.load(Ordering::SeqCst) != snapshot.ai_activity_count {
+            return false;
+        }
+        !self.worker().history()[snapshot.history_len..]
+            .iter()
+            .any(is_ai_materialized_item)
+    }
+
+    fn rollback_empty_turn(
+        &mut self,
+        snapshot: EmptyTurnRollbackSnapshot,
+    ) -> Result<(), StoreError> {
+        self.worker_mut()
+            .history_mut()
+            .truncate(snapshot.history_len);
+        self.worker_mut()
+            .set_last_run_interrupted(snapshot.last_run_interrupted);
+        self.user_segments.truncate(snapshot.user_segments_len);
+        *self
+            .pending_attachments
+            .lock()
+            .expect("pending_attachments poisoned") = snapshot.pending_attachments;
+        self.usage_history
+            .lock()
+            .expect("usage_history poisoned")
+            .truncate(snapshot.usage_history_len);
+        let _ = self.usage_tracker.drain();
+        let _ = self.metrics_tracker.drain();
+
+        let loc = self.segment_state.location();
+        self.store
+            .truncate(loc.session_id, loc.segment_id, snapshot.entries_written)?;
+        self.segment_state
+            .set_entries_written(snapshot.entries_written);
+        self.sink.truncate_silent(snapshot.sink_len);
+        Ok(())
+    }
+
     /// Send user input and run until the LLM turn completes.
     ///
     /// `input` is a typed segment list (see [`protocol::Segment`]). The
@@ -1269,6 +1371,8 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         }
 
         self.prepare_for_run().await?;
+
+        let rollback_snapshot = self.capture_empty_turn_rollback_snapshot();
 
         // IDLE → active marker. Commits first so the next UserInput entry
         // is contained inside this Invoke range. See `tickets/invoke-turn-llmcall-semantics.md`.
@@ -1310,6 +1414,11 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         let mut locked = worker.lock();
         let result = locked.run(flattened).await;
         self.worker = Some(locked.unlock());
+
+        if self.should_rollback_empty_turn(&result, &rollback_snapshot) {
+            self.rollback_empty_turn(rollback_snapshot)?;
+            return Ok(PodRunResult::RolledBack);
+        }
 
         self.handle_worker_result(result, history_before).await
     }
@@ -2847,6 +2956,7 @@ where
             system_prompt_template: common.system_prompt_template,
             alerter: None,
             event_tx: None,
+            ai_activity_counter: Arc::new(AtomicUsize::new(0)),
             pending_notifies: NotifyBuffer::new(),
             pending_attachments: Arc::new(Mutex::new(Vec::<SystemItem>::new())),
             scope_allocation: Some(scope_allocation),
@@ -2923,6 +3033,7 @@ where
             system_prompt_template: common.system_prompt_template,
             alerter: None,
             event_tx: None,
+            ai_activity_counter: Arc::new(AtomicUsize::new(0)),
             pending_notifies: NotifyBuffer::new(),
             pending_attachments: Arc::new(Mutex::new(Vec::<SystemItem>::new())),
             scope_allocation: Some(scope_allocation),
@@ -3098,6 +3209,7 @@ where
             system_prompt_template: None,
             alerter: None,
             event_tx: None,
+            ai_activity_counter: Arc::new(AtomicUsize::new(0)),
             pending_notifies: NotifyBuffer::new(),
             pending_attachments: Arc::new(Mutex::new(Vec::<SystemItem>::new())),
             scope_allocation: Some(scope_allocation),
@@ -3184,6 +3296,8 @@ pub enum PodRunResult {
     Paused,
     /// The worker reached its configured max_turns limit.
     LimitReached,
+    /// The submit-time user turn was rolled back because no AI output was materialized.
+    RolledBack,
 }
 
 impl From<WorkerResult> for PodRunResult {
