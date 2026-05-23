@@ -17,7 +17,6 @@
   - Run 中の入力キューイング → [tickets/tui-input-queue.md](tickets/tui-input-queue.md)
   - ユーザーマニフェストのモデル設定 wizard → [tickets/tui-user-model-setup.md](tickets/tui-user-model-setup.md)
   - spawn 失敗時に Pod の stderr が TUI に表示されない → [tickets/tui-spawn-error-surface.md](tickets/tui-spawn-error-surface.md)
-  - 巻き戻されたターンの入力テキストを編集領域に復元 → [tickets/tui-empty-turn-restore.md](tickets/tui-empty-turn-restore.md)
 - メモリ機構
   - extract / consolidation 監査ログ → [tickets/memory-audit-log.md](tickets/memory-audit-log.md)
 - セッション内 Task ツールの注意機構（無アクティビティで `<system-reminder>` ナッジ） → [tickets/session-todo-reminder.md](tickets/session-todo-reminder.md)
