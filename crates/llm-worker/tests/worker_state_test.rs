@@ -5,8 +5,8 @@
 
 mod common;
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use common::MockLlmClient;
@@ -44,14 +44,12 @@ fn test_mutable_history_manipulation() {
     assert!(worker.history().is_empty());
 
     // Add to history
-    worker.push_item(Item::user_message("Hello"));
-    worker.push_item(Item::assistant_message("Hi there!"));
+    worker.append_history(vec![Item::user_message("Hello")]);
+    worker.append_history(vec![Item::assistant_message("Hi there!")]);
     assert_eq!(worker.history().len(), 2);
 
-    // Mutable access to history
-    worker
-        .history_mut()
-        .push(Item::user_message("How are you?"));
+    // Append to history via the callback-aware API.
+    worker.append_history(vec![Item::user_message("How are you?")]);
     assert_eq!(worker.history().len(), 3);
 
     // Clear history
@@ -71,34 +69,38 @@ fn test_mutable_history_manipulation() {
 #[test]
 fn test_mutable_builder_pattern() {
     let client = MockLlmClient::new(vec![]);
-    let worker = Worker::new(client)
-        .system_prompt("System prompt")
-        .with_item(Item::user_message("Hello"))
-        .with_item(Item::assistant_message("Hi!"))
-        .with_items(vec![
-            Item::user_message("How are you?"),
-            Item::assistant_message("I'm fine!"),
-        ]);
+    let worker = Worker::new(client).system_prompt("System prompt");
 
     assert_eq!(worker.get_system_prompt(), Some("System prompt"));
-    assert_eq!(worker.history().len(), 4);
+    assert!(worker.history().is_empty());
 }
 
-/// Verify that multiple items can be added with extend_history
+/// Verify that multiple items can be added with append_history and callbacks fire.
 #[test]
-fn test_mutable_extend_history() {
+fn test_mutable_append_history() {
     let client = MockLlmClient::new(vec![]);
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let observed_for_callback = Arc::clone(&observed);
     let mut worker = Worker::new(client);
+    worker.on_history_append(move |item| {
+        if let Some(text) = item.as_text() {
+            observed_for_callback.lock().unwrap().push(text.to_string());
+        }
+    });
 
-    worker.push_item(Item::user_message("First"));
+    worker.append_history(vec![Item::user_message("First")]);
 
-    worker.extend_history(vec![
+    worker.append_history(vec![
         Item::assistant_message("Response 1"),
         Item::user_message("Second"),
         Item::assistant_message("Response 2"),
     ]);
 
     assert_eq!(worker.history().len(), 4);
+    assert_eq!(
+        observed.lock().unwrap().as_slice(),
+        ["First", "Response 1", "Second", "Response 2"]
+    );
 }
 
 #[derive(Clone)]
@@ -162,8 +164,8 @@ fn test_lock_transition() {
     let mut worker = Worker::new(client);
 
     worker.set_system_prompt("System");
-    worker.push_item(Item::user_message("Hello"));
-    worker.push_item(Item::assistant_message("Hi"));
+    worker.append_history(vec![Item::user_message("Hello")]);
+    worker.append_history(vec![Item::assistant_message("Hi")]);
 
     // Lock
     let locked_worker = worker.lock();
@@ -180,14 +182,14 @@ fn test_unlock_transition() {
     let client = MockLlmClient::new(vec![]);
     let mut worker = Worker::new(client);
 
-    worker.push_item(Item::user_message("Hello"));
+    worker.append_history(vec![Item::user_message("Hello")]);
     let locked_worker = worker.lock();
 
     // Unlock
     let mut worker = locked_worker.unlock();
 
     // History operations are available again in Mutable state
-    worker.push_item(Item::assistant_message("Hi"));
+    worker.append_history(vec![Item::assistant_message("Hi")]);
     worker.clear_history();
     assert!(worker.history().is_empty());
 }
@@ -310,8 +312,8 @@ async fn test_locked_prefix_len_tracking() {
     let mut worker = Worker::new(client);
 
     // Add items beforehand
-    worker.push_item(Item::user_message("Pre-existing message 1"));
-    worker.push_item(Item::assistant_message("Pre-existing response 1"));
+    worker.append_history(vec![Item::user_message("Pre-existing message 1")]);
+    worker.append_history(vec![Item::assistant_message("Pre-existing response 1")]);
 
     assert_eq!(worker.history().len(), 2);
 
@@ -380,9 +382,11 @@ async fn test_unlock_edit_relock() {
         }),
     ]]);
 
-    let worker = Worker::new(client)
-        .with_item(Item::user_message("Hello"))
-        .with_item(Item::assistant_message("Hi"));
+    let mut worker = Worker::new(client);
+    worker.append_history(vec![
+        Item::user_message("Hello"),
+        Item::assistant_message("Hi"),
+    ]);
 
     // Lock -> Unlock
     let locked = worker.lock();
@@ -392,7 +396,7 @@ async fn test_unlock_edit_relock() {
 
     // Edit history
     unlocked.clear_history();
-    unlocked.push_item(Item::user_message("Fresh start"));
+    unlocked.append_history(vec![Item::user_message("Fresh start")]);
 
     // Re-lock
     let relocked = unlocked.lock();

@@ -470,9 +470,10 @@ impl<C: LlmClient + Clone + 'static, St: Store + Clone + 'static> Pod<C, St> {
     ///
     /// `user_message` items are skipped because they are committed
     /// up-front via `commit_entry(LogEntry::UserInput { segments })`.
-    /// `role:system` items are committed by `PodInterceptor` as typed
-    /// `LogEntry::SystemItem` entries before they reach the worker's
-    /// history (so this callback would otherwise double-write them).
+    /// `role:system` items are committed as typed `LogEntry::SystemItem`
+    /// entries by their producers (for example `PodInterceptor` and
+    /// interrupted-turn prep) before they reach the worker's history, so this
+    /// callback would otherwise double-write them.
     pub fn wire_history_persistence(&mut self) {
         let writer = self.log_writer_handle();
         self.worker_mut().on_history_append(move |item| {
@@ -1312,9 +1313,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         &mut self,
         snapshot: EmptyTurnRollbackSnapshot,
     ) -> Result<(), StoreError> {
-        self.worker_mut()
-            .history_mut()
-            .truncate(snapshot.history_len);
+        self.worker_mut().truncate_history(snapshot.history_len);
         self.worker_mut()
             .set_last_run_interrupted(snapshot.last_run_interrupted);
         self.user_segments.truncate(snapshot.user_segments_len);
@@ -1661,10 +1660,18 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             &tool_result_summary,
         );
         if !closures.is_empty() {
-            self.worker_mut().extend_history(closures);
+            self.worker_mut().append_history(closures);
         }
+        self.commit_entry(LogEntry::SystemItem {
+            ts: segment_log::now_millis(),
+            item: SystemItem::Interrupt {
+                body: system_note.clone(),
+            },
+        })?;
         self.worker_mut()
-            .push_item(llm_worker::Item::system_message(system_note));
+            .append_history(std::iter::once(llm_worker::Item::system_message(
+                system_note,
+            )));
         Ok(())
     }
 
@@ -3746,6 +3753,102 @@ mod build_summary_prompt_tests {
         ];
         let prompt = build_summary_prompt(&items);
         assert_eq!(prompt, "[User] fix the bug\n\n[Assistant] done");
+    }
+
+    #[derive(Clone)]
+    struct NoopClient;
+
+    #[async_trait]
+    impl LlmClient for NoopClient {
+        async fn stream(
+            &self,
+            _request: llm_worker::llm_client::Request,
+        ) -> Result<
+            std::pin::Pin<
+                Box<
+                    dyn futures::Stream<
+                            Item = Result<
+                                llm_worker::llm_client::event::Event,
+                                llm_worker::llm_client::ClientError,
+                            >,
+                        > + Send,
+                >,
+            >,
+            llm_worker::llm_client::ClientError,
+        > {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+
+        fn clone_boxed(&self) -> Box<dyn LlmClient> {
+            Box::new(self.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_interrupt_prep_appends_via_callback_and_logs_independent_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = minimal_manifest_with_skills(vec![]);
+        let store = session_store::FsStore::new(dir.path().join("sessions")).unwrap();
+        let pwd = dir.path().join("workspace");
+        std::fs::create_dir_all(&pwd).unwrap();
+        let scope = Scope::writable(&pwd).unwrap();
+        let mut pod = Pod::new(manifest, Worker::new(NoopClient), store, pwd, scope)
+            .await
+            .unwrap();
+
+        pod.ensure_segment_head().unwrap();
+        pod.wire_history_persistence();
+        pod.worker_mut()
+            .set_history(vec![Item::tool_call("call-1", "Read", "{}")]);
+
+        pod.apply_interrupt_prep().unwrap();
+
+        let history = pod.worker().history();
+        assert_eq!(history.len(), 3);
+        assert!(matches!(history[1], Item::ToolResult { ref call_id, .. } if call_id == "call-1"));
+        assert!(matches!(
+            history[2],
+            Item::Message {
+                role: Role::System,
+                ..
+            }
+        ));
+
+        let interrupt_note = history[2].as_text().unwrap().to_string();
+        let entries = pod
+            .store
+            .read_all(
+                pod.segment_state.session_id(),
+                pod.segment_state.segment_id(),
+            )
+            .unwrap();
+        let tool_result_count = entries
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry,
+                    LogEntry::ToolResult {
+                        item: session_store::LoggedItem::ToolResult { call_id, .. },
+                        ..
+                    } if call_id == "call-1"
+                )
+            })
+            .count();
+        let interrupt_system_count = entries
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry,
+                    LogEntry::SystemItem {
+                        item: SystemItem::Interrupt { body },
+                        ..
+                    } if body == &interrupt_note
+                )
+            })
+            .count();
+
+        assert_eq!(tool_result_count, 1);
+        assert_eq!(interrupt_system_count, 1);
     }
 
     fn minimal_manifest_with_skills(dirs: Vec<PathBuf>) -> PodManifest {

@@ -67,6 +67,11 @@ pub enum SystemItem {
     /// `/<slug>` Workflow invocation. `body` is the workflow's
     /// prompt body materialized into the LLM context.
     Workflow { slug: String, body: String },
+
+    /// Synthetic note inserted after an interrupted turn before the next
+    /// user input. `body` is the exact LLM-context text explaining that the
+    /// previous turn was cut short.
+    Interrupt { body: String },
 }
 
 impl SystemItem {
@@ -79,6 +84,7 @@ impl SystemItem {
             SystemItem::FileAttachment { body, .. } => body.clone(),
             SystemItem::Knowledge { body, .. } => body.clone(),
             SystemItem::Workflow { body, .. } => body.clone(),
+            SystemItem::Interrupt { body } => body.clone(),
         }
     }
 
@@ -97,6 +103,7 @@ impl SystemItem {
             SystemItem::FileAttachment { .. } => "file_attachment",
             SystemItem::Knowledge { .. } => "knowledge",
             SystemItem::Workflow { .. } => "workflow",
+            SystemItem::Interrupt { .. } => "interrupt",
         }
     }
 }
