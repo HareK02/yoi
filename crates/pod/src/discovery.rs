@@ -684,7 +684,11 @@ where
             .description(
                 "List Pod state entries visible to this Pod. This is state-backed and does not expose the host-wide Pod universe.",
             )
-            .input_schema(serde_json::to_value(schemars::schema_for!(())).unwrap());
+            .input_schema(serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false,
+            }));
         let tool: Arc<dyn Tool> = Arc::new(ListVisiblePodsTool {
             discovery: discovery.clone(),
         });
