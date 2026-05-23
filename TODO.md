@@ -5,6 +5,7 @@
   - Prompt / Workflow 評価メトリクスと改善 Offer → [tickets/prompt-eval-metrics.md](tickets/prompt-eval-metrics.md)
 - Permission: allow-all 既定 policy への整理 → [tickets/permission-default-policy.md](tickets/permission-default-policy.md)
 - Pod: 任意ターンからの Fork（複数ターン巻き戻しを汎用化） → [tickets/pod-session-fork.md](tickets/pod-session-fork.md)
+- Pod/TUI: 手動 rollback 導線 → [tickets/manual-turn-rollback.md](tickets/manual-turn-rollback.md)
 - Pod: Inbound PodEvent ハンドリングの重複を統合 → [tickets/pod-inbound-pod-event-dedup.md](tickets/pod-inbound-pod-event-dedup.md)
 - llm-worker のエラー耐性
   - ストリーム途中失敗時の継続 → [tickets/llm-worker-stream-continuation.md](tickets/llm-worker-stream-continuation.md)
@@ -24,3 +25,4 @@
 - system-reminder 注入機構の汎用化（2件目の利用者が出た時に検討。タグ形式 `<system-reminder>...</system-reminder>` の規約は session-todo-reminder で先行確立。注入された Item は worker.history に append する方針）
 - Bashツールがファイル編集に常用されている問題をdesciptionで抑制
 - 事前定義したManifestをProfile的に扱い、Orchestrator/Coder/Researcherで別々のモデル/設定を使わせる運用ができるようにする
+- 複数のPodのViewを行き来できるUI
