@@ -223,6 +223,26 @@ impl InputBuffer {
         self.cursor += 1;
     }
 
+    pub fn insert_str(&mut self, text: &str) {
+        for c in text.chars() {
+            self.insert_char(c);
+        }
+    }
+
+    pub fn plain_text(&self) -> String {
+        let mut text = String::new();
+        for atom in &self.atoms {
+            match atom {
+                Atom::Char(c) => text.push(*c),
+                Atom::Paste(paste) => text.push_str(&paste.content),
+                Atom::FileRef(file) => text.push_str(&file.path),
+                Atom::KnowledgeRef(knowledge) => text.push_str(&knowledge.slug),
+                Atom::WorkflowInvoke(workflow) => text.push_str(&workflow.slug),
+            }
+        }
+        text
+    }
+
     pub fn insert_newline(&mut self) {
         self.insert_char('\n');
     }
