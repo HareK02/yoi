@@ -69,4 +69,19 @@ mod tests {
         assert!(s.contains("[ToolResult] ok"));
         assert!(!s.contains("scratch"));
     }
+
+    #[test]
+    fn tool_result_renders_summary_but_not_content() {
+        let huge_content = "raw-content-should-never-enter-extract-input".repeat(10_000);
+        let items = vec![Item::tool_result_with_content(
+            "c1",
+            "short summary kept for extraction",
+            huge_content.clone(),
+        )];
+
+        let s = build_extract_input(&items);
+        assert!(s.contains("[ToolResult] short summary kept for extraction"));
+        assert!(!s.contains("raw-content-should-never-enter-extract-input"));
+        assert!(!s.contains(&huge_content));
+    }
 }

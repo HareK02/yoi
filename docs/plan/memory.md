@@ -122,7 +122,7 @@ Workflow 保護は専用 tool schema のトリックではなく Linter ルー�
 
 - **Trigger**: activity tokens の累積閾値（cumulative input tokens since last pointer）。tool call カウントは不採用（ツールカスタマイズ非依存・大小重みづけのため）
 - **実行主体**: 既存 compact と同じ Worker spawn 機構を再利用。Pod は立てない
-- **入力**: 前回 extract 以降の session log 範囲。処理済み境界の pointer は session log 側に保持し、寿命を session と揃える。session-store のドメイン純度を保つため、汎用拡張点 `LogEntry::Extension { domain, payload }`（domain = `"memory.extract"`）に寄せ、session-store は memory ドメインを知らない
+- **入力**: 前回 extract 以降の session log 範囲。処理済み境界の pointer は session log 側に保持し、寿命を session と揃える。session-store のドメイン純度を保つため、汎用拡張点 `LogEntry::Extension { domain, payload }`（domain = `"memory.extract"`）に寄せ、session-store は memory ドメインを知らない。Tool result は raw `content` ではなく表示用 `summary` だけを render し、巨大な tool output を extract input に載せない
 - **出力**: JSON schema で**活動ログ**の候補配列を返す。Knowledge 等の派生物は consolidation が活動ログから導出するので、extract では純粋な「起きたこと」に絞る
   - `decisions`: 判断したこと（選択肢 + 選んだ + 根拠）
   - `discussions`: 議論したこと（トピック + 論点）
@@ -131,6 +131,7 @@ Workflow 保護は専用 tool schema のトリックではなく Linter ルー�
   - **抽出対象がなければ空配列を返してよい**（Hermes の "Nothing to save." と同系。頻繁発火を許容する前提）
 - **書き込み先**: `memory/_staging/<id>.json`
   - LLM 出力（活動ログ JSON）は pod 側ラッパーが `source: { session_id, range: [start_entry, end_entry] }` を**機械付与**して wrap。LLM には source を推論させない
+- **実行保証**: extract worker 自身の input occupancy cap は設けない。未処理 range が大きい場合でも pointer 以降の最大範囲を渡し、LLM/API/tool failure のときだけ pointer を進めない
 - **モデル**: `memory.extract_model`。軽量だが文脈理解できる中堅クラス（Haiku / 4o-mini / Flash 相当）を想定
 - **Compact との順序**: 同一 turn 完了後の post-run チェックで extract を **compact より前** に走らせる。compact は history を組み替えるので、extract の入力範囲（session log 上の entry index）は compact 前のほうが安定する
 - **並走防止 (extract 同士)**: Pod 上の `extract_in_flight` フラグで in-flight 中の新規 trigger を skip。完了時点で閾値超過していれば直ちに次回を発火し、新 pointer 以降の最大範囲を回収する（pending 状態は保持しない＝完了時の閾値再評価で coalesce 相当の挙動を成立させる）

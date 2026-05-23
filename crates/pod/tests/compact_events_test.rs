@@ -680,6 +680,27 @@ permission = "write"
 "#;
 
 #[tokio::test]
+async fn extract_large_unprocessed_range_does_not_abort_on_input_occupancy() {
+    let client = MockClient::new(vec![
+        text_events_with_usage("recorded", 1000),
+        write_extracted_tool_use_events("ec-large"),
+        single_text_events("done"),
+    ]);
+    let mut pod = make_pod_with_manifest(EXTRACT_NO_COMPACT_MANIFEST, client).await;
+
+    let large_request = format!("remember this large slice: {}", "x ".repeat(200_000));
+    pod.run_text(&large_request).await.unwrap();
+
+    pod.try_post_run_extract().await.expect(
+        "large unprocessed extract ranges must reach the extract worker, not abort locally",
+    );
+    assert!(
+        pod.extract_pointer().is_some(),
+        "successful extract should advance the pointer even when the input range is large"
+    );
+}
+
+#[tokio::test]
 async fn spawn_and_wait_drives_extract_to_completion() {
     let client = MockClient::new(vec![
         text_events_with_usage("hi", 1000),

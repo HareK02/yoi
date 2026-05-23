@@ -263,10 +263,6 @@ permission = "write"
 # # ※ memory tools と resident injection は extract_threshold が None でも動く。
 # extract_threshold = 30000
 #
-# # 任意。デフォルト: 30000 (`defaults::MEMORY_EXTRACT_WORKER_MAX_INPUT_TOKENS`)。
-# # extract worker 自身の現在占有 token cap (超過で abort)。
-# extract_worker_max_input_tokens = 30000
-#
 # # 任意。デフォルト: 8 (`defaults::MEMORY_EXTRACT_WORKER_MAX_TURNS`)。
 # # extract worker 自身の tool loop 上限。Rust config で None の場合のみ無制限。
 # extract_worker_max_turns = 8
