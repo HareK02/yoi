@@ -31,6 +31,11 @@ pub enum Method {
     /// fresh turn via `Run` (orphan `tool_use` items are closed with a
     /// synthetic tool result before the new user message is appended).
     Pause,
+    /// Request an explicit compaction while the Pod is otherwise idle.
+    ///
+    /// This is a typed control method: clients must not send `compact` as a
+    /// `Method::Run` user message.
+    Compact,
     Shutdown,
     /// Request a list of completion candidates from the Pod.
     ///
@@ -728,6 +733,15 @@ mod tests {
         let json = r#"{"method":"pause"}"#;
         let method: Method = serde_json::from_str(json).unwrap();
         assert!(matches!(method, Method::Pause));
+        let serialized = serde_json::to_string(&method).unwrap();
+        assert_eq!(serialized, json);
+    }
+
+    #[test]
+    fn method_compact_roundtrip() {
+        let json = r#"{"method":"compact"}"#;
+        let method: Method = serde_json::from_str(json).unwrap();
+        assert!(matches!(method, Method::Compact));
         let serialized = serde_json::to_string(&method).unwrap();
         assert_eq!(serialized, json);
     }

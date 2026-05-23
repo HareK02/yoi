@@ -1235,6 +1235,38 @@ mod tests {
     }
 
     #[test]
+    fn compact_command_sends_compact_method_without_run() {
+        let mut app = App::new("agent".to_string());
+        app.connected = true;
+        assert!(
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE)
+            )
+            .is_none()
+        );
+        for c in "compact".chars() {
+            assert!(
+                handle_key(
+                    &mut app,
+                    KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+                )
+                .is_none()
+            );
+        }
+
+        let method = handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(method, Some(protocol::Method::Compact)));
+        assert!(!app.is_command_mode());
+        assert_eq!(input_text(&app), "");
+        assert_eq!(app.queued_input_count(), 0);
+        assert!(app.blocks.iter().any(|block| match block {
+            crate::block::Block::Alert { message, .. } => message.contains("compact requested"),
+            _ => false,
+        }));
+    }
+
+    #[test]
     fn command_registry_suggestions_are_available() {
         let mut app = App::new("agent".to_string());
         assert!(
