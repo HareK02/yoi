@@ -1,4 +1,4 @@
-# TUI から任意タイミングで Compact を実行する system command
+# TUI command mode から任意タイミングで Compact を実行する
 
 ## 背景
 
@@ -14,21 +14,24 @@ Compact は現在、manifest の compaction 設定と token 閾値に基づい�
 
 ## ゴール
 
-TUI から、会話本文を送らずに任意タイミングで Compact を発火できるようにする。あわせて、Compact だけの特例ではなく、将来の TUI / Pod 制御操作にも使える system command の入口を用意する。
+TUI から、会話本文を送らずに任意タイミングで Compact を発火できるようにする。system command の入口は `tickets/tui-command-mode.md` で実装済みの `:` command mode を使い、本チケットでは `compact` command と Pod 側実行経路に集中する。
+
+## 前提
+
+`tickets/tui-command-mode.md` で TUI の `:` command mode / command registry / completion が実装済みであること。本チケットはその registry に `compact` command を追加し、Pod 側の manual compact 実行経路へ接続する。
 
 ## 要件
 
-### System command の入力体系
+### Compact command
 
-TUI に、通常の user message / `@` / `#` / `/` とは衝突しない system command の入力体系を追加する。
+Command registry に `compact` command を追加する。
 
-- `/` と `#` は使わない
-- `@` FileRef とも衝突しない
-- 入力された system command は LLM への user message として送られない
-- command の発火は UI 上で見分けられる
-- 未知 command や引数不正は、Pod に送らず TUI 側でユーザーに診断を出す
-
-記法にするか、専用モードにするか、keybinding から command palette 的に起動するかは本チケット内で確定してよい。ただし既存の submit / completion / paste / chip 化の入力体験を壊さないこと。
+- `:` command mode から `compact` を実行できる。
+- `/` と `#` は使わない。
+- `@` FileRef とも衝突しない。
+- 入力された system command は LLM への user message として送られない。
+- command の発火は UI 上で見分けられる。
+- 未知 command や引数不正は、Pod に送らず TUI 側でユーザーに診断を出す。
 
 ### Manual Compact
 
@@ -60,6 +63,7 @@ System command から Compact を明示実行できるようにする。
 
 ## 範囲外
 
+- command mode / registry / completion の実装（`tickets/tui-command-mode.md`）
 - Compact の要約品質や prompt の変更
 - compaction 閾値・retained token など manifest 設定の再設計
 - slash command と WorkflowRef の意味論変更
