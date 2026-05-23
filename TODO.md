@@ -9,12 +9,12 @@
 - Pod: Inbound PodEvent ハンドリングの重複を統合 → [tickets/pod-inbound-pod-event-dedup.md](tickets/pod-inbound-pod-event-dedup.md)
 - llm-worker のエラー耐性
   - ストリーム途中失敗時の継続 → [tickets/llm-worker-stream-continuation.md](tickets/llm-worker-stream-continuation.md)
-- ネイティブ GUI クライアント MVP → [tickets/native-gui-mvp.md](tickets/native-gui-mvp.md)
 - E2E テストハーネス（`tests/e2e/`、opt-in） → [tickets/e2e-harness.md](tickets/e2e-harness.md)
 - TUI 拡充
   - TUI command mode / registry / completion → [tickets/tui-command-mode.md](tickets/tui-command-mode.md)
   - command modeから任意タイミングで Compact を発火 → [tickets/tui-system-command-compact.md](tickets/tui-system-command-compact.md)
   - navigation mode / block focus の設計 → [tickets/tui-navigation-mode-design.md](tickets/tui-navigation-mode-design.md)
+  - spawned child Pod の一覧と一時 attach → [tickets/tui-spawned-pod-panel.md](tickets/tui-spawned-pod-panel.md)
   - user manifest env override 時の spawn scope overlay 前提ズレ → [tickets/tui-user-manifest-env-overlay.md](tickets/tui-user-manifest-env-overlay.md)
   - ユーザーマニフェストのモデル設定 wizard → [tickets/tui-user-model-setup.md](tickets/tui-user-model-setup.md)
 - メモリ機構
