@@ -61,10 +61,14 @@ impl Mode {
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
-    // Input content starts after the "> " / "  " prompt, so the width
+    // Input content starts after the prompt (`> ` or `: `), so the width
     // available for wrapping is two columns narrower than the frame.
     let input_content_width = area.width.saturating_sub(2).max(1);
-    let input_render = app.input.render(input_content_width);
+    let input_render = if app.is_command_mode() {
+        app.command_input.render(input_content_width)
+    } else {
+        app.input.render(input_content_width)
+    };
     let input_height = input_area_height(&input_render, area.height);
     let mini_view_h = task_mini_view_height(&app.task_store);
     // One blank row separates the history tail from the mini-view so
@@ -89,9 +93,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
     draw_separator(frame, chunks[3]);
     draw_status(frame, app, chunks[4]);
-    draw_input(frame, &input_render, chunks[5]);
+    draw_input(frame, app, &input_render, chunks[5]);
     draw_actionbar(frame, app, chunks[6]);
-    if let Some(state) = app.completion.as_ref().filter(|c| c.is_active()) {
+    if !app.is_command_mode()
+        && let Some(state) = app.completion.as_ref().filter(|c| c.is_active())
+    {
         draw_completion_popup(frame, state, chunks[5]);
     }
 }
@@ -1146,6 +1152,16 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         spans.push(Span::styled(queue, Style::default().fg(Color::Magenta)));
     }
 
+    if app.is_command_mode() {
+        spans.push(Span::raw(" | "));
+        spans.push(Span::styled(
+            "command",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
     let right_text = context_usage_text(app);
     let right_line = Line::from(Span::styled(right_text, Style::default().fg(Color::Gray)))
         .alignment(ratatui::layout::Alignment::Right);
@@ -1156,7 +1172,28 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
 
 fn draw_actionbar(frame: &mut Frame, app: &App, area: Rect) {
     let mut left: Vec<Span<'static>> = Vec::new();
-    if app.queued_input_count() > 0 {
+    if app.is_command_mode() {
+        left.push(Span::styled(
+            "COMMAND  Esc cancel  Enter dispatch",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+        let suggestions = app.command_suggestions();
+        if !suggestions.is_empty() {
+            let suggestion_text = suggestions
+                .iter()
+                .take(4)
+                .map(|candidate| format!("{} — {}", candidate.name, candidate.description))
+                .collect::<Vec<_>>()
+                .join("  |  ");
+            left.push(Span::styled("  ", Style::default()));
+            left.push(Span::styled(
+                truncate_with_ellipsis(&suggestion_text, area.width.saturating_sub(34) as usize),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+    } else if app.queued_input_count() > 0 {
         left.push(Span::styled(
             "Alt-q edit queued  Alt-c clear queued",
             Style::default().fg(Color::DarkGray),
@@ -1196,13 +1233,21 @@ fn queue_status_text(app: &App) -> Option<String> {
     Some(text)
 }
 
-fn draw_input(frame: &mut Frame, render: &crate::input::InputRender, area: Rect) {
-    // Prefix "> " on the first row, two-space gutter for continuation
+fn draw_input(frame: &mut Frame, app: &App, render: &crate::input::InputRender, area: Rect) {
+    // Prefix prompt on the first row, matching-width gutter for continuation
     // rows so multi-line input aligns visually.
-    let prompt_style = Style::default().fg(Color::DarkGray);
+    let prompt = if app.is_command_mode() { ": " } else { "> " };
+    let continuation = if app.is_command_mode() { ": " } else { "  " };
+    let prompt_style = if app.is_command_mode() {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(render.lines.len());
     for (i, src) in render.lines.iter().enumerate() {
-        let prefix = if i == 0 { "> " } else { "  " };
+        let prefix = if i == 0 { prompt } else { continuation };
         let mut spans = vec![Span::styled(prefix.to_owned(), prompt_style)];
         spans.extend(src.spans.iter().cloned());
         lines.push(Line::from(spans));

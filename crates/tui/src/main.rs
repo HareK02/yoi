@@ -1,6 +1,7 @@
 mod app;
 mod block;
 mod cache;
+mod command;
 mod input;
 mod markdown;
 mod picker;
@@ -644,7 +645,13 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Option<Method> {
             app.move_cursor_start();
             Some(app.refresh_completion())
         }
-        KeyCode::Char(c) if c.eq_ignore_ascii_case(&'q') && alt && !ctrl => {
+        KeyCode::Char('u') if ctrl && app.is_command_mode() => {
+            app.clear_command_input();
+            Some(None)
+        }
+        KeyCode::Char(c)
+            if c.eq_ignore_ascii_case(&'q') && alt && !ctrl && !app.is_command_mode() =>
+        {
             if app.restore_next_queued_input_to_composer() {
                 Some(app.refresh_completion())
             } else {
@@ -668,8 +675,12 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Option<Method> {
             Some(None)
         }
         KeyCode::Enter if alt => {
-            app.insert_newline();
-            Some(app.refresh_completion())
+            if app.is_command_mode() {
+                Some(None)
+            } else {
+                app.insert_newline();
+                Some(app.refresh_completion())
+            }
         }
         _ => None,
     } {
@@ -703,6 +714,10 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Option<Method> {
             return None;
         }
         _ => {}
+    }
+
+    if app.is_command_mode() {
+        return handle_command_key(app, key);
     }
 
     // Completion popup overrides — only when there's something to
@@ -790,6 +805,10 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Option<Method> {
             app.move_cursor_end();
             app.refresh_completion()
         }
+        KeyCode::Char(':') if !alt && app.input.is_empty() => {
+            app.enter_command_mode();
+            None
+        }
         KeyCode::Char(c) => {
             // Whitespace ends an in-flight completion token. Try the
             // auto-confirm path first so an exact match (e.g. typed
@@ -802,6 +821,60 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Option<Method> {
             }
             app.insert_char(c);
             app.refresh_completion()
+        }
+        _ => None,
+    }
+}
+
+fn handle_command_key(app: &mut App, key: KeyEvent) -> Option<Method> {
+    match key.code {
+        KeyCode::Esc => {
+            app.exit_command_mode();
+            None
+        }
+        KeyCode::Enter => app.submit_command(),
+        KeyCode::Backspace => {
+            app.delete_char_before();
+            None
+        }
+        KeyCode::Delete => {
+            app.delete_char_after();
+            None
+        }
+        KeyCode::Left => {
+            app.move_cursor_left();
+            None
+        }
+        KeyCode::Right => {
+            app.move_cursor_right();
+            None
+        }
+        KeyCode::Up => {
+            app.move_cursor_up();
+            None
+        }
+        KeyCode::Down => {
+            app.move_cursor_down();
+            None
+        }
+        KeyCode::Home => {
+            app.move_cursor_home();
+            None
+        }
+        KeyCode::End => {
+            app.move_cursor_end();
+            None
+        }
+        KeyCode::Tab => None,
+        KeyCode::Char(c) => {
+            if key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            {
+                return None;
+            }
+            app.insert_char(c);
+            None
         }
         _ => None,
     }
@@ -1054,6 +1127,138 @@ mod tests {
         );
         assert!(matches!(cancel, Some(Method::Cancel)));
         assert_eq!(app.queued_input_count(), 0);
+    }
+
+    #[test]
+    fn command_mode_enters_with_colon_and_esc_restores_composer() {
+        let mut app = App::new("agent".to_string());
+        app.insert_char('d');
+        app.insert_char('r');
+        app.insert_char('a');
+        app.insert_char('f');
+        app.insert_char('t');
+        assert!(
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE)
+            )
+            .is_none()
+        );
+        assert!(!app.is_command_mode());
+        assert_eq!(input_text(&app), "draft:");
+
+        app.input.clear();
+        assert!(
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE)
+            )
+            .is_none()
+        );
+        assert!(app.is_command_mode());
+        for c in "help".chars() {
+            assert!(
+                handle_key(
+                    &mut app,
+                    KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+                )
+                .is_none()
+            );
+        }
+        assert_eq!(input_text(&app), "");
+        assert_eq!(app.command_text(), "help");
+
+        assert!(handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).is_none());
+        assert!(!app.is_command_mode());
+        assert_eq!(input_text(&app), "");
+    }
+
+    #[test]
+    fn unknown_command_is_not_sent_as_user_message() {
+        let mut app = App::new("agent".to_string());
+        assert!(
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE)
+            )
+            .is_none()
+        );
+        for c in "does-not-exist".chars() {
+            assert!(
+                handle_key(
+                    &mut app,
+                    KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+                )
+                .is_none()
+            );
+        }
+
+        let method = handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(method.is_none());
+        assert!(app.is_command_mode());
+        assert_eq!(input_text(&app), "");
+        assert_eq!(app.queued_input_count(), 0);
+        assert!(app.blocks.iter().any(|block| match block {
+            crate::block::Block::Alert { message, .. } => message.contains("Unknown command"),
+            _ => false,
+        }));
+    }
+
+    #[test]
+    fn command_enter_dispatches_registry_without_run() {
+        let mut app = App::new("agent".to_string());
+        assert!(
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE)
+            )
+            .is_none()
+        );
+        for c in "noop".chars() {
+            assert!(
+                handle_key(
+                    &mut app,
+                    KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+                )
+                .is_none()
+            );
+        }
+
+        let method = handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(method.is_none());
+        assert!(!app.is_command_mode());
+        assert_eq!(input_text(&app), "");
+        assert!(app.blocks.iter().any(|block| match block {
+            crate::block::Block::Alert { message, .. } => message.contains("noop: no action"),
+            _ => false,
+        }));
+    }
+
+    #[test]
+    fn command_registry_suggestions_are_available() {
+        let mut app = App::new("agent".to_string());
+        assert!(
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE)
+            )
+            .is_none()
+        );
+        assert!(
+            app.command_suggestions()
+                .iter()
+                .any(|candidate| candidate.name == "help")
+        );
+        assert!(
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)
+            )
+            .is_none()
+        );
+        let suggestions = app.command_suggestions();
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].name, "noop");
     }
 
     fn input_text(app: &App) -> String {

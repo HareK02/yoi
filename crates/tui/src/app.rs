@@ -10,6 +10,7 @@ use crate::block::{
     Block, CompactEvent, ThinkingBlock, ThinkingState, ToolCallBlock, ToolCallState,
 };
 use crate::cache::FileCache;
+use crate::command::{CommandEnvironment, CommandExecution, CommandInputMode, CommandRegistry};
 use crate::input::InputBuffer;
 use crate::scroll::Scroll;
 use crate::task::TaskStore;
@@ -88,7 +89,12 @@ pub struct App {
     pub context_window: u64,
     pub turn_index: usize,
     pub current_tool: Option<String>,
+    /// Normal composer input that is submitted as `Method::Run`.
     pub input: InputBuffer,
+    /// Separate command-line input. It is never submitted as a user message.
+    pub command_input: InputBuffer,
+    pub input_mode: CommandInputMode,
+    pub command_registry: CommandRegistry,
     pub quit: bool,
     /// 2-tap guard for `Ctrl-C` when the Pod is not running. First press
     /// records the instant; a second press within the timeout exits the
@@ -143,6 +149,9 @@ impl App {
             turn_index: 0,
             current_tool: None,
             input: InputBuffer::new(),
+            command_input: InputBuffer::new(),
+            input_mode: CommandInputMode::Composer,
+            command_registry: CommandRegistry::default(),
             quit: false,
             quit_confirm: None,
             blocks: Vec::new(),
@@ -190,6 +199,10 @@ impl App {
     /// Callers should invoke this after every input mutation that could
     /// move the cursor or change atoms.
     pub fn refresh_completion(&mut self) -> Option<Method> {
+        if self.is_command_mode() {
+            self.completion = None;
+            return None;
+        }
         match self.input.pending_completion_prefix() {
             Some((kind, start, prefix)) => {
                 let need_query = match &self.completion {
@@ -1013,43 +1026,119 @@ impl App {
         }
     }
 
+    pub fn is_command_mode(&self) -> bool {
+        self.input_mode == CommandInputMode::Command
+    }
+
+    pub fn enter_command_mode(&mut self) {
+        self.input_mode = CommandInputMode::Command;
+        self.completion = None;
+        self.quit_confirm = None;
+    }
+
+    pub fn exit_command_mode(&mut self) {
+        self.input_mode = CommandInputMode::Composer;
+        self.command_input.clear();
+    }
+
+    pub fn clear_command_input(&mut self) {
+        self.command_input.clear();
+    }
+
+    pub fn command_text(&self) -> String {
+        self.command_input.plain_text()
+    }
+
+    pub fn command_suggestions(&self) -> Vec<crate::command::CommandCandidate> {
+        self.command_registry.suggest(&self.command_text())
+    }
+
+    fn command_environment(&self) -> CommandEnvironment {
+        CommandEnvironment {
+            connected: self.connected,
+            running: self.running,
+            paused: self.paused,
+        }
+    }
+
+    pub fn submit_command(&mut self) -> Option<Method> {
+        let command_line = self.command_text();
+        let environment = self.command_environment();
+        let result = self.command_registry.dispatch(&command_line, &environment);
+        self.apply_command_execution(result)
+    }
+
+    fn apply_command_execution(&mut self, result: CommandExecution) -> Option<Method> {
+        for diagnostic in result.diagnostics {
+            self.push_command_diagnostic(diagnostic.message);
+        }
+        if result.clear_input {
+            self.command_input.clear();
+        }
+        if result.exit_command_mode {
+            self.input_mode = CommandInputMode::Composer;
+        }
+        result.method
+    }
+
+    fn push_command_diagnostic(&mut self, message: impl Into<String>) {
+        self.blocks.push(Block::Alert {
+            level: AlertLevel::Warn,
+            source: AlertSource::Pod,
+            message: format!("TUI command: {}", message.into()),
+        });
+    }
+
+    fn active_input_mut(&mut self) -> &mut InputBuffer {
+        if self.is_command_mode() {
+            &mut self.command_input
+        } else {
+            &mut self.input
+        }
+    }
+
     // Input manipulation — thin forwarders so call sites in main.rs
-    // stay readable.
+    // stay readable. In command mode these operate on the command line,
+    // keeping the normal composer buffer intact.
     pub fn insert_char(&mut self, c: char) {
-        self.input.insert_char(c);
+        self.active_input_mut().insert_char(c);
     }
     pub fn insert_newline(&mut self) {
-        self.input.insert_newline();
+        self.active_input_mut().insert_newline();
     }
     pub fn insert_paste(&mut self, content: String) {
-        self.input.insert_paste(content);
+        if self.is_command_mode() {
+            self.command_input.insert_str(&content);
+        } else {
+            self.input.insert_paste(content);
+        }
     }
     pub fn delete_char_before(&mut self) {
-        self.input.delete_before();
+        self.active_input_mut().delete_before();
     }
     pub fn delete_char_after(&mut self) {
-        self.input.delete_after();
+        self.active_input_mut().delete_after();
     }
     pub fn move_cursor_left(&mut self) {
-        self.input.move_left();
+        self.active_input_mut().move_left();
     }
     pub fn move_cursor_right(&mut self) {
-        self.input.move_right();
+        self.active_input_mut().move_right();
     }
     pub fn move_cursor_start(&mut self) {
-        self.input.move_start();
+        self.active_input_mut().move_start();
     }
     pub fn move_cursor_home(&mut self) {
-        self.input.move_home();
+        self.active_input_mut().move_home();
     }
     pub fn move_cursor_end(&mut self) {
-        self.input.move_end();
+        self.active_input_mut().move_end();
     }
     pub fn move_cursor_up(&mut self) {
-        self.input.move_up();
+        self.active_input_mut().move_up();
     }
     pub fn move_cursor_down(&mut self) {
-        self.input.move_down();
+        self.active_input_mut().move_down();
     }
 
     /// Reset the block list and replay a connect-time `Event::Snapshot`.
