@@ -10,8 +10,10 @@
 
 LLM に投げる context への割り込みは、大きく2種類に分かれる。**前者は許されるが、後者は禁止**。
 
-- **許される**: 既存 history から純粋に再現可能な変換器（pruning、tool result の content 切り詰め、prompt cache anchor の付与等）。同じ history を入力すれば同じ結果が出る決定的な加工で、history そのものを書き換えるわけでもなく、外から新しい情報を持ち込まない。
-- **禁止**: ターンを跨ぐことができない情報に基づいて、history に記録せずに context だけにコンテンツを差し込むこと。これをやると LLM はそれに反応して生成を行う一方、次以降のターンでhistoryに残らないため、「自分がなぜその発言/tool call をしたか」の根拠が消えるうえ、prompt cache のヒット率も低下させることになる。
+Podの状態から純粋に再現可能で、且つ揮発性の無い操作であることが望ましい。（pruning、tool result の content 切り詰め、prompt cache anchor の付与等）。
+原則として、コンテキストは積み重ねるものであり、一時的にメッセージを差し込むことや、過去のメッセージを改ざんすることはKVキャッシュのヒット率を下げる。
+
+**禁止**: ターンを跨ぐことができない情報に基づいて、history に記録せずに context だけにコンテンツを差し込むこと。これをやると LLM はそれに反応して生成を行う一方、次以降のターンでhistoryに残らないため、「自分がなぜその発言/tool call をしたか」の根拠が消えるうえ、prompt cache のヒット率も低下させることになる。
 
 新しい input を context に乗せたいなら、必ず先に `worker.history` に append して commit すること。`history.json` への永続化はそこから自動的についてくる。Notify / PodEvent / `<system-reminder>` 系はこの原則で扱う（→ `tickets/notify-history-persist.md`）。
 また、キャッシュを破壊するタイミングは正確にコントロールされる必要があり、キャッシュ破壊とトークン消費のトレードオフに基づいて慎重に設計されるべきである。
@@ -26,13 +28,15 @@ LLM に投げる context への割り込みは、大きく2種類に分かれる
 
 ## Git操作
 
-Gitはpush以外のすべての操作が許可されている。
+workflowで明示されない限り、読み取り以外の操作は控えること。
 基本はworktree上の一時的なブランチでコミットを重ね、メインブランチに取り込む運用をしている。
 コミットメッセージは適当に`<prefix>: *簡潔な1行*`で書いている。
 
 外部の参考プロジェクトはexternal checkoutでgetしており、必要に応じて`<external-checkouts>`からReadすること。
 
 ---
+
+## Ticketの運用について
 
 `TODO.md`、`tickets/`はgitで管理されていて、時系列の管理はgitを参照して把握すること。
 

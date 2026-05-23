@@ -1,40 +1,47 @@
 ---
-description: Git worktree を使って実装用作業ツリーを作り、main workspace の管理ファイルと子 worktree のコード差分を分離して開発を進める
+description: insomnia プロジェクトで child git worktree を作成・管理するための機械的手順。実装 Pod に作らせず、親 Pod が main workspace で実行する。
 model_invokation: false
 user_invocable: true
 requires: []
 ---
 # Worktree Workflow
 
-Git worktree を使って、実装差分を main workspace から分離して進める。子 worktree はコード変更専用の作業面として扱う。
+insomnia プロジェクトで実装差分を main workspace から分離するため、`./.worktree/<task-name>` に child git worktree を作る。これは **worktree の扱い方だけ** を定める Workflow であり、ticket 選定、実装委譲、review、merge の運用は `$user/multi-agent-workflow` 側で扱う。
 
-insomnia では Pod の write scope が排他的に委譲されるため、子 worktree に `.insomnia` を置かず、親 Pod が main workspace 側の管理ファイルを書ける状態を保つ。
+insomnia では Pod の write scope が排他的に委譲されるため、child worktree に `.insomnia` を置かない。main workspace は orchestration / ticket / docs / memory / workflow 管理の場所として残し、child worktree はコード差分専用の作業面として扱う。
 
-この Workflow は親 Pod / orchestrator が worktree を用意するための手順である。実装 Pod にこの Workflow を渡して worktree を作らせてはならない。実装 Pod は親 Pod から既存 child worktree を受け取り、その中で実装・build・test・報告だけを行う。
+## 適用範囲
+
+この Workflow は親 Pod / orchestrator が main workspace で実行する。
+
+- 実装 Pod にこの Workflow を渡して worktree を作らせない。
+- 実装 Pod は、親 Pod が作成済みの child worktree を受け取り、その中で実装・build・test・報告を行う。
+- ticket 作成、TODO 更新、review artifact、docs/report は main workspace 側で扱う。
 
 ## 原則
 
-- 1 セッション / 1 ticket / 1 task につき 1 worktree を作る。
-- worktree は `./.worktree/<task-name>` に作る。
-- branch 名は原則 `<task-name>` と同じにする。
-- 子 worktree はコード差分専用にし、`TODO.md` / `tickets/` / `docs/report/` / inbox などの管理ファイルは main workspace 側で扱う。
-- 子 worktree には `.insomnia` を出さない。worktree 作成後に sparse checkout で `.insomnia` を除外する。
-- git commit / merge / push / branch deletion / worktree remove は、人間が明示した場合以外は行わない。
+- 1 ticket / 1 実装 task につき 1 worktree を作る。
+- worktree path は `./.worktree/<task-name>`。
+- branch 名は原則 `<task-name>` と同じ kebab-case。
+- child worktree には `.insomnia` を出さない。
+- child worktree は実装差分用。`TODO.md` / `tickets/` / `docs/report/` / workflow / memory は原則 main workspace 側で扱う。
+- push はしない。
 
 ## 事前確認
 
-作業前に以下を確認する。
+作成前に以下を確認する。
 
-1. 対象 ticket / task 名が決まっているか。
-2. branch / worktree 名に使える kebab-case の `<task-name>` があるか。
-3. git 書き込み操作を行ってよい明示許可があるか。
-4. main workspace の未保存差分や既存 worktree と衝突しないか。
+1. 対象 ticket / task が決まっているか。
+2. `<task-name>` が branch / path 名に使える kebab-case か。
+3. `git worktree add` を実行してよい許可があるか。
+4. main workspace に混ぜてはいけない未保存差分がないか。
+5. 同名 branch / worktree が既に存在しないか。
 
-許可が曖昧な場合、`git worktree add` の前に人間へ確認する。
+同名 branch がある場合は、既存 branch を使うか、人間に確認する。`git worktree add -b` で上書きしない。
 
 ## 作成手順
 
-`<task-name>` を確定したら、main workspace で以下を実行する。
+main workspace で実行する。
 
 ```bash
 git worktree add .worktree/<task-name> -b <task-name>
@@ -46,44 +53,46 @@ git -C .worktree/<task-name> sparse-checkout set --no-cone \
   '!/.insomnia/**'
 ```
 
-既に branch がある場合は `-b` で新規作成せず、既存 branch を使うか人間へ確認する。`git worktree add` が失敗した場合は、worktree / branch / lock の状態を確認してから人間へ報告する。
+確認する。
+
+```bash
+git -C .worktree/<task-name> status --short --branch
+test ! -e .worktree/<task-name>/.insomnia
+```
+
+失敗した場合は、worktree / branch / lock の状態を確認し、勝手に cleanup せず人間へ報告する。
 
 ## 子 Pod へ渡す scope
 
-子 Pod を使う場合、子 Pod の cwd は現状 main workspace のままになる。子 Pod には作業対象が child worktree であることを明示し、Bash 実行時は必ず `cd .worktree/<task-name> && ...` させる。
+子 Pod を使う場合、子 Pod の cwd は main workspace のままになる。必ず作業対象が child worktree であることを明示し、Bash 実行時は毎回 `cd <repo>/.worktree/<task-name> && ...` させる。
 
 推奨 scope:
 
-- read: main workspace 全体
-- write: child worktree の必要最小ディレクトリだけ
-
-例:
-
 ```text
 read:  <repo>
-write: <repo>/.worktree/<task-name>/crates/tui
+write: <repo>/.worktree/<task-name>
 ```
 
-子 Pod には `tickets/` や inbox を書かせない。review artifact や完了候補の記録は親 Pod が main workspace 側に書く。
+より狭く切れる場合は、write scope を変更対象 crate / directory まで狭めてよい。ただし build / test に必要な生成物を書けることを確認する。
 
-## 実装中のルール
+## child worktree 内の禁止事項
 
-- child worktree 内で build / test / format を実行する。
-- main workspace の `.insomnia` や memory は child worktree にコピーしない。
-- `.insomnia` が child worktree に現れた場合は作業を止め、sparse checkout 設定を確認する。
-- ticket 要件外の設計変更、scope / permission / history 永続化 / prompt context 加工原則に触れる変更は実装前に人間へ確認する。
-- 依存関係追加や大きな設計変更が必要になった場合も人間へ確認する。
+- `.insomnia` を作らない / コピーしない。
+- main workspace の `TODO.md` / `tickets/` / `docs/report/` を編集しない。
+- merge / push / branch deletion / worktree remove をしない。
+- scope / permission / history persistence / prompt context 加工原則に関わる設計変更を無断で行わない。
 
-## 完了時
+## 完了時の扱い
 
-実装が終わったら、merge は行わず、以下を報告する。
+worktree 作成 Workflow としては、完了時に merge しない。merge、ticket 完了、TODO 削除は `$user/multi-agent-workflow` または人間の明示指示で行う。
+
+実装 Pod へ渡す完了報告項目の標準形:
 
 - worktree path
 - branch 名
+- commit hash（実装 Pod に commit を許可した場合）
 - 変更ファイル
 - 実装概要
 - 実行した build / test / format
 - 未解決事項
-- review に回せるかどうか
-
-マージウィンドウとして人間が明示的にこの Workflow を呼んだ場合だけ、merge / worktree remove / branch cleanup の候補手順を提示する。実行は人間の明示許可を待つ。
+- review に回せるか
