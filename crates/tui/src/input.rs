@@ -168,6 +168,56 @@ impl InputBuffer {
         self.cursor = 0;
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.atoms.is_empty()
+    }
+
+    /// Replace the whole composer with protocol segments previously emitted
+    /// by [`submit_segments`](Self::submit_segments), preserving typed chips
+    /// and placing the cursor at the end of the restored input.
+    pub fn replace_with_segments(&mut self, segments: &[protocol::Segment]) {
+        self.atoms.clear();
+        for segment in segments {
+            match segment {
+                protocol::Segment::Text { content } => {
+                    self.atoms.extend(content.chars().map(Atom::Char));
+                }
+                protocol::Segment::Paste {
+                    id,
+                    chars,
+                    lines,
+                    content,
+                } => {
+                    self.next_paste_id = self.next_paste_id.max(id.saturating_add(1).max(1));
+                    self.atoms.push(Atom::Paste(PasteRef {
+                        id: *id,
+                        chars: *chars as usize,
+                        lines: *lines as usize,
+                        content: content.clone(),
+                    }));
+                }
+                protocol::Segment::FileRef { path } => {
+                    self.atoms
+                        .push(Atom::FileRef(FileRefAtom { path: path.clone() }));
+                }
+                protocol::Segment::KnowledgeRef { slug } => {
+                    self.atoms
+                        .push(Atom::KnowledgeRef(KnowledgeRefAtom { slug: slug.clone() }));
+                }
+                protocol::Segment::WorkflowInvoke { slug } => {
+                    self.atoms.push(Atom::WorkflowInvoke(WorkflowInvokeAtom {
+                        slug: slug.clone(),
+                    }));
+                }
+                protocol::Segment::Unknown => {
+                    self.atoms
+                        .extend("[unknown input segment]".chars().map(Atom::Char));
+                }
+            }
+        }
+        self.cursor = self.atoms.len();
+    }
+
     pub fn insert_char(&mut self, c: char) {
         self.atoms.insert(self.cursor, Atom::Char(c));
         self.cursor += 1;
