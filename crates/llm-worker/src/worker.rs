@@ -127,7 +127,7 @@ enum ToolExecutionResult {
 ///
 /// // To edit between turns, unlock back to Mutable
 /// let mut worker = worker.unlock();
-/// worker.history_mut().truncate(5);
+/// worker.truncate_history(5);
 /// let out = worker.run("Continue").await?;
 /// let mut worker = out.worker;
 /// ```
@@ -400,7 +400,7 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
         }
     }
 
-    fn extend_history_with_callbacks(&mut self, items: impl IntoIterator<Item = Item>) {
+    fn append_history_items(&mut self, items: impl IntoIterator<Item = Item>) {
         for item in items {
             self.emit_history_append(&item);
             self.history.push(item);
@@ -985,7 +985,7 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
             // get persisted by the upper layer that owns history.json.
             let pending = self.interceptor.pending_history_appends().await;
             if !pending.is_empty() {
-                self.extend_history_with_callbacks(pending);
+                self.append_history_items(pending);
             }
 
             // Clone the history into a per-request context. Everything
@@ -1093,7 +1093,7 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
             self.turn_count += 1;
 
             // Collect and commit assistant items. Routed through
-            // `extend_history_with_callbacks` so observers (e.g. the
+            // `append_history_items` so observers (e.g. the
             // Pod-side per-item session-log committer) see each item
             // as it lands.
             let reasoning_items = self.reasoning_item_collector.take_collected();
@@ -1101,7 +1101,7 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
             let tool_calls = self.tool_call_collector.take_collected();
             let assistant_items =
                 self.build_assistant_items(&reasoning_items, &text_blocks, &tool_calls);
-            self.extend_history_with_callbacks(assistant_items);
+            self.append_history_items(assistant_items);
 
             if tool_calls.is_empty() {
                 match self.interceptor.on_turn_end(&self.history).await {
@@ -1110,7 +1110,7 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
                         return Ok(WorkerResult::Finished);
                     }
                     TurnEndAction::ContinueWithMessages(additional) => {
-                        self.extend_history_with_callbacks(additional);
+                        self.append_history_items(additional);
                         continue;
                     }
                     TurnEndAction::Pause => {
@@ -1227,7 +1227,7 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
                         result.is_error,
                     )
                 });
-                self.extend_history_with_callbacks(items);
+                self.append_history_items(items);
                 Ok(None)
             }
             Err(err) => {
@@ -1411,38 +1411,28 @@ impl<C: LlmClient> Worker<C, Mutable> {
         }
     }
 
-    /// Get a mutable reference to history
+    /// Replace history during restore/rebuild without emitting append callbacks.
     ///
-    /// Available only in Mutable state.
-    pub fn history_mut(&mut self) -> &mut Vec<Item> {
-        &mut self.history
-    }
-
-    /// Set history
+    /// This is not a history-growth API. Live append paths must use
+    /// [`append_history`](Self::append_history) so `on_history_append` observers
+    /// see every inserted item.
     pub fn set_history(&mut self, items: Vec<Item>) {
         self.history = items;
     }
 
-    /// Add an item to history (builder pattern)
-    pub fn with_item(mut self, item: Item) -> Self {
-        self.history.push(item);
-        self
+    /// Append items to history and notify history-append observers for each
+    /// item before it lands. This is the only public Mutable-state API for
+    /// growing worker history; callers that need session-log persistence must
+    /// install [`on_history_append`](Self::on_history_append) before calling it.
+    pub fn append_history(&mut self, items: impl IntoIterator<Item = Item>) {
+        self.append_history_items(items);
     }
 
-    /// Add an item to history
-    pub fn push_item(&mut self, item: Item) {
-        self.history.push(item);
-    }
-
-    /// Add multiple items to history (builder pattern)
-    pub fn with_items(mut self, items: impl IntoIterator<Item = Item>) -> Self {
-        self.history.extend(items);
-        self
-    }
-
-    /// Add multiple items to history
-    pub fn extend_history(&mut self, items: impl IntoIterator<Item = Item>) {
-        self.history.extend(items);
+    /// Truncate history without emitting append callbacks.
+    ///
+    /// This is an edit operation, not a history-growth path.
+    pub fn truncate_history(&mut self, len: usize) {
+        self.history.truncate(len);
     }
 
     /// Clear history
@@ -1575,9 +1565,9 @@ impl<C: LlmClient> Worker<C, Locked> {
             PromptAction::Continue => Vec::new(),
             PromptAction::ContinueWith(items) => items,
         };
-        self.history.push(user_item);
+        self.append_history_items(std::iter::once(user_item));
         if !extras.is_empty() {
-            self.extend_history_with_callbacks(extras);
+            self.append_history_items(extras);
         }
         let result = self.run_turn_loop().await;
         self.finalize_interruption(result).await
