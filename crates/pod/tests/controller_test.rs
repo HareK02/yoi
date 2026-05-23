@@ -1470,3 +1470,204 @@ async fn paused_then_run_closes_orphan_tool_use_for_next_request() {
         "system note must precede new user message"
     );
 }
+
+fn item_text_contains(item: &Item, needle: &str) -> bool {
+    item.as_text().unwrap_or_default().contains(needle)
+}
+
+async fn snapshot_contains_user_input(handle: &PodHandle, needle: &str) -> bool {
+    let stream = tokio::net::UnixStream::connect(handle.runtime_dir.socket_path())
+        .await
+        .unwrap();
+    let (reader, _writer) = stream.into_split();
+    let mut reader = protocol::stream::JsonLineReader::new(reader);
+
+    loop {
+        let event = reader.next::<Event>().await.unwrap().unwrap();
+        match event {
+            Event::Snapshot { entries, .. } => {
+                return entries.into_iter().any(|value| {
+                    let entry: session_store::LogEntry =
+                        serde_json::from_value(value).expect("LogEntry deserialise");
+                    match entry {
+                        session_store::LogEntry::UserInput { segments, .. } => {
+                            protocol::Segment::flatten_to_text(&segments).contains(needle)
+                        }
+                        _ => false,
+                    }
+                });
+            }
+            Event::Alert(_) => continue,
+            other => panic!("expected Snapshot first, got {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn empty_turn_cancel_rolls_back_submit_entries_and_emits_signal() {
+    let client = MockClient::sequential(vec![MockResponse::Hang(vec![])]);
+    let pod = make_pod(client).await;
+    let handle = spawn_controller(pod).await;
+    let mut rx = handle.subscribe();
+
+    handle.send(Method::run_text("rollback me")).await.unwrap();
+    wait_for_status(&handle, PodStatus::Running).await;
+    handle.send(Method::Cancel).await.unwrap();
+
+    assert!(
+        drain_until(&mut rx, std::time::Duration::from_secs(2), |e| matches!(
+            e,
+            Event::RunEnd {
+                result: protocol::RunResult::RolledBack
+            }
+        ))
+        .await,
+        "expected RunEnd::RolledBack after empty cancel"
+    );
+    wait_for_status(&handle, PodStatus::Idle).await;
+
+    let history = history_from_sink(&handle);
+    assert!(
+        !history
+            .iter()
+            .any(|item| item_text_contains(item, "rollback me")),
+        "rolled-back user input must not remain in history: {history:?}"
+    );
+}
+
+#[tokio::test]
+async fn empty_turn_pause_rolls_back_and_snapshot_does_not_restore_input() {
+    let client = MockClient::sequential(vec![MockResponse::Hang(vec![])]);
+    let pod = make_pod(client).await;
+    let handle = spawn_controller(pod).await;
+    let mut rx = handle.subscribe();
+
+    handle
+        .send(Method::run_text("pause rollback"))
+        .await
+        .unwrap();
+    wait_for_status(&handle, PodStatus::Running).await;
+    handle.send(Method::Pause).await.unwrap();
+
+    assert!(
+        drain_until(&mut rx, std::time::Duration::from_secs(2), |e| matches!(
+            e,
+            Event::RunEnd {
+                result: protocol::RunResult::RolledBack
+            }
+        ))
+        .await,
+        "expected RunEnd::RolledBack after empty pause"
+    );
+    wait_for_status(&handle, PodStatus::Idle).await;
+
+    assert!(
+        !snapshot_contains_user_input(&handle, "pause rollback").await,
+        "attach snapshot must not resurrect rolled-back empty turn input"
+    );
+}
+
+#[tokio::test]
+async fn empty_turn_rollback_removes_only_the_most_recent_turn() {
+    let client = MockClient::sequential(vec![
+        MockResponse::Complete(simple_text_events()),
+        MockResponse::Hang(vec![]),
+    ]);
+    let pod = make_pod(client).await;
+    let handle = spawn_controller(pod).await;
+    let mut rx = handle.subscribe();
+
+    handle.send(Method::run_text("first kept")).await.unwrap();
+    assert!(
+        drain_until(&mut rx, std::time::Duration::from_secs(2), |e| matches!(
+            e,
+            Event::RunEnd {
+                result: protocol::RunResult::Finished
+            }
+        ))
+        .await,
+        "expected first run to finish"
+    );
+    wait_for_status(&handle, PodStatus::Idle).await;
+
+    handle
+        .send(Method::run_text("second rolled back"))
+        .await
+        .unwrap();
+    wait_for_status(&handle, PodStatus::Running).await;
+    handle.send(Method::Cancel).await.unwrap();
+    assert!(
+        drain_until(&mut rx, std::time::Duration::from_secs(2), |e| matches!(
+            e,
+            Event::RunEnd {
+                result: protocol::RunResult::RolledBack
+            }
+        ))
+        .await,
+        "expected empty second run to roll back"
+    );
+
+    let history = history_from_sink(&handle);
+    assert!(
+        history
+            .iter()
+            .any(|item| item_text_contains(item, "first kept"))
+    );
+    assert!(
+        history
+            .iter()
+            .any(|item| item_text_contains(item, "Hello World"))
+    );
+    assert!(
+        !history
+            .iter()
+            .any(|item| item_text_contains(item, "second rolled back")),
+        "rollback must affect only the most recent empty turn: {history:?}"
+    );
+}
+
+#[tokio::test]
+async fn pause_after_assistant_token_does_not_rollback() {
+    let client = MockClient::sequential(vec![MockResponse::Hang(vec![
+        LlmEvent::text_block_start(0),
+        LlmEvent::text_delta(0, "committed before pause"),
+        LlmEvent::text_block_stop(0, None),
+    ])]);
+    let pod = make_pod(client).await;
+    let handle = spawn_controller(pod).await;
+    let mut rx = handle.subscribe();
+
+    handle
+        .send(Method::run_text("keep this turn"))
+        .await
+        .unwrap();
+    assert!(
+        drain_until(&mut rx, std::time::Duration::from_secs(2), |e| matches!(
+            e,
+            Event::TextDone { .. }
+        ))
+        .await,
+        "assistant token should be visible before pause"
+    );
+    handle.send(Method::Pause).await.unwrap();
+
+    assert!(
+        drain_until(&mut rx, std::time::Duration::from_secs(2), |e| matches!(
+            e,
+            Event::RunEnd {
+                result: protocol::RunResult::Paused
+            }
+        ))
+        .await,
+        "pause after assistant output must keep the existing Paused path"
+    );
+    wait_for_status(&handle, PodStatus::Paused).await;
+
+    let history = history_from_sink(&handle);
+    assert!(
+        history
+            .iter()
+            .any(|item| item_text_contains(item, "keep this turn")),
+        "token-visible turn must keep its UserInput entry: {history:?}"
+    );
+}

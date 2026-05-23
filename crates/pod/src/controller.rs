@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use llm_worker::WorkerError;
 use llm_worker::llm_client::client::LlmClient;
@@ -303,6 +304,7 @@ fn wire_event_bridges_on_worker<C, St>(
     C: LlmClient + Clone + 'static,
     St: Store + PodMetadataStore + Clone + 'static,
 {
+    let ai_activity = pod.ai_activity_counter();
     let worker = pod.worker_mut();
 
     let tx = event_tx.clone();
@@ -329,15 +331,22 @@ fn wire_event_bridges_on_worker<C, St>(
     });
 
     let tx = event_tx.clone();
+    let activity = ai_activity.clone();
     worker.on_text_block(move |block| {
         let tx_d = tx.clone();
+        let activity_d = activity.clone();
         block.on_delta(move |text| {
+            activity_d.fetch_add(1, Ordering::SeqCst);
             let _ = tx_d.send(Event::TextDelta {
                 text: text.to_owned(),
             });
         });
         let tx_s = tx.clone();
+        let activity_s = activity.clone();
         block.on_stop(move |text| {
+            if !text.is_empty() {
+                activity_s.fetch_add(1, Ordering::SeqCst);
+            }
             let _ = tx_s.send(Event::TextDone {
                 text: text.to_owned(),
             });
@@ -345,18 +354,26 @@ fn wire_event_bridges_on_worker<C, St>(
     });
 
     let tx = event_tx.clone();
+    let activity = ai_activity.clone();
     worker.on_thinking_block(move |block| {
         // Start fires unconditionally so the TUI can show "Thinking..."
         // even when the provider doesn't emit plaintext deltas.
+        activity.fetch_add(1, Ordering::SeqCst);
         let _ = tx.send(Event::ThinkingStart);
         let tx_d = tx.clone();
+        let activity_d = activity.clone();
         block.on_delta(move |text| {
+            activity_d.fetch_add(1, Ordering::SeqCst);
             let _ = tx_d.send(Event::ThinkingDelta {
                 text: text.to_owned(),
             });
         });
         let tx_s = tx.clone();
+        let activity_s = activity.clone();
         block.on_stop(move |text| {
+            if !text.is_empty() {
+                activity_s.fetch_add(1, Ordering::SeqCst);
+            }
             let _ = tx_s.send(Event::ThinkingDone {
                 text: text.to_owned(),
             });
@@ -364,21 +381,27 @@ fn wire_event_bridges_on_worker<C, St>(
     });
 
     let tx = event_tx.clone();
+    let activity = ai_activity.clone();
     worker.on_tool_use_block(move |start, block| {
+        activity.fetch_add(1, Ordering::SeqCst);
         let _ = tx.send(Event::ToolCallStart {
             id: start.id.clone(),
             name: start.name.clone(),
         });
         let id_for_delta = start.id.clone();
         let tx_d = tx.clone();
+        let activity_d = activity.clone();
         block.on_delta(move |json| {
+            activity_d.fetch_add(1, Ordering::SeqCst);
             let _ = tx_d.send(Event::ToolCallArgsDelta {
                 id: id_for_delta.clone(),
                 json: json.to_owned(),
             });
         });
         let tx_s = tx.clone();
+        let activity_s = activity.clone();
         block.on_stop(move |call| {
+            activity_s.fetch_add(1, Ordering::SeqCst);
             let _ = tx_s.send(Event::ToolCallDone {
                 id: call.id.clone(),
                 name: call.name.clone(),
@@ -388,7 +411,9 @@ fn wire_event_bridges_on_worker<C, St>(
     });
 
     let tx = event_tx.clone();
+    let activity = ai_activity.clone();
     worker.on_tool_result(move |result| {
+        activity.fetch_add(1, Ordering::SeqCst);
         let _ = tx.send(Event::ToolResult {
             id: result.tool_use_id.clone(),
             summary: result.summary.clone(),
@@ -879,6 +904,7 @@ where
                             PodRunResult::Finished => (PodStatus::Idle, RunResult::Finished),
                             PodRunResult::Paused => (PodStatus::Paused, RunResult::Paused),
                             PodRunResult::LimitReached => (PodStatus::Idle, RunResult::LimitReached),
+                            PodRunResult::RolledBack => (PodStatus::Idle, RunResult::RolledBack),
                         };
                         let _ = event_tx.send(Event::RunEnd { result: run_result });
                         if parent_originated && matches!(run_result, RunResult::Finished) {

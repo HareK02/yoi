@@ -571,6 +571,11 @@ pub enum RunResult {
     Finished,
     Paused,
     LimitReached,
+    /// The accepted Method::Run produced no assistant/tool output before
+    /// user interruption, so the Pod rolled the submit-time turn state back
+    /// to its pre-submit snapshot. Clients should treat the Pod as Idle and
+    /// restore the just-submitted input into the editable composer if desired.
+    RolledBack,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
