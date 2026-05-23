@@ -1,5 +1,6 @@
 pub mod compact;
 pub mod controller;
+pub mod discovery;
 pub mod fs_view;
 pub mod hook;
 pub mod ipc;

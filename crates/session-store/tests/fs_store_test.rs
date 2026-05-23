@@ -250,6 +250,7 @@ fn pod_metadata_minimal_crud() {
 
     let pending = PodMetadata::new(pod_name, Some(PodActiveSegmentRef::pending_segment(sid)));
     store.write(&pending).unwrap();
+    assert_eq!(store.list_names().unwrap(), vec![pod_name.to_string()]);
     assert_eq!(store.read_by_name(pod_name).unwrap(), Some(pending.clone()));
     assert!(
         dir.path()

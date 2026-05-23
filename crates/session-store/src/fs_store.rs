@@ -123,6 +123,35 @@ impl PodMetadataStore for FsStore {
         Ok(Some(serde_json::from_str(&content)?))
     }
 
+    fn list_names(&self) -> Result<Vec<String>, StoreError> {
+        let dir = self.pods_dir();
+        let mut names = Vec::new();
+        if !dir.exists() {
+            return Ok(names);
+        }
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            if !entry.path().join("metadata.json").exists() {
+                continue;
+            }
+            let Some(name) = entry.file_name().to_str().map(ToOwned::to_owned) else {
+                continue;
+            };
+            if validate_pod_name(&name).is_ok() {
+                names.push(name);
+            }
+        }
+        names.sort();
+        Ok(names)
+    }
+
+    fn root_dir(&self) -> Option<PathBuf> {
+        Some(self.root.clone())
+    }
+
     fn delete_by_name(&self, pod_name: &str) -> Result<(), StoreError> {
         let path = self.pod_metadata_path(pod_name)?;
         match fs::remove_file(&path) {
