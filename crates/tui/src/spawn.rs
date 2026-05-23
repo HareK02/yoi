@@ -173,18 +173,7 @@ pub async fn run(resume_from: Option<SegmentId>) -> Result<SpawnOutcome, SpawnEr
 /// with the usual TUI cwd-scope fallback.
 pub async fn run_pod_name(pod_name: String) -> Result<SpawnOutcome, SpawnError> {
     let defaults = load_spawn_defaults()?;
-    let mut form = Form {
-        cwd: defaults.cwd,
-        cascade_has_scope: defaults.cascade_has_scope,
-        scope_origin: defaults.scope_origin,
-        name_cursor: pod_name.chars().count(),
-        name: pod_name,
-        message: Some(("resuming pod...".to_string(), MessageKind::Progress)),
-        editing: false,
-        resume_from: None,
-        resume_by_pod_name: true,
-        resume_scope: None,
-    };
+    let mut form = form_for_pod_name(pod_name, defaults);
     let overlay_toml = build_overlay_toml(&form);
     let mut terminal = make_inline_terminal()?;
     terminal.draw(|f| draw_form(f, &form))?;
@@ -261,6 +250,21 @@ fn load_spawn_defaults() -> Result<SpawnDefaults, SpawnError> {
         scope_origin,
         default_name,
     })
+}
+
+fn form_for_pod_name(pod_name: String, defaults: SpawnDefaults) -> Form {
+    Form {
+        cwd: defaults.cwd,
+        cascade_has_scope: defaults.cascade_has_scope,
+        scope_origin: defaults.scope_origin,
+        name_cursor: pod_name.chars().count(),
+        name: pod_name,
+        message: Some(("resuming pod...".to_string(), MessageKind::Progress)),
+        editing: false,
+        resume_from: None,
+        resume_by_pod_name: true,
+        resume_scope: None,
+    }
 }
 
 fn make_inline_terminal() -> io::Result<InlineTerminal> {
@@ -397,6 +401,7 @@ async fn load_resume_scope(segment_id: SegmentId) -> Result<ScopeConfig, SpawnEr
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MessageKind {
     Info,
     Ok,
@@ -620,6 +625,28 @@ mod tests {
             resume_by_pod_name: false,
             resume_scope: None,
         }
+    }
+
+    #[test]
+    fn pod_name_form_restores_or_creates_by_pod_name() {
+        let defaults = SpawnDefaults {
+            cwd: PathBuf::from("/work/example"),
+            cascade_has_scope: true,
+            scope_origin: ScopeOrigin::FromProject,
+            default_name: "ignored".to_string(),
+        };
+        let f = form_for_pod_name("agent".to_string(), defaults);
+
+        assert_eq!(f.name, "agent");
+        assert_eq!(f.name_cursor, "agent".chars().count());
+        assert_eq!(f.resume_from, None);
+        assert!(f.resume_by_pod_name);
+        assert!(f.resume_scope.is_none());
+        assert!(!f.editing);
+        assert_eq!(
+            f.message,
+            Some(("resuming pod...".to_string(), MessageKind::Progress))
+        );
     }
 
     #[test]

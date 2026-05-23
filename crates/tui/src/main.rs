@@ -56,19 +56,15 @@ fn resolve_socket(pod_name: &str, override_path: Option<PathBuf>) -> PathBuf {
 #[derive(Debug)]
 enum Mode {
     Spawn,
-    Attach {
-        pod_name: String,
-        socket_override: Option<PathBuf>,
-    },
-    /// `tui --pod <name>`: attach to a live Pod by name if possible;
-    /// otherwise launch `pod --pod <name>` so the pod process resumes from
-    /// name-keyed state or creates a fresh same-name Pod.
+    /// `tui <name>` / `tui --pod <name>`: attach to a live Pod by name if
+    /// possible; otherwise launch `pod --pod <name>` so the pod process
+    /// resumes from name-keyed state or creates a fresh same-name Pod.
     PodName {
         pod_name: String,
         socket_override: Option<PathBuf>,
     },
-    /// `tui -r` / `tui --resume`: open the session picker first, then
-    /// run the same name dialog as Spawn but in resume mode.
+    /// `tui -r` / `tui --resume`: open the Pod picker, then attach to the
+    /// selected live Pod or restore the selected stopped Pod by name.
     Resume,
     /// `tui --session <UUID>`: skip the picker, go straight to the
     /// resume name dialog with `id` baked in.
@@ -178,7 +174,7 @@ where
         return Ok(Mode::Resume);
     }
     if let Some(pod_name) = positional {
-        return Ok(Mode::Attach {
+        return Ok(Mode::PodName {
             pod_name,
             socket_override,
         });
@@ -208,10 +204,6 @@ async fn main() -> ExitCode {
 
     let result = match mode {
         Mode::Spawn => run_spawn(None).await,
-        Mode::Attach {
-            pod_name,
-            socket_override,
-        } => run_attach(pod_name, socket_override).await,
         Mode::PodName {
             pod_name,
             socket_override,
@@ -239,8 +231,8 @@ async fn main() -> ExitCode {
             // SpawnError has already been painted into the inline
             // viewport's final frame, so it's already visible in the
             // user's scrollback — printing it again would be a noisy
-            // duplicate. Other errors (attach-mode failures, terminal
-            // setup hiccups, etc.) need surfacing here.
+            // duplicate. Other errors (pod-name failures, terminal setup
+            // hiccups, etc.) need surfacing here.
             if e.downcast_ref::<spawn::SpawnError>().is_none() {
                 eprintln!("tui: {e}");
             }
@@ -249,21 +241,14 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run_attach(
-    pod_name: String,
-    socket_override: Option<PathBuf>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let socket_path = resolve_socket(&pod_name, socket_override);
-    let mut terminal = enter_fullscreen()?;
-    run(&mut terminal, pod_name, &socket_path).await
-}
-
 async fn run_pod_name(
     pod_name: String,
     socket_override: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let socket_path = resolve_socket(&pod_name, socket_override);
-    if let Ok(client) = PodClient::connect(&socket_path).await {
+    let preferred_socket = resolve_socket(&pod_name, socket_override.clone());
+    if let Some((_socket_path, client)) =
+        connect_live_pod(&pod_name, preferred_socket, socket_override.is_none()).await
+    {
         let mut terminal = enter_fullscreen()?;
         let mut app = App::new(pod_name);
         app.connected = true;
@@ -289,15 +274,39 @@ async fn run_pod_name(
     result
 }
 
+async fn connect_live_pod(
+    pod_name: &str,
+    preferred_socket: PathBuf,
+    allow_registry_fallback: bool,
+) -> Option<(PathBuf, PodClient)> {
+    if let Ok(client) = PodClient::connect(&preferred_socket).await {
+        return Some((preferred_socket, client));
+    }
+
+    if !allow_registry_fallback {
+        return None;
+    }
+    let registry_socket = picker::live_socket_for_pod(pod_name)?;
+    if registry_socket == preferred_socket {
+        return None;
+    }
+    PodClient::connect(&registry_socket)
+        .await
+        .ok()
+        .map(|client| (registry_socket, client))
+}
+
 async fn run_resume() -> Result<(), Box<dyn std::error::Error>> {
-    // Phase 1: pick a session in its own inline viewport, dropping the
-    // viewport before the name dialog opens so each phase gets fresh
-    // vertical room.
-    let segment_id = match picker::run().await? {
-        PickerOutcome::Picked { segment_id } => segment_id,
+    // Pick a Pod in its own inline viewport, dropping the viewport before
+    // attaching/restoring so each phase gets fresh vertical room.
+    let (pod_name, socket_override) = match picker::run().await? {
+        PickerOutcome::Picked {
+            pod_name,
+            socket_override,
+        } => (pod_name, socket_override),
         PickerOutcome::Cancelled => return Ok(()),
     };
-    run_spawn(Some(segment_id)).await
+    run_pod_name(pod_name, socket_override).await
 }
 
 async fn run_spawn(resume_from: Option<SegmentId>) -> Result<(), Box<dyn std::error::Error>> {
@@ -808,6 +817,20 @@ mod tests {
             } => {
                 assert_eq!(pod_name, "agent");
                 assert_eq!(socket_override, Some(PathBuf::from("/tmp/agent.sock")));
+            }
+            _ => panic!("expected PodName mode"),
+        }
+    }
+
+    #[test]
+    fn parse_positional_name_uses_pod_name_mode() {
+        match parse_args_from(["agent"]).unwrap() {
+            Mode::PodName {
+                pod_name,
+                socket_override,
+            } => {
+                assert_eq!(pod_name, "agent");
+                assert_eq!(socket_override, None);
             }
             _ => panic!("expected PodName mode"),
         }
