@@ -1141,6 +1141,11 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         spans.push(Span::styled(" idle", Style::default().fg(Color::DarkGray)));
     }
 
+    if let Some(queue) = queue_status_text(app) {
+        spans.push(Span::raw(" | "));
+        spans.push(Span::styled(queue, Style::default().fg(Color::Magenta)));
+    }
+
     let right_text = context_usage_text(app);
     let right_line = Line::from(Span::styled(right_text, Style::default().fg(Color::Gray)))
         .alignment(ratatui::layout::Alignment::Right);
@@ -1150,6 +1155,14 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_actionbar(frame: &mut Frame, app: &App, area: Rect) {
+    let mut left: Vec<Span<'static>> = Vec::new();
+    if app.queued_input_count() > 0 {
+        left.push(Span::styled(
+            "Alt-q edit queued  Alt-c clear queued",
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+
     let mut right: Vec<Span<'static>> = Vec::new();
     if !app.scroll.follow_tail {
         right.push(Span::styled(
@@ -1161,8 +1174,26 @@ fn draw_actionbar(frame: &mut Frame, app: &App, area: Rect) {
         format!("[{}]", app.mode.label()),
         Style::default().fg(Color::DarkGray),
     ));
+    let left_line = Line::from(left);
     let right_line = Line::from(right).alignment(ratatui::layout::Alignment::Right);
+    frame.render_widget(Paragraph::new(left_line), area);
     frame.render_widget(Paragraph::new(right_line), area);
+}
+
+fn queue_status_text(app: &App) -> Option<String> {
+    let count = app.queued_input_count();
+    if count == 0 {
+        return None;
+    }
+    let mut text = format!("queued: {count}");
+    if let Some(preview) = app.next_queued_input_preview() {
+        let preview = truncate_with_ellipsis(preview.trim(), 40);
+        if !preview.is_empty() {
+            text.push_str(" — ");
+            text.push_str(&preview);
+        }
+    }
+    Some(text)
 }
 
 fn draw_input(frame: &mut Frame, render: &crate::input::InputRender, area: Rect) {
@@ -1322,5 +1353,34 @@ fn format_pod_event(event: &PodEvent) -> String {
         } => {
             format!("[pod_event] {parent_pod} → scope_sub_delegated: {sub_pod}")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::App;
+    use protocol::PodStatus;
+
+    #[test]
+    fn queue_status_text_includes_count_and_preview() {
+        let mut app = App::new("test".into());
+        app.set_pod_status(PodStatus::Running);
+        for c in "queued preview".chars() {
+            app.insert_char(c);
+        }
+        assert!(app.submit_input().is_none());
+
+        assert_eq!(
+            queue_status_text(&app),
+            Some("queued: 1 — queued preview".to_string())
+        );
+    }
+
+    #[test]
+    fn queue_status_text_is_absent_without_queue() {
+        let app = App::new("test".into());
+
+        assert_eq!(queue_status_text(&app), None);
     }
 }

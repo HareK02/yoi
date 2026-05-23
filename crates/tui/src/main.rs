@@ -477,18 +477,23 @@ async fn drain_terminal_events(
     Ok(handled)
 }
 
-fn drain_pod_events(app: &mut App, client: &mut PodClient) -> bool {
+async fn drain_pod_events(
+    app: &mut App,
+    client: &mut PodClient,
+) -> Result<bool, Box<dyn std::error::Error>> {
     let mut handled = false;
     for _ in 0..POD_EVENT_DRAIN_LIMIT {
         match client.try_next_event() {
             Some(ev) => {
                 handled = true;
-                app.handle_pod_event(ev);
+                if let Some(method) = app.handle_pod_event(ev) {
+                    client.send(&method).await?;
+                }
             }
             None => break,
         }
     }
-    handled
+    Ok(handled)
 }
 
 async fn run_loop(
@@ -509,7 +514,7 @@ async fn run_loop(
         if app.quit {
             break;
         }
-        let handled_pod_event = drain_pod_events(app, &mut client);
+        let handled_pod_event = drain_pod_events(app, &mut client).await?;
         if handled_term_event || handled_pod_event {
             terminal.draw(|f| ui::draw(f, app))?;
             continue;
@@ -520,7 +525,11 @@ async fn run_loop(
                 handle_terminal_event(app, &mut client, term_event?).await?;
             }
             LoopInput::Pod(event) => match event {
-                Some(ev) => app.handle_pod_event(ev),
+                Some(ev) => {
+                    if let Some(method) = app.handle_pod_event(ev) {
+                        client.send(&method).await?;
+                    }
+                }
                 None => {
                     app.connected = false;
                     app.mark_orphan_compacts_incomplete();
@@ -635,9 +644,23 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Option<Method> {
             app.move_cursor_start();
             Some(app.refresh_completion())
         }
+        KeyCode::Char(c) if c.eq_ignore_ascii_case(&'q') && alt && !ctrl => {
+            if app.restore_next_queued_input_to_composer() {
+                Some(app.refresh_completion())
+            } else {
+                Some(None)
+            }
+        }
+        KeyCode::Char(c) if c.eq_ignore_ascii_case(&'c') && alt && !ctrl => {
+            app.clear_queued_inputs();
+            Some(None)
+        }
         KeyCode::Char('c') if ctrl => Some(handle_pause_or_quit(app)),
         KeyCode::Char('x') if ctrl => Some(match app.pod_status {
-            PodStatus::Running => Some(Method::Cancel),
+            PodStatus::Running => {
+                app.clear_queued_inputs();
+                Some(Method::Cancel)
+            }
             PodStatus::Paused | PodStatus::Idle => Some(Method::Shutdown),
         }),
         KeyCode::Char('d') if ctrl => {
@@ -790,6 +813,7 @@ const CONFIRM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 /// Idle / Paused → 2-tap to quit the TUI (the Pod keeps running).
 fn handle_pause_or_quit(app: &mut App) -> Option<Method> {
     if app.pod_status == PodStatus::Running {
+        app.clear_queued_inputs();
         return Some(Method::Pause);
     }
     if let Some(t) = app.quit_confirm
@@ -918,5 +942,121 @@ mod tests {
             protocol::Segment::flatten_to_text(&app.input.submit_segments()),
             "abc"
         );
+    }
+
+    #[test]
+    fn running_enter_queues_instead_of_sending_run() {
+        let mut app = App::new("agent".to_string());
+        app.set_pod_status(PodStatus::Running);
+        for c in "queued".chars() {
+            assert!(
+                handle_key(
+                    &mut app,
+                    KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+                )
+                .is_none()
+            );
+        }
+
+        assert!(handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)).is_none());
+
+        assert_eq!(app.queued_input_count(), 1);
+        assert_eq!(app.next_queued_input_preview(), Some("queued"));
+        assert_eq!(input_text(&app), "");
+    }
+
+    #[test]
+    fn queued_input_keybindings_restore_and_clear() {
+        let mut app = App::new("agent".to_string());
+        app.set_pod_status(PodStatus::Running);
+        for c in "edit queued".chars() {
+            assert!(
+                handle_key(
+                    &mut app,
+                    KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+                )
+                .is_none()
+            );
+        }
+        assert!(handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)).is_none());
+
+        assert!(
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('q'), KeyModifiers::ALT)
+            )
+            .is_none()
+        );
+        assert_eq!(app.queued_input_count(), 0);
+        assert_eq!(input_text(&app), "edit queued");
+
+        app.input.clear();
+        for c in "clear queued".chars() {
+            assert!(
+                handle_key(
+                    &mut app,
+                    KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+                )
+                .is_none()
+            );
+        }
+        assert!(handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)).is_none());
+        assert_eq!(app.queued_input_count(), 1);
+
+        assert!(
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::ALT)
+            )
+            .is_none()
+        );
+        assert_eq!(app.queued_input_count(), 0);
+    }
+
+    #[test]
+    fn pause_and_cancel_clear_queued_input() {
+        let mut app = App::new("agent".to_string());
+        app.set_pod_status(PodStatus::Running);
+        for c in "queued".chars() {
+            assert!(
+                handle_key(
+                    &mut app,
+                    KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+                )
+                .is_none()
+            );
+        }
+        assert!(handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)).is_none());
+        assert_eq!(app.queued_input_count(), 1);
+
+        let pause = handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        );
+        assert!(matches!(pause, Some(Method::Pause)));
+        assert_eq!(app.queued_input_count(), 0);
+
+        for c in "queued again".chars() {
+            assert!(
+                handle_key(
+                    &mut app,
+                    KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+                )
+                .is_none()
+            );
+        }
+        assert!(handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)).is_none());
+        assert_eq!(app.queued_input_count(), 1);
+
+        let cancel = handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+        );
+        assert!(matches!(cancel, Some(Method::Cancel)));
+        assert_eq!(app.queued_input_count(), 0);
+    }
+
+    fn input_text(app: &App) -> String {
+        protocol::Segment::flatten_to_text(&app.input.submit_segments())
     }
 }

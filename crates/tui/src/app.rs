@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::time::Instant;
 
 use protocol::{
@@ -45,6 +46,23 @@ struct RollbackSubmitState {
     segments: Vec<Segment>,
     block_start: usize,
     turn_before: usize,
+}
+
+#[derive(Clone)]
+pub struct QueuedInput {
+    segments: Vec<Segment>,
+    preview: String,
+}
+
+impl QueuedInput {
+    fn new(segments: Vec<Segment>) -> Self {
+        let preview = Segment::flatten_to_text(&segments);
+        Self { segments, preview }
+    }
+
+    pub fn preview(&self) -> &str {
+        &self.preview
+    }
 }
 
 pub struct App {
@@ -98,6 +116,9 @@ pub struct App {
     /// Top entry index of the task pane's visible window. Clamped on
     /// render so it never points past the end of the list.
     pub task_pane_scroll: usize,
+    /// TUI-local FIFO of user inputs submitted while the Pod is already running.
+    /// Entries have not been sent to the Pod yet, so they remain editable/cancellable locally.
+    queued_inputs: VecDeque<QueuedInput>,
     /// Local submit state kept until the accepted run either completes
     /// normally or reports that the empty assistant turn was rolled back.
     pending_submit_rollback: Option<RollbackSubmitState>,
@@ -133,6 +154,7 @@ impl App {
             task_store: TaskStore::new(),
             task_pane_open: false,
             task_pane_scroll: 0,
+            queued_inputs: VecDeque::new(),
             pending_submit_rollback: None,
             last_rolled_back_input: None,
         }
@@ -351,6 +373,17 @@ impl App {
             }
             return None;
         }
+        if self.running {
+            self.queued_inputs.push_back(QueuedInput::new(segments));
+            self.input.clear();
+            self.completion = None;
+            return None;
+        }
+        self.input.clear();
+        Some(self.method_for_run(segments))
+    }
+
+    fn method_for_run(&mut self, segments: Vec<Segment>) -> Method {
         // TurnHeader / UserMessage blocks are pushed in response to
         // `Event::UserMessage` (single source of truth, shared by every
         // client subscribed to the Pod). Locally we only clear the
@@ -363,8 +396,42 @@ impl App {
             block_start: self.blocks.len(),
             turn_before: self.turn_index,
         });
-        self.input.clear();
-        Some(Method::Run { input: segments })
+        Method::Run { input: segments }
+    }
+
+    pub fn queued_input_count(&self) -> usize {
+        self.queued_inputs.len()
+    }
+
+    pub fn next_queued_input_preview(&self) -> Option<&str> {
+        self.queued_inputs.front().map(QueuedInput::preview)
+    }
+
+    pub fn clear_queued_inputs(&mut self) -> usize {
+        let cleared = self.queued_inputs.len();
+        self.queued_inputs.clear();
+        cleared
+    }
+
+    pub fn restore_next_queued_input_to_composer(&mut self) -> bool {
+        if self.queued_inputs.is_empty() {
+            return false;
+        }
+        if !self.input.is_empty() {
+            self.push_error("Composer is not empty; clear it before editing queued input.");
+            return false;
+        }
+        let Some(queued) = self.queued_inputs.pop_front() else {
+            return false;
+        };
+        self.input.replace_with_segments(&queued.segments);
+        self.completion = None;
+        true
+    }
+
+    fn pop_next_queued_run(&mut self) -> Option<Method> {
+        let queued = self.queued_inputs.pop_front()?;
+        Some(self.method_for_run(queued.segments))
     }
 
     pub fn push_error(&mut self, message: impl Into<String>) {
@@ -502,7 +569,7 @@ impl App {
         }
     }
 
-    pub fn handle_pod_event(&mut self, event: Event) {
+    pub fn handle_pod_event(&mut self, event: Event) -> Option<Method> {
         match event {
             Event::UserMessage { segments } => {
                 self.turn_index += 1;
@@ -708,6 +775,9 @@ impl App {
                             PodStatus::Idle
                         }
                     });
+                    if matches!(result, RunResult::Finished | RunResult::LimitReached) {
+                        return self.pop_next_queued_run();
+                    }
                 }
             }
             Event::CompactStart => {
@@ -791,6 +861,7 @@ impl App {
                 self.quit = true;
             }
         }
+        None
     }
 
     fn reset_run_state(&mut self, status: PodStatus) {
@@ -1607,6 +1678,108 @@ mod completion_flow_tests {
             );
             assert!(!warning_contains(&app, "Rolled back empty assistant turn"));
             assert!(app.last_rolled_back_input.is_none());
+        }
+    }
+
+    #[test]
+    fn running_submit_is_queued_locally_and_clears_composer() {
+        let mut app = App::new("test".into());
+        app.set_pod_status(PodStatus::Running);
+        insert_text(&mut app, "queued turn");
+
+        assert!(app.submit_input().is_none());
+
+        assert_eq!(app.queued_input_count(), 1);
+        assert_eq!(app.next_queued_input_preview(), Some("queued turn"));
+        assert_eq!(input_text(&app), "");
+    }
+
+    #[test]
+    fn finished_run_auto_sends_next_queued_input() {
+        let mut app = App::new("test".into());
+        app.set_pod_status(PodStatus::Running);
+        insert_text(&mut app, "next turn");
+        assert!(app.submit_input().is_none());
+
+        let method = app.handle_pod_event(Event::RunEnd {
+            result: RunResult::Finished,
+        });
+
+        match method {
+            Some(Method::Run { input }) => {
+                assert_eq!(Segment::flatten_to_text(&input), "next turn");
+            }
+            other => panic!("expected queued Run, got {other:?}"),
+        }
+        assert_eq!(app.queued_input_count(), 0);
+    }
+
+    #[test]
+    fn limit_reached_run_auto_sends_next_queued_input() {
+        let mut app = App::new("test".into());
+        app.set_pod_status(PodStatus::Running);
+        insert_text(&mut app, "next after limit");
+        assert!(app.submit_input().is_none());
+
+        let method = app.handle_pod_event(Event::RunEnd {
+            result: RunResult::LimitReached,
+        });
+
+        match method {
+            Some(Method::Run { input }) => {
+                assert_eq!(Segment::flatten_to_text(&input), "next after limit");
+            }
+            other => panic!("expected queued Run, got {other:?}"),
+        }
+        assert_eq!(app.queued_input_count(), 0);
+    }
+
+    #[test]
+    fn paused_and_rolled_back_run_do_not_auto_send_queue() {
+        for result in [RunResult::Paused, RunResult::RolledBack] {
+            let mut app = App::new("test".into());
+            app.set_pod_status(PodStatus::Running);
+            insert_text(&mut app, "held turn");
+            assert!(app.submit_input().is_none());
+
+            let method = app.handle_pod_event(Event::RunEnd { result });
+
+            assert!(method.is_none());
+            assert_eq!(app.queued_input_count(), 1);
+            assert_eq!(app.next_queued_input_preview(), Some("held turn"));
+        }
+    }
+
+    #[test]
+    fn paused_empty_submit_still_resumes_immediately() {
+        let mut app = App::new("test".into());
+        app.set_pod_status(PodStatus::Paused);
+
+        assert!(matches!(app.submit_input(), Some(Method::Resume)));
+        assert_eq!(app.queued_input_count(), 0);
+    }
+
+    #[test]
+    fn queued_input_can_be_restored_to_composer_or_cleared() {
+        let mut app = App::new("test".into());
+        app.set_pod_status(PodStatus::Running);
+        insert_text(&mut app, "edit me");
+        assert!(app.submit_input().is_none());
+
+        assert!(app.restore_next_queued_input_to_composer());
+        assert_eq!(app.queued_input_count(), 0);
+        assert_eq!(input_text(&app), "edit me");
+
+        app.input.clear();
+        insert_text(&mut app, "clear me");
+        assert!(app.submit_input().is_none());
+        assert_eq!(app.clear_queued_inputs(), 1);
+        assert_eq!(app.queued_input_count(), 0);
+    }
+
+    fn insert_text(app: &mut App, text: &str) {
+        for c in text.chars() {
+            app.insert_char(c);
         }
     }
 
