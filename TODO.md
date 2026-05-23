@@ -21,7 +21,6 @@
   - spawn 失敗時に Pod の stderr が TUI に表示されない → [tickets/tui-spawn-error-surface.md](tickets/tui-spawn-error-surface.md)
   - 巻き戻されたターンの入力テキストを編集領域に復元 → [tickets/tui-empty-turn-restore.md](tickets/tui-empty-turn-restore.md)
 - メモリ機構
-  - Memory extract の input occupancy cap を撤廃 → [tickets/memory-extract-remove-input-cap.md](tickets/memory-extract-remove-input-cap.md)
   - extract / consolidation 監査ログ → [tickets/memory-audit-log.md](tickets/memory-audit-log.md)
 - セッション内 Task ツールの注意機構（無アクティビティで `<system-reminder>` ナッジ） → [tickets/session-todo-reminder.md](tickets/session-todo-reminder.md)
 - ワークスペースのメモリーをLintするヘッドレスCLI
