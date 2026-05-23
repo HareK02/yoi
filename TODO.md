@@ -7,7 +7,6 @@
 - Pod: 空応答ターン (Submit 後 AI 応答ゼロで Pause/Cancel) を自動巻き戻し → [tickets/pod-empty-turn-rollback.md](tickets/pod-empty-turn-rollback.md)
 - Pod: 任意ターンからの Fork（複数ターン巻き戻しを汎用化） → [tickets/pod-session-fork.md](tickets/pod-session-fork.md)
 - Pod: Inbound PodEvent ハンドリングの重複を統合 → [tickets/pod-inbound-pod-event-dedup.md](tickets/pod-inbound-pod-event-dedup.md)
-- Pod: 過去 Pod の探索と restore ツール → [tickets/pod-discovery-restore-tools.md](tickets/pod-discovery-restore-tools.md)
 - llm-worker のエラー耐性
   - ストリーム途中失敗時の継続 → [tickets/llm-worker-stream-continuation.md](tickets/llm-worker-stream-continuation.md)
 - llm-worker: history append を callback 経由の単一経路に閉じる → [tickets/worker-history-append-contract.md](tickets/worker-history-append-contract.md)
