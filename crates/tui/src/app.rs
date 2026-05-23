@@ -40,6 +40,13 @@ impl CompletionState {
     pub const MAX_VISIBLE: usize = 6;
 }
 
+struct RollbackSubmitState {
+    text: String,
+    segments: Vec<Segment>,
+    block_start: usize,
+    turn_before: usize,
+}
+
 pub struct App {
     pub pod_name: String,
     pub connected: bool,
@@ -91,6 +98,12 @@ pub struct App {
     /// Top entry index of the task pane's visible window. Clamped on
     /// render so it never points past the end of the list.
     pub task_pane_scroll: usize,
+    /// Local submit state kept until the accepted run either completes
+    /// normally or reports that the empty assistant turn was rolled back.
+    pending_submit_rollback: Option<RollbackSubmitState>,
+    /// Last rolled-back submit that could not be restored because the
+    /// composer already contained unsent user input.
+    last_rolled_back_input: Option<Vec<Segment>>,
 }
 
 impl App {
@@ -120,6 +133,8 @@ impl App {
             task_store: TaskStore::new(),
             task_pane_open: false,
             task_pane_scroll: 0,
+            pending_submit_rollback: None,
+            last_rolled_back_input: None,
         }
     }
 
@@ -339,7 +354,15 @@ impl App {
         // TurnHeader / UserMessage blocks are pushed in response to
         // `Event::UserMessage` (single source of truth, shared by every
         // client subscribed to the Pod). Locally we only clear the
-        // input buffer and forward the method.
+        // input buffer and forward the method, while remembering enough
+        // local state to undo the visible submit if the Pod reports that
+        // the accepted run produced no assistant output and was rolled back.
+        self.pending_submit_rollback = Some(RollbackSubmitState {
+            text: Segment::flatten_to_text(&segments),
+            segments: segments.clone(),
+            block_start: self.blocks.len(),
+            turn_before: self.turn_index,
+        });
         self.input.clear();
         Some(Method::Run { input: segments })
     }
@@ -670,22 +693,22 @@ impl App {
                 self.push_error(format!("[{code:?}] {message}"));
             }
             Event::RunEnd { result } => {
-                self.blocks.push(Block::TurnStats {
-                    requests: self.run_requests,
-                    upload_tokens: self.run_upload_tokens,
-                    output_tokens: self.run_output_tokens,
-                });
-                self.set_pod_status(match result {
-                    RunResult::Paused => PodStatus::Paused,
-                    RunResult::Finished | RunResult::LimitReached | RunResult::RolledBack => {
-                        PodStatus::Idle
-                    }
-                });
-                self.run_requests = 0;
-                self.run_upload_tokens = 0;
-                self.run_output_tokens = 0;
-                self.current_tool = None;
-                self.assistant_streaming = false;
+                if matches!(result, RunResult::RolledBack) {
+                    self.handle_rolled_back_run();
+                } else {
+                    self.blocks.push(Block::TurnStats {
+                        requests: self.run_requests,
+                        upload_tokens: self.run_upload_tokens,
+                        output_tokens: self.run_output_tokens,
+                    });
+                    self.pending_submit_rollback = None;
+                    self.reset_run_state(match result {
+                        RunResult::Paused => PodStatus::Paused,
+                        RunResult::Finished | RunResult::LimitReached | RunResult::RolledBack => {
+                            PodStatus::Idle
+                        }
+                    });
+                }
             }
             Event::CompactStart => {
                 self.blocks.push(Block::Compact(CompactEvent::Streaming {
@@ -768,6 +791,44 @@ impl App {
                 self.quit = true;
             }
         }
+    }
+
+    fn reset_run_state(&mut self, status: PodStatus) {
+        self.set_pod_status(status);
+        self.run_requests = 0;
+        self.run_upload_tokens = 0;
+        self.run_output_tokens = 0;
+        self.current_tool = None;
+        self.assistant_streaming = false;
+    }
+
+    fn handle_rolled_back_run(&mut self) {
+        let hint = if let Some(state) = self.pending_submit_rollback.take() {
+            self.blocks
+                .truncate(state.block_start.min(self.blocks.len()));
+            self.turn_index = state.turn_before;
+            if self.input.is_empty() {
+                self.input.replace_with_segments(&state.segments);
+                self.completion = None;
+                self.last_rolled_back_input = None;
+                "Rolled back empty assistant turn; restored your input.".to_owned()
+            } else {
+                let preview = rollback_input_preview(&state.text);
+                self.last_rolled_back_input = Some(state.segments);
+                format!(
+                    "Rolled back empty assistant turn; composer was not empty, kept submitted input in backup: {preview}"
+                )
+            }
+        } else {
+            "Rolled back empty assistant turn; no local submitted input was available to restore."
+                .to_owned()
+        };
+        self.reset_run_state(PodStatus::Idle);
+        self.blocks.push(Block::Alert {
+            level: AlertLevel::Warn,
+            source: AlertSource::Pod,
+            message: hint,
+        });
     }
 
     fn append_assistant_text(&mut self, text: &str) {
@@ -1096,6 +1157,16 @@ fn strip_cat_n_prefix(formatted: &str) -> String {
         }
     }
     out
+}
+
+fn rollback_input_preview(text: &str) -> String {
+    const MAX_CHARS: usize = 80;
+    let mut one_line = text.replace('\n', "⏎");
+    if one_line.chars().count() > MAX_CHARS {
+        one_line = one_line.chars().take(MAX_CHARS).collect::<String>();
+        one_line.push('…');
+    }
+    one_line
 }
 
 /// True if the submitted segment list carries no user-visible content
@@ -1437,6 +1508,133 @@ mod completion_flow_tests {
             }],
         });
         assert!(app.completion.as_ref().unwrap().entries.is_empty());
+    }
+
+    #[test]
+    fn rolled_back_run_restores_input_and_removes_submit_blocks() {
+        let mut app = App::new("test".into());
+        let submitted = submit_text(&mut app, "please wait");
+        assert_eq!(input_text(&app), "");
+
+        app.handle_pod_event(Event::UserMessage {
+            segments: submitted,
+        });
+        // Simulate run-derived attachment display after the submitted user line.
+        app.blocks.push(Block::SystemMessage {
+            text: "[File: README.md]".into(),
+        });
+        app.handle_pod_event(Event::TurnStart { turn: 1 });
+        app.handle_pod_event(Event::Usage {
+            input_tokens: Some(100),
+            output_tokens: Some(0),
+            cache_read_input_tokens: Some(40),
+        });
+        app.handle_pod_event(Event::RunEnd {
+            result: RunResult::RolledBack,
+        });
+
+        assert_eq!(input_text(&app), "please wait");
+        assert_eq!(app.turn_index, 0);
+        assert!(app.blocks.iter().all(|b| !matches!(
+            b,
+            Block::TurnHeader { .. }
+                | Block::UserMessage { .. }
+                | Block::SystemMessage { .. }
+                | Block::TurnStats { .. }
+        )));
+        assert!(warning_contains(&app, "restored your input"));
+        assert!(matches!(app.pod_status, PodStatus::Idle));
+        assert!(!app.running);
+        assert!(!app.paused);
+        assert_eq!(app.run_requests, 0);
+        assert_eq!(app.run_upload_tokens, 0);
+        assert_eq!(app.run_output_tokens, 0);
+        assert!(app.current_tool.is_none());
+    }
+
+    #[test]
+    fn rolled_back_run_does_not_overwrite_existing_unsent_input() {
+        let mut app = App::new("test".into());
+        let submitted = submit_text(&mut app, "original submit");
+        app.handle_pod_event(Event::UserMessage {
+            segments: submitted,
+        });
+        for c in "draft while running".chars() {
+            app.insert_char(c);
+        }
+
+        app.handle_pod_event(Event::RunEnd {
+            result: RunResult::RolledBack,
+        });
+
+        assert_eq!(input_text(&app), "draft while running");
+        assert_eq!(
+            Segment::flatten_to_text(app.last_rolled_back_input.as_ref().unwrap()),
+            "original submit"
+        );
+        assert!(warning_contains(&app, "composer was not empty"));
+        assert!(app.blocks.iter().all(|b| !matches!(
+            b,
+            Block::TurnHeader { .. } | Block::UserMessage { .. } | Block::TurnStats { .. }
+        )));
+    }
+
+    #[test]
+    fn non_rolled_back_run_end_keeps_submitted_blocks_and_does_not_restore_input() {
+        for result in [RunResult::Paused, RunResult::Finished] {
+            let mut app = App::new("test".into());
+            let submitted = submit_text(&mut app, "normal run");
+            app.handle_pod_event(Event::UserMessage {
+                segments: submitted,
+            });
+            app.handle_pod_event(Event::RunEnd { result });
+
+            assert_eq!(input_text(&app), "");
+            assert!(
+                app.blocks
+                    .iter()
+                    .any(|b| matches!(b, Block::TurnHeader { .. }))
+            );
+            assert!(
+                app.blocks
+                    .iter()
+                    .any(|b| matches!(b, Block::UserMessage { .. }))
+            );
+            assert!(
+                app.blocks
+                    .iter()
+                    .any(|b| matches!(b, Block::TurnStats { .. }))
+            );
+            assert!(!warning_contains(&app, "Rolled back empty assistant turn"));
+            assert!(app.last_rolled_back_input.is_none());
+        }
+    }
+
+    fn submit_text(app: &mut App, text: &str) -> Vec<Segment> {
+        for c in text.chars() {
+            app.insert_char(c);
+        }
+        match app.submit_input() {
+            Some(Method::Run { input }) => input,
+            other => panic!("expected Run, got {other:?}"),
+        }
+    }
+
+    fn input_text(app: &App) -> String {
+        Segment::flatten_to_text(&app.input.submit_segments())
+    }
+
+    fn warning_contains(app: &App, needle: &str) -> bool {
+        app.blocks.iter().any(|block| {
+            matches!(
+                block,
+                Block::Alert {
+                    level: AlertLevel::Warn,
+                    message,
+                    ..
+                } if message.contains(needle)
+            )
+        })
     }
 
     #[test]
