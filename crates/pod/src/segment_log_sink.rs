@@ -157,6 +157,16 @@ impl SegmentLogSink {
         *mirror = entries;
     }
 
+    /// Truncate the mirror without broadcasting.
+    pub fn truncate_silent(&self, entries_len: usize) {
+        let mut mirror = self
+            .inner
+            .mirror
+            .lock()
+            .expect("session log mirror mutex poisoned");
+        mirror.truncate(entries_len);
+    }
+
     /// Atomically read the current mirror and subscribe to subsequent
     /// commits. The returned snapshot and receiver split the entry
     /// timeline into a duplicate-free, gap-free prefix/suffix pair.
