@@ -1,18 +1,18 @@
-//! Inline-viewport "pick a session to restore" UX.
+//! Inline-viewport "pick a Pod to attach or restore" UX.
 //!
-//! Reads the most recently updated sessions from the configured store,
-//! lets the user pick one with the arrow keys, and returns the chosen
-//! `SegmentId`. Closes its inline viewport before returning so the
-//! caller can open a fresh viewport for the name dialog.
-//!
-//! The picker only handles selection. Forking, pod-registry checks, and
-//! actual `pod` launch happen later in the resume flow.
+//! Reads live Pod allocations from the runtime registry and stopped Pod state
+//! from the session store's name-keyed metadata. Picking a live row attaches to
+//! its socket; picking a stopped row restores via `pod --pod <name>`.
 
+use std::collections::{BTreeMap, HashMap};
+use std::fs;
 use std::io;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use client::PodClient;
 use crossterm::event::{self, Event as TermEvent, KeyCode, KeyEventKind, KeyModifiers};
-use pod_registry::lookup_segment;
+use pod_registry::{LockFileGuard, default_registry_path};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout};
@@ -21,7 +21,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::{Frame, TerminalOptions, Viewport};
 use session_store::{
-    FsStore, LogEntry, LoggedContentPart, LoggedItem, SegmentId, SessionId, Store,
+    FsStore, LogEntry, LoggedContentPart, LoggedItem, PodMetadata, SegmentId, SessionId, Store,
 };
 
 const MAX_ROWS: usize = 10;
@@ -31,7 +31,7 @@ const VIEWPORT_LINES: u16 = MAX_ROWS as u16 + 4;
 pub enum PickerError {
     Io(io::Error),
     Store(session_store::StoreError),
-    NoSessions,
+    NoPods,
 }
 
 impl std::fmt::Display for PickerError {
@@ -39,9 +39,9 @@ impl std::fmt::Display for PickerError {
         match self {
             Self::Io(e) => write!(f, "io error: {e}"),
             Self::Store(e) => write!(f, "session store error: {e}"),
-            Self::NoSessions => write!(
+            Self::NoPods => write!(
                 f,
-                "no sessions found — start a fresh pod with `tui` and try again"
+                "no pods found — start a fresh pod with `tui` and try again"
             ),
         }
     }
@@ -62,43 +62,77 @@ impl From<session_store::StoreError> for PickerError {
 }
 
 pub enum PickerOutcome {
-    /// User picked a session; resume at the segment represented by the
-    /// selected row. The pod-cli rehydrates `session_id` via
-    /// `Store::lookup_session_of` so we only need to surface the segment
-    /// here.
+    /// User picked a Pod. `socket_override` is set for live rows when the
+    /// runtime registry knows the exact socket path; stopped rows leave it
+    /// empty so the caller restores with `pod --pod <name>`.
     Picked {
-        segment_id: SegmentId,
+        pod_name: String,
+        socket_override: Option<PathBuf>,
     },
     Cancelled,
 }
 
-/// One row in the picker view. Rendered from the most recently updated
-/// segment of a Session so the user can recognise their conversation at a
-/// glance without parsing UUIDs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PodRowState {
+    Live,
+    Stopped,
+    Corrupt,
+}
+
+impl PodRowState {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Live => "live",
+            Self::Stopped => "stopped",
+            Self::Corrupt => "corrupt",
+        }
+    }
+
+    fn style(self) -> Style {
+        match self {
+            Self::Live => Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+            Self::Stopped => Style::default().fg(Color::Yellow),
+            Self::Corrupt => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        }
+    }
+}
+
+/// One row in the Pod picker. The primary key is the Pod name; Session/Segment
+/// IDs are included only as debug context.
+#[derive(Debug, Clone)]
 struct Row {
-    session_id: SessionId,
-    segment_id: SegmentId,
-    /// Latest log-entry timestamp in the row's selected segment. Used only
-    /// to order the picker newest-update first.
+    pod_name: String,
+    state: PodRowState,
     updated_at: u64,
-    /// Last user / assistant snippet, or a `[corrupt]` placeholder.
-    preview: String,
-    /// `Some(pod_name)` when a live Pod currently holds an allocation
-    /// for this row's segment in `pods.json`. Picking such a row launches
-    /// `pod --session <UUID>` which will fail with `SegmentConflict` — the
-    /// badge warns the user up-front.
-    live_pod: Option<String>,
+    active_session_id: Option<SessionId>,
+    active_segment_id: Option<SegmentId>,
+    preview: Option<String>,
+    socket_path: Option<PathBuf>,
+}
+
+#[derive(Debug)]
+struct PodStateRecord {
+    pod_name: String,
+    state: Result<PodMetadata, String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct LivePodRecord {
+    pub pod_name: String,
+    pub socket_path: PathBuf,
+    pub segment_id: Option<SegmentId>,
 }
 
 pub async fn run() -> Result<PickerOutcome, PickerError> {
-    let store = open_default_store()?;
-    let sessions = store.list_sessions()?;
-    if sessions.is_empty() {
-        return Err(PickerError::NoSessions);
-    }
-    let rows = build_rows(&store, sessions)?;
+    let store_dir = default_store_dir()?;
+    let store = FsStore::new(&store_dir)?;
+    let pod_states = read_pod_state_records(&store_dir)?;
+    let live_pods = read_reachable_live_pod_records().await.unwrap_or_default();
+    let rows = build_rows(&store, pod_states, live_pods)?;
     if rows.is_empty() {
-        return Err(PickerError::NoSessions);
+        return Err(PickerError::NoPods);
     }
 
     let mut selected = 0usize;
@@ -108,9 +142,7 @@ pub async fn run() -> Result<PickerOutcome, PickerError> {
         match poll_event()? {
             None => continue,
             Some(Action::Up) => {
-                if selected > 0 {
-                    selected -= 1;
-                }
+                selected = selected.saturating_sub(1);
             }
             Some(Action::Down) => {
                 if selected + 1 < rows.len() {
@@ -119,8 +151,10 @@ pub async fn run() -> Result<PickerOutcome, PickerError> {
             }
             Some(Action::Submit) => {
                 close_viewport(&mut terminal)?;
+                let row = &rows[selected];
                 return Ok(PickerOutcome::Picked {
-                    segment_id: rows[selected].segment_id,
+                    pod_name: row.pod_name.clone(),
+                    socket_override: row.socket_path.clone(),
                 });
             }
             Some(Action::Cancel) => {
@@ -131,17 +165,9 @@ pub async fn run() -> Result<PickerOutcome, PickerError> {
     }
 }
 
-/// Park the cursor at the very bottom of the picker's inline viewport
-/// and emit one newline before dropping the terminal. Without this the
-/// inline area is left with the cursor still inside it, so the next
-/// `Terminal::with_options(Inline(_))` call (the resume name dialog)
-/// computes its own area starting from inside the picker — drawing the
-/// new dialog on top of the lower picker rows.
-///
-/// Setting the cursor to `area.bottom() - 1` and writing `\r\n`
-/// scrolls the terminal up exactly one row, so the next inline
-/// viewport opens immediately below the picker rather than on top of
-/// it.
+/// Park the cursor at the very bottom of the picker's inline viewport and emit
+/// one newline before dropping the terminal. This keeps any next inline viewport
+/// from drawing over the lower picker rows.
 fn close_viewport(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
     let area = terminal.get_frame().area();
     let last_row = area.bottom().saturating_sub(1);
@@ -153,76 +179,234 @@ fn close_viewport(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::
     Ok(())
 }
 
-fn open_default_store() -> Result<FsStore, PickerError> {
-    let dir = manifest::paths::sessions_dir().ok_or_else(|| {
+fn default_store_dir() -> Result<PathBuf, PickerError> {
+    manifest::paths::sessions_dir().ok_or_else(|| {
         PickerError::Io(io::Error::new(
             io::ErrorKind::NotFound,
             "could not resolve sessions directory \
              (set INSOMNIA_HOME, INSOMNIA_DATA_DIR, or HOME)",
         ))
-    })?;
-    Ok(FsStore::new(&dir)?)
+    })
 }
 
-fn build_rows(store: &FsStore, sessions: Vec<SessionId>) -> Result<Vec<Row>, PickerError> {
-    let mut rows = Vec::new();
-    for session_id in sessions {
-        let mut selected_segment: Option<(SegmentId, u64, String)> = None;
-        for segment_id in store.list_segments(session_id)? {
-            let (updated_at, preview) = summarize_segment(store, session_id, segment_id);
-            if selected_segment
-                .as_ref()
-                .is_none_or(|(best_segment_id, best_updated_at, _)| {
-                    updated_at > *best_updated_at
-                        || (updated_at == *best_updated_at && segment_id > *best_segment_id)
-                })
-            {
-                selected_segment = Some((segment_id, updated_at, preview));
-            }
-        }
-
-        let Some((segment_id, updated_at, preview)) = selected_segment else {
-            continue;
-        };
-        rows.push(Row {
-            session_id,
-            segment_id,
-            updated_at,
-            preview,
-            live_pod: None,
-        });
+fn read_pod_state_records(store_dir: &Path) -> Result<Vec<PodStateRecord>, PickerError> {
+    let pods_dir = store_dir.join("pods");
+    let mut records = Vec::new();
+    if !pods_dir.exists() {
+        return Ok(records);
     }
 
+    for entry in fs::read_dir(pods_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let pod_name = entry.file_name().to_string_lossy().to_string();
+        let path = entry.path().join("metadata.json");
+        let state = match fs::read_to_string(&path) {
+            Ok(content) => serde_json::from_str::<PodMetadata>(&content).map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
+        };
+        records.push(PodStateRecord { pod_name, state });
+    }
+    Ok(records)
+}
+
+fn read_live_pod_records() -> Result<Vec<LivePodRecord>, io::Error> {
+    let path = default_registry_path()?;
+    let guard = LockFileGuard::open(&path)?;
+    Ok(guard
+        .data()
+        .allocations
+        .iter()
+        .map(|allocation| LivePodRecord {
+            pod_name: allocation.pod_name.clone(),
+            socket_path: allocation.socket.clone(),
+            segment_id: allocation.segment_id,
+        })
+        .collect())
+}
+
+async fn read_reachable_live_pod_records() -> Result<Vec<LivePodRecord>, io::Error> {
+    let records = read_live_pod_records()?;
+    let mut reachable = Vec::new();
+    for record in records {
+        if PodClient::connect(&record.socket_path).await.is_ok() {
+            reachable.push(record);
+        }
+    }
+    Ok(reachable)
+}
+
+pub(crate) fn live_socket_for_pod(pod_name: &str) -> Option<PathBuf> {
+    read_live_pod_records()
+        .ok()?
+        .into_iter()
+        .find(|pod| pod.pod_name == pod_name)
+        .map(|pod| pod.socket_path)
+}
+
+fn build_rows(
+    store: &FsStore,
+    pod_states: Vec<PodStateRecord>,
+    live_pods: Vec<LivePodRecord>,
+) -> Result<Vec<Row>, PickerError> {
+    let mut rows_by_name: BTreeMap<String, Row> = BTreeMap::new();
+    let mut live_by_name: HashMap<String, LivePodRecord> = HashMap::new();
+
+    for live in live_pods {
+        let (active_session_id, active_segment_id, updated_at, preview) =
+            summarize_live_pod(store, &live);
+        rows_by_name.insert(
+            live.pod_name.clone(),
+            Row {
+                pod_name: live.pod_name.clone(),
+                state: PodRowState::Live,
+                updated_at,
+                active_session_id,
+                active_segment_id,
+                preview,
+                socket_path: Some(live.socket_path.clone()),
+            },
+        );
+        live_by_name.insert(live.pod_name.clone(), live);
+    }
+
+    for record in pod_states {
+        match record.state {
+            Ok(metadata) => {
+                let summary = summarize_metadata(store, &metadata);
+                let state = if live_by_name.contains_key(&record.pod_name) {
+                    PodRowState::Live
+                } else {
+                    PodRowState::Stopped
+                };
+                upsert_metadata_row(&mut rows_by_name, record.pod_name, metadata, summary, state);
+            }
+            Err(message) => {
+                rows_by_name.entry(record.pod_name.clone()).or_insert(Row {
+                    pod_name: record.pod_name,
+                    state: PodRowState::Corrupt,
+                    updated_at: 0,
+                    active_session_id: None,
+                    active_segment_id: None,
+                    preview: Some(format!("metadata: {}", trim_one_line(&message, 48))),
+                    socket_path: None,
+                });
+            }
+        }
+    }
+
+    let mut rows: Vec<Row> = rows_by_name.into_values().collect();
     rows.sort_by(|a, b| {
         b.updated_at
             .cmp(&a.updated_at)
-            .then_with(|| b.segment_id.cmp(&a.segment_id))
-            .then_with(|| b.session_id.cmp(&a.session_id))
+            .then_with(|| a.pod_name.cmp(&b.pod_name))
     });
     rows.truncate(MAX_ROWS);
-    for row in &mut rows {
-        // Best-effort live check. A pods.json I/O hiccup downgrades
-        // the row to "no badge" rather than killing the picker — the
-        // user still gets to see the listing.
-        row.live_pod = lookup_segment(row.segment_id)
-            .ok()
-            .flatten()
-            .map(|info| info.pod_name);
-    }
     Ok(rows)
+}
+
+fn upsert_metadata_row(
+    rows_by_name: &mut BTreeMap<String, Row>,
+    pod_name: String,
+    metadata: PodMetadata,
+    summary: SegmentSummary,
+    state: PodRowState,
+) {
+    let active = metadata.active;
+    let active_session_id = active.as_ref().map(|a| a.session_id);
+    let active_segment_id = active.as_ref().and_then(|a| a.segment_id);
+
+    match rows_by_name.get_mut(&pod_name) {
+        Some(existing) => {
+            existing.state = state;
+            if summary.updated_at > existing.updated_at {
+                existing.updated_at = summary.updated_at;
+            }
+            if existing.active_session_id.is_none() {
+                existing.active_session_id = active_session_id;
+            }
+            if existing.active_segment_id.is_none() {
+                existing.active_segment_id = active_segment_id;
+            }
+            if existing.preview.is_none() {
+                existing.preview = summary.preview;
+            }
+        }
+        None => {
+            rows_by_name.insert(
+                pod_name.clone(),
+                Row {
+                    pod_name,
+                    state,
+                    updated_at: summary.updated_at,
+                    active_session_id,
+                    active_segment_id,
+                    preview: summary.preview,
+                    socket_path: None,
+                },
+            );
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SegmentSummary {
+    updated_at: u64,
+    preview: Option<String>,
+}
+
+fn summarize_live_pod(
+    store: &FsStore,
+    live: &LivePodRecord,
+) -> (Option<SessionId>, Option<SegmentId>, u64, Option<String>) {
+    let Some(segment_id) = live.segment_id else {
+        return (None, None, 0, None);
+    };
+    let session_id = store.lookup_session_of(segment_id).ok().flatten();
+    let Some(session_id) = session_id else {
+        return (None, Some(segment_id), 0, None);
+    };
+    let summary = summarize_segment(store, session_id, segment_id);
+    (
+        Some(session_id),
+        Some(segment_id),
+        summary.updated_at,
+        summary.preview,
+    )
+}
+
+fn summarize_metadata(store: &FsStore, metadata: &PodMetadata) -> SegmentSummary {
+    let Some(active) = metadata.active.as_ref() else {
+        return SegmentSummary {
+            updated_at: 0,
+            preview: None,
+        };
+    };
+    let Some(segment_id) = active.segment_id else {
+        return SegmentSummary {
+            updated_at: 0,
+            preview: Some("[pending segment]".to_string()),
+        };
+    };
+    summarize_segment(store, active.session_id, segment_id)
 }
 
 fn summarize_segment(
     store: &FsStore,
     session_id: SessionId,
     segment_id: SegmentId,
-) -> (u64, String) {
+) -> SegmentSummary {
     match store.read_all(session_id, segment_id) {
-        Ok(entries) => (
-            last_entry_ts(&entries).unwrap_or(0),
-            last_message_preview(&entries).unwrap_or_else(|| "[empty]".to_string()),
-        ),
-        Err(_) => (0, "[corrupt]".to_string()),
+        Ok(entries) => SegmentSummary {
+            updated_at: last_entry_ts(&entries).unwrap_or(0),
+            preview: last_message_preview(&entries).or_else(|| Some("[empty]".to_string())),
+        },
+        Err(_) => SegmentSummary {
+            updated_at: 0,
+            preview: Some("[corrupt segment]".to_string()),
+        },
     }
 }
 
@@ -247,9 +431,8 @@ fn log_entry_ts(entry: &LogEntry) -> u64 {
     }
 }
 
-/// Walk the log from the tail looking for the most recent user-message
-/// or assistant-message entry, then render its first text fragment in
-/// a single line.
+/// Walk the log from the tail looking for the most recent user-message or
+/// assistant-message entry, then render its first text fragment in a single line.
 fn last_message_preview(entries: &[LogEntry]) -> Option<String> {
     for entry in entries.iter().rev() {
         match entry {
@@ -342,7 +525,7 @@ fn draw(f: &mut Frame<'_>, rows: &[Row], selected: usize) {
 
     f.render_widget(
         Paragraph::new(Line::from(vec![Span::styled(
-            "resume pod   pick a session",
+            picker_title(),
             Style::default().add_modifier(Modifier::BOLD),
         )])),
         layout[0],
@@ -358,7 +541,7 @@ fn draw(f: &mut Frame<'_>, rows: &[Row], selected: usize) {
             Span::styled("[↑/↓]", Style::default().fg(Color::DarkGray)),
             Span::raw(" select   "),
             Span::styled("[enter]", Style::default().fg(Color::Green)),
-            Span::raw(" pick   "),
+            Span::raw(" attach/restore   "),
             Span::styled("[esc]", Style::default().fg(Color::Yellow)),
             Span::raw(" cancel"),
         ])),
@@ -366,9 +549,13 @@ fn draw(f: &mut Frame<'_>, rows: &[Row], selected: usize) {
     );
 }
 
+fn picker_title() -> &'static str {
+    "resume pod   pick a pod"
+}
+
 fn row_line(row: &Row, selected: bool) -> Line<'_> {
     let marker = if selected { "▶ " } else { "  " };
-    let id_style = if selected {
+    let name_style = if selected {
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD)
@@ -380,35 +567,60 @@ fn row_line(row: &Row, selected: bool) -> Line<'_> {
     } else {
         Style::default().fg(Color::DarkGray)
     };
+
     let mut spans = vec![
         Span::raw(marker),
-        Span::styled(short_segment(row.session_id), id_style),
+        Span::styled(row.pod_name.as_str(), name_style),
         Span::raw("  "),
+        Span::styled(format!("[{}]", row.state.label()), row.state.style()),
+        Span::raw("  "),
+        Span::styled(
+            format_updated_at(row.updated_at),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::raw("  "),
+        Span::styled(debug_ids(row), Style::default().fg(Color::DarkGray)),
     ];
-    if let Some(ref pod_name) = row.live_pod {
-        spans.push(Span::styled(
-            format!("[live: {pod_name}] "),
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        ));
+    if let Some(preview) = row.preview.as_ref() {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(preview.as_str(), preview_style));
     }
-    spans.push(Span::styled(row.preview.clone(), preview_style));
     Line::from(spans)
 }
 
-fn short_segment(id: SessionId) -> String {
-    let s = id.to_string();
-    s.chars().take(8).collect()
+fn format_updated_at(updated_at: u64) -> String {
+    if updated_at == 0 {
+        "updated: —".to_string()
+    } else {
+        format!("updated: {updated_at}")
+    }
+}
+
+fn debug_ids(row: &Row) -> String {
+    let session = row
+        .active_session_id
+        .map(short_id)
+        .unwrap_or_else(|| "--------".to_string());
+    let segment = row
+        .active_segment_id
+        .map(short_id)
+        .unwrap_or_else(|| "--------".to_string());
+    format!("s:{session} g:{segment}")
+}
+
+fn short_id<T: ToString>(id: T) -> String {
+    id.to_string().chars().take(8).collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use llm_worker::llm_client::types::RequestConfig;
-    use session_store::{new_segment_id, new_session_id};
+    use session_store::{PodActiveSegmentRef, PodMetadataStore, new_segment_id, new_session_id};
     use tempfile::tempdir;
 
     #[test]
-    fn rows_are_sorted_by_latest_log_entry_timestamp() {
+    fn pod_rows_are_sorted_by_active_segment_timestamp() {
         let dir = tempdir().unwrap();
         let store = FsStore::new(dir.path()).unwrap();
         let earlier_session = new_session_id();
@@ -417,42 +629,116 @@ mod tests {
         let later_segment = new_segment_id();
 
         append_start(&store, earlier_session, earlier_segment, 10);
-        append_start(&store, later_session, later_segment, 20);
         append_user(
             &store,
             earlier_session,
             earlier_segment,
             100,
-            "latest update",
+            "old pod update",
         );
+        append_start(&store, later_session, later_segment, 20);
+        append_user(&store, later_session, later_segment, 200, "new pod update");
 
-        let rows = build_rows(&store, store.list_sessions().unwrap()).unwrap();
+        let records = vec![
+            metadata_record("older", earlier_session, earlier_segment),
+            metadata_record("newer", later_session, later_segment),
+        ];
+        let rows = build_rows(&store, records, vec![]).unwrap();
 
-        assert_eq!(rows[0].session_id, earlier_session);
-        assert_eq!(rows[0].segment_id, earlier_segment);
-        assert_eq!(rows[0].updated_at, 100);
-        assert_eq!(rows[0].preview, "user: latest update");
-        assert_eq!(rows[1].session_id, later_session);
+        assert_eq!(rows[0].pod_name, "newer");
+        assert_eq!(rows[0].state, PodRowState::Stopped);
+        assert_eq!(rows[0].updated_at, 200);
+        assert_eq!(rows[0].preview.as_deref(), Some("user: new pod update"));
+        assert_eq!(rows[1].pod_name, "older");
     }
 
     #[test]
-    fn row_uses_the_most_recently_updated_segment_in_a_session() {
+    fn pod_rows_include_live_and_stopped_pods() {
         let dir = tempdir().unwrap();
         let store = FsStore::new(dir.path()).unwrap();
-        let session_id = new_session_id();
-        let old_segment = new_segment_id();
-        let new_segment = new_segment_id();
+        let stopped_session = new_session_id();
+        let stopped_segment = new_segment_id();
+        let live_session = new_session_id();
+        let live_segment = new_segment_id();
 
-        append_start(&store, session_id, old_segment, 10);
-        append_start(&store, session_id, new_segment, 20);
-        append_user(&store, session_id, old_segment, 200, "continued old branch");
+        append_start(&store, stopped_session, stopped_segment, 10);
+        append_user(
+            &store,
+            stopped_session,
+            stopped_segment,
+            50,
+            "stopped preview",
+        );
+        append_start(&store, live_session, live_segment, 20);
+        append_user(&store, live_session, live_segment, 70, "live preview");
 
-        let rows = build_rows(&store, vec![session_id]).unwrap();
+        let rows = build_rows(
+            &store,
+            vec![metadata_record("stopped", stopped_session, stopped_segment)],
+            vec![LivePodRecord {
+                pod_name: "live".to_string(),
+                socket_path: PathBuf::from("/tmp/live.sock"),
+                segment_id: Some(live_segment),
+            }],
+        )
+        .unwrap();
+
+        let live = rows.iter().find(|row| row.pod_name == "live").unwrap();
+        assert_eq!(live.state, PodRowState::Live);
+        assert_eq!(live.active_session_id, Some(live_session));
+        assert_eq!(
+            live.socket_path.as_deref(),
+            Some(Path::new("/tmp/live.sock"))
+        );
+
+        let stopped = rows.iter().find(|row| row.pod_name == "stopped").unwrap();
+        assert_eq!(stopped.state, PodRowState::Stopped);
+        assert_eq!(stopped.socket_path, None);
+    }
+
+    #[test]
+    fn corrupt_pod_state_is_rendered_as_corrupt_row() {
+        let dir = tempdir().unwrap();
+        let store = FsStore::new(dir.path()).unwrap();
+        let rows = build_rows(
+            &store,
+            vec![PodStateRecord {
+                pod_name: "broken".to_string(),
+                state: Err("expected value".to_string()),
+            }],
+            vec![],
+        )
+        .unwrap();
 
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].segment_id, old_segment);
-        assert_eq!(rows[0].updated_at, 200);
-        assert_eq!(rows[0].preview, "user: continued old branch");
+        assert_eq!(rows[0].pod_name, "broken");
+        assert_eq!(rows[0].state, PodRowState::Corrupt);
+        assert!(
+            rows[0]
+                .preview
+                .as_deref()
+                .unwrap()
+                .contains("expected value")
+        );
+    }
+
+    #[test]
+    fn picker_title_names_pods_not_sessions() {
+        assert_eq!(picker_title(), "resume pod   pick a pod");
+    }
+
+    fn metadata_record(
+        pod_name: &str,
+        session_id: SessionId,
+        segment_id: SegmentId,
+    ) -> PodStateRecord {
+        PodStateRecord {
+            pod_name: pod_name.to_string(),
+            state: Ok(PodMetadata::new(
+                pod_name,
+                Some(PodActiveSegmentRef::active_segment(session_id, segment_id)),
+            )),
+        }
     }
 
     fn append_start(store: &FsStore, session_id: SessionId, segment_id: SegmentId, ts: u64) {
@@ -490,5 +776,37 @@ mod tests {
                 },
             )
             .unwrap();
+    }
+
+    #[test]
+    fn read_pod_state_records_reports_corrupt_metadata() {
+        let dir = tempdir().unwrap();
+        let pod_dir = dir.path().join("pods").join("broken");
+        fs::create_dir_all(&pod_dir).unwrap();
+        fs::write(pod_dir.join("metadata.json"), "{not-json").unwrap();
+
+        let records = read_pod_state_records(dir.path()).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].pod_name, "broken");
+        assert!(records[0].state.is_err());
+    }
+
+    #[test]
+    fn read_pod_state_records_reads_metadata() {
+        let dir = tempdir().unwrap();
+        let store = FsStore::new(dir.path()).unwrap();
+        let session_id = new_session_id();
+        let segment_id = new_segment_id();
+        store
+            .write(&PodMetadata::new(
+                "agent",
+                Some(PodActiveSegmentRef::active_segment(session_id, segment_id)),
+            ))
+            .unwrap();
+
+        let records = read_pod_state_records(dir.path()).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].pod_name, "agent");
+        assert!(records[0].state.is_ok());
     }
 }
