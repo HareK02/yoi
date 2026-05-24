@@ -17,6 +17,7 @@
   - navigation mode / block focus の設計 → [tickets/tui-navigation-mode-design.md](tickets/tui-navigation-mode-design.md)
   - spawned child Pod の一覧と一時 attach → [tickets/tui-spawned-pod-panel.md](tickets/tui-spawned-pod-panel.md)
   - actionbar transient notice API → [tickets/tui-actionbar-transient-notice-api.md](tickets/tui-actionbar-transient-notice-api.md)
+  - tui -r picker で live pending Pod が表示から漏れる → [tickets/tui-picker-live-pending-pods.md](tickets/tui-picker-live-pending-pods.md)
   - user manifest env override 時の spawn scope overlay 前提ズレ → [tickets/tui-user-manifest-env-overlay.md](tickets/tui-user-manifest-env-overlay.md)
   - ユーザーマニフェストのモデル設定 wizard → [tickets/tui-user-model-setup.md](tickets/tui-user-model-setup.md)
 - セッション内 Task ツールの注意機構（無アクティビティで `<system-reminder>` ナッジ） → [tickets/session-todo-reminder.md](tickets/session-todo-reminder.md)
