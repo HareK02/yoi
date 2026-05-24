@@ -22,6 +22,7 @@ LLM 応答の SSE ストリームを読んでいる途中で upstream が切れ�
   という形を自作する必要がある。
 - 部分出力の質は内容依存:
   - 完成した text ブロックは原則そのまま history に置ける
+  - 未完成の通常 text ブロックも、LLM の仕様上は assistant partial として置けば続きを生成させられる
   - tool_use の `input_json` が途中で切れたブロックは破損 JSON で、そのままは置けない
   - reasoning / thinking ブロックも provider 依存の扱いが要る
 
@@ -32,52 +33,108 @@ LLM 応答の SSE ストリームを読んでいる途中で upstream が切れ�
 
 なお `worker.rs:973` 付近で部分 `flush_usage()` だけは既に行っており、
 半分くらいは継続を意識した作りになっている。あとは
-「壊れていないブロックの確定」と「次ターンの起動条件」を足す形。
+「壊れていないブロックの確定」と「次 call の起動条件」を足す形。
 
-## 詰めたい論点（実装前に決める）
+## 決定した方針
 
-このチケットは仕様議論を含む。以下を確定させてから実装に入る。
+stream 開始後に transport / SSE error で落ちた場合、同じ request をそのまま再送しない。
+Timeline に積まれた部分生成を安全な範囲で assistant history として確定し、その history を前提に continuation call を起動する。
 
-1. **部分ブロックの取り扱い基準**
-   - 完成した text ブロックは確定して history に push するか
-   - 未完の tool_use は捨てるのが妥当か、暫定 stop で残すか
-   - reasoning / thinking ブロックの扱い（provider 別）
+- 通常 text は partial でも残す。
+  - 完成済み text block はそのまま確定する。
+  - 未完成 text block も text として確定し、次の LLMCall で続きを生成させる。
+- tool_use は壊れていないものだけ残す。
+  - 完成済み tool_use は通常通り確定する。
+  - 未完成 tool_use / partial JSON は history に入れず破棄する。
+  - 破棄した事実は structured diagnostic event として記録する。
+- reasoning / thinking block は初期実装では保守的に扱う。
+  - provider が history に安全に戻せる完成 block として扱えるものだけ残す。
+  - 未完成または復元不能な thinking/reasoning は破棄し、diagnostic event に残す。
+- continuation は自動で最大 5 回試す。
+  - backoff は attempt ごとに伸ばす。例: 1s, 2s, 4s, 8s, 16s。
+  - 5 回失敗したら turn を中断し、通常の失敗として上位へ返す。
+- `Cancelled` / `Aborted` / interceptor `Yield` は continuation より優先する。
+  - 明示的な user cancel や上位制御を transport error retry で覆さない。
+- 明示的な safety / content filter stop reason が provider event として返る場合は retry 対象外にする。
+  - transport / SSE error としてしか見えない場合は continuation 対象にする。
+  - 同じ箇所で繰り返し切られる場合は最大 5 回で exhausted する。
 
-2. **継続の起動方式**
-   - 自動的に次ターンを回す（= retry-like 挙動）/ Pause で上位に判断委譲 /
-     manifest で切替、のいずれか
-   - デフォルトは何か（自動継続は意図しない出費を生む可能性あり）
+## 失敗ログ / 統計
 
-3. **ループ防止**
-   - 同種の transport エラーが連続 N 回起きたら諦める閾値
-   - 「ストリーム開始後ほぼ即座に切れる」が連続するパターンの検知
+この機能は実運用での発生頻度と回復率を見たいので、continuation lifecycle を structured log として残す。
+ログは統計・デバッグ用であり、通常の LLM context へ暗黙注入しない。
 
-4. **他の中断要因との優先度**
-   - `Cancelled` / `Aborted` / interceptor の `Yield` が同時に起きたときの順序
+最低限記録する event:
 
-5. **可観測性**
-   - 「途中で切れて継続した」事実をセッションログに残す形
-   - `ClientError::Sse(String)` を `Sse { kind: Parse | Transport, msg }` に
-     分割するかどうか（診断容易性のため）
+- `llm_stream_interrupted`
+  - provider / model
+  - run_id / turn_id 相当
+  - original attempt / continuation attempt
+  - error kind: `sse_transport`, `sse_parse`, `body_decode`, `unknown` 等
+  - error message
+  - committed text block count
+  - committed partial text の有無
+  - discarded partial tool_use count
+  - discarded thinking/reasoning count
+  - usage flush の有無
+- `llm_stream_continuation_started`
+  - continuation attempt
+  - backoff duration
+  - history に確定した block summary
+- `llm_stream_continuation_completed`
+  - continuation attempt
+  - completion reason
+- `llm_stream_continuation_failed`
+  - continuation attempt
+  - error kind / message
+- `llm_stream_continuation_exhausted`
+  - attempts
+  - final reason
 
-## 要件（暫定。論点確定後に再記述）
+未完成 tool_use を破棄した場合は、可能な範囲で以下も残す。
 
-- ストリーム途中で transport 由来のエラーが出た場合、
-  `worker.rs` がそれを catch し、Timeline に積まれた完成ブロックだけを
-  assistant items として確定する。
-- 未完ブロック（特に壊れた tool_use）は破棄するか、
-  破棄したことを示す形で履歴に残す（決定は論点 1）。
-- 継続するか中断するかの判定が、論点 2 の決定に従って分岐する。
-- 連続失敗時に止まる（論点 3）。
-- 既存の `Cancelled` / `Aborted` パスが優先される（論点 4）。
+```json
+{
+  "event": "discarded_partial_tool_use",
+  "tool_name": "Bash",
+  "partial_input_bytes": 1234,
+  "reason": "sse_transport_error"
+}
+```
+
+## 要件
+
+- ストリーム開始後の transport / SSE error を `worker.rs` 層で捕捉し、continuation 対象か判定する。
+  - pre-stream の transient retry とは別枠にする。
+  - 同じ request の単純再送はしない。
+- Timeline に積まれた安全な block を assistant history として確定する。
+  - 完成済み text block を残す。
+  - 未完成 text block も残す。
+  - 完成済み tool_use を残す。
+  - 未完成 tool_use / partial JSON は破棄し、diagnostic event を記録する。
+  - 未完成または復元不能な thinking/reasoning は破棄し、diagnostic event を記録する。
+- continuation call を最大 5 回まで自動実行する。
+  - attempt ごとに backoff を伸ばす。
+  - 成功したら通常の LLMCall 完了として扱う。
+  - exhausted したら turn を中断する。
+- `Cancelled` / `Aborted` / interceptor `Yield` がある場合は continuation しない。
+- provider が明示的な safety / content filter stop reason を正常 event として返した場合は continuation しない。
+- continuation lifecycle と破棄した partial block の概要を structured log に残す。
+  - 統計として provider/model 別の失敗頻度、回復率、partial tool_use 発生有無を後から集計できること。
+- continuation のために context へ一時的な system message を暗黙注入しない。
+  - もし LLM に中断事実を知らせる必要が出た場合は、history に残る明示 event/message として設計する。
+  - 初期実装では壊れた tool_use は LLM に知らせず、ログにだけ残す。
 
 ## 完了条件
 
-- 上記論点が決まり、ドキュメント or チケット本文に反映されている。
-- ストリーム途中で切れるモックを使った integration test が、
-  決まった仕様どおりに継続 or 中断する。
-- 課金重複が起きないこと（自動継続でも、過去ターンの再生成は発生しない）が
-  test または手動手順で確認されている。
+- stream 途中で transport / SSE error を起こすモック integration test がある。
+- text-only partial response では、未完成 text が history に残り、continuation call が続きを生成する。
+- partial tool_use response では、壊れた tool_use が history に入らず、discard diagnostic が記録される。
+- completed tool_use は破棄されず、通常通り history に残る。
+- continuation が最大 5 回で exhausted し、turn が中断される test がある。
+- `Cancelled` / `Aborted` / `Yield` が continuation より優先される test がある。
+- structured log から interrupted / started / completed / failed / exhausted が確認できる。
+- 課金重複が起きないこと（過去ターンの単純再生成ではなく partial assistant history からの continuation であること）が test または手動手順で確認されている。
 - `cargo check` / `cargo test` が `llm-worker` で通る。
 
 ## 範囲外
@@ -85,3 +142,4 @@ LLM 応答の SSE ストリームを読んでいる途中で upstream が切れ�
 - pre-stream の transient リトライ → `llm-worker-transient-retry`
 - ストリーム resume API の実装（プロバイダ側に存在しないので不可能）
 - 課金額の自動上限制御
+- 壊れた partial tool_use を system message 等で LLM に説明して復旧させる高度な戦略
