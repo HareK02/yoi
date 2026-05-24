@@ -138,6 +138,15 @@ impl CommandRegistry {
             can_execute: always_available,
             executor: noop_command,
         });
+        registry.register(CommandSpec {
+            name: "compact",
+            aliases: &[],
+            usage: "compact",
+            description: "Request immediate Pod context compaction.",
+            argument_parser: compact_args,
+            can_execute: compact_available,
+            executor: compact_command,
+        });
         registry
     }
 
@@ -266,6 +275,34 @@ fn help_args(raw: &str) -> Result<CommandArgs, CommandDiagnostic> {
     }
 }
 
+fn compact_args(raw: &str) -> Result<CommandArgs, CommandDiagnostic> {
+    let args = CommandArgs::parse_whitespace(raw);
+    if args.argv().is_empty() {
+        Ok(args)
+    } else {
+        Err(CommandDiagnostic::new("Invalid arguments. Usage: compact"))
+    }
+}
+
+fn compact_available(environment: &CommandEnvironment) -> Result<(), CommandDiagnostic> {
+    if !environment.connected {
+        return Err(CommandDiagnostic::new(
+            "Cannot compact: not connected to a Pod.",
+        ));
+    }
+    if environment.running {
+        return Err(CommandDiagnostic::new(
+            "Cannot compact while the Pod is running.",
+        ));
+    }
+    if environment.paused {
+        return Err(CommandDiagnostic::new(
+            "Cannot compact while the Pod is paused; resume or start a fresh turn first.",
+        ));
+    }
+    Ok(())
+}
+
 fn help_command(invocation: CommandInvocation<'_>) -> CommandExecution {
     if let Some(name) = invocation.args.argv().first() {
         let Some(command) = invocation.registry.find(name) else {
@@ -299,6 +336,18 @@ fn noop_command(invocation: CommandInvocation<'_>) -> CommandExecution {
     let _ = invocation.environment;
     let _ = invocation.args.raw();
     CommandExecution::notice("noop: no action")
+}
+
+fn compact_command(invocation: CommandInvocation<'_>) -> CommandExecution {
+    let _ = invocation.command;
+    let _ = invocation.environment;
+    let _ = invocation.args.raw();
+    CommandExecution {
+        method: Some(Method::Compact),
+        diagnostics: vec![CommandDiagnostic::new("compact requested")],
+        exit_command_mode: true,
+        clear_input: true,
+    }
 }
 
 #[cfg(test)]
@@ -336,5 +385,40 @@ mod tests {
         assert!(result.method.is_none());
         assert!(!result.exit_command_mode);
         assert!(result.diagnostics[0].message.contains("Invalid arguments"));
+    }
+
+    #[test]
+    fn compact_command_returns_compact_method_not_run() {
+        let registry = CommandRegistry::builtins();
+        let result = registry.dispatch("compact", &env());
+        assert!(matches!(result.method, Some(Method::Compact)));
+        assert!(result.exit_command_mode);
+        assert!(result.clear_input);
+        assert!(result.diagnostics[0].message.contains("compact requested"));
+    }
+
+    #[test]
+    fn compact_invalid_arguments_are_local_diagnostic() {
+        let registry = CommandRegistry::builtins();
+        let result = registry.dispatch("compact now", &env());
+        assert!(result.method.is_none());
+        assert!(!result.exit_command_mode);
+        assert!(result.diagnostics[0].message.contains("Invalid arguments"));
+    }
+
+    #[test]
+    fn compact_rejects_running_and_paused_locally() {
+        let registry = CommandRegistry::builtins();
+        let mut running = env();
+        running.running = true;
+        let result = registry.dispatch("compact", &running);
+        assert!(result.method.is_none());
+        assert!(result.diagnostics[0].message.contains("running"));
+
+        let mut paused = env();
+        paused.paused = true;
+        let result = registry.dispatch("compact", &paused);
+        assert!(result.method.is_none());
+        assert!(result.diagnostics[0].message.contains("paused"));
     }
 }

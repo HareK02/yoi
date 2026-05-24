@@ -2008,6 +2008,86 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         }
     }
 
+    /// Run an explicit user-requested compaction between turns.
+    ///
+    /// The controller only calls this while Idle. Paused turns keep their
+    /// interrupted Worker state intact and are intentionally rejected before
+    /// this method is reached.
+    pub async fn manual_compact(&mut self) -> Result<ManualCompactResult, PodError> {
+        if self.manifest.compaction.is_none() {
+            let message =
+                "manual compact is unavailable because [compaction] is not configured".to_string();
+            self.alert(AlertLevel::Warn, AlertSource::Compactor, message.clone());
+            return Ok(ManualCompactResult::Skipped { message });
+        }
+
+        if self.history().is_empty() {
+            let message = "manual compact skipped: no conversation history to compact".to_string();
+            self.alert(AlertLevel::Warn, AlertSource::Compactor, message.clone());
+            return Ok(ManualCompactResult::Skipped { message });
+        }
+
+        self.ensure_interceptor_installed();
+        self.cleanup_finished_memory_task();
+        self.ensure_segment_head()?;
+
+        let state = self.compact_state.clone();
+        if state.as_ref().is_some_and(|s| s.is_disabled()) {
+            let message =
+                "manual compact is disabled after repeated compaction failures".to_string();
+            self.alert(AlertLevel::Warn, AlertSource::Compactor, message.clone());
+            return Ok(ManualCompactResult::Skipped { message });
+        }
+
+        let retained = state
+            .as_ref()
+            .map(|s| s.retained_tokens())
+            .or_else(|| {
+                self.manifest
+                    .compaction
+                    .as_ref()
+                    .map(|c| c.compact_retained_tokens)
+            })
+            .unwrap_or(manifest::defaults::COMPACT_RETAINED_TOKENS);
+        let current_tokens = self.total_tokens().tokens;
+        let cut = self.split_for_retained(retained);
+        if cut.index == 0 {
+            let message = format!(
+                "manual compact skipped: current context is within the retained tail ({current_tokens} <= {retained} tokens)"
+            );
+            self.alert(AlertLevel::Warn, AlertSource::Compactor, message.clone());
+            return Ok(ManualCompactResult::Skipped { message });
+        }
+
+        self.join_memory_task().await;
+        self.send_event(Event::CompactStart);
+        match self.compact(retained).await {
+            Ok(new_segment_id) => {
+                info!(new_segment_id = %new_segment_id, "Manual compaction succeeded");
+                self.send_event(Event::CompactDone { new_segment_id });
+                if let Some(ref state) = state {
+                    state.record_compact_success();
+                }
+                Ok(ManualCompactResult::Compacted { new_segment_id })
+            }
+            Err(e) => {
+                warn!(error = %e, "Manual compaction failed");
+                self.send_event(Event::CompactFailed {
+                    error: e.to_string(),
+                });
+                self.alert(
+                    AlertLevel::Error,
+                    AlertSource::Compactor,
+                    format!("manual compaction failed: {e}"),
+                );
+                if let Some(ref state) = state {
+                    state.record_compact_failure();
+                }
+                Err(e)
+            }
+        }
+    }
+
     /// Persist delta + turn end + outcome after a run/resume.
     async fn persist_turn(
         &mut self,
@@ -3305,6 +3385,15 @@ pub enum PodRunResult {
     LimitReached,
     /// The submit-time user turn was rolled back because no AI output was materialized.
     RolledBack,
+}
+
+/// Result of a manual compaction request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManualCompactResult {
+    /// The history was compacted into a new segment.
+    Compacted { new_segment_id: SegmentId },
+    /// No compaction was run; the message has already been surfaced as an alert.
+    Skipped { message: String },
 }
 
 impl From<WorkerResult> for PodRunResult {

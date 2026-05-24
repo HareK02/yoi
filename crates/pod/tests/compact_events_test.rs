@@ -16,11 +16,11 @@ use llm_worker::Worker;
 use llm_worker::llm_client::event::{Event as LlmEvent, ResponseStatus, StatusEvent};
 use llm_worker::llm_client::types::Item;
 use llm_worker::llm_client::{ClientError, LlmClient, Request};
-use protocol::Event;
+use protocol::{Event, Method, RunResult};
 use session_store::{FsStore, LogEntry, PodMetadataStore, Store};
 use tokio::sync::broadcast;
 
-use pod::Pod;
+use pod::{Pod, PodController};
 
 #[derive(Clone)]
 struct MockClient {
@@ -753,4 +753,54 @@ async fn detached_extract_does_not_fork_session_log() {
          must share the entry tally through SegmentState — a fork here means the \
          clone carried its own counter"
     );
+}
+
+#[tokio::test]
+async fn controller_compact_method_emits_start_and_done() {
+    let client = MockClient::new(vec![
+        text_events_with_usage("hi", 1000),
+        write_summary_tool_use_events("manual-summary", "manual compact summary"),
+        single_text_events("done"),
+    ]);
+    let pod = make_pod_with_manifest(POST_RUN_MANIFEST_TOML, client).await;
+    let runtime_tmp = tempfile::tempdir().unwrap();
+    let (handle, _shutdown) = PodController::spawn(pod, runtime_tmp.path()).await.unwrap();
+    let mut rx = handle.subscribe();
+
+    handle
+        .send(Method::run_text("seed history"))
+        .await
+        .expect("send run");
+    loop {
+        match tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timeout waiting for run end")
+            .expect("event")
+        {
+            Event::RunEnd {
+                result: RunResult::Finished,
+            } => break,
+            _ => {}
+        }
+    }
+
+    handle.send(Method::Compact).await.expect("send compact");
+    let mut saw_start = false;
+    loop {
+        match tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timeout waiting for compact events")
+            .expect("event")
+        {
+            Event::CompactStart => saw_start = true,
+            Event::CompactDone { .. } => {
+                break;
+            }
+            Event::CompactFailed { error } => panic!("manual compact failed: {error}"),
+            _ => {}
+        }
+    }
+
+    assert!(saw_start, "manual compact should emit CompactStart");
+    let _ = handle.send(Method::Shutdown).await;
 }

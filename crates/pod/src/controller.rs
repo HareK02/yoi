@@ -732,6 +732,31 @@ async fn controller_loop<C, St>(
                 }
             }
 
+            Method::Compact => match shared_state.get_status() {
+                PodStatus::Idle => {
+                    if let Err(error) = pod.manual_compact().await {
+                        let _ = event_tx.send(Event::Error {
+                            code: worker_error_code(&error),
+                            message: error.to_string(),
+                        });
+                    }
+                }
+                PodStatus::Paused => {
+                    let _ = event_tx.send(Event::Error {
+                        code: ErrorCode::InvalidRequest,
+                        message: "Cannot compact while the Pod is paused; resume or start a fresh turn first"
+                            .into(),
+                    });
+                }
+                PodStatus::Running => {
+                    let _ = event_tx.send(Event::Error {
+                        code: ErrorCode::AlreadyRunning,
+                        message: "Pod is already executing a turn; compact can only run while idle"
+                            .into(),
+                    });
+                }
+            },
+
             Method::Shutdown => {
                 let _ = event_tx.send(Event::Shutdown);
                 break;
@@ -963,6 +988,13 @@ where
                         let _ = event_tx.send(Event::Error {
                             code: ErrorCode::AlreadyRunning,
                             message: "Pod is already executing a turn".into(),
+                        });
+                    }
+                    Some(Method::Compact) => {
+                        let _ = event_tx.send(Event::Error {
+                            code: ErrorCode::AlreadyRunning,
+                            message: "Pod is already executing a turn; compact can only run while idle"
+                                .into(),
                         });
                     }
                     Some(Method::Notify { message }) => {
@@ -1319,5 +1351,47 @@ mod tests {
             accept.is_err(),
             "expected no PodEvent for notification-originated worker error"
         );
+    }
+
+    #[tokio::test]
+    async fn compact_method_is_rejected_while_running() {
+        let mut env = make_env().await;
+        let mut events = env.event_tx.subscribe();
+        env._method_tx
+            .send(Method::Compact)
+            .await
+            .expect("send compact");
+
+        let pod_future = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Ok::<_, PodError>(PodRunResult::Finished)
+        };
+        let (status, shutdown) = drive_turn(
+            pod_future,
+            &mut env.method_rx,
+            &env.event_tx,
+            &env.cancel_tx,
+            &env.shared_state,
+            &env.notify_buffer,
+            Some(&env.parent_socket_path),
+            "child-pod",
+            &env.spawned_registry,
+            false,
+        )
+        .await;
+        assert_eq!(status, PodStatus::Idle);
+        assert!(!shutdown);
+
+        let event = tokio::time::timeout(Duration::from_secs(1), events.recv())
+            .await
+            .expect("event timeout")
+            .expect("event");
+        match event {
+            Event::Error { code, message } => {
+                assert_eq!(code, ErrorCode::AlreadyRunning);
+                assert!(message.contains("compact"), "got message: {message}");
+            }
+            other => panic!("expected compact rejection error, got {other:?}"),
+        }
     }
 }
