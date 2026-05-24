@@ -786,7 +786,6 @@ async fn controller_compact_method_emits_start_and_done() {
 
     handle.send(Method::Compact).await.expect("send compact");
     let mut saw_start = false;
-    let mut saw_done = false;
     loop {
         match tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
             .await
@@ -795,7 +794,6 @@ async fn controller_compact_method_emits_start_and_done() {
         {
             Event::CompactStart => saw_start = true,
             Event::CompactDone { .. } => {
-                saw_done = true;
                 break;
             }
             Event::CompactFailed { error } => panic!("manual compact failed: {error}"),
@@ -804,6 +802,5 @@ async fn controller_compact_method_emits_start_and_done() {
     }
 
     assert!(saw_start, "manual compact should emit CompactStart");
-    assert!(saw_done, "manual compact should emit CompactDone");
     let _ = handle.send(Method::Shutdown).await;
 }
