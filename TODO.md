@@ -16,8 +16,6 @@
   - actionbar transient notice API → [tickets/tui-actionbar-transient-notice-api.md](tickets/tui-actionbar-transient-notice-api.md)
   - user manifest env override 時の spawn scope overlay 前提ズレ → [tickets/tui-user-manifest-env-overlay.md](tickets/tui-user-manifest-env-overlay.md)
   - ユーザーマニフェストのモデル設定 wizard → [tickets/tui-user-model-setup.md](tickets/tui-user-model-setup.md)
-- メモリ機構
-  - extract / consolidation 監査ログ → [tickets/memory-audit-log.md](tickets/memory-audit-log.md)
 - セッション内 Task ツールの注意機構（無アクティビティで `<system-reminder>` ナッジ） → [tickets/session-todo-reminder.md](tickets/session-todo-reminder.md)
 - ワークスペースのメモリーをLintするヘッドレスCLI
 - system-reminder 注入機構の汎用化（2件目の利用者が出た時に検討。タグ形式 `<system-reminder>...</system-reminder>` の規約は session-todo-reminder で先行確立。注入された Item は worker.history に append する方針）
