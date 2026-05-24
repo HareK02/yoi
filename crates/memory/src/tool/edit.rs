@@ -12,6 +12,9 @@ use async_trait::async_trait;
 use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use serde::Deserialize;
 
+use crate::audit::{
+    AuditStatus, RecordOperationAudit, append_record_operation, file_hash, hash_bytes,
+};
 use crate::linter::{LintReport, Linter, WriteMode};
 use crate::tool::MemoryToolKind;
 use crate::workspace::WorkspaceLayout;
@@ -62,30 +65,94 @@ impl Tool for EditTool {
         let path = params
             .kind
             .resolve_path(&self.layout, params.slug.as_deref())?;
+        let kind = params.kind.to_string();
+        let slug = audit_slug(&params.kind, params.slug.as_deref());
 
-        let current_bytes = std::fs::read(&path).map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => ToolError::ExecutionFailed(format!(
-                "record not found (use MemoryWrite to create): {}",
-                path.display()
-            )),
-            _ => ToolError::ExecutionFailed(format!("read failed at {}: {e}", path.display())),
-        })?;
-        let current_text = std::str::from_utf8(&current_bytes).map_err(|_| {
-            ToolError::InvalidArgument(format!("file is not valid UTF-8: {}", path.display()))
-        })?;
+        let current_bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                let reason = match e.kind() {
+                    std::io::ErrorKind::NotFound => format!(
+                        "record not found (use MemoryWrite to create): {}",
+                        path.display()
+                    ),
+                    _ => format!("read failed at {}: {e}", path.display()),
+                };
+                let _ = append_record_operation(
+                    &self.layout,
+                    RecordOperationAudit {
+                        op: "edit".to_string(),
+                        status: AuditStatus::Failed,
+                        kind,
+                        slug,
+                        path: path.display().to_string(),
+                        before_hash: None,
+                        after_hash: None,
+                        reason: Some(reason.clone()),
+                    },
+                );
+                return Err(ToolError::ExecutionFailed(reason));
+            }
+        };
+        let before_hash = Some(hash_bytes(&current_bytes));
+        let current_text = match std::str::from_utf8(&current_bytes) {
+            Ok(text) => text,
+            Err(_) => {
+                let reason = format!("file is not valid UTF-8: {}", path.display());
+                let _ = append_record_operation(
+                    &self.layout,
+                    RecordOperationAudit {
+                        op: "edit".to_string(),
+                        status: AuditStatus::Failed,
+                        kind,
+                        slug,
+                        path: path.display().to_string(),
+                        before_hash,
+                        after_hash: None,
+                        reason: Some(reason.clone()),
+                    },
+                );
+                return Err(ToolError::InvalidArgument(reason));
+            }
+        };
 
         let count = current_text.matches(&params.old_string).count();
         if count == 0 {
-            return Err(ToolError::InvalidArgument(format!(
-                "old_string not found in {}",
-                path.display()
-            )));
+            let reason = format!("old_string not found in {}", path.display());
+            let _ = append_record_operation(
+                &self.layout,
+                RecordOperationAudit {
+                    op: "edit".to_string(),
+                    status: AuditStatus::Failed,
+                    kind,
+                    slug,
+                    path: path.display().to_string(),
+                    before_hash,
+                    after_hash: None,
+                    reason: Some(reason.clone()),
+                },
+            );
+            return Err(ToolError::InvalidArgument(reason));
         }
         if !params.replace_all && count > 1 {
-            return Err(ToolError::InvalidArgument(format!(
+            let reason = format!(
                 "old_string occurs {count} times in {}; pass replace_all: true or narrow the snippet",
                 path.display()
-            )));
+            );
+            let _ = append_record_operation(
+                &self.layout,
+                RecordOperationAudit {
+                    op: "edit".to_string(),
+                    status: AuditStatus::Failed,
+                    kind,
+                    slug,
+                    path: path.display().to_string(),
+                    before_hash,
+                    after_hash: None,
+                    reason: Some(reason.clone()),
+                },
+            );
+            return Err(ToolError::InvalidArgument(reason));
         }
 
         let new_text = if params.replace_all {
@@ -97,12 +164,58 @@ impl Tool for EditTool {
 
         let report = self.linter.lint(&path, &new_text, WriteMode::Update);
         if report.has_errors() {
-            return Err(ToolError::InvalidArgument(format_report(&report)));
+            let reason = format_report(&report);
+            let _ = append_record_operation(
+                &self.layout,
+                RecordOperationAudit {
+                    op: "edit".to_string(),
+                    status: AuditStatus::Failed,
+                    kind,
+                    slug,
+                    path: path.display().to_string(),
+                    before_hash,
+                    after_hash: None,
+                    reason: Some(reason.clone()),
+                },
+            );
+            return Err(ToolError::InvalidArgument(reason));
         }
 
-        std::fs::write(&path, new_text.as_bytes()).map_err(|e| {
-            ToolError::ExecutionFailed(format!("failed to write {}: {e}", path.display()))
-        })?;
+        if let Err(e) = std::fs::write(&path, new_text.as_bytes()) {
+            let reason = format!("failed to write {}: {e}", path.display());
+            let _ = append_record_operation(
+                &self.layout,
+                RecordOperationAudit {
+                    op: "edit".to_string(),
+                    status: AuditStatus::Failed,
+                    kind,
+                    slug,
+                    path: path.display().to_string(),
+                    before_hash,
+                    after_hash: None,
+                    reason: Some(reason.clone()),
+                },
+            );
+            return Err(ToolError::ExecutionFailed(reason));
+        }
+        let after_hash = file_hash(&path).ok().flatten();
+        let _ = append_record_operation(
+            &self.layout,
+            RecordOperationAudit {
+                op: "edit".to_string(),
+                status: AuditStatus::Success,
+                kind,
+                slug,
+                path: path.display().to_string(),
+                before_hash,
+                after_hash,
+                reason: if report.warnings.is_empty() {
+                    None
+                } else {
+                    Some(format!("{} warning(s)", report.warnings.len()))
+                },
+            },
+        );
 
         let summary = format!(
             "Edited {} ({} replacement{}){}",
@@ -115,6 +228,13 @@ impl Tool for EditTool {
             summary,
             content: None,
         })
+    }
+}
+
+fn audit_slug(kind: &MemoryToolKind, slug: Option<&str>) -> String {
+    match kind {
+        MemoryToolKind::Summary => "summary".to_string(),
+        _ => slug.unwrap_or("<missing>").to_string(),
     }
 }
 

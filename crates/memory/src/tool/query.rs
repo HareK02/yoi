@@ -7,8 +7,9 @@
 //! enumerate what records exist without knowing what's inside them.
 //!
 //! - `MemoryQuery` walks `.insomnia/memory/{summary.md,decisions/,
-//!   requests/}`. `.insomnia/workflow/` and `.insomnia/memory/_staging/`
-//!   are excluded by construction.
+//!   requests/}`. `.insomnia/workflow/`, `.insomnia/memory/_staging/`,
+//!   `.insomnia/memory/_usage/`, and `.insomnia/memory/_logs/` are excluded
+//!   by construction.
 //! - `KnowledgeQuery` walks `.insomnia/knowledge/*.md` and supports a
 //!   `kind` filter against the Knowledge frontmatter's `kind` field.
 //!
@@ -23,6 +24,7 @@ use async_trait::async_trait;
 use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use serde::{Deserialize, Serialize};
 
+use crate::audit::{AuditStatus, RecordUsageAudit, append_record_usage};
 use crate::schema::{KnowledgeFrontmatter, split_frontmatter};
 use crate::workspace::WorkspaceLayout;
 
@@ -128,7 +130,25 @@ impl Tool for MemoryQueryTool {
         let params: MemoryQueryParams = serde_json::from_str(input_json)
             .map_err(|e| ToolError::InvalidArgument(format!("invalid MemoryQuery input: {e}")))?;
         let needle = match params.query.as_deref() {
-            Some(q) => Some(validate_query(q)?),
+            Some(q) => match validate_query(q) {
+                Ok(q) => Some(q),
+                Err(err) => {
+                    let _ = append_record_usage(
+                        &self.layout,
+                        RecordUsageAudit {
+                            op: "query".to_string(),
+                            status: AuditStatus::Failed,
+                            kind: "memory".to_string(),
+                            slug: None,
+                            path: None,
+                            query: params.query.clone(),
+                            result_count: None,
+                            reason: Some(err.to_string()),
+                        },
+                    );
+                    return Err(err);
+                }
+            },
             None => None,
         };
 
@@ -194,6 +214,23 @@ impl Tool for MemoryQueryTool {
             Some(q) => format!("{} hit(s) for {q:?}", records.len()),
             None => format!("{} record(s)", records.len()),
         };
+        let _ = append_record_usage(
+            &self.layout,
+            RecordUsageAudit {
+                op: "query".to_string(),
+                status: AuditStatus::Success,
+                kind: "memory".to_string(),
+                slug: None,
+                path: None,
+                query: params.query.clone(),
+                result_count: Some(records.len()),
+                reason: if records.len() >= limit {
+                    Some("result_limit_reached".to_string())
+                } else {
+                    None
+                },
+            },
+        );
         Ok(ToolOutput {
             summary,
             content: Some(body),
@@ -208,7 +245,25 @@ impl Tool for KnowledgeQueryTool {
             ToolError::InvalidArgument(format!("invalid KnowledgeQuery input: {e}"))
         })?;
         let needle = match params.query.as_deref() {
-            Some(q) => Some(validate_query(q)?),
+            Some(q) => match validate_query(q) {
+                Ok(q) => Some(q),
+                Err(err) => {
+                    let _ = append_record_usage(
+                        &self.layout,
+                        RecordUsageAudit {
+                            op: "query".to_string(),
+                            status: AuditStatus::Failed,
+                            kind: "knowledge".to_string(),
+                            slug: None,
+                            path: None,
+                            query: params.query.clone(),
+                            result_count: None,
+                            reason: Some(err.to_string()),
+                        },
+                    );
+                    return Err(err);
+                }
+            },
             None => None,
         };
         let kind_filter = params.kind.as_deref();
@@ -272,6 +327,23 @@ impl Tool for KnowledgeQueryTool {
             Some(q) => format!("{} hit(s) for {q:?}", records.len()),
             None => format!("{} record(s)", records.len()),
         };
+        let _ = append_record_usage(
+            &self.layout,
+            RecordUsageAudit {
+                op: "query".to_string(),
+                status: AuditStatus::Success,
+                kind: "knowledge".to_string(),
+                slug: None,
+                path: None,
+                query: params.query.clone(),
+                result_count: Some(records.len()),
+                reason: if records.len() >= limit {
+                    Some("result_limit_reached".to_string())
+                } else {
+                    None
+                },
+            },
+        );
         Ok(ToolOutput {
             summary,
             content: Some(body),

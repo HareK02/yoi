@@ -425,6 +425,11 @@ pub enum Event {
         result: serde_json::Value,
     },
     Alert(Alert),
+    /// Latest memory extract/consolidation lifecycle event for UI observability.
+    ///
+    /// This is not part of LLM history or prompt context; clients may display it
+    /// briefly as operational status.
+    MemoryWorker(MemoryWorkerEvent),
     /// Pod has started compacting the current session.
     ///
     /// Fired immediately before a compaction run. Success is signalled by
@@ -455,6 +460,19 @@ pub enum Event {
 pub struct Alert {
     pub level: AlertLevel,
     pub source: AlertSource,
+    pub message: String,
+    /// Milliseconds since the Unix epoch.
+    pub timestamp_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryWorkerEvent {
+    pub worker: String,
+    pub status: String,
+    pub run_id: String,
+    pub trigger: String,
+    pub reason: String,
+    /// Human-readable compact form for actionbar rendering.
     pub message: String,
     /// Milliseconds since the Unix epoch.
     pub timestamp_ms: i64,

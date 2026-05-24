@@ -2596,6 +2596,25 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         // `Some(0)` means disabled, same as `None`. Otherwise the
         // `tokens_since >= 0` comparison would fire on every post-run.
         let Some(threshold) = memory_cfg.extract_threshold.filter(|n| *n > 0) else {
+            let layout = memory::WorkspaceLayout::resolve(&memory_cfg, &self.pwd);
+            let model = memory_cfg
+                .extract_model
+                .as_ref()
+                .unwrap_or(&self.manifest.model);
+            WorkerAuditBase::new(
+                memory::audit::AuditWorker::MemoryExtract,
+                memory::audit::AuditTrigger::TokenThreshold,
+                Some(model_audit_from_manifest(model)),
+            )
+            .emit(
+                &layout,
+                self.event_tx.as_ref(),
+                memory::audit::WorkerLifecycleStatus::Skipped,
+                "extract_threshold_disabled",
+                None,
+                None,
+                None,
+            );
             return Ok(());
         };
 
@@ -2607,6 +2626,25 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                 .is_err()
             {
+                let layout = memory::WorkspaceLayout::resolve(&memory_cfg, &self.pwd);
+                let model = memory_cfg
+                    .extract_model
+                    .as_ref()
+                    .unwrap_or(&self.manifest.model);
+                WorkerAuditBase::new(
+                    memory::audit::AuditWorker::MemoryExtract,
+                    memory::audit::AuditTrigger::TokenThreshold,
+                    Some(model_audit_from_manifest(model)),
+                )
+                .emit(
+                    &layout,
+                    self.event_tx.as_ref(),
+                    memory::audit::WorkerLifecycleStatus::Skipped,
+                    "extract_already_in_flight",
+                    None,
+                    None,
+                    None,
+                );
                 return Ok(());
             }
             let result = self.run_extract_once(&memory_cfg, threshold).await;
@@ -2644,6 +2682,18 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     ) -> Result<ExtractDecision, PodError> {
         use memory::extract;
 
+        let layout = memory::WorkspaceLayout::resolve(memory_cfg, &self.pwd);
+        let model = memory_cfg
+            .extract_model
+            .as_ref()
+            .unwrap_or(&self.manifest.model);
+        let audit = WorkerAuditBase::new(
+            memory::audit::AuditWorker::MemoryExtract,
+            memory::audit::AuditTrigger::TokenThreshold,
+            Some(model_audit_from_manifest(model)),
+        );
+        let event_tx = self.event_tx.as_ref();
+
         let pointer_snapshot = self
             .extract_pointer
             .lock()
@@ -2656,6 +2706,17 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
 
         let tokens_since = self.tokens_added_since(processed_history_len);
         if tokens_since < threshold {
+            audit.emit(
+                &layout,
+                event_tx,
+                memory::audit::WorkerLifecycleStatus::Skipped,
+                format!(
+                    "token_threshold_not_reached tokens_since={tokens_since} threshold={threshold}"
+                ),
+                None,
+                None,
+                None,
+            );
             return Ok(ExtractDecision::Skipped);
         }
 
@@ -2666,6 +2727,18 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             .history()
             .len();
         if current_history_len <= processed_history_len {
+            audit.emit(
+                &layout,
+                event_tx,
+                memory::audit::WorkerLifecycleStatus::Skipped,
+                "no_new_history_items",
+                None,
+                Some(memory::audit::ExtractAudit {
+                    history_range: Some([processed_history_len as u64, current_history_len as u64]),
+                    ..Default::default()
+                }),
+                None,
+            );
             return Ok(ExtractDecision::Skipped);
         }
 
@@ -2677,6 +2750,15 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             .read_all(self.session_id(), self.segment_id())?
             .len();
         if entries_now == 0 {
+            audit.emit(
+                &layout,
+                event_tx,
+                memory::audit::WorkerLifecycleStatus::Skipped,
+                "empty_segment_log",
+                None,
+                None,
+                None,
+            );
             return Ok(ExtractDecision::Skipped);
         }
         let end_entry = entries_now - 1;
@@ -2685,42 +2767,118 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             .map(|p| p.processed_through_entry + 1)
             .unwrap_or(0);
         if start_entry > end_entry {
+            audit.emit(
+                &layout,
+                event_tx,
+                memory::audit::WorkerLifecycleStatus::Skipped,
+                "no_new_segment_entries",
+                None,
+                Some(memory::audit::ExtractAudit {
+                    session_id: Some(self.session_id().to_string()),
+                    segment_id: Some(self.segment_id().to_string()),
+                    entry_range: Some([start_entry as u64, end_entry as u64]),
+                    history_range: Some([processed_history_len as u64, current_history_len as u64]),
+                    ..Default::default()
+                }),
+                None,
+            );
             return Ok(ExtractDecision::Skipped);
         }
+
+        let extract_audit_base = memory::audit::ExtractAudit {
+            session_id: Some(self.session_id().to_string()),
+            segment_id: Some(self.segment_id().to_string()),
+            entry_range: Some([start_entry as u64, end_entry as u64]),
+            history_range: Some([processed_history_len as u64, current_history_len as u64]),
+            ..Default::default()
+        };
+        audit.emit(
+            &layout,
+            event_tx,
+            memory::audit::WorkerLifecycleStatus::Started,
+            format!("token_threshold_reached tokens_since={tokens_since} threshold={threshold}"),
+            None,
+            Some(extract_audit_base.clone()),
+            None,
+        );
 
         let items_to_extract = self.worker.as_ref().expect("worker present").history()
             [processed_history_len..current_history_len]
             .to_vec();
 
-        let layout = memory::WorkspaceLayout::resolve(memory_cfg, &self.pwd);
         let extract_worker_max_turns = memory_cfg
             .extract_worker_max_turns
             .or(manifest::defaults::MEMORY_EXTRACT_WORKER_MAX_TURNS);
 
-        let client = self.build_extractor_client(memory_cfg)?;
+        let client = match self.build_extractor_client(memory_cfg) {
+            Ok(client) => client,
+            Err(err) => {
+                audit.emit(
+                    &layout,
+                    event_tx,
+                    memory::audit::WorkerLifecycleStatus::Failed,
+                    format!("client_build_failed: {err}"),
+                    None,
+                    Some(extract_audit_base),
+                    None,
+                );
+                return Err(err);
+            }
+        };
         let memory_language = memory_language(memory_cfg);
-        let extract_system_prompt = self
-            .prompts
-            .memory_extract_system(memory_language)
-            .map_err(PodError::PromptCatalog)?;
+        let extract_system_prompt = match self.prompts.memory_extract_system(memory_language) {
+            Ok(prompt) => prompt,
+            Err(err) => {
+                audit.emit(
+                    &layout,
+                    event_tx,
+                    memory::audit::WorkerLifecycleStatus::Failed,
+                    format!("prompt_render_failed: {err}"),
+                    None,
+                    Some(extract_audit_base),
+                    None,
+                );
+                return Err(PodError::PromptCatalog(err));
+            }
+        };
         let mut extract_worker = Worker::new(client).system_prompt(extract_system_prompt);
         extract_worker.set_cache_key(Some(self.segment_id().to_string()));
 
         extract_worker.set_max_turns(extract_worker_max_turns);
 
+        let usage_capture = Arc::new(Mutex::new(None));
+        let usage_capture_for_worker = usage_capture.clone();
+        extract_worker.on_usage(move |event| {
+            *usage_capture_for_worker
+                .lock()
+                .expect("memory extract usage capture poisoned") =
+                Some(usage_audit_from_event(event));
+        });
+
         let ctx = Arc::new(extract::ExtractWorkerContext::new());
         extract_worker.register_tool(extract::write_extracted_tool(ctx.clone()));
 
         let input_text = extract::build_extract_input(&items_to_extract);
-        extract_worker
-            .run(input_text)
-            .await
-            .map_err(PodError::Worker)?;
+        if let Err(err) = extract_worker.run(input_text).await {
+            let usage = usage_capture
+                .lock()
+                .expect("memory extract usage capture poisoned")
+                .clone();
+            audit.emit(
+                &layout,
+                event_tx,
+                lifecycle_status_for_worker_error(&err),
+                format!("worker_failed: {err}"),
+                usage,
+                Some(extract_audit_base),
+                None,
+            );
+            return Err(PodError::Worker(err));
+        }
 
         let payload = ctx.take_payload().unwrap_or_else(|| {
             tracing::warn!(
-                "extract worker did not call write_extracted; \
-                 advancing pointer with empty payload"
+                "extract worker did not call write_extracted; advancing pointer with empty payload"
             );
             extract::ExtractedPayload::default()
         });
@@ -2733,15 +2891,32 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 segment_id: source_segment_id.to_string(),
                 range: [start_entry as u64, end_entry as u64],
             };
-            let (id, _) = extract::write_staging(&layout, source, payload)
-                .map_err(PodError::ExtractStaging)?;
+            let (id, _) = match extract::write_staging(&layout, source, payload) {
+                Ok(result) => result,
+                Err(err) => {
+                    let usage = usage_capture
+                        .lock()
+                        .expect("memory extract usage capture poisoned")
+                        .clone();
+                    audit.emit(
+                        &layout,
+                        event_tx,
+                        memory::audit::WorkerLifecycleStatus::Failed,
+                        format!("staging_write_failed: {err}"),
+                        usage,
+                        Some(extract_audit_base),
+                        None,
+                    );
+                    return Err(PodError::ExtractStaging(err));
+                }
+            };
             id.to_string()
         };
 
         let pointer_payload = extract::ExtractPointerPayload {
             processed_through_entry: end_entry,
             processed_through_history_len: current_history_len,
-            staging_id,
+            staging_id: staging_id.clone(),
         };
         let payload_value = serde_json::to_value(&pointer_payload)
             .expect("ExtractPointerPayload is always JSON-serializable");
@@ -2755,6 +2930,37 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             .extract_pointer
             .lock()
             .expect("extract_pointer poisoned") = Some(pointer_payload);
+
+        let mut extract_audit = extract_audit_base;
+        if !staging_id.is_empty() {
+            extract_audit.staging_count = 1;
+            extract_audit.staging_ids.push(staging_id.clone());
+            extract_audit.staging_paths.push(
+                layout
+                    .staging_dir()
+                    .join(format!("{staging_id}.json"))
+                    .display()
+                    .to_string(),
+            );
+        }
+        let usage = usage_capture
+            .lock()
+            .expect("memory extract usage capture poisoned")
+            .clone();
+        let reason = if staging_id.is_empty() {
+            "completed_no_staging_output"
+        } else {
+            "completed_staging_written"
+        };
+        audit.emit(
+            &layout,
+            event_tx,
+            memory::audit::WorkerLifecycleStatus::Completed,
+            reason,
+            usage,
+            Some(extract_audit),
+            None,
+        );
 
         Ok(ExtractDecision::Completed)
     }
@@ -2799,6 +3005,25 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         let files_threshold = memory_cfg.consolidation_threshold_files.filter(|n| *n > 0);
         let bytes_threshold = memory_cfg.consolidation_threshold_bytes.filter(|n| *n > 0);
         if files_threshold.is_none() && bytes_threshold.is_none() {
+            let layout = memory::WorkspaceLayout::resolve(&memory_cfg, &self.pwd);
+            let model = memory_cfg
+                .consolidation_model
+                .as_ref()
+                .unwrap_or(&self.manifest.model);
+            WorkerAuditBase::new(
+                memory::audit::AuditWorker::MemoryConsolidation,
+                memory::audit::AuditTrigger::StagingBacklog,
+                Some(model_audit_from_manifest(model)),
+            )
+            .emit(
+                &layout,
+                self.event_tx.as_ref(),
+                memory::audit::WorkerLifecycleStatus::Skipped,
+                "consolidation_threshold_disabled",
+                None,
+                None,
+                None,
+            );
             return Ok(());
         }
 
@@ -2808,6 +3033,25 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                 .is_err()
             {
+                let layout = memory::WorkspaceLayout::resolve(&memory_cfg, &self.pwd);
+                let model = memory_cfg
+                    .consolidation_model
+                    .as_ref()
+                    .unwrap_or(&self.manifest.model);
+                WorkerAuditBase::new(
+                    memory::audit::AuditWorker::MemoryConsolidation,
+                    memory::audit::AuditTrigger::StagingBacklog,
+                    Some(model_audit_from_manifest(model)),
+                )
+                .emit(
+                    &layout,
+                    self.event_tx.as_ref(),
+                    memory::audit::WorkerLifecycleStatus::Skipped,
+                    "consolidation_already_in_flight",
+                    None,
+                    None,
+                    None,
+                );
                 return Ok(());
             }
             let result = self
@@ -2843,21 +3087,57 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         use memory::consolidate;
 
         let layout = memory::WorkspaceLayout::resolve(memory_cfg, &self.pwd);
+        let model = memory_cfg
+            .consolidation_model
+            .as_ref()
+            .unwrap_or(&self.manifest.model);
+        let audit = WorkerAuditBase::new(
+            memory::audit::AuditWorker::MemoryConsolidation,
+            memory::audit::AuditTrigger::StagingBacklog,
+            Some(model_audit_from_manifest(model)),
+        );
+        let event_tx = self.event_tx.as_ref();
 
         let entries = consolidate::list_staging_entries(&layout);
         if entries.is_empty() {
+            audit.emit(
+                &layout,
+                event_tx,
+                memory::audit::WorkerLifecycleStatus::Skipped,
+                "no_staging_entries",
+                None,
+                None,
+                Some(memory::audit::ConsolidationAudit::default()),
+            );
             return Ok(ConsolidateDecision::Skipped);
         }
 
         let total_files = entries.len();
         let total_bytes: u64 = entries.iter().map(|e| e.bytes).sum();
+        let consumed_ids: Vec<uuid::Uuid> = entries.iter().map(|e| e.id).collect();
+        let base_consolidation = memory::audit::ConsolidationAudit {
+            staging_count: total_files,
+            staging_bytes: total_bytes,
+            consumed_staging_ids: consumed_ids.iter().map(ToString::to_string).collect(),
+            operations: memory::audit::OperationCounts::default(),
+        };
         let files_hit = files_threshold.is_some_and(|n| total_files >= n);
         let bytes_hit = bytes_threshold.is_some_and(|n| total_bytes >= n);
         if !files_hit && !bytes_hit {
+            audit.emit(
+                &layout,
+                event_tx,
+                memory::audit::WorkerLifecycleStatus::Skipped,
+                format!(
+                    "threshold_not_reached files={total_files} bytes={total_bytes} files_threshold={files_threshold:?} bytes_threshold={bytes_threshold:?}"
+                ),
+                None,
+                None,
+                Some(base_consolidation),
+            );
             return Ok(ConsolidateDecision::Skipped);
         }
 
-        let consumed_ids: Vec<uuid::Uuid> = entries.iter().map(|e| e.id).collect();
         let lock = match consolidate::StagingLock::acquire(
             &layout,
             std::process::id(),
@@ -2866,15 +3146,56 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         ) {
             Ok(l) => l,
             Err(memory::consolidate::LockError::InUse { .. }) => {
+                audit.emit(
+                    &layout,
+                    event_tx,
+                    memory::audit::WorkerLifecycleStatus::Skipped,
+                    "staging_lock_in_use",
+                    None,
+                    None,
+                    Some(base_consolidation),
+                );
                 return Ok(ConsolidateDecision::Skipped);
             }
-            Err(e) => return Err(PodError::ConsolidationLock(e)),
+            Err(e) => {
+                audit.emit(
+                    &layout,
+                    event_tx,
+                    memory::audit::WorkerLifecycleStatus::Failed,
+                    format!("staging_lock_failed: {e}"),
+                    None,
+                    None,
+                    Some(base_consolidation),
+                );
+                return Err(PodError::ConsolidationLock(e));
+            }
         };
+
+        audit.emit(
+            &layout,
+            event_tx,
+            memory::audit::WorkerLifecycleStatus::Started,
+            format!("staging_threshold_reached files={total_files} bytes={total_bytes}"),
+            None,
+            None,
+            Some(base_consolidation.clone()),
+        );
+
+        let before_records = memory::audit::snapshot_records(&layout);
 
         let client = match self.build_consolidator_client(memory_cfg) {
             Ok(c) => c,
             Err(e) => {
                 lock.release_only();
+                audit.emit(
+                    &layout,
+                    event_tx,
+                    memory::audit::WorkerLifecycleStatus::Failed,
+                    format!("client_build_failed: {e}"),
+                    None,
+                    None,
+                    Some(base_consolidation),
+                );
                 return Err(e);
             }
         };
@@ -2884,11 +3205,29 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 Ok(p) => p,
                 Err(e) => {
                     lock.release_only();
+                    audit.emit(
+                        &layout,
+                        event_tx,
+                        memory::audit::WorkerLifecycleStatus::Failed,
+                        format!("prompt_render_failed: {e}"),
+                        None,
+                        None,
+                        Some(base_consolidation),
+                    );
                     return Err(PodError::PromptCatalog(e));
                 }
             };
         let mut worker = Worker::new(client).system_prompt(consolidation_system_prompt);
         worker.set_cache_key(Some(self.segment_id().to_string()));
+
+        let usage_capture = Arc::new(Mutex::new(None));
+        let usage_capture_for_worker = usage_capture.clone();
+        worker.on_usage(move |event| {
+            *usage_capture_for_worker
+                .lock()
+                .expect("memory consolidation usage capture poisoned") =
+                Some(usage_audit_from_event(event));
+        });
 
         // Memory tools are self-contained — they bypass ScopedFs and write
         // directly under the workspace via WorkspaceLayout. Resident
@@ -2904,6 +3243,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         ));
         worker.register_tool(memory::tool::write_tool(layout.clone()));
         worker.register_tool(memory::tool::edit_tool(layout.clone()));
+        worker.register_tool(memory::tool::delete_tool(layout.clone()));
         worker.register_tool(memory::tool::memory_query_tool(layout.clone(), query_cfg));
         worker.register_tool(memory::tool::knowledge_query_tool(
             layout.clone(),
@@ -2922,16 +3262,156 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             consolidate::build_consolidate_input(&layout, &entries, &tidy, &usage_report);
 
         let run_result = worker.run(input_text).await;
+        let usage = usage_capture
+            .lock()
+            .expect("memory consolidation usage capture poisoned")
+            .clone();
         match run_result {
             Ok(_) => {
                 lock.release_with_cleanup(&layout);
+                let after_records = memory::audit::snapshot_records(&layout);
+                let mut consolidation = base_consolidation;
+                consolidation.operations =
+                    memory::audit::operation_counts_from_snapshots(&before_records, &after_records);
+                let reason = if consolidation.operations.total_record_changes() == 0 {
+                    "completed_no_record_changes"
+                } else {
+                    "completed_record_changes"
+                };
+                audit.emit(
+                    &layout,
+                    event_tx,
+                    memory::audit::WorkerLifecycleStatus::Completed,
+                    reason,
+                    usage,
+                    None,
+                    Some(consolidation),
+                );
                 Ok(ConsolidateDecision::Completed)
             }
             Err(e) => {
                 lock.release_only();
+                audit.emit(
+                    &layout,
+                    event_tx,
+                    lifecycle_status_for_worker_error(&e),
+                    format!("worker_failed: {e}"),
+                    usage,
+                    None,
+                    Some(base_consolidation),
+                );
                 Err(PodError::Worker(e))
             }
         }
+    }
+}
+
+fn lifecycle_status_for_worker_error(err: &WorkerError) -> memory::audit::WorkerLifecycleStatus {
+    if matches!(err, WorkerError::Cancelled) {
+        memory::audit::WorkerLifecycleStatus::Cancelled
+    } else {
+        memory::audit::WorkerLifecycleStatus::Failed
+    }
+}
+
+fn usage_audit_from_event(
+    event: &llm_worker::llm_client::event::UsageEvent,
+) -> memory::audit::UsageAudit {
+    memory::audit::UsageAudit {
+        input_tokens: event.input_tokens,
+        output_tokens: event.output_tokens,
+        total_tokens: event.total_tokens,
+        cache_read_input_tokens: event.cache_read_input_tokens,
+        cache_creation_input_tokens: event.cache_creation_input_tokens,
+    }
+}
+
+fn model_audit_from_manifest(model: &manifest::ModelManifest) -> memory::audit::ModelAudit {
+    memory::audit::ModelAudit {
+        ref_: model.ref_.clone(),
+        scheme: model.scheme.map(|scheme| format!("{scheme:?}")),
+        model_id: model.model_id.clone(),
+    }
+}
+
+fn emit_memory_worker_event(
+    event_tx: Option<&broadcast::Sender<Event>>,
+    run_id: uuid::Uuid,
+    worker: memory::audit::AuditWorker,
+    status: memory::audit::WorkerLifecycleStatus,
+    trigger: memory::audit::AuditTrigger,
+    reason: &str,
+) {
+    let Some(event_tx) = event_tx else {
+        return;
+    };
+    let message = format!("memory {} {}: {reason}", worker.label(), status.label());
+    let _ = event_tx.send(Event::MemoryWorker(protocol::MemoryWorkerEvent {
+        worker: worker.label().to_string(),
+        status: status.label().to_string(),
+        run_id: run_id.to_string(),
+        trigger: trigger.label().to_string(),
+        reason: reason.to_string(),
+        message,
+        timestamp_ms: segment_log::now_millis() as i64,
+    }));
+}
+
+#[derive(Debug, Clone)]
+struct WorkerAuditBase {
+    run_id: uuid::Uuid,
+    worker: memory::audit::AuditWorker,
+    trigger: memory::audit::AuditTrigger,
+    model: Option<memory::audit::ModelAudit>,
+}
+
+impl WorkerAuditBase {
+    fn new(
+        worker: memory::audit::AuditWorker,
+        trigger: memory::audit::AuditTrigger,
+        model: Option<memory::audit::ModelAudit>,
+    ) -> Self {
+        Self {
+            run_id: uuid::Uuid::now_v7(),
+            worker,
+            trigger,
+            model,
+        }
+    }
+
+    fn emit(
+        &self,
+        layout: &memory::WorkspaceLayout,
+        event_tx: Option<&broadcast::Sender<Event>>,
+        status: memory::audit::WorkerLifecycleStatus,
+        reason: impl Into<String>,
+        usage: Option<memory::audit::UsageAudit>,
+        extract: Option<memory::audit::ExtractAudit>,
+        consolidation: Option<memory::audit::ConsolidationAudit>,
+    ) {
+        let reason = reason.into();
+        let _ = memory::audit::append_worker_lifecycle(
+            layout,
+            memory::audit::WorkerLifecycleAudit {
+                run_id: self.run_id,
+                worker: self.worker,
+                status,
+                trigger: self.trigger,
+                reason: reason.clone(),
+                model: self.model.clone(),
+                usage,
+                extract,
+                consolidation,
+            },
+        );
+        emit_memory_worker_event(
+            event_tx,
+            self.run_id,
+            self.worker,
+            status,
+            self.trigger,
+            &reason,
+        );
     }
 }
 

@@ -11,6 +11,7 @@
 //! - `<root>/.insomnia/memory/decisions/<slug>.md`
 //! - `<root>/.insomnia/memory/requests/<slug>.md`
 //! - `<root>/.insomnia/memory/_staging/<id>.json`
+//! - `<root>/.insomnia/memory/_logs/current.log` (append-only audit log)
 //!
 //! `memory/` is reserved for session-derived / generated state;
 //! Workflows are human-managed and live one level up under
@@ -24,6 +25,7 @@ use std::path::{Path, PathBuf};
 
 use crate::Slug;
 use crate::error::LintError;
+#[cfg(test)]
 use lint_common::RecordLintError;
 
 const INSOMNIA_DIR: &str = ".insomnia";
@@ -35,7 +37,9 @@ const DECISIONS_DIR: &str = "decisions";
 const REQUESTS_DIR: &str = "requests";
 const STAGING_DIR: &str = "_staging";
 const USAGE_DIR: &str = "_usage";
+const LOGS_DIR: &str = "_logs";
 const USAGE_EVENTS_FILE: &str = "events.jsonl";
+const AUDIT_CURRENT_LOG_FILE: &str = "current.log";
 
 /// What kind of record a path under the memory tree represents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,6 +141,18 @@ impl WorkspaceLayout {
         self.usage_dir().join(USAGE_EVENTS_FILE)
     }
 
+    pub fn audit_logs_dir(&self) -> PathBuf {
+        self.memory_dir().join(LOGS_DIR)
+    }
+
+    /// Tail-friendly latest memory audit log path.
+    ///
+    /// Operators can inspect live memory worker and tool events with:
+    /// `tail -f .insomnia/memory/_logs/current.log`.
+    pub fn audit_current_log_path(&self) -> PathBuf {
+        self.audit_logs_dir().join(AUDIT_CURRENT_LOG_FILE)
+    }
+
     pub fn decision_path(&self, slug: &Slug) -> PathBuf {
         self.decisions_dir().join(format!("{slug}.md"))
     }
@@ -156,7 +172,7 @@ impl WorkspaceLayout {
     /// Classify a path under the memory tree. Returns `None` if the
     /// path is not under `.insomnia/memory/` or `.insomnia/knowledge/`
     /// of this workspace, or if it lives in
-    /// `_staging/` / `_usage/` (opaque subsystem-owned trees).
+    /// `_staging/` / `_usage/` / `_logs/` (opaque subsystem-owned trees).
     ///
     /// On a conventional path that's *almost* a record but malformed
     /// (e.g. `.insomnia/memory/decisions/Foo.md` with an invalid slug),
@@ -189,7 +205,7 @@ impl WorkspaceLayout {
                 slug: None,
             }));
         }
-        if first == STAGING_DIR || first == USAGE_DIR {
+        if first == STAGING_DIR || first == USAGE_DIR || first == LOGS_DIR {
             // Linter opts out of subsystem-owned opaque trees.
             return Ok(None);
         }
@@ -296,6 +312,14 @@ mod tests {
     fn usage_tree_is_opaque_to_classifier() {
         let cp = layout()
             .classify(&PathBuf::from("/ws/.insomnia/memory/_usage/events.jsonl"))
+            .unwrap();
+        assert!(cp.is_none());
+    }
+
+    #[test]
+    fn logs_tree_is_opaque_to_classifier() {
+        let cp = layout()
+            .classify(&PathBuf::from("/ws/.insomnia/memory/_logs/current.log"))
             .unwrap();
         assert!(cp.is_none());
     }

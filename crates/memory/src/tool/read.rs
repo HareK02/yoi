@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use serde::Deserialize;
 
+use crate::audit::{AuditStatus, RecordUsageAudit, append_record_usage};
 use crate::tool::MemoryToolKind;
 use crate::usage::{self, UsageSource};
 use crate::workspace::WorkspaceLayout;
@@ -51,13 +52,32 @@ impl Tool for ReadTool {
         let path = params
             .kind
             .resolve_path(&self.layout, params.slug.as_deref())?;
+        let kind = params.kind.to_string();
+        let slug = audit_slug(&params.kind, params.slug.as_deref());
 
-        let bytes = std::fs::read(&path).map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => {
-                ToolError::ExecutionFailed(format!("record not found: {}", path.display()))
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                let reason = match e.kind() {
+                    std::io::ErrorKind::NotFound => format!("record not found: {}", path.display()),
+                    _ => format!("read failed at {}: {e}", path.display()),
+                };
+                let _ = append_record_usage(
+                    &self.layout,
+                    RecordUsageAudit {
+                        op: "read".to_string(),
+                        status: AuditStatus::Failed,
+                        kind,
+                        slug: Some(slug),
+                        path: Some(path.display().to_string()),
+                        query: None,
+                        result_count: None,
+                        reason: Some(reason.clone()),
+                    },
+                );
+                return Err(ToolError::ExecutionFailed(reason));
             }
-            _ => ToolError::ExecutionFailed(format!("read failed at {}: {e}", path.display())),
-        })?;
+        };
 
         let text = String::from_utf8_lossy(&bytes).into_owned();
         if let Some(segment_id) = self.usage_session_id.as_deref() {
@@ -97,10 +117,35 @@ impl Tool for ReadTool {
             )
         };
 
+        let _ = append_record_usage(
+            &self.layout,
+            RecordUsageAudit {
+                op: "read".to_string(),
+                status: AuditStatus::Success,
+                kind,
+                slug: Some(slug),
+                path: Some(path.display().to_string()),
+                query: None,
+                result_count: Some(rendered.line_count),
+                reason: if rendered.truncated {
+                    Some("truncated".to_string())
+                } else {
+                    None
+                },
+            },
+        );
+
         Ok(ToolOutput {
             summary,
             content: Some(rendered.body),
         })
+    }
+}
+
+fn audit_slug(kind: &MemoryToolKind, slug: Option<&str>) -> String {
+    match kind {
+        MemoryToolKind::Summary => "summary".to_string(),
+        _ => slug.unwrap_or("<missing>").to_string(),
     }
 }
 
