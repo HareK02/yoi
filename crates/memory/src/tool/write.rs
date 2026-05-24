@@ -12,6 +12,9 @@ use async_trait::async_trait;
 use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use serde::Deserialize;
 
+use crate::audit::{
+    AuditStatus, RecordOperationAudit, append_record_operation, file_hash, hash_bytes,
+};
 use crate::linter::{LintReport, Linter, WriteMode};
 use crate::tool::MemoryToolKind;
 use crate::workspace::WorkspaceLayout;
@@ -46,8 +49,11 @@ impl Tool for WriteTool {
         let path = params
             .kind
             .resolve_path(&self.layout, params.slug.as_deref())?;
+        let kind = params.kind.to_string();
+        let slug = audit_slug(&params.kind, params.slug.as_deref());
 
-        let already_exists = path.exists();
+        let before_hash = file_hash(&path).ok().flatten();
+        let already_exists = before_hash.is_some();
         let mode = if already_exists {
             WriteMode::Update
         } else {
@@ -56,20 +62,77 @@ impl Tool for WriteTool {
 
         let report = self.linter.lint(&path, &params.content, mode);
         if report.has_errors() {
-            return Err(ToolError::InvalidArgument(format_report(&report)));
+            let reason = format_report(&report);
+            let _ = append_record_operation(
+                &self.layout,
+                RecordOperationAudit {
+                    op: "write".to_string(),
+                    status: AuditStatus::Failed,
+                    kind,
+                    slug,
+                    path: path.display().to_string(),
+                    before_hash,
+                    after_hash: None,
+                    reason: Some(reason.clone()),
+                },
+            );
+            return Err(ToolError::InvalidArgument(reason));
         }
 
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                ToolError::ExecutionFailed(format!(
-                    "failed to create directory {}: {e}",
-                    parent.display()
-                ))
-            })?;
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                let reason = format!("failed to create directory {}: {e}", parent.display());
+                let _ = append_record_operation(
+                    &self.layout,
+                    RecordOperationAudit {
+                        op: "write".to_string(),
+                        status: AuditStatus::Failed,
+                        kind,
+                        slug,
+                        path: path.display().to_string(),
+                        before_hash,
+                        after_hash: None,
+                        reason: Some(reason.clone()),
+                    },
+                );
+                return Err(ToolError::ExecutionFailed(reason));
+            }
         }
-        std::fs::write(&path, params.content.as_bytes()).map_err(|e| {
-            ToolError::ExecutionFailed(format!("failed to write {}: {e}", path.display()))
-        })?;
+        if let Err(e) = std::fs::write(&path, params.content.as_bytes()) {
+            let reason = format!("failed to write {}: {e}", path.display());
+            let _ = append_record_operation(
+                &self.layout,
+                RecordOperationAudit {
+                    op: "write".to_string(),
+                    status: AuditStatus::Failed,
+                    kind,
+                    slug,
+                    path: path.display().to_string(),
+                    before_hash,
+                    after_hash: None,
+                    reason: Some(reason.clone()),
+                },
+            );
+            return Err(ToolError::ExecutionFailed(reason));
+        }
+        let after_hash = Some(hash_bytes(params.content.as_bytes()));
+        let _ = append_record_operation(
+            &self.layout,
+            RecordOperationAudit {
+                op: "write".to_string(),
+                status: AuditStatus::Success,
+                kind,
+                slug,
+                path: path.display().to_string(),
+                before_hash,
+                after_hash,
+                reason: if report.warnings.is_empty() {
+                    None
+                } else {
+                    Some(format!("{} warning(s)", report.warnings.len()))
+                },
+            },
+        );
 
         let summary = format!(
             "{} {}{}",
@@ -85,6 +148,13 @@ impl Tool for WriteTool {
             summary,
             content: None,
         })
+    }
+}
+
+fn audit_slug(kind: &MemoryToolKind, slug: Option<&str>) -> String {
+    match kind {
+        MemoryToolKind::Summary => "summary".to_string(),
+        _ => slug.unwrap_or("<missing>").to_string(),
     }
 }
 

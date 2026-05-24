@@ -5,10 +5,13 @@
 //! to know the on-disk layout — Search returns `{slug, kind, ...}` and
 //! that pair feeds straight into Read / Edit.
 
+mod delete;
 mod edit;
 mod query;
 mod read;
 mod write;
+
+pub use delete::delete_tool;
 
 use std::path::PathBuf;
 
@@ -32,6 +35,17 @@ pub enum MemoryToolKind {
     Decision,
     Request,
     Knowledge,
+}
+
+impl std::fmt::Display for MemoryToolKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Summary => "summary",
+            Self::Decision => "decision",
+            Self::Request => "request",
+            Self::Knowledge => "knowledge",
+        })
+    }
 }
 
 impl MemoryToolKind {

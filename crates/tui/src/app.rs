@@ -89,6 +89,8 @@ pub struct App {
     pub context_window: u64,
     pub turn_index: usize,
     pub current_tool: Option<String>,
+    /// Latest memory extract/consolidation lifecycle event for actionbar observability.
+    pub latest_memory_worker_event: Option<String>,
     /// Normal composer input that is submitted as `Method::Run`.
     pub input: InputBuffer,
     /// Separate command-line input. It is never submitted as a user message.
@@ -148,6 +150,7 @@ impl App {
             context_window: 0,
             turn_index: 0,
             current_tool: None,
+            latest_memory_worker_event: None,
             input: InputBuffer::new(),
             command_input: InputBuffer::new(),
             input_mode: CommandInputMode::Composer,
@@ -843,6 +846,9 @@ impl App {
                     source: alert.source,
                     message: alert.message,
                 });
+            }
+            Event::MemoryWorker(event) => {
+                self.latest_memory_worker_event = Some(event.message);
             }
             Event::Snapshot {
                 entries,
@@ -2081,6 +2087,26 @@ mod completion_flow_tests {
         assert_eq!(app.session_context_tokens, 42_000);
         assert_eq!(app.run_upload_tokens, 2_000);
         assert_eq!(app.run_output_tokens, 9);
+    }
+
+    #[test]
+    fn memory_worker_event_updates_actionbar_state() {
+        let mut app = App::new("test".into());
+
+        app.handle_pod_event(Event::MemoryWorker(protocol::MemoryWorkerEvent {
+            worker: "extract".into(),
+            status: "done".into(),
+            run_id: "00000000-0000-0000-0000-000000000000".into(),
+            trigger: "token_threshold".into(),
+            reason: "completed_staging_written".into(),
+            message: "memory extract done: completed_staging_written".into(),
+            timestamp_ms: 0,
+        }));
+
+        assert_eq!(
+            app.latest_memory_worker_event.as_deref(),
+            Some("memory extract done: completed_staging_written")
+        );
     }
 
     #[test]

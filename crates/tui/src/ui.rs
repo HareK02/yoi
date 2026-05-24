@@ -1218,6 +1218,11 @@ fn draw_actionbar(frame: &mut Frame, app: &App, area: Rect) {
             "Alt-q edit queued  Alt-c clear queued",
             Style::default().fg(Color::DarkGray),
         ));
+    } else if let Some(memory_event) = app.latest_memory_worker_event.as_deref() {
+        left.push(Span::styled(
+            truncate_with_ellipsis(memory_event, 72),
+            Style::default().fg(Color::Blue),
+        ));
     }
 
     let mut right: Vec<Span<'static>> = Vec::new();

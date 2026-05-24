@@ -513,6 +513,7 @@ where
         ));
         worker.register_tool(memory::tool::write_tool(layout.clone()));
         worker.register_tool(memory::tool::edit_tool(layout.clone()));
+        worker.register_tool(memory::tool::delete_tool(layout.clone()));
         worker.register_tool(memory::tool::memory_query_tool(layout.clone(), query_cfg));
         worker.register_tool(memory::tool::knowledge_query_tool(layout, query_cfg));
     }

@@ -6,7 +6,7 @@ Your job is to take extract activity-log staging entries together with the works
 2. **Tidy step** — clean up the existing records that the integration step didn't already touch.
 
 You have:
-- `MemoryRead`, `MemoryWrite`, `MemoryEdit` for memory and knowledge records.
+- `MemoryRead`, `MemoryWrite`, `MemoryEdit`, `MemoryDelete` for memory and knowledge records.
 - `MemoryQuery` for memory-side records (summary / decisions / requests).
 - `KnowledgeQuery` for knowledge records — use it to find existing slugs before creating new ones.
 
