@@ -834,7 +834,11 @@ fn handle_command_key(app: &mut App, key: KeyEvent) -> Option<Method> {
         }
         KeyCode::Enter => app.submit_command(),
         KeyCode::Backspace => {
-            app.delete_char_before();
+            if app.command_text().is_empty() {
+                app.exit_command_mode();
+            } else {
+                app.delete_char_before();
+            }
             None
         }
         KeyCode::Delete => {
@@ -1171,6 +1175,59 @@ mod tests {
         assert!(handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).is_none());
         assert!(!app.is_command_mode());
         assert_eq!(input_text(&app), "");
+    }
+
+    #[test]
+    fn command_mode_empty_backspace_restores_composer() {
+        let mut app = App::new("agent".to_string());
+        assert!(
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE)
+            )
+            .is_none()
+        );
+        assert!(app.is_command_mode());
+        assert_eq!(app.command_text(), "");
+
+        assert!(
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)
+            )
+            .is_none()
+        );
+        assert!(!app.is_command_mode());
+        assert_eq!(input_text(&app), "");
+    }
+
+    #[test]
+    fn command_mode_non_empty_backspace_keeps_command_mode() {
+        let mut app = App::new("agent".to_string());
+        assert!(
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE)
+            )
+            .is_none()
+        );
+        assert!(
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE)
+            )
+            .is_none()
+        );
+
+        assert!(
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)
+            )
+            .is_none()
+        );
+        assert!(app.is_command_mode());
+        assert_eq!(app.command_text(), "");
     }
 
     #[test]

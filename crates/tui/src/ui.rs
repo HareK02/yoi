@@ -27,6 +27,7 @@ use protocol::{AlertLevel, CompletionEntry, Greeting, PodEvent, Segment};
 
 use crate::app::{App, CompletionState, alert_source_label, fmt_tokens};
 use crate::block::{Block, CompactEvent, ThinkingBlock, ThinkingState};
+use crate::command::CommandCandidate;
 use crate::task::{TaskCounts, TaskEntry, TaskStatus, TaskStore};
 
 /// Display density for the history view.
@@ -95,9 +96,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_status(frame, app, chunks[4]);
     draw_input(frame, app, &input_render, chunks[5]);
     draw_actionbar(frame, app, chunks[6]);
-    if !app.is_command_mode()
-        && let Some(state) = app.completion.as_ref().filter(|c| c.is_active())
-    {
+    if app.is_command_mode() {
+        draw_command_popup(frame, app, chunks[5]);
+    } else if let Some(state) = app.completion.as_ref().filter(|c| c.is_active()) {
         draw_completion_popup(frame, state, chunks[5]);
     }
 }
@@ -254,6 +255,49 @@ fn draw_completion_popup(frame: &mut Frame, state: &CompletionState, input_area:
     }
     frame.render_widget(Clear, popup_area);
     frame.render_widget(Paragraph::new(lines), popup_area);
+}
+
+fn draw_command_popup(frame: &mut Frame, app: &App, input_area: Rect) {
+    let suggestions = app.command_suggestions();
+    if suggestions.is_empty() || input_area.y == 0 {
+        return;
+    }
+
+    let visible = suggestions.len().min(CompletionState::MAX_VISIBLE);
+    let visible_suggestions = &suggestions[..visible];
+    let max_label = visible_suggestions
+        .iter()
+        .map(|candidate| command_suggestion_label(candidate).width() as u16)
+        .max()
+        .unwrap_or(0);
+    let popup_w = max_label.saturating_add(2).min(input_area.width).max(1);
+    let popup_h = (visible as u16).min(input_area.y);
+    let popup_area = Rect::new(
+        input_area.x,
+        input_area.y.saturating_sub(popup_h),
+        popup_w,
+        popup_h,
+    );
+
+    let command_style = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    let description_style = Style::default().fg(Color::DarkGray);
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(popup_h as usize);
+    for candidate in visible_suggestions.iter().take(popup_h as usize) {
+        lines.push(Line::from(vec![
+            Span::styled(candidate.name.to_owned(), command_style),
+            Span::styled(" — ", description_style),
+            Span::styled(candidate.description.to_owned(), description_style),
+        ]));
+    }
+
+    frame.render_widget(Clear, popup_area);
+    frame.render_widget(Paragraph::new(lines), popup_area);
+}
+
+fn command_suggestion_label(candidate: &CommandCandidate) -> String {
+    format!("{} — {}", candidate.name, candidate.description)
 }
 
 /// Cap the input area so it doesn't eat the history view: grows with the
@@ -1152,16 +1196,6 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         spans.push(Span::styled(queue, Style::default().fg(Color::Magenta)));
     }
 
-    if app.is_command_mode() {
-        spans.push(Span::raw(" | "));
-        spans.push(Span::styled(
-            "command",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ));
-    }
-
     let right_text = context_usage_text(app);
     let right_line = Line::from(Span::styled(right_text, Style::default().fg(Color::Gray)))
         .alignment(ratatui::layout::Alignment::Right);
@@ -1174,25 +1208,11 @@ fn draw_actionbar(frame: &mut Frame, app: &App, area: Rect) {
     let mut left: Vec<Span<'static>> = Vec::new();
     if app.is_command_mode() {
         left.push(Span::styled(
-            "COMMAND  Esc cancel  Enter dispatch",
+            "COMMAND",
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         ));
-        let suggestions = app.command_suggestions();
-        if !suggestions.is_empty() {
-            let suggestion_text = suggestions
-                .iter()
-                .take(4)
-                .map(|candidate| format!("{} — {}", candidate.name, candidate.description))
-                .collect::<Vec<_>>()
-                .join("  |  ");
-            left.push(Span::styled("  ", Style::default()));
-            left.push(Span::styled(
-                truncate_with_ellipsis(&suggestion_text, area.width.saturating_sub(34) as usize),
-                Style::default().fg(Color::DarkGray),
-            ));
-        }
     } else if app.queued_input_count() > 0 {
         left.push(Span::styled(
             "Alt-q edit queued  Alt-c clear queued",
