@@ -16,6 +16,8 @@
 
 この場合 `SpawnPod` は成功を返すが、child Pod は初回 task を実行していない。
 
+同種の問題は child Pod の通知経路でも既に踏んでおり、送信側が write 後にすぐ切断せず、receiver 側の acknowledgement / observable event を待つ形にして解消している。`SpawnPod` の初回 task delivery も同じ性質の race と見なす。
+
 ## 方針
 
 `SpawnPod` は child process / socket の起動だけでなく、初回 task が controller に受理され、少なくとも `UserMessage` または `TurnStart` が観測できるまで確認してから成功を返す。
