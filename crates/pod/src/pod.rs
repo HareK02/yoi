@@ -3098,16 +3098,26 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         );
         let event_tx = self.event_tx.as_ref();
 
-        let entries = consolidate::list_staging_entries(&layout);
+        let staging_snapshot = consolidate::list_staging_entries_snapshot(&layout);
+        let invalid_staging_count = staging_snapshot.invalid_count;
+        let entries = staging_snapshot.entries;
         if entries.is_empty() {
+            let reason = if invalid_staging_count == 0 {
+                "no_staging_entries".to_string()
+            } else {
+                format!("no_valid_staging_entries invalid={invalid_staging_count}")
+            };
             audit.emit(
                 &layout,
                 event_tx,
                 memory::audit::WorkerLifecycleStatus::Skipped,
-                "no_staging_entries",
+                reason,
                 None,
                 None,
-                Some(memory::audit::ConsolidationAudit::default()),
+                Some(memory::audit::ConsolidationAudit {
+                    invalid_staging_count,
+                    ..Default::default()
+                }),
             );
             return Ok(ConsolidateDecision::Skipped);
         }
@@ -3117,6 +3127,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         let consumed_ids: Vec<uuid::Uuid> = entries.iter().map(|e| e.id).collect();
         let base_consolidation = memory::audit::ConsolidationAudit {
             staging_count: total_files,
+            invalid_staging_count,
             staging_bytes: total_bytes,
             consumed_staging_ids: consumed_ids.iter().map(ToString::to_string).collect(),
             operations: memory::audit::OperationCounts::default(),
@@ -3404,15 +3415,36 @@ impl WorkerAuditBase {
                 consolidation,
             },
         );
-        emit_memory_worker_event(
-            event_tx,
-            self.run_id,
-            self.worker,
-            status,
-            self.trigger,
-            &reason,
-        );
+        if should_emit_memory_worker_event(self.worker, status, &reason) {
+            emit_memory_worker_event(
+                event_tx,
+                self.run_id,
+                self.worker,
+                status,
+                self.trigger,
+                &reason,
+            );
+        }
     }
+}
+
+fn should_emit_memory_worker_event(
+    worker: memory::audit::AuditWorker,
+    status: memory::audit::WorkerLifecycleStatus,
+    reason: &str,
+) -> bool {
+    if worker == memory::audit::AuditWorker::MemoryConsolidation
+        && status == memory::audit::WorkerLifecycleStatus::Skipped
+    {
+        return !is_idle_consolidation_skip_reason(reason);
+    }
+    true
+}
+
+fn is_idle_consolidation_skip_reason(reason: &str) -> bool {
+    reason == "no_staging_entries"
+        || reason == "consolidation_threshold_disabled"
+        || reason.starts_with("threshold_not_reached")
 }
 
 fn memory_language(cfg: &manifest::MemoryConfig) -> &str {
@@ -4245,6 +4277,45 @@ fn current_pwd() -> Result<PathBuf, PodError> {
     })?;
     cwd.canonicalize()
         .map_err(|source| PodError::InvalidPwd { pwd: cwd, source })
+}
+
+#[cfg(test)]
+mod memory_worker_event_tests {
+    use super::*;
+
+    #[test]
+    fn suppresses_idle_consolidation_skip_worker_events() {
+        assert!(!should_emit_memory_worker_event(
+            memory::audit::AuditWorker::MemoryConsolidation,
+            memory::audit::WorkerLifecycleStatus::Skipped,
+            "no_staging_entries",
+        ));
+        assert!(!should_emit_memory_worker_event(
+            memory::audit::AuditWorker::MemoryConsolidation,
+            memory::audit::WorkerLifecycleStatus::Skipped,
+            "threshold_not_reached files=1 bytes=64 min_files=2 min_bytes=1048576",
+        ));
+        assert!(!should_emit_memory_worker_event(
+            memory::audit::AuditWorker::MemoryConsolidation,
+            memory::audit::WorkerLifecycleStatus::Skipped,
+            "consolidation_threshold_disabled",
+        ));
+        assert!(should_emit_memory_worker_event(
+            memory::audit::AuditWorker::MemoryConsolidation,
+            memory::audit::WorkerLifecycleStatus::Skipped,
+            "no_valid_staging_entries invalid=1",
+        ));
+        assert!(should_emit_memory_worker_event(
+            memory::audit::AuditWorker::MemoryConsolidation,
+            memory::audit::WorkerLifecycleStatus::Completed,
+            "completed",
+        ));
+        assert!(should_emit_memory_worker_event(
+            memory::audit::AuditWorker::MemoryExtract,
+            memory::audit::WorkerLifecycleStatus::Skipped,
+            "threshold_not_reached files=1",
+        ));
+    }
 }
 
 #[cfg(test)]

@@ -26,5 +26,7 @@ pub use input::{
     render_tidy_hints,
 };
 pub use lock::{LockError, LockRecord, StagingLock};
-pub use staging::{StagingEntry, list_staging_entries};
+pub use staging::{
+    StagingEntriesSnapshot, StagingEntry, list_staging_entries, list_staging_entries_snapshot,
+};
 pub use tidy::{TidyHints, collect_tidy_hints};
