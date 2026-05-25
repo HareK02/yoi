@@ -11,6 +11,7 @@
 - E2E テストハーネス（`tests/e2e/`、opt-in） → [tickets/e2e-harness.md](tickets/e2e-harness.md)
 - メモリ機構
   - consolidation skip 表示と invalid staging の観測性 → [tickets/memory-consolidation-skip-observability.md](tickets/memory-consolidation-skip-observability.md)
+  - summary.md の resident 注入 → [tickets/memory-summary-resident-injection.md](tickets/memory-summary-resident-injection.md)
 
 - TUI 拡充
   - navigation mode / block focus の設計 → [tickets/tui-navigation-mode-design.md](tickets/tui-navigation-mode-design.md)
