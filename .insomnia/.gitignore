@@ -1,7 +1,1 @@
-# Generated / session-derived memory state
-/memory/_staging/
-/memory/summary.md
-/memory/decisions/
-/memory/requests/
-
-# Project-authored workflows and knowledge are intentionally tracked.
+/memory/
