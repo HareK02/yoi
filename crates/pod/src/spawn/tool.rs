@@ -17,8 +17,6 @@ use manifest::{
     ModelManifest, Permission, PodManifestConfig, PodMetaConfig, ScopeConfig, ScopeRule,
     SharedScope, WorkerManifestConfig,
 };
-use protocol::Method;
-use protocol::stream::JsonLineWriter;
 use serde::Deserialize;
 use session_store::PodScopeSnapshot;
 use tokio::net::UnixStream;
@@ -28,6 +26,7 @@ use tokio::time::sleep;
 use crate::ipc::event;
 use crate::runtime::dir::SpawnedPodRecord;
 use crate::runtime::pod_registry::{self, LockFileGuard, ScopeLockError};
+use crate::spawn::comm_tools::{SendRunError, send_run_and_confirm};
 use crate::spawn::registry::SpawnedPodRegistry;
 use protocol::PodEvent;
 
@@ -258,8 +257,6 @@ impl Tool for SpawnPodTool {
             });
         }
 
-        send_run(&predicted_socket, &input.task).await?;
-
         let record = SpawnedPodRecord {
             pod_name: input.name.clone(),
             socket_path: predicted_socket.clone(),
@@ -283,6 +280,10 @@ impl Tool for SpawnPodTool {
                 scope: scope_allow,
             },
         );
+
+        send_run_and_confirm(&predicted_socket, input.task.clone())
+            .await
+            .map_err(|err| spawn_delivery_error(&input.name, err))?;
 
         Ok(ToolOutput {
             summary: format!(
@@ -458,23 +459,15 @@ async fn wait_for_socket(path: &Path, timeout: Duration) -> Result<(), ToolError
     }
 }
 
-async fn send_run(socket: &Path, task: &str) -> Result<(), ToolError> {
-    let stream = UnixStream::connect(socket)
-        .await
-        .map_err(|e| ToolError::ExecutionFailed(format!("connect {}: {e}", socket.display())))?;
-    let (_reader, writer) = stream.into_split();
-    let mut w = JsonLineWriter::new(writer);
-    w.write(&Method::Run {
-        input: vec![protocol::Segment::text(task)],
-    })
-    .await
-    .map_err(|e| ToolError::ExecutionFailed(format!("send Method::Run: {e}")))?;
-    // Drop the writer to close the socket's write half. The flush
-    // inside `JsonLineWriter::write` has already pushed the bytes
-    // across, so the child will see a complete method line followed by
-    // EOF.
-    drop(w);
-    Ok(())
+fn spawn_delivery_error(pod_name: &str, err: SendRunError) -> ToolError {
+    match err {
+        SendRunError::AlreadyRunning => ToolError::ExecutionFailed(format!(
+            "spawned pod `{pod_name}` rejected its initial task as already running; the pod remains registered and can be inspected or stopped"
+        )),
+        SendRunError::Io(msg) => ToolError::ExecutionFailed(format!(
+            "spawned pod `{pod_name}` did not confirm initial task delivery: {msg}; the pod remains registered and can be inspected or stopped"
+        )),
+    }
 }
 
 fn pod_registry_err_to_tool(e: ScopeLockError) -> ToolError {

@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use llm_worker::llm_client::types::{ContentPart, Item, Role};
 use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use protocol::stream::{JsonLineReader, JsonLineWriter};
-use protocol::{ErrorCode, Event, Method};
+use protocol::{ErrorCode, Event, InvokeKind, Method};
 use serde::Deserialize;
 use session_store::LogEntry;
 use tokio::net::UnixStream;
@@ -365,7 +365,8 @@ where
 }
 
 /// Failure modes distinguished by `SendToPod`.
-enum SendRunError {
+#[derive(Debug)]
+pub(crate) enum SendRunError {
     /// Target Pod responded with `Error { AlreadyRunning }` — the
     /// caller can retry once the current turn ends.
     AlreadyRunning,
@@ -374,10 +375,12 @@ enum SendRunError {
 }
 
 /// Write `Method::Run` to the target and read back events until we see
-/// either `TurnStart` (accepted) or `Error { AlreadyRunning }`
-/// (rejected). Any replayed alerts that precede the response are
-/// skipped. Times out per-read so a stuck Pod doesn't hang the tool.
-async fn send_run_and_confirm(socket: &Path, input: String) -> Result<(), SendRunError> {
+/// evidence that the controller accepted the run (`UserMessage`,
+/// `TurnStart`, or a user-send `InvokeStart`) or rejected it with
+/// `Error { AlreadyRunning }`. Any connect-time Snapshot or replayed alerts
+/// that precede the response are skipped. Times out per-read so a stuck Pod
+/// doesn't hang the tool.
+pub(crate) async fn send_run_and_confirm(socket: &Path, input: String) -> Result<(), SendRunError> {
     let stream = tokio::time::timeout(SOCKET_OP_TIMEOUT, UnixStream::connect(socket))
         .await
         .map_err(|_| SendRunError::Io("connect timed out".into()))?
@@ -404,10 +407,19 @@ async fn send_run_and_confirm(socket: &Path, input: String) -> Result<(), SendRu
                 code: ErrorCode::AlreadyRunning,
                 ..
             }) => return Err(SendRunError::AlreadyRunning),
-            Some(Event::TurnStart { .. }) => return Ok(()),
-            // Alerts and other pre-turn events are replayed to new
-            // subscribers; keep reading until the controller's response
-            // to our `Run` shows up.
+            Some(Event::Error { code, message }) => {
+                return Err(SendRunError::Io(format!(
+                    "pod returned {code:?}: {message}"
+                )));
+            }
+            Some(Event::InvokeStart {
+                kind: InvokeKind::UserSend,
+            })
+            | Some(Event::UserMessage { .. })
+            | Some(Event::TurnStart { .. }) => return Ok(()),
+            // Alerts, Snapshot, and other pre-turn events can precede the
+            // controller's response; keep reading until the Run is accepted
+            // or rejected.
             Some(_) => continue,
             None => return Err(SendRunError::Io("connection closed before response".into())),
         }
@@ -553,6 +565,78 @@ mod tests {
             }
             reader.next::<Method>().await.ok().flatten()
         })
+    }
+
+    fn serve_initial_events_then_run_ack(
+        listener: UnixListener,
+        initial_events: Vec<Event>,
+        ack: Event,
+    ) -> JoinHandle<Option<Method>> {
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.ok()?;
+            let (r, w) = stream.into_split();
+            let mut reader = JsonLineReader::new(r);
+            let mut writer = JsonLineWriter::new(w);
+            for event in initial_events {
+                writer.write(&event).await.ok()?;
+            }
+            let method = reader.next::<Method>().await.ok().flatten()?;
+            writer.write(&ack).await.ok()?;
+            Some(method)
+        })
+    }
+
+    #[tokio::test]
+    async fn send_run_and_confirm_keeps_connection_open_until_user_message_ack() {
+        let tmp = TempDir::new().unwrap();
+        let socket = tmp.path().join("pod.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let received = serve_initial_events_then_run_ack(
+            listener,
+            vec![
+                Event::Alert(Alert {
+                    level: AlertLevel::Warn,
+                    source: AlertSource::Pod,
+                    message: "replayed alert".into(),
+                    timestamp_ms: 0,
+                }),
+                snapshot(Vec::new()),
+            ],
+            Event::UserMessage {
+                segments: vec![protocol::Segment::text("hello")],
+            },
+        );
+
+        send_run_and_confirm(&socket, "hello".into()).await.unwrap();
+
+        let method = received.await.unwrap().expect("expected method");
+        match method {
+            Method::Run { input } => {
+                assert_eq!(protocol::Segment::flatten_to_text(&input), "hello");
+            }
+            other => panic!("expected Run, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn send_run_and_confirm_reports_already_running() {
+        let tmp = TempDir::new().unwrap();
+        let socket = tmp.path().join("pod.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let received = serve_initial_events_then_run_ack(
+            listener,
+            vec![snapshot(Vec::new())],
+            Event::Error {
+                code: ErrorCode::AlreadyRunning,
+                message: "busy".into(),
+            },
+        );
+
+        let err = send_run_and_confirm(&socket, "hello".into())
+            .await
+            .expect_err("expected AlreadyRunning");
+        assert!(matches!(err, SendRunError::AlreadyRunning));
+        assert!(matches!(received.await.unwrap(), Some(Method::Run { .. })));
     }
 
     #[tokio::test]

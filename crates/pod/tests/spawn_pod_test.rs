@@ -16,8 +16,8 @@ use pod::runtime::dir::{RuntimeDir, SpawnedPodRecord};
 use pod::runtime::pod_registry::{self, LockFileGuard};
 use pod::spawn::registry::SpawnedPodRegistry;
 use pod::spawn::tool::spawn_pod_tool;
-use protocol::Method;
-use protocol::stream::JsonLineReader;
+use protocol::stream::{JsonLineReader, JsonLineWriter};
+use protocol::{Event, Method};
 use serde_json::json;
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -97,16 +97,22 @@ async fn bind_mock_pod_socket(runtime_base: &Path, pod_name: &str) -> (PathBuf, 
 }
 
 /// Launch a tokio task that accepts connections until one carries a
-/// `Method` line, then returns it. `wait_for_socket` inside the tool
-/// makes a probe connection that carries no data, so the task must
-/// tolerate an empty connection and keep listening.
+/// `Method` line, then acknowledges it and returns it. `wait_for_socket`
+/// inside the tool makes a probe connection that carries no data, so the
+/// task must tolerate an empty connection and keep listening.
 fn accept_one_method(listener: UnixListener) -> tokio::task::JoinHandle<Option<Method>> {
     tokio::spawn(async move {
         loop {
             let (stream, _) = listener.accept().await.ok()?;
-            let (reader, _writer) = stream.into_split();
+            let (reader, writer) = stream.into_split();
             let mut r = JsonLineReader::new(reader);
+            let mut w = JsonLineWriter::new(writer);
             if let Ok(Some(method)) = r.next::<Method>().await {
+                w.write(&Event::UserMessage {
+                    segments: vec![protocol::Segment::text("accepted")],
+                })
+                .await
+                .ok()?;
                 return Some(method);
             }
         }
