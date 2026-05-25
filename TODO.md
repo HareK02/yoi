@@ -9,7 +9,7 @@
 - Pod: Inbound PodEvent ハンドリングの重複を統合 → [tickets/pod-inbound-pod-event-dedup.md](tickets/pod-inbound-pod-event-dedup.md)
 - SpawnPod 初回 task delivery の受理確認 → [tickets/spawnpod-initial-run-confirmation.md](tickets/spawnpod-initial-run-confirmation.md)
 - llm-worker のエラー耐性
-  - ストリーム途中失敗時の継続 → [tickets/llm-worker-stream-continuation.md](tickets/llm-worker-stream-continuation.md)
+  - LLM request retry / stream 中断の可視化と継続 → [tickets/llm-worker-stream-continuation.md](tickets/llm-worker-stream-continuation.md)
 - E2E テストハーネス（`tests/e2e/`、opt-in） → [tickets/e2e-harness.md](tickets/e2e-harness.md)
 - メモリ機構
   - consolidation skip 表示と invalid staging の観測性 → [tickets/memory-consolidation-skip-observability.md](tickets/memory-consolidation-skip-observability.md)

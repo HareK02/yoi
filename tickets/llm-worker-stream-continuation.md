@@ -1,145 +1,219 @@
-# llm-worker: ストリーム途中失敗時の継続
+# llm-worker: LLM request retry / stream continuation を可視化しつつ安全に継続する
 
 ## 背景
 
-LLM 応答の SSE ストリームを読んでいる途中で upstream が切れると、
-`crates/llm-worker/src/llm_client/transport.rs:231` で
-`ClientError::Sse(...)`（中身は `eventsource_stream::Error::Transport`、
-さらに reqwest の `error decoding response body`）として上に投げられ、
-`worker.rs:933 stream_response` が `WorkerError` に変換して Run 全体が中断する。
+`Read` などの tool 実行が完了した後、本来は tool result を含めた次の LLM request が走り、assistant 応答が続く。実運用ではこの次 request が provider / upstream gateway から HTTP 504 を返すことがあり、現行の `HttpTransport` は transient retry として最大 `RetryPolicy::default()` の範囲で再試行する。
 
-実例: セッション `019de419-6f8b-71a0-9e56-f0b9a6c7098b.jsonl:236`。
-直前まで text / tool_use を Timeline に積み続けていたが、
-最後の SSE フレームが届く前に接続が切れ、Run が落ちた。
+現在の問題は、retry / backoff 中であることが TUI に表示されず、「tool は終わったのに、その後の LLM 応答がハングした」ように見えることにある。
 
-ここで重要な点:
+また、SSE stream が開始した後に途中で切れた場合、単純に同じ request を再送すると既に受け取った assistant 出力を二重生成させる可能性がある。stream 開始後の interruption では、安全に確定できる assistant output だけを history に積み、次 request で続きを生成する必要がある。
 
-- 出力トークンは upstream 側で既に発生しており、課金済み。
-  単純に同じ request を再送すると二重出力 + 二重課金。
-- Anthropic / OpenAI のいずれの API も、途切れた SSE を
-  resume するエンドポイントは持たない。継続したい場合は
-  「assistant turn として部分出力を history に置いた状態で再リクエスト」
-  という形を自作する必要がある。
-- 部分出力の質は内容依存:
-  - 完成した text ブロックは原則そのまま history に置ける
-  - 未完成の通常 text ブロックも、LLM の仕様上は assistant partial として置けば続きを生成させられる
-  - tool_use の `input_json` が途中で切れたブロックは破損 JSON で、そのままは置けない
-  - reasoning / thinking ブロックも provider 依存の扱いが要る
+この ticket では、以下を一つの機能として扱う。
 
-このため、これは「リトライ」ではなく「継続 (continuation)」。
-`history` を編集する責務であり、`transport.rs` には収まらず、
-`worker.rs` 層（または上位）の機能になる。
-`feedback_llm_worker_scope.md` の方針（llm-worker は低レベル基盤に留める）にも合致する。
+- HTTP transient retry / backoff の user-visible 化
+- stream 開始後 interruption からの安全な continuation
+- どちらの場合も TUI に「何を待っているか」を表示する経路
 
-なお `worker.rs:973` 付近で部分 `flush_usage()` だけは既に行っており、
-半分くらいは継続を意識した作りになっている。あとは
-「壊れていないブロックの確定」と「次 call の起動条件」を足す形。
+## 設計方針
 
-## 決定した方針
+LLM request が待っている理由は user-visible operational state として扱う。history / LLM context には入れない。
 
-stream 開始後に transport / SSE error で落ちた場合、同じ request をそのまま再送しない。
-Timeline に積まれた部分生成を安全な範囲で assistant history として確定し、その history を前提に continuation call を起動する。
+transport から protocol / TUI に直接依存させず、下から上へ typed event を渡す。
 
-- 通常 text は partial でも残す。
-  - 完成済み text block はそのまま確定する。
-  - 未完成 text block も text として確定し、次の LLMCall で続きを生成させる。
-- tool_use は壊れていないものだけ残す。
-  - 完成済み tool_use は通常通り確定する。
-  - 未完成 tool_use / partial JSON は history に入れず破棄する。
-  - 破棄した事実は structured diagnostic event として記録する。
-- reasoning / thinking block は初期実装では保守的に扱う。
-  - provider が history に安全に戻せる完成 block として扱えるものだけ残す。
-  - 未完成または復元不能な thinking/reasoning は破棄し、diagnostic event に残す。
-- continuation は自動で最大 5 回試す。
-  - backoff は attempt ごとに伸ばす。例: 1s, 2s, 4s, 8s, 16s。
-  - 5 回失敗したら turn を中断し、通常の失敗として上位へ返す。
-- `Cancelled` / `Aborted` / interceptor `Yield` は continuation より優先する。
-  - 明示的な user cancel や上位制御を transport error retry で覆さない。
-- 明示的な safety / content filter stop reason が provider event として返る場合は retry 対象外にする。
-  - transport / SSE error としてしか見えない場合は continuation 対象にする。
-  - 同じ箇所で繰り返し切られる場合は最大 5 回で exhausted する。
+```text
+HttpTransport / stream consumer
+  -> llm-worker callback
+  -> Pod controller bridge
+  -> protocol::Event
+  -> TUI transient status / actionbar
+```
 
-## 失敗ログ / 統計
+正常系の制御フローは崩さない。過去実装のように continuation のために worker の共通 turn loop を大きく組み替えない。
 
-この機能は実運用での発生頻度と回復率を見たいので、continuation lifecycle を structured log として残す。
-ログは統計・デバッグ用であり、通常の LLM context へ暗黙注入しない。
+正常 stream 完了時は、現行の成功経路をそのまま通す。
 
-最低限記録する event:
+```text
+stream_response
+  -> handle_completed_response
+  -> execute_and_commit_tools
+```
 
-- `llm_stream_interrupted`
-  - provider / model
-  - run_id / turn_id 相当
-  - original attempt / continuation attempt
-  - error kind: `sse_transport`, `sse_parse`, `body_decode`, `unknown` 等
-  - error message
-  - committed text block count
-  - committed partial text の有無
-  - discarded partial tool_use count
-  - discarded thinking/reasoning count
-  - usage flush の有無
-- `llm_stream_continuation_started`
-  - continuation attempt
-  - backoff duration
-  - history に確定した block summary
-- `llm_stream_continuation_completed`
-  - continuation attempt
-  - completion reason
-- `llm_stream_continuation_failed`
-  - continuation attempt
-  - error kind / message
-- `llm_stream_continuation_exhausted`
-  - attempts
-  - final reason
+continuation は `Worker::stream_response` の error branch 周辺に閉じ込める。
 
-未完成 tool_use を破棄した場合は、可能な範囲で以下も残す。
+## Phase 1: HTTP transient retry を TUI に表示する
 
-```json
-{
-  "event": "discarded_partial_tool_use",
-  "tool_name": "Bash",
-  "partial_input_bytes": 1234,
-  "reason": "sse_transport_error"
+### 対象
+
+`client.stream(request).await` が SSE stream を返す前に、HTTP response status / connect / timeout などで retryable error になったケース。
+
+例:
+
+- HTTP 504 gateway timeout
+- HTTP 429 rate limit
+- HTTP 500 / 502 / 503
+- connect timeout
+
+### 実装方針
+
+1. `llm_client::client::LlmClient` に retry observer 付き stream entrypoint を追加する。
+   - 既存 `stream(request)` の意味は維持する。
+   - default 実装は observer を無視して `stream(request)` に委譲する。
+   - `HttpTransport` だけが observer を利用する。
+2. `llm_client::transport::HttpTransport::stream` の retry 判定直後、`tokio::time::sleep(wait)` の直前で retry notice を発火する。
+3. `Worker` に `on_llm_retry` callback を追加する。
+4. `Pod` の `wire_event_bridges_on_worker` で protocol event に変換する。
+5. `TUI` は retry state を transient に表示する。
+
+### protocol event
+
+名称は実装時に最終決定してよいが、意味は以下を満たす typed event にする。
+
+```rust
+Event::LlmRetry {
+    llm_call: usize,
+    attempt: u32,
+    max_attempts: u32,
+    wait_ms: u64,
+    elapsed_ms: u64,
+    status: Option<u16>,
+    error: String,
 }
 ```
 
+- `attempt` は「次に実行する attempt 番号」または「失敗した attempt 番号」のどちらかに統一し、protocol comment と TUI 表示で曖昧にならないようにする。
+- `status` は HTTP status が取れる場合のみ入れる。504 の場合は `Some(504)`。
+- `error` は user-visible になり得るので、API key / Authorization header / request body を含めない。
+- retry exhausted は既存の final error 経路で表示する。初期実装では sleep 前の retry notice に絞る。
+
+### TUI 表示要件
+
+- ToolResult 表示後、次 LLM request が retry に入った場合、TUI 上で待っている理由が分かること。
+- status line または actionbar に少なくとも以下が出ること。
+  - retry 中であること
+  - HTTP status または error kind
+  - attempt / max_attempts
+  - 次 retry までの wait 秒数
+- 例: `retrying LLM request after HTTP 504 (attempt 2/4 in 1.2s)`
+- 表示は transient とする。次の `LlmCallStart` / `TextDelta` / `ToolCallStart` / `RunEnd` / `Status(Idle|Paused)` など、明確な進行イベントで消える。
+- `Event::Alert` のように履歴 block として毎回積み上げない。retry が複数回起きると履歴がノイズで埋まるため。
+
+## Phase 2: stream 開始後 interruption から continuation する
+
+### 対象
+
+`client.stream(request).await` が stream を返した後、stream event を読む途中で error / unexpected EOF が起きるケース。
+
+HTTP status 504 のような stream 開始前 error は Phase 1 の retry 表示対象であり、partial history commit はしない。
+
+### 実装方針
+
+差し込み位置は `Worker::stream_response` の error branch に限定する。
+
+- 正常に stream が完了した場合:
+  - 現行と同じ `TimelineDispatch` / collector の結果を使う。
+  - 現行と同じ assistant history commit 経路を使う。
+  - 現行と同じ tool execution 経路を使う。
+  - continuation 用の別 collector / 別 result type で正常系を包み直さない。
+- stream 開始前の error の場合:
+  - HTTP retry / final error の扱いに任せる。
+  - partial history commit はしない。
+- stream 開始後の error の場合:
+  - それまで `TimelineDispatch` が受け取った block のうち、安全に閉じているものだけを partial assistant message として history に commit する。
+  - 未完成の text block / reasoning item / tool_use は commit しない。
+  - partial commit 後、同じ turn loop 内で次の LLM request を発行する。
+  - cancel / abort / user interrupt は continuation より優先する。
+
+### 設計上の制約
+
+- `run_turn_loop` 全体を新しい generation sequence abstraction で置き換えない。
+- 正常系の `stream_response -> handle_completed_response -> execute_and_commit_tools` の流れを維持する。
+- continuation 用 state は error branch の局所 state として扱う。
+- completed tool_use を stream interruption から復元して即 tool execution へ流すような特殊経路は初期実装では入れない。
+  - tool_use は protocol 上の境界が壊れると危険なので、stream が最後まで完了した場合だけ通常 collector から実行する。
+- continuation の進行も TUI に user-visible event として表示する。
+- continuation のための system reminder を history に積まず context だけへ差し込む実装は禁止。
+
+### 推奨する差し込み形
+
+`stream_response` の成功 result は保ちつつ、stream が途中で切れたことだけを表せる型にする。
+
+```rust
+enum StreamResponseOutcome {
+    Completed(CompletedResponse),
+    Interrupted(StreamInterruption),
+}
+```
+
+`CompletedResponse` は現行成功経路で使っている情報を保持する。`Interrupted` には partial commit に必要な情報だけを入れる。
+
+`TimelineDispatch` / collector に partial drain API を追加し、途中中断時に安全に history 化できるものだけを取り出す。
+
+- 完了済み text block
+- 完了済み reasoning item
+- 必要なら完了済み assistant metadata
+
+未完成 block は破棄する。`abort_current_block` 相当の既存処理があるなら、それを明示的に使う。
+
+擬似コード:
+
+```rust
+match self.stream_response(request).await? {
+    StreamResponseOutcome::Completed(response) => {
+        self.handle_completed_response(response).await?;
+        if self.execute_and_commit_tools(...).await? {
+            continue;
+        }
+        break;
+    }
+    StreamResponseOutcome::Interrupted(interruption) => {
+        if continuation_budget.exhausted() {
+            return Err(...);
+        }
+        self.commit_partial_assistant(interruption.safe_items).await?;
+        self.emit_continuation_notice(...);
+        continue;
+    }
+}
+```
+
+この形なら、正常系は completed branch に留まり、途中中断時だけ continuation branch に入る。
+
 ## 要件
 
-- ストリーム開始後の transport / SSE error を `worker.rs` 層で捕捉し、continuation 対象か判定する。
-  - pre-stream の transient retry とは別枠にする。
-  - 同じ request の単純再送はしない。
-- Timeline に積まれた安全な block を assistant history として確定する。
-  - 完成済み text block を残す。
-  - 未完成 text block も残す。
-  - 完成済み tool_use を残す。
-  - 未完成 tool_use / partial JSON は破棄し、diagnostic event を記録する。
-  - 未完成または復元不能な thinking/reasoning は破棄し、diagnostic event を記録する。
-- continuation call を最大 5 回まで自動実行する。
-  - attempt ごとに backoff を伸ばす。
-  - 成功したら通常の LLMCall 完了として扱う。
-  - exhausted したら turn を中断する。
-- `Cancelled` / `Aborted` / interceptor `Yield` がある場合は continuation しない。
-- provider が明示的な safety / content filter stop reason を正常 event として返した場合は continuation しない。
-- continuation lifecycle と破棄した partial block の概要を structured log に残す。
-  - 統計として provider/model 別の失敗頻度、回復率、partial tool_use 発生有無を後から集計できること。
-- continuation のために context へ一時的な system message を暗黙注入しない。
-  - もし LLM に中断事実を知らせる必要が出た場合は、history に残る明示 event/message として設計する。
-  - 初期実装では壊れた tool_use は LLM に知らせず、ログにだけ残す。
+- HTTP 504 / 429 / 500 など retryable API status で backoff に入る前に retry notice が発火する。
+- retry notice は worker callback として Pod 層に届く。
+- Pod は retry notice を protocol event として TUI / socket clients に broadcast する。
+- TUI は retry 中の状態を user-visible に表示する。
+- retry notice は worker history / LLM context / session log の会話 item には入らない。
+- API key / Authorization header / request body / tool output full content を retry event に含めない。
+- stream が正常完了した場合、既存の成功経路と同じ挙動になる。
+- tool call が含まれる正常 response では、既存と同じ collector 由来の tool calls だけが実行される。
+- stream 開始前の HTTP error では partial history が増えない。
+- stream 開始後に中断した場合、安全に完了済みの assistant item だけを history に commit する。
+- 未完成 tool_use は commit / execute しない。
+- continuation は最大回数で打ち切る。
+- cancel / abort / user interrupt は continuation より優先される。
+- continuation 中であることが TUI に表示される。
 
 ## 完了条件
 
-- stream 途中で transport / SSE error を起こすモック integration test がある。
-- text-only partial response では、未完成 text が history に残り、continuation call が続きを生成する。
-- partial tool_use response では、壊れた tool_use が history に入らず、discard diagnostic が記録される。
-- completed tool_use は破棄されず、通常通り history に残る。
-- continuation が最大 5 回で exhausted し、turn が中断される test がある。
-- `Cancelled` / `Aborted` / `Yield` が continuation より優先される test がある。
-- structured log から interrupted / started / completed / failed / exhausted が確認できる。
-- 課金重複が起きないこと（過去ターンの単純再生成ではなく partial assistant history からの continuation であること）が test または手動手順で確認されている。
-- `cargo check` / `cargo test` が `llm-worker` で通る。
+- `HttpTransport` の unit test で retryable 504 時に retry notice が発火する。
+- `Worker` の test で `on_llm_retry` callback が呼ばれる。
+- `protocol::Event` の retry / continuation event の serde roundtrip test がある。
+- Pod controller bridge の test、または既存 bridge test への追加で retry / continuation event が流れることを確認する。
+- TUI app test で retry / continuation event が transient state を更新し、進行イベントで clear されることを確認する。
+- 正常 stream 完了 + text response の既存テストが通る。
+- 正常 stream 完了 + tool_use response の既存テストが通る。
+- stream 開始前 error で partial history が増えない test がある。
+- stream 開始後 interruption で完了済み text だけが history に commit される test がある。
+- incomplete tool_use が commit / execute されない test がある。
+- continuation 回数上限の test がある。
+- `cargo check` と関連 crate の test が通る。
 
 ## 範囲外
 
-- pre-stream の transient リトライ → `llm-worker-transient-retry`
-- ストリーム resume API の実装（プロバイダ側に存在しないので不可能）
-- 課金額の自動上限制御
-- 壊れた partial tool_use を system message 等で LLM に説明して復旧させる高度な戦略
+- retry policy の manifest 設定化。
+- retry 回数や timeout の調整。
+- provider 504 自体の削減。
+- context pruning / compaction threshold の調整。
+- E2E 実プロセス test。
