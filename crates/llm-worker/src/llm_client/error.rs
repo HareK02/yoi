@@ -1,6 +1,6 @@
 //! LLMクライアントエラー型
 
-use std::fmt;
+use std::{fmt, time::Duration};
 
 /// LLMクライアントのエラー
 #[derive(Debug)]
@@ -16,6 +16,7 @@ pub enum ClientError {
         status: Option<u16>,
         code: Option<String>,
         message: String,
+        retry_after: Option<Duration>,
     },
     /// 設定エラー
     Config(String),
@@ -31,6 +32,7 @@ impl fmt::Display for ClientError {
                 status,
                 code,
                 message,
+                ..
             } => {
                 write!(f, "API error")?;
                 if let Some(s) = status {
@@ -68,6 +70,22 @@ impl From<serde_json::Error> for ClientError {
     }
 }
 
+impl ClientError {
+    pub fn status(&self) -> Option<u16> {
+        match self {
+            ClientError::Api { status, .. } => *status,
+            _ => None,
+        }
+    }
+
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            ClientError::Api { retry_after, .. } => *retry_after,
+            _ => None,
+        }
+    }
+}
+
 /// transient な失敗としてリトライ対象になるかを判定する。
 ///
 /// 対象:
@@ -97,6 +115,7 @@ mod tests {
             status,
             code: None,
             message: String::new(),
+            retry_after: None,
         }
     }
 

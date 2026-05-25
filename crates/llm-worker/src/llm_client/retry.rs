@@ -1,8 +1,8 @@
-//! HTTP transient エラー向けリトライポリシー。
+//! LLM response stream を開く前の transient error 向けリトライポリシー。
 //!
-//! `transport.rs` の HTTP 送信〜ステータスチェック区間で `is_retryable`
-//! が true を返した失敗をリトライする際に、待ち時間と打ち切り条件を
-//! 提供する。SSE 読み出し開始後の失敗は対象外。
+//! Worker が `LlmClient::stream` の open error に対して `is_retryable` を見て
+//! retry / backoff / TUI event / cancellation をまとめて管理する。
+//! SSE 読み出し開始後の失敗は対象外。
 
 use std::time::Duration;
 

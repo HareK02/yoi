@@ -56,6 +56,7 @@ impl CodexAuthError {
                 status: None,
                 code: Some("refresh_transient".into()),
                 message: msg,
+                retry_after: None,
             },
             CodexAuthError::RefreshPermanent { reason, message } => ClientError::Api {
                 status: Some(401),
@@ -66,6 +67,7 @@ impl CodexAuthError {
                     PermanentReason::Other => "refresh_token_failed".into(),
                 }),
                 message: format!("{message}. Please run `codex login` again."),
+                retry_after: None,
             },
         }
     }

@@ -101,6 +101,7 @@ impl LlmClient for MockClient {
                 status: Some(500),
                 code: Some("mock".into()),
                 message: "No more responses".into(),
+                retry_after: None,
             });
         }
         let response = self.responses[count].clone();

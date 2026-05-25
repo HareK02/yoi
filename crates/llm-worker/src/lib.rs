@@ -59,4 +59,6 @@ pub use interceptor::Interceptor;
 pub use message::{ContentPart, Item, Message, Role};
 pub use tool::{ToolCall, ToolOutputLimits, ToolResult};
 pub use usage_record::UsageRecord;
-pub use worker::{RunOutput, ToolRegistryError, Worker, WorkerConfig, WorkerError, WorkerResult};
+pub use worker::{
+    LlmRetryNotice, RunOutput, ToolRegistryError, Worker, WorkerConfig, WorkerError, WorkerResult,
+};

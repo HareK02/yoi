@@ -2,7 +2,7 @@
 
 ## 背景
 
-`Read` などの tool 実行が完了した後、本来は tool result を含めた次の LLM request が走り、assistant 応答が続く。実運用ではこの次 request が provider / upstream gateway から HTTP 504 を返すことがあり、現行の `HttpTransport` は transient retry として最大 `RetryPolicy::default()` の範囲で再試行する。
+`Read` などの tool 実行が完了した後、本来は tool result を含めた次の LLM request が走り、assistant 応答が続く。実運用ではこの次 request が provider / upstream gateway から HTTP 504 を返すことがあり、LLM response stream を開く前の transient failure として retry する必要がある。
 
 現在の問題は、retry / backoff 中であることが TUI に表示されず、「tool は終わったのに、その後の LLM 応答がハングした」ように見えることにある。
 
@@ -18,10 +18,12 @@
 
 LLM request が待っている理由は user-visible operational state として扱う。history / LLM context には入れない。
 
-transport から protocol / TUI に直接依存させず、下から上へ typed event を渡す。
+retry / continuation から protocol / TUI に直接依存させず、Worker の lifecycle event として下から上へ typed event を渡す。`HttpTransport` は 1 回の HTTP request と response classification を担当し、retry / backoff / cancellation / TUI 通知は Worker が管理する。
 
 ```text
-HttpTransport / stream consumer
+HttpTransport
+  -> ClientError { status, retry_after, ... }
+  -> Worker retry / continuation state
   -> llm-worker callback
   -> Pod controller bridge
   -> protocol::Event
@@ -55,12 +57,17 @@ continuation は `Worker::stream_response` の error branch 周辺に閉じ込�
 
 ### 実装方針
 
-1. `llm_client::client::LlmClient` に retry observer 付き stream entrypoint を追加する。
-   - 既存 `stream(request)` の意味は維持する。
-   - default 実装は observer を無視して `stream(request)` に委譲する。
-   - `HttpTransport` だけが observer を利用する。
-2. `llm_client::transport::HttpTransport::stream` の retry 判定直後、`tokio::time::sleep(wait)` の直前で retry notice を発火する。
-3. `Worker` に `on_llm_retry` callback を追加する。
+1. `llm_client::client::LlmClient::stream(request)` は単発 request として維持する。
+   - 成功時は `ResponseStream` を返す。
+   - stream open 前の失敗は `ClientError` として返す。
+   - retry observer 付き entrypoint は作らない。
+2. `llm_client::transport::HttpTransport::stream` は retry しない。
+   - HTTP status / connect / timeout を `ClientError` に分類する。
+   - `Retry-After` がある場合は `ClientError` の metadata として保持する。
+3. `Worker` に `open_stream_with_retry` 相当の helper を置く。
+   - `RetryPolicy` と `is_retryable(&ClientError)` に従って `client.stream(request.clone())` を再試行する。
+   - backoff sleep は cancel / abort より低優先にする。
+   - sleep 前に `on_llm_retry` callback を発火する。
 4. `Pod` の `wire_event_bridges_on_worker` で protocol event に変換する。
 5. `TUI` は retry state を transient に表示する。
 
@@ -71,7 +78,7 @@ continuation は `Worker::stream_response` の error branch 周辺に閉じ込�
 ```rust
 Event::LlmRetry {
     llm_call: usize,
-    attempt: u32,
+    failed_attempt: u32,
     max_attempts: u32,
     wait_ms: u64,
     elapsed_ms: u64,
@@ -80,7 +87,7 @@ Event::LlmRetry {
 }
 ```
 
-- `attempt` は「次に実行する attempt 番号」または「失敗した attempt 番号」のどちらかに統一し、protocol comment と TUI 表示で曖昧にならないようにする。
+- `failed_attempt` は「直近で失敗した attempt 番号」として扱う。TUI 表示では次に実行される attempt を `failed_attempt + 1` として表示してよい。
 - `status` は HTTP status が取れる場合のみ入れる。504 の場合は `Some(504)`。
 - `error` は user-visible になり得るので、API key / Authorization header / request body を含めない。
 - retry exhausted は既存の final error 経路で表示する。初期実装では sleep 前の retry notice に絞る。
@@ -138,13 +145,13 @@ HTTP status 504 のような stream 開始前 error は Phase 1 の retry 表示
 `stream_response` の成功 result は保ちつつ、stream が途中で切れたことだけを表せる型にする。
 
 ```rust
-enum StreamResponseOutcome {
-    Completed(CompletedResponse),
-    Interrupted(StreamInterruption),
+enum StreamCompletion {
+    Complete,
+    Interrupted { reason: String },
 }
 ```
 
-`CompletedResponse` は現行成功経路で使っている情報を保持する。`Interrupted` には partial commit に必要な情報だけを入れる。
+`Complete` は現行成功経路へ進むだけで、成功時の assistant item / tool call を別 result type へ包み直さない。`Interrupted` には continuation notice と partial commit 判断に必要な理由だけを入れる。
 
 `TimelineDispatch` / collector に partial drain API を追加し、途中中断時に安全に history 化できるものだけを取り出す。
 
@@ -158,19 +165,19 @@ enum StreamResponseOutcome {
 
 ```rust
 match self.stream_response(request).await? {
-    StreamResponseOutcome::Completed(response) => {
-        self.handle_completed_response(response).await?;
+    StreamCompletion::Complete => {
+        self.handle_completed_response().await?;
         if self.execute_and_commit_tools(...).await? {
             continue;
         }
         break;
     }
-    StreamResponseOutcome::Interrupted(interruption) => {
+    StreamCompletion::Interrupted { reason } => {
         if continuation_budget.exhausted() {
             return Err(...);
         }
-        self.commit_partial_assistant(interruption.safe_items).await?;
-        self.emit_continuation_notice(...);
+        self.commit_partial_assistant(...).await?;
+        self.emit_continuation_notice(reason);
         continue;
     }
 }
@@ -197,8 +204,9 @@ match self.stream_response(request).await? {
 
 ## 完了条件
 
-- `HttpTransport` の unit test で retryable 504 時に retry notice が発火する。
-- `Worker` の test で `on_llm_retry` callback が呼ばれる。
+- `HttpTransport` の unit test で retryable 504/503 が transport 内部では retry されず、`ClientError` として返る。
+- `HttpTransport` の unit test で `Retry-After` が `ClientError` metadata として保持される。
+- `Worker` の test で stream open 前の retryable error に対して `on_llm_retry` callback が呼ばれる。
 - `protocol::Event` の retry / continuation event の serde roundtrip test がある。
 - Pod controller bridge の test、または既存 bridge test への追加で retry / continuation event が流れることを確認する。
 - TUI app test で retry / continuation event が transient state を更新し、進行イベントで clear されることを確認する。

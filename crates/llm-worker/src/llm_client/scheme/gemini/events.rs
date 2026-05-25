@@ -131,6 +131,7 @@ impl GeminiScheme {
                 status: None,
                 code: Some("parse_error".to_string()),
                 message: format!("Failed to parse Gemini SSE data: {} -> {}", e, data),
+                retry_after: None,
             })?;
 
         let mut events = Vec::new();

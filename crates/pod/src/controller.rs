@@ -331,6 +331,29 @@ fn wire_event_bridges_on_worker<C, St>(
     });
 
     let tx = event_tx.clone();
+    worker.on_llm_retry(move |llm_call, notice| {
+        let _ = tx.send(Event::LlmRetry {
+            llm_call,
+            failed_attempt: notice.failed_attempt,
+            max_attempts: notice.max_attempts,
+            wait_ms: notice.wait.as_millis() as u64,
+            elapsed_ms: notice.elapsed.as_millis() as u64,
+            status: notice.status,
+            error: notice.error.clone(),
+        });
+    });
+
+    let tx = event_tx.clone();
+    worker.on_llm_continuation(move |llm_call, attempt, max_attempts, reason| {
+        let _ = tx.send(Event::LlmContinuation {
+            llm_call,
+            attempt,
+            max_attempts,
+            reason: reason.to_owned(),
+        });
+    });
+
+    let tx = event_tx.clone();
     let activity = ai_activity.clone();
     worker.on_text_block(move |block| {
         let tx_d = tx.clone();

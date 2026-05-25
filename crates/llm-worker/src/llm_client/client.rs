@@ -36,6 +36,8 @@ impl std::fmt::Display for ConfigWarning {
     }
 }
 
+pub type ResponseStream = Pin<Box<dyn Stream<Item = Result<Event, ClientError>> + Send>>;
+
 /// LLMクライアントのtrait
 ///
 /// 各プロバイダはこのtraitを実装し、統一されたインターフェースを提供する。
@@ -49,10 +51,7 @@ pub trait LlmClient: Send + Sync {
     /// # Returns
     /// * `Ok(Stream)` - イベントストリーム
     /// * `Err(ClientError)` - エラー
-    async fn stream(
-        &self,
-        request: Request,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<Event, ClientError>> + Send>>, ClientError>;
+    async fn stream(&self, request: Request) -> Result<ResponseStream, ClientError>;
 
     /// Clone this client into a new `Box<dyn LlmClient>`.
     ///
@@ -85,10 +84,7 @@ impl Clone for Box<dyn LlmClient> {
 /// これにより、動的ディスパッチを使用するクライアントも `Worker` で利用可能になる。
 #[async_trait]
 impl LlmClient for Box<dyn LlmClient> {
-    async fn stream(
-        &self,
-        request: Request,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<Event, ClientError>> + Send>>, ClientError> {
+    async fn stream(&self, request: Request) -> Result<ResponseStream, ClientError> {
         (**self).stream(request).await
     }
 

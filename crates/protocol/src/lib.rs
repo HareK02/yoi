@@ -298,6 +298,29 @@ pub enum Event {
     LlmCallEnd {
         llm_call: usize,
     },
+    /// A transport-level LLM request retry has been scheduled.
+    ///
+    /// This is operational state for clients to render while the worker is
+    /// waiting in backoff. It is not part of conversation history.
+    LlmRetry {
+        llm_call: usize,
+        /// The attempt that just failed. 1 origin.
+        failed_attempt: u32,
+        max_attempts: u32,
+        wait_ms: u64,
+        elapsed_ms: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<u16>,
+        error: String,
+    },
+    /// Stream generation was interrupted after events had begun and the worker
+    /// is continuing with a follow-up LLM request.
+    LlmContinuation {
+        llm_call: usize,
+        attempt: u32,
+        max_attempts: u32,
+        reason: String,
+    },
     TextDelta {
         text: String,
     },
@@ -865,6 +888,69 @@ mod tests {
         .unwrap();
         assert_eq!(parsed["event"], "llm_call_start");
         assert_eq!(parsed["data"]["llm_call"], 3);
+    }
+
+    #[test]
+    fn event_llm_retry_roundtrip() {
+        let event = Event::LlmRetry {
+            llm_call: 3,
+            failed_attempt: 1,
+            max_attempts: 4,
+            wait_ms: 800,
+            elapsed_ms: 120,
+            status: Some(504),
+            error: "API error (status: 504): gateway timeout".into(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["event"], "llm_retry");
+        assert_eq!(parsed["data"]["status"], 504);
+        let decoded: Event = serde_json::from_str(&json).unwrap();
+        match decoded {
+            Event::LlmRetry {
+                llm_call,
+                failed_attempt,
+                max_attempts,
+                wait_ms,
+                status,
+                ..
+            } => {
+                assert_eq!(llm_call, 3);
+                assert_eq!(failed_attempt, 1);
+                assert_eq!(max_attempts, 4);
+                assert_eq!(wait_ms, 800);
+                assert_eq!(status, Some(504));
+            }
+            other => panic!("expected LlmRetry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn event_llm_continuation_roundtrip() {
+        let event = Event::LlmContinuation {
+            llm_call: 4,
+            attempt: 1,
+            max_attempts: 3,
+            reason: "SSE parse error: closed".into(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["event"], "llm_continuation");
+        let decoded: Event = serde_json::from_str(&json).unwrap();
+        match decoded {
+            Event::LlmContinuation {
+                llm_call,
+                attempt,
+                max_attempts,
+                reason,
+            } => {
+                assert_eq!(llm_call, 4);
+                assert_eq!(attempt, 1);
+                assert_eq!(max_attempts, 3);
+                assert_eq!(reason, "SSE parse error: closed");
+            }
+            other => panic!("expected LlmContinuation, got {other:?}"),
+        }
     }
 
     #[test]

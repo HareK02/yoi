@@ -1158,7 +1158,14 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     ];
 
     if app.running {
-        let status = if let Some(tool) = &app.current_tool {
+        let status = if let Some(wait_event) = &app.latest_llm_wait_event {
+            format!(
+                "request: {} | ↑{}/↓{} | {wait_event}",
+                app.run_requests,
+                fmt_tokens(app.run_upload_tokens),
+                fmt_tokens(app.run_output_tokens),
+            )
+        } else if let Some(tool) = &app.current_tool {
             format!(
                 "request: {} | ↑{}/↓{} | tool: {tool}",
                 app.run_requests,
@@ -1217,6 +1224,11 @@ fn draw_actionbar(frame: &mut Frame, app: &App, area: Rect) {
         left.push(Span::styled(
             "Alt-q edit queued  Alt-c clear queued",
             Style::default().fg(Color::DarkGray),
+        ));
+    } else if let Some(llm_event) = app.latest_llm_wait_event.as_deref() {
+        left.push(Span::styled(
+            truncate_with_ellipsis(llm_event, 96),
+            Style::default().fg(Color::Yellow),
         ));
     } else if let Some(memory_event) = app.latest_memory_worker_event.as_deref() {
         left.push(Span::styled(

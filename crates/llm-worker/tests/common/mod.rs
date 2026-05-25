@@ -59,6 +59,7 @@ impl LlmClient for MockLlmClient {
                 status: Some(500),
                 code: Some("mock_error".to_string()),
                 message: "No more mock responses".to_string(),
+                retry_after: None,
             });
         }
         let events = self.responses[count].clone();

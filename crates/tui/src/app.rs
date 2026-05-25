@@ -89,6 +89,8 @@ pub struct App {
     pub context_window: u64,
     pub turn_index: usize,
     pub current_tool: Option<String>,
+    /// Latest LLM wait/retry lifecycle event for actionbar observability.
+    pub latest_llm_wait_event: Option<String>,
     /// Latest memory extract/consolidation lifecycle event for actionbar observability.
     pub latest_memory_worker_event: Option<String>,
     /// Normal composer input that is submitted as `Method::Run`.
@@ -150,6 +152,7 @@ impl App {
             context_window: 0,
             turn_index: 0,
             current_tool: None,
+            latest_llm_wait_event: None,
             latest_memory_worker_event: None,
             input: InputBuffer::new(),
             command_input: InputBuffer::new(),
@@ -608,20 +611,52 @@ impl App {
                 self.set_pod_status(PodStatus::Running);
                 self.run_requests += 1;
                 self.current_tool = None;
+                self.latest_llm_wait_event = None;
                 self.assistant_streaming = false;
             }
             // UI consumers of Invoke / LlmCall semantics are out of scope
             // for `tickets/invoke-turn-llmcall-semantics.md`; events flow
             // through to subscribers but the TUI currently derives its
             // turn header from `UserMessage` / `SystemItem` arrivals.
-            Event::InvokeStart { .. } | Event::LlmCallStart { .. } | Event::LlmCallEnd { .. } => {}
+            Event::InvokeStart { .. } | Event::LlmCallStart { .. } | Event::LlmCallEnd { .. } => {
+                self.latest_llm_wait_event = None;
+            }
+            Event::LlmRetry {
+                failed_attempt,
+                max_attempts,
+                wait_ms,
+                status,
+                error,
+                ..
+            } => {
+                let next_attempt = failed_attempt.saturating_add(1).min(max_attempts);
+                let reason = status
+                    .map(|code| format!("HTTP {code}"))
+                    .unwrap_or_else(|| error);
+                self.latest_llm_wait_event = Some(format!(
+                    "retrying LLM request after {reason} (attempt {next_attempt}/{max_attempts} in {})",
+                    fmt_millis(wait_ms)
+                ));
+            }
+            Event::LlmContinuation {
+                attempt,
+                max_attempts,
+                reason,
+                ..
+            } => {
+                self.latest_llm_wait_event = Some(format!(
+                    "LLM stream interrupted; continuing generation ({attempt}/{max_attempts}): {reason}"
+                ));
+            }
             Event::TextDelta { text } => {
+                self.latest_llm_wait_event = None;
                 self.append_assistant_text(&text);
             }
             Event::TextDone { .. } => {
                 self.assistant_streaming = false;
             }
             Event::ThinkingStart => {
+                self.latest_llm_wait_event = None;
                 self.assistant_streaming = false;
                 self.blocks.push(Block::Thinking(ThinkingBlock {
                     text: String::new(),
@@ -661,6 +696,7 @@ impl App {
                 self.current_tool = None;
             }
             Event::ToolCallStart { id, name } => {
+                self.latest_llm_wait_event = None;
                 self.current_tool = Some(name.clone());
                 self.assistant_streaming = false;
                 self.blocks.push(Block::ToolCall(ToolCallBlock {
@@ -702,6 +738,7 @@ impl App {
                 output,
                 is_error,
             } => {
+                self.latest_llm_wait_event = None;
                 // Pull the name / args out first so we can look at the
                 // (immutable) cache before taking the mutable block
                 // borrow below.
@@ -776,6 +813,7 @@ impl App {
                 self.push_error(format!("[{code:?}] {message}"));
             }
             Event::RunEnd { result } => {
+                self.latest_llm_wait_event = None;
                 if matches!(result, RunResult::RolledBack) {
                     self.handle_rolled_back_run();
                 } else {
@@ -889,6 +927,7 @@ impl App {
         self.run_upload_tokens = 0;
         self.run_output_tokens = 0;
         self.current_tool = None;
+        self.latest_llm_wait_event = None;
         self.assistant_streaming = false;
     }
 
@@ -1291,6 +1330,14 @@ pub fn fmt_tokens(n: u64) -> String {
     }
 }
 
+fn fmt_millis(ms: u64) -> String {
+    if ms >= 1_000 {
+        format!("{:.1}s", ms as f64 / 1_000.0)
+    } else {
+        format!("{ms}ms")
+    }
+}
+
 fn message_text(item: &serde_json::Value) -> String {
     item["content"]
         .as_array()
@@ -1353,6 +1400,47 @@ pub fn alert_source_label(source: AlertSource) -> &'static str {
         AlertSource::Worker => "worker",
         AlertSource::Compactor => "compactor",
         AlertSource::AgentsMd => "AGENTS.md",
+    }
+}
+
+#[cfg(test)]
+mod llm_wait_event_tests {
+    use super::*;
+
+    #[test]
+    fn llm_retry_updates_and_progress_clears_transient_status() {
+        let mut app = App::new("test".into());
+        app.handle_pod_event(Event::LlmRetry {
+            llm_call: 2,
+            failed_attempt: 1,
+            max_attempts: 4,
+            wait_ms: 1_200,
+            elapsed_ms: 50,
+            status: Some(504),
+            error: "gateway timeout".into(),
+        });
+        assert_eq!(
+            app.latest_llm_wait_event.as_deref(),
+            Some("retrying LLM request after HTTP 504 (attempt 2/4 in 1.2s)")
+        );
+
+        app.handle_pod_event(Event::TextDelta { text: "ok".into() });
+        assert!(app.latest_llm_wait_event.is_none());
+    }
+
+    #[test]
+    fn llm_continuation_updates_transient_status() {
+        let mut app = App::new("test".into());
+        app.handle_pod_event(Event::LlmContinuation {
+            llm_call: 3,
+            attempt: 1,
+            max_attempts: 3,
+            reason: "SSE parse error: closed".into(),
+        });
+        assert_eq!(
+            app.latest_llm_wait_event.as_deref(),
+            Some("LLM stream interrupted; continuing generation (1/3): SSE parse error: closed")
+        );
     }
 }
 

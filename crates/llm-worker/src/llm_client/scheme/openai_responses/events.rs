@@ -597,6 +597,7 @@ fn from_json<T: for<'de> Deserialize<'de>>(data: &str) -> Result<T, ClientError>
         status: None,
         code: Some("parse_error".to_string()),
         message: format!("Failed to parse SSE data: {e}"),
+        retry_after: None,
     })
 }
 

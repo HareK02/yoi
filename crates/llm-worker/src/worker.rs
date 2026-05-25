@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::marker::PhantomData;
+use std::{marker::PhantomData, time::Instant};
 
 use futures::StreamExt;
 use tokio::sync::mpsc;
@@ -17,8 +17,8 @@ use crate::{
         PromptAction, ToolCallInfo, ToolResultInfo, TurnEndAction,
     },
     llm_client::{
-        ClientError, ConfigWarning, LlmClient, Request, RequestConfig, ToolDefinition,
-        types::parse_tool_arguments,
+        ClientError, ConfigWarning, LlmClient, Request, RequestConfig, ResponseStream,
+        ToolDefinition, error::is_retryable, retry::RetryPolicy, types::parse_tool_arguments,
     },
     state::{Locked, Mutable, WorkerState},
     timeline::event::{ErrorEvent, StatusEvent, UsageEvent},
@@ -99,6 +99,8 @@ enum ToolExecutionResult {
     Paused,
 }
 
+const MAX_STREAM_CONTINUATIONS: u32 = 3;
+
 /// Central component for managing LLM interactions
 ///
 /// Receives input from the user, sends requests to the LLM, and
@@ -131,9 +133,28 @@ enum ToolExecutionResult {
 /// let out = worker.run("Continue").await?;
 /// let mut worker = out.worker;
 /// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LlmRetryNotice {
+    /// 直近で失敗した attempt 番号。1 origin。
+    pub failed_attempt: u32,
+    pub max_attempts: u32,
+    pub wait: std::time::Duration,
+    pub elapsed: std::time::Duration,
+    pub status: Option<u16>,
+    pub error: String,
+}
+
+#[derive(Debug)]
+enum StreamCompletion {
+    Complete,
+    Interrupted { reason: String },
+}
+
 pub struct Worker<C: LlmClient, S: WorkerState = Mutable> {
     /// LLM client
     client: C,
+    /// Retry policy for opening an LLM response stream.
+    retry_policy: RetryPolicy,
     /// Event timeline
     timeline: Timeline,
     /// Text block collector (Timeline handler)
@@ -175,6 +196,10 @@ pub struct Worker<C: LlmClient, S: WorkerState = Mutable> {
     llm_call_start_cbs: Vec<Box<dyn Fn(usize) + Send + Sync>>,
     /// LlmCall-end callbacks
     llm_call_end_cbs: Vec<Box<dyn Fn(usize) + Send + Sync>>,
+    /// Transport-level retry callbacks for a specific LlmCall.
+    llm_retry_cbs: Vec<Box<dyn Fn(usize, &LlmRetryNotice) + Send + Sync>>,
+    /// Stream continuation callbacks for a specific LlmCall.
+    llm_continuation_cbs: Vec<Box<dyn Fn(usize, u32, u32, &str) + Send + Sync>>,
     /// Non-fatal warning callbacks. Invoked when the Worker wants to
     /// surface an advisory message to the upper layer (e.g. Pod) so it
     /// can be forwarded to the user — distinct from `tracing::warn!`,
@@ -353,6 +378,34 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
     /// Register an LlmCall-end callback.
     pub fn on_llm_call_end(&mut self, callback: impl Fn(usize) + Send + Sync + 'static) {
         self.llm_call_end_cbs.push(Box::new(callback));
+    }
+
+    /// Register a transport-level retry callback.
+    pub fn on_llm_retry(
+        &mut self,
+        callback: impl Fn(usize, &LlmRetryNotice) + Send + Sync + 'static,
+    ) {
+        self.llm_retry_cbs.push(Box::new(callback));
+    }
+
+    /// Register a stream continuation callback.
+    pub fn on_llm_continuation(
+        &mut self,
+        callback: impl Fn(usize, u32, u32, &str) + Send + Sync + 'static,
+    ) {
+        self.llm_continuation_cbs.push(Box::new(callback));
+    }
+
+    fn emit_llm_continuation(
+        &self,
+        llm_call: usize,
+        attempt: u32,
+        max_attempts: u32,
+        reason: &str,
+    ) {
+        for cb in &self.llm_continuation_cbs {
+            cb(llm_call, attempt, max_attempts, reason);
+        }
     }
 
     /// Register a non-fatal warning callback.
@@ -964,6 +1017,8 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
             }
         }
 
+        let mut stream_continuations: u32 = 0;
+        let mut continuing_stream = false;
         loop {
             if self.try_cancelled() {
                 info!("Execution cancelled");
@@ -973,9 +1028,11 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
             }
 
             let current_turn = self.turn_count;
-            debug!(turn = current_turn, "Turn start");
-            for cb in &self.turn_start_cbs {
-                cb(current_turn);
+            if !continuing_stream {
+                debug!(turn = current_turn, "Turn start");
+                for cb in &self.turn_start_cbs {
+                    cb(current_turn);
+                }
             }
 
             // Drain interceptor-side inputs that are meant to land in
@@ -1080,12 +1137,49 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
 
             // Stream LLM response
             let request = self.build_request(&tool_definitions, &request_context);
-            self.stream_response(request).await?;
+            let stream_outcome = self.stream_response(request, current_llm_call).await?;
 
             for cb in &self.llm_call_end_cbs {
                 cb(current_llm_call);
             }
             self.llm_call_count += 1;
+
+            if let StreamCompletion::Interrupted { reason } = stream_outcome {
+                stream_continuations += 1;
+                if stream_continuations > MAX_STREAM_CONTINUATIONS {
+                    self.last_run_interrupted = true;
+                    return Err(WorkerError::Client(ClientError::Api {
+                        status: None,
+                        code: None,
+                        message: format!("LLM stream interrupted too many times: {reason}"),
+                        retry_after: None,
+                    }));
+                }
+
+                self.timeline.abort_current_block();
+                self.timeline.flush_usage();
+                let reasoning_items = self.reasoning_item_collector.take_collected();
+                let text_blocks = self.text_block_collector.take_collected();
+                // Do not recover tool calls from an interrupted stream. A completed
+                // tool_use is executable only when the provider finishes the stream.
+                let _dropped_tool_calls = self.tool_call_collector.take_collected();
+                let assistant_items =
+                    self.build_assistant_items(&reasoning_items, &text_blocks, &[]);
+                if !assistant_items.is_empty() {
+                    self.append_history_items(assistant_items);
+                }
+                self.emit_llm_continuation(
+                    current_llm_call,
+                    stream_continuations,
+                    MAX_STREAM_CONTINUATIONS,
+                    &reason,
+                );
+                continuing_stream = true;
+                continue;
+            }
+
+            stream_continuations = 0;
+            continuing_stream = false;
 
             for cb in &self.turn_end_cbs {
                 cb(current_turn);
@@ -1138,8 +1232,88 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
         }
     }
 
+    async fn open_stream_with_retry(
+        &mut self,
+        request: Request,
+        llm_call: usize,
+    ) -> Result<ResponseStream, WorkerError> {
+        let policy = self.retry_policy.clone();
+        let started = Instant::now();
+        let mut failed_attempt: u32 = 0;
+
+        loop {
+            let stream_result = tokio::select! {
+                stream_result = self.client.stream(request.clone()) => stream_result,
+                cancel = self.cancel_rx.recv() => {
+                    if cancel.is_some() {
+                        info!("Cancelled before stream started");
+                    }
+                    self.timeline.abort_current_block();
+                    self.last_run_interrupted = true;
+                    return Err(WorkerError::Cancelled);
+                }
+            };
+
+            match stream_result {
+                Ok(stream) => return Ok(stream),
+                Err(err) => {
+                    let next_failed_attempt = failed_attempt + 1;
+                    if next_failed_attempt >= policy.max_attempts || !is_retryable(&err) {
+                        self.last_run_interrupted = true;
+                        return Err(WorkerError::Client(err));
+                    }
+
+                    let wait = err
+                        .retry_after()
+                        .unwrap_or_else(|| policy.backoff(failed_attempt));
+                    let elapsed = started.elapsed();
+                    if elapsed + wait > policy.total_timeout {
+                        self.last_run_interrupted = true;
+                        return Err(WorkerError::Client(err));
+                    }
+
+                    warn!(
+                        error = %err,
+                        failed_attempt = next_failed_attempt,
+                        wait_ms = wait.as_millis() as u64,
+                        "transient LLM request error, retrying"
+                    );
+                    let notice = LlmRetryNotice {
+                        failed_attempt: next_failed_attempt,
+                        max_attempts: policy.max_attempts,
+                        wait,
+                        elapsed,
+                        status: err.status(),
+                        error: err.to_string(),
+                    };
+                    for cb in &self.llm_retry_cbs {
+                        cb(llm_call, &notice);
+                    }
+
+                    tokio::select! {
+                        _ = tokio::time::sleep(wait) => {}
+                        cancel = self.cancel_rx.recv() => {
+                            if cancel.is_some() {
+                                info!("Cancelled during LLM retry backoff");
+                            }
+                            self.timeline.abort_current_block();
+                            self.last_run_interrupted = true;
+                            return Err(WorkerError::Cancelled);
+                        }
+                    }
+
+                    failed_attempt = next_failed_attempt;
+                }
+            }
+        }
+    }
+
     /// Open a stream, dispatch all events to the timeline, handle cancellation.
-    async fn stream_response(&mut self, request: Request) -> Result<(), WorkerError> {
+    async fn stream_response(
+        &mut self,
+        request: Request,
+        llm_call: usize,
+    ) -> Result<StreamCompletion, WorkerError> {
         debug!(
             item_count = request.items.len(),
             tool_count = request.tools.len(),
@@ -1147,18 +1321,7 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
             "Sending request to LLM"
         );
 
-        let mut stream = tokio::select! {
-            stream_result = self.client.stream(request) => stream_result
-                .inspect_err(|_| self.last_run_interrupted = true)?,
-            cancel = self.cancel_rx.recv() => {
-                if cancel.is_some() {
-                    info!("Cancelled before stream started");
-                }
-                self.timeline.abort_current_block();
-                self.last_run_interrupted = true;
-                return Err(WorkerError::Cancelled);
-            }
-        };
+        let mut stream = self.open_stream_with_retry(request, llm_call).await?;
 
         let mut event_count: usize = 0;
         loop {
@@ -1175,12 +1338,17 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
                                     warn!(error = %e, "Stream error");
                                 }
                             }
-                            let event = result
-                                .inspect_err(|_| {
+                            let event = match result {
+                                Ok(event) => event,
+                                Err(err) => {
                                     self.last_run_interrupted = true;
                                     // 部分情報でも発火しておく（料金会計用）
                                     self.timeline.flush_usage();
-                                })?;
+                                    return Ok(StreamCompletion::Interrupted {
+                                        reason: err.to_string(),
+                                    });
+                                }
+                            };
                             self.timeline.dispatch(&event);
                         }
                         None => break,
@@ -1200,7 +1368,7 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
         // ストリーム完了時に集約済み Usage を 1 度だけ発火
         self.timeline.flush_usage();
         debug!(event_count = event_count, "Stream completed");
-        Ok(())
+        Ok(StreamCompletion::Complete)
     }
 
     /// Execute tools and push results to history.
@@ -1254,6 +1422,7 @@ impl<C: LlmClient> Worker<C, Mutable> {
 
         Self {
             client,
+            retry_policy: RetryPolicy::default(),
             timeline,
             text_block_collector,
             tool_call_collector,
@@ -1270,6 +1439,8 @@ impl<C: LlmClient> Worker<C, Mutable> {
             turn_end_cbs: Vec::new(),
             llm_call_start_cbs: Vec::new(),
             llm_call_end_cbs: Vec::new(),
+            llm_retry_cbs: Vec::new(),
+            llm_continuation_cbs: Vec::new(),
             warning_cbs: Vec::new(),
             tool_result_cbs: Vec::new(),
             history_append_cbs: Vec::new(),
@@ -1382,6 +1553,12 @@ impl<C: LlmClient> Worker<C, Mutable> {
     /// ```
     pub fn with_config(mut self, config: RequestConfig) -> Self {
         self.request_config = config;
+        self
+    }
+
+    /// Set the retry policy used when opening an LLM response stream.
+    pub fn with_retry_policy(mut self, retry_policy: RetryPolicy) -> Self {
+        self.retry_policy = retry_policy;
         self
     }
 
@@ -1507,6 +1684,7 @@ impl<C: LlmClient> Worker<C, Mutable> {
         let locked_prefix_len = self.history.len();
         Worker {
             client: self.client,
+            retry_policy: self.retry_policy,
             timeline: self.timeline,
             text_block_collector: self.text_block_collector,
             tool_call_collector: self.tool_call_collector,
@@ -1523,6 +1701,8 @@ impl<C: LlmClient> Worker<C, Mutable> {
             turn_end_cbs: self.turn_end_cbs,
             llm_call_start_cbs: self.llm_call_start_cbs,
             llm_call_end_cbs: self.llm_call_end_cbs,
+            llm_retry_cbs: self.llm_retry_cbs,
+            llm_continuation_cbs: self.llm_continuation_cbs,
             warning_cbs: self.warning_cbs,
             tool_result_cbs: self.tool_result_cbs,
             history_append_cbs: self.history_append_cbs,
@@ -1594,6 +1774,7 @@ impl<C: LlmClient> Worker<C, Locked> {
     pub fn unlock(self) -> Worker<C, Mutable> {
         Worker {
             client: self.client,
+            retry_policy: self.retry_policy,
             timeline: self.timeline,
             text_block_collector: self.text_block_collector,
             tool_call_collector: self.tool_call_collector,
@@ -1610,6 +1791,8 @@ impl<C: LlmClient> Worker<C, Locked> {
             turn_end_cbs: self.turn_end_cbs,
             llm_call_start_cbs: self.llm_call_start_cbs,
             llm_call_end_cbs: self.llm_call_end_cbs,
+            llm_retry_cbs: self.llm_retry_cbs,
+            llm_continuation_cbs: self.llm_continuation_cbs,
             warning_cbs: self.warning_cbs,
             tool_result_cbs: self.tool_result_cbs,
             history_append_cbs: self.history_append_cbs,

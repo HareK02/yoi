@@ -4,17 +4,77 @@
 
 mod common;
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use common::MockLlmClient;
 use llm_worker::Worker;
 use llm_worker::llm_client::event::{Event, ResponseStatus, StatusEvent as ClientStatusEvent};
+use llm_worker::llm_client::retry::RetryPolicy;
+use llm_worker::llm_client::{ClientError, LlmClient, Request, ResponseStream};
 use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 
-// =============================================================================
-// Tests
-// =============================================================================
+#[derive(Clone)]
+struct FailOnceClient {
+    calls: Arc<AtomicUsize>,
+    events: Vec<Event>,
+}
+
+#[async_trait]
+impl LlmClient for FailOnceClient {
+    async fn stream(&self, _request: Request) -> Result<ResponseStream, ClientError> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Err(ClientError::Api {
+                status: Some(504),
+                code: None,
+                message: "gateway timeout".into(),
+                retry_after: None,
+            });
+        }
+        Ok(Box::pin(futures::stream::iter(
+            self.events.clone().into_iter().map(Ok),
+        )))
+    }
+
+    fn clone_boxed(&self) -> Box<dyn LlmClient> {
+        Box::new(self.clone())
+    }
+}
+
+#[tokio::test]
+async fn test_callback_llm_retry_event() {
+    let events = vec![Event::Status(ClientStatusEvent {
+        status: ResponseStatus::Completed,
+    })];
+    let client = FailOnceClient {
+        calls: Arc::new(AtomicUsize::new(0)),
+        events,
+    };
+    let mut worker = Worker::new(client).with_retry_policy(RetryPolicy {
+        base: Duration::from_millis(1),
+        cap: Duration::from_millis(1),
+        max_attempts: 2,
+        total_timeout: Duration::from_secs(1),
+    });
+
+    let notices = Arc::new(Mutex::new(Vec::new()));
+    let sink = notices.clone();
+    worker.on_llm_retry(move |llm_call, notice| {
+        sink.lock().unwrap().push((llm_call, notice.clone()));
+    });
+
+    let result = worker.run("retry once").await;
+    assert!(result.is_ok(), "worker should succeed after one retry");
+
+    let notices = notices.lock().unwrap();
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0].0, 0);
+    assert_eq!(notices[0].1.failed_attempt, 1);
+    assert_eq!(notices[0].1.max_attempts, 2);
+    assert_eq!(notices[0].1.status, Some(504));
+}
 
 /// Verify that on_text_block correctly receives delta and stop events
 #[tokio::test]
