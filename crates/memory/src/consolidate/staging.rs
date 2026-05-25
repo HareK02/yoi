@@ -26,34 +26,58 @@ pub struct StagingEntry {
     pub bytes: u64,
 }
 
+/// staging directory の検査結果。`entries` は current schema として読めた
+/// staging のみで、`invalid_count` は `.json` だが staging として採用できなかった
+/// ファイル数。
+#[derive(Debug, Clone, Default)]
+pub struct StagingEntriesSnapshot {
+    pub entries: Vec<StagingEntry>,
+    pub invalid_count: usize,
+}
+
 /// `<staging_dir>/*.json` を読んで UUIDv7 順に並べた [`StagingEntry`]
 /// 配列を返す。staging_dir が存在しなければ空配列。読めないファイルや
 /// JSON parse 失敗は `tracing::warn!` してスキップ（壊れた個別ファイルが
 /// consolidation 全体を止めないように）。
 pub fn list_staging_entries(layout: &WorkspaceLayout) -> Vec<StagingEntry> {
+    list_staging_entries_snapshot(layout).entries
+}
+
+/// `<staging_dir>/*.json` を読んで valid staging と invalid staging 件数を返す。
+/// invalid は自動 migration / 削除 / archive せず、観測可能にするための件数だけを
+/// 呼び出し側へ渡す。
+pub fn list_staging_entries_snapshot(layout: &WorkspaceLayout) -> StagingEntriesSnapshot {
     let dir = layout.staging_dir();
     let entries = match std::fs::read_dir(&dir) {
         Ok(it) => it,
-        Err(_) => return Vec::new(),
+        Err(_) => return StagingEntriesSnapshot::default(),
     };
 
     let mut out: Vec<StagingEntry> = Vec::new();
+    let mut invalid_count = 0;
     for entry in entries.flatten() {
         let path = entry.path();
         if !path.is_file() {
             continue;
         }
-        let stem = match path.file_stem().and_then(|s| s.to_str()) {
-            Some(s) => s,
-            None => continue,
-        };
         let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
         if ext != "json" {
             continue;
         }
+        let stem = match path.file_stem().and_then(|s| s.to_str()) {
+            Some(s) => s,
+            None => {
+                invalid_count += 1;
+                continue;
+            }
+        };
         let id = match Uuid::parse_str(stem) {
             Ok(u) => u,
-            Err(_) => continue,
+            Err(e) => {
+                invalid_count += 1;
+                tracing::warn!(path = %path.display(), error = %e, "failed to parse staging entry id");
+                continue;
+            }
         };
         let bytes = match std::fs::metadata(&path) {
             Ok(m) => m.len(),
@@ -62,6 +86,7 @@ pub fn list_staging_entries(layout: &WorkspaceLayout) -> Vec<StagingEntry> {
         let raw = match std::fs::read_to_string(&path) {
             Ok(s) => s,
             Err(e) => {
+                invalid_count += 1;
                 tracing::warn!(path = %path.display(), error = %e, "failed to read staging entry");
                 continue;
             }
@@ -69,6 +94,7 @@ pub fn list_staging_entries(layout: &WorkspaceLayout) -> Vec<StagingEntry> {
         let record = match serde_json::from_str::<StagingRecord>(&raw) {
             Ok(r) => r,
             Err(e) => {
+                invalid_count += 1;
                 tracing::warn!(path = %path.display(), error = %e, "failed to parse staging entry");
                 continue;
             }
@@ -81,7 +107,10 @@ pub fn list_staging_entries(layout: &WorkspaceLayout) -> Vec<StagingEntry> {
         });
     }
     out.sort_by_key(|e| e.id);
-    out
+    StagingEntriesSnapshot {
+        entries: out,
+        invalid_count,
+    }
 }
 
 #[cfg(test)]
@@ -116,17 +145,26 @@ mod tests {
     }
 
     #[test]
-    fn skips_lock_file_and_garbage() {
+    fn skips_lock_file_and_counts_invalid_json() {
         let tmp = tempfile::TempDir::new().unwrap();
         let layout = WorkspaceLayout::new(tmp.path().to_path_buf());
         let (_id, _) = write_staging(&layout, source("s", [0, 1]), empty_payload()).unwrap();
 
-        // Drop a non-UUID json file and a bare lock file alongside.
+        // Drop a non-UUID json file, an unparsable UUID-named json file, and
+        // a bare lock file alongside. Lock files are not `.json`; invalid
+        // `.json` files are surfaced separately instead of being mistaken for
+        // an empty staging directory.
         std::fs::write(layout.staging_dir().join("not-a-uuid.json"), "{}").unwrap();
+        let bad_id = Uuid::now_v7();
+        std::fs::write(layout.staging_dir().join(format!("{bad_id}.json")), "{").unwrap();
         std::fs::write(layout.staging_dir().join(".consolidation.lock"), "{}").unwrap();
 
         let entries = list_staging_entries(&layout);
         assert_eq!(entries.len(), 1);
+
+        let snapshot = list_staging_entries_snapshot(&layout);
+        assert_eq!(snapshot.entries.len(), 1);
+        assert_eq!(snapshot.invalid_count, 2);
     }
 
     #[test]

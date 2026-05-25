@@ -21,6 +21,10 @@ use uuid::Uuid;
 
 use crate::workspace::WorkspaceLayout;
 
+fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditWorker {
@@ -141,6 +145,8 @@ pub struct ExtractAudit {
 pub struct ConsolidationAudit {
     #[serde(default)]
     pub staging_count: usize,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub invalid_staging_count: usize,
     #[serde(default)]
     pub staging_bytes: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

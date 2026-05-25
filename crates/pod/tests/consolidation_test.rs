@@ -27,8 +27,9 @@ use memory::WorkspaceLayout;
 use memory::extract::{ExtractedPayload, write_staging};
 use memory::schema::SourceRef;
 use session_store::FsStore;
+use tokio::sync::broadcast;
 
-use pod::Pod;
+use pod::{Event, Pod};
 
 #[derive(Clone)]
 struct MockClient {
@@ -183,6 +184,32 @@ fn write_n_staging(layout: &WorkspaceLayout, n: usize) -> Vec<uuid::Uuid> {
     ids
 }
 
+fn attach_event_receiver(pod: &mut Pod<MockClient, FsStore>) -> broadcast::Receiver<Event> {
+    let (tx, rx) = broadcast::channel(16);
+    pod.attach_event_tx(tx);
+    rx
+}
+
+fn collect_memory_worker_reasons(rx: &mut broadcast::Receiver<Event>) -> Vec<String> {
+    let mut reasons = Vec::new();
+    loop {
+        match rx.try_recv() {
+            Ok(Event::MemoryWorker(event)) => reasons.push(event.reason),
+            Ok(_) => {}
+            Err(broadcast::error::TryRecvError::Empty) => break,
+            Err(err) => panic!("unexpected broadcast receive error: {err}"),
+        }
+    }
+    reasons
+}
+
+fn read_audit_jsonl(layout: &WorkspaceLayout) -> Vec<serde_json::Value> {
+    let text = std::fs::read_to_string(layout.audit_current_log_path()).unwrap();
+    text.lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect()
+}
+
 #[tokio::test]
 async fn no_memory_section_is_a_noop() {
     let pwd = tempfile::tempdir().unwrap();
@@ -240,6 +267,79 @@ async fn empty_staging_skips() {
     let mut pod = make_pod_with(FILES_THRESHOLD_TOML, pwd.path().to_path_buf(), client).await;
     pod.try_post_run_consolidate().await.unwrap();
     // No mock calls expected.
+}
+
+#[tokio::test]
+async fn empty_staging_skip_is_audit_only() {
+    let pwd = tempfile::tempdir().unwrap();
+    let client = MockClient::new(vec![]);
+    let mut pod = make_pod_with(FILES_THRESHOLD_TOML, pwd.path().to_path_buf(), client).await;
+    let mut rx = attach_event_receiver(&mut pod);
+
+    pod.try_post_run_consolidate().await.unwrap();
+
+    assert!(collect_memory_worker_reasons(&mut rx).is_empty());
+}
+
+#[tokio::test]
+async fn invalid_only_staging_is_distinct_from_no_staging() {
+    let pwd = tempfile::tempdir().unwrap();
+    let layout = WorkspaceLayout::new(pwd.path().to_path_buf());
+    std::fs::create_dir_all(layout.staging_dir()).unwrap();
+    let invalid_id = uuid::Uuid::now_v7();
+    let invalid_path = layout.staging_dir().join(format!("{invalid_id}.json"));
+    std::fs::write(&invalid_path, "{").unwrap();
+
+    let client = MockClient::new(vec![]);
+    let mut pod = make_pod_with(FILES_THRESHOLD_TOML, pwd.path().to_path_buf(), client).await;
+    let mut rx = attach_event_receiver(&mut pod);
+
+    pod.try_post_run_consolidate().await.unwrap();
+
+    assert!(invalid_path.exists(), "invalid staging is not auto-deleted");
+    let reasons = collect_memory_worker_reasons(&mut rx);
+    assert_eq!(reasons, vec!["no_valid_staging_entries invalid=1"]);
+
+    let audit = read_audit_jsonl(&layout);
+    let last = audit.last().unwrap();
+    assert_eq!(last["reason"], "no_valid_staging_entries invalid=1");
+    assert_eq!(last["consolidation"]["staging_count"], 0);
+    assert_eq!(last["consolidation"]["invalid_staging_count"], 1);
+}
+
+#[tokio::test]
+async fn below_threshold_skip_is_audit_only() {
+    let pwd = tempfile::tempdir().unwrap();
+    let layout = WorkspaceLayout::new(pwd.path().to_path_buf());
+    write_n_staging(&layout, 1); // threshold is 2
+
+    let client = MockClient::new(vec![]);
+    let mut pod = make_pod_with(FILES_THRESHOLD_TOML, pwd.path().to_path_buf(), client).await;
+    let mut rx = attach_event_receiver(&mut pod);
+
+    pod.try_post_run_consolidate().await.unwrap();
+
+    assert!(collect_memory_worker_reasons(&mut rx).is_empty());
+}
+
+#[tokio::test]
+async fn completed_event_survives_terminal_empty_drain_skip() {
+    let pwd = tempfile::tempdir().unwrap();
+    let layout = WorkspaceLayout::new(pwd.path().to_path_buf());
+    write_n_staging(&layout, 2); // threshold is 2 — fires.
+
+    let client = MockClient::new(vec![done("ok")]);
+    let mut pod = make_pod_with(FILES_THRESHOLD_TOML, pwd.path().to_path_buf(), client).await;
+    let mut rx = attach_event_receiver(&mut pod);
+
+    pod.try_post_run_consolidate().await.unwrap();
+
+    let reasons = collect_memory_worker_reasons(&mut rx);
+    assert_eq!(reasons.len(), 2);
+    assert!(reasons[0].starts_with("staging_threshold_reached files=2 bytes="));
+    assert_eq!(reasons[1], "completed_no_record_changes");
+    let audit = read_audit_jsonl(&layout);
+    assert_eq!(audit.last().unwrap()["reason"], "no_staging_entries");
 }
 
 #[tokio::test]
