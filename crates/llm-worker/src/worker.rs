@@ -18,7 +18,8 @@ use crate::{
     },
     llm_client::{
         ClientError, ConfigWarning, LlmClient, Request, RequestConfig, ResponseStream,
-        ToolDefinition, error::is_retryable, retry::RetryPolicy, types::parse_tool_arguments,
+        ToolDefinition, error::is_retryable, event::Event, retry::RetryPolicy,
+        types::parse_tool_arguments,
     },
     state::{Locked, Mutable, WorkerState},
     timeline::event::{ErrorEvent, StatusEvent, UsageEvent},
@@ -200,6 +201,9 @@ pub struct Worker<C: LlmClient, S: WorkerState = Mutable> {
     llm_retry_cbs: Vec<Box<dyn Fn(usize, &LlmRetryNotice) + Send + Sync>>,
     /// Stream continuation callbacks for a specific LlmCall.
     llm_continuation_cbs: Vec<Box<dyn Fn(usize, u32, u32, &str) + Send + Sync>>,
+    /// Stream event callbacks. Fired for every normalized provider stream
+    /// event before it enters the Timeline.
+    stream_event_cbs: Vec<Box<dyn Fn(usize, usize, &Event) + Send + Sync>>,
     /// Non-fatal warning callbacks. Invoked when the Worker wants to
     /// surface an advisory message to the upper layer (e.g. Pod) so it
     /// can be forwarded to the user — distinct from `tracing::warn!`,
@@ -405,6 +409,20 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
     ) {
         for cb in &self.llm_continuation_cbs {
             cb(llm_call, attempt, max_attempts, reason);
+        }
+    }
+
+    /// Register a raw normalized stream event callback.
+    pub fn on_stream_event(
+        &mut self,
+        callback: impl Fn(usize, usize, &Event) + Send + Sync + 'static,
+    ) {
+        self.stream_event_cbs.push(Box::new(callback));
+    }
+
+    fn emit_stream_event(&self, turn: usize, llm_call: usize, event: &Event) {
+        for cb in &self.stream_event_cbs {
+            cb(turn, llm_call, event);
         }
     }
 
@@ -1137,7 +1155,9 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
 
             // Stream LLM response
             let request = self.build_request(&tool_definitions, &request_context);
-            let stream_outcome = self.stream_response(request, current_llm_call).await?;
+            let stream_outcome = self
+                .stream_response(request, current_turn, current_llm_call)
+                .await?;
 
             for cb in &self.llm_call_end_cbs {
                 cb(current_llm_call);
@@ -1312,6 +1332,7 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
     async fn stream_response(
         &mut self,
         request: Request,
+        turn: usize,
         llm_call: usize,
     ) -> Result<StreamCompletion, WorkerError> {
         debug!(
@@ -1349,6 +1370,7 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
                                     });
                                 }
                             };
+                            self.emit_stream_event(turn, llm_call, &event);
                             self.timeline.dispatch(&event);
                         }
                         None => break,
@@ -1441,6 +1463,7 @@ impl<C: LlmClient> Worker<C, Mutable> {
             llm_call_end_cbs: Vec::new(),
             llm_retry_cbs: Vec::new(),
             llm_continuation_cbs: Vec::new(),
+            stream_event_cbs: Vec::new(),
             warning_cbs: Vec::new(),
             tool_result_cbs: Vec::new(),
             history_append_cbs: Vec::new(),
@@ -1703,6 +1726,7 @@ impl<C: LlmClient> Worker<C, Mutable> {
             llm_call_end_cbs: self.llm_call_end_cbs,
             llm_retry_cbs: self.llm_retry_cbs,
             llm_continuation_cbs: self.llm_continuation_cbs,
+            stream_event_cbs: self.stream_event_cbs,
             warning_cbs: self.warning_cbs,
             tool_result_cbs: self.tool_result_cbs,
             history_append_cbs: self.history_append_cbs,
@@ -1793,6 +1817,7 @@ impl<C: LlmClient> Worker<C, Locked> {
             llm_call_end_cbs: self.llm_call_end_cbs,
             llm_retry_cbs: self.llm_retry_cbs,
             llm_continuation_cbs: self.llm_continuation_cbs,
+            stream_event_cbs: self.stream_event_cbs,
             warning_cbs: self.warning_cbs,
             tool_result_cbs: self.tool_result_cbs,
             history_append_cbs: self.history_append_cbs,

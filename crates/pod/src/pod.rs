@@ -167,6 +167,15 @@ where
         self.sink.publish(entry);
         Ok(())
     }
+
+    /// Append a debug trace record alongside the current segment log. Trace
+    /// writes deliberately do not affect the segment entry counter or live
+    /// replay sink because they are not conversation history.
+    pub fn append_trace(&self, entry: &session_store::TraceEntry) -> Result<(), StoreError> {
+        let loc = self.state.location();
+        self.store
+            .append_trace(loc.session_id, loc.segment_id, entry)
+    }
 }
 
 /// Type-erased commit handle for the interceptor. Lets the
@@ -502,6 +511,20 @@ impl<C: LlmClient + Clone + 'static, St: Store + Clone + 'static> Pod<C, St> {
                 warn!(error = %err, "history append commit failed; dropping");
             }
         });
+        if self.manifest.session.record_event_trace {
+            let writer = self.log_writer_handle();
+            self.worker_mut()
+                .on_stream_event(move |turn, _llm_call, event| {
+                    let entry = session_store::TraceEntry {
+                        ts: segment_log::now_millis(),
+                        turn,
+                        event: event.clone(),
+                    };
+                    if let Err(err) = writer.append_trace(&entry) {
+                        warn!(error = %err, "stream event trace commit failed; dropping");
+                    }
+                });
+        }
         self.history_persistence_wired = true;
     }
 

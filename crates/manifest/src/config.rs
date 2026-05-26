@@ -17,7 +17,8 @@ use crate::defaults;
 use crate::model::{AuthRef, ModelManifest, ReasoningControl};
 use crate::{
     CompactionConfig, FileUploadLimits, MemoryConfig, PodManifest, PodMeta, ScopeConfig,
-    SkillsConfig, ToolOutputLimits, ToolPermissionConfig, ToolPermissionRule, WorkerManifest,
+    SessionConfig, SkillsConfig, ToolOutputLimits, ToolPermissionConfig, ToolPermissionRule,
+    WorkerManifest,
 };
 
 /// Partial-form Pod manifest. Every field is optional; one or more
@@ -37,6 +38,8 @@ pub struct PodManifestConfig {
     pub worker: WorkerManifestConfig,
     #[serde(default)]
     pub scope: ScopeConfig,
+    #[serde(default)]
+    pub session: Option<SessionConfigPartial>,
     /// Optional `[permissions]` section. `None` means the permission layer
     /// is disabled; `Some` requires `default_action` during final resolve.
     #[serde(default)]
@@ -100,6 +103,12 @@ pub struct ToolOutputLimitsPartial {
 pub struct FileUploadLimitsPartial {
     #[serde(default)]
     pub max_bytes: Option<usize>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SessionConfigPartial {
+    #[serde(default)]
+    pub record_event_trace: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -260,6 +269,7 @@ impl PodManifestConfig {
             model: self.model.merge(upper.model),
             worker: self.worker.merge(upper.worker),
             scope: merge_scope(self.scope, upper.scope),
+            session: merge_option(self.session, upper.session, SessionConfigPartial::merge),
             permissions: merge_option(
                 self.permissions,
                 upper.permissions,
@@ -349,6 +359,14 @@ impl FileUploadLimitsPartial {
     fn merge(self, upper: Self) -> Self {
         Self {
             max_bytes: upper.max_bytes.or(self.max_bytes),
+        }
+    }
+}
+
+impl SessionConfigPartial {
+    fn merge(self, upper: Self) -> Self {
+        Self {
+            record_event_trace: upper.record_event_trace.or(self.record_event_trace),
         }
     }
 }
@@ -496,6 +514,12 @@ impl TryFrom<PodManifestConfig> for PodManifest {
         for rule in &cfg.scope.deny {
             ensure_absolute("scope.deny.target", &rule.target)?;
         }
+        let session = SessionConfig {
+            record_event_trace: cfg
+                .session
+                .and_then(|s| s.record_event_trace)
+                .unwrap_or(false),
+        };
 
         let permissions = cfg
             .permissions
@@ -550,6 +574,7 @@ impl TryFrom<PodManifestConfig> for PodManifest {
             model: cfg.model,
             worker,
             scope: cfg.scope,
+            session,
             permissions,
             compaction,
             memory: cfg.memory,
@@ -596,6 +621,7 @@ mod tests {
                 deny: Vec::new(),
             },
             permissions: None,
+            session: None,
             compaction: None,
             memory: None,
             skills: None,
@@ -608,6 +634,17 @@ mod tests {
         assert_eq!(manifest.pod.name, "test");
         assert_eq!(manifest.model.scheme, Some(SchemeKind::Anthropic));
         assert!(manifest.permissions.is_none());
+    }
+
+    #[test]
+    fn resolve_session_record_event_trace() {
+        let mut cfg = minimal_valid();
+        cfg.session = Some(SessionConfigPartial {
+            record_event_trace: Some(true),
+        });
+
+        let manifest: PodManifest = cfg.try_into().unwrap();
+        assert!(manifest.session.record_event_trace);
     }
 
     #[test]

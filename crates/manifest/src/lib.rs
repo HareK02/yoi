@@ -37,6 +37,9 @@ pub struct PodManifest {
     pub model: ModelManifest,
     pub worker: WorkerManifest,
     pub scope: ScopeConfig,
+    /// Session/debug persistence settings. Defaults keep extra traces off.
+    #[serde(default)]
+    pub session: SessionConfig,
     /// Optional manifest-level tool permission policy. Absent means the
     /// permission layer is disabled and tool calls run as before.
     #[serde(default)]
@@ -298,6 +301,15 @@ pub struct ScopeConfig {
     /// default.
     #[serde(default)]
     pub deny: Vec<ScopeRule>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct SessionConfig {
+    /// Persist every provider stream event directly to `trace.jsonl` next to the
+    /// segment log. Intended for debugging stalls between stream requests; off
+    /// by default because it can be verbose.
+    #[serde(default)]
+    pub record_event_trace: bool,
 }
 
 /// Manifest-level pattern-based tool permission policy.
