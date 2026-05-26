@@ -174,9 +174,12 @@ fn trace_entries_in_separate_file() {
     let trace = TraceEntry {
         ts: 1500,
         turn: 0,
-        event: llm_worker::llm_client::event::Event::Ping(
-            llm_worker::llm_client::event::PingEvent { timestamp: None },
-        ),
+        llm_call: Some(0),
+        payload: session_store::TracePayload::StreamEvent {
+            event: llm_worker::llm_client::event::Event::Ping(
+                llm_worker::llm_client::event::PingEvent { timestamp: None },
+            ),
+        },
     };
     store.append_trace(sid, segid, &trace).unwrap();
 

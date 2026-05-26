@@ -514,14 +514,33 @@ impl<C: LlmClient + Clone + 'static, St: Store + Clone + 'static> Pod<C, St> {
         if self.manifest.session.record_event_trace {
             let writer = self.log_writer_handle();
             self.worker_mut()
-                .on_stream_event(move |turn, _llm_call, event| {
+                .on_stream_event(move |turn, llm_call, event| {
                     let entry = session_store::TraceEntry {
                         ts: segment_log::now_millis(),
                         turn,
-                        event: event.clone(),
+                        llm_call: Some(llm_call),
+                        payload: session_store::TracePayload::StreamEvent {
+                            event: event.clone(),
+                        },
                     };
                     if let Err(err) = writer.append_trace(&entry) {
                         warn!(error = %err, "stream event trace commit failed; dropping");
+                    }
+                });
+            let writer = self.log_writer_handle();
+            self.worker_mut()
+                .on_lifecycle_trace(move |turn, llm_call, label, data| {
+                    let entry = session_store::TraceEntry {
+                        ts: segment_log::now_millis(),
+                        turn,
+                        llm_call: Some(llm_call),
+                        payload: session_store::TracePayload::Lifecycle {
+                            label: label.to_string(),
+                            data: data.clone(),
+                        },
+                    };
+                    if let Err(err) = writer.append_trace(&entry) {
+                        warn!(error = %err, "lifecycle trace commit failed; dropping");
                     }
                 });
         }

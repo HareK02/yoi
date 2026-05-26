@@ -39,7 +39,7 @@ pub mod segment_log;
 pub mod store;
 pub mod system_item;
 
-pub use event_trace::TraceEntry;
+pub use event_trace::{TraceEntry, TracePayload};
 pub use fs_store::FsStore;
 pub use llm_worker::UsageRecord;
 pub use llm_worker::llm_client::types::{ContentPart, Item, Role};
