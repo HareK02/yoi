@@ -8,9 +8,9 @@
 //! prompt is materialised exactly once just before the first LLM turn:
 //! the rendered body is appended with a fixed trailing section carrying
 //! the Pod's `Scope` summary and (if present) the project's `AGENTS.md`
-//! contents, and the whole string is handed to the Worker via
-//! `set_system_prompt`. Subsequent turns and compactions reuse that
-//! materialised string verbatim.
+//! contents plus resident memory sections, and the whole string is handed
+//! to the Worker via `set_system_prompt`. Subsequent turns and compactions
+//! reuse that materialised string verbatim.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -122,6 +122,7 @@ impl SystemPromptTemplate {
             ctx.prompts,
             ctx.scope,
             ctx.agents_md.as_deref(),
+            ctx.resident_summary,
             ctx.resident_knowledge,
             ctx.resident_workflows,
         )
@@ -152,6 +153,10 @@ pub struct SystemPromptContext<'a> {
     /// Not visible from the template; consumed by the trailing-section
     /// formatter in [`SystemPromptTemplate::render`].
     pub agents_md: Option<String>,
+    /// The body of `<workspace>/.insomnia/memory/summary.md`, with
+    /// frontmatter stripped. `None` disables the resident summary section;
+    /// empty strings are ignored by the trailing-section formatter.
+    pub resident_summary: Option<&'a str>,
     /// Resident-injection candidates from `<workspace>/knowledge/*` whose
     /// frontmatter has `model_invokation: true`. `None` disables the
     /// section entirely (memory disabled, or a consolidation worker that opts
@@ -209,6 +214,7 @@ pub fn append_trailing_section(
     prompts: &PromptCatalog,
     scope: &Scope,
     agents_md: Option<&str>,
+    resident_summary: Option<&str>,
     resident_knowledge: Option<&[ResidentKnowledgeEntry]>,
     resident_workflows: Option<&[ResidentWorkflowEntry]>,
 ) -> Result<String, SystemPromptError> {
@@ -227,6 +233,15 @@ pub fn append_trailing_section(
         let section = prompts.agents_md_section(agents)?;
         out.push_str(section.trim_end_matches(&['\n', ' '][..]));
         out.push('\n');
+    }
+    if let Some(summary) = resident_summary {
+        let summary = summary.trim_matches(&['\n', '\r'][..]);
+        if !summary.trim().is_empty() {
+            out.push('\n');
+            let section = prompts.resident_memory_summary_section(summary)?;
+            out.push_str(section.trim_end_matches(&['\n', ' '][..]));
+            out.push('\n');
+        }
     }
     if let Some(entries) = resident_knowledge {
         if !entries.is_empty() {
@@ -335,6 +350,26 @@ mod tests {
             scope,
             tool_names: tools,
             agents_md,
+            resident_summary: None,
+            resident_knowledge: None,
+            resident_workflows: None,
+            prompts: test_prompts(),
+        }
+    }
+
+    fn ctx_with_summary<'a>(
+        cwd: &'a Path,
+        scope: &'a Scope,
+        summary: Option<&'a str>,
+    ) -> SystemPromptContext<'a> {
+        SystemPromptContext {
+            now: fixed_now(),
+            cwd,
+            language: manifest::defaults::WORKER_LANGUAGE,
+            scope,
+            tool_names: Vec::new(),
+            agents_md: None,
+            resident_summary: summary,
             resident_knowledge: None,
             resident_workflows: None,
             prompts: test_prompts(),
@@ -353,8 +388,28 @@ mod tests {
             scope,
             tool_names: Vec::new(),
             agents_md: None,
+            resident_summary: None,
             resident_knowledge: Some(resident),
             resident_workflows: None,
+            prompts: test_prompts(),
+        }
+    }
+
+    fn ctx_with_resident_workflows<'a>(
+        cwd: &'a Path,
+        scope: &'a Scope,
+        resident: &'a [ResidentWorkflowEntry],
+    ) -> SystemPromptContext<'a> {
+        SystemPromptContext {
+            now: fixed_now(),
+            cwd,
+            language: manifest::defaults::WORKER_LANGUAGE,
+            scope,
+            tool_names: Vec::new(),
+            agents_md: None,
+            resident_summary: None,
+            resident_knowledge: None,
+            resident_workflows: Some(resident),
             prompts: test_prompts(),
         }
     }
@@ -569,6 +624,40 @@ mod tests {
     }
 
     #[test]
+    fn trailing_section_renders_resident_summary_body() {
+        let (_tmp, loader) = user_loader_with("body.md", "BODY");
+        let tmpl = SystemPromptTemplate::parse("$user/body", loader).unwrap();
+        let dir = TempDir::new().unwrap();
+        let scope = build_scope(dir.path());
+        let rendered = tmpl
+            .render(&ctx_with_summary(
+                dir.path(),
+                &scope,
+                Some("Persistent summary body"),
+            ))
+            .unwrap();
+        assert!(rendered.contains("## Resident memory summary"));
+        assert!(rendered.contains("Persistent summary body"));
+    }
+
+    #[test]
+    fn trailing_section_omits_resident_summary_when_none_or_empty() {
+        let (_tmp, loader) = user_loader_with("body.md", "BODY");
+        let tmpl = SystemPromptTemplate::parse("$user/body", loader).unwrap();
+        let dir = TempDir::new().unwrap();
+        let scope = build_scope(dir.path());
+        let rendered = tmpl
+            .render(&ctx_with_summary(dir.path(), &scope, None))
+            .unwrap();
+        assert!(!rendered.contains("Resident memory summary"));
+
+        let rendered = tmpl
+            .render(&ctx_with_summary(dir.path(), &scope, Some("  \n")))
+            .unwrap();
+        assert!(!rendered.contains("Resident memory summary"));
+    }
+
+    #[test]
     fn trailing_section_omits_resident_knowledge_when_none() {
         let (_tmp, loader) = user_loader_with("body.md", "BODY");
         let tmpl = SystemPromptTemplate::parse("$user/body", loader).unwrap();
@@ -617,5 +706,40 @@ mod tests {
         let pos_boundaries = rendered.find("## Working boundaries").unwrap();
         let pos_resident = rendered.find("## Resident knowledge").unwrap();
         assert!(pos_resident > pos_boundaries);
+    }
+
+    #[test]
+    fn trailing_section_renders_resident_workflows() {
+        let (_tmp, loader) = user_loader_with("body.md", "BODY");
+        let tmpl = SystemPromptTemplate::parse("$user/body", loader).unwrap();
+        let dir = TempDir::new().unwrap();
+        let scope = build_scope(dir.path());
+        let workflows = [ResidentWorkflowEntry {
+            slug: "resident-flow".to_string(),
+            description: "workflow resident desc\nwith newline".to_string(),
+        }];
+        let rendered = tmpl
+            .render(&ctx_with_resident_workflows(dir.path(), &scope, &workflows))
+            .unwrap();
+
+        assert!(rendered.contains("## Resident workflows"));
+        assert!(rendered.contains("- resident-flow: workflow resident desc with newline"));
+        let pos_boundaries = rendered.find("## Working boundaries").unwrap();
+        let pos_resident = rendered.find("## Resident workflows").unwrap();
+        assert!(pos_resident > pos_boundaries);
+    }
+
+    #[test]
+    fn trailing_section_omits_empty_resident_workflows() {
+        let (_tmp, loader) = user_loader_with("body.md", "BODY");
+        let tmpl = SystemPromptTemplate::parse("$user/body", loader).unwrap();
+        let dir = TempDir::new().unwrap();
+        let scope = build_scope(dir.path());
+        let workflows: [ResidentWorkflowEntry; 0] = [];
+        let rendered = tmpl
+            .render(&ctx_with_resident_workflows(dir.path(), &scope, &workflows))
+            .unwrap();
+
+        assert!(!rendered.contains("Resident workflows"));
     }
 }

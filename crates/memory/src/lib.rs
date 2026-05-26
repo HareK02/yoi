@@ -22,7 +22,10 @@ pub use error::{LintError, LintWarning, MemoryError};
 pub use extract::ExtractPointerPayload;
 pub use lint_common::{RecordLintError, Slug, is_valid_slug};
 pub use linter::{LintReport, Linter};
-pub use resident::{ResidentKnowledgeEntry, collect_resident_knowledge, list_knowledge_slugs};
+pub use resident::{
+    ResidentKnowledgeEntry, collect_resident_knowledge, collect_resident_summary,
+    list_knowledge_slugs,
+};
 pub use scope::deny_write_rules;
 pub use usage::{
     UsageEvent, UsageEventKind, UsageRecordSnapshot, UsageReport, UsageReportRecord, UsageSource,

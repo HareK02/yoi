@@ -79,13 +79,18 @@ pub enum PodPrompt {
     /// Trailing `## Project instructions (AGENTS.md)` section, appended
     /// after the scope summary when an AGENTS.md is present.
     AgentsMdSection,
+    /// Trailing `## Resident memory summary` section, appended after the
+    /// AGENTS.md section when memory is enabled, summary injection is enabled,
+    /// and `memory/summary.md` has a valid non-empty body.
+    ResidentMemorySummarySection,
     /// Trailing `## Resident knowledge` section, appended after the
-    /// AGENTS.md section when memory is enabled and at least one
-    /// `knowledge/*` record advertises `model_invokation: true`.
+    /// resident memory summary when memory is enabled, Knowledge resident
+    /// injection is enabled, and at least one `knowledge/*` record advertises
+    /// `model_invokation: true`.
     ResidentKnowledgeSection,
     /// Trailing `## Resident workflows` section, appended after resident
-    /// knowledge when memory is enabled and at least one workflow advertises
-    /// `model_invokation: true`.
+    /// knowledge when Workflow resident injection is enabled and at least one
+    /// workflow advertises `model_invokation: true`.
     ResidentWorkflowsSection,
 }
 
@@ -100,6 +105,7 @@ impl PodPrompt {
             Self::InterruptSystemNote => "interrupt_system_note",
             Self::WorkingBoundariesSection => "working_boundaries_section",
             Self::AgentsMdSection => "agents_md_section",
+            Self::ResidentMemorySummarySection => "resident_memory_summary_section",
             Self::ResidentKnowledgeSection => "resident_knowledge_section",
             Self::ResidentWorkflowsSection => "resident_workflows_section",
         }
@@ -117,6 +123,7 @@ impl PodPrompt {
         PodPrompt::InterruptSystemNote,
         PodPrompt::WorkingBoundariesSection,
         PodPrompt::AgentsMdSection,
+        PodPrompt::ResidentMemorySummarySection,
         PodPrompt::ResidentKnowledgeSection,
         PodPrompt::ResidentWorkflowsSection,
     ];
@@ -130,6 +137,7 @@ impl PodPrompt {
         "interrupt_system_note",
         "working_boundaries_section",
         "agents_md_section",
+        "resident_memory_summary_section",
         "resident_knowledge_section",
         "resident_workflows_section",
     ];
@@ -350,6 +358,14 @@ impl PromptCatalog {
     /// Render `PodPrompt::AgentsMdSection` with `{{ agents_md }}`.
     pub fn agents_md_section(&self, agents_md: &str) -> Result<String, CatalogError> {
         self.render(PodPrompt::AgentsMdSection, single("agents_md", agents_md))
+    }
+
+    /// Render `PodPrompt::ResidentMemorySummarySection` with `{{ summary }}`.
+    pub fn resident_memory_summary_section(&self, summary: &str) -> Result<String, CatalogError> {
+        self.render(
+            PodPrompt::ResidentMemorySummarySection,
+            single("summary", summary),
+        )
     }
 
     /// Render `PodPrompt::ResidentKnowledgeSection` with `{{ entries }}`

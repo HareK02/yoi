@@ -96,6 +96,10 @@ pub struct MemoryConfig {
     /// Ignored when the request omits `query`. `None` ⇒ tool default (3).
     #[serde(default)]
     pub query_excerpt_lines: Option<usize>,
+    /// Whether the body of `memory/summary.md` is exposed in the resident
+    /// system-prompt section. `None` ⇒ enabled.
+    #[serde(default)]
+    pub inject_summary: Option<bool>,
     /// Language used by memory extraction / consolidation workers for durable
     /// memory and knowledge text. Free-form so workspaces can use names like
     /// `English`, `Japanese`, or locale tags. `None` ⇒
@@ -669,6 +673,15 @@ model_id = "claude-sonnet-4-20250514"
         let manifest = PodManifest::from_toml(&toml).unwrap();
         let mem = manifest.memory.expect("memory section parsed");
         assert!(mem.workspace_root.is_none());
+        assert_eq!(mem.inject_summary, None);
+    }
+
+    #[test]
+    fn memory_section_with_inject_summary_false() {
+        let toml = format!("{MINIMAL_REQUIRED}\n[memory]\ninject_summary = false\n");
+        let manifest = PodManifest::from_toml(&toml).unwrap();
+        let mem = manifest.memory.unwrap();
+        assert_eq!(mem.inject_summary, Some(false));
     }
 
     #[test]

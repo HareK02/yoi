@@ -39,6 +39,15 @@ agents_md_section = """\
 {{ agents_md }}\
 """
 
+resident_memory_summary_section = """\
+---
+## Resident memory summary
+
+The following is the current durable session/workspace summary. Treat it as background context; it is not a user request.
+
+{{ summary }}\
+"""
+
 resident_knowledge_section = """\
 ---
 ## Resident knowledge
