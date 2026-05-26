@@ -11,7 +11,6 @@
 - Pod: scope 永続化 authority の整理 → [tickets/pod-scope-persistence-authority.md](tickets/pod-scope-persistence-authority.md)
 - SpawnPod 初回 task delivery の受理確認 → [tickets/spawnpod-initial-run-confirmation.md](tickets/spawnpod-initial-run-confirmation.md)
 - E2E テストハーネス（`tests/e2e/`、opt-in） → [tickets/e2e-harness.md](tickets/e2e-harness.md)
-- Compact: retained split が pruning 後 usage record に引きずられて巨大 tail を残す → [tickets/compact-retained-split-usage-records.md](tickets/compact-retained-split-usage-records.md)
 - メモリ機構
   - consolidation skip 表示と invalid staging の観測性 → [tickets/memory-consolidation-skip-observability.md](tickets/memory-consolidation-skip-observability.md)
   - memory / knowledge tool 利用タイミングのプロンプトガイダンス → [tickets/memory-tool-guidance-prompt.md](tickets/memory-tool-guidance-prompt.md)
