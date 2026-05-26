@@ -12,6 +12,7 @@
 //! The viewport's last frame stays in the terminal's scrollback so the
 //! user has a record of what was spawned (or why a spawn failed).
 
+use std::ffi::OsString;
 use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -20,6 +21,7 @@ use client::{SpawnConfig, spawn_pod};
 use crossterm::event::{self, Event as TermEvent, KeyCode, KeyEventKind, KeyModifiers};
 use manifest::{
     PodManifestConfig, ScopeConfig, find_project_manifest_from, load_layer, user_manifest_path,
+    user_manifest_path_from_env,
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -210,9 +212,15 @@ fn load_spawn_defaults() -> Result<SpawnDefaults, SpawnError> {
     // Run the same merge pod itself uses, then read what's missing off the
     // result. We only look at `scope.allow` here — `pod.name` is an
     // instance-level identifier and is supplied by the dialog or `--pod`.
-    let user_layer = user_manifest_path()
-        .filter(|p| p.is_file())
-        .and_then(|p| load_layer(&p).ok());
+    // TUI must pre-read the same user manifest path that the pod CLI will use,
+    // including a non-empty INSOMNIA_USER_MANIFEST override; empty values fall
+    // back to the auto-discovered path.
+    let user_layer = user_manifest_path_for_spawn(
+        std::env::var_os(manifest::paths::USER_MANIFEST_ENV),
+        user_manifest_path(),
+    )
+    .filter(|p| p.is_file())
+    .and_then(|p| load_layer(&p).ok());
     let project_layer = find_project_manifest_from(&cwd).and_then(|p| load_layer(&p).ok());
 
     let mut cascade = PodManifestConfig::builtin_defaults();
@@ -250,6 +258,13 @@ fn load_spawn_defaults() -> Result<SpawnDefaults, SpawnError> {
         scope_origin,
         default_name,
     })
+}
+
+fn user_manifest_path_for_spawn(
+    env_value: Option<OsString>,
+    default_user_manifest: Option<PathBuf>,
+) -> Option<PathBuf> {
+    user_manifest_path_from_env(env_value).or(default_user_manifest)
 }
 
 fn form_for_pod_name(pod_name: String, defaults: SpawnDefaults) -> Form {
@@ -710,6 +725,28 @@ permission = "write"
 
         let empty_cascade = PodManifestConfig::builtin_defaults();
         assert!(empty_cascade.scope.allow.is_empty());
+    }
+
+    #[test]
+    fn user_manifest_path_for_spawn_prefers_non_empty_env_override() {
+        assert_eq!(
+            user_manifest_path_for_spawn(
+                Some(OsString::from("/tmp/override.toml")),
+                Some(PathBuf::from("/default/manifest.toml")),
+            ),
+            Some(PathBuf::from("/tmp/override.toml")),
+        );
+    }
+
+    #[test]
+    fn user_manifest_path_for_spawn_treats_empty_env_as_unset() {
+        assert_eq!(
+            user_manifest_path_for_spawn(
+                Some(OsString::from("")),
+                Some(PathBuf::from("/default/manifest.toml")),
+            ),
+            Some(PathBuf::from("/default/manifest.toml")),
+        );
     }
 
     #[test]

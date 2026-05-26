@@ -13,7 +13,9 @@ pub use config::{
 pub use model::{
     AuthRef, ModelCapability, ModelManifest, ReasoningControl, ReasoningEffort, SchemeKind,
 };
-pub use paths::user_manifest_path;
+pub use paths::{
+    user_manifest_path, user_manifest_path_from_env, user_manifest_path_with_env_override,
+};
 pub use protocol::{Permission, ScopeRule};
 pub use scope::{Scope, ScopeError, SharedScope};
 

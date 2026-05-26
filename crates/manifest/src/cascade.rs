@@ -3,7 +3,8 @@
 //! Pod manifests are assembled from up to three on-disk layers (see
 //! `pod::PodFactory` for the full cascade story):
 //!
-//! 1. **User manifest** — see [`crate::paths::user_manifest_path`]
+//! 1. **User manifest** — Pod CLI uses
+//!    [`crate::paths::user_manifest_path_with_env_override`]
 //! 2. **Project manifest** at the closest `.insomnia/manifest.toml`
 //!    found by walking up from a starting directory (typically `cwd`)
 //! 3. **Programmatic overlay** supplied at the call site

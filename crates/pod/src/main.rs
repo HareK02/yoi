@@ -7,8 +7,6 @@ use manifest::{PodManifest, PodManifestConfig, paths};
 use pod::{Pod, PodController, PodFactory, PromptLoader};
 use session_store::{FsStore, PodMetadataStore, SegmentId, Store};
 
-const USER_MANIFEST_ENV: &str = "INSOMNIA_USER_MANIFEST";
-
 #[derive(Debug, Parser)]
 #[command(
     name = "pod",
@@ -68,19 +66,20 @@ struct Cli {
 }
 
 fn resolve_manifest(cli: &Cli) -> Result<(PodManifest, PromptLoader), String> {
-    resolve_manifest_with_user_manifest_env(cli, std::env::var_os(USER_MANIFEST_ENV))
+    resolve_manifest_with_user_manifest_env(cli, std::env::var_os(paths::USER_MANIFEST_ENV))
 }
 
 fn resolve_manifest_with_user_manifest_env(
     cli: &Cli,
     user_manifest_env: Option<OsString>,
 ) -> Result<(PodManifest, PromptLoader), String> {
-    let user_manifest = user_manifest_path_from_env(user_manifest_env);
+    let user_manifest = paths::user_manifest_path_from_env(user_manifest_env);
 
     if let Some(path) = &cli.manifest {
         if user_manifest.is_some() {
             return Err(format!(
-                "--manifest cannot be used when {USER_MANIFEST_ENV} is set"
+                "--manifest cannot be used when {} is set",
+                paths::USER_MANIFEST_ENV
             ));
         }
         return load_single_manifest(path, cli.pod.as_deref());
@@ -90,16 +89,6 @@ fn resolve_manifest_with_user_manifest_env(
     factory
         .resolve()
         .map_err(|e| format!("failed to resolve manifest cascade: {e}"))
-}
-
-fn user_manifest_path_from_env(value: Option<OsString>) -> Option<PathBuf> {
-    value.and_then(|value| {
-        if value.is_empty() {
-            None
-        } else {
-            Some(PathBuf::from(value))
-        }
-    })
 }
 
 fn load_single_manifest(
@@ -408,7 +397,7 @@ permission = "write"
             .unwrap_err();
 
         assert!(err.contains("--manifest cannot be used"));
-        assert!(err.contains(USER_MANIFEST_ENV));
+        assert!(err.contains(paths::USER_MANIFEST_ENV));
     }
 
     #[test]
