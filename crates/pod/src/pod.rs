@@ -314,13 +314,18 @@ pub struct Pod<C: LlmClient, St: Store> {
     /// Memory workspace layout used by the workflow resolver to load required
     /// Knowledge records by exact slug.
     memory_layout: Option<memory::WorkspaceLayout>,
+    /// When true (default), the system-prompt assembler may append the
+    /// workspace memory summary (`memory/summary.md`). Internal disposable
+    /// workers disable this so resident memory exposure is opt-in per Pod.
+    inject_resident_summary: bool,
     /// When true (default), the system-prompt assembler may append resident
-    /// memory sections from the workspace: `memory/summary.md`, resident
-    /// knowledge records, and resident workflows. Consolidation workers set
-    /// this to false so the agentic worker pulls knowledge through the
-    /// search tools instead, and so disposable internal workers avoid
-    /// resident memory exposure entirely.
+    /// Knowledge descriptions. This is intentionally independent from
+    /// summary and workflow residency: each section has its own gate.
     inject_resident_knowledge: bool,
+    /// When true (default), the system-prompt assembler may append resident
+    /// Workflow descriptions. This is intentionally independent from
+    /// summary and Knowledge residency: each section has its own gate.
+    inject_resident_workflows: bool,
     /// Latest runtime scope snapshot queued by dynamic scope changes.
     /// Drained into the session log before the next turn result is
     /// persisted, so resume never silently reclaims delegated writes.
@@ -426,7 +431,9 @@ impl<C: LlmClient + Clone + 'static, St: Store + Clone + 'static> Pod<C, St> {
             prompts: self.prompts.clone(),
             workflow_registry: self.workflow_registry.clone(),
             memory_layout: self.memory_layout.clone(),
+            inject_resident_summary: self.inject_resident_summary,
             inject_resident_knowledge: self.inject_resident_knowledge,
+            inject_resident_workflows: self.inject_resident_workflows,
             pending_scope_snapshot: self.pending_scope_snapshot.clone(),
             extract_in_flight: self.extract_in_flight.clone(),
             consolidation_in_flight: self.consolidation_in_flight.clone(),
@@ -570,7 +577,9 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             prompts,
             workflow_registry: workflow_crate::WorkflowRegistry::empty(),
             memory_layout: None,
+            inject_resident_summary: true,
             inject_resident_knowledge: true,
+            inject_resident_workflows: true,
             pending_scope_snapshot: Arc::new(Mutex::new(None)),
             extract_in_flight: Arc::new(AtomicBool::new(false)),
             consolidation_in_flight: Arc::new(AtomicBool::new(false)),
@@ -594,18 +603,31 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         self.system_prompt_template = Some(template);
     }
 
-    /// Toggle resident memory sections in the system prompt.
+    /// Toggle all resident sections in the system prompt.
     ///
-    /// Default `true`: when memory is enabled in the manifest, the
-    /// assembler can expose the summary body, resident knowledge records,
-    /// and resident workflows. Consolidation workers and other internal
-    /// disposable workers set this to `false` so the worker pulls knowledge
-    /// through the search tools instead of riding on the resident
-    /// system-prompt budget. Idempotent if called multiple times before
-    /// the first turn; ineffective once the system prompt has been
-    /// materialised.
+    /// Default `true`: normal Pods may expose each resident section according
+    /// to its own gate and manifest settings. Internal disposable workers set
+    /// this to `false` so summary, Knowledge, and Workflow residency are all
+    /// suppressed while explicit tools remain available.
+    pub fn set_resident_injection(&mut self, enabled: bool) {
+        self.inject_resident_summary = enabled;
+        self.inject_resident_knowledge = enabled;
+        self.inject_resident_workflows = enabled;
+    }
+
+    /// Toggle `memory/summary.md` resident injection in the system prompt.
+    pub fn set_resident_summary_injection(&mut self, enabled: bool) {
+        self.inject_resident_summary = enabled;
+    }
+
+    /// Toggle resident Knowledge injection in the system prompt.
     pub fn set_resident_knowledge_injection(&mut self, enabled: bool) {
         self.inject_resident_knowledge = enabled;
+    }
+
+    /// Toggle resident Workflow injection in the system prompt.
+    pub fn set_resident_workflow_injection(&mut self, enabled: bool) {
+        self.inject_resident_workflows = enabled;
     }
 
     /// Shared handle to the prompt catalog. Cheap to clone (`Arc`).
@@ -1160,12 +1182,15 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 n.alert(AlertLevel::Warn, AlertSource::AgentsMd, warning);
             }
         }
-        // Resident-injection collection: only when memory is enabled in
-        // the manifest AND this Pod opts in (internal workers opt out).
+        // Resident-injection collection. Each resident section has its own
+        // gate so summary, Knowledge, and Workflow residency remain
+        // conceptually independent. Internal workers can still opt out of all
+        // resident sections by flipping all three gates.
         // Owned values live for the duration of `render` below; the
         // context borrows from them.
-        let inject_memory_resident = self.inject_resident_knowledge && self.memory_layout.is_some();
-        let inject_summary = inject_memory_resident
+        let memory_layout = self.memory_layout.as_ref();
+        let inject_summary = self.inject_resident_summary
+            && memory_layout.is_some()
             && self
                 .manifest
                 .memory
@@ -1173,33 +1198,32 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 .and_then(|m| m.inject_summary)
                 .unwrap_or(true);
         let resident_summary: Option<String> = if inject_summary {
-            self.memory_layout
-                .as_ref()
-                .and_then(memory::collect_resident_summary)
+            memory_layout.and_then(memory::collect_resident_summary)
         } else {
             None
         };
-        let resident: Vec<memory::ResidentKnowledgeEntry> = if inject_memory_resident {
-            self.memory_layout
-                .as_ref()
+        let inject_resident_knowledge = self.inject_resident_knowledge && memory_layout.is_some();
+        let resident: Vec<memory::ResidentKnowledgeEntry> = if inject_resident_knowledge {
+            memory_layout
                 .map(memory::collect_resident_knowledge)
                 .unwrap_or_default()
         } else {
             Vec::new()
         };
-        let resident_slice: Option<&[memory::ResidentKnowledgeEntry]> = if inject_memory_resident {
+        let resident_slice: Option<&[memory::ResidentKnowledgeEntry]> = if inject_resident_knowledge
+        {
             Some(&resident)
         } else {
             None
         };
         let resident_workflows: Vec<workflow_crate::ResidentWorkflowEntry> =
-            if inject_memory_resident {
+            if self.inject_resident_workflows {
                 self.workflow_registry.resident_entries()
             } else {
                 Vec::new()
             };
         let resident_workflow_slice: Option<&[workflow_crate::ResidentWorkflowEntry]> =
-            if inject_memory_resident {
+            if self.inject_resident_workflows {
                 Some(&resident_workflows)
             } else {
                 None
@@ -3257,12 +3281,11 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         });
 
         // Memory tools are self-contained — they bypass ScopedFs and write
-        // directly under the workspace via WorkspaceLayout. Resident
-        // knowledge injection (`Pod::set_resident_knowledge_injection`) is
-        // a Pod-level concern; this disposable Worker is built without it
-        // by construction, in keeping with `docs/plan/memory.md` §Consolidation
-        // のKnowledgeアクセス (agent pulls knowledge through the search
-        // tool instead of via system-prompt residency).
+        // directly under the workspace via WorkspaceLayout. Resident section
+        // injection is a Pod-level concern; this disposable Worker is built
+        // without it by construction, in keeping with `docs/plan/memory.md`
+        // §Consolidation のKnowledgeアクセス (agent pulls knowledge through
+        // the search tool instead of via system-prompt residency).
         let query_cfg = memory::tool::QueryConfig::from(memory_cfg);
         worker.register_tool(memory::tool::read_tool_with_usage(
             layout.clone(),
@@ -3579,7 +3602,9 @@ where
             prompts: common.prompts,
             workflow_registry: common.workflow_registry,
             memory_layout: common.memory_layout,
+            inject_resident_summary: true,
             inject_resident_knowledge: true,
+            inject_resident_workflows: true,
             pending_scope_snapshot: Arc::new(Mutex::new(None)),
             extract_in_flight: Arc::new(AtomicBool::new(false)),
             consolidation_in_flight: Arc::new(AtomicBool::new(false)),
@@ -3656,7 +3681,9 @@ where
             prompts: common.prompts,
             workflow_registry: common.workflow_registry,
             memory_layout: common.memory_layout,
+            inject_resident_summary: true,
             inject_resident_knowledge: true,
+            inject_resident_workflows: true,
             pending_scope_snapshot: Arc::new(Mutex::new(None)),
             extract_in_flight: Arc::new(AtomicBool::new(false)),
             consolidation_in_flight: Arc::new(AtomicBool::new(false)),
@@ -3832,7 +3859,9 @@ where
             prompts: common.prompts,
             workflow_registry: common.workflow_registry,
             memory_layout: common.memory_layout,
+            inject_resident_summary: true,
             inject_resident_knowledge: true,
+            inject_resident_workflows: true,
             pending_scope_snapshot: Arc::new(Mutex::new(None)),
             extract_in_flight: Arc::new(AtomicBool::new(false)),
             consolidation_in_flight: Arc::new(AtomicBool::new(false)),
@@ -4507,10 +4536,44 @@ mod build_summary_prompt_tests {
         assert_eq!(interrupt_system_count, 1);
     }
 
+    #[derive(Clone, Copy)]
+    struct ResidentInjectionGates {
+        summary: bool,
+        knowledge: bool,
+        workflows: bool,
+    }
+
+    impl ResidentInjectionGates {
+        fn all(enabled: bool) -> Self {
+            Self {
+                summary: enabled,
+                knowledge: enabled,
+                workflows: enabled,
+            }
+        }
+    }
+
     async fn render_system_prompt_with_summary(
         summary_doc: Option<&str>,
         memory_config: Option<manifest::MemoryConfig>,
         resident_injection: bool,
+    ) -> String {
+        render_system_prompt_with_resident_sections(
+            summary_doc,
+            memory_config,
+            ResidentInjectionGates::all(resident_injection),
+            false,
+            false,
+        )
+        .await
+    }
+
+    async fn render_system_prompt_with_resident_sections(
+        summary_doc: Option<&str>,
+        memory_config: Option<manifest::MemoryConfig>,
+        gates: ResidentInjectionGates,
+        include_knowledge: bool,
+        include_workflow: bool,
     ) -> String {
         let dir = tempfile::tempdir().unwrap();
         let store = session_store::FsStore::new(dir.path().join("sessions")).unwrap();
@@ -4519,6 +4582,22 @@ mod build_summary_prompt_tests {
         if let Some(doc) = summary_doc {
             std::fs::create_dir_all(pwd.join(".insomnia/memory")).unwrap();
             std::fs::write(pwd.join(".insomnia/memory/summary.md"), doc).unwrap();
+        }
+        if include_knowledge {
+            std::fs::create_dir_all(pwd.join(".insomnia/knowledge")).unwrap();
+            std::fs::write(
+                pwd.join(".insomnia/knowledge/resident-policy.md"),
+                knowledge_doc("knowledge resident desc"),
+            )
+            .unwrap();
+        }
+        if include_workflow {
+            std::fs::create_dir_all(pwd.join(".insomnia/workflow")).unwrap();
+            std::fs::write(
+                pwd.join(".insomnia/workflow/resident-flow.md"),
+                workflow_doc("workflow resident desc"),
+            )
+            .unwrap();
         }
 
         let mut manifest = minimal_manifest_with_skills(vec![]);
@@ -4532,7 +4611,16 @@ mod build_summary_prompt_tests {
             .memory
             .as_ref()
             .map(|mem| memory::WorkspaceLayout::resolve(mem, &pwd));
-        pod.set_resident_knowledge_injection(resident_injection);
+        if let Some(layout) = pod.memory_layout.as_ref() {
+            pod.workflow_registry = workflow_crate::load_workflows(layout).unwrap();
+        }
+        if gates.summary == gates.knowledge && gates.summary == gates.workflows {
+            pod.set_resident_injection(gates.summary);
+        } else {
+            pod.set_resident_summary_injection(gates.summary);
+            pod.set_resident_knowledge_injection(gates.knowledge);
+            pod.set_resident_workflow_injection(gates.workflows);
+        }
         let template = SystemPromptTemplate::parse(
             "$insomnia/default",
             crate::prompt::loader::PromptLoader::builtins_only(),
@@ -4545,6 +4633,16 @@ mod build_summary_prompt_tests {
 
     fn summary_doc(body: &str) -> String {
         format!("---\nupdated_at: 2026-01-01T00:00:00Z\n---\n{body}")
+    }
+
+    fn knowledge_doc(description: &str) -> String {
+        format!(
+            "---\ncreated_at: 2026-01-01T00:00:00Z\nupdated_at: 2026-01-01T00:00:00Z\nkind: policy\ndescription: \"{description}\"\nmodel_invokation: true\nuser_invocable: true\nlast_sources: []\n---\nbody\n",
+        )
+    }
+
+    fn workflow_doc(description: &str) -> String {
+        format!("---\ndescription: {description}\nmodel_invokation: true\n---\nbody\n")
     }
 
     #[tokio::test]
@@ -4607,16 +4705,68 @@ mod build_summary_prompt_tests {
     }
 
     #[tokio::test]
-    async fn resident_summary_respects_internal_worker_opt_out() {
-        let rendered = render_system_prompt_with_summary(
-            Some(&summary_doc("internal opt-out summary body\n")),
+    async fn resident_summary_gate_false_omits_only_summary() {
+        let prompt = render_system_prompt_with_resident_sections(
+            Some(&summary_doc("resident summary marker")),
             Some(manifest::MemoryConfig::default()),
-            false,
+            ResidentInjectionGates {
+                summary: false,
+                knowledge: true,
+                workflows: true,
+            },
+            true,
+            true,
         )
         .await;
 
-        assert!(!rendered.contains("Resident memory summary"));
-        assert!(!rendered.contains("internal opt-out summary body"));
+        assert!(!prompt.contains("Resident memory summary"));
+        assert!(!prompt.contains("resident summary marker"));
+        assert!(prompt.contains("Resident knowledge"));
+        assert!(prompt.contains("knowledge resident desc"));
+        assert!(prompt.contains("Resident workflows"));
+        assert!(prompt.contains("workflow resident desc"));
+    }
+
+    #[tokio::test]
+    async fn knowledge_and_workflow_gates_false_keep_resident_summary() {
+        let prompt = render_system_prompt_with_resident_sections(
+            Some(&summary_doc("resident summary marker")),
+            Some(manifest::MemoryConfig::default()),
+            ResidentInjectionGates {
+                summary: true,
+                knowledge: false,
+                workflows: false,
+            },
+            true,
+            true,
+        )
+        .await;
+
+        assert!(prompt.contains("Resident memory summary"));
+        assert!(prompt.contains("resident summary marker"));
+        assert!(!prompt.contains("Resident knowledge"));
+        assert!(!prompt.contains("knowledge resident desc"));
+        assert!(!prompt.contains("Resident workflows"));
+        assert!(!prompt.contains("workflow resident desc"));
+    }
+
+    #[tokio::test]
+    async fn resident_injection_opt_out_omits_all_resident_sections() {
+        let prompt = render_system_prompt_with_resident_sections(
+            Some(&summary_doc("resident summary marker")),
+            Some(manifest::MemoryConfig::default()),
+            ResidentInjectionGates::all(false),
+            true,
+            true,
+        )
+        .await;
+
+        assert!(!prompt.contains("Resident memory summary"));
+        assert!(!prompt.contains("resident summary marker"));
+        assert!(!prompt.contains("Resident knowledge"));
+        assert!(!prompt.contains("knowledge resident desc"));
+        assert!(!prompt.contains("Resident workflows"));
+        assert!(!prompt.contains("workflow resident desc"));
     }
 
     fn minimal_manifest_with_skills(dirs: Vec<PathBuf>) -> PodManifest {

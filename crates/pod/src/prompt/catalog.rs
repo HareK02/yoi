@@ -84,12 +84,13 @@ pub enum PodPrompt {
     /// and `memory/summary.md` has a valid non-empty body.
     ResidentMemorySummarySection,
     /// Trailing `## Resident knowledge` section, appended after the
-    /// resident memory summary when memory is enabled and at least one
-    /// `knowledge/*` record advertises `model_invokation: true`.
+    /// resident memory summary when memory is enabled, Knowledge resident
+    /// injection is enabled, and at least one `knowledge/*` record advertises
+    /// `model_invokation: true`.
     ResidentKnowledgeSection,
     /// Trailing `## Resident workflows` section, appended after resident
-    /// knowledge when memory is enabled and at least one workflow advertises
-    /// `model_invokation: true`.
+    /// knowledge when Workflow resident injection is enabled and at least one
+    /// workflow advertises `model_invokation: true`.
     ResidentWorkflowsSection,
 }
 

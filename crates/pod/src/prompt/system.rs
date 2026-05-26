@@ -395,6 +395,25 @@ mod tests {
         }
     }
 
+    fn ctx_with_resident_workflows<'a>(
+        cwd: &'a Path,
+        scope: &'a Scope,
+        resident: &'a [ResidentWorkflowEntry],
+    ) -> SystemPromptContext<'a> {
+        SystemPromptContext {
+            now: fixed_now(),
+            cwd,
+            language: manifest::defaults::WORKER_LANGUAGE,
+            scope,
+            tool_names: Vec::new(),
+            agents_md: None,
+            resident_summary: None,
+            resident_knowledge: None,
+            resident_workflows: Some(resident),
+            prompts: test_prompts(),
+        }
+    }
+
     /// Lazily-initialised builtin catalog shared across system-prompt
     /// tests, so every `ctx()` can hand out a `&'static PromptCatalog`
     /// reference without forcing test bodies to create one per call.
@@ -687,5 +706,40 @@ mod tests {
         let pos_boundaries = rendered.find("## Working boundaries").unwrap();
         let pos_resident = rendered.find("## Resident knowledge").unwrap();
         assert!(pos_resident > pos_boundaries);
+    }
+
+    #[test]
+    fn trailing_section_renders_resident_workflows() {
+        let (_tmp, loader) = user_loader_with("body.md", "BODY");
+        let tmpl = SystemPromptTemplate::parse("$user/body", loader).unwrap();
+        let dir = TempDir::new().unwrap();
+        let scope = build_scope(dir.path());
+        let workflows = [ResidentWorkflowEntry {
+            slug: "resident-flow".to_string(),
+            description: "workflow resident desc\nwith newline".to_string(),
+        }];
+        let rendered = tmpl
+            .render(&ctx_with_resident_workflows(dir.path(), &scope, &workflows))
+            .unwrap();
+
+        assert!(rendered.contains("## Resident workflows"));
+        assert!(rendered.contains("- resident-flow: workflow resident desc with newline"));
+        let pos_boundaries = rendered.find("## Working boundaries").unwrap();
+        let pos_resident = rendered.find("## Resident workflows").unwrap();
+        assert!(pos_resident > pos_boundaries);
+    }
+
+    #[test]
+    fn trailing_section_omits_empty_resident_workflows() {
+        let (_tmp, loader) = user_loader_with("body.md", "BODY");
+        let tmpl = SystemPromptTemplate::parse("$user/body", loader).unwrap();
+        let dir = TempDir::new().unwrap();
+        let scope = build_scope(dir.path());
+        let workflows: [ResidentWorkflowEntry; 0] = [];
+        let rendered = tmpl
+            .render(&ctx_with_resident_workflows(dir.path(), &scope, &workflows))
+            .unwrap();
+
+        assert!(!rendered.contains("Resident workflows"));
     }
 }
