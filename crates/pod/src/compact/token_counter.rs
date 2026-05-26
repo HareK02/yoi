@@ -10,6 +10,10 @@
 //!
 //! - ローカルトークナイザは持たない。実測値があればそれを採用し、
 //!   measurement 間はバイト数で按分、最新 measurement より先は最終 rate で外挿する
+//! - Compact の retained split では、request-time pruning / projection 後の
+//!   `UsageRecord` を persisted history prefix の単調系列として扱わない。
+//!   現在の prompt occupancy 推定を raw serialized bytes に配分し、末尾の
+//!   persisted tail サイズで cut を決める。
 //! - 推定の出どころは [`EstimateSource`] で呼び出し側に明示する。
 //!   課金判断には使えないが、compact / prune の閾値判定には十分な精度
 
@@ -40,26 +44,61 @@ fn split_for_retained_impl(history: &[Item], records: &[UsageRecord], retained: 
             source: current.source,
         };
     }
-    let target = current.tokens - retained;
 
-    // `tokens_at` が target 以上になる最小の idx を線形探索。
-    // prefix を使い回すので 1 回の split 呼び出しあたり O(n) で済む
-    // （内部で毎回再計算すると O(n²) になる）。将来ボトルネックになれば
-    // record 境界で二分探索に置き換える。
-    let mut chosen_source = current.source;
-    let mut cut_index = history.len();
-    for idx in 1..=history.len() {
-        let est = tokens_at(history, records, idx, &prefix);
-        if est.tokens >= target {
-            chosen_source = est.source;
-            cut_index = idx;
+    let cut_index = split_index_by_retained_bytes(&prefix, current.tokens, retained);
+    SplitPoint {
+        index: balance_to_pair_boundary(history, cut_index),
+        source: current.source,
+    }
+}
+
+fn split_index_by_retained_bytes(prefix: &[u64], total_tokens: u64, retained_tokens: u64) -> usize {
+    debug_assert!(!prefix.is_empty());
+
+    let len = prefix.len() - 1;
+    if len == 0 {
+        return 0;
+    }
+    if retained_tokens == 0 {
+        return len;
+    }
+
+    let total_bytes = *prefix.last().unwrap_or(&0);
+    if total_bytes == 0 || total_tokens == 0 {
+        return 0;
+    }
+
+    let raw_fallback_tokens = ceil_div_u128(total_bytes as u128, 4) as u64;
+    let rate_tokens = total_tokens.max(raw_fallback_tokens);
+    let target_retained_bytes = ceil_div_u128(
+        retained_tokens as u128 * total_bytes as u128,
+        rate_tokens as u128,
+    )
+    .min(total_bytes as u128) as u64;
+
+    // Drop as many complete Items as possible while keeping the raw persisted
+    // suffix at or above the retained budget. This is monotonic in serialized
+    // history size and intentionally does not inspect per-history_len
+    // UsageRecords: request-time usage can move up and down after pruning /
+    // projection, so it is not a valid prefix series for retained split. The
+    // byte/4 fallback is kept as a lower bound for raw persisted size so a
+    // heavily-pruned request measurement cannot justify retaining megabytes of
+    // history.
+    let mut cut = 0;
+    for (idx, bytes_before) in prefix.iter().enumerate().take(len + 1) {
+        let suffix_bytes = total_bytes.saturating_sub(*bytes_before);
+        if suffix_bytes >= target_retained_bytes {
+            cut = idx;
+        } else {
             break;
         }
     }
-    SplitPoint {
-        index: balance_to_pair_boundary(history, cut_index),
-        source: chosen_source,
-    }
+    cut
+}
+
+fn ceil_div_u128(n: u128, d: u128) -> u128 {
+    debug_assert!(d > 0);
+    if n == 0 { 0 } else { ((n - 1) / d) + 1 }
 }
 
 /// `history[cut..]` が `ToolCall` / `ToolResult` のペア境界を尊重するよう
@@ -259,23 +298,44 @@ mod tests {
     }
 
     #[test]
-    fn split_at_exact_measurement_boundary() {
-        // 4 items。measurements: len=2 → 100, len=4 → 300。
-        // retained=200 → target_drop = 100 → record[0] にぴったり一致 → index=2。
+    fn split_uses_current_occupancy_as_raw_byte_rate() {
+        // Compact retained split does not treat the intermediate record at
+        // len=2 as a raw prefix boundary. It uses the current occupancy
+        // estimate (len=4 → 300) as a serialized-byte rate and keeps the
+        // smallest item-granular suffix whose raw size covers retained=200.
         let history = vec![msg("a"), msg("b"), msg("c"), msg("d")];
         let records = vec![record(2, 100), record(4, 300)];
         let cut = split_for_retained_impl(&history, &records, 200);
-        assert_eq!(cut.index, 2);
+        assert_eq!(cut.index, 1);
         assert_eq!(cut.source, EstimateSource::Measured);
     }
 
     #[test]
-    fn split_interpolated_between_measurements() {
+    fn split_does_not_use_non_current_measurements_as_cut_boundaries() {
         let history = vec![msg("aaaaaa"), msg("bbbbbb"), msg("cccccc"), msg("dddddd")];
         let records = vec![record(1, 50), record(4, 400)];
         let cut = split_for_retained_impl(&history, &records, 250);
-        assert!(cut.index > 1 && cut.index <= 4);
-        assert_eq!(cut.source, EstimateSource::Interpolated);
+        assert_eq!(cut.index, 1);
+        assert_eq!(cut.source, EstimateSource::Measured);
+    }
+
+    #[test]
+    fn split_ignores_non_monotonic_usage_spike_for_retained_tail() {
+        let history: Vec<Item> = (0..20)
+            .map(|idx| msg(&format!("message-{idx}-{}", "x".repeat(100))))
+            .collect();
+        let records = vec![
+            record(2, 900), // request-time spike after pruning/projection
+            record(20, 1000),
+        ];
+        let cut = split_for_retained_impl(&history, &records, 100);
+
+        // The old prefix-crossing logic picked index 2 because 900 >=
+        // 1000-100, retaining almost the whole persisted history. The compact
+        // split must instead use raw suffix size and keep only the tail needed
+        // for the retained budget.
+        assert!(cut.index > 10, "cut.index = {}", cut.index);
+        assert_eq!(cut.source, EstimateSource::Measured);
     }
 
     #[test]
