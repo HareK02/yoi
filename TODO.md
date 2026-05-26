@@ -8,6 +8,7 @@
 - Pod: 任意ターンからの Fork（複数ターン巻き戻しを汎用化） → [tickets/pod-session-fork.md](tickets/pod-session-fork.md)
 - Pod/TUI: 手動 rollback 導線 → [tickets/manual-turn-rollback.md](tickets/manual-turn-rollback.md)
 - Pod: Inbound PodEvent ハンドリングの重複を統合 → [tickets/pod-inbound-pod-event-dedup.md](tickets/pod-inbound-pod-event-dedup.md)
+- Pod: scope 永続化 authority の整理 → [tickets/pod-scope-persistence-authority.md](tickets/pod-scope-persistence-authority.md)
 - SpawnPod 初回 task delivery の受理確認 → [tickets/spawnpod-initial-run-confirmation.md](tickets/spawnpod-initial-run-confirmation.md)
 - E2E テストハーネス（`tests/e2e/`、opt-in） → [tickets/e2e-harness.md](tickets/e2e-harness.md)
 - メモリ機構
