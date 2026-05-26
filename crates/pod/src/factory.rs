@@ -647,6 +647,7 @@ permission = "write"
             scope: &scope,
             tool_names: Vec::new(),
             agents_md: None,
+            resident_summary: None,
             resident_knowledge: None,
             resident_workflows: None,
             prompts: &catalog,

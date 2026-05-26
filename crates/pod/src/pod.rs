@@ -314,11 +314,12 @@ pub struct Pod<C: LlmClient, St: Store> {
     /// Memory workspace layout used by the workflow resolver to load required
     /// Knowledge records by exact slug.
     memory_layout: Option<memory::WorkspaceLayout>,
-    /// When true (default), the system-prompt assembler walks
-    /// `<workspace>/knowledge/*` and appends a `## Resident knowledge`
-    /// section listing records with `model_invokation: true`.
-    /// consolidation workers set this to false so the
-    /// agentic worker pulls knowledge through the search tools instead.
+    /// When true (default), the system-prompt assembler may append resident
+    /// memory sections from the workspace: `memory/summary.md`, resident
+    /// knowledge records, and resident workflows. Consolidation workers set
+    /// this to false so the agentic worker pulls knowledge through the
+    /// search tools instead, and so disposable internal workers avoid
+    /// resident memory exposure entirely.
     inject_resident_knowledge: bool,
     /// Latest runtime scope snapshot queued by dynamic scope changes.
     /// Drained into the session log before the next turn result is
@@ -593,16 +594,16 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         self.system_prompt_template = Some(template);
     }
 
-    /// Toggle the resident-knowledge section of the system prompt.
+    /// Toggle resident memory sections in the system prompt.
     ///
     /// Default `true`: when memory is enabled in the manifest, the
-    /// assembler walks `<workspace>/knowledge/*` and lists records with
-    /// `model_invokation: true`. consolidation workers and
-    /// other agentic memory paths set this to `false` so the worker
-    /// pulls knowledge through the search tools instead of riding on
-    /// the resident system-prompt budget. Idempotent if called multiple
-    /// times before the first turn; ineffective once the system prompt
-    /// has been materialised.
+    /// assembler can expose the summary body, resident knowledge records,
+    /// and resident workflows. Consolidation workers and other internal
+    /// disposable workers set this to `false` so the worker pulls knowledge
+    /// through the search tools instead of riding on the resident
+    /// system-prompt budget. Idempotent if called multiple times before
+    /// the first turn; ineffective once the system prompt has been
+    /// materialised.
     pub fn set_resident_knowledge_injection(&mut self, enabled: bool) {
         self.inject_resident_knowledge = enabled;
     }
@@ -1160,10 +1161,25 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             }
         }
         // Resident-injection collection: only when memory is enabled in
-        // the manifest AND this Pod opts in (consolidation workers opt out).
-        // Owned `Vec` lives for the duration of `render` below; the
-        // context borrows a slice into it.
-        let resident: Vec<memory::ResidentKnowledgeEntry> = if self.inject_resident_knowledge {
+        // the manifest AND this Pod opts in (internal workers opt out).
+        // Owned values live for the duration of `render` below; the
+        // context borrows from them.
+        let inject_memory_resident = self.inject_resident_knowledge && self.memory_layout.is_some();
+        let inject_summary = inject_memory_resident
+            && self
+                .manifest
+                .memory
+                .as_ref()
+                .and_then(|m| m.inject_summary)
+                .unwrap_or(true);
+        let resident_summary: Option<String> = if inject_summary {
+            self.memory_layout
+                .as_ref()
+                .and_then(memory::collect_resident_summary)
+        } else {
+            None
+        };
+        let resident: Vec<memory::ResidentKnowledgeEntry> = if inject_memory_resident {
             self.memory_layout
                 .as_ref()
                 .map(memory::collect_resident_knowledge)
@@ -1171,20 +1187,19 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         } else {
             Vec::new()
         };
-        let resident_slice: Option<&[memory::ResidentKnowledgeEntry]> =
-            if self.inject_resident_knowledge && self.memory_layout.is_some() {
-                Some(&resident)
-            } else {
-                None
-            };
+        let resident_slice: Option<&[memory::ResidentKnowledgeEntry]> = if inject_memory_resident {
+            Some(&resident)
+        } else {
+            None
+        };
         let resident_workflows: Vec<workflow_crate::ResidentWorkflowEntry> =
-            if self.inject_resident_knowledge && self.memory_layout.is_some() {
+            if inject_memory_resident {
                 self.workflow_registry.resident_entries()
             } else {
                 Vec::new()
             };
         let resident_workflow_slice: Option<&[workflow_crate::ResidentWorkflowEntry]> =
-            if self.inject_resident_knowledge && self.memory_layout.is_some() {
+            if inject_memory_resident {
                 Some(&resident_workflows)
             } else {
                 None
@@ -1200,6 +1215,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             scope: &scope_snapshot,
             tool_names,
             agents_md: agents_md_read.body,
+            resident_summary: resident_summary.as_deref(),
             resident_knowledge: resident_slice,
             resident_workflows: resident_workflow_slice,
             prompts: &self.prompts,
@@ -4489,6 +4505,118 @@ mod build_summary_prompt_tests {
 
         assert_eq!(tool_result_count, 1);
         assert_eq!(interrupt_system_count, 1);
+    }
+
+    async fn render_system_prompt_with_summary(
+        summary_doc: Option<&str>,
+        memory_config: Option<manifest::MemoryConfig>,
+        resident_injection: bool,
+    ) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let store = session_store::FsStore::new(dir.path().join("sessions")).unwrap();
+        let pwd = dir.path().join("workspace");
+        std::fs::create_dir_all(&pwd).unwrap();
+        if let Some(doc) = summary_doc {
+            std::fs::create_dir_all(pwd.join(".insomnia/memory")).unwrap();
+            std::fs::write(pwd.join(".insomnia/memory/summary.md"), doc).unwrap();
+        }
+
+        let mut manifest = minimal_manifest_with_skills(vec![]);
+        manifest.memory = memory_config;
+        let scope = Scope::writable(&pwd).unwrap();
+        let mut pod = Pod::new(manifest, Worker::new(NoopClient), store, pwd.clone(), scope)
+            .await
+            .unwrap();
+        pod.memory_layout = pod
+            .manifest
+            .memory
+            .as_ref()
+            .map(|mem| memory::WorkspaceLayout::resolve(mem, &pwd));
+        pod.set_resident_knowledge_injection(resident_injection);
+        let template = SystemPromptTemplate::parse(
+            "$insomnia/default",
+            crate::prompt::loader::PromptLoader::builtins_only(),
+        )
+        .unwrap();
+        pod.set_system_prompt_template(template);
+        pod.ensure_system_prompt_materialized().unwrap();
+        pod.worker().get_system_prompt().unwrap().to_string()
+    }
+
+    fn summary_doc(body: &str) -> String {
+        format!("---\nupdated_at: 2026-01-01T00:00:00Z\n---\n{body}")
+    }
+
+    #[tokio::test]
+    async fn resident_summary_body_is_injected_without_frontmatter() {
+        let rendered = render_system_prompt_with_summary(
+            Some(&summary_doc("summary body for resident prompt\n")),
+            Some(manifest::MemoryConfig::default()),
+            true,
+        )
+        .await;
+
+        assert!(rendered.contains("## Resident memory summary"));
+        assert!(rendered.contains("summary body for resident prompt"));
+        assert!(!rendered.contains("updated_at: 2026-01-01T00:00:00Z"));
+        assert!(!rendered.contains("---\nupdated_at"));
+    }
+
+    #[tokio::test]
+    async fn resident_summary_injection_can_be_disabled_by_manifest() {
+        let memory = manifest::MemoryConfig {
+            inject_summary: Some(false),
+            ..manifest::MemoryConfig::default()
+        };
+        let rendered = render_system_prompt_with_summary(
+            Some(&summary_doc("disabled summary body\n")),
+            Some(memory),
+            true,
+        )
+        .await;
+
+        assert!(!rendered.contains("Resident memory summary"));
+        assert!(!rendered.contains("disabled summary body"));
+    }
+
+    #[tokio::test]
+    async fn resident_summary_is_absent_without_memory_config() {
+        let rendered = render_system_prompt_with_summary(
+            Some(&summary_doc("memory-disabled summary body\n")),
+            None,
+            true,
+        )
+        .await;
+
+        assert!(!rendered.contains("Resident memory summary"));
+        assert!(!rendered.contains("memory-disabled summary body"));
+    }
+
+    #[tokio::test]
+    async fn malformed_resident_summary_does_not_fail_render() {
+        let rendered = render_system_prompt_with_summary(
+            Some("---\nthis is not yaml: : :\n---\nbad summary body\n"),
+            Some(manifest::MemoryConfig::default()),
+            true,
+        )
+        .await;
+
+        assert!(rendered.contains("## Working boundaries"));
+        assert!(!rendered.contains("Resident memory summary"));
+        assert!(!rendered.contains("bad summary body"));
+    }
+
+    #[tokio::test]
+    async fn resident_summary_respects_internal_worker_opt_out() {
+        let rendered = render_system_prompt_with_summary(
+            Some(&summary_doc("internal opt-out summary body\n")),
+            Some(manifest::MemoryConfig::default()),
+            false,
+        )
+        .await;
+
+        assert!(!rendered.contains("Resident memory summary"));
+        assert!(!rendered.contains("internal opt-out summary body"));
     }
 
     fn minimal_manifest_with_skills(dirs: Vec<PathBuf>) -> PodManifest {
