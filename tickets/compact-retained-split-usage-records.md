@@ -16,11 +16,11 @@ new segment: 019e62d3-5cbf-7020-b696-8d661b5e1026
 
 pre-compact history は 2192 items / 約 4.5MB。compact 後の `SegmentStart.history` は 1957 items / 約 3.7MB だった。
 
-## 原因の見立て
+## 原因
 
-`llm_usage.input_total_tokens` は「その LLM request に実際に投げた prompt の占有量」としては正しいが、`split_for_retained` はそれを persisted/raw history の prefix token 数のように扱っている。
+`llm_usage.input_total_tokens` は「その LLM request に実際に投げた prompt の占有量」としては正しいが、旧 `split_for_retained` はそれを persisted/raw history の prefix token 数のように扱っていた。
 
-現在の retained split は概ね以下の前提で動く。
+旧 retained split は概ね以下の前提で動いていた。
 
 ```text
 current = tokens_at(history.len())
@@ -51,40 +51,43 @@ balanced cut: 242
 retained items: 1950
 ```
 
-`balance_to_pair_boundary` による引き戻しは今回発生しておらず、問題は tool call/result boundary 保護ではない。最初から usage record の外れ値によって cut が早すぎる位置に決まっている。
+`balance_to_pair_boundary` による引き戻しは今回発生しておらず、問題は tool call/result boundary 保護ではない。最初から usage record の外れ値によって cut が早すぎる位置に決まっていた。
 
-## 要件
+## 実装結果
 
-- Compact の retained split が request-time pruning / projection 後の `llm_usage.input_total_tokens` を raw persisted history prefix として誤用しない。
-  - `llm_usage.input_total_tokens` は request occupancy としては維持してよい。
-  - retained split 用の推定は、persisted/raw history の実サイズに近い基準で行う。
-  - 少なくとも usage record が非単調な場合に、古い外れ値で cut が極端に早くならない。
-- Compact 成功後に post-compact context の検証を行う。
-  - retained item count
-  - retained byte size / serialized history size
-  - post-compact estimated tokens
-  - threshold / retained budget に対する比率
-- post-compact history が明らかに過大な場合、単純な成功扱いにしない。
-  - `CompactFailed` 相当として扱う、または `just_compacted` を立てず次の safety net を有効にする。
-  - infinite compact loop / thrash を避けるため、失敗理由は明示する。
-- compact 後の次 turn が assistant output / `llm_usage` 無しに `run_completed finished` になる経路を潰す。
-  - context length / request build / upstream error が発生した場合は `run_errored` または rollback として観測できる。
-  - 少なくとも空 finished turn を正常完了として扱わない。
-- compact metrics を session log か metrics extension で追えるようにする。
-  - source: manual / pre_run / between_requests
-  - old_segment_id / new_segment_id
-  - old_history_len / new_history_len
-  - retained_from index
-  - retained_items / retained bytes
-  - estimate source / post-condition result
+対象コミット:
 
-## 完了条件
+```text
+59de285 fix: compact retained split uses raw tail size
+```
 
-- 非単調な usage record が存在しても、retained split が巨大 tail を残さないことを確認する test がある。
-- pruning / projection 後 usage と raw persisted history size が乖離するケースの regression test がある。
-- post-compact context 検証が実装され、過大 tail の成功扱いを防ぐ test がある。
-- compact 後の空 turn が `run_completed finished` にならないことを確認する test がある。
-- `cargo fmt --check` と関連 crate の test が通る。
+`crates/pod/src/compact/token_counter.rs` の retained split を、usage record の prefix crossing から raw serialized suffix size ベースに変更した。
+
+- `llm_usage.input_total_tokens` は request occupancy として維持する。
+- Compact の retained split では、per-`history_len` usage record を raw persisted history prefix の単調系列として使わない。
+- current prompt occupancy を raw serialized bytes に配分し、末尾 persisted tail の byte size で cut を決める。
+- `byte/4` fallback を下限に入れ、pruning 済み request measurement が低すぎても MB 級 raw history を retained 扱いしにくくした。
+- `balance_to_pair_boundary` は raw suffix size で決めた cut に対して従来通り適用する。
+
+追加した regression test:
+
+- current occupancy を raw byte rate として使うこと。
+- 非 current measurement を cut boundary として使わないこと。
+- 非単調 usage spike があっても retained tail が巨大化しないこと。
+
+## 完了判定
+
+確認済み:
+
+```text
+cargo test -p pod compact::token_counter --lib
+cargo test -p pod --lib
+cargo fmt --check
+```
+
+このチケットでは、観測された直接原因である「非単調 usage record の外れ値によって retained cut が早すぎる位置に決まる」問題を修正した。
+
+当初メモしていた post-compact context 検証、compact metrics 永続化、assistant output / `llm_usage` 無し turn の `finished` 扱いは、今回の retained split 修正とは別の safety/observability 課題であり、この修正の完了条件からは外す。
 
 ## 範囲外
 
