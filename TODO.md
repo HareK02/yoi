@@ -12,6 +12,7 @@
 - SpawnPod 初回 task delivery の受理確認 → [tickets/spawnpod-initial-run-confirmation.md](tickets/spawnpod-initial-run-confirmation.md)
 - E2E テストハーネス（`tests/e2e/`、opt-in） → [tickets/e2e-harness.md](tickets/e2e-harness.md)
 - LLM client: API request timeout を stream lifecycle 全体に入れる → [tickets/llm-client-request-timeouts.md](tickets/llm-client-request-timeouts.md)
+- LLM client: OpenAI Responses の incomplete / unknown field 観測性 → [tickets/openai-responses-incomplete-observability.md](tickets/openai-responses-incomplete-observability.md)
 - メモリ機構
   - consolidation skip 表示と invalid staging の観測性 → [tickets/memory-consolidation-skip-observability.md](tickets/memory-consolidation-skip-observability.md)
   - memory / knowledge tool 利用タイミングのプロンプトガイダンス → [tickets/memory-tool-guidance-prompt.md](tickets/memory-tool-guidance-prompt.md)
