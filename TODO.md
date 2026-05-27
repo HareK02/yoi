@@ -1,26 +1,5 @@
-- Workflow / Skills
-  - 内部 Worker / 内部 Pod の Workflow 化 → [tickets/internal-worker-workflow.md](tickets/internal-worker-workflow.md)
-  - 半自動開発運用 Workflow → [tickets/auto-maintain-workflow.md](tickets/auto-maintain-workflow.md)
-  - tickets.sh による WorkItem / Thread MVP → [tickets/tickets-sh-workitem-thread-mvp.md](tickets/tickets-sh-workitem-thread-mvp.md)
-  - Prompt / Workflow 評価メトリクスと改善 Offer → [tickets/prompt-eval-metrics.md](tickets/prompt-eval-metrics.md)
-- Permission: allow-all 既定 policy への整理 → [tickets/permission-default-policy.md](tickets/permission-default-policy.md)
-- Pod: 任意ターンからの Fork（複数ターン巻き戻しを汎用化） → [tickets/pod-session-fork.md](tickets/pod-session-fork.md)
-- Pod/TUI: 手動 rollback 導線 → [tickets/manual-turn-rollback.md](tickets/manual-turn-rollback.md)
-- Pod: Inbound PodEvent ハンドリングの重複を統合 → [tickets/pod-inbound-pod-event-dedup.md](tickets/pod-inbound-pod-event-dedup.md)
-- Pod: scope 永続化 authority の整理 → [tickets/pod-scope-persistence-authority.md](tickets/pod-scope-persistence-authority.md)
-- SpawnPod 初回 task delivery の受理確認 → [tickets/spawnpod-initial-run-confirmation.md](tickets/spawnpod-initial-run-confirmation.md)
-- E2E テストハーネス（`tests/e2e/`、opt-in） → [tickets/e2e-harness.md](tickets/e2e-harness.md)
-- メモリ機構
-  - memory / knowledge tool 利用タイミングのプロンプトガイダンス → [tickets/memory-tool-guidance-prompt.md](tickets/memory-tool-guidance-prompt.md)
-- TUI 拡充
-  - navigation mode / block focus の設計 → [tickets/tui-navigation-mode-design.md](tickets/tui-navigation-mode-design.md)
-  - spawned child Pod の一覧と一時 attach → [tickets/tui-spawned-pod-panel.md](tickets/tui-spawned-pod-panel.md)
-  - actionbar transient notice API → [tickets/tui-actionbar-transient-notice-api.md](tickets/tui-actionbar-transient-notice-api.md)
-  - tui -r picker で live pending Pod が表示から漏れる → [tickets/tui-picker-live-pending-pods.md](tickets/tui-picker-live-pending-pods.md)
-  - ユーザーマニフェストのモデル設定 wizard → [tickets/tui-user-model-setup.md](tickets/tui-user-model-setup.md)
-- セッション内 Task ツールの注意機構（無アクティビティで `<system-reminder>` ナッジ） → [tickets/session-todo-reminder.md](tickets/session-todo-reminder.md)
-- ワークスペースのメモリーをLintするヘッドレスCLI
-- system-reminder 注入機構の汎用化（2件目の利用者が出た時に検討。タグ形式 `<system-reminder>...</system-reminder>` の規約は session-todo-reminder で先行確立。注入された Item は worker.history に append する方針）
-- Bashツールがファイル編集に常用されている問題をdesciptionで抑制
-- 事前定義したManifestをProfile的に扱い、Orchestrator/Coder/Researcherで別々のモデル/設定を使わせる運用ができるようにする
-- 複数のPodのViewを行き来できるUI
+# TODO legacy notice
+
+Active repository work items have been migrated to `work-items/`.
+
+Use `./tickets.sh list --status all` for the generated/current view and `./tickets.sh doctor` to validate the migration state.
