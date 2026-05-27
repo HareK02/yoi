@@ -13,7 +13,6 @@
 - E2E テストハーネス（`tests/e2e/`、opt-in） → [tickets/e2e-harness.md](tickets/e2e-harness.md)
 - LLM client: OpenAI Responses の incomplete / unknown field 観測性 → [tickets/openai-responses-incomplete-observability.md](tickets/openai-responses-incomplete-observability.md)
 - メモリ機構
-  - consolidation skip 表示と invalid staging の観測性 → [tickets/memory-consolidation-skip-observability.md](tickets/memory-consolidation-skip-observability.md)
   - memory / knowledge tool 利用タイミングのプロンプトガイダンス → [tickets/memory-tool-guidance-prompt.md](tickets/memory-tool-guidance-prompt.md)
 - TUI 拡充
   - navigation mode / block focus の設計 → [tickets/tui-navigation-mode-design.md](tickets/tui-navigation-mode-design.md)
