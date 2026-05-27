@@ -27,7 +27,8 @@ legacy_ticket: tickets/session-todo-reminder.md
 - 「やったつもり」になって `completed` への更新を忘れる
 - そもそも TaskStore の存在を忘れて、構造化を諦めて自由記述に回帰する
 
-OpenCode の todo は専用の注意機構を持たない（汎用 reminder 経由）。一方 Claude Code は `task_reminder` を「N リクエスト無アクティビティで初めて発火するナッジ型」として実装しており、毎リクエスト押し戻しはしない（`<local-agent-install>` の local reminder helper functions、閾値 `a local reminder threshold`）。
+OpenCode の todo は専用の注意機構を持たない（汎用 reminder 経由）。一方、一部の既存エージェント実装では todo reminder を「N リクエスト無アクティビティで初めて発火するナッジ型」として扱い、毎リクエスト押し戻しはしない。
+
 
 Insomnia でも同方針を採り、active Task が残っているのに `TaskCreate` / `TaskUpdate` が一定リクエスト呼ばれていない場合に限り、`<system-reminder>` Item を 1件 history に append する。「やったつもり」抑止と、トークン浪費・LLM の自律性侵害のバランスを取るため、毎リクエスト押し戻しはしない。
 
@@ -76,4 +77,4 @@ Insomnia でも同方針を採り、active Task が残っているのに `TaskCr
 
 - 設計指針: `AGENTS.md`（LLM コンテキストの加工原則。揮発的注入は禁止、history に append してから commit する）
 - 前提: `tickets/session-todo.md`（Tool 群と TaskStore）、`tickets/notify-history-persist.md`（`pending_history_appends` レーン）
-- 参考実装: Claude Code の `task_reminder`（local reminder helper functions、閾値 `a local reminder threshold`）
+- 参考: 一部エージェント実装の todo reminder は、一定リクエスト無アクティビティ後に発火し、再通知にも cooldown を置くナッジ型として扱われている

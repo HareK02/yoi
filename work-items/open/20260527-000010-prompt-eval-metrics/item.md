@@ -21,7 +21,7 @@ legacy_ticket: tickets/prompt-eval-metrics.md
 
 ## 背景
 
-external author の empirical-prompt-tuning は、agent-facing な指示（Skill / slash command / prompt 等）を新規 subagent に実行させ、実行者の自己申告と指示側メトリクスを突き合わせて反復改善する手法である。insomnia では Workflow / Skill ingest / Knowledge / memory consolidation / usage metrics / Pod orchestration があるため、この手法を単なる「手順」ではなく、**agent-facing instruction の品質観測 pipeline** として扱える。
+empirical prompt tuning pattern は、agent-facing な指示（Skill / slash command / prompt 等）を新規 subagent に実行させ、実行者の自己申告と指示側メトリクスを突き合わせて反復改善する手法である。insomnia では Workflow / Skill ingest / Knowledge / memory consolidation / usage metrics / Pod orchestration があるため、この手法を単なる「手順」ではなく、**agent-facing instruction の品質観測 pipeline** として扱える。
 
 特に insomnia では以下をシステム側で観測できる。
 
@@ -159,7 +159,7 @@ Claude Code 版の `tool_uses` を、insomnia では tool 種別ごとの偏り�
 
 ## 参照
 
-- `external skill reference/empirical-prompt-tuning/SKILL.md`（外部参照。取り込み時は必要最小限に一般化する）
+- empirical prompt tuning skill example（外部参照。取り込み時は必要最小限に一般化する）
 - `docs/plan/workflow.md`
 - `docs/plan/memory.md`
 - `tickets/memory-usage-metrics.md`

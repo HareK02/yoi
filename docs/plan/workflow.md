@@ -54,7 +54,7 @@ consolidation が以下を検出した場合、Client に Notification を投げ
 
 - DSL 化や step 粒度の制約 — 初期は Markdown 本文そのまま実行
 - Workflow 実行中の中断・再開・トランザクション管理
-- 品質検証フロー: external author empirical-prompt-tuning（`docs/ref/memory-systems.md` §6）相当の**新規 subagent 試走 + 構造化報告**を Workflow に適用。判定対象は本文の不明瞭点・裁量補完・要件達成率。Knowledge 単体の検証は設けず、`requires` 経由で Workflow から使われる前提で間接回収。SKILL 的用途（Workflow 経由しない `#knowledge`）は人間レビューに委ねる
+- 品質検証フロー: empirical prompt tuning pattern（`docs/ref/memory-systems.md` §6）相当の**新規 subagent 試走 + 構造化報告**を Workflow に適用。判定対象は本文の不明瞭点・裁量補完・要件達成率。Knowledge 単体の検証は設けず、`requires` 経由で Workflow から使われる前提で間接回収。SKILL 的用途（Workflow 経由しない `#knowledge`）は人間レビューに委ねる
 
 ## 関連
 

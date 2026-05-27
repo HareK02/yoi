@@ -380,9 +380,9 @@ Skill content のライフサイクルは重要で、**一度発動すると ren
 
 ---
 
-## 6. プロンプト・スキルの継続的チューニング (external author empirical-prompt-tuning)
+## 6. プロンプト・スキルの継続的チューニング (empirical prompt tuning pattern)
 
-メモリや skill の**中身を腐らせない**側の話。external author が 2025-07 頃に公開し、その後 Claude Code の SKILL として整備したメソッドで、「暗黙知の排除」を自動化する。insomnia のように skill を蓄積する設計では、**書いた直後に客観的に試す**仕組みが無いと品質が崩れていく。ここへの素直な当てはめ材料として記録。
+メモリや skill の**中身を腐らせない**側の話。公開されている prompt tuning pattern として、agent-facing な指示を新規 subagent に実行させ、実行者の自己申告と指示側メトリクスを突き合わせて反復改善する方法がある。insomnia のように skill を蓄積する設計では、**書いた直後に客観的に試す**仕組みが無いと品質が崩れていく。ここへの素直な当てはめ材料として記録。
 
 ### 基本思想
 
@@ -430,11 +430,9 @@ Claude Code の Task tool 戻り値から:
 - **skill や lessons を新規追加した直後に、同じ insomnia ハーネス内の別 pod で実行して評価**する自動フロー（"skill doctor" 的な存在）を作れる。これは insomnia が pod factory を持っている点と相性がいい。
 - 失敗ログを書いた後、「同じ失敗が再現しないか」を新規 pod で試走する検証ステップが、構造的に**メモリ整備の一部**に組み込める。skill 化しない失敗ログでも有効。
 - 評価指標を自前で定義しておくと、後で他人（or 未来の自分）が skill を更新した時に腐敗検知できる。
-- 実体は skill 自身として配布されている（`public skill example/dot_claude/skills/empirical-prompt-tuning/SKILL.md`）。insomnia のメンテ用 skill セットのテンプレにそのまま借りられる。
+- 実体は skill 自身として配布されている例がある。insomnia のメンテ用 skill セットのテンプレにも応用できる。
 
-一次ソース:
-- https://zenn.dev/external author/articles/empirical-prompt-tuning
-- https://github.com/public skill example/blob/main/dot_claude/skills/empirical-prompt-tuning/SKILL.md
+一次ソースは公開 sanitize branch では省略する。
 
 ---
 

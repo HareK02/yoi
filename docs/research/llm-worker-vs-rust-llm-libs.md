@@ -3,7 +3,7 @@
 調査日: 2026-04-26
 対象: `crates/llm-worker` (本プロジェクト) / `rig` / `genai` / `swiftide`
 
-調査方法: 各リポジトリを external checkout で取得し、ソース（README, Cargo.toml, src/, examples/）を直接読解。
+調査方法: 各リポジトリを ローカルに取得し、ソース（README, Cargo.toml, src/, examples/）を直接読解。
 
 ---
 
