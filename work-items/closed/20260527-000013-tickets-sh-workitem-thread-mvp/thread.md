@@ -1,13 +1,25 @@
+<!-- event: migration author: tickets.sh-migration at: 2026-05-27T00:00:13Z -->
+
+## Migrated
+
+Migrated from tickets/tickets-sh-workitem-thread-mvp.md. No legacy review file was present at migration time.
+
+---
+
+<!-- event: close author: hare at: 2026-05-27T19:28:41Z status: closed -->
+
+## Closed
+
 ---
 id: 20260527-000013-tickets-sh-workitem-thread-mvp
 slug: tickets-sh-workitem-thread-mvp
 title: Ticket 管理: tickets.sh による WorkItem / Thread MVP
-status: open
+status: closed
 kind: task
 priority: P2
 labels: [migrated]
 created_at: 2026-05-27T00:00:13Z
-updated_at: 2026-05-27T00:00:13Z
+updated_at: 2026-05-27T19:28:41Z
 assignee: null
 legacy_ticket: tickets/tickets-sh-workitem-thread-mvp.md
 ---
@@ -209,3 +221,6 @@ legacy_ticket: tickets/foo.md
 - Git commit の自動化。
 - TUI 統合。
 - WorkItem から TODO.md を自動生成する仕組み。
+
+
+---
