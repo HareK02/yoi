@@ -530,6 +530,8 @@ impl Timeline {
             Event::Ping(p) => self.dispatch_ping(p),
             Event::Status(s) => self.dispatch_status(s),
             Event::Error(e) => self.dispatch_error(e),
+            // Observability-only event: stream trace records it before timeline dispatch.
+            Event::UnhandledSse(_) => {}
 
             // Block系: スコープ管理しながらディスパッチ
             Event::BlockStart(s) => self.handle_block_start(s),
@@ -676,6 +678,36 @@ mod tests {
     fn test_timeline_creation() {
         let timeline = Timeline::new();
         assert!(timeline.current_block().is_none());
+    }
+
+    #[test]
+    fn unhandled_sse_is_ignored_by_timeline_handlers() {
+        struct TestTextHandler {
+            calls: Arc<Mutex<Vec<TextBlockEvent>>>,
+        }
+
+        impl Handler<TextBlockKind> for TestTextHandler {
+            type Scope = ();
+            fn on_event(&mut self, _scope: &mut (), event: &TextBlockEvent) {
+                self.calls.lock().unwrap().push(event.clone());
+            }
+        }
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut timeline = Timeline::new();
+        timeline.on_text_block(TestTextHandler {
+            calls: calls.clone(),
+        });
+
+        timeline.dispatch(&Event::UnhandledSse(UnhandledSseEvent {
+            provider: "openai_responses".to_string(),
+            event_type: "response.mystery".to_string(),
+            data_preview: "{}".to_string(),
+            data_len: 2,
+        }));
+
+        assert!(timeline.current_block().is_none());
+        assert!(calls.lock().unwrap().is_empty());
     }
 
     #[test]
