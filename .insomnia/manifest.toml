@@ -1,8 +1,10 @@
 [scope]
 allow = [
     { target = ".", permission = "write", recursive = true },
-    { target = "<external-checkouts>", permission = "read", recursive = true },
 ]
+
+[session]
+record_event_trace = true
 
 [memory]
 extract_threshold = 50000
