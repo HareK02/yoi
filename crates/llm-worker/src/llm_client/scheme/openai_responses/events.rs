@@ -5,9 +5,10 @@
 //! insomnia 側 1 次元 `BlockStart/Delta/Stop::index` のマッピングは
 //! [`OpenAIResponsesState`] が保持する。
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::Deserialize;
+use serde_json::{Map, Value};
 
 use crate::llm_client::{
     ClientError,
@@ -255,12 +256,16 @@ struct InputTokensDetails {
 #[derive(Debug, Deserialize)]
 struct ResponseFailed {
     response: FailedResponse,
+    #[serde(flatten)]
+    extra: BTreeMap<String, Value>,
 }
 
 #[derive(Debug, Deserialize)]
 struct FailedResponse {
     #[serde(default)]
     error: Option<ErrorDetail>,
+    #[serde(flatten)]
+    extra: BTreeMap<String, Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -269,6 +274,17 @@ struct ErrorDetail {
     error_type: Option<String>,
     #[serde(default)]
     message: Option<String>,
+    #[serde(default)]
+    code: Option<String>,
+    #[serde(flatten)]
+    extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TopLevelErrorEnvelope {
+    error: TopLevelError,
+    #[serde(flatten)]
+    extra: BTreeMap<String, Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -279,6 +295,8 @@ struct TopLevelError {
     error_type: Option<String>,
     #[serde(default)]
     code: Option<String>,
+    #[serde(flatten)]
+    extra: BTreeMap<String, Value>,
 }
 
 // ============================================================================
@@ -325,10 +343,7 @@ pub(crate) fn parse_sse(
 
         "response.failed" | "response.incomplete" => {
             let ev: ResponseFailed = from_json(data)?;
-            let (code, message) = match ev.response.error {
-                Some(err) => (err.error_type, err.message.unwrap_or_default()),
-                None => (None, format!("response {event_type}")),
-            };
+            let (code, message) = response_failure_diagnostic(event_type, ev);
             Ok(vec![
                 Event::Error(ErrorEvent { code, message }),
                 Event::Status(StatusEvent {
@@ -551,20 +566,139 @@ pub(crate) fn parse_sse(
         }
 
         "error" => {
-            let ev: TopLevelError = from_json(data).unwrap_or(TopLevelError {
-                message: Some(data.to_string()),
-                error_type: None,
-                code: None,
+            let ev = from_json::<TopLevelErrorEnvelope>(data).unwrap_or_else(|_| {
+                TopLevelErrorEnvelope {
+                    error: TopLevelError {
+                        message: Some(data.to_string()),
+                        error_type: None,
+                        code: None,
+                        extra: BTreeMap::new(),
+                    },
+                    extra: BTreeMap::new(),
+                }
             });
-            Ok(vec![Event::Error(ErrorEvent {
-                code: ev.error_type.or(ev.code),
-                message: ev.message.unwrap_or_default(),
-            })])
+            let (code, message) = top_level_error_diagnostic(ev);
+            Ok(vec![Event::Error(ErrorEvent { code, message })])
         }
 
         // 未対応 / 情報系イベントは無視
         _ => Ok(Vec::new()),
     }
+}
+
+fn response_failure_diagnostic(event_type: &str, ev: ResponseFailed) -> (Option<String>, String) {
+    let mut diagnostic = Map::new();
+    diagnostic.insert("event".to_string(), Value::String(event_type.to_string()));
+
+    let mut code = None;
+    let base_message = if let Some(err) = ev.response.error {
+        code = err.code.clone().or(err.error_type.clone());
+        if let Some(error_type) = err.error_type {
+            diagnostic.insert("error_type".to_string(), Value::String(error_type));
+        }
+        if let Some(error_code) = err.code {
+            diagnostic.insert("error_code".to_string(), Value::String(error_code));
+        }
+        if !err.extra.is_empty() {
+            diagnostic.insert(
+                "error_extra".to_string(),
+                diagnostic_object(err.extra, DIAGNOSTIC_VALUE_LIMIT),
+            );
+        }
+        err.message
+            .filter(|message| !message.trim().is_empty())
+            .unwrap_or_else(|| format!("OpenAI Responses {event_type}"))
+    } else {
+        format!("OpenAI Responses {event_type}")
+    };
+
+    let response_extra = ev.response.extra;
+    if let Some(reason) = response_extra
+        .get("incomplete_details")
+        .and_then(|value| value.get("reason"))
+        .and_then(Value::as_str)
+    {
+        diagnostic.insert(
+            "incomplete_reason".to_string(),
+            Value::String(reason.to_string()),
+        );
+        if code.is_none() {
+            code = Some(reason.to_string());
+        }
+    }
+    if !response_extra.is_empty() {
+        diagnostic.insert(
+            "response_extra".to_string(),
+            diagnostic_object(response_extra, DIAGNOSTIC_VALUE_LIMIT),
+        );
+    }
+    if !ev.extra.is_empty() {
+        diagnostic.insert(
+            "event_extra".to_string(),
+            diagnostic_object(ev.extra, DIAGNOSTIC_VALUE_LIMIT),
+        );
+    }
+
+    (code, append_diagnostic(base_message, diagnostic))
+}
+
+fn top_level_error_diagnostic(ev: TopLevelErrorEnvelope) -> (Option<String>, String) {
+    let code = ev.error.code.clone().or(ev.error.error_type.clone());
+    let mut diagnostic = Map::new();
+    diagnostic.insert("event".to_string(), Value::String("error".to_string()));
+    if let Some(error_type) = ev.error.error_type {
+        diagnostic.insert("error_type".to_string(), Value::String(error_type));
+    }
+    if let Some(error_code) = ev.error.code {
+        diagnostic.insert("error_code".to_string(), Value::String(error_code));
+    }
+    if !ev.error.extra.is_empty() {
+        diagnostic.insert(
+            "error_extra".to_string(),
+            diagnostic_object(ev.error.extra, DIAGNOSTIC_VALUE_LIMIT),
+        );
+    }
+    if !ev.extra.is_empty() {
+        diagnostic.insert(
+            "event_extra".to_string(),
+            diagnostic_object(ev.extra, DIAGNOSTIC_VALUE_LIMIT),
+        );
+    }
+
+    let message = ev
+        .error
+        .message
+        .filter(|message| !message.trim().is_empty())
+        .unwrap_or_else(|| "OpenAI Responses error".to_string());
+    (code, append_diagnostic(message, diagnostic))
+}
+
+const DIAGNOSTIC_VALUE_LIMIT: usize = 512;
+
+fn diagnostic_object(extra: BTreeMap<String, Value>, value_limit: usize) -> Value {
+    Value::Object(
+        extra
+            .into_iter()
+            .map(|(key, value)| (key, cap_json_value(value, value_limit)))
+            .collect(),
+    )
+}
+
+fn cap_json_value(value: Value, limit: usize) -> Value {
+    let rendered = value.to_string();
+    if rendered.len() <= limit {
+        value
+    } else {
+        let capped: String = rendered.chars().take(limit).collect();
+        Value::String(format!("{capped}…"))
+    }
+}
+
+fn append_diagnostic(message: String, diagnostic: Map<String, Value>) -> String {
+    if diagnostic.len() <= 1 {
+        return message;
+    }
+    format!("{} | diagnostic={}", message, Value::Object(diagnostic))
 }
 
 /// 対応する BlockStart がまだ発行されていなければ発行しつつ、delta を流す。
@@ -871,6 +1005,88 @@ mod tests {
                 status: ResponseStatus::Failed
             })
         ));
+    }
+
+    #[test]
+    fn incomplete_response_preserves_incomplete_reason_without_error() {
+        let data = r#"{
+            "response": {
+                "status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"}
+            }
+        }"#;
+        let (events, _) = run("response.incomplete", data);
+        let Event::Error(err) = &events[0] else {
+            panic!("expected error event")
+        };
+        assert_eq!(err.code.as_deref(), Some("max_output_tokens"));
+        assert!(err.message.contains("OpenAI Responses response.incomplete"));
+        assert!(err.message.contains("incomplete_reason"));
+        assert!(err.message.contains("max_output_tokens"));
+        assert!(!err.message.ends_with("response response.incomplete"));
+    }
+
+    #[test]
+    fn incomplete_response_preserves_unknown_response_fields() {
+        let data = r#"{
+            "response": {
+                "status": "incomplete",
+                "incomplete_details": {"reason": "content_filter"},
+                "mystery_field": {"nested": true}
+            },
+            "sequence_number": 42
+        }"#;
+        let (events, _) = run("response.incomplete", data);
+        let Event::Error(err) = &events[0] else {
+            panic!("expected error event")
+        };
+        assert!(err.message.contains("mystery_field"));
+        assert!(err.message.contains("sequence_number"));
+        assert!(err.message.contains("content_filter"));
+    }
+
+    #[test]
+    fn failed_response_preserves_error_and_response_extra_fields() {
+        let data = r#"{
+            "response": {
+                "error": {
+                    "type": "server_error",
+                    "code": "upstream_overloaded",
+                    "message": "try later",
+                    "param": "input"
+                },
+                "retry_hint": "short"
+            }
+        }"#;
+        let (events, _) = run("response.failed", data);
+        let Event::Error(err) = &events[0] else {
+            panic!("expected error event")
+        };
+        assert_eq!(err.code.as_deref(), Some("upstream_overloaded"));
+        assert!(err.message.contains("try later"));
+        assert!(err.message.contains("param"));
+        assert!(err.message.contains("retry_hint"));
+    }
+
+    #[test]
+    fn top_level_error_preserves_unknown_fields() {
+        let data = r#"{
+            "error": {
+                "type": "rate_limit_error",
+                "code": "rate_limit_exceeded",
+                "message": "slow down",
+                "retry_after_ms": 1000
+            },
+            "request_id": "req_123"
+        }"#;
+        let (events, _) = run("error", data);
+        let Event::Error(err) = &events[0] else {
+            panic!("expected error event")
+        };
+        assert_eq!(err.code.as_deref(), Some("rate_limit_exceeded"));
+        assert!(err.message.contains("slow down"));
+        assert!(err.message.contains("retry_after_ms"));
+        assert!(err.message.contains("request_id"));
     }
 
     #[test]
