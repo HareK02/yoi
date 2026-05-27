@@ -1,7 +1,7 @@
 ---
 id: 20260527-000023-multi-pod-view-ui
 slug: multi-pod-view-ui
-title: è¤æ°ã®Podã®Viewãè¡ãæ¥ã§ããUI
+title: 複数のPodのViewを行き来できるUI
 status: open
 kind: task
 priority: P2
@@ -17,7 +17,7 @@ legacy_ticket: null
 - legacy_ticket: null
 - migrated_from: TODO.md / tickets directory migration on 2026-05-27
 
-# è¤æ°ã®Podã®Viewãè¡ãæ¥ã§ããUI
+# 複数のPodのViewを行き来できるUI
 
 ## Background
 

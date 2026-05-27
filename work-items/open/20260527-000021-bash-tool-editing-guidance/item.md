@@ -1,7 +1,7 @@
 ---
 id: 20260527-000021-bash-tool-editing-guidance
 slug: bash-tool-editing-guidance
-title: Bashãã¼ã«ããã¡ã¤ã«ç·¨éã«å¸¸ç¨ããã¦ããåé¡ãdesciptionã§æå¶
+title: Bashツールがファイル編集に常用されている問題をdesciptionで抑制
 status: open
 kind: task
 priority: P2
@@ -17,7 +17,7 @@ legacy_ticket: null
 - legacy_ticket: null
 - migrated_from: TODO.md / tickets directory migration on 2026-05-27
 
-# Bashãã¼ã«ããã¡ã¤ã«ç·¨éã«å¸¸ç¨ããã¦ããåé¡ãdesciptionã§æå¶
+# Bashツールがファイル編集に常用されている問題をdesciptionで抑制
 
 ## Background
 

@@ -1,7 +1,7 @@
 ---
 id: 20260527-000019-workspace-memory-lint-cli
 slug: workspace-memory-lint-cli
-title: ã¯ã¼ã¯ã¹ãã¼ã¹ã®ã¡ã¢ãªã¼ãLintãããããã¬ã¹CLI
+title: ワークスペースのメモリーをLintするヘッドレスCLI
 status: open
 kind: task
 priority: P2
@@ -17,7 +17,7 @@ legacy_ticket: null
 - legacy_ticket: null
 - migrated_from: TODO.md / tickets directory migration on 2026-05-27
 
-# ã¯ã¼ã¯ã¹ãã¼ã¹ã®ã¡ã¢ãªã¼ãLintãããããã¬ã¹CLI
+# ワークスペースのメモリーをLintするヘッドレスCLI
 
 ## Background
 

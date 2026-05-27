@@ -1,7 +1,7 @@
 ---
 id: 20260527-000020-system-reminder-injection-generalization
 slug: system-reminder-injection-generalization
-title: system-reminder æ³¨å¥æ©æ§ã®æ±ç¨åï¼2ä»¶ç®ã®å©ç¨èãåºãæã«æ¤è¨ãã¿ã°å½¢å¼ `<system-reminder>...</system-reminder>` ã®è¦ç´ã¯ session-todo-reminder ã§åè¡ç¢ºç«ãæ³¨å¥ããã Item ã¯ worker.history ã« append ããæ¹éï¼
+title: system-reminder 注入機構の汎用化（2件目の利用者が出た時に検討。タグ形式 `<system-reminder>...</system-reminder>` の規約は session-todo-reminder で先行確立。注入された Item は worker.history に append する方針）
 status: open
 kind: task
 priority: P2
@@ -17,7 +17,7 @@ legacy_ticket: null
 - legacy_ticket: null
 - migrated_from: TODO.md / tickets directory migration on 2026-05-27
 
-# system-reminder æ³¨å¥æ©æ§ã®æ±ç¨åï¼2ä»¶ç®ã®å©ç¨èãåºãæã«æ¤è¨ãã¿ã°å½¢å¼ `<system-reminder>...</system-reminder>` ã®è¦ç´ã¯ session-todo-reminder ã§åè¡ç¢ºç«ãæ³¨å¥ããã Item ã¯ worker.history ã« append ããæ¹éï¼
+# system-reminder 注入機構の汎用化（2件目の利用者が出た時に検討。タグ形式 `<system-reminder>...</system-reminder>` の規約は session-todo-reminder で先行確立。注入された Item は worker.history に append する方針）
 
 ## Background
 

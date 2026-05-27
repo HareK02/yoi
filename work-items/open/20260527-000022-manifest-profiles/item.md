@@ -1,7 +1,7 @@
 ---
 id: 20260527-000022-manifest-profiles
 slug: manifest-profiles
-title: äºåå®ç¾©ããManifestãProfileçã«æ±ããOrchestrator/Coder/Researcherã§å¥ãã®ã¢ãã«/è¨­å®ãä½¿ãããéç¨ãã§ããããã«ãã
+title: 事前定義したManifestをProfile的に扱い、Orchestrator/Coder/Researcherで別々のモデル/設定を使わせる運用ができるようにする
 status: open
 kind: task
 priority: P2
@@ -17,7 +17,7 @@ legacy_ticket: null
 - legacy_ticket: null
 - migrated_from: TODO.md / tickets directory migration on 2026-05-27
 
-# äºåå®ç¾©ããManifestãProfileçã«æ±ããOrchestrator/Coder/Researcherã§å¥ãã®ã¢ãã«/è¨­å®ãä½¿ãããéç¨ãã§ããããã«ãã
+# 事前定義したManifestをProfile的に扱い、Orchestrator/Coder/Researcherで別々のモデル/設定を使わせる運用ができるようにする
 
 ## Background
 
