@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// # イベントの種類
 ///
-/// - **メタイベント**: `Ping`, `Usage`, `Status`, `Error`
+/// - **メタイベント**: `Ping`, `Usage`, `Status`, `Error`, `UnhandledSse`
 /// - **ブロックイベント**: `BlockStart`, `BlockDelta`, `BlockStop`, `BlockAbort`
 /// - **永続化イベント**: `ReasoningItem` (history に commit すべき完成済み
 ///   reasoning item。streaming 表示用の Thinking BlockStart/Delta/Stop と
@@ -35,6 +35,10 @@ pub enum Event {
     Status(StatusEvent),
     /// エラー発生
     Error(ErrorEvent),
+    /// Scheme が生成内容として解釈しない未対応 SSE イベント。
+    ///
+    /// stream trace 用の観測イベントであり、timeline / history には反映しない。
+    UnhandledSse(UnhandledSseEvent),
 
     /// ブロック開始（テキスト、ツール使用等）
     BlockStart(BlockStart),
@@ -117,6 +121,18 @@ pub enum ResponseStatus {
 pub struct ErrorEvent {
     pub code: Option<String>,
     pub message: String,
+}
+
+/// 未対応 SSE イベントの観測用メタイベント。
+///
+/// `data_preview` は provider から受け取った raw SSE data の bounded preview、
+/// `data_len` は preview 前の raw data byte length。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UnhandledSseEvent {
+    pub provider: String,
+    pub event_type: String,
+    pub data_preview: String,
+    pub data_len: usize,
 }
 
 // =============================================================================
