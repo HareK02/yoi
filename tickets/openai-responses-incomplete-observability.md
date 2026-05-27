@@ -4,37 +4,50 @@
 
 CodexOAuth / OpenAI Responses 経路で、Prune 後の大きな request に対して `response.incomplete` が SSE event として返り、出力が中断される症状が観測された。
 
-現行の OpenAI Responses parser は `response.failed` / `response.incomplete` を `ResponseFailed` として deserialize し、`response.error` がある場合だけ `ErrorEvent` に反映している。`response.error` が無い `response.incomplete` は `response response.incomplete` という汎用 message に潰れるため、provider が返した `incomplete_details` や response 直下の未知 field を後から確認できない。
+旧 OpenAI Responses parser は `response.failed` / `response.incomplete` を既知 field だけに deserialize し、`response.error` がある場合だけ `ErrorEvent` に反映していた。`response.error` が無い `response.incomplete` は `response response.incomplete` という汎用 message に潰れるため、provider が返した `incomplete_details` や response 直下の未知 field を後から確認できなかった。
 
-また、Responses API は event schema が増える可能性がある。既知 field だけを構造体に deserialize して未知 field を暗黙に捨てると、障害調査時に「provider は何を返していたか」が失われる。特に incomplete / failed / top-level error は、復旧判断や retry 対象判定に使う可能性があるため、未知 field を観測可能な形で残す必要がある。
+Responses API は event schema が増える可能性がある。既知 field だけを構造体に deserialize して未知 field を暗黙に捨てると、障害調査時に「provider は何を返していたか」が失われる。特に incomplete / failed / top-level error は、復旧判断や retry 対象判定に使う可能性があるため、未知 field を観測可能な形で残す必要がある。
 
-## 要件
+## 実装結果
 
-- `response.incomplete` の詳細 reason を失わない。
-  - `response.incomplete_details.reason` がある場合は ErrorEvent / trace / log から確認できる。
-  - `response.error` が無い場合でも `response response.incomplete` だけに潰さない。
-- `response.failed` / `response.incomplete` で、既知 schema に入らない response field を観測できる。
-  - まずは raw `serde_json::Value` から diagnostic を組み立てる形でよい。
-  - 既知 field に昇格していない field があっても deserialize 時点で完全には捨てない。
-- unknown / extra field の記録は、通常の session history には混ぜない。
-  - LLM context に暗黙注入しない。
-  - debug trace / structured log / error diagnostic のいずれか、調査用の経路に残す。
-- 記録する raw JSON は肥大化と secret 混入に注意する。
-  - full raw frame を常時 transcript に保存しない。
-  - trace に残す場合は debug mode / size cap / redaction 方針を明確にする。
-- OpenAI Responses の top-level `error` event も同じ方針で確認する。
-  - `message`, `type`, `code` 以外の field がある場合に捨て切らない。
-- incomplete / failed の diagnostic は、将来の retry 判定に使える粒度にする。
-  - 例: `incomplete_reason`, provider error code/type, status 相当、raw extra keys。
+対象コミット:
 
-## 完了条件
+```text
+32ae63d fix: preserve openai responses incomplete diagnostics
+```
 
-- `response.incomplete` に `incomplete_details.reason` が含まれる fixture で、ErrorEvent または trace/log diagnostic に reason が残る test がある。
-- `response.incomplete` に `response.error` が無い fixture でも、汎用 message だけにならない test がある。
-- `response.failed` / `response.incomplete` の response 直下 unknown field が観測用 diagnostic に残る test がある。
-- top-level `error` event の unknown field について、捨て切らない方針が実装または test で確認されている。
-- diagnostic が session history / LLM context に混入しないことが確認されている。
-- `cargo fmt --check` と関連 crate の test が通る。
+実装内容:
+
+- `response.failed` / `response.incomplete` を parse する際、既知 field だけでなく `serde(flatten)` で unknown / extra field を保持する。
+- `response.incomplete_details.reason` を diagnostic に残す。
+  - `response.error` が無い `response.incomplete` でも `OpenAI Responses response.incomplete` と diagnostic を含む message にする。
+  - reason がある場合は `ErrorEvent.code` にも入る。
+- `response.failed` / `response.incomplete` の response 直下 extra field、error object 内 extra field、event top-level extra field を diagnostic に残す。
+- top-level `error` event についても、error object 内 extra field と event top-level extra field を diagnostic に残す。
+- diagnostic は `ErrorEvent.message` に付与する。
+  - session history / LLM context には混ぜない。
+  - raw frame 全体の恒久保存ではなく、extra field を size cap 付き diagnostic として残す。
+- diagnostic value は JSON 文字列化後 512 chars で cap する。
+
+追加 test:
+
+- `response.incomplete` に `incomplete_details.reason` が含まれる場合、reason が `ErrorEvent` に残る。
+- `response.error` が無い `response.incomplete` でも汎用 message だけにならない。
+- `response.incomplete` の response 直下 unknown field が diagnostic に残る。
+- `response.failed` の response/error unknown field が diagnostic に残る。
+- top-level `error` event の unknown field が diagnostic に残る。
+
+確認済み:
+
+```text
+cargo test -p llm-worker openai_responses --lib
+cargo test -p llm-worker --lib
+cargo fmt --check
+```
+
+## 完了判定
+
+incomplete / failed / top-level error の diagnostic 観測性は実装済み。自動 retry、Prune 閾値調整、prompt cache key / previous_response_id 設計変更、raw SSE frame 全体の恒久保存は範囲外として残す。
 
 ## 範囲外
 
