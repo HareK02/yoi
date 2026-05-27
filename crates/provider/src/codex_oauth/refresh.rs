@@ -4,11 +4,13 @@
 //! 401 + `error.code` で永続失敗を分類する。
 
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 use super::error::{CodexAuthError, PermanentReason};
 
 pub const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 pub const REFRESH_URL: &str = "https://auth.openai.com/oauth/token";
+pub const DEFAULT_REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Serialize)]
 struct RefreshRequest<'a> {
@@ -41,13 +43,15 @@ pub async fn request_refresh(
         grant_type: "refresh_token",
         refresh_token,
     };
-    let response = client
-        .post(endpoint)
-        .header("Content-Type", "application/json")
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| CodexAuthError::RefreshTransient(format!("send: {e}")))?;
+    let response = response_with_timeout(
+        client
+            .post(endpoint)
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send(),
+        DEFAULT_REFRESH_TIMEOUT,
+    )
+    .await?;
 
     let status = response.status();
     if status.is_success() {
@@ -66,6 +70,21 @@ pub async fn request_refresh(
             )))
         }
     }
+}
+
+async fn response_with_timeout(
+    future: impl std::future::Future<Output = Result<reqwest::Response, reqwest::Error>>,
+    timeout: Duration,
+) -> Result<reqwest::Response, CodexAuthError> {
+    tokio::time::timeout(timeout, future)
+        .await
+        .map_err(|_| {
+            CodexAuthError::RefreshTransient(format!(
+                "codex_oauth_refresh timed out after {}s",
+                timeout.as_secs()
+            ))
+        })?
+        .map_err(|e| CodexAuthError::RefreshTransient(format!("send: {e}")))
 }
 
 fn classify_permanent(body: &str) -> (PermanentReason, String) {
@@ -106,6 +125,23 @@ fn extract_error_code(body: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn refresh_response_timeout_is_transient() {
+        let err = match response_with_timeout(
+            std::future::pending::<Result<reqwest::Response, reqwest::Error>>(),
+            Duration::from_millis(5),
+        )
+        .await
+        {
+            Ok(_) => panic!("expected refresh timeout"),
+            Err(err) => err,
+        };
+
+        assert!(
+            matches!(err, CodexAuthError::RefreshTransient(message) if message.contains("timed out"))
+        );
+    }
 
     #[test]
     fn classify_expired() {

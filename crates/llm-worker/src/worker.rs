@@ -20,7 +20,7 @@ use crate::{
     llm_client::{
         ClientError, ConfigWarning, LlmClient, Request, RequestConfig, ResponseStream,
         ToolDefinition, error::is_retryable, event::Event, retry::RetryPolicy,
-        types::parse_tool_arguments,
+        transport::DEFAULT_FIRST_STREAM_EVENT_TIMEOUT, types::parse_tool_arguments,
     },
     state::{Locked, Mutable, WorkerState},
     timeline::event::{ErrorEvent, StatusEvent, UsageEvent},
@@ -1334,7 +1334,7 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
                 }
             };
 
-            match stream_result {
+            let err = match stream_result {
                 Ok(stream) => {
                     self.emit_lifecycle_trace(
                         turn,
@@ -1345,7 +1345,26 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
                             "elapsed_ms": stream_started.elapsed().as_millis() as u64,
                         }),
                     );
-                    return Ok(stream);
+                    match wait_for_first_stream_event(stream, DEFAULT_FIRST_STREAM_EVENT_TIMEOUT)
+                        .await
+                    {
+                        Ok(FirstStreamEvent::Ready(stream)) => return Ok(stream),
+                        Ok(FirstStreamEvent::Empty(stream)) => return Ok(stream),
+                        Err(err) => {
+                            self.emit_lifecycle_trace(
+                                turn,
+                                llm_call,
+                                "stream_first_event_error",
+                                json!({
+                                    "attempt": attempt,
+                                    "elapsed_ms": stream_started.elapsed().as_millis() as u64,
+                                    "retryable": is_retryable(&err),
+                                    "error": err.to_string(),
+                                }),
+                            );
+                            err
+                        }
+                    }
                 }
                 Err(err) => {
                     self.emit_lifecycle_trace(
@@ -1360,54 +1379,56 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
                             "error": err.to_string(),
                         }),
                     );
-                    let next_failed_attempt = failed_attempt + 1;
-                    if next_failed_attempt >= policy.max_attempts || !is_retryable(&err) {
-                        self.last_run_interrupted = true;
-                        return Err(WorkerError::Client(err));
-                    }
+                    err
+                }
+            };
 
-                    let wait = err
-                        .retry_after()
-                        .unwrap_or_else(|| policy.backoff(failed_attempt));
-                    let elapsed = started.elapsed();
-                    if elapsed + wait > policy.total_timeout {
-                        self.last_run_interrupted = true;
-                        return Err(WorkerError::Client(err));
-                    }
+            let next_failed_attempt = failed_attempt + 1;
+            if next_failed_attempt >= policy.max_attempts || !is_retryable(&err) {
+                self.last_run_interrupted = true;
+                return Err(WorkerError::Client(err));
+            }
 
-                    warn!(
-                        error = %err,
-                        failed_attempt = next_failed_attempt,
-                        wait_ms = wait.as_millis() as u64,
-                        "transient LLM request error, retrying"
-                    );
-                    let notice = LlmRetryNotice {
-                        failed_attempt: next_failed_attempt,
-                        max_attempts: policy.max_attempts,
-                        wait,
-                        elapsed,
-                        status: err.status(),
-                        error: err.to_string(),
-                    };
-                    for cb in &self.llm_retry_cbs {
-                        cb(llm_call, &notice);
-                    }
+            let wait = err
+                .retry_after()
+                .unwrap_or_else(|| policy.backoff(failed_attempt));
+            let elapsed = started.elapsed();
+            if elapsed + wait > policy.total_timeout {
+                self.last_run_interrupted = true;
+                return Err(WorkerError::Client(err));
+            }
 
-                    tokio::select! {
-                        _ = tokio::time::sleep(wait) => {}
-                        cancel = self.cancel_rx.recv() => {
-                            if cancel.is_some() {
-                                info!("Cancelled during LLM retry backoff");
-                            }
-                            self.timeline.abort_current_block();
-                            self.last_run_interrupted = true;
-                            return Err(WorkerError::Cancelled);
-                        }
-                    }
+            warn!(
+                error = %err,
+                failed_attempt = next_failed_attempt,
+                wait_ms = wait.as_millis() as u64,
+                "transient LLM request error, retrying"
+            );
+            let notice = LlmRetryNotice {
+                failed_attempt: next_failed_attempt,
+                max_attempts: policy.max_attempts,
+                wait,
+                elapsed,
+                status: err.status(),
+                error: err.to_string(),
+            };
+            for cb in &self.llm_retry_cbs {
+                cb(llm_call, &notice);
+            }
 
-                    failed_attempt = next_failed_attempt;
+            tokio::select! {
+                _ = tokio::time::sleep(wait) => {}
+                cancel = self.cancel_rx.recv() => {
+                    if cancel.is_some() {
+                        info!("Cancelled during LLM retry backoff");
+                    }
+                    self.timeline.abort_current_block();
+                    self.last_run_interrupted = true;
+                    return Err(WorkerError::Cancelled);
                 }
             }
+
+            failed_attempt = next_failed_attempt;
         }
     }
 
@@ -1932,6 +1953,29 @@ impl<C: LlmClient> Worker<C, Locked> {
     }
 }
 
+enum FirstStreamEvent {
+    Ready(ResponseStream),
+    Empty(ResponseStream),
+}
+
+async fn wait_for_first_stream_event(
+    mut stream: ResponseStream,
+    timeout: std::time::Duration,
+) -> Result<FirstStreamEvent, ClientError> {
+    match tokio::time::timeout(timeout, stream.next()).await {
+        Ok(Some(first)) => {
+            let first = first?;
+            let stream = futures::stream::once(async move { Ok(first) }).chain(stream);
+            Ok(FirstStreamEvent::Ready(Box::pin(stream)))
+        }
+        Ok(None) => Ok(FirstStreamEvent::Empty(stream)),
+        Err(_) => Err(ClientError::Timeout {
+            phase: "stream_first_event",
+            timeout,
+        }),
+    }
+}
+
 fn items_trace_payload(
     items: &[Item],
     tools_len: usize,
@@ -1990,5 +2034,46 @@ fn item_kind(item: &Item) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    // Basic tests only. Tests using LlmClient are done in integration tests.
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn first_stream_event_timeout_returns_retryable_timeout() {
+        let stream: ResponseStream = Box::pin(futures::stream::pending());
+        let err = match wait_for_first_stream_event(stream, Duration::from_millis(5)).await {
+            Ok(_) => panic!("expected first event timeout"),
+            Err(err) => err,
+        };
+
+        assert!(is_retryable(&err));
+        assert!(matches!(
+            err,
+            ClientError::Timeout {
+                phase: "stream_first_event",
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn first_stream_event_is_replayed_after_probe() {
+        let first = Event::Status(crate::llm_client::event::StatusEvent {
+            status: crate::llm_client::event::ResponseStatus::Started,
+        });
+        let stream: ResponseStream = Box::pin(futures::stream::once({
+            let first = first.clone();
+            async move { Ok(first) }
+        }));
+
+        let FirstStreamEvent::Ready(mut stream) =
+            wait_for_first_stream_event(stream, Duration::from_secs(1))
+                .await
+                .unwrap()
+        else {
+            panic!("expected first event to be buffered");
+        };
+
+        let replayed = stream.next().await.unwrap().unwrap();
+        assert_eq!(replayed, first);
+    }
 }

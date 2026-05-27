@@ -23,6 +23,9 @@ use super::event::Event;
 use super::scheme::Scheme;
 use super::types::{Request, RequestConfig};
 
+pub const DEFAULT_STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
+pub const DEFAULT_FIRST_STREAM_EVENT_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// `AuthRef` を解決したランタイム表現。`crates/provider` が構築する。
 ///
 /// - `None`: 認証ヘッダを送らない（Ollama 等の opt-out）
@@ -201,6 +204,17 @@ enum RequestBody {
     CompressedJson(Vec<u8>),
 }
 
+async fn response_with_timeout(
+    future: impl std::future::Future<Output = Result<reqwest::Response, reqwest::Error>>,
+    timeout: Duration,
+    phase: &'static str,
+) -> Result<reqwest::Response, ClientError> {
+    tokio::time::timeout(timeout, future)
+        .await
+        .map_err(|_| ClientError::Timeout { phase, timeout })?
+        .map_err(ClientError::Http)
+}
+
 impl<S: Scheme + Clone> Clone for HttpTransport<S> {
     fn clone(&self) -> Self {
         Self {
@@ -272,7 +286,9 @@ impl<S: Scheme + Clone + 'static> LlmClient for HttpTransport<S> {
             RequestBody::Json(body) => builder.json(&body),
             RequestBody::CompressedJson(body) => builder.body(body),
         };
-        let response = builder.send().await.map_err(ClientError::Http)?;
+        let response =
+            response_with_timeout(builder.send(), DEFAULT_STREAM_OPEN_TIMEOUT, "stream_open")
+                .await?;
 
         if !response.status().is_success() {
             return Err(classify_error_response(response).await);
@@ -389,6 +405,26 @@ mod tests {
             auth,
             ModelCapability::minimal(),
         )
+    }
+
+    #[tokio::test]
+    async fn response_timeout_returns_retryable_lifecycle_timeout() {
+        let err = response_with_timeout(
+            std::future::pending::<Result<reqwest::Response, reqwest::Error>>(),
+            Duration::from_millis(5),
+            "stream_open",
+        )
+        .await
+        .unwrap_err();
+
+        assert!(crate::llm_client::error::is_retryable(&err));
+        assert!(matches!(
+            err,
+            ClientError::Timeout {
+                phase: "stream_open",
+                ..
+            }
+        ));
     }
 
     #[tokio::test]

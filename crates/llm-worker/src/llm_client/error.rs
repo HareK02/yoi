@@ -18,6 +18,11 @@ pub enum ClientError {
         message: String,
         retry_after: Option<Duration>,
     },
+    /// A request lifecycle phase exceeded its hard timeout.
+    Timeout {
+        phase: &'static str,
+        timeout: Duration,
+    },
     /// 設定エラー
     Config(String),
 }
@@ -42,6 +47,9 @@ impl fmt::Display for ClientError {
                     write!(f, " [{}]", c)?;
                 }
                 write!(f, ": {}", message)
+            }
+            ClientError::Timeout { phase, timeout } => {
+                write!(f, "{phase} timed out after {}s", timeout.as_secs())
             }
             ClientError::Config(msg) => write!(f, "Config error: {}", msg),
         }
@@ -91,6 +99,7 @@ impl ClientError {
 /// 対象:
 /// - `Api { status }` のうち 408 / 425 / 429 / 500 / 502 / 503 / 504 / 529
 /// - `Http(reqwest::Error)` のうち `is_connect()` または `is_timeout()`
+/// - `Timeout { .. }` の lifecycle hard timeout
 ///
 /// それ以外（Json、Sse、Config、上記以外の Api ステータス）は false。
 /// SSE 読み出し開始後の失敗は呼び出し側で `Sse` として上に流すため、
@@ -101,6 +110,7 @@ pub fn is_retryable(error: &ClientError) -> bool {
             status: Some(code), ..
         } => matches!(*code, 408 | 425 | 429 | 500 | 502 | 503 | 504 | 529),
         ClientError::Api { status: None, .. } => false,
+        ClientError::Timeout { .. } => true,
         ClientError::Http(e) => e.is_connect() || e.is_timeout(),
         ClientError::Json(_) | ClientError::Sse(_) | ClientError::Config(_) => false,
     }
@@ -142,6 +152,14 @@ mod tests {
     #[test]
     fn api_without_status_not_retryable() {
         assert!(!is_retryable(&api_err(None)));
+    }
+
+    #[test]
+    fn lifecycle_timeout_is_retryable() {
+        assert!(is_retryable(&ClientError::Timeout {
+            phase: "stream_open",
+            timeout: Duration::from_secs(30),
+        }));
     }
 
     #[test]
