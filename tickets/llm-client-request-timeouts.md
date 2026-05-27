@@ -8,32 +8,47 @@ CodexOAuth / OpenAI Responses 経路で、tool result 後の次 LLM request が 
 
 現状の retry policy は `client.stream().await` が error を返した後にだけ効く。in-flight request が response headers 前で戻らない場合、retry / UI observability / run lifecycle が進まない。
 
-## 要件
+## 実装結果
 
-- 全 HTTP schema 共通で、stream open に hard timeout を設ける。
-  - request build 後、HTTP request を送り response headers を受け取るまでを対象にする。
-  - timeout は retryable error として Worker retry policy に渡る。
-  - stream が始まった後の長い正常出力を全体 timeout で殺さない。
-- 全 HTTP schema 共通で、first SSE event に hard timeout を設ける。
-  - response headers は返ったが最初の stream event が来ない blackhole を検出する。
-  - timeout は retryable error として扱う。
-  - first event 後の通常 stream にはこの timeout を適用しない。
-- CodexOAuth token refresh request に timeout を設ける。
-  - auth refresh が戻らない場合も run が無期限に止まらない。
-  - refresh timeout は一時的な auth transport failure として surfacing する。
-- timeout 値はまず固定 default でよい。
-  - manifest configurable 化は後続で必要になった時に行う。
-- timeout 発生時の error message は phase が分かるものにする。
-  - 例: `stream_open`, `stream_first_event`, `codex_oauth_refresh`。
-- 既存の provider-specific SSE parsing / long streaming behavior を壊さない。
+対象コミット:
 
-## 完了条件
+```text
+541b542 fix: add llm request lifecycle timeouts
+```
 
-- `HttpTransport<S>::stream` の response headers 待ちが timeout で戻る test がある。
-- Worker の first stream event 待ちが timeout で戻る test がある。
-- timeout error が retryable と判定される test がある。
-- CodexOAuth refresh request timeout の実装または focused test がある。
-- `cargo fmt --check` と関連 crate の test が通る。
+実装内容:
+
+- `ClientError::Timeout { phase, timeout }` を追加し、retryable error として扱う。
+- `HttpTransport<S>::stream` の HTTP response headers 待ちを `DEFAULT_STREAM_OPEN_TIMEOUT = 30s` で制限する。
+  - timeout phase: `stream_open`
+  - 全 HTTP schema 共通。
+- Worker 側で stream open 成功後、最初の SSE event を `DEFAULT_FIRST_STREAM_EVENT_TIMEOUT = 30s` で probe する。
+  - timeout phase: `stream_first_event`
+  - first event は消費せず、stream に戻して通常 dispatch に流す。
+  - first event 後の通常 stream には timeout をかけない。
+- CodexOAuth token refresh request を `DEFAULT_REFRESH_TIMEOUT = 30s` で制限する。
+  - timeout は `RefreshTransient` として扱う。
+- `tokio` の `time` feature を `llm-worker` / `provider` に追加した。
+
+追加 test:
+
+- `HttpTransport` response timeout が retryable `ClientError::Timeout { phase: "stream_open" }` になる。
+- Worker first stream event timeout が retryable `ClientError::Timeout { phase: "stream_first_event" }` になる。
+- first event probe が最初の event を失わず replay する。
+- `ClientError::Timeout` が retryable と判定される。
+- CodexOAuth refresh timeout が transient error になる。
+
+確認済み:
+
+```text
+cargo test -p llm-worker --lib
+cargo test -p provider --lib
+cargo fmt --check
+```
+
+## 完了判定
+
+要件の stream open timeout / first SSE event timeout / CodexOAuth refresh timeout は実装済み。timeout 値の manifest configurable 化、追加 trace、Prune 閾値調整、CodexOAuth 401 recovery は範囲外として残す。
 
 ## 範囲外
 
