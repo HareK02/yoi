@@ -16,6 +16,7 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tokio-util = "0.7"
 reqwest = { version = "0.13", default-features = false, features = ["stream", "json", "native-tls", "http2"] }
 eventsource-stream = "0.2"
+zstd = "0.13"
 llm-worker-macros = { workspace = true }
 
 [dev-dependencies]

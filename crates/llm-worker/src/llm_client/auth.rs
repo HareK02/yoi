@@ -45,4 +45,13 @@ pub enum AuthRequirement {
 pub trait AuthProvider: Send + Sync + std::fmt::Debug {
     /// 1 リクエスト分の認証ヘッダを返す。refresh が必要なら内部で行う。
     async fn headers(&self) -> Result<Vec<(HeaderName, HeaderValue)>, ClientError>;
+
+    /// ChatGPT Codex backend 向けの複合認証かどうか。
+    ///
+    /// transport は provider crate の具象型を知らないため、この hook だけで
+    /// Codex CLI 互換の wire behavior（conversation header / request compression 等）
+    /// を切り替える。
+    fn is_codex_backend(&self) -> bool {
+        false
+    }
 }

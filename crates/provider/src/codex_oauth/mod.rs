@@ -188,6 +188,10 @@ impl AuthProvider for CodexAuthProvider {
             .map_err(CodexAuthError::to_client_error)?;
         Self::build_headers(&snap).map_err(CodexAuthError::to_client_error)
     }
+
+    fn is_codex_backend(&self) -> bool {
+        true
+    }
 }
 
 /// `access_token` の JWT `exp` を見て、期限切れなら true。
