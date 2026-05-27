@@ -150,13 +150,26 @@ mod tests {
         let layout = WorkspaceLayout::new(tmp.path().to_path_buf());
         let (_id, _) = write_staging(&layout, source("s", [0, 1]), empty_payload()).unwrap();
 
-        // Drop a non-UUID json file, an unparsable UUID-named json file, and
-        // a bare lock file alongside. Lock files are not `.json`; invalid
-        // `.json` files are surfaced separately instead of being mistaken for
-        // an empty staging directory.
+        // Drop a non-UUID json file, an unparsable UUID-named json file, an
+        // old-schema UUID-named json file, and a bare lock file alongside.
+        // Lock files are not `.json`; invalid `.json` files are surfaced
+        // separately instead of being mistaken for an empty staging directory.
         std::fs::write(layout.staging_dir().join("not-a-uuid.json"), "{}").unwrap();
         let bad_id = Uuid::now_v7();
         std::fs::write(layout.staging_dir().join(format!("{bad_id}.json")), "{").unwrap();
+        let old_schema_id = Uuid::now_v7();
+        std::fs::write(
+            layout.staging_dir().join(format!("{old_schema_id}.json")),
+            serde_json::json!({
+                "source": {
+                    "session_id": "legacy-session",
+                    "range": [0, 1]
+                },
+                "requests": []
+            })
+            .to_string(),
+        )
+        .unwrap();
         std::fs::write(layout.staging_dir().join(".consolidation.lock"), "{}").unwrap();
 
         let entries = list_staging_entries(&layout);
@@ -164,7 +177,7 @@ mod tests {
 
         let snapshot = list_staging_entries_snapshot(&layout);
         assert_eq!(snapshot.entries.len(), 1);
-        assert_eq!(snapshot.invalid_count, 2);
+        assert_eq!(snapshot.invalid_count, 3);
     }
 
     #[test]

@@ -288,7 +288,18 @@ async fn invalid_only_staging_is_distinct_from_no_staging() {
     std::fs::create_dir_all(layout.staging_dir()).unwrap();
     let invalid_id = uuid::Uuid::now_v7();
     let invalid_path = layout.staging_dir().join(format!("{invalid_id}.json"));
-    std::fs::write(&invalid_path, "{").unwrap();
+    std::fs::write(
+        &invalid_path,
+        serde_json::json!({
+            "source": {
+                "session_id": "legacy-session",
+                "range": [0, 1]
+            },
+            "requests": []
+        })
+        .to_string(),
+    )
+    .unwrap();
 
     let client = MockClient::new(vec![]);
     let mut pod = make_pod_with(FILES_THRESHOLD_TOML, pwd.path().to_path_buf(), client).await;
@@ -320,6 +331,11 @@ async fn below_threshold_skip_is_audit_only() {
     pod.try_post_run_consolidate().await.unwrap();
 
     assert!(collect_memory_worker_reasons(&mut rx).is_empty());
+    let audit = read_audit_jsonl(&layout);
+    let reason = audit.last().unwrap()["reason"]
+        .as_str()
+        .expect("audit reason must be a string");
+    assert!(reason.starts_with("threshold_not_reached "));
 }
 
 #[tokio::test]
