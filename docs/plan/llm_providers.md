@@ -13,7 +13,7 @@ INSOMNIA が利用する LLM プロバイダとその認証方式を決める。
 | プロバイダ | scheme | 認証 | 用途 |
 |---|---|---|---|
 | **Ollama** | scheme/anthropic 流用（v0.14+ `/v1/messages`） | なし（ダミー） | ローカル + `:cloud` サフィックスでクラウド中継。`localhost:11434` で統一 |
-| **Codex OAuth 経路** | scheme/openai_responses | `~/.codex/auth.json` | ChatGPT の定額枠を利用 |
+| **Codex OAuth** | scheme/openai_responses | `~/.codex/auth.json` | Codex CLI と同じ認証ストアを使う Responses 経路 |
 | **Anthropic API** | scheme/anthropic | API key | 従量課金経路のみ |
 
 Ollama は独自 scheme を作らず `scheme/anthropic` を base_url 差し替えで流用。`/v1/chat/completions` は stream+tools バグ (#9092) のため使わない。`cache_control` / `tool_choice` / `metadata` / `count_tokens` は Ollama 非対応のため送らない。
@@ -31,13 +31,13 @@ Ollama は独自 scheme を作らず `scheme/anthropic` を base_url 差し替�
 
 ### 非サポート
 
-- **Claude Pro/Max OAuth 経路** — Anthropic が 2026-01-09 にサーバ側でブロック、2026-02-19 に ToS で第三者ツール経由を明文禁止。リスクが第一級機能に見合わない
-- **`claude -p` CLI fork** — 同様に採用しない。実装しない
+- **Claude Pro/Max OAuth 経路** — Anthropic が 2026-01-09 にサーバ側でブロック、2026-02-19 に第三者ツール経由の利用制限を明文化。第一級機能としては採用しない
+- **`claude -p` CLI fork** — 専用 API integration ではないため実装しない
 
 ## 根拠
 
-- **Codex OAuth は Codex CLI 互換**: Codex CLI は Apache-2.0、openai/codex #8338 で OpenAI 社員が fork 自由と明言、service terms に名指し禁止なし
-- **Anthropic API は従量だが代替なし**: Pro/Max OAuth 封鎖後、Claude 系を使うには API key 経路のみ
+- **Codex OAuth は Codex CLI 互換の認証経路として扱う**: Codex CLI は Apache-2.0 で公開されており、同じ Responses 系 wire behavior に寄せる
+- **Anthropic API は従量だが代替なし**: Pro/Max OAuth 経路の制限後、Claude 系を使うには API key 経路のみ
 - **Ollama は `:cloud` で透過**: `ollama signin` で Ed25519 鍵登録後、`localhost:11434` 経由でクラウドモデルが使える。ローカルデーモンが署名付き中継
 - **OpenAI 互換は汎用アダプタ 1 本**: ルーター系は後追いで数を増やしやすい宣言型設計、実装コスト最小
 

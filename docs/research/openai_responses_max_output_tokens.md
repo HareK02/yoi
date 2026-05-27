@@ -36,11 +36,11 @@
 - コスト制御目的には `reasoning.effort` (`"low"` など) の使用が推奨される。`max_output_tokens` はあくまで暴走抑止のガードとして位置づける。
 - o シリーズなど reasoning モデルでは `reasoning.max_tokens` (別パラメータ) で reasoning 専用の上限を設定できる場合もある。
 
-## 5. ChatGPT backend (`https://chatgpt.com/backend-api/codex/responses`) における取り扱い
+## 5. Codex CLI 互換 Responses 経路における取り扱い
 
-このエンドポイントは公式 Responses API のサブセットのみをサポートするCodex CLI 互換 backend であり、`max_output_tokens` を **サポートしないパラメータとして 400 エラーで拒否する**。
+この経路は公式 Responses API のパラメータをすべて受け付けるわけではなく、`max_output_tokens` を **サポートしないパラメータとして 400 エラーで拒否する**。
 
-LiteLLM の調査 (https://github.com/BerriAI/litellm/issues/21193) によれば、ChatGPT Codex backend が受け付けるパラメータは以下に限られる:
+LiteLLM の調査 (https://github.com/BerriAI/litellm/issues/21193) によれば、この経路が受け付けるパラメータは以下に限られる:
 
 ```
 model, input, instructions, stream, store, include,

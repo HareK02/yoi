@@ -1,6 +1,6 @@
 # LLM プロバイダ統合の外部事例
 
-調査日: 2026-04-19。認証経路・`ollama launch` 等の時事的項目は陳腐化が早い。数値・URLは一次ソースで再確認すること。
+調査日: 2026-04-19。プロバイダ認証経路・`ollama launch` 等の時事的項目は陳腐化が早い。数値・URLは一次ソースで再確認すること。
 
 ## 各ハーネスのプロバイダ対応方式
 
@@ -15,7 +15,7 @@
 - Vercel AI SDK + Models.dev で 75+ プロバイダ
 - 認証は `~/.local/share/opencode/auth.json` に統一保存（OAuth / APIキー / その他の3種別）
 - **2026-03-19 に Anthropic OAuth 対応を削除**（PR #18186）。詳細は後述
-- ChatGPT のブラウザ OAuth (`/connect`) は存続
+- ChatGPT ブラウザ認証 (`/connect`) は存続
 - https://opencode.ai/docs/providers/
 
 ### OpenClaw
@@ -38,13 +38,13 @@
   - `packages/opencode/src/session/prompt/anthropic-20250930.txt`（Claude Code 風システムプロンプト）
   - `opencode-anthropic-auth@0.0.13` ビルトインプラグイン
   - `claude-code-20250219` beta ヘッダ
-- 代替検討: `claude -p` (Claude Code の headless mode) を subprocess で呼ぶ方式。ACP ではなく素朴な CLI fork。Anthropic ToS 的には採用しない（明確な裁定なし）
+- 代替検討: `claude -p` (Claude Code の headless mode) を subprocess で呼ぶ方式。ACP ではなく素朴な CLI fork であり、insomnia では採用しない
 - https://code.claude.com/docs/en/legal-and-compliance
 - https://github.com/sst/opencode/pull/18186
 
-### OpenAI (ChatGPT Plus / Pro via Codex CLI) ── 互換経路
-- Codex CLI は Apache-2.0。openai/codex Discussion #8338 で OpenAI 社員が fork・改変自由と明言
-- ChatGPT OAuth を他ツールから使う行為を service terms で名指し禁止する条項は未確認
+### OpenAI (Codex CLI / Responses)
+- Codex CLI は Apache-2.0 で公開されている。insomnia の Codex OAuth 経路は、Codex CLI と同じ Responses 系 wire behavior に寄せる
+- Codex CLI の認証ストアと conversation header / request compression / SSE behavior を参考にする
 - OpenCode の `/connect` で ChatGPT ブラウザ認証が通る
 - コミュニティ評価: 「Anthropic は walled garden、OpenAI はむしろ取り込みに来た」
 - https://github.com/openai/codex/discussions/8338
@@ -54,7 +54,7 @@
 - `claude --print` / `claude -p` は Claude Code の非対話（headless）モード。プロンプトを stdin/引数で受け stdout に返す
 - **ACP ではなく素朴な subprocess 呼び出し**
 - OpenClaw と OpenCode コミュニティフォーク (`griffinmartin/opencode-claude-auth`) が採用
-- OAuth 経路ではないため 2026-01-09 のブロックは回避できるが、Anthropic ToS の「第三者ツールでの資格情報経由」禁止条項に抵触する可能性（明確な裁定なし）
+- insomnia では専用 API integration ではないため採用しない
 
 ## Ollama の統合機構
 
@@ -225,7 +225,7 @@ parallel tool calls 可否、tool_choice 対応度。DeepSeek reasoner のよう
 
 ### 第一級サポート（専用アダプタ）
 - **Ollama API** — ローカル + `:cloud` サフィックスで透過的にクラウド中継。エンドポイントは `localhost:11434` で統一
-- **Codex OAuth 経路** — `~/.codex/auth.json` を読み ChatGPT 枠を利用。Codex CLI 互換（Apache-2.0、社員が fork 自由と明言、ToS に名指し禁止なし）
+- **Codex OAuth** — `~/.codex/auth.json` を読み、Codex CLI 互換の Responses 経路として扱う。conversation header / compression / SSE behavior は公開実装に合わせる
 - **Anthropic API** — 従量 API key 経路のみ
 
 ### 二次サポート（共通 OpenAI 互換枠）
@@ -233,8 +233,8 @@ parallel tool calls 可否、tool_choice 対応度。DeepSeek reasoner のよう
 - ルーター系は後追いで追加しやすい宣言型設計
 
 ### 非サポート
-- **Claude Pro/Max OAuth 経路** — 2026-01-09 サーバ側ブロック、2026-02-19 ToS で明文禁止。リスクが第一級機能に見合わない
-- `claude -p` CLI fork も同様に採用しないなので実装しない
+- **Claude Pro/Max OAuth 経路** — 2026-01-09 サーバ側ブロック、2026-02-19 に第三者ツール経由の利用制限を明文化。第一級機能としては採用しない
+- `claude -p` CLI fork も専用 API integration ではないため実装しない
 
 ### 実装原則
 - 認証アダプタ（外部 CLI の認証ストアを読む類）は llm-worker 直下ではなく上位アダプタ層に配置。llm-worker は低レベル基盤に留める原則（project memory）と整合
