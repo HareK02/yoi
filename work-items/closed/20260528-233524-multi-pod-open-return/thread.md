@@ -1,13 +1,25 @@
+<!-- event: create author: tickets.sh at: 2026-05-28T23:35:24Z -->
+
+## Created
+
+Created by tickets.sh create.
+
+---
+
+<!-- event: close author: hare at: 2026-05-28T23:57:49Z status: closed -->
+
+## Closed
+
 ---
 id: 20260528-233524-multi-pod-open-return
 slug: multi-pod-open-return
 title: Return to multi-Pod view after opening a Pod
-status: open
+status: closed
 kind: task
 priority: P2
 labels: [tui, pod, ux]
 created_at: 2026-05-28T23:35:24Z
-updated_at: 2026-05-28T23:35:24Z
+updated_at: 2026-05-28T23:57:49Z
 assignee: null
 legacy_ticket: null
 ---
@@ -78,3 +90,6 @@ loop:
 - Protocol changes.
 - Changing direct-send semantics.
 - Changing Pod visibility/discovery rules.
+
+
+---
