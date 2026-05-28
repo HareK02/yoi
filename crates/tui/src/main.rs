@@ -4,6 +4,7 @@ mod cache;
 mod command;
 mod input;
 mod markdown;
+mod multi_pod;
 mod picker;
 mod pod_list;
 mod scroll;
@@ -71,6 +72,10 @@ enum Mode {
     /// `tui --session <UUID>`: skip the picker, go straight to the
     /// resume name dialog with `id` baked in.
     ResumeWithSession(SegmentId),
+    /// `tui --multi`: open the multi-Pod dashboard. This is intentionally
+    /// separate from `-r`/`--resume`, which keeps its single-Pod picker
+    /// meaning.
+    Multi,
 }
 
 #[derive(Debug)]
@@ -101,9 +106,11 @@ where
 {
     let args: Vec<String> = args.into_iter().map(Into::into).collect();
     let mut resume = false;
+    let mut multi = false;
     let mut session: Option<SegmentId> = None;
     let mut pod: Option<String> = None;
     let mut socket_override: Option<PathBuf> = None;
+    let mut socket_seen = false;
     let mut positional: Option<String> = None;
 
     let mut i = 0;
@@ -111,6 +118,10 @@ where
         match args[i].as_str() {
             "-r" | "--resume" => {
                 resume = true;
+                i += 1;
+            }
+            "--multi" => {
+                multi = true;
                 i += 1;
             }
             "--session" => {
@@ -129,6 +140,7 @@ where
                 i += 2;
             }
             "--socket" => {
+                socket_seen = true;
                 let raw = args
                     .get(i + 1)
                     .ok_or(ParseError::MissingValue("--socket"))?;
@@ -145,6 +157,35 @@ where
                 i += 1;
             }
         }
+    }
+
+    if multi {
+        if resume {
+            return Err(ParseError::Conflict(
+                "--multi and --resume are mutually exclusive",
+            ));
+        }
+        if session.is_some() {
+            return Err(ParseError::Conflict(
+                "--multi and --session are mutually exclusive",
+            ));
+        }
+        if pod.is_some() {
+            return Err(ParseError::Conflict(
+                "--multi and --pod are mutually exclusive",
+            ));
+        }
+        if positional.is_some() {
+            return Err(ParseError::Conflict(
+                "--multi cannot be used with a positional Pod name",
+            ));
+        }
+        if socket_seen {
+            return Err(ParseError::Conflict(
+                "--multi and --socket are mutually exclusive",
+            ));
+        }
+        return Ok(Mode::Multi);
     }
 
     if resume && session.is_some() {
@@ -212,6 +253,7 @@ async fn main() -> ExitCode {
         } => run_pod_name(pod_name, socket_override).await,
         Mode::Resume => run_resume().await,
         Mode::ResumeWithSession(id) => run_spawn(Some(id)).await,
+        Mode::Multi => run_multi().await,
     };
 
     // Always restore the terminal first so any pending eprintln below
@@ -309,6 +351,25 @@ async fn run_resume() -> Result<(), Box<dyn std::error::Error>> {
         PickerOutcome::Cancelled => return Ok(()),
     };
     run_pod_name(pod_name, socket_override).await
+}
+
+async fn run_multi() -> Result<(), Box<dyn std::error::Error>> {
+    let mut terminal = enter_fullscreen()?;
+    let outcome = multi_pod::run(&mut terminal).await;
+
+    let _ = execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    );
+
+    match outcome? {
+        multi_pod::MultiPodOutcome::Quit => Ok(()),
+        multi_pod::MultiPodOutcome::Open {
+            pod_name,
+            socket_override,
+        } => run_pod_name(pod_name, socket_override).await,
+    }
 }
 
 async fn run_spawn(resume_from: Option<SegmentId>) -> Result<(), Box<dyn std::error::Error>> {
@@ -946,6 +1007,54 @@ mod tests {
             err.to_string(),
             "--pod and --session are mutually exclusive"
         );
+    }
+
+    #[test]
+    fn parse_multi_mode() {
+        match parse_args_from(["--multi"]).unwrap() {
+            Mode::Multi => {}
+            _ => panic!("expected Multi mode"),
+        }
+    }
+
+    #[test]
+    fn parse_multi_conflicts_are_clear() {
+        let segment_id = session_store::new_segment_id().to_string();
+        let cases = [
+            (
+                vec!["--multi".to_string(), "--resume".to_string()],
+                "--multi and --resume are mutually exclusive",
+            ),
+            (
+                vec!["--multi".to_string(), "--session".to_string(), segment_id],
+                "--multi and --session are mutually exclusive",
+            ),
+            (
+                vec![
+                    "--multi".to_string(),
+                    "--pod".to_string(),
+                    "agent".to_string(),
+                ],
+                "--multi and --pod are mutually exclusive",
+            ),
+            (
+                vec!["--multi".to_string(), "agent".to_string()],
+                "--multi cannot be used with a positional Pod name",
+            ),
+            (
+                vec![
+                    "--multi".to_string(),
+                    "--socket".to_string(),
+                    "/tmp/a.sock".to_string(),
+                ],
+                "--multi and --socket are mutually exclusive",
+            ),
+        ];
+
+        for (args, message) in cases {
+            let err = parse_args_from(args).unwrap_err();
+            assert_eq!(err.to_string(), message);
+        }
     }
 
     #[tokio::test]
