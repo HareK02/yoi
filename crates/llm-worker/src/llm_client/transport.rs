@@ -6,7 +6,7 @@
 
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use eventsource_stream::Eventsource;
@@ -14,6 +14,7 @@ use futures::{Stream, StreamExt, TryStreamExt};
 use reqwest::header::{
     ACCEPT, CONTENT_ENCODING, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, RETRY_AFTER,
 };
+use serde_json::{Value, json};
 
 use super::auth::{AuthProvider, AuthRequirement};
 use super::capability::ModelCapability;
@@ -23,7 +24,7 @@ use super::event::Event;
 use super::scheme::Scheme;
 use super::types::{Request, RequestConfig};
 
-pub const DEFAULT_STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
+pub const DEFAULT_STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(20);
 pub const DEFAULT_FIRST_STREAM_EVENT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// `AuthRef` を解決したランタイム表現。`crates/provider` が構築する。
@@ -192,16 +193,71 @@ impl<S: Scheme> HttpTransport<S> {
         }
 
         let raw = serde_json::to_vec(body)?;
+        let raw_json_bytes = raw.len();
         let compressed = zstd::stream::encode_all(std::io::Cursor::new(raw), 3)
             .map_err(|e| ClientError::Config(format!("failed to zstd-compress request: {e}")))?;
         headers.insert(CONTENT_ENCODING, HeaderValue::from_static("zstd"));
-        Ok(RequestBody::CompressedJson(compressed))
+        Ok(RequestBody::CompressedJson {
+            bytes: compressed,
+            raw_json_bytes,
+        })
     }
 }
 
 enum RequestBody {
     Json(serde_json::Value),
-    CompressedJson(Vec<u8>),
+    CompressedJson {
+        bytes: Vec<u8>,
+        raw_json_bytes: usize,
+    },
+}
+
+impl RequestBody {
+    fn encoding(&self) -> &'static str {
+        match self {
+            Self::Json(_) => "json",
+            Self::CompressedJson { .. } => "zstd",
+        }
+    }
+
+    fn raw_json_bytes(&self) -> Option<usize> {
+        match self {
+            Self::Json(body) => serde_json::to_vec(body).ok().map(|bytes| bytes.len()),
+            Self::CompressedJson { raw_json_bytes, .. } => Some(*raw_json_bytes),
+        }
+    }
+
+    fn wire_bytes(&self) -> Option<usize> {
+        match self {
+            Self::Json(body) => serde_json::to_vec(body).ok().map(|bytes| bytes.len()),
+            Self::CompressedJson { bytes, .. } => Some(bytes.len()),
+        }
+    }
+}
+
+fn auth_kind(auth: &ResolvedAuth) -> &'static str {
+    match auth {
+        ResolvedAuth::None => "none",
+        ResolvedAuth::ApiKey(_) => "api_key",
+        ResolvedAuth::Custom(_) => "custom",
+    }
+}
+
+fn emit_transport_trace(request: &Request, label: &str, data: Value) {
+    if let Some(trace) = &request.transport_trace {
+        trace.emit(label, data);
+    }
+}
+
+fn json_value_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
 }
 
 async fn response_with_timeout(
@@ -273,26 +329,174 @@ impl<S: Scheme + Clone + 'static> LlmClient for HttpTransport<S> {
     }
 
     async fn stream(&self, request: Request) -> Result<ResponseStream, ClientError> {
+        let total_started = Instant::now();
+        let path = self.scheme.path(&self.model_id);
+        emit_transport_trace(
+            &request,
+            "transport_start",
+            json!({
+                "model": &self.model_id,
+                "path": path,
+                "auth_kind": auth_kind(&self.auth),
+                "required_auth": format!("{:?}", self.scheme.required_auth()),
+                "codex_backend": self.is_codex_backend(),
+                "cache_key_present": request.cache_key.is_some(),
+                "stream_open_timeout_ms": DEFAULT_STREAM_OPEN_TIMEOUT.as_millis() as u64,
+            }),
+        );
+
         let url = self.build_url();
-        let mut headers = self.build_headers().await?;
-        self.apply_stream_headers(&mut headers, &request)?;
+        let headers_started = Instant::now();
+        emit_transport_trace(
+            &request,
+            "transport_headers_start",
+            json!({
+                "auth_kind": auth_kind(&self.auth),
+                "required_auth": format!("{:?}", self.scheme.required_auth()),
+            }),
+        );
+        let mut headers = match self.build_headers().await {
+            Ok(headers) => {
+                emit_transport_trace(
+                    &request,
+                    "transport_headers_done",
+                    json!({
+                        "elapsed_ms": headers_started.elapsed().as_millis() as u64,
+                        "headers_len": headers.len(),
+                    }),
+                );
+                headers
+            }
+            Err(error) => {
+                emit_transport_trace(
+                    &request,
+                    "transport_headers_error",
+                    json!({
+                        "elapsed_ms": headers_started.elapsed().as_millis() as u64,
+                        "error": error.to_string(),
+                    }),
+                );
+                return Err(error);
+            }
+        };
+
+        let stream_headers_started = Instant::now();
+        if let Err(error) = self.apply_stream_headers(&mut headers, &request) {
+            emit_transport_trace(
+                &request,
+                "transport_stream_headers_error",
+                json!({
+                    "elapsed_ms": stream_headers_started.elapsed().as_millis() as u64,
+                    "error": error.to_string(),
+                }),
+            );
+            return Err(error);
+        }
+        emit_transport_trace(
+            &request,
+            "transport_stream_headers_done",
+            json!({
+                "elapsed_ms": stream_headers_started.elapsed().as_millis() as u64,
+                "headers_len": headers.len(),
+            }),
+        );
+
+        let body_started = Instant::now();
+        emit_transport_trace(&request, "transport_body_build_start", json!({}));
         let body = self
             .scheme
             .build_request_body(&self.model_id, &request, &self.capability);
-        let request_body = self.encode_request_body(&body, &mut headers)?;
+        emit_transport_trace(
+            &request,
+            "transport_body_build_done",
+            json!({
+                "elapsed_ms": body_started.elapsed().as_millis() as u64,
+                "body_kind": json_value_kind(&body),
+            }),
+        );
+
+        let encode_started = Instant::now();
+        let request_body = match self.encode_request_body(&body, &mut headers) {
+            Ok(body) => body,
+            Err(error) => {
+                emit_transport_trace(
+                    &request,
+                    "transport_body_encode_error",
+                    json!({
+                        "elapsed_ms": encode_started.elapsed().as_millis() as u64,
+                        "error": error.to_string(),
+                    }),
+                );
+                return Err(error);
+            }
+        };
+        emit_transport_trace(
+            &request,
+            "transport_body_encode_done",
+            json!({
+                "elapsed_ms": encode_started.elapsed().as_millis() as u64,
+                "encoding": request_body.encoding(),
+                "raw_json_bytes": request_body.raw_json_bytes(),
+                "wire_bytes": request_body.wire_bytes(),
+            }),
+        );
 
         let builder = self.http_client.post(&url).headers(headers);
         let builder = match request_body {
             RequestBody::Json(body) => builder.json(&body),
-            RequestBody::CompressedJson(body) => builder.body(body),
+            RequestBody::CompressedJson { bytes, .. } => builder.body(bytes),
         };
+
+        let send_started = Instant::now();
+        emit_transport_trace(&request, "transport_http_send_start", json!({}));
         let response =
-            response_with_timeout(builder.send(), DEFAULT_STREAM_OPEN_TIMEOUT, "stream_open")
-                .await?;
+            match response_with_timeout(builder.send(), DEFAULT_STREAM_OPEN_TIMEOUT, "stream_open")
+                .await
+            {
+                Ok(response) => {
+                    emit_transport_trace(
+                        &request,
+                        "transport_http_headers_received",
+                        json!({
+                            "elapsed_ms": send_started.elapsed().as_millis() as u64,
+                            "status": response.status().as_u16(),
+                            "success": response.status().is_success(),
+                        }),
+                    );
+                    response
+                }
+                Err(error) => {
+                    emit_transport_trace(
+                        &request,
+                        "transport_http_send_error",
+                        json!({
+                            "elapsed_ms": send_started.elapsed().as_millis() as u64,
+                            "error": error.to_string(),
+                        }),
+                    );
+                    return Err(error);
+                }
+            };
 
         if !response.status().is_success() {
+            emit_transport_trace(
+                &request,
+                "transport_http_status_error",
+                json!({
+                    "status": response.status().as_u16(),
+                    "retry_after_present": response.headers().get(RETRY_AFTER).is_some(),
+                }),
+            );
             return Err(classify_error_response(response).await);
         }
+
+        emit_transport_trace(
+            &request,
+            "transport_stream_ready",
+            json!({
+                "elapsed_ms": total_started.elapsed().as_millis() as u64,
+            }),
+        );
 
         let scheme = self.scheme.clone();
         let byte_stream = response.bytes_stream().map_err(std::io::Error::other);
@@ -449,9 +653,14 @@ mod tests {
         assert_eq!(headers.get("x-client-request-id").unwrap(), "segment-123");
         assert_eq!(headers.get(CONTENT_ENCODING).unwrap(), "zstd");
 
-        let RequestBody::CompressedJson(compressed) = encoded else {
+        let RequestBody::CompressedJson {
+            bytes: compressed,
+            raw_json_bytes,
+        } = encoded
+        else {
             panic!("Codex backend request body must be zstd-compressed");
         };
+        assert!(raw_json_bytes > 0);
         let decoded = zstd::stream::decode_all(std::io::Cursor::new(compressed)).unwrap();
         let decoded: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
         assert_eq!(decoded["prompt_cache_key"], "segment-123");
