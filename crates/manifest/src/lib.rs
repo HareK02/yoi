@@ -363,8 +363,8 @@ pub struct CompactionConfig {
     /// Checked by the Controller after each run. When current occupancy
     /// exceeds this value, compact runs before the next turn. `None`
     /// disables the between-turns check.
-    #[serde(default)]
-    pub compact_threshold: Option<u64>,
+    #[serde(default, alias = "compact_threshold")]
+    pub threshold: Option<u64>,
 
     /// Safety-net (between-requests) compaction threshold.
     ///
@@ -373,32 +373,76 @@ pub struct CompactionConfig {
     /// Controller can compact before the next LLM request. `None`
     /// disables the between-requests check.
     ///
-    /// Expected relation: `compact_threshold < compact_request_threshold`
-    /// (proactive triggers before safety net). A reversed configuration
-    /// is accepted but logged as a warning.
-    #[serde(default)]
-    pub compact_request_threshold: Option<u64>,
+    /// Expected relation: `threshold < request_threshold` (proactive triggers
+    /// before safety net). A reversed configuration is accepted but logged as
+    /// a warning.
+    #[serde(default, alias = "compact_request_threshold")]
+    pub request_threshold: Option<u64>,
 
     /// Token budget retained verbatim at the tail of the history after
     /// compaction. Measured against the occupancy estimate from
     /// `UsageRecord` history; turn boundaries are ignored.
-    #[serde(default = "default_compact_retained_tokens")]
-    pub compact_retained_tokens: u64,
+    #[serde(default = "default_retained_tokens", alias = "compact_retained_tokens")]
+    pub retained_tokens: u64,
 
-    /// Aggregate token budget for auto-read file contents injected into
-    /// the compacted session by the compact worker.
-    #[serde(default = "default_compact_auto_read_budget")]
-    pub compact_auto_read_budget: u64,
+    /// Target size for the deterministic overview/index fed to the compact
+    /// worker. Overshooting this target is not an error.
+    #[serde(default = "default_overview_target_tokens")]
+    pub overview_target_tokens: u64,
+
+    /// Warning threshold for deterministic overview/index size.
+    #[serde(default = "default_overview_warning_tokens")]
+    pub overview_warning_tokens: u64,
+
+    /// Deadline threshold for deterministic overview/index generation.
+    /// Oversized overviews fall back to a coarser deterministic index.
+    #[serde(default = "default_overview_deadline_tokens")]
+    pub overview_deadline_tokens: u64,
 
     /// Current prompt-occupancy cap for the compact worker's own LLM
     /// requests. Exceeding this aborts the compact run.
-    #[serde(default = "default_compact_worker_max_input_tokens")]
-    pub compact_worker_max_input_tokens: u64,
+    #[serde(
+        default = "default_worker_context_max_tokens",
+        alias = "compact_worker_max_input_tokens"
+    )]
+    pub worker_context_max_tokens: u64,
+
+    /// Remaining compact-worker context threshold that triggers a warning and
+    /// an instruction to stop exploring and call `write_summary`.
+    #[serde(default = "default_finish_warning_remaining_tokens")]
+    pub finish_warning_remaining_tokens: u64,
+
+    /// Context reserve preserved for final summary/tool closing turns.
+    #[serde(default = "default_final_reserve_tokens")]
+    pub final_reserve_tokens: u64,
 
     /// Optional maximum compact-worker tool-loop depth. `None` leaves the
     /// worker unlimited; the default bounds runaway short-context loops.
-    #[serde(default = "default_compact_worker_max_turns")]
-    pub compact_worker_max_turns: Option<u32>,
+    #[serde(
+        default = "default_worker_max_turns",
+        alias = "compact_worker_max_turns"
+    )]
+    pub worker_max_turns: Option<u32>,
+
+    /// Target size for the `write_summary` text. Used in prompt/nudge text.
+    #[serde(default = "default_summary_target_tokens")]
+    pub summary_target_tokens: u64,
+
+    /// Hard validation cap for the final `write_summary` text.
+    #[serde(default = "default_summary_max_tokens")]
+    pub summary_max_tokens: u64,
+
+    /// Aggregate token budget for auto-read file contents injected into
+    /// the compacted session by the compact worker.
+    #[serde(
+        default = "default_auto_read_budget_tokens",
+        alias = "compact_auto_read_budget"
+    )]
+    pub auto_read_budget_tokens: u64,
+
+    /// Dry-run cap for the compacted session's initial request context.
+    #[serde(default = "default_result_context_max_tokens")]
+    pub result_context_max_tokens: u64,
 
     /// Optional model for the compactor (summary) LLM.
     /// If omitted, the main model is cloned via `clone_boxed()`.
@@ -412,17 +456,41 @@ fn default_prune_protected_tokens() -> u64 {
 fn default_prune_min_savings() -> u64 {
     defaults::PRUNE_MIN_SAVINGS
 }
-fn default_compact_retained_tokens() -> u64 {
+fn default_retained_tokens() -> u64 {
     defaults::COMPACT_RETAINED_TOKENS
 }
-fn default_compact_auto_read_budget() -> u64 {
-    defaults::COMPACT_AUTO_READ_BUDGET
+fn default_overview_target_tokens() -> u64 {
+    defaults::COMPACT_OVERVIEW_TARGET_TOKENS
 }
-fn default_compact_worker_max_input_tokens() -> u64 {
+fn default_overview_warning_tokens() -> u64 {
+    defaults::COMPACT_OVERVIEW_WARNING_TOKENS
+}
+fn default_overview_deadline_tokens() -> u64 {
+    defaults::COMPACT_OVERVIEW_DEADLINE_TOKENS
+}
+fn default_worker_context_max_tokens() -> u64 {
     defaults::COMPACT_WORKER_MAX_INPUT_TOKENS
 }
-fn default_compact_worker_max_turns() -> Option<u32> {
+fn default_finish_warning_remaining_tokens() -> u64 {
+    defaults::COMPACT_FINISH_WARNING_REMAINING_TOKENS
+}
+fn default_final_reserve_tokens() -> u64 {
+    defaults::COMPACT_FINAL_RESERVE_TOKENS
+}
+fn default_worker_max_turns() -> Option<u32> {
     defaults::COMPACT_WORKER_MAX_TURNS
+}
+fn default_summary_target_tokens() -> u64 {
+    defaults::COMPACT_SUMMARY_TARGET_TOKENS
+}
+fn default_summary_max_tokens() -> u64 {
+    defaults::COMPACT_SUMMARY_MAX_TOKENS
+}
+fn default_auto_read_budget_tokens() -> u64 {
+    defaults::COMPACT_AUTO_READ_BUDGET
+}
+fn default_result_context_max_tokens() -> u64 {
+    defaults::COMPACT_RESULT_CONTEXT_MAX_TOKENS
 }
 
 impl Default for CompactionConfig {
@@ -430,12 +498,20 @@ impl Default for CompactionConfig {
         Self {
             prune_protected_tokens: default_prune_protected_tokens(),
             prune_min_savings: default_prune_min_savings(),
-            compact_threshold: None,
-            compact_request_threshold: None,
-            compact_retained_tokens: default_compact_retained_tokens(),
-            compact_auto_read_budget: default_compact_auto_read_budget(),
-            compact_worker_max_input_tokens: default_compact_worker_max_input_tokens(),
-            compact_worker_max_turns: default_compact_worker_max_turns(),
+            threshold: None,
+            request_threshold: None,
+            retained_tokens: default_retained_tokens(),
+            overview_target_tokens: default_overview_target_tokens(),
+            overview_warning_tokens: default_overview_warning_tokens(),
+            overview_deadline_tokens: default_overview_deadline_tokens(),
+            worker_context_max_tokens: default_worker_context_max_tokens(),
+            finish_warning_remaining_tokens: default_finish_warning_remaining_tokens(),
+            final_reserve_tokens: default_final_reserve_tokens(),
+            worker_max_turns: default_worker_max_turns(),
+            summary_target_tokens: default_summary_target_tokens(),
+            summary_max_tokens: default_summary_max_tokens(),
+            auto_read_budget_tokens: default_auto_read_budget_tokens(),
+            result_context_max_tokens: default_result_context_max_tokens(),
             model: None,
         }
     }
@@ -592,15 +668,15 @@ model_id = "claude-sonnet-4-20250514"
 
     #[test]
     fn parse_compaction_config() {
-        let toml = format!("{MINIMAL_REQUIRED}\n[compaction]\ncompact_threshold = 80000\n");
+        let toml = format!("{MINIMAL_REQUIRED}\n[compaction]\nthreshold = 80000\n");
         let manifest = PodManifest::from_toml(&toml).unwrap();
         let c = manifest.compaction.unwrap();
         assert_eq!(c.prune_protected_tokens, 8000);
         assert_eq!(c.prune_min_savings, 4096);
-        assert_eq!(c.compact_threshold, Some(80000));
-        assert_eq!(c.compact_request_threshold, None);
-        assert_eq!(c.compact_retained_tokens, 8000);
-        assert_eq!(c.compact_worker_max_turns, Some(20));
+        assert_eq!(c.threshold, Some(80000));
+        assert_eq!(c.request_threshold, None);
+        assert_eq!(c.retained_tokens, 8000);
+        assert_eq!(c.worker_max_turns, Some(20));
     }
 
     #[test]
@@ -618,11 +694,11 @@ model_id = "claude-sonnet-4-20250514"
         let toml = format!(
             "{MINIMAL_REQUIRED}\n\
              [compaction]\n\
-             compact_worker_max_turns = 7\n"
+             worker_max_turns = 7\n"
         );
         let manifest = PodManifest::from_toml(&toml).unwrap();
         let c = manifest.compaction.unwrap();
-        assert_eq!(c.compact_worker_max_turns, Some(7));
+        assert_eq!(c.worker_max_turns, Some(7));
     }
 
     #[test]
@@ -630,13 +706,13 @@ model_id = "claude-sonnet-4-20250514"
         let toml = format!(
             "{MINIMAL_REQUIRED}\n\
              [compaction]\n\
-             compact_threshold = 80000\n\
-             compact_request_threshold = 90000\n"
+             threshold = 80000\n\
+             request_threshold = 90000\n"
         );
         let manifest = PodManifest::from_toml(&toml).unwrap();
         let c = manifest.compaction.unwrap();
-        assert_eq!(c.compact_threshold, Some(80000));
-        assert_eq!(c.compact_request_threshold, Some(90000));
+        assert_eq!(c.threshold, Some(80000));
+        assert_eq!(c.request_threshold, Some(90000));
     }
 
     #[test]
@@ -644,12 +720,12 @@ model_id = "claude-sonnet-4-20250514"
         let toml = format!(
             "{MINIMAL_REQUIRED}\n\
              [compaction]\n\
-             compact_request_threshold = 90000\n"
+             request_threshold = 90000\n"
         );
         let manifest = PodManifest::from_toml(&toml).unwrap();
         let c = manifest.compaction.unwrap();
-        assert_eq!(c.compact_threshold, None);
-        assert_eq!(c.compact_request_threshold, Some(90000));
+        assert_eq!(c.threshold, None);
+        assert_eq!(c.request_threshold, Some(90000));
     }
 
     #[test]
@@ -657,7 +733,7 @@ model_id = "claude-sonnet-4-20250514"
         let toml = format!(
             "{MINIMAL_REQUIRED}\n\
              [compaction]\n\
-             compact_threshold = 80000\n\n\
+             threshold = 80000\n\n\
              [compaction.model]\n\
              scheme = \"gemini\"\n\
              model_id = \"gemini-2.0-flash\"\n"

@@ -72,11 +72,11 @@ pub struct ToolOutput {
 
 **ターンの合間が proactive (小さい閾値)**:
 turn が完了した地点はタスクの自然な区切り。ここで先を見越して早めに compact する。
-マニフェストの `compact_threshold` が対応。
+マニフェストの `threshold` が対応。
 
 **リクエストの合間は safety net (大きい閾値)**:
 turn 内部でリクエストの合間にチェックするのは「暴走的に膨張した場合のみ止める」用途。
-マニフェストの `compact_request_threshold` が対応。通常は発動しない。
+マニフェストの `request_threshold` が対応。通常は発動しない。
 
 **両閾値は manifest で個別指定する**。過去の設計では 9/8 倍で自動導出していたが、
 比率に根拠がなかったため廃止。両方が `Option<u64>` で、片方だけの設定も可能
@@ -137,14 +137,28 @@ compact は fork と同じ構造。旧セッションを保全し、新 SessionI
 
 ```toml
 [compaction]
-compact_threshold = 80000              # ターンの合間 (proactive)
-compact_request_threshold = 90000      # リクエストの合間 (safety net)
-prune_protected_tokens = 8000       # prune から保護する末尾 token budget
-compact_retained_tokens = 8000      # compact 後に生のまま残す末尾 token budget
-compact_auto_read_budget = 8000     # compact worker の mark_read_required 合計上限
-compact_worker_max_input_tokens = 50000 # compact worker 自身の現在占有トークン上限
-compact_worker_max_turns = 20           # compact worker 自身の tool loop 上限
+threshold = 80000                  # ターンの合間 (proactive)
+request_threshold = 90000          # リクエストの合間 (safety net)
+prune_protected_tokens = 8000      # prune から保護する末尾 token budget
+retained_tokens = 8000             # compact 後に生のまま残す末尾 token budget
+
+overview_target_tokens = 8000      # compact worker 初期 overview の通常目標
+overview_warning_tokens = 16000    # 超えたら警告・trace、compact は続行
+overview_deadline_tokens = 40000   # 超えたら粗い overview へ fallback
+
+worker_context_max_tokens = 50000          # compact worker session 全体の hard limit
+finish_warning_remaining_tokens = 8000     # 残りが少ないため write_summary へ進める勧告
+final_reserve_tokens = 4000                # 最終 summary/closing turn 用 reserve
+worker_max_turns = 20                      # compact worker 自身の tool loop 上限
+
+summary_target_tokens = 1500       # write_summary の目標サイズ
+summary_max_tokens = 3000          # write_summary の hard validation
+auto_read_budget_tokens = 8000     # compact 後に注入する file content 合計上限
+result_context_max_tokens = 24000  # 新 session 初期 context の dry-run validation
 ```
+
+`compact_*` prefix の旧 key は互換 alias として読み取るが、`[compaction]` 内の新規 key は prefix なしを正とする。
+初期 overview の target/warning は効率のための目安で、通常は hard error にしない。deadline 超過時も、可能なら deterministic に粗い overview へ fallback して compact の完走を優先する。
 
 ### Auto-Read とリファレンス
 
@@ -176,8 +190,9 @@ auto-read も通常の history 内 system message なので、将来の Prune/Co
 
 ## compact worker
 
-要約生成とファイル選定を行う使い捨て Worker。ツールなし・1リクエストの現行実装から、
-ツール付きマルチターンに改善する。
+要約生成とファイル選定を行う使い捨て Worker。Pod は compact 対象 prefix を全文投入せず、User / Assistant / System を優先した bounded overview と tool index を初期 input として渡す。Tool call arguments、tool result full content、reasoning body は初期 input には載せない。
+
+初期 overview は `overview_target_tokens` を目標にする。`overview_warning_tokens` を超えた場合は警告・trace を記録して続行し、`overview_deadline_tokens` を超えた場合は粗い deterministic overview へ fallback する。Compact の目的は完走なので、初期 input が少し大きいだけでは hard error にしない。
 
 ### ツール
 
@@ -192,13 +207,19 @@ write_summary(text)                       — 構造化要約を出力/上書き
 
 1. Pod が `tools::Tracker::recent_files(5)` で最近触られたファイルを抽出（デフォルトリファレンス）
 2. compact worker にプロンプトとして渡す:
-   - pruned history（summary only、arguments/reasoning 除去）
+   - bounded overview / index（User / Assistant / System 優先）
    - デフォルトリファレンスの一覧
+   - TaskStore snapshot
 3. compact worker が自律的に:
    - read_file で各ファイルを読み、必要性を判断
    - mark_read_required / add_reference で指定
    - write_summary で構造化要約を出力（呼び直し可）
-4. ターン終了時に write_summary 未呼び出し or read_required 空（かつファイル操作履歴がある場合）→ 追加プロンプトで促す
+4. CompactWorkerInterceptor が worker session 全体の context occupancy を監視する:
+   - `finish_warning_remaining_tokens` 到達時に「探索を切り上げて write_summary へ進め」と Worker history に永続化される warning を挿入し、人間向け warning も出す
+   - `final_reserve_tokens` を割った後は `write_summary` 以外の探索 tool call に synthetic error を返し、最終 summary の余白を守る
+   - `worker_context_max_tokens` 超過は最後の hard stop
+5. ターン終了時に write_summary 未呼び出し or read_required 空（かつファイル操作履歴がある場合）→ 追加プロンプトで促す
+6. `summary_max_tokens` と `result_context_max_tokens` で compact 結果を検証してから新 session を作る
 
 ### 構造化要約の要件
 

@@ -125,18 +125,34 @@ pub struct CompactionConfigPartial {
     pub prune_protected_tokens: Option<u64>,
     #[serde(default)]
     pub prune_min_savings: Option<u64>,
+    #[serde(default, alias = "compact_threshold")]
+    pub threshold: Option<u64>,
+    #[serde(default, alias = "compact_request_threshold")]
+    pub request_threshold: Option<u64>,
+    #[serde(default, alias = "compact_retained_tokens")]
+    pub retained_tokens: Option<u64>,
     #[serde(default)]
-    pub compact_threshold: Option<u64>,
+    pub overview_target_tokens: Option<u64>,
     #[serde(default)]
-    pub compact_request_threshold: Option<u64>,
+    pub overview_warning_tokens: Option<u64>,
     #[serde(default)]
-    pub compact_retained_tokens: Option<u64>,
+    pub overview_deadline_tokens: Option<u64>,
+    #[serde(default, alias = "compact_worker_max_input_tokens")]
+    pub worker_context_max_tokens: Option<u64>,
     #[serde(default)]
-    pub compact_auto_read_budget: Option<u64>,
+    pub finish_warning_remaining_tokens: Option<u64>,
     #[serde(default)]
-    pub compact_worker_max_input_tokens: Option<u64>,
+    pub final_reserve_tokens: Option<u64>,
+    #[serde(default, alias = "compact_worker_max_turns")]
+    pub worker_max_turns: Option<u32>,
     #[serde(default)]
-    pub compact_worker_max_turns: Option<u32>,
+    pub summary_target_tokens: Option<u64>,
+    #[serde(default)]
+    pub summary_max_tokens: Option<u64>,
+    #[serde(default, alias = "compact_auto_read_budget")]
+    pub auto_read_budget_tokens: Option<u64>,
+    #[serde(default)]
+    pub result_context_max_tokens: Option<u64>,
     #[serde(default)]
     pub model: Option<ModelManifest>,
 }
@@ -386,22 +402,32 @@ impl CompactionConfigPartial {
         Self {
             prune_protected_tokens: upper.prune_protected_tokens.or(self.prune_protected_tokens),
             prune_min_savings: upper.prune_min_savings.or(self.prune_min_savings),
-            compact_threshold: upper.compact_threshold.or(self.compact_threshold),
-            compact_request_threshold: upper
-                .compact_request_threshold
-                .or(self.compact_request_threshold),
-            compact_retained_tokens: upper
-                .compact_retained_tokens
-                .or(self.compact_retained_tokens),
-            compact_auto_read_budget: upper
-                .compact_auto_read_budget
-                .or(self.compact_auto_read_budget),
-            compact_worker_max_input_tokens: upper
-                .compact_worker_max_input_tokens
-                .or(self.compact_worker_max_input_tokens),
-            compact_worker_max_turns: upper
-                .compact_worker_max_turns
-                .or(self.compact_worker_max_turns),
+            threshold: upper.threshold.or(self.threshold),
+            request_threshold: upper.request_threshold.or(self.request_threshold),
+            retained_tokens: upper.retained_tokens.or(self.retained_tokens),
+            overview_target_tokens: upper.overview_target_tokens.or(self.overview_target_tokens),
+            overview_warning_tokens: upper
+                .overview_warning_tokens
+                .or(self.overview_warning_tokens),
+            overview_deadline_tokens: upper
+                .overview_deadline_tokens
+                .or(self.overview_deadline_tokens),
+            worker_context_max_tokens: upper
+                .worker_context_max_tokens
+                .or(self.worker_context_max_tokens),
+            finish_warning_remaining_tokens: upper
+                .finish_warning_remaining_tokens
+                .or(self.finish_warning_remaining_tokens),
+            final_reserve_tokens: upper.final_reserve_tokens.or(self.final_reserve_tokens),
+            worker_max_turns: upper.worker_max_turns.or(self.worker_max_turns),
+            summary_target_tokens: upper.summary_target_tokens.or(self.summary_target_tokens),
+            summary_max_tokens: upper.summary_max_tokens.or(self.summary_max_tokens),
+            auto_read_budget_tokens: upper
+                .auto_read_budget_tokens
+                .or(self.auto_read_budget_tokens),
+            result_context_max_tokens: upper
+                .result_context_max_tokens
+                .or(self.result_context_max_tokens),
             model: merge_option(self.model, upper.model, ModelManifest::merge),
         }
     }
@@ -544,20 +570,42 @@ impl TryFrom<PodManifestConfig> for PodManifest {
                         .prune_protected_tokens
                         .unwrap_or(defaults::PRUNE_PROTECTED_TOKENS),
                     prune_min_savings: c.prune_min_savings.unwrap_or(defaults::PRUNE_MIN_SAVINGS),
-                    compact_threshold: c.compact_threshold,
-                    compact_request_threshold: c.compact_request_threshold,
-                    compact_retained_tokens: c
-                        .compact_retained_tokens
+                    threshold: c.threshold,
+                    request_threshold: c.request_threshold,
+                    retained_tokens: c
+                        .retained_tokens
                         .unwrap_or(defaults::COMPACT_RETAINED_TOKENS),
-                    compact_auto_read_budget: c
-                        .compact_auto_read_budget
-                        .unwrap_or(defaults::COMPACT_AUTO_READ_BUDGET),
-                    compact_worker_max_input_tokens: c
-                        .compact_worker_max_input_tokens
+                    overview_target_tokens: c
+                        .overview_target_tokens
+                        .unwrap_or(defaults::COMPACT_OVERVIEW_TARGET_TOKENS),
+                    overview_warning_tokens: c
+                        .overview_warning_tokens
+                        .unwrap_or(defaults::COMPACT_OVERVIEW_WARNING_TOKENS),
+                    overview_deadline_tokens: c
+                        .overview_deadline_tokens
+                        .unwrap_or(defaults::COMPACT_OVERVIEW_DEADLINE_TOKENS),
+                    worker_context_max_tokens: c
+                        .worker_context_max_tokens
                         .unwrap_or(defaults::COMPACT_WORKER_MAX_INPUT_TOKENS),
-                    compact_worker_max_turns: c
-                        .compact_worker_max_turns
-                        .or(defaults::COMPACT_WORKER_MAX_TURNS),
+                    finish_warning_remaining_tokens: c
+                        .finish_warning_remaining_tokens
+                        .unwrap_or(defaults::COMPACT_FINISH_WARNING_REMAINING_TOKENS),
+                    final_reserve_tokens: c
+                        .final_reserve_tokens
+                        .unwrap_or(defaults::COMPACT_FINAL_RESERVE_TOKENS),
+                    worker_max_turns: c.worker_max_turns.or(defaults::COMPACT_WORKER_MAX_TURNS),
+                    summary_target_tokens: c
+                        .summary_target_tokens
+                        .unwrap_or(defaults::COMPACT_SUMMARY_TARGET_TOKENS),
+                    summary_max_tokens: c
+                        .summary_max_tokens
+                        .unwrap_or(defaults::COMPACT_SUMMARY_MAX_TOKENS),
+                    auto_read_budget_tokens: c
+                        .auto_read_budget_tokens
+                        .unwrap_or(defaults::COMPACT_AUTO_READ_BUDGET),
+                    result_context_max_tokens: c
+                        .result_context_max_tokens
+                        .unwrap_or(defaults::COMPACT_RESULT_CONTEXT_MAX_TOKENS),
                     model: c.model,
                 })
             })
@@ -984,7 +1032,7 @@ mod tests {
     fn merge_option_struct_field_wise() {
         let lower = PodManifestConfig {
             compaction: Some(CompactionConfigPartial {
-                compact_threshold: Some(50_000),
+                threshold: Some(50_000),
                 prune_protected_tokens: Some(5_000),
                 ..Default::default()
             }),
@@ -992,14 +1040,14 @@ mod tests {
         };
         let upper = PodManifestConfig {
             compaction: Some(CompactionConfigPartial {
-                compact_threshold: Some(80_000),
+                threshold: Some(80_000),
                 ..Default::default()
             }),
             ..Default::default()
         };
         let merged = lower.merge(upper);
         let c = merged.compaction.unwrap();
-        assert_eq!(c.compact_threshold, Some(80_000));
+        assert_eq!(c.threshold, Some(80_000));
         // field from lower retained when upper has None
         assert_eq!(c.prune_protected_tokens, Some(5_000));
     }
@@ -1122,27 +1170,27 @@ stop_sequences = ["\n\n", "</stop>"]
     }
 
     #[test]
-    fn from_toml_accepts_compact_worker_max_turns() {
+    fn from_toml_accepts_worker_max_turns() {
         let cfg = PodManifestConfig::from_toml(
             r#"
 [compaction]
-compact_worker_max_turns = 7
+worker_max_turns = 7
 "#,
         )
         .unwrap();
 
-        assert_eq!(cfg.compaction.unwrap().compact_worker_max_turns, Some(7));
+        assert_eq!(cfg.compaction.unwrap().worker_max_turns, Some(7));
     }
 
     #[test]
-    fn try_from_compaction_defaults_compact_worker_max_turns() {
+    fn try_from_compaction_defaults_worker_max_turns() {
         let mut cfg = minimal_valid();
         cfg.compaction = Some(CompactionConfigPartial::default());
 
         let manifest = PodManifest::try_from(cfg).unwrap();
 
         assert_eq!(
-            manifest.compaction.unwrap().compact_worker_max_turns,
+            manifest.compaction.unwrap().worker_max_turns,
             defaults::COMPACT_WORKER_MAX_TURNS
         );
     }

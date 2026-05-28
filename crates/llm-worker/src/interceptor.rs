@@ -32,10 +32,16 @@ pub enum PromptAction {
 }
 
 /// Action before an LLM request.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum PreRequestAction {
     /// Proceed normally.
     Continue,
+    /// Proceed after appending these items to durable worker history.
+    ///
+    /// This is for upper-layer budget/status nudges that the model may react
+    /// to: the items are committed before the request so later turns can see
+    /// why the worker changed course.
+    ContinueWith(Vec<Item>),
     /// Cancel with a reason (treated as an error).
     Cancel(String),
     /// Yield control to the caller for external processing.
@@ -149,11 +155,12 @@ pub trait Interceptor: Send + Sync {
 
     /// Called before each LLM request. The context starts as a clone
     /// of `worker.history` (after `pending_history_appends` and the
-    /// Worker's own prune projection have been applied) and can be
-    /// further modified for that single request only — mutations here
-    /// are **not** persisted back to history. Use
-    /// [`Self::pending_history_appends`] for inputs that need to land
-    /// in history.
+    /// Worker's own prune projection have been applied).
+    ///
+    /// Direct mutations to `context` remain request-local and are not persisted.
+    /// If an interceptor derives a human/model-visible nudge from the current
+    /// request context, return [`PreRequestAction::ContinueWith`] so the Worker
+    /// commits it to history before the request is sent.
     async fn pre_llm_request(&self, _context: &mut Vec<Item>) -> PreRequestAction {
         PreRequestAction::Continue
     }

@@ -241,7 +241,7 @@ pub struct Pod<C: LlmClient, St: Store> {
     scope: SharedScope,
     hook_builder: HookRegistryBuilder,
     interceptor_installed: bool,
-    /// Shared compaction state (present when compact_threshold is configured).
+    /// Shared compaction state (present when threshold is configured).
     compact_state: Option<Arc<CompactState>>,
     /// Per-LLM-request Usage tracker. Always present after construction.
     /// Captures `(history_len, UsageEvent)` pairs during a run; drained
@@ -1121,8 +1121,8 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
 
     /// Install the hook-based interceptor on the Worker if not already done.
     ///
-    /// When either compaction threshold (`compact_threshold` or
-    /// `compact_request_threshold`) is configured in the manifest, allocates
+    /// When either compaction threshold (`threshold` or
+    /// `request_threshold`) is configured in the manifest, allocates
     /// a shared [`CompactState`] and wires the interceptor to read current
     /// occupancy through the `UsageRecord` timeline.
     fn ensure_interceptor_installed(&mut self) {
@@ -1141,13 +1141,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 .manifest
                 .compaction
                 .as_ref()
-                .map(|c| {
-                    (
-                        c.compact_threshold,
-                        c.compact_request_threshold,
-                        c.compact_retained_tokens,
-                    )
-                })
+                .map(|c| (c.threshold, c.request_threshold, c.retained_tokens))
                 .unwrap_or((None, None, manifest::defaults::COMPACT_RETAINED_TOKENS));
 
             let tracker_for_usage = self.usage_tracker.clone();
@@ -1161,7 +1155,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                         warn!(
                             post_run_threshold = post,
                             request_threshold = req,
-                            "compact_threshold > compact_request_threshold; \
+                            "threshold > request_threshold; \
                              proactive check will never fire before the safety net"
                         );
                     }
@@ -2124,12 +2118,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         let retained = state
             .as_ref()
             .map(|s| s.retained_tokens())
-            .or_else(|| {
-                self.manifest
-                    .compaction
-                    .as_ref()
-                    .map(|c| c.compact_retained_tokens)
-            })
+            .or_else(|| self.manifest.compaction.as_ref().map(|c| c.retained_tokens))
             .unwrap_or(manifest::defaults::COMPACT_RETAINED_TOKENS);
         let current_tokens = self.total_tokens().tokens;
         let cut = self.split_for_retained(retained);
@@ -2324,21 +2313,49 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
 
         // Compaction-related knobs. Fall through to manifest defaults when
         // `[compaction]` is omitted entirely.
-        let (auto_read_budget, compact_worker_max_input_tokens, compact_worker_max_turns) = self
+        let (
+            auto_read_budget,
+            worker_context_max_tokens,
+            finish_warning_remaining_tokens,
+            final_reserve_tokens,
+            worker_max_turns,
+            overview_target_tokens,
+            overview_warning_tokens,
+            overview_deadline_tokens,
+            summary_target_tokens,
+            summary_max_tokens,
+            result_context_max_tokens,
+        ) = self
             .manifest
             .compaction
             .as_ref()
             .map(|c| {
                 (
-                    c.compact_auto_read_budget,
-                    c.compact_worker_max_input_tokens,
-                    c.compact_worker_max_turns,
+                    c.auto_read_budget_tokens,
+                    c.worker_context_max_tokens,
+                    c.finish_warning_remaining_tokens,
+                    c.final_reserve_tokens,
+                    c.worker_max_turns,
+                    c.overview_target_tokens,
+                    c.overview_warning_tokens,
+                    c.overview_deadline_tokens,
+                    c.summary_target_tokens,
+                    c.summary_max_tokens,
+                    c.result_context_max_tokens,
                 )
             })
             .unwrap_or((
                 manifest::defaults::COMPACT_AUTO_READ_BUDGET,
                 manifest::defaults::COMPACT_WORKER_MAX_INPUT_TOKENS,
+                manifest::defaults::COMPACT_FINISH_WARNING_REMAINING_TOKENS,
+                manifest::defaults::COMPACT_FINAL_RESERVE_TOKENS,
                 manifest::defaults::COMPACT_WORKER_MAX_TURNS,
+                manifest::defaults::COMPACT_OVERVIEW_TARGET_TOKENS,
+                manifest::defaults::COMPACT_OVERVIEW_WARNING_TOKENS,
+                manifest::defaults::COMPACT_OVERVIEW_DEADLINE_TOKENS,
+                manifest::defaults::COMPACT_SUMMARY_TARGET_TOKENS,
+                manifest::defaults::COMPACT_SUMMARY_MAX_TOKENS,
+                manifest::defaults::COMPACT_RESULT_CONTEXT_MAX_TOKENS,
             ));
 
         // Default references: the N most-recently-touched files in the
@@ -2358,7 +2375,33 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             &items_to_summarise,
             &default_refs,
             Some(task_snapshot_text.as_str()),
+            SummaryInputOptions {
+                overview_target_tokens,
+                overview_warning_tokens,
+                overview_deadline_tokens,
+                summary_target_tokens,
+            },
         );
+        if summary_input.warning_exceeded {
+            self.alert(
+                AlertLevel::Warn,
+                AlertSource::Compactor,
+                format!(
+                    "compact overview is larger than expected (≈{} tokens; warning threshold {})",
+                    summary_input.overview_tokens, overview_warning_tokens
+                ),
+            );
+        }
+        if summary_input.deadline_fallback_used {
+            self.alert(
+                AlertLevel::Warn,
+                AlertSource::Compactor,
+                format!(
+                    "compact overview exceeded deadline ({} tokens); using coarse fallback",
+                    overview_deadline_tokens
+                ),
+            );
+        }
 
         // Worker-side state collected by the compact worker's tool calls.
         let ctx = Arc::new(std::sync::Mutex::new(CompactWorkerContext::with_budget(
@@ -2390,11 +2433,19 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 tracker.record_usage(event);
             });
         }
-        summary_worker.set_interceptor(CompactWorkerInterceptor {
-            usage_tracker: summary_usage_tracker,
-            max_input_tokens: compact_worker_max_input_tokens,
+        let compactor_warning_cb = self.alerter.clone().map(|alerter| {
+            Arc::new(move |message: String| {
+                alerter.alert(AlertLevel::Warn, AlertSource::Compactor, message);
+            }) as Arc<dyn Fn(String) + Send + Sync>
         });
-        summary_worker.set_max_turns(compact_worker_max_turns);
+        summary_worker.set_interceptor(CompactWorkerInterceptor::new(
+            summary_usage_tracker,
+            worker_context_max_tokens,
+            finish_warning_remaining_tokens,
+            final_reserve_tokens,
+            compactor_warning_cb,
+        ));
+        summary_worker.set_max_turns(worker_max_turns);
 
         // Tools: read_file (shared scope, fresh tracker) + the three
         // compact-specific tools that populate `ctx`.
@@ -2404,7 +2455,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         summary_worker.register_tool(write_summary_tool(ctx.clone()));
 
         let out = summary_worker
-            .run(summary_input)
+            .run(summary_input.text)
             .await
             .map_err(PodError::Worker)?;
         let mut locked_worker = out.worker;
@@ -2439,11 +2490,32 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             let _ = locked_worker.run(prompt).await.map_err(PodError::Worker)?;
         }
 
-        let final_ctx = ctx.lock().expect("compact ctx poisoned").clone();
-        let summary_text = final_ctx
+        let mut final_ctx = ctx.lock().expect("compact ctx poisoned").clone();
+        let mut summary_text = final_ctx
             .summary
             .clone()
             .ok_or(PodError::CompactSummaryMissing)?;
+        let mut summary_tokens = estimate_text_tokens(summary_text.len());
+        if summary_max_tokens > 0 && summary_tokens > summary_max_tokens {
+            let prompt = format!(
+                "Your `write_summary` output is too large (≈{summary_tokens} tokens; max \
+                 {summary_max_tokens}). Rewrite it now with `write_summary`, preserving the \
+                 same five sections but making it concise. Target ≈{summary_target_tokens} tokens."
+            );
+            let _ = locked_worker.run(prompt).await.map_err(PodError::Worker)?;
+            final_ctx = ctx.lock().expect("compact ctx poisoned").clone();
+            summary_text = final_ctx
+                .summary
+                .clone()
+                .ok_or(PodError::CompactSummaryMissing)?;
+            summary_tokens = estimate_text_tokens(summary_text.len());
+            if summary_tokens > summary_max_tokens {
+                return Err(PodError::CompactSummaryTooLarge {
+                    tokens: summary_tokens,
+                    max: summary_max_tokens,
+                });
+            }
+        }
 
         // Re-read each auto-read target via the Pod FS view. Errors are
         // logged and skipped inside `render_auto_read` rather than
@@ -2515,6 +2587,13 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             tools::task::snapshot_overview(&self.task_store.list()),
             task_snapshot_text.clone(),
         ));
+        let result_estimate = llm_worker::token_counter::total_tokens(&new_history, &[]);
+        if result_context_max_tokens > 0 && result_estimate.tokens > result_context_max_tokens {
+            return Err(PodError::CompactResultContextTooLarge {
+                tokens: result_estimate.tokens,
+                max: result_context_max_tokens,
+            });
+        }
 
         // Build the SegmentStart entry for the new compacted segment.
         // Inherits the source Segment's session_id so the compacted
@@ -4008,19 +4087,56 @@ impl From<WorkerResult> for PodRunResult {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct SummaryInputOptions {
+    overview_target_tokens: u64,
+    overview_warning_tokens: u64,
+    overview_deadline_tokens: u64,
+    summary_target_tokens: u64,
+}
+
+#[derive(Debug)]
+struct SummaryInputBuild {
+    text: String,
+    overview_tokens: u64,
+    warning_exceeded: bool,
+    deadline_fallback_used: bool,
+}
+
 /// Build the compact worker's input: default-reference instructions,
-/// the list of recently-touched files, and the pruned conversation
-/// produced by [`build_summary_prompt`].
+/// the list of recently-touched files, task snapshot, and a bounded overview
+/// rather than a prefix-wide transcript.
 fn build_summary_input(
     items: &[Item],
     default_refs: &[PathBuf],
     task_snapshot: Option<&str>,
-) -> String {
-    let mut out = String::new();
-    out.push_str(
-        "Summarise the conversation below into a structured summary and nominate \
-         files the next session needs.\n\n",
+    options: SummaryInputOptions,
+) -> SummaryInputBuild {
+    let overview = build_summary_overview(
+        items,
+        options.overview_target_tokens,
+        options.overview_deadline_tokens,
     );
+    let overview_tokens = estimate_text_tokens(overview.len());
+    let warning_exceeded =
+        options.overview_warning_tokens > 0 && overview_tokens > options.overview_warning_tokens;
+    let deadline_fallback_used =
+        options.overview_deadline_tokens > 0 && overview_tokens > options.overview_deadline_tokens;
+    let overview = if deadline_fallback_used {
+        build_coarse_summary_overview(items, options.overview_deadline_tokens)
+    } else {
+        overview
+    };
+    let overview_tokens = estimate_text_tokens(overview.len());
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "Summarise this session into a structured summary of about {} tokens and \
+         nominate files the next session needs. The conversation below is a \
+         bounded overview/index, not the full transcript. Use tools to inspect \
+         current files when deciding auto-read/reference output.\n\n",
+        options.summary_target_tokens
+    ));
     if !default_refs.is_empty() {
         out.push_str(
             "These files were touched recently in this session. Use `read_file` \
@@ -4045,47 +4161,166 @@ fn build_summary_input(
         out.push_str(task_snapshot);
         out.push_str("\n\n");
     }
-    out.push_str("## Conversation\n");
-    out.push_str(&build_summary_prompt(items));
+    out.push_str("## Conversation overview/index\n");
+    out.push_str(&overview);
     out.push_str("\n\nWhen you are done, call `write_summary` with the final 5-section text.");
+
+    SummaryInputBuild {
+        text: out,
+        overview_tokens,
+        warning_exceeded,
+        deadline_fallback_used,
+    }
+}
+
+fn build_summary_overview(items: &[Item], target_tokens: u64, deadline_tokens: u64) -> String {
+    let target_bytes = token_budget_bytes(target_tokens).max(1024);
+    let deadline_bytes = token_budget_bytes(deadline_tokens).max(target_bytes);
+    let mut out = String::new();
+    write_overview_header(items, &mut out);
+    out.push_str("\n## Recent user/assistant/system messages\n");
+
+    let mut selected = Vec::new();
+    let mut omitted_messages = 0usize;
+    for (idx, item) in items.iter().enumerate().rev() {
+        let Some(entry) = message_overview_entry(idx, item, 2_000) else {
+            continue;
+        };
+        let projected = out
+            .len()
+            .saturating_add(selected.iter().map(String::len).sum::<usize>())
+            .saturating_add(entry.len())
+            .saturating_add(2);
+        if projected > target_bytes && !selected.is_empty() {
+            omitted_messages += 1;
+            continue;
+        }
+        selected.push(entry);
+        if projected >= target_bytes {
+            break;
+        }
+    }
+    selected.reverse();
+    for entry in selected {
+        out.push_str(&entry);
+        out.push_str("\n\n");
+    }
+    if omitted_messages > 0 {
+        out.push_str(&format!(
+            "[Overview omitted {omitted_messages} older message(s) to stay near target.]\n\n"
+        ));
+    }
+
+    append_tool_index(items, &mut out, target_bytes, deadline_bytes);
     out
 }
 
-/// Format conversation items into a text prompt for the summary Worker.
-///
-/// The summary should capture decisions and user intent, not recreate code.
-/// File contents and tool IO belong in auto-read / references, not in the
-/// summary input. So this strips:
-/// - `ToolCall.arguments` (keep only the tool name)
-/// - `ToolResult.content` (keep only the summary line)
-/// - `Reasoning` entirely (intermediate thought, superseded by decisions)
-fn build_summary_prompt(items: &[Item]) -> String {
-    let mut lines = Vec::new();
+fn build_coarse_summary_overview(items: &[Item], deadline_tokens: u64) -> String {
+    let deadline_bytes = token_budget_bytes(deadline_tokens).max(1024);
+    let mut out = String::new();
+    write_overview_header(items, &mut out);
+    out.push_str("\n## Coarse recent message index\n");
+    for (idx, item) in items.iter().enumerate().rev() {
+        let Some(entry) = message_overview_entry(idx, item, 240) else {
+            continue;
+        };
+        if out.len().saturating_add(entry.len()).saturating_add(2) > deadline_bytes {
+            break;
+        }
+        out.push_str(&entry);
+        out.push_str("\n\n");
+    }
+    out
+}
+
+fn write_overview_header(items: &[Item], out: &mut String) {
+    let mut messages = 0usize;
+    let mut tool_calls = 0usize;
+    let mut tool_results = 0usize;
+    let mut reasoning = 0usize;
     for item in items {
         match item {
-            Item::Message { role, content, .. } => {
-                let role_label = match role {
-                    llm_worker::Role::User => "User",
-                    llm_worker::Role::Assistant => "Assistant",
-                    llm_worker::Role::System => "System",
-                };
-                let text: String = content
-                    .iter()
-                    .map(|p| p.as_text())
-                    .collect::<Vec<_>>()
-                    .join("");
-                lines.push(format!("[{role_label}] {text}"));
-            }
-            Item::ToolCall { name, .. } => {
-                lines.push(format!("[ToolCall] {name}"));
-            }
-            Item::ToolResult { summary, .. } => {
-                lines.push(format!("[ToolResult] {summary}"));
-            }
-            Item::Reasoning { .. } => {}
+            Item::Message { .. } => messages += 1,
+            Item::ToolCall { .. } => tool_calls += 1,
+            Item::ToolResult { .. } => tool_results += 1,
+            Item::Reasoning { .. } => reasoning += 1,
         }
     }
-    lines.join("\n\n")
+    out.push_str(&format!(
+        "Items summarized: {} total; {messages} message(s), {tool_calls} tool call(s), \
+         {tool_results} tool result(s), {reasoning} reasoning item(s). Tool call \
+         arguments, tool result full content, and reasoning bodies are omitted from \
+         this initial input.\n",
+        items.len()
+    ));
+}
+
+fn append_tool_index(items: &[Item], out: &mut String, target_bytes: usize, deadline_bytes: usize) {
+    let mut entries = Vec::new();
+    for (idx, item) in items.iter().enumerate().rev() {
+        match item {
+            Item::ToolCall { name, .. } => entries.push(format!("[{idx} ToolCall] {name}")),
+            Item::ToolResult { summary, .. } => entries.push(format!(
+                "[{idx} ToolResult] {}",
+                truncate_chars(summary, 240)
+            )),
+            _ => {}
+        }
+        if entries.len() >= 24 {
+            break;
+        }
+    }
+    if entries.is_empty() {
+        return;
+    }
+    entries.reverse();
+    out.push_str("## Recent tool index (content omitted)\n");
+    for entry in entries {
+        let projected = out.len().saturating_add(entry.len()).saturating_add(1);
+        if projected > deadline_bytes || (projected > target_bytes && out.contains("ToolResult")) {
+            out.push_str("[Additional tool index entries omitted.]\n");
+            break;
+        }
+        out.push_str(&entry);
+        out.push('\n');
+    }
+}
+
+fn message_overview_entry(idx: usize, item: &Item, max_chars: usize) -> Option<String> {
+    let Item::Message { role, content, .. } = item else {
+        return None;
+    };
+    let role_label = match role {
+        llm_worker::Role::User => "User",
+        llm_worker::Role::Assistant => "Assistant",
+        llm_worker::Role::System => "System",
+    };
+    let text: String = content
+        .iter()
+        .map(|p| p.as_text())
+        .collect::<Vec<_>>()
+        .join("");
+    Some(format!(
+        "[{idx} {role_label}] {}",
+        truncate_chars(&text, max_chars)
+    ))
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let mut out = text.chars().take(max_chars).collect::<String>();
+    out.push_str("… [truncated]");
+    out
+}
+
+fn estimate_text_tokens(bytes: usize) -> u64 {
+    (bytes as u64).div_ceil(4)
+}
+
+fn token_budget_bytes(tokens: u64) -> usize {
+    tokens.saturating_mul(4).min(usize::MAX as u64) as usize
 }
 
 /// Pod errors.
@@ -4124,6 +4359,12 @@ pub enum PodError {
 
     #[error("compact worker did not produce a summary (write_summary was never called)")]
     CompactSummaryMissing,
+
+    #[error("compact summary too large: {tokens} tokens exceeds max {max}")]
+    CompactSummaryTooLarge { tokens: u64, max: u64 },
+
+    #[error("compacted result context too large: {tokens} tokens exceeds max {max}")]
+    CompactResultContextTooLarge { tokens: u64, max: u64 },
 
     #[error("invalid system prompt template: {source}")]
     InvalidSystemPromptTemplate {
@@ -4409,6 +4650,21 @@ mod memory_worker_event_tests {
 mod build_summary_prompt_tests {
     use super::*;
 
+    fn test_summary_input(items: &[Item]) -> String {
+        build_summary_input(
+            items,
+            &[],
+            None,
+            SummaryInputOptions {
+                overview_target_tokens: 512,
+                overview_warning_tokens: 1024,
+                overview_deadline_tokens: 2048,
+                summary_target_tokens: 256,
+            },
+        )
+        .text
+    }
+
     #[test]
     fn strips_tool_call_arguments() {
         let items = vec![Item::tool_call_json(
@@ -4416,8 +4672,8 @@ mod build_summary_prompt_tests {
             "read_file",
             serde_json::json!({ "path": "src/main.rs" }),
         )];
-        let prompt = build_summary_prompt(&items);
-        assert_eq!(prompt, "[ToolCall] read_file");
+        let prompt = test_summary_input(&items);
+        assert!(prompt.contains("[0 ToolCall] read_file"));
         assert!(!prompt.contains("src/main.rs"));
     }
 
@@ -4428,8 +4684,8 @@ mod build_summary_prompt_tests {
             "read 3 lines",
             "fn main() { println!(\"hello\"); }",
         )];
-        let prompt = build_summary_prompt(&items);
-        assert_eq!(prompt, "[ToolResult] read 3 lines");
+        let prompt = test_summary_input(&items);
+        assert!(prompt.contains("[0 ToolResult] read 3 lines"));
         assert!(!prompt.contains("println"));
     }
 
@@ -4440,11 +4696,48 @@ mod build_summary_prompt_tests {
             Item::reasoning("internal deliberation"),
             Item::assistant_message("hello"),
         ];
-        let prompt = build_summary_prompt(&items);
-        assert!(prompt.contains("[User] hi"));
-        assert!(prompt.contains("[Assistant] hello"));
+        let prompt = test_summary_input(&items);
+        assert!(prompt.contains("[0 User] hi"));
+        assert!(prompt.contains("[2 Assistant] hello"));
         assert!(!prompt.contains("Reasoning"));
         assert!(!prompt.contains("deliberation"));
+    }
+
+    #[test]
+    fn overview_warning_does_not_drop_input() {
+        let items = vec![Item::user_message("x".repeat(4_000))];
+        let built = build_summary_input(
+            &items,
+            &[],
+            None,
+            SummaryInputOptions {
+                overview_target_tokens: 10,
+                overview_warning_tokens: 100,
+                overview_deadline_tokens: 2_000,
+                summary_target_tokens: 256,
+            },
+        );
+        assert!(built.warning_exceeded);
+        assert!(!built.deadline_fallback_used);
+        assert!(built.text.contains("[0 User]"));
+    }
+
+    #[test]
+    fn overview_deadline_falls_back_to_coarse_index() {
+        let items = vec![Item::user_message("x".repeat(4_000))];
+        let built = build_summary_input(
+            &items,
+            &[],
+            None,
+            SummaryInputOptions {
+                overview_target_tokens: 10,
+                overview_warning_tokens: 10,
+                overview_deadline_tokens: 100,
+                summary_target_tokens: 256,
+            },
+        );
+        assert!(built.deadline_fallback_used);
+        assert!(built.text.contains("## Coarse recent message index"));
     }
 
     #[test]
@@ -4478,8 +4771,9 @@ mod build_summary_prompt_tests {
             Item::user_message("fix the bug"),
             Item::assistant_message("done"),
         ];
-        let prompt = build_summary_prompt(&items);
-        assert_eq!(prompt, "[User] fix the bug\n\n[Assistant] done");
+        let prompt = test_summary_input(&items);
+        assert!(prompt.contains("[0 User] fix the bug"));
+        assert!(prompt.contains("[1 Assistant] done"));
     }
 
     #[derive(Clone)]

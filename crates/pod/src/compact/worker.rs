@@ -18,12 +18,13 @@
 //! compacted session's opening system messages.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use llm_worker::Item;
-use llm_worker::interceptor::{Interceptor, PreRequestAction};
-use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
+use llm_worker::interceptor::{Interceptor, PreRequestAction, PreToolAction, ToolCallInfo};
+use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput, ToolResult};
 use serde::Deserialize;
 use tools::ScopedFs;
 
@@ -246,14 +247,63 @@ pub(crate) fn write_summary_tool(ctx: Arc<Mutex<CompactWorkerContext>>) -> ToolD
     })
 }
 
-/// Interceptor that aborts the compact worker when its current prompt
-/// occupancy estimate crosses `max_input_tokens`. The estimate uses the same
-/// `UsageRecord` + `llm_worker::token_counter::total_tokens` path as the main
-/// Pod compaction thresholds, so prompt-cache hits are not counted cumulatively
-/// across turns.
+/// Interceptor that monitors compact-worker context occupancy.
+///
+/// `max_input_tokens` remains the hard circuit breaker. Before that point,
+/// the interceptor can persist a system warning into worker history telling
+/// the model to stop broad exploration and call `write_summary`, and can block
+/// additional exploratory tool calls once the final reserve is reached.
 pub(crate) struct CompactWorkerInterceptor {
     pub usage_tracker: Arc<UsageTracker>,
     pub max_input_tokens: u64,
+    pub finish_warning_remaining_tokens: u64,
+    pub final_reserve_tokens: u64,
+    pub on_warning: Option<Arc<dyn Fn(String) + Send + Sync>>,
+    warning_sent: AtomicBool,
+    last_remaining_tokens: AtomicU64,
+}
+
+impl CompactWorkerInterceptor {
+    pub(crate) fn new(
+        usage_tracker: Arc<UsageTracker>,
+        max_input_tokens: u64,
+        finish_warning_remaining_tokens: u64,
+        final_reserve_tokens: u64,
+        on_warning: Option<Arc<dyn Fn(String) + Send + Sync>>,
+    ) -> Self {
+        Self {
+            usage_tracker,
+            max_input_tokens,
+            finish_warning_remaining_tokens,
+            final_reserve_tokens,
+            on_warning,
+            warning_sent: AtomicBool::new(false),
+            last_remaining_tokens: AtomicU64::new(max_input_tokens),
+        }
+    }
+
+    fn maybe_emit_warning(&self, remaining: u64) -> Option<Item> {
+        let warning_threshold = self.finish_warning_remaining_tokens;
+        let reserve_threshold = self.final_reserve_tokens;
+        let should_warn = (warning_threshold > 0 && remaining <= warning_threshold)
+            || (reserve_threshold > 0 && remaining <= reserve_threshold);
+        if !should_warn || self.warning_sent.swap(true, Ordering::AcqRel) {
+            return None;
+        }
+
+        let message = format!(
+            "compact worker context budget is low ({remaining}/{} tokens remaining). \
+             Stop broad exploration now, read only if absolutely necessary, then call \
+             `write_summary` with the final structured summary.",
+            self.max_input_tokens
+        );
+        if let Some(cb) = self.on_warning.as_ref() {
+            cb(message.clone());
+        }
+        Some(Item::system_message(format!(
+            "[Compact worker budget warning]\n\n{message}"
+        )))
+    }
 }
 
 #[async_trait]
@@ -268,8 +318,30 @@ impl Interceptor for CompactWorkerInterceptor {
             ));
         }
 
+        let remaining = self.max_input_tokens.saturating_sub(estimate.tokens);
+        self.last_remaining_tokens
+            .store(remaining, Ordering::Release);
+        if let Some(item) = self.maybe_emit_warning(remaining) {
+            self.usage_tracker.note_request(context.len() + 1);
+            return PreRequestAction::ContinueWith(vec![item]);
+        }
+
         self.usage_tracker.note_request(context.len());
         PreRequestAction::Continue
+    }
+
+    async fn pre_tool_call(&self, info: &mut ToolCallInfo) -> PreToolAction {
+        if self.final_reserve_tokens == 0 || info.call.name == "write_summary" {
+            return PreToolAction::Continue;
+        }
+        let remaining = self.last_remaining_tokens.load(Ordering::Acquire);
+        if remaining > self.final_reserve_tokens {
+            return PreToolAction::Continue;
+        }
+        PreToolAction::SyntheticResult(ToolResult::error(
+            info.call.id.clone(),
+            "compact worker final reserve reached; do not perform more exploratory tool reads. Call `write_summary` now.",
+        ))
     }
 }
 
@@ -301,10 +373,7 @@ mod tests {
     #[tokio::test]
     async fn compact_worker_interceptor_uses_occupancy_not_cumulative_usage() {
         let tracker = Arc::new(UsageTracker::new());
-        let interceptor = CompactWorkerInterceptor {
-            usage_tracker: tracker.clone(),
-            max_input_tokens: 150,
-        };
+        let interceptor = CompactWorkerInterceptor::new(tracker.clone(), 150, 0, 0, None);
         let mut context = vec![Item::user_message("hello")];
 
         assert!(matches!(
@@ -328,12 +397,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compact_worker_interceptor_warns_before_hard_cap() {
+        let tracker = Arc::new(UsageTracker::new());
+        let warnings = Arc::new(Mutex::new(Vec::new()));
+        let captured = warnings.clone();
+        let interceptor = CompactWorkerInterceptor::new(
+            tracker.clone(),
+            150,
+            60,
+            20,
+            Some(Arc::new(move |message| {
+                captured.lock().unwrap().push(message);
+            })),
+        );
+        let mut context = vec![Item::user_message("hello")];
+
+        assert!(matches!(
+            interceptor.pre_llm_request(&mut context).await,
+            PreRequestAction::Continue
+        ));
+        tracker.record_usage(&make_usage(100));
+
+        assert!(matches!(
+            interceptor.pre_llm_request(&mut context).await,
+            PreRequestAction::ContinueWith(items)
+                if items.len() == 1 && items[0].as_text().unwrap_or_default().contains("write_summary")
+        ));
+        assert_eq!(warnings.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn compact_worker_interceptor_cancels_when_occupancy_exceeds_cap() {
         let tracker = Arc::new(UsageTracker::new());
-        let interceptor = CompactWorkerInterceptor {
-            usage_tracker: tracker.clone(),
-            max_input_tokens: 99,
-        };
+        let interceptor = CompactWorkerInterceptor::new(tracker.clone(), 99, 0, 0, None);
         let mut context = vec![Item::user_message("hello")];
 
         assert!(matches!(
