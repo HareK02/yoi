@@ -336,16 +336,32 @@ fn corrupt_stored_info(pod_name: String, message: String) -> StoredPodInfo {
     }
 }
 
+const LIVE_STATUS_PROBE_TIMEOUT: Duration = Duration::from_millis(25);
+
 async fn probe_live_status(socket_path: &Path) -> Result<Option<PodStatus>, io::Error> {
     let mut client = PodClient::connect(socket_path).await?;
-    let event = tokio::time::timeout(Duration::from_millis(25), client.next_event()).await;
-    let status = match event {
-        Ok(Some(Event::Snapshot { status, .. })) | Ok(Some(Event::Status { status })) => {
-            Some(status)
+    let deadline = tokio::time::Instant::now() + LIVE_STATUS_PROBE_TIMEOUT;
+
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(None);
         }
+        match tokio::time::timeout_at(deadline, client.next_event()).await {
+            Ok(Some(event)) => {
+                if let Some(status) = status_from_event(&event) {
+                    return Ok(Some(status));
+                }
+            }
+            Ok(None) | Err(_) => return Ok(None),
+        }
+    }
+}
+
+fn status_from_event(event: &Event) -> Option<PodStatus> {
+    match event {
+        Event::Snapshot { status, .. } | Event::Status { status } => Some(*status),
         _ => None,
-    };
-    Ok(status)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -655,6 +671,49 @@ mod tests {
     }
 
     #[test]
+    fn live_unreachable_row_has_diagnostic_and_cannot_open() {
+        let mut live = live_info("live", PodStatus::Idle);
+        live.reachable = false;
+        live.status = None;
+
+        let entry = single_entry(PodList::from_sources(SOURCE, vec![], vec![live], None, 10));
+
+        assert!(!entry.actions.can_open);
+        assert!(!entry.actions.can_restore);
+        assert!(!entry.actions.can_send_now);
+        assert!(!entry.actions.can_queue_send);
+        assert_eq!(
+            entry.actions.disabled_reason.as_deref(),
+            Some("live pod is unreachable")
+        );
+        assert_eq!(entry.attach_socket_path(), None);
+        assert!(entry.diagnostics.iter().any(|diagnostic| {
+            diagnostic.kind == PodEntryDiagnosticKind::LiveUnreachable
+                && diagnostic.message.contains("/tmp/live.sock")
+        }));
+    }
+
+    #[test]
+    fn status_extraction_skips_alert_before_snapshot() {
+        let events = [
+            Event::Alert(protocol::Alert {
+                level: protocol::AlertLevel::Warn,
+                source: protocol::AlertSource::Pod,
+                message: "warming up".to_string(),
+                timestamp_ms: 0,
+            }),
+            Event::Snapshot {
+                entries: vec![],
+                greeting: test_greeting(),
+                status: PodStatus::Idle,
+            },
+        ];
+
+        let status = events.iter().find_map(status_from_event);
+        assert_eq!(status, Some(PodStatus::Idle));
+    }
+
+    #[test]
     fn corrupt_stored_metadata_has_diagnostic() {
         let entry = single_entry(PodList::from_sources(
             SOURCE,
@@ -791,6 +850,19 @@ mod tests {
                 updated_at,
                 preview: None,
             },
+        }
+    }
+
+    fn test_greeting() -> protocol::Greeting {
+        protocol::Greeting {
+            pod_name: "live".to_string(),
+            cwd: "/tmp".to_string(),
+            provider: "test".to_string(),
+            model: "test".to_string(),
+            scope_summary: "test".to_string(),
+            tools: vec![],
+            context_window: 0,
+            context_tokens: 0,
         }
     }
 
