@@ -5,6 +5,7 @@ mod command;
 mod input;
 mod markdown;
 mod picker;
+mod pod_list;
 mod scroll;
 mod spawn;
 mod task;
