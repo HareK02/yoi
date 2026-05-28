@@ -279,9 +279,12 @@ mod tests {
     fn runtime_dir_prefers_xdg_runtime_dir() {
         let _g = EnvGuard::new(&[
             ("HOME", Some("/h")),
-            ("XDG_RUNTIME_DIR", Some("/run/user/1000")),
+            ("XDG_RUNTIME_DIR", Some("/xdg-runtime")),
         ]);
-        assert_eq!(runtime_dir().unwrap(), PathBuf::from("<runtime-dir>"));
+        assert_eq!(
+            runtime_dir().unwrap(),
+            PathBuf::from("/xdg-runtime/insomnia")
+        );
     }
 
     #[test]
