@@ -2296,7 +2296,8 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     pub async fn compact(&mut self, retained_tokens: u64) -> Result<SegmentId, PodError> {
         use crate::compact::worker::{
             CompactWorkerContext, CompactWorkerInterceptor, add_reference_tool,
-            mark_read_required_tool, write_summary_tool,
+            mark_read_required_tool, read_session_items_tool, search_session_log_tool,
+            write_summary_tool,
         };
         use crate::fs_view::PodFsView;
 
@@ -2447,9 +2448,12 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         ));
         summary_worker.set_max_turns(worker_max_turns);
 
-        // Tools: read_file (shared scope, fresh tracker) + the three
-        // compact-specific tools that populate `ctx`.
+        // Tools: read_file (shared scope, fresh tracker), bounded session
+        // history exploration, and compact-specific tools that populate `ctx`.
+        let compact_target_items = Arc::new(items_to_summarise.clone());
         summary_worker.register_tool(tools::read_tool(scoped_fs.clone(), summary_tracker));
+        summary_worker.register_tool(search_session_log_tool(compact_target_items.clone()));
+        summary_worker.register_tool(read_session_items_tool(compact_target_items));
         summary_worker.register_tool(mark_read_required_tool(scoped_fs.clone(), ctx.clone()));
         summary_worker.register_tool(add_reference_tool(ctx.clone()));
         summary_worker.register_tool(write_summary_tool(ctx.clone()));

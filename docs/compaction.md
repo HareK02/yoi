@@ -211,6 +211,7 @@ write_summary(text)                       — 構造化要約を出力/上書き
    - デフォルトリファレンスの一覧
    - TaskStore snapshot
 3. compact worker が自律的に:
+   - search_session_log / read_session_items で bounded overview から漏れた compact 対象履歴を必要範囲だけ探索
    - read_file で各ファイルを読み、必要性を判断
    - mark_read_required / add_reference で指定
    - write_summary で構造化要約を出力（呼び直し可）
