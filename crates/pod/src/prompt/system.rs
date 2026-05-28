@@ -440,7 +440,11 @@ mod tests {
         let rendered = tmpl
             .render(&ctx(dir.path(), &scope, vec!["Read".into()], None))
             .unwrap();
-        // Builtin default body must expose the language policy.
+        // Builtin default body must expose the tool and language policies.
+        assert!(rendered.contains("### Memory and knowledge"));
+        assert!(rendered.contains("MemoryQuery"));
+        assert!(rendered.contains("MemoryRead(kind=summary)"));
+        assert!(rendered.contains("Do not query memory every turn"));
         assert!(rendered.contains("## Language"));
         assert!(rendered.contains("`language`: `match the user's language"));
         // Trailing section must be present.
