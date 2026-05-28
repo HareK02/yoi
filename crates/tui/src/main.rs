@@ -44,6 +44,8 @@ use crate::app::App;
 use crate::picker::PickerOutcome;
 use crate::spawn::{SpawnOutcome, SpawnReady};
 
+type FullscreenTerminal = Terminal<CrosstermBackend<io::Stdout>>;
+
 fn resolve_socket(pod_name: &str, override_path: Option<PathBuf>) -> PathBuf {
     if let Some(p) = override_path {
         return p;
@@ -289,33 +291,95 @@ async fn run_pod_name(
     pod_name: String,
     socket_override: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let preferred_socket = resolve_socket(&pod_name, socket_override.clone());
-    if let Some((_socket_path, client)) =
-        connect_live_pod(&pod_name, preferred_socket, socket_override.is_none()).await
-    {
+    if let Some(client) = try_connect_live_pod(&pod_name, socket_override.clone()).await {
         let mut terminal = enter_fullscreen()?;
-        let mut app = App::new(pod_name);
-        app.connected = true;
-        return run_loop(&mut terminal, &mut app, client).await;
+        run_connected_pod(&mut terminal, pod_name, client).await?;
+        return Ok(());
     }
 
     let ready = match spawn::run_pod_name(pod_name).await? {
         SpawnOutcome::Ready(r) => r,
         SpawnOutcome::Cancelled => return Ok(()),
     };
+    let mut terminal = enter_fullscreen()?;
+    terminal.clear()?;
+    let result = run_ready_pod(&mut terminal, ready).await;
+    let _ = leave_fullscreen(&mut terminal);
+    result
+}
+
+async fn run_connected_pod(
+    terminal: &mut FullscreenTerminal,
+    pod_name: String,
+    client: PodClient,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut app = App::new(pod_name);
+    app.connected = true;
+    run_loop(terminal, &mut app, client).await
+}
+
+async fn run_pod_name_nested(
+    terminal: &mut FullscreenTerminal,
+    request: multi_pod::OpenPodRequest,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let multi_pod::OpenPodRequest {
+        pod_name,
+        socket_override,
+    } = request;
+
+    if let Some(client) = try_connect_live_pod(&pod_name, socket_override).await {
+        return run_connected_pod(terminal, pod_name, client).await;
+    }
+
+    let ready = spawn_pod_name_from_fullscreen(terminal, &pod_name).await?;
+    run_ready_pod(terminal, ready).await
+}
+
+async fn spawn_pod_name_from_fullscreen(
+    terminal: &mut FullscreenTerminal,
+    pod_name: &str,
+) -> Result<SpawnReady, Box<dyn std::error::Error>> {
+    leave_fullscreen(terminal)?;
+    let outcome = spawn::run_pod_name(pod_name.to_string()).await;
+    enter_fullscreen_existing(terminal)?;
+    terminal.clear()?;
+
+    match outcome? {
+        SpawnOutcome::Ready(ready) => Ok(ready),
+        SpawnOutcome::Cancelled => Err(Box::new(NestedOpenCancelled)),
+    }
+}
+
+async fn try_connect_live_pod(
+    pod_name: &str,
+    socket_override: Option<PathBuf>,
+) -> Option<PodClient> {
+    let preferred_socket = resolve_socket(pod_name, socket_override.clone());
+    connect_live_pod(pod_name, preferred_socket, socket_override.is_none())
+        .await
+        .map(|(_, client)| client)
+}
+
+#[derive(Debug)]
+struct NestedOpenCancelled;
+
+impl std::fmt::Display for NestedOpenCancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Pod open was cancelled")
+    }
+}
+
+impl std::error::Error for NestedOpenCancelled {}
+
+async fn run_ready_pod(
+    terminal: &mut FullscreenTerminal,
+    ready: SpawnReady,
+) -> Result<(), Box<dyn std::error::Error>> {
     let SpawnReady {
         pod_name,
         socket_path,
     } = ready;
-
-    let mut terminal = enter_fullscreen()?;
-    let result = run(&mut terminal, pod_name, &socket_path).await;
-    let _ = execute!(
-        terminal.backend_mut(),
-        DisableMouseCapture,
-        LeaveAlternateScreen
-    );
-    result
+    run(terminal, pod_name, &socket_path).await
 }
 
 async fn connect_live_pod(
@@ -354,22 +418,35 @@ async fn run_resume() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn run_multi() -> Result<(), Box<dyn std::error::Error>> {
+    let mut app = multi_pod::load_app().await?;
     let mut terminal = enter_fullscreen()?;
-    let outcome = multi_pod::run(&mut terminal).await;
 
-    let _ = execute!(
-        terminal.backend_mut(),
-        DisableMouseCapture,
-        LeaveAlternateScreen
-    );
-
-    match outcome? {
-        multi_pod::MultiPodOutcome::Quit => Ok(()),
-        multi_pod::MultiPodOutcome::Open {
-            pod_name,
-            socket_override,
-        } => run_pod_name(pod_name, socket_override).await,
+    loop {
+        match multi_pod::run(&mut terminal, &mut app).await? {
+            multi_pod::MultiPodOutcome::Quit => {
+                let _ = leave_fullscreen(&mut terminal);
+                return Ok(());
+            }
+            multi_pod::MultiPodOutcome::Open(request) => {
+                let pod_name = request.pod_name.clone();
+                match run_pod_name_nested(&mut terminal, request).await {
+                    Ok(()) => app.finish_open(&pod_name, Ok(())),
+                    Err(error) if is_recoverable_multi_open_error(error.as_ref()) => {
+                        app.finish_open(&pod_name, Err(error.as_ref()));
+                    }
+                    Err(error) => {
+                        let _ = leave_fullscreen(&mut terminal);
+                        return Err(error);
+                    }
+                }
+                app.reload().await?;
+            }
+        }
     }
+}
+
+fn is_recoverable_multi_open_error(error: &(dyn std::error::Error + 'static)) -> bool {
+    error.is::<spawn::SpawnError>() || error.is::<NestedOpenCancelled>()
 }
 
 async fn run_spawn(resume_from: Option<SegmentId>) -> Result<(), Box<dyn std::error::Error>> {
@@ -396,16 +473,34 @@ async fn run_spawn(resume_from: Option<SegmentId>) -> Result<(), Box<dyn std::er
     result
 }
 
-fn enter_fullscreen() -> Result<Terminal<CrosstermBackend<io::Stdout>>, Box<dyn std::error::Error>>
-{
+fn enter_fullscreen() -> Result<FullscreenTerminal, Box<dyn std::error::Error>> {
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     Ok(Terminal::new(backend)?)
 }
 
+fn enter_fullscreen_existing(
+    terminal: &mut FullscreenTerminal,
+) -> Result<(), Box<dyn std::error::Error>> {
+    execute!(
+        terminal.backend_mut(),
+        EnterAlternateScreen,
+        EnableMouseCapture
+    )?;
+    Ok(())
+}
+
+fn leave_fullscreen(terminal: &mut FullscreenTerminal) -> io::Result<()> {
+    execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    )
+}
+
 async fn run(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    terminal: &mut FullscreenTerminal,
     pod_name: String,
     socket_path: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -438,7 +533,7 @@ const POD_EVENT_DRAIN_LIMIT: usize = 32;
 
 struct TerminalEventReader {
     stop: Arc<AtomicBool>,
-    _thread: thread::JoinHandle<()>,
+    thread: Option<thread::JoinHandle<()>>,
 }
 
 impl TerminalEventReader {
@@ -453,7 +548,7 @@ impl TerminalEventReader {
         Ok((
             Self {
                 stop,
-                _thread: thread,
+                thread: Some(thread),
             },
             rx,
         ))
@@ -463,6 +558,9 @@ impl TerminalEventReader {
 impl Drop for TerminalEventReader {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 
