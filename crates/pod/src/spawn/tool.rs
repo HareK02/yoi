@@ -464,6 +464,9 @@ fn spawn_delivery_error(pod_name: &str, err: SendRunError) -> ToolError {
         SendRunError::AlreadyRunning => ToolError::ExecutionFailed(format!(
             "spawned pod `{pod_name}` rejected its initial task as already running; the pod remains registered and can be inspected or stopped"
         )),
+        SendRunError::Rejected { code, message } => ToolError::ExecutionFailed(format!(
+            "spawned pod `{pod_name}` rejected its initial task with {code:?}: {message}; the pod remains registered and can be inspected or stopped"
+        )),
         SendRunError::Io(msg) => ToolError::ExecutionFailed(format!(
             "spawned pod `{pod_name}` did not confirm initial task delivery: {msg}; the pod remains registered and can be inspected or stopped"
         )),
