@@ -508,6 +508,18 @@ mod tests {
     }
 
     #[test]
+    fn internal_worker_prompts_do_not_include_default_memory_guidance() {
+        let cat = PromptCatalog::builtins_only().unwrap();
+        let compact = cat.compact_system().unwrap();
+        let extract = cat.memory_extract_system("Japanese").unwrap();
+        let consolidate = cat.memory_consolidation_system("Japanese").unwrap();
+        for rendered in [compact, extract, consolidate] {
+            assert!(!rendered.contains("### Memory and knowledge"));
+            assert!(!rendered.contains("Do not query memory every turn"));
+        }
+    }
+
+    #[test]
     fn memory_worker_prompts_include_language() {
         let cat = PromptCatalog::builtins_only().unwrap();
         let extract = cat.memory_extract_system("Japanese").unwrap();
