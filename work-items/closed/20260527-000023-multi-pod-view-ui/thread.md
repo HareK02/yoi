@@ -1,13 +1,25 @@
+<!-- event: migration author: tickets.sh-migration at: 2026-05-27T00:00:23Z -->
+
+## Migrated
+
+Migrated from TODO.md entry without a legacy ticket file. No legacy review file was present at migration time.
+
+---
+
+<!-- event: close author: hare at: 2026-05-28T16:09:01Z status: closed -->
+
+## Closed
+
 ---
 id: 20260527-000023-multi-pod-view-ui
 slug: multi-pod-view-ui
 title: Multi-Pod view UI
-status: open
+status: closed
 kind: task
 priority: P2
 labels: [tui, pod]
 created_at: 2026-05-27T00:00:23Z
-updated_at: 2026-05-28T15:47:20Z
+updated_at: 2026-05-28T16:09:01Z
 assignee: null
 legacy_ticket: null
 ---
@@ -116,3 +128,6 @@ The multi-Pod view should center on a Pod list and a persistent composer:
 - Changing Pod visibility, permission, registry, or discovery authority.
 - Protocol changes for accepting concurrent user messages while a Pod is already running.
 - Native GUI.
+
+
+---
