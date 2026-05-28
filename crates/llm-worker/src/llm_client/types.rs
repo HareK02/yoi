@@ -7,6 +7,8 @@
 //! - ToolResult items (tool results)
 //! - Reasoning items (extended thinking)
 
+use std::{fmt, sync::Arc};
+
 use serde::{Deserialize, Serialize};
 
 fn is_false(value: &bool) -> bool {
@@ -22,6 +24,35 @@ pub type ItemId = String;
 
 /// Call ID type for linking function calls to their outputs
 pub type CallId = String;
+
+/// Callback sink for request-local transport lifecycle diagnostics.
+///
+/// This is carried on [`Request`] so generic [`crate::llm_client::LlmClient`]
+/// implementations can emit fine-grained transport milestones without widening
+/// the trait method signature. The callback must never receive request body
+/// contents or secret header values.
+#[derive(Clone)]
+pub struct RequestTrace {
+    callback: Arc<dyn Fn(&str, serde_json::Value) + Send + Sync>,
+}
+
+impl RequestTrace {
+    pub fn new(callback: impl Fn(&str, serde_json::Value) + Send + Sync + 'static) -> Self {
+        Self {
+            callback: Arc::new(callback),
+        }
+    }
+
+    pub fn emit(&self, label: &str, data: serde_json::Value) {
+        (self.callback)(label, data);
+    }
+}
+
+impl fmt::Debug for RequestTrace {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RequestTrace").finish_non_exhaustive()
+    }
+}
 
 /// Conversation item - the primary unit of conversation history
 ///
@@ -497,6 +528,9 @@ pub struct Request {
     /// 別の概念。`cache_anchor` を読まない provider と同じく、
     /// `prompt_cache_key` を持たない provider は無視する。
     pub cache_key: Option<String>,
+    /// Request-local diagnostics sink for transport lifecycle tracing.
+    #[doc(hidden)]
+    pub transport_trace: Option<RequestTrace>,
 }
 
 impl Request {
@@ -544,6 +578,15 @@ impl Request {
     /// Set the request config
     pub fn config(mut self, config: RequestConfig) -> Self {
         self.config = config;
+        self
+    }
+
+    /// Attach a request-local transport trace callback.
+    pub fn transport_trace(
+        mut self,
+        callback: impl Fn(&str, serde_json::Value) + Send + Sync + 'static,
+    ) -> Self {
+        self.transport_trace = Some(RequestTrace::new(callback));
         self
     }
 

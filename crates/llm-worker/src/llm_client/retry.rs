@@ -29,7 +29,7 @@ impl Default for RetryPolicy {
             base: Duration::from_millis(500),
             cap: Duration::from_secs(10),
             max_attempts: 4,
-            total_timeout: Duration::from_secs(30),
+            total_timeout: Duration::from_secs(40),
         }
     }
 }
@@ -75,7 +75,7 @@ mod tests {
         assert_eq!(p.base, Duration::from_millis(500));
         assert_eq!(p.cap, Duration::from_secs(10));
         assert_eq!(p.max_attempts, 4);
-        assert_eq!(p.total_timeout, Duration::from_secs(30));
+        assert_eq!(p.total_timeout, Duration::from_secs(40));
     }
 
     #[test]

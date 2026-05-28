@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::{marker::PhantomData, time::Instant};
+use std::{marker::PhantomData, sync::Arc, time::Instant};
 
 use futures::StreamExt;
 use serde_json::{Value, json};
@@ -207,7 +207,7 @@ pub struct Worker<C: LlmClient, S: WorkerState = Mutable> {
     stream_event_cbs: Vec<Box<dyn Fn(usize, usize, &Event) + Send + Sync>>,
     /// Pre-stream lifecycle callbacks for debugging stalls before provider
     /// stream events become visible.
-    lifecycle_trace_cbs: Vec<Box<dyn Fn(usize, usize, &str, &Value) + Send + Sync>>,
+    lifecycle_trace_cbs: Vec<Arc<dyn Fn(usize, usize, &str, &Value) + Send + Sync>>,
     /// Non-fatal warning callbacks. Invoked when the Worker wants to
     /// surface an advisory message to the upper layer (e.g. Pod) so it
     /// can be forwarded to the user — distinct from `tracing::warn!`,
@@ -435,13 +435,26 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
         &mut self,
         callback: impl Fn(usize, usize, &str, &Value) + Send + Sync + 'static,
     ) {
-        self.lifecycle_trace_cbs.push(Box::new(callback));
+        self.lifecycle_trace_cbs.push(Arc::new(callback));
     }
 
     fn emit_lifecycle_trace(&self, turn: usize, llm_call: usize, label: &str, data: Value) {
         for cb in &self.lifecycle_trace_cbs {
             cb(turn, llm_call, label, &data);
         }
+    }
+
+    fn attach_transport_trace(&self, request: Request, turn: usize, llm_call: usize) -> Request {
+        if self.lifecycle_trace_cbs.is_empty() {
+            return request;
+        }
+
+        let callbacks = self.lifecycle_trace_cbs.clone();
+        request.transport_trace(move |label, data| {
+            for cb in &callbacks {
+                cb(turn, llm_call, label, &data);
+            }
+        })
     }
 
     /// Register a non-fatal warning callback.
@@ -1198,6 +1211,7 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
                 "build_request_done",
                 self.request_trace_payload(&request),
             );
+            let request = self.attach_transport_trace(request, current_turn, current_llm_call);
             let stream_outcome = self
                 .stream_response(request, current_turn, current_llm_call)
                 .await?;
