@@ -1,13 +1,56 @@
+<!-- event: create author: tickets.sh at: 2026-05-28T00:17:48Z -->
+
+## Created
+
+Created by tickets.sh create.
+
+---
+
+<!-- event: review author: insomnia at: 2026-05-28T03:41:41Z status: approve -->
+
+## Review: approve
+
+実装を review し、approve する。
+
+確認内容:
+- Compact Worker 初期入力が bounded overview / index に変更され、ToolCall arguments / ToolResult full content / Reasoning body が初期 input に混入しない。
+- `[compaction]` の prefix なし parameter と旧 `compact_*` alias が manifest/config/defaults に反映されている。
+- `finish_warning_remaining_tokens` で Worker history に永続化される budget warning が入り、人間向け warning も出る。
+- `final_reserve_tokens` 到達後は `write_summary` 以外の探索 tool が synthetic error になり、summary 用 reserve を守る。
+- `search_session_log` / `read_session_items` が Compact Worker に登録され、bounded overview から漏れた履歴を探索できる。
+- `summary_max_tokens` と `result_context_max_tokens` の validation が入っている。
+- docs / compact system prompt が新 flow に更新されている。
+
+検証:
+- cargo fmt --check
+- cargo check -p llm-worker -p pod -p manifest
+- cargo test -p manifest compaction
+- cargo test -p pod compact_worker_interceptor --no-default-features
+- cargo test -p pod build_summary_prompt_tests --no-default-features
+- cargo test -p pod session_log --no-default-features
+- cargo test -p pod read_session_items --no-default-features
+
+注意:
+- `cargo test -p pod --no-default-features` 全体は master 上の trace commit だけでも controller empty-turn rollback 系 3 tests が失敗するため、この ticket の blocking とはしない。
+- `cargo test -p manifest` 全体は環境依存の `runtime_dir_prefers_xdg_runtime_dir` が失敗するため、この ticket の blocking とはしない。
+
+
+---
+
+<!-- event: close author: hare at: 2026-05-28T03:41:42Z status: closed -->
+
+## Closed
+
 ---
 id: 20260528-001748-compact-session-log-exploration
 slug: compact-session-log-exploration
 title: Compact: session log 探索型の要約入力に変更する
-status: open
+status: closed
 kind: task
 priority: P2
 labels: [compact, session-log]
 created_at: 2026-05-28T00:17:48Z
-updated_at: 2026-05-28T00:58:00Z
+updated_at: 2026-05-28T03:41:42Z
 assignee: null
 legacy_ticket: null
 ---
@@ -141,3 +184,6 @@ Compact 発火条件の `threshold` / `request_threshold` は Compact Worker の
 - `crates/manifest/src/defaults.rs`
 - `resources/prompts/internal/compact_system.md`
 - `docs/compaction.md`
+
+
+---
