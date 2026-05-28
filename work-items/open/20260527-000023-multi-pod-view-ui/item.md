@@ -7,7 +7,7 @@ kind: task
 priority: P2
 labels: [tui, pod]
 created_at: 2026-05-27T00:00:23Z
-updated_at: 2026-05-28T14:48:01Z
+updated_at: 2026-05-28T15:47:20Z
 assignee: null
 legacy_ticket: null
 ---
@@ -23,6 +23,19 @@ This ticket is downstream of the shared TUI Pod list/view abstraction. The concr
 ## Prerequisite
 
 - `20260528-141602-tui-pod-list-view-abstraction`
+
+## CLI entrypoint
+
+- Add `tui --multi` as the explicit entrypoint for the multi-Pod dashboard.
+- Do not change `tui -r` / `tui --resume` semantics; those remain the resume picker.
+- Do not add a short `-m` alias yet.
+- `--multi` conflicts with direct single-Pod/session selectors for this ticket:
+  - positional pod name
+  - `--pod <name>`
+  - `--session <UUID>`
+  - `-r` / `--resume`
+  - `--socket`
+- Initial selected Pod for `--multi --pod <name>` is out of scope; add it later if the UX needs it.
 
 ## Current implementation notes
 
@@ -58,7 +71,8 @@ The multi-Pod view should center on a Pod list and a persistent composer:
 
 ## Requirements
 
-- Build on `tui-pod-list-view-abstraction` for row/state/source modeling.
+- Add the `tui --multi` CLI entrypoint and reject conflicting single-Pod/session selectors.
+- Build on the completed `tui-pod-list-view-abstraction` for row/state/source modeling.
 - Add or design a TUI mode for multi-Pod view that can show:
   - live idle/waiting Pods.
   - live working/running Pods.
@@ -80,6 +94,7 @@ The multi-Pod view should center on a Pod list and a persistent composer:
 
 ## Acceptance criteria
 
+- `tui --multi` starts the multi-Pod view, and conflicting CLI argument combinations are rejected with clear errors.
 - Multi-Pod view requirements are implemented against the shared Pod list/view abstraction, not a separate list model.
 - The view can render live Pods with idle/running/paused distinctions and stopped/restorable history entries.
 - A persistent composer remains available while moving selection.
