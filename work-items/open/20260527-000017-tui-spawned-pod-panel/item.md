@@ -7,7 +7,7 @@ kind: task
 priority: P2
 labels: [migrated]
 created_at: 2026-05-27T00:00:17Z
-updated_at: 2026-05-27T00:00:17Z
+updated_at: 2026-05-28T14:16:02Z
 assignee: null
 legacy_ticket: tickets/tui-spawned-pod-panel.md
 ---
@@ -24,6 +24,12 @@ legacy_ticket: tickets/tui-spawned-pod-panel.md
 insomnia の開発では、親 Pod が複数の実装 Pod / reviewer Pod を spawn し、並列に作業させる運用が増えている。現在、spawned child の状態確認や出力確認は主に tool (`ListPods`, `ReadPodOutput`, `SendToPod`, `StopPod`) 経由で行っているが、TUI 上では親 Pod の会話と child Pod の進捗を行き来しにくい。
 
 ネイティブ GUI は将来的には便利だが、現時点で必要なタスクではない。まず TUI のまま、現在の Pod が spawn した child Pod を一覧し、一時的に attach / view できる UI を用意したい。
+
+## Prerequisite
+
+- `20260528-141602-tui-pod-list-view-abstraction`
+
+This ticket should build on the shared TUI Pod list/view abstraction instead of introducing a separate child-Pod-specific list model. The child panel may specialize the source/visibility to current-parent spawned children, but row status, reachability diagnostics, attach target representation, selection, and refresh behavior should reuse the prerequisite abstraction.
 
 ## 要件
 
