@@ -11,7 +11,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block as UiBlock, Borders, Padding, Paragraph, Widget};
+use ratatui::widgets::{Paragraph, Widget};
 use session_store::FsStore;
 use tokio::net::UnixStream;
 use unicode_width::UnicodeWidthStr;
@@ -23,6 +23,7 @@ use crate::pod_list::{
 };
 
 const MAX_ENTRIES: usize = 50;
+const CLOSED_VISIBLE_ROWS: usize = 3;
 const SOCKET_OP_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug)]
@@ -136,16 +137,19 @@ pub(crate) struct MultiPodApp {
 
 impl MultiPodApp {
     async fn load(selected_name: Option<String>) -> Result<Self, MultiPodError> {
-        Ok(Self {
+        let mut app = Self {
             list: load_pod_list(selected_name).await?,
             input: InputBuffer::new(),
             notice: None,
             sending: false,
-        })
+        };
+        app.ensure_selection_visible();
+        Ok(app)
     }
 
     async fn reload(&mut self) -> Result<(), MultiPodError> {
         self.list = load_pod_list(self.list.selected_name.clone()).await?;
+        self.ensure_selection_visible();
         Ok(())
     }
 
@@ -166,15 +170,45 @@ impl MultiPodApp {
     }
 
     pub(crate) fn select_next(&mut self) {
-        let selected = self.list.selected_index();
-        if selected + 1 < self.list.entries.len() {
-            self.list.select_index(selected + 1);
+        let visible = visible_entry_indices(&self.list);
+        if visible.is_empty() {
+            self.list.selected_name = None;
+            return;
         }
+        let selected = self.list.selected_index();
+        let Some(selected_pos) = visible.iter().position(|index| *index == selected) else {
+            self.list.select_index(visible[0]);
+            return;
+        };
+        let next_pos = (selected_pos + 1).min(visible.len() - 1);
+        self.list.select_index(visible[next_pos]);
     }
 
     pub(crate) fn select_prev(&mut self) {
-        let selected = self.list.selected_index().saturating_sub(1);
-        self.list.select_index(selected);
+        let visible = visible_entry_indices(&self.list);
+        if visible.is_empty() {
+            self.list.selected_name = None;
+            return;
+        }
+        let selected = self.list.selected_index();
+        let Some(selected_pos) = visible.iter().position(|index| *index == selected) else {
+            self.list.select_index(visible[0]);
+            return;
+        };
+        let prev_pos = selected_pos.saturating_sub(1);
+        self.list.select_index(visible[prev_pos]);
+    }
+
+    fn ensure_selection_visible(&mut self) {
+        let visible = visible_entry_indices(&self.list);
+        if visible.is_empty() {
+            self.list.selected_name = None;
+            return;
+        }
+        let selected = self.list.selected_index();
+        if !visible.contains(&selected) {
+            self.list.select_index(visible[0]);
+        }
     }
 
     pub(crate) fn prepare_send(&mut self) -> Option<DirectSendRequest> {
@@ -478,11 +512,124 @@ fn row_status_label(entry: &PodListEntry) -> (&'static str, Style) {
     ("stopped/restorable", Style::default().fg(Color::Yellow))
 }
 
-fn draw(frame: &mut Frame<'_>, app: &mut MultiPodApp) {
-    let area = frame.area();
-    let input_content_width = area.width.saturating_sub(2).max(1);
-    let input_render = app.input.render(input_content_width);
-    let input_height = input_area_height(&input_render, area.height);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MultiPodSectionKind {
+    Pending,
+    Working,
+    Closed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MultiPodSection {
+    kind: MultiPodSectionKind,
+    entries: Vec<usize>,
+}
+
+impl MultiPodSection {
+    fn hidden_count(&self) -> usize {
+        self.entries
+            .len()
+            .saturating_sub(visible_section_len(self.kind, self.entries.len()))
+    }
+}
+
+fn classify_entry(entry: &PodListEntry) -> MultiPodSectionKind {
+    if entry.live.is_some() {
+        if entry.actions.can_send_now {
+            MultiPodSectionKind::Pending
+        } else {
+            MultiPodSectionKind::Working
+        }
+    } else {
+        MultiPodSectionKind::Closed
+    }
+}
+
+fn sectioned_entries(list: &PodList) -> Vec<MultiPodSection> {
+    let mut pending = MultiPodSection {
+        kind: MultiPodSectionKind::Pending,
+        entries: Vec::new(),
+    };
+    let mut working = MultiPodSection {
+        kind: MultiPodSectionKind::Working,
+        entries: Vec::new(),
+    };
+    let mut closed = MultiPodSection {
+        kind: MultiPodSectionKind::Closed,
+        entries: Vec::new(),
+    };
+
+    for (index, entry) in list.entries.iter().enumerate() {
+        match classify_entry(entry) {
+            MultiPodSectionKind::Pending => pending.entries.push(index),
+            MultiPodSectionKind::Working => working.entries.push(index),
+            MultiPodSectionKind::Closed => closed.entries.push(index),
+        }
+    }
+
+    vec![pending, working, closed]
+}
+
+fn visible_entry_indices(list: &PodList) -> Vec<usize> {
+    sectioned_entries(list)
+        .into_iter()
+        .flat_map(|section| visible_section_indices(&section))
+        .collect()
+}
+
+fn visible_section_indices(section: &MultiPodSection) -> Vec<usize> {
+    section
+        .entries
+        .iter()
+        .copied()
+        .take(visible_section_len(section.kind, section.entries.len()))
+        .collect()
+}
+
+fn visible_section_len(kind: MultiPodSectionKind, len: usize) -> usize {
+    match kind {
+        MultiPodSectionKind::Pending | MultiPodSectionKind::Working => len,
+        MultiPodSectionKind::Closed => len.min(CLOSED_VISIBLE_ROWS),
+    }
+}
+
+fn section_header_line(
+    kind: MultiPodSectionKind,
+    total: usize,
+    hidden: usize,
+    width: u16,
+) -> Line<'static> {
+    let label = match kind {
+        MultiPodSectionKind::Pending => "pending",
+        MultiPodSectionKind::Working => "working",
+        MultiPodSectionKind::Closed => "closed",
+    };
+    let detail = if hidden > 0 {
+        format!(" {total} total, +{hidden} hidden")
+    } else {
+        String::new()
+    };
+    let text = truncate_with_ellipsis(&format!("--{label}{detail}---"), width as usize);
+    Line::from(Span::styled(
+        text,
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    ))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MultiPodLayoutState {
+    title: Rect,
+    list: Rect,
+    boundary: Rect,
+    target_status: Rect,
+    input: Rect,
+    actionbar: Rect,
+    list_draws_own_separator: bool,
+}
+
+fn multi_pod_layout(area: Rect, input_height: u16) -> MultiPodLayoutState {
     let chunks = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(0),
@@ -493,12 +640,30 @@ fn draw(frame: &mut Frame<'_>, app: &mut MultiPodApp) {
     ])
     .split(area);
 
-    draw_title(frame, chunks[0]);
-    draw_list(frame, app, chunks[1]);
-    draw_separator(frame, chunks[2]);
-    draw_target_status(frame, app, chunks[3]);
-    draw_input(frame, &input_render, chunks[4]);
-    draw_actionbar(frame, app, chunks[5]);
+    MultiPodLayoutState {
+        title: chunks[0],
+        list: chunks[1],
+        boundary: chunks[2],
+        target_status: chunks[3],
+        input: chunks[4],
+        actionbar: chunks[5],
+        list_draws_own_separator: false,
+    }
+}
+
+fn draw(frame: &mut Frame<'_>, app: &mut MultiPodApp) {
+    let area = frame.area();
+    let input_content_width = area.width.saturating_sub(2).max(1);
+    let input_render = app.input.render(input_content_width);
+    let input_height = input_area_height(&input_render, area.height);
+    let layout = multi_pod_layout(area, input_height);
+
+    draw_title(frame, layout.title);
+    draw_list(frame, app, layout.list);
+    draw_separator(frame, layout.boundary);
+    draw_target_status(frame, app, layout.target_status);
+    draw_input(frame, &input_render, layout.input);
+    draw_actionbar(frame, app, layout.actionbar);
 }
 
 fn input_area_height(render: &crate::input::InputRender, terminal_height: u16) -> u16 {
@@ -527,32 +692,60 @@ fn draw_list(frame: &mut Frame<'_>, app: &MultiPodApp, area: Rect) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let block = UiBlock::default()
-        .borders(Borders::BOTTOM)
-        .border_style(Style::default().fg(Color::DarkGray))
-        .padding(Padding::horizontal(1));
-    let inner = block.inner(area);
-    let mut lines = Vec::new();
-    let selected = app.list.selected_index();
-    let visible_height = inner.height as usize;
-    let start = if visible_height == 0 {
-        0
-    } else {
-        selected.saturating_sub(visible_height.saturating_sub(1))
-    };
-    for (i, entry) in app
-        .list
-        .entries
+    let lines = list_lines(&app.list, area.width, area.height);
+    Paragraph::new(lines).render(area, frame.buffer_mut());
+}
+
+fn list_lines(list: &PodList, width: u16, height: u16) -> Vec<Line<'static>> {
+    let sections = sectioned_entries(list);
+    let selected = list.selected_index();
+    let live_lines = sections
         .iter()
-        .enumerate()
-        .skip(start)
-        .take(visible_height)
-    {
-        lines.push(row_line(entry, i == selected, inner.width));
+        .filter(|section| section.kind != MultiPodSectionKind::Closed)
+        .flat_map(|section| section_lines(list, section, selected, width))
+        .collect::<Vec<_>>();
+    let closed_lines = sections
+        .iter()
+        .find(|section| section.kind == MultiPodSectionKind::Closed)
+        .map(|section| section_lines(list, section, selected, width))
+        .unwrap_or_default();
+
+    let available = height as usize;
+    let closed_len = closed_lines.len().min(available);
+    let live_len = live_lines.len().min(available.saturating_sub(closed_len));
+    let spacer_len = available.saturating_sub(live_len + closed_len);
+
+    let mut lines = Vec::with_capacity(available);
+    lines.extend(live_lines.into_iter().take(live_len));
+    lines.extend(std::iter::repeat_with(|| Line::from(Span::raw(""))).take(spacer_len));
+    lines.extend(closed_lines.into_iter().take(closed_len));
+    lines
+}
+
+fn section_lines(
+    list: &PodList,
+    section: &MultiPodSection,
+    selected: usize,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let visible = visible_section_indices(section);
+    if visible.is_empty() {
+        return Vec::new();
     }
-    Paragraph::new(lines)
-        .block(block)
-        .render(area, frame.buffer_mut());
+
+    let mut lines = Vec::with_capacity(visible.len() + 1);
+    lines.push(section_header_line(
+        section.kind,
+        section.entries.len(),
+        section.hidden_count(),
+        width,
+    ));
+    for index in visible {
+        if let Some(entry) = list.entries.get(index) {
+            lines.push(row_line(entry, index == selected, width));
+        }
+    }
+    lines
 }
 
 fn row_line(entry: &PodListEntry, selected: bool, width: u16) -> Line<'static> {
@@ -779,6 +972,126 @@ mod tests {
     }
 
     #[test]
+    fn multi_sections_classify_pending_working_and_closed() {
+        let list = PodList::from_sources(
+            PodVisibilitySource::ResumePicker,
+            vec![stopped_info_with_updated_at("closed", 60)],
+            vec![
+                live_info_with_updated_at("idle", PodStatus::Idle, 50),
+                live_info_with_updated_at("running", PodStatus::Running, 40),
+                live_info_with_updated_at("paused", PodStatus::Paused, 30),
+            ],
+            Some("idle".to_string()),
+            10,
+        );
+
+        let sections = sectioned_entries(&list);
+
+        assert_eq!(section_names(&list, &sections[0]), vec!["idle"]);
+        assert_eq!(
+            section_names(&list, &sections[1]),
+            vec!["running", "paused"]
+        );
+        assert_eq!(section_names(&list, &sections[2]), vec!["closed"]);
+    }
+
+    #[test]
+    fn multi_closed_section_is_limited_to_three_visible_rows() {
+        let list = closed_list(5, Some("closed-0"));
+        let visible = visible_entry_indices(&list)
+            .into_iter()
+            .map(|index| list.entries[index].name.as_str())
+            .collect::<Vec<_>>();
+        let sections = sectioned_entries(&list);
+        let closed = sections
+            .iter()
+            .find(|section| section.kind == MultiPodSectionKind::Closed)
+            .unwrap();
+        let lines = list_lines(&list, 80, 8)
+            .into_iter()
+            .map(|line| plain_line(&line))
+            .collect::<Vec<_>>();
+
+        assert_eq!(visible, vec!["closed-0", "closed-1", "closed-2"]);
+        assert_eq!(closed.hidden_count(), 2);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("closed 5 total, +2 hidden"))
+        );
+        assert!(lines.iter().any(|line| line.contains("closed-2")));
+        assert!(!lines.iter().any(|line| line.contains("closed-3")));
+    }
+
+    #[test]
+    fn multi_selection_follows_visible_section_order_without_hidden_closed_rows() {
+        let list = PodList::from_sources(
+            PodVisibilitySource::ResumePicker,
+            (0..5)
+                .map(|index| stopped_info_with_updated_at(&format!("closed-{index}"), 50 - index))
+                .collect(),
+            vec![
+                live_info_with_updated_at("running", PodStatus::Running, 70),
+                live_info_with_updated_at("idle", PodStatus::Idle, 60),
+            ],
+            Some("idle".to_string()),
+            20,
+        );
+        let mut app = app_with_list(list);
+
+        assert_eq!(app.list.selected_entry().unwrap().name, "idle");
+        app.select_next();
+        assert_eq!(app.list.selected_entry().unwrap().name, "running");
+        app.select_next();
+        assert_eq!(app.list.selected_entry().unwrap().name, "closed-0");
+        app.select_next();
+        assert_eq!(app.list.selected_entry().unwrap().name, "closed-1");
+        app.select_next();
+        assert_eq!(app.list.selected_entry().unwrap().name, "closed-2");
+        app.select_next();
+        assert_eq!(app.list.selected_entry().unwrap().name, "closed-2");
+    }
+
+    #[test]
+    fn multi_list_pins_closed_section_below_live_flexible_area() {
+        let list = PodList::from_sources(
+            PodVisibilitySource::ResumePicker,
+            (0..3)
+                .map(|index| stopped_info_with_updated_at(&format!("closed-{index}"), 50 - index))
+                .collect(),
+            vec![
+                live_info_with_updated_at("running", PodStatus::Running, 70),
+                live_info_with_updated_at("idle", PodStatus::Idle, 60),
+            ],
+            Some("idle".to_string()),
+            20,
+        );
+        let lines = list_lines(&list, 80, 12)
+            .into_iter()
+            .map(|line| plain_line(&line))
+            .collect::<Vec<_>>();
+
+        assert!(lines[0].contains("pending"));
+        assert!(lines[2].contains("working"));
+        assert!(lines[4].is_empty());
+        assert!(lines[8].contains("closed"));
+        assert!(lines[11].contains("closed-2"));
+    }
+
+    #[test]
+    fn multi_layout_uses_single_boundary_separator_between_list_and_composer() {
+        let layout = multi_pod_layout(Rect::new(0, 0, 80, 24), 1);
+
+        assert_eq!(layout.boundary.height, 1);
+        assert!(!layout.list_draws_own_separator);
+        assert_eq!(layout.boundary.y, layout.list.y + layout.list.height);
+        assert_eq!(
+            layout.target_status.y,
+            layout.boundary.y + layout.boundary.height
+        );
+    }
+
+    #[test]
     fn multi_delivery_failure_keeps_composer_contents() {
         let mut app = test_app(vec![live_info("idle", PodStatus::Idle)]);
         app.input.insert_str("keep me");
@@ -802,12 +1115,38 @@ mod tests {
     }
 
     fn test_app(live: Vec<LivePodInfo>) -> MultiPodApp {
-        MultiPodApp {
-            list: PodList::from_sources(PodVisibilitySource::ResumePicker, vec![], live, None, 10),
+        app_with_list(PodList::from_sources(
+            PodVisibilitySource::ResumePicker,
+            vec![],
+            live,
+            None,
+            10,
+        ))
+    }
+
+    fn app_with_list(list: PodList) -> MultiPodApp {
+        let mut app = MultiPodApp {
+            list,
             input: InputBuffer::new(),
             notice: None,
             sending: false,
-        }
+        };
+        app.ensure_selection_visible();
+        app
+    }
+
+    fn closed_list(count: usize, selected: Option<&str>) -> PodList {
+        PodList::from_sources(
+            PodVisibilitySource::ResumePicker,
+            (0..count)
+                .map(|index| {
+                    stopped_info_with_updated_at(&format!("closed-{index}"), 100 - index as u64)
+                })
+                .collect(),
+            vec![],
+            selected.map(str::to_string),
+            count.max(1),
+        )
     }
 
     fn live_info(pod_name: &str, status: PodStatus) -> LivePodInfo {
@@ -835,14 +1174,33 @@ mod tests {
     }
 
     fn stopped_info(pod_name: &str) -> StoredPodInfo {
+        stopped_info_with_updated_at(pod_name, 10)
+    }
+
+    fn stopped_info_with_updated_at(pod_name: &str, updated_at: u64) -> StoredPodInfo {
         StoredPodInfo {
             pod_name: pod_name.to_string(),
             metadata_state: StoredMetadataState::Present,
             active_session_id: None,
             active_segment_id: None,
-            updated_at: 10,
+            updated_at,
             preview: None,
         }
+    }
+
+    fn section_names<'a>(list: &'a PodList, section: &MultiPodSection) -> Vec<&'a str> {
+        section
+            .entries
+            .iter()
+            .map(|index| list.entries[*index].name.as_str())
+            .collect()
+    }
+
+    fn plain_line(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
     }
 
     fn input_text(app: &MultiPodApp) -> String {
