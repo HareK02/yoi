@@ -1,13 +1,25 @@
+<!-- event: migration author: tickets.sh-migration at: 2026-05-27T00:00:05Z -->
+
+## Migrated
+
+Migrated from tickets/memory-tool-guidance-prompt.md. No legacy review file was present at migration time.
+
+---
+
+<!-- event: close author: hare at: 2026-05-28T23:59:06Z status: closed -->
+
+## Closed
+
 ---
 id: 20260527-000005-memory-tool-guidance-prompt
 slug: memory-tool-guidance-prompt
 title: プロンプト: memory / knowledge tool 利用タイミングのガイダンス
-status: open
+status: closed
 kind: task
 priority: P2
 labels: [migrated]
 created_at: 2026-05-27T00:00:05Z
-updated_at: 2026-05-27T00:00:05Z
+updated_at: 2026-05-28T23:59:06Z
 assignee: null
 legacy_ticket: tickets/memory-tool-guidance-prompt.md
 ---
@@ -85,3 +97,6 @@ Do not query memory on every turn. Prefer it when past context, user preferences
 - memory tool descriptions の大幅変更。
 - memory usage metrics の設計変更。
 - global memory / project local memory の store 分離。
+
+
+---
