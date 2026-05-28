@@ -1182,6 +1182,10 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
                     self.last_run_interrupted = true;
                     return Ok(WorkerResult::Yielded);
                 }
+                PreRequestAction::ContinueWith(items) => {
+                    self.append_history_items(items.clone());
+                    request_context.extend(items);
+                }
                 PreRequestAction::Continue => {}
             }
 

@@ -18,12 +18,13 @@
 //! compacted session's opening system messages.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use llm_worker::Item;
-use llm_worker::interceptor::{Interceptor, PreRequestAction};
-use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
+use llm_worker::interceptor::{Interceptor, PreRequestAction, PreToolAction, ToolCallInfo};
+use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput, ToolResult};
 use serde::Deserialize;
 use tools::ScopedFs;
 
@@ -83,6 +84,39 @@ struct SummaryParams {
     pub text: String,
 }
 
+/// Input to `search_session_log`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct SearchSessionParams {
+    /// Case-insensitive substring to search in compact-target history.
+    pub query: String,
+    /// 0-based item offset to start searching from.
+    #[serde(default)]
+    pub offset: Option<usize>,
+    /// Maximum number of hits to return.
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+/// Input to `read_session_items`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ReadSessionParams {
+    /// 0-based compact-target history item offset.
+    pub offset: usize,
+    /// Maximum number of items to return.
+    pub limit: usize,
+    /// `compact` omits tool arguments/full results; `full` includes message text and tool result content.
+    #[serde(default = "default_session_read_mode")]
+    pub mode: String,
+}
+
+fn default_session_read_mode() -> String {
+    "compact".to_string()
+}
+
+const SESSION_TOOL_MAX_OUTPUT_TOKENS: u64 = 12_000;
+const SESSION_SEARCH_MAX_RESULTS: usize = 50;
+const SESSION_READ_MAX_ITEMS: usize = 80;
+
 const MARK_DESCRIPTION: &str = "Inject a file's contents into the compacted context so the \
 next session starts with it already read. Use this for files the next task needs in full. \
 Optionally specify `offset` (0-based line) and `limit` (line count) to inject only a slice. \
@@ -96,6 +130,236 @@ whose current content the next session can fetch on demand.";
 const SUMMARY_DESCRIPTION: &str = "Provide the final structured summary text. Subsequent calls \
 replace the previous content; only the last call is used. Must be called before the compact run \
 ends or compaction fails.";
+
+const SEARCH_SESSION_DESCRIPTION: &str = "Search the compact-target session history by \
+case-insensitive substring. Returns item indexes and compact snippets. Use this when the initial \
+overview is not enough to identify which part of the session matters. Results are bounded; narrow \
+the query if important details are omitted.";
+
+const READ_SESSION_DESCRIPTION: &str = "Read a bounded range of compact-target session history \
+items by 0-based index. mode='compact' omits tool arguments, full tool results, and reasoning \
+bodies; mode='full' includes message text and tool result content but still remains bounded. Use \
+this to verify details before writing the summary.";
+
+struct SessionLogToolState {
+    items: Arc<Vec<Item>>,
+}
+
+struct SearchSessionLogTool {
+    state: Arc<SessionLogToolState>,
+}
+
+#[async_trait]
+impl Tool for SearchSessionLogTool {
+    async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError> {
+        let params: SearchSessionParams = serde_json::from_str(input_json).map_err(|e| {
+            ToolError::InvalidArgument(format!("invalid search_session_log input: {e}"))
+        })?;
+        let query = params.query.trim().to_lowercase();
+        if query.is_empty() {
+            return Err(ToolError::InvalidArgument(
+                "search_session_log query must not be empty".to_string(),
+            ));
+        }
+        let offset = params.offset.unwrap_or(0).min(self.state.items.len());
+        let limit = params
+            .limit
+            .unwrap_or(20)
+            .clamp(1, SESSION_SEARCH_MAX_RESULTS);
+        let mut hits = Vec::new();
+        for (idx, item) in self.state.items.iter().enumerate().skip(offset) {
+            let haystack = session_item_search_text(item).to_lowercase();
+            if haystack.contains(&query) {
+                hits.push(format_session_item(
+                    idx,
+                    item,
+                    SessionReadMode::Compact,
+                    600,
+                ));
+                if hits.len() >= limit {
+                    break;
+                }
+            }
+        }
+        let mut content = hits.join("\n\n");
+        let truncated = truncate_to_token_budget(&mut content, SESSION_TOOL_MAX_OUTPUT_TOKENS);
+        let summary = if hits.is_empty() {
+            format!("No session log hits for {query:?} from item offset {offset}.")
+        } else if truncated {
+            format!(
+                "Found {} session log hit(s) for {query:?}; output truncated. Narrow the query.",
+                hits.len()
+            )
+        } else {
+            format!("Found {} session log hit(s) for {query:?}.", hits.len())
+        };
+        Ok(ToolOutput {
+            summary,
+            content: (!content.is_empty()).then_some(content),
+        })
+    }
+}
+
+struct ReadSessionItemsTool {
+    state: Arc<SessionLogToolState>,
+}
+
+#[async_trait]
+impl Tool for ReadSessionItemsTool {
+    async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError> {
+        let params: ReadSessionParams = serde_json::from_str(input_json).map_err(|e| {
+            ToolError::InvalidArgument(format!("invalid read_session_items input: {e}"))
+        })?;
+        let mode = SessionReadMode::parse(&params.mode)?;
+        let offset = params.offset.min(self.state.items.len());
+        let limit = params.limit.clamp(1, SESSION_READ_MAX_ITEMS);
+        let end = offset.saturating_add(limit).min(self.state.items.len());
+        let mut blocks = Vec::new();
+        for idx in offset..end {
+            blocks.push(format_session_item(
+                idx,
+                &self.state.items[idx],
+                mode,
+                4_000,
+            ));
+        }
+        let mut content = blocks.join("\n\n");
+        let truncated = truncate_to_token_budget(&mut content, SESSION_TOOL_MAX_OUTPUT_TOKENS);
+        let summary = if truncated {
+            format!(
+                "Read session items {offset}..{end} in {mode:?} mode; output truncated. Narrow the range."
+            )
+        } else {
+            format!("Read session items {offset}..{end} in {mode:?} mode.")
+        };
+        Ok(ToolOutput {
+            summary,
+            content: (!content.is_empty()).then_some(content),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionReadMode {
+    Compact,
+    Full,
+}
+
+impl SessionReadMode {
+    fn parse(value: &str) -> Result<Self, ToolError> {
+        match value {
+            "compact" => Ok(Self::Compact),
+            "full" => Ok(Self::Full),
+            other => Err(ToolError::InvalidArgument(format!(
+                "invalid read_session_items mode {other:?}; expected 'compact' or 'full'"
+            ))),
+        }
+    }
+}
+
+fn session_item_search_text(item: &Item) -> String {
+    match item {
+        Item::Message { role, content, .. } => format!(
+            "{:?} {}",
+            role,
+            content
+                .iter()
+                .map(|p| p.as_text())
+                .collect::<Vec<_>>()
+                .join("")
+        ),
+        Item::ToolCall {
+            name, arguments, ..
+        } => format!("tool_call {name} {arguments}"),
+        Item::ToolResult {
+            summary, content, ..
+        } => format!(
+            "tool_result {summary} {}",
+            content.as_deref().unwrap_or_default()
+        ),
+        Item::Reasoning { text, summary, .. } => format!("reasoning {text} {}", summary.join(" ")),
+    }
+}
+
+fn format_session_item(idx: usize, item: &Item, mode: SessionReadMode, max_chars: usize) -> String {
+    match item {
+        Item::Message { role, content, .. } => {
+            let text = content
+                .iter()
+                .map(|p| p.as_text())
+                .collect::<Vec<_>>()
+                .join("");
+            format!(
+                "[{idx} Message {:?}] {}",
+                role,
+                truncate_chars(&text, max_chars)
+            )
+        }
+        Item::ToolCall {
+            name, arguments, ..
+        } => match mode {
+            SessionReadMode::Compact => format!("[{idx} ToolCall] {name} (arguments omitted)"),
+            SessionReadMode::Full => format!(
+                "[{idx} ToolCall] {name}\narguments: {}",
+                truncate_chars(arguments, max_chars)
+            ),
+        },
+        Item::ToolResult {
+            summary,
+            content,
+            is_error,
+            ..
+        } => match mode {
+            SessionReadMode::Compact => format!(
+                "[{idx} ToolResult{}] {} (content omitted)",
+                if *is_error { " error" } else { "" },
+                truncate_chars(summary, 800)
+            ),
+            SessionReadMode::Full => format!(
+                "[{idx} ToolResult{}] {}\ncontent: {}",
+                if *is_error { " error" } else { "" },
+                truncate_chars(summary, 800),
+                truncate_chars(content.as_deref().unwrap_or(""), max_chars)
+            ),
+        },
+        Item::Reasoning { summary, .. } => match mode {
+            SessionReadMode::Compact => format!(
+                "[{idx} Reasoning] {} (body omitted)",
+                truncate_chars(&summary.join(" "), 800)
+            ),
+            SessionReadMode::Full => format!(
+                "[{idx} Reasoning] {} (body omitted)",
+                truncate_chars(&summary.join(" "), 800)
+            ),
+        },
+    }
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let mut out = text.chars().take(max_chars).collect::<String>();
+    out.push_str("… [truncated]");
+    out
+}
+
+fn truncate_to_token_budget(text: &mut String, max_tokens: u64) -> bool {
+    let max_bytes = max_tokens.saturating_mul(4) as usize;
+    if text.len() <= max_bytes {
+        return false;
+    }
+    let mut cut = 0;
+    for (idx, _) in text.char_indices() {
+        if idx > max_bytes {
+            break;
+        }
+        cut = idx;
+    }
+    text.truncate(cut);
+    text.push_str("\n… [session tool output truncated]");
+    true
+}
 
 struct MarkReadRequiredTool {
     fs: ScopedFs,
@@ -246,14 +510,93 @@ pub(crate) fn write_summary_tool(ctx: Arc<Mutex<CompactWorkerContext>>) -> ToolD
     })
 }
 
-/// Interceptor that aborts the compact worker when its current prompt
-/// occupancy estimate crosses `max_input_tokens`. The estimate uses the same
-/// `UsageRecord` + `llm_worker::token_counter::total_tokens` path as the main
-/// Pod compaction thresholds, so prompt-cache hits are not counted cumulatively
-/// across turns.
+pub(crate) fn search_session_log_tool(items: Arc<Vec<Item>>) -> ToolDefinition {
+    let state = Arc::new(SessionLogToolState { items });
+    Arc::new(move || {
+        let schema = schemars::schema_for!(SearchSessionParams);
+        let schema_value = serde_json::to_value(schema).unwrap_or(serde_json::json!({}));
+        let meta = ToolMeta::new("search_session_log")
+            .description(SEARCH_SESSION_DESCRIPTION)
+            .input_schema(schema_value);
+        let tool: Arc<dyn Tool> = Arc::new(SearchSessionLogTool {
+            state: state.clone(),
+        });
+        (meta, tool)
+    })
+}
+
+pub(crate) fn read_session_items_tool(items: Arc<Vec<Item>>) -> ToolDefinition {
+    let state = Arc::new(SessionLogToolState { items });
+    Arc::new(move || {
+        let schema = schemars::schema_for!(ReadSessionParams);
+        let schema_value = serde_json::to_value(schema).unwrap_or(serde_json::json!({}));
+        let meta = ToolMeta::new("read_session_items")
+            .description(READ_SESSION_DESCRIPTION)
+            .input_schema(schema_value);
+        let tool: Arc<dyn Tool> = Arc::new(ReadSessionItemsTool {
+            state: state.clone(),
+        });
+        (meta, tool)
+    })
+}
+
+/// Interceptor that monitors compact-worker context occupancy.
+///
+/// `max_input_tokens` remains the hard circuit breaker. Before that point,
+/// the interceptor can persist a system warning into worker history telling
+/// the model to stop broad exploration and call `write_summary`, and can block
+/// additional exploratory tool calls once the final reserve is reached.
 pub(crate) struct CompactWorkerInterceptor {
     pub usage_tracker: Arc<UsageTracker>,
     pub max_input_tokens: u64,
+    pub finish_warning_remaining_tokens: u64,
+    pub final_reserve_tokens: u64,
+    pub on_warning: Option<Arc<dyn Fn(String) + Send + Sync>>,
+    warning_sent: AtomicBool,
+    last_remaining_tokens: AtomicU64,
+}
+
+impl CompactWorkerInterceptor {
+    pub(crate) fn new(
+        usage_tracker: Arc<UsageTracker>,
+        max_input_tokens: u64,
+        finish_warning_remaining_tokens: u64,
+        final_reserve_tokens: u64,
+        on_warning: Option<Arc<dyn Fn(String) + Send + Sync>>,
+    ) -> Self {
+        Self {
+            usage_tracker,
+            max_input_tokens,
+            finish_warning_remaining_tokens,
+            final_reserve_tokens,
+            on_warning,
+            warning_sent: AtomicBool::new(false),
+            last_remaining_tokens: AtomicU64::new(max_input_tokens),
+        }
+    }
+
+    fn maybe_emit_warning(&self, remaining: u64) -> Option<Item> {
+        let warning_threshold = self.finish_warning_remaining_tokens;
+        let reserve_threshold = self.final_reserve_tokens;
+        let should_warn = (warning_threshold > 0 && remaining <= warning_threshold)
+            || (reserve_threshold > 0 && remaining <= reserve_threshold);
+        if !should_warn || self.warning_sent.swap(true, Ordering::AcqRel) {
+            return None;
+        }
+
+        let message = format!(
+            "compact worker context budget is low ({remaining}/{} tokens remaining). \
+             Stop broad exploration now, read only if absolutely necessary, then call \
+             `write_summary` with the final structured summary.",
+            self.max_input_tokens
+        );
+        if let Some(cb) = self.on_warning.as_ref() {
+            cb(message.clone());
+        }
+        Some(Item::system_message(format!(
+            "[Compact worker budget warning]\n\n{message}"
+        )))
+    }
 }
 
 #[async_trait]
@@ -268,8 +611,30 @@ impl Interceptor for CompactWorkerInterceptor {
             ));
         }
 
+        let remaining = self.max_input_tokens.saturating_sub(estimate.tokens);
+        self.last_remaining_tokens
+            .store(remaining, Ordering::Release);
+        if let Some(item) = self.maybe_emit_warning(remaining) {
+            self.usage_tracker.note_request(context.len() + 1);
+            return PreRequestAction::ContinueWith(vec![item]);
+        }
+
         self.usage_tracker.note_request(context.len());
         PreRequestAction::Continue
+    }
+
+    async fn pre_tool_call(&self, info: &mut ToolCallInfo) -> PreToolAction {
+        if self.final_reserve_tokens == 0 || info.call.name == "write_summary" {
+            return PreToolAction::Continue;
+        }
+        let remaining = self.last_remaining_tokens.load(Ordering::Acquire);
+        if remaining > self.final_reserve_tokens {
+            return PreToolAction::Continue;
+        }
+        PreToolAction::SyntheticResult(ToolResult::error(
+            info.call.id.clone(),
+            "compact worker final reserve reached; do not perform more exploratory tool reads. Call `write_summary` now.",
+        ))
     }
 }
 
@@ -301,10 +666,7 @@ mod tests {
     #[tokio::test]
     async fn compact_worker_interceptor_uses_occupancy_not_cumulative_usage() {
         let tracker = Arc::new(UsageTracker::new());
-        let interceptor = CompactWorkerInterceptor {
-            usage_tracker: tracker.clone(),
-            max_input_tokens: 150,
-        };
+        let interceptor = CompactWorkerInterceptor::new(tracker.clone(), 150, 0, 0, None);
         let mut context = vec![Item::user_message("hello")];
 
         assert!(matches!(
@@ -328,12 +690,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compact_worker_interceptor_warns_before_hard_cap() {
+        let tracker = Arc::new(UsageTracker::new());
+        let warnings = Arc::new(Mutex::new(Vec::new()));
+        let captured = warnings.clone();
+        let interceptor = CompactWorkerInterceptor::new(
+            tracker.clone(),
+            150,
+            60,
+            20,
+            Some(Arc::new(move |message| {
+                captured.lock().unwrap().push(message);
+            })),
+        );
+        let mut context = vec![Item::user_message("hello")];
+
+        assert!(matches!(
+            interceptor.pre_llm_request(&mut context).await,
+            PreRequestAction::Continue
+        ));
+        tracker.record_usage(&make_usage(100));
+
+        assert!(matches!(
+            interceptor.pre_llm_request(&mut context).await,
+            PreRequestAction::ContinueWith(items)
+                if items.len() == 1 && items[0].as_text().unwrap_or_default().contains("write_summary")
+        ));
+        assert_eq!(warnings.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn compact_worker_interceptor_cancels_when_occupancy_exceeds_cap() {
         let tracker = Arc::new(UsageTracker::new());
-        let interceptor = CompactWorkerInterceptor {
-            usage_tracker: tracker.clone(),
-            max_input_tokens: 99,
-        };
+        let interceptor = CompactWorkerInterceptor::new(tracker.clone(), 99, 0, 0, None);
         let mut context = vec![Item::user_message("hello")];
 
         assert!(matches!(
@@ -418,6 +807,45 @@ mod tests {
         let guard = ctx.lock().unwrap();
         assert_eq!(guard.references.len(), 1);
         assert_eq!(guard.references[0], PathBuf::from(p));
+    }
+
+    #[tokio::test]
+    async fn search_session_log_returns_bounded_hits_without_full_tool_content() {
+        let items = Arc::new(vec![
+            Item::user_message("investigate compact failure"),
+            Item::tool_result_with_content(
+                "call-1",
+                "read trace with compact failure",
+                "very large raw trace body with secret detail",
+            ),
+        ]);
+        let tool: Arc<dyn Tool> = Arc::new(SearchSessionLogTool {
+            state: Arc::new(SessionLogToolState { items }),
+        });
+        let input = serde_json::json!({ "query": "compact", "limit": 10 }).to_string();
+        let out = tool.execute(&input).await.unwrap();
+        let content = out.content.unwrap();
+
+        assert!(content.contains("investigate compact failure"));
+        assert!(content.contains("read trace with compact failure"));
+        assert!(!content.contains("secret detail"));
+    }
+
+    #[tokio::test]
+    async fn read_session_items_full_mode_can_read_tool_result_content() {
+        let items = Arc::new(vec![Item::tool_result_with_content(
+            "call-1",
+            "read trace",
+            "raw trace detail",
+        )]);
+        let tool: Arc<dyn Tool> = Arc::new(ReadSessionItemsTool {
+            state: Arc::new(SessionLogToolState { items }),
+        });
+        let input = serde_json::json!({ "offset": 0, "limit": 1, "mode": "full" }).to_string();
+        let out = tool.execute(&input).await.unwrap();
+        let content = out.content.unwrap();
+
+        assert!(content.contains("raw trace detail"));
     }
 
     #[test]

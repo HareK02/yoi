@@ -281,10 +281,7 @@ mod tests {
             ("HOME", Some("/h")),
             ("XDG_RUNTIME_DIR", Some("/run/user/1000")),
         ]);
-        assert_eq!(
-            runtime_dir().unwrap(),
-            PathBuf::from("<runtime-dir>")
-        );
+        assert_eq!(runtime_dir().unwrap(), PathBuf::from("<runtime-dir>"));
     }
 
     #[test]
