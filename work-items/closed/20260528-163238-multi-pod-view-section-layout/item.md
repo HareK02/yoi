@@ -2,12 +2,12 @@
 id: 20260528-163238-multi-pod-view-section-layout
 slug: multi-pod-view-section-layout
 title: Polish multi-Pod view section layout
-status: open
+status: closed
 kind: task
 priority: P2
 labels: [tui, pod, ux]
 created_at: 2026-05-28T16:32:38Z
-updated_at: 2026-05-28T16:32:38Z
+updated_at: 2026-05-28T16:49:25Z
 assignee: null
 legacy_ticket: null
 ---
