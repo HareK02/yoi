@@ -7,7 +7,7 @@ kind: task
 priority: P2
 labels: [packaging, nix, distribution]
 created_at: 2026-05-28T15:29:59Z
-updated_at: 2026-05-28T15:29:59Z
+updated_at: 2026-05-28T15:55:18Z
 assignee: null
 legacy_ticket: null
 ---
@@ -18,10 +18,22 @@ Insomnia should be easy to install and run on Nix/NixOS systems without requirin
 
 This ticket is about packaging and installability, not changing runtime behavior. The package should build the Rust workspace binaries and include the runtime resources needed by the installed commands.
 
+## Existing Nix file layout
+
+The repository already separates the Nix package definition from the developer shell:
+
+- `package.nix` is the package derivation used for install/build outputs.
+- `devshell.nix` is for the development shell only.
+- `flake.nix` may remain the entry point, but package outputs should call/use `package.nix`.
+
+Do not implement the installable package primarily in `devshell.nix`. Update `devshell.nix` only if the development shell genuinely needs small supporting changes.
+
 ## Requirement
 
 - Add Nix packaging for the repository.
-  - Prefer a `flake.nix` entry point unless there is a strong project-local reason not to.
+  - Use `package.nix` for the installable derivation.
+  - `flake.nix` should expose package outputs by importing/calling `package.nix`.
+  - Keep `devshell.nix` scoped to development shell concerns.
   - Provide package outputs for the user-facing binaries, at minimum the Pod CLI and TUI binaries produced by the workspace.
   - Provide a dev shell or equivalent developer environment if it can be done without large scope creep.
 - Ensure runtime resources are included or discoverable.
@@ -42,6 +54,7 @@ This ticket is about packaging and installability, not changing runtime behavior
 
 ## Acceptance criteria
 
+- `package.nix` contains the installable package derivation and is used by `flake.nix` package outputs.
 - `nix build` or the documented equivalent builds the package from a clean checkout.
 - Installed binaries can find built-in resources/prompts at runtime.
 - User config/data/runtime paths continue to resolve through existing path logic and are not stored in the Nix store.
