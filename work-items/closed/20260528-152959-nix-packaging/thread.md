@@ -1,13 +1,25 @@
+<!-- event: create author: tickets.sh at: 2026-05-28T15:29:59Z -->
+
+## Created
+
+Created by tickets.sh create.
+
+---
+
+<!-- event: close author: hare at: 2026-05-28T16:42:08Z status: closed -->
+
+## Closed
+
 ---
 id: 20260528-152959-nix-packaging
 slug: nix-packaging
 title: Package Insomnia with Nix
-status: open
+status: closed
 kind: task
 priority: P2
 labels: [packaging, nix, distribution]
 created_at: 2026-05-28T15:29:59Z
-updated_at: 2026-05-28T15:55:18Z
+updated_at: 2026-05-28T16:42:08Z
 assignee: null
 legacy_ticket: null
 ---
@@ -71,3 +83,6 @@ Do not implement the installable package primarily in `devshell.nix`. Update `de
 - Packaging external LLM providers or model runtimes.
 - Secret management for provider API keys.
 - Changing manifest/path semantics specifically for Nix unless a separate design decision is made.
+
+
+---
