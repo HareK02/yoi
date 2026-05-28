@@ -16,13 +16,19 @@ let
       pathString = toString path;
       relPath = lib.removePrefix "${srcRootString}/" pathString;
       baseName = baseNameOf pathString;
+      isExcludedTree = dir: relPath == dir || lib.hasPrefix "${dir}/" relPath;
     in
+    # Keep the package source closure focused on build inputs: exclude VCS/build
+    # outputs plus local coordination state, generated reports, and child
+    # worktrees that may live under the repository root during development.
     !(
       baseName == ".git"
       || baseName == "target"
       || baseName == "result"
-      || lib.hasPrefix ".insomnia" relPath
-      || lib.hasPrefix "work-items" relPath
+      || isExcludedTree ".insomnia"
+      || isExcludedTree ".worktree"
+      || isExcludedTree "work-items"
+      || isExcludedTree "docs/report"
     );
 in
 rustPlatform.buildRustPackage rec {
