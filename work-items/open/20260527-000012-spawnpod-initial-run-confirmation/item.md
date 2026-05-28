@@ -7,7 +7,7 @@ kind: task
 priority: P2
 labels: [migrated]
 created_at: 2026-05-27T00:00:12Z
-updated_at: 2026-05-27T00:00:12Z
+updated_at: 2026-05-28T13:05:40Z
 assignee: null
 legacy_ticket: tickets/spawnpod-initial-run-confirmation.md
 ---
@@ -37,11 +37,18 @@ legacy_ticket: tickets/spawnpod-initial-run-confirmation.md
 
 同種の問題は child Pod の通知経路でも既に踏んでおり、送信側が write 後にすぐ切断せず、receiver 側の acknowledgement / observable event を待つ形にして解消している。`SpawnPod` の初回 task delivery も同じ性質の race と見なす。
 
+追加確認として、Pod socket server は接続直後に replayed `Alert` と connect-time `Snapshot` を送ってから client `Method` を読む。したがって one-shot / send-only client は初期 event を消化してから Method を送る必要がある。
+
+- `send_run_and_confirm` は `Method::Run` を送った後に event を読む実装になっており、Snapshot が大きい場合や Run payload が大きい場合に双方向で詰まる余地がある。
+- `connect_and_send` / `fetch_history` は既に Snapshot まで drain / read しており、この系統の問題は対策済み。
+- `probe_socket` は最初の event だけを見て `Snapshot` でなければ status を取らないため、replayed `Alert` が先に来る live Pod で reachable だが status unknown になる可能性がある。
+- `PodClient::connect` は background reader を起動するため、通常の TUI attach / interactive client では初期 Snapshot を詰まらせにくい。
+
 ## 方針
 
 `SpawnPod` は child process / socket の起動だけでなく、初回 task が controller に受理され、少なくとも `UserMessage` または `TurnStart` が観測できるまで確認してから成功を返す。
 
-既存の `SendToPod` が使う `send_run_and_confirm` と同等の acknowledgement を `SpawnPod` の初回 task 送信にも適用する。
+既存の `SendToPod` / `SpawnPod` が使う run delivery confirmation ロジックを、接続直後の `Alert` / `Snapshot` drain を含む形へ共通化・安全化する。
 
 ## 要件
 
@@ -51,8 +58,11 @@ legacy_ticket: tickets/spawnpod-initial-run-confirmation.md
 - 初回 task delivery に失敗した場合、process / registry / delegated scope の扱いを明確にする。
   - cleanup するか、attach 可能な idle Pod として残すかを実装で決める。
   - 少なくとも成功扱いで返さない。
-- Server が connection 開始時に `Snapshot` を書く設計と競合しない。
-  - client 側が snapshot/event を読みながら `Method::Run` ack を待つ形にする。
+- Server が connection 開始時に `Alert` / `Snapshot` を書く設計と競合しない。
+  - client 側が `Alert` / `Snapshot` を読みながら `Method::Run` ack を待つ形にする。
+  - `send_run_and_confirm` は connect-time `Snapshot` を消化してから `Method::Run` を送る。
+- live Pod status probe は replayed `Alert` によって status 取得を落とさない。
+  - `probe_socket` は first event だけで判断せず、`Snapshot` まで初期 event を読む。
 - `SpawnPod` 成功後は、child Pod の metadata が pending でも、初回 run が開始済みであることを確認できる。
   - session log materialization のタイミングそのものは別設計でもよい。
 - `SendToPod` と `SpawnPod` の run delivery confirmation ロジックを可能な範囲で共通化する。
@@ -61,6 +71,8 @@ legacy_ticket: tickets/spawnpod-initial-run-confirmation.md
 
 - `SpawnPod` が初回 task の受理確認を待つ。
 - 初回 task が実行されない race を再現する test または regression test がある。
+- connect-time `Alert` / `Snapshot` がある状態でも `send_run_and_confirm` が詰まらず、受理 event を観測する regression test がある。
+- `probe_socket` が replayed `Alert` の後の `Snapshot` から status を取得できる regression test がある。
 - `SpawnPod` が success を返した後、child Pod が idle pending のまま task 未実行になる状態が起きない。
 - delivery timeout / failure 時の error message が人間に分かる。
 - `cargo fmt --check` と関連 crate の test が通る。
