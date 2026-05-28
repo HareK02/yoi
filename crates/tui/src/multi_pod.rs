@@ -62,37 +62,41 @@ impl From<session_store::StoreError> for MultiPodError {
 
 pub(crate) enum MultiPodOutcome {
     Quit,
-    Open {
-        pod_name: String,
-        socket_override: Option<PathBuf>,
-    },
+    Open(OpenPodRequest),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OpenPodRequest {
+    pub(crate) pod_name: String,
+    pub(crate) socket_override: Option<PathBuf>,
+}
+
+pub(crate) async fn load_app() -> Result<MultiPodApp, MultiPodError> {
+    MultiPodApp::load(None).await
 }
 
 pub(crate) async fn run(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut MultiPodApp,
 ) -> Result<MultiPodOutcome, MultiPodError> {
-    let mut app = MultiPodApp::load(None).await?;
     if app.list.entries.is_empty() {
         return Err(MultiPodError::NoPods);
     }
 
     loop {
-        terminal.draw(|f| draw(f, &mut app))?;
+        terminal.draw(|f| draw(f, app))?;
         match read()? {
             TermEvent::Key(key) => match app.handle_key(key) {
                 MultiPodAction::None => {}
                 MultiPodAction::Quit => return Ok(MultiPodOutcome::Quit),
                 MultiPodAction::Open => {
-                    if let Some(entry) = app.list.selected_entry() {
-                        return Ok(MultiPodOutcome::Open {
-                            pod_name: entry.name.clone(),
-                            socket_override: entry.attach_socket_path().map(PathBuf::from),
-                        });
+                    if let Some(request) = app.prepare_open() {
+                        return Ok(MultiPodOutcome::Open(request));
                     }
                 }
                 MultiPodAction::Refresh => app.reload().await?,
                 MultiPodAction::Send(request) => {
-                    terminal.draw(|f| draw(f, &mut app))?;
+                    terminal.draw(|f| draw(f, app))?;
                     let result = send_run_and_confirm(&request.socket_path, request.segments).await;
                     app.finish_send(result);
                     let _ = app.reload().await;
@@ -147,7 +151,7 @@ impl MultiPodApp {
         Ok(app)
     }
 
-    async fn reload(&mut self) -> Result<(), MultiPodError> {
+    pub(crate) async fn reload(&mut self) -> Result<(), MultiPodError> {
         self.list = load_pod_list(self.list.selected_name.clone()).await?;
         self.ensure_selection_visible();
         Ok(())
@@ -208,6 +212,40 @@ impl MultiPodApp {
         let selected = self.list.selected_index();
         if !visible.contains(&selected) {
             self.list.select_index(visible[0]);
+        }
+    }
+
+    pub(crate) fn prepare_open(&mut self) -> Option<OpenPodRequest> {
+        let entry = match self.list.selected_entry() {
+            Some(entry) => entry,
+            None => {
+                self.notice = Some("No Pod is selected.".to_string());
+                return None;
+            }
+        };
+        if !entry.actions.can_open {
+            self.notice = Some("Selected Pod cannot be opened from this view.".to_string());
+            return None;
+        }
+        self.notice = Some(format!("Opening {}…", entry.name));
+        Some(OpenPodRequest {
+            pod_name: entry.name.clone(),
+            socket_override: entry.attach_socket_path().map(PathBuf::from),
+        })
+    }
+
+    pub(crate) fn finish_open(
+        &mut self,
+        pod_name: &str,
+        result: Result<(), &dyn std::fmt::Display>,
+    ) {
+        match result {
+            Ok(()) => {
+                self.notice = Some(format!("Returned from {pod_name}."));
+            }
+            Err(error) => {
+                self.notice = Some(format!("Open failed for {pod_name}: {error}"));
+            }
         }
     }
 
@@ -1112,6 +1150,53 @@ mod tests {
 
         assert_eq!(input_text(&app), "");
         assert!(app.notice.as_deref().unwrap().contains("Delivered"));
+    }
+
+    #[test]
+    fn multi_open_request_keeps_dashboard_state_for_nested_single_pod() {
+        let mut app = test_app(vec![live_info("alpha", PodStatus::Idle)]);
+        app.input.insert_str("draft survives open");
+
+        let request = app.prepare_open().unwrap();
+
+        assert_eq!(request.pod_name, "alpha");
+        assert_eq!(
+            request.socket_override,
+            Some(PathBuf::from("/tmp/alpha.sock"))
+        );
+        assert_eq!(app.list.selected_entry().unwrap().name, "alpha");
+        assert_eq!(input_text(&app), "draft survives open");
+        assert!(app.notice.as_deref().unwrap().contains("Opening alpha"));
+    }
+
+    #[test]
+    fn multi_open_failure_keeps_composer_and_sets_notice() {
+        let mut app = test_app(vec![live_info("alpha", PodStatus::Idle)]);
+        app.input.insert_str("keep this draft");
+        let before = input_text(&app);
+        let error = io::Error::other("boom");
+
+        app.finish_open("alpha", Err(&error));
+
+        assert_eq!(input_text(&app), before);
+        assert_eq!(app.list.selected_entry().unwrap().name, "alpha");
+        assert!(
+            app.notice
+                .as_deref()
+                .unwrap()
+                .contains("Open failed for alpha")
+        );
+    }
+
+    #[test]
+    fn multi_open_disabled_target_stays_in_dashboard() {
+        let mut live = live_info("unreachable", PodStatus::Idle);
+        live.reachable = false;
+        live.status = None;
+        let mut app = test_app(vec![live]);
+
+        assert!(app.prepare_open().is_none());
+        assert!(app.notice.as_deref().unwrap().contains("cannot be opened"));
     }
 
     fn test_app(live: Vec<LivePodInfo>) -> MultiPodApp {
