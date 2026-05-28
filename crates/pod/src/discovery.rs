@@ -548,10 +548,20 @@ async fn probe_socket(socket_path: &Path) -> LiveInfo {
         Ok(Ok(stream)) => {
             let (r, _w) = stream.into_split();
             let mut reader = JsonLineReader::new(r);
-            let status = match tokio::time::timeout(PROBE_TIMEOUT, reader.next::<Event>()).await {
-                Ok(Ok(Some(Event::Snapshot { status, .. }))) => Some(status),
-                _ => None,
-            };
+            let mut status = None;
+            loop {
+                match tokio::time::timeout(PROBE_TIMEOUT, reader.next::<Event>()).await {
+                    Ok(Ok(Some(Event::Snapshot {
+                        status: snapshot_status,
+                        ..
+                    }))) => {
+                        status = Some(snapshot_status);
+                        break;
+                    }
+                    Ok(Ok(Some(Event::Alert(_)))) => continue,
+                    Ok(Ok(Some(_))) | Ok(Ok(None)) | Ok(Err(_)) | Err(_) => break,
+                }
+            }
             LiveInfo {
                 socket_path: socket_path.to_path_buf(),
                 reachable: true,
@@ -755,8 +765,8 @@ mod tests {
     use std::sync::Mutex;
 
     use manifest::{Permission, ScopeRule};
-    use protocol::Greeting;
     use protocol::stream::JsonLineWriter;
+    use protocol::{Alert, AlertLevel, AlertSource, Greeting};
     use session_store::{
         FsStore, PodSpawnedChild, PodSpawnedScopeRule, new_segment_id, new_session_id,
     };
@@ -929,6 +939,48 @@ mod tests {
         assert!(matches!(locked_err, PodDiscoveryError::LockConflict { .. }));
 
         live_listener.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn probe_socket_reads_status_after_replayed_alert() {
+        let root = TempDir::new().unwrap();
+        let socket = root.path().join("pod.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let handle = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut writer = JsonLineWriter::new(stream);
+            writer
+                .write(&Event::Alert(Alert {
+                    level: AlertLevel::Warn,
+                    source: AlertSource::Pod,
+                    message: "replayed alert".into(),
+                    timestamp_ms: 0,
+                }))
+                .await
+                .unwrap();
+            writer
+                .write(&Event::Snapshot {
+                    entries: Vec::new(),
+                    greeting: Greeting {
+                        pod_name: "alerted".into(),
+                        cwd: "/tmp".into(),
+                        provider: "test".into(),
+                        model: "test".into(),
+                        scope_summary: String::new(),
+                        tools: Vec::new(),
+                        context_window: 0,
+                        context_tokens: 0,
+                    },
+                    status: PodStatus::Paused,
+                })
+                .await
+                .unwrap();
+        });
+
+        let info = probe_socket(&socket).await;
+        assert!(info.reachable);
+        assert!(matches!(info.status, Some(PodStatus::Paused)));
+        handle.await.unwrap();
     }
 
     fn child(name: &str, socket_path: &Path) -> PodSpawnedChild {
