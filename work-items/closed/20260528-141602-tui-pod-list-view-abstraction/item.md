@@ -2,12 +2,12 @@
 id: 20260528-141602-tui-pod-list-view-abstraction
 slug: tui-pod-list-view-abstraction
 title: TUI Pod list/view abstraction
-status: open
+status: closed
 kind: task
 priority: P2
 labels: [tui, pod, architecture]
 created_at: 2026-05-28T14:16:02Z
-updated_at: 2026-05-28T15:04:12Z
+updated_at: 2026-05-28T15:40:30Z
 assignee: null
 legacy_ticket: null
 ---
