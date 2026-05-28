@@ -1,13 +1,25 @@
+<!-- event: migration author: tickets.sh-migration at: 2026-05-27T00:00:12Z -->
+
+## Migrated
+
+Migrated from tickets/spawnpod-initial-run-confirmation.md. No legacy review file was present at migration time.
+
+---
+
+<!-- event: close author: hare at: 2026-05-28T13:24:48Z status: closed -->
+
+## Closed
+
 ---
 id: 20260527-000012-spawnpod-initial-run-confirmation
 slug: spawnpod-initial-run-confirmation
 title: SpawnPod: initial Run delivery confirmation
-status: open
+status: closed
 kind: task
 priority: P2
 labels: [migrated]
 created_at: 2026-05-27T00:00:12Z
-updated_at: 2026-05-28T13:05:40Z
+updated_at: 2026-05-28T13:24:48Z
 assignee: null
 legacy_ticket: tickets/spawnpod-initial-run-confirmation.md
 ---
@@ -82,3 +94,6 @@ legacy_ticket: tickets/spawnpod-initial-run-confirmation.md
 - `tui -r` picker に live pending Pod を表示する修正。
 - session log の SegmentStart materialization 方針変更。
 - spawned child Pod panel UI。
+
+
+---
