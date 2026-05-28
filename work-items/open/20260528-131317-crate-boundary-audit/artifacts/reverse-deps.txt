@@ -1,0 +1,16 @@
+client <- tui
+daemon <- 
+lint-common <- memory, workflow
+llm-worker <- manifest, memory, pod, provider, session-store, tools, tui
+llm-worker-macros <- llm-worker
+manifest <- client, daemon, memory, pod, pod-registry, provider, tools, tui, workflow
+memory <- pod, workflow
+pod <- 
+pod-registry <- pod, tui
+protocol <- client, daemon, manifest, pod, session-store, tui
+provider <- pod
+session-metrics <- pod
+session-store <- pod, pod-registry, session-metrics, tui
+tools <- pod, tui
+tui <- 
+workflow <- pod

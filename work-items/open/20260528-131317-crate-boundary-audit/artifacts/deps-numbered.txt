@@ -1,0 +1,58 @@
+     1	client:
+     2	  -> manifest [normal]
+     3	  -> protocol [normal]
+     4	daemon:
+     5	  -> manifest [normal]
+     6	  -> protocol [normal]
+     7	lint-common:
+     8	  (no workspace deps)
+     9	llm-worker:
+    10	  -> llm-worker-macros [normal]
+    11	llm-worker-macros:
+    12	  (no workspace deps)
+    13	manifest:
+    14	  -> llm-worker [normal]
+    15	  -> protocol [normal]
+    16	memory:
+    17	  -> lint-common [normal]
+    18	  -> llm-worker [normal]
+    19	  -> manifest [normal]
+    20	pod:
+    21	  -> llm-worker [normal]
+    22	  -> manifest [normal]
+    23	  -> memory [normal]
+    24	  -> pod-registry [normal]
+    25	  -> protocol [normal]
+    26	  -> provider [normal]
+    27	  -> session-metrics [normal]
+    28	  -> session-store [normal]
+    29	  -> tools [normal]
+    30	  -> workflow [normal]
+    31	pod-registry:
+    32	  -> manifest [normal]
+    33	  -> session-store [normal]
+    34	protocol:
+    35	  (no workspace deps)
+    36	provider:
+    37	  -> llm-worker [normal]
+    38	  -> manifest [normal]
+    39	session-metrics:
+    40	  -> session-store [normal]
+    41	session-store:
+    42	  -> llm-worker [normal]
+    43	  -> protocol [normal]
+    44	tools:
+    45	  -> llm-worker [normal]
+    46	  -> manifest [normal]
+    47	tui:
+    48	  -> client [normal]
+    49	  -> llm-worker [normal]
+    50	  -> manifest [normal]
+    51	  -> pod-registry [normal]
+    52	  -> protocol [normal]
+    53	  -> session-store [normal]
+    54	  -> tools [dev]
+    55	workflow:
+    56	  -> lint-common [normal]
+    57	  -> manifest [normal]
+    58	  -> memory [normal]

@@ -1,0 +1,16 @@
+     1	client <- tui
+     2	daemon <- 
+     3	lint-common <- memory, workflow
+     4	llm-worker <- manifest, memory, pod, provider, session-store, tools, tui
+     5	llm-worker-macros <- llm-worker
+     6	manifest <- client, daemon, memory, pod, pod-registry, provider, tools, tui, workflow
+     7	memory <- pod, workflow
+     8	pod <- 
+     9	pod-registry <- pod, tui
+    10	protocol <- client, daemon, manifest, pod, session-store, tui
+    11	provider <- pod
+    12	session-metrics <- pod
+    13	session-store <- pod, pod-registry, session-metrics, tui
+    14	tools <- pod, tui
+    15	tui <- 
+    16	workflow <- pod
