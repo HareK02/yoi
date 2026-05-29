@@ -1,13 +1,25 @@
+<!-- event: create author: tickets.sh at: 2026-05-29T00:13:26Z -->
+
+## Created
+
+Created by tickets.sh create.
+
+---
+
+<!-- event: close author: hare at: 2026-05-29T00:39:08Z status: closed -->
+
+## Closed
+
 ---
 id: 20260529-001326-rename-installed-binaries
 slug: rename-installed-binaries
 title: Rename installed binaries
-status: open
+status: closed
 kind: task
 priority: P2
 labels: [cli, packaging, tui, pod]
 created_at: 2026-05-29T00:13:26Z
-updated_at: 2026-05-29T00:13:26Z
+updated_at: 2026-05-29T00:39:08Z
 assignee: null
 legacy_ticket: null
 ---
@@ -61,3 +73,6 @@ This is a command name change, not a crate rename. Keep the Rust crate/package n
 - Changing CLI argument semantics.
 - Changing Pod protocol or socket behavior.
 - Publishing or Home Manager module changes.
+
+
+---
