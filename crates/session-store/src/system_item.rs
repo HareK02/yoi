@@ -22,6 +22,86 @@ use llm_worker::llm_client::types::Item;
 use protocol::PodEvent;
 use serde::{Deserialize, Serialize};
 
+const SYSTEM_REMINDER_OPEN: &str = "<system-reminder>";
+const SYSTEM_REMINDER_CLOSE: &str = "</system-reminder>";
+
+/// Source policy that produced a durable `<system-reminder>` input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SystemReminderSource {
+    /// Session task inactivity reminder emitted after task-management tools
+    /// have gone unused for the configured request threshold.
+    TaskInactivity,
+}
+
+fn default_task_reminder_source() -> SystemReminderSource {
+    SystemReminderSource::TaskInactivity
+}
+
+/// Typed pending system reminder before it is committed as a [`SystemItem`].
+///
+/// System reminders are durable input: producers must append the rendered
+/// `SystemItem` through worker history before the next LLM request. They are
+/// not transient UI notices and must not be prompt-cache/context-only
+/// injections, because then the model could react to input that is absent from
+/// persisted history on later turns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SystemReminder {
+    source: SystemReminderSource,
+    body: String,
+}
+
+impl SystemReminder {
+    /// Build a task-inactivity reminder from an unwrapped body.
+    pub fn task_inactivity(body: impl Into<String>) -> Self {
+        Self::new(SystemReminderSource::TaskInactivity, body)
+    }
+
+    /// Build a reminder from an unwrapped body. If a caller passes a body that
+    /// is already exactly wrapped in `<system-reminder>` tags, normalize it back
+    /// to the inner body so rendering still wraps exactly once.
+    pub fn new(source: SystemReminderSource, body: impl Into<String>) -> Self {
+        let body = normalize_unwrapped_system_reminder_body(body.into());
+        Self { source, body }
+    }
+
+    pub fn source(&self) -> SystemReminderSource {
+        self.source
+    }
+
+    pub fn body(&self) -> &str {
+        &self.body
+    }
+
+    pub fn rendered_body(&self) -> String {
+        render_system_reminder(&self.body)
+    }
+
+    pub fn into_system_item(self) -> SystemItem {
+        match self.source {
+            SystemReminderSource::TaskInactivity => SystemItem::TaskReminder {
+                source: self.source,
+                body: self.rendered_body(),
+            },
+        }
+    }
+}
+
+fn normalize_unwrapped_system_reminder_body(body: String) -> String {
+    let trimmed = body.trim();
+    if let Some(inner) = trimmed
+        .strip_prefix(SYSTEM_REMINDER_OPEN)
+        .and_then(|rest| rest.strip_suffix(SYSTEM_REMINDER_CLOSE))
+    {
+        return inner.trim_matches('\n').to_string();
+    }
+    body
+}
+
+fn render_system_reminder(body: &str) -> String {
+    format!("{SYSTEM_REMINDER_OPEN}\n{body}\n{SYSTEM_REMINDER_CLOSE}")
+}
+
 /// One agent-injected system item, tagged by origin.
 ///
 /// Each variant carries the kind-specific raw data clients use for
@@ -69,9 +149,13 @@ pub enum SystemItem {
     Workflow { slug: String, body: String },
 
     /// Task-management inactivity reminder inserted before an LLM request.
-    /// `body` is the exact LLM-context text wrapped in a
-    /// `<system-reminder>` block.
-    TaskReminder { body: String },
+    /// `source` is the policy that produced this durable reminder; `body` is
+    /// the exact LLM-context text wrapped in a `<system-reminder>` block.
+    TaskReminder {
+        #[serde(default = "default_task_reminder_source")]
+        source: SystemReminderSource,
+        body: String,
+    },
 
     /// Synthetic note inserted after an interrupted turn before the next
     /// user input. `body` is the exact LLM-context text explaining that the
@@ -89,7 +173,7 @@ impl SystemItem {
             SystemItem::FileAttachment { body, .. } => body.clone(),
             SystemItem::Knowledge { body, .. } => body.clone(),
             SystemItem::Workflow { body, .. } => body.clone(),
-            SystemItem::TaskReminder { body } => body.clone(),
+            SystemItem::TaskReminder { body, .. } => body.clone(),
             SystemItem::Interrupt { body } => body.clone(),
         }
     }
@@ -170,6 +254,53 @@ mod tests {
             body: "[File: src/main.rs]\nfn main() {}".into(),
         };
         assert_eq!(item.history_text(), "[File: src/main.rs]\nfn main() {}");
+    }
+
+    #[test]
+    fn system_reminder_renders_body_once() {
+        let reminder = SystemReminder::task_inactivity("remember tasks");
+        assert_eq!(
+            reminder.rendered_body(),
+            "<system-reminder>\nremember tasks\n</system-reminder>"
+        );
+
+        let already_wrapped = SystemReminder::task_inactivity(
+            "<system-reminder>\nremember tasks\n</system-reminder>",
+        );
+        assert_eq!(already_wrapped.body(), "remember tasks");
+        assert_eq!(
+            already_wrapped.rendered_body(),
+            "<system-reminder>\nremember tasks\n</system-reminder>"
+        );
+    }
+
+    #[test]
+    fn system_reminder_source_is_retained_in_system_item() {
+        let item = SystemReminder::task_inactivity("remember tasks").into_system_item();
+        match item {
+            SystemItem::TaskReminder { source, body } => {
+                assert_eq!(source, SystemReminderSource::TaskInactivity);
+                assert_eq!(
+                    body,
+                    "<system-reminder>\nremember tasks\n</system-reminder>"
+                );
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn task_reminder_deserialization_defaults_legacy_source() {
+        let parsed: SystemItem = serde_json::from_str(
+            r#"{"kind":"task_reminder","body":"<system-reminder>\nbody\n</system-reminder>"}"#,
+        )
+        .unwrap();
+        match parsed {
+            SystemItem::TaskReminder { source, .. } => {
+                assert_eq!(source, SystemReminderSource::TaskInactivity);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 
     #[test]
