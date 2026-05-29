@@ -10,12 +10,12 @@ From the repository root:
 nix build .#
 ```
 
-The default package is implemented by `package.nix` and builds the Cargo workspace binaries `pod` and `tui`. The derivation uses the checked-in `Cargo.lock`, so Cargo dependencies are fetched by the normal Nix Rust packaging path instead of by network access during the build.
+The default package is implemented by `package.nix` and builds the Cargo packages `pod` and `tui` as installed binaries `insomnia-pod` and `insomnia`. The derivation uses the checked-in `Cargo.lock`, so Cargo dependencies are fetched by the normal Nix Rust packaging path instead of by network access during the build.
 
 The package output contains:
 
-- `bin/pod` — Pod CLI / runtime process.
-- `bin/tui` — terminal UI.
+- `bin/insomnia-pod` — Pod CLI / runtime process.
+- `bin/insomnia` — terminal UI.
 - `share/insomnia/resources/` — bundled runtime resources, including `resources/prompts/`.
 - `share/doc/insomnia/nix.md` — this document.
 
@@ -24,15 +24,15 @@ The package output contains:
 After `nix build`:
 
 ```sh
-./result/bin/pod --help
-./result/bin/tui
+./result/bin/insomnia-pod --help
+./result/bin/insomnia
 ```
 
 With flakes:
 
 ```sh
-nix run .#tui
-nix run .#pod -- --help
+nix run .#insomnia
+nix run .#insomnia-pod -- --help
 ```
 
 `nix run .#` defaults to the TUI.
@@ -53,8 +53,8 @@ The Nix package does not put user configuration, sessions, sockets, or other mut
 
 The package derivation has a credential-free install check that verifies:
 
-- `pod --help` starts successfully.
-- `tui` is installed and reaches argument parsing.
+- `insomnia-pod --help` starts successfully.
+- `insomnia` is installed and reaches argument parsing.
 - bundled prompt resources and this Nix usage document are present in the output.
 
 For full validation before handing changes to review, run:

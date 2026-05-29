@@ -172,7 +172,7 @@ unique であれば workspace を指定しなくて済む。
 ## Daemon-less リモート Pod 生成（SSH-only モデル）
 
 リモートホスト上の Pod 生成は **daemon 無しで SSH だけで成立する**。
-remote 側に必要なのは `pod` バイナリと SSH アクセスのみ。
+remote 側に必要なのは `insomnia-pod` バイナリと SSH アクセスのみ。
 
 ### 前提
 
@@ -182,7 +182,7 @@ remote 側に必要なのは `pod` バイナリと SSH アクセスのみ。
 - insomnia が転送するのは**セッション（会話履歴）と manifest overlay**
   だけ。コードベースの同期は外部に委ねる
 - コンテナ内で動かすか bare metal で動かすかも insomnia は問わない。
-  `pod` バイナリが動くホストの fs 上で活動する主体がある、
+  `insomnia-pod` バイナリが動くホストの fs 上で活動する主体がある、
   それだけが前提
 
 ### フロー
@@ -193,7 +193,7 @@ host_a (spawner)                         host_b (remote)
     │
     ├── ssh: session データを転送 ────────→ ファイル書き込み
     ├── ssh: overlay TOML を転送 ─────────→ ファイル書き込み
-    ├── ssh: `pod --overlay ... &` ───────→ Pod プロセス起動、socket 作成
+    ├── ssh: `insomnia-pod --overlay ... &` ───────→ Pod プロセス起動、socket 作成
     ├── ssh -L: socket を tunnel ─────────→ Pod B の unix socket
     │
     └── localhost:tunnel に接続 ──────────→ Method::Run / Event stream
@@ -209,7 +209,7 @@ tar cz session/ | ssh insomnia@host-b "tar xz -C ~/workspaces/task-123/store"
 echo "$OVERLAY" | ssh insomnia@host-b "cat > ~/workspaces/task-123/overlay.toml"
 
 # 2. Pod を起動（detach）
-ssh insomnia@host-b "pod --store ~/workspaces/task-123/store \
+ssh insomnia@host-b "insomnia-pod --store ~/workspaces/task-123/store \
     --overlay ~/workspaces/task-123/overlay.toml &"
 
 # 3. socket を tunnel で引っ張る

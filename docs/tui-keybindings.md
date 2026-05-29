@@ -111,7 +111,7 @@ Running 中に割り込みたい場合、ほとんどのケースで `Ctrl-C`（
 
 `Ctrl-X` は Running 中だけ Cancel、Idle / Paused では Shutdown。`Ctrl-C` は Running 中だけ Pod に `Method::Pause` を送り、それ以外では Pod は落とさず TUI プロセスだけ抜ける。`Ctrl-D` は常に Pod へ制御メソッドを送らず TUI プロセスだけ抜ける。
 
-TUI のダイアログから Pod を起動する経路では、起動した Pod は TUI の子プロセスとして管理・終了されず、独立したプロセスとして残る。TUI 終了後は `tui <pod-name>` で再接続できる。
+TUI のダイアログから Pod を起動する経路では、起動した Pod は TUI の子プロセスとして管理・終了されず、独立したプロセスとして残る。TUI 終了後は `insomnia <pod-name>` で再接続できる。
 
 ## 履歴メモ
 

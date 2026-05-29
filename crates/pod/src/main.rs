@@ -9,7 +9,7 @@ use session_store::{FsStore, PodMetadataStore, SegmentId, Store};
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "pod",
+    name = "insomnia-pod",
     about = "Spawn a Pod process from manifest layers or a single manifest file"
 )]
 struct Cli {
@@ -364,19 +364,25 @@ permission = "write"
 
     #[test]
     fn user_manifest_flag_is_not_accepted() {
-        let err = Cli::try_parse_from(["pod", "--user-manifest", "manifest.toml"]).unwrap_err();
+        let err =
+            Cli::try_parse_from(["insomnia-pod", "--user-manifest", "manifest.toml"]).unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
     }
 
     #[test]
     fn manifest_conflicts_with_project_and_overlay() {
-        let project_err =
-            Cli::try_parse_from(["pod", "--manifest", "manifest.toml", "--project", "."])
-                .unwrap_err();
+        let project_err = Cli::try_parse_from([
+            "insomnia-pod",
+            "--manifest",
+            "manifest.toml",
+            "--project",
+            ".",
+        ])
+        .unwrap_err();
         assert_eq!(project_err.kind(), clap::error::ErrorKind::ArgumentConflict);
 
         let overlay_err = Cli::try_parse_from([
-            "pod",
+            "insomnia-pod",
             "--manifest",
             "manifest.toml",
             "--overlay",
@@ -391,7 +397,8 @@ permission = "write"
         let tmp = TempDir::new().unwrap();
         let manifest = tmp.path().join("manifest.toml");
         write(&manifest, &manifest_toml("single", tmp.path()));
-        let cli = Cli::try_parse_from(["pod", "--manifest", manifest.to_str().unwrap()]).unwrap();
+        let cli = Cli::try_parse_from(["insomnia-pod", "--manifest", manifest.to_str().unwrap()])
+            .unwrap();
 
         let err = resolve_manifest_with_user_manifest_env(&cli, Some(OsString::from("user.toml")))
             .unwrap_err();
@@ -405,7 +412,8 @@ permission = "write"
         let tmp = TempDir::new().unwrap();
         let manifest = tmp.path().join("manifest.toml");
         write(&manifest, &manifest_toml("single", tmp.path()));
-        let cli = Cli::try_parse_from(["pod", "--manifest", manifest.to_str().unwrap()]).unwrap();
+        let cli = Cli::try_parse_from(["insomnia-pod", "--manifest", manifest.to_str().unwrap()])
+            .unwrap();
 
         let (manifest, loader) =
             resolve_manifest_with_user_manifest_env(&cli, Some(OsString::new())).unwrap();
@@ -422,8 +430,12 @@ permission = "write"
         write(&user_manifest, &manifest_toml("from-env", tmp.path()));
         let no_project_root = tmp.path().join("no-project");
         std::fs::create_dir_all(&no_project_root).unwrap();
-        let cli =
-            Cli::try_parse_from(["pod", "--project", no_project_root.to_str().unwrap()]).unwrap();
+        let cli = Cli::try_parse_from([
+            "insomnia-pod",
+            "--project",
+            no_project_root.to_str().unwrap(),
+        ])
+        .unwrap();
 
         let (manifest, _loader) = resolve_manifest_with_user_manifest_env(
             &cli,
@@ -438,8 +450,8 @@ permission = "write"
     fn pod_flag_conflicts_with_session() {
         let segment_id = session_store::new_segment_id();
         let segment_id = segment_id.to_string();
-        let err =
-            Cli::try_parse_from(["pod", "--pod", "agent", "--session", &segment_id]).unwrap_err();
+        let err = Cli::try_parse_from(["insomnia-pod", "--pod", "agent", "--session", &segment_id])
+            .unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
@@ -449,7 +461,7 @@ permission = "write"
         let manifest = tmp.path().join("manifest.toml");
         write(&manifest, &manifest_toml("from-file", tmp.path()));
         let cli = Cli::try_parse_from([
-            "pod",
+            "insomnia-pod",
             "--manifest",
             manifest.to_str().unwrap(),
             "--pod",
@@ -471,7 +483,7 @@ permission = "write"
             &manifest_toml("unused", tmp.path()).replace("name = \"unused\"\n", ""),
         );
         let cli = Cli::try_parse_from([
-            "pod",
+            "insomnia-pod",
             "--manifest",
             manifest.to_str().unwrap(),
             "--pod",
@@ -491,8 +503,12 @@ permission = "write"
         write(&single_manifest, &manifest_toml("single-file", tmp.path()));
         std::fs::create_dir_all(tmp.path().join("prompts")).unwrap();
         std::fs::create_dir_all(tmp.path().join(".insomnia").join("prompts")).unwrap();
-        let cli =
-            Cli::try_parse_from(["pod", "--manifest", single_manifest.to_str().unwrap()]).unwrap();
+        let cli = Cli::try_parse_from([
+            "insomnia-pod",
+            "--manifest",
+            single_manifest.to_str().unwrap(),
+        ])
+        .unwrap();
 
         let (manifest, loader) = resolve_manifest_with_user_manifest_env(&cli, None).unwrap();
 

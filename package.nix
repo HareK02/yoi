@@ -103,13 +103,13 @@ rustPlatform.buildRustPackage rec {
   installCheckPhase = ''
     runHook preInstallCheck
 
-    "$out/bin/pod" --help >/dev/null
-    test -x "$out/bin/tui"
-    if "$out/bin/tui" --session not-a-uuid 2>tui.err; then
-      echo "tui unexpectedly accepted an invalid --session value" >&2
+    "$out/bin/insomnia-pod" --help >/dev/null
+    test -x "$out/bin/insomnia"
+    if "$out/bin/insomnia" --session not-a-uuid 2>insomnia.err; then
+      echo "insomnia unexpectedly accepted an invalid --session value" >&2
       exit 1
     fi
-    grep -q "invalid --session UUID" tui.err
+    grep -q "invalid --session UUID" insomnia.err
 
     test -d "$out/share/insomnia/resources/prompts"
     test -f "$out/share/doc/insomnia/nix.md"
@@ -120,7 +120,7 @@ rustPlatform.buildRustPackage rec {
   meta = {
     description = "Agentic coding Pod runtime and terminal UI";
     license = lib.licenses.mit;
-    mainProgram = "tui";
+    mainProgram = "insomnia";
     platforms = lib.platforms.unix;
   };
 }

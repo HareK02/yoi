@@ -27,9 +27,9 @@
         packages.default = insomnia;
         packages.insomnia = insomnia;
 
-        apps.default = mkApp "tui" "Run the INSOMNIA terminal UI";
-        apps.tui = mkApp "tui" "Run the INSOMNIA terminal UI";
-        apps.pod = mkApp "pod" "Run the INSOMNIA Pod CLI";
+        apps.default = mkApp "insomnia" "Run the INSOMNIA terminal UI";
+        apps.insomnia = mkApp "insomnia" "Run the INSOMNIA terminal UI";
+        apps.insomnia-pod = mkApp "insomnia-pod" "Run the INSOMNIA Pod CLI";
 
         checks.default = insomnia;
 
