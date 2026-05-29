@@ -2,12 +2,12 @@
 id: 20260527-000014-tui-actionbar-transient-notice-api
 slug: tui-actionbar-transient-notice-api
 title: TUI: actionbar transient notice API
-status: open
+status: closed
 kind: task
 priority: P2
 labels: [migrated]
 created_at: 2026-05-27T00:00:14Z
-updated_at: 2026-05-27T00:00:14Z
+updated_at: 2026-05-29T03:57:34Z
 assignee: null
 legacy_ticket: tickets/tui-actionbar-transient-notice-api.md
 ---
