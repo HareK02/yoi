@@ -37,8 +37,8 @@ use llm_worker::token_counter::total_tokens;
 /// Maximum number of bytes copied into `TurnEndInfo::final_text_preview`.
 const FINAL_TEXT_PREVIEW_LIMIT: usize = 512;
 
-const TASK_REMINDER_REQUEST_THRESHOLD: usize = 8;
-const TASK_REMINDER_COOLDOWN_REQUESTS: usize = 8;
+const TASK_REMINDER_REQUEST_THRESHOLD: usize = 24;
+const TASK_REMINDER_COOLDOWN_REQUESTS: usize = 24;
 const TASK_MANAGEMENT_TOOL_NAMES: [&str; 2] = ["TaskCreate", "TaskUpdate"];
 
 #[derive(Debug)]
