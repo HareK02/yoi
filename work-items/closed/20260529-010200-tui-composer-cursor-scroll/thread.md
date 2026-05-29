@@ -1,13 +1,25 @@
+<!-- event: create author: tickets.sh at: 2026-05-29T01:02:00Z -->
+
+## Created
+
+Created by tickets.sh create.
+
+---
+
+<!-- event: close author: hare at: 2026-05-29T02:08:04Z status: closed -->
+
+## Closed
+
 ---
 id: 20260529-010200-tui-composer-cursor-scroll
 slug: tui-composer-cursor-scroll
 title: Scroll TUI composer around cursor
-status: open
+status: closed
 kind: task
 priority: P2
 labels: [tui, input, ux]
 created_at: 2026-05-29T01:02:00Z
-updated_at: 2026-05-29T01:02:00Z
+updated_at: 2026-05-29T02:08:03Z
 assignee: null
 legacy_ticket: null
 ---
@@ -53,3 +65,6 @@ This makes editing long messages unreliable: the user can continue typing or mov
 - Mouse scrolling inside composer.
 - Horizontal scrolling/wrapping redesign beyond what is needed to keep current behavior correct.
 - Changing command completion behavior; see `20260529-010200-tui-command-completion-apply`.
+
+
+---
