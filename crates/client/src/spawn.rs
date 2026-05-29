@@ -1,4 +1,4 @@
-//! pod バイナリをサブプロセスとして立ち上げ、`INSOMNIA-READY` を待つ
+//! `insomnia-pod` バイナリをサブプロセスとして立ち上げ、`INSOMNIA-READY` を待つ
 //! ハンドシェイク。
 //!
 //! - 親プロセス (TUI / GUI / E2E) は overlay TOML を組み立ててこの関数に
@@ -258,7 +258,7 @@ async fn drain_stderr_into_tail(stderr_path: &Path, tail: &mut StderrTail, offse
 }
 
 /// Resolves the binary used to launch a child Pod. Must point at a
-/// `pod`-compatible executable — the parent reads the child's stderr
+/// `insomnia-pod`-compatible executable — the parent reads the child's stderr
 /// directly looking for `INSOMNIA-READY`, so any wrapper that emits
 /// extra lines on stderr will pollute that handshake.
 ///
@@ -271,7 +271,7 @@ fn resolve_pod_command() -> PathBuf {
     {
         return PathBuf::from(cmd);
     }
-    PathBuf::from("pod")
+    PathBuf::from("insomnia-pod")
 }
 
 struct StderrTail {

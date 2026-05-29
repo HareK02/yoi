@@ -56,7 +56,7 @@ manifest 中のパス（`model.auth.file` / `scope.*.target` /
 
 Pod の作業ディレクトリは manifest に含まれない。プロセス起動時の
 `std::env::current_dir()` がそのまま Pod の pwd となるため、別の作業
-ディレクトリで Pod を走らせたい場合は `cd` してから `pod` を起動する
+ディレクトリで Pod を走らせたい場合は `cd` してから `insomnia-pod` を起動する
 （または `SpawnPod` が子に対して行っているように、親プロセス側で
 `Command::current_dir` を明示する）。
 
@@ -297,12 +297,12 @@ import-map 形式のプレフィックスで指定する:
 
 ---
 
-## `pod` CLI
+## `insomnia-pod` CLI
 
-`pod` は通常、builtin default → user manifest → project manifest → overlay の cascade で manifest を解決して起動する。
+`insomnia-pod` は通常、builtin default → user manifest → project manifest → overlay の cascade で manifest を解決して起動する。
 
 ```
-pod [--project <path>] [--overlay <toml>] [-s/--store <path>] [--session <uuid>]
+insomnia-pod [--project <path>] [--overlay <toml>] [-s/--store <path>] [--session <uuid>]
 ```
 
 | フラグ | 説明 |
@@ -323,15 +323,15 @@ user manifest は CLI フラグではなく、以下の規則で解決する。
 単一ファイルだけで起動したい場合は cascade を使わず、`--manifest` を指定する。
 
 ```
-pod --manifest <path> [-s/--store <path>] [--session <uuid>]
+insomnia-pod --manifest <path> [-s/--store <path>] [--session <uuid>]
 ```
 
 `--manifest` は指定 TOML 1 枚だけを `PodManifest::from_toml` で読み、user / project / overlay layer は一切読まない。したがって `--project`、`--overlay`、非空の `INSOMNIA_USER_MANIFEST` とは併用不可。
 
 spawn 子 Pod 用の内部フラグとして `--adopt` と `--callback <path>` がある。これらは `SpawnPod` が scope allocation と親 callback socket を引き継がせるために使うもので、通常の手動起動では使わない。
 
-Pod の作業ディレクトリは `pod` 起動時の cwd が直接使われる。別ディレクトリで
-動かしたい場合は `cd <path> && pod ...` のように外側で `cd` してから起動する。
+Pod の作業ディレクトリは `insomnia-pod` 起動時の cwd が直接使われる。別ディレクトリで
+動かしたい場合は `cd <path> && insomnia-pod ...` のように外側で `cd` してから起動する。
 
 引数無しで起動すると、cwd + `manifest::paths` の自動解決だけで動く最小構成になる
 （overlay 無し、プロジェクトに `.insomnia/manifest.toml` があればそれを使う）。

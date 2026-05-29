@@ -1,9 +1,9 @@
 //! Inline-viewport "spawn Pod and attach" UX.
 //!
-//! Rendered at the user's current cursor position when `tui` is invoked
+//! Rendered at the user's current cursor position when `insomnia` is invoked
 //! with no positional argument. Walks the cwd for a `.insomnia/manifest.toml`
 //! to seed defaults, prompts for the Pod's name, and on confirmation
-//! launches the `pod` binary as an independent process with a freshly built
+//! launches the `insomnia-pod` binary as an independent process with a freshly built
 //! overlay (name + cwd scope when no project manifest exists). Once
 //! the process reports its socket via the `INSOMNIA-READY` stderr line,
 //! the dialog hands control back so main can switch the terminal to
@@ -90,7 +90,7 @@ type InlineTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 
 /// Source session for a resume run. `None` = fresh spawn (current
 /// behaviour); `Some(id)` swaps the dialog into "Resume Pod" mode and
-/// passes `--session <id>` to the spawned `pod` child.
+/// passes `--session <id>` to the spawned `insomnia-pod` child.
 pub async fn run(resume_from: Option<SegmentId>) -> Result<SpawnOutcome, SpawnError> {
     let defaults = load_spawn_defaults()?;
 
@@ -170,7 +170,7 @@ pub async fn run(resume_from: Option<SegmentId>) -> Result<SpawnOutcome, SpawnEr
     }
 }
 
-/// Launch `pod --pod <name>` without opening the name dialog. The child Pod
+/// Launch `insomnia-pod --pod <name>` without opening the name dialog. The child Pod
 /// resolves persisted Pod metadata if present, or creates a fresh same-name Pod
 /// with the usual TUI cwd-scope fallback.
 pub async fn run_pod_name(pod_name: String) -> Result<SpawnOutcome, SpawnError> {

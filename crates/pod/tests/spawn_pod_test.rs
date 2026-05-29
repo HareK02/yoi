@@ -2,7 +2,7 @@
 //!
 //! These tests exercise the tool's pod-registry delegation, subprocess
 //! launch, socket handoff, and `spawned_pods.json` write without relying
-//! on the real `pod` binary. `INSOMNIA_POD_COMMAND` is pointed at
+//! on the real `insomnia-pod` binary. `INSOMNIA_POD_COMMAND` is pointed at
 //! `/bin/true` (which exits immediately) while a test-owned Unix
 //! listener pre-binds the predicted socket path, so the tool sees the
 //! "child" as live.

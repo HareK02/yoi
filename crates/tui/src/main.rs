@@ -61,20 +61,20 @@ fn resolve_socket(pod_name: &str, override_path: Option<PathBuf>) -> PathBuf {
 #[derive(Debug)]
 enum Mode {
     Spawn,
-    /// `tui <name>` / `tui --pod <name>`: attach to a live Pod by name if
-    /// possible; otherwise launch `pod --pod <name>` so the pod process
+    /// `insomnia <name>` / `insomnia --pod <name>`: attach to a live Pod by name if
+    /// possible; otherwise launch `insomnia-pod --pod <name>` so the pod process
     /// resumes from name-keyed state or creates a fresh same-name Pod.
     PodName {
         pod_name: String,
         socket_override: Option<PathBuf>,
     },
-    /// `tui -r` / `tui --resume`: open the Pod picker, then attach to the
+    /// `insomnia -r` / `insomnia --resume`: open the Pod picker, then attach to the
     /// selected live Pod or restore the selected stopped Pod by name.
     Resume,
-    /// `tui --session <UUID>`: skip the picker, go straight to the
+    /// `insomnia --session <UUID>`: skip the picker, go straight to the
     /// resume name dialog with `id` baked in.
     ResumeWithSession(SegmentId),
-    /// `tui --multi`: open the multi-Pod dashboard. This is intentionally
+    /// `insomnia --multi`: open the multi-Pod dashboard. This is intentionally
     /// separate from `-r`/`--resume`, which keeps its single-Pod picker
     /// meaning.
     Multi,
@@ -232,18 +232,18 @@ async fn main() -> ExitCode {
     let mode = match parse_args() {
         Ok(m) => m,
         Err(e) => {
-            eprintln!("tui: {e}");
+            eprintln!("insomnia: {e}");
             return ExitCode::FAILURE;
         }
     };
 
     if let Err(e) = enable_raw_mode() {
-        eprintln!("tui: failed to enter raw mode: {e}");
+        eprintln!("insomnia: failed to enter raw mode: {e}");
         return ExitCode::FAILURE;
     }
     if let Err(e) = execute!(io::stdout(), EnableBracketedPaste) {
         let _ = disable_raw_mode();
-        eprintln!("tui: {e}");
+        eprintln!("insomnia: {e}");
         return ExitCode::FAILURE;
     }
 
@@ -280,7 +280,7 @@ async fn main() -> ExitCode {
             // duplicate. Other errors (pod-name failures, terminal setup
             // hiccups, etc.) need surfacing here.
             if e.downcast_ref::<spawn::SpawnError>().is_none() {
-                eprintln!("tui: {e}");
+                eprintln!("insomnia: {e}");
             }
             ExitCode::FAILURE
         }

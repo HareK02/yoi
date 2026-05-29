@@ -40,7 +40,7 @@ impl std::fmt::Display for MultiPodError {
             Self::Store(e) => write!(f, "session store error: {e}"),
             Self::NoPods => write!(
                 f,
-                "no pods found — start a fresh pod with `tui` or restore one with `tui -r`"
+                "no pods found — start a fresh pod with `insomnia` or restore one with `insomnia -r`"
             ),
         }
     }

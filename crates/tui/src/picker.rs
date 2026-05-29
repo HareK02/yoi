@@ -2,7 +2,7 @@
 //!
 //! Reads live Pod allocations from the runtime registry and stopped Pod state
 //! from the session store's name-keyed metadata. Picking a live row attaches to
-//! its socket; picking a stopped row restores via `pod --pod <name>`.
+//! its socket; picking a stopped row restores via `insomnia-pod --pod <name>`.
 
 use std::io;
 use std::path::PathBuf;
@@ -41,7 +41,7 @@ impl std::fmt::Display for PickerError {
             Self::Store(e) => write!(f, "session store error: {e}"),
             Self::NoPods => write!(
                 f,
-                "no pods found — start a fresh pod with `tui` and try again"
+                "no pods found — start a fresh pod with `insomnia` and try again"
             ),
         }
     }
@@ -64,7 +64,7 @@ impl From<session_store::StoreError> for PickerError {
 pub enum PickerOutcome {
     /// User picked a Pod. `socket_override` is set for live rows when the
     /// runtime registry knows the exact socket path; stopped rows leave it
-    /// empty so the caller restores with `pod --pod <name>`.
+    /// empty so the caller restores with `insomnia-pod --pod <name>`.
     Picked {
         pod_name: String,
         socket_override: Option<PathBuf>,

@@ -2,7 +2,7 @@
 //!
 //! Wires pod-registry delegation, overlay-TOML construction, subprocess
 //! launch, and socket handoff into a single `Tool` implementation. When
-//! the LLM calls `SpawnPod`, a fresh `pod` binary is exec'd in its own
+//! the LLM calls `SpawnPod`, a fresh `insomnia-pod` binary is exec'd in its own
 //! process group, the pod-registry is updated atomically, and the child's
 //! first turn is kicked off by handing its socket a `Method::Run`.
 
@@ -303,7 +303,8 @@ impl SpawnPodTool {
         overlay_toml: &str,
         predicted_socket: &Path,
     ) -> Result<(), ToolError> {
-        let pod_command = std::env::var("INSOMNIA_POD_COMMAND").unwrap_or_else(|_| "pod".into());
+        let pod_command =
+            std::env::var("INSOMNIA_POD_COMMAND").unwrap_or_else(|_| "insomnia-pod".into());
 
         // Pre-create the child's runtime dir so we have a stable place to
         // capture its stderr before it has had a chance to bind anything.
@@ -381,7 +382,7 @@ fn parse_scope(rules: &[ScopeRuleInput]) -> Result<Vec<ScopeRule>, ToolError> {
         .collect()
 }
 
-/// Serialise the overlay TOML that gets handed to the child `pod`
+/// Serialise the overlay TOML that gets handed to the child `insomnia-pod`
 /// binary via `--overlay`. `PodManifestConfig`'s `Serialize` impl is
 /// the single source of truth for the on-disk manifest format.
 ///

@@ -596,7 +596,7 @@ fn resolve_pod_command() -> PathBuf {
     {
         return PathBuf::from(cmd);
     }
-    PathBuf::from("pod")
+    PathBuf::from("insomnia-pod")
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
