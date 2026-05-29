@@ -22,20 +22,20 @@ A cross-check against `/home/hare/ghq/github.com/openai/codex` found that upstre
 
 Two implementation areas need to be corrected together so context safety checks match what the Responses backend actually receives:
 
-1. `openai_responses` request construction appears to project persisted `Item::Reasoning` entries, including `encrypted_content`, back into the next request without enforcing the intended `reasoning.context` / current-turn / function-call adjacency policy documented in `docs/ref/model-reasoning-context.md`.
+1. Responses reasoning items, including `encrypted_content`, must stay visible to request-shape diagnostics and documented accounting. Upstream Codex preserves reasoning items as normal API messages; Insomnia should not invent turn-boundary filtering or unverified `reasoning.context` request fields without API confirmation.
 2. Pod request-threshold safety checks appear to use persisted usage history and can miss in-flight usage records from earlier LLM calls in the same run, so a long tool loop can keep issuing requests based on stale token occupancy.
 
 ## Requirements
 
 - Reconcile `docs/ref/model-reasoning-context.md` with `crates/llm-worker/src/llm_client/scheme/openai_responses/request.rs`.
-  - Define exactly which reasoning items may be sent for `reasoning.context="current_turn"`.
+  - Document that persisted Responses reasoning items remain normal API messages unless an API-confirmed policy says otherwise.
   - Preserve the provider requirements for tool/function-call continuity.
-  - Do not silently resend old reasoning `encrypted_content` outside the documented policy.
+  - Do not introduce unverified client-side reasoning filtering or request fields as a context-safety mechanism.
 - Reconcile Insomnia model metadata/config semantics with upstream Codex's `context_window` / `max_context_window` split.
   - Support or document a backend max-window clamp so a user-visible 1M configured window cannot mask an effective backend limit such as 272k.
   - Ensure TUI displayed context window, compact thresholds, and request safety checks all use consistent effective-window semantics.
-- Update request construction so persisted reasoning items are included only when required by the documented policy.
-  - Add focused tests covering old reasoning items, current-turn reasoning, function-call adjacency, and encrypted reasoning content.
+- Keep request construction aligned with the documented reasoning policy.
+  - Add focused tests covering old reasoning items, function-call adjacency, encrypted reasoning content, and the absence of unverified `reasoning.context` serialization.
 - Update Pod context safety accounting so request-threshold / pre-request checks include in-flight `UsageTracker` records from the current run, not only persisted session-log usage history.
   - Ensure long same-run tool loops can trigger compact/prune/stop decisions using the latest successful usage before the next request is sent.
 - Preserve the existing principle that `Usage.input_tokens` is request prompt occupancy, while acknowledging failed `context_length_exceeded` responses may not include usage.
@@ -51,16 +51,16 @@ Two implementation areas need to be corrected together so context safety checks 
   - `codex-rs/protocol/src/openai_models.rs` derives `auto_compact_token_limit()` from the resolved context window.
   - `codex-rs/core/src/context_manager/history.rs` tracks `server_reasoning_included` and uses encrypted reasoning estimates only when the server usage does not already include them.
 - Do not blindly port Codex internals. Preserve Insomnia's existing manifest/model layering and session-log authority; add the smallest typed concepts needed to represent an effective backend max window and to make safety accounting conservative enough.
-- If exact reasoning inclusion policy is ambiguous, make the request builder policy explicit in code and tests, and update `docs/ref/model-reasoning-context.md` alongside the implementation.
+- If exact reasoning inclusion policy is ambiguous, keep the request builder policy explicit in code and tests, and update `docs/ref/model-reasoning-context.md` alongside the implementation. Do not add provider request fields that are not confirmed by local schema/upstream references.
 - Treat provider `context_length_exceeded` responses with `usage=null` as expected; diagnostics must rely on request-shape counters rather than nonexistent failed-request token usage.
 
 ## Acceptance criteria
 
-- `reasoning.context="current_turn"` no longer causes old persisted reasoning `encrypted_content` to be resent outside the documented policy.
+- Persisted Responses reasoning items, including old `encrypted_content`, remain normal API messages unless an API-confirmed policy says otherwise.
 - Function/tool-call continuity still works for Responses models that require adjacent reasoning/function-call state.
 - Request safety checks include current-run in-flight usage before sending subsequent LLM calls.
 - A focused regression test covers a single run with multiple LLM calls where later calls would exceed the threshold if in-flight usage were ignored.
-- A focused regression test covers a history containing old reasoning items and verifies request input contains only the allowed reasoning subset.
+- Focused regression tests cover a history containing old reasoning items, function-call continuity, encrypted reasoning diagnostics, and the absence of unverified `reasoning.context` serialization.
 - Context overflow diagnostics make it clear when provider usage is absent and expose request-size/reasoning-size counters.
 - `cargo fmt --check`
 - Relevant `cargo test` / `cargo check` for `llm-worker` and `pod` pass.
