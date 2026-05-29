@@ -4,14 +4,49 @@
 //! resolved artifact. Rust consumes the evaluated JSON artifact directly and
 //! validates it into the existing [`crate::PodManifest`] runtime contract.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{PodManifest, PodManifestConfig, ResolveError};
+use crate::{PodManifest, PodManifestConfig, ResolveError, paths};
 
 const PROFILE_FORMAT_V1: &str = "insomnia.nix-profile.v1";
+
+/// Registry source for discovered profiles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProfileRegistrySource {
+    Builtin,
+    User,
+    Project,
+}
+
+impl ProfileRegistrySource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Builtin => "builtin",
+            Self::User => "user",
+            Self::Project => "project",
+        }
+    }
+
+    fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "builtin" => Some(Self::Builtin),
+            "user" => Some(Self::User),
+            "project" => Some(Self::Project),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for ProfileRegistrySource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
 /// User selection of a profile source.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -19,11 +54,71 @@ const PROFILE_FORMAT_V1: &str = "insomnia.nix-profile.v1";
 pub enum ProfileSelector {
     /// A local Nix expression evaluated with `nix eval --json --file <path>`.
     Path { path: PathBuf },
+    /// A named profile discovered from builtin/user/project registries.
+    Named {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<ProfileRegistrySource>,
+        name: String,
+    },
+    /// The effective default from the discovered profile registry.
+    Default,
 }
 
 impl ProfileSelector {
     pub fn path(path: impl Into<PathBuf>) -> Self {
         Self::Path { path: path.into() }
+    }
+
+    pub fn named(name: impl Into<String>) -> Self {
+        Self::Named {
+            source: None,
+            name: name.into(),
+        }
+    }
+
+    pub fn source_named(source: ProfileRegistrySource, name: impl Into<String>) -> Self {
+        Self::Named {
+            source: Some(source),
+            name: name.into(),
+        }
+    }
+
+    /// Parse the CLI/TUI `--profile` argument.
+    ///
+    /// `path:<path>` always selects an explicit path. `builtin:<name>`,
+    /// `user:<name>`, and `project:<name>` require the given registry source.
+    /// Unqualified path-like values (containing `/`, starting with `.`, or ending
+    /// in `.nix`) remain compatible with the original explicit-path flow; other
+    /// values are discovered names. `default` asks discovery for the effective
+    /// default profile.
+    pub fn parse_cli(raw: &str) -> Self {
+        if raw == "default" {
+            return Self::Default;
+        }
+        if let Some(path) = raw.strip_prefix("path:") {
+            return Self::path(path);
+        }
+        if let Some((prefix, name)) = raw.split_once(':') {
+            if let Some(source) = ProfileRegistrySource::parse(prefix) {
+                return Self::source_named(source, name);
+            }
+        }
+        if raw.contains('/') || raw.starts_with('.') || raw.ends_with(".nix") {
+            Self::path(raw)
+        } else {
+            Self::named(raw)
+        }
+    }
+
+    pub fn display_label(&self) -> String {
+        match self {
+            Self::Path { path } => path.display().to_string(),
+            Self::Named { source, name } => match source {
+                Some(source) => format!("{source}:{name}"),
+                None => name.clone(),
+            },
+            Self::Default => "default".to_string(),
+        }
     }
 }
 
@@ -31,7 +126,194 @@ impl ProfileSelector {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProfileSource {
-    Path { path: PathBuf },
+    Path {
+        path: PathBuf,
+    },
+    Registry {
+        source: ProfileRegistrySource,
+        name: String,
+        path: PathBuf,
+    },
+}
+
+/// One profile discovered from a registry source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileRegistryEntry {
+    pub source: ProfileRegistrySource,
+    pub name: String,
+    pub path: PathBuf,
+    pub description: Option<String>,
+    pub is_default: bool,
+}
+
+impl ProfileRegistryEntry {
+    pub fn qualified_name(&self) -> String {
+        format!("{}:{}", self.source, self.name)
+    }
+}
+
+/// Discovered profile registry. User/project manifests contribute only profile
+/// discovery metadata (entries, aliases, defaults); those files are not merged
+/// into the selected profile's runtime manifest.
+#[derive(Debug, Clone, Default)]
+pub struct ProfileRegistry {
+    entries: Vec<ProfileRegistryEntry>,
+    aliases: Vec<ProfileAlias>,
+    default: Option<ProfileDefault>,
+}
+
+impl ProfileRegistry {
+    pub fn entries(&self) -> &[ProfileRegistryEntry] {
+        &self.entries
+    }
+
+    pub fn default_entry(&self) -> Result<&ProfileRegistryEntry, ProfileError> {
+        let default = self
+            .default
+            .as_ref()
+            .ok_or(ProfileError::NoDefaultProfile)?;
+        self.select_named(default.source, &default.name)
+    }
+
+    pub fn select(
+        &self,
+        selector: &ProfileSelector,
+    ) -> Result<&ProfileRegistryEntry, ProfileError> {
+        match selector {
+            ProfileSelector::Path { .. } => Err(ProfileError::InvalidArtifact(
+                "path selectors are not registry entries".to_string(),
+            )),
+            ProfileSelector::Default => self.default_entry(),
+            ProfileSelector::Named { source, name } => self.select_named(*source, name),
+        }
+    }
+
+    fn select_named(
+        &self,
+        source: Option<ProfileRegistrySource>,
+        name: &str,
+    ) -> Result<&ProfileRegistryEntry, ProfileError> {
+        let alias_matches: Vec<_> = self
+            .aliases
+            .iter()
+            .filter(|alias| alias.name == name && source.is_none_or(|s| s == alias.source))
+            .collect();
+        match alias_matches.as_slice() {
+            [alias] => return self.select_named(alias.target_source, &alias.target_name),
+            [] => {}
+            _ => {
+                return Err(ProfileError::AmbiguousProfileName {
+                    name: name.to_string(),
+                    matches: alias_matches
+                        .iter()
+                        .map(|alias| format!("{}:{}", alias.source, alias.name))
+                        .collect(),
+                });
+            }
+        }
+
+        let matches: Vec<_> = self
+            .entries
+            .iter()
+            .filter(|entry| entry.name == name && source.is_none_or(|s| s == entry.source))
+            .collect();
+        match matches.as_slice() {
+            [entry] => Ok(*entry),
+            [] => Err(ProfileError::ProfileNotFound {
+                selector: match source {
+                    Some(source) => format!("{source}:{name}"),
+                    None => name.to_string(),
+                },
+            }),
+            _ => Err(ProfileError::AmbiguousProfileName {
+                name: name.to_string(),
+                matches: matches.iter().map(|entry| entry.qualified_name()).collect(),
+            }),
+        }
+    }
+
+    fn push_entry(&mut self, entry: ProfileRegistryEntry) {
+        self.entries.push(entry);
+    }
+
+    fn push_alias(&mut self, alias: ProfileAlias) {
+        self.aliases.push(alias);
+    }
+
+    fn set_default(&mut self, default: ProfileDefault) {
+        self.default = Some(default);
+    }
+
+    fn mark_default_flags(&mut self) {
+        let Some(default) = self.default.clone() else {
+            return;
+        };
+        let Some(source) = default.source else {
+            return;
+        };
+        for entry in &mut self.entries {
+            entry.is_default = entry.source == source && entry.name == default.name;
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProfileAlias {
+    source: ProfileRegistrySource,
+    name: String,
+    target_source: Option<ProfileRegistrySource>,
+    target_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProfileDefault {
+    source: Option<ProfileRegistrySource>,
+    name: String,
+}
+
+/// Filesystem-backed profile discovery.
+#[derive(Debug, Clone)]
+pub struct ProfileDiscovery {
+    builtin_dir: Option<PathBuf>,
+    user_manifest: Option<PathBuf>,
+    project_manifest: Option<PathBuf>,
+}
+
+impl ProfileDiscovery {
+    pub fn for_cwd(cwd: &Path) -> Self {
+        Self {
+            builtin_dir: paths::builtin_profiles_dir(),
+            user_manifest: paths::user_manifest_path_with_env_override(),
+            project_manifest: crate::find_project_manifest_from(cwd),
+        }
+    }
+
+    pub fn with_sources(
+        builtin_dir: Option<PathBuf>,
+        user_manifest: Option<PathBuf>,
+        project_manifest: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            builtin_dir,
+            user_manifest,
+            project_manifest,
+        }
+    }
+
+    pub fn discover(&self) -> Result<ProfileRegistry, ProfileError> {
+        let mut registry = ProfileRegistry::default();
+        if let Some(dir) = &self.builtin_dir {
+            discover_profile_dir(&mut registry, ProfileRegistrySource::Builtin, dir)?;
+        }
+        if let Some(path) = &self.user_manifest {
+            load_profile_config_manifest(&mut registry, ProfileRegistrySource::User, path)?;
+        }
+        if let Some(path) = &self.project_manifest {
+            load_profile_config_manifest(&mut registry, ProfileRegistrySource::Project, path)?;
+        }
+        registry.mark_default_flags();
+        Ok(registry)
+    }
 }
 
 /// Metadata optionally emitted by `mkProfile`.
@@ -93,11 +375,36 @@ impl NixProfileResolver {
 
     pub fn resolve(&self, selector: &ProfileSelector) -> Result<ResolvedProfile, ProfileError> {
         match selector {
-            ProfileSelector::Path { path } => self.resolve_path(path),
+            ProfileSelector::Path { path } => self.resolve_path(
+                path,
+                ProfileSource::Path {
+                    path: absolutize(path)?,
+                },
+            ),
+            ProfileSelector::Named { .. } | ProfileSelector::Default => {
+                let cwd = std::env::current_dir().map_err(|source| ProfileError::CommandIo {
+                    path: PathBuf::from("."),
+                    source,
+                })?;
+                let registry = ProfileDiscovery::for_cwd(&cwd).discover()?;
+                let entry = registry.select(selector)?.clone();
+                self.resolve_path(
+                    &entry.path,
+                    ProfileSource::Registry {
+                        source: entry.source,
+                        name: entry.name,
+                        path: absolutize(&entry.path)?,
+                    },
+                )
+            }
         }
     }
 
-    fn resolve_path(&self, path: &Path) -> Result<ResolvedProfile, ProfileError> {
+    fn resolve_path(
+        &self,
+        path: &Path,
+        source: ProfileSource,
+    ) -> Result<ResolvedProfile, ProfileError> {
         let absolute_path = absolutize(path)?;
         let base_dir = absolute_path
             .parent()
@@ -137,17 +444,11 @@ impl NixProfileResolver {
 
         let raw_artifact: serde_json::Value =
             serde_json::from_slice(&output.stdout).map_err(|source| ProfileError::JsonParse {
-                path: absolute_path.clone(),
+                path: absolute_path,
                 source,
             })?;
 
-        resolve_profile_artifact(
-            ProfileSource::Path {
-                path: absolute_path,
-            },
-            &base_dir,
-            raw_artifact,
-        )
+        resolve_profile_artifact(source, &base_dir, raw_artifact)
     }
 }
 
@@ -210,6 +511,150 @@ impl ProfileEnvelope {
     }
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct ProfileConfigDocument {
+    #[serde(default)]
+    profiles: Option<ProfilesConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ProfilesConfig {
+    #[serde(default)]
+    default: Option<String>,
+    #[serde(default, alias = "entries")]
+    profile: BTreeMap<String, ProfileEntryConfig>,
+    #[serde(default, alias = "aliases")]
+    alias: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum ProfileEntryConfig {
+    Path(String),
+    Table {
+        path: PathBuf,
+        #[serde(default)]
+        description: Option<String>,
+    },
+}
+
+impl ProfileEntryConfig {
+    fn into_parts(self) -> (PathBuf, Option<String>) {
+        match self {
+            Self::Path(path) => (PathBuf::from(path), None),
+            Self::Table { path, description } => (path, description),
+        }
+    }
+}
+
+fn load_profile_config_manifest(
+    registry: &mut ProfileRegistry,
+    source: ProfileRegistrySource,
+    path: &Path,
+) -> Result<(), ProfileError> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let content = std::fs::read_to_string(path).map_err(|source| ProfileError::ConfigRead {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let document: ProfileConfigDocument =
+        toml::from_str(&content).map_err(|source| ProfileError::ConfigParse {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let Some(config) = document.profiles else {
+        return Ok(());
+    };
+    let base = path.parent().unwrap_or_else(|| Path::new("."));
+
+    for (name, entry_config) in config.profile {
+        let (entry_path, description) = entry_config.into_parts();
+        registry.push_entry(ProfileRegistryEntry {
+            source,
+            name,
+            path: join_if_relative(base, &entry_path),
+            description,
+            is_default: false,
+        });
+    }
+
+    for (name, target) in config.alias {
+        let (target_source, target_name) = parse_profile_ref(&target);
+        registry.push_alias(ProfileAlias {
+            source,
+            name,
+            target_source,
+            target_name,
+        });
+    }
+
+    if let Some(default) = config.default {
+        let (default_source, default_name) = parse_profile_ref(&default);
+        registry.set_default(ProfileDefault {
+            source: default_source.or(Some(source)),
+            name: default_name,
+        });
+    }
+
+    Ok(())
+}
+
+fn discover_profile_dir(
+    registry: &mut ProfileRegistry,
+    source: ProfileRegistrySource,
+    dir: &Path,
+) -> Result<(), ProfileError> {
+    if !dir.is_dir() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(dir).map_err(|source| ProfileError::ConfigRead {
+        path: dir.to_path_buf(),
+        source,
+    })? {
+        let entry = entry.map_err(|source| ProfileError::ConfigRead {
+            path: dir.to_path_buf(),
+            source,
+        })?;
+        let path = entry.path();
+        if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("nix") {
+            if let Some(name) = path.file_stem().and_then(|s| s.to_str()) {
+                registry.push_entry(ProfileRegistryEntry {
+                    source,
+                    name: name.to_string(),
+                    path,
+                    description: None,
+                    is_default: false,
+                });
+            }
+        } else if path.is_dir() {
+            let profile = path.join("profile.nix");
+            if profile.is_file() {
+                if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+                    registry.push_entry(ProfileRegistryEntry {
+                        source,
+                        name: name.to_string(),
+                        path: profile,
+                        description: None,
+                        is_default: false,
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_profile_ref(raw: &str) -> (Option<ProfileRegistrySource>, String) {
+    if let Some((prefix, name)) = raw.split_once(':') {
+        if let Some(source) = ProfileRegistrySource::parse(prefix) {
+            return (Some(source), name.to_string());
+        }
+    }
+    (None, raw.to_string())
+}
+
 fn extract_manifest_value(raw: &serde_json::Value) -> Result<serde_json::Value, ProfileError> {
     match raw {
         serde_json::Value::Object(map) => {
@@ -241,7 +686,15 @@ fn absolutize(path: &Path) -> Result<PathBuf, ProfileError> {
     }
 }
 
-/// Errors raised while evaluating and validating a profile.
+fn join_if_relative(base: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
+    }
+}
+
+/// Errors raised while evaluating, discovering, and validating a profile.
 #[derive(Debug, thiserror::Error)]
 pub enum ProfileError {
     #[error("invalid profile path {}: {message}", .path.display())]
@@ -270,6 +723,29 @@ pub enum ProfileError {
         #[source]
         source: serde_json::Error,
     },
+
+    #[error("failed to read profile registry config {}: {source}", .path.display())]
+    ConfigRead {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("failed to parse profile registry config {}: {source}", .path.display())]
+    ConfigParse {
+        path: PathBuf,
+        #[source]
+        source: toml::de::Error,
+    },
+
+    #[error("no default profile is configured")]
+    NoDefaultProfile,
+
+    #[error("profile not found: {selector}")]
+    ProfileNotFound { selector: String },
+
+    #[error("ambiguous profile name `{name}`; use a source-qualified selector such as {matches:?}")]
+    AmbiguousProfileName { name: String, matches: Vec<String> },
 
     #[error("failed to decode profile artifact envelope: {source}")]
     ArtifactShape {
@@ -300,6 +776,7 @@ pub enum ProfileError {
 mod tests {
     use super::*;
     use crate::{AuthRef, Permission, SchemeKind};
+    use tempfile::TempDir;
 
     fn artifact() -> serde_json::Value {
         serde_json::json!({
@@ -424,5 +901,122 @@ mod tests {
         assert!(matches!(err, ProfileError::NixUnavailable { .. }));
         assert!(err.to_string().contains("requires the `nix` command"));
         assert!(err.to_string().contains("--manifest"));
+    }
+
+    #[test]
+    fn parse_cli_preserves_paths_and_source_qualified_names() {
+        assert!(matches!(
+            ProfileSelector::parse_cli("./coder.nix"),
+            ProfileSelector::Path { .. }
+        ));
+        assert_eq!(
+            ProfileSelector::parse_cli("project:coder"),
+            ProfileSelector::source_named(ProfileRegistrySource::Project, "coder")
+        );
+        assert_eq!(
+            ProfileSelector::parse_cli("coder"),
+            ProfileSelector::named("coder")
+        );
+        assert_eq!(
+            ProfileSelector::parse_cli("default"),
+            ProfileSelector::Default
+        );
+    }
+
+    #[test]
+    fn discovery_reads_user_and_project_registry_and_project_default_wins() {
+        let tmp = TempDir::new().unwrap();
+        let user_manifest = tmp.path().join("user.toml");
+        let project_dir = tmp.path().join("project/.insomnia");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let project_manifest = project_dir.join("manifest.toml");
+        std::fs::write(
+            &user_manifest,
+            r#"
+[profiles]
+default = "coder"
+[profiles.profile]
+coder = "profiles/user-coder.nix"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &project_manifest,
+            r#"
+[profiles]
+default = "project:coder"
+[profiles.profile.coder]
+path = "profiles/project-coder.nix"
+description = "Project coder"
+"#,
+        )
+        .unwrap();
+
+        let registry =
+            ProfileDiscovery::with_sources(None, Some(user_manifest), Some(project_manifest))
+                .discover()
+                .unwrap();
+
+        let default = registry.default_entry().unwrap();
+        assert_eq!(default.source, ProfileRegistrySource::Project);
+        assert_eq!(default.name, "coder");
+        assert!(default.path.ends_with("profiles/project-coder.nix"));
+    }
+
+    #[test]
+    fn unqualified_ambiguous_names_fail_closed() {
+        let mut registry = ProfileRegistry::default();
+        registry.push_entry(ProfileRegistryEntry {
+            source: ProfileRegistrySource::User,
+            name: "coder".to_string(),
+            path: PathBuf::from("/user/coder.nix"),
+            description: None,
+            is_default: false,
+        });
+        registry.push_entry(ProfileRegistryEntry {
+            source: ProfileRegistrySource::Project,
+            name: "coder".to_string(),
+            path: PathBuf::from("/project/coder.nix"),
+            description: None,
+            is_default: false,
+        });
+
+        let err = registry
+            .select(&ProfileSelector::named("coder"))
+            .unwrap_err();
+        assert!(matches!(err, ProfileError::AmbiguousProfileName { .. }));
+        let selected = registry
+            .select(&ProfileSelector::source_named(
+                ProfileRegistrySource::Project,
+                "coder",
+            ))
+            .unwrap();
+        assert_eq!(selected.path, PathBuf::from("/project/coder.nix"));
+    }
+
+    #[test]
+    fn aliases_resolve_within_their_source() {
+        let mut registry = ProfileRegistry::default();
+        registry.push_entry(ProfileRegistryEntry {
+            source: ProfileRegistrySource::Project,
+            name: "coder".to_string(),
+            path: PathBuf::from("/project/coder.nix"),
+            description: None,
+            is_default: false,
+        });
+        registry.push_alias(ProfileAlias {
+            source: ProfileRegistrySource::Project,
+            name: "default-coder".to_string(),
+            target_source: Some(ProfileRegistrySource::Project),
+            target_name: "coder".to_string(),
+        });
+
+        let selected = registry
+            .select(&ProfileSelector::source_named(
+                ProfileRegistrySource::Project,
+                "default-coder",
+            ))
+            .unwrap();
+        assert_eq!(selected.name, "coder");
     }
 }

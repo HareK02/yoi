@@ -20,8 +20,8 @@ use std::time::Duration;
 use client::{SpawnConfig, spawn_pod};
 use crossterm::event::{self, Event as TermEvent, KeyCode, KeyEventKind, KeyModifiers};
 use manifest::{
-    PodManifestConfig, ScopeConfig, find_project_manifest_from, load_layer, user_manifest_path,
-    user_manifest_path_from_env,
+    PodManifestConfig, ProfileDiscovery, ScopeConfig, find_project_manifest_from, load_layer,
+    user_manifest_path, user_manifest_path_from_env,
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -93,11 +93,18 @@ type InlineTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 /// passes `--session <id>` to the spawned `insomnia-pod` child.
 pub async fn run(
     resume_from: Option<SegmentId>,
-    profile_path: Option<PathBuf>,
+    profile: Option<String>,
 ) -> Result<SpawnOutcome, SpawnError> {
     let defaults = load_spawn_defaults()?;
-    let scope_origin = match profile_path.as_ref() {
-        Some(path) => ScopeOrigin::FromProfile(path.clone()),
+    let selected_profile = profile
+        .map(|selector| ProfileSelection {
+            label: selector.clone(),
+            selector,
+            is_default: false,
+        })
+        .or(defaults.default_profile);
+    let scope_origin = match selected_profile.as_ref() {
+        Some(profile) => ScopeOrigin::FromProfile(profile.label.clone()),
         None => defaults.scope_origin,
     };
 
@@ -112,7 +119,7 @@ pub async fn run(
         resume_from,
         resume_by_pod_name: false,
         resume_scope: None,
-        profile_path,
+        profile: selected_profile,
     };
 
     let mut terminal = make_inline_terminal()?;
@@ -212,6 +219,14 @@ struct SpawnDefaults {
     cascade_has_scope: bool,
     scope_origin: ScopeOrigin,
     default_name: String,
+    default_profile: Option<ProfileSelection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProfileSelection {
+    selector: String,
+    label: String,
+    is_default: bool,
 }
 
 fn load_spawn_defaults() -> Result<SpawnDefaults, SpawnError> {
@@ -260,11 +275,24 @@ fn load_spawn_defaults() -> Result<SpawnDefaults, SpawnError> {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "pod".to_string());
 
+    let default_profile = default_profile_selection(&cwd);
+
     Ok(SpawnDefaults {
         cwd,
         cascade_has_scope,
         scope_origin,
         default_name,
+        default_profile,
+    })
+}
+
+fn default_profile_selection(cwd: &std::path::Path) -> Option<ProfileSelection> {
+    let registry = ProfileDiscovery::for_cwd(cwd).discover().ok()?;
+    let entry = registry.default_entry().ok()?;
+    Some(ProfileSelection {
+        selector: entry.qualified_name(),
+        label: format!("{} (default)", entry.name),
+        is_default: true,
     })
 }
 
@@ -287,7 +315,7 @@ fn form_for_pod_name(pod_name: String, defaults: SpawnDefaults) -> Form {
         resume_from: None,
         resume_by_pod_name: true,
         resume_scope: None,
-        profile_path: None,
+        profile: None,
     }
 }
 
@@ -361,7 +389,10 @@ async fn wait_for_ready(
 
     let config = SpawnConfig {
         pod_name: form.name.clone(),
-        profile_path: form.profile_path.clone(),
+        profile: form
+            .profile
+            .as_ref()
+            .map(|profile| profile.selector.clone()),
         overlay_toml: overlay_toml.to_string(),
         cwd,
         resume_from: form.resume_from,
@@ -438,7 +469,7 @@ enum ScopeOrigin {
     FromUser,
     FromProject,
     CwdDefault,
-    FromProfile(PathBuf),
+    FromProfile(String),
 }
 
 struct Form {
@@ -476,7 +507,7 @@ struct Form {
     /// Optional Nix profile passed to `insomnia-pod --profile` for fresh spawns.
     /// This is not used for resume/attach flows because those must restore Pod
     /// state rather than re-evaluate a profile source.
-    profile_path: Option<PathBuf>,
+    profile: Option<ProfileSelection>,
 }
 
 impl Form {
@@ -608,13 +639,10 @@ fn context_line(form: &Form) -> Line<'_> {
             ),
             Span::styled(" (write, default)", Style::default().fg(Color::DarkGray)),
         ]),
-        ScopeOrigin::FromProfile(ref path) => Line::from(vec![
+        ScopeOrigin::FromProfile(ref label) => Line::from(vec![
             Span::raw("  "),
             Span::styled("profile: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                path.display().to_string(),
-                Style::default().fg(Color::Green),
-            ),
+            Span::styled(label.as_str(), Style::default().fg(Color::Green)),
             Span::styled(" (resolved by pod)", Style::default().fg(Color::DarkGray)),
         ]),
     }
@@ -663,7 +691,7 @@ mod tests {
             resume_from: None,
             resume_by_pod_name: false,
             resume_scope: None,
-            profile_path: None,
+            profile: None,
         }
     }
 
@@ -674,6 +702,7 @@ mod tests {
             cascade_has_scope: true,
             scope_origin: ScopeOrigin::FromProject,
             default_name: "ignored".to_string(),
+            default_profile: None,
         };
         let f = form_for_pod_name("agent".to_string(), defaults);
 
@@ -772,6 +801,29 @@ permission = "write"
             ),
             Some(PathBuf::from("/default/manifest.toml")),
         );
+    }
+
+    #[test]
+    fn default_profile_selection_uses_project_registry_default() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        let insomnia = project.join(".insomnia");
+        std::fs::create_dir_all(&insomnia).unwrap();
+        std::fs::write(
+            insomnia.join("manifest.toml"),
+            r#"
+[profiles]
+default = "coder"
+[profiles.profile]
+coder = "profiles/coder.nix"
+"#,
+        )
+        .unwrap();
+
+        let selected = default_profile_selection(&project).unwrap();
+        assert_eq!(selected.selector, "project:coder");
+        assert_eq!(selected.label, "coder (default)");
+        assert!(selected.is_default);
     }
 
     #[test]

@@ -13,14 +13,15 @@ use session_store::{FsStore, PodMetadataStore, SegmentId, Store};
     about = "Spawn a Pod process from manifest layers or a single manifest file"
 )]
 struct Cli {
-    /// Nix profile to evaluate with `nix eval --json --file <PATH>`.
-    /// Profiles are resolved artifacts, not manifest-cascade layers.
+    /// Nix profile to evaluate. Accepts an explicit path, `path:<path>`, a
+    /// discovered profile name, `default`, or a source-qualified name such as
+    /// `project:coder`.
     #[arg(
         long,
-        value_name = "PATH",
+        value_name = "PROFILE",
         conflicts_with_all = ["manifest", "project", "overlay", "pod", "session", "adopt"]
     )]
-    profile: Option<PathBuf>,
+    profile: Option<String>,
 
     /// Pod name override for a freshly-created profile Pod. This does not use
     /// `--pod` restore semantics, so it must not attach/restore existing Pod
@@ -97,10 +98,11 @@ fn resolve_manifest_with_user_manifest_env_and_profile_loader<F>(
     load_profile_fn: F,
 ) -> Result<(PodManifest, PromptLoader), String>
 where
-    F: FnOnce(&Path, Option<&str>) -> Result<(PodManifest, PromptLoader), String>,
+    F: FnOnce(&ProfileSelector, Option<&str>) -> Result<(PodManifest, PromptLoader), String>,
 {
-    if let Some(path) = &cli.profile {
-        return load_profile_fn(path, cli.profile_pod_name.as_deref());
+    if let Some(profile) = &cli.profile {
+        let selector = ProfileSelector::parse_cli(profile);
+        return load_profile_fn(&selector, cli.profile_pod_name.as_deref());
     }
 
     let user_manifest = paths::user_manifest_path_from_env(user_manifest_env);
@@ -122,13 +124,16 @@ where
 }
 
 fn load_profile(
-    path: &Path,
+    selector: &ProfileSelector,
     pod_name_override: Option<&str>,
 ) -> Result<(PodManifest, PromptLoader), String> {
     let resolver = NixProfileResolver::new();
-    let mut resolved = resolver
-        .resolve(&ProfileSelector::path(path.to_path_buf()))
-        .map_err(|e| format!("failed to resolve profile {}: {e}", path.display()))?;
+    let mut resolved = resolver.resolve(selector).map_err(|e| {
+        format!(
+            "failed to resolve profile {}: {e}",
+            selector.display_label()
+        )
+    })?;
     if let Some(pod_name) = pod_name_override {
         resolved.manifest.pod.name = pod_name.to_string();
     }
@@ -468,9 +473,9 @@ permission = "write"
         let (manifest, loader) = resolve_manifest_with_user_manifest_env_and_profile_loader(
             &cli,
             Some(OsString::from("non-existent-user-manifest.toml")),
-            |path, pod_name| {
+            |selector, pod_name| {
                 called = true;
-                assert_eq!(path, profile.as_path());
+                assert_eq!(selector, &ProfileSelector::path(profile.clone()));
                 assert_eq!(pod_name, Some("from-profile-name"));
                 let mut manifest =
                     PodManifest::from_toml(&manifest_toml("from-profile", tmp.path())).unwrap();
@@ -486,6 +491,45 @@ permission = "write"
         assert_eq!(manifest.pod.name, "from-profile-name");
         assert!(loader.user_dir().is_none());
         assert!(loader.workspace_dir().is_none());
+    }
+
+    #[test]
+    fn profile_accepts_source_qualified_discovered_name() {
+        let tmp = TempDir::new().unwrap();
+        let cli = Cli::try_parse_from([
+            "insomnia-pod",
+            "--profile",
+            "project:coder",
+            "--profile-pod-name",
+            "from-profile-name",
+        ])
+        .unwrap();
+        let mut called = false;
+
+        let (manifest, _loader) = resolve_manifest_with_user_manifest_env_and_profile_loader(
+            &cli,
+            None,
+            |selector, pod_name| {
+                called = true;
+                assert_eq!(
+                    selector,
+                    &ProfileSelector::source_named(
+                        manifest::ProfileRegistrySource::Project,
+                        "coder"
+                    )
+                );
+                let mut manifest =
+                    PodManifest::from_toml(&manifest_toml("from-profile", tmp.path())).unwrap();
+                if let Some(pod_name) = pod_name {
+                    manifest.pod.name = pod_name.to_string();
+                }
+                Ok((manifest, PromptLoader::builtins_only()))
+            },
+        )
+        .unwrap();
+
+        assert!(called);
+        assert_eq!(manifest.pod.name, "from-profile-name");
     }
 
     #[test]

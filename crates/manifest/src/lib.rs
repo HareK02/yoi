@@ -18,8 +18,9 @@ pub use paths::{
     user_manifest_path, user_manifest_path_from_env, user_manifest_path_with_env_override,
 };
 pub use profile::{
-    NixProfileResolver, ProfileError, ProfileManifestSnapshot, ProfileMetadata, ProfileSelector,
-    ProfileSource, ResolvedProfile, resolve_profile_artifact,
+    NixProfileResolver, ProfileDiscovery, ProfileError, ProfileManifestSnapshot, ProfileMetadata,
+    ProfileRegistry, ProfileRegistryEntry, ProfileRegistrySource, ProfileSelector, ProfileSource,
+    ResolvedProfile, resolve_profile_artifact,
 };
 pub use protocol::{Permission, ScopeRule};
 pub use scope::{Scope, ScopeError, SharedScope};
