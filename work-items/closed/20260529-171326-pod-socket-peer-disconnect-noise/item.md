@@ -2,12 +2,12 @@
 id: 20260529-171326-pod-socket-peer-disconnect-noise
 slug: pod-socket-peer-disconnect-noise
 title: Treat Pod socket peer disconnects as normal connection close
-status: open
+status: closed
 kind: bug
 priority: P1
 labels: [pod, ipc, tui, noise]
 created_at: 2026-05-29T17:13:26Z
-updated_at: 2026-05-29T17:26:19Z
+updated_at: 2026-05-29T17:26:50Z
 assignee: null
 legacy_ticket: null
 ---
