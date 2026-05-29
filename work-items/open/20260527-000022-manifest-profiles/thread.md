@@ -25,3 +25,37 @@ The child orchestrator may split implementation among sub-Pods, but final merge/
 
 
 ---
+
+<!-- event: review author: hare at: 2026-05-29T16:52:47Z status: approve -->
+
+## Review: approve
+
+Reviewed the nested Pod implementation from branch `work/nix-manifest-profiles`.
+
+Result: approved after blocking fix.
+
+Findings:
+
+- Initial review found one blocking issue: `--profile` rejected non-empty `INSOMNIA_USER_MANIFEST`. That contradicted the profile design because a selected Nix profile is a standalone runtime config artifact and ambient user/project manifest cascade should not affect it.
+- The child orchestrator fixed this in commit `c9a175a fix: ignore user manifest for profiles` and added `profile_ignores_non_empty_user_manifest_env` without invoking real Nix.
+- Profile foundation is intentionally a vertical slice: explicit path-based Nix profile resolution, minimal Nix helper, CLI/TUI spawn entrypoints, resolved snapshot metadata, and restore-from-snapshot behavior. Rich discovery/default picker remains future work.
+
+Validation run by reviewer:
+
+- `cargo fmt --check`
+- `cargo test -p manifest profile -- --nocapture`
+- `cargo test -p pod --bin insomnia-pod profile -- --nocapture`
+- `cargo check -p session-store -p manifest -p pod -p client -p tui -p provider`
+- `cargo check -p pod -p tui`
+- `git diff --check`
+- Manual `nix eval --json --file` smoke check for `resources/nix/profile-lib.nix`
+
+Non-blocking follow-up candidates:
+
+- Hide or narrow `ResolvedProfile::raw_artifact` if future call sites might log/persist accidental raw Nix output.
+- Add a timeout around `nix eval` so profile startup cannot hang indefinitely.
+- Validate direct `client::SpawnConfig` construction that combines `profile_path` with `resume_from`; TUI currently avoids it.
+- Build richer profile discovery/default selection and the full TUI profile picker.
+
+
+---
