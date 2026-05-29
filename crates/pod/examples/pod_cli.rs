@@ -12,6 +12,7 @@
 //! ```
 
 use pod::{Pod, PodManifest, PodRunResult};
+use pod_store::{CombinedStore, FsPodStore};
 use session_store::FsStore;
 
 fn manifest_toml(pwd: &std::path::Path) -> String {
@@ -48,7 +49,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 2. Create a persistent store (temp dir for demo)
     let tmp = tempfile::tempdir()?;
-    let store = FsStore::new(tmp.path())?;
+    let store = CombinedStore::new(
+        FsStore::new(tmp.path().join("sessions"))?,
+        FsPodStore::new(tmp.path().join("pods"))?,
+    );
 
     // 3. Build the Pod from the single-layer manifest TOML
     let mut pod = Pod::from_manifest_toml(&toml, store).await?;

@@ -3,7 +3,6 @@
 //! Layout:
 //! - Segment log: `{root}/{session_id}/{segment_id}.jsonl`
 //! - Event trace: `{root}/{session_id}/{segment_id}.trace.jsonl`
-//! - Pod metadata: `{root}/pods/{pod_name}/metadata.json`
 //!
 //! The per-Session directory makes `list_segments(session_id)` an O(dir)
 //! scan and gives the fork tree a visible grouping in the filesystem.
@@ -17,7 +16,6 @@
 //! enumerable by the picker.
 
 use crate::event_trace::TraceEntry;
-use crate::pod_metadata::{PodMetadata, PodMetadataStore, validate_pod_name};
 use crate::segment_log::LogEntry;
 use crate::store::{Store, StoreError};
 use crate::{SegmentId, SessionId};
@@ -57,19 +55,6 @@ impl FsStore {
             .join(format!("{segment_id}.trace.jsonl"))
     }
 
-    fn pods_dir(&self) -> PathBuf {
-        self.root.join("pods")
-    }
-
-    fn pod_dir(&self, pod_name: &str) -> Result<PathBuf, StoreError> {
-        validate_pod_name(pod_name)?;
-        Ok(self.pods_dir().join(pod_name))
-    }
-
-    fn pod_metadata_path(&self, pod_name: &str) -> Result<PathBuf, StoreError> {
-        Ok(self.pod_dir(pod_name)?.join("metadata.json"))
-    }
-
     fn append_line(&self, path: &Path, line: &str) -> Result<(), StoreError> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -99,70 +84,6 @@ impl FsStore {
             entries.push(entry);
         }
         Ok(entries)
-    }
-}
-
-impl PodMetadataStore for FsStore {
-    fn write(&self, metadata: &PodMetadata) -> Result<(), StoreError> {
-        let path = self.pod_metadata_path(&metadata.pod_name)?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let content = serde_json::to_vec_pretty(metadata)?;
-        fs::write(path, content)?;
-        Ok(())
-    }
-
-    fn read_by_name(&self, pod_name: &str) -> Result<Option<PodMetadata>, StoreError> {
-        let path = self.pod_metadata_path(pod_name)?;
-        let content = match fs::read_to_string(path) {
-            Ok(content) => content,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(err) => return Err(StoreError::Io(err)),
-        };
-        Ok(Some(serde_json::from_str(&content)?))
-    }
-
-    fn list_names(&self) -> Result<Vec<String>, StoreError> {
-        let dir = self.pods_dir();
-        let mut names = Vec::new();
-        if !dir.exists() {
-            return Ok(names);
-        }
-        for entry in fs::read_dir(dir)? {
-            let entry = entry?;
-            if !entry.file_type()?.is_dir() {
-                continue;
-            }
-            if !entry.path().join("metadata.json").exists() {
-                continue;
-            }
-            let Some(name) = entry.file_name().to_str().map(ToOwned::to_owned) else {
-                continue;
-            };
-            if validate_pod_name(&name).is_ok() {
-                names.push(name);
-            }
-        }
-        names.sort();
-        Ok(names)
-    }
-
-    fn root_dir(&self) -> Option<PathBuf> {
-        Some(self.root.clone())
-    }
-
-    fn delete_by_name(&self, pod_name: &str) -> Result<(), StoreError> {
-        let path = self.pod_metadata_path(pod_name)?;
-        match fs::remove_file(&path) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(err) => return Err(StoreError::Io(err)),
-        }
-        if let Some(parent) = path.parent() {
-            let _ = fs::remove_dir(parent);
-        }
-        Ok(())
     }
 }
 

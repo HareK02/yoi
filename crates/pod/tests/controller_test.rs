@@ -9,9 +9,12 @@ use llm_worker::llm_client::event::{Event as LlmEvent, ResponseStatus, StatusEve
 use llm_worker::llm_client::types::Item;
 use llm_worker::llm_client::{ClientError, LlmClient, Request};
 use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
+use pod_store::{CombinedStore, FsPodStore};
 use session_store::{FsStore, LogEntry};
 
 use pod::{Event, Method, Pod, PodController, PodHandle, PodManifest, PodStatus};
+
+type TestStore = CombinedStore<FsStore, FsPodStore>;
 
 /// Reconstruct a worker-history-like `Vec<Item>` from the live session
 /// log mirror held by the Pod's broadcast sink. Replaces the previous
@@ -152,21 +155,24 @@ target = "./"
 permission = "write"
 "#;
 
-async fn make_pod(client: MockClient) -> Pod<MockClient, FsStore> {
+async fn make_pod(client: MockClient) -> Pod<MockClient, TestStore> {
     make_pod_with_pwd(client).await.0
 }
 
-async fn make_pod_with_pwd(client: MockClient) -> (Pod<MockClient, FsStore>, std::path::PathBuf) {
+async fn make_pod_with_pwd(client: MockClient) -> (Pod<MockClient, TestStore>, std::path::PathBuf) {
     make_pod_with_pwd_and_manifest(client, MANIFEST_TOML).await
 }
 
 async fn make_pod_with_pwd_and_manifest(
     client: MockClient,
     manifest_toml: &str,
-) -> (Pod<MockClient, FsStore>, std::path::PathBuf) {
+) -> (Pod<MockClient, TestStore>, std::path::PathBuf) {
     let manifest = PodManifest::from_toml(manifest_toml).unwrap();
     let store_tmp = tempfile::tempdir().unwrap();
-    let store = FsStore::new(store_tmp.path()).unwrap();
+    let store = CombinedStore::new(
+        FsStore::new(store_tmp.path()).unwrap(),
+        FsPodStore::new(store_tmp.path().join("pods")).unwrap(),
+    );
     std::mem::forget(store_tmp);
 
     // Separate tempdir to serve as the Pod's pwd/scope — these tests
@@ -184,7 +190,7 @@ async fn make_pod_with_pwd_and_manifest(
     (pod, pwd)
 }
 
-async fn spawn_controller(pod: Pod<MockClient, FsStore>) -> PodHandle {
+async fn spawn_controller(pod: Pod<MockClient, TestStore>) -> PodHandle {
     let tmp = tempfile::tempdir().unwrap();
     let runtime_base = tmp.path().to_owned();
     std::mem::forget(tmp);

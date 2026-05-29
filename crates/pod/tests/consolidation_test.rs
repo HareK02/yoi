@@ -26,7 +26,10 @@ use llm_worker::llm_client::{ClientError, LlmClient, Request};
 use memory::WorkspaceLayout;
 use memory::extract::{ExtractedPayload, write_staging};
 use memory::schema::SourceRef;
+use pod_store::{CombinedStore, FsPodStore};
 use session_store::FsStore;
+
+type TestStore = CombinedStore<FsStore, FsPodStore>;
 use tokio::sync::broadcast;
 
 use pod::{Event, Pod};
@@ -155,11 +158,14 @@ async fn make_pod_with(
     manifest_toml: &str,
     pwd: std::path::PathBuf,
     client: MockClient,
-) -> Pod<MockClient, FsStore> {
+) -> Pod<MockClient, TestStore> {
     let manifest = pod::PodManifest::from_toml(manifest_toml).unwrap();
 
     let store_tmp = tempfile::tempdir().unwrap();
-    let store = FsStore::new(store_tmp.path()).unwrap();
+    let store = CombinedStore::new(
+        FsStore::new(store_tmp.path()).unwrap(),
+        FsPodStore::new(store_tmp.path().join("pods")).unwrap(),
+    );
     std::mem::forget(store_tmp);
 
     let scope = pod::Scope::writable(&pwd).unwrap();
@@ -184,7 +190,7 @@ fn write_n_staging(layout: &WorkspaceLayout, n: usize) -> Vec<uuid::Uuid> {
     ids
 }
 
-fn attach_event_receiver(pod: &mut Pod<MockClient, FsStore>) -> broadcast::Receiver<Event> {
+fn attach_event_receiver(pod: &mut Pod<MockClient, TestStore>) -> broadcast::Receiver<Event> {
     let (tx, rx) = broadcast::channel(16);
     pod.attach_event_tx(tx);
     rx

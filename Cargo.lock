@@ -2166,6 +2166,7 @@ dependencies = [
  "memory",
  "minijinja",
  "pod-registry",
+ "pod-store",
  "protocol",
  "provider",
  "schemars",
@@ -2190,6 +2191,17 @@ dependencies = [
  "fs4",
  "libc",
  "manifest",
+ "serde",
+ "serde_json",
+ "session-store",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "pod-store"
+version = "0.1.0"
+dependencies = [
  "serde",
  "serde_json",
  "session-store",
@@ -3652,6 +3664,7 @@ dependencies = [
  "llm-worker",
  "manifest",
  "pod-registry",
+ "pod-store",
  "protocol",
  "pulldown-cmark",
  "ratatui",

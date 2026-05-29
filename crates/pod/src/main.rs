@@ -6,7 +6,8 @@ use manifest::{
     NixProfileResolver, PodManifest, PodManifestConfig, ProfileSelector, ScopeConfig, paths,
 };
 use pod::{Pod, PodController, PromptLoader};
-use session_store::{FsStore, PodMetadataStore, SegmentId, Store};
+use pod_store::{CombinedStore, FsPodStore, PodMetadataStore};
+use session_store::{FsStore, SegmentId, Store};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -229,13 +230,28 @@ async fn main() -> ExitCode {
             }
         },
     };
-    let store = match FsStore::new(&store_dir) {
+    let session_store = match FsStore::new(&store_dir) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("error: failed to initialize store at {store_dir:?}: {e}");
+            eprintln!("error: failed to initialize session store at {store_dir:?}: {e}");
             return ExitCode::FAILURE;
         }
     };
+    let pod_store_dir = match paths::data_dir() {
+        Some(data_dir) => data_dir.join("pods"),
+        None => store_dir
+            .parent()
+            .map(|parent| parent.join("pods"))
+            .unwrap_or_else(|| PathBuf::from("pods")),
+    };
+    let pod_store = match FsPodStore::new(&pod_store_dir) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: failed to initialize pod store at {pod_store_dir:?}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let store = CombinedStore::new(session_store, pod_store);
 
     let pod = if cli.adopt {
         let callback = match cli.callback.clone() {

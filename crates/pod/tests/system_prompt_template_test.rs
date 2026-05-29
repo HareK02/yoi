@@ -8,9 +8,12 @@ use futures::Stream;
 use llm_worker::Worker;
 use llm_worker::llm_client::event::{Event as LlmEvent, ResponseStatus, StatusEvent};
 use llm_worker::llm_client::{ClientError, LlmClient, Request};
+use pod_store::{CombinedStore, FsPodStore};
 use session_store::{FsStore, LogEntry, Store};
 
 use pod::{Pod, PodError, PromptLoader, SystemPromptTemplate};
+
+type TestStore = CombinedStore<FsStore, FsPodStore>;
 
 // ---------------------------------------------------------------------------
 // Mock LLM Client
@@ -99,11 +102,14 @@ permission = "write"
 async fn make_pod_with_body(
     body: &str,
     client: MockClient,
-) -> Result<(Pod<MockClient, FsStore>, PathBuf), PodError> {
+) -> Result<(Pod<MockClient, TestStore>, PathBuf), PodError> {
     let manifest = pod::PodManifest::from_toml(MINIMAL_MANIFEST_TOML).unwrap();
 
     let store_tmp = tempfile::tempdir().unwrap();
-    let store = FsStore::new(store_tmp.path()).unwrap();
+    let store = CombinedStore::new(
+        FsStore::new(store_tmp.path()).unwrap(),
+        FsPodStore::new(store_tmp.path().join("pods")).unwrap(),
+    );
     std::mem::forget(store_tmp);
 
     let pwd_tmp = tempfile::tempdir().unwrap();

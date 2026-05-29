@@ -16,11 +16,14 @@ use llm_worker::Worker;
 use llm_worker::llm_client::event::{Event as LlmEvent, ResponseStatus, StatusEvent};
 use llm_worker::llm_client::types::Item;
 use llm_worker::llm_client::{ClientError, LlmClient, Request};
+use pod_store::{CombinedStore, FsPodStore, PodMetadataStore};
 use protocol::{Event, Method, RunResult};
-use session_store::{FsStore, LogEntry, PodMetadataStore, Store};
+use session_store::{FsStore, LogEntry, Store};
 use tokio::sync::broadcast;
 
 use pod::{Pod, PodController};
+
+type TestStore = CombinedStore<FsStore, FsPodStore>;
 
 #[derive(Clone)]
 struct MockClient {
@@ -145,11 +148,14 @@ permission = "write"
 async fn make_pod_with_manifest(
     manifest_toml: &str,
     client: MockClient,
-) -> Pod<MockClient, FsStore> {
+) -> Pod<MockClient, TestStore> {
     let manifest = pod::PodManifest::from_toml(manifest_toml).unwrap();
 
     let store_tmp = tempfile::tempdir().unwrap();
-    let store = FsStore::new(store_tmp.path()).unwrap();
+    let store = CombinedStore::new(
+        FsStore::new(store_tmp.path()).unwrap(),
+        FsPodStore::new(store_tmp.path().join("pods")).unwrap(),
+    );
     std::mem::forget(store_tmp);
 
     let pwd_tmp = tempfile::tempdir().unwrap();
@@ -163,7 +169,7 @@ async fn make_pod_with_manifest(
     pod
 }
 
-async fn make_pod(client: MockClient) -> Pod<MockClient, FsStore> {
+async fn make_pod(client: MockClient) -> Pod<MockClient, TestStore> {
     make_pod_with_manifest(POST_RUN_MANIFEST_TOML, client).await
 }
 

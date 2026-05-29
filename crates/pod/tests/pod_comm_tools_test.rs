@@ -20,10 +20,11 @@ use pod::spawn::comm_tools::{
     list_pods_tool, read_pod_output_tool, send_to_pod_tool, stop_pod_tool,
 };
 use pod::spawn::registry::SpawnedPodRegistry;
+use pod_store::{CombinedStore, FsPodStore, PodMetadataStore};
 use protocol::stream::{JsonLineReader, JsonLineWriter};
 use protocol::{ErrorCode, Event, Greeting, Method};
 use serde_json::json;
-use session_store::{FsStore, PodMetadataStore};
+use session_store::FsStore;
 use tempfile::TempDir;
 use tokio::net::UnixListener;
 use tokio::sync::mpsc;
@@ -385,7 +386,10 @@ async fn stop_pod_sends_shutdown_and_releases_scope() {
     let _env = EnvGuard::acquire();
     let tmp = TempDir::new().unwrap();
     let store_tmp = TempDir::new().unwrap();
-    let store = FsStore::new(store_tmp.path()).unwrap();
+    let store = CombinedStore::new(
+        FsStore::new(store_tmp.path()).unwrap(),
+        FsPodStore::new(store_tmp.path().join("pods")).unwrap(),
+    );
     let rd = Arc::new(RuntimeDir::create(tmp.path(), "spawner").await.unwrap());
     let parent_scope = SharedScope::new(
         Scope::writable(tmp.path())
@@ -512,7 +516,10 @@ async fn restored_registry_uses_pod_state_without_runtime_file() {
     let _env = EnvGuard::acquire();
     let runtime_tmp = TempDir::new().unwrap();
     let store_tmp = TempDir::new().unwrap();
-    let store = FsStore::new(store_tmp.path()).unwrap();
+    let store = CombinedStore::new(
+        FsStore::new(store_tmp.path()).unwrap(),
+        FsPodStore::new(store_tmp.path().join("pods")).unwrap(),
+    );
     unsafe {
         std::env::set_var("INSOMNIA_RUNTIME_DIR", runtime_tmp.path());
     }
@@ -582,7 +589,10 @@ async fn restored_registry_uses_pod_state_without_runtime_file() {
 async fn load_from_pod_state_prunes_runtime_children_but_preserves_durable_state() {
     let runtime_tmp = TempDir::new().unwrap();
     let store_tmp = TempDir::new().unwrap();
-    let store = FsStore::new(store_tmp.path()).unwrap();
+    let store = CombinedStore::new(
+        FsStore::new(store_tmp.path()).unwrap(),
+        FsPodStore::new(store_tmp.path().join("pods")).unwrap(),
+    );
     let rd = Arc::new(
         RuntimeDir::create(runtime_tmp.path(), "spawner")
             .await
@@ -635,7 +645,10 @@ async fn load_from_pod_state_reclaims_pruned_child_scope_without_deleting_pod_st
     let _env = EnvGuard::acquire();
     let runtime_tmp = TempDir::new().unwrap();
     let store_tmp = TempDir::new().unwrap();
-    let store = FsStore::new(store_tmp.path()).unwrap();
+    let store = CombinedStore::new(
+        FsStore::new(store_tmp.path()).unwrap(),
+        FsPodStore::new(store_tmp.path().join("pods")).unwrap(),
+    );
     unsafe {
         std::env::set_var("INSOMNIA_RUNTIME_DIR", runtime_tmp.path());
     }

@@ -4,7 +4,8 @@ use std::sync::atomic::Ordering;
 
 use llm_worker::WorkerError;
 use llm_worker::llm_client::client::LlmClient;
-use session_store::{PodMetadataStore, Store};
+use pod_store::PodMetadataStore;
+use session_store::Store;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::discovery::{

@@ -20,10 +20,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use manifest::{Permission, ScopeRule, SharedScope};
-use session_store::{
-    PodMetadata, PodMetadataStore, PodScopeSnapshot, PodSpawnedChild, PodSpawnedScopeRule,
-    StoreError,
-};
+use pod_store::{PodMetadataStore, PodSpawnedChild, PodSpawnedScopeRule, PodStoreError};
+use session_store::PodScopeSnapshot;
 use tokio::net::UnixStream;
 use tokio::sync::Mutex;
 use tracing::warn;
@@ -304,18 +302,16 @@ fn write_records_to_pod_state<St>(
     store: &St,
     pod_name: &str,
     records: &[SpawnedPodRecord],
-) -> Result<(), StoreError>
+) -> Result<(), PodStoreError>
 where
     St: PodMetadataStore,
 {
-    let mut metadata = store
-        .read_by_name(pod_name)?
-        .unwrap_or_else(|| PodMetadata::new(pod_name, None));
-    metadata.spawned_children = records
+    let children = records
         .iter()
         .map(record_to_pod_state)
         .collect::<Result<Vec<_>, _>>()?;
-    store.write(&metadata)
+    store.set_spawned_children(pod_name, children)?;
+    Ok(())
 }
 
 fn record_to_pod_state(record: &SpawnedPodRecord) -> Result<PodSpawnedChild, serde_json::Error> {
@@ -366,7 +362,7 @@ fn record_from_pod_state(child: &PodSpawnedChild) -> Result<SpawnedPodRecord, se
     })
 }
 
-fn store_error_to_io(error: StoreError) -> io::Error {
+fn store_error_to_io(error: PodStoreError) -> io::Error {
     io::Error::other(error)
 }
 

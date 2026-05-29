@@ -9,9 +9,10 @@ use llm_worker::llm_client::client::LlmClient;
 use llm_worker::llm_client::types::Role;
 use llm_worker::state::Mutable;
 use llm_worker::{ToolOutputLimits, UsageRecord, Worker, WorkerError, WorkerResult};
+use pod_store::{PodActiveSegmentRef, PodMetadata, PodMetadataStore, PodStoreError};
 use session_store::{
-    LogEntry, PodActiveSegmentRef, PodMetadata, PodMetadataStore, PodScopeSnapshot, SegmentId,
-    SessionId, Store, StoreError, SystemItem, segment_log, to_logged,
+    LogEntry, PodScopeSnapshot, SegmentId, SessionId, Store, StoreError, SystemItem, segment_log,
+    to_logged,
 };
 use tracing::{info, warn};
 
@@ -53,18 +54,21 @@ pub struct SegmentLocation {
     pub segment_id: SegmentId,
 }
 
-type PodMetadataWriter = Arc<dyn Fn(PodMetadata) -> Result<(), StoreError> + Send + Sync>;
+type PodMetadataWriter = Arc<dyn Fn(PodMetadata) -> Result<(), PodStoreError> + Send + Sync>;
 
 fn pod_metadata_writer_for_store<St>(store: &St) -> PodMetadataWriter
 where
     St: PodMetadataStore + Clone + Send + Sync + 'static,
 {
     let store = store.clone();
-    Arc::new(move |mut metadata| {
-        if let Some(existing) = store.read_by_name(&metadata.pod_name)? {
-            metadata.spawned_children = existing.spawned_children;
-        }
-        store.write(&metadata)
+    Arc::new(move |metadata| {
+        store
+            .set_active(
+                &metadata.pod_name,
+                metadata.active,
+                metadata.resolved_manifest_snapshot,
+            )
+            .map(|_| ())
     })
 }
 
@@ -925,30 +929,32 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         metadata
     }
 
-    fn write_pod_metadata_pending(&self) -> Result<(), StoreError> {
+    fn write_pod_metadata_pending(&self) -> Result<(), PodError> {
         let Some(writer) = &self.pod_metadata_writer else {
             return Ok(());
         };
         writer(self.pod_metadata(Some(PodActiveSegmentRef::pending_segment(
             self.session_id(),
-        ))))
+        ))))?;
+        Ok(())
     }
 
-    fn write_pod_metadata_active(&self, loc: SegmentLocation) -> Result<(), StoreError> {
+    fn write_pod_metadata_active(&self, loc: SegmentLocation) -> Result<(), PodError> {
         let Some(writer) = &self.pod_metadata_writer else {
             return Ok(());
         };
         writer(self.pod_metadata(Some(PodActiveSegmentRef::active_segment(
             loc.session_id,
             loc.segment_id,
-        ))))
+        ))))?;
+        Ok(())
     }
 
     /// Enable name-keyed Pod metadata write-through for Pods built through
     /// the low-level constructor. High-level manifest constructors enable it
     /// automatically; this hook lets tests and custom embedders opt into the
     /// same persistence behavior without changing `Pod::new`'s minimal bounds.
-    pub fn enable_pod_metadata_write_through(&mut self) -> Result<(), StoreError>
+    pub fn enable_pod_metadata_write_through(&mut self) -> Result<(), PodError>
     where
         St: PodMetadataStore + Clone + Send + Sync + 'static,
     {
@@ -4438,6 +4444,7 @@ fn token_budget_bytes(tokens: u64) -> usize {
 pub enum RewindError {
     #[error(transparent)]
     Store(#[from] StoreError),
+
     #[error("{0}")]
     Invalid(String),
 }
@@ -4545,6 +4552,9 @@ pub enum PodError {
 
     #[error(transparent)]
     Store(#[from] StoreError),
+
+    #[error(transparent)]
+    PodStore(#[from] PodStoreError),
 
     #[error(transparent)]
     Scope(ScopeError),
