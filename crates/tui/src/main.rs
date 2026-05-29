@@ -40,7 +40,7 @@ use tokio::sync::mpsc;
 
 use client::PodClient;
 
-use crate::app::App;
+use crate::app::{ActionbarNoticeLevel, ActionbarNoticeSource, App};
 use crate::picker::PickerOutcome;
 use crate::spawn::{SpawnOutcome, SpawnReady};
 
@@ -1094,7 +1094,12 @@ fn handle_pause_or_quit(app: &mut App) -> Option<Method> {
         return None;
     }
     app.quit_confirm = Some(std::time::Instant::now());
-    app.push_error("Press Ctrl-C again within 3 s to exit the TUI (the Pod keeps running).");
+    app.flash_actionbar_notice(
+        "Press Ctrl-C again within 3 s to exit the TUI (the Pod keeps running).",
+        ActionbarNoticeLevel::Warn,
+        ActionbarNoticeSource::Tui,
+        CONFIRM_TIMEOUT,
+    );
     None
 }
 
@@ -1563,6 +1568,34 @@ mod tests {
             crate::block::Block::Alert { message, .. } => message.contains("compact requested"),
             _ => false,
         }));
+    }
+
+    #[test]
+    fn ctrl_c_quit_guard_uses_actionbar_notice_without_transcript_alert() {
+        let mut app = App::new("agent".to_string());
+        app.set_pod_status(PodStatus::Idle);
+
+        let method = handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        );
+
+        assert!(method.is_none());
+        assert!(!app.quit);
+        let notice = app
+            .current_actionbar_notice(std::time::Instant::now())
+            .expect("quit guard notice is active");
+        assert!(notice.text.contains("Pod keeps running"));
+        assert_eq!(notice.level, ActionbarNoticeLevel::Warn);
+        assert_eq!(notice.source, ActionbarNoticeSource::Tui);
+        assert!(!has_alert(&app, "Pod keeps running"));
+
+        let method = handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        );
+        assert!(method.is_none());
+        assert!(app.quit);
     }
 
     #[test]

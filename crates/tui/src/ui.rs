@@ -14,6 +14,8 @@
 //! lines, and render the tail that fits the history area. No
 //! `insert_before` use — the terminal scrollback stays untouched.
 
+use std::time::Instant;
+
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -25,7 +27,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use protocol::{AlertLevel, CompletionEntry, Greeting, PodEvent, Segment};
 
-use crate::app::{App, CompletionState, alert_source_label, fmt_tokens};
+use crate::app::{ActionbarNoticeLevel, App, CompletionState, alert_source_label, fmt_tokens};
 use crate::block::{Block, CompactEvent, ThinkingBlock, ThinkingState};
 use crate::command::CommandCandidate;
 use crate::task::{TaskCounts, TaskEntry, TaskStatus, TaskStore};
@@ -1334,30 +1336,60 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(right_line), area);
 }
 
-fn draw_actionbar(frame: &mut Frame, app: &App, area: Rect) {
-    let mut left: Vec<Span<'static>> = Vec::new();
+fn actionbar_left_item(app: &App, now: Instant) -> Option<(String, Style)> {
+    // Priority is deliberately actionable UI state first, then transient notices,
+    // then lower-priority lifecycle status. Right-side scroll/view labels are
+    // rendered independently below.
     if app.is_command_mode() {
-        left.push(Span::styled(
-            "COMMAND",
+        return Some((
+            "COMMAND".to_string(),
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         ));
-    } else if app.queued_input_count() > 0 {
-        left.push(Span::styled(
-            "Alt-q edit queued  Alt-c clear queued",
+    }
+    if app.queued_input_count() > 0 {
+        return Some((
+            "Alt-q edit queued  Alt-c clear queued".to_string(),
             Style::default().fg(Color::DarkGray),
         ));
-    } else if let Some(llm_event) = app.latest_llm_wait_event.as_deref() {
-        left.push(Span::styled(
+    }
+    if let Some(notice) = app.current_actionbar_notice(now) {
+        return Some((
+            truncate_with_ellipsis(&notice.text, 96),
+            actionbar_notice_style(notice.level),
+        ));
+    }
+    if let Some(llm_event) = app.latest_llm_wait_event.as_deref() {
+        return Some((
             truncate_with_ellipsis(llm_event, 96),
             Style::default().fg(Color::Yellow),
         ));
-    } else if let Some(memory_event) = app.latest_memory_worker_event.as_deref() {
-        left.push(Span::styled(
+    }
+    if let Some(memory_event) = app.latest_memory_worker_event.as_deref() {
+        return Some((
             truncate_with_ellipsis(memory_event, 72),
             Style::default().fg(Color::Blue),
         ));
+    }
+    None
+}
+
+fn actionbar_notice_style(level: ActionbarNoticeLevel) -> Style {
+    match level {
+        ActionbarNoticeLevel::Info => Style::default().fg(Color::Cyan),
+        ActionbarNoticeLevel::Warn => Style::default().fg(Color::Yellow),
+        ActionbarNoticeLevel::Error => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+    }
+}
+
+fn draw_actionbar(frame: &mut Frame, app: &mut App, area: Rect) {
+    let now = Instant::now();
+    app.clear_expired_actionbar_notice(now);
+
+    let mut left: Vec<Span<'static>> = Vec::new();
+    if let Some((text, style)) = actionbar_left_item(app, now) {
+        left.push(Span::styled(text, style));
     }
 
     let mut right: Vec<Span<'static>> = Vec::new();
@@ -1569,8 +1601,9 @@ fn format_pod_event(event: &PodEvent) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::App;
+    use crate::app::{ActionbarNoticeLevel, ActionbarNoticeSource, App};
     use protocol::PodStatus;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn queue_status_text_includes_count_and_preview() {
@@ -1592,5 +1625,60 @@ mod tests {
         let app = App::new("test".into());
 
         assert_eq!(queue_status_text(&app), None);
+    }
+
+    #[test]
+    fn actionbar_notice_priority_sits_below_actionable_hints_and_above_lifecycle_status() {
+        let mut app = App::new("test".into());
+        let now = Instant::now();
+        app.latest_llm_wait_event = Some("retrying LLM request".into());
+        app.latest_memory_worker_event = Some("memory extract running".into());
+        app.flash_actionbar_notice_at(
+            "Pod keeps running. Press Ctrl-C again to exit TUI.",
+            ActionbarNoticeLevel::Warn,
+            ActionbarNoticeSource::Tui,
+            now,
+            Duration::from_secs(3),
+        );
+
+        assert_eq!(
+            actionbar_left_item(&app, now).map(|(text, _)| text),
+            Some("Pod keeps running. Press Ctrl-C again to exit TUI.".into())
+        );
+
+        app.set_pod_status(PodStatus::Running);
+        for c in "queued turn".chars() {
+            app.insert_char(c);
+        }
+        assert!(app.submit_input().is_none());
+        assert_eq!(
+            actionbar_left_item(&app, now).map(|(text, _)| text),
+            Some("Alt-q edit queued  Alt-c clear queued".into())
+        );
+
+        app.enter_command_mode();
+        assert_eq!(
+            actionbar_left_item(&app, now).map(|(text, _)| text),
+            Some("COMMAND".into())
+        );
+    }
+
+    #[test]
+    fn expired_actionbar_notice_is_skipped_for_lifecycle_status() {
+        let mut app = App::new("test".into());
+        let now = Instant::now();
+        app.latest_llm_wait_event = Some("retrying LLM request".into());
+        app.flash_actionbar_notice_at(
+            "expired",
+            ActionbarNoticeLevel::Info,
+            ActionbarNoticeSource::Tui,
+            now,
+            Duration::from_secs(1),
+        );
+
+        assert_eq!(
+            actionbar_left_item(&app, now + Duration::from_secs(1)).map(|(text, _)| text),
+            Some("retrying LLM request".into())
+        );
     }
 }
