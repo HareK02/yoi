@@ -59,3 +59,23 @@ Non-blocking follow-up candidates:
 
 
 ---
+
+<!-- event: plan author: hare at: 2026-05-29T16:59:41Z -->
+
+## Plan
+
+Continue implementation beyond the merged Nix profile foundation. The previous nested delegation stopped at a reviewable vertical slice; this phase should keep iterating until the work item acceptance criteria are materially closer to completion or a real blocker is found.
+
+Phase 2 target:
+
+- Add profile discovery/default selection instead of requiring only explicit `--profile <path>`.
+- Support discovered-name selection with source disambiguation where needed, e.g. builtin/user/project/path semantics.
+- Add or substantially advance the new Pod profile selection UX so a default can be displayed as `profile: coder (default)` and changed before spawn.
+- Preserve the core design: selected Nix profile resolves to a standalone manifest/config artifact; ambient user/project manifests do not merge into it.
+- Keep Pod resume using resolved snapshots rather than silent Nix re-evaluation.
+- Keep secrets as references only.
+
+The delegated orchestrator should not return merely because one slice is reviewable. It should internally review acceptance criteria, delegate sub-Pods as needed, and continue with the next reachable slice unless it hits a concrete design or technical blocker. Parent-side merge/close remains reserved for this parent Pod.
+
+
+---
