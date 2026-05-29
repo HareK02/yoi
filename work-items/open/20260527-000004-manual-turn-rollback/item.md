@@ -7,7 +7,7 @@ kind: task
 priority: P2
 labels: [tui, pod, ux]
 created_at: 2026-05-27T00:00:04Z
-updated_at: 2026-05-29T01:38:57Z
+updated_at: 2026-05-29T02:14:36Z
 assignee: null
 legacy_ticket: tickets/manual-turn-rollback.md
 ---
@@ -26,6 +26,12 @@ legacy_ticket: tickets/manual-turn-rollback.md
 - `:rollback` は `:rewind` の alias として扱ってよい。
 - `Ctrl+R` は rewind/rollback を表す shortcut として、同じ picker を開く。
 - `:rewind` / `Ctrl+R` は引数を取らず、TUI 内の picker を開く。
+- Rewind picker は popup/overlay ではなく、通常の conversation/history view area を一時的に置き換える dedicated view として表示する。
+  - composer/input area と actionbar/status area は通常通り残す。
+  - main view area だけが message history から rewind target list に切り替わる。
+  - Esc 等で picker を閉じると、通常の conversation/history view に戻る。
+- `:rewind` command は `Idle` / `Paused` の時だけ picker を開く。`Running` 中は visible diagnostic を出して何もしない。
+- `Ctrl+R` shortcut も Pod が停止中 (`Idle` または `Paused`) の時だけ有効にする。`Running` 中は無視または visible diagnostic にする。
 - picker は過去の user message を新しい順に表示する。
   - turn number / index
   - timestamp または relative time
@@ -50,8 +56,8 @@ Manual rewind は destructive operation として扱う。選択地点より後�
 
 Initial safety policy:
 
-- Pod が `Idle` の時だけ許可する。
-- `Running` / `Paused` 中は拒否する。
+- Pod が `Idle` または `Paused` の時だけ許可する。
+- `Running` 中は拒否する。
 - picker 表示時から head が変わった場合は apply 時に再検証して拒否する。
 - segment rotation / compaction を跨ぐ rewind は初期実装では対象外でよい。
 - suffix に tool call / tool result / other side-effect-looking entries が含まれる場合でも、初期方針としては destructive rewind を許可してよい。ただし UI には「以降の履歴は破棄され、tool side effects は undo されない」ことが分かる notice/diagnostic を出す。
@@ -118,11 +124,12 @@ RewindTargetId {
 
 ## Acceptance criteria
 
-- `:rewind` opens a picker of past user messages.
-- `Ctrl+R` opens the same picker.
+- `:rewind` opens a picker of past user messages by replacing the normal conversation/history view area, not by drawing a small popup.
+- `Ctrl+R` opens the same picker only while Pod status is `Idle` or `Paused`; it is disabled/rejected while `Running`.
 - Selecting a message rewinds the Pod state to before that message and restores the message into the TUI composer.
 - Rewind does not auto-run; pressing Enter after selection retries the restored message.
 - Rewind success updates Pod session log, SegmentLogSink mirror, worker state, and TUI display consistently.
+- Esc returns from the rewind picker to the normal conversation/history view without changing Pod state.
 - Rewind failure leaves state unchanged and shows a clear reason.
 - Picker selections are revalidated at apply time to avoid stale-head corruption.
 - Rewound suffix is intentionally discarded; no fork is created.
