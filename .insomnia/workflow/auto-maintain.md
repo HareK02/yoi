@@ -8,7 +8,7 @@ requires: []
 
 insomnia を AI maintainer として運用するための半自動 loop。TODO / tickets から「今進められそうな作業」を選ぶだけでなく、課題の発見、設計判断の切り分け、次に人間へ戻すべき問いの整理までを扱う。
 
-これは unattended 自動開発ではない。実装の並列委譲は `multi-agent-workflow`、worktree の機械的作成は `worktree-workflow` に任せる。本 Workflow はその前段として、何を進めるべきか、何をまだ決めるべきかを整理する。
+これは unattended 自動開発ではない。実装の並列委譲は `multi-agent-workflow`、worktree の機械的作成は `worktree-workflow` に任せる。本 Workflow はその前段として、何を進めるべきか、何をまだ決めるべきか、下位 orchestrator にどの intent packet を渡すべきかを整理する。
 
 参照:
 
@@ -24,6 +24,7 @@ AI maintainer の目的は、コードを書くこと自体ではなく、プロ
 - TODO / tickets / docs / git history を読んで現在地を把握する。
 - 実装可能な ticket と、方針決定が必要な ticket を分ける。
 - 小さく実装できる候補を提案する。
+- 複数 ticket からなる作業群は、下位 orchestrator に任せる単位として整理する。
 - 設計相談が必要な論点を人間に戻す。
 - 運用上の問題や繰り返し発生する詰まりを report / ticket / workflow 改訂候補として整理する。
 
@@ -65,7 +66,7 @@ TODO と ticket の不整合を見つけたら、勝手に修正せず、まず�
 - 大きな設計判断が不要。
 - scope を狭く切れる。
 
-この場合は、人間に候補として提示する。人間が実行を許可したら `$user/multi-agent-workflow` に進む。
+この場合は、人間に候補として提示する。人間が実行を許可したら `$user/multi-agent-workflow` に進む。複数 ticket や連続した作業群では、最上位 Pod が直接 coder を抱えず、下位 orchestrator に intent packet を渡して coder / reviewer sibling loop を管理させる。
 
 ### B. 方針決定が必要
 
@@ -89,6 +90,7 @@ TODO と ticket の不整合を見つけたら、勝手に修正せず、まず�
 
 - 同じ tool 問題が繰り返し出る。
 - Workflow の指示が曖昧で実装 Pod が迷った。
+- coder / reviewer / orchestrator の責務が混ざり、親 Pod が細かい code review に戻ってしまった。
 - AI が過剰に Task tool を使うなど、運用上の癖が出た。
 - 通知や Pod completion tracking など、開発基盤の不足が観測された。
 
@@ -114,9 +116,12 @@ TODO と ticket の不整合を見つけたら、勝手に修正せず、まず�
    - 「次に進めるなら X」を1つ推奨する。
    - 理由を短く述べる。
    - 実装委譲する場合の scope / test 方針を添える。
+   - 複数 ticket の作業群なら、下位 orchestrator に任せる単位として提示する。
 
 5. 実行への接続
    - 人間が「進めて」と言ったら `$user/multi-agent-workflow` に接続する。
+   - 単発 ticket か、下位 orchestrator に任せる ticket 群かを明示する。
+   - 下位 orchestrator に渡す intent / requirements / invariants / non-goals / escalation 条件を短くまとめる。
    - worktree 作成は `$user/worktree-workflow` に従う。
 
 ## エスカレーション基準
@@ -129,7 +134,7 @@ TODO と ticket の不整合を見つけたら、勝手に修正せず、まず�
 - 新 ticket の作成、既存 ticket の大幅変更、ticket 完了削除について合意がない。
 - test 不能、再現不能、または作業範囲外の不具合に遭遇した。
 - WorkItem / Thread / Lease / maintainer state など、まだ設計中の概念が必要になる。
-
+- 下位 orchestrator に委譲するには intent / invariant / escalation 条件が曖昧すぎる。
 
 ## まだ固定しないもの
 
