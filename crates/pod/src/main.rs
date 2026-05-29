@@ -88,17 +88,22 @@ fn resolve_manifest_with_user_manifest_env(
     cli: &Cli,
     user_manifest_env: Option<OsString>,
 ) -> Result<(PodManifest, PromptLoader), String> {
-    let user_manifest = paths::user_manifest_path_from_env(user_manifest_env);
+    resolve_manifest_with_user_manifest_env_and_profile_loader(cli, user_manifest_env, load_profile)
+}
 
+fn resolve_manifest_with_user_manifest_env_and_profile_loader<F>(
+    cli: &Cli,
+    user_manifest_env: Option<OsString>,
+    load_profile_fn: F,
+) -> Result<(PodManifest, PromptLoader), String>
+where
+    F: FnOnce(&Path, Option<&str>) -> Result<(PodManifest, PromptLoader), String>,
+{
     if let Some(path) = &cli.profile {
-        if user_manifest.is_some() {
-            return Err(format!(
-                "--profile cannot be used when {} is set",
-                paths::USER_MANIFEST_ENV
-            ));
-        }
-        return load_profile(path, cli.profile_pod_name.as_deref());
+        return load_profile_fn(path, cli.profile_pod_name.as_deref());
     }
+
+    let user_manifest = paths::user_manifest_path_from_env(user_manifest_env);
 
     if let Some(path) = &cli.manifest {
         if user_manifest.is_some() {
@@ -444,6 +449,43 @@ permission = "write"
 
         assert!(err.contains("--manifest cannot be used"));
         assert!(err.contains(paths::USER_MANIFEST_ENV));
+    }
+
+    #[test]
+    fn profile_ignores_non_empty_user_manifest_env() {
+        let tmp = TempDir::new().unwrap();
+        let profile = tmp.path().join("profile.nix");
+        let cli = Cli::try_parse_from([
+            "insomnia-pod",
+            "--profile",
+            profile.to_str().unwrap(),
+            "--profile-pod-name",
+            "from-profile-name",
+        ])
+        .unwrap();
+        let mut called = false;
+
+        let (manifest, loader) = resolve_manifest_with_user_manifest_env_and_profile_loader(
+            &cli,
+            Some(OsString::from("non-existent-user-manifest.toml")),
+            |path, pod_name| {
+                called = true;
+                assert_eq!(path, profile.as_path());
+                assert_eq!(pod_name, Some("from-profile-name"));
+                let mut manifest =
+                    PodManifest::from_toml(&manifest_toml("from-profile", tmp.path())).unwrap();
+                if let Some(pod_name) = pod_name {
+                    manifest.pod.name = pod_name.to_string();
+                }
+                Ok((manifest, PromptLoader::builtins_only()))
+            },
+        )
+        .unwrap();
+
+        assert!(called);
+        assert_eq!(manifest.pod.name, "from-profile-name");
+        assert!(loader.user_dir().is_none());
+        assert!(loader.workspace_dir().is_none());
     }
 
     #[test]
