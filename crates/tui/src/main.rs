@@ -439,7 +439,7 @@ async fn run_multi() -> Result<(), Box<dyn std::error::Error>> {
                         return Err(error);
                     }
                 }
-                app.reload().await?;
+                app.reload_or_notice().await;
             }
         }
     }
