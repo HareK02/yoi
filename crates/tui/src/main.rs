@@ -992,7 +992,7 @@ fn handle_command_key(app: &mut App, key: KeyEvent) -> Option<Method> {
             app.exit_command_mode();
             None
         }
-        KeyCode::Enter => app.submit_command(),
+        KeyCode::Enter => app.submit_command_with_completion(),
         KeyCode::Backspace => {
             if app.command_text().is_empty() {
                 app.exit_command_mode();
@@ -1014,11 +1014,19 @@ fn handle_command_key(app: &mut App, key: KeyEvent) -> Option<Method> {
             None
         }
         KeyCode::Up => {
-            app.move_cursor_up();
+            if app.command_completion_active() {
+                app.move_command_completion_up();
+            } else {
+                app.move_cursor_up();
+            }
             None
         }
         KeyCode::Down => {
-            app.move_cursor_down();
+            if app.command_completion_active() {
+                app.move_command_completion_down();
+            } else {
+                app.move_cursor_down();
+            }
             None
         }
         KeyCode::Home => {
@@ -1029,7 +1037,10 @@ fn handle_command_key(app: &mut App, key: KeyEvent) -> Option<Method> {
             app.move_cursor_end();
             None
         }
-        KeyCode::Tab => None,
+        KeyCode::Tab => {
+            app.apply_command_completion();
+            None
+        }
         KeyCode::Char(c) => {
             if key
                 .modifiers
@@ -1556,6 +1567,204 @@ mod tests {
         let suggestions = app.command_suggestions();
         assert_eq!(suggestions.len(), 1);
         assert_eq!(suggestions[0].name, "noop");
+    }
+
+    #[test]
+    fn command_completion_tab_applies_unambiguous_candidate() {
+        let mut app = App::new("agent".to_string());
+        enter_command_mode(&mut app);
+        type_keys(&mut app, "no");
+
+        assert!(handle_key(&mut app, key(KeyCode::Tab)).is_none());
+
+        assert!(app.is_command_mode());
+        assert_eq!(app.command_text(), "noop ");
+        assert_eq!(input_text(&app), "");
+    }
+
+    #[test]
+    fn command_completion_enter_applies_and_executes_unambiguous_candidate() {
+        let mut app = App::new("agent".to_string());
+        enter_command_mode(&mut app);
+        type_keys(&mut app, "no");
+
+        let method = handle_key(&mut app, key(KeyCode::Enter));
+
+        assert!(method.is_none());
+        assert!(!app.is_command_mode());
+        assert_eq!(input_text(&app), "");
+        assert!(has_alert(&app, "noop: no action"));
+    }
+
+    #[test]
+    fn command_completion_ambiguous_candidate_requires_selection_or_more_input() {
+        let mut app = App::new("agent".to_string());
+        register_test_command(&mut app, "open", "open", parse_no_args, "open executed");
+        register_test_command(
+            &mut app,
+            "options",
+            "options",
+            parse_no_args,
+            "options executed",
+        );
+        enter_command_mode(&mut app);
+        type_keys(&mut app, "o");
+
+        assert!(handle_key(&mut app, key(KeyCode::Tab)).is_none());
+        assert_eq!(app.command_text(), "o");
+        assert!(app.is_command_mode());
+        assert!(has_alert(&app, "Ambiguous command completion"));
+
+        let before = app.blocks.len();
+        let method = handle_key(&mut app, key(KeyCode::Enter));
+        assert!(method.is_none());
+        assert_eq!(app.command_text(), "o");
+        assert!(app.is_command_mode());
+        assert!(app.blocks.len() > before);
+        assert!(!has_alert(&app, "open executed"));
+        assert!(!has_alert(&app, "options executed"));
+    }
+
+    #[test]
+    fn command_completion_selected_candidate_applies_on_enter() {
+        let mut app = App::new("agent".to_string());
+        register_test_command(&mut app, "open", "open", parse_no_args, "open executed");
+        register_test_command(
+            &mut app,
+            "options",
+            "options",
+            parse_no_args,
+            "options executed",
+        );
+        enter_command_mode(&mut app);
+        type_keys(&mut app, "o");
+
+        assert!(handle_key(&mut app, key(KeyCode::Down)).is_none());
+        let method = handle_key(&mut app, key(KeyCode::Enter));
+
+        assert!(method.is_none());
+        assert!(!app.is_command_mode());
+        assert!(has_alert(&app, "open executed"));
+        assert!(!has_alert(&app, "options executed"));
+    }
+
+    #[test]
+    fn command_completion_argument_required_keeps_command_mode_after_name_completion() {
+        let mut app = App::new("agent".to_string());
+        register_test_command(
+            &mut app,
+            "open",
+            "open <path>",
+            parse_required_arg,
+            "open executed",
+        );
+        enter_command_mode(&mut app);
+        type_keys(&mut app, "op");
+
+        let method = handle_key(&mut app, key(KeyCode::Enter));
+
+        assert!(method.is_none());
+        assert!(app.is_command_mode());
+        assert_eq!(app.command_text(), "open ");
+        assert!(has_alert(&app, "Invalid arguments. Usage: open <path>"));
+        assert!(!has_alert(&app, "open executed"));
+        assert_eq!(input_text(&app), "");
+    }
+
+    #[test]
+    fn command_completion_does_not_affect_normal_composer_without_popup() {
+        let mut app = App::new("agent".to_string());
+        type_keys(&mut app, "hello");
+
+        assert!(handle_key(&mut app, key(KeyCode::Tab)).is_none());
+
+        assert!(!app.is_command_mode());
+        assert_eq!(input_text(&app), "hello");
+    }
+
+    fn enter_command_mode(app: &mut App) {
+        assert!(handle_key(app, key(KeyCode::Char(':'))).is_none());
+        assert!(app.is_command_mode());
+    }
+
+    fn type_keys(app: &mut App, text: &str) {
+        for c in text.chars() {
+            assert!(handle_key(app, key(KeyCode::Char(c))).is_none());
+        }
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn has_alert(app: &App, needle: &str) -> bool {
+        app.blocks.iter().any(|block| match block {
+            crate::block::Block::Alert { message, .. } => message.contains(needle),
+            _ => false,
+        })
+    }
+
+    fn register_test_command(
+        app: &mut App,
+        name: &'static str,
+        usage: &'static str,
+        argument_parser: crate::command::ArgumentParser,
+        message: &'static str,
+    ) {
+        app.command_registry.register(crate::command::CommandSpec {
+            name,
+            aliases: &[],
+            usage,
+            description: "test command",
+            argument_parser,
+            can_execute: test_command_available,
+            executor: test_command_executor,
+        });
+        TEST_COMMAND_MESSAGES.with(|messages| messages.borrow_mut().push((name, message)));
+    }
+
+    thread_local! {
+        static TEST_COMMAND_MESSAGES: std::cell::RefCell<Vec<(&'static str, &'static str)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    fn parse_no_args(
+        raw: &str,
+    ) -> Result<crate::command::CommandArgs, crate::command::CommandDiagnostic> {
+        Ok(crate::command::CommandArgs::parse_whitespace(raw))
+    }
+
+    fn parse_required_arg(
+        raw: &str,
+    ) -> Result<crate::command::CommandArgs, crate::command::CommandDiagnostic> {
+        let args = crate::command::CommandArgs::parse_whitespace(raw);
+        if args.argv().is_empty() {
+            return Err(crate::command::CommandDiagnostic::new(
+                "Invalid arguments. Usage: open <path>",
+            ));
+        }
+        Ok(args)
+    }
+
+    fn test_command_available(
+        _environment: &crate::command::CommandEnvironment,
+    ) -> Result<(), crate::command::CommandDiagnostic> {
+        Ok(())
+    }
+
+    fn test_command_executor(
+        invocation: crate::command::CommandInvocation<'_>,
+    ) -> crate::command::CommandExecution {
+        let message = TEST_COMMAND_MESSAGES
+            .with(|messages| {
+                messages
+                    .borrow()
+                    .iter()
+                    .find(|(name, _)| *name == invocation.command.name)
+                    .map(|(_, message)| *message)
+            })
+            .unwrap_or("test command executed");
+        crate::command::CommandExecution::notice(message)
     }
 
     fn input_text(app: &App) -> String {
