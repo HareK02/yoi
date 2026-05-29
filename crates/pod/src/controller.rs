@@ -23,7 +23,8 @@ use crate::spawn::comm_tools::{
 use crate::spawn::registry::SpawnedPodRegistry;
 use crate::spawn::tool::spawn_pod_tool;
 use protocol::{
-    AlertLevel, AlertSource, ErrorCode, Event, Method, PodStatus, RunResult, Segment, TurnResult,
+    AlertLevel, AlertSource, ErrorCode, Event, Method, PodStatus, RewindTargetId, RunResult,
+    Segment, TurnResult,
 };
 
 // ---------------------------------------------------------------------------
@@ -781,6 +782,45 @@ async fn controller_loop<C, St>(
                 }
             },
 
+            Method::ListRewindTargets => match shared_state.get_status() {
+                PodStatus::Idle | PodStatus::Paused => emit_rewind_targets(&pod, &event_tx),
+                PodStatus::Running => {
+                    let _ = event_tx.send(Event::Error {
+                        code: ErrorCode::AlreadyRunning,
+                        message: "Pod is already executing a turn; rewind can only run while idle or paused"
+                            .into(),
+                    });
+                }
+            },
+
+            Method::RewindTo {
+                target,
+                expected_head_entries,
+            } => match shared_state.get_status() {
+                PodStatus::Idle => {
+                    if apply_rewind(&mut pod, &event_tx, target, expected_head_entries) {
+                        shared_state.set_status(PodStatus::Idle);
+                        let _ = event_tx.send(Event::Status {
+                            status: PodStatus::Idle,
+                        });
+                    }
+                }
+                PodStatus::Paused => {
+                    let _ = event_tx.send(Event::Error {
+                        code: ErrorCode::InvalidRequest,
+                        message: "Cannot apply rewind while the Pod is paused; resume or wait for idle first"
+                            .into(),
+                    });
+                }
+                PodStatus::Running => {
+                    let _ = event_tx.send(Event::Error {
+                        code: ErrorCode::AlreadyRunning,
+                        message: "Pod is already executing a turn; rewind can only run while idle or paused"
+                            .into(),
+                    });
+                }
+            },
+
             Method::Shutdown => {
                 let _ = event_tx.send(Event::Shutdown);
                 break;
@@ -1014,10 +1054,10 @@ where
                             message: "Pod is already executing a turn".into(),
                         });
                     }
-                    Some(Method::Compact) => {
+                    Some(Method::Compact | Method::ListRewindTargets | Method::RewindTo { .. }) => {
                         let _ = event_tx.send(Event::Error {
                             code: ErrorCode::AlreadyRunning,
-                            message: "Pod is already executing a turn; compact can only run while idle"
+                            message: "Pod is already executing a turn; rewind/compact can only run while idle or paused"
                                 .into(),
                         });
                     }
@@ -1065,6 +1105,70 @@ where
                     }
                 }
             }
+        }
+    }
+}
+
+fn emit_rewind_targets<C, St>(pod: &Pod<C, St>, event_tx: &broadcast::Sender<Event>)
+where
+    C: LlmClient,
+    St: Store,
+{
+    match pod.list_rewind_targets() {
+        Ok((head_entries, targets)) => {
+            let _ = event_tx.send(Event::RewindTargets {
+                head_entries,
+                targets,
+            });
+        }
+        Err(err) => {
+            let _ = event_tx.send(Event::Error {
+                code: ErrorCode::Internal,
+                message: err.to_string(),
+            });
+        }
+    }
+}
+
+fn apply_rewind<C, St>(
+    pod: &mut Pod<C, St>,
+    event_tx: &broadcast::Sender<Event>,
+    target: RewindTargetId,
+    expected_head_entries: usize,
+) -> bool
+where
+    C: LlmClient,
+    St: Store,
+{
+    match pod.rewind_to(target, expected_head_entries) {
+        Ok(applied) => match applied
+            .entries
+            .into_iter()
+            .map(serde_json::to_value)
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(entries) => {
+                let _ = event_tx.send(Event::RewindApplied {
+                    entries,
+                    input: applied.input,
+                    summary: applied.summary,
+                });
+                true
+            }
+            Err(error) => {
+                let _ = event_tx.send(Event::Error {
+                    code: ErrorCode::Internal,
+                    message: format!("failed to encode rewind snapshot: {error}"),
+                });
+                false
+            }
+        },
+        Err(err) => {
+            let _ = event_tx.send(Event::Error {
+                code: ErrorCode::InvalidRequest,
+                message: err.to_string(),
+            });
+            false
         }
     }
 }

@@ -2,8 +2,8 @@ use std::collections::VecDeque;
 use std::time::Instant;
 
 use protocol::{
-    AlertLevel, AlertSource, CompletionEntry, CompletionKind, Event, Method, PodStatus, RunResult,
-    Segment,
+    AlertLevel, AlertSource, CompletionEntry, CompletionKind, Event, Method, PodStatus,
+    RewindTarget, RunResult, Segment,
 };
 
 use crate::block::{
@@ -49,6 +49,38 @@ impl CompletionState {
     /// Maximum rows the popup ever renders. Caller can clip to fewer
     /// rows if vertical space is tight.
     pub const MAX_VISIBLE: usize = 6;
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RewindPickerScroll {
+    pub top_offset: usize,
+    pub total_lines: usize,
+    pub area_height: u16,
+    pub tail_top_offset: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct RewindPickerState {
+    pub head_entries: usize,
+    pub targets: Vec<RewindTarget>,
+    pub selected: usize,
+    pub scroll: RewindPickerScroll,
+}
+
+impl RewindPickerState {
+    pub fn new(head_entries: usize, targets: Vec<RewindTarget>) -> Self {
+        let selected = targets.iter().position(|t| t.eligible).unwrap_or(0);
+        Self {
+            head_entries,
+            targets,
+            selected,
+            scroll: RewindPickerScroll::default(),
+        }
+    }
+
+    pub fn selected_target(&self) -> Option<&RewindTarget> {
+        self.targets.get(self.selected)
+    }
 }
 
 struct RollbackSubmitState {
@@ -126,6 +158,10 @@ pub struct App {
     /// Completion popup state, when an `@` / `#` / `/` token is in
     /// flight. `None` whenever the trigger conditions don't hold.
     pub completion: Option<CompletionState>,
+    /// Dedicated main-view rewind picker state.
+    pub rewind_picker: Option<RewindPickerState>,
+    rewind_request_pending: bool,
+    greeting: Option<protocol::Greeting>,
     /// In-TUI mirror of the Pod's session task store, reconstructed
     /// directly from observed `TaskCreate` / `TaskUpdate` tool calls and
     /// `[Session TaskStore snapshot]` system messages — no protocol
@@ -177,6 +213,9 @@ impl App {
             cache: FileCache::new(),
             assistant_streaming: false,
             completion: None,
+            rewind_picker: None,
+            rewind_request_pending: false,
+            greeting: None,
             task_store: TaskStore::new(),
             task_pane_open: false,
             task_pane_scroll: 0,
@@ -921,6 +960,54 @@ impl App {
                     state.selected = 0;
                 }
             }
+            Event::RewindTargets {
+                head_entries,
+                targets,
+            } => {
+                if self.rewind_request_pending {
+                    self.rewind_request_pending = false;
+                    self.rewind_picker = Some(RewindPickerState::new(head_entries, targets));
+                }
+            }
+            Event::RewindApplied {
+                entries,
+                input,
+                summary,
+            } => {
+                if let Some(greeting) = self.greeting.clone() {
+                    self.restore_snapshot(&entries, greeting);
+                }
+                let restored_composer = if self.input.is_empty() {
+                    self.input.replace_with_segments(&input);
+                    true
+                } else {
+                    false
+                };
+                self.completion = None;
+                self.close_rewind_picker();
+                self.reset_run_state(self.pod_status);
+                let mut message = if restored_composer {
+                    format!(
+                        "Rewound session: discarded {} log entries; restored selected input to composer.",
+                        summary.discarded_entries
+                    )
+                } else {
+                    format!(
+                        "Rewound session: discarded {} log entries. Rewind applied; composer not overwritten because it was not empty.",
+                        summary.discarded_entries
+                    )
+                };
+                if summary.tool_side_effect_warning {
+                    message.push_str(
+                        " History suffix was discarded; tool side effects were not undone.",
+                    );
+                }
+                self.blocks.push(Block::Alert {
+                    level: AlertLevel::Warn,
+                    source: AlertSource::Pod,
+                    message,
+                });
+            }
             Event::VisiblePods { .. }
             | Event::PodInspection { .. }
             | Event::PodAttachRestore { .. } => {}
@@ -1220,6 +1307,82 @@ impl App {
         self.command_input.insert_str(&completed);
     }
 
+    pub fn request_rewind_picker(&mut self) -> Option<Method> {
+        if !self.connected {
+            self.push_command_diagnostic("cannot rewind before the Pod is connected");
+            return None;
+        }
+        if self.running {
+            self.push_command_diagnostic("cannot rewind while the Pod is running");
+            return None;
+        }
+        self.completion = None;
+        self.rewind_picker = None;
+        self.rewind_request_pending = true;
+        Some(Method::ListRewindTargets)
+    }
+
+    pub fn close_rewind_picker(&mut self) {
+        self.rewind_picker = None;
+        self.rewind_request_pending = false;
+    }
+
+    pub fn rewind_picker_up(&mut self) {
+        if let Some(picker) = self.rewind_picker.as_mut() {
+            if picker.targets.is_empty() {
+                return;
+            }
+            picker.selected = if picker.selected == 0 {
+                picker.targets.len() - 1
+            } else {
+                picker.selected - 1
+            };
+        }
+    }
+
+    pub fn rewind_picker_down(&mut self) {
+        if let Some(picker) = self.rewind_picker.as_mut() {
+            if !picker.targets.is_empty() {
+                picker.selected = (picker.selected + 1) % picker.targets.len();
+            }
+        }
+    }
+
+    pub fn submit_rewind_picker(&mut self) -> Option<Method> {
+        if self.paused {
+            self.push_command_diagnostic(
+                "cannot apply rewind while the Pod is paused; resume or wait for idle first",
+            );
+            return None;
+        }
+        if !self.input.is_empty() {
+            self.push_command_diagnostic(
+                "cannot apply rewind while composer is not empty; clear it before restoring rewind input",
+            );
+            return None;
+        }
+        let Some(picker) = self.rewind_picker.as_ref() else {
+            return None;
+        };
+        let Some(target) = picker.selected_target() else {
+            self.push_command_diagnostic("no rewind target is available");
+            return None;
+        };
+        if !target.eligible {
+            self.push_command_diagnostic(
+                target
+                    .disabled_reason
+                    .clone()
+                    .unwrap_or_else(|| "rewind target is disabled".into()),
+            );
+            return None;
+        }
+        Some(Method::RewindTo {
+            target: target.id.clone(),
+            expected_head_entries: target.expected_head_entries,
+        })
+    }
+
     fn command_environment(&self) -> CommandEnvironment {
         CommandEnvironment {
             connected: self.connected,
@@ -1246,6 +1409,11 @@ impl App {
         if result.exit_command_mode {
             self.input_mode = CommandInputMode::Composer;
             self.command_completion_selected = None;
+        }
+        if let Some(Method::ListRewindTargets) = result.method.as_ref() {
+            self.completion = None;
+            self.rewind_picker = None;
+            self.rewind_request_pending = true;
         }
         result.method
     }
@@ -1334,6 +1502,7 @@ impl App {
     /// produced. Followed by `Event::Entry` updates for anything
     /// committed after the snapshot.
     fn restore_snapshot(&mut self, entries: &[serde_json::Value], greeting: protocol::Greeting) {
+        self.greeting = Some(greeting.clone());
         self.context_window = greeting.context_window;
         self.session_context_tokens = greeting.context_tokens;
         self.turn_index = 0;

@@ -419,6 +419,11 @@ fn draw_history(frame: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
+    if let Some(picker) = app.rewind_picker.as_mut() {
+        draw_rewind_picker(frame, history_area, inner, outer_block, picker);
+        return;
+    }
+
     let HistoryLayout { lines, turn_starts } = compute_history(app, inner.width);
 
     // `lines` is already pre-wrapped: 1 entry == 1 terminal row. Scroll
@@ -442,6 +447,99 @@ fn draw_history(frame: &mut Frame, app: &mut App, area: Rect) {
     // would otherwise re-wrap mid-row at word boundaries and desync the
     // height count). The outer Block handles left/right padding
     // uniformly for all rows.
+    Paragraph::new(visible)
+        .block(outer_block)
+        .render(history_area, frame.buffer_mut());
+}
+
+fn draw_rewind_picker(
+    frame: &mut Frame,
+    history_area: Rect,
+    inner: Rect,
+    outer_block: UiBlock<'_>,
+    picker: &mut crate::app::RewindPickerState,
+) {
+    let mut logical: Vec<Line<'static>> = Vec::new();
+    logical.push(Line::from(vec![
+        Span::styled(
+            "Rewind targets",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(format!("  head={} ", picker.head_entries)),
+        Span::styled("Enter", Style::default().fg(Color::Green)),
+        Span::raw(" apply  "),
+        Span::styled("Esc", Style::default().fg(Color::Green)),
+        Span::raw(" cancel"),
+    ]));
+    logical.push(Line::from(Span::styled(
+        "Selecting a target discards the later history suffix; tool side effects are not undone.",
+        Style::default().fg(Color::DarkGray),
+    )));
+    logical.push(Line::from(""));
+
+    if picker.targets.is_empty() {
+        logical.push(Line::from(Span::styled(
+            "No previous user messages are available to rewind.",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        for (idx, target) in picker.targets.iter().enumerate() {
+            let selected = idx == picker.selected;
+            let marker = if selected { "▶" } else { " " };
+            let base_style = if selected {
+                Style::default()
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD)
+            } else if target.eligible {
+                Style::default()
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            let ts = target
+                .timestamp_ms
+                .map(|ts| format!("{}", ts))
+                .unwrap_or_else(|| "-".into());
+            logical.push(Line::from(vec![
+                Span::styled(marker.to_owned(), base_style),
+                Span::styled(
+                    format!(
+                        " turn {}  idx {}  ts {}  ",
+                        target.turn_index, target.id.user_input_entry_index, ts
+                    ),
+                    base_style,
+                ),
+                Span::styled(target.preview.clone(), base_style),
+            ]));
+            if let Some(warning) = target.warning.as_ref() {
+                logical.push(Line::from(Span::styled(
+                    format!("  warning: {warning}"),
+                    Style::default().fg(Color::Yellow),
+                )));
+            }
+            if let Some(reason) = target.disabled_reason.as_ref() {
+                logical.push(Line::from(Span::styled(
+                    format!("  disabled: {reason}"),
+                    Style::default().fg(Color::Red),
+                )));
+            }
+        }
+    }
+
+    let mut lines = Vec::new();
+    for line in logical {
+        wrap_line_into(line, inner.width, &mut lines);
+    }
+
+    let tail_top = lines.len().saturating_sub(inner.height as usize);
+    picker.scroll.area_height = inner.height;
+    picker.scroll.total_lines = lines.len();
+    picker.scroll.tail_top_offset = tail_top;
+    picker.scroll.top_offset = picker.scroll.top_offset.min(tail_top);
+
+    let end = (picker.scroll.top_offset + inner.height as usize).min(lines.len());
+    let visible = lines[picker.scroll.top_offset..end].to_vec();
     Paragraph::new(visible)
         .block(outer_block)
         .render(history_area, frame.buffer_mut());
