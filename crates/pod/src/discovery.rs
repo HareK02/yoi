@@ -809,6 +809,7 @@ mod tests {
                 child("child-stale", &stale_socket),
                 child("child-pending", &pending_socket),
             ],
+            reclaimed_children: Vec::new(),
             resolved_manifest_snapshot: None,
         };
         store.write(&parent).unwrap();
@@ -820,6 +821,7 @@ mod tests {
                     active_child_segment,
                 )),
                 spawned_children: Vec::new(),
+                reclaimed_children: Vec::new(),
                 resolved_manifest_snapshot: None,
             })
             .unwrap();
@@ -831,6 +833,7 @@ mod tests {
                     active_child_segment,
                 )),
                 spawned_children: Vec::new(),
+                reclaimed_children: Vec::new(),
                 resolved_manifest_snapshot: None,
             })
             .unwrap();
@@ -839,6 +842,7 @@ mod tests {
                 pod_name: "child-pending".into(),
                 active: Some(PodActiveSegmentRef::pending_segment(pending_session_id)),
                 spawned_children: Vec::new(),
+                reclaimed_children: Vec::new(),
                 resolved_manifest_snapshot: None,
             })
             .unwrap();
@@ -850,6 +854,7 @@ mod tests {
                     new_segment_id(),
                 )),
                 spawned_children: Vec::new(),
+                reclaimed_children: Vec::new(),
                 resolved_manifest_snapshot: None,
             })
             .unwrap();

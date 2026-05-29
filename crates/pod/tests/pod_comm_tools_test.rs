@@ -442,7 +442,6 @@ async fn stop_pod_sends_shutdown_and_releases_scope() {
         store.clone(),
         "spawner".into(),
         Some(parent_scope.clone()),
-        None,
     )
     .await
     .unwrap();
@@ -580,13 +579,15 @@ async fn restored_registry_uses_pod_state_without_runtime_file() {
         .unwrap()
         .expect("spawner metadata should remain");
     assert!(metadata.spawned_children.is_empty());
+    assert_eq!(metadata.reclaimed_children.len(), 1);
+    assert_eq!(metadata.reclaimed_children[0].pod_name, "child");
     let runtime_contents = std::fs::read_to_string(rd.path().join("spawned_pods.json")).unwrap();
     let runtime_records: Vec<SpawnedPodRecord> = serde_json::from_str(&runtime_contents).unwrap();
     assert!(runtime_records.is_empty());
 }
 
 #[tokio::test]
-async fn load_from_pod_state_prunes_runtime_children_but_preserves_durable_state() {
+async fn load_from_pod_state_prunes_runtime_children_and_reclaims_durable_delegation() {
     let runtime_tmp = TempDir::new().unwrap();
     let store_tmp = TempDir::new().unwrap();
     let store = CombinedStore::new(
@@ -625,23 +626,14 @@ async fn load_from_pod_state_prunes_runtime_children_but_preserves_durable_state
         .read_by_name("spawner")
         .unwrap()
         .expect("spawner metadata should be written");
-    assert_eq!(metadata.spawned_children.len(), 2);
-    assert!(
-        metadata
-            .spawned_children
-            .iter()
-            .any(|c| c.pod_name == "alive")
-    );
-    assert!(
-        metadata
-            .spawned_children
-            .iter()
-            .any(|c| c.pod_name == "missing")
-    );
+    assert_eq!(metadata.spawned_children.len(), 1);
+    assert_eq!(metadata.spawned_children[0].pod_name, "alive");
+    assert_eq!(metadata.reclaimed_children.len(), 1);
+    assert_eq!(metadata.reclaimed_children[0].pod_name, "missing");
 }
 
 #[tokio::test]
-async fn load_from_pod_state_reclaims_pruned_child_scope_without_deleting_pod_state() {
+async fn load_from_pod_state_reclaims_pruned_child_scope_and_records_history() {
     let _env = EnvGuard::acquire();
     let runtime_tmp = TempDir::new().unwrap();
     let store_tmp = TempDir::new().unwrap();
@@ -709,7 +701,6 @@ async fn load_from_pod_state_reclaims_pruned_child_scope_without_deleting_pod_st
         store.clone(),
         "spawner".into(),
         Some(parent_scope.clone()),
-        None,
     )
     .await
     .unwrap();
@@ -729,8 +720,9 @@ async fn load_from_pod_state_reclaims_pruned_child_scope_without_deleting_pod_st
         .read_by_name("spawner")
         .unwrap()
         .expect("spawner metadata should remain");
-    assert_eq!(metadata.spawned_children.len(), 1);
-    assert_eq!(metadata.spawned_children[0].pod_name, "missing");
+    assert!(metadata.spawned_children.is_empty());
+    assert_eq!(metadata.reclaimed_children.len(), 1);
+    assert_eq!(metadata.reclaimed_children[0].pod_name, "missing");
     let runtime_contents = std::fs::read_to_string(rd.path().join("spawned_pods.json")).unwrap();
     let runtime_records: Vec<SpawnedPodRecord> = serde_json::from_str(&runtime_contents).unwrap();
     assert!(runtime_records.is_empty());

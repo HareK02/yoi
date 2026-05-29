@@ -2,9 +2,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
-use manifest::{
-    NixProfileResolver, PodManifest, PodManifestConfig, ProfileSelector, ScopeConfig, paths,
-};
+use manifest::{NixProfileResolver, PodManifest, PodManifestConfig, ProfileSelector, paths};
 use pod::{Pod, PodController, PromptLoader};
 use pod_store::{CombinedStore, FsPodStore, PodMetadataStore};
 use session_store::{FsStore, SegmentId, Store};
@@ -45,10 +43,6 @@ struct Cli {
     /// Internal typed pod-name override for session restore launched by the TUI.
     #[arg(long, value_name = "NAME", requires = "session", hide = true)]
     session_pod_name: Option<String>,
-
-    /// Internal typed scope snapshot for session restore launched by the TUI.
-    #[arg(long, value_name = "JSON", requires = "session", hide = true)]
-    resume_scope_json: Option<String>,
 
     /// Internal resolved manifest config for delegated child Pod spawning.
     #[arg(
@@ -133,10 +127,6 @@ where
 fn apply_session_restore_overrides(manifest: &mut PodManifest, cli: &Cli) -> Result<(), String> {
     if let Some(pod_name) = cli.session_pod_name.as_deref() {
         manifest.pod.name = pod_name.to_string();
-    }
-    if let Some(scope_json) = cli.resume_scope_json.as_deref() {
-        manifest.scope = serde_json::from_str::<ScopeConfig>(scope_json)
-            .map_err(|e| format!("failed to parse --resume-scope-json: {e}"))?;
     }
     Ok(())
 }

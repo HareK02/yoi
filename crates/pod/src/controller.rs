@@ -162,14 +162,15 @@ impl PodController {
             pod.store().clone(),
             spawner_name.clone(),
             Some(pod.scope().clone()),
-            Some(pod.scope_change_sink()),
         )
         .await?;
         let reclaimed_unreachable = loaded_registry.reclaimed_unreachable;
         let spawned_registry = loaded_registry.registry;
         if reclaimed_unreachable {
-            pod.persist_scope_snapshot()
-                .map_err(std::io::Error::other)?;
+            pod.push_notify(
+                "Restored Pod state contained unreachable delegated child Pods; their delegated write scopes were reclaimed before resume."
+                    .to_string(),
+            );
         }
 
         // Hand the alerter to the Pod so internal operations (compaction,
@@ -497,7 +498,6 @@ where
     let pwd = pod.pwd().to_path_buf();
     let task_store = pod.task_store();
     let session_id_for_usage = pod.segment_id().to_string();
-    let scope_change_sink = pod.scope_change_sink();
     let memory_config = pod.manifest().memory.clone();
     let web_config = pod.manifest().web.clone();
     let spawner_name = pod.manifest().pod.name.clone();
@@ -557,7 +557,6 @@ where
         self_parent_socket,
         spawner_model,
         scope_handle,
-        scope_change_sink,
     ));
     worker.register_tool(send_to_pod_tool(spawned_registry.clone()));
     worker.register_tool(read_pod_output_tool(spawned_registry.clone()));

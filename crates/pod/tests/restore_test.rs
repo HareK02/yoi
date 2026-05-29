@@ -199,39 +199,3 @@ async fn restore_from_manifest_rejects_empty_segment_log() {
         Ok(_) => panic!("expected empty segment log to fail"),
     }
 }
-
-#[tokio::test]
-async fn restore_from_manifest_rejects_segment_without_scope_snapshot() {
-    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-
-    let store_tmp = tempfile::tempdir().unwrap();
-    let store = CombinedStore::new(
-        FsStore::new(store_tmp.path()).unwrap(),
-        FsPodStore::new(store_tmp.path().join("pods")).unwrap(),
-    );
-    let manifest = pod::PodManifest::from_toml(MINIMAL_MANIFEST_TOML).unwrap();
-
-    let sid = session_store::new_session_id();
-    let segid = session_store::new_segment_id();
-    let state = session_store::SegmentStartState {
-        system_prompt: None,
-        config: &Default::default(),
-        history: &[],
-    };
-    session_store::create_segment_with_ids(&store, sid, segid, state).unwrap();
-
-    let result = Pod::restore_from_manifest(
-        sid,
-        segid,
-        manifest,
-        store,
-        pod::PromptLoader::builtins_only(),
-    )
-    .await;
-
-    match result {
-        Err(PodError::SegmentScopeMissing { segment_id }) => assert_eq!(segment_id, segid),
-        Err(other) => panic!("expected SegmentScopeMissing, got {other:?}"),
-        Ok(_) => panic!("expected missing scope snapshot to fail"),
-    }
-}

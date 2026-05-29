@@ -20,8 +20,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use manifest::{Permission, ScopeRule, SharedScope};
-use pod_store::{PodMetadataStore, PodSpawnedChild, PodSpawnedScopeRule, PodStoreError};
-use session_store::PodScopeSnapshot;
+use pod_store::{
+    PodMetadataStore, PodReclaimedChild, PodSpawnedChild, PodSpawnedScopeRule, PodStoreError,
+};
 use tokio::net::UnixStream;
 use tokio::sync::Mutex;
 use tracing::warn;
@@ -30,7 +31,7 @@ use crate::runtime::dir::{RuntimeDir, SpawnedPodRecord};
 use crate::runtime::pod_registry;
 
 type RegistryStateWriter = Arc<dyn Fn(&[SpawnedPodRecord]) -> io::Result<()> + Send + Sync>;
-type ScopeChangeSink = Arc<dyn Fn(PodScopeSnapshot) + Send + Sync>;
+type RegistryReclaimWriter = Arc<dyn Fn(&SpawnedPodRecord) -> io::Result<()> + Send + Sync>;
 
 const RESTORE_REACHABILITY_TIMEOUT: Duration = Duration::from_millis(500);
 
@@ -39,9 +40,9 @@ pub struct SpawnedPodRegistry {
     cursors: Mutex<HashMap<String, usize>>,
     runtime_dir: Arc<RuntimeDir>,
     state_writer: Option<RegistryStateWriter>,
+    reclaim_writer: Option<RegistryReclaimWriter>,
     parent_name: Option<String>,
     parent_scope: Option<SharedScope>,
-    scope_change_sink: Option<ScopeChangeSink>,
 }
 
 pub struct SpawnedPodRegistryLoad {
@@ -56,9 +57,9 @@ impl SpawnedPodRegistry {
             cursors: Mutex::new(HashMap::new()),
             runtime_dir,
             state_writer: None,
+            reclaim_writer: None,
             parent_name: None,
             parent_scope: None,
-            scope_change_sink: None,
         })
     }
 
@@ -75,8 +76,7 @@ impl SpawnedPodRegistry {
         St: PodMetadataStore + Clone + Send + Sync + 'static,
     {
         let loaded =
-            Self::load_from_pod_state_with_reclaim(runtime_dir, store, pod_name, None, None)
-                .await?;
+            Self::load_from_pod_state_with_reclaim(runtime_dir, store, pod_name, None).await?;
         Ok(loaded.registry)
     }
 
@@ -85,7 +85,6 @@ impl SpawnedPodRegistry {
         store: St,
         pod_name: String,
         parent_scope: Option<SharedScope>,
-        scope_change_sink: Option<ScopeChangeSink>,
     ) -> io::Result<SpawnedPodRegistryLoad>
     where
         St: PodMetadataStore + Clone + Send + Sync + 'static,
@@ -97,13 +96,11 @@ impl SpawnedPodRegistry {
             .unwrap_or_default();
 
         let mut records = Vec::with_capacity(persisted_children.len());
-        let mut pruned = false;
         let mut pruned_records = Vec::new();
         for child in &persisted_children {
             let record = match record_from_pod_state(child) {
                 Ok(record) => record,
                 Err(err) => {
-                    pruned = true;
                     warn!(
                         error = %err,
                         pod = %child.pod_name,
@@ -115,7 +112,6 @@ impl SpawnedPodRegistry {
             if is_reachable(&record.socket_path).await {
                 records.push(record);
             } else {
-                pruned = true;
                 warn!(
                     pod = %record.pod_name,
                     socket = %record.socket_path.display(),
@@ -126,20 +122,40 @@ impl SpawnedPodRegistry {
         }
 
         runtime_dir.write_spawned_pods(&records).await?;
-        let state_writer = pod_state_writer(store, pod_name.clone());
-        // Runtime spawned-pod records are a live registry for ListPods and
-        // cursor/scope cleanup; durable Pod state remains the discovery source
-        // for later attach/restore, so do not delete unreachable children from
-        // Pod state just because their sockets are gone.
-        if metadata.is_none() || !pruned {
+        let state_writer = pod_state_writer(store.clone(), pod_name.clone());
+        let reclaim_writer = pod_state_reclaim_writer(store.clone(), pod_name.clone());
+        if metadata.is_none() {
             state_writer(&records)?;
         }
 
         let mut reclaimed_unreachable = false;
+        if !pruned_records.is_empty() {
+            let reclaimed = pruned_records
+                .iter()
+                .map(|record| PodReclaimedChild {
+                    pod_name: record.pod_name.clone(),
+                    scope_delegated: record
+                        .scope_delegated
+                        .iter()
+                        .map(|rule| PodSpawnedScopeRule {
+                            target: rule.target.clone(),
+                            permission: match rule.permission {
+                                Permission::Read => "read".to_string(),
+                                Permission::Write => "write".to_string(),
+                            },
+                            recursive: rule.recursive,
+                        })
+                        .collect(),
+                })
+                .collect();
+            store
+                .reclaim_spawned_children(&pod_name, reclaimed)
+                .map_err(store_error_to_io)?;
+            reclaimed_unreachable = true;
+        }
         if parent_scope.is_some() {
             for record in &pruned_records {
-                reclaim_record(&pod_name, parent_scope.as_ref(), None, record)?;
-                reclaimed_unreachable = true;
+                reclaim_record(&pod_name, parent_scope.as_ref(), record)?;
             }
         }
 
@@ -149,9 +165,9 @@ impl SpawnedPodRegistry {
                 cursors: Mutex::new(HashMap::new()),
                 runtime_dir,
                 state_writer: Some(state_writer),
+                reclaim_writer: Some(reclaim_writer),
                 parent_name: Some(pod_name),
                 parent_scope,
-                scope_change_sink,
             }),
             reclaimed_unreachable,
         })
@@ -194,6 +210,9 @@ impl SpawnedPodRegistry {
         self.cursors.lock().await.remove(pod_name);
         if let Some(record) = &removed {
             self.reclaim_record(record)?;
+            if let Some(write_reclaim) = &self.reclaim_writer {
+                write_reclaim(record)?;
+            }
         }
         Ok(removed)
     }
@@ -203,12 +222,7 @@ impl SpawnedPodRegistry {
             release_child_allocation(&record.pod_name)?;
             return Ok(());
         };
-        reclaim_record(
-            parent_name,
-            self.parent_scope.as_ref(),
-            self.scope_change_sink.as_ref(),
-            record,
-        )
+        reclaim_record(parent_name, self.parent_scope.as_ref(), record)
     }
 
     /// Read-only cursor lookup. Returns 0 when no cursor has been set.
@@ -246,10 +260,36 @@ where
     })
 }
 
+fn pod_state_reclaim_writer<St>(store: St, pod_name: String) -> RegistryReclaimWriter
+where
+    St: PodMetadataStore + Clone + Send + Sync + 'static,
+{
+    Arc::new(move |record| {
+        let reclaimed = PodReclaimedChild {
+            pod_name: record.pod_name.clone(),
+            scope_delegated: record
+                .scope_delegated
+                .iter()
+                .map(|rule| PodSpawnedScopeRule {
+                    target: rule.target.clone(),
+                    permission: match rule.permission {
+                        Permission::Read => "read".to_string(),
+                        Permission::Write => "write".to_string(),
+                    },
+                    recursive: rule.recursive,
+                })
+                .collect(),
+        };
+        store
+            .reclaim_spawned_children(&pod_name, vec![reclaimed])
+            .map(|_| ())
+            .map_err(store_error_to_io)
+    })
+}
+
 fn reclaim_record(
     parent_name: &str,
     parent_scope: Option<&SharedScope>,
-    scope_change_sink: Option<&ScopeChangeSink>,
     record: &SpawnedPodRecord,
 ) -> io::Result<()> {
     let write_rules = record
@@ -275,13 +315,6 @@ fn reclaim_record(
         scope
             .update(|current| current.with_removed_deny_rules(write_rules))
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
-        if let Some(sink) = scope_change_sink {
-            let snapshot = scope.snapshot();
-            sink(PodScopeSnapshot {
-                allow: snapshot.allow_rules(),
-                deny: snapshot.deny_rules(),
-            });
-        }
     }
 
     Ok(())

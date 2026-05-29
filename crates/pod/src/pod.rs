@@ -9,10 +9,11 @@ use llm_worker::llm_client::client::LlmClient;
 use llm_worker::llm_client::types::Role;
 use llm_worker::state::Mutable;
 use llm_worker::{ToolOutputLimits, UsageRecord, Worker, WorkerError, WorkerResult};
-use pod_store::{PodActiveSegmentRef, PodMetadata, PodMetadataStore, PodStoreError};
+use pod_store::{
+    PodActiveSegmentRef, PodMetadata, PodMetadataStore, PodSpawnedScopeRule, PodStoreError,
+};
 use session_store::{
-    LogEntry, PodScopeSnapshot, SegmentId, SessionId, Store, StoreError, SystemItem, segment_log,
-    to_logged,
+    LogEntry, SegmentId, SessionId, Store, StoreError, SystemItem, segment_log, to_logged,
 };
 use tracing::{info, warn};
 
@@ -345,10 +346,6 @@ pub struct Pod<C: LlmClient, St: Store> {
     /// Workflow descriptions. This is intentionally independent from
     /// summary and Knowledge residency: each section has its own gate.
     inject_resident_workflows: bool,
-    /// Latest runtime scope snapshot queued by dynamic scope changes.
-    /// Drained into the session log before the next turn result is
-    /// persisted, so resume never silently reclaims delegated writes.
-    pending_scope_snapshot: Arc<Mutex<Option<PodScopeSnapshot>>>,
     /// extract (memory.extract) reentry guard. `true` while an extract
     /// worker is running; subsequent triggers are skipped per spec
     /// (`docs/plan/memory.md` §Extract 並走防止). `Arc<AtomicBool>` so
@@ -454,7 +451,6 @@ impl<C: LlmClient + Clone + 'static, St: Store + Clone + 'static> Pod<C, St> {
             inject_resident_summary: self.inject_resident_summary,
             inject_resident_knowledge: self.inject_resident_knowledge,
             inject_resident_workflows: self.inject_resident_workflows,
-            pending_scope_snapshot: self.pending_scope_snapshot.clone(),
             extract_in_flight: self.extract_in_flight.clone(),
             consolidation_in_flight: self.consolidation_in_flight.clone(),
             extract_pointer: self.extract_pointer.clone(),
@@ -634,7 +630,6 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             inject_resident_summary: true,
             inject_resident_knowledge: true,
             inject_resident_workflows: true,
-            pending_scope_snapshot: Arc::new(Mutex::new(None)),
             extract_in_flight: Arc::new(AtomicBool::new(false)),
             consolidation_in_flight: Arc::new(AtomicBool::new(false)),
             extract_pointer: Arc::new(Mutex::new(None)),
@@ -753,30 +748,6 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             .update(|cur| cur.with_added_deny_rules(revoke.clone()))
     }
 
-    /// Snapshot the current runtime scope in the session log. The entry
-    /// is intentionally appended as soon as a session log exists: if the
-    /// process later exits while children keep their allocations, resume
-    /// can restore the narrowed scope instead of reclaiming delegated
-    /// writes.
-    pub fn persist_scope_snapshot(&mut self) -> Result<(), StoreError> {
-        if self.segment_state.entries_written() == 0 {
-            return Ok(());
-        }
-        let snapshot = {
-            let scope = self.scope.snapshot();
-            PodScopeSnapshot {
-                allow: scope.allow_rules(),
-                deny: scope.deny_rules(),
-            }
-        };
-        let payload = serde_json::to_value(&snapshot).expect("PodScopeSnapshot is Serialize");
-        self.commit_entry(LogEntry::Extension {
-            ts: segment_log::now_millis(),
-            domain: session_store::POD_SCOPE_EXTENSION_DOMAIN.into(),
-            payload,
-        })
-    }
-
     /// Append `entry` to the session log AND publish it through the
     /// broadcast sink. No user-space serialization is needed across
     /// concurrent appenders — the kernel orders `O_APPEND` writes for
@@ -794,34 +765,6 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     /// clients without consulting any other state.
     pub fn sink(&self) -> SegmentLogSink {
         self.sink.clone()
-    }
-
-    /// Cloneable callback handed to dynamic-scope tools. It cannot append
-    /// directly to the async store from a sync tool callback, so it records
-    /// the latest snapshot and the controller flushes it after the tool
-    /// turn completes.
-    pub fn scope_change_sink(&self) -> Arc<dyn Fn(PodScopeSnapshot) + Send + Sync> {
-        let pending = self.pending_scope_snapshot.clone();
-        Arc::new(move |snapshot| {
-            *pending.lock().expect("pending_scope_snapshot poisoned") = Some(snapshot);
-        })
-    }
-
-    fn flush_pending_scope_snapshot(&mut self) -> Result<(), StoreError> {
-        let snapshot = self
-            .pending_scope_snapshot
-            .lock()
-            .expect("pending_scope_snapshot poisoned")
-            .take();
-        if let Some(snapshot) = snapshot {
-            let payload = serde_json::to_value(&snapshot).expect("PodScopeSnapshot is Serialize");
-            self.commit_entry(LogEntry::Extension {
-                ts: segment_log::now_millis(),
-                domain: session_store::POD_SCOPE_EXTENSION_DOMAIN.into(),
-                payload,
-            })?;
-        }
-        Ok(())
     }
 
     /// Direct access to the underlying Worker.
@@ -2007,7 +1950,6 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 compacted_from: None,
             };
             self.commit_entry(initial)?;
-            self.persist_scope_snapshot()?;
             self.write_pod_metadata_active(loc)?;
             return Ok(());
         }
@@ -2301,8 +2243,6 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 self.commit_entry(entry)?;
             }
         }
-
-        self.flush_pending_scope_snapshot()?;
 
         let turn_count = self.worker.as_ref().unwrap().turn_count();
         self.commit_entry(LogEntry::TurnEnd {
@@ -2775,7 +2715,6 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             .lock()
             .expect("usage_history poisoned")
             .clear();
-        self.persist_scope_snapshot()?;
         // Reset extract pointer alongside usage_history: the compacted
         // session has a fresh log with no `LogEntry::Extension` entries
         // yet, so a cold restore here would set extract_pointer to None
@@ -3831,7 +3770,6 @@ where
             inject_resident_summary: true,
             inject_resident_knowledge: true,
             inject_resident_workflows: true,
-            pending_scope_snapshot: Arc::new(Mutex::new(None)),
             extract_in_flight: Arc::new(AtomicBool::new(false)),
             consolidation_in_flight: Arc::new(AtomicBool::new(false)),
             extract_pointer: Arc::new(Mutex::new(None)),
@@ -3911,7 +3849,6 @@ where
             inject_resident_summary: true,
             inject_resident_knowledge: true,
             inject_resident_workflows: true,
-            pending_scope_snapshot: Arc::new(Mutex::new(None)),
             extract_in_flight: Arc::new(AtomicBool::new(false)),
             consolidation_in_flight: Arc::new(AtomicBool::new(false)),
             extract_pointer: Arc::new(Mutex::new(None)),
@@ -4001,19 +3938,13 @@ where
             return Err(PodError::SegmentEmpty { segment_id });
         }
         let mirror_entries: Vec<LogEntry> = raw_entries.clone();
-        let scope_snapshot = state
-            .pod_scope
-            .clone()
-            .ok_or(PodError::SegmentScopeMissing { segment_id })?;
+        let scope_config = effective_restore_scope_config(&store, &manifest)?;
 
         let mut common = prepare_pod_common_with_scope(
             &manifest,
             &loader,
             /* parse_template */ false,
-            ScopeConfig {
-                allow: scope_snapshot.allow,
-                deny: scope_snapshot.deny,
-            },
+            scope_config,
         )?;
         let skill_shadows = std::mem::take(&mut common.skill_shadows);
 
@@ -4099,7 +4030,6 @@ where
             inject_resident_summary: true,
             inject_resident_knowledge: true,
             inject_resident_workflows: true,
-            pending_scope_snapshot: Arc::new(Mutex::new(None)),
             extract_in_flight: Arc::new(AtomicBool::new(false)),
             consolidation_in_flight: Arc::new(AtomicBool::new(false)),
             extract_pointer: Arc::new(Mutex::new(extract_pointer)),
@@ -4623,11 +4553,6 @@ pub enum PodError {
     #[error("session {segment_id} has no entries to restore")]
     SegmentEmpty { segment_id: SegmentId },
 
-    #[error(
-        "session {segment_id} has no persisted scope snapshot; refusing resume without explicit scope"
-    )]
-    SegmentScopeMissing { segment_id: SegmentId },
-
     #[error("pod metadata for {pod_name} was not found")]
     PodMetadataMissing { pod_name: String },
 
@@ -4667,6 +4592,42 @@ struct PodCommon {
     /// after the Pod is materialised so the first LLM request observes
     /// any skill ↔ workflow collisions.
     skill_shadows: Vec<workflow_crate::ShadowedSkill>,
+}
+
+fn effective_restore_scope_config<St>(
+    store: &St,
+    manifest: &PodManifest,
+) -> Result<ScopeConfig, PodStoreError>
+where
+    St: PodMetadataStore,
+{
+    let mut scope = manifest.scope.clone();
+    let Some(metadata) = store.read_by_name(&manifest.pod.name)? else {
+        return Ok(scope);
+    };
+    for child in metadata.spawned_children {
+        for rule in child.scope_delegated {
+            if let Some(deny) = delegated_write_rule_to_deny(rule) {
+                scope.deny.push(deny);
+            }
+        }
+    }
+    Ok(scope)
+}
+
+fn delegated_write_rule_to_deny(rule: PodSpawnedScopeRule) -> Option<ScopeRule> {
+    match rule.permission.as_str() {
+        "write" => Some(ScopeRule {
+            target: rule.target,
+            permission: Permission::Write,
+            recursive: rule.recursive,
+        }),
+        "read" => None,
+        other => {
+            warn!(permission = %other, "ignoring invalid delegated child scope permission");
+            None
+        }
+    }
 }
 
 /// Resolve pwd / scope / LLM client / prompt catalog from a validated

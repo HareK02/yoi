@@ -75,6 +75,15 @@ pub struct PodSpawnedChild {
     pub callback_address: PathBuf,
 }
 
+/// One child delegation that has been reclaimed. Kept as durable audit state so
+/// restore can distinguish outstanding delegated scope from already-reclaimed
+/// child state without consulting session logs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PodReclaimedChild {
+    pub pod_name: String,
+    pub scope_delegated: Vec<PodSpawnedScopeRule>,
+}
+
 /// Persistent metadata for a Pod name.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PodMetadata {
@@ -83,6 +92,8 @@ pub struct PodMetadata {
     pub active: Option<PodActiveSegmentRef>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub spawned_children: Vec<PodSpawnedChild>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reclaimed_children: Vec<PodReclaimedChild>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_manifest_snapshot: Option<serde_json::Value>,
 }
@@ -94,6 +105,7 @@ impl PodMetadata {
             pod_name: pod_name.into(),
             active,
             spawned_children: Vec::new(),
+            reclaimed_children: Vec::new(),
             resolved_manifest_snapshot: None,
         }
     }
@@ -153,6 +165,23 @@ pub trait PodMetadataStore: Send + Sync {
     ) -> Result<PodMetadata, PodStoreError> {
         self.update_by_name(pod_name, |metadata| {
             metadata.spawned_children = children;
+        })
+    }
+
+    /// Remove reclaimed child delegations from the outstanding set and record
+    /// them in durable reclaim history.
+    fn reclaim_spawned_children(
+        &self,
+        pod_name: &str,
+        reclaimed: Vec<PodReclaimedChild>,
+    ) -> Result<PodMetadata, PodStoreError> {
+        self.update_by_name(pod_name, |metadata| {
+            for reclaimed_child in &reclaimed {
+                metadata
+                    .spawned_children
+                    .retain(|child| child.pod_name != reclaimed_child.pod_name);
+            }
+            metadata.reclaimed_children.extend(reclaimed);
         })
     }
 }
@@ -472,5 +501,41 @@ mod tests {
         let restored = store.read_by_name("agent").unwrap().unwrap();
         assert_eq!(restored.active, Some(active));
         assert_eq!(restored.resolved_manifest_snapshot, Some(snapshot));
+    }
+
+    #[test]
+    fn reclaim_children_removes_outstanding_and_records_history() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = FsPodStore::new(tmp.path()).unwrap();
+        let scope = PodSpawnedScopeRule {
+            target: std::path::Path::new("/tmp/delegated").into(),
+            permission: "write".into(),
+            recursive: true,
+        };
+        store
+            .set_spawned_children(
+                "agent",
+                vec![PodSpawnedChild {
+                    pod_name: "child".into(),
+                    socket_path: std::path::Path::new("/tmp/child.sock").into(),
+                    scope_delegated: vec![scope.clone()],
+                    callback_address: std::path::Path::new("/tmp/parent.sock").into(),
+                }],
+            )
+            .unwrap();
+
+        store
+            .reclaim_spawned_children(
+                "agent",
+                vec![PodReclaimedChild {
+                    pod_name: "child".into(),
+                    scope_delegated: vec![scope.clone()],
+                }],
+            )
+            .unwrap();
+        let restored = store.read_by_name("agent").unwrap().unwrap();
+        assert!(restored.spawned_children.is_empty());
+        assert_eq!(restored.reclaimed_children.len(), 1);
+        assert_eq!(restored.reclaimed_children[0].scope_delegated, vec![scope]);
     }
 }

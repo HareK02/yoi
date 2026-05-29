@@ -47,13 +47,9 @@ pub use segment::{
     SegmentStartState, append_entry, append_system_item, classify_history_item,
     create_compacted_segment, create_segment, create_segment_with_ids, ensure_head_or_fork, fork,
     fork_at, restore, restore_by_segment, save_config_changed, save_delta, save_extension,
-    save_pod_scope, save_run_completed, save_run_errored, save_turn_end, save_usage,
-    save_user_input,
+    save_run_completed, save_run_errored, save_turn_end, save_usage, save_user_input,
 };
-pub use segment_log::{
-    LogEntry, POD_SCOPE_EXTENSION_DOMAIN, PodScopeSnapshot, RestoredState, SegmentOrigin,
-    collect_state,
-};
+pub use segment_log::{LogEntry, RestoredState, SegmentOrigin, collect_state};
 pub use store::{Store, StoreError};
 pub use system_item::{SystemItem, SystemReminder, SystemReminderSource, render_pod_event};
 
