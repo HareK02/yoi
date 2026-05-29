@@ -10,11 +10,20 @@ use crate::block::{
     Block, CompactEvent, ThinkingBlock, ThinkingState, ToolCallBlock, ToolCallState,
 };
 use crate::cache::FileCache;
-use crate::command::{CommandEnvironment, CommandExecution, CommandInputMode, CommandRegistry};
+use crate::command::{
+    CommandCandidate, CommandEnvironment, CommandExecution, CommandInputMode, CommandRegistry,
+};
 use crate::input::InputBuffer;
 use crate::scroll::Scroll;
 use crate::task::TaskStore;
 use crate::ui::Mode;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandCompletionApply {
+    Applied,
+    Ambiguous,
+    NoCandidates,
+}
 
 /// In-flight completion popup state. Lives on `App` while the user is
 /// typing inside a `@` / `#` / `/` token. Cleared whenever the trigger
@@ -99,6 +108,7 @@ pub struct App {
     pub command_input: InputBuffer,
     pub input_mode: CommandInputMode,
     pub command_registry: CommandRegistry,
+    command_completion_selected: Option<usize>,
     pub quit: bool,
     /// 2-tap guard for `Ctrl-C` when the Pod is not running. First press
     /// records the instant; a second press within the timeout exits the
@@ -158,6 +168,7 @@ impl App {
             command_input: InputBuffer::new(),
             input_mode: CommandInputMode::Composer,
             command_registry: CommandRegistry::default(),
+            command_completion_selected: None,
             quit: false,
             quit_confirm: None,
             blocks: Vec::new(),
@@ -1078,24 +1089,135 @@ impl App {
     pub fn enter_command_mode(&mut self) {
         self.input_mode = CommandInputMode::Command;
         self.completion = None;
+        self.command_completion_selected = None;
         self.quit_confirm = None;
     }
 
     pub fn exit_command_mode(&mut self) {
         self.input_mode = CommandInputMode::Composer;
         self.command_input.clear();
+        self.command_completion_selected = None;
     }
 
     pub fn clear_command_input(&mut self) {
         self.command_input.clear();
+        self.command_completion_selected = None;
     }
 
     pub fn command_text(&self) -> String {
         self.command_input.plain_text()
     }
 
-    pub fn command_suggestions(&self) -> Vec<crate::command::CommandCandidate> {
+    pub fn command_suggestions(&self) -> Vec<CommandCandidate> {
         self.command_registry.suggest(&self.command_text())
+    }
+
+    pub fn command_completion_selected(&self) -> Option<usize> {
+        let selected = self.command_completion_selected?;
+        (selected < self.command_suggestions().len()).then_some(selected)
+    }
+
+    pub fn command_completion_active(&self) -> bool {
+        !self.command_suggestions().is_empty()
+    }
+
+    pub fn move_command_completion_up(&mut self) {
+        let len = self.command_suggestions().len();
+        if len == 0 {
+            self.command_completion_selected = None;
+            return;
+        }
+        self.command_completion_selected = Some(match self.command_completion_selected() {
+            Some(0) | None => len - 1,
+            Some(selected) => selected - 1,
+        });
+    }
+
+    pub fn move_command_completion_down(&mut self) {
+        let len = self.command_suggestions().len();
+        if len == 0 {
+            self.command_completion_selected = None;
+            return;
+        }
+        self.command_completion_selected = Some(match self.command_completion_selected() {
+            Some(selected) => (selected + 1) % len,
+            None => 0,
+        });
+    }
+
+    pub fn apply_command_completion(&mut self) -> CommandCompletionApply {
+        let suggestions = self.command_suggestions();
+        let candidate = match self.command_completion_selected() {
+            Some(selected) => suggestions.get(selected),
+            None if suggestions.len() == 1 => suggestions.first(),
+            None if suggestions.is_empty() => return CommandCompletionApply::NoCandidates,
+            None => return self.ambiguous_command_completion(),
+        };
+
+        let Some(candidate) = candidate else {
+            self.command_completion_selected = None;
+            return CommandCompletionApply::NoCandidates;
+        };
+        self.replace_command_name(candidate.name);
+        self.command_completion_selected = None;
+        CommandCompletionApply::Applied
+    }
+
+    pub fn submit_command_with_completion(&mut self) -> Option<Method> {
+        let selected = self.command_completion_selected().is_some();
+        let command_text = self.command_text();
+        if command_text.trim().is_empty() && !selected {
+            return self.submit_command();
+        }
+        if !selected && self.command_name_is_complete(&command_text) {
+            return self.submit_command();
+        }
+
+        match self.apply_command_completion() {
+            CommandCompletionApply::Applied | CommandCompletionApply::NoCandidates => {
+                self.submit_command()
+            }
+            CommandCompletionApply::Ambiguous => None,
+        }
+    }
+
+    fn ambiguous_command_completion(&mut self) -> CommandCompletionApply {
+        self.push_command_diagnostic(
+            "Ambiguous command completion; select a candidate with Up/Down or keep typing.",
+        );
+        CommandCompletionApply::Ambiguous
+    }
+
+    fn command_name_is_complete(&self, command_line: &str) -> bool {
+        let trimmed = command_line.trim_start();
+        let name = trimmed
+            .find(char::is_whitespace)
+            .map(|idx| &trimmed[..idx])
+            .unwrap_or(trimmed);
+        !name.is_empty() && self.command_registry.find(name).is_some()
+    }
+
+    fn replace_command_name(&mut self, canonical_name: &str) {
+        let command_line = self.command_text();
+        let leading_len = command_line.len() - command_line.trim_start().len();
+        let after_leading = &command_line[leading_len..];
+        let name_end = after_leading
+            .find(char::is_whitespace)
+            .map(|idx| leading_len + idx)
+            .unwrap_or(command_line.len());
+        let rest = &command_line[name_end..];
+
+        let mut completed = String::with_capacity(command_line.len().max(canonical_name.len() + 1));
+        completed.push_str(&command_line[..leading_len]);
+        completed.push_str(canonical_name);
+        if rest.is_empty() {
+            completed.push(' ');
+        } else {
+            completed.push_str(rest);
+        }
+
+        self.command_input.clear();
+        self.command_input.insert_str(&completed);
     }
 
     fn command_environment(&self) -> CommandEnvironment {
@@ -1119,9 +1241,11 @@ impl App {
         }
         if result.clear_input {
             self.command_input.clear();
+            self.command_completion_selected = None;
         }
         if result.exit_command_mode {
             self.input_mode = CommandInputMode::Composer;
+            self.command_completion_selected = None;
         }
         result.method
     }
@@ -1146,23 +1270,40 @@ impl App {
     // stay readable. In command mode these operate on the command line,
     // keeping the normal composer buffer intact.
     pub fn insert_char(&mut self, c: char) {
+        let command_mode = self.is_command_mode();
         self.active_input_mut().insert_char(c);
+        if command_mode {
+            self.command_completion_selected = None;
+        }
     }
     pub fn insert_newline(&mut self) {
+        let command_mode = self.is_command_mode();
         self.active_input_mut().insert_newline();
+        if command_mode {
+            self.command_completion_selected = None;
+        }
     }
     pub fn insert_paste(&mut self, content: String) {
         if self.is_command_mode() {
             self.command_input.insert_str(&content);
+            self.command_completion_selected = None;
         } else {
             self.input.insert_paste(content);
         }
     }
     pub fn delete_char_before(&mut self) {
+        let command_mode = self.is_command_mode();
         self.active_input_mut().delete_before();
+        if command_mode {
+            self.command_completion_selected = None;
+        }
     }
     pub fn delete_char_after(&mut self) {
+        let command_mode = self.is_command_mode();
         self.active_input_mut().delete_after();
+        if command_mode {
+            self.command_completion_selected = None;
+        }
     }
     pub fn move_cursor_left(&mut self) {
         self.active_input_mut().move_left();

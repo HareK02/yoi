@@ -284,11 +284,29 @@ fn draw_command_popup(frame: &mut Frame, app: &App, input_area: Rect) {
         .add_modifier(Modifier::BOLD);
     let description_style = Style::default().fg(Color::DarkGray);
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(popup_h as usize);
-    for candidate in visible_suggestions.iter().take(popup_h as usize) {
+    let selected = app.command_completion_selected();
+    for (idx, candidate) in visible_suggestions
+        .iter()
+        .take(popup_h as usize)
+        .enumerate()
+    {
+        let selected_style = if Some(idx) == selected {
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
         lines.push(Line::from(vec![
-            Span::styled(candidate.name.to_owned(), command_style),
-            Span::styled(" — ", description_style),
-            Span::styled(candidate.description.to_owned(), description_style),
+            Span::styled(
+                candidate.name.to_owned(),
+                command_style.patch(selected_style),
+            ),
+            Span::styled(" — ", description_style.patch(selected_style)),
+            Span::styled(
+                candidate.description.to_owned(),
+                description_style.patch(selected_style),
+            ),
         ]));
     }
 
