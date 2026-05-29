@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
-use manifest::{PodManifest, PodManifestConfig, paths};
+use manifest::{NixProfileResolver, PodManifest, PodManifestConfig, ProfileSelector, paths};
 use pod::{Pod, PodController, PodFactory, PromptLoader};
 use session_store::{FsStore, PodMetadataStore, SegmentId, Store};
 
@@ -13,6 +13,21 @@ use session_store::{FsStore, PodMetadataStore, SegmentId, Store};
     about = "Spawn a Pod process from manifest layers or a single manifest file"
 )]
 struct Cli {
+    /// Nix profile to evaluate with `nix eval --json --file <PATH>`.
+    /// Profiles are resolved artifacts, not manifest-cascade layers.
+    #[arg(
+        long,
+        value_name = "PATH",
+        conflicts_with_all = ["manifest", "project", "overlay", "pod", "session", "adopt"]
+    )]
+    profile: Option<PathBuf>,
+
+    /// Pod name override for a freshly-created profile Pod. This does not use
+    /// `--pod` restore semantics, so it must not attach/restore existing Pod
+    /// state by re-evaluating the profile source.
+    #[arg(long, value_name = "NAME", requires = "profile", conflicts_with_all = ["pod", "session", "adopt"])]
+    profile_pod_name: Option<String>,
+
     /// Manifest TOML to use directly, without loading user, project, or
     /// overlay layers.
     #[arg(long, value_name = "PATH", conflicts_with_all = ["project", "overlay"])]
@@ -73,6 +88,21 @@ fn resolve_manifest_with_user_manifest_env(
     cli: &Cli,
     user_manifest_env: Option<OsString>,
 ) -> Result<(PodManifest, PromptLoader), String> {
+    resolve_manifest_with_user_manifest_env_and_profile_loader(cli, user_manifest_env, load_profile)
+}
+
+fn resolve_manifest_with_user_manifest_env_and_profile_loader<F>(
+    cli: &Cli,
+    user_manifest_env: Option<OsString>,
+    load_profile_fn: F,
+) -> Result<(PodManifest, PromptLoader), String>
+where
+    F: FnOnce(&Path, Option<&str>) -> Result<(PodManifest, PromptLoader), String>,
+{
+    if let Some(path) = &cli.profile {
+        return load_profile_fn(path, cli.profile_pod_name.as_deref());
+    }
+
     let user_manifest = paths::user_manifest_path_from_env(user_manifest_env);
 
     if let Some(path) = &cli.manifest {
@@ -89,6 +119,20 @@ fn resolve_manifest_with_user_manifest_env(
     factory
         .resolve()
         .map_err(|e| format!("failed to resolve manifest cascade: {e}"))
+}
+
+fn load_profile(
+    path: &Path,
+    pod_name_override: Option<&str>,
+) -> Result<(PodManifest, PromptLoader), String> {
+    let resolver = NixProfileResolver::new();
+    let mut resolved = resolver
+        .resolve(&ProfileSelector::path(path.to_path_buf()))
+        .map_err(|e| format!("failed to resolve profile {}: {e}", path.display()))?;
+    if let Some(pod_name) = pod_name_override {
+        resolved.manifest.pod.name = pod_name.to_string();
+    }
+    Ok((resolved.manifest, PromptLoader::builtins_only()))
 }
 
 fn load_single_manifest(
@@ -408,6 +452,43 @@ permission = "write"
     }
 
     #[test]
+    fn profile_ignores_non_empty_user_manifest_env() {
+        let tmp = TempDir::new().unwrap();
+        let profile = tmp.path().join("profile.nix");
+        let cli = Cli::try_parse_from([
+            "insomnia-pod",
+            "--profile",
+            profile.to_str().unwrap(),
+            "--profile-pod-name",
+            "from-profile-name",
+        ])
+        .unwrap();
+        let mut called = false;
+
+        let (manifest, loader) = resolve_manifest_with_user_manifest_env_and_profile_loader(
+            &cli,
+            Some(OsString::from("non-existent-user-manifest.toml")),
+            |path, pod_name| {
+                called = true;
+                assert_eq!(path, profile.as_path());
+                assert_eq!(pod_name, Some("from-profile-name"));
+                let mut manifest =
+                    PodManifest::from_toml(&manifest_toml("from-profile", tmp.path())).unwrap();
+                if let Some(pod_name) = pod_name {
+                    manifest.pod.name = pod_name.to_string();
+                }
+                Ok((manifest, PromptLoader::builtins_only()))
+            },
+        )
+        .unwrap();
+
+        assert!(called);
+        assert_eq!(manifest.pod.name, "from-profile-name");
+        assert!(loader.user_dir().is_none());
+        assert!(loader.workspace_dir().is_none());
+    }
+
+    #[test]
     fn manifest_allows_empty_user_manifest_env() {
         let tmp = TempDir::new().unwrap();
         let manifest = tmp.path().join("manifest.toml");
@@ -494,6 +575,45 @@ permission = "write"
         let (manifest, _loader) = resolve_manifest_with_user_manifest_env(&cli, None).unwrap();
 
         assert_eq!(manifest.pod.name, "from-flag");
+    }
+
+    #[test]
+    fn profile_conflicts_with_manifest_and_restore_modes() {
+        let segment_id = session_store::new_segment_id().to_string();
+        for args in [
+            vec!["insomnia-pod", "--profile", "p.nix", "--manifest", "m.toml"],
+            vec!["insomnia-pod", "--profile", "p.nix", "--pod", "agent"],
+            vec![
+                "insomnia-pod",
+                "--profile",
+                "p.nix",
+                "--session",
+                &segment_id,
+            ],
+        ] {
+            let err = Cli::try_parse_from(args).unwrap_err();
+            assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+        }
+    }
+
+    #[test]
+    fn profile_pod_name_requires_profile() {
+        let err = Cli::try_parse_from(["insomnia-pod", "--profile-pod-name", "agent"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn profile_pod_name_is_not_restore_pod_flag() {
+        let cli = Cli::try_parse_from([
+            "insomnia-pod",
+            "--profile",
+            "p.nix",
+            "--profile-pod-name",
+            "agent",
+        ])
+        .unwrap();
+        assert_eq!(cli.profile_pod_name.as_deref(), Some("agent"));
+        assert!(cli.pod.is_none());
     }
 
     #[test]

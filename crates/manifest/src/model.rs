@@ -117,6 +117,14 @@ pub enum AuthRef {
     /// ChatGPT OAuth（`~/.codex/auth.json`）。実装は `llm-auth-codex-oauth` チケット
     #[serde(rename = "codex_oauth")]
     CodexOAuth,
+    /// Typed secret-store reference. The profile resolver preserves this
+    /// reference verbatim; secret-store lookup/decryption is intentionally a
+    /// later consumer-boundary concern.
+    #[serde(rename = "secret_ref")]
+    SecretRef {
+        #[serde(rename = "ref")]
+        ref_: String,
+    },
 }
 
 impl SchemeKind {

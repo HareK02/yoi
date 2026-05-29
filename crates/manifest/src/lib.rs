@@ -3,6 +3,7 @@ mod config;
 pub mod defaults;
 mod model;
 pub mod paths;
+mod profile;
 mod scope;
 
 pub use cascade::{LayerLoadError, find_project_manifest_from, load_layer};
@@ -15,6 +16,10 @@ pub use model::{
 };
 pub use paths::{
     user_manifest_path, user_manifest_path_from_env, user_manifest_path_with_env_override,
+};
+pub use profile::{
+    NixProfileResolver, ProfileError, ProfileManifestSnapshot, ProfileMetadata, ProfileSelector,
+    ProfileSource, ResolvedProfile, resolve_profile_artifact,
 };
 pub use protocol::{Permission, ScopeRule};
 pub use scope::{Scope, ScopeError, SharedScope};
@@ -66,6 +71,11 @@ pub struct PodManifest {
     /// there is no implicit `$config_dir/skills/` or builtin probe.
     #[serde(default)]
     pub skills: Option<SkillsConfig>,
+    /// Optional profile provenance for manifests produced by a Nix profile.
+    /// Stored only after profile resolution so Pod restore can prefer the
+    /// validated snapshot over ambient manifest cascade state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<profile::ProfileManifestSnapshot>,
 }
 
 /// External Agent Skills (`SKILL.md`) ingest configuration. Skills are

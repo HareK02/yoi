@@ -917,27 +917,31 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         })
     }
 
+    fn pod_metadata(&self, active: Option<PodActiveSegmentRef>) -> PodMetadata {
+        let mut metadata = PodMetadata::new(self.manifest.pod.name.clone(), active);
+        if self.manifest.profile.is_some() {
+            metadata.resolved_manifest_snapshot = serde_json::to_value(&self.manifest).ok();
+        }
+        metadata
+    }
+
     fn write_pod_metadata_pending(&self) -> Result<(), StoreError> {
         let Some(writer) = &self.pod_metadata_writer else {
             return Ok(());
         };
-        writer(PodMetadata::new(
-            self.manifest.pod.name.clone(),
-            Some(PodActiveSegmentRef::pending_segment(self.session_id())),
-        ))
+        writer(self.pod_metadata(Some(PodActiveSegmentRef::pending_segment(
+            self.session_id(),
+        ))))
     }
 
     fn write_pod_metadata_active(&self, loc: SegmentLocation) -> Result<(), StoreError> {
         let Some(writer) = &self.pod_metadata_writer else {
             return Ok(());
         };
-        writer(PodMetadata::new(
-            self.manifest.pod.name.clone(),
-            Some(PodActiveSegmentRef::active_segment(
-                loc.session_id,
-                loc.segment_id,
-            )),
-        ))
+        writer(self.pod_metadata(Some(PodActiveSegmentRef::active_segment(
+            loc.session_id,
+            loc.segment_id,
+        ))))
     }
 
     /// Enable name-keyed Pod metadata write-through for Pods built through
@@ -3945,6 +3949,15 @@ where
                 pod_name: pod_name.to_string(),
                 session_id: active.session_id,
             })?;
+        let manifest = match metadata.resolved_manifest_snapshot {
+            Some(snapshot) => serde_json::from_value(snapshot).map_err(|source| {
+                PodError::PodMetadataManifestSnapshot {
+                    pod_name: pod_name.to_string(),
+                    source,
+                }
+            })?,
+            None => manifest,
+        };
         Self::restore_from_manifest(active.session_id, segment_id, manifest, store, loader).await
     }
 
@@ -4617,6 +4630,13 @@ pub enum PodError {
     PodMetadataPending {
         pod_name: String,
         session_id: SessionId,
+    },
+
+    #[error("pod metadata for {pod_name} contains an invalid resolved manifest snapshot: {source}")]
+    PodMetadataManifestSnapshot {
+        pod_name: String,
+        #[source]
+        source: serde_json::Error,
     },
 }
 

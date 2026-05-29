@@ -90,6 +90,9 @@ fn resolve_auth(scheme: SchemeKind, auth: &AuthRef) -> Result<ResolvedAuth, Prov
                 .map_err(|e| ProviderError::Config(e.to_string()))?;
             Ok(ResolvedAuth::Custom(Arc::new(provider)))
         }
+        AuthRef::SecretRef { ref_ } => Err(ProviderError::Config(format!(
+            "secret store references are not implemented yet: {ref_}"
+        ))),
     }
 }
 
