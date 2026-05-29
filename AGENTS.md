@@ -15,7 +15,7 @@ Podの状態から純粋に再現可能で、且つ揮発性の無い操作で�
 
 **禁止**: ターンを跨ぐことができない情報に基づいて、history に記録せずに context だけにコンテンツを差し込むこと。これをやると LLM はそれに反応して生成を行う一方、次以降のターンでhistoryに残らないため、「自分がなぜその発言/tool call をしたか」の根拠が消えるうえ、prompt cache のヒット率も低下させることになる。
 
-新しい input を context に乗せたいなら、必ず先に `worker.history` に append して commit すること。`history.json` への永続化はそこから自動的についてくる。Notify / PodEvent / `<system-reminder>` 系はこの原則で扱う（→ `tickets/notify-history-persist.md`）。
+新しい input を context に乗せたいなら、必ず先に `worker.history` に append して commit すること。`history.json` への永続化はそこから自動的についてくる。Notify / PodEvent / `<system-reminder>` 系はこの原則で扱う。
 また、キャッシュを破壊するタイミングは正確にコントロールされる必要があり、キャッシュ破壊とトークン消費のトレードオフに基づいて慎重に設計されるべきである。
 
 ---
@@ -36,39 +36,40 @@ workflowで明示されない限り、読み取り以外の操作は控えるこ
 
 ---
 
-## Ticketの運用について
+## Work item / Ticket の運用について
 
-`TODO.md`、`tickets/`はgitで管理されていて、時系列の管理はgitを参照して把握すること。
+作業管理は `work-items/` と `tickets.sh` を正とする。時系列・状態遷移の最終的な根拠は git history なので、work item の作成・更新・レビュー・完了はファイル操作と commit で表現する。
 
-### TODO.md
+### 基本コマンド
 
-- 1チケット = 1行。未完了のみ記載し、完了したら行ごと削除する（履歴はgitで追える）
-- ネストは同一領域のグルーピング（表示用）にのみ使う。実装上の依存関係はネストで表現しない
-- 完了した子は削除し、親は未完了の子がある限り残す。最後の子が完了したら親ごと削除
-- Ticketを追加する際は、合わせてTODOも書くこと
+- 新規作成: `./tickets.sh create --title "..." [--slug slug] [--kind task] [--priority P2] [--label a,b]`
+- 一覧: `./tickets.sh list [--status open|pending|closed|all]`
+- 詳細: `./tickets.sh show <id-or-slug>`
+- コメント / 計画 / 判断 / 実装報告: `./tickets.sh comment <id-or-slug> [--role comment|plan|decision|implementation_report] [--file path]`
+- レビュー記録: `./tickets.sh review <id-or-slug> --approve|--request-changes [--file path]`
+- 状態変更: `./tickets.sh status <id-or-slug> open|pending|closed`
+- 完了: `./tickets.sh close <id-or-slug> [--resolution text|--file path]`
+- 整合性確認: `./tickets.sh doctor`
 
-### Ticket の粒度
+`tickets.sh` は `work-items/{open,pending,closed}/<id>/` 配下の `item.md`、`thread.md`、`artifacts/` を扱う。完了時は `resolution.md` も作られる。手でファイルを作るより、原則としてスクリプトを使うこと。
 
-- 1チケット = 完了時点で、実装が仕様又は機能として説明できる粒度。
-- 作成時、背景や要件を前提として書き、実装の方針やコードの詳細は不必要に増やさない。
-- チケット内のステップ（Phase 1, 2, ...）は実装順序であり、TODO等、外に出さない
-- ビルドが通り、その機能に限り,まだ動作できないと明示出来ている場合を除いて全体を通して動作させられる状態である必要がある。
+### Work item の粒度
 
-### Ticket のライフサイクル
+- 1 work item = 完了時点で、実装が仕様または機能として説明できる粒度。
+- 作成時は背景・要件・受け入れ条件を明確にする。実装手順やコード詳細は、必要になるまで増やしすぎない。
+- チケット内の Phase / Step は実装順序であり、外部の依存関係管理として扱わない。
+- ビルドが通り、その機能に限り「まだ動作できない」と明示できている場合を除き、全体として動作可能な状態を保つ。
 
-gitがタイムラインの単一の情報源。ファイル操作とcommitで状態遷移を表現する。
+### ライフサイクル
 
-a. 作成: `tickets/foo.md` を作成してcommit
-b. 詳細化や前提の変化: `tickets/foo.md` を更新してcommit
-c. レビュー: `tickets/foo.md` にレビュー状態を追記 + `tickets/foo.review.md` を作成してcommit
-d. 完了: `tickets/foo.md` と `tickets/foo.review.md` を両方削除してcommit
+- 作成: `./tickets.sh create ...` で `work-items/open/...` を作成し、必要な前提を書いて commit する。
+- 詳細化・前提変更: `item.md` を更新し、必要に応じて `./tickets.sh comment` で `thread.md` に経緯を残して commit する。
+- レビュー: `./tickets.sh review <id-or-slug> --approve|--request-changes` で `thread.md` にレビュー結果を追記して commit する。
+- 完了: `./tickets.sh close <id-or-slug>` で `work-items/closed/...` に移動し、`resolution.md` と完了状態を commit する。
 
-worktreeと併用して作業を進める場合、必ずブランチを切る前に対象のチケットをコミットしてから切ること。
+worktree と併用して作業を進める場合、必ずブランチを切る前に対象 work item を作成・詳細化して commit してから切ること。
 
-TODO.mdのリンクは完了後に切れるが、そのリンクを元にgitで消されたファイルを読み、内容を把握できる。
-`.review.md` にはレビューの指摘事項と判断結果を記載する。
-レビューはdiffの確認だけでなく、チケットはどのような前提・要件であり、それが達成されたかの確認まで含めて行う。
-常に、提出された実装で良いのか、コードベースを歪めていないか、不必要な実装ではないかを確認すること。
+レビューは diff の確認だけでなく、work item の前提・要件・受け入れ条件が提出された実装で満たされているかを確認する。常に、その実装で良いのか、コードベースを歪めていないか、不必要な実装ではないかを確認すること。
 
 ---
 
