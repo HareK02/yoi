@@ -60,7 +60,9 @@ fn resolve_socket(pod_name: &str, override_path: Option<PathBuf>) -> PathBuf {
 
 #[derive(Debug)]
 enum Mode {
-    Spawn,
+    Spawn {
+        profile_path: Option<PathBuf>,
+    },
     /// `insomnia <name>` / `insomnia --pod <name>`: attach to a live Pod by name if
     /// possible; otherwise launch `insomnia-pod --pod <name>` so the pod process
     /// resumes from name-keyed state or creates a fresh same-name Pod.
@@ -111,6 +113,7 @@ where
     let mut multi = false;
     let mut session: Option<SegmentId> = None;
     let mut pod: Option<String> = None;
+    let mut profile_path: Option<PathBuf> = None;
     let mut socket_override: Option<PathBuf> = None;
     let mut socket_seen = false;
     let mut positional: Option<String> = None;
@@ -139,6 +142,13 @@ where
             "--pod" => {
                 let raw = args.get(i + 1).ok_or(ParseError::MissingValue("--pod"))?;
                 pod = Some(raw.clone());
+                i += 2;
+            }
+            "--profile" => {
+                let raw = args
+                    .get(i + 1)
+                    .ok_or(ParseError::MissingValue("--profile"))?;
+                profile_path = Some(PathBuf::from(raw));
                 i += 2;
             }
             "--socket" => {
@@ -187,6 +197,11 @@ where
                 "--multi and --socket are mutually exclusive",
             ));
         }
+        if profile_path.is_some() {
+            return Err(ParseError::Conflict(
+                "--multi and --profile are mutually exclusive",
+            ));
+        }
         return Ok(Mode::Multi);
     }
 
@@ -203,6 +218,13 @@ where
     if pod.is_some() && resume {
         return Err(ParseError::Conflict(
             "--pod and --resume are mutually exclusive",
+        ));
+    }
+    if profile_path.is_some()
+        && (resume || session.is_some() || pod.is_some() || positional.is_some() || socket_seen)
+    {
+        return Err(ParseError::Conflict(
+            "--profile can only be used for fresh spawn",
         ));
     }
 
@@ -224,7 +246,7 @@ where
             socket_override,
         });
     }
-    Ok(Mode::Spawn)
+    Ok(Mode::Spawn { profile_path })
 }
 
 #[tokio::main]
@@ -248,13 +270,13 @@ async fn main() -> ExitCode {
     }
 
     let result = match mode {
-        Mode::Spawn => run_spawn(None).await,
+        Mode::Spawn { profile_path } => run_spawn(None, profile_path).await,
         Mode::PodName {
             pod_name,
             socket_override,
         } => run_pod_name(pod_name, socket_override).await,
         Mode::Resume => run_resume().await,
-        Mode::ResumeWithSession(id) => run_spawn(Some(id)).await,
+        Mode::ResumeWithSession(id) => run_spawn(Some(id), None).await,
         Mode::Multi => run_multi().await,
     };
 
@@ -449,8 +471,11 @@ fn is_recoverable_multi_open_error(error: &(dyn std::error::Error + 'static)) ->
     error.is::<spawn::SpawnError>() || error.is::<NestedOpenCancelled>()
 }
 
-async fn run_spawn(resume_from: Option<SegmentId>) -> Result<(), Box<dyn std::error::Error>> {
-    let ready = match spawn::run(resume_from).await? {
+async fn run_spawn(
+    resume_from: Option<SegmentId>,
+    profile_path: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let ready = match spawn::run(resume_from, profile_path).await? {
         SpawnOutcome::Ready(r) => r,
         SpawnOutcome::Cancelled => return Ok(()),
     };
@@ -1152,6 +1177,62 @@ mod tests {
             err.to_string(),
             "--pod and --session are mutually exclusive"
         );
+    }
+
+    #[test]
+    fn parse_profile_spawn_mode() {
+        match parse_args_from(["--profile", "/profiles/coder.nix"]).unwrap() {
+            Mode::Spawn { profile_path } => {
+                assert_eq!(profile_path, Some(PathBuf::from("/profiles/coder.nix")));
+            }
+            _ => panic!("expected Spawn mode"),
+        }
+    }
+
+    #[test]
+    fn parse_profile_rejects_resume_attach_modes() {
+        let segment_id = session_store::new_segment_id().to_string();
+        let cases = [
+            (
+                vec![
+                    "--profile".to_string(),
+                    "p.nix".to_string(),
+                    "--resume".to_string(),
+                ],
+                "--profile can only be used for fresh spawn",
+            ),
+            (
+                vec![
+                    "--profile".to_string(),
+                    "p.nix".to_string(),
+                    "--session".to_string(),
+                    segment_id,
+                ],
+                "--profile can only be used for fresh spawn",
+            ),
+            (
+                vec![
+                    "--profile".to_string(),
+                    "p.nix".to_string(),
+                    "--socket".to_string(),
+                    "/tmp/insomnia/sock".to_string(),
+                ],
+                "--profile can only be used for fresh spawn",
+            ),
+            (
+                vec![
+                    "--profile".to_string(),
+                    "p.nix".to_string(),
+                    "agent".to_string(),
+                ],
+                "--profile can only be used for fresh spawn",
+            ),
+        ];
+
+        for (args, message) in cases {
+            let err = parse_args_from(args).unwrap_err();
+            assert_eq!(err.to_string(), message);
+        }
     }
 
     #[test]

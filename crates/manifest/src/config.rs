@@ -676,6 +676,7 @@ impl TryFrom<PodManifestConfig> for PodManifest {
             web: cfg.web,
             memory: cfg.memory,
             skills: cfg.skills,
+            profile: None,
         })
     }
 }

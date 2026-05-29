@@ -9,6 +9,7 @@ arc-swap = "1"
 llm-worker = { workspace = true }
 protocol = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 serde_ignored = "0.1.14"
 thiserror = { workspace = true }
 toml = { workspace = true }

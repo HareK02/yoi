@@ -67,6 +67,8 @@ pub struct PodMetadata {
     pub active: Option<PodActiveSegmentRef>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub spawned_children: Vec<PodSpawnedChild>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_manifest_snapshot: Option<serde_json::Value>,
 }
 
 impl PodMetadata {
@@ -76,6 +78,7 @@ impl PodMetadata {
             pod_name: pod_name.into(),
             active,
             spawned_children: Vec::new(),
+            resolved_manifest_snapshot: None,
         }
     }
 }
@@ -116,4 +119,32 @@ pub(crate) fn validate_pod_name(pod_name: &str) -> Result<(), StoreError> {
         return Err(StoreError::InvalidPodName(pod_name.to_string()));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pod_metadata_manifest_snapshot_roundtrips() {
+        let mut metadata = PodMetadata::new(
+            "profile-pod",
+            Some(PodActiveSegmentRef::pending_segment(crate::new_session_id())),
+        );
+        metadata.resolved_manifest_snapshot = Some(serde_json::json!({
+            "pod": { "name": "profile-pod" },
+            "profile": {
+                "source": { "kind": "path", "path": "/profiles/coder.nix" }
+            }
+        }));
+
+        let json = serde_json::to_string(&metadata).unwrap();
+        let restored: PodMetadata = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored, metadata);
+        assert_eq!(
+            restored.resolved_manifest_snapshot.as_ref().unwrap()["profile"]["source"]["kind"],
+            "path"
+        );
+    }
 }

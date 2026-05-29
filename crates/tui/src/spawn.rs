@@ -91,13 +91,20 @@ type InlineTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 /// Source session for a resume run. `None` = fresh spawn (current
 /// behaviour); `Some(id)` swaps the dialog into "Resume Pod" mode and
 /// passes `--session <id>` to the spawned `insomnia-pod` child.
-pub async fn run(resume_from: Option<SegmentId>) -> Result<SpawnOutcome, SpawnError> {
+pub async fn run(
+    resume_from: Option<SegmentId>,
+    profile_path: Option<PathBuf>,
+) -> Result<SpawnOutcome, SpawnError> {
     let defaults = load_spawn_defaults()?;
+    let scope_origin = match profile_path.as_ref() {
+        Some(path) => ScopeOrigin::FromProfile(path.clone()),
+        None => defaults.scope_origin,
+    };
 
     let mut form = Form {
         cwd: defaults.cwd.clone(),
         cascade_has_scope: defaults.cascade_has_scope,
-        scope_origin: defaults.scope_origin,
+        scope_origin,
         name_cursor: defaults.default_name.chars().count(),
         name: defaults.default_name,
         message: None,
@@ -105,6 +112,7 @@ pub async fn run(resume_from: Option<SegmentId>) -> Result<SpawnOutcome, SpawnEr
         resume_from,
         resume_by_pod_name: false,
         resume_scope: None,
+        profile_path,
     };
 
     let mut terminal = make_inline_terminal()?;
@@ -279,6 +287,7 @@ fn form_for_pod_name(pod_name: String, defaults: SpawnDefaults) -> Form {
         resume_from: None,
         resume_by_pod_name: true,
         resume_scope: None,
+        profile_path: None,
     }
 }
 
@@ -352,6 +361,7 @@ async fn wait_for_ready(
 
     let config = SpawnConfig {
         pod_name: form.name.clone(),
+        profile_path: form.profile_path.clone(),
         overlay_toml: overlay_toml.to_string(),
         cwd,
         resume_from: form.resume_from,
@@ -428,6 +438,7 @@ enum ScopeOrigin {
     FromUser,
     FromProject,
     CwdDefault,
+    FromProfile(PathBuf),
 }
 
 struct Form {
@@ -462,6 +473,10 @@ struct Form {
     /// resume runs, and serialized into the overlay instead of cwd-default
     /// scope so resume does not silently broaden access.
     resume_scope: Option<ScopeConfig>,
+    /// Optional Nix profile passed to `insomnia-pod --profile` for fresh spawns.
+    /// This is not used for resume/attach flows because those must restore Pod
+    /// state rather than re-evaluate a profile source.
+    profile_path: Option<PathBuf>,
 }
 
 impl Form {
@@ -593,6 +608,15 @@ fn context_line(form: &Form) -> Line<'_> {
             ),
             Span::styled(" (write, default)", Style::default().fg(Color::DarkGray)),
         ]),
+        ScopeOrigin::FromProfile(ref path) => Line::from(vec![
+            Span::raw("  "),
+            Span::styled("profile: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                path.display().to_string(),
+                Style::default().fg(Color::Green),
+            ),
+            Span::styled(" (resolved by pod)", Style::default().fg(Color::DarkGray)),
+        ]),
     }
 }
 
@@ -639,6 +663,7 @@ mod tests {
             resume_from: None,
             resume_by_pod_name: false,
             resume_scope: None,
+            profile_path: None,
         }
     }
 
