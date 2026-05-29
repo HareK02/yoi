@@ -147,6 +147,15 @@ impl CommandRegistry {
             can_execute: compact_available,
             executor: compact_command,
         });
+        registry.register(CommandSpec {
+            name: "rewind",
+            aliases: &["rollback"],
+            usage: "rewind",
+            description: "Open the rewind target picker.",
+            argument_parser: rewind_args,
+            can_execute: rewind_available,
+            executor: rewind_command,
+        });
         registry
     }
 
@@ -284,6 +293,15 @@ fn compact_args(raw: &str) -> Result<CommandArgs, CommandDiagnostic> {
     }
 }
 
+fn rewind_args(raw: &str) -> Result<CommandArgs, CommandDiagnostic> {
+    let args = CommandArgs::parse_whitespace(raw);
+    if args.argv().is_empty() {
+        Ok(args)
+    } else {
+        Err(CommandDiagnostic::new("Invalid arguments. Usage: rewind"))
+    }
+}
+
 fn compact_available(environment: &CommandEnvironment) -> Result<(), CommandDiagnostic> {
     if !environment.connected {
         return Err(CommandDiagnostic::new(
@@ -298,6 +316,20 @@ fn compact_available(environment: &CommandEnvironment) -> Result<(), CommandDiag
     if environment.paused {
         return Err(CommandDiagnostic::new(
             "Cannot compact while the Pod is paused; resume or start a fresh turn first.",
+        ));
+    }
+    Ok(())
+}
+
+fn rewind_available(environment: &CommandEnvironment) -> Result<(), CommandDiagnostic> {
+    if !environment.connected {
+        return Err(CommandDiagnostic::new(
+            "Cannot rewind before the Pod is connected.",
+        ));
+    }
+    if environment.running {
+        return Err(CommandDiagnostic::new(
+            "Cannot rewind while the Pod is running.",
         ));
     }
     Ok(())
@@ -345,6 +377,18 @@ fn compact_command(invocation: CommandInvocation<'_>) -> CommandExecution {
     CommandExecution {
         method: Some(Method::Compact),
         diagnostics: vec![CommandDiagnostic::new("compact requested")],
+        exit_command_mode: true,
+        clear_input: true,
+    }
+}
+
+fn rewind_command(invocation: CommandInvocation<'_>) -> CommandExecution {
+    let _ = invocation.command;
+    let _ = invocation.environment;
+    let _ = invocation.args.raw();
+    CommandExecution {
+        method: Some(Method::ListRewindTargets),
+        diagnostics: vec![CommandDiagnostic::new("rewind picker requested")],
         exit_command_mode: true,
         clear_input: true,
     }
@@ -420,5 +464,41 @@ mod tests {
         let result = registry.dispatch("compact", &paused);
         assert!(result.method.is_none());
         assert!(result.diagnostics[0].message.contains("paused"));
+    }
+
+    #[test]
+    fn rewind_command_and_alias_return_list_method() {
+        let registry = CommandRegistry::builtins();
+        for command in ["rewind", "rollback"] {
+            let result = registry.dispatch(command, &env());
+            assert!(matches!(result.method, Some(Method::ListRewindTargets)));
+            assert!(result.exit_command_mode);
+            assert!(result.clear_input);
+            assert!(result.diagnostics[0].message.contains("rewind picker"));
+        }
+    }
+
+    #[test]
+    fn rewind_invalid_arguments_are_local_diagnostic() {
+        let registry = CommandRegistry::builtins();
+        let result = registry.dispatch("rewind now", &env());
+        assert!(result.method.is_none());
+        assert!(!result.exit_command_mode);
+        assert!(result.diagnostics[0].message.contains("Invalid arguments"));
+    }
+
+    #[test]
+    fn rewind_rejects_running_but_allows_paused() {
+        let registry = CommandRegistry::builtins();
+        let mut running = env();
+        running.running = true;
+        let result = registry.dispatch("rewind", &running);
+        assert!(result.method.is_none());
+        assert!(result.diagnostics[0].message.contains("running"));
+
+        let mut paused = env();
+        paused.paused = true;
+        let result = registry.dispatch("rewind", &paused);
+        assert!(matches!(result.method, Some(Method::ListRewindTargets)));
     }
 }

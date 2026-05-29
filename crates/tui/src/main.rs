@@ -801,6 +801,9 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Option<Method> {
             app.toggle_task_pane();
             Some(None)
         }
+        KeyCode::Char(c) if c.eq_ignore_ascii_case(&'r') && ctrl => {
+            Some(app.request_rewind_picker())
+        }
         KeyCode::Char('a') if ctrl => {
             app.move_cursor_start();
             Some(app.refresh_completion())
@@ -878,6 +881,25 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Option<Method> {
 
     if app.is_command_mode() {
         return handle_command_key(app, key);
+    }
+
+    if app.rewind_picker.is_some() {
+        match key.code {
+            KeyCode::Esc => {
+                app.close_rewind_picker();
+                return None;
+            }
+            KeyCode::Enter => return app.submit_rewind_picker(),
+            KeyCode::Up => {
+                app.rewind_picker_up();
+                return None;
+            }
+            KeyCode::Down => {
+                app.rewind_picker_down();
+                return None;
+            }
+            _ => {}
+        }
     }
 
     // Completion popup overrides — only when there's something to
@@ -1079,6 +1101,7 @@ fn handle_pause_or_quit(app: &mut App) -> Option<Method> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use protocol::{Event, Segment};
 
     #[test]
     fn parse_pod_name_mode() {
@@ -1540,6 +1563,104 @@ mod tests {
             crate::block::Block::Alert { message, .. } => message.contains("compact requested"),
             _ => false,
         }));
+    }
+
+    #[test]
+    fn ctrl_r_requests_rewind_picker_when_idle_or_paused() {
+        let mut app = App::new("agent".to_string());
+        app.connected = true;
+        let idle = handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
+        );
+        assert!(matches!(idle, Some(Method::ListRewindTargets)));
+
+        app.set_pod_status(PodStatus::Paused);
+        let paused = handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
+        );
+        assert!(matches!(paused, Some(Method::ListRewindTargets)));
+    }
+
+    #[test]
+    fn ctrl_r_is_rejected_while_running() {
+        let mut app = App::new("agent".to_string());
+        app.connected = true;
+        app.set_pod_status(PodStatus::Running);
+
+        let method = handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
+        );
+
+        assert!(method.is_none());
+        assert!(has_alert(&app, "cannot rewind while the Pod is running"));
+    }
+
+    #[test]
+    fn rewind_picker_close_returns_to_history_view() {
+        let mut app = App::new("agent".to_string());
+        app.connected = true;
+        app.handle_pod_event(Event::RewindTargets {
+            head_entries: 1,
+            targets: vec![],
+        });
+        assert!(app.rewind_picker.is_none());
+
+        let method = handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
+        );
+        assert!(matches!(method, Some(Method::ListRewindTargets)));
+        app.handle_pod_event(Event::RewindTargets {
+            head_entries: 1,
+            targets: vec![],
+        });
+        assert!(app.rewind_picker.is_some());
+
+        let method = handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert!(method.is_none());
+        assert!(app.rewind_picker.is_none());
+    }
+
+    #[test]
+    fn rewind_applied_reseeds_display_and_restores_composer() {
+        let mut app = App::new("agent".to_string());
+        app.handle_pod_event(Event::Snapshot {
+            greeting: test_greeting(),
+            entries: vec![],
+            status: PodStatus::Idle,
+        });
+        app.handle_pod_event(Event::RewindApplied {
+            entries: vec![],
+            input: vec![Segment::Text {
+                content: "retry this".into(),
+            }],
+            summary: protocol::RewindSummary {
+                truncated_to_entries: 0,
+                discarded_entries: 2,
+                tool_side_effect_warning: true,
+            },
+        });
+
+        assert_eq!(input_text(&app), "retry this");
+        assert!(app.rewind_picker.is_none());
+        assert!(has_alert(&app, "tool side effects"));
+    }
+
+    fn test_greeting() -> protocol::Greeting {
+        protocol::Greeting {
+            pod_name: "agent".into(),
+            cwd: "/tmp".into(),
+            provider: "test".into(),
+            model: "test".into(),
+            scope_summary: "".into(),
+            tools: vec![],
+            context_window: 0,
+            context_tokens: 0,
+        }
     }
 
     #[test]

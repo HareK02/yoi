@@ -36,6 +36,14 @@ pub enum Method {
     /// This is a typed control method: clients must not send `compact` as a
     /// `Method::Run` user message.
     Compact,
+    /// Ask the Pod to list valid rewind targets from its authoritative session log.
+    ListRewindTargets,
+    /// Truncate the current session back to the selected rewind target and
+    /// return the selected user input to the client composer.
+    RewindTo {
+        target: RewindTargetId,
+        expected_head_entries: usize,
+    },
     Shutdown,
     /// Request a list of completion candidates from the Pod.
     ///
@@ -125,7 +133,7 @@ pub enum PodEvent {
 /// variants — emits an alert and inserts a `[unknown input segment]`
 /// placeholder into the LLM context so neither user nor LLM is blind to
 /// the dropped intent.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Segment {
     /// Free-form text. The fallback every client can produce.
@@ -433,6 +441,19 @@ pub enum Event {
         kind: CompletionKind,
         entries: Vec<CompletionEntry>,
     },
+    /// Reply to `Method::ListRewindTargets`. Clients should only open a picker
+    /// in response to their own pending request; the event may be broadcast.
+    RewindTargets {
+        head_entries: usize,
+        targets: Vec<RewindTarget>,
+    },
+    /// A rewind has truncated the authoritative session. `entries` is the
+    /// retained session-log prefix clients should use to reseed display state.
+    RewindApplied {
+        entries: Vec<serde_json::Value>,
+        input: Vec<Segment>,
+        summary: RewindSummary,
+    },
     /// Reply to `Method::ListVisiblePods`. Payload is a stable JSON value so
     /// the Pod crate can evolve discovery fields without introducing a protocol
     /// dependency on session-store.
@@ -543,6 +564,34 @@ pub struct CompletionEntry {
     pub value: String,
     #[serde(default)]
     pub is_dir: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RewindTargetId {
+    pub segment_id: uuid::Uuid,
+    pub user_input_entry_index: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RewindTarget {
+    pub id: RewindTargetId,
+    pub expected_head_entries: usize,
+    pub truncate_entries: usize,
+    pub turn_index: usize,
+    pub timestamp_ms: Option<u64>,
+    pub preview: String,
+    pub eligible: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disabled_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RewindSummary {
+    pub truncated_to_entries: usize,
+    pub discarded_entries: usize,
+    pub tool_side_effect_warning: bool,
 }
 
 /// Pod self-description rendered by the TUI when a session starts empty.

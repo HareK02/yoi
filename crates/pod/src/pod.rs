@@ -40,7 +40,9 @@ use crate::runtime::pod_registry::{self, ScopeAllocationGuard, ScopeLockError};
 use crate::workflow::WorkflowResolveError;
 use async_trait::async_trait;
 use llm_worker::interceptor::PreRequestAction;
-use protocol::{AlertLevel, AlertSource, Event, Segment};
+use protocol::{
+    AlertLevel, AlertSource, Event, RewindSummary, RewindTarget, RewindTargetId, Segment,
+};
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
@@ -828,6 +830,85 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     /// Reference to the store.
     pub fn store(&self) -> &St {
         &self.store
+    }
+
+    /// List user-submitted turns in newest-first order for the manual rewind picker.
+    pub fn list_rewind_targets(&self) -> Result<(usize, Vec<RewindTarget>), RewindError> {
+        let loc = self.segment_state.location();
+        let entries = self.store.read_all(loc.session_id, loc.segment_id)?;
+        Ok((
+            entries.len(),
+            build_rewind_targets(loc.segment_id, &entries),
+        ))
+    }
+
+    /// Truncate the current segment to just before a previously listed user input.
+    pub fn rewind_to(
+        &mut self,
+        target: RewindTargetId,
+        expected_head_entries: usize,
+    ) -> Result<RewindAppliedState, RewindError> {
+        let loc = self.segment_state.location();
+        if target.segment_id != loc.segment_id {
+            return Err(RewindError::Invalid(
+                "rewind target belongs to a different segment".into(),
+            ));
+        }
+
+        let entries = self.store.read_all(loc.session_id, loc.segment_id)?;
+        if entries.len() != expected_head_entries {
+            return Err(RewindError::Invalid(format!(
+                "session head changed since picker opened (expected {expected_head_entries}, current {})",
+                entries.len()
+            )));
+        }
+
+        let Some(LogEntry::UserInput { segments, .. }) = entries.get(target.user_input_entry_index)
+        else {
+            return Err(RewindError::Invalid(
+                "rewind target is no longer a user message".into(),
+            ));
+        };
+        let input = segments.clone();
+        let truncate_entries = rewind_truncate_entries(&entries, target.user_input_entry_index);
+        let retained = entries[..truncate_entries].to_vec();
+        let tool_side_effect_warning = suffix_has_tool_side_effects(&entries[truncate_entries..]);
+        let state = segment_log::collect_state(&retained);
+        let extract_pointer = memory::extract::fold_pointer(&state.extensions);
+        let task_store = tools::TaskStore::from_history(&state.history);
+        let summary = RewindSummary {
+            truncated_to_entries: truncate_entries,
+            discarded_entries: entries.len().saturating_sub(truncate_entries),
+            tool_side_effect_warning,
+        };
+
+        self.store
+            .truncate(loc.session_id, loc.segment_id, truncate_entries)?;
+        self.segment_state.set_entries_written(truncate_entries);
+        self.sink.truncate_silent(truncate_entries);
+
+        self.worker_mut().set_history(state.history);
+        self.worker_mut().set_request_config(state.config);
+        self.worker_mut().set_turn_count(state.turn_count);
+        self.worker_mut()
+            .set_last_run_interrupted(state.last_run_interrupted);
+        self.user_segments = state.user_segments;
+        *self.usage_history.lock().expect("usage_history poisoned") = state.usage_history;
+        *self
+            .pending_attachments
+            .lock()
+            .expect("pending_attachments poisoned") = Vec::new();
+        *self
+            .extract_pointer
+            .lock()
+            .expect("extract_pointer poisoned") = extract_pointer;
+        self.task_store = task_store;
+
+        Ok(RewindAppliedState {
+            entries: retained,
+            input,
+            summary,
+        })
     }
 
     fn write_pod_metadata_pending(&self) -> Result<(), StoreError> {
@@ -4329,6 +4410,110 @@ fn token_budget_bytes(tokens: u64) -> usize {
 
 /// Pod errors.
 #[derive(Debug, thiserror::Error)]
+pub enum RewindError {
+    #[error(transparent)]
+    Store(#[from] StoreError),
+    #[error("{0}")]
+    Invalid(String),
+}
+
+#[derive(Debug)]
+pub struct RewindAppliedState {
+    pub entries: Vec<LogEntry>,
+    pub input: Vec<Segment>,
+    pub summary: RewindSummary,
+}
+
+fn build_rewind_targets(segment_id: uuid::Uuid, entries: &[LogEntry]) -> Vec<RewindTarget> {
+    let head_entries = entries.len();
+    let mut turn_index = 0usize;
+    let mut targets = Vec::new();
+    for (entry_index, entry) in entries.iter().enumerate() {
+        if let LogEntry::UserInput { segments, ts } = entry {
+            turn_index += 1;
+            let truncate_entries = rewind_truncate_entries(entries, entry_index);
+            let tool_warning = suffix_has_tool_side_effects(&entries[truncate_entries..]);
+            targets.push(RewindTarget {
+                id: RewindTargetId {
+                    segment_id,
+                    user_input_entry_index: entry_index,
+                },
+                expected_head_entries: head_entries,
+                truncate_entries,
+                turn_index,
+                timestamp_ms: Some(*ts),
+                preview: preview_segments(segments),
+                eligible: true,
+                disabled_reason: None,
+                warning: tool_warning.then(|| {
+                    "history suffix will be discarded; tool side effects are not undone".into()
+                }),
+            });
+        }
+    }
+    targets.reverse();
+    targets
+}
+
+fn rewind_truncate_entries(entries: &[LogEntry], user_input_entry_index: usize) -> usize {
+    if user_input_entry_index > 0
+        && matches!(
+            entries.get(user_input_entry_index - 1),
+            Some(LogEntry::Invoke { .. })
+        )
+    {
+        user_input_entry_index - 1
+    } else {
+        user_input_entry_index
+    }
+}
+
+fn suffix_has_tool_side_effects(entries: &[LogEntry]) -> bool {
+    entries.iter().any(|entry| match entry {
+        LogEntry::ToolResult { .. } => true,
+        LogEntry::AssistantItem { item, .. } => logged_item_is_tool_call(item),
+        _ => false,
+    })
+}
+
+fn logged_item_is_tool_call(item: &session_store::LoggedItem) -> bool {
+    matches!(item, session_store::LoggedItem::ToolCall { .. })
+}
+
+fn preview_segments(segments: &[Segment]) -> String {
+    let mut preview = String::new();
+    for segment in segments {
+        if !preview.is_empty() {
+            preview.push(' ');
+        }
+        match segment {
+            Segment::Text { content } => preview.push_str(content.trim()),
+            Segment::Paste { content, .. } => preview.push_str(content.trim()),
+            Segment::FileRef { path } => {
+                preview.push('@');
+                preview.push_str(path);
+            }
+            Segment::KnowledgeRef { slug } => {
+                preview.push('#');
+                preview.push_str(slug);
+            }
+            Segment::WorkflowInvoke { slug } => {
+                preview.push('/');
+                preview.push_str(slug);
+            }
+            Segment::Unknown => preview.push_str("[unknown input segment]"),
+        }
+    }
+    let preview = preview.replace(['\n', '\r'], " ");
+    let mut chars = preview.chars();
+    let mut out: String = chars.by_ref().take(120).collect();
+    if chars.next().is_some() {
+        out.push('…');
+    }
+    out
+}
+
+#[derive(Debug, thiserror::Error)]
 pub enum PodError {
     #[error(transparent)]
     Worker(#[from] WorkerError),
@@ -4807,6 +4992,156 @@ mod build_summary_prompt_tests {
         fn clone_boxed(&self) -> Box<dyn LlmClient> {
             Box::new(self.clone())
         }
+    }
+
+    fn text_segment(text: &str) -> Segment {
+        Segment::Text {
+            content: text.into(),
+        }
+    }
+
+    async fn rewind_test_pod() -> (tempfile::TempDir, Pod<NoopClient, session_store::FsStore>) {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = minimal_manifest_with_skills(vec![]);
+        let store = session_store::FsStore::new(dir.path().join("sessions")).unwrap();
+        let pwd = dir.path().join("workspace");
+        std::fs::create_dir_all(&pwd).unwrap();
+        let scope = Scope::writable(&pwd).unwrap();
+        let mut pod = Pod::new(manifest, Worker::new(NoopClient), store, pwd, scope)
+            .await
+            .unwrap();
+        pod.ensure_segment_head().unwrap();
+        (dir, pod)
+    }
+
+    fn append_test_entry(pod: &Pod<NoopClient, session_store::FsStore>, entry: LogEntry) {
+        let loc = pod.segment_state.location();
+        pod.store
+            .append(loc.session_id, loc.segment_id, &entry)
+            .unwrap();
+    }
+
+    fn append_user_turn(pod: &Pod<NoopClient, session_store::FsStore>, ts: u64, text: &str) {
+        append_test_entry(
+            pod,
+            LogEntry::Invoke {
+                ts,
+                trigger: protocol::InvokeKind::UserSend,
+            },
+        );
+        append_test_entry(
+            pod,
+            LogEntry::UserInput {
+                ts: ts + 1,
+                segments: vec![text_segment(text)],
+            },
+        );
+        append_test_entry(
+            pod,
+            LogEntry::TurnEnd {
+                ts: ts + 2,
+                turn_count: 1,
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn rewind_target_listing_is_newest_first_and_warns_on_tool_suffix() {
+        let (_dir, pod) = rewind_test_pod().await;
+        append_user_turn(&pod, 10, "first message");
+        append_user_turn(&pod, 20, "second message");
+        append_test_entry(
+            &pod,
+            LogEntry::ToolResult {
+                ts: 30,
+                item: session_store::LoggedItem::ToolResult {
+                    call_id: "call-1".into(),
+                    summary: "wrote a file".into(),
+                    content: None,
+                    is_error: false,
+                },
+            },
+        );
+
+        let (head_entries, targets) = pod.list_rewind_targets().unwrap();
+        let loc = pod.segment_state.location();
+
+        assert_eq!(
+            head_entries,
+            pod.store
+                .read_all(loc.session_id, loc.segment_id)
+                .unwrap()
+                .len()
+        );
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].preview, "second message");
+        assert_eq!(targets[1].preview, "first message");
+        assert!(
+            targets[0]
+                .warning
+                .as_ref()
+                .unwrap()
+                .contains("tool side effects")
+        );
+    }
+
+    #[tokio::test]
+    async fn rewind_apply_truncates_log_and_restores_selected_input() {
+        let (_dir, mut pod) = rewind_test_pod().await;
+        append_user_turn(&pod, 10, "first message");
+        append_user_turn(&pod, 20, "second message");
+        append_test_entry(
+            &pod,
+            LogEntry::ToolResult {
+                ts: 30,
+                item: session_store::LoggedItem::ToolResult {
+                    call_id: "call-1".into(),
+                    summary: "wrote a file".into(),
+                    content: None,
+                    is_error: false,
+                },
+            },
+        );
+        let (head_entries, targets) = pod.list_rewind_targets().unwrap();
+        let expected_truncate_entries = targets[0].truncate_entries;
+        let target = targets[0].id.clone();
+
+        let applied = pod.rewind_to(target, head_entries).unwrap();
+
+        assert_eq!(preview_segments(&applied.input), "second message");
+        assert_eq!(
+            applied.summary.truncated_to_entries,
+            expected_truncate_entries
+        );
+        assert!(applied.summary.tool_side_effect_warning);
+        let loc = pod.segment_state.location();
+        assert_eq!(
+            pod.store
+                .read_all(loc.session_id, loc.segment_id)
+                .unwrap()
+                .len(),
+            expected_truncate_entries
+        );
+        assert_eq!(pod.worker().history().len(), 1);
+        assert_eq!(
+            pod.worker().history()[0].as_text().unwrap(),
+            "first message"
+        );
+    }
+
+    #[tokio::test]
+    async fn rewind_apply_rejects_stale_head() {
+        let (_dir, mut pod) = rewind_test_pod().await;
+        append_user_turn(&pod, 10, "first message");
+        let (head_entries, targets) = pod.list_rewind_targets().unwrap();
+        append_user_turn(&pod, 20, "newer message");
+
+        let err = pod
+            .rewind_to(targets[0].id.clone(), head_entries)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("session head changed"));
     }
 
     #[tokio::test]
