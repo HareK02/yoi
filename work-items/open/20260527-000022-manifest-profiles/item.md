@@ -7,7 +7,7 @@ kind: feature
 priority: P2
 labels: [manifest, profiles, nix, tui]
 created_at: 2026-05-27T00:00:22Z
-updated_at: 2026-05-29T15:55:00Z
+updated_at: 2026-05-29T16:09:27Z
 assignee: null
 legacy_ticket: null
 ---
