@@ -1,13 +1,25 @@
+<!-- event: migration author: tickets.sh-migration at: 2026-05-27T00:00:04Z -->
+
+## Migrated
+
+Migrated from tickets/manual-turn-rollback.md. No legacy review file was present at migration time.
+
+---
+
+<!-- event: close author: hare at: 2026-05-29T03:09:22Z status: closed -->
+
+## Closed
+
 ---
 id: 20260527-000004-manual-turn-rollback
 slug: manual-turn-rollback
 title: Pod/TUI: 手動 rewind 導線
-status: open
+status: closed
 kind: task
 priority: P2
 labels: [tui, pod, ux]
 created_at: 2026-05-27T00:00:04Z
-updated_at: 2026-05-29T02:14:36Z
+updated_at: 2026-05-29T03:09:22Z
 assignee: null
 legacy_ticket: tickets/manual-turn-rollback.md
 ---
@@ -153,3 +165,6 @@ RewindTargetId {
 - `20260527-000009-pod-session-fork` remains a lower-priority future feature for preserving alternate histories.
 - Completed: `pod-empty-turn-rollback`
 - Completed: `tui-empty-turn-restore`
+
+
+---
