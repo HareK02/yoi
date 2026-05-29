@@ -7,7 +7,7 @@ kind: feature
 priority: P1
 labels: [profiles, manifest, nix, config]
 created_at: 2026-05-29T18:33:18Z
-updated_at: 2026-05-29T18:33:18Z
+updated_at: 2026-05-29T19:37:45Z
 assignee: null
 legacy_ticket: null
 ---
