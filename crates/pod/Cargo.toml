@@ -13,6 +13,7 @@ async-trait = { workspace = true }
 clap = { version = "4.6.0", features = ["derive"] }
 llm-worker = { workspace = true }
 session-store = { workspace = true }
+pod-store = { workspace = true }
 manifest = { workspace = true }
 protocol = { workspace = true }
 provider = { workspace = true }

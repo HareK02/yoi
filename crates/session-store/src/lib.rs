@@ -33,7 +33,6 @@
 pub mod event_trace;
 pub mod fs_store;
 pub mod logged_item;
-pub mod pod_metadata;
 pub mod segment;
 pub mod segment_log;
 pub mod store;
@@ -44,20 +43,13 @@ pub use fs_store::FsStore;
 pub use llm_worker::UsageRecord;
 pub use llm_worker::llm_client::types::{ContentPart, Item, Role};
 pub use logged_item::{LoggedContentPart, LoggedItem, LoggedRole, from_logged, to_logged};
-pub use pod_metadata::{
-    PodActiveSegmentRef, PodMetadata, PodMetadataStore, PodSpawnedChild, PodSpawnedScopeRule,
-};
 pub use segment::{
     SegmentStartState, append_entry, append_system_item, classify_history_item,
     create_compacted_segment, create_segment, create_segment_with_ids, ensure_head_or_fork, fork,
     fork_at, restore, restore_by_segment, save_config_changed, save_delta, save_extension,
-    save_pod_scope, save_run_completed, save_run_errored, save_turn_end, save_usage,
-    save_user_input,
+    save_run_completed, save_run_errored, save_turn_end, save_usage, save_user_input,
 };
-pub use segment_log::{
-    LogEntry, POD_SCOPE_EXTENSION_DOMAIN, PodScopeSnapshot, RestoredState, SegmentOrigin,
-    collect_state,
-};
+pub use segment_log::{LogEntry, RestoredState, SegmentOrigin, collect_state};
 pub use store::{Store, StoreError};
 pub use system_item::{SystemItem, SystemReminder, SystemReminderSource, render_pod_event};
 

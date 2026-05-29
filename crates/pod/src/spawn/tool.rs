@@ -18,7 +18,6 @@ use manifest::{
     SharedScope, WorkerManifestConfig,
 };
 use serde::Deserialize;
-use session_store::PodScopeSnapshot;
 use tokio::net::UnixStream;
 use tokio::process::Command;
 use tokio::time::sleep;
@@ -128,9 +127,6 @@ pub struct SpawnPodTool {
     /// `effective_write` semantics: Write is the only permission
     /// tracked across Pods, so revocation only touches Write.
     spawner_scope: SharedScope,
-    /// Called after the spawner scope has been updated so the new
-    /// effective scope can be persisted to the session log.
-    scope_changed: Arc<dyn Fn(PodScopeSnapshot) + Send + Sync>,
 }
 
 impl SpawnPodTool {
@@ -143,7 +139,6 @@ impl SpawnPodTool {
         parent_socket: Option<PathBuf>,
         spawner_model: ModelManifest,
         spawner_scope: SharedScope,
-        scope_changed: Arc<dyn Fn(PodScopeSnapshot) + Send + Sync>,
     ) -> Self {
         Self {
             spawner_name,
@@ -154,7 +149,6 @@ impl SpawnPodTool {
             parent_socket,
             spawner_model,
             spawner_scope,
-            scope_changed,
         }
     }
 }
@@ -250,11 +244,6 @@ impl Tool for SpawnPodTool {
             self.spawner_scope
                 .update(|cur| cur.with_added_deny_rules(revoke_write.clone()))
                 .map_err(|e| ToolError::ExecutionFailed(format!("revoke spawner scope: {e}")))?;
-            let current = self.spawner_scope.snapshot();
-            (self.scope_changed)(PodScopeSnapshot {
-                allow: current.allow_rules(),
-                deny: current.deny_rules(),
-            });
         }
 
         let record = SpawnedPodRecord {
@@ -496,7 +485,6 @@ pub fn spawn_pod_tool(
     parent_socket: Option<PathBuf>,
     spawner_model: ModelManifest,
     spawner_scope: SharedScope,
-    scope_changed: Arc<dyn Fn(PodScopeSnapshot) + Send + Sync>,
 ) -> ToolDefinition {
     Arc::new(move || {
         let schema = schemars::schema_for!(SpawnPodInput);
@@ -513,7 +501,6 @@ pub fn spawn_pod_tool(
             parent_socket.clone(),
             spawner_model.clone(),
             spawner_scope.clone(),
-            scope_changed.clone(),
         ));
         (meta, tool)
     })

@@ -193,7 +193,6 @@ async fn spawn_pod_delegates_scope_and_sends_run() {
         None,
         dummy_model(),
         spawner_scope.clone(),
-        std::sync::Arc::new(|_| {}),
     );
     let (_meta, tool) = def();
 
@@ -282,7 +281,6 @@ async fn spawn_pod_rejects_scope_outside_spawner() {
         None,
         dummy_model(),
         spawner_scope.clone(),
-        std::sync::Arc::new(|_| {}),
     );
     let (_meta, tool) = def();
 
@@ -354,7 +352,6 @@ async fn spawn_pod_rolls_back_reservation_when_socket_never_appears() {
         None,
         dummy_model(),
         spawner_scope.clone(),
-        std::sync::Arc::new(|_| {}),
     );
     let (_meta, tool) = def();
 

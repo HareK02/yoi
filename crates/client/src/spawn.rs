@@ -31,8 +31,6 @@ pub struct SpawnConfig {
     /// `--profile`; the Pod name is supplied through `--profile-pod-name` so
     /// profile evaluation stays separate from `--pod` restore semantics.
     pub profile: Option<String>,
-    /// Optional session-scope snapshot used when restoring by session id.
-    pub resume_scope: Option<manifest::ScopeConfig>,
     /// pod の current_dir。
     pub cwd: PathBuf,
     /// `Some(id)` のとき `--session <id>` を付与し、当該セッションから
@@ -132,12 +130,6 @@ where
             .arg(id.to_string())
             .arg("--session-pod-name")
             .arg(&config.pod_name);
-        if let Some(scope) = &config.resume_scope {
-            let scope_json = serde_json::to_string(scope).map_err(|e| {
-                SpawnError::PodLaunchFailed(io::Error::new(io::ErrorKind::InvalidInput, e))
-            })?;
-            command.arg("--resume-scope-json").arg(scope_json);
-        }
     }
     let mut child = command.spawn().map_err(SpawnError::PodLaunchFailed)?;
 

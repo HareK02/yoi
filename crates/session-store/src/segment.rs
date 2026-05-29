@@ -5,7 +5,7 @@
 //! functions after state-mutating operations.
 
 use crate::logged_item::{LoggedItem, to_logged};
-use crate::segment_log::{self, LogEntry, PodScopeSnapshot, SegmentOrigin};
+use crate::segment_log::{self, LogEntry, SegmentOrigin};
 use crate::store::{Store, StoreError};
 use crate::system_item::SystemItem;
 use crate::{SegmentId, SessionId};
@@ -382,23 +382,6 @@ pub fn save_extension(
             domain: domain.into(),
             payload,
         },
-    )
-}
-
-/// Log the Pod's latest runtime scope snapshot.
-pub fn save_pod_scope(
-    store: &impl Store,
-    session_id: SessionId,
-    segment_id: SegmentId,
-    snapshot: &PodScopeSnapshot,
-) -> Result<(), StoreError> {
-    let payload = serde_json::to_value(snapshot)?;
-    save_extension(
-        store,
-        session_id,
-        segment_id,
-        segment_log::POD_SCOPE_EXTENSION_DOMAIN,
-        payload,
     )
 }
 

@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use client::{SpawnConfig, spawn_pod};
 use crossterm::event::{self, Event as TermEvent, KeyCode, KeyEventKind, KeyModifiers};
-use manifest::{ProfileDiscovery, ScopeConfig};
+use manifest::ProfileDiscovery;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout};
@@ -42,8 +42,6 @@ pub enum SpawnOutcome {
 #[derive(Debug)]
 pub enum SpawnError {
     Io(io::Error),
-    Store(session_store::StoreError),
-    MissingResumeScope { segment_id: SegmentId },
     Spawn(client::SpawnError),
 }
 
@@ -51,11 +49,6 @@ impl std::fmt::Display for SpawnError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(e) => write!(f, "io error: {e}"),
-            Self::Store(e) => write!(f, "failed to read session log: {e}"),
-            Self::MissingResumeScope { segment_id } => write!(
-                f,
-                "session {segment_id} has no persisted scope snapshot; refusing resume without explicit scope"
-            ),
             Self::Spawn(e) => write!(f, "{e}"),
         }
     }
@@ -66,12 +59,6 @@ impl std::error::Error for SpawnError {}
 impl From<io::Error> for SpawnError {
     fn from(e: io::Error) -> Self {
         Self::Io(e)
-    }
-}
-
-impl From<session_store::StoreError> for SpawnError {
-    fn from(e: session_store::StoreError) -> Self {
-        Self::Store(e)
     }
 }
 
@@ -111,7 +98,6 @@ pub async fn run(
         editing: true,
         resume_from,
         resume_by_pod_name: false,
-        resume_scope: None,
         profile_choices,
         profile_index,
     };
@@ -147,10 +133,6 @@ pub async fn run(
             Some(Action::ProfileNext) => form.cycle_profile_next(),
             Some(Action::ProfilePrev) => form.cycle_profile_prev(),
         }
-    }
-
-    if let Some(id) = form.resume_from {
-        form.resume_scope = Some(load_resume_scope(id).await?);
     }
 
     // Phase 2: launch pod and wait for ready line. Drop the cursor
@@ -305,7 +287,6 @@ fn form_for_pod_name(pod_name: String, defaults: SpawnDefaults) -> Form {
         editing: false,
         resume_from: None,
         resume_by_pod_name: true,
-        resume_scope: None,
         profile_choices: Vec::new(),
         profile_index: 0,
     }
@@ -383,7 +364,6 @@ async fn wait_for_ready(
     let config = SpawnConfig {
         pod_name: form.name.clone(),
         profile: form.selected_profile_selector(),
-        resume_scope: form.resume_scope.clone(),
         cwd: form.cwd.clone(),
         resume_from: form.resume_from,
         resume_by_pod_name: form.resume_by_pod_name,
@@ -396,24 +376,6 @@ async fn wait_for_ready(
     Ok(SpawnReady {
         pod_name: ready.pod_name,
         socket_path: ready.socket_path,
-    })
-}
-
-async fn load_resume_scope(segment_id: SegmentId) -> Result<ScopeConfig, SpawnError> {
-    let store_dir = manifest::paths::sessions_dir().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "could not resolve sessions directory (set INSOMNIA_HOME, INSOMNIA_DATA_DIR, or HOME)",
-        )
-    })?;
-    let store = session_store::FsStore::new(&store_dir)?;
-    let state = session_store::restore_by_segment(&store, segment_id)?;
-    let snapshot = state
-        .pod_scope
-        .ok_or(SpawnError::MissingResumeScope { segment_id })?;
-    Ok(ScopeConfig {
-        allow: snapshot.allow,
-        deny: snapshot.deny,
     })
 }
 
@@ -453,10 +415,6 @@ struct Form {
     /// When true, launch the child with `--pod <name>` so the pod process
     /// resolves name-keyed state before falling back to fresh creation.
     resume_by_pod_name: bool,
-    /// Scope snapshot recovered from the source session log. Set only for
-    /// resume runs and passed through a typed internal restore flag so resume
-    /// does not silently broaden access.
-    resume_scope: Option<ScopeConfig>,
     /// Optional Nix profile choices passed to `insomnia-pod --profile` for
     /// fresh spawns. This is not used for resume/attach flows because those must
     /// restore Pod state rather than re-evaluate a profile source.
@@ -616,17 +574,6 @@ fn context_line(form: &Form) -> Line<'_> {
         ]);
     }
 
-    if form.resume_scope.is_some() {
-        return Line::from(vec![
-            Span::raw("  "),
-            Span::styled("scope: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                "from restored session snapshot",
-                Style::default().fg(Color::Green),
-            ),
-        ]);
-    }
-
     match form.scope_origin {
         ScopeOrigin::FromProfile => Line::from(vec![
             Span::raw("  "),
@@ -670,7 +617,6 @@ mod tests {
             editing: true,
             resume_from: None,
             resume_by_pod_name: false,
-            resume_scope: None,
             profile_choices: Vec::new(),
             profile_index: 0,
         }
@@ -691,34 +637,11 @@ mod tests {
         assert_eq!(f.name_cursor, "agent".chars().count());
         assert_eq!(f.resume_from, None);
         assert!(f.resume_by_pod_name);
-        assert!(f.resume_scope.is_none());
         assert!(!f.editing);
         assert_eq!(
             f.message,
             Some(("resuming pod...".to_string(), MessageKind::Progress))
         );
-    }
-
-    #[test]
-    fn resume_scope_snapshot_stays_on_form_for_typed_restore_flag() {
-        let mut f = form("agent-r");
-        f.resume_from = Some(session_store::new_segment_id());
-        f.resume_scope = Some(ScopeConfig {
-            allow: vec![manifest::ScopeRule {
-                target: PathBuf::from("/work/example"),
-                permission: manifest::Permission::Write,
-                recursive: true,
-            }],
-            deny: vec![manifest::ScopeRule {
-                target: PathBuf::from("/work/example/child"),
-                permission: manifest::Permission::Write,
-                recursive: true,
-            }],
-        });
-
-        let scope = f.resume_scope.as_ref().unwrap();
-        assert_eq!(scope.allow[0].target, PathBuf::from("/work/example"));
-        assert_eq!(scope.deny[0].target, PathBuf::from("/work/example/child"));
     }
 
     #[test]

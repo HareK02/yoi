@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use llm_worker::Item;
@@ -9,9 +10,12 @@ use llm_worker::llm_client::client::LlmClient;
 use llm_worker::llm_client::types::Role;
 use llm_worker::state::Mutable;
 use llm_worker::{ToolOutputLimits, UsageRecord, Worker, WorkerError, WorkerResult};
+use pod_store::{
+    PodActiveSegmentRef, PodMetadata, PodMetadataStore, PodReclaimedChild, PodSpawnedChild,
+    PodSpawnedScopeRule, PodStoreError,
+};
 use session_store::{
-    LogEntry, PodActiveSegmentRef, PodMetadata, PodMetadataStore, PodScopeSnapshot, SegmentId,
-    SessionId, Store, StoreError, SystemItem, segment_log, to_logged,
+    LogEntry, SegmentId, SessionId, Store, StoreError, SystemItem, segment_log, to_logged,
 };
 use tracing::{info, warn};
 
@@ -43,8 +47,11 @@ use llm_worker::interceptor::PreRequestAction;
 use protocol::{
     AlertLevel, AlertSource, Event, RewindSummary, RewindTarget, RewindTargetId, Segment,
 };
+use tokio::net::UnixStream;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
+
+const RESTORE_RECONCILIATION_REACHABILITY_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// `(SessionId, SegmentId)` pair the Pod is currently writing to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,18 +60,21 @@ pub struct SegmentLocation {
     pub segment_id: SegmentId,
 }
 
-type PodMetadataWriter = Arc<dyn Fn(PodMetadata) -> Result<(), StoreError> + Send + Sync>;
+type PodMetadataWriter = Arc<dyn Fn(PodMetadata) -> Result<(), PodStoreError> + Send + Sync>;
 
 fn pod_metadata_writer_for_store<St>(store: &St) -> PodMetadataWriter
 where
     St: PodMetadataStore + Clone + Send + Sync + 'static,
 {
     let store = store.clone();
-    Arc::new(move |mut metadata| {
-        if let Some(existing) = store.read_by_name(&metadata.pod_name)? {
-            metadata.spawned_children = existing.spawned_children;
-        }
-        store.write(&metadata)
+    Arc::new(move |metadata| {
+        store
+            .set_active(
+                &metadata.pod_name,
+                metadata.active,
+                metadata.resolved_manifest_snapshot,
+            )
+            .map(|_| ())
     })
 }
 
@@ -341,10 +351,6 @@ pub struct Pod<C: LlmClient, St: Store> {
     /// Workflow descriptions. This is intentionally independent from
     /// summary and Knowledge residency: each section has its own gate.
     inject_resident_workflows: bool,
-    /// Latest runtime scope snapshot queued by dynamic scope changes.
-    /// Drained into the session log before the next turn result is
-    /// persisted, so resume never silently reclaims delegated writes.
-    pending_scope_snapshot: Arc<Mutex<Option<PodScopeSnapshot>>>,
     /// extract (memory.extract) reentry guard. `true` while an extract
     /// worker is running; subsequent triggers are skipped per spec
     /// (`docs/plan/memory.md` §Extract 並走防止). `Arc<AtomicBool>` so
@@ -450,7 +456,6 @@ impl<C: LlmClient + Clone + 'static, St: Store + Clone + 'static> Pod<C, St> {
             inject_resident_summary: self.inject_resident_summary,
             inject_resident_knowledge: self.inject_resident_knowledge,
             inject_resident_workflows: self.inject_resident_workflows,
-            pending_scope_snapshot: self.pending_scope_snapshot.clone(),
             extract_in_flight: self.extract_in_flight.clone(),
             consolidation_in_flight: self.consolidation_in_flight.clone(),
             extract_pointer: self.extract_pointer.clone(),
@@ -630,7 +635,6 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             inject_resident_summary: true,
             inject_resident_knowledge: true,
             inject_resident_workflows: true,
-            pending_scope_snapshot: Arc::new(Mutex::new(None)),
             extract_in_flight: Arc::new(AtomicBool::new(false)),
             consolidation_in_flight: Arc::new(AtomicBool::new(false)),
             extract_pointer: Arc::new(Mutex::new(None)),
@@ -749,30 +753,6 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             .update(|cur| cur.with_added_deny_rules(revoke.clone()))
     }
 
-    /// Snapshot the current runtime scope in the session log. The entry
-    /// is intentionally appended as soon as a session log exists: if the
-    /// process later exits while children keep their allocations, resume
-    /// can restore the narrowed scope instead of reclaiming delegated
-    /// writes.
-    pub fn persist_scope_snapshot(&mut self) -> Result<(), StoreError> {
-        if self.segment_state.entries_written() == 0 {
-            return Ok(());
-        }
-        let snapshot = {
-            let scope = self.scope.snapshot();
-            PodScopeSnapshot {
-                allow: scope.allow_rules(),
-                deny: scope.deny_rules(),
-            }
-        };
-        let payload = serde_json::to_value(&snapshot).expect("PodScopeSnapshot is Serialize");
-        self.commit_entry(LogEntry::Extension {
-            ts: segment_log::now_millis(),
-            domain: session_store::POD_SCOPE_EXTENSION_DOMAIN.into(),
-            payload,
-        })
-    }
-
     /// Append `entry` to the session log AND publish it through the
     /// broadcast sink. No user-space serialization is needed across
     /// concurrent appenders — the kernel orders `O_APPEND` writes for
@@ -790,34 +770,6 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     /// clients without consulting any other state.
     pub fn sink(&self) -> SegmentLogSink {
         self.sink.clone()
-    }
-
-    /// Cloneable callback handed to dynamic-scope tools. It cannot append
-    /// directly to the async store from a sync tool callback, so it records
-    /// the latest snapshot and the controller flushes it after the tool
-    /// turn completes.
-    pub fn scope_change_sink(&self) -> Arc<dyn Fn(PodScopeSnapshot) + Send + Sync> {
-        let pending = self.pending_scope_snapshot.clone();
-        Arc::new(move |snapshot| {
-            *pending.lock().expect("pending_scope_snapshot poisoned") = Some(snapshot);
-        })
-    }
-
-    fn flush_pending_scope_snapshot(&mut self) -> Result<(), StoreError> {
-        let snapshot = self
-            .pending_scope_snapshot
-            .lock()
-            .expect("pending_scope_snapshot poisoned")
-            .take();
-        if let Some(snapshot) = snapshot {
-            let payload = serde_json::to_value(&snapshot).expect("PodScopeSnapshot is Serialize");
-            self.commit_entry(LogEntry::Extension {
-                ts: segment_log::now_millis(),
-                domain: session_store::POD_SCOPE_EXTENSION_DOMAIN.into(),
-                payload,
-            })?;
-        }
-        Ok(())
     }
 
     /// Direct access to the underlying Worker.
@@ -925,30 +877,32 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         metadata
     }
 
-    fn write_pod_metadata_pending(&self) -> Result<(), StoreError> {
+    fn write_pod_metadata_pending(&self) -> Result<(), PodError> {
         let Some(writer) = &self.pod_metadata_writer else {
             return Ok(());
         };
         writer(self.pod_metadata(Some(PodActiveSegmentRef::pending_segment(
             self.session_id(),
-        ))))
+        ))))?;
+        Ok(())
     }
 
-    fn write_pod_metadata_active(&self, loc: SegmentLocation) -> Result<(), StoreError> {
+    fn write_pod_metadata_active(&self, loc: SegmentLocation) -> Result<(), PodError> {
         let Some(writer) = &self.pod_metadata_writer else {
             return Ok(());
         };
         writer(self.pod_metadata(Some(PodActiveSegmentRef::active_segment(
             loc.session_id,
             loc.segment_id,
-        ))))
+        ))))?;
+        Ok(())
     }
 
     /// Enable name-keyed Pod metadata write-through for Pods built through
     /// the low-level constructor. High-level manifest constructors enable it
     /// automatically; this hook lets tests and custom embedders opt into the
     /// same persistence behavior without changing `Pod::new`'s minimal bounds.
-    pub fn enable_pod_metadata_write_through(&mut self) -> Result<(), StoreError>
+    pub fn enable_pod_metadata_write_through(&mut self) -> Result<(), PodError>
     where
         St: PodMetadataStore + Clone + Send + Sync + 'static,
     {
@@ -2001,7 +1955,6 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 compacted_from: None,
             };
             self.commit_entry(initial)?;
-            self.persist_scope_snapshot()?;
             self.write_pod_metadata_active(loc)?;
             return Ok(());
         }
@@ -2295,8 +2248,6 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 self.commit_entry(entry)?;
             }
         }
-
-        self.flush_pending_scope_snapshot()?;
 
         let turn_count = self.worker.as_ref().unwrap().turn_count();
         self.commit_entry(LogEntry::TurnEnd {
@@ -2769,7 +2720,6 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             .lock()
             .expect("usage_history poisoned")
             .clear();
-        self.persist_scope_snapshot()?;
         // Reset extract pointer alongside usage_history: the compacted
         // session has a fresh log with no `LogEntry::Extension` entries
         // yet, so a cold restore here would set extract_pointer to None
@@ -3825,7 +3775,6 @@ where
             inject_resident_summary: true,
             inject_resident_knowledge: true,
             inject_resident_workflows: true,
-            pending_scope_snapshot: Arc::new(Mutex::new(None)),
             extract_in_flight: Arc::new(AtomicBool::new(false)),
             consolidation_in_flight: Arc::new(AtomicBool::new(false)),
             extract_pointer: Arc::new(Mutex::new(None)),
@@ -3905,7 +3854,6 @@ where
             inject_resident_summary: true,
             inject_resident_knowledge: true,
             inject_resident_workflows: true,
-            pending_scope_snapshot: Arc::new(Mutex::new(None)),
             extract_in_flight: Arc::new(AtomicBool::new(false)),
             consolidation_in_flight: Arc::new(AtomicBool::new(false)),
             extract_pointer: Arc::new(Mutex::new(None)),
@@ -3995,19 +3943,13 @@ where
             return Err(PodError::SegmentEmpty { segment_id });
         }
         let mirror_entries: Vec<LogEntry> = raw_entries.clone();
-        let scope_snapshot = state
-            .pod_scope
-            .clone()
-            .ok_or(PodError::SegmentScopeMissing { segment_id })?;
+        let scope_config = effective_restore_scope_config(&store, &manifest)?;
 
         let mut common = prepare_pod_common_with_scope(
             &manifest,
             &loader,
             /* parse_template */ false,
-            ScopeConfig {
-                allow: scope_snapshot.allow,
-                deny: scope_snapshot.deny,
-            },
+            scope_config,
         )?;
         let skill_shadows = std::mem::take(&mut common.skill_shadows);
 
@@ -4093,7 +4035,6 @@ where
             inject_resident_summary: true,
             inject_resident_knowledge: true,
             inject_resident_workflows: true,
-            pending_scope_snapshot: Arc::new(Mutex::new(None)),
             extract_in_flight: Arc::new(AtomicBool::new(false)),
             consolidation_in_flight: Arc::new(AtomicBool::new(false)),
             extract_pointer: Arc::new(Mutex::new(extract_pointer)),
@@ -4112,8 +4053,59 @@ where
             session_id,
             segment_id,
         })?;
+        pod.reconcile_restored_delegations().await?;
         drain_skill_shadows(&pod, skill_shadows);
         Ok(pod)
+    }
+
+    async fn reconcile_restored_delegations(&mut self) -> Result<(), PodError> {
+        let pod_name = self.manifest.pod.name.clone();
+        let Some(metadata) = self.store.read_by_name(&pod_name)? else {
+            return Ok(());
+        };
+
+        let mut reclaimed = Vec::new();
+        for child in metadata.spawned_children {
+            if restored_child_reachable(&child).await {
+                continue;
+            }
+            let delegated_scope = spawned_child_scope_rules(&child);
+            if !delegated_scope.is_empty() {
+                let lock_path =
+                    pod_registry::default_registry_path().map_err(ScopeLockError::from)?;
+                let mut guard =
+                    pod_registry::LockFileGuard::open(&lock_path).map_err(ScopeLockError::from)?;
+                pod_registry::reclaim_delegated_scope(
+                    &mut guard,
+                    &pod_name,
+                    &child.pod_name,
+                    &delegated_scope,
+                )?;
+                let write_rules = delegated_scope
+                    .iter()
+                    .filter(|rule| rule.permission == Permission::Write)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                self.scope
+                    .update(|current| current.with_removed_deny_rules(write_rules))
+                    .map_err(PodError::Scope)?;
+            }
+            reclaimed.push(PodReclaimedChild {
+                pod_name: child.pod_name,
+                scope_delegated: child.scope_delegated,
+            });
+        }
+
+        if reclaimed.is_empty() {
+            return Ok(());
+        }
+
+        self.store.reclaim_spawned_children(&pod_name, reclaimed)?;
+        self.push_notify(
+            "Restored Pod state contained missing or unreachable delegated child Pods; their delegated write scopes were reclaimed before resume."
+                .to_string(),
+        );
+        Ok(())
     }
 
     /// Convenience: build a Pod from a single-layer TOML manifest string.
@@ -4438,6 +4430,7 @@ fn token_budget_bytes(tokens: u64) -> usize {
 pub enum RewindError {
     #[error(transparent)]
     Store(#[from] StoreError),
+
     #[error("{0}")]
     Invalid(String),
 }
@@ -4547,6 +4540,9 @@ pub enum PodError {
     Store(#[from] StoreError),
 
     #[error(transparent)]
+    PodStore(#[from] PodStoreError),
+
+    #[error(transparent)]
     Scope(ScopeError),
 
     #[error("pwd is not readable under the configured scope: {}", .pwd.display())]
@@ -4613,11 +4609,6 @@ pub enum PodError {
     #[error("session {segment_id} has no entries to restore")]
     SegmentEmpty { segment_id: SegmentId },
 
-    #[error(
-        "session {segment_id} has no persisted scope snapshot; refusing resume without explicit scope"
-    )]
-    SegmentScopeMissing { segment_id: SegmentId },
-
     #[error("pod metadata for {pod_name} was not found")]
     PodMetadataMissing { pod_name: String },
 
@@ -4657,6 +4648,66 @@ struct PodCommon {
     /// after the Pod is materialised so the first LLM request observes
     /// any skill ↔ workflow collisions.
     skill_shadows: Vec<workflow_crate::ShadowedSkill>,
+}
+
+async fn restored_child_reachable(child: &PodSpawnedChild) -> bool {
+    tokio::time::timeout(
+        RESTORE_RECONCILIATION_REACHABILITY_TIMEOUT,
+        UnixStream::connect(&child.socket_path),
+    )
+    .await
+    .map(|result| result.is_ok())
+    .unwrap_or(false)
+}
+
+fn spawned_child_scope_rules(child: &PodSpawnedChild) -> Vec<ScopeRule> {
+    child
+        .scope_delegated
+        .iter()
+        .filter_map(|rule| delegated_scope_rule_to_scope_rule(rule.clone()))
+        .collect()
+}
+
+fn delegated_scope_rule_to_scope_rule(rule: PodSpawnedScopeRule) -> Option<ScopeRule> {
+    let permission = match rule.permission.as_str() {
+        "read" => Permission::Read,
+        "write" => Permission::Write,
+        other => {
+            warn!(permission = %other, "ignoring invalid delegated child scope permission");
+            return None;
+        }
+    };
+    Some(ScopeRule {
+        target: rule.target,
+        permission,
+        recursive: rule.recursive,
+    })
+}
+
+fn effective_restore_scope_config<St>(
+    store: &St,
+    manifest: &PodManifest,
+) -> Result<ScopeConfig, PodStoreError>
+where
+    St: PodMetadataStore,
+{
+    let mut scope = manifest.scope.clone();
+    let Some(metadata) = store.read_by_name(&manifest.pod.name)? else {
+        return Ok(scope);
+    };
+    for child in metadata.spawned_children {
+        for rule in child.scope_delegated {
+            if let Some(deny) = delegated_write_rule_to_deny(rule) {
+                scope.deny.push(deny);
+            }
+        }
+    }
+    Ok(scope)
+}
+
+fn delegated_write_rule_to_deny(rule: PodSpawnedScopeRule) -> Option<ScopeRule> {
+    let rule = delegated_scope_rule_to_scope_rule(rule)?;
+    (rule.permission == Permission::Write).then_some(rule)
 }
 
 /// Resolve pwd / scope / LLM client / prompt catalog from a validated

@@ -20,10 +20,11 @@ use pod::spawn::comm_tools::{
     list_pods_tool, read_pod_output_tool, send_to_pod_tool, stop_pod_tool,
 };
 use pod::spawn::registry::SpawnedPodRegistry;
+use pod_store::{CombinedStore, FsPodStore, PodMetadataStore};
 use protocol::stream::{JsonLineReader, JsonLineWriter};
 use protocol::{ErrorCode, Event, Greeting, Method};
 use serde_json::json;
-use session_store::{FsStore, PodMetadataStore};
+use session_store::FsStore;
 use tempfile::TempDir;
 use tokio::net::UnixListener;
 use tokio::sync::mpsc;
@@ -385,7 +386,10 @@ async fn stop_pod_sends_shutdown_and_releases_scope() {
     let _env = EnvGuard::acquire();
     let tmp = TempDir::new().unwrap();
     let store_tmp = TempDir::new().unwrap();
-    let store = FsStore::new(store_tmp.path()).unwrap();
+    let store = CombinedStore::new(
+        FsStore::new(store_tmp.path()).unwrap(),
+        FsPodStore::new(store_tmp.path().join("pods")).unwrap(),
+    );
     let rd = Arc::new(RuntimeDir::create(tmp.path(), "spawner").await.unwrap());
     let parent_scope = SharedScope::new(
         Scope::writable(tmp.path())
@@ -438,7 +442,6 @@ async fn stop_pod_sends_shutdown_and_releases_scope() {
         store.clone(),
         "spawner".into(),
         Some(parent_scope.clone()),
-        None,
     )
     .await
     .unwrap();
@@ -512,7 +515,10 @@ async fn restored_registry_uses_pod_state_without_runtime_file() {
     let _env = EnvGuard::acquire();
     let runtime_tmp = TempDir::new().unwrap();
     let store_tmp = TempDir::new().unwrap();
-    let store = FsStore::new(store_tmp.path()).unwrap();
+    let store = CombinedStore::new(
+        FsStore::new(store_tmp.path()).unwrap(),
+        FsPodStore::new(store_tmp.path().join("pods")).unwrap(),
+    );
     unsafe {
         std::env::set_var("INSOMNIA_RUNTIME_DIR", runtime_tmp.path());
     }
@@ -573,16 +579,21 @@ async fn restored_registry_uses_pod_state_without_runtime_file() {
         .unwrap()
         .expect("spawner metadata should remain");
     assert!(metadata.spawned_children.is_empty());
+    assert_eq!(metadata.reclaimed_children.len(), 1);
+    assert_eq!(metadata.reclaimed_children[0].pod_name, "child");
     let runtime_contents = std::fs::read_to_string(rd.path().join("spawned_pods.json")).unwrap();
     let runtime_records: Vec<SpawnedPodRecord> = serde_json::from_str(&runtime_contents).unwrap();
     assert!(runtime_records.is_empty());
 }
 
 #[tokio::test]
-async fn load_from_pod_state_prunes_runtime_children_but_preserves_durable_state() {
+async fn load_from_pod_state_prunes_runtime_children_and_reclaims_durable_delegation() {
     let runtime_tmp = TempDir::new().unwrap();
     let store_tmp = TempDir::new().unwrap();
-    let store = FsStore::new(store_tmp.path()).unwrap();
+    let store = CombinedStore::new(
+        FsStore::new(store_tmp.path()).unwrap(),
+        FsPodStore::new(store_tmp.path().join("pods")).unwrap(),
+    );
     let rd = Arc::new(
         RuntimeDir::create(runtime_tmp.path(), "spawner")
             .await
@@ -615,27 +626,21 @@ async fn load_from_pod_state_prunes_runtime_children_but_preserves_durable_state
         .read_by_name("spawner")
         .unwrap()
         .expect("spawner metadata should be written");
-    assert_eq!(metadata.spawned_children.len(), 2);
-    assert!(
-        metadata
-            .spawned_children
-            .iter()
-            .any(|c| c.pod_name == "alive")
-    );
-    assert!(
-        metadata
-            .spawned_children
-            .iter()
-            .any(|c| c.pod_name == "missing")
-    );
+    assert_eq!(metadata.spawned_children.len(), 1);
+    assert_eq!(metadata.spawned_children[0].pod_name, "alive");
+    assert_eq!(metadata.reclaimed_children.len(), 1);
+    assert_eq!(metadata.reclaimed_children[0].pod_name, "missing");
 }
 
 #[tokio::test]
-async fn load_from_pod_state_reclaims_pruned_child_scope_without_deleting_pod_state() {
+async fn load_from_pod_state_reclaims_missing_child_scope_and_records_history() {
     let _env = EnvGuard::acquire();
     let runtime_tmp = TempDir::new().unwrap();
     let store_tmp = TempDir::new().unwrap();
-    let store = FsStore::new(store_tmp.path()).unwrap();
+    let store = CombinedStore::new(
+        FsStore::new(store_tmp.path()).unwrap(),
+        FsPodStore::new(store_tmp.path().join("pods")).unwrap(),
+    );
     unsafe {
         std::env::set_var("INSOMNIA_RUNTIME_DIR", runtime_tmp.path());
     }
@@ -658,15 +663,6 @@ async fn load_from_pod_state_reclaims_pruned_child_scope_without_deleting_pod_st
             std::process::id(),
             "/tmp/spawner.sock".into(),
             vec![missing_rule.clone()],
-            vec![missing_rule.clone()],
-            session_store::new_segment_id(),
-        )
-        .unwrap();
-        pod_registry::register_pod(
-            &mut g,
-            "missing".into(),
-            std::process::id(),
-            "/tmp/missing.sock".into(),
             vec![missing_rule.clone()],
             session_store::new_segment_id(),
         )
@@ -696,7 +692,6 @@ async fn load_from_pod_state_reclaims_pruned_child_scope_without_deleting_pod_st
         store.clone(),
         "spawner".into(),
         Some(parent_scope.clone()),
-        None,
     )
     .await
     .unwrap();
@@ -716,8 +711,9 @@ async fn load_from_pod_state_reclaims_pruned_child_scope_without_deleting_pod_st
         .read_by_name("spawner")
         .unwrap()
         .expect("spawner metadata should remain");
-    assert_eq!(metadata.spawned_children.len(), 1);
-    assert_eq!(metadata.spawned_children[0].pod_name, "missing");
+    assert!(metadata.spawned_children.is_empty());
+    assert_eq!(metadata.reclaimed_children.len(), 1);
+    assert_eq!(metadata.reclaimed_children[0].pod_name, "missing");
     let runtime_contents = std::fs::read_to_string(rd.path().join("spawned_pods.json")).unwrap();
     let runtime_records: Vec<SpawnedPodRecord> = serde_json::from_str(&runtime_contents).unwrap();
     assert!(runtime_records.is_empty());

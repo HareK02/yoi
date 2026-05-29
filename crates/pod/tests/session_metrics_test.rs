@@ -25,10 +25,13 @@ use llm_worker::Worker;
 use llm_worker::llm_client::event::{Event as LlmEvent, ResponseStatus, StatusEvent, UsageEvent};
 use llm_worker::llm_client::{ClientError, LlmClient, Request};
 use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
+use pod_store::{CombinedStore, FsPodStore};
 use session_metrics::{DOMAIN, Metric, metrics_from_extensions};
 use session_store::{FsStore, LogEntry, SegmentId, SessionId, Store, StoreError, TraceEntry};
 
 use pod::{Pod, PodManifest};
+
+type TestStore = CombinedStore<FsStore, FsPodStore>;
 
 #[derive(Clone)]
 struct MockClient {
@@ -166,13 +169,16 @@ async fn make_pod(
     client: MockClient,
     tool_name: &'static str,
 ) -> (
-    Pod<MockClient, FsStore>,
+    Pod<MockClient, TestStore>,
     tempfile::TempDir,
     tempfile::TempDir,
 ) {
     let manifest = PodManifest::from_toml(&manifest_toml).unwrap();
     let store_tmp = tempfile::tempdir().unwrap();
-    let store = FsStore::new(store_tmp.path()).unwrap();
+    let store = CombinedStore::new(
+        FsStore::new(store_tmp.path()).unwrap(),
+        FsPodStore::new(store_tmp.path().join("pods")).unwrap(),
+    );
     let pwd_tmp = tempfile::tempdir().unwrap();
     let pwd = pwd_tmp.path().to_path_buf();
     let scope = pod::Scope::writable(&pwd).unwrap();
@@ -500,7 +506,10 @@ permission = "write"
     let client = MockClient::new(vec![text_response_with_cache("hi", 0, 0)]);
     let manifest = PodManifest::from_toml(manifest_toml).unwrap();
     let store_tmp = tempfile::tempdir().unwrap();
-    let store = FsStore::new(store_tmp.path()).unwrap();
+    let store = CombinedStore::new(
+        FsStore::new(store_tmp.path()).unwrap(),
+        FsPodStore::new(store_tmp.path().join("pods")).unwrap(),
+    );
     let pwd_tmp = tempfile::tempdir().unwrap();
     let pwd = pwd_tmp.path().to_path_buf();
     let scope = pod::Scope::writable(&pwd).unwrap();

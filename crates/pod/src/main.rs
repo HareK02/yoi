@@ -2,11 +2,10 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
-use manifest::{
-    NixProfileResolver, PodManifest, PodManifestConfig, ProfileSelector, ScopeConfig, paths,
-};
+use manifest::{NixProfileResolver, PodManifest, PodManifestConfig, ProfileSelector, paths};
 use pod::{Pod, PodController, PromptLoader};
-use session_store::{FsStore, PodMetadataStore, SegmentId, Store};
+use pod_store::{CombinedStore, FsPodStore, PodMetadataStore};
+use session_store::{FsStore, SegmentId, Store};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -44,10 +43,6 @@ struct Cli {
     /// Internal typed pod-name override for session restore launched by the TUI.
     #[arg(long, value_name = "NAME", requires = "session", hide = true)]
     session_pod_name: Option<String>,
-
-    /// Internal typed scope snapshot for session restore launched by the TUI.
-    #[arg(long, value_name = "JSON", requires = "session", hide = true)]
-    resume_scope_json: Option<String>,
 
     /// Internal resolved manifest config for delegated child Pod spawning.
     #[arg(
@@ -132,10 +127,6 @@ where
 fn apply_session_restore_overrides(manifest: &mut PodManifest, cli: &Cli) -> Result<(), String> {
     if let Some(pod_name) = cli.session_pod_name.as_deref() {
         manifest.pod.name = pod_name.to_string();
-    }
-    if let Some(scope_json) = cli.resume_scope_json.as_deref() {
-        manifest.scope = serde_json::from_str::<ScopeConfig>(scope_json)
-            .map_err(|e| format!("failed to parse --resume-scope-json: {e}"))?;
     }
     Ok(())
 }
@@ -229,13 +220,28 @@ async fn main() -> ExitCode {
             }
         },
     };
-    let store = match FsStore::new(&store_dir) {
+    let session_store = match FsStore::new(&store_dir) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("error: failed to initialize store at {store_dir:?}: {e}");
+            eprintln!("error: failed to initialize session store at {store_dir:?}: {e}");
             return ExitCode::FAILURE;
         }
     };
+    let pod_store_dir = match paths::data_dir() {
+        Some(data_dir) => data_dir.join("pods"),
+        None => store_dir
+            .parent()
+            .map(|parent| parent.join("pods"))
+            .unwrap_or_else(|| PathBuf::from("pods")),
+    };
+    let pod_store = match FsPodStore::new(&pod_store_dir) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: failed to initialize pod store at {pod_store_dir:?}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let store = CombinedStore::new(session_store, pod_store);
 
     let pod = if cli.adopt {
         let callback = match cli.callback.clone() {

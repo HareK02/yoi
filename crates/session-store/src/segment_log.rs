@@ -11,7 +11,7 @@
 
 use llm_worker::llm_client::types::{Item, RequestConfig};
 use llm_worker::{UsageRecord, WorkerResult};
-use protocol::{InvokeKind, ScopeRule, Segment};
+use protocol::{InvokeKind, Segment};
 use serde::{Deserialize, Serialize};
 
 use crate::logged_item::LoggedItem;
@@ -166,16 +166,6 @@ pub struct SegmentOrigin {
     pub at_turn_index: usize,
 }
 
-/// Domain used by Pod to persist its latest effective runtime scope.
-pub const POD_SCOPE_EXTENSION_DOMAIN: &str = "pod.scope";
-
-/// Payload stored in `LogEntry::Extension { domain: "pod.scope", .. }`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct PodScopeSnapshot {
-    pub allow: Vec<ScopeRule>,
-    pub deny: Vec<ScopeRule>,
-}
-
 /// State collected from log entries.
 #[derive(Debug, Clone)]
 pub struct RestoredState {
@@ -199,9 +189,6 @@ pub struct RestoredState {
     /// `LogEntry::Extension` を replay 順に積んだもの。`(domain, payload)`。
     /// session-store は domain を不透明扱いし、各ドメインが自前で fold する。
     pub extensions: Vec<(String, serde_json::Value)>,
-    /// Latest runtime scope snapshot persisted by the Pod. `None` means
-    /// the segment predates scope persistence or the payload was corrupt.
-    pub pod_scope: Option<PodScopeSnapshot>,
     /// User submissions in original typed form, in submit order.
     /// One entry per `LogEntry::UserInput`; the K-th entry corresponds to
     /// the K-th `Item::user_message` derived during replay (modulo
@@ -223,7 +210,6 @@ pub fn collect_state(entries: &[LogEntry]) -> RestoredState {
         entries_count: 0,
         usage_history: Vec::new(),
         extensions: Vec::new(),
-        pod_scope: None,
         user_segments: Vec::new(),
     };
 
@@ -293,17 +279,6 @@ pub fn collect_state(entries: &[LogEntry]) -> RestoredState {
             LogEntry::Extension {
                 domain, payload, ..
             } => {
-                if domain == POD_SCOPE_EXTENSION_DOMAIN {
-                    match serde_json::from_value::<PodScopeSnapshot>(payload.clone()) {
-                        Ok(snapshot) => state.pod_scope = Some(snapshot),
-                        Err(err) => {
-                            tracing::warn!(
-                                error = %err,
-                                "discarding malformed pod.scope snapshot from segment log"
-                            );
-                        }
-                    }
-                }
                 state.extensions.push((domain.clone(), payload.clone()));
             }
         }

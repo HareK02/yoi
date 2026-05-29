@@ -1,14 +1,14 @@
 use std::collections::BTreeMap;
-use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use client::PodClient;
 use pod_registry::{LockFileGuard, default_registry_path};
+use pod_store::{PodActiveSegmentRef, PodMetadata, PodMetadataStore};
 use protocol::{Event, PodStatus};
 use session_store::{
-    FsStore, LogEntry, LoggedContentPart, LoggedItem, PodMetadata, SegmentId, SessionId, Store,
+    FsStore, LogEntry, LoggedContentPart, LoggedItem, SegmentId, SessionId, Store,
 };
 
 #[derive(Debug, Clone)]
@@ -234,27 +234,17 @@ pub(crate) enum PodEntryDiagnosticKind {
 }
 
 pub(crate) fn read_stored_pod_infos(
-    store_dir: &Path,
     store: &FsStore,
+    pod_store: &impl PodMetadataStore,
 ) -> Result<Vec<StoredPodInfo>, io::Error> {
-    let pods_dir = store_dir.join("pods");
     let mut records = Vec::new();
-    if !pods_dir.exists() {
-        return Ok(records);
-    }
-
-    for entry in fs::read_dir(pods_dir)? {
-        let entry = entry?;
-        if !entry.file_type()?.is_dir() {
-            continue;
-        }
-        let pod_name = entry.file_name().to_string_lossy().to_string();
-        let path = entry.path().join("metadata.json");
-        let info = match fs::read_to_string(&path) {
-            Ok(content) => match serde_json::from_str::<PodMetadata>(&content) {
-                Ok(metadata) => stored_info_from_metadata(store, pod_name, metadata),
-                Err(e) => corrupt_stored_info(pod_name, e.to_string()),
-            },
+    for pod_name in pod_store.list_names().map_err(io::Error::other)? {
+        let info = match pod_store.read_by_name(&pod_name) {
+            Ok(Some(metadata)) => stored_info_from_metadata(store, pod_name, metadata),
+            Ok(None) => corrupt_stored_info(
+                pod_name,
+                "metadata disappeared during discovery".to_string(),
+            ),
             Err(e) => corrupt_stored_info(pod_name, e.to_string()),
         };
         records.push(info);
@@ -392,10 +382,7 @@ fn summarize_live_pod(store: &FsStore, live: &LivePodInfo) -> PodEntrySummary {
     }
 }
 
-fn summarize_metadata(
-    store: &FsStore,
-    active: Option<&session_store::PodActiveSegmentRef>,
-) -> SegmentSummary {
+fn summarize_metadata(store: &FsStore, active: Option<&PodActiveSegmentRef>) -> SegmentSummary {
     let Some(active) = active else {
         return SegmentSummary {
             updated_at: 0,
@@ -558,7 +545,9 @@ fn trim_one_line(s: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
     use llm_worker::llm_client::types::RequestConfig;
-    use session_store::{PodActiveSegmentRef, PodMetadataStore, new_segment_id, new_session_id};
+    use pod_store::FsPodStore;
+    use pod_store::{PodActiveSegmentRef, PodMetadataStore};
+    use session_store::{new_segment_id, new_session_id};
     use tempfile::tempdir;
 
     const SOURCE: PodVisibilitySource = PodVisibilitySource::ResumePicker;
@@ -776,11 +765,12 @@ mod tests {
     fn read_stored_pod_infos_reports_corrupt_metadata() {
         let dir = tempdir().unwrap();
         let store = FsStore::new(dir.path()).unwrap();
+        let pod_store = FsPodStore::new(dir.path().join("pods")).unwrap();
         let pod_dir = dir.path().join("pods").join("broken");
-        fs::create_dir_all(&pod_dir).unwrap();
-        fs::write(pod_dir.join("metadata.json"), "{not-json").unwrap();
+        std::fs::create_dir_all(&pod_dir).unwrap();
+        std::fs::write(pod_dir.join("metadata.json"), "{not-json").unwrap();
 
-        let records = read_stored_pod_infos(dir.path(), &store).unwrap();
+        let records = read_stored_pod_infos(&store, &pod_store).unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].pod_name, "broken");
         assert!(matches!(
@@ -793,16 +783,17 @@ mod tests {
     fn read_stored_pod_infos_reads_metadata() {
         let dir = tempdir().unwrap();
         let store = FsStore::new(dir.path()).unwrap();
+        let pod_store = FsPodStore::new(dir.path().join("pods")).unwrap();
         let session_id = new_session_id();
         let segment_id = new_segment_id();
-        store
+        pod_store
             .write(&PodMetadata::new(
                 "agent",
                 Some(PodActiveSegmentRef::active_segment(session_id, segment_id)),
             ))
             .unwrap();
 
-        let records = read_stored_pod_infos(dir.path(), &store).unwrap();
+        let records = read_stored_pod_infos(&store, &pod_store).unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].pod_name, "agent");
         assert_eq!(records[0].metadata_state, StoredMetadataState::Present);

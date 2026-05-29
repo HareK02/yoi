@@ -15,11 +15,12 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
+use pod_store::{PodActiveSegmentRef, PodMetadata, PodMetadataStore};
 use protocol::stream::JsonLineReader;
 use protocol::{Event, PodStatus};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use session_store::{PodActiveSegmentRef, PodMetadata, PodMetadataStore, SegmentId, SessionId};
+use session_store::{SegmentId, SessionId};
 use tokio::net::UnixStream;
 use tokio::process::Command;
 
@@ -496,8 +497,10 @@ pub enum PodDiscoveryError {
         socket_path: PathBuf,
         pid: u32,
     },
-    #[error("store error: {0}")]
+    #[error("session store error: {0}")]
     Store(#[from] session_store::StoreError),
+    #[error("pod store error: {0}")]
+    PodStore(#[from] pod_store::PodStoreError),
     #[error("scope lock error: {0}")]
     ScopeLock(#[from] pod_registry::ScopeLockError),
     #[error("failed to launch restore process: {0}")]
@@ -527,7 +530,7 @@ impl VisibilitySet {
 }
 
 async fn summarize_spawned_children(
-    children: &[session_store::PodSpawnedChild],
+    children: &[pod_store::PodSpawnedChild],
 ) -> SpawnedChildrenSummary {
     let mut summary = SpawnedChildrenSummary {
         count: children.len(),
@@ -752,6 +755,7 @@ fn discovery_error_to_tool_error(error: PodDiscoveryError) -> ToolError {
         | PodDiscoveryError::NotRestorable { .. } => ToolError::InvalidArgument(error.to_string()),
         PodDiscoveryError::LockConflict { .. }
         | PodDiscoveryError::Store(_)
+        | PodDiscoveryError::PodStore(_)
         | PodDiscoveryError::ScopeLock(_)
         | PodDiscoveryError::RestoreSpawn(_)
         | PodDiscoveryError::RestoreExited { .. }
@@ -765,11 +769,10 @@ mod tests {
     use std::sync::Mutex;
 
     use manifest::{Permission, ScopeRule};
+    use pod_store::{FsPodStore, PodSpawnedChild, PodSpawnedScopeRule};
     use protocol::stream::JsonLineWriter;
     use protocol::{Alert, AlertLevel, AlertSource, Greeting};
-    use session_store::{
-        FsStore, PodSpawnedChild, PodSpawnedScopeRule, new_segment_id, new_session_id,
-    };
+    use session_store::{new_segment_id, new_session_id};
     use tempfile::TempDir;
     use tokio::net::UnixListener;
 
@@ -788,7 +791,7 @@ mod tests {
             std::env::set_var("INSOMNIA_RUNTIME_DIR", &runtime_base);
         }
 
-        let store = FsStore::new(&store_dir).unwrap();
+        let store = FsPodStore::new(&store_dir).unwrap();
         let session_id = new_session_id();
         let active_child_segment = new_segment_id();
         let pending_session_id = new_session_id();
@@ -806,6 +809,7 @@ mod tests {
                 child("child-stale", &stale_socket),
                 child("child-pending", &pending_socket),
             ],
+            reclaimed_children: Vec::new(),
             resolved_manifest_snapshot: None,
         };
         store.write(&parent).unwrap();
@@ -817,6 +821,7 @@ mod tests {
                     active_child_segment,
                 )),
                 spawned_children: Vec::new(),
+                reclaimed_children: Vec::new(),
                 resolved_manifest_snapshot: None,
             })
             .unwrap();
@@ -828,6 +833,7 @@ mod tests {
                     active_child_segment,
                 )),
                 spawned_children: Vec::new(),
+                reclaimed_children: Vec::new(),
                 resolved_manifest_snapshot: None,
             })
             .unwrap();
@@ -836,6 +842,7 @@ mod tests {
                 pod_name: "child-pending".into(),
                 active: Some(PodActiveSegmentRef::pending_segment(pending_session_id)),
                 spawned_children: Vec::new(),
+                reclaimed_children: Vec::new(),
                 resolved_manifest_snapshot: None,
             })
             .unwrap();
@@ -847,6 +854,7 @@ mod tests {
                     new_segment_id(),
                 )),
                 spawned_children: Vec::new(),
+                reclaimed_children: Vec::new(),
                 resolved_manifest_snapshot: None,
             })
             .unwrap();

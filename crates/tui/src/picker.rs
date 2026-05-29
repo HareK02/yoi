@@ -1,7 +1,7 @@
 //! Inline-viewport "pick a Pod to attach or restore" UX.
 //!
 //! Reads live Pod allocations from the runtime registry and stopped Pod state
-//! from the session store's name-keyed metadata. Picking a live row attaches to
+//! from the pod-store name-keyed metadata. Picking a live row attaches to
 //! its socket; picking a stopped row restores via `insomnia-pod --pod <name>`.
 
 use std::io;
@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crossterm::event::{self, Event as TermEvent, KeyCode, KeyEventKind, KeyModifiers};
+use pod_store::FsPodStore;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout};
@@ -102,7 +103,8 @@ impl PodRowState {
 pub async fn run() -> Result<PickerOutcome, PickerError> {
     let store_dir = default_store_dir()?;
     let store = FsStore::new(&store_dir)?;
-    let stored_pods = read_stored_pod_infos(&store_dir, &store)?;
+    let pod_store = FsPodStore::new(default_pod_store_dir()?).map_err(io::Error::other)?;
+    let stored_pods = read_stored_pod_infos(&store, &pod_store)?;
     let live_pods = read_reachable_live_pod_infos(&store)
         .await
         .unwrap_or_default();
@@ -170,6 +172,18 @@ fn default_store_dir() -> Result<PathBuf, PickerError> {
              (set INSOMNIA_HOME, INSOMNIA_DATA_DIR, or HOME)",
         ))
     })
+}
+
+fn default_pod_store_dir() -> Result<PathBuf, PickerError> {
+    manifest::paths::data_dir()
+        .map(|dir| dir.join("pods"))
+        .ok_or_else(|| {
+            PickerError::Io(io::Error::new(
+                io::ErrorKind::NotFound,
+                "could not resolve pod state directory \
+             (set INSOMNIA_HOME, INSOMNIA_DATA_DIR, or HOME)",
+            ))
+        })
 }
 
 pub(crate) fn live_socket_for_pod(pod_name: &str) -> Option<PathBuf> {

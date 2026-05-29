@@ -6,6 +6,7 @@
 //! ```
 
 use pod::{Event, Method, PodController};
+use pod_store::{CombinedStore, FsPodStore};
 use session_store::FsStore;
 
 fn manifest_toml(pwd: &std::path::Path) -> String {
@@ -39,7 +40,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pwd = std::env::current_dir()?;
     let toml = manifest_toml(&pwd);
     let tmp = tempfile::tempdir()?;
-    let store = FsStore::new(tmp.path())?;
+    let store = CombinedStore::new(
+        FsStore::new(tmp.path().join("sessions"))?,
+        FsPodStore::new(tmp.path().join("pods"))?,
+    );
     let pod = pod::Pod::from_manifest_toml(&toml, store).await?;
 
     let runtime_tmp = tempfile::tempdir()?;

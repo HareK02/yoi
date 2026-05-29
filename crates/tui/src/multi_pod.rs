@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{Event as TermEvent, KeyCode, KeyEvent, KeyModifiers, poll, read};
+use pod_store::FsPodStore;
 use protocol::stream::{JsonLineReader, JsonLineWriter};
 use protocol::{ErrorCode, Event, InvokeKind, Method, PodStatus, Segment};
 use ratatui::Frame;
@@ -199,10 +200,20 @@ fn default_store_dir() -> Result<PathBuf, MultiPodError> {
     manifest::paths::sessions_dir().ok_or_else(|| {
         MultiPodError::Io(io::Error::new(
             io::ErrorKind::NotFound,
-            "could not resolve sessions directory \
-             (set INSOMNIA_HOME, INSOMNIA_DATA_DIR, or HOME)",
+            "could not resolve sessions directory",
         ))
     })
+}
+
+fn default_pod_store_dir() -> Result<PathBuf, MultiPodError> {
+    manifest::paths::data_dir()
+        .map(|dir| dir.join("pods"))
+        .ok_or_else(|| {
+            MultiPodError::Io(io::Error::new(
+                io::ErrorKind::NotFound,
+                "could not resolve pod state directory",
+            ))
+        })
 }
 
 #[cfg(test)]
@@ -483,7 +494,8 @@ enum MultiPodAction {
 async fn load_pod_list(selected_name: Option<String>) -> Result<PodList, MultiPodError> {
     let store_dir = default_store_dir()?;
     let store = FsStore::new(&store_dir)?;
-    let stored = read_stored_pod_infos(&store_dir, &store)?;
+    let pod_store = FsPodStore::new(default_pod_store_dir()?).map_err(io::Error::other)?;
+    let stored = read_stored_pod_infos(&store, &pod_store)?;
     let live = read_reachable_live_pod_infos(&store)
         .await
         .unwrap_or_default();

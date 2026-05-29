@@ -1,8 +1,7 @@
 use llm_worker::WorkerResult;
 use llm_worker::llm_client::types::{Item, RequestConfig};
 use session_store::{
-    FsStore, LogEntry, PodActiveSegmentRef, PodMetadata, PodMetadataStore, Store, TraceEntry,
-    collect_state, new_segment_id, new_session_id,
+    FsStore, LogEntry, Store, TraceEntry, collect_state, new_segment_id, new_session_id,
 };
 
 fn nil_session_start(ts: u64, session_id: uuid::Uuid) -> LogEntry {
@@ -239,41 +238,4 @@ fn lookup_session_of_finds_owning_session() {
         .unwrap();
 
     assert_eq!(store.lookup_session_of(segid).unwrap(), Some(sid));
-}
-
-#[test]
-fn pod_metadata_minimal_crud() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = FsStore::new(dir.path()).unwrap();
-    let pod_name = "worker-a";
-    let sid = new_session_id();
-    let segid = new_segment_id();
-
-    assert_eq!(store.read_by_name(pod_name).unwrap(), None);
-
-    let pending = PodMetadata::new(pod_name, Some(PodActiveSegmentRef::pending_segment(sid)));
-    store.write(&pending).unwrap();
-    assert_eq!(store.list_names().unwrap(), vec![pod_name.to_string()]);
-    assert_eq!(store.read_by_name(pod_name).unwrap(), Some(pending.clone()));
-    assert!(
-        dir.path()
-            .join("pods")
-            .join(pod_name)
-            .join("metadata.json")
-            .exists(),
-        "Pod metadata must live under <data_dir>/pods/<pod_name>/"
-    );
-
-    let resolved = PodMetadata::new(
-        pod_name,
-        Some(PodActiveSegmentRef::active_segment(sid, segid)),
-    );
-    store.write(&resolved).unwrap();
-    assert_eq!(store.read_by_name(pod_name).unwrap(), Some(resolved));
-
-    store.delete_by_name(pod_name).unwrap();
-    assert_eq!(store.read_by_name(pod_name).unwrap(), None);
-
-    // Delete is idempotent for missing metadata.
-    store.delete_by_name(pod_name).unwrap();
 }
