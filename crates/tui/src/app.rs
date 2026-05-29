@@ -51,14 +51,33 @@ impl CompletionState {
     pub const MAX_VISIBLE: usize = 6;
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct RewindPickerScroll {
+    pub top_offset: usize,
+    pub total_lines: usize,
+    pub area_height: u16,
+    pub tail_top_offset: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct RewindPickerState {
     pub head_entries: usize,
     pub targets: Vec<RewindTarget>,
     pub selected: usize,
+    pub scroll: RewindPickerScroll,
 }
 
 impl RewindPickerState {
+    pub fn new(head_entries: usize, targets: Vec<RewindTarget>) -> Self {
+        let selected = targets.iter().position(|t| t.eligible).unwrap_or(0);
+        Self {
+            head_entries,
+            targets,
+            selected,
+            scroll: RewindPickerScroll::default(),
+        }
+    }
+
     pub fn selected_target(&self) -> Option<&RewindTarget> {
         self.targets.get(self.selected)
     }
@@ -947,13 +966,7 @@ impl App {
             } => {
                 if self.rewind_request_pending {
                     self.rewind_request_pending = false;
-                    let selected = targets.iter().position(|t| t.eligible).unwrap_or(0);
-                    self.rewind_picker = Some(RewindPickerState {
-                        head_entries,
-                        targets,
-                        selected,
-                    });
-                    self.scroll = Scroll::default();
+                    self.rewind_picker = Some(RewindPickerState::new(head_entries, targets));
                 }
             }
             Event::RewindApplied {
@@ -964,14 +977,26 @@ impl App {
                 if let Some(greeting) = self.greeting.clone() {
                     self.restore_snapshot(&entries, greeting);
                 }
-                self.input.replace_with_segments(&input);
+                let restored_composer = if self.input.is_empty() {
+                    self.input.replace_with_segments(&input);
+                    true
+                } else {
+                    false
+                };
                 self.completion = None;
                 self.close_rewind_picker();
                 self.reset_run_state(self.pod_status);
-                let mut message = format!(
-                    "Rewound session: discarded {} log entries; restored selected input to composer.",
-                    summary.discarded_entries
-                );
+                let mut message = if restored_composer {
+                    format!(
+                        "Rewound session: discarded {} log entries; restored selected input to composer.",
+                        summary.discarded_entries
+                    )
+                } else {
+                    format!(
+                        "Rewound session: discarded {} log entries. Rewind applied; composer not overwritten because it was not empty.",
+                        summary.discarded_entries
+                    )
+                };
                 if summary.tool_side_effect_warning {
                     message.push_str(
                         " History suffix was discarded; tool side effects were not undone.",
@@ -1324,6 +1349,18 @@ impl App {
     }
 
     pub fn submit_rewind_picker(&mut self) -> Option<Method> {
+        if self.paused {
+            self.push_command_diagnostic(
+                "cannot apply rewind while the Pod is paused; resume or wait for idle first",
+            );
+            return None;
+        }
+        if !self.input.is_empty() {
+            self.push_command_diagnostic(
+                "cannot apply rewind while composer is not empty; clear it before restoring rewind input",
+            );
+            return None;
+        }
         let Some(picker) = self.rewind_picker.as_ref() else {
             return None;
         };

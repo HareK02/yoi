@@ -1101,7 +1101,7 @@ fn handle_pause_or_quit(app: &mut App) -> Option<Method> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use protocol::{Event, Segment};
+    use protocol::{Event, RewindTarget, RewindTargetId, Segment};
 
     #[test]
     fn parse_pod_name_mode() {
@@ -1648,6 +1648,93 @@ mod tests {
         assert_eq!(input_text(&app), "retry this");
         assert!(app.rewind_picker.is_none());
         assert!(has_alert(&app, "tool side effects"));
+    }
+
+    #[test]
+    fn rewind_applied_keeps_non_empty_composer() {
+        let mut app = App::new("agent".to_string());
+        app.handle_pod_event(Event::Snapshot {
+            greeting: test_greeting(),
+            entries: vec![],
+            status: PodStatus::Idle,
+        });
+        type_keys(&mut app, "draft");
+
+        app.handle_pod_event(Event::RewindApplied {
+            entries: vec![],
+            input: vec![Segment::Text {
+                content: "retry this".into(),
+            }],
+            summary: protocol::RewindSummary {
+                truncated_to_entries: 0,
+                discarded_entries: 2,
+                tool_side_effect_warning: false,
+            },
+        });
+
+        assert_eq!(input_text(&app), "draft");
+        assert!(has_alert(
+            &app,
+            "composer not overwritten because it was not empty"
+        ));
+    }
+
+    #[test]
+    fn rewind_apply_rejects_non_empty_composer_and_paused_status() {
+        let mut app = App::new("agent".to_string());
+        app.rewind_picker = Some(crate::app::RewindPickerState::new(1, vec![rewind_target()]));
+        type_keys(&mut app, "draft");
+        assert!(app.submit_rewind_picker().is_none());
+        assert!(has_alert(&app, "composer is not empty"));
+
+        let mut app = App::new("agent".to_string());
+        app.rewind_picker = Some(crate::app::RewindPickerState::new(1, vec![rewind_target()]));
+        app.set_pod_status(PodStatus::Paused);
+        assert!(app.submit_rewind_picker().is_none());
+        assert!(has_alert(
+            &app,
+            "cannot apply rewind while the Pod is paused"
+        ));
+    }
+
+    #[test]
+    fn rewind_picker_draw_does_not_overwrite_history_scroll_state() {
+        let mut app = App::new("agent".to_string());
+        app.scroll.top_offset = 3;
+        app.scroll.turn_starts = vec![0, 5, 9];
+        app.scroll.total_lines = 42;
+        app.rewind_picker = Some(crate::app::RewindPickerState::new(1, vec![rewind_target()]));
+        let original_top_offset = app.scroll.top_offset;
+        let original_turn_starts = app.scroll.turn_starts.clone();
+        let original_total_lines = app.scroll.total_lines;
+
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &mut app))
+            .unwrap();
+        app.close_rewind_picker();
+
+        assert_eq!(app.scroll.top_offset, original_top_offset);
+        assert_eq!(app.scroll.turn_starts, original_turn_starts);
+        assert_eq!(app.scroll.total_lines, original_total_lines);
+    }
+
+    fn rewind_target() -> RewindTarget {
+        RewindTarget {
+            id: RewindTargetId {
+                segment_id: uuid::Uuid::nil(),
+                user_input_entry_index: 0,
+            },
+            expected_head_entries: 1,
+            truncate_entries: 0,
+            turn_index: 1,
+            timestamp_ms: Some(1),
+            preview: "retry this".into(),
+            eligible: true,
+            disabled_reason: None,
+            warning: None,
+        }
     }
 
     fn test_greeting() -> protocol::Greeting {

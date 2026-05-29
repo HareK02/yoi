@@ -797,13 +797,20 @@ async fn controller_loop<C, St>(
                 target,
                 expected_head_entries,
             } => match shared_state.get_status() {
-                PodStatus::Idle | PodStatus::Paused => {
+                PodStatus::Idle => {
                     if apply_rewind(&mut pod, &event_tx, target, expected_head_entries) {
                         shared_state.set_status(PodStatus::Idle);
                         let _ = event_tx.send(Event::Status {
                             status: PodStatus::Idle,
                         });
                     }
+                }
+                PodStatus::Paused => {
+                    let _ = event_tx.send(Event::Error {
+                        code: ErrorCode::InvalidRequest,
+                        message: "Cannot apply rewind while the Pod is paused; resume or wait for idle first"
+                            .into(),
+                    });
                 }
                 PodStatus::Running => {
                     let _ = event_tx.send(Event::Error {

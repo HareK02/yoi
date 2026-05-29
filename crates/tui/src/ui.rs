@@ -419,8 +419,8 @@ fn draw_history(frame: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
-    if let Some(picker) = app.rewind_picker.clone() {
-        draw_rewind_picker(frame, app, history_area, inner, outer_block, &picker);
+    if let Some(picker) = app.rewind_picker.as_mut() {
+        draw_rewind_picker(frame, history_area, inner, outer_block, picker);
         return;
     }
 
@@ -454,11 +454,10 @@ fn draw_history(frame: &mut Frame, app: &mut App, area: Rect) {
 
 fn draw_rewind_picker(
     frame: &mut Frame,
-    app: &mut App,
     history_area: Rect,
     inner: Rect,
     outer_block: UiBlock<'_>,
-    picker: &crate::app::RewindPickerState,
+    picker: &mut crate::app::RewindPickerState,
 ) {
     let mut logical: Vec<Line<'static>> = Vec::new();
     logical.push(Line::from(vec![
@@ -534,14 +533,13 @@ fn draw_rewind_picker(
     }
 
     let tail_top = lines.len().saturating_sub(inner.height as usize);
-    app.scroll.area_height = inner.height;
-    app.scroll.total_lines = lines.len();
-    app.scroll.tail_top_offset = tail_top;
-    app.scroll.turn_starts.clear();
-    app.scroll.top_offset = app.scroll.top_offset.min(tail_top);
+    picker.scroll.area_height = inner.height;
+    picker.scroll.total_lines = lines.len();
+    picker.scroll.tail_top_offset = tail_top;
+    picker.scroll.top_offset = picker.scroll.top_offset.min(tail_top);
 
-    let end = (app.scroll.top_offset + inner.height as usize).min(lines.len());
-    let visible = lines[app.scroll.top_offset..end].to_vec();
+    let end = (picker.scroll.top_offset + inner.height as usize).min(lines.len());
+    let visible = lines[picker.scroll.top_offset..end].to_vec();
     Paragraph::new(visible)
         .block(outer_block)
         .render(history_area, frame.buffer_mut());
