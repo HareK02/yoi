@@ -104,7 +104,6 @@ pub async fn run(
 
     let mut form = Form {
         cwd: defaults.cwd.clone(),
-        cascade_has_scope: defaults.cascade_has_scope,
         scope_origin: defaults.scope_origin,
         name_cursor: defaults.default_name.chars().count(),
         name: defaults.default_name,
@@ -153,7 +152,6 @@ pub async fn run(
     if let Some(id) = form.resume_from {
         form.resume_scope = Some(load_resume_scope(id).await?);
     }
-    let overlay_toml = build_overlay_toml(&form);
 
     // Phase 2: launch pod and wait for ready line. Drop the cursor
     // out of the name field — subsequent frames are passive status
@@ -163,7 +161,7 @@ pub async fn run(
     form.message = Some(("starting pod...".to_string(), MessageKind::Progress));
     terminal.draw(|f| draw_form(f, &form))?;
 
-    match wait_for_ready(&mut terminal, &mut form, &overlay_toml).await {
+    match wait_for_ready(&mut terminal, &mut form).await {
         Ok(ready) => {
             form.message = Some((
                 format!("ready: {}  attaching...", ready.pod_name),
@@ -184,15 +182,14 @@ pub async fn run(
 
 /// Launch `insomnia-pod --pod <name>` without opening the name dialog. The child Pod
 /// resolves persisted Pod metadata if present, or creates a fresh same-name Pod
-/// with the usual TUI cwd-scope fallback.
+/// from the default profile.
 pub async fn run_pod_name(pod_name: String) -> Result<SpawnOutcome, SpawnError> {
     let defaults = load_spawn_defaults()?;
     let mut form = form_for_pod_name(pod_name, defaults);
-    let overlay_toml = build_overlay_toml(&form);
     let mut terminal = make_inline_terminal()?;
     terminal.draw(|f| draw_form(f, &form))?;
 
-    match wait_for_ready(&mut terminal, &mut form, &overlay_toml).await {
+    match wait_for_ready(&mut terminal, &mut form).await {
         Ok(ready) => {
             form.message = Some((
                 format!("ready: {}  attaching...", ready.pod_name),
@@ -213,7 +210,6 @@ pub async fn run_pod_name(pod_name: String) -> Result<SpawnOutcome, SpawnError> 
 
 struct SpawnDefaults {
     cwd: PathBuf,
-    cascade_has_scope: bool,
     scope_origin: ScopeOrigin,
     default_name: String,
     default_profile_index: usize,
@@ -241,7 +237,6 @@ fn load_spawn_defaults() -> Result<SpawnDefaults, SpawnError> {
 
     Ok(SpawnDefaults {
         cwd,
-        cascade_has_scope: true,
         scope_origin: ScopeOrigin::FromProfile,
         default_name,
         default_profile_index,
@@ -303,7 +298,6 @@ fn initial_profile_index(
 fn form_for_pod_name(pod_name: String, defaults: SpawnDefaults) -> Form {
     Form {
         cwd: defaults.cwd,
-        cascade_has_scope: defaults.cascade_has_scope,
         scope_origin: defaults.scope_origin,
         name_cursor: pod_name.chars().count(),
         name: pod_name,
@@ -385,15 +379,12 @@ fn sanitise_default_name(s: &str) -> String {
 async fn wait_for_ready(
     terminal: &mut InlineTerminal,
     form: &mut Form,
-    overlay_toml: &str,
 ) -> Result<SpawnReady, SpawnError> {
-    let cwd = std::env::current_dir().map_err(SpawnError::Io)?;
-
     let config = SpawnConfig {
         pod_name: form.name.clone(),
         profile: form.selected_profile_selector(),
-        overlay_toml: overlay_toml.to_string(),
-        cwd,
+        resume_scope: form.resume_scope.clone(),
+        cwd: form.cwd.clone(),
         resume_from: form.resume_from,
         resume_by_pod_name: form.resume_by_pod_name,
     };
@@ -406,36 +397,6 @@ async fn wait_for_ready(
         pod_name: ready.pod_name,
         socket_path: ready.socket_path,
     })
-}
-
-fn build_overlay_toml(form: &Form) -> String {
-    let mut root = toml::value::Table::new();
-
-    let mut pod = toml::value::Table::new();
-    pod.insert("name".into(), toml::Value::String(form.name.clone()));
-    root.insert("pod".into(), toml::Value::Table(pod));
-
-    if let Some(scope_config) = form.resume_scope.as_ref() {
-        root.insert(
-            "scope".into(),
-            toml::Value::try_from(scope_config).expect("scope serialisation cannot fail"),
-        );
-    } else if !form.cascade_has_scope {
-        let mut rule = toml::value::Table::new();
-        rule.insert(
-            "target".into(),
-            toml::Value::String(form.cwd.display().to_string()),
-        );
-        rule.insert("permission".into(), toml::Value::String("write".into()));
-        let mut scope = toml::value::Table::new();
-        scope.insert(
-            "allow".into(),
-            toml::Value::Array(vec![toml::Value::Table(rule)]),
-        );
-        root.insert("scope".into(), toml::Value::Table(scope));
-    }
-
-    toml::to_string(&toml::Value::Table(root)).expect("overlay serialisation cannot fail")
 }
 
 async fn load_resume_scope(segment_id: SegmentId) -> Result<ScopeConfig, SpawnError> {
@@ -466,14 +427,10 @@ enum MessageKind {
 
 enum ScopeOrigin {
     FromProfile,
-    CwdDefault,
 }
 
 struct Form {
     cwd: PathBuf,
-    /// True when the launch source already supplies `scope.allow`.
-    /// Drives whether the compatibility overlay should add a cwd-write rule.
-    cascade_has_scope: bool,
     /// Display label for the scope row in the dialog.
     scope_origin: ScopeOrigin,
     name: String,
@@ -497,8 +454,8 @@ struct Form {
     /// resolves name-keyed state before falling back to fresh creation.
     resume_by_pod_name: bool,
     /// Scope snapshot recovered from the source session log. Set only for
-    /// resume runs, and serialized into the overlay instead of cwd-default
-    /// scope so resume does not silently broaden access.
+    /// resume runs and passed through a typed internal restore flag so resume
+    /// does not silently broaden access.
     resume_scope: Option<ScopeConfig>,
     /// Optional Nix profile choices passed to `insomnia-pod --profile` for
     /// fresh spawns. This is not used for resume/attach flows because those must
@@ -659,20 +616,22 @@ fn context_line(form: &Form) -> Line<'_> {
         ]);
     }
 
+    if form.resume_scope.is_some() {
+        return Line::from(vec![
+            Span::raw("  "),
+            Span::styled("scope: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                "from restored session snapshot",
+                Style::default().fg(Color::Green),
+            ),
+        ]);
+    }
+
     match form.scope_origin {
         ScopeOrigin::FromProfile => Line::from(vec![
             Span::raw("  "),
             Span::styled("scope: ", Style::default().fg(Color::DarkGray)),
-            Span::styled("from default profile", Style::default().fg(Color::Green)),
-        ]),
-        ScopeOrigin::CwdDefault => Line::from(vec![
-            Span::raw("  "),
-            Span::styled("scope: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                form.cwd.display().to_string(),
-                Style::default().fg(Color::Yellow),
-            ),
-            Span::styled(" (write, default)", Style::default().fg(Color::DarkGray)),
+            Span::styled("from selected profile", Style::default().fg(Color::Green)),
         ]),
     }
 }
@@ -701,15 +660,10 @@ fn message_line(form: &Form) -> Line<'_> {
 mod tests {
     use super::*;
 
-    fn form(name: &str, cascade_has_scope: bool) -> Form {
+    fn form(name: &str) -> Form {
         Form {
             cwd: PathBuf::from("/work/example"),
-            cascade_has_scope,
-            scope_origin: if cascade_has_scope {
-                ScopeOrigin::FromProfile
-            } else {
-                ScopeOrigin::CwdDefault
-            },
+            scope_origin: ScopeOrigin::FromProfile,
             name: name.to_string(),
             name_cursor: name.chars().count(),
             message: None,
@@ -726,7 +680,6 @@ mod tests {
     fn pod_name_form_restores_or_creates_by_pod_name() {
         let defaults = SpawnDefaults {
             cwd: PathBuf::from("/work/example"),
-            cascade_has_scope: true,
             scope_origin: ScopeOrigin::FromProfile,
             default_name: "ignored".to_string(),
             default_profile_index: 0,
@@ -747,29 +700,8 @@ mod tests {
     }
 
     #[test]
-    fn overlay_adds_scope_default_when_cascade_lacks_scope() {
-        let f = form("agent-1", false);
-        let toml_str = build_overlay_toml(&f);
-        let parsed: toml::Value = toml::from_str(&toml_str).unwrap();
-        assert_eq!(parsed["pod"]["name"].as_str(), Some("agent-1"));
-        let allow = parsed["scope"]["allow"].as_array().unwrap();
-        assert_eq!(allow.len(), 1);
-        assert_eq!(allow[0]["target"].as_str(), Some("/work/example"));
-        assert_eq!(allow[0]["permission"].as_str(), Some("write"));
-    }
-
-    #[test]
-    fn overlay_omits_scope_when_cascade_already_has_one() {
-        let f = form("agent-2", true);
-        let toml_str = build_overlay_toml(&f);
-        let parsed: toml::Value = toml::from_str(&toml_str).unwrap();
-        assert_eq!(parsed["pod"]["name"].as_str(), Some("agent-2"));
-        assert!(parsed.get("scope").is_none());
-    }
-
-    #[test]
-    fn overlay_uses_resume_scope_snapshot() {
-        let mut f = form("agent-r", false);
+    fn resume_scope_snapshot_stays_on_form_for_typed_restore_flag() {
+        let mut f = form("agent-r");
         f.resume_from = Some(session_store::new_segment_id());
         f.resume_scope = Some(ScopeConfig {
             allow: vec![manifest::ScopeRule {
@@ -783,12 +715,10 @@ mod tests {
                 recursive: true,
             }],
         });
-        let toml_str = build_overlay_toml(&f);
-        let parsed: toml::Value = toml::from_str(&toml_str).unwrap();
-        assert_eq!(parsed["pod"]["name"].as_str(), Some("agent-r"));
-        assert_eq!(parsed["scope"]["allow"].as_array().unwrap().len(), 1);
-        let deny = parsed["scope"]["deny"].as_array().unwrap();
-        assert_eq!(deny[0]["target"].as_str(), Some("/work/example/child"));
+
+        let scope = f.resume_scope.as_ref().unwrap();
+        assert_eq!(scope.allow[0].target, PathBuf::from("/work/example"));
+        assert_eq!(scope.deny[0].target, PathBuf::from("/work/example/child"));
     }
 
     #[test]
@@ -841,8 +771,8 @@ description = "Project coder"
     }
 
     #[test]
-    fn profile_cycle_selects_profiles_without_manifest_cascade_opt_out() {
-        let mut form = form("coder", true);
+    fn profile_cycle_selects_only_discovered_profiles() {
+        let mut form = form("coder");
         form.profile_choices = vec![
             ProfileChoice {
                 selector: Some("project:coder".to_string()),
@@ -889,7 +819,7 @@ description = "Project coder"
 
     #[test]
     fn name_input_handles_insert_backspace_and_cursor() {
-        let mut f = form("", false);
+        let mut f = form("");
         for c in "abc".chars() {
             f.insert_char(c);
         }

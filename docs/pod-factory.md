@@ -347,7 +347,6 @@ insomnia-pod [--profile <selector>] [--profile-pod-name <name>] [-s/--store <pat
 |---|---|
 | `--profile <selector>` | builtin/user/project profile registry から Nix profile を選択。省略時は registry default（通常は `builtin:default`） |
 | `--profile-pod-name <name>` | profile 由来 manifest の `pod.name` を fresh spawn 用に上書き |
-| `--overlay <toml>` | TUI/launcher compatibility 用の inline override。user/project manifest discovery は行わない |
 | `-s, --store <path>` | セッション永続化ディレクトリ（デフォルト: `<data_dir>/sessions/`、`manifest::paths` で解決） |
 | `--session <uuid>` | 既存 session id から Pod を復元し、同じ jsonl に後続 turn を追記する |
 
@@ -357,7 +356,7 @@ insomnia-pod [--profile <selector>] [--profile-pod-name <name>] [-s/--store <pat
 insomnia-pod --manifest <path> [-s/--store <path>] [--session <uuid>]
 ```
 
-`--manifest` は指定 TOML 1 枚だけを読み、builtin defaults を merge したうえで `PodManifestConfig -> PodManifest` の required validation を通す。user / project manifest layer は読まない。`--profile`、`--project`、`--overlay` とは併用不可。
+`--manifest` は指定 TOML 1 枚だけを読み、builtin defaults を merge したうえで `PodManifestConfig -> PodManifest` の required validation を通す。user / project manifest layer は読まない。`--profile`、`--project` とは併用不可。
 
 spawn 子 Pod 用の内部フラグとして `--adopt` と `--callback <path>` がある。これらは `SpawnPod` が scope allocation と親 callback socket を引き継がせるために使うもので、通常の手動起動では使わない。
 

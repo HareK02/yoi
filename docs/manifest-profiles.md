@@ -87,6 +87,8 @@ A profile should evaluate to one of:
 
 The resolved artifact is deserialized into the same `PodManifestConfig -> PodManifest` boundary used by direct one-file manifests, so builtin defaults and required-field validation stay shared. Explicit profile paths and user/project registry profile artifacts resolve relative manifest paths against the profile file's directory. Builtin profile artifacts resolve manifest-relative paths against the launch workspace/current directory so the bundled default can grant `scope.allow target = "."` for the workspace rather than for `resources/nix/profiles`.
 
+Profile and one-file manifest CLI paths currently use builtin prompt assets only. `$insomnia/...` instruction refs work; `$user/...` and `$workspace/...` prompt refs need a future explicit prompt-loader source design instead of reviving ambient manifest discovery.
+
 Secret values must stay as typed references. `resources/nix/profile-lib.nix` emits secret references as JSON like:
 
 ```json

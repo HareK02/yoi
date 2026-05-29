@@ -89,16 +89,13 @@ permission = "write"
 
 `[model]` は `ref = "<provider>/<model_id>"` でプロバイダ / モデルカタログを引く短縮形と、`scheme` / `model_id` / `auth` を直書きする inline 形式の両方を受ける。カタログは `resources/{providers,models}/builtin.toml` を builtin、`<config_dir>/{providers,models}.toml` を user override として解決する（`<config_dir>` の解決ルールは `manifest::paths` 参照）。詳細は `docs/pod-factory.md` と `crates/provider/README.md`。
 
-### PodFactory: カスケード設定
+### Manifest / profile 入力
 
-マニフェストを手書きせず、4 層のカスケードで `PodManifest` を組み立てる:
+通常の Pod 起動は Nix profile discovery/default から `PodManifest` を生成する。bundled `builtin:default` が fallback default で、user/project `profiles.toml` は profile registry と default selection だけを担う。user/project `manifest.toml` の ambient cascade は通常起動では使わない。
 
-1. **ビルトインデフォルト** — `manifest::defaults` の定数値
-2. **ユーザー manifest** — `<config_dir>/manifest.toml`（`manifest::paths` で解決）
-3. **プロジェクト manifest** — `.insomnia/manifest.toml`（cwd から上方向に探索）
-4. **プログラマティック overlay** — CLI / GUI / spawn 時のインライン指定
+`insomnia-pod --manifest <PATH>` は explicit one-file compatibility/debug input で、指定 TOML 1 枚だけに builtin defaults を merge し、`PodManifestConfig -> PodManifest` の required validation を通す。
 
-マージ規則: スカラーは上層が置換、Map はキー単位マージ、`scope.allow` / `scope.deny` は union。全パスは絶対パスのみ。
+`PodFactory` の user/project/overlay API は低レベル構成部品として残るが、CLI の通常起動 path では generic TOML overlay を公開しない。
 
 ### Instruction とプロンプト資産
 

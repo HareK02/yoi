@@ -192,8 +192,8 @@ host_a (spawner)                         host_b (remote)
   Pod A                                   (pod binary + ssh のみ)
     │
     ├── ssh: session データを転送 ────────→ ファイル書き込み
-    ├── ssh: overlay TOML を転送 ─────────→ ファイル書き込み
-    ├── ssh: `insomnia-pod --overlay ... &` ───────→ Pod プロセス起動、socket 作成
+    ├── ssh: profile / one-file manifest 入力を転送 ─→ 必要ならファイル書き込み
+    ├── ssh: `insomnia-pod --profile ... &` ───────→ Pod プロセス起動、socket 作成
     ├── ssh -L: socket を tunnel ─────────→ Pod B の unix socket
     │
     └── localhost:tunnel に接続 ──────────→ Method::Run / Event stream
@@ -203,14 +203,14 @@ host_a (spawner)                         host_b (remote)
 ### コマンドイメージ
 
 ```bash
-# 1. session + overlay を転送
+# 1. session + profile/manifest input を転送
 ssh insomnia@host-b "mkdir -p ~/workspaces/task-123/store"
 tar cz session/ | ssh insomnia@host-b "tar xz -C ~/workspaces/task-123/store"
-echo "$OVERLAY" | ssh insomnia@host-b "cat > ~/workspaces/task-123/overlay.toml"
+scp profile.nix insomnia@host-b:~/workspaces/task-123/profile.nix
 
 # 2. Pod を起動（detach）
 ssh insomnia@host-b "insomnia-pod --store ~/workspaces/task-123/store \
-    --overlay ~/workspaces/task-123/overlay.toml &"
+    --profile ~/workspaces/task-123/profile.nix &"
 
 # 3. socket を tunnel で引っ張る
 ssh -L /tmp/pod-b.sock:/run/insomnia/task-123/pod.sock insomnia@host-b

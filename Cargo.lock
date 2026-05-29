@@ -334,6 +334,7 @@ version = "0.1.0"
 dependencies = [
  "manifest",
  "protocol",
+ "serde_json",
  "tokio",
  "uuid",
 ]
