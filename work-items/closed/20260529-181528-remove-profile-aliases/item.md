@@ -2,12 +2,12 @@
 id: 20260529-181528-remove-profile-aliases
 slug: remove-profile-aliases
 title: Remove profile aliases from profile registry
-status: open
+status: closed
 kind: bug
 priority: P1
 labels: [profiles, config, simplification]
 created_at: 2026-05-29T18:15:28Z
-updated_at: 2026-05-29T18:15:28Z
+updated_at: 2026-05-29T18:20:44Z
 assignee: null
 legacy_ticket: null
 ---
