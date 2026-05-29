@@ -7,7 +7,7 @@ kind: task
 priority: P2
 labels: [session-store, pod-store, pod, persistence, architecture]
 created_at: 2026-05-29T20:58:44Z
-updated_at: 2026-05-29T22:00:16Z
+updated_at: 2026-05-29T22:18:00Z
 assignee: null
 legacy_ticket: null
 ---
@@ -29,7 +29,8 @@ This happened because earlier implementation work treated `session-store` as a c
 - Move Pod metadata storage from `{sessions_root}/pods/{pod_name}/metadata.json` to a top-level Pod-state root such as `{data_dir}/pods/{pod_name}/metadata.json`.
 - Do not provide backward compatibility or migration for the obsolete `{sessions_root}/pods` layout. Existing old-layout Pod metadata may be ignored/lost by this change.
 - Redesign the Pod metadata API where needed instead of preserving awkward `session-store`-shaped APIs.
-- Keep session logs as the authority for conversation/history replay and segment-bound runtime state.
+- Keep session logs as the authority for conversation/history replay and for Pod lifecycle notifications actually shown to the model.
+- Remove `pod.scope` / effective-scope snapshots from the session-log authority. Parent effective scope during restore should be derived from `pod-store` delegation state, not from a duplicate session extension.
 - Keep runtime mirrors such as sockets, lock-file allocations, and `spawned_pods.json` as live runtime views, not durable authority.
 
 Pod metadata may point at a `(SessionId, SegmentId)`, but the session log store must not own Pod metadata types or the Pod metadata filesystem layout. If sharing ID types directly causes an undesirable dependency, introduce a small shared ID module/crate or otherwise keep the dependency narrow; do not let `pod-store` pull in session replay concerns just to name a session pointer.
@@ -55,7 +56,7 @@ The resulting design should make these responsibilities explicit:
   - conversation history and system prompt replay;
   - segment lineage (`forked_from`, `compacted_from`);
   - request config / usage / metrics / memory extension records;
-  - Pod runtime scope snapshots required to restore the same session without silently reclaiming delegated writes;
+  - Pod lifecycle notifications and restore/reclaim notices only when they are appended to history as information shown to the model;
   - filesystem layout under the session log root, e.g. `{data_dir}/sessions/{session_id}/{segment_id}.jsonl` and associated trace logs.
 - Pod metadata authority, owned by `pod-store`:
   - Pod-name validation and safe filesystem key rules;
@@ -63,7 +64,8 @@ The resulting design should make these responsibilities explicit:
   - pending/new Pod state if needed before a session segment is materialized;
   - resolved manifest snapshot needed for Pod-name restore when the source profile/manifest should not be re-evaluated;
   - spawned-child registry state, because it is current parent-Pod state rather than conversation history;
-  - delegated child scope records needed for prune/reclaim bookkeeping;
+  - delegated child scope records and delegation/reclaim history needed to derive parent effective scope during restore;
+  - restore reconciliation state sufficient to detect children that are missing, stopped, or unreachable and to reclaim their delegated scope before continuing;
   - filesystem layout under a Pod-state root, e.g. `{data_dir}/pods/{pod_name}/metadata.json`, not below the session log root.
 - Runtime mirrors:
   - sockets, lock-file allocations, and `spawned_pods.json` are live runtime views, not durable authority;
@@ -82,10 +84,11 @@ The resulting design should make these responsibilities explicit:
 - Document the new boundary in code comments and/or crate/module docs, including why Pod metadata points to session IDs rather than being contained by the session store.
 - Clarify the authority of `resolved_manifest_snapshot`: it belongs to Pod-name restore state in `pod-store`; session JSONL `SegmentStart` config/system prompt remain the authority for replaying an existing segment.
 - Clarify the authority of `spawned_children`: it belongs to Pod-state/durable child-registry state in `pod-store`; child lifecycle messages shown to the model remain session JSONL history.
-- Clarify delegated scope handling: child delegated-scope records live in `pod-store` for child registry/reclaim, while effective parent scope snapshots remain in session JSONL for restore safety.
+- Clarify delegated scope handling: delegated-scope records and delegation/reclaim history live in `pod-store`; parent effective scope during restore is derived from outstanding `pod-store` delegations. Remove the duplicate `pod.scope` session-log extension/typed restore state unless a narrower non-duplicating replacement is proven necessary.
+- Add restore reconciliation behavior: when `pod-store` records a delegated child that is missing, stopped, or unreachable at restore time, reclaim the delegated scope in `pod-store`/runtime state and append a system notification to the session history before any model request observes the resumed state.
 - Preserve intended durable behavior for newly written state:
   - Pod-name restore resolves active metadata from `pod-store` then restores the session log from `session-store`;
-  - session restore uses session log state and scope snapshots;
+  - session restore uses session log conversation/history plus `pod-store` delegation state for Pod-scope reconciliation;
   - runtime `spawned_pods.json` remains a mirror;
   - stopped or unreachable child Pod metadata is not deleted merely because its socket is gone.
 - Add focused tests for the split, including active pointer updates preserving spawned children / manifest snapshot, spawned-child updates preserving active pointer / manifest snapshot, and discovery/restore behavior when one durable surface exists without the other.
