@@ -2,7 +2,8 @@
 //!
 //! Rendered at the user's current cursor position when `insomnia` is invoked
 //! with no positional argument. Walks the cwd for a `.insomnia/manifest.toml`
-//! to seed defaults, prompts for the Pod's name, and on confirmation
+//! to seed manifest defaults and `.insomnia/profiles.toml` to discover profile
+//! choices, prompts for the Pod's name, and on confirmation
 //! launches the `insomnia-pod` binary as an independent process with a freshly built
 //! overlay (name + cwd scope when no project manifest exists). Once
 //! the process reports its socket via the `INSOMNIA-READY` stderr line,
@@ -906,13 +907,12 @@ permission = "write"
         let insomnia = project.join(".insomnia");
         std::fs::create_dir_all(&insomnia).unwrap();
         std::fs::write(
-            insomnia.join("manifest.toml"),
+            insomnia.join("profiles.toml"),
             r#"
-[profiles]
 default = "work"
-[profiles.profile]
+[profile]
 coder = "profiles/coder.nix"
-[profiles.alias]
+[alias]
 work = "coder"
 "#,
         )
@@ -933,11 +933,10 @@ work = "coder"
         let insomnia = project.join(".insomnia");
         std::fs::create_dir_all(&insomnia).unwrap();
         std::fs::write(
-            insomnia.join("manifest.toml"),
+            insomnia.join("profiles.toml"),
             r#"
-[profiles]
 default = "coder"
-[profiles.profile.coder]
+[profile.coder]
 path = "profiles/coder.nix"
 description = "Project coder"
 "#,

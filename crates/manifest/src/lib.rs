@@ -16,6 +16,7 @@ pub use model::{
 };
 pub use paths::{
     user_manifest_path, user_manifest_path_from_env, user_manifest_path_with_env_override,
+    user_profiles_path,
 };
 pub use profile::{
     NixProfileResolver, ProfileDiscovery, ProfileError, ProfileManifestSnapshot, ProfileMetadata,

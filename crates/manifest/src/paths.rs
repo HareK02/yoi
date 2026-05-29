@@ -112,6 +112,14 @@ pub fn user_manifest_path_with_env_override() -> Option<PathBuf> {
     user_manifest_path_from_env(std::env::var_os(USER_MANIFEST_ENV)).or_else(user_manifest_path)
 }
 
+/// `<config_dir>/profiles.toml` — user profile registry/default/alias configuration.
+///
+/// This is application/profile selection configuration, not a Pod manifest
+/// layer. It deliberately ignores [`USER_MANIFEST_ENV`].
+pub fn user_profiles_path() -> Option<PathBuf> {
+    Some(config_dir()?.join("profiles.toml"))
+}
+
 /// `<config_dir>/prompts/` — user prompts ライブラリ。
 pub fn user_prompts_dir() -> Option<PathBuf> {
     Some(config_dir()?.join("prompts"))
@@ -384,6 +392,10 @@ mod tests {
         assert_eq!(
             user_manifest_path().unwrap(),
             PathBuf::from("/sand/config/manifest.toml")
+        );
+        assert_eq!(
+            user_profiles_path().unwrap(),
+            PathBuf::from("/sand/config/profiles.toml")
         );
         assert_eq!(
             user_prompts_dir().unwrap(),

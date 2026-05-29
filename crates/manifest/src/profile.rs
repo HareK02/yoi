@@ -152,9 +152,10 @@ impl ProfileRegistryEntry {
     }
 }
 
-/// Discovered profile registry. User/project manifests contribute only profile
-/// discovery metadata (entries, aliases, defaults); those files are not merged
-/// into the selected profile's runtime manifest.
+/// Discovered profile registry. User/project `profiles.toml` files contribute
+/// only profile discovery metadata (entries, aliases, defaults); those files are
+/// application/project UX configuration, not Pod runtime manifests and are not
+/// merged into the selected profile's runtime manifest.
 #[derive(Debug, Clone, Default)]
 pub struct ProfileRegistry {
     entries: Vec<ProfileRegistryEntry>,
@@ -277,28 +278,28 @@ struct ProfileDefault {
 #[derive(Debug, Clone)]
 pub struct ProfileDiscovery {
     builtin_dir: Option<PathBuf>,
-    user_manifest: Option<PathBuf>,
-    project_manifest: Option<PathBuf>,
+    user_config: Option<PathBuf>,
+    project_config: Option<PathBuf>,
 }
 
 impl ProfileDiscovery {
     pub fn for_cwd(cwd: &Path) -> Self {
         Self {
             builtin_dir: paths::builtin_profiles_dir(),
-            user_manifest: paths::user_manifest_path_with_env_override(),
-            project_manifest: crate::find_project_manifest_from(cwd),
+            user_config: paths::user_profiles_path(),
+            project_config: find_project_profiles_from(cwd),
         }
     }
 
     pub fn with_sources(
         builtin_dir: Option<PathBuf>,
-        user_manifest: Option<PathBuf>,
-        project_manifest: Option<PathBuf>,
+        user_config: Option<PathBuf>,
+        project_config: Option<PathBuf>,
     ) -> Self {
         Self {
             builtin_dir,
-            user_manifest,
-            project_manifest,
+            user_config,
+            project_config,
         }
     }
 
@@ -307,11 +308,11 @@ impl ProfileDiscovery {
         if let Some(dir) = &self.builtin_dir {
             discover_profile_dir(&mut registry, ProfileRegistrySource::Builtin, dir)?;
         }
-        if let Some(path) = &self.user_manifest {
-            load_profile_config_manifest(&mut registry, ProfileRegistrySource::User, path)?;
+        if let Some(path) = &self.user_config {
+            load_profile_registry_file(&mut registry, ProfileRegistrySource::User, path)?;
         }
-        if let Some(path) = &self.project_manifest {
-            load_profile_config_manifest(&mut registry, ProfileRegistrySource::Project, path)?;
+        if let Some(path) = &self.project_config {
+            load_profile_registry_file(&mut registry, ProfileRegistrySource::Project, path)?;
         }
         registry.mark_default_flags();
         Ok(registry)
@@ -514,13 +515,7 @@ impl ProfileEnvelope {
 }
 
 #[derive(Debug, Default, Deserialize)]
-struct ProfileConfigDocument {
-    #[serde(default)]
-    profiles: Option<ProfilesConfig>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct ProfilesConfig {
+struct ProfileRegistryDocument {
     #[serde(default)]
     default: Option<String>,
     #[serde(default, alias = "entries")]
@@ -549,7 +544,7 @@ impl ProfileEntryConfig {
     }
 }
 
-fn load_profile_config_manifest(
+fn load_profile_registry_file(
     registry: &mut ProfileRegistry,
     source: ProfileRegistrySource,
     path: &Path,
@@ -561,14 +556,11 @@ fn load_profile_config_manifest(
         path: path.to_path_buf(),
         source,
     })?;
-    let document: ProfileConfigDocument =
+    let config: ProfileRegistryDocument =
         toml::from_str(&content).map_err(|source| ProfileError::ConfigParse {
             path: path.to_path_buf(),
             source,
         })?;
-    let Some(config) = document.profiles else {
-        return Ok(());
-    };
     let base = path.parent().unwrap_or_else(|| Path::new("."));
 
     for (name, entry_config) in config.profile {
@@ -601,6 +593,25 @@ fn load_profile_config_manifest(
     }
 
     Ok(())
+}
+
+/// Walk up from `start` looking for `.insomnia/profiles.toml`. Returns the
+/// closest match, or `None` if none is found before reaching the filesystem
+/// root.
+fn find_project_profiles_from(start: &Path) -> Option<PathBuf> {
+    let start = start
+        .canonicalize()
+        .ok()
+        .unwrap_or_else(|| start.to_path_buf());
+    let mut cur: Option<&Path> = Some(start.as_path());
+    while let Some(dir) = cur {
+        let candidate = dir.join(".insomnia").join("profiles.toml");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        cur = dir.parent();
+    }
+    None
 }
 
 fn discover_profile_dir(
@@ -778,7 +789,63 @@ pub enum ProfileError {
 mod tests {
     use super::*;
     use crate::{AuthRef, Permission, SchemeKind};
+    use std::sync::{Mutex, MutexGuard, OnceLock};
     use tempfile::TempDir;
+
+    fn env_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    struct EnvGuard {
+        vars: Vec<(&'static str, Option<String>)>,
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl EnvGuard {
+        fn new(overrides: &[(&'static str, Option<&str>)]) -> Self {
+            let lock = env_lock();
+            let names = [
+                "INSOMNIA_CONFIG_DIR",
+                "INSOMNIA_USER_MANIFEST",
+                "INSOMNIA_HOME",
+                "XDG_CONFIG_HOME",
+                "HOME",
+            ];
+            let saved: Vec<_> = names.iter().map(|n| (*n, std::env::var(n).ok())).collect();
+            // SAFETY: env_lock() protects environment mutation within this test binary.
+            unsafe {
+                for (n, _) in &saved {
+                    std::env::remove_var(n);
+                }
+                for (n, v) in overrides {
+                    if let Some(v) = v {
+                        std::env::set_var(n, v);
+                    }
+                }
+            }
+            Self {
+                vars: saved,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: env_lock() is still held while restoring the environment.
+            unsafe {
+                for (n, v) in &self.vars {
+                    match v {
+                        Some(v) => std::env::set_var(n, v),
+                        None => std::env::remove_var(n),
+                    }
+                }
+            }
+        }
+    }
 
     fn artifact() -> serde_json::Value {
         serde_json::json!({
@@ -926,28 +993,104 @@ mod tests {
     }
 
     #[test]
-    fn discovery_reads_user_and_project_registry_and_project_default_wins() {
+    fn for_cwd_reads_profiles_toml_and_ignores_manifest_profiles() {
         let tmp = TempDir::new().unwrap();
-        let user_manifest = tmp.path().join("user.toml");
-        let project_dir = tmp.path().join("project/.insomnia");
-        std::fs::create_dir_all(&project_dir).unwrap();
-        let project_manifest = project_dir.join("manifest.toml");
+        let config_dir = tmp.path().join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let _env = EnvGuard::new(&[("INSOMNIA_CONFIG_DIR", Some(config_dir.to_str().unwrap()))]);
+
+        let project = tmp.path().join("project").join("nested");
+        let insomnia = tmp.path().join("project").join(".insomnia");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&insomnia).unwrap();
         std::fs::write(
-            &user_manifest,
+            insomnia.join("manifest.toml"),
             r#"
 [profiles]
-default = "coder"
+default = "wrong"
 [profiles.profile]
+wrong = "wrong.nix"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            insomnia.join("profiles.toml"),
+            r#"
+default = "coder"
+[profile]
+coder = "profiles/coder.nix"
+"#,
+        )
+        .unwrap();
+
+        let registry = ProfileDiscovery::for_cwd(&project).discover().unwrap();
+        assert!(registry.select_named(None, "wrong").is_err());
+        let selected = registry.default_entry().unwrap();
+        assert_eq!(selected.source, ProfileRegistrySource::Project);
+        assert_eq!(selected.name, "coder");
+    }
+
+    #[test]
+    fn user_manifest_env_does_not_affect_profile_registry_discovery() {
+        let tmp = TempDir::new().unwrap();
+        let config_dir = tmp.path().join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let env_manifest = tmp.path().join("env-manifest.toml");
+        std::fs::write(
+            &env_manifest,
+            r#"
+[profiles]
+default = "wrong"
+[profiles.profile]
+wrong = "wrong.nix"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            config_dir.join("profiles.toml"),
+            r#"
+default = "coder"
+[profile]
+coder = "profiles/coder.nix"
+"#,
+        )
+        .unwrap();
+        let _env = EnvGuard::new(&[
+            ("INSOMNIA_CONFIG_DIR", Some(config_dir.to_str().unwrap())),
+            (
+                "INSOMNIA_USER_MANIFEST",
+                Some(env_manifest.to_str().unwrap()),
+            ),
+        ]);
+
+        let registry = ProfileDiscovery::for_cwd(tmp.path()).discover().unwrap();
+        assert!(registry.select_named(None, "wrong").is_err());
+        let selected = registry.default_entry().unwrap();
+        assert_eq!(selected.source, ProfileRegistrySource::User);
+        assert_eq!(selected.name, "coder");
+    }
+
+    #[test]
+    fn discovery_reads_user_and_project_registry_and_project_default_wins() {
+        let tmp = TempDir::new().unwrap();
+        let user_config = tmp.path().join("profiles.toml");
+        let project_dir = tmp.path().join("project/.insomnia");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let project_config = project_dir.join("profiles.toml");
+        std::fs::write(
+            &user_config,
+            r#"
+default = "coder"
+[profile]
 coder = "profiles/user-coder.nix"
 "#,
         )
         .unwrap();
         std::fs::write(
-            &project_manifest,
+            &project_config,
             r#"
-[profiles]
 default = "project:coder"
-[profiles.profile.coder]
+[profile.coder]
 path = "profiles/project-coder.nix"
 description = "Project coder"
 "#,
@@ -955,7 +1098,7 @@ description = "Project coder"
         .unwrap();
 
         let registry =
-            ProfileDiscovery::with_sources(None, Some(user_manifest), Some(project_manifest))
+            ProfileDiscovery::with_sources(None, Some(user_config), Some(project_config))
                 .discover()
                 .unwrap();
 
@@ -968,31 +1111,31 @@ description = "Project coder"
     #[test]
     fn config_alias_unqualified_target_resolves_within_declaring_source() {
         let tmp = TempDir::new().unwrap();
-        let user_manifest = tmp.path().join("user.toml");
+        let user_config = tmp.path().join("profiles.toml");
         let project_dir = tmp.path().join("project/.insomnia");
         std::fs::create_dir_all(&project_dir).unwrap();
-        let project_manifest = project_dir.join("manifest.toml");
+        let project_config = project_dir.join("profiles.toml");
         std::fs::write(
-            &user_manifest,
+            &user_config,
             r#"
-[profiles.profile]
+[profile]
 coder = "profiles/user-coder.nix"
 "#,
         )
         .unwrap();
         std::fs::write(
-            &project_manifest,
+            &project_config,
             r#"
-[profiles.profile]
+[profile]
 coder = "profiles/project-coder.nix"
-[profiles.alias]
+[alias]
 default-coder = "coder"
 "#,
         )
         .unwrap();
 
         let registry =
-            ProfileDiscovery::with_sources(None, Some(user_manifest), Some(project_manifest))
+            ProfileDiscovery::with_sources(None, Some(user_config), Some(project_config))
                 .discover()
                 .unwrap();
         let selected = registry
@@ -1012,21 +1155,20 @@ default-coder = "coder"
         let tmp = TempDir::new().unwrap();
         let project_dir = tmp.path().join("project/.insomnia");
         std::fs::create_dir_all(&project_dir).unwrap();
-        let project_manifest = project_dir.join("manifest.toml");
+        let project_config = project_dir.join("profiles.toml");
         std::fs::write(
-            &project_manifest,
+            &project_config,
             r#"
-[profiles]
 default = "work"
-[profiles.profile]
+[profile]
 coder = "profiles/coder.nix"
-[profiles.alias]
+[alias]
 work = "coder"
 "#,
         )
         .unwrap();
 
-        let registry = ProfileDiscovery::with_sources(None, None, Some(project_manifest))
+        let registry = ProfileDiscovery::with_sources(None, None, Some(project_config))
             .discover()
             .unwrap();
         let default = registry.default_entry().unwrap();

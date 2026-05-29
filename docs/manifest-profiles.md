@@ -41,31 +41,30 @@ insomnia --profile ./coder.nix
 
 ## Profile discovery
 
-Profile discovery is separate from runtime manifest merging. User/project TOML files may declare profile registry metadata under `[profiles]`, but those files are not merged into the Nix profile artifact.
+Profile discovery is separate from runtime manifest merging. User/project `profiles.toml` files may declare profile registry metadata, but those files are application/project UX configuration and are not merged into the Nix profile artifact.
 
-Example project config at `.insomnia/manifest.toml`:
+Example project config at `.insomnia/profiles.toml`:
 
 ```toml
-[profiles]
 default = "coder"
 
-[profiles.profile]
+[profile]
 coder = "profiles/coder.nix"
 reviewer = "profiles/reviewer.nix"
 
-[profiles.alias]
+[alias]
 work = "project:coder"
 ```
 
 Table entries can carry descriptions:
 
 ```toml
-[profiles.profile.coder]
+[profile.coder]
 path = "profiles/coder.nix"
 description = "Project coding assistant"
 ```
 
-Relative registry paths are resolved against the TOML file that declares them. Discovery checks builtin profiles, then the user manifest, then the nearest project manifest. Later defaults override earlier defaults, so a project default wins over a user default. Unqualified alias/default targets resolve within the declaring source by default. Unqualified ambiguous names fail closed:
+Relative registry paths are resolved against the `profiles.toml` file that declares them. Discovery checks bundled builtin profiles, then the user registry at `<config_dir>/profiles.toml`, then the nearest project registry at `.insomnia/profiles.toml`. Later defaults override earlier defaults, so a project default wins over a user default. Unqualified alias/default targets resolve within the declaring source by default. Unqualified ambiguous names fail closed:
 
 ```sh
 insomnia --profile coder          # fails if both user:coder and project:coder exist
