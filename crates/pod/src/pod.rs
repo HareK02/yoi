@@ -29,7 +29,7 @@ use crate::hook::{
     PreRequestInfo, PreToolCall,
 };
 use crate::ipc::alerter::Alerter;
-use crate::ipc::interceptor::PodInterceptor;
+use crate::ipc::interceptor::{PodInterceptor, TaskReminderState};
 use crate::ipc::notify_buffer::NotifyBuffer;
 use crate::prompt::agents_md::read_agents_md;
 use crate::prompt::catalog::{CatalogError, PromptCatalog};
@@ -272,6 +272,10 @@ pub struct Pod<C: LlmClient, St: Store> {
     /// compaction by keeping the same handle while the Worker history is
     /// replaced. Restored Pods reconstruct it by replaying Task* tool calls.
     task_store: tools::TaskStore,
+    /// Session-lifetime counters for active-Task reminder nudges.
+    /// Restored Pods start these at zero; the only consequence is a delayed
+    /// first reminder after resume.
+    task_reminder_state: Arc<TaskReminderState>,
     /// Parsed system-prompt template awaiting first-turn materialisation.
     /// `Some` until `ensure_system_prompt_materialized` renders it once,
     /// then `None` forever — including after compaction.
@@ -431,6 +435,7 @@ impl<C: LlmClient + Clone + 'static, St: Store + Clone + 'static> Pod<C, St> {
             usage_history: self.usage_history.clone(),
             tracker: None,
             task_store: self.task_store.clone(),
+            task_reminder_state: self.task_reminder_state.clone(),
             system_prompt_template: None,
             alerter: self.alerter.clone(),
             event_tx: self.event_tx.clone(),
@@ -610,6 +615,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             usage_history: Arc::new(Mutex::new(Vec::<UsageRecord>::new())),
             tracker: None,
             task_store: tools::TaskStore::new(),
+            task_reminder_state: Arc::new(TaskReminderState::new()),
             system_prompt_template: None,
             alerter: None,
             event_tx: None,
@@ -1260,6 +1266,8 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 usage_history_handle,
                 self.pending_notifies.clone(),
                 self.pending_attachments.clone(),
+                self.task_store.clone(),
+                self.task_reminder_state.clone(),
                 self.prompts.clone(),
                 self.log_writer.clone(),
             );
@@ -3797,6 +3805,7 @@ where
             usage_history: Arc::new(Mutex::new(Vec::new())),
             tracker: None,
             task_store: tools::TaskStore::new(),
+            task_reminder_state: Arc::new(TaskReminderState::new()),
             system_prompt_template: common.system_prompt_template,
             alerter: None,
             event_tx: None,
@@ -3876,6 +3885,7 @@ where
             usage_history: Arc::new(Mutex::new(Vec::new())),
             tracker: None,
             task_store: tools::TaskStore::new(),
+            task_reminder_state: Arc::new(TaskReminderState::new()),
             system_prompt_template: common.system_prompt_template,
             alerter: None,
             event_tx: None,
@@ -4052,6 +4062,7 @@ where
             usage_history: Arc::new(Mutex::new(state.usage_history)),
             tracker: None,
             task_store,
+            task_reminder_state: Arc::new(TaskReminderState::new()),
             // Restore replays the saved system_prompt verbatim — no
             // template re-render on resume.
             system_prompt_template: None,

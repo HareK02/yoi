@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 /// resume.
 ///
 /// New variants get added here as fresh injection kinds come online
-/// (e.g. `Reminder`). The `kind` JSON tag is the snake_case form of
+/// (e.g. `TaskReminder`). The `kind` JSON tag is the snake_case form of
 /// the variant name.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -68,6 +68,11 @@ pub enum SystemItem {
     /// prompt body materialized into the LLM context.
     Workflow { slug: String, body: String },
 
+    /// Task-management inactivity reminder inserted before an LLM request.
+    /// `body` is the exact LLM-context text wrapped in a
+    /// `<system-reminder>` block.
+    TaskReminder { body: String },
+
     /// Synthetic note inserted after an interrupted turn before the next
     /// user input. `body` is the exact LLM-context text explaining that the
     /// previous turn was cut short.
@@ -84,6 +89,7 @@ impl SystemItem {
             SystemItem::FileAttachment { body, .. } => body.clone(),
             SystemItem::Knowledge { body, .. } => body.clone(),
             SystemItem::Workflow { body, .. } => body.clone(),
+            SystemItem::TaskReminder { body } => body.clone(),
             SystemItem::Interrupt { body } => body.clone(),
         }
     }
@@ -103,6 +109,7 @@ impl SystemItem {
             SystemItem::FileAttachment { .. } => "file_attachment",
             SystemItem::Knowledge { .. } => "knowledge",
             SystemItem::Workflow { .. } => "workflow",
+            SystemItem::TaskReminder { .. } => "task_reminder",
             SystemItem::Interrupt { .. } => "interrupt",
         }
     }
