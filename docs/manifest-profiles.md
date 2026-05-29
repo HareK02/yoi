@@ -65,7 +65,7 @@ path = "profiles/coder.nix"
 description = "Project coding assistant"
 ```
 
-Relative registry paths are resolved against the TOML file that declares them. Discovery checks builtin profiles, then the user manifest, then the nearest project manifest. Later defaults override earlier defaults, so a project default wins over a user default. Unqualified ambiguous names fail closed:
+Relative registry paths are resolved against the TOML file that declares them. Discovery checks builtin profiles, then the user manifest, then the nearest project manifest. Later defaults override earlier defaults, so a project default wins over a user default. Unqualified alias/default targets resolve within the declaring source by default. Unqualified ambiguous names fail closed:
 
 ```sh
 insomnia --profile coder          # fails if both user:coder and project:coder exist
@@ -73,7 +73,7 @@ insomnia --profile project:coder  # source-qualified selection
 insomnia --profile default        # selected registry default
 ```
 
-The fresh-spawn TUI also uses discovery. If a default profile is configured, the new Pod dialog shows `profile: coder (default)` and spawns with the source-qualified selector. Passing `insomnia --profile <selector>` opens the same new Pod dialog with that selector shown and leaves Pod-name editing unchanged.
+The fresh-spawn TUI also uses discovery. If a default profile is configured, the new Pod dialog shows a selectable source-qualified profile row such as `profile: project:coder (default)`. `Tab`/`Down` cycles forward through discovered profiles, `Shift-Tab`/`Up` cycles backward, and the `manifest cascade` choice opts out of a default profile for that spawn. Passing `insomnia --profile <selector>` opens the same new Pod dialog with that selector selected and leaves Pod-name editing unchanged.
 
 ## Artifact contract
 

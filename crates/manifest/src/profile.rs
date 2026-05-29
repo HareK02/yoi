@@ -585,7 +585,7 @@ fn load_profile_config_manifest(
         registry.push_alias(ProfileAlias {
             source,
             name,
-            target_source,
+            target_source: target_source.or(Some(source)),
             target_name,
         });
     }
@@ -961,6 +961,48 @@ description = "Project coder"
         assert_eq!(default.source, ProfileRegistrySource::Project);
         assert_eq!(default.name, "coder");
         assert!(default.path.ends_with("profiles/project-coder.nix"));
+    }
+
+    #[test]
+    fn config_alias_unqualified_target_resolves_within_declaring_source() {
+        let tmp = TempDir::new().unwrap();
+        let user_manifest = tmp.path().join("user.toml");
+        let project_dir = tmp.path().join("project/.insomnia");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let project_manifest = project_dir.join("manifest.toml");
+        std::fs::write(
+            &user_manifest,
+            r#"
+[profiles.profile]
+coder = "profiles/user-coder.nix"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &project_manifest,
+            r#"
+[profiles.profile]
+coder = "profiles/project-coder.nix"
+[profiles.alias]
+default-coder = "coder"
+"#,
+        )
+        .unwrap();
+
+        let registry =
+            ProfileDiscovery::with_sources(None, Some(user_manifest), Some(project_manifest))
+                .discover()
+                .unwrap();
+        let selected = registry
+            .select(&ProfileSelector::source_named(
+                ProfileRegistrySource::Project,
+                "default-coder",
+            ))
+            .unwrap();
+
+        assert_eq!(selected.source, ProfileRegistrySource::Project);
+        assert_eq!(selected.name, "coder");
+        assert!(selected.path.ends_with("profiles/project-coder.nix"));
     }
 
     #[test]

@@ -14,7 +14,7 @@
 
 use std::ffi::OsString;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use client::{SpawnConfig, spawn_pod};
@@ -96,22 +96,17 @@ pub async fn run(
     profile: Option<String>,
 ) -> Result<SpawnOutcome, SpawnError> {
     let defaults = load_spawn_defaults()?;
-    let selected_profile = profile
-        .map(|selector| ProfileSelection {
-            label: selector.clone(),
-            selector,
-            is_default: false,
-        })
-        .or(defaults.default_profile);
-    let scope_origin = match selected_profile.as_ref() {
-        Some(profile) => ScopeOrigin::FromProfile(profile.label.clone()),
-        None => defaults.scope_origin,
-    };
+    let mut profile_choices = defaults.profile_choices;
+    let profile_index = initial_profile_index(
+        &mut profile_choices,
+        profile.as_deref(),
+        defaults.default_profile_index,
+    );
 
     let mut form = Form {
         cwd: defaults.cwd.clone(),
         cascade_has_scope: defaults.cascade_has_scope,
-        scope_origin,
+        scope_origin: defaults.scope_origin,
         name_cursor: defaults.default_name.chars().count(),
         name: defaults.default_name,
         message: None,
@@ -119,7 +114,8 @@ pub async fn run(
         resume_from,
         resume_by_pod_name: false,
         resume_scope: None,
-        profile: selected_profile,
+        profile_choices,
+        profile_index,
     };
 
     let mut terminal = make_inline_terminal()?;
@@ -150,6 +146,8 @@ pub async fn run(
             Some(Action::Right) => form.move_right(),
             Some(Action::Home) => form.name_cursor = 0,
             Some(Action::End) => form.name_cursor = form.name.chars().count(),
+            Some(Action::ProfileNext) => form.cycle_profile_next(),
+            Some(Action::ProfilePrev) => form.cycle_profile_prev(),
         }
     }
 
@@ -219,12 +217,13 @@ struct SpawnDefaults {
     cascade_has_scope: bool,
     scope_origin: ScopeOrigin,
     default_name: String,
-    default_profile: Option<ProfileSelection>,
+    default_profile_index: usize,
+    profile_choices: Vec<ProfileChoice>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ProfileSelection {
-    selector: String,
+struct ProfileChoice {
+    selector: Option<String>,
     label: String,
     is_default: bool,
 }
@@ -275,25 +274,80 @@ fn load_spawn_defaults() -> Result<SpawnDefaults, SpawnError> {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "pod".to_string());
 
-    let default_profile = default_profile_selection(&cwd);
+    let (profile_choices, default_profile_index) = profile_choices_for_cwd(&cwd);
 
     Ok(SpawnDefaults {
         cwd,
         cascade_has_scope,
         scope_origin,
         default_name,
-        default_profile,
+        default_profile_index,
+        profile_choices,
     })
 }
 
-fn default_profile_selection(cwd: &std::path::Path) -> Option<ProfileSelection> {
-    let registry = ProfileDiscovery::for_cwd(cwd).discover().ok()?;
-    let entry = registry.default_entry().ok()?;
-    Some(ProfileSelection {
-        selector: entry.qualified_name(),
-        label: format!("{} (default)", entry.name),
-        is_default: true,
-    })
+fn profile_choices_for_cwd(cwd: &Path) -> (Vec<ProfileChoice>, usize) {
+    let mut choices = vec![ProfileChoice {
+        selector: None,
+        label: "manifest cascade".to_string(),
+        is_default: false,
+    }];
+
+    let Ok(registry) = ProfileDiscovery::for_cwd(cwd).discover() else {
+        return (choices, 0);
+    };
+
+    for entry in registry.entries() {
+        let mut label = entry.qualified_name();
+        if entry.is_default {
+            label.push_str(" (default)");
+        }
+        if let Some(description) = entry.description.as_deref() {
+            label.push_str(" — ");
+            label.push_str(description);
+        }
+        choices.push(ProfileChoice {
+            selector: Some(entry.qualified_name()),
+            label,
+            is_default: entry.is_default,
+        });
+    }
+
+    let default_index = choices
+        .iter()
+        .position(|choice| choice.is_default)
+        .unwrap_or(0);
+    (choices, default_index)
+}
+
+fn initial_profile_index(
+    choices: &mut Vec<ProfileChoice>,
+    explicit_profile: Option<&str>,
+    default_index: usize,
+) -> usize {
+    let Some(selector) = explicit_profile else {
+        return default_index.min(choices.len().saturating_sub(1));
+    };
+    if let Some(index) = choices
+        .iter()
+        .position(|choice| choice.selector.as_deref() == Some(selector))
+    {
+        return index;
+    }
+    choices.push(ProfileChoice {
+        selector: Some(selector.to_string()),
+        label: selector.to_string(),
+        is_default: false,
+    });
+    choices.len() - 1
+}
+
+fn default_profile_selection(cwd: &Path) -> Option<ProfileChoice> {
+    let (choices, default_index) = profile_choices_for_cwd(cwd);
+    choices
+        .get(default_index)
+        .filter(|choice| choice.selector.is_some())
+        .cloned()
 }
 
 fn user_manifest_path_for_spawn(
@@ -315,7 +369,12 @@ fn form_for_pod_name(pod_name: String, defaults: SpawnDefaults) -> Form {
         resume_from: None,
         resume_by_pod_name: true,
         resume_scope: None,
-        profile: None,
+        profile_choices: vec![ProfileChoice {
+            selector: None,
+            label: "manifest cascade".to_string(),
+            is_default: false,
+        }],
+        profile_index: 0,
     }
 }
 
@@ -339,6 +398,8 @@ enum Action {
     Right,
     Home,
     End,
+    ProfileNext,
+    ProfilePrev,
 }
 
 fn poll_event() -> io::Result<Option<Action>> {
@@ -359,6 +420,8 @@ fn poll_event() -> io::Result<Option<Action>> {
                 KeyCode::Delete => Some(Action::Delete),
                 KeyCode::Left => Some(Action::Left),
                 KeyCode::Right => Some(Action::Right),
+                KeyCode::Up | KeyCode::BackTab => Some(Action::ProfilePrev),
+                KeyCode::Down | KeyCode::Tab => Some(Action::ProfileNext),
                 KeyCode::Home => Some(Action::Home),
                 KeyCode::End => Some(Action::End),
                 KeyCode::Char(c) if !ctrl && is_safe_name_char(c) => Some(Action::Char(c)),
@@ -389,10 +452,7 @@ async fn wait_for_ready(
 
     let config = SpawnConfig {
         pod_name: form.name.clone(),
-        profile: form
-            .profile
-            .as_ref()
-            .map(|profile| profile.selector.clone()),
+        profile: form.selected_profile_selector(),
         overlay_toml: overlay_toml.to_string(),
         cwd,
         resume_from: form.resume_from,
@@ -469,7 +529,6 @@ enum ScopeOrigin {
     FromUser,
     FromProject,
     CwdDefault,
-    FromProfile(String),
 }
 
 struct Form {
@@ -504,10 +563,11 @@ struct Form {
     /// resume runs, and serialized into the overlay instead of cwd-default
     /// scope so resume does not silently broaden access.
     resume_scope: Option<ScopeConfig>,
-    /// Optional Nix profile passed to `insomnia-pod --profile` for fresh spawns.
-    /// This is not used for resume/attach flows because those must restore Pod
-    /// state rather than re-evaluate a profile source.
-    profile: Option<ProfileSelection>,
+    /// Optional Nix profile choices passed to `insomnia-pod --profile` for
+    /// fresh spawns. This is not used for resume/attach flows because those must
+    /// restore Pod state rather than re-evaluate a profile source.
+    profile_choices: Vec<ProfileChoice>,
+    profile_index: usize,
 }
 
 impl Form {
@@ -548,6 +608,37 @@ impl Form {
         if self.name_cursor < total {
             self.name_cursor += 1;
         }
+    }
+
+    fn selected_profile(&self) -> Option<&ProfileChoice> {
+        self.profile_choices
+            .get(self.profile_index)
+            .filter(|choice| choice.selector.is_some())
+    }
+
+    fn selected_profile_selector(&self) -> Option<String> {
+        self.selected_profile()
+            .and_then(|choice| choice.selector.clone())
+    }
+
+    fn cycle_profile_next(&mut self) {
+        if self.profile_choices.is_empty() {
+            return;
+        }
+        self.profile_index = (self.profile_index + 1) % self.profile_choices.len();
+        self.message = None;
+    }
+
+    fn cycle_profile_prev(&mut self) {
+        if self.profile_choices.is_empty() {
+            return;
+        }
+        self.profile_index = if self.profile_index == 0 {
+            self.profile_choices.len() - 1
+        } else {
+            self.profile_index - 1
+        };
+        self.message = None;
     }
 
     fn char_offset_to_byte(&self, char_off: usize) -> usize {
@@ -619,6 +710,18 @@ fn name_line(form: &Form) -> Line<'_> {
 }
 
 fn context_line(form: &Form) -> Line<'_> {
+    if let Some(profile) = form.profile_choices.get(form.profile_index) {
+        return Line::from(vec![
+            Span::raw("  "),
+            Span::styled("profile: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(profile.label.as_str(), Style::default().fg(Color::Green)),
+            Span::styled(
+                " (tab/down to change)",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]);
+    }
+
     match form.scope_origin {
         ScopeOrigin::FromProject => Line::from(vec![
             Span::raw("  "),
@@ -639,23 +742,14 @@ fn context_line(form: &Form) -> Line<'_> {
             ),
             Span::styled(" (write, default)", Style::default().fg(Color::DarkGray)),
         ]),
-        ScopeOrigin::FromProfile(ref label) => Line::from(vec![
-            Span::raw("  "),
-            Span::styled("profile: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(label.as_str(), Style::default().fg(Color::Green)),
-            Span::styled(" (resolved by pod)", Style::default().fg(Color::DarkGray)),
-        ]),
     }
 }
 
 fn hint_line() -> Line<'static> {
-    Line::from(vec![
-        Span::raw("  "),
-        Span::styled("[enter]", Style::default().fg(Color::Green)),
-        Span::raw(" spawn   "),
-        Span::styled("[esc]", Style::default().fg(Color::Yellow)),
-        Span::raw(" cancel"),
-    ])
+    Line::from(vec![Span::styled(
+        "  enter spawn · tab/down next profile · shift-tab/up prev · esc cancel",
+        Style::default().fg(Color::DarkGray),
+    )])
 }
 
 fn message_line(form: &Form) -> Line<'_> {
@@ -691,7 +785,12 @@ mod tests {
             resume_from: None,
             resume_by_pod_name: false,
             resume_scope: None,
-            profile: None,
+            profile_choices: vec![ProfileChoice {
+                selector: None,
+                label: "manifest cascade".to_string(),
+                is_default: false,
+            }],
+            profile_index: 0,
         }
     }
 
@@ -702,7 +801,12 @@ mod tests {
             cascade_has_scope: true,
             scope_origin: ScopeOrigin::FromProject,
             default_name: "ignored".to_string(),
-            default_profile: None,
+            default_profile_index: 0,
+            profile_choices: vec![ProfileChoice {
+                selector: None,
+                label: "manifest cascade".to_string(),
+                is_default: false,
+            }],
         };
         let f = form_for_pod_name("agent".to_string(), defaults);
 
@@ -821,9 +925,88 @@ coder = "profiles/coder.nix"
         .unwrap();
 
         let selected = default_profile_selection(&project).unwrap();
-        assert_eq!(selected.selector, "project:coder");
-        assert_eq!(selected.label, "coder (default)");
+        assert_eq!(selected.selector.as_deref(), Some("project:coder"));
+        assert_eq!(selected.label, "project:coder (default)");
         assert!(selected.is_default);
+    }
+
+    #[test]
+    fn profile_choices_include_no_profile_source_labels_and_default_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        let insomnia = project.join(".insomnia");
+        std::fs::create_dir_all(&insomnia).unwrap();
+        std::fs::write(
+            insomnia.join("manifest.toml"),
+            r#"
+[profiles]
+default = "coder"
+[profiles.profile.coder]
+path = "profiles/coder.nix"
+description = "Project coder"
+"#,
+        )
+        .unwrap();
+
+        let (choices, default_index) = profile_choices_for_cwd(&project);
+        assert_eq!(choices[0].selector, None);
+        assert_eq!(choices[0].label, "manifest cascade");
+        assert_eq!(default_index, 1);
+        assert_eq!(choices[1].selector.as_deref(), Some("project:coder"));
+        assert_eq!(choices[1].label, "project:coder (default) — Project coder");
+    }
+
+    #[test]
+    fn profile_cycle_selects_profiles_and_can_opt_out_of_default() {
+        let mut form = form("coder", true);
+        form.profile_choices = vec![
+            ProfileChoice {
+                selector: None,
+                label: "manifest cascade".to_string(),
+                is_default: false,
+            },
+            ProfileChoice {
+                selector: Some("project:coder".to_string()),
+                label: "project:coder (default)".to_string(),
+                is_default: true,
+            },
+            ProfileChoice {
+                selector: Some("user:reviewer".to_string()),
+                label: "user:reviewer".to_string(),
+                is_default: false,
+            },
+        ];
+        form.profile_index = 1;
+
+        assert_eq!(
+            form.selected_profile_selector().as_deref(),
+            Some("project:coder")
+        );
+        form.cycle_profile_next();
+        assert_eq!(
+            form.selected_profile_selector().as_deref(),
+            Some("user:reviewer")
+        );
+        form.cycle_profile_next();
+        assert_eq!(form.selected_profile_selector(), None);
+        form.cycle_profile_prev();
+        assert_eq!(
+            form.selected_profile_selector().as_deref(),
+            Some("user:reviewer")
+        );
+    }
+
+    #[test]
+    fn initial_profile_index_adds_explicit_selector_not_in_discovery_list() {
+        let mut choices = vec![ProfileChoice {
+            selector: None,
+            label: "manifest cascade".to_string(),
+            is_default: false,
+        }];
+        let selected = initial_profile_index(&mut choices, Some("coder"), 0);
+        assert_eq!(selected, 1);
+        assert_eq!(choices[1].selector.as_deref(), Some("coder"));
+        assert_eq!(choices[1].label, "coder");
     }
 
     #[test]
