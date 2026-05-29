@@ -1,13 +1,25 @@
+<!-- event: create author: tickets.sh at: 2026-05-29T01:02:00Z -->
+
+## Created
+
+Created by tickets.sh create.
+
+---
+
+<!-- event: close author: hare at: 2026-05-29T02:08:56Z status: closed -->
+
+## Closed
+
 ---
 id: 20260529-010200-tui-command-completion-apply
 slug: tui-command-completion-apply
 title: Apply command completions from keyboard
-status: open
+status: closed
 kind: task
 priority: P2
 labels: [tui, commands, ux]
 created_at: 2026-05-29T01:02:00Z
-updated_at: 2026-05-29T01:02:00Z
+updated_at: 2026-05-29T02:08:56Z
 assignee: null
 legacy_ticket: null
 ---
@@ -56,3 +68,6 @@ This should make command mode behave like a small command palette rather than a 
 - Mouse selection in the completion popup.
 - Normal input/file reference completion changes.
 - Changing command registry semantics outside completion application.
+
+
+---
