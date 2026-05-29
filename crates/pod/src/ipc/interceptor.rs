@@ -41,10 +41,19 @@ const TASK_REMINDER_REQUEST_THRESHOLD: usize = 8;
 const TASK_REMINDER_COOLDOWN_REQUESTS: usize = 8;
 const TASK_MANAGEMENT_TOOL_NAMES: [&str; 2] = ["TaskCreate", "TaskUpdate"];
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct TaskReminderState {
     requests_since_last_task_management: AtomicUsize,
     requests_since_last_reminder: AtomicUsize,
+}
+
+impl Default for TaskReminderState {
+    fn default() -> Self {
+        Self {
+            requests_since_last_task_management: AtomicUsize::new(0),
+            requests_since_last_reminder: AtomicUsize::new(TASK_REMINDER_COOLDOWN_REQUESTS),
+        }
+    }
 }
 
 impl TaskReminderState {
@@ -665,6 +674,22 @@ mod tests {
         assert!(!body.contains("long task description"));
     }
 
+    #[test]
+    fn task_reminder_state_starts_with_initial_cooldown_elapsed() {
+        let state = TaskReminderState::new();
+
+        assert_eq!(
+            state.requests_since_last_reminder.load(Ordering::Relaxed),
+            TASK_REMINDER_COOLDOWN_REQUESTS
+        );
+        assert_eq!(
+            state
+                .requests_since_last_task_management
+                .load(Ordering::Relaxed),
+            0
+        );
+    }
+
     #[tokio::test]
     async fn task_management_tool_call_resets_reminder_inactivity_counter() {
         let task_store = TaskStore::new();
@@ -725,6 +750,30 @@ mod tests {
         }
 
         task_store.create("new active".into(), String::new());
+        for _ in 0..TASK_REMINDER_REQUEST_THRESHOLD - 1 {
+            assert!(interceptor.pending_history_appends().await.is_empty());
+        }
+        assert_eq!(interceptor.pending_history_appends().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn task_create_reset_does_not_block_first_reminder_cooldown() {
+        let task_store = TaskStore::new();
+        let state = Arc::new(TaskReminderState::new());
+        let interceptor = interceptor_for_task_reminders(task_store.clone(), state.clone());
+
+        for _ in 0..TASK_REMINDER_REQUEST_THRESHOLD * 2 {
+            assert!(interceptor.pending_history_appends().await.is_empty());
+        }
+
+        call_pre_tool(&interceptor, "TaskCreate").await;
+        task_store.create("created after idle".into(), String::new());
+        assert_eq!(
+            state.requests_since_last_reminder.load(Ordering::Relaxed),
+            TASK_REMINDER_COOLDOWN_REQUESTS,
+            "TaskCreate reset must not clear the initial reminder cooldown"
+        );
+
         for _ in 0..TASK_REMINDER_REQUEST_THRESHOLD - 1 {
             assert!(interceptor.pending_history_appends().await.is_empty());
         }
