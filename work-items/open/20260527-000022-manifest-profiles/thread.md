@@ -79,3 +79,48 @@ The delegated orchestrator should not return merely because one slice is reviewa
 
 
 ---
+
+<!-- event: review author: hare at: 2026-05-29T17:44:47Z status: approve -->
+
+## Review: approve
+
+Reviewed phase 2 implementation from branch `work/nix-manifest-profiles-phase2`.
+
+Result: approved after two parent-review fixes.
+
+Implemented scope:
+
+- Profile registry/discovery for builtin/user/project sources.
+- `[profiles]` metadata in user/project manifests for discovery/default/alias only; it is not merged into the selected runtime manifest.
+- `--profile` selector parsing for explicit paths, `path:<path>`, discovered names, `default`, and source-qualified names such as `project:coder`.
+- Ambiguous unqualified discovered names fail closed.
+- TUI fresh-spawn UI now shows a selectable `profile:` row, uses discovered choices, marks defaults, and includes `manifest cascade` as opt-out.
+- SpawnConfig passes selected profiles to `insomnia-pod --profile`; resume/attach paths do not re-evaluate profiles.
+- Docs and focused tests updated.
+
+Parent review findings fixed by child orchestrator:
+
+1. Unqualified alias targets initially resolved globally. Fixed so aliases declared in a source resolve unqualified targets within that declaring source by default.
+2. Defaults pointing at aliases initially did not mark the resolved target entry as default, causing TUI to fall back to `manifest cascade`. Fixed by resolving the default through `select_named()` before setting `is_default` flags.
+
+Validation run by parent reviewer:
+
+- `cargo fmt --check`
+- `cargo check`
+- `cargo test -p manifest profile -- --nocapture`
+- `cargo test -p tui spawn -- --nocapture`
+- `cargo test -p pod profile -- --nocapture`
+- `cargo test -p client spawn -- --nocapture`
+- `git diff --check`
+
+All passed. Full `cargo test` was run by the child orchestrator and failed only in the unrelated existing/flaky `llm-worker` parallel timing test class.
+
+Remaining polish/follow-up candidates, not blockers for this work item:
+
+- A richer popup-style profile picker instead of inline cycling.
+- Actual bundled builtin profile files once default builtin semantics are decided.
+- `nix eval` timeout/robustness follow-up.
+- Encrypted secret store integration remains tracked by the related encrypted-secrets work item.
+
+
+---
