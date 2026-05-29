@@ -43,6 +43,17 @@ Two implementation areas need to be corrected together so context safety checks 
   - Record at least items count, item JSON bytes, raw/wire request bytes, reasoning item count, reasoning encrypted-content bytes, and whether provider usage was absent.
   - Keep diagnostics out of model context unless they are intentionally logged as normal visible events.
 
+## Implementation notes
+
+- Upstream Codex references for comparison:
+  - `/home/hare/ghq/github.com/openai/codex/codex-rs/models-manager/models.json` defines `gpt-5.5` with `context_window=272000` and `max_context_window=272000`.
+  - `codex-rs/models-manager/src/model_info.rs` clamps configured `model_context_window` by `max_context_window` when applying config overrides.
+  - `codex-rs/protocol/src/openai_models.rs` derives `auto_compact_token_limit()` from the resolved context window.
+  - `codex-rs/core/src/context_manager/history.rs` tracks `server_reasoning_included` and uses encrypted reasoning estimates only when the server usage does not already include them.
+- Do not blindly port Codex internals. Preserve Insomnia's existing manifest/model layering and session-log authority; add the smallest typed concepts needed to represent an effective backend max window and to make safety accounting conservative enough.
+- If exact reasoning inclusion policy is ambiguous, make the request builder policy explicit in code and tests, and update `docs/ref/model-reasoning-context.md` alongside the implementation.
+- Treat provider `context_length_exceeded` responses with `usage=null` as expected; diagnostics must rely on request-shape counters rather than nonexistent failed-request token usage.
+
 ## Acceptance criteria
 
 - `reasoning.context="current_turn"` no longer causes old persisted reasoning `encrypted_content` to be resent outside the documented policy.
