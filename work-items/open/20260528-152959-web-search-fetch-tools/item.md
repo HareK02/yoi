@@ -63,6 +63,22 @@ Useful details to mirror for `WebSearch`:
 - Brave's public docs/reference include an LLM Context endpoint (`/res/v1/summarizer/llm_context`) that returns extracted snippets/content with token and per-URL limits. This is useful as a future `WebContext`/enhanced search provider, but should not replace `WebFetch` in the first implementation because it is provider-specific and not a direct URL fetch tool.
 - Brave MCP defines a nominal free-plan rate limit of 1 request/second and 15,000/month and does not implement robust self-throttling. Insomnia should at least surface HTTP 429/rate-limit errors clearly; local throttling can be a follow-up unless implementation is cheap.
 
+## Implementation plan
+
+- First implementation should be provider-independent normal function tools, not OpenAI/Codex hosted `web_search`.
+- Add a small typed web config to manifest resolution and pass it into built-in tool registration.
+  - Default disabled/no provider should produce clear tool errors, not implicit network access.
+  - Prefer environment-variable secret references for API keys; do not require raw keys in manifest files.
+- Implement `WebSearch` with Brave as the first provider.
+  - Keep the first-call schema small: `query`, optional `limit`, and optional `offset` only unless a broader parameter is trivial and well-tested.
+  - Use deterministic JSON output with provider metadata and a bounded result list.
+- Implement `WebFetch` independently from Brave.
+  - Use an HTTP client with timeout, redirect limits, response byte limits, and content-type checks.
+  - Enforce URL/host/IP policy before fetch and on every redirect.
+  - Convert HTML to readable text with a scoped dependency or a small internal extractor; reject unsupported binary content.
+- Register both tools through the existing built-in tool path so existing permission policy and history/logging behavior applies naturally.
+- Do not implement provider-hosted OpenAI/Codex `web_search` in this ticket; that is a separate model/provider hosted-tool feature.
+
 ## Acceptance criteria
 
 - `WebSearch` and `WebFetch` are registered built-in tools when enabled/configured.
