@@ -1,74 +1,148 @@
 ---
 id: 20260527-000004-manual-turn-rollback
 slug: manual-turn-rollback
-title: Pod/TUI: 手動 rollback 導線
+title: Pod/TUI: 手動 rewind 導線
 status: open
 kind: task
 priority: P2
-labels: [migrated]
+labels: [tui, pod, ux]
 created_at: 2026-05-27T00:00:04Z
-updated_at: 2026-05-27T00:00:04Z
+updated_at: 2026-05-29T01:38:57Z
 assignee: null
 legacy_ticket: tickets/manual-turn-rollback.md
 ---
 
-## Migration reference
-
-- legacy_ticket: tickets/manual-turn-rollback.md
-- migrated_from: TODO.md / tickets directory migration on 2026-05-27
-
-# Pod/TUI: 手動 rollback 導線
-
-## 背景
+## Background
 
 `pod-empty-turn-rollback` / `tui-empty-turn-restore` により、AI 側出力が 0 の interrupted turn については Pod 側で自動 rollback し、TUI 側で入力を復元できるようになった。
 
-一方で、rollback substrate は直前 Run の状態復元に使える形で入り始めているが、ユーザーが明示的に rollback を要求する導線はまだない。誤送信、モデル選択ミス、途中で方針を変えた場合などに、ユーザーが手動で直前状態へ戻す手段が必要になる可能性がある。
+次に欲しいのは、直前 turn だけの rollback command ではなく、TUI から過去の user message を選び、その地点まで会話を戻してその入力を composer に復元する **manual rewind** 導線である。
 
-詳細な UX / rollback 対象範囲 / safety policy は未決定のため、本チケットでは要求を保持し、実装方針は着手時に確定する。
+誤送信、モデル選択ミス、途中で方針を変えた場合などに、ユーザーは過去の入力を選び直し、必要なら編集してから Enter で retry できる。選択した瞬間に再実行はしない。
 
-## 要件メモ
+## UX
 
-- ユーザーが明示的に rollback を要求できる導線を用意する。
-  - TUI system command / keybinding / tool / protocol Method のどこに置くかは未決定。
-  - 最初は TUI から直前 turn を rollback する導線が候補。
-- rollback 対象範囲を決める。
-  - 直前 submit のみか。
-  - assistant output がある turn を許可するか。
-  - tool call / tool result が含まれる turn を許可するか。
-  - 複数 turn rollback は `pod-session-fork` との関係を確認する。
-- safety policy を決める。
-  - user-visible assistant output を消す場合は確認を要求するか。
-  - tool side effect が既に発生した turn を rollback できるのか、履歴から消すのではなく fork に誘導するのか。
-  - rollback が history/context 永続化原則を壊さないようにする。
-- TUI 側の表示を決める。
-  - rollback 成功 / 失敗の通知。
-  - 消された blocks の扱い。
-  - rollback された input を composer に戻すか、history/backup に置くか。
-- protocol signal を整理する。
-  - 既存 `RunResult::RolledBack` を再利用できるか。
-  - 手動 rollback は RunEnd ではなく専用 Event / Method が必要か。
+- `:rewind` command を追加する。
+- `:rollback` は `:rewind` の alias として扱ってよい。
+- `Ctrl+R` は rewind/rollback を表す shortcut として、同じ picker を開く。
+- `:rewind` / `Ctrl+R` は引数を取らず、TUI 内の picker を開く。
+- picker は過去の user message を新しい順に表示する。
+  - turn number / index
+  - timestamp または relative time
+  - message preview
+  - eligible / disabled reason
+- picker で user message を選択すると、Pod はその user message の直前まで history/session log を rewind し、選択された message を TUI composer に復元する。
+- 選択後は、composer に該当 message が入っている状態になる。
+  - Enter を押すとその message で retry できる。
+  - ユーザーは送信前に編集できる。
+  - 選択しただけで自動実行しない。
+- Esc 等で picker を閉じると何も変更しない。
 
-## 完了条件（詳細未確定）
+## Semantics
 
-- 手動操作で rollback を要求できる。
-- rollback 成功時、Pod の session log / SegmentLogSink mirror / TUI 表示が整合する。
-- rollback 失敗時、理由がユーザーに見える。
-- tool side effect や assistant output を含む turn の扱いが仕様として明示されている。
-- tests がある。
+Manual rewind は destructive operation として扱う。選択地点より後の履歴 suffix は捨てる。fork は優先度低めの別機能であり、この ticket の実装では fork を作らない。
+
+- Rewind は current active segment/session に対して行う。
+- Rewind 成功時、選択された `UserInput` entry 自体も履歴から取り除かれ、composer に戻る。
+- Rewind 後、選択地点より後の assistant output / later user messages / usage entries / display blocks は現 branch から消える。
+- 元 suffix を保持したい場合は将来の `pod-session-fork` で扱う。この ticket では保持しない。
+- Tool side effect の undo はしない。
+
+Initial safety policy:
+
+- Pod が `Idle` の時だけ許可する。
+- `Running` / `Paused` 中は拒否する。
+- picker 表示時から head が変わった場合は apply 時に再検証して拒否する。
+- segment rotation / compaction を跨ぐ rewind は初期実装では対象外でよい。
+- suffix に tool call / tool result / other side-effect-looking entries が含まれる場合でも、初期方針としては destructive rewind を許可してよい。ただし UI には「以降の履歴は破棄され、tool side effects は undo されない」ことが分かる notice/diagnostic を出す。
+- 実装上どうしても安全に整合性を保てない suffix 種別がある場合は、具体的な disabled reason を表示して拒否する。
+
+## Protocol / ownership
+
+TUI がローカルに履歴を削るのではなく、Pod が authoritative に rewind を検証・適用する。
+
+Suggested protocol shape:
+
+```rust
+Method::ListRewindTargets { limit: Option<usize> }
+Method::RewindTo {
+    target: RewindTargetId,
+    expected_head_entries: usize,
+}
+
+Event::RewindTargets { targets: Vec<RewindTarget> }
+Event::RewindApplied {
+    entries: Vec<serde_json::Value>,
+    input: Vec<Segment>,
+    summary: RewindSummary,
+}
+```
+
+Exact names may differ, but the behavior should stay:
+
+- listing targets and applying a target are separate operations.
+- apply revalidates target identity and current head.
+- success returns enough entries for clients to reseed their view.
+- success returns the selected user input segments so TUI can restore the composer.
+- failure uses visible diagnostics, e.g. `Event::Error { code: InvalidRequest, message }`.
+
+`RunResult::RolledBack` should not be reused for this idle control operation. It remains the run-lifecycle signal for submit-time empty-turn rollback.
+
+## Implementation notes
+
+- Target identity can initially be current segment + entry index:
+
+```rust
+RewindTargetId {
+    segment_id: SegmentId,
+    user_input_entry_index: usize,
+}
+```
+
+- Include `expected_head_entries` to reject stale picker selections.
+- Each target should include:
+  - preview
+  - original `Vec<Segment>`
+  - turn/index metadata if available
+  - whether the target is eligible
+  - disabled/warning reason if relevant
+  - the entry count to truncate to, which is before the selected user message.
+- Rewind apply must keep these in sync:
+  - worker history
+  - `user_segments`
+  - session store segment log
+  - `SegmentLogSink` mirror
+  - usage history / trackers
+  - TUI view reconstructed from returned entries
+- If a complete current-state reconstruction from log is simpler and safer than maintaining many historical snapshots, prefer that over fragile partial truncation.
+
+## Acceptance criteria
+
+- `:rewind` opens a picker of past user messages.
+- `Ctrl+R` opens the same picker.
+- Selecting a message rewinds the Pod state to before that message and restores the message into the TUI composer.
+- Rewind does not auto-run; pressing Enter after selection retries the restored message.
+- Rewind success updates Pod session log, SegmentLogSink mirror, worker state, and TUI display consistently.
+- Rewind failure leaves state unchanged and shows a clear reason.
+- Picker selections are revalidated at apply time to avoid stale-head corruption.
+- Rewound suffix is intentionally discarded; no fork is created.
+- Tool side effects are not undone; UI/diagnostics make this clear when relevant.
+- Tests cover target listing, apply success, stale-head rejection, composer restore, TUI display reseed, and at least one suffix-with-tool case.
 - `cargo fmt --check`
-- `cargo check --workspace`
-- 関連 crate の tests。
+- `cargo check -p protocol -p pod -p tui`
+- Relevant focused tests.
 
-## 範囲外
+## Out of scope
 
-- 複数ターン rollback / 過去地点からの本格的なやり直し（`pod-session-fork` と調整）
-- rollback 履歴スタック
-- tool side effect の undo
-- fork tree 可視化
+- Creating a fork when rewinding.
+- Fork tree visualization.
+- Merging branches.
+- Undoing tool side effects.
+- Rollback history stack / redo.
+- Rewind across compacted segments unless it falls out naturally from implementation.
 
-## 関連
+## Related
 
-- `tickets/pod-session-fork.md`
-- 完了済み: `pod-empty-turn-rollback`
-- 完了済み: `tui-empty-turn-restore`
+- `20260527-000009-pod-session-fork` remains a lower-priority future feature for preserving alternate histories.
+- Completed: `pod-empty-turn-rollback`
+- Completed: `tui-empty-turn-restore`
