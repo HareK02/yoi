@@ -23,6 +23,10 @@ legacy_ticket: null
 
 This work item was migrated from an unfinished TODO.md entry that did not have a dedicated legacy ticket file.
 
+## Related work
+
+- `work-items/open/20260529-145355-manifest-profile-encrypted-secrets/item.md`: profiles should integrate with explicit encrypted secret references so API keys/tokens are not limited to process environment variables.
+
 ## Acceptance criteria
 
 - Define the concrete requirements before implementation.
