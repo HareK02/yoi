@@ -38,6 +38,13 @@ provider = "codex-oauth"
 context_window = 400000
 capability = { tool_calling = "parallel", structured_output = "json_schema", reasoning = "effort", vision = true, prompt_caching = { kind = "auto" } }
 
+[[model]]
+id = "gpt-5.5"
+provider = "codex-oauth"
+context_window = 1000000
+max_context_window = 272000
+capability = { tool_calling = "parallel", structured_output = "json_schema", reasoning = "effort", vision = true, prompt_caching = { kind = "auto" } }
+
 # OpenRouter
 [[model]]
 id = "anthropic/claude-sonnet-4"

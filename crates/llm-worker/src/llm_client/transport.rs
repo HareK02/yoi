@@ -14,7 +14,7 @@ use futures::{Stream, StreamExt, TryStreamExt};
 use reqwest::header::{
     ACCEPT, CONTENT_ENCODING, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, RETRY_AFTER,
 };
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use super::auth::{AuthProvider, AuthRequirement};
 use super::capability::ModelCapability;
@@ -260,6 +260,60 @@ fn json_value_kind(value: &Value) -> &'static str {
     }
 }
 
+fn request_body_shape_payload(body: &Value) -> Value {
+    let mut map = Map::new();
+    if let Some(input) = body.get("input").and_then(Value::as_array) {
+        let items_json_bytes = serde_json::to_vec(input).map(|bytes| bytes.len()).ok();
+        let mut reasoning_items = 0usize;
+        let mut reasoning_encrypted_content_count = 0usize;
+        let mut reasoning_encrypted_content_bytes = 0usize;
+        for item in input {
+            if item.get("type").and_then(Value::as_str) != Some("reasoning") {
+                continue;
+            }
+            reasoning_items += 1;
+            if let Some(encrypted) = item.get("encrypted_content").and_then(Value::as_str) {
+                reasoning_encrypted_content_count += 1;
+                reasoning_encrypted_content_bytes += encrypted.len();
+            }
+        }
+        map.insert("items_len".to_string(), json!(input.len()));
+        map.insert("items_json_bytes".to_string(), json!(items_json_bytes));
+        map.insert("reasoning_items".to_string(), json!(reasoning_items));
+        map.insert(
+            "reasoning_encrypted_content_count".to_string(),
+            json!(reasoning_encrypted_content_count),
+        );
+        map.insert(
+            "reasoning_encrypted_content_bytes".to_string(),
+            json!(reasoning_encrypted_content_bytes),
+        );
+    }
+    let reasoning_context = body
+        .get("reasoning")
+        .and_then(|reasoning| reasoning.get("context"))
+        .and_then(Value::as_str);
+    map.insert("reasoning_context".to_string(), json!(reasoning_context));
+    Value::Object(map)
+}
+
+fn api_error_code(error: &ClientError) -> Option<&str> {
+    match error {
+        ClientError::Api { code, .. } => code.as_deref(),
+        _ => None,
+    }
+}
+
+fn is_context_length_exceeded(error: &ClientError) -> bool {
+    match error {
+        ClientError::Api { code, message, .. } => {
+            code.as_deref() == Some("context_length_exceeded")
+                || message.contains("context_length_exceeded")
+        }
+        _ => false,
+    }
+}
+
 async fn response_with_timeout(
     future: impl std::future::Future<Output = Result<reqwest::Response, reqwest::Error>>,
     timeout: Duration,
@@ -296,7 +350,11 @@ async fn classify_error_response(resp: reqwest::Response) -> ClientError {
     let text = resp.text().await.unwrap_or_default();
     if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
         let error = json.get("error").unwrap_or(&json);
-        let code = error.get("type").and_then(|v| v.as_str()).map(String::from);
+        let code = error
+            .get("code")
+            .and_then(|v| v.as_str())
+            .or_else(|| error.get("type").and_then(|v| v.as_str()))
+            .map(String::from);
         let message = error
             .get("message")
             .and_then(|v| v.as_str())
@@ -406,12 +464,14 @@ impl<S: Scheme + Clone + 'static> LlmClient for HttpTransport<S> {
         let body = self
             .scheme
             .build_request_body(&self.model_id, &request, &self.capability);
+        let body_shape = request_body_shape_payload(&body);
         emit_transport_trace(
             &request,
             "transport_body_build_done",
             json!({
                 "elapsed_ms": body_started.elapsed().as_millis() as u64,
                 "body_kind": json_value_kind(&body),
+                "request_shape": body_shape.clone(),
             }),
         );
 
@@ -438,6 +498,7 @@ impl<S: Scheme + Clone + 'static> LlmClient for HttpTransport<S> {
                 "encoding": request_body.encoding(),
                 "raw_json_bytes": request_body.raw_json_bytes(),
                 "wire_bytes": request_body.wire_bytes(),
+                "request_shape": body_shape.clone(),
             }),
         );
 
@@ -479,15 +540,23 @@ impl<S: Scheme + Clone + 'static> LlmClient for HttpTransport<S> {
             };
 
         if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let retry_after_present = response.headers().get(RETRY_AFTER).is_some();
+            let error = classify_error_response(response).await;
+            let context_length_exceeded = is_context_length_exceeded(&error);
             emit_transport_trace(
                 &request,
                 "transport_http_status_error",
                 json!({
-                    "status": response.status().as_u16(),
-                    "retry_after_present": response.headers().get(RETRY_AFTER).is_some(),
+                    "status": status,
+                    "retry_after_present": retry_after_present,
+                    "api_error_code": api_error_code(&error),
+                    "context_length_exceeded": context_length_exceeded,
+                    "provider_usage_absent": context_length_exceeded,
+                    "request_shape": body_shape.clone(),
                 }),
             );
-            return Err(classify_error_response(response).await);
+            return Err(error);
         }
 
         emit_transport_trace(
@@ -609,6 +678,24 @@ mod tests {
             auth,
             ModelCapability::minimal(),
         )
+    }
+
+    #[test]
+    fn request_body_shape_counts_reasoning_encrypted_content() {
+        let payload = request_body_shape_payload(&json!({
+            "reasoning": { "context": "current_turn" },
+            "input": [
+                { "type": "message", "role": "user", "content": [] },
+                { "type": "reasoning", "encrypted_content": "abc", "summary": [] },
+                { "type": "reasoning", "encrypted_content": "defgh", "summary": [] }
+            ]
+        }));
+        assert_eq!(payload["items_len"], 3);
+        assert_eq!(payload["reasoning_items"], 2);
+        assert_eq!(payload["reasoning_encrypted_content_count"], 2);
+        assert_eq!(payload["reasoning_encrypted_content_bytes"], 8);
+        assert_eq!(payload["reasoning_context"], "current_turn");
+        assert!(payload["items_json_bytes"].as_u64().unwrap() > 0);
     }
 
     #[tokio::test]

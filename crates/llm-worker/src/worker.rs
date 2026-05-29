@@ -2029,12 +2029,31 @@ fn items_trace_payload(
         _ => None,
     };
 
+    let mut reasoning_items = 0usize;
+    let mut reasoning_encrypted_content_count = 0usize;
+    let mut reasoning_encrypted_content_bytes = 0usize;
+    for item in items {
+        if let Item::Reasoning {
+            encrypted_content, ..
+        } = item
+        {
+            reasoning_items += 1;
+            if let Some(encrypted) = encrypted_content {
+                reasoning_encrypted_content_count += 1;
+                reasoning_encrypted_content_bytes += encrypted.len();
+            }
+        }
+    }
+
     json!({
         "items_len": items.len(),
         "items_json_bytes": serde_json::to_vec(items).map(|bytes| bytes.len()).ok(),
         "tools_len": tools_len,
         "cache_anchor": cache_anchor,
         "cache_key_present": cache_key_present,
+        "reasoning_items": reasoning_items,
+        "reasoning_encrypted_content_count": reasoning_encrypted_content_count,
+        "reasoning_encrypted_content_bytes": reasoning_encrypted_content_bytes,
         "last_item_kind": last.map(item_kind),
         "last_item_json_bytes": last.and_then(|item| serde_json::to_vec(item).ok().map(|bytes| bytes.len())),
         "last_tool_result": last_tool_result,

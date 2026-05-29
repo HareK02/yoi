@@ -187,6 +187,7 @@ mod tests {
             },
             capability: None,
             context_window: 200_000,
+            max_context_window: None,
         }
     }
 
@@ -315,6 +316,7 @@ mod tests {
             auth: AuthRef::None,
             capability: None,
             context_window: 200_000,
+            max_context_window: None,
         };
         assert!(build_client_from_config(&config).is_ok());
     }

@@ -62,6 +62,9 @@ pub(crate) struct ResponsesRequest {
 pub(crate) struct ReasoningConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// Reasoning encrypted_content は同一 user turn 内だけ再利用する。
+    /// 古い turn の reasoning item は request input から除外する。
+    pub context: &'static str,
     /// summary の出力制御。`"auto"` 固定で summary_text を受け取る。
     pub summary: &'static str,
 }
@@ -193,6 +196,7 @@ impl OpenAIResponsesScheme {
                     ReasoningControl::Effort(effort) => Some(effort.as_str().to_string()),
                     ReasoningControl::BudgetTokens(_) => None,
                 },
+                context: "current_turn",
                 summary: "auto",
             })
             .filter(|reasoning| reasoning.effort.is_some());
@@ -236,8 +240,9 @@ impl OpenAIResponsesScheme {
 
 /// `Item` 列を `input[]` に変換する。
 fn convert_items_to_input(items: &[Item]) -> Vec<InputItem> {
+    let current_turn_start = current_turn_start_index(items);
     let mut out = Vec::with_capacity(items.len());
-    for item in items {
+    for (idx, item) in items.iter().enumerate() {
         match item {
             Item::Message { role, content, .. } => {
                 let (role_str, text_variant): (&'static str, fn(String) -> InputContent) =
@@ -294,6 +299,9 @@ fn convert_items_to_input(items: &[Item]) -> Vec<InputItem> {
                 encrypted_content,
                 ..
             } => {
+                if idx < current_turn_start {
+                    continue;
+                }
                 let summary_parts = summary
                     .iter()
                     .filter(|s| !s.is_empty())
@@ -314,6 +322,26 @@ fn convert_items_to_input(items: &[Item]) -> Vec<InputItem> {
         }
     }
     out
+}
+
+/// Responses の `reasoning.context = "current_turn"` に合わせ、直近の
+/// user message 以降だけを current turn とみなす。ToolResult は Responses
+/// wire 上では user 側 item だが、新しい人間/外部入力ではなく function-call
+/// chain の継続なので turn reset には使わない。System/developer notes も
+/// 同一 turn 内の補助入力になり得るため reset しない。
+fn current_turn_start_index(items: &[Item]) -> usize {
+    items
+        .iter()
+        .rposition(|item| {
+            matches!(
+                item,
+                Item::Message {
+                    role: Role::User,
+                    ..
+                }
+            )
+        })
+        .unwrap_or(0)
 }
 
 fn convert_tool(tool: &ToolDefinition) -> ResponseTool {
@@ -478,6 +506,60 @@ mod tests {
     }
 
     #[test]
+    fn old_turn_reasoning_items_are_omitted_for_current_turn_context() {
+        let scheme = OpenAIResponsesScheme::new();
+        let old_reasoning = Item::reasoning("old").with_encrypted_content("OLD_ENC");
+        let current_reasoning = Item::reasoning("current").with_encrypted_content("CURRENT_ENC");
+        let req = Request::new()
+            .user("old prompt")
+            .item(old_reasoning)
+            .assistant("old answer")
+            .user("new prompt")
+            .item(current_reasoning);
+        let body = scheme.build_request("gpt-5", &req, &cap_with_reasoning());
+        let encrypted: Vec<_> = body
+            .input
+            .iter()
+            .filter_map(|item| match item {
+                InputItem::Reasoning {
+                    encrypted_content, ..
+                } => encrypted_content.as_deref(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(encrypted, vec!["CURRENT_ENC"]);
+    }
+
+    #[test]
+    fn current_turn_reasoning_is_kept_across_function_call_loop() {
+        let scheme = OpenAIResponsesScheme::new();
+        let req = Request::new()
+            .user("run tool")
+            .item(Item::reasoning("plan").with_encrypted_content("ENC"))
+            .item(Item::tool_call("c1", "tool", "{}"))
+            .item(Item::tool_result("c1", "ok"));
+        let body = scheme.build_request("gpt-5", &req, &cap_with_reasoning());
+        assert!(matches!(body.input[1], InputItem::Reasoning { .. }));
+        assert!(matches!(body.input[2], InputItem::FunctionCall { .. }));
+        assert!(matches!(
+            body.input[3],
+            InputItem::FunctionCallOutput { .. }
+        ));
+    }
+
+    #[test]
+    fn reasoning_request_uses_current_turn_context() {
+        let scheme = OpenAIResponsesScheme::new();
+        let mut req = Request::new().user("hi");
+        req.config.reasoning = Some(ReasoningControl::Effort(ReasoningEffort::Medium));
+        let body = scheme.build_request("gpt-5", &req, &cap_with_reasoning());
+        let reasoning = body.reasoning.expect("reasoning should be set");
+        assert_eq!(reasoning.context, "current_turn");
+        let json = serde_json::to_value(reasoning).unwrap();
+        assert_eq!(json["context"], "current_turn");
+    }
+
+    #[test]
     fn reasoning_summary_field_is_always_serialized() {
         // Responses API は reasoning item に `summary` を必須で要求する。
         // summary が空でも wire 上に `summary: []` として残らないと、
@@ -508,6 +590,7 @@ mod tests {
         let body = scheme.build_request("gpt-5", &req, &cap_with_reasoning());
         let reasoning = body.reasoning.expect("reasoning should be set");
         assert_eq!(reasoning.effort.as_deref(), Some("high"));
+        assert_eq!(reasoning.context, "current_turn");
         assert_eq!(reasoning.summary, "auto");
     }
 

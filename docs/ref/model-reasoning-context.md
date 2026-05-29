@@ -85,7 +85,9 @@ reasoning トークンは各ターンの後に破棄される。次ターンに�
 1. `previous_response_id` パラメータで過去のレスポンスを参照
 2. `response.output` の全アイテムを次の `input` に手動で渡す
 
-ステートレス利用（`store=false`、ZDR組織）の場合は `include=["reasoning.encrypted_content"]` を指定すれば暗号化された推論コンテンツを受け取り、次リクエストに渡すことで推論を引き継げる。
+ステートレス利用（`store=false`、ZDR組織）の場合は `include=["reasoning.encrypted_content"]` を指定すれば暗号化された推論コンテンツを受け取り、次リクエストに渡すことで推論を引き継げる。ただし Insomnia では Responses リクエストに `reasoning.context="current_turn"` を明示し、直近の user message 以降の同一ターン内 reasoning item だけを `input` に残す。過去ターンの persisted `encrypted_content` は、履歴に残っていても次ターンへ盲目的には再送しない。
+
+同一ターン内の function-call loop では、`reasoning item → function_call → function_call_output → 次の Responses request` の連続性を保つため、直近 user message 以降の reasoning item は保持する。ToolResult は wire 上で user 側 item に見えるが、新しい user turn ではなく function-call chain の継続なので reasoning reset の境界にはしない。
 
 #### モデル世代差
 
@@ -185,7 +187,7 @@ Ollamaはローカル実行プラットフォームで、モデルごとに思�
 
 **ChatGPT を使うとき**
 - 新規実装は **Responses API** を選ぶ（Chat Completions は推論引き継ぎが弱い）
-- ZDR組織でも `reasoning.encrypted_content` で推論を引き継げる
+- ZDR組織でも `reasoning.encrypted_content` で推論を引き継げるが、Insomnia では `reasoning.context="current_turn"` に合わせて同一 user turn / function-call loop 内だけ再送する
 - raw reasoning の抽出を試みない（規約違反の可能性）
 
 **Ollama を使うとき**
