@@ -18,6 +18,8 @@ A long-running `gpt-5.5` session hit `context_length_exceeded` while the TUI sti
 
 The immediate trace showed the last successful usage event reported `input_tokens=197700`, while the failed request returned no usage. The request diagnostics also showed `reasoning.context="current_turn"` and a large request body (`items_len=2617`, `items_json_bytes=1775947`, `raw_json_bytes=1834360`, `wire_bytes=686528`). The same segment contained hundreds of persisted reasoning items with substantial `encrypted_content`.
 
+A cross-check against `/home/hare/ghq/github.com/openai/codex` found that upstream Codex does not assume every configured context window is directly usable. Its model metadata has both `context_window` and `max_context_window`, and `ModelInfo::resolve_context_window()` clamps user `model_context_window` by `max_context_window` when present. Upstream also carries a `GPT_5_BEDROCK_CONTEXT_WINDOW = 272_000`, which matches the observed successful-session ceiling much better than the locally configured 1M window. Insomnia needs to distinguish advertised/configured window, backend max window, and compact/request thresholds.
+
 Two implementation areas need to be corrected together so context safety checks match what the Responses backend actually receives:
 
 1. `openai_responses` request construction appears to project persisted `Item::Reasoning` entries, including `encrypted_content`, back into the next request without enforcing the intended `reasoning.context` / current-turn / function-call adjacency policy documented in `docs/ref/model-reasoning-context.md`.
@@ -29,6 +31,9 @@ Two implementation areas need to be corrected together so context safety checks 
   - Define exactly which reasoning items may be sent for `reasoning.context="current_turn"`.
   - Preserve the provider requirements for tool/function-call continuity.
   - Do not silently resend old reasoning `encrypted_content` outside the documented policy.
+- Reconcile Insomnia model metadata/config semantics with upstream Codex's `context_window` / `max_context_window` split.
+  - Support or document a backend max-window clamp so a user-visible 1M configured window cannot mask an effective backend limit such as 272k.
+  - Ensure TUI displayed context window, compact thresholds, and request safety checks all use consistent effective-window semantics.
 - Update request construction so persisted reasoning items are included only when required by the documented policy.
   - Add focused tests covering old reasoning items, current-turn reasoning, function-call adjacency, and encrypted reasoning content.
 - Update Pod context safety accounting so request-threshold / pre-request checks include in-flight `UsageTracker` records from the current run, not only persisted session-log usage history.
