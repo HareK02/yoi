@@ -65,12 +65,19 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // Input content starts after the prompt (`> ` or `: `), so the width
     // available for wrapping is two columns narrower than the frame.
     let input_content_width = area.width.saturating_sub(2).max(1);
-    let input_render = if app.is_command_mode() {
+    let mut input_render = if app.is_command_mode() {
         app.command_input.render(input_content_width)
     } else {
         app.input.render(input_content_width)
     };
     let input_height = input_area_height(&input_render, area.height);
+    if app.is_command_mode() {
+        app.command_input
+            .apply_cursor_viewport(&mut input_render, input_height);
+    } else {
+        app.input
+            .apply_cursor_viewport(&mut input_render, input_height);
+    }
     let mini_view_h = task_mini_view_height(&app.task_store);
     // One blank row separates the history tail from the mini-view so
     // the latest message doesn't visually crash into the task summary.
@@ -1284,7 +1291,12 @@ fn draw_input(frame: &mut Frame, app: &App, render: &crate::input::InputRender, 
     };
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(render.lines.len());
     for (i, src) in render.lines.iter().enumerate() {
-        let prefix = if i == 0 { prompt } else { continuation };
+        let absolute_row = render.viewport_start_row as usize + i;
+        let prefix = if absolute_row == 0 {
+            prompt
+        } else {
+            continuation
+        };
         let mut spans = vec![Span::styled(prefix.to_owned(), prompt_style)];
         spans.extend(src.spans.iter().cloned());
         lines.push(Line::from(spans));

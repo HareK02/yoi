@@ -692,8 +692,10 @@ fn multi_pod_layout(area: Rect, input_height: u16) -> MultiPodLayoutState {
 fn draw(frame: &mut Frame<'_>, app: &mut MultiPodApp) {
     let area = frame.area();
     let input_content_width = area.width.saturating_sub(2).max(1);
-    let input_render = app.input.render(input_content_width);
+    let mut input_render = app.input.render(input_content_width);
     let input_height = input_area_height(&input_render, area.height);
+    app.input
+        .apply_cursor_viewport(&mut input_render, input_height);
     let layout = multi_pod_layout(area, input_height);
 
     draw_title(frame, layout.title);
@@ -873,7 +875,8 @@ fn draw_target_status(frame: &mut Frame<'_>, app: &MultiPodApp, area: Rect) {
 fn draw_input(frame: &mut Frame<'_>, render: &crate::input::InputRender, area: Rect) {
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(render.lines.len());
     for (i, src) in render.lines.iter().enumerate() {
-        let prefix = if i == 0 { "> " } else { "  " };
+        let absolute_row = render.viewport_start_row as usize + i;
+        let prefix = if absolute_row == 0 { "> " } else { "  " };
         let mut spans = vec![Span::styled(prefix, Style::default().fg(Color::DarkGray))];
         spans.extend(src.spans.iter().cloned());
         lines.push(Line::from(spans));

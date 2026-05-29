@@ -144,6 +144,8 @@ pub struct InputBuffer {
     atoms: Vec<Atom>,
     /// Insertion point in `0..=atoms.len()`.
     cursor: usize,
+    /// Top wrapped row of the visible composer viewport.
+    scroll_offset: usize,
     /// Monotonic counter reused across the TUI process lifetime.
     next_paste_id: u32,
 }
@@ -153,6 +155,7 @@ impl Default for InputBuffer {
         Self {
             atoms: Vec::new(),
             cursor: 0,
+            scroll_offset: 0,
             next_paste_id: 1,
         }
     }
@@ -166,6 +169,7 @@ impl InputBuffer {
     pub fn clear(&mut self) {
         self.atoms.clear();
         self.cursor = 0;
+        self.scroll_offset = 0;
     }
 
     pub fn is_empty(&self) -> bool {
@@ -697,7 +701,26 @@ impl InputBuffer {
             lines,
             cursor_row,
             cursor_col,
+            viewport_start_row: 0,
         }
+    }
+
+    /// Clip a full render to `visible_height` rows, updating the stored
+    /// vertical scroll offset just enough to keep the cursor row visible.
+    pub fn apply_cursor_viewport(&mut self, render: &mut InputRender, visible_height: u16) {
+        let height = visible_height.max(1) as usize;
+        let total_rows = render.lines.len().max(1);
+        let max_offset = total_rows.saturating_sub(height);
+        self.scroll_offset = self.scroll_offset.min(max_offset);
+
+        let cursor_row = render.cursor_row as usize;
+        if cursor_row < self.scroll_offset {
+            self.scroll_offset = cursor_row;
+        } else if cursor_row >= self.scroll_offset.saturating_add(height) {
+            self.scroll_offset = cursor_row.saturating_add(1).saturating_sub(height);
+        }
+        self.scroll_offset = self.scroll_offset.min(max_offset);
+        render.apply_viewport(self.scroll_offset, height);
     }
 }
 
@@ -746,6 +769,119 @@ pub struct InputRender {
     pub lines: Vec<Line<'static>>,
     pub cursor_row: u16,
     pub cursor_col: u16,
+    /// First wrapped row included in `lines` after viewport clipping.
+    pub viewport_start_row: u16,
+}
+
+impl InputRender {
+    fn apply_viewport(&mut self, offset: usize, height: usize) {
+        let offset = offset.min(self.lines.len().saturating_sub(1));
+        self.viewport_start_row = offset as u16;
+        self.cursor_row = self.cursor_row.saturating_sub(self.viewport_start_row);
+        let lines = std::mem::take(&mut self.lines);
+        self.lines = lines.into_iter().skip(offset).take(height).collect();
+        if self.lines.is_empty() {
+            self.lines.push(Line::raw(""));
+        }
+    }
+}
+
+#[cfg(test)]
+mod render_viewport_tests {
+    use super::*;
+
+    fn buf_from(text: &str) -> InputBuffer {
+        let mut buf = InputBuffer::new();
+        for c in text.chars() {
+            buf.insert_char(c);
+        }
+        buf
+    }
+
+    fn render_lines(buf: &mut InputBuffer, width: u16, height: u16) -> Vec<String> {
+        let mut render = buf.render(width);
+        buf.apply_cursor_viewport(&mut render, height);
+        render
+            .lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn short_input_rendering_stays_unscrolled() {
+        let mut buf = buf_from("one\ntwo");
+        let mut render = buf.render(20);
+        buf.apply_cursor_viewport(&mut render, 5);
+
+        assert_eq!(buf.scroll_offset, 0);
+        assert_eq!(render.viewport_start_row, 0);
+        assert_eq!(render.cursor_row, 1);
+        assert_eq!(render.cursor_col, 3);
+        assert_eq!(render_lines(&mut buf, 20, 5), ["one", "two"]);
+    }
+
+    #[test]
+    fn input_viewport_follows_cursor_at_bottom() {
+        let mut buf = buf_from("0\n1\n2\n3\n4");
+        let mut render = buf.render(20);
+        buf.apply_cursor_viewport(&mut render, 3);
+
+        assert_eq!(buf.scroll_offset, 2);
+        assert_eq!(render.viewport_start_row, 2);
+        assert_eq!(render.cursor_row, 2);
+        assert_eq!(render.cursor_col, 1);
+        assert_eq!(render_lines(&mut buf, 20, 3), ["2", "3", "4"]);
+    }
+
+    #[test]
+    fn input_viewport_scrolls_when_cursor_moves_above_or_below() {
+        let mut buf = buf_from("0\n1\n2\n3\n4");
+        assert_eq!(render_lines(&mut buf, 20, 3), ["2", "3", "4"]);
+        assert_eq!(buf.scroll_offset, 2);
+
+        buf.move_up();
+        assert_eq!(render_lines(&mut buf, 20, 3), ["2", "3", "4"]);
+        assert_eq!(buf.scroll_offset, 2);
+
+        buf.move_up();
+        assert_eq!(render_lines(&mut buf, 20, 3), ["2", "3", "4"]);
+        assert_eq!(buf.scroll_offset, 2);
+
+        buf.move_up();
+        assert_eq!(render_lines(&mut buf, 20, 3), ["1", "2", "3"]);
+        assert_eq!(buf.scroll_offset, 1);
+
+        buf.move_down();
+        assert_eq!(render_lines(&mut buf, 20, 3), ["1", "2", "3"]);
+        assert_eq!(buf.scroll_offset, 1);
+
+        buf.move_down();
+        assert_eq!(render_lines(&mut buf, 20, 3), ["1", "2", "3"]);
+        assert_eq!(buf.scroll_offset, 1);
+
+        buf.move_down();
+        assert_eq!(render_lines(&mut buf, 20, 3), ["2", "3", "4"]);
+        assert_eq!(buf.scroll_offset, 2);
+    }
+
+    #[test]
+    fn input_viewport_clamps_after_line_deletion() {
+        let mut buf = buf_from("0\n1\n2\n3\n4\n5");
+        assert_eq!(render_lines(&mut buf, 20, 3), ["3", "4", "5"]);
+        assert_eq!(buf.scroll_offset, 3);
+
+        for _ in 0..6 {
+            buf.delete_before();
+        }
+        assert_eq!(render_lines(&mut buf, 20, 3), ["0", "1", "2"]);
+        assert_eq!(buf.scroll_offset, 0);
+    }
 }
 
 #[cfg(test)]
