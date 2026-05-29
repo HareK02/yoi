@@ -62,9 +62,6 @@ pub(crate) struct ResponsesRequest {
 pub(crate) struct ReasoningConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
-    /// API 側の reasoning retention policy。Insomnia はこの値を送るが、
-    /// persisted reasoning item の client-side filtering はしない。
-    pub context: &'static str,
     /// summary の出力制御。`"auto"` 固定で summary_text を受け取る。
     pub summary: &'static str,
 }
@@ -196,7 +193,6 @@ impl OpenAIResponsesScheme {
                     ReasoningControl::Effort(effort) => Some(effort.as_str().to_string()),
                     ReasoningControl::BudgetTokens(_) => None,
                 },
-                context: "current_turn",
                 summary: "auto",
             })
             .filter(|reasoning| reasoning.effort.is_some());
@@ -507,7 +503,7 @@ mod tests {
     }
 
     #[test]
-    fn current_turn_reasoning_is_kept_across_function_call_loop() {
+    fn reasoning_is_kept_across_function_call_loop() {
         let scheme = OpenAIResponsesScheme::new();
         let req = Request::new()
             .user("run tool")
@@ -521,18 +517,6 @@ mod tests {
             body.input[3],
             InputItem::FunctionCallOutput { .. }
         ));
-    }
-
-    #[test]
-    fn reasoning_request_uses_current_turn_context() {
-        let scheme = OpenAIResponsesScheme::new();
-        let mut req = Request::new().user("hi");
-        req.config.reasoning = Some(ReasoningControl::Effort(ReasoningEffort::Medium));
-        let body = scheme.build_request("gpt-5", &req, &cap_with_reasoning());
-        let reasoning = body.reasoning.expect("reasoning should be set");
-        assert_eq!(reasoning.context, "current_turn");
-        let json = serde_json::to_value(reasoning).unwrap();
-        assert_eq!(json["context"], "current_turn");
     }
 
     #[test]
@@ -566,8 +550,12 @@ mod tests {
         let body = scheme.build_request("gpt-5", &req, &cap_with_reasoning());
         let reasoning = body.reasoning.expect("reasoning should be set");
         assert_eq!(reasoning.effort.as_deref(), Some("high"));
-        assert_eq!(reasoning.context, "current_turn");
         assert_eq!(reasoning.summary, "auto");
+        let json = serde_json::to_value(reasoning).unwrap();
+        assert!(
+            json.get("context").is_none(),
+            "reasoning.context must not be serialized, got: {json}"
+        );
     }
 
     #[test]

@@ -289,11 +289,6 @@ fn request_body_shape_payload(body: &Value) -> Value {
             json!(reasoning_encrypted_content_bytes),
         );
     }
-    let reasoning_context = body
-        .get("reasoning")
-        .and_then(|reasoning| reasoning.get("context"))
-        .and_then(Value::as_str);
-    map.insert("reasoning_context".to_string(), json!(reasoning_context));
     Value::Object(map)
 }
 
@@ -683,7 +678,7 @@ mod tests {
     #[test]
     fn request_body_shape_counts_reasoning_encrypted_content() {
         let payload = request_body_shape_payload(&json!({
-            "reasoning": { "context": "current_turn" },
+            "reasoning": { "summary": "auto" },
             "input": [
                 { "type": "message", "role": "user", "content": [] },
                 { "type": "reasoning", "encrypted_content": "abc", "summary": [] },
@@ -694,7 +689,6 @@ mod tests {
         assert_eq!(payload["reasoning_items"], 2);
         assert_eq!(payload["reasoning_encrypted_content_count"], 2);
         assert_eq!(payload["reasoning_encrypted_content_bytes"], 8);
-        assert_eq!(payload["reasoning_context"], "current_turn");
         assert!(payload["items_json_bytes"].as_u64().unwrap() > 0);
     }
 
