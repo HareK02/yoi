@@ -972,12 +972,20 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Option<Method> {
             app.refresh_completion()
         }
         KeyCode::Up => {
-            app.move_cursor_up();
-            app.refresh_completion()
+            if app.can_browse_input_history_older() && app.browse_input_history_older() {
+                app.refresh_completion()
+            } else {
+                app.move_cursor_up();
+                app.refresh_completion()
+            }
         }
         KeyCode::Down => {
-            app.move_cursor_down();
-            app.refresh_completion()
+            if app.can_browse_input_history_newer() && app.browse_input_history_newer() {
+                app.refresh_completion()
+            } else {
+                app.move_cursor_down();
+                app.refresh_completion()
+            }
         }
         KeyCode::Home => {
             app.move_cursor_home();
@@ -1921,6 +1929,70 @@ mod tests {
 
         assert!(!app.is_command_mode());
         assert_eq!(input_text(&app), "hello");
+    }
+
+    #[test]
+    fn up_at_start_with_empty_history_preserves_draft_without_browsing() {
+        let mut app = App::new("agent".to_string());
+        type_keys(&mut app, "draft");
+        app.move_cursor_start();
+
+        assert!(handle_key(&mut app, key(KeyCode::Up)).is_none());
+
+        assert_eq!(input_text(&app), "draft");
+        assert!(!app.input_history_is_browsing());
+    }
+
+    #[test]
+    fn up_from_empty_composer_recalls_history_and_down_restores_empty_draft() {
+        let mut app = App::new("agent".to_string());
+        type_keys(&mut app, "first");
+        assert!(matches!(
+            handle_key(&mut app, key(KeyCode::Enter)),
+            Some(Method::Run { .. })
+        ));
+        type_keys(&mut app, "second");
+        assert!(matches!(
+            handle_key(&mut app, key(KeyCode::Enter)),
+            Some(Method::Run { .. })
+        ));
+
+        assert_eq!(input_text(&app), "");
+        assert!(handle_key(&mut app, key(KeyCode::Up)).is_none());
+        assert_eq!(input_text(&app), "second");
+        assert!(handle_key(&mut app, key(KeyCode::Up)).is_none());
+        assert_eq!(input_text(&app), "first");
+        assert!(handle_key(&mut app, key(KeyCode::Down)).is_none());
+        assert_eq!(input_text(&app), "second");
+        assert!(handle_key(&mut app, key(KeyCode::Down)).is_none());
+        assert_eq!(input_text(&app), "");
+    }
+
+    #[test]
+    fn up_inside_multiline_preserves_existing_cursor_up_behavior() {
+        let mut app = App::new("agent".to_string());
+        type_keys(&mut app, "ab\ncd");
+
+        assert!(handle_key(&mut app, key(KeyCode::Up)).is_none());
+        assert!(handle_key(&mut app, key(KeyCode::Char('X'))).is_none());
+
+        assert_eq!(input_text(&app), "abX\ncd");
+    }
+
+    #[test]
+    fn up_at_start_of_multiline_recalls_history() {
+        let mut app = App::new("agent".to_string());
+        type_keys(&mut app, "sent");
+        assert!(matches!(
+            handle_key(&mut app, key(KeyCode::Enter)),
+            Some(Method::Run { .. })
+        ));
+        type_keys(&mut app, "draft\nbody");
+        app.move_cursor_start();
+
+        assert!(handle_key(&mut app, key(KeyCode::Up)).is_none());
+
+        assert_eq!(input_text(&app), "sent");
     }
 
     fn enter_command_mode(app: &mut App) {
