@@ -59,7 +59,7 @@ pub use segment_log::{
     collect_state,
 };
 pub use store::{Store, StoreError};
-pub use system_item::{SystemItem, render_pod_event};
+pub use system_item::{SystemItem, SystemReminder, SystemReminderSource, render_pod_event};
 
 /// Session identifier — the fork-tree root. UUID v7 (time-ordered).
 ///

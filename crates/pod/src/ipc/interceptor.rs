@@ -22,7 +22,7 @@ use tracing::info;
 use tracing::warn;
 
 use crate::compact::state::CompactState;
-use session_store::SystemItem;
+use session_store::{SystemItem, SystemReminder};
 use tools::{TaskEntry, TaskStatus, TaskStore};
 
 use crate::hook::{
@@ -198,9 +198,10 @@ impl PodInterceptor {
         }
 
         self.task_reminder_state.note_reminder();
-        Some(SystemItem::TaskReminder {
-            body: render_task_reminder(&active_tasks),
-        })
+        Some(
+            SystemReminder::task_inactivity(render_task_reminder_body(&active_tasks))
+                .into_system_item(),
+        )
     }
 }
 
@@ -208,9 +209,9 @@ fn is_task_management_tool(name: &str) -> bool {
     TASK_MANAGEMENT_TOOL_NAMES.contains(&name)
 }
 
-fn render_task_reminder(active_tasks: &[TaskEntry]) -> String {
+fn render_task_reminder_body(active_tasks: &[TaskEntry]) -> String {
     let mut body = String::from(
-        "<system-reminder>\nActive session tasks are still open. If progress changed, call TaskUpdate.\n",
+        "Active session tasks are still open. If progress changed, call TaskUpdate.\n",
     );
     for task in active_tasks {
         body.push_str(&format!(
@@ -218,8 +219,7 @@ fn render_task_reminder(active_tasks: &[TaskEntry]) -> String {
             task.taskid, task.status, task.subject
         ));
     }
-    body.push_str("</system-reminder>");
-    body
+    body.trim_end_matches('\n').to_string()
 }
 
 #[async_trait]
@@ -430,6 +430,7 @@ mod tests {
 
     use super::*;
     use crate::hook::{Hook, HookRegistryBuilder, PreLlmRequest};
+    use session_store::SystemReminderSource;
 
     struct CountingHook(Arc<AtomicUsize>);
 
@@ -666,12 +667,46 @@ mod tests {
         let items = interceptor.pending_history_appends().await;
         assert_eq!(items.len(), 1);
         let body = items[0].as_text().unwrap_or_default();
-        assert!(body.contains("<system-reminder>"));
-        assert!(body.contains("</system-reminder>"));
+        assert_eq!(body.matches("<system-reminder>").count(), 1);
+        assert_eq!(body.matches("</system-reminder>").count(), 1);
         assert!(body.contains("taskid 1"));
         assert!(body.contains("pending"));
         assert!(body.contains("keep going"));
         assert!(!body.contains("long task description"));
+    }
+
+    #[test]
+    fn task_reminder_system_item_retains_source() {
+        let task_store = TaskStore::new();
+        task_store.create("typed".into(), String::new());
+        let interceptor =
+            interceptor_for_task_reminders(task_store, Arc::new(TaskReminderState::new()));
+
+        for _ in 0..TASK_REMINDER_REQUEST_THRESHOLD - 1 {
+            assert!(interceptor.task_reminder_system_item().is_none());
+        }
+        let item = interceptor.task_reminder_system_item().unwrap();
+        match item {
+            SystemItem::TaskReminder { source, body } => {
+                assert_eq!(source, SystemReminderSource::TaskInactivity);
+                assert_eq!(body.matches("<system-reminder>").count(), 1);
+                assert_eq!(body.matches("</system-reminder>").count(), 1);
+                assert!(body.contains("typed"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn render_task_reminder_body_is_unwrapped_for_system_reminder_helper() {
+        let task_store = TaskStore::new();
+        let task = task_store.create("body".into(), String::new());
+        let body = render_task_reminder_body(&[task]);
+
+        assert!(!body.contains("<system-reminder>"));
+        assert!(!body.contains("</system-reminder>"));
+        assert!(body.contains("TaskUpdate"));
+        assert!(body.contains("taskid 1"));
     }
 
     #[test]
@@ -795,6 +830,29 @@ mod tests {
 
         assert!(matches!(action, PreRequestAction::Continue));
         assert_eq!(ctx.len(), 1, "pre_llm_request must not inject reminders");
+    }
+
+    #[tokio::test]
+    async fn pre_llm_request_does_not_touch_task_reminder_lane() {
+        let task_store = TaskStore::new();
+        task_store.create("lane".into(), String::new());
+        let interceptor =
+            interceptor_for_task_reminders(task_store, Arc::new(TaskReminderState::new()));
+        let mut ctx = vec![Item::user_message("hi")];
+
+        for _ in 0..TASK_REMINDER_REQUEST_THRESHOLD - 1 {
+            assert!(interceptor.pending_history_appends().await.is_empty());
+        }
+        let action = interceptor.pre_llm_request(&mut ctx).await;
+
+        assert!(matches!(action, PreRequestAction::Continue));
+        assert_eq!(ctx.len(), 1, "pre_llm_request must not inject reminders");
+        let pending = interceptor.pending_history_appends().await;
+        assert_eq!(
+            pending.len(),
+            1,
+            "reminders stay in pending_history_appends"
+        );
     }
 
     #[tokio::test]
