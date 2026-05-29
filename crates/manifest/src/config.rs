@@ -18,7 +18,7 @@ use crate::model::{AuthRef, ModelManifest, ReasoningControl};
 use crate::{
     CompactionConfig, FileUploadLimits, MemoryConfig, PodManifest, PodMeta, ScopeConfig,
     SessionConfig, SkillsConfig, ToolOutputLimits, ToolPermissionConfig, ToolPermissionRule,
-    WorkerManifest,
+    WebConfig, WorkerManifest,
 };
 
 /// Partial-form Pod manifest. Every field is optional; one or more
@@ -46,6 +46,9 @@ pub struct PodManifestConfig {
     pub permissions: Option<PermissionConfigPartial>,
     #[serde(default)]
     pub compaction: Option<CompactionConfigPartial>,
+    /// First-class web tool opt-in. See [`WebConfig`].
+    #[serde(default)]
+    pub web: Option<WebConfig>,
     /// Memory subsystem opt-in. See [`MemoryConfig`].
     #[serde(default)]
     pub memory: Option<MemoryConfig>,
@@ -296,6 +299,7 @@ impl PodManifestConfig {
                 upper.compaction,
                 CompactionConfigPartial::merge,
             ),
+            web: merge_option(self.web, upper.web, WebConfig::merge),
             memory: merge_option(self.memory, upper.memory, MemoryConfig::merge),
             skills: merge_option(self.skills, upper.skills, SkillsConfig::merge),
         }
@@ -306,6 +310,50 @@ impl SkillsConfig {
     fn merge(mut self, upper: Self) -> Self {
         self.directories.extend(upper.directories);
         self
+    }
+}
+
+impl WebConfig {
+    fn merge(self, upper: Self) -> Self {
+        Self {
+            enabled: upper.enabled.or(self.enabled),
+            allow_private_addresses: upper
+                .allow_private_addresses
+                .or(self.allow_private_addresses),
+            search: merge_option(self.search, upper.search, crate::WebSearchConfig::merge),
+            fetch: merge_option(self.fetch, upper.fetch, crate::WebFetchConfig::merge),
+        }
+    }
+}
+
+impl crate::WebSearchConfig {
+    fn merge(self, upper: Self) -> Self {
+        Self {
+            enabled: upper.enabled.or(self.enabled),
+            provider: upper.provider.or(self.provider),
+            api_key_env: upper.api_key_env.or(self.api_key_env),
+            timeout_secs: upper.timeout_secs.or(self.timeout_secs),
+            base_url: upper.base_url.or(self.base_url),
+            country: upper.country.or(self.country),
+            search_lang: upper.search_lang.or(self.search_lang),
+            ui_lang: upper.ui_lang.or(self.ui_lang),
+            safesearch: upper.safesearch.or(self.safesearch),
+        }
+    }
+}
+
+impl crate::WebFetchConfig {
+    fn merge(self, upper: Self) -> Self {
+        Self {
+            enabled: upper.enabled.or(self.enabled),
+            timeout_secs: upper.timeout_secs.or(self.timeout_secs),
+            redirect_limit: upper.redirect_limit.or(self.redirect_limit),
+            max_response_bytes: upper.max_response_bytes.or(self.max_response_bytes),
+            max_output_bytes: upper.max_output_bytes.or(self.max_output_bytes),
+            allow_private_addresses: upper
+                .allow_private_addresses
+                .or(self.allow_private_addresses),
+        }
     }
 }
 
@@ -625,6 +673,7 @@ impl TryFrom<PodManifestConfig> for PodManifest {
             session,
             permissions,
             compaction,
+            web: cfg.web,
             memory: cfg.memory,
             skills: cfg.skills,
         })
@@ -671,6 +720,7 @@ mod tests {
             permissions: None,
             session: None,
             compaction: None,
+            web: None,
             memory: None,
             skills: None,
         }
@@ -1036,11 +1086,26 @@ mod tests {
                 prune_protected_tokens: Some(5_000),
                 ..Default::default()
             }),
+            web: Some(WebConfig {
+                search: Some(crate::WebSearchConfig {
+                    api_key_env: Some("LOWER_BRAVE_KEY".into()),
+                    timeout_secs: Some(12),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
             ..Default::default()
         };
         let upper = PodManifestConfig {
             compaction: Some(CompactionConfigPartial {
                 threshold: Some(80_000),
+                ..Default::default()
+            }),
+            web: Some(WebConfig {
+                search: Some(crate::WebSearchConfig {
+                    timeout_secs: Some(3),
+                    ..Default::default()
+                }),
                 ..Default::default()
             }),
             ..Default::default()
@@ -1050,6 +1115,9 @@ mod tests {
         assert_eq!(c.threshold, Some(80_000));
         // field from lower retained when upper has None
         assert_eq!(c.prune_protected_tokens, Some(5_000));
+        let search = merged.web.unwrap().search.unwrap();
+        assert_eq!(search.timeout_secs, Some(3));
+        assert_eq!(search.api_key_env.as_deref(), Some("LOWER_BRAVE_KEY"));
     }
 
     #[test]

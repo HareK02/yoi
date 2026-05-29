@@ -178,6 +178,20 @@ tool = "Write"
 pattern = "*.env"
 action = "deny"
 
+[web]
+enabled = true
+
+[web.search]
+provider = "brave"
+api_key_env = "BRAVE_SEARCH_API_KEY"
+timeout_secs = 15
+
+[web.fetch]
+timeout_secs = 20
+redirect_limit = 5
+max_response_bytes = 2097152
+max_output_bytes = 65536
+
 [compaction]
 prune_protected_tokens = 8000
 prune_min_savings = 4096
@@ -220,6 +234,30 @@ scheme 側が吸収する。
 生成設定は provider 別の値域検証を行わない。型が TOML と合わない場合は manifest
 parse error になるが、provider が受け付けない値や組み合わせは API 応答で検出する。
 
+## `[web]` 設定
+
+`WebSearch` / `WebFetch` は通常の built-in function tool として登録されるが、manifest で明示的に有効化されるまでネットワークアクセスしない。無効または未設定の場合、tool call は「設定されていない」旨の明示的なエラーを返す。
+
+```toml
+[web]
+enabled = true
+
+[web.search]
+provider = "brave"
+api_key_env = "BRAVE_SEARCH_API_KEY" # API key は env 参照に置き、manifest に raw secret を書かない
+timeout_secs = 15
+
+[web.fetch]
+timeout_secs = 20
+redirect_limit = 5
+max_response_bytes = 2097152
+max_output_bytes = 65536
+```
+
+`WebSearch` の最初の provider は Brave Search API（`https://api.search.brave.com/res/v1/web/search`）で、入力は `query` と任意の `limit` / `offset`。Brave の制約に合わせて `query` は 400 文字 / 50 words まで、`limit` は 1-20、`offset` は 0-9 に制限される。`timeout_secs` を省略した場合は安全な既定値が使われ、provider response は固定上限内で読み込まれる。
+
+`WebFetch` は http/https URL のみを fetch し、timeout・redirect・response/output byte limit を適用する。localhost / private / link-local などの host/IP は fetch 前と各 redirect で拒否される。テストや明示的に信頼した環境では `[web] allow_private_addresses = true` または `[web.fetch] allow_private_addresses = true` を指定できる。
+
 ## `[permissions]` 設定
 
 `[permissions]` が無い場合、ツール permission 層は無効で従来通り実行する。`[permissions]` を書く場合は `default_action = "allow" | "deny" | "ask"` が必須で、`[[permissions.rule]]` は宣言順に最初に一致した rule が採用される。一致しなければ `default_action` を使う。
@@ -234,7 +272,7 @@ pattern = "rm *"
 action = "deny"
 ```
 
-`tool` は実行時に登録されているツール名（`Bash`, `Read`, `Write`, `Edit`, `Glob`, `Grep` 等）に対して大小文字を無視して照合する。`pattern` は built-in tool では主に `command` / `file_path` / `path` / `pattern` 引数に対する `*` / `?` ワイルドカードとして評価される。
+`tool` は実行時に登録されているツール名（`Bash`, `Read`, `Write`, `Edit`, `Glob`, `Grep`, `WebSearch`, `WebFetch` 等）に対して大小文字を無視して照合する。`pattern` は built-in tool では主に `command` / `file_path` / `path` / `pattern` / `query` / `url` 引数に対する `*` / `?` ワイルドカードとして評価される。
 
 `allow` は通常実行、`deny` はその tool call を実行せず `is_error = true` の synthetic tool result を履歴へ追加してターンを継続する。`ask` は型として受け付けるが、承認 protocol は未実装のため現在は headless に待機せず fail-closed（synthetic error result）になる。
 

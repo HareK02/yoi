@@ -28,6 +28,7 @@ mod edit;
 mod glob;
 mod grep;
 mod read;
+mod web;
 mod write;
 
 pub use bash::bash_tool;
@@ -39,6 +40,7 @@ pub use read::read_tool;
 pub use scoped_fs::ScopedFs;
 pub use task::{TaskEntry, TaskSnapshot, TaskStatus, TaskStore, task_tools};
 pub use tracker::Tracker;
+pub use web::{web_fetch_tool, web_search_tool};
 pub use write::write_tool;
 
 /// Register all builtin tools, wiring them to a shared `ScopedFs`
@@ -57,6 +59,7 @@ pub fn builtin_tools(
     tracker: Tracker,
     task_store: TaskStore,
     bash_output_dir: std::path::PathBuf,
+    web_config: Option<manifest::WebConfig>,
 ) -> Vec<llm_worker::tool::ToolDefinition> {
     let mut defs = vec![
         read_tool(fs.clone(), tracker.clone()),
@@ -65,6 +68,8 @@ pub fn builtin_tools(
         glob_tool(fs.clone()),
         grep_tool(fs.clone()),
         bash_tool(fs, bash_output_dir),
+        web_search_tool(web::WebTools::new(web_config.clone())),
+        web_fetch_tool(web::WebTools::new(web_config)),
     ];
     defs.extend(task_tools(task_store));
     defs

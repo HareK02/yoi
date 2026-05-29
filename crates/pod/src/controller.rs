@@ -498,6 +498,7 @@ where
     let session_id_for_usage = pod.segment_id().to_string();
     let scope_change_sink = pod.scope_change_sink();
     let memory_config = pod.manifest().memory.clone();
+    let web_config = pod.manifest().web.clone();
     let spawner_name = pod.manifest().pod.name.clone();
     let spawner_model = pod.manifest().model.clone();
     let pod_store = pod.store().clone();
@@ -521,6 +522,7 @@ where
         tracker.clone(),
         task_store,
         bash_output_dir,
+        web_config,
     ));
 
     // Memory subsystem opt-in. When `[memory]` is present in the
