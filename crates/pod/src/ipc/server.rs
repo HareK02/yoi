@@ -1,4 +1,5 @@
 use std::io;
+use std::io::ErrorKind;
 use std::path::PathBuf;
 
 use protocol::stream::{JsonLineReader, JsonLineWriter};
@@ -55,6 +56,16 @@ impl Drop for SocketServer {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
     }
+}
+
+fn is_peer_disconnect_read_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::BrokenPipe
+            | ErrorKind::UnexpectedEof
+    )
 }
 
 async fn handle_connection(stream: tokio::net::UnixStream, handle: PodHandle) {
@@ -206,14 +217,48 @@ async fn handle_connection(stream: tokio::net::UnixStream, handle: PodHandle) {
                         let _ = handle.send(method).await;
                     }
                     Ok(None) => break,
+                    Err(e) if is_peer_disconnect_read_error(&e) => break,
                     Err(e) => {
-                        let _ = handle.send_event(Event::Error {
-                            code: protocol::ErrorCode::Internal,
-                            message: format!("invalid method: {e}"),
-                        });
+                        if writer
+                            .write(&Event::Error {
+                                code: protocol::ErrorCode::InvalidRequest,
+                                message: format!("invalid method: {e}"),
+                            })
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
                     }
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn peer_disconnect_read_errors_are_connection_close() {
+        for kind in [
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::BrokenPipe,
+            ErrorKind::UnexpectedEof,
+        ] {
+            let error = io::Error::new(kind, "peer disconnected");
+            assert!(
+                is_peer_disconnect_read_error(&error),
+                "{kind:?} should be treated as a normal peer disconnect"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_data_is_not_peer_disconnect() {
+        let error = io::Error::new(ErrorKind::InvalidData, "malformed method");
+        assert!(!is_peer_disconnect_read_error(&error));
     }
 }
