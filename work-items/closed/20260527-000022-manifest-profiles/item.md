@@ -2,12 +2,12 @@
 id: 20260527-000022-manifest-profiles
 slug: manifest-profiles
 title: Nix profile entrypoints that resolve to portable Pod manifests
-status: open
+status: closed
 kind: feature
 priority: P2
 labels: [manifest, profiles, nix, tui]
 created_at: 2026-05-27T00:00:22Z
-updated_at: 2026-05-29T17:44:47Z
+updated_at: 2026-05-29T17:45:59Z
 assignee: null
 legacy_ticket: null
 ---
