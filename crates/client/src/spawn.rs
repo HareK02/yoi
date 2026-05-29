@@ -27,11 +27,11 @@ pub struct SpawnConfig {
     /// (`manifest::paths::pod_runtime_dir`) の解決と、ready 行に乗る
     /// 名前との突き合わせに使う。
     pub pod_name: String,
-    /// Optional Nix profile path. When present the child is launched with
+    /// Optional Nix profile selector. When present the child is launched with
     /// `--profile` and the TOML overlay is not passed; the Pod name is supplied
     /// through `--profile-pod-name` so profile evaluation stays separate from
     /// manifest layer merging and from `--pod` restore semantics.
-    pub profile_path: Option<PathBuf>,
+    pub profile: Option<String>,
     /// `--overlay` で pod に渡す TOML 文字列。
     pub overlay_toml: String,
     /// pod の current_dir。
@@ -117,16 +117,16 @@ where
         .stdout(Stdio::null())
         .stderr(Stdio::from(stderr_file))
         .process_group(0);
-    if let Some(profile_path) = &config.profile_path {
+    if let Some(profile) = &config.profile {
         command
             .arg("--profile")
-            .arg(profile_path)
+            .arg(profile)
             .arg("--profile-pod-name")
             .arg(&config.pod_name);
     } else {
         command.arg("--overlay").arg(&config.overlay_toml);
     }
-    if config.resume_by_pod_name && config.profile_path.is_none() {
+    if config.resume_by_pod_name && config.profile.is_none() {
         command.arg("--pod").arg(&config.pod_name);
     }
     if let Some(id) = config.resume_from {

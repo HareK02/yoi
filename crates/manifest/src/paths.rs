@@ -33,6 +33,9 @@ use std::path::PathBuf;
 /// auto-discovered user manifest path.
 pub const USER_MANIFEST_ENV: &str = "INSOMNIA_USER_MANIFEST";
 
+/// Environment variable that points at installed project resources.
+pub const RESOURCE_DIR_ENV: &str = "INSOMNIA_RESOURCE_DIR";
+
 /// 設定ディレクトリ。`manifest.toml`, `providers.toml`, `models.toml`,
 /// `prompts/` などが置かれる。
 pub fn config_dir() -> Option<PathBuf> {
@@ -114,6 +117,32 @@ pub fn user_prompts_dir() -> Option<PathBuf> {
     Some(config_dir()?.join("prompts"))
 }
 
+/// Root resource directory used for bundled prompts/Nix support files.
+pub fn resource_dir() -> Option<PathBuf> {
+    if let Some(p) = env_path(RESOURCE_DIR_ENV) {
+        return Some(p);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(prefix) = exe.parent().and_then(|bin| bin.parent()) {
+            let installed = prefix.join("share").join("insomnia").join("resources");
+            if installed.exists() {
+                return Some(installed);
+            }
+        }
+    }
+    Some(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("resources"),
+    )
+}
+
+/// Bundled profile registry directory. Missing directories are treated as an
+/// empty builtin registry by discovery.
+pub fn builtin_profiles_dir() -> Option<PathBuf> {
+    Some(resource_dir()?.join("nix").join("profiles"))
+}
+
 /// `<config_dir>/prompts.toml` — user prompt pack。
 pub fn user_pack_file() -> Option<PathBuf> {
     Some(config_dir()?.join("prompts.toml"))
@@ -192,6 +221,7 @@ mod tests {
                 "INSOMNIA_DATA_DIR",
                 "INSOMNIA_RUNTIME_DIR",
                 "INSOMNIA_USER_MANIFEST",
+                "INSOMNIA_RESOURCE_DIR",
                 "INSOMNIA_HOME",
                 "XDG_CONFIG_HOME",
                 "XDG_RUNTIME_DIR",

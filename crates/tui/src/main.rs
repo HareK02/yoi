@@ -61,7 +61,7 @@ fn resolve_socket(pod_name: &str, override_path: Option<PathBuf>) -> PathBuf {
 #[derive(Debug)]
 enum Mode {
     Spawn {
-        profile_path: Option<PathBuf>,
+        profile: Option<String>,
     },
     /// `insomnia <name>` / `insomnia --pod <name>`: attach to a live Pod by name if
     /// possible; otherwise launch `insomnia-pod --pod <name>` so the pod process
@@ -113,7 +113,7 @@ where
     let mut multi = false;
     let mut session: Option<SegmentId> = None;
     let mut pod: Option<String> = None;
-    let mut profile_path: Option<PathBuf> = None;
+    let mut profile: Option<String> = None;
     let mut socket_override: Option<PathBuf> = None;
     let mut socket_seen = false;
     let mut positional: Option<String> = None;
@@ -148,7 +148,7 @@ where
                 let raw = args
                     .get(i + 1)
                     .ok_or(ParseError::MissingValue("--profile"))?;
-                profile_path = Some(PathBuf::from(raw));
+                profile = Some(raw.clone());
                 i += 2;
             }
             "--socket" => {
@@ -197,7 +197,7 @@ where
                 "--multi and --socket are mutually exclusive",
             ));
         }
-        if profile_path.is_some() {
+        if profile.is_some() {
             return Err(ParseError::Conflict(
                 "--multi and --profile are mutually exclusive",
             ));
@@ -220,7 +220,7 @@ where
             "--pod and --resume are mutually exclusive",
         ));
     }
-    if profile_path.is_some()
+    if profile.is_some()
         && (resume || session.is_some() || pod.is_some() || positional.is_some() || socket_seen)
     {
         return Err(ParseError::Conflict(
@@ -246,7 +246,7 @@ where
             socket_override,
         });
     }
-    Ok(Mode::Spawn { profile_path })
+    Ok(Mode::Spawn { profile })
 }
 
 #[tokio::main]
@@ -270,7 +270,7 @@ async fn main() -> ExitCode {
     }
 
     let result = match mode {
-        Mode::Spawn { profile_path } => run_spawn(None, profile_path).await,
+        Mode::Spawn { profile } => run_spawn(None, profile).await,
         Mode::PodName {
             pod_name,
             socket_override,
@@ -473,9 +473,9 @@ fn is_recoverable_multi_open_error(error: &(dyn std::error::Error + 'static)) ->
 
 async fn run_spawn(
     resume_from: Option<SegmentId>,
-    profile_path: Option<PathBuf>,
+    profile: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let ready = match spawn::run(resume_from, profile_path).await? {
+    let ready = match spawn::run(resume_from, profile).await? {
         SpawnOutcome::Ready(r) => r,
         SpawnOutcome::Cancelled => return Ok(()),
     };
@@ -1182,8 +1182,8 @@ mod tests {
     #[test]
     fn parse_profile_spawn_mode() {
         match parse_args_from(["--profile", "/profiles/coder.nix"]).unwrap() {
-            Mode::Spawn { profile_path } => {
-                assert_eq!(profile_path, Some(PathBuf::from("/profiles/coder.nix")));
+            Mode::Spawn { profile } => {
+                assert_eq!(profile, Some("/profiles/coder.nix".to_string()));
             }
             _ => panic!("expected Spawn mode"),
         }
