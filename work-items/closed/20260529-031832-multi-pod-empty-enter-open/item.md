@@ -2,12 +2,12 @@
 id: 20260529-031832-multi-pod-empty-enter-open
 slug: multi-pod-empty-enter-open
 title: Open selected multi-Pod entry on empty Enter
-status: open
+status: closed
 kind: task
 priority: P2
 labels: [tui, pod, ux]
 created_at: 2026-05-29T03:18:32Z
-updated_at: 2026-05-29T03:18:32Z
+updated_at: 2026-05-29T03:27:13Z
 assignee: null
 legacy_ticket: null
 ---
