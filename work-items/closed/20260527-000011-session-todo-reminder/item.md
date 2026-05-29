@@ -2,12 +2,12 @@
 id: 20260527-000011-session-todo-reminder
 slug: session-todo-reminder
 title: セッション内 Task ツールの注意機構
-status: open
+status: closed
 kind: task
 priority: P2
 labels: [migrated]
 created_at: 2026-05-27T00:00:11Z
-updated_at: 2026-05-27T00:00:11Z
+updated_at: 2026-05-29T04:31:10Z
 assignee: null
 legacy_ticket: tickets/session-todo-reminder.md
 ---
