@@ -3,17 +3,17 @@
 # ============================================================================
 # Pod の宣言的設定 (`PodManifest` / `PodManifestConfig`)。
 #
-# カスケード層は下から順に
-#   1. builtin defaults (`manifest::defaults`)
-#   2. user manifest    (`<config_dir>/manifest.toml`)
-#   3. project manifest (cwd から上方向に探す `.insomnia/manifest.toml`)
-#   4. programmatic overlay (呼び出し側が差し込む)
-# 上の層が同名フィールドを上書き、scope rule と skills.directories は
-# 累積マージ、tool_output.per_tool は key 単位でマージ。
+# このファイル形式は低レベル runtime manifest。通常起動は profile discovery/default
+# (`profiles.toml` と bundled builtin profile) から manifest を生成する。
+# `insomnia-pod --manifest <path>` の one-file compatibility/debug mode では、
+# 指定した TOML 1 枚に builtin defaults を merge し、required validation を行う。
+# user/project `manifest.toml` を暗黙に merge する通常起動 cascade は使わない。
 #
-# パス解決: 相対パスは「その層の manifest ファイルが置かれているディレクトリ」
-# を base に絶対パスへ解決される (overlay 層は cwd)。マージは絶対化済みの
-# 値同士で行われる。
+# `PodManifestConfig` の merge 規則: 上の層が同名フィールドを上書き、scope rule と
+# skills.directories は累積マージ、tool_output.per_tool は key 単位でマージ。
+#
+# パス解決: `--manifest <path>` では相対パスはその manifest ファイルの親ディレクトリ
+# を base に絶対パスへ解決される。profile artifact でも同じ validation 境界を通る。
 #
 # 凡例:
 #   - 必須        … 値が無いと resolve エラー

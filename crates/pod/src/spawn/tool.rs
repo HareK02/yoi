@@ -1,6 +1,6 @@
 //! `SpawnPod` tool — launch a new Pod process as a child of this one.
 //!
-//! Wires pod-registry delegation, overlay-TOML construction, subprocess
+//! Wires pod-registry delegation, child manifest-config construction, subprocess
 //! launch, and socket handoff into a single `Tool` implementation. When
 //! the LLM calls `SpawnPod`, a fresh `insomnia-pod` binary is exec'd in its own
 //! process group, the pod-registry is updated atomically, and the child's
@@ -116,8 +116,8 @@ pub struct SpawnPodTool {
     /// no-op.
     parent_socket: Option<PathBuf>,
     /// Spawner's resolved provider config — copied into every spawned
-    /// Pod's overlay TOML so the child does not need its own provider
-    /// configuration in the manifest cascade. Per-spawn override is
+    /// Pod's internal manifest config so the child does not need its own provider
+    /// configuration. Per-spawn override is
     /// out of scope here (see `tickets/spawn-inherit-provider.md`).
     spawner_model: ModelManifest,
     /// Spawner's runtime scope. After a successful spawn, the
@@ -208,7 +208,7 @@ impl Tool for SpawnPodTool {
         // it back — even if later steps (Method::Run delivery, record
         // write) fail, the child is running and will release its own
         // entry on exit.
-        let overlay_toml = match build_overlay_toml(
+        let spawn_config_json = match build_spawn_config_json(
             &input.name,
             &instruction,
             &scope_allow,
@@ -218,13 +218,13 @@ impl Tool for SpawnPodTool {
             Err(e) => {
                 self.release_reservation(&lock_path, &input.name);
                 return Err(ToolError::ExecutionFailed(format!(
-                    "overlay serialisation: {e}"
+                    "spawn config serialisation: {e}"
                 )));
             }
         };
 
         let start_outcome = self
-            .exec_child(&input.name, &overlay_toml, &predicted_socket)
+            .exec_child(&input.name, &spawn_config_json, &predicted_socket)
             .await;
         if let Err(e) = start_outcome {
             self.release_reservation(&lock_path, &input.name);
@@ -300,7 +300,7 @@ impl SpawnPodTool {
     async fn exec_child(
         &self,
         pod_name: &str,
-        overlay_toml: &str,
+        spawn_config_json: &str,
         predicted_socket: &Path,
     ) -> Result<(), ToolError> {
         let pod_command =
@@ -329,8 +329,8 @@ impl SpawnPodTool {
         cmd.arg("--adopt")
             .arg("--callback")
             .arg(&self.callback_socket)
-            .arg("--overlay")
-            .arg(overlay_toml)
+            .arg("--spawn-config-json")
+            .arg(spawn_config_json)
             .current_dir(&self.spawner_pwd)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -382,20 +382,21 @@ fn parse_scope(rules: &[ScopeRuleInput]) -> Result<Vec<ScopeRule>, ToolError> {
         .collect()
 }
 
-/// Serialise the overlay TOML that gets handed to the child `insomnia-pod`
-/// binary via `--overlay`. `PodManifestConfig`'s `Serialize` impl is
-/// the single source of truth for the on-disk manifest format.
+/// Serialise the internal manifest config that gets handed to the child
+/// `insomnia-pod` binary via the hidden `--spawn-config-json` flag.
+/// `PodManifestConfig`'s `Serialize` impl is the single source of truth for the
+/// internal handoff shape.
 ///
 /// The child's working directory is set separately via
 /// `Command::current_dir` (see [`SpawnPodTool::exec_child`]) — it is
 /// not part of the manifest.
-fn build_overlay_toml(
+fn build_spawn_config_json(
     name: &str,
     instruction: &str,
     scope_allow: &[ScopeRule],
     model: &ModelManifest,
-) -> Result<String, toml::ser::Error> {
-    let overlay = PodManifestConfig {
+) -> Result<String, serde_json::Error> {
+    let config = PodManifestConfig {
         pod: PodMetaConfig {
             name: Some(name.to_string()),
             prompt_pack: None,
@@ -411,7 +412,7 @@ fn build_overlay_toml(
         },
         ..Default::default()
     };
-    toml::to_string(&overlay)
+    serde_json::to_string(&config)
 }
 
 /// Tail of the spawned child's `stderr.log` to splice into a startup
@@ -524,7 +525,7 @@ mod tests {
     use manifest::{AuthRef, SchemeKind};
 
     #[test]
-    fn overlay_inherits_inline_spawner_model() {
+    fn spawn_config_inherits_inline_spawner_model() {
         let model = ModelManifest {
             scheme: Some(SchemeKind::Anthropic),
             base_url: Some("https://example.test".into()),
@@ -536,8 +537,9 @@ mod tests {
             ..Default::default()
         };
 
-        let toml_str = build_overlay_toml("child", "$insomnia/default", &[], &model).unwrap();
-        let parsed = PodManifestConfig::from_toml(&toml_str).unwrap();
+        let config_json =
+            build_spawn_config_json("child", "$insomnia/default", &[], &model).unwrap();
+        let parsed: PodManifestConfig = serde_json::from_str(&config_json).unwrap();
 
         assert_eq!(parsed.model.scheme, Some(SchemeKind::Anthropic));
         assert_eq!(parsed.model.model_id.as_deref(), Some("claude-sonnet-4"));
@@ -553,13 +555,14 @@ mod tests {
     }
 
     #[test]
-    fn overlay_inherits_ref_spawner_model() {
+    fn spawn_config_inherits_ref_spawner_model() {
         let model = ModelManifest {
             ref_: Some("anthropic/claude-sonnet-4-6".into()),
             ..Default::default()
         };
-        let toml_str = build_overlay_toml("child", "$insomnia/default", &[], &model).unwrap();
-        let parsed = PodManifestConfig::from_toml(&toml_str).unwrap();
+        let config_json =
+            build_spawn_config_json("child", "$insomnia/default", &[], &model).unwrap();
+        let parsed: PodManifestConfig = serde_json::from_str(&config_json).unwrap();
         assert_eq!(
             parsed.model.ref_.as_deref(),
             Some("anthropic/claude-sonnet-4-6")

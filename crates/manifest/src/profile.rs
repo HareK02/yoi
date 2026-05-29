@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::{PodManifest, PodManifestConfig, ResolveError, paths};
 
 const PROFILE_FORMAT_V1: &str = "insomnia.nix-profile.v1";
+const BUILTIN_DEFAULT_PROFILE_NAME: &str = "default";
 
 /// Registry source for discovered profiles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -221,6 +222,24 @@ impl ProfileRegistry {
         self.default = Some(default);
     }
 
+    fn set_builtin_default_if_available(&mut self) {
+        if self.default.is_some() {
+            return;
+        }
+        if self
+            .select_named(
+                Some(ProfileRegistrySource::Builtin),
+                BUILTIN_DEFAULT_PROFILE_NAME,
+            )
+            .is_ok()
+        {
+            self.default = Some(ProfileDefault {
+                source: Some(ProfileRegistrySource::Builtin),
+                name: BUILTIN_DEFAULT_PROFILE_NAME.to_string(),
+            });
+        }
+    }
+
     fn mark_default_flags(&mut self) {
         let Some(default) = self.default.clone() else {
             return;
@@ -282,6 +301,7 @@ impl ProfileDiscovery {
         if let Some(path) = &self.project_config {
             load_profile_registry_file(&mut registry, ProfileRegistrySource::Project, path)?;
         }
+        registry.set_builtin_default_if_available();
         registry.mark_default_flags();
         Ok(registry)
     }
@@ -323,12 +343,14 @@ pub struct ResolvedProfile {
 #[derive(Debug, Clone)]
 pub struct NixProfileResolver {
     nix_bin: PathBuf,
+    workspace_base: Option<PathBuf>,
 }
 
 impl Default for NixProfileResolver {
     fn default() -> Self {
         Self {
             nix_bin: PathBuf::from("nix"),
+            workspace_base: None,
         }
     }
 }
@@ -341,7 +363,13 @@ impl NixProfileResolver {
     pub fn with_nix_bin(nix_bin: impl Into<PathBuf>) -> Self {
         Self {
             nix_bin: nix_bin.into(),
+            workspace_base: None,
         }
+    }
+
+    pub fn with_workspace_base(mut self, workspace_base: impl Into<PathBuf>) -> Self {
+        self.workspace_base = Some(workspace_base.into());
+        self
     }
 
     pub fn resolve(&self, selector: &ProfileSelector) -> Result<ResolvedProfile, ProfileError> {
@@ -351,6 +379,7 @@ impl NixProfileResolver {
                 ProfileSource::Path {
                     path: absolutize(path)?,
                 },
+                None,
             ),
             ProfileSelector::Named { .. } | ProfileSelector::Default => {
                 let cwd = std::env::current_dir().map_err(|source| ProfileError::CommandIo {
@@ -359,6 +388,11 @@ impl NixProfileResolver {
                 })?;
                 let registry = ProfileDiscovery::for_cwd(&cwd).discover()?;
                 let entry = registry.select(selector)?.clone();
+                let artifact_base = if entry.source == ProfileRegistrySource::Builtin {
+                    Some(absolutize(self.workspace_base.as_deref().unwrap_or(&cwd))?)
+                } else {
+                    None
+                };
                 self.resolve_path(
                     &entry.path,
                     ProfileSource::Registry {
@@ -366,6 +400,7 @@ impl NixProfileResolver {
                         name: entry.name,
                         path: absolutize(&entry.path)?,
                     },
+                    artifact_base,
                 )
             }
         }
@@ -375,15 +410,17 @@ impl NixProfileResolver {
         &self,
         path: &Path,
         source: ProfileSource,
+        manifest_base_override: Option<PathBuf>,
     ) -> Result<ResolvedProfile, ProfileError> {
         let absolute_path = absolutize(path)?;
-        let base_dir = absolute_path
+        let file_base_dir = absolute_path
             .parent()
             .map(Path::to_path_buf)
             .ok_or_else(|| ProfileError::InvalidPath {
                 path: absolute_path.clone(),
                 message: "profile path has no parent directory".to_string(),
             })?;
+        let base_dir = manifest_base_override.unwrap_or(file_base_dir);
 
         let output = Command::new(&self.nix_bin)
             .arg("eval")
@@ -946,6 +983,56 @@ mod tests {
             ProfileSelector::parse_cli("default"),
             ProfileSelector::Default
         );
+    }
+
+    #[test]
+    fn builtin_default_profile_is_registered_as_default() {
+        let registry = ProfileDiscovery::with_sources(paths::builtin_profiles_dir(), None, None)
+            .discover()
+            .unwrap();
+        let default = registry.default_entry().unwrap();
+        assert_eq!(default.source, ProfileRegistrySource::Builtin);
+        assert_eq!(default.name, BUILTIN_DEFAULT_PROFILE_NAME);
+        assert!(default.is_default);
+        assert!(default.path.ends_with("resources/nix/profiles/default.nix"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn builtin_profile_relative_paths_resolve_against_workspace_base() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let profile_path = tmp.path().join("default.nix");
+        std::fs::write(&profile_path, "{}").unwrap();
+        let nix_bin = tmp.path().join("fake-nix");
+        std::fs::write(
+            &nix_bin,
+            r#"#!/bin/sh
+cat <<'JSON'
+{"profile":{"format":"insomnia.nix-profile.v1","name":"default"},"manifest":{"pod":{"name":"default"},"model":{"scheme":"anthropic","model_id":"claude-sonnet-4-20250514"},"scope":{"allow":[{"target":".","permission":"write"}]}}}
+JSON
+"#,
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&nix_bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&nix_bin, perms).unwrap();
+        let resolved = NixProfileResolver::with_nix_bin(&nix_bin)
+            .resolve_path(
+                &profile_path,
+                ProfileSource::Registry {
+                    source: ProfileRegistrySource::Builtin,
+                    name: BUILTIN_DEFAULT_PROFILE_NAME.to_string(),
+                    path: profile_path.clone(),
+                },
+                Some(workspace.clone()),
+            )
+            .unwrap();
+
+        assert_eq!(resolved.manifest.scope.allow[0].target, workspace);
     }
 
     #[test]

@@ -43,11 +43,11 @@ The Nix package does not put user configuration, sessions, sockets, or other mut
 
 | Purpose | Override | `INSOMNIA_HOME` fallback | XDG / default fallback |
 | --- | --- | --- | --- |
-| User config (`manifest.toml`, prompt overrides, model/provider overrides) | `INSOMNIA_CONFIG_DIR` | `$INSOMNIA_HOME/config` | `$XDG_CONFIG_HOME/insomnia`, then `$HOME/.config/insomnia` |
+| User config (`profiles.toml`, prompt overrides, model/provider overrides) | `INSOMNIA_CONFIG_DIR` | `$INSOMNIA_HOME/config` | `$XDG_CONFIG_HOME/insomnia`, then `$HOME/.config/insomnia` |
 | Persistent data (`sessions/`, Pod metadata) | `INSOMNIA_DATA_DIR` | `$INSOMNIA_HOME` | `$HOME/.insomnia` |
 | Runtime state (sockets, lock files, live registry) | `INSOMNIA_RUNTIME_DIR` | `$INSOMNIA_HOME/run` | `$XDG_RUNTIME_DIR/insomnia`, then `$HOME/.insomnia/run` |
 
-`INSOMNIA_USER_MANIFEST=<path>` can still be used to select an explicit user manifest for the Pod CLI cascade path. Project manifests are still discovered from `.insomnia/manifest.toml` under the current workspace unless a CLI mode documents otherwise.
+Normal fresh startup is profile-based. The package ships a builtin default profile, user/project `profiles.toml` files may select or define profiles, and `insomnia-pod --manifest <PATH>` remains a one-file compatibility/debug input. `INSOMNIA_USER_MANIFEST` and ambient `.insomnia/manifest.toml` discovery are not part of normal Pod/TUI startup.
 
 ## Validation
 

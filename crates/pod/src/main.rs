@@ -1,16 +1,17 @@
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
-use manifest::{NixProfileResolver, PodManifest, PodManifestConfig, ProfileSelector, paths};
-use pod::{Pod, PodController, PodFactory, PromptLoader};
+use manifest::{
+    NixProfileResolver, PodManifest, PodManifestConfig, ProfileSelector, ScopeConfig, paths,
+};
+use pod::{Pod, PodController, PromptLoader};
 use session_store::{FsStore, PodMetadataStore, SegmentId, Store};
 
 #[derive(Debug, Parser)]
 #[command(
     name = "insomnia-pod",
-    about = "Spawn a Pod process from manifest layers or a single manifest file"
+    about = "Spawn a Pod process from a Nix profile or a single manifest file"
 )]
 struct Cli {
     /// Nix profile to evaluate. Accepts an explicit path, `path:<path>`, a
@@ -19,7 +20,7 @@ struct Cli {
     #[arg(
         long,
         value_name = "PROFILE",
-        conflicts_with_all = ["manifest", "project", "overlay", "pod", "session", "adopt"]
+        conflicts_with_all = ["manifest", "project", "pod", "session", "adopt"]
     )]
     profile: Option<String>,
 
@@ -29,21 +30,34 @@ struct Cli {
     #[arg(long, value_name = "NAME", requires = "profile", conflicts_with_all = ["pod", "session", "adopt"])]
     profile_pod_name: Option<String>,
 
-    /// Manifest TOML to use directly, without loading user, project, or
-    /// overlay layers.
-    #[arg(long, value_name = "PATH", conflicts_with_all = ["project", "overlay"])]
+    /// Manifest TOML to use directly as a one-file compatibility/debug input.
+    /// This bypasses profile discovery but still applies builtin defaults and
+    /// the same required-field validation boundary.
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["project"])]
     manifest: Option<PathBuf>,
 
-    /// Start the project-manifest walk from this directory. When
-    /// omitted, the factory walks up from the current working
-    /// directory looking for `.insomnia/manifest.toml`.
+    /// Deprecated manifest-cascade project root flag. Ambient project/user
+    /// manifest discovery has been removed; configure/select a profile instead.
     #[arg(long, value_name = "PATH")]
     project: Option<PathBuf>,
 
-    /// Inline TOML string applied as the highest-priority overlay
-    /// layer. Example: `--overlay 'pod.name = "dbg"'`.
-    #[arg(long, value_name = "TOML")]
-    overlay: Option<String>,
+    /// Internal typed pod-name override for session restore launched by the TUI.
+    #[arg(long, value_name = "NAME", requires = "session", hide = true)]
+    session_pod_name: Option<String>,
+
+    /// Internal typed scope snapshot for session restore launched by the TUI.
+    #[arg(long, value_name = "JSON", requires = "session", hide = true)]
+    resume_scope_json: Option<String>,
+
+    /// Internal resolved manifest config for delegated child Pod spawning.
+    #[arg(
+        long,
+        value_name = "JSON",
+        requires = "adopt",
+        conflicts_with_all = ["profile", "manifest", "project", "pod", "session"],
+        hide = true
+    )]
+    spawn_config_json: Option<String>,
 
     /// Directory for session persistence. Defaults to
     /// `<data_dir>/sessions/` (see `manifest::paths`).
@@ -82,52 +96,65 @@ struct Cli {
 }
 
 fn resolve_manifest(cli: &Cli) -> Result<(PodManifest, PromptLoader), String> {
-    resolve_manifest_with_user_manifest_env(cli, std::env::var_os(paths::USER_MANIFEST_ENV))
+    resolve_manifest_with_profile_loader(cli, load_profile)
 }
 
-fn resolve_manifest_with_user_manifest_env(
+fn resolve_manifest_with_profile_loader<F>(
     cli: &Cli,
-    user_manifest_env: Option<OsString>,
-) -> Result<(PodManifest, PromptLoader), String> {
-    resolve_manifest_with_user_manifest_env_and_profile_loader(cli, user_manifest_env, load_profile)
-}
-
-fn resolve_manifest_with_user_manifest_env_and_profile_loader<F>(
-    cli: &Cli,
-    user_manifest_env: Option<OsString>,
     load_profile_fn: F,
 ) -> Result<(PodManifest, PromptLoader), String>
 where
     F: FnOnce(&ProfileSelector, Option<&str>) -> Result<(PodManifest, PromptLoader), String>,
 {
-    if let Some(profile) = &cli.profile {
+    let mut manifest_and_loader = if let Some(config_json) = cli.spawn_config_json.as_deref() {
+        load_spawn_config_json(config_json)?
+    } else if let Some(profile) = &cli.profile {
         let selector = ProfileSelector::parse_cli(profile);
-        return load_profile_fn(&selector, cli.profile_pod_name.as_deref());
-    }
-
-    let user_manifest = paths::user_manifest_path_from_env(user_manifest_env);
-
-    if let Some(path) = &cli.manifest {
-        if user_manifest.is_some() {
-            return Err(format!(
-                "--manifest cannot be used when {} is set",
-                paths::USER_MANIFEST_ENV
-            ));
+        load_profile_fn(&selector, cli.profile_pod_name.as_deref())?
+    } else if let Some(path) = &cli.manifest {
+        load_single_manifest(path, cli.pod.as_deref())?
+    } else {
+        if cli.project.is_some() {
+            return Err(
+                "--project is no longer supported; normal startup uses profile discovery/default, \
+                 and --manifest <PATH> is the only one-file manifest mode"
+                    .to_string(),
+            );
         }
-        return load_single_manifest(path, cli.pod.as_deref());
-    }
+        let selector = ProfileSelector::Default;
+        load_profile_fn(&selector, cli.pod.as_deref())?
+    };
 
-    let factory = build_factory_with_user_manifest_path(cli, user_manifest)?;
-    factory
-        .resolve()
-        .map_err(|e| format!("failed to resolve manifest cascade: {e}"))
+    apply_session_restore_overrides(&mut manifest_and_loader.0, cli)?;
+    Ok(manifest_and_loader)
+}
+
+fn apply_session_restore_overrides(manifest: &mut PodManifest, cli: &Cli) -> Result<(), String> {
+    if let Some(pod_name) = cli.session_pod_name.as_deref() {
+        manifest.pod.name = pod_name.to_string();
+    }
+    if let Some(scope_json) = cli.resume_scope_json.as_deref() {
+        manifest.scope = serde_json::from_str::<ScopeConfig>(scope_json)
+            .map_err(|e| format!("failed to parse --resume-scope-json: {e}"))?;
+    }
+    Ok(())
+}
+
+fn load_spawn_config_json(config_json: &str) -> Result<(PodManifest, PromptLoader), String> {
+    let config = serde_json::from_str::<PodManifestConfig>(config_json)
+        .map_err(|e| format!("failed to parse --spawn-config-json: {e}"))?;
+    let manifest = PodManifest::try_from(PodManifestConfig::builtin_defaults().merge(config))
+        .map_err(|e| format!("failed to resolve --spawn-config-json: {e}"))?;
+    Ok((manifest, PromptLoader::builtins_only()))
 }
 
 fn load_profile(
     selector: &ProfileSelector,
     pod_name_override: Option<&str>,
 ) -> Result<(PodManifest, PromptLoader), String> {
-    let resolver = NixProfileResolver::new();
+    let cwd = std::env::current_dir()
+        .map_err(|e| format!("failed to resolve current directory for profile: {e}"))?;
+    let resolver = NixProfileResolver::new().with_workspace_base(cwd);
     let mut resolved = resolver.resolve(selector).map_err(|e| {
         format!(
             "failed to resolve profile {}: {e}",
@@ -146,76 +173,30 @@ fn load_single_manifest(
 ) -> Result<(PodManifest, PromptLoader), String> {
     let toml = std::fs::read_to_string(path)
         .map_err(|e| format!("failed to read manifest {}: {e}", path.display()))?;
-    let manifest = match pod_name_override {
-        Some(pod_name) => match PodManifest::from_toml(&toml) {
-            Ok(mut manifest) => {
-                manifest.pod.name = pod_name.to_string();
-                manifest
-            }
-            Err(_) => {
-                let base = PodManifestConfig::from_toml(&toml)
-                    .map_err(|e| format!("failed to parse manifest {}: {e}", path.display()))?;
-                let overlay = PodManifestConfig::from_toml(&pod_name_overlay_toml(pod_name))
-                    .expect("pod name overlay TOML is generated");
-                PodManifest::try_from(base.merge(overlay)).map_err(|e| {
-                    format!(
-                        "failed to resolve manifest {} with --pod: {e}",
-                        path.display()
-                    )
-                })?
-            }
-        },
-        None => PodManifest::from_toml(&toml)
-            .map_err(|e| format!("failed to parse manifest {}: {e}", path.display()))?,
+    let absolute_path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| format!("failed to resolve current directory: {e}"))?
+            .join(path)
     };
+    let base_dir = absolute_path.parent().ok_or_else(|| {
+        format!(
+            "manifest path {} has no parent directory",
+            absolute_path.display()
+        )
+    })?;
+    let mut config = PodManifestConfig::builtin_defaults().merge(
+        PodManifestConfig::from_toml(&toml)
+            .map_err(|e| format!("failed to parse manifest {}: {e}", path.display()))?
+            .resolve_paths(base_dir),
+    );
+    if let Some(pod_name) = pod_name_override {
+        config.pod.name = Some(pod_name.to_string());
+    }
+    let manifest = PodManifest::try_from(config)
+        .map_err(|e| format!("failed to resolve manifest {}: {e}", path.display()))?;
     Ok((manifest, PromptLoader::builtins_only()))
-}
-
-fn pod_name_overlay_toml(pod_name: &str) -> String {
-    let mut pod = toml::value::Table::new();
-    pod.insert("name".into(), toml::Value::String(pod_name.to_string()));
-    let mut root = toml::value::Table::new();
-    root.insert("pod".into(), toml::Value::Table(pod));
-    toml::to_string(&toml::Value::Table(root)).expect("pod name overlay serialisation cannot fail")
-}
-
-fn build_factory_with_user_manifest_path(
-    cli: &Cli,
-    user_manifest: Option<PathBuf>,
-) -> Result<PodFactory, String> {
-    let mut factory = PodFactory::new();
-
-    factory = match user_manifest {
-        Some(path) => factory
-            .with_user_manifest(path)
-            .map_err(|e| format!("failed to load user manifest: {e}"))?,
-        None => factory
-            .with_user_manifest_auto()
-            .map_err(|e| format!("failed to auto-load user manifest: {e}"))?,
-    };
-
-    factory = match &cli.project {
-        Some(path) => factory
-            .with_project_manifest_from(path)
-            .map_err(|e| format!("failed to load project manifest: {e}"))?,
-        None => factory
-            .with_project_manifest_auto()
-            .map_err(|e| format!("failed to auto-load project manifest: {e}"))?,
-    };
-
-    if let Some(overlay) = cli.overlay.as_deref() {
-        factory = factory
-            .with_overlay_toml(overlay)
-            .map_err(|e| format!("failed to parse overlay TOML: {e}"))?;
-    }
-
-    if let Some(pod_name) = cli.pod.as_deref() {
-        factory = factory
-            .with_overlay_toml(&pod_name_overlay_toml(pod_name))
-            .map_err(|e| format!("failed to apply --pod overlay: {e}"))?;
-    }
-
-    Ok(factory)
 }
 
 #[tokio::main]
@@ -419,7 +400,7 @@ permission = "write"
     }
 
     #[test]
-    fn manifest_conflicts_with_project_and_overlay() {
+    fn manifest_conflicts_with_project() {
         let project_err = Cli::try_parse_from([
             "insomnia-pod",
             "--manifest",
@@ -429,35 +410,31 @@ permission = "write"
         ])
         .unwrap_err();
         assert_eq!(project_err.kind(), clap::error::ErrorKind::ArgumentConflict);
-
-        let overlay_err = Cli::try_parse_from([
-            "insomnia-pod",
-            "--manifest",
-            "manifest.toml",
-            "--overlay",
-            "pod.name = 'x'",
-        ])
-        .unwrap_err();
-        assert_eq!(overlay_err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
     #[test]
-    fn manifest_conflicts_with_user_manifest_env_when_env_is_non_empty() {
+    fn overlay_flag_is_not_accepted() {
+        let err = Cli::try_parse_from(["insomnia-pod", "--overlay", "pod.name = 'x'"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+
+    #[test]
+    fn manifest_loads_single_file_without_user_or_workspace_prompt_loader() {
         let tmp = TempDir::new().unwrap();
         let manifest = tmp.path().join("manifest.toml");
         write(&manifest, &manifest_toml("single", tmp.path()));
         let cli = Cli::try_parse_from(["insomnia-pod", "--manifest", manifest.to_str().unwrap()])
             .unwrap();
 
-        let err = resolve_manifest_with_user_manifest_env(&cli, Some(OsString::from("user.toml")))
-            .unwrap_err();
+        let (manifest, loader) = resolve_manifest(&cli).unwrap();
 
-        assert!(err.contains("--manifest cannot be used"));
-        assert!(err.contains(paths::USER_MANIFEST_ENV));
+        assert_eq!(manifest.pod.name, "single");
+        assert!(loader.user_dir().is_none());
+        assert!(loader.workspace_dir().is_none());
     }
 
     #[test]
-    fn profile_ignores_non_empty_user_manifest_env() {
+    fn profile_uses_selected_profile() {
         let tmp = TempDir::new().unwrap();
         let profile = tmp.path().join("profile.nix");
         let cli = Cli::try_parse_from([
@@ -470,10 +447,8 @@ permission = "write"
         .unwrap();
         let mut called = false;
 
-        let (manifest, loader) = resolve_manifest_with_user_manifest_env_and_profile_loader(
-            &cli,
-            Some(OsString::from("non-existent-user-manifest.toml")),
-            |selector, pod_name| {
+        let (manifest, loader) =
+            resolve_manifest_with_profile_loader(&cli, |selector, pod_name| {
                 called = true;
                 assert_eq!(selector, &ProfileSelector::path(profile.clone()));
                 assert_eq!(pod_name, Some("from-profile-name"));
@@ -483,9 +458,8 @@ permission = "write"
                     manifest.pod.name = pod_name.to_string();
                 }
                 Ok((manifest, PromptLoader::builtins_only()))
-            },
-        )
-        .unwrap();
+            })
+            .unwrap();
 
         assert!(called);
         assert_eq!(manifest.pod.name, "from-profile-name");
@@ -506,10 +480,8 @@ permission = "write"
         .unwrap();
         let mut called = false;
 
-        let (manifest, _loader) = resolve_manifest_with_user_manifest_env_and_profile_loader(
-            &cli,
-            None,
-            |selector, pod_name| {
+        let (manifest, _loader) =
+            resolve_manifest_with_profile_loader(&cli, |selector, pod_name| {
                 called = true;
                 assert_eq!(
                     selector,
@@ -524,51 +496,43 @@ permission = "write"
                     manifest.pod.name = pod_name.to_string();
                 }
                 Ok((manifest, PromptLoader::builtins_only()))
-            },
-        )
-        .unwrap();
+            })
+            .unwrap();
 
         assert!(called);
         assert_eq!(manifest.pod.name, "from-profile-name");
     }
 
     #[test]
-    fn manifest_allows_empty_user_manifest_env() {
+    fn normal_startup_uses_default_profile() {
         let tmp = TempDir::new().unwrap();
-        let manifest = tmp.path().join("manifest.toml");
-        write(&manifest, &manifest_toml("single", tmp.path()));
-        let cli = Cli::try_parse_from(["insomnia-pod", "--manifest", manifest.to_str().unwrap()])
+        let cli = Cli::try_parse_from(["insomnia-pod"]).unwrap();
+        let mut called = false;
+
+        let (manifest, _loader) =
+            resolve_manifest_with_profile_loader(&cli, |selector, pod_name| {
+                called = true;
+                assert_eq!(selector, &ProfileSelector::Default);
+                assert_eq!(pod_name, None);
+                let manifest =
+                    PodManifest::from_toml(&manifest_toml("from-default-profile", tmp.path()))
+                        .unwrap();
+                Ok((manifest, PromptLoader::builtins_only()))
+            })
             .unwrap();
 
-        let (manifest, loader) =
-            resolve_manifest_with_user_manifest_env(&cli, Some(OsString::new())).unwrap();
-
-        assert_eq!(manifest.pod.name, "single");
-        assert!(loader.user_dir().is_none());
-        assert!(loader.workspace_dir().is_none());
+        assert!(called);
+        assert_eq!(manifest.pod.name, "from-default-profile");
     }
 
     #[test]
-    fn user_manifest_env_overrides_auto_user_manifest_path() {
-        let tmp = TempDir::new().unwrap();
-        let user_manifest = tmp.path().join("custom-user.toml");
-        write(&user_manifest, &manifest_toml("from-env", tmp.path()));
-        let no_project_root = tmp.path().join("no-project");
-        std::fs::create_dir_all(&no_project_root).unwrap();
-        let cli = Cli::try_parse_from([
-            "insomnia-pod",
-            "--project",
-            no_project_root.to_str().unwrap(),
-        ])
-        .unwrap();
-
-        let (manifest, _loader) = resolve_manifest_with_user_manifest_env(
-            &cli,
-            Some(user_manifest.as_os_str().to_os_string()),
-        )
-        .unwrap();
-
-        assert_eq!(manifest.pod.name, "from-env");
+    fn project_flag_no_longer_enables_ambient_manifest_cascade() {
+        let cli = Cli::try_parse_from(["insomnia-pod", "--project", "."]).unwrap();
+        let err = resolve_manifest_with_profile_loader(&cli, |_, _| {
+            panic!("default profile loader must not run when deprecated --project is present")
+        })
+        .unwrap_err();
+        assert!(err.contains("--project is no longer supported"));
     }
 
     #[test]
@@ -594,7 +558,7 @@ permission = "write"
         ])
         .unwrap();
 
-        let (manifest, _loader) = resolve_manifest_with_user_manifest_env(&cli, None).unwrap();
+        let (manifest, _loader) = resolve_manifest(&cli).unwrap();
 
         assert_eq!(manifest.pod.name, "from-flag");
     }
@@ -605,7 +569,17 @@ permission = "write"
         let manifest = tmp.path().join("manifest.toml");
         write(
             &manifest,
-            &manifest_toml("unused", tmp.path()).replace("name = \"unused\"\n", ""),
+            r#"
+[pod]
+
+[model]
+scheme = "anthropic"
+model_id = "test-model"
+
+[[scope.allow]]
+target = "."
+permission = "write"
+"#,
         );
         let cli = Cli::try_parse_from([
             "insomnia-pod",
@@ -616,9 +590,35 @@ permission = "write"
         ])
         .unwrap();
 
-        let (manifest, _loader) = resolve_manifest_with_user_manifest_env(&cli, None).unwrap();
+        let (manifest, _loader) = resolve_manifest(&cli).unwrap();
 
         assert_eq!(manifest.pod.name, "from-flag");
+        assert_eq!(manifest.scope.allow[0].target, tmp.path());
+    }
+
+    #[test]
+    fn pod_flag_with_no_manifest_creates_from_default_profile_with_typed_name() {
+        let tmp = TempDir::new().unwrap();
+        let cli = Cli::try_parse_from(["insomnia-pod", "--pod", "agent"]).unwrap();
+        let mut called = false;
+
+        let (manifest, _loader) =
+            resolve_manifest_with_profile_loader(&cli, |selector, pod_name| {
+                called = true;
+                assert_eq!(selector, &ProfileSelector::Default);
+                assert_eq!(pod_name, Some("agent"));
+                let mut manifest =
+                    PodManifest::from_toml(&manifest_toml("from-default-profile", tmp.path()))
+                        .unwrap();
+                if let Some(pod_name) = pod_name {
+                    manifest.pod.name = pod_name.to_string();
+                }
+                Ok((manifest, PromptLoader::builtins_only()))
+            })
+            .unwrap();
+
+        assert!(called);
+        assert_eq!(manifest.pod.name, "agent");
     }
 
     #[test]
@@ -674,7 +674,7 @@ permission = "write"
         ])
         .unwrap();
 
-        let (manifest, loader) = resolve_manifest_with_user_manifest_env(&cli, None).unwrap();
+        let (manifest, loader) = resolve_manifest(&cli).unwrap();
 
         assert_eq!(manifest.pod.name, "single-file");
         assert!(loader.user_dir().is_none());
