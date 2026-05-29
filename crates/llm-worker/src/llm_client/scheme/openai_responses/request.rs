@@ -62,8 +62,8 @@ pub(crate) struct ResponsesRequest {
 pub(crate) struct ReasoningConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
-    /// Reasoning encrypted_content は同一 user turn 内だけ再利用する。
-    /// 古い turn の reasoning item は request input から除外する。
+    /// API 側の reasoning retention policy。Insomnia はこの値を送るが、
+    /// persisted reasoning item の client-side filtering はしない。
     pub context: &'static str,
     /// summary の出力制御。`"auto"` 固定で summary_text を受け取る。
     pub summary: &'static str,
@@ -240,9 +240,8 @@ impl OpenAIResponsesScheme {
 
 /// `Item` 列を `input[]` に変換する。
 fn convert_items_to_input(items: &[Item]) -> Vec<InputItem> {
-    let current_turn_start = current_turn_start_index(items);
     let mut out = Vec::with_capacity(items.len());
-    for (idx, item) in items.iter().enumerate() {
+    for item in items {
         match item {
             Item::Message { role, content, .. } => {
                 let (role_str, text_variant): (&'static str, fn(String) -> InputContent) =
@@ -299,9 +298,6 @@ fn convert_items_to_input(items: &[Item]) -> Vec<InputItem> {
                 encrypted_content,
                 ..
             } => {
-                if idx < current_turn_start {
-                    continue;
-                }
                 let summary_parts = summary
                     .iter()
                     .filter(|s| !s.is_empty())
@@ -322,26 +318,6 @@ fn convert_items_to_input(items: &[Item]) -> Vec<InputItem> {
         }
     }
     out
-}
-
-/// Responses の `reasoning.context = "current_turn"` に合わせ、直近の
-/// user message 以降だけを current turn とみなす。ToolResult は Responses
-/// wire 上では user 側 item だが、新しい人間/外部入力ではなく function-call
-/// chain の継続なので turn reset には使わない。System/developer notes も
-/// 同一 turn 内の補助入力になり得るため reset しない。
-fn current_turn_start_index(items: &[Item]) -> usize {
-    items
-        .iter()
-        .rposition(|item| {
-            matches!(
-                item,
-                Item::Message {
-                    role: Role::User,
-                    ..
-                }
-            )
-        })
-        .unwrap_or(0)
 }
 
 fn convert_tool(tool: &ToolDefinition) -> ResponseTool {
@@ -506,7 +482,7 @@ mod tests {
     }
 
     #[test]
-    fn old_turn_reasoning_items_are_omitted_for_current_turn_context() {
+    fn persisted_reasoning_items_are_preserved_across_user_turns() {
         let scheme = OpenAIResponsesScheme::new();
         let old_reasoning = Item::reasoning("old").with_encrypted_content("OLD_ENC");
         let current_reasoning = Item::reasoning("current").with_encrypted_content("CURRENT_ENC");
@@ -527,7 +503,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(encrypted, vec!["CURRENT_ENC"]);
+        assert_eq!(encrypted, vec!["OLD_ENC", "CURRENT_ENC"]);
     }
 
     #[test]
