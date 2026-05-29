@@ -248,11 +248,13 @@ impl ProfileRegistry {
         let Some(default) = self.default.clone() else {
             return;
         };
-        let Some(source) = default.source else {
+        let Ok(default_entry) = self.select_named(default.source, &default.name) else {
             return;
         };
+        let source = default_entry.source;
+        let name = default_entry.name.clone();
         for entry in &mut self.entries {
-            entry.is_default = entry.source == source && entry.name == default.name;
+            entry.is_default = entry.source == source && entry.name == name;
         }
     }
 }
@@ -1003,6 +1005,42 @@ default-coder = "coder"
         assert_eq!(selected.source, ProfileRegistrySource::Project);
         assert_eq!(selected.name, "coder");
         assert!(selected.path.ends_with("profiles/project-coder.nix"));
+    }
+
+    #[test]
+    fn config_default_alias_marks_resolved_default_entry() {
+        let tmp = TempDir::new().unwrap();
+        let project_dir = tmp.path().join("project/.insomnia");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let project_manifest = project_dir.join("manifest.toml");
+        std::fs::write(
+            &project_manifest,
+            r#"
+[profiles]
+default = "work"
+[profiles.profile]
+coder = "profiles/coder.nix"
+[profiles.alias]
+work = "coder"
+"#,
+        )
+        .unwrap();
+
+        let registry = ProfileDiscovery::with_sources(None, None, Some(project_manifest))
+            .discover()
+            .unwrap();
+        let default = registry.default_entry().unwrap();
+        assert_eq!(default.source, ProfileRegistrySource::Project);
+        assert_eq!(default.name, "coder");
+        assert!(default.is_default);
+        assert_eq!(
+            registry
+                .entries()
+                .iter()
+                .filter(|entry| entry.is_default)
+                .count(),
+            1
+        );
     }
 
     #[test]

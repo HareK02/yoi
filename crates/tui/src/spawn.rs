@@ -342,14 +342,6 @@ fn initial_profile_index(
     choices.len() - 1
 }
 
-fn default_profile_selection(cwd: &Path) -> Option<ProfileChoice> {
-    let (choices, default_index) = profile_choices_for_cwd(cwd);
-    choices
-        .get(default_index)
-        .filter(|choice| choice.selector.is_some())
-        .cloned()
-}
-
 fn user_manifest_path_for_spawn(
     env_value: Option<OsString>,
     default_user_manifest: Option<PathBuf>,
@@ -908,7 +900,7 @@ permission = "write"
     }
 
     #[test]
-    fn default_profile_selection_uses_project_registry_default() {
+    fn profile_choices_use_project_registry_default_alias() {
         let temp = tempfile::tempdir().unwrap();
         let project = temp.path().join("project");
         let insomnia = project.join(".insomnia");
@@ -917,14 +909,18 @@ permission = "write"
             insomnia.join("manifest.toml"),
             r#"
 [profiles]
-default = "coder"
+default = "work"
 [profiles.profile]
 coder = "profiles/coder.nix"
+[profiles.alias]
+work = "coder"
 "#,
         )
         .unwrap();
 
-        let selected = default_profile_selection(&project).unwrap();
+        let (choices, default_index) = profile_choices_for_cwd(&project);
+        assert_eq!(default_index, 1);
+        let selected = &choices[default_index];
         assert_eq!(selected.selector.as_deref(), Some("project:coder"));
         assert_eq!(selected.label, "project:coder (default)");
         assert!(selected.is_default);
