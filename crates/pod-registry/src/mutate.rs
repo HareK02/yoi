@@ -45,9 +45,9 @@ pub fn register_pod(
 /// and the registration proceeds. The check is structural (deny ⊇
 /// competitor.rule), not relational — it does not verify that the
 /// competitor actually descends from this Pod's prior delegations.
-/// In practice this is safe because the canonical caller is `restore`,
-/// which derives `scope_deny` from the session's own snapshot, so any
-/// covered competitor is guaranteed to be a descendant of the original
+/// In practice this is safe because the canonical restore caller derives
+/// `scope_deny` from outstanding `pod-store` child delegations, so any
+/// covered competitor is expected to be a descendant of the original
 /// allocation. Direct callers must uphold the same invariant.
 pub fn register_pod_with_deny(
     guard: &mut LockFileGuard,
@@ -180,10 +180,11 @@ pub fn release_pod(guard: &mut LockFileGuard, pod_name: &str) -> Result<(), Scop
 
 /// Reclaim a child delegation back into its parent allocation.
 ///
-/// This is idempotent: missing child allocations and missing deny entries are
-/// ignored. For each delegated Write rule, at most one exact matching deny rule
-/// is removed from the parent's `scope_deny`, preserving any duplicate explicit
-/// base deny that was not owned by this child delegation.
+/// This is idempotent for missing deny entries. For each delegated Write rule,
+/// at most one exact matching deny rule is removed from the parent's `scope_deny`
+/// even when the child allocation is already absent; restore reconciliation uses
+/// that case when durable Pod-state still records an outstanding delegation but
+/// the live lock file no longer has a child allocation.
 pub fn reclaim_delegated_scope(
     guard: &mut LockFileGuard,
     parent: &str,
@@ -199,17 +200,13 @@ pub fn reclaim_delegated_scope(
         .map(|idx| guard.data().allocations[idx].delegated_from.clone())
         .unwrap_or(None);
 
-    let child_exists = child_idx.is_some();
-
-    if child_exists {
-        if let Some(parent_alloc) = guard.data_mut().find_mut(parent) {
-            for rule in delegated_scope
-                .iter()
-                .filter(|rule| rule.permission == Permission::Write)
-            {
-                if let Some(idx) = parent_alloc.scope_deny.iter().position(|deny| deny == rule) {
-                    parent_alloc.scope_deny.remove(idx);
-                }
+    if let Some(parent_alloc) = guard.data_mut().find_mut(parent) {
+        for rule in delegated_scope
+            .iter()
+            .filter(|rule| rule.permission == Permission::Write)
+        {
+            if let Some(idx) = parent_alloc.scope_deny.iter().position(|deny| deny == rule) {
+                parent_alloc.scope_deny.remove(idx);
             }
         }
     }
@@ -516,13 +513,41 @@ mod tests {
         assert_eq!(a.scope_deny, vec![delegated_rule.clone()]);
         assert!(g.data().find("b").is_none());
 
-        reclaim_delegated_scope(&mut g, "a", "b", &[delegated_rule.clone()]).unwrap();
+        reclaim_delegated_scope(&mut g, "a", "b", std::slice::from_ref(&delegated_rule)).unwrap();
         let a = g.data().find("a").unwrap();
-        assert_eq!(
-            a.scope_deny,
-            vec![delegated_rule],
-            "a repeated reclaim with no child allocation must not broaden an explicit duplicate base deny"
+        assert!(
+            a.scope_deny.is_empty(),
+            "a missing child allocation still reclaims one matching parent deny"
         );
+    }
+
+    #[test]
+    fn reclaim_delegated_scope_removes_parent_deny_when_child_allocation_missing() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("pods.json");
+        let mut g = open_empty(&path);
+        let delegated_rule = write_rule("/src/core", true);
+        register_pod_with_deny(
+            &mut g,
+            "a".into(),
+            std::process::id(),
+            sock("a"),
+            vec![write_rule("/src", true)],
+            vec![delegated_rule.clone()],
+            sid(),
+        )
+        .unwrap();
+
+        reclaim_delegated_scope(
+            &mut g,
+            "a",
+            "missing",
+            std::slice::from_ref(&delegated_rule),
+        )
+        .unwrap();
+
+        let a = g.data().find("a").unwrap();
+        assert!(a.scope_deny.is_empty());
     }
 
     #[test]

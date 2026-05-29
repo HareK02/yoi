@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use llm_worker::Item;
@@ -10,7 +11,8 @@ use llm_worker::llm_client::types::Role;
 use llm_worker::state::Mutable;
 use llm_worker::{ToolOutputLimits, UsageRecord, Worker, WorkerError, WorkerResult};
 use pod_store::{
-    PodActiveSegmentRef, PodMetadata, PodMetadataStore, PodSpawnedScopeRule, PodStoreError,
+    PodActiveSegmentRef, PodMetadata, PodMetadataStore, PodReclaimedChild, PodSpawnedChild,
+    PodSpawnedScopeRule, PodStoreError,
 };
 use session_store::{
     LogEntry, SegmentId, SessionId, Store, StoreError, SystemItem, segment_log, to_logged,
@@ -45,8 +47,11 @@ use llm_worker::interceptor::PreRequestAction;
 use protocol::{
     AlertLevel, AlertSource, Event, RewindSummary, RewindTarget, RewindTargetId, Segment,
 };
+use tokio::net::UnixStream;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
+
+const RESTORE_RECONCILIATION_REACHABILITY_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// `(SessionId, SegmentId)` pair the Pod is currently writing to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4048,8 +4053,59 @@ where
             session_id,
             segment_id,
         })?;
+        pod.reconcile_restored_delegations().await?;
         drain_skill_shadows(&pod, skill_shadows);
         Ok(pod)
+    }
+
+    async fn reconcile_restored_delegations(&mut self) -> Result<(), PodError> {
+        let pod_name = self.manifest.pod.name.clone();
+        let Some(metadata) = self.store.read_by_name(&pod_name)? else {
+            return Ok(());
+        };
+
+        let mut reclaimed = Vec::new();
+        for child in metadata.spawned_children {
+            if restored_child_reachable(&child).await {
+                continue;
+            }
+            let delegated_scope = spawned_child_scope_rules(&child);
+            if !delegated_scope.is_empty() {
+                let lock_path =
+                    pod_registry::default_registry_path().map_err(ScopeLockError::from)?;
+                let mut guard =
+                    pod_registry::LockFileGuard::open(&lock_path).map_err(ScopeLockError::from)?;
+                pod_registry::reclaim_delegated_scope(
+                    &mut guard,
+                    &pod_name,
+                    &child.pod_name,
+                    &delegated_scope,
+                )?;
+                let write_rules = delegated_scope
+                    .iter()
+                    .filter(|rule| rule.permission == Permission::Write)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                self.scope
+                    .update(|current| current.with_removed_deny_rules(write_rules))
+                    .map_err(PodError::Scope)?;
+            }
+            reclaimed.push(PodReclaimedChild {
+                pod_name: child.pod_name,
+                scope_delegated: child.scope_delegated,
+            });
+        }
+
+        if reclaimed.is_empty() {
+            return Ok(());
+        }
+
+        self.store.reclaim_spawned_children(&pod_name, reclaimed)?;
+        self.push_notify(
+            "Restored Pod state contained missing or unreachable delegated child Pods; their delegated write scopes were reclaimed before resume."
+                .to_string(),
+        );
+        Ok(())
     }
 
     /// Convenience: build a Pod from a single-layer TOML manifest string.
@@ -4594,6 +4650,40 @@ struct PodCommon {
     skill_shadows: Vec<workflow_crate::ShadowedSkill>,
 }
 
+async fn restored_child_reachable(child: &PodSpawnedChild) -> bool {
+    tokio::time::timeout(
+        RESTORE_RECONCILIATION_REACHABILITY_TIMEOUT,
+        UnixStream::connect(&child.socket_path),
+    )
+    .await
+    .map(|result| result.is_ok())
+    .unwrap_or(false)
+}
+
+fn spawned_child_scope_rules(child: &PodSpawnedChild) -> Vec<ScopeRule> {
+    child
+        .scope_delegated
+        .iter()
+        .filter_map(|rule| delegated_scope_rule_to_scope_rule(rule.clone()))
+        .collect()
+}
+
+fn delegated_scope_rule_to_scope_rule(rule: PodSpawnedScopeRule) -> Option<ScopeRule> {
+    let permission = match rule.permission.as_str() {
+        "read" => Permission::Read,
+        "write" => Permission::Write,
+        other => {
+            warn!(permission = %other, "ignoring invalid delegated child scope permission");
+            return None;
+        }
+    };
+    Some(ScopeRule {
+        target: rule.target,
+        permission,
+        recursive: rule.recursive,
+    })
+}
+
 fn effective_restore_scope_config<St>(
     store: &St,
     manifest: &PodManifest,
@@ -4616,18 +4706,8 @@ where
 }
 
 fn delegated_write_rule_to_deny(rule: PodSpawnedScopeRule) -> Option<ScopeRule> {
-    match rule.permission.as_str() {
-        "write" => Some(ScopeRule {
-            target: rule.target,
-            permission: Permission::Write,
-            recursive: rule.recursive,
-        }),
-        "read" => None,
-        other => {
-            warn!(permission = %other, "ignoring invalid delegated child scope permission");
-            None
-        }
-    }
+    let rule = delegated_scope_rule_to_scope_rule(rule)?;
+    (rule.permission == Permission::Write).then_some(rule)
 }
 
 /// Resolve pwd / scope / LLM client / prompt catalog from a validated

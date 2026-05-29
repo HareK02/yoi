@@ -633,7 +633,7 @@ async fn load_from_pod_state_prunes_runtime_children_and_reclaims_durable_delega
 }
 
 #[tokio::test]
-async fn load_from_pod_state_reclaims_pruned_child_scope_and_records_history() {
+async fn load_from_pod_state_reclaims_missing_child_scope_and_records_history() {
     let _env = EnvGuard::acquire();
     let runtime_tmp = TempDir::new().unwrap();
     let store_tmp = TempDir::new().unwrap();
@@ -663,15 +663,6 @@ async fn load_from_pod_state_reclaims_pruned_child_scope_and_records_history() {
             std::process::id(),
             "/tmp/spawner.sock".into(),
             vec![missing_rule.clone()],
-            vec![missing_rule.clone()],
-            session_store::new_segment_id(),
-        )
-        .unwrap();
-        pod_registry::register_pod(
-            &mut g,
-            "missing".into(),
-            std::process::id(),
-            "/tmp/missing.sock".into(),
             vec![missing_rule.clone()],
             session_store::new_segment_id(),
         )
