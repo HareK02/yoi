@@ -16,6 +16,8 @@ const BRAVE_SEARCH_ENDPOINT: &str = "https://api.search.brave.com/res/v1/web/sea
 const BRAVE_QUERY_MAX_CHARS: usize = 400;
 const BRAVE_QUERY_MAX_WORDS: usize = 50;
 const WEB_SEARCH_DEFAULT_LIMIT: usize = 10;
+const WEB_SEARCH_DEFAULT_TIMEOUT_SECS: u64 = 15;
+const WEB_SEARCH_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const WEB_FETCH_DEFAULT_TIMEOUT_SECS: u64 = 20;
 const WEB_FETCH_DEFAULT_REDIRECT_LIMIT: usize = 5;
 const WEB_FETCH_DEFAULT_MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
@@ -240,17 +242,27 @@ async fn brave_search(
         }
     }
 
+    let timeout = Duration::from_secs(
+        cfg.timeout_secs
+            .unwrap_or(WEB_SEARCH_DEFAULT_TIMEOUT_SECS)
+            .max(1),
+    );
     let response = client
         .get(url)
+        .timeout(timeout)
         .header("Accept", "application/json")
         .header("X-Subscription-Token", api_key)
         .send()
         .await
         .map_err(|err| ToolError::ExecutionFailed(format!("Brave Search request failed: {err}")))?;
     let status = response.status();
-    let body = response.bytes().await.map_err(|err| {
-        ToolError::ExecutionFailed(format!("Brave Search response read failed: {err}"))
-    })?;
+    reject_oversized_content_length(response.headers(), WEB_SEARCH_MAX_RESPONSE_BYTES)?;
+    let (body, truncated) = read_limited(response, WEB_SEARCH_MAX_RESPONSE_BYTES).await?;
+    if truncated {
+        return Err(ToolError::ExecutionFailed(format!(
+            "Brave Search response exceeded max_response_bytes {WEB_SEARCH_MAX_RESPONSE_BYTES}"
+        )));
+    }
     if !status.is_success() {
         return Err(ToolError::ExecutionFailed(format!(
             "Brave Search returned HTTP {status}: {}",
@@ -281,6 +293,8 @@ async fn brave_search(
             "query_max_words": BRAVE_QUERY_MAX_WORDS,
             "limit": limit,
             "offset": offset,
+            "timeout_secs": timeout.as_secs(),
+            "max_response_bytes": WEB_SEARCH_MAX_RESPONSE_BYTES,
         },
         "query": query,
         "results": results,
@@ -1003,6 +1017,7 @@ mod tests {
                 enabled: Some(true),
                 provider: Some(WebSearchProvider::Brave),
                 api_key_env: Some(env_name.clone()),
+                timeout_secs: Some(2),
                 base_url: Some(format!("http://{addr}/search")),
                 ..Default::default()
             }),
@@ -1026,7 +1041,42 @@ mod tests {
                 .contains("x-subscription-token: test-key\r\n")
         );
         assert_eq!(value["provider"]["name"], "brave");
+        assert_eq!(value["provider"]["timeout_secs"], 2);
         assert_eq!(value["results"][0]["title"], "Example");
         assert_eq!(value["results"][0]["extra_snippets"][0], "Extra");
+    }
+
+    #[tokio::test]
+    async fn rejects_oversized_brave_response() {
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{{}}",
+            WEB_SEARCH_MAX_RESPONSE_BYTES + 1
+        );
+        let response: &'static str = Box::leak(response.into_boxed_str());
+        let addr = serve_once(response).await;
+        let env_name = format!("INSOMNIA_TEST_BRAVE_OVERSIZED_KEY_{}", std::process::id());
+        unsafe { std::env::set_var(&env_name, "test-key") };
+        let tools = WebTools::new(Some(WebConfig {
+            enabled: Some(true),
+            allow_private_addresses: Some(true),
+            search: Some(WebSearchConfig {
+                enabled: Some(true),
+                provider: Some(WebSearchProvider::Brave),
+                api_key_env: Some(env_name.clone()),
+                base_url: Some(format!("http://{addr}/search")),
+                ..Default::default()
+            }),
+            fetch: None,
+        }));
+        let err = tools
+            .run_search(WebSearchInput {
+                query: "insomnia".into(),
+                limit: Some(1),
+                offset: Some(0),
+            })
+            .await
+            .unwrap_err();
+        unsafe { std::env::remove_var(&env_name) };
+        assert!(err.to_string().contains("Content-Length"));
     }
 }

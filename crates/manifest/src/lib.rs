@@ -120,6 +120,10 @@ pub struct WebSearchConfig {
     /// not belong in manifest files.
     #[serde(default)]
     pub api_key_env: Option<String>,
+    /// Request timeout in seconds. Tool implementation applies a safe default
+    /// when this is omitted.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
     /// Optional provider endpoint override for tests/proxies. Defaults to the
     /// Brave web search endpoint for the Brave provider.
     #[serde(default)]
@@ -640,13 +644,15 @@ permission = "write"
     #[test]
     fn parse_web_config() {
         let toml = format!(
-            "{}\n[web]\nenabled = true\n\n[web.search]\nprovider = \"brave\"\napi_key_env = \"BRAVE_SEARCH_API_KEY\"\n\n[web.fetch]\ntimeout_secs = 7\nredirect_limit = 3\nmax_response_bytes = 12345\nmax_output_bytes = 2048\n",
+            "{}\n[web]\nenabled = true\n\n[web.search]\nprovider = \"brave\"\napi_key_env = \"BRAVE_SEARCH_API_KEY\"\ntimeout_secs = 12\n\n[web.fetch]\ntimeout_secs = 7\nredirect_limit = 3\nmax_response_bytes = 12345\nmax_output_bytes = 2048\n",
             MINIMAL_REQUIRED
         );
         let manifest = PodManifest::from_toml(&toml).unwrap();
         let web = manifest.web.unwrap();
         assert_eq!(web.enabled, Some(true));
-        assert_eq!(web.search.unwrap().provider, Some(WebSearchProvider::Brave));
+        let search = web.search.unwrap();
+        assert_eq!(search.provider, Some(WebSearchProvider::Brave));
+        assert_eq!(search.timeout_secs, Some(12));
         let fetch = web.fetch.unwrap();
         assert_eq!(fetch.timeout_secs, Some(7));
         assert_eq!(fetch.redirect_limit, Some(3));

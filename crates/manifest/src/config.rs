@@ -332,6 +332,7 @@ impl crate::WebSearchConfig {
             enabled: upper.enabled.or(self.enabled),
             provider: upper.provider.or(self.provider),
             api_key_env: upper.api_key_env.or(self.api_key_env),
+            timeout_secs: upper.timeout_secs.or(self.timeout_secs),
             base_url: upper.base_url.or(self.base_url),
             country: upper.country.or(self.country),
             search_lang: upper.search_lang.or(self.search_lang),
@@ -1085,11 +1086,26 @@ mod tests {
                 prune_protected_tokens: Some(5_000),
                 ..Default::default()
             }),
+            web: Some(WebConfig {
+                search: Some(crate::WebSearchConfig {
+                    api_key_env: Some("LOWER_BRAVE_KEY".into()),
+                    timeout_secs: Some(12),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
             ..Default::default()
         };
         let upper = PodManifestConfig {
             compaction: Some(CompactionConfigPartial {
                 threshold: Some(80_000),
+                ..Default::default()
+            }),
+            web: Some(WebConfig {
+                search: Some(crate::WebSearchConfig {
+                    timeout_secs: Some(3),
+                    ..Default::default()
+                }),
                 ..Default::default()
             }),
             ..Default::default()
@@ -1099,6 +1115,9 @@ mod tests {
         assert_eq!(c.threshold, Some(80_000));
         // field from lower retained when upper has None
         assert_eq!(c.prune_protected_tokens, Some(5_000));
+        let search = merged.web.unwrap().search.unwrap();
+        assert_eq!(search.timeout_secs, Some(3));
+        assert_eq!(search.api_key_env.as_deref(), Some("LOWER_BRAVE_KEY"));
     }
 
     #[test]

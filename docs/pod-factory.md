@@ -184,6 +184,7 @@ enabled = true
 [web.search]
 provider = "brave"
 api_key_env = "BRAVE_SEARCH_API_KEY"
+timeout_secs = 15
 
 [web.fetch]
 timeout_secs = 20
@@ -244,6 +245,7 @@ enabled = true
 [web.search]
 provider = "brave"
 api_key_env = "BRAVE_SEARCH_API_KEY" # API key は env 参照に置き、manifest に raw secret を書かない
+timeout_secs = 15
 
 [web.fetch]
 timeout_secs = 20
@@ -252,7 +254,7 @@ max_response_bytes = 2097152
 max_output_bytes = 65536
 ```
 
-`WebSearch` の最初の provider は Brave Search API（`https://api.search.brave.com/res/v1/web/search`）で、入力は `query` と任意の `limit` / `offset`。Brave の制約に合わせて `query` は 400 文字 / 50 words まで、`limit` は 1-20、`offset` は 0-9 に制限される。
+`WebSearch` の最初の provider は Brave Search API（`https://api.search.brave.com/res/v1/web/search`）で、入力は `query` と任意の `limit` / `offset`。Brave の制約に合わせて `query` は 400 文字 / 50 words まで、`limit` は 1-20、`offset` は 0-9 に制限される。`timeout_secs` を省略した場合は安全な既定値が使われ、provider response は固定上限内で読み込まれる。
 
 `WebFetch` は http/https URL のみを fetch し、timeout・redirect・response/output byte limit を適用する。localhost / private / link-local などの host/IP は fetch 前と各 redirect で拒否される。テストや明示的に信頼した環境では `[web] allow_private_addresses = true` または `[web.fetch] allow_private_addresses = true` を指定できる。
 
