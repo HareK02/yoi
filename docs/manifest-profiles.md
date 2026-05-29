@@ -51,9 +51,6 @@ default = "coder"
 [profile]
 coder = "profiles/coder.nix"
 reviewer = "profiles/reviewer.nix"
-
-[alias]
-work = "project:coder"
 ```
 
 Table entries can carry descriptions:
@@ -64,7 +61,7 @@ path = "profiles/coder.nix"
 description = "Project coding assistant"
 ```
 
-Relative registry paths are resolved against the `profiles.toml` file that declares them. Discovery checks bundled builtin profiles, then the user registry at `<config_dir>/profiles.toml`, then the nearest project registry at `.insomnia/profiles.toml`. Later defaults override earlier defaults, so a project default wins over a user default. Unqualified alias/default targets resolve within the declaring source by default. Unqualified ambiguous names fail closed:
+Relative registry paths are resolved against the `profiles.toml` file that declares them. Discovery checks bundled builtin profiles, then the user registry at `<config_dir>/profiles.toml`, then the nearest project registry at `.insomnia/profiles.toml`. Later defaults override earlier defaults, so a project default wins over a user default. Unqualified defaults resolve within the declaring source by default. Unqualified ambiguous names fail closed:
 
 ```sh
 insomnia --profile coder          # fails if both user:coder and project:coder exist

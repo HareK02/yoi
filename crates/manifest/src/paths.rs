@@ -112,7 +112,7 @@ pub fn user_manifest_path_with_env_override() -> Option<PathBuf> {
     user_manifest_path_from_env(std::env::var_os(USER_MANIFEST_ENV)).or_else(user_manifest_path)
 }
 
-/// `<config_dir>/profiles.toml` — user profile registry/default/alias configuration.
+/// `<config_dir>/profiles.toml` — user profile registry/default configuration.
 ///
 /// This is application/profile selection configuration, not a Pod manifest
 /// layer. It deliberately ignores [`USER_MANIFEST_ENV`].

@@ -901,7 +901,7 @@ permission = "write"
     }
 
     #[test]
-    fn profile_choices_use_project_registry_default_alias() {
+    fn profile_choices_use_project_registry_default() {
         let temp = tempfile::tempdir().unwrap();
         let project = temp.path().join("project");
         let insomnia = project.join(".insomnia");
@@ -909,11 +909,9 @@ permission = "write"
         std::fs::write(
             insomnia.join("profiles.toml"),
             r#"
-default = "work"
+default = "coder"
 [profile]
 coder = "profiles/coder.nix"
-[alias]
-work = "coder"
 "#,
         )
         .unwrap();

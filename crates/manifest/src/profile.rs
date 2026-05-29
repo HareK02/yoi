@@ -153,13 +153,12 @@ impl ProfileRegistryEntry {
 }
 
 /// Discovered profile registry. User/project `profiles.toml` files contribute
-/// only profile discovery metadata (entries, aliases, defaults); those files are
+/// only profile discovery metadata (entries and defaults); those files are
 /// application/project UX configuration, not Pod runtime manifests and are not
 /// merged into the selected profile's runtime manifest.
 #[derive(Debug, Clone, Default)]
 pub struct ProfileRegistry {
     entries: Vec<ProfileRegistryEntry>,
-    aliases: Vec<ProfileAlias>,
     default: Option<ProfileDefault>,
 }
 
@@ -194,25 +193,6 @@ impl ProfileRegistry {
         source: Option<ProfileRegistrySource>,
         name: &str,
     ) -> Result<&ProfileRegistryEntry, ProfileError> {
-        let alias_matches: Vec<_> = self
-            .aliases
-            .iter()
-            .filter(|alias| alias.name == name && source.is_none_or(|s| s == alias.source))
-            .collect();
-        match alias_matches.as_slice() {
-            [alias] => return self.select_named(alias.target_source, &alias.target_name),
-            [] => {}
-            _ => {
-                return Err(ProfileError::AmbiguousProfileName {
-                    name: name.to_string(),
-                    matches: alias_matches
-                        .iter()
-                        .map(|alias| format!("{}:{}", alias.source, alias.name))
-                        .collect(),
-                });
-            }
-        }
-
         let matches: Vec<_> = self
             .entries
             .iter()
@@ -237,10 +217,6 @@ impl ProfileRegistry {
         self.entries.push(entry);
     }
 
-    fn push_alias(&mut self, alias: ProfileAlias) {
-        self.aliases.push(alias);
-    }
-
     fn set_default(&mut self, default: ProfileDefault) {
         self.default = Some(default);
     }
@@ -258,14 +234,6 @@ impl ProfileRegistry {
             entry.is_default = entry.source == source && entry.name == name;
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ProfileAlias {
-    source: ProfileRegistrySource,
-    name: String,
-    target_source: Option<ProfileRegistrySource>,
-    target_name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -520,8 +488,6 @@ struct ProfileRegistryDocument {
     default: Option<String>,
     #[serde(default, alias = "entries")]
     profile: BTreeMap<String, ProfileEntryConfig>,
-    #[serde(default, alias = "aliases")]
-    alias: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -571,16 +537,6 @@ fn load_profile_registry_file(
             path: join_if_relative(base, &entry_path),
             description,
             is_default: false,
-        });
-    }
-
-    for (name, target) in config.alias {
-        let (target_source, target_name) = parse_profile_ref(&target);
-        registry.push_alias(ProfileAlias {
-            source,
-            name,
-            target_source: target_source.or(Some(source)),
-            target_name,
         });
     }
 
@@ -1109,49 +1065,7 @@ description = "Project coder"
     }
 
     #[test]
-    fn config_alias_unqualified_target_resolves_within_declaring_source() {
-        let tmp = TempDir::new().unwrap();
-        let user_config = tmp.path().join("profiles.toml");
-        let project_dir = tmp.path().join("project/.insomnia");
-        std::fs::create_dir_all(&project_dir).unwrap();
-        let project_config = project_dir.join("profiles.toml");
-        std::fs::write(
-            &user_config,
-            r#"
-[profile]
-coder = "profiles/user-coder.nix"
-"#,
-        )
-        .unwrap();
-        std::fs::write(
-            &project_config,
-            r#"
-[profile]
-coder = "profiles/project-coder.nix"
-[alias]
-default-coder = "coder"
-"#,
-        )
-        .unwrap();
-
-        let registry =
-            ProfileDiscovery::with_sources(None, Some(user_config), Some(project_config))
-                .discover()
-                .unwrap();
-        let selected = registry
-            .select(&ProfileSelector::source_named(
-                ProfileRegistrySource::Project,
-                "default-coder",
-            ))
-            .unwrap();
-
-        assert_eq!(selected.source, ProfileRegistrySource::Project);
-        assert_eq!(selected.name, "coder");
-        assert!(selected.path.ends_with("profiles/project-coder.nix"));
-    }
-
-    #[test]
-    fn config_default_alias_marks_resolved_default_entry() {
+    fn default_marks_direct_profile_entry() {
         let tmp = TempDir::new().unwrap();
         let project_dir = tmp.path().join("project/.insomnia");
         std::fs::create_dir_all(&project_dir).unwrap();
@@ -1159,11 +1073,9 @@ default-coder = "coder"
         std::fs::write(
             &project_config,
             r#"
-default = "work"
+default = "coder"
 [profile]
 coder = "profiles/coder.nix"
-[alias]
-work = "coder"
 "#,
         )
         .unwrap();
@@ -1214,31 +1126,5 @@ work = "coder"
             ))
             .unwrap();
         assert_eq!(selected.path, PathBuf::from("/project/coder.nix"));
-    }
-
-    #[test]
-    fn aliases_resolve_within_their_source() {
-        let mut registry = ProfileRegistry::default();
-        registry.push_entry(ProfileRegistryEntry {
-            source: ProfileRegistrySource::Project,
-            name: "coder".to_string(),
-            path: PathBuf::from("/project/coder.nix"),
-            description: None,
-            is_default: false,
-        });
-        registry.push_alias(ProfileAlias {
-            source: ProfileRegistrySource::Project,
-            name: "default-coder".to_string(),
-            target_source: Some(ProfileRegistrySource::Project),
-            target_name: "coder".to_string(),
-        });
-
-        let selected = registry
-            .select(&ProfileSelector::source_named(
-                ProfileRegistrySource::Project,
-                "default-coder",
-            ))
-            .unwrap();
-        assert_eq!(selected.name, "coder");
     }
 }
