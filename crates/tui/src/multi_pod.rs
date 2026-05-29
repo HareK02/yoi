@@ -249,6 +249,10 @@ impl MultiPodApp {
         }
     }
 
+    fn composer_is_blank(&self) -> bool {
+        segments_are_blank(&self.input.submit_segments())
+    }
+
     pub(crate) fn prepare_send(&mut self) -> Option<DirectSendRequest> {
         let entry = match self.list.selected_entry() {
             Some(entry) => entry,
@@ -325,6 +329,7 @@ impl MultiPodApp {
                 self.input.insert_newline();
                 MultiPodAction::None
             }
+            KeyCode::Enter if self.composer_is_blank() => MultiPodAction::Open,
             KeyCode::Enter => self
                 .prepare_send()
                 .map(MultiPodAction::Send)
@@ -1202,6 +1207,76 @@ mod tests {
         assert!(app.notice.as_deref().unwrap().contains("cannot be opened"));
     }
 
+    #[test]
+    fn multi_empty_enter_uses_open_action() {
+        let mut app = test_app(vec![live_info("alpha", PodStatus::Idle)]);
+
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Enter)),
+            MultiPodAction::Open
+        ));
+        let request = app.prepare_open().unwrap();
+
+        assert_eq!(request.pod_name, "alpha");
+        assert_eq!(
+            request.socket_override,
+            Some(PathBuf::from("/tmp/alpha.sock"))
+        );
+        assert_eq!(input_text(&app), "");
+        assert!(app.notice.as_deref().unwrap().contains("Opening alpha"));
+    }
+
+    #[test]
+    fn multi_whitespace_only_enter_uses_open_action() {
+        let mut app = test_app(vec![live_info("alpha", PodStatus::Idle)]);
+        app.input.insert_str("  \n\t");
+
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Enter)),
+            MultiPodAction::Open
+        ));
+        let request = app.prepare_open().unwrap();
+
+        assert_eq!(request.pod_name, "alpha");
+        assert_eq!(input_text(&app), "  \n\t");
+    }
+
+    #[test]
+    fn multi_non_empty_enter_uses_direct_send_action() {
+        let mut app = test_app(vec![live_info("idle", PodStatus::Idle)]);
+        app.input.insert_str("send me");
+
+        let request = match app.handle_key(key(KeyCode::Enter)) {
+            MultiPodAction::Send(request) => request,
+            _ => panic!("non-empty Enter should direct-send"),
+        };
+
+        assert_eq!(request.socket_path, PathBuf::from("/tmp/idle.sock"));
+        assert_eq!(Segment::flatten_to_text(&request.segments), "send me");
+        assert!(app.sending);
+        assert!(app.notice.as_deref().unwrap().contains("Sending to idle"));
+    }
+
+    #[test]
+    fn multi_empty_enter_on_non_openable_row_matches_o_diagnostic() {
+        let mut enter_app = test_app(vec![unreachable_live_info("unreachable")]);
+        assert!(matches!(
+            enter_app.handle_key(key(KeyCode::Enter)),
+            MultiPodAction::Open
+        ));
+        assert!(enter_app.prepare_open().is_none());
+        let enter_notice = enter_app.notice.clone();
+
+        let mut open_app = test_app(vec![unreachable_live_info("unreachable")]);
+        assert!(matches!(
+            open_app.handle_key(key(KeyCode::Char('o'))),
+            MultiPodAction::Open
+        ));
+        assert!(open_app.prepare_open().is_none());
+
+        assert_eq!(enter_notice, open_app.notice);
+    }
+
     fn test_app(live: Vec<LivePodInfo>) -> MultiPodApp {
         app_with_list(PodList::from_sources(
             PodVisibilitySource::ResumePicker,
@@ -1239,6 +1314,13 @@ mod tests {
 
     fn live_info(pod_name: &str, status: PodStatus) -> LivePodInfo {
         live_info_with_updated_at(pod_name, status, 0)
+    }
+
+    fn unreachable_live_info(pod_name: &str) -> LivePodInfo {
+        let mut live = live_info(pod_name, PodStatus::Idle);
+        live.reachable = false;
+        live.status = None;
+        live
     }
 
     fn live_info_with_updated_at(
@@ -1293,5 +1375,9 @@ mod tests {
 
     fn input_text(app: &MultiPodApp) -> String {
         Segment::flatten_to_text(&app.input.submit_segments())
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
     }
 }
