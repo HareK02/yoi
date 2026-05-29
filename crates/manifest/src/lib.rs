@@ -53,6 +53,11 @@ pub struct PodManifest {
     /// memory tools registered.
     #[serde(default)]
     pub memory: Option<MemoryConfig>,
+    /// First-class web tools configuration. Absent or `enabled = false` keeps
+    /// WebSearch/WebFetch registered but disabled, so no network access occurs
+    /// unless a manifest explicitly opts in.
+    #[serde(default)]
+    pub web: Option<WebConfig>,
     /// External Agent Skills (`SKILL.md`) directories to ingest as
     /// Workflows. Each entry is a path to a skills *root* (i.e. a
     /// directory whose children are individual `<name>/SKILL.md` skill
@@ -77,6 +82,75 @@ pub struct SkillsConfig {
     /// [`PodManifest`] is materialised.
     #[serde(default)]
     pub directories: Vec<PathBuf>,
+}
+
+/// Configuration for WebSearch and WebFetch built-in tools.
+///
+/// Network tools are fail-closed: absent config or `enabled = false` disables
+/// both tools. Per-tool `enabled = false` can disable a tool under an enabled
+/// global section.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WebConfig {
+    /// Global opt-in for web tools. Defaults to false when omitted.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// Escape hatch for tests / trusted local deployments. Defaults to false.
+    #[serde(default)]
+    pub allow_private_addresses: Option<bool>,
+    #[serde(default)]
+    pub search: Option<WebSearchConfig>,
+    #[serde(default)]
+    pub fetch: Option<WebFetchConfig>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WebSearchProvider {
+    Brave,
+}
+
+/// WebSearch provider configuration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WebSearchConfig {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub provider: Option<WebSearchProvider>,
+    /// Environment variable that stores the provider API key. Raw secrets do
+    /// not belong in manifest files.
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+    /// Optional provider endpoint override for tests/proxies. Defaults to the
+    /// Brave web search endpoint for the Brave provider.
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub country: Option<String>,
+    #[serde(default)]
+    pub search_lang: Option<String>,
+    #[serde(default)]
+    pub ui_lang: Option<String>,
+    #[serde(default)]
+    pub safesearch: Option<String>,
+}
+
+/// WebFetch HTTP client limits and policy.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WebFetchConfig {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub redirect_limit: Option<usize>,
+    #[serde(default)]
+    pub max_response_bytes: Option<usize>,
+    #[serde(default)]
+    pub max_output_bytes: Option<usize>,
+    /// Per-fetch escape hatch; when absent falls back to `[web]`
+    /// `allow_private_addresses`, then false.
+    #[serde(default)]
+    pub allow_private_addresses: Option<bool>,
 }
 
 /// Memory subsystem configuration. Presence in the manifest enables
@@ -560,6 +634,24 @@ permission = "write"
         assert!(manifest.worker.top_p.is_none());
         assert!(manifest.worker.top_k.is_none());
         assert!(manifest.worker.stop_sequences.is_empty());
+        assert!(manifest.web.is_none());
+    }
+
+    #[test]
+    fn parse_web_config() {
+        let toml = format!(
+            "{}\n[web]\nenabled = true\n\n[web.search]\nprovider = \"brave\"\napi_key_env = \"BRAVE_SEARCH_API_KEY\"\n\n[web.fetch]\ntimeout_secs = 7\nredirect_limit = 3\nmax_response_bytes = 12345\nmax_output_bytes = 2048\n",
+            MINIMAL_REQUIRED
+        );
+        let manifest = PodManifest::from_toml(&toml).unwrap();
+        let web = manifest.web.unwrap();
+        assert_eq!(web.enabled, Some(true));
+        assert_eq!(web.search.unwrap().provider, Some(WebSearchProvider::Brave));
+        let fetch = web.fetch.unwrap();
+        assert_eq!(fetch.timeout_secs, Some(7));
+        assert_eq!(fetch.redirect_limit, Some(3));
+        assert_eq!(fetch.max_response_bytes, Some(12345));
+        assert_eq!(fetch.max_output_bytes, Some(2048));
     }
 
     #[test]

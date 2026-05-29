@@ -80,7 +80,7 @@ fn permission_ask_unsupported(input: &ToolCallSummary) -> ToolResult {
 
 fn permission_target(arguments: &Value) -> String {
     if let Value::Object(map) = arguments {
-        for key in ["command", "file_path", "path", "pattern"] {
+        for key in ["command", "file_path", "path", "pattern", "query", "url"] {
             if let Some(value) = map.get(key).and_then(Value::as_str) {
                 return value.to_string();
             }

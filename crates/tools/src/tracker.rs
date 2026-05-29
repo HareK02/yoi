@@ -35,7 +35,7 @@
 //! let tracker = Tracker::new();    // session lifetime
 //! let bash_outputs = PathBuf::from("/run/insomnia/bash-output");
 //! let task_store = tools::TaskStore::new();
-//! let defs = builtin_tools(fs, tracker, task_store, bash_outputs);
+//! let defs = builtin_tools(fs, tracker, task_store, bash_outputs, None);
 //! ```
 
 use std::collections::{HashMap, VecDeque};

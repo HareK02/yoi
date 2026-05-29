@@ -48,6 +48,7 @@ fn setup() -> (TempDir, TempDir, Registry) {
         tracker,
         TaskStore::new(),
         spill.path().to_path_buf(),
+        None,
     ));
     (dir, spill, reg)
 }

@@ -61,6 +61,7 @@ fn setup() -> (TempDir, TempDir, Registry) {
         tracker,
         TaskStore::new(),
         spill.path().to_path_buf(),
+        None,
     ));
     (dir, spill, reg)
 }
@@ -94,6 +95,8 @@ fn builtin_tools_registers_full_set() {
             "TaskGet",
             "TaskList",
             "TaskUpdate",
+            "WebFetch",
+            "WebSearch",
             "Write"
         ]
     );
@@ -289,7 +292,7 @@ async fn edit_requires_read_across_tools() {
 #[tokio::test]
 async fn deterministic_tool_order_is_registration_order() {
     let (_dir, _spill, reg) = setup();
-    // Registration order from builtin_tools(): Read, Write, Edit, Glob, Grep, Bash, TaskCreate, TaskList, TaskGet, TaskUpdate
+    // Registration order from builtin_tools(): Read, Write, Edit, Glob, Grep, Bash, WebSearch, WebFetch, TaskCreate, TaskList, TaskGet, TaskUpdate
     let names: Vec<&str> = reg.entries.iter().map(|(m, _)| m.name.as_str()).collect();
     assert_eq!(
         names,
@@ -300,6 +303,8 @@ async fn deterministic_tool_order_is_registration_order() {
             "Glob",
             "Grep",
             "Bash",
+            "WebSearch",
+            "WebFetch",
             "TaskCreate",
             "TaskList",
             "TaskGet",
@@ -319,6 +324,8 @@ fn tool_names_match_reference_spec() {
         "Glob",
         "Grep",
         "Bash",
+        "WebSearch",
+        "WebFetch",
         "TaskCreate",
         "TaskList",
         "TaskGet",
@@ -344,6 +351,7 @@ async fn tracker_recent_files_tracks_read_write_edit() {
         tracker.clone(),
         TaskStore::new(),
         spill.path().to_path_buf(),
+        None,
     ));
 
     let a = dir.path().join("a.txt");
