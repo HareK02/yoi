@@ -40,7 +40,30 @@ rustPlatform.buildRustPackage rec {
     filter = sourceFilter;
   };
 
-  cargoLock.lockFile = ./Cargo.lock;
+  cargoHash = "sha256-8ZT5moKFxj/5vbp5rsUG7UkPLY1fvQKhYTyjRWQ58xk=";
+
+  depsExtraArgs = {
+    # nixpkgs 25.11's fetchCargoVendor still uses crates.io's API
+    # download endpoint in this environment, which returns 403 while the
+    # immutable static CDN endpoint works. Keep this local package build on
+    # static.crates.io until the upstream fetcher is fixed in our nixpkgs pin.
+    buildPhase = ''
+      runHook preBuild
+
+      if [ -n "''${cargoRoot-}" ]; then
+        cd "$cargoRoot"
+      fi
+
+      vendor_util="$(command -v fetch-cargo-vendor-util-v2 || command -v fetch-cargo-vendor-util)"
+      cp "$vendor_util" ./fetch-cargo-vendor-util-static
+      substituteInPlace ./fetch-cargo-vendor-util-static \
+        --replace-fail 'https://crates.io/api/v1/crates/{pkg["name"]}/{pkg["version"]}/download' \
+                       'https://static.crates.io/crates/{pkg["name"]}/{pkg["version"]}/download'
+      ./fetch-cargo-vendor-util-static create-vendor-staging ./Cargo.lock "$out"
+
+      runHook postBuild
+    '';
+  };
 
   strictDeps = true;
 
