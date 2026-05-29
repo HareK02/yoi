@@ -1,13 +1,25 @@
+<!-- event: create author: tickets.sh at: 2026-05-29T18:02:57Z -->
+
+## Created
+
+Created by tickets.sh create.
+
+---
+
+<!-- event: close author: hare at: 2026-05-29T18:11:10Z status: closed -->
+
+## Closed
+
 ---
 id: 20260529-180257-profile-registry-config-file
 slug: profile-registry-config-file
 title: Move profile registry out of manifest files
-status: open
+status: closed
 kind: bug
 priority: P1
 labels: [manifest, profiles, config]
 created_at: 2026-05-29T18:02:57Z
-updated_at: 2026-05-29T18:02:57Z
+updated_at: 2026-05-29T18:11:09Z
 assignee: null
 legacy_ticket: null
 ---
@@ -67,3 +79,6 @@ This was caught immediately after merge, before compatibility needs exist. Do no
 - Focused manifest/tui/pod/client profile tests pass.
 - `cargo fmt --check`
 - Relevant checks pass.
+
+
+---
