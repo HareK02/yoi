@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use protocol::{
     AlertLevel, AlertSource, CompletionEntry, CompletionKind, Event, Method, PodStatus,
@@ -107,6 +107,33 @@ impl QueuedInput {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum ActionbarNoticeLevel {
+    Info,
+    Warn,
+    Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionbarNoticeSource {
+    Tui,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActionbarNotice {
+    pub text: String,
+    pub level: ActionbarNoticeLevel,
+    pub source: ActionbarNoticeSource,
+    pub expires_at: Instant,
+}
+
+impl ActionbarNotice {
+    pub fn is_expired(&self, now: Instant) -> bool {
+        now >= self.expires_at
+    }
+}
+
 pub struct App {
     pub pod_name: String,
     pub connected: bool,
@@ -134,6 +161,9 @@ pub struct App {
     pub latest_llm_wait_event: Option<String>,
     /// Latest memory extract/consolidation lifecycle event for actionbar observability.
     pub latest_memory_worker_event: Option<String>,
+    /// Current transient actionbar notice. Notices are local UI state only:
+    /// they are never appended to transcript/session history or LLM context.
+    actionbar_notice: Option<ActionbarNotice>,
     /// Normal composer input that is submitted as `Method::Run`.
     pub input: InputBuffer,
     /// Separate command-line input. It is never submitted as a user message.
@@ -200,6 +230,7 @@ impl App {
             current_tool: None,
             latest_llm_wait_event: None,
             latest_memory_worker_event: None,
+            actionbar_notice: None,
             input: InputBuffer::new(),
             command_input: InputBuffer::new(),
             input_mode: CommandInputMode::Composer,
@@ -470,6 +501,48 @@ impl App {
 
     pub fn queued_input_count(&self) -> usize {
         self.queued_inputs.len()
+    }
+
+    pub fn flash_actionbar_notice(
+        &mut self,
+        text: impl Into<String>,
+        level: ActionbarNoticeLevel,
+        source: ActionbarNoticeSource,
+        duration: Duration,
+    ) {
+        self.flash_actionbar_notice_at(text, level, source, Instant::now(), duration);
+    }
+
+    pub fn flash_actionbar_notice_at(
+        &mut self,
+        text: impl Into<String>,
+        level: ActionbarNoticeLevel,
+        source: ActionbarNoticeSource,
+        now: Instant,
+        duration: Duration,
+    ) {
+        self.actionbar_notice = Some(ActionbarNotice {
+            text: text.into(),
+            level,
+            source,
+            expires_at: now + duration,
+        });
+    }
+
+    pub fn current_actionbar_notice(&self, now: Instant) -> Option<&ActionbarNotice> {
+        self.actionbar_notice
+            .as_ref()
+            .filter(|notice| !notice.is_expired(now))
+    }
+
+    pub fn clear_expired_actionbar_notice(&mut self, now: Instant) {
+        if self
+            .actionbar_notice
+            .as_ref()
+            .is_some_and(|notice| notice.is_expired(now))
+        {
+            self.actionbar_notice = None;
+        }
     }
 
     pub fn next_queued_input_preview(&self) -> Option<&str> {
@@ -1751,6 +1824,40 @@ mod llm_wait_event_tests {
             app.latest_llm_wait_event.as_deref(),
             Some("LLM stream interrupted; continuing generation (1/3): SSE parse error: closed")
         );
+    }
+}
+
+#[cfg(test)]
+mod actionbar_notice_tests {
+    use super::*;
+
+    #[test]
+    fn actionbar_notice_expires_from_injected_time_source() {
+        let mut app = App::new("test".into());
+        let now = Instant::now();
+        let duration = Duration::from_secs(2);
+
+        app.flash_actionbar_notice_at(
+            "Pod keeps running",
+            ActionbarNoticeLevel::Warn,
+            ActionbarNoticeSource::Tui,
+            now,
+            duration,
+        );
+
+        let notice = app.current_actionbar_notice(now).expect("notice is active");
+        assert_eq!(notice.text, "Pod keeps running");
+        assert_eq!(notice.level, ActionbarNoticeLevel::Warn);
+        assert_eq!(notice.source, ActionbarNoticeSource::Tui);
+        assert_eq!(notice.expires_at, now + duration);
+        assert!(
+            app.current_actionbar_notice(now + duration - Duration::from_millis(1))
+                .is_some()
+        );
+        assert!(app.current_actionbar_notice(now + duration).is_none());
+
+        app.clear_expired_actionbar_notice(now + duration);
+        assert!(app.current_actionbar_notice(now).is_none());
     }
 }
 
