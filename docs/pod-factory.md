@@ -337,42 +337,34 @@ import-map 形式のプレフィックスで指定する:
 
 ## `insomnia-pod` CLI
 
-`insomnia-pod` は通常、builtin default → user manifest → project manifest → overlay の cascade で manifest を解決して起動する。
+`insomnia-pod` の通常起動は profile discovery/default から runtime manifest を作る。user/project `manifest.toml` の ambient cascade は通常起動では使わない。
 
 ```
-insomnia-pod [--project <path>] [--overlay <toml>] [-s/--store <path>] [--session <uuid>]
+insomnia-pod [--profile <selector>] [--profile-pod-name <name>] [-s/--store <path>] [--session <uuid>]
 ```
 
 | フラグ | 説明 |
 |---|---|
-| `--project <path>` | プロジェクト manifest 探索の起点。省略時は cwd から上方向に `.insomnia/manifest.toml` を探索 |
-| `--overlay <toml>` | 最上層の overlay を inline TOML 文字列で渡す（例: `--overlay 'worker.instruction = "$user/foo"'`） |
+| `--profile <selector>` | builtin/user/project profile registry から Nix profile を選択。省略時は registry default（通常は `builtin:default`） |
+| `--profile-pod-name <name>` | profile 由来 manifest の `pod.name` を fresh spawn 用に上書き |
+| `--overlay <toml>` | TUI/launcher compatibility 用の inline override。user/project manifest discovery は行わない |
 | `-s, --store <path>` | セッション永続化ディレクトリ（デフォルト: `<data_dir>/sessions/`、`manifest::paths` で解決） |
 | `--session <uuid>` | 既存 session id から Pod を復元し、同じ jsonl に後続 turn を追記する |
 
-user manifest は CLI フラグではなく、以下の規則で解決する。
-
-| 入力 | 挙動 |
-|---|---|
-| `INSOMNIA_USER_MANIFEST=<path>` | 指定 path を user manifest として読む。ファイル不在や parse error は起動エラー |
-| `INSOMNIA_USER_MANIFEST=` | 空文字列は未指定扱い |
-| env 未指定 | `manifest::paths::user_manifest_path()` で自動探索し、存在すれば読む |
-
-単一ファイルだけで起動したい場合は cascade を使わず、`--manifest` を指定する。
+単一ファイルだけで起動したい場合は `--manifest` を指定する。
 
 ```
 insomnia-pod --manifest <path> [-s/--store <path>] [--session <uuid>]
 ```
 
-`--manifest` は指定 TOML 1 枚だけを `PodManifest::from_toml` で読み、user / project / overlay layer は一切読まない。したがって `--project`、`--overlay`、非空の `INSOMNIA_USER_MANIFEST` とは併用不可。
+`--manifest` は指定 TOML 1 枚だけを読み、builtin defaults を merge したうえで `PodManifestConfig -> PodManifest` の required validation を通す。user / project manifest layer は読まない。`--profile`、`--project`、`--overlay` とは併用不可。
 
 spawn 子 Pod 用の内部フラグとして `--adopt` と `--callback <path>` がある。これらは `SpawnPod` が scope allocation と親 callback socket を引き継がせるために使うもので、通常の手動起動では使わない。
 
 Pod の作業ディレクトリは `insomnia-pod` 起動時の cwd が直接使われる。別ディレクトリで
 動かしたい場合は `cd <path> && insomnia-pod ...` のように外側で `cd` してから起動する。
 
-引数無しで起動すると、cwd + `manifest::paths` の自動解決だけで動く最小構成になる
-（overlay 無し、プロジェクトに `.insomnia/manifest.toml` があればそれを使う）。
+引数無しで起動すると、profile registry default（通常は bundled `builtin:default`）で起動する。
 
 ---
 
