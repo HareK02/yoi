@@ -107,6 +107,81 @@ impl QueuedInput {
     }
 }
 
+const COMPOSER_INPUT_HISTORY_LIMIT: usize = 100;
+
+struct ComposerInputHistory {
+    entries: VecDeque<Vec<Segment>>,
+    browse: Option<ComposerInputHistoryBrowse>,
+}
+
+struct ComposerInputHistoryBrowse {
+    index: usize,
+    draft: Vec<Segment>,
+}
+
+impl ComposerInputHistory {
+    fn new() -> Self {
+        Self {
+            entries: VecDeque::new(),
+            browse: None,
+        }
+    }
+
+    fn record(&mut self, segments: Vec<Segment>) {
+        if segments_are_blank(&segments) {
+            return;
+        }
+        self.browse = None;
+        if self.entries.back() == Some(&segments) {
+            return;
+        }
+        if self.entries.len() == COMPOSER_INPUT_HISTORY_LIMIT {
+            self.entries.pop_front();
+        }
+        self.entries.push_back(segments);
+    }
+
+    fn is_browsing(&self) -> bool {
+        self.browse.is_some()
+    }
+
+    fn browse_older(&mut self, draft: Vec<Segment>) -> Option<Vec<Segment>> {
+        if self.entries.is_empty() {
+            return None;
+        }
+
+        let index = match self.browse.as_mut() {
+            Some(browse) => {
+                if browse.index > 0 {
+                    browse.index -= 1;
+                }
+                browse.index
+            }
+            None => {
+                let index = self.entries.len() - 1;
+                self.browse = Some(ComposerInputHistoryBrowse { index, draft });
+                index
+            }
+        };
+
+        self.entries.get(index).cloned()
+    }
+
+    fn browse_newer(&mut self) -> Option<Vec<Segment>> {
+        let browse = self.browse.as_mut()?;
+        if browse.index + 1 < self.entries.len() {
+            browse.index += 1;
+            return self.entries.get(browse.index).cloned();
+        }
+
+        self.browse.take().map(|browse| browse.draft)
+    }
+
+    fn cancel_browse(&mut self) {
+        self.browse = None;
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 pub enum ActionbarNoticeLevel {
@@ -205,6 +280,9 @@ pub struct App {
     /// TUI-local FIFO of user inputs submitted while the Pod is already running.
     /// Entries have not been sent to the Pod yet, so they remain editable/cancellable locally.
     queued_inputs: VecDeque<QueuedInput>,
+    /// TUI-local readline-style composer input history. This is intentionally
+    /// client-side only: recalled entries are plain drafts until submitted again.
+    input_history: ComposerInputHistory,
     /// Local submit state kept until the accepted run either completes
     /// normally or reports that the empty assistant turn was rolled back.
     pending_submit_rollback: Option<RollbackSubmitState>,
@@ -251,6 +329,7 @@ impl App {
             task_pane_open: false,
             task_pane_scroll: 0,
             queued_inputs: VecDeque::new(),
+            input_history: ComposerInputHistory::new(),
             pending_submit_rollback: None,
             last_rolled_back_input: None,
         }
@@ -365,6 +444,7 @@ impl App {
         // `prefix_start` indexes the sigil atom; the text we want to
         // replace lives just after it (sigil itself stays).
         let typed_start = state.prefix_start + 1;
+        self.input_history.cancel_browse();
         self.input.replace_with_text_at(typed_start, &text);
         self.refresh_completion()
     }
@@ -419,6 +499,7 @@ impl App {
         };
         let kind = state.kind;
         let start = state.prefix_start;
+        self.input_history.cancel_browse();
         match kind {
             CompletionKind::File => self.input.replace_with_file_ref(start, value),
             CompletionKind::Knowledge => self.input.replace_with_knowledge_ref(start, value),
@@ -453,6 +534,7 @@ impl App {
         let kind = state.kind;
         let start = state.prefix_start;
         let value = entry.value.clone();
+        self.input_history.cancel_browse();
         match kind {
             CompletionKind::File => self.input.replace_with_file_ref(start, value),
             CompletionKind::Knowledge => self.input.replace_with_knowledge_ref(start, value),
@@ -468,11 +550,13 @@ impl App {
             // Empty Enter only does something meaningful when the Pod
             // is paused: resume the interrupted turn. Otherwise no-op.
             if self.paused {
+                self.input_history.cancel_browse();
                 self.input.clear();
                 return Some(Method::Resume);
             }
             return None;
         }
+        self.input_history.record(segments.clone());
         if self.running {
             self.queued_inputs.push_back(QueuedInput::new(segments));
             self.input.clear();
@@ -501,6 +585,44 @@ impl App {
 
     pub fn queued_input_count(&self) -> usize {
         self.queued_inputs.len()
+    }
+
+    pub fn input_history_len(&self) -> usize {
+        self.input_history.entries.len()
+    }
+
+    pub fn input_history_is_browsing(&self) -> bool {
+        self.input_history.is_browsing()
+    }
+
+    pub fn can_browse_input_history_older(&self) -> bool {
+        self.input_history.is_browsing() || self.input.cursor_at_start()
+    }
+
+    pub fn can_browse_input_history_newer(&self) -> bool {
+        self.input_history.is_browsing() && self.input.cursor_at_end()
+    }
+
+    pub fn browse_input_history_older(&mut self) -> bool {
+        if self.input_history.entries.is_empty() {
+            return false;
+        }
+        let draft = self.input.submit_segments();
+        let Some(segments) = self.input_history.browse_older(draft) else {
+            return false;
+        };
+        self.input.replace_with_segments(&segments);
+        self.completion = None;
+        true
+    }
+
+    pub fn browse_input_history_newer(&mut self) -> bool {
+        let Some(segments) = self.input_history.browse_newer() else {
+            return false;
+        };
+        self.input.replace_with_segments(&segments);
+        self.completion = None;
+        true
     }
 
     pub fn flash_actionbar_notice(
@@ -566,6 +688,7 @@ impl App {
         let Some(queued) = self.queued_inputs.pop_front() else {
             return false;
         };
+        self.input_history.cancel_browse();
         self.input.replace_with_segments(&queued.segments);
         self.completion = None;
         true
@@ -1512,6 +1635,9 @@ impl App {
     // keeping the normal composer buffer intact.
     pub fn insert_char(&mut self, c: char) {
         let command_mode = self.is_command_mode();
+        if !command_mode {
+            self.input_history.cancel_browse();
+        }
         self.active_input_mut().insert_char(c);
         if command_mode {
             self.command_completion_selected = None;
@@ -1519,6 +1645,9 @@ impl App {
     }
     pub fn insert_newline(&mut self) {
         let command_mode = self.is_command_mode();
+        if !command_mode {
+            self.input_history.cancel_browse();
+        }
         self.active_input_mut().insert_newline();
         if command_mode {
             self.command_completion_selected = None;
@@ -1529,11 +1658,15 @@ impl App {
             self.command_input.insert_str(&content);
             self.command_completion_selected = None;
         } else {
+            self.input_history.cancel_browse();
             self.input.insert_paste(content);
         }
     }
     pub fn delete_char_before(&mut self) {
         let command_mode = self.is_command_mode();
+        if !command_mode {
+            self.input_history.cancel_browse();
+        }
         self.active_input_mut().delete_before();
         if command_mode {
             self.command_completion_selected = None;
@@ -1541,6 +1674,9 @@ impl App {
     }
     pub fn delete_char_after(&mut self) {
         let command_mode = self.is_command_mode();
+        if !command_mode {
+            self.input_history.cancel_browse();
+        }
         self.active_input_mut().delete_after();
         if command_mode {
             self.command_completion_selected = None;
@@ -2779,6 +2915,124 @@ mod completion_flow_tests {
         assert_eq!(tasks[0].subject, "a");
         assert_eq!(tasks[1].subject, "b");
         assert_eq!(tasks[1].status, crate::task::TaskStatus::Inprogress);
+    }
+
+    #[test]
+    fn input_history_records_queued_inputs_and_suppresses_consecutive_duplicates() {
+        let mut app = App::new("test".into());
+        app.running = true;
+
+        for c in "repeat".chars() {
+            app.insert_char(c);
+        }
+        assert!(app.submit_input().is_none());
+        assert_eq!(app.input_history_len(), 1);
+        assert_eq!(app.queued_input_count(), 1);
+
+        for c in "repeat".chars() {
+            app.insert_char(c);
+        }
+        assert!(app.submit_input().is_none());
+        assert_eq!(app.input_history_len(), 1);
+        assert_eq!(app.queued_input_count(), 2);
+
+        app.insert_char(' ');
+        assert!(app.submit_input().is_none());
+        assert_eq!(app.input_history_len(), 1);
+    }
+
+    #[test]
+    fn input_history_preserves_typed_segments() {
+        let mut app = App::new("test".into());
+        let original = vec![
+            Segment::Text {
+                content: "see ".into(),
+            },
+            Segment::FileRef {
+                path: "src/main.rs".into(),
+            },
+            Segment::Text {
+                content: " and ".into(),
+            },
+            Segment::KnowledgeRef {
+                slug: "design-note".into(),
+            },
+            Segment::Text {
+                content: " then ".into(),
+            },
+            Segment::WorkflowInvoke {
+                slug: "review".into(),
+            },
+            Segment::Paste {
+                id: 1,
+                chars: 13,
+                lines: 1,
+                content: "literal paste".into(),
+            },
+        ];
+        app.input.replace_with_segments(&original);
+        assert!(matches!(app.submit_input(), Some(Method::Run { .. })));
+
+        assert!(app.browse_input_history_older());
+        assert_eq!(app.input.submit_segments(), original);
+    }
+
+    #[test]
+    fn input_history_restores_non_empty_draft_after_newest() {
+        let mut app = App::new("test".into());
+        for c in "sent".chars() {
+            app.insert_char(c);
+        }
+        assert!(matches!(app.submit_input(), Some(Method::Run { .. })));
+
+        for c in "draft".chars() {
+            app.insert_char(c);
+        }
+        assert!(app.browse_input_history_older());
+        assert_eq!(input_text(&app), "sent");
+        assert!(app.browse_input_history_newer());
+        assert_eq!(input_text(&app), "draft");
+        assert!(!app.input_history_is_browsing());
+    }
+
+    #[test]
+    fn editing_recalled_input_exits_history_browse_mode() {
+        let mut app = App::new("test".into());
+        for c in "sent".chars() {
+            app.insert_char(c);
+        }
+        assert!(matches!(app.submit_input(), Some(Method::Run { .. })));
+
+        assert!(app.browse_input_history_older());
+        assert!(app.input_history_is_browsing());
+        app.insert_char('!');
+        assert!(!app.input_history_is_browsing());
+        assert_eq!(input_text(&app), "sent!");
+        assert!(!app.browse_input_history_newer());
+        assert_eq!(input_text(&app), "sent!");
+    }
+
+    #[test]
+    fn submitting_recalled_history_sends_normally_and_records_if_not_duplicate() {
+        let mut app = App::new("test".into());
+        for c in "first".chars() {
+            app.insert_char(c);
+        }
+        assert!(matches!(app.submit_input(), Some(Method::Run { .. })));
+        for c in "second".chars() {
+            app.insert_char(c);
+        }
+        assert!(matches!(app.submit_input(), Some(Method::Run { .. })));
+
+        assert!(app.browse_input_history_older());
+        assert!(app.browse_input_history_older());
+        let method = app.submit_input();
+        match method {
+            Some(Method::Run { input }) => assert_eq!(Segment::flatten_to_text(&input), "first"),
+            other => panic!("expected recalled run, got {other:?}"),
+        }
+        assert_eq!(app.input_history_len(), 3);
+        assert!(!app.input_history_is_browsing());
     }
 
     #[test]

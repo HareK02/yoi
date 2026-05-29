@@ -176,6 +176,14 @@ impl InputBuffer {
         self.atoms.is_empty()
     }
 
+    pub fn cursor_at_start(&self) -> bool {
+        self.cursor == 0
+    }
+
+    pub fn cursor_at_end(&self) -> bool {
+        self.cursor == self.atoms.len()
+    }
+
     /// Replace the whole composer with protocol segments previously emitted
     /// by [`submit_segments`](Self::submit_segments), preserving typed chips
     /// and placing the cursor at the end of the restored input.
