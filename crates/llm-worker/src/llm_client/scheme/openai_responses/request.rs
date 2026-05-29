@@ -478,6 +478,48 @@ mod tests {
     }
 
     #[test]
+    fn persisted_reasoning_items_are_preserved_across_user_turns() {
+        let scheme = OpenAIResponsesScheme::new();
+        let old_reasoning = Item::reasoning("old").with_encrypted_content("OLD_ENC");
+        let current_reasoning = Item::reasoning("current").with_encrypted_content("CURRENT_ENC");
+        let req = Request::new()
+            .user("old prompt")
+            .item(old_reasoning)
+            .assistant("old answer")
+            .user("new prompt")
+            .item(current_reasoning);
+        let body = scheme.build_request("gpt-5", &req, &cap_with_reasoning());
+        let encrypted: Vec<_> = body
+            .input
+            .iter()
+            .filter_map(|item| match item {
+                InputItem::Reasoning {
+                    encrypted_content, ..
+                } => encrypted_content.as_deref(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(encrypted, vec!["OLD_ENC", "CURRENT_ENC"]);
+    }
+
+    #[test]
+    fn reasoning_is_kept_across_function_call_loop() {
+        let scheme = OpenAIResponsesScheme::new();
+        let req = Request::new()
+            .user("run tool")
+            .item(Item::reasoning("plan").with_encrypted_content("ENC"))
+            .item(Item::tool_call("c1", "tool", "{}"))
+            .item(Item::tool_result("c1", "ok"));
+        let body = scheme.build_request("gpt-5", &req, &cap_with_reasoning());
+        assert!(matches!(body.input[1], InputItem::Reasoning { .. }));
+        assert!(matches!(body.input[2], InputItem::FunctionCall { .. }));
+        assert!(matches!(
+            body.input[3],
+            InputItem::FunctionCallOutput { .. }
+        ));
+    }
+
+    #[test]
     fn reasoning_summary_field_is_always_serialized() {
         // Responses API は reasoning item に `summary` を必須で要求する。
         // summary が空でも wire 上に `summary: []` として残らないと、
@@ -509,6 +551,11 @@ mod tests {
         let reasoning = body.reasoning.expect("reasoning should be set");
         assert_eq!(reasoning.effort.as_deref(), Some("high"));
         assert_eq!(reasoning.summary, "auto");
+        let json = serde_json::to_value(reasoning).unwrap();
+        assert!(
+            json.get("context").is_none(),
+            "reasoning.context must not be serialized, got: {json}"
+        );
     }
 
     #[test]

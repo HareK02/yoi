@@ -1270,7 +1270,8 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 self.task_reminder_state.clone(),
                 self.prompts.clone(),
                 self.log_writer.clone(),
-            );
+            )
+            .with_usage_tracker(self.usage_tracker.clone());
             self.worker_mut().set_interceptor(interceptor);
             self.interceptor_installed = true;
         }

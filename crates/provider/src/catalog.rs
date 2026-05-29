@@ -117,9 +117,14 @@ pub struct ModelEntry {
     #[serde(default)]
     pub capability: Option<ModelCapability>,
     /// モデル単位の context window。省略時は provider default → builtin
-    /// fallback にフォールバックする。
+    /// fallback にフォールバックする。実効値は `max_context_window` で clamp
+    /// される。
     #[serde(default)]
     pub context_window: Option<u64>,
+    /// backend が実際に受け付ける context window の上限。UI や pre-request
+    /// safety は希望値ではなく clamp 済みの実効値を使う。
+    #[serde(default)]
+    pub max_context_window: Option<u64>,
 }
 
 /// 解決済みモデル設定。`build_client` が消費する完成形。
@@ -130,7 +135,10 @@ pub struct ModelConfig {
     pub model_id: String,
     pub auth: AuthRef,
     pub capability: Option<ModelCapability>,
+    /// Effective context window after backend maximum clamping.
     pub context_window: u64,
+    /// Backend maximum that constrained `context_window`, when known.
+    pub max_context_window: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -259,7 +267,8 @@ fn split_ref(s: &str) -> Option<(&str, &str)> {
 /// manifest 明示 > model catalog > provider.default_capability >
 /// （`build_client` 側で）`Scheme::default_capability()`。
 /// context_window は manifest 明示 > model catalog > provider default >
-/// [`DEFAULT_CONTEXT_WINDOW`]。
+/// [`DEFAULT_CONTEXT_WINDOW`]。実効 context_window は manifest/model の
+/// max_context_window で clamp される。
 pub fn resolve_model_manifest(manifest: &ModelManifest) -> Result<ModelConfig, ResolveError> {
     let providers = load_providers().map_err(ResolveError::LoadProviders)?;
     let models = load_models().map_err(ResolveError::LoadModels)?;
@@ -310,11 +319,15 @@ pub fn resolve_with_catalogs(
                 .and_then(|m| m.capability.clone())
                 .or_else(|| provider.default_capability.clone())
         });
-        let context_window = manifest
+        let desired_context_window = manifest
             .context_window
             .or_else(|| model_entry.and_then(|m| m.context_window))
             .or(provider.default_context_window)
             .unwrap_or(DEFAULT_CONTEXT_WINDOW);
+        let max_context_window = manifest
+            .max_context_window
+            .or_else(|| model_entry.and_then(|m| m.max_context_window));
+        let context_window = clamp_context_window(desired_context_window, max_context_window);
         Ok(ModelConfig {
             scheme,
             base_url,
@@ -322,6 +335,7 @@ pub fn resolve_with_catalogs(
             auth,
             capability,
             context_window,
+            max_context_window,
         })
     } else {
         let scheme = manifest
@@ -335,15 +349,22 @@ pub fn resolve_with_catalogs(
             .auth
             .clone()
             .ok_or(ResolveError::InlineMissing("auth"))?;
+        let desired_context_window = manifest.context_window.unwrap_or(DEFAULT_CONTEXT_WINDOW);
+        let max_context_window = manifest.max_context_window;
         Ok(ModelConfig {
             scheme,
             base_url: manifest.base_url.clone(),
             model_id,
             auth,
             capability: manifest.capability.clone(),
-            context_window: manifest.context_window.unwrap_or(DEFAULT_CONTEXT_WINDOW),
+            context_window: clamp_context_window(desired_context_window, max_context_window),
+            max_context_window,
         })
     }
+}
+
+fn clamp_context_window(desired: u64, max: Option<u64>) -> u64 {
+    max.map(|limit| desired.min(limit)).unwrap_or(desired)
 }
 
 #[cfg(test)]
@@ -418,6 +439,52 @@ mod tests {
         };
         let cfg = resolve_with_catalogs(&manifest, &providers, &models).unwrap();
         assert_eq!(cfg.context_window, 123_456);
+    }
+
+    #[test]
+    fn context_window_is_clamped_by_catalog_backend_max() {
+        let providers = load_builtin_providers().unwrap();
+        let models = load_builtin_models().unwrap();
+        let manifest = ModelManifest {
+            ref_: Some("codex-oauth/gpt-5.5".into()),
+            context_window: Some(1_000_000),
+            ..Default::default()
+        };
+        let cfg = resolve_with_catalogs(&manifest, &providers, &models).unwrap();
+        assert_eq!(cfg.context_window, 272_000);
+        assert_eq!(cfg.max_context_window, Some(272_000));
+    }
+
+    #[test]
+    fn inline_context_window_is_clamped_by_manifest_backend_max() {
+        let providers = load_builtin_providers().unwrap();
+        let models = load_builtin_models().unwrap();
+        let manifest = ModelManifest {
+            scheme: Some(SchemeKind::Anthropic),
+            model_id: Some("custom".into()),
+            auth: Some(AuthRef::None),
+            context_window: Some(1_000_000),
+            max_context_window: Some(272_000),
+            ..Default::default()
+        };
+        let cfg = resolve_with_catalogs(&manifest, &providers, &models).unwrap();
+        assert_eq!(cfg.context_window, 272_000);
+        assert_eq!(cfg.max_context_window, Some(272_000));
+    }
+
+    #[test]
+    fn manifest_backend_max_overrides_catalog_backend_max() {
+        let providers = load_builtin_providers().unwrap();
+        let models = load_builtin_models().unwrap();
+        let manifest = ModelManifest {
+            ref_: Some("codex-oauth/gpt-5.5".into()),
+            context_window: Some(1_000_000),
+            max_context_window: Some(500_000),
+            ..Default::default()
+        };
+        let cfg = resolve_with_catalogs(&manifest, &providers, &models).unwrap();
+        assert_eq!(cfg.context_window, 500_000);
+        assert_eq!(cfg.max_context_window, Some(500_000));
     }
 
     #[test]

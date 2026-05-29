@@ -52,10 +52,16 @@ pub struct ModelManifest {
     /// `default_capability` → scheme 既定の順で解決される。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capability: Option<ModelCapability>,
-    /// モデルのコンテキストウィンドウ上限（tokens）。カタログ未掲載 / inline
-    /// モデルでもここで明示 override できる。
+    /// モデルの希望コンテキストウィンドウ（tokens）。カタログ未掲載 / inline
+    /// モデルでもここで明示 override できる。実効値は `max_context_window`
+    /// またはカタログ上の backend maximum で clamp される。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
+    /// backend が実際に受け付けるコンテキストウィンドウ上限（tokens）。
+    /// 表示・安全判定に使う実効 context window は `context_window` とこの値の
+    /// 小さい方になる。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_context_window: Option<u64>,
 }
 
 impl ModelManifest {
@@ -70,6 +76,7 @@ impl ModelManifest {
             auth: upper.auth.or(self.auth),
             capability: upper.capability.or(self.capability),
             context_window: upper.context_window.or(self.context_window),
+            max_context_window: upper.max_context_window.or(self.max_context_window),
         }
     }
 }

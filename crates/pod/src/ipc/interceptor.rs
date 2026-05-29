@@ -22,6 +22,7 @@ use tracing::info;
 use tracing::warn;
 
 use crate::compact::state::CompactState;
+use crate::compact::usage_tracker::UsageTracker;
 use session_store::{SystemItem, SystemReminder};
 use tools::{TaskEntry, TaskStatus, TaskStore};
 
@@ -91,6 +92,10 @@ pub(crate) struct PodInterceptor {
     /// per-request `context` to estimate current occupancy for threshold
     /// checks. `None` when compaction is disabled (both thresholds unset).
     usage_history: Option<Arc<Mutex<Vec<UsageRecord>>>>,
+    /// In-flight usage records observed during the current run but not yet
+    /// persisted into `usage_history`. Subsequent tool-loop LLM calls must
+    /// see these records during pre-request safety accounting.
+    usage_tracker: Option<Arc<UsageTracker>>,
     /// Pending-notification buffer drained into `worker.history`
     /// via [`Self::pending_history_appends`] just before the next LLM
     /// request. The Worker `extend`s these into its persistent history
@@ -138,6 +143,7 @@ impl PodInterceptor {
             registry,
             compact_state,
             usage_history,
+            usage_tracker: None,
             pending_notifies,
             pending_attachments,
             task_store,
@@ -147,6 +153,11 @@ impl PodInterceptor {
             next_turn_index: AtomicUsize::new(0),
             tool_calls_this_turn: AtomicUsize::new(0),
         }
+    }
+
+    pub(crate) fn with_usage_tracker(mut self, usage_tracker: Arc<UsageTracker>) -> Self {
+        self.usage_tracker = Some(usage_tracker);
+        self
     }
 
     /// Commit each `SystemItem` as its own `LogEntry::SystemItem`
@@ -175,7 +186,10 @@ impl PodInterceptor {
     /// `usage_history` is not attached (compaction fully disabled).
     fn estimated_tokens(&self, context: &[Item]) -> Option<u64> {
         let handle = self.usage_history.as_ref()?;
-        let records = handle.lock().expect("usage_history poisoned").clone();
+        let mut records = handle.lock().expect("usage_history poisoned").clone();
+        if let Some(tracker) = self.usage_tracker.as_ref() {
+            records.extend(tracker.records());
+        }
         Some(total_tokens(context, &records).tokens)
     }
 
@@ -305,9 +319,15 @@ impl Interceptor for PodInterceptor {
             if !state.is_disabled() && !state.just_compacted() {
                 let current = current_tokens.unwrap_or(0);
                 if state.exceeds_request(current) {
+                    let shape = context_shape(context);
                     info!(
                         input_tokens = current,
                         threshold = state.request_threshold().unwrap_or(0),
+                        items_len = shape.items_len,
+                        items_json_bytes = shape.items_json_bytes,
+                        reasoning_items = shape.reasoning_items,
+                        reasoning_encrypted_content_count = shape.reasoning_encrypted_content_count,
+                        reasoning_encrypted_content_bytes = shape.reasoning_encrypted_content_bytes,
                         "Between-requests compaction threshold exceeded, yielding"
                     );
                     return PreRequestAction::Yield;
@@ -398,6 +418,37 @@ impl Interceptor for PodInterceptor {
             hook.call(&info).await;
         }
     }
+}
+
+struct ContextShape {
+    items_len: usize,
+    items_json_bytes: Option<usize>,
+    reasoning_items: usize,
+    reasoning_encrypted_content_count: usize,
+    reasoning_encrypted_content_bytes: usize,
+}
+
+fn context_shape(context: &[Item]) -> ContextShape {
+    let mut shape = ContextShape {
+        items_len: context.len(),
+        items_json_bytes: serde_json::to_vec(context).ok().map(|bytes| bytes.len()),
+        reasoning_items: 0,
+        reasoning_encrypted_content_count: 0,
+        reasoning_encrypted_content_bytes: 0,
+    };
+    for item in context {
+        if let Item::Reasoning {
+            encrypted_content, ..
+        } = item
+        {
+            shape.reasoning_items += 1;
+            if let Some(encrypted) = encrypted_content {
+                shape.reasoning_encrypted_content_count += 1;
+                shape.reasoning_encrypted_content_bytes += encrypted.len();
+            }
+        }
+    }
+    shape
 }
 
 fn extract_message_text(item: &Item) -> Option<String> {
@@ -526,6 +577,40 @@ mod tests {
         assert!(matches!(action, PreRequestAction::Yield));
         // Hook must not run when an internal mechanism short-circuits first.
         assert_eq!(count.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn pre_llm_request_counts_in_flight_usage_records() {
+        let registry = Arc::new(HookRegistryBuilder::new().build());
+        let state = Arc::new(CompactState::new(None, Some(100), 2));
+        let ctx_items = vec![Item::user_message("hi")];
+        let history = usage_handle_with(ctx_items.len(), 50);
+        let usage_tracker = Arc::new(UsageTracker::new());
+        usage_tracker.note_request(ctx_items.len());
+        usage_tracker.record_usage(&llm_worker::event::UsageEvent {
+            input_tokens: Some(150),
+            output_tokens: Some(0),
+            total_tokens: Some(150),
+            cache_read_input_tokens: Some(0),
+            cache_creation_input_tokens: Some(0),
+        });
+
+        let interceptor = PodInterceptor::new(
+            registry,
+            Some(state),
+            Some(history),
+            NotifyBuffer::new(),
+            Arc::new(Mutex::new(Vec::new())),
+            TaskStore::new(),
+            Arc::new(TaskReminderState::new()),
+            PromptCatalog::builtins_only().unwrap(),
+            None,
+        )
+        .with_usage_tracker(usage_tracker);
+        let mut ctx = ctx_items;
+        let action = interceptor.pre_llm_request(&mut ctx).await;
+
+        assert!(matches!(action, PreRequestAction::Yield));
     }
 
     #[tokio::test]
