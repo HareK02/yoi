@@ -899,6 +899,27 @@ mod tests {
     }
 
     #[test]
+    fn profile_artifact_preserves_session_record_event_trace() {
+        let mut raw = artifact();
+        raw["manifest"]["session"] = serde_json::json!({ "record_event_trace": true });
+
+        let resolved = resolve_profile_artifact(
+            ProfileSource::Path {
+                path: PathBuf::from("/profiles/coder.nix"),
+            },
+            Path::new("/workspace/project"),
+            raw,
+        )
+        .unwrap();
+
+        assert!(resolved.manifest.session.record_event_trace);
+        assert_eq!(
+            resolved.manifest_snapshot["session"]["record_event_trace"],
+            serde_json::json!(true)
+        );
+    }
+
+    #[test]
     fn rejects_both_manifest_and_config_fields() {
         let err = resolve_profile_artifact(
             ProfileSource::Path {

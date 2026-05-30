@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use manifest::{
     ModelManifest, Permission, PodManifestConfig, PodMetaConfig, ScopeConfig, ScopeRule,
-    SharedScope, WorkerManifestConfig,
+    SessionConfigPartial, SharedScope, WorkerManifestConfig,
 };
 use serde::Deserialize;
 use tokio::net::UnixStream;
@@ -119,6 +119,9 @@ pub struct SpawnPodTool {
     /// configuration. Per-spawn override is
     /// out of scope here (see `tickets/spawn-inherit-provider.md`).
     spawner_model: ModelManifest,
+    /// Spawner's session diagnostics policy. Preserved for spawned Pods so
+    /// opt-in provider event traces continue across delegation.
+    spawner_record_event_trace: bool,
     /// Spawner's runtime scope. After a successful spawn, the
     /// `Permission::Write` rules in the delegated scope are revoked
     /// from the spawner's in-memory view (a `deny(Write, target)` is
@@ -138,6 +141,7 @@ impl SpawnPodTool {
         registry: Arc<SpawnedPodRegistry>,
         parent_socket: Option<PathBuf>,
         spawner_model: ModelManifest,
+        spawner_record_event_trace: bool,
         spawner_scope: SharedScope,
     ) -> Self {
         Self {
@@ -148,6 +152,7 @@ impl SpawnPodTool {
             registry,
             parent_socket,
             spawner_model,
+            spawner_record_event_trace,
             spawner_scope,
         }
     }
@@ -207,6 +212,7 @@ impl Tool for SpawnPodTool {
             &instruction,
             &scope_allow,
             &self.spawner_model,
+            self.spawner_record_event_trace,
         ) {
             Ok(s) => s,
             Err(e) => {
@@ -384,6 +390,7 @@ fn build_spawn_config_json(
     instruction: &str,
     scope_allow: &[ScopeRule],
     model: &ModelManifest,
+    record_event_trace: bool,
 ) -> Result<String, serde_json::Error> {
     let config = PodManifestConfig {
         pod: PodMetaConfig {
@@ -399,6 +406,9 @@ fn build_spawn_config_json(
             allow: scope_allow.to_vec(),
             deny: Vec::new(),
         },
+        session: record_event_trace.then_some(SessionConfigPartial {
+            record_event_trace: Some(true),
+        }),
         ..Default::default()
     };
     serde_json::to_string(&config)
@@ -484,6 +494,7 @@ pub fn spawn_pod_tool(
     registry: Arc<SpawnedPodRegistry>,
     parent_socket: Option<PathBuf>,
     spawner_model: ModelManifest,
+    spawner_record_event_trace: bool,
     spawner_scope: SharedScope,
 ) -> ToolDefinition {
     Arc::new(move || {
@@ -500,6 +511,7 @@ pub fn spawn_pod_tool(
             registry.clone(),
             parent_socket.clone(),
             spawner_model.clone(),
+            spawner_record_event_trace,
             spawner_scope.clone(),
         ));
         (meta, tool)
@@ -509,7 +521,7 @@ pub fn spawn_pod_tool(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use manifest::{AuthRef, SchemeKind};
+    use manifest::{AuthRef, PodManifest, SchemeKind};
 
     #[test]
     fn spawn_config_inherits_inline_spawner_model() {
@@ -525,7 +537,7 @@ mod tests {
         };
 
         let config_json =
-            build_spawn_config_json("child", "$insomnia/default", &[], &model).unwrap();
+            build_spawn_config_json("child", "$insomnia/default", &[], &model, false).unwrap();
         let parsed: PodManifestConfig = serde_json::from_str(&config_json).unwrap();
 
         assert_eq!(parsed.model.scheme, Some(SchemeKind::Anthropic));
@@ -548,11 +560,51 @@ mod tests {
             ..Default::default()
         };
         let config_json =
-            build_spawn_config_json("child", "$insomnia/default", &[], &model).unwrap();
+            build_spawn_config_json("child", "$insomnia/default", &[], &model, false).unwrap();
         let parsed: PodManifestConfig = serde_json::from_str(&config_json).unwrap();
         assert_eq!(
             parsed.model.ref_.as_deref(),
             Some("anthropic/claude-sonnet-4-6")
         );
+    }
+
+    #[test]
+    fn spawn_config_preserves_record_event_trace_when_enabled() {
+        let model = ModelManifest {
+            ref_: Some("anthropic/claude-sonnet-4-6".into()),
+            ..Default::default()
+        };
+        let scope = vec![ScopeRule {
+            target: PathBuf::from("/tmp/child"),
+            permission: Permission::Read,
+            recursive: true,
+        }];
+
+        let config_json =
+            build_spawn_config_json("child", "$insomnia/default", &scope, &model, true).unwrap();
+        let parsed: PodManifestConfig = serde_json::from_str(&config_json).unwrap();
+        assert_eq!(
+            parsed.session.as_ref().and_then(|s| s.record_event_trace),
+            Some(true)
+        );
+
+        let manifest: PodManifest = PodManifestConfig::builtin_defaults()
+            .merge(parsed)
+            .try_into()
+            .unwrap();
+        assert!(manifest.session.record_event_trace);
+    }
+
+    #[test]
+    fn spawn_config_omits_record_event_trace_when_disabled() {
+        let model = ModelManifest {
+            ref_: Some("anthropic/claude-sonnet-4-6".into()),
+            ..Default::default()
+        };
+        let config_json =
+            build_spawn_config_json("child", "$insomnia/default", &[], &model, false).unwrap();
+        let parsed: PodManifestConfig = serde_json::from_str(&config_json).unwrap();
+
+        assert!(parsed.session.is_none());
     }
 }
