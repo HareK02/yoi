@@ -972,6 +972,54 @@ async fn pod_event_turn_ended_while_idle_auto_starts_turn_and_injects_system_mes
 }
 
 #[tokio::test]
+async fn pod_event_scope_sub_delegated_while_idle_stays_control_plane_only() {
+    let client = MockClient::new(simple_text_events());
+    let client_for_assert = client.clone();
+    let pod = make_pod(client).await;
+    let handle = spawn_controller(pod).await;
+
+    handle
+        .send(Method::PodEvent(protocol::PodEvent::ScopeSubDelegated {
+            parent_pod: "child".into(),
+            sub_pod: "grandchild".into(),
+            sub_socket: "/tmp/grandchild.sock".into(),
+            scope: vec![],
+        }))
+        .await
+        .unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    assert_eq!(
+        handle.shared_state.get_status(),
+        PodStatus::Idle,
+        "control-plane ScopeSubDelegated must not auto-start the parent LLM"
+    );
+    assert!(
+        client_for_assert.captured_requests().is_empty(),
+        "ScopeSubDelegated must not issue an LLM request"
+    );
+
+    let (entries, _) = handle.sink.subscribe_with_snapshot();
+    let saw_scope_event_in_mirror = entries.iter().any(|entry| {
+        matches!(
+            entry,
+            session_store::LogEntry::SystemItem {
+                item: session_store::SystemItem::PodEvent {
+                    event: protocol::PodEvent::ScopeSubDelegated { .. },
+                    ..
+                },
+                ..
+            }
+        )
+    });
+    assert!(
+        !saw_scope_event_in_mirror,
+        "ScopeSubDelegated must not create an agent-visible SystemItem::PodEvent; mirror = {entries:?}"
+    );
+}
+
+#[tokio::test]
 async fn notify_while_running_does_not_emit_already_running_error() {
     let client = MockClient::new(simple_text_events());
     let pod = make_pod(client).await;

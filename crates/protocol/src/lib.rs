@@ -73,9 +73,10 @@ pub enum Method {
 /// Typed lifecycle events sent from a child Pod to its parent.
 ///
 /// Delivered as `Method::PodEvent` over the parent's Unix socket. The
-/// parent Controller applies variant-specific side effects (registry /
-/// pod-registry updates) and renders a human-readable string that is
-/// injected into the parent's LLM context via the notification buffer.
+/// parent Controller always applies variant-specific side effects
+/// (registry / pod-registry updates). Agent-visible variants are also
+/// queued into the notification buffer; control-plane-only variants are
+/// not injected into the parent's LLM context.
 ///
 /// Transport is fire-and-forget; receivers must tolerate out-of-order
 /// delivery (e.g. `TurnEnded` arriving after `ShutDown` for the same
@@ -98,6 +99,9 @@ pub enum PodEvent {
 
     /// Child sub-delegated scope to a grandchild Pod via `SpawnPod`.
     ///
+    /// Control-plane only: receivers apply registry side effects and
+    /// propagate upward, but do not expose this as an agent notification.
+    ///
     /// The parent uses this to add the grandchild to its own
     /// `spawned_pods.json` so it can manage the grandchild directly
     /// even if the intermediate child dies. The parent then re-fires
@@ -113,6 +117,22 @@ pub enum PodEvent {
         /// Scope delegated to the grandchild.
         scope: Vec<ScopeRule>,
     },
+}
+
+impl PodEvent {
+    /// Whether this event should become an agent-visible notification/history item.
+    ///
+    /// Control-plane-only events still travel over the same wire enum and still
+    /// run receiver side effects, but they must not wake the parent LLM or enter
+    /// the notification buffer.
+    pub fn should_notify_agent(&self) -> bool {
+        match self {
+            PodEvent::TurnEnded { .. } | PodEvent::Errored { .. } | PodEvent::ShutDown { .. } => {
+                true
+            }
+            PodEvent::ScopeSubDelegated { .. } => false,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1207,6 +1227,38 @@ mod tests {
             decoded,
             Method::PodEvent(PodEvent::ShutDown { ref pod_name }) if pod_name == "child"
         ));
+    }
+
+    #[test]
+    fn pod_event_agent_notification_classification() {
+        assert!(
+            PodEvent::TurnEnded {
+                pod_name: "child".into()
+            }
+            .should_notify_agent()
+        );
+        assert!(
+            PodEvent::Errored {
+                pod_name: "child".into(),
+                message: "boom".into()
+            }
+            .should_notify_agent()
+        );
+        assert!(
+            PodEvent::ShutDown {
+                pod_name: "child".into()
+            }
+            .should_notify_agent()
+        );
+        assert!(
+            !PodEvent::ScopeSubDelegated {
+                parent_pod: "child".into(),
+                sub_pod: "grandchild".into(),
+                sub_socket: "/tmp/grandchild.sock".into(),
+                scope: vec![],
+            }
+            .should_notify_agent()
+        );
     }
 
     #[test]
