@@ -2,12 +2,12 @@
 id: 20260529-163047-pod-event-scope-subdelegation-control-only
 slug: pod-event-scope-subdelegation-control-only
 title: Keep scope sub-delegation PodEvent out of agent notifications
-status: open
+status: closed
 kind: bug
 priority: P2
 labels: [pod, events, orchestration, context]
 created_at: 2026-05-29T16:30:47Z
-updated_at: 2026-05-30T05:03:44Z
+updated_at: 2026-05-30T05:04:26Z
 assignee: null
 legacy_ticket: null
 ---
