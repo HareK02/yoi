@@ -19,3 +19,60 @@ Planning note:
 
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-05-30T20:54:26Z -->
+
+## Implementation report
+
+Implementation report from coder Pod `webfetch-readable-coder-20260530`:
+
+- Branch: `webfetch-readable-extraction`
+- Commit: `7906ca532666669417c20d831a08103c2f0f80dd` (`web: extract readable html content`)
+- Changed files: `Cargo.lock`, `crates/tools/Cargo.toml`, `crates/tools/src/web.rs`, `package.nix`
+- Added `readability-rs = 0.5.0` to `tools` and updated Nix cargo hash.
+- Added a WebFetch HTML extraction helper that uses readability for main text when useful and falls back to existing `html_to_text` when readability fails or returns too-short text.
+- Added `html_extraction` metadata with method/fallback/reason/title and kept output bounded.
+- Full extracted HTML is not returned.
+
+Validation reported by coder:
+
+- `cargo fmt --check` passed
+- `cargo test -p tools web` passed (10 passed)
+- `cargo check -p tools` passed, with only existing `llm-worker` dead_code warning
+- `./tickets.sh doctor` passed
+- `git diff --check` passed
+- `nix build .#insomnia` passed
+
+Unresolved issues: none.
+
+
+---
+
+<!-- event: review author: hare at: 2026-05-30T20:54:26Z status: approve -->
+
+## Review: approve
+
+External review by reviewer Pod `webfetch-readable-reviewer-20260530`: approve.
+
+Summary:
+- The change adds a pure-Rust `readability-rs` extraction path for `WebFetch` HTML responses.
+- HTML responses use reader-mode text when extraction is useful and fall back to existing local `html_to_text` otherwise.
+- Output JSON includes separate `html_extraction` metadata plus document `text`, while preserving fetch metadata and untrusted-content warning.
+
+Requirements check:
+- `WebSearch` / `WebFetch` separation preserved.
+- Pure Rust dependency only; no QuickJS, Node, Python, browser, or subprocess path.
+- Existing WebFetch safety behavior remains in place.
+- Fallback behavior exists for readability errors and too-short/empty text.
+- Output separates extraction metadata from text.
+- Full extracted HTML is not exposed.
+- Tests cover fallback metadata, article/main preference over nav/footer, truncation, and existing WebSearch/fetch safety behavior.
+- Dependency and Nix hash changes are reasonable.
+
+Blockers: none.
+
+Non-blocking follow-up:
+- Optional future direct test for a stable readability error path; current fallback coverage is sufficient for this ticket.
+
+
+---
