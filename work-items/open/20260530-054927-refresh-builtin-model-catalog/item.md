@@ -7,7 +7,7 @@ kind: task
 priority: P2
 labels: [models, providers, catalog, research]
 created_at: 2026-05-30T05:49:27Z
-updated_at: 2026-05-30T05:50:04Z
+updated_at: 2026-05-30T23:17:25Z
 assignee: null
 legacy_ticket: null
 ---

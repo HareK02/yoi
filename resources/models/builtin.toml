@@ -1,59 +1,68 @@
 # Anthropic direct
 [[model]]
+id = "claude-opus-4-8"
+provider = "anthropic"
+context_window = 1000000
+capability = { tool_calling = "parallel", structured_output = "json_schema", vision = true, prompt_caching = { kind = "explicit", max_breakpoints = 4 } }
+
+[[model]]
 id = "claude-sonnet-4-6"
 provider = "anthropic"
-context_window = 200000
+context_window = 1000000
+capability = { tool_calling = "parallel", structured_output = "json_schema", reasoning = "budget_tokens", vision = true, prompt_caching = { kind = "explicit", max_breakpoints = 4 } }
 
 [[model]]
-id = "claude-sonnet-4-5"
+id = "claude-haiku-4-5"
 provider = "anthropic"
 context_window = 200000
-
-[[model]]
-id = "claude-opus-4-1"
-provider = "anthropic"
-context_window = 200000
+capability = { tool_calling = "parallel", structured_output = "json_schema", reasoning = "budget_tokens", vision = true, prompt_caching = { kind = "explicit", max_breakpoints = 4 } }
 
 # Ollama local (capability is router-ish / ollama handles its own models)
 [[model]]
-id = "llama3.1"
+id = "llama3.3"
 provider = "ollama-local"
 context_window = 128000
 
 [[model]]
-id = "qwen2.5-coder"
+id = "qwen3-coder"
 provider = "ollama-local"
-context_window = 128000
+context_window = 256000
 
 # Codex OAuth (ChatGPT backend via Responses API)
+[[model]]
+id = "gpt-5.5"
+provider = "codex-oauth"
+context_window = 1050000
+max_context_window = 272000
+capability = { tool_calling = "parallel", structured_output = "json_schema", reasoning = "effort", vision = true, prompt_caching = { kind = "auto" } }
+
+[[model]]
+id = "gpt-5.4"
+provider = "codex-oauth"
+context_window = 1050000
+capability = { tool_calling = "parallel", structured_output = "json_schema", reasoning = "effort", vision = true, prompt_caching = { kind = "auto" } }
+
 [[model]]
 id = "gpt-5-codex"
 provider = "codex-oauth"
 context_window = 400000
 capability = { tool_calling = "parallel", structured_output = "json_schema", reasoning = "effort", vision = true, prompt_caching = { kind = "auto" } }
 
-[[model]]
-id = "gpt-5"
-provider = "codex-oauth"
-context_window = 400000
-capability = { tool_calling = "parallel", structured_output = "json_schema", reasoning = "effort", vision = true, prompt_caching = { kind = "auto" } }
-
-[[model]]
-id = "gpt-5.5"
-provider = "codex-oauth"
-context_window = 1000000
-max_context_window = 272000
-capability = { tool_calling = "parallel", structured_output = "json_schema", reasoning = "effort", vision = true, prompt_caching = { kind = "auto" } }
-
 # OpenRouter
 [[model]]
-id = "anthropic/claude-sonnet-4"
+id = "anthropic/claude-opus-4.8"
 provider = "openrouter"
-context_window = 200000
+context_window = 1000000
 capability = { tool_calling = "parallel", structured_output = "json_schema", reasoning = "budget_tokens", vision = true, prompt_caching = { kind = "auto" } }
 
 [[model]]
-id = "openai/gpt-5"
+id = "anthropic/claude-sonnet-4.6"
 provider = "openrouter"
-context_window = 400000
+context_window = 1000000
+capability = { tool_calling = "parallel", structured_output = "json_schema", reasoning = "budget_tokens", vision = true, prompt_caching = { kind = "auto" } }
+
+[[model]]
+id = "openai/gpt-5.5"
+provider = "openrouter"
+context_window = 1050000
 capability = { tool_calling = "parallel", structured_output = "json_schema", reasoning = "effort", vision = true, prompt_caching = { kind = "auto" } }

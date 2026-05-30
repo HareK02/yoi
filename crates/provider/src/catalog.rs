@@ -241,9 +241,9 @@ pub fn load_models_from(path: &Path) -> Result<Vec<ModelEntry>, CatalogError> {
 // --- ref 解決 / マニフェスト → ModelConfig ---------------------------------
 
 /// `<provider_id>/<model_id>` の最初の `/` で 1 回だけ split する。
-/// OpenRouter の `openrouter/anthropic/claude-sonnet-4` のように
+/// OpenRouter の `openrouter/anthropic/claude-sonnet-4.6` のように
 /// model_id に `/` を含むケースは、provider=`openrouter`、
-/// model_id=`anthropic/claude-sonnet-4` として通る。
+/// model_id=`anthropic/claude-sonnet-4.6` として通る。
 fn split_ref(s: &str) -> Option<(&str, &str)> {
     let (provider, rest) = s.split_once('/')?;
     if provider.is_empty() || rest.is_empty() {
@@ -403,7 +403,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_ref_pulls_provider_defaults() {
+    fn resolve_ref_merges_provider_and_model_catalog() {
         let providers = load_builtin_providers().unwrap();
         let models = load_builtin_models().unwrap();
         let manifest = ModelManifest {
@@ -423,9 +423,9 @@ mod tests {
         }
         assert!(
             cfg.capability.is_some(),
-            "should fall back to provider.default_capability"
+            "model catalog should provide capability"
         );
-        assert_eq!(cfg.context_window, 200_000);
+        assert_eq!(cfg.context_window, 1_000_000);
     }
 
     #[test]
@@ -515,12 +515,12 @@ mod tests {
         let providers = load_builtin_providers().unwrap();
         let models = load_builtin_models().unwrap();
         let manifest = ModelManifest {
-            ref_: Some("openrouter/anthropic/claude-sonnet-4".into()),
+            ref_: Some("openrouter/anthropic/claude-sonnet-4.6".into()),
             ..Default::default()
         };
         let cfg = resolve_with_catalogs(&manifest, &providers, &models).unwrap();
         assert_eq!(cfg.scheme, SchemeKind::OpenaiChat);
-        assert_eq!(cfg.model_id, "anthropic/claude-sonnet-4");
+        assert_eq!(cfg.model_id, "anthropic/claude-sonnet-4.6");
     }
 
     #[test]
