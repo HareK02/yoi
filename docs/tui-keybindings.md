@@ -1,6 +1,6 @@
 # TUI キーバインド
 
-`crates/tui` の対話画面で効くキー一覧。`main.rs:handle_key` を単一情報源とし、このドキュメントは人間向けの目次。
+`crates/tui` の対話画面で効くキー一覧。`crates/tui/src/main.rs:handle_key` を単一情報源とし、このドキュメントは人間向けの目次。
 
 ## 入力編集
 
@@ -11,9 +11,10 @@
 | `Backspace` | カーソル直前を削除（ペーストプレースホルダは 1 回で全削除） |
 | `Delete` | カーソル直後を削除（同上） |
 | `Left` / `Right` | カーソル移動 |
-| `Up` / `Down` | 論理行単位の上下移動（桁位置を保持） |
+| `Up` / `Down` | 通常は論理行単位の上下移動。入力欄の先頭/末尾では送信済み composer history を browse |
 | `Home` / `End` | 現在行の行頭 / 行末へ |
 | `Alt-Enter` | 改行を挿入（Input を複数行化） |
+| `Esc` | completion popup があれば閉じる |
 
 ### ペーストプレースホルダ
 
@@ -23,13 +24,34 @@
 カーソルはプレースホルダ内部には入れず、`Backspace` / `Delete` 1 回で
 プレースホルダ全体が消える。`#N` の通し番号は TUI プロセス起動中で連番。
 
+### Completion
+
+`@` file ref / `#` knowledge ref / `/` workflow invocation などは completion popup を開く。
+
+| キー | 動作 |
+|---|---|
+| `Up` / `Down` | completion 候補を移動 |
+| `Tab` | 選択候補をテキストとして適用 |
+| `Enter` | committable な候補は chip 化して空白を追加。directory などはテキスト適用して drill-in |
+| `Esc` | popup を閉じる |
+| 空白文字 | exact match なら chip 化してから空白を挿入 |
+
 ## 送信（Enter）
 
 | 状態 | 入力あり | 入力空 |
 |---|---|---|
 | Idle | `Method::Run` で新ターン開始 | no-op |
 | Paused | `Method::Run`（前ターンは割り込み終了として扱い、新ターンとして開始） | `Method::Resume`（前ターンの続きを再開） |
-| Running | 入力は TUI 側でバッファのみ、送信はしない | 同左 |
+| Running | 入力は TUI 側 queue に積まれ、現在 turn の終了後に自動送信 | no-op |
+
+### Running 中の queue
+
+Running 中に入力ありで Enter すると、現在の provider stream には割り込まず、typed input segments を TUI-local queue に積む。`RunResult::Finished` / `LimitReached` 後に先頭の queued input が次の `Method::Run` として自動送信される。`Paused` / `RolledBack` では自動送信しない。
+
+| キー | 動作 |
+|---|---|
+| `Alt-Q` | queue 先頭を composer に戻す（composer が空の時のみ） |
+| `Alt-C` | queued input を全消去 |
 
 ### Paused からの挙動
 
@@ -42,16 +64,32 @@ Paused 中に Enter すると、入力の有無で 2 通り：
   3. 入力を新しい user メッセージとして append
   4. ターン開始
 
+## Command mode
+
+composer が空の通常入力で `:` を押すと command mode に入る。command mode 中は composer が command line として扱われる。
+
+| キー | 動作 |
+|---|---|
+| `Enter` | command を実行 |
+| `Esc` | command mode を終了 |
+| `Backspace` | 文字を削除。空なら command mode を終了 |
+| `Ctrl-U` | command input をクリア |
+| `Tab` | command completion を適用 |
+| `Up` / `Down` | command completion 候補があれば移動、なければカーソル上下 |
+
+主な command は `:help`, `:noop`, `:compact`, `:rewind` / `:rollback`。`:compact` は idle 時だけ即時 compaction を要求し、`:rewind` / `:rollback` は rewind target picker を開く。
+
 ## 履歴ビューのナビゲーション
 
 履歴ビューは全画面 TUI の上段にあり、TUI 内部で全ブロックを state として
 保持してスクロール可能。スクロールバック（端末側の履歴）ではなく TUI の
 自前バッファを動かす点に注意。
 
-| キー | 動作 |
+| キー / 操作 | 動作 |
 |---|---|
 | `Shift-Up` / `Shift-Down` | 1 論理行スクロール |
-| `PageUp` / `PageDown` | 1 ページスクロール（`area_height - 1` 行） |
+| mouse wheel | 数行単位でスクロール |
+| `PageUp` / `PageDown` | 1 ページスクロール（task pane が開いている時は task pane をスクロール） |
 | `Ctrl-[` / `Ctrl-]` | 前 / 次のターン先頭へジャンプ |
 | `Ctrl-Home` | 履歴の先頭へ |
 | `Ctrl-End` | 履歴の末尾へ（末尾追従モードを再開） |
@@ -69,7 +107,7 @@ Paused 中に Enter すると、入力の有無で 2 通り：
 合わせる。多数のツール呼び出しが挟まった長いターンでも前後ターンの先頭に
 1 発で戻れる。末尾ターンから `Ctrl-]` を押すと末尾追従に復帰する。
 
-## 表示モード
+## 表示モード / 補助 pane
 
 履歴各ブロックの密度を 3 段階で切り替える。現在のモードはステータスバー
 右端に `[mode]` として表示される。
@@ -77,12 +115,11 @@ Paused 中に Enter すると、入力の有無で 2 通り：
 | キー | 動作 |
 |---|---|
 | `Ctrl-O` | `detail` → `normal` → `overview` → `detail` の順に循環 |
+| `Ctrl-T` | task pane を開閉 |
 
 - **detail**: 全ブロック完全表示。ツールブロックは結果本体も全量
-- **normal**: 完了ブロックは概ね 5–6 行に圧縮、実行中のツールブロックは
-  detail と同じ扱い
-- **overview**: 各ブロック 1 行に畳む（ツールブロックは
-  `ToolResult.summary` 1 行、長文 AssistantText は先頭 1 行 + 省略記）
+- **normal**: 完了ブロックは概ね 5–6 行に圧縮、実行中のツールブロックは detail と同じ扱い
+- **overview**: 各ブロック 1 行に畳む（ツールブロックは `ToolResult.summary` 1 行、長文 AssistantText は先頭 1 行 + 省略記）
 
 モード切替は全体に一括適用。個別ブロックの開閉は持たない。
 
@@ -90,9 +127,10 @@ Paused 中に Enter すると、入力の有無で 2 通り：
 
 | キー | Running 中 | Idle / Paused |
 |---|---|---|
-| `Ctrl-X` | `Method::Cancel`（進行中ターンを破棄 → Idle） | `Method::Shutdown`（Pod を終了） |
+| `Ctrl-X` | queued input を消去して `Method::Cancel`（進行中ターンを破棄 → Idle） | `Method::Shutdown`（Pod を終了） |
 | `Ctrl-C` | `Method::Pause`（進行中ターンを中断 → Paused） | 1 回目 warn、3 秒以内の 2 回目で TUI 終了（Pod は残る） |
 | `Ctrl-D` | TUI 終了（Pod は残る、Pause しない） | TUI 終了（Pod は残る） |
+| `Ctrl-R` | rewind picker 要求は拒否される | rewind target picker を開く |
 
 ### Cancel と Pause の違い
 
@@ -101,9 +139,21 @@ Paused 中に Enter すると、入力の有無で 2 通り：
 
 Running 中に割り込みたい場合、ほとんどのケースで `Ctrl-C`（Pause）が自然。Ctrl-X（Cancel）は明示的に破棄したい時（LLM が暴走した時など）用。Pod を終了したい場合は、先に Running ではない状態（Idle / Paused）にしてから `Ctrl-X` で Shutdown する。
 
+### Rewind picker
+
+`Ctrl-R` または `:rewind` / `:rollback` で Pod に `Method::ListRewindTargets` を送り、main area に rewind target picker を開く。picker 中の操作は以下。
+
+| キー | 動作 |
+|---|---|
+| `Up` / `Down` | target を移動 |
+| `Enter` | 選択 target へ `Method::RewindTo`。復元された user input は composer に戻る |
+| `Esc` | picker を閉じる |
+
+Running 中の rewind request は拒否される。Paused 中は picker を開けるが、実際の apply は idle で composer が空の時だけ行う。
+
 ### Ctrl-C と Ctrl-D の終了 UX
 
-- Ctrl-X Running 中: `Method::Cancel`。終了したい場合は、明示的にターンを止めて Idle に戻してからもう一度 `Ctrl-X`
+- Ctrl-X Running 中: queued input を消去して `Method::Cancel`。終了したい場合は、明示的にターンを止めて Idle に戻してからもう一度 `Ctrl-X`
 - Ctrl-X Idle / Paused: `Method::Shutdown` を送って Pod を終了
 - Ctrl-C Running 中: 1 回目で即 Pause（破壊的ではない）
 - Ctrl-C Idle / Paused: 1 回目で warn メッセージ、3 秒以内の 2 回目で TUI 終了（Pod は残る）
@@ -115,10 +165,7 @@ TUI のダイアログから Pod を起動する経路では、起動した Pod 
 
 ## 履歴メモ
 
-- かつて存在した `Ctrl-R`（Resume 専用）は、空 Enter での Resume に統合されたため廃止
-- かつて存在した `Esc`（TUI 終了）は、`Ctrl-C` の 2 連打 UX に統合されたため廃止
+- `Ctrl-R` はかつて Resume 専用だったが、空 Enter での Resume に統合された。現在の `Ctrl-R` は rewind picker の導線
+- かつて存在した `Esc`（TUI 終了）は、`Ctrl-C` の 2 連打 UX に統合されたため廃止。現在の `Esc` は popup / picker / command mode のキャンセル用途
 - かつて `Ctrl-D` は Pod に `Method::Shutdown` を送っていたが、TUI だけを抜けるデタッチ操作に変更された
-- 旧 inline viewport 時代は履歴スクロールを端末側スクロールバックに
-  任せていたため TUI 内のスクロールキーは存在しなかった。全画面 alt screen
-  への移行（`tickets/tui-fullscreen-overhaul.md`）で `Shift-Up/Down` ほか
-  のナビゲーションキーが追加された
+- 旧 inline viewport 時代は履歴スクロールを端末側スクロールバックに任せていたため TUI 内のスクロールキーは存在しなかった。全画面 alt screen への移行で `Shift-Up/Down` ほかのナビゲーションキーが追加された

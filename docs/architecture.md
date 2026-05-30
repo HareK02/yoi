@@ -24,11 +24,12 @@ insomnia は環境再現・コンテナ管理・VCS 統合などを自身の責�
 
 ## Pod
 
-独立したエージェントの実行単位。llm-worker の Worker をラップし、マニフェストによる宣言的構成とディレクトリスコープを加える。
+独立したエージェントの実行単位。llm-worker の Worker をラップし、マニフェストによる宣言的構成、ディレクトリスコープ、Pod 名に紐づく永続状態を加える。
 
-- 1 Pod = 1 プロセス = 1 セッション
-- マニフェスト（TOML）から完結構築できる
-- scope で書き込み可能なパスを制限（読み取りは自由）
+- 1 live Pod process は 1 Pod name/current state を所有する
+- 会話の永続化は `session-store` の `session_id` / `segment_id` ログ、Pod 名の current state は `pod-store` metadata が担う
+- マニフェストまたは profile から完結構築できる
+- scope で読み取り・書き込み可能なパスを制限する
 - 独立した socket サーバーを持ち、Client (TUI / GUI) が接続して操作する
 
 ### 実行ループ
@@ -50,19 +51,28 @@ Client → Method::Run { input }
 
 ### コンテキスト管理
 
-- **Prune**: 古い tool result の content を除去（summary は残す）。`pre_llm_request` で毎回判定
-- **Compact**: 履歴全体を要約して圧縮。`input_tokens` が閾値を超えたとき、`PreRequestAction::Yield` で Worker を一旦中断し、Pod 側で要約 → 新セッションとして再開
+- **Prune**: 古い tool result の content を除去（summary は残す）。LLM request context だけを加工し、永続 history 本体は変更しない
+- **Compact**: 履歴 prefix を要約し、同じ `session_id` 配下の新 `segment_id` へ rotate する。`SegmentStart.compacted_from` が元 segment を参照し、Pod metadata の active pointer は新 segment を指す
 - サーキットブレーカー: compact が3回連続失敗したら無効化
 
 ## Protocol
 
-Pod の制御・監視に使う JSONL ベースのメッセージプロトコル。トランスポートに依存しない。
+Pod の制御・監視に使う JSONL ベースのメッセージプロトコル。トランスポートに依存しない。正確な wire enum は `crates/protocol/src/lib.rs::{Method, Event}` を正とし、この節はカテゴリの目次として扱う。
 
-- **Method** (Client → Pod): `Run` / `Notify` / `Resume` / `Cancel` / `Shutdown` / `GetHistory`
-- **Event** (Pod → Client, broadcast): `TurnStart` / `TurnEnd` / `TextDelta` / `ToolCallStart` / `ToolCallArgsDelta` / `ToolCallDone` / `ToolResult` / `Usage` / `RunEnd` / `Error` / `History` / `Notification` / `Shutdown`
-- リクエストとレスポンスの紐付けはしない。Pod の状態遷移（イベント）を見れば何が起きているか分かる
-- イベントは全リスナーに broadcast
-- 操作の競合は先勝ち（run 中に別の run → AlreadyRunning エラー）
+- **Client → Pod (`Method`)**
+  - turn 制御: `Run`, `Resume`, `Cancel`, `Pause`, `Shutdown`
+  - context/session 制御: `Compact`, `ListRewindTargets`, `RewindTo`
+  - typed injection / child lifecycle: `Notify`, `PodEvent`
+  - client 補助: `ListCompletions`
+  - Pod visibility / attach: `ListVisiblePods`, `InspectPod`, `AttachOrRestorePod`
+- **Pod → Client (`Event`)**
+  - accepted input / history seed: `Snapshot`, `UserMessage`, `SystemItem`, `SegmentRotated`
+  - generation stream: `TurnStart`, `TurnEnd`, `LlmCallStart`, `LlmCallEnd`, retry/continuation events, `Text*`, `Thinking*`, `ToolCall*`, `ToolResult`, `Usage`, `RunEnd`
+  - control replies: completions, rewind, visible Pod / inspect / attach results
+  - operational status: `Status`, `Alert`, `MemoryWorker`, `Compact*`, `Error`, `Shutdown`
+- リクエストとレスポンスの紐付けを一般化した RPC にはしない。多くの状態は broadcast event と Pod status で観測する
+- 一部の reply（例: completions）は要求 socket にだけ返る。broadcast event と request-local reply の違いは enum variant のコメントを正とする
+- 操作の競合は先勝ち（run 中に別の run → `AlreadyRunning` エラー）
 
 ## マニフェストとファクトリ
 
@@ -116,23 +126,28 @@ Pod が操作できるファイルパスの制御。
 - `allow` ルールで読み取り・書き込みを許可、`deny` ルールで制限
 - effective permission = allow - deny
 - `recursive = false` で直下のみに制限可能（summary に `[non-recursive]` マーカー）
-- scope 排他: Pod 間の write 衝突は scope lock file (`$XDG_RUNTIME_DIR/insomnia/scope.lock`) で検出。scope 分譲（spawn 時に譲渡、終了時に返却）の記録にも使う
+- scope 排他: Pod 間の write 衝突は runtime registry / scope lock で検出する。child Pod へ委譲した write scope は親の effective scope から delegated-out deny として差し引かれ、child 停止・prune 時に reclaim される
 
 ## セッション永続化
 
-- append-only JSONL ログ。1 エントリ = 1 行
-- SHA-256 チェーンでエントリの整合性を保証
-- ログ再生で Worker の状態を完全復元（スナップショット不要）
-- Compact 時に新セッションを開始し、旧セッションへのリンクを保持
+- `session-store` は append-only JSONL segment log。1 `LogEntry` = 1 行
+- `SessionId` は論理会話の fork-tree root、`SegmentId` はその中の現在の書き込み先 segment
+- fresh conversation だけが新 `SessionId` を作る。compact / fork は同じ `SessionId` 配下に新 `SegmentId` を作り、`SegmentStart.{compacted_from,forked_from}: SegmentOrigin` で出自を持つ
+- segment log の先頭は `LogEntry::SegmentStart`。以降に `Invoke`, `UserInput`, `AssistantItem`, `ToolResult`, `SystemItem`, `TurnEnd`, `RunCompleted` / `RunErrored`, `ConfigChanged`, `LlmUsage`, `Extension` などを append する
+- replay は segment log から Worker state を再構成する。lineage は entry hash ではなく `SegmentOrigin.at_turn_index` と segment id で参照する
+- Pod 名の durable current state（active pointer、resolved manifest snapshot、spawned child delegation/reclaim）は `pod-store` metadata が担う。socket path や runtime mirror は liveness authority ではない
 
 ## 組み込みツール
 
-| ツール | 概要                                       |
-| ------ | ------------------------------------------ |
-| Read   | ファイル内容の読み取り                     |
-| Write  | ファイルの新規作成・上書き                 |
-| Edit   | 既存ファイルの部分編集（事前 Read が必要） |
-| Glob   | ファイル名パターンマッチ                   |
-| Grep   | ファイル内容の正規表現検索                 |
+正確な callable set と description は ToolRegistry / manifest permission / scope / profile に依存する。高レベルには以下のカテゴリを持つ。
 
-すべて scope の permission チェックを経由。`ScopedFs` が書き込み制限を、`Tracker` がセッション内のコンテンツハッシュ追跡を行う。
+| カテゴリ | 例 | 概要 |
+|---|---|---|
+| File / shell | `Read`, `Write`, `Edit`, `Glob`, `Grep`, `Bash` | workspace ファイル操作と shell 実行。file tools は `ScopedFs` と read-before-edit tracker を通る。`Bash` は permission policy と出力退避で制御する |
+| Task | `TaskCreate`, `TaskUpdate`, `TaskList`, `TaskGet` | セッション内の短期 task 状態管理 |
+| Memory / Knowledge | `MemoryQuery`, `MemoryRead`, `MemoryWrite`, `MemoryEdit`, `MemoryDelete`, `KnowledgeQuery` | manifest の memory 設定が有効な時に登録される durable memory / knowledge 操作 |
+| Pod orchestration | `SpawnPod`, `SendToPod`, `ReadPodOutput`, `StopPod`, `ListPods` | child Pod の起動・通信・停止・一覧 |
+| Visible Pod state | `ListVisiblePods`, `InspectPod`, `AttachOrRestorePod` | durable Pod state と visibility に基づく Pod inspection / attach / restore |
+| Web | `WebSearch`, `WebFetch` | manifest/env で明示設定された provider 経由の bounded web access |
+
+すべての tool call は manifest tool permission と scope/policy のチェックを通る。ファイル write scope、Pod delegation、memory layout、web provider 設定はそれぞれ別の authority を持ち、UI 表示だけで権限を広げない。

@@ -20,8 +20,8 @@ CompactInterceptor (pre_llm_request)  ← safety net
   → Worker が WorkerResult::Yielded で正常終了
   ↓
 Pod::handle_worker_result
-  → persist_turn（旧セッションに記録）
-  → compact() → resume()
+  → turn 結果を現在 segment log に記録
+  → compact() で同じ session_id 内の新 segment へ rotate → resume()
 
 [ターンの合間 — 次の Pod::run 冒頭]
 Pod::try_pre_run_compact  ← proactive
@@ -97,21 +97,29 @@ PreRequestAction::Cancel → WorkerError::Aborted → エラー
 
 - **サーキットブレーカー**: 3回連続 compact 失敗で無効化 (`CompactState::disabled`)
 - **Thrash 検出**: compact 直後に再び閾値超過 → `PodError::CompactThrash`
-- **Yield 前の永続化**: `persist_turn` を compact の前に実行。失敗しても旧セッションにデータが残る
+- **Yield 前後の永続化**: Worker が `Yielded` で抜けた turn は現在 segment log に記録してから compact する。compact が失敗しても元 segment の状態は残る
 
 ### セッション管理
 
-compact は fork と同じ構造。旧セッションを保全し、新 SessionId で圧縮後のセッションを開始。
+compact は「新 SessionId を作る」操作ではなく、同じ `session_id` 配下で active `segment_id` を切り替える操作。
 
 ```
-旧セッション (abc-123):
-  [...entries...] → Outcome::Yielded (interrupted=true)  ← そのまま残る
+session_id = abc-123
 
-新セッション (def-456):
-  [SessionStart { compacted_from: (abc-123, entryN.hash), history: [要約 + 直近] }] → ...
+segment old:
+  SegmentStart { origin: fresh/fork/... }
+  [...entries...]
+  RunCompleted { result: Yielded }
+
+segment new:
+  SegmentStart { compacted_from: SegmentOrigin { segment_id: old, at_turn_index: N } }
+  [system prompt]
+  [system: 構造化要約]
+  [system: retained tail / auto-read / references]
+  ...以後の turn を append
 ```
 
-`SessionStart` に `forked_from` / `compacted_from` フィールドで出自を追跡可能。
+`SegmentStart.compacted_from` / `forked_from` が lineage を追跡する。Pod 名からの resume は `pod-store` metadata の active pointer が現在の `(session_id, segment_id)` を指し、conversation/history の replay は `session-store` の segment log から行う。
 
 ---
 
@@ -220,7 +228,7 @@ write_summary(text)                       — 構造化要約を出力/上書き
    - `final_reserve_tokens` を割った後は `write_summary` 以外の探索 tool call に synthetic error を返し、最終 summary の余白を守る
    - `worker_context_max_tokens` 超過は最後の hard stop
 5. ターン終了時に write_summary 未呼び出し or read_required 空（かつファイル操作履歴がある場合）→ 追加プロンプトで促す
-6. `summary_max_tokens` と `result_context_max_tokens` で compact 結果を検証してから新 session を作る
+6. `summary_max_tokens` と `result_context_max_tokens` で compact 結果を検証してから新 segment を作り、Pod metadata の active pointer を更新する
 
 ### 構造化要約の要件
 

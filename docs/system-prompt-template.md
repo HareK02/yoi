@@ -46,7 +46,7 @@ Available tools: {{ tools | join(", ") }}
 
 ### タイミング
 
-1. `Pod::from_manifest` 時点: テンプレート文字列を `SystemPromptTemplate::parse` で **構文検査のみ** 行い、`Pod.system_prompt_template: Option<SystemPromptTemplate>` に保持する。この時点で Worker 側の system_prompt は `None`、session log もまだ書かれない (`head_hash: None`)。
+1. `Pod::from_manifest` 時点: テンプレート文字列を `SystemPromptTemplate::parse` で **構文検査のみ** 行い、`Pod.system_prompt_template: Option<SystemPromptTemplate>` に保持する。この時点で Worker 側の system_prompt は `None`、segment log の head もまだ作られない。
 
 2. `Pod::run` / `Pod::resume` 初回呼び出し冒頭 (`ensure_system_prompt_materialized`):
    1. `worker.tool_server_handle().flush_pending()` で pending な tool factory を materialize して tool 名を確定させる
@@ -54,12 +54,12 @@ Available tools: {{ tools | join(", ") }}
    3. `template.render(ctx)` で文字列化して `worker.set_system_prompt(rendered)` を呼ぶ
    4. `Pod.system_prompt_template = None` (`Option::take()` で構造的に1回性を保証)
 
-3. その直後の `ensure_session_head` が `head_hash` を見て初回なら `create_session_with_id` を呼び、materialize 後の system_prompt を **SessionStart ログエントリに焼き付ける**。
+3. その直後の `ensure_segment_head` が現在 segment の entry count を見て初回なら `SegmentStart` を append し、materialize 後の system_prompt を segment log に焼き付ける。
 
 ### 1回性の保証
 
 - `Pod.system_prompt_template` は `Option<SystemPromptTemplate>` で、materialize 時に `take()` する。2 ターン目以降はフィールドが `None` なので `ensure_system_prompt_materialized` は早期 return し、再 render は発生しない。
-- compact は Worker の system_prompt フィールドを触らない (pod.rs の `compact` は `w.get_system_prompt()` を読み取って新セッションに引き継ぐだけ)。そのため compact 前後で同じ文字列が流れ続ける。
+- compact は Worker の system_prompt フィールドを触らない (pod.rs の `compact` は `w.get_system_prompt()` を読み取って新 segment に引き継ぐだけ)。そのため compact 前後で同じ文字列が流れ続ける。
 - 統合テスト `compact_preserves_system_prompt` が実装で直接検証している。
 
 ### 責務分離
@@ -79,7 +79,7 @@ Available tools: {{ tools | join(", ") }}
 ## 関連ファイル
 
 - `crates/pod/src/system_prompt.rs` — `SystemPromptTemplate` / `SystemPromptContext` / `SystemPromptError`
-- `crates/pod/src/pod.rs` — `Pod.system_prompt_template` フィールド、`ensure_system_prompt_materialized`、`ensure_session_head` の初回 append ロジック
+- `crates/pod/src/pod.rs` — `Pod.system_prompt_template` フィールド、`ensure_system_prompt_materialized`、`ensure_segment_head` の初回 append ロジック
 - `crates/manifest/src/scope.rs` — `Scope::summary` / `readable_paths` / `writable_paths`
-- `crates/session-store/src/session.rs` — `create_session_with_id` (事前生成 ID で SessionStart を書くための entry point)
+- `crates/session-store/src/segment_log.rs` — `LogEntry::SegmentStart` / segment replay entries
 - `crates/llm-worker/src/tool_server.rs` — `ToolServerHandle::flush_pending` (pub)
