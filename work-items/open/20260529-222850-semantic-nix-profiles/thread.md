@@ -30,3 +30,14 @@ Implementation should remain narrow: preserve existing profile selection semanti
 
 
 ---
+
+<!-- event: decision author: hare at: 2026-05-30T01:39:47Z -->
+
+## Decision
+
+Implementation is paused after design discussion. The attempted direction of introducing a semantic JSON-profile-to-Manifest projection is not accepted as the specification: it risks preserving nearly the same information as Manifest and therefore failing the intended abstraction.
+
+The current design question has been split into `profile-authoring-requirements-sync`, which records the shared requirements and open questions before choosing Lua/external Nix/another authoring language. Do not proceed with the existing child-worktree implementation until that specification is decided.
+
+
+---
