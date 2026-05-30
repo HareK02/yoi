@@ -2,13 +2,15 @@
 description: worktree と sibling の coder / reviewer Pod を使い、下位 orchestrator が複数 ticket の実装・外部レビュー・修正・完了準備を管理する orchestration フロー
 model_invokation: true
 user_invocable: true
-requires: []
+requires: ["ticket-preflight-workflow", "worktree-workflow"]
 ---
 # Multi-agent Worktree Workflow
 
 insomnia を insomnia で開発する際の、worktree + coder Pod + 外部 reviewer Pod + orchestrator Pod の標準フロー。これは **最上位 Pod が細かい code review を抱えず、下位 orchestrator が実装と外部レビューの loop を完了状態まで運ぶためのフロー** である。
 
-worktree の機械的作成手順は `$user/worktree-workflow`、ticket 候補選定や方針探索の半自動 loop は `$user/auto-maintain` に分ける。
+worktree の機械的作成手順は `$user/worktree-workflow`、実装前の要件同期・反証 preflight は `$user/ticket-preflight-workflow`、ticket 候補選定や方針探索の半自動 loop は `$user/auto-maintain` に分ける。
+
+この Workflow は、対象 ticket が implementation-ready であることを前提にする。設計境界・仕様・authority boundary が未同期の場合は、worktree 作成や coder Pod 起動の前に `ticket-preflight-workflow` を通す。
 
 ## 目的
 
@@ -59,8 +61,9 @@ reviewer Pod
 - worktree 作成と git 書き込み操作について、人間の許可がある。
 - main workspace の unrelated dirty changes を把握している。
 - 下位 orchestrator に渡す intent / invariant / non-goals / escalation 条件を短く書ける。
+- 設計境界・仕様・authority boundary に不確定要素がある場合、`ticket-preflight-workflow` の結果が ticket thread に記録されている。
 
-設計方針が複数自然に導ける場合、protocol / scope / permission / history persistence に触れる場合、ticket 自体の再定義が必要な場合は、実装委譲前に人間へ戻す。ただし下位 orchestrator に探索だけを委譲することはできる。
+設計方針が複数自然に導ける場合、protocol / scope / permission / history persistence に触れる場合、ticket 自体の再定義が必要な場合は、実装委譲前に `ticket-preflight-workflow` を通し、必要なら人間へ戻す。ただし下位 orchestrator に探索だけを委譲することはできる。
 
 ## Intent packet
 
@@ -99,6 +102,7 @@ reviewer には coder の実装方針ではなく、この intent packet と dif
    - `git status --short --branch`
    - 対象 ticket / ticket 群
    - 関連 TODO / docs / 既存 worktree
+   - preflight が必要な ticket では、`ticket-preflight-workflow` の分類・要件同期・critical risks
 
 2. worktree 作成
    - `$user/worktree-workflow` に従い `./.worktree/<task-name>` を作る。
