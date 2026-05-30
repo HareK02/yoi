@@ -345,8 +345,8 @@ insomnia-pod [--profile <selector>] [--profile-pod-name <name>] [-s/--store <pat
 
 | フラグ | 説明 |
 |---|---|
-| `--profile <selector>` | builtin/user/project profile registry から Nix profile を選択。省略時は registry default（通常は `builtin:default`） |
-| `--profile-pod-name <name>` | profile 由来 manifest の `pod.name` を fresh spawn 用に上書き |
+| `--profile <selector>` | builtin/user/project profile registry から Lua profile を選択。省略時は registry default（通常は `builtin:default`） |
+| `--profile-pod-name <name>` | profile resolution 時に fresh spawn 用の runtime `pod.name` を指定 |
 | `-s, --store <path>` | セッション永続化ディレクトリ（デフォルト: `<data_dir>/sessions/`、`manifest::paths` で解決） |
 | `--session <uuid>` | 既存 session id から Pod を復元し、同じ jsonl に後続 turn を追記する |
 

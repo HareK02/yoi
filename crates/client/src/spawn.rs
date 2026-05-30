@@ -27,7 +27,7 @@ pub struct SpawnConfig {
     /// (`manifest::paths::pod_runtime_dir`) の解決と、ready 行に乗る
     /// 名前との突き合わせに使う。
     pub pod_name: String,
-    /// Optional Nix profile selector. When present the child is launched with
+    /// Optional profile selector. When present the child is launched with
     /// `--profile`; the Pod name is supplied through `--profile-pod-name` so
     /// profile evaluation stays separate from `--pod` restore semantics.
     pub profile: Option<String>,

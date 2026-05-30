@@ -2,7 +2,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
-use manifest::{NixProfileResolver, PodManifest, PodManifestConfig, ProfileSelector, paths};
+use manifest::{
+    PodManifest, PodManifestConfig, ProfileResolveOptions, ProfileResolver, ProfileSelector, paths,
+};
 use pod::{Pod, PodController, PromptLoader};
 use pod_store::{CombinedStore, FsPodStore, PodMetadataStore};
 use session_store::{FsStore, SegmentId, Store};
@@ -10,10 +12,10 @@ use session_store::{FsStore, SegmentId, Store};
 #[derive(Debug, Parser)]
 #[command(
     name = "insomnia-pod",
-    about = "Spawn a Pod process from a Nix profile or a single manifest file"
+    about = "Spawn a Pod process from a profile or a single manifest file"
 )]
 struct Cli {
-    /// Nix profile to evaluate. Accepts an explicit path, `path:<path>`, a
+    /// Profile to evaluate. Accepts an explicit path, `path:<path>`, a
     /// discovered profile name, `default`, or a source-qualified name such as
     /// `project:coder`.
     #[arg(
@@ -145,16 +147,16 @@ fn load_profile(
 ) -> Result<(PodManifest, PromptLoader), String> {
     let cwd = std::env::current_dir()
         .map_err(|e| format!("failed to resolve current directory for profile: {e}"))?;
-    let resolver = NixProfileResolver::new().with_workspace_base(cwd);
-    let mut resolved = resolver.resolve(selector).map_err(|e| {
+    let resolver = ProfileResolver::new().with_workspace_base(cwd);
+    let options = pod_name_override
+        .map(ProfileResolveOptions::with_pod_name)
+        .unwrap_or_default();
+    let resolved = resolver.resolve(selector, options).map_err(|e| {
         format!(
             "failed to resolve profile {}: {e}",
             selector.display_label()
         )
     })?;
-    if let Some(pod_name) = pod_name_override {
-        resolved.manifest.pod.name = pod_name.to_string();
-    }
     Ok((resolved.manifest, PromptLoader::builtins_only()))
 }
 

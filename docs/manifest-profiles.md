@@ -1,47 +1,55 @@
 # Manifest profiles
 
-Manifest profiles are the human-authored Nix entrypoint for generating an Insomnia runtime manifest. The Rust side evaluates a selected profile with `nix eval --json --file <path>`, deserializes the resulting JSON artifact, and validates it through the existing `PodManifest` pipeline.
+Profiles are reusable Lua-authored recipes for generating an Insomnia runtime manifest. The Rust resolver evaluates a selected `.lua` profile in-process, validates that it is Profile-shaped rather than a complete Manifest, then binds runtime values such as Pod name and concrete scope to produce the persisted `PodManifest` snapshot.
 
-This keeps composition/import/common logic in Nix. Insomnia does not add an implicit profile cascade or merge TOML profile layers into the selected runtime manifest.
+Profiles are intentionally not authority-bearing manifests. `pod.name`, concrete `scope.allow` / `scope.deny`, runtime directories, sockets, active session state, and raw secret material do not belong in reusable profiles. Use `--manifest` when you need the explicit low-level complete Manifest escape hatch.
 
 ## Minimal profile
 
-```nix
-let
-  insomnia = import ./resources/nix/profile-lib.nix {};
-in
-insomnia.mkProfile {
-  name = "coder";
-  description = "Example coding Pod";
-  manifest = insomnia.mkManifest {
-    pod.name = "coder";
-    model = {
-      scheme = "anthropic";
-      model_id = "claude-sonnet-4-20250514";
-      auth = insomnia.secrets.ref "llm.anthropic.default";
-    };
-    scope.allow = [
-      { target = "."; permission = "write"; }
-    ];
-  };
+```lua
+local profile = require("insomnia.profile")
+local models = require("insomnia.models")
+local scope = require("insomnia.scope")
+
+return profile {
+  slug = "coder",
+  description = "Example coding Pod",
+
+  model = models.catalog("codex-oauth/gpt-5.5"),
+  worker = {
+    reasoning = "high",
+  },
+  scope = scope.workspace_write(),
 }
 ```
 
 Run an explicit path with:
 
 ```sh
-insomnia-pod --profile ./coder.nix
+insomnia-pod --profile ./coder.lua
 # or through the TUI fresh-spawn dialog
-insomnia --profile ./coder.nix
+insomnia --profile ./coder.lua
 ```
 
-`--profile` accepts an explicit path, `path:<path>`, a discovered profile name, `default`, or a source-qualified name such as `project:coder`, `user:coder`, or `builtin:coder`. Path-like values containing `/`, starting with `.`, or ending in `.nix` preserve the original explicit-path behavior.
+`--profile` accepts an explicit path, `path:<path>`, a discovered profile name, `default`, or a source-qualified name such as `project:coder`, `user:coder`, or `builtin:coder`. Path-like values containing `/`, starting with `.`, or ending in `.lua` are explicit paths. `.nix` paths are no longer the primary profile layer and fail with a diagnostic that points users at Lua profiles or `--manifest`.
 
-`--profile` conflicts with `insomnia-pod --manifest` and with restore/session/adopt modes. Use `--profile-pod-name <name>` when a launcher needs a creation-time Pod name override without invoking `--pod` restore semantics. Profile evaluation is a creation-time path; Pod resume restores saved Pod state/resolved snapshots rather than re-evaluating the Nix source.
+`--profile` conflicts with `insomnia-pod --manifest` and with restore/session/adopt modes. Use `--profile-pod-name <name>` when a launcher needs a creation-time Pod name override without invoking `--pod` restore semantics. Profile evaluation is a creation-time path; Pod resume restores saved Pod state/resolved snapshots rather than re-evaluating the profile source.
+
+## Controlled Lua environment
+
+Profiles run in a restricted Lua VM. Host virtual modules are available through controlled `require`:
+
+- `require("insomnia")`
+- `require("insomnia.profile")`
+- `require("insomnia.models")`
+- `require("insomnia.compact")`
+- `require("insomnia.scope")`
+
+Profile-local modules may be required by dotted names such as `require("shared")` or `require("shared.models")`; those resolve only under the selected profile file's directory. Unsafe/unrestricted Lua facilities such as `os`, `io`, `debug`, `package`, `dofile`, and `loadfile` are unavailable by default.
 
 ## Profile discovery
 
-Profile discovery is separate from runtime manifest merging. User/project `profiles.toml` files may declare profile registry metadata, but those files are application/project UX configuration and are not merged into the Nix profile artifact.
+Profile discovery is separate from runtime manifest merging. User/project `profiles.toml` files may declare profile registry metadata, but those files are application/project UX configuration and are not merged into the selected profile artifact.
 
 Example project config at `.insomnia/profiles.toml`:
 
@@ -49,15 +57,15 @@ Example project config at `.insomnia/profiles.toml`:
 default = "coder"
 
 [profile]
-coder = "profiles/coder.nix"
-reviewer = "profiles/reviewer.nix"
+coder = "profiles/coder.lua"
+reviewer = "profiles/reviewer.lua"
 ```
 
 Table entries can carry descriptions:
 
 ```toml
 [profile.coder]
-path = "profiles/coder.nix"
+path = "profiles/coder.lua"
 description = "Project coding assistant"
 ```
 
@@ -77,22 +85,8 @@ The fresh-spawn TUI also uses discovery. The new Pod dialog defaults to the sele
 
 Ambient user/project `manifest.toml` cascade startup has been removed. Normal fresh spawns use profile discovery/default selection, with `profiles.toml` acting only as a profile registry/default selector.
 
-## Artifact contract
+## Resolver contract
 
-A profile should evaluate to one of:
-
-- `{ profile = { format = "insomnia.nix-profile.v1"; ... }; manifest = { ... }; }`
-- `{ profile = { format = "insomnia.nix-profile.v1"; ... }; config = { ... }; }`
-- a raw manifest/config object for debug/test paths.
-
-The resolved artifact is deserialized into the same `PodManifestConfig -> PodManifest` boundary used by direct one-file manifests, so builtin defaults and required-field validation stay shared. Explicit profile paths and user/project registry profile artifacts resolve relative manifest paths against the profile file's directory. Builtin profile artifacts resolve manifest-relative paths against the launch workspace/current directory so the bundled default can grant `scope.allow target = "."` for the workspace rather than for `resources/nix/profiles`.
+A Lua profile should return either `profile { ... }` or a plain table containing Profile fields. The resolver converts reusable fields such as `model`, `worker`, `compaction`, `memory`, `web`, `permissions`, `session`, and scope intent into a concrete Manifest. Runtime Pod name and concrete scope authority are supplied by launch context, then the resolved Manifest snapshot is persisted for restore.
 
 Profile and one-file manifest CLI paths currently use builtin prompt assets only. `$insomnia/...` instruction refs work; `$user/...` and `$workspace/...` prompt refs need a future explicit prompt-loader source design instead of reviving ambient manifest discovery.
-
-Secret values must stay as typed references. `resources/nix/profile-lib.nix` emits secret references as JSON like:
-
-```json
-{ "kind": "secret_ref", "ref": "llm.anthropic.default" }
-```
-
-The encrypted secret store is intentionally not implemented by this profile foundation; attempting to use a `secret_ref` as a live provider credential currently fails with a clear diagnostic at provider construction time.

@@ -415,7 +415,7 @@ struct Form {
     /// When true, launch the child with `--pod <name>` so the pod process
     /// resolves name-keyed state before falling back to fresh creation.
     resume_by_pod_name: bool,
-    /// Optional Nix profile choices passed to `insomnia-pod --profile` for
+    /// Optional profile choices passed to `insomnia-pod --profile` for
     /// fresh spawns. This is not used for resume/attach flows because those must
     /// restore Pod state rather than re-evaluate a profile source.
     profile_choices: Vec<ProfileChoice>,
