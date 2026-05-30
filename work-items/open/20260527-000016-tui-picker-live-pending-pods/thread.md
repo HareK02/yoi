@@ -56,3 +56,35 @@ Validation plan:
 
 
 ---
+
+<!-- event: review author: hare at: 2026-05-30T05:00:32Z status: approve -->
+
+## Review: approve
+
+Approve.
+
+The change correctly moves the live-priority rule into shared `PodList` construction, so both the resume picker and multi-Pod dashboard consume the same merged/sorted model. Reachable live Pods now sort ahead of non-live/unreachable/stopped/corrupt rows before truncation, and live pending rows get display-only runtime segment supplementation plus clearer pending preview text without changing pod-store metadata or restore behavior.
+
+Blocker findings: none.
+
+Requirement coverage:
+- Reachable live rows sort before stopped/corrupt/unreachable rows before truncation.
+- Sorting remains deterministic inside groups: `updated_at` desc, then pod name asc.
+- Live pending/runtime-only rows remain attachable/openable but not restorable.
+- Runtime segment id supplementation is display/model-only; no pod-store write path is touched.
+- Pending preview uses `[live, pending segment]` and does not imply restoreability.
+- Shared `PodList` was fixed rather than duplicating picker-specific logic.
+- Unreachable registry allocations are not promoted.
+- PodDiscovery / AttachOrRestore behavior was not broadened.
+
+Validation reviewed from coder report:
+- `cargo test -p tui pod_list` — passed.
+- `cargo test -p tui picker` — passed.
+- `cargo test -p tui multi_pod` — passed.
+- `cargo test -p tui` — passed.
+- `cargo fmt --check` — passed.
+
+Final verdict: approve.
+
+
+---
