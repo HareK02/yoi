@@ -503,44 +503,62 @@ impl SpawnPodTool {
         scope_allow: &[ScopeRule],
         selector: SpawnProfileSelector,
     ) -> Result<String, String> {
-        let mut config = match selector {
-            SpawnProfileSelector::Inherit => manifest_to_reusable_config(&self.spawner_manifest),
-            SpawnProfileSelector::Default | SpawnProfileSelector::Registry(_) => {
-                let registry = self.available_profiles.registry.as_ref().ok_or_else(|| {
-                    format!(
-                        "profile discovery failed for SpawnPod: {}{}",
-                        self.available_profiles
-                            .diagnostic()
-                            .if_empty("unknown error"),
-                        self.available_profiles.error_suffix()
-                    )
-                })?;
-                let profile_selector = match selector {
-                    SpawnProfileSelector::Default => ProfileSelector::Default,
-                    SpawnProfileSelector::Registry(selector) => selector,
-                    SpawnProfileSelector::Inherit => unreachable!(),
-                };
-                let resolved = ProfileResolver::new()
-                    .with_workspace_base(&self.spawner_pwd)
-                    .resolve_from_registry(
-                        &profile_selector,
-                        registry,
-                        ProfileResolveOptions::with_pod_name(name),
-                    )
-                    .map_err(|e| profile_error_with_available(e, &self.available_profiles))?;
-                manifest_to_reusable_config(&resolved.manifest)
-            }
-        };
-        config.pod.name = Some(name.to_string());
-        config.scope = ScopeConfig {
-            allow: scope_allow.to_vec(),
-            deny: Vec::new(),
-        };
-        if let Some(instruction) = instruction_override {
-            config.worker.instruction = Some(instruction.to_string());
-        }
-        serde_json::to_string(&config).map_err(|e| format!("spawn config serialisation: {e}"))
+        build_spawn_config_json_for_profile(
+            &self.spawner_manifest,
+            &self.available_profiles,
+            &self.spawner_pwd,
+            name,
+            instruction_override,
+            scope_allow,
+            selector,
+        )
     }
+}
+
+fn build_spawn_config_json_for_profile(
+    spawner_manifest: &PodManifest,
+    available_profiles: &AvailableProfiles,
+    spawner_pwd: &Path,
+    name: &str,
+    instruction_override: Option<&str>,
+    scope_allow: &[ScopeRule],
+    selector: SpawnProfileSelector,
+) -> Result<String, String> {
+    let mut config = match selector {
+        SpawnProfileSelector::Inherit => manifest_to_reusable_config(spawner_manifest),
+        SpawnProfileSelector::Default | SpawnProfileSelector::Registry(_) => {
+            let registry = available_profiles.registry.as_ref().ok_or_else(|| {
+                format!(
+                    "profile discovery failed for SpawnPod: {}{}",
+                    available_profiles.diagnostic().if_empty("unknown error"),
+                    available_profiles.error_suffix()
+                )
+            })?;
+            let profile_selector = match selector {
+                SpawnProfileSelector::Default => ProfileSelector::Default,
+                SpawnProfileSelector::Registry(selector) => selector,
+                SpawnProfileSelector::Inherit => unreachable!(),
+            };
+            let resolved = ProfileResolver::new()
+                .with_workspace_base(spawner_pwd)
+                .resolve_from_registry(
+                    &profile_selector,
+                    registry,
+                    ProfileResolveOptions::with_pod_name(name),
+                )
+                .map_err(|e| profile_error_with_available(e, available_profiles))?;
+            manifest_to_reusable_config(&resolved.manifest)
+        }
+    };
+    config.pod.name = Some(name.to_string());
+    config.scope = ScopeConfig {
+        allow: scope_allow.to_vec(),
+        deny: Vec::new(),
+    };
+    if let Some(instruction) = instruction_override {
+        config.worker.instruction = Some(instruction.to_string());
+    }
+    serde_json::to_string(&config).map_err(|e| format!("spawn config serialisation: {e}"))
 }
 
 #[cfg(test)]
@@ -782,6 +800,122 @@ pub fn spawn_pod_tool(
 mod tests {
     use super::*;
     use manifest::{AuthRef, ModelManifest, PodManifest, SchemeKind};
+    use tempfile::TempDir;
+
+    fn abs_rule(path: &Path, permission: Permission) -> ScopeRule {
+        ScopeRule {
+            target: path.to_path_buf(),
+            permission,
+            recursive: true,
+        }
+    }
+
+    fn parent_manifest(root: &Path, deny: Option<&Path>) -> PodManifest {
+        PodManifestConfig {
+            pod: PodMetaConfig {
+                name: Some("parent".into()),
+                prompt_pack: None,
+            },
+            model: ModelManifest {
+                scheme: Some(SchemeKind::Anthropic),
+                model_id: Some("parent-model".into()),
+                auth: Some(AuthRef::None),
+                ..Default::default()
+            },
+            worker: WorkerManifestConfig {
+                instruction: Some("$insomnia/parent".into()),
+                language: Some("Parentish".into()),
+                max_tokens: Some(1234),
+                stop_sequences: Some(vec!["STOP".into()]),
+                ..Default::default()
+            },
+            scope: ScopeConfig {
+                allow: vec![abs_rule(root, Permission::Write)],
+                deny: deny
+                    .map(|path| vec![abs_rule(path, Permission::Read)])
+                    .unwrap_or_default(),
+            },
+            session: Some(SessionConfigPartial {
+                record_event_trace: Some(true),
+            }),
+            ..Default::default()
+        }
+        .try_into()
+        .unwrap()
+    }
+
+    fn write_project_profile_registry(
+        project: &Path,
+        default: Option<&str>,
+        profiles: &[(&str, &str, &str)],
+    ) -> AvailableProfiles {
+        let insomnia = project.join(".insomnia");
+        let profile_dir = insomnia.join("profiles");
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        let mut registry_toml = String::new();
+        if let Some(default) = default {
+            registry_toml.push_str(&format!("default = \"{default}\"\n"));
+        }
+        registry_toml.push_str("[profile]\n");
+        for (name, file, body) in profiles {
+            std::fs::write(profile_dir.join(file), body).unwrap();
+            registry_toml.push_str(&format!("{name} = \"profiles/{file}\"\n"));
+        }
+        let registry_path = insomnia.join("profiles.toml");
+        std::fs::write(&registry_path, registry_toml).unwrap();
+        AvailableProfiles {
+            registry: Some(
+                ProfileDiscovery::with_sources(None, None, Some(registry_path))
+                    .discover()
+                    .unwrap(),
+            ),
+            diagnostic: None,
+        }
+    }
+
+    fn child_config_from_profile(
+        spawner_manifest: &PodManifest,
+        available: &AvailableProfiles,
+        cwd: &Path,
+        name: &str,
+        instruction_override: Option<&str>,
+        scope: &[ScopeRule],
+        selector: SpawnProfileSelector,
+    ) -> PodManifestConfig {
+        let json = build_spawn_config_json_for_profile(
+            spawner_manifest,
+            available,
+            cwd,
+            name,
+            instruction_override,
+            scope,
+            selector,
+        )
+        .unwrap();
+        serde_json::from_str(&json).unwrap()
+    }
+
+    const CODER_PROFILE: &str = r#"
+local profile = require("insomnia.profile")
+local scope = require("insomnia.scope")
+return profile {
+  slug = "coder",
+  model = { scheme = "anthropic", model_id = "coder-model" },
+  worker = { instruction = "$insomnia/coder", language = "Coderish", max_tokens = 2222 },
+  scope = scope.workspace_write(),
+}
+"#;
+
+    const REVIEWER_PROFILE: &str = r#"
+local profile = require("insomnia.profile")
+local scope = require("insomnia.scope")
+return profile {
+  slug = "reviewer",
+  model = { scheme = "anthropic", model_id = "reviewer-model" },
+  worker = { instruction = "$insomnia/reviewer", language = "Reviewerish", max_tokens = 3333 },
+  scope = scope.workspace_write(),
+}
+"#;
 
     #[test]
     fn spawn_config_inherits_inline_spawner_model() {
@@ -866,6 +1000,278 @@ mod tests {
         let parsed: PodManifestConfig = serde_json::from_str(&config_json).unwrap();
 
         assert!(parsed.session.is_none());
+    }
+
+    #[test]
+    fn omitted_profile_resolves_effective_registry_default() {
+        let tmp = TempDir::new().unwrap();
+        let project = tmp.path().join("project");
+        let delegated = tmp.path().join("delegated");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&delegated).unwrap();
+        let available = write_project_profile_registry(
+            &project,
+            Some("reviewer"),
+            &[
+                ("coder", "coder.lua", CODER_PROFILE),
+                ("reviewer", "reviewer.lua", REVIEWER_PROFILE),
+            ],
+        );
+        let parent = parent_manifest(&project, None);
+        let scope = vec![abs_rule(&delegated, Permission::Read)];
+
+        let config = child_config_from_profile(
+            &parent,
+            &available,
+            &project,
+            "child-default",
+            None,
+            &scope,
+            SpawnProfileSelector::Default,
+        );
+
+        assert_eq!(config.pod.name.as_deref(), Some("child-default"));
+        assert_eq!(config.model.model_id.as_deref(), Some("reviewer-model"));
+        assert_eq!(
+            config.worker.instruction.as_deref(),
+            Some("$insomnia/reviewer")
+        );
+        assert_eq!(config.worker.language.as_deref(), Some("Reviewerish"));
+        assert_eq!(config.scope.allow, scope);
+        assert!(config.scope.deny.is_empty());
+    }
+
+    #[test]
+    fn source_qualified_profile_role_config_reaches_spawn_config() {
+        let tmp = TempDir::new().unwrap();
+        let project = tmp.path().join("project");
+        let delegated = tmp.path().join("delegated");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&delegated).unwrap();
+        let available = write_project_profile_registry(
+            &project,
+            Some("coder"),
+            &[
+                ("coder", "coder.lua", CODER_PROFILE),
+                ("reviewer", "reviewer.lua", REVIEWER_PROFILE),
+            ],
+        );
+        let parent = parent_manifest(&project, None);
+        let scope = vec![abs_rule(&delegated, Permission::Write)];
+
+        let config = child_config_from_profile(
+            &parent,
+            &available,
+            &project,
+            "review-child",
+            None,
+            &scope,
+            SpawnProfileSelector::Registry(ProfileSelector::source_named(
+                ProfileRegistrySource::Project,
+                "reviewer",
+            )),
+        );
+
+        assert_eq!(config.pod.name.as_deref(), Some("review-child"));
+        assert_eq!(config.model.model_id.as_deref(), Some("reviewer-model"));
+        assert_eq!(
+            config.worker.instruction.as_deref(),
+            Some("$insomnia/reviewer")
+        );
+        assert_eq!(config.worker.language.as_deref(), Some("Reviewerish"));
+        assert_eq!(config.worker.max_tokens, Some(3333));
+        assert_eq!(config.scope.allow, scope);
+        assert!(config.scope.deny.is_empty());
+    }
+
+    #[test]
+    fn inherit_copies_reusable_parent_fields_and_replaces_runtime_authority() {
+        let tmp = TempDir::new().unwrap();
+        let parent_root = tmp.path().join("parent-root");
+        let parent_deny = parent_root.join("secret");
+        let delegated = tmp.path().join("delegated");
+        std::fs::create_dir_all(&parent_deny).unwrap();
+        std::fs::create_dir_all(&delegated).unwrap();
+        let parent = parent_manifest(&parent_root, Some(&parent_deny));
+        let scope = vec![abs_rule(&delegated, Permission::Read)];
+        let available = AvailableProfiles {
+            registry: None,
+            diagnostic: None,
+        };
+
+        let config = child_config_from_profile(
+            &parent,
+            &available,
+            tmp.path(),
+            "inherited-child",
+            None,
+            &scope,
+            SpawnProfileSelector::Inherit,
+        );
+
+        assert_eq!(config.pod.name.as_deref(), Some("inherited-child"));
+        assert_eq!(config.model.model_id.as_deref(), Some("parent-model"));
+        assert_eq!(
+            config.worker.instruction.as_deref(),
+            Some("$insomnia/parent")
+        );
+        assert_eq!(config.worker.language.as_deref(), Some("Parentish"));
+        assert_eq!(config.worker.max_tokens, Some(1234));
+        assert_eq!(
+            config.worker.stop_sequences.as_deref(),
+            Some(&["STOP".to_string()][..])
+        );
+        assert_eq!(
+            config.session.as_ref().and_then(|s| s.record_event_trace),
+            Some(true)
+        );
+        assert_eq!(config.scope.allow, scope);
+        assert!(config.scope.deny.is_empty());
+    }
+
+    #[test]
+    fn instruction_override_changes_only_worker_instruction() {
+        let tmp = TempDir::new().unwrap();
+        let project = tmp.path().join("project");
+        let delegated = tmp.path().join("delegated");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&delegated).unwrap();
+        let available = write_project_profile_registry(
+            &project,
+            Some("reviewer"),
+            &[("reviewer", "reviewer.lua", REVIEWER_PROFILE)],
+        );
+        let parent = parent_manifest(&project, None);
+        let scope = vec![abs_rule(&delegated, Permission::Write)];
+
+        let config = child_config_from_profile(
+            &parent,
+            &available,
+            &project,
+            "override-child",
+            Some("$user/custom-reviewer"),
+            &scope,
+            SpawnProfileSelector::Default,
+        );
+
+        assert_eq!(
+            config.worker.instruction.as_deref(),
+            Some("$user/custom-reviewer")
+        );
+        assert_eq!(config.model.model_id.as_deref(), Some("reviewer-model"));
+        assert_eq!(config.worker.language.as_deref(), Some("Reviewerish"));
+        assert_eq!(config.worker.max_tokens, Some(3333));
+        assert_eq!(config.scope.allow, scope);
+    }
+
+    #[test]
+    fn profile_and_inherited_scope_are_replaced_by_delegated_scope() {
+        let tmp = TempDir::new().unwrap();
+        let project = tmp.path().join("project");
+        let delegated = tmp.path().join("delegated");
+        let parent_root = tmp.path().join("parent-root");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&delegated).unwrap();
+        std::fs::create_dir_all(&parent_root).unwrap();
+        let available = write_project_profile_registry(
+            &project,
+            Some("reviewer"),
+            &[("reviewer", "reviewer.lua", REVIEWER_PROFILE)],
+        );
+        let parent = parent_manifest(&parent_root, Some(&parent_root.join("deny")));
+        let scope = vec![abs_rule(&delegated, Permission::Read)];
+
+        let profile_config = child_config_from_profile(
+            &parent,
+            &available,
+            &project,
+            "profile-child",
+            None,
+            &scope,
+            SpawnProfileSelector::Default,
+        );
+        let inherit_config = child_config_from_profile(
+            &parent,
+            &available,
+            &project,
+            "inherit-child",
+            None,
+            &scope,
+            SpawnProfileSelector::Inherit,
+        );
+
+        for config in [profile_config, inherit_config] {
+            assert_eq!(config.scope.allow, scope);
+            assert!(config.scope.deny.is_empty());
+            assert!(!config.scope.allow.iter().any(|rule| rule.target == project));
+            assert!(
+                !config
+                    .scope
+                    .allow
+                    .iter()
+                    .any(|rule| rule.target == parent_root)
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_ambiguous_and_no_default_diagnostics_include_available_selectors() {
+        let tmp = TempDir::new().unwrap();
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let available = write_project_profile_registry(
+            &project,
+            None,
+            &[("coder", "coder.lua", CODER_PROFILE)],
+        );
+        let parent = parent_manifest(&project, None);
+        let scope = vec![abs_rule(&project, Permission::Read)];
+
+        let invalid = parse_spawn_profile_selector(Some("./reviewer.lua"))
+            .map_err(|msg| format!("{msg}{}", available.error_suffix()))
+            .unwrap_err();
+        assert!(invalid.contains("Use `default`, `inherit`"));
+        assert!(invalid.contains("`project:coder`"));
+
+        let no_default = build_spawn_config_json_for_profile(
+            &parent,
+            &available,
+            &project,
+            "child",
+            None,
+            &scope,
+            SpawnProfileSelector::Default,
+        )
+        .unwrap_err();
+        assert!(no_default.contains("no default profile"), "{no_default}");
+        assert!(no_default.contains("Use `default`, `inherit`"));
+        assert!(no_default.contains("`project:coder`"));
+
+        let user_config = tmp.path().join("user-profiles.toml");
+        std::fs::write(&user_config, "[profile]\ncoder = \"user-coder.lua\"\n").unwrap();
+        let project_config = project.join(".insomnia/profiles.toml");
+        let ambiguous = AvailableProfiles {
+            registry: Some(
+                ProfileDiscovery::with_sources(None, Some(user_config), Some(project_config))
+                    .discover()
+                    .unwrap(),
+            ),
+            diagnostic: None,
+        };
+        let ambiguous_error = build_spawn_config_json_for_profile(
+            &parent,
+            &ambiguous,
+            &project,
+            "child",
+            None,
+            &scope,
+            SpawnProfileSelector::Registry(ProfileSelector::named("coder")),
+        )
+        .unwrap_err();
+        assert!(ambiguous_error.contains("ambiguous"), "{ambiguous_error}");
+        assert!(ambiguous_error.contains("user:coder"));
+        assert!(ambiguous_error.contains("project:coder"));
+        assert!(ambiguous_error.contains("Use `default`, `inherit`"));
     }
 
     #[test]
