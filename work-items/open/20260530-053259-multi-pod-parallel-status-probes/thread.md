@@ -28,3 +28,36 @@ Critical risks:
 
 
 ---
+
+<!-- event: review author: hare at: 2026-05-30T05:45:14Z status: approve -->
+
+## Review: approve
+
+Approve.
+
+The implementation addresses the ticket in the shared `PodList` live-probe path. Live status probes now run concurrently with a more realistic per-Pod timeout, reachable sockets without reported status remain live/attachable, and the multi-Pod label is softened from `live unknown` to `live` while explicit statuses remain unchanged.
+
+Blocker findings: none.
+
+Requirement coverage:
+- Per-Pod timeout increased to 200ms.
+- Probes are concurrent and bounded by the slowest bounded probe rather than `N * timeout`.
+- Reachable sockets with no status remain reachable/live/attachable.
+- Restoreability remains separate and unchanged.
+- No last-known status is persisted to pod-store.
+- Explicit `live idle`, `live running`, and `live paused` labels remain.
+- `status = None` renders as `live`.
+- The implementation changes shared `PodList` live-probe logic rather than duplicating dashboard-only logic.
+- Tests cover concurrency, timeout/no-status reachable handling, and label rendering.
+
+Validation reviewed:
+- `cargo fmt --check` — passed.
+- `cargo test -p tui pod_list` — passed.
+- `cargo test -p tui multi_pod` — passed.
+- `cargo test -p tui` — passed.
+- Reviewer additionally ran `./tickets.sh doctor` — passed.
+
+Final verdict: approve.
+
+
+---
