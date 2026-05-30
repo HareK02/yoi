@@ -656,7 +656,7 @@ fn row_status_label(entry: &PodListEntry) -> (&'static str, Style) {
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             ),
-            None => ("live unknown", Style::default().fg(Color::DarkGray)),
+            None => ("live", Style::default().fg(Color::DarkGray)),
         };
     }
     if entry
@@ -1192,6 +1192,31 @@ mod tests {
 
         assert_eq!(app.selected_send_eligibility(), SendEligibility::SendNow);
         assert!(app.selected_send_disabled_reason().is_none());
+    }
+
+    #[test]
+    fn multi_status_label_for_live_without_reported_status_is_softened() {
+        let mut live = live_info("probing", PodStatus::Idle);
+        live.status = None;
+        let app = test_app(vec![live]);
+
+        let (label, _) = row_status_label(app.list.selected_entry().unwrap());
+
+        assert_eq!(label, "live");
+    }
+
+    #[test]
+    fn multi_status_labels_preserve_explicit_live_statuses() {
+        for (status, expected_label) in [
+            (PodStatus::Idle, "live idle"),
+            (PodStatus::Running, "live running"),
+            (PodStatus::Paused, "live paused"),
+        ] {
+            let app = test_app(vec![live_info("pod", status)]);
+            let (label, _) = row_status_label(app.list.selected_entry().unwrap());
+
+            assert_eq!(label, expected_label);
+        }
     }
 
     #[test]

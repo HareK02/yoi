@@ -291,17 +291,37 @@ pub(crate) async fn read_reachable_live_pod_infos(
     store: &FsStore,
 ) -> Result<Vec<LivePodInfo>, io::Error> {
     let records = read_live_pod_infos()?;
-    let mut reachable = Vec::new();
-    for mut record in records {
-        let Ok(status) = probe_live_status(&record.socket_path).await else {
+    probe_reachable_live_pod_infos(store, records).await
+}
+
+async fn probe_reachable_live_pod_infos(
+    store: &FsStore,
+    records: Vec<LivePodInfo>,
+) -> Result<Vec<LivePodInfo>, io::Error> {
+    let mut handles = Vec::with_capacity(records.len());
+    for record in records {
+        handles.push(tokio::spawn(probe_live_pod_info(record)));
+    }
+
+    let mut reachable = Vec::with_capacity(handles.len());
+    for handle in handles {
+        let result = handle
+            .await
+            .map_err(|e| io::Error::other(format!("live status probe task failed: {e}")))?;
+        let Ok(mut record) = result else {
             continue;
         };
-        record.reachable = true;
-        record.status = status;
         record.summary = summarize_live_pod(store, &record);
         reachable.push(record);
     }
     Ok(reachable)
+}
+
+async fn probe_live_pod_info(mut record: LivePodInfo) -> Result<LivePodInfo, io::Error> {
+    let status = probe_live_status(&record.socket_path).await?;
+    record.reachable = true;
+    record.status = status;
+    Ok(record)
 }
 
 pub(crate) fn live_socket_for_pod(pod_name: &str) -> Option<PathBuf> {
@@ -343,7 +363,7 @@ fn corrupt_stored_info(pod_name: String, message: String) -> StoredPodInfo {
     }
 }
 
-const LIVE_STATUS_PROBE_TIMEOUT: Duration = Duration::from_millis(25);
+const LIVE_STATUS_PROBE_TIMEOUT: Duration = Duration::from_millis(200);
 
 async fn probe_live_status(socket_path: &Path) -> Result<Option<PodStatus>, io::Error> {
     let mut client = PodClient::connect(socket_path).await?;
@@ -561,11 +581,16 @@ fn trim_one_line(s: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
     use llm_worker::llm_client::types::RequestConfig;
     use pod_store::FsPodStore;
     use pod_store::{PodActiveSegmentRef, PodMetadataStore};
+    use protocol::stream::JsonLineWriter;
     use session_store::{new_segment_id, new_session_id};
     use tempfile::tempdir;
+    use tokio::net::UnixListener;
+    use tokio::sync::Barrier;
 
     const SOURCE: PodVisibilitySource = PodVisibilitySource::ResumePicker;
 
@@ -753,6 +778,30 @@ mod tests {
     }
 
     #[test]
+    fn live_reachable_row_without_reported_status_can_open_but_not_send_now() {
+        let mut live = live_info("live", PodStatus::Idle);
+        live.status = None;
+        live.reachable = true;
+
+        let entry = single_entry(PodList::from_sources(SOURCE, vec![], vec![live], None, 10));
+
+        assert!(entry.actions.can_open);
+        assert!(!entry.actions.can_restore);
+        assert!(!entry.actions.can_send_now);
+        assert!(!entry.actions.can_queue_send);
+        assert_eq!(
+            entry.attach_socket_path(),
+            Some(Path::new("/tmp/live.sock"))
+        );
+        assert!(
+            !entry
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.kind == PodEntryDiagnosticKind::LiveUnreachable)
+        );
+    }
+
+    #[test]
     fn live_running_reachable_row_can_open_but_not_send_now() {
         let entry = single_entry(PodList::from_sources(
             SOURCE,
@@ -809,6 +858,82 @@ mod tests {
 
         let status = events.iter().find_map(status_from_event);
         assert_eq!(status, Some(PodStatus::Idle));
+    }
+
+    #[tokio::test]
+    async fn live_status_probes_run_concurrently() {
+        let store_dir = tempdir().unwrap();
+        let store = FsStore::new(store_dir.path()).unwrap();
+        let socket_dir = tempdir().unwrap();
+        let probe_count = 3;
+        let barrier = Arc::new(Barrier::new(probe_count));
+        let mut records = Vec::new();
+        let mut servers = Vec::new();
+
+        for index in 0..probe_count {
+            let pod_name = format!("pod-{index}");
+            let socket_path = socket_dir.path().join(format!("{pod_name}.sock"));
+            let listener = UnixListener::bind(&socket_path).unwrap();
+            let barrier = Arc::clone(&barrier);
+            servers.push(tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                barrier.wait().await;
+                let mut writer = JsonLineWriter::new(stream);
+                writer
+                    .write(&Event::Status {
+                        status: PodStatus::Idle,
+                    })
+                    .await
+                    .unwrap();
+            }));
+            records.push(live_probe_record(&pod_name, socket_path));
+        }
+
+        let records = tokio::time::timeout(
+            LIVE_STATUS_PROBE_TIMEOUT * 3,
+            probe_reachable_live_pod_infos(&store, records),
+        )
+        .await
+        .expect("status probes should complete")
+        .unwrap();
+
+        assert_eq!(records.len(), probe_count);
+        assert!(records.iter().all(|record| record.reachable));
+        assert!(
+            records
+                .iter()
+                .all(|record| record.status == Some(PodStatus::Idle))
+        );
+        for server in servers {
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn live_status_probe_timeout_still_marks_socket_reachable() {
+        let store_dir = tempdir().unwrap();
+        let store = FsStore::new(store_dir.path()).unwrap();
+        let socket_dir = tempdir().unwrap();
+        let socket_path = socket_dir.path().join("silent.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let records = probe_reachable_live_pod_infos(
+            &store,
+            vec![live_probe_record("silent", socket_path.clone())],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].pod_name, "silent");
+        assert!(records[0].reachable);
+        assert_eq!(records[0].status, None);
+        assert_eq!(records[0].socket_path, socket_path);
+        server.abort();
     }
 
     #[test]
@@ -982,6 +1107,17 @@ mod tests {
                 updated_at,
                 preview: None,
             },
+        }
+    }
+
+    fn live_probe_record(pod_name: &str, socket_path: PathBuf) -> LivePodInfo {
+        LivePodInfo {
+            pod_name: pod_name.to_string(),
+            socket_path,
+            status: None,
+            reachable: false,
+            segment_id: None,
+            summary: PodEntrySummary::default(),
         }
     }
 
