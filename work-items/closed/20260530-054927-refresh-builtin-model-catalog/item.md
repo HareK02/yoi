@@ -2,12 +2,12 @@
 id: 20260530-054927-refresh-builtin-model-catalog
 slug: refresh-builtin-model-catalog
 title: Refresh builtin model catalog to current provider recommendations
-status: open
+status: closed
 kind: task
 priority: P2
 labels: [models, providers, catalog, research]
 created_at: 2026-05-30T05:49:27Z
-updated_at: 2026-05-30T23:17:25Z
+updated_at: 2026-05-30T23:17:46Z
 assignee: null
 legacy_ticket: null
 ---
