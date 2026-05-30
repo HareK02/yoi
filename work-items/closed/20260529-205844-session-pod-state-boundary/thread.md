@@ -1,13 +1,49 @@
+<!-- event: create author: tickets.sh at: 2026-05-29T20:58:44Z -->
+
+## Created
+
+Created by tickets.sh create.
+
+---
+
+<!-- event: review author: review-session-pod-state-boundary at: 2026-05-29T23:04:00Z -->
+
+## External review
+
+Initial review found blocking issues in restore reconciliation: missing child allocations left stale runtime deny entries, and reconciliation was not enforced at the public restore boundary. The coder fixed these in commit `d2e8087`; second review approved the implementation.
+
+Artifacts:
+- `artifacts/review.md`
+- `artifacts/review-r2.md`
+
+---
+
+<!-- event: fix author: insomnia at: 2026-05-30T00:08:00Z -->
+
+## Parent-side validation fix
+
+After merging the approved implementation, post-merge validation failed on `cargo test -p pod --test controller_test empty_turn_pause_rolls_back_and_snapshot_does_not_restore_input`.
+
+The parent took over the stopped/failed handoff and fixed the adjacent turn-control regression directly on main: cancellation received immediately after the controller accepts a run was being lost before the worker reached its first stream event wait, so empty turns could hang instead of rolling back. The fix preserves idle stale-cancel cleanup at the controller boundary and makes first-event waiting cancellation-aware.
+
+While investigating the child Pod's `context_length_exceeded` ping failure, the parent also fixed provider terminal stream errors so `Event::Error` is not only a live TUI event: terminal provider errors now fail the worker turn and persist `RunErrored` instead of allowing an empty `RunCompleted::Finished`.
+
+---
+
+<!-- event: close author: hare at: 2026-05-30T00:10:45Z status: closed -->
+
+## Closed
+
 ---
 id: 20260529-205844-session-pod-state-boundary
 slug: session-pod-state-boundary
 title: Split Pod metadata into a dedicated pod-store crate
-status: open
+status: closed
 kind: task
 priority: P2
 labels: [session-store, pod-store, pod, persistence, architecture]
 created_at: 2026-05-29T20:58:44Z
-updated_at: 2026-05-29T22:18:00Z
+updated_at: 2026-05-30T00:10:45Z
 assignee: null
 legacy_ticket: null
 ---
@@ -102,3 +138,6 @@ The resulting design should make these responsibilities explicit:
 - Do not preserve backward compatibility for obsolete `{sessions_root}/pods` metadata, and do not implement a permanent fallback or migration path.
 - Do not change live Pod registry lock semantics except where necessary to align with the clarified durable authority.
 - Do not implement broader database storage or transactional storage in this ticket; if the boundary audit reveals a need for transactions, record it as a follow-up unless a minimal update API suffices.
+
+
+---
