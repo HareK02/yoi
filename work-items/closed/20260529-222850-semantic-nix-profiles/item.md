@@ -2,12 +2,12 @@
 id: 20260529-222850-semantic-nix-profiles
 slug: semantic-nix-profiles
 title: Make Nix profiles semantic and manifestize them in the resolver
-status: open
+status: closed
 kind: task
 priority: P2
 labels: [manifest, profiles, nix, architecture]
 created_at: 2026-05-29T22:28:50Z
-updated_at: 2026-05-30T01:39:47Z
+updated_at: 2026-05-30T03:52:39Z
 assignee: null
 legacy_ticket: null
 ---
