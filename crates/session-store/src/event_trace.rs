@@ -1,7 +1,8 @@
 //! Debug-only LLM request/stream trace recording.
 //!
-//! [`TraceEntry`] captures stream lifecycle markers and raw provider stream
-//! events for debugging stalls. Written to a separate `.trace.jsonl` file,
+//! [`TraceEntry`] captures stream lifecycle markers and normalized provider
+//! stream events for debugging stalls. It is not a byte-for-byte raw SSE
+//! capture. Written to a separate `.trace.jsonl` file,
 //! completely independent of the segment log used for state restoration.
 //!
 //! Disabled by default. Enable via `SessionConfig::record_event_trace`.
@@ -10,7 +11,7 @@ use llm_worker::llm_client::event::Event;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// A single trace entry recording either a lifecycle marker or raw stream event.
+/// A single trace entry recording either a lifecycle marker or normalized stream event.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TraceEntry {
     /// Timestamp in milliseconds since Unix epoch.

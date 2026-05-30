@@ -192,6 +192,7 @@ async fn spawn_pod_delegates_scope_and_sends_run() {
         registry,
         None,
         dummy_model(),
+        false,
         spawner_scope.clone(),
     );
     let (_meta, tool) = def();
@@ -280,6 +281,7 @@ async fn spawn_pod_rejects_scope_outside_spawner() {
         registry,
         None,
         dummy_model(),
+        false,
         spawner_scope.clone(),
     );
     let (_meta, tool) = def();
@@ -351,6 +353,7 @@ async fn spawn_pod_rolls_back_reservation_when_socket_never_appears() {
         registry,
         None,
         dummy_model(),
+        false,
         spawner_scope.clone(),
     );
     let (_meta, tool) = def();

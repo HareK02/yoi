@@ -9,7 +9,8 @@ mod scope;
 pub use cascade::{LayerLoadError, find_project_manifest_from, load_layer};
 pub use config::{
     CompactionConfigPartial, FileUploadLimitsPartial, PermissionConfigPartial, PodManifestConfig,
-    PodMetaConfig, ResolveError, ToolOutputLimitsPartial, WorkerManifestConfig,
+    PodMetaConfig, ResolveError, SessionConfigPartial, ToolOutputLimitsPartial,
+    WorkerManifestConfig,
 };
 pub use model::{
     AuthRef, ModelCapability, ModelManifest, ReasoningControl, ReasoningEffort, SchemeKind,
@@ -395,9 +396,10 @@ pub struct ScopeConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct SessionConfig {
-    /// Persist every provider stream event directly to `trace.jsonl` next to the
-    /// segment log. Intended for debugging stalls between stream requests; off
-    /// by default because it can be verbose.
+    /// Persist normalized provider stream events and lifecycle diagnostics to a
+    /// `.trace.jsonl` sidecar next to the segment log. This is not guaranteed to
+    /// be a byte-for-byte raw SSE capture. Intended for debugging stalls between
+    /// stream requests; off by default because it can be verbose.
     #[serde(default)]
     pub record_event_trace: bool,
 }
