@@ -11,7 +11,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 
 use llm_worker::tool::{ToolError, ToolOutput};
-use manifest::{AuthRef, ModelManifest, Permission, SchemeKind, Scope, ScopeRule, SharedScope};
+use manifest::{
+    AuthRef, ModelManifest, Permission, PodManifest, PodManifestConfig, PodMetaConfig, SchemeKind,
+    Scope, ScopeConfig, ScopeRule, SharedScope,
+};
 use pod::runtime::dir::{RuntimeDir, SpawnedPodRecord};
 use pod::runtime::pod_registry::{self, LockFileGuard};
 use pod::spawn::registry::SpawnedPodRegistry;
@@ -107,6 +110,25 @@ fn accept_one_method(listener: UnixListener) -> tokio::task::JoinHandle<Option<M
             let (reader, writer) = stream.into_split();
             let mut r = JsonLineReader::new(reader);
             let mut w = JsonLineWriter::new(writer);
+            if w.write(&Event::Snapshot {
+                entries: Vec::new(),
+                greeting: protocol::Greeting {
+                    pod_name: "child".into(),
+                    cwd: "/tmp".into(),
+                    provider: "test".into(),
+                    model: "test".into(),
+                    scope_summary: String::new(),
+                    tools: Vec::new(),
+                    context_window: 200_000,
+                    context_tokens: 0,
+                },
+                status: protocol::PodStatus::Idle,
+            })
+            .await
+            .is_err()
+            {
+                continue;
+            }
             if let Ok(Some(method)) = r.next::<Method>().await {
                 w.write(&Event::UserMessage {
                     segments: vec![protocol::Segment::text("accepted")],
@@ -155,6 +177,31 @@ fn dummy_model() -> ModelManifest {
     }
 }
 
+fn dummy_manifest(allow_root: &Path) -> PodManifest {
+    PodManifestConfig {
+        pod: PodMetaConfig {
+            name: Some("root".into()),
+            prompt_pack: None,
+        },
+        model: dummy_model(),
+        scope: ScopeConfig {
+            allow: vec![ScopeRule {
+                target: allow_root.to_path_buf(),
+                permission: Permission::Write,
+                recursive: true,
+            }],
+            deny: Vec::new(),
+        },
+        ..Default::default()
+    }
+    .try_into()
+    .unwrap()
+}
+
+fn builtin_prompts() -> Arc<pod::PromptCatalog> {
+    pod::PromptCatalog::builtins_only().unwrap()
+}
+
 /// Spawner-side `SharedScope` mirroring the `allow_root` granted by
 /// `setup_spawner`. The tool revokes Write rules from this scope on
 /// successful spawn — tests can `load()` it to assert the
@@ -191,15 +238,16 @@ async fn spawn_pod_delegates_scope_and_sends_run() {
         allow_root.path().to_path_buf(),
         registry,
         None,
-        dummy_model(),
-        false,
+        dummy_manifest(allow_root.path()),
         spawner_scope.clone(),
+        builtin_prompts(),
     );
     let (_meta, tool) = def();
 
     let input = json!({
         "name": "child",
         "task": "hello",
+        "profile": "inherit",
         "scope": [{
             "target": allow_root.path().to_str().unwrap(),
             "permission": "write"
@@ -280,9 +328,9 @@ async fn spawn_pod_rejects_scope_outside_spawner() {
         allow_root.path().to_path_buf(),
         registry,
         None,
-        dummy_model(),
-        false,
+        dummy_manifest(allow_root.path()),
         spawner_scope.clone(),
+        builtin_prompts(),
     );
     let (_meta, tool) = def();
 
@@ -290,6 +338,7 @@ async fn spawn_pod_rejects_scope_outside_spawner() {
     let input = json!({
         "name": "child",
         "task": "nope",
+        "profile": "inherit",
         "scope": [{
             "target": outside.path().to_str().unwrap(),
             "permission": "write"
@@ -352,15 +401,16 @@ async fn spawn_pod_rolls_back_reservation_when_socket_never_appears() {
         allow_root.path().to_path_buf(),
         registry,
         None,
-        dummy_model(),
-        false,
+        dummy_manifest(allow_root.path()),
         spawner_scope.clone(),
+        builtin_prompts(),
     );
     let (_meta, tool) = def();
 
     let input = json!({
         "name": "ghost",
         "task": "will never be delivered",
+        "profile": "inherit",
         "scope": [{
             "target": allow_root.path().to_str().unwrap(),
             "permission": "write"
