@@ -2,12 +2,12 @@
 id: 20260529-205540-spawnpod-profile-tool-description
 slug: spawnpod-profile-tool-description
 title: SpawnPod profile selection and templated tool description
-status: open
+status: closed
 kind: feature
 priority: P2
 labels: [pod, manifest, tools, workflow]
 created_at: 2026-05-29T20:55:40Z
-updated_at: 2026-05-30T05:18:48Z
+updated_at: 2026-05-30T05:19:46Z
 assignee: null
 legacy_ticket: null
 ---
