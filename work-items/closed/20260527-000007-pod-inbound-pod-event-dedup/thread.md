@@ -1,13 +1,25 @@
+<!-- event: migration author: tickets.sh-migration at: 2026-05-27T00:00:07Z -->
+
+## Migrated
+
+Migrated from tickets/pod-inbound-pod-event-dedup.md. No legacy review file was present at migration time.
+
+---
+
+<!-- event: close author: hare at: 2026-05-30T05:37:00Z status: closed -->
+
+## Closed
+
 ---
 id: 20260527-000007-pod-inbound-pod-event-dedup
 slug: pod-inbound-pod-event-dedup
 title: Inbound PodEvent ハンドリングの重複を統合する
-status: open
+status: closed
 kind: task
 priority: P2
 labels: [migrated]
 created_at: 2026-05-27T00:00:07Z
-updated_at: 2026-05-27T00:00:07Z
+updated_at: 2026-05-30T05:37:00Z
 assignee: null
 legacy_ticket: tickets/pod-inbound-pod-event-dedup.md
 ---
@@ -74,3 +86,6 @@ Some(Method::PodEvent(event)) => {
 - `apply_event_side_effects` 自体の中身変更。
 - `NotifyBuffer` API のリネーム / 統合。
 - `pod.push_pod_event_notify` の削除（[[pod-interrupt-prep-internalize]] と同じく将来の整理対象だが、本チケットでは外向き API は触らない）。
+
+
+---

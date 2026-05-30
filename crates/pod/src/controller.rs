@@ -900,28 +900,15 @@ async fn controller_loop<C, St>(
             Method::ListCompletions { .. } => {}
 
             Method::PodEvent(event) => {
-                // For agent-visible PodEvents, live echo travels through the
-                // SystemItem lane: once the interceptor drains the notify buffer,
-                // the typed `SystemItem::PodEvent` lands as a
-                // `LogEntry::SystemItem` entry and the sink forwards it
-                // to clients as `Event::SystemItem`. Control-plane-only
-                // PodEvents use this same receive path only for side effects.
-                //
-                // (1) system side effects — idempotent and tolerant of
-                // out-of-order delivery (e.g. `TurnEnded` arriving
-                // after `ShutDown`).
-                crate::ipc::event::apply_event_side_effects(
-                    &event,
+                if handle_inbound_pod_event(
+                    event,
                     &spawned_registry,
                     &spawner_name,
-                    &self_parent_socket,
+                    self_parent_socket.as_ref(),
+                    &notify_buffer,
                 )
-                .await;
-                // (2) agent-visible events enter the notification/history lane.
-                // Control-plane-only events (currently ScopeSubDelegated)
-                // stop after side effects so they do not wake or notify the LLM.
-                if event.should_notify_agent() {
-                    pod.push_pod_event_notify(event);
+                .await
+                {
                     // Auto-kick a turn if the Pod is idle so the
                     // notification is not stranded. Matches the
                     // `Method::Notify` idle path.
@@ -959,6 +946,35 @@ async fn controller_loop<C, St>(
     }
 
     let _ = shutdown_tx.send(());
+}
+
+/// Apply an inbound child `PodEvent` exactly once.
+///
+/// Side effects are control-plane state updates and upward propagation; they
+/// run for every event. Only agent-visible events are staged on the notify
+/// buffer. The caller owns lifecycle-dependent follow-up such as idle
+/// `RunForNotification` auto-kick.
+async fn handle_inbound_pod_event(
+    event: protocol::PodEvent,
+    spawned_registry: &Arc<SpawnedPodRegistry>,
+    self_name: &str,
+    parent_socket: Option<&PathBuf>,
+    notify_buffer: &NotifyBuffer,
+) -> bool {
+    let self_parent_socket = parent_socket.cloned();
+    crate::ipc::event::apply_event_side_effects(
+        &event,
+        spawned_registry,
+        self_name,
+        &self_parent_socket,
+    )
+    .await;
+
+    let notify_agent = event.should_notify_agent();
+    if notify_agent {
+        notify_buffer.push_pod_event(event);
+    }
+    notify_agent
 }
 
 /// Drives a Pod future (one in-flight turn) while concurrently
@@ -1095,23 +1111,17 @@ where
                         // mpsc is consume-once, so we cannot defer this
                         // to the next main-loop iteration — drop here
                         // would lose the event entirely (children fire
-                        // and forget). Apply the side effects inline
-                        // and, for agent-visible variants, stage the typed
-                        // event on the notification buffer so the in-flight
-                        // turn's next `pending_history_appends` surfaces it
-                        // as a typed `SystemItem::PodEvent`. Control-plane-only
-                        // variants stop after side effects.
-                        let self_parent_socket = parent_socket.cloned();
-                        crate::ipc::event::apply_event_side_effects(
-                            &event,
+                        // and forget). Auto-kick remains unnecessary here:
+                        // the in-flight turn will drain agent-visible events
+                        // from the notify buffer on its next history append.
+                        handle_inbound_pod_event(
+                            event,
                             spawned_registry,
                             self_name,
-                            &self_parent_socket,
+                            parent_socket,
+                            notify_buffer,
                         )
                         .await;
-                        if event.should_notify_agent() {
-                            notify_buffer.push_pod_event(event);
-                        }
                     }
                     None => {
                         let _ = cancel_tx.try_send(());
