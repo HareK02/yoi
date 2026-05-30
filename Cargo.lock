@@ -2713,21 +2713,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "readability-rs"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5a17841ca2fc1c3e2aed7c44b29121ab099176923c0ac55d9906edea8ab025bc"
-dependencies = [
- "html5ever",
- "lazy_static",
- "log",
- "markup5ever_rcdom",
- "regex",
- "thiserror 2.0.18",
- "url",
-]
-
-[[package]]
 name = "redox_syscall"
 version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3775,10 +3760,11 @@ dependencies = [
  "grep-matcher",
  "grep-regex",
  "grep-searcher",
+ "html5ever",
  "ignore",
  "llm-worker",
  "manifest",
- "readability-rs",
+ "markup5ever_rcdom",
  "reqwest",
  "schemars",
  "serde",
