@@ -352,6 +352,24 @@ impl ProfileResolver {
                     source,
                 })?;
                 let registry = ProfileDiscovery::for_cwd(&cwd).discover()?;
+                self.resolve_from_registry(selector, &registry, options)
+            }
+        }
+    }
+    /// Resolve a registry/default selector against an already-discovered
+    /// registry. Callers such as SpawnPod use this to bind discovery to the
+    /// Pod's cwd instead of the process current directory.
+    pub fn resolve_from_registry(
+        &self,
+        selector: &ProfileSelector,
+        registry: &ProfileRegistry,
+        options: ProfileResolveOptions,
+    ) -> Result<ResolvedProfile, ProfileError> {
+        match selector {
+            ProfileSelector::Path { .. } => Err(ProfileError::InvalidProfile(
+                "path selectors are not registry entries".into(),
+            )),
+            ProfileSelector::Named { .. } | ProfileSelector::Default => {
                 let entry = registry.select(selector)?.clone();
                 self.resolve_path(
                     &entry.path,
@@ -365,6 +383,7 @@ impl ProfileResolver {
             }
         }
     }
+
     fn resolve_path(
         &self,
         path: &Path,

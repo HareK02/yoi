@@ -92,6 +92,9 @@ pub enum PodPrompt {
     /// knowledge when Workflow resident injection is enabled and at least one
     /// workflow advertises `model_invokation: true`.
     ResidentWorkflowsSection,
+    /// LLM-facing description for the SpawnPod tool, including discovered
+    /// profile selectors.
+    SpawnPodToolDescription,
 }
 
 impl PodPrompt {
@@ -108,6 +111,7 @@ impl PodPrompt {
             Self::ResidentMemorySummarySection => "resident_memory_summary_section",
             Self::ResidentKnowledgeSection => "resident_knowledge_section",
             Self::ResidentWorkflowsSection => "resident_workflows_section",
+            Self::SpawnPodToolDescription => "spawn_pod_tool_description",
         }
     }
 
@@ -126,6 +130,7 @@ impl PodPrompt {
         PodPrompt::ResidentMemorySummarySection,
         PodPrompt::ResidentKnowledgeSection,
         PodPrompt::ResidentWorkflowsSection,
+        PodPrompt::SpawnPodToolDescription,
     ];
 
     pub const KEYS: &'static [&'static str] = &[
@@ -140,6 +145,7 @@ impl PodPrompt {
         "resident_memory_summary_section",
         "resident_knowledge_section",
         "resident_workflows_section",
+        "spawn_pod_tool_description",
     ];
 }
 
@@ -384,6 +390,21 @@ impl PromptCatalog {
             PodPrompt::ResidentWorkflowsSection,
             single("entries", entries),
         )
+    }
+
+    /// Render `PodPrompt::SpawnPodToolDescription`.
+    pub fn spawn_pod_tool_description(
+        &self,
+        available_profiles: &str,
+        default_profile: &str,
+        profile_diagnostic: &str,
+    ) -> Result<String, CatalogError> {
+        use std::collections::BTreeMap;
+        let mut m: BTreeMap<&'static str, Value> = BTreeMap::new();
+        m.insert("available_profiles", Value::from(available_profiles));
+        m.insert("default_profile", Value::from(default_profile));
+        m.insert("profile_diagnostic", Value::from(profile_diagnostic));
+        self.render(PodPrompt::SpawnPodToolDescription, Value::from(m))
     }
 }
 
@@ -681,5 +702,21 @@ compact_system = "PREFIX\n{% include \"$insomnia/internal/compact_system\" %}"
         let rendered = cat.compact_system().unwrap();
         assert!(rendered.starts_with("PREFIX\n"));
         assert!(rendered.contains("write_summary"));
+    }
+
+    #[test]
+    fn spawn_pod_tool_description_renders_profile_block() {
+        let cat = PromptCatalog::builtins_only().unwrap();
+        let rendered = cat
+            .spawn_pod_tool_description(
+                "- `project:coder` — Coder\n- `project:reviewer` — Reviewer",
+                "project:coder",
+                "",
+            )
+            .unwrap();
+        assert!(rendered.contains("Profile selection"));
+        assert!(rendered.contains("Default profile: project:coder"));
+        assert!(rendered.contains("`project:reviewer`"));
+        assert!(rendered.contains("Special selector: inherit"));
     }
 }

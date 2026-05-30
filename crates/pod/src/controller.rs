@@ -501,8 +501,8 @@ where
     let memory_config = pod.manifest().memory.clone();
     let web_config = pod.manifest().web.clone();
     let spawner_name = pod.manifest().pod.name.clone();
-    let spawner_model = pod.manifest().model.clone();
-    let spawner_record_event_trace = pod.manifest().session.record_event_trace;
+    let spawner_manifest = pod.manifest().clone();
+    let prompts = pod.prompts().clone();
     let pod_store = pod.store().clone();
     let self_parent_socket = pod.callback_socket().cloned();
 
@@ -556,9 +556,9 @@ where
         pwd.clone(),
         spawned_registry.clone(),
         self_parent_socket,
-        spawner_model,
-        spawner_record_event_trace,
+        spawner_manifest,
         scope_handle,
+        prompts,
     ));
     worker.register_tool(send_to_pod_tool(spawned_registry.clone()));
     worker.register_tool(read_pod_output_tool(spawned_registry.clone()));

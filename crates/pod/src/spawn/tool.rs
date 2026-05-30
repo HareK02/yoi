@@ -14,8 +14,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use manifest::{
-    ModelManifest, Permission, PodManifestConfig, PodMetaConfig, ScopeConfig, ScopeRule,
-    SessionConfigPartial, SharedScope, WorkerManifestConfig,
+    CompactionConfigPartial, FileUploadLimitsPartial, Permission, PermissionConfigPartial,
+    PodManifest, PodManifestConfig, PodMetaConfig, ProfileDiscovery, ProfileError, ProfileRegistry,
+    ProfileRegistrySource, ProfileResolveOptions, ProfileResolver, ProfileSelector, ScopeConfig,
+    ScopeRule, SessionConfigPartial, SharedScope, ToolOutputLimitsPartial, WorkerManifestConfig,
 };
 use serde::Deserialize;
 use tokio::net::UnixStream;
@@ -23,19 +25,12 @@ use tokio::process::Command;
 use tokio::time::sleep;
 
 use crate::ipc::event;
+use crate::prompt::catalog::PromptCatalog;
 use crate::runtime::dir::SpawnedPodRecord;
 use crate::runtime::pod_registry::{self, LockFileGuard, ScopeLockError};
 use crate::spawn::comm_tools::{SendRunError, send_run_and_confirm};
 use crate::spawn::registry::SpawnedPodRegistry;
 use protocol::PodEvent;
-
-const DESCRIPTION: &str = "Spawn a new Pod process to work on a delegated task. \
-The spawner's write scope is reduced by the scope passed here; the spawned \
-Pod receives its own socket and starts running `task` immediately. The \
-spawned Pod outlives the spawner's current turn and can be contacted again \
-through its socket path.";
-
-const DEFAULT_INSTRUCTION: &str = "$insomnia/default";
 
 /// How long we will wait for the spawned Pod's socket to become
 /// connectable before treating the spawn as failed.
@@ -45,6 +40,13 @@ const SOCKET_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 struct SpawnPodInput {
     /// Identifier for the spawned Pod. Must be unique machine-wide.
     name: String,
+    /// Profile selector for child role configuration. Omit or use `default`
+    /// for the effective child default profile, use `inherit` to derive
+    /// reusable config from the spawner, or use a registry selector such as
+    /// `project:coder`, `project:reviewer`, `builtin:default`, or an
+    /// unambiguous profile slug. Raw/path selectors are rejected.
+    #[serde(default)]
+    profile: Option<String>,
     /// Instruction-file reference (e.g. `$insomnia/default`, `$user/my-agent`).
     #[serde(default)]
     instruction: Option<String>,
@@ -87,6 +89,120 @@ impl From<PermissionInput> for Permission {
     }
 }
 
+#[derive(Debug, Clone)]
+struct AvailableProfiles {
+    registry: Option<ProfileRegistry>,
+    diagnostic: Option<String>,
+}
+
+impl AvailableProfiles {
+    fn discover(cwd: &Path) -> Self {
+        match ProfileDiscovery::for_cwd(cwd).discover() {
+            Ok(registry) => Self {
+                registry: Some(registry),
+                diagnostic: None,
+            },
+            Err(error) => Self {
+                registry: None,
+                diagnostic: Some(error.to_string()),
+            },
+        }
+    }
+
+    fn compact_list(&self) -> String {
+        let Some(registry) = &self.registry else {
+            return "- profile discovery failed; use `inherit` or retry after fixing discovery"
+                .into();
+        };
+        if registry.entries().is_empty() {
+            return "- no registry profiles discovered; `inherit` is still available".into();
+        }
+        registry
+            .entries()
+            .iter()
+            .map(|entry| {
+                let default = if entry.is_default { " (default)" } else { "" };
+                let desc = entry
+                    .description
+                    .as_deref()
+                    .map(|d| format!(" — {d}"))
+                    .unwrap_or_default();
+                format!("- `{}`{}{}", entry.qualified_name(), default, desc)
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn default_label(&self) -> String {
+        self.registry
+            .as_ref()
+            .and_then(|registry| registry.default_entry().ok())
+            .map(|entry| entry.qualified_name())
+            .unwrap_or_else(|| "none resolved".into())
+    }
+
+    fn diagnostic(&self) -> &str {
+        self.diagnostic.as_deref().unwrap_or("")
+    }
+
+    fn error_suffix(&self) -> String {
+        format!(
+            "\nUse `default`, `inherit`, or one of these registry selectors:\n{}",
+            self.compact_list()
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SpawnProfileSelector {
+    Default,
+    Inherit,
+    Registry(ProfileSelector),
+}
+
+fn parse_spawn_profile_selector(raw: Option<&str>) -> Result<SpawnProfileSelector, String> {
+    let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(SpawnProfileSelector::Default);
+    };
+    if raw == "default" {
+        return Ok(SpawnProfileSelector::Default);
+    }
+    if raw == "inherit" {
+        return Ok(SpawnProfileSelector::Inherit);
+    }
+    if raw.starts_with("path:")
+        || raw.starts_with('/')
+        || raw.starts_with("./")
+        || raw.starts_with("../")
+        || raw.contains('/')
+        || raw.ends_with(".lua")
+        || raw.ends_with(".nix")
+    {
+        return Err(format!(
+            "SpawnPod.profile accepts `default`, `inherit`, or registry selectors only; path-like selector `{raw}` is not allowed"
+        ));
+    }
+    if let Some((prefix, name)) = raw.split_once(':') {
+        let source = match prefix {
+            "builtin" => ProfileRegistrySource::Builtin,
+            "user" => ProfileRegistrySource::User,
+            "project" => ProfileRegistrySource::Project,
+            _ => {
+                return Err(format!(
+                    "unsupported SpawnPod.profile selector prefix `{prefix}`; use builtin:, user:, project:, default, or inherit"
+                ));
+            }
+        };
+        if name.is_empty() {
+            return Err("SpawnPod.profile registry selector has an empty profile name".into());
+        }
+        return Ok(SpawnProfileSelector::Registry(
+            ProfileSelector::source_named(source, name),
+        ));
+    }
+    Ok(SpawnProfileSelector::Registry(ProfileSelector::named(raw)))
+}
+
 /// Runtime dependencies the `SpawnPod` tool needs in order to launch a
 /// child Pod and record the handoff locally. Constructed by the Pod
 /// controller once per Pod lifetime.
@@ -114,14 +230,12 @@ pub struct SpawnPodTool {
     /// `None` for top-level Pods — in that case the re-emission is a
     /// no-op.
     parent_socket: Option<PathBuf>,
-    /// Spawner's resolved provider config — copied into every spawned
-    /// Pod's internal manifest config so the child does not need its own provider
-    /// configuration. Per-spawn override is
-    /// out of scope here (see `tickets/spawn-inherit-provider.md`).
-    spawner_model: ModelManifest,
-    /// Spawner's session diagnostics policy. Preserved for spawned Pods so
-    /// opt-in provider event traces continue across delegation.
-    spawner_record_event_trace: bool,
+    /// Spawner's resolved Manifest. `profile = "inherit"` derives the
+    /// child config from reusable fields here, and selected profiles are
+    /// merged into the same internal handoff shape before launch.
+    spawner_manifest: PodManifest,
+    /// Compact selector list shared by tool description and diagnostics.
+    available_profiles: AvailableProfiles,
     /// Spawner's runtime scope. After a successful spawn, the
     /// `Permission::Write` rules in the delegated scope are revoked
     /// from the spawner's in-memory view (a `deny(Write, target)` is
@@ -133,15 +247,15 @@ pub struct SpawnPodTool {
 }
 
 impl SpawnPodTool {
-    pub fn new(
+    fn new(
         spawner_name: String,
         callback_socket: PathBuf,
         runtime_base: PathBuf,
         spawner_pwd: PathBuf,
         registry: Arc<SpawnedPodRegistry>,
         parent_socket: Option<PathBuf>,
-        spawner_model: ModelManifest,
-        spawner_record_event_trace: bool,
+        spawner_manifest: PodManifest,
+        available_profiles: AvailableProfiles,
         spawner_scope: SharedScope,
     ) -> Self {
         Self {
@@ -151,8 +265,8 @@ impl SpawnPodTool {
             spawner_pwd,
             registry,
             parent_socket,
-            spawner_model,
-            spawner_record_event_trace,
+            spawner_manifest,
+            available_profiles,
             spawner_scope,
         }
     }
@@ -176,10 +290,21 @@ impl Tool for SpawnPodTool {
 
         let scope_allow = parse_scope(&input.scope)?;
 
-        let instruction = input
-            .instruction
-            .clone()
-            .unwrap_or_else(|| DEFAULT_INSTRUCTION.to_string());
+        let spawn_selector =
+            parse_spawn_profile_selector(input.profile.as_deref()).map_err(|msg| {
+                ToolError::InvalidArgument(format!(
+                    "{msg}{}",
+                    self.available_profiles.error_suffix()
+                ))
+            })?;
+        let spawn_config_json = self
+            .build_spawn_config_json(
+                &input.name,
+                input.instruction.as_deref(),
+                &scope_allow,
+                spawn_selector,
+            )
+            .map_err(|e| ToolError::InvalidArgument(format!("{e}")))?;
 
         let predicted_socket = self.runtime_base.join(&input.name).join("sock");
         let lock_path = pod_registry::default_registry_path()
@@ -207,21 +332,6 @@ impl Tool for SpawnPodTool {
         // it back — even if later steps (Method::Run delivery, record
         // write) fail, the child is running and will release its own
         // entry on exit.
-        let spawn_config_json = match build_spawn_config_json(
-            &input.name,
-            &instruction,
-            &scope_allow,
-            &self.spawner_model,
-            self.spawner_record_event_trace,
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                self.release_reservation(&lock_path, &input.name);
-                return Err(ToolError::ExecutionFailed(format!(
-                    "spawn config serialisation: {e}"
-                )));
-            }
-        };
 
         let start_outcome = self
             .exec_child(&input.name, &spawn_config_json, &predicted_socket)
@@ -385,11 +495,60 @@ fn parse_scope(rules: &[ScopeRuleInput]) -> Result<Vec<ScopeRule>, ToolError> {
 /// The child's working directory is set separately via
 /// `Command::current_dir` (see [`SpawnPodTool::exec_child`]) — it is
 /// not part of the manifest.
+impl SpawnPodTool {
+    fn build_spawn_config_json(
+        &self,
+        name: &str,
+        instruction_override: Option<&str>,
+        scope_allow: &[ScopeRule],
+        selector: SpawnProfileSelector,
+    ) -> Result<String, String> {
+        let mut config = match selector {
+            SpawnProfileSelector::Inherit => manifest_to_reusable_config(&self.spawner_manifest),
+            SpawnProfileSelector::Default | SpawnProfileSelector::Registry(_) => {
+                let registry = self.available_profiles.registry.as_ref().ok_or_else(|| {
+                    format!(
+                        "profile discovery failed for SpawnPod: {}{}",
+                        self.available_profiles
+                            .diagnostic()
+                            .if_empty("unknown error"),
+                        self.available_profiles.error_suffix()
+                    )
+                })?;
+                let profile_selector = match selector {
+                    SpawnProfileSelector::Default => ProfileSelector::Default,
+                    SpawnProfileSelector::Registry(selector) => selector,
+                    SpawnProfileSelector::Inherit => unreachable!(),
+                };
+                let resolved = ProfileResolver::new()
+                    .with_workspace_base(&self.spawner_pwd)
+                    .resolve_from_registry(
+                        &profile_selector,
+                        registry,
+                        ProfileResolveOptions::with_pod_name(name),
+                    )
+                    .map_err(|e| profile_error_with_available(e, &self.available_profiles))?;
+                manifest_to_reusable_config(&resolved.manifest)
+            }
+        };
+        config.pod.name = Some(name.to_string());
+        config.scope = ScopeConfig {
+            allow: scope_allow.to_vec(),
+            deny: Vec::new(),
+        };
+        if let Some(instruction) = instruction_override {
+            config.worker.instruction = Some(instruction.to_string());
+        }
+        serde_json::to_string(&config).map_err(|e| format!("spawn config serialisation: {e}"))
+    }
+}
+
+#[cfg(test)]
 fn build_spawn_config_json(
     name: &str,
     instruction: &str,
     scope_allow: &[ScopeRule],
-    model: &ModelManifest,
+    model: &manifest::ModelManifest,
     record_event_trace: bool,
 ) -> Result<String, serde_json::Error> {
     let config = PodManifestConfig {
@@ -412,6 +571,94 @@ fn build_spawn_config_json(
         ..Default::default()
     };
     serde_json::to_string(&config)
+}
+
+trait IfEmpty {
+    fn if_empty(&self, fallback: &str) -> String;
+}
+impl IfEmpty for str {
+    fn if_empty(&self, fallback: &str) -> String {
+        if self.is_empty() {
+            fallback.into()
+        } else {
+            self.into()
+        }
+    }
+}
+
+fn profile_error_with_available(error: ProfileError, available: &AvailableProfiles) -> String {
+    format!(
+        "invalid SpawnPod.profile: {error}{}",
+        available.error_suffix()
+    )
+}
+
+fn manifest_to_reusable_config(manifest: &PodManifest) -> PodManifestConfig {
+    PodManifestConfig {
+        pod: PodMetaConfig {
+            name: Some(manifest.pod.name.clone()),
+            prompt_pack: manifest.pod.prompt_pack.clone(),
+        },
+        model: manifest.model.clone(),
+        worker: WorkerManifestConfig {
+            instruction: Some(manifest.worker.instruction.clone()),
+            language: Some(manifest.worker.language.clone()),
+            max_tokens: manifest.worker.max_tokens,
+            max_turns: manifest.worker.max_turns,
+            temperature: manifest.worker.temperature,
+            top_p: manifest.worker.top_p,
+            top_k: manifest.worker.top_k,
+            stop_sequences: (!manifest.worker.stop_sequences.is_empty())
+                .then_some(manifest.worker.stop_sequences.clone()),
+            reasoning: manifest.worker.reasoning.clone(),
+            tool_output: ToolOutputLimitsPartial {
+                default_max_bytes: Some(manifest.worker.tool_output.default_max_bytes),
+                per_tool: manifest.worker.tool_output.per_tool.clone(),
+            },
+            file_upload: FileUploadLimitsPartial {
+                max_bytes: Some(manifest.worker.file_upload.max_bytes),
+            },
+        },
+        scope: ScopeConfig {
+            allow: manifest.scope.allow.clone(),
+            deny: manifest.scope.deny.clone(),
+        },
+        session: Some(SessionConfigPartial {
+            record_event_trace: Some(manifest.session.record_event_trace),
+        }),
+        permissions: manifest
+            .permissions
+            .as_ref()
+            .map(|p| PermissionConfigPartial {
+                default_action: Some(p.default_action),
+                rules: p.rules.clone(),
+            }),
+        compaction: manifest
+            .compaction
+            .as_ref()
+            .map(|c| CompactionConfigPartial {
+                prune_protected_tokens: Some(c.prune_protected_tokens),
+                prune_min_savings: Some(c.prune_min_savings),
+                threshold: c.threshold,
+                request_threshold: c.request_threshold,
+                retained_tokens: Some(c.retained_tokens),
+                overview_target_tokens: Some(c.overview_target_tokens),
+                overview_warning_tokens: Some(c.overview_warning_tokens),
+                overview_deadline_tokens: Some(c.overview_deadline_tokens),
+                worker_context_max_tokens: Some(c.worker_context_max_tokens),
+                finish_warning_remaining_tokens: Some(c.finish_warning_remaining_tokens),
+                final_reserve_tokens: Some(c.final_reserve_tokens),
+                worker_max_turns: c.worker_max_turns,
+                summary_target_tokens: Some(c.summary_target_tokens),
+                summary_max_tokens: Some(c.summary_max_tokens),
+                auto_read_budget_tokens: Some(c.auto_read_budget_tokens),
+                result_context_max_tokens: Some(c.result_context_max_tokens),
+                model: c.model.clone(),
+            }),
+        web: manifest.web.clone(),
+        memory: manifest.memory.clone(),
+        skills: manifest.skills.clone(),
+    }
 }
 
 /// Tail of the spawned child's `stderr.log` to splice into a startup
@@ -493,15 +740,28 @@ pub fn spawn_pod_tool(
     spawner_pwd: PathBuf,
     registry: Arc<SpawnedPodRegistry>,
     parent_socket: Option<PathBuf>,
-    spawner_model: ModelManifest,
-    spawner_record_event_trace: bool,
+    spawner_manifest: PodManifest,
     spawner_scope: SharedScope,
+    prompts: Arc<PromptCatalog>,
 ) -> ToolDefinition {
     Arc::new(move || {
         let schema = schemars::schema_for!(SpawnPodInput);
         let schema_value = serde_json::to_value(schema).unwrap_or(serde_json::json!({}));
+        let available_profiles = AvailableProfiles::discover(&spawner_pwd);
+        let description = prompts
+            .spawn_pod_tool_description(
+                &available_profiles.compact_list(),
+                &available_profiles.default_label(),
+                available_profiles.diagnostic(),
+            )
+            .unwrap_or_else(|e| {
+                format!(
+                    "Spawn a new Pod process to work on a delegated task. Profile description rendering failed: {e}. Available profiles:\n{}",
+                    available_profiles.compact_list()
+                )
+            });
         let meta = ToolMeta::new("SpawnPod")
-            .description(DESCRIPTION)
+            .description(description)
             .input_schema(schema_value);
         let tool: Arc<dyn Tool> = Arc::new(SpawnPodTool::new(
             spawner_name.clone(),
@@ -510,8 +770,8 @@ pub fn spawn_pod_tool(
             spawner_pwd.clone(),
             registry.clone(),
             parent_socket.clone(),
-            spawner_model.clone(),
-            spawner_record_event_trace,
+            spawner_manifest.clone(),
+            available_profiles,
             spawner_scope.clone(),
         ));
         (meta, tool)
@@ -521,7 +781,7 @@ pub fn spawn_pod_tool(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use manifest::{AuthRef, PodManifest, SchemeKind};
+    use manifest::{AuthRef, ModelManifest, PodManifest, SchemeKind};
 
     #[test]
     fn spawn_config_inherits_inline_spawner_model() {
@@ -606,5 +866,41 @@ mod tests {
         let parsed: PodManifestConfig = serde_json::from_str(&config_json).unwrap();
 
         assert!(parsed.session.is_none());
+    }
+
+    #[test]
+    fn spawn_profile_selector_rejects_path_like_values() {
+        for raw in [
+            "./reviewer.lua",
+            "path:./reviewer.lua",
+            "/tmp/reviewer.lua",
+            "legacy.nix",
+        ] {
+            let err = parse_spawn_profile_selector(Some(raw)).unwrap_err();
+            assert!(err.contains("registry selectors only"), "{raw}: {err}");
+        }
+    }
+
+    #[test]
+    fn spawn_profile_selector_accepts_default_inherit_and_registry() {
+        assert_eq!(
+            parse_spawn_profile_selector(None).unwrap(),
+            SpawnProfileSelector::Default
+        );
+        assert_eq!(
+            parse_spawn_profile_selector(Some("inherit")).unwrap(),
+            SpawnProfileSelector::Inherit
+        );
+        assert_eq!(
+            parse_spawn_profile_selector(Some("project:reviewer")).unwrap(),
+            SpawnProfileSelector::Registry(ProfileSelector::source_named(
+                ProfileRegistrySource::Project,
+                "reviewer"
+            ))
+        );
+        assert_eq!(
+            parse_spawn_profile_selector(Some("coder")).unwrap(),
+            SpawnProfileSelector::Registry(ProfileSelector::named("coder"))
+        );
     }
 }
