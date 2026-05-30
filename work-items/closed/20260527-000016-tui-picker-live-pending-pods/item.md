@@ -2,12 +2,12 @@
 id: 20260527-000016-tui-picker-live-pending-pods
 slug: tui-picker-live-pending-pods
 title: TUI picker: live pending Pod の表示優先と状態補完
-status: open
+status: closed
 kind: task
 priority: P2
 labels: [migrated]
 created_at: 2026-05-27T00:00:16Z
-updated_at: 2026-05-30T05:00:32Z
+updated_at: 2026-05-30T05:00:56Z
 assignee: null
 legacy_ticket: tickets/tui-picker-live-pending-pods.md
 ---
