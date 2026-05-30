@@ -731,9 +731,10 @@ fn extract_html_document(html: &str, base_url: &Url, include_navigation: bool) -
         Ok(dom) => dom,
         Err(err) => {
             return html_fallback_document(
-                html,
+                fallback_diagnostic_text(html_to_text(html)),
                 None,
                 Some(format!("HTML parser failed: {err}")),
+                false,
                 false,
                 false,
                 false,
@@ -750,16 +751,21 @@ fn extract_html_document(html: &str, base_url: &Url, include_navigation: bool) -
     } else {
         (None, false)
     };
+    let navigation_included = navigation_markdown
+        .as_ref()
+        .map(|navigation_markdown| !navigation_markdown.is_empty())
+        .unwrap_or(false);
 
     let Some(candidate) = select_main_candidate(&body) else {
         return html_fallback_document(
-            html,
+            fallback_diagnostic_text_from_body(&body, base_url, navigation_markdown.as_deref()),
             title,
             Some(format!(
                 "local reader found no main-content candidate with at least {WEB_FETCH_READER_MIN_TEXT_CHARS} text characters"
             )),
             navigation_detected,
             include_navigation,
+            navigation_included,
             navigation_truncated,
         );
     };
@@ -767,21 +773,18 @@ fn extract_html_document(html: &str, base_url: &Url, include_navigation: bool) -
     let mut text = clean_text(markdown_for_node(&candidate.handle, base_url, true));
     if text.chars().count() < WEB_FETCH_READER_MIN_TEXT_CHARS {
         return html_fallback_document(
-            html,
+            fallback_diagnostic_text_from_body(&body, base_url, navigation_markdown.as_deref()),
             title,
             Some(format!(
                 "local reader selected content shorter than {WEB_FETCH_READER_MIN_TEXT_CHARS} characters"
             )),
             navigation_detected,
             include_navigation,
+            navigation_included,
             navigation_truncated,
         );
     }
 
-    let navigation_included = navigation_markdown
-        .as_ref()
-        .map(|navigation_markdown| !navigation_markdown.is_empty())
-        .unwrap_or(false);
     if let Some(navigation_markdown) = navigation_markdown {
         if !navigation_markdown.is_empty() {
             text.push_str("\n\n## Navigation\n\n");
@@ -807,17 +810,14 @@ fn extract_html_document(html: &str, base_url: &Url, include_navigation: bool) -
 }
 
 fn html_fallback_document(
-    html: &str,
+    text: String,
     title: Option<String>,
     fallback_reason: Option<String>,
     navigation_detected: bool,
     include_navigation: bool,
+    navigation_included: bool,
     navigation_truncated: bool,
 ) -> HtmlDocument {
-    let mut text = String::from(
-        "[fallback diagnostic: local reader did not find useful main content; below is stripped HTML text]\n\n",
-    );
-    text.push_str(&html_to_text(html));
     HtmlDocument {
         text,
         metadata: HtmlExtractionMetadata {
@@ -827,12 +827,35 @@ fn html_fallback_document(
             title,
             readable: false,
             navigation_detected,
-            navigation_included: false,
+            navigation_included,
             navigation_omitted: navigation_detected && !include_navigation,
             navigation_truncated,
             navigation_notice: navigation_notice(navigation_detected, include_navigation),
         },
     }
+}
+
+fn fallback_diagnostic_text_from_body(
+    body: &Handle,
+    base_url: &Url,
+    navigation_markdown: Option<&str>,
+) -> String {
+    let mut body_text = clean_text(markdown_for_node(body, base_url, true));
+    if let Some(navigation_markdown) = navigation_markdown {
+        if !navigation_markdown.is_empty() {
+            body_text.push_str("\n\n## Navigation\n\n");
+            body_text.push_str(navigation_markdown);
+        }
+    }
+    fallback_diagnostic_text(body_text)
+}
+
+fn fallback_diagnostic_text(body_text: String) -> String {
+    let mut text = String::from(
+        "[fallback diagnostic: local reader did not find useful main content; below is stripped HTML body text]\n\n",
+    );
+    text.push_str(&body_text);
+    text
 }
 
 #[derive(Debug)]
@@ -897,7 +920,7 @@ fn candidate_score(handle: &Handle, tag: &str, stats: TextStats) -> Option<f64> 
         return None;
     }
     let link_density = stats.link_text_chars as f64 / stats.text_chars.max(1) as f64;
-    if link_density > 0.60 && !matches!(tag, "body" | "main") {
+    if link_density > 0.60 {
         return None;
     }
 
@@ -1364,7 +1387,6 @@ fn is_navigation_element(handle: &Handle) -> bool {
         || has("menu")
         || has("breadcrumb")
         || has("breadcrumbs")
-        || has("chapter")
         || has("pagination")
         || has("pager")
         || has("prevnext")
@@ -1780,7 +1802,9 @@ mod tests {
         assert!(text.contains("[careful Rust web fetching]("));
         assert!(text.contains(&format!("http://{addr}/docs/reader")));
         assert!(text.contains("durable safety bounds"));
-        assert!(!text.contains("Home Products Pricing"));
+        assert!(!text.contains("Home"));
+        assert!(!text.contains("Pricing"));
+        assert!(!text.contains("unrelated navigation"));
         assert!(!text.contains("Copyright boilerplate"));
         assert_eq!(value["transformed_as"], "local_reader_markdown");
         assert_eq!(value["html_extraction"]["method"], "local_reader_markdown");
@@ -1798,6 +1822,92 @@ mod tests {
             value["html_extraction"]["title"].as_str().unwrap(),
             "Example Readable Article"
         );
+    }
+
+    #[tokio::test]
+    async fn link_heavy_main_is_not_reported_as_readable() {
+        let body = r#"
+            <html>
+              <body>
+                <main>
+                  <ul>
+                    <li><a href="/chapter-1">Chapter one overview and navigation entry</a></li>
+                    <li><a href="/chapter-2">Chapter two overview and navigation entry</a></li>
+                    <li><a href="/chapter-3">Chapter three overview and navigation entry</a></li>
+                    <li><a href="/chapter-4">Chapter four overview and navigation entry</a></li>
+                  </ul>
+                </main>
+              </body>
+            </html>
+        "#;
+        let addr = serve_once(html_response(body)).await;
+        let tools = enabled_web_fetch();
+        let result = tools
+            .run_fetch(WebFetchInput {
+                url: format!("http://{addr}/contents"),
+                include_navigation: None,
+            })
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_str(result.content.as_deref().unwrap()).unwrap();
+        let text = value.get("text").unwrap().as_str().unwrap();
+        assert!(text.contains("fallback diagnostic"));
+        assert_ne!(value["transformed_as"], "local_reader_markdown");
+        assert_eq!(value["html_extraction"]["fallback"], true);
+        assert_eq!(value["html_extraction"]["readable"], false);
+    }
+
+    #[tokio::test]
+    async fn fallback_omits_detected_navigation_when_not_requested() {
+        let body = r#"
+            <html>
+              <body>
+                <aside class="sidebar menu">
+                  <a href="/home">Home</a>
+                  <a href="/pricing">Pricing</a>
+                </aside>
+                <article><p>Tiny body.</p></article>
+              </body>
+            </html>
+        "#;
+        let addr = serve_once(html_response(body)).await;
+        let tools = enabled_web_fetch();
+        let result = tools
+            .run_fetch(WebFetchInput {
+                url: format!("http://{addr}/short"),
+                include_navigation: None,
+            })
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_str(result.content.as_deref().unwrap()).unwrap();
+        let text = value.get("text").unwrap().as_str().unwrap();
+        assert!(text.contains("Tiny body."));
+        assert!(!text.contains("Home"));
+        assert!(!text.contains("Pricing"));
+        assert_eq!(value["html_extraction"]["fallback"], true);
+        assert_eq!(value["html_extraction"]["readable"], false);
+        assert_eq!(value["html_extraction"]["navigation_detected"], true);
+        assert_eq!(value["html_extraction"]["navigation_omitted"], true);
+        assert_eq!(value["html_extraction"]["navigation_included"], false);
+    }
+
+    #[test]
+    fn included_navigation_reports_truncation_metadata() {
+        let links = (0..600)
+            .map(|index| {
+                format!("<a href=\"/nav/{index}\">Navigation item {index} with a verbose label</a>")
+            })
+            .collect::<String>();
+        let html = format!(
+            "<html><body><nav>{links}</nav><article><h1>Readable Article</h1><p>This useful article has enough focused prose to make the local reader choose it as main content for the truncation test.</p><p>It also mentions bounded extraction, markdown rendering, and link preservation for untrusted HTML bodies.</p></article></body></html>"
+        );
+        let base_url = Url::parse("https://example.test/docs/index.html").unwrap();
+        let document = extract_html_document(&html, &base_url, true);
+        assert_eq!(document.metadata.readable, true);
+        assert_eq!(document.metadata.navigation_detected, true);
+        assert_eq!(document.metadata.navigation_included, true);
+        assert_eq!(document.metadata.navigation_truncated, true);
+        assert!(document.text.contains("## Navigation"));
     }
 
     #[tokio::test]
