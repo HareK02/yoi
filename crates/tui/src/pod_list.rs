@@ -48,9 +48,9 @@ impl PodList {
             entry.finalize();
         }
         entries.sort_by(|a, b| {
-            b.summary
-                .updated_at
-                .cmp(&a.summary.updated_at)
+            b.has_reachable_live()
+                .cmp(&a.has_reachable_live())
+                .then_with(|| b.summary.updated_at.cmp(&a.summary.updated_at))
                 .then_with(|| a.name.cmp(&b.name))
         });
         entries.truncate(max_entries);
@@ -164,8 +164,25 @@ impl PodListEntry {
     }
 
     fn finalize(&mut self) {
+        self.fill_live_pending_preview();
         self.diagnostics = build_diagnostics(self);
         self.actions = build_actions(self);
+    }
+
+    fn has_reachable_live(&self) -> bool {
+        self.live.as_ref().is_some_and(|live| live.reachable)
+    }
+
+    fn fill_live_pending_preview(&mut self) {
+        if !self.has_reachable_live() || self.summary.updated_at != 0 {
+            return;
+        }
+        let preview_is_pending = self.summary.preview.as_deref() == Some("[pending segment]");
+        let preview_is_incomplete = self.summary.preview.is_none() || preview_is_pending;
+        if preview_is_incomplete && (self.summary.active_segment_id.is_some() || preview_is_pending)
+        {
+            self.summary.preview = Some("[live, pending segment]".to_string());
+        }
     }
 
     pub(crate) fn attach_socket_path(&self) -> Option<&Path> {
@@ -594,6 +611,98 @@ mod tests {
     }
 
     #[test]
+    fn reachable_live_rows_sort_before_stopped_rows_before_truncation() {
+        let stopped = (0..10)
+            .map(|index| stopped_info_with_updated_at(&format!("stopped-{index}"), 1_000 - index))
+            .collect::<Vec<_>>();
+        let live = live_info_with_updated_at("live-pending", PodStatus::Idle, 0);
+
+        let entries = PodList::from_sources(SOURCE, stopped, vec![live], None, 10).entries;
+
+        assert_eq!(entries.len(), 10);
+        assert_eq!(entries[0].name, "live-pending");
+        assert!(entries.iter().all(|entry| entry.name != "stopped-9"));
+    }
+
+    #[test]
+    fn reachable_live_sort_does_not_promote_unreachable_registry_allocations() {
+        let mut unreachable = live_info_with_updated_at("unreachable", PodStatus::Idle, 0);
+        unreachable.reachable = false;
+        unreachable.status = None;
+
+        let entries = PodList::from_sources(
+            SOURCE,
+            vec![stopped_info_with_updated_at("stopped", 100)],
+            vec![unreachable],
+            None,
+            10,
+        )
+        .entries;
+
+        assert_eq!(entries[0].name, "stopped");
+        assert_eq!(entries[1].name, "unreachable");
+    }
+
+    #[test]
+    fn live_pending_with_runtime_segment_is_attach_only_and_gets_pending_preview() {
+        let session_id = new_session_id();
+        let runtime_segment_id = new_segment_id();
+        let entry = single_entry(PodList::from_sources(
+            SOURCE,
+            vec![pending_metadata_info("pending", session_id)],
+            vec![live_info_with_segment(
+                "pending",
+                PodStatus::Idle,
+                runtime_segment_id,
+            )],
+            None,
+            10,
+        ));
+
+        assert_eq!(entry.name, "pending");
+        assert_eq!(entry.summary.active_session_id, Some(session_id));
+        assert_eq!(entry.summary.active_segment_id, Some(runtime_segment_id));
+        assert_eq!(
+            entry.summary.preview.as_deref(),
+            Some("[live, pending segment]")
+        );
+        assert!(entry.actions.can_open);
+        assert!(!entry.actions.can_restore);
+        assert_eq!(
+            entry.attach_socket_path(),
+            Some(Path::new("/tmp/pending.sock"))
+        );
+    }
+
+    #[test]
+    fn live_only_runtime_segment_is_attach_only_and_not_restorable() {
+        let runtime_segment_id = new_segment_id();
+        let entry = single_entry(PodList::from_sources(
+            SOURCE,
+            vec![],
+            vec![live_info_with_segment(
+                "runtime-only",
+                PodStatus::Idle,
+                runtime_segment_id,
+            )],
+            None,
+            10,
+        ));
+
+        assert_eq!(entry.summary.active_segment_id, Some(runtime_segment_id));
+        assert_eq!(
+            entry.summary.preview.as_deref(),
+            Some("[live, pending segment]")
+        );
+        assert!(entry.actions.can_open);
+        assert!(!entry.actions.can_restore);
+        assert_eq!(
+            entry.attach_socket_path(),
+            Some(Path::new("/tmp/runtime-only.sock"))
+        );
+    }
+
+    #[test]
     fn stored_only_row_can_restore_and_open_but_not_direct_send() {
         let dir = tempdir().unwrap();
         let store = FsStore::new(dir.path()).unwrap();
@@ -820,8 +929,40 @@ mod tests {
         )
     }
 
+    fn pending_metadata_info(pod_name: &str, session_id: SessionId) -> StoredPodInfo {
+        StoredPodInfo {
+            pod_name: pod_name.to_string(),
+            metadata_state: StoredMetadataState::Present,
+            active_session_id: Some(session_id),
+            active_segment_id: None,
+            updated_at: 0,
+            preview: Some("[pending segment]".to_string()),
+        }
+    }
+
+    fn stopped_info_with_updated_at(pod_name: &str, updated_at: u64) -> StoredPodInfo {
+        StoredPodInfo {
+            pod_name: pod_name.to_string(),
+            metadata_state: StoredMetadataState::Present,
+            active_session_id: None,
+            active_segment_id: None,
+            updated_at,
+            preview: None,
+        }
+    }
+
     fn live_info(pod_name: &str, status: PodStatus) -> LivePodInfo {
         live_info_with_updated_at(pod_name, status, 0)
+    }
+
+    fn live_info_with_segment(
+        pod_name: &str,
+        status: PodStatus,
+        segment_id: SegmentId,
+    ) -> LivePodInfo {
+        let mut info = live_info(pod_name, status);
+        info.segment_id = Some(segment_id);
+        info
     }
 
     fn live_info_with_updated_at(

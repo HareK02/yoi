@@ -360,4 +360,37 @@ mod tests {
     fn picker_title_names_pods_not_sessions() {
         assert_eq!(picker_title(), "resume pod   pick a pod");
     }
+
+    #[test]
+    fn picker_row_shows_live_pending_preview_and_runtime_segment_id() {
+        let segment_id = session_store::new_segment_id();
+        let entry = PodList::from_sources(
+            PodVisibilitySource::ResumePicker,
+            vec![],
+            vec![crate::pod_list::LivePodInfo {
+                pod_name: "pending".to_string(),
+                socket_path: PathBuf::from("/tmp/pending.sock"),
+                status: Some(protocol::PodStatus::Idle),
+                reachable: true,
+                segment_id: Some(segment_id),
+                summary: crate::pod_list::PodEntrySummary::default(),
+            }],
+            None,
+            10,
+        )
+        .entries
+        .into_iter()
+        .next()
+        .unwrap();
+
+        let text = row_line(&entry, false)
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(text.contains("[live]"));
+        assert!(text.contains("[live, pending segment]"));
+        assert!(text.contains(&format!("g:{}", short_id(segment_id))));
+    }
 }
