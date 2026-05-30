@@ -71,3 +71,29 @@ Validation plan:
 
 
 ---
+
+<!-- event: review author: hare at: 2026-05-30T05:11:43Z status: request_changes -->
+
+## Review: request changes
+
+Request changes.
+
+The implementation direction appears sound, and the reviewer did not find a concrete authority-expansion or lifecycle regression. However, the work item acceptance criteria require focused tests for the new SpawnPod profile semantics, and the submitted tests mostly cover selector parsing plus existing lifecycle tests forced to `profile = "inherit"`.
+
+Required fixes:
+- Add SpawnPod default-profile coverage proving omitted `profile` resolves the effective registry default.
+- Add a source-qualified profile coverage case, e.g. `project:reviewer`, proving role config from the selected profile reaches the generated `--spawn-config-json`.
+- Add `inherit` config coverage proving reusable parent fields are copied while `pod.name`, `scope.allow`, and `scope.deny` are replaced.
+- Add explicit `instruction` override coverage proving only `worker.instruction` changes.
+- Add invalid / ambiguous / no-default diagnostics coverage proving the available-selector block appears.
+- Add profile scope replacement coverage proving profile/inherited scope cannot expand delegated scope.
+
+Non-blocking follow-ups:
+- Available profile list currently emits source-qualified selectors only; future refinement may mention unqualified names when unambiguous.
+- Workflow examples can later be updated to use explicit `project:coder` / `project:reviewer` selectors.
+
+Validation note:
+- `cargo test -p pod spawn_profile --no-default-features` currently only proves parser behavior, not profile resolution or child config construction.
+
+
+---
