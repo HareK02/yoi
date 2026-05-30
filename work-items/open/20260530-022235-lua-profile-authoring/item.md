@@ -7,7 +7,7 @@ kind: task
 priority: P1
 labels: [manifest, profiles, lua, architecture]
 created_at: 2026-05-30T02:22:35Z
-updated_at: 2026-05-30T02:23:16Z
+updated_at: 2026-05-30T02:26:32Z
 assignee: null
 legacy_ticket: null
 ---
