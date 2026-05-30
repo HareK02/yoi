@@ -145,10 +145,10 @@ pub fn resource_dir() -> Option<PathBuf> {
     )
 }
 
-/// Bundled profile registry directory. Missing directories are treated as an
-/// empty builtin registry by discovery.
+/// Bundled Lua profile registry directory. Missing directories are treated as
+/// an empty builtin registry by discovery.
 pub fn builtin_profiles_dir() -> Option<PathBuf> {
-    Some(resource_dir()?.join("nix").join("profiles"))
+    Some(resource_dir()?.join("profiles"))
 }
 
 /// `<config_dir>/prompts.toml` — user prompt pack。

@@ -91,7 +91,7 @@ permission = "write"
 
 ### Manifest / profile 入力
 
-通常の Pod 起動は Nix profile discovery/default から `PodManifest` を生成する。bundled `builtin:default` が fallback default で、user/project `profiles.toml` は profile registry と default selection だけを担う。user/project `manifest.toml` の ambient cascade は通常起動では使わない。
+通常の Pod 起動は Lua profile discovery/default から `PodManifest` を生成する。bundled `builtin:default` が fallback default で、user/project `profiles.toml` は profile registry と default selection だけを担う。user/project `manifest.toml` の ambient cascade は通常起動では使わない。
 
 `insomnia-pod --manifest <PATH>` は explicit one-file compatibility/debug input で、指定 TOML 1 枚だけに builtin defaults を merge し、`PodManifestConfig -> PodManifest` の required validation を通す。
 

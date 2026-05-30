@@ -20,9 +20,9 @@ pub use paths::{
     user_profiles_path,
 };
 pub use profile::{
-    NixProfileResolver, ProfileDiscovery, ProfileError, ProfileManifestSnapshot, ProfileMetadata,
-    ProfileRegistry, ProfileRegistryEntry, ProfileRegistrySource, ProfileSelector, ProfileSource,
-    ResolvedProfile, resolve_profile_artifact,
+    ProfileDiscovery, ProfileError, ProfileManifestSnapshot, ProfileMetadata, ProfileRegistry,
+    ProfileRegistryEntry, ProfileRegistrySource, ProfileResolveOptions, ProfileResolver,
+    ProfileSelector, ProfileSource, ResolvedProfile, resolve_profile_artifact,
 };
 pub use protocol::{Permission, ScopeRule};
 pub use scope::{Scope, ScopeError, SharedScope};
@@ -74,7 +74,7 @@ pub struct PodManifest {
     /// there is no implicit `$config_dir/skills/` or builtin probe.
     #[serde(default)]
     pub skills: Option<SkillsConfig>,
-    /// Optional profile provenance for manifests produced by a Nix profile.
+    /// Optional profile provenance for manifests produced by profile resolution.
     /// Stored only after profile resolution so Pod restore can prefer the
     /// validated snapshot over ambient manifest cascade state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
