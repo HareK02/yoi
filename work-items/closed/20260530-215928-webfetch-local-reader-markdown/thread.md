@@ -76,3 +76,28 @@ Reviewer found no new blocker. Reported validation is adequate.
 
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-05-30T22:21:39Z -->
+
+## Implementation report
+
+Main workspace validation after merge:
+
+- `cargo fmt --check` passed
+- `cargo test -p tools web` passed (14 passed)
+- `cargo check -p tools` passed with existing `llm-worker` dead_code warning
+- `./tickets.sh doctor` passed
+- `git diff --check` passed
+- `nix build .#insomnia` passed (with dirty tree warning due to existing `.insomnia/workflow/multi-agent-workflow.md` local modification and open ticket lifecycle files)
+
+
+---
+
+<!-- event: close author: hare at: 2026-05-30T22:21:39Z status: closed -->
+
+## Closed
+
+Replaced the `readability-rs` WebFetch HTML extraction path with a local pure-Rust DOM reader that renders Markdown-ish main content and preserves inline links as absolute Markdown links. Added optional `include_navigation`, default navigation omission notices, bounded navigation inclusion, readable/fallback metadata, and regression coverage. External review approved after blocker fixes; validation passed including focused tools tests and Nix build.
+
+
+---
