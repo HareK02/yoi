@@ -2,7 +2,7 @@
 //!
 //! 用途別に三つの base directory を持つ:
 //!
-//! - **`config_dir`** — 人が手で書く / 編集する設定。`manifest.toml`,
+//! - **`config_dir`** — 人が手で書く / 編集する設定。`profiles.toml`,
 //!   `providers.toml`, `models.toml`, `prompts/`, `prompts.toml` 等
 //! - **`data_dir`** — プログラムが書く永続データ。`sessions/` 等
 //! - **`runtime_dir`** — 再起動で消えてよいランタイム状態。socket,
@@ -23,20 +23,12 @@
 //! 解決された各 base が存在するか / ディレクトリかは保証しない —
 //! 呼び出し側がファイル操作の前に作成 / 検査する。
 
-use std::ffi::OsString;
 use std::path::PathBuf;
-
-/// Environment variable that points at an explicit user manifest.
-///
-/// Pod CLI treats a non-empty value as an explicit manifest path. Empty values
-/// are treated the same as an unset variable, so callers fall back to the
-/// auto-discovered user manifest path.
-pub const USER_MANIFEST_ENV: &str = "INSOMNIA_USER_MANIFEST";
 
 /// Environment variable that points at installed project resources.
 pub const RESOURCE_DIR_ENV: &str = "INSOMNIA_RESOURCE_DIR";
 
-/// 設定ディレクトリ。`manifest.toml`, `providers.toml`, `models.toml`,
+/// 設定ディレクトリ。`profiles.toml`, `providers.toml`, `models.toml`,
 /// `prompts/` などが置かれる。
 pub fn config_dir() -> Option<PathBuf> {
     if let Some(p) = env_path("INSOMNIA_CONFIG_DIR") {
@@ -80,42 +72,10 @@ pub fn runtime_dir() -> Option<PathBuf> {
 
 // ---- well-known file getters ------------------------------------------------
 
-/// `<config_dir>/manifest.toml` — user manifest の既定位置。
-///
-/// This deliberately ignores [`USER_MANIFEST_ENV`]. Use
-/// [`user_manifest_path_with_env_override`] when mirroring the Pod CLI cascade
-/// resolution rules.
-pub fn user_manifest_path() -> Option<PathBuf> {
-    Some(config_dir()?.join("manifest.toml"))
-}
-
-/// Resolve an explicit user manifest override from an env value.
-///
-/// Non-empty values are paths. `None` and empty strings are both treated as no
-/// override, matching the Pod CLI's `INSOMNIA_USER_MANIFEST` handling.
-pub fn user_manifest_path_from_env(value: Option<OsString>) -> Option<PathBuf> {
-    value.and_then(|value| {
-        if value.as_os_str().is_empty() {
-            None
-        } else {
-            Some(PathBuf::from(value))
-        }
-    })
-}
-
-/// User manifest path using the same env override rule as the Pod CLI cascade.
-///
-/// A non-empty [`USER_MANIFEST_ENV`] value wins. If the variable is unset or
-/// empty, this falls back to [`user_manifest_path`]. The returned path is not
-/// guaranteed to exist.
-pub fn user_manifest_path_with_env_override() -> Option<PathBuf> {
-    user_manifest_path_from_env(std::env::var_os(USER_MANIFEST_ENV)).or_else(user_manifest_path)
-}
-
 /// `<config_dir>/profiles.toml` — user profile registry/default configuration.
 ///
 /// This is application/profile selection configuration, not a Pod manifest
-/// layer. It deliberately ignores [`USER_MANIFEST_ENV`].
+/// layer.
 pub fn user_profiles_path() -> Option<PathBuf> {
     Some(config_dir()?.join("profiles.toml"))
 }
@@ -228,7 +188,6 @@ mod tests {
                 "INSOMNIA_CONFIG_DIR",
                 "INSOMNIA_DATA_DIR",
                 "INSOMNIA_RUNTIME_DIR",
-                "INSOMNIA_USER_MANIFEST",
                 "INSOMNIA_RESOURCE_DIR",
                 "INSOMNIA_HOME",
                 "XDG_CONFIG_HOME",
@@ -356,43 +315,8 @@ mod tests {
     }
 
     #[test]
-    fn user_manifest_env_override_wins_when_non_empty() {
-        let _g = EnvGuard::new(&[
-            ("HOME", Some("/h")),
-            ("INSOMNIA_USER_MANIFEST", Some("/tmp/user.toml")),
-        ]);
-        assert_eq!(
-            user_manifest_path_with_env_override().unwrap(),
-            PathBuf::from("/tmp/user.toml")
-        );
-    }
-
-    #[test]
-    fn empty_user_manifest_env_falls_back_to_default_path() {
-        let _g = EnvGuard::new(&[("HOME", Some("/h")), ("INSOMNIA_USER_MANIFEST", Some(""))]);
-        assert_eq!(
-            user_manifest_path_with_env_override().unwrap(),
-            PathBuf::from("/h/.config/insomnia/manifest.toml")
-        );
-    }
-
-    #[test]
-    fn user_manifest_path_from_env_treats_empty_as_unset() {
-        assert_eq!(user_manifest_path_from_env(None), None);
-        assert_eq!(user_manifest_path_from_env(Some(OsString::from(""))), None);
-        assert_eq!(
-            user_manifest_path_from_env(Some(OsString::from("/tmp/u.toml"))).unwrap(),
-            PathBuf::from("/tmp/u.toml")
-        );
-    }
-
-    #[test]
     fn well_known_files_compose_off_base_dirs() {
         let _g = EnvGuard::new(&[("INSOMNIA_HOME", Some("/sand"))]);
-        assert_eq!(
-            user_manifest_path().unwrap(),
-            PathBuf::from("/sand/config/manifest.toml")
-        );
         assert_eq!(
             user_profiles_path().unwrap(),
             PathBuf::from("/sand/config/profiles.toml")

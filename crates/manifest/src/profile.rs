@@ -1186,7 +1186,6 @@ mod tests {
             let lock = env_lock();
             let names = [
                 "INSOMNIA_CONFIG_DIR",
-                "INSOMNIA_USER_MANIFEST",
                 "INSOMNIA_RESOURCE_DIR",
                 "INSOMNIA_HOME",
                 "XDG_CONFIG_HOME",
@@ -1454,61 +1453,6 @@ return profile {
             .unwrap_err();
         assert!(matches!(err, ProfileError::UnsupportedProfileType { .. }));
         assert!(err.to_string().contains("Lua profiles must end in .lua"));
-    }
-    #[test]
-    fn for_cwd_reads_profiles_toml_and_ignores_manifest_profiles() {
-        let tmp = TempDir::new().unwrap();
-        let config_dir = tmp.path().join("config");
-        std::fs::create_dir_all(&config_dir).unwrap();
-        let _env = EnvGuard::new(&[("INSOMNIA_CONFIG_DIR", Some(config_dir.to_str().unwrap()))]);
-        let project = tmp.path().join("project").join("nested");
-        let insomnia = tmp.path().join("project").join(".insomnia");
-        std::fs::create_dir_all(&project).unwrap();
-        std::fs::create_dir_all(&insomnia).unwrap();
-        std::fs::write(
-            insomnia.join("manifest.toml"),
-            "[profiles]\ndefault = \"wrong\"\n[profiles.profile]\nwrong = \"wrong.lua\"\n",
-        )
-        .unwrap();
-        std::fs::write(
-            insomnia.join("profiles.toml"),
-            "default = \"coder\"\n[profile]\ncoder = \"profiles/coder.lua\"\n",
-        )
-        .unwrap();
-        let registry = ProfileDiscovery::for_cwd(&project).discover().unwrap();
-        assert!(registry.select_named(None, "wrong").is_err());
-        let selected = registry.default_entry().unwrap();
-        assert_eq!(selected.source, ProfileRegistrySource::Project);
-        assert_eq!(selected.name, "coder");
-    }
-    #[test]
-    fn user_manifest_env_does_not_affect_profile_registry_discovery() {
-        let tmp = TempDir::new().unwrap();
-        let config_dir = tmp.path().join("config");
-        std::fs::create_dir_all(&config_dir).unwrap();
-        let env_manifest = tmp.path().join("env-manifest.toml");
-        std::fs::write(
-            &env_manifest,
-            "[profiles]\ndefault = \"wrong\"\n[profiles.profile]\nwrong = \"wrong.lua\"\n",
-        )
-        .unwrap();
-        std::fs::write(
-            config_dir.join("profiles.toml"),
-            "default = \"coder\"\n[profile]\ncoder = \"profiles/coder.lua\"\n",
-        )
-        .unwrap();
-        let _env = EnvGuard::new(&[
-            ("INSOMNIA_CONFIG_DIR", Some(config_dir.to_str().unwrap())),
-            (
-                "INSOMNIA_USER_MANIFEST",
-                Some(env_manifest.to_str().unwrap()),
-            ),
-        ]);
-        let registry = ProfileDiscovery::for_cwd(tmp.path()).discover().unwrap();
-        assert!(registry.select_named(None, "wrong").is_err());
-        let selected = registry.default_entry().unwrap();
-        assert_eq!(selected.source, ProfileRegistrySource::User);
-        assert_eq!(selected.name, "coder");
     }
     #[test]
     fn discovery_reads_user_and_project_registry_and_project_default_wins() {

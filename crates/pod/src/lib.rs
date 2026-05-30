@@ -11,14 +11,12 @@ pub mod shared_state;
 pub mod spawn;
 pub mod workflow;
 
-mod factory;
 mod interrupt_prep;
 mod permission;
 mod pod;
 
 pub use compact::token_counter::{EstimateSource, SplitPoint, TokenEstimate};
 pub use controller::{PodController, PodHandle, ShutdownReceiver};
-pub use factory::{FactoryError, PodFactory};
 pub use hook::{Hook, HookEventKind, HookRegistryBuilder};
 pub use ipc::alerter::Alerter;
 pub use ipc::server::SocketServer;

@@ -3911,8 +3911,7 @@ where
 
     /// Restore a Pod from an existing session log.
     ///
-    /// Resolves the manifest cascade exactly like [`Self::from_manifest`]
-    /// (pwd / scope / pod-registry / client / prompt catalog), seeds a
+    /// Uses the resolved manifest supplied by the caller, seeds a
     /// fresh Worker from the source session's `RestoredState`, and
     /// reuses the same `segment_id` so subsequent turns append to the
     /// source jsonl as a continuation of the same conversation.
@@ -4634,7 +4633,7 @@ pub enum PodError {
 /// Bundle of resources that every high-level Pod constructor needs:
 /// pwd, scope, an LLM client, the prompt catalog, and (optionally) a
 /// parsed system-prompt template. Built once by [`prepare_pod_common`]
-/// from the manifest cascade and then split into Pod fields.
+/// from the resolved manifest and then split into Pod fields.
 struct PodCommon {
     pwd: PathBuf,
     scope: Scope,
@@ -4711,7 +4710,7 @@ fn delegated_write_rule_to_deny(rule: PodSpawnedScopeRule) -> Option<ScopeRule> 
 }
 
 /// Resolve pwd / scope / LLM client / prompt catalog from a validated
-/// manifest cascade. Used by `from_manifest`, `from_manifest_spawned`,
+/// manifest. Used by `from_manifest`, `from_manifest_spawned`,
 /// and `restore_from_manifest` so they share one definition of "what
 /// pieces fall out of a manifest".
 ///

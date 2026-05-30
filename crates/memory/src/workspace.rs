@@ -3,7 +3,8 @@
 //! `WorkspaceLayout` carries the workspace root (typically the Pod's
 //! pwd). All insomnia-managed content lives under the conventional
 //! `<root>/.insomnia/` subdirectory — the same place that holds
-//! `manifest.toml` and `prompts/`. The trees inside it:
+//! `profiles.toml`, `prompts/`, workflow, knowledge, and generated
+//! memory. The trees inside it:
 //!
 //! - `<root>/.insomnia/workflow/<slug>.md`
 //! - `<root>/.insomnia/knowledge/<slug>.md`

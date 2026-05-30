@@ -16,10 +16,10 @@
 //!
 //! 1. **builtin** — `resources/prompts/internal.toml`, baked into the
 //!    binary. Must cover every [`PodPrompt`] variant (build-time check).
-//! 2. **user** — `<user_manifest_dir>/prompts.toml`, auto-discovered by
-//!    [`PodFactory`]. Optional.
-//! 3. **workspace** — `<project>/.insomnia/prompts.toml`, auto-discovered.
+//! 2. **user** — `<config_dir>/prompts.toml`, when a caller supplies it.
 //!    Optional.
+//! 3. **workspace** — `<project>/.insomnia/prompts.toml`, when a caller
+//!    supplies it. Optional.
 //! 4. **manifest pack** — `manifest.pod.prompt_pack`, an explicit path
 //!    per-Pod. Optional.
 //!
@@ -270,7 +270,7 @@ impl PromptCatalog {
     /// - Layer 2 (user): `loader.user_pack_file()` if present.
     /// - Layer 3 (workspace): `loader.workspace_pack_file()` if present.
     /// - Layer 4 (manifest): `manifest_pack` as an absolute filesystem
-    ///   path (pre-resolved by the manifest cascade).
+    ///   path (pre-resolved by profile/manifest resolution).
     pub fn load(
         loader: &PromptLoader,
         manifest_pack: Option<&Path>,

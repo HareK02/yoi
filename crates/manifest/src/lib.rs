@@ -1,4 +1,3 @@
-mod cascade;
 mod config;
 pub mod defaults;
 mod model;
@@ -6,7 +5,6 @@ pub mod paths;
 mod profile;
 mod scope;
 
-pub use cascade::{LayerLoadError, find_project_manifest_from, load_layer};
 pub use config::{
     CompactionConfigPartial, FileUploadLimitsPartial, PermissionConfigPartial, PodManifestConfig,
     PodMetaConfig, ResolveError, SessionConfigPartial, ToolOutputLimitsPartial,
@@ -15,10 +13,7 @@ pub use config::{
 pub use model::{
     AuthRef, ModelCapability, ModelManifest, ReasoningControl, ReasoningEffort, SchemeKind,
 };
-pub use paths::{
-    user_manifest_path, user_manifest_path_from_env, user_manifest_path_with_env_override,
-    user_profiles_path,
-};
+pub use paths::user_profiles_path;
 pub use profile::{
     ProfileDiscovery, ProfileError, ProfileManifestSnapshot, ProfileMetadata, ProfileRegistry,
     ProfileRegistryEntry, ProfileRegistrySource, ProfileResolveOptions, ProfileResolver,
@@ -76,17 +71,15 @@ pub struct PodManifest {
     pub skills: Option<SkillsConfig>,
     /// Optional profile provenance for manifests produced by profile resolution.
     /// Stored only after profile resolution so Pod restore can prefer the
-    /// validated snapshot over ambient manifest cascade state.
+    /// validated snapshot over current profile files or one-file Manifest input.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<profile::ProfileManifestSnapshot>,
 }
 
 /// External Agent Skills (`SKILL.md`) ingest configuration. Skills are
 /// loaded *only* from the directories listed here — there is no
-/// implicit `$config_dir/skills/` or builtin probe. Cascade-merged
-/// across manifest layers, so a user-level manifest can declare a
-/// shared skill root once while a project manifest adds its own
-/// `.claude/skills/` / `.cursor/skills/` paths on top.
+/// implicit `$config_dir/skills/` or builtin probe. Profile and Manifest
+/// resolution may compose these entries before validation.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SkillsConfig {
     /// Skills *roots*. Children of each root must be individual

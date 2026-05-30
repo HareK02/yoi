@@ -210,9 +210,9 @@ impl PodManifestConfig {
         })
     }
 
-    /// Cascade layer populated with the in-code defaults listed in
-    /// [`crate::defaults`]. Used by [`PodFactory::resolve`] as the
-    /// bottom layer, so every per-field default lives at exactly one
+    /// Base config populated with the in-code defaults listed in
+    /// [`crate::defaults`]. Profile and one-file Manifest resolvers start
+    /// from this layer so every per-field default lives at exactly one
     /// call site (the `defaults` module).
     ///
     /// `TryFrom<PodManifestConfig>` also reads the same constants as a

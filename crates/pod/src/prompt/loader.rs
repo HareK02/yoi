@@ -138,9 +138,8 @@ impl PromptLoader {
         }
     }
 
-    /// Override the auto-discovered pack file paths. Used by
-    /// [`crate::PodFactory`] to surface `<user_manifest_dir>/prompts.toml`
-    /// and `<project>/.insomnia/prompts.toml`.
+    /// Override pack file paths supplied by the caller's profile/manifest
+    /// resolution context.
     pub fn with_pack_files(
         mut self,
         user_pack_file: Option<PathBuf>,
