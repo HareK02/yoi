@@ -2,12 +2,12 @@
 id: 20260530-022235-lua-profile-authoring
 slug: lua-profile-authoring
 title: Implement reusable Lua profile authoring
-status: open
+status: closed
 kind: task
 priority: P1
 labels: [manifest, profiles, lua, architecture]
 created_at: 2026-05-30T02:22:35Z
-updated_at: 2026-05-30T02:58:55Z
+updated_at: 2026-05-30T02:59:54Z
 assignee: null
 legacy_ticket: null
 ---
