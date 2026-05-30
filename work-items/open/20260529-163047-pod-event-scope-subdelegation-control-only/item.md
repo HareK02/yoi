@@ -7,7 +7,7 @@ kind: bug
 priority: P2
 labels: [pod, events, orchestration, context]
 created_at: 2026-05-29T16:30:47Z
-updated_at: 2026-05-29T16:30:47Z
+updated_at: 2026-05-30T04:54:02Z
 assignee: null
 legacy_ticket: null
 ---

@@ -7,7 +7,7 @@ kind: task
 priority: P2
 labels: [migrated]
 created_at: 2026-05-27T00:00:16Z
-updated_at: 2026-05-27T00:00:16Z
+updated_at: 2026-05-30T04:54:03Z
 assignee: null
 legacy_ticket: tickets/tui-picker-live-pending-pods.md
 ---
