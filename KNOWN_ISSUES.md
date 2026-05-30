@@ -11,10 +11,8 @@ Ticket を切るほどではないが、次に近所を触るときに合わせ�
 
 ## エントリ
 
-- `crates/tui/src/app.rs:478-485` — bad workflow slug を含む `Method::Run` 送信時、`Event::UserMessage` の早期 broadcast で `turn_index += 1` されターンヘッダだけ残る ("ghost turn header")。次に TUI のターンヘッダ / エラー表示周りを触るときに整理。→ [tickets/pod-input-validate-internalize.md] の review 由来。
-- `crates/pod/src/controller.rs:944` — `worker_error_code` で `PodError::WorkflowResolve(_) => InvalidRequest` が post-commit な resolve エラー (`KnowledgeNotFound` 等) にも適用される。意味論的には妥当方向だが、resolve 系のエラー粒度を分けたくなったタイミングで再評価。
-- `crates/pod/tests/controller_test.rs` — `double_run_returns_error` がたまに失敗する flakiness を観測。`pod-interrupt-prep-internalize` 以前から存在する別件。次に controller_test の Run 連投系のタイミングを触るときに併せて原因を切り分け。
-- `crates/session-store/src/fs_store.rs:117-122` — `FsStore::read_entry_count` が `fs::read_to_string` で全文ロードしてから行数カウントするため O(n)。`ensure_head_or_fork` は run-start でしか呼ばれず現状は許容範囲だが、長期セッションが普通になった時点で `\n` バイト数の cheap count か末尾 seek に置き換える。
-- `crates/session-store/src/segment.rs:121` `ensure_head_or_fork` (free fn, test 専用・本番 caller ゼロ) と `crates/pod/src/pod.rs` `Pod::ensure_segment_head` (本番 inline) に live auto-fork の検知 + forked_from 記録が二重実装されている。entry-hash-abolish 以前からの重複で、両方独立にテスト済みだが drift 必至。session-store 側を本番から呼ぶ形に寄せるか free fn を畳むかは要設計判断。Pod state / fork 周辺を次に触るときに統合を検討。
+- `crates/pod/src/controller.rs:703-718` / `crates/tui/src/app.rs:837-845` — bad workflow slug を含む `Method::Run` 送信時、`Event::UserMessage` の早期 broadcast で `turn_index += 1` されターンヘッダだけ残る ("ghost turn header")。次に TUI のターンヘッダ / エラー表示周りを触るときに整理。
+- `crates/pod/src/controller.rs:1256-1265` — `worker_error_code` で `PodError::WorkflowResolve(_) => InvalidRequest` が post-commit な resolve エラー (`KnowledgeNotFound` 等) にも適用される。意味論的には妥当方向だが、resolve 系のエラー粒度を分けたくなったタイミングで再評価。
+- `crates/session-store/src/fs_store.rs:200-210` — `FsStore::read_entry_count` が `fs::read_to_string` で全文ロードしてから行数カウントするため O(n)。`ensure_head_or_fork` は run-start でしか呼ばれず現状は許容範囲だが、長期セッションが普通になった時点で `\n` バイト数の cheap count か末尾 seek に置き換える。
+- `crates/session-store/src/segment.rs:143-172` `ensure_head_or_fork` (free fn, test 専用・本番 caller ゼロ) と `crates/pod/src/pod.rs:1943-2006` `Pod::ensure_segment_head` (本番 inline) に live auto-fork の検知 + forked_from 記録が二重実装されている。entry-hash-abolish 以前からの重複で、両方独立にテスト済みだが drift 必至。session-store 側を本番から呼ぶ形に寄せるか free fn を畳むかは要設計判断。Pod state / fork 周辺を次に触るときに統合を検討。
 - `crates/pod/src/pod.rs:4074` / `crates/pod/src/spawn/registry.rs:83` — restore 時の spawned child prune/reclaim が Pod restore path と spawned registry load path の両方に残っている。現状は安全側の重複チェックだが、Pod state / spawned registry 周辺を次に触るときに責務境界を再整理。
-- `tickets.sh:414-425` — `cmd_close` が `cmd_status` 呼び出し後に POSIX shell のグローバル変数 `file` 汚染を踏み、`--resolution` 指定でも `item.md` を resolution/thread body としてコピーし得る。今回は手で修正済み。次に tickets.sh の close/status 周辺を触るときに変数名分離か body 作成順序を直す。

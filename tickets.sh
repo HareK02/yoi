@@ -410,19 +410,19 @@ cmd_close() {
     query=$1
     shift
     resolution=
-    file=
+    close_file=
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --resolution) [ "$#" -ge 2 ] || die "--resolution requires a value"; resolution=$2; shift 2 ;;
-            --file) [ "$#" -ge 2 ] || die "--file requires a value"; file=$2; shift 2 ;;
+            --file) [ "$#" -ge 2 ] || die "--file requires a value"; close_file=$2; shift 2 ;;
             *) die "unknown close argument: $1" ;;
         esac
     done
     cmd_status "$query" closed
     dir=$(find_item_dir "$query")
     body=${TMPDIR:-/tmp}/tickets-sh.body.$$
-    if [ -n "$file" ]; then
-        read_body_to_file "$file" "$body"
+    if [ -n "$close_file" ]; then
+        read_body_to_file "$close_file" "$body"
     elif [ -n "$resolution" ]; then
         printf '%s\n' "$resolution" > "$body"
     else
