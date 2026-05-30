@@ -76,3 +76,28 @@ Non-blocking follow-up:
 
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-05-30T20:55:12Z -->
+
+## Implementation report
+
+Main workspace validation after merge:
+
+- `cargo fmt --check` passed
+- `cargo test -p tools web` passed (10 passed)
+- `cargo check -p tools` passed with existing `llm-worker` dead_code warning
+- `./tickets.sh doctor` passed
+- `git diff --check` passed
+- `nix build .#insomnia` passed (with dirty tree warning due to unrelated `.insomnia/workflow/multi-agent-workflow.md` local modification)
+
+
+---
+
+<!-- event: close author: hare at: 2026-05-30T20:55:13Z status: closed -->
+
+## Closed
+
+Implemented `WebFetch` HTML reader-mode extraction with pure-Rust `readability-rs`, preserving existing safety checks and fallback to local `html_to_text`. Output now reports `html_extraction` metadata and bounded main text without exposing extracted HTML by default. Reviewed externally and approved; validation passed including focused tools tests and `nix build .#insomnia`.
+
+
+---

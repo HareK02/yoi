@@ -2,12 +2,12 @@
 id: 20260530-204045-webfetch-readable-extraction
 slug: webfetch-readable-extraction
 title: WebFetch: extract main HTML content with lightweight readability
-status: open
+status: closed
 kind: task
 priority: P2
 labels: [web, tools, html]
 created_at: 2026-05-30T20:40:45Z
-updated_at: 2026-05-30T20:54:26Z
+updated_at: 2026-05-30T20:55:13Z
 assignee: null
 legacy_ticket: null
 ---

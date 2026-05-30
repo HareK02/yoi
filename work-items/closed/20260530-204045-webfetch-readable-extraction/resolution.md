@@ -1,0 +1,1 @@
+Implemented `WebFetch` HTML reader-mode extraction with pure-Rust `readability-rs`, preserving existing safety checks and fallback to local `html_to_text`. Output now reports `html_extraction` metadata and bounded main text without exposing extracted HTML by default. Reviewed externally and approved; validation passed including focused tools tests and `nix build .#insomnia`.
