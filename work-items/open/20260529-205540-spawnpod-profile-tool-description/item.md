@@ -7,7 +7,7 @@ kind: feature
 priority: P2
 labels: [pod, manifest, tools, workflow]
 created_at: 2026-05-29T20:55:40Z
-updated_at: 2026-05-30T05:11:43Z
+updated_at: 2026-05-30T05:18:48Z
 assignee: null
 legacy_ticket: null
 ---

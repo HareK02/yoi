@@ -97,3 +97,34 @@ Validation note:
 
 
 ---
+
+<!-- event: review author: hare at: 2026-05-30T05:18:48Z status: approve -->
+
+## Review: approve
+
+Approve.
+
+The requested test coverage gaps are satisfied by `b94891e`. The new tests directly cover the previously missing SpawnPod profile/config-building behaviors, and the added seam remains private to the module/test context rather than exposing a new production API.
+
+Coverage verified:
+- Omitted/default selector resolves the effective registry default.
+- Source-qualified `project:reviewer` role config reaches generated hidden spawn config / child config.
+- `inherit` copies reusable parent fields while replacing `pod.name`, `scope.allow`, and `scope.deny`.
+- Explicit `instruction` override changes only `worker.instruction` while preserving other selected role fields.
+- Invalid / ambiguous / no-default diagnostics include available-selector guidance.
+- Profile and inherited scope are replaced by delegated scope and cannot expand child authority.
+
+Remaining blockers: none.
+
+Non-blocking follow-ups:
+- Default-selector coverage exercises `SpawnProfileSelector::Default` directly while omitted parse coverage is separate; acceptable.
+- Diagnostics parser test manually composes the invalid-selector suffix instead of going through full `execute`; acceptable because production append logic is simple and builder diagnostics are covered directly.
+
+Validation reviewed:
+- Coder: `cargo fmt --check`, `cargo test -p manifest profile`, `cargo test -p pod`, `cargo test -p pod --no-default-features` passed.
+- Reviewer spot-ran: `cargo test -p pod profile`, `cargo test -p manifest profile`, `cargo test -p pod --no-default-features` passed.
+
+Final verdict: approve.
+
+
+---
