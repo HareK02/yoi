@@ -179,6 +179,8 @@ insomnia-pod --session <uuid>
 
 Spawn children use hidden `--spawn-config-json`, `--adopt`, and `--callback <path>` flags. These are internal handoff details used by `SpawnPod` after the parent has allocated scope and prepared the child config.
 
+`SpawnPod.profile` accepts registry/default selectors and the special `inherit` selector. Typical orchestration calls are `SpawnPod(profile = "project:coder")` for implementation work, `SpawnPod(profile = "project:reviewer")` for independent review, optionally `SpawnPod(profile = "project:orchestrator")` for lower-level coordination, or `SpawnPod(profile = "inherit")` when the child should reuse the parent role configuration. The explicit `SpawnPod.scope` remains the only delegated filesystem capability; selected or inherited profile scope is replaced by the tool argument.
+
 ## Programmatic boundary
 
 New code should resolve profiles through the profile resolver and then construct Pods from the resulting `PodManifest` and `PromptLoader`. One-file Manifest helpers remain for tests/debugging. Avoid reintroducing user/project manifest cascade APIs as normal startup behavior.
