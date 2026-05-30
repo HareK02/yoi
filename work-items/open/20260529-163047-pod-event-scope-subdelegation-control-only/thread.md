@@ -47,3 +47,37 @@ Validation plan:
 
 
 ---
+
+<!-- event: review author: hare at: 2026-05-30T05:03:44Z status: approve -->
+
+## Review: approve
+
+Approve.
+
+The implementation keeps `PodEvent::ScopeSubDelegated` on the typed IPC/control plane while removing it from the agent-visible notification/history/auto-run lane. The core change is an explicit `PodEvent::should_notify_agent()` classifier used by both controller event receive paths after side effects have already been applied.
+
+Blocker findings: none.
+
+Requirement coverage:
+- `ScopeSubDelegated` side effects are still applied in both idle and running paths.
+- Upward re-emission remains in `apply_event_side_effects`.
+- `ScopeSubDelegated` no longer enters `NotifyBuffer`, does not append `SystemItem::PodEvent`, and does not auto-kick `RunForNotification`.
+- `TurnEnded`, `Errored`, and `ShutDown` remain agent-visible.
+- Wire serialization/protocol shape is unchanged.
+- No new hidden history/context injection path was introduced.
+
+Non-blocking follow-ups:
+- Consider making misuse harder later by renaming/gating lower-level `push_pod_event_notify` / `NotifyBuffer::push_pod_event` APIs or adding debug assertions.
+- Idle-path test does not directly assert registry side effect, but running-path and pod event side-effect tests cover it and the idle path calls the same side-effect function before gating.
+
+Validation reviewed from coder report:
+- `cargo fmt --check` — passed.
+- `cargo test -p protocol pod_event` — passed.
+- `cargo test -p pod --test pod_events_test` — passed.
+- `cargo test -p pod --test controller_test pod_event` — passed.
+- focused running-path tests for control-only and visible events — passed.
+
+Final verdict: approve.
+
+
+---
