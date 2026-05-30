@@ -7,7 +7,7 @@ kind: task
 priority: P2
 labels: [pod, profile, session-trace, debuggability]
 created_at: 2026-05-29T23:54:08Z
-updated_at: 2026-05-29T23:54:08Z
+updated_at: 2026-05-30T00:23:45Z
 assignee: null
 legacy_ticket: null
 ---
