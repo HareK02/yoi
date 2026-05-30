@@ -1,3 +1,4 @@
+use std::io::Cursor;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -8,7 +9,7 @@ use manifest::{WebConfig, WebFetchConfig, WebSearchConfig, WebSearchProvider};
 use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, LOCATION};
 use reqwest::{Client, Url};
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::net::lookup_host;
 
@@ -24,6 +25,8 @@ const WEB_FETCH_DEFAULT_MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const WEB_FETCH_DEFAULT_MAX_OUTPUT_BYTES: usize = 64 * 1024;
 const WEB_FETCH_MIN_MAX_RESPONSE_BYTES: usize = 1024;
 const WEB_FETCH_MIN_MAX_OUTPUT_BYTES: usize = 512;
+const WEB_FETCH_READABILITY_MIN_TEXT_CHARS: usize = 40;
+const WEB_FETCH_TRUNCATION_MARKER: &str = "\n[truncated]";
 
 #[derive(Clone)]
 pub struct WebTools {
@@ -429,10 +432,11 @@ async fn fetch_url(
             )));
         }
         let (bytes, response_truncated) = read_limited(response, limits.max_response_bytes).await?;
-        let (text, transformed_as) = render_content(
+        let rendered = render_content(
             &bytes,
             media_kind,
             content_type.as_deref(),
+            &url,
             limits.max_output_bytes,
         )?;
         return Ok(json_output(json!({
@@ -440,13 +444,15 @@ async fn fetch_url(
             "url": url.as_str(),
             "status": status.as_u16(),
             "content_type": content_type,
-            "transformed_as": transformed_as,
+            "transformed_as": rendered.transformed_as,
+            "html_extraction": rendered.html_extraction,
             "bytes_read": bytes.len(),
             "truncated": response_truncated,
+            "output_truncated": rendered.output_truncated,
             "max_response_bytes": limits.max_response_bytes,
             "max_output_bytes": limits.max_output_bytes,
             "redirects": redirects,
-            "text": text,
+            "text": rendered.text,
         })));
     }
     unreachable!("redirect loop exits through return or error")
@@ -635,12 +641,36 @@ fn classify_content_type(content_type: Option<&str>) -> Result<MediaKind, ToolEr
     }
 }
 
+#[derive(Debug)]
+struct RenderedContent {
+    text: String,
+    transformed_as: &'static str,
+    html_extraction: Option<HtmlExtractionMetadata>,
+    output_truncated: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct HtmlExtractionMetadata {
+    method: &'static str,
+    fallback: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fallback_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+}
+
+struct HtmlDocument {
+    text: String,
+    metadata: HtmlExtractionMetadata,
+}
+
 fn render_content(
     bytes: &[u8],
     kind: MediaKind,
     content_type: Option<&str>,
+    base_url: &Url,
     max_output_bytes: usize,
-) -> Result<(String, &'static str), ToolError> {
+) -> Result<RenderedContent, ToolError> {
     reject_binary(bytes)?;
     let raw = String::from_utf8(bytes.to_vec()).map_err(|err| {
         ToolError::ExecutionFailed(format!(
@@ -648,16 +678,75 @@ fn render_content(
             content_type.unwrap_or("unknown")
         ))
     })?;
-    let rendered = match kind {
-        MediaKind::Html => (html_to_text(&raw), "html_to_text"),
-        MediaKind::Json => (json_to_text(&raw)?, "json_pretty"),
-        MediaKind::Xml => (xmlish_to_text(&raw), "xml_text"),
-        MediaKind::Text | MediaKind::Unknown => (raw, "text"),
+    let (text, transformed_as, html_extraction) = match kind {
+        MediaKind::Html => {
+            let document = extract_html_document(&raw, base_url);
+            (
+                document.text,
+                document.metadata.method,
+                Some(document.metadata),
+            )
+        }
+        MediaKind::Json => (json_to_text(&raw)?, "json_pretty", None),
+        MediaKind::Xml => (xmlish_to_text(&raw), "xml_text", None),
+        MediaKind::Text | MediaKind::Unknown => (raw, "text", None),
     };
-    Ok((
-        truncate_to_bytes(clean_text(rendered.0), max_output_bytes),
-        rendered.1,
-    ))
+    let (text, output_truncated) = truncate_to_bytes(clean_text(text), max_output_bytes);
+    Ok(RenderedContent {
+        text,
+        transformed_as,
+        html_extraction,
+        output_truncated,
+    })
+}
+
+fn extract_html_document(html: &str, base_url: &Url) -> HtmlDocument {
+    let mut input = Cursor::new(html.as_bytes());
+    match readability::extract(&mut input, base_url, Default::default()) {
+        Ok(readable) => {
+            let text = clean_text(readable.text);
+            let title = non_empty_string(clean_text(readable.title));
+            if text.chars().count() >= WEB_FETCH_READABILITY_MIN_TEXT_CHARS {
+                return HtmlDocument {
+                    text,
+                    metadata: HtmlExtractionMetadata {
+                        method: "readability",
+                        fallback: false,
+                        fallback_reason: None,
+                        title,
+                    },
+                };
+            }
+            html_fallback_document(
+                html,
+                title,
+                Some(format!(
+                    "readability text shorter than {WEB_FETCH_READABILITY_MIN_TEXT_CHARS} characters"
+                )),
+            )
+        }
+        Err(err) => html_fallback_document(
+            html,
+            None,
+            Some(format!("readability extraction failed: {err}")),
+        ),
+    }
+}
+
+fn html_fallback_document(
+    html: &str,
+    title: Option<String>,
+    fallback_reason: Option<String>,
+) -> HtmlDocument {
+    HtmlDocument {
+        text: html_to_text(html),
+        metadata: HtmlExtractionMetadata {
+            method: "html_to_text",
+            fallback: true,
+            fallback_reason,
+            title,
+        },
+    }
 }
 
 fn reject_binary(bytes: &[u8]) -> Result<(), ToolError> {
@@ -772,17 +861,31 @@ fn decode_basic_entities(input: &str) -> String {
         .replace("&#39;", "'")
 }
 
-fn truncate_to_bytes(mut s: String, max: usize) -> String {
+fn non_empty_string(input: String) -> Option<String> {
+    if input.is_empty() { None } else { Some(input) }
+}
+
+fn truncate_to_bytes(mut s: String, max: usize) -> (String, bool) {
     if s.len() <= max {
-        return s;
+        return (s, false);
     }
-    let mut end = max;
-    while !s.is_char_boundary(end) {
+
+    if max <= WEB_FETCH_TRUNCATION_MARKER.len() {
+        let mut end = max;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s.truncate(end);
+        return (s, true);
+    }
+
+    let mut end = max - WEB_FETCH_TRUNCATION_MARKER.len();
+    while end > 0 && !s.is_char_boundary(end) {
         end -= 1;
     }
     s.truncate(end);
-    s.push_str("\n[truncated]");
-    s
+    s.push_str(WEB_FETCH_TRUNCATION_MARKER);
+    (s, true)
 }
 
 fn bounded_lossy(bytes: &[u8], max: usize) -> String {
@@ -875,6 +978,16 @@ mod tests {
         addr
     }
 
+    fn html_response(body: &str) -> &'static str {
+        Box::leak(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(), body
+            )
+            .into_boxed_str(),
+        )
+    }
+
     async fn read_request(stream: &mut TcpStream) -> String {
         let mut buf = vec![0; 4096];
         let n = stream.read(&mut buf).await.unwrap();
@@ -882,6 +995,10 @@ mod tests {
     }
 
     fn enabled_web_fetch() -> WebTools {
+        enabled_web_fetch_with_output(2048)
+    }
+
+    fn enabled_web_fetch_with_output(max_output_bytes: usize) -> WebTools {
         WebTools::new(Some(WebConfig {
             enabled: Some(true),
             allow_private_addresses: Some(true),
@@ -891,7 +1008,7 @@ mod tests {
                 timeout_secs: Some(5),
                 redirect_limit: Some(2),
                 max_response_bytes: Some(4096),
-                max_output_bytes: Some(2048),
+                max_output_bytes: Some(max_output_bytes),
                 allow_private_addresses: None,
             }),
         }))
@@ -942,10 +1059,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetches_html_as_bounded_text() {
-        let addr = serve_once(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: 93\r\n\r\n<html><body><h1>Hello &amp; welcome</h1><script>ignore()</script><p>Readable text.</p></body></html>",
-        )
+    async fn fetches_short_html_with_fallback_metadata() {
+        let addr = serve_once(html_response(
+            "<html><body><h1>Hello &amp; welcome</h1><script>ignore()</script><p>Readable text.</p></body></html>",
+        ))
         .await;
         let tools = enabled_web_fetch();
         let result = tools
@@ -959,6 +1076,80 @@ mod tests {
         assert!(text.contains("Hello & welcome"));
         assert!(text.contains("Readable text."));
         assert!(!text.contains("ignore"));
+        assert_eq!(value["transformed_as"], "html_to_text");
+        assert_eq!(value["html_extraction"]["method"], "html_to_text");
+        assert_eq!(value["html_extraction"]["fallback"], true);
+        assert!(
+            value["html_extraction"]["fallback_reason"]
+                .as_str()
+                .unwrap()
+                .contains("shorter")
+        );
+    }
+
+    #[tokio::test]
+    async fn fetches_html_with_readability_main_text() {
+        let body = r#"
+            <html>
+              <head><title>Example Readable Article</title></head>
+              <body>
+                <nav>Home Products Pricing unrelated navigation</nav>
+                <main>
+                  <article>
+                    <h1>Example Readable Article</h1>
+                    <p>The useful article opens with a distinct sentence about careful Rust web fetching and reader mode extraction.</p>
+                    <p>It continues with enough focused prose to make the main document body clearly longer than boilerplate around it.</p>
+                    <p>A final paragraph mentions durable safety bounds and untrusted web content handling for the fetched page.</p>
+                  </article>
+                </main>
+                <footer>Copyright boilerplate and social links should not be part of the article.</footer>
+              </body>
+            </html>
+        "#;
+        let addr = serve_once(html_response(body)).await;
+        let tools = enabled_web_fetch();
+        let result = tools
+            .run_fetch(WebFetchInput {
+                url: format!("http://{addr}/article"),
+            })
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_str(result.content.as_deref().unwrap()).unwrap();
+        let text = value.get("text").unwrap().as_str().unwrap();
+        assert!(text.contains("careful Rust web fetching"));
+        assert!(text.contains("durable safety bounds"));
+        assert!(!text.contains("Home Products Pricing"));
+        assert!(!text.contains("Copyright boilerplate"));
+        assert_eq!(value["transformed_as"], "readability");
+        assert_eq!(value["html_extraction"]["method"], "readability");
+        assert_eq!(value["html_extraction"]["fallback"], false);
+        assert_eq!(
+            value["html_extraction"]["title"].as_str().unwrap(),
+            "Example Readable Article"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetches_readable_html_with_bounded_output() {
+        let repeated =
+            "Reader-mode extracted paragraph with enough content for truncation. ".repeat(30);
+        let body = format!(
+            "<html><head><title>Long Article</title></head><body><article><h1>Long Article</h1><p>{repeated}</p></article></body></html>"
+        );
+        let addr = serve_once(html_response(&body)).await;
+        let tools = enabled_web_fetch_with_output(WEB_FETCH_MIN_MAX_OUTPUT_BYTES);
+        let result = tools
+            .run_fetch(WebFetchInput {
+                url: format!("http://{addr}/long"),
+            })
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_str(result.content.as_deref().unwrap()).unwrap();
+        let text = value.get("text").unwrap().as_str().unwrap();
+        assert!(text.len() <= WEB_FETCH_MIN_MAX_OUTPUT_BYTES);
+        assert!(text.ends_with(WEB_FETCH_TRUNCATION_MARKER));
+        assert_eq!(value["output_truncated"], true);
+        assert_eq!(value["html_extraction"]["fallback"], false);
     }
 
     #[tokio::test]

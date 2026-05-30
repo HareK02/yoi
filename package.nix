@@ -40,7 +40,7 @@ rustPlatform.buildRustPackage rec {
     filter = sourceFilter;
   };
 
-  cargoHash = "sha256-8ZT5moKFxj/5vbp5rsUG7UkPLY1fvQKhYTyjRWQ58xk=";
+  cargoHash = "sha256-VzVFqOWJHfgX92Qw84995ICQu2uvQPeYm6AotU4/LR0=";
 
   depsExtraArgs = {
     # nixpkgs 25.11's fetchCargoVendor still uses crates.io's API
