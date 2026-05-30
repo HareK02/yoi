@@ -206,11 +206,11 @@ host_a (spawner)                         host_b (remote)
 # 1. session + profile/manifest input を転送
 ssh insomnia@host-b "mkdir -p ~/workspaces/task-123/store"
 tar cz session/ | ssh insomnia@host-b "tar xz -C ~/workspaces/task-123/store"
-scp profile.nix insomnia@host-b:~/workspaces/task-123/profile.nix
+scp profile.lua insomnia@host-b:~/workspaces/task-123/profile.lua
 
 # 2. Pod を起動（detach）
 ssh insomnia@host-b "insomnia-pod --store ~/workspaces/task-123/store \
-    --profile ~/workspaces/task-123/profile.nix &"
+    --profile ~/workspaces/task-123/profile.lua &"
 
 # 3. socket を tunnel で引っ張る
 ssh -L /tmp/pod-b.sock:/run/insomnia/task-123/pod.sock insomnia@host-b

@@ -444,7 +444,7 @@ permission = "write"
     #[test]
     fn profile_uses_selected_profile() {
         let tmp = TempDir::new().unwrap();
-        let profile = tmp.path().join("profile.nix");
+        let profile = tmp.path().join("profile.lua");
         let cli = Cli::try_parse_from([
             "insomnia-pod",
             "--profile",
@@ -633,12 +633,12 @@ permission = "write"
     fn profile_conflicts_with_manifest_and_restore_modes() {
         let segment_id = session_store::new_segment_id().to_string();
         for args in [
-            vec!["insomnia-pod", "--profile", "p.nix", "--manifest", "m.toml"],
-            vec!["insomnia-pod", "--profile", "p.nix", "--pod", "agent"],
+            vec!["insomnia-pod", "--profile", "p.lua", "--manifest", "m.toml"],
+            vec!["insomnia-pod", "--profile", "p.lua", "--pod", "agent"],
             vec![
                 "insomnia-pod",
                 "--profile",
-                "p.nix",
+                "p.lua",
                 "--session",
                 &segment_id,
             ],
@@ -659,7 +659,7 @@ permission = "write"
         let cli = Cli::try_parse_from([
             "insomnia-pod",
             "--profile",
-            "p.nix",
+            "p.lua",
             "--profile-pod-name",
             "agent",
         ])

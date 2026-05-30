@@ -655,7 +655,7 @@ mod tests {
             r#"
 default = "coder"
 [profile]
-coder = "profiles/coder.nix"
+coder = "profiles/coder.lua"
 "#,
         )
         .unwrap();
@@ -679,7 +679,7 @@ coder = "profiles/coder.nix"
             r#"
 default = "coder"
 [profile.coder]
-path = "profiles/coder.nix"
+path = "profiles/coder.lua"
 description = "Project coder"
 "#,
         )

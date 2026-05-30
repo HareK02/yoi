@@ -125,7 +125,7 @@ pub fn user_prompts_dir() -> Option<PathBuf> {
     Some(config_dir()?.join("prompts"))
 }
 
-/// Root resource directory used for bundled prompts/Nix support files.
+/// Root resource directory used for bundled prompts, profiles, catalogs, and docs.
 pub fn resource_dir() -> Option<PathBuf> {
     if let Some(p) = env_path(RESOURCE_DIR_ENV) {
         return Some(p);

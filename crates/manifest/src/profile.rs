@@ -382,7 +382,7 @@ impl ProfileResolver {
             .map(str::to_string);
         match extension.as_deref() {
             Some("lua") => {}
-            Some("nix") => return Err(ProfileError::UnsupportedProfileType { path: absolute_path, message: "Nix profile evaluation is not part of the primary Profile path; use a Lua profile or --manifest for a complete Manifest".into() }),
+            Some("nix") => return Err(ProfileError::UnsupportedProfileType { path: absolute_path, message: "Nix profile files are no longer supported; use a Lua profile or --manifest for a complete Manifest".into() }),
             other => return Err(ProfileError::UnsupportedProfileType { path: absolute_path, message: format!("unsupported profile extension {}; Lua profiles must end in .lua", other.map_or("<none>".to_string(), |s| format!(".{s}"))) }),
         }
         let profile_dir = absolute_path

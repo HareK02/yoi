@@ -1181,9 +1181,9 @@ mod tests {
 
     #[test]
     fn parse_profile_spawn_mode() {
-        match parse_args_from(["--profile", "/profiles/coder.nix"]).unwrap() {
+        match parse_args_from(["--profile", "/profiles/coder.lua"]).unwrap() {
             Mode::Spawn { profile } => {
-                assert_eq!(profile, Some("/profiles/coder.nix".to_string()));
+                assert_eq!(profile, Some("/profiles/coder.lua".to_string()));
             }
             _ => panic!("expected Spawn mode"),
         }
@@ -1196,7 +1196,7 @@ mod tests {
             (
                 vec![
                     "--profile".to_string(),
-                    "p.nix".to_string(),
+                    "p.lua".to_string(),
                     "--resume".to_string(),
                 ],
                 "--profile can only be used for fresh spawn",
@@ -1204,7 +1204,7 @@ mod tests {
             (
                 vec![
                     "--profile".to_string(),
-                    "p.nix".to_string(),
+                    "p.lua".to_string(),
                     "--session".to_string(),
                     segment_id,
                 ],
@@ -1213,7 +1213,7 @@ mod tests {
             (
                 vec![
                     "--profile".to_string(),
-                    "p.nix".to_string(),
+                    "p.lua".to_string(),
                     "--socket".to_string(),
                     "/tmp/insomnia/sock".to_string(),
                 ],
@@ -1222,7 +1222,7 @@ mod tests {
             (
                 vec![
                     "--profile".to_string(),
-                    "p.nix".to_string(),
+                    "p.lua".to_string(),
                     "agent".to_string(),
                 ],
                 "--profile can only be used for fresh spawn",

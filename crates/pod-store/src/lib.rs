@@ -416,7 +416,7 @@ mod tests {
         );
         metadata.resolved_manifest_snapshot = Some(serde_json::json!({
             "pod": { "name": "profile-pod" },
-            "profile": { "source": { "kind": "path", "path": "/profiles/coder.nix" } }
+            "profile": { "source": { "kind": "path", "path": "/profiles/coder.lua" } }
         }));
 
         let json = serde_json::to_string(&metadata).unwrap();

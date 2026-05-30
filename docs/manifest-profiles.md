@@ -31,7 +31,7 @@ insomnia-pod --profile ./coder.lua
 insomnia --profile ./coder.lua
 ```
 
-`--profile` accepts an explicit path, `path:<path>`, a discovered profile name, `default`, or a source-qualified name such as `project:coder`, `user:coder`, or `builtin:coder`. Path-like values containing `/`, starting with `.`, or ending in `.lua` are explicit paths. `.nix` paths are no longer the primary profile layer and fail with a diagnostic that points users at Lua profiles or `--manifest`.
+`--profile` accepts an explicit path, `path:<path>`, a discovered profile name, `default`, or a source-qualified name such as `project:coder`, `user:coder`, or `builtin:coder`. Path-like values containing `/`, starting with `.`, or ending in `.lua` are explicit paths. ``.nix` paths are no longer supported as profiles and fail with a diagnostic that points users at Lua profiles or `--manifest`.
 
 `--profile` conflicts with `insomnia-pod --manifest` and with restore/session/adopt modes. Use `--profile-pod-name <name>` when a launcher needs a creation-time Pod name override without invoking `--pod` restore semantics. Profile evaluation is a creation-time path; Pod resume restores saved Pod state/resolved snapshots rather than re-evaluating the profile source.
 
