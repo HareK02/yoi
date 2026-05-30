@@ -29,3 +29,25 @@ Validation target:
 
 
 ---
+
+<!-- event: review author: hare at: 2026-05-30T00:37:40Z status: approve -->
+
+## Review: approve
+
+Approve.
+
+The change narrowly fixes the hidden `--spawn-config-json` loss point by carrying the already-resolved spawner `manifest.session.record_event_trace` into `SpawnPodTool` and serializing `[session].record_event_trace = true` only when the parent has opted in. It also adds focused coverage for profile artifact preservation, spawned config preservation, disabled omission, and clarifies trace sidecar semantics as normalized provider/lifecycle diagnostics rather than byte-for-byte raw SSE.
+
+Blocker findings: none.
+
+Validation re-run by reviewer:
+- `cargo test -p manifest profile_artifact_preserves_session_record_event_trace` — passed.
+- `cargo test -p pod spawn_config` — passed, 4 tests.
+- `./tickets.sh doctor` — passed.
+- `git diff --check 23f234d^ 23f234d` — passed earlier during inspection.
+- Worktree status is clean.
+
+Final verdict: approve.
+
+
+---
