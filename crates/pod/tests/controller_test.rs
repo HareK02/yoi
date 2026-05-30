@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use futures::{Stream, StreamExt};
 use llm_worker::Worker;
-use llm_worker::llm_client::event::{Event as LlmEvent, ResponseStatus, StatusEvent};
+use llm_worker::llm_client::event::{ErrorEvent, Event as LlmEvent, ResponseStatus, StatusEvent};
 use llm_worker::llm_client::types::Item;
 use llm_worker::llm_client::{ClientError, LlmClient, Request};
 use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
@@ -252,6 +252,52 @@ async fn run_end_returns_to_idle_without_busy_status() {
         "expected idle status immediately after RunEnd"
     );
     assert_eq!(handle.shared_state.get_status(), PodStatus::Idle);
+}
+
+#[tokio::test]
+async fn provider_stream_error_records_run_errored() {
+    let client = MockClient::new(vec![LlmEvent::Error(ErrorEvent {
+        code: Some("context_length_exceeded".into()),
+        message: "request too large".into(),
+    })]);
+    let pod = make_pod(client).await;
+    let handle = spawn_controller(pod).await;
+    let mut rx = handle.subscribe();
+
+    handle.send(Method::run_text("ping")).await.unwrap();
+
+    assert!(
+        drain_until(&mut rx, std::time::Duration::from_secs(2), |e| matches!(
+            e,
+            Event::Error {
+                code: protocol::ErrorCode::ProviderError,
+                message,
+            } if message.contains("context_length_exceeded")
+        ))
+        .await,
+        "provider stream error should be surfaced as a live provider error"
+    );
+    wait_for_status(&handle, PodStatus::Idle).await;
+
+    let (entries, _rx) = handle.sink.subscribe_with_snapshot();
+    assert!(
+        entries.iter().any(|entry| matches!(
+            entry,
+            LogEntry::RunErrored { message, .. }
+                if message.contains("context_length_exceeded")
+        )),
+        "provider stream error should be persisted as RunErrored"
+    );
+    assert!(
+        !entries.iter().any(|entry| matches!(
+            entry,
+            LogEntry::RunCompleted {
+                result: llm_worker::WorkerResult::Finished,
+                ..
+            }
+        )),
+        "provider stream error must not be recorded as a finished run"
+    );
 }
 
 /// Mid-turn re-attach: a client connecting while the worker is still

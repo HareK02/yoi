@@ -617,6 +617,11 @@ async fn controller_loop<C, St>(
         // here so the status flip → drive_turn → finish sequence lives
         // in one place, regardless of which Method caused it.
         if let Some(run) = pending.take() {
+            // Cancellation is meaningful only for an accepted running turn. Clear
+            // idle/stale signals before the status flip; any Cancel/Pause received
+            // after this point is delivered to the turn and must not be discarded by
+            // the Worker at run start.
+            pod.worker_mut().clear_pending_cancel();
             set_controller_status(&shared_state, &runtime_dir, &event_tx, PodStatus::Running).await;
             let parent_originated = run.is_parent_originated();
             let (new_status, shutdown) = match run {

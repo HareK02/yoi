@@ -262,13 +262,17 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
     }
 
     fn drain_cancel_queue(&mut self) {
-        use tokio::sync::mpsc::error::TryRecvError;
-        loop {
-            match self.cancel_rx.try_recv() {
-                Ok(()) => continue,
-                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
-            }
-        }
+        while self.cancel_rx.try_recv().is_ok() {}
+    }
+
+    /// Discard pending cancellation notifications while the worker is idle.
+    ///
+    /// Cancellation is a running-turn control signal. Callers that own a higher
+    /// level run state can use this before starting a new turn so an old idle
+    /// signal does not poison the next request, while cancellation queued after
+    /// the run has been accepted remains observable by the turn loop.
+    pub fn clear_pending_cancel(&mut self) {
+        self.drain_cancel_queue();
     }
 
     fn try_cancelled(&mut self) -> bool {
@@ -1058,7 +1062,6 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
     /// Internal turn execution logic
     async fn run_turn_loop(&mut self) -> Result<WorkerResult, WorkerError> {
         self.reset_interruption_state();
-        self.drain_cancel_queue();
         let tool_definitions = self.build_tool_definitions();
 
         info!(
@@ -1363,9 +1366,27 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
                             "elapsed_ms": stream_started.elapsed().as_millis() as u64,
                         }),
                     );
-                    match wait_for_first_stream_event(stream, DEFAULT_FIRST_STREAM_EVENT_TIMEOUT)
-                        .await
-                    {
+                    let first_event_result = tokio::select! {
+                        first_event = wait_for_first_stream_event(stream, DEFAULT_FIRST_STREAM_EVENT_TIMEOUT) => first_event,
+                        cancel = self.cancel_rx.recv() => {
+                            if cancel.is_some() {
+                                info!("Cancelled before first stream event");
+                            }
+                            self.emit_lifecycle_trace(
+                                turn,
+                                llm_call,
+                                "stream_first_event_cancelled",
+                                json!({
+                                    "attempt": attempt,
+                                    "elapsed_ms": stream_started.elapsed().as_millis() as u64,
+                                }),
+                            );
+                            self.timeline.abort_current_block();
+                            self.last_run_interrupted = true;
+                            return Err(WorkerError::Cancelled);
+                        }
+                    };
+                    match first_event_result {
                         Ok(FirstStreamEvent::Ready(stream)) => return Ok(stream),
                         Ok(FirstStreamEvent::Empty(stream)) => return Ok(stream),
                         Err(err) => {
@@ -1502,6 +1523,17 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
                             }
                             self.emit_stream_event(turn, llm_call, &event);
                             self.timeline.dispatch(&event);
+                            if let Event::Error(err) = &event {
+                                self.timeline.abort_current_block();
+                                self.timeline.flush_usage();
+                                self.last_run_interrupted = true;
+                                return Err(WorkerError::Client(ClientError::Api {
+                                    status: None,
+                                    code: err.code.clone(),
+                                    message: err.message.clone(),
+                                    retry_after: None,
+                                }));
+                            }
                         }
                         None => break,
                     }
