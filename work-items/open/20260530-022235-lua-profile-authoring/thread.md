@@ -60,3 +60,31 @@ Implementation plan summary:
 
 
 ---
+
+<!-- event: review author: hare at: 2026-05-30T02:58:55Z status: approve -->
+
+## Review: approve
+
+Approve.
+
+The implementation shifts normal profile authoring from Nix-primary evaluation to embedded Lua/Profile authoring. The public authoring boundary is `profile` / `require("insomnia.profile")`; builtin/default resolves without external `nix`; controlled `require` supports host virtual modules and profile-local modules; unsafe Lua facilities are denied; runtime-bound and authority-bearing Manifest fields are rejected; and `--manifest` remains the explicit low-level escape hatch.
+
+Blocker findings: none.
+
+Non-blocking follow-ups:
+- `docs/pod-factory.md` still contains old ambient manifest cascade wording and should be refreshed later.
+- Unsupported `.nix` entries in user/project `profiles.toml` can still appear as selectable entries before failing at resolution with the intended diagnostic.
+- Builtin profile directory scanning currently treats every top-level `.lua` as a profile, so future helper files should use a convention that avoids accidental selection.
+- Nested reused Manifest structs remain more lenient about unknown fields than Profile top-level validation; stronger profile-specific nested diagnostics can be considered later.
+
+SpawnPod integration timeout assessment:
+- The failing `spawn_pod_delegates_scope_and_sends_run` timeout appears unrelated to Lua profile authoring. SpawnPod hidden `--spawn-config-json` takes the direct manifest config path before profile/manifest CLI resolution, and does not invoke ProfileResolver/Lua discovery. Track separately if it remains reproducible.
+
+Validation reviewed:
+- Coder: `cargo fmt`, `git diff --check`, `cargo test -p manifest`, `cargo test -p client -p tui`, `cargo test -p pod --lib --bins` passed.
+- Reviewer: `cargo test -p manifest` passed, 119 tests.
+
+Final verdict: approve.
+
+
+---
