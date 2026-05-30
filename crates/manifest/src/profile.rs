@@ -99,11 +99,7 @@ impl ProfileSelector {
         {
             return Self::source_named(source, name);
         }
-        if raw.contains('/')
-            || raw.starts_with('.')
-            || raw.ends_with(".lua")
-            || raw.ends_with(".nix")
-        {
+        if raw.contains('/') || raw.starts_with('.') || raw.ends_with(".lua") {
             Self::path(raw)
         } else {
             Self::named(raw)
@@ -382,8 +378,15 @@ impl ProfileResolver {
             .map(str::to_string);
         match extension.as_deref() {
             Some("lua") => {}
-            Some("nix") => return Err(ProfileError::UnsupportedProfileType { path: absolute_path, message: "Nix profile files are no longer supported; use a Lua profile or --manifest for a complete Manifest".into() }),
-            other => return Err(ProfileError::UnsupportedProfileType { path: absolute_path, message: format!("unsupported profile extension {}; Lua profiles must end in .lua", other.map_or("<none>".to_string(), |s| format!(".{s}"))) }),
+            other => {
+                return Err(ProfileError::UnsupportedProfileType {
+                    path: absolute_path,
+                    message: format!(
+                        "unsupported profile extension {}; Lua profiles must end in .lua",
+                        other.map_or("<none>".to_string(), |s| format!(".{s}"))
+                    ),
+                });
+            }
         }
         let profile_dir = absolute_path
             .parent()
@@ -1230,10 +1233,6 @@ mod tests {
             ProfileSelector::parse_cli("./coder.lua"),
             ProfileSelector::Path { .. }
         ));
-        assert!(matches!(
-            ProfileSelector::parse_cli("./legacy.nix"),
-            ProfileSelector::Path { .. }
-        ));
         assert_eq!(
             ProfileSelector::parse_cli("project:coder"),
             ProfileSelector::source_named(ProfileRegistrySource::Project, "coder")
@@ -1443,9 +1442,9 @@ return profile {
         );
     }
     #[test]
-    fn unsupported_nix_profile_has_clear_diagnostic() {
+    fn unsupported_profile_extension_has_clear_diagnostic() {
         let tmp = TempDir::new().unwrap();
-        let path = write_profile(tmp.path(), "legacy.nix", "{}");
+        let path = write_profile(tmp.path(), "legacy.txt", "{}");
         let err = ProfileResolver::new()
             .with_workspace_base(tmp.path())
             .resolve(
@@ -1454,7 +1453,7 @@ return profile {
             )
             .unwrap_err();
         assert!(matches!(err, ProfileError::UnsupportedProfileType { .. }));
-        assert!(err.to_string().contains("--manifest"));
+        assert!(err.to_string().contains("Lua profiles must end in .lua"));
     }
     #[test]
     fn for_cwd_reads_profiles_toml_and_ignores_manifest_profiles() {

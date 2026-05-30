@@ -126,8 +126,8 @@ fn point_pod_command_at_true() {
     }
 }
 
-/// `/bin/true` only exists on FHS-compliant systems. On Nix, resolve it
-/// via PATH so the tests work regardless of distro.
+/// `/bin/true` only exists on FHS-compliant systems. Resolve it via PATH
+/// so the tests work regardless of distro.
 fn which_true() -> String {
     for dir in std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
