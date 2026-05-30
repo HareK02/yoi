@@ -6,8 +6,10 @@
 //!
 //! - **Send** a `Method::PodEvent` to the parent socket, fire-and-forget,
 //!   logging failures without blocking the child.
-//! - **Render** a variant into a human-readable string that the parent's
-//!   LLM sees via the notification buffer.
+//! - **Render** agent-visible variants into human-readable strings for the
+//!   parent's notification buffer. Control-plane-only variants may still have
+//!   a renderer for diagnostics, but receive-side classification keeps them
+//!   out of LLM history/context.
 //! - **Apply side effects** on the parent (registry / pod-registry
 //!   updates) so that the receive path is idempotent and tolerant of
 //!   out-of-order delivery.
@@ -52,11 +54,13 @@ pub fn fire_and_forget(socket: Option<PathBuf>, event: PodEvent) {
     });
 }
 
-/// Render a variant into the one-line human-readable string that will
-/// be injected into the parent's LLM context as a system message.
+/// Render a variant into a one-line human-readable string.
 ///
-/// Kept deliberately short — the LLM can always call `ReadPodOutput`
-/// to fetch more detail if the event summary is not enough.
+/// Only events classified by `PodEvent::should_notify_agent` are injected
+/// into the parent's LLM context as system messages; control-plane-only events
+/// keep this renderer for diagnostics/tests. Agent-visible summaries are kept
+/// deliberately short — the LLM can always call `ReadPodOutput` to fetch more
+/// detail if the event summary is not enough.
 pub fn render_event(event: &PodEvent) -> String {
     match event {
         PodEvent::TurnEnded { pod_name } => {

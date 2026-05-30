@@ -11,8 +11,9 @@
 //! persistent history.
 //!
 //! This is the **single lane** for "system messages produced by Pod
-//! state that should land in the next LLM request": Notify, PodEvent,
-//! and any future `<system-reminder>` injection all ride this queue.
+//! state that should land in the next LLM request": Notify,
+//! agent-visible PodEvent variants, and any future `<system-reminder>`
+//! injection all ride this queue.
 //! Per `tickets/notify-history-persist.md` and `AGENTS.md` (LLM
 //! context の加工原則), there is **no** "transient, history-skipping"
 //! lane — everything injected into a request is also committed to

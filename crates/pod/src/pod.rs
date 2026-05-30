@@ -1081,8 +1081,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         }
     }
 
-    /// Push a `Method::Notify` (or rendered `Method::PodEvent`) entry
-    /// onto the pending buffer.
+    /// Push a `Method::Notify` entry onto the pending buffer.
     ///
     /// The notification will be appended to `worker.history` as an
     /// `Item::system_message` just before the next LLM request, via
@@ -1092,8 +1091,9 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         self.pending_notifies.push_notify(message);
     }
 
-    /// Push a typed `PodEvent` entry onto the pending buffer.
+    /// Push an agent-visible typed `PodEvent` entry onto the pending buffer.
     ///
+    /// Callers must classify control-plane-only PodEvents before invoking this.
     /// Same lifecycle as [`push_notify`](Self::push_notify) but
     /// preserves the typed `PodEvent` payload so the IPC layer can
     /// emit `SystemItem::PodEvent { event, body }` with structured

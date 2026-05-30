@@ -728,7 +728,7 @@ async fn controller_loop<C, St>(
                 // RUNNING / Paused: the buffer push is the entire
                 // operation; an in-flight turn (or the next
                 // Resume/Run) will drain it at its next
-                // pre_llm_request. IDLE: auto-start a turn so the LLM
+                // pending_history_appends. IDLE: auto-start a turn so the LLM
                 // sees the buffered notification(s) without a human
                 // Run.
                 if shared_state.get_status() == PodStatus::Idle {
@@ -900,11 +900,12 @@ async fn controller_loop<C, St>(
             Method::ListCompletions { .. } => {}
 
             Method::PodEvent(event) => {
-                // Live echo travels through the SystemItem lane: once
-                // the interceptor drains the notify buffer, the
-                // typed `SystemItem::PodEvent` lands as a
+                // For agent-visible PodEvents, live echo travels through the
+                // SystemItem lane: once the interceptor drains the notify buffer,
+                // the typed `SystemItem::PodEvent` lands as a
                 // `LogEntry::SystemItem` entry and the sink forwards it
-                // to clients as `Event::SystemItem`.
+                // to clients as `Event::SystemItem`. Control-plane-only
+                // PodEvents use this same receive path only for side effects.
                 //
                 // (1) system side effects — idempotent and tolerant of
                 // out-of-order delivery (e.g. `TurnEnded` arriving
@@ -916,17 +917,19 @@ async fn controller_loop<C, St>(
                     &self_parent_socket,
                 )
                 .await;
-                // (2) queue the typed event in the notification buffer;
-                // the next LLM request will inject it as a typed
-                // `SystemItem::PodEvent` via the interceptor drain.
-                pod.push_pod_event_notify(event);
-                // Auto-kick a turn if the Pod is idle so the
-                // notification is not stranded. Matches the
-                // `Method::Notify` idle path.
-                if shared_state.get_status() == PodStatus::Idle {
-                    pending = Some(PendingRun::RunForNotification(
-                        protocol::InvokeKind::PodEvent,
-                    ));
+                // (2) agent-visible events enter the notification/history lane.
+                // Control-plane-only events (currently ScopeSubDelegated)
+                // stop after side effects so they do not wake or notify the LLM.
+                if event.should_notify_agent() {
+                    pod.push_pod_event_notify(event);
+                    // Auto-kick a turn if the Pod is idle so the
+                    // notification is not stranded. Matches the
+                    // `Method::Notify` idle path.
+                    if shared_state.get_status() == PodStatus::Idle {
+                        pending = Some(PendingRun::RunForNotification(
+                            protocol::InvokeKind::PodEvent,
+                        ));
+                    }
                 }
             }
         }
@@ -1072,7 +1075,7 @@ where
                     }
                     Some(Method::Notify { message }) => {
                         // Live echo arrives via `Event::SystemItem` once
-                        // the in-flight turn's next `pre_llm_request`
+                        // the in-flight turn's next `pending_history_appends`
                         // drains this entry through the interceptor.
                         notify_buffer.push_notify(message);
                     }
@@ -1093,10 +1096,11 @@ where
                         // to the next main-loop iteration — drop here
                         // would lose the event entirely (children fire
                         // and forget). Apply the side effects inline
-                        // and stage the typed event on the notification
-                        // buffer so the in-flight turn's next
-                        // `pre_llm_request` surfaces it as a typed
-                        // `SystemItem::PodEvent`.
+                        // and, for agent-visible variants, stage the typed
+                        // event on the notification buffer so the in-flight
+                        // turn's next `pending_history_appends` surfaces it
+                        // as a typed `SystemItem::PodEvent`. Control-plane-only
+                        // variants stop after side effects.
                         let self_parent_socket = parent_socket.cloned();
                         crate::ipc::event::apply_event_side_effects(
                             &event,
@@ -1105,7 +1109,9 @@ where
                             &self_parent_socket,
                         )
                         .await;
-                        notify_buffer.push_pod_event(event);
+                        if event.should_notify_agent() {
+                            notify_buffer.push_pod_event(event);
+                        }
                     }
                     None => {
                         let _ = cancel_tx.try_send(());
@@ -1253,6 +1259,7 @@ fn worker_error_code(e: &PodError) -> ErrorCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::dir::SpawnedPodRecord;
     use protocol::PodEvent;
     use protocol::stream::{JsonLineReader, JsonLineWriter};
     use std::time::Duration;
@@ -1488,6 +1495,91 @@ mod tests {
             accept.is_err(),
             "expected no PodEvent for notification-originated worker error"
         );
+    }
+
+    #[tokio::test]
+    async fn running_scope_sub_delegated_applies_side_effects_without_notify_buffer() {
+        let mut env = make_env().await;
+        env.spawned_registry
+            .add(SpawnedPodRecord {
+                pod_name: "child".into(),
+                socket_path: "/tmp/child.sock".into(),
+                scope_delegated: vec![],
+                callback_address: "/tmp/parent.sock".into(),
+            })
+            .await
+            .expect("seed child record");
+        env._method_tx
+            .send(Method::PodEvent(PodEvent::ScopeSubDelegated {
+                parent_pod: "child".into(),
+                sub_pod: "grandchild".into(),
+                sub_socket: "/tmp/grandchild.sock".into(),
+                scope: vec![],
+            }))
+            .await
+            .expect("send pod event");
+
+        let pod_future = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Ok::<_, PodError>(PodRunResult::Finished)
+        };
+        let (status, shutdown) = drive_turn(
+            pod_future,
+            &mut env.method_rx,
+            &env.event_tx,
+            &env.cancel_tx,
+            &env.shared_state,
+            &env.notify_buffer,
+            Some(&env.parent_socket_path),
+            "parent",
+            &env.spawned_registry,
+            false,
+        )
+        .await;
+
+        assert_eq!(status, PodStatus::Idle);
+        assert!(!shutdown);
+        assert!(
+            env.spawned_registry.get("grandchild").await.is_some(),
+            "ScopeSubDelegated side effects must still register the grandchild"
+        );
+        assert!(
+            env.notify_buffer.is_empty(),
+            "control-plane-only ScopeSubDelegated must not enter the agent-visible notify buffer"
+        );
+    }
+
+    #[tokio::test]
+    async fn running_visible_pod_event_enters_notify_buffer() {
+        let mut env = make_env().await;
+        env._method_tx
+            .send(Method::PodEvent(PodEvent::TurnEnded {
+                pod_name: "child".into(),
+            }))
+            .await
+            .expect("send pod event");
+
+        let pod_future = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Ok::<_, PodError>(PodRunResult::Finished)
+        };
+        let (status, shutdown) = drive_turn(
+            pod_future,
+            &mut env.method_rx,
+            &env.event_tx,
+            &env.cancel_tx,
+            &env.shared_state,
+            &env.notify_buffer,
+            Some(&env.parent_socket_path),
+            "parent",
+            &env.spawned_registry,
+            false,
+        )
+        .await;
+
+        assert_eq!(status, PodStatus::Idle);
+        assert!(!shutdown);
+        assert_eq!(env.notify_buffer.len(), 1);
     }
 
     #[tokio::test]
