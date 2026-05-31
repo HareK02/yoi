@@ -22,6 +22,7 @@ manifest = { workspace = true }
 memory = { workspace = true }
 session-store = { workspace = true }
 pod-store = { workspace = true }
+pod = { workspace = true }
 pod-registry = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 pulldown-cmark = { version = "0.13.3", default-features = false }
