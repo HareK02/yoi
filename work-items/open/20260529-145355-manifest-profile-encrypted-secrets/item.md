@@ -23,8 +23,8 @@ Related work item: `work-items/open/20260527-000022-manifest-profiles/item.md`.
 ## Requirements
 
 - Design a typed secret reference format for manifest/profile fields that need credentials.
-  - Existing env references such as `api_key_env = "BRAVE_SEARCH_API_KEY"` should keep working.
   - Add a new encrypted-store reference form, e.g. `api_key_secret = "brave.search.default"` or a more general `SecretRef` enum.
+  - Existing env references such as `api_key_env = "BRAVE_SEARCH_API_KEY"` may be supported only as a migration/compatibility input during the transition; the target state is to remove credential environment-variable configuration rather than keep it as a normal fallback.
   - Secret references must be explicit in resolved config; do not silently read arbitrary `.env` files.
 - Add an encrypted local secret store suitable for API keys/tokens.
   - Store secrets outside tracked project files by default, under the user data/config directory.
@@ -41,9 +41,9 @@ Related work item: `work-items/open/20260527-000022-manifest-profiles/item.md`.
   - Show references and metadata, not secret values.
   - Consider migration helpers from existing env-var based configuration, but keep migration optional.
 - Update credential consumers.
-  - WebSearch should support encrypted secret refs in addition to env vars.
-  - Provider API keys/tokens and future hosted/search credentials should be able to use the same mechanism.
-  - Existing env-var behavior remains as a fallback/compatibility path.
+  - WebSearch should use encrypted secret refs instead of requiring env vars.
+  - Provider API keys/tokens and future hosted/search credentials should use the same mechanism.
+  - Remove env-var credential configuration from the normal supported path once encrypted secret refs and migration diagnostics exist.
 - Security and UX constraints.
   - Fail closed when a referenced secret is missing or cannot be decrypted.
   - Diagnostics should name the missing reference, not the secret value.
@@ -52,13 +52,13 @@ Related work item: `work-items/open/20260527-000022-manifest-profiles/item.md`.
 
 ## Acceptance criteria
 
-- Manifest/profile schema has a typed credential reference that can point either to an env var or encrypted secret-store entry.
+- Manifest/profile schema has a typed credential reference for encrypted secret-store entries; env-var credential inputs are at most transitional migration inputs, not the final supported configuration path.
 - Encrypted secret-store files are created outside the repository by default and use authenticated encryption with atomic update behavior.
 - A user can add/list/delete a Brave Search API key in the secret store and configure `WebSearch` to use it without exporting an environment variable.
 - Resolved configuration and diagnostics never display plaintext secrets.
 - Missing/decryption-failed secrets produce clear fail-closed errors.
-- Existing env-var based configuration continues to work.
-- Documentation explains how profiles reference secrets and how to manage them.
+- Existing env-var based credential configuration is either removed or produces an explicit migration diagnostic after encrypted secret references are available.
+- Documentation explains how profiles reference secrets, how to manage them, and why credential env vars are no longer the normal path.
 - Focused tests cover config parsing/resolution, missing secret diagnostics, no-plaintext serialization/logging paths, and WebSearch secret resolution.
 - `cargo fmt --check`
 - Relevant manifest/provider/tools/pod tests pass.
