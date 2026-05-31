@@ -65,3 +65,30 @@ Blockers: none.
 
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-05-31T01:58:24Z -->
+
+## Implementation report
+
+Main workspace validation after merge:
+
+- `cargo fmt --check` passed
+- `cargo test -p provider catalog` passed
+- `cargo test -p manifest model` passed
+- `cargo check -p provider -p manifest` passed
+- `./tickets.sh doctor` passed
+- `git diff --check` passed
+
+Warnings observed are pre-existing dead-code warnings in `llm-worker` / filtered manifest test helpers.
+
+
+---
+
+<!-- event: close author: hare at: 2026-05-31T01:58:24Z status: closed -->
+
+## Closed
+
+Updated the builtin `codex-oauth/gpt-5.5` entry so `context_window = 272000` directly represents the effective Codex OAuth / ChatGPT backend route limit, with a catalog comment explaining that generic OpenAI docs advertise 1.05M. Removed catalog-level `max_context_window` from that entry while preserving inline/config `max_context_window` support. External review approved and validation passed.
+
+
+---
