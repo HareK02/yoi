@@ -220,6 +220,9 @@ pub struct SpawnPodTool {
     /// Directory the spawned Pod should run in when the LLM did not
     /// override it. Defaults to the spawner's pwd — see module docs.
     spawner_pwd: PathBuf,
+    /// Optional typed runtime command injected by tests. Production resolves
+    /// the runtime command from `std::env::current_exe()` at launch time.
+    runtime_command: Option<PodRuntimeCommand>,
     /// Shared registry of spawned children, also used by the
     /// pod-comm tools (`SendToPod` / `ReadPodOutput` / `StopPod`) and by
     /// Pod discovery. Writes the list to runtime and durable Pod state on
@@ -258,12 +261,14 @@ impl SpawnPodTool {
         spawner_manifest: PodManifest,
         available_profiles: AvailableProfiles,
         spawner_scope: SharedScope,
+        runtime_command: Option<PodRuntimeCommand>,
     ) -> Self {
         Self {
             spawner_name,
             callback_socket,
             runtime_base,
             spawner_pwd,
+            runtime_command,
             registry,
             parent_socket,
             spawner_manifest,
@@ -409,9 +414,14 @@ impl SpawnPodTool {
         spawn_config_json: &str,
         predicted_socket: &Path,
     ) -> Result<(), ToolError> {
-        let runtime_command = PodRuntimeCommand::resolve().map_err(|error| {
-            ToolError::ExecutionFailed(format!("failed to resolve Pod runtime command: {error}"))
-        })?;
+        let runtime_command = match &self.runtime_command {
+            Some(command) => command.clone(),
+            None => PodRuntimeCommand::resolve().map_err(|error| {
+                ToolError::ExecutionFailed(format!(
+                    "failed to resolve Pod runtime command: {error}"
+                ))
+            })?,
+        };
 
         // Pre-create the child's runtime dir so we have a stable place to
         // capture its stderr before it has had a chance to bind anything.
@@ -765,6 +775,59 @@ pub fn spawn_pod_tool(
     spawner_scope: SharedScope,
     prompts: Arc<PromptCatalog>,
 ) -> ToolDefinition {
+    spawn_pod_tool_impl(
+        spawner_name,
+        callback_socket,
+        runtime_base,
+        spawner_pwd,
+        registry,
+        parent_socket,
+        spawner_manifest,
+        spawner_scope,
+        prompts,
+        None,
+    )
+}
+
+#[doc(hidden)]
+pub fn spawn_pod_tool_with_runtime_command(
+    spawner_name: String,
+    callback_socket: PathBuf,
+    runtime_base: PathBuf,
+    spawner_pwd: PathBuf,
+    registry: Arc<SpawnedPodRegistry>,
+    parent_socket: Option<PathBuf>,
+    spawner_manifest: PodManifest,
+    spawner_scope: SharedScope,
+    prompts: Arc<PromptCatalog>,
+    runtime_command: PodRuntimeCommand,
+) -> ToolDefinition {
+    spawn_pod_tool_impl(
+        spawner_name,
+        callback_socket,
+        runtime_base,
+        spawner_pwd,
+        registry,
+        parent_socket,
+        spawner_manifest,
+        spawner_scope,
+        prompts,
+        Some(runtime_command),
+    )
+}
+
+fn spawn_pod_tool_impl(
+    spawner_name: String,
+    callback_socket: PathBuf,
+    runtime_base: PathBuf,
+    spawner_pwd: PathBuf,
+    registry: Arc<SpawnedPodRegistry>,
+    parent_socket: Option<PathBuf>,
+    spawner_manifest: PodManifest,
+    spawner_scope: SharedScope,
+    prompts: Arc<PromptCatalog>,
+    runtime_command: Option<PodRuntimeCommand>,
+) -> ToolDefinition {
     Arc::new(move || {
         let schema = schemars::schema_for!(SpawnPodInput);
         let schema_value = serde_json::to_value(schema).unwrap_or(serde_json::json!({}));
@@ -794,6 +857,7 @@ pub fn spawn_pod_tool(
             spawner_manifest.clone(),
             available_profiles,
             spawner_scope.clone(),
+            runtime_command.clone(),
         ));
         (meta, tool)
     })

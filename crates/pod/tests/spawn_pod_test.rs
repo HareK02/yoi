@@ -1,15 +1,15 @@
 //! Integration tests for the `SpawnPod` tool.
 //!
 //! These tests exercise the tool's pod-registry delegation, subprocess
-//! launch, socket handoff, and `spawned_pods.json` write without relying
-//! on the real Pod runtime executable. `INSOMNIA_POD_COMMAND` is pointed at
-//! `/bin/true` (which exits immediately) while a test-owned Unix
-//! listener pre-binds the predicted socket path, so the tool sees the
-//! "child" as live.
+//! launch, socket handoff, and `spawned_pods.json` write through an injected
+//! typed runtime command. The mock command exits immediately while a
+//! test-owned Unix listener pre-binds the predicted socket path, so the tool
+//! sees the "child" as live.
 
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 
+use insomnia::PodRuntimeCommand;
 use llm_worker::tool::{ToolError, ToolOutput};
 use manifest::{
     AuthRef, ModelManifest, Permission, PodManifest, PodManifestConfig, PodMetaConfig, SchemeKind,
@@ -18,7 +18,7 @@ use manifest::{
 use pod::runtime::dir::{RuntimeDir, SpawnedPodRecord};
 use pod::runtime::pod_registry::{self, LockFileGuard};
 use pod::spawn::registry::SpawnedPodRegistry;
-use pod::spawn::tool::spawn_pod_tool;
+use pod::spawn::tool::spawn_pod_tool_with_runtime_command;
 use protocol::stream::{JsonLineReader, JsonLineWriter};
 use protocol::{Event, Method};
 use serde_json::json;
@@ -26,8 +26,8 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::net::UnixListener;
 
-/// Serialises tests that mutate `INSOMNIA_RUNTIME_DIR` /
-/// `INSOMNIA_POD_COMMAND` across the thread-pooled test harness.
+/// Serialises tests that mutate `INSOMNIA_RUNTIME_DIR` across the
+/// thread-pooled test harness.
 static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 struct EnvGuard {
@@ -141,11 +141,8 @@ fn accept_one_method(listener: UnixListener) -> tokio::task::JoinHandle<Option<M
     })
 }
 
-fn point_runtime_command_at_true() {
-    let path = which_true();
-    unsafe {
-        std::env::set_var("INSOMNIA_POD_COMMAND", &path);
-    }
+fn mock_runtime_command() -> PodRuntimeCommand {
+    PodRuntimeCommand::new(which_true(), Vec::new())
 }
 
 /// `/bin/true` only exists on FHS-compliant systems. Resolve it via PATH
@@ -213,7 +210,6 @@ fn shared_scope_for(allow_root: &Path) -> SharedScope {
 fn clear_env() {
     unsafe {
         std::env::remove_var("INSOMNIA_RUNTIME_DIR");
-        std::env::remove_var("INSOMNIA_POD_COMMAND");
     }
 }
 
@@ -224,14 +220,13 @@ async fn spawn_pod_delegates_scope_and_sends_run() {
     let allow_root = TempDir::new().unwrap();
     let (_tmp, runtime_base, spawner_socket, spawner_rd) =
         setup_spawner("root", allow_root.path()).await;
-    point_runtime_command_at_true();
 
     let (_predicted_socket, listener) = bind_mock_pod_socket(&runtime_base, "child").await;
     let received = accept_one_method(listener);
 
     let registry = SpawnedPodRegistry::new(spawner_rd.clone());
     let spawner_scope = shared_scope_for(allow_root.path());
-    let def = spawn_pod_tool(
+    let def = spawn_pod_tool_with_runtime_command(
         "root".into(),
         spawner_socket.clone(),
         runtime_base.clone(),
@@ -241,6 +236,7 @@ async fn spawn_pod_delegates_scope_and_sends_run() {
         dummy_manifest(allow_root.path()),
         spawner_scope.clone(),
         builtin_prompts(),
+        mock_runtime_command(),
     );
     let (_meta, tool) = def();
 
@@ -317,11 +313,10 @@ async fn spawn_pod_rejects_scope_outside_spawner() {
     let outside = TempDir::new().unwrap();
     let (_tmp, runtime_base, spawner_socket, spawner_rd) =
         setup_spawner("root", allow_root.path()).await;
-    point_runtime_command_at_true();
 
     let registry = SpawnedPodRegistry::new(spawner_rd);
     let spawner_scope = shared_scope_for(allow_root.path());
-    let def = spawn_pod_tool(
+    let def = spawn_pod_tool_with_runtime_command(
         "root".into(),
         spawner_socket,
         runtime_base,
@@ -331,6 +326,7 @@ async fn spawn_pod_rejects_scope_outside_spawner() {
         dummy_manifest(allow_root.path()),
         spawner_scope.clone(),
         builtin_prompts(),
+        mock_runtime_command(),
     );
     let (_meta, tool) = def();
 
@@ -379,7 +375,6 @@ async fn spawn_pod_rolls_back_reservation_when_socket_never_appears() {
     let allow_root = TempDir::new().unwrap();
     let (_tmp, runtime_base, spawner_socket, spawner_rd) =
         setup_spawner("root", allow_root.path()).await;
-    point_runtime_command_at_true();
 
     // Deliberately do NOT bind a socket at the predicted path. The
     // tool's wait_for_socket should time out, triggering rollback.
@@ -394,7 +389,7 @@ async fn spawn_pod_rolls_back_reservation_when_socket_never_appears() {
 
     let registry = SpawnedPodRegistry::new(spawner_rd);
     let spawner_scope = shared_scope_for(allow_root.path());
-    let def = spawn_pod_tool(
+    let def = spawn_pod_tool_with_runtime_command(
         "root".into(),
         spawner_socket,
         runtime_base,
@@ -404,6 +399,7 @@ async fn spawn_pod_rolls_back_reservation_when_socket_never_appears() {
         dummy_manifest(allow_root.path()),
         spawner_scope.clone(),
         builtin_prompts(),
+        mock_runtime_command(),
     );
     let (_meta, tool) = def();
 

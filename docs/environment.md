@@ -77,7 +77,6 @@ Credential env var は interoperability のために現時点では残ってい�
 
 - `INSOMNIA_USER_MANIFEST` は通常の profile-based Pod/TUI startup の一部ではない。one-file manifest の debug / compatibility path には `insomnia pod --manifest <PATH>` を使う。
 - ambient `.insomnia/manifest.toml` discovery は通常の fresh startup の一部ではない。
-- `INSOMNIA_POD_COMMAND` は single-binary 化に伴って削除する。Pod runtime は `insomnia pod ...` の typed command として起動する。
 - `INSOMNIA_TEST_*` のような test-only 環境変数は supported surface にしない。既存利用も削除する。
 - `insomnia-pod` は installed command ではない。Pod runtime は `insomnia pod ...` から起動する。
 - 通常 runtime は `.env` ファイルを load しない。
@@ -89,7 +88,7 @@ Credential env var は interoperability のために現時点では残ってい�
 1. test-only env var を削除し、public env behavior を検証する test だけを shared guard / test-support crate に集約する。
 2. path resolution は `manifest::paths` に集約し、path precedence rule を別の場所で重複実装しない。
 3. credential source は resolved config 上で明示し、process-env convention を増やすより typed secret reference へ寄せる。encrypted secret store 導入時に credential env var 依存を削除する。
-4. `INSOMNIA_POD_COMMAND` は削除し、Pod runtime 起動は `current_exe() + ["pod"]` の typed command に一本化する。
+4. Pod runtime 起動は環境変数ではなく `current_exe() + ["pod"]` の typed command に一本化する。
 5. fallback env は独立した設定項目として増やさず、対応する main key の解決順として文書化する。
 6. 空の env value は、変数 category に応じて unset / invalid のどちらとして扱うかを一貫させ、新しい supported variable を追加する場合は挙動を文書化する。
 7. 外部 process integration が env inheritance / filtering を必要とする場合は、ambient な inherited process state に頼らず、明示的な policy boundary として設計する。

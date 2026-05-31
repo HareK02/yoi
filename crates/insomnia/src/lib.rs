@@ -3,8 +3,6 @@ use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 
-pub const POD_COMMAND_OVERRIDE_ENV: &str = "INSOMNIA_POD_COMMAND";
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PodRuntimeCommand {
     pub program: PathBuf,
@@ -19,10 +17,6 @@ impl PodRuntimeCommand {
         }
     }
 
-    pub fn executable_only(program: impl Into<PathBuf>) -> Self {
-        Self::new(program, Vec::new())
-    }
-
     pub fn for_current_exe() -> io::Result<Self> {
         Ok(Self::for_executable(std::env::current_exe()?))
     }
@@ -33,23 +27,10 @@ impl PodRuntimeCommand {
 
     /// Resolve the Pod runtime command used for subprocess launches.
     ///
-    /// `INSOMNIA_POD_COMMAND` is intentionally executable-only: its value is
-    /// used as the program path without shell parsing and without the unified
-    /// `pod` prefix arg. That keeps development/test overrides safe while the
-    /// default path is always `current_exe() + ["pod"]`.
+    /// The default launch path is always the current `insomnia` executable plus
+    /// the unified `pod` prefix argument.
     pub fn resolve() -> io::Result<Self> {
-        if let Some(command) = Self::from_override_env() {
-            return Ok(command);
-        }
         Self::for_current_exe()
-    }
-
-    pub fn from_override_env() -> Option<Self> {
-        let raw = std::env::var_os(POD_COMMAND_OVERRIDE_ENV)?;
-        if raw.is_empty() {
-            return None;
-        }
-        Some(Self::executable_only(raw))
     }
 
     pub fn program(&self) -> &Path {
@@ -84,28 +65,6 @@ impl fmt::Display for PodRuntimeCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    struct EnvRestore(Option<OsString>);
-
-    impl EnvRestore {
-        fn capture() -> Self {
-            Self(std::env::var_os(POD_COMMAND_OVERRIDE_ENV))
-        }
-    }
-
-    impl Drop for EnvRestore {
-        fn drop(&mut self) {
-            unsafe {
-                match &self.0 {
-                    Some(value) => std::env::set_var(POD_COMMAND_OVERRIDE_ENV, value),
-                    None => std::env::remove_var(POD_COMMAND_OVERRIDE_ENV),
-                }
-            }
-        }
-    }
 
     #[test]
     fn insomnia_binary_defaults_to_pod_prefix() {
@@ -138,19 +97,5 @@ mod tests {
                 .map(OsString::from)
                 .collect::<Vec<_>>()
         );
-    }
-
-    #[test]
-    fn env_override_is_executable_only_and_not_shell_parsed() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let _restore = EnvRestore::capture();
-        unsafe {
-            std::env::set_var(POD_COMMAND_OVERRIDE_ENV, "/tmp/mock pod --flag");
-        }
-
-        let command = PodRuntimeCommand::resolve().unwrap();
-
-        assert_eq!(command.program(), Path::new("/tmp/mock pod --flag"));
-        assert!(command.prefix_args().is_empty());
     }
 }
