@@ -7,7 +7,7 @@ kind: task
 priority: P2
 labels: [cli, tui, pod, architecture]
 created_at: 2026-05-31T11:19:56Z
-updated_at: 2026-05-31T12:42:22Z
+updated_at: 2026-05-31T13:17:15Z
 assignee: null
 legacy_ticket: null
 ---

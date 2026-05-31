@@ -100,3 +100,47 @@ Validation:
 
 
 ---
+
+<!-- event: review author: hare at: 2026-05-31T13:17:15Z status: approve -->
+
+## Review: approve
+
+External reviewer: `insomnia-cli-owner-reviewer-20260531`
+Reviewed implementation commits:
+- `22d974a` (`cli: move product entrypoint to insomnia`)
+- `37281b6` (`cli: reject resume with pod selection`)
+Verdict: approve
+
+Summary:
+- Product binary and top-level CLI dispatch moved from the `tui` package to the `insomnia` package.
+- `tui` is now a library implementation crate and no longer owns `pod`/`memory lint` top-level dispatch.
+- `PodRuntimeCommand` moved to `client`, removing the wrong lower-crate dependency on the product CLI crate.
+- `pod` remains library-only and does not depend on `insomnia`.
+- Packaging now builds package `insomnia` for the installed `bin/insomnia` output.
+
+Initial review blocker:
+- `--resume` combined with `--pod` or positional Pod name selection initially stopped erroring.
+
+Fix:
+- Commit `37281b6` restored mutual exclusion:
+  - `insomnia -r --pod agent` errors.
+  - `insomnia --pod agent -r` errors.
+  - `insomnia -r agent` errors.
+  - `insomnia --multi --pod agent` reports `--multi and --pod are mutually exclusive`.
+
+Requirements mapping:
+- `insomnia` owns binary target and top-level CLI dispatch.
+- `tui`, `pod`, and `client` do not depend on `insomnia`.
+- `tui` does not depend on `pod`.
+- `insomnia pod ...`, `insomnia memory lint ...`, and normal TUI launch modes are preserved.
+- No `insomnia-pod`, `INSOMNIA_POD_COMMAND`, or `INSOMNIA_POD_RUNTIME_COMMAND` was introduced.
+- No Pod protocol/profile/manifest semantic change was found.
+
+Blockers: none.
+
+Validation adequacy:
+- Coder ran Rust tests/checks, CLI smoke, dependency ownership checks, Nix build/install smoke, doctor, diff-check, and active `cargo run -p tui` grep.
+- Reviewer reran focused parser tests and manually confirmed conflict diagnostics through the built binary after the fix.
+
+
+---
