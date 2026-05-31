@@ -8,9 +8,7 @@ use pod_store::PodMetadataStore;
 use session_store::Store;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
-use crate::discovery::{
-    PodDiscovery, attach_or_restore_pod_tool, inspect_pod_tool, list_visible_pods_tool,
-};
+use crate::discovery::{PodDiscovery, list_pods_tool, restore_pod_tool};
 use crate::ipc::alerter::Alerter;
 use crate::ipc::notify_buffer::NotifyBuffer;
 use crate::ipc::server::SocketServer;
@@ -18,9 +16,7 @@ use crate::pod::{Pod, PodError, PodRunResult, SystemItemCommitter};
 use crate::runtime::dir::RuntimeDir;
 use crate::segment_log_sink::SegmentLogSink;
 use crate::shared_state::PodSharedState;
-use crate::spawn::comm_tools::{
-    list_pods_tool, read_pod_output_tool, send_to_pod_tool, stop_pod_tool,
-};
+use crate::spawn::comm_tools::{read_pod_output_tool, send_to_pod_tool, stop_pod_tool};
 use crate::spawn::registry::SpawnedPodRegistry;
 use crate::spawn::tool::spawn_pod_tool;
 use protocol::{
@@ -563,12 +559,9 @@ where
     worker.register_tool(send_to_pod_tool(spawned_registry.clone()));
     worker.register_tool(read_pod_output_tool(spawned_registry.clone()));
     worker.register_tool(stop_pod_tool(spawned_registry.clone()));
-    worker.register_tool(list_pods_tool(spawned_registry.clone()));
-
     let discovery = PodDiscovery::new(pod_store, spawner_name, runtime_base, pwd, spawned_registry);
-    worker.register_tool(list_visible_pods_tool(discovery.clone()));
-    worker.register_tool(inspect_pod_tool(discovery.clone()));
-    worker.register_tool(attach_or_restore_pod_tool(discovery));
+    worker.register_tool(list_pods_tool(discovery.clone()));
+    worker.register_tool(restore_pod_tool(discovery));
     pod.attach_tracker(tracker);
     fs_for_view
 }
@@ -835,10 +828,10 @@ async fn controller_loop<C, St>(
                 break;
             }
 
-            Method::ListVisiblePods => match discovery.list_visible().await {
+            Method::ListPods => match discovery.list_visible().await {
                 Ok(pods) => match serde_json::to_value(pods) {
                     Ok(pods) => {
-                        let _ = event_tx.send(Event::VisiblePods { pods });
+                        let _ = event_tx.send(Event::PodsListed { pods });
                     }
                     Err(error) => {
                         let _ = event_tx.send(Event::Error {
@@ -855,35 +848,15 @@ async fn controller_loop<C, St>(
                 }
             },
 
-            Method::InspectPod { name } => match discovery.inspect(&name).await {
-                Ok(pod) => match serde_json::to_value(pod) {
-                    Ok(pod) => {
-                        let _ = event_tx.send(Event::PodInspection { pod });
-                    }
-                    Err(error) => {
-                        let _ = event_tx.send(Event::Error {
-                            code: ErrorCode::Internal,
-                            message: format!("serialize pod inspection: {error}"),
-                        });
-                    }
-                },
-                Err(error) => {
-                    let _ = event_tx.send(Event::Error {
-                        code: ErrorCode::InvalidRequest,
-                        message: error.to_string(),
-                    });
-                }
-            },
-
-            Method::AttachOrRestorePod { name } => match discovery.attach_or_restore(&name).await {
+            Method::RestorePod { name } => match discovery.restore(&name).await {
                 Ok(result) => match serde_json::to_value(result) {
                     Ok(result) => {
-                        let _ = event_tx.send(Event::PodAttachRestore { result });
+                        let _ = event_tx.send(Event::PodRestored { result });
                     }
                     Err(error) => {
                         let _ = event_tx.send(Event::Error {
                             code: ErrorCode::Internal,
-                            message: format!("serialize pod attach/restore result: {error}"),
+                            message: format!("serialize pod restore result: {error}"),
                         });
                     }
                 },
@@ -1096,11 +1069,7 @@ where
                         notify_buffer.push_notify(message);
                     }
                     Some(Method::ListCompletions { .. }) => {}
-                    Some(
-                        Method::ListVisiblePods
-                        | Method::InspectPod { .. }
-                        | Method::AttachOrRestorePod { .. },
-                    ) => {
+                    Some(Method::ListPods | Method::RestorePod { .. }) => {
                         let _ = event_tx.send(Event::Error {
                             code: ErrorCode::AlreadyRunning,
                             message: "Pod discovery requests are only handled while the Pod is idle or paused"

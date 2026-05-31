@@ -262,7 +262,7 @@ fn draw(f: &mut Frame<'_>, list: &PodList) {
             Span::styled("[↑/↓]", Style::default().fg(Color::DarkGray)),
             Span::raw(" select   "),
             Span::styled("[enter]", Style::default().fg(Color::Green)),
-            Span::raw(" attach/restore   "),
+            Span::raw(" open/restore   "),
             Span::styled("[esc]", Style::default().fg(Color::Yellow)),
             Span::raw(" cancel"),
         ])),

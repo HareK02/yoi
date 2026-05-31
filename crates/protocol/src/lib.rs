@@ -56,16 +56,12 @@ pub enum Method {
         kind: CompletionKind,
         prefix: String,
     },
-    /// List Pods visible to this Pod from durable Pod state. This is not a
-    /// host-wide Pod universe query.
-    ListVisiblePods,
-    /// Inspect one Pod by name if its state exists and it is visible to this Pod.
-    InspectPod {
-        name: String,
-    },
-    /// Attach to a visible live Pod, or restore it from durable Pod state when
-    /// it is not live. Missing state and not-visible state are distinct errors.
-    AttachOrRestorePod {
+    /// List Pods visible to this Pod from durable Pod state and the spawned-child
+    /// registry. This is not a host-wide Pod universe query.
+    ListPods,
+    /// Restore a visible stopped/restorable Pod, or report that it is already
+    /// live. Missing state and not-visible state are distinct errors.
+    RestorePod {
         name: String,
     },
 }
@@ -474,18 +470,14 @@ pub enum Event {
         input: Vec<Segment>,
         summary: RewindSummary,
     },
-    /// Reply to `Method::ListVisiblePods`. Payload is a stable JSON value so
-    /// the Pod crate can evolve discovery fields without introducing a protocol
+    /// Reply to `Method::ListPods`. Payload is a stable JSON value so the Pod
+    /// crate can evolve discovery fields without introducing a protocol
     /// dependency on session-store.
-    VisiblePods {
+    PodsListed {
         pods: serde_json::Value,
     },
-    /// Reply to `Method::InspectPod`.
-    PodInspection {
-        pod: serde_json::Value,
-    },
-    /// Reply to `Method::AttachOrRestorePod`.
-    PodAttachRestore {
+    /// Reply to `Method::RestorePod`.
+    PodRestored {
         result: serde_json::Value,
     },
     Alert(Alert),
@@ -1469,11 +1461,8 @@ mod tests {
     #[test]
     fn pod_discovery_methods_roundtrip() {
         let methods = [
-            Method::ListVisiblePods,
-            Method::InspectPod {
-                name: "child".into(),
-            },
-            Method::AttachOrRestorePod {
+            Method::ListPods,
+            Method::RestorePod {
                 name: "child".into(),
             },
         ];
@@ -1481,9 +1470,8 @@ mod tests {
             let json = serde_json::to_string(&method).unwrap();
             let decoded: Method = serde_json::from_str(&json).unwrap();
             match (decoded, method) {
-                (Method::ListVisiblePods, Method::ListVisiblePods)
-                | (Method::InspectPod { .. }, Method::InspectPod { .. })
-                | (Method::AttachOrRestorePod { .. }, Method::AttachOrRestorePod { .. }) => {}
+                (Method::ListPods, Method::ListPods)
+                | (Method::RestorePod { .. }, Method::RestorePod { .. }) => {}
                 (decoded, expected) => panic!("decoded {decoded:?}, expected {expected:?}"),
             }
         }
@@ -1492,30 +1480,23 @@ mod tests {
     #[test]
     fn pod_discovery_events_roundtrip() {
         let events = [
-            Event::VisiblePods {
+            Event::PodsListed {
                 pods: serde_json::json!([{ "pod_name": "child" }]),
             },
-            Event::PodInspection {
-                pod: serde_json::json!({ "pod_name": "child" }),
-            },
-            Event::PodAttachRestore {
-                result: serde_json::json!({ "action": "attach" }),
+            Event::PodRestored {
+                result: serde_json::json!({ "action": "already_live" }),
             },
         ];
         for event in events {
             let json = serde_json::to_string(&event).unwrap();
             let decoded: Event = serde_json::from_str(&json).unwrap();
             match (decoded, event) {
-                (Event::VisiblePods { pods }, Event::VisiblePods { pods: expected }) => {
+                (Event::PodsListed { pods }, Event::PodsListed { pods: expected }) => {
                     assert_eq!(pods, expected)
                 }
-                (Event::PodInspection { pod }, Event::PodInspection { pod: expected }) => {
-                    assert_eq!(pod, expected)
+                (Event::PodRestored { result }, Event::PodRestored { result: expected }) => {
+                    assert_eq!(result, expected)
                 }
-                (
-                    Event::PodAttachRestore { result },
-                    Event::PodAttachRestore { result: expected },
-                ) => assert_eq!(result, expected),
                 (decoded, expected) => panic!("decoded {decoded:?}, expected {expected:?}"),
             }
         }

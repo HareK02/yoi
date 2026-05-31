@@ -1,9 +1,10 @@
 //! Shared registry of Pods spawned by this Pod.
 //!
 //! `SpawnPod` writes here; the pod-comm tools (`SendToPod`,
-//! `ReadPodOutput`, `StopPod`, `ListPods`) read and mutate the same
-//! instance. Runtime write-through still materialises `spawned_pods.json`,
-//! but durable state lives in the spawner's Pod metadata.
+//! `ReadPodOutput`, `StopPod`) read and mutate the same instance. Discovery
+//! tools consult this registry together with durable Pod state. Runtime
+//! write-through still materialises `spawned_pods.json`, but durable state lives
+//! in the spawner's Pod metadata.
 //!
 //! `ReadPodOutput` additionally owns a per-spawned-pod cursor here so
 //! two consecutive reads yield only new assistant text. The cursor is

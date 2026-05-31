@@ -1204,9 +1204,7 @@ impl App {
                     message,
                 });
             }
-            Event::VisiblePods { .. }
-            | Event::PodInspection { .. }
-            | Event::PodAttachRestore { .. } => {}
+            Event::PodsListed { .. } | Event::PodRestored { .. } => {}
             Event::Shutdown => {
                 self.mark_orphan_compacts_incomplete();
                 self.quit = true;

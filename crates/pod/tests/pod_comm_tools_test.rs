@@ -1,5 +1,5 @@
 //! Integration tests for the pod-comm tools (`SendToPod`,
-//! `ReadPodOutput`, `StopPod`, `ListPods`).
+//! `ReadPodOutput`, `StopPod`).
 //!
 //! The real child Pod binary is not started. Instead each test stands
 //! up a mock `UnixListener` that speaks the socket protocol directly:
@@ -16,9 +16,7 @@ use llm_worker::tool::ToolOutput;
 use manifest::{Permission, Scope, ScopeRule, SharedScope};
 use pod::runtime::dir::{RuntimeDir, SpawnedPodRecord};
 use pod::runtime::pod_registry::{self, LockFileGuard};
-use pod::spawn::comm_tools::{
-    list_pods_tool, read_pod_output_tool, send_to_pod_tool, stop_pod_tool,
-};
+use pod::spawn::comm_tools::{read_pod_output_tool, send_to_pod_tool, stop_pod_tool};
 use pod::spawn::registry::SpawnedPodRegistry;
 use pod_store::{CombinedStore, FsPodStore, PodMetadataStore};
 use protocol::stream::{JsonLineReader, JsonLineWriter};
@@ -544,13 +542,6 @@ async fn restored_registry_uses_pod_state_without_runtime_file() {
             .await
             .unwrap();
 
-    let def = list_pods_tool(restored.clone());
-    let (_meta, tool) = def();
-    let output: ToolOutput = tool.execute("{}").await.unwrap();
-    assert!(output.summary.contains("1 pod"), "{}", output.summary);
-    let body = output.content.expect("restored ListPods should list child");
-    assert!(body.contains("child [alive]"), "body: {body}");
-
     let def = send_to_pod_tool(restored.clone());
     let (_meta, tool) = def();
     let input = json!({ "name": "child", "message": "after restart" }).to_string();
@@ -717,52 +708,4 @@ async fn load_from_pod_state_reclaims_missing_child_scope_and_records_history() 
     let runtime_contents = std::fs::read_to_string(rd.path().join("spawned_pods.json")).unwrap();
     let runtime_records: Vec<SpawnedPodRecord> = serde_json::from_str(&runtime_contents).unwrap();
     assert!(runtime_records.is_empty());
-}
-
-// ---------------------------------------------------------------------------
-// ListPods
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn list_pods_reports_alive_and_stopped() {
-    let (tmp, registry, _rd) = setup_registry().await;
-
-    // One child is reachable…
-    let (live_socket, listener) = bind_mock_socket(tmp.path(), "alive").await;
-    // Keep the listener alive by moving it into a task that never exits.
-    let _accept = tokio::spawn(async move {
-        loop {
-            let Ok((stream, _)) = listener.accept().await else {
-                return;
-            };
-            drop(stream);
-        }
-    });
-    register_child(&registry, "alive", &live_socket, tmp.path()).await;
-
-    // …the other is not.
-    let dead_socket = tmp.path().join("dead.sock");
-    register_child(&registry, "dead", &dead_socket, tmp.path()).await;
-
-    let def = list_pods_tool(registry);
-    let (_meta, tool) = def();
-    let output: ToolOutput = tool.execute("{}").await.unwrap();
-    assert!(output.summary.contains("2 pod"), "{}", output.summary);
-    let body = output.content.expect("list_pods should populate content");
-    assert!(body.contains("alive [alive]"), "body: {body}");
-    assert!(body.contains("dead [stopped]"), "body: {body}");
-}
-
-#[tokio::test]
-async fn list_pods_empty_when_nothing_registered() {
-    let (_tmp, registry, _rd) = setup_registry().await;
-    let def = list_pods_tool(registry);
-    let (_meta, tool) = def();
-    let output: ToolOutput = tool.execute("{}").await.unwrap();
-    assert!(
-        output.summary.contains("no spawned pods"),
-        "{}",
-        output.summary
-    );
-    assert!(output.content.is_none());
 }
