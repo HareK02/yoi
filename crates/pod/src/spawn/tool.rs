@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use insomnia::PodRuntimeCommand;
+use client::PodRuntimeCommand;
 use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use manifest::{
     CompactionConfigPartial, FileUploadLimitsPartial, Permission, PermissionConfigPartial,
@@ -1300,7 +1300,7 @@ return profile {
         assert!(invalid.contains("Use `default`, `inherit`"));
         assert!(invalid.contains("`project:coder`"));
 
-        let no_default = build_spawn_config_json_for_profile(
+        let default_config = build_spawn_config_json_for_profile(
             &parent,
             &available,
             &project,
@@ -1309,10 +1309,8 @@ return profile {
             &scope,
             SpawnProfileSelector::Default,
         )
-        .unwrap_err();
-        assert!(no_default.contains("no default profile"), "{no_default}");
-        assert!(no_default.contains("Use `default`, `inherit`"));
-        assert!(no_default.contains("`project:coder`"));
+        .unwrap();
+        assert!(default_config.contains("\"name\":\"child\""));
 
         let user_config = tmp.path().join("user-profiles.toml");
         std::fs::write(&user_config, "[profile]\ncoder = \"user-coder.lua\"\n").unwrap();

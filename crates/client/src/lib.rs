@@ -9,7 +9,10 @@
 //! TUI / GUI / E2E ハーネスはこの crate に依存して protocol を喋る。
 
 mod pod_client;
+pub mod runtime_command;
 pub mod spawn;
+
+pub use runtime_command::PodRuntimeCommand;
 
 pub use pod_client::PodClient;
 pub use spawn::{SpawnConfig, SpawnError, SpawnReady, spawn_pod};

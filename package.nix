@@ -40,7 +40,7 @@ rustPlatform.buildRustPackage rec {
     filter = sourceFilter;
   };
 
-  cargoHash = "sha256-Nu+QAXwRhqqSwgc5/9XLwQEpjEnF54tWoEknM17wYq8=";
+  cargoHash = "sha256-tYql+E6s7WeZ2vQSfjH0BzmXmNQaqm54VQy8mUnpzLg=";
 
   depsExtraArgs = {
     # nixpkgs 25.11's fetchCargoVendor still uses crates.io's API
@@ -83,7 +83,7 @@ rustPlatform.buildRustPackage rec {
 
   cargoBuildFlags = [
     "-p"
-    "tui"
+    "insomnia"
   ];
 
   # The package check is a credential-free install smoke check below. Running the

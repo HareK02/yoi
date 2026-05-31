@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 
-use insomnia::PodRuntimeCommand;
+use client::PodRuntimeCommand;
 use llm_worker::tool::{ToolError, ToolOutput};
 use manifest::{
     AuthRef, ModelManifest, Permission, PodManifest, PodManifestConfig, PodMetaConfig, SchemeKind,

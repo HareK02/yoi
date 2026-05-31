@@ -332,7 +332,6 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 name = "client"
 version = "0.1.0"
 dependencies = [
- "insomnia",
  "manifest",
  "protocol",
  "serde_json",
@@ -1483,6 +1482,17 @@ dependencies = [
 [[package]]
 name = "insomnia"
 version = "0.1.0"
+dependencies = [
+ "client",
+ "memory",
+ "pod",
+ "serde",
+ "serde_json",
+ "session-store",
+ "tempfile",
+ "tokio",
+ "tui",
+]
 
 [[package]]
 name = "instability"
@@ -2334,11 +2344,11 @@ dependencies = [
  "async-trait",
  "chrono",
  "clap",
+ "client",
  "dotenv",
  "fs4",
  "futures",
  "include_dir",
- "insomnia",
  "libc",
  "llm-worker",
  "manifest",
@@ -3917,8 +3927,6 @@ dependencies = [
  "crossterm 0.28.1",
  "llm-worker",
  "manifest",
- "memory",
- "pod",
  "pod-registry",
  "pod-store",
  "protocol",

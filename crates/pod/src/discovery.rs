@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use insomnia::PodRuntimeCommand;
+use client::PodRuntimeCommand;
 use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use manifest::{Permission, ScopeRule};
 use pod_store::{PodActiveSegmentRef, PodMetadata, PodMetadataStore};
