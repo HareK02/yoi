@@ -7,7 +7,7 @@ kind: task
 priority: P2
 labels: [memory, prompts, tools]
 created_at: 2026-05-31T22:35:06Z
-updated_at: 2026-05-31T22:35:06Z
+updated_at: 2026-05-31T22:51:36Z
 assignee: null
 legacy_ticket: null
 ---

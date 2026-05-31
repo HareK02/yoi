@@ -1,15 +1,3 @@
-<!-- event: create author: tickets.sh at: 2026-05-31T22:35:06Z -->
-
-## Created
-
-Created by tickets.sh create.
-
----
-
-<!-- event: review author: hare at: 2026-05-31T22:51:36Z status: approve -->
-
-## Review: approve
-
 # Review: memory prompt conditional lookup
 
 Implementation reviewed on branch `memory-prompt-conditional-lookup`.
@@ -37,6 +25,3 @@ Review notes:
 - Final focused review approved the follow-up. `cargo test -p pod prompt::` passed with `53 passed; 0 failed`; only an existing unrelated `llm-worker` dead-code warning remains.
 
 Merge readiness: ready to merge.
-
-
----
