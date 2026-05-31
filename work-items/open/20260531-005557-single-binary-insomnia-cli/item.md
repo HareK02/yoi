@@ -1,50 +1,65 @@
 ---
 id: 20260531-005557-single-binary-insomnia-cli
 slug: single-binary-insomnia-cli
-title: CLI: clarify single-binary insomnia architecture
+title: CLI: migrate toward a single insomnia binary
 status: open
 kind: task
 priority: P2
 labels: [cli, architecture, nix]
 created_at: 2026-05-31T00:55:57Z
-updated_at: 2026-05-31T00:56:38Z
+updated_at: 2026-05-31T04:32:30Z
 assignee: null
 legacy_ticket: null
 ---
 
 ## Background
 
-The installed user-facing command is already `insomnia`, while the Cargo package/crate that owns it is still named `tui`. Headless CLI commands such as `insomnia memory lint` are starting to live in that same binary. This is acceptable short-term, but the architecture should be made explicit before more commands accumulate.
+The repository currently installs two command names:
 
-The preferred product direction is a single user-facing `insomnia` binary that can run TUI screens and headless commands. The main downside is that headless commands inherit ratatui/crossterm and related dependencies, but binary size is not expected to dominate runtime memory compared with LLM clients, HTTP/TLS, JSON/session/memory processing, and spawned process orchestration. A single binary also improves distribution and “minimal standalone install” ergonomics.
+- `insomnia` from the `tui` package: user-facing TUI/CLI entry point, including headless subcommands such as `insomnia memory lint`.
+- `insomnia-pod` from the `pod` package: Pod runtime process entry point used by the TUI, restore flows, and `SpawnPod` to start detached Pod controller processes.
+
+The desired direction is one primary installed executable, `insomnia`, that can act as both the user-facing CLI/TUI and the Pod runtime process entry point. Pod runtime should remain a separate process; the unification is about packaging/entrypoint, not merging TUI and Pod controller into one process.
+
+The Pod runtime does not need a separate human-friendly `insomnia-pod` alias. It was never intended as a user-facing command. Prefer an explicit subcommand such as `insomnia pod ...` over a hidden `__pod-runtime` command.
 
 ## Requirements
 
-- Decide and document the intended command architecture:
-  - one installed `insomnia` binary as the primary user-facing entry point;
-  - headless subcommands under that binary;
-  - TUI/interactive paths as subcommands or default modes;
-  - relationship to `insomnia-pod`.
-- Refactor only if necessary to keep headless commands cleanly separated from terminal/TUI initialization.
-- Ensure headless commands do not initialize ratatui, enter raw mode, connect Pod sockets, or spawn Pod processes unless explicitly requested by that command.
-- Evaluate whether to rename the Cargo package/crate from `tui` to `insomnia`.
-  - If the rename is straightforward, implement it with scoped Nix/docs updates.
-  - If it is broad/risky, leave the rename as a follow-up and document the boundary.
-- Keep installed command names stable unless a separate explicit decision says otherwise.
-- Preserve Nix/Home Manager packaging expectations: installing the flake package should put the intended commands on `PATH`.
-- Avoid introducing separate binaries for every headless command unless there is a measured startup/binary-size/runtime-memory reason.
+- Plan and implement a staged migration toward a single primary installed `insomnia` executable.
+- Target CLI shape:
+  - `insomnia` / `insomnia <pod>` / `insomnia --pod ...` / `insomnia --multi` keep current user-facing behavior;
+  - `insomnia memory lint ...` remains a headless command;
+  - `insomnia pod ...` invokes the Pod runtime using the existing Pod runtime flags/semantics.
+- Pod runtime remains a detached child process when spawned by TUI/RestorePod/SpawnPod.
+- `insomnia-pod` is not kept as a long-term compatibility alias. If a transition step leaves it temporarily, the follow-up/removal boundary must be explicit.
+- Refactor Pod runtime startup so both old and new entrypoints, if temporarily present, share one library entrypoint.
+- Update internal spawn/restore paths to support executable + prefix args, so `insomnia pod ...` can replace executable-only `insomnia-pod ...` invocations.
+- Preserve the `INSOMNIA-READY` stderr handshake and detached process behavior.
+- Preserve headless command invariants: headless subcommands must not initialize ratatui/raw terminal, connect Pod sockets, or spawn Pod processes unless requested by that command.
+- Preserve Nix/Home Manager packaging expectations and make the intended installed command set explicit.
+- Evaluate `tui` package rename separately. It is not required for runtime unification and should not be mixed into early migration phases unless it becomes mechanically unavoidable.
+
+## Suggested phases
+
+1. Extract Pod runtime startup into a library entrypoint and add `insomnia pod ...` dispatch.
+2. Extend Pod runtime command resolution to support `program + prefix_args` and switch TUI/RestorePod/SpawnPod defaults to `current_exe() + ["pod"]` where appropriate.
+3. Update Nix/devshell/docs so the canonical installed runtime path is `insomnia pod ...`; remove `insomnia-pod` from installed package outputs when internal callers no longer need it.
+4. Consider `tui` package/crate rename as a later cleanup only after binary/process unification is stable.
 
 ## Non-goals
 
-- Reworking the Pod daemon binary protocol.
-- Removing `insomnia-pod` unless a separate architecture decision covers Pod process lifecycle.
+- Running Pod controller inside the TUI process.
+- Keeping `insomnia-pod` as a long-term public compatibility command.
 - Feature-gating ratatui/crossterm for a headless-only build before there is a measured need.
-- Large CLI UX redesign beyond clarifying the single-binary structure.
+- Large CLI UX redesign beyond the runtime entrypoint migration.
+- Renaming `tui` package/crate in the first implementation step.
 
 ## Acceptance criteria
 
-- The repository has a clear documented decision or implementation path for the single-binary `insomnia` CLI architecture.
-- Existing TUI flows and headless command flows remain tested.
-- If crate/package rename is implemented, Cargo/Nix/docs references are updated consistently.
-- If crate/package rename is deferred, a precise follow-up or documented rationale explains why.
-- `cargo fmt --check`, relevant `cargo test`/`cargo check`, `./tickets.sh doctor`, and `git diff --check` pass.
+- The repository has a concrete staged plan and implementation tickets for moving Pod runtime startup under `insomnia pod`.
+- First implementation step lands without changing unrelated CLI behavior.
+- `insomnia pod --help` reaches the Pod runtime parser.
+- Existing headless command behavior (`insomnia memory lint`) remains headless.
+- Internal callers can be migrated from `insomnia-pod` to `insomnia pod` through typed command resolution rather than shell-string parsing.
+- Follow-up/removal of `insomnia-pod` is explicit if not completed in the first implementation step.
+- `cargo fmt --check`, relevant `cargo test`/`cargo check`, `./tickets.sh doctor`, and `git diff --check` pass for each step.
