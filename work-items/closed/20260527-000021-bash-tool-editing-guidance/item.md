@@ -2,12 +2,12 @@
 id: 20260527-000021-bash-tool-editing-guidance
 slug: bash-tool-editing-guidance
 title: Bashツールがファイル編集に常用されている問題をdesciptionで抑制
-status: open
+status: closed
 kind: task
 priority: P2
 labels: [migrated]
 created_at: 2026-05-27T00:00:21Z
-updated_at: 2026-05-27T00:00:21Z
+updated_at: 2026-05-31T22:36:34Z
 assignee: null
 legacy_ticket: null
 ---

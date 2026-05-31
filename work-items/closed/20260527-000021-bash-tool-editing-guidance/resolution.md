@@ -1,0 +1,1 @@
+Closed without implementation for now. Current Bash tool description already nudges agents toward Read/Edit/Glob/Grep over shell-based file edits, and this is not urgent enough to carry as an active work item. If the behavior becomes a recurring problem, reopen as a focused prompt-description polish ticket covering Bash child processes such as cat/tee/sed/perl/python rewrites.
