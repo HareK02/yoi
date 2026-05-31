@@ -7,7 +7,7 @@ kind: task
 priority: P2
 labels: [migrated, memory, cli]
 created_at: 2026-05-27T00:00:19Z
-updated_at: 2026-05-31T00:51:55Z
+updated_at: 2026-05-31T02:14:28Z
 assignee: null
 legacy_ticket: null
 ---
