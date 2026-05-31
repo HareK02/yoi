@@ -53,7 +53,10 @@ pub enum SpawnError {
     Io(io::Error),
     /// runtime ディレクトリが解決できなかった (環境変数未設定等)。
     RuntimeDirUnavailable,
-    PodLaunchFailed(io::Error),
+    PodLaunchFailed {
+        command: PodRuntimeCommand,
+        source: io::Error,
+    },
     PodExitedEarly {
         stderr_tail: String,
     },
@@ -68,7 +71,10 @@ impl std::fmt::Display for SpawnError {
                 f,
                 "could not resolve runtime directory (set INSOMNIA_HOME, INSOMNIA_RUNTIME_DIR, XDG_RUNTIME_DIR, or HOME)"
             ),
-            Self::PodLaunchFailed(e) => write!(f, "failed to launch pod: {e}"),
+            Self::PodLaunchFailed { command, source } => write!(
+                f,
+                "failed to launch pod runtime command `{command}`: {source}"
+            ),
             Self::PodExitedEarly { stderr_tail } => {
                 if stderr_tail.is_empty() {
                     write!(f, "pod exited before becoming ready")
@@ -85,7 +91,14 @@ impl std::fmt::Display for SpawnError {
     }
 }
 
-impl std::error::Error for SpawnError {}
+impl std::error::Error for SpawnError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) | Self::PodLaunchFailed { source: error, .. } => Some(error),
+            Self::RuntimeDirUnavailable | Self::PodExitedEarly { .. } | Self::Timeout => None,
+        }
+    }
+}
 
 impl From<io::Error> for SpawnError {
     fn from(e: io::Error) -> Self {
@@ -132,7 +145,12 @@ where
             .arg("--session-pod-name")
             .arg(&config.pod_name);
     }
-    let mut child = command.spawn().map_err(SpawnError::PodLaunchFailed)?;
+    let mut child = command
+        .spawn()
+        .map_err(|source| SpawnError::PodLaunchFailed {
+            command: config.runtime_command.clone(),
+            source,
+        })?;
 
     // Default `kill_on_drop = false` plus `process_group(0)` makes this
     // a detached Pod once startup succeeds: dropping the handle does not

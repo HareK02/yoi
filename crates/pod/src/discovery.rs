@@ -346,7 +346,13 @@ where
             command.arg("--store").arg(store_dir);
         }
 
-        let mut child = command.spawn().map_err(PodDiscoveryError::RestoreSpawn)?;
+        let mut child =
+            command
+                .spawn()
+                .map_err(|source| PodDiscoveryError::RestoreLaunchFailed {
+                    command: runtime_command.clone(),
+                    source,
+                })?;
         let deadline = tokio::time::Instant::now() + RESTORE_START_TIMEOUT;
         loop {
             if probe_socket(socket_path).await.reachable {
@@ -545,6 +551,12 @@ pub enum PodDiscoveryError {
     ScopeLock(#[from] pod_registry::ScopeLockError),
     #[error("failed to launch restore process: {0}")]
     RestoreSpawn(io::Error),
+    #[error("failed to launch restore runtime command `{command}`: {source}")]
+    RestoreLaunchFailed {
+        command: PodRuntimeCommand,
+        #[source]
+        source: io::Error,
+    },
     #[error("restore process exited before socket became reachable: {status}")]
     RestoreExited { status: std::process::ExitStatus },
     #[error("restore process did not become reachable before timeout")]
@@ -779,6 +791,7 @@ fn discovery_error_to_tool_error(error: PodDiscoveryError) -> ToolError {
         | PodDiscoveryError::PodStore(_)
         | PodDiscoveryError::ScopeLock(_)
         | PodDiscoveryError::RestoreSpawn(_)
+        | PodDiscoveryError::RestoreLaunchFailed { .. }
         | PodDiscoveryError::RestoreExited { .. }
         | PodDiscoveryError::RestoreTimeout => ToolError::ExecutionFailed(error.to_string()),
     }

@@ -2,7 +2,7 @@
 
 INSOMNIA では、プロセス境界で本当に必要な場合を除き、環境変数の利用を避ける。新しい ambient な入力を増やすより、明示的な profile / manifest / config file / typed secret reference / CLI argument を優先する。
 
-それでも、path discovery、runtime directory、外部 provider の credential 慣習との移行互換のために、一部の環境変数はまだサポートしている。この文書に載せた環境変数は公開 surface として扱う。ただし、fallback 変数は独立した設定項目ではなく、対応する main key の解決順の一部として扱う。開発・テスト都合だけの環境変数は追加しない。
+それでも、path discovery、runtime directory、外部 provider の credential 慣習との移行互換のために、一部の環境変数はまだサポートしている。この文書に載せた通常 runtime 用の環境変数は公開 surface として扱う。ただし、fallback 変数は独立した設定項目ではなく、対応する main key の解決順の一部として扱う。開発・テスト都合だけの環境変数は、通常ユーザー向け configuration として扱わない明確な escape hatch に限る。
 
 ## 原則
 
@@ -55,6 +55,14 @@ Provider credential は、現在は manifest / profile / catalog の設定から
 | `CODEX_HOME` | Codex OAuth `auth.json` の場所。 | 外部互換用の入力。fallback は `$HOME/.codex`。 |
 
 Credential env var は interoperability のために現時点では残っているが、長期的に望ましい secret mechanism ではない。現時点では適切なら `auth.file` を優先し、今後は typed secret reference へ寄せる。credential UX のために implicit `.env` loading を追加しないこと。project secret を漏らしやすく、profile ごとの credential model とも相性が悪い。
+
+## Development-only escape hatches
+
+これらは dogfooding / self-rebuild / fixture などの開発運用だけの逃げ道であり、通常ユーザー向けの configuration surface ではない。profile、manifest、CLI option の代替として案内しない。
+
+| 変数 | Context | 備考 |
+| --- | --- | --- |
+| `INSOMNIA_POD_RUNTIME_COMMAND` | 開発中に起動中の `insomnia` binary が rebuild され、`std::env::current_exe()` が `target/debug/insomnia (deleted)` のような stale path を返す場合の Pod runtime executable override。 | Unset または empty の場合は既定どおり current executable に `pod` prefix argument を付けて起動する。Non-empty の場合は値を executable path としてそのまま使い、`pod` prefix argument は常に自動追加する。shell parsing や argument splitting は行わないため、値に flags や `pod` を含めない。 |
 
 ## Build / example variables
 
