@@ -19,6 +19,7 @@ unicode-width = "0.2.2"
 uuid = { workspace = true }
 toml = { workspace = true }
 manifest = { workspace = true }
+memory = { workspace = true }
 session-store = { workspace = true }
 pod-store = { workspace = true }
 pod-registry = { workspace = true }

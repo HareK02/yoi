@@ -4,6 +4,7 @@ mod cache;
 mod command;
 mod input;
 mod markdown;
+mod memory_lint;
 mod multi_pod;
 mod picker;
 mod pod_list;
@@ -80,12 +81,15 @@ enum Mode {
     /// separate from `-r`/`--resume`, which keeps its single-Pod picker
     /// meaning.
     Multi,
+    /// `insomnia memory lint`: headless lint for workspace memory and knowledge files.
+    MemoryLint(memory_lint::LintCliOptions),
 }
 
 #[derive(Debug)]
 enum ParseError {
     Conflict(&'static str),
     InvalidSession(String),
+    MemoryLint(memory_lint::UsageError),
     MissingValue(&'static str),
 }
 
@@ -94,6 +98,7 @@ impl std::fmt::Display for ParseError {
         match self {
             Self::Conflict(message) => write!(f, "{message}"),
             Self::InvalidSession(s) => write!(f, "invalid --session UUID: {s}"),
+            Self::MemoryLint(err) => write!(f, "{err}"),
             Self::MissingValue(flag) => write!(f, "{flag} requires a value"),
         }
     }
@@ -109,6 +114,13 @@ where
     S: Into<String>,
 {
     let args: Vec<String> = args.into_iter().map(Into::into).collect();
+    if args.first().map(String::as_str) == Some("memory")
+        && args.get(1).map(String::as_str) == Some("lint")
+    {
+        let options = memory_lint::parse_lint_args(&args[2..]).map_err(ParseError::MemoryLint)?;
+        return Ok(Mode::MemoryLint(options));
+    }
+
     let mut resume = false;
     let mut multi = false;
     let mut session: Option<SegmentId> = None;
@@ -255,9 +267,23 @@ async fn main() -> ExitCode {
         Ok(m) => m,
         Err(e) => {
             eprintln!("insomnia: {e}");
-            return ExitCode::FAILURE;
+            return match e {
+                ParseError::MemoryLint(_) => ExitCode::from(2),
+                _ => ExitCode::FAILURE,
+            };
         }
     };
+
+    if let Mode::MemoryLint(ref options) = mode {
+        return match memory_lint::run(options) {
+            Ok(memory_lint::LintStatus::Clean) => ExitCode::SUCCESS,
+            Ok(memory_lint::LintStatus::Failed) => ExitCode::FAILURE,
+            Err(err) => {
+                eprintln!("insomnia: {err}");
+                ExitCode::from(2)
+            }
+        };
+    }
 
     if let Err(e) = enable_raw_mode() {
         eprintln!("insomnia: failed to enter raw mode: {e}");
@@ -278,6 +304,7 @@ async fn main() -> ExitCode {
         Mode::Resume => run_resume().await,
         Mode::ResumeWithSession(id) => run_spawn(Some(id), None).await,
         Mode::Multi => run_multi().await,
+        Mode::MemoryLint(_) => unreachable!("memory lint returns before terminal setup"),
     };
 
     // Always restore the terminal first so any pending eprintln below
@@ -1165,6 +1192,67 @@ mod tests {
                 assert_eq!(pod_name, "agent");
                 assert_eq!(socket_override, None);
             }
+            _ => panic!("expected PodName mode"),
+        }
+    }
+
+    #[test]
+    fn parse_memory_alone_remains_positional_pod_name() {
+        match parse_args_from(["memory"]).unwrap() {
+            Mode::PodName {
+                pod_name,
+                socket_override,
+            } => {
+                assert_eq!(pod_name, "memory");
+                assert_eq!(socket_override, None);
+            }
+            _ => panic!("expected PodName mode"),
+        }
+    }
+
+    #[test]
+    fn parse_memory_lint_mode() {
+        match parse_args_from([
+            "memory",
+            "lint",
+            "--workspace",
+            "/tmp/ws",
+            "--json",
+            "--warnings-as-errors",
+        ])
+        .unwrap()
+        {
+            Mode::MemoryLint(options) => {
+                assert_eq!(options.workspace, Some(PathBuf::from("/tmp/ws")));
+                assert!(options.json);
+                assert!(options.warnings_as_errors);
+            }
+            _ => panic!("expected MemoryLint mode"),
+        }
+    }
+
+    #[test]
+    fn parse_memory_lint_rejects_usage_errors() {
+        let err = parse_args_from(["memory", "lint", "--workspace"]).unwrap_err();
+        assert_eq!(err.to_string(), "--workspace requires a value");
+    }
+
+    #[test]
+    fn parse_memory_lint_workspace_equals() {
+        match parse_args_from(["memory", "lint", "--workspace=/tmp/ws"]).unwrap() {
+            Mode::MemoryLint(options) => {
+                assert_eq!(options.workspace, Some(PathBuf::from("/tmp/ws")));
+                assert!(!options.json);
+                assert!(!options.warnings_as_errors);
+            }
+            _ => panic!("expected MemoryLint mode"),
+        }
+    }
+
+    #[test]
+    fn memory_lint_with_other_second_word_remains_positional_pod_name() {
+        match parse_args_from(["memory", "other"]).unwrap() {
+            Mode::PodName { pod_name, .. } => assert_eq!(pod_name, "memory"),
             _ => panic!("expected PodName mode"),
         }
     }
