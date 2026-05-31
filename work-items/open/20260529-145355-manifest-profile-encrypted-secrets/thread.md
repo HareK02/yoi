@@ -148,3 +148,40 @@ Implications for implementation planning:
 
 
 ---
+
+<!-- event: plan author: hare at: 2026-05-31T21:19:29Z -->
+
+## Plan
+
+Preflight update: implementation-ready as a single phased ticket.
+
+Finalized intent:
+- Build a provider-independent local key-value secret store and wire it into provider/WebSearch credential resolution.
+- Add `insomnia keys` as the required interactive TUI management surface.
+- Keep the security claim modest: avoid casual plaintext exposure and generic env scraping; do not claim strong local security.
+
+Settled decisions:
+- Store model is user-visible `id -> value`; no provider-specific slots and no required metadata.
+- Store may use technical envelope fields for version/nonce/ciphertext/checksum, but those are implementation details.
+- No OS keychain, passphrase UX, or high-assurance key-management dependency in this ticket.
+- No automatic provider-name-to-secret-id lookup. Config must explicitly reference a key id.
+- This is one ticket with phases, not separate tickets.
+
+Suggested implementation order:
+1. Add a focused secret store crate/module with id validation, obfuscated/encrypted persistence, atomic writes, and tests.
+2. Add `insomnia keys` TUI manager for list/add/delete with masked input.
+3. Implement provider `AuthRef::SecretRef` resolution through the store.
+4. Add WebSearch secret-ref configuration path.
+5. Update docs and migration messaging.
+
+Critical risks for coder/reviewer:
+- Accidentally turning the store into provider-aware schema.
+- Displaying plaintext in Debug/errors/TUI list output.
+- Overstating security guarantees in docs.
+- Adding ambient defaults that recreate the env-var problem in secret-store form.
+- Expanding into OS keychain/passphrase design despite the settled modest threat model.
+
+Validation should include focused tests for id validation, store round-trip, decode failure, provider secret-ref resolution, WebSearch secret-ref resolution, and no plaintext in display/debug paths where applicable.
+
+
+---
