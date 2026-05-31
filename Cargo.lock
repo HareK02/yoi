@@ -3911,6 +3911,7 @@ dependencies = [
  "crossterm 0.28.1",
  "llm-worker",
  "manifest",
+ "memory",
  "pod-registry",
  "pod-store",
  "protocol",
