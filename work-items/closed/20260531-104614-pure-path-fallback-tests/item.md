@@ -2,12 +2,12 @@
 id: 20260531-104614-pure-path-fallback-tests
 slug: pure-path-fallback-tests
 title: Tests: make path fallback tests independent from process env
-status: open
+status: closed
 kind: task
 priority: P2
 labels: [test, env, manifest, cleanup]
 created_at: 2026-05-31T10:46:14Z
-updated_at: 2026-05-31T10:54:18Z
+updated_at: 2026-05-31T10:54:49Z
 assignee: null
 legacy_ticket: null
 ---
