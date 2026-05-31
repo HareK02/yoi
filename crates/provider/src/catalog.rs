@@ -442,17 +442,16 @@ mod tests {
     }
 
     #[test]
-    fn context_window_is_clamped_by_catalog_backend_max() {
+    fn codex_gpt55_catalog_records_effective_context_window() {
         let providers = load_builtin_providers().unwrap();
         let models = load_builtin_models().unwrap();
         let manifest = ModelManifest {
             ref_: Some("codex-oauth/gpt-5.5".into()),
-            context_window: Some(1_000_000),
             ..Default::default()
         };
         let cfg = resolve_with_catalogs(&manifest, &providers, &models).unwrap();
         assert_eq!(cfg.context_window, 272_000);
-        assert_eq!(cfg.max_context_window, Some(272_000));
+        assert_eq!(cfg.max_context_window, None);
     }
 
     #[test]
@@ -473,7 +472,7 @@ mod tests {
     }
 
     #[test]
-    fn manifest_backend_max_overrides_catalog_backend_max() {
+    fn manifest_backend_max_clamps_ref_context_override() {
         let providers = load_builtin_providers().unwrap();
         let models = load_builtin_models().unwrap();
         let manifest = ModelManifest {
