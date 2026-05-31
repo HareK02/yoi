@@ -2,12 +2,12 @@
 id: 20260531-022821-pod-tool-surface-restore-list
 slug: pod-tool-surface-restore-list
 title: Pod tools: unify pod listing and rename restore operation
-status: open
+status: closed
 kind: task
 priority: P2
 labels: [pod, tools, orchestration]
 created_at: 2026-05-31T02:28:21Z
-updated_at: 2026-05-31T02:59:12Z
+updated_at: 2026-05-31T03:00:15Z
 assignee: null
 legacy_ticket: null
 ---

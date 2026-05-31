@@ -77,3 +77,29 @@ Non-blocking follow-ups:
 
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-05-31T03:00:14Z -->
+
+## Implementation report
+
+Main workspace validation after merge:
+
+- `cargo fmt --check` passed
+- `cargo check -p pod -p protocol -p tui` passed with pre-existing dead-code warnings in `llm-worker` and `tui`
+- `cargo test -p protocol pod_discovery` passed
+- `cargo test -p pod state_backed_visibility_and_restore_planning` passed
+- `cargo test -p pod --test pod_comm_tools_test` passed
+- `./tickets.sh doctor` passed
+- `git diff --check` passed
+
+
+---
+
+<!-- event: close author: hare at: 2026-05-31T03:00:15Z status: closed -->
+
+## Closed
+
+Simplified the LLM-facing Pod tool surface: `ListPods` now uses visibility/state-backed listing semantics, `ListVisiblePods` and `InspectPod` are removed from the active tool/protocol surface, and `AttachOrRestorePod` is renamed to `RestorePod`. TUI/protocol/docs/tests were updated, external review approved, and main workspace validation passed.
+
+
+---
