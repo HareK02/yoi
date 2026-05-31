@@ -21,3 +21,66 @@ Implementation plan:
 
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-05-31T05:25:12Z -->
+
+## Implementation report
+
+Implementation report from coder Pod `spawn-through-insomnia-pod-coder-20260531`:
+
+- Branch: `spawn-through-insomnia-pod-subcommand`
+- Commit: `4f622b8` (`cli: spawn pods through insomnia pod`)
+- Added new `pod-command` crate with typed `PodRuntimeCommand { program, prefix_args }`.
+- Default runtime command now resolves to `current_exe()` + `pod` prefix args, except when running through the temporary legacy `insomnia-pod` wrapper.
+- `INSOMNIA_POD_COMMAND` remains executable-only, is not shell-parsed, and bypasses prefix args for development/debug override behavior.
+- Migrated internal Pod runtime launches to the typed command:
+  - `client::spawn_pod`
+  - `SpawnPod` child process creation
+  - `PodDiscovery::restore` / `RestorePod`
+  - TUI spawn/restore callers through `client::spawn_pod`
+- Preserved detached process behavior, process groups, socket prediction/probing, and `INSOMNIA-READY` stderr handshake.
+- Left `insomnia-pod` package/output removal for the next phase.
+
+Validation reported by coder:
+
+- `cargo fmt --check` passed
+- `cargo test -p pod-command` passed
+- `cargo test -p client -p pod-command` passed
+- `cargo test -p pod --lib discovery::tests` passed
+- `cargo test -p pod --test spawn_pod_test` passed
+- `cargo test -p tui parse_pod_subcommand_uses_runtime_mode` passed
+- `cargo check -p client -p pod -p tui` passed with existing dead-code warnings
+- `./tickets.sh doctor` passed
+- `git diff --check` passed
+
+Unresolved follow-ups:
+
+- Remove/demote `insomnia-pod` package/output once packaging/devshell/docs are updated.
+- Optional stronger future test: capture actual argv of a mock spawned executable in a default-command call site.
+
+
+---
+
+<!-- event: review author: hare at: 2026-05-31T05:25:12Z status: approve -->
+
+## Review: approve
+
+External review by reviewer Pod `spawn-through-insomnia-pod-reviewer-20260531`: approve.
+
+Reviewer summary:
+
+- The implementation adds typed `PodRuntimeCommand { program, prefix_args }` command resolution.
+- Default runtime command is now current executable plus `pod` prefix args, except for the temporary legacy `insomnia-pod` wrapper path.
+- `INSOMNIA_POD_COMMAND` remains executable-only and is not shell-parsed.
+- `client::spawn_pod`, `SpawnPod`, and `RestorePod`/discovery restore paths now use the typed command.
+- Detached process behavior and `INSOMNIA-READY` handshake are preserved.
+- Nix/package removal and crate rename are not mixed into this ticket.
+
+Blockers: none.
+
+Non-blocking follow-up:
+
+- Future test could capture actual argv of a mock spawned executable in a default-command call site. Current tests are adequate for this ticket because the typed command composition and existing spawn behavior are covered.
+
+
+---
