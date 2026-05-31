@@ -234,6 +234,17 @@ async fn brave_search(
         )));
     }
 
+    brave_search_with_api_key(client, cfg, &api_key, query, limit, offset).await
+}
+
+async fn brave_search_with_api_key(
+    client: &Client,
+    cfg: &WebSearchConfig,
+    api_key: &str,
+    query: &str,
+    limit: usize,
+    offset: usize,
+) -> Result<ToolOutput, ToolError> {
     let endpoint = cfg.base_url.as_deref().unwrap_or(BRAVE_SEARCH_ENDPOINT);
     let mut url = Url::parse(endpoint).map_err(|err| {
         ToolError::InvalidArgument(format!("invalid Brave search endpoint: {err}"))
@@ -1694,6 +1705,17 @@ mod tests {
         }))
     }
 
+    fn brave_search_config(base_url: String) -> WebSearchConfig {
+        WebSearchConfig {
+            enabled: Some(true),
+            provider: Some(WebSearchProvider::Brave),
+            api_key_env: None,
+            timeout_secs: Some(2),
+            base_url: Some(base_url),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn validates_brave_query_limits() {
         validate_brave_query("hello world").unwrap();
@@ -2019,30 +2041,16 @@ mod tests {
     async fn searches_brave_with_bounded_output() {
         let response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"web\":{\"results\":[{\"title\":\"Example\",\"url\":\"https://example.com\",\"description\":\"Snippet\",\"extra_snippets\":[\"Extra\"],\"language\":\"en\"}]}}";
         let (addr, captured) = serve_once_capture(response).await;
-        let env_name = format!("INSOMNIA_TEST_BRAVE_KEY_{}", std::process::id());
-        unsafe { std::env::set_var(&env_name, "test-key") };
         let tools = WebTools::new(Some(WebConfig {
             enabled: Some(true),
             allow_private_addresses: Some(true),
-            search: Some(WebSearchConfig {
-                enabled: Some(true),
-                provider: Some(WebSearchProvider::Brave),
-                api_key_env: Some(env_name.clone()),
-                timeout_secs: Some(2),
-                base_url: Some(format!("http://{addr}/search")),
-                ..Default::default()
-            }),
+            search: None,
             fetch: None,
         }));
-        let result = tools
-            .run_search(WebSearchInput {
-                query: "insomnia".into(),
-                limit: Some(1),
-                offset: Some(0),
-            })
+        let cfg = brave_search_config(format!("http://{addr}/search"));
+        let result = brave_search_with_api_key(&tools.client, &cfg, "test-key", "insomnia", 1, 0)
             .await
             .unwrap();
-        unsafe { std::env::remove_var(&env_name) };
         let value: Value = serde_json::from_str(result.content.as_deref().unwrap()).unwrap();
         let request = captured.lock().await.clone().unwrap();
         assert!(request.starts_with("GET /search?q=insomnia&count=1&offset=0 "));
@@ -2065,29 +2073,16 @@ mod tests {
         );
         let response: &'static str = Box::leak(response.into_boxed_str());
         let addr = serve_once(response).await;
-        let env_name = format!("INSOMNIA_TEST_BRAVE_OVERSIZED_KEY_{}", std::process::id());
-        unsafe { std::env::set_var(&env_name, "test-key") };
         let tools = WebTools::new(Some(WebConfig {
             enabled: Some(true),
             allow_private_addresses: Some(true),
-            search: Some(WebSearchConfig {
-                enabled: Some(true),
-                provider: Some(WebSearchProvider::Brave),
-                api_key_env: Some(env_name.clone()),
-                base_url: Some(format!("http://{addr}/search")),
-                ..Default::default()
-            }),
+            search: None,
             fetch: None,
         }));
-        let err = tools
-            .run_search(WebSearchInput {
-                query: "insomnia".into(),
-                limit: Some(1),
-                offset: Some(0),
-            })
+        let cfg = brave_search_config(format!("http://{addr}/search"));
+        let err = brave_search_with_api_key(&tools.client, &cfg, "test-key", "insomnia", 1, 0)
             .await
             .unwrap_err();
-        unsafe { std::env::remove_var(&env_name) };
         assert!(err.to_string().contains("Content-Length"));
     }
 }
