@@ -78,7 +78,7 @@ Credential env var は interoperability のために現時点では残ってい�
 - `INSOMNIA_USER_MANIFEST` は通常の profile-based Pod/TUI startup の一部ではない。one-file manifest の debug / compatibility path には `insomnia pod --manifest <PATH>` を使う。
 - ambient `.insomnia/manifest.toml` discovery は通常の fresh startup の一部ではない。
 - Pod runtime command の環境変数 override は提供しない。Pod runtime は `insomnia pod ...` の typed command として起動する。
-- `INSOMNIA_TEST_*` のような開発・テスト専用の環境変数は supported surface にしない。既存利用も削除する。
+- 開発・テスト専用の環境変数は supported surface にしない。既存利用も削除する。
 - `insomnia-pod` は installed command ではない。Pod runtime は `insomnia pod ...` から起動する。
 - 通常 runtime は `.env` ファイルを load しない。
 
