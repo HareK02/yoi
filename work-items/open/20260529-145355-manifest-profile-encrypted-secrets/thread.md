@@ -111,3 +111,40 @@ Recommended next step:
 
 
 ---
+
+<!-- event: decision author: hare at: 2026-05-31T21:04:45Z -->
+
+## Decision
+
+Decision: keep the secret store as a provider-independent key-value store.
+
+User decision:
+- The secret store path should be completely limited to a simple key-value store.
+- Do not hard-code provider-specific slots or provider-specific semantics into the store.
+- Do not require metadata in the store schema.
+- Conceptual model is:
+
+```text
+{
+  "anthropic/default" = "sk-..."
+}
+```
+
+- Provider/model/tool configuration is responsible for choosing which secret key to reference.
+- The store does not know whether a value is an Anthropic key, Brave key, OpenAI key, token, or anything else.
+- Any provider-aware UX should be a higher-level helper that writes ordinary key-value entries and/or config references; it must not change the store schema.
+
+Security stance:
+- Use light encryption/obfuscation at rest if practical, but do not claim strong security guarantees.
+- The goal is to avoid casual plaintext exposure in files, logs, work items, and accidental grep/cat output, not to defend against a local attacker with access to the user account.
+- Avoid complicated key-management requirements such as OS keychain dependency as a prerequisite for this ticket unless a later explicit decision changes the security target.
+- Documentation and diagnostics should be honest: this is an obfuscated/encrypted local key-value store with limited protection, not a high-assurance secret manager.
+
+Implications for implementation planning:
+- Remove the previous requirement for metadata such as provider/kind/description/created_at/updated_at unless the implementation needs internal versioning/encryption fields.
+- Store format may still need technical envelope fields for version/nonce/ciphertext/checksum, but the user-visible logical schema is only `id -> value`.
+- Secret id validation remains useful because ids are referenced from manifest/profile/tool config and diagnostics.
+- Provider/WebSearch integration should resolve `secret_ref` by direct key lookup only.
+
+
+---

@@ -7,7 +7,7 @@ kind: feature
 priority: P2
 labels: [manifest, profiles, secrets, security]
 created_at: 2026-05-29T14:53:55Z
-updated_at: 2026-05-31T20:58:00Z
+updated_at: 2026-05-31T21:04:45Z
 assignee: null
 legacy_ticket: null
 ---
