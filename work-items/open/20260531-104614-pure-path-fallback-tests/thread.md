@@ -69,3 +69,34 @@ Validation:
 
 
 ---
+
+<!-- event: review author: hare at: 2026-05-31T10:54:18Z status: approve -->
+
+## Review: approve
+
+External reviewer: `pure-path-fallback-reviewer-20260531`
+Reviewed implementation commit: `e232f54` (`test: make path fallback tests pure`)
+Verdict: approve
+
+Summary:
+- `manifest::paths` fallback/precedence logic was split into private pure helpers.
+- Tests now pass direct `Option<PathBuf>` inputs to verify fallback order rather than mutating process environment.
+- No `PathEnv`/`EnvSnapshot`/trait/test-support crate was introduced.
+- The change is limited to `crates/manifest/src/paths.rs`.
+
+Requirements mapping:
+- `config_dir`, `data_dir`, and `runtime_dir` public wrappers still read the same env keys and pass them in the existing precedence order.
+- Empty env values still become `None` through the retained `env_path`/path conversion behavior.
+- `docs/environment.md` fallback order matches the code.
+- `git grep -n -E 'set_var\(|remove_var\(' -- crates/manifest/src/paths.rs` has no matches.
+- No credential env behavior, Pod runtime/process behavior, or new env var surface was changed.
+
+Blockers: none.
+Non-blocking follow-ups: none.
+
+Validation adequacy:
+- Coder validation covered fmt, focused/full manifest tests, manifest check, doctor, diff check, and set_var/remove_var grep.
+- Reviewer performed read-only diff/source/docs consistency review and grep/diff-check spot checks; no additional Cargo tests were rerun by reviewer.
+
+
+---
