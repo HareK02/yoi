@@ -7,7 +7,7 @@ kind: feature
 priority: P2
 labels: [manifest, profiles, secrets, security, cli, tui]
 created_at: 2026-05-29T14:53:55Z
-updated_at: 2026-05-31T21:19:29Z
+updated_at: 2026-05-31T21:23:46Z
 assignee: null
 legacy_ticket: null
 ---
@@ -90,13 +90,21 @@ The store must not know that a key is Anthropic, Brave, OpenAI, or any other pro
 - Secret refs are resolved at the consumer/runtime boundary only; resolved config/debug output must not contain plaintext.
 - The store must not implicitly choose default keys based on provider name. No ambient lookup like "anthropic automatically reads anthropic/default" unless the profile/config explicitly references it.
 
-### Env credential migration
+### Env credential removal
 
 - Do not load `.env` files.
 - Do not add new credential environment variables.
-- Existing env credential paths may remain temporarily as compatibility/migration input during this ticket if removing all of them would make the change too large.
-- If env credential paths remain, docs and diagnostics should prefer `insomnia keys` + secret refs as the normal path.
-- The target state is to remove credential env configuration from normal profile use in a follow-up or final phase of this ticket if feasible.
+- Do not keep migration/backward-compatibility behavior for credential env config in the normal profile path.
+- Remove credential env configuration from normal provider/WebSearch use as part of this ticket.
+- Docs and diagnostics should point users to `insomnia keys` + secret refs as the credential path.
+
+### Codex OAuth relationship
+
+- Codex OAuth is not part of this key-value secret store in this ticket.
+- Current Codex OAuth intentionally interoperates with Codex CLI's `auth.json` file and refresh behavior; that file contains a structured token bundle, not a single provider API key string.
+- Do not store or refresh Codex OAuth token bundles through the key-value store as part of this ticket.
+- Do not change `CODEX_HOME` / `$HOME/.codex` lookup behavior in this ticket.
+- A future Insomnia-owned Codex login/token store could be designed separately if needed, but it should be a dedicated OAuth token-store design, not an implicit use of the simple key-value API-key store.
 
 ## Phases within this ticket
 
@@ -117,10 +125,11 @@ The store must not know that a key is Anthropic, Brave, OpenAI, or any other pro
 4. WebSearch integration
    - add a secret-ref credential path;
    - make Brave search usable without env credentials.
-5. Docs and migration
+5. Docs and env removal
    - update `docs/environment.md` and manifest/profile docs;
    - document the modest security target honestly;
-   - point users to `insomnia keys` and secret refs as the normal credential path.
+   - point users to `insomnia keys` and secret refs as the credential path;
+   - remove credential env configuration from normal provider/WebSearch docs and code paths.
 
 ## Non-goals
 
@@ -130,7 +139,7 @@ The store must not know that a key is Anthropic, Brave, OpenAI, or any other pro
 - Provider-specific secret-store schema.
 - Automatic provider-name-to-secret-id lookup.
 - Loading `.env` files.
-- Changing Codex OAuth behavior unless a narrow integration need appears.
+- Changing Codex OAuth behavior. Codex OAuth remains an external structured token-source integration in this ticket.
 - Reworking model/provider catalog ownership.
 
 ## Acceptance criteria
@@ -141,6 +150,6 @@ The store must not know that a key is Anthropic, Brave, OpenAI, or any other pro
 - Provider `AuthRef::SecretRef` resolves through the store and does not print/serialize plaintext.
 - WebSearch can use a configured secret ref without exporting an environment variable.
 - Missing key, invalid id, unreadable store, and decode/decrypt failure produce clear fail-closed errors naming only the key id.
-- `docs/environment.md` no longer presents credential env vars as the normal path and documents the limited protection goal.
+- `docs/environment.md` no longer presents credential env vars as the normal path, removes normal provider/WebSearch credential env configuration, and documents the limited protection goal.
 - Focused tests cover store round-trip, id validation, decode failure, provider secret-ref resolution, WebSearch secret-ref resolution, and no-plaintext debug/serialization paths where applicable.
 - `cargo fmt --check`, relevant crate tests/checks, `./tickets.sh doctor`, and `git diff --check` pass.

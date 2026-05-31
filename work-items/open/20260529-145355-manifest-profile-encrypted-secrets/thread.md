@@ -185,3 +185,22 @@ Validation should include focused tests for id validation, store round-trip, dec
 
 
 ---
+
+<!-- event: decision author: hare at: 2026-05-31T21:23:46Z -->
+
+## Decision
+
+Decision update:
+- Migration/backward compatibility for credential environment variables is not required.
+- The implementation should remove credential env configuration from the normal provider/WebSearch path rather than keep env fallback as a compatibility layer.
+- Docs should point to `insomnia keys` + explicit secret refs as the credential path.
+
+Codex OAuth relationship:
+- Codex OAuth should not be connected to this key-value API-key store in this ticket.
+- The current Codex integration interoperates with Codex CLI's structured `auth.json` token bundle and refresh behavior.
+- That is a different credential shape than `id -> secret string` API keys.
+- Keep `CODEX_HOME` / `$HOME/.codex` behavior unchanged for this ticket.
+- If Insomnia later owns Codex login/token storage, design it as a separate OAuth token-store feature, not as an implicit use of the simple key-value store.
+
+
+---
