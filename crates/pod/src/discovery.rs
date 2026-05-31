@@ -14,9 +14,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use insomnia::PodRuntimeCommand;
 use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use manifest::{Permission, ScopeRule};
-use pod_command::PodRuntimeCommand;
 use pod_store::{PodActiveSegmentRef, PodMetadata, PodMetadataStore};
 use protocol::stream::JsonLineReader;
 use protocol::{Event, PodStatus};
@@ -329,10 +329,11 @@ where
         pod_name: &str,
         socket_path: &Path,
     ) -> Result<(), PodDiscoveryError> {
-        let pod_command = PodRuntimeCommand::resolve().map_err(PodDiscoveryError::RestoreSpawn)?;
-        let mut command = Command::new(pod_command.program());
+        let runtime_command =
+            PodRuntimeCommand::resolve().map_err(PodDiscoveryError::RestoreSpawn)?;
+        let mut command = Command::new(runtime_command.program());
         command
-            .args(pod_command.prefix_args())
+            .args(runtime_command.prefix_args())
             .arg("--pod")
             .arg(pod_name)
             .arg("--require-pod-state")

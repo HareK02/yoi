@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use insomnia::PodRuntimeCommand;
 use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use manifest::{
     CompactionConfigPartial, FileUploadLimitsPartial, Permission, PermissionConfigPartial,
@@ -19,7 +20,6 @@ use manifest::{
     ProfileRegistrySource, ProfileResolveOptions, ProfileResolver, ProfileSelector, ScopeConfig,
     ScopeRule, SessionConfigPartial, SharedScope, ToolOutputLimitsPartial, WorkerManifestConfig,
 };
-use pod_command::PodRuntimeCommand;
 use serde::Deserialize;
 use tokio::net::UnixStream;
 use tokio::process::Command;
@@ -409,7 +409,7 @@ impl SpawnPodTool {
         spawn_config_json: &str,
         predicted_socket: &Path,
     ) -> Result<(), ToolError> {
-        let pod_command = PodRuntimeCommand::resolve().map_err(|error| {
+        let runtime_command = PodRuntimeCommand::resolve().map_err(|error| {
             ToolError::ExecutionFailed(format!("failed to resolve Pod runtime command: {error}"))
         })?;
 
@@ -432,8 +432,8 @@ impl SpawnPodTool {
             ToolError::ExecutionFailed(format!("open {}: {e}", stderr_path.display()))
         })?;
 
-        let mut cmd = Command::new(pod_command.program());
-        cmd.args(pod_command.prefix_args())
+        let mut cmd = Command::new(runtime_command.program());
+        cmd.args(runtime_command.prefix_args())
             .arg("--adopt")
             .arg("--callback")
             .arg(&self.callback_socket)
@@ -446,7 +446,7 @@ impl SpawnPodTool {
             .process_group(0);
 
         let child = cmd.spawn().map_err(|e| {
-            ToolError::ExecutionFailed(format!("failed to spawn `{pod_command}`: {e}"))
+            ToolError::ExecutionFailed(format!("failed to spawn `{runtime_command}`: {e}"))
         })?;
 
         // Default `kill_on_drop = false` keeps the process alive after

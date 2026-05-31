@@ -332,8 +332,8 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 name = "client"
 version = "0.1.0"
 dependencies = [
+ "insomnia",
  "manifest",
- "pod-command",
  "protocol",
  "serde_json",
  "tokio",
@@ -1481,6 +1481,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "insomnia"
+version = "0.1.0"
+
+[[package]]
 name = "instability"
 version = "0.3.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2334,12 +2338,12 @@ dependencies = [
  "fs4",
  "futures",
  "include_dir",
+ "insomnia",
  "libc",
  "llm-worker",
  "manifest",
  "memory",
  "minijinja",
- "pod-command",
  "pod-registry",
  "pod-store",
  "protocol",
@@ -2358,10 +2362,6 @@ dependencies = [
  "uuid",
  "workflow",
 ]
-
-[[package]]
-name = "pod-command"
-version = "0.1.0"
 
 [[package]]
 name = "pod-registry"

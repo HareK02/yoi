@@ -141,7 +141,7 @@ fn accept_one_method(listener: UnixListener) -> tokio::task::JoinHandle<Option<M
     })
 }
 
-fn point_pod_command_at_true() {
+fn point_runtime_command_at_true() {
     let path = which_true();
     unsafe {
         std::env::set_var("INSOMNIA_POD_COMMAND", &path);
@@ -224,7 +224,7 @@ async fn spawn_pod_delegates_scope_and_sends_run() {
     let allow_root = TempDir::new().unwrap();
     let (_tmp, runtime_base, spawner_socket, spawner_rd) =
         setup_spawner("root", allow_root.path()).await;
-    point_pod_command_at_true();
+    point_runtime_command_at_true();
 
     let (_predicted_socket, listener) = bind_mock_pod_socket(&runtime_base, "child").await;
     let received = accept_one_method(listener);
@@ -317,7 +317,7 @@ async fn spawn_pod_rejects_scope_outside_spawner() {
     let outside = TempDir::new().unwrap();
     let (_tmp, runtime_base, spawner_socket, spawner_rd) =
         setup_spawner("root", allow_root.path()).await;
-    point_pod_command_at_true();
+    point_runtime_command_at_true();
 
     let registry = SpawnedPodRegistry::new(spawner_rd);
     let spawner_scope = shared_scope_for(allow_root.path());
@@ -379,7 +379,7 @@ async fn spawn_pod_rolls_back_reservation_when_socket_never_appears() {
     let allow_root = TempDir::new().unwrap();
     let (_tmp, runtime_base, spawner_socket, spawner_rd) =
         setup_spawner("root", allow_root.path()).await;
-    point_pod_command_at_true();
+    point_runtime_command_at_true();
 
     // Deliberately do NOT bind a socket at the predicted path. The
     // tool's wait_for_socket should time out, triggering rollback.

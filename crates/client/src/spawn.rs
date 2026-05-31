@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use pod_command::PodRuntimeCommand;
+use insomnia::PodRuntimeCommand;
 use tokio::process::Command;
 use uuid::Uuid;
 
@@ -100,7 +100,7 @@ pub async fn spawn_pod<F>(config: SpawnConfig, mut progress: F) -> Result<SpawnR
 where
     F: FnMut(&str),
 {
-    let pod_command = PodRuntimeCommand::resolve().map_err(SpawnError::Io)?;
+    let runtime_command = PodRuntimeCommand::resolve().map_err(SpawnError::Io)?;
 
     let pod_runtime_dir = manifest::paths::pod_runtime_dir(&config.pod_name)
         .ok_or(SpawnError::RuntimeDirUnavailable)?;
@@ -108,9 +108,9 @@ where
     let stderr_path = pod_runtime_dir.join("stderr.log");
     let stderr_file = std::fs::File::create(&stderr_path).map_err(SpawnError::Io)?;
 
-    let mut command = Command::new(pod_command.program());
+    let mut command = Command::new(runtime_command.program());
     command
-        .args(pod_command.prefix_args())
+        .args(runtime_command.prefix_args())
         .current_dir(&config.cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::null())

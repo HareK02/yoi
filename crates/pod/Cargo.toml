@@ -14,7 +14,7 @@ pod-store = { workspace = true }
 manifest = { workspace = true }
 protocol = { workspace = true }
 provider = { workspace = true }
-pod-command = { workspace = true }
+insomnia = { workspace = true }
 pod-registry = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
