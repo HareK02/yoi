@@ -2,7 +2,7 @@
 
 INSOMNIA では、プロセス境界で本当に必要な場合を除き、環境変数の利用を避ける。新しい ambient な入力を増やすより、明示的な profile / manifest / config file / typed secret reference / CLI argument を優先する。
 
-それでも、path discovery、runtime directory、package resource lookup、外部 provider の credential 慣習との移行互換のために、一部の環境変数はまだサポートしている。この文書に載せた環境変数は公開 surface として扱う。ただし、fallback 変数は独立した設定項目ではなく、対応する main key の解決順の一部として扱う。開発・テスト都合だけの環境変数は原則として追加せず、既存のものも削除する。
+それでも、path discovery、runtime directory、package resource lookup、外部 provider の credential 慣習との移行互換のために、一部の環境変数はまだサポートしている。この文書に載せた環境変数は公開 surface として扱う。ただし、fallback 変数は独立した設定項目ではなく、対応する main key の解決順の一部として扱う。開発・テスト都合だけの環境変数は追加しない。
 
 ## 原則
 
@@ -61,9 +61,9 @@ Provider credential は、現在は manifest / profile / catalog の設定から
 
 Credential env var は interoperability のために現時点では残っているが、長期的に望ましい secret mechanism ではない。現時点では適切なら `auth.file` を優先し、今後は typed secret reference へ寄せる。credential UX のために implicit `.env` loading を追加しないこと。project secret を漏らしやすく、profile ごとの credential model とも相性が悪い。
 
-## Build / example / test 変数
+## Build / example variables
 
-これらは通常の application configuration ではない。test-only の user-facing env var は supported surface として立てず、既存のものも active code/tests から削除する。test が public env behavior を検証する必要がある場合だけ、shared guard / test-support crate で process environment mutation を閉じ込める。
+これらは通常の application configuration ではない。
 
 | 変数 | Context | 備考 |
 | --- | --- | --- |
@@ -73,23 +73,13 @@ Credential env var は interoperability のために現時点では残ってい�
 | `RUST_LOG` | example / dev diagnostics。 | example CLI が tracing setup 経由で読む場合がある。 |
 | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY` などの provider example vars | `llm-worker` や Pod example / fixture recorder。 | example code が `dotenv::dotenv().ok()` を呼ぶことがある。通常の `insomnia` runtime startup には適用されない。 |
 
-## deprecated または意図的に存在しない surface
-
-- `INSOMNIA_USER_MANIFEST` は通常の profile-based Pod/TUI startup の一部ではない。one-file manifest の debug / compatibility path には `insomnia pod --manifest <PATH>` を使う。
-- ambient `.insomnia/manifest.toml` discovery は通常の fresh startup の一部ではない。
-- Pod runtime command の環境変数 override は提供しない。Pod runtime は `insomnia pod ...` の typed command として起動する。
-- 開発・テスト専用の環境変数は supported surface にしない。
-- `insomnia-pod` は installed command ではない。Pod runtime は `insomnia pod ...` から起動する。
-- 通常 runtime は `.env` ファイルを load しない。
-
 ## 整理方針
 
 環境変数に関わるコードを触る場合は、以下を優先する。
 
-1. test-only env var を削除し、public env behavior を検証する test だけを shared guard / test-support crate に集約する。
+1. public env behavior を検証する test の process environment mutation は shared guard / test-support crate に集約する。
 2. path resolution は `manifest::paths` に集約し、path precedence rule を別の場所で重複実装しない。
 3. credential source は resolved config 上で明示し、process-env convention を増やすより typed secret reference へ寄せる。encrypted secret store 導入時に credential env var 依存を削除する。
-4. Pod runtime 起動は環境変数ではなく `current_exe() + ["pod"]` の typed command に一本化する。
-5. fallback env は独立した設定項目として増やさず、対応する main key の解決順として文書化する。
-6. 空の env value は、変数 category に応じて unset / invalid のどちらとして扱うかを一貫させ、新しい supported variable を追加する場合は挙動を文書化する。
-7. 外部 process integration が env inheritance / filtering を必要とする場合は、ambient な inherited process state に頼らず、明示的な policy boundary として設計する。
+4. fallback env は独立した設定項目として増やさず、対応する main key の解決順として文書化する。
+5. 空の env value は、変数 category に応じて unset / invalid のどちらとして扱うかを一貫させ、新しい supported variable を追加する場合は挙動を文書化する。
+6. 外部 process integration が env inheritance / filtering を必要とする場合は、ambient な inherited process state に頼らず、明示的な policy boundary として設計する。
