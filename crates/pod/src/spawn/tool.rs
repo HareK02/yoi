@@ -2,7 +2,7 @@
 //!
 //! Wires pod-registry delegation, child manifest-config construction, subprocess
 //! launch, and socket handoff into a single `Tool` implementation. When
-//! the LLM calls `SpawnPod`, a fresh `insomnia-pod` binary is exec'd in its own
+//! the LLM calls `SpawnPod`, a fresh Pod runtime command is exec'd in its own
 //! process group, the pod-registry is updated atomically, and the child's
 //! first turn is kicked off by handing its socket a `Method::Run`.
 
@@ -19,6 +19,7 @@ use manifest::{
     ProfileRegistrySource, ProfileResolveOptions, ProfileResolver, ProfileSelector, ScopeConfig,
     ScopeRule, SessionConfigPartial, SharedScope, ToolOutputLimitsPartial, WorkerManifestConfig,
 };
+use pod_command::PodRuntimeCommand;
 use serde::Deserialize;
 use tokio::net::UnixStream;
 use tokio::process::Command;
@@ -408,8 +409,9 @@ impl SpawnPodTool {
         spawn_config_json: &str,
         predicted_socket: &Path,
     ) -> Result<(), ToolError> {
-        let pod_command =
-            std::env::var("INSOMNIA_POD_COMMAND").unwrap_or_else(|_| "insomnia-pod".into());
+        let pod_command = PodRuntimeCommand::resolve().map_err(|error| {
+            ToolError::ExecutionFailed(format!("failed to resolve Pod runtime command: {error}"))
+        })?;
 
         // Pre-create the child's runtime dir so we have a stable place to
         // capture its stderr before it has had a chance to bind anything.
@@ -430,8 +432,9 @@ impl SpawnPodTool {
             ToolError::ExecutionFailed(format!("open {}: {e}", stderr_path.display()))
         })?;
 
-        let mut cmd = Command::new(&pod_command);
-        cmd.arg("--adopt")
+        let mut cmd = Command::new(pod_command.program());
+        cmd.args(pod_command.prefix_args())
+            .arg("--adopt")
             .arg("--callback")
             .arg(&self.callback_socket)
             .arg("--spawn-config-json")
@@ -488,7 +491,7 @@ fn parse_scope(rules: &[ScopeRuleInput]) -> Result<Vec<ScopeRule>, ToolError> {
 }
 
 /// Serialise the internal manifest config that gets handed to the child
-/// `insomnia-pod` binary via the hidden `--spawn-config-json` flag.
+/// Pod runtime process via the hidden `--spawn-config-json` flag.
 /// `PodManifestConfig`'s `Serialize` impl is the single source of truth for the
 /// internal handoff shape.
 ///

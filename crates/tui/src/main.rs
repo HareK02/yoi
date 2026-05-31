@@ -65,7 +65,7 @@ enum Mode {
         profile: Option<String>,
     },
     /// `insomnia <name>` / `insomnia --pod <name>`: attach to a live Pod by name if
-    /// possible; otherwise launch `insomnia-pod --pod <name>` so the pod process
+    /// possible; otherwise launch the Pod runtime command with `--pod <name>` so it
     /// resumes from name-keyed state or creates a fresh same-name Pod.
     PodName {
         pod_name: String,
