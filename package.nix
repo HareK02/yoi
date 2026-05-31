@@ -40,7 +40,7 @@ rustPlatform.buildRustPackage rec {
     filter = sourceFilter;
   };
 
-  cargoHash = "sha256-8TAJLV7+7Th4o5Jpsyqz+n9kiuB0FO6qxGi559otfko=";
+  cargoHash = "sha256-fisV77ZqAPsI0eLZIqw06HTj1CfmnL3NBHhjruZPZUE=";
 
   depsExtraArgs = {
     # nixpkgs 25.11's fetchCargoVendor still uses crates.io's API
@@ -83,8 +83,6 @@ rustPlatform.buildRustPackage rec {
 
   cargoBuildFlags = [
     "-p"
-    "pod"
-    "-p"
     "tui"
   ];
 
@@ -103,8 +101,9 @@ rustPlatform.buildRustPackage rec {
   installCheckPhase = ''
     runHook preInstallCheck
 
-    "$out/bin/insomnia-pod" --help >/dev/null
+    "$out/bin/insomnia" pod --help >/dev/null
     test -x "$out/bin/insomnia"
+    test ! -e "$out/bin/insomnia-pod"
     if "$out/bin/insomnia" --session not-a-uuid 2>insomnia.err; then
       echo "insomnia unexpectedly accepted an invalid --session value" >&2
       exit 1

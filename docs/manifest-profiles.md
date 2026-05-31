@@ -26,14 +26,14 @@ return profile {
 Run an explicit path with:
 
 ```sh
-insomnia-pod --profile ./coder.lua
+insomnia pod --profile ./coder.lua
 # or through the TUI fresh-spawn dialog
 insomnia --profile ./coder.lua
 ```
 
 `--profile` accepts an explicit path, `path:<path>`, a discovered profile name, `default`, or a source-qualified name such as `project:coder`, `user:coder`, or `builtin:coder`. Path-like values containing `/`, starting with `.`, or ending in `.lua` are explicit paths. ``.nix` paths are no longer supported as profiles and fail with a diagnostic that points users at Lua profiles or `--manifest`.
 
-`--profile` conflicts with `insomnia-pod --manifest` and with restore/session/adopt modes. Use `--profile-pod-name <name>` when a launcher needs a creation-time Pod name override without invoking `--pod` restore semantics. Profile evaluation is a creation-time path; Pod resume restores saved Pod state/resolved snapshots rather than re-evaluating the profile source.
+`--profile` conflicts with `insomnia pod --manifest` and with restore/session/adopt modes. Use `--profile-pod-name <name>` when a launcher needs a creation-time Pod name override without invoking `--pod` restore semantics. Profile evaluation is a creation-time path; Pod resume restores saved Pod state/resolved snapshots rather than re-evaluating the profile source.
 
 ## Controlled Lua environment
 
@@ -81,7 +81,7 @@ The fresh-spawn TUI also uses discovery. The new Pod dialog defaults to the sele
 
 ## One-file manifests
 
-`insomnia-pod --manifest <PATH>` remains as an explicit compatibility/debug path. It reads exactly that TOML file, resolves relative paths against the file's parent directory, merges builtin defaults, and validates through the same `PodManifestConfig -> PodManifest` boundary as profile artifacts. It does not load user or project `manifest.toml` files and conflicts with `--profile`.
+`insomnia pod --manifest <PATH>` remains as an explicit compatibility/debug path. It reads exactly that TOML file, resolves relative paths against the file's parent directory, merges builtin defaults, and validates through the same `PodManifestConfig -> PodManifest` boundary as profile artifacts. It does not load user or project `manifest.toml` files and conflicts with `--profile`.
 
 Ambient user/project `manifest.toml` cascade startup has been removed. Normal fresh spawns use profile discovery/default selection, with `profiles.toml` acting only as a profile registry/default selector.
 

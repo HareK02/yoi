@@ -191,7 +191,7 @@ fn load_single_manifest(
 }
 
 pub async fn run_cli() -> ExitCode {
-    run_cli_from("insomnia-pod", std::env::args_os().skip(1)).await
+    run_cli_from("insomnia pod", std::env::args_os().skip(1)).await
 }
 
 pub async fn run_cli_from<I, T>(bin_name: &'static str, args: I) -> ExitCode
@@ -444,7 +444,7 @@ permission = "write"
     #[test]
     fn user_manifest_flag_is_not_accepted() {
         let err =
-            Cli::try_parse_from(["insomnia-pod", "--user-manifest", "manifest.toml"]).unwrap_err();
+            Cli::try_parse_from(["insomnia pod", "--user-manifest", "manifest.toml"]).unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
     }
 
@@ -460,7 +460,7 @@ permission = "write"
     #[test]
     fn manifest_conflicts_with_project() {
         let project_err = Cli::try_parse_from([
-            "insomnia-pod",
+            "insomnia pod",
             "--manifest",
             "manifest.toml",
             "--project",
@@ -472,7 +472,7 @@ permission = "write"
 
     #[test]
     fn overlay_flag_is_not_accepted() {
-        let err = Cli::try_parse_from(["insomnia-pod", "--overlay", "pod.name = 'x'"]).unwrap_err();
+        let err = Cli::try_parse_from(["insomnia pod", "--overlay", "pod.name = 'x'"]).unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
     }
 
@@ -481,7 +481,7 @@ permission = "write"
         let tmp = TempDir::new().unwrap();
         let manifest = tmp.path().join("manifest.toml");
         write(&manifest, &manifest_toml("single", tmp.path()));
-        let cli = Cli::try_parse_from(["insomnia-pod", "--manifest", manifest.to_str().unwrap()])
+        let cli = Cli::try_parse_from(["insomnia pod", "--manifest", manifest.to_str().unwrap()])
             .unwrap();
 
         let (manifest, loader) = resolve_manifest(&cli).unwrap();
@@ -496,7 +496,7 @@ permission = "write"
         let tmp = TempDir::new().unwrap();
         let profile = tmp.path().join("profile.lua");
         let cli = Cli::try_parse_from([
-            "insomnia-pod",
+            "insomnia pod",
             "--profile",
             profile.to_str().unwrap(),
             "--profile-pod-name",
@@ -529,7 +529,7 @@ permission = "write"
     fn profile_accepts_source_qualified_discovered_name() {
         let tmp = TempDir::new().unwrap();
         let cli = Cli::try_parse_from([
-            "insomnia-pod",
+            "insomnia pod",
             "--profile",
             "project:coder",
             "--profile-pod-name",
@@ -564,7 +564,7 @@ permission = "write"
     #[test]
     fn normal_startup_uses_default_profile() {
         let tmp = TempDir::new().unwrap();
-        let cli = Cli::try_parse_from(["insomnia-pod"]).unwrap();
+        let cli = Cli::try_parse_from(["insomnia pod"]).unwrap();
         let mut called = false;
 
         let (manifest, _loader) =
@@ -585,7 +585,7 @@ permission = "write"
 
     #[test]
     fn project_flag_no_longer_enables_ambient_manifest_cascade() {
-        let cli = Cli::try_parse_from(["insomnia-pod", "--project", "."]).unwrap();
+        let cli = Cli::try_parse_from(["insomnia pod", "--project", "."]).unwrap();
         let err = resolve_manifest_with_profile_loader(&cli, |_, _| {
             panic!("default profile loader must not run when deprecated --project is present")
         })
@@ -597,7 +597,7 @@ permission = "write"
     fn pod_flag_conflicts_with_session() {
         let segment_id = session_store::new_segment_id();
         let segment_id = segment_id.to_string();
-        let err = Cli::try_parse_from(["insomnia-pod", "--pod", "agent", "--session", &segment_id])
+        let err = Cli::try_parse_from(["insomnia pod", "--pod", "agent", "--session", &segment_id])
             .unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
@@ -608,7 +608,7 @@ permission = "write"
         let manifest = tmp.path().join("manifest.toml");
         write(&manifest, &manifest_toml("from-file", tmp.path()));
         let cli = Cli::try_parse_from([
-            "insomnia-pod",
+            "insomnia pod",
             "--manifest",
             manifest.to_str().unwrap(),
             "--pod",
@@ -640,7 +640,7 @@ permission = "write"
 "#,
         );
         let cli = Cli::try_parse_from([
-            "insomnia-pod",
+            "insomnia pod",
             "--manifest",
             manifest.to_str().unwrap(),
             "--pod",
@@ -657,7 +657,7 @@ permission = "write"
     #[test]
     fn pod_flag_with_no_manifest_creates_from_default_profile_with_typed_name() {
         let tmp = TempDir::new().unwrap();
-        let cli = Cli::try_parse_from(["insomnia-pod", "--pod", "agent"]).unwrap();
+        let cli = Cli::try_parse_from(["insomnia pod", "--pod", "agent"]).unwrap();
         let mut called = false;
 
         let (manifest, _loader) =
@@ -683,10 +683,10 @@ permission = "write"
     fn profile_conflicts_with_manifest_and_restore_modes() {
         let segment_id = session_store::new_segment_id().to_string();
         for args in [
-            vec!["insomnia-pod", "--profile", "p.lua", "--manifest", "m.toml"],
-            vec!["insomnia-pod", "--profile", "p.lua", "--pod", "agent"],
+            vec!["insomnia pod", "--profile", "p.lua", "--manifest", "m.toml"],
+            vec!["insomnia pod", "--profile", "p.lua", "--pod", "agent"],
             vec![
-                "insomnia-pod",
+                "insomnia pod",
                 "--profile",
                 "p.lua",
                 "--session",
@@ -700,14 +700,14 @@ permission = "write"
 
     #[test]
     fn profile_pod_name_requires_profile() {
-        let err = Cli::try_parse_from(["insomnia-pod", "--profile-pod-name", "agent"]).unwrap_err();
+        let err = Cli::try_parse_from(["insomnia pod", "--profile-pod-name", "agent"]).unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
     }
 
     #[test]
     fn profile_pod_name_is_not_restore_pod_flag() {
         let cli = Cli::try_parse_from([
-            "insomnia-pod",
+            "insomnia pod",
             "--profile",
             "p.lua",
             "--profile-pod-name",
@@ -726,7 +726,7 @@ permission = "write"
         std::fs::create_dir_all(tmp.path().join("prompts")).unwrap();
         std::fs::create_dir_all(tmp.path().join(".insomnia").join("prompts")).unwrap();
         let cli = Cli::try_parse_from([
-            "insomnia-pod",
+            "insomnia pod",
             "--manifest",
             single_manifest.to_str().unwrap(),
         ])

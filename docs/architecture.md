@@ -103,7 +103,7 @@ permission = "write"
 
 通常の Pod 起動は Lua profile discovery/default から `PodManifest` を生成する。bundled `builtin:default` が fallback default で、user/project `profiles.toml` は profile registry と default selection だけを担う。user/project `manifest.toml` の ambient cascade は通常起動では使わない。
 
-`insomnia-pod --manifest <PATH>` は explicit one-file compatibility/debug input で、指定 TOML 1 枚だけに builtin defaults を merge し、`PodManifestConfig -> PodManifest` の required validation を通す。
+`insomnia pod --manifest <PATH>` は explicit one-file compatibility/debug input で、指定 TOML 1 枚だけに builtin defaults を merge し、`PodManifestConfig -> PodManifest` の required validation を通す。
 
 `PodFactory` の user/project/overlay API は低レベル構成部品として残るが、CLI の通常起動 path では generic TOML overlay を公開しない。
 
