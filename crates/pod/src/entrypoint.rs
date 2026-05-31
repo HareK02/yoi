@@ -1,0 +1,743 @@
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+
+use crate::{Pod, PodController, PromptLoader};
+use clap::{CommandFactory, FromArgMatches, Parser};
+use manifest::{
+    PodManifest, PodManifestConfig, ProfileResolveOptions, ProfileResolver, ProfileSelector, paths,
+};
+use pod_store::{CombinedStore, FsPodStore, PodMetadataStore};
+use session_store::{FsStore, SegmentId, Store};
+
+#[derive(Debug, Parser)]
+#[command(about = "Spawn a Pod process from a profile or a single manifest file")]
+struct Cli {
+    /// Profile to evaluate. Accepts an explicit path, `path:<path>`, a
+    /// discovered profile name, `default`, or a source-qualified name such as
+    /// `project:coder`.
+    #[arg(
+        long,
+        value_name = "PROFILE",
+        conflicts_with_all = ["manifest", "project", "pod", "session", "adopt"]
+    )]
+    profile: Option<String>,
+
+    /// Pod name override for a freshly-created profile Pod. This does not use
+    /// `--pod` restore semantics, so it must not attach/restore existing Pod
+    /// state by re-evaluating the profile source.
+    #[arg(long, value_name = "NAME", requires = "profile", conflicts_with_all = ["pod", "session", "adopt"])]
+    profile_pod_name: Option<String>,
+
+    /// Manifest TOML to use directly as a one-file compatibility/debug input.
+    /// This bypasses profile discovery but still applies builtin defaults and
+    /// the same required-field validation boundary.
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["project"])]
+    manifest: Option<PathBuf>,
+
+    /// Deprecated manifest-cascade project root flag. Ambient project/user
+    /// manifest discovery has been removed; configure/select a profile instead.
+    #[arg(long, value_name = "PATH")]
+    project: Option<PathBuf>,
+
+    /// Internal typed pod-name override for session restore launched by the TUI.
+    #[arg(long, value_name = "NAME", requires = "session", hide = true)]
+    session_pod_name: Option<String>,
+
+    /// Internal resolved manifest config for delegated child Pod spawning.
+    #[arg(
+        long,
+        value_name = "JSON",
+        requires = "adopt",
+        conflicts_with_all = ["profile", "manifest", "project", "pod", "session"],
+        hide = true
+    )]
+    spawn_config_json: Option<String>,
+
+    /// Directory for session persistence. Defaults to
+    /// `<data_dir>/sessions/` (see `manifest::paths`).
+    #[arg(short, long)]
+    store: Option<PathBuf>,
+
+    /// Claim a scope allocation pre-registered by a spawning Pod, rather
+    /// than installing a new top-level allocation. Used only when this
+    /// process is launched by `SpawnPod`; end users should never pass it.
+    #[arg(long)]
+    adopt: bool,
+
+    /// Socket path of the spawning Pod, for delivering `Method::Notify`
+    /// callbacks upward. Required alongside `--adopt`.
+    #[arg(long, value_name = "PATH", requires = "adopt")]
+    callback: Option<PathBuf>,
+
+    /// Resume or create a Pod by name. If name-keyed Pod state exists,
+    /// the active session/segment recorded there is restored; otherwise a
+    /// fresh top-level Pod is created with this name.
+    #[arg(long, value_name = "NAME", conflicts_with_all = ["session", "adopt"])]
+    pod: Option<String>,
+
+    /// Require `--pod` to restore existing Pod state instead of creating a
+    /// fresh Pod when no state exists. Used by Pod discovery restore flows.
+    #[arg(long, requires = "pod")]
+    require_pod_state: bool,
+
+    /// Restore a Pod from an existing session. The Pod re-uses the
+    /// given session id and appends new turns to the same jsonl;
+    /// concurrent writers are prevented by the pod-registry.
+    /// Mutually exclusive with `--adopt` (spawned children always start
+    /// fresh).
+    #[arg(long, value_name = "UUID", conflicts_with_all = ["adopt", "pod"])]
+    session: Option<SegmentId>,
+}
+
+fn resolve_manifest(cli: &Cli) -> Result<(PodManifest, PromptLoader), String> {
+    resolve_manifest_with_profile_loader(cli, load_profile)
+}
+
+fn resolve_manifest_with_profile_loader<F>(
+    cli: &Cli,
+    load_profile_fn: F,
+) -> Result<(PodManifest, PromptLoader), String>
+where
+    F: FnOnce(&ProfileSelector, Option<&str>) -> Result<(PodManifest, PromptLoader), String>,
+{
+    let mut manifest_and_loader = if let Some(config_json) = cli.spawn_config_json.as_deref() {
+        load_spawn_config_json(config_json)?
+    } else if let Some(profile) = &cli.profile {
+        let selector = ProfileSelector::parse_cli(profile);
+        load_profile_fn(&selector, cli.profile_pod_name.as_deref())?
+    } else if let Some(path) = &cli.manifest {
+        load_single_manifest(path, cli.pod.as_deref())?
+    } else {
+        if cli.project.is_some() {
+            return Err(
+                "--project is no longer supported; normal startup uses profile discovery/default, \
+                 and --manifest <PATH> is the only one-file manifest mode"
+                    .to_string(),
+            );
+        }
+        let selector = ProfileSelector::Default;
+        load_profile_fn(&selector, cli.pod.as_deref())?
+    };
+
+    apply_session_restore_overrides(&mut manifest_and_loader.0, cli)?;
+    Ok(manifest_and_loader)
+}
+
+fn apply_session_restore_overrides(manifest: &mut PodManifest, cli: &Cli) -> Result<(), String> {
+    if let Some(pod_name) = cli.session_pod_name.as_deref() {
+        manifest.pod.name = pod_name.to_string();
+    }
+    Ok(())
+}
+
+fn load_spawn_config_json(config_json: &str) -> Result<(PodManifest, PromptLoader), String> {
+    let config = serde_json::from_str::<PodManifestConfig>(config_json)
+        .map_err(|e| format!("failed to parse --spawn-config-json: {e}"))?;
+    let manifest = PodManifest::try_from(PodManifestConfig::builtin_defaults().merge(config))
+        .map_err(|e| format!("failed to resolve --spawn-config-json: {e}"))?;
+    Ok((manifest, PromptLoader::builtins_only()))
+}
+
+fn load_profile(
+    selector: &ProfileSelector,
+    pod_name_override: Option<&str>,
+) -> Result<(PodManifest, PromptLoader), String> {
+    let cwd = std::env::current_dir()
+        .map_err(|e| format!("failed to resolve current directory for profile: {e}"))?;
+    let resolver = ProfileResolver::new().with_workspace_base(cwd);
+    let options = pod_name_override
+        .map(ProfileResolveOptions::with_pod_name)
+        .unwrap_or_default();
+    let resolved = resolver.resolve(selector, options).map_err(|e| {
+        format!(
+            "failed to resolve profile {}: {e}",
+            selector.display_label()
+        )
+    })?;
+    Ok((resolved.manifest, PromptLoader::builtins_only()))
+}
+
+fn load_single_manifest(
+    path: &Path,
+    pod_name_override: Option<&str>,
+) -> Result<(PodManifest, PromptLoader), String> {
+    let toml = std::fs::read_to_string(path)
+        .map_err(|e| format!("failed to read manifest {}: {e}", path.display()))?;
+    let absolute_path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| format!("failed to resolve current directory: {e}"))?
+            .join(path)
+    };
+    let base_dir = absolute_path.parent().ok_or_else(|| {
+        format!(
+            "manifest path {} has no parent directory",
+            absolute_path.display()
+        )
+    })?;
+    let mut config = PodManifestConfig::builtin_defaults().merge(
+        PodManifestConfig::from_toml(&toml)
+            .map_err(|e| format!("failed to parse manifest {}: {e}", path.display()))?
+            .resolve_paths(base_dir),
+    );
+    if let Some(pod_name) = pod_name_override {
+        config.pod.name = Some(pod_name.to_string());
+    }
+    let manifest = PodManifest::try_from(config)
+        .map_err(|e| format!("failed to resolve manifest {}: {e}", path.display()))?;
+    Ok((manifest, PromptLoader::builtins_only()))
+}
+
+pub async fn run_cli() -> ExitCode {
+    run_cli_from("insomnia-pod", std::env::args_os().skip(1)).await
+}
+
+pub async fn run_cli_from<I, T>(bin_name: &'static str, args: I) -> ExitCode
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString>,
+{
+    let cli = match parse_cli_from(bin_name, args) {
+        Ok(cli) => cli,
+        Err(err) => {
+            let code = err.exit_code();
+            if let Err(print_err) = err.print() {
+                eprintln!("error: failed to write CLI error: {print_err}");
+            }
+            return exit_code_from_i32(code);
+        }
+    };
+
+    run_cli_inner(cli).await
+}
+
+fn parse_cli_from<I, T>(bin_name: &'static str, args: I) -> Result<Cli, clap::Error>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString>,
+{
+    let argv = std::iter::once(OsString::from(bin_name))
+        .chain(args.into_iter().map(Into::into))
+        .collect::<Vec<_>>();
+    let matches = Cli::command()
+        .name(bin_name)
+        .bin_name(bin_name)
+        .try_get_matches_from(argv)?;
+    Cli::from_arg_matches(&matches)
+}
+
+fn exit_code_from_i32(code: i32) -> ExitCode {
+    match code {
+        0 => ExitCode::SUCCESS,
+        1 => ExitCode::FAILURE,
+        code => ExitCode::from(code.clamp(0, u8::MAX as i32) as u8),
+    }
+}
+
+async fn run_cli_inner(cli: Cli) -> ExitCode {
+    let (mut manifest, loader) = match resolve_manifest(&cli) {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Initialize persistent store. `paths::sessions_dir()` only
+    // returns None when none of INSOMNIA_HOME / INSOMNIA_DATA_DIR /
+    // HOME is set — surface that as a hard error to match the
+    // runtime-dir resolution below, rather than silently writing to a
+    // relative path under cwd.
+    let store_dir = match cli.store.clone() {
+        Some(p) => p,
+        None => match paths::sessions_dir() {
+            Some(d) => d,
+            None => {
+                eprintln!(
+                    "error: could not resolve sessions directory \
+                     (set --store, INSOMNIA_HOME, INSOMNIA_DATA_DIR, or HOME)"
+                );
+                return ExitCode::FAILURE;
+            }
+        },
+    };
+    let session_store = match FsStore::new(&store_dir) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: failed to initialize session store at {store_dir:?}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let pod_store_dir = match paths::data_dir() {
+        Some(data_dir) => data_dir.join("pods"),
+        None => store_dir
+            .parent()
+            .map(|parent| parent.join("pods"))
+            .unwrap_or_else(|| PathBuf::from("pods")),
+    };
+    let pod_store = match FsPodStore::new(&pod_store_dir) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: failed to initialize pod store at {pod_store_dir:?}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let store = CombinedStore::new(session_store, pod_store);
+
+    let pod = if cli.adopt {
+        let callback = match cli.callback.clone() {
+            Some(p) => p,
+            None => {
+                eprintln!("error: --adopt requires --callback");
+                return ExitCode::FAILURE;
+            }
+        };
+        match Pod::from_manifest_spawned(manifest, store, loader, callback).await {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("error: failed to create spawned pod: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else if let Some(source_segment_id) = cli.session {
+        let source_session_id = match store.lookup_session_of(source_segment_id) {
+            Ok(Some(sid)) => sid,
+            Ok(None) => {
+                eprintln!(
+                    "error: --session {source_segment_id}: segment is not registered to any session"
+                );
+                return ExitCode::FAILURE;
+            }
+            Err(e) => {
+                eprintln!("error: lookup_session_of failed: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        match Pod::restore_from_manifest(
+            source_session_id,
+            source_segment_id,
+            manifest,
+            store,
+            loader,
+        )
+        .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("error: failed to restore pod: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else if let Some(pod_name) = cli.pod.as_deref() {
+        manifest.pod.name = pod_name.to_string();
+        match store.read_by_name(pod_name) {
+            Ok(Some(_)) => {
+                match Pod::restore_from_pod_metadata(pod_name, manifest, store, loader).await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("error: failed to restore pod {pod_name}: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+            Ok(None) if cli.require_pod_state => {
+                eprintln!("error: pod state missing for {pod_name}");
+                return ExitCode::FAILURE;
+            }
+            Ok(None) => match Pod::from_manifest(manifest, store, loader).await {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("error: failed to create pod {pod_name}: {e}");
+                    return ExitCode::FAILURE;
+                }
+            },
+            Err(e) => {
+                eprintln!("error: failed to read pod state for {pod_name}: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        match Pod::from_manifest(manifest, store, loader).await {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("error: failed to create pod: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    };
+    let pod_name = pod.manifest().pod.name.clone();
+
+    // Spawn the controller (starts socket server)
+    let runtime_base = match paths::runtime_dir() {
+        Some(d) => d,
+        None => {
+            eprintln!(
+                "error: could not resolve runtime directory \
+                 (set INSOMNIA_HOME, INSOMNIA_RUNTIME_DIR, XDG_RUNTIME_DIR, or HOME)"
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    let (handle, shutdown_rx) = match PodController::spawn(pod, &runtime_base).await {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln!("error: failed to start pod controller: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let socket_path = handle.runtime_dir.socket_path();
+    // Machine-readable ready line for parents that spawned this Pod
+    // (e.g. the TUI's interactive `spawn` flow). Tab-separated so a
+    // pod name with spaces still parses cleanly. Emit before the
+    // human line so a stderr-watching parent sees it first.
+    eprintln!("INSOMNIA-READY\t{pod_name}\t{}", socket_path.display());
+    eprintln!("pod: {pod_name} listening on {:?}", socket_path);
+
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            eprintln!("pod: {pod_name} shutting down (signal)");
+        }
+        _ = shutdown_rx => {
+            eprintln!("pod: {pod_name} shutting down (client request)");
+        }
+    }
+
+    drop(handle);
+    ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn write(path: &Path, contents: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, contents).unwrap();
+    }
+
+    fn manifest_toml(name: &str, scope: &Path) -> String {
+        format!(
+            r#"
+[pod]
+name = "{name}"
+
+[model]
+scheme = "anthropic"
+model_id = "test-model"
+
+[worker]
+
+[[scope.allow]]
+target = "{scope}"
+permission = "write"
+"#,
+            scope = scope.display()
+        )
+    }
+
+    #[test]
+    fn user_manifest_flag_is_not_accepted() {
+        let err =
+            Cli::try_parse_from(["insomnia-pod", "--user-manifest", "manifest.toml"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+
+    #[test]
+    fn subcommand_help_uses_insomnia_pod_invocation() {
+        let err = parse_cli_from("insomnia pod", ["--help"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
+        let help = err.to_string();
+        assert!(help.contains("Usage: insomnia pod"), "{help}");
+        assert!(help.contains("--pod <NAME>"), "{help}");
+    }
+
+    #[test]
+    fn manifest_conflicts_with_project() {
+        let project_err = Cli::try_parse_from([
+            "insomnia-pod",
+            "--manifest",
+            "manifest.toml",
+            "--project",
+            ".",
+        ])
+        .unwrap_err();
+        assert_eq!(project_err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn overlay_flag_is_not_accepted() {
+        let err = Cli::try_parse_from(["insomnia-pod", "--overlay", "pod.name = 'x'"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+
+    #[test]
+    fn manifest_loads_single_file_without_user_or_workspace_prompt_loader() {
+        let tmp = TempDir::new().unwrap();
+        let manifest = tmp.path().join("manifest.toml");
+        write(&manifest, &manifest_toml("single", tmp.path()));
+        let cli = Cli::try_parse_from(["insomnia-pod", "--manifest", manifest.to_str().unwrap()])
+            .unwrap();
+
+        let (manifest, loader) = resolve_manifest(&cli).unwrap();
+
+        assert_eq!(manifest.pod.name, "single");
+        assert!(loader.user_dir().is_none());
+        assert!(loader.workspace_dir().is_none());
+    }
+
+    #[test]
+    fn profile_uses_selected_profile() {
+        let tmp = TempDir::new().unwrap();
+        let profile = tmp.path().join("profile.lua");
+        let cli = Cli::try_parse_from([
+            "insomnia-pod",
+            "--profile",
+            profile.to_str().unwrap(),
+            "--profile-pod-name",
+            "from-profile-name",
+        ])
+        .unwrap();
+        let mut called = false;
+
+        let (manifest, loader) =
+            resolve_manifest_with_profile_loader(&cli, |selector, pod_name| {
+                called = true;
+                assert_eq!(selector, &ProfileSelector::path(profile.clone()));
+                assert_eq!(pod_name, Some("from-profile-name"));
+                let mut manifest =
+                    PodManifest::from_toml(&manifest_toml("from-profile", tmp.path())).unwrap();
+                if let Some(pod_name) = pod_name {
+                    manifest.pod.name = pod_name.to_string();
+                }
+                Ok((manifest, PromptLoader::builtins_only()))
+            })
+            .unwrap();
+
+        assert!(called);
+        assert_eq!(manifest.pod.name, "from-profile-name");
+        assert!(loader.user_dir().is_none());
+        assert!(loader.workspace_dir().is_none());
+    }
+
+    #[test]
+    fn profile_accepts_source_qualified_discovered_name() {
+        let tmp = TempDir::new().unwrap();
+        let cli = Cli::try_parse_from([
+            "insomnia-pod",
+            "--profile",
+            "project:coder",
+            "--profile-pod-name",
+            "from-profile-name",
+        ])
+        .unwrap();
+        let mut called = false;
+
+        let (manifest, _loader) =
+            resolve_manifest_with_profile_loader(&cli, |selector, pod_name| {
+                called = true;
+                assert_eq!(
+                    selector,
+                    &ProfileSelector::source_named(
+                        manifest::ProfileRegistrySource::Project,
+                        "coder"
+                    )
+                );
+                let mut manifest =
+                    PodManifest::from_toml(&manifest_toml("from-profile", tmp.path())).unwrap();
+                if let Some(pod_name) = pod_name {
+                    manifest.pod.name = pod_name.to_string();
+                }
+                Ok((manifest, PromptLoader::builtins_only()))
+            })
+            .unwrap();
+
+        assert!(called);
+        assert_eq!(manifest.pod.name, "from-profile-name");
+    }
+
+    #[test]
+    fn normal_startup_uses_default_profile() {
+        let tmp = TempDir::new().unwrap();
+        let cli = Cli::try_parse_from(["insomnia-pod"]).unwrap();
+        let mut called = false;
+
+        let (manifest, _loader) =
+            resolve_manifest_with_profile_loader(&cli, |selector, pod_name| {
+                called = true;
+                assert_eq!(selector, &ProfileSelector::Default);
+                assert_eq!(pod_name, None);
+                let manifest =
+                    PodManifest::from_toml(&manifest_toml("from-default-profile", tmp.path()))
+                        .unwrap();
+                Ok((manifest, PromptLoader::builtins_only()))
+            })
+            .unwrap();
+
+        assert!(called);
+        assert_eq!(manifest.pod.name, "from-default-profile");
+    }
+
+    #[test]
+    fn project_flag_no_longer_enables_ambient_manifest_cascade() {
+        let cli = Cli::try_parse_from(["insomnia-pod", "--project", "."]).unwrap();
+        let err = resolve_manifest_with_profile_loader(&cli, |_, _| {
+            panic!("default profile loader must not run when deprecated --project is present")
+        })
+        .unwrap_err();
+        assert!(err.contains("--project is no longer supported"));
+    }
+
+    #[test]
+    fn pod_flag_conflicts_with_session() {
+        let segment_id = session_store::new_segment_id();
+        let segment_id = segment_id.to_string();
+        let err = Cli::try_parse_from(["insomnia-pod", "--pod", "agent", "--session", &segment_id])
+            .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn pod_flag_sets_requested_name_after_manifest_resolution() {
+        let tmp = TempDir::new().unwrap();
+        let manifest = tmp.path().join("manifest.toml");
+        write(&manifest, &manifest_toml("from-file", tmp.path()));
+        let cli = Cli::try_parse_from([
+            "insomnia-pod",
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--pod",
+            "from-flag",
+        ])
+        .unwrap();
+
+        let (manifest, _loader) = resolve_manifest(&cli).unwrap();
+
+        assert_eq!(manifest.pod.name, "from-flag");
+    }
+
+    #[test]
+    fn pod_flag_supplies_missing_name_for_single_manifest() {
+        let tmp = TempDir::new().unwrap();
+        let manifest = tmp.path().join("manifest.toml");
+        write(
+            &manifest,
+            r#"
+[pod]
+
+[model]
+scheme = "anthropic"
+model_id = "test-model"
+
+[[scope.allow]]
+target = "."
+permission = "write"
+"#,
+        );
+        let cli = Cli::try_parse_from([
+            "insomnia-pod",
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--pod",
+            "from-flag",
+        ])
+        .unwrap();
+
+        let (manifest, _loader) = resolve_manifest(&cli).unwrap();
+
+        assert_eq!(manifest.pod.name, "from-flag");
+        assert_eq!(manifest.scope.allow[0].target, tmp.path());
+    }
+
+    #[test]
+    fn pod_flag_with_no_manifest_creates_from_default_profile_with_typed_name() {
+        let tmp = TempDir::new().unwrap();
+        let cli = Cli::try_parse_from(["insomnia-pod", "--pod", "agent"]).unwrap();
+        let mut called = false;
+
+        let (manifest, _loader) =
+            resolve_manifest_with_profile_loader(&cli, |selector, pod_name| {
+                called = true;
+                assert_eq!(selector, &ProfileSelector::Default);
+                assert_eq!(pod_name, Some("agent"));
+                let mut manifest =
+                    PodManifest::from_toml(&manifest_toml("from-default-profile", tmp.path()))
+                        .unwrap();
+                if let Some(pod_name) = pod_name {
+                    manifest.pod.name = pod_name.to_string();
+                }
+                Ok((manifest, PromptLoader::builtins_only()))
+            })
+            .unwrap();
+
+        assert!(called);
+        assert_eq!(manifest.pod.name, "agent");
+    }
+
+    #[test]
+    fn profile_conflicts_with_manifest_and_restore_modes() {
+        let segment_id = session_store::new_segment_id().to_string();
+        for args in [
+            vec!["insomnia-pod", "--profile", "p.lua", "--manifest", "m.toml"],
+            vec!["insomnia-pod", "--profile", "p.lua", "--pod", "agent"],
+            vec![
+                "insomnia-pod",
+                "--profile",
+                "p.lua",
+                "--session",
+                &segment_id,
+            ],
+        ] {
+            let err = Cli::try_parse_from(args).unwrap_err();
+            assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+        }
+    }
+
+    #[test]
+    fn profile_pod_name_requires_profile() {
+        let err = Cli::try_parse_from(["insomnia-pod", "--profile-pod-name", "agent"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn profile_pod_name_is_not_restore_pod_flag() {
+        let cli = Cli::try_parse_from([
+            "insomnia-pod",
+            "--profile",
+            "p.lua",
+            "--profile-pod-name",
+            "agent",
+        ])
+        .unwrap();
+        assert_eq!(cli.profile_pod_name.as_deref(), Some("agent"));
+        assert!(cli.pod.is_none());
+    }
+
+    #[test]
+    fn manifest_mode_loads_single_file_with_minimal_prompt_loader() {
+        let tmp = TempDir::new().unwrap();
+        let single_manifest = tmp.path().join("single.toml");
+        write(&single_manifest, &manifest_toml("single-file", tmp.path()));
+        std::fs::create_dir_all(tmp.path().join("prompts")).unwrap();
+        std::fs::create_dir_all(tmp.path().join(".insomnia").join("prompts")).unwrap();
+        let cli = Cli::try_parse_from([
+            "insomnia-pod",
+            "--manifest",
+            single_manifest.to_str().unwrap(),
+        ])
+        .unwrap();
+
+        let (manifest, loader) = resolve_manifest(&cli).unwrap();
+
+        assert_eq!(manifest.pod.name, "single-file");
+        assert!(loader.user_dir().is_none());
+        assert!(loader.workspace_dir().is_none());
+        assert!(loader.user_pack_file().is_none());
+        assert!(loader.workspace_pack_file().is_none());
+    }
+}

@@ -83,6 +83,8 @@ enum Mode {
     Multi,
     /// `insomnia memory lint`: headless lint for workspace memory and knowledge files.
     MemoryLint(memory_lint::LintCliOptions),
+    /// `insomnia pod ...`: run the Pod runtime parser/entrypoint without TUI side effects.
+    PodRuntime(Vec<String>),
 }
 
 #[derive(Debug)]
@@ -119,6 +121,9 @@ where
     {
         let options = memory_lint::parse_lint_args(&args[2..]).map_err(ParseError::MemoryLint)?;
         return Ok(Mode::MemoryLint(options));
+    }
+    if args.first().map(String::as_str) == Some("pod") {
+        return Ok(Mode::PodRuntime(args[1..].to_vec()));
     }
 
     let mut resume = false;
@@ -285,6 +290,10 @@ async fn main() -> ExitCode {
         };
     }
 
+    if let Mode::PodRuntime(args) = mode {
+        return pod::entrypoint::run_cli_from("insomnia pod", args).await;
+    }
+
     if let Err(e) = enable_raw_mode() {
         eprintln!("insomnia: failed to enter raw mode: {e}");
         return ExitCode::FAILURE;
@@ -305,6 +314,7 @@ async fn main() -> ExitCode {
         Mode::ResumeWithSession(id) => run_spawn(Some(id), None).await,
         Mode::Multi => run_multi().await,
         Mode::MemoryLint(_) => unreachable!("memory lint returns before terminal setup"),
+        Mode::PodRuntime(_) => unreachable!("pod runtime returns before terminal setup"),
     };
 
     // Always restore the terminal first so any pending eprintln below
@@ -1204,6 +1214,28 @@ mod tests {
                 socket_override,
             } => {
                 assert_eq!(pod_name, "memory");
+                assert_eq!(socket_override, None);
+            }
+            _ => panic!("expected PodName mode"),
+        }
+    }
+
+    #[test]
+    fn parse_pod_subcommand_uses_runtime_mode() {
+        match parse_args_from(["pod", "--pod", "agent", "--profile", "default"]).unwrap() {
+            Mode::PodRuntime(args) => assert_eq!(args, ["--pod", "agent", "--profile", "default"]),
+            _ => panic!("expected PodRuntime mode"),
+        }
+    }
+
+    #[test]
+    fn parse_literal_pod_name_still_available_with_flag() {
+        match parse_args_from(["--pod", "pod"]).unwrap() {
+            Mode::PodName {
+                pod_name,
+                socket_override,
+            } => {
+                assert_eq!(pod_name, "pod");
                 assert_eq!(socket_override, None);
             }
             _ => panic!("expected PodName mode"),
