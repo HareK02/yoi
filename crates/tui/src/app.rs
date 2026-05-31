@@ -16,7 +16,7 @@ use crate::command::{
 use crate::input::InputBuffer;
 use crate::scroll::Scroll;
 use crate::task::TaskStore;
-use crate::ui::Mode;
+use crate::view_mode::Mode;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandCompletionApply {
