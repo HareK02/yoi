@@ -2,12 +2,12 @@
 id: 20260531-223506-memory-prompt-conditional-lookup
 slug: memory-prompt-conditional-lookup
 title: Memory prompt: conditional guidance and proactive lookup
-status: open
+status: closed
 kind: task
 priority: P2
 labels: [memory, prompts, tools]
 created_at: 2026-05-31T22:35:06Z
-updated_at: 2026-05-31T22:51:36Z
+updated_at: 2026-05-31T22:52:35Z
 assignee: null
 legacy_ticket: null
 ---
