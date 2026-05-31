@@ -2,12 +2,12 @@
 id: 20260531-110818-remove-resource-dir
 slug: remove-resource-dir
 title: Manifest: remove filesystem resource_dir dependency
-status: open
+status: closed
 kind: task
 priority: P2
 labels: [manifest, profile, nix, env, cleanup]
 created_at: 2026-05-31T11:08:18Z
-updated_at: 2026-05-31T11:54:28Z
+updated_at: 2026-05-31T11:58:28Z
 assignee: null
 legacy_ticket: null
 ---
