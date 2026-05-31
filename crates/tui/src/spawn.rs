@@ -15,7 +15,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use client::{SpawnConfig, spawn_pod};
+use client::{PodRuntimeCommand, SpawnConfig, spawn_pod};
 use crossterm::event::{self, Event as TermEvent, KeyCode, KeyEventKind, KeyModifiers};
 use manifest::ProfileDiscovery;
 use ratatui::Terminal;
@@ -76,6 +76,7 @@ type InlineTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 pub async fn run(
     resume_from: Option<SegmentId>,
     profile: Option<String>,
+    runtime_command: PodRuntimeCommand,
 ) -> Result<SpawnOutcome, SpawnError> {
     let defaults = load_spawn_defaults()?;
     let mut profile_choices = if resume_from.is_some() {
@@ -143,7 +144,7 @@ pub async fn run(
     form.message = Some(("starting pod...".to_string(), MessageKind::Progress));
     terminal.draw(|f| draw_form(f, &form))?;
 
-    match wait_for_ready(&mut terminal, &mut form).await {
+    match wait_for_ready(&mut terminal, &mut form, &runtime_command).await {
         Ok(ready) => {
             form.message = Some((
                 format!("ready: {}  attaching...", ready.pod_name),
@@ -165,13 +166,16 @@ pub async fn run(
 /// Launch a Pod runtime command with `--pod <name>` without opening the name dialog. The child Pod
 /// resolves persisted Pod metadata if present, or creates a fresh same-name Pod
 /// from the default profile.
-pub async fn run_pod_name(pod_name: String) -> Result<SpawnOutcome, SpawnError> {
+pub async fn run_pod_name(
+    pod_name: String,
+    runtime_command: PodRuntimeCommand,
+) -> Result<SpawnOutcome, SpawnError> {
     let defaults = load_spawn_defaults()?;
     let mut form = form_for_pod_name(pod_name, defaults);
     let mut terminal = make_inline_terminal()?;
     terminal.draw(|f| draw_form(f, &form))?;
 
-    match wait_for_ready(&mut terminal, &mut form).await {
+    match wait_for_ready(&mut terminal, &mut form, &runtime_command).await {
         Ok(ready) => {
             form.message = Some((
                 format!("ready: {}  attaching...", ready.pod_name),
@@ -360,8 +364,10 @@ fn sanitise_default_name(s: &str) -> String {
 async fn wait_for_ready(
     terminal: &mut InlineTerminal,
     form: &mut Form,
+    runtime_command: &PodRuntimeCommand,
 ) -> Result<SpawnReady, SpawnError> {
     let config = SpawnConfig {
+        runtime_command: runtime_command.clone(),
         pod_name: form.name.clone(),
         profile: form.selected_profile_selector(),
         cwd: form.cwd.clone(),
@@ -687,7 +693,10 @@ description = "Project coder"
 
         let (choices, default_index) = profile_choices_for_cwd(&project);
         assert_eq!(choices[0].selector.as_deref(), Some("builtin:default"));
-        assert_eq!(choices[0].label, "builtin:default");
+        assert_eq!(
+            choices[0].label,
+            "builtin:default — Bundled default Insomnia coding profile"
+        );
         assert_eq!(default_index, 1);
         assert_eq!(choices[1].selector.as_deref(), Some("project:coder"));
         assert_eq!(choices[1].label, "project:coder (default) — Project coder");

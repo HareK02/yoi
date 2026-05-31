@@ -4,7 +4,6 @@ mod cache;
 mod command;
 mod input;
 mod markdown;
-mod memory_lint;
 mod multi_pod;
 mod picker;
 mod pod_list;
@@ -39,7 +38,7 @@ use ratatui::backend::CrosstermBackend;
 use session_store::SegmentId;
 use tokio::sync::mpsc;
 
-use client::PodClient;
+use client::{PodClient, PodRuntimeCommand};
 
 use crate::app::{ActionbarNoticeLevel, ActionbarNoticeSource, App};
 use crate::picker::PickerOutcome;
@@ -59,8 +58,14 @@ fn resolve_socket(pod_name: &str, override_path: Option<PathBuf>) -> PathBuf {
     })
 }
 
-#[derive(Debug)]
-enum Mode {
+#[derive(Debug, Clone)]
+pub struct LaunchOptions {
+    pub mode: LaunchMode,
+    pub runtime_command: PodRuntimeCommand,
+}
+
+#[derive(Debug, Clone)]
+pub enum LaunchMode {
     Spawn {
         profile: Option<String>,
     },
@@ -81,218 +86,13 @@ enum Mode {
     /// separate from `-r`/`--resume`, which keeps its single-Pod picker
     /// meaning.
     Multi,
-    /// `insomnia memory lint`: headless lint for workspace memory and knowledge files.
-    MemoryLint(memory_lint::LintCliOptions),
-    /// `insomnia pod ...`: run the Pod runtime parser/entrypoint without TUI side effects.
-    PodRuntime(Vec<String>),
 }
 
-#[derive(Debug)]
-enum ParseError {
-    Conflict(&'static str),
-    InvalidSession(String),
-    MemoryLint(memory_lint::UsageError),
-    MissingValue(&'static str),
-}
-
-impl std::fmt::Display for ParseError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Conflict(message) => write!(f, "{message}"),
-            Self::InvalidSession(s) => write!(f, "invalid --session UUID: {s}"),
-            Self::MemoryLint(err) => write!(f, "{err}"),
-            Self::MissingValue(flag) => write!(f, "{flag} requires a value"),
-        }
-    }
-}
-
-fn parse_args() -> Result<Mode, ParseError> {
-    parse_args_from(std::env::args().skip(1))
-}
-
-fn parse_args_from<I, S>(args: I) -> Result<Mode, ParseError>
-where
-    I: IntoIterator<Item = S>,
-    S: Into<String>,
-{
-    let args: Vec<String> = args.into_iter().map(Into::into).collect();
-    if args.first().map(String::as_str) == Some("memory")
-        && args.get(1).map(String::as_str) == Some("lint")
-    {
-        let options = memory_lint::parse_lint_args(&args[2..]).map_err(ParseError::MemoryLint)?;
-        return Ok(Mode::MemoryLint(options));
-    }
-    if args.first().map(String::as_str) == Some("pod") {
-        return Ok(Mode::PodRuntime(args[1..].to_vec()));
-    }
-
-    let mut resume = false;
-    let mut multi = false;
-    let mut session: Option<SegmentId> = None;
-    let mut pod: Option<String> = None;
-    let mut profile: Option<String> = None;
-    let mut socket_override: Option<PathBuf> = None;
-    let mut socket_seen = false;
-    let mut positional: Option<String> = None;
-
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "-r" | "--resume" => {
-                resume = true;
-                i += 1;
-            }
-            "--multi" => {
-                multi = true;
-                i += 1;
-            }
-            "--session" => {
-                let raw = args
-                    .get(i + 1)
-                    .ok_or(ParseError::MissingValue("--session"))?;
-                session = Some(
-                    raw.parse::<SegmentId>()
-                        .map_err(|_| ParseError::InvalidSession(raw.clone()))?,
-                );
-                i += 2;
-            }
-            "--pod" => {
-                let raw = args.get(i + 1).ok_or(ParseError::MissingValue("--pod"))?;
-                pod = Some(raw.clone());
-                i += 2;
-            }
-            "--profile" => {
-                let raw = args
-                    .get(i + 1)
-                    .ok_or(ParseError::MissingValue("--profile"))?;
-                profile = Some(raw.clone());
-                i += 2;
-            }
-            "--socket" => {
-                socket_seen = true;
-                let raw = args
-                    .get(i + 1)
-                    .ok_or(ParseError::MissingValue("--socket"))?;
-                socket_override = Some(PathBuf::from(raw));
-                i += 2;
-            }
-            other if positional.is_none() && !other.starts_with('-') => {
-                positional = Some(other.to_string());
-                i += 1;
-            }
-            _ => {
-                // Unknown flag or extra positional — keep older
-                // behaviour of ignoring unknowns rather than aborting.
-                i += 1;
-            }
-        }
-    }
-
-    if multi {
-        if resume {
-            return Err(ParseError::Conflict(
-                "--multi and --resume are mutually exclusive",
-            ));
-        }
-        if session.is_some() {
-            return Err(ParseError::Conflict(
-                "--multi and --session are mutually exclusive",
-            ));
-        }
-        if pod.is_some() {
-            return Err(ParseError::Conflict(
-                "--multi and --pod are mutually exclusive",
-            ));
-        }
-        if positional.is_some() {
-            return Err(ParseError::Conflict(
-                "--multi cannot be used with a positional Pod name",
-            ));
-        }
-        if socket_seen {
-            return Err(ParseError::Conflict(
-                "--multi and --socket are mutually exclusive",
-            ));
-        }
-        if profile.is_some() {
-            return Err(ParseError::Conflict(
-                "--multi and --profile are mutually exclusive",
-            ));
-        }
-        return Ok(Mode::Multi);
-    }
-
-    if resume && session.is_some() {
-        return Err(ParseError::Conflict(
-            "--resume and --session are mutually exclusive",
-        ));
-    }
-    if pod.is_some() && session.is_some() {
-        return Err(ParseError::Conflict(
-            "--pod and --session are mutually exclusive",
-        ));
-    }
-    if pod.is_some() && resume {
-        return Err(ParseError::Conflict(
-            "--pod and --resume are mutually exclusive",
-        ));
-    }
-    if profile.is_some()
-        && (resume || session.is_some() || pod.is_some() || positional.is_some() || socket_seen)
-    {
-        return Err(ParseError::Conflict(
-            "--profile can only be used for fresh spawn",
-        ));
-    }
-
-    if let Some(pod_name) = pod {
-        return Ok(Mode::PodName {
-            pod_name,
-            socket_override,
-        });
-    }
-    if let Some(id) = session {
-        return Ok(Mode::ResumeWithSession(id));
-    }
-    if resume {
-        return Ok(Mode::Resume);
-    }
-    if let Some(pod_name) = positional {
-        return Ok(Mode::PodName {
-            pod_name,
-            socket_override,
-        });
-    }
-    Ok(Mode::Spawn { profile })
-}
-
-#[tokio::main]
-async fn main() -> ExitCode {
-    let mode = match parse_args() {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("insomnia: {e}");
-            return match e {
-                ParseError::MemoryLint(_) => ExitCode::from(2),
-                _ => ExitCode::FAILURE,
-            };
-        }
-    };
-
-    if let Mode::MemoryLint(ref options) = mode {
-        return match memory_lint::run(options) {
-            Ok(memory_lint::LintStatus::Clean) => ExitCode::SUCCESS,
-            Ok(memory_lint::LintStatus::Failed) => ExitCode::FAILURE,
-            Err(err) => {
-                eprintln!("insomnia: {err}");
-                ExitCode::from(2)
-            }
-        };
-    }
-
-    if let Mode::PodRuntime(args) = mode {
-        return pod::entrypoint::run_cli_from("insomnia pod", args).await;
-    }
+pub async fn launch(options: LaunchOptions) -> ExitCode {
+    let LaunchOptions {
+        mode,
+        runtime_command,
+    } = options;
 
     if let Err(e) = enable_raw_mode() {
         eprintln!("insomnia: failed to enter raw mode: {e}");
@@ -305,16 +105,14 @@ async fn main() -> ExitCode {
     }
 
     let result = match mode {
-        Mode::Spawn { profile } => run_spawn(None, profile).await,
-        Mode::PodName {
+        LaunchMode::Spawn { profile } => run_spawn(None, profile, runtime_command).await,
+        LaunchMode::PodName {
             pod_name,
             socket_override,
-        } => run_pod_name(pod_name, socket_override).await,
-        Mode::Resume => run_resume().await,
-        Mode::ResumeWithSession(id) => run_spawn(Some(id), None).await,
-        Mode::Multi => run_multi().await,
-        Mode::MemoryLint(_) => unreachable!("memory lint returns before terminal setup"),
-        Mode::PodRuntime(_) => unreachable!("pod runtime returns before terminal setup"),
+        } => run_pod_name(pod_name, socket_override, runtime_command).await,
+        LaunchMode::Resume => run_resume(runtime_command).await,
+        LaunchMode::ResumeWithSession(id) => run_spawn(Some(id), None, runtime_command).await,
+        LaunchMode::Multi => run_multi(runtime_command).await,
     };
 
     // Always restore the terminal first so any pending eprintln below
@@ -349,6 +147,7 @@ async fn main() -> ExitCode {
 async fn run_pod_name(
     pod_name: String,
     socket_override: Option<PathBuf>,
+    runtime_command: PodRuntimeCommand,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(client) = try_connect_live_pod(&pod_name, socket_override.clone()).await {
         let mut terminal = enter_fullscreen()?;
@@ -356,7 +155,7 @@ async fn run_pod_name(
         return Ok(());
     }
 
-    let ready = match spawn::run_pod_name(pod_name).await? {
+    let ready = match spawn::run_pod_name(pod_name, runtime_command).await? {
         SpawnOutcome::Ready(r) => r,
         SpawnOutcome::Cancelled => return Ok(()),
     };
@@ -380,6 +179,7 @@ async fn run_connected_pod(
 async fn run_pod_name_nested(
     terminal: &mut FullscreenTerminal,
     request: multi_pod::OpenPodRequest,
+    runtime_command: PodRuntimeCommand,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let multi_pod::OpenPodRequest {
         pod_name,
@@ -390,16 +190,17 @@ async fn run_pod_name_nested(
         return run_connected_pod(terminal, pod_name, client).await;
     }
 
-    let ready = spawn_pod_name_from_fullscreen(terminal, &pod_name).await?;
+    let ready = spawn_pod_name_from_fullscreen(terminal, &pod_name, runtime_command).await?;
     run_ready_pod(terminal, ready).await
 }
 
 async fn spawn_pod_name_from_fullscreen(
     terminal: &mut FullscreenTerminal,
     pod_name: &str,
+    runtime_command: PodRuntimeCommand,
 ) -> Result<SpawnReady, Box<dyn std::error::Error>> {
     leave_fullscreen(terminal)?;
-    let outcome = spawn::run_pod_name(pod_name.to_string()).await;
+    let outcome = spawn::run_pod_name(pod_name.to_string(), runtime_command).await;
     enter_fullscreen_existing(terminal)?;
     terminal.clear()?;
 
@@ -463,7 +264,7 @@ async fn connect_live_pod(
         .map(|client| (registry_socket, client))
 }
 
-async fn run_resume() -> Result<(), Box<dyn std::error::Error>> {
+async fn run_resume(runtime_command: PodRuntimeCommand) -> Result<(), Box<dyn std::error::Error>> {
     // Pick a Pod in its own inline viewport, dropping the viewport before
     // attaching/restoring so each phase gets fresh vertical room.
     let (pod_name, socket_override) = match picker::run().await? {
@@ -473,10 +274,10 @@ async fn run_resume() -> Result<(), Box<dyn std::error::Error>> {
         } => (pod_name, socket_override),
         PickerOutcome::Cancelled => return Ok(()),
     };
-    run_pod_name(pod_name, socket_override).await
+    run_pod_name(pod_name, socket_override, runtime_command).await
 }
 
-async fn run_multi() -> Result<(), Box<dyn std::error::Error>> {
+async fn run_multi(runtime_command: PodRuntimeCommand) -> Result<(), Box<dyn std::error::Error>> {
     let mut app = multi_pod::load_app().await?;
     let mut terminal = enter_fullscreen()?;
 
@@ -488,7 +289,7 @@ async fn run_multi() -> Result<(), Box<dyn std::error::Error>> {
             }
             multi_pod::MultiPodOutcome::Open(request) => {
                 let pod_name = request.pod_name.clone();
-                match run_pod_name_nested(&mut terminal, request).await {
+                match run_pod_name_nested(&mut terminal, request, runtime_command.clone()).await {
                     Ok(()) => app.finish_open(&pod_name, Ok(())),
                     Err(error) if is_recoverable_multi_open_error(error.as_ref()) => {
                         app.finish_open(&pod_name, Err(error.as_ref()));
@@ -511,8 +312,9 @@ fn is_recoverable_multi_open_error(error: &(dyn std::error::Error + 'static)) ->
 async fn run_spawn(
     resume_from: Option<SegmentId>,
     profile: Option<String>,
+    runtime_command: PodRuntimeCommand,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let ready = match spawn::run(resume_from, profile).await? {
+    let ready = match spawn::run(resume_from, profile, runtime_command).await? {
         SpawnOutcome::Ready(r) => r,
         SpawnOutcome::Cancelled => return Ok(()),
     };
@@ -1177,231 +979,6 @@ fn handle_pause_or_quit(app: &mut App) -> Option<Method> {
 mod tests {
     use super::*;
     use protocol::{Event, RewindTarget, RewindTargetId, Segment};
-
-    #[test]
-    fn parse_pod_name_mode() {
-        match parse_args_from(["--pod", "agent", "--socket", "/tmp/agent.sock"]).unwrap() {
-            Mode::PodName {
-                pod_name,
-                socket_override,
-            } => {
-                assert_eq!(pod_name, "agent");
-                assert_eq!(socket_override, Some(PathBuf::from("/tmp/agent.sock")));
-            }
-            _ => panic!("expected PodName mode"),
-        }
-    }
-
-    #[test]
-    fn parse_positional_name_uses_pod_name_mode() {
-        match parse_args_from(["agent"]).unwrap() {
-            Mode::PodName {
-                pod_name,
-                socket_override,
-            } => {
-                assert_eq!(pod_name, "agent");
-                assert_eq!(socket_override, None);
-            }
-            _ => panic!("expected PodName mode"),
-        }
-    }
-
-    #[test]
-    fn parse_memory_alone_remains_positional_pod_name() {
-        match parse_args_from(["memory"]).unwrap() {
-            Mode::PodName {
-                pod_name,
-                socket_override,
-            } => {
-                assert_eq!(pod_name, "memory");
-                assert_eq!(socket_override, None);
-            }
-            _ => panic!("expected PodName mode"),
-        }
-    }
-
-    #[test]
-    fn parse_pod_subcommand_uses_runtime_mode() {
-        match parse_args_from(["pod", "--pod", "agent", "--profile", "default"]).unwrap() {
-            Mode::PodRuntime(args) => assert_eq!(args, ["--pod", "agent", "--profile", "default"]),
-            _ => panic!("expected PodRuntime mode"),
-        }
-    }
-
-    #[test]
-    fn parse_literal_pod_name_still_available_with_flag() {
-        match parse_args_from(["--pod", "pod"]).unwrap() {
-            Mode::PodName {
-                pod_name,
-                socket_override,
-            } => {
-                assert_eq!(pod_name, "pod");
-                assert_eq!(socket_override, None);
-            }
-            _ => panic!("expected PodName mode"),
-        }
-    }
-
-    #[test]
-    fn parse_memory_lint_mode() {
-        match parse_args_from([
-            "memory",
-            "lint",
-            "--workspace",
-            "/tmp/ws",
-            "--json",
-            "--warnings-as-errors",
-        ])
-        .unwrap()
-        {
-            Mode::MemoryLint(options) => {
-                assert_eq!(options.workspace, Some(PathBuf::from("/tmp/ws")));
-                assert!(options.json);
-                assert!(options.warnings_as_errors);
-            }
-            _ => panic!("expected MemoryLint mode"),
-        }
-    }
-
-    #[test]
-    fn parse_memory_lint_rejects_usage_errors() {
-        let err = parse_args_from(["memory", "lint", "--workspace"]).unwrap_err();
-        assert_eq!(err.to_string(), "--workspace requires a value");
-    }
-
-    #[test]
-    fn parse_memory_lint_workspace_equals() {
-        match parse_args_from(["memory", "lint", "--workspace=/tmp/ws"]).unwrap() {
-            Mode::MemoryLint(options) => {
-                assert_eq!(options.workspace, Some(PathBuf::from("/tmp/ws")));
-                assert!(!options.json);
-                assert!(!options.warnings_as_errors);
-            }
-            _ => panic!("expected MemoryLint mode"),
-        }
-    }
-
-    #[test]
-    fn memory_lint_with_other_second_word_remains_positional_pod_name() {
-        match parse_args_from(["memory", "other"]).unwrap() {
-            Mode::PodName { pod_name, .. } => assert_eq!(pod_name, "memory"),
-            _ => panic!("expected PodName mode"),
-        }
-    }
-
-    #[test]
-    fn parse_rejects_pod_and_session() {
-        let segment_id = session_store::new_segment_id().to_string();
-        let err = parse_args_from(["--pod", "agent", "--session", &segment_id]).unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            "--pod and --session are mutually exclusive"
-        );
-    }
-
-    #[test]
-    fn parse_profile_spawn_mode() {
-        match parse_args_from(["--profile", "/profiles/coder.lua"]).unwrap() {
-            Mode::Spawn { profile } => {
-                assert_eq!(profile, Some("/profiles/coder.lua".to_string()));
-            }
-            _ => panic!("expected Spawn mode"),
-        }
-    }
-
-    #[test]
-    fn parse_profile_rejects_resume_attach_modes() {
-        let segment_id = session_store::new_segment_id().to_string();
-        let cases = [
-            (
-                vec![
-                    "--profile".to_string(),
-                    "p.lua".to_string(),
-                    "--resume".to_string(),
-                ],
-                "--profile can only be used for fresh spawn",
-            ),
-            (
-                vec![
-                    "--profile".to_string(),
-                    "p.lua".to_string(),
-                    "--session".to_string(),
-                    segment_id,
-                ],
-                "--profile can only be used for fresh spawn",
-            ),
-            (
-                vec![
-                    "--profile".to_string(),
-                    "p.lua".to_string(),
-                    "--socket".to_string(),
-                    "/tmp/insomnia/sock".to_string(),
-                ],
-                "--profile can only be used for fresh spawn",
-            ),
-            (
-                vec![
-                    "--profile".to_string(),
-                    "p.lua".to_string(),
-                    "agent".to_string(),
-                ],
-                "--profile can only be used for fresh spawn",
-            ),
-        ];
-
-        for (args, message) in cases {
-            let err = parse_args_from(args).unwrap_err();
-            assert_eq!(err.to_string(), message);
-        }
-    }
-
-    #[test]
-    fn parse_multi_mode() {
-        match parse_args_from(["--multi"]).unwrap() {
-            Mode::Multi => {}
-            _ => panic!("expected Multi mode"),
-        }
-    }
-
-    #[test]
-    fn parse_multi_conflicts_are_clear() {
-        let segment_id = session_store::new_segment_id().to_string();
-        let cases = [
-            (
-                vec!["--multi".to_string(), "--resume".to_string()],
-                "--multi and --resume are mutually exclusive",
-            ),
-            (
-                vec!["--multi".to_string(), "--session".to_string(), segment_id],
-                "--multi and --session are mutually exclusive",
-            ),
-            (
-                vec![
-                    "--multi".to_string(),
-                    "--pod".to_string(),
-                    "agent".to_string(),
-                ],
-                "--multi and --pod are mutually exclusive",
-            ),
-            (
-                vec!["--multi".to_string(), "agent".to_string()],
-                "--multi cannot be used with a positional Pod name",
-            ),
-            (
-                vec![
-                    "--multi".to_string(),
-                    "--socket".to_string(),
-                    "/tmp/a.sock".to_string(),
-                ],
-                "--multi and --socket are mutually exclusive",
-            ),
-        ];
-
-        for (args, message) in cases {
-            let err = parse_args_from(args).unwrap_err();
-            assert_eq!(err.to_string(), message);
-        }
-    }
 
     #[tokio::test]
     async fn terminal_event_is_selected_before_ready_pod_event() {
