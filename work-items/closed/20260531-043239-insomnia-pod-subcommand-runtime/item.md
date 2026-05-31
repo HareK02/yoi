@@ -2,12 +2,12 @@
 id: 20260531-043239-insomnia-pod-subcommand-runtime
 slug: insomnia-pod-subcommand-runtime
 title: CLI: add insomnia pod runtime entrypoint
-status: open
+status: closed
 kind: task
 priority: P2
 labels: [cli, pod, nix]
 created_at: 2026-05-31T04:32:39Z
-updated_at: 2026-05-31T04:46:53Z
+updated_at: 2026-05-31T04:50:14Z
 assignee: null
 legacy_ticket: null
 ---

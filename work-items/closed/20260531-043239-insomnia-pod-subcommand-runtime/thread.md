@@ -82,3 +82,31 @@ Non-blocking follow-ups:
 
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-05-31T04:50:13Z -->
+
+## Implementation report
+
+Main workspace validation after merge:
+
+- `cargo fmt --check` passed
+- `cargo test -p tui parse_` passed
+- `cargo test -p pod subcommand_help_uses_insomnia_pod_invocation` passed
+- `cargo run -q -p tui -- pod --help` smoke passed (`Usage: insomnia pod`, Pod runtime flags present)
+- `cargo run -q -p pod --bin insomnia-pod -- --help` smoke passed (`Usage: insomnia-pod`, Pod runtime flags present)
+- `cargo run -q -p tui -- memory lint` reached the headless command path. It exited `1` because the current generated `.insomnia/memory` contains existing lint errors, which is the expected lint-failure exit code; no TUI/Pod startup side effects were observed.
+- `cargo check -p tui -p pod -p client` passed with pre-existing dead-code warnings
+- `./tickets.sh doctor` passed
+- `git diff --check` passed
+
+
+---
+
+<!-- event: close author: hare at: 2026-05-31T04:50:14Z status: closed -->
+
+## Closed
+
+Added the first single-binary migration step: Pod runtime startup is now available as a shared `pod::entrypoint` library path, the existing `insomnia-pod` binary is a temporary thin wrapper, and the user-facing `insomnia` binary now supports `insomnia pod ...` with the same Pod runtime parser/help. Existing internal spawn defaults and Nix packaging are intentionally unchanged for this step. External review approved and validation passed.
+
+
+---
