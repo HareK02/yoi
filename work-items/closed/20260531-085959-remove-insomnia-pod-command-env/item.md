@@ -2,12 +2,12 @@
 id: 20260531-085959-remove-insomnia-pod-command-env
 slug: remove-insomnia-pod-command-env
 title: CLI: remove INSOMNIA_POD_COMMAND override
-status: open
+status: closed
 kind: task
 priority: P2
 labels: [cli, pod, env]
 created_at: 2026-05-31T08:59:59Z
-updated_at: 2026-05-31T10:09:52Z
+updated_at: 2026-05-31T10:12:03Z
 assignee: null
 legacy_ticket: null
 ---
