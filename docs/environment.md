@@ -2,7 +2,7 @@
 
 INSOMNIA では、プロセス境界で本当に必要な場合を除き、環境変数の利用を避ける。新しい ambient な入力を増やすより、明示的な profile / manifest / config file / typed secret reference / CLI argument を優先する。
 
-それでも、ユーザー設定や runtime directory の発見、package resource の発見、開発・テスト用 override、外部 provider の credential 慣習との互換のために、一部の環境変数はサポートしている。この文書に載せた環境変数は公開 surface として扱う。
+それでも、path discovery、runtime directory、package resource lookup、開発・テスト用 override、外部 provider の credential 慣習との互換のために、一部の環境変数はサポートしている。この文書に載せた環境変数は公開 surface として扱う。ただし、fallback 変数は独立した設定項目ではなく、対応する main key の解決順の一部として扱う。
 
 ## 原則
 
@@ -13,33 +13,37 @@ INSOMNIA では、プロセス境界で本当に必要な場合を除き、環�
 - path/location 用の環境変数、provider credential 用の環境変数、test/build-only の環境変数を混ぜない。
 - test が process environment を変更する必要がある場合は、guard で直列化し、元の値を復元する。Rust の process environment は global state である。
 
-## サポートしている runtime 環境変数
+## Path / resource discovery
 
-### Core config / data / resource path
+Path 系の環境変数は論理的な key ごとに立項する。`XDG_*` や `HOME` は単独の設定 surface ではなく、該当 key の fallback として読む。
 
-これらは `manifest::paths` で解決される、application path の主要 contract である。
-
-| 変数 | 用途 | 備考 |
-| --- | --- | --- |
-| `INSOMNIA_HOME` | Insomnia 管理下の config / data / runtime path の sandbox/root override。 | config は `$INSOMNIA_HOME/config`、data は `$INSOMNIA_HOME`、runtime は `$INSOMNIA_HOME/run` になる。test や isolated run で使う。 |
-| `INSOMNIA_CONFIG_DIR` | 明示的な user config directory。 | 最優先の config override。`profiles.toml`、prompt override、model/provider override などを置く。 |
-| `INSOMNIA_DATA_DIR` | 明示的な persistent data directory。 | 最優先の data override。session と Pod metadata を置く。 |
-| `INSOMNIA_RESOURCE_DIR` | 明示的な bundled resource directory。 | 主に packaging / development の resource lookup 用。通常の installed package では `share/insomnia/resources` を使う。 |
-| `XDG_CONFIG_HOME` | XDG config fallback。 | `INSOMNIA_CONFIG_DIR` と `INSOMNIA_HOME` が未設定の場合に `$XDG_CONFIG_HOME/insomnia` を使う。 |
-| `HOME` | 最終的な user config / data fallback。 | `$HOME/.config/insomnia`、`$HOME/.insomnia`、`$HOME/.insomnia/run` の fallback に使う。 |
+| 論理 key | Main env | Fallback / 解決順 | 用途と位置付け |
+| --- | --- | --- | --- |
+| `home` | `INSOMNIA_HOME` | なし | config / data / runtime をまとめて sandbox する root override。設定を細かく分けるより、test や isolated run ではまずこれを使う。 |
+| `config_dir` | `INSOMNIA_CONFIG_DIR` | `$INSOMNIA_HOME/config` → `$XDG_CONFIG_HOME/insomnia` → `$HOME/.config/insomnia` | 人が書く設定・override の置き場。`profiles.toml`、prompt override、model/provider override など。 |
+| `data_dir` | `INSOMNIA_DATA_DIR` | `$INSOMNIA_HOME` → `$HOME/.insomnia` | プログラムが書く永続データの置き場。session log、Pod metadata など、再起動後も restore / replay の根拠になるもの。通常ユーザー向けの primary knob ではなく、migration、test、isolated data store 用の advanced override。 |
+| `runtime_dir` | `INSOMNIA_RUNTIME_DIR` | `$INSOMNIA_HOME/run` → `$XDG_RUNTIME_DIR/insomnia` → `$HOME/.insomnia/run` | socket、pid/status file、live registry mirror など、再起動で捨ててよい runtime state の置き場。 |
+| `resource_dir` | `INSOMNIA_RESOURCE_DIR` | installed executable から見た `share/insomnia/resources` → build tree の `resources/` | bundled prompts、builtin profiles、provider/model catalog など、package が所有する immutable-ish な builtin asset の置き場。通常 user configuration ではなく、packaging / development / debug 用の override。 |
 
 空の path 環境変数は、`manifest::paths` では原則として unset 相当に扱う。
 
-### Runtime / socket / registry path
+### `data_dir` と `runtime_dir` の違い
 
-| 変数 | 用途 | 備考 |
-| --- | --- | --- |
-| `INSOMNIA_RUNTIME_DIR` | socket、pid/status file、live Pod registry file 用の明示的な runtime directory。 | 最優先の runtime override。test や isolated run でよく使う。 |
-| `XDG_RUNTIME_DIR` | runtime fallback。 | `INSOMNIA_RUNTIME_DIR` と `INSOMNIA_HOME` が未設定の場合に `$XDG_RUNTIME_DIR/insomnia` を使う。 |
+`data_dir` は durable data のための場所である。消すと session history、Pod metadata、restore/replay の根拠が失われる。
 
-Runtime state は durable authority ではない。replay / restore の durable source は session log と Pod metadata であり、socket や live registry file は runtime mirror / hint である。
+`runtime_dir` は process coordination のための場所である。socket、pid/status file、live Pod registry mirror などを置き、プロセス終了や再起動で stale になり得る。runtime state は durable authority ではない。session log と Pod metadata が durable source であり、runtime file は mirror / hint である。
 
-### Pod runtime command override
+このため、socket や pid file を `data_dir` に置かない。永続データと揮発 runtime state は分ける。
+
+### `resource_dir` と `config_dir` の違い
+
+`resource_dir` は package-owned builtin asset の場所である。installed package では `share/insomnia/resources` に置かれ、binary version と対応する。ユーザーが普段編集する場所ではない。
+
+`config_dir` は user/project-owned override の場所である。`profiles.toml` や prompt/model/provider override はここに置き、package update で上書きされない。
+
+つまり、builtin fallback は `resource_dir`、user override は `config_dir` で扱う。`INSOMNIA_RESOURCE_DIR` を user configuration の代わりに使わない。
+
+## Pod runtime command override
 
 | 変数 | 用途 | 備考 |
 | --- | --- | --- |
@@ -90,5 +94,6 @@ Credential env var は interoperability のために許容しているが、長�
 1. test env mutation を shared guard に集約し、unsafe な `set_var` / `remove_var` call を一箇所に閉じ込めて直列化する。
 2. path resolution は `manifest::paths` に集約し、path precedence rule を別の場所で重複実装しない。
 3. credential source は resolved config 上で明示し、process-env convention を増やすより typed secret reference へ寄せる。
-4. 空の env value は、変数 category に応じて unset / invalid のどちらとして扱うかを一貫させ、新しい supported variable を追加する場合は挙動を文書化する。
-5. 外部 process integration が env inheritance / filtering を必要とする場合は、ambient な inherited process state に頼らず、明示的な policy boundary として設計する。
+4. fallback env は独立した設定項目として増やさず、対応する main key の解決順として文書化する。
+5. 空の env value は、変数 category に応じて unset / invalid のどちらとして扱うかを一貫させ、新しい supported variable を追加する場合は挙動を文書化する。
+6. 外部 process integration が env inheritance / filtering を必要とする場合は、ambient な inherited process state に頼らず、明示的な policy boundary として設計する。
