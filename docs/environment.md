@@ -40,21 +40,32 @@ Builtin profiles and catalogs are embedded in the binary at build time. User/pro
 
 ## Credential と外部 auth
 
-Provider credential は、現在は manifest / profile / catalog の設定から env var 名を明示的に参照できる。ただし、これは移行互換のための現状であり、長期的な supported configuration path ではない。`manifest-profile-encrypted-secrets` で encrypted secret store と typed secret reference を導入し、credential env var 依存は削除する方針である。
+Provider API key と WebSearch credential は、通常の runtime では環境変数から読まない。`insomnia keys` で local secret store に論理 id を追加し、profile / manifest / provider catalog / web config がその id を明示的に参照する。
 
-これは「ambient な provider 自動発見」ではなく、設定で選んだ環境変数名を読む仕組みである。通常 runtime が `.env` を暗黙に load することもない。
+```toml
+[[models]]
+id = "anthropic/claude-sonnet-4"
+scheme = "anthropic"
+model = "claude-sonnet-4-20250514"
+auth = { kind = "secret_ref", ref = "providers/anthropic/default" }
+
+[web]
+enabled = true
+
+[web.search]
+provider = "brave"
+api_key_secret = "web/brave/default"
+```
+
+Store の user-visible schema は `id -> value` だけであり、store は provider 名や kind を解釈しない。自動的な provider-name-to-secret-id lookup は行わず、設定が secret id を選ぶ。
+
+On-disk store は `<data_dir>/secrets/store.json`。secret value は軽量な obfuscation と integrity check で plaintext config / log / terminal output に出にくくするが、OS keychain や passphrase vault ではない。data directory と source code を読める local user に対する強い保護は主張しない。
 
 | 変数 / pattern | 用途 | 備考 |
 | --- | --- | --- |
-| `INSOMNIA_API_KEY_ANTHROPIC` | custom env が指定されていない場合の Anthropic API key の default env 名。 | provider auth resolution で使う。 |
-| `INSOMNIA_API_KEY_OPENAI` | OpenAI / OpenAI Responses API key の default env 名。 | provider auth resolution で使う。 |
-| `INSOMNIA_API_KEY_GEMINI` | Gemini API key の default env 名。 | provider auth resolution で使う。 |
-| `INSOMNIA_API_KEY_OPENROUTER` | builtin OpenRouter provider の auth hint。 | bundled provider catalog 由来。 |
-| custom `model.auth.env` value | manifest / profile ごとの API key env 名。 | 明示的な config が変数名を選ぶ。`auth.env` と `auth.file` が両方ある場合は env が優先される。 |
-| `BRAVE_SEARCH_API_KEY` または custom `web.search.api_key_env` | Brave WebSearch key。 | WebSearch は configured env 名だけを読み、missing / empty の場合は fail closed する。 |
-| `CODEX_HOME` | Codex OAuth `auth.json` の場所。 | 外部互換用の入力。fallback は `$HOME/.codex`。 |
+| `CODEX_HOME` | Codex OAuth `auth.json` の場所。 | 外部互換用の入力。fallback は `$HOME/.codex`。Codex OAuth は local secret store とは別の structured integration のまま維持する。 |
 
-Credential env var は interoperability のために現時点では残っているが、長期的に望ましい secret mechanism ではない。現時点では適切なら `auth.file` を優先し、今後は typed secret reference へ寄せる。credential UX のために implicit `.env` loading を追加しないこと。project secret を漏らしやすく、profile ごとの credential model とも相性が悪い。
+通常 runtime が `.env` を暗黙に load することはない。credential UX のために implicit `.env` loading を追加しないこと。
 
 ## Development-only escape hatches
 
@@ -83,7 +94,7 @@ Credential env var は interoperability のために現時点では残ってい�
 1. fallback / precedence の test は、process environment を読ませず、直接入力を渡せる小さな pure helper で検証する。
 2. path resolution は `manifest::paths` に集約し、path precedence rule を別の場所で重複実装しない。
 3. test が process environment を変更するのは、process env から読む thin wrapper 自体を検証する場合や、subprocess isolation に必要な場合に限る。
-4. credential source は resolved config 上で明示し、process-env convention を増やすより typed secret reference へ寄せる。encrypted secret store 導入時に credential env var 依存を削除する。
+4. credential source は resolved config 上で明示し、process-env convention を増やすより typed secret reference を使う。
 5. fallback env は独立した設定項目として増やさず、対応する main key の解決順として文書化する。
 6. 空の env value は、変数 category に応じて unset / invalid のどちらとして扱うかを一貫させ、新しい supported variable を追加する場合は挙動を文書化する。
 7. 外部 process integration が env inheritance / filtering を必要とする場合は、ambient な inherited process state に頼らず、明示的な policy boundary として設計する。

@@ -97,7 +97,7 @@ pub enum SchemeKind {
 
 /// 認証の参照。
 ///
-/// 実際のトークン値の解決（env / file 読取、OAuth refresh 等）は
+/// 実際のトークン値の解決（local secret store / file 読取、OAuth refresh 等）は
 /// `crates/provider` で行う。ここはあくまで「どこから取るか」の宣言。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -105,11 +105,10 @@ pub enum AuthRef {
     /// 認証不要（ローカル Ollama 等）
     #[default]
     None,
-    /// API key。env / file のいずれか（両方指定された場合は env が優先）
+    /// API key file reference. Prefer [`AuthRef::SecretRef`] for normal
+    /// provider credentials; this remains an explicit file source for low-level
+    /// manifests and tests.
     ApiKey {
-        /// 環境変数名。未指定のときは scheme ごとの既定（`INSOMNIA_API_KEY_*`）
-        #[serde(default)]
-        env: Option<String>,
         /// key を書き込んだファイル（絶対パス）
         #[serde(default)]
         file: Option<PathBuf>,
@@ -117,25 +116,12 @@ pub enum AuthRef {
     /// ChatGPT OAuth（`~/.codex/auth.json`）。実装は `llm-auth-codex-oauth` チケット
     #[serde(rename = "codex_oauth")]
     CodexOAuth,
-    /// Typed secret-store reference. The profile resolver preserves this
-    /// reference verbatim; secret-store lookup/decryption is intentionally a
+    /// Typed local secret-store reference. The profile resolver preserves this
+    /// reference verbatim; secret-store lookup/deobfuscation is intentionally a
     /// later consumer-boundary concern.
     #[serde(rename = "secret_ref")]
     SecretRef {
         #[serde(rename = "ref")]
         ref_: String,
     },
-}
-
-impl SchemeKind {
-    /// 既定の環境変数名（`INSOMNIA_API_KEY_*`）。
-    ///
-    /// `AuthRef::ApiKey { env: None, .. }` の env 未指定時に使う。
-    pub fn default_env_var(self) -> &'static str {
-        match self {
-            Self::Anthropic => "INSOMNIA_API_KEY_ANTHROPIC",
-            Self::OpenaiChat | Self::OpenaiResponses => "INSOMNIA_API_KEY_OPENAI",
-            Self::Gemini => "INSOMNIA_API_KEY_GEMINI",
-        }
-    }
 }

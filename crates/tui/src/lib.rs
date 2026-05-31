@@ -3,6 +3,7 @@ mod block;
 mod cache;
 mod command;
 mod input;
+pub mod keys;
 mod markdown;
 mod multi_pod;
 mod picker;

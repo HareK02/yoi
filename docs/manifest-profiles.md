@@ -2,7 +2,7 @@
 
 Profiles are reusable Lua-authored recipes for generating an Insomnia runtime manifest. The Rust resolver evaluates a selected `.lua` profile in-process, validates that it is Profile-shaped rather than a complete Manifest, then binds runtime values such as Pod name and concrete scope to produce the persisted `PodManifest` snapshot.
 
-Profiles are intentionally not authority-bearing manifests. `pod.name`, concrete `scope.allow` / `scope.deny`, runtime directories, sockets, active session state, and raw secret material do not belong in reusable profiles. Use `--manifest` when you need the explicit low-level complete Manifest escape hatch.
+Profiles are intentionally not authority-bearing manifests. `pod.name`, concrete `scope.allow` / `scope.deny`, runtime directories, sockets, active session state, and raw secret material do not belong in reusable profiles. Use `insomnia keys` to store provider/WebSearch credentials, then reference explicit secret ids such as `auth = { kind = "secret_ref", ref = "providers/anthropic/default" }` or `web.search.api_key_secret = "web/brave/default"`. Use `--manifest` when you need the explicit low-level complete Manifest escape hatch.
 
 ## Minimal profile
 

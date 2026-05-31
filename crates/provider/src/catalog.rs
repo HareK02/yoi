@@ -72,10 +72,15 @@ pub enum ResolveError {
 pub enum AuthHint {
     /// 認証不要（ローカル Ollama 等）
     None,
-    /// API key。`env` が指定されていれば UI はその env 名を提示する
-    ApiKey {
-        #[serde(default)]
-        env: Option<String>,
+    /// API key file reference. Normal credential configuration should prefer
+    /// [`AuthHint::SecretRef`] so plaintext credentials stay out of manifests.
+    ApiKey,
+    /// Local secret-store reference. The catalog/profile explicitly chooses the
+    /// logical key id; the secret store itself has no provider semantics.
+    #[serde(rename = "secret_ref")]
+    SecretRef {
+        #[serde(rename = "ref")]
+        ref_: String,
     },
     /// ChatGPT OAuth（`~/.codex/auth.json`）
     #[serde(rename = "codex_oauth")]
@@ -153,16 +158,12 @@ struct ModelCatalogFile {
     model: Vec<ModelEntry>,
 }
 
-/// `auth_hint` に対応する [`AuthRef`] のひな型を返す。env / file は
-/// マニフェスト側で override 可能なので、ここでは hint そのままを
-/// 反映した最小形だけを返す（`AuthRef::ApiKey { env: hint_env, file: None }`）。
+/// `auth_hint` に対応する [`AuthRef`] のひな型を返す。
 fn auth_hint_to_ref(hint: &AuthHint) -> AuthRef {
     match hint {
         AuthHint::None => AuthRef::None,
-        AuthHint::ApiKey { env } => AuthRef::ApiKey {
-            env: env.clone(),
-            file: None,
-        },
+        AuthHint::ApiKey => AuthRef::ApiKey { file: None },
+        AuthHint::SecretRef { ref_ } => AuthRef::SecretRef { ref_: ref_.clone() },
         AuthHint::CodexOAuth => AuthRef::CodexOAuth,
     }
 }
@@ -415,11 +416,10 @@ mod tests {
         assert_eq!(cfg.model_id, "claude-sonnet-4-6");
         assert_eq!(cfg.base_url.as_deref(), Some("https://api.anthropic.com"));
         match cfg.auth {
-            AuthRef::ApiKey { env, file } => {
-                assert_eq!(env.as_deref(), Some("INSOMNIA_API_KEY_ANTHROPIC"));
-                assert!(file.is_none());
+            AuthRef::SecretRef { ref_ } => {
+                assert_eq!(ref_, "providers/anthropic/default");
             }
-            _ => panic!("expected ApiKey auth from provider hint"),
+            _ => panic!("expected SecretRef auth from provider hint"),
         }
         assert!(
             cfg.capability.is_some(),
@@ -493,15 +493,13 @@ mod tests {
         let manifest = ModelManifest {
             ref_: Some("anthropic/claude-sonnet-4-6".into()),
             auth: Some(AuthRef::ApiKey {
-                env: None,
                 file: Some(PathBuf::from("/tmp/sk-ant")),
             }),
             ..Default::default()
         };
         let cfg = resolve_with_catalogs(&manifest, &providers, &models).unwrap();
         match cfg.auth {
-            AuthRef::ApiKey { env, file } => {
-                assert!(env.is_none());
+            AuthRef::ApiKey { file } => {
                 assert_eq!(file.as_deref(), Some(Path::new("/tmp/sk-ant")));
             }
             _ => panic!("override auth should win"),
@@ -555,7 +553,6 @@ mod tests {
             scheme: Some(SchemeKind::Anthropic),
             model_id: Some("claude-sonnet-4-6".into()),
             auth: Some(AuthRef::ApiKey {
-                env: None,
                 file: Some(PathBuf::from("/tmp/sk")),
             }),
             ..Default::default()
@@ -575,7 +572,6 @@ mod tests {
             scheme: Some(SchemeKind::Anthropic),
             model_id: Some("claude-sonnet-4-6".into()),
             auth: Some(AuthRef::ApiKey {
-                env: None,
                 file: Some(PathBuf::from("/tmp/sk")),
             }),
             context_window: Some(777_000),

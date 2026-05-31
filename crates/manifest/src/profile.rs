@@ -1038,9 +1038,7 @@ fn reject_absolute_auth_file(
     auth: &Option<AuthRef>,
     field: &'static str,
 ) -> Result<(), ProfileError> {
-    if let Some(AuthRef::ApiKey {
-        file: Some(file), ..
-    }) = auth
+    if let Some(AuthRef::ApiKey { file: Some(file) }) = auth
         && file.is_absolute()
     {
         return Err(ProfileError::InvalidProfile(format!(

@@ -331,7 +331,7 @@ impl crate::WebSearchConfig {
         Self {
             enabled: upper.enabled.or(self.enabled),
             provider: upper.provider.or(self.provider),
-            api_key_env: upper.api_key_env.or(self.api_key_env),
+            api_key_secret: upper.api_key_secret.or(self.api_key_secret),
             timeout_secs: upper.timeout_secs.or(self.timeout_secs),
             base_url: upper.base_url.or(self.base_url),
             country: upper.country.or(self.country),
@@ -517,7 +517,7 @@ fn ensure_absolute(field: &'static str, path: &Path) -> Result<(), ResolveError>
     }
 }
 
-/// `AuthRef::ApiKey { file, .. }` が相対パスのとき `base` を前置する。
+/// `AuthRef::ApiKey { file }` が相対パスのとき `base` を前置する。
 fn resolve_auth_file(auth: &mut Option<AuthRef>, base: &Path) {
     if let Some(AuthRef::ApiKey { file: Some(p), .. }) = auth.as_mut() {
         *p = join_if_relative(base, p);
@@ -692,10 +692,7 @@ mod tests {
     }
 
     fn api_key_file_auth(path: PathBuf) -> AuthRef {
-        AuthRef::ApiKey {
-            env: None,
-            file: Some(path),
-        }
+        AuthRef::ApiKey { file: Some(path) }
     }
 
     fn minimal_valid() -> PodManifestConfig {
@@ -1089,7 +1086,7 @@ mod tests {
             }),
             web: Some(WebConfig {
                 search: Some(crate::WebSearchConfig {
-                    api_key_env: Some("LOWER_BRAVE_KEY".into()),
+                    api_key_secret: Some("web/brave/lower".into()),
                     timeout_secs: Some(12),
                     ..Default::default()
                 }),
@@ -1118,7 +1115,7 @@ mod tests {
         assert_eq!(c.prune_protected_tokens, Some(5_000));
         let search = merged.web.unwrap().search.unwrap();
         assert_eq!(search.timeout_secs, Some(3));
-        assert_eq!(search.api_key_env.as_deref(), Some("LOWER_BRAVE_KEY"));
+        assert_eq!(search.api_key_secret.as_deref(), Some("web/brave/lower"));
     }
 
     #[test]

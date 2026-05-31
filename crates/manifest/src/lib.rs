@@ -122,10 +122,10 @@ pub struct WebSearchConfig {
     pub enabled: Option<bool>,
     #[serde(default)]
     pub provider: Option<WebSearchProvider>,
-    /// Environment variable that stores the provider API key. Raw secrets do
-    /// not belong in manifest files.
+    /// Local secret-store id for the provider API key. Raw secrets do not
+    /// belong in manifest files.
     #[serde(default)]
-    pub api_key_env: Option<String>,
+    pub api_key_secret: Option<String>,
     /// Request timeout in seconds. Tool implementation applies a safe default
     /// when this is omitted.
     #[serde(default)]
@@ -651,7 +651,7 @@ permission = "write"
     #[test]
     fn parse_web_config() {
         let toml = format!(
-            "{}\n[web]\nenabled = true\n\n[web.search]\nprovider = \"brave\"\napi_key_env = \"BRAVE_SEARCH_API_KEY\"\ntimeout_secs = 12\n\n[web.fetch]\ntimeout_secs = 7\nredirect_limit = 3\nmax_response_bytes = 12345\nmax_output_bytes = 2048\n",
+            "{}\n[web]\nenabled = true\n\n[web.search]\nprovider = \"brave\"\napi_key_secret = \"web/brave/default\"\ntimeout_secs = 12\n\n[web.fetch]\ntimeout_secs = 7\nredirect_limit = 3\nmax_response_bytes = 12345\nmax_output_bytes = 2048\n",
             MINIMAL_REQUIRED
         );
         let manifest = PodManifest::from_toml(&toml).unwrap();
