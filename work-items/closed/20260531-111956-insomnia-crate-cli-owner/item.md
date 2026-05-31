@@ -2,12 +2,12 @@
 id: 20260531-111956-insomnia-crate-cli-owner
 slug: insomnia-crate-cli-owner
 title: CLI: make insomnia crate own binary entrypoint and CLI dispatch
-status: open
+status: closed
 kind: task
 priority: P2
 labels: [cli, tui, pod, architecture]
 created_at: 2026-05-31T11:19:56Z
-updated_at: 2026-05-31T13:17:15Z
+updated_at: 2026-05-31T13:20:02Z
 assignee: null
 legacy_ticket: null
 ---
