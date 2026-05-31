@@ -104,3 +104,37 @@ Validation:
 
 
 ---
+
+<!-- event: review author: hare at: 2026-05-31T11:54:28Z status: approve -->
+
+## Review: approve
+
+External reviewer: `remove-resource-dir-reviewer-20260531`
+Reviewed implementation commit: `365ec8b7fad008ab36bdc4de3adadb3696739a07` (`manifest: embed builtin resources`)
+Verdict: approve
+
+Summary:
+- Runtime filesystem resource discovery and `INSOMNIA_RESOURCE_DIR` active surface were removed.
+- Builtin profile is embedded and represented as `builtin:default` without pretending to have a runtime filesystem path under `resources/profiles`.
+- User/project/path profile semantics remain filesystem-backed.
+- Builtin model context lookup is embedded on the manifest side without adding a `manifest -> provider` dependency.
+- Nix package/docs no longer require installed runtime resources.
+
+Requirements mapping:
+- `INSOMNIA_RESOURCE_DIR`, `RESOURCE_DIR_ENV`, `resource_dir()`, and `builtin_profiles_dir()` have no active hits in `crates/`, `docs/`, or `package.nix`.
+- Embedded builtin profiles do not silently support local filesystem `require` by falling back to resources; non-filesystem profile local modules produce the existing disabled diagnostic.
+- `crates/pod/src/spawn/tool.rs` change is test/API fallout for `ProfileDiscovery::with_sources`, not a runtime/protocol behavior change.
+- Runtime installed resources are no longer required; source `resources/` remains build-time input for embeds.
+
+Blockers: none.
+
+Non-blocking follow-ups:
+- Add a narrow regression test for an embedded builtin-like profile attempting local `require("x")`, asserting the explicit disabled diagnostic.
+- Rerun `nix build .#insomnia` in an environment with enough disk space before treating the ticket as fully release-validated; the final rerun is environment-blocked by disk full.
+
+Validation adequacy:
+- Rust validation and forbidden-symbol grep are well targeted.
+- Final Nix validation remains pending due to `No space left on device`, not due to a code review finding.
+
+
+---

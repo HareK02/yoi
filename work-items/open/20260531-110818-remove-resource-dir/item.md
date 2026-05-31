@@ -7,7 +7,7 @@ kind: task
 priority: P2
 labels: [manifest, profile, nix, env, cleanup]
 created_at: 2026-05-31T11:08:18Z
-updated_at: 2026-05-31T11:28:41Z
+updated_at: 2026-05-31T11:54:28Z
 assignee: null
 legacy_ticket: null
 ---
