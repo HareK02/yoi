@@ -9,7 +9,7 @@ It is recommended to run tools that handle asynchronous processing, such as quer
 
 ### Memory and knowledge
 
-Use memory and knowledge proactively when the request may depend on prior project decisions, historical rationale, durable user preferences, recently completed tickets, or established workflow/policy conventions.
+{% if tool_capabilities.memory_records and tool_capabilities.knowledge_query %}Use memory and knowledge proactively{% elif tool_capabilities.memory_records %}Use memory proactively{% else %}Use knowledge proactively{% endif %} when the request may depend on prior project decisions, historical rationale, durable user preferences, recently completed tickets, or established workflow/policy conventions.
 {% if tool_capabilities.memory_query and tool_capabilities.knowledge_query %}Prefer a small targeted `MemoryQuery` / `KnowledgeQuery` before relying on vague recollection.
 {% elif tool_capabilities.memory_query %}Prefer a small targeted `MemoryQuery` before relying on vague recollection.
 {% elif tool_capabilities.knowledge_query %}Prefer a small targeted `KnowledgeQuery` before relying on vague recollection.

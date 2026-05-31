@@ -117,7 +117,7 @@ impl SystemPromptTemplate {
         let body = tmpl
             .render(ctx.to_minijinja_value())
             .map_err(|e| SystemPromptError::Render(e.to_string()))?;
-        append_trailing_section_with_capabilities(
+        append_trailing_section(
             &body,
             ctx.prompts,
             ctx.scope,
@@ -272,28 +272,7 @@ impl ToolCapabilities {
 /// comes from the prompt catalog (`PodPrompt::WorkingBoundariesSection`
 /// / `PodPrompt::AgentsMdSection`) so that wording can be overridden
 /// per-pack without touching this function.
-pub fn append_trailing_section(
-    body: &str,
-    prompts: &PromptCatalog,
-    scope: &Scope,
-    agents_md: Option<&str>,
-    resident_summary: Option<&str>,
-    resident_knowledge: Option<&[ResidentKnowledgeEntry]>,
-    resident_workflows: Option<&[ResidentWorkflowEntry]>,
-) -> Result<String, SystemPromptError> {
-    append_trailing_section_with_capabilities(
-        body,
-        prompts,
-        scope,
-        agents_md,
-        resident_summary,
-        resident_knowledge,
-        resident_workflows,
-        ToolCapabilities::default(),
-    )
-}
-
-fn append_trailing_section_with_capabilities(
+fn append_trailing_section(
     body: &str,
     prompts: &PromptCatalog,
     scope: &Scope,
