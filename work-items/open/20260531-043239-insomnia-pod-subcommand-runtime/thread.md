@@ -20,3 +20,65 @@ Implementation plan:
 
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-05-31T04:46:52Z -->
+
+## Implementation report
+
+Implementation report from coder Pod `insomnia-pod-subcommand-coder-20260531`:
+
+- Branch: `insomnia-pod-subcommand-runtime`
+- Commit: `544257b` (`cli: add insomnia pod runtime entrypoint`)
+- Extracted current Pod runtime startup into `pod::entrypoint` with `run_cli()` / `run_cli_from(...)` sharing one `run_cli_inner(...)` path.
+- Kept existing `insomnia-pod` binary as a thin temporary wrapper around the shared entrypoint.
+- Added reserved `insomnia pod ...` dispatch in the user-facing `insomnia` binary.
+- `insomnia pod --help` reaches the Pod runtime parser with `Usage: insomnia pod ...`.
+- `insomnia memory lint` remains a headless path before TUI/raw-terminal/Pod side effects.
+- Pod named `pod` remains addressable with explicit `--pod pod`.
+- Internal spawn default migration and Nix removal of `insomnia-pod` were intentionally left for follow-up phases.
+
+Validation reported by coder:
+
+- `cargo fmt --check` passed
+- `cargo test -p tui parse_` passed
+- `cargo test -p pod subcommand_help_uses_insomnia_pod_invocation` passed
+- `cargo run -q -p tui -- pod --help` + grep passed
+- `cargo run -q -p pod --bin insomnia-pod -- --help` + grep passed
+- `cargo run -q -p tui -- memory lint` passed
+- `cargo check -p tui -p pod -p client` passed
+- `./tickets.sh doctor` passed
+- `git diff --check` passed
+
+Unresolved follow-ups:
+
+- Switch internal spawn/restore defaults to `insomnia pod` via typed `program + prefix_args` command resolution.
+- Remove `insomnia-pod` from packaging once internal callers no longer depend on it.
+
+
+---
+
+<!-- event: review author: hare at: 2026-05-31T04:46:53Z status: approve -->
+
+## Review: approve
+
+External review by reviewer Pod `insomnia-pod-subcommand-reviewer-20260531`: approve.
+
+Reviewer summary:
+
+- The existing `insomnia-pod` runtime startup is now a library-callable `pod::entrypoint` path.
+- Both the temporary `insomnia-pod` wrapper and the new `insomnia pod ...` path call the same runtime entrypoint.
+- `insomnia pod --help` reaches the Pod runtime parser/help with the appropriate invocation name.
+- Existing Pod runtime flags, semantics, and `INSOMNIA-READY` stderr handshake are preserved.
+- `insomnia memory lint` remains headless and returns before terminal/TUI setup.
+- Existing CLI behavior is preserved except that leading positional `pod` is now a reserved subcommand; explicit `--pod pod` remains available.
+- Spawn/Restore default migration and Nix removal were correctly left for later phases.
+
+Blockers: none.
+
+Non-blocking follow-ups:
+
+- Migrate `client::spawn_pod`, `SpawnPod`, and restore/discovery paths to typed `program + prefix_args` so default runtime startup can become `insomnia pod ...`.
+- Add installed-binary smoke coverage once CLI E2E exists.
+
+
+---
