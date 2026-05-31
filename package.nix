@@ -92,7 +92,6 @@ rustPlatform.buildRustPackage rec {
   doCheck = false;
 
   postInstall = ''
-    install -Dm644 docs/nix.md "$out/share/doc/insomnia/nix.md"
     install -Dm644 docs/environment.md "$out/share/doc/insomnia/environment.md"
   '';
 
@@ -110,7 +109,6 @@ rustPlatform.buildRustPackage rec {
     fi
     grep -q "invalid --session UUID" insomnia.err
 
-    test -f "$out/share/doc/insomnia/nix.md"
     test -f "$out/share/doc/insomnia/environment.md"
 
     runHook postInstallCheck
