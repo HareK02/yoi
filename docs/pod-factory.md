@@ -119,12 +119,12 @@ Use `--manifest` only when you need the complete low-level Manifest escape hatch
 
 ## Builtin defaults
 
-Base defaults that are independent of profile choice live in Rust constants under `crates/manifest/src/defaults.rs` and in `PodManifestConfig::builtin_defaults()`. The bundled default role profile lives at `resources/profiles/default.lua` and is discovered as `builtin:default`.
+Base defaults that are independent of profile choice live in Rust constants under `crates/manifest/src/defaults.rs` and in `PodManifestConfig::builtin_defaults()`. The default role profile is embedded from `resources/profiles/default.lua` at build time and is discovered as `builtin:default`.
 
 デフォルト値を変更するときは、次のどちらを変更するのかを明確にする。
 
 - all manifests/profiles の baseline default: Rust defaults
-- ordinary dogfooding/default role: `resources/profiles/default.lua`
+- ordinary dogfooding/default role: embedded `builtin:default` profile sourced from `resources/profiles/default.lua`
 
 ## Path resolution
 

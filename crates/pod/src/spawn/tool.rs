@@ -932,7 +932,7 @@ mod tests {
         std::fs::write(&registry_path, registry_toml).unwrap();
         AvailableProfiles {
             registry: Some(
-                ProfileDiscovery::with_sources(None, None, Some(registry_path))
+                ProfileDiscovery::with_sources(None, Some(registry_path))
                     .discover()
                     .unwrap(),
             ),
@@ -1319,7 +1319,7 @@ return profile {
         let project_config = project.join(".insomnia/profiles.toml");
         let ambiguous = AvailableProfiles {
             registry: Some(
-                ProfileDiscovery::with_sources(None, Some(user_config), Some(project_config))
+                ProfileDiscovery::with_sources(Some(user_config), Some(project_config))
                     .discover()
                     .unwrap(),
             ),
