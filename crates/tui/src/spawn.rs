@@ -3,7 +3,7 @@
 //! Rendered at the user's current cursor position when `insomnia` is invoked
 //! with no positional argument. Discovers `.insomnia/profiles.toml` profile
 //! choices plus bundled profiles, defaults to the builtin profile, prompts for
-//! the Pod's name, and on confirmation launches the `insomnia-pod` binary as an
+//! the Pod's name, and on confirmation launches the Pod runtime command as an
 //! independent process. Once the process reports its socket via the
 //! `INSOMNIA-READY` stderr line, the dialog hands control back so main can
 //! switch the terminal to alternate-screen mode.
@@ -72,7 +72,7 @@ type InlineTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 
 /// Source session for a resume run. `None` = fresh spawn (current
 /// behaviour); `Some(id)` swaps the dialog into "Resume Pod" mode and
-/// passes `--session <id>` to the spawned `insomnia-pod` child.
+/// passes `--session <id>` to the spawned Pod runtime child.
 pub async fn run(
     resume_from: Option<SegmentId>,
     profile: Option<String>,
@@ -162,7 +162,7 @@ pub async fn run(
     }
 }
 
-/// Launch `insomnia-pod --pod <name>` without opening the name dialog. The child Pod
+/// Launch a Pod runtime command with `--pod <name>` without opening the name dialog. The child Pod
 /// resolves persisted Pod metadata if present, or creates a fresh same-name Pod
 /// from the default profile.
 pub async fn run_pod_name(pod_name: String) -> Result<SpawnOutcome, SpawnError> {
@@ -415,7 +415,7 @@ struct Form {
     /// When true, launch the child with `--pod <name>` so the pod process
     /// resolves name-keyed state before falling back to fresh creation.
     resume_by_pod_name: bool,
-    /// Optional profile choices passed to `insomnia-pod --profile` for
+    /// Optional profile choices passed with `--profile` for
     /// fresh spawns. This is not used for resume/attach flows because those must
     /// restore Pod state rather than re-evaluate a profile source.
     profile_choices: Vec<ProfileChoice>,

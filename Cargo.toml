@@ -8,6 +8,7 @@ members = [
     "crates/session-store",
     "crates/manifest",
     "crates/pod",
+    "crates/pod-command",
     "crates/pod-store",
     "crates/protocol",
     "crates/provider",
@@ -33,6 +34,7 @@ manifest = { path = "crates/manifest" }
 lint-common = { path = "crates/lint-common" }
 memory = { path = "crates/memory" }
 pod = { path = "crates/pod" }
+pod-command = { path = "crates/pod-command" }
 pod-registry = { path = "crates/pod-registry" }
 pod-store = { path = "crates/pod-store" }
 protocol = { path = "crates/protocol" }

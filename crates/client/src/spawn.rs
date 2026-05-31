@@ -1,4 +1,4 @@
-//! `insomnia-pod` バイナリをサブプロセスとして立ち上げ、`INSOMNIA-READY` を待つ
+//! Pod runtime command をサブプロセスとして立ち上げ、`INSOMNIA-READY` を待つ
 //! ハンドシェイク。
 //!
 //! - 親プロセス (TUI / GUI / E2E) は profile/default/typed restore flags を
@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
+use pod_command::PodRuntimeCommand;
 use tokio::process::Command;
 use uuid::Uuid;
 
@@ -99,7 +100,7 @@ pub async fn spawn_pod<F>(config: SpawnConfig, mut progress: F) -> Result<SpawnR
 where
     F: FnMut(&str),
 {
-    let pod_bin = resolve_pod_command();
+    let pod_command = PodRuntimeCommand::resolve().map_err(SpawnError::Io)?;
 
     let pod_runtime_dir = manifest::paths::pod_runtime_dir(&config.pod_name)
         .ok_or(SpawnError::RuntimeDirUnavailable)?;
@@ -107,8 +108,9 @@ where
     let stderr_path = pod_runtime_dir.join("stderr.log");
     let stderr_file = std::fs::File::create(&stderr_path).map_err(SpawnError::Io)?;
 
-    let mut command = Command::new(&pod_bin);
+    let mut command = Command::new(pod_command.program());
     command
+        .args(pod_command.prefix_args())
         .current_dir(&config.cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -266,23 +268,6 @@ async fn drain_stderr_into_tail(stderr_path: &Path, tail: &mut StderrTail, offse
         }
     }
     *offset = content.len();
-}
-
-/// Resolves the binary used to launch a child Pod. Must point at a
-/// `insomnia-pod`-compatible executable — the parent reads the child's stderr
-/// directly looking for `INSOMNIA-READY`, so any wrapper that emits
-/// extra lines on stderr will pollute that handshake.
-///
-/// `INSOMNIA_POD_COMMAND` overrides the lookup (used by tests to inject
-/// a mock binary). Otherwise we defer to `PATH` — missing binary
-/// surfaces as the spawn `io::Error`.
-fn resolve_pod_command() -> PathBuf {
-    if let Ok(cmd) = std::env::var("INSOMNIA_POD_COMMAND")
-        && !cmd.is_empty()
-    {
-        return PathBuf::from(cmd);
-    }
-    PathBuf::from("insomnia-pod")
 }
 
 struct StderrTail {

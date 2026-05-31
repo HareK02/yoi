@@ -333,6 +333,7 @@ name = "client"
 version = "0.1.0"
 dependencies = [
  "manifest",
+ "pod-command",
  "protocol",
  "serde_json",
  "tokio",
@@ -2338,6 +2339,7 @@ dependencies = [
  "manifest",
  "memory",
  "minijinja",
+ "pod-command",
  "pod-registry",
  "pod-store",
  "protocol",
@@ -2356,6 +2358,10 @@ dependencies = [
  "uuid",
  "workflow",
 ]
+
+[[package]]
+name = "pod-command"
+version = "0.1.0"
 
 [[package]]
 name = "pod-registry"

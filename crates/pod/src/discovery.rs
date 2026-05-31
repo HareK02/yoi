@@ -16,6 +16,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use manifest::{Permission, ScopeRule};
+use pod_command::PodRuntimeCommand;
 use pod_store::{PodActiveSegmentRef, PodMetadata, PodMetadataStore};
 use protocol::stream::JsonLineReader;
 use protocol::{Event, PodStatus};
@@ -328,8 +329,10 @@ where
         pod_name: &str,
         socket_path: &Path,
     ) -> Result<(), PodDiscoveryError> {
-        let mut command = Command::new(resolve_pod_command());
+        let pod_command = PodRuntimeCommand::resolve().map_err(PodDiscoveryError::RestoreSpawn)?;
+        let mut command = Command::new(pod_command.program());
         command
+            .args(pod_command.prefix_args())
             .arg("--pod")
             .arg(pod_name)
             .arg("--require-pod-state")
@@ -659,15 +662,6 @@ fn lookup_segment_lock(
     segment_id: SegmentId,
 ) -> Result<Option<pod_registry::SegmentLockInfo>, pod_registry::ScopeLockError> {
     pod_registry::lookup_segment(segment_id)
-}
-
-fn resolve_pod_command() -> PathBuf {
-    if let Ok(cmd) = std::env::var("INSOMNIA_POD_COMMAND")
-        && !cmd.is_empty()
-    {
-        return PathBuf::from(cmd);
-    }
-    PathBuf::from("insomnia-pod")
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
