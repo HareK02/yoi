@@ -2,12 +2,12 @@
 id: 20260531-074258-tui-move-view-mode-state
 slug: tui-move-view-mode-state
 title: TUI: move view mode state out of ui module
-status: open
+status: closed
 kind: task
 priority: P2
 labels: [tui, cleanup]
 created_at: 2026-05-31T07:42:58Z
-updated_at: 2026-05-31T13:45:04Z
+updated_at: 2026-05-31T13:45:39Z
 assignee: null
 legacy_ticket: null
 ---
