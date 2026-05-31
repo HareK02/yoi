@@ -84,3 +84,31 @@ Non-blocking follow-up:
 
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-05-31T05:27:03Z -->
+
+## Implementation report
+
+Main workspace validation after merge:
+
+- `cargo fmt --check` passed
+- `cargo test -p pod-command` passed
+- `cargo test -p client -p pod-command` passed
+- `cargo test -p pod --lib discovery::tests` passed
+- `cargo test -p pod --test spawn_pod_test` passed
+- `cargo test -p tui parse_pod_subcommand_uses_runtime_mode` passed
+- `cargo check -p client -p pod -p tui` passed with pre-existing dead-code warnings
+- `./tickets.sh doctor` passed
+- `git diff --check` passed
+
+
+---
+
+<!-- event: close author: hare at: 2026-05-31T05:27:04Z status: closed -->
+
+## Closed
+
+Switched internal Pod runtime spawning/restoration to typed `program + prefix_args` command resolution. Default runtime command now uses the current executable plus `pod`, while `INSOMNIA_POD_COMMAND` remains executable-only and not shell-parsed for development/debug overrides. `client::spawn_pod`, `SpawnPod`, and `RestorePod`/discovery restore paths use the typed command; detached process behavior and `INSOMNIA-READY` handshake are preserved. External review approved and validation passed. `insomnia-pod` packaging removal remains the next phase.
+
+
+---

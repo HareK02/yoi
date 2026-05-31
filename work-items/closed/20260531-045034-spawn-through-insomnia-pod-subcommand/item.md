@@ -2,12 +2,12 @@
 id: 20260531-045034-spawn-through-insomnia-pod-subcommand
 slug: spawn-through-insomnia-pod-subcommand
 title: CLI: spawn Pods through insomnia pod runtime
-status: open
+status: closed
 kind: task
 priority: P2
 labels: [cli, pod, client, nix]
 created_at: 2026-05-31T04:50:34Z
-updated_at: 2026-05-31T05:25:12Z
+updated_at: 2026-05-31T05:27:04Z
 assignee: null
 legacy_ticket: null
 ---
