@@ -77,9 +77,10 @@ Credential env var は interoperability のために現時点では残ってい�
 
 環境変数に関わるコードを触る場合は、以下を優先する。
 
-1. public env behavior を検証する test の process environment mutation は shared guard / test-support crate に集約する。
+1. fallback / precedence の test は、process environment を読ませず、直接入力を渡せる小さな pure helper で検証する。
 2. path resolution は `manifest::paths` に集約し、path precedence rule を別の場所で重複実装しない。
-3. credential source は resolved config 上で明示し、process-env convention を増やすより typed secret reference へ寄せる。encrypted secret store 導入時に credential env var 依存を削除する。
-4. fallback env は独立した設定項目として増やさず、対応する main key の解決順として文書化する。
-5. 空の env value は、変数 category に応じて unset / invalid のどちらとして扱うかを一貫させ、新しい supported variable を追加する場合は挙動を文書化する。
-6. 外部 process integration が env inheritance / filtering を必要とする場合は、ambient な inherited process state に頼らず、明示的な policy boundary として設計する。
+3. test が process environment を変更するのは、process env から読む thin wrapper 自体を検証する場合や、subprocess isolation に必要な場合に限る。
+4. credential source は resolved config 上で明示し、process-env convention を増やすより typed secret reference へ寄せる。encrypted secret store 導入時に credential env var 依存を削除する。
+5. fallback env は独立した設定項目として増やさず、対応する main key の解決順として文書化する。
+6. 空の env value は、変数 category に応じて unset / invalid のどちらとして扱うかを一貫させ、新しい supported variable を追加する場合は挙動を文書化する。
+7. 外部 process integration が env inheritance / filtering を必要とする場合は、ambient な inherited process state に頼らず、明示的な policy boundary として設計する。
