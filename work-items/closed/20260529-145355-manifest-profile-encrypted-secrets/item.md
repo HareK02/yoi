@@ -2,12 +2,12 @@
 id: 20260529-145355-manifest-profile-encrypted-secrets
 slug: manifest-profile-encrypted-secrets
 title: Manifest/Profile: local key-value secret store
-status: open
+status: closed
 kind: feature
 priority: P2
 labels: [manifest, profiles, secrets, security, cli, tui]
 created_at: 2026-05-29T14:53:55Z
-updated_at: 2026-05-31T22:21:04Z
+updated_at: 2026-05-31T22:23:34Z
 assignee: null
 legacy_ticket: null
 ---
