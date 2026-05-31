@@ -2,12 +2,12 @@
 id: 20260531-005557-single-binary-insomnia-cli
 slug: single-binary-insomnia-cli
 title: CLI: migrate toward a single insomnia binary
-status: open
+status: closed
 kind: task
 priority: P2
 labels: [cli, architecture, nix]
 created_at: 2026-05-31T00:55:57Z
-updated_at: 2026-05-31T04:32:30Z
+updated_at: 2026-05-31T12:15:50Z
 assignee: null
 legacy_ticket: null
 ---
