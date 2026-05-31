@@ -2,7 +2,7 @@
 description: worktree と sibling の coder / reviewer Pod を使い、下位 orchestrator が複数 ticket の実装・外部レビュー・修正・完了準備を管理する orchestration フロー
 model_invokation: true
 user_invocable: true
-requires: ["ticket-preflight-workflow", "worktree-workflow"]
+requires: []
 ---
 # Multi-agent Worktree Workflow
 
