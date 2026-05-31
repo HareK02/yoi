@@ -2,7 +2,7 @@
 
 INSOMNIA では、プロセス境界で本当に必要な場合を除き、環境変数の利用を避ける。新しい ambient な入力を増やすより、明示的な profile / manifest / config file / typed secret reference / CLI argument を優先する。
 
-それでも、path discovery、runtime directory、package resource lookup、開発・テスト用 override、外部 provider の credential 慣習との互換のために、一部の環境変数はサポートしている。この文書に載せた環境変数は公開 surface として扱う。ただし、fallback 変数は独立した設定項目ではなく、対応する main key の解決順の一部として扱う。
+それでも、path discovery、runtime directory、package resource lookup、外部 provider の credential 慣習との移行互換のために、一部の環境変数はまだサポートしている。この文書に載せた環境変数は公開 surface として扱う。ただし、fallback 変数は独立した設定項目ではなく、対応する main key の解決順の一部として扱う。開発・テスト都合だけの環境変数は原則として追加せず、既存のものも削除する。
 
 ## 原則
 
@@ -10,7 +10,7 @@ INSOMNIA では、プロセス境界で本当に必要な場合を除き、環�
 - 永続的な project state を環境変数に置かない。解決済みの状態は適切な store に保存する。
 - 通常の TUI / Pod runtime は `.env` ファイルを暗黙に load しない。example が局所的に `dotenv` を使うことはあっても、application startup が project の `.env` を勝手に読むべきではない。
 - 生の secret value を generated log、work item、trace output、docs に出さない。環境変数名の記述はよいが、値は書かない。
-- path/location 用の環境変数、provider credential 用の環境変数、test/build-only の環境変数を混ぜない。
+- path/location 用の環境変数、provider credential 用の移行互換、test/build-only の環境変数を混ぜない。
 - test が process environment を変更する必要がある場合は、guard で直列化し、元の値を復元する。Rust の process environment は global state である。
 
 ## Path / resource discovery
@@ -43,17 +43,11 @@ Path 系の環境変数は論理的な key ごとに立項する。`XDG_*` や `
 
 つまり、builtin fallback は `resource_dir`、user override は `config_dir` で扱う。`INSOMNIA_RESOURCE_DIR` を user configuration の代わりに使わない。
 
-## Pod runtime command override
-
-| 変数 | 用途 | 備考 |
-| --- | --- | --- |
-| `INSOMNIA_POD_COMMAND` | Pod runtime subprocess の起動 executable を差し替える開発・テスト用 override。 | default runtime command は現在の `insomnia` executable に `pod` prefix argument を付けたもの。この override は executable-only で、shell parse せず、`pod` prefix argument も自動付与しない。 |
-
-これは通常の user configuration として使わない。test、development wrapper、狭い debugging 用の escape hatch である。
-
 ## Credential と外部 auth
 
-Provider credential は、現在は manifest / profile / catalog の設定から env var 名を明示的に参照できる。これは「ambient な provider 自動発見」ではなく、設定で選んだ環境変数名を読む仕組みである。
+Provider credential は、現在は manifest / profile / catalog の設定から env var 名を明示的に参照できる。ただし、これは移行互換のための現状であり、長期的な supported configuration path ではない。`manifest-profile-encrypted-secrets` で encrypted secret store と typed secret reference を導入し、credential env var 依存は削除する方針である。
+
+これは「ambient な provider 自動発見」ではなく、設定で選んだ環境変数名を読む仕組みである。通常 runtime が `.env` を暗黙に load することもない。
 
 | 変数 / pattern | 用途 | 備考 |
 | --- | --- | --- |
@@ -65,11 +59,11 @@ Provider credential は、現在は manifest / profile / catalog の設定から
 | `BRAVE_SEARCH_API_KEY` または custom `web.search.api_key_env` | Brave WebSearch key。 | WebSearch は configured env 名だけを読み、missing / empty の場合は fail closed する。 |
 | `CODEX_HOME` | Codex OAuth `auth.json` の場所。 | 外部互換用の入力。fallback は `$HOME/.codex`。 |
 
-Credential env var は interoperability のために許容しているが、長期的に望ましい secret mechanism ではない。現時点では適切なら `auth.file` を優先し、今後は typed secret reference へ寄せる。credential UX のために implicit `.env` loading を追加しないこと。project secret を漏らしやすく、profile ごとの credential model とも相性が悪い。
+Credential env var は interoperability のために現時点では残っているが、長期的に望ましい secret mechanism ではない。現時点では適切なら `auth.file` を優先し、今後は typed secret reference へ寄せる。credential UX のために implicit `.env` loading を追加しないこと。project secret を漏らしやすく、profile ごとの credential model とも相性が悪い。
 
-## Build / example / test-only 変数
+## Build / example / test 変数
 
-これらは通常の application configuration ではない。
+これらは通常の application configuration ではない。test-only の user-facing env var は supported surface として立てず、既存の `INSOMNIA_TEST_*` も削除する。test が public env behavior を検証する必要がある場合だけ、shared guard / test-support crate で process environment mutation を閉じ込める。
 
 | 変数 | Context | 備考 |
 | --- | --- | --- |
@@ -78,12 +72,13 @@ Credential env var は interoperability のために許容しているが、長�
 | `TMPDIR` | shell script / test。 | `tickets.sh` が temporary file に使う。 |
 | `RUST_LOG` | example / dev diagnostics。 | example CLI が tracing setup 経由で読む場合がある。 |
 | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY` などの provider example vars | `llm-worker` や Pod example / fixture recorder。 | example code が `dotenv::dotenv().ok()` を呼ぶことがある。通常の `insomnia` runtime startup には適用されない。 |
-| `INSOMNIA_TEST_*` | test only。 | user-facing configuration にしてはいけない。 |
 
 ## deprecated または意図的に存在しない surface
 
 - `INSOMNIA_USER_MANIFEST` は通常の profile-based Pod/TUI startup の一部ではない。one-file manifest の debug / compatibility path には `insomnia pod --manifest <PATH>` を使う。
 - ambient `.insomnia/manifest.toml` discovery は通常の fresh startup の一部ではない。
+- `INSOMNIA_POD_COMMAND` は single-binary 化に伴って削除する。Pod runtime は `insomnia pod ...` の typed command として起動する。
+- `INSOMNIA_TEST_*` のような test-only 環境変数は supported surface にしない。既存利用も削除する。
 - `insomnia-pod` は installed command ではない。Pod runtime は `insomnia pod ...` から起動する。
 - 通常 runtime は `.env` ファイルを load しない。
 
@@ -91,9 +86,10 @@ Credential env var は interoperability のために許容しているが、長�
 
 環境変数に関わるコードを触る場合は、以下を優先する。
 
-1. test env mutation を shared guard に集約し、unsafe な `set_var` / `remove_var` call を一箇所に閉じ込めて直列化する。
+1. test-only env var を削除し、public env behavior を検証する test だけを shared guard / test-support crate に集約する。
 2. path resolution は `manifest::paths` に集約し、path precedence rule を別の場所で重複実装しない。
-3. credential source は resolved config 上で明示し、process-env convention を増やすより typed secret reference へ寄せる。
-4. fallback env は独立した設定項目として増やさず、対応する main key の解決順として文書化する。
-5. 空の env value は、変数 category に応じて unset / invalid のどちらとして扱うかを一貫させ、新しい supported variable を追加する場合は挙動を文書化する。
-6. 外部 process integration が env inheritance / filtering を必要とする場合は、ambient な inherited process state に頼らず、明示的な policy boundary として設計する。
+3. credential source は resolved config 上で明示し、process-env convention を増やすより typed secret reference へ寄せる。encrypted secret store 導入時に credential env var 依存を削除する。
+4. `INSOMNIA_POD_COMMAND` は削除し、Pod runtime 起動は `current_exe() + ["pod"]` の typed command に一本化する。
+5. fallback env は独立した設定項目として増やさず、対応する main key の解決順として文書化する。
+6. 空の env value は、変数 category に応じて unset / invalid のどちらとして扱うかを一貫させ、新しい supported variable を追加する場合は挙動を文書化する。
+7. 外部 process integration が env inheritance / filtering を必要とする場合は、ambient な inherited process state に頼らず、明示的な policy boundary として設計する。
