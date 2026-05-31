@@ -63,7 +63,7 @@ Credential env var は interoperability のために現時点では残ってい�
 
 ## Build / example / test 変数
 
-これらは通常の application configuration ではない。test-only の user-facing env var は supported surface として立てず、既存の `INSOMNIA_TEST_*` も削除する。test が public env behavior を検証する必要がある場合だけ、shared guard / test-support crate で process environment mutation を閉じ込める。
+これらは通常の application configuration ではない。test-only の user-facing env var は supported surface として立てず、既存のものも active code/tests から削除する。test が public env behavior を検証する必要がある場合だけ、shared guard / test-support crate で process environment mutation を閉じ込める。
 
 | 変数 | Context | 備考 |
 | --- | --- | --- |
@@ -78,7 +78,7 @@ Credential env var は interoperability のために現時点では残ってい�
 - `INSOMNIA_USER_MANIFEST` は通常の profile-based Pod/TUI startup の一部ではない。one-file manifest の debug / compatibility path には `insomnia pod --manifest <PATH>` を使う。
 - ambient `.insomnia/manifest.toml` discovery は通常の fresh startup の一部ではない。
 - `INSOMNIA_POD_COMMAND` は single-binary 化に伴って削除する。Pod runtime は `insomnia pod ...` の typed command として起動する。
-- `INSOMNIA_TEST_*` のような test-only 環境変数は supported surface にしない。既存利用も削除する。
+- 開発・テスト専用の環境変数は supported surface にしない。既存利用も削除する。
 - `insomnia-pod` は installed command ではない。Pod runtime は `insomnia pod ...` から起動する。
 - 通常 runtime は `.env` ファイルを load しない。
 
