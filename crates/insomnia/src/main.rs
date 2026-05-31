@@ -222,10 +222,14 @@ fn parse_args_slice(args: &[String]) -> Result<Mode, ParseError> {
             "--pod and a positional Pod name are mutually exclusive".to_string(),
         ));
     }
-    let pod_name = pod_name.or(positional);
 
     if profile.is_some()
-        && (resume || session.is_some() || pod_name.is_some() || socket_override.is_some() || multi)
+        && (resume
+            || session.is_some()
+            || pod_name.is_some()
+            || positional.is_some()
+            || socket_override.is_some()
+            || multi)
     {
         return Err(ParseError(
             "--profile can only be used for fresh spawn".to_string(),
@@ -243,6 +247,11 @@ fn parse_args_slice(args: &[String]) -> Result<Mode, ParseError> {
     }
     if multi && pod_name.is_some() {
         return Err(ParseError(
+            "--multi and --pod are mutually exclusive".to_string(),
+        ));
+    }
+    if multi && positional.is_some() {
+        return Err(ParseError(
             "--multi cannot be used with a positional Pod name".to_string(),
         ));
     }
@@ -256,7 +265,17 @@ fn parse_args_slice(args: &[String]) -> Result<Mode, ParseError> {
             "--pod and --session are mutually exclusive".to_string(),
         ));
     }
-    if socket_override.is_some() && pod_name.is_none() {
+    if pod_name.is_some() && resume {
+        return Err(ParseError(
+            "--pod and --resume are mutually exclusive".to_string(),
+        ));
+    }
+    if positional.is_some() && resume {
+        return Err(ParseError(
+            "--resume cannot be used with a positional Pod name".to_string(),
+        ));
+    }
+    if socket_override.is_some() && pod_name.is_none() && positional.is_none() {
         return Err(ParseError(
             "--socket requires --pod or a positional Pod name".to_string(),
         ));
@@ -270,6 +289,7 @@ fn parse_args_slice(args: &[String]) -> Result<Mode, ParseError> {
     if multi {
         return Ok(Mode::Tui(LaunchMode::Multi));
     }
+    let pod_name = pod_name.or(positional);
     if let Some(pod_name) = pod_name {
         return Ok(Mode::Tui(LaunchMode::PodName {
             pod_name,
@@ -430,6 +450,29 @@ mod tests {
     }
 
     #[test]
+    fn parse_rejects_resume_and_pod_name_selection() {
+        let cases = [
+            (
+                vec!["-r".to_string(), "--pod".to_string(), "agent".to_string()],
+                "--pod and --resume are mutually exclusive",
+            ),
+            (
+                vec!["--pod".to_string(), "agent".to_string(), "-r".to_string()],
+                "--pod and --resume are mutually exclusive",
+            ),
+            (
+                vec!["-r".to_string(), "agent".to_string()],
+                "--resume cannot be used with a positional Pod name",
+            ),
+        ];
+
+        for (args, message) in cases {
+            let err = parse_args_from(args).unwrap_err();
+            assert_eq!(err.to_string(), message);
+        }
+    }
+
+    #[test]
     fn parse_profile_spawn_mode() {
         match parse_args_from(["--profile", "/profiles/coder.lua"]).unwrap() {
             Mode::Tui(LaunchMode::Spawn { profile }) => {
@@ -527,7 +570,7 @@ mod tests {
                     "--pod".to_string(),
                     "agent".to_string(),
                 ],
-                "--multi cannot be used with a positional Pod name",
+                "--multi and --pod are mutually exclusive",
             ),
             (
                 vec!["--multi".to_string(), "agent".to_string()],
