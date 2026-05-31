@@ -43,10 +43,8 @@ Builtin profiles and catalogs are embedded in the binary at build time. User/pro
 Provider API key と WebSearch credential は、通常の runtime では環境変数から読まない。`insomnia keys` で local secret store に論理 id を追加し、profile / manifest / provider catalog / web config がその id を明示的に参照する。
 
 ```toml
-[[models]]
-id = "anthropic/claude-sonnet-4"
-scheme = "anthropic"
-model = "claude-sonnet-4-20250514"
+[model]
+ref = "anthropic/claude-sonnet-4-6"
 auth = { kind = "secret_ref", ref = "providers/anthropic/default" }
 
 [web]

@@ -239,16 +239,44 @@ pub async fn launch() -> ExitCode {
 
 type UiResult<T> = Result<T, Box<dyn std::error::Error>>;
 
+struct TerminalRestoreGuard {
+    active: bool,
+}
+
+impl TerminalRestoreGuard {
+    fn new() -> Self {
+        Self { active: true }
+    }
+
+    fn restore(mut self) {
+        self.cleanup();
+        self.active = false;
+    }
+
+    fn cleanup(&mut self) {
+        let _ = execute!(io::stdout(), crossterm::cursor::Show, LeaveAlternateScreen);
+        let _ = disable_raw_mode();
+    }
+}
+
+impl Drop for TerminalRestoreGuard {
+    fn drop(&mut self) {
+        if self.active {
+            self.cleanup();
+        }
+    }
+}
+
 fn run(store: SecretStore) -> UiResult<()> {
     enable_raw_mode()?;
+    let guard = TerminalRestoreGuard::new();
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, crossterm::cursor::Hide)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     let result = run_loop(&mut terminal, store);
-    let mut stdout = io::stdout();
-    let _ = execute!(stdout, crossterm::cursor::Show, LeaveAlternateScreen);
-    let _ = disable_raw_mode();
+    drop(terminal);
+    guard.restore();
     result
 }
 
