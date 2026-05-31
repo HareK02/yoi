@@ -376,11 +376,21 @@ impl PromptCatalog {
 
     /// Render `PodPrompt::ResidentKnowledgeSection` with `{{ entries }}`
     /// (a pre-formatted list block authored by the caller).
-    pub fn resident_knowledge_section(&self, entries: &str) -> Result<String, CatalogError> {
-        self.render(
-            PodPrompt::ResidentKnowledgeSection,
-            single("entries", entries),
-        )
+    pub fn resident_knowledge_section(
+        &self,
+        entries: &str,
+        knowledge_query_available: bool,
+        memory_read_available: bool,
+    ) -> Result<String, CatalogError> {
+        use std::collections::BTreeMap;
+        let mut m: BTreeMap<&'static str, Value> = BTreeMap::new();
+        m.insert("entries", Value::from(entries));
+        m.insert(
+            "knowledge_query_available",
+            Value::from(knowledge_query_available),
+        );
+        m.insert("memory_read_available", Value::from(memory_read_available));
+        self.render(PodPrompt::ResidentKnowledgeSection, Value::from(m))
     }
 
     /// Render `PodPrompt::ResidentWorkflowsSection` with `{{ entries }}`
@@ -537,6 +547,7 @@ mod tests {
         for rendered in [compact, extract, consolidate] {
             assert!(!rendered.contains("### Memory and knowledge"));
             assert!(!rendered.contains("Do not query memory every turn"));
+            assert!(!rendered.contains("Strong lookup triggers include"));
         }
     }
 

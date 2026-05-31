@@ -125,6 +125,7 @@ impl SystemPromptTemplate {
             ctx.resident_summary,
             ctx.resident_knowledge,
             ctx.resident_workflows,
+            ToolCapabilities::from_tool_names(&ctx.tool_names),
         )
     }
 }
@@ -199,7 +200,69 @@ impl<'a> SystemPromptContext<'a> {
                     .collect::<Vec<_>>(),
             ),
         );
+        root.insert(
+            "tool_capabilities".into(),
+            ToolCapabilities::from_tool_names(&self.tool_names).to_minijinja_value(),
+        );
         Value::from(root)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ToolCapabilities {
+    memory_query: bool,
+    knowledge_query: bool,
+    memory_read: bool,
+    memory_write: bool,
+    memory_edit: bool,
+    memory_delete: bool,
+}
+
+impl ToolCapabilities {
+    fn from_tool_names(names: &[String]) -> Self {
+        let mut capabilities = Self::default();
+        for name in names {
+            match name.as_str() {
+                "MemoryQuery" => capabilities.memory_query = true,
+                "KnowledgeQuery" => capabilities.knowledge_query = true,
+                "MemoryRead" => capabilities.memory_read = true,
+                "MemoryWrite" => capabilities.memory_write = true,
+                "MemoryEdit" => capabilities.memory_edit = true,
+                "MemoryDelete" => capabilities.memory_delete = true,
+                _ => {}
+            }
+        }
+        capabilities
+    }
+
+    fn memory_records(self) -> bool {
+        self.memory_query
+            || self.memory_read
+            || self.memory_write
+            || self.memory_edit
+            || self.memory_delete
+    }
+
+    fn memory_any(self) -> bool {
+        self.memory_records() || self.knowledge_query
+    }
+
+    fn memory_mutation(self) -> bool {
+        self.memory_write || self.memory_edit || self.memory_delete
+    }
+
+    fn to_minijinja_value(self) -> Value {
+        let mut map: BTreeMap<&'static str, Value> = BTreeMap::new();
+        map.insert("memory_any", Value::from(self.memory_any()));
+        map.insert("memory_records", Value::from(self.memory_records()));
+        map.insert("memory_query", Value::from(self.memory_query));
+        map.insert("knowledge_query", Value::from(self.knowledge_query));
+        map.insert("memory_read", Value::from(self.memory_read));
+        map.insert("memory_write", Value::from(self.memory_write));
+        map.insert("memory_edit", Value::from(self.memory_edit));
+        map.insert("memory_delete", Value::from(self.memory_delete));
+        map.insert("memory_mutation", Value::from(self.memory_mutation()));
+        Value::from(map)
     }
 }
 
@@ -209,7 +272,7 @@ impl<'a> SystemPromptContext<'a> {
 /// comes from the prompt catalog (`PodPrompt::WorkingBoundariesSection`
 /// / `PodPrompt::AgentsMdSection`) so that wording can be overridden
 /// per-pack without touching this function.
-pub fn append_trailing_section(
+fn append_trailing_section(
     body: &str,
     prompts: &PromptCatalog,
     scope: &Scope,
@@ -217,6 +280,7 @@ pub fn append_trailing_section(
     resident_summary: Option<&str>,
     resident_knowledge: Option<&[ResidentKnowledgeEntry]>,
     resident_workflows: Option<&[ResidentWorkflowEntry]>,
+    tool_capabilities: ToolCapabilities,
 ) -> Result<String, SystemPromptError> {
     let mut out = String::with_capacity(body.len() + 256);
     out.push_str(body);
@@ -247,7 +311,11 @@ pub fn append_trailing_section(
         if !entries.is_empty() {
             out.push('\n');
             let formatted = format_resident_knowledge_entries(entries);
-            let section = prompts.resident_knowledge_section(&formatted)?;
+            let section = prompts.resident_knowledge_section(
+                &formatted,
+                tool_capabilities.knowledge_query,
+                tool_capabilities.memory_read,
+            )?;
             out.push_str(section.trim_end_matches(&['\n', ' '][..]));
             out.push('\n');
         }
@@ -414,6 +482,20 @@ mod tests {
         }
     }
 
+    fn memory_tool_names() -> Vec<String> {
+        [
+            "MemoryQuery",
+            "KnowledgeQuery",
+            "MemoryRead",
+            "MemoryWrite",
+            "MemoryEdit",
+            "MemoryDelete",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect()
+    }
+
     /// Lazily-initialised builtin catalog shared across system-prompt
     /// tests, so every `ctx()` can hand out a `&'static PromptCatalog`
     /// reference without forcing test bodies to create one per call.
@@ -438,18 +520,70 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let scope = build_scope(dir.path());
         let rendered = tmpl
-            .render(&ctx(dir.path(), &scope, vec!["Read".into()], None))
+            .render(&ctx(dir.path(), &scope, memory_tool_names(), None))
             .unwrap();
         // Builtin default body must expose the tool and language policies.
         assert!(rendered.contains("### Memory and knowledge"));
-        assert!(rendered.contains("MemoryQuery"));
+        assert!(rendered.contains("small targeted `MemoryQuery` / `KnowledgeQuery`"));
+        assert!(rendered.contains("Strong lookup triggers include"));
         assert!(rendered.contains("MemoryRead(kind=summary)"));
         assert!(rendered.contains("Do not query memory every turn"));
+        assert!(rendered.contains("MemoryWrite"));
         assert!(rendered.contains("## Language"));
         assert!(rendered.contains("`language`: `match the user's language"));
         // Trailing section must be present.
         assert!(rendered.contains("## Working boundaries"));
         assert!(rendered.contains("Readable:"));
+    }
+
+    #[test]
+    fn instruction_default_omits_memory_guidance_without_memory_tools() {
+        let loader = PromptLoader::builtins_only();
+        let tmpl = SystemPromptTemplate::parse("$insomnia/default", loader).unwrap();
+        let dir = TempDir::new().unwrap();
+        let scope = build_scope(dir.path());
+        let rendered = tmpl
+            .render(&ctx(
+                dir.path(),
+                &scope,
+                vec!["Read".into(), "Edit".into()],
+                None,
+            ))
+            .unwrap();
+
+        assert!(!rendered.contains("### Memory and knowledge"));
+        assert!(!rendered.contains("MemoryQuery"));
+        assert!(!rendered.contains("KnowledgeQuery"));
+        assert!(!rendered.contains("MemoryRead"));
+        assert!(!rendered.contains("MemoryWrite"));
+        assert!(!rendered.contains("MemoryEdit"));
+        assert!(!rendered.contains("MemoryDelete"));
+        assert!(rendered.contains("## Language"));
+        assert!(rendered.contains("## Working boundaries"));
+    }
+
+    #[test]
+    fn memory_guidance_names_only_available_memory_tools() {
+        let loader = PromptLoader::builtins_only();
+        let tmpl = SystemPromptTemplate::parse("$insomnia/default", loader).unwrap();
+        let dir = TempDir::new().unwrap();
+        let scope = build_scope(dir.path());
+        let rendered = tmpl
+            .render(&ctx(
+                dir.path(),
+                &scope,
+                vec!["MemoryQuery".into(), "MemoryRead".into()],
+                None,
+            ))
+            .unwrap();
+
+        assert!(rendered.contains("### Memory and knowledge"));
+        assert!(rendered.contains("small targeted `MemoryQuery`"));
+        assert!(rendered.contains("MemoryRead(kind=summary)"));
+        assert!(!rendered.contains("KnowledgeQuery"));
+        assert!(!rendered.contains("MemoryWrite"));
+        assert!(!rendered.contains("MemoryEdit"));
+        assert!(!rendered.contains("MemoryDelete"));
     }
 
     #[test]
@@ -706,10 +840,30 @@ mod tests {
         assert!(rendered.contains("- alpha: first record"));
         // Newline in description is folded to a space (one entry per line).
         assert!(rendered.contains("- beta: second record with newline"));
+        assert!(!rendered.contains("KnowledgeQuery"));
+        assert!(!rendered.contains("MemoryRead"));
         // Resident section sits *after* the working-boundaries header.
         let pos_boundaries = rendered.find("## Working boundaries").unwrap();
         let pos_resident = rendered.find("## Resident knowledge").unwrap();
         assert!(pos_resident > pos_boundaries);
+    }
+
+    #[test]
+    fn trailing_section_mentions_resident_knowledge_tools_when_available() {
+        let (_tmp, loader) = user_loader_with("body.md", "BODY");
+        let tmpl = SystemPromptTemplate::parse("$user/body", loader).unwrap();
+        let dir = TempDir::new().unwrap();
+        let scope = build_scope(dir.path());
+        let entries = [ResidentKnowledgeEntry {
+            slug: "alpha".into(),
+            description: "first record".into(),
+        }];
+        let mut context = ctx_with_resident(dir.path(), &scope, &entries);
+        context.tool_names = memory_tool_names();
+        let rendered = tmpl.render(&context).unwrap();
+
+        assert!(rendered.contains("## Resident knowledge"));
+        assert!(rendered.contains("KnowledgeQuery / MemoryRead"));
     }
 
     #[test]
