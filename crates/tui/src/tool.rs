@@ -12,7 +12,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::block::{Block, ToolCallBlock, ToolCallState};
 use crate::cache::FileCache;
-use crate::ui::Mode;
+use crate::view_mode::Mode;
 
 /// Maximum body lines in normal mode for tool output previews.
 const NORMAL_MAX_BODY: usize = 5;

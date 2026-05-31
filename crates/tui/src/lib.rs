@@ -12,6 +12,7 @@ mod spawn;
 mod task;
 mod tool;
 mod ui;
+mod view_mode;
 
 use std::future::Future;
 use std::io;
