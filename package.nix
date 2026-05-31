@@ -93,6 +93,7 @@ rustPlatform.buildRustPackage rec {
 
   postInstall = ''
     install -Dm644 docs/nix.md "$out/share/doc/insomnia/nix.md"
+    install -Dm644 docs/environment.md "$out/share/doc/insomnia/environment.md"
     mkdir -p "$out/share/insomnia"
     cp -R resources "$out/share/insomnia/resources"
   '';
@@ -112,6 +113,7 @@ rustPlatform.buildRustPackage rec {
 
     test -d "$out/share/insomnia/resources/prompts"
     test -f "$out/share/doc/insomnia/nix.md"
+    test -f "$out/share/doc/insomnia/environment.md"
 
     runHook postInstallCheck
   '';

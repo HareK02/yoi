@@ -17,6 +17,7 @@ The package output contains:
 - `bin/insomnia` — terminal UI and `insomnia pod ...` runtime entrypoint.
 - `share/insomnia/resources/` — bundled runtime resources, including `resources/prompts/`.
 - `share/doc/insomnia/nix.md` — this document.
+- `share/doc/insomnia/environment.md` — environment-variable policy and supported variables.
 
 ## Run
 
@@ -46,7 +47,7 @@ The Nix package does not put user configuration, sessions, sockets, or other mut
 | Persistent data (`sessions/`, Pod metadata) | `INSOMNIA_DATA_DIR` | `$INSOMNIA_HOME` | `$HOME/.insomnia` |
 | Runtime state (sockets, lock files, live registry) | `INSOMNIA_RUNTIME_DIR` | `$INSOMNIA_HOME/run` | `$XDG_RUNTIME_DIR/insomnia`, then `$HOME/.insomnia/run` |
 
-Normal fresh startup is profile-based. The package ships a builtin default profile, user/project `profiles.toml` files may select or define profiles, and `insomnia pod --manifest <PATH>` remains a one-file compatibility/debug input. `INSOMNIA_USER_MANIFEST` and ambient `.insomnia/manifest.toml` discovery are not part of normal Pod/TUI startup.
+Normal fresh startup is profile-based. The package ships a builtin default profile, user/project `profiles.toml` files may select or define profiles, and `insomnia pod --manifest <PATH>` remains a one-file compatibility/debug input. `INSOMNIA_USER_MANIFEST` and ambient `.insomnia/manifest.toml` discovery are not part of normal Pod/TUI startup. See [`environment.md`](environment.md) for the environment-variable policy; new configuration should prefer profiles/manifests/config files over additional environment variables.
 
 ## Validation
 
