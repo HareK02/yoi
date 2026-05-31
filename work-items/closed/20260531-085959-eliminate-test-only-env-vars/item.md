@@ -2,12 +2,12 @@
 id: 20260531-085959-eliminate-test-only-env-vars
 slug: eliminate-test-only-env-vars
 title: Tests: eliminate test-only environment variables
-status: open
+status: closed
 kind: task
 priority: P2
 labels: [test, env, cleanup]
 created_at: 2026-05-31T08:59:59Z
-updated_at: 2026-05-31T10:03:55Z
+updated_at: 2026-05-31T10:04:28Z
 assignee: null
 legacy_ticket: null
 ---
