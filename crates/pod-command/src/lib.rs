@@ -1,4 +1,4 @@
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -28,21 +28,15 @@ impl PodRuntimeCommand {
     }
 
     pub fn for_executable(program: impl Into<PathBuf>) -> Self {
-        let program = program.into();
-        let prefix_args = if is_legacy_pod_binary(&program) {
-            Vec::new()
-        } else {
-            vec![OsString::from("pod")]
-        };
-        Self::new(program, prefix_args)
+        Self::new(program, vec![OsString::from("pod")])
     }
 
     /// Resolve the Pod runtime command used for subprocess launches.
     ///
     /// `INSOMNIA_POD_COMMAND` is intentionally executable-only: its value is
     /// used as the program path without shell parsing and without the unified
-    /// `pod` prefix arg. That keeps existing development/test overrides safe
-    /// while the default path moves to `current_exe() + ["pod"]`.
+    /// `pod` prefix arg. That keeps development/test overrides safe while the
+    /// default path is always `current_exe() + ["pod"]`.
     pub fn resolve() -> io::Result<Self> {
         if let Some(command) = Self::from_override_env() {
             return Ok(command);
@@ -87,14 +81,6 @@ impl fmt::Display for PodRuntimeCommand {
     }
 }
 
-fn is_legacy_pod_binary(program: &Path) -> bool {
-    let Some(file_name) = program.file_name().and_then(OsStr::to_str) else {
-        return false;
-    };
-    let stem = file_name.strip_suffix(".exe").unwrap_or(file_name);
-    stem == "insomnia-pod"
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,17 +123,17 @@ mod tests {
     }
 
     #[test]
-    fn legacy_wrapper_keeps_executable_only_command() {
-        let command = PodRuntimeCommand::for_executable("/opt/insomnia/bin/insomnia-pod");
+    fn any_runtime_executable_gets_pod_prefix() {
+        let command = PodRuntimeCommand::for_executable("/opt/insomnia/bin/custom-runtime");
 
         assert_eq!(
             command.program(),
-            Path::new("/opt/insomnia/bin/insomnia-pod")
+            Path::new("/opt/insomnia/bin/custom-runtime")
         );
-        assert!(command.prefix_args().is_empty());
+        assert_eq!(command.prefix_args(), [OsString::from("pod")]);
         assert_eq!(
             command.argv_with(["--pod", "agent"]),
-            vec!["--pod", "agent"]
+            vec!["pod", "--pod", "agent"]
                 .into_iter()
                 .map(OsString::from)
                 .collect::<Vec<_>>()

@@ -5,7 +5,7 @@
 #
 # このファイル形式は低レベル runtime manifest。通常起動は profile discovery/default
 # (`profiles.toml` と bundled builtin profile) から manifest を生成する。
-# `insomnia-pod --manifest <path>` の one-file compatibility/debug mode では、
+# `insomnia pod --manifest <path>` の one-file compatibility/debug mode では、
 # 指定した TOML 1 枚に builtin defaults を merge し、required validation を行う。
 # user/project `manifest.toml` を暗黙に merge する通常起動 cascade は使わない。
 #

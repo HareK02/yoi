@@ -156,12 +156,12 @@ Profile and one-file Manifest CLI paths currently use builtin prompt assets only
 
 The rendered instruction body is followed by fixed Rust-provided sections for working boundaries and, when present, `AGENTS.md`. User templates cannot remove the scope section.
 
-## `insomnia-pod` CLI
+## `insomnia pod` CLI
 
 Normal fresh startup uses profile discovery/default selection:
 
 ```text
-insomnia-pod [--profile <selector>] [--profile-pod-name <name>] [-s/--store <path>]
+insomnia pod [--profile <selector>] [--profile-pod-name <name>] [-s/--store <path>]
 ```
 
 | Flag | Description |
@@ -173,8 +173,8 @@ insomnia-pod [--profile <selector>] [--profile-pod-name <name>] [-s/--store <pat
 Restore/attach uses Pod/session state and does not re-evaluate profile sources.
 
 ```text
-insomnia-pod --pod <name>
-insomnia-pod --session <uuid>
+insomnia pod --pod <name>
+insomnia pod --session <uuid>
 ```
 
 Spawn children use hidden `--spawn-config-json`, `--adopt`, and `--callback <path>` flags. These are internal handoff details used by `SpawnPod` after the parent has allocated scope and prepared the child config.
