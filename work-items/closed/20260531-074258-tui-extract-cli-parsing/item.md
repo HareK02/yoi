@@ -2,12 +2,12 @@
 id: 20260531-074258-tui-extract-cli-parsing
 slug: tui-extract-cli-parsing
 title: TUI: extract CLI parsing from main.rs
-status: open
+status: closed
 kind: task
 priority: P2
 labels: [tui, cleanup]
 created_at: 2026-05-31T07:42:58Z
-updated_at: 2026-05-31T07:42:58Z
+updated_at: 2026-05-31T13:38:30Z
 assignee: null
 legacy_ticket: null
 ---
