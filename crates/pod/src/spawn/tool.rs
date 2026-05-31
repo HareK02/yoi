@@ -991,7 +991,6 @@ return profile {
             base_url: Some("https://example.test".into()),
             model_id: Some("claude-sonnet-4".into()),
             auth: Some(AuthRef::ApiKey {
-                env: None,
                 file: Some(PathBuf::from("/etc/keys/anthropic")),
             }),
             ..Default::default()

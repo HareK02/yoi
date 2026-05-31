@@ -12,6 +12,7 @@ use markup5ever_rcdom::{Handle, NodeData, RcDom};
 use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, LOCATION};
 use reqwest::{Client, Url};
 use schemars::JsonSchema;
+use secrets::SecretStore;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::net::lookup_host;
@@ -36,6 +37,7 @@ const WEB_FETCH_TRUNCATION_MARKER: &str = "\n[truncated]";
 pub struct WebTools {
     config: Option<WebConfig>,
     client: Client,
+    secret_store: Option<SecretStore>,
 }
 
 impl WebTools {
@@ -45,7 +47,25 @@ impl WebTools {
             .user_agent("insomnia-web-tools/0.1")
             .build()
             .expect("static reqwest client configuration is valid");
-        Self { config, client }
+        let secret_store = manifest::paths::data_dir().map(SecretStore::new);
+        Self {
+            config,
+            client,
+            secret_store,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_client_and_secret_store(
+        config: Option<WebConfig>,
+        client: Client,
+        secret_store: Option<SecretStore>,
+    ) -> Self {
+        Self {
+            config,
+            client,
+            secret_store,
+        }
     }
 
     fn global_enabled(&self) -> bool {
@@ -153,11 +173,19 @@ impl WebTools {
         match cfg.provider.ok_or_else(|| {
             disabled_error(
                 "WebSearch",
-                "set web.search.provider = \"brave\" and web.search.api_key_env",
+                "set web.search.provider = \"brave\" and web.search.api_key_secret",
             )
         })? {
             WebSearchProvider::Brave => {
-                brave_search(&self.client, cfg, &input.query, limit, offset).await
+                brave_search(
+                    &self.client,
+                    cfg,
+                    self.secret_store.as_ref(),
+                    &input.query,
+                    limit,
+                    offset,
+                )
+                .await
             }
         }
     }
@@ -213,28 +241,35 @@ pub fn web_fetch_tool(tools: WebTools) -> ToolDefinition {
 async fn brave_search(
     client: &Client,
     cfg: &WebSearchConfig,
+    secret_store: Option<&SecretStore>,
     query: &str,
     limit: usize,
     offset: usize,
 ) -> Result<ToolOutput, ToolError> {
-    let api_key_env = cfg.api_key_env.as_ref().ok_or_else(|| {
+    let api_key_secret = cfg.api_key_secret.as_ref().ok_or_else(|| {
         disabled_error(
             "WebSearch",
-            "set web.search.api_key_env to an environment variable containing the Brave API key",
+            "set web.search.api_key_secret to the insomnia keys secret id for the Brave API key",
         )
     })?;
-    let api_key = std::env::var(api_key_env).map_err(|_| {
+    let store = secret_store.ok_or_else(|| {
+        ToolError::ExecutionFailed(
+            "WebSearch provider is configured but the local secret store path is unavailable"
+                .into(),
+        )
+    })?;
+    let api_key = store.get(api_key_secret).map_err(|err| {
         ToolError::ExecutionFailed(format!(
-            "WebSearch provider is configured but environment variable {api_key_env} is not set"
+            "WebSearch provider is configured but secret `{api_key_secret}` could not be resolved: {err}"
         ))
     })?;
-    if api_key.trim().is_empty() {
+    if api_key.expose_secret().trim().is_empty() {
         return Err(ToolError::ExecutionFailed(format!(
-            "WebSearch provider is configured but environment variable {api_key_env} is empty"
+            "WebSearch provider is configured but secret `{api_key_secret}` is empty"
         )));
     }
 
-    brave_search_with_api_key(client, cfg, &api_key, query, limit, offset).await
+    brave_search_with_api_key(client, cfg, api_key.expose_secret(), query, limit, offset).await
 }
 
 async fn brave_search_with_api_key(
@@ -1709,7 +1744,7 @@ mod tests {
         WebSearchConfig {
             enabled: Some(true),
             provider: Some(WebSearchProvider::Brave),
-            api_key_env: None,
+            api_key_secret: Some("web/brave/test".into()),
             timeout_secs: Some(2),
             base_url: Some(base_url),
             ..Default::default()
@@ -2035,6 +2070,49 @@ mod tests {
         let value: Value = serde_json::from_str(result.content.as_deref().unwrap()).unwrap();
         assert_eq!(value.get("text").unwrap().as_str().unwrap(), "final");
         assert_eq!(value.get("redirects").unwrap().as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn searches_brave_with_secret_ref() {
+        let response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"web\":{\"results\":[{\"title\":\"Example\",\"url\":\"https://example.com\",\"description\":\"Snippet\"}]}}";
+        let (addr, captured) = serve_once_capture(response).await;
+        let dir = tempfile::tempdir().unwrap();
+        let store = SecretStore::at_path_for_tests(dir.path().join("secrets/store.json"));
+        store
+            .set(
+                "web/brave/test",
+                secrets::SecretValue::new("test-secret-ref"),
+            )
+            .unwrap();
+        let tools = WebTools::with_client_and_secret_store(
+            Some(WebConfig {
+                enabled: Some(true),
+                allow_private_addresses: Some(true),
+                search: Some(brave_search_config(format!("http://{addr}/search"))),
+                fetch: None,
+            }),
+            Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap(),
+            Some(store),
+        );
+        let result = tools
+            .run_search(WebSearchInput {
+                query: "insomnia".into(),
+                limit: Some(1),
+                offset: Some(0),
+            })
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_str(result.content.as_deref().unwrap()).unwrap();
+        let request = captured.lock().await.clone().unwrap();
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("x-subscription-token: test-secret-ref\r\n")
+        );
+        assert_eq!(value["results"][0]["title"], "Example");
     }
 
     #[tokio::test]

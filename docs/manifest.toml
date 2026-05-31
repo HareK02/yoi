@@ -63,18 +63,16 @@ ref = "anthropic/claude-sonnet-4-6"
 # base_url = "https://api.anthropic.com"
 
 # 任意 (ref 未指定時は実質必須)。デフォルト: なし。
-# kind の値: "none" | "api_key" | "codex_oauth"
+# kind の値: "none" | "secret_ref" | "api_key" | "codex_oauth"
 #   - "none"        … 認証不要 (ローカル Ollama 等)
-#   - "api_key"     … env / file のいずれかで key を渡す。両方指定なら env 優先。
-#                     env 未指定時は scheme ごとの既定環境変数:
-#                       Anthropic                    -> INSOMNIA_API_KEY_ANTHROPIC
-#                       OpenaiChat / OpenaiResponses -> INSOMNIA_API_KEY_OPENAI
-#                       Gemini                       -> INSOMNIA_API_KEY_GEMINI
-#                     file 指定時、相対パスは manifest base 起点で解決。
+#   - "secret_ref"  … `insomnia keys` の local secret store から key を読む。
+#                     `ref` はユーザー設定が明示的に選ぶ論理 secret id。
+#                     store は id -> value のみを持ち、provider 種別を解釈しない。
+#   - "api_key"     … 明示ファイルから key を読む低レベル形式。通常は
+#                     `secret_ref` を使う。file 指定時、相対パスは manifest base 起点で解決。
 #   - "codex_oauth" … ChatGPT OAuth (`~/.codex/auth.json`)。追加フィールドなし。
 # auth = { kind = "none" }
-# auth = { kind = "api_key" }                                          # env のみ既定使用
-# auth = { kind = "api_key", env = "MY_ANTHROPIC_KEY" }
+# auth = { kind = "secret_ref", ref = "providers/anthropic/default" }
 # auth = { kind = "api_key", file = "./sk-ant.local" }
 # auth = { kind = "codex_oauth" }
 

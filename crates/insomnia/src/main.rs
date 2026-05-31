@@ -15,6 +15,7 @@ enum Mode {
     MemoryLintHelp,
     MemoryLint(LintCliOptions),
     PodRuntime(Vec<String>),
+    Keys,
     Tui(LaunchMode),
 }
 
@@ -58,6 +59,7 @@ async fn main() -> ExitCode {
             }
         },
         Mode::PodRuntime(args) => pod::entrypoint::run_cli_from("insomnia pod", args).await,
+        Mode::Keys => tui::keys::launch().await,
         Mode::Tui(mode) => {
             let runtime_command = match PodRuntimeCommand::resolve() {
                 Ok(command) => command,
@@ -96,6 +98,12 @@ fn parse_args_slice(args: &[String]) -> Result<Mode, ParseError> {
     match args[0].as_str() {
         "--help" | "-h" => return Ok(Mode::Help),
         "pod" => return Ok(Mode::PodRuntime(args[1..].to_vec())),
+        "keys" => {
+            if args.len() != 1 {
+                return Err(ParseError("insomnia keys does not accept arguments".into()));
+            }
+            return Ok(Mode::Keys);
+        }
         "memory" if args.get(1).map(String::as_str) == Some("lint") => {
             let lint_args = &args[2..];
             if lint_args.iter().any(|arg| arg == "--help" || arg == "-h") {
@@ -314,7 +322,7 @@ fn parse_session_id(value: &str) -> Result<SegmentId, ParseError> {
 
 fn print_help() {
     println!(
-        "insomnia\n\nUsage:\n  insomnia [OPTIONS] [POD_NAME]\n  insomnia pod [POD_OPTIONS]\n  insomnia memory lint [OPTIONS]\n\nOptions:\n  -r, --resume           Open the Pod picker and resume/attach a Pod\n      --multi            Open the multi-Pod dashboard\n      --pod <NAME>       Attach/restore/create a Pod by name\n      --socket <PATH>    Attach to a specific Pod socket with --pod\n      --session <UUID>   Resume a specific session segment\n      --profile <REF>    Start a fresh Pod from a profile\n  -h, --help             Print help\n"
+        "insomnia\n\nUsage:\n  insomnia [OPTIONS] [POD_NAME]\n  insomnia keys\n  insomnia pod [POD_OPTIONS]\n  insomnia memory lint [OPTIONS]\n\nOptions:\n  -r, --resume           Open the Pod picker and resume/attach a Pod\n      --multi            Open the multi-Pod dashboard\n      --pod <NAME>       Attach/restore/create a Pod by name\n      --socket <PATH>    Attach to a specific Pod socket with --pod\n      --session <UUID>   Resume a specific session segment\n      --profile <REF>    Start a fresh Pod from a profile\n  -h, --help             Print help\n"
     );
 }
 
@@ -375,6 +383,14 @@ mod tests {
         match parse_args_from(["pod", "--pod", "agent", "--profile", "default"]).unwrap() {
             Mode::PodRuntime(args) => assert_eq!(args, ["--pod", "agent", "--profile", "default"]),
             _ => panic!("expected PodRuntime mode"),
+        }
+    }
+
+    #[test]
+    fn parse_keys_subcommand() {
+        match parse_args_from(["keys"]).unwrap() {
+            Mode::Keys => {}
+            _ => panic!("expected Keys mode"),
         }
     }
 

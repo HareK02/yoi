@@ -147,6 +147,6 @@ Pod が操作できるファイルパスの制御。
 | Task | `TaskCreate`, `TaskUpdate`, `TaskList`, `TaskGet` | セッション内の短期 task 状態管理 |
 | Memory / Knowledge | `MemoryQuery`, `MemoryRead`, `MemoryWrite`, `MemoryEdit`, `MemoryDelete`, `KnowledgeQuery` | manifest の memory 設定が有効な時に登録される durable memory / knowledge 操作 |
 | Pod orchestration | `SpawnPod`, `SendToPod`, `ReadPodOutput`, `StopPod`, `ListPods`, `RestorePod` | child / visible Pod の起動・通信・停止・一覧・復元 |
-| Web | `WebSearch`, `WebFetch` | manifest/env で明示設定された provider 経由の bounded web access |
+| Web | `WebSearch`, `WebFetch` | manifest で明示設定された provider と local secret-store reference 経由の bounded web access |
 
 すべての tool call は manifest tool permission と scope/policy のチェックを通る。ファイル write scope、Pod delegation、memory layout、web provider 設定はそれぞれ別の authority を持ち、UI 表示だけで権限を広げない。

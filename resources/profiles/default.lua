@@ -36,7 +36,7 @@ return profile {
     enabled = true,
     search = {
       provider = "brave",
-      api_key_env = "BRAVE_SEARCH_API_KEY",
+      api_key_secret = "web/brave/default",
     },
   },
 }

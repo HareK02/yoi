@@ -2473,6 +2473,7 @@ dependencies = [
  "llm-worker",
  "manifest",
  "reqwest",
+ "secrets",
  "serde",
  "serde_json",
  "serial_test",
@@ -3046,6 +3047,17 @@ name = "sdd"
 version = "3.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "490dcfcbfef26be6800d11870ff2df8774fa6e86d047e3e8c8a76b25655e41ca"
+
+[[package]]
+name = "secrets"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.18",
+]
 
 [[package]]
 name = "security-framework"
@@ -3783,6 +3795,7 @@ dependencies = [
  "markup5ever_rcdom",
  "reqwest",
  "schemars",
+ "secrets",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -3932,6 +3945,7 @@ dependencies = [
  "protocol",
  "pulldown-cmark",
  "ratatui",
+ "secrets",
  "serde",
  "serde_json",
  "session-store",

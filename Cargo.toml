@@ -6,6 +6,7 @@ members = [
     "crates/llm-worker",
     "crates/llm-worker-macros",
     "crates/session-store",
+    "crates/secrets",
     "crates/manifest",
     "crates/pod",
     "crates/insomnia",
@@ -41,6 +42,7 @@ protocol = { path = "crates/protocol" }
 provider = { path = "crates/provider" }
 session-metrics = { path = "crates/session-metrics" }
 session-store = { path = "crates/session-store" }
+secrets = { path = "crates/secrets" }
 tools = { path = "crates/tools" }
 tui = { path = "crates/tui" }
 
