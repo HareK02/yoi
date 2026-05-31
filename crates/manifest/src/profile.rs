@@ -22,6 +22,8 @@ use crate::{
 
 const PROFILE_FORMAT_V1: &str = "insomnia.lua-profile.v1";
 const BUILTIN_DEFAULT_PROFILE_NAME: &str = "default";
+const BUILTIN_DEFAULT_PROFILE: &str = include_str!("../../../resources/profiles/default.lua");
+const BUILTIN_MODEL_CATALOG: &str = include_str!("../../../resources/models/builtin.toml");
 const DEFAULT_POD_NAME: &str = "insomnia";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -126,7 +128,10 @@ pub enum ProfileSource {
     Registry {
         source: ProfileRegistrySource,
         name: String,
-        path: PathBuf,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<PathBuf>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provenance: Option<String>,
     },
 }
 
@@ -134,15 +139,62 @@ pub enum ProfileSource {
 pub struct ProfileRegistryEntry {
     pub source: ProfileRegistrySource,
     pub name: String,
-    pub path: PathBuf,
+    pub path: Option<PathBuf>,
+    pub provenance: String,
     pub description: Option<String>,
     pub is_default: bool,
+    artifact: ProfileRegistryArtifact,
 }
 
 impl ProfileRegistryEntry {
     pub fn qualified_name(&self) -> String {
         format!("{}:{}", self.source, self.name)
     }
+
+    fn path(
+        source: ProfileRegistrySource,
+        name: String,
+        path: PathBuf,
+        description: Option<String>,
+    ) -> Self {
+        let provenance = path.display().to_string();
+        Self {
+            source,
+            name,
+            path: Some(path.clone()),
+            provenance,
+            description,
+            is_default: false,
+            artifact: ProfileRegistryArtifact::Path(path),
+        }
+    }
+
+    fn embedded(
+        source: ProfileRegistrySource,
+        name: &'static str,
+        label: &'static str,
+        content: &'static str,
+        description: Option<String>,
+    ) -> Self {
+        Self {
+            source,
+            name: name.to_string(),
+            path: None,
+            provenance: label.to_string(),
+            description,
+            is_default: false,
+            artifact: ProfileRegistryArtifact::Embedded { label, content },
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProfileRegistryArtifact {
+    Path(PathBuf),
+    Embedded {
+        label: &'static str,
+        content: &'static str,
+    },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -241,7 +293,6 @@ struct ProfileDefault {
 
 #[derive(Debug, Clone)]
 pub struct ProfileDiscovery {
-    builtin_dir: Option<PathBuf>,
     user_config: Option<PathBuf>,
     project_config: Option<PathBuf>,
 }
@@ -249,27 +300,19 @@ pub struct ProfileDiscovery {
 impl ProfileDiscovery {
     pub fn for_cwd(cwd: &Path) -> Self {
         Self {
-            builtin_dir: paths::builtin_profiles_dir(),
             user_config: paths::user_profiles_path(),
             project_config: find_project_profiles_from(cwd),
         }
     }
-    pub fn with_sources(
-        builtin_dir: Option<PathBuf>,
-        user_config: Option<PathBuf>,
-        project_config: Option<PathBuf>,
-    ) -> Self {
+    pub fn with_sources(user_config: Option<PathBuf>, project_config: Option<PathBuf>) -> Self {
         Self {
-            builtin_dir,
             user_config,
             project_config,
         }
     }
     pub fn discover(&self) -> Result<ProfileRegistry, ProfileError> {
         let mut registry = ProfileRegistry::default();
-        if let Some(dir) = &self.builtin_dir {
-            discover_profile_dir(&mut registry, ProfileRegistrySource::Builtin, dir)?;
-        }
+        add_builtin_profiles(&mut registry);
         if let Some(path) = &self.user_config {
             load_profile_registry_file(&mut registry, ProfileRegistrySource::User, path)?;
         }
@@ -371,15 +414,27 @@ impl ProfileResolver {
             )),
             ProfileSelector::Named { .. } | ProfileSelector::Default => {
                 let entry = registry.select(selector)?.clone();
-                self.resolve_path(
-                    &entry.path,
-                    ProfileSource::Registry {
-                        source: entry.source,
-                        name: entry.name,
-                        path: absolutize(&entry.path)?,
-                    },
-                    options,
-                )
+                let source = ProfileSource::Registry {
+                    source: entry.source,
+                    name: entry.name.clone(),
+                    path: entry.path.as_deref().map(absolutize).transpose()?,
+                    provenance: (entry.path.is_none()).then(|| entry.provenance.clone()),
+                };
+                self.resolve_registry_entry(&entry, source, options)
+            }
+        }
+    }
+
+    fn resolve_registry_entry(
+        &self,
+        entry: &ProfileRegistryEntry,
+        source: ProfileSource,
+        options: ProfileResolveOptions,
+    ) -> Result<ResolvedProfile, ProfileError> {
+        match &entry.artifact {
+            ProfileRegistryArtifact::Path(path) => self.resolve_path(path, source, options),
+            ProfileRegistryArtifact::Embedded { label, content } => {
+                self.resolve_embedded_profile(label, content, source, options)
             }
         }
     }
@@ -425,6 +480,30 @@ impl ProfileResolver {
         resolve_lua_profile_value(
             source,
             &profile_dir,
+            &workspace_base,
+            options,
+            lua_value,
+            raw_artifact,
+        )
+    }
+
+    fn resolve_embedded_profile(
+        &self,
+        label: &'static str,
+        content: &'static str,
+        source: ProfileSource,
+        options: ProfileResolveOptions,
+    ) -> Result<ResolvedProfile, ProfileError> {
+        let workspace_base = absolutize(
+            self.workspace_base
+                .as_deref()
+                .unwrap_or_else(|| Path::new(".")),
+        )?;
+        let lua_value = evaluate_embedded_lua_profile(label, content)?;
+        let raw_artifact = lua_value.clone();
+        resolve_lua_profile_value(
+            source,
+            &workspace_base,
             &workspace_base,
             options,
             lua_value,
@@ -591,13 +670,12 @@ fn load_profile_registry_file(
     let base = path.parent().unwrap_or_else(|| Path::new("."));
     for (name, entry_config) in config.profile {
         let (entry_path, description) = entry_config.into_parts();
-        registry.push_entry(ProfileRegistryEntry {
+        registry.push_entry(ProfileRegistryEntry::path(
             source,
             name,
-            path: join_if_relative(base, &entry_path),
+            join_if_relative(base, &entry_path),
             description,
-            is_default: false,
-        });
+        ));
     }
     if let Some(default) = config.default {
         let (default_source, default_name) = parse_profile_ref(&default);
@@ -625,49 +703,14 @@ fn find_project_profiles_from(start: &Path) -> Option<PathBuf> {
     None
 }
 
-fn discover_profile_dir(
-    registry: &mut ProfileRegistry,
-    source: ProfileRegistrySource,
-    dir: &Path,
-) -> Result<(), ProfileError> {
-    if !dir.is_dir() {
-        return Ok(());
-    }
-    for entry in std::fs::read_dir(dir).map_err(|source| ProfileError::ConfigRead {
-        path: dir.to_path_buf(),
-        source,
-    })? {
-        let entry = entry.map_err(|source| ProfileError::ConfigRead {
-            path: dir.to_path_buf(),
-            source,
-        })?;
-        let path = entry.path();
-        if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("lua") {
-            if let Some(name) = path.file_stem().and_then(|s| s.to_str()) {
-                registry.push_entry(ProfileRegistryEntry {
-                    source,
-                    name: name.to_string(),
-                    path,
-                    description: None,
-                    is_default: false,
-                });
-            }
-        } else if path.is_dir() {
-            let profile = path.join("profile.lua");
-            if profile.is_file()
-                && let Some(name) = path.file_name().and_then(|s| s.to_str())
-            {
-                registry.push_entry(ProfileRegistryEntry {
-                    source,
-                    name: name.to_string(),
-                    path: profile,
-                    description: None,
-                    is_default: false,
-                });
-            }
-        }
-    }
-    Ok(())
+fn add_builtin_profiles(registry: &mut ProfileRegistry) {
+    registry.push_entry(ProfileRegistryEntry::embedded(
+        ProfileRegistrySource::Builtin,
+        BUILTIN_DEFAULT_PROFILE_NAME,
+        "builtin:default",
+        BUILTIN_DEFAULT_PROFILE,
+        Some("Bundled default Insomnia coding profile".into()),
+    ));
 }
 
 fn parse_profile_ref(raw: &str) -> (Option<ProfileRegistrySource>, String) {
@@ -687,15 +730,38 @@ fn evaluate_lua_profile(
         path: path.to_path_buf(),
         source,
     })?;
+    evaluate_lua_profile_source(
+        &content,
+        path.display().to_string(),
+        LocalModuleRoot::Filesystem(module_root.to_path_buf()),
+    )
+}
+
+fn evaluate_embedded_lua_profile(
+    label: &'static str,
+    content: &'static str,
+) -> Result<serde_json::Value, ProfileError> {
+    evaluate_lua_profile_source(
+        content,
+        label.to_string(),
+        LocalModuleRoot::Disabled { label },
+    )
+}
+
+fn evaluate_lua_profile_source(
+    content: &str,
+    chunk_name: String,
+    module_root: LocalModuleRoot,
+) -> Result<serde_json::Value, ProfileError> {
     let lua = Lua::new_with(
         StdLib::TABLE | StdLib::STRING | StdLib::MATH | StdLib::UTF8,
         LuaOptions::default(),
     )
     .map_err(ProfileError::Lua)?;
-    install_lua_api(&lua, module_root.to_path_buf())?;
+    install_lua_api(&lua, module_root)?;
     let value: LuaValue = lua
-        .load(&content)
-        .set_name(path.display().to_string())
+        .load(content)
+        .set_name(chunk_name)
         .eval()
         .map_err(ProfileError::Lua)?;
     match value {
@@ -706,7 +772,7 @@ fn evaluate_lua_profile(
     }
 }
 
-fn install_lua_api(lua: &Lua, module_root: PathBuf) -> Result<(), ProfileError> {
+fn install_lua_api(lua: &Lua, module_root: LocalModuleRoot) -> Result<(), ProfileError> {
     let loader = Rc::new(RefCell::new(LocalModuleLoader {
         root: module_root,
         cache: HashMap::new(),
@@ -743,9 +809,14 @@ fn install_lua_api(lua: &Lua, module_root: PathBuf) -> Result<(), ProfileError> 
 }
 
 struct LocalModuleLoader {
-    root: PathBuf,
+    root: LocalModuleRoot,
     cache: HashMap<String, RegistryKey>,
     loading: HashSet<String>,
+}
+
+enum LocalModuleRoot {
+    Filesystem(PathBuf),
+    Disabled { label: &'static str },
 }
 
 fn require_module(
@@ -773,7 +844,19 @@ fn require_module(
             )));
         }
     }
-    let path = local_module_path(&loader.borrow().root, name).map_err(mlua::Error::RuntimeError)?;
+    let path = {
+        let state = loader.borrow();
+        match &state.root {
+            LocalModuleRoot::Filesystem(root) => {
+                local_module_path(root, name).map_err(mlua::Error::RuntimeError)?
+            }
+            LocalModuleRoot::Disabled { label } => {
+                return Err(mlua::Error::RuntimeError(format!(
+                    "local require `{name}` is not available for embedded profile `{label}`"
+                )));
+            }
+        }
+    };
     let content = std::fs::read_to_string(&path).map_err(|e| {
         mlua::Error::RuntimeError(format!(
             "failed to read local module `{name}` ({}): {e}",
@@ -1042,9 +1125,7 @@ fn model_context_window(model: Option<&ModelManifest>) -> Option<u64> {
 }
 fn builtin_model_context_window(reference: &str) -> Option<u64> {
     let (provider, model_id) = reference.split_once('/')?;
-    let path = paths::resource_dir()?.join("models").join("builtin.toml");
-    let content = std::fs::read_to_string(path).ok()?;
-    let parsed: toml::Value = toml::from_str(&content).ok()?;
+    let parsed: toml::Value = toml::from_str(BUILTIN_MODEL_CATALOG).ok()?;
     for entry in parsed.get("model")?.as_array()? {
         let table = entry.as_table()?;
         if table.get("provider")?.as_str()? == provider && table.get("id")?.as_str()? == model_id {
@@ -1187,58 +1268,8 @@ pub enum ProfileError {
 mod tests {
     use super::*;
     use crate::{ReasoningControl, ReasoningEffort, SchemeKind};
-    use std::sync::{Mutex, MutexGuard, OnceLock};
     use tempfile::TempDir;
 
-    fn env_lock() -> MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-    }
-    struct EnvGuard {
-        vars: Vec<(&'static str, Option<String>)>,
-        _lock: MutexGuard<'static, ()>,
-    }
-    impl EnvGuard {
-        fn new(overrides: &[(&'static str, Option<&str>)]) -> Self {
-            let lock = env_lock();
-            let names = [
-                "INSOMNIA_CONFIG_DIR",
-                "INSOMNIA_RESOURCE_DIR",
-                "INSOMNIA_HOME",
-                "XDG_CONFIG_HOME",
-                "HOME",
-            ];
-            let saved: Vec<_> = names.iter().map(|n| (*n, std::env::var(n).ok())).collect();
-            unsafe {
-                for (n, _) in &saved {
-                    std::env::remove_var(n);
-                }
-                for (n, v) in overrides {
-                    if let Some(v) = v {
-                        std::env::set_var(n, v);
-                    }
-                }
-            }
-            Self {
-                vars: saved,
-                _lock: lock,
-            }
-        }
-    }
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            unsafe {
-                for (n, v) in &self.vars {
-                    match v {
-                        Some(v) => std::env::set_var(n, v),
-                        None => std::env::remove_var(n),
-                    }
-                }
-            }
-        }
-    }
     fn write_profile(dir: &Path, name: &str, body: &str) -> PathBuf {
         let path = dir.join(name);
         std::fs::write(&path, body).unwrap();
@@ -1266,14 +1297,15 @@ mod tests {
     }
     #[test]
     fn builtin_default_profile_is_registered_as_default() {
-        let registry = ProfileDiscovery::with_sources(paths::builtin_profiles_dir(), None, None)
+        let registry = ProfileDiscovery::with_sources(None, None)
             .discover()
             .unwrap();
         let default = registry.default_entry().unwrap();
         assert_eq!(default.source, ProfileRegistrySource::Builtin);
         assert_eq!(default.name, BUILTIN_DEFAULT_PROFILE_NAME);
         assert!(default.is_default);
-        assert!(default.path.ends_with("resources/profiles/default.lua"));
+        assert_eq!(default.path, None);
+        assert_eq!(default.provenance, "builtin:default");
     }
     #[test]
     fn resolves_plain_lua_profile_with_runtime_pod_name_and_scope_intent() {
@@ -1458,6 +1490,15 @@ return profile {
             resolved.profile.as_ref().unwrap().name.as_deref(),
             Some("default")
         );
+        assert_eq!(
+            resolved.source,
+            ProfileSource::Registry {
+                source: ProfileRegistrySource::Builtin,
+                name: "default".into(),
+                path: None,
+                provenance: Some("builtin:default".into()),
+            }
+        );
     }
     #[test]
     fn unsupported_profile_extension_has_clear_diagnostic() {
@@ -1486,14 +1527,19 @@ return profile {
         )
         .unwrap();
         std::fs::write(&project_config, "default = \"project:coder\"\n[profile.coder]\npath = \"profiles/project-coder.lua\"\ndescription = \"Project coder\"\n").unwrap();
-        let registry =
-            ProfileDiscovery::with_sources(None, Some(user_config), Some(project_config))
-                .discover()
-                .unwrap();
+        let registry = ProfileDiscovery::with_sources(Some(user_config), Some(project_config))
+            .discover()
+            .unwrap();
         let default = registry.default_entry().unwrap();
         assert_eq!(default.source, ProfileRegistrySource::Project);
         assert_eq!(default.name, "coder");
-        assert!(default.path.ends_with("profiles/project-coder.lua"));
+        assert!(
+            default
+                .path
+                .as_ref()
+                .unwrap()
+                .ends_with("profiles/project-coder.lua")
+        );
     }
     #[test]
     fn default_marks_direct_profile_entry() {
@@ -1506,7 +1552,7 @@ return profile {
             "default = \"coder\"\n[profile]\ncoder = \"profiles/coder.lua\"\n",
         )
         .unwrap();
-        let registry = ProfileDiscovery::with_sources(None, None, Some(project_config))
+        let registry = ProfileDiscovery::with_sources(None, Some(project_config))
             .discover()
             .unwrap();
         let default = registry.default_entry().unwrap();
@@ -1525,20 +1571,18 @@ return profile {
     #[test]
     fn unqualified_ambiguous_names_fail_closed() {
         let mut registry = ProfileRegistry::default();
-        registry.push_entry(ProfileRegistryEntry {
-            source: ProfileRegistrySource::User,
-            name: "coder".to_string(),
-            path: PathBuf::from("/user/coder.lua"),
-            description: None,
-            is_default: false,
-        });
-        registry.push_entry(ProfileRegistryEntry {
-            source: ProfileRegistrySource::Project,
-            name: "coder".to_string(),
-            path: PathBuf::from("/project/coder.lua"),
-            description: None,
-            is_default: false,
-        });
+        registry.push_entry(ProfileRegistryEntry::path(
+            ProfileRegistrySource::User,
+            "coder".to_string(),
+            PathBuf::from("/user/coder.lua"),
+            None,
+        ));
+        registry.push_entry(ProfileRegistryEntry::path(
+            ProfileRegistrySource::Project,
+            "coder".to_string(),
+            PathBuf::from("/project/coder.lua"),
+            None,
+        ));
         let err = registry
             .select(&ProfileSelector::named("coder"))
             .unwrap_err();
@@ -1549,6 +1593,9 @@ return profile {
                 "coder",
             ))
             .unwrap();
-        assert_eq!(selected.path, PathBuf::from("/project/coder.lua"));
+        assert_eq!(
+            selected.path.as_deref(),
+            Some(Path::new("/project/coder.lua"))
+        );
     }
 }

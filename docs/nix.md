@@ -15,7 +15,6 @@ The default package is implemented by `package.nix` and builds the Cargo package
 The package output contains:
 
 - `bin/insomnia` — terminal UI and `insomnia pod ...` runtime entrypoint.
-- `share/insomnia/resources/` — bundled runtime resources, including `resources/prompts/`.
 - `share/doc/insomnia/nix.md` — this document.
 - `share/doc/insomnia/environment.md` — environment-variable policy and supported variables.
 
@@ -47,7 +46,7 @@ The Nix package does not put user configuration, sessions, sockets, or other mut
 | Persistent data (`sessions/`, Pod metadata) | `INSOMNIA_DATA_DIR` | `$INSOMNIA_HOME` | `$HOME/.insomnia` |
 | Runtime state (sockets, lock files, live registry) | `INSOMNIA_RUNTIME_DIR` | `$INSOMNIA_HOME/run` | `$XDG_RUNTIME_DIR/insomnia`, then `$HOME/.insomnia/run` |
 
-Normal fresh startup is profile-based. The package ships a builtin default profile, user/project `profiles.toml` files may select or define profiles, and `insomnia pod --manifest <PATH>` remains a one-file compatibility/debug input. `INSOMNIA_USER_MANIFEST` and ambient `.insomnia/manifest.toml` discovery are not part of normal Pod/TUI startup. See [`environment.md`](environment.md) for the environment-variable policy; new configuration should prefer profiles/manifests/config files over additional environment variables.
+Normal fresh startup is profile-based. The package includes the builtin default profile in the binary, user/project `profiles.toml` files may select or define profiles, and `insomnia pod --manifest <PATH>` remains a one-file compatibility/debug input. `INSOMNIA_USER_MANIFEST` and ambient `.insomnia/manifest.toml` discovery are not part of normal Pod/TUI startup. See [`environment.md`](environment.md) for the environment-variable policy; new configuration should prefer profiles/manifests/config files over additional environment variables.
 
 ## Validation
 
@@ -56,7 +55,8 @@ The package derivation has a credential-free install check that verifies:
 - `insomnia pod --help` starts successfully.
 - `insomnia` is installed and reaches argument parsing.
 - `bin/insomnia-pod` is not installed.
-- bundled prompt resources and this Nix usage document are present in the output.
+- embedded builtin profiles do not require `share/insomnia/resources` at runtime.
+- this Nix usage document is present in the output.
 
 For full validation before handing changes to review, run:
 
@@ -73,4 +73,3 @@ These checks do not require provider credentials.
 
 - The package currently installs only the `insomnia` command; development-only wrappers from `devshell.nix` are not part of the installable package.
 - The TUI does not currently expose a conventional `--help` / `--version` CLI path, so the package smoke check uses an argument-parse failure path for the TUI rather than launching an interactive session.
-- Bundled resources are installed under `share/insomnia/resources/` for packaging completeness and inspection. Built-in prompt/resource loading remains governed by the existing application code and user/project override rules.

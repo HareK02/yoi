@@ -25,9 +25,6 @@
 
 use std::path::PathBuf;
 
-/// Environment variable that points at installed project resources.
-pub const RESOURCE_DIR_ENV: &str = "INSOMNIA_RESOURCE_DIR";
-
 /// 設定ディレクトリ。`profiles.toml`, `providers.toml`, `models.toml`,
 /// `prompts/` などが置かれる。
 pub fn config_dir() -> Option<PathBuf> {
@@ -73,32 +70,6 @@ pub fn user_profiles_path() -> Option<PathBuf> {
 /// `<config_dir>/prompts/` — user prompts ライブラリ。
 pub fn user_prompts_dir() -> Option<PathBuf> {
     user_prompts_dir_from_config_dir(config_dir())
-}
-
-/// Root resource directory used for bundled prompts, profiles, catalogs, and docs.
-pub fn resource_dir() -> Option<PathBuf> {
-    if let Some(p) = env_path(RESOURCE_DIR_ENV) {
-        return Some(p);
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(prefix) = exe.parent().and_then(|bin| bin.parent()) {
-            let installed = prefix.join("share").join("insomnia").join("resources");
-            if installed.exists() {
-                return Some(installed);
-            }
-        }
-    }
-    Some(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join("resources"),
-    )
-}
-
-/// Bundled Lua profile registry directory. Missing directories are treated as
-/// an empty builtin registry by discovery.
-pub fn builtin_profiles_dir() -> Option<PathBuf> {
-    Some(resource_dir()?.join("profiles"))
 }
 
 /// `<config_dir>/prompts.toml` — user prompt pack。
