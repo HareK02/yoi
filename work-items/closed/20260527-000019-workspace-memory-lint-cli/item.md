@@ -2,12 +2,12 @@
 id: 20260527-000019-workspace-memory-lint-cli
 slug: workspace-memory-lint-cli
 title: ワークスペースのメモリーをLintするヘッドレスCLI
-status: open
+status: closed
 kind: task
 priority: P2
 labels: [migrated, memory, cli]
 created_at: 2026-05-27T00:00:19Z
-updated_at: 2026-05-31T02:14:28Z
+updated_at: 2026-05-31T02:15:17Z
 assignee: null
 legacy_ticket: null
 ---

@@ -78,3 +78,28 @@ Validation adequacy: coder-reported validation is sufficient for this ticket. Re
 
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-05-31T02:15:16Z -->
+
+## Implementation report
+
+Main workspace validation after merge:
+
+- `cargo fmt --check` passed
+- `cargo test -p tui memory_lint -- --nocapture` passed (10 passed)
+- `cargo test -p tui` passed (224 passed)
+- `cargo check -p tui` passed with pre-existing dead-code warnings in `llm-worker` and `tui`
+- `./tickets.sh doctor` passed
+- `git diff --check` passed
+
+
+---
+
+<!-- event: close author: hare at: 2026-05-31T02:15:17Z status: closed -->
+
+## Closed
+
+Implemented `insomnia memory lint` as a headless command in the existing user-facing `insomnia` binary. The command lints workspace memory/knowledge records with the existing `memory::Linter` using `WriteMode::Update`, supports human and JSON output, handles warnings-as-errors, preserves `insomnia memory` as a positional Pod name, and returns before TUI/raw-terminal or Pod connection paths. External review approved and validation passed.
+
+
+---
