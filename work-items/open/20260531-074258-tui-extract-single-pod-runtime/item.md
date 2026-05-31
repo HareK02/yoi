@@ -7,7 +7,7 @@ kind: task
 priority: P2
 labels: [tui, cleanup]
 created_at: 2026-05-31T07:42:58Z
-updated_at: 2026-05-31T13:46:30Z
+updated_at: 2026-05-31T13:56:32Z
 assignee: null
 legacy_ticket: null
 ---

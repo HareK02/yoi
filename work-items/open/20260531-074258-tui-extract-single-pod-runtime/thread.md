@@ -56,3 +56,36 @@ Validation:
 
 
 ---
+
+<!-- event: review author: hare at: 2026-05-31T13:56:32Z status: approve -->
+
+## Review: approve
+
+External reviewer: `tui-runtime-reviewer-20260531`
+Reviewed implementation commit: `4d89718` (`tui: extract single pod runtime`)
+Verdict: approve
+
+Summary:
+- This is a behavior-preserving mechanical extraction.
+- `crates/tui/src/lib.rs` is now a façade/high-level dispatcher.
+- Single-Pod runtime/event-loop code now lives in `crates/tui/src/single_pod.rs`.
+- Public `tui::launch`, `LaunchOptions`, and `LaunchMode` signatures remain stable.
+
+Requirements mapping:
+- `lib.rs` keeps module declarations, public launch API/types, and high-level mode dispatch.
+- `single_pod.rs` owns Pod-name/spawn/resume attach paths, fullscreen terminal helpers, main loop/drain logic, key/mouse handling, and the focused tests that cover those behaviors.
+- Terminal setup/restore behavior is preserved: raw mode/bracketed paste global setup remains in `lib.rs`, while fullscreen/alternate-screen helpers moved with single-Pod runtime code.
+- Input queueing, interruption, task reminders, compact/rewind handling, and Pod socket behavior are moved with tests and unchanged by inspection.
+- No render helper move, `multi_pod.rs` split, App rewrite, keybinding redesign, Pod protocol/profile/manifest change, crate rename, or CLI ownership regression was introduced.
+
+Blockers: none.
+
+Non-blocking follow-up:
+- `single_pod.rs` now contains a thin `run_multi` dashboard bridge. This is acceptable here because it bridges dashboard open requests into private single-Pod attach helpers, but if dashboard orchestration grows a future cleanup could move that bridge into a small launch/runtime coordination module.
+
+Validation adequacy:
+- Coder validation covered fmt, full TUI tests, TUI/insomnia check, doctor, and diff check.
+- Reviewer reran `cargo fmt --check`, `cargo test -p tui`, `cargo check -p tui -p insomnia`, `./tickets.sh doctor`, and `git diff --check HEAD^ HEAD`; all passed with existing dead-code warnings.
+
+
+---
