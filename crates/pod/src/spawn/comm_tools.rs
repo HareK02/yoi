@@ -1,7 +1,7 @@
 //! Pod-to-Pod communication tools.
 //!
-//! Four tools in one module — `SendToPod`, `ReadPodOutput`, `StopPod`,
-//! `ListPods` — all built on the same `SpawnedPodRegistry` handed in by
+//! Three tools in one module: `SendToPod`, `ReadPodOutput`, `StopPod`,
+//! all built on the same `SpawnedPodRegistry` handed in by
 //! the controller. Each operation is request-response: connect to the
 //! target's Unix socket, perform one method exchange, disconnect.
 //!
@@ -23,7 +23,6 @@ use session_store::LogEntry;
 use tokio::net::UnixStream;
 
 use crate::runtime::dir::SpawnedPodRecord;
-use crate::runtime::pod_registry::{self, LockFileGuard};
 use crate::spawn::registry::SpawnedPodRegistry;
 
 /// Timeout applied to each socket-level operation — connect, write,
@@ -245,81 +244,34 @@ pub fn stop_pod_tool(registry: Arc<SpawnedPodRegistry>) -> ToolDefinition {
 }
 
 // ---------------------------------------------------------------------------
-// ListPods
-// ---------------------------------------------------------------------------
-
-const LIST_PODS_DESCRIPTION: &str = "List all Pods spawned by this Pod along with their reachability \
-status (`alive` / `stopped`) and the scope each was granted.";
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct EmptyInput {}
-
-struct ListPodsTool {
-    registry: Arc<SpawnedPodRegistry>,
-}
-
-#[async_trait]
-impl Tool for ListPodsTool {
-    async fn execute(&self, _input_json: &str) -> Result<ToolOutput, ToolError> {
-        let records = self.registry.list().await;
-        if records.is_empty() {
-            return Ok(ToolOutput {
-                summary: "no spawned pods".into(),
-                content: None,
-            });
-        }
-
-        let mut lines: Vec<String> = Vec::with_capacity(records.len());
-        let mut stale_names: Vec<String> = Vec::new();
-        for record in &records {
-            let alive = is_reachable(&record.socket_path).await;
-            let status = if alive { "alive" } else { "stopped" };
-            let scope = summarize_scope(record);
-            lines.push(format!("{} [{status}] scope={scope}", record.pod_name));
-            if !alive {
-                stale_names.push(record.pod_name.clone());
-            }
-        }
-
-        // Trigger stale reclaim on unreachable pods so the lock file's
-        // allocation table doesn't keep growing indefinitely when
-        // children crash without a clean exit path.
-        if !stale_names.is_empty() {
-            if let Ok(lock_path) = pod_registry::default_registry_path()
-                && let Ok(mut guard) = LockFileGuard::open(&lock_path)
-            {
-                pod_registry::reclaim_stale(&mut guard);
-            }
-        }
-
-        let summary = format!("{} pod(s) known", records.len());
-        Ok(ToolOutput {
-            summary,
-            content: Some(lines.join("\n")),
-        })
-    }
-}
-
-pub fn list_pods_tool(registry: Arc<SpawnedPodRegistry>) -> ToolDefinition {
-    Arc::new(move || {
-        let schema = schemars::schema_for!(EmptyInput);
-        let schema_value = serde_json::to_value(schema).unwrap_or(serde_json::json!({}));
-        let meta = ToolMeta::new("ListPods")
-            .description(LIST_PODS_DESCRIPTION)
-            .input_schema(schema_value);
-        let tool: Arc<dyn Tool> = Arc::new(ListPodsTool {
-            registry: registry.clone(),
-        });
-        (meta, tool)
-    })
-}
-
-// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
 fn unknown_pod_err(name: &str) -> ToolError {
     ToolError::InvalidArgument(format!("no spawned pod named `{name}`"))
+}
+
+fn summarize_scope(record: &SpawnedPodRecord) -> String {
+    if record.scope_delegated.is_empty() {
+        return "(none)".into();
+    }
+    let parts: Vec<String> = record
+        .scope_delegated
+        .iter()
+        .map(|rule| {
+            let perm = match rule.permission {
+                manifest::Permission::Read => "read",
+                manifest::Permission::Write => "write",
+            };
+            let recursive = if rule.recursive {
+                ""
+            } else {
+                " [non-recursive]"
+            };
+            format!("{perm}:{}{recursive}", rule.target.display())
+        })
+        .collect();
+    parts.join(", ")
 }
 
 /// Connect with a timeout, drain the server's connect-time snapshot,
@@ -487,14 +439,6 @@ async fn fetch_history(socket: &Path) -> std::io::Result<Vec<serde_json::Value>>
     }
 }
 
-/// Probe-connect test. Connection accepted within timeout → alive.
-async fn is_reachable(socket: &Path) -> bool {
-    tokio::time::timeout(SOCKET_OP_TIMEOUT, UnixStream::connect(socket))
-        .await
-        .map(|r| r.is_ok())
-        .unwrap_or(false)
-}
-
 fn extract_assistant_text(entries: &[serde_json::Value]) -> String {
     let mut out = String::new();
     for value in entries {
@@ -534,25 +478,6 @@ fn push_assistant_text(out: &mut String, logged: session_store::LoggedItem) {
             }
         }
     }
-}
-
-fn summarize_scope(record: &SpawnedPodRecord) -> String {
-    if record.scope_delegated.is_empty() {
-        return "(none)".into();
-    }
-    let parts: Vec<String> = record
-        .scope_delegated
-        .iter()
-        .map(|r| {
-            let perm = match r.permission {
-                manifest::Permission::Read => "read",
-                manifest::Permission::Write => "write",
-            };
-            let tag = if r.recursive { "" } else { " [non-recursive]" };
-            format!("{perm}:{}{tag}", r.target.display())
-        })
-        .collect();
-    parts.join(", ")
 }
 
 #[cfg(test)]

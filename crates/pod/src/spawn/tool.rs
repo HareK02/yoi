@@ -220,8 +220,8 @@ pub struct SpawnPodTool {
     /// override it. Defaults to the spawner's pwd — see module docs.
     spawner_pwd: PathBuf,
     /// Shared registry of spawned children, also used by the
-    /// pod-comm tools (`SendToPod` / `ReadPodOutput` / `StopPod` /
-    /// `ListPods`). Writes the list to runtime and durable Pod state on
+    /// pod-comm tools (`SendToPod` / `ReadPodOutput` / `StopPod`) and by
+    /// Pod discovery. Writes the list to runtime and durable Pod state on
     /// each add.
     registry: Arc<SpawnedPodRegistry>,
     /// THIS Pod's own parent-callback socket, if any. After a

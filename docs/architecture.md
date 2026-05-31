@@ -64,11 +64,11 @@ Pod の制御・監視に使う JSONL ベースのメッセージプロトコル
   - context/session 制御: `Compact`, `ListRewindTargets`, `RewindTo`
   - typed injection / child lifecycle: `Notify`, `PodEvent`
   - client 補助: `ListCompletions`
-  - Pod visibility / attach: `ListVisiblePods`, `InspectPod`, `AttachOrRestorePod`
+  - Pod visibility / restore: `ListPods`, `RestorePod`
 - **Pod → Client (`Event`)**
   - accepted input / history seed: `Snapshot`, `UserMessage`, `SystemItem`, `SegmentRotated`
   - generation stream: `TurnStart`, `TurnEnd`, `LlmCallStart`, `LlmCallEnd`, retry/continuation events, `Text*`, `Thinking*`, `ToolCall*`, `ToolResult`, `Usage`, `RunEnd`
-  - control replies: completions, rewind, visible Pod / inspect / attach results
+  - control replies: completions, rewind, visible Pod list / restore results
   - operational status: `Status`, `Alert`, `MemoryWorker`, `Compact*`, `Error`, `Shutdown`
 - リクエストとレスポンスの紐付けを一般化した RPC にはしない。多くの状態は broadcast event と Pod status で観測する
 - 一部の reply（例: completions）は要求 socket にだけ返る。broadcast event と request-local reply の違いは enum variant のコメントを正とする
@@ -146,8 +146,7 @@ Pod が操作できるファイルパスの制御。
 | File / shell | `Read`, `Write`, `Edit`, `Glob`, `Grep`, `Bash` | workspace ファイル操作と shell 実行。file tools は `ScopedFs` と read-before-edit tracker を通る。`Bash` は permission policy と出力退避で制御する |
 | Task | `TaskCreate`, `TaskUpdate`, `TaskList`, `TaskGet` | セッション内の短期 task 状態管理 |
 | Memory / Knowledge | `MemoryQuery`, `MemoryRead`, `MemoryWrite`, `MemoryEdit`, `MemoryDelete`, `KnowledgeQuery` | manifest の memory 設定が有効な時に登録される durable memory / knowledge 操作 |
-| Pod orchestration | `SpawnPod`, `SendToPod`, `ReadPodOutput`, `StopPod`, `ListPods` | child Pod の起動・通信・停止・一覧 |
-| Visible Pod state | `ListVisiblePods`, `InspectPod`, `AttachOrRestorePod` | durable Pod state と visibility に基づく Pod inspection / attach / restore |
+| Pod orchestration | `SpawnPod`, `SendToPod`, `ReadPodOutput`, `StopPod`, `ListPods`, `RestorePod` | child / visible Pod の起動・通信・停止・一覧・復元 |
 | Web | `WebSearch`, `WebFetch` | manifest/env で明示設定された provider 経由の bounded web access |
 
 すべての tool call は manifest tool permission と scope/policy のチェックを通る。ファイル write scope、Pod delegation、memory layout、web provider 設定はそれぞれ別の authority を持ち、UI 表示だけで権限を広げない。

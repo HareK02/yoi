@@ -1,4 +1,4 @@
-//! Pod-state-backed discovery and restore/attach tools.
+//! Pod-state-backed discovery and restore tools.
 //!
 //! This surface deliberately does not enumerate every Pod on the host. The
 //! listing path starts from the caller's visibility set (the caller itself and
@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
+use manifest::{Permission, ScopeRule};
 use pod_store::{PodActiveSegmentRef, PodMetadata, PodMetadataStore};
 use protocol::stream::JsonLineReader;
 use protocol::{Event, PodStatus};
@@ -24,6 +25,7 @@ use session_store::{SegmentId, SessionId};
 use tokio::net::UnixStream;
 use tokio::process::Command;
 
+use crate::runtime::dir::SpawnedPodRecord;
 use crate::runtime::pod_registry;
 use crate::spawn::registry::SpawnedPodRegistry;
 
@@ -97,26 +99,23 @@ where
         }
     }
 
-    pub async fn attach_or_restore(
-        &self,
-        pod_name: &str,
-    ) -> Result<AttachRestoreResult, PodDiscoveryError> {
-        match self.plan_attach_or_restore(pod_name).await? {
-            AttachRestorePlan::Attach {
+    pub async fn restore(&self, pod_name: &str) -> Result<RestoreResult, PodDiscoveryError> {
+        match self.plan_restore(pod_name).await? {
+            RestorePlan::AlreadyLive {
                 pod_name,
                 socket_path,
                 status,
-            } => Ok(AttachRestoreResult::Attached {
+            } => Ok(RestoreResult::AlreadyLive {
                 pod_name,
                 socket_path,
                 status,
             }),
-            AttachRestorePlan::Restore {
+            RestorePlan::Restore {
                 pod_name,
                 socket_path,
             } => {
                 self.spawn_restore_process(&pod_name, &socket_path).await?;
-                Ok(AttachRestoreResult::Restored {
+                Ok(RestoreResult::Restored {
                     pod_name,
                     socket_path,
                 })
@@ -124,13 +123,10 @@ where
         }
     }
 
-    pub async fn plan_attach_or_restore(
-        &self,
-        pod_name: &str,
-    ) -> Result<AttachRestorePlan, PodDiscoveryError> {
+    pub async fn plan_restore(&self, pod_name: &str) -> Result<RestorePlan, PodDiscoveryError> {
         let detail = self.inspect(pod_name).await?;
         if detail.live.reachable {
-            return Ok(AttachRestorePlan::Attach {
+            return Ok(RestorePlan::AlreadyLive {
                 pod_name: pod_name.to_string(),
                 socket_path: detail.live.socket_path,
                 status: detail.live.status,
@@ -153,7 +149,7 @@ where
         if let Some(lock) = lookup_segment_lock(segment_id)? {
             let lock_live = probe_socket(&lock.socket).await;
             return if lock_live.reachable {
-                Ok(AttachRestorePlan::Attach {
+                Ok(RestorePlan::AlreadyLive {
                     pod_name: lock.pod_name,
                     socket_path: lock.socket,
                     status: lock_live.status,
@@ -169,7 +165,7 @@ where
             };
         }
 
-        Ok(AttachRestorePlan::Restore {
+        Ok(RestorePlan::Restore {
             pod_name: pod_name.to_string(),
             socket_path: self.default_socket_path(pod_name),
         })
@@ -178,6 +174,7 @@ where
     async fn visibility(&self) -> Result<VisibilitySet, PodDiscoveryError> {
         let mut visible = BTreeMap::new();
         let mut child_sockets = BTreeMap::new();
+        let mut comm_registry = BTreeMap::new();
         visible.insert(self.self_pod_name.clone(), VisibilityReason::SelfPod);
 
         // Durable parent -> child state is the primary visibility source.
@@ -186,7 +183,8 @@ where
                 visible
                     .entry(child.pod_name.clone())
                     .or_insert(VisibilityReason::SpawnedChild);
-                child_sockets.insert(child.pod_name, child.socket_path);
+                child_sockets.insert(child.pod_name.clone(), child.socket_path.clone());
+                comm_registry.insert(child.pod_name.clone(), comm_info_from_spawned_child(&child));
             }
         }
 
@@ -197,12 +195,17 @@ where
             visible
                 .entry(record.pod_name.clone())
                 .or_insert(VisibilityReason::SpawnedChild);
-            child_sockets.insert(record.pod_name, record.socket_path);
+            child_sockets.insert(record.pod_name.clone(), record.socket_path.clone());
+            comm_registry.insert(
+                record.pod_name.clone(),
+                CommRegistryInfo::from_record(&record),
+            );
         }
 
         Ok(VisibilitySet {
             visible,
             child_sockets,
+            comm_registry,
         })
     }
 
@@ -222,6 +225,7 @@ where
                     active: detail.active,
                     live: detail.live,
                     restore: detail.restore,
+                    comm_registry: detail.comm_registry,
                     spawned_children: detail.spawned_children,
                     error: None,
                 }
@@ -233,6 +237,7 @@ where
                 active: None,
                 live: self.live_for_name(pod_name, None).await,
                 restore: RestoreInfo::not_possible("pod state missing"),
+                comm_registry: visibility.comm_info_for(pod_name),
                 spawned_children: SpawnedChildrenSummary::default(),
                 error: None,
             },
@@ -243,6 +248,7 @@ where
                 active: None,
                 live: self.live_for_name(pod_name, None).await,
                 restore: RestoreInfo::not_possible("pod state is unreadable"),
+                comm_registry: visibility.comm_info_for(pod_name),
                 spawned_children: SpawnedChildrenSummary::default(),
                 error: Some(error.to_string()),
             },
@@ -268,6 +274,7 @@ where
             active: metadata.active.map(ActivePointer::from),
             live,
             restore,
+            comm_registry: visibility.comm_info_for(&metadata.pod_name),
             spawned_children,
         }
     }
@@ -425,6 +432,33 @@ pub struct SpawnedChildrenSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommRegistryInfo {
+    pub registered: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub socket_path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scope_delegated: Vec<ScopeRule>,
+}
+
+impl CommRegistryInfo {
+    fn missing() -> Self {
+        Self {
+            registered: false,
+            socket_path: None,
+            scope_delegated: Vec::new(),
+        }
+    }
+
+    fn from_record(record: &SpawnedPodRecord) -> Self {
+        Self {
+            registered: true,
+            socket_path: Some(record.socket_path.clone()),
+            scope_delegated: record.scope_delegated.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VisiblePodItem {
     pub pod_name: String,
     pub visibility: VisibilityReason,
@@ -433,6 +467,7 @@ pub struct VisiblePodItem {
     pub active: Option<ActivePointer>,
     pub live: LiveInfo,
     pub restore: RestoreInfo,
+    pub comm_registry: CommRegistryInfo,
     pub spawned_children: SpawnedChildrenSummary,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -446,13 +481,14 @@ pub struct PodDetail {
     pub active: Option<ActivePointer>,
     pub live: LiveInfo,
     pub restore: RestoreInfo,
+    pub comm_registry: CommRegistryInfo,
     pub spawned_children: SpawnedChildrenSummary,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "action", rename_all = "snake_case")]
-pub enum AttachRestorePlan {
-    Attach {
+pub enum RestorePlan {
+    AlreadyLive {
         pod_name: String,
         socket_path: PathBuf,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -466,8 +502,8 @@ pub enum AttachRestorePlan {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "action", rename_all = "snake_case")]
-pub enum AttachRestoreResult {
-    Attached {
+pub enum RestoreResult {
+    AlreadyLive {
         pod_name: String,
         socket_path: PathBuf,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -514,6 +550,7 @@ pub enum PodDiscoveryError {
 struct VisibilitySet {
     visible: BTreeMap<String, VisibilityReason>,
     child_sockets: BTreeMap<String, PathBuf>,
+    comm_registry: BTreeMap<String, CommRegistryInfo>,
 }
 
 impl VisibilitySet {
@@ -526,6 +563,37 @@ impl VisibilitySet {
 
     fn child_socket_for(&self, pod_name: &str) -> Option<PathBuf> {
         self.child_sockets.get(pod_name).cloned()
+    }
+
+    fn comm_info_for(&self, pod_name: &str) -> CommRegistryInfo {
+        self.comm_registry
+            .get(pod_name)
+            .cloned()
+            .unwrap_or_else(CommRegistryInfo::missing)
+    }
+}
+
+fn comm_info_from_spawned_child(child: &pod_store::PodSpawnedChild) -> CommRegistryInfo {
+    let scope_delegated = child
+        .scope_delegated
+        .iter()
+        .filter_map(|rule| {
+            let permission = match rule.permission.as_str() {
+                "read" => Permission::Read,
+                "write" => Permission::Write,
+                _ => return None,
+            };
+            Some(ScopeRule {
+                target: rule.target.clone(),
+                permission,
+                recursive: rule.recursive,
+            })
+        })
+        .collect();
+    CommRegistryInfo {
+        registered: true,
+        socket_path: Some(child.socket_path.clone()),
+        scope_delegated,
     }
 }
 
@@ -604,16 +672,16 @@ fn resolve_pod_command() -> PathBuf {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct PodNameInput {
-    /// Pod name to inspect, attach, or restore.
+    /// Pod name to restore.
     name: String,
 }
 
-struct ListVisiblePodsTool<St> {
+struct ListPodsTool<St> {
     discovery: PodDiscovery<St>,
 }
 
 #[async_trait]
-impl<St> Tool for ListVisiblePodsTool<St>
+impl<St> Tool for ListPodsTool<St>
 where
     St: PodMetadataStore + Clone + Send + Sync + 'static,
 {
@@ -631,53 +699,28 @@ where
     }
 }
 
-struct InspectPodTool<St> {
+struct RestorePodTool<St> {
     discovery: PodDiscovery<St>,
 }
 
 #[async_trait]
-impl<St> Tool for InspectPodTool<St>
+impl<St> Tool for RestorePodTool<St>
 where
     St: PodMetadataStore + Clone + Send + Sync + 'static,
 {
     async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError> {
         let input: PodNameInput = serde_json::from_str(input_json)
-            .map_err(|e| ToolError::InvalidArgument(format!("invalid InspectPod input: {e}")))?;
-        let detail = self
-            .discovery
-            .inspect(&input.name)
-            .await
-            .map_err(discovery_error_to_tool_error)?;
-        Ok(ToolOutput {
-            summary: format!("pod `{}` inspected", detail.pod_name),
-            content: Some(json_content(&detail)?),
-        })
-    }
-}
-
-struct AttachOrRestorePodTool<St> {
-    discovery: PodDiscovery<St>,
-}
-
-#[async_trait]
-impl<St> Tool for AttachOrRestorePodTool<St>
-where
-    St: PodMetadataStore + Clone + Send + Sync + 'static,
-{
-    async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError> {
-        let input: PodNameInput = serde_json::from_str(input_json).map_err(|e| {
-            ToolError::InvalidArgument(format!("invalid AttachOrRestorePod input: {e}"))
-        })?;
+            .map_err(|e| ToolError::InvalidArgument(format!("invalid RestorePod input: {e}")))?;
         let result = self
             .discovery
-            .attach_or_restore(&input.name)
+            .restore(&input.name)
             .await
             .map_err(discovery_error_to_tool_error)?;
         let summary = match &result {
-            AttachRestoreResult::Attached { pod_name, .. } => {
-                format!("pod `{pod_name}` is live; attached to existing socket")
+            RestoreResult::AlreadyLive { pod_name, .. } => {
+                format!("pod `{pod_name}` is already live")
             }
-            AttachRestoreResult::Restored { pod_name, .. } => {
+            RestoreResult::Restored { pod_name, .. } => {
                 format!("pod `{pod_name}` restored from pod state")
             }
         };
@@ -688,55 +731,38 @@ where
     }
 }
 
-pub fn list_visible_pods_tool<St>(discovery: PodDiscovery<St>) -> ToolDefinition
+pub fn list_pods_tool<St>(discovery: PodDiscovery<St>) -> ToolDefinition
 where
     St: PodMetadataStore + Clone + Send + Sync + 'static,
 {
     Arc::new(move || {
-        let meta = ToolMeta::new("ListVisiblePods")
+        let meta = ToolMeta::new("ListPods")
             .description(
-                "List Pod state entries visible to this Pod. This is state-backed and does not expose the host-wide Pod universe.",
+                "List Pods visible to this Pod from durable Pod state and the spawned-child registry. This does not expose the host-wide Pod universe.",
             )
             .input_schema(serde_json::json!({
                 "type": "object",
                 "properties": {},
                 "additionalProperties": false,
             }));
-        let tool: Arc<dyn Tool> = Arc::new(ListVisiblePodsTool {
+        let tool: Arc<dyn Tool> = Arc::new(ListPodsTool {
             discovery: discovery.clone(),
         });
         (meta, tool)
     })
 }
 
-pub fn inspect_pod_tool<St>(discovery: PodDiscovery<St>) -> ToolDefinition
+pub fn restore_pod_tool<St>(discovery: PodDiscovery<St>) -> ToolDefinition
 where
     St: PodMetadataStore + Clone + Send + Sync + 'static,
 {
     Arc::new(move || {
-        let meta = ToolMeta::new("InspectPod")
+        let meta = ToolMeta::new("RestorePod")
             .description(
-                "Inspect one visible Pod by name from durable Pod state, distinguishing missing state from not-visible Pods.",
+                "Restore a visible stopped/restorable Pod, or report that a visible Pod is already live. Missing state is an error.",
             )
             .input_schema(serde_json::to_value(schemars::schema_for!(PodNameInput)).unwrap());
-        let tool: Arc<dyn Tool> = Arc::new(InspectPodTool {
-            discovery: discovery.clone(),
-        });
-        (meta, tool)
-    })
-}
-
-pub fn attach_or_restore_pod_tool<St>(discovery: PodDiscovery<St>) -> ToolDefinition
-where
-    St: PodMetadataStore + Clone + Send + Sync + 'static,
-{
-    Arc::new(move || {
-        let meta = ToolMeta::new("AttachOrRestorePod")
-            .description(
-                "Attach to a visible live Pod, or restore it from Pod state when no live socket is reachable. Missing state is an error.",
-            )
-            .input_schema(serde_json::to_value(schemars::schema_for!(PodNameInput)).unwrap());
-        let tool: Arc<dyn Tool> = Arc::new(AttachOrRestorePodTool {
+        let tool: Arc<dyn Tool> = Arc::new(RestorePodTool {
             discovery: discovery.clone(),
         });
         (meta, tool)
@@ -781,7 +807,7 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[tokio::test(flavor = "current_thread")]
-    async fn state_backed_visibility_and_attach_restore_planning() {
+    async fn state_backed_visibility_and_restore_planning() {
         let _env = ENV_LOCK.lock().unwrap();
         let root = TempDir::new().unwrap();
         let store_dir = root.path().join("store");
@@ -873,6 +899,13 @@ mod tests {
             registry,
         );
 
+        let list_tool_def = list_pods_tool(discovery.clone());
+        let (list_meta, _) = list_tool_def();
+        assert_eq!(list_meta.name, "ListPods");
+        let restore_tool_def = restore_pod_tool(discovery.clone());
+        let (restore_meta, _) = restore_tool_def();
+        assert_eq!(restore_meta.name, "RestorePod");
+
         let list = discovery.list_visible().await.unwrap();
         let names: Vec<_> = list.iter().map(|p| p.pod_name.as_str()).collect();
         assert_eq!(
@@ -912,25 +945,16 @@ mod tests {
             missing_err,
             PodDiscoveryError::StateMissing { .. }
         ));
-        let hidden_restore_err = discovery
-            .plan_attach_or_restore("hidden")
-            .await
-            .unwrap_err();
+        let hidden_restore_err = discovery.plan_restore("hidden").await.unwrap_err();
         assert!(matches!(
             hidden_restore_err,
             PodDiscoveryError::NotVisible { .. }
         ));
 
-        let attach_plan = discovery
-            .plan_attach_or_restore("child-live")
-            .await
-            .unwrap();
-        assert!(matches!(attach_plan, AttachRestorePlan::Attach { .. }));
-        let restore_plan = discovery
-            .plan_attach_or_restore("child-stale")
-            .await
-            .unwrap();
-        assert!(matches!(restore_plan, AttachRestorePlan::Restore { .. }));
+        let live_plan = discovery.plan_restore("child-live").await.unwrap();
+        assert!(matches!(live_plan, RestorePlan::AlreadyLive { .. }));
+        let restore_plan = discovery.plan_restore("child-stale").await.unwrap();
+        assert!(matches!(restore_plan, RestorePlan::Restore { .. }));
 
         let lock_socket = runtime_base.join("lock-owner.sock");
         let _guard = pod_registry::install_top_level(
@@ -945,10 +969,7 @@ mod tests {
             active_child_segment,
         )
         .unwrap();
-        let locked_err = discovery
-            .plan_attach_or_restore("child-stale")
-            .await
-            .unwrap_err();
+        let locked_err = discovery.plan_restore("child-stale").await.unwrap_err();
         assert!(matches!(locked_err, PodDiscoveryError::LockConflict { .. }));
 
         live_listener.abort();
