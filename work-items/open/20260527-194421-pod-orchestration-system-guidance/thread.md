@@ -56,3 +56,19 @@ AGENTS.md や workflow に multi-agent の運用は書かれているが、こ�
 
 
 ---
+
+<!-- event: comment author: hare at: 2026-06-01T00:57:03Z -->
+
+## Comment
+
+## Supplemental guidance from dogfooding
+
+Add two explicit rules to the Pod orchestration/system guidance:
+
+- A spawned Pod completion notification is delivered as a normal background signal. The parent does not need to keep the turn open or call tools solely to wait for it; it is acceptable to finish the current turn and handle the notification at the next natural point.
+- Do not use `sleep`/polling loops just to wait for a Pod's output. If there is no other useful immediate work, return control to the user instead of blocking the turn; when the notification arrives, read the Pod output then.
+
+Rationale: during multi-agent work, waiting with `sleep` wastes the active turn and fights the notification model. The desired behavior is notification-driven follow-up, not artificial polling.
+
+
+---
