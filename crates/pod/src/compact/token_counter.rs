@@ -9,7 +9,7 @@
 //! # 方針
 //!
 //! - ローカルトークナイザは持たない。実測値があればそれを採用し、
-//!   measurement 間はバイト数で按分、最新 measurement より先は最終 rate で外挿する
+//!   measurement 間はバイト数で按分、最新 measurement より先は byte/4 で外挿する
 //! - Compact の retained split では、request-time pruning / projection 後の
 //!   `UsageRecord` を persisted history prefix の単調系列として扱わない。
 //!   現在の prompt occupancy 推定を raw serialized bytes に配分し、末尾の
@@ -245,7 +245,7 @@ pub(crate) fn savings_for_prune_impl(
 impl<C: LlmClient, St: Store> Pod<C, St> {
     /// 現在の history 全体の推定トークン数。
     ///
-    /// 最後の measurement と、その後に追加された未測定分のバイト按分／外挿。
+    /// 最後の measurement と、その後に追加された未測定分の byte/4 外挿。
     pub fn total_tokens(&self) -> TokenEstimate {
         let usage = self.usage_history();
         llm_worker::token_counter::total_tokens(self.history(), &usage)

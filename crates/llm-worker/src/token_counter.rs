@@ -6,8 +6,8 @@
 //! # 方針
 //!
 //! - ローカルトークナイザは持たない。実測値があればそれを採用し、
-//!   measurement 間はバイト数で按分、最新 measurement より先は測定済みの増分 rate
-//!   または byte/4 fallback で外挿する
+//!   measurement 間はバイト数で按分、最新 measurement より先は byte/4
+//!   fallback で外挿する
 //! - 推定の出どころは [`EstimateSource`] で呼び出し側に明示する。
 //!   課金判断には使えないが、compact / prune / memory extract trigger 等の
 //!   閾値判定には十分な精度
@@ -22,7 +22,7 @@ pub enum EstimateSource {
     Measured,
     /// 連続する 2 つの measurement の間をバイト按分で計算
     Interpolated,
-    /// 最後の measurement より新しい区間を最終 rate で外挿
+    /// 最後の measurement より新しい区間を byte/4 fallback で外挿
     Extrapolated,
     /// measurement が 1 件も無く、バイト数のみのフォールバック
     NoData,
@@ -122,33 +122,8 @@ pub fn tokens_at(
             let at_bytes = prefix[index];
             let delta_bytes = at_bytes.saturating_sub(lo_bytes);
 
-            let mut measured_span = None;
-            for pair in records.windows(2) {
-                let older = &pair[0];
-                let newer = &pair[1];
-                if newer.history_len > lo.history_len {
-                    break;
-                }
-
-                let older_bytes = prefix[older.history_len.min(cap)];
-                let newer_bytes = prefix[newer.history_len.min(cap)];
-                let span_bytes = newer_bytes.saturating_sub(older_bytes);
-                let span_tokens = newer
-                    .input_total_tokens
-                    .saturating_sub(older.input_total_tokens);
-                if span_bytes > 0 && span_tokens > 0 {
-                    measured_span = Some((span_tokens, span_bytes));
-                }
-            }
-
-            let delta_tokens = if let Some((span_tokens, span_bytes)) = measured_span {
-                (delta_bytes as u128 * span_tokens as u128 / span_bytes as u128) as u64
-            } else {
-                delta_bytes / 4
-            };
-
             TokenEstimate {
-                tokens: lo.input_total_tokens.saturating_add(delta_tokens),
+                tokens: lo.input_total_tokens.saturating_add(delta_bytes / 4),
                 source: EstimateSource::Extrapolated,
             }
         }
@@ -255,7 +230,7 @@ mod tests {
     }
 
     #[test]
-    fn extrapolation_prefers_latest_measured_incremental_span_rate() {
+    fn extrapolation_after_multiple_measurements_uses_byte_fallback_for_unmeasured_delta() {
         let history = vec![
             msg("first"),
             msg(&"measured increment ".repeat(20)),
@@ -263,15 +238,31 @@ mod tests {
         ];
         let records = vec![record(1, 10_000), record(2, 10_200)];
         let prefix = prefix_bytes(&history);
-        let measured_bytes = prefix[2].saturating_sub(prefix[1]);
         let delta_bytes = prefix[3].saturating_sub(prefix[2]);
-        let expected_delta = (delta_bytes as u128 * 200_u128 / measured_bytes as u128) as u64;
 
         let est = total_tokens(&history, &records);
 
         assert_eq!(est.source, EstimateSource::Extrapolated);
-        assert_eq!(est.tokens, 10_200 + expected_delta);
-        assert_ne!(est.tokens, 10_200 + delta_bytes / 4);
+        assert_eq!(est.tokens, 10_200 + delta_bytes / 4);
+    }
+
+    #[test]
+    fn extrapolation_does_not_reuse_measured_rate_after_context_projection() {
+        let compacted_span = msg("x");
+        let projected = vec![
+            msg("first"),
+            msg("summary only"),
+            compacted_span,
+            msg("new user input"),
+        ];
+        let records = vec![record(1, 10_000), record(3, 30_000)];
+        let prefix = prefix_bytes(&projected);
+        let delta_bytes = prefix[4].saturating_sub(prefix[3]);
+
+        let est = total_tokens(&projected, &records);
+
+        assert_eq!(est.source, EstimateSource::Extrapolated);
+        assert_eq!(est.tokens, 30_000 + delta_bytes / 4);
     }
 
     #[test]
