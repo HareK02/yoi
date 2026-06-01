@@ -7,10 +7,11 @@
 //! eagerly syntax-checks it at Pod construction. The final system
 //! prompt is materialised exactly once just before the first LLM turn:
 //! the rendered body is appended with a fixed trailing section carrying
-//! the Pod's `Scope` summary and (if present) the project's `AGENTS.md`
-//! contents plus resident memory sections, and the whole string is handed
-//! to the Worker via `set_system_prompt`. Subsequent turns and compactions
-//! reuse that materialised string verbatim.
+//! the Pod's `Scope` summary, (if present) the project's `AGENTS.md`
+//! contents, resident memory sections, and conditional Pod-orchestration
+//! guidance, then the whole string is handed to the Worker via
+//! `set_system_prompt`. Subsequent turns and compactions reuse that
+//! materialised string verbatim.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -216,6 +217,12 @@ struct ToolCapabilities {
     memory_write: bool,
     memory_edit: bool,
     memory_delete: bool,
+    pod_spawn: bool,
+    pod_send: bool,
+    pod_read_output: bool,
+    pod_stop: bool,
+    pod_list: bool,
+    pod_restore: bool,
 }
 
 impl ToolCapabilities {
@@ -229,6 +236,12 @@ impl ToolCapabilities {
                 "MemoryWrite" => capabilities.memory_write = true,
                 "MemoryEdit" => capabilities.memory_edit = true,
                 "MemoryDelete" => capabilities.memory_delete = true,
+                "SpawnPod" => capabilities.pod_spawn = true,
+                "SendToPod" => capabilities.pod_send = true,
+                "ReadPodOutput" => capabilities.pod_read_output = true,
+                "StopPod" => capabilities.pod_stop = true,
+                "ListPods" => capabilities.pod_list = true,
+                "RestorePod" => capabilities.pod_restore = true,
                 _ => {}
             }
         }
@@ -251,6 +264,15 @@ impl ToolCapabilities {
         self.memory_write || self.memory_edit || self.memory_delete
     }
 
+    fn pod_management(self) -> bool {
+        self.pod_spawn
+            || self.pod_send
+            || self.pod_read_output
+            || self.pod_stop
+            || self.pod_list
+            || self.pod_restore
+    }
+
     fn to_minijinja_value(self) -> Value {
         let mut map: BTreeMap<&'static str, Value> = BTreeMap::new();
         map.insert("memory_any", Value::from(self.memory_any()));
@@ -262,6 +284,7 @@ impl ToolCapabilities {
         map.insert("memory_edit", Value::from(self.memory_edit));
         map.insert("memory_delete", Value::from(self.memory_delete));
         map.insert("memory_mutation", Value::from(self.memory_mutation()));
+        map.insert("pod_management", Value::from(self.pod_management()));
         Value::from(map)
     }
 }
@@ -328,6 +351,12 @@ fn append_trailing_section(
             out.push_str(section.trim_end_matches(&['\n', ' '][..]));
             out.push('\n');
         }
+    }
+    if tool_capabilities.pod_management() {
+        out.push('\n');
+        let section = prompts.pod_orchestration_guidance_section()?;
+        out.push_str(section.trim_end_matches(&['\n', ' '][..]));
+        out.push('\n');
     }
     // Canonicalise the tail so the emitted prompt has a single form
     // regardless of how individual templates chose to end.
@@ -496,6 +525,20 @@ mod tests {
         .collect()
     }
 
+    fn pod_management_tool_names() -> Vec<String> {
+        [
+            "SpawnPod",
+            "SendToPod",
+            "ReadPodOutput",
+            "StopPod",
+            "ListPods",
+            "RestorePod",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect()
+    }
+
     /// Lazily-initialised builtin catalog shared across system-prompt
     /// tests, so every `ctx()` can hand out a `&'static PromptCatalog`
     /// reference without forcing test bodies to create one per call.
@@ -584,6 +627,46 @@ mod tests {
         assert!(!rendered.contains("MemoryWrite"));
         assert!(!rendered.contains("MemoryEdit"));
         assert!(!rendered.contains("MemoryDelete"));
+    }
+
+    #[test]
+    fn pod_orchestration_guidance_is_included_for_pod_management_tools() {
+        let loader = PromptLoader::builtins_only();
+        let tmpl = SystemPromptTemplate::parse("$insomnia/default", loader).unwrap();
+        let dir = TempDir::new().unwrap();
+        let scope = build_scope(dir.path());
+        let rendered = tmpl
+            .render(&ctx(dir.path(), &scope, pod_management_tool_names(), None))
+            .unwrap();
+
+        assert!(rendered.contains("## Pod orchestration"));
+        assert!(rendered.contains("spawned Pod notifications are background signals"));
+        assert!(rendered.contains("does not need to keep a turn open"));
+        assert!(rendered.contains("Do not use `sleep` or polling loops"));
+        assert!(rendered.contains("worktree status, diff, and test results"));
+        assert!(rendered.contains("not scheduler or auto-maintain authorization"));
+        assert!(rendered.contains("bypass user/workflow authorization"));
+    }
+
+    #[test]
+    fn pod_orchestration_guidance_is_omitted_without_pod_management_tools() {
+        let loader = PromptLoader::builtins_only();
+        let tmpl = SystemPromptTemplate::parse("$insomnia/default", loader).unwrap();
+        let dir = TempDir::new().unwrap();
+        let scope = build_scope(dir.path());
+        let rendered = tmpl
+            .render(&ctx(
+                dir.path(),
+                &scope,
+                vec!["Read".into(), "Edit".into(), "MemoryRead".into()],
+                None,
+            ))
+            .unwrap();
+
+        assert!(!rendered.contains("## Pod orchestration"));
+        assert!(!rendered.contains("spawned Pod notifications are background signals"));
+        assert!(!rendered.contains("does not need to keep a turn open"));
+        assert!(!rendered.contains("Do not use `sleep` or polling loops"));
     }
 
     #[test]
