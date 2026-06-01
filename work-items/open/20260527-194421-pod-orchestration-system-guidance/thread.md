@@ -72,3 +72,44 @@ Rationale: during multi-agent work, waiting with `sleep` wastes the active turn 
 
 
 ---
+
+<!-- event: plan author: hare at: 2026-06-01T01:10:57Z -->
+
+## Plan
+
+## Preflight classification
+
+implementation-ready.
+
+The ticket affects prompt/system guidance and conditional prompt assembly, but the desired product behavior is already specified in the ticket thread and item: include orchestration guidance only when Pod management tools are available, keep the prose in `resources/prompts`, and explicitly avoid `sleep`/polling or turn-blocking waits for child Pod output.
+
+## Current code map
+
+- `resources/prompts/`: prompt text sources; new guidance text should live here.
+- Prompt assembly code/tests: locate the system prompt construction path that already conditionally includes memory/workflow/tool guidance and add a tool-availability gate for Pod orchestration guidance.
+- Tool registry / available tool list: use existing tool availability rather than hard-coding a Worker kind if possible.
+- Existing prompt assembly tests: add inclusion/exclusion coverage for Pod management tools available/unavailable.
+
+## Requirements / invariants
+
+- Guidance is conditional on Pod management tools being available.
+- Guidance is not shown to Workers without Pod management tools.
+- Guidance must not imply an auto scheduler or unauthorized workflow start.
+- Guidance must say notifications can be handled at the next natural point and the parent need not keep the turn open just to wait.
+- Guidance must say not to use `sleep`/polling loops merely to wait for Pod output.
+- Do not change PodEvent/notification protocol, TUI notification UI, spawned registry restore, or workflow semantics.
+
+## Escalate if
+
+- The only available hook requires injecting notification-derived context without durable history.
+- Conditional tool-availability detection would require broad ToolRegistry redesign.
+- The implementation would change runtime notification delivery or Pod lifecycle behavior instead of prompt guidance.
+
+## Validation
+
+- Focused prompt assembly tests for conditional inclusion/exclusion.
+- Any touched crate tests relevant to prompt loading/assembly.
+- `cargo fmt --check`.
+
+
+---
