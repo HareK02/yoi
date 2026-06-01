@@ -310,6 +310,42 @@ Potential process blocker before public distribution: third-party notices/licens
 - Review HTML parser stack only if size/build time is a concern.
 - Review `serde_yaml` maintenance posture for frontmatter parsing; this is design-sensitive, not an obvious cleanup.
 
+## Version update scan
+
+Additional commands run after the initial audit:
+
+```sh
+cargo outdated --workspace --root-deps-only --format json > /tmp/yoi-cargo-outdated-root.json
+cargo outdated --workspace --format json > /tmp/yoi-cargo-outdated-all.json
+cargo update --dry-run
+```
+
+`cargo outdated --workspace --root-deps-only` reported the following direct workspace dependency updates:
+
+| Dependency | Current | Latest reported | Kind | Direct users | Note |
+| --- | ---: | ---: | --- | --- | --- |
+| `reqwest` | 0.13.2 | 0.13.4 | normal | `llm-worker`, `provider`, `tools` | Patch update; should be combined with the TLS feature normalization follow-up. |
+| `clap` | 4.6.0 | 4.6.1 | normal/dev | `pod`, `llm-worker` dev | Patch update. |
+| `minijinja` | 2.19.0 | 2.20.0 | normal | `pod` | Minor update. |
+| `crossterm` | 0.28.1 | 0.29.0 | normal | `tui` | Also matches the earlier duplicate-version finding with `ratatui`'s backend. |
+| `pulldown-cmark` | 0.13.3 | 0.13.4 | normal | `tui` | Patch update. |
+| `html5ever` | 0.26.0 | 0.39.0 | normal | `tools` | Major stack update; treat as WebFetch parser migration work, not routine bump. |
+| `markup5ever_rcdom` | 0.2.0 | 0.39.0+unofficial | normal | `tools` | Major/unofficial stack update; tied to `html5ever` review. |
+| `filetime` | 0.2.27 | 0.2.29 | dev | `tools` dev | Dev/test-only patch update. |
+
+`cargo update --dry-run` reported that 80 locked packages can move to latest compatible versions without editing manifests. Notable compatible lockfile updates include:
+
+- HTTP/TLS stack: `reqwest 0.13.2 -> 0.13.4`, `hyper 1.9.0 -> 1.10.1`, `h2 0.4.13 -> 0.4.14`, `rustls 0.23.37 -> 0.23.40`, `rustls-native-certs 0.8.3 -> 0.8.4`, `rustls-platform-verifier 0.6.2 -> 0.7.0`, `openssl 0.10.76 -> 0.10.80`, `openssl-sys 0.9.112 -> 0.9.116`, `aws-lc-rs 1.15.2 -> 1.17.0`, `aws-lc-sys 0.35.0 -> 0.41.0`.
+- Core/runtime stack: `tokio 1.52.1 -> 1.52.3`, `uuid 1.23.1 -> 1.23.2`, `serde_json 1.0.149 -> 1.0.150`, `memchr 2.8.0 -> 2.8.1`, `indexmap 2.13.1 -> 2.14.0`, `socket2 0.6.3 -> 0.6.4`.
+- UI/parser/dev stack: `minijinja 2.19.0 -> 2.20.0`, `pulldown-cmark 0.13.3 -> 0.13.4`, `filetime 0.2.27 -> 0.2.29`, `serial_test 3.4.0 -> 3.5.0`.
+- Platform/wasm/windows support crates: multiple `wasm-bindgen`, `web-sys`, `windows-*`, `wasip2`, and `zerocopy` patch/minor updates.
+
+Interpretation:
+
+- There is a low-risk follow-up to run a lockfile refresh (`cargo update`) and validate it, but it should be separate from dependency policy changes because it touches many transitive packages.
+- Direct manifest bumps can be grouped by risk: small patch/minor bumps (`reqwest`, `clap`, `minijinja`, `pulldown-cmark`, `filetime`) vs behavior/API-sensitive stack bumps (`crossterm`, `html5ever`, `markup5ever_rcdom`).
+- The `reqwest` bump should not be done blindly before deciding the TLS feature policy, because the current audit already found accidental native-tls/rustls feature duplication.
+
 ## Recommended follow-up tickets
 
 1. **Add dependency license policy and third-party notice generation**

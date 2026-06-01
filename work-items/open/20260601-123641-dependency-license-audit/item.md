@@ -7,7 +7,7 @@ kind: task
 priority: P2
 labels: [audit, dependencies, license]
 created_at: 2026-06-01T12:36:41Z
-updated_at: 2026-06-01T12:37:30Z
+updated_at: 2026-06-01T13:08:45Z
 assignee: null
 legacy_ticket: null
 ---
