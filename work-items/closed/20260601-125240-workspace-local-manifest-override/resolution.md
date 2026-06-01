@@ -1,0 +1,1 @@
+Implemented workspace-local .yoi/override.local.toml as an ignored manifest override layer for normal Profile/default startup. Explicit --manifest remains override-free; focused tests and nix build passed.

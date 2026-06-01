@@ -2,12 +2,12 @@
 id: 20260601-125240-workspace-local-manifest-override
 slug: workspace-local-manifest-override
 title: Support workspace-local manifest override layer
-status: open
+status: closed
 kind: task
 priority: P2
 labels: [profile, manifest, config]
 created_at: 2026-06-01T12:52:40Z
-updated_at: 2026-06-01T13:05:58Z
+updated_at: 2026-06-01T13:19:36Z
 assignee: null
 legacy_ticket: null
 ---
