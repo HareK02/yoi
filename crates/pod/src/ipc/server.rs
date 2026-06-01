@@ -68,6 +68,37 @@ fn is_peer_disconnect_read_error(error: &io::Error) -> bool {
     )
 }
 
+fn live_entry_event(entry: session_store::LogEntry) -> Option<Event> {
+    match entry {
+        session_store::LogEntry::SegmentStart { .. } => {
+            let value = serde_json::to_value(&entry).expect("LogEntry is Serialize");
+            Some(Event::SegmentRotated { entry: value })
+        }
+        session_store::LogEntry::UserInput { segments, .. } => {
+            Some(Event::UserMessage { segments })
+        }
+        session_store::LogEntry::SystemItem { item, .. } => {
+            let value = serde_json::to_value(&item).expect("SystemItem is Serialize");
+            Some(Event::SystemItem { item: value })
+        }
+        session_store::LogEntry::Invoke { trigger, .. } => {
+            Some(Event::InvokeStart { kind: trigger })
+        }
+        other => {
+            // `SegmentLogSink::is_live_relevant` keeps non-live-relevant
+            // variants off the broadcast lane; reaching here means the two
+            // are out of sync and we silently dropped a wire event. Log so a
+            // future regression surfaces instead of vanishing.
+            tracing::error!(
+                entry_kind = ?std::mem::discriminant(&other),
+                "session-log broadcast emitted a non-live-relevant entry; \
+                 sink filter and IPC dispatch are out of sync"
+            );
+            None
+        }
+    }
+}
+
 async fn handle_connection(stream: tokio::net::UnixStream, handle: PodHandle) {
     let (reader, writer) = stream.into_split();
     let mut reader = JsonLineReader::new(reader);
@@ -108,43 +139,13 @@ async fn handle_connection(stream: tokio::net::UnixStream, handle: PodHandle) {
     loop {
         tokio::select! {
             // Live session-log entries → dispatched as the role-specific
-            // wire events. The sink only broadcasts entries that the
-            // streaming-event lane doesn't cover; everything else is
-            // already on the wire via TextDelta / ToolCall* / etc., so we
-            // never see (and never need to forward) other variants here.
+            // wire events. `SegmentLogSink` only broadcasts committed log
+            // entries with live UI meaning; `UserInput` travels this lane so
+            // the visible user line is ordered with `SegmentStart` rotation.
             entry = entry_rx.recv() => {
                 match entry {
                     Ok(entry) => {
-                        let outbound = match entry {
-                            session_store::LogEntry::SegmentStart { .. } => {
-                                let value = serde_json::to_value(&entry)
-                                    .expect("LogEntry is Serialize");
-                                Some(Event::SegmentRotated { entry: value })
-                            }
-                            session_store::LogEntry::SystemItem { item, .. } => {
-                                let value = serde_json::to_value(&item)
-                                    .expect("SystemItem is Serialize");
-                                Some(Event::SystemItem { item: value })
-                            }
-                            session_store::LogEntry::Invoke { trigger, .. } => {
-                                Some(Event::InvokeStart { kind: trigger })
-                            }
-                            other => {
-                                // `SegmentLogSink::is_live_relevant` keeps
-                                // non-live-relevant variants off the
-                                // broadcast lane; reaching here means the
-                                // two are out of sync and we silently
-                                // dropped a wire event. Log so a future
-                                // regression surfaces instead of vanishing.
-                                tracing::error!(
-                                    entry_kind = ?std::mem::discriminant(&other),
-                                    "session-log broadcast emitted a non-live-relevant entry; \
-                                     sink filter and IPC dispatch are out of sync"
-                                );
-                                None
-                            }
-                        };
-                        if let Some(event) = outbound {
+                        if let Some(event) = live_entry_event(entry) {
                             if writer.write(&event).await.is_err() {
                                 break;
                             }
@@ -260,5 +261,20 @@ mod tests {
     fn invalid_data_is_not_peer_disconnect() {
         let error = io::Error::new(ErrorKind::InvalidData, "malformed method");
         assert!(!is_peer_disconnect_read_error(&error));
+    }
+
+    #[test]
+    fn user_input_log_entry_maps_to_user_message_event() {
+        let segments = vec![protocol::Segment::text("hello from log")];
+        let event = live_entry_event(session_store::LogEntry::UserInput {
+            ts: session_store::segment_log::now_millis(),
+            segments: segments.clone(),
+        })
+        .expect("UserInput must be live-relevant");
+
+        match event {
+            Event::UserMessage { segments: echoed } => assert_eq!(echoed, segments),
+            other => panic!("expected UserMessage, got {other:?}"),
+        }
     }
 }

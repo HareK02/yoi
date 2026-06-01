@@ -87,18 +87,19 @@ impl SegmentLogSink {
     /// entry to the underlying `Store` — disk write is the gate. Failed
     /// disk writes must not call `publish`.
     ///
-    /// Live broadcast fires only for entries that the streaming-event
-    /// lane does not cover:
+    /// Live broadcast fires for committed session-log entries that
+    /// socket clients must see in log order:
     ///   - `LogEntry::SegmentStart` → `Event::SegmentRotated` on the wire.
+    ///   - `LogEntry::UserInput`    → `Event::UserMessage`.
     ///   - `LogEntry::SystemItem`   → `Event::SystemItem`.
     ///   - `LogEntry::Invoke`       → `Event::InvokeStart`.
-    /// Everything else (AssistantItem, ToolResult, UserInput, TurnEnd,
+    /// Everything else (AssistantItem, ToolResult, TurnEnd,
     /// RunCompleted, RunErrored, LlmUsage, Extension, ConfigChanged) is
     /// reflected in the mirror so reconnect snapshots stay accurate,
     /// but is not sent live — the streaming events (TextDelta /
-    /// ToolCallStart / ToolResult / UserMessage / TurnEnd / etc.)
-    /// already provide that data, and re-broadcasting it as a typed
-    /// entry would just double-render every block on the client side.
+    /// ToolCallStart / ToolResult / TurnEnd / etc.) already provide
+    /// that data, and re-broadcasting it as a typed entry would just
+    /// double-render every block on the client side.
     pub fn publish(&self, entry: LogEntry) {
         let mut mirror = self
             .inner
@@ -119,7 +120,10 @@ impl SegmentLogSink {
     fn is_live_relevant(entry: &LogEntry) -> bool {
         matches!(
             entry,
-            LogEntry::SegmentStart { .. } | LogEntry::SystemItem { .. } | LogEntry::Invoke { .. }
+            LogEntry::SegmentStart { .. }
+                | LogEntry::UserInput { .. }
+                | LogEntry::SystemItem { .. }
+                | LogEntry::Invoke { .. }
         )
     }
 
@@ -227,6 +231,15 @@ mod tests {
         }
     }
 
+    fn user_input(text: &str) -> LogEntry {
+        LogEntry::UserInput {
+            ts: now_millis(),
+            segments: vec![protocol::Segment::Text {
+                content: text.to_owned(),
+            }],
+        }
+    }
+
     #[test]
     fn publish_then_subscribe_returns_history_in_snapshot() {
         let sink = SegmentLogSink::new();
@@ -265,6 +278,16 @@ mod tests {
         sink.publish(turn_end(1));
         assert!(rx.try_recv().is_err(), "TurnEnd must not be broadcast live");
 
+        // UserInput is live-relevant because it is the persisted source
+        // for Event::UserMessage.
+        sink.publish(user_input("hi from log"));
+        match rx.try_recv() {
+            Ok(LogEntry::UserInput { segments, .. }) => {
+                assert_eq!(segments.len(), 1);
+            }
+            other => panic!("expected UserInput, got {other:?}"),
+        }
+
         // SystemItem is live-relevant.
         sink.publish(notification_entry("hi"));
         match rx.try_recv() {
@@ -272,9 +295,9 @@ mod tests {
             other => panic!("expected SystemItem, got {other:?}"),
         }
 
-        // Mirror still grew with both entries (snapshot completeness).
+        // Mirror still grew with all entries (snapshot completeness).
         let (after_snapshot, _) = sink.subscribe_with_snapshot();
-        assert_eq!(after_snapshot.len(), 3);
+        assert_eq!(after_snapshot.len(), 4);
     }
 
     #[test]

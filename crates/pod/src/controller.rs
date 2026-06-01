@@ -693,21 +693,15 @@ async fn controller_loop<C, St>(
                     });
                     continue;
                 }
-                // Broadcast the user message so every subscriber
-                // (including the submitter) can render the turn header
-                // + user line from a single source of truth.
-                // shared_state's `user_segments` is re-synced from
-                // `pod` after the run completes, so we don't push
-                // here. Workflow-invocation validation happens inside
-                // `Pod::run`; on failure the turn errors out via
-                // `Event::Error { InvalidRequest }` before any
-                // UserInput is committed. Paused→Run cleanup (orphan
-                // tool_result closure + interrupt system note) is
-                // applied inside `Pod::run` itself when the worker's
-                // `last_run_interrupted` flag is set.
-                let _ = event_tx.send(Event::UserMessage {
-                    segments: input.clone(),
-                });
+                // Stage the run without a speculative user-message echo.
+                // `Pod::run` validates the input, commits
+                // `LogEntry::UserInput`, and the session-log sink turns that
+                // committed entry into the live `Event::UserMessage`. That
+                // keeps every client ordered against `SegmentStart` replay and
+                // makes persisted history the single source of visible user
+                // input. Paused→Run cleanup (orphan tool_result closure +
+                // interrupt system note) is applied inside `Pod::run` itself
+                // when the worker's `last_run_interrupted` flag is set.
                 pending = Some(PendingRun::Run(input));
             }
 

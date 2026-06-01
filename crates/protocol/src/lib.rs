@@ -243,14 +243,14 @@ impl Method {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event", content = "data", rename_all = "snake_case")]
 pub enum Event {
-    /// A user input message was accepted by the Pod and is about to
-    /// start a new turn. Broadcast to every subscribed client so
-    /// additional TUI / GUI instances show the same pending user line
-    /// that the submitter already sees — without this event, non-
-    /// submitting clients would see tool calls and assistant text
-    /// appear without any preceding user message.
+    /// A user input message was accepted, persisted as
+    /// `LogEntry::UserInput`, and is about to start a new turn.
+    /// Broadcast to every subscribed client so TUI / GUI instances show
+    /// the same user line that reconnect snapshots would replay from
+    /// history; clients must not synthesize a separate pending/fake
+    /// message for accepted runs.
     ///
-    /// Fires exactly once per accepted `Method::Run`, after
+    /// Fires exactly once per committed user input, after
     /// `InvokeStart { kind: UserSend }` and before the first
     /// `TurnStart`. Rejected runs (e.g. `AlreadyRunning`) do not emit.
     UserMessage {
