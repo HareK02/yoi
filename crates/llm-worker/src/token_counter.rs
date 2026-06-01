@@ -6,7 +6,8 @@
 //! # 方針
 //!
 //! - ローカルトークナイザは持たない。実測値があればそれを採用し、
-//!   measurement 間はバイト数で按分、最新 measurement より先は最終 rate で外挿する
+//!   measurement 間はバイト数で按分、最新 measurement より先は測定済みの増分 rate
+//!   または byte/4 fallback で外挿する
 //! - 推定の出どころは [`EstimateSource`] で呼び出し側に明示する。
 //!   課金判断には使えないが、compact / prune / memory extract trigger 等の
 //!   閾値判定には十分な精度
@@ -119,17 +120,35 @@ pub fn tokens_at(
         (Some(lo), None) => {
             let lo_bytes = prefix[lo.history_len.min(cap)];
             let at_bytes = prefix[index];
-            if lo_bytes == 0 || lo.input_total_tokens == 0 {
-                return TokenEstimate {
-                    tokens: lo.input_total_tokens,
-                    source: EstimateSource::Extrapolated,
-                };
-            }
             let delta_bytes = at_bytes.saturating_sub(lo_bytes);
-            let delta_tokens =
-                (delta_bytes as u128 * lo.input_total_tokens as u128 / lo_bytes as u128) as u64;
+
+            let mut measured_span = None;
+            for pair in records.windows(2) {
+                let older = &pair[0];
+                let newer = &pair[1];
+                if newer.history_len > lo.history_len {
+                    break;
+                }
+
+                let older_bytes = prefix[older.history_len.min(cap)];
+                let newer_bytes = prefix[newer.history_len.min(cap)];
+                let span_bytes = newer_bytes.saturating_sub(older_bytes);
+                let span_tokens = newer
+                    .input_total_tokens
+                    .saturating_sub(older.input_total_tokens);
+                if span_bytes > 0 && span_tokens > 0 {
+                    measured_span = Some((span_tokens, span_bytes));
+                }
+            }
+
+            let delta_tokens = if let Some((span_tokens, span_bytes)) = measured_span {
+                (delta_bytes as u128 * span_tokens as u128 / span_bytes as u128) as u64
+            } else {
+                delta_bytes / 4
+            };
+
             TokenEstimate {
-                tokens: lo.input_total_tokens + delta_tokens,
+                tokens: lo.input_total_tokens.saturating_add(delta_tokens),
                 source: EstimateSource::Extrapolated,
             }
         }
@@ -212,6 +231,47 @@ mod tests {
         let est = total_tokens(&history, &records);
         assert_eq!(est.source, EstimateSource::Extrapolated);
         assert!(est.tokens > 100);
+    }
+
+    #[test]
+    fn extrapolation_after_single_measurement_uses_byte_fallback_not_total_prompt_rate() {
+        let history = vec![msg("first"), msg(&"tool output ".repeat(400))];
+        let records = vec![record(1, 11_124)];
+        let prefix = prefix_bytes(&history);
+        let delta_bytes = prefix[2].saturating_sub(prefix[1]);
+
+        let est = total_tokens(&history, &records);
+
+        assert_eq!(est.source, EstimateSource::Extrapolated);
+        assert_eq!(est.tokens, 11_124 + delta_bytes / 4);
+
+        let old_projection =
+            11_124 + (delta_bytes as u128 * 11_124_u128 / prefix[1] as u128) as u64;
+        assert!(
+            old_projection > est.tokens.saturating_mul(10),
+            "old_projection={old_projection}, corrected={}",
+            est.tokens
+        );
+    }
+
+    #[test]
+    fn extrapolation_prefers_latest_measured_incremental_span_rate() {
+        let history = vec![
+            msg("first"),
+            msg(&"measured increment ".repeat(20)),
+            msg(&"unmeasured increment ".repeat(30)),
+        ];
+        let records = vec![record(1, 10_000), record(2, 10_200)];
+        let prefix = prefix_bytes(&history);
+        let measured_bytes = prefix[2].saturating_sub(prefix[1]);
+        let delta_bytes = prefix[3].saturating_sub(prefix[2]);
+        let expected_delta = (delta_bytes as u128 * 200_u128 / measured_bytes as u128) as u64;
+
+        let est = total_tokens(&history, &records);
+
+        assert_eq!(est.source, EstimateSource::Extrapolated);
+        assert_eq!(est.tokens, 10_200 + expected_delta);
+        assert_ne!(est.tokens, 10_200 + delta_bytes / 4);
     }
 
     #[test]
