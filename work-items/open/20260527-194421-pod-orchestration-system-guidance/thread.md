@@ -113,3 +113,39 @@ The ticket affects prompt/system guidance and conditional prompt assembly, but t
 
 
 ---
+
+<!-- event: review author: hare at: 2026-06-01T01:24:27Z status: approve -->
+
+## Review: approve
+
+External reviewer recommendation: approve.
+
+Summary:
+- Static Pod orchestration guidance was added under `resources/prompts/common/pod-orchestration.md` and registered through the prompt catalog.
+- The guidance is appended to the materialized system prompt only when available tool names include Pod-management capabilities.
+- The gate uses registered tool definitions, not Worker kind, matching the ticket boundary.
+- The prompt explicitly covers background notifications, natural stopping points, not keeping a turn open solely to wait, no `sleep`/polling loops for Pod output, evidence-before-completion, and no scheduler/authorization bypass.
+
+Intent / requirement mapping:
+- Included when Pod management tools are enabled: satisfied.
+- Omitted when Pod management tools are disabled: satisfied.
+- Prompt body lives under `resources/prompts`: satisfied.
+- Conditional prompt assembly tests exist: satisfied.
+
+Invariant check:
+- No changes to PodEvent/notification protocol, TUI notification UI, spawned registry restore, Pod lifecycle behavior, scheduler/auto-maintain behavior, or notification-derived context injection.
+- The implementation adds static guidance based on durable tool availability, not transient notification state.
+
+Blockers: none.
+
+Non-blocking follow-ups:
+- A future small test could pin the intended "any Pod-management tool is enough" semantics with a single representative tool.
+- Tool-name class recognition could be centralized later if more prompt gates need it.
+
+Reported validation from coder was considered sufficient:
+- `cargo test -p pod pod_orchestration`
+- `cargo test -p pod prompt::catalog`
+- `cargo fmt --check`
+
+
+---
