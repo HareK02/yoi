@@ -7,7 +7,7 @@ kind: task
 priority: P2
 labels: [profile, manifest, config]
 created_at: 2026-06-01T12:52:40Z
-updated_at: 2026-06-01T12:52:40Z
+updated_at: 2026-06-01T12:53:58Z
 assignee: null
 legacy_ticket: null
 ---

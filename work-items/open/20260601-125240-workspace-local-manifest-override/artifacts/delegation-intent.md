@@ -1,15 +1,3 @@
-<!-- event: create author: tickets.sh at: 2026-06-01T12:52:40Z -->
-
-## Created
-
-Created by tickets.sh create.
-
----
-
-<!-- event: plan author: hare at: 2026-06-01T12:53:58Z -->
-
-## Plan
-
 # Delegation intent: workspace-local manifest override
 
 Intent:
@@ -48,6 +36,3 @@ Validation:
 - Run focused manifest/profile tests, preferably `cargo test -p manifest` plus any touched `pod` tests.
 - Run `./tickets.sh doctor`, `git diff --check`, and `nix build .#yoi` if feasible in the worktree.
 - Record any skipped validation with rationale.
-
-
----
