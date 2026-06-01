@@ -17,7 +17,8 @@ pub use paths::user_profiles_path;
 pub use profile::{
     ProfileDiscovery, ProfileError, ProfileManifestSnapshot, ProfileMetadata, ProfileRegistry,
     ProfileRegistryEntry, ProfileRegistrySource, ProfileResolveOptions, ProfileResolver,
-    ProfileSelector, ProfileSource, ResolvedProfile, resolve_profile_artifact,
+    ProfileSelector, ProfileSource, ResolvedProfile, WorkspaceOverrideSnapshot,
+    resolve_profile_artifact,
 };
 pub use protocol::{Permission, ScopeRule};
 pub use scope::{Scope, ScopeError, SharedScope};

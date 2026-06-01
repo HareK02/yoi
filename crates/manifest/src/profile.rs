@@ -25,6 +25,7 @@ const BUILTIN_DEFAULT_PROFILE_NAME: &str = "default";
 const BUILTIN_DEFAULT_PROFILE: &str = include_str!("../../../resources/profiles/default.lua");
 const BUILTIN_MODEL_CATALOG: &str = include_str!("../../../resources/models/builtin.toml");
 const DEFAULT_POD_NAME: &str = "yoi";
+const WORKSPACE_OVERRIDE_LOCAL_FILENAME: &str = "override.local.toml";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -340,6 +341,19 @@ pub struct ProfileManifestSnapshot {
     pub source: ProfileSource,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<ProfileMetadata>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_override: Option<WorkspaceOverrideSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceOverrideSnapshot {
+    pub path: PathBuf,
+}
+
+#[derive(Debug)]
+struct WorkspaceOverrideLayer {
+    path: PathBuf,
+    config: PodManifestConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -475,6 +489,7 @@ impl ProfileResolver {
                 .as_deref()
                 .unwrap_or_else(|| Path::new(".")),
         )?;
+        let workspace_override = load_workspace_override_from(&workspace_base)?;
         let lua_value = evaluate_lua_profile(&absolute_path, &profile_dir)?;
         let raw_artifact = lua_value.clone();
         resolve_lua_profile_value(
@@ -484,6 +499,7 @@ impl ProfileResolver {
             options,
             lua_value,
             raw_artifact,
+            workspace_override,
         )
     }
 
@@ -499,6 +515,7 @@ impl ProfileResolver {
                 .as_deref()
                 .unwrap_or_else(|| Path::new(".")),
         )?;
+        let workspace_override = load_workspace_override_from(&workspace_base)?;
         let lua_value = evaluate_embedded_lua_profile(label, content)?;
         let raw_artifact = lua_value.clone();
         resolve_lua_profile_value(
@@ -508,6 +525,7 @@ impl ProfileResolver {
             options,
             lua_value,
             raw_artifact,
+            workspace_override,
         )
     }
 }
@@ -519,6 +537,7 @@ fn resolve_lua_profile_value(
     options: ProfileResolveOptions,
     value: serde_json::Value,
     raw_artifact: serde_json::Value,
+    workspace_override: Option<WorkspaceOverrideLayer>,
 ) -> Result<ResolvedProfile, ProfileError> {
     if !workspace_base.is_absolute() {
         return Err(ProfileError::InvalidPath {
@@ -554,11 +573,28 @@ fn resolve_lua_profile_value(
         memory: profile.memory,
         skills: profile.skills,
     };
-    let config = PodManifestConfig::builtin_defaults().merge(config.resolve_paths(profile_dir));
+    let mut config = PodManifestConfig::builtin_defaults().merge(config.resolve_paths(profile_dir));
+    let workspace_override_snapshot = if let Some(override_layer) = workspace_override {
+        let override_base =
+            override_layer
+                .path
+                .parent()
+                .ok_or_else(|| ProfileError::InvalidPath {
+                    path: override_layer.path.clone(),
+                    message: "workspace override path has no parent directory".into(),
+                })?;
+        config = config.merge(override_layer.config.resolve_paths(override_base));
+        Some(WorkspaceOverrideSnapshot {
+            path: override_layer.path,
+        })
+    } else {
+        None
+    };
     let mut manifest = PodManifest::try_from(config).map_err(ProfileError::ManifestResolve)?;
     manifest.profile = Some(ProfileManifestSnapshot {
         source: source.clone(),
         profile: profile_meta.clone(),
+        workspace_override: workspace_override_snapshot,
     });
     let manifest_snapshot =
         serde_json::to_value(&manifest).map_err(ProfileError::SnapshotSerialize)?;
@@ -685,6 +721,54 @@ fn load_profile_registry_file(
         });
     }
     Ok(())
+}
+
+fn load_workspace_override_from(
+    workspace_base: &Path,
+) -> Result<Option<WorkspaceOverrideLayer>, ProfileError> {
+    find_workspace_override_from(workspace_base)
+        .map(|path| load_workspace_override_file(&path))
+        .transpose()
+}
+
+fn load_workspace_override_file(path: &Path) -> Result<WorkspaceOverrideLayer, ProfileError> {
+    let content =
+        std::fs::read_to_string(path).map_err(|source| ProfileError::WorkspaceOverrideRead {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let config = PodManifestConfig::from_toml(&content).map_err(|source| {
+        ProfileError::WorkspaceOverrideParse {
+            path: path.to_path_buf(),
+            source,
+        }
+    })?;
+    if config.pod.name.is_some() {
+        return Err(ProfileError::InvalidWorkspaceOverride {
+            path: path.to_path_buf(),
+            message: "workspace-local manifest overrides cannot set pod.name; Pod identity is a runtime input".into(),
+        });
+    }
+    Ok(WorkspaceOverrideLayer {
+        path: path.to_path_buf(),
+        config,
+    })
+}
+
+fn find_workspace_override_from(start: &Path) -> Option<PathBuf> {
+    let start = start
+        .canonicalize()
+        .ok()
+        .unwrap_or_else(|| start.to_path_buf());
+    let mut cur: Option<&Path> = Some(start.as_path());
+    while let Some(dir) = cur {
+        let candidate = dir.join(".yoi").join(WORKSPACE_OVERRIDE_LOCAL_FILENAME);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        cur = dir.parent();
+    }
+    None
 }
 
 fn find_project_profiles_from(start: &Path) -> Option<PathBuf> {
@@ -1214,6 +1298,7 @@ pub fn resolve_profile_artifact(
         ProfileResolveOptions::default(),
         raw_artifact.clone(),
         raw_artifact,
+        None,
     )
 }
 
@@ -1241,6 +1326,20 @@ pub enum ProfileError {
         #[source]
         source: toml::de::Error,
     },
+    #[error("failed to read workspace local manifest override {}: {source}", .path.display())]
+    WorkspaceOverrideRead {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to parse workspace local manifest override {}: {source}", .path.display())]
+    WorkspaceOverrideParse {
+        path: PathBuf,
+        #[source]
+        source: toml::de::Error,
+    },
+    #[error("invalid workspace local manifest override {}: {message}", .path.display())]
+    InvalidWorkspaceOverride { path: PathBuf, message: String },
     #[error("no default profile is configured")]
     NoDefaultProfile,
     #[error("profile not found: {selector}")]
@@ -1498,6 +1597,71 @@ return profile {
             }
         );
     }
+    #[test]
+    fn workspace_local_override_layers_over_profile_defaults() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().join("project");
+        let nested = workspace.join("nested");
+        let yoi_dir = workspace.join(".yoi");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(&yoi_dir).unwrap();
+        let override_path = yoi_dir.join(WORKSPACE_OVERRIDE_LOCAL_FILENAME);
+        std::fs::write(
+            &override_path,
+            r#"
+[pod]
+prompt_pack = "prompts.toml"
+[worker]
+language = "ja"
+[session]
+record_event_trace = false
+"#,
+        )
+        .unwrap();
+
+        let resolved = ProfileResolver::new()
+            .with_workspace_base(&nested)
+            .resolve(&ProfileSelector::Default, ProfileResolveOptions::default())
+            .unwrap();
+
+        assert_eq!(resolved.manifest.pod.name, "yoi");
+        assert_eq!(resolved.manifest.worker.language, "ja");
+        assert!(!resolved.manifest.session.record_event_trace);
+        assert_eq!(
+            resolved.manifest.pod.prompt_pack.as_deref(),
+            Some(yoi_dir.join("prompts.toml").as_path())
+        );
+        assert_eq!(resolved.manifest.scope.allow[0].target, nested);
+        assert_eq!(
+            resolved
+                .manifest
+                .profile
+                .as_ref()
+                .and_then(|snapshot| snapshot.workspace_override.as_ref())
+                .map(|snapshot| snapshot.path.as_path()),
+            Some(override_path.as_path())
+        );
+    }
+
+    #[test]
+    fn workspace_local_override_rejects_runtime_pod_name() {
+        let tmp = TempDir::new().unwrap();
+        let yoi_dir = tmp.path().join(".yoi");
+        std::fs::create_dir_all(&yoi_dir).unwrap();
+        std::fs::write(
+            yoi_dir.join(WORKSPACE_OVERRIDE_LOCAL_FILENAME),
+            "[pod]\nname = \"not-local\"\n",
+        )
+        .unwrap();
+
+        let err = ProfileResolver::new()
+            .with_workspace_base(tmp.path())
+            .resolve(&ProfileSelector::Default, ProfileResolveOptions::default())
+            .unwrap_err();
+        assert!(matches!(err, ProfileError::InvalidWorkspaceOverride { .. }));
+        assert!(err.to_string().contains("pod.name"));
+    }
+
     #[test]
     fn unsupported_profile_extension_has_clear_diagnostic() {
         let tmp = TempDir::new().unwrap();

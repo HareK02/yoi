@@ -27,6 +27,8 @@ Source/partial layers may omit fields. Resolved manifests should be explicit eno
 
 `--manifest <path>` exists as an explicit low-level escape hatch. Normal fresh startup should select a Profile through `profiles.toml` / builtin defaults rather than ambient manifest cascades.
 
+For normal Profile/default startup, a workspace may add `.yoi/override.local.toml` as a final local manifest layer. Yoi discovers the nearest ancestor `.yoi/override.local.toml` from the workspace base used for profile resolution, resolves relative paths in that file against its containing `.yoi` directory, and applies it after the selected Profile and builtin defaults. This file is intended for machine-local choices such as provider/model, worker language, prompt pack, and permission policy tweaks; it is ignored by git via the repository `*.local.*` rule. It is not applied in explicit `--manifest <path>` mode, and it cannot set `pod.name` because Pod identity remains a runtime input.
+
 ## Spawned Pods
 
 `SpawnPod.profile` is optional and resolves through defaults when omitted. The only concrete capability delegation in the tool call is `SpawnPod.scope`, and it must be a subset of the parent's effective scope.

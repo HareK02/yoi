@@ -486,6 +486,51 @@ permission = "write"
     }
 
     #[test]
+    fn manifest_mode_does_not_apply_workspace_local_override() {
+        let tmp = TempDir::new().unwrap();
+        let yoi_dir = tmp.path().join(".yoi");
+        std::fs::create_dir_all(&yoi_dir).unwrap();
+        write(
+            &yoi_dir.join("override.local.toml"),
+            r#"
+[pod]
+name = "from-local-override"
+[worker]
+language = "override"
+"#,
+        );
+        let manifest_path = tmp.path().join("manifest.toml");
+        write(
+            &manifest_path,
+            &format!(
+                r#"
+[pod]
+name = "from-single-file"
+
+[model]
+scheme = "anthropic"
+model_id = "test-model"
+
+[worker]
+language = "manifest"
+
+[[scope.allow]]
+target = "{}"
+permission = "write"
+"#,
+                tmp.path().display()
+            ),
+        );
+
+        let cli = Cli::try_parse_from(["yoi pod", "--manifest", manifest_path.to_str().unwrap()])
+            .unwrap();
+        let (manifest, _loader) = resolve_manifest(&cli).unwrap();
+
+        assert_eq!(manifest.pod.name, "from-single-file");
+        assert_eq!(manifest.worker.language, "manifest");
+    }
+
+    #[test]
     fn profile_uses_selected_profile() {
         let tmp = TempDir::new().unwrap();
         let profile = tmp.path().join("profile.lua");
