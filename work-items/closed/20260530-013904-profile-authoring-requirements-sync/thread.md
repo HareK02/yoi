@@ -16,3 +16,12 @@ Lua-specific notes now record controlled `require` and a public `profile` constr
 
 
 ---
+
+<!-- event: close author: hare at: 2026-06-01T07:02:44Z status: closed -->
+
+## Closed
+
+Closed as completed. The requirements sync served its purpose: it captured the Profile boundary, rejected proceeding with semantic-nix-profiles as the assumed direction, and led to the follow-up Lua implementation ticket. The concrete authoring direction was implemented and closed in lua-profile-authoring; remaining refinements should be tracked as separate follow-up tickets.
+
+
+---

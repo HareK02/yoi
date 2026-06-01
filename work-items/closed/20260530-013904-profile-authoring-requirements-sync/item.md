@@ -2,12 +2,12 @@
 id: 20260530-013904-profile-authoring-requirements-sync
 slug: profile-authoring-requirements-sync
 title: Sync profile authoring requirements before choosing the language
-status: open
+status: closed
 kind: task
 priority: P2
 labels: [manifest, profiles, architecture]
 created_at: 2026-05-30T01:39:04Z
-updated_at: 2026-05-30T02:03:58Z
+updated_at: 2026-06-01T07:02:44Z
 assignee: null
 legacy_ticket: null
 ---
