@@ -7,7 +7,7 @@ kind: bug
 priority: P1
 labels: [tui, session, display]
 created_at: 2026-06-01T01:31:32Z
-updated_at: 2026-06-01T01:31:32Z
+updated_at: 2026-06-01T02:00:33Z
 assignee: null
 legacy_ticket: null
 ---

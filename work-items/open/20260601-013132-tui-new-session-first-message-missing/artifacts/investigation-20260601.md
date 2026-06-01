@@ -1,15 +1,3 @@
-<!-- event: create author: tickets.sh at: 2026-06-01T01:31:32Z -->
-
-## Created
-
-Created by tickets.sh create.
-
----
-
-<!-- event: plan author: hare at: 2026-06-01T02:00:33Z -->
-
-## Plan
-
 ## Investigation summary
 
 Read-only investigation found that the most likely cause is live-event ordering between `Event::UserMessage` and the first `Event::SegmentRotated` in a fresh session.
@@ -73,6 +61,3 @@ This should make a fresh session produce `SegmentRotated` first and then `UserMe
   - Corrected ordering `SegmentRotated` then `UserMessage` leaves the block visible.
 - Confirm snapshot restore still creates user blocks from `LogEntry::UserInput`.
 - Run focused tests for `pod` / `tui` crates as appropriate, plus formatting/checks that are reasonably scoped to the touched code.
-
-
----
