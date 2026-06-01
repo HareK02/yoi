@@ -1,0 +1,22 @@
+<!-- event: create author: tickets.sh at: 2026-06-01T06:49:53Z -->
+
+## Created
+
+Created by tickets.sh create.
+
+---
+
+<!-- event: decision author: hare at: 2026-06-01T06:50:33Z -->
+
+## Decision
+
+Distribution direction from user discussion:
+
+- Initial plugin packages should be single-file archives placed in user or workspace plugin stores, such as `~/.config/insomnia/plugins/` and `./.insomnia/plugins/`.
+- Package presence is discovery only. Tool/Hook registration, WASM initialization, or MCP process startup requires explicit manifest/profile enablement and capability grant resolution.
+- The package should contain a root `plugin.toml` and optional runtime assets such as `module.wasm`, schemas, README, and license files.
+- User and workspace stores map to source/trust categories. `user:<id>` and `project:<id>` are distinct; ambiguous selectors should fail closed.
+- Workspace packages are repository-provided and must be treated conservatively, especially for executable runtimes and MCP/process-spawn behavior.
+
+
+---
