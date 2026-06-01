@@ -1,9 +1,27 @@
 # llm-worker-macros
 
-Rust メソッドを LLM 呼び出し可能なツールとして自動登録する手続きマクロクレート。引数構造体・Tool トレイト実装・ToolDefinition を自動生成する。
+## Role
 
-## 公開マクロ
+`llm-worker-macros` provides procedural macros for declaring Rust methods as LLM-callable tools.
 
-- `#[tool_registry]` — impl ブロックに付与し、内部の `#[tool]` メソッドを一括処理
-- `#[tool]` — メソッドをツールとしてマーク
-- `#[description = "..."]` — 引数に説明を付与（JSON Schema の description に反映）
+## Boundaries
+
+Owns:
+
+- compile-time generation of tool argument structures and definitions
+- small macro conveniences around tool descriptions and schemas
+
+Does not own:
+
+- runtime permission decisions
+- filesystem scope checks
+- tool execution policy
+- model/tool-loop orchestration
+
+## Design notes
+
+Macros reduce boilerplate, but they must not imply capability. A generated tool definition is still subject to manifest permissions, Pod scope, and runtime policy.
+
+## See also
+
+- [`../../docs/design/tool-permissions-scope.md`](../../docs/design/tool-permissions-scope.md)

@@ -1,22 +1,32 @@
 # pod
 
-独立したエージェント実行単位「Pod」を実装するクレート。LLM ワーカーセッションをマニフェスト設定・ファイルスコープ制約と組み合わせ、Unix ソケット経由の双方向通信で操作可能にする。
+## Role
 
-## 公開型
+`pod` turns an `llm-worker` Worker into a named runtime entity with manifest configuration, scoped tools, session persistence, protocol handling, and Pod metadata integration.
 
-### コア
+## Boundaries
 
-- `Pod<C, St>` — LLM ワーカーセッション + マニフェスト + スコープのラッパー（`run()`, `resume()`, `from_manifest()`）
-- `PodRunResult` — 実行結果（`Finished`, `Paused`）
-- `PodError` — エラー型
+Owns:
 
-### 制御
+- Pod lifecycle and socket protocol serving
+- Worker construction around a resolved Manifest
+- session-store and pod-store coordination
+- built-in tool registration under scope/policy
+- spawned-child orchestration hooks
 
-- `PodController` — Pod ライフサイクルを管理するアクター（`spawn()` でタスク起動）
-- `PodHandle` — Pod への操作ハンドル（`send()`, `subscribe()`）
-- `PodSharedState` / `PodStatus` — 共有状態（`Idle`, `Running`, `Paused`）
+Does not own:
 
-### ランタイム
+- provider-specific wire formats (`provider` / `llm-worker` clients)
+- product CLI parsing (`yoi`)
+- TUI display authority (`tui`)
+- current-state storage schema outside Pod metadata (`pod-store`)
 
-- `RuntimeDir` — `$XDG_RUNTIME_DIR/yoi/{pod_name}/` 配下のランタイムディレクトリ管理（ステータス・履歴のアトミック書き込み）
-- `SocketServer` — Pod Protocol 用 Unix ソケットサーバー
+## Design notes
+
+A Pod is runtime authority, not UI state. It should commit model-visible events through history/session paths and keep current Pod-name state in Pod metadata rather than in transient runtime files.
+
+## See also
+
+- [`../../docs/design/pod-session-state.md`](../../docs/design/pod-session-state.md)
+- [`../../docs/design/context-history.md`](../../docs/design/context-history.md)
+- [`../../docs/design/tool-permissions-scope.md`](../../docs/design/tool-permissions-scope.md)

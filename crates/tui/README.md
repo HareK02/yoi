@@ -1,10 +1,30 @@
 # tui
 
-Pod と対話するためのターミナル UI クライアント。Unix ソケット経由で Pod に接続し、チャット形式でユーザー入力の送信・アシスタント応答の表示・ツール実行の監視を行う。
+## Role
 
-## 公開型
+`tui` implements terminal UI clients for interacting with one or more Pods.
 
-- `App` — アプリケーション状態（メッセージ履歴、入力バッファ、スクロール位置）
-- `Message` / `MessageKind` — 表示メッセージ（User, Assistant, Tool, Error, Status）
-- `PodClient` — Pod との Unix ソケット通信クライアント（`connect()`, `send()`, `next_event()`）
-- `draw()` — ratatui によるUI描画関数
+## Boundaries
+
+Owns:
+
+- terminal rendering and input handling
+- local composer state and UI affordances
+- single-Pod attach/restore screens
+- multi-Pod dashboard presentation
+
+Does not own:
+
+- durable transcript authority (`session-store`)
+- Pod current state (`pod-store`)
+- Pod lifecycle policy (`pod`)
+- product CLI ownership (`yoi`)
+
+## Design notes
+
+The TUI should display committed events and Pod snapshots rather than inventing durable state. Local input history and optimistic UI affordances are editing conveniences; they must not become hidden model context.
+
+## See also
+
+- [`../../docs/design/context-history.md`](../../docs/design/context-history.md)
+- [`../../docs/design/pod-session-state.md`](../../docs/design/pod-session-state.md)

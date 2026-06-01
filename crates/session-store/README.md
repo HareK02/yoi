@@ -1,29 +1,32 @@
-# llm-worker-persistence
+# session-store
 
-Worker のセッション永続化を提供するクレート。追記専用の JSONL ログとして状態遷移を記録し、ログの再生によってセッションを完全に復元する。大きなツール出力は Blob ストアに分離保存する。
+## Role
 
-## 公開型
+`session-store` owns replayable append-only session logs.
 
-### セッション
+## Boundaries
 
-- `Session<C, St>` — Worker をラップした永続化セッション（`run()`, `resume()`, `fork()`, `fork_at()`）
-- `SessionId` — UUID v7 によるセッション識別子
-- `SessionConfig` — 永続化設定（イベントトレース記録の有無）
+Owns:
 
-### ストア
+- session identifiers and segment lineage
+- JSONL log entries for replayable conversation/runtime history
+- restoring Worker/session state from committed records
+- schema surfaces that should make drift compile-visible
 
-- `Store` トレイト — 永続化バックエンド抽象（`append`, `read_all`, `list_sessions`）
-- `FsStore` — ファイルシステム上の JSONL ストア実装
-- `BlobStore` トレイト — Blob ストレージ抽象（`store`, `load`）
-- `FsBlobStore` — ファイルシステム上の Blob ストア実装
-- `BlobOutputProcessor` — ToolOutputProcessor 実装（小さい出力はインライン、大きい出力は Blob 保存）
+Does not own:
 
-### ログ
+- current Pod-name metadata (`pod-store`)
+- live process/socket discovery (`pod-registry`, `client`)
+- UI state (`tui`)
+- generated memory summaries (`memory`)
 
-- `LogEntry` — セッションログのエントリ型（`SegmentStart`, `UserInput`, `AssistantItem`, `ToolResult`, `SystemItem`, `TurnEnd` など）
-- `RestoredState` — ログ再生で復元された状態
-- `collect_state()` — ログエントリ列から状態を復元する関数
+## Design notes
 
-### ツール
+A session log records what happened. It is not the current Pod registry and should not be queried as the only source of "what does Pod X mean now?"
 
-- `InspectTool` — Blob 内容を取得する組み込みツール（行範囲・配列スライス・キー指定セレクタ対応）
+Prefer explicit current log variants over broad legacy compatibility when schema changes; hidden compatibility can make future replay bugs silent.
+
+## See also
+
+- [`../../docs/design/pod-session-state.md`](../../docs/design/pod-session-state.md)
+- [`../../docs/design/context-history.md`](../../docs/design/context-history.md)
