@@ -641,6 +641,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pre_llm_request_does_not_yield_from_single_measurement_history_rate_projection() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let registry = registry_with_pre_llm_hook(count.clone());
+        let ctx_items = vec![
+            Item::user_message("first"),
+            Item::user_message("tool output ".repeat(400)),
+        ];
+        let record = UsageRecord {
+            history_len: 1,
+            input_total_tokens: 11_124,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            output_tokens: 0,
+        };
+        let prefix = llm_worker::token_counter::prefix_bytes(&ctx_items);
+        let delta_bytes = prefix[2].saturating_sub(prefix[1]);
+        let old_projection =
+            11_124 + (delta_bytes as u128 * 11_124_u128 / prefix[1] as u128) as u64;
+        let corrected = total_tokens(&ctx_items, std::slice::from_ref(&record)).tokens;
+        let threshold = corrected + 100;
+        assert!(old_projection > threshold);
+
+        let state = Arc::new(CompactState::new(None, Some(threshold), 2));
+        let history = Arc::new(Mutex::new(vec![record]));
+        let interceptor = PodInterceptor::new(
+            registry,
+            Some(state),
+            Some(history),
+            NotifyBuffer::new(),
+            Arc::new(Mutex::new(Vec::new())),
+            TaskStore::new(),
+            Arc::new(TaskReminderState::new()),
+            PromptCatalog::builtins_only().unwrap(),
+            None,
+        );
+        let mut ctx = ctx_items;
+        let action = interceptor.pre_llm_request(&mut ctx).await;
+
+        assert!(matches!(action, PreRequestAction::Continue));
+        assert_eq!(count.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
     async fn pre_llm_request_does_not_yield_when_only_post_run_threshold_set() {
         // request_threshold = None → safety-net check is inert inside the turn
         // even if current occupancy is huge. Post-run check runs elsewhere.
