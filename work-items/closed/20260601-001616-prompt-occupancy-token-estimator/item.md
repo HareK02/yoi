@@ -2,12 +2,12 @@
 id: 20260601-001616-prompt-occupancy-token-estimator
 slug: prompt-occupancy-token-estimator
 title: Token estimator must keep prompt occupancy accounting whole
-status: open
+status: closed
 kind: task
 priority: P1
 labels: [compaction, token-accounting]
 created_at: 2026-06-01T00:16:16Z
-updated_at: 2026-06-01T00:59:20Z
+updated_at: 2026-06-01T01:10:06Z
 assignee: null
 legacy_ticket: null
 ---
