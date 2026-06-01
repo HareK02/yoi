@@ -568,11 +568,10 @@ impl App {
     }
 
     fn method_for_run(&mut self, segments: Vec<Segment>) -> Method {
-        // TurnHeader / UserMessage blocks are pushed in response to
-        // `Event::UserMessage` (single source of truth, shared by every
-        // client subscribed to the Pod). Locally we only clear the
-        // input buffer and forward the method, while remembering enough
-        // local state to undo the visible submit if the Pod reports that
+        // TurnHeader / UserMessage blocks are pushed only after the Pod
+        // emits `Event::UserMessage` from a committed `LogEntry::UserInput`.
+        // Locally we only clear the input buffer and forward the method,
+        // while remembering enough local state to undo the visible submit if
         // the accepted run produced no assistant output and was rolled back.
         self.pending_submit_rollback = Some(RollbackSubmitState {
             text: Segment::flatten_to_text(&segments),
@@ -2315,6 +2314,34 @@ mod completion_flow_tests {
             }],
         });
         assert!(app.completion.as_ref().unwrap().entries.is_empty());
+    }
+
+    #[test]
+    fn committed_user_message_survives_fresh_segment_rotation() {
+        let mut app = App::new("test".into());
+        let start = session_store::LogEntry::SegmentStart {
+            ts: session_store::segment_log::now_millis(),
+            session_id: uuid::Uuid::nil(),
+            system_prompt: None,
+            config: llm_worker::llm_client::RequestConfig::default(),
+            history: vec![],
+            forked_from: None,
+            compacted_from: None,
+        };
+
+        app.handle_pod_event(Event::SegmentRotated {
+            entry: serde_json::to_value(start).expect("LogEntry is Serialize"),
+        });
+        app.handle_pod_event(Event::UserMessage {
+            segments: vec![Segment::text("first persisted message")],
+        });
+
+        assert_eq!(app.turn_index, 1);
+        assert!(app.blocks.iter().any(|b| matches!(
+            b,
+            Block::UserMessage { segments }
+                if Segment::flatten_to_text(segments) == "first persisted message"
+        )));
     }
 
     #[test]

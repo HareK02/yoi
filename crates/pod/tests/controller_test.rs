@@ -571,13 +571,14 @@ async fn run_with_paste_segment_inlines_content_and_emits_typed_user_message() {
     let client_for_assert = client.clone();
     let pod = make_pod(client).await;
     let handle = spawn_controller(pod).await;
-    let mut rx = handle.subscribe();
+    let (_snapshot, mut entry_rx) = handle.sink.subscribe_with_snapshot();
+    let mut event_rx = handle.subscribe();
 
     // Mixed input: plain text + a paste chip + trailing text. Pod must
     // flatten this into one user-message string (paste content inlined,
-    // no `[Clipboard ...]` label leaking to the LLM); the
-    // `Event::UserMessage` re-broadcast must carry the typed segments
-    // unchanged so other clients can re-render the chip.
+    // no `[Clipboard ...]` label leaking to the LLM); the committed
+    // `LogEntry::UserInput` must carry the typed segments unchanged so
+    // socket clients can derive `Event::UserMessage` and re-render the chip.
     let segments = vec![
         protocol::Segment::text("see "),
         protocol::Segment::Paste {
@@ -596,21 +597,36 @@ async fn run_with_paste_segment_inlines_content_and_emits_typed_user_message() {
         .unwrap();
 
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-    let mut user_event_segments: Option<Vec<protocol::Segment>> = None;
+    let mut saw_turn_end = false;
+    let mut user_input_segments: Option<Vec<protocol::Segment>> = None;
     loop {
         tokio::select! {
-            event = rx.recv() => match event {
-                Ok(Event::UserMessage { segments }) => user_event_segments = Some(segments),
-                Ok(Event::TurnEnd { .. }) => break,
+            event = event_rx.recv() => match event {
+                Ok(Event::TurnEnd { .. }) => {
+                    saw_turn_end = true;
+                    if user_input_segments.is_some() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+                _ => {}
+            },
+            entry = entry_rx.recv() => match entry {
+                Ok(session_store::LogEntry::UserInput { segments, .. }) => {
+                    user_input_segments = Some(segments);
+                    if saw_turn_end {
+                        break;
+                    }
+                }
                 Err(_) => break,
                 _ => {}
             },
             _ = tokio::time::sleep_until(deadline) => break,
         }
     }
-    let echoed = user_event_segments.expect("UserMessage event missing");
-    assert_eq!(echoed.len(), 3, "all three segments must round-trip");
-    assert!(matches!(echoed[1], protocol::Segment::Paste { id: 7, .. }));
+    assert!(saw_turn_end, "TurnEnd event missing");
+    let echoed = user_input_segments.expect("committed UserInput entry missing");
+    assert_eq!(echoed, segments, "typed segments must round-trip unchanged");
 
     // The Worker received a single user message whose text is the
     // flattened body — paste content inlined, no chip label.
