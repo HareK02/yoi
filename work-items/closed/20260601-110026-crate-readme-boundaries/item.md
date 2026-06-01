@@ -2,12 +2,12 @@
 id: 20260601-110026-crate-readme-boundaries
 slug: crate-readme-boundaries
 title: Standardize crate README responsibility boundaries
-status: open
+status: closed
 kind: task
 priority: P2
 labels: [docs]
 created_at: 2026-06-01T11:00:26Z
-updated_at: 2026-06-01T11:09:35Z
+updated_at: 2026-06-01T13:22:51Z
 assignee: null
 legacy_ticket: null
 ---

@@ -1,0 +1,1 @@
+Completed documentation information architecture cleanup: root and docs README now define maintained docs surface; design/development docs added; old plan/ref/research/top-level docs moved out of maintained surface; validation passed.

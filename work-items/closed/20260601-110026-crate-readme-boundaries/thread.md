@@ -46,3 +46,12 @@ Standardized crate README files as thin responsibility-boundary documents.
 
 
 ---
+
+<!-- event: close author: hare at: 2026-06-01T13:22:51Z status: closed -->
+
+## Closed
+
+Completed crate README boundary cleanup: all crates now have concise role/boundary README files linked to maintained design/development docs; validation passed.
+
+
+---

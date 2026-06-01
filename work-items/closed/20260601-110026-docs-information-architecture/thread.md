@@ -45,3 +45,12 @@ Reorganized maintained repository documentation around current Yoi design intent
 
 
 ---
+
+<!-- event: close author: hare at: 2026-06-01T13:22:50Z status: closed -->
+
+## Closed
+
+Completed documentation information architecture cleanup: root and docs README now define maintained docs surface; design/development docs added; old plan/ref/research/top-level docs moved out of maintained surface; validation passed.
+
+
+---
