@@ -1,15 +1,3 @@
-<!-- event: create author: tickets.sh at: 2026-06-01T03:12:52Z -->
-
-## Created
-
-Created by tickets.sh create.
-
----
-
-<!-- event: decision author: hare at: 2026-06-01T05:26:27Z -->
-
-## Decision
-
 # WorkItem definition and API shape
 
 ## Definition
@@ -228,6 +216,3 @@ This does not imply unlimited file access. The WorkItem tool should be limited t
 ## Design consequence
 
 The first implementation can be LocalFilesBackend over current `work-items/`, preserving markdown/frontmatter/thread/artifacts and `tickets.sh` compatibility. The API should already be backend-shaped so GitHub Issues or other trackers can be added later without changing Intake/Orchestrator semantics.
-
-
----
