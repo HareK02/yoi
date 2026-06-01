@@ -19,4 +19,10 @@ Implemented workspace-local manifest override support.
 - `git diff --check`
 - `nix build .#yoi`
 
+Reviewer follow-up validation:
+
+- `cargo test -p manifest workspace_local_override -- --nocapture`
+- `./tickets.sh doctor`
+- `git diff --check`
+
 All completed successfully.

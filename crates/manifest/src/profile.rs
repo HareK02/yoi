@@ -1644,6 +1644,60 @@ record_event_trace = false
     }
 
     #[test]
+    fn workspace_local_override_uses_nearest_ancestor() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().join("project");
+        let nested = workspace.join("nested");
+        let child = nested.join("child");
+        let parent_yoi = workspace.join(".yoi");
+        let nested_yoi = nested.join(".yoi");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::create_dir_all(&parent_yoi).unwrap();
+        std::fs::create_dir_all(&nested_yoi).unwrap();
+        std::fs::write(
+            parent_yoi.join(WORKSPACE_OVERRIDE_LOCAL_FILENAME),
+            r#"
+[pod]
+prompt_pack = "parent-prompts.toml"
+[worker]
+language = "parent"
+"#,
+        )
+        .unwrap();
+        let nested_override_path = nested_yoi.join(WORKSPACE_OVERRIDE_LOCAL_FILENAME);
+        std::fs::write(
+            &nested_override_path,
+            r#"
+[pod]
+prompt_pack = "nested-prompts.toml"
+[worker]
+language = "nested"
+"#,
+        )
+        .unwrap();
+
+        let resolved = ProfileResolver::new()
+            .with_workspace_base(&child)
+            .resolve(&ProfileSelector::Default, ProfileResolveOptions::default())
+            .unwrap();
+
+        assert_eq!(resolved.manifest.worker.language, "nested");
+        assert_eq!(
+            resolved.manifest.pod.prompt_pack.as_deref(),
+            Some(nested_yoi.join("nested-prompts.toml").as_path())
+        );
+        assert_eq!(
+            resolved
+                .manifest
+                .profile
+                .as_ref()
+                .and_then(|snapshot| snapshot.workspace_override.as_ref())
+                .map(|snapshot| snapshot.path.as_path()),
+            Some(nested_override_path.as_path())
+        );
+    }
+
+    #[test]
     fn workspace_local_override_rejects_runtime_pod_name() {
         let tmp = TempDir::new().unwrap();
         let yoi_dir = tmp.path().join(".yoi");
