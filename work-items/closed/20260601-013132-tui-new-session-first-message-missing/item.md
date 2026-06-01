@@ -2,12 +2,12 @@
 id: 20260601-013132-tui-new-session-first-message-missing
 slug: tui-new-session-first-message-missing
 title: TUI: first message missing when starting a new session
-status: open
+status: closed
 kind: bug
 priority: P1
 labels: [tui, session, display]
 created_at: 2026-06-01T01:31:32Z
-updated_at: 2026-06-01T02:00:33Z
+updated_at: 2026-06-01T02:23:11Z
 assignee: null
 legacy_ticket: null
 ---

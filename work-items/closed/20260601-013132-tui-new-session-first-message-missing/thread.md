@@ -76,3 +76,43 @@ This should make a fresh session produce `SegmentRotated` first and then `UserMe
 
 
 ---
+
+<!-- event: review author: hare at: 2026-06-01T02:23:10Z status: approve -->
+
+## Review: approve
+
+## External review summary
+
+Status: approved
+
+Reviewer inspected the ticket, investigation artifact, and implementation commit `501dcc9 fix: show initial TUI user message` in branch `tui-new-session-first-message-missing`.
+
+Findings:
+
+- The implementation matches the ticket intent and investigation result.
+- The controller-side pre-run optimistic `Event::UserMessage` broadcast is removed from the authoritative path.
+- Live `Event::UserMessage` emission is tied to persisted `LogEntry::UserInput` / session-log-derived ordering.
+- Fresh sessions should now see initial `SegmentRotated` before the committed user message event, preserving the first message in the TUI view.
+- The fix does not use a TUI-only fake/pending message.
+- No unnecessary protocol/schema expansion was found.
+- Existing snapshot restore, later sends, queued input, and composer input history did not show obvious regressions from the diff.
+
+Validation reviewed:
+
+- `cargo fmt`
+- `cargo test -p pod`
+- `cargo test -p tui`
+
+Parent decision needed: none.
+
+
+---
+
+<!-- event: close author: hare at: 2026-06-01T02:23:11Z status: closed -->
+
+## Closed
+
+Merged branch tui-new-session-first-message-missing via merge commit ff27917 after external review approval. Validation on develop passed: cargo fmt --check, cargo test -p pod, cargo test -p tui, cargo check -p insomnia, ./tickets.sh doctor.
+
+
+---

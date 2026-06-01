@@ -2,12 +2,12 @@
 id: 20260601-020202-tui-keys-inline-viewport-ui
 slug: tui-keys-inline-viewport-ui
 title: TUI: align insomnia keys UI with inline viewport style
-status: open
+status: closed
 kind: task
 priority: P2
 labels: [tui, keys, ui]
 created_at: 2026-06-01T02:02:02Z
-updated_at: 2026-06-01T02:02:02Z
+updated_at: 2026-06-01T02:23:12Z
 assignee: null
 legacy_ticket: null
 ---

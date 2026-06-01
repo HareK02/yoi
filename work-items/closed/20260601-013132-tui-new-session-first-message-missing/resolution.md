@@ -1,0 +1,1 @@
+Merged branch tui-new-session-first-message-missing via merge commit ff27917 after external review approval. Validation on develop passed: cargo fmt --check, cargo test -p pod, cargo test -p tui, cargo check -p insomnia, ./tickets.sh doctor.
