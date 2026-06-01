@@ -92,6 +92,9 @@ pub enum PodPrompt {
     /// knowledge when Workflow resident injection is enabled and at least one
     /// workflow advertises `model_invokation: true`.
     ResidentWorkflowsSection,
+    /// Trailing Pod orchestration guidance, appended when registered tools
+    /// include Pod-management capabilities.
+    PodOrchestrationGuidanceSection,
     /// LLM-facing description for the SpawnPod tool, including discovered
     /// profile selectors.
     SpawnPodToolDescription,
@@ -111,6 +114,7 @@ impl PodPrompt {
             Self::ResidentMemorySummarySection => "resident_memory_summary_section",
             Self::ResidentKnowledgeSection => "resident_knowledge_section",
             Self::ResidentWorkflowsSection => "resident_workflows_section",
+            Self::PodOrchestrationGuidanceSection => "pod_orchestration_guidance_section",
             Self::SpawnPodToolDescription => "spawn_pod_tool_description",
         }
     }
@@ -130,6 +134,7 @@ impl PodPrompt {
         PodPrompt::ResidentMemorySummarySection,
         PodPrompt::ResidentKnowledgeSection,
         PodPrompt::ResidentWorkflowsSection,
+        PodPrompt::PodOrchestrationGuidanceSection,
         PodPrompt::SpawnPodToolDescription,
     ];
 
@@ -145,6 +150,7 @@ impl PodPrompt {
         "resident_memory_summary_section",
         "resident_knowledge_section",
         "resident_workflows_section",
+        "pod_orchestration_guidance_section",
         "spawn_pod_tool_description",
     ];
 }
@@ -400,6 +406,11 @@ impl PromptCatalog {
             PodPrompt::ResidentWorkflowsSection,
             single("entries", entries),
         )
+    }
+
+    /// Render `PodPrompt::PodOrchestrationGuidanceSection` (no inputs).
+    pub fn pod_orchestration_guidance_section(&self) -> Result<String, CatalogError> {
+        self.render(PodPrompt::PodOrchestrationGuidanceSection, Value::UNDEFINED)
     }
 
     /// Render `PodPrompt::SpawnPodToolDescription`.
@@ -713,6 +724,19 @@ compact_system = "PREFIX\n{% include \"$insomnia/internal/compact_system\" %}"
         let rendered = cat.compact_system().unwrap();
         assert!(rendered.starts_with("PREFIX\n"));
         assert!(rendered.contains("write_summary"));
+    }
+
+    #[test]
+    fn pod_orchestration_guidance_section_renders_resource_body() {
+        let cat = PromptCatalog::builtins_only().unwrap();
+        let rendered = cat.pod_orchestration_guidance_section().unwrap();
+        assert!(rendered.contains("## Pod orchestration"));
+        assert!(rendered.contains("spawned Pod notifications are background signals"));
+        assert!(rendered.contains("does not need to keep a turn open"));
+        assert!(rendered.contains("Do not use `sleep` or polling loops"));
+        assert!(rendered.contains("worktree status, diff, and test results"));
+        assert!(rendered.contains("not scheduler or auto-maintain authorization"));
+        assert!(rendered.contains("bypass user/workflow authorization"));
     }
 
     #[test]

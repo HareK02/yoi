@@ -66,6 +66,8 @@ The following workflows are advertised resident. When a user request matches one
 {{ entries }}\
 """
 
+pod_orchestration_guidance_section = "{% include \"$insomnia/common/pod-orchestration\" %}"
+
 spawn_pod_tool_description = """\
 Spawn a new Pod process to work on a delegated task. The spawner's write scope is reduced by the scope passed here; the spawned Pod receives its own socket and starts running `task` immediately. The spawned Pod outlives the spawner's current turn and can be contacted again through its socket path.
 
