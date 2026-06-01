@@ -1,4 +1,4 @@
-# Yoi
+# 夜居 / Yoi agent
 
 Yoi is an agent runtime for building, running, and orchestrating LLM Pods while preserving explicit history, scoped capabilities, and developer-controlled workflows.
 
