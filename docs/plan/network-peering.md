@@ -23,26 +23,26 @@ Pod が連携する等）では、マシン間のメッセージングが必要�
 
 ## アドレッシング
 
-Pod のネットワークアドレスは `insomnia.pod-name@host` の形式を**論理的な
+Pod のネットワークアドレスは `yoi.pod-name@host` の形式を**論理的な
 宛先表記**として使う。実際の SSH 接続がこの文字列そのままで行えるかは
 transport 方式に依存する（後述）。
 
-- `insomnia` = SSH ユーザー名（固定）
+- `yoi` = SSH ユーザー名（固定）
 - `host` = 相手マシンのホスト名 or IP
 - `pod-name` = 送信先の Pod 名（相手マシン上のローカル workspace 内で一意）
 
-推奨構文は **`insomnia@host:pod-name`**（git 方式）。
+推奨構文は **`yoi@host:pod-name`**（git 方式）。
 詳細は後述の「アドレッシング構文」を参照。
 
 ## アドレッシング構文
 
-論理的な宛先表記として **`insomnia@host:pod-name`** を推奨する。
+論理的な宛先表記として **`yoi@host:pod-name`** を推奨する。
 git の `git@github.com:user/repo` と同じ構文で:
 
-- SSH ユーザーは `insomnia` 固定（動的ユーザー名が不要）
+- SSH ユーザーは `yoi` 固定（動的ユーザー名が不要）
 - `:` 以降がルーティング情報（Pod 名）
-- クライアント側が `insomnia@host:pod-name` をパースし、
-  `ssh insomnia@host "insomnia-route pod-name"` に変換する
+- クライアント側が `yoi@host:pod-name` をパースし、
+  `ssh yoi@host "yoi-route pod-name"` に変換する
 
 git がこの方式で `git-upload-pack user/repo` にルーティングしている
 のと同じ仕組み。OS レベルの設定（NSS モジュール等）が一切不要で、
@@ -53,37 +53,37 @@ git がこの方式で `git-upload-pack user/repo` にルーティングして�
 ### A. 単一ユーザー + コマンド引数
 
 ```
-ssh insomnia@host send pod-name "message"
+ssh yoi@host send pod-name "message"
 ```
 
-- 相手マシンにシステムユーザー `insomnia` を 1 つ作る
+- 相手マシンにシステムユーザー `yoi` を 1 つ作る
 - `authorized_keys` に接続元 Pod の公開鍵を登録
 - ForceCommand または shell スクリプトが第一引数 (`send`) と
   第二引数 (`pod-name`) を解釈してローカル workspace のレジストリから
   Pod の socket を引き、メッセージをルーティング
 - **導入コスト最低**。ユーザー 1 つ + スクリプト 1 つで動く
-- 宛先が引数に入るので `insomnia.pod-name@host` の見た目にはならない
+- 宛先が引数に入るので `yoi.pod-name@host` の見た目にはならない
 
 ### B. 鍵ベースルーティング（gitolite 方式）
 
 ```
-ssh insomnia@host    # 使った鍵でどの Pod 宛か判別
+ssh yoi@host    # 使った鍵でどの Pod 宛か判別
 ```
 
-- `~insomnia/.ssh/authorized_keys` に Pod ごとのエントリ:
+- `~yoi/.ssh/authorized_keys` に Pod ごとのエントリ:
   ```
-  command="insomnia-route pod-a",no-port-forwarding,... ssh-ed25519 AAAA... pod-a@remote
-  command="insomnia-route pod-b",no-port-forwarding,... ssh-ed25519 AAAA... pod-b@remote
+  command="yoi-route pod-a",no-port-forwarding,... ssh-ed25519 AAAA... pod-a@remote
+  command="yoi-route pod-b",no-port-forwarding,... ssh-ed25519 AAAA... pod-b@remote
   ```
 - SSH 接続時に使われた鍵が `command=` で指定されたルーティング先を決定
 - gitolite / Gitea / Gogs で実証済みのパターン
-- 接続元は `ssh insomnia@host` だけ。**鍵が宛先を決める**
+- 接続元は `ssh yoi@host` だけ。**鍵が宛先を決める**
 - クライアント側 SSH config で alias を作れば見た目を整えられる:
   ```
   Host pod-a.host-b
     HostName host-b
-    User insomnia
-    IdentityFile ~/.config/insomnia/keys/pod-a
+    User yoi
+    IdentityFile ~/.config/yoi/keys/pod-a
   ```
 - 鍵の登録が相互に必要（Pod A が Pod B に送るなら、B のマシンの
   authorized_keys に A の公開鍵 + route 先を登録）
@@ -91,15 +91,15 @@ ssh insomnia@host    # 使った鍵でどの Pod 宛か判別
 ### C. 動的ユーザー名
 
 ```
-ssh insomnia.pod-name@host
+ssh yoi.pod-name@host
 ```
 
-- `insomnia.pod-name` を OS レベルで有効なユーザー名として解決する:
+- `yoi.pod-name` を OS レベルで有効なユーザー名として解決する:
   - NSS (Name Service Switch) モジュールを書くか `libnss-extrausers` を利用
   - PAM モジュールで認証をフック
-  - `sshd_config` で `Match User insomnia.*` → `ForceCommand` でルーティング
+  - `sshd_config` で `Match User yoi.*` → `ForceCommand` でルーティング
 - **最も直感的なアドレッシング**だが OS レベルの設定が必要
-- insomnia をインストールするだけでは動かない（管理者権限での設定が要る）
+- yoi をインストールするだけでは動かない（管理者権限での設定が要る）
 - コンテナ環境ではやりやすい（ユーザー管理を自由にできる）
 
 ### 推奨
@@ -143,7 +143,7 @@ Pod 協働では:
 - broadcast = known-peers を iterate して個別送信
 - 規模が数十 Pod なら十分実用的
 - 将来的に gossip protocol で peer 発見を自動化できるが、
-  MVP では手動登録（`insomnia peer add pod-a@host-b`）で十分
+  MVP では手動登録（`yoi peer add pod-a@host-b`）で十分
 
 ## 受信側のルーティング
 
@@ -151,16 +151,16 @@ SSH 接続を受けた側が、宛先 Pod のローカル socket にルーティ
 仕組みが必要。
 
 ```
-[SSH 接続] → insomnia-route <pod-name>
+[SSH 接続] → yoi-route <pod-name>
                 ↓
             workspace registry を参照
                 ↓
-            /run/insomnia/.../pod-name.sock に転送
+            /run/yoi/.../pod-name.sock に転送
                 ↓
             Pod が受信・処理
 ```
 
-`insomnia-route` は:
+`yoi-route` は:
 1. workspace のレジストリを読んで pod-name の socket path を引く
 2. socket に接続してメッセージを中継
 3. 応答を SSH 接続に返す
@@ -172,17 +172,17 @@ unique であれば workspace を指定しなくて済む。
 ## Daemon-less リモート Pod 生成（SSH-only モデル）
 
 リモートホスト上の Pod 生成は **daemon 無しで SSH だけで成立する**。
-remote 側に必要なのは `insomnia` バイナリと SSH アクセスのみ。
+remote 側に必要なのは `yoi` バイナリと SSH アクセスのみ。
 
 ### 前提
 
-- insomnia は環境再現（git clone, コンテナ構築等）を自身の責務としない。
+- yoi は環境再現（git clone, コンテナ構築等）を自身の責務としない。
   作業対象のファイルがリモートに既にあるか、ユーザーが任意の手段で
   用意する前提（git clone, rsync, 手動配置、CI の checkout 等）
-- insomnia が転送するのは**セッション（会話履歴）と manifest overlay**
+- yoi が転送するのは**セッション（会話履歴）と manifest overlay**
   だけ。コードベースの同期は外部に委ねる
-- コンテナ内で動かすか bare metal で動かすかも insomnia は問わない。
-  `insomnia` バイナリが動くホストの fs 上で活動する主体がある、
+- コンテナ内で動かすか bare metal で動かすかも yoi は問わない。
+  `yoi` バイナリが動くホストの fs 上で活動する主体がある、
   それだけが前提
 
 ### フロー
@@ -193,7 +193,7 @@ host_a (spawner)                         host_b (remote)
     │
     ├── ssh: session データを転送 ────────→ ファイル書き込み
     ├── ssh: profile / one-file manifest 入力を転送 ─→ 必要ならファイル書き込み
-    ├── ssh: `insomnia pod --profile ... &` ───────→ Pod プロセス起動、socket 作成
+    ├── ssh: `yoi pod --profile ... &` ───────→ Pod プロセス起動、socket 作成
     ├── ssh -L: socket を tunnel ─────────→ Pod B の unix socket
     │
     └── localhost:tunnel に接続 ──────────→ Method::Run / Event stream
@@ -204,16 +204,16 @@ host_a (spawner)                         host_b (remote)
 
 ```bash
 # 1. session + profile/manifest input を転送
-ssh insomnia@host-b "mkdir -p ~/workspaces/task-123/store"
-tar cz session/ | ssh insomnia@host-b "tar xz -C ~/workspaces/task-123/store"
-scp profile.lua insomnia@host-b:~/workspaces/task-123/profile.lua
+ssh yoi@host-b "mkdir -p ~/workspaces/task-123/store"
+tar cz session/ | ssh yoi@host-b "tar xz -C ~/workspaces/task-123/store"
+scp profile.lua yoi@host-b:~/workspaces/task-123/profile.lua
 
 # 2. Pod を起動（detach）
-ssh insomnia@host-b "insomnia pod --store ~/workspaces/task-123/store \
+ssh yoi@host-b "yoi pod --store ~/workspaces/task-123/store \
     --profile ~/workspaces/task-123/profile.lua &"
 
 # 3. socket を tunnel で引っ張る
-ssh -L /tmp/pod-b.sock:/run/insomnia/task-123/pod.sock insomnia@host-b
+ssh -L /tmp/pod-b.sock:/run/yoi/task-123/pod.sock yoi@host-b
 
 # 4. あとは /tmp/pod-b.sock にローカルと同じ protocol で繋ぐ
 ```
@@ -229,7 +229,7 @@ spawner の `SpawnPod` ツールがこの一連を内部で実行する。LLM �
   成立しないので、workspace の scope 会計は remote には関係しない
 - **通知**: SSH tunnel が繋がっている限り `Event` stream がそのまま
   流れる。tunnel が切れたら再接続する
-- **環境構築は insomnia の責務外**: git clone するか rsync するかは
+- **環境構築は yoi の責務外**: git clone するか rsync するかは
   Pod の instruction で指示するか、事前に用意されている前提
 
 ### daemon が必要になるケース
@@ -251,7 +251,7 @@ SSH-only モデルの制約が、daemon 導入の動機になる:
 ### リモート側のディレクトリ構成
 
 ```
-/home/insomnia/                    ← insomnia システムユーザーの home
+/home/yoi/                    ← yoi システムユーザーの home
 ├── workspaces/
 │   ├── <task-or-project-id>/      ← workspace ごとのルート
 │   │   ├── repo/                  ← ユーザーが用意した作業ファイル群
@@ -261,8 +261,8 @@ SSH-only モデルの制約が、daemon 導入の動機になる:
     └── authorized_keys            ← 接続元 Pod の公開鍵
 ```
 
-- `insomnia` システムユーザーが SSH 接続先 + ファイル所有者
-- `repo/` 配下の準備は insomnia の責務外（git clone, rsync 等は
+- `yoi` システムユーザーが SSH 接続先 + ファイル所有者
+- `repo/` 配下の準備は yoi の責務外（git clone, rsync 等は
   ユーザーや instruction が指示）
 - `store/` は spawner がセッションデータを書き込む場所
 

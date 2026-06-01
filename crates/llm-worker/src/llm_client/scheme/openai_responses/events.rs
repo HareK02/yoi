@@ -2,7 +2,7 @@
 //!
 //! `response.*` 名前空間の SSE を共通の [`Event`](crate::llm_client::event::Event)
 //! に変換する。Responses の (output_index, content_index) 2 次元座標と
-//! insomnia 側 1 次元 `BlockStart/Delta/Stop::index` のマッピングは
+//! yoi 側 1 次元 `BlockStart/Delta/Stop::index` のマッピングは
 //! [`OpenAIResponsesState`] が保持する。
 
 use std::collections::{BTreeMap, HashMap};

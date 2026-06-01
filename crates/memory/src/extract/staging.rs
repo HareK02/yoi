@@ -1,4 +1,4 @@
-//! `<workspace>/.insomnia/memory/_staging/<id>.json` への書き出しヘルパー。
+//! `<workspace>/.yoi/memory/_staging/<id>.json` への書き出しヘルパー。
 //!
 //! 1 件 1 ファイル、UUIDv7 命名（短命なので衝突回避と順序を兼ねる）。
 //! `source` を機械付与した [`StagingRecord`] 形式で保存する。

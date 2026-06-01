@@ -1,10 +1,10 @@
-local profile = require("insomnia.profile")
-local scope = require("insomnia.scope")
-local compact = require("insomnia.compact")
+local profile = require("yoi.profile")
+local scope = require("yoi.scope")
+local compact = require("yoi.compact")
 
 return profile {
     slug = "default",
-    description = "Bundled default Insomnia coding profile",
+    description = "Bundled default Yoi coding profile",
 
     scope = scope.workspace_write(),
 

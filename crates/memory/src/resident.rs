@@ -5,7 +5,7 @@
 //! - [`collect_resident_knowledge`] — resident-injection candidates
 //!   (`model_invokation: true`) returned as `(slug, description)` pairs.
 //! - [`collect_resident_summary`] — the body of
-//!   `<workspace>/.insomnia/memory/summary.md` when it parses as a summary
+//!   `<workspace>/.yoi/memory/summary.md` when it parses as a summary
 //!   record and has non-empty body.
 //! - [`list_knowledge_slugs`] — every slug whose file parses, regardless
 //!   of `model_invokation`. Used by the Pod IPC layer to answer TUI `#`
@@ -25,7 +25,7 @@ pub struct ResidentKnowledgeEntry {
     pub description: String,
 }
 
-/// Walk `<workspace>/.insomnia/knowledge/*.md` and return entries whose
+/// Walk `<workspace>/.yoi/knowledge/*.md` and return entries whose
 /// frontmatter has `model_invokation: true`, sorted by slug. A missing
 /// directory yields an empty vec.
 pub fn collect_resident_knowledge(layout: &WorkspaceLayout) -> Vec<ResidentKnowledgeEntry> {
@@ -42,7 +42,7 @@ pub fn collect_resident_knowledge(layout: &WorkspaceLayout) -> Vec<ResidentKnowl
     out
 }
 
-/// Read `<workspace>/.insomnia/memory/summary.md` for resident prompt
+/// Read `<workspace>/.yoi/memory/summary.md` for resident prompt
 /// injection. Returns only the markdown body (frontmatter stripped), and
 /// degrades to `None` for missing, unreadable, malformed, or empty records.
 pub fn collect_resident_summary(layout: &WorkspaceLayout) -> Option<String> {
@@ -115,7 +115,7 @@ mod tests {
     }
 
     fn write_summary(dir: &Path, body: &str) {
-        let path = dir.join(".insomnia/memory/summary.md");
+        let path = dir.join(".yoi/memory/summary.md");
         let content = format!("---\nupdated_at: {n}\n---\n{body}", n = now());
         std::fs::write(path, content).unwrap();
     }
@@ -127,7 +127,7 @@ mod tests {
         model_invokation: bool,
         body: &str,
     ) {
-        let path = dir.join(".insomnia/knowledge").join(format!("{slug}.md"));
+        let path = dir.join(".yoi/knowledge").join(format!("{slug}.md"));
         let content = format!(
             "---\ncreated_at: {n}\nupdated_at: {n}\nkind: policy\ndescription: \"{description}\"\nmodel_invokation: {flag}\nuser_invocable: true\nlast_sources: []\n---\n{body}",
             n = now(),
@@ -138,8 +138,8 @@ mod tests {
 
     fn setup() -> (TempDir, WorkspaceLayout) {
         let dir = TempDir::new().unwrap();
-        std::fs::create_dir_all(dir.path().join(".insomnia/knowledge")).unwrap();
-        std::fs::create_dir_all(dir.path().join(".insomnia/memory")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".yoi/knowledge")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".yoi/memory")).unwrap();
         let layout = WorkspaceLayout::new(dir.path().to_path_buf());
         (dir, layout)
     }
@@ -166,7 +166,7 @@ mod tests {
     fn malformed_summary_returns_none() {
         let (dir, layout) = setup();
         std::fs::write(
-            dir.path().join(".insomnia/memory/summary.md"),
+            dir.path().join(".yoi/memory/summary.md"),
             "---\nthis is not yaml: : :\n---\nbody\n",
         )
         .unwrap();
@@ -222,7 +222,7 @@ mod tests {
         write_knowledge(dir.path(), "good", "ok", true, "");
         // Garbage in frontmatter — must be skipped, not panic.
         std::fs::write(
-            dir.path().join(".insomnia/knowledge/bad.md"),
+            dir.path().join(".yoi/knowledge/bad.md"),
             "---\nthis is not yaml: : :\n---\nbody\n",
         )
         .unwrap();
@@ -236,11 +236,7 @@ mod tests {
     fn non_md_files_ignored() {
         let (dir, layout) = setup();
         write_knowledge(dir.path(), "good", "ok", true, "");
-        std::fs::write(
-            dir.path().join(".insomnia/knowledge/note.txt"),
-            "not markdown\n",
-        )
-        .unwrap();
+        std::fs::write(dir.path().join(".yoi/knowledge/note.txt"), "not markdown\n").unwrap();
 
         let got = collect_resident_knowledge(&layout);
         assert_eq!(got.len(), 1);
@@ -269,15 +265,11 @@ mod tests {
         let (dir, layout) = setup();
         write_knowledge(dir.path(), "good", "ok", true, "");
         std::fs::write(
-            dir.path().join(".insomnia/knowledge/bad.md"),
+            dir.path().join(".yoi/knowledge/bad.md"),
             "---\nthis is not yaml: : :\n---\nbody\n",
         )
         .unwrap();
-        std::fs::write(
-            dir.path().join(".insomnia/knowledge/note.txt"),
-            "not markdown\n",
-        )
-        .unwrap();
+        std::fs::write(dir.path().join(".yoi/knowledge/note.txt"), "not markdown\n").unwrap();
 
         let got = list_knowledge_slugs(&layout);
         assert_eq!(got, vec!["good"]);

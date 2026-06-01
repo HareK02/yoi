@@ -78,7 +78,7 @@ impl SecretResolver for DefaultSecretResolver {
             path: std::path::PathBuf::from("<data_dir>"),
             source: std::io::Error::new(
                 std::io::ErrorKind::NotFound,
-                "could not determine insomnia data directory",
+                "could not determine yoi data directory",
             ),
         })?;
         SecretStore::new(data_dir).get(id)

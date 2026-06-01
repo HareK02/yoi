@@ -20,11 +20,11 @@ use crate::{
     ScopeConfig, ScopeRule, SkillsConfig, WebConfig, WorkerManifestConfig, paths,
 };
 
-const PROFILE_FORMAT_V1: &str = "insomnia.lua-profile.v1";
+const PROFILE_FORMAT_V1: &str = "yoi.lua-profile.v1";
 const BUILTIN_DEFAULT_PROFILE_NAME: &str = "default";
 const BUILTIN_DEFAULT_PROFILE: &str = include_str!("../../../resources/profiles/default.lua");
 const BUILTIN_MODEL_CATALOG: &str = include_str!("../../../resources/models/builtin.toml");
-const DEFAULT_POD_NAME: &str = "insomnia";
+const DEFAULT_POD_NAME: &str = "yoi";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -694,7 +694,7 @@ fn find_project_profiles_from(start: &Path) -> Option<PathBuf> {
         .unwrap_or_else(|| start.to_path_buf());
     let mut cur: Option<&Path> = Some(start.as_path());
     while let Some(dir) = cur {
-        let candidate = dir.join(".insomnia").join("profiles.toml");
+        let candidate = dir.join(".yoi").join("profiles.toml");
         if candidate.is_file() {
             return Some(candidate);
         }
@@ -709,7 +709,7 @@ fn add_builtin_profiles(registry: &mut ProfileRegistry) {
         BUILTIN_DEFAULT_PROFILE_NAME,
         "builtin:default",
         BUILTIN_DEFAULT_PROFILE,
-        Some("Bundled default Insomnia coding profile".into()),
+        Some("Bundled default Yoi coding profile".into()),
     ));
 }
 
@@ -827,7 +827,7 @@ fn require_module(
     if let Some(value) = host_module(lua, name)? {
         return Ok(value);
     }
-    if name.starts_with("insomnia.") || name == "insomnia" {
+    if name.starts_with("yoi.") || name == "yoi" {
         return Err(mlua::Error::RuntimeError(format!(
             "unknown host module `{name}`"
         )));
@@ -876,7 +876,7 @@ fn require_module(
 
 fn host_module(lua: &Lua, name: &str) -> mlua::Result<Option<LuaValue>> {
     match name {
-        "insomnia" => {
+        "yoi" => {
             let t = lua.create_table()?;
             t.set("profile", profile_function(lua)?)?;
             t.set("models", models_module(lua)?)?;
@@ -884,10 +884,10 @@ fn host_module(lua: &Lua, name: &str) -> mlua::Result<Option<LuaValue>> {
             t.set("scope", scope_module(lua)?)?;
             Ok(Some(LuaValue::Table(t)))
         }
-        "insomnia.profile" => Ok(Some(LuaValue::Function(profile_function(lua)?))),
-        "insomnia.models" => Ok(Some(LuaValue::Table(models_module(lua)?))),
-        "insomnia.compact" => Ok(Some(LuaValue::Table(compact_module(lua)?))),
-        "insomnia.scope" => Ok(Some(LuaValue::Table(scope_module(lua)?))),
+        "yoi.profile" => Ok(Some(LuaValue::Function(profile_function(lua)?))),
+        "yoi.models" => Ok(Some(LuaValue::Table(models_module(lua)?))),
+        "yoi.compact" => Ok(Some(LuaValue::Table(compact_module(lua)?))),
+        "yoi.scope" => Ok(Some(LuaValue::Table(scope_module(lua)?))),
         _ => Ok(None),
     }
 }
@@ -997,7 +997,7 @@ fn reject_manifest_shaped_profile(value: &serde_json::Value) -> Result<(), Profi
         for key in ["allow", "deny"] {
             if scope.contains_key(key) {
                 return Err(ProfileError::InvalidProfile(format!(
-                    "field `scope.{key}` grants concrete authority and is not allowed in reusable Profiles; use require(\"insomnia.scope\") intent helpers"
+                    "field `scope.{key}` grants concrete authority and is not allowed in reusable Profiles; use require(\"yoi.scope\") intent helpers"
                 )));
             }
         }
@@ -1312,8 +1312,8 @@ mod tests {
             tmp.path(),
             "coder.lua",
             r#"
-local profile = require("insomnia.profile")
-local scope = require("insomnia.scope")
+local profile = require("yoi.profile")
+local scope = require("yoi.scope")
 return profile {
   slug = "coder",
   model = { scheme = "anthropic", model_id = "claude-sonnet-4-20250514" },
@@ -1352,19 +1352,19 @@ return profile {
         let tmp = TempDir::new().unwrap();
         std::fs::write(
             tmp.path().join("shared.lua"),
-            r#"return { model = require("insomnia.models").catalog("codex-oauth/gpt-5.5") }"#,
+            r#"return { model = require("yoi.models").catalog("codex-oauth/gpt-5.5") }"#,
         )
         .unwrap();
         let profile = write_profile(
             tmp.path(),
             "main.lua",
             r#"
-local insomnia = require("insomnia")
+local yoi = require("yoi")
 local shared = require("shared")
-return insomnia.profile {
+return yoi.profile {
   slug = "main",
   model = shared.model,
-  scope = insomnia.scope.workspace_write(),
+  scope = yoi.scope.workspace_write(),
 }
 "#,
         );
@@ -1445,9 +1445,9 @@ return insomnia.profile {
             tmp.path(),
             "ratio.lua",
             r#"
-local profile = require("insomnia.profile")
-local models = require("insomnia.models")
-local compact = require("insomnia.compact")
+local profile = require("yoi.profile")
+local models = require("yoi.models")
+local compact = require("yoi.compact")
 return profile {
   model = models.catalog("codex-oauth/gpt-5.5"),
   compaction = compact.ratio { threshold = 0.5, request = 0.75, worker = 0.25 },
@@ -1473,7 +1473,7 @@ return profile {
             .with_workspace_base(tmp.path())
             .resolve(&ProfileSelector::Default, ProfileResolveOptions::default())
             .unwrap();
-        assert_eq!(resolved.manifest.pod.name, "insomnia");
+        assert_eq!(resolved.manifest.pod.name, "yoi");
         assert_eq!(
             resolved.manifest.model.ref_.as_deref(),
             Some("codex-oauth/gpt-5.5")
@@ -1516,7 +1516,7 @@ return profile {
     fn discovery_reads_user_and_project_registry_and_project_default_wins() {
         let tmp = TempDir::new().unwrap();
         let user_config = tmp.path().join("profiles.toml");
-        let project_dir = tmp.path().join("project/.insomnia");
+        let project_dir = tmp.path().join("project/.yoi");
         std::fs::create_dir_all(&project_dir).unwrap();
         let project_config = project_dir.join("profiles.toml");
         std::fs::write(
@@ -1542,7 +1542,7 @@ return profile {
     #[test]
     fn default_marks_direct_profile_entry() {
         let tmp = TempDir::new().unwrap();
-        let project_dir = tmp.path().join("project/.insomnia");
+        let project_dir = tmp.path().join("project/.yoi");
         std::fs::create_dir_all(&project_dir).unwrap();
         let project_config = project_dir.join("profiles.toml");
         std::fs::write(

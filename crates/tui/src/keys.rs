@@ -221,14 +221,14 @@ pub async fn launch() -> ExitCode {
     let data_dir = match manifest::paths::data_dir() {
         Some(path) => path,
         None => {
-            eprintln!("insomnia keys: could not determine insomnia data directory");
+            eprintln!("yoi keys: could not determine yoi data directory");
             return ExitCode::FAILURE;
         }
     };
     match run(SecretStore::new(data_dir)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("insomnia keys: {err}");
+            eprintln!("yoi keys: {err}");
             ExitCode::FAILURE
         }
     }
@@ -391,7 +391,7 @@ fn draw(frame: &mut Frame<'_>, app: &KeysApp) {
 fn title_line(app: &KeysApp) -> Line<'_> {
     Line::from(vec![
         Span::styled(
-            "insomnia keys   local secrets",
+            "yoi keys   local secrets",
             Style::default().add_modifier(Modifier::BOLD),
         ),
         Span::raw("   "),

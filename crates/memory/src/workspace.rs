@@ -1,25 +1,25 @@
 //! Workspace-level path layout for the memory subsystem.
 //!
 //! `WorkspaceLayout` carries the workspace root (typically the Pod's
-//! pwd). All insomnia-managed content lives under the conventional
-//! `<root>/.insomnia/` subdirectory — the same place that holds
+//! pwd). All yoi-managed content lives under the conventional
+//! `<root>/.yoi/` subdirectory — the same place that holds
 //! `profiles.toml`, `prompts/`, workflow, knowledge, and generated
 //! memory. The trees inside it:
 //!
-//! - `<root>/.insomnia/workflow/<slug>.md`
-//! - `<root>/.insomnia/knowledge/<slug>.md`
-//! - `<root>/.insomnia/memory/summary.md`
-//! - `<root>/.insomnia/memory/decisions/<slug>.md`
-//! - `<root>/.insomnia/memory/requests/<slug>.md`
-//! - `<root>/.insomnia/memory/_staging/<id>.json`
-//! - `<root>/.insomnia/memory/_logs/current.log` (append-only audit log)
+//! - `<root>/.yoi/workflow/<slug>.md`
+//! - `<root>/.yoi/knowledge/<slug>.md`
+//! - `<root>/.yoi/memory/summary.md`
+//! - `<root>/.yoi/memory/decisions/<slug>.md`
+//! - `<root>/.yoi/memory/requests/<slug>.md`
+//! - `<root>/.yoi/memory/_staging/<id>.json`
+//! - `<root>/.yoi/memory/_logs/current.log` (append-only audit log)
 //!
 //! `memory/` is reserved for session-derived / generated state;
 //! Workflows are human-managed and live one level up under
-//! `.insomnia/workflow/`.
+//! `.yoi/workflow/`.
 //!
 //! Configuring `[memory]` with an empty body is therefore sufficient
-//! for any workspace that already uses the `.insomnia/` convention; no
+//! for any workspace that already uses the `.yoi/` convention; no
 //! `workspace_root` override is needed.
 
 use std::path::{Path, PathBuf};
@@ -29,7 +29,7 @@ use crate::error::LintError;
 #[cfg(test)]
 use lint_common::RecordLintError;
 
-const INSOMNIA_DIR: &str = ".insomnia";
+const YOI_DIR: &str = ".yoi";
 const MEMORY_DIR: &str = "memory";
 const KNOWLEDGE_DIR: &str = "knowledge";
 const WORKFLOW_DIR: &str = "workflow";
@@ -100,17 +100,17 @@ impl WorkspaceLayout {
         &self.root
     }
 
-    /// `<root>/.insomnia/`. The base of every other memory path.
-    pub fn insomnia_dir(&self) -> PathBuf {
-        self.root.join(INSOMNIA_DIR)
+    /// `<root>/.yoi/`. The base of every other memory path.
+    pub fn yoi_dir(&self) -> PathBuf {
+        self.root.join(YOI_DIR)
     }
 
     pub fn memory_dir(&self) -> PathBuf {
-        self.insomnia_dir().join(MEMORY_DIR)
+        self.yoi_dir().join(MEMORY_DIR)
     }
 
     pub fn knowledge_dir(&self) -> PathBuf {
-        self.insomnia_dir().join(KNOWLEDGE_DIR)
+        self.yoi_dir().join(KNOWLEDGE_DIR)
     }
 
     pub fn summary_path(&self) -> PathBuf {
@@ -125,9 +125,9 @@ impl WorkspaceLayout {
         self.memory_dir().join(REQUESTS_DIR)
     }
 
-    /// Workflow directory: `<root>/.insomnia/workflow/`.
+    /// Workflow directory: `<root>/.yoi/workflow/`.
     pub fn workflow_dir(&self) -> PathBuf {
-        self.insomnia_dir().join(WORKFLOW_DIR)
+        self.yoi_dir().join(WORKFLOW_DIR)
     }
 
     pub fn staging_dir(&self) -> PathBuf {
@@ -149,7 +149,7 @@ impl WorkspaceLayout {
     /// Tail-friendly latest memory audit log path.
     ///
     /// Operators can inspect live memory worker and tool events with:
-    /// `tail -f .insomnia/memory/_logs/current.log`.
+    /// `tail -f .yoi/memory/_logs/current.log`.
     pub fn audit_current_log_path(&self) -> PathBuf {
         self.audit_logs_dir().join(AUDIT_CURRENT_LOG_FILE)
     }
@@ -171,12 +171,12 @@ impl WorkspaceLayout {
     }
 
     /// Classify a path under the memory tree. Returns `None` if the
-    /// path is not under `.insomnia/memory/` or `.insomnia/knowledge/`
+    /// path is not under `.yoi/memory/` or `.yoi/knowledge/`
     /// of this workspace, or if it lives in
     /// `_staging/` / `_usage/` / `_logs/` (opaque subsystem-owned trees).
     ///
     /// On a conventional path that's *almost* a record but malformed
-    /// (e.g. `.insomnia/memory/decisions/Foo.md` with an invalid slug),
+    /// (e.g. `.yoi/memory/decisions/Foo.md` with an invalid slug),
     /// returns `Err(LintError::Record(InvalidSlug) | InvalidPath)` so the caller
     /// can surface it as a write violation.
     pub fn classify(&self, path: &Path) -> Result<Option<ClassifiedPath>, LintError> {
@@ -265,7 +265,7 @@ mod tests {
     #[test]
     fn classifies_summary() {
         let cp = layout()
-            .classify(&PathBuf::from("/ws/.insomnia/memory/summary.md"))
+            .classify(&PathBuf::from("/ws/.yoi/memory/summary.md"))
             .unwrap()
             .unwrap();
         assert_eq!(cp.kind, RecordKind::Summary);
@@ -275,7 +275,7 @@ mod tests {
     #[test]
     fn classifies_decision_with_slug() {
         let cp = layout()
-            .classify(&PathBuf::from("/ws/.insomnia/memory/decisions/foo-bar.md"))
+            .classify(&PathBuf::from("/ws/.yoi/memory/decisions/foo-bar.md"))
             .unwrap()
             .unwrap();
         assert_eq!(cp.kind, RecordKind::Decision);
@@ -285,7 +285,7 @@ mod tests {
     #[test]
     fn classifies_knowledge() {
         let cp = layout()
-            .classify(&PathBuf::from("/ws/.insomnia/knowledge/x.md"))
+            .classify(&PathBuf::from("/ws/.yoi/knowledge/x.md"))
             .unwrap()
             .unwrap();
         assert_eq!(cp.kind, RecordKind::Knowledge);
@@ -294,7 +294,7 @@ mod tests {
     #[test]
     fn workflow_under_memory_is_invalid_path() {
         let err = layout()
-            .classify(&PathBuf::from("/ws/.insomnia/memory/workflow/wf.md"))
+            .classify(&PathBuf::from("/ws/.yoi/memory/workflow/wf.md"))
             .unwrap_err();
         assert!(matches!(err, LintError::InvalidPath(_)));
     }
@@ -303,7 +303,7 @@ mod tests {
     fn staging_returns_none() {
         assert!(
             layout()
-                .classify(&PathBuf::from("/ws/.insomnia/memory/_staging/abc.json"))
+                .classify(&PathBuf::from("/ws/.yoi/memory/_staging/abc.json"))
                 .unwrap()
                 .is_none()
         );
@@ -312,7 +312,7 @@ mod tests {
     #[test]
     fn usage_tree_is_opaque_to_classifier() {
         let cp = layout()
-            .classify(&PathBuf::from("/ws/.insomnia/memory/_usage/events.jsonl"))
+            .classify(&PathBuf::from("/ws/.yoi/memory/_usage/events.jsonl"))
             .unwrap();
         assert!(cp.is_none());
     }
@@ -320,7 +320,7 @@ mod tests {
     #[test]
     fn logs_tree_is_opaque_to_classifier() {
         let cp = layout()
-            .classify(&PathBuf::from("/ws/.insomnia/memory/_logs/current.log"))
+            .classify(&PathBuf::from("/ws/.yoi/memory/_logs/current.log"))
             .unwrap();
         assert!(cp.is_none());
     }
@@ -344,7 +344,7 @@ mod tests {
     #[test]
     fn invalid_slug_rejected() {
         let err = layout()
-            .classify(&PathBuf::from("/ws/.insomnia/memory/decisions/Foo.md"))
+            .classify(&PathBuf::from("/ws/.yoi/memory/decisions/Foo.md"))
             .unwrap_err();
         assert!(matches!(
             err,
@@ -355,7 +355,7 @@ mod tests {
     #[test]
     fn nested_under_record_dir_rejected() {
         let err = layout()
-            .classify(&PathBuf::from("/ws/.insomnia/memory/decisions/sub/foo.md"))
+            .classify(&PathBuf::from("/ws/.yoi/memory/decisions/sub/foo.md"))
             .unwrap_err();
         assert!(matches!(err, LintError::InvalidPath(_)));
     }
@@ -363,7 +363,7 @@ mod tests {
     #[test]
     fn unknown_top_level_dir_rejected() {
         let err = layout()
-            .classify(&PathBuf::from("/ws/.insomnia/memory/something/foo.md"))
+            .classify(&PathBuf::from("/ws/.yoi/memory/something/foo.md"))
             .unwrap_err();
         assert!(matches!(err, LintError::InvalidPath(_)));
     }

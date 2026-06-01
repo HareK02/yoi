@@ -416,19 +416,16 @@ mod tests {
     fn lints_only_workspace_memory_and_knowledge_records() {
         let dir = TempDir::new().unwrap();
         let root = dir.path();
-        write(&root.join(".insomnia/memory/summary.md"), valid_summary());
+        write(&root.join(".yoi/memory/summary.md"), valid_summary());
         write(
-            &root.join(".insomnia/memory/requests/request-one.md"),
+            &root.join(".yoi/memory/requests/request-one.md"),
             valid_request(),
         );
         write(
-            &root.join(".insomnia/memory/_logs/ignored.md"),
+            &root.join(".yoi/memory/_logs/ignored.md"),
             "not frontmatter",
         );
-        write(
-            &root.join(".insomnia/workflow/ignored.md"),
-            "not frontmatter",
-        );
+        write(&root.join(".yoi/workflow/ignored.md"), "not frontmatter");
 
         let report = lint_workspace(root).unwrap();
         assert_eq!(
@@ -438,8 +435,8 @@ mod tests {
                 .map(|file| file.path.as_str())
                 .collect::<Vec<_>>(),
             vec![
-                ".insomnia/memory/requests/request-one.md",
-                ".insomnia/memory/summary.md",
+                ".yoi/memory/requests/request-one.md",
+                ".yoi/memory/summary.md",
             ]
         );
         assert_eq!(report.counts.files, 2);
@@ -450,10 +447,7 @@ mod tests {
     fn invalid_records_count_as_lint_failures() {
         let dir = TempDir::new().unwrap();
         let root = dir.path();
-        write(
-            &root.join(".insomnia/memory/summary.md"),
-            "missing frontmatter",
-        );
+        write(&root.join(".yoi/memory/summary.md"), "missing frontmatter");
 
         let report = lint_workspace(root).unwrap();
         assert_eq!(report.counts.files, 1);
@@ -467,7 +461,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let root = dir.path();
         write(
-            &root.join(".insomnia/memory/requests/large-record.md"),
+            &root.join(".yoi/memory/requests/large-record.md"),
             &warning_request(),
         );
 
@@ -492,7 +486,7 @@ mod tests {
     fn json_output_is_machine_readable() {
         let dir = TempDir::new().unwrap();
         let root = dir.path();
-        write(&root.join(".insomnia/memory/summary.md"), valid_summary());
+        write(&root.join(".yoi/memory/summary.md"), valid_summary());
 
         let mut output = Vec::new();
         let status = run_with_writer(
@@ -509,7 +503,7 @@ mod tests {
         let parsed: Value = serde_json::from_slice(&output).unwrap();
         assert_eq!(parsed["workspace"], root.display().to_string());
         assert_eq!(parsed["counts"]["files"], 1);
-        assert_eq!(parsed["files"][0]["path"], ".insomnia/memory/summary.md");
+        assert_eq!(parsed["files"][0]["path"], ".yoi/memory/summary.md");
         assert!(parsed["files"][0]["errors"].as_array().unwrap().is_empty());
     }
 }

@@ -305,7 +305,7 @@ pub fn validate_id(id: &str) -> Result<()> {
 
 fn derive_key(data_dir: &Path) -> [u8; KEY_LEN] {
     let mut hasher = Sha256::new();
-    hasher.update(b"insomnia local secret store obfuscation key v1");
+    hasher.update(b"yoi local secret store obfuscation key v1");
     hasher.update(data_dir.as_os_str().as_encoded_bytes());
     hasher.finalize().into()
 }
@@ -339,7 +339,7 @@ fn make_nonce(id: &str, plaintext: &[u8]) -> Vec<u8> {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    hasher.update(b"insomnia nonce v1");
+    hasher.update(b"yoi nonce v1");
     hasher.update(now.to_le_bytes());
     hasher.update(std::process::id().to_le_bytes());
     hasher.update(NONCE_COUNTER.fetch_add(1, Ordering::Relaxed).to_le_bytes());
@@ -353,7 +353,7 @@ fn xor_stream(key: &[u8; KEY_LEN], nonce: &[u8], input: &[u8]) -> Vec<u8> {
     let mut counter = 0u64;
     for chunk in input.chunks(KEY_LEN) {
         let mut hasher = Sha256::new();
-        hasher.update(b"insomnia secret keystream v1");
+        hasher.update(b"yoi secret keystream v1");
         hasher.update(key);
         hasher.update(nonce);
         hasher.update(counter.to_le_bytes());
@@ -368,7 +368,7 @@ fn xor_stream(key: &[u8; KEY_LEN], nonce: &[u8], input: &[u8]) -> Vec<u8> {
 
 fn tag(key: &[u8; KEY_LEN], id: &str, nonce: &[u8], ciphertext: &[u8]) -> [u8; TAG_LEN] {
     let mut hasher = Sha256::new();
-    hasher.update(b"insomnia secret tag v1");
+    hasher.update(b"yoi secret tag v1");
     hasher.update(key);
     hasher.update(id.as_bytes());
     hasher.update(nonce);

@@ -33,7 +33,7 @@
 //! let scope = Scope::writable("/workspace").unwrap();
 //! let fs = ScopedFs::new(scope, PathBuf::from("/workspace")); // pod lifetime
 //! let tracker = Tracker::new();    // session lifetime
-//! let bash_outputs = PathBuf::from("/run/insomnia/bash-output");
+//! let bash_outputs = PathBuf::from("/run/yoi/bash-output");
 //! let task_store = tools::TaskStore::new();
 //! let defs = builtin_tools(fs, tracker, task_store, bash_outputs, None);
 //! ```

@@ -116,8 +116,8 @@ pub fn default_base() -> Result<PathBuf, io::Error> {
     paths::runtime_dir().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
-            "could not resolve runtime directory (no INSOMNIA_HOME / \
-             INSOMNIA_RUNTIME_DIR / XDG_RUNTIME_DIR / HOME)",
+            "could not resolve runtime directory (no YOI_HOME / \
+             YOI_RUNTIME_DIR / XDG_RUNTIME_DIR / HOME)",
         )
     })
 }
@@ -203,13 +203,13 @@ mod tests {
 
         let records = vec![SpawnedPodRecord {
             pod_name: "child".into(),
-            socket_path: "/run/insomnia/child/sock".into(),
+            socket_path: "/run/yoi/child/sock".into(),
             scope_delegated: vec![ScopeRule {
                 target: "/tmp/work".into(),
                 permission: Permission::Write,
                 recursive: true,
             }],
-            callback_address: "/run/insomnia/my-pod/sock".into(),
+            callback_address: "/run/yoi/my-pod/sock".into(),
         }];
         rt.write_spawned_pods(&records).await.unwrap();
 

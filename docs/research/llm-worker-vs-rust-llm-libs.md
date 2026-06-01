@@ -211,7 +211,7 @@ Worker<C, Mutable>           Worker<C, Locked>
 - **需要がある層か**: yes。rig / swiftide / genai は揃って "もう一段下のキャッシュ整合性プリミティブ" を持っていない
 - **既存と被るか**: 上記 3 案でかわせる
 - **維持コスト**: API 安定化 + provider 追従が恒常的に乗る。`llm_client/` を外すか genai に寄せるかでだいぶ軽くなる
-- **タイミング**: insomnia 本体がリリースされ、`Worker` の API が stress test を受ける前に公開すると、後から破壊的変更を強いられる。**先に insomnia をリリースして、production 使用例として参照させてからライブラリ化する**方が安全
+- **タイミング**: yoi 本体がリリースされ、`Worker` の API が stress test を受ける前に公開すると、後から破壊的変更を強いられる。**先に yoi をリリースして、production 使用例として参照させてからライブラリ化する**方が安全
 
 ---
 

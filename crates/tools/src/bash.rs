@@ -141,7 +141,7 @@ impl Tool for BashTool {
         //                       close before bash itself exits.
         //   exit $__exit        propagate the user's exit
         let wrapped = format!(
-            "exec >{out} 2>&1\n{{ {user_cmd}\n}}\n__insomnia_exit=$?\nwait 2>/dev/null\nexit $__insomnia_exit\n",
+            "exec >{out} 2>&1\n{{ {user_cmd}\n}}\n__yoi_exit=$?\nwait 2>/dev/null\nexit $__yoi_exit\n",
             out = shell_single_quote(output_path_str),
             user_cmd = params.command,
         );

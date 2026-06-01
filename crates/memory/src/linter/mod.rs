@@ -291,7 +291,7 @@ mod tests {
     #[test]
     fn decision_with_unknown_replaced_by_errors() {
         let (dir, linter) = workspace();
-        let path = dir.path().join(".insomnia/memory/decisions/foo.md");
+        let path = dir.path().join(".yoi/memory/decisions/foo.md");
         let content = format!(
             "---\ncreated_at: {now}\nupdated_at: {now}\nsources: []\nstatus: replaced\nreplaced_by: ghost\n---\nbody\n",
             now = iso_now()
@@ -308,7 +308,7 @@ mod tests {
     #[test]
     fn decision_replaced_by_self_errors() {
         let (dir, linter) = workspace();
-        let path = dir.path().join(".insomnia/memory/decisions/foo.md");
+        let path = dir.path().join(".yoi/memory/decisions/foo.md");
         let content = format!(
             "---\ncreated_at: {now}\nupdated_at: {now}\nsources: []\nstatus: replaced\nreplaced_by: foo\n---\nbody\n",
             now = iso_now()
@@ -326,7 +326,7 @@ mod tests {
     fn decision_replaced_by_existing_ok() {
         let (dir, linter) = workspace();
         // Pre-create the target.
-        let target = dir.path().join(".insomnia/memory/decisions/bar.md");
+        let target = dir.path().join(".yoi/memory/decisions/bar.md");
         write(
             &target,
             &format!(
@@ -334,7 +334,7 @@ mod tests {
                 now = iso_now()
             ),
         );
-        let path = dir.path().join(".insomnia/memory/decisions/foo.md");
+        let path = dir.path().join(".yoi/memory/decisions/foo.md");
         let content = format!(
             "---\ncreated_at: {now}\nupdated_at: {now}\nsources: []\nstatus: replaced\nreplaced_by: bar\n---\nbody\n",
             now = iso_now()
@@ -346,7 +346,7 @@ mod tests {
     #[test]
     fn missing_required_field_errors() {
         let (dir, linter) = workspace();
-        let path = dir.path().join(".insomnia/memory/decisions/foo.md");
+        let path = dir.path().join(".yoi/memory/decisions/foo.md");
         // Missing `status`.
         let content = format!(
             "---\ncreated_at: {now}\nupdated_at: {now}\nsources: []\n---\nbody\n",
@@ -363,7 +363,7 @@ mod tests {
     #[test]
     fn knowledge_long_description_with_model_invokation_errors() {
         let (dir, linter) = workspace();
-        let path = dir.path().join(".insomnia/knowledge/foo.md");
+        let path = dir.path().join(".yoi/knowledge/foo.md");
         let big_desc = "x".repeat(2000);
         let content = format!(
             "---\ncreated_at: {now}\nupdated_at: {now}\nkind: rule\ndescription: {big_desc}\nmodel_invokation: true\nuser_invocable: true\nlast_sources: []\n---\nbody\n",
@@ -381,7 +381,7 @@ mod tests {
     #[test]
     fn knowledge_long_description_without_model_invokation_ok() {
         let (dir, linter) = workspace();
-        let path = dir.path().join(".insomnia/knowledge/foo.md");
+        let path = dir.path().join(".yoi/knowledge/foo.md");
         let big_desc = "x".repeat(2000);
         let content = format!(
             "---\ncreated_at: {now}\nupdated_at: {now}\nkind: rule\ndescription: {big_desc}\nmodel_invokation: false\nuser_invocable: true\nlast_sources: []\n---\nbody\n",
@@ -394,7 +394,7 @@ mod tests {
     #[test]
     fn summary_path_accepted() {
         let (dir, linter) = workspace();
-        let path = dir.path().join(".insomnia/memory/summary.md");
+        let path = dir.path().join(".yoi/memory/summary.md");
         let content = format!(
             "---\nupdated_at: {now}\n---\nsummary body\n",
             now = iso_now()
@@ -406,7 +406,7 @@ mod tests {
     #[test]
     fn create_when_existing_errors() {
         let (dir, linter) = workspace();
-        let path = dir.path().join(".insomnia/memory/decisions/foo.md");
+        let path = dir.path().join(".yoi/memory/decisions/foo.md");
         write(
             &path,
             &format!(
@@ -434,15 +434,14 @@ mod tests {
         //   `db-pol` (1 deletion), `db-pools` (1 insertion).
         for slug in ["db-pol", "db-pools"] {
             write(
-                &dir.path()
-                    .join(format!(".insomnia/memory/decisions/{slug}.md")),
+                &dir.path().join(format!(".yoi/memory/decisions/{slug}.md")),
                 &format!(
                     "---\ncreated_at: {n}\nupdated_at: {n}\nsources: []\nstatus: open\n---\n",
                     n = iso_now()
                 ),
             );
         }
-        let path = dir.path().join(".insomnia/memory/decisions/db-pool.md");
+        let path = dir.path().join(".yoi/memory/decisions/db-pool.md");
         let content = format!(
             "---\ncreated_at: {n}\nupdated_at: {n}\nsources: []\nstatus: open\n---\nbody\n",
             n = iso_now()
@@ -464,15 +463,14 @@ mod tests {
         let (dir, linter) = workspace();
         for slug in ["alpha", "bravo"] {
             write(
-                &dir.path()
-                    .join(format!(".insomnia/memory/decisions/{slug}.md")),
+                &dir.path().join(format!(".yoi/memory/decisions/{slug}.md")),
                 &format!(
                     "---\ncreated_at: {n}\nupdated_at: {n}\nsources: []\nstatus: open\n---\n",
                     n = iso_now()
                 ),
             );
         }
-        let path = dir.path().join(".insomnia/memory/decisions/charlie.md");
+        let path = dir.path().join(".yoi/memory/decisions/charlie.md");
         let content = format!(
             "---\ncreated_at: {n}\nupdated_at: {n}\nsources: []\nstatus: open\n---\n",
             n = iso_now()
@@ -491,7 +489,7 @@ mod tests {
     #[test]
     fn body_size_limit_errors() {
         let (dir, linter) = workspace();
-        let path = dir.path().join(".insomnia/memory/decisions/foo.md");
+        let path = dir.path().join(".yoi/memory/decisions/foo.md");
         let big_body = "x".repeat(8001);
         let content = format!(
             "---\ncreated_at: {now}\nupdated_at: {now}\nsources: []\nstatus: open\n---\n{body}",

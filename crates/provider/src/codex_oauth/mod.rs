@@ -8,7 +8,7 @@
 //!   [`CodexAuthProvider`] はこのクレートに置く（feedback_llm_worker_scope）
 //! - access_token JWT の `exp` を読み、`now` 以下で proactive refresh
 //!   （Codex CLI と同じバッファなし）
-//! - 並行する Codex CLI / 別 insomnia の refresh と取り違えないよう、
+//! - 並行する Codex CLI / 別 yoi の refresh と取り違えないよう、
 //!   refresh 直前に再 load して account_id 一致を確認（guarded reload）
 //! - ファイルロックは取らず、書込前に再 load + diff merge で吸収
 //! - Codex の Keyring storage は対象外。auth.json 不在ならエラーで案内

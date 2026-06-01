@@ -2,7 +2,7 @@
 
 ## Context
 
-INSOMNIA がユーザーのプロジェクトに対して提供するメモリ機構。プロジェクトの暗黙知蓄積と同じ失敗を繰り返さないための記憶が目的。エージェントに連続するアイデンティティや自己意識を持たせる方向は対象外。
+Yoi がユーザーのプロジェクトに対して提供するメモリ機構。プロジェクトの暗黙知蓄積と同じ失敗を繰り返さないための記憶が目的。エージェントに連続するアイデンティティや自己意識を持たせる方向は対象外。
 
 リサーチは `docs/ref/memory-systems.md`。前提として、**レポジトリがファイルシステム上にある**ケースで設計する（越境・バックエンド抽象は Scope 外）。
 
@@ -14,7 +14,7 @@ Workflow（`/<slug>` で呼び出される制約付き作業フロー）は別 p
 
 ### 記録対象の 4 種
 
-本ドキュメント以下のパスはすべて **`<workspace_root>/.insomnia/`** からの相対表記。`.insomnia/` は manifest / prompts と同じく workspace に紐付く insomnia コンテンツのルートで、memory もこの規約に従う。`workspace_root` 既定は Pod の pwd。
+本ドキュメント以下のパスはすべて **`<workspace_root>/.yoi/`** からの相対表記。`.yoi/` は manifest / prompts と同じく workspace に紐付く yoi コンテンツのルートで、memory もこの規約に従う。`workspace_root` 既定は Pod の pwd。
 
 | 種別             | パス                         | 備考                                                                                        |
 | ---------------- | ---------------------------- | ------------------------------------------------------------------------------------------- |
@@ -98,7 +98,7 @@ Linter ルールは 2 系統:
   - Decisions / Requests: `created_at`, `updated_at`, `sources`
   - Knowledge: `kind`, `description`, `model_invokation`, `user_invocable`, `last_sources`, `created_at`, `updated_at`
   - Summary: `updated_at`（optional: `last_rewritten_from_range`）
-- Workflow パス（`.insomnia/workflow/`）への書き込み禁止（sub-Worker context のみ、人間編集は除外）
+- Workflow パス（`.yoi/workflow/`）への書き込み禁止（sub-Worker context のみ、人間編集は除外）
 - 同 slug での新規作成禁止（既存があれば update に切り替えるサイン）
 - `#<slug>` 参照が実在ファイルを指す
 - `replaced_by: <slug>` が実在 record を指す

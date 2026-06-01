@@ -176,7 +176,7 @@ mod tests {
     fn workflow_lint_accepts_valid_file() {
         let (dir, linter) = workspace();
         write(
-            &dir.path().join(".insomnia/knowledge/policy.md"),
+            &dir.path().join(".yoi/knowledge/policy.md"),
             "---\ndescription: p\n---\nbody",
         );
         let wf = "---\ndescription: run\nrequires: [policy]\n---\nbody";

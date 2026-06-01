@@ -18,5 +18,5 @@
 
 ### ランタイム
 
-- `RuntimeDir` — `$XDG_RUNTIME_DIR/insomnia/{pod_name}/` 配下のランタイムディレクトリ管理（ステータス・履歴のアトミック書き込み）
+- `RuntimeDir` — `$XDG_RUNTIME_DIR/yoi/{pod_name}/` 配下のランタイムディレクトリ管理（ステータス・履歴のアトミック書き込み）
 - `SocketServer` — Pod Protocol 用 Unix ソケットサーバー

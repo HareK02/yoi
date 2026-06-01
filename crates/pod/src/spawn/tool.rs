@@ -48,7 +48,7 @@ struct SpawnPodInput {
     /// unambiguous profile slug. Raw/path selectors are rejected.
     #[serde(default)]
     profile: Option<String>,
-    /// Instruction-file reference (e.g. `$insomnia/default`, `$user/my-agent`).
+    /// Instruction-file reference (e.g. `$yoi/default`, `$user/my-agent`).
     #[serde(default)]
     instruction: Option<String>,
     /// First message sent to the spawned Pod via `Method::Run`.
@@ -214,7 +214,7 @@ pub struct SpawnPodTool {
     /// Path to the spawner's Unix socket. Handed to the child via
     /// `--callback` so its `PodEvent` callbacks have somewhere to land.
     callback_socket: PathBuf,
-    /// Root of the `$XDG_RUNTIME_DIR/insomnia/` tree, used to predict
+    /// Root of the `$XDG_RUNTIME_DIR/yoi/` tree, used to predict
     /// the spawned Pod's socket path before the child has bound it.
     runtime_base: PathBuf,
     /// Directory the spawned Pod should run in when the LLM did not
@@ -890,7 +890,7 @@ mod tests {
                 ..Default::default()
             },
             worker: WorkerManifestConfig {
-                instruction: Some("$insomnia/parent".into()),
+                instruction: Some("$yoi/parent".into()),
                 language: Some("Parentish".into()),
                 max_tokens: Some(1234),
                 stop_sequences: Some(vec!["STOP".into()]),
@@ -916,8 +916,8 @@ mod tests {
         default: Option<&str>,
         profiles: &[(&str, &str, &str)],
     ) -> AvailableProfiles {
-        let insomnia = project.join(".insomnia");
-        let profile_dir = insomnia.join("profiles");
+        let yoi = project.join(".yoi");
+        let profile_dir = yoi.join("profiles");
         std::fs::create_dir_all(&profile_dir).unwrap();
         let mut registry_toml = String::new();
         if let Some(default) = default {
@@ -928,7 +928,7 @@ mod tests {
             std::fs::write(profile_dir.join(file), body).unwrap();
             registry_toml.push_str(&format!("{name} = \"profiles/{file}\"\n"));
         }
-        let registry_path = insomnia.join("profiles.toml");
+        let registry_path = yoi.join("profiles.toml");
         std::fs::write(&registry_path, registry_toml).unwrap();
         AvailableProfiles {
             registry: Some(
@@ -963,23 +963,23 @@ mod tests {
     }
 
     const CODER_PROFILE: &str = r#"
-local profile = require("insomnia.profile")
-local scope = require("insomnia.scope")
+local profile = require("yoi.profile")
+local scope = require("yoi.scope")
 return profile {
   slug = "coder",
   model = { scheme = "anthropic", model_id = "coder-model" },
-  worker = { instruction = "$insomnia/coder", language = "Coderish", max_tokens = 2222 },
+  worker = { instruction = "$yoi/coder", language = "Coderish", max_tokens = 2222 },
   scope = scope.workspace_write(),
 }
 "#;
 
     const REVIEWER_PROFILE: &str = r#"
-local profile = require("insomnia.profile")
-local scope = require("insomnia.scope")
+local profile = require("yoi.profile")
+local scope = require("yoi.scope")
 return profile {
   slug = "reviewer",
   model = { scheme = "anthropic", model_id = "reviewer-model" },
-  worker = { instruction = "$insomnia/reviewer", language = "Reviewerish", max_tokens = 3333 },
+  worker = { instruction = "$yoi/reviewer", language = "Reviewerish", max_tokens = 3333 },
   scope = scope.workspace_write(),
 }
 "#;
@@ -997,7 +997,7 @@ return profile {
         };
 
         let config_json =
-            build_spawn_config_json("child", "$insomnia/default", &[], &model, false).unwrap();
+            build_spawn_config_json("child", "$yoi/default", &[], &model, false).unwrap();
         let parsed: PodManifestConfig = serde_json::from_str(&config_json).unwrap();
 
         assert_eq!(parsed.model.scheme, Some(SchemeKind::Anthropic));
@@ -1020,7 +1020,7 @@ return profile {
             ..Default::default()
         };
         let config_json =
-            build_spawn_config_json("child", "$insomnia/default", &[], &model, false).unwrap();
+            build_spawn_config_json("child", "$yoi/default", &[], &model, false).unwrap();
         let parsed: PodManifestConfig = serde_json::from_str(&config_json).unwrap();
         assert_eq!(
             parsed.model.ref_.as_deref(),
@@ -1041,7 +1041,7 @@ return profile {
         }];
 
         let config_json =
-            build_spawn_config_json("child", "$insomnia/default", &scope, &model, true).unwrap();
+            build_spawn_config_json("child", "$yoi/default", &scope, &model, true).unwrap();
         let parsed: PodManifestConfig = serde_json::from_str(&config_json).unwrap();
         assert_eq!(
             parsed.session.as_ref().and_then(|s| s.record_event_trace),
@@ -1062,7 +1062,7 @@ return profile {
             ..Default::default()
         };
         let config_json =
-            build_spawn_config_json("child", "$insomnia/default", &[], &model, false).unwrap();
+            build_spawn_config_json("child", "$yoi/default", &[], &model, false).unwrap();
         let parsed: PodManifestConfig = serde_json::from_str(&config_json).unwrap();
 
         assert!(parsed.session.is_none());
@@ -1098,10 +1098,7 @@ return profile {
 
         assert_eq!(config.pod.name.as_deref(), Some("child-default"));
         assert_eq!(config.model.model_id.as_deref(), Some("reviewer-model"));
-        assert_eq!(
-            config.worker.instruction.as_deref(),
-            Some("$insomnia/reviewer")
-        );
+        assert_eq!(config.worker.instruction.as_deref(), Some("$yoi/reviewer"));
         assert_eq!(config.worker.language.as_deref(), Some("Reviewerish"));
         assert_eq!(config.scope.allow, scope);
         assert!(config.scope.deny.is_empty());
@@ -1140,10 +1137,7 @@ return profile {
 
         assert_eq!(config.pod.name.as_deref(), Some("review-child"));
         assert_eq!(config.model.model_id.as_deref(), Some("reviewer-model"));
-        assert_eq!(
-            config.worker.instruction.as_deref(),
-            Some("$insomnia/reviewer")
-        );
+        assert_eq!(config.worker.instruction.as_deref(), Some("$yoi/reviewer"));
         assert_eq!(config.worker.language.as_deref(), Some("Reviewerish"));
         assert_eq!(config.worker.max_tokens, Some(3333));
         assert_eq!(config.scope.allow, scope);
@@ -1177,10 +1171,7 @@ return profile {
 
         assert_eq!(config.pod.name.as_deref(), Some("inherited-child"));
         assert_eq!(config.model.model_id.as_deref(), Some("parent-model"));
-        assert_eq!(
-            config.worker.instruction.as_deref(),
-            Some("$insomnia/parent")
-        );
+        assert_eq!(config.worker.instruction.as_deref(), Some("$yoi/parent"));
         assert_eq!(config.worker.language.as_deref(), Some("Parentish"));
         assert_eq!(config.worker.max_tokens, Some(1234));
         assert_eq!(
@@ -1313,7 +1304,7 @@ return profile {
 
         let user_config = tmp.path().join("user-profiles.toml");
         std::fs::write(&user_config, "[profile]\ncoder = \"user-coder.lua\"\n").unwrap();
-        let project_config = project.join(".insomnia/profiles.toml");
+        let project_config = project.join(".yoi/profiles.toml");
         let ambiguous = AvailableProfiles {
             registry: Some(
                 ProfileDiscovery::with_sources(Some(user_config), Some(project_config))

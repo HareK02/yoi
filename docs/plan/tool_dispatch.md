@@ -2,7 +2,7 @@
 
 ## Context
 
-INSOMNIA はエージェントが扱うツール数の増加 (built-in tools + MCP サーバ + ユーザ定義) を想定する必要がある。すべてを upfront に context へ展開すると以下が問題になる:
+Yoi はエージェントが扱うツール数の増加 (built-in tools + MCP サーバ + ユーザ定義) を想定する必要がある。すべてを upfront に context へ展開すると以下が問題になる:
 
 - **入力トークン消費**: 30-50 ツールで 10-20K tokens を消費しうる (Anthropic 公式ガイド)
 - **ツール選択精度の低下**: 数十個を超えるとモデルの tool selection accuracy が落ちる

@@ -333,7 +333,7 @@ pub struct Pod<C: LlmClient, St: Store> {
     /// [`Self::from_manifest`], or defaults to the builtin pack when a
     /// Pod is constructed through lower-level paths that have no loader.
     prompts: Arc<PromptCatalog>,
-    /// Registry loaded from `<workspace>/.insomnia/workflow/*.md` when
+    /// Registry loaded from `<workspace>/.yoi/workflow/*.md` when
     /// memory is enabled. Missing memory config keeps this empty.
     workflow_registry: workflow_crate::WorkflowRegistry,
     /// Memory workspace layout used by the workflow resolver to load required
@@ -5337,21 +5337,21 @@ mod build_summary_prompt_tests {
         let pwd = dir.path().join("workspace");
         std::fs::create_dir_all(&pwd).unwrap();
         if let Some(doc) = summary_doc {
-            std::fs::create_dir_all(pwd.join(".insomnia/memory")).unwrap();
-            std::fs::write(pwd.join(".insomnia/memory/summary.md"), doc).unwrap();
+            std::fs::create_dir_all(pwd.join(".yoi/memory")).unwrap();
+            std::fs::write(pwd.join(".yoi/memory/summary.md"), doc).unwrap();
         }
         if include_knowledge {
-            std::fs::create_dir_all(pwd.join(".insomnia/knowledge")).unwrap();
+            std::fs::create_dir_all(pwd.join(".yoi/knowledge")).unwrap();
             std::fs::write(
-                pwd.join(".insomnia/knowledge/resident-policy.md"),
+                pwd.join(".yoi/knowledge/resident-policy.md"),
                 knowledge_doc("knowledge resident desc"),
             )
             .unwrap();
         }
         if include_workflow {
-            std::fs::create_dir_all(pwd.join(".insomnia/workflow")).unwrap();
+            std::fs::create_dir_all(pwd.join(".yoi/workflow")).unwrap();
             std::fs::write(
-                pwd.join(".insomnia/workflow/resident-flow.md"),
+                pwd.join(".yoi/workflow/resident-flow.md"),
                 workflow_doc("workflow resident desc"),
             )
             .unwrap();
@@ -5379,7 +5379,7 @@ mod build_summary_prompt_tests {
             pod.set_resident_workflow_injection(gates.workflows);
         }
         let template = SystemPromptTemplate::parse(
-            "$insomnia/default",
+            "$yoi/default",
             crate::prompt::loader::PromptLoader::builtins_only(),
         )
         .unwrap();

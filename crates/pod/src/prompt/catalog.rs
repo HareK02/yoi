@@ -18,7 +18,7 @@
 //!    binary. Must cover every [`PodPrompt`] variant (build-time check).
 //! 2. **user** — `<config_dir>/prompts.toml`, when a caller supplies it.
 //!    Optional.
-//! 3. **workspace** — `<project>/.insomnia/prompts.toml`, when a caller
+//! 3. **workspace** — `<project>/.yoi/prompts.toml`, when a caller
 //!    supplies it. Optional.
 //! 4. **manifest pack** — `manifest.pod.prompt_pack`, an explicit path
 //!    per-Pod. Optional.
@@ -258,7 +258,7 @@ struct PackFile {
 /// Owns a `minijinja::Environment` with one template registered per
 /// [`PodPrompt`] key (after the 4-layer merge). Includes inside templates
 /// are resolved via a provided [`PromptLoader`], so values can pull from
-/// `$insomnia` / `$user` / `$workspace`.
+/// `$yoi` / `$user` / `$workspace`.
 pub struct PromptCatalog {
     env: Environment<'static>,
 }
@@ -271,7 +271,7 @@ impl std::fmt::Debug for PromptCatalog {
 
 impl PromptCatalog {
     /// Builtin-only catalog. All `{% include %}` references must resolve
-    /// through `$insomnia` (user/workspace prefixes are unavailable).
+    /// through `$yoi` (user/workspace prefixes are unavailable).
     pub fn builtins_only() -> Result<Arc<Self>, CatalogError> {
         Self::load(&PromptLoader::builtins_only(), None)
     }
@@ -707,7 +707,7 @@ interrupt_system_note = "[FROM-MANIFEST-PACK]"
     #[test]
     fn value_can_pull_long_text_via_include() {
         // A runtime pack that overrides `compact_system` with an
-        // `{% include %}` into the same `$insomnia` namespace — exercises
+        // `{% include %}` into the same `$yoi` namespace — exercises
         // the template resolver path through all four layers.
         let tmp = TempDir::new().unwrap();
         let pack = tmp.path().join("p.toml");
@@ -715,7 +715,7 @@ interrupt_system_note = "[FROM-MANIFEST-PACK]"
             &pack,
             r#"
 [prompt]
-compact_system = "PREFIX\n{% include \"$insomnia/internal/compact_system\" %}"
+compact_system = "PREFIX\n{% include \"$yoi/internal/compact_system\" %}"
 "#,
         )
         .unwrap();

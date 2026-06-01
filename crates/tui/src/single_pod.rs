@@ -35,7 +35,7 @@ fn resolve_socket(pod_name: &str, override_path: Option<PathBuf>) -> PathBuf {
     }
     manifest::paths::pod_socket_path(pod_name).unwrap_or_else(|| {
         PathBuf::from("/tmp")
-            .join("insomnia")
+            .join("yoi")
             .join(pod_name)
             .join("sock")
     })
@@ -307,7 +307,7 @@ impl TerminalEventReader {
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
         let thread = thread::Builder::new()
-            .name("insomnia-tui-terminal-reader".to_string())
+            .name("yoi-tui-terminal-reader".to_string())
             .spawn(move || read_terminal_events(thread_stop, tx))?;
 
         Ok((

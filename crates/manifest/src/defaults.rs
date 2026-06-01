@@ -44,8 +44,8 @@ pub const COMPACT_OVERVIEW_DEADLINE_TOKENS: u64 = 40_000;
 
 /// Default instruction asset reference used when `worker.instruction`
 /// is omitted. See the `PromptLoader` prefix addressing scheme for the
-/// `$insomnia/` / `$user/` / `$workspace/` namespaces.
-pub const DEFAULT_INSTRUCTION: &str = "$insomnia/default";
+/// `$yoi/` / `$user/` / `$workspace/` namespaces.
+pub const DEFAULT_INSTRUCTION: &str = "$yoi/default";
 
 /// Default language policy used by the main worker for normal prose
 /// responses. See [`crate::WorkerManifest::language`].

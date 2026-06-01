@@ -35,8 +35,8 @@ async fn main() -> ExitCode {
     let mode = match parse_args() {
         Ok(mode) => mode,
         Err(e) => {
-            eprintln!("insomnia: {e}");
-            eprintln!("try `insomnia --help` for usage.");
+            eprintln!("yoi: {e}");
+            eprintln!("try `yoi --help` for usage.");
             return ExitCode::FAILURE;
         }
     };
@@ -54,17 +54,17 @@ async fn main() -> ExitCode {
             Ok(LintStatus::Clean) => ExitCode::SUCCESS,
             Ok(LintStatus::Failed) => ExitCode::FAILURE,
             Err(e) => {
-                eprintln!("insomnia memory lint: {e}");
+                eprintln!("yoi memory lint: {e}");
                 ExitCode::FAILURE
             }
         },
-        Mode::PodRuntime(args) => pod::entrypoint::run_cli_from("insomnia pod", args).await,
+        Mode::PodRuntime(args) => pod::entrypoint::run_cli_from("yoi pod", args).await,
         Mode::Keys => tui::keys::launch().await,
         Mode::Tui(mode) => {
             let runtime_command = match PodRuntimeCommand::resolve() {
                 Ok(command) => command,
                 Err(e) => {
-                    eprintln!("insomnia: failed to resolve Pod runtime command: {e}");
+                    eprintln!("yoi: failed to resolve Pod runtime command: {e}");
                     return ExitCode::FAILURE;
                 }
             };
@@ -100,7 +100,7 @@ fn parse_args_slice(args: &[String]) -> Result<Mode, ParseError> {
         "pod" => return Ok(Mode::PodRuntime(args[1..].to_vec())),
         "keys" => {
             if args.len() != 1 {
-                return Err(ParseError("insomnia keys does not accept arguments".into()));
+                return Err(ParseError("yoi keys does not accept arguments".into()));
             }
             return Ok(Mode::Keys);
         }
@@ -322,13 +322,13 @@ fn parse_session_id(value: &str) -> Result<SegmentId, ParseError> {
 
 fn print_help() {
     println!(
-        "insomnia\n\nUsage:\n  insomnia [OPTIONS] [POD_NAME]\n  insomnia keys\n  insomnia pod [POD_OPTIONS]\n  insomnia memory lint [OPTIONS]\n\nOptions:\n  -r, --resume           Open the Pod picker and resume/attach a Pod\n      --multi            Open the multi-Pod dashboard\n      --pod <NAME>       Attach/restore/create a Pod by name\n      --socket <PATH>    Attach to a specific Pod socket with --pod\n      --session <UUID>   Resume a specific session segment\n      --profile <REF>    Start a fresh Pod from a profile\n  -h, --help             Print help\n"
+        "yoi\n\nUsage:\n  yoi [OPTIONS] [POD_NAME]\n  yoi keys\n  yoi pod [POD_OPTIONS]\n  yoi memory lint [OPTIONS]\n\nOptions:\n  -r, --resume           Open the Pod picker and resume/attach a Pod\n      --multi            Open the multi-Pod dashboard\n      --pod <NAME>       Attach/restore/create a Pod by name\n      --socket <PATH>    Attach to a specific Pod socket with --pod\n      --session <UUID>   Resume a specific session segment\n      --profile <REF>    Start a fresh Pod from a profile\n  -h, --help             Print help\n"
     );
 }
 
 fn print_memory_lint_help() {
     println!(
-        "insomnia memory lint\n\nUsage:\n  insomnia memory lint [OPTIONS]\n\nOptions:\n      --workspace <PATH>       Workspace root to lint (defaults to cwd)\n      --json                   Emit a JSON report\n      --warnings-as-errors     Return failure when warnings are present\n  -h, --help                   Print help\n"
+        "yoi memory lint\n\nUsage:\n  yoi memory lint [OPTIONS]\n\nOptions:\n      --workspace <PATH>       Workspace root to lint (defaults to cwd)\n      --json                   Emit a JSON report\n      --warnings-as-errors     Return failure when warnings are present\n  -h, --help                   Print help\n"
     );
 }
 
@@ -524,7 +524,7 @@ mod tests {
                     "--profile".to_string(),
                     "p.lua".to_string(),
                     "--socket".to_string(),
-                    "/tmp/insomnia/sock".to_string(),
+                    "/tmp/yoi/sock".to_string(),
                 ],
                 "--profile can only be used for fresh spawn",
             ),

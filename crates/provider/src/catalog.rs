@@ -636,9 +636,9 @@ auth_hint = { kind = "none" }
         assert!(matches!(err, CatalogError::Parse { .. }));
     }
 
-    /// `INSOMNIA_CONFIG_DIR` を tempdir に向けるテストガード。
-    /// `paths::config_dir` は他の env (INSOMNIA_HOME / XDG_CONFIG_HOME)
-    /// より高優先で `INSOMNIA_CONFIG_DIR` を尊重するため、これだけで
+    /// `YOI_CONFIG_DIR` を tempdir に向けるテストガード。
+    /// `paths::config_dir` は他の env (YOI_HOME / XDG_CONFIG_HOME)
+    /// より高優先で `YOI_CONFIG_DIR` を尊重するため、これだけで
     /// 開発機の env 設定に左右されないテストになる。
     struct ConfigDirGuard {
         prev: Option<String>,
@@ -646,10 +646,10 @@ auth_hint = { kind = "none" }
 
     impl ConfigDirGuard {
         fn new(path: &Path) -> Self {
-            let prev = std::env::var("INSOMNIA_CONFIG_DIR").ok();
+            let prev = std::env::var("YOI_CONFIG_DIR").ok();
             // SAFETY: serial_test の `#[serial]` 属性で env を弄るテスト
             // 同士は直列化される。
-            unsafe { std::env::set_var("INSOMNIA_CONFIG_DIR", path) };
+            unsafe { std::env::set_var("YOI_CONFIG_DIR", path) };
             Self { prev }
         }
     }
@@ -658,8 +658,8 @@ auth_hint = { kind = "none" }
         fn drop(&mut self) {
             unsafe {
                 match &self.prev {
-                    Some(v) => std::env::set_var("INSOMNIA_CONFIG_DIR", v),
-                    None => std::env::remove_var("INSOMNIA_CONFIG_DIR"),
+                    Some(v) => std::env::set_var("YOI_CONFIG_DIR", v),
+                    None => std::env::remove_var("YOI_CONFIG_DIR"),
                 }
             }
         }

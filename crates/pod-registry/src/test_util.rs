@@ -20,8 +20,8 @@ pub(crate) fn sid() -> SegmentId {
 /// parallel test's `default_registry_path()` lookup.
 pub(crate) static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
-/// Sandbox `INSOMNIA_RUNTIME_DIR` to a tempdir for the duration of
-/// a test; restore the previous value (and any `INSOMNIA_HOME` /
+/// Sandbox `YOI_RUNTIME_DIR` to a tempdir for the duration of
+/// a test; restore the previous value (and any `YOI_HOME` /
 /// `XDG_RUNTIME_DIR` that would otherwise outrank it) on drop.
 pub(crate) struct RuntimeDirSandbox {
     prev_runtime: Option<String>,
@@ -33,16 +33,16 @@ pub(crate) struct RuntimeDirSandbox {
 impl RuntimeDirSandbox {
     pub(crate) fn new(dir: &Path) -> Self {
         let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev_runtime = std::env::var("INSOMNIA_RUNTIME_DIR").ok();
-        let prev_home = std::env::var("INSOMNIA_HOME").ok();
+        let prev_runtime = std::env::var("YOI_RUNTIME_DIR").ok();
+        let prev_home = std::env::var("YOI_HOME").ok();
         let prev_xdg = std::env::var("XDG_RUNTIME_DIR").ok();
         // SAFETY: ENV_LOCK serialises env writes across this test
         // module; other modules that touch env vars rely on their
         // own lock or `serial_test`.
         unsafe {
-            std::env::remove_var("INSOMNIA_HOME");
+            std::env::remove_var("YOI_HOME");
             std::env::remove_var("XDG_RUNTIME_DIR");
-            std::env::set_var("INSOMNIA_RUNTIME_DIR", dir);
+            std::env::set_var("YOI_RUNTIME_DIR", dir);
         }
         Self {
             prev_runtime,
@@ -57,12 +57,12 @@ impl Drop for RuntimeDirSandbox {
     fn drop(&mut self) {
         unsafe {
             match &self.prev_runtime {
-                Some(v) => std::env::set_var("INSOMNIA_RUNTIME_DIR", v),
-                None => std::env::remove_var("INSOMNIA_RUNTIME_DIR"),
+                Some(v) => std::env::set_var("YOI_RUNTIME_DIR", v),
+                None => std::env::remove_var("YOI_RUNTIME_DIR"),
             }
             match &self.prev_home {
-                Some(v) => std::env::set_var("INSOMNIA_HOME", v),
-                None => std::env::remove_var("INSOMNIA_HOME"),
+                Some(v) => std::env::set_var("YOI_HOME", v),
+                None => std::env::remove_var("YOI_HOME"),
             }
             match &self.prev_xdg {
                 Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),

@@ -6,11 +6,11 @@
 //! omitted, returns one entry per file (no excerpt) so the agent can
 //! enumerate what records exist without knowing what's inside them.
 //!
-//! - `MemoryQuery` walks `.insomnia/memory/{summary.md,decisions/,
-//!   requests/}`. `.insomnia/workflow/`, `.insomnia/memory/_staging/`,
-//!   `.insomnia/memory/_usage/`, and `.insomnia/memory/_logs/` are excluded
+//! - `MemoryQuery` walks `.yoi/memory/{summary.md,decisions/,
+//!   requests/}`. `.yoi/workflow/`, `.yoi/memory/_staging/`,
+//!   `.yoi/memory/_usage/`, and `.yoi/memory/_logs/` are excluded
 //!   by construction.
-//! - `KnowledgeQuery` walks `.insomnia/knowledge/*.md` and supports a
+//! - `KnowledgeQuery` walks `.yoi/knowledge/*.md` and supports a
 //!   `kind` filter against the Knowledge frontmatter's `kind` field.
 //!
 //! No derived index — the file tree is the source of truth and is
@@ -513,18 +513,16 @@ mod tests {
     fn setup() -> (TempDir, WorkspaceLayout) {
         let dir = TempDir::new().unwrap();
         let layout = WorkspaceLayout::new(dir.path().to_path_buf());
-        std::fs::create_dir_all(dir.path().join(".insomnia/memory/decisions")).unwrap();
-        std::fs::create_dir_all(dir.path().join(".insomnia/memory/requests")).unwrap();
-        std::fs::create_dir_all(dir.path().join(".insomnia/memory/_staging")).unwrap();
-        std::fs::create_dir_all(dir.path().join(".insomnia/workflow")).unwrap();
-        std::fs::create_dir_all(dir.path().join(".insomnia/knowledge")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".yoi/memory/decisions")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".yoi/memory/requests")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".yoi/memory/_staging")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".yoi/workflow")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".yoi/knowledge")).unwrap();
         (dir, layout)
     }
 
     fn write_decision(dir: &Path, slug: &str, body: &str) {
-        let path = dir
-            .join(".insomnia/memory/decisions")
-            .join(format!("{slug}.md"));
+        let path = dir.join(".yoi/memory/decisions").join(format!("{slug}.md"));
         let content = format!(
             "---\ncreated_at: {n}\nupdated_at: {n}\nsources: []\nstatus: open\n---\n{body}",
             n = now()
@@ -533,7 +531,7 @@ mod tests {
     }
 
     fn write_knowledge(dir: &Path, slug: &str, kind: &str, description: &str, body: &str) {
-        let path = dir.join(".insomnia/knowledge").join(format!("{slug}.md"));
+        let path = dir.join(".yoi/knowledge").join(format!("{slug}.md"));
         let content = format!(
             "---\ncreated_at: {n}\nupdated_at: {n}\nkind: {kind}\ndescription: \"{description}\"\nmodel_invokation: false\nuser_invocable: true\nlast_sources: []\n---\n{body}",
             n = now()
@@ -590,7 +588,7 @@ mod tests {
         let (dir, layout) = setup();
         write_decision(dir.path(), "alpha", "body\n");
         write_decision(dir.path(), "beta", "body\n");
-        let summary_path = dir.path().join(".insomnia/memory/summary.md");
+        let summary_path = dir.path().join(".yoi/memory/summary.md");
         std::fs::write(
             &summary_path,
             format!("---\nupdated_at: {n}\n---\nhello\n", n = now()),
@@ -610,7 +608,7 @@ mod tests {
     #[tokio::test]
     async fn memory_query_finds_summary() {
         let (dir, layout) = setup();
-        let summary_path = dir.path().join(".insomnia/memory/summary.md");
+        let summary_path = dir.path().join(".yoi/memory/summary.md");
         std::fs::write(
             &summary_path,
             format!("---\nupdated_at: {n}\n---\nthe needle is here\n", n = now()),
@@ -628,9 +626,9 @@ mod tests {
     #[tokio::test]
     async fn memory_query_excludes_workflow_and_staging() {
         let (dir, layout) = setup();
-        let wf = dir.path().join(".insomnia/workflow/wf.md");
+        let wf = dir.path().join(".yoi/workflow/wf.md");
         std::fs::write(&wf, "needle in workflow\n").unwrap();
-        let stg = dir.path().join(".insomnia/memory/_staging/abc.json");
+        let stg = dir.path().join(".yoi/memory/_staging/abc.json");
         std::fs::write(&stg, "needle in staging\n").unwrap();
 
         let (_, tool) = memory_query_tool(layout, QueryConfig::default())();

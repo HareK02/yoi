@@ -25,14 +25,14 @@ let
       baseName == ".git"
       || baseName == "target"
       || baseName == "result"
-      || isExcludedTree ".insomnia"
+      || isExcludedTree ".yoi"
       || isExcludedTree ".worktree"
       || isExcludedTree "work-items"
       || isExcludedTree "docs/report"
     );
 in
 rustPlatform.buildRustPackage rec {
-  pname = "insomnia";
+  pname = "yoi";
   version = "0.1.0";
 
   src = lib.cleanSourceWith {
@@ -40,7 +40,7 @@ rustPlatform.buildRustPackage rec {
     filter = sourceFilter;
   };
 
-  cargoHash = "sha256-0uyFmUH5w6RuG/JP1nXKWVqQERdOZWHHdnjGROkFuG0=";
+  cargoHash = "sha256-f4/oOuPv4dUiwznX+popMjjDCXZQPBvqWRYmlJDyKkE=";
 
   depsExtraArgs = {
     # nixpkgs 25.11's fetchCargoVendor still uses crates.io's API
@@ -83,7 +83,7 @@ rustPlatform.buildRustPackage rec {
 
   cargoBuildFlags = [
     "-p"
-    "insomnia"
+    "yoi"
   ];
 
   # The package check is a credential-free install smoke check below. Running the
@@ -92,24 +92,24 @@ rustPlatform.buildRustPackage rec {
   doCheck = false;
 
   postInstall = ''
-    install -Dm644 docs/environment.md "$out/share/doc/insomnia/environment.md"
+    install -Dm644 docs/environment.md "$out/share/doc/yoi/environment.md"
   '';
 
   doInstallCheck = true;
   installCheckPhase = ''
     runHook preInstallCheck
 
-    "$out/bin/insomnia" pod --help >/dev/null
-    test -x "$out/bin/insomnia"
-    test ! -e "$out/bin/insomnia-pod"
-    test ! -e "$out/share/insomnia/resources"
-    if "$out/bin/insomnia" --session not-a-uuid 2>insomnia.err; then
-      echo "insomnia unexpectedly accepted an invalid --session value" >&2
+    "$out/bin/yoi" pod --help >/dev/null
+    test -x "$out/bin/yoi"
+    test ! -e "$out/bin/yoi-pod"
+    test ! -e "$out/share/yoi/resources"
+    if "$out/bin/yoi" --session not-a-uuid 2>yoi.err; then
+      echo "yoi unexpectedly accepted an invalid --session value" >&2
       exit 1
     fi
-    grep -q "invalid --session UUID" insomnia.err
+    grep -q "invalid --session UUID" yoi.err
 
-    test -f "$out/share/doc/insomnia/environment.md"
+    test -f "$out/share/doc/yoi/environment.md"
 
     runHook postInstallCheck
   '';
@@ -117,7 +117,7 @@ rustPlatform.buildRustPackage rec {
   meta = {
     description = "Agentic coding Pod runtime and terminal UI";
     license = lib.licenses.mit;
-    mainProgram = "insomnia";
+    mainProgram = "yoi";
     platforms = lib.platforms.unix;
   };
 }

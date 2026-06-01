@@ -688,7 +688,7 @@ mod tests {
     use crate::{Permission, ReasoningEffort, ScopeRule};
 
     fn abs(path: &str) -> PathBuf {
-        PathBuf::from(format!("/tmp/insomnia-test{path}"))
+        PathBuf::from(format!("/tmp/yoi-test{path}"))
     }
 
     fn api_key_file_auth(path: PathBuf) -> AuthRef {
@@ -791,14 +791,14 @@ mod tests {
     fn resolve_paths_joins_relative_auth_file() {
         let mut cfg = minimal_valid();
         cfg.model.auth = Some(api_key_file_auth(PathBuf::from("keys/anthropic")));
-        let resolved = cfg.resolve_paths(Path::new("/home/user/.config/insomnia"));
+        let resolved = cfg.resolve_paths(Path::new("/home/user/.config/yoi"));
         let file = match resolved.model.auth {
             Some(AuthRef::ApiKey { file, .. }) => file,
             _ => panic!("expected ApiKey"),
         };
         assert_eq!(
             file.as_deref(),
-            Some(Path::new("/home/user/.config/insomnia/keys/anthropic"))
+            Some(Path::new("/home/user/.config/yoi/keys/anthropic"))
         );
     }
 

@@ -14,7 +14,7 @@
 - ID: timestamp + slug 形式
 - Doctor: `./tickets.sh doctor`
 
-`work-items/` は repo-managed な project coordination record であり、`.insomnia/memory` はその代替ではない。
+`work-items/` は repo-managed な project coordination record であり、`.yoi/memory` はその代替ではない。
 
 ## 現在も残る設計余地
 

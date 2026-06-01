@@ -71,14 +71,14 @@ impl LockFile {
 
 /// Default on-disk path: `<runtime_dir>/pods.json` resolved via
 /// [`manifest::paths::pod_registry_path`]. Tests should point this
-/// elsewhere by setting `INSOMNIA_HOME` or `INSOMNIA_RUNTIME_DIR` to a
+/// elsewhere by setting `YOI_HOME` or `YOI_RUNTIME_DIR` to a
 /// tempdir.
 pub fn default_registry_path() -> io::Result<PathBuf> {
     paths::pod_registry_path().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
-            "could not resolve pods.json path (no INSOMNIA_HOME / \
-             INSOMNIA_RUNTIME_DIR / XDG_RUNTIME_DIR / HOME)",
+            "could not resolve pods.json path (no YOI_HOME / \
+             YOI_RUNTIME_DIR / XDG_RUNTIME_DIR / HOME)",
         )
     })
 }
@@ -190,7 +190,7 @@ mod tests {
     fn open_creates_file_with_owner_only_permissions() {
         use std::os::unix::fs::PermissionsExt;
         let dir = TempDir::new().unwrap();
-        let parent = dir.path().join("insomnia");
+        let parent = dir.path().join("yoi");
         let path = parent.join("pods.json");
         let _guard = LockFileGuard::open(&path).unwrap();
         let file_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;

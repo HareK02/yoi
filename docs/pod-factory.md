@@ -22,10 +22,10 @@
 Profile は Lua で書かれる。Rust resolver は selected profile を restricted Lua VM 内で評価し、返り値が Profile-shaped であることを検証してから `PodManifest` に変換する。
 
 ```lua
-local profile = require("insomnia.profile")
-local models = require("insomnia.models")
-local scope = require("insomnia.scope")
-local compact = require("insomnia.compact")
+local profile = require("yoi.profile")
+local models = require("yoi.models")
+local scope = require("yoi.scope")
+local compact = require("yoi.compact")
 
 local model = models.catalog("codex-oauth/gpt-5.5")
 
@@ -79,9 +79,9 @@ Profile に入れてはいけないもの:
 
 `.nix` profile files are no longer supported. Reusable profiles are Lua; complete low-level recipes belong behind `--manifest`.
 
-Discovery は bundled builtin profiles、user registry (`<config_dir>/profiles.toml`)、project registry (`<project>/.insomnia/profiles.toml`) を読む。後段の default が前段の default を上書きするため、project default は user/default builtin より優先される。unqualified ambiguous names は source-qualified suggestion を出して失敗する。
+Discovery は bundled builtin profiles、user registry (`<config_dir>/profiles.toml`)、project registry (`<project>/.yoi/profiles.toml`) を読む。後段の default が前段の default を上書きするため、project default は user/default builtin より優先される。unqualified ambiguous names は source-qualified suggestion を出して失敗する。
 
-Example `.insomnia/profiles.toml`:
+Example `.yoi/profiles.toml`:
 
 ```toml
 default = "coder"
@@ -103,11 +103,11 @@ Profile evaluation runs with controlled host-provided `require`.
 
 Host virtual modules:
 
-- `require("insomnia")`
-- `require("insomnia.profile")`
-- `require("insomnia.models")`
-- `require("insomnia.compact")`
-- `require("insomnia.scope")`
+- `require("yoi")`
+- `require("yoi.profile")`
+- `require("yoi.models")`
+- `require("yoi.compact")`
+- `require("yoi.scope")`
 
 Profile-local modules can be reused with dotted names such as `require("shared")` or `require("shared.models")`; they resolve only under the selected profile file's directory. Unsafe/unrestricted Lua facilities such as `os`, `io`, `debug`, unrestricted `package`, `dofile`, `loadfile`, `load`, and `collectgarbage` are unavailable by default.
 
@@ -146,22 +146,22 @@ One-file Manifest deserialization keeps the Manifest compatibility behavior: unk
 
 | Prefix | Resolution |
 |---|---|
-| `$insomnia` | bundled `resources/prompts/` (`include_dir!`) |
+| `$yoi` | bundled `resources/prompts/` (`include_dir!`) |
 | `$user` | `<config_dir>/prompts/` |
-| `$workspace` | `<project>/.insomnia/prompts/` |
+| `$workspace` | `<project>/.yoi/prompts/` |
 
-`.md` extension can be omitted, e.g. `$insomnia/default` resolves to `resources/prompts/default.md`. Missing files are hard errors; prefixes do not fall through.
+`.md` extension can be omitted, e.g. `$yoi/default` resolves to `resources/prompts/default.md`. Missing files are hard errors; prefixes do not fall through.
 
-Profile and one-file Manifest CLI paths currently use builtin prompt assets only for initial loader construction. `$insomnia/...` works; `$user/...` and `$workspace/...` prompt refs need a future explicit prompt-loader source design instead of reviving ambient manifest discovery.
+Profile and one-file Manifest CLI paths currently use builtin prompt assets only for initial loader construction. `$yoi/...` works; `$user/...` and `$workspace/...` prompt refs need a future explicit prompt-loader source design instead of reviving ambient manifest discovery.
 
 The rendered instruction body is followed by fixed Rust-provided sections for working boundaries and, when present, `AGENTS.md`. User templates cannot remove the scope section.
 
-## `insomnia pod` CLI
+## `yoi pod` CLI
 
 Normal fresh startup uses profile discovery/default selection:
 
 ```text
-insomnia pod [--profile <selector>] [--profile-pod-name <name>] [-s/--store <path>]
+yoi pod [--profile <selector>] [--profile-pod-name <name>] [-s/--store <path>]
 ```
 
 | Flag | Description |
@@ -173,8 +173,8 @@ insomnia pod [--profile <selector>] [--profile-pod-name <name>] [-s/--store <pat
 Restore/attach uses Pod/session state and does not re-evaluate profile sources.
 
 ```text
-insomnia pod --pod <name>
-insomnia pod --session <uuid>
+yoi pod --pod <name>
+yoi pod --session <uuid>
 ```
 
 Spawn children use hidden `--spawn-config-json`, `--adopt`, and `--callback <path>` flags. These are internal handoff details used by `SpawnPod` after the parent has allocated scope and prepared the child config.

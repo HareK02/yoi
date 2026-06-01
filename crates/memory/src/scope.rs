@@ -41,9 +41,9 @@ mod tests {
         let layout = WorkspaceLayout::new(PathBuf::from("/ws"));
         let rules = deny_write_rules(&layout);
         assert_eq!(rules.len(), 2);
-        assert_eq!(rules[0].target, PathBuf::from("/ws/.insomnia/memory"));
+        assert_eq!(rules[0].target, PathBuf::from("/ws/.yoi/memory"));
         assert_eq!(rules[0].permission, Permission::Write);
         assert!(rules[0].recursive);
-        assert_eq!(rules[1].target, PathBuf::from("/ws/.insomnia/knowledge"));
+        assert_eq!(rules[1].target, PathBuf::from("/ws/.yoi/knowledge"));
     }
 }

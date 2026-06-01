@@ -44,7 +44,7 @@ impl WebTools {
     pub fn new(config: Option<WebConfig>) -> Self {
         let client = Client::builder()
             .redirect(reqwest::redirect::Policy::none())
-            .user_agent("insomnia-web-tools/0.1")
+            .user_agent("yoi-web-tools/0.1")
             .build()
             .expect("static reqwest client configuration is valid");
         let secret_store = manifest::paths::data_dir().map(SecretStore::new);
@@ -249,7 +249,7 @@ async fn brave_search(
     let api_key_secret = cfg.api_key_secret.as_ref().ok_or_else(|| {
         disabled_error(
             "WebSearch",
-            "set web.search.api_key_secret to the insomnia keys secret id for the Brave API key",
+            "set web.search.api_key_secret to the yoi keys secret id for the Brave API key",
         )
     })?;
     let store = secret_store.ok_or_else(|| {
@@ -1783,7 +1783,7 @@ mod tests {
         );
         let search_err = tools
             .run_search(WebSearchInput {
-                query: "insomnia".into(),
+                query: "yoi".into(),
                 limit: None,
                 offset: None,
             })
@@ -2099,7 +2099,7 @@ mod tests {
         );
         let result = tools
             .run_search(WebSearchInput {
-                query: "insomnia".into(),
+                query: "yoi".into(),
                 limit: Some(1),
                 offset: Some(0),
             })
@@ -2126,12 +2126,12 @@ mod tests {
             fetch: None,
         }));
         let cfg = brave_search_config(format!("http://{addr}/search"));
-        let result = brave_search_with_api_key(&tools.client, &cfg, "test-key", "insomnia", 1, 0)
+        let result = brave_search_with_api_key(&tools.client, &cfg, "test-key", "yoi", 1, 0)
             .await
             .unwrap();
         let value: Value = serde_json::from_str(result.content.as_deref().unwrap()).unwrap();
         let request = captured.lock().await.clone().unwrap();
-        assert!(request.starts_with("GET /search?q=insomnia&count=1&offset=0 "));
+        assert!(request.starts_with("GET /search?q=yoi&count=1&offset=0 "));
         assert!(
             request
                 .to_ascii_lowercase()
@@ -2158,7 +2158,7 @@ mod tests {
             fetch: None,
         }));
         let cfg = brave_search_config(format!("http://{addr}/search"));
-        let err = brave_search_with_api_key(&tools.client, &cfg, "test-key", "insomnia", 1, 0)
+        let err = brave_search_with_api_key(&tools.client, &cfg, "test-key", "yoi", 1, 0)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("Content-Length"));

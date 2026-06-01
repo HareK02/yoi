@@ -133,8 +133,8 @@ pub fn collect_tidy_hints(layout: &WorkspaceLayout) -> TidyHints {
     hints
 }
 
-/// `<root>/.insomnia/memory/<kind>/*.md` (Knowledge は
-/// `<root>/.insomnia/knowledge/*.md`) を slug ごとに `(slug, full content)`
+/// `<root>/.yoi/memory/<kind>/*.md` (Knowledge は
+/// `<root>/.yoi/knowledge/*.md`) を slug ごとに `(slug, full content)`
 /// 化して返す。
 fn read_kind_records(layout: &WorkspaceLayout, kind: RecordKind) -> BTreeMap<String, String> {
     let dir = match kind {
@@ -280,14 +280,14 @@ mod tests {
     fn collects_replaced_chain() {
         let (dir, layout) = workspace();
         write(
-            &dir.path().join(".insomnia/memory/decisions/replaced.md"),
+            &dir.path().join(".yoi/memory/decisions/replaced.md"),
             &format!(
                 "---\ncreated_at: {n}\nupdated_at: {n}\nsources: []\nstatus: replaced\nreplaced_by: winner\n---\n",
                 n = now()
             ),
         );
         write(
-            &dir.path().join(".insomnia/memory/decisions/winner.md"),
+            &dir.path().join(".yoi/memory/decisions/winner.md"),
             &format!(
                 "---\ncreated_at: {n}\nupdated_at: {n}\nsources: []\nstatus: open\n---\n",
                 n = now()
@@ -308,7 +308,7 @@ mod tests {
             .map(|i| format!("  - segment_id: s{i}\n    range: [{i}, {i}]\n"))
             .collect();
         write(
-            &dir.path().join(".insomnia/memory/decisions/big.md"),
+            &dir.path().join(".yoi/memory/decisions/big.md"),
             &format!(
                 "---\ncreated_at: {n}\nupdated_at: {n}\nstatus: open\nsources:\n{m}---\n",
                 n = now(),
@@ -327,8 +327,7 @@ mod tests {
         let (dir, layout) = workspace();
         for slug in ["db-pool", "db-pol", "db-pools", "alpha"] {
             write(
-                &dir.path()
-                    .join(format!(".insomnia/memory/decisions/{slug}.md")),
+                &dir.path().join(format!(".yoi/memory/decisions/{slug}.md")),
                 &format!(
                     "---\ncreated_at: {n}\nupdated_at: {n}\nsources: []\nstatus: open\n---\n",
                     n = now()

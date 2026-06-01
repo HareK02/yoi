@@ -1,7 +1,7 @@
 //! extract: 活動抽出。
 //!
 //! 通常 Pod の post-run hook で発火する disposable Worker と、その
-//! 出力を `<workspace>/.insomnia/memory/_staging/<id>.json` に書き出す
+//! 出力を `<workspace>/.yoi/memory/_staging/<id>.json` に書き出す
 //! ヘルパーを提供する。Pod 側はこのモジュールから:
 //!
 //! - [`build_extract_input`] を sub-Worker の最初の user 入力に

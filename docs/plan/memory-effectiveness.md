@@ -10,7 +10,7 @@
 - `memory/summary.md` は「Always-on サマリ」と設計されているが、通常 Pod の system prompt へ常駐注入されていない
 - consolidation は `KnowledgeCandidateReport::empty()` を受け取り、prompt 上も「候補レポートが空なら新規 Knowledge を作るな」としているため、Knowledge の cold-start が起きない
 - `decisions/*` と `requests/*` は記録としては残るが、description / resident injection を持たず、後続 turn で自然に読まれにくい
-- bundled prompt に INSOMNIA 開発固有の ticket / TODO 運用を前提にした shadow 禁止が入り、一般ユーザー workspace の管理文脈を過剰に落とす可能性がある
+- bundled prompt に Yoi 開発固有の ticket / TODO 運用を前提にした shadow 禁止が入り、一般ユーザー workspace の管理文脈を過剰に落とす可能性がある
 
 この状態で usage metrics を先に実装しても、「使われていない / 発見されない memory」を測るだけになり、Knowledge 化候補や保護閾値の信号が十分に育たない。先に memory が読まれ、Knowledge が最低限生まれる経路を作る。
 
@@ -78,7 +78,7 @@ Knowledge が空のまま固定される問題を避ける。metrics 実装前�
 
 ### Problem
 
-bundled memory prompts は、INSOMNIA 自身の ticket / TODO / worktree 運用を一般ユーザーへ押し付けている。ticket はこのプロジェクトの管理手法であり、ユーザー workspace の正本や作業管理の形は project ごとに異なる。
+bundled memory prompts は、Yoi 自身の ticket / TODO / worktree 運用を一般ユーザーへ押し付けている。ticket はこのプロジェクトの管理手法であり、ユーザー workspace の正本や作業管理の形は project ごとに異なる。
 
 ### Direction
 
@@ -89,7 +89,7 @@ Default prompt では特定の管理手法名を禁止対象として列挙し�
 - 既存の authoritative record を逐語的に mirror しない
 - ファイル操作ログや VCS 履歴そのものを memory に再保存しない
 - ただし、将来の作業判断に効く project-management 上の制約・優先順位理由・プロセス決定・ recurring pattern は抽象化して保存してよい
-- INSOMNIA 自身の ticket shadow 回避は bundled default ではなく workspace / user prompt override で表現する
+- Yoi 自身の ticket shadow 回避は bundled default ではなく workspace / user prompt override で表現する
 
 ### Expected effect
 
@@ -181,7 +181,7 @@ cold-start gate を緩めると Knowledge が増えすぎる可能性がある�
 
 ### Prompt override boundary
 
-INSOMNIA 自身の ticket shadow 回避を完全に消すと、この repository の memory は作業ログ寄りに戻る可能性がある。これは bundled default ではなく workspace prompt override で解くべきで、default prompt の責務ではない。
+Yoi 自身の ticket shadow 回避を完全に消すと、この repository の memory は作業ログ寄りに戻る可能性がある。これは bundled default ではなく workspace prompt override で解くべきで、default prompt の責務ではない。
 
 ### `#<slug>` history representation
 

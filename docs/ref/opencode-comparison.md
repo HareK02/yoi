@@ -1,18 +1,18 @@
-# Insomnia × OpenCode 比較レポート
+# Yoi × OpenCode 比較レポート
 
 ## 概要
 
-Insomnia（Rust製エージェントプラットフォーム、基礎実装段階）と OpenCode（TypeScript/Bun製AIコーディングアシスタント、本番稼働レベル）の設計を比較し、Insomniaの基礎設計に取り込めるパターンを特定する。
+Yoi（Rust製エージェントプラットフォーム、基礎実装段階）と OpenCode（TypeScript/Bun製AIコーディングアシスタント、本番稼働レベル）の設計を比較し、Yoiの基礎設計に取り込めるパターンを特定する。
 
 ---
 
 ## 1. アーキテクチャ概観
 
-### Insomnia（現状）
+### Yoi（現状）
 
 ```
-insomnia (stub)
-  └─ insomnia-core          Pod / Controller / Protocol / SocketServer
+yoi (stub)
+  └─ yoi-core          Pod / Controller / Protocol / SocketServer
        └─ llm-worker-persistence   Session永続化（JSONL + Blob）
             └─ llm-worker          Worker / Tool / Hook / Subscriber
                  └─ llm-worker-macros  #[tool] / #[tool_registry]
@@ -41,13 +41,13 @@ packages/desktop (Tauri)      Web UIラッパー
 
 ## 2. 設計判断の比較
 
-| 観点 | Insomnia | OpenCode | 評価 |
+| 観点 | Yoi | OpenCode | 評価 |
 |------|----------|----------|------|
-| **DI** | ジェネリクス `<C: LlmClient, St: Store>` | Effect Service + Layer | Insomnia: コンパイル時保証。OpenCode: 実行時合成の柔軟性。方向性は正しい |
-| **状態管理** | `RwLock<PodStatus>` + ファイル書き出し | SQLite + Event Bus + SSE | Insomnia: 軽量で正しい。DBは将来の選択肢 |
-| **プロトコル** | 自前 JSONL (Method/Event) | Hono HTTP API + SSE | Insomnia: Unix Socketに最適化。目的が違う |
+| **DI** | ジェネリクス `<C: LlmClient, St: Store>` | Effect Service + Layer | Yoi: コンパイル時保証。OpenCode: 実行時合成の柔軟性。方向性は正しい |
+| **状態管理** | `RwLock<PodStatus>` + ファイル書き出し | SQLite + Event Bus + SSE | Yoi: 軽量で正しい。DBは将来の選択肢 |
+| **プロトコル** | 自前 JSONL (Method/Event) | Hono HTTP API + SSE | Yoi: Unix Socketに最適化。目的が違う |
 | **ツール** | `Tool` trait + マクロ生成 | Zod schema + execute関数 | 同等のアプローチ。マクロの方が型安全 |
-| **フック** | `Hook<K: HookEventKind>` trait 10種 | Plugin hooks (before/after) | Insomnia: 型安全で粒度が細かい。OpenCode: 動的で拡張しやすい |
+| **フック** | `Hook<K: HookEventKind>` trait 10種 | Plugin hooks (before/after) | Yoi: 型安全で粒度が細かい。OpenCode: 動的で拡張しやすい |
 | **永続化** | JSONL append-only + Blob | SQLite + Drizzle ORM | 方向性が異なる。両方とも正当な選択 |
 | **プロバイダ** | 4種（Anthropic/OpenAI/Gemini/Ollama） | 20種+（ai-sdk経由） | 数は後から追加できる。抽象は同レベル |
 
@@ -62,9 +62,9 @@ packages/desktop (Tauri)      Web UIラッパー
 - 3段階: `deny` → `allow` → `ask`（ユーザーに確認）
 - 「always」応答でパターンを永続的に許可
 
-**Insomniaへの示唆:**
+**Yoiへの示唆:**
 
-Insomniaには `Scope`（書き込みディレクトリ制約）があるが、これは静的な境界。
+Yoiには `Scope`（書き込みディレクトリ制約）があるが、これは静的な境界。
 ツール単位の動的パーミッションが欠落している。
 
 ```
@@ -101,12 +101,12 @@ action = "deny"
 - 切り捨て分はファイルに保存（7日間保持）
 - LLMには「出力が大きすぎた。`grep` や `read` で絞り込め」とヒント
 
-**Insomniaの現状:**
+**Yoiの現状:**
 - `llm-worker` に Tool Output の Inline/Stored 閾値（800 bytes）がある
 - Stored 出力は Blob Storage に退避し、要約を自動生成
 
 **比較:**
-Insomnia の方が洗練されている（要約生成まで組み込み済み）。
+Yoi の方が洗練されている（要約生成まで組み込み済み）。
 ただし OpenCode の「ヒント付きトランケーション」は追加の視点として有用。
 
 **取り込み案:**
@@ -124,11 +124,11 @@ Insomnia の方が洗練されている（要約生成まで組み込み済み�
    - 構造化要約: Goal / Instructions / Discoveries / Accomplished / Files
 3. **Replay**: 圧縮後に前回のユーザーメッセージを再送して作業継続
 
-**Insomniaの現状:**
+**Yoiの現状:**
 - Worker は history をそのまま保持
 - コンテキスト管理の仕組みは未実装
 
-**これは重要な欠落。** 長時間実行エージェントである Insomnia にとって、コンテキスト管理はコア機能。
+**これは重要な欠落。** 長時間実行エージェントである Yoi にとって、コンテキスト管理はコア機能。
 
 **取り込み案:**
 
@@ -157,13 +157,13 @@ consolidation: Compact（Agent ベース）
 - Instance スコープ + Global スコープの二段バス
 - `publish` / `subscribe` / `subscribeAll` の3操作
 
-**Insomniaの現状:**
+**Yoiの現状:**
 - `broadcast::Sender<Event>` による単一チャネル
 - Event enum で型安全
 - Pod 単位のスコープのみ
 
 **比較:**
-Insomnia の broadcast channel は Pod 単位では十分。
+Yoi の broadcast channel は Pod 単位では十分。
 ただし、**複数 Pod の協調**（Supervisor）段階で Global Bus が必要になる。
 
 **取り込み案:**
@@ -180,7 +180,7 @@ Insomnia の broadcast channel は Pod 単位では十分。
 - ツール実行前にスナップショット取得
 - `restore` / `revert` / `diff` 操作
 
-**Insomniaの現状:**
+**Yoiの現状:**
 - Scope（書き込み制約）はあるが、変更追跡・復元は未実装
 
 **取り込み案:**
@@ -200,13 +200,13 @@ Insomnia の broadcast channel は Pod 単位では十分。
 - `steps` パラメータでサブエージェントの反復回数を制限
 - 親セッションのコンテキストを子に渡す
 
-**Insomniaの現状:**
+**Yoiの現状:**
 - Pod は独立実行単位。Pod 間通信は未実装
 - 拡張ポイント表に「Supervisor」として記載
 
 **比較:**
 OpenCode の Agent は Session 内のモード切り替え。
-Insomnia の Pod は完全に独立したプロセス。
+Yoi の Pod は完全に独立したプロセス。
 
 **取り込み案:**
 - OpenCode の `steps`（最大反復回数）は Pod マニフェストに追加する価値あり
@@ -225,7 +225,7 @@ Insomnia の Pod は完全に独立したプロセス。
 - 配列フィールドはマージ（上書きではなく結合）
 - Plugin の出自を追跡（PluginOrigin）
 
-**Insomniaの現状:**
+**Yoiの現状:**
 - マニフェスト（TOML）のみ。階層なし
 
 **取り込み案:**
@@ -244,7 +244,7 @@ Insomnia の Pod は完全に独立したプロセス。
 - 遅延初期化（必要時にのみ起動）
 - graceful degradation（サーバーなし → 無視）
 
-**Insomniaの現状:**
+**Yoiの現状:**
 - LSP の言及なし
 
 **取り込み案:**
@@ -256,7 +256,7 @@ Insomnia の Pod は完全に独立したプロセス。
 
 ## 4. 設計思想の根本的な違い
 
-### Insomnia: 「Pod は独立した実行単位」
+### Yoi: 「Pod は独立した実行単位」
 
 - 各 Pod が完結したプロセス
 - 協調は外部（Supervisor）が行う
@@ -269,7 +269,7 @@ Insomnia の Pod は完全に独立したプロセス。
 - アプリケーションの哲学に近い
 
 **この違いは意図的であり、変える必要はない。**
-Insomnia のアプローチは長時間自律実行に適しており、Pod の独立性がフォールトトレランスと拡張性の基盤になる。
+Yoi のアプローチは長時間自律実行に適しており、Pod の独立性がフォールトトレランスと拡張性の基盤になる。
 
 ---
 

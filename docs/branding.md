@@ -115,7 +115,7 @@ If `Yoi` is adopted, the rename should cover at least:
 - docs, reports, AGENTS instructions, tickets, and release material;
 - socket/runtime path labels and diagnostics where user-visible.
 
-Compatibility aliases should be considered separately, but the public identity should not preserve `insomnia` longer than necessary.
+The public identity should move cleanly to Yoi; do not preserve `insomnia` through compatibility aliases.
 
 ## Adoption checks
 

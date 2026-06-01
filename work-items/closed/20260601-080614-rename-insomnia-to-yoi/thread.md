@@ -306,3 +306,189 @@ For existing dogfood/user state, implement only a bounded one-shot migration pat
 
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-06-01T08:50:59Z -->
+
+## Implementation report
+
+# Implementation report: Yoi rename
+
+Implemented a clean public rename from Insomnia to Yoi.
+
+## Scope completed
+
+- Renamed the main Cargo package/crate/binary from `insomnia` to `yoi`:
+  - `crates/insomnia/` -> `crates/yoi/`
+  - workspace package/dependency metadata updated
+  - CLI help and tests now use `yoi`
+- Updated Nix packaging:
+  - package `pname` is `yoi`
+  - flake package/app output points at `bin/yoi`
+  - `cargoHash` refreshed after the lock/vendor input changed
+- Updated CLI/runtime command surfaces:
+  - `insomnia pod` -> `yoi pod`
+  - `INSOMNIA_POD_RUNTIME_COMMAND` -> `YOI_POD_RUNTIME_COMMAND`
+  - `INSOMNIA-READY` -> `YOI-READY`
+  - runtime fallback command now targets `yoi`
+- Updated path/env authority:
+  - `.insomnia` -> `.yoi`
+  - `~/.insomnia` -> `~/.yoi`
+  - config/runtime/data env prefixes use `YOI_*`
+- Implemented a bounded one-shot migration for persistent local roots:
+  - `$HOME/.insomnia` -> `$HOME/.yoi`
+  - `$XDG_CONFIG_HOME/insomnia` or `$HOME/.config/insomnia` -> Yoi equivalents
+  - only when the corresponding new `YOI_*` override is not set and the new target does not already exist
+  - no old env aliases, command aliases, prompt/profile aliases, or long-term old root search paths are supported
+  - runtime directories are not migrated because they are transient and may contain live sockets
+- Updated prompt/profile namespace:
+  - `$insomnia` -> `$yoi`
+  - `require("insomnia")` -> `require("yoi")`
+  - Lua profile API/version strings updated to Yoi naming
+- Updated active docs, prompt resources, tests, diagnostics, examples, and help strings.
+- Kept old-name references only where they are intentional migration/rationale references, such as `docs/branding.md`, `docs/environment.md`, path migration code/tests, and historical work items/reports.
+
+## Residual old-name references in active surfaces
+
+The active non-historical residual grep is intentional:
+
+- `crates/manifest/src/paths.rs`: one-shot migration source paths and tests
+- `docs/environment.md`: migration documentation and explicit no-alias policy
+- `package.nix`: excludes legacy `.insomnia` local state from package sources
+
+Historical/rationale records under `docs/report/`, `docs/branding.md`, and work-item history were not bulk-renamed.
+
+## Validation
+
+Passed:
+
+- `cargo fmt --check`
+- `cargo check --workspace`
+- `cargo test -p manifest`
+- `cargo test -p yoi`
+- `cargo test -p client runtime_command`
+- `cargo test -p pod entrypoint`
+- `cargo test -p pod prompt::loader`
+- `cargo test -p manifest profile`
+- `target/debug/yoi --help`
+- `target/debug/yoi pod --help`
+- `nix eval .#packages.x86_64-linux.default.pname --raw`
+- `nix eval .#apps.x86_64-linux.default.program --raw`
+- `nix build .#yoi --no-link`
+- `git diff --check`
+
+Observed warnings are pre-existing unused-code warnings in `llm-worker` and `tui`.
+
+
+---
+
+<!-- event: decision author: hare at: 2026-06-01T09:39:00Z -->
+
+## Decision
+
+Decision correction: keep the Yoi rename clean.
+
+Do not implement old-name command aliases, old environment variable aliases, prompt/profile aliases, old search roots, or old path handling in the codebase. Existing local dogfood state is handled manually outside the implementation.
+
+
+---
+
+<!-- event: decision author: hare at: 2026-06-01T09:47:15Z -->
+
+## Decision
+
+Naming decision: the formal product name is `Yoi`, or `Yoi agent` where a fuller phrase is useful. Do not use all-caps `YOI` as the product name; reserve uppercase `YOI_*` / `YOI-READY` for environment variables and protocol literals only.
+
+
+---
+
+<!-- event: implementation_report author: hare at: 2026-06-01T09:49:11Z -->
+
+## Implementation report
+
+# Implementation report: Yoi rename
+
+Implemented a clean public rename from Insomnia to Yoi.
+
+## Scope completed
+
+- Renamed the main Cargo package/crate/binary from `insomnia` to `yoi`:
+  - `crates/insomnia/` -> `crates/yoi/`
+  - workspace package/dependency metadata updated
+  - CLI help and tests now use `yoi`
+- Updated Nix packaging:
+  - package `pname` is `yoi`
+  - flake package/app output points at `bin/yoi`
+  - `cargoHash` refreshed after the lock/vendor input changed
+- Updated CLI/runtime command surfaces:
+  - `insomnia pod` -> `yoi pod`
+  - `INSOMNIA_POD_RUNTIME_COMMAND` -> `YOI_POD_RUNTIME_COMMAND`
+  - `INSOMNIA-READY` -> `YOI-READY`
+  - runtime fallback command now targets `yoi`
+- Updated path/env authority:
+  - `.insomnia` -> `.yoi`
+  - `~/.insomnia` -> `~/.yoi`
+  - config/runtime/data env prefixes use `YOI_*`
+- Updated prompt/profile namespace:
+  - `$insomnia` -> `$yoi`
+  - `require("insomnia")` -> `require("yoi")`
+  - Lua profile API/version strings updated to Yoi naming
+- Updated active docs, prompt resources, tests, diagnostics, examples, and help strings.
+- Kept old-name references only where they are rationale or historical records, such as `docs/branding.md`, historical reports, and work-item history.
+
+## Compatibility decision
+
+No old command aliases, old environment-variable aliases, old prompt/profile aliases, or old search roots are implemented. Yoi paths are the active paths.
+
+## Residual old-name references in active surfaces
+
+The active non-historical residual grep should not include old product/runtime identifiers. Remaining old-name references are expected only in rationale/historical records.
+
+## Validation
+
+Passed before the correction to remove compatibility remnants:
+
+- `cargo fmt --check`
+- `cargo check --workspace`
+- `cargo test -p manifest`
+- `cargo test -p yoi`
+- `cargo test -p client runtime_command`
+- `cargo test -p pod entrypoint`
+- `cargo test -p pod prompt::loader`
+- `cargo test -p manifest profile`
+- `target/debug/yoi --help`
+- `target/debug/yoi pod --help`
+- `nix eval .#packages.x86_64-linux.default.pname --raw`
+- `nix eval .#apps.x86_64-linux.default.program --raw`
+- `nix build .#yoi --no-link`
+- `git diff --check`
+
+Additional validation after removing compatibility remnants:
+
+- `cargo fmt --check`
+- `cargo test -p manifest paths`
+- `cargo test -p pod spawn_profile_selector_accepts_default_inherit_and_registry`
+
+Run the final full validation set again before closing this work item.
+
+
+---
+
+<!-- event: close author: hare at: 2026-06-01T09:49:11Z status: closed -->
+
+## Closed
+
+Completed the clean Yoi rename implementation.
+
+The public identity is now `Yoi` / `Yoi agent` for prose, `yoi` for package/CLI names, `.yoi` for local project/data paths, and `YOI_*` / `YOI-READY` only for environment variables and protocol literals.
+
+No old `insomnia` command aliases, env aliases, prompt/profile aliases, old search roots, or old-path handling are implemented. Existing dogfood state was moved manually outside the codebase.
+
+Validation recorded in `artifacts/implementation-report.md`; final focused checks after correction passed:
+
+- `cargo fmt --check`
+- `cargo test -p manifest paths`
+- `cargo test -p pod spawn_profile_selector_accepts_default_inherit_and_registry`
+- `git diff --check`
+
+
+---

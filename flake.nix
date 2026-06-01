@@ -1,5 +1,5 @@
 {
-  description = "INSOMNIA agent runtime";
+  description = "Yoi agent";
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs?ref=nixos-unstable";
@@ -16,21 +16,21 @@
       system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
-        insomnia = pkgs.callPackage ./package.nix { };
+        yoi = pkgs.callPackage ./package.nix { };
         mkApp = name: description: {
           type = "app";
-          program = "${insomnia}/bin/${name}";
+          program = "${yoi}/bin/${name}";
           meta.description = description;
         };
       in
       {
-        packages.default = insomnia;
-        packages.insomnia = insomnia;
+        packages.default = yoi;
+        packages.yoi = yoi;
 
-        apps.default = mkApp "insomnia" "Run the INSOMNIA terminal UI";
-        apps.insomnia = mkApp "insomnia" "Run the INSOMNIA terminal UI";
+        apps.default = mkApp "yoi" "Run the Yoi terminal UI";
+        apps.yoi = mkApp "yoi" "Run the Yoi terminal UI";
 
-        checks.default = insomnia;
+        checks.default = yoi;
 
         devShells.default = import ./devshell.nix { inherit pkgs; };
       }

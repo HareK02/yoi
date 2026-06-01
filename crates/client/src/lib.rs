@@ -2,7 +2,7 @@
 //!
 //! - [`PodClient`]: 既存 pod の Unix ソケットへ接続して `Method` を送り、
 //!   `Event` を受け取る低レベル接続。
-//! - [`spawn`]: pod バイナリをサブプロセスとして起動し、`INSOMNIA-READY`
+//! - [`spawn`]: pod バイナリをサブプロセスとして起動し、`YOI-READY`
 //!   ハンドシェイクが終わるまで待つフロー。subprocess を立ち上げる必要が
 //!   ない呼び出し側 (=既存 pod に attach する場合) は使わなくてよい。
 //!

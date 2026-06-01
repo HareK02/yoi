@@ -1,12 +1,12 @@
 //! Append-only JSONL audit log for memory workers and tools.
 //!
 //! The log is evidence-only observability data under
-//! `.insomnia/memory/_logs/current.log`. It is intentionally separate from
+//! `.yoi/memory/_logs/current.log`. It is intentionally separate from
 //! `_staging` and `_usage`, and consolidation never consumes it. Operators can
 //! follow the latest stream with:
 //!
 //! ```text
-//! tail -f .insomnia/memory/_logs/current.log
+//! tail -f .yoi/memory/_logs/current.log
 //! ```
 
 use std::collections::BTreeMap;
@@ -260,7 +260,7 @@ pub struct RecordSnapshot {
     pub hash: String,
 }
 
-/// Append one audit event to `.insomnia/memory/_logs/current.log`.
+/// Append one audit event to `.yoi/memory/_logs/current.log`.
 pub fn append_audit_event(layout: &WorkspaceLayout, event: &AuditEvent) -> io::Result<()> {
     let path = layout.audit_current_log_path();
     if let Some(parent) = path.parent() {
@@ -425,7 +425,7 @@ mod tests {
     #[test]
     fn counts_created_edited_deleted_records() {
         let (dir, layout) = setup();
-        let decision_dir = dir.path().join(".insomnia/memory/decisions");
+        let decision_dir = dir.path().join(".yoi/memory/decisions");
         fs::create_dir_all(&decision_dir).unwrap();
         fs::write(decision_dir.join("a.md"), "old").unwrap();
         fs::write(decision_dir.join("gone.md"), "old").unwrap();

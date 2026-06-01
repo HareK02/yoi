@@ -822,7 +822,7 @@ mod tests {
         let runtime_base = root.path().join("runtime");
         std::fs::create_dir_all(&runtime_base).unwrap();
         unsafe {
-            std::env::set_var("INSOMNIA_RUNTIME_DIR", &runtime_base);
+            std::env::set_var("YOI_RUNTIME_DIR", &runtime_base);
         }
 
         let store = FsPodStore::new(&store_dir).unwrap();

@@ -4,12 +4,12 @@
 //!
 //! | prefix       | location                                                |
 //! |--------------|---------------------------------------------------------|
-//! | `$insomnia`  | builtin, baked into the binary via `include_dir!`       |
+//! | `$yoi`  | builtin, baked into the binary via `include_dir!`       |
 //! | `$user`      | `<config_dir>/prompts/` (resolved by `manifest::paths`) |
-//! | `$workspace` | `<project>/.insomnia/prompts/`                          |
+//! | `$workspace` | `<project>/.yoi/prompts/`                          |
 //!
 //! A reference is `$<prefix>/<path>` where `<path>` is a `/`-separated
-//! name without the `.md` extension (e.g. `$insomnia/common/header`).
+//! name without the `.md` extension (e.g. `$yoi/common/header`).
 //! Unqualified names (no `$prefix/` at the front) are resolved relative
 //! to an optional current reference — typically the file that issued
 //! the `{% include %}` — so a prompt library can be authored as a
@@ -25,13 +25,13 @@ use thiserror::Error;
 
 static BUILTIN_PROMPTS: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/../../resources/prompts");
 
-const PREFIX_INSOMNIA: &str = "$insomnia";
+const PREFIX_YOI: &str = "$yoi";
 const PREFIX_USER: &str = "$user";
 const PREFIX_WORKSPACE: &str = "$workspace";
 
 /// Prefix-resolved reference to a prompt asset. Produced by
 /// [`PromptLoader::parse_ref`] from a user-supplied string such as
-/// `"$insomnia/default"`.
+/// `"$yoi/default"`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PromptRef {
     prefix: Prefix,
@@ -42,7 +42,7 @@ pub struct PromptRef {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Prefix {
-    Insomnia,
+    Yoi,
     User,
     Workspace,
 }
@@ -50,7 +50,7 @@ enum Prefix {
 impl Prefix {
     fn as_str(self) -> &'static str {
         match self {
-            Self::Insomnia => PREFIX_INSOMNIA,
+            Self::Yoi => PREFIX_YOI,
             Self::User => PREFIX_USER,
             Self::Workspace => PREFIX_WORKSPACE,
         }
@@ -116,7 +116,7 @@ pub struct PromptLoader {
 }
 
 impl PromptLoader {
-    /// Loader with only the builtin `$insomnia` library available.
+    /// Loader with only the builtin `$yoi` library available.
     /// `$user` / `$workspace` references fail with
     /// [`LoaderError::PrefixNotConfigured`].
     pub fn builtins_only() -> Self {
@@ -221,7 +221,7 @@ impl PromptLoader {
     /// when the prefix is not configured or the file does not exist.
     pub fn load(&self, reference: &PromptRef) -> Result<String, LoaderError> {
         match reference.prefix {
-            Prefix::Insomnia => load_from_include_dir(&BUILTIN_PROMPTS, reference),
+            Prefix::Yoi => load_from_include_dir(&BUILTIN_PROMPTS, reference),
             Prefix::User => match self.user_dir.as_deref() {
                 Some(dir) => load_from_dir(dir, reference),
                 None => Err(LoaderError::PrefixNotConfigured {
@@ -252,7 +252,7 @@ impl PromptLoader {
 
 fn parse_prefix(raw: &str, prefix_name: &str) -> Result<Prefix, LoaderError> {
     match prefix_name {
-        "insomnia" => Ok(Prefix::Insomnia),
+        "yoi" => Ok(Prefix::Yoi),
         "user" => Ok(Prefix::User),
         "workspace" => Ok(Prefix::Workspace),
         _ => Err(LoaderError::UnknownPrefix {
@@ -311,15 +311,15 @@ mod tests {
     #[test]
     fn builtin_default_resolves() {
         let loader = PromptLoader::builtins_only();
-        let (r, source) = loader.resolve("$insomnia/default", None).unwrap();
-        assert_eq!(r.to_qualified_string(), "$insomnia/default");
+        let (r, source) = loader.resolve("$yoi/default", None).unwrap();
+        assert_eq!(r.to_qualified_string(), "$yoi/default");
         assert!(!source.is_empty());
     }
 
     #[test]
     fn builtin_subdirectory_lookup() {
         let loader = PromptLoader::builtins_only();
-        let (_, source) = loader.resolve("$insomnia/common/tool-usage", None).unwrap();
+        let (_, source) = loader.resolve("$yoi/common/tool-usage", None).unwrap();
         assert!(source.contains("tool"));
     }
 
@@ -346,9 +346,7 @@ mod tests {
     #[test]
     fn missing_file_is_hard_error() {
         let loader = PromptLoader::builtins_only();
-        let err = loader
-            .resolve("$insomnia/definitely-missing", None)
-            .unwrap_err();
+        let err = loader.resolve("$yoi/definitely-missing", None).unwrap_err();
         assert!(matches!(err, LoaderError::NotFound { .. }));
     }
 
@@ -379,20 +377,18 @@ mod tests {
     #[test]
     fn unqualified_ref_resolves_relative_to_current() {
         let loader = PromptLoader::builtins_only();
-        let current = loader
-            .parse_ref("$insomnia/common/tool-usage", None)
-            .unwrap();
+        let current = loader.parse_ref("$yoi/common/tool-usage", None).unwrap();
         // Sibling lookup under the same prefix and directory.
         let sibling = loader.parse_ref("workspace", Some(&current)).unwrap();
-        assert_eq!(sibling.to_qualified_string(), "$insomnia/common/workspace");
+        assert_eq!(sibling.to_qualified_string(), "$yoi/common/workspace");
     }
 
     #[test]
     fn unqualified_ref_from_root_file_has_empty_dir() {
         let loader = PromptLoader::builtins_only();
-        let current = loader.parse_ref("$insomnia/default", None).unwrap();
+        let current = loader.parse_ref("$yoi/default", None).unwrap();
         let sibling = loader.parse_ref("other", Some(&current)).unwrap();
-        assert_eq!(sibling.to_qualified_string(), "$insomnia/other");
+        assert_eq!(sibling.to_qualified_string(), "$yoi/other");
     }
 
     #[test]
@@ -402,8 +398,8 @@ mod tests {
         std::fs::write(user_dir.join("custom.md"), "user-body").unwrap();
         let loader = PromptLoader::new(Some(user_dir), None);
 
-        let current = loader.parse_ref("$insomnia/default", None).unwrap();
-        // Even with an $insomnia-rooted current, an explicit $user
+        let current = loader.parse_ref("$yoi/default", None).unwrap();
+        // Even with an $yoi-rooted current, an explicit $user
         // prefix must win.
         let (reference, source) = loader.resolve("$user/custom", Some(&current)).unwrap();
         assert_eq!(reference.to_qualified_string(), "$user/custom");
@@ -413,7 +409,7 @@ mod tests {
     #[test]
     fn traversal_segments_rejected() {
         let loader = PromptLoader::builtins_only();
-        let err = loader.resolve("$insomnia/../etc/passwd", None).unwrap_err();
+        let err = loader.resolve("$yoi/../etc/passwd", None).unwrap_err();
         assert!(matches!(err, LoaderError::InvalidRef { .. }));
     }
 }

@@ -48,7 +48,7 @@ let prompt_cache_key = Some(self.client.state.conversation_id.to_string());
 シナリオ（マルチテナント等）で意図しないヒット混線を避ける用途
 で使う。少なくとも害は無いので両 backend で同じ値を送って良い。
 
-## 5. insomnia での運用
+## 5. yoi での運用
 
 - `Request::cache_key: Option<String>` を provider-agnostic な
   キャッシュヒントとして持つ。`cache_anchor` (Anthropic 用 prefix

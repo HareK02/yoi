@@ -1,8 +1,8 @@
 # 環境変数ポリシー
 
-INSOMNIA では、プロセス境界で本当に必要な場合を除き、環境変数の利用を避ける。新しい ambient な入力を増やすより、明示的な profile / manifest / config file / typed secret reference / CLI argument を優先する。
+Yoi では、プロセス境界で本当に必要な場合を除き、環境変数の利用を避ける。新しい ambient な入力を増やすより、明示的な profile / manifest / config file / typed secret reference / CLI argument を優先する。
 
-それでも、path discovery、runtime directory、外部 provider の credential 慣習との移行互換のために、一部の環境変数はまだサポートしている。この文書に載せた通常 runtime 用の環境変数は公開 surface として扱う。ただし、fallback 変数は独立した設定項目ではなく、対応する main key の解決順の一部として扱う。開発・テスト都合だけの環境変数は、通常ユーザー向け configuration として扱わない明確な escape hatch に限る。
+それでも、path discovery、runtime directory、外部 provider の credential 慣習のために、一部の環境変数はまだサポートしている。この文書に載せた通常 runtime 用の環境変数は公開 surface として扱う。ただし、fallback 変数は独立した設定項目ではなく、対応する main key の解決順の一部として扱う。開発・テスト都合だけの環境変数は、通常ユーザー向け configuration として扱わない明確な escape hatch に限る。
 
 ## 原則
 
@@ -19,10 +19,10 @@ Path 系の環境変数は論理的な key ごとに立項する。`XDG_*` や `
 
 | 論理 key | Main env | Fallback / 解決順 | 用途と位置付け |
 | --- | --- | --- | --- |
-| `home` | `INSOMNIA_HOME` | なし | config / data / runtime をまとめて sandbox する root override。設定を細かく分けるより、test や isolated run ではまずこれを使う。 |
-| `config_dir` | `INSOMNIA_CONFIG_DIR` | `$INSOMNIA_HOME/config` → `$XDG_CONFIG_HOME/insomnia` → `$HOME/.config/insomnia` | 人が書く設定・override の置き場。`profiles.toml`、prompt override、model/provider override など。 |
-| `data_dir` | `INSOMNIA_DATA_DIR` | `$INSOMNIA_HOME` → `$HOME/.insomnia` | プログラムが書く永続データの置き場。session log、Pod metadata など、再起動後も restore / replay の根拠になるもの。通常ユーザー向けの primary knob ではなく、migration、test、isolated data store 用の advanced override。 |
-| `runtime_dir` | `INSOMNIA_RUNTIME_DIR` | `$INSOMNIA_HOME/run` → `$XDG_RUNTIME_DIR/insomnia` → `$HOME/.insomnia/run` | socket、pid/status file、live registry mirror など、再起動で捨ててよい runtime state の置き場。 |
+| `home` | `YOI_HOME` | なし | config / data / runtime をまとめて sandbox する root override。設定を細かく分けるより、test や isolated run ではまずこれを使う。 |
+| `config_dir` | `YOI_CONFIG_DIR` | `$YOI_HOME/config` → `$XDG_CONFIG_HOME/yoi` → `$HOME/.config/yoi` | 人が書く設定・override の置き場。`profiles.toml`、prompt override、model/provider override など。 |
+| `data_dir` | `YOI_DATA_DIR` | `$YOI_HOME` → `$HOME/.yoi` | プログラムが書く永続データの置き場。session log、Pod metadata など、再起動後も restore / replay の根拠になるもの。通常ユーザー向けの primary knob ではなく、test や isolated data store 用の advanced override。 |
+| `runtime_dir` | `YOI_RUNTIME_DIR` | `$YOI_HOME/run` → `$XDG_RUNTIME_DIR/yoi` → `$HOME/.yoi/run` | socket、pid/status file、live registry mirror など、再起動で捨ててよい runtime state の置き場。 |
 
 空の path 環境変数は、`manifest::paths` では原則として unset 相当に扱う。
 
@@ -36,11 +36,11 @@ Path 系の環境変数は論理的な key ごとに立項する。`XDG_*` や `
 
 ### Builtin assets と `config_dir`
 
-Builtin profiles and catalogs are embedded in the binary at build time. User/project-owned overrides remain under `config_dir` and project `.insomnia/` files such as `profiles.toml`; package runtime resource lookup is not a supported configuration surface.
+Builtin profiles and catalogs are embedded in the binary at build time. User/project-owned overrides remain under `config_dir` and project `.yoi/` files such as `profiles.toml`; package runtime resource lookup is not a supported configuration surface.
 
 ## Credential と外部 auth
 
-Provider API key と WebSearch credential は、通常の runtime では環境変数から読まない。`insomnia keys` で local secret store に論理 id を追加し、profile / manifest / provider catalog / web config がその id を明示的に参照する。
+Provider API key と WebSearch credential は、通常の runtime では環境変数から読まない。`yoi keys` で local secret store に論理 id を追加し、profile / manifest / provider catalog / web config がその id を明示的に参照する。
 
 ```toml
 [model]
@@ -71,7 +71,7 @@ On-disk store は `<data_dir>/secrets/store.json`。secret value は軽量な ob
 
 | 変数 | Context | 備考 |
 | --- | --- | --- |
-| `INSOMNIA_POD_RUNTIME_COMMAND` | 開発中に起動中の `insomnia` binary が rebuild され、`std::env::current_exe()` が `target/debug/insomnia (deleted)` のような stale path を返す場合の Pod runtime executable override。 | Unset または empty の場合は既定どおり current executable に `pod` prefix argument を付けて起動する。Non-empty の場合は値を executable path としてそのまま使い、`pod` prefix argument は常に自動追加する。shell parsing や argument splitting は行わないため、値に flags や `pod` を含めない。 |
+| `YOI_POD_RUNTIME_COMMAND` | 開発中に起動中の `yoi` binary が rebuild され、`std::env::current_exe()` が `target/debug/yoi (deleted)` のような stale path を返す場合の Pod runtime executable override。 | Unset または empty の場合は既定どおり current executable に `pod` prefix argument を付けて起動する。Non-empty の場合は値を executable path としてそのまま使い、`pod` prefix argument は常に自動追加する。shell parsing や argument splitting は行わないため、値に flags や `pod` を含めない。 |
 
 ## Build / example variables
 
@@ -83,7 +83,7 @@ On-disk store は `<data_dir>/secrets/store.json`。secret value は軽量な ob
 | `PATH` | test / dev command lookup。 | helper executable を探す場合だけ使う。 |
 | `TMPDIR` | shell script / test。 | `tickets.sh` が temporary file に使う。 |
 | `RUST_LOG` | example / dev diagnostics。 | example CLI が tracing setup 経由で読む場合がある。 |
-| `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY` などの provider example vars | `llm-worker` や Pod example / fixture recorder。 | example code が `dotenv::dotenv().ok()` を呼ぶことがある。通常の `insomnia` runtime startup には適用されない。 |
+| `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY` などの provider example vars | `llm-worker` や Pod example / fixture recorder。 | example code が `dotenv::dotenv().ok()` を呼ぶことがある。通常の `yoi` runtime startup には適用されない。 |
 
 ## 整理方針
 

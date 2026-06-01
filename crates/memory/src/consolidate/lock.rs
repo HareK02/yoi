@@ -9,7 +9,7 @@
 //!   が追加した分は残す
 //!
 //! 占有判定は Linux/macOS の `kill(pid, 0)` 経由で行う（`ESRCH` で死亡判定）。
-//! Windows は対象外: INSOMNIA は POSIX 環境を前提にしている。
+//! Windows は対象外: Yoi は POSIX 環境を前提にしている。
 
 use std::fs;
 use std::path::{Path, PathBuf};

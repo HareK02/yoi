@@ -1258,7 +1258,7 @@ mod tests {
         let method = Method::PodEvent(PodEvent::ScopeSubDelegated {
             parent_pod: "child".into(),
             sub_pod: "grandchild".into(),
-            sub_socket: "/run/insomnia/grandchild/sock".into(),
+            sub_socket: "/run/yoi/grandchild/sock".into(),
             scope: vec![ScopeRule {
                 target: "/tmp/work".into(),
                 permission: Permission::Write,
@@ -1276,7 +1276,7 @@ mod tests {
             }) => {
                 assert_eq!(parent_pod, "child");
                 assert_eq!(sub_pod, "grandchild");
-                assert_eq!(sub_socket, PathBuf::from("/run/insomnia/grandchild/sock"));
+                assert_eq!(sub_socket, PathBuf::from("/run/yoi/grandchild/sock"));
                 assert_eq!(scope.len(), 1);
                 assert_eq!(scope[0].target, PathBuf::from("/tmp/work"));
                 assert_eq!(scope[0].permission, Permission::Write);

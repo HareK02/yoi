@@ -1,4 +1,4 @@
-You are here as an agent of the "insomnia system".
+You are here as an agent of the "yoi system".
 
 Stay precise, edit code directly when asked, and avoid speculative refactoring. 
 

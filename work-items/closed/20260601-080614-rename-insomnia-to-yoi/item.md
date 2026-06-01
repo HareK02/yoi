@@ -2,12 +2,12 @@
 id: 20260601-080614-rename-insomnia-to-yoi
 slug: rename-insomnia-to-yoi
 title: Rename project from Insomnia to Yoi
-status: open
+status: closed
 kind: task
 priority: P1
 labels: [branding, rename, release-hygiene]
 created_at: 2026-06-01T08:06:14Z
-updated_at: 2026-06-01T08:29:35Z
+updated_at: 2026-06-01T09:49:11Z
 assignee: null
 legacy_ticket: null
 ---
@@ -22,7 +22,7 @@ Branding rationale and adoption checks are recorded in `docs/branding.md`. Nixpk
 
 - Rename the public product identity from Insomnia to Yoi.
 - Rename user-facing CLI/package/config/runtime surfaces that currently expose `insomnia` where doing so is not purely internal implementation detail.
-- Prefer a clean public identity over long-lived compatibility with `insomnia`; any compatibility alias must be explicitly justified.
+- Prefer a clean public identity; do not add `insomnia` compatibility aliases, legacy env aliases, prompt/profile aliases, or old-path handling.
 - Preserve existing project behavior while renaming, without speculative redesign.
 - Keep generated/personal state handling safe; do not expose secrets or private session content during broad rename audits.
 - Update documentation, prompts, diagnostics, package metadata, and release-facing text consistently.
@@ -31,7 +31,7 @@ Branding rationale and adoption checks are recorded in `docs/branding.md`. Nixpk
 
 - The installable main binary/package identity is `yoi` rather than `insomnia`.
 - Nix package/app outputs expose `yoi` and no longer center the long-term public output on `insomnia`.
-- User data/config/workspace directories and environment variable prefixes are renamed or have an explicit migration/compatibility decision recorded.
+- User data/config/workspace directories and environment variable prefixes are renamed directly, without old-name compatibility aliases.
 - User-visible docs, prompts, diagnostics, and command help refer to Yoi where appropriate.
 - Repository references to `insomnia` are either renamed, intentionally retained as historical/internal/generated context, or listed in the implementation report as deferred/intentional.
 - Tests and packaging checks relevant to renamed surfaces pass.

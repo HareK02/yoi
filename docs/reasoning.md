@@ -1,6 +1,6 @@
 # Reasoning / Thinking 制御
 
-manifest の `[worker]` セクションで `reasoning` を指定すると、scheme が provider 各社の wire 形式に投影する。文字列なら **effort label**、数値なら **thinking budget tokens** として扱う。insomnia 側は値の妥当性を検証せず、未知ラベルや provider が拒む値は API 応答で初めて検出される。
+manifest の `[worker]` セクションで `reasoning` を指定すると、scheme が provider 各社の wire 形式に投影する。文字列なら **effort label**、数値なら **thinking budget tokens** として扱う。yoi 側は値の妥当性を検証せず、未知ラベルや provider が拒む値は API 応答で初めて検出される。
 
 ## 書き方
 

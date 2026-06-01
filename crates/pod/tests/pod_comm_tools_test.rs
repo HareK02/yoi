@@ -29,11 +29,11 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 /// Serialises env-mutating tests. The test harness runs tasks across
-/// threads, and `INSOMNIA_RUNTIME_DIR` is a process-wide resource.
+/// threads, and `YOI_RUNTIME_DIR` is a process-wide resource.
 static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 /// Take `ENV_LOCK` and clear any env vars that would outrank
-/// `INSOMNIA_RUNTIME_DIR` in `paths::runtime_dir` resolution; restore
+/// `YOI_RUNTIME_DIR` in `paths::runtime_dir` resolution; restore
 /// previous values on drop.
 struct EnvGuard {
     prev_home: Option<String>,
@@ -44,10 +44,10 @@ struct EnvGuard {
 impl EnvGuard {
     fn acquire() -> Self {
         let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev_home = std::env::var("INSOMNIA_HOME").ok();
+        let prev_home = std::env::var("YOI_HOME").ok();
         let prev_xdg = std::env::var("XDG_RUNTIME_DIR").ok();
         unsafe {
-            std::env::remove_var("INSOMNIA_HOME");
+            std::env::remove_var("YOI_HOME");
             std::env::remove_var("XDG_RUNTIME_DIR");
         }
         Self {
@@ -62,14 +62,14 @@ impl Drop for EnvGuard {
     fn drop(&mut self) {
         unsafe {
             match &self.prev_home {
-                Some(v) => std::env::set_var("INSOMNIA_HOME", v),
-                None => std::env::remove_var("INSOMNIA_HOME"),
+                Some(v) => std::env::set_var("YOI_HOME", v),
+                None => std::env::remove_var("YOI_HOME"),
             }
             match &self.prev_xdg {
                 Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
                 None => std::env::remove_var("XDG_RUNTIME_DIR"),
             }
-            std::env::remove_var("INSOMNIA_RUNTIME_DIR");
+            std::env::remove_var("YOI_RUNTIME_DIR");
         }
     }
 }
@@ -400,7 +400,7 @@ async fn stop_pod_sends_shutdown_and_releases_scope() {
             .unwrap(),
     );
     unsafe {
-        std::env::set_var("INSOMNIA_RUNTIME_DIR", tmp.path());
+        std::env::set_var("YOI_RUNTIME_DIR", tmp.path());
     }
     let lock_path = tmp.path().join("pods.json");
 
@@ -486,7 +486,7 @@ async fn stop_pod_succeeds_even_when_child_unreachable() {
     let _env = EnvGuard::acquire();
     let (tmp, registry, _rd) = setup_registry().await;
     unsafe {
-        std::env::set_var("INSOMNIA_RUNTIME_DIR", tmp.path());
+        std::env::set_var("YOI_RUNTIME_DIR", tmp.path());
     }
 
     // No live listener — socket never bound. Registered record points
@@ -518,7 +518,7 @@ async fn restored_registry_uses_pod_state_without_runtime_file() {
         FsPodStore::new(store_tmp.path().join("pods")).unwrap(),
     );
     unsafe {
-        std::env::set_var("INSOMNIA_RUNTIME_DIR", runtime_tmp.path());
+        std::env::set_var("YOI_RUNTIME_DIR", runtime_tmp.path());
     }
 
     let rd = Arc::new(
@@ -633,7 +633,7 @@ async fn load_from_pod_state_reclaims_missing_child_scope_and_records_history() 
         FsPodStore::new(store_tmp.path().join("pods")).unwrap(),
     );
     unsafe {
-        std::env::set_var("INSOMNIA_RUNTIME_DIR", runtime_tmp.path());
+        std::env::set_var("YOI_RUNTIME_DIR", runtime_tmp.path());
     }
     let rd = Arc::new(
         RuntimeDir::create(runtime_tmp.path(), "spawner")

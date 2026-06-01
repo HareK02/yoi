@@ -1,18 +1,18 @@
 # Pod internal prompts (builtin pack).
 #
 # Values are minijinja template strings. Use `{% include "$prefix/..." %}`
-# to pull in long text from the $insomnia / $user / $workspace prompt
+# to pull in long text from the $yoi / $user / $workspace prompt
 # libraries.
 #
 # Every key here MUST correspond to a `PodPrompt` variant; missing or
 # extra keys cause a build-time error (see `crates/pod/build.rs`).
 
 [prompt]
-compact_system = "{% include \"$insomnia/internal/compact_system\" %}"
+compact_system = "{% include \"$yoi/internal/compact_system\" %}"
 
-memory_extract_system = "{% include \"$insomnia/internal/memory_extract_system\" %}"
+memory_extract_system = "{% include \"$yoi/internal/memory_extract_system\" %}"
 
-memory_consolidation_system = "{% include \"$insomnia/internal/memory_consolidation_system\" %}"
+memory_consolidation_system = "{% include \"$yoi/internal/memory_consolidation_system\" %}"
 
 notify_wrapper = """\
 [Notification]
@@ -66,7 +66,7 @@ The following workflows are advertised resident. When a user request matches one
 {{ entries }}\
 """
 
-pod_orchestration_guidance_section = "{% include \"$insomnia/common/pod-orchestration\" %}"
+pod_orchestration_guidance_section = "{% include \"$yoi/common/pod-orchestration\" %}"
 
 spawn_pod_tool_description = """\
 Spawn a new Pod process to work on a delegated task. The spawner's write scope is reduced by the scope passed here; the spawned Pod receives its own socket and starts running `task` immediately. The spawned Pod outlives the spawner's current turn and can be contacted again through its socket path.

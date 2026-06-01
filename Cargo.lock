@@ -1480,21 +1480,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "insomnia"
-version = "0.1.0"
-dependencies = [
- "client",
- "memory",
- "pod",
- "serde",
- "serde_json",
- "session-store",
- "tempfile",
- "tokio",
- "tui",
-]
-
-[[package]]
 name = "instability"
 version = "0.3.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4759,6 +4744,22 @@ dependencies = [
  "log",
  "mac",
  "markup5ever",
+]
+
+[[package]]
+name = "yoi"
+version = "0.1.0"
+dependencies = [
+ "client",
+ "manifest",
+ "memory",
+ "pod",
+ "serde",
+ "serde_json",
+ "session-store",
+ "tempfile",
+ "tokio",
+ "tui",
 ]
 
 [[package]]

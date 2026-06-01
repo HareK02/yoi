@@ -38,12 +38,12 @@
   - `packages/opencode/src/session/prompt/anthropic-20250930.txt`（Claude Code 風システムプロンプト）
   - `opencode-anthropic-auth@0.0.13` ビルトインプラグイン
   - `claude-code-20250219` beta ヘッダ
-- 代替検討: `claude -p` (Claude Code の headless mode) を subprocess で呼ぶ方式。ACP ではなく素朴な CLI fork であり、insomnia では採用しない
+- 代替検討: `claude -p` (Claude Code の headless mode) を subprocess で呼ぶ方式。ACP ではなく素朴な CLI fork であり、yoi では採用しない
 - https://code.claude.com/docs/en/legal-and-compliance
 - https://github.com/sst/opencode/pull/18186
 
 ### OpenAI (Codex CLI / Responses)
-- Codex CLI は Apache-2.0 で公開されている。insomnia の Codex OAuth 経路は、Codex CLI と同じ Responses 系 wire behavior に寄せる
+- Codex CLI は Apache-2.0 で公開されている。yoi の Codex OAuth 経路は、Codex CLI と同じ Responses 系 wire behavior に寄せる
 - Codex CLI の認証ストアと conversation header / request compression / SSE behavior を参考にする
 - OpenCode の `/connect` で ChatGPT ブラウザ認証が通る
 - コミュニティ評価: 「Anthropic は walled garden、OpenAI はむしろ取り込みに来た」
@@ -54,7 +54,7 @@
 - `claude --print` / `claude -p` は Claude Code の非対話（headless）モード。プロンプトを stdin/引数で受け stdout に返す
 - **ACP ではなく素朴な subprocess 呼び出し**
 - OpenClaw と OpenCode コミュニティフォーク (`griffinmartin/opencode-claude-auth`) が採用
-- insomnia では専用 API integration ではないため採用しない
+- yoi では専用 API integration ではないため採用しない
 
 ## Ollama の統合機構
 
@@ -177,7 +177,7 @@
 
 ## Capability 軸
 
-モデル/プロバイダごとの機能差を表現する軸。**プロバイダ側高次ツール (web_search / code_interpreter / computer_use / Live Search) は insomnia では使用しない方針**のため capability 軸から除外。
+モデル/プロバイダごとの機能差を表現する軸。**プロバイダ側高次ツール (web_search / code_interpreter / computer_use / Live Search) は yoi では使用しない方針**のため capability 軸から除外。
 
 ### 1. tool calling
 parallel tool calls 可否、tool_choice 対応度。DeepSeek reasoner のような「reasoner + tool 非対応」ケースあり。
@@ -221,7 +221,7 @@ parallel tool calls 可否、tool_choice 対応度。DeepSeek reasoner のよう
 
 → Gemini / Ollama `/v1` は scheme アダプタで「BlockStart → InputJson(全体 1 回) → BlockStop」の**擬似ストリーム化**で共通化可能。
 
-## insomnia での採用方針
+## yoi での採用方針
 
 ### 第一級サポート（専用アダプタ）
 - **Ollama API** — ローカル + `:cloud` サフィックスで透過的にクラウド中継。エンドポイントは `localhost:11434` で統一
@@ -239,4 +239,4 @@ parallel tool calls 可否、tool_choice 対応度。DeepSeek reasoner のよう
 ### 実装原則
 - 認証アダプタ（外部 CLI の認証ストアを読む類）は llm-worker 直下ではなく上位アダプタ層に配置。llm-worker は低レベル基盤に留める原則（project memory）と整合
 - モデル列挙は `auto_discover` と宣言型の両輪。Ollama は自動、ルーター系は宣言
-- `ollama launch insomnia` 対応を視野に入れ、env 注入 (`ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL` 等) で起動設定を受け入れる作り
+- `ollama launch yoi` 対応を視野に入れ、env 注入 (`ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL` 等) で起動設定を受け入れる作り

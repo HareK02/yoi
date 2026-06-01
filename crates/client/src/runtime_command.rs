@@ -3,7 +3,7 @@ use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 
-const POD_RUNTIME_COMMAND_ENV: &str = "INSOMNIA_POD_RUNTIME_COMMAND";
+const POD_RUNTIME_COMMAND_ENV: &str = "YOI_POD_RUNTIME_COMMAND";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PodRuntimeCommand {
@@ -29,9 +29,9 @@ impl PodRuntimeCommand {
 
     /// Resolve the Pod runtime command used for subprocess launches.
     ///
-    /// The default launch path is always the current `insomnia` executable plus
+    /// The default launch path is always the current `yoi` executable plus
     /// the unified `pod` prefix argument. During development, a non-empty
-    /// `INSOMNIA_POD_RUNTIME_COMMAND` value replaces only the executable path;
+    /// `YOI_POD_RUNTIME_COMMAND` value replaces only the executable path;
     /// the `pod` prefix is still added here and the env value is not parsed as a
     /// shell command.
     pub fn resolve() -> io::Result<Self> {
@@ -89,10 +89,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn insomnia_binary_defaults_to_pod_prefix() {
-        let command = PodRuntimeCommand::for_executable("/opt/insomnia/bin/insomnia");
+    fn yoi_binary_defaults_to_pod_prefix() {
+        let command = PodRuntimeCommand::for_executable("/opt/yoi/bin/yoi");
 
-        assert_eq!(command.program(), Path::new("/opt/insomnia/bin/insomnia"));
+        assert_eq!(command.program(), Path::new("/opt/yoi/bin/yoi"));
         assert_eq!(command.prefix_args(), [OsString::from("pod")]);
         assert_eq!(
             command.argv_with(["--pod", "agent"]),
@@ -105,12 +105,9 @@ mod tests {
 
     #[test]
     fn any_runtime_executable_gets_pod_prefix() {
-        let command = PodRuntimeCommand::for_executable("/opt/insomnia/bin/custom-runtime");
+        let command = PodRuntimeCommand::for_executable("/opt/yoi/bin/custom-runtime");
 
-        assert_eq!(
-            command.program(),
-            Path::new("/opt/insomnia/bin/custom-runtime")
-        );
+        assert_eq!(command.program(), Path::new("/opt/yoi/bin/custom-runtime"));
         assert_eq!(command.prefix_args(), [OsString::from("pod")]);
         assert_eq!(
             command.argv_with(["--pod", "agent"]),
@@ -124,38 +121,38 @@ mod tests {
     #[test]
     fn resolve_uses_current_exe_when_override_is_unset() {
         let command = PodRuntimeCommand::resolve_from_env_value(None, || {
-            Ok(PathBuf::from("/opt/insomnia/bin/insomnia"))
+            Ok(PathBuf::from("/opt/yoi/bin/yoi"))
         })
         .unwrap();
 
         assert_eq!(
             command,
-            PodRuntimeCommand::for_executable("/opt/insomnia/bin/insomnia")
+            PodRuntimeCommand::for_executable("/opt/yoi/bin/yoi")
         );
     }
 
     #[test]
     fn resolve_uses_current_exe_when_override_is_empty() {
         let command = PodRuntimeCommand::resolve_from_env_value(Some(OsString::new()), || {
-            Ok(PathBuf::from("/opt/insomnia/bin/insomnia"))
+            Ok(PathBuf::from("/opt/yoi/bin/yoi"))
         })
         .unwrap();
 
         assert_eq!(
             command,
-            PodRuntimeCommand::for_executable("/opt/insomnia/bin/insomnia")
+            PodRuntimeCommand::for_executable("/opt/yoi/bin/yoi")
         );
     }
 
     #[test]
     fn resolve_override_replaces_only_program_and_keeps_pod_prefix() {
         let command = PodRuntimeCommand::resolve_from_env_value(
-            Some(OsString::from("/tmp/rebuilt insomnia")),
+            Some(OsString::from("/tmp/rebuilt yoi")),
             || panic!("override must not inspect current_exe"),
         )
         .unwrap();
 
-        assert_eq!(command.program(), Path::new("/tmp/rebuilt insomnia"));
+        assert_eq!(command.program(), Path::new("/tmp/rebuilt yoi"));
         assert_eq!(command.prefix_args(), [OsString::from("pod")]);
         assert_eq!(
             command.argv_with(["--pod", "agent"]),

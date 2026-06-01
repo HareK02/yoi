@@ -1,6 +1,6 @@
 //! Workspace-local usage event log for memory / knowledge / workflow records.
 //!
-//! The log is append-only JSONL under the workspace's `.insomnia/` tree. It is
+//! The log is append-only JSONL under the workspace's `.yoi/` tree. It is
 //! intentionally evidence-only: aggregation reports explicit context reads and
 //! resident exposure cost telemetry, but it does not classify records as
 //! Knowledge candidates or tidy-protected records.

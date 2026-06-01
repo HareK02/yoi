@@ -12,7 +12,7 @@
 
 ## 責務
 
-- プロバイダ / モデルカタログの builtin (`resources/{providers,models}/builtin.toml`) と user override (`$XDG_CONFIG_HOME/insomnia/{providers,models}.toml`) の解決
+- プロバイダ / モデルカタログの builtin (`resources/{providers,models}/builtin.toml`) と user override (`$XDG_CONFIG_HOME/yoi/{providers,models}.toml`) の解決
 - `ModelManifest` の ref 形を `(provider, model_id)` に split し、`ModelConfig` へ展開
 - `AuthRef::SecretRef` / `AuthRef::ApiKey` を `ResolvedAuth::ApiKey` に解決（通常は local secret store、低レベル manifest では明示ファイルも可）
 - `AuthRef::None` / `AuthRef::CodexOAuth` の解決

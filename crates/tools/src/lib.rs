@@ -1,4 +1,4 @@
-//! Built-in tools for the Insomnia LLM agent.
+//! Built-in tools for the Yoi LLM agent.
 //!
 //! Implements Read / Write / Edit / Glob / Grep / Bash on top of the
 //! `llm-worker` `Tool` infrastructure. Filesystem access is mediated by

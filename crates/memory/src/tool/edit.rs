@@ -294,7 +294,7 @@ mod tests {
     fn setup() -> (TempDir, WorkspaceLayout, PathBuf) {
         let dir = TempDir::new().unwrap();
         let layout = WorkspaceLayout::new(dir.path().to_path_buf());
-        let path = dir.path().join(".insomnia/memory/decisions/foo.md");
+        let path = dir.path().join(".yoi/memory/decisions/foo.md");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let initial = format!(
             "---\ncreated_at: {n}\nupdated_at: {n}\nsources: []\nstatus: open\n---\nbody body\n",

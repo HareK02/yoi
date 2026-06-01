@@ -2,7 +2,7 @@
 
 ## 目的
 
-AI maintainer は、insomnia リポジトリの開発を継続的に進めるための orchestration role である。単発の `/auto-maintain` より広く、設計相談、work item 整理、実装委譲、レビュー、運用課題の記録、改善提案を一つの maintainer loop として扱う。
+AI maintainer は、yoi リポジトリの開発を継続的に進めるための orchestration role である。単発の `/auto-maintain` より広く、設計相談、work item 整理、実装委譲、レビュー、運用課題の記録、改善提案を一つの maintainer loop として扱う。
 
 `/auto-maintain` はこの設計の限定実行形であり、`tickets.sh` / `work-items/` から小さな実装作業を選んで実装・レビューを orchestration する Workflow に留まる。
 
@@ -16,7 +16,7 @@ AI maintainer は、insomnia リポジトリの開発を継続的に進めるた
 - `resolution.md` は close 時の完了記録
 - 時系列と状態遷移の最終根拠は git history
 - `docs/report/` は観測・所感・改善候補の記録であり、最新仕様の authority ではない
-- `.insomnia/memory` は個人/生成 state であり、project record の正本ではない
+- `.yoi/memory` は個人/生成 state であり、project record の正本ではない
 
 AI maintainer は project record を勝手に膨らませない。明確な実装単位は work item 化し、小粒な所見は `KNOWN_ISSUES.md`、ドッグフーディング上の障壁やツール問題は `docs/report/` に記録する。
 
@@ -44,7 +44,7 @@ Maintainer Pod は「便利だから」project record を書き換えない。�
 制約:
 
 - 指定 scope 外を編集しない
-- `.insomnia` や main workspace の control-plane record を勝手に編集しない
+- `.yoi` や main workspace の control-plane record を勝手に編集しない
 - work item / review / close は maintainer の責務として扱う
 - 実装報告には変更点、検証、未解決点を含める
 
@@ -185,8 +185,8 @@ AI maintainer は以下で人間に戻す。
 ## Reports / Knowledge / Memory
 
 - `docs/report/`: ドッグフーディングで感じた障壁、改善案、ツール問題の記録。明確な作業単位になったら work item 化する
-- `.insomnia/knowledge`: curated project knowledge。正本ではなく補助 context
-- `.insomnia/memory`: generated/personal state。project record の代替にしない
+- `.yoi/knowledge`: curated project knowledge。正本ではなく補助 context
+- `.yoi/memory`: generated/personal state。project record の代替にしない
 - `KNOWN_ISSUES.md`: ticket 化するほどではないが、次に近所を触る時に拾いたい小粒所見
 
 ## Future extension points

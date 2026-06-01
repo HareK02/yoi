@@ -155,7 +155,7 @@ pub struct SystemPromptContext<'a> {
     /// Not visible from the template; consumed by the trailing-section
     /// formatter in [`SystemPromptTemplate::render`].
     pub agents_md: Option<String>,
-    /// The body of `<workspace>/.insomnia/memory/summary.md`, with
+    /// The body of `<workspace>/.yoi/memory/summary.md`, with
     /// frontmatter stripped. `None` disables the resident summary section;
     /// empty strings are ignored by the trailing-section formatter.
     pub resident_summary: Option<&'a str>,
@@ -164,7 +164,7 @@ pub struct SystemPromptContext<'a> {
     /// section entirely (memory disabled, or a consolidation worker that opts
     /// out); `Some(&[])` also yields no section.
     pub resident_knowledge: Option<&'a [ResidentKnowledgeEntry]>,
-    /// Resident workflow descriptions from `<workspace>/.insomnia/workflow/*`
+    /// Resident workflow descriptions from `<workspace>/.yoi/workflow/*`
     /// whose frontmatter has `model_invokation: true`. `None` disables the
     /// section; consolidation workers opt out together with resident Knowledge.
     pub resident_workflows: Option<&'a [ResidentWorkflowEntry]>,
@@ -557,9 +557,9 @@ mod tests {
     }
 
     #[test]
-    fn instruction_default_resolves_to_insomnia_default() {
+    fn instruction_default_resolves_to_yoi_default() {
         let loader = PromptLoader::builtins_only();
-        let tmpl = SystemPromptTemplate::parse("$insomnia/default", loader).unwrap();
+        let tmpl = SystemPromptTemplate::parse("$yoi/default", loader).unwrap();
         let dir = TempDir::new().unwrap();
         let scope = build_scope(dir.path());
         let rendered = tmpl
@@ -582,7 +582,7 @@ mod tests {
     #[test]
     fn instruction_default_omits_memory_guidance_without_memory_tools() {
         let loader = PromptLoader::builtins_only();
-        let tmpl = SystemPromptTemplate::parse("$insomnia/default", loader).unwrap();
+        let tmpl = SystemPromptTemplate::parse("$yoi/default", loader).unwrap();
         let dir = TempDir::new().unwrap();
         let scope = build_scope(dir.path());
         let rendered = tmpl
@@ -608,7 +608,7 @@ mod tests {
     #[test]
     fn memory_guidance_names_only_available_memory_tools() {
         let loader = PromptLoader::builtins_only();
-        let tmpl = SystemPromptTemplate::parse("$insomnia/default", loader).unwrap();
+        let tmpl = SystemPromptTemplate::parse("$yoi/default", loader).unwrap();
         let dir = TempDir::new().unwrap();
         let scope = build_scope(dir.path());
         let rendered = tmpl
@@ -632,7 +632,7 @@ mod tests {
     #[test]
     fn pod_orchestration_guidance_is_included_for_pod_management_tools() {
         let loader = PromptLoader::builtins_only();
-        let tmpl = SystemPromptTemplate::parse("$insomnia/default", loader).unwrap();
+        let tmpl = SystemPromptTemplate::parse("$yoi/default", loader).unwrap();
         let dir = TempDir::new().unwrap();
         let scope = build_scope(dir.path());
         let rendered = tmpl
@@ -651,7 +651,7 @@ mod tests {
     #[test]
     fn pod_orchestration_guidance_is_omitted_without_pod_management_tools() {
         let loader = PromptLoader::builtins_only();
-        let tmpl = SystemPromptTemplate::parse("$insomnia/default", loader).unwrap();
+        let tmpl = SystemPromptTemplate::parse("$yoi/default", loader).unwrap();
         let dir = TempDir::new().unwrap();
         let scope = build_scope(dir.path());
         let rendered = tmpl
@@ -735,7 +735,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::fs::write(
             tmp.path().join("root.md"),
-            "U-ROOT\n{% include \"$insomnia/common/tool-usage\" %}",
+            "U-ROOT\n{% include \"$yoi/common/tool-usage\" %}",
         )
         .unwrap();
         let loader = PromptLoader::new(Some(tmp.path().to_path_buf()), None);
@@ -758,7 +758,7 @@ mod tests {
     #[test]
     fn prefix_with_missing_file_is_hard_error() {
         let loader = PromptLoader::builtins_only();
-        let err = SystemPromptTemplate::parse("$insomnia/definitely-missing", loader).unwrap_err();
+        let err = SystemPromptTemplate::parse("$yoi/definitely-missing", loader).unwrap_err();
         assert!(matches!(err, SystemPromptError::LoaderResolve(_)));
     }
 

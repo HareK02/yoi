@@ -42,7 +42,7 @@ impl std::fmt::Display for PickerError {
             Self::Store(e) => write!(f, "session store error: {e}"),
             Self::NoPods => write!(
                 f,
-                "no pods found — start a fresh pod with `insomnia` and try again"
+                "no pods found — start a fresh pod with `yoi` and try again"
             ),
         }
     }
@@ -169,7 +169,7 @@ fn default_store_dir() -> Result<PathBuf, PickerError> {
         PickerError::Io(io::Error::new(
             io::ErrorKind::NotFound,
             "could not resolve sessions directory \
-             (set INSOMNIA_HOME, INSOMNIA_DATA_DIR, or HOME)",
+             (set YOI_HOME, YOI_DATA_DIR, or HOME)",
         ))
     })
 }
@@ -181,7 +181,7 @@ fn default_pod_store_dir() -> Result<PathBuf, PickerError> {
             PickerError::Io(io::Error::new(
                 io::ErrorKind::NotFound,
                 "could not resolve pod state directory \
-             (set INSOMNIA_HOME, INSOMNIA_DATA_DIR, or HOME)",
+             (set YOI_HOME, YOI_DATA_DIR, or HOME)",
             ))
         })
 }

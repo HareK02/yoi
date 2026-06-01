@@ -3,13 +3,13 @@
 //! Skills follow the [agentskills.io](https://agentskills.io/specification)
 //! spec: a directory `<root>/<name>/` containing `SKILL.md` (YAML frontmatter
 //! + Markdown body) and optional `scripts/` / `references/` / `assets/`
-//! subdirectories. The body is procedural agent guidance; insomnia ingests
+//! subdirectories. The body is procedural agent guidance; yoi ingests
 //! it as a Workflow so `/<name>` resolves to it just like an internal
 //! Workflow.
 //!
 //! Parsing is intentionally lenient at the directory-scan level — one
 //! malformed SKILL.md emits `tracing::warn!` and is skipped, leaving sibling
-//! skills loadable. Internal Workflows (`.insomnia/workflow/<slug>.md`) keep
+//! skills loadable. Internal Workflows (`.yoi/workflow/<slug>.md`) keep
 //! their hard-error semantics.
 
 use std::io;
@@ -30,7 +30,7 @@ pub const SKILL_FILENAME: &str = "SKILL.md";
 /// SKILL.md frontmatter as defined by the agent-skills spec.
 ///
 /// Fields beyond `name` / `description` are accepted to be spec-compatible
-/// but not used by insomnia today: `license`, `compatibility`, and
+/// but not used by yoi today: `license`, `compatibility`, and
 /// `metadata` are documentary, while `allowed-tools` is recognised and
 /// emits a warning until [`permission-extension-point.md`] lands.
 #[derive(Debug, Clone, Deserialize)]

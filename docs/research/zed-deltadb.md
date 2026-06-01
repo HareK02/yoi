@@ -84,7 +84,7 @@ LLM／AI エージェント時代のコーディングで、Git の粒度が粗�
 - **永続的位置参照**: Tree-sitter ベースの semantic anchor、Sourcegraph の SCIP、`git-blame` の line tracking。DeltaDB は CRDT identity を使うため理論的にこれらより堅牢な anchor を提供できる。
 - **AI エージェント協働基盤**: OpenAI の "evolving spec" 議論、Anthropic の Computer Use 系、各社の MCP。DeltaDB は「エージェント↔コード↔人間の対話」を VCS 層で受ける狙い。
 
-## 8. 自プロジェクト（insomnia）への含意メモ
+## 8. 自プロジェクト（yoi）への含意メモ
 
 参考材料として残す（採用の可否ではない）。
 

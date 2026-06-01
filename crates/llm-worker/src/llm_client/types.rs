@@ -1,6 +1,6 @@
 //! LLM Client Common Types
 //!
-//! Core conversation types for insomnia's LLM interaction model.
+//! Core conversation types for yoi's LLM interaction model.
 //! The core abstraction is `Item` which represents different types of conversation elements:
 //! - Message items (user/assistant messages with content parts)
 //! - ToolCall items (tool invocations)

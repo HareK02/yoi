@@ -1,4 +1,4 @@
-# Insomnia アーキテクチャ
+# Yoi アーキテクチャ
 
 ## プロジェクトの目的
 
@@ -12,7 +12,7 @@
 
 ### 宣言した層が解決する
 
-ある層が構成を宣言として受け取ったなら、その解決もその層の責務。マニフェストに `[model] ref = "anthropic/claude-sonnet-4-6"`（あるいは `scheme = "anthropic"` + `model_id = ...` の inline 形式）と書いた以上、`ModelManifest` → `LlmClient` の変換は insomnia 側（`crates/provider`）が行う。逆に llm-worker が `LlmClient` trait だけを受け取るのは正しい — llm-worker はプロバイダの選択を宣言として受け取っていないから。
+ある層が構成を宣言として受け取ったなら、その解決もその層の責務。マニフェストに `[model] ref = "anthropic/claude-sonnet-4-6"`（あるいは `scheme = "anthropic"` + `model_id = ...` の inline 形式）と書いた以上、`ModelManifest` → `LlmClient` の変換は yoi 側（`crates/provider`）が行う。逆に llm-worker が `LlmClient` trait だけを受け取るのは正しい — llm-worker はプロバイダの選択を宣言として受け取っていないから。
 
 ### 概念の追加は不在が問題になってから
 
@@ -20,7 +20,7 @@
 
 ### 最小の構造化で最大の自由度
 
-insomnia は環境再現・コンテナ管理・VCS 統合などを自身の責務としない。Pod が動くホストの fs 上で活動する主体を提供し、それにコンテキストを与えてスポーンさせられる仕組みを付与する。構築する環境はユーザー次第。
+yoi は環境再現・コンテナ管理・VCS 統合などを自身の責務としない。Pod が動くホストの fs 上で活動する主体を提供し、それにコンテキストを与えてスポーンさせられる仕組みを付与する。構築する環境はユーザー次第。
 
 ## Pod
 
@@ -88,7 +88,7 @@ name = "agent"
 ref = "anthropic/claude-sonnet-4-6"
 
 [worker]
-instruction = "$insomnia/default"
+instruction = "$yoi/default"
 max_tokens = 4096
 temperature = 0.3
 
@@ -103,7 +103,7 @@ permission = "write"
 
 通常の Pod 起動は Lua profile discovery/default から `PodManifest` を生成する。bundled `builtin:default` が fallback default で、user/project `profiles.toml` は profile registry と default selection だけを担う。user/project `manifest.toml` の ambient cascade は通常起動では使わない。
 
-`insomnia pod --manifest <PATH>` は explicit one-file compatibility/debug input で、指定 TOML 1 枚だけに builtin defaults を merge し、`PodManifestConfig -> PodManifest` の required validation を通す。
+`yoi pod --manifest <PATH>` は explicit one-file compatibility/debug input で、指定 TOML 1 枚だけに builtin defaults を merge し、`PodManifestConfig -> PodManifest` の required validation を通す。
 
 `PodFactory` の user/project/overlay API は低レベル構成部品として残るが、CLI の通常起動 path では generic TOML overlay を公開しない。
 
@@ -111,11 +111,11 @@ permission = "write"
 
 `worker.instruction` はファイル参照。3 層の prefix addressing でプロンプト資産を解決:
 
-- `$insomnia/...` — バイナリ同梱（`resources/prompts/`、`include_dir!` で埋め込み）
+- `$yoi/...` — バイナリ同梱（`resources/prompts/`、`include_dir!` で埋め込み）
 - `$user/...` — `<config_dir>/prompts/`（`manifest::paths` で解決）
-- `$workspace/...` — `<project>/.insomnia/prompts/`
+- `$workspace/...` — `<project>/.yoi/prompts/`
 
-テンプレートは minijinja で評価。`{% include "$insomnia/common/tool-usage" %}` のようにプロンプト間で参照可能（prefix なしの include は現在のファイルからの相対解決）。
+テンプレートは minijinja で評価。`{% include "$yoi/common/tool-usage" %}` のようにプロンプト間で参照可能（prefix なしの include は現在のファイルからの相対解決）。
 
 レンダリング結果の末尾に scope summary と AGENTS.md（あれば）がコード側で固定付加される。ユーザーテンプレートからはこれらに触れない。
 

@@ -2,7 +2,7 @@
 
 ## Context
 
-INSOMNIA が利用する LLM プロバイダとその認証方式を決める。従量 API 課金の心理的負担を避け、定額サブスク枠（ChatGPT Codex / Ollama Cloud）を活かせる構成にする。
+Yoi が利用する LLM プロバイダとその認証方式を決める。従量 API 課金の心理的負担を避け、定額サブスク枠（ChatGPT Codex / Ollama Cloud）を活かせる構成にする。
 
 詳細な現状調査は `docs/ref/llm-provider-landscape.md` と `docs/ref/llm-pricing-2026-04.md` を参照。
 
@@ -46,13 +46,13 @@ Ollama は独自 scheme を作らず `scheme/anthropic` を base_url 差し替�
 - 認証ストアを読むアダプタ（`~/.codex/auth.json` 等）は **llm-worker 直下に置かず上位層に配置**。llm-worker は低レベル基盤に留める方針（`feedback_llm_worker_scope.md`）と整合
 - モデル列挙は **auto_discover と宣言型の両輪**。Ollama は `/api/tags` で自動、OpenAI 互換枠はモデルカタログ（`resources/models/builtin.toml` + `<config_dir>/models.toml` の user override、`<config_dir>` は `manifest::paths` で解決）で宣言
 - UI のプロバイダ選択肢も第一級 → 二次の優先順位で並べる
-- **`ollama launch insomnia` 対応を視野に**、env 注入（`ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL` 等）で起動設定を受け入れる作り
+- **`ollama launch yoi` 対応を視野に**、env 注入（`ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL` 等）で起動設定を受け入れる作り
 
 ## 機能方針
 
 ### プロバイダ側の高次ツールは使用しない
 
-`web_search` / `code_interpreter` / `computer_use` / Live Search 等はプロバイダ依存を避けるため不採用。insomnia の自前 Tool 層で統一。fallback や routing もワーカー側で管理するため OpenRouter の `transforms` / `provider routing` も使わない。
+`web_search` / `code_interpreter` / `computer_use` / Live Search 等はプロバイダ依存を避けるため不採用。yoi の自前 Tool 層で統一。fallback や routing もワーカー側で管理するため OpenRouter の `transforms` / `provider routing` も使わない。
 
 ### 必須 capability
 

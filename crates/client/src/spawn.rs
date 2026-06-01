@@ -1,9 +1,9 @@
-//! Pod runtime command をサブプロセスとして立ち上げ、`INSOMNIA-READY` を待つ
+//! Pod runtime command をサブプロセスとして立ち上げ、`YOI-READY` を待つ
 //! ハンドシェイク。
 //!
 //! - 親プロセス (TUI / GUI / E2E) は profile/default/typed restore flags を
 //!   指定してこの関数に渡す。pod はそれを受けて socket を bind し、stderr に
-//!   `INSOMNIA-READY\t<name>\t<socket>` を吐く。
+//!   `YOI-READY\t<name>\t<socket>` を吐く。
 //! - 待機中の stderr 行は `progress` コールバック越しに呼び出し側へ流す。
 //!   UI の進捗表示や E2E のログ収集はここで賄う。
 //! - `kill_on_drop = false` + `process_group(0)` により、親プロセス
@@ -19,7 +19,7 @@ use crate::PodRuntimeCommand;
 use tokio::process::Command;
 use uuid::Uuid;
 
-const READY_PREFIX: &str = "INSOMNIA-READY\t";
+const READY_PREFIX: &str = "YOI-READY\t";
 const READY_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// `spawn_pod` の入力。
@@ -69,7 +69,7 @@ impl std::fmt::Display for SpawnError {
             Self::Io(e) => write!(f, "io error: {e}"),
             Self::RuntimeDirUnavailable => write!(
                 f,
-                "could not resolve runtime directory (set INSOMNIA_HOME, INSOMNIA_RUNTIME_DIR, XDG_RUNTIME_DIR, or HOME)"
+                "could not resolve runtime directory (set YOI_HOME, YOI_RUNTIME_DIR, XDG_RUNTIME_DIR, or HOME)"
             ),
             Self::PodLaunchFailed { command, source } => write!(
                 f,
@@ -106,7 +106,7 @@ impl From<io::Error> for SpawnError {
     }
 }
 
-/// pod を spawn し、`INSOMNIA-READY` ハンドシェイクが終わるまで待つ。
+/// pod を spawn し、`YOI-READY` ハンドシェイクが終わるまで待つ。
 ///
 /// `progress` は ready 行を見つけるまでに観測した stderr の各行で呼ばれる
 /// (ready 行自体は除外される)。UI の表示更新や E2E ログ取得に使う。

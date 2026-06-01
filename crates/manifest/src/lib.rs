@@ -256,7 +256,7 @@ pub struct PodMeta {
 pub struct WorkerManifest {
     /// Reference to the instruction prompt asset used as the body of
     /// the worker's system prompt. Uses the `PromptLoader` prefix
-    /// addressing scheme (`$insomnia/...`, `$user/...`,
+    /// addressing scheme (`$yoi/...`, `$user/...`,
     /// `$workspace/...`) and is always populated after resolution —
     /// unset manifests fall through to [`defaults::DEFAULT_INSTRUCTION`].
     #[serde(default = "default_instruction")]

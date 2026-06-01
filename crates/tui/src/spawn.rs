@@ -1,11 +1,11 @@
 //! Inline-viewport "spawn Pod and attach" UX.
 //!
-//! Rendered at the user's current cursor position when `insomnia` is invoked
-//! with no positional argument. Discovers `.insomnia/profiles.toml` profile
+//! Rendered at the user's current cursor position when `yoi` is invoked
+//! with no positional argument. Discovers `.yoi/profiles.toml` profile
 //! choices plus bundled profiles, defaults to the builtin profile, prompts for
 //! the Pod's name, and on confirmation launches the Pod runtime command as an
 //! independent process. Once the process reports its socket via the
-//! `INSOMNIA-READY` stderr line, the dialog hands control back so main can
+//! `YOI-READY` stderr line, the dialog hands control back so main can
 //! switch the terminal to alternate-screen mode.
 //!
 //! The viewport's last frame stays in the terminal's scrollback so the
@@ -654,10 +654,10 @@ mod tests {
     fn profile_choices_use_project_registry_default() {
         let temp = tempfile::tempdir().unwrap();
         let project = temp.path().join("project");
-        let insomnia = project.join(".insomnia");
-        std::fs::create_dir_all(&insomnia).unwrap();
+        let yoi = project.join(".yoi");
+        std::fs::create_dir_all(&yoi).unwrap();
         std::fs::write(
-            insomnia.join("profiles.toml"),
+            yoi.join("profiles.toml"),
             r#"
 default = "coder"
 [profile]
@@ -678,10 +678,10 @@ coder = "profiles/coder.lua"
     fn profile_choices_include_builtin_and_project_default_marker() {
         let temp = tempfile::tempdir().unwrap();
         let project = temp.path().join("project");
-        let insomnia = project.join(".insomnia");
-        std::fs::create_dir_all(&insomnia).unwrap();
+        let yoi = project.join(".yoi");
+        std::fs::create_dir_all(&yoi).unwrap();
         std::fs::write(
-            insomnia.join("profiles.toml"),
+            yoi.join("profiles.toml"),
             r#"
 default = "coder"
 [profile.coder]
@@ -695,7 +695,7 @@ description = "Project coder"
         assert_eq!(choices[0].selector.as_deref(), Some("builtin:default"));
         assert_eq!(
             choices[0].label,
-            "builtin:default — Bundled default Insomnia coding profile"
+            "builtin:default — Bundled default Yoi coding profile"
         );
         assert_eq!(default_index, 1);
         assert_eq!(choices[1].selector.as_deref(), Some("project:coder"));

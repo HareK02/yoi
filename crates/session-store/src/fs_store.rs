@@ -9,7 +9,7 @@
 //!
 //! Migration: this layout is incompatible with the pre-`session-grouping`
 //! flat `{root}/{segment_id}.jsonl` form. Project policy is no
-//! backward compatibility — discard `~/.insomnia/sessions/` (or whatever
+//! backward compatibility — discard `~/.yoi/sessions/` (or whatever
 //! `root` resolved to) before running the new code. `list_sessions`
 //! ignores top-level files outside session directories, so leftover
 //! flat files do not corrupt new sessions, but they are no longer

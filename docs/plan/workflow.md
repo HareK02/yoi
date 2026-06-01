@@ -24,8 +24,8 @@ Workflow は制約付きの強制的な作業フロー。`/<slug>` で明示的�
 
 ### 格納先とファイル形式
 
-- `.insomnia/workflow/<slug>.md`（ファイル名 = slug がそのまま識別子、`name` field は持たない）
-- `.insomnia/memory/` は session-derived state 専用、Workflow は配置しない
+- `.yoi/workflow/<slug>.md`（ファイル名 = slug がそのまま識別子、`name` field は持たない）
+- `.yoi/memory/` は session-derived state 専用、Workflow は配置しない
 - frontmatter + Markdown 本文
 - frontmatter フィールド: `description`, `auto_invoke`, `user_invocable`, `requires`
 

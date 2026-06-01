@@ -1,6 +1,6 @@
 # エージェント向けメモリ機構の外部事例
 
-調査日: 2026-04-21。本ドキュメントはユーザー依頼の3ソース（OpenAI Codex Chronicle / Shann³ の "AI Knowledge Layer" スレッド / Nous Research Hermes Agent）を中心に、直近で公開されたメモリ機構をまとめ、insomnia に入れる際の比較材料とすることを目的とする。2026年前半は各所からメモリ実装が同時多発的に登場しているので、「どの事例がどのレイヤを担っているか」を見失わないよう、各節で**何を記憶するか／いつ書くか／どう引き出すか／何に保存するか**を揃えて整理する。
+調査日: 2026-04-21。本ドキュメントはユーザー依頼の3ソース（OpenAI Codex Chronicle / Shann³ の "AI Knowledge Layer" スレッド / Nous Research Hermes Agent）を中心に、直近で公開されたメモリ機構をまとめ、yoi に入れる際の比較材料とすることを目的とする。2026年前半は各所からメモリ実装が同時多発的に登場しているので、「どの事例がどのレイヤを担っているか」を見失わないよう、各節で**何を記憶するか／いつ書くか／どう引き出すか／何に保存するか**を揃えて整理する。
 
 数値・URLは一次ソースで再確認すること。挙動は研究プレビュー段階のものが多く、変わる前提で読む。
 
@@ -25,7 +25,7 @@ Codex CLI に 2026-03 頃から追加された "Memories" 機能と、2026-04-15
 - 生成タイミングは「スレッドが十分アイドルになってから」（age + idle window で判定）
 - `memory_summary.md` が **5,000 tokens cap** で system prompt に注入される（`MEMORY_TOOL_DEVELOPER_INSTRUCTIONS_SUMMARY_TOKEN_LIMIT`）
 
-**非対称の肝**: 抽出 (extract) は structured output で分類を強制、統合 (consolidation) は sub-agent に自由書き込みさせる。分類ブレを extract で封じ、統合の柔軟性は consolidation の agentic 判断に委ねる、という役割分担。insomnia の extract / consolidation 設計の直接の元ネタ。
+**非対称の肝**: 抽出 (extract) は structured output で分類を強制、統合 (consolidation) は sub-agent に自由書き込みさせる。分類ブレを extract で封じ、統合の柔軟性は consolidation の agentic 判断に委ねる、という役割分担。yoi の extract / consolidation 設計の直接の元ネタ。
 
 ### 保存場所 / 形式
 
@@ -66,7 +66,7 @@ Codex CLI に 2026-03 頃から追加された "Memories" 機能と、2026-04-15
 
 ## 2. Shann³ "AI Knowledge Layer"
 
-https://x.com/shannholmberg/status/2044111115878326444 で提唱している、**エージェントより先に読ませる知識層**という枠組み。エンジニア向けというよりマーケター / コンテンツ運用者向けだが、構造はかなり insomnia に転用しやすい。
+https://x.com/shannholmberg/status/2044111115878326444 で提唱している、**エージェントより先に読ませる知識層**という枠組み。エンジニア向けというよりマーケター / コンテンツ運用者向けだが、構造はかなり yoi に転用しやすい。
 
 ### 2 層構造
 
@@ -128,7 +128,7 @@ MindStudio の比較記事が要点をまとめている。
 
 ### 設計上の示唆
 
-- **可変 KBL と不変 BF の分離**が強い。insomnia なら前者が Chronicle 的な自動メモリ、後者が `AGENTS.md` / 人間のガイド。
+- **可変 KBL と不変 BF の分離**が強い。yoi なら前者が Chronicle 的な自動メモリ、後者が `AGENTS.md` / 人間のガイド。
 - **retrieval を埋め込みではなく決定論的 wikilink でやる**アプローチは、少量ドメインで意外と強い。
 - エージェントに書かせる `log.md` と `index.md` の append-only 運用は、後で diff / git で検証しやすい。
 
@@ -163,7 +163,7 @@ Self-improving agent を名乗るフレーム。メモリ周りは **3 層 + ク
   > Review the conversation above and consider saving or updating a skill if appropriate.
   > Focus on: was a non-trivial approach used to complete a task that required trial and error...
   > **If nothing is worth saving, just say 'Nothing to save.' and stop.**
-- 末尾の "Nothing to save." 指示が肝。頻繁発火でも中身ゼロの場合は NOP で抜ける設計。insomnia extract の「空配列許容」の直接ソース
+- 末尾の "Nothing to save." 指示が肝。頻繁発火でも中身ゼロの場合は NOP で抜ける設計。yoi extract の「空配列許容」の直接ソース
 
 ### 書き込み機構
 
@@ -180,7 +180,7 @@ Self-improving agent を名乗るフレーム。メモリ周りは **3 層 + ク
 
 ### 設計上の示唆
 
-- **"skill"＝ procedural memory として episodic / semantic から分離する**のは insomnia にとっても綺麗。Claude Code の skill と接続できる余地がある。
+- **"skill"＝ procedural memory として episodic / semantic から分離する**のは yoi にとっても綺麗。Claude Code の skill と接続できる余地がある。
 - **FTS5 + LLM 要約ハイブリッド**で、ベクタを入れずにそこそこ回せる事例として参考価値が高い（少量ドメインなら LLM Wiki 論と同じ示唆）。
 - **Honcho 的 user model** を semantic profile として固定注入する運用は、Codex の memory summary と形式的に同じ。
 
@@ -228,7 +228,7 @@ Self-improving agent を名乗るフレーム。メモリ周りは **3 層 + ク
 
 ### OpenClaw
 
-Peter Steinberger が 2025-11 に出したメッセージングファースト agent。2026-02 に本人は OpenAI 入社、プロジェクトは foundation へ移譲。Hermes Agent の `hermes claw migrate` はここからの移行導線。設計は **Markdown ファイルのみに全状態を持つ**という極端な透明性志向で、insomnia の「ファイル + git」方針との親和性が最も高い。
+Peter Steinberger が 2025-11 に出したメッセージングファースト agent。2026-02 に本人は OpenAI 入社、プロジェクトは foundation へ移譲。Hermes Agent の `hermes claw migrate` はここからの移行導線。設計は **Markdown ファイルのみに全状態を持つ**という極端な透明性志向で、yoi の「ファイル + git」方針との親和性が最も高い。
 
 Agent Workspace（`~/.openclaw/workspace/`）構成:
 
@@ -263,7 +263,7 @@ Agent Workspace（`~/.openclaw/workspace/`）構成:
 - **Lock**: `memory/.dreams/short-term-promotion.lock` を `wx` フラグで exclusive create、60s stale 検出 + 10s wait timeout、in-process の Map も併用
 - **モデルが "覚えている" のはディスクに書かれた内容だけ**、という明示ポリシー。隠れた state 無し
 
-**insomnia にとって重要**: consolidation を LLM 依存から切り離せる見本。narrative は subagent が生成するが、promotion の判断は純機械（scoring）。insomnia の plan では Scope 外（consolidation は当面 agent 委任）だが、成熟したカテゴリから決定論的 promotion に差し替える upgrade path の参考になる。
+**yoi にとって重要**: consolidation を LLM 依存から切り離せる見本。narrative は subagent が生成するが、promotion の判断は純機械（scoring）。yoi の plan では Scope 外（consolidation は当面 agent 委任）だが、成熟したカテゴリから決定論的 promotion に差し替える upgrade path の参考になる。
 
 **GC 観点の追加詳細**（`extensions/memory-core/src/short-term-promotion.ts:1518-1652` 実装より）:
 
@@ -278,7 +278,7 @@ OpenClaw は「**削除は人間、script は append と退避まで**」とい�
 
 設計上の示唆:
 
-- Workspace = git リポジトリ 1 本で完結、配置もフラット。insomnia の pod workspace 概念にそのまま借用できる。
+- Workspace = git リポジトリ 1 本で完結、配置もフラット。yoi の pod workspace 概念にそのまま借用できる。
 - 秘密は workspace **外**の `~/.openclaw/` 側（auth / credentials / session transcripts / managed skills）に退避する分離設計は、pod sandbox 境界を越えない運用の手本になる。
 - `memory/YYYY-MM-DD.md` の日次切り分け + 「当日+前日のみ load」は、時系列の自然減衰を Markdown で素直に表現できる良い pattern。
 
@@ -298,7 +298,7 @@ OpenClaw は「**削除は人間、script は append と退避まで**」とい�
 
 ## 5. Agent Skills 標準（procedural memory の実装単位）
 
-Hermes / OpenClaw / Claude Code / OpenAI Codex / Cursor / GitHub Copilot 等が揃って採用している **`agentskills.io` オープン標準**。Anthropic が 2025-12 に発表し、2026-03 時点で事実上の共通フォーマットになっている。memory 設計の「手続き的記憶 (procedural memory)」のほぼ全てがこの単位で流通するので、insomnia でも独自フォーマットを避けて素直にこれに乗るのが合理的。
+Hermes / OpenClaw / Claude Code / OpenAI Codex / Cursor / GitHub Copilot 等が揃って採用している **`agentskills.io` オープン標準**。Anthropic が 2025-12 に発表し、2026-03 時点で事実上の共通フォーマットになっている。memory 設計の「手続き的記憶 (procedural memory)」のほぼ全てがこの単位で流通するので、yoi でも独自フォーマットを避けて素直にこれに乗るのが合理的。
 
 ### SKILL.md の最小仕様
 
@@ -365,7 +365,7 @@ enterprise (managed) > personal (~/.claude/skills/) > project (.claude/skills/) 
 
 Skill content のライフサイクルは重要で、**一度発動すると rendered 内容が会話に単一メッセージとして入り、以後再読み込みされない**。auto-compaction 時は各 skill の直近 invocation だけが冒頭 5,000 tokens 維持され、全 skill 合算 25,000 tokens の予算内で新しい順に残す。つまり「skill の本体は session 中ずっと context に居座る」前提で書く必要がある。
 
-### insomnia への示唆
+### yoi への示唆
 
 - **procedural memory は SKILL.md で表現**する。`.claude/skills/` に人間手入れの skill を置き、エージェントが自動生成する手続きは別ディレクトリ（例: `memory/skills/`）で分離、混ざらないようにする。BF/KBL 分離の原則に一致。
 - **`paths:` によるスコープ絞り**は、前回議論した「Pod の所属スコープ = ディレクトリ階層」と自然に噛む。`paths: ["crates/protocol/**"]` の skill は protocol スコープの pod でだけ発動、という運用が素直にできる。
@@ -382,7 +382,7 @@ Skill content のライフサイクルは重要で、**一度発動すると ren
 
 ## 6. プロンプト・スキルの継続的チューニング (empirical prompt tuning pattern)
 
-メモリや skill の**中身を腐らせない**側の話。公開されている prompt tuning pattern として、agent-facing な指示を新規 subagent に実行させ、実行者の自己申告と指示側メトリクスを突き合わせて反復改善する方法がある。insomnia のように skill を蓄積する設計では、**書いた直後に客観的に試す**仕組みが無いと品質が崩れていく。ここへの素直な当てはめ材料として記録。
+メモリや skill の**中身を腐らせない**側の話。公開されている prompt tuning pattern として、agent-facing な指示を新規 subagent に実行させ、実行者の自己申告と指示側メトリクスを突き合わせて反復改善する方法がある。yoi のように skill を蓄積する設計では、**書いた直後に客観的に試す**仕組みが無いと品質が崩れていく。ここへの素直な当てはめ材料として記録。
 
 ### 基本思想
 
@@ -425,12 +425,12 @@ Claude Code の Task tool 戻り値から:
 
 > 毎回**新規** AI を dispatch すること。同じセッション再利用は前回の指摘を学習してしまい、指標が腐る。
 
-### insomnia への示唆
+### yoi への示唆
 
-- **skill や lessons を新規追加した直後に、同じ insomnia ハーネス内の別 pod で実行して評価**する自動フロー（"skill doctor" 的な存在）を作れる。これは insomnia が pod factory を持っている点と相性がいい。
+- **skill や lessons を新規追加した直後に、同じ yoi ハーネス内の別 pod で実行して評価**する自動フロー（"skill doctor" 的な存在）を作れる。これは yoi が pod factory を持っている点と相性がいい。
 - 失敗ログを書いた後、「同じ失敗が再現しないか」を新規 pod で試走する検証ステップが、構造的に**メモリ整備の一部**に組み込める。skill 化しない失敗ログでも有効。
 - 評価指標を自前で定義しておくと、後で他人（or 未来の自分）が skill を更新した時に腐敗検知できる。
-- 実体は skill 自身として配布されている例がある。insomnia のメンテ用 skill セットのテンプレにも応用できる。
+- 実体は skill 自身として配布されている例がある。yoi のメンテ用 skill セットのテンプレにも応用できる。
 
 一次ソースは公開 sanitize branch では省略する。
 
@@ -450,19 +450,19 @@ Claude Code の Task tool 戻り値から:
 | ユーザー編集性 | 不可視 / 読取のみ / 手編集前提 |
 | スコープ | per-user / per-project / shared across agents |
 
-insomnia で意思決定すべきポイントはこの対応表：
+yoi で意思決定すべきポイントはこの対応表：
 
 - **Pod / Agent の「skill」概念を Hermes 風に明示すべきか**。現状の controller.rs には "sub-agent spawn" はあるが、skill を書き出して再利用する仕組みは無い。
-- **Codex Chronicle 風の "consolidation モデルを別途設定" 構成**は、insomnia の llm provider policy（Ollama / Codex OAuth / Anthropic）と相性が良い。軽量 extract と重い consolidation を別プロバイダに張れる。
+- **Codex Chronicle 風の "consolidation モデルを別途設定" 構成**は、yoi の llm provider policy（Ollama / Codex OAuth / Anthropic）と相性が良い。軽量 extract と重い consolidation を別プロバイダに張れる。
 - **LLM Wiki パターンを採用する場合**、既に `docs/` と `tickets/` が Markdown + git で運用されているので、`memory/` ディレクトリを足して Git で可観測にしておくのが自然。RAG やベクトル化より先に、wikilink / index.md / log.md で足りるか見極めるべき。
 - **storage 層**: SQLite は既存 crate 構成にもフィット。Cloudflare Agent Memory / Codex の SQLite + 最終 Markdown の 2 段は移植しやすい。
-- **prompt injection 対策**: Chronicle が注意書きしている通り、観測チャンネルを増やすと攻撃面が広がる。insomnia では pod の sandbox 境界とメモリ生成を同じ境界で括る必要がある。
+- **prompt injection 対策**: Chronicle が注意書きしている通り、観測チャンネルを増やすと攻撃面が広がる。yoi では pod の sandbox 境界とメモリ生成を同じ境界で括る必要がある。
 
 ---
 
 ## 8. GC 機構の横断比較
 
-`docs/plan/memory.md` §GC は「consolidation とは別経路で memory を再評価し、drop / merge / split / `replaced` chain 整理を行う」ことを決めた段階で、判断主体と処理種別の仕様をこれから詰める。本節は他プロジェクトの GC 設計を共通の 6 軸で並べて、insomnia で採るべき型の材料とする。
+`docs/plan/memory.md` §GC は「consolidation とは別経路で memory を再評価し、drop / merge / split / `replaced` chain 整理を行う」ことを決めた段階で、判断主体と処理種別の仕様をこれから詰める。本節は他プロジェクトの GC 設計を共通の 6 軸で並べて、yoi で採るべき型の材料とする。
 
 ### 8.1 比較表
 
@@ -499,7 +499,7 @@ insomnia で意思決定すべきポイントはこの対応表：
 3. **cron / scheduled sweep**（OpenClaw dreaming default `0 3 * * *`, Codex extension retention）: 定期的・予測可能。人間 review との組み合わせがしやすい。
 4. **ingest 時の即時**（Cloudflare supersession）: 書き込みの tx 内で完結、後続 GC 走査が要らない。topic key 設計が前提。
 
-insomnia の plan は (2) consolidation で rewrite 許可を置きつつ、GC は (3) 方向で別経路という構造。これは Codex / OpenClaw の両方と整合する。
+yoi の plan は (2) consolidation で rewrite 許可を置きつつ、GC は (3) 方向で別経路という構造。これは Codex / OpenClaw の両方と整合する。
 
 **判断主体の 3 系統**:
 
@@ -507,13 +507,13 @@ insomnia の plan は (2) consolidation で rewrite 許可を置きつつ、GC �
 - **決定論 scoring → 閾値 gate → 機械適用**: OpenClaw Deep promotion。LLM の揺れを除き、コストも LLM コールゼロ。ただし対象が append 側のみで、削除には使われていない。
 - **LLM agentic**: Codex consolidation / Hermes review / Letta sleep-time。判断の柔軟性（block 内部分削除、context 依存の merge）を LLM に委ねる。
 
-`docs/plan/memory.md` は consolidation が LLM agentic、GC も暫定的に **LLM agentic + Linter Warn 併用**としている。完全に一致する事例は **Codex consolidation の consolidation prompt**（836 行）で、「removed thread id を `MEMORY.md` から部分削除し、blockに他の thread が残っている場合は split / rewrite して保持」という手続きを自然言語で指示している。**insomnia は Linter 側に警告カテゴリ（類似 slug / `replaced` 滞留 / sources 過多 / stale）を先に定義し、GC 実行の agent プロンプトはそれを入力にする**構造が素直。
+`docs/plan/memory.md` は consolidation が LLM agentic、GC も暫定的に **LLM agentic + Linter Warn 併用**としている。完全に一致する事例は **Codex consolidation の consolidation prompt**（836 行）で、「removed thread id を `MEMORY.md` から部分削除し、blockに他の thread が残っている場合は split / rewrite して保持」という手続きを自然言語で指示している。**yoi は Linter 側に警告カテゴリ（類似 slug / `replaced` 滞留 / sources 過多 / stale）を先に定義し、GC 実行の agent プロンプトはそれを入力にする**構造が素直。
 
 **処理種別の選択肢**:
 
 - `drop / merge / split / rewrite` の組み合わせは Codex consolidation が最も自由度高く、Hermes もそれに近い（entry 粒度）。
-- `replaced` chain の整理は **Cloudflare だけが自動で版チェーン維持**、他は LLM 任せ。insomnia は decision record に `replaced_by` を入れているので、Cloudflare 方式の forward pointer 概念を **人間可読な `replaced_by:` frontmatter** で既に踏襲している。GC 時に chain をどこまで短く畳むか（長大な `a → b → c → d` を `a → d` に圧縮するか）は未決定論点で、Cloudflare は圧縮せず chain を保持する設計。
-- **`split` は Codex だけが明示**。block 内に複数 thread id が混ざった場合に thread id 単位で分ける。insomnia の「1 件 1 ファイル」方針では split = ファイル分割となり、主題の粒度判断は GC agent に委ねる必要がある。
+- `replaced` chain の整理は **Cloudflare だけが自動で版チェーン維持**、他は LLM 任せ。yoi は decision record に `replaced_by` を入れているので、Cloudflare 方式の forward pointer 概念を **人間可読な `replaced_by:` frontmatter** で既に踏襲している。GC 時に chain をどこまで短く畳むか（長大な `a → b → c → d` を `a → d` に圧縮するか）は未決定論点で、Cloudflare は圧縮せず chain を保持する設計。
+- **`split` は Codex だけが明示**。block 内に複数 thread id が混ざった場合に thread id 単位で分ける。yoi の「1 件 1 ファイル」方針では split = ファイル分割となり、主題の粒度判断は GC agent に委ねる必要がある。
 
 **人間介入点の 3 段**:
 
@@ -521,7 +521,7 @@ insomnia の plan は (2) consolidation で rewrite 許可を置きつつ、GC �
 - audit-first（issue を surface し、人間が決断）: memory-wiki lint / OpenClaw dreaming-repair
 - high-stake 限定 gate: LinkedIn CMA
 
-insomnia の plan は「人間 offer 承認を併用」なので **audit-first に寄る**のが自然。lint 相当の Warn を Linter で出し、LLM consolidation / GC がそれを消費する前に人間が承認 / 拒否できる UI を提供する構造。memory-wiki lint は `reports/lint.md` というシンプルな Markdown 出力なので、そのまま `memory/reports/gc-lint.md` 相当を tick off する実装が参考になる。
+yoi の plan は「人間 offer 承認を併用」なので **audit-first に寄る**のが自然。lint 相当の Warn を Linter で出し、LLM consolidation / GC がそれを消費する前に人間が承認 / 拒否できる UI を提供する構造。memory-wiki lint は `reports/lint.md` というシンプルな Markdown 出力なので、そのまま `memory/reports/gc-lint.md` 相当を tick off する実装が参考になる。
 
 **履歴保持の 3 モデル**:
 
@@ -529,14 +529,14 @@ insomnia の plan は「人間 offer 承認を併用」なので **audit-first �
 2. **archive 退避（rename）**: OpenClaw dreaming-repair
 3. **forward pointer / tombstone**: Cloudflare supersession
 
-insomnia は **git 管理下に memory を置く**前提なので、物理削除を選んでも git log で復元できるのが強み。`replaced_by:` frontmatter が forward pointer の役割を果たしているので、Cloudflare 型と git を足した「**現物は物理削除、frontmatter pointer で chain を参照、git で history**」が最も設計コストに合う。archive 退避は git を前提にすると冗長。
+yoi は **git 管理下に memory を置く**前提なので、物理削除を選んでも git log で復元できるのが強み。`replaced_by:` frontmatter が forward pointer の役割を果たしているので、Cloudflare 型と git を足した「**現物は物理削除、frontmatter pointer で chain を参照、git で history**」が最も設計コストに合う。archive 退避は git を前提にすると冗長。
 
-### 8.3 insomnia の GC 仕様を詰めるときの示唆
+### 8.3 yoi の GC 仕様を詰めるときの示唆
 
 1. **GC trigger は 2 系統に割る**。(a) 決定論: Linter Warn 群 + age / count / size 閾値の sweep、(b) LLM 判定: consolidation とは別 prompt で Linter の issue リストを入力に渡す。両方が `memory/reports/gc-*.md` 相当を書き、それを次回の GC run が読む、というフィードバックループが OpenClaw lint / Codex consolidation input selection の両方と整合する。
-2. **Linter に「GC 候補検出」カテゴリを足す**。memory-wiki の lint issue code が参考になる: `stale-page`（90d 超）/ `stale-claim` / `low-confidence` / `orphan` / `duplicate-id` / `broken-wikilink` / `contradiction-present` / `open-question`。insomnia 固有の追加候補: `similar-slug`（類似 slug 乱立、既に plan に記載）/ `replaced-chain-long`（`replaced_by` が 3 段以上）/ `sources-overflow`（1 record の sources が閾値超）/ `knowledge-invoke-frequency-low`（`user_invoke` が一定期間ゼロ）。
-3. **処理は rewrite 優先、削除は `status: replaced` 経由**（既に plan 方針と一致）。forward pointer は Cloudflare 流、ただし chain 圧縮ルール（例: 「chain が n 段超えたら中間を drop、端のみ残す」）を決めるかは別論点。Cloudflare は圧縮しない、insomnia は git があるので圧縮してよい。
-4. **char limit は採用しない方が筋が良い**。Hermes の hard limit + LLM self-rewrite は設計最小だが、insomnia は 1 record 1 file なのでファイル内 size 制約は薄く、file 数による grep コストの方が支配的になる。file 数閾値 → GC trigger の方が insomnia の形に合う。
+2. **Linter に「GC 候補検出」カテゴリを足す**。memory-wiki の lint issue code が参考になる: `stale-page`（90d 超）/ `stale-claim` / `low-confidence` / `orphan` / `duplicate-id` / `broken-wikilink` / `contradiction-present` / `open-question`。yoi 固有の追加候補: `similar-slug`（類似 slug 乱立、既に plan に記載）/ `replaced-chain-long`（`replaced_by` が 3 段以上）/ `sources-overflow`（1 record の sources が閾値超）/ `knowledge-invoke-frequency-low`（`user_invoke` が一定期間ゼロ）。
+3. **処理は rewrite 優先、削除は `status: replaced` 経由**（既に plan 方針と一致）。forward pointer は Cloudflare 流、ただし chain 圧縮ルール（例: 「chain が n 段超えたら中間を drop、端のみ残す」）を決めるかは別論点。Cloudflare は圧縮しない、yoi は git があるので圧縮してよい。
+4. **char limit は採用しない方が筋が良い**。Hermes の hard limit + LLM self-rewrite は設計最小だが、yoi は 1 record 1 file なのでファイル内 size 制約は薄く、file 数による grep コストの方が支配的になる。file 数閾値 → GC trigger の方が yoi の形に合う。
 5. **決定論 scoring を後から差し込む余地を残す**。OpenClaw Deep pass のような「頻度 / 関連度 / 多様性 / 時間減衰 / 整合性 / 概念」の 6 重み + 閾値は、agent LLM の出力が運用で評価可能になった段階で部分的に差し替える upgrade path として最適。初期は consolidation LLM + Linter Warn で十分。
 6. **削除は git commit 単位で可逆**という前提を明示する。プロジェクトメモリは git 管理下なので、GC が誤って drop してもユーザーは revert できる。これは Codex が持っていない利点で、GC agent の判断を多少攻めても安全マージンがある。
 

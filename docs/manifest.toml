@@ -5,7 +5,7 @@
 #
 # このファイル形式は低レベル runtime manifest。通常起動は profile discovery/default
 # (`profiles.toml` と bundled builtin profile) から manifest を生成する。
-# `insomnia pod --manifest <path>` の one-file compatibility/debug mode では、
+# `yoi pod --manifest <path>` の one-file compatibility/debug mode では、
 # 指定した TOML 1 枚に builtin defaults を merge し、required validation を行う。
 # user/project `manifest.toml` を暗黙に merge する通常起動 cascade は使わない。
 #
@@ -65,7 +65,7 @@ ref = "anthropic/claude-sonnet-4-6"
 # 任意 (ref 未指定時は実質必須)。デフォルト: なし。
 # kind の値: "none" | "secret_ref" | "api_key" | "codex_oauth"
 #   - "none"        … 認証不要 (ローカル Ollama 等)
-#   - "secret_ref"  … `insomnia keys` の local secret store から key を読む。
+#   - "secret_ref"  … `yoi keys` の local secret store から key を読む。
 #                     `ref` はユーザー設定が明示的に選ぶ論理 secret id。
 #                     store は id -> value のみを持ち、provider 種別を解釈しない。
 #   - "api_key"     … 明示ファイルから key を読む低レベル形式。通常は
@@ -95,10 +95,10 @@ ref = "anthropic/claude-sonnet-4-6"
 # ワーカーの生成パラメータ等。セクション自体省略可 (全フィールド任意)。
 [worker]
 
-# 任意。デフォルト: "$insomnia/default" (`defaults::DEFAULT_INSTRUCTION`)。
+# 任意。デフォルト: "$yoi/default" (`defaults::DEFAULT_INSTRUCTION`)。
 # システムプロンプト本体の `PromptLoader` 参照。
-# プレフィクス: "$insomnia/..." | "$user/..." | "$workspace/..."
-# instruction = "$insomnia/default"
+# プレフィクス: "$yoi/..." | "$user/..." | "$workspace/..."
+# instruction = "$yoi/default"
 
 # 任意。デフォルト: なし (プロバイダ任せ)。
 # 1 レスポンスあたりの出力 token 上限。

@@ -74,7 +74,7 @@ pub fn render_staging_records(entries: &[StagingEntry]) -> String {
     out
 }
 
-/// `<workspace>/.insomnia/memory/{summary.md,decisions/*,requests/*}` を
+/// `<workspace>/.yoi/memory/{summary.md,decisions/*,requests/*}` を
 /// 「`### <kind>:<slug>` ヘッダ + raw markdown ブロック」で全文渡す。
 pub fn render_existing_memory_records(layout: &WorkspaceLayout) -> String {
     let mut out = String::new();
@@ -230,11 +230,11 @@ mod tests {
         let layout = WorkspaceLayout::new(dir.path().to_path_buf());
 
         write(
-            &dir.path().join(".insomnia/memory/summary.md"),
+            &dir.path().join(".yoi/memory/summary.md"),
             &format!("---\nupdated_at: {n}\n---\nstate of the world\n", n = now()),
         );
         write(
-            &dir.path().join(".insomnia/memory/decisions/dec.md"),
+            &dir.path().join(".yoi/memory/decisions/dec.md"),
             &format!(
                 "---\ncreated_at: {n}\nupdated_at: {n}\nsources: []\nstatus: open\n---\nbody\n",
                 n = now()

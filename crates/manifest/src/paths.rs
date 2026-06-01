@@ -1,4 +1,4 @@
-//! Insomnia のホームディレクトリ配下のパス解決を一元化するモジュール。
+//! Yoi のホームディレクトリ配下のパス解決を一元化するモジュール。
 //!
 //! 用途別に三つの base directory を持つ:
 //!
@@ -10,13 +10,13 @@
 //!
 //! ## 解決順 (優先順位高 → 低)
 //!
-//! | base | 1. `INSOMNIA_<KIND>_DIR` | 2. `INSOMNIA_HOME` | 3. `XDG_*` | 4. 既定 |
+//! | base | 1. `YOI_<KIND>_DIR` | 2. `YOI_HOME` | 3. `XDG_*` | 4. 既定 |
 //! |---|---|---|---|---|
-//! | config  | `INSOMNIA_CONFIG_DIR`  | `$INSOMNIA_HOME/config` | `$XDG_CONFIG_HOME/insomnia` | `$HOME/.config/insomnia` |
-//! | data    | `INSOMNIA_DATA_DIR`    | `$INSOMNIA_HOME`        | —                            | `$HOME/.insomnia` |
-//! | runtime | `INSOMNIA_RUNTIME_DIR` | `$INSOMNIA_HOME/run`    | `$XDG_RUNTIME_DIR/insomnia` | `$HOME/.insomnia/run` |
+//! | config  | `YOI_CONFIG_DIR`  | `$YOI_HOME/config` | `$XDG_CONFIG_HOME/yoi` | `$HOME/.config/yoi` |
+//! | data    | `YOI_DATA_DIR`    | `$YOI_HOME`        | —                            | `$HOME/.yoi` |
+//! | runtime | `YOI_RUNTIME_DIR` | `$YOI_HOME/run`    | `$XDG_RUNTIME_DIR/yoi` | `$HOME/.yoi/run` |
 //!
-//! `INSOMNIA_HOME=$X` のとき config は `$X/config`、data は `$X` 直下、
+//! `YOI_HOME=$X` のとき config は `$X/config`、data は `$X` 直下、
 //! runtime は `$X/run` に集約される。テストや sandbox 利用ではこれ一本
 //! で全部 tempdir に向けられる。
 //!
@@ -29,8 +29,8 @@ use std::path::PathBuf;
 /// `prompts/` などが置かれる。
 pub fn config_dir() -> Option<PathBuf> {
     resolve_config_dir_from_parts(
-        env_path("INSOMNIA_CONFIG_DIR"),
-        env_path("INSOMNIA_HOME"),
+        env_path("YOI_CONFIG_DIR"),
+        env_path("YOI_HOME"),
         env_path("XDG_CONFIG_HOME"),
         env_path("HOME"),
     )
@@ -40,8 +40,8 @@ pub fn config_dir() -> Option<PathBuf> {
 /// 置き場。
 pub fn data_dir() -> Option<PathBuf> {
     resolve_data_dir_from_parts(
-        env_path("INSOMNIA_DATA_DIR"),
-        env_path("INSOMNIA_HOME"),
+        env_path("YOI_DATA_DIR"),
+        env_path("YOI_HOME"),
         env_path("HOME"),
     )
 }
@@ -50,8 +50,8 @@ pub fn data_dir() -> Option<PathBuf> {
 /// `status.json` 等が置かれる。再起動で消えて構わない。
 pub fn runtime_dir() -> Option<PathBuf> {
     resolve_runtime_dir_from_parts(
-        env_path("INSOMNIA_RUNTIME_DIR"),
-        env_path("INSOMNIA_HOME"),
+        env_path("YOI_RUNTIME_DIR"),
+        env_path("YOI_HOME"),
         env_path("XDG_RUNTIME_DIR"),
         env_path("HOME"),
     )
@@ -111,53 +111,53 @@ pub fn pod_socket_path(pod_name: &str) -> Option<PathBuf> {
 // ---- internals --------------------------------------------------------------
 
 fn resolve_config_dir_from_parts(
-    insomnia_config_dir: Option<PathBuf>,
-    insomnia_home: Option<PathBuf>,
+    yoi_config_dir: Option<PathBuf>,
+    yoi_home: Option<PathBuf>,
     xdg_config_home: Option<PathBuf>,
     home: Option<PathBuf>,
 ) -> Option<PathBuf> {
-    if let Some(p) = insomnia_config_dir {
+    if let Some(p) = yoi_config_dir {
         return Some(p);
     }
-    if let Some(p) = insomnia_home {
+    if let Some(p) = yoi_home {
         return Some(p.join("config"));
     }
     if let Some(p) = xdg_config_home {
-        return Some(p.join("insomnia"));
+        return Some(p.join("yoi"));
     }
-    Some(home?.join(".config").join("insomnia"))
+    Some(home?.join(".config").join("yoi"))
 }
 
 fn resolve_data_dir_from_parts(
-    insomnia_data_dir: Option<PathBuf>,
-    insomnia_home: Option<PathBuf>,
+    yoi_data_dir: Option<PathBuf>,
+    yoi_home: Option<PathBuf>,
     home: Option<PathBuf>,
 ) -> Option<PathBuf> {
-    if let Some(p) = insomnia_data_dir {
+    if let Some(p) = yoi_data_dir {
         return Some(p);
     }
-    if let Some(p) = insomnia_home {
+    if let Some(p) = yoi_home {
         return Some(p);
     }
-    Some(home?.join(".insomnia"))
+    Some(home?.join(".yoi"))
 }
 
 fn resolve_runtime_dir_from_parts(
-    insomnia_runtime_dir: Option<PathBuf>,
-    insomnia_home: Option<PathBuf>,
+    yoi_runtime_dir: Option<PathBuf>,
+    yoi_home: Option<PathBuf>,
     xdg_runtime_dir: Option<PathBuf>,
     home: Option<PathBuf>,
 ) -> Option<PathBuf> {
-    if let Some(p) = insomnia_runtime_dir {
+    if let Some(p) = yoi_runtime_dir {
         return Some(p);
     }
-    if let Some(p) = insomnia_home {
+    if let Some(p) = yoi_home {
         return Some(p.join("run"));
     }
     if let Some(p) = xdg_runtime_dir {
-        return Some(p.join("insomnia"));
+        return Some(p.join("yoi"));
     }
-    Some(home?.join(".insomnia").join("run"))
+    Some(home?.join(".yoi").join("run"))
 }
 
 fn user_profiles_path_from_config_dir(config_dir: Option<PathBuf>) -> Option<PathBuf> {
@@ -221,7 +221,7 @@ mod tests {
     fn config_dir_falls_back_to_home_dot_config() {
         assert_eq!(
             resolve_config_dir_from_parts(None, None, None, Some(PathBuf::from("/h"))).unwrap(),
-            PathBuf::from("/h/.config/insomnia")
+            PathBuf::from("/h/.config/yoi")
         );
     }
 
@@ -235,12 +235,12 @@ mod tests {
                 Some(PathBuf::from("/h")),
             )
             .unwrap(),
-            PathBuf::from("/x/insomnia")
+            PathBuf::from("/x/yoi")
         );
     }
 
     #[test]
-    fn config_dir_insomnia_home_outranks_xdg() {
+    fn config_dir_yoi_home_outranks_xdg() {
         assert_eq!(
             resolve_config_dir_from_parts(
                 None,
@@ -254,7 +254,7 @@ mod tests {
     }
 
     #[test]
-    fn config_dir_explicit_wins_over_insomnia_home() {
+    fn config_dir_explicit_wins_over_yoi_home() {
         assert_eq!(
             resolve_config_dir_from_parts(
                 Some(PathBuf::from("/explicit-cfg")),
@@ -268,15 +268,15 @@ mod tests {
     }
 
     #[test]
-    fn data_dir_default_is_dot_insomnia() {
+    fn data_dir_default_is_dot_yoi() {
         assert_eq!(
             resolve_data_dir_from_parts(None, None, Some(PathBuf::from("/h"))).unwrap(),
-            PathBuf::from("/h/.insomnia")
+            PathBuf::from("/h/.yoi")
         );
     }
 
     #[test]
-    fn data_dir_insomnia_home_is_data_dir_itself() {
+    fn data_dir_yoi_home_is_data_dir_itself() {
         assert_eq!(
             resolve_data_dir_from_parts(
                 None,
@@ -289,7 +289,7 @@ mod tests {
     }
 
     #[test]
-    fn data_dir_explicit_wins_over_insomnia_home() {
+    fn data_dir_explicit_wins_over_yoi_home() {
         assert_eq!(
             resolve_data_dir_from_parts(
                 Some(PathBuf::from("/explicit-data")),
@@ -311,20 +311,20 @@ mod tests {
                 Some(PathBuf::from("/h")),
             )
             .unwrap(),
-            PathBuf::from("/xdg-runtime/insomnia")
+            PathBuf::from("/xdg-runtime/yoi")
         );
     }
 
     #[test]
-    fn runtime_dir_falls_back_to_dot_insomnia_run() {
+    fn runtime_dir_falls_back_to_dot_yoi_run() {
         assert_eq!(
             resolve_runtime_dir_from_parts(None, None, None, Some(PathBuf::from("/h"))).unwrap(),
-            PathBuf::from("/h/.insomnia/run")
+            PathBuf::from("/h/.yoi/run")
         );
     }
 
     #[test]
-    fn runtime_dir_insomnia_home_is_run_subdir() {
+    fn runtime_dir_yoi_home_is_run_subdir() {
         assert_eq!(
             resolve_runtime_dir_from_parts(
                 None,
@@ -338,7 +338,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_dir_explicit_wins_over_insomnia_home() {
+    fn runtime_dir_explicit_wins_over_yoi_home() {
         assert_eq!(
             resolve_runtime_dir_from_parts(
                 Some(PathBuf::from("/explicit-run")),
@@ -358,7 +358,7 @@ mod tests {
         assert_eq!(
             resolve_config_dir_from_parts(None, None, xdg_config_home, Some(PathBuf::from("/h")))
                 .unwrap(),
-            PathBuf::from("/h/.config/insomnia")
+            PathBuf::from("/h/.config/yoi")
         );
     }
 

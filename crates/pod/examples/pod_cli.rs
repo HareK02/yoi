@@ -1,6 +1,6 @@
 //! Minimal example: Pod running a single prompt with persistence.
 //!
-//! Demonstrates the core insomnia abstraction — a TOML manifest drives
+//! Demonstrates the core yoi abstraction — a TOML manifest drives
 //! provider selection, model config, and system prompt, while FsStore
 //! persists the session to disk automatically.
 //!

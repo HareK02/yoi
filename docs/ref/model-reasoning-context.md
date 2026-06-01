@@ -85,7 +85,7 @@ reasoning トークンは各ターンの後に破棄される。次ターンに�
 1. `previous_response_id` パラメータで過去のレスポンスを参照
 2. `response.output` の全アイテムを次の `input` に手動で渡す
 
-ステートレス利用（`store=false`、ZDR組織）の場合は `include=["reasoning.encrypted_content"]` を指定すれば暗号化された推論コンテンツを受け取り、次リクエストに渡すことで推論を引き継げる。Insomnia は履歴から復元した reasoning item を通常の API message として扱い、独自の turn-boundary filtering はしない。
+ステートレス利用（`store=false`、ZDR組織）の場合は `include=["reasoning.encrypted_content"]` を指定すれば暗号化された推論コンテンツを受け取り、次リクエストに渡すことで推論を引き継げる。Yoi は履歴から復元した reasoning item を通常の API message として扱い、独自の turn-boundary filtering はしない。
 
 同一ターン内の function-call loop でも、`reasoning item → function_call → function_call_output → 次の Responses request` の連続性を保つため、履歴上の reasoning item は通常の API message として保持する。ToolResult は wire 上で user 側 item に見えるが、reasoning item の削除境界としては扱わない。
 
