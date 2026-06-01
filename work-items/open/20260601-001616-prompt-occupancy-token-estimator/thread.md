@@ -97,3 +97,29 @@ Validation:
 
 
 ---
+
+<!-- event: review author: hare at: 2026-06-01T00:59:20Z status: approve -->
+
+## Review: approve
+
+External reviewer recommendation: approve.
+
+Summary:
+- Exact UsageRecord matches remain authoritative.
+- Extrapolation after the latest measurement no longer uses `latest_total_input_tokens / latest_history_bytes`.
+- Interpolation between two measurements still uses measured deltas where fixed overhead cancels.
+- One-measurement extrapolation uses a conservative byte fallback added to latest measured total.
+- Regression coverage exists in `llm-worker` token counter tests and pod `pre_llm_request` behavior.
+- No intentional prune policy/savings, threshold/default, session schema, or compact lifecycle changes were found.
+
+Validation re-run by reviewer:
+- `cargo test -p llm-worker token_counter` passed.
+- `cargo test -p pod pre_llm_request_does_not_yield_from_single_measurement_history_rate_projection` passed.
+- `git diff --check 3ea0058..HEAD` passed.
+- `cargo fmt --check` passed.
+
+Non-blocking follow-up:
+- Some comments still describe extrapolation as a latest/final measurement rate even though the implementation is now latest measured incremental span or byte fallback. Reviewer classified this as documentation drift only, not a blocker.
+
+
+---

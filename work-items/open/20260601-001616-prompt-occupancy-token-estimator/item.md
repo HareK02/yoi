@@ -7,7 +7,7 @@ kind: task
 priority: P1
 labels: [compaction, token-accounting]
 created_at: 2026-06-01T00:16:16Z
-updated_at: 2026-06-01T00:41:18Z
+updated_at: 2026-06-01T00:59:20Z
 assignee: null
 legacy_ticket: null
 ---
