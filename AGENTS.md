@@ -37,6 +37,14 @@ Podの状態から純粋に再現可能で、且つ揮発性の無い操作で�
 
 ---
 
+## 検証
+
+コード・パッケージング・runtime resource・prompt に関わる変更は、完了前に `nix build .#yoi`（または同等の flake package build）を通して確認すること。`cargo test` / `cargo check` が通っていても Nix packaging 側で壊れることがあるため、Nix build を別途確認する。
+
+docs-only など Nix build の価値が低い変更で省略する場合は、完了報告で省略理由を明示すること。
+
+---
+
 ## Work item / Ticket の運用について
 
 作業管理は `work-items/` と `tickets.sh` を正とする。時系列・状態遷移の最終的な根拠は git history なので、work item の作成・更新・レビュー・完了はファイル操作と commit で表現する。

@@ -91,10 +91,6 @@ rustPlatform.buildRustPackage rec {
   # derivation is scoped to packaging the user-facing binaries.
   doCheck = false;
 
-  postInstall = ''
-    install -Dm644 docs/environment.md "$out/share/doc/yoi/environment.md"
-  '';
-
   doInstallCheck = true;
   installCheckPhase = ''
     runHook preInstallCheck
@@ -108,8 +104,6 @@ rustPlatform.buildRustPackage rec {
       exit 1
     fi
     grep -q "invalid --session UUID" yoi.err
-
-    test -f "$out/share/doc/yoi/environment.md"
 
     runHook postInstallCheck
   '';
