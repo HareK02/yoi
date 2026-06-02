@@ -1204,6 +1204,22 @@ impl App {
                 });
             }
             Event::PodsListed { .. } | Event::PodRestored { .. } => {}
+            Event::PeerRegistered { result } => {
+                let source = result
+                    .get("source")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("this Pod");
+                let peer = result
+                    .get("peer")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("peer Pod");
+                self.flash_actionbar_notice(
+                    format!("Peer handshake registered: `{source}` ↔ `{peer}`"),
+                    ActionbarNoticeLevel::Info,
+                    ActionbarNoticeSource::Tui,
+                    Duration::from_secs(4),
+                );
+            }
             Event::Shutdown => {
                 self.mark_orphan_compacts_incomplete();
                 self.quit = true;

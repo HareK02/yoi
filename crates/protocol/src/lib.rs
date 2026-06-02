@@ -64,6 +64,13 @@ pub enum Method {
     RestorePod {
         name: String,
     },
+    /// Register another existing Pod as a reciprocal peer of this Pod.
+    ///
+    /// This is metadata/control state only: it must not grant delegated scope,
+    /// spawned-child ownership, output cursors, or child lifecycle authority.
+    RegisterPeer {
+        name: String,
+    },
 }
 
 /// Typed lifecycle events sent from a child Pod to its parent.
@@ -478,6 +485,10 @@ pub enum Event {
     },
     /// Reply to `Method::RestorePod`.
     PodRestored {
+        result: serde_json::Value,
+    },
+    /// Reply to `Method::RegisterPeer`.
+    PeerRegistered {
         result: serde_json::Value,
     },
     Alert(Alert),
@@ -1465,13 +1476,17 @@ mod tests {
             Method::RestorePod {
                 name: "child".into(),
             },
+            Method::RegisterPeer {
+                name: "peer".into(),
+            },
         ];
         for method in methods {
             let json = serde_json::to_string(&method).unwrap();
             let decoded: Method = serde_json::from_str(&json).unwrap();
             match (decoded, method) {
                 (Method::ListPods, Method::ListPods)
-                | (Method::RestorePod { .. }, Method::RestorePod { .. }) => {}
+                | (Method::RestorePod { .. }, Method::RestorePod { .. })
+                | (Method::RegisterPeer { .. }, Method::RegisterPeer { .. }) => {}
                 (decoded, expected) => panic!("decoded {decoded:?}, expected {expected:?}"),
             }
         }
@@ -1486,6 +1501,9 @@ mod tests {
             Event::PodRestored {
                 result: serde_json::json!({ "action": "already_live" }),
             },
+            Event::PeerRegistered {
+                result: serde_json::json!({ "source": "self", "peer": "other" }),
+            },
         ];
         for event in events {
             let json = serde_json::to_string(&event).unwrap();
@@ -1495,6 +1513,9 @@ mod tests {
                     assert_eq!(pods, expected)
                 }
                 (Event::PodRestored { result }, Event::PodRestored { result: expected }) => {
+                    assert_eq!(result, expected)
+                }
+                (Event::PeerRegistered { result }, Event::PeerRegistered { result: expected }) => {
                     assert_eq!(result, expected)
                 }
                 (decoded, expected) => panic!("decoded {decoded:?}, expected {expected:?}"),

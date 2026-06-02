@@ -156,6 +156,15 @@ impl CommandRegistry {
             can_execute: rewind_available,
             executor: rewind_command,
         });
+        registry.register(CommandSpec {
+            name: "peer",
+            aliases: &[],
+            usage: "peer <pod-name>",
+            description: "Make another existing Pod visible as a reciprocal peer.",
+            argument_parser: peer_args,
+            can_execute: peer_available,
+            executor: peer_command,
+        });
         registry
     }
 
@@ -302,6 +311,17 @@ fn rewind_args(raw: &str) -> Result<CommandArgs, CommandDiagnostic> {
     }
 }
 
+fn peer_args(raw: &str) -> Result<CommandArgs, CommandDiagnostic> {
+    let args = CommandArgs::parse_whitespace(raw);
+    if args.argv().len() == 1 {
+        Ok(args)
+    } else {
+        Err(CommandDiagnostic::new(
+            "Invalid arguments. Usage: peer <pod-name>",
+        ))
+    }
+}
+
 fn compact_available(environment: &CommandEnvironment) -> Result<(), CommandDiagnostic> {
     if !environment.connected {
         return Err(CommandDiagnostic::new(
@@ -330,6 +350,20 @@ fn rewind_available(environment: &CommandEnvironment) -> Result<(), CommandDiagn
     if environment.running {
         return Err(CommandDiagnostic::new(
             "Cannot rewind while the Pod is running.",
+        ));
+    }
+    Ok(())
+}
+
+fn peer_available(environment: &CommandEnvironment) -> Result<(), CommandDiagnostic> {
+    if !environment.connected {
+        return Err(CommandDiagnostic::new(
+            "Cannot register a peer before the Pod is connected.",
+        ));
+    }
+    if environment.running {
+        return Err(CommandDiagnostic::new(
+            "Cannot register a peer while the Pod is running.",
         ));
     }
     Ok(())
@@ -389,6 +423,20 @@ fn rewind_command(invocation: CommandInvocation<'_>) -> CommandExecution {
     CommandExecution {
         method: Some(Method::ListRewindTargets),
         diagnostics: vec![CommandDiagnostic::new("rewind picker requested")],
+        exit_command_mode: true,
+        clear_input: true,
+    }
+}
+
+fn peer_command(invocation: CommandInvocation<'_>) -> CommandExecution {
+    let _ = invocation.command;
+    let _ = invocation.environment;
+    let name = invocation.args.argv()[0].clone();
+    CommandExecution {
+        method: Some(Method::RegisterPeer { name: name.clone() }),
+        diagnostics: vec![CommandDiagnostic::new(format!(
+            "peer handshake requested with `{name}`"
+        ))],
         exit_command_mode: true,
         clear_input: true,
     }
@@ -500,5 +548,39 @@ mod tests {
         paused.paused = true;
         let result = registry.dispatch("rewind", &paused);
         assert!(matches!(result.method, Some(Method::ListRewindTargets)));
+    }
+
+    #[test]
+    fn peer_command_returns_register_peer_method() {
+        let registry = CommandRegistry::builtins();
+        let result = registry.dispatch("peer reviewer", &env());
+        assert!(matches!(
+            result.method,
+            Some(Method::RegisterPeer { ref name }) if name == "reviewer"
+        ));
+        assert!(result.exit_command_mode);
+        assert!(result.clear_input);
+        assert!(result.diagnostics[0].message.contains("peer handshake"));
+    }
+
+    #[test]
+    fn peer_invalid_arguments_are_local_diagnostic() {
+        let registry = CommandRegistry::builtins();
+        for command in ["peer", "peer one two"] {
+            let result = registry.dispatch(command, &env());
+            assert!(result.method.is_none());
+            assert!(!result.exit_command_mode);
+            assert!(result.diagnostics[0].message.contains("Invalid arguments"));
+        }
+    }
+
+    #[test]
+    fn peer_rejects_running() {
+        let registry = CommandRegistry::builtins();
+        let mut running = env();
+        running.running = true;
+        let result = registry.dispatch("peer reviewer", &running);
+        assert!(result.method.is_none());
+        assert!(result.diagnostics[0].message.contains("running"));
     }
 }
