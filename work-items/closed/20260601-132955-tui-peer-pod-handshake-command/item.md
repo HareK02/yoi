@@ -2,12 +2,12 @@
 id: 20260601-132955-tui-peer-pod-handshake-command
 slug: tui-peer-pod-handshake-command
 title: TUI: add peer Pod handshake and messaging command
-status: open
+status: closed
 kind: task
 priority: P2
 labels: [tui, pod, command, orchestration]
 created_at: 2026-06-01T13:29:55Z
-updated_at: 2026-06-02T13:18:34Z
+updated_at: 2026-06-02T13:54:50Z
 assignee: null
 legacy_ticket: null
 ---
