@@ -8,7 +8,7 @@ use pod_store::PodMetadataStore;
 use session_store::Store;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
-use crate::discovery::{PodDiscovery, list_pods_tool, restore_pod_tool};
+use crate::discovery::{PodDiscovery, list_pods_tool, restore_pod_tool, send_to_peer_pod_tool};
 use crate::ipc::alerter::Alerter;
 use crate::ipc::notify_buffer::NotifyBuffer;
 use crate::ipc::server::SocketServer;
@@ -561,7 +561,8 @@ where
     worker.register_tool(stop_pod_tool(spawned_registry.clone()));
     let discovery = PodDiscovery::new(pod_store, spawner_name, runtime_base, pwd, spawned_registry);
     worker.register_tool(list_pods_tool(discovery.clone()));
-    worker.register_tool(restore_pod_tool(discovery));
+    worker.register_tool(restore_pod_tool(discovery.clone()));
+    worker.register_tool(send_to_peer_pod_tool(discovery));
     pod.attach_tracker(tracker);
     fs_for_view
 }
@@ -862,6 +863,26 @@ async fn controller_loop<C, St>(
                 }
             },
 
+            Method::RegisterPeer { name } => match discovery.register_peer(&name) {
+                Ok(result) => match serde_json::to_value(result) {
+                    Ok(result) => {
+                        let _ = event_tx.send(Event::PeerRegistered { result });
+                    }
+                    Err(error) => {
+                        let _ = event_tx.send(Event::Error {
+                            code: ErrorCode::Internal,
+                            message: format!("serialize peer registration result: {error}"),
+                        });
+                    }
+                },
+                Err(error) => {
+                    let _ = event_tx.send(Event::Error {
+                        code: ErrorCode::InvalidRequest,
+                        message: error.to_string(),
+                    });
+                }
+            },
+
             // ListCompletions is handled at the socket layer (direct
             // response). If it reaches the controller, ignore it.
             Method::ListCompletions { .. } => {}
@@ -1063,10 +1084,10 @@ where
                         notify_buffer.push_notify(message);
                     }
                     Some(Method::ListCompletions { .. }) => {}
-                    Some(Method::ListPods | Method::RestorePod { .. }) => {
+                    Some(Method::ListPods | Method::RestorePod { .. } | Method::RegisterPeer { .. }) => {
                         let _ = event_tx.send(Event::Error {
                             code: ErrorCode::AlreadyRunning,
-                            message: "Pod discovery requests are only handled while the Pod is idle or paused"
+                            message: "Pod discovery/control requests are only handled while the Pod is idle or paused"
                                 .into(),
                         });
                     }

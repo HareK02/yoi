@@ -84,6 +84,16 @@ pub struct PodReclaimedChild {
     pub scope_delegated: Vec<PodSpawnedScopeRule>,
 }
 
+/// One peer Pod made visible by an explicit peer handshake.
+///
+/// Peer visibility is intentionally separate from spawned-child delegation: it
+/// does not carry filesystem scope, callback ownership, output cursors, or
+/// lifecycle-notification authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PodPeer {
+    pub pod_name: String,
+}
+
 /// Persistent metadata for a Pod name.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PodMetadata {
@@ -94,6 +104,8 @@ pub struct PodMetadata {
     pub spawned_children: Vec<PodSpawnedChild>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reclaimed_children: Vec<PodReclaimedChild>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub peers: Vec<PodPeer>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_manifest_snapshot: Option<serde_json::Value>,
 }
@@ -106,6 +118,7 @@ impl PodMetadata {
             active,
             spawned_children: Vec::new(),
             reclaimed_children: Vec::new(),
+            peers: Vec::new(),
             resolved_manifest_snapshot: None,
         }
     }
@@ -165,6 +178,33 @@ pub trait PodMetadataStore: Send + Sync {
     ) -> Result<PodMetadata, PodStoreError> {
         self.update_by_name(pod_name, |metadata| {
             metadata.spawned_children = children;
+        })
+    }
+
+    /// Set peer visibility state while preserving active pointer, child state,
+    /// and manifest snapshot.
+    fn set_peers(&self, pod_name: &str, peers: Vec<PodPeer>) -> Result<PodMetadata, PodStoreError> {
+        self.update_by_name(pod_name, |metadata| {
+            metadata.peers = peers;
+        })
+    }
+
+    /// Add one peer if absent while preserving every other metadata field.
+    fn add_peer(&self, pod_name: &str, peer_name: &str) -> Result<PodMetadata, PodStoreError> {
+        self.update_by_name(pod_name, |metadata| {
+            if !metadata.peers.iter().any(|peer| peer.pod_name == peer_name) {
+                metadata.peers.push(PodPeer {
+                    pod_name: peer_name.to_string(),
+                });
+                metadata.peers.sort_by(|a, b| a.pod_name.cmp(&b.pod_name));
+            }
+        })
+    }
+
+    /// Remove one peer while preserving every other metadata field.
+    fn remove_peer(&self, pod_name: &str, peer_name: &str) -> Result<PodMetadata, PodStoreError> {
+        self.update_by_name(pod_name, |metadata| {
+            metadata.peers.retain(|peer| peer.pod_name != peer_name);
         })
     }
 
@@ -501,6 +541,52 @@ mod tests {
         let restored = store.read_by_name("agent").unwrap().unwrap();
         assert_eq!(restored.active, Some(active));
         assert_eq!(restored.resolved_manifest_snapshot, Some(snapshot));
+    }
+
+    #[test]
+    fn peer_updates_preserve_active_children_and_manifest_snapshot() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = FsPodStore::new(tmp.path()).unwrap();
+        let active = PodActiveSegmentRef::active_segment(
+            session_store::new_session_id(),
+            session_store::new_segment_id(),
+        );
+        let snapshot = serde_json::json!({"pod":{"name":"agent"}});
+        store
+            .set_active("agent", Some(active.clone()), Some(snapshot.clone()))
+            .unwrap();
+        store
+            .set_spawned_children(
+                "agent",
+                vec![PodSpawnedChild {
+                    pod_name: "child".into(),
+                    socket_path: std::path::Path::new("/tmp/child.sock").into(),
+                    scope_delegated: vec![],
+                    callback_address: std::path::Path::new("/tmp/parent.sock").into(),
+                }],
+            )
+            .unwrap();
+        store.add_peer("agent", "peer-b").unwrap();
+        store.add_peer("agent", "peer-a").unwrap();
+        store.add_peer("agent", "peer-a").unwrap();
+
+        let restored = store.read_by_name("agent").unwrap().unwrap();
+        assert_eq!(restored.active, Some(active));
+        assert_eq!(restored.spawned_children.len(), 1);
+        assert_eq!(restored.resolved_manifest_snapshot, Some(snapshot));
+        assert_eq!(
+            restored
+                .peers
+                .iter()
+                .map(|peer| peer.pod_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["peer-a", "peer-b"]
+        );
+
+        store.remove_peer("agent", "peer-a").unwrap();
+        let restored = store.read_by_name("agent").unwrap().unwrap();
+        assert_eq!(restored.peers.len(), 1);
+        assert_eq!(restored.peers[0].pod_name, "peer-b");
     }
 
     #[test]

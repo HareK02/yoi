@@ -32,6 +32,12 @@ Parent-visible children are sourced from Pod metadata, not from a transient runt
 
 Delegated write scope is a capability loan. Stopping, shutting down, or pruning a child must reclaim the parent's effective write permissions while preserving explicit base denies.
 
+## Peer Pods
+
+Peer visibility is also Pod metadata, but it is distinct from spawned-child delegation. A TUI user can run `:peer <pod-name>` while attached to an idle Pod to register reciprocal peer metadata with another existing Pod. This is a metadata-level registration, not live target-controller consent.
+
+A peer relationship only makes the Pods mutually visible through `ListPods` with visibility source `peer`. It does not grant filesystem scope, create a child output cursor, make either Pod the other's parent, or imply child completion notifications. Peer messages use `SendToPeerPod`, which delivers a labeled notification into the target Pod's normal durable notification/history path. `SendToPeerPod` requires the peer to be live and fails clearly for non-live peers rather than auto-restoring them.
+
 ## Notifications are not authority
 
 Pod completion notifications are UX hints. Before treating delegated work as complete, inspect queryable evidence: child output, session/log state, worktree status, diffs, and validation output.
