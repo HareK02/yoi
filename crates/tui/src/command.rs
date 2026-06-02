@@ -160,7 +160,7 @@ impl CommandRegistry {
             name: "peer",
             aliases: &[],
             usage: "peer <pod-name>",
-            description: "Make another existing Pod visible as a reciprocal peer.",
+            description: "Register another existing Pod as a reciprocal metadata peer.",
             argument_parser: peer_args,
             can_execute: peer_available,
             executor: peer_command,
@@ -435,7 +435,7 @@ fn peer_command(invocation: CommandInvocation<'_>) -> CommandExecution {
     CommandExecution {
         method: Some(Method::RegisterPeer { name: name.clone() }),
         diagnostics: vec![CommandDiagnostic::new(format!(
-            "peer handshake requested with `{name}`"
+            "peer metadata registration requested with `{name}`"
         ))],
         exit_command_mode: true,
         clear_input: true,
@@ -560,7 +560,11 @@ mod tests {
         ));
         assert!(result.exit_command_mode);
         assert!(result.clear_input);
-        assert!(result.diagnostics[0].message.contains("peer handshake"));
+        assert!(
+            result.diagnostics[0]
+                .message
+                .contains("metadata registration")
+        );
     }
 
     #[test]
@@ -572,6 +576,25 @@ mod tests {
             assert!(!result.exit_command_mode);
             assert!(result.diagnostics[0].message.contains("Invalid arguments"));
         }
+    }
+
+    #[test]
+    fn peer_help_mentions_metadata_registration() {
+        let registry = CommandRegistry::builtins();
+        let result = registry.dispatch("help peer", &env());
+        assert!(result.method.is_none());
+        assert!(result.diagnostics[0].message.contains("peer <pod-name>"));
+        assert!(result.diagnostics[0].message.contains("metadata peer"));
+    }
+
+    #[test]
+    fn peer_rejects_disconnected() {
+        let registry = CommandRegistry::builtins();
+        let mut disconnected = env();
+        disconnected.connected = false;
+        let result = registry.dispatch("peer reviewer", &disconnected);
+        assert!(result.method.is_none());
+        assert!(result.diagnostics[0].message.contains("connected"));
     }
 
     #[test]

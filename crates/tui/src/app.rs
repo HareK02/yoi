@@ -1214,7 +1214,7 @@ impl App {
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("peer Pod");
                 self.flash_actionbar_notice(
-                    format!("Peer handshake registered: `{source}` ↔ `{peer}`"),
+                    format!("Peer metadata registered: `{source}` ↔ `{peer}`"),
                     ActionbarNoticeLevel::Info,
                     ActionbarNoticeSource::Tui,
                     Duration::from_secs(4),

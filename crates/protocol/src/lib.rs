@@ -66,7 +66,8 @@ pub enum Method {
     },
     /// Register another existing Pod as a reciprocal peer of this Pod.
     ///
-    /// This is metadata/control state only: it must not grant delegated scope,
+    /// This is metadata/control state only: it does not ask the target's live
+    /// controller for consent, and it must not grant delegated scope,
     /// spawned-child ownership, output cursors, or child lifecycle authority.
     RegisterPeer {
         name: String,

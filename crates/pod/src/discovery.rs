@@ -18,7 +18,7 @@ use client::PodRuntimeCommand;
 use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use manifest::{Permission, ScopeRule};
 use pod_store::{PodActiveSegmentRef, PodMetadata, PodMetadataStore, validate_pod_name};
-use protocol::stream::{JsonLineReader, JsonLineWriter};
+use protocol::stream::JsonLineReader;
 use protocol::{Event, Method, PodStatus};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -28,6 +28,7 @@ use tokio::process::Command;
 
 use crate::runtime::dir::SpawnedPodRecord;
 use crate::runtime::pod_registry;
+use crate::spawn::comm_tools::connect_and_send;
 use crate::spawn::registry::SpawnedPodRegistry;
 
 const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
@@ -182,14 +183,14 @@ where
                 pod_name: peer_name.to_string(),
             });
         }
-        let self_exists = self.store.read_by_name(&self.self_pod_name)?.is_some();
-        if !self_exists {
-            return Err(PodDiscoveryError::StateMissing {
+        let self_metadata = self
+            .store
+            .read_by_name(&self.self_pod_name)?
+            .ok_or_else(|| PodDiscoveryError::StateMissing {
                 pod_name: self.self_pod_name.clone(),
-            });
-        }
-        let peer_exists = self.store.read_by_name(peer_name)?.is_some();
-        if !peer_exists {
+            })?;
+        let prior_self_peers = self_metadata.peers.clone();
+        if self.store.read_by_name(peer_name)?.is_none() {
             return Err(PodDiscoveryError::MissingPod {
                 pod_name: peer_name.to_string(),
             });
@@ -197,7 +198,7 @@ where
 
         self.store.add_peer(&self.self_pod_name, peer_name)?;
         if let Err(error) = self.store.add_peer(peer_name, &self.self_pod_name) {
-            let _ = self.store.remove_peer(&self.self_pod_name, peer_name);
+            let _ = self.store.set_peers(&self.self_pod_name, prior_self_peers);
             return Err(PodDiscoveryError::PodStore(error));
         }
 
@@ -804,7 +805,7 @@ where
     Arc::new(move || {
         let meta = ToolMeta::new("ListPods")
             .description(
-                "List Pods visible to this Pod from durable Pod state and the spawned-child registry. This does not expose the host-wide Pod universe.",
+                "List Pods visible to this Pod from durable Pod state, peer metadata, and the spawned-child registry. This does not expose the host-wide Pod universe.",
             )
             .input_schema(serde_json::json!({
                 "type": "object",
@@ -835,7 +836,7 @@ where
     })
 }
 
-const SEND_TO_PEER_POD_DESCRIPTION: &str = "Send a text message to a peer Pod made visible by an explicit peer handshake. The message is delivered as a peer notification through the target Pod's durable notification/history path. This does not grant delegated scope, create a spawned-child output cursor, imply parent ownership, or produce child completion notifications. Fails if the target is not a visible live peer.";
+const SEND_TO_PEER_POD_DESCRIPTION: &str = "Send a text message to a peer Pod made visible by explicit reciprocal peer metadata. The message is delivered as a peer notification through the target Pod's durable notification/history path. This does not grant delegated scope, create a spawned-child output cursor, imply parent ownership, or produce child completion notifications. Fails clearly if the target is not a visible live peer; it does not auto-restore stopped peers.";
 
 struct SendToPeerPodTool<St> {
     discovery: PodDiscovery<St>,
@@ -900,16 +901,7 @@ where
 }
 
 async fn send_peer_notify(socket_path: &Path, message: String) -> io::Result<()> {
-    let stream = tokio::time::timeout(Duration::from_secs(5), UnixStream::connect(socket_path))
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connect timed out"))??;
-    let mut writer = JsonLineWriter::new(stream);
-    tokio::time::timeout(
-        Duration::from_secs(5),
-        writer.write(&Method::Notify { message }),
-    )
-    .await
-    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "write timed out"))?
+    connect_and_send(socket_path, &Method::Notify { message }).await
 }
 
 fn json_content<T: Serialize>(value: &T) -> Result<String, ToolError> {
@@ -941,7 +933,7 @@ mod tests {
     use std::sync::Mutex;
 
     use manifest::{Permission, ScopeRule};
-    use pod_store::{FsPodStore, PodSpawnedChild, PodSpawnedScopeRule};
+    use pod_store::{FsPodStore, PodSpawnedChild, PodSpawnedScopeRule, PodStoreError};
     use protocol::stream::JsonLineWriter;
     use protocol::{Alert, AlertLevel, AlertSource};
     use session_store::{new_segment_id, new_session_id};
@@ -949,6 +941,40 @@ mod tests {
     use tokio::net::UnixListener;
 
     use crate::runtime::dir::RuntimeDir;
+
+    #[derive(Clone)]
+    struct FailTargetPeerStore {
+        inner: FsPodStore,
+    }
+
+    impl PodMetadataStore for FailTargetPeerStore {
+        fn write(&self, metadata: &PodMetadata) -> Result<(), PodStoreError> {
+            if metadata.pod_name == "target"
+                && metadata.peers.iter().any(|peer| peer.pod_name == "source")
+            {
+                return Err(PodStoreError::Io(io::Error::other(
+                    "injected target-side peer write failure",
+                )));
+            }
+            self.inner.write(metadata)
+        }
+
+        fn read_by_name(&self, pod_name: &str) -> Result<Option<PodMetadata>, PodStoreError> {
+            self.inner.read_by_name(pod_name)
+        }
+
+        fn list_names(&self) -> Result<Vec<String>, PodStoreError> {
+            self.inner.list_names()
+        }
+
+        fn root_dir(&self) -> Option<PathBuf> {
+            self.inner.root_dir()
+        }
+
+        fn delete_by_name(&self, pod_name: &str) -> Result<(), PodStoreError> {
+            self.inner.delete_by_name(pod_name)
+        }
+    }
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -1224,6 +1250,45 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn register_peer_target_failure_preserves_existing_source_peer() {
+        let root = TempDir::new().unwrap();
+        let store_dir = root.path().join("store");
+        let runtime_base = root.path().join("runtime");
+        std::fs::create_dir_all(&runtime_base).unwrap();
+        let inner = FsPodStore::new(&store_dir).unwrap();
+        inner
+            .write(&PodMetadata {
+                pod_name: "source".into(),
+                active: None,
+                spawned_children: Vec::new(),
+                reclaimed_children: Vec::new(),
+                peers: vec![pod_store::PodPeer {
+                    pod_name: "target".into(),
+                }],
+                resolved_manifest_snapshot: None,
+            })
+            .unwrap();
+        inner.write(&PodMetadata::new("target", None)).unwrap();
+        let store = FailTargetPeerStore { inner };
+        let runtime_dir = Arc::new(RuntimeDir::create(&runtime_base, "source").await.unwrap());
+        let discovery = PodDiscovery::new(
+            store.clone(),
+            "source".into(),
+            runtime_base,
+            root.path().to_path_buf(),
+            SpawnedPodRegistry::new(runtime_dir),
+        );
+
+        let err = discovery.register_peer("target").unwrap_err();
+        assert!(matches!(err, PodDiscoveryError::PodStore(_)));
+        let source = store.read_by_name("source").unwrap().unwrap();
+        assert_eq!(source.peers.len(), 1);
+        assert_eq!(source.peers[0].pod_name, "target");
+        let target = store.read_by_name("target").unwrap().unwrap();
+        assert!(target.peers.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn send_to_peer_pod_delivers_notify_without_child_registry() {
         let root = TempDir::new().unwrap();
         let store_dir = root.path().join("store");
@@ -1288,7 +1353,35 @@ mod tests {
                 .unwrap();
 
             let (stream, _) = listener.accept().await.unwrap();
-            let mut reader = JsonLineReader::new(stream);
+            let (reader_half, writer_half) = stream.into_split();
+            let mut reader = JsonLineReader::new(reader_half);
+            let mut writer = JsonLineWriter::new(writer_half);
+            writer
+                .write(&Event::Alert(Alert {
+                    level: AlertLevel::Warn,
+                    source: AlertSource::Pod,
+                    message: "connect-time alert".into(),
+                    timestamp_ms: 0,
+                }))
+                .await
+                .unwrap();
+            writer
+                .write(&Event::Snapshot {
+                    entries: Vec::new(),
+                    greeting: protocol::Greeting {
+                        pod_name: "target".into(),
+                        cwd: "/tmp".into(),
+                        provider: "test".into(),
+                        model: "test".into(),
+                        scope_summary: String::new(),
+                        tools: Vec::new(),
+                        context_window: 0,
+                        context_tokens: 0,
+                    },
+                    status: PodStatus::Idle,
+                })
+                .await
+                .unwrap();
             let method = reader.next::<Method>().await.unwrap().unwrap();
             if let Method::Notify { message } = method {
                 tx.send(message).await.unwrap();
