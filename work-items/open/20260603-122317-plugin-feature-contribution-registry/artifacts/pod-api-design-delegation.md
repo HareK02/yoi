@@ -1,15 +1,3 @@
-<!-- event: create author: tickets.sh at: 2026-06-03T12:23:17Z -->
-
-## Created
-
-Created by tickets.sh create.
-
----
-
-<!-- event: plan author: hare at: 2026-06-03T16:38:46Z -->
-
-## Plan
-
 # Delegation intent: Plugin base Pod API design
 
 ## Intent
@@ -116,6 +104,3 @@ Report:
 - the recommended API placement
 - the highest-risk API decision
 - any blockers that require parent/user decision
-
-
----
