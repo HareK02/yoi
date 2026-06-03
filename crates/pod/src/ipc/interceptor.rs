@@ -27,7 +27,8 @@ use session_store::{SystemItem, SystemReminder};
 use tools::{TaskEntry, TaskStatus, TaskStore};
 
 use crate::hook::{
-    AbortInfo, HookPromptAction, HookRegistry, PreRequestInfo, PromptSubmitInfo, ToolCallSummary,
+    AbortInfo, HookPostToolAction, HookPreRequestAction, HookPreToolAction, HookPromptAction,
+    HookRegistry, HookTurnEndAction, PreRequestInfo, PromptSubmitInfo, ToolCallSummary,
     ToolResultSummary, TurnEndInfo,
 };
 use crate::ipc::notify_buffer::{NotifyBuffer, build_system_item};
@@ -343,8 +344,8 @@ impl Interceptor for PodInterceptor {
         };
         for hook in &self.registry.pre_llm_request {
             let action = hook.call(&info).await;
-            if !matches!(action, PreRequestAction::Continue) {
-                return action;
+            if !matches!(action, HookPreRequestAction::Continue) {
+                return action.into();
             }
         }
         PreRequestAction::Continue
@@ -358,8 +359,8 @@ impl Interceptor for PodInterceptor {
         };
         for hook in &self.registry.pre_tool_call {
             let action = hook.call(&summary).await;
-            if !matches!(action, PreToolAction::Continue) {
-                return action;
+            if !matches!(action, HookPreToolAction::Continue) {
+                return action.into_worker_action(summary.call_id.clone());
             }
         }
         if is_task_management_tool(&info.call.name) {
@@ -381,8 +382,8 @@ impl Interceptor for PodInterceptor {
         };
         for hook in &self.registry.post_tool_call {
             let action = hook.call(&summary).await;
-            if !matches!(action, PostToolAction::Continue) {
-                return action;
+            if !matches!(action, HookPostToolAction::Continue) {
+                return action.into();
             }
         }
         PostToolAction::Continue
@@ -403,8 +404,8 @@ impl Interceptor for PodInterceptor {
         };
         for hook in &self.registry.on_turn_end {
             let action = hook.call(&info).await;
-            if !matches!(action, TurnEndAction::Finish) {
-                return action;
+            if !matches!(action, HookTurnEndAction::Finish) {
+                return action.into();
             }
         }
         TurnEndAction::Finish
@@ -480,16 +481,19 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize};
 
     use super::*;
-    use crate::hook::{Hook, HookRegistryBuilder, PreLlmRequest};
+    use crate::hook::{
+        Hook, HookPostToolAction, HookPreRequestAction, HookPreToolAction, HookRegistryBuilder,
+        HookTurnEndAction, OnTurnEnd, PostToolCall, PreLlmRequest, PreToolCall,
+    };
     use session_store::SystemReminderSource;
 
     struct CountingHook(Arc<AtomicUsize>);
 
     #[async_trait]
     impl Hook<PreLlmRequest> for CountingHook {
-        async fn call(&self, _info: &PreRequestInfo) -> PreRequestAction {
+        async fn call(&self, _info: &PreRequestInfo) -> HookPreRequestAction {
             self.0.fetch_add(1, Ordering::Relaxed);
-            PreRequestAction::Continue
+            HookPreRequestAction::Continue
         }
     }
 
@@ -516,7 +520,7 @@ mod tests {
         )
     }
 
-    async fn call_pre_tool(interceptor: &PodInterceptor, name: &str) {
+    fn task_tool_call_info(name: &str, input: serde_json::Value) -> ToolCallInfo {
         let def = tools::task_tools(TaskStore::new())
             .into_iter()
             .find(|def| {
@@ -525,15 +529,19 @@ mod tests {
             })
             .expect("task tool definition");
         let (meta, tool) = def();
-        let mut info = ToolCallInfo {
+        ToolCallInfo {
             call: llm_worker::tool::ToolCall {
                 id: "call-id".into(),
                 name: name.into(),
-                input: serde_json::json!({}),
+                input,
             },
             meta,
             tool,
-        };
+        }
+    }
+
+    async fn call_pre_tool(interceptor: &PodInterceptor, name: &str) {
+        let mut info = task_tool_call_info(name, serde_json::json!({}));
         let action = interceptor.pre_tool_call(&mut info).await;
         assert!(matches!(action, PreToolAction::Continue));
     }
@@ -739,10 +747,158 @@ mod tests {
 
     #[async_trait]
     impl Hook<PreLlmRequest> for AbortingHook {
-        async fn call(&self, _info: &PreRequestInfo) -> PreRequestAction {
+        async fn call(&self, _info: &PreRequestInfo) -> HookPreRequestAction {
             self.0.store(true, Ordering::Relaxed);
-            PreRequestAction::Cancel("nope".into())
+            HookPreRequestAction::Cancel("nope".into())
         }
+    }
+
+    #[tokio::test]
+    async fn public_pre_tool_hook_deny_becomes_synthetic_error_and_short_circuits() {
+        struct DenyToolHook(Arc<AtomicUsize>);
+        struct CountingToolHook(Arc<AtomicUsize>);
+
+        #[async_trait]
+        impl Hook<PreToolCall> for DenyToolHook {
+            async fn call(&self, input: &ToolCallSummary) -> HookPreToolAction {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                assert_eq!(input.call_id, "call-id");
+                assert_eq!(input.tool_name, "TaskList");
+                assert_eq!(input.arguments, serde_json::json!({"scope": "all"}));
+                HookPreToolAction::Deny("blocked by public hook".into())
+            }
+        }
+
+        #[async_trait]
+        impl Hook<PreToolCall> for CountingToolHook {
+            async fn call(&self, _input: &ToolCallSummary) -> HookPreToolAction {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                HookPreToolAction::Continue
+            }
+        }
+
+        let first_count = Arc::new(AtomicUsize::new(0));
+        let second_count = Arc::new(AtomicUsize::new(0));
+        let mut builder = HookRegistryBuilder::new();
+        builder.add_pre_tool_call(DenyToolHook(first_count.clone()));
+        builder.add_pre_tool_call(CountingToolHook(second_count.clone()));
+        let registry = Arc::new(builder.build());
+        let interceptor = PodInterceptor::new(
+            registry,
+            None,
+            None,
+            NotifyBuffer::new(),
+            Arc::new(Mutex::new(Vec::new())),
+            TaskStore::new(),
+            Arc::new(TaskReminderState::new()),
+            PromptCatalog::builtins_only().unwrap(),
+            None,
+        );
+        let mut info = task_tool_call_info("TaskList", serde_json::json!({"scope": "all"}));
+
+        let action = interceptor.pre_tool_call(&mut info).await;
+
+        match action {
+            PreToolAction::SyntheticResult(result) => {
+                assert_eq!(result.tool_use_id, "call-id");
+                assert_eq!(result.summary, "blocked by public hook");
+                assert_eq!(result.content, None);
+                assert!(result.is_error);
+            }
+            other => panic!("expected synthetic denial, got {other:?}"),
+        }
+        assert_eq!(first_count.load(Ordering::Relaxed), 1);
+        assert_eq!(second_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn public_post_tool_hooks_observe_output_but_only_abort() {
+        struct AbortAfterToolHook(Arc<AtomicUsize>);
+
+        #[async_trait]
+        impl Hook<PostToolCall> for AbortAfterToolHook {
+            async fn call(&self, input: &ToolResultSummary) -> HookPostToolAction {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                assert_eq!(input.call_id, "call-id");
+                assert_eq!(input.tool_name, "TaskList");
+                assert!(!input.is_error);
+                assert_eq!(input.output.summary, "ok");
+                assert_eq!(input.output.content.as_deref(), Some("full"));
+                HookPostToolAction::Abort("post tool abort".into())
+            }
+        }
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let mut builder = HookRegistryBuilder::new();
+        builder.add_post_tool_call(AbortAfterToolHook(count.clone()));
+        let registry = Arc::new(builder.build());
+        let interceptor = PodInterceptor::new(
+            registry,
+            None,
+            None,
+            NotifyBuffer::new(),
+            Arc::new(Mutex::new(Vec::new())),
+            TaskStore::new(),
+            Arc::new(TaskReminderState::new()),
+            PromptCatalog::builtins_only().unwrap(),
+            None,
+        );
+        let info = task_tool_call_info("TaskList", serde_json::json!({}));
+        let mut result_info = ToolResultInfo {
+            call: info.call,
+            result: llm_worker::tool::ToolResult::from_output(
+                "call-id",
+                ToolOutput {
+                    summary: "ok".into(),
+                    content: Some("full".into()),
+                },
+            ),
+            meta: info.meta,
+            tool: info.tool,
+        };
+
+        let action = interceptor.post_tool_call(&mut result_info).await;
+
+        assert_eq!(action, PostToolAction::Abort("post tool abort".to_string()));
+        assert_eq!(count.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn public_turn_end_hooks_are_observational_or_pause_only() {
+        struct PauseTurnEndHook(Arc<AtomicUsize>);
+
+        #[async_trait]
+        impl Hook<OnTurnEnd> for PauseTurnEndHook {
+            async fn call(&self, input: &TurnEndInfo) -> HookTurnEndAction {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                assert_eq!(input.turn_index, 0);
+                assert_eq!(input.tool_calls_count, 0);
+                assert_eq!(input.final_text_preview, "done");
+                HookTurnEndAction::Pause
+            }
+        }
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let mut builder = HookRegistryBuilder::new();
+        builder.add_on_turn_end(PauseTurnEndHook(count.clone()));
+        let registry = Arc::new(builder.build());
+        let interceptor = PodInterceptor::new(
+            registry,
+            None,
+            None,
+            NotifyBuffer::new(),
+            Arc::new(Mutex::new(Vec::new())),
+            TaskStore::new(),
+            Arc::new(TaskReminderState::new()),
+            PromptCatalog::builtins_only().unwrap(),
+            None,
+        );
+        let history = vec![Item::user_message("hi"), Item::assistant_message("done")];
+
+        let action = interceptor.on_turn_end(&history).await;
+
+        assert!(matches!(action, TurnEndAction::Pause));
+        assert_eq!(count.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]

@@ -29,8 +29,8 @@ use manifest::{
 use crate::compact::state::CompactState;
 use crate::compact::usage_tracker::UsageTracker;
 use crate::hook::{
-    Hook, HookRegistryBuilder, OnAbort, OnPromptSubmit, OnTurnEnd, PostToolCall, PreLlmRequest,
-    PreRequestInfo, PreToolCall,
+    Hook, HookPreRequestAction, HookRegistryBuilder, OnAbort, OnPromptSubmit, OnTurnEnd,
+    PostToolCall, PreLlmRequest, PreRequestInfo, PreToolCall,
 };
 use crate::ipc::alerter::Alerter;
 use crate::ipc::interceptor::{PodInterceptor, TaskReminderState};
@@ -43,7 +43,6 @@ use crate::runtime::dir;
 use crate::runtime::pod_registry::{self, ScopeAllocationGuard, ScopeLockError};
 use crate::workflow::WorkflowResolveError;
 use async_trait::async_trait;
-use llm_worker::interceptor::PreRequestAction;
 use protocol::{
     AlertLevel, AlertSource, Event, RewindSummary, RewindTarget, RewindTargetId, Segment,
 };
@@ -221,9 +220,9 @@ struct UsageTrackingHook {
 
 #[async_trait]
 impl Hook<PreLlmRequest> for UsageTrackingHook {
-    async fn call(&self, info: &PreRequestInfo) -> PreRequestAction {
+    async fn call(&self, info: &PreRequestInfo) -> HookPreRequestAction {
         self.tracker.note_request(info.item_count);
-        PreRequestAction::Continue
+        HookPreRequestAction::Continue
     }
 }
 
