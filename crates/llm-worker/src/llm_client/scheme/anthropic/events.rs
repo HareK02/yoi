@@ -216,6 +216,7 @@ impl AnthropicScheme {
                     index: event.index,
                     block_type: BlockType::Text, // Timeline層で上書きされる
                     stop_reason: None,
+                    reasoning: None,
                 })))
             }
             AnthropicEventType::MessageDelta => {
@@ -286,9 +287,9 @@ impl AnthropicScheme {
     /// `parse_event` の単発 Event に加えて、以下を行う:
     /// - `content_block_stop` の `block_type` を直前の Start 値で書き戻す
     /// - `thinking` / `redacted_thinking` ブロックの本体・signature・data を
-    ///   `state.pending_thinking` に蓄積し、`content_block_stop` で
-    ///   `Event::ReasoningItem` を追加発火する
-    /// - `signature_delta` を蓄積（Stream channel には流さず、reasoning event
+    ///   `state.pending_thinking` に蓄積し、`content_block_stop` の Thinking
+    ///   BlockStop metadata に載せる
+    /// - `signature_delta` を蓄積（Stream channel には流さず、reasoning metadata
     ///   にだけ反映する）
     pub(crate) fn parse_with_state(
         &self,
@@ -374,16 +375,21 @@ impl AnthropicScheme {
             AnthropicEventType::ContentBlockStop => {
                 let raw: ContentBlockStopEvent = serde_json::from_str(data)?;
                 let block_type = state.current_block_type.take().unwrap_or(BlockType::Text);
+                let reasoning = if matches!(block_type, BlockType::Thinking) {
+                    state
+                        .pending_thinking
+                        .take()
+                        .map(PendingThinking::into_reasoning)
+                } else {
+                    state.pending_thinking.take();
+                    None
+                };
                 emitted.push(Event::BlockStop(BlockStop {
                     index: raw.index,
                     block_type,
                     stop_reason: None,
+                    reasoning,
                 }));
-                if matches!(block_type, BlockType::Thinking) {
-                    if let Some(pending) = state.pending_thinking.take() {
-                        emitted.push(Event::ReasoningItem(pending.into_event()));
-                    }
-                }
             }
             // 残りは state を必要としない。既存 parse_event に委譲。
             _ => {
@@ -524,8 +530,8 @@ mod tests {
     }
 
     #[test]
-    fn thinking_block_emits_reasoning_item_with_signature() {
-        // thinking ブロックが完了したら ReasoningItem に text+signature が乗ること
+    fn thinking_block_stop_carries_reasoning_with_signature() {
+        // thinking ブロックが完了したら reasoning metadata に text+signature が乗ること
         let scheme = AnthropicScheme::new();
         let mut state = AnthropicState::default();
 
@@ -567,18 +573,18 @@ mod tests {
                 &mut state,
             )
             .unwrap();
-        // BlockStop と ReasoningItem の 2 件が並ぶ
-        assert!(matches!(stop_evs[0], Event::BlockStop(_)));
-        let Event::ReasoningItem(reasoning) = &stop_evs[1] else {
-            panic!("expected ReasoningItem, got {:?}", stop_evs[1]);
+        assert_eq!(stop_evs.len(), 1);
+        let Event::BlockStop(stop) = &stop_evs[0] else {
+            panic!("expected BlockStop, got {:?}", stop_evs[0]);
         };
-        assert_eq!(reasoning.text, "hello world");
+        let reasoning = stop.reasoning.as_ref().expect("reasoning metadata");
+        assert_eq!(reasoning.text.as_deref(), Some("hello world"));
         assert_eq!(reasoning.signature.as_deref(), Some("SIG-XYZ"));
         assert!(reasoning.encrypted_content.is_none());
     }
 
     #[test]
-    fn redacted_thinking_emits_reasoning_item_with_data() {
+    fn redacted_thinking_stop_carries_reasoning_with_data() {
         let scheme = AnthropicScheme::new();
         let mut state = AnthropicState::default();
 
@@ -596,16 +602,18 @@ mod tests {
                 &mut state,
             )
             .unwrap();
-        let Event::ReasoningItem(reasoning) = &stop_evs[1] else {
-            panic!("expected ReasoningItem");
+        assert_eq!(stop_evs.len(), 1);
+        let Event::BlockStop(stop) = &stop_evs[0] else {
+            panic!("expected BlockStop");
         };
-        assert!(reasoning.text.is_empty());
+        let reasoning = stop.reasoning.as_ref().expect("reasoning metadata");
+        assert_eq!(reasoning.text.as_deref(), Some(""));
         assert!(reasoning.signature.is_none());
         assert_eq!(reasoning.encrypted_content.as_deref(), Some("opaque-blob"));
     }
 
     #[test]
-    fn text_block_does_not_emit_reasoning_item() {
+    fn text_block_stop_has_no_reasoning_metadata() {
         let scheme = AnthropicScheme::new();
         let mut state = AnthropicState::default();
 
@@ -631,7 +639,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stop_evs.len(), 1);
-        assert!(matches!(stop_evs[0], Event::BlockStop(_)));
+        let Event::BlockStop(stop) = &stop_evs[0] else {
+            panic!("expected BlockStop");
+        };
+        assert!(stop.reasoning.is_none());
     }
 
     #[test]

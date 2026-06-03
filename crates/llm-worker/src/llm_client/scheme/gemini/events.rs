@@ -205,6 +205,7 @@ impl GeminiScheme {
                         index: candidate_index,
                         block_type: BlockType::Text,
                         stop_reason,
+                        reasoning: None,
                     }));
                 }
             }

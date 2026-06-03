@@ -3,7 +3,7 @@
 //! LLMからのイベントストリームを受信し、登録されたHandlerにディスパッチします。
 //! 通常はWorker経由で使用しますが、直接使用することも可能です。
 
-use std::marker::PhantomData;
+use std::{collections::HashMap, marker::PhantomData};
 
 use super::event::*;
 use crate::handler::*;
@@ -189,7 +189,7 @@ where
     H: Handler<ThinkingBlockKind>,
 {
     handler: H,
-    scope: Option<H::Scope>,
+    scopes: HashMap<usize, H::Scope>,
 }
 
 impl<H> ThinkingBlockHandlerWrapper<H>
@@ -199,7 +199,7 @@ where
     fn new(handler: H) -> Self {
         Self {
             handler,
-            scope: None,
+            scopes: HashMap::new(),
         }
     }
 }
@@ -210,44 +210,43 @@ where
     H::Scope: Send + Sync,
 {
     fn dispatch_start(&mut self, start: &BlockStart) {
-        if let Some(scope) = &mut self.scope {
-            self.handler.on_event(
-                scope,
-                &ThinkingBlockEvent::Start(ThinkingBlockStart { index: start.index }),
-            );
-        }
+        let scope = self.scopes.entry(start.index).or_default();
+        self.handler.on_event(
+            scope,
+            &ThinkingBlockEvent::Start(ThinkingBlockStart { index: start.index }),
+        );
     }
 
     fn dispatch_delta(&mut self, delta: &BlockDelta) {
-        if let Some(scope) = &mut self.scope {
-            if let DeltaContent::Thinking(text) = &delta.delta {
-                self.handler
-                    .on_event(scope, &ThinkingBlockEvent::Delta(text.clone()));
-            }
+        if let DeltaContent::Thinking(text) = &delta.delta {
+            let scope = self.scopes.entry(delta.index).or_default();
+            self.handler
+                .on_event(scope, &ThinkingBlockEvent::Delta(text.clone()));
         }
     }
 
     fn dispatch_stop(&mut self, stop: &BlockStop) {
-        if let Some(scope) = &mut self.scope {
+        if let Some(mut scope) = self.scopes.remove(&stop.index) {
             self.handler.on_event(
-                scope,
-                &ThinkingBlockEvent::Stop(ThinkingBlockStop { index: stop.index }),
+                &mut scope,
+                &ThinkingBlockEvent::Stop(ThinkingBlockStop {
+                    index: stop.index,
+                    reasoning: stop.reasoning.clone(),
+                }),
             );
         }
     }
 
-    fn dispatch_abort(&mut self, _abort: &BlockAbort) {}
-
-    fn start_scope(&mut self) {
-        self.scope = Some(H::Scope::default());
+    fn dispatch_abort(&mut self, _abort: &BlockAbort) {
+        self.scopes.clear();
     }
 
-    fn end_scope(&mut self) {
-        self.scope = None;
-    }
+    fn start_scope(&mut self) {}
+
+    fn end_scope(&mut self) {}
 
     fn has_scope(&self) -> bool {
-        self.scope.is_some()
+        !self.scopes.is_empty()
     }
 }
 
@@ -375,8 +374,6 @@ pub struct Timeline {
     ping_handlers: Vec<Box<dyn ErasedHandler<PingKind>>>,
     status_handlers: Vec<Box<dyn ErasedHandler<StatusKind>>>,
     error_handlers: Vec<Box<dyn ErasedHandler<ErrorKind>>>,
-    reasoning_item_handlers: Vec<Box<dyn ErasedHandler<ReasoningItemKind>>>,
-
     // Block系ハンドラー（BlockTypeごとにグループ化）
     text_block_handlers: Vec<Box<dyn ErasedBlockHandler>>,
     thinking_block_handlers: Vec<Box<dyn ErasedBlockHandler>>,
@@ -405,7 +402,6 @@ impl Timeline {
             ping_handlers: Vec::new(),
             status_handlers: Vec::new(),
             error_handlers: Vec::new(),
-            reasoning_item_handlers: Vec::new(),
             text_block_handlers: Vec::new(),
             thinking_block_handlers: Vec::new(),
             tool_use_block_handlers: Vec::new(),
@@ -467,18 +463,6 @@ impl Timeline {
         self
     }
 
-    /// `ReasoningItemKind` 用 Handler を登録
-    pub fn on_reasoning_item<H>(&mut self, handler: H) -> &mut Self
-    where
-        H: Handler<ReasoningItemKind> + Send + Sync + 'static,
-        H::Scope: Send + Sync,
-    {
-        let mut wrapper = HandlerWrapper::new(handler);
-        wrapper.start_scope();
-        self.reasoning_item_handlers.push(Box::new(wrapper));
-        self
-    }
-
     /// TextBlockKind用のHandlerを登録
     pub fn on_text_block<H>(&mut self, handler: H) -> &mut Self
     where
@@ -532,9 +516,6 @@ impl Timeline {
             Event::BlockDelta(d) => self.handle_block_delta(d),
             Event::BlockStop(s) => self.handle_block_stop(s),
             Event::BlockAbort(a) => self.handle_block_abort(a),
-
-            // 完成済み reasoning item: 即時ディスパッチ
-            Event::ReasoningItem(r) => self.dispatch_reasoning_item(r),
         }
     }
 
@@ -573,12 +554,6 @@ impl Timeline {
 
     fn dispatch_error(&mut self, event: &ErrorEvent) {
         for handler in &mut self.error_handlers {
-            handler.dispatch(event);
-        }
-    }
-
-    fn dispatch_reasoning_item(&mut self, event: &ReasoningItemEvent) {
-        for handler in &mut self.reasoning_item_handlers {
             handler.dispatch(event);
         }
     }

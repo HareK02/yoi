@@ -91,16 +91,6 @@ impl Kind for ErrorKind {
     type Event = ErrorEvent;
 }
 
-/// Reasoning item Kind - 完成済み reasoning item の永続化用
-///
-/// 1 reasoning item につき 1 度だけ発火する。Worker は
-/// `ReasoningItemCollector` 経由で受け取り、ターン終了時に
-/// `Item::Reasoning` として history に append する。
-pub struct ReasoningItemKind;
-impl Kind for ReasoningItemKind {
-    type Event = ReasoningItemEvent;
-}
-
 // =============================================================================
 // Block Kind Definitions
 // =============================================================================
@@ -152,6 +142,7 @@ pub struct ThinkingBlockStart {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ThinkingBlockStop {
     pub index: usize,
+    pub reasoning: Option<ReasoningBlockData>,
 }
 
 /// ToolUseBlock Kind - for tool use blocks
