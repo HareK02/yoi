@@ -1,15 +1,3 @@
-<!-- event: create author: tickets.sh at: 2026-06-03T00:11:24Z -->
-
-## Created
-
-Created by tickets.sh create.
-
----
-
-<!-- event: plan author: hare at: 2026-06-03T00:51:09Z -->
-
-## Plan
-
 # Delegation intent: unify reasoning persistence with block lifecycle
 
 Intent:
@@ -73,6 +61,3 @@ Completion report:
 - validation commands and results;
 - unresolved risks or parent decisions needed;
 - whether ready for external review.
-
-
----
