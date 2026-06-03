@@ -73,16 +73,14 @@ impl From<HookPreRequestAction> for PreRequestAction {
 
 /// Hook-facing pre-tool-call action.
 ///
-/// Hooks may continue, skip/pause/abort the call, or deny it with an error
+/// Hooks may continue, pause/abort the call, or deny it with an error
 /// string that Pod converts into a synthetic tool result for the current
-/// tool call. Hooks cannot mutate the tool call arguments or construct
-/// arbitrary `ToolResult` values.
+/// tool call. Hooks cannot express the internal no-result skip path, mutate
+/// the tool call arguments, or construct arbitrary `ToolResult` values.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HookPreToolAction {
     /// Proceed with tool execution.
     Continue,
-    /// Skip this tool call without executing it.
-    Skip,
     /// Deny this tool call and commit a synthetic error result.
     Deny(String),
     /// Abort the entire run.
@@ -95,7 +93,6 @@ impl HookPreToolAction {
     pub(crate) fn into_worker_action(self, call_id: String) -> PreToolAction {
         match self {
             HookPreToolAction::Continue => PreToolAction::Continue,
-            HookPreToolAction::Skip => PreToolAction::Skip,
             HookPreToolAction::Deny(reason) => {
                 PreToolAction::SyntheticResult(ToolResult::error(call_id, reason))
             }
@@ -239,7 +236,8 @@ pub trait HookEventKind: Send + Sync + 'static {
 pub struct OnPromptSubmit;
 /// Before each LLM request; may continue, cancel, or yield.
 pub struct PreLlmRequest;
-/// Before each tool is executed; may continue, skip, deny, abort, or pause.
+/// Before each tool is executed; may continue, deny with a synthetic result,
+/// abort, or pause.
 pub struct PreToolCall;
 /// After each tool completes; observational except it may abort the run.
 pub struct PostToolCall;
@@ -361,4 +359,33 @@ pub struct HookRegistry {
     pub(crate) post_tool_call: Vec<Box<dyn Hook<PostToolCall>>>,
     pub(crate) on_turn_end: Vec<Box<dyn Hook<OnTurnEnd>>>,
     pub(crate) on_abort: Vec<Box<dyn Hook<OnAbort>>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn public_pre_tool_hook_actions_cannot_emit_internal_no_result_skip() {
+        let continue_action = HookPreToolAction::Continue.into_worker_action("call_1".into());
+        assert!(matches!(continue_action, PreToolAction::Continue));
+
+        let deny_action =
+            HookPreToolAction::Deny("blocked".into()).into_worker_action("call_2".into());
+        match deny_action {
+            PreToolAction::SyntheticResult(result) => {
+                assert_eq!(result.tool_use_id, "call_2");
+                assert_eq!(result.summary, "blocked");
+                assert!(result.is_error);
+            }
+            other => panic!("public deny must produce synthetic result, got {other:?}"),
+        }
+
+        let abort_action =
+            HookPreToolAction::Abort("stop".into()).into_worker_action("call_3".into());
+        assert!(matches!(abort_action, PreToolAction::Abort(reason) if reason == "stop"));
+
+        let pause_action = HookPreToolAction::Pause.into_worker_action("call_4".into());
+        assert!(matches!(pause_action, PreToolAction::Pause));
+    }
 }
