@@ -1,13 +1,11 @@
 use async_trait::async_trait;
-use llm_worker::interceptor::PreToolAction;
 use llm_worker::llm_client::client::LlmClient;
-use llm_worker::tool::ToolResult;
 use manifest::{ToolPermissionAction, ToolPermissionConfig};
 use serde_json::Value;
 use session_store::Store;
 
 use crate::Pod;
-use crate::hook::{Hook, PreToolCall, ToolCallSummary};
+use crate::hook::{Hook, HookPreToolAction, PreToolCall, ToolCallSummary};
 
 /// Built-in manifest permission policy for `PreToolCall`.
 ///
@@ -47,34 +45,28 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
 
 #[async_trait]
 impl Hook<PreToolCall> for PermissionHook {
-    async fn call(&self, input: &ToolCallSummary) -> PreToolAction {
+    async fn call(&self, input: &ToolCallSummary) -> HookPreToolAction {
         match self.action_for(input) {
-            ToolPermissionAction::Allow => PreToolAction::Continue,
-            ToolPermissionAction::Deny => PreToolAction::SyntheticResult(permission_denied(input)),
+            ToolPermissionAction::Allow => HookPreToolAction::Continue,
+            ToolPermissionAction::Deny => HookPreToolAction::Deny(permission_denied_message(input)),
             ToolPermissionAction::Ask => {
-                PreToolAction::SyntheticResult(permission_ask_unsupported(input))
+                HookPreToolAction::Deny(permission_ask_unsupported_message(input))
             }
         }
     }
 }
 
-fn permission_denied(input: &ToolCallSummary) -> ToolResult {
-    ToolResult::error(
-        input.call_id.clone(),
-        format!(
-            "permission denied: tool `{}` arguments matched the manifest permission policy",
-            input.tool_name
-        ),
+fn permission_denied_message(input: &ToolCallSummary) -> String {
+    format!(
+        "permission denied: tool `{}` arguments matched the manifest permission policy",
+        input.tool_name
     )
 }
 
-fn permission_ask_unsupported(input: &ToolCallSummary) -> ToolResult {
-    ToolResult::error(
-        input.call_id.clone(),
-        format!(
-            "permission ask unsupported: tool `{}` requires approval, but this runtime has no permission approval protocol; denied fail-closed",
-            input.tool_name
-        ),
+fn permission_ask_unsupported_message(input: &ToolCallSummary) -> String {
+    format!(
+        "permission ask unsupported: tool `{}` requires approval, but this runtime has no permission approval protocol; denied fail-closed",
+        input.tool_name
     )
 }
 
@@ -123,6 +115,7 @@ fn wildcard_match(pattern: &str, text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hook::HookPreToolAction;
     use manifest::ToolPermissionRule;
 
     fn summary(tool_name: &str, arguments: Value) -> ToolCallSummary {
@@ -166,6 +159,45 @@ mod tests {
         let input = summary("Read", serde_json::json!({ "file_path": "/tmp/a.txt" }));
 
         assert_eq!(hook.action_for(&input), ToolPermissionAction::Deny);
+    }
+
+    #[tokio::test]
+    async fn deny_and_ask_fail_closed_as_public_deny_actions() {
+        let deny = PermissionHook::new(ToolPermissionConfig {
+            default_action: ToolPermissionAction::Deny,
+            rules: Vec::new(),
+        });
+        let denied = deny
+            .call(&summary(
+                "Bash",
+                serde_json::json!({ "command": "rm -rf target" }),
+            ))
+            .await;
+        match denied {
+            HookPreToolAction::Deny(message) => {
+                assert!(message.contains("permission denied"));
+                assert!(message.contains("Bash"));
+            }
+            other => panic!("expected fail-closed deny action, got {other:?}"),
+        }
+
+        let ask = PermissionHook::new(ToolPermissionConfig {
+            default_action: ToolPermissionAction::Ask,
+            rules: Vec::new(),
+        });
+        let asked = ask
+            .call(&summary(
+                "Bash",
+                serde_json::json!({ "command": "git status" }),
+            ))
+            .await;
+        match asked {
+            HookPreToolAction::Deny(message) => {
+                assert!(message.contains("permission ask unsupported"));
+                assert!(message.contains("denied fail-closed"));
+            }
+            other => panic!("expected ask fail-closed deny action, got {other:?}"),
+        }
     }
 
     #[test]

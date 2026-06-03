@@ -2,8 +2,7 @@
 //!
 //! Hooks are the **public** orchestration extension point. They receive
 //! read-only summary information about each event in the Worker
-//! execution loop and return a control-flow action
-//! (continue / skip / abort / pause).
+//! execution loop and return a safe public control-flow action.
 //!
 //! Hooks intentionally cannot mutate the Worker's context, history, tool
 //! call, or tool result. Internal mechanisms that need such access (e.g.
@@ -18,7 +17,7 @@ use async_trait::async_trait;
 use llm_worker::interceptor::{
     PostToolAction, PreRequestAction, PreToolAction, PromptAction, TurnEndAction,
 };
-use llm_worker::tool::ToolOutput;
+use llm_worker::tool::{ToolOutput, ToolResult};
 use serde_json::Value;
 
 /// Hook-facing prompt-submit action.
@@ -32,7 +31,7 @@ use serde_json::Value;
 pub enum HookPromptAction {
     /// Proceed normally.
     Continue,
-    /// Cancel with a reason.
+    /// Cancel this submitted prompt with a reason.
     Cancel(String),
 }
 
@@ -41,6 +40,109 @@ impl From<HookPromptAction> for PromptAction {
         match action {
             HookPromptAction::Continue => PromptAction::Continue,
             HookPromptAction::Cancel(reason) => PromptAction::Cancel(reason),
+        }
+    }
+}
+
+/// Hook-facing pre-LLM-request action.
+///
+/// Public hooks may observe the request boundary, cancel the run, or yield
+/// control back to the caller. They cannot return
+/// `PreRequestAction::ContinueWith(Vec<Item>)`; model-visible request/history
+/// additions must use durable host-owned paths such as notifications or
+/// system-item commits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HookPreRequestAction {
+    /// Proceed normally.
+    Continue,
+    /// Cancel the run with a reason.
+    Cancel(String),
+    /// Yield control to the caller for host-owned processing/resume.
+    Yield,
+}
+
+impl From<HookPreRequestAction> for PreRequestAction {
+    fn from(action: HookPreRequestAction) -> Self {
+        match action {
+            HookPreRequestAction::Continue => PreRequestAction::Continue,
+            HookPreRequestAction::Cancel(reason) => PreRequestAction::Cancel(reason),
+            HookPreRequestAction::Yield => PreRequestAction::Yield,
+        }
+    }
+}
+
+/// Hook-facing pre-tool-call action.
+///
+/// Hooks may continue, pause/abort the call, or deny it with an error
+/// string that Pod converts into a synthetic tool result for the current
+/// tool call. Hooks cannot express the internal no-result skip path, mutate
+/// the tool call arguments, or construct arbitrary `ToolResult` values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HookPreToolAction {
+    /// Proceed with tool execution.
+    Continue,
+    /// Deny this tool call and commit a synthetic error result.
+    Deny(String),
+    /// Abort the entire run.
+    Abort(String),
+    /// Pause execution.
+    Pause,
+}
+
+impl HookPreToolAction {
+    pub(crate) fn into_worker_action(self, call_id: String) -> PreToolAction {
+        match self {
+            HookPreToolAction::Continue => PreToolAction::Continue,
+            HookPreToolAction::Deny(reason) => {
+                PreToolAction::SyntheticResult(ToolResult::error(call_id, reason))
+            }
+            HookPreToolAction::Abort(reason) => PreToolAction::Abort(reason),
+            HookPreToolAction::Pause => PreToolAction::Pause,
+        }
+    }
+}
+
+/// Hook-facing post-tool-call action.
+///
+/// Post-tool hooks are observational except that they may abort the run. They
+/// cannot rewrite the tool output; adding an explicit bounded transform would
+/// require a separate safe public type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HookPostToolAction {
+    /// Proceed normally.
+    Continue,
+    /// Abort the entire run.
+    Abort(String),
+}
+
+impl From<HookPostToolAction> for PostToolAction {
+    fn from(action: HookPostToolAction) -> Self {
+        match action {
+            HookPostToolAction::Continue => PostToolAction::Continue,
+            HookPostToolAction::Abort(reason) => PostToolAction::Abort(reason),
+        }
+    }
+}
+
+/// Hook-facing turn-end action.
+///
+/// Turn-end hooks may observe a completed turn and optionally pause further
+/// execution. They cannot return
+/// `TurnEndAction::ContinueWithMessages(Vec<Item>)`; public hooks must not
+/// append arbitrary model-visible messages at turn boundaries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HookTurnEndAction {
+    /// Finish the turn normally.
+    Finish,
+    /// Pause execution.
+    Pause,
+}
+
+impl From<HookTurnEndAction> for TurnEndAction {
+    fn from(action: HookTurnEndAction) -> Self {
+        match action {
+            HookTurnEndAction::Finish => TurnEndAction::Finish,
+            HookTurnEndAction::Pause => TurnEndAction::Pause,
         }
     }
 }
@@ -121,8 +223,8 @@ pub struct AbortInfo {
 
 /// Marker trait for hook event kinds.
 ///
-/// Each event kind specifies its read-only input and the control-flow
-/// action returned by hooks.
+/// Each event kind specifies its read-only input and the safe public
+/// control-flow action returned by hooks.
 pub trait HookEventKind: Send + Sync + 'static {
     /// Read-only input passed to the hook.
     type Input: Send + Sync;
@@ -130,17 +232,18 @@ pub trait HookEventKind: Send + Sync + 'static {
     type Output;
 }
 
-/// After receiving user input, before adding to history.
+/// After receiving user input, before adding to history; may continue or cancel.
 pub struct OnPromptSubmit;
-/// Before each LLM request.
+/// Before each LLM request; may continue, cancel, or yield.
 pub struct PreLlmRequest;
-/// Before each tool is executed.
+/// Before each tool is executed; may continue, deny with a synthetic result,
+/// abort, or pause.
 pub struct PreToolCall;
-/// After each tool completes.
+/// After each tool completes; observational except it may abort the run.
 pub struct PostToolCall;
-/// When a turn ends with no tool calls.
+/// When a turn ends with no tool calls; observational except it may pause.
 pub struct OnTurnEnd;
-/// When execution is interrupted.
+/// When execution is interrupted; observational only.
 pub struct OnAbort;
 
 impl HookEventKind for OnPromptSubmit {
@@ -150,22 +253,22 @@ impl HookEventKind for OnPromptSubmit {
 
 impl HookEventKind for PreLlmRequest {
     type Input = PreRequestInfo;
-    type Output = PreRequestAction;
+    type Output = HookPreRequestAction;
 }
 
 impl HookEventKind for PreToolCall {
     type Input = ToolCallSummary;
-    type Output = PreToolAction;
+    type Output = HookPreToolAction;
 }
 
 impl HookEventKind for PostToolCall {
     type Input = ToolResultSummary;
-    type Output = PostToolAction;
+    type Output = HookPostToolAction;
 }
 
 impl HookEventKind for OnTurnEnd {
     type Input = TurnEndInfo;
-    type Output = TurnEndAction;
+    type Output = HookTurnEndAction;
 }
 
 impl HookEventKind for OnAbort {
@@ -180,9 +283,9 @@ impl HookEventKind for OnAbort {
 /// Async hook for a specific event kind.
 ///
 /// Hooks receive a shared reference to the event's read-only input
-/// and return a control-flow action. Multiple hooks can be registered
-/// per event; they are evaluated in registration order and
-/// short-circuit on the first non-Continue (or non-Finish) result.
+/// and return a safe public control-flow action. Multiple hooks can be
+/// registered per event; they are evaluated in registration order and
+/// short-circuit on the first non-continue action.
 #[async_trait]
 pub trait Hook<E: HookEventKind>: Send + Sync {
     async fn call(&self, input: &E::Input) -> E::Output;
@@ -256,4 +359,33 @@ pub struct HookRegistry {
     pub(crate) post_tool_call: Vec<Box<dyn Hook<PostToolCall>>>,
     pub(crate) on_turn_end: Vec<Box<dyn Hook<OnTurnEnd>>>,
     pub(crate) on_abort: Vec<Box<dyn Hook<OnAbort>>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn public_pre_tool_hook_actions_cannot_emit_internal_no_result_skip() {
+        let continue_action = HookPreToolAction::Continue.into_worker_action("call_1".into());
+        assert!(matches!(continue_action, PreToolAction::Continue));
+
+        let deny_action =
+            HookPreToolAction::Deny("blocked".into()).into_worker_action("call_2".into());
+        match deny_action {
+            PreToolAction::SyntheticResult(result) => {
+                assert_eq!(result.tool_use_id, "call_2");
+                assert_eq!(result.summary, "blocked");
+                assert!(result.is_error);
+            }
+            other => panic!("public deny must produce synthetic result, got {other:?}"),
+        }
+
+        let abort_action =
+            HookPreToolAction::Abort("stop".into()).into_worker_action("call_3".into());
+        assert!(matches!(abort_action, PreToolAction::Abort(reason) if reason == "stop"));
+
+        let pause_action = HookPreToolAction::Pause.into_worker_action("call_4".into());
+        assert!(matches!(pause_action, PreToolAction::Pause));
+    }
 }
