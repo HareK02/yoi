@@ -7,7 +7,7 @@ kind: task
 priority: P1
 labels: [work-item, intake, orchestration, tui]
 created_at: 2026-06-01T03:12:52Z
-updated_at: 2026-06-01T05:26:27Z
+updated_at: 2026-06-03T12:25:05Z
 assignee: null
 legacy_ticket: null
 ---
@@ -21,6 +21,7 @@ legacy_ticket: null
 ## Direction
 
 - `tickets.sh` 相当の work item 管理を、Insomnia の built-in feature / tool surface として設計・実装する。
+- WorkItem は Pod 専用の独自 context injection や特殊 queue ではなく、`plugin-feature-contribution-registry` で定義する feature contribution として既存 Tool / Hook / Notify 経路に載せる。
 - Intake Pod はユーザーと直接会話し、必要な調査・重複確認・要件同期を行い、合意済み WorkItem / ticket を作成できるようにする。
 - Orchestrator はユーザー意図の一次解釈や ticket draft の再承認者ではなく、登録済み WorkItem の scheduling / prioritization / interruption / implementation delegation を担当する。
 - ユーザー向け Inbox 専用 UI は初期スコープにしない。Intake は既存の `--multi` UI の延長として通常の Pod 会話で制御できるようにする。
@@ -42,6 +43,7 @@ Scope は、エージェントが占有して作業する filesystem space を�
   - status transition
   - close / resolution
   - doctor / consistency check
+- WorkItem tool surface は `plugin-feature-contribution-registry` の built-in feature contribution として登録できること。
 - WorkItem / ticket の保存形式は、現在の markdown + frontmatter + thread / artifacts 方式との移行可能性を保つこと。
 - 既存の `tickets.sh` 運用を即座に破壊しないこと。built-in 化の途中でも git history / work-items directory を authority として読めること。
 - Intake Pod がユーザーと合意済み WorkItem を作成できる導線を設計すること。

@@ -7,7 +7,7 @@ kind: feature
 priority: P2
 labels: [plugin, hooks, tools, wasm, mcp]
 created_at: 2026-05-31T01:00:05Z
-updated_at: 2026-05-31T01:01:09Z
+updated_at: 2026-06-03T12:25:05Z
 assignee: null
 legacy_ticket: null
 ---
@@ -26,6 +26,8 @@ The plugin surface should not be a grab bag of arbitrary code execution. Candida
 ## Related work
 
 - `work-items/open/20260529-161928-mcp-integration/` — MCP integration as one plugin backend / external capability bridge.
+- `work-items/open/20260603-122317-plugin-feature-contribution-registry/` — implementation-oriented runtime registry split-out for built-in and external feature contributions.
+- `work-items/open/20260603-122317-hook-public-surface-hardening/` — prerequisite hardening for public Hook contribution safety.
 - Existing internal hooks/tools code: `crates/pod`, `crates/tools`, `crates/llm-worker`.
 - Manifest permission policy and scope enforcement must remain authoritative for plugin-provided tools.
 
@@ -69,7 +71,7 @@ The plugin surface should not be a grab bag of arbitrary code execution. Candida
    - Define Plugin, PluginManifest, PluginRuntimeKind, Tool contribution, Hook contribution, capability request, and trust/source model.
    - Map MCP, declarative hooks, and WASM onto that model.
 2. **Internal registry boundary**
-   - Introduce code structure that can register plugin-provided tool/hook descriptors without changing runtime behavior yet.
+   - Detailed implementation is split to `plugin-feature-contribution-registry` so this ticket can stay focused on the architecture surface and invariants.
 3. **Declarative hooks MVP**
    - Add a non-code configuration path for simple hook behavior if an immediate use case exists.
 4. **WASM spike**
