@@ -586,10 +586,12 @@ impl App {
         self.queued_inputs.len()
     }
 
+    #[cfg(test)]
     pub fn input_history_len(&self) -> usize {
         self.input_history.entries.len()
     }
 
+    #[cfg(test)]
     pub fn input_history_is_browsing(&self) -> bool {
         self.input_history.is_browsing()
     }
@@ -1700,6 +1702,22 @@ impl App {
     }
     pub fn move_cursor_right(&mut self) {
         self.active_input_mut().move_right();
+    }
+    pub fn move_cursor_word_left(&mut self) {
+        self.active_input_mut().move_word_left();
+    }
+    pub fn move_cursor_word_right(&mut self) {
+        self.active_input_mut().move_word_right();
+    }
+    pub fn delete_word_before_cursor(&mut self) {
+        let command_mode = self.is_command_mode();
+        if !command_mode {
+            self.input_history.cancel_browse();
+        }
+        self.active_input_mut().delete_word_before();
+        if command_mode {
+            self.command_completion_selected = None;
+        }
     }
     pub fn move_cursor_start(&mut self) {
         self.active_input_mut().move_start();

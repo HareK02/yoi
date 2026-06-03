@@ -573,6 +573,22 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Option<Method> {
             app.move_cursor_start();
             Some(app.refresh_completion())
         }
+        KeyCode::Left if ctrl || alt => {
+            app.move_cursor_word_left();
+            Some(app.refresh_completion())
+        }
+        KeyCode::Right if ctrl || alt => {
+            app.move_cursor_word_right();
+            Some(app.refresh_completion())
+        }
+        KeyCode::Backspace if ctrl || alt => {
+            app.delete_word_before_cursor();
+            Some(app.refresh_completion())
+        }
+        KeyCode::Char('w') if ctrl => {
+            app.delete_word_before_cursor();
+            Some(app.refresh_completion())
+        }
         KeyCode::Char('u') if ctrl && app.is_command_mode() => {
             app.clear_command_input();
             Some(None)
@@ -1065,6 +1081,125 @@ mod tests {
         );
         assert!(matches!(cancel, Some(Method::Cancel)));
         assert_eq!(app.queued_input_count(), 0);
+    }
+
+    #[test]
+    fn word_navigation_keys_edit_composer() {
+        let mut app = App::new("agent".to_string());
+        for c in "foo bar".chars() {
+            assert!(
+                handle_key(
+                    &mut app,
+                    KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+                )
+                .is_none()
+            );
+        }
+
+        assert!(
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL)
+            )
+            .is_none()
+        );
+        assert!(
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('_'), KeyModifiers::NONE)
+            )
+            .is_none()
+        );
+        assert_eq!(input_text(&app), "foo _bar");
+
+        assert!(handle_key(&mut app, KeyEvent::new(KeyCode::Right, KeyModifiers::ALT)).is_none());
+        assert!(
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE)
+            )
+            .is_none()
+        );
+        assert_eq!(input_text(&app), "foo _bar!");
+
+        assert!(
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL)
+            )
+            .is_none()
+        );
+        assert_eq!(input_text(&app), "foo ");
+    }
+
+    #[test]
+    fn ctrl_w_deletes_word_before_cursor() {
+        let mut app = App::new("agent".to_string());
+        for c in "foo bar baz".chars() {
+            assert!(
+                handle_key(
+                    &mut app,
+                    KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+                )
+                .is_none()
+            );
+        }
+
+        assert!(
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL)
+            )
+            .is_none()
+        );
+        assert_eq!(input_text(&app), "foo bar ");
+    }
+
+    #[test]
+    fn word_navigation_keys_edit_command_input() {
+        let mut app = App::new("agent".to_string());
+        assert!(
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE)
+            )
+            .is_none()
+        );
+        for c in "peer alpha beta".chars() {
+            assert!(
+                handle_key(
+                    &mut app,
+                    KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+                )
+                .is_none()
+            );
+        }
+
+        assert!(
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL)
+            )
+            .is_none()
+        );
+        assert!(
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('_'), KeyModifiers::NONE)
+            )
+            .is_none()
+        );
+        assert_eq!(app.command_text(), "peer alpha _beta");
+
+        assert!(
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL)
+            )
+            .is_none()
+        );
+        assert_eq!(app.command_text(), "peer alpha beta");
+        assert_eq!(input_text(&app), "");
     }
 
     #[test]

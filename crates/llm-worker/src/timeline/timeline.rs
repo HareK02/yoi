@@ -47,10 +47,8 @@ fn merge_usage(acc: &mut UsageEvent, new: &UsageEvent) {
 pub trait ErasedHandler<K: Kind>: Send + Sync {
     /// イベントをディスパッチ
     fn dispatch(&mut self, event: &K::Event);
-    /// スコープを開始（Block開始時）
+    /// スコープを開始
     fn start_scope(&mut self);
-    /// スコープを終了（Block終了時）
-    fn end_scope(&mut self);
 }
 
 /// `Handler<K>`を`ErasedHandler<K>`として扱うためのラッパー
@@ -93,10 +91,6 @@ where
 
     fn start_scope(&mut self) {
         self.scope = Some(H::Scope::default());
-    }
-
-    fn end_scope(&mut self) {
-        self.scope = None;
     }
 }
 
