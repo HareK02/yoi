@@ -230,3 +230,12 @@ No merge-blocking residual risk found. The remaining risk is API polish for the 
 
 
 ---
+
+<!-- event: close author: hare at: 2026-06-03T17:07:44Z status: closed -->
+
+## Closed
+
+Hardened public pod::hook actions for plugin/feature exposure. Public hooks no longer expose raw Item injection or no-result pre-tool skip; public pre-tool deny maps to synthetic error results; internal interceptor capabilities remain internal. Added focused Pod-layer hook tests; reviewer blocker fixed and rereview approved. Validation passed: cargo test -p pod hook --lib, cargo test -p pod --lib, cargo test -p llm-worker --lib, cargo fmt --check, cargo check --workspace --all-targets, ./tickets.sh doctor, git diff --check, nix build .#yoi, ./result/bin/yoi pod --help.
+
+
+---

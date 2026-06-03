@@ -2,12 +2,12 @@
 id: 20260603-122317-hook-public-surface-hardening
 slug: hook-public-surface-hardening
 title: Hook: harden public hook surface before plugin exposure
-status: open
+status: closed
 kind: task
 priority: P1
 labels: [hooks, plugin, safety, tests]
 created_at: 2026-06-03T12:23:17Z
-updated_at: 2026-06-03T17:05:43Z
+updated_at: 2026-06-03T17:07:44Z
 assignee: null
 legacy_ticket: null
 ---
