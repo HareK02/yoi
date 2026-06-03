@@ -7,7 +7,7 @@ kind: task
 priority: P1
 labels: [hooks, plugin, safety, tests]
 created_at: 2026-06-03T12:23:17Z
-updated_at: 2026-06-03T16:36:57Z
+updated_at: 2026-06-03T16:58:49Z
 assignee: null
 legacy_ticket: null
 ---
