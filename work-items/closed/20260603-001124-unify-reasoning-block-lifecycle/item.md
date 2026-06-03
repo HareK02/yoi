@@ -2,12 +2,12 @@
 id: 20260603-001124-unify-reasoning-block-lifecycle
 slug: unify-reasoning-block-lifecycle
 title: Unify reasoning persistence with block lifecycle
-status: open
+status: closed
 kind: task
 priority: P2
 labels: [llm-worker, reasoning, timeline]
 created_at: 2026-06-03T00:11:24Z
-updated_at: 2026-06-03T00:51:09Z
+updated_at: 2026-06-03T02:15:02Z
 assignee: null
 legacy_ticket: null
 ---
