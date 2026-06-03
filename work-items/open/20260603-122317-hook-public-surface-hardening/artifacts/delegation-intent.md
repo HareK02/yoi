@@ -1,15 +1,3 @@
-<!-- event: create author: tickets.sh at: 2026-06-03T12:23:17Z -->
-
-## Created
-
-Created by tickets.sh create.
-
----
-
-<!-- event: plan author: hare at: 2026-06-03T16:36:57Z -->
-
-## Plan
-
 # Delegation intent: Hook public surface hardening
 
 ## Intent
@@ -94,6 +82,3 @@ Report:
 - validation commands and results
 - unresolved risks or follow-up recommendations
 - whether the work is ready for external review
-
-
----
