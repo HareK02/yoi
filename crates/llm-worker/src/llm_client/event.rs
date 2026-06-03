@@ -17,14 +17,12 @@ use serde::{Deserialize, Serialize};
 ///
 /// - **メタイベント**: `Ping`, `Usage`, `Status`, `Error`, `UnhandledSse`
 /// - **ブロックイベント**: `BlockStart`, `BlockDelta`, `BlockStop`, `BlockAbort`
-/// - **永続化イベント**: `ReasoningItem` (history に commit すべき完成済み
-///   reasoning item。streaming 表示用の Thinking BlockStart/Delta/Stop と
-///   は別経路で発火する)
 ///
 /// # ブロックのライフサイクル
 ///
-/// テキストやツール呼び出しは、`BlockStart` → `BlockDelta`(複数) → `BlockStop`
-/// の順序でイベントが発生します。
+/// テキスト、thinking、ツール呼び出しは、`BlockStart` → `BlockDelta`(複数) → `BlockStop`
+/// の順序でイベントが発生します。thinking の round-trip metadata は
+/// `BlockStop.reasoning` に載ります。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Event {
     /// ハートビート
@@ -48,18 +46,6 @@ pub enum Event {
     BlockStop(BlockStop),
     /// ブロック中断
     BlockAbort(BlockAbort),
-
-    /// Reasoning item の完成。scheme が「次の request に送り返すための
-    /// reasoning material が揃った」点で 1 度だけ発火する。
-    ///
-    /// - Anthropic: 1 つの `thinking` content_block 完了ごと
-    /// - OpenAI Responses: 1 つの reasoning output_item 完了ごと
-    ///
-    /// 上位層（Worker / ReasoningItemCollector）はこれを `Item::Reasoning`
-    /// として `worker.history` に append する。streaming 表示用の
-    /// `BlockStart(Thinking)` / `BlockDelta(Thinking)` / `BlockStop(Thinking)`
-    /// は依然として並行発火する（live display と round-trip persist の責務分離）。
-    ReasoningItem(ReasoningItemEvent),
 }
 
 // =============================================================================
@@ -218,6 +204,12 @@ pub struct BlockStop {
     pub block_type: BlockType,
     /// 停止理由
     pub stop_reason: Option<StopReason>,
+    /// Thinking block の停止時に確定した reasoning round-trip metadata。
+    ///
+    /// `None` の Thinking block は live streaming / trace 用で、history に
+    /// `Item::Reasoning` として永続化しない。`Some` の場合は block lifecycle
+    /// が永続化の authoritative source になる。
+    pub reasoning: Option<ReasoningBlockData>,
 }
 
 impl BlockStop {
@@ -243,22 +235,17 @@ impl BlockAbort {
     }
 }
 
-// =============================================================================
-// Reasoning Item Event
-// =============================================================================
-
-/// 完成済み reasoning item。scheme が round-trip に必要なすべての
-/// material（text, summary, encrypted_content, signature, id）を揃えて
-/// 1 度だけ発火する。
+/// Thinking block stop で確定した reasoning material。
 ///
-/// `Item::Reasoning` のフィールドを 1:1 に持つ。
+/// `Item::Reasoning` の round-trip に必要な provider material を保持する。
+/// `text` は deltas から収集した本文を上書きするために使う（metadata-only
+/// reasoning block や provider completion event で全文が届くケース）。
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-pub struct ReasoningItemEvent {
+pub struct ReasoningBlockData {
     /// scheme 側で観測した item id（OpenAI Responses の `id`）。
     pub id: Option<String>,
-    /// reasoning 本体テキスト。Anthropic は `thinking` 累積、OpenAI は
-    /// `reasoning_text` 累積。redacted_thinking では空。
-    pub text: String,
+    /// reasoning 本体テキスト。`None` の場合は block delta 収集結果を使う。
+    pub text: Option<String>,
     /// summary (OpenAI Responses の `summary_text[]`)。他 scheme は空。
     pub summary: Vec<String>,
     /// 暗号化された opaque blob（Anthropic `redacted_thinking.data` /
@@ -309,6 +296,7 @@ impl Event {
             index,
             block_type: BlockType::Text,
             stop_reason,
+            reasoning: None,
         })
     }
 
@@ -338,6 +326,7 @@ impl Event {
             index,
             block_type: BlockType::ToolUse,
             stop_reason: Some(StopReason::ToolUse),
+            reasoning: None,
         })
     }
 

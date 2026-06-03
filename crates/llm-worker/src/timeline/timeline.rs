@@ -231,7 +231,10 @@ where
         if let Some(scope) = &mut self.scope {
             self.handler.on_event(
                 scope,
-                &ThinkingBlockEvent::Stop(ThinkingBlockStop { index: stop.index }),
+                &ThinkingBlockEvent::Stop(ThinkingBlockStop {
+                    index: stop.index,
+                    reasoning: stop.reasoning.clone(),
+                }),
             );
         }
     }
@@ -375,8 +378,6 @@ pub struct Timeline {
     ping_handlers: Vec<Box<dyn ErasedHandler<PingKind>>>,
     status_handlers: Vec<Box<dyn ErasedHandler<StatusKind>>>,
     error_handlers: Vec<Box<dyn ErasedHandler<ErrorKind>>>,
-    reasoning_item_handlers: Vec<Box<dyn ErasedHandler<ReasoningItemKind>>>,
-
     // Block系ハンドラー（BlockTypeごとにグループ化）
     text_block_handlers: Vec<Box<dyn ErasedBlockHandler>>,
     thinking_block_handlers: Vec<Box<dyn ErasedBlockHandler>>,
@@ -405,7 +406,6 @@ impl Timeline {
             ping_handlers: Vec::new(),
             status_handlers: Vec::new(),
             error_handlers: Vec::new(),
-            reasoning_item_handlers: Vec::new(),
             text_block_handlers: Vec::new(),
             thinking_block_handlers: Vec::new(),
             tool_use_block_handlers: Vec::new(),
@@ -467,18 +467,6 @@ impl Timeline {
         self
     }
 
-    /// `ReasoningItemKind` 用 Handler を登録
-    pub fn on_reasoning_item<H>(&mut self, handler: H) -> &mut Self
-    where
-        H: Handler<ReasoningItemKind> + Send + Sync + 'static,
-        H::Scope: Send + Sync,
-    {
-        let mut wrapper = HandlerWrapper::new(handler);
-        wrapper.start_scope();
-        self.reasoning_item_handlers.push(Box::new(wrapper));
-        self
-    }
-
     /// TextBlockKind用のHandlerを登録
     pub fn on_text_block<H>(&mut self, handler: H) -> &mut Self
     where
@@ -532,9 +520,6 @@ impl Timeline {
             Event::BlockDelta(d) => self.handle_block_delta(d),
             Event::BlockStop(s) => self.handle_block_stop(s),
             Event::BlockAbort(a) => self.handle_block_abort(a),
-
-            // 完成済み reasoning item: 即時ディスパッチ
-            Event::ReasoningItem(r) => self.dispatch_reasoning_item(r),
         }
     }
 
@@ -573,12 +558,6 @@ impl Timeline {
 
     fn dispatch_error(&mut self, event: &ErrorEvent) {
         for handler in &mut self.error_handlers {
-            handler.dispatch(event);
-        }
-    }
-
-    fn dispatch_reasoning_item(&mut self, event: &ReasoningItemEvent) {
-        for handler in &mut self.reasoning_item_handlers {
             handler.dispatch(event);
         }
     }

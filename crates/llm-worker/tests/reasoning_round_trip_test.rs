@@ -16,27 +16,53 @@ mod common;
 use common::MockLlmClient;
 use llm_worker::Item;
 use llm_worker::Worker;
-use llm_worker::llm_client::event::{Event, ReasoningItemEvent, ResponseStatus, StatusEvent};
+use llm_worker::llm_client::event::{
+    BlockMetadata, BlockStart, BlockStop, BlockType, Event, ReasoningBlockData, ResponseStatus,
+    StatusEvent,
+};
+
+fn reasoning_block(text: impl Into<String>, data: ReasoningBlockData) -> Vec<Event> {
+    vec![
+        Event::BlockStart(BlockStart {
+            index: 100,
+            block_type: BlockType::Thinking,
+            metadata: BlockMetadata::Thinking,
+        }),
+        Event::BlockDelta(llm_worker::llm_client::event::BlockDelta {
+            index: 100,
+            delta: llm_worker::llm_client::event::DeltaContent::Thinking(text.into()),
+        }),
+        Event::BlockStop(BlockStop {
+            index: 100,
+            block_type: BlockType::Thinking,
+            stop_reason: None,
+            reasoning: Some(data),
+        }),
+    ]
+}
 
 /// Anthropic 風: thinking ブロック → text → 終了 のシーケンス。
 /// Worker history に Reasoning(signature 付き) → assistant_message が並ぶ。
 #[tokio::test]
 async fn anthropic_thinking_round_trips_signature_into_history() {
-    let events = vec![
-        Event::ReasoningItem(ReasoningItemEvent {
+    let mut events = reasoning_block(
+        "let me think...",
+        ReasoningBlockData {
             id: None,
-            text: "let me think...".into(),
+            text: None,
             summary: Vec::new(),
             encrypted_content: None,
             signature: Some("SIG-OPUS".into()),
-        }),
+        },
+    );
+    events.extend([
         Event::text_block_start(0),
         Event::text_delta(0, "Here's the answer"),
         Event::text_block_stop(0, None),
         Event::Status(StatusEvent {
             status: ResponseStatus::Completed,
         }),
-    ];
+    ]);
     let client = MockLlmClient::new(events);
     let worker = Worker::new(client);
     let out = worker.run("question?").await.expect("run ok");
@@ -63,21 +89,24 @@ async fn anthropic_thinking_round_trips_signature_into_history() {
 /// `Item::Reasoning` のフィールドに展開されること。
 #[tokio::test]
 async fn openai_reasoning_round_trips_encrypted_and_summary() {
-    let events = vec![
-        Event::ReasoningItem(ReasoningItemEvent {
+    let mut events = reasoning_block(
+        "",
+        ReasoningBlockData {
             id: Some("r1".into()),
-            text: "inner reasoning".into(),
+            text: Some("inner reasoning".into()),
             summary: vec!["sum-A".into(), "sum-B".into()],
             encrypted_content: Some("ENC-OPAQUE".into()),
             signature: None,
-        }),
+        },
+    );
+    events.extend([
         Event::text_block_start(0),
         Event::text_delta(0, "answer"),
         Event::text_block_stop(0, None),
         Event::Status(StatusEvent {
             status: ResponseStatus::Completed,
         }),
-    ];
+    ]);
     let client = MockLlmClient::new(events);
     let worker = Worker::new(client);
     let out = worker.run("q").await.expect("run ok");
@@ -107,21 +136,23 @@ async fn openai_reasoning_round_trips_encrypted_and_summary() {
 /// が thinking を assistant メッセージの先頭に要求するため）。
 #[tokio::test]
 async fn reasoning_precedes_text_in_assistant_burst() {
-    let events = vec![
-        // text/tool_call とは独立に、ReasoningItem が中盤で発火しても、
+    let mut events = vec![
+        // text/tool_call とは独立に、reasoning block が中盤で完了しても、
         // history append 時には assistant items の先頭に置かれる。
         Event::text_block_start(0),
         Event::text_delta(0, "intermediate"),
         Event::text_block_stop(0, None),
-        Event::ReasoningItem(ReasoningItemEvent {
-            text: "after text".into(),
+    ];
+    events.extend(reasoning_block(
+        "after text",
+        ReasoningBlockData {
             signature: Some("SIG".into()),
             ..Default::default()
-        }),
-        Event::Status(StatusEvent {
-            status: ResponseStatus::Completed,
-        }),
-    ];
+        },
+    ));
+    events.push(Event::Status(StatusEvent {
+        status: ResponseStatus::Completed,
+    }));
     let client = MockLlmClient::new(events);
     let worker = Worker::new(client);
     let out = worker.run("q").await.expect("run ok");

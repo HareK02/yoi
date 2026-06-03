@@ -9,7 +9,7 @@ use crate::llm_client::{
     ClientError,
     auth::AuthRequirement,
     capability::ModelCapability,
-    event::{BlockType, Event, ReasoningItemEvent},
+    event::{BlockType, Event, ReasoningBlockData},
     scheme::Scheme,
     types::Request,
 };
@@ -23,7 +23,7 @@ use super::AnthropicScheme;
 ///    `BlockStop` に書き戻す。
 /// 2. `thinking` ブロック中の `thinking_delta` テキストと `signature_delta`
 ///    署名、および `redacted_thinking` ブロックの `data` を蓄積し、
-///    `content_block_stop` で `Event::ReasoningItem` を発火する
+///    `content_block_stop` の Thinking block metadata として返す
 ///    （round-trip 永続化のため）。
 #[derive(Debug, Default)]
 pub struct AnthropicState {
@@ -40,10 +40,10 @@ pub(crate) struct PendingThinking {
 }
 
 impl PendingThinking {
-    pub(crate) fn into_event(self) -> ReasoningItemEvent {
-        ReasoningItemEvent {
+    pub(crate) fn into_reasoning(self) -> ReasoningBlockData {
+        ReasoningBlockData {
             id: None,
-            text: self.text,
+            text: Some(self.text),
             summary: Vec::new(),
             encrypted_content: self.redacted_data,
             signature: self.signature,

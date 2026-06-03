@@ -14,7 +14,7 @@ use crate::llm_client::{
     ClientError,
     event::{
         BlockDelta, BlockMetadata, BlockStart, BlockStop, BlockType, DeltaContent, ErrorEvent,
-        Event, ReasoningItemEvent, ResponseStatus, StatusEvent, UnhandledSseEvent, UsageEvent,
+        Event, ReasoningBlockData, ResponseStatus, StatusEvent, UnhandledSseEvent, UsageEvent,
     },
 };
 
@@ -25,8 +25,8 @@ pub struct OpenAIResponsesState {
     next_index: usize,
     /// 蓄積中の reasoning output_item。`output_item.added`(Reasoning) で
     /// 確保し、`reasoning_text.delta` / `reasoning_summary_text.delta` で
-    /// 蓄積、`output_item.done`(Reasoning) で `Event::ReasoningItem` を
-    /// 発火してエントリを除去する。
+    /// 蓄積、`output_item.done`(Reasoning) で metadata-only Thinking block を
+    /// 完了させて reasoning persistence material を渡す。
     pending_reasoning: HashMap<usize, PendingReasoning>,
 }
 
@@ -380,8 +380,8 @@ pub(crate) fn parse_sse(
 
         "response.output_item.done" => {
             let ev: OutputItemDone = from_json(data)?;
-            // Reasoning wrapper の done で蓄積分を ReasoningItem として発火。
-            // これは `slots` の OutputItem slot とは独立している
+            // Reasoning wrapper の done で蓄積分を metadata-only Thinking block
+            // stop に載せる。これは `slots` の OutputItem slot とは独立している
             // (FunctionCall は slots、Reasoning は pending_reasoning)。
             if let OutputItem::Reasoning {
                 id,
@@ -396,23 +396,39 @@ pub(crate) fn parse_sse(
                 if pending.id.is_none() {
                     pending.id = id;
                 }
-                return Ok(vec![Event::ReasoningItem(ReasoningItemEvent {
-                    id: pending.id,
-                    text: pending.text,
-                    summary: pending
-                        .summary
-                        .into_iter()
-                        .filter(|s| !s.is_empty())
-                        .collect(),
-                    encrypted_content,
-                    signature: None,
-                })]);
+                let info =
+                    state.allocate(SlotKey::OutputItem(ev.output_index), BlockType::Thinking);
+                state.slots.remove(&SlotKey::OutputItem(ev.output_index));
+                return Ok(vec![
+                    Event::BlockStart(BlockStart {
+                        index: info.flat_index,
+                        block_type: BlockType::Thinking,
+                        metadata: BlockMetadata::Thinking,
+                    }),
+                    Event::BlockStop(BlockStop {
+                        index: info.flat_index,
+                        block_type: BlockType::Thinking,
+                        stop_reason: None,
+                        reasoning: Some(ReasoningBlockData {
+                            id: pending.id,
+                            text: Some(pending.text),
+                            summary: pending
+                                .summary
+                                .into_iter()
+                                .filter(|s| !s.is_empty())
+                                .collect(),
+                            encrypted_content,
+                            signature: None,
+                        }),
+                    }),
+                ]);
             }
             if let Some(info) = state.slots.remove(&SlotKey::OutputItem(ev.output_index)) {
                 Ok(vec![Event::BlockStop(BlockStop {
                     index: info.flat_index,
                     block_type: info.block_type,
                     stop_reason: None,
+                    reasoning: None,
                 })])
             } else {
                 Ok(Vec::new())
@@ -450,6 +466,7 @@ pub(crate) fn parse_sse(
                     index: info.flat_index,
                     block_type: info.block_type,
                     stop_reason: None,
+                    reasoning: None,
                 })])
             } else {
                 Ok(Vec::new())
@@ -531,6 +548,7 @@ pub(crate) fn parse_sse(
                     index: info.flat_index,
                     block_type: info.block_type,
                     stop_reason: None,
+                    reasoning: None,
                 })])
             } else {
                 Ok(Vec::new())
@@ -1116,9 +1134,9 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_output_item_emits_reasoning_item_with_text_summary_encrypted() {
+    fn reasoning_output_item_completes_metadata_thinking_block_with_text_summary_encrypted() {
         // 完成済み reasoning wrapper が text + summary[] + encrypted_content を持って
-        // ReasoningItem として届くこと。
+        // Thinking BlockStop metadata として届くこと。
         let mut state = OpenAIResponsesState::default();
 
         // wrapper added (id だけ持つ)
@@ -1171,12 +1189,14 @@ mod tests {
             "response.output_item.done",
             r#"{"output_index":0,"item":{"type":"reasoning","id":"r1","encrypted_content":"ENC-XYZ"}}"#,
         );
-        assert_eq!(evs.len(), 1);
-        let Event::ReasoningItem(reasoning) = &evs[0] else {
-            panic!("expected ReasoningItem, got {:?}", evs[0]);
+        assert_eq!(evs.len(), 2);
+        assert!(matches!(evs[0], Event::BlockStart(_)));
+        let Event::BlockStop(stop) = &evs[1] else {
+            panic!("expected BlockStop, got {:?}", evs[1]);
         };
+        let reasoning = stop.reasoning.as_ref().expect("reasoning metadata");
         assert_eq!(reasoning.id.as_deref(), Some("r1"));
-        assert_eq!(reasoning.text, "hello world");
+        assert_eq!(reasoning.text.as_deref(), Some("hello world"));
         assert_eq!(reasoning.summary, vec!["sum-A".to_string()]);
         assert_eq!(reasoning.encrypted_content.as_deref(), Some("ENC-XYZ"));
         assert!(reasoning.signature.is_none());
@@ -1187,7 +1207,7 @@ mod tests {
     #[test]
     fn reasoning_wrapper_without_inner_content_emits_empty_text() {
         // encrypted_content だけ届く（reasoning_text 無し）ケースでも
-        // ReasoningItem は発火する。
+        // reasoning metadata は届く。
         let mut state = OpenAIResponsesState::default();
         with(
             &mut state,
@@ -1199,10 +1219,13 @@ mod tests {
             "response.output_item.done",
             r#"{"output_index":2,"item":{"type":"reasoning","id":"r9","encrypted_content":"BLOB"}}"#,
         );
-        let Event::ReasoningItem(r) = &evs[0] else {
-            panic!()
+        assert_eq!(evs.len(), 2);
+        assert!(matches!(evs[0], Event::BlockStart(_)));
+        let Event::BlockStop(stop) = &evs[1] else {
+            panic!("expected BlockStop")
         };
-        assert!(r.text.is_empty());
+        let r = stop.reasoning.as_ref().expect("reasoning metadata");
+        assert_eq!(r.text.as_deref(), Some(""));
         assert!(r.summary.is_empty());
         assert_eq!(r.encrypted_content.as_deref(), Some("BLOB"));
     }
