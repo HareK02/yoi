@@ -7,7 +7,7 @@ kind: feature
 priority: P1
 labels: [plugin, registry, tools, hooks, orchestration]
 created_at: 2026-06-03T12:23:17Z
-updated_at: 2026-06-03T16:38:46Z
+updated_at: 2026-06-03T16:44:05Z
 assignee: null
 legacy_ticket: null
 ---
