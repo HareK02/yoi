@@ -9,6 +9,7 @@ use session_store::Store;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::discovery::{PodDiscovery, list_pods_tool, restore_pod_tool, send_to_peer_pod_tool};
+use crate::feature::{FeatureRegistryBuilder, builtin::task_feature};
 use crate::ipc::alerter::Alerter;
 use crate::ipc::notify_buffer::NotifyBuffer;
 use crate::ipc::server::SocketServer;
@@ -502,8 +503,6 @@ where
     let pod_store = pod.store().clone();
     let self_parent_socket = pod.callback_socket().cloned();
 
-    let worker = pod.worker_mut();
-
     // The Pod's SharedScope (already augmented with the bash-output
     // Read rule by the caller) is the single source of truth — every
     // ScopedFs (builtin tools, fs_view, compact worker) reads from it,
@@ -515,13 +514,18 @@ where
     // a clone for the FS view we attach below, since the tools consume
     // `fs` itself.
     let fs_for_view = fs.clone();
-    worker.register_tools(tools::builtin_tools(
+    pod.worker_mut().register_tools(tools::core_builtin_tools(
         fs,
         tracker.clone(),
-        task_store,
         bash_output_dir,
         web_config,
     ));
+
+    let mut feature_registry = FeatureRegistryBuilder::new();
+    feature_registry.add_module(task_feature(task_store));
+    let _feature_install_report = pod.install_features(feature_registry);
+
+    let worker = pod.worker_mut();
 
     // Memory subsystem opt-in. When `[memory]` is present in the
     // manifest, register the memory-specific Read/Write/Edit tools that

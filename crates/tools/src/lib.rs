@@ -43,8 +43,9 @@ pub use tracker::Tracker;
 pub use web::{web_fetch_tool, web_search_tool};
 pub use write::write_tool;
 
-/// Register all builtin tools, wiring them to a shared `ScopedFs`
-/// (Pod-process lifetime) and `Tracker` (Pod-process lifetime).
+/// Register core builtin tools that do not require Pod-local task state,
+/// wiring them to a shared `ScopedFs` (Pod-process lifetime) and `Tracker`
+/// (Pod-process lifetime).
 ///
 /// All returned factories share the same tracker instance so that
 /// `Read` / `Write` / `Edit` see a consistent history across tool
@@ -54,14 +55,13 @@ pub use write::write_tool;
 /// caller is responsible for adding that path to the readable scope
 /// (see [`manifest::Scope::with_extra_read`]) so the agent can `Read`
 /// the saved files.
-pub fn builtin_tools(
+pub fn core_builtin_tools(
     fs: ScopedFs,
     tracker: Tracker,
-    task_store: TaskStore,
     bash_output_dir: std::path::PathBuf,
     web_config: Option<manifest::WebConfig>,
 ) -> Vec<llm_worker::tool::ToolDefinition> {
-    let mut defs = vec![
+    vec![
         read_tool(fs.clone(), tracker.clone()),
         write_tool(fs.clone(), tracker.clone()),
         edit_tool(fs.clone(), tracker),
@@ -70,7 +70,19 @@ pub fn builtin_tools(
         bash_tool(fs, bash_output_dir),
         web_search_tool(web::WebTools::new(web_config.clone())),
         web_fetch_tool(web::WebTools::new(web_config)),
-    ];
+    ]
+}
+
+/// Register all builtin tools, including task tools, for callers that are not
+/// using the Pod feature registry path.
+pub fn builtin_tools(
+    fs: ScopedFs,
+    tracker: Tracker,
+    task_store: TaskStore,
+    bash_output_dir: std::path::PathBuf,
+    web_config: Option<manifest::WebConfig>,
+) -> Vec<llm_worker::tool::ToolDefinition> {
+    let mut defs = core_builtin_tools(fs, tracker, bash_output_dir, web_config);
     defs.extend(task_tools(task_store));
     defs
 }
