@@ -2,7 +2,7 @@
 
 ## 1. Summary recommendation
 
-Introduce a `pod::feature` public API as the single Pod-side registration layer for built-in features and future external plugins. A feature module should declare its identity, requested capabilities, and contributions, then install those contributions only through typed host registrars for existing Pod/Worker surfaces: `ToolRegistry`, the hardened safe `pod::hook` surface, host-managed background tasks, and host-owned notification/history/alert/diagnostic paths.
+Introduce a `pod::feature` public API as the single Pod-side registration layer for built-in features and future external plugins. A feature module should declare its identity, requested capabilities, service dependencies, service exports, and contributions, then install those capabilities only through typed host registrars for existing Pod/Worker surfaces: `ToolRegistry`, the hardened safe `pod::hook` surface, host-managed background tasks, host-mediated service registry, and host-owned notification/history/alert/diagnostic paths.
 
 The registry should not become a second runtime, a plugin dispatcher tool, or a generic `Pod` mutation escape hatch. Feature state remains inside the feature module; the Pod owns only install metadata, diagnostics, granted host handles, and normal durable session/runtime surfaces.
 
@@ -65,6 +65,7 @@ pub mod feature {
     pub mod hook;
     pub mod notify;
     pub mod registry;
+    pub mod service;
     pub mod tool;
 
     pub use background::{BackgroundTaskContribution, BackgroundTaskRegistrar};
@@ -72,6 +73,7 @@ pub mod feature {
     pub use diagnostic::{FeatureDiagnostic, FeatureInstallReport};
     pub use notify::{FeatureAlertSink, FeatureNotifySink};
     pub use registry::{FeatureDescriptor, FeatureId, FeatureInstallContext, FeatureModule, FeatureRuntimeKind};
+    pub use service::{FeatureServiceProvider, FeatureServiceRegistrar, ServiceDeclaration, ServiceRequirement, YoiService};
     pub use tool::ToolContribution;
 }
 ```
@@ -91,6 +93,8 @@ pub struct FeatureDescriptor {
     pub version: Option<String>,
     pub runtime: FeatureRuntimeKind,    // Builtin, ExternalProcess, McpBridge, WasmPlaceholder, DeclarativePlaceholder
     pub requested_capabilities: Vec<CapabilityRequest>,
+    pub provides_services: Vec<ServiceDeclaration>,
+    pub requires_services: Vec<ServiceRequirement>,
     pub declared_tools: Vec<ToolDeclaration>,
     pub declared_hooks: Vec<HookDeclaration>,
     pub declared_background_tasks: Vec<BackgroundTaskDeclaration>,
@@ -110,11 +114,12 @@ pub struct FeatureInstallContext<'a> {
     pub grants: &'a CapabilityGrantSet,
     pub tools: ToolRegistrar<'a>,
     pub hooks: PublicHookRegistrar<'a>,
+    pub services: FeatureServiceProvider<'a>,
+    pub service_exports: FeatureServiceRegistrar<'a>,
     pub background_tasks: BackgroundTaskRegistrar<'a>,
     pub notify: FeatureNotifySink<'a>,
     pub alerts: FeatureAlertSink<'a>,
     pub diagnostics: FeatureDiagnosticSink<'a>,
-    pub services: FeatureServiceProvider<'a>,
 }
 ```
 
@@ -123,7 +128,8 @@ Important details:
 - `FeatureDescriptor` is declarative and serializable. It is safe to show in diagnostics, profile previews, and `ListFeatures`-style future tooling.
 - `FeatureModule::install` is runtime code that wires stateful tool/hook implementations into host registrars.
 - `FeatureInstallContext` must not expose `Pod`, `Worker`, raw `ToolServerHandle`, raw `Interceptor`, raw `NotifyBuffer`, raw `LogWriter`, raw `event_tx`, or direct history mutation.
-- `FeatureServiceProvider` returns only host services backed by granted capabilities, for example scoped filesystem access, WorkItem store access, memory access, Pod orchestration handles, web provider handles, or secret references. It should return `Denied`/`Unavailable` diagnostics instead of exposing partial internals.
+- `FeatureServiceProvider` returns only host-mediated services backed by granted capabilities and resolved service dependencies, for example scoped filesystem access, WorkItem store access, memory access, Pod orchestration handles, web provider handles, secret references, or another feature's declared public service. It should return `Denied`/`Unavailable` diagnostics instead of exposing partial internals.
+- `FeatureServiceRegistrar` lets a feature expose a narrow public service API to other features. This is an extension boundary for future plugin-to-plugin APIs, not a requirement to move already-implemented core behavior out of the host.
 
 ### Example registration snippet
 
@@ -297,6 +303,54 @@ Rules:
 - The host records task lifecycle/status in install/runtime diagnostics. Do not expose arbitrary feature-defined event channels for task progress.
 - Initial activation can be conservative (`PodLifetime` and/or `OnDemand`); restart policy may start with `Never`, but the API should make shutdown/cancellation behavior explicit from the beginning.
 
+### Service contribution and dependency
+
+Add a host-mediated service registry so a feature/plugin can publish a narrow API and another feature/plugin can depend on that API without importing the provider's concrete implementation or bypassing capability policy.
+
+This is not a plan to move existing implemented core features out of the host immediately. Core-backed APIs may remain core-backed. The service form exists so future detachable features can depend on stable public interfaces rather than private Pod internals or another plugin's concrete state.
+
+Initial shape:
+
+```rust
+pub trait YoiService: Send + Sync + 'static {
+    fn service_id(&self) -> ServiceId;
+    fn service_version(&self) -> ServiceVersion;
+}
+
+pub struct ServiceDeclaration {
+    pub id: ServiceId,                  // e.g. yoi.memory.v1
+    pub version: ServiceVersion,
+    pub description: String,
+    pub operations: Vec<ServiceOperationDeclaration>,
+}
+
+pub struct ServiceRequirement {
+    pub id: ServiceId,
+    pub version: ServiceVersionReq,
+    pub optional: bool,
+    pub reason: String,
+}
+
+pub struct FeatureServiceRegistrar<'a> { /* host-owned */ }
+pub struct FeatureServiceProvider<'a> { /* host-owned */ }
+```
+
+Rules:
+
+- A feature may provide a service through `FeatureServiceRegistrar`, and consumers may obtain the service only through `FeatureServiceProvider` after host dependency resolution and capability grant checks.
+- Features must not directly hold another feature's concrete module/state unless that handle was returned by the host service registry.
+- Service identity is source-independent interface identity (`yoi.memory.v1`, `yoi.pod-management.v1`, `project.issue-tracker.v1`), while provider identity remains a `FeatureId`.
+- Service dependencies are resolved during feature registry preflight. Required missing services skip the consumer feature with diagnostics; optional missing services install the consumer in a degraded mode if its installer supports that.
+- Service dependency cycles are rejected initially. Late-bound/cyclic service handles are out of scope until a real need appears.
+- In-process built-in services may use Rust trait objects internally. External plugin/WASM/MCP services should be represented by host-side proxies that implement the same service interface boundary; do not expose raw foreign runtime handles.
+- Service handles should be capability-bound. Prefer narrowed interfaces such as read-only vs write-capable services, or enforce caller/grant checks through a host-provided service call context.
+
+Examples:
+
+- `builtin:memory` may provide `yoi.memory.v1` and contribute memory tools. A WorkItem intake feature may require `yoi.memory.v1` optionally for contextual lookup.
+- `builtin:pod-orchestration` may provide `yoi.pod-management.v1` and contribute Pod management tools. The actual Pod lifecycle/scope authority remains host-owned; the service is a controlled façade.
+- A future issue-tracker plugin may provide `project.issue-tracker.v1`, while WorkItem tooling consumes that service without knowing the concrete plugin package.
+
 ### Capability request/grant/diagnostics
 
 Capabilities are requested by descriptors and granted by the host. A feature may request a capability, but it must not assume the capability exists.
@@ -308,6 +362,8 @@ pub enum HostCapability {
     ContributeTool { name: ToolName },
     ContributeHook { point: pod::hook::HookPoint },
     RunBackgroundTask,
+    ProvideService { id: ServiceId },
+    UseService { id: ServiceId, access: ServiceAccess },
     EmitModelNotification,
     EmitAlert,
     ScopedFs { read: bool, write: bool, execute: bool },
@@ -336,6 +392,8 @@ pub struct FeatureInstallReport {
     pub installed_tools: Vec<ToolName>,
     pub installed_hooks: Vec<String>,
     pub installed_background_tasks: Vec<FeatureTaskId>,
+    pub provided_services: Vec<ServiceId>,
+    pub resolved_services: Vec<ServiceResolutionReport>,
     pub skipped_contributions: Vec<SkippedContribution>,
     pub diagnostics: Vec<FeatureDiagnostic>,
 }
@@ -347,8 +405,8 @@ Diagnostics must avoid secrets and must be safe for session logs, TUI display, a
 
 Feature state belongs to the feature module.
 
-- A feature may own `Arc<State>` and clone it into contributed tools, hooks, and background tasks.
-- The Pod registry stores descriptors, install reports, enabled/disabled status, and host-owned handles. It does not store feature business state.
+- A feature may own `Arc<State>` and clone it into contributed tools, hooks, background tasks, and service implementations.
+- The Pod registry stores descriptors, service resolution records, install reports, enabled/disabled status, and host-owned handles. It does not store feature business state.
 - Durable feature data must live in a feature-owned or host-granted store with an explicit API: WorkItem files through a WorkItem service, memory records through memory APIs, plugin config/state through a future plugin-state service, etc.
 - Session history is not feature storage. It is an audit/replay record of model-visible interactions and committed system items.
 - A feature that needs restoration after process restart should reconstruct itself from its own durable store/config plus normal Pod metadata, not from private data hidden in Worker context.
@@ -370,6 +428,7 @@ Public features/plugins must not be able to perform these operations:
 - Grant themselves capabilities or infer grants from successful construction.
 - Mutate manifest/profile/scope state directly.
 - Perform filesystem/process/network/secret access outside granted host services.
+- Depend on another feature/plugin by concrete implementation, private state, raw process handle, or direct module pointer instead of a host-resolved service interface.
 - Emit unbounded tool outputs, diagnostics, alerts, task-status reports, or notification bodies.
 - Emit arbitrary plugin-defined UI payloads, dialogs, or event-channel messages.
 - Put secrets into diagnostics, session logs, model context, TUI output, or feature install reports.
@@ -387,6 +446,7 @@ Recommended placement:
   - install reports/diagnostics
   - capability request/grant model
   - typed registrars/sinks
+  - service registry, service declarations, and dependency resolution reports
 
 - `crates/pod/src/hook.rs`
   - remains the public hook module after hardening
@@ -410,9 +470,10 @@ Install location in Pod startup:
 1. Resolve manifest/profile and host capability policy.
 2. Construct `Pod` and internal safety surfaces.
 3. Install host/internal hooks such as manifest permission enforcement.
-4. Build and install enabled feature modules through `FeatureRegistryBuilder`.
-5. Flush/register tools through the existing Worker tool registry.
-6. Freeze/install the Pod interceptor and start normal run/attach behavior.
+4. Build enabled feature descriptors, collect declared service providers/requirements, resolve the service dependency DAG, and compute capability grants.
+5. Install enabled feature modules through `FeatureRegistryBuilder`, including service exports, tools, hooks, and background task declarations.
+6. Flush/register tools through the existing Worker tool registry.
+7. Freeze/install the Pod interceptor, start host-managed background tasks at their activation point, and start normal run/attach behavior.
 
 The exact sequencing can be adjusted to match current construction, but the invariant should hold: public feature hooks cannot precede host safety hooks, and feature tools must exist before the model receives the final tool schema for a run.
 
@@ -425,30 +486,35 @@ Recommended migration is incremental and behavior-preserving:
    - Define which hook decisions are safe for external contributors.
 
 2. Add `pod::feature` with no behavior change.
-   - Implement descriptors, capability grants, install reports, and registrars.
+   - Implement descriptors, service declarations/requirements, capability grants, install reports, and registrars.
    - Initially register no external plugins.
 
-3. Wrap current built-in tool registration as built-in feature modules.
+3. Add the service registry as a host-mediated boundary.
+   - Start with core-backed services or a trivial built-in service provider to validate provider/consumer resolution.
+   - Do not move existing Memory or Pod management implementation solely for this ticket.
+   - Use diagnostics for missing required services, optional degraded service dependencies, and service cycles.
+
+4. Wrap current built-in tool registration as built-in feature modules.
    - Start with a small built-in feature whose state/services are already cleanly bounded.
    - Preserve existing tool names, schemas, and permission behavior.
    - Convert duplicate-name failures into registry diagnostics before flushing tools.
 
-4. Move larger built-in groups behind feature modules.
+5. Move larger built-in groups behind feature modules.
    - Filesystem/process tools from `crates/tools`.
    - Memory tools.
    - Pod orchestration tools.
    - Task/WorkItem tools once their stores and hooks have explicit capabilities.
    - Web tools as configured provider-backed features.
 
-5. Move built-in hook contributions only after safe hook semantics are stable.
+6. Move built-in hook contributions only after safe hook semantics are stable.
    - Keep manifest permission enforcement as an internal host hook, not a feature hook.
    - Keep accounting/usage hooks internal unless they become genuine feature behavior.
 
-6. Treat workflow/user-input expansion separately.
+7. Treat workflow/user-input expansion separately.
    - Workflow invocation already uses a durable system-item attachment pattern.
    - Do not expose arbitrary workflow-like context injection to plugins until there is a safe typed command/input-contribution API with durable append semantics.
 
-7. Add profile/manifest enablement after built-ins work through the same registry.
+8. Add profile/manifest enablement after built-ins work through the same registry.
    - Built-ins and external plugins should share descriptor/capability/install-report mechanics.
    - Host policy may grant built-ins by default, but built-ins should still declare what they use.
 
@@ -460,6 +526,13 @@ WorkItem / intake routing:
 - It should request `WorkItemStore`, `RunBackgroundTask`, and notification/alert capabilities instead of reaching into ticket files ad hoc.
 - Model-visible routing hints or intake results must be committed through notification/history append paths.
 - This registry gives the WorkItem feature a clean way to install without making WorkItem a special Pod runtime mode.
+- If WorkItem, Memory, or Pod orchestration are split into smaller feature modules later, they should communicate through declared services such as `yoi.work-item-store.v1`, `yoi.memory.v1`, or `yoi.pod-management.v1` rather than private module references.
+
+Feature-to-feature service APIs:
+
+- The service registry lets plugins expose stable APIs without requiring the host to make every domain capability a permanent core API.
+- This does not force existing Memory or Pod management implementations to be extracted immediately. They may stay core-backed while still being representable as service façades for consumers.
+- External plugins should consume service proxies provided by the host, not another plugin's raw process/WASM/MCP handle.
 
 MCP:
 
@@ -500,5 +573,9 @@ Plugin distribution:
 7. Background tasks need lifecycle policy.
    - If external plugins can spawn tasks, the host must define shutdown, cancellation, panic handling, diagnostic routing, and whether task output may become model-visible.
 
-8. Existing workflow/input expansion is close to the forbidden boundary.
+8. Service API design needs an in-process vs external-plugin boundary.
+   - Built-in services can use Rust traits or typed handles, but external plugins need host-side proxies and operation schemas. The first implementation should avoid baking in Rust trait-object assumptions as the only service representation.
+   - Service handles must be capability-bound, or one broad service handle can accidentally become an authority escalation path.
+
+9. Existing workflow/input expansion is close to the forbidden boundary.
    - It is safe only because it commits system items before model visibility. Any future plugin command/input contribution must preserve that durable replay property.
