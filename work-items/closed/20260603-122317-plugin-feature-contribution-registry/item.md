@@ -2,12 +2,12 @@
 id: 20260603-122317-plugin-feature-contribution-registry
 slug: plugin-feature-contribution-registry
 title: Plugin: feature contribution registry for built-in and external capabilities
-status: open
+status: closed
 kind: feature
 priority: P1
 labels: [plugin, registry, tools, hooks, orchestration]
 created_at: 2026-06-03T12:23:17Z
-updated_at: 2026-06-04T22:25:25Z
+updated_at: 2026-06-04T22:26:37Z
 assignee: null
 legacy_ticket: null
 ---

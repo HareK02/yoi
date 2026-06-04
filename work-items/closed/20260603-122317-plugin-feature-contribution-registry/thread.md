@@ -1297,3 +1297,12 @@ Residual risk is acceptable for this slice. The registry is still a skeleton for
 
 
 ---
+
+<!-- event: close author: hare at: 2026-06-04T22:26:37Z status: closed -->
+
+## Closed
+
+Implemented the first Pod-layer feature contribution registry slice. Added pod::feature with descriptors, contribution registrars, host-authority model, service/background descriptor skeletons, notification/alert/diagnostic sinks, descriptor-approved contribution checks, once-materialized tool registration, and installed Task tools through the normal Worker tool path. External plugin loading, real approval resolver, full background/service runtime, and WorkItem/MCP integrations remain follow-up scope. Final external review approved. Merge validation passed: cargo test -p pod --lib feature::tests --no-fail-fast, cargo test -p pod --lib, cargo test -p llm-worker --lib, cargo fmt --check, cargo check --workspace --all-targets, ./tickets.sh doctor, git diff --check, nix build .#yoi, ./result/bin/yoi pod --help.
+
+
+---
