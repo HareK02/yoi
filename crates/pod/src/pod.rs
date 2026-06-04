@@ -28,6 +28,7 @@ use manifest::{
 
 use crate::compact::state::CompactState;
 use crate::compact::usage_tracker::UsageTracker;
+use crate::feature::{FeatureRegistryBuilder, FeatureRegistryInstallReport};
 use crate::hook::{
     Hook, HookPreRequestAction, HookRegistryBuilder, OnAbort, OnPromptSubmit, OnTurnEnd,
     PostToolCall, PreLlmRequest, PreRequestInfo, PreToolCall,
@@ -782,6 +783,15 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     /// [`run`](Self::run).
     pub fn worker_mut(&mut self) -> &mut Worker<C, Mutable> {
         self.worker.as_mut().expect("worker taken during run")
+    }
+
+    /// Install enabled feature modules into the Pod host surfaces.
+    pub fn install_features(
+        &mut self,
+        registry: FeatureRegistryBuilder,
+    ) -> FeatureRegistryInstallReport {
+        let worker = self.worker.as_mut().expect("worker taken during run");
+        registry.install_into_worker(worker, &mut self.hook_builder)
     }
 
     /// Reference to the store.
