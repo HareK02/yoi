@@ -2,7 +2,7 @@
 
 ## 1. Summary recommendation
 
-Introduce a `pod::feature` public API as the single Pod-side registration layer for built-in features and future external plugins. A feature module should declare its identity, requested capabilities, and contributions, then install those contributions only through typed host registrars for existing Pod/Worker surfaces: `ToolRegistry`, the hardened safe `pod::hook` surface, and host-owned notification/event/history append paths.
+Introduce a `pod::feature` public API as the single Pod-side registration layer for built-in features and future external plugins. A feature module should declare its identity, requested capabilities, and contributions, then install those contributions only through typed host registrars for existing Pod/Worker surfaces: `ToolRegistry`, the hardened safe `pod::hook` surface, host-managed background tasks, and host-owned notification/history/alert/diagnostic paths.
 
 The registry should not become a second runtime, a plugin dispatcher tool, or a generic `Pod` mutation escape hatch. Feature state remains inside the feature module; the Pod owns only install metadata, diagnostics, granted host handles, and normal durable session/runtime surfaces.
 
@@ -59,16 +59,19 @@ Add a new module under `pod`:
 
 ```rust
 pub mod feature {
+    pub mod background;
     pub mod capability;
     pub mod diagnostic;
-    pub mod event;
     pub mod hook;
+    pub mod notify;
     pub mod registry;
     pub mod tool;
 
+    pub use background::{BackgroundTaskContribution, BackgroundTaskRegistrar};
     pub use capability::{CapabilityGrantSet, CapabilityRequest, HostCapability};
     pub use diagnostic::{FeatureDiagnostic, FeatureInstallReport};
-    pub use registry::{FeatureDescriptor, FeatureId, FeatureInstallContext, FeatureModule, FeatureRegistryBuilder, FeatureRuntimeKind};
+    pub use notify::{FeatureAlertSink, FeatureNotifySink};
+    pub use registry::{FeatureDescriptor, FeatureId, FeatureInstallContext, FeatureModule, FeatureRuntimeKind};
     pub use tool::ToolContribution;
 }
 ```
@@ -90,7 +93,7 @@ pub struct FeatureDescriptor {
     pub requested_capabilities: Vec<CapabilityRequest>,
     pub declared_tools: Vec<ToolDeclaration>,
     pub declared_hooks: Vec<HookDeclaration>,
-    pub declared_event_channels: Vec<EventChannelDeclaration>,
+    pub declared_background_tasks: Vec<BackgroundTaskDeclaration>,
 }
 
 pub enum FeatureRuntimeKind {
@@ -107,8 +110,9 @@ pub struct FeatureInstallContext<'a> {
     pub grants: &'a CapabilityGrantSet,
     pub tools: ToolRegistrar<'a>,
     pub hooks: PublicHookRegistrar<'a>,
+    pub background_tasks: BackgroundTaskRegistrar<'a>,
     pub notify: FeatureNotifySink<'a>,
-    pub events: FeatureEventSink<'a>,
+    pub alerts: FeatureAlertSink<'a>,
     pub diagnostics: FeatureDiagnosticSink<'a>,
     pub services: FeatureServiceProvider<'a>,
 }
@@ -145,13 +149,21 @@ impl FeatureModule for WorkItemFeature {
                 "create and update WorkItem records through host-owned ticket storage",
             ))
             .request(CapabilityRequest::optional(
-                HostCapability::EmitUserEvent,
-                "surface routing diagnostics to the TUI/actionbar",
+                HostCapability::EmitModelNotification,
+                "commit user-action-required notices through the existing Notify/SystemItem path when the model should see them",
+            ))
+            .request(CapabilityRequest::optional(
+                HostCapability::EmitAlert,
+                "surface short transient human-facing warnings when the watcher fails",
+            ))
+            .request(CapabilityRequest::optional(
+                HostCapability::RunBackgroundTask,
+                "watch the WorkItem store for state changes without ad hoc tokio::spawn usage",
             ))
             .tool("WorkItemCreate")
             .tool("WorkItemComment")
             .hook("work_item_intake_pre_tool_audit", pod::hook::HookPoint::PreToolCall)
-            .event_channel("work-item")
+            .background_task("work_item_watch")
             .build()
     }
 
@@ -168,7 +180,10 @@ impl FeatureModule for WorkItemFeature {
             WorkItemAuditHook::new(self.state.clone()),
         )?;
 
-        ctx.events.declare_channel("work-item")?;
+        ctx.background_tasks.register(BackgroundTaskContribution::pod_lifetime(
+            "work_item_watch",
+            WorkItemWatchTask::new(store.clone(), self.state.clone()),
+        ))?;
         Ok(())
     }
 }
@@ -228,37 +243,59 @@ pub trait PublicPreToolCallHook: Send + Sync {
 
 If a hook needs to add model-visible text, it should use `FeatureNotifySink::notify_model(...)` or another host-owned durable append API, not return an `Item`.
 
-### Notification/event contribution
+### Notification, alert, and diagnostic surfaces
 
-Expose two distinct sinks:
+Do not add a plugin-defined event-channel API. A feature should not be able to publish arbitrary structured UI payloads or ask clients to render feature-specific dialogs through the base Pod API.
+
+Expose narrowly-scoped host sinks instead:
 
 ```rust
 pub struct FeatureNotifySink<'a> { /* host-owned */ }
-pub struct FeatureEventSink<'a> { /* host-owned */ }
+pub struct FeatureAlertSink<'a> { /* host-owned */ }
+pub struct FeatureDiagnosticSink<'a> { /* host-owned */ }
 ```
 
 Recommended behavior:
 
-- `FeatureNotifySink::notify_model(...)` creates a model-visible notification through the existing durable notification/system-item path. The host commits the corresponding `SystemItem` before it is appended to Worker history.
-- `FeatureNotifySink::notify_user(...)` or `FeatureEventSink::emit(...)` creates user-visible diagnostics/progress/action events through the existing alert/event path. These are not model-visible unless explicitly routed through `notify_model`.
-- Event payloads should be typed, bounded, and feature-identified. Avoid arbitrary JSON blobs as the first public API; allow an opaque bounded metadata field only if diagnostics require it.
-- Notifications and events should require explicit capabilities such as `EmitModelNotification` and `EmitUserEvent`.
-- Background feature tasks must use these sinks; they must not hold raw log writers or append directly to history.
+- `FeatureNotifySink::notify_model(...)` is the feature-facing form of the existing `Method::Notify` / `SystemItem::Notification` path. It creates a model-visible, history-backed notification by asking the host to commit a `LogEntry::SystemItem`; clients then see the same committed item through `Event::SystemItem`. Disk-side and wire-side remain 1:1.
+- `FeatureAlertSink::alert(...)` emits a short human-facing transient alert equivalent to `Event::Alert`. It is UI/person-facing only: not model-visible, not session history, not replayed as an input, and not a structured UI extension channel.
+- `FeatureDiagnosticSink` records install/runtime/capability/task diagnostics for host logs, future `ListFeatures`, profile validation, and TUI diagnostics. Diagnostics are host-defined records, not arbitrary client-rendered UI payloads.
+- Dialogs, confirmations, and other interactive client UI are out of scope for the base API. If needed later, add a separate host-defined interaction protocol; do not use a generic event channel for it.
+- Model-visible notifications, transient alerts, and diagnostics should require distinct capabilities such as `EmitModelNotification`, `EmitAlert`, and diagnostic/reporting rights where policy needs them.
+- Background feature tasks must use these sinks; they must not hold raw log writers, raw event senders, or append directly to history.
 
-Useful initial event shape:
+### Background task contribution
+
+Background tasks should be a first-class feature contribution. Without this, asynchronous features will inevitably create ad hoc `tokio::spawn` loops, private channels, and shutdown/reporting paths outside the registry.
+
+Initial shape:
 
 ```rust
-pub struct FeatureEvent {
+pub struct BackgroundTaskContribution {
     pub feature_id: FeatureId,
-    pub level: FeatureEventLevel,       // Info, Warn, Error
-    pub channel: String,                // e.g. "work-item"
-    pub summary: String,
-    pub detail: Option<String>,
-    pub model_visible: bool,            // false unless host routes through notify_model
+    pub id: FeatureTaskId,
+    pub description: String,
+    pub activation: TaskActivation,
+    pub restart: RestartPolicy,
+    pub shutdown: ShutdownPolicy,
+    pub required_capabilities: Vec<HostCapability>,
+}
+
+pub struct FeatureTaskContext<'a> {
+    pub cancellation: CancellationToken,
+    pub notify: FeatureNotifySink<'a>,
+    pub alerts: FeatureAlertSink<'a>,
+    pub diagnostics: FeatureDiagnosticSink<'a>,
+    pub services: FeatureServiceProvider<'a>,
 }
 ```
 
-`model_visible` should be host-controlled in practice: a feature may request model visibility, but the sink decides whether that capability is granted and records the durable append if it is.
+Rules:
+
+- The host starts, tracks, cancels, and reports background tasks. Feature modules register tasks; they do not spawn untracked runtime loops.
+- Task output is limited to granted sinks/services: model-visible notification through `FeatureNotifySink`, human transient alert through `FeatureAlertSink`, diagnostics through `FeatureDiagnosticSink`, and host-granted service operations.
+- The host records task lifecycle/status in install/runtime diagnostics. Do not expose arbitrary feature-defined event channels for task progress.
+- Initial activation can be conservative (`PodLifetime` and/or `OnDemand`); restart policy may start with `Never`, but the API should make shutdown/cancellation behavior explicit from the beginning.
 
 ### Capability request/grant/diagnostics
 
@@ -270,8 +307,9 @@ Initial capability categories:
 pub enum HostCapability {
     ContributeTool { name: ToolName },
     ContributeHook { point: pod::hook::HookPoint },
-    EmitUserEvent,
+    RunBackgroundTask,
     EmitModelNotification,
+    EmitAlert,
     ScopedFs { read: bool, write: bool, execute: bool },
     WorkItemStore { read: bool, write: bool },
     MemoryStore { read: bool, write: bool },
@@ -297,6 +335,7 @@ pub struct FeatureInstallReport {
     pub denied: Vec<CapabilityDenial>,
     pub installed_tools: Vec<ToolName>,
     pub installed_hooks: Vec<String>,
+    pub installed_background_tasks: Vec<FeatureTaskId>,
     pub skipped_contributions: Vec<SkippedContribution>,
     pub diagnostics: Vec<FeatureDiagnostic>,
 }
@@ -311,7 +350,7 @@ Feature state belongs to the feature module.
 - A feature may own `Arc<State>` and clone it into contributed tools, hooks, and background tasks.
 - The Pod registry stores descriptors, install reports, enabled/disabled status, and host-owned handles. It does not store feature business state.
 - Durable feature data must live in a feature-owned or host-granted store with an explicit API: WorkItem files through a WorkItem service, memory records through memory APIs, plugin config/state through a future plugin-state service, etc.
-- Session history is not feature storage. It is an audit/replay record of model-visible interactions and host-visible events.
+- Session history is not feature storage. It is an audit/replay record of model-visible interactions and committed system items.
 - A feature that needs restoration after process restart should reconstruct itself from its own durable store/config plus normal Pod metadata, not from private data hidden in Worker context.
 - Background tasks are allowed only if they communicate through granted sinks/services and have a defined shutdown/lifecycle policy owned by the host.
 
@@ -331,7 +370,8 @@ Public features/plugins must not be able to perform these operations:
 - Grant themselves capabilities or infer grants from successful construction.
 - Mutate manifest/profile/scope state directly.
 - Perform filesystem/process/network/secret access outside granted host services.
-- Emit unbounded tool outputs, event payloads, diagnostics, or notification bodies.
+- Emit unbounded tool outputs, diagnostics, alerts, task-status reports, or notification bodies.
+- Emit arbitrary plugin-defined UI payloads, dialogs, or event-channel messages.
 - Put secrets into diagnostics, session logs, model context, TUI output, or feature install reports.
 - Depend on MCP/WASM/package-distribution mechanics in the base Pod API.
 
@@ -416,14 +456,14 @@ Recommended migration is incremental and behavior-preserving:
 
 WorkItem / intake routing:
 
-- WorkItem routing can become a built-in feature that contributes WorkItem tools, optional routing hooks, and user-visible action events.
-- It should request `WorkItemStore` and event/notification capabilities instead of reaching into ticket files ad hoc.
+- WorkItem routing can become a built-in feature that contributes WorkItem tools, optional routing hooks, and host-managed background tasks such as a watcher.
+- It should request `WorkItemStore`, `RunBackgroundTask`, and notification/alert capabilities instead of reaching into ticket files ad hoc.
 - Model-visible routing hints or intake results must be committed through notification/history append paths.
 - This registry gives the WorkItem feature a clean way to install without making WorkItem a special Pod runtime mode.
 
 MCP:
 
-- MCP should be an adapter/runtime kind that produces normal `ToolContribution`s and possibly safe event diagnostics.
+- MCP should be an adapter/runtime kind that produces normal `ToolContribution`s and, when needed, host-managed background tasks for connection/session supervision plus bounded diagnostics/alerts.
 - MCP tool calls must still pass through `ToolRegistry`, PreToolCall permission, output bounding, and history result recording.
 - MCP resources/prompts should not become invisible prompt injection. If exposed later, they should be explicit tools, user-invoked attachments, or durable notification/history appends.
 - MCP transport/session details are out of scope for the base API beyond the `FeatureRuntimeKind::McpBridge` placeholder.
@@ -443,8 +483,10 @@ Plugin distribution:
 2. The exact safe hook action set must be settled by `hook-public-surface-hardening`.
    - Especially important: whether public pre-tool hooks may synthesize denials/results, and how durable append requests are represented.
 
-3. Notification/event durability needs precise semantics.
-   - User-visible events may be live-only, while model-visible notifications must be durable. The public API should make this distinction impossible to miss.
+3. Notification, alert, and diagnostic semantics need precise names and capabilities.
+   - Model-visible notifications must be durable and should use the existing `Notify` / `SystemItem` / `Event::SystemItem` path.
+   - `Alert`-like output is transient human-facing text only.
+   - Diagnostics/status are host-defined operational records, not plugin-defined UI channels.
 
 4. Capability granularity can easily become either too coarse or too noisy.
    - Start with coarse host-service capabilities plus normal tool permissions, then split only when real features need finer grants.
