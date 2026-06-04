@@ -1256,59 +1256,7 @@ pub enum FeatureInstallError {
     Install(String),
 }
 
-/// Builtin task tools feature used to prove existing builtin tool registration
-/// through the feature registry without changing tool names, schemas, or
-/// permission behavior.
-pub mod builtin {
-    use super::*;
-
-    pub fn task_feature(task_store: tools::TaskStore) -> impl FeatureModule {
-        TaskFeature { task_store }
-    }
-
-    struct TaskFeature {
-        task_store: tools::TaskStore,
-    }
-
-    impl FeatureModule for TaskFeature {
-        fn descriptor(&self) -> FeatureDescriptor {
-            FeatureDescriptor::builtin("task-tools", "Task tools")
-                .with_description("Session-lifetime task tracking builtin tools")
-                .with_tool(ToolDeclaration::new(
-                    "TaskCreate",
-                    "Create a session-lifetime user-visible task",
-                ))
-                .with_tool(ToolDeclaration::new(
-                    "TaskUpdate",
-                    "Update a session-lifetime user-visible task",
-                ))
-                .with_tool(ToolDeclaration::new(
-                    "TaskGet",
-                    "Get one session-lifetime user-visible task",
-                ))
-                .with_tool(ToolDeclaration::new(
-                    "TaskList",
-                    "List session-lifetime user-visible tasks",
-                ))
-        }
-
-        fn install(
-            &self,
-            context: &mut FeatureInstallContext<'_>,
-        ) -> Result<(), FeatureInstallError> {
-            let names = ["TaskCreate", "TaskList", "TaskGet", "TaskUpdate"];
-            for (name, definition) in names
-                .into_iter()
-                .zip(tools::task_tools(self.task_store.clone()))
-            {
-                context
-                    .tools()
-                    .register(ToolContribution::new(name, definition))?;
-            }
-            Ok(())
-        }
-    }
-}
+pub mod builtin;
 
 #[cfg(test)]
 mod tests {
@@ -1798,12 +1746,75 @@ mod tests {
     }
 
     #[test]
+    fn builtin_internal_task_feature_descriptor_has_exact_tools_and_no_authorities() {
+        let descriptor = builtin::task_tools_feature(tools::TaskStore::new()).descriptor();
+        let tool_names: Vec<_> = descriptor
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect();
+
+        assert_eq!(descriptor.id.as_str(), "builtin:task-tools");
+        assert_eq!(descriptor.runtime, FeatureRuntimeKind::Builtin);
+        assert!(descriptor.requested_authorities.is_empty());
+        assert!(descriptor.hooks.is_empty());
+        assert!(descriptor.background_tasks.is_empty());
+        assert!(descriptor.provides_services.is_empty());
+        assert!(descriptor.requires_services.is_empty());
+        assert_eq!(
+            tool_names,
+            vec!["TaskCreate", "TaskUpdate", "TaskGet", "TaskList"]
+        );
+    }
+
+    #[test]
+    fn builtin_internal_task_feature_installs_declared_tools_without_host_authorities() {
+        let task_store = tools::TaskStore::new();
+        let mut hook_builder = HookRegistryBuilder::default();
+        let mut pending_tools = Vec::new();
+        let mut builder = FeatureRegistryBuilder::new();
+        builder.add_module(builtin::task_tools_feature(task_store));
+        let mut declared_names: Vec<_> = builder.descriptors()[0]
+            .tools
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect();
+        let report = builder.install_into_pending(&mut pending_tools, &mut hook_builder);
+        let pending_names: Vec<_> = pending_tools
+            .iter()
+            .map(|definition| definition().0.name)
+            .collect();
+        let installed_names = report.installed_tool_names();
+        let mut sorted_installed_names = installed_names.clone();
+        declared_names.sort();
+        sorted_installed_names.sort();
+
+        assert_eq!(report.reports.len(), 1);
+        assert!(report.reports[0].installed);
+        assert_eq!(
+            report.reports[0].granted_authorities,
+            AuthorityGrantSet::empty()
+        );
+        assert!(report.reports[0].skipped.is_empty());
+        assert!(report.reports[0].diagnostics.is_empty());
+        assert_eq!(declared_names, sorted_installed_names);
+        assert_eq!(
+            installed_names,
+            vec!["TaskCreate", "TaskList", "TaskGet", "TaskUpdate"]
+        );
+        assert_eq!(
+            pending_names,
+            vec!["TaskCreate", "TaskList", "TaskGet", "TaskUpdate"]
+        );
+    }
+
+    #[test]
     fn builtin_task_feature_installs_through_worker_tool_path() {
         let task_store = tools::TaskStore::new();
         let mut worker = Worker::new(DummyClient);
         let mut hook_builder = HookRegistryBuilder::default();
         let report = FeatureRegistryBuilder::new()
-            .with_module(builtin::task_feature(task_store))
+            .with_module(builtin::task_tools_feature(task_store))
             .install_into_worker(&mut worker, &mut hook_builder);
 
         worker.tool_server_handle().flush_pending();
