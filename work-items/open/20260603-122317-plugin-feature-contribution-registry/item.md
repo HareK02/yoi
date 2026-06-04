@@ -7,7 +7,7 @@ kind: feature
 priority: P1
 labels: [plugin, registry, tools, hooks, orchestration]
 created_at: 2026-06-03T12:23:17Z
-updated_at: 2026-06-04T21:46:04Z
+updated_at: 2026-06-04T21:51:09Z
 assignee: null
 legacy_ticket: null
 ---
@@ -20,14 +20,14 @@ The immediate need is not package distribution or WASM execution. The immediate 
 
 ## Direction
 
-Introduce a feature registry boundary for Pod runtime capability installation.
+Introduce a feature registry boundary for Pod runtime contribution installation and host-authority grants.
 
 - Feature state remains owned by the feature/extension module, not by Pod history or prompt context.
 - Pod interaction happens through existing surfaces:
   - Tool contributions registered into the normal ToolRegistry / permission / history path.
   - Hook contributions registered through the public Pod Hook boundary.
   - BackgroundTask contributions are host-managed for async feature work; feature modules must not create untracked runtime loops.
-  - Service provider/consumer contributions allow a feature/plugin to expose a narrow public API and another feature/plugin to acquire it through host dependency resolution and capability grants.
+  - Service provider/consumer declarations allow a feature/plugin to expose a narrow public API and another feature/plugin to acquire it through host dependency resolution and host-authority grants where the service exposes host authority.
   - Model-visible notifications use the existing durable Notify / SystemItem / Event::SystemItem path rather than invisible context injection.
   - Transient human-facing alerts and diagnostics are separate host-defined outputs, not arbitrary plugin UI channels.
 - The registry is responsible for discovery/enablement diagnostics and installation into existing surfaces; it must not create a parallel execution path.
@@ -49,8 +49,8 @@ Pure descriptor types may later move to a separate `plugin` / `extension` crate 
   - Hooks
   - BackgroundTasks
   - Service providers and service requirements
-  - Model-visible notification, transient alert, and diagnostic capabilities where needed
-- Define capability request / host grant data structures suitable for policy diagnostics.
+  - Model-visible notification, transient alert, and diagnostic surfaces where needed
+- Define host-authority request / grant data structures suitable for user approval and policy diagnostics. Tool/Hook/BackgroundTask/ServiceProvider declarations are contributions to display and lock by descriptor/digest, not separate sandbox authorities.
 - Add a registry/builder/install context that can install enabled feature contributions into existing Pod/Worker surfaces.
 - Preserve current behavior while moving registration toward the registry.
   - Existing built-in tool registration must still work.
@@ -72,7 +72,7 @@ Pure descriptor types may later move to a separate `plugin` / `extension` crate 
 ## Suggested phases
 
 1. **Registry design**
-   - Define feature descriptor, source, runtime kind, contribution kinds, capability request/grant, and diagnostics.
+   - Define feature descriptor, source, runtime kind, contribution kinds, host-authority request/grant, and diagnostics.
 2. **Pod runtime registry skeleton**
    - Add a Pod-layer feature registry/builder and install context.
    - Keep behavior unchanged initially.
@@ -87,8 +87,8 @@ Pure descriptor types may later move to a separate `plugin` / `extension` crate 
 ## Acceptance criteria
 
 - The codebase has a first-class feature contribution registry boundary for Pod runtime installation.
-- At least one built-in capability group is registered through the new registry without changing behavior.
-- The registry can describe Tool, Hook, BackgroundTask, and Service provider/requirement contributions and records source/runtime/capability diagnostics.
+- At least one built-in contribution group is registered through the new registry without changing behavior.
+- The registry can describe Tool, Hook, BackgroundTask, and Service provider/requirement contributions and records source/runtime/authority diagnostics.
 - Feature installation uses existing ToolRegistry, HookRegistry, host-managed BackgroundTask lifecycle, host-mediated Service resolution, and notification/history paths; no parallel Pod context injection path or arbitrary plugin UI channel is introduced.
 - WorkItem and MCP follow-up tickets can target this registry instead of adding ad hoc registration code.
-- Focused tests cover the migrated built-in registration and capability/diagnostic behavior.
+- Focused tests cover the migrated built-in registration and authority/diagnostic behavior.
