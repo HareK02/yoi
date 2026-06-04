@@ -1,7 +1,7 @@
 //! Feature contribution registry for Pod-hosted builtin/plugin modules.
 //!
 //! This module defines the Pod-side feature boundary used to collect
-//! descriptor metadata, capability requests, tool contributions, safe hook
+//! descriptor metadata, authority requests, tool contributions, safe hook
 //! contributions, background task declarations, and service declarations before
 //! installing them into the existing Worker/HookRegistry host surfaces.
 //!
@@ -69,20 +69,23 @@ pub enum FeatureRuntimeKind {
     ExternalPlugin,
 }
 
-/// Host capability requested by a feature before it contributes host-visible
-/// behavior. Grants are additive and do not replace manifest/tool permission
-/// checks.
+/// Host authority requested by a feature for host-mediated operations that can
+/// cross sandbox or model-context boundaries.
+///
+/// Contribution declarations such as tools, hooks, background tasks, and
+/// services are descriptor/package-approved host-visible contributions, not
+/// sandbox authorities. Grants are additive and do not replace manifest/tool
+/// permission checks.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum HostCapability {
-    ContributeTool { name: String },
-    ContributeHook { point: FeatureHookPoint },
-    DeclareBackgroundTask { name: String },
-    ProvideService { service: ServiceId },
-    RequireService { service: ServiceId },
-    EmitNotification,
-    EmitAlert,
-    EmitDiagnostic,
+pub enum HostAuthority {
+    Filesystem,
+    Network,
+    SecretRef { id: String },
+    ModelNotification,
+    PodManagement,
+    StateStore { name: String },
+    ServiceAccess { service: ServiceId },
 }
 
 /// A safe hook contribution point exposed to feature modules.
@@ -95,45 +98,45 @@ pub enum FeatureHookPoint {
     TurnEnd,
 }
 
-/// Capability request declared by a feature descriptor.
+/// Authority request declared by a feature descriptor.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CapabilityRequest {
-    pub capability: HostCapability,
+pub struct AuthorityRequest {
+    pub authority: HostAuthority,
     pub required: bool,
     pub reason: String,
 }
 
-impl CapabilityRequest {
-    pub fn required(capability: HostCapability, reason: impl Into<String>) -> Self {
+impl AuthorityRequest {
+    pub fn required(authority: HostAuthority, reason: impl Into<String>) -> Self {
         Self {
-            capability,
+            authority,
             required: true,
             reason: reason.into(),
         }
     }
 
-    pub fn optional(capability: HostCapability, reason: impl Into<String>) -> Self {
+    pub fn optional(authority: HostAuthority, reason: impl Into<String>) -> Self {
         Self {
-            capability,
+            authority,
             required: false,
             reason: reason.into(),
         }
     }
 }
 
-/// Capability grants resolved by the host for one feature installation.
+/// Authority grants resolved by the host for one feature installation.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CapabilityGrantSet {
-    granted: HashSet<HostCapability>,
-    denied: Vec<CapabilityDenial>,
+pub struct AuthorityGrantSet {
+    granted: HashSet<HostAuthority>,
+    denied: Vec<AuthorityDenial>,
 }
 
-impl CapabilityGrantSet {
-    pub fn grant_all(requests: &[CapabilityRequest]) -> Self {
+impl AuthorityGrantSet {
+    pub fn grant_all(requests: &[AuthorityRequest]) -> Self {
         Self {
             granted: requests
                 .iter()
-                .map(|request| request.capability.clone())
+                .map(|request| request.authority.clone())
                 .collect(),
             denied: Vec::new(),
         }
@@ -143,31 +146,31 @@ impl CapabilityGrantSet {
         Self::default()
     }
 
-    pub fn contains(&self, capability: &HostCapability) -> bool {
-        self.granted.contains(capability)
+    pub fn contains(&self, authority: &HostAuthority) -> bool {
+        self.granted.contains(authority)
     }
 
-    pub fn denied(&self) -> &[CapabilityDenial] {
+    pub fn denied(&self) -> &[AuthorityDenial] {
         &self.denied
     }
 
-    pub fn grant(&mut self, capability: HostCapability) {
-        self.granted.insert(capability);
+    pub fn grant(&mut self, authority: HostAuthority) {
+        self.granted.insert(authority);
     }
 
-    pub fn deny(&mut self, capability: HostCapability, reason: impl Into<String>) {
-        self.granted.remove(&capability);
-        self.denied.push(CapabilityDenial {
-            capability,
+    pub fn deny(&mut self, authority: HostAuthority, reason: impl Into<String>) {
+        self.granted.remove(&authority);
+        self.denied.push(AuthorityDenial {
+            authority,
             reason: reason.into(),
         });
     }
 }
 
-/// Host-side denial of a requested feature capability.
+/// Host-side denial of a requested feature authority.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CapabilityDenial {
-    pub capability: HostCapability,
+pub struct AuthorityDenial {
+    pub authority: HostAuthority,
     pub reason: String,
 }
 
@@ -177,15 +180,12 @@ pub struct CapabilityDenial {
 pub struct ToolDeclaration {
     pub name: String,
     pub description: String,
-    pub required_capabilities: Vec<HostCapability>,
 }
 
 impl ToolDeclaration {
     pub fn new(name: impl Into<String>, description: impl Into<String>) -> Self {
-        let name = name.into();
         Self {
-            required_capabilities: vec![HostCapability::ContributeTool { name: name.clone() }],
-            name,
+            name: name.into(),
             description: description.into(),
         }
     }
@@ -195,24 +195,20 @@ impl ToolDeclaration {
 pub struct ToolContribution {
     name: String,
     definition: ToolDefinition,
-    required_capabilities: Vec<HostCapability>,
+    required_authorities: Vec<HostAuthority>,
 }
 
 impl ToolContribution {
     pub fn new(name: impl Into<String>, definition: ToolDefinition) -> Self {
-        let name = name.into();
         Self {
-            required_capabilities: vec![HostCapability::ContributeTool { name: name.clone() }],
-            name,
+            name: name.into(),
             definition,
+            required_authorities: Vec::new(),
         }
     }
 
-    pub fn with_required_capabilities(
-        mut self,
-        required_capabilities: Vec<HostCapability>,
-    ) -> Self {
-        self.required_capabilities = required_capabilities;
+    pub fn with_required_authorities(mut self, required_authorities: Vec<HostAuthority>) -> Self {
+        self.required_authorities = required_authorities;
         self
     }
 
@@ -226,16 +222,12 @@ impl ToolContribution {
 pub struct HookDeclaration {
     pub name: String,
     pub point: FeatureHookPoint,
-    pub required_capabilities: Vec<HostCapability>,
 }
 
 impl HookDeclaration {
     pub fn new(name: impl Into<String>, point: FeatureHookPoint) -> Self {
         Self {
             name: name.into(),
-            required_capabilities: vec![HostCapability::ContributeHook {
-                point: point.clone(),
-            }],
             point,
         }
     }
@@ -255,17 +247,12 @@ pub struct BackgroundTaskDeclaration {
     pub name: String,
     pub description: String,
     pub lifecycle: BackgroundTaskLifecycle,
-    pub required_capabilities: Vec<HostCapability>,
 }
 
 impl BackgroundTaskDeclaration {
     pub fn descriptor_only(name: impl Into<String>, description: impl Into<String>) -> Self {
-        let name = name.into();
         Self {
-            required_capabilities: vec![HostCapability::DeclareBackgroundTask {
-                name: name.clone(),
-            }],
-            name,
+            name: name.into(),
             description: description.into(),
             lifecycle: BackgroundTaskLifecycle::DescriptorOnly,
         }
@@ -418,7 +405,7 @@ pub struct FeatureDescriptor {
     pub display_name: String,
     pub version: String,
     pub description: String,
-    pub requested_capabilities: Vec<CapabilityRequest>,
+    pub requested_authorities: Vec<AuthorityRequest>,
     pub tools: Vec<ToolDeclaration>,
     pub hooks: Vec<HookDeclaration>,
     pub background_tasks: Vec<BackgroundTaskDeclaration>,
@@ -434,7 +421,7 @@ impl FeatureDescriptor {
             display_name: display_name.into(),
             version: env!("CARGO_PKG_VERSION").into(),
             description: String::new(),
-            requested_capabilities: Vec::new(),
+            requested_authorities: Vec::new(),
             tools: Vec::new(),
             hooks: Vec::new(),
             background_tasks: Vec::new(),
@@ -448,8 +435,8 @@ impl FeatureDescriptor {
         self
     }
 
-    pub fn with_capability(mut self, request: CapabilityRequest) -> Self {
-        self.requested_capabilities.push(request);
+    pub fn with_authority(mut self, request: AuthorityRequest) -> Self {
+        self.requested_authorities.push(request);
         self
     }
 
@@ -551,7 +538,7 @@ pub struct FeatureInstallReport {
     pub feature_id: FeatureId,
     pub runtime: FeatureRuntimeKind,
     pub installed: bool,
-    pub granted_capabilities: CapabilityGrantSet,
+    pub granted_authorities: AuthorityGrantSet,
     pub installed_tools: Vec<String>,
     pub installed_hooks: Vec<HookDeclaration>,
     pub declared_background_tasks: Vec<BackgroundTaskDeclaration>,
@@ -562,12 +549,12 @@ pub struct FeatureInstallReport {
 }
 
 impl FeatureInstallReport {
-    fn new(descriptor: &FeatureDescriptor, granted_capabilities: CapabilityGrantSet) -> Self {
+    fn new(descriptor: &FeatureDescriptor, granted_authorities: AuthorityGrantSet) -> Self {
         Self {
             feature_id: descriptor.id.clone(),
             runtime: descriptor.runtime.clone(),
             installed: false,
-            granted_capabilities,
+            granted_authorities,
             installed_tools: Vec::new(),
             installed_hooks: Vec::new(),
             declared_background_tasks: Vec::new(),
@@ -592,81 +579,37 @@ impl FeatureInstallReport {
     }
 }
 
-fn require_capability(
-    grants: &CapabilityGrantSet,
+fn require_authority(
+    grants: &AuthorityGrantSet,
     report: &mut FeatureInstallReport,
     kind: FeatureContributionKind,
     name: impl Into<String>,
-    capability: &HostCapability,
+    authority: &HostAuthority,
 ) -> Result<(), FeatureInstallError> {
-    if grants.contains(capability) {
+    if grants.contains(authority) {
         return Ok(());
     }
 
-    let reason = format!("required capability was not granted: {capability:?}");
+    let reason = format!("required authority was not granted: {authority:?}");
     report.mark_skipped(kind, name, reason.clone());
-    Err(FeatureInstallError::CapabilityDenied(reason))
-}
-
-fn require_background_task_capability(
-    grants: &CapabilityGrantSet,
-    report: &mut FeatureInstallReport,
-    declaration: &BackgroundTaskDeclaration,
-) -> Result<(), FeatureInstallError> {
-    let default_capability = HostCapability::DeclareBackgroundTask {
-        name: declaration.name.clone(),
-    };
-    require_capability(
-        grants,
-        report,
-        FeatureContributionKind::BackgroundTask,
-        declaration.name.clone(),
-        &default_capability,
-    )?;
-    for capability in &declaration.required_capabilities {
-        require_capability(
-            grants,
-            report,
-            FeatureContributionKind::BackgroundTask,
-            declaration.name.clone(),
-            capability,
-        )?;
-    }
-    Ok(())
-}
-
-fn require_service_provider_capability(
-    grants: &CapabilityGrantSet,
-    report: &mut FeatureInstallReport,
-    declaration: &ServiceDeclaration,
-) -> Result<(), FeatureInstallError> {
-    let capability = HostCapability::ProvideService {
-        service: declaration.id.clone(),
-    };
-    require_capability(
-        grants,
-        report,
-        FeatureContributionKind::Service,
-        declaration.id.to_string(),
-        &capability,
-    )
+    Err(FeatureInstallError::AuthorityDenied(reason))
 }
 
 /// Model-visible durable notification sink skeleton. The first slice exposes
 /// the boundary without implementing a new event channel.
 pub struct FeatureNotificationSink<'a> {
-    grants: &'a CapabilityGrantSet,
+    grants: &'a AuthorityGrantSet,
     report: &'a mut FeatureInstallReport,
 }
 
 impl FeatureNotificationSink<'_> {
     pub fn notify_model(&mut self, message: impl Into<String>) -> Result<(), FeatureInstallError> {
-        require_capability(
+        require_authority(
             self.grants,
             self.report,
             FeatureContributionKind::Notification,
             "notify_model",
-            &HostCapability::EmitNotification,
+            &HostAuthority::ModelNotification,
         )?;
         let message = message.into();
         self.report.diagnostics.push(FeatureDiagnostic::warning(format!(
@@ -683,19 +626,11 @@ impl FeatureNotificationSink<'_> {
 
 /// Transient human-facing alert sink skeleton.
 pub struct FeatureAlertSink<'a> {
-    grants: &'a CapabilityGrantSet,
     report: &'a mut FeatureInstallReport,
 }
 
 impl FeatureAlertSink<'_> {
-    pub fn alert(&mut self, message: impl Into<String>) -> Result<(), FeatureInstallError> {
-        require_capability(
-            self.grants,
-            self.report,
-            FeatureContributionKind::Alert,
-            "alert",
-            &HostCapability::EmitAlert,
-        )?;
+    pub fn alert(&mut self, message: impl Into<String>) {
         let message = message.into();
         self.report
             .diagnostics
@@ -705,46 +640,36 @@ impl FeatureAlertSink<'_> {
             "alert",
             "transient alert host is not connected during feature installation",
         );
-        Ok(())
     }
 }
 
 /// Diagnostic sink available to feature installers.
 pub struct FeatureDiagnosticSink<'a> {
-    grants: &'a CapabilityGrantSet,
     report: &'a mut FeatureInstallReport,
 }
 
 impl FeatureDiagnosticSink<'_> {
-    pub fn push(&mut self, diagnostic: FeatureDiagnostic) -> Result<(), FeatureInstallError> {
-        require_capability(
-            self.grants,
-            self.report,
-            FeatureContributionKind::Diagnostic,
-            "diagnostic",
-            &HostCapability::EmitDiagnostic,
-        )?;
+    pub fn push(&mut self, diagnostic: FeatureDiagnostic) {
         self.report.diagnostics.push(diagnostic);
-        Ok(())
     }
 
-    pub fn info(&mut self, message: impl Into<String>) -> Result<(), FeatureInstallError> {
-        self.push(FeatureDiagnostic::info(message))
+    pub fn info(&mut self, message: impl Into<String>) {
+        self.push(FeatureDiagnostic::info(message));
     }
 
-    pub fn warning(&mut self, message: impl Into<String>) -> Result<(), FeatureInstallError> {
-        self.push(FeatureDiagnostic::warning(message))
+    pub fn warning(&mut self, message: impl Into<String>) {
+        self.push(FeatureDiagnostic::warning(message));
     }
 
-    pub fn error(&mut self, message: impl Into<String>) -> Result<(), FeatureInstallError> {
-        self.push(FeatureDiagnostic::error(message))
+    pub fn error(&mut self, message: impl Into<String>) {
+        self.push(FeatureDiagnostic::error(message));
     }
 }
 
 /// Tool contribution registrar exposed inside [`FeatureInstallContext`].
 pub struct ToolContributionRegistrar<'a> {
     feature_id: &'a FeatureId,
-    grants: &'a CapabilityGrantSet,
+    grants: &'a AuthorityGrantSet,
     pending_tools: &'a mut Vec<ToolDefinition>,
     installed_tool_names: &'a mut HashMap<String, FeatureId>,
     report: &'a mut FeatureInstallReport,
@@ -752,7 +677,8 @@ pub struct ToolContributionRegistrar<'a> {
 
 impl ToolContributionRegistrar<'_> {
     pub fn register(&mut self, contribution: ToolContribution) -> Result<(), FeatureInstallError> {
-        let model_visible_name = (contribution.definition)().0.name;
+        let (tool_meta, tool) = (contribution.definition)();
+        let model_visible_name = tool_meta.name.clone();
         if contribution.name != model_visible_name {
             let error = FeatureInstallError::ToolNameMismatch {
                 declared: contribution.name,
@@ -766,23 +692,13 @@ impl ToolContributionRegistrar<'_> {
             return Err(error);
         }
 
-        let tool_capability = HostCapability::ContributeTool {
-            name: model_visible_name.clone(),
-        };
-        require_capability(
-            self.grants,
-            self.report,
-            FeatureContributionKind::Tool,
-            model_visible_name.clone(),
-            &tool_capability,
-        )?;
-        for capability in &contribution.required_capabilities {
-            require_capability(
+        for authority in &contribution.required_authorities {
+            require_authority(
                 self.grants,
                 self.report,
                 FeatureContributionKind::Tool,
                 model_visible_name.clone(),
-                capability,
+                authority,
             )?;
         }
 
@@ -803,14 +719,14 @@ impl ToolContributionRegistrar<'_> {
         self.installed_tool_names
             .insert(model_visible_name.clone(), self.feature_id.clone());
         self.report.installed_tools.push(model_visible_name);
-        self.pending_tools.push(contribution.definition);
+        self.pending_tools
+            .push(Arc::new(move || (tool_meta.clone(), Arc::clone(&tool))));
         Ok(())
     }
 }
 
 /// Safe hook contribution registrar backed by [`HookRegistryBuilder`].
 pub struct HookContributionRegistrar<'a> {
-    grants: &'a CapabilityGrantSet,
     hook_builder: &'a mut HookRegistryBuilder,
     report: &'a mut FeatureInstallReport,
 }
@@ -822,7 +738,6 @@ impl HookContributionRegistrar<'_> {
         hook: impl Hook<PreLlmRequest> + 'static,
     ) -> Result<(), FeatureInstallError> {
         let declaration = HookDeclaration::new(name, FeatureHookPoint::PreRequest);
-        self.require_hook_capability(&declaration)?;
         self.hook_builder.add_pre_llm_request(hook);
         self.report.installed_hooks.push(declaration);
         Ok(())
@@ -834,7 +749,6 @@ impl HookContributionRegistrar<'_> {
         hook: impl Hook<PreToolCall> + 'static,
     ) -> Result<(), FeatureInstallError> {
         let declaration = HookDeclaration::new(name, FeatureHookPoint::PreToolCall);
-        self.require_hook_capability(&declaration)?;
         self.hook_builder.add_pre_tool_call(hook);
         self.report.installed_hooks.push(declaration);
         Ok(())
@@ -846,7 +760,6 @@ impl HookContributionRegistrar<'_> {
         hook: impl Hook<PostToolCall> + 'static,
     ) -> Result<(), FeatureInstallError> {
         let declaration = HookDeclaration::new(name, FeatureHookPoint::ToolResult);
-        self.require_hook_capability(&declaration)?;
         self.hook_builder.add_post_tool_call(hook);
         self.report.installed_hooks.push(declaration);
         Ok(())
@@ -858,59 +771,32 @@ impl HookContributionRegistrar<'_> {
         hook: impl Hook<OnTurnEnd> + 'static,
     ) -> Result<(), FeatureInstallError> {
         let declaration = HookDeclaration::new(name, FeatureHookPoint::TurnEnd);
-        self.require_hook_capability(&declaration)?;
         self.hook_builder.add_on_turn_end(hook);
         self.report.installed_hooks.push(declaration);
-        Ok(())
-    }
-
-    fn require_hook_capability(
-        &mut self,
-        declaration: &HookDeclaration,
-    ) -> Result<(), FeatureInstallError> {
-        for capability in &declaration.required_capabilities {
-            if !self.grants.contains(capability) {
-                let reason = format!("required capability was not granted: {capability:?}");
-                self.report.mark_skipped(
-                    FeatureContributionKind::Hook,
-                    declaration.name.clone(),
-                    reason.clone(),
-                );
-                return Err(FeatureInstallError::CapabilityDenied(reason));
-            }
-        }
         Ok(())
     }
 }
 
 /// Background task registrar for descriptor/report-only contributions.
 pub struct BackgroundTaskRegistrar<'a> {
-    grants: &'a CapabilityGrantSet,
     report: &'a mut FeatureInstallReport,
 }
 
 impl BackgroundTaskRegistrar<'_> {
-    pub fn declare(
-        &mut self,
-        declaration: BackgroundTaskDeclaration,
-    ) -> Result<(), FeatureInstallError> {
-        require_background_task_capability(self.grants, self.report, &declaration)?;
+    pub fn declare(&mut self, declaration: BackgroundTaskDeclaration) {
         self.report.declared_background_tasks.push(declaration);
-        Ok(())
     }
 }
 
 /// Service registrar for descriptor/report-only provider metadata.
 pub struct FeatureServiceRegistrar<'a> {
     feature_id: &'a FeatureId,
-    grants: &'a CapabilityGrantSet,
     service_registry: &'a mut FeatureServiceRegistry,
     report: &'a mut FeatureInstallReport,
 }
 
 impl FeatureServiceRegistrar<'_> {
     pub fn provide(&mut self, declaration: ServiceDeclaration) -> Result<(), FeatureInstallError> {
-        require_service_provider_capability(self.grants, self.report, &declaration)?;
         self.service_registry
             .register_provider(self.feature_id.clone(), declaration.clone())?;
         self.report.provided_services.push(declaration);
@@ -921,7 +807,7 @@ impl FeatureServiceRegistrar<'_> {
 /// Install-time context provided to a feature module.
 pub struct FeatureInstallContext<'a> {
     feature_id: &'a FeatureId,
-    grants: &'a CapabilityGrantSet,
+    grants: &'a AuthorityGrantSet,
     pending_tools: &'a mut Vec<ToolDefinition>,
     installed_tool_names: &'a mut HashMap<String, FeatureId>,
     hook_builder: &'a mut HookRegistryBuilder,
@@ -934,7 +820,7 @@ impl FeatureInstallContext<'_> {
         self.feature_id
     }
 
-    pub fn grants(&self) -> &CapabilityGrantSet {
+    pub fn grants(&self) -> &AuthorityGrantSet {
         self.grants
     }
 
@@ -950,7 +836,6 @@ impl FeatureInstallContext<'_> {
 
     pub fn hooks(&mut self) -> HookContributionRegistrar<'_> {
         HookContributionRegistrar {
-            grants: self.grants,
             hook_builder: self.hook_builder,
             report: self.report,
         }
@@ -958,7 +843,6 @@ impl FeatureInstallContext<'_> {
 
     pub fn background_tasks(&mut self) -> BackgroundTaskRegistrar<'_> {
         BackgroundTaskRegistrar {
-            grants: self.grants,
             report: self.report,
         }
     }
@@ -966,7 +850,6 @@ impl FeatureInstallContext<'_> {
     pub fn services(&mut self) -> FeatureServiceRegistrar<'_> {
         FeatureServiceRegistrar {
             feature_id: self.feature_id,
-            grants: self.grants,
             service_registry: self.service_registry,
             report: self.report,
         }
@@ -981,14 +864,12 @@ impl FeatureInstallContext<'_> {
 
     pub fn alerts(&mut self) -> FeatureAlertSink<'_> {
         FeatureAlertSink {
-            grants: self.grants,
             report: self.report,
         }
     }
 
     pub fn diagnostics(&mut self) -> FeatureDiagnosticSink<'_> {
         FeatureDiagnosticSink {
-            grants: self.grants,
             report: self.report,
         }
     }
@@ -1076,7 +957,7 @@ impl FeatureRegistryBuilder {
         let mut seen_features = HashSet::new();
 
         for (module, descriptor) in self.modules.into_iter().zip(descriptors.into_iter()) {
-            let grants = CapabilityGrantSet::grant_all(&descriptor.requested_capabilities);
+            let grants = AuthorityGrantSet::grant_all(&descriptor.requested_authorities);
             let mut report = FeatureInstallReport::new(&descriptor, grants.clone());
 
             if !seen_features.insert(descriptor.id.clone()) {
@@ -1093,38 +974,15 @@ impl FeatureRegistryBuilder {
                 continue;
             }
 
-            for capability in grants.denied() {
+            for authority in grants.denied() {
                 report.diagnostics.push(FeatureDiagnostic::warning(format!(
-                    "capability denied: {:?}: {}",
-                    capability.capability, capability.reason
+                    "authority denied: {:?}: {}",
+                    authority.authority, authority.reason
                 )));
             }
 
             let mut required_service_failed = false;
             for requirement in descriptor.requires_services.iter().cloned() {
-                let capability = HostCapability::RequireService {
-                    service: requirement.id.clone(),
-                };
-                if let Err(error) = require_capability(
-                    &grants,
-                    &mut report,
-                    FeatureContributionKind::Service,
-                    requirement.id.to_string(),
-                    &capability,
-                ) {
-                    if requirement.required {
-                        report
-                            .diagnostics
-                            .push(FeatureDiagnostic::error(error.to_string()));
-                        required_service_failed = true;
-                    } else {
-                        report
-                            .diagnostics
-                            .push(FeatureDiagnostic::warning(error.to_string()));
-                    }
-                    continue;
-                }
-
                 if service_registry.provides(&requirement.id) {
                     report.resolved_service_requirements.push(requirement);
                 } else if requirement.required {
@@ -1159,34 +1017,22 @@ impl FeatureRegistryBuilder {
             }
 
             for background_task in descriptor.background_tasks.iter().cloned() {
-                match require_background_task_capability(&grants, &mut report, &background_task) {
-                    Ok(()) => report.declared_background_tasks.push(background_task),
-                    Err(error) => report
-                        .diagnostics
-                        .push(FeatureDiagnostic::warning(error.to_string())),
-                }
+                report.declared_background_tasks.push(background_task);
             }
 
             for service in descriptor.provides_services.iter().cloned() {
-                match require_service_provider_capability(&grants, &mut report, &service) {
-                    Ok(()) => match service_registry
-                        .register_provider(descriptor.id.clone(), service.clone())
-                    {
-                        Ok(()) => report.provided_services.push(service),
-                        Err(error) => {
-                            report
-                                .diagnostics
-                                .push(FeatureDiagnostic::error(error.to_string()));
-                            report.mark_skipped(
-                                FeatureContributionKind::Service,
-                                service.id.to_string(),
-                                error.to_string(),
-                            );
-                        }
-                    },
-                    Err(error) => report
-                        .diagnostics
-                        .push(FeatureDiagnostic::warning(error.to_string())),
+                match service_registry.register_provider(descriptor.id.clone(), service.clone()) {
+                    Ok(()) => report.provided_services.push(service),
+                    Err(error) => {
+                        report
+                            .diagnostics
+                            .push(FeatureDiagnostic::error(error.to_string()));
+                        report.mark_skipped(
+                            FeatureContributionKind::Service,
+                            service.id.to_string(),
+                            error.to_string(),
+                        );
+                    }
                 }
             }
 
@@ -1249,8 +1095,8 @@ pub enum FeatureInstallError {
         first_feature: String,
         duplicate_feature: String,
     },
-    #[error("feature capability denied: {0}")]
-    CapabilityDenied(String),
+    #[error("feature authority denied: {0}")]
+    AuthorityDenied(String),
     #[error("feature install failed: {0}")]
     Install(String),
 }
@@ -1273,30 +1119,6 @@ pub mod builtin {
         fn descriptor(&self) -> FeatureDescriptor {
             FeatureDescriptor::builtin("task-tools", "Task tools")
                 .with_description("Session-lifetime task tracking builtin tools")
-                .with_capability(CapabilityRequest::required(
-                    HostCapability::ContributeTool {
-                        name: "TaskCreate".into(),
-                    },
-                    "register TaskCreate builtin tool",
-                ))
-                .with_capability(CapabilityRequest::required(
-                    HostCapability::ContributeTool {
-                        name: "TaskUpdate".into(),
-                    },
-                    "register TaskUpdate builtin tool",
-                ))
-                .with_capability(CapabilityRequest::required(
-                    HostCapability::ContributeTool {
-                        name: "TaskGet".into(),
-                    },
-                    "register TaskGet builtin tool",
-                ))
-                .with_capability(CapabilityRequest::required(
-                    HostCapability::ContributeTool {
-                        name: "TaskList".into(),
-                    },
-                    "register TaskList builtin tool",
-                ))
                 .with_tool(ToolDeclaration::new(
                     "TaskCreate",
                     "Create a session-lifetime user-visible task",
@@ -1338,6 +1160,7 @@ mod tests {
     use llm_worker::llm_client::{ClientError, Request, ResponseStream};
     use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
     use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[derive(Clone)]
     struct DummyClient;
@@ -1396,20 +1219,8 @@ mod tests {
     }
 
     #[test]
-    fn descriptor_capabilities_and_install_report_are_recorded() {
+    fn descriptor_authorities_and_install_report_are_recorded() {
         let descriptor = FeatureDescriptor::builtin("dummy", "Dummy")
-            .with_capability(CapabilityRequest::required(
-                HostCapability::ContributeTool {
-                    name: "Dummy".into(),
-                },
-                "test",
-            ))
-            .with_capability(CapabilityRequest::required(
-                HostCapability::DeclareBackgroundTask {
-                    name: "daily".into(),
-                },
-                "test background task declaration",
-            ))
             .with_tool(ToolDeclaration::new("Dummy", "dummy tool"))
             .with_background_task(BackgroundTaskDeclaration::descriptor_only(
                 "daily",
@@ -1431,32 +1242,14 @@ mod tests {
         assert!(feature_report.installed);
         assert_eq!(feature_report.installed_tools, vec!["Dummy"]);
         assert_eq!(feature_report.declared_background_tasks[0].name, "daily");
-        assert!(
-            feature_report
-                .granted_capabilities
-                .contains(&HostCapability::ContributeTool {
-                    name: "Dummy".into()
-                })
-        );
+        assert!(feature_report.granted_authorities.denied().is_empty());
     }
 
     #[test]
     fn duplicate_tool_names_are_rejected() {
         let descriptor_a = FeatureDescriptor::builtin("a", "A")
-            .with_capability(CapabilityRequest::required(
-                HostCapability::ContributeTool {
-                    name: "Duplicate".into(),
-                },
-                "test duplicate handling",
-            ))
             .with_tool(ToolDeclaration::new("Duplicate", "first tool"));
         let descriptor_b = FeatureDescriptor::builtin("b", "B")
-            .with_capability(CapabilityRequest::required(
-                HostCapability::ContributeTool {
-                    name: "Duplicate".into(),
-                },
-                "test duplicate handling",
-            ))
             .with_tool(ToolDeclaration::new("Duplicate", "second tool"));
         let mut hook_builder = HookRegistryBuilder::default();
         let mut pending_tools = Vec::new();
@@ -1491,12 +1284,6 @@ mod tests {
     #[test]
     fn mismatched_tool_contribution_name_is_rejected_before_queueing() {
         let descriptor = FeatureDescriptor::builtin("mismatch", "Mismatch")
-            .with_capability(CapabilityRequest::required(
-                HostCapability::ContributeTool {
-                    name: "Actual".into(),
-                },
-                "test mismatch handling",
-            ))
             .with_tool(ToolDeclaration::new("Actual", "actual model-visible tool"));
         let mut hook_builder = HookRegistryBuilder::default();
         let mut pending_tools = Vec::new();
@@ -1516,6 +1303,61 @@ mod tests {
                 .contains("does not match model-visible tool name")
         }));
         assert_eq!(report.reports[0].skipped[0].name, "Actual");
+    }
+
+    #[test]
+    fn stateful_tool_definition_is_materialized_once_for_report_and_worker() {
+        struct StatefulToolFeature {
+            calls: Arc<AtomicUsize>,
+        }
+
+        impl FeatureModule for StatefulToolFeature {
+            fn descriptor(&self) -> FeatureDescriptor {
+                FeatureDescriptor::builtin("stateful-tool", "Stateful tool")
+                    .with_tool(ToolDeclaration::new("First", "stateful tool"))
+            }
+
+            fn install(
+                &self,
+                context: &mut FeatureInstallContext<'_>,
+            ) -> Result<(), FeatureInstallError> {
+                let calls = Arc::clone(&self.calls);
+                let definition: ToolDefinition = Arc::new(move || {
+                    let call_index = calls.fetch_add(1, Ordering::SeqCst);
+                    let name = if call_index == 0 { "First" } else { "Second" };
+                    (
+                        ToolMeta::new(name)
+                            .description("stateful")
+                            .input_schema(json!({})),
+                        Arc::new(DummyTool) as Arc<dyn Tool>,
+                    )
+                });
+                context
+                    .tools()
+                    .register(ToolContribution::new("First", definition))
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut worker = Worker::new(DummyClient);
+        let mut hook_builder = HookRegistryBuilder::default();
+        let report = FeatureRegistryBuilder::new()
+            .with_module(StatefulToolFeature {
+                calls: Arc::clone(&calls),
+            })
+            .install_into_worker(&mut worker, &mut hook_builder);
+
+        worker.tool_server_handle().flush_pending();
+        let names: Vec<_> = worker
+            .tool_server_handle()
+            .tool_definitions_sorted()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+
+        assert_eq!(report.installed_tool_names(), vec!["First"]);
+        assert_eq!(names, vec!["First"]);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     struct ServiceFeature {
@@ -1538,50 +1380,19 @@ mod tests {
     #[test]
     fn service_requirements_resolve_against_prior_providers() {
         let service = ServiceId::builtin("demo-service");
-        let provider = FeatureDescriptor::builtin("provider", "Provider")
-            .with_capability(CapabilityRequest::required(
-                HostCapability::ProvideService {
-                    service: service.clone(),
-                },
-                "provide demo service",
-            ))
-            .with_provided_service(ServiceDeclaration::new(
-                service.clone(),
-                "1",
-                "demo service",
-            ));
+        let provider = FeatureDescriptor::builtin("provider", "Provider").with_provided_service(
+            ServiceDeclaration::new(service.clone(), "1", "demo service"),
+        );
         let consumer = FeatureDescriptor::builtin("consumer", "Consumer")
-            .with_capability(CapabilityRequest::required(
-                HostCapability::RequireService {
-                    service: service.clone(),
-                },
-                "require demo service",
-            ))
             .with_service_requirement(ServiceRequirement::required(service.clone(), "needs demo"));
         let missing_service = ServiceId::builtin("missing-service");
-        let missing = FeatureDescriptor::builtin("missing", "Missing")
-            .with_capability(CapabilityRequest::required(
-                HostCapability::RequireService {
-                    service: missing_service.clone(),
-                },
-                "require missing service",
-            ))
-            .with_service_requirement(ServiceRequirement::required(
-                missing_service,
-                "needs missing",
-            ));
+        let missing = FeatureDescriptor::builtin("missing", "Missing").with_service_requirement(
+            ServiceRequirement::required(missing_service, "needs missing"),
+        );
         let optional_service = ServiceId::builtin("optional-service");
-        let optional = FeatureDescriptor::builtin("optional", "Optional")
-            .with_capability(CapabilityRequest::required(
-                HostCapability::RequireService {
-                    service: optional_service.clone(),
-                },
-                "optionally require service",
-            ))
-            .with_service_requirement(ServiceRequirement::optional(
-                optional_service,
-                "nice to have",
-            ));
+        let optional = FeatureDescriptor::builtin("optional", "Optional").with_service_requirement(
+            ServiceRequirement::optional(optional_service, "nice to have"),
+        );
         let mut hook_builder = HookRegistryBuilder::default();
         let mut pending_tools = Vec::new();
         let report = FeatureRegistryBuilder::new()
@@ -1620,11 +1431,11 @@ mod tests {
     }
 
     #[test]
-    fn background_task_declaration_without_capability_is_skipped() {
-        let descriptor = FeatureDescriptor::builtin("background-denied", "Background denied")
+    fn background_task_declaration_is_not_sandbox_authority_gated() {
+        let descriptor = FeatureDescriptor::builtin("background", "Background")
             .with_background_task(BackgroundTaskDeclaration::descriptor_only(
-                "denied-task",
-                "should be skipped",
+                "declared-task",
+                "descriptor contribution",
             ));
         let mut hook_builder = HookRegistryBuilder::default();
         let mut pending_tools = Vec::new();
@@ -1633,25 +1444,19 @@ mod tests {
             .install_into_pending(&mut pending_tools, &mut hook_builder);
 
         assert!(report.reports[0].installed);
-        assert!(report.reports[0].declared_background_tasks.is_empty());
         assert_eq!(
-            report.reports[0].skipped[0].kind,
-            FeatureContributionKind::BackgroundTask
+            report.reports[0].declared_background_tasks[0].name,
+            "declared-task"
         );
-        assert!(report.reports[0].diagnostics.iter().any(|diagnostic| {
-            diagnostic
-                .message
-                .contains("required capability was not granted")
-        }));
+        assert!(report.reports[0].skipped.is_empty());
     }
 
     #[test]
-    fn service_provider_without_capability_is_skipped() {
-        let service = ServiceId::builtin("denied-service");
-        let descriptor =
-            FeatureDescriptor::builtin("service-denied", "Service denied").with_provided_service(
-                ServiceDeclaration::new(service.clone(), "1", "should be skipped"),
-            );
+    fn service_provider_declaration_is_not_sandbox_authority_gated() {
+        let service = ServiceId::builtin("declared-service");
+        let descriptor = FeatureDescriptor::builtin("service", "Service").with_provided_service(
+            ServiceDeclaration::new(service.clone(), "1", "descriptor contribution"),
+        );
         let mut hook_builder = HookRegistryBuilder::default();
         let mut pending_tools = Vec::new();
         let report = FeatureRegistryBuilder::new()
@@ -1659,17 +1464,9 @@ mod tests {
             .install_into_pending(&mut pending_tools, &mut hook_builder);
 
         assert!(report.reports[0].installed);
-        assert!(!report.services.provides(&service));
-        assert!(report.reports[0].provided_services.is_empty());
-        assert_eq!(
-            report.reports[0].skipped[0].kind,
-            FeatureContributionKind::Service
-        );
-        assert!(report.reports[0].diagnostics.iter().any(|diagnostic| {
-            diagnostic
-                .message
-                .contains("required capability was not granted")
-        }));
+        assert!(report.services.provides(&service));
+        assert_eq!(report.reports[0].provided_services[0].id, service);
+        assert!(report.reports[0].skipped.is_empty());
     }
 
     #[test]
