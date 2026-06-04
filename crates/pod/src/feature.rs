@@ -579,6 +579,75 @@ impl FeatureInstallReport {
     }
 }
 
+#[derive(Clone, Debug)]
+struct FeatureContributionDeclarations {
+    tools: HashSet<String>,
+    hooks: HashSet<(String, FeatureHookPoint)>,
+    background_tasks: HashSet<String>,
+    provided_services: HashSet<(ServiceId, String)>,
+}
+
+impl FeatureContributionDeclarations {
+    fn from_descriptor(descriptor: &FeatureDescriptor) -> Self {
+        Self {
+            tools: descriptor
+                .tools
+                .iter()
+                .map(|tool| tool.name.clone())
+                .collect(),
+            hooks: descriptor
+                .hooks
+                .iter()
+                .map(|hook| (hook.name.clone(), hook.point.clone()))
+                .collect(),
+            background_tasks: descriptor
+                .background_tasks
+                .iter()
+                .map(|task| task.name.clone())
+                .collect(),
+            provided_services: descriptor
+                .provides_services
+                .iter()
+                .map(|service| (service.id.clone(), service.version.clone()))
+                .collect(),
+        }
+    }
+
+    fn contains_tool(&self, name: &str) -> bool {
+        self.tools.contains(name)
+    }
+
+    fn contains_hook(&self, declaration: &HookDeclaration) -> bool {
+        self.hooks
+            .contains(&(declaration.name.clone(), declaration.point.clone()))
+    }
+
+    fn contains_background_task(&self, declaration: &BackgroundTaskDeclaration) -> bool {
+        self.background_tasks.contains(&declaration.name)
+    }
+
+    fn contains_provided_service(&self, declaration: &ServiceDeclaration) -> bool {
+        self.provided_services
+            .contains(&(declaration.id.clone(), declaration.version.clone()))
+    }
+}
+
+fn reject_undeclared_contribution(
+    feature_id: &FeatureId,
+    report: &mut FeatureInstallReport,
+    kind: FeatureContributionKind,
+    name: impl Into<String>,
+) -> FeatureInstallError {
+    let name = name.into();
+    let error = FeatureInstallError::UndeclaredContribution {
+        kind: kind.clone(),
+        name: name.clone(),
+        feature: feature_id.to_string(),
+    };
+    report.mark_skipped(kind, name, error.to_string());
+    error
+}
+
 fn require_authority(
     grants: &AuthorityGrantSet,
     report: &mut FeatureInstallReport,
@@ -669,6 +738,7 @@ impl FeatureDiagnosticSink<'_> {
 /// Tool contribution registrar exposed inside [`FeatureInstallContext`].
 pub struct ToolContributionRegistrar<'a> {
     feature_id: &'a FeatureId,
+    declarations: &'a FeatureContributionDeclarations,
     grants: &'a AuthorityGrantSet,
     pending_tools: &'a mut Vec<ToolDefinition>,
     installed_tool_names: &'a mut HashMap<String, FeatureId>,
@@ -690,6 +760,15 @@ impl ToolContributionRegistrar<'_> {
                 error.to_string(),
             );
             return Err(error);
+        }
+
+        if !self.declarations.contains_tool(&model_visible_name) {
+            return Err(reject_undeclared_contribution(
+                self.feature_id,
+                self.report,
+                FeatureContributionKind::Tool,
+                model_visible_name,
+            ));
         }
 
         for authority in &contribution.required_authorities {
@@ -727,17 +806,35 @@ impl ToolContributionRegistrar<'_> {
 
 /// Safe hook contribution registrar backed by [`HookRegistryBuilder`].
 pub struct HookContributionRegistrar<'a> {
+    feature_id: &'a FeatureId,
+    declarations: &'a FeatureContributionDeclarations,
     hook_builder: &'a mut HookRegistryBuilder,
     report: &'a mut FeatureInstallReport,
 }
 
 impl HookContributionRegistrar<'_> {
+    fn require_declared(
+        &mut self,
+        declaration: &HookDeclaration,
+    ) -> Result<(), FeatureInstallError> {
+        if self.declarations.contains_hook(declaration) {
+            return Ok(());
+        }
+        Err(reject_undeclared_contribution(
+            self.feature_id,
+            self.report,
+            FeatureContributionKind::Hook,
+            format!("{}:{:?}", declaration.name, declaration.point),
+        ))
+    }
+
     pub fn add_pre_request(
         &mut self,
         name: impl Into<String>,
         hook: impl Hook<PreLlmRequest> + 'static,
     ) -> Result<(), FeatureInstallError> {
         let declaration = HookDeclaration::new(name, FeatureHookPoint::PreRequest);
+        self.require_declared(&declaration)?;
         self.hook_builder.add_pre_llm_request(hook);
         self.report.installed_hooks.push(declaration);
         Ok(())
@@ -749,6 +846,7 @@ impl HookContributionRegistrar<'_> {
         hook: impl Hook<PreToolCall> + 'static,
     ) -> Result<(), FeatureInstallError> {
         let declaration = HookDeclaration::new(name, FeatureHookPoint::PreToolCall);
+        self.require_declared(&declaration)?;
         self.hook_builder.add_pre_tool_call(hook);
         self.report.installed_hooks.push(declaration);
         Ok(())
@@ -760,6 +858,7 @@ impl HookContributionRegistrar<'_> {
         hook: impl Hook<PostToolCall> + 'static,
     ) -> Result<(), FeatureInstallError> {
         let declaration = HookDeclaration::new(name, FeatureHookPoint::ToolResult);
+        self.require_declared(&declaration)?;
         self.hook_builder.add_post_tool_call(hook);
         self.report.installed_hooks.push(declaration);
         Ok(())
@@ -771,6 +870,7 @@ impl HookContributionRegistrar<'_> {
         hook: impl Hook<OnTurnEnd> + 'static,
     ) -> Result<(), FeatureInstallError> {
         let declaration = HookDeclaration::new(name, FeatureHookPoint::TurnEnd);
+        self.require_declared(&declaration)?;
         self.hook_builder.add_on_turn_end(hook);
         self.report.installed_hooks.push(declaration);
         Ok(())
@@ -779,24 +879,62 @@ impl HookContributionRegistrar<'_> {
 
 /// Background task registrar for descriptor/report-only contributions.
 pub struct BackgroundTaskRegistrar<'a> {
+    feature_id: &'a FeatureId,
+    declarations: &'a FeatureContributionDeclarations,
     report: &'a mut FeatureInstallReport,
 }
 
 impl BackgroundTaskRegistrar<'_> {
-    pub fn declare(&mut self, declaration: BackgroundTaskDeclaration) {
-        self.report.declared_background_tasks.push(declaration);
+    pub fn declare(
+        &mut self,
+        declaration: BackgroundTaskDeclaration,
+    ) -> Result<(), FeatureInstallError> {
+        if !self.declarations.contains_background_task(&declaration) {
+            return Err(reject_undeclared_contribution(
+                self.feature_id,
+                self.report,
+                FeatureContributionKind::BackgroundTask,
+                declaration.name,
+            ));
+        }
+        if !self
+            .report
+            .declared_background_tasks
+            .iter()
+            .any(|task| task.name == declaration.name)
+        {
+            self.report.declared_background_tasks.push(declaration);
+        }
+        Ok(())
     }
 }
 
 /// Service registrar for descriptor/report-only provider metadata.
 pub struct FeatureServiceRegistrar<'a> {
     feature_id: &'a FeatureId,
+    declarations: &'a FeatureContributionDeclarations,
     service_registry: &'a mut FeatureServiceRegistry,
     report: &'a mut FeatureInstallReport,
 }
 
 impl FeatureServiceRegistrar<'_> {
     pub fn provide(&mut self, declaration: ServiceDeclaration) -> Result<(), FeatureInstallError> {
+        if !self.declarations.contains_provided_service(&declaration) {
+            return Err(reject_undeclared_contribution(
+                self.feature_id,
+                self.report,
+                FeatureContributionKind::Service,
+                declaration.id.to_string(),
+            ));
+        }
+        if self
+            .report
+            .provided_services
+            .iter()
+            .any(|service| service.id == declaration.id && service.version == declaration.version)
+        {
+            return Ok(());
+        }
         self.service_registry
             .register_provider(self.feature_id.clone(), declaration.clone())?;
         self.report.provided_services.push(declaration);
@@ -807,6 +945,7 @@ impl FeatureServiceRegistrar<'_> {
 /// Install-time context provided to a feature module.
 pub struct FeatureInstallContext<'a> {
     feature_id: &'a FeatureId,
+    declarations: &'a FeatureContributionDeclarations,
     grants: &'a AuthorityGrantSet,
     pending_tools: &'a mut Vec<ToolDefinition>,
     installed_tool_names: &'a mut HashMap<String, FeatureId>,
@@ -827,6 +966,7 @@ impl FeatureInstallContext<'_> {
     pub fn tools(&mut self) -> ToolContributionRegistrar<'_> {
         ToolContributionRegistrar {
             feature_id: self.feature_id,
+            declarations: self.declarations,
             grants: self.grants,
             pending_tools: self.pending_tools,
             installed_tool_names: self.installed_tool_names,
@@ -836,6 +976,8 @@ impl FeatureInstallContext<'_> {
 
     pub fn hooks(&mut self) -> HookContributionRegistrar<'_> {
         HookContributionRegistrar {
+            feature_id: self.feature_id,
+            declarations: self.declarations,
             hook_builder: self.hook_builder,
             report: self.report,
         }
@@ -843,6 +985,8 @@ impl FeatureInstallContext<'_> {
 
     pub fn background_tasks(&mut self) -> BackgroundTaskRegistrar<'_> {
         BackgroundTaskRegistrar {
+            feature_id: self.feature_id,
+            declarations: self.declarations,
             report: self.report,
         }
     }
@@ -850,6 +994,7 @@ impl FeatureInstallContext<'_> {
     pub fn services(&mut self) -> FeatureServiceRegistrar<'_> {
         FeatureServiceRegistrar {
             feature_id: self.feature_id,
+            declarations: self.declarations,
             service_registry: self.service_registry,
             report: self.report,
         }
@@ -958,6 +1103,7 @@ impl FeatureRegistryBuilder {
 
         for (module, descriptor) in self.modules.into_iter().zip(descriptors.into_iter()) {
             let grants = AuthorityGrantSet::grant_all(&descriptor.requested_authorities);
+            let declarations = FeatureContributionDeclarations::from_descriptor(&descriptor);
             let mut report = FeatureInstallReport::new(&descriptor, grants.clone());
 
             if !seen_features.insert(descriptor.id.clone()) {
@@ -1039,6 +1185,7 @@ impl FeatureRegistryBuilder {
             let install_result = {
                 let mut context = FeatureInstallContext {
                     feature_id: &descriptor.id,
+                    declarations: &declarations,
                     grants: &grants,
                     pending_tools,
                     installed_tool_names: &mut installed_tool_names,
@@ -1086,6 +1233,14 @@ pub enum FeatureInstallError {
     ToolNameMismatch {
         declared: String,
         model_visible: String,
+    },
+    #[error(
+        "undeclared {kind:?} contribution `{name}` from feature `{feature}` is not present in the approved feature descriptor"
+    )]
+    UndeclaredContribution {
+        kind: FeatureContributionKind,
+        name: String,
+        feature: String,
     },
     #[error(
         "duplicate service declaration `{service}` from feature `{duplicate_feature}`; first provided by `{first_feature}`"
@@ -1141,8 +1296,11 @@ pub mod builtin {
             &self,
             context: &mut FeatureInstallContext<'_>,
         ) -> Result<(), FeatureInstallError> {
-            for definition in tools::task_tools(self.task_store.clone()) {
-                let name = (definition)().0.name;
+            let names = ["TaskCreate", "TaskList", "TaskGet", "TaskUpdate"];
+            for (name, definition) in names
+                .into_iter()
+                .zip(tools::task_tools(self.task_store.clone()))
+            {
                 context
                     .tools()
                     .register(ToolContribution::new(name, definition))?;
@@ -1375,6 +1533,176 @@ mod tests {
         ) -> Result<(), FeatureInstallError> {
             Ok(())
         }
+    }
+
+    struct DummyPreToolHook;
+
+    #[async_trait]
+    impl Hook<PreToolCall> for DummyPreToolHook {
+        async fn call(
+            &self,
+            _input: &crate::hook::ToolCallSummary,
+        ) -> crate::hook::HookPreToolAction {
+            crate::hook::HookPreToolAction::Continue
+        }
+    }
+
+    struct HookFeature {
+        descriptor: FeatureDescriptor,
+        hook_name: &'static str,
+    }
+
+    impl FeatureModule for HookFeature {
+        fn descriptor(&self) -> FeatureDescriptor {
+            self.descriptor.clone()
+        }
+
+        fn install(
+            &self,
+            context: &mut FeatureInstallContext<'_>,
+        ) -> Result<(), FeatureInstallError> {
+            context
+                .hooks()
+                .add_pre_tool_call(self.hook_name, DummyPreToolHook)
+        }
+    }
+
+    struct BackgroundFeature {
+        descriptor: FeatureDescriptor,
+        task_name: &'static str,
+    }
+
+    impl FeatureModule for BackgroundFeature {
+        fn descriptor(&self) -> FeatureDescriptor {
+            self.descriptor.clone()
+        }
+
+        fn install(
+            &self,
+            context: &mut FeatureInstallContext<'_>,
+        ) -> Result<(), FeatureInstallError> {
+            context
+                .background_tasks()
+                .declare(BackgroundTaskDeclaration::descriptor_only(
+                    self.task_name,
+                    "runtime background task",
+                ))
+        }
+    }
+
+    struct ServiceProviderFeature {
+        descriptor: FeatureDescriptor,
+        service: ServiceId,
+    }
+
+    impl FeatureModule for ServiceProviderFeature {
+        fn descriptor(&self) -> FeatureDescriptor {
+            self.descriptor.clone()
+        }
+
+        fn install(
+            &self,
+            context: &mut FeatureInstallContext<'_>,
+        ) -> Result<(), FeatureInstallError> {
+            context.services().provide(ServiceDeclaration::new(
+                self.service.clone(),
+                "1",
+                "runtime service provider",
+            ))
+        }
+    }
+
+    #[test]
+    fn undeclared_tool_contribution_is_rejected() {
+        let descriptor = FeatureDescriptor::builtin("undeclared-tool", "Undeclared tool");
+        let mut hook_builder = HookRegistryBuilder::default();
+        let mut pending_tools = Vec::new();
+        let report = FeatureRegistryBuilder::new()
+            .with_module(ToolFeature {
+                descriptor,
+                contribution_name: "HiddenTool",
+                model_visible_name: "HiddenTool",
+            })
+            .install_into_pending(&mut pending_tools, &mut hook_builder);
+
+        assert!(pending_tools.is_empty());
+        assert!(!report.reports[0].installed);
+        assert_eq!(
+            report.reports[0].skipped[0].kind,
+            FeatureContributionKind::Tool
+        );
+        assert_eq!(report.reports[0].skipped[0].name, "HiddenTool");
+        assert!(report.reports[0].diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("is not present in the approved feature descriptor")
+        }));
+    }
+
+    #[test]
+    fn undeclared_hook_contribution_is_rejected() {
+        let descriptor = FeatureDescriptor::builtin("undeclared-hook", "Undeclared hook");
+        let mut hook_builder = HookRegistryBuilder::default();
+        let mut pending_tools = Vec::new();
+        let report = FeatureRegistryBuilder::new()
+            .with_module(HookFeature {
+                descriptor,
+                hook_name: "hidden-hook",
+            })
+            .install_into_pending(&mut pending_tools, &mut hook_builder);
+
+        assert!(!report.reports[0].installed);
+        assert!(report.reports[0].installed_hooks.is_empty());
+        assert_eq!(
+            report.reports[0].skipped[0].kind,
+            FeatureContributionKind::Hook
+        );
+        assert!(report.reports[0].skipped[0].name.contains("hidden-hook"));
+    }
+
+    #[test]
+    fn undeclared_background_task_contribution_is_rejected() {
+        let descriptor =
+            FeatureDescriptor::builtin("undeclared-background", "Undeclared background");
+        let mut hook_builder = HookRegistryBuilder::default();
+        let mut pending_tools = Vec::new();
+        let report = FeatureRegistryBuilder::new()
+            .with_module(BackgroundFeature {
+                descriptor,
+                task_name: "hidden-task",
+            })
+            .install_into_pending(&mut pending_tools, &mut hook_builder);
+
+        assert!(!report.reports[0].installed);
+        assert!(report.reports[0].declared_background_tasks.is_empty());
+        assert_eq!(
+            report.reports[0].skipped[0].kind,
+            FeatureContributionKind::BackgroundTask
+        );
+        assert_eq!(report.reports[0].skipped[0].name, "hidden-task");
+    }
+
+    #[test]
+    fn undeclared_service_provider_contribution_is_rejected() {
+        let service = ServiceId::builtin("hidden-service");
+        let descriptor = FeatureDescriptor::builtin("undeclared-service", "Undeclared service");
+        let mut hook_builder = HookRegistryBuilder::default();
+        let mut pending_tools = Vec::new();
+        let report = FeatureRegistryBuilder::new()
+            .with_module(ServiceProviderFeature {
+                descriptor,
+                service: service.clone(),
+            })
+            .install_into_pending(&mut pending_tools, &mut hook_builder);
+
+        assert!(!report.reports[0].installed);
+        assert!(!report.services.provides(&service));
+        assert!(report.reports[0].provided_services.is_empty());
+        assert_eq!(
+            report.reports[0].skipped[0].kind,
+            FeatureContributionKind::Service
+        );
+        assert_eq!(report.reports[0].skipped[0].name, service.to_string());
     }
 
     #[test]
