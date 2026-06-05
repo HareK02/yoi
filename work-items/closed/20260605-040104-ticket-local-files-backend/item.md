@@ -2,12 +2,12 @@
 id: 20260605-040104-ticket-local-files-backend
 slug: ticket-local-files-backend
 title: Ticket local files backend
-status: open
+status: closed
 kind: task
 priority: P1
 labels: [ticket, backend, orchestration]
 created_at: 2026-06-05T04:01:04Z
-updated_at: 2026-06-05T04:44:08Z
+updated_at: 2026-06-05T04:45:46Z
 assignee: null
 legacy_ticket: null
 ---
