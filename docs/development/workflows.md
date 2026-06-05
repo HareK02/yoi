@@ -6,11 +6,12 @@ Project-authored workflows live under `.yoi/workflow/`. Generated memory lives u
 
 ## Workflow role
 
-A workflow should define how to coordinate work. It should not become a private implementation branch, an unreviewed design decision, or a replacement for work items.
+A workflow should define how to coordinate work. It should not become a private implementation branch, an unreviewed design decision, or a replacement for Tickets.
 
 Current workflow themes include:
 
-- preflight before delegating uncertain ticket work
+- Intake clarification before materializing user requests as Tickets
+- preflight before delegating uncertain Ticket work
 - worktree setup and cleanup
 - sibling coder/reviewer Pod orchestration
 - human-gated maintenance and merge readiness
@@ -25,7 +26,7 @@ A parent/orchestrator must verify:
 - live/restorable state via Pod tools when relevant
 - worktree status and diff
 - validation command output
-- work item requirements and acceptance criteria
+- Ticket requirements and acceptance criteria
 
 Notifications are hints to inspect state. They are not proof of completion.
 
