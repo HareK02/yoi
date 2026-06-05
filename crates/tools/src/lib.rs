@@ -12,7 +12,7 @@
 //!   Recreated fresh on each Pod start (including resume).
 //!
 //! The Pod layer owns both instances and passes them to
-//! [`builtin_tools`] when registering tools on a `Worker`.
+//! [`core_builtin_tools`] when registering tools on a `Worker`.
 //!
 //! `Bash` is the lone exception — its child processes bypass `ScopedFs`
 //! entirely. Safety for arbitrary command execution is delegated to the
@@ -20,7 +20,6 @@
 
 pub mod error;
 pub mod scoped_fs;
-pub mod task;
 pub mod tracker;
 
 mod bash;
@@ -38,7 +37,6 @@ pub use glob::glob_tool;
 pub use grep::grep_tool;
 pub use read::read_tool;
 pub use scoped_fs::ScopedFs;
-pub use task::{TaskEntry, TaskSnapshot, TaskStatus, TaskStore, task_tools};
 pub use tracker::Tracker;
 pub use web::{web_fetch_tool, web_search_tool};
 pub use write::write_tool;
@@ -71,18 +69,4 @@ pub fn core_builtin_tools(
         web_search_tool(web::WebTools::new(web_config.clone())),
         web_fetch_tool(web::WebTools::new(web_config)),
     ]
-}
-
-/// Register all builtin tools, including task tools, for callers that are not
-/// using the Pod feature registry path.
-pub fn builtin_tools(
-    fs: ScopedFs,
-    tracker: Tracker,
-    task_store: TaskStore,
-    bash_output_dir: std::path::PathBuf,
-    web_config: Option<manifest::WebConfig>,
-) -> Vec<llm_worker::tool::ToolDefinition> {
-    let mut defs = core_builtin_tools(fs, tracker, bash_output_dir, web_config);
-    defs.extend(task_tools(task_store));
-    defs
 }

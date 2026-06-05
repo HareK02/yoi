@@ -473,13 +473,15 @@ mod tests {
     }
 
     fn task_tool_call_info(name: &str, input: serde_json::Value) -> ToolCallInfo {
-        let def = tools::task_tools(tools::TaskStore::new())
-            .into_iter()
-            .find(|def| {
-                let (meta, _) = def();
-                meta.name == name
-            })
-            .expect("task tool definition");
+        let def = crate::feature::builtin::task::task_tools(
+            crate::feature::builtin::task::TaskStore::new(),
+        )
+        .into_iter()
+        .find(|def| {
+            let (meta, _) = def();
+            meta.name == name
+        })
+        .expect("task tool definition");
         let (meta, tool) = def();
         ToolCallInfo {
             call: llm_worker::tool::ToolCall {

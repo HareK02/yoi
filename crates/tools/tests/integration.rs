@@ -1,4 +1,4 @@
-//! Cross-tool integration tests exercising `builtin_tools()` end-to-end.
+//! Cross-tool integration tests exercising `core_builtin_tools()` end-to-end.
 //!
 //! `ToolServerHandle::register_tool` / `flush_pending` are `pub(crate)` in
 //! llm-worker, so from here we exercise the factories directly — the same
@@ -11,7 +11,7 @@ use llm_worker::tool::{Tool, ToolDefinition, ToolMeta};
 use manifest::{Permission, Scope, ScopeConfig, ScopeRule};
 use serde_json::json;
 use tempfile::TempDir;
-use tools::{ScopedFs, TaskStore, Tracker, builtin_tools};
+use tools::{ScopedFs, Tracker, core_builtin_tools};
 
 fn scope_with_spill(workspace: &Path, spill: &Path) -> Scope {
     let base = Scope::writable(workspace).unwrap();
@@ -56,10 +56,9 @@ fn setup() -> (TempDir, TempDir, Registry) {
     let scope = scope_with_spill(dir.path(), spill.path());
     let fs = ScopedFs::new(scope, dir.path().to_path_buf());
     let tracker = Tracker::new();
-    let reg = Registry::new(builtin_tools(
+    let reg = Registry::new(core_builtin_tools(
         fs,
         tracker,
-        TaskStore::new(),
         spill.path().to_path_buf(),
         None,
     ));
@@ -79,7 +78,7 @@ async fn call_err(tool: &Arc<dyn Tool>, input: serde_json::Value) -> llm_worker:
 }
 
 #[test]
-fn builtin_tools_registers_full_set() {
+fn core_builtin_tools_registers_full_set() {
     let (_dir, _spill, reg) = setup();
     let mut names = reg.names();
     names.sort();
@@ -91,10 +90,6 @@ fn builtin_tools_registers_full_set() {
             "Glob",
             "Grep",
             "Read",
-            "TaskCreate",
-            "TaskGet",
-            "TaskList",
-            "TaskUpdate",
             "WebFetch",
             "WebSearch",
             "Write"
@@ -292,7 +287,7 @@ async fn edit_requires_read_across_tools() {
 #[tokio::test]
 async fn deterministic_tool_order_is_registration_order() {
     let (_dir, _spill, reg) = setup();
-    // Registration order from builtin_tools(): Read, Write, Edit, Glob, Grep, Bash, WebSearch, WebFetch, TaskCreate, TaskList, TaskGet, TaskUpdate
+    // Registration order from core_builtin_tools(): Read, Write, Edit, Glob, Grep, Bash, WebSearch, WebFetch
     let names: Vec<&str> = reg.entries.iter().map(|(m, _)| m.name.as_str()).collect();
     assert_eq!(
         names,
@@ -305,10 +300,6 @@ async fn deterministic_tool_order_is_registration_order() {
             "Bash",
             "WebSearch",
             "WebFetch",
-            "TaskCreate",
-            "TaskList",
-            "TaskGet",
-            "TaskUpdate"
         ]
     );
 }
@@ -326,10 +317,6 @@ fn tool_names_match_reference_spec() {
         "Bash",
         "WebSearch",
         "WebFetch",
-        "TaskCreate",
-        "TaskList",
-        "TaskGet",
-        "TaskUpdate",
     ] {
         assert!(
             reg.entries.iter().any(|(m, _)| m.name == expected),
@@ -346,10 +333,9 @@ async fn tracker_recent_files_tracks_read_write_edit() {
     let scope = scope_with_spill(dir.path(), spill.path());
     let fs = ScopedFs::new(scope, dir.path().to_path_buf());
     let tracker = Tracker::new();
-    let reg = Registry::new(builtin_tools(
+    let reg = Registry::new(core_builtin_tools(
         fs,
         tracker.clone(),
-        TaskStore::new(),
         spill.path().to_path_buf(),
         None,
     ));

@@ -1,11 +1,11 @@
 //! In-TUI mirror of the session-lifetime task store.
 //!
-//! This deliberately does NOT depend on `tools::TaskStore`. The TUI is a
+//! This deliberately does NOT depend on the Pod TaskStore. The TUI is a
 //! presentation layer; pulling in `tools` would drag along `llm-worker`
 //! and the whole tool surface. Instead we mirror the small subset we
 //! need:
 //!
-//! - `TaskEntry` / `TaskStatus`: shaped to round-trip with `tools`'s JSON
+//! - `TaskEntry` / `TaskStatus`: shaped to round-trip with Pod Task JSON
 //!   serialization (`#[serde(rename_all = "lowercase")]` on the status,
 //!   matching field names on the entry).
 //! - Just enough state machine to apply `TaskCreate` / `TaskUpdate`
@@ -90,7 +90,7 @@ impl TaskStore {
 
     /// Apply a completed `TaskCreate` / `TaskUpdate` tool_call. Other
     /// tool names and unparseable JSON are silent no-ops, matching the
-    /// resilience of `tools::TaskStore::replay_history`.
+    /// resilience of the Pod TaskStore history replay.
     pub fn apply_tool_call(&mut self, name: &str, arguments: &str) {
         match name {
             "TaskCreate" => {
@@ -313,22 +313,15 @@ mod tests {
     }
 }
 
-/// Cross-crate contract tests. The TUI deliberately re-implements a
-/// stripped-down mirror of `tools::TaskStore` instead of depending on
-/// the real one (see `tickets/tui-task-display.md`). That decoupling
-/// means a format change on the tools side — a renamed field on
-/// `TaskEntry`, a different fence syntax in `render_snapshot`, a new
-/// JSON wrapper — would silently leave the TUI parsing nothing instead
-/// of failing loudly.
-///
-/// These tests pull `tools` in as a dev-dependency so the contract is
-/// exercised at CI time. If they fail, either the format genuinely
-/// changed (update both sides) or the TUI mirror has drifted (re-sync
-/// it).
+/// Snapshot format compatibility tests. The TUI deliberately re-implements a
+/// stripped-down TaskStore mirror instead of depending on the Pod Task feature;
+/// it only consumes task tool calls and `[Session TaskStore snapshot]` system
+/// messages. These fixtures encode the Pod-owned Task snapshot JSON/text shape
+/// so accidental TUI parser drift still fails locally without making `tui`
+/// depend on `pod` or `tools`.
 #[cfg(test)]
-mod cross_format_contract {
+mod snapshot_format_contract {
     use super::*;
-    use tools::task::{TaskStatus as ToolsTaskStatus, TaskStore as ToolsTaskStore};
 
     /// Mirrors the envelope `Pod::try_pre_run_compact` wraps the raw
     /// snapshot text in. Hand-rolled here so the test fails loudly if
@@ -341,16 +334,40 @@ mod cross_format_contract {
         )
     }
 
-    fn tools_status_label(s: ToolsTaskStatus) -> &'static str {
-        match s {
-            ToolsTaskStatus::Pending => "pending",
-            ToolsTaskStatus::Inprogress => "inprogress",
-            ToolsTaskStatus::Completed => "completed",
-            ToolsTaskStatus::Deleted => "deleted",
-        }
+    fn snapshot_fixture() -> &'static str {
+        r#"TaskStore: 2 task(s) (pending: 0, inprogress: 1, completed: 1, deleted: 0)
+
+```json
+{
+  "tasks": [
+    {
+      "taskid": 1,
+      "status": "inprogress",
+      "subject": "first",
+      "description": "first desc"
+    },
+    {
+      "taskid": 2,
+      "status": "completed",
+      "subject": "second",
+      "description": "second desc with\nnewline"
+    }
+  ]
+}
+```"#
     }
 
-    fn tui_status_label(s: TaskStatus) -> &'static str {
+    fn empty_snapshot_fixture() -> &'static str {
+        r#"TaskStore: 0 task(s) (pending: 0, inprogress: 0, completed: 0, deleted: 0)
+
+```json
+{
+  "tasks": []
+}
+```"#
+    }
+
+    fn status_label(s: TaskStatus) -> &'static str {
         match s {
             TaskStatus::Pending => "pending",
             TaskStatus::Inprogress => "inprogress",
@@ -360,61 +377,49 @@ mod cross_format_contract {
     }
 
     #[test]
-    fn tools_snapshot_text_round_trips_into_tui_store() {
-        let upstream = ToolsTaskStore::new();
-        upstream.create("first".into(), "first desc".into());
-        upstream.create("second".into(), "second desc with\nnewline".into());
-        upstream
-            .update(1, Some(ToolsTaskStatus::Inprogress), None, None)
-            .expect("update 1");
-        upstream
-            .update(2, Some(ToolsTaskStatus::Completed), None, None)
-            .expect("update 2");
-
-        let envelope = wrap_pod_style(&upstream.snapshot_text());
+    fn pod_snapshot_text_round_trips_into_tui_store() {
+        let envelope = wrap_pod_style(snapshot_fixture());
 
         let mut downstream = TaskStore::new();
         downstream.apply_system_message_text(&envelope);
 
-        let upstream_tasks = upstream.list();
-        let downstream_tasks = downstream.tasks();
-        assert_eq!(
-            downstream_tasks.len(),
-            upstream_tasks.len(),
-            "TUI parsed wrong number of tasks — `tools::render_snapshot` shape may have shifted"
-        );
-        for (u, d) in upstream_tasks.iter().zip(downstream_tasks.iter()) {
-            assert_eq!(d.taskid, u.taskid);
-            assert_eq!(d.subject, u.subject);
-            assert_eq!(d.description, u.description);
-            assert_eq!(tui_status_label(d.status), tools_status_label(u.status));
-        }
+        let tasks = downstream.tasks();
+        assert_eq!(tasks.len(), 2, "TUI parsed wrong number of tasks");
+        assert_eq!(tasks[0].taskid, 1);
+        assert_eq!(tasks[0].subject, "first");
+        assert_eq!(tasks[0].description, "first desc");
+        assert_eq!(status_label(tasks[0].status), "inprogress");
+        assert_eq!(tasks[1].taskid, 2);
+        assert_eq!(tasks[1].subject, "second");
+        assert_eq!(tasks[1].description, "second desc with\nnewline");
+        assert_eq!(status_label(tasks[1].status), "completed");
     }
 
     #[test]
-    fn tools_taskentry_field_shape_deserializes_into_tui_taskentry() {
-        // A single `tools::TaskEntry` round-tripped through JSON. Field
-        // renames like `taskid` → `task_id` or status case changes on
-        // the tools side would surface here as a serde failure or a
-        // wrong-status assertion.
-        let upstream = ToolsTaskStore::new();
-        let created = upstream.create("subj".into(), "desc".into());
-        let json = serde_json::to_string(&created).expect("serialize tools::TaskEntry");
+    fn taskentry_field_shape_deserializes_into_tui_taskentry() {
+        // A single Pod TaskEntry as JSON. Field renames like `taskid` →
+        // `task_id` or status case changes surface here as serde failures or
+        // wrong-status assertions.
+        let json = r#"{
+  "taskid": 7,
+  "status": "pending",
+  "subject": "subj",
+  "description": "desc"
+}"#;
         let parsed: TaskEntry =
-            serde_json::from_str(&json).expect("deserialize into tui::task::TaskEntry");
-        assert_eq!(parsed.taskid, created.taskid);
-        assert_eq!(parsed.subject, created.subject);
-        assert_eq!(parsed.description, created.description);
-        assert_eq!(tui_status_label(parsed.status), "pending");
+            serde_json::from_str(json).expect("deserialize into tui::task::TaskEntry");
+        assert_eq!(parsed.taskid, 7);
+        assert_eq!(parsed.subject, "subj");
+        assert_eq!(parsed.description, "desc");
+        assert_eq!(status_label(parsed.status), "pending");
     }
 
     #[test]
-    fn empty_tools_store_snapshot_is_recognised_by_tui() {
-        // Edge case: a freshly initialised TaskStore still produces a
-        // valid snapshot envelope. The TUI must parse it as "zero
-        // tasks", not silently fall through to no-op.
-        let upstream = ToolsTaskStore::new();
-        let envelope = wrap_pod_style(&upstream.snapshot_text());
+    fn empty_pod_task_snapshot_is_recognised_by_tui() {
+        // Edge case: a freshly initialised TaskStore still produces a valid
+        // snapshot envelope. The TUI must parse it as "zero tasks", not
+        // silently fall through to no-op.
+        let envelope = wrap_pod_style(empty_snapshot_fixture());
 
         // Seed the TUI store with stale state to confirm replacement.
         let mut downstream = TaskStore::new();
