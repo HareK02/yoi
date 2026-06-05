@@ -7,7 +7,7 @@ kind: task
 priority: P1
 labels: [tui, design, orchestration, panel]
 created_at: 2026-06-05T21:07:04Z
-updated_at: 2026-06-05T21:22:49Z
+updated_at: 2026-06-05T21:32:54Z
 assignee: null
 legacy_ticket: null
 ---
@@ -52,5 +52,7 @@ Produce a design artifact that fixes:
 
 - A design artifact exists under this Ticket's `artifacts/` directory.
 - The artifact defines the state/action model and responsibility boundaries clearly enough to implement child tickets.
+- The artifact defines a UI intermediate representation between runtime/domain state and rendering.
+- The artifact specifies that the concrete visual design follows existing TUI conventions/components rather than inventing a separate dashboard style.
 - The artifact explicitly preserves history/context rules: dynamic messages are committed to the destination Pod history, not injected into hidden context.
 - Reviewer or parent approves the design before implementation child tickets proceed.
