@@ -22,7 +22,7 @@ use uuid::Uuid;
 const READY_PREFIX: &str = "YOI-READY\t";
 const READY_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// `spawn_pod` の入力。
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpawnConfig {
     pub runtime_command: PodRuntimeCommand,
     /// `pod.name` として使う識別子。runtime ディレクトリ

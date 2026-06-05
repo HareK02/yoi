@@ -6,8 +6,9 @@
 
 use std::io;
 use std::path::PathBuf;
+use std::time::Duration;
 
-use protocol::{Method, Segment};
+use protocol::{ErrorCode, Event, InvokeKind, Method, Segment};
 use thiserror::Error;
 use ticket::config::{TicketConfig, TicketConfigError, TicketRole};
 
@@ -15,6 +16,7 @@ use crate::{PodClient, PodRuntimeCommand, SpawnConfig, SpawnError, SpawnReady, s
 
 const MAX_FIELD_CHARS: usize = 8_000;
 const MAX_POD_NAME_CHARS: usize = 80;
+const RUN_ACCEPTANCE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Ticket identifier carried by a role launch request.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -119,15 +121,21 @@ impl TicketRoleLaunchPlan {
         }
     }
 
-    pub fn spawn_config(&self, runtime_command: PodRuntimeCommand) -> SpawnConfig {
-        SpawnConfig {
+    pub fn spawn_config(
+        &self,
+        runtime_command: PodRuntimeCommand,
+    ) -> Result<SpawnConfig, TicketRoleLaunchError> {
+        if self.profile == "inherit" {
+            return Err(TicketRoleLaunchError::UnsupportedInheritProfile);
+        }
+        Ok(SpawnConfig {
             runtime_command,
             pod_name: self.pod_name.clone(),
             profile: Some(self.profile.clone()),
             cwd: self.workspace_root.clone(),
             resume_from: None,
             resume_by_pod_name: false,
-        }
+        })
     }
 }
 
@@ -144,6 +152,10 @@ pub enum TicketRoleLaunchError {
     Config(#[from] TicketConfigError),
     #[error("Ticket role Pod name must not be empty")]
     EmptyPodName,
+    #[error(
+        "Ticket role profile 'inherit' cannot be used for top-level launch execution; configure a concrete role profile selector"
+    )]
+    UnsupportedInheritProfile,
     #[error(transparent)]
     Spawn(#[from] SpawnError),
     #[error("failed to connect to spawned Ticket role Pod at {}: {source}", .socket_path.display())]
@@ -157,6 +169,12 @@ pub enum TicketRoleLaunchError {
         #[source]
         source: io::Error,
     },
+    #[error("Ticket role Pod rejected first run input with {code:?}: {message}")]
+    RunRejected { code: ErrorCode, message: String },
+    #[error("Ticket role Pod closed before confirming first run acceptance")]
+    RunAcceptanceClosed,
+    #[error("timed out waiting for Ticket role Pod to confirm first run acceptance")]
+    RunAcceptanceTimeout,
 }
 
 /// Load `.yoi/ticket.config.toml` from the workspace and construct a launch plan.
@@ -202,7 +220,8 @@ pub fn plan_ticket_role_launch_with_config(
     })
 }
 
-/// Spawn the Pod, connect to its socket, and send the first `Method::Run` input.
+/// Spawn the Pod, connect to its socket, send the first `Method::Run` input,
+/// and wait for bounded acceptance evidence from the Pod event stream.
 pub async fn launch_ticket_role_pod<F>(
     context: TicketRoleLaunchContext,
     runtime_command: PodRuntimeCommand,
@@ -212,7 +231,7 @@ where
     F: FnMut(&str),
 {
     let plan = plan_ticket_role_launch(context)?;
-    let ready = spawn_pod(plan.spawn_config(runtime_command), progress).await?;
+    let ready = spawn_pod(plan.spawn_config(runtime_command)?, progress).await?;
     let mut client = PodClient::connect(&ready.socket_path)
         .await
         .map_err(|source| TicketRoleLaunchError::Connect {
@@ -223,7 +242,37 @@ where
         .send(&plan.run_method())
         .await
         .map_err(|source| TicketRoleLaunchError::SendRun { source })?;
+    wait_for_run_acceptance(&mut client, &plan.run_segments, RUN_ACCEPTANCE_TIMEOUT).await?;
     Ok(TicketRoleLaunchResult { plan, ready })
+}
+
+async fn wait_for_run_acceptance(
+    client: &mut PodClient,
+    expected_segments: &[Segment],
+    timeout: Duration,
+) -> Result<(), TicketRoleLaunchError> {
+    let wait = async {
+        loop {
+            let Some(event) = client.next_event().await else {
+                return Err(TicketRoleLaunchError::RunAcceptanceClosed);
+            };
+            match event {
+                Event::UserMessage { segments } if segments == expected_segments => return Ok(()),
+                Event::InvokeStart {
+                    kind: InvokeKind::UserSend,
+                }
+                | Event::TurnStart { .. } => return Ok(()),
+                Event::Error { code, message } => {
+                    return Err(TicketRoleLaunchError::RunRejected { code, message });
+                }
+                _ => {}
+            }
+        }
+    };
+
+    tokio::time::timeout(timeout, wait)
+        .await
+        .map_err(|_| TicketRoleLaunchError::RunAcceptanceTimeout)?
 }
 
 fn build_launch_prompt(
@@ -414,10 +463,14 @@ mod tests {
             Segment::WorkflowInvoke { slug } if slug == "multi-agent-workflow"
         ));
         assert!(text_segment(&plan).contains("Profile selector: inherit"));
-        let spawn = plan.spawn_config(PodRuntimeCommand::for_executable("/bin/yoi"));
-        assert_eq!(spawn.pod_name, "ticket-coder-ticket-role-pod-launcher");
-        assert_eq!(spawn.profile.as_deref(), Some("inherit"));
-        assert_eq!(spawn.cwd, temp.path());
+        let err = plan
+            .spawn_config(PodRuntimeCommand::for_executable("/bin/yoi"))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            TicketRoleLaunchError::UnsupportedInheritProfile
+        ));
+        assert!(err.to_string().contains("'inherit' cannot be used"));
     }
 
     #[test]
@@ -460,6 +513,12 @@ workflow = "ticket-review-workflow"
         assert!(text.contains("Workflow: ticket-review-workflow"));
         assert!(text.contains("Profile selector: project:reviewer"));
         assert!(!text.contains("system_instruction"));
+        let spawn = plan
+            .spawn_config(PodRuntimeCommand::for_executable("/bin/yoi"))
+            .unwrap();
+        assert_eq!(spawn.pod_name, "reviewer-fixed");
+        assert_eq!(spawn.profile.as_deref(), Some("project:reviewer"));
+        assert_eq!(spawn.cwd, temp.path());
     }
 
     #[test]
