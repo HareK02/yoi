@@ -3618,6 +3618,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ticket"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "fs4",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "time"
 version = "0.3.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
