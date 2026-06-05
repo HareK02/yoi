@@ -1,10 +1,377 @@
-# Work items
+# Tickets and development workflow
 
-Yoi project work is tracked through `work-items/` and `./tickets.sh`. Git history plus work item files are the authoritative state-transition record.
+Yoi project work is tracked through Tickets. For normal use, interact with Tickets through the TUI role commands, Ticket tools, and Ticket workflows. Git history plus Ticket files remain the authoritative state-transition record behind those interfaces.
 
-Do not treat ad-hoc chat summaries, memory records, or Pod notifications as the final source of project state.
+The current local backend stores Ticket files under `work-items/`. That storage detail matters for maintainers and backend compatibility, but it is not the primary user-facing workflow.
 
-## Basic commands
+Do not treat ad-hoc chat summaries, memory records, or Pod notifications as the final source of project state. Notifications are hints to inspect concrete state, not proof of completion.
+
+## Concepts
+
+- `Ticket`: durable project/orchestration record. It contains requirements, decisions, plans, implementation reports, reviews, artifacts, and resolution history.
+- `Task`: session-local progress tracking inside a Pod. It is not the project record.
+- `Assignment`: a concrete delegation from an Orchestrator to a coder/reviewer/investigator Pod.
+- `IntentPacket`: the short implementation/review contract derived from a Ticket and handed to an Assignment.
+- `LocalTicketBackend`: the current `work-items/` markdown/thread/artifacts storage backend.
+
+A Ticket may represent a feature, bug, cleanup, design decision, investigation, workflow change, release task, or orchestration umbrella. The common requirement is that the closed Ticket explains a completed outcome.
+
+## User-facing entry points
+
+Use the highest-level interface that matches the work:
+
+- In the TUI, use `:ticket ...` commands to launch fixed Ticket-role Pods.
+- Inside Pods, use typed Ticket tools to create, inspect, comment, review, and close Tickets.
+- For multi-step work, follow the Ticket Intake, Orchestrator Routing, Preflight, and Multi-agent workflows.
+
+The local `work-items/` files and `tickets.sh` compatibility CLI are backend/maintenance surfaces. They are documented later for maintainers, tests, and compatibility work, but normal user instructions should not start there.
+
+## Ticket tools inside Pods
+
+Pods with the Ticket built-in feature can use typed Ticket tools:
+
+- `TicketCreate`
+- `TicketList`
+- `TicketShow`
+- `TicketComment`
+- `TicketReview`
+- `TicketStatus`
+- `TicketClose`
+- `TicketDoctor`
+
+These tools operate through the typed Ticket backend. They are not arbitrary filesystem write permission to `work-items/`.
+
+Use them when a Pod needs to materialize or update project records:
+
+- Intake creates a new Ticket after user agreement.
+- Orchestrator records routing decisions and intent packets.
+- Reviewer records approve/request-changes review results.
+- Maintainer closes a Ticket with a resolution when merge/validation/cleanup evidence is complete.
+
+Do not bypass workflow gates just because Ticket tools are available. Ticket mutation is a project-record operation and should remain auditable.
+
+## Ticket configuration
+
+Workspace Ticket orchestration is configured by `.yoi/ticket.config.toml` when present.
+
+MVP shape:
+
+```toml
+[backend]
+kind = "local"
+root = "work-items"
+
+[roles.intake]
+profile = "project:intake"
+launch_prompt = "$workspace/ticket/intake/launch"
+workflow = "ticket-intake-workflow"
+
+[roles.orchestrator]
+profile = "project:orchestrator"
+launch_prompt = "$workspace/ticket/orchestrator/launch"
+workflow = "ticket-orchestrator-routing"
+
+[roles.coder]
+profile = "project:coder"
+launch_prompt = "$workspace/ticket/coder/launch"
+workflow = "multi-agent-workflow"
+
+[roles.reviewer]
+profile = "project:reviewer"
+launch_prompt = "$workspace/ticket/reviewer/launch"
+workflow = "multi-agent-workflow"
+
+[roles.investigator]
+profile = "project:investigator"
+launch_prompt = "$workspace/ticket/investigator/launch"
+workflow = "ticket-orchestrator-routing"
+```
+
+Fixed roles are:
+
+- `intake`
+- `orchestrator`
+- `coder`
+- `reviewer`
+- `investigator`
+
+This is not an arbitrary role registry. The fixed roles are the roles required by Ticket orchestration.
+
+`profile` selects the Pod runtime Profile for that role. The selected Profile owns durable role/system behavior. `ticket.config.toml` does not have a role-level `system_instruction` field.
+
+`launch_prompt` is a per-action first-run prompt reference for future prompt resolution. Current launcher behavior exposes the ref but does not treat it as system instruction.
+
+`workflow` is the workflow the launched role should follow. Workflow state and phase-specific prompt injection are future work; any dynamic prompt content must be committed as history before it affects model context.
+
+If `.yoi/ticket.config.toml` is missing, defaults are:
+
+- backend: local `<workspace>/work-items`
+- all role profiles: `inherit`
+- no launch prompt refs
+- workflows:
+  - intake: `ticket-intake-workflow`
+  - orchestrator: `ticket-orchestrator-routing`
+  - coder: `multi-agent-workflow`
+  - reviewer: `multi-agent-workflow`
+  - investigator: `ticket-orchestrator-routing`
+
+Important: top-level TUI Ticket role launches cannot execute `profile = "inherit"` because top-level launch has no parent Profile to inherit from. Configure concrete role profiles in `.yoi/ticket.config.toml` before using TUI role-launch commands.
+
+## Workflow lifecycle
+
+Ticket-driven development normally moves through these gates:
+
+1. Intake
+2. Orchestrator routing
+3. Preflight or spike when needed
+4. Implementation assignment
+5. Review
+6. Merge / validation / cleanup
+7. Close
+
+Each gate records its decision or evidence in the Ticket thread or artifacts.
+
+### 1. Intake
+
+Use `ticket-intake-workflow` when a user request is broad, ambiguous, or not yet a Ticket.
+
+Intake should:
+
+- clarify user intent;
+- check duplicate/related Tickets;
+- draft background, requirements, acceptance criteria, non-goals, readiness, risk flags, and validation;
+- create or update the Ticket only after user agreement.
+
+Intake should not schedule implementation, spawn coder/reviewer Pods, create worktrees, merge, or close Tickets.
+
+### 2. Orchestrator routing
+
+Use `ticket-orchestrator-routing` to classify the next action for an existing Ticket.
+
+Routing classifications include:
+
+- `requirements_sync_needed`
+- `preflight_needed`
+- `spike_needed`
+- `implementation_ready`
+- `review_needed`
+- `blocked_action_required`
+- `close_ready`
+- `defer_pending`
+- `closed_or_noop`
+
+Routing decisions should be recorded with `TicketComment` using `plan` or `decision` role. The decision should state the classification, evidence checked, reason, next action, and escalation conditions.
+
+### 3. Preflight
+
+Use `ticket-preflight-workflow` before implementation when the Ticket touches design/authority boundaries, has multiple natural implementation strategies, or cannot produce a short IntentPacket.
+
+Preflight should resolve or record:
+
+- requirements and acceptance criteria;
+- current code map;
+- invariants and non-goals;
+- critical risks and failure modes;
+- implementation-ready vs requirements-sync/spike/blocked classification.
+
+Do not send preflight-needed Tickets directly to coder Pods.
+
+### 4. Implementation assignment
+
+Use `multi-agent-workflow` for implementation-ready Tickets.
+
+The Orchestrator should prepare an `IntentPacket` with:
+
+- intent;
+- requirements;
+- invariants;
+- non-goals;
+- escalation conditions;
+- validation;
+- current code map;
+- critical risks.
+
+Implementation normally happens in a child git worktree created by the Orchestrator, not by the coder Pod. The coder Pod receives narrow write scope to the worktree and must report changed files, implementation summary, validation, unresolved risks, and review readiness.
+
+### 5. Review
+
+Reviewer Pods should be sibling Pods, not children of coder Pods. They should read the Ticket, intent packet, diff, implementation report, and validation evidence.
+
+Review results should be recorded with the `TicketReview` tool. Maintainers working directly with the local backend can use the compatibility CLI documented later.
+
+Blockers must be fixed or explicitly escalated before merge-ready submission.
+
+### 6. Merge and close
+
+Unless explicitly authorized otherwise, final merge, cleanup, design-boundary decisions, and Ticket closure remain Orchestrator/human responsibilities.
+
+Before closing, verify concrete evidence:
+
+- child Pod output via `ReadPodOutput`;
+- worktree status and diff;
+- validation command output;
+- review result;
+- Ticket requirements and acceptance criteria;
+- merge/cleanup state in the main workspace.
+
+Close with a resolution that summarizes what changed, key commits, validation, review status, and remaining follow-ups.
+
+## TUI Ticket role actions
+
+TUI exposes explicit commands for fixed Ticket roles:
+
+```text
+:ticket intake <context...>
+:ticket route <ticket-id-or-slug> [instruction...]
+:ticket investigate <ticket-id-or-slug> [instruction...]
+:ticket implement <ticket-id-or-slug> [instruction...]
+:ticket review <ticket-id-or-slug> [instruction...]
+```
+
+These commands call the shared client Ticket role launcher. TUI does not construct `SpawnConfig`, Profile semantics, workflow segments, or prompt content directly.
+
+Command mapping:
+
+- `intake` launches the intake role without an existing Ticket and requires freeform context.
+- `route` launches the orchestrator role for an existing Ticket.
+- `investigate` launches the investigator role for a read-only spike/investigation.
+- `implement` launches the coder role for an implementation assignment.
+- `review` launches the reviewer role for review.
+
+All actions are explicit and user-triggered. They are not a scheduler, queue, spawned-Pod panel, or automatic maintainer loop.
+
+### TUI execution path
+
+The TUI path is:
+
+```text
+User types :ticket ... in the TUI
+  -> TUI parses the command into a fixed Ticket role action
+  -> TUI builds a TicketRoleLaunchContext
+  -> client Ticket role launcher reads .yoi/ticket.config.toml
+  -> launcher selects the role Profile and workflow
+  -> launcher spawns the role Pod
+  -> launcher sends Method::Run with WorkflowInvoke + Text segments
+  -> launcher waits for run-acceptance evidence
+  -> TUI shows success/failure in the actionbar
+```
+
+The launched Pod receives dynamic Ticket/action context as its first committed run input. The TUI does not inject hidden context, does not write Ticket files directly, and does not construct prompt/workflow segments by hand.
+
+The first run input contains:
+
+- the selected fixed role;
+- the workflow slug from `.yoi/ticket.config.toml`;
+- Ticket id/slug when the command targets an existing Ticket;
+- freeform user instruction/context from the command;
+- configured `launch_prompt` reference if present, as an unresolved reference for future prompt resolution.
+
+The selected Profile supplies durable system/role behavior. `ticket.config.toml` does not override system instruction.
+
+### TUI setup
+
+Because top-level TUI role launches cannot inherit a parent Profile, configure concrete role profiles before using these commands:
+
+```toml
+# .yoi/ticket.config.toml
+
+[backend]
+kind = "local"
+root = "work-items"
+
+[roles.intake]
+profile = "project:intake"
+workflow = "ticket-intake-workflow"
+
+[roles.orchestrator]
+profile = "project:orchestrator"
+workflow = "ticket-orchestrator-routing"
+
+[roles.coder]
+profile = "project:coder"
+workflow = "multi-agent-workflow"
+
+[roles.reviewer]
+profile = "project:reviewer"
+workflow = "multi-agent-workflow"
+
+[roles.investigator]
+profile = "project:investigator"
+workflow = "ticket-orchestrator-routing"
+```
+
+If a role still uses `profile = "inherit"`, TUI will fail closed with a diagnostic explaining that a concrete profile is required.
+
+### TUI usage examples
+
+Create or refine a Ticket from a broad request:
+
+```text
+:ticket intake Add a safer retry policy for stream-open provider failures
+```
+
+Route an existing Ticket:
+
+```text
+:ticket route ticket-local-files-backend classify next action and record routing decision
+```
+
+Start a read-only investigation role:
+
+```text
+:ticket investigate plugin-extension-surface map current feature API boundaries
+```
+
+Launch a coder role for an implementation-ready Ticket:
+
+```text
+:ticket implement ticket-config-role-profile-mapping implement the accepted MVP only
+```
+
+Launch a reviewer role:
+
+```text
+:ticket review tui-ticket-role-actions review diff against Ticket requirements
+```
+
+After launch, inspect the created Pod through normal Pod/TUI surfaces. The command confirms launch/run acceptance; it does not mean the role Pod completed the assignment.
+
+### TUI troubleshooting
+
+- `profile = "inherit"`: configure a concrete role Profile in `.yoi/ticket.config.toml`.
+- malformed `.yoi/ticket.config.toml`: fix the config and retry.
+- missing Ticket id/slug for `route`, `investigate`, `implement`, or `review`: provide the target Ticket.
+- empty `:ticket intake`: provide the request/context to clarify.
+- launch success but no visible completion: attach to or inspect the launched Pod; completion notifications are hints, not authority.
+
+## Granularity
+
+One Ticket should describe a complete change that can be explained as a feature, behavior, design decision, investigation result, or maintenance outcome when closed.
+
+Avoid Tickets that only mirror an implementation step unless that step is independently reviewable and useful. Phase/step lists inside a Ticket are execution order, not a separate dependency system.
+
+Use umbrella Tickets only to track a split. Child Tickets should be independently reviewable and closeable.
+
+## Ticket contents
+
+A useful Ticket states:
+
+- background and motivation;
+- requirements;
+- acceptance criteria;
+- relevant constraints and non-goals;
+- readiness / preflight needs / risk flags when relevant;
+- implementation reports when work is submitted;
+- reviews;
+- final resolution when closed.
+
+Keep long research dumps out of the item body. Put necessary artifacts under the Ticket's `artifacts/` directory and summarize the conclusion in the thread.
+
+Do not store secrets, credentials, private prompt contents, or raw logs containing secrets in Ticket bodies, thread entries, artifacts, diagnostics, or model-visible prompts.
+
+## Backend/maintainer compatibility: local Ticket CLI
+
+`./tickets.sh` is the local-file compatibility and maintainer CLI for the current `work-items/` backend. It is useful for repository maintenance, tests, migration/debugging, and low-level recovery, but it is not the primary user-facing path.
 
 ```sh
 ./tickets.sh create --title "..." [--slug slug] [--kind task] [--priority P2] [--label a,b]
@@ -17,27 +384,34 @@ Do not treat ad-hoc chat summaries, memory records, or Pod notifications as the 
 ./tickets.sh doctor
 ```
 
-## Granularity
+The current LocalTicketBackend stores records under:
 
-One work item should describe a complete change that can be explained as a feature, behavior, design decision, or maintenance outcome when closed.
+```text
+work-items/{open,pending,closed}/<id>/
+  item.md
+  thread.md
+  artifacts/
+  resolution.md   # closed Tickets only
+```
 
-Avoid tickets that only mirror an implementation step unless that step is independently reviewable and useful. Phase/step lists inside a ticket are execution order, not a separate dependency system.
+Backend integrations must preserve this format until an explicit migration changes it. Human users should prefer TUI role actions or Ticket tools; maintainers may use `tickets.sh` when working directly with repository records.
 
-## Contents
+## Validation
 
-A useful work item states:
+Run at least:
 
-- background and motivation
-- requirements
-- acceptance criteria
-- relevant constraints
-- review/implementation reports when work is submitted
-- final resolution when closed
+```sh
+./tickets.sh doctor
+git diff --check
+```
 
-Keep long research dumps out of the item body. Put necessary artifacts under the ticket's `artifacts/` directory and summarize the conclusion in the thread.
+Implementation Tickets usually also need focused tests and broader checks, for example:
 
-## Workflow
+```sh
+cargo fmt --check
+cargo check --workspace --all-targets
+cargo test -p <crate> <filter>
+nix build .#yoi --no-link
+```
 
-Create or refine the work item before opening a separate implementation worktree. When using child Pods, the orchestrator should provide a scoped task and later verify concrete evidence: diff, tests, worktree status, and child output.
-
-Closing a ticket means the repository records are ready, not merely that a child Pod announced completion.
+Record validation commands and results in the implementation report or resolution.
