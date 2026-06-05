@@ -1,15 +1,3 @@
-<!-- event: create author: tickets.sh at: 2026-06-05T20:30:06Z -->
-
-## Created
-
-Created by tickets.sh create.
-
----
-
-<!-- event: plan author: hare at: 2026-06-05T20:34:35Z -->
-
-## Plan
-
 # Delegation intent: yoi ticket CLI parity
 
 ## Intent
@@ -104,6 +92,3 @@ Report:
 - tests/validation results;
 - known compatibility gaps from `tickets.sh`, if any;
 - whether ready for external review.
-
-
----
