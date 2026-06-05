@@ -1,16 +1,22 @@
 //! Task tools built-in feature module.
 //!
-//! The built-in Task feature owns the session-lifetime [`tools::TaskStore`]
-//! shared by the Task tools and reminder hooks. Pod hosts install this module
-//! through the feature contribution boundary and use its narrow snapshot surface
-//! for restore/rewind/compaction compatibility; Pod does not own Task-specific
-//! store or reminder state.
+//! The built-in Task feature owns the session-lifetime [`TaskStore`] shared by
+//! the Task tools and reminder hooks. Pod hosts install this module through the
+//! feature contribution boundary and use its narrow snapshot surface for
+//! restore/rewind/compaction compatibility.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use llm_worker::Item;
+
+mod store;
+mod tool_impl;
+
+pub(crate) use self::tool_impl::task_tools;
+use store::snapshot_overview;
+pub(crate) use store::{TaskEntry, TaskStatus, TaskStore};
 
 use crate::feature::{
     FeatureDescriptor, FeatureHookPoint, FeatureInstallContext, FeatureInstallError, FeatureModule,
@@ -44,20 +50,20 @@ pub struct TaskFeature {
 
 #[derive(Debug)]
 struct TaskFeatureState {
-    task_store: tools::TaskStore,
+    task_store: TaskStore,
     reminder_state: TaskReminderState,
 }
 
 impl TaskFeature {
     pub fn new() -> Self {
-        Self::from_store(tools::TaskStore::new())
+        Self::from_store(TaskStore::new())
     }
 
     pub fn from_history(history: &[Item]) -> Self {
-        Self::from_store(tools::TaskStore::from_history(history))
+        Self::from_store(TaskStore::from_history(history))
     }
 
-    fn from_store(task_store: tools::TaskStore) -> Self {
+    fn from_store(task_store: TaskStore) -> Self {
         Self {
             state: Arc::new(TaskFeatureState {
                 task_store,
@@ -70,7 +76,7 @@ impl TaskFeature {
     /// existing shared store handle. Existing Task tool instances and hooks keep
     /// pointing at the same feature-owned store after rewind.
     pub fn restore_from_history(&self, history: &[Item]) {
-        let restored = tools::TaskStore::from_history(history);
+        let restored = TaskStore::from_history(history);
         self.state.task_store.replace_with(restored.list());
     }
 
@@ -81,11 +87,11 @@ impl TaskFeature {
 
     /// Feature-owned compact summary used for the synthetic TaskList result.
     pub fn snapshot_overview(&self) -> String {
-        tools::task::snapshot_overview(&self.state.task_store.list())
+        snapshot_overview(&self.state.task_store.list())
     }
 
     #[cfg(test)]
-    fn task_store(&self) -> tools::TaskStore {
+    fn task_store(&self) -> TaskStore {
         self.state.task_store.clone()
     }
 }
@@ -130,7 +136,7 @@ impl FeatureModule for TaskFeature {
         let names = ["TaskCreate", "TaskList", "TaskGet", "TaskUpdate"];
         for (name, definition) in names
             .into_iter()
-            .zip(tools::task_tools(self.state.task_store.clone()))
+            .zip(task_tools(self.state.task_store.clone()))
         {
             context
                 .tools()
@@ -203,17 +209,12 @@ struct TaskReminderPreRequestHook {
 #[async_trait]
 impl Hook<PreLlmRequest> for TaskReminderPreRequestHook {
     async fn call(&self, input: &PreRequestContext) -> HookPreRequestAction {
-        let active_tasks: Vec<tools::TaskEntry> = self
+        let active_tasks: Vec<TaskEntry> = self
             .state
             .task_store
             .list()
             .into_iter()
-            .filter(|task| {
-                matches!(
-                    task.status,
-                    tools::TaskStatus::Pending | tools::TaskStatus::Inprogress
-                )
-            })
+            .filter(|task| matches!(task.status, TaskStatus::Pending | TaskStatus::Inprogress))
             .collect();
         if active_tasks.is_empty() {
             return HookPreRequestAction::Continue;
@@ -252,7 +253,7 @@ fn is_task_management_tool(name: &str) -> bool {
     TASK_MANAGEMENT_TOOL_NAMES.contains(&name)
 }
 
-fn render_task_reminder_body(active_tasks: &[tools::TaskEntry]) -> String {
+fn render_task_reminder_body(active_tasks: &[TaskEntry]) -> String {
     let mut body = String::from(
         "Active session tasks are still open. If progress changed, call TaskUpdate.\n",
     );
@@ -441,7 +442,7 @@ mod tests {
             .taskid;
         feature
             .task_store()
-            .update(done, Some(tools::TaskStatus::Completed), None, None)
+            .update(done, Some(TaskStatus::Completed), None, None)
             .expect("complete task");
         let hook = TaskReminderPreRequestHook {
             state: Arc::clone(&feature.state),

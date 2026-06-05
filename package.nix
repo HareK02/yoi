@@ -40,13 +40,13 @@ rustPlatform.buildRustPackage rec {
     filter = sourceFilter;
   };
 
-  cargoHash = "sha256-f4/oOuPv4dUiwznX+popMjjDCXZQPBvqWRYmlJDyKkE=";
+  cargoHash = "sha256-iickLtGGmqc0raCZp7giowKajAMLn5+jwtQ9c5hZmhA=";
 
   depsExtraArgs = {
-    # nixpkgs 25.11's fetchCargoVendor still uses crates.io's API
-    # download endpoint in this environment, which returns 403 while the
-    # immutable static CDN endpoint works. Keep this local package build on
-    # static.crates.io until the upstream fetcher is fixed in our nixpkgs pin.
+    # Older fetchCargoVendor utilities used crates.io's API download endpoint,
+    # which returns 403 in this environment while the immutable static CDN
+    # endpoint works. Newer utilities already use static.crates.io, so patch
+    # only when the legacy endpoint is still present.
     buildPhase = ''
       runHook preBuild
 
@@ -56,9 +56,11 @@ rustPlatform.buildRustPackage rec {
 
       vendor_util="$(command -v fetch-cargo-vendor-util-v2 || command -v fetch-cargo-vendor-util)"
       cp "$vendor_util" ./fetch-cargo-vendor-util-static
-      substituteInPlace ./fetch-cargo-vendor-util-static \
-        --replace-fail 'https://crates.io/api/v1/crates/{pkg["name"]}/{pkg["version"]}/download' \
-                       'https://static.crates.io/crates/{pkg["name"]}/{pkg["version"]}/download'
+      if grep -q 'https://crates.io/api/v1/crates/{pkg\["name"\]}/{pkg\["version"\]}/download' ./fetch-cargo-vendor-util-static; then
+        substituteInPlace ./fetch-cargo-vendor-util-static \
+          --replace-fail 'https://crates.io/api/v1/crates/{pkg["name"]}/{pkg["version"]}/download' \
+                         'https://static.crates.io/crates/{pkg["name"]}/{pkg["version"]}/download'
+      fi
       ./fetch-cargo-vendor-util-static create-vendor-staging ./Cargo.lock "$out"
 
       runHook postBuild
