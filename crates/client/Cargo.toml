@@ -7,6 +7,11 @@ license.workspace = true
 [dependencies]
 protocol = { workspace = true }
 manifest = { workspace = true }
+ticket = { workspace = true }
 serde_json = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "net", "io-util", "sync", "time", "process", "fs"] }
 uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
