@@ -50,3 +50,25 @@ This preserves the clean distinction: contribution declarations are descriptor-l
 
 
 ---
+
+<!-- event: plan author: hare at: 2026-06-05T04:54:33Z -->
+
+## Plan
+
+Preflight result: `implementation-ready`.
+
+`ticket-built-in-feature-tools` should not be implemented until this boundary is clarified, because Ticket tools need to be internal built-in feature contributions while Ticket backend operations remain typed host authority, not arbitrary filesystem scope or external plugin package approval.
+
+Implementation intent:
+
+- Clarify `pod::feature` naming around host authority grants.
+- Keep contribution declarations and descriptor reconciliation separate from host authority requests/grants.
+- Preserve built-in Task feature behavior as the current contribution-only example.
+- Avoid external plugin loading, real approval protocol, Ticket tool implementation, Hook behavior changes, or broader crate moves.
+
+Detailed delegation intent is in `artifacts/delegation-intent.md`.
+
+Note: main workspace currently has an unrelated dirty `README.md` change. This feature work must not touch or commit that file.
+
+
+---
