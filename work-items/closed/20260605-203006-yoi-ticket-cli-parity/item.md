@@ -2,12 +2,12 @@
 id: 20260605-203006-yoi-ticket-cli-parity
 slug: yoi-ticket-cli-parity
 title: Yoi ticket CLI parity
-status: open
+status: closed
 kind: task
 priority: P1
 labels: [ticket, cli, backend]
 created_at: 2026-06-05T20:30:06Z
-updated_at: 2026-06-05T20:56:42Z
+updated_at: 2026-06-05T20:58:21Z
 assignee: null
 legacy_ticket: null
 ---
