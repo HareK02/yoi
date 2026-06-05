@@ -10,7 +10,8 @@ use std::time::Duration;
 
 use protocol::{ErrorCode, Event, InvokeKind, Method, Segment};
 use thiserror::Error;
-use ticket::config::{TicketConfig, TicketConfigError, TicketRole};
+pub use ticket::config::TicketRole;
+use ticket::config::{TicketConfig, TicketConfigError};
 
 use crate::{PodClient, PodRuntimeCommand, SpawnConfig, SpawnError, SpawnReady, spawn_pod};
 
