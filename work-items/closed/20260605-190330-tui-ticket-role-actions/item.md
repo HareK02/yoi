@@ -2,12 +2,12 @@
 id: 20260605-190330-tui-ticket-role-actions
 slug: tui-ticket-role-actions
 title: TUI Ticket role actions
-status: open
+status: closed
 kind: task
 priority: P1
 labels: [tui, ticket, role, orchestration]
 created_at: 2026-06-05T19:03:30Z
-updated_at: 2026-06-05T20:07:22Z
+updated_at: 2026-06-05T20:09:50Z
 assignee: null
 legacy_ticket: null
 ---
