@@ -2,12 +2,12 @@
 id: 20260605-203006-builtin-yoi-local-ticket-backend-config
 slug: builtin-yoi-local-ticket-backend-config
 title: Builtin yoi_local Ticket backend config
-status: open
+status: closed
 kind: task
 priority: P1
 labels: [ticket, backend, config]
 created_at: 2026-06-05T20:30:06Z
-updated_at: 2026-06-05T21:10:22Z
+updated_at: 2026-06-05T21:26:56Z
 assignee: null
 legacy_ticket: null
 ---
