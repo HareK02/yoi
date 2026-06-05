@@ -22,6 +22,10 @@ use crate::pod_list::{
     PodList, PodListEntry, PodVisibilitySource, StoredMetadataState, read_reachable_live_pod_infos,
     read_stored_pod_infos,
 };
+use crate::workspace_panel::{
+    ActionPriority, NextUserAction, PanelRow, PanelRowKey, WorkspacePanelViewModel,
+    build_workspace_panel,
+};
 
 const MAX_ENTRIES: usize = 50;
 const CLOSED_VISIBLE_ROWS: usize = 3;
@@ -43,7 +47,7 @@ impl std::fmt::Display for MultiPodError {
             Self::Store(e) => write!(f, "session store error: {e}"),
             Self::NoPods => write!(
                 f,
-                "no pods found — start a fresh pod with `yoi` or restore one with `yoi -r`"
+                "no Tickets or Pods found — create a Ticket with `yoi ticket create` or restore a Pod with `yoi -r`"
             ),
         }
     }
@@ -82,7 +86,7 @@ pub(crate) async fn run(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut MultiPodApp,
 ) -> Result<MultiPodOutcome, MultiPodError> {
-    if app.list.entries.is_empty() {
+    if app.panel.rows.is_empty() {
         return Err(MultiPodError::NoPods);
     }
 
@@ -139,7 +143,7 @@ pub(crate) async fn run(
 }
 
 struct PendingReload {
-    handle: Option<tokio::task::JoinHandle<Result<PodList, MultiPodError>>>,
+    handle: Option<tokio::task::JoinHandle<Result<MultiPodSnapshot, MultiPodError>>>,
 }
 
 impl PendingReload {
@@ -147,14 +151,14 @@ impl PendingReload {
         if self.handle.is_some() {
             return false;
         }
-        self.handle = Some(tokio::spawn(async { load_pod_list(None).await }));
+        self.handle = Some(tokio::spawn(async { load_multi_pod_snapshot(None).await }));
         true
     }
 
     #[cfg(test)]
     fn start_with_handle(
         &mut self,
-        handle: tokio::task::JoinHandle<Result<PodList, MultiPodError>>,
+        handle: tokio::task::JoinHandle<Result<MultiPodSnapshot, MultiPodError>>,
     ) -> bool {
         if self.handle.is_some() {
             handle.abort();
@@ -164,7 +168,7 @@ impl PendingReload {
         true
     }
 
-    async fn finish_if_ready(&mut self) -> Option<Result<PodList, MultiPodError>> {
+    async fn finish_if_ready(&mut self) -> Option<Result<MultiPodSnapshot, MultiPodError>> {
         if !self.handle.as_ref()?.is_finished() {
             return None;
         }
@@ -231,16 +235,21 @@ pub(crate) struct DirectSendRequest {
 
 pub(crate) struct MultiPodApp {
     pub(crate) list: PodList,
+    pub(crate) panel: WorkspacePanelViewModel,
     pub(crate) input: InputBuffer,
+    selected_row: Option<PanelRowKey>,
     notice: Option<String>,
     sending: bool,
 }
 
 impl MultiPodApp {
     async fn load(selected_name: Option<String>) -> Result<Self, MultiPodError> {
+        let snapshot = load_multi_pod_snapshot(selected_name).await?;
         let mut app = Self {
-            list: load_pod_list(selected_name).await?,
+            list: snapshot.list,
+            panel: snapshot.panel,
             input: InputBuffer::new(),
+            selected_row: None,
             notice: None,
             sending: false,
         };
@@ -249,19 +258,20 @@ impl MultiPodApp {
     }
 
     pub(crate) async fn reload_or_notice(&mut self) {
-        let result = load_pod_list(None).await;
+        let result = load_multi_pod_snapshot(None).await;
         self.apply_reload_result(result);
     }
 
-    fn apply_reload_result(&mut self, result: Result<PodList, MultiPodError>) {
+    fn apply_reload_result(&mut self, result: Result<MultiPodSnapshot, MultiPodError>) {
         match result {
-            Ok(list) => self.apply_reloaded_list(list),
+            Ok(snapshot) => self.apply_reloaded_snapshot(snapshot),
             Err(error) => {
                 self.notice = Some(format!("Refresh failed: {error}"));
             }
         }
     }
 
+    #[cfg(test)]
     fn apply_reloaded_list(&mut self, mut list: PodList) {
         list.selected_name = self
             .list
@@ -269,20 +279,72 @@ impl MultiPodApp {
             .clone()
             .filter(|name| list.entries.iter().any(|entry| entry.name == *name))
             .or_else(|| list.entries.first().map(|entry| entry.name.clone()));
-        self.list = list;
+        let panel = build_workspace_panel(&current_workspace_root(), &list);
+        self.apply_reloaded_snapshot(MultiPodSnapshot { list, panel });
+    }
+
+    fn apply_reloaded_snapshot(&mut self, mut snapshot: MultiPodSnapshot) {
+        let previous_selected_pod = self.list.selected_name.clone();
+        snapshot.list.selected_name = previous_selected_pod
+            .filter(|name| {
+                snapshot
+                    .list
+                    .entries
+                    .iter()
+                    .any(|entry| entry.name == *name)
+            })
+            .or_else(|| {
+                snapshot
+                    .list
+                    .entries
+                    .first()
+                    .map(|entry| entry.name.clone())
+            });
+        let previous_row = self.selected_row.clone();
+        self.list = snapshot.list;
+        self.panel = snapshot.panel;
+        self.selected_row = previous_row.filter(|key| self.panel.row(key).is_some());
         self.ensure_selection_visible();
+    }
+
+    fn selected_panel_row(&self) -> Option<&PanelRow> {
+        self.selected_row
+            .as_ref()
+            .and_then(|key| self.panel.row(key))
+    }
+
+    fn selected_pod_entry(&self) -> Option<&PodListEntry> {
+        match self.selected_row.as_ref() {
+            Some(PanelRowKey::Pod(name)) => {
+                self.list.entries.iter().find(|entry| &entry.name == name)
+            }
+            _ => None,
+        }
     }
 
     #[cfg(test)]
     pub(crate) fn selected_send_eligibility(&self) -> SendEligibility {
-        match self.list.selected_entry() {
+        match self.selected_pod_entry() {
             Some(entry) if entry.actions.can_send_now => SendEligibility::SendNow,
             _ => SendEligibility::Disabled,
         }
     }
 
     pub(crate) fn selected_send_disabled_reason(&self) -> Option<String> {
-        let entry = self.list.selected_entry()?;
+        if let Some(row) = self
+            .selected_panel_row()
+            .filter(|row| row.is_ticket_action())
+        {
+            return Some(
+                row.disabled_reason
+                    .clone()
+                    .or_else(|| row.key_hint.clone())
+                    .unwrap_or_else(|| {
+                        "Ticket actions are display-only in this first panel slice.".to_string()
+                    }),
+            );
+        }
+        let entry = self.selected_pod_entry()?;
         if entry.actions.can_send_now {
             return None;
         }
@@ -290,63 +352,93 @@ impl MultiPodApp {
     }
 
     pub(crate) fn select_next(&mut self) {
-        let visible = visible_entry_indices(&self.list);
+        let visible = visible_panel_keys(&self.panel, &self.list);
         if visible.is_empty() {
+            self.selected_row = None;
             self.list.selected_name = None;
             return;
         }
-        let selected = self.list.selected_index();
-        let Some(selected_pos) = visible.iter().position(|index| *index == selected) else {
-            self.list.select_index(visible[0]);
-            return;
-        };
+        let selected_pos = self
+            .selected_row
+            .as_ref()
+            .and_then(|key| visible.iter().position(|visible_key| visible_key == key))
+            .unwrap_or(0);
         let next_pos = (selected_pos + 1).min(visible.len() - 1);
-        self.list.select_index(visible[next_pos]);
+        self.select_panel_key(visible[next_pos].clone());
     }
 
     pub(crate) fn select_prev(&mut self) {
-        let visible = visible_entry_indices(&self.list);
+        let visible = visible_panel_keys(&self.panel, &self.list);
         if visible.is_empty() {
+            self.selected_row = None;
             self.list.selected_name = None;
             return;
         }
-        let selected = self.list.selected_index();
-        let Some(selected_pos) = visible.iter().position(|index| *index == selected) else {
-            self.list.select_index(visible[0]);
-            return;
-        };
-        let prev_pos = selected_pos.saturating_sub(1);
-        self.list.select_index(visible[prev_pos]);
+        let selected_pos = self
+            .selected_row
+            .as_ref()
+            .and_then(|key| visible.iter().position(|visible_key| visible_key == key))
+            .unwrap_or(0);
+        self.select_panel_key(visible[selected_pos.saturating_sub(1)].clone());
     }
 
     fn ensure_selection_visible(&mut self) {
-        let visible = visible_entry_indices(&self.list);
+        let visible = visible_panel_keys(&self.panel, &self.list);
         if visible.is_empty() {
+            self.selected_row = None;
             self.list.selected_name = None;
             return;
         }
-        let selected = self.list.selected_index();
-        if !visible.contains(&selected) {
-            self.list.select_index(visible[0]);
+        let selected_visible = self
+            .selected_row
+            .as_ref()
+            .is_some_and(|key| visible.iter().any(|visible_key| visible_key == key));
+        if !selected_visible {
+            let has_action_rows = self.panel.rows.iter().any(|row| row.is_ticket_action());
+            if !has_action_rows {
+                if let Some(selected_name) = self.list.selected_name.as_ref() {
+                    let key = PanelRowKey::Pod(selected_name.clone());
+                    if visible.iter().any(|visible_key| visible_key == &key) {
+                        self.select_panel_key(key);
+                        return;
+                    }
+                }
+            }
+            self.select_panel_key(visible[0].clone());
+        } else if let Some(PanelRowKey::Pod(name)) = self.selected_row.as_ref() {
+            self.list.selected_name = Some(name.clone());
         }
     }
 
+    fn select_panel_key(&mut self, key: PanelRowKey) {
+        if let PanelRowKey::Pod(name) = &key {
+            self.list.selected_name = Some(name.clone());
+        }
+        self.selected_row = Some(key);
+    }
+
     pub(crate) fn prepare_open(&mut self) -> Option<OpenPodRequest> {
-        let entry = match self.list.selected_entry() {
-            Some(entry) => entry,
-            None => {
-                self.notice = Some("No Pod is selected.".to_string());
+        let (pod_name, socket_override) = {
+            let entry = match self.selected_pod_entry() {
+                Some(entry) => entry,
+                None => {
+                    self.notice = Some(selected_ticket_notice(self.selected_panel_row()));
+                    return None;
+                }
+            };
+            if !entry.actions.can_open {
+                self.notice = Some("Selected Pod cannot be opened from this view.".to_string());
                 return None;
             }
+            (
+                entry.name.clone(),
+                entry.attach_socket_path().map(PathBuf::from),
+            )
         };
-        if !entry.actions.can_open {
-            self.notice = Some("Selected Pod cannot be opened from this view.".to_string());
-            return None;
-        }
-        self.notice = Some(format!("Opening {}…", entry.name));
+        self.notice = Some(format!("Opening {pod_name}…"));
         Some(OpenPodRequest {
-            pod_name: entry.name.clone(),
-            socket_override: entry.attach_socket_path().map(PathBuf::from),
+            pod_name,
+            socket_override,
         })
     }
 
@@ -370,20 +462,23 @@ impl MultiPodApp {
     }
 
     pub(crate) fn prepare_send(&mut self) -> Option<DirectSendRequest> {
-        let entry = match self.list.selected_entry() {
-            Some(entry) => entry,
-            None => {
-                self.notice = Some("No Pod is selected.".to_string());
+        let (target_name, socket_path) = {
+            let entry = match self.selected_pod_entry() {
+                Some(entry) => entry,
+                None => {
+                    self.notice = Some(selected_ticket_notice(self.selected_panel_row()));
+                    return None;
+                }
+            };
+            if !entry.actions.can_send_now {
+                self.notice = Some(send_disabled_reason(entry));
                 return None;
             }
-        };
-        if !entry.actions.can_send_now {
-            self.notice = Some(send_disabled_reason(entry));
-            return None;
-        }
-        let Some(socket_path) = entry.attach_socket_path().map(PathBuf::from) else {
-            self.notice = Some("Selected Pod has no reachable socket.".to_string());
-            return None;
+            let Some(socket_path) = entry.attach_socket_path().map(PathBuf::from) else {
+                self.notice = Some("Selected Pod has no reachable socket.".to_string());
+                return None;
+            };
+            (entry.name.clone(), socket_path)
         };
         let segments = self.input.submit_segments();
         if segments_are_blank(&segments) {
@@ -391,7 +486,7 @@ impl MultiPodApp {
             return None;
         }
         self.sending = true;
-        self.notice = Some(format!("Sending to {}…", entry.name));
+        self.notice = Some(format!("Sending to {target_name}…"));
         Some(DirectSendRequest {
             socket_path,
             segments,
@@ -403,8 +498,7 @@ impl MultiPodApp {
         match result {
             Ok(()) => {
                 let target = self
-                    .list
-                    .selected_entry()
+                    .selected_pod_entry()
                     .map(|entry| entry.name.clone())
                     .unwrap_or_else(|| "selected Pod".to_string());
                 self.input.clear();
@@ -489,6 +583,24 @@ enum MultiPodAction {
     Open,
     Refresh,
     Send(DirectSendRequest),
+}
+
+#[derive(Debug, Clone)]
+struct MultiPodSnapshot {
+    list: PodList,
+    panel: WorkspacePanelViewModel,
+}
+
+async fn load_multi_pod_snapshot(
+    selected_name: Option<String>,
+) -> Result<MultiPodSnapshot, MultiPodError> {
+    let list = load_pod_list(selected_name).await?;
+    let panel = build_workspace_panel(&current_workspace_root(), &list);
+    Ok(MultiPodSnapshot { list, panel })
+}
+
+fn current_workspace_root() -> PathBuf {
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
 async fn load_pod_list(selected_name: Option<String>) -> Result<PodList, MultiPodError> {
@@ -629,6 +741,19 @@ fn send_disabled_reason(entry: &PodListEntry) -> String {
         .unwrap_or_else(|| "Selected Pod is not send-eligible.".to_string())
 }
 
+fn selected_ticket_notice(row: Option<&PanelRow>) -> String {
+    match row {
+        Some(row) if row.is_ticket_action() => {
+            let action = row.next_action.map(NextUserAction::label).unwrap_or("View");
+            format!(
+                "{action} for Ticket '{}' is display-only in this slice; use Ticket commands/workflows after re-checking state.",
+                row.title
+            )
+        }
+        _ => "No Pod is selected.".to_string(),
+    }
+}
+
 fn row_status_label(entry: &PodListEntry) -> (&'static str, Style) {
     if let Some(live) = entry.live.as_ref() {
         if !live.reachable {
@@ -737,6 +862,22 @@ fn visible_entry_indices(list: &PodList) -> Vec<usize> {
         .collect()
 }
 
+fn visible_panel_keys(panel: &WorkspacePanelViewModel, list: &PodList) -> Vec<PanelRowKey> {
+    let mut keys = panel
+        .rows
+        .iter()
+        .filter(|row| row.is_ticket_action())
+        .map(|row| row.key.clone())
+        .collect::<Vec<_>>();
+    keys.extend(
+        visible_entry_indices(list)
+            .into_iter()
+            .filter_map(|index| list.entries.get(index))
+            .map(|entry| PanelRowKey::Pod(entry.name.clone())),
+    );
+    keys
+}
+
 fn visible_section_indices(section: &MultiPodSection) -> Vec<usize> {
     section
         .entries
@@ -838,11 +979,11 @@ fn draw_title(frame: &mut Frame<'_>, area: Rect) {
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
-                "multi-Pod dashboard",
+                "workspace dashboard",
                 Style::default().add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                "  Enter send to idle live Pod · o open/attach · r refresh",
+                "  Ticket actions are display-only · Enter sends to selected idle Pod · o open/attach · r refresh",
                 Style::default().fg(Color::DarkGray),
             ),
         ])),
@@ -854,40 +995,135 @@ fn draw_list(frame: &mut Frame<'_>, app: &MultiPodApp, area: Rect) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let lines = list_lines(&app.list, area.width, area.height);
+    let lines = list_lines(app, area.width, area.height);
     Paragraph::new(lines).render(area, frame.buffer_mut());
 }
 
-fn list_lines(list: &PodList, width: u16, height: u16) -> Vec<Line<'static>> {
-    let sections = sectioned_entries(list);
-    let selected = list.selected_index();
+fn list_lines(app: &MultiPodApp, width: u16, height: u16) -> Vec<Line<'static>> {
+    let sections = sectioned_entries(&app.list);
+    let selected = app.selected_row.as_ref();
+    let action_lines = panel_action_lines(&app.panel, selected, width);
     let live_lines = sections
         .iter()
         .filter(|section| section.kind != MultiPodSectionKind::Closed)
-        .flat_map(|section| section_lines(list, section, selected, width))
+        .flat_map(|section| section_lines(&app.list, section, selected, width))
         .collect::<Vec<_>>();
     let closed_lines = sections
         .iter()
         .find(|section| section.kind == MultiPodSectionKind::Closed)
-        .map(|section| section_lines(list, section, selected, width))
+        .map(|section| section_lines(&app.list, section, selected, width))
         .unwrap_or_default();
 
     let available = height as usize;
-    let closed_len = closed_lines.len().min(available);
-    let live_len = live_lines.len().min(available.saturating_sub(closed_len));
-    let spacer_len = available.saturating_sub(live_len + closed_len);
+    let action_len = action_lines.len().min(available);
+    let remaining_after_actions = available.saturating_sub(action_len);
+    let closed_len = closed_lines.len().min(remaining_after_actions);
+    let live_len = live_lines
+        .len()
+        .min(remaining_after_actions.saturating_sub(closed_len));
+    let spacer_len = available.saturating_sub(action_len + live_len + closed_len);
 
     let mut lines = Vec::with_capacity(available);
+    lines.extend(action_lines.into_iter().take(action_len));
     lines.extend(live_lines.into_iter().take(live_len));
     lines.extend(std::iter::repeat_with(|| Line::from(Span::raw(""))).take(spacer_len));
     lines.extend(closed_lines.into_iter().take(closed_len));
     lines
 }
 
+fn panel_action_lines(
+    panel: &WorkspacePanelViewModel,
+    selected: Option<&PanelRowKey>,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let rows = panel
+        .rows
+        .iter()
+        .filter(|row| row.is_ticket_action())
+        .collect::<Vec<_>>();
+    if rows.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = Vec::with_capacity(rows.len() + 1);
+    lines.push(panel_action_header_line(rows.len(), width));
+    for row in rows {
+        lines.push(panel_row_line(row, selected == Some(&row.key), width));
+    }
+    lines
+}
+
+fn panel_action_header_line(total: usize, width: u16) -> Line<'static> {
+    let detail = if total == 1 {
+        " 1 row".to_string()
+    } else {
+        format!(" {total} rows")
+    };
+    let text = truncate_with_ellipsis(&format!("--actions{detail}---"), width as usize);
+    Line::from(Span::styled(
+        text,
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    ))
+}
+
+fn panel_row_line(row: &PanelRow, selected: bool, width: u16) -> Line<'static> {
+    let marker = if selected { "▶ " } else { "  " };
+    let action = row.next_action.map(NextUserAction::label).unwrap_or("View");
+    let status_style = panel_priority_style(row.priority);
+    let mut text = format!(
+        "{marker}{}  [{}]  {action}: {}",
+        row.title,
+        row.priority.label(),
+        row.status
+    );
+    if let Some(subtitle) = row.subtitle.as_deref() {
+        text.push_str("  ");
+        text.push_str(subtitle);
+    }
+    let truncated = truncate_with_ellipsis(&text, width as usize);
+    let prefix = format!("{marker}{}  ", row.title);
+    let status_prefix = format!("{prefix}[{}]", row.priority.label());
+    let mut spans = Vec::new();
+    spans.push(Span::styled(
+        prefix.clone(),
+        if selected {
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Magenta)
+        },
+    ));
+    spans.push(Span::styled(
+        format!("[{}]", row.priority.label()),
+        status_style,
+    ));
+    let rest = truncated.strip_prefix(&status_prefix).unwrap_or("");
+    spans.push(Span::styled(
+        rest.to_string(),
+        Style::default().fg(Color::DarkGray),
+    ));
+    Line::from(spans)
+}
+
+fn panel_priority_style(priority: ActionPriority) -> Style {
+    match priority {
+        ActionPriority::UserReply => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ActionPriority::ReadyForGo => Style::default().fg(Color::Green),
+        ActionPriority::Decision => Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+        ActionPriority::Blocked => Style::default().fg(Color::Red),
+        ActionPriority::ActiveWork => Style::default().fg(Color::Cyan),
+        ActionPriority::Background => Style::default().fg(Color::DarkGray),
+    }
+}
+
 fn section_lines(
     list: &PodList,
     section: &MultiPodSection,
-    selected: usize,
+    selected: Option<&PanelRowKey>,
     width: u16,
 ) -> Vec<Line<'static>> {
     let visible = visible_section_indices(section);
@@ -904,7 +1140,8 @@ fn section_lines(
     ));
     for index in visible {
         if let Some(entry) = list.entries.get(index) {
-            lines.push(row_line(entry, index == selected, width));
+            let selected = selected == Some(&PanelRowKey::Pod(entry.name.clone()));
+            lines.push(row_line(entry, selected, width));
         }
     }
     lines
@@ -959,37 +1196,64 @@ fn draw_separator(frame: &mut Frame<'_>, area: Rect) {
 }
 
 fn draw_target_status(frame: &mut Frame<'_>, app: &MultiPodApp, area: Rect) {
-    let line = match app.list.selected_entry() {
-        Some(entry) => {
-            let (status, status_style) = row_status_label(entry);
-            let send_text = if entry.actions.can_send_now {
-                "send enabled"
-            } else {
-                "send disabled"
-            };
-            Line::from(vec![
-                Span::styled("target ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    entry.name.clone(),
-                    Style::default().add_modifier(Modifier::BOLD),
-                ),
-                Span::raw("  "),
-                Span::styled(format!("[{status}]"), status_style),
-                Span::raw("  "),
-                Span::styled(
-                    send_text,
-                    if entry.actions.can_send_now {
-                        Style::default().fg(Color::Green)
-                    } else {
-                        Style::default().fg(Color::DarkGray)
-                    },
-                ),
-            ])
+    let line = if let Some(row) = app
+        .selected_panel_row()
+        .filter(|row| row.is_ticket_action())
+    {
+        Line::from(vec![
+            Span::styled("action ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                row.title.clone(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                format!("[{}]", row.priority.label()),
+                panel_priority_style(row.priority),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                row.next_action.map(NextUserAction::label).unwrap_or("View"),
+                Style::default().fg(Color::Magenta),
+            ),
+            Span::styled(
+                " display-only; re-check Ticket before dispatch",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])
+    } else {
+        match app.selected_pod_entry() {
+            Some(entry) => {
+                let (status, status_style) = row_status_label(entry);
+                let send_text = if entry.actions.can_send_now {
+                    "send enabled"
+                } else {
+                    "send disabled"
+                };
+                Line::from(vec![
+                    Span::styled("target ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        entry.name.clone(),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw("  "),
+                    Span::styled(format!("[{status}]"), status_style),
+                    Span::raw("  "),
+                    Span::styled(
+                        send_text,
+                        if entry.actions.can_send_now {
+                            Style::default().fg(Color::Green)
+                        } else {
+                            Style::default().fg(Color::DarkGray)
+                        },
+                    ),
+                ])
+            }
+            None => Line::from(Span::styled(
+                "target — none",
+                Style::default().fg(Color::DarkGray),
+            )),
         }
-        None => Line::from(Span::styled(
-            "target — none",
-            Style::default().fg(Color::DarkGray),
-        )),
     };
     frame.render_widget(Paragraph::new(line), area);
 }
@@ -1068,6 +1332,66 @@ fn truncate_with_ellipsis(s: &str, max_width: usize) -> String {
 mod tests {
     use super::*;
     use crate::pod_list::{LivePodInfo, PodEntrySummary, StoredMetadataState, StoredPodInfo};
+    use std::fs;
+    use tempfile::TempDir;
+    use ticket::{LocalTicketBackend, NewTicket, TicketBackend};
+
+    #[test]
+    fn multi_ticket_action_rows_precede_pods_and_pod_actions_still_work() {
+        let temp = TempDir::new().unwrap();
+        fs::create_dir_all(temp.path().join(".yoi")).unwrap();
+        fs::write(
+            temp.path().join(".yoi/ticket.config.toml"),
+            "[backend]\nprovider = \"builtin:yoi_local\"\nroot = \".yoi/tickets\"\n",
+        )
+        .unwrap();
+        let backend = LocalTicketBackend::new(temp.path().join(".yoi/tickets"));
+        let mut ticket = NewTicket::new("Needs Human Reply");
+        ticket.slug = Some("needs-human-reply".to_string());
+        ticket.action_required = Some("answer intake question".to_string());
+        ticket.labels = vec!["intake".to_string()];
+        backend.create(ticket).unwrap();
+        let list = PodList::from_sources(
+            PodVisibilitySource::ResumePicker,
+            vec![],
+            vec![live_info("idle", PodStatus::Idle)],
+            None,
+            10,
+        );
+        let panel = build_workspace_panel(temp.path(), &list);
+        let mut app = app_with_panel(list, panel);
+
+        assert_eq!(app.selected_panel_row().unwrap().title, "Needs Human Reply");
+        assert_eq!(app.selected_send_eligibility(), SendEligibility::Disabled);
+        let lines = list_lines(&app, 100, 6)
+            .into_iter()
+            .map(|line| plain_line(&line))
+            .collect::<Vec<_>>();
+        let ticket_line = lines
+            .iter()
+            .position(|line| line.contains("Needs Human Reply"))
+            .unwrap();
+        let pod_line = lines.iter().position(|line| line.contains("idle")).unwrap();
+        assert!(ticket_line < pod_line);
+
+        app.select_next();
+        assert_eq!(app.list.selected_entry().unwrap().name, "idle");
+        assert_eq!(app.selected_send_eligibility(), SendEligibility::SendNow);
+        let open = app.prepare_open().unwrap();
+        assert_eq!(open.pod_name, "idle");
+        assert_eq!(open.socket_override, Some(PathBuf::from("/tmp/idle.sock")));
+
+        app.input.insert_str("send after ticket row");
+        let request = match app.handle_key(key(KeyCode::Enter)) {
+            MultiPodAction::Send(request) => request,
+            _ => panic!("Pod row should preserve direct send behavior"),
+        };
+        assert_eq!(request.socket_path, PathBuf::from("/tmp/idle.sock"));
+        assert_eq!(
+            Segment::flatten_to_text(&request.segments),
+            "send after ticket row"
+        );
+    }
 
     #[test]
     fn multi_selection_changes_preserve_composer_contents() {
@@ -1168,13 +1492,17 @@ mod tests {
             Err(MultiPodError::Io(io::Error::other("boom")))
         })));
         assert!(!pending.start_with_handle(tokio::spawn(async {
-            Ok(PodList::from_sources(
+            let list = PodList::from_sources(
                 PodVisibilitySource::ResumePicker,
                 vec![],
                 vec![live_info("beta", PodStatus::Idle)],
                 None,
                 10,
-            ))
+            );
+            Ok(MultiPodSnapshot {
+                panel: WorkspacePanelViewModel::empty(Path::new("test")),
+                list,
+            })
         })));
         assert!(pending.finish_if_ready().await.is_none());
 
@@ -1236,6 +1564,8 @@ mod tests {
             Some("running".to_string()),
             10,
         );
+        app.selected_row = None;
+        app.ensure_selection_visible();
 
         assert_eq!(app.selected_send_eligibility(), SendEligibility::Disabled);
         assert!(
@@ -1290,14 +1620,15 @@ mod tests {
         let list = closed_list(5, Some("closed-0"));
         let visible = visible_entry_indices(&list)
             .into_iter()
-            .map(|index| list.entries[index].name.as_str())
+            .map(|index| list.entries[index].name.clone())
             .collect::<Vec<_>>();
         let sections = sectioned_entries(&list);
         let closed = sections
             .iter()
             .find(|section| section.kind == MultiPodSectionKind::Closed)
             .unwrap();
-        let lines = list_lines(&list, 80, 8)
+        let app = app_with_list(list);
+        let lines = list_lines(&app, 80, 8)
             .into_iter()
             .map(|line| plain_line(&line))
             .collect::<Vec<_>>();
@@ -1356,7 +1687,8 @@ mod tests {
             Some("idle".to_string()),
             20,
         );
-        let lines = list_lines(&list, 80, 12)
+        let app = app_with_list(list);
+        let lines = list_lines(&app, 80, 12)
             .into_iter()
             .map(|line| plain_line(&line))
             .collect::<Vec<_>>();
@@ -1532,9 +1864,15 @@ mod tests {
     }
 
     fn app_with_list(list: PodList) -> MultiPodApp {
+        app_with_panel(list, WorkspacePanelViewModel::empty(Path::new("test")))
+    }
+
+    fn app_with_panel(list: PodList, panel: WorkspacePanelViewModel) -> MultiPodApp {
         let mut app = MultiPodApp {
             list,
+            panel,
             input: InputBuffer::new(),
+            selected_row: None,
             notice: None,
             sending: false,
         };
