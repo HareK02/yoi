@@ -23,8 +23,7 @@ use tracing::warn;
 
 use crate::compact::state::CompactState;
 use crate::compact::usage_tracker::UsageTracker;
-use session_store::{SystemItem, SystemReminder};
-use tools::{TaskEntry, TaskStatus, TaskStore};
+use session_store::SystemItem;
 
 use crate::hook::{
     AbortInfo, HookPostToolAction, HookPreRequestAction, HookPreToolAction, HookPromptAction,
@@ -38,53 +37,6 @@ use llm_worker::token_counter::total_tokens;
 
 /// Maximum number of bytes copied into `TurnEndInfo::final_text_preview`.
 const FINAL_TEXT_PREVIEW_LIMIT: usize = 512;
-
-const TASK_REMINDER_REQUEST_THRESHOLD: usize = 24;
-const TASK_REMINDER_COOLDOWN_REQUESTS: usize = 24;
-const TASK_MANAGEMENT_TOOL_NAMES: [&str; 2] = ["TaskCreate", "TaskUpdate"];
-
-#[derive(Debug)]
-pub(crate) struct TaskReminderState {
-    requests_since_last_task_management: AtomicUsize,
-    requests_since_last_reminder: AtomicUsize,
-}
-
-impl Default for TaskReminderState {
-    fn default() -> Self {
-        Self {
-            requests_since_last_task_management: AtomicUsize::new(0),
-            requests_since_last_reminder: AtomicUsize::new(TASK_REMINDER_COOLDOWN_REQUESTS),
-        }
-    }
-}
-
-impl TaskReminderState {
-    pub(crate) fn new() -> Self {
-        Self::default()
-    }
-
-    fn note_request(&self) -> (usize, usize) {
-        let since_task_management = self
-            .requests_since_last_task_management
-            .fetch_add(1, Ordering::Relaxed)
-            .saturating_add(1);
-        let since_reminder = self
-            .requests_since_last_reminder
-            .fetch_add(1, Ordering::Relaxed)
-            .saturating_add(1);
-        (since_task_management, since_reminder)
-    }
-
-    fn note_task_management(&self) {
-        self.requests_since_last_task_management
-            .store(0, Ordering::Relaxed);
-    }
-
-    fn note_reminder(&self) {
-        self.requests_since_last_reminder
-            .store(0, Ordering::Relaxed);
-    }
-}
 
 pub(crate) struct PodInterceptor {
     registry: Arc<HookRegistry>,
@@ -109,10 +61,6 @@ pub(crate) struct PodInterceptor {
     /// `PromptAction::ContinueWith`. Populated by `Pod::run`
     /// immediately before handing off to the worker.
     pending_attachments: Arc<Mutex<Vec<SystemItem>>>,
-    /// Task state observed by built-in task tools. Used to nudge the main
-    /// worker when active tasks have gone unmentioned for several requests.
-    task_store: TaskStore,
-    task_reminder_state: Arc<TaskReminderState>,
     /// Prompt catalog used to render pending notification entries into the
     /// same system-message text that will be persisted in history.
     prompts: Arc<PromptCatalog>,
@@ -135,8 +83,6 @@ impl PodInterceptor {
         usage_history: Option<Arc<Mutex<Vec<UsageRecord>>>>,
         pending_notifies: NotifyBuffer,
         pending_attachments: Arc<Mutex<Vec<SystemItem>>>,
-        task_store: TaskStore,
-        task_reminder_state: Arc<TaskReminderState>,
         prompts: Arc<PromptCatalog>,
         log_writer: Option<Arc<dyn SystemItemCommitter>>,
     ) -> Self {
@@ -147,8 +93,6 @@ impl PodInterceptor {
             usage_tracker: None,
             pending_notifies,
             pending_attachments,
-            task_store,
-            task_reminder_state,
             prompts,
             log_writer,
             next_turn_index: AtomicUsize::new(0),
@@ -193,48 +137,6 @@ impl PodInterceptor {
         }
         Some(total_tokens(context, &records).tokens)
     }
-
-    fn task_reminder_system_item(&self) -> Option<SystemItem> {
-        let active_tasks: Vec<TaskEntry> = self
-            .task_store
-            .list()
-            .into_iter()
-            .filter(|task| matches!(task.status, TaskStatus::Pending | TaskStatus::Inprogress))
-            .collect();
-        if active_tasks.is_empty() {
-            return None;
-        }
-
-        let (since_task_management, since_reminder) = self.task_reminder_state.note_request();
-        if since_task_management < TASK_REMINDER_REQUEST_THRESHOLD
-            || since_reminder < TASK_REMINDER_COOLDOWN_REQUESTS
-        {
-            return None;
-        }
-
-        self.task_reminder_state.note_reminder();
-        Some(
-            SystemReminder::task_inactivity(render_task_reminder_body(&active_tasks))
-                .into_system_item(),
-        )
-    }
-}
-
-fn is_task_management_tool(name: &str) -> bool {
-    TASK_MANAGEMENT_TOOL_NAMES.contains(&name)
-}
-
-fn render_task_reminder_body(active_tasks: &[TaskEntry]) -> String {
-    let mut body = String::from(
-        "Active session tasks are still open. If progress changed, call TaskUpdate.\n",
-    );
-    for task in active_tasks {
-        body.push_str(&format!(
-            "- taskid {} ({}) {}\n",
-            task.taskid, task.status, task.subject
-        ));
-    }
-    body.trim_end_matches('\n').to_string()
 }
 
 #[async_trait]
@@ -275,13 +177,12 @@ impl Interceptor for PodInterceptor {
 
     async fn pending_history_appends(&self) -> Vec<Item> {
         let drained = self.pending_notifies.drain();
-        let task_reminder = self.task_reminder_system_item();
-        if drained.is_empty() && task_reminder.is_none() {
+        if drained.is_empty() {
             return Vec::new();
         }
 
-        let mut system_items: Vec<SystemItem> = Vec::with_capacity(drained.len() + 1);
-        let mut items: Vec<Item> = Vec::with_capacity(drained.len() + 1);
+        let mut system_items: Vec<SystemItem> = Vec::with_capacity(drained.len());
+        let mut items: Vec<Item> = Vec::with_capacity(drained.len());
         for entry in drained {
             match build_system_item(&entry, &self.prompts) {
                 Ok(system_item) => {
@@ -303,10 +204,6 @@ impl Interceptor for PodInterceptor {
                     items.push(Item::system_message(fallback));
                 }
             }
-        }
-        if let Some(system_item) = task_reminder {
-            items.push(system_item.to_history_item());
-            system_items.push(system_item);
         }
         self.commit_system_items(&system_items);
         items
@@ -383,9 +280,6 @@ impl Interceptor for PodInterceptor {
             if !matches!(action, HookPreToolAction::Continue) {
                 return action.into_worker_action(summary.call_id.clone());
             }
-        }
-        if is_task_management_tool(&info.call.name) {
-            self.task_reminder_state.note_task_management();
         }
         self.tool_calls_this_turn.fetch_add(1, Ordering::Relaxed);
         PreToolAction::Continue
@@ -506,7 +400,6 @@ mod tests {
         Hook, HookPostToolAction, HookPreRequestAction, HookPreToolAction, HookRegistryBuilder,
         HookTurnEndAction, OnTurnEnd, PostToolCall, PreLlmRequest, PreToolCall,
     };
-    use session_store::SystemReminderSource;
 
     struct CountingHook(Arc<AtomicUsize>);
 
@@ -552,25 +445,8 @@ mod tests {
         }
     }
 
-    fn interceptor_for_task_reminders(
-        task_store: TaskStore,
-        task_reminder_state: Arc<TaskReminderState>,
-    ) -> PodInterceptor {
-        PodInterceptor::new(
-            Arc::new(HookRegistryBuilder::new().build()),
-            None,
-            None,
-            NotifyBuffer::new(),
-            Arc::new(Mutex::new(Vec::new())),
-            task_store,
-            task_reminder_state,
-            PromptCatalog::builtins_only().unwrap(),
-            None,
-        )
-    }
-
     fn task_tool_call_info(name: &str, input: serde_json::Value) -> ToolCallInfo {
-        let def = tools::task_tools(TaskStore::new())
+        let def = tools::task_tools(tools::TaskStore::new())
             .into_iter()
             .find(|def| {
                 let (meta, _) = def();
@@ -587,12 +463,6 @@ mod tests {
             meta,
             tool,
         }
-    }
-
-    async fn call_pre_tool(interceptor: &PodInterceptor, name: &str) {
-        let mut info = task_tool_call_info(name, serde_json::json!({}));
-        let action = interceptor.pre_tool_call(&mut info).await;
-        assert!(matches!(action, PreToolAction::Continue));
     }
 
     /// Build a usage_history handle with a single record pinned at the
@@ -623,8 +493,6 @@ mod tests {
             Some(history),
             NotifyBuffer::new(),
             Arc::new(Mutex::new(Vec::new())),
-            TaskStore::new(),
-            Arc::new(TaskReminderState::new()),
             PromptCatalog::builtins_only().unwrap(),
             None,
         );
@@ -658,8 +526,6 @@ mod tests {
             Some(history),
             NotifyBuffer::new(),
             Arc::new(Mutex::new(Vec::new())),
-            TaskStore::new(),
-            Arc::new(TaskReminderState::new()),
             PromptCatalog::builtins_only().unwrap(),
             None,
         )
@@ -685,8 +551,6 @@ mod tests {
             Some(history),
             NotifyBuffer::new(),
             Arc::new(Mutex::new(Vec::new())),
-            TaskStore::new(),
-            Arc::new(TaskReminderState::new()),
             PromptCatalog::builtins_only().unwrap(),
             None,
         );
@@ -728,8 +592,6 @@ mod tests {
             Some(history),
             NotifyBuffer::new(),
             Arc::new(Mutex::new(Vec::new())),
-            TaskStore::new(),
-            Arc::new(TaskReminderState::new()),
             PromptCatalog::builtins_only().unwrap(),
             None,
         );
@@ -757,8 +619,6 @@ mod tests {
             Some(history),
             NotifyBuffer::new(),
             Arc::new(Mutex::new(Vec::new())),
-            TaskStore::new(),
-            Arc::new(TaskReminderState::new()),
             PromptCatalog::builtins_only().unwrap(),
             None,
         );
@@ -780,8 +640,6 @@ mod tests {
             None,
             NotifyBuffer::new(),
             Arc::new(Mutex::new(Vec::new())),
-            TaskStore::new(),
-            Arc::new(TaskReminderState::new()),
             PromptCatalog::builtins_only().unwrap(),
             None,
         );
@@ -810,8 +668,6 @@ mod tests {
             None,
             NotifyBuffer::new(),
             Arc::new(Mutex::new(Vec::new())),
-            TaskStore::new(),
-            Arc::new(TaskReminderState::new()),
             PromptCatalog::builtins_only().unwrap(),
             Some(committer),
         );
@@ -859,8 +715,6 @@ mod tests {
             None,
             NotifyBuffer::new(),
             Arc::new(Mutex::new(Vec::new())),
-            TaskStore::new(),
-            Arc::new(TaskReminderState::new()),
             PromptCatalog::builtins_only().unwrap(),
             None,
         );
@@ -918,8 +772,6 @@ mod tests {
             None,
             NotifyBuffer::new(),
             Arc::new(Mutex::new(Vec::new())),
-            TaskStore::new(),
-            Arc::new(TaskReminderState::new()),
             PromptCatalog::builtins_only().unwrap(),
             None,
         );
@@ -967,8 +819,6 @@ mod tests {
             None,
             NotifyBuffer::new(),
             Arc::new(Mutex::new(Vec::new())),
-            TaskStore::new(),
-            Arc::new(TaskReminderState::new()),
             PromptCatalog::builtins_only().unwrap(),
             None,
         );
@@ -1017,8 +867,6 @@ mod tests {
             None,
             NotifyBuffer::new(),
             Arc::new(Mutex::new(Vec::new())),
-            TaskStore::new(),
-            Arc::new(TaskReminderState::new()),
             PromptCatalog::builtins_only().unwrap(),
             None,
         );
@@ -1043,8 +891,6 @@ mod tests {
             None,
             buffer.clone(),
             Arc::new(Mutex::new(Vec::new())),
-            TaskStore::new(),
-            Arc::new(TaskReminderState::new()),
             PromptCatalog::builtins_only().unwrap(),
             None,
         );
@@ -1068,207 +914,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn task_reminder_appends_after_inactive_request_threshold() {
-        let task_store = TaskStore::new();
-        task_store.create("keep going".into(), "long task description".into());
-        let interceptor =
-            interceptor_for_task_reminders(task_store, Arc::new(TaskReminderState::new()));
-
-        for _ in 0..TASK_REMINDER_REQUEST_THRESHOLD - 1 {
-            assert!(interceptor.pending_history_appends().await.is_empty());
-        }
-        let items = interceptor.pending_history_appends().await;
-        assert_eq!(items.len(), 1);
-        let body = items[0].as_text().unwrap_or_default();
-        assert_eq!(body.matches("<system-reminder>").count(), 1);
-        assert_eq!(body.matches("</system-reminder>").count(), 1);
-        assert!(body.contains("taskid 1"));
-        assert!(body.contains("pending"));
-        assert!(body.contains("keep going"));
-        assert!(!body.contains("long task description"));
-    }
-
-    #[test]
-    fn task_reminder_system_item_retains_source() {
-        let task_store = TaskStore::new();
-        task_store.create("typed".into(), String::new());
-        let interceptor =
-            interceptor_for_task_reminders(task_store, Arc::new(TaskReminderState::new()));
-
-        for _ in 0..TASK_REMINDER_REQUEST_THRESHOLD - 1 {
-            assert!(interceptor.task_reminder_system_item().is_none());
-        }
-        let item = interceptor.task_reminder_system_item().unwrap();
-        match item {
-            SystemItem::TaskReminder { source, body } => {
-                assert_eq!(source, SystemReminderSource::TaskInactivity);
-                assert_eq!(body.matches("<system-reminder>").count(), 1);
-                assert_eq!(body.matches("</system-reminder>").count(), 1);
-                assert!(body.contains("typed"));
-            }
-            other => panic!("unexpected: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn render_task_reminder_body_is_unwrapped_for_system_reminder_helper() {
-        let task_store = TaskStore::new();
-        let task = task_store.create("body".into(), String::new());
-        let body = render_task_reminder_body(&[task]);
-
-        assert!(!body.contains("<system-reminder>"));
-        assert!(!body.contains("</system-reminder>"));
-        assert!(body.contains("TaskUpdate"));
-        assert!(body.contains("taskid 1"));
-    }
-
-    #[test]
-    fn task_reminder_state_starts_with_initial_cooldown_elapsed() {
-        let state = TaskReminderState::new();
-
-        assert_eq!(
-            state.requests_since_last_reminder.load(Ordering::Relaxed),
-            TASK_REMINDER_COOLDOWN_REQUESTS
-        );
-        assert_eq!(
-            state
-                .requests_since_last_task_management
-                .load(Ordering::Relaxed),
-            0
-        );
-    }
-
-    #[tokio::test]
-    async fn task_management_tool_call_resets_reminder_inactivity_counter() {
-        let task_store = TaskStore::new();
-        task_store.create("track me".into(), String::new());
-        let interceptor =
-            interceptor_for_task_reminders(task_store, Arc::new(TaskReminderState::new()));
-
-        for _ in 0..TASK_REMINDER_REQUEST_THRESHOLD - 1 {
-            assert!(interceptor.pending_history_appends().await.is_empty());
-        }
-        call_pre_tool(&interceptor, "TaskUpdate").await;
-
-        for _ in 0..TASK_REMINDER_REQUEST_THRESHOLD - 1 {
-            assert!(interceptor.pending_history_appends().await.is_empty());
-        }
-        assert_eq!(interceptor.pending_history_appends().await.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn task_reminder_respects_cooldown_after_reminder() {
-        let task_store = TaskStore::new();
-        task_store.create("cooldown".into(), String::new());
-        let interceptor =
-            interceptor_for_task_reminders(task_store, Arc::new(TaskReminderState::new()));
-
-        for _ in 0..TASK_REMINDER_REQUEST_THRESHOLD {
-            let _ = interceptor.pending_history_appends().await;
-        }
-        for _ in 0..TASK_REMINDER_COOLDOWN_REQUESTS - 1 {
-            assert!(interceptor.pending_history_appends().await.is_empty());
-        }
-        assert_eq!(interceptor.pending_history_appends().await.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn task_reminder_is_silent_when_no_active_tasks_exist() {
-        let task_store = TaskStore::new();
-        let done = task_store.create("done".into(), String::new()).taskid;
-        task_store
-            .update(done, Some(TaskStatus::Completed), None, None)
-            .expect("complete task");
-        let interceptor =
-            interceptor_for_task_reminders(task_store, Arc::new(TaskReminderState::new()));
-
-        for _ in 0..TASK_REMINDER_REQUEST_THRESHOLD * 2 {
-            assert!(interceptor.pending_history_appends().await.is_empty());
-        }
-    }
-
-    #[tokio::test]
-    async fn inactive_requests_without_active_tasks_do_not_prime_task_reminder() {
-        let task_store = TaskStore::new();
-        let interceptor =
-            interceptor_for_task_reminders(task_store.clone(), Arc::new(TaskReminderState::new()));
-
-        for _ in 0..TASK_REMINDER_REQUEST_THRESHOLD * 2 {
-            assert!(interceptor.pending_history_appends().await.is_empty());
-        }
-
-        task_store.create("new active".into(), String::new());
-        for _ in 0..TASK_REMINDER_REQUEST_THRESHOLD - 1 {
-            assert!(interceptor.pending_history_appends().await.is_empty());
-        }
-        assert_eq!(interceptor.pending_history_appends().await.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn task_create_reset_does_not_block_first_reminder_cooldown() {
-        let task_store = TaskStore::new();
-        let state = Arc::new(TaskReminderState::new());
-        let interceptor = interceptor_for_task_reminders(task_store.clone(), state.clone());
-
-        for _ in 0..TASK_REMINDER_REQUEST_THRESHOLD * 2 {
-            assert!(interceptor.pending_history_appends().await.is_empty());
-        }
-
-        call_pre_tool(&interceptor, "TaskCreate").await;
-        task_store.create("created after idle".into(), String::new());
-        assert_eq!(
-            state.requests_since_last_reminder.load(Ordering::Relaxed),
-            TASK_REMINDER_COOLDOWN_REQUESTS,
-            "TaskCreate reset must not clear the initial reminder cooldown"
-        );
-
-        for _ in 0..TASK_REMINDER_REQUEST_THRESHOLD - 1 {
-            assert!(interceptor.pending_history_appends().await.is_empty());
-        }
-        assert_eq!(interceptor.pending_history_appends().await.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn task_reminder_lands_in_pending_history_appends_lane() {
-        let task_store = TaskStore::new();
-        task_store.create("lane".into(), String::new());
-        let interceptor =
-            interceptor_for_task_reminders(task_store, Arc::new(TaskReminderState::new()));
-        let mut ctx = vec![Item::user_message("hi")];
-
-        for _ in 0..TASK_REMINDER_REQUEST_THRESHOLD {
-            let _ = interceptor.pending_history_appends().await;
-        }
-        let action = interceptor.pre_llm_request(&mut ctx).await;
-
-        assert!(matches!(action, PreRequestAction::Continue));
-        assert_eq!(ctx.len(), 1, "pre_llm_request must not inject reminders");
-    }
-
-    #[tokio::test]
-    async fn pre_llm_request_does_not_touch_task_reminder_lane() {
-        let task_store = TaskStore::new();
-        task_store.create("lane".into(), String::new());
-        let interceptor =
-            interceptor_for_task_reminders(task_store, Arc::new(TaskReminderState::new()));
-        let mut ctx = vec![Item::user_message("hi")];
-
-        for _ in 0..TASK_REMINDER_REQUEST_THRESHOLD - 1 {
-            assert!(interceptor.pending_history_appends().await.is_empty());
-        }
-        let action = interceptor.pre_llm_request(&mut ctx).await;
-
-        assert!(matches!(action, PreRequestAction::Continue));
-        assert_eq!(ctx.len(), 1, "pre_llm_request must not inject reminders");
-        let pending = interceptor.pending_history_appends().await;
-        assert_eq!(
-            pending.len(),
-            1,
-            "reminders stay in pending_history_appends"
-        );
-    }
-
-    #[tokio::test]
     async fn pre_llm_request_does_not_touch_pending_notifies() {
         // The drain lane has moved to `pending_history_appends`;
         // `pre_llm_request` must leave the buffer alone and not inject
@@ -1283,8 +928,6 @@ mod tests {
             None,
             buffer.clone(),
             Arc::new(Mutex::new(Vec::new())),
-            TaskStore::new(),
-            Arc::new(TaskReminderState::new()),
             PromptCatalog::builtins_only().unwrap(),
             None,
         );
@@ -1315,8 +958,6 @@ mod tests {
             None,
             NotifyBuffer::new(),
             Arc::new(Mutex::new(Vec::new())),
-            TaskStore::new(),
-            Arc::new(TaskReminderState::new()),
             PromptCatalog::builtins_only().unwrap(),
             None,
         );

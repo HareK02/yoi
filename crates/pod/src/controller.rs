@@ -9,7 +9,7 @@ use session_store::Store;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::discovery::{PodDiscovery, list_pods_tool, restore_pod_tool, send_to_peer_pod_tool};
-use crate::feature::{FeatureRegistryBuilder, builtin::task_tools_feature};
+use crate::feature::FeatureRegistryBuilder;
 use crate::ipc::alerter::Alerter;
 use crate::ipc::notify_buffer::NotifyBuffer;
 use crate::ipc::server::SocketServer;
@@ -493,7 +493,7 @@ where
     // below so the worker borrow doesn't conflict with reads on `pod`.
     let scope_handle = pod.scope().clone();
     let pwd = pod.pwd().to_path_buf();
-    let task_store = pod.task_store();
+    let task_feature = pod.task_feature();
     let session_id_for_usage = pod.segment_id().to_string();
     let memory_config = pod.manifest().memory.clone();
     let web_config = pod.manifest().web.clone();
@@ -522,7 +522,7 @@ where
     ));
 
     let mut feature_registry = FeatureRegistryBuilder::new();
-    feature_registry.add_module(task_tools_feature(task_store));
+    feature_registry.add_module(task_feature);
     let _feature_install_report = pod.install_features(feature_registry);
 
     let worker = pod.worker_mut();
