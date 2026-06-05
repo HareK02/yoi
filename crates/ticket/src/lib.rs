@@ -514,6 +514,14 @@ impl TicketDoctorReport {
             path,
         });
     }
+
+    pub fn push_warning(&mut self, message: impl Into<String>, path: Option<PathBuf>) {
+        self.diagnostics.push(TicketDoctorDiagnostic {
+            severity: TicketDoctorSeverity::Warning,
+            message: message.into(),
+            path,
+        });
+    }
 }
 
 pub trait TicketBackend {
@@ -1010,15 +1018,13 @@ impl TicketBackend for LocalTicketBackend {
                     );
                 }
                 if status == TicketStatus::Closed && !dir.join("resolution.md").is_file() {
-                    report.push_error(
-                        format!("missing resolution.md for closed ticket: {}", dir.display()),
+                    report.push_warning(
+                        format!("closed ticket missing resolution.md: {}", dir.display()),
                         Some(dir.join("resolution.md")),
                     );
                 }
                 if thread.exists() {
-                    for diagnostic in doctor_thread_events(&thread)? {
-                        report.push_error(diagnostic, Some(thread.clone()));
-                    }
+                    doctor_thread_events(&thread, &mut report)?;
                 }
                 if artifacts.exists() {
                     doctor_artifacts(&artifacts, &mut report)?;
@@ -1339,17 +1345,19 @@ fn parse_event_comment(comment: &str) -> BTreeMap<String, String> {
     attrs
 }
 
-fn doctor_thread_events(path: &Path) -> Result<Vec<String>> {
+fn doctor_thread_events(path: &Path, report: &mut TicketDoctorReport) -> Result<()> {
     let content = fs::read_to_string(path).map_err(|e| io_err(path, e))?;
-    let mut diagnostics = Vec::new();
     for (line_no, line) in content.lines().enumerate() {
         let trimmed = line.trim();
         if trimmed.starts_with("<!-- event:") && !trimmed.ends_with("-->") {
-            diagnostics.push(format!(
-                "malformed thread event comment at {}:{}",
-                path.display(),
-                line_no + 1
-            ));
+            report.push_error(
+                format!(
+                    "malformed thread event comment at {}:{}",
+                    path.display(),
+                    line_no + 1
+                ),
+                Some(path.to_path_buf()),
+            );
         }
         if let Some(comment) = trimmed
             .strip_prefix("<!-- ")
@@ -1357,25 +1365,31 @@ fn doctor_thread_events(path: &Path) -> Result<Vec<String>> {
         {
             let attrs = parse_event_comment(comment);
             if attrs.contains_key("event") && attrs.get("at").is_none() {
-                diagnostics.push(format!(
-                    "thread event missing at: {}:{}",
-                    path.display(),
-                    line_no + 1
-                ));
+                report.push_error(
+                    format!(
+                        "thread event missing at: {}:{}",
+                        path.display(),
+                        line_no + 1
+                    ),
+                    Some(path.to_path_buf()),
+                );
             }
             if attrs.get("event").map(String::as_str) == Some("review") {
                 match attrs.get("status").map(String::as_str) {
                     Some("approve" | "request_changes") => {}
-                    _ => diagnostics.push(format!(
-                        "review event missing valid status at {}:{}",
-                        path.display(),
-                        line_no + 1
-                    )),
+                    _ => report.push_warning(
+                        format!(
+                            "legacy review event missing valid status at {}:{}",
+                            path.display(),
+                            line_no + 1
+                        ),
+                        Some(path.to_path_buf()),
+                    ),
                 }
             }
         }
     }
-    Ok(diagnostics)
+    Ok(())
 }
 
 fn collect_artifacts(dir: &Path) -> Result<Vec<TicketArtifactRef>> {

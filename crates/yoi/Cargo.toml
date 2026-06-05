@@ -10,6 +10,7 @@ memory = { workspace = true }
 manifest = { workspace = true }
 pod = { workspace = true }
 session-store = { workspace = true }
+ticket = { workspace = true }
 tui = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

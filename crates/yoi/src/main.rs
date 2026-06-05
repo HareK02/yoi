@@ -1,4 +1,5 @@
 mod memory_lint;
+mod ticket_cli;
 
 use std::fmt;
 use std::path::PathBuf;
@@ -14,6 +15,7 @@ enum Mode {
     Help,
     MemoryLintHelp,
     MemoryLint(LintCliOptions),
+    Ticket(ticket_cli::TicketCli),
     PodRuntime(Vec<String>),
     Keys,
     Tui(LaunchMode),
@@ -58,6 +60,19 @@ async fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Mode::Ticket(cli) => match ticket_cli::run(cli) {
+            Ok(output) => {
+                print!("{}", output.stdout);
+                match output.status {
+                    ticket_cli::TicketCliStatus::Success => ExitCode::SUCCESS,
+                    ticket_cli::TicketCliStatus::Failure => ExitCode::FAILURE,
+                }
+            }
+            Err(e) => {
+                eprintln!("yoi ticket: {e}");
+                ExitCode::FAILURE
+            }
+        },
         Mode::PodRuntime(args) => pod::entrypoint::run_cli_from("yoi pod", args).await,
         Mode::Keys => tui::keys::launch().await,
         Mode::Tui(mode) => {
@@ -98,6 +113,11 @@ fn parse_args_slice(args: &[String]) -> Result<Mode, ParseError> {
     match args[0].as_str() {
         "--help" | "-h" => return Ok(Mode::Help),
         "pod" => return Ok(Mode::PodRuntime(args[1..].to_vec())),
+        "ticket" => {
+            let ticket_cli =
+                ticket_cli::parse_ticket_args(&args[1..]).map_err(|e| ParseError(e.to_string()))?;
+            return Ok(Mode::Ticket(ticket_cli));
+        }
         "keys" => {
             if args.len() != 1 {
                 return Err(ParseError("yoi keys does not accept arguments".into()));
@@ -322,7 +342,7 @@ fn parse_session_id(value: &str) -> Result<SegmentId, ParseError> {
 
 fn print_help() {
     println!(
-        "yoi\n\nUsage:\n  yoi [OPTIONS] [POD_NAME]\n  yoi keys\n  yoi pod [POD_OPTIONS]\n  yoi memory lint [OPTIONS]\n\nOptions:\n  -r, --resume           Open the Pod picker and resume/attach a Pod\n      --multi            Open the multi-Pod dashboard\n      --pod <NAME>       Attach/restore/create a Pod by name\n      --socket <PATH>    Attach to a specific Pod socket with --pod\n      --session <UUID>   Resume a specific session segment\n      --profile <REF>    Start a fresh Pod from a profile\n  -h, --help             Print help\n"
+        "yoi\n\nUsage:\n  yoi [OPTIONS] [POD_NAME]\n  yoi keys\n  yoi pod [POD_OPTIONS]\n  yoi ticket <COMMAND> [OPTIONS]\n  yoi memory lint [OPTIONS]\n\nOptions:\n  -r, --resume           Open the Pod picker and resume/attach a Pod\n      --multi            Open the multi-Pod dashboard\n      --pod <NAME>       Attach/restore/create a Pod by name\n      --socket <PATH>    Attach to a specific Pod socket with --pod\n      --session <UUID>   Resume a specific session segment\n      --profile <REF>    Start a fresh Pod from a profile\n  -h, --help             Print help\n"
     );
 }
 
@@ -383,6 +403,22 @@ mod tests {
         match parse_args_from(["pod", "--pod", "agent", "--profile", "default"]).unwrap() {
             Mode::PodRuntime(args) => assert_eq!(args, ["--pod", "agent", "--profile", "default"]),
             _ => panic!("expected PodRuntime mode"),
+        }
+    }
+
+    #[test]
+    fn parse_ticket_subcommand_uses_ticket_mode() {
+        match parse_args_from(["ticket", "doctor"]).unwrap() {
+            Mode::Ticket(ticket_cli::TicketCli::Command(ticket_cli::TicketCommand::Doctor)) => {}
+            _ => panic!("expected Ticket doctor mode"),
+        }
+    }
+
+    #[test]
+    fn parse_ticket_help_uses_ticket_mode() {
+        match parse_args_from(["ticket", "--help"]).unwrap() {
+            Mode::Ticket(ticket_cli::TicketCli::Help) => {}
+            _ => panic!("expected Ticket help mode"),
         }
     }
 
