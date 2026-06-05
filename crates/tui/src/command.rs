@@ -365,7 +365,10 @@ fn ticket_args(raw: &str) -> Result<CommandArgs, CommandDiagnostic> {
         ));
     };
     match action {
-        "intake" => Ok(args),
+        "intake" if args.argv().len() >= 2 => Ok(args),
+        "intake" => Err(CommandDiagnostic::new(
+            "Invalid arguments. Usage: ticket intake <context...>",
+        )),
         "route" | "investigate" | "implement" | "review" if args.argv().len() >= 2 => Ok(args),
         "route" => Err(CommandDiagnostic::new(
             "Invalid arguments. Usage: ticket route <ticket-id-or-slug> [instruction...]",
@@ -524,7 +527,12 @@ fn ticket_command(invocation: CommandInvocation<'_>) -> CommandExecution {
     };
 
     let (ticket, instruction) = if action == "intake" {
-        (None, non_empty_string(rest))
+        let Some(instruction) = non_empty_string(rest) else {
+            return CommandExecution::diagnostic(
+                "Invalid arguments. Usage: ticket intake <context...>",
+            );
+        };
+        (None, Some(instruction))
     } else {
         let Some((ticket, rest)) = split_first_word(rest) else {
             return CommandExecution::diagnostic(format!(
@@ -730,6 +738,21 @@ mod tests {
                 instruction: Some(ref instruction),
             })) if instruction == "add role shortcuts"
         ));
+    }
+
+    #[test]
+    fn ticket_intake_requires_context() {
+        let registry = CommandRegistry::builtins();
+        for command in ["ticket intake", "ticket intake    "] {
+            let result = registry.dispatch(command, &env());
+            assert!(result.method.is_none());
+            assert!(result.action.is_none());
+            assert!(!result.exit_command_mode);
+            assert_eq!(
+                result.diagnostics[0].message,
+                "Invalid arguments. Usage: ticket intake <context...>"
+            );
+        }
     }
 
     #[test]
