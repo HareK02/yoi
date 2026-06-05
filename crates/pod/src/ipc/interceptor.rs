@@ -4,7 +4,7 @@
 //! notification injection / output truncation in the future) and the
 //! public `HookRegistry`. Internal mechanisms run first and have full
 //! mutable access via the `Interceptor` trait. Hooks then receive
-//! read-only summary information and only return control-flow
+//! event-specific read-only contexts and only return control-flow
 //! decisions (continue / skip / abort / pause).
 
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -28,8 +28,8 @@ use tools::{TaskEntry, TaskStatus, TaskStore};
 
 use crate::hook::{
     AbortInfo, HookPostToolAction, HookPreRequestAction, HookPreToolAction, HookPromptAction,
-    HookRegistry, HookTurnEndAction, PreRequestInfo, PromptSubmitInfo, ToolCallSummary,
-    ToolResultSummary, TurnEndInfo,
+    HookRegistry, HookTurnEndAction, PreRequestContext, PreRequestInfo, PromptSubmitInfo,
+    SystemItemAppendHandle, ToolCallSummary, ToolResultSummary, TurnEndInfo,
 };
 use crate::ipc::notify_buffer::{NotifyBuffer, build_system_item};
 use crate::pod::SystemItemCommitter;
@@ -342,13 +342,34 @@ impl Interceptor for PodInterceptor {
             turn_index: self.current_turn_index(),
             tool_calls_this_turn: self.tool_calls_this_turn.load(Ordering::Relaxed),
         };
+        let pending_hook_system_items = Arc::new(Mutex::new(Vec::new()));
+        let system_item_sink = self
+            .log_writer
+            .as_ref()
+            .map(|_| SystemItemAppendHandle::new(Arc::clone(&pending_hook_system_items)));
+        let hook_context = PreRequestContext::new(info, system_item_sink);
         for hook in &self.registry.pre_llm_request {
-            let action = hook.call(&info).await;
+            let action = hook.call(&hook_context).await;
             if !matches!(action, HookPreRequestAction::Continue) {
                 return action.into();
             }
         }
-        PreRequestAction::Continue
+
+        let system_items: Vec<SystemItem> = std::mem::take(
+            &mut *pending_hook_system_items
+                .lock()
+                .expect("pending hook system-item queue poisoned"),
+        );
+        if system_items.is_empty() {
+            return PreRequestAction::Continue;
+        }
+        self.commit_system_items(&system_items);
+        PreRequestAction::ContinueWith(
+            system_items
+                .into_iter()
+                .map(|item| item.to_history_item())
+                .collect(),
+        )
     }
 
     async fn pre_tool_call(&self, info: &mut ToolCallInfo) -> PreToolAction {
@@ -491,7 +512,7 @@ mod tests {
 
     #[async_trait]
     impl Hook<PreLlmRequest> for CountingHook {
-        async fn call(&self, _info: &PreRequestInfo) -> HookPreRequestAction {
+        async fn call(&self, _info: &PreRequestContext) -> HookPreRequestAction {
             self.0.fetch_add(1, Ordering::Relaxed);
             HookPreRequestAction::Continue
         }
@@ -501,6 +522,34 @@ mod tests {
         let mut builder = HookRegistryBuilder::new();
         builder.add_pre_llm_request(CountingHook(count));
         Arc::new(builder.build())
+    }
+
+    struct RecordingSystemItemCommitter {
+        committed: Arc<Mutex<Vec<SystemItem>>>,
+    }
+
+    impl SystemItemCommitter for RecordingSystemItemCommitter {
+        fn commit_system_item(&self, item: SystemItem) {
+            self.committed
+                .lock()
+                .expect("committed system-item list poisoned")
+                .push(item);
+        }
+    }
+
+    struct AppendingPreRequestHook {
+        saw_handle: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl Hook<PreLlmRequest> for AppendingPreRequestHook {
+        async fn call(&self, input: &PreRequestContext) -> HookPreRequestAction {
+            if let Some(system_items) = input.system_items() {
+                self.saw_handle.store(true, Ordering::Relaxed);
+                system_items.append_task_reminder("hook reminder");
+            }
+            HookPreRequestAction::Continue
+        }
     }
 
     fn interceptor_for_task_reminders(
@@ -743,11 +792,91 @@ mod tests {
         assert_eq!(count.load(Ordering::Relaxed), 1);
     }
 
+    #[tokio::test]
+    async fn pre_llm_request_commits_hook_system_items_before_continue_with() {
+        let saw_handle = Arc::new(AtomicBool::new(false));
+        let mut builder = HookRegistryBuilder::new();
+        builder.add_pre_llm_request(AppendingPreRequestHook {
+            saw_handle: Arc::clone(&saw_handle),
+        });
+        let registry = Arc::new(builder.build());
+        let committed = Arc::new(Mutex::new(Vec::new()));
+        let committer = Arc::new(RecordingSystemItemCommitter {
+            committed: Arc::clone(&committed),
+        });
+        let interceptor = PodInterceptor::new(
+            registry,
+            None,
+            None,
+            NotifyBuffer::new(),
+            Arc::new(Mutex::new(Vec::new())),
+            TaskStore::new(),
+            Arc::new(TaskReminderState::new()),
+            PromptCatalog::builtins_only().unwrap(),
+            Some(committer),
+        );
+
+        let mut ctx: Vec<Item> = Vec::new();
+        let action = interceptor.pre_llm_request(&mut ctx).await;
+
+        assert!(saw_handle.load(Ordering::Relaxed));
+        let PreRequestAction::ContinueWith(items) = action else {
+            panic!("expected ContinueWith for committed hook system item");
+        };
+        assert_eq!(items.len(), 1);
+        assert!(matches!(
+            &items[0],
+            Item::Message {
+                role: llm_worker::Role::System,
+                ..
+            }
+        ));
+        assert!(
+            extract_message_text(&items[0])
+                .expect("system message text")
+                .contains("hook reminder")
+        );
+        let committed = committed
+            .lock()
+            .expect("committed system-item list poisoned");
+        assert_eq!(committed.len(), 1);
+        match &committed[0] {
+            SystemItem::TaskReminder { body, .. } => assert!(body.contains("hook reminder")),
+            other => panic!("unexpected committed system item: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn pre_llm_request_without_log_writer_does_not_expose_system_item_handle() {
+        let saw_handle = Arc::new(AtomicBool::new(false));
+        let mut builder = HookRegistryBuilder::new();
+        builder.add_pre_llm_request(AppendingPreRequestHook {
+            saw_handle: Arc::clone(&saw_handle),
+        });
+        let interceptor = PodInterceptor::new(
+            Arc::new(builder.build()),
+            None,
+            None,
+            NotifyBuffer::new(),
+            Arc::new(Mutex::new(Vec::new())),
+            TaskStore::new(),
+            Arc::new(TaskReminderState::new()),
+            PromptCatalog::builtins_only().unwrap(),
+            None,
+        );
+
+        let mut ctx: Vec<Item> = Vec::new();
+        let action = interceptor.pre_llm_request(&mut ctx).await;
+
+        assert!(!saw_handle.load(Ordering::Relaxed));
+        assert!(matches!(action, PreRequestAction::Continue));
+    }
+
     struct AbortingHook(Arc<AtomicBool>);
 
     #[async_trait]
     impl Hook<PreLlmRequest> for AbortingHook {
-        async fn call(&self, _info: &PreRequestInfo) -> HookPreRequestAction {
+        async fn call(&self, _info: &PreRequestContext) -> HookPreRequestAction {
             self.0.store(true, Ordering::Relaxed);
             HookPreRequestAction::Cancel("nope".into())
         }
