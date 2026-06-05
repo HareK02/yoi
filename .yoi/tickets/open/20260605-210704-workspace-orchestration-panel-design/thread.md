@@ -22,3 +22,18 @@ This is a design draft for review/iteration, not implementation approval for the
 
 
 ---
+
+<!-- event: decision author: hare at: 2026-06-05T21:32:54Z -->
+
+## Decision
+
+Updated the workspace panel design draft per UI direction:
+
+- concrete look-and-feel should follow the existing TUI design language/components rather than introducing a separate dashboard style;
+- the panel should remain a `--multi` successor with attach/drill-down, not a permanent split with the normal single-Pod UI;
+- rendering should go through a UI intermediate representation (`WorkspacePanelViewModel`, `TicketPanelEntry`, action rows, composer view state, timeline lanes) built from Ticket/Pod/runtime sources before widgets render.
+
+The design ticket acceptance criteria now explicitly require both the UI intermediate representation and existing-TUI visual convention constraints.
+
+
+---
