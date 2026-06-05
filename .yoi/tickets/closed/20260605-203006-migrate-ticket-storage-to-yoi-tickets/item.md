@@ -2,12 +2,12 @@
 id: 20260605-203006-migrate-ticket-storage-to-yoi-tickets
 slug: migrate-ticket-storage-to-yoi-tickets
 title: Migrate Ticket storage to .yoi/tickets
-status: open
+status: closed
 kind: task
 priority: P1
 labels: [ticket, migration, storage]
 created_at: 2026-06-05T20:30:06Z
-updated_at: 2026-06-05T21:43:54Z
+updated_at: 2026-06-05T21:51:58Z
 assignee: null
 legacy_ticket: null
 ---
