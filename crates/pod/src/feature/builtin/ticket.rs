@@ -7,7 +7,10 @@
 use std::path::{Path, PathBuf};
 
 use ticket::{
-    LocalTicketBackend, config::TicketConfig, tool::TICKET_TOOL_NAMES, tool::ticket_tools,
+    LocalTicketBackend,
+    config::{DEFAULT_TICKET_BACKEND_RELATIVE_PATH, TicketConfig},
+    tool::TICKET_TOOL_NAMES,
+    tool::ticket_tools,
 };
 
 use crate::feature::{
@@ -40,7 +43,7 @@ impl TicketFeature {
         match TicketConfig::load_workspace(workspace) {
             Ok(config) => Self::new(config.backend_root().to_path_buf()),
             Err(error) => Self {
-                backend_root: workspace.join("work-items"),
+                backend_root: workspace.join(DEFAULT_TICKET_BACKEND_RELATIVE_PATH),
                 config_error: Some(error.to_string()),
             },
         }
@@ -155,7 +158,7 @@ mod tests {
     use crate::hook::HookRegistryBuilder;
     use tempfile::TempDir;
 
-    fn make_work_items(root: &Path) {
+    fn make_ticket_root(root: &Path) {
         std::fs::create_dir_all(root.join("open")).unwrap();
         std::fs::create_dir_all(root.join("pending")).unwrap();
         std::fs::create_dir_all(root.join("closed")).unwrap();
@@ -191,9 +194,9 @@ mod tests {
     }
 
     #[test]
-    fn installs_ticket_tools_when_work_items_root_is_usable() {
+    fn installs_ticket_tools_when_default_root_is_usable() {
         let temp = TempDir::new().unwrap();
-        make_work_items(&temp.path().join("work-items"));
+        make_ticket_root(&temp.path().join(DEFAULT_TICKET_BACKEND_RELATIVE_PATH));
         let mut pending_tools = Vec::new();
         let mut hooks = HookRegistryBuilder::default();
         let report = FeatureRegistryBuilder::new()
@@ -221,7 +224,7 @@ root = "tickets"
 profile = "project:coder"
 "#,
         );
-        make_work_items(&temp.path().join("tickets"));
+        make_ticket_root(&temp.path().join("tickets"));
 
         let feature = ticket_tools_feature(temp.path());
         assert_eq!(feature.backend_root(), temp.path().join("tickets"));
@@ -239,7 +242,7 @@ profile = "project:coder"
     #[test]
     fn malformed_ticket_config_fails_closed() {
         let temp = TempDir::new().unwrap();
-        make_work_items(&temp.path().join("work-items"));
+        make_ticket_root(&temp.path().join(DEFAULT_TICKET_BACKEND_RELATIVE_PATH));
         write_ticket_config(
             temp.path(),
             r#"
@@ -264,7 +267,7 @@ profile = "inherit"
     #[test]
     fn unsupported_ticket_backend_provider_fails_closed() {
         let temp = TempDir::new().unwrap();
-        make_work_items(&temp.path().join("work-items"));
+        make_ticket_root(&temp.path().join(DEFAULT_TICKET_BACKEND_RELATIVE_PATH));
         write_ticket_config(
             temp.path(),
             r#"
@@ -310,7 +313,7 @@ provider = "github"
     #[test]
     fn does_not_register_ticket_tools_when_root_lacks_status_dirs() {
         let temp = TempDir::new().unwrap();
-        std::fs::create_dir_all(temp.path().join("work-items")).unwrap();
+        std::fs::create_dir_all(temp.path().join(DEFAULT_TICKET_BACKEND_RELATIVE_PATH)).unwrap();
         let mut pending_tools = Vec::new();
         let mut hooks = HookRegistryBuilder::default();
         let report = FeatureRegistryBuilder::new()

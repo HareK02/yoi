@@ -1,7 +1,7 @@
-//! Ticket domain types and the local `work-items/` file backend.
+//! Ticket domain types and the local `.yoi/tickets/` file backend.
 //!
 //! The public domain name is **Ticket**. `LocalTicketBackend` preserves the
-//! repository's current `work-items/{open,pending,closed}/<id>/` layout and the
+//! repository's current `.yoi/tickets/{open,pending,closed}/<id>/` layout and the
 //! event format used by `tickets.sh` while exposing typed Rust operations.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -1525,7 +1525,7 @@ mod tests {
     use tempfile::TempDir;
 
     fn backend(dir: &TempDir) -> LocalTicketBackend {
-        LocalTicketBackend::new(dir.path().join("work-items"))
+        LocalTicketBackend::new(dir.path().join("tickets"))
     }
 
     fn script_path() -> PathBuf {
@@ -1592,12 +1592,12 @@ action_required: none
         let mut input = NewTicket::new("Example Ticket");
         input.labels = vec!["ticket".into(), "backend".into()];
         let ticket = backend.create(input).unwrap();
-        let dir = tmp.path().join("work-items/open").join(&ticket.id);
+        let dir = tmp.path().join("tickets/open").join(&ticket.id);
         assert!(dir.join("item.md").exists());
         assert!(dir.join("thread.md").exists());
         assert!(dir.join("artifacts/.gitkeep").exists());
         assert_eq!(ticket.slug, "example-ticket");
-        assert_script_ok(&tmp.path().join("work-items"), &["doctor"]);
+        assert_script_ok(&tmp.path().join("tickets"), &["doctor"]);
     }
 
     #[test]
@@ -1622,7 +1622,7 @@ action_required: none
             .unwrap();
         let pending_item = tmp
             .path()
-            .join("work-items/pending")
+            .join("tickets/pending")
             .join(&ticket.id)
             .join("item.md");
         assert!(pending_item.exists());
@@ -1632,19 +1632,19 @@ action_required: none
                 MarkdownText::new("Done.\n"),
             )
             .unwrap();
-        let closed_dir = tmp.path().join("work-items/closed").join(&ticket.id);
+        let closed_dir = tmp.path().join("tickets/closed").join(&ticket.id);
         assert!(closed_dir.join("resolution.md").exists());
         let thread = fs::read_to_string(closed_dir.join("thread.md")).unwrap();
         assert!(thread.contains("<!-- event: review"));
         assert!(thread.contains("status: approve"));
         assert!(thread.contains("<!-- event: close"));
-        assert_script_ok(&tmp.path().join("work-items"), &["doctor"]);
+        assert_script_ok(&tmp.path().join("tickets"), &["doctor"]);
     }
 
     #[test]
     fn reads_ticket_created_by_tickets_sh_and_script_mutates_rust_ticket() {
         let tmp = TempDir::new().unwrap();
-        let work_items = tmp.path().join("work-items");
+        let work_items = tmp.path().join("tickets");
         let id = assert_script_ok(
             &work_items,
             &[
@@ -1676,7 +1676,7 @@ action_required: none
     #[test]
     fn doctor_reports_core_consistency_errors() {
         let tmp = TempDir::new().unwrap();
-        let root = tmp.path().join("work-items");
+        let root = tmp.path().join("tickets");
         fs::create_dir_all(root.join("open/bad/artifacts")).unwrap();
         fs::write(
             root.join("open/bad/item.md"),
@@ -1733,7 +1733,7 @@ action_required: none
     #[test]
     fn rejects_unsafe_components_for_status_moves() {
         let tmp = TempDir::new().unwrap();
-        let root = tmp.path().join("work-items");
+        let root = tmp.path().join("tickets");
         fs::create_dir_all(root.join("open/bad/artifacts")).unwrap();
         fs::write(
             root.join("open/bad/item.md"),

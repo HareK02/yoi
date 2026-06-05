@@ -1,13 +1,13 @@
 #!/bin/sh
 set -eu
 
-WORK_ITEMS_DIR=${WORK_ITEMS_DIR:-work-items}
+WORK_ITEMS_DIR=${WORK_ITEMS_DIR:-.yoi/tickets}
 STATUSES="open pending closed"
 REQUIRED_FIELDS="id slug title status kind priority labels created_at updated_at assignee legacy_ticket"
 
 usage() {
     cat <<'EOF'
-tickets.sh - repository-local WorkItem / Thread helper
+tickets.sh - transitional repository-local Ticket helper
 
 Usage:
   ./tickets.sh help
@@ -22,14 +22,15 @@ Usage:
   ./tickets.sh doctor
 
 Backend:
-  work-items/{open,pending,closed}/<id>/item.md
-  work-items/{open,pending,closed}/<id>/thread.md
-  work-items/{open,pending,closed}/<id>/artifacts/
+  .yoi/tickets/{open,pending,closed}/<id>/item.md
+  .yoi/tickets/{open,pending,closed}/<id>/thread.md
+  .yoi/tickets/{open,pending,closed}/<id>/artifacts/
 
-Migration policy:
-  work-items/ is the canonical backend after migration. TODO.md is only a
-  legacy/generated-view notice. Open items must not remain as tickets/*.md, and
-  review notes must be appended to thread.md instead of tickets/*.review.md.
+Transition policy:
+  .yoi/tickets/ is the active built-in local Ticket backend. This script remains
+  a maintainer shim until yoi ticket fully replaces it; WORK_ITEMS_DIR may be
+  set for one-off legacy/recovery checks, but do not maintain a second live root.
+  Review notes must be appended to thread.md instead of tickets/*.review.md.
 EOF
 }
 
