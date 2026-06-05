@@ -62,7 +62,7 @@ Intake は以下を行う。
 
 Intake は `TicketReview`, `TicketStatus`, `TicketClose` を通常使わない。review / status transition / close は Orchestrator または reviewer / maintainer workflow の責務である。
 
-Ticket tools が利用できない環境では、勝手に file write で代替しない。ユーザーまたは Orchestrator に「Ticket tools がないため materialize できない」と報告し、必要なら `tickets.sh` を使う人間/親 workflow に戻す。
+Ticket tools が利用できない環境では、勝手に file write で代替しない。ユーザーまたは Orchestrator に「Ticket tools がないため materialize できない」と報告し、必要なら `yoi ticket` を使える人間/親 workflow に戻す。
 
 ## 手順
 

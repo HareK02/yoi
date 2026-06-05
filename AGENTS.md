@@ -47,20 +47,20 @@ docs-only など Nix build の価値が低い変更で省略する場合は、�
 
 ## Work item / Ticket の運用について
 
-作業管理は `.yoi/tickets/` と `tickets.sh` を正とする。時系列・状態遷移の最終的な根拠は git history なので、work item の作成・更新・レビュー・完了はファイル操作と commit で表現する。
+作業管理は `.yoi/tickets/` に保存される Ticket と `yoi ticket ...` コマンド / Ticket tools を正とする。時系列・状態遷移の最終的な根拠は git history なので、work item の作成・更新・レビュー・完了は Ticket 操作と commit で表現する。
 
 ### 基本コマンド
 
-- 新規作成: `./tickets.sh create --title "..." [--slug slug] [--kind task] [--priority P2] [--label a,b]`
-- 一覧: `./tickets.sh list [--status open|pending|closed|all]`
-- 詳細: `./tickets.sh show <id-or-slug>`
-- コメント / 計画 / 判断 / 実装報告: `./tickets.sh comment <id-or-slug> [--role comment|plan|decision|implementation_report] [--file path]`
-- レビュー記録: `./tickets.sh review <id-or-slug> --approve|--request-changes [--file path]`
-- 状態変更: `./tickets.sh status <id-or-slug> open|pending|closed`
-- 完了: `./tickets.sh close <id-or-slug> [--resolution text|--file path]`
-- 整合性確認: `./tickets.sh doctor`
+- 新規作成: `yoi ticket create --title "..." [--slug slug] [--kind task] [--priority P2] [--label a,b]`
+- 一覧: `yoi ticket list [--status open|pending|closed|all]`
+- 詳細: `yoi ticket show <id-or-slug>`
+- コメント / 計画 / 判断 / 実装報告: `yoi ticket comment <id-or-slug> [--role comment|plan|decision|implementation_report] [--file path]`
+- レビュー記録: `yoi ticket review <id-or-slug> --approve|--request-changes [--file path]`
+- 状態変更: `yoi ticket status <id-or-slug> open|pending`
+- 完了: `yoi ticket close <id-or-slug> [--resolution text|--file path]`
+- 整合性確認: `yoi ticket doctor`
 
-`tickets.sh` は `.yoi/tickets/{open,pending,closed}/<id>/` 配下の `item.md`、`thread.md`、`artifacts/` を扱う。完了時は `resolution.md` も作られる。手でファイルを作るより、原則としてスクリプトを使うこと。
+`yoi ticket` は typed Ticket backend 経由で `.yoi/tickets/{open,pending,closed}/<id>/` 配下の `item.md`、`thread.md`、`artifacts/` を扱う。完了時は `resolution.md` も作られる。手でファイルを作るより、原則として `yoi ticket` または Ticket tools を使うこと。
 
 ### Work item の粒度
 
@@ -71,10 +71,10 @@ docs-only など Nix build の価値が低い変更で省略する場合は、�
 
 ### ライフサイクル
 
-- 作成: `./tickets.sh create ...` で `.yoi/tickets/open/...` を作成し、必要な前提を書いて commit する。
-- 詳細化・前提変更: `item.md` を更新し、必要に応じて `./tickets.sh comment` で `thread.md` に経緯を残して commit する。
-- レビュー: `./tickets.sh review <id-or-slug> --approve|--request-changes` で `thread.md` にレビュー結果を追記して commit する。
-- 完了: `./tickets.sh close <id-or-slug>` で `.yoi/tickets/closed/...` に移動し、`resolution.md` と完了状態を commit する。
+- 作成: `yoi ticket create ...` で `.yoi/tickets/open/...` を作成し、必要な前提を書いて commit する。
+- 詳細化・前提変更: `item.md` を更新し、必要に応じて `yoi ticket comment` で `thread.md` に経緯を残して commit する。
+- レビュー: `yoi ticket review <id-or-slug> --approve|--request-changes` で `thread.md` にレビュー結果を追記して commit する。
+- 完了: `yoi ticket close <id-or-slug>` で `.yoi/tickets/closed/...` に移動し、`resolution.md` と完了状態を commit する。
 
 worktree と併用して作業を進める場合、必ずブランチを切る前に対象 work item を作成・詳細化して commit してから切ること。
 

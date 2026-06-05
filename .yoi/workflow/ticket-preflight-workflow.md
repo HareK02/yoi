@@ -1,5 +1,5 @@
 ---
-description: ticket を実装委譲する前に、要件・前提・設計境界・反証観点を同期し、tickets.sh に記録する preflight フロー
+description: ticket を実装委譲する前に、要件・前提・設計境界・反証観点を同期し、Ticket thread に記録する preflight フロー
 model_invokation: true
 user_invocable: true
 requires: []
@@ -23,12 +23,12 @@ yoi プロジェクトで ticket を実装に渡す前に、要件・前提・�
 
 小さなバグ修正や仕様が明確な局所変更では、この Workflow は省略してよい。ただし省略理由が曖昧な場合は preflight する。
 
-## tickets.sh 運用方針
+## Ticket 記録方針
 
-作業管理の authority は `work-items/` と `tickets.sh` である。preflight の結果は、口頭の会話だけで終わらせず、ticket の `thread.md` または `item.md` に残す。
+作業管理の authority は `.yoi/tickets/` に保存される Ticket と git history である。preflight の結果は、口頭の会話だけで終わらせず、Ticket tool または `yoi ticket ...` で ticket の `thread.md` または `item.md` に残す。
 
 - 新規の前提・要件・受け入れ条件は、必要に応じて `item.md` を更新する。
-- 調査結果・実装前 plan は `./tickets.sh comment <ticket> --role plan --file <file>` で残す。
+- 調査結果・実装前 plan は `TicketComment` または `yoi ticket comment <ticket> --role plan --file <file>` で残す。
 - 採用/却下した設計判断、実装停止判断、仕様同期の結論は `--role decision` で残す。
 - 実装に入ってよい状態になったら、その根拠を intent packet として ticket thread に残す。
 - 仕様が未決定なら、実装 ticket にせず requirements-sync / spike / design ticket として切り分ける。

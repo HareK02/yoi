@@ -268,7 +268,7 @@ Validation:
 - cargo fmt --check
 - cargo check --workspace
 - cargo test ...
-- ./tickets.sh doctor
+- yoi ticket doctor
 
 Parent decision needed:
 - none / specific question

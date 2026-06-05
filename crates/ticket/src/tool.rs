@@ -42,7 +42,7 @@ pub const TICKET_TOOL_NAMES: [&str; 8] = [
 
 const CREATE_DESCRIPTION: &str = "Create a Ticket through the configured typed Ticket backend. \
 Inputs mirror the Ticket `item.md` fields; `title` is required, `body` is Markdown, and the \
-backend assigns the id and writes tickets.sh-compatible files under the configured backend root.";
+backend assigns the id and writes the local Ticket file layout under the configured backend root.";
 const LIST_DESCRIPTION: &str = "List Tickets from the configured typed Ticket backend. Filter by \
 status (`open`, `pending`, `closed`, or `all`) and optionally kind/priority/label. Output is a \
 bounded JSON summary list, not full ticket bodies.";
@@ -56,12 +56,12 @@ const REVIEW_DESCRIPTION: &str = "Append a Ticket review event. `result` must be
 `request_changes`; `body` is Markdown. Writes stay inside the configured Ticket backend root.";
 const STATUS_DESCRIPTION: &str = "Move a Ticket between non-closed local statuses through the typed \
 Ticket backend. Use `TicketClose` for closing because closed Tickets require a resolution accepted \
-by `tickets.sh doctor`.";
+by `yoi ticket doctor`.";
 const CLOSE_DESCRIPTION: &str = "Close a Ticket with a Markdown resolution through the typed Ticket \
 backend. The backend moves the Ticket to closed/, writes resolution.md, updates item.md, and appends \
 a close event.";
 const DOCTOR_DESCRIPTION: &str = "Run typed Ticket backend consistency checks and return bounded \
-diagnostics. This does not shell out to tickets.sh.";
+diagnostics through the typed backend without shelling out to external commands.";
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct TicketCreateParams {
