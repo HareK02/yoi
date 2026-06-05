@@ -2,12 +2,12 @@
 id: 20260605-210704-workspace-orchestration-panel-design
 slug: workspace-orchestration-panel-design
 title: Workspace orchestration panel design
-status: open
+status: closed
 kind: task
 priority: P1
 labels: [tui, design, orchestration, panel]
 created_at: 2026-06-05T21:07:04Z
-updated_at: 2026-06-05T22:29:53Z
+updated_at: 2026-06-05T22:35:18Z
 assignee: null
 legacy_ticket: null
 ---
