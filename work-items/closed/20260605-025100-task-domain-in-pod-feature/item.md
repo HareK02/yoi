@@ -2,12 +2,12 @@
 id: 20260605-025100-task-domain-in-pod-feature
 slug: task-domain-in-pod-feature
 title: Task: move Task domain out of tools into pod built-in feature
-status: open
+status: closed
 kind: task
 priority: P1
 labels: [tasks, feature-registry, crate-boundary, tools]
 created_at: 2026-06-05T02:51:00Z
-updated_at: 2026-06-05T03:24:54Z
+updated_at: 2026-06-05T03:26:31Z
 assignee: null
 legacy_ticket: null
 ---
