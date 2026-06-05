@@ -58,7 +58,7 @@ MVP shape:
 
 ```toml
 [backend]
-kind = "local"
+provider = "builtin:yoi_local"
 root = "work-items"
 
 [roles.intake]
@@ -103,9 +103,12 @@ This is not an arbitrary role registry. The fixed roles are the roles required b
 
 `workflow` is the workflow the launched role should follow. Workflow state and phase-specific prompt injection are future work; any dynamic prompt content must be committed as history before it affects model context.
 
+`provider = "builtin:yoi_local"` selects Yoi's built-in local Ticket backend. `root = "work-items"` is the active transitional root until the planned storage migration moves records under `.yoi/`. Legacy `kind = "local"` is accepted only as a short transitional alias; new configs should use `provider`.
+
 If `.yoi/ticket.config.toml` is missing, defaults are:
 
-- backend: local `<workspace>/work-items`
+- backend provider: `builtin:yoi_local`
+- backend root: transitional `<workspace>/work-items`
 - all role profiles: `inherit`
 - no launch prompt refs
 - workflows:
@@ -276,7 +279,7 @@ Because top-level TUI role launches cannot inherit a parent Profile, configure c
 # .yoi/ticket.config.toml
 
 [backend]
-kind = "local"
+provider = "builtin:yoi_local"
 root = "work-items"
 
 [roles.intake]

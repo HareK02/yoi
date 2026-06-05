@@ -745,7 +745,7 @@ fn default_author() -> String {
 }
 
 fn help_text() -> &'static str {
-    "yoi ticket\n\nUsage:\n  yoi ticket create --title <title> [--slug <slug>] [--kind <kind>] [--priority P2] [--label a,b]\n  yoi ticket list [--status open|pending|closed|all]\n  yoi ticket show <id-or-slug>\n  yoi ticket comment <id-or-slug> [--role comment|plan|decision|implementation_report] (--file <path>|--message <text>)\n  yoi ticket review <id-or-slug> (--approve|--request-changes) (--file <path>|--message <text>)\n  yoi ticket status <id-or-slug> <open|pending|closed>\n  yoi ticket close <id-or-slug> (--resolution <text>|--file <path>)\n  yoi ticket doctor\n\nOptions:\n  -h, --help    Print help\n\nBackend:\n  Uses the workspace Ticket config at .yoi/ticket.config.toml when present.\n  Without config, the local backend root is <cwd>/work-items.\n"
+    "yoi ticket\n\nUsage:\n  yoi ticket create --title <title> [--slug <slug>] [--kind <kind>] [--priority P2] [--label a,b]\n  yoi ticket list [--status open|pending|closed|all]\n  yoi ticket show <id-or-slug>\n  yoi ticket comment <id-or-slug> [--role comment|plan|decision|implementation_report] (--file <path>|--message <text>)\n  yoi ticket review <id-or-slug> (--approve|--request-changes) (--file <path>|--message <text>)\n  yoi ticket status <id-or-slug> <open|pending|closed>\n  yoi ticket close <id-or-slug> (--resolution <text>|--file <path>)\n  yoi ticket doctor\n\nOptions:\n  -h, --help    Print help\n\nBackend:\n  Uses the workspace Ticket config at .yoi/ticket.config.toml when present.\n  Supported provider: builtin:yoi_local.\n  Without config, the transitional local backend root is <cwd>/work-items.\n"
 }
 
 #[cfg(test)]
@@ -867,7 +867,7 @@ mod tests {
         fs::create_dir_all(temp.path().join(".yoi")).unwrap();
         fs::write(
             temp.path().join(".yoi/ticket.config.toml"),
-            "[backend]\nroot = \"custom-work-items\"\n",
+            "[backend]\nprovider = \"builtin:yoi_local\"\nroot = \"custom-work-items\"\n",
         )
         .unwrap();
 

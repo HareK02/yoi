@@ -99,23 +99,44 @@ impl TicketConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TicketBackendConfig {
-    pub kind: TicketBackendKind,
+    pub provider: TicketBackendProvider,
     pub root: PathBuf,
 }
 
 impl TicketBackendConfig {
     pub fn default_for_workspace(workspace_root: &Path) -> Self {
         Self {
-            kind: TicketBackendKind::Local,
+            provider: TicketBackendProvider::BuiltinYoiLocal,
             root: workspace_root.join("work-items"),
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TicketBackendKind {
-    Local,
+pub enum TicketBackendProvider {
+    #[serde(rename = "builtin:yoi_local")]
+    BuiltinYoiLocal,
+}
+
+impl TicketBackendProvider {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BuiltinYoiLocal => "builtin:yoi_local",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "builtin:yoi_local" => Some(Self::BuiltinYoiLocal),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for TicketBackendProvider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -387,7 +408,12 @@ impl RawTicketConfig {
             roles.inner.insert(role, raw_role.resolve(role));
         }
         Ok(TicketConfig {
-            backend: self.backend.resolve(workspace_root),
+            backend: self.backend.resolve(workspace_root).map_err(|message| {
+                TicketConfigError::Invalid {
+                    path: path.to_path_buf(),
+                    message,
+                }
+            })?,
             roles,
         })
     }
@@ -397,18 +423,40 @@ impl RawTicketConfig {
 #[serde(deny_unknown_fields)]
 struct RawBackendConfig {
     #[serde(default)]
-    kind: Option<TicketBackendKind>,
+    provider: Option<String>,
+    #[serde(default)]
+    kind: Option<String>,
     #[serde(default)]
     root: Option<PathBuf>,
 }
 
 impl RawBackendConfig {
-    fn resolve(self, workspace_root: &Path) -> TicketBackendConfig {
+    fn resolve(self, workspace_root: &Path) -> Result<TicketBackendConfig, String> {
+        let provider = match (self.provider, self.kind) {
+            (Some(provider), None) => TicketBackendProvider::parse(&provider).ok_or_else(|| {
+                format!(
+                    "unsupported Ticket backend provider `{provider}`; supported provider: `builtin:yoi_local`"
+                )
+            })?,
+            (None, Some(kind)) if kind == "local" => TicketBackendProvider::BuiltinYoiLocal,
+            (None, Some(kind)) => {
+                return Err(format!(
+                    "unsupported legacy Ticket backend kind `{kind}`; use provider = \"builtin:yoi_local\""
+                ));
+            }
+            (None, None) => TicketBackendProvider::BuiltinYoiLocal,
+            (Some(_), Some(_)) => {
+                return Err(
+                    "backend.provider and legacy backend.kind are mutually exclusive; use provider = \"builtin:yoi_local\""
+                        .to_string(),
+                );
+            }
+        };
         let root = self.root.unwrap_or_else(|| PathBuf::from("work-items"));
-        TicketBackendConfig {
-            kind: self.kind.unwrap_or(TicketBackendKind::Local),
+        Ok(TicketBackendConfig {
+            provider,
             root: join_if_relative(workspace_root, &root),
-        }
+        })
     }
 }
 
@@ -458,7 +506,10 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let config = TicketConfig::load_workspace(temp.path()).unwrap();
 
-        assert_eq!(config.backend.kind, TicketBackendKind::Local);
+        assert_eq!(
+            config.backend.provider,
+            TicketBackendProvider::BuiltinYoiLocal
+        );
         assert_eq!(config.backend.root, temp.path().join("work-items"));
         for role in TicketRole::ALL {
             let role_config = config.role(role);
@@ -475,7 +526,7 @@ mod tests {
             temp.path(),
             r#"
 [backend]
-kind = "local"
+provider = "builtin:yoi_local"
 root = "custom-work-items"
 
 [roles.intake]
@@ -506,6 +557,10 @@ workflow = "ticket-orchestrator-routing"
         );
 
         let config = TicketConfig::load_workspace(temp.path()).unwrap();
+        assert_eq!(
+            config.backend.provider,
+            TicketBackendProvider::BuiltinYoiLocal
+        );
         assert_eq!(config.backend.root, temp.path().join("custom-work-items"));
         assert_eq!(
             config.profile_for(TicketRole::Intake).as_str(),
@@ -576,7 +631,47 @@ system_instruction = "$workspace/not-supported"
     }
 
     #[test]
-    fn unsupported_backend_kind_is_rejected() {
+    fn legacy_backend_kind_local_is_transitional_alias() {
+        let temp = TempDir::new().unwrap();
+        write_config(
+            temp.path(),
+            r#"
+[backend]
+kind = "local"
+root = "legacy-work-items"
+"#,
+        );
+
+        let config = TicketConfig::load_workspace(temp.path()).unwrap();
+        assert_eq!(
+            config.backend.provider,
+            TicketBackendProvider::BuiltinYoiLocal
+        );
+        assert_eq!(config.backend_root(), temp.path().join("legacy-work-items"));
+    }
+
+    #[test]
+    fn unsupported_backend_provider_is_rejected() {
+        let temp = TempDir::new().unwrap();
+        write_config(
+            temp.path(),
+            r#"
+[backend]
+provider = "github"
+"#,
+        );
+
+        let error = TicketConfig::load_workspace(temp.path()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported Ticket backend provider `github`")
+        );
+        assert!(error.to_string().contains("builtin:yoi_local"));
+    }
+
+    #[test]
+    fn unsupported_legacy_backend_kind_is_rejected() {
         let temp = TempDir::new().unwrap();
         write_config(
             temp.path(),
@@ -587,8 +682,31 @@ kind = "github"
         );
 
         let error = TicketConfig::load_workspace(temp.path()).unwrap_err();
-        assert!(error.to_string().contains("unknown variant"));
-        assert!(error.to_string().contains("github"));
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported legacy Ticket backend kind `github`")
+        );
+    }
+
+    #[test]
+    fn backend_provider_and_legacy_kind_are_mutually_exclusive() {
+        let temp = TempDir::new().unwrap();
+        write_config(
+            temp.path(),
+            r#"
+[backend]
+provider = "builtin:yoi_local"
+kind = "local"
+"#,
+        );
+
+        let error = TicketConfig::load_workspace(temp.path()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("backend.provider and legacy backend.kind are mutually exclusive")
+        );
     }
 
     #[test]
