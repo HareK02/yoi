@@ -2,12 +2,12 @@
 id: 20260605-203006-yoi-local-ticket-backend-migration
 slug: yoi-local-ticket-backend-migration
 title: Yoi-local Ticket backend migration
-status: open
+status: closed
 kind: task
 priority: P1
 labels: [ticket, backend, migration, cli]
 created_at: 2026-06-05T20:30:06Z
-updated_at: 2026-06-05T20:32:09Z
+updated_at: 2026-06-05T22:13:53Z
 assignee: null
 legacy_ticket: null
 ---
