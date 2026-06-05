@@ -190,3 +190,12 @@ Residual risk is low. The main unverified risk is ordinary integration/build reg
 
 
 ---
+
+<!-- event: close author: hare at: 2026-06-05T00:05:55Z status: closed -->
+
+## Closed
+
+Extracted TaskCreate/TaskUpdate/TaskGet/TaskList into a clean built-in internal feature module at pod::feature::builtin::task with task_tools_feature(task_store). The descriptor declares exactly the four Task tools and no requested host authorities; TaskStore sharing, Task tool metadata/behavior, system-reminder behavior, ToolRegistry installation, and PreToolCall policy remain unchanged. External review approved. Merge validation passed: cargo test -p pod --lib feature::tests --no-fail-fast, cargo test -p pod --lib, cargo test -p llm-worker --lib, cargo fmt --check, cargo check --workspace --all-targets, ./tickets.sh doctor, git diff --check, nix build .#yoi, ./result/bin/yoi pod --help.
+
+
+---
