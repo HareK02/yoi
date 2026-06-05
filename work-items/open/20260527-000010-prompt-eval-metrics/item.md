@@ -155,7 +155,7 @@ Claude Code 版の `tool_uses` を、insomnia では tool 種別ごとの偏り�
 - 評価 event schema が docs または ticket 内で定義されている
 - eval event を memory consolidation / usage metrics / Workflow improvement offer / `model_invokation` 判断へ接続する方針が文書化されている
 - 既存の Workflow 自動生成禁止・history に commit されない context input 禁止・memory consolidation 方針に反していない
-- `/auto-maintain` または `/worktree-workflow` のどちらか 1 件を対象に、構造審査または小規模 evaluator Pod 試走を行い、結果を記録している
+- `ticket-intake-workflow` / `ticket-orchestrator-routing` / `worktree-workflow` のいずれか 1 件を対象に、構造審査または小規模 evaluator Pod 試走を行い、結果を記録している
 
 ## 参照
 
@@ -163,4 +163,4 @@ Claude Code 版の `tool_uses` を、insomnia では tool 種別ごとの偏り�
 - `docs/plan/workflow.md`
 - `docs/plan/memory.md`
 - `tickets/memory-usage-metrics.md`
-- `tickets/auto-maintain-workflow.md`
+- `ticket-intake-workflow.md` / `ticket-orchestrator-routing.md`

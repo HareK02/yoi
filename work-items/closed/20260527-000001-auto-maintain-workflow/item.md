@@ -2,12 +2,12 @@
 id: 20260527-000001-auto-maintain-workflow
 slug: auto-maintain-workflow
 title: 半自動開発運用 Workflow
-status: open
+status: closed
 kind: task
 priority: P2
 labels: [migrated]
 created_at: 2026-05-27T00:00:01Z
-updated_at: 2026-05-27T00:00:01Z
+updated_at: 2026-06-05T15:56:29Z
 assignee: null
 legacy_ticket: tickets/auto-maintain-workflow.md
 ---

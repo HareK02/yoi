@@ -268,5 +268,4 @@ Ticket の body は Markdown/freeform を維持する。すべてを strict sche
 
 - `ticket-preflight-workflow`: needs_preflight が true、または implementation_ready か不安な場合に接続する。
 - `multi-agent-workflow`: Orchestrator が implementation_ready と判断した後に接続する。
-- `auto-maintain`: 候補抽出や maintenance loop から Intake に接続できる。
 - `ticket-orchestrator-routing`: この Workflow が作った Ticket を routing する後続 Workflow。

@@ -8,7 +8,7 @@ requires: []
 
 yoi を yoi で開発する際の、worktree + coder Pod + 外部 reviewer Pod + orchestrator Pod の標準フロー。これは **最上位 Pod が細かい code review を抱えず、下位 orchestrator が実装と外部レビューの loop を完了状態まで運ぶためのフロー** である。
 
-worktree の機械的作成手順は `$user/worktree-workflow`、実装前の要件同期・反証 preflight は `$user/ticket-preflight-workflow`、ticket 候補選定や方針探索の半自動 loop は `$user/auto-maintain` に分ける。
+worktree の機械的作成手順は `$user/worktree-workflow`、ユーザー依頼の Ticket 化は `$user/ticket-intake-workflow`、Ticket の next action 分類は `$user/ticket-orchestrator-routing`、実装前の要件同期・反証 preflight は `$user/ticket-preflight-workflow` に分ける。
 
 この Workflow は、対象 ticket が implementation-ready であることを前提にする。設計境界・仕様・authority boundary が未同期の場合は、worktree 作成や coder Pod 起動の前に `ticket-preflight-workflow` を通す。
 
@@ -297,10 +297,10 @@ Dirty state:
 
 ## この Workflow で扱わないもの
 
-以下は `$user/auto-maintain` または別の設計相談で扱う。
+以下は `$user/ticket-intake-workflow`、`$user/ticket-orchestrator-routing`、または別の設計相談で扱う。
 
-- ticket 候補を見繕うこと。
-- 新規 ticket 作成判断。
-- QA feedback / AI feedback を ticket / report / workflow に落とす判断。
-- 長期 maintainer loop / WorkItemStore / LeaseStore の設計。
+- ユーザー依頼を Ticket 化すること。
+- Ticket の next action を分類すること。
+- QA feedback / AI feedback を Ticket / report / workflow に落とす判断。
+- 長期 maintainer loop / scheduler / LeaseStore の設計。
 - reviewer Pod の品質評価を機械的に採点する仕組み。
