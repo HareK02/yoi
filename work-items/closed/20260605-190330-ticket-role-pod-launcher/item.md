@@ -2,12 +2,12 @@
 id: 20260605-190330-ticket-role-pod-launcher
 slug: ticket-role-pod-launcher
 title: Ticket role Pod launcher
-status: open
+status: closed
 kind: task
 priority: P1
 labels: [ticket, pod, role, orchestration]
 created_at: 2026-06-05T19:03:30Z
-updated_at: 2026-06-05T19:32:53Z
+updated_at: 2026-06-05T19:34:06Z
 assignee: null
 legacy_ticket: null
 ---
