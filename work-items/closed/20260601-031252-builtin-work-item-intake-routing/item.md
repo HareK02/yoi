@@ -2,12 +2,12 @@
 id: 20260601-031252-builtin-work-item-intake-routing
 slug: builtin-work-item-intake-routing
 title: Built-in Ticket intake and orchestration routing
-status: open
+status: closed
 kind: task
 priority: P1
 labels: [ticket, intake, orchestration]
 created_at: 2026-06-01T03:12:52Z
-updated_at: 2026-06-05T04:04:42Z
+updated_at: 2026-06-05T06:42:40Z
 assignee: null
 legacy_ticket: null
 ---
