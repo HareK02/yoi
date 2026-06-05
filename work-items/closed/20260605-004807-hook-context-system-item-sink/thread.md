@@ -195,3 +195,12 @@ The remaining risk is in future authority granularity, not this prerequisite imp
 
 
 ---
+
+<!-- event: close author: hare at: 2026-06-05T01:26:06Z status: closed -->
+
+## Closed
+
+Added PreRequestContext and host-mediated SystemItemAppendHandle for pre-request hooks. Hook returns remain per-hook-point flow-control actions; the append handle has host-private construction and a narrow task-reminder request surface; queued system items commit through the existing LogEntry::SystemItem / Event::SystemItem path only on successful continue. Existing Task reminder ownership remains unchanged for the follow-up ticket. External review approved. Merge validation passed: cargo test -p pod hook --lib, cargo test -p pod --lib, cargo test -p llm-worker --lib, cargo fmt --check, cargo check --workspace --all-targets, ./tickets.sh doctor, git diff --check, nix build .#yoi, ./result/bin/yoi pod --help.
+
+
+---

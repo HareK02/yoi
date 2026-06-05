@@ -2,12 +2,12 @@
 id: 20260605-004807-hook-context-system-item-sink
 slug: hook-context-system-item-sink
 title: Hook: add context handles for host-mediated SystemItem append
-status: open
+status: closed
 kind: feature
 priority: P1
 labels: [hooks, feature-registry, history, task-reminder]
 created_at: 2026-06-05T00:48:07Z
-updated_at: 2026-06-05T01:25:03Z
+updated_at: 2026-06-05T01:26:06Z
 assignee: null
 legacy_ticket: null
 ---
