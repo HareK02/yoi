@@ -2,12 +2,12 @@
 id: 20260605-210704-workspace-panel-action-model
 slug: workspace-panel-action-model
 title: Workspace panel action model
-status: open
+status: closed
 kind: task
 priority: P1
 labels: [tui, ticket, orchestration, panel]
 created_at: 2026-06-05T21:07:04Z
-updated_at: 2026-06-05T22:35:56Z
+updated_at: 2026-06-05T23:31:28Z
 assignee: null
 legacy_ticket: null
 ---
