@@ -11,6 +11,7 @@ A workflow should define how to coordinate work. It should not become a private 
 Current workflow themes include:
 
 - Intake clarification before materializing user requests as Tickets
+- Orchestrator routing from Tickets to the next workflow/action
 - preflight before delegating uncertain Ticket work
 - worktree setup and cleanup
 - sibling coder/reviewer Pod orchestration
