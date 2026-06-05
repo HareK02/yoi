@@ -1,14 +1,14 @@
 ---
-description: insomnia プロジェクトで child git worktree を作成・管理するための機械的手順。coder Pod に作らせず、orchestrator Pod が main workspace で実行する。
+description: yoi プロジェクトで child git worktree を作成・管理するための機械的手順。coder Pod に作らせず、orchestrator Pod が main workspace で実行する。
 model_invokation: true
 user_invocable: true
 requires: []
 ---
 # Worktree Workflow
 
-insomnia プロジェクトで実装差分を main workspace から分離するため、`./.worktree/<task-name>` に child git worktree を作る。これは **worktree の扱い方だけ** を定める Workflow であり、ticket 選定、coder / reviewer sibling の起動、外部レビュー、merge の運用は `$user/multi-agent-workflow` 側で扱う。
+yoi プロジェクトで実装差分を main workspace から分離するため、`./.worktree/<task-name>` に child git worktree を作る。これは **worktree の扱い方だけ** を定める Workflow であり、ticket 選定、coder / reviewer sibling の起動、外部レビュー、merge の運用は `$user/multi-agent-workflow` 側で扱う。
 
-insomnia では Pod の write scope が排他的に委譲されるため、child worktree に `.insomnia` を置かない。main workspace は orchestration / ticket / docs / memory / workflow 管理の場所として残し、child worktree はコード差分専用の作業面として扱う。
+yoi では Pod の write scope が排他的に委譲されるため、child worktree に `.yoi` を置かない。main workspace は orchestration / ticket / docs / memory / workflow 管理の場所として残し、child worktree はコード差分専用の作業面として扱う。
 
 ## 適用範囲
 
@@ -25,7 +25,7 @@ insomnia では Pod の write scope が排他的に委譲されるため、child
 - 複数 ticket を下位 orchestrator に任せる場合も、実装差分は ticket / bounded task ごとに worktree を分ける。
 - worktree path は `./.worktree/<task-name>`。
 - branch 名は原則 `<task-name>` と同じ kebab-case。
-- child worktree には `.insomnia` を出さない。
+- child worktree には `.yoi` を出さない。
 - child worktree は実装差分用。`TODO.md` / `tickets/` / `docs/report/` / workflow / memory は原則 main workspace 側で扱う。
 - push はしない。
 
@@ -52,15 +52,15 @@ git worktree add .worktree/<task-name> -b <task-name>
 git -C .worktree/<task-name> sparse-checkout init --no-cone
 git -C .worktree/<task-name> sparse-checkout set --no-cone \
   '/*' \
-  '!/.insomnia/' \
-  '!/.insomnia/**'
+  '!/.yoi/' \
+  '!/.yoi/**'
 ```
 
 確認する。
 
 ```bash
 git -C .worktree/<task-name> status --short --branch
-test ! -e .worktree/<task-name>/.insomnia
+test ! -e .worktree/<task-name>/.yoi
 ```
 
 失敗した場合は、worktree / branch / lock の状態を確認し、勝手に cleanup せず人間へ報告する。
@@ -89,7 +89,7 @@ reviewer は原則 write scope を持たない。review artifact を書かせる
 
 ## child worktree 内の禁止事項
 
-- `.insomnia` を作らない / コピーしない。
+- `.yoi` を作らない / コピーしない。
 - main workspace の `TODO.md` / `tickets/` / `docs/report/` を編集しない。
 - merge / push / branch deletion / worktree remove をしない。
 - scope / permission / history persistence / prompt context 加工原則に関わる設計変更を無断で行わない。

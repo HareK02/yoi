@@ -6,7 +6,7 @@ requires: []
 ---
 # Multi-agent Worktree Workflow
 
-insomnia を insomnia で開発する際の、worktree + coder Pod + 外部 reviewer Pod + orchestrator Pod の標準フロー。これは **最上位 Pod が細かい code review を抱えず、下位 orchestrator が実装と外部レビューの loop を完了状態まで運ぶためのフロー** である。
+yoi を yoi で開発する際の、worktree + coder Pod + 外部 reviewer Pod + orchestrator Pod の標準フロー。これは **最上位 Pod が細かい code review を抱えず、下位 orchestrator が実装と外部レビューの loop を完了状態まで運ぶためのフロー** である。
 
 worktree の機械的作成手順は `$user/worktree-workflow`、実装前の要件同期・反証 preflight は `$user/ticket-preflight-workflow`、ticket 候補選定や方針探索の半自動 loop は `$user/auto-maintain` に分ける。
 
@@ -106,7 +106,7 @@ reviewer には coder の実装方針ではなく、この intent packet と dif
 
 2. worktree 作成
    - `$user/worktree-workflow` に従い `./.worktree/<task-name>` を作る。
-   - `.insomnia` を sparse checkout で除外する。
+   - `.yoi` を sparse checkout で除外する。
 
 3. coder Pod spawn
    - read scope: main workspace 全体。
@@ -116,7 +116,7 @@ reviewer には coder の実装方針ではなく、この intent packet と dif
      - 対象 ticket path
      - intent packet
      - Bash は必ず child worktree に `cd` すること
-     - main workspace の `TODO.md` / `tickets/` / `docs/report/` / `.insomnia` は編集しないこと
+     - main workspace の `TODO.md` / `tickets/` / `docs/report/` / `.yoi` は編集しないこと
      - 範囲外事項
      - 実行すべき build / test / format
      - 完了報告項目

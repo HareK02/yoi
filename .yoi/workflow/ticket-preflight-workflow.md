@@ -6,7 +6,7 @@ requires: []
 ---
 # Ticket Preflight Workflow
 
-insomnia プロジェクトで ticket を実装に渡す前に、要件・前提・設計境界・反証観点を同期するための Workflow。これは **実装前の gate** であり、worktree 作成や coder / reviewer Pod の起動は `multi-agent-workflow` / `worktree-workflow` 側で扱う。
+yoi プロジェクトで ticket を実装に渡す前に、要件・前提・設計境界・反証観点を同期するための Workflow。これは **実装前の gate** であり、worktree 作成や coder / reviewer Pod の起動は `multi-agent-workflow` / `worktree-workflow` 側で扱う。
 
 目的は「ticket があるから実装する」状態を避け、ticket が **実装可能な仕様** なのか、**調査 ticket** なのか、**人間との仕様同期が必要な未決定 ticket** なのかを明確にすることである。
 

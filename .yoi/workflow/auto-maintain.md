@@ -6,7 +6,7 @@ requires: []
 ---
 # Auto Maintain Workflow (WIP)
 
-insomnia を AI maintainer として運用するための半自動 loop。TODO / tickets から「今進められそうな作業」を選ぶだけでなく、課題の発見、設計判断の切り分け、次に人間へ戻すべき問いの整理までを扱う。
+yoi を AI maintainer として運用するための半自動 loop。TODO / tickets から「今進められそうな作業」を選ぶだけでなく、課題の発見、設計判断の切り分け、次に人間へ戻すべき問いの整理までを扱う。
 
 これは unattended 自動開発ではない。実装の並列委譲は `multi-agent-workflow`、worktree の機械的作成は `worktree-workflow` に任せる。本 Workflow はその前段として、何を進めるべきか、何をまだ決めるべきか、下位 orchestrator にどの intent packet を渡すべきかを整理する。
 
