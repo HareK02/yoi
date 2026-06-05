@@ -2,12 +2,12 @@
 id: 20260605-203006-remove-tickets-sh
 slug: remove-tickets-sh
 title: Remove tickets.sh compatibility CLI
-status: open
+status: closed
 kind: task
 priority: P1
 labels: [ticket, cleanup, cli]
 created_at: 2026-06-05T20:30:06Z
-updated_at: 2026-06-05T21:52:55Z
+updated_at: 2026-06-05T22:13:36Z
 assignee: null
 legacy_ticket: null
 ---

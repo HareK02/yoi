@@ -399,7 +399,7 @@ The current LocalTicketBackend stores records under:
   resolution.md   # closed Tickets only
 ```
 
-Backend integrations must preserve this format until an explicit migration changes it. The repository-root `work-items/` directory is a legacy notice only, not a live mutable backend. Human users should prefer TUI role actions or Ticket tools; maintainers may use `yoi ticket ...` when working directly with repository records.
+Backend integrations must preserve this format until an explicit migration changes it. The repository-root `work-items/` path is no longer a live mutable backend; do not recreate it for Ticket records. Human users should prefer TUI role actions or Ticket tools; maintainers may use `yoi ticket ...` when working directly with repository records.
 
 ## Validation
 
