@@ -2350,6 +2350,7 @@ dependencies = [
  "session-store",
  "tempfile",
  "thiserror 2.0.18",
+ "ticket",
  "tokio",
  "toml",
  "tools",
@@ -3621,10 +3622,16 @@ dependencies = [
 name = "ticket"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "chrono",
  "fs4",
+ "llm-worker",
+ "schemars",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]

@@ -29,6 +29,7 @@ include_dir = "0.7.4"
 fs4 = { workspace = true, features = ["sync"] }
 libc = { workspace = true }
 schemars = { workspace = true }
+ticket = { workspace = true }
 memory = { workspace = true }
 workflow-crate = { package = "workflow", path = "../workflow" }
 uuid = { workspace = true, features = ["v7"] }
