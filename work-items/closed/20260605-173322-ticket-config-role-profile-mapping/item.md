@@ -2,12 +2,12 @@
 id: 20260605-173322-ticket-config-role-profile-mapping
 slug: ticket-config-role-profile-mapping
 title: Ticket config role profile mapping
-status: open
+status: closed
 kind: task
 priority: P1
 labels: [ticket, config, profile, orchestration]
 created_at: 2026-06-05T17:33:22Z
-updated_at: 2026-06-05T18:45:41Z
+updated_at: 2026-06-05T18:48:15Z
 assignee: null
 legacy_ticket: null
 ---
