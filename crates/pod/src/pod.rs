@@ -31,8 +31,8 @@ use crate::compact::usage_tracker::UsageTracker;
 use crate::feature::builtin::TaskFeature;
 use crate::feature::{FeatureRegistryBuilder, FeatureRegistryInstallReport};
 use crate::hook::{
-    Hook, HookPreRequestAction, HookRegistryBuilder, OnAbort, OnPromptSubmit, OnTurnEnd,
-    PostToolCall, PreLlmRequest, PreRequestContext, PreToolCall,
+    Hook, HookRegistryBuilder, OnAbort, OnPromptSubmit, OnTurnEnd, PostToolCall, PreLlmRequest,
+    PreToolCall,
 };
 use crate::ipc::alerter::Alerter;
 use crate::ipc::interceptor::PodInterceptor;
@@ -44,6 +44,7 @@ use crate::prompt::system::{SystemPromptContext, SystemPromptError, SystemPrompt
 use crate::runtime::dir;
 use crate::runtime::pod_registry::{self, ScopeAllocationGuard, ScopeLockError};
 use crate::workflow::WorkflowResolveError;
+#[cfg(test)]
 use async_trait::async_trait;
 use protocol::{
     AlertLevel, AlertSource, Event, RewindSummary, RewindTarget, RewindTargetId, Segment,
@@ -210,21 +211,6 @@ where
         if let Err(err) = self.append_entry(entry) {
             warn!(error = %err, "system item commit failed; dropping");
         }
-    }
-}
-
-/// Pre-LLM-request hook that records `history.len()` at send time into a
-/// shared `UsageTracker`. The on_usage callback later pairs this with the
-/// aggregated UsageEvent to produce one `UsageRecord` per LLM call.
-struct UsageTrackingHook {
-    tracker: Arc<UsageTracker>,
-}
-
-#[async_trait]
-impl Hook<PreLlmRequest> for UsageTrackingHook {
-    async fn call(&self, info: &PreRequestContext) -> HookPreRequestAction {
-        self.tracker.note_request(info.item_count);
-        HookPreRequestAction::Continue
     }
 }
 
@@ -1167,13 +1153,6 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     /// occupancy through the `UsageRecord` timeline.
     fn ensure_interceptor_installed(&mut self) {
         if !self.interceptor_installed {
-            // Pre-LLM-request hook: record the item count at send time
-            // so the on_usage callback can pair it with the measured
-            // input_tokens.
-            self.hook_builder.add_pre_llm_request(UsageTrackingHook {
-                tracker: self.usage_tracker.clone(),
-            });
-
             let builder = std::mem::take(&mut self.hook_builder);
             let registry = Arc::new(builder.build());
 
