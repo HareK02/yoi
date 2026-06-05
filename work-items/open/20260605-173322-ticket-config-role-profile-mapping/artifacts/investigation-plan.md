@@ -20,9 +20,8 @@ These are not arbitrary user-defined roles. They are the roles required by the T
 
 Keep the boundary:
 
-- Profile: Pod runtime recipe.
-- Ticket role config: binds a fixed Ticket role to a Profile selector and optional prompt/workflow refs.
-- System instruction: role's durable behavior/boundary.
+- Profile: Pod runtime recipe, including durable role behavior/system instruction when using role-specific profiles.
+- Ticket role config: binds a fixed Ticket role to a Profile selector and optional launch prompt/workflow refs.
 - Launch prompt: first committed task/user message for a concrete Ticket/action.
 - Workflow: procedural flow, later possibly stateful.
 
@@ -64,12 +63,13 @@ Keep the boundary:
   - Parses workflow frontmatter/body records.
   - No stateful workflow runner exists yet.
 
-### Prompt resources / system instruction
+### Prompt resources / launch prompts
 
 - `crates/pod/src/prompt/loader.rs`
   - Resolves instruction-file references like `$yoi/...` and `$user/...` for current startup/instruction use.
 - Prompt catalog/resources are currently separate from workflow state.
 - There is no implemented role-specific launch prompt engine yet.
+- Role-specific durable system behavior should remain in the selected Profile for the MVP; this config should not override Profile system instruction.
 
 ## Important constraint
 
@@ -88,6 +88,7 @@ Possible dependency choices:
 Recommended MVP:
 
 - Add config domain/parser to `crates/ticket`, using lightweight string wrapper types such as `ProfileSelectorRef`, `PromptRef`, and `WorkflowRef` without depending on `manifest` or `pod`.
+- In the MVP, `PromptRef` is for launch prompts only. Do not add role-level `system_instruction` here; the selected Profile owns durable role system behavior.
 - `pod` consumes this config and performs runtime interpretation where needed.
 
 This preserves:
@@ -112,31 +113,26 @@ root = "work-items"
 
 [roles.intake]
 profile = "project:intake"
-system_instruction = "$workspace/ticket/intake/system"
 launch_prompt = "$workspace/ticket/intake/launch"
 workflow = "ticket-intake-workflow"
 
 [roles.orchestrator]
 profile = "project:orchestrator"
-system_instruction = "$workspace/ticket/orchestrator/system"
 launch_prompt = "$workspace/ticket/orchestrator/launch"
 workflow = "ticket-orchestrator-routing"
 
 [roles.coder]
 profile = "inherit"
-system_instruction = "$workspace/ticket/coder/system"
 launch_prompt = "$workspace/ticket/coder/launch"
 workflow = "multi-agent-workflow"
 
 [roles.reviewer]
 profile = "project:reviewer"
-system_instruction = "$workspace/ticket/reviewer/system"
 launch_prompt = "$workspace/ticket/reviewer/launch"
 workflow = "multi-agent-workflow"
 
 [roles.investigator]
 profile = "inherit"
-system_instruction = "$workspace/ticket/investigator/system"
 launch_prompt = "$workspace/ticket/investigator/launch"
 workflow = "ticket-orchestrator-routing"
 ```
@@ -156,7 +152,7 @@ When `.yoi/ticket.config.toml` is missing:
   - coder: `multi-agent-workflow`
   - reviewer: `multi-agent-workflow`
   - investigator: `ticket-orchestrator-routing`
-- system instruction / launch prompt: none
+- launch prompt: none
 
 When a role section exists but omits optional prompt/workflow refs:
 
@@ -197,7 +193,6 @@ pub enum TicketRole {
 
 pub struct TicketRoleProfile {
     pub profile: ProfileSelectorRef,
-    pub system_instruction: Option<PromptRef>,
     pub launch_prompt: Option<PromptRef>,
     pub workflow: WorkflowRef,
 }
@@ -258,8 +253,8 @@ For this repository, adding actual `.yoi/ticket.config.toml` should be considere
 
 - Take TicketRole + Ticket context + role config.
 - Build `SpawnPod` requests.
-- Resolve profile selector using existing Profile registry.
-- Resolve role system instruction separately from initial launch prompt.
+- Resolve selected Profile using existing Profile registry; role-specific system behavior comes from that Profile.
+- Resolve launch prompt separately from the selected Profile's system instruction.
 - Commit launch prompt as the first user/task message, not hidden context.
 - Include workflow ref in launch/task context.
 
@@ -278,7 +273,7 @@ For this repository, adding actual `.yoi/ticket.config.toml` should be considere
 - Persist workflow phase/state.
 - Gate allowed tools by phase.
 - Inject phase prompts only by committing them to history first.
-- Keep SystemInstruction role-stable and task/phase prompts dynamic.
+- Keep Profile/SystemInstruction role-stable and task/phase prompts dynamic.
 
 ## Validation for implementation
 

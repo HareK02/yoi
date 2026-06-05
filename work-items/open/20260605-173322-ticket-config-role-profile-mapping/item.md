@@ -7,7 +7,7 @@ kind: task
 priority: P1
 labels: [ticket, config, profile, orchestration]
 created_at: 2026-06-05T17:33:22Z
-updated_at: 2026-06-05T17:35:08Z
+updated_at: 2026-06-05T18:15:02Z
 assignee: null
 legacy_ticket: null
 ---
@@ -24,7 +24,7 @@ The project should not introduce an arbitrary Role registry. The roles needed he
 - reviewer
 - investigator
 
-Each fixed role needs to select a Profile and, later, separate role-level system instruction, first launch prompt, and workflow binding. This is Ticket orchestration configuration, not a generic Profile replacement.
+Each fixed role needs to select a Profile and, later, a first launch prompt and workflow binding. Role-specific durable behavior should live in the selected Profile, not in this config file. This is Ticket orchestration configuration, not a generic Profile replacement.
 
 ## Goal
 
@@ -46,7 +46,6 @@ The MVP should establish the configuration file, fixed role schema, backend root
   - root path, defaulting to `work-items` relative to the workspace.
 - Support per-role configuration:
   - `profile` selector string;
-  - optional role system instruction prompt reference;
   - optional launch/initial prompt reference;
   - optional workflow slug/reference.
 - Keep `profile` selector syntax aligned with existing SpawnPod/profile selectors where possible:
@@ -57,8 +56,7 @@ The MVP should establish the configuration file, fixed role schema, backend root
   - `project:<name>`
   - unqualified registry selector when accepted by existing profile resolution.
 - Preserve the conceptual separation:
-  - Profile = Pod runtime recipe.
-  - role system instruction = role's durable behavior/boundary.
+  - Profile = Pod runtime recipe, including durable role behavior/system instruction when using role-specific profiles.
   - launch prompt = first committed task/user message for a specific Ticket/action.
   - workflow = procedural flow, later potentially stateful.
 - Validate known fields and reject/diagnose unknown roles or malformed fields.
@@ -67,7 +65,6 @@ The MVP should establish the configuration file, fixed role schema, backend root
 - Update the existing Ticket built-in feature adapter to use the configured backend root when available, falling back to `work-items`.
 - Expose a reusable resolver API for later Pod launch/TUI code:
   - role -> profile selector;
-  - role -> optional system instruction ref;
   - role -> optional launch prompt ref;
   - role -> optional workflow slug;
   - backend root.
@@ -94,31 +91,26 @@ root = "work-items"
 
 [roles.intake]
 profile = "project:intake"
-system_instruction = "$workspace/ticket/intake/system"
 launch_prompt = "$workspace/ticket/intake/launch"
 workflow = "ticket-intake-workflow"
 
 [roles.orchestrator]
 profile = "project:orchestrator"
-system_instruction = "$workspace/ticket/orchestrator/system"
 launch_prompt = "$workspace/ticket/orchestrator/launch"
 workflow = "ticket-orchestrator-routing"
 
 [roles.coder]
 profile = "inherit"
-system_instruction = "$workspace/ticket/coder/system"
 launch_prompt = "$workspace/ticket/coder/launch"
 workflow = "multi-agent-workflow"
 
 [roles.reviewer]
 profile = "project:reviewer"
-system_instruction = "$workspace/ticket/reviewer/system"
 launch_prompt = "$workspace/ticket/reviewer/launch"
 workflow = "multi-agent-workflow"
 
 [roles.investigator]
 profile = "inherit"
-system_instruction = "$workspace/ticket/investigator/system"
 launch_prompt = "$workspace/ticket/investigator/launch"
 workflow = "ticket-orchestrator-routing"
 ```
@@ -138,7 +130,7 @@ When `.yoi/ticket.config.toml` is absent:
   - coder: `multi-agent-workflow`
   - reviewer: `multi-agent-workflow`
   - investigator: `ticket-orchestrator-routing`
-- system instruction / launch prompt refs: none
+- launch prompt refs: none
 
 ## Acceptance criteria
 
@@ -149,13 +141,13 @@ When `.yoi/ticket.config.toml` is absent:
 - Relative backend root resolves against workspace root.
 - Backend root from config is used by the Ticket built-in feature adapter.
 - Role profile selector strings are retained/parsed in a form later usable by role launching code.
-- Optional `system_instruction`, `launch_prompt`, and `workflow` refs are parsed and exposed without trying to run a workflow engine.
+- Optional `launch_prompt` and `workflow` refs are parsed and exposed without trying to run a workflow engine.
 - Tests cover missing config, full config, partial role config, unknown role, relative backend root, and adapter backend-root usage.
 - `cargo test -p ticket` and focused `cargo test -p pod ticket --lib` pass.
 - `cargo check --workspace --all-targets`, `cargo fmt --check`, `git diff --check`, and `./tickets.sh doctor` pass.
 
 ## Follow-up tickets
 
-- `ticket-role-pod-launcher`: construct role-specific `SpawnPod` requests from Ticket context, role config, separated system instruction, launch prompt, workflow binding, and scope policy.
+- `ticket-role-pod-launcher`: construct role-specific `SpawnPod` requests from Ticket context, role config, selected Profile, launch prompt, workflow binding, and scope policy.
 - `tui-ticket-role-actions`: expose fixed Ticket role actions in TUI using the launcher.
 - Later workflow-state engine: persisted workflow phase/state, phase-specific allowed tools, and phase prompts committed to history before model use.

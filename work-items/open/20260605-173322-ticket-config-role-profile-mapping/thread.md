@@ -44,3 +44,27 @@ Plan:
 
 
 ---
+
+<!-- event: decision author: hare at: 2026-06-05T18:15:02Z -->
+
+## Decision
+
+Decision update: remove `system_instruction` from the MVP `.yoi/ticket.config.toml` role schema.
+
+Rationale:
+
+- The selected Profile already owns durable role behavior and system/instruction configuration.
+- Adding `system_instruction` to Ticket role config would create an unclear override/merge boundary with Profile.
+- Ticket role config should bind fixed Ticket roles to Profile selectors, workflow refs, and launch prompts only.
+- Launch prompts remain useful here because they are per-action first committed task/user messages, unlike role-stable system behavior.
+
+Updated MVP role fields:
+
+- `profile`
+- optional `launch_prompt`
+- optional `workflow`
+
+If system-level role overlays are needed later, design them explicitly as a separate prompt/context ticket, likely with an overlay name and clear history/cache semantics. Do not add an implicit system instruction override in this ticket.
+
+
+---
