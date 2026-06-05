@@ -68,7 +68,7 @@ Key docs:
 
 ## 5. Development
 
-This repository dogfoods Yoi to develop Yoi. Work is tracked through `work-items/` and `./tickets.sh`; git history plus Ticket files are the authoritative project record.
+This repository dogfoods Yoi to develop Yoi. Work is tracked through `.yoi/tickets/` and `./tickets.sh`; git history plus Ticket files are the authoritative project record.
 
 Common checks:
 

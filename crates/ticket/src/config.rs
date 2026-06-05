@@ -14,6 +14,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub const TICKET_CONFIG_RELATIVE_PATH: &str = ".yoi/ticket.config.toml";
+/// Workspace-relative default root for the built-in local Ticket backend.
+pub const DEFAULT_TICKET_BACKEND_RELATIVE_PATH: &str = ".yoi/tickets";
 
 #[derive(Debug, Error)]
 pub enum TicketConfigError {
@@ -107,7 +109,7 @@ impl TicketBackendConfig {
     pub fn default_for_workspace(workspace_root: &Path) -> Self {
         Self {
             provider: TicketBackendProvider::BuiltinYoiLocal,
-            root: workspace_root.join("work-items"),
+            root: workspace_root.join(DEFAULT_TICKET_BACKEND_RELATIVE_PATH),
         }
     }
 }
@@ -452,7 +454,9 @@ impl RawBackendConfig {
                 );
             }
         };
-        let root = self.root.unwrap_or_else(|| PathBuf::from("work-items"));
+        let root = self
+            .root
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_TICKET_BACKEND_RELATIVE_PATH));
         Ok(TicketBackendConfig {
             provider,
             root: join_if_relative(workspace_root, &root),
@@ -510,7 +514,10 @@ mod tests {
             config.backend.provider,
             TicketBackendProvider::BuiltinYoiLocal
         );
-        assert_eq!(config.backend.root, temp.path().join("work-items"));
+        assert_eq!(
+            config.backend.root,
+            temp.path().join(DEFAULT_TICKET_BACKEND_RELATIVE_PATH)
+        );
         for role in TicketRole::ALL {
             let role_config = config.role(role);
             assert_eq!(role_config.profile.as_str(), "inherit");
@@ -527,7 +534,7 @@ mod tests {
             r#"
 [backend]
 provider = "builtin:yoi_local"
-root = "custom-work-items"
+root = "custom-tickets"
 
 [roles.intake]
 profile = "project:intake"
@@ -561,7 +568,7 @@ workflow = "ticket-orchestrator-routing"
             config.backend.provider,
             TicketBackendProvider::BuiltinYoiLocal
         );
-        assert_eq!(config.backend.root, temp.path().join("custom-work-items"));
+        assert_eq!(config.backend.root, temp.path().join("custom-tickets"));
         assert_eq!(
             config.profile_for(TicketRole::Intake).as_str(),
             "project:intake"
@@ -638,7 +645,7 @@ system_instruction = "$workspace/not-supported"
             r#"
 [backend]
 kind = "local"
-root = "legacy-work-items"
+root = "legacy-tickets"
 "#,
         );
 
@@ -647,7 +654,7 @@ root = "legacy-work-items"
             config.backend.provider,
             TicketBackendProvider::BuiltinYoiLocal
         );
-        assert_eq!(config.backend_root(), temp.path().join("legacy-work-items"));
+        assert_eq!(config.backend_root(), temp.path().join("legacy-tickets"));
     }
 
     #[test]
@@ -716,12 +723,12 @@ kind = "local"
             temp.path(),
             r#"
 [backend]
-root = "nested/work-items"
+root = "nested/tickets"
 "#,
         );
 
         let config = TicketConfig::load_workspace(temp.path()).unwrap();
-        assert_eq!(config.backend_root(), temp.path().join("nested/work-items"));
+        assert_eq!(config.backend_root(), temp.path().join("nested/tickets"));
     }
 
     #[test]

@@ -41,7 +41,7 @@ pub const TICKET_TOOL_NAMES: [&str; 8] = [
 ];
 
 const CREATE_DESCRIPTION: &str = "Create a Ticket through the configured typed Ticket backend. \
-Inputs mirror the work-items item.md fields; `title` is required, `body` is Markdown, and the \
+Inputs mirror the Ticket `item.md` fields; `title` is required, `body` is Markdown, and the \
 backend assigns the id and writes tickets.sh-compatible files under the configured backend root.";
 const LIST_DESCRIPTION: &str = "List Tickets from the configured typed Ticket backend. Filter by \
 status (`open`, `pending`, `closed`, or `all`) and optionally kind/priority/label. Output is a \
@@ -778,7 +778,7 @@ mod tests {
     use tempfile::TempDir;
 
     fn backend(temp: &TempDir) -> LocalTicketBackend {
-        LocalTicketBackend::new(temp.path().join("work-items"))
+        LocalTicketBackend::new(temp.path().join("tickets"))
     }
 
     fn tool(definition: ToolDefinition) -> Arc<dyn Tool> {

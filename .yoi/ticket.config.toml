@@ -1,0 +1,3 @@
+[backend]
+provider = "builtin:yoi_local"
+root = ".yoi/tickets"

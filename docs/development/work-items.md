@@ -2,7 +2,7 @@
 
 Yoi project work is tracked through Tickets. For normal use, interact with Tickets through the TUI role commands, Ticket tools, and Ticket workflows. Git history plus Ticket files remain the authoritative state-transition record behind those interfaces.
 
-The current local backend stores Ticket files under `work-items/`. That storage detail matters for maintainers and backend compatibility, but it is not the primary user-facing workflow.
+The current local backend stores Ticket files under `.yoi/tickets/`. That storage detail matters for maintainers and backend compatibility, but it is not the primary user-facing workflow.
 
 Do not treat ad-hoc chat summaries, memory records, or Pod notifications as the final source of project state. Notifications are hints to inspect concrete state, not proof of completion.
 
@@ -12,7 +12,7 @@ Do not treat ad-hoc chat summaries, memory records, or Pod notifications as the 
 - `Task`: session-local progress tracking inside a Pod. It is not the project record.
 - `Assignment`: a concrete delegation from an Orchestrator to a coder/reviewer/investigator Pod.
 - `IntentPacket`: the short implementation/review contract derived from a Ticket and handed to an Assignment.
-- `LocalTicketBackend`: the current `work-items/` markdown/thread/artifacts storage backend.
+- `LocalTicketBackend`: the current `.yoi/tickets/` markdown/thread/artifacts storage backend.
 
 A Ticket may represent a feature, bug, cleanup, design decision, investigation, workflow change, release task, or orchestration umbrella. The common requirement is that the closed Ticket explains a completed outcome.
 
@@ -24,7 +24,7 @@ Use the highest-level interface that matches the work:
 - Inside Pods, use typed Ticket tools to create, inspect, comment, review, and close Tickets.
 - For multi-step work, follow the Ticket Intake, Orchestrator Routing, Preflight, and Multi-agent workflows.
 
-The local `work-items/` files and `tickets.sh` compatibility CLI are backend/maintenance surfaces. They are documented later for maintainers, tests, and compatibility work, but normal user instructions should not start there.
+The local `.yoi/tickets/` files and `tickets.sh` compatibility CLI are backend/maintenance surfaces. They are documented later for maintainers, tests, and compatibility work, but normal user instructions should not start there.
 
 ## Ticket tools inside Pods
 
@@ -39,7 +39,7 @@ Pods with the Ticket built-in feature can use typed Ticket tools:
 - `TicketClose`
 - `TicketDoctor`
 
-These tools operate through the typed Ticket backend. They are not arbitrary filesystem write permission to `work-items/`.
+These tools operate through the typed Ticket backend. They are not arbitrary filesystem write permission to `.yoi/tickets/`.
 
 Use them when a Pod needs to materialize or update project records:
 
@@ -59,7 +59,7 @@ MVP shape:
 ```toml
 [backend]
 provider = "builtin:yoi_local"
-root = "work-items"
+root = ".yoi/tickets"
 
 [roles.intake]
 profile = "project:intake"
@@ -103,12 +103,12 @@ This is not an arbitrary role registry. The fixed roles are the roles required b
 
 `workflow` is the workflow the launched role should follow. Workflow state and phase-specific prompt injection are future work; any dynamic prompt content must be committed as history before it affects model context.
 
-`provider = "builtin:yoi_local"` selects Yoi's built-in local Ticket backend. `root = "work-items"` is the active transitional root until the planned storage migration moves records under `.yoi/`. Legacy `kind = "local"` is accepted only as a short transitional alias; new configs should use `provider`.
+`provider = "builtin:yoi_local"` selects Yoi's built-in local Ticket backend. `root = ".yoi/tickets"` is the canonical local storage root for this repository. Legacy `kind = "local"` is accepted only as a short transitional alias; new configs should use `provider`.
 
 If `.yoi/ticket.config.toml` is missing, defaults are:
 
 - backend provider: `builtin:yoi_local`
-- backend root: transitional `<workspace>/work-items`
+- backend root: `<workspace>/.yoi/tickets`
 - all role profiles: `inherit`
 - no launch prompt refs
 - workflows:
@@ -280,7 +280,7 @@ Because top-level TUI role launches cannot inherit a parent Profile, configure c
 
 [backend]
 provider = "builtin:yoi_local"
-root = "work-items"
+root = ".yoi/tickets"
 
 [roles.intake]
 profile = "project:intake"
@@ -374,7 +374,7 @@ Do not store secrets, credentials, private prompt contents, or raw logs containi
 
 ## Backend/maintainer compatibility: local Ticket CLI
 
-`./tickets.sh` is the local-file compatibility and maintainer CLI for the current `work-items/` backend. It is useful for repository maintenance, tests, migration/debugging, and low-level recovery, but it is not the primary user-facing path.
+`./tickets.sh` is the local-file compatibility and maintainer CLI for the current `.yoi/tickets/` backend. It is useful for repository maintenance, tests, migration/debugging, and low-level recovery, but it is not the primary user-facing path.
 
 ```sh
 ./tickets.sh create --title "..." [--slug slug] [--kind task] [--priority P2] [--label a,b]
@@ -390,14 +390,14 @@ Do not store secrets, credentials, private prompt contents, or raw logs containi
 The current LocalTicketBackend stores records under:
 
 ```text
-work-items/{open,pending,closed}/<id>/
+.yoi/tickets/{open,pending,closed}/<id>/
   item.md
   thread.md
   artifacts/
   resolution.md   # closed Tickets only
 ```
 
-Backend integrations must preserve this format until an explicit migration changes it. Human users should prefer TUI role actions or Ticket tools; maintainers may use `tickets.sh` when working directly with repository records.
+Backend integrations must preserve this format until an explicit migration changes it. The repository-root `work-items/` directory is a legacy notice only, not a live mutable backend. Human users should prefer TUI role actions or Ticket tools; maintainers may use `tickets.sh` when working directly with repository records.
 
 ## Validation
 
