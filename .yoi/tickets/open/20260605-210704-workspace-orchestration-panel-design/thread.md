@@ -37,3 +37,18 @@ The design ticket acceptance criteria now explicitly require both the UI interme
 
 
 ---
+
+<!-- event: decision author: hare at: 2026-06-05T22:29:53Z -->
+
+## Decision
+
+Updated the workspace panel design to keep the UI intermediate representation intentionally thin.
+
+Direction recorded:
+- the panel is local-file-first for display: `.yoi/tickets/` is the Ticket authority, with Pod metadata/session state only for related live/restorable status;
+- sockets/client APIs are used at operation boundaries such as spawn/restore/send/attach, not as the panel's primary state source;
+- the intermediate representation is a render/action-dispatch contract (`WorkspacePanelViewModel`, rows, compact Ticket entries), not a second Ticket backend, scheduler, or UI-owned state machine;
+- the panel is not display-only: it is a Ticket-centric workspace cockpit for status, decision points, Intake/Orchestrator actions, and Pod drill-down.
+
+
+---
