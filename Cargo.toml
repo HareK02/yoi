@@ -19,6 +19,7 @@ members = [
     "crates/tools",
     "crates/tui",
     "crates/memory",
+    "crates/ticket",
     "crates/workflow",
 ]
 
@@ -34,6 +35,7 @@ llm-worker-macros = { path = "crates/llm-worker-macros", version = "0.2" }
 manifest = { path = "crates/manifest" }
 lint-common = { path = "crates/lint-common" }
 memory = { path = "crates/memory" }
+ticket = { path = "crates/ticket" }
 pod = { path = "crates/pod" }
 yoi = { path = "crates/yoi" }
 pod-registry = { path = "crates/pod-registry" }
