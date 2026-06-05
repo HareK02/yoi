@@ -1,8 +1,8 @@
 //! In-TUI mirror of the session-lifetime task store.
 //!
 //! This deliberately does NOT depend on the Pod TaskStore. The TUI is a
-//! presentation layer; pulling in `tools` would drag along `llm-worker`
-//! and the whole tool surface. Instead we mirror the small subset we
+//! presentation layer; pulling in `pod` would drag along the runtime
+//! feature surface. Instead we mirror the small subset we
 //! need:
 //!
 //! - `TaskEntry` / `TaskStatus`: shaped to round-trip with Pod Task JSON
@@ -12,9 +12,9 @@
 //!   tool-call arguments and the `[Session TaskStore snapshot]` system
 //!   message that compaction emits.
 //!
-//! The snapshot text format is owned by `tools::render_snapshot`. Since
-//! `tools` itself parses it back on resume, the shape is a stable
-//! contract.
+//! The snapshot text format is owned by the Pod Task feature. The TUI keeps
+//! local compatibility fixtures for the `[Session TaskStore snapshot]` system
+//! message shape emitted during compaction and restored on resume.
 
 use serde::Deserialize;
 
@@ -236,8 +236,8 @@ mod tests {
         assert_eq!(c.active(), 2);
     }
 
-    /// Snapshot text matches the wrapping `Pod::try_pre_run_compact` /
-    /// `tools::render_snapshot` produce: header line, blank, overview
+    /// Snapshot text matches the wrapping `Pod::try_pre_run_compact` and the
+    /// Pod Task feature snapshot fixture shape: header line, blank, overview
     /// line, blank, fenced JSON, trailing prose.
     fn wrap_snapshot(json_body: &str, overview: &str) -> String {
         format!(
