@@ -2,12 +2,12 @@
 id: 20260605-040104-ticket-intake-workflow
 slug: ticket-intake-workflow
 title: Ticket intake workflow
-status: open
+status: closed
 kind: task
 priority: P1
 labels: [ticket, intake, workflow, orchestration]
 created_at: 2026-06-05T04:01:04Z
-updated_at: 2026-06-05T06:10:32Z
+updated_at: 2026-06-05T06:10:56Z
 assignee: null
 legacy_ticket: null
 ---
