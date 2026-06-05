@@ -51,3 +51,22 @@ Implications:
 
 
 ---
+
+<!-- event: decision author: hare at: 2026-06-05T23:08:49Z -->
+
+## Decision
+
+Decision/update from launch-route discussion:
+
+Current route is still `yoi --multi` -> `LaunchMode::Multi` -> `single_pod::run_multi(...)` -> current multi-Pod dashboard. There is no dedicated `yoi panel` command yet.
+
+Target route should be `yoi panel`: open the workspace panel for the current working directory/workspace. The panel should resolve the workspace from cwd using the same project/config/Ticket root conventions as the rest of Yoi, then:
+
+- show Ticket/action-centric mode when `.yoi/tickets` / Ticket config is available or Ticket use is active;
+- fall back to the Pod-centric route (current `--multi` behavior) when the workspace has no Ticket backend/config or no Ticket records;
+- keep current `--multi` as a temporary compatibility alias/shortcut into `yoi panel`'s Pod-centric route during migration, rather than a separate long-term surface.
+
+This keeps a single workspace control surface while preserving the existing multi-Pod affordances for non-Ticket workspaces.
+
+
+---
