@@ -2,12 +2,12 @@
 id: 20260605-040104-ticket-built-in-feature-tools
 slug: ticket-built-in-feature-tools
 title: Ticket built-in feature tools
-status: open
+status: closed
 kind: task
 priority: P1
 labels: [ticket, feature, tool, orchestration]
 created_at: 2026-06-05T04:01:04Z
-updated_at: 2026-06-05T05:58:39Z
+updated_at: 2026-06-05T06:00:22Z
 assignee: null
 legacy_ticket: null
 ---
