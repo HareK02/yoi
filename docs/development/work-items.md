@@ -24,7 +24,7 @@ Use the highest-level interface that matches the work:
 - Inside Pods, use typed Ticket tools to create, inspect, comment, review, and close Tickets.
 - For multi-step work, follow the Ticket Intake, Orchestrator Routing, Preflight, and Multi-agent workflows.
 
-The local `.yoi/tickets/` files and `tickets.sh` compatibility CLI are backend/maintenance surfaces. They are documented later for maintainers, tests, and compatibility work, but normal user instructions should not start there.
+Maintainers can inspect the local `.yoi/tickets/` files directly when debugging storage, but normal user instructions should go through TUI role actions, Ticket tools, or `yoi ticket ...`.
 
 ## Ticket tools inside Pods
 
@@ -200,7 +200,7 @@ Implementation normally happens in a child git worktree created by the Orchestra
 
 Reviewer Pods should be sibling Pods, not children of coder Pods. They should read the Ticket, intent packet, diff, implementation report, and validation evidence.
 
-Review results should be recorded with the `TicketReview` tool. Maintainers working directly with the local backend can use the compatibility CLI documented later.
+Review results should be recorded with the `TicketReview` tool. Maintainers working directly with the local backend can use the `yoi ticket` CLI documented later.
 
 Blockers must be fixed or explicitly escalated before merge-ready submission.
 
@@ -372,20 +372,22 @@ Keep long research dumps out of the item body. Put necessary artifacts under the
 
 Do not store secrets, credentials, private prompt contents, or raw logs containing secrets in Ticket bodies, thread entries, artifacts, diagnostics, or model-visible prompts.
 
-## Backend/maintainer compatibility: local Ticket CLI
+## Backend/maintainer CLI: `yoi ticket`
 
-`./tickets.sh` is the local-file compatibility and maintainer CLI for the current `.yoi/tickets/` backend. It is useful for repository maintenance, tests, migration/debugging, and low-level recovery, but it is not the primary user-facing path.
+The product CLI exposes the typed Ticket backend for repository maintenance and validation. It operates on the configured `.yoi/tickets/` storage and is the preferred command-line surface when editing Tickets outside a Pod.
 
 ```sh
-./tickets.sh create --title "..." [--slug slug] [--kind task] [--priority P2] [--label a,b]
-./tickets.sh list [--status open|pending|closed|all]
-./tickets.sh show <id-or-slug>
-./tickets.sh comment <id-or-slug> [--role comment|plan|decision|implementation_report] [--file path]
-./tickets.sh review <id-or-slug> --approve|--request-changes [--file path]
-./tickets.sh status <id-or-slug> open|pending|closed
-./tickets.sh close <id-or-slug> [--resolution text|--file path]
-./tickets.sh doctor
+yoi ticket create --title "..." [--slug slug] [--kind task] [--priority P2] [--label a,b]
+yoi ticket list [--status open|pending|closed|all]
+yoi ticket show <id-or-slug>
+yoi ticket comment <id-or-slug> [--role comment|plan|decision|implementation_report] [--file path]
+yoi ticket review <id-or-slug> --approve|--request-changes [--file path]
+yoi ticket status <id-or-slug> open|pending
+yoi ticket close <id-or-slug> [--resolution text|--file path]
+yoi ticket doctor
 ```
+
+`yoi ticket status` intentionally does not close Tickets. Closing must use `yoi ticket close` so the backend writes the required `resolution.md` and passes `yoi ticket doctor`.
 
 The current LocalTicketBackend stores records under:
 
@@ -397,14 +399,14 @@ The current LocalTicketBackend stores records under:
   resolution.md   # closed Tickets only
 ```
 
-Backend integrations must preserve this format until an explicit migration changes it. The repository-root `work-items/` directory is a legacy notice only, not a live mutable backend. Human users should prefer TUI role actions or Ticket tools; maintainers may use `tickets.sh` when working directly with repository records.
+Backend integrations must preserve this format until an explicit migration changes it. The repository-root `work-items/` directory is a legacy notice only, not a live mutable backend. Human users should prefer TUI role actions or Ticket tools; maintainers may use `yoi ticket ...` when working directly with repository records.
 
 ## Validation
 
 Run at least:
 
 ```sh
-./tickets.sh doctor
+yoi ticket doctor
 git diff --check
 ```
 

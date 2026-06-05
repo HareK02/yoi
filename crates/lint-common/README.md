@@ -15,8 +15,8 @@ Does not own:
 
 - memory-specific policy (`memory`)
 - workflow-specific policy (`workflow`)
+- Ticket backend policy (`ticket`)
 - product CLI command shape (`yoi`)
-- work item script behavior (`tickets.sh`)
 
 ## Design notes
 

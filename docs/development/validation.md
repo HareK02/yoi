@@ -7,7 +7,7 @@ Validation should match the change. Do not run expensive broad checks just to lo
 Minimum checks:
 
 ```sh
-./tickets.sh doctor
+yoi ticket doctor
 git diff --check
 ```
 
@@ -37,7 +37,7 @@ Avoid repository-wide formatting churn when a validation failure is caused by pr
 Run:
 
 ```sh
-./tickets.sh doctor
+yoi ticket doctor
 ```
 
 Use work item review to verify that the implementation satisfies the ticket, not only that the diff looks plausible.

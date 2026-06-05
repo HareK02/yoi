@@ -2,7 +2,7 @@
 //!
 //! The public domain name is **Ticket**. `LocalTicketBackend` preserves the
 //! repository's current `.yoi/tickets/{open,pending,closed}/<id>/` layout and the
-//! event format used by `tickets.sh` while exposing typed Rust operations.
+//! event/thread format while exposing typed Rust operations.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
@@ -1330,9 +1330,9 @@ fn parse_thread(path: &Path) -> Result<Vec<TicketEvent>> {
 }
 
 fn parse_event_comment(comment: &str) -> BTreeMap<String, String> {
-    // tickets.sh emits unquoted `key: value` pairs separated by spaces. Values
-    // currently do not contain spaces; this parser intentionally preserves the
-    // compatibility shape instead of treating thread.md as strict YAML.
+    // Thread event comments use unquoted `key: value` pairs separated by spaces.
+    // Values currently do not contain spaces; this parser intentionally preserves
+    // the local file format instead of treating thread.md as strict YAML.
     let mut attrs = BTreeMap::new();
     let mut iter = comment.split_whitespace().peekable();
     while let Some(token) = iter.next() {
@@ -1528,31 +1528,6 @@ mod tests {
         LocalTicketBackend::new(dir.path().join("tickets"))
     }
 
-    fn script_path() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../..//tickets.sh")
-    }
-
-    fn run_tickets_sh(work_items: &Path, args: &[&str]) -> std::process::Output {
-        std::process::Command::new(script_path())
-            .current_dir(work_items.parent().unwrap())
-            .env("WORK_ITEMS_DIR", work_items)
-            .args(args)
-            .output()
-            .unwrap()
-    }
-
-    fn assert_script_ok(work_items: &Path, args: &[&str]) -> String {
-        let output = run_tickets_sh(work_items, args);
-        assert!(
-            output.status.success(),
-            "tickets.sh {:?} failed\nstdout:\n{}\nstderr:\n{}",
-            args,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8(output.stdout).unwrap()
-    }
-
     #[test]
     fn parses_item_frontmatter_and_optional_fields() {
         let item = r#"---
@@ -1586,7 +1561,7 @@ action_required: none
     }
 
     #[test]
-    fn create_writes_tickets_sh_compatible_layout() {
+    fn create_writes_local_ticket_layout() {
         let tmp = TempDir::new().unwrap();
         let backend = backend(&tmp);
         let mut input = NewTicket::new("Example Ticket");
@@ -1597,11 +1572,12 @@ action_required: none
         assert!(dir.join("thread.md").exists());
         assert!(dir.join("artifacts/.gitkeep").exists());
         assert_eq!(ticket.slug, "example-ticket");
-        assert_script_ok(&tmp.path().join("tickets"), &["doctor"]);
+        let report = backend.doctor().unwrap();
+        assert!(report.is_ok(), "{:?}", report.diagnostics);
     }
 
     #[test]
-    fn add_event_review_status_and_close_are_script_compatible() {
+    fn add_event_review_status_and_close_preserve_local_layout() {
         let tmp = TempDir::new().unwrap();
         let backend = backend(&tmp);
         let ticket = backend.create(NewTicket::new("Flow Ticket")).unwrap();
@@ -1638,39 +1614,8 @@ action_required: none
         assert!(thread.contains("<!-- event: review"));
         assert!(thread.contains("status: approve"));
         assert!(thread.contains("<!-- event: close"));
-        assert_script_ok(&tmp.path().join("tickets"), &["doctor"]);
-    }
-
-    #[test]
-    fn reads_ticket_created_by_tickets_sh_and_script_mutates_rust_ticket() {
-        let tmp = TempDir::new().unwrap();
-        let work_items = tmp.path().join("tickets");
-        let id = assert_script_ok(
-            &work_items,
-            &[
-                "create",
-                "--title",
-                "Shell Created",
-                "--slug",
-                "shell-created",
-            ],
-        );
-        let id = id.trim();
-        let backend = LocalTicketBackend::new(&work_items);
-        let ticket = backend.show(TicketIdOrSlug::Id(id.to_string())).unwrap();
-        assert_eq!(ticket.meta.slug, "shell-created");
-        let rust_ticket = backend.create(NewTicket::new("Rust Created")).unwrap();
-        assert_script_ok(
-            &work_items,
-            &["comment", &rust_ticket.slug, "--author", "test"],
-        );
-        let shown = backend.show(TicketIdOrSlug::Id(rust_ticket.id)).unwrap();
-        assert!(
-            shown
-                .events
-                .iter()
-                .any(|event| event.kind == TicketEventKind::Comment)
-        );
+        let report = backend.doctor().unwrap();
+        assert!(report.is_ok(), "{:?}", report.diagnostics);
     }
 
     #[test]
