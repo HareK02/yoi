@@ -230,6 +230,7 @@ impl ProfileSelectorRef {
             || value.starts_with('.')
             || value.contains('/')
             || value.ends_with(".lua")
+            || value.ends_with(".nix")
         {
             return Err("profile selector must be `inherit`, `default`, a source-qualified registry selector, or an unqualified registry selector; path selectors are not supported".to_string());
         }
@@ -603,6 +604,25 @@ root = "nested/work-items"
 
         let config = TicketConfig::load_workspace(temp.path()).unwrap();
         assert_eq!(config.backend_root(), temp.path().join("nested/work-items"));
+    }
+
+    #[test]
+    fn nix_profile_selector_refs_are_rejected() {
+        let temp = TempDir::new().unwrap();
+        write_config(
+            temp.path(),
+            r#"
+[roles.coder]
+profile = "legacy.nix"
+"#,
+        );
+
+        let error = TicketConfig::load_workspace(temp.path()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("path selectors are not supported")
+        );
     }
 
     #[test]
