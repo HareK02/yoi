@@ -1177,6 +1177,16 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
                     self.last_run_interrupted = true;
                     return Err(WorkerError::Aborted(reason));
                 }
+                PreRequestAction::YieldWith(items) => {
+                    self.append_history_items(items.clone());
+                    request_context.extend(items);
+                    info!("Yielded by interceptor after pre-request history append");
+                    for cb in &self.turn_end_cbs {
+                        cb(current_turn);
+                    }
+                    self.last_run_interrupted = true;
+                    return Ok(WorkerResult::Yielded);
+                }
                 PreRequestAction::Yield => {
                     info!("Yielded by interceptor");
                     for cb in &self.turn_end_cbs {

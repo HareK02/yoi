@@ -42,6 +42,12 @@ pub enum PreRequestAction {
     /// to: the items are committed before the request so later turns can see
     /// why the worker changed course.
     ContinueWith(Vec<Item>),
+    /// Yield after appending these items to durable worker history.
+    ///
+    /// This is for host-mediated pre-request appends that must be visible to
+    /// usage accounting and compaction checks before the current LLM request is
+    /// allowed to proceed.
+    YieldWith(Vec<Item>),
     /// Cancel with a reason (treated as an error).
     Cancel(String),
     /// Yield control to the caller for external processing.

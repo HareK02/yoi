@@ -28,13 +28,14 @@ use manifest::{
 
 use crate::compact::state::CompactState;
 use crate::compact::usage_tracker::UsageTracker;
+use crate::feature::builtin::TaskFeature;
 use crate::feature::{FeatureRegistryBuilder, FeatureRegistryInstallReport};
 use crate::hook::{
-    Hook, HookPreRequestAction, HookRegistryBuilder, OnAbort, OnPromptSubmit, OnTurnEnd,
-    PostToolCall, PreLlmRequest, PreRequestContext, PreToolCall,
+    Hook, HookRegistryBuilder, OnAbort, OnPromptSubmit, OnTurnEnd, PostToolCall, PreLlmRequest,
+    PreToolCall,
 };
 use crate::ipc::alerter::Alerter;
-use crate::ipc::interceptor::{PodInterceptor, TaskReminderState};
+use crate::ipc::interceptor::PodInterceptor;
 use crate::ipc::notify_buffer::NotifyBuffer;
 use crate::prompt::agents_md::read_agents_md;
 use crate::prompt::catalog::{CatalogError, PromptCatalog};
@@ -43,6 +44,7 @@ use crate::prompt::system::{SystemPromptContext, SystemPromptError, SystemPrompt
 use crate::runtime::dir;
 use crate::runtime::pod_registry::{self, ScopeAllocationGuard, ScopeLockError};
 use crate::workflow::WorkflowResolveError;
+#[cfg(test)]
 use async_trait::async_trait;
 use protocol::{
     AlertLevel, AlertSource, Event, RewindSummary, RewindTarget, RewindTargetId, Segment,
@@ -212,21 +214,6 @@ where
     }
 }
 
-/// Pre-LLM-request hook that records `history.len()` at send time into a
-/// shared `UsageTracker`. The on_usage callback later pairs this with the
-/// aggregated UsageEvent to produce one `UsageRecord` per LLM call.
-struct UsageTrackingHook {
-    tracker: Arc<UsageTracker>,
-}
-
-#[async_trait]
-impl Hook<PreLlmRequest> for UsageTrackingHook {
-    async fn call(&self, info: &PreRequestContext) -> HookPreRequestAction {
-        self.tracker.note_request(info.item_count);
-        HookPreRequestAction::Continue
-    }
-}
-
 /// An independent agent execution unit.
 ///
 /// Holds a [`Worker`] directly and persists session state via
@@ -277,15 +264,10 @@ pub struct Pod<C: LlmClient, St: Store> {
     /// tools so that Pod-owned operations (e.g. compaction) can consult
     /// the recency of touched files.
     tracker: Option<tools::Tracker>,
-    /// Pod-lifetime task store from the builtin `tools` crate. Shared by
-    /// TaskCreate / TaskUpdate / TaskList / TaskGet and preserved across
-    /// compaction by keeping the same handle while the Worker history is
-    /// replaced. Restored Pods reconstruct it by replaying Task* tool calls.
-    task_store: tools::TaskStore,
-    /// Session-lifetime counters for active-Task reminder nudges.
-    /// Restored Pods start these at zero; the only consequence is a delayed
-    /// first reminder after resume.
-    task_reminder_state: Arc<TaskReminderState>,
+    /// Built-in Task feature state shared by Task tools, reminder hooks, and
+    /// the narrow snapshot/restore surface Pod needs for compaction and rewind.
+    /// Store/reminder ownership stays inside the Task feature module.
+    task_feature: TaskFeature,
     /// Parsed system-prompt template awaiting first-turn materialisation.
     /// `Some` until `ensure_system_prompt_materialized` renders it once,
     /// then `None` forever — including after compaction.
@@ -440,8 +422,7 @@ impl<C: LlmClient + Clone + 'static, St: Store + Clone + 'static> Pod<C, St> {
             metrics_tracker: Arc::new(crate::compact::metrics_tracker::MetricsTracker::new()),
             usage_history: self.usage_history.clone(),
             tracker: None,
-            task_store: self.task_store.clone(),
-            task_reminder_state: self.task_reminder_state.clone(),
+            task_feature: self.task_feature.clone(),
             system_prompt_template: None,
             alerter: self.alerter.clone(),
             event_tx: self.event_tx.clone(),
@@ -619,8 +600,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             metrics_tracker: Arc::new(crate::compact::metrics_tracker::MetricsTracker::new()),
             usage_history: Arc::new(Mutex::new(Vec::<UsageRecord>::new())),
             tracker: None,
-            task_store: tools::TaskStore::new(),
-            task_reminder_state: Arc::new(TaskReminderState::new()),
+            task_feature: TaskFeature::new(),
             system_prompt_template: None,
             alerter: None,
             event_tx: None,
@@ -842,7 +822,6 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         let tool_side_effect_warning = suffix_has_tool_side_effects(&entries[truncate_entries..]);
         let state = segment_log::collect_state(&retained);
         let extract_pointer = memory::extract::fold_pointer(&state.extensions);
-        let task_store = tools::TaskStore::from_history(&state.history);
         let summary = RewindSummary {
             truncated_to_entries: truncate_entries,
             discarded_entries: entries.len().saturating_sub(truncate_entries),
@@ -854,6 +833,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         self.segment_state.set_entries_written(truncate_entries);
         self.sink.truncate_silent(truncate_entries);
 
+        self.task_feature.restore_from_history(&state.history);
         self.worker_mut().set_history(state.history);
         self.worker_mut().set_request_config(state.config);
         self.worker_mut().set_turn_count(state.turn_count);
@@ -869,7 +849,6 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             .extract_pointer
             .lock()
             .expect("extract_pointer poisoned") = extract_pointer;
-        self.task_store = task_store;
 
         Ok(RewindAppliedState {
             entries: retained,
@@ -1013,16 +992,9 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         self.tracker = Some(tracker);
     }
 
-    /// Attach the session-scoped TaskStore from the builtin `tools` crate.
-    /// Called by the Controller before registering builtin tools so the Pod
-    /// and Worker share one store.
-    pub fn attach_task_store(&mut self, task_store: tools::TaskStore) {
-        self.task_store = task_store;
-    }
-
-    /// Shared TaskStore handle.
-    pub fn task_store(&self) -> tools::TaskStore {
-        self.task_store.clone()
+    /// Built-in Task feature module and snapshot/restore facade.
+    pub(crate) fn task_feature(&self) -> TaskFeature {
+        self.task_feature.clone()
     }
 
     /// The attached session-scoped file-operation tracker, if any.
@@ -1181,13 +1153,6 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     /// occupancy through the `UsageRecord` timeline.
     fn ensure_interceptor_installed(&mut self) {
         if !self.interceptor_installed {
-            // Pre-LLM-request hook: record the item count at send time
-            // so the on_usage callback can pair it with the measured
-            // input_tokens.
-            self.hook_builder.add_pre_llm_request(UsageTrackingHook {
-                tracker: self.usage_tracker.clone(),
-            });
-
             let builder = std::mem::take(&mut self.hook_builder);
             let registry = Arc::new(builder.build());
 
@@ -1233,8 +1198,6 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 usage_history_handle,
                 self.pending_notifies.clone(),
                 self.pending_attachments.clone(),
-                self.task_store.clone(),
-                self.task_reminder_state.clone(),
                 self.prompts.clone(),
                 self.log_writer.clone(),
             )
@@ -2425,7 +2388,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         // Input text fed to the compact worker. Includes the default
         // references, current TaskStore snapshot, and the (pruned)
         // conversation text.
-        let task_snapshot_text = self.task_store.snapshot_text();
+        let task_snapshot_text = self.task_feature.snapshot_text();
         let summary_input = build_summary_input(
             &items_to_summarise,
             &default_refs,
@@ -2642,7 +2605,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         new_history.push(Item::tool_call("compact-tasklist", "TaskList", "{}"));
         new_history.push(Item::tool_result_with_content(
             "compact-tasklist",
-            tools::task::snapshot_overview(&self.task_store.list()),
+            self.task_feature.snapshot_overview(),
             task_snapshot_text.clone(),
         ));
         let result_estimate = llm_worker::token_counter::total_tokens(&new_history, &[]);
@@ -3768,8 +3731,7 @@ where
             metrics_tracker: Arc::new(crate::compact::metrics_tracker::MetricsTracker::new()),
             usage_history: Arc::new(Mutex::new(Vec::new())),
             tracker: None,
-            task_store: tools::TaskStore::new(),
-            task_reminder_state: Arc::new(TaskReminderState::new()),
+            task_feature: TaskFeature::new(),
             system_prompt_template: common.system_prompt_template,
             alerter: None,
             event_tx: None,
@@ -3847,8 +3809,7 @@ where
             metrics_tracker: Arc::new(crate::compact::metrics_tracker::MetricsTracker::new()),
             usage_history: Arc::new(Mutex::new(Vec::new())),
             tracker: None,
-            task_store: tools::TaskStore::new(),
-            task_reminder_state: Arc::new(TaskReminderState::new()),
+            task_feature: TaskFeature::new(),
             system_prompt_template: common.system_prompt_template,
             alerter: None,
             event_tx: None,
@@ -4007,7 +3968,7 @@ where
         }
 
         let extract_pointer = memory::extract::fold_pointer(&state.extensions);
-        let task_store = tools::TaskStore::from_history(&state.history);
+        let task_feature = TaskFeature::from_history(&state.history);
         let pod_metadata_writer = Some(pod_metadata_writer_for_store(&store));
 
         let mut pod = Self {
@@ -4025,8 +3986,7 @@ where
             metrics_tracker: Arc::new(crate::compact::metrics_tracker::MetricsTracker::new()),
             usage_history: Arc::new(Mutex::new(state.usage_history)),
             tracker: None,
-            task_store,
-            task_reminder_state: Arc::new(TaskReminderState::new()),
+            task_feature,
             // Restore replays the saved system_prompt verbatim — no
             // template re-render on resume.
             system_prompt_template: None,

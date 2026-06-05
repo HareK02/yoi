@@ -1746,18 +1746,27 @@ mod tests {
     }
 
     #[test]
-    fn builtin_internal_task_feature_descriptor_has_exact_tools_and_no_authorities() {
-        let descriptor = builtin::task_tools_feature(tools::TaskStore::new()).descriptor();
+    fn builtin_internal_task_feature_descriptor_has_exact_tools_hooks_and_no_authorities() {
+        let descriptor = builtin::task_tools_feature().descriptor();
         let tool_names: Vec<_> = descriptor
             .tools
             .iter()
             .map(|tool| tool.name.as_str())
             .collect();
 
+        let hook_points: Vec<_> = descriptor
+            .hooks
+            .iter()
+            .map(|hook| hook.point.clone())
+            .collect();
+
         assert_eq!(descriptor.id.as_str(), "builtin:task-tools");
         assert_eq!(descriptor.runtime, FeatureRuntimeKind::Builtin);
         assert!(descriptor.requested_authorities.is_empty());
-        assert!(descriptor.hooks.is_empty());
+        assert_eq!(
+            hook_points,
+            vec![FeatureHookPoint::PreRequest, FeatureHookPoint::PreToolCall]
+        );
         assert!(descriptor.background_tasks.is_empty());
         assert!(descriptor.provides_services.is_empty());
         assert!(descriptor.requires_services.is_empty());
@@ -1769,11 +1778,10 @@ mod tests {
 
     #[test]
     fn builtin_internal_task_feature_installs_declared_tools_without_host_authorities() {
-        let task_store = tools::TaskStore::new();
         let mut hook_builder = HookRegistryBuilder::default();
         let mut pending_tools = Vec::new();
         let mut builder = FeatureRegistryBuilder::new();
-        builder.add_module(builtin::task_tools_feature(task_store));
+        builder.add_module(builtin::task_tools_feature());
         let mut declared_names: Vec<_> = builder.descriptors()[0]
             .tools
             .iter()
@@ -1797,6 +1805,10 @@ mod tests {
         );
         assert!(report.reports[0].skipped.is_empty());
         assert!(report.reports[0].diagnostics.is_empty());
+        assert_eq!(report.reports[0].installed_hooks.len(), 2);
+        let hook_registry = hook_builder.build();
+        assert_eq!(hook_registry.pre_llm_request.len(), 1);
+        assert_eq!(hook_registry.pre_tool_call.len(), 1);
         assert_eq!(declared_names, sorted_installed_names);
         assert_eq!(
             installed_names,
@@ -1810,11 +1822,10 @@ mod tests {
 
     #[test]
     fn builtin_task_feature_installs_through_worker_tool_path() {
-        let task_store = tools::TaskStore::new();
         let mut worker = Worker::new(DummyClient);
         let mut hook_builder = HookRegistryBuilder::default();
         let report = FeatureRegistryBuilder::new()
-            .with_module(builtin::task_tools_feature(task_store))
+            .with_module(builtin::task_tools_feature())
             .install_into_worker(&mut worker, &mut hook_builder);
 
         worker.tool_server_handle().flush_pending();

@@ -6,4 +6,4 @@
 
 pub mod task;
 
-pub use task::task_tools_feature;
+pub use task::{TaskFeature, task_tools_feature};
