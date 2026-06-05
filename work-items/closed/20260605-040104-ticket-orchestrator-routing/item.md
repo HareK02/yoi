@@ -2,12 +2,12 @@
 id: 20260605-040104-ticket-orchestrator-routing
 slug: ticket-orchestrator-routing
 title: Ticket orchestrator routing
-status: open
+status: closed
 kind: task
 priority: P1
 labels: [ticket, orchestrator, routing, orchestration]
 created_at: 2026-06-05T04:01:04Z
-updated_at: 2026-06-05T06:41:34Z
+updated_at: 2026-06-05T06:42:00Z
 assignee: null
 legacy_ticket: null
 ---
