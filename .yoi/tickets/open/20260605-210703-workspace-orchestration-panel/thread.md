@@ -70,3 +70,28 @@ This keeps a single workspace control surface while preserving the existing mult
 
 
 ---
+
+<!-- event: decision author: hare at: 2026-06-05T23:13:39Z -->
+
+## Decision
+
+Decision/update from launch and no-Ticket workspace discussion:
+
+Remove `--multi` as a user-facing launch option rather than keeping it as a compatibility alias.
+
+Target launch model:
+
+- `yoi panel` opens the workspace panel for the current working directory/workspace.
+- The panel resolves Ticket config from the workspace.
+- If `.yoi/ticket.config.toml` / Ticket config is defined and usable, the panel shows Ticket/action-centric workspace UI.
+- If Ticket config is undefined, the panel suppresses Ticket-related UI entirely:
+  - no Ticket/action rows;
+  - no Ticket-specific Pod labels/actions;
+  - no Intake/Orchestrator/Ticket workflow affordances;
+  - no Ticket-related diagnostics unless needed to explain an explicitly requested Ticket action.
+- In that no-Ticket mode, `yoi panel` should provide the same functional surface as the current `--multi` view: Pod discovery/status, selection, attach/open, and direct send where currently supported.
+
+This keeps one panel implementation while avoiding a permanent `--multi` surface or confusing Ticket UI in workspaces that have not opted into Ticket config.
+
+
+---
