@@ -187,7 +187,7 @@ pub(crate) async fn run_resume(
 pub(crate) async fn run_panel(
     runtime_command: PodRuntimeCommand,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut app = multi_pod::load_app().await?;
+    let mut app = multi_pod::load_app(runtime_command.clone()).await?;
     let mut terminal = enter_fullscreen()?;
 
     loop {

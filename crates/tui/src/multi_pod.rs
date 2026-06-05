@@ -2,6 +2,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use client::ticket_role::{TicketRole, TicketRoleLaunchContext};
+use client::{PodRuntimeCommand, SpawnConfig, launch_ticket_role_pod, spawn_pod};
 use crossterm::event::{Event as TermEvent, KeyCode, KeyEvent, KeyModifiers, poll, read};
 use pod_store::FsPodStore;
 use protocol::stream::{JsonLineReader, JsonLineWriter};
@@ -23,8 +25,11 @@ use crate::pod_list::{
     read_stored_pod_infos,
 };
 use crate::workspace_panel::{
-    ActionPriority, NextUserAction, PanelRow, PanelRowKey, WorkspacePanelViewModel,
-    build_workspace_panel,
+    ActionPriority, NextUserAction, OrchestratorLifecyclePlan, OrchestratorPanelState,
+    OrchestratorPanelStatus, OrchestratorPodPresence, PanelRow, PanelRowKey,
+    TicketConfigAvailability, WorkspacePanelViewModel, bounded_panel_diagnostic,
+    build_workspace_panel, decide_orchestrator_lifecycle, orchestrator_pod_presence,
+    ticket_config_availability, workspace_orchestrator_pod_name,
 };
 
 const MAX_ENTRIES: usize = 50;
@@ -78,15 +83,17 @@ pub(crate) struct OpenPodRequest {
     pub(crate) socket_override: Option<PathBuf>,
 }
 
-pub(crate) async fn load_app() -> Result<MultiPodApp, MultiPodError> {
-    MultiPodApp::load(None).await
+pub(crate) async fn load_app(
+    runtime_command: PodRuntimeCommand,
+) -> Result<MultiPodApp, MultiPodError> {
+    MultiPodApp::load(None, runtime_command).await
 }
 
 pub(crate) async fn run(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut MultiPodApp,
 ) -> Result<MultiPodOutcome, MultiPodError> {
-    if app.panel.rows.is_empty() {
+    if app.panel.rows.is_empty() && app.panel.header.diagnostics.is_empty() {
         return Err(MultiPodError::NoPods);
     }
 
@@ -151,7 +158,9 @@ impl PendingReload {
         if self.handle.is_some() {
             return false;
         }
-        self.handle = Some(tokio::spawn(async { load_multi_pod_snapshot(None).await }));
+        self.handle = Some(tokio::spawn(async {
+            load_multi_pod_snapshot(None, OrchestratorLifecycleMode::Observe).await
+        }));
         true
     }
 
@@ -243,8 +252,15 @@ pub(crate) struct MultiPodApp {
 }
 
 impl MultiPodApp {
-    async fn load(selected_name: Option<String>) -> Result<Self, MultiPodError> {
-        let snapshot = load_multi_pod_snapshot(selected_name).await?;
+    async fn load(
+        selected_name: Option<String>,
+        runtime_command: PodRuntimeCommand,
+    ) -> Result<Self, MultiPodError> {
+        let snapshot = load_multi_pod_snapshot(
+            selected_name,
+            OrchestratorLifecycleMode::Ensure { runtime_command },
+        )
+        .await?;
         let mut app = Self {
             list: snapshot.list,
             panel: snapshot.panel,
@@ -258,7 +274,7 @@ impl MultiPodApp {
     }
 
     pub(crate) async fn reload_or_notice(&mut self) {
-        let result = load_multi_pod_snapshot(None).await;
+        let result = load_multi_pod_snapshot(None, OrchestratorLifecycleMode::Observe).await;
         self.apply_reload_result(result);
     }
 
@@ -395,14 +411,32 @@ impl MultiPodApp {
             .is_some_and(|key| visible.iter().any(|visible_key| visible_key == key));
         if !selected_visible {
             let has_action_rows = self.panel.rows.iter().any(|row| row.is_ticket_action());
+            let orchestrator_pod_name = self
+                .panel
+                .header
+                .orchestrator
+                .as_ref()
+                .map(|state| state.pod_name.as_str());
             if !has_action_rows {
                 if let Some(selected_name) = self.list.selected_name.as_ref() {
-                    let key = PanelRowKey::Pod(selected_name.clone());
-                    if visible.iter().any(|visible_key| visible_key == &key) {
-                        self.select_panel_key(key);
-                        return;
+                    if Some(selected_name.as_str()) != orchestrator_pod_name {
+                        let key = PanelRowKey::Pod(selected_name.clone());
+                        if visible.iter().any(|visible_key| visible_key == &key) {
+                            self.select_panel_key(key);
+                            return;
+                        }
                     }
                 }
+                if let Some(key) = visible.iter().find(|key| match key {
+                    PanelRowKey::Pod(name) => Some(name.as_str()) != orchestrator_pod_name,
+                    PanelRowKey::Ticket(_) => true,
+                }) {
+                    self.select_panel_key(key.clone());
+                    return;
+                }
+                self.selected_row = None;
+                self.list.selected_name = None;
+                return;
             }
             self.select_panel_key(visible[0].clone());
         } else if let Some(PanelRowKey::Pod(name)) = self.selected_row.as_ref() {
@@ -591,19 +625,231 @@ struct MultiPodSnapshot {
     panel: WorkspacePanelViewModel,
 }
 
+#[derive(Debug, Clone)]
+enum OrchestratorLifecycleMode {
+    Ensure { runtime_command: PodRuntimeCommand },
+    Observe,
+}
+
 async fn load_multi_pod_snapshot(
     selected_name: Option<String>,
+    lifecycle_mode: OrchestratorLifecycleMode,
 ) -> Result<MultiPodSnapshot, MultiPodError> {
-    let list = load_pod_list(selected_name).await?;
-    let panel = build_workspace_panel(&current_workspace_root(), &list);
+    let workspace_root = current_workspace_root();
+    let mut list = load_pod_list(selected_name.clone(), MAX_ENTRIES).await?;
+    let config = ticket_config_availability(&workspace_root);
+    let orchestrator_pod_name = workspace_orchestrator_pod_name(&workspace_root);
+    let orchestrator_presence = match &config {
+        TicketConfigAvailability::Absent | TicketConfigAvailability::Unusable(_) => None,
+        TicketConfigAvailability::Usable => {
+            Some(load_exact_pod_presence(&orchestrator_pod_name).await?)
+        }
+    };
+    let orchestrator = match lifecycle_mode {
+        OrchestratorLifecycleMode::Ensure { runtime_command } => {
+            ensure_workspace_orchestrator(
+                &workspace_root,
+                config,
+                orchestrator_pod_name,
+                orchestrator_presence,
+                runtime_command,
+            )
+            .await
+        }
+        OrchestratorLifecycleMode::Observe => {
+            observe_workspace_orchestrator(config, orchestrator_pod_name, orchestrator_presence)
+        }
+    };
+    if orchestrator.reload_pods {
+        list = load_pod_list(selected_name, MAX_ENTRIES).await?;
+    }
+    let mut panel = build_workspace_panel(&workspace_root, &list);
+    panel.header.orchestrator = orchestrator.state;
+    panel.header.diagnostics.extend(orchestrator.diagnostics);
     Ok(MultiPodSnapshot { list, panel })
+}
+
+#[derive(Debug, Clone)]
+struct OrchestratorLifecycleReport {
+    state: Option<OrchestratorPanelState>,
+    diagnostics: Vec<String>,
+    reload_pods: bool,
+}
+
+impl OrchestratorLifecycleReport {
+    fn skipped() -> Self {
+        Self {
+            state: None,
+            diagnostics: Vec::new(),
+            reload_pods: false,
+        }
+    }
+
+    fn with_state(state: OrchestratorPanelState) -> Self {
+        Self {
+            state: Some(state),
+            diagnostics: Vec::new(),
+            reload_pods: false,
+        }
+    }
+
+    fn unavailable(pod_name: String, detail: String) -> Self {
+        let detail = bounded_panel_diagnostic(detail);
+        Self {
+            state: Some(OrchestratorPanelState::new(
+                pod_name,
+                OrchestratorPanelStatus::Unavailable,
+                Some(detail.clone()),
+            )),
+            diagnostics: vec![detail],
+            reload_pods: false,
+        }
+    }
+
+    fn mark_reload(mut self) -> Self {
+        self.reload_pods = true;
+        self
+    }
+}
+
+async fn ensure_workspace_orchestrator(
+    workspace_root: &Path,
+    config: TicketConfigAvailability,
+    pod_name: String,
+    presence: Option<OrchestratorPodPresence>,
+    runtime_command: PodRuntimeCommand,
+) -> OrchestratorLifecycleReport {
+    orchestrator_lifecycle(workspace_root, config, pod_name, presence, runtime_command).await
+}
+
+fn observe_workspace_orchestrator(
+    config: TicketConfigAvailability,
+    pod_name: String,
+    presence: Option<OrchestratorPodPresence>,
+) -> OrchestratorLifecycleReport {
+    if matches!(config, TicketConfigAvailability::Absent) {
+        return OrchestratorLifecycleReport::skipped();
+    }
+    if let TicketConfigAvailability::Unusable(message) = config {
+        return OrchestratorLifecycleReport::unavailable(
+            pod_name,
+            format!("Ticket config is unusable; workspace Orchestrator not observed: {message}"),
+        );
+    }
+    match presence.unwrap_or(OrchestratorPodPresence::Missing) {
+        OrchestratorPodPresence::Live => OrchestratorLifecycleReport::with_state(
+            OrchestratorPanelState::new(pod_name, OrchestratorPanelStatus::Live, None),
+        ),
+        OrchestratorPodPresence::Restorable => OrchestratorLifecycleReport::with_state(
+            OrchestratorPanelState::new(pod_name, OrchestratorPanelStatus::Stopped, None),
+        ),
+        OrchestratorPodPresence::Missing => OrchestratorLifecycleReport::with_state(
+            OrchestratorPanelState::new(pod_name, OrchestratorPanelStatus::Missing, None),
+        ),
+        OrchestratorPodPresence::Unavailable(message) => {
+            OrchestratorLifecycleReport::unavailable(pod_name, message)
+        }
+    }
+}
+
+async fn orchestrator_lifecycle(
+    workspace_root: &Path,
+    config: TicketConfigAvailability,
+    pod_name: String,
+    presence: Option<OrchestratorPodPresence>,
+    runtime_command: PodRuntimeCommand,
+) -> OrchestratorLifecycleReport {
+    if matches!(config, TicketConfigAvailability::Absent) {
+        return OrchestratorLifecycleReport::skipped();
+    }
+    let presence = presence.unwrap_or(OrchestratorPodPresence::Missing);
+    match decide_orchestrator_lifecycle(&config, &presence) {
+        OrchestratorLifecyclePlan::SkipNoTicketConfig => OrchestratorLifecycleReport::skipped(),
+        OrchestratorLifecyclePlan::ReportLive => OrchestratorLifecycleReport::with_state(
+            OrchestratorPanelState::new(pod_name, OrchestratorPanelStatus::Live, None),
+        ),
+        OrchestratorLifecyclePlan::Restore => {
+            match restore_orchestrator_pod(workspace_root, &pod_name, runtime_command.clone()).await
+            {
+                Ok(()) => OrchestratorLifecycleReport::with_state(OrchestratorPanelState::new(
+                    pod_name,
+                    OrchestratorPanelStatus::Restored,
+                    Some("restored existing Pod state".to_string()),
+                ))
+                .mark_reload(),
+                Err(error) => OrchestratorLifecycleReport::unavailable(
+                    pod_name,
+                    format!("could not restore workspace Orchestrator: {error}"),
+                ),
+            }
+        }
+        OrchestratorLifecyclePlan::Spawn => {
+            match spawn_orchestrator_pod(workspace_root, &pod_name, runtime_command).await {
+                Ok(profile) => {
+                    OrchestratorLifecycleReport::with_state(OrchestratorPanelState::new(
+                        pod_name,
+                        OrchestratorPanelStatus::Spawned,
+                        Some(format!("launched with profile {profile}")),
+                    ))
+                    .mark_reload()
+                }
+                Err(error) => OrchestratorLifecycleReport::unavailable(
+                    pod_name,
+                    format!("could not spawn workspace Orchestrator: {error}"),
+                ),
+            }
+        }
+        OrchestratorLifecyclePlan::Unavailable(message) => {
+            OrchestratorLifecycleReport::unavailable(pod_name, message)
+        }
+    }
+}
+
+async fn restore_orchestrator_pod(
+    workspace_root: &Path,
+    pod_name: &str,
+    runtime_command: PodRuntimeCommand,
+) -> Result<(), client::SpawnError> {
+    let config = SpawnConfig {
+        runtime_command,
+        pod_name: pod_name.to_string(),
+        profile: None,
+        cwd: workspace_root.to_path_buf(),
+        resume_from: None,
+        resume_by_pod_name: true,
+    };
+    spawn_pod(config, |_| {}).await.map(|_| ())
+}
+
+async fn spawn_orchestrator_pod(
+    workspace_root: &Path,
+    pod_name: &str,
+    runtime_command: PodRuntimeCommand,
+) -> Result<String, client::TicketRoleLaunchError> {
+    let mut context =
+        TicketRoleLaunchContext::new(workspace_root.to_path_buf(), TicketRole::Orchestrator);
+    context.pod_name = Some(pod_name.to_string());
+    context.user_instruction = Some(
+        "Workspace panel opened for this Ticket-enabled workspace. Coordinate Ticket routing and wait for explicit follow-up before spawning role Pods."
+            .to_string(),
+    );
+    let result = launch_ticket_role_pod(context, runtime_command, |_| {}).await?;
+    Ok(result.plan.profile)
 }
 
 fn current_workspace_root() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
-async fn load_pod_list(selected_name: Option<String>) -> Result<PodList, MultiPodError> {
+async fn load_exact_pod_presence(pod_name: &str) -> Result<OrchestratorPodPresence, MultiPodError> {
+    let list = load_pod_list(Some(pod_name.to_string()), usize::MAX).await?;
+    Ok(orchestrator_pod_presence(pod_name, &list))
+}
+
+async fn load_pod_list(
+    selected_name: Option<String>,
+    max_entries: usize,
+) -> Result<PodList, MultiPodError> {
     let store_dir = default_store_dir()?;
     let store = FsStore::new(&store_dir)?;
     let pod_store = FsPodStore::new(default_pod_store_dir()?).map_err(io::Error::other)?;
@@ -616,7 +862,7 @@ async fn load_pod_list(selected_name: Option<String>) -> Result<PodList, MultiPo
         stored,
         live,
         selected_name,
-        MAX_ENTRIES,
+        max_entries,
     ))
 }
 
@@ -961,7 +1207,7 @@ fn draw(frame: &mut Frame<'_>, app: &mut MultiPodApp) {
         .apply_cursor_viewport(&mut input_render, input_height);
     let layout = multi_pod_layout(area, input_height);
 
-    draw_title(frame, layout.title);
+    draw_title(frame, app, layout.title);
     draw_list(frame, app, layout.list);
     draw_separator(frame, layout.boundary);
     draw_target_status(frame, app, layout.target_status);
@@ -975,20 +1221,42 @@ fn input_area_height(render: &crate::input::InputRender, terminal_height: u16) -
     needed.clamp(1, cap)
 }
 
-fn draw_title(frame: &mut Frame<'_>, area: Rect) {
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                "workspace dashboard",
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                "  Ticket actions are display-only · Enter sends to selected idle Pod · o open/attach · r refresh",
-                Style::default().fg(Color::DarkGray),
-            ),
-        ])),
-        area,
-    );
+fn draw_title(frame: &mut Frame<'_>, app: &MultiPodApp, area: Rect) {
+    let guidance = if app.panel.header.ticket_configured {
+        "  Ticket actions are display-only · Enter sends to selected idle Pod · o open/attach · r refresh"
+    } else {
+        "  Pod-centric view · Enter sends to selected idle Pod · o open/attach · r refresh"
+    };
+    let mut spans = vec![
+        Span::styled(
+            "workspace dashboard",
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(guidance, Style::default().fg(Color::DarkGray)),
+    ];
+    if let Some(orchestrator) = &app.panel.header.orchestrator {
+        spans.push(Span::styled(
+            " · orchestrator ",
+            Style::default().fg(Color::DarkGray),
+        ));
+        spans.push(Span::styled(
+            orchestrator.status.label(),
+            orchestrator_status_style(orchestrator.status),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn orchestrator_status_style(status: OrchestratorPanelStatus) -> Style {
+    match status {
+        OrchestratorPanelStatus::Live
+        | OrchestratorPanelStatus::Restored
+        | OrchestratorPanelStatus::Spawned => Style::default().fg(Color::Green),
+        OrchestratorPanelStatus::Stopped | OrchestratorPanelStatus::Missing => {
+            Style::default().fg(Color::Yellow)
+        }
+        OrchestratorPanelStatus::Unavailable => Style::default().fg(Color::Red),
+    }
 }
 
 fn draw_list(frame: &mut Frame<'_>, app: &MultiPodApp, area: Rect) {
@@ -1002,6 +1270,7 @@ fn draw_list(frame: &mut Frame<'_>, app: &MultiPodApp, area: Rect) {
 fn list_lines(app: &MultiPodApp, width: u16, height: u16) -> Vec<Line<'static>> {
     let sections = sectioned_entries(&app.list);
     let selected = app.selected_row.as_ref();
+    let diagnostic_lines = panel_diagnostic_lines(&app.panel, width);
     let action_lines = panel_action_lines(&app.panel, selected, width);
     let live_lines = sections
         .iter()
@@ -1015,20 +1284,40 @@ fn list_lines(app: &MultiPodApp, width: u16, height: u16) -> Vec<Line<'static>> 
         .unwrap_or_default();
 
     let available = height as usize;
-    let action_len = action_lines.len().min(available);
-    let remaining_after_actions = available.saturating_sub(action_len);
+    let diagnostic_len = diagnostic_lines.len().min(available);
+    let remaining_after_diagnostics = available.saturating_sub(diagnostic_len);
+    let action_len = action_lines.len().min(remaining_after_diagnostics);
+    let remaining_after_actions = remaining_after_diagnostics.saturating_sub(action_len);
     let closed_len = closed_lines.len().min(remaining_after_actions);
     let live_len = live_lines
         .len()
         .min(remaining_after_actions.saturating_sub(closed_len));
-    let spacer_len = available.saturating_sub(action_len + live_len + closed_len);
+    let spacer_len = available.saturating_sub(diagnostic_len + action_len + live_len + closed_len);
 
     let mut lines = Vec::with_capacity(available);
+    lines.extend(diagnostic_lines.into_iter().take(diagnostic_len));
     lines.extend(action_lines.into_iter().take(action_len));
     lines.extend(live_lines.into_iter().take(live_len));
     lines.extend(std::iter::repeat_with(|| Line::from(Span::raw(""))).take(spacer_len));
     lines.extend(closed_lines.into_iter().take(closed_len));
     lines
+}
+
+fn panel_diagnostic_lines(panel: &WorkspacePanelViewModel, width: u16) -> Vec<Line<'static>> {
+    panel
+        .header
+        .diagnostics
+        .iter()
+        .map(|diagnostic| {
+            Line::from(vec![
+                Span::styled("⚠ ", Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    truncate_with_ellipsis(diagnostic, width.saturating_sub(2) as usize),
+                    Style::default().fg(Color::Yellow),
+                ),
+            ])
+        })
+        .collect()
 }
 
 fn panel_action_lines(
@@ -1671,6 +1960,77 @@ mod tests {
         assert_eq!(app.list.selected_entry().unwrap().name, "closed-2");
         app.select_next();
         assert_eq!(app.list.selected_entry().unwrap().name, "closed-2");
+    }
+
+    #[test]
+    fn multi_selection_does_not_default_to_orchestrator_only_row() {
+        let list = PodList::from_sources(
+            PodVisibilitySource::ResumePicker,
+            vec![],
+            vec![live_info("test-orchestrator", PodStatus::Idle)],
+            None,
+            10,
+        );
+        let mut panel = WorkspacePanelViewModel::empty(Path::new("test"));
+        panel.header.orchestrator = Some(OrchestratorPanelState::new(
+            "test-orchestrator",
+            OrchestratorPanelStatus::Live,
+            None,
+        ));
+        let app = app_with_panel(list, panel);
+
+        assert!(app.selected_row.is_none());
+        assert!(app.list.selected_name.is_none());
+        assert_eq!(app.selected_send_eligibility(), SendEligibility::Disabled);
+    }
+
+    #[test]
+    fn multi_selection_prefers_non_orchestrator_pod_by_default() {
+        let list = PodList::from_sources(
+            PodVisibilitySource::ResumePicker,
+            vec![],
+            vec![
+                live_info_with_updated_at("test-orchestrator", PodStatus::Idle, 80),
+                live_info_with_updated_at("worker", PodStatus::Idle, 70),
+            ],
+            None,
+            10,
+        );
+        let mut panel = WorkspacePanelViewModel::empty(Path::new("test"));
+        panel.header.orchestrator = Some(OrchestratorPanelState::new(
+            "test-orchestrator",
+            OrchestratorPanelStatus::Live,
+            None,
+        ));
+        let app = app_with_panel(list, panel);
+
+        assert_eq!(app.list.selected_entry().unwrap().name, "worker");
+    }
+
+    #[test]
+    fn multi_list_renders_workspace_diagnostics_before_rows() {
+        let mut panel = WorkspacePanelViewModel::empty(Path::new("test"));
+        panel
+            .header
+            .diagnostics
+            .push("Ticket config is unusable".to_string());
+        let app = app_with_panel(
+            PodList::from_sources(
+                PodVisibilitySource::ResumePicker,
+                vec![],
+                vec![live_info("idle", PodStatus::Idle)],
+                None,
+                10,
+            ),
+            panel,
+        );
+        let lines = list_lines(&app, 80, 4)
+            .into_iter()
+            .map(|line| plain_line(&line))
+            .collect::<Vec<_>>();
+
+        assert!(lines[0].contains("Ticket config is unusable"));
+        assert!(lines.iter().any(|line| line.contains("idle")));
     }
 
     #[test]

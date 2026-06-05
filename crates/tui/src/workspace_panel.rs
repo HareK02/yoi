@@ -26,6 +26,8 @@ impl WorkspacePanelViewModel {
                     .to_string(),
                 ticket_root: workspace_root
                     .join(ticket::config::DEFAULT_TICKET_BACKEND_RELATIVE_PATH),
+                ticket_configured: false,
+                orchestrator: None,
                 diagnostics: Vec::new(),
             },
             rows: Vec::new(),
@@ -41,7 +43,53 @@ impl WorkspacePanelViewModel {
 pub(crate) struct WorkspacePanelHeader {
     pub(crate) workspace_label: String,
     pub(crate) ticket_root: PathBuf,
+    pub(crate) ticket_configured: bool,
+    pub(crate) orchestrator: Option<OrchestratorPanelState>,
     pub(crate) diagnostics: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OrchestratorPanelState {
+    pub(crate) pod_name: String,
+    pub(crate) status: OrchestratorPanelStatus,
+    pub(crate) detail: Option<String>,
+}
+
+impl OrchestratorPanelState {
+    pub(crate) fn new(
+        pod_name: impl Into<String>,
+        status: OrchestratorPanelStatus,
+        detail: Option<String>,
+    ) -> Self {
+        Self {
+            pod_name: pod_name.into(),
+            status,
+            detail,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OrchestratorPanelStatus {
+    Live,
+    Restored,
+    Spawned,
+    Stopped,
+    Missing,
+    Unavailable,
+}
+
+impl OrchestratorPanelStatus {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Live => "live",
+            Self::Restored => "restored",
+            Self::Spawned => "spawned",
+            Self::Stopped => "stopped/restorable",
+            Self::Missing => "missing",
+            Self::Unavailable => "unavailable",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -185,19 +233,191 @@ impl PanelRow {
     }
 }
 
+const MAX_POD_NAME_CHARS: usize = 80;
+const ORCHESTRATOR_SUFFIX: &str = "-orchestrator";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TicketConfigAvailability {
+    Absent,
+    Usable,
+    Unusable(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OrchestratorPodPresence {
+    Live,
+    Restorable,
+    Missing,
+    Unavailable(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OrchestratorLifecyclePlan {
+    SkipNoTicketConfig,
+    ReportLive,
+    Restore,
+    Spawn,
+    Unavailable(String),
+}
+
+pub(crate) fn workspace_orchestrator_pod_name(workspace_root: &Path) -> String {
+    let seed = workspace_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("workspace");
+    let max_component_chars = MAX_POD_NAME_CHARS.saturating_sub(ORCHESTRATOR_SUFFIX.len());
+    let component = sanitise_pod_name_component(seed, max_component_chars)
+        .filter(|component| !component.is_empty())
+        .unwrap_or_else(|| "workspace".to_string());
+    format!("{component}{ORCHESTRATOR_SUFFIX}")
+}
+
+fn sanitise_pod_name_component(value: &str, max_chars: usize) -> Option<String> {
+    let mut out = String::new();
+    let mut last_was_dash = false;
+    for ch in value.trim().chars() {
+        let mapped = if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.') {
+            ch.to_ascii_lowercase()
+        } else {
+            '-'
+        };
+        if mapped == '-' {
+            if !last_was_dash && !out.is_empty() {
+                out.push(mapped);
+            }
+            last_was_dash = true;
+        } else {
+            out.push(mapped);
+            last_was_dash = false;
+        }
+    }
+    let trimmed = out.trim_matches(|ch| matches!(ch, '-' | '_' | '.'));
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.chars().take(max_chars).collect())
+    }
+}
+
+pub(crate) fn orchestrator_pod_presence(pod_name: &str, pods: &PodList) -> OrchestratorPodPresence {
+    let Some(entry) = pods.entries.iter().find(|entry| entry.name == pod_name) else {
+        return OrchestratorPodPresence::Missing;
+    };
+    if entry.live.as_ref().is_some_and(|live| live.reachable) {
+        return OrchestratorPodPresence::Live;
+    }
+    if entry.actions.can_restore {
+        return OrchestratorPodPresence::Restorable;
+    }
+    let reason = entry
+        .actions
+        .disabled_reason
+        .clone()
+        .or_else(|| {
+            entry
+                .diagnostics
+                .first()
+                .map(|diagnostic| diagnostic.message.clone())
+        })
+        .unwrap_or_else(|| "pod state is not live, restorable, or spawn-safe".to_string());
+    OrchestratorPodPresence::Unavailable(reason)
+}
+
+pub(crate) fn decide_orchestrator_lifecycle(
+    config: &TicketConfigAvailability,
+    presence: &OrchestratorPodPresence,
+) -> OrchestratorLifecyclePlan {
+    match config {
+        TicketConfigAvailability::Absent => OrchestratorLifecyclePlan::SkipNoTicketConfig,
+        TicketConfigAvailability::Unusable(message) => OrchestratorLifecyclePlan::Unavailable(
+            format!("Ticket config is unusable; workspace Orchestrator not started: {message}"),
+        ),
+        TicketConfigAvailability::Usable => match presence {
+            OrchestratorPodPresence::Live => OrchestratorLifecyclePlan::ReportLive,
+            OrchestratorPodPresence::Restorable => OrchestratorLifecyclePlan::Restore,
+            OrchestratorPodPresence::Missing => OrchestratorLifecyclePlan::Spawn,
+            OrchestratorPodPresence::Unavailable(message) => {
+                OrchestratorLifecyclePlan::Unavailable(format!(
+                    "Workspace Orchestrator Pod state is unusable: {message}"
+                ))
+            }
+        },
+    }
+}
+
+pub(crate) fn ticket_config_availability(workspace_root: &Path) -> TicketConfigAvailability {
+    let config_path = workspace_root.join(TICKET_CONFIG_RELATIVE_PATH);
+    match config_path.symlink_metadata() {
+        Ok(metadata) if !metadata.is_file() => TicketConfigAvailability::Unusable(format!(
+            "{} exists but is not a regular file",
+            TICKET_CONFIG_RELATIVE_PATH
+        )),
+        Ok(_) => match TicketConfig::load_workspace(workspace_root) {
+            Ok(_) => TicketConfigAvailability::Usable,
+            Err(error) => TicketConfigAvailability::Unusable(error.to_string()),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            TicketConfigAvailability::Absent
+        }
+        Err(error) => TicketConfigAvailability::Unusable(format!(
+            "could not inspect {}: {error}",
+            TICKET_CONFIG_RELATIVE_PATH
+        )),
+    }
+}
+
+pub(crate) fn bounded_panel_diagnostic(message: impl AsRef<str>) -> String {
+    let collapsed = message
+        .as_ref()
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    excerpt(&collapsed, 180).unwrap_or_else(|| "unknown diagnostic".to_string())
+}
+
 pub(crate) fn build_workspace_panel(
     workspace_root: &Path,
     pods: &PodList,
 ) -> WorkspacePanelViewModel {
     let mut model = WorkspacePanelViewModel::empty(workspace_root);
-    let ticket_config_path = workspace_root.join(TICKET_CONFIG_RELATIVE_PATH);
-    if ticket_config_path.is_file() {
-        if let Ok(config) = TicketConfig::load_workspace(workspace_root) {
-            model.header.ticket_root = config.backend_root().to_path_buf();
-            let backend = LocalTicketBackend::new(config.backend_root().to_path_buf());
-            if let Ok(rows) = build_ticket_rows(&backend, pods) {
-                model.rows.extend(rows);
+    match ticket_config_availability(workspace_root) {
+        TicketConfigAvailability::Absent => {}
+        TicketConfigAvailability::Usable => {
+            model.header.ticket_configured = true;
+            match TicketConfig::load_workspace(workspace_root) {
+                Ok(config) => {
+                    model.header.ticket_root = config.backend_root().to_path_buf();
+                    let backend = LocalTicketBackend::new(config.backend_root().to_path_buf());
+                    match build_ticket_rows(&backend, pods) {
+                        Ok(rows) => model.rows.extend(rows),
+                        Err(error) => {
+                            model
+                                .header
+                                .diagnostics
+                                .push(bounded_panel_diagnostic(format!(
+                                    "Ticket rows unavailable: {error}"
+                                )))
+                        }
+                    }
+                }
+                Err(error) => model
+                    .header
+                    .diagnostics
+                    .push(bounded_panel_diagnostic(format!(
+                        "Ticket config is unusable: {error}"
+                    ))),
             }
+        }
+        TicketConfigAvailability::Unusable(message) => {
+            model.header.ticket_configured = true;
+            model
+                .header
+                .diagnostics
+                .push(bounded_panel_diagnostic(format!(
+                    "Ticket config is unusable: {message}"
+                )));
         }
     }
 
@@ -862,5 +1082,143 @@ mod tests {
         assert_eq!(review.next_action, Some(NextUserAction::Review));
         assert_eq!(close.priority, ActionPriority::Decision);
         assert_eq!(close.next_action, Some(NextUserAction::Close));
+    }
+
+    #[test]
+    fn workspace_orchestrator_pod_name_is_stable_and_safe() {
+        assert_eq!(
+            workspace_orchestrator_pod_name(Path::new("/tmp/Yoi Workspace")),
+            "yoi-workspace-orchestrator"
+        );
+        assert_eq!(
+            workspace_orchestrator_pod_name(Path::new("/tmp/.strange_日本語!!")),
+            "strange-orchestrator"
+        );
+        assert_eq!(
+            workspace_orchestrator_pod_name(Path::new("/tmp/___")),
+            "workspace-orchestrator"
+        );
+        let long = "a".repeat(120);
+        let name = workspace_orchestrator_pod_name(&PathBuf::from(format!("/tmp/{long}")));
+        assert_eq!(name.chars().count(), 80);
+        assert!(name.ends_with("-orchestrator"));
+    }
+
+    #[test]
+    fn orchestrator_lifecycle_decisions_follow_ticket_gate_and_pod_state() {
+        assert_eq!(
+            decide_orchestrator_lifecycle(
+                &TicketConfigAvailability::Absent,
+                &OrchestratorPodPresence::Missing,
+            ),
+            OrchestratorLifecyclePlan::SkipNoTicketConfig
+        );
+        assert!(matches!(
+            decide_orchestrator_lifecycle(
+                &TicketConfigAvailability::Unusable("bad config".to_string()),
+                &OrchestratorPodPresence::Missing,
+            ),
+            OrchestratorLifecyclePlan::Unavailable(message) if message.contains("bad config")
+        ));
+        assert_eq!(
+            decide_orchestrator_lifecycle(
+                &TicketConfigAvailability::Usable,
+                &OrchestratorPodPresence::Live,
+            ),
+            OrchestratorLifecyclePlan::ReportLive
+        );
+        assert_eq!(
+            decide_orchestrator_lifecycle(
+                &TicketConfigAvailability::Usable,
+                &OrchestratorPodPresence::Restorable,
+            ),
+            OrchestratorLifecyclePlan::Restore
+        );
+        assert_eq!(
+            decide_orchestrator_lifecycle(
+                &TicketConfigAvailability::Usable,
+                &OrchestratorPodPresence::Missing,
+            ),
+            OrchestratorLifecyclePlan::Spawn
+        );
+        assert!(matches!(
+            decide_orchestrator_lifecycle(
+                &TicketConfigAvailability::Usable,
+                &OrchestratorPodPresence::Unavailable("corrupt metadata".to_string()),
+            ),
+            OrchestratorLifecyclePlan::Unavailable(message) if message.contains("corrupt metadata")
+        ));
+    }
+
+    #[test]
+    fn existing_non_file_ticket_config_is_unusable_not_absent() {
+        let temp = TempDir::new().unwrap();
+        let config_parent = temp.path().join(".yoi");
+        fs::create_dir_all(&config_parent).unwrap();
+        fs::create_dir(config_parent.join("ticket.config.toml")).unwrap();
+
+        assert!(matches!(
+            ticket_config_availability(temp.path()),
+            TicketConfigAvailability::Unusable(message) if message.contains("not a regular file")
+        ));
+        let model = build_workspace_panel(temp.path(), &empty_pods());
+
+        assert!(model.header.ticket_configured);
+        assert!(model.header.diagnostics.iter().any(|diagnostic| {
+            diagnostic.contains("Ticket config is unusable")
+                && diagnostic.contains("not a regular file")
+        }));
+    }
+
+    #[test]
+    fn orchestrator_presence_can_be_decided_from_untruncated_authority() {
+        let live = (0..60)
+            .map(|index| LivePodInfo {
+                pod_name: format!("pod-{index:02}"),
+                socket_path: PathBuf::from(format!("/tmp/pod-{index:02}.sock")),
+                status: Some(PodStatus::Idle),
+                reachable: true,
+                segment_id: None,
+                summary: PodEntrySummary::default(),
+            })
+            .chain(std::iter::once(LivePodInfo {
+                pod_name: "zz-workspace-orchestrator".to_string(),
+                socket_path: PathBuf::from("/tmp/zz-workspace-orchestrator.sock"),
+                status: Some(PodStatus::Idle),
+                reachable: true,
+                segment_id: None,
+                summary: PodEntrySummary::default(),
+            }))
+            .collect::<Vec<_>>();
+        let visible = PodList::from_sources(
+            crate::pod_list::PodVisibilitySource::ResumePicker,
+            vec![],
+            live.clone(),
+            None,
+            50,
+        );
+        let authority = PodList::from_sources(
+            crate::pod_list::PodVisibilitySource::ResumePicker,
+            vec![],
+            live,
+            None,
+            usize::MAX,
+        );
+
+        assert_eq!(
+            orchestrator_pod_presence("zz-workspace-orchestrator", &visible),
+            OrchestratorPodPresence::Missing
+        );
+        assert_eq!(
+            orchestrator_pod_presence("zz-workspace-orchestrator", &authority),
+            OrchestratorPodPresence::Live
+        );
+        assert_eq!(
+            decide_orchestrator_lifecycle(
+                &TicketConfigAvailability::Usable,
+                &orchestrator_pod_presence("zz-workspace-orchestrator", &authority),
+            ),
+            OrchestratorLifecyclePlan::ReportLive
+        );
     }
 }
