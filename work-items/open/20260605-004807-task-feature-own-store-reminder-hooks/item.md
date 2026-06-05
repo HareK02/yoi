@@ -7,7 +7,7 @@ kind: task
 priority: P1
 labels: [tasks, hooks, feature-registry, history]
 created_at: 2026-06-05T00:48:07Z
-updated_at: 2026-06-05T01:27:27Z
+updated_at: 2026-06-05T02:00:46Z
 assignee: null
 legacy_ticket: null
 ---
