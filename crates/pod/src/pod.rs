@@ -31,7 +31,7 @@ use crate::compact::usage_tracker::UsageTracker;
 use crate::feature::{FeatureRegistryBuilder, FeatureRegistryInstallReport};
 use crate::hook::{
     Hook, HookPreRequestAction, HookRegistryBuilder, OnAbort, OnPromptSubmit, OnTurnEnd,
-    PostToolCall, PreLlmRequest, PreRequestInfo, PreToolCall,
+    PostToolCall, PreLlmRequest, PreRequestContext, PreToolCall,
 };
 use crate::ipc::alerter::Alerter;
 use crate::ipc::interceptor::{PodInterceptor, TaskReminderState};
@@ -221,7 +221,7 @@ struct UsageTrackingHook {
 
 #[async_trait]
 impl Hook<PreLlmRequest> for UsageTrackingHook {
-    async fn call(&self, info: &PreRequestInfo) -> HookPreRequestAction {
+    async fn call(&self, info: &PreRequestContext) -> HookPreRequestAction {
         self.tracker.note_request(info.item_count);
         HookPreRequestAction::Continue
     }

@@ -1,8 +1,10 @@
 //! Pod-layer hook infrastructure
 //!
 //! Hooks are the **public** orchestration extension point. They receive
-//! read-only summary information about each event in the Worker
-//! execution loop and return a safe public control-flow action.
+//! event-specific context values about each event in the Worker execution loop
+//! and return a safe public control-flow action. Contexts may carry narrow
+//! host-created handles for approved side effects; hook return values remain
+//! flow-control decisions only.
 //!
 //! Hooks intentionally cannot mutate the Worker's context, history, tool
 //! call, or tool result. Internal mechanisms that need such access (e.g.
@@ -13,12 +15,16 @@
 //! extension surfaces (scripting, plugins) in the future without
 //! exposing the underlying mutable state.
 
+use std::ops::Deref;
+use std::sync::{Arc, Mutex};
+
 use async_trait::async_trait;
 use llm_worker::interceptor::{
     PostToolAction, PreRequestAction, PreToolAction, PromptAction, TurnEndAction,
 };
 use llm_worker::tool::{ToolOutput, ToolResult};
 use serde_json::Value;
+use session_store::{SystemItem, SystemReminder};
 
 /// Hook-facing prompt-submit action.
 ///
@@ -148,7 +154,42 @@ impl From<HookTurnEndAction> for TurnEndAction {
 }
 
 // =============================================================================
-// Hook input summary types (read-only)
+// Hook context handles
+// =============================================================================
+
+/// Host-created handle for appending approved durable [`SystemItem`] requests.
+///
+/// Hook code can use this handle only when the Pod host includes it in an
+/// event-specific context. The handle queues typed requests; the host drains the
+/// queue, commits each entry through `LogEntry::SystemItem`, and only then makes
+/// the matching system message visible to the model. It deliberately exposes no
+/// raw `llm_worker::Item`, history writer, event sender, `Pod`, `Worker`, or
+/// notification buffer.
+pub struct SystemItemAppendHandle {
+    pending: Arc<Mutex<Vec<SystemItem>>>,
+}
+
+impl SystemItemAppendHandle {
+    pub(crate) fn new(pending: Arc<Mutex<Vec<SystemItem>>>) -> Self {
+        Self { pending }
+    }
+
+    /// Queue a task-inactivity reminder for durable model-visible append.
+    ///
+    /// The body should be the unwrapped reminder text; the host-side
+    /// `SystemReminder` renderer wraps it exactly once in `<system-reminder>`
+    /// tags before commit.
+    pub fn append_task_reminder(&self, body: impl Into<String>) {
+        let item = SystemReminder::task_inactivity(body).into_system_item();
+        self.pending
+            .lock()
+            .expect("system-item append queue poisoned")
+            .push(item);
+    }
+}
+
+// =============================================================================
+// Hook input summary/context types (read-only)
 // =============================================================================
 
 /// Information passed to `OnPromptSubmit` hooks.
@@ -159,7 +200,7 @@ pub struct PromptSubmitInfo {
     pub turn_index: usize,
 }
 
-/// Information passed to `PreLlmRequest` hooks.
+/// Summary information included in `PreLlmRequest` contexts.
 pub struct PreRequestInfo {
     /// Number of items currently in the Worker context.
     pub item_count: usize,
@@ -171,6 +212,41 @@ pub struct PreRequestInfo {
     pub turn_index: usize,
     /// Tool calls already executed in this turn.
     pub tool_calls_this_turn: usize,
+}
+
+/// Context passed to `PreLlmRequest` hooks.
+///
+/// The summary remains read-only. When the host grants durable system-item
+/// append authority for this request, `system_items()` exposes a typed append
+/// handle; otherwise it returns `None` and hooks cannot produce model-visible
+/// additions.
+pub struct PreRequestContext {
+    info: PreRequestInfo,
+    system_items: Option<SystemItemAppendHandle>,
+}
+
+impl PreRequestContext {
+    pub(crate) fn new(info: PreRequestInfo, system_items: Option<SystemItemAppendHandle>) -> Self {
+        Self { info, system_items }
+    }
+
+    /// Read-only request summary.
+    pub fn info(&self) -> &PreRequestInfo {
+        &self.info
+    }
+
+    /// Host-provided durable system-item append handle, when available.
+    pub fn system_items(&self) -> Option<&SystemItemAppendHandle> {
+        self.system_items.as_ref()
+    }
+}
+
+impl Deref for PreRequestContext {
+    type Target = PreRequestInfo;
+
+    fn deref(&self) -> &Self::Target {
+        &self.info
+    }
 }
 
 /// Information passed to `PreToolCall` hooks.
@@ -252,7 +328,7 @@ impl HookEventKind for OnPromptSubmit {
 }
 
 impl HookEventKind for PreLlmRequest {
-    type Input = PreRequestInfo;
+    type Input = PreRequestContext;
     type Output = HookPreRequestAction;
 }
 
@@ -364,6 +440,39 @@ pub struct HookRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn system_item_append_handle_queues_only_approved_task_reminder_items() {
+        let pending = Arc::new(Mutex::new(Vec::new()));
+        let handle = SystemItemAppendHandle::new(Arc::clone(&pending));
+
+        handle.append_task_reminder("remember tasks");
+
+        let queued = pending.lock().expect("pending queue poisoned");
+        assert_eq!(queued.len(), 1);
+        match &queued[0] {
+            SystemItem::TaskReminder { body, .. } => {
+                assert_eq!(body.matches("<system-reminder>").count(), 1);
+                assert!(body.contains("remember tasks"));
+            }
+            other => panic!("unexpected system item: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pre_request_context_exposes_handle_only_when_host_supplies_one() {
+        let info = PreRequestInfo {
+            item_count: 3,
+            estimated_tokens: Some(42),
+            turn_index: 1,
+            tool_calls_this_turn: 2,
+        };
+        let context = PreRequestContext::new(info, None);
+
+        assert_eq!(context.item_count, 3);
+        assert_eq!(context.info().estimated_tokens, Some(42));
+        assert!(context.system_items().is_none());
+    }
 
     #[test]
     fn public_pre_tool_hook_actions_cannot_emit_internal_no_result_skip() {
