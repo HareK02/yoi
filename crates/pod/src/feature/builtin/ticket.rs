@@ -6,7 +6,9 @@
 
 use std::path::{Path, PathBuf};
 
-use ticket::{LocalTicketBackend, tool::TICKET_TOOL_NAMES, tool::ticket_tools};
+use ticket::{
+    LocalTicketBackend, config::TicketConfig, tool::TICKET_TOOL_NAMES, tool::ticket_tools,
+};
 
 use crate::feature::{
     FeatureDescriptor, FeatureDiagnostic, FeatureInstallContext, FeatureInstallError,
@@ -22,17 +24,26 @@ const AUTHORITY_REASON: &str = "Use a configured local Ticket backend root for t
 #[derive(Clone, Debug)]
 pub struct TicketFeature {
     backend_root: PathBuf,
+    config_error: Option<String>,
 }
 
 impl TicketFeature {
     pub fn new(backend_root: impl Into<PathBuf>) -> Self {
         Self {
             backend_root: backend_root.into(),
+            config_error: None,
         }
     }
 
     pub fn for_workspace(workspace: impl AsRef<Path>) -> Self {
-        Self::new(workspace.as_ref().join("work-items"))
+        let workspace = workspace.as_ref();
+        match TicketConfig::load_workspace(workspace) {
+            Ok(config) => Self::new(config.backend.root),
+            Err(error) => Self {
+                backend_root: workspace.join("work-items"),
+                config_error: Some(error.to_string()),
+            },
+        }
     }
 
     pub fn backend_root(&self) -> &Path {
@@ -80,6 +91,14 @@ impl FeatureModule for TicketFeature {
     }
 
     fn install(&self, context: &mut FeatureInstallContext<'_>) -> Result<(), FeatureInstallError> {
+        if let Some(error) = &self.config_error {
+            context
+                .diagnostics()
+                .push(FeatureDiagnostic::warning(format!(
+                    "Ticket tools not registered: {error}"
+                )));
+            return Ok(());
+        }
         let usable_root = match self.usable_backend_root() {
             Ok(root) => root,
             Err(reason) => {
@@ -142,6 +161,12 @@ mod tests {
         std::fs::create_dir_all(root.join("closed")).unwrap();
     }
 
+    fn write_ticket_config(workspace: &Path, content: &str) {
+        let yoi_dir = workspace.join(".yoi");
+        std::fs::create_dir_all(&yoi_dir).unwrap();
+        std::fs::write(yoi_dir.join("ticket.config.toml"), content).unwrap();
+    }
+
     #[test]
     fn descriptor_declares_ticket_tools_and_backend_authority() {
         let temp = TempDir::new().unwrap();
@@ -180,6 +205,59 @@ mod tests {
         assert!(report.reports[0].installed);
         assert_eq!(report.reports[0].installed_tools, TICKET_TOOL_NAMES);
         assert!(report.reports[0].skipped.is_empty());
+    }
+
+    #[test]
+    fn installs_ticket_tools_with_configured_backend_root() {
+        let temp = TempDir::new().unwrap();
+        write_ticket_config(
+            temp.path(),
+            r#"
+[backend]
+root = "tickets"
+
+[roles.coder]
+profile = "project:coder"
+"#,
+        );
+        make_work_items(&temp.path().join("tickets"));
+
+        let feature = ticket_tools_feature(temp.path());
+        assert_eq!(feature.backend_root(), temp.path().join("tickets"));
+
+        let mut pending_tools = Vec::new();
+        let mut hooks = HookRegistryBuilder::default();
+        let report = FeatureRegistryBuilder::new()
+            .with_module(feature)
+            .install_into_pending(&mut pending_tools, &mut hooks);
+
+        assert_eq!(pending_tools.len(), TICKET_TOOL_NAMES.len());
+        assert!(report.reports[0].diagnostics.is_empty());
+    }
+
+    #[test]
+    fn malformed_ticket_config_fails_closed() {
+        let temp = TempDir::new().unwrap();
+        make_work_items(&temp.path().join("work-items"));
+        write_ticket_config(
+            temp.path(),
+            r#"
+[roles.operator]
+profile = "inherit"
+"#,
+        );
+        let mut pending_tools = Vec::new();
+        let mut hooks = HookRegistryBuilder::default();
+        let report = FeatureRegistryBuilder::new()
+            .with_module(ticket_tools_feature(temp.path()))
+            .install_into_pending(&mut pending_tools, &mut hooks);
+
+        assert!(pending_tools.is_empty());
+        assert!(report.reports[0].installed_tools.is_empty());
+        assert_eq!(report.reports[0].diagnostics.len(), 1);
+        let message = &report.reports[0].diagnostics[0].message;
+        assert!(message.contains("Ticket tools not registered"));
+        assert!(message.contains("unknown Ticket role `operator`"));
     }
 
     #[test]
