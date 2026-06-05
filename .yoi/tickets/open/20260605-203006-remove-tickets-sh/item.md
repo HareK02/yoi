@@ -7,7 +7,7 @@ kind: task
 priority: P1
 labels: [ticket, cleanup, cli]
 created_at: 2026-06-05T20:30:06Z
-updated_at: 2026-06-05T20:30:06Z
+updated_at: 2026-06-05T21:52:55Z
 assignee: null
 legacy_ticket: null
 ---
