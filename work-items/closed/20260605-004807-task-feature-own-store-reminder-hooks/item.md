@@ -2,12 +2,12 @@
 id: 20260605-004807-task-feature-own-store-reminder-hooks
 slug: task-feature-own-store-reminder-hooks
 title: Task: move TaskStore and reminders into Task feature
-status: open
+status: closed
 kind: task
 priority: P1
 labels: [tasks, hooks, feature-registry, history]
 created_at: 2026-06-05T00:48:07Z
-updated_at: 2026-06-05T02:23:00Z
+updated_at: 2026-06-05T02:24:23Z
 assignee: null
 legacy_ticket: null
 ---

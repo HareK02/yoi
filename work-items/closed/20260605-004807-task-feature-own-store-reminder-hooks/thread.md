@@ -386,3 +386,12 @@ I did not rerun full workspace tests or `nix build .#yoi` as part of this rerevi
 Residual risk is low for this ticket. The main area to watch is future expansion of `YieldWith(Vec<Item>)`: it should remain an internal worker/interceptor mechanism for preserving already-authorized, host-created history appends across yield/compaction boundaries, not a public raw-history injection mechanism.
 
 ---
+
+<!-- event: close author: hare at: 2026-06-05T02:24:23Z status: closed -->
+
+## Closed
+
+Moved TaskStore and Task reminder state/logic into the built-in Task feature. Task tools share the feature-owned session store; Task feature hooks now record Task tool usage and append TaskReminder via SystemItemAppendHandle. Pod/PodInterceptor no longer own TaskStore/TaskReminderState or special-case Task tool reminder emission. Reminder append accounting was fixed so usage and request-threshold compaction see the post-append context. External review approved. Merge validation passed: cargo test -p pod task_reminder --lib, cargo test -p pod hook --lib, cargo test -p pod --lib, cargo test -p llm-worker --lib, cargo fmt --check, cargo check --workspace --all-targets, ./tickets.sh doctor, git diff --check, nix build .#yoi, ./result/bin/yoi pod --help.
+
+
+---
