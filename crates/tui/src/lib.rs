@@ -15,6 +15,7 @@ mod task;
 mod tool;
 mod ui;
 mod view_mode;
+mod workspace_panel;
 
 use std::io;
 use std::path::PathBuf;
@@ -51,10 +52,8 @@ pub enum LaunchMode {
     /// `yoi --session <UUID>`: skip the picker, go straight to the
     /// resume name dialog with `id` baked in.
     ResumeWithSession(SegmentId),
-    /// `yoi --multi`: open the multi-Pod dashboard. This is intentionally
-    /// separate from `-r`/`--resume`, which keeps its single-Pod picker
-    /// meaning.
-    Multi,
+    /// `yoi panel`: open the workspace panel from the current workspace.
+    Panel,
 }
 
 pub async fn launch(options: LaunchOptions) -> ExitCode {
@@ -85,7 +84,7 @@ pub async fn launch(options: LaunchOptions) -> ExitCode {
         LaunchMode::ResumeWithSession(id) => {
             single_pod::run_spawn(Some(id), None, runtime_command).await
         }
-        LaunchMode::Multi => single_pod::run_multi(runtime_command).await,
+        LaunchMode::Panel => single_pod::run_panel(runtime_command).await,
     };
 
     // Always restore the terminal first so any pending eprintln below

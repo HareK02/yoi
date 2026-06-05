@@ -118,6 +118,12 @@ fn parse_args_slice(args: &[String]) -> Result<Mode, ParseError> {
                 ticket_cli::parse_ticket_args(&args[1..]).map_err(|e| ParseError(e.to_string()))?;
             return Ok(Mode::Ticket(ticket_cli));
         }
+        "panel" => {
+            if args.len() != 1 {
+                return Err(ParseError("yoi panel does not accept arguments".into()));
+            }
+            return Ok(Mode::Tui(LaunchMode::Panel));
+        }
         "keys" => {
             if args.len() != 1 {
                 return Err(ParseError("yoi keys does not accept arguments".into()));
@@ -147,7 +153,6 @@ fn parse_args_slice(args: &[String]) -> Result<Mode, ParseError> {
     let mut pod_name = None;
     let mut socket_override = None;
     let mut profile = None;
-    let mut multi = false;
     let mut positional = None;
 
     let mut i = 0;
@@ -156,10 +161,6 @@ fn parse_args_slice(args: &[String]) -> Result<Mode, ParseError> {
         match arg.as_str() {
             "--resume" | "-r" => {
                 resume = true;
-                i += 1;
-            }
-            "--multi" => {
-                multi = true;
                 i += 1;
             }
             "--session" => {
@@ -256,36 +257,10 @@ fn parse_args_slice(args: &[String]) -> Result<Mode, ParseError> {
             || session.is_some()
             || pod_name.is_some()
             || positional.is_some()
-            || socket_override.is_some()
-            || multi)
+            || socket_override.is_some())
     {
         return Err(ParseError(
             "--profile can only be used for fresh spawn".to_string(),
-        ));
-    }
-    if multi && resume {
-        return Err(ParseError(
-            "--multi and --resume are mutually exclusive".to_string(),
-        ));
-    }
-    if multi && session.is_some() {
-        return Err(ParseError(
-            "--multi and --session are mutually exclusive".to_string(),
-        ));
-    }
-    if multi && pod_name.is_some() {
-        return Err(ParseError(
-            "--multi and --pod are mutually exclusive".to_string(),
-        ));
-    }
-    if multi && positional.is_some() {
-        return Err(ParseError(
-            "--multi cannot be used with a positional Pod name".to_string(),
-        ));
-    }
-    if multi && socket_override.is_some() {
-        return Err(ParseError(
-            "--multi and --socket are mutually exclusive".to_string(),
         ));
     }
     if pod_name.is_some() && session.is_some() {
@@ -314,9 +289,6 @@ fn parse_args_slice(args: &[String]) -> Result<Mode, ParseError> {
         ));
     }
 
-    if multi {
-        return Ok(Mode::Tui(LaunchMode::Multi));
-    }
     let pod_name = pod_name.or(positional);
     if let Some(pod_name) = pod_name {
         return Ok(Mode::Tui(LaunchMode::PodName {
@@ -342,7 +314,7 @@ fn parse_session_id(value: &str) -> Result<SegmentId, ParseError> {
 
 fn print_help() {
     println!(
-        "yoi\n\nUsage:\n  yoi [OPTIONS] [POD_NAME]\n  yoi keys\n  yoi pod [POD_OPTIONS]\n  yoi ticket <COMMAND> [OPTIONS]\n  yoi memory lint [OPTIONS]\n\nOptions:\n  -r, --resume           Open the Pod picker and resume/attach a Pod\n      --multi            Open the multi-Pod dashboard\n      --pod <NAME>       Attach/restore/create a Pod by name\n      --socket <PATH>    Attach to a specific Pod socket with --pod\n      --session <UUID>   Resume a specific session segment\n      --profile <REF>    Start a fresh Pod from a profile\n  -h, --help             Print help\n"
+        "yoi\n\nUsage:\n  yoi [OPTIONS] [POD_NAME]\n  yoi panel\n  yoi keys\n  yoi pod [POD_OPTIONS]\n  yoi ticket <COMMAND> [OPTIONS]\n  yoi memory lint [OPTIONS]\n\nOptions:\n  -r, --resume           Open the Pod picker and resume/attach a Pod\n      --pod <NAME>       Attach/restore/create a Pod by name\n      --socket <PATH>    Attach to a specific Pod socket with --pod\n      --session <UUID>   Resume a specific session segment\n      --profile <REF>    Start a fresh Pod from a profile\n  -h, --help             Print help\n"
     );
 }
 
@@ -581,11 +553,17 @@ mod tests {
     }
 
     #[test]
-    fn parse_multi_mode() {
-        match parse_args_from(["--multi"]).unwrap() {
-            Mode::Tui(LaunchMode::Multi) => {}
-            _ => panic!("expected Multi mode"),
+    fn parse_panel_mode() {
+        match parse_args_from(["panel"]).unwrap() {
+            Mode::Tui(LaunchMode::Panel) => {}
+            _ => panic!("expected Panel mode"),
         }
+    }
+
+    #[test]
+    fn parse_multi_flag_is_not_a_launch_alias() {
+        let err = parse_args_from(["--multi"]).unwrap_err();
+        assert_eq!(err.to_string(), "unknown argument: --multi");
     }
 
     #[test]
@@ -601,46 +579,6 @@ mod tests {
         match parse_args_from(["memory", "lint", "--help"]).unwrap() {
             Mode::MemoryLintHelp => {}
             _ => panic!("expected MemoryLintHelp mode"),
-        }
-    }
-
-    #[test]
-    fn parse_multi_conflicts_are_clear() {
-        let segment_id = session_store::new_segment_id().to_string();
-        let cases = [
-            (
-                vec!["--multi".to_string(), "--resume".to_string()],
-                "--multi and --resume are mutually exclusive",
-            ),
-            (
-                vec!["--multi".to_string(), "--session".to_string(), segment_id],
-                "--multi and --session are mutually exclusive",
-            ),
-            (
-                vec![
-                    "--multi".to_string(),
-                    "--pod".to_string(),
-                    "agent".to_string(),
-                ],
-                "--multi and --pod are mutually exclusive",
-            ),
-            (
-                vec!["--multi".to_string(), "agent".to_string()],
-                "--multi cannot be used with a positional Pod name",
-            ),
-            (
-                vec![
-                    "--multi".to_string(),
-                    "--socket".to_string(),
-                    "/tmp/a.sock".to_string(),
-                ],
-                "--multi and --socket are mutually exclusive",
-            ),
-        ];
-
-        for (args, message) in cases {
-            let err = parse_args_from(args).unwrap_err();
-            assert_eq!(err.to_string(), message);
         }
     }
 }

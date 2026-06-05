@@ -184,7 +184,7 @@ pub(crate) async fn run_resume(
     run_pod_name(pod_name, socket_override, runtime_command).await
 }
 
-pub(crate) async fn run_multi(
+pub(crate) async fn run_panel(
     runtime_command: PodRuntimeCommand,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut app = multi_pod::load_app().await?;
