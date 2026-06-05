@@ -5,5 +5,7 @@
 //! an external plugin-loading surface.
 
 pub mod task;
+pub mod ticket;
 
 pub use task::{TaskFeature, task_tools_feature};
+pub use ticket::{TicketFeature, ticket_tools_feature};

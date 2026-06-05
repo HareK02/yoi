@@ -14,6 +14,8 @@ use chrono::Utc;
 use fs4::fs_std::FileExt;
 use thiserror::Error;
 
+pub mod tool;
+
 const STATUSES: [TicketStatus; 3] = [
     TicketStatus::Open,
     TicketStatus::Pending,
@@ -853,10 +855,16 @@ impl TicketBackend for LocalTicketBackend {
             }
             fs::rename(&old_dir, &new_dir).map_err(|e| io_err(&new_dir, e))?;
         }
-        let at = now_utc();
-        self.set_frontmatter_fields(
-            &new_dir.join("item.md"),
-            &[("status", status.as_str()), ("updated_at", &at)],
+        self.set_frontmatter_fields(&new_dir.join("item.md"), &[("status", status.as_str())])?;
+        let author = default_author();
+        let body = MarkdownText::new(format!("Status changed to `{}`.\n", status.as_str()));
+        self.append_thread_event(
+            &new_dir,
+            "status_changed",
+            "Status changed",
+            &author,
+            Some(status.as_str()),
+            &body,
         )
     }
 

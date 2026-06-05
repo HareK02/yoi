@@ -85,6 +85,7 @@ pub enum HostAuthority {
     ModelNotification,
     PodManagement,
     StateStore { name: String },
+    TicketBackend { root: String },
     ServiceAccess { service: ServiceId },
 }
 

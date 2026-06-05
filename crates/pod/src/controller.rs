@@ -523,6 +523,7 @@ where
 
     let mut feature_registry = FeatureRegistryBuilder::new();
     feature_registry.add_module(task_feature);
+    feature_registry.add_module(crate::feature::builtin::ticket_tools_feature(&pwd));
     let _feature_install_report = pod.install_features(feature_registry);
 
     let worker = pod.worker_mut();
