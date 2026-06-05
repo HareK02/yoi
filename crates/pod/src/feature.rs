@@ -1,7 +1,7 @@
 //! Feature contribution registry for Pod-hosted builtin/plugin modules.
 //!
 //! This module defines the Pod-side feature boundary used to collect
-//! descriptor metadata, authority requests, tool contributions, safe hook
+//! descriptor metadata, host authority requests, tool contributions, safe hook
 //! contributions, background task declarations, and service declarations before
 //! installing them into the existing Worker/HookRegistry host surfaces.
 //!
@@ -74,8 +74,8 @@ pub enum FeatureRuntimeKind {
 ///
 /// Contribution declarations such as tools, hooks, background tasks, and
 /// services are descriptor/package-approved host-visible contributions, not
-/// sandbox authorities. Grants are additive and do not replace manifest/tool
-/// permission checks.
+/// host authorities. Host authority grants are additive and do not replace
+/// manifest/tool permission checks.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HostAuthority {
@@ -98,15 +98,15 @@ pub enum FeatureHookPoint {
     TurnEnd,
 }
 
-/// Authority request declared by a feature descriptor.
+/// Host authority request declared by a feature descriptor.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AuthorityRequest {
+pub struct HostAuthorityRequest {
     pub authority: HostAuthority,
     pub required: bool,
     pub reason: String,
 }
 
-impl AuthorityRequest {
+impl HostAuthorityRequest {
     pub fn required(authority: HostAuthority, reason: impl Into<String>) -> Self {
         Self {
             authority,
@@ -124,15 +124,15 @@ impl AuthorityRequest {
     }
 }
 
-/// Authority grants resolved by the host for one feature installation.
+/// Host authority grants resolved by the host for one feature installation.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AuthorityGrantSet {
+pub struct HostAuthorityGrantSet {
     granted: HashSet<HostAuthority>,
-    denied: Vec<AuthorityDenial>,
+    denied: Vec<HostAuthorityDenial>,
 }
 
-impl AuthorityGrantSet {
-    pub fn grant_all(requests: &[AuthorityRequest]) -> Self {
+impl HostAuthorityGrantSet {
+    pub fn grant_all(requests: &[HostAuthorityRequest]) -> Self {
         Self {
             granted: requests
                 .iter()
@@ -150,7 +150,7 @@ impl AuthorityGrantSet {
         self.granted.contains(authority)
     }
 
-    pub fn denied(&self) -> &[AuthorityDenial] {
+    pub fn denied(&self) -> &[HostAuthorityDenial] {
         &self.denied
     }
 
@@ -160,16 +160,16 @@ impl AuthorityGrantSet {
 
     pub fn deny(&mut self, authority: HostAuthority, reason: impl Into<String>) {
         self.granted.remove(&authority);
-        self.denied.push(AuthorityDenial {
+        self.denied.push(HostAuthorityDenial {
             authority,
             reason: reason.into(),
         });
     }
 }
 
-/// Host-side denial of a requested feature authority.
+/// Host-side denial of a requested feature host authority.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AuthorityDenial {
+pub struct HostAuthorityDenial {
     pub authority: HostAuthority,
     pub reason: String,
 }
@@ -191,11 +191,12 @@ impl ToolDeclaration {
     }
 }
 
-/// Executable tool contribution wrapper.
+/// Executable tool contribution wrapper. Host-authority requirements are optional
+/// per-tool gates for privileged host APIs, not permission to contribute a tool.
 pub struct ToolContribution {
     name: String,
     definition: ToolDefinition,
-    required_authorities: Vec<HostAuthority>,
+    required_host_authorities: Vec<HostAuthority>,
 }
 
 impl ToolContribution {
@@ -203,12 +204,15 @@ impl ToolContribution {
         Self {
             name: name.into(),
             definition,
-            required_authorities: Vec::new(),
+            required_host_authorities: Vec::new(),
         }
     }
 
-    pub fn with_required_authorities(mut self, required_authorities: Vec<HostAuthority>) -> Self {
-        self.required_authorities = required_authorities;
+    pub fn with_required_host_authorities(
+        mut self,
+        required_host_authorities: Vec<HostAuthority>,
+    ) -> Self {
+        self.required_host_authorities = required_host_authorities;
         self
     }
 
@@ -323,7 +327,7 @@ impl ServiceDeclaration {
     }
 }
 
-/// Feature service requirement used for host-mediated dependency resolution.
+/// Feature service requirement used for contribution dependency resolution.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServiceRequirement {
     pub id: ServiceId,
@@ -352,7 +356,7 @@ impl ServiceRequirement {
     }
 }
 
-/// Host-mediated service registry skeleton used during feature installation.
+/// Contribution service registry skeleton used during feature installation.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FeatureServiceRegistry {
     providers: HashMap<ServiceId, FeatureServiceProvider>,
@@ -405,7 +409,7 @@ pub struct FeatureDescriptor {
     pub display_name: String,
     pub version: String,
     pub description: String,
-    pub requested_authorities: Vec<AuthorityRequest>,
+    pub requested_host_authorities: Vec<HostAuthorityRequest>,
     pub tools: Vec<ToolDeclaration>,
     pub hooks: Vec<HookDeclaration>,
     pub background_tasks: Vec<BackgroundTaskDeclaration>,
@@ -421,7 +425,7 @@ impl FeatureDescriptor {
             display_name: display_name.into(),
             version: env!("CARGO_PKG_VERSION").into(),
             description: String::new(),
-            requested_authorities: Vec::new(),
+            requested_host_authorities: Vec::new(),
             tools: Vec::new(),
             hooks: Vec::new(),
             background_tasks: Vec::new(),
@@ -435,8 +439,8 @@ impl FeatureDescriptor {
         self
     }
 
-    pub fn with_authority(mut self, request: AuthorityRequest) -> Self {
-        self.requested_authorities.push(request);
+    pub fn with_host_authority(mut self, request: HostAuthorityRequest) -> Self {
+        self.requested_host_authorities.push(request);
         self
     }
 
@@ -538,7 +542,7 @@ pub struct FeatureInstallReport {
     pub feature_id: FeatureId,
     pub runtime: FeatureRuntimeKind,
     pub installed: bool,
-    pub granted_authorities: AuthorityGrantSet,
+    pub host_authority_grants: HostAuthorityGrantSet,
     pub installed_tools: Vec<String>,
     pub installed_hooks: Vec<HookDeclaration>,
     pub declared_background_tasks: Vec<BackgroundTaskDeclaration>,
@@ -549,12 +553,12 @@ pub struct FeatureInstallReport {
 }
 
 impl FeatureInstallReport {
-    fn new(descriptor: &FeatureDescriptor, granted_authorities: AuthorityGrantSet) -> Self {
+    fn new(descriptor: &FeatureDescriptor, host_authority_grants: HostAuthorityGrantSet) -> Self {
         Self {
             feature_id: descriptor.id.clone(),
             runtime: descriptor.runtime.clone(),
             installed: false,
-            granted_authorities,
+            host_authority_grants,
             installed_tools: Vec::new(),
             installed_hooks: Vec::new(),
             declared_background_tasks: Vec::new(),
@@ -648,33 +652,33 @@ fn reject_undeclared_contribution(
     error
 }
 
-fn require_authority(
-    grants: &AuthorityGrantSet,
+fn require_host_authority(
+    host_authority_grants: &HostAuthorityGrantSet,
     report: &mut FeatureInstallReport,
     kind: FeatureContributionKind,
     name: impl Into<String>,
     authority: &HostAuthority,
 ) -> Result<(), FeatureInstallError> {
-    if grants.contains(authority) {
+    if host_authority_grants.contains(authority) {
         return Ok(());
     }
 
-    let reason = format!("required authority was not granted: {authority:?}");
+    let reason = format!("required host authority was not granted: {authority:?}");
     report.mark_skipped(kind, name, reason.clone());
-    Err(FeatureInstallError::AuthorityDenied(reason))
+    Err(FeatureInstallError::HostAuthorityDenied(reason))
 }
 
 /// Model-visible durable notification sink skeleton. The first slice exposes
 /// the boundary without implementing a new event channel.
 pub struct FeatureNotificationSink<'a> {
-    grants: &'a AuthorityGrantSet,
+    host_authority_grants: &'a HostAuthorityGrantSet,
     report: &'a mut FeatureInstallReport,
 }
 
 impl FeatureNotificationSink<'_> {
     pub fn notify_model(&mut self, message: impl Into<String>) -> Result<(), FeatureInstallError> {
-        require_authority(
-            self.grants,
+        require_host_authority(
+            self.host_authority_grants,
             self.report,
             FeatureContributionKind::Notification,
             "notify_model",
@@ -739,7 +743,7 @@ impl FeatureDiagnosticSink<'_> {
 pub struct ToolContributionRegistrar<'a> {
     feature_id: &'a FeatureId,
     declarations: &'a FeatureContributionDeclarations,
-    grants: &'a AuthorityGrantSet,
+    host_authority_grants: &'a HostAuthorityGrantSet,
     pending_tools: &'a mut Vec<ToolDefinition>,
     installed_tool_names: &'a mut HashMap<String, FeatureId>,
     report: &'a mut FeatureInstallReport,
@@ -771,9 +775,9 @@ impl ToolContributionRegistrar<'_> {
             ));
         }
 
-        for authority in &contribution.required_authorities {
-            require_authority(
-                self.grants,
+        for authority in &contribution.required_host_authorities {
+            require_host_authority(
+                self.host_authority_grants,
                 self.report,
                 FeatureContributionKind::Tool,
                 model_visible_name.clone(),
@@ -946,7 +950,7 @@ impl FeatureServiceRegistrar<'_> {
 pub struct FeatureInstallContext<'a> {
     feature_id: &'a FeatureId,
     declarations: &'a FeatureContributionDeclarations,
-    grants: &'a AuthorityGrantSet,
+    host_authority_grants: &'a HostAuthorityGrantSet,
     pending_tools: &'a mut Vec<ToolDefinition>,
     installed_tool_names: &'a mut HashMap<String, FeatureId>,
     hook_builder: &'a mut HookRegistryBuilder,
@@ -959,15 +963,15 @@ impl FeatureInstallContext<'_> {
         self.feature_id
     }
 
-    pub fn grants(&self) -> &AuthorityGrantSet {
-        self.grants
+    pub fn host_authority_grants(&self) -> &HostAuthorityGrantSet {
+        self.host_authority_grants
     }
 
     pub fn tools(&mut self) -> ToolContributionRegistrar<'_> {
         ToolContributionRegistrar {
             feature_id: self.feature_id,
             declarations: self.declarations,
-            grants: self.grants,
+            host_authority_grants: self.host_authority_grants,
             pending_tools: self.pending_tools,
             installed_tool_names: self.installed_tool_names,
             report: self.report,
@@ -1002,7 +1006,7 @@ impl FeatureInstallContext<'_> {
 
     pub fn notifications(&mut self) -> FeatureNotificationSink<'_> {
         FeatureNotificationSink {
-            grants: self.grants,
+            host_authority_grants: self.host_authority_grants,
             report: self.report,
         }
     }
@@ -1102,9 +1106,10 @@ impl FeatureRegistryBuilder {
         let mut seen_features = HashSet::new();
 
         for (module, descriptor) in self.modules.into_iter().zip(descriptors.into_iter()) {
-            let grants = AuthorityGrantSet::grant_all(&descriptor.requested_authorities);
+            let host_authority_grants =
+                HostAuthorityGrantSet::grant_all(&descriptor.requested_host_authorities);
             let declarations = FeatureContributionDeclarations::from_descriptor(&descriptor);
-            let mut report = FeatureInstallReport::new(&descriptor, grants.clone());
+            let mut report = FeatureInstallReport::new(&descriptor, host_authority_grants.clone());
 
             if !seen_features.insert(descriptor.id.clone()) {
                 report.diagnostics.push(FeatureDiagnostic::error(format!(
@@ -1120,9 +1125,9 @@ impl FeatureRegistryBuilder {
                 continue;
             }
 
-            for authority in grants.denied() {
+            for authority in host_authority_grants.denied() {
                 report.diagnostics.push(FeatureDiagnostic::warning(format!(
-                    "authority denied: {:?}: {}",
+                    "host authority denied: {:?}: {}",
                     authority.authority, authority.reason
                 )));
             }
@@ -1186,7 +1191,7 @@ impl FeatureRegistryBuilder {
                 let mut context = FeatureInstallContext {
                     feature_id: &descriptor.id,
                     declarations: &declarations,
-                    grants: &grants,
+                    host_authority_grants: &host_authority_grants,
                     pending_tools,
                     installed_tool_names: &mut installed_tool_names,
                     hook_builder,
@@ -1250,8 +1255,8 @@ pub enum FeatureInstallError {
         first_feature: String,
         duplicate_feature: String,
     },
-    #[error("feature authority denied: {0}")]
-    AuthorityDenied(String),
+    #[error("feature host authority denied: {0}")]
+    HostAuthorityDenied(String),
     #[error("feature install failed: {0}")]
     Install(String),
 }
@@ -1325,7 +1330,7 @@ mod tests {
     }
 
     #[test]
-    fn descriptor_authorities_and_install_report_are_recorded() {
+    fn descriptor_contributions_and_empty_host_authority_grants_are_recorded() {
         let descriptor = FeatureDescriptor::builtin("dummy", "Dummy")
             .with_tool(ToolDeclaration::new("Dummy", "dummy tool"))
             .with_background_task(BackgroundTaskDeclaration::descriptor_only(
@@ -1348,7 +1353,7 @@ mod tests {
         assert!(feature_report.installed);
         assert_eq!(feature_report.installed_tools, vec!["Dummy"]);
         assert_eq!(feature_report.declared_background_tasks[0].name, "daily");
-        assert!(feature_report.granted_authorities.denied().is_empty());
+        assert!(feature_report.host_authority_grants.denied().is_empty());
     }
 
     #[test]
@@ -1409,6 +1414,79 @@ mod tests {
                 .contains("does not match model-visible tool name")
         }));
         assert_eq!(report.reports[0].skipped[0].name, "Actual");
+    }
+
+    #[test]
+    fn tool_host_authority_requirements_use_host_authority_grants_not_contribution_declarations() {
+        struct HostAuthorityToolFeature {
+            descriptor: FeatureDescriptor,
+            required_host_authorities: Vec<HostAuthority>,
+        }
+
+        impl FeatureModule for HostAuthorityToolFeature {
+            fn descriptor(&self) -> FeatureDescriptor {
+                self.descriptor.clone()
+            }
+
+            fn install(
+                &self,
+                context: &mut FeatureInstallContext<'_>,
+            ) -> Result<(), FeatureInstallError> {
+                context.tools().register(
+                    ToolContribution::new("NetworkTool", dummy_tool("NetworkTool"))
+                        .with_required_host_authorities(self.required_host_authorities.clone()),
+                )
+            }
+        }
+
+        let mut hook_builder = HookRegistryBuilder::default();
+        let mut pending_tools = Vec::new();
+        let missing_grant = FeatureDescriptor::builtin("missing-host-authority", "Missing")
+            .with_tool(ToolDeclaration::new("NetworkTool", "network host API tool"));
+        let missing_report = FeatureRegistryBuilder::new()
+            .with_module(HostAuthorityToolFeature {
+                descriptor: missing_grant,
+                required_host_authorities: vec![HostAuthority::Network],
+            })
+            .install_into_pending(&mut pending_tools, &mut hook_builder);
+
+        assert!(pending_tools.is_empty());
+        assert!(!missing_report.reports[0].installed);
+        assert!(
+            missing_report.reports[0]
+                .diagnostics
+                .iter()
+                .any(|diagnostic| {
+                    diagnostic
+                        .message
+                        .contains("required host authority was not granted")
+                })
+        );
+        assert_eq!(
+            missing_report.reports[0].skipped[0].kind,
+            FeatureContributionKind::Tool
+        );
+
+        let granted = FeatureDescriptor::builtin("granted-host-authority", "Granted")
+            .with_host_authority(HostAuthorityRequest::required(
+                HostAuthority::Network,
+                "uses a host network API",
+            ))
+            .with_tool(ToolDeclaration::new("NetworkTool", "network host API tool"));
+        let granted_report = FeatureRegistryBuilder::new()
+            .with_module(HostAuthorityToolFeature {
+                descriptor: granted,
+                required_host_authorities: vec![HostAuthority::Network],
+            })
+            .install_into_pending(&mut pending_tools, &mut hook_builder);
+
+        assert!(granted_report.reports[0].installed);
+        assert!(
+            granted_report.reports[0]
+                .host_authority_grants
+                .contains(&HostAuthority::Network)
+        );
+        assert_eq!(pending_tools.len(), 1);
     }
 
     #[test]
@@ -1707,7 +1785,7 @@ mod tests {
     }
 
     #[test]
-    fn background_task_declaration_is_not_sandbox_authority_gated() {
+    fn background_task_declaration_is_not_host_authority_gated() {
         let descriptor = FeatureDescriptor::builtin("background", "Background")
             .with_background_task(BackgroundTaskDeclaration::descriptor_only(
                 "declared-task",
@@ -1728,7 +1806,7 @@ mod tests {
     }
 
     #[test]
-    fn service_provider_declaration_is_not_sandbox_authority_gated() {
+    fn service_provider_declaration_is_not_host_authority_gated() {
         let service = ServiceId::builtin("declared-service");
         let descriptor = FeatureDescriptor::builtin("service", "Service").with_provided_service(
             ServiceDeclaration::new(service.clone(), "1", "descriptor contribution"),
@@ -1746,7 +1824,7 @@ mod tests {
     }
 
     #[test]
-    fn builtin_internal_task_feature_descriptor_has_exact_tools_hooks_and_no_authorities() {
+    fn builtin_internal_task_feature_descriptor_has_exact_tools_hooks_and_no_host_authorities() {
         let descriptor = builtin::task_tools_feature().descriptor();
         let tool_names: Vec<_> = descriptor
             .tools
@@ -1762,7 +1840,7 @@ mod tests {
 
         assert_eq!(descriptor.id.as_str(), "builtin:task-tools");
         assert_eq!(descriptor.runtime, FeatureRuntimeKind::Builtin);
-        assert!(descriptor.requested_authorities.is_empty());
+        assert!(descriptor.requested_host_authorities.is_empty());
         assert_eq!(
             hook_points,
             vec![FeatureHookPoint::PreRequest, FeatureHookPoint::PreToolCall]
@@ -1800,8 +1878,8 @@ mod tests {
         assert_eq!(report.reports.len(), 1);
         assert!(report.reports[0].installed);
         assert_eq!(
-            report.reports[0].granted_authorities,
-            AuthorityGrantSet::empty()
+            report.reports[0].host_authority_grants,
+            HostAuthorityGrantSet::empty()
         );
         assert!(report.reports[0].skipped.is_empty());
         assert!(report.reports[0].diagnostics.is_empty());
