@@ -43,6 +43,7 @@ pub struct SpawnConfig {
     pub resume_by_pod_name: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpawnReady {
     pub pod_name: String,
     pub socket_path: PathBuf,
