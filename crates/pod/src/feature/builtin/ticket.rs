@@ -38,7 +38,7 @@ impl TicketFeature {
     pub fn for_workspace(workspace: impl AsRef<Path>) -> Self {
         let workspace = workspace.as_ref();
         match TicketConfig::load_workspace(workspace) {
-            Ok(config) => Self::new(config.backend.root),
+            Ok(config) => Self::new(config.backend_root().to_path_buf()),
             Err(error) => Self {
                 backend_root: workspace.join("work-items"),
                 config_error: Some(error.to_string()),
@@ -214,6 +214,7 @@ mod tests {
             temp.path(),
             r#"
 [backend]
+provider = "builtin:yoi_local"
 root = "tickets"
 
 [roles.coder]
@@ -258,6 +259,31 @@ profile = "inherit"
         let message = &report.reports[0].diagnostics[0].message;
         assert!(message.contains("Ticket tools not registered"));
         assert!(message.contains("unknown Ticket role `operator`"));
+    }
+
+    #[test]
+    fn unsupported_ticket_backend_provider_fails_closed() {
+        let temp = TempDir::new().unwrap();
+        make_work_items(&temp.path().join("work-items"));
+        write_ticket_config(
+            temp.path(),
+            r#"
+[backend]
+provider = "github"
+"#,
+        );
+        let mut pending_tools = Vec::new();
+        let mut hooks = HookRegistryBuilder::default();
+        let report = FeatureRegistryBuilder::new()
+            .with_module(ticket_tools_feature(temp.path()))
+            .install_into_pending(&mut pending_tools, &mut hooks);
+
+        assert!(pending_tools.is_empty());
+        assert!(report.reports[0].installed_tools.is_empty());
+        assert_eq!(report.reports[0].diagnostics.len(), 1);
+        let message = &report.reports[0].diagnostics[0].message;
+        assert!(message.contains("Ticket tools not registered"));
+        assert!(message.contains("unsupported Ticket backend provider `github`"));
     }
 
     #[test]
