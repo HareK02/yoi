@@ -14,6 +14,7 @@ use chrono::Utc;
 use fs4::fs_std::FileExt;
 use thiserror::Error;
 
+pub mod config;
 pub mod tool;
 
 const STATUSES: [TicketStatus; 3] = [
