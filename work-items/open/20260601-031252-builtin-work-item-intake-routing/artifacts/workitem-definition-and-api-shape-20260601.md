@@ -1,5 +1,7 @@
 # WorkItem definition and API shape
 
+> Superseded on 2026-06-05: the durable orchestration record concept is now named `Ticket`, not `WorkItem`. See `ticket-definition-and-api-shape-20260605.md` and the ticket thread decision for current terminology. This file is retained as historical design context.
+
 ## Definition
 
 In Insomnia, a WorkItem is not primarily an issue tracker item. A WorkItem is an agreed execution contract that fixes user intent into a bounded unit that Pods can schedule, delegate, implement, review, and close safely.

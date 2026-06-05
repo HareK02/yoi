@@ -1,68 +1,86 @@
 ---
 id: 20260601-031252-builtin-work-item-intake-routing
 slug: builtin-work-item-intake-routing
-title: Built-in work item management and intake routing
+title: Built-in Ticket intake and orchestration routing
 status: open
 kind: task
 priority: P1
-labels: [work-item, intake, orchestration, tui]
+labels: [ticket, intake, orchestration]
 created_at: 2026-06-01T03:12:52Z
-updated_at: 2026-06-03T12:25:05Z
+updated_at: 2026-06-05T04:04:42Z
 assignee: null
 legacy_ticket: null
 ---
 
-## Issue
+## Background
 
-現在の work item / ticket 運用は、Insomnia システムから切り離しても使えるように `tickets.sh` と markdown files で管理している。一方で、チケットは実質的に WorkItem と統合された構造化データとして運用され始めており、Intake Pod / Orchestrator / coder / reviewer の並行開発フローでは、チケット管理自体を Insomnia の feature として扱う必要が出てきている。
+Yoi needs a durable project-level coordination record that Intake, Orchestrator, coder Pods, reviewer Pods, and humans can share. The accepted concept name is **Ticket**.
 
-特に、ユーザーが単一 Orchestrator に依頼してから Orchestrator が調査・チケット化・実装委譲する現在の入口では、ユーザー待ち時間が残る。ユーザーの submit から Intake Pod が直接起動し、ユーザーと意図・要件をすり合わせたうえで正式な WorkItem / ticket を作成し、Orchestrator はそのチケット群の順序付け・割り込み・実装 orchestration に集中する構造へ移行したい。
+A Ticket is not the same thing as the session-local Task tool. A Task tracks short-lived user-visible progress inside a Pod/session. A Ticket is a durable orchestration contract with requirements, decisions, plans, implementation reports, reviews, artifacts, and resolution history.
 
-## Direction
+The current repository already stores this information under `work-items/` and manages it through `tickets.sh`. For now, that storage format remains the local backend. The new code-facing concept should be `Ticket`, not `WorkItem`; `work-items/` is a current local storage path, not the product concept name.
 
-- `tickets.sh` 相当の work item 管理を、Insomnia の built-in feature / tool surface として設計・実装する。
-- WorkItem は Pod 専用の独自 context injection や特殊 queue ではなく、`plugin-feature-contribution-registry` で定義する feature contribution として既存 Tool / Hook / Notify 経路に載せる。
-- Intake Pod はユーザーと直接会話し、必要な調査・重複確認・要件同期を行い、合意済み WorkItem / ticket を作成できるようにする。
-- Orchestrator はユーザー意図の一次解釈や ticket draft の再承認者ではなく、登録済み WorkItem の scheduling / prioritization / interruption / implementation delegation を担当する。
-- ユーザー向け Inbox 専用 UI は初期スコープにしない。Intake は既存の `--multi` UI の延長として通常の Pod 会話で制御できるようにする。
-- Orchestrator が WorkItem を見て不十分と判断し、Intake と Orchestrator 間だけで合意できない場合は、Intake Pod に action-required flag を持たせ、既存の TUI polling / multi-Pod 表示経路でユーザー対応要求として表示する。
+The original version of this ticket mixed several layers: local ticket backend, built-in Pod tools, Intake behavior, Orchestrator routing, action-required state, and scheduler-like automation. That is too broad for a single implementation ticket, so this ticket now acts as the umbrella tracking ticket for the split.
 
-## Scope / permission note
+## Terminology
 
-Scope は、エージェントが占有して作業する filesystem space を保証するための仕組みである。WorkItem / ticket 管理を built-in tool として提供する場合、その tool は単なる delegated workspace edit と同じ扱いにせず、既存の `tickets.sh` / Bash と同様に work item authority のための専用経路として設計してよい。
+- `Ticket`: durable orchestration record shared by Intake, Orchestrator, implementation Pods, reviewer Pods, and humans.
+- `Task`: session-local progress tracking tool; intentionally separate from Ticket.
+- `Assignment`: a concrete delegation from Orchestrator to a coder/reviewer/investigator Pod.
+- `IntentPacket`: short implementation/review contract derived from a Ticket and passed to an Assignment.
+- `TicketBackend`: backend abstraction for reading and mutating Tickets.
+- `LocalTicketBackend`: backend implementation for the current `work-items/` directory format.
 
-ただし、これは無制限のファイル編集許可を意味しない。WorkItem tool は対象を work item store に限定し、通常の code/worktree scope とは別の authority boundary と auditability を持つべきである。
+## Scope of the umbrella
+
+This umbrella covers the following sequence:
+
+1. `ticket-local-files-backend`
+   - Add a code-facing Ticket domain model and local backend for current `work-items/` files.
+   - Keep `tickets.sh` and existing file format compatible.
+
+2. `ticket-built-in-feature-tools`
+   - Expose Ticket operations as a built-in Pod feature/tool surface.
+   - Treat Ticket operations as typed backend authority, not arbitrary filesystem writes.
+
+3. `ticket-intake-workflow`
+   - Define and install an Intake workflow/profile that clarifies user requests and creates Tickets after user agreement.
+
+4. `ticket-orchestrator-routing`
+   - Let Orchestrator classify Tickets and route them into preflight, implementation, review, spike, blocked/action-required, or close paths.
+
+Later scheduler/lease/automatic maintainer behavior is out of scope for this umbrella until the above pieces are usable.
 
 ## Requirements
 
-- `tickets.sh` で行っている主要操作を、Insomnia の built-in work item management surface として扱えるようにすること。
-  - create
-  - show/list
-  - comment / plan / decision / implementation report
-  - review approve/request-changes
-  - status transition
-  - close / resolution
-  - doctor / consistency check
-- WorkItem tool surface は `plugin-feature-contribution-registry` の built-in feature contribution として登録できること。
-- WorkItem / ticket の保存形式は、現在の markdown + frontmatter + thread / artifacts 方式との移行可能性を保つこと。
-- 既存の `tickets.sh` 運用を即座に破壊しないこと。built-in 化の途中でも git history / work-items directory を authority として読めること。
-- Intake Pod がユーザーと合意済み WorkItem を作成できる導線を設計すること。
-- Intake Pod は正式作成前に、必要に応じて既存 ticket / duplicate / related work / relevant files を調査できること。
-- Intake Pod が作った WorkItem には、ユーザー合意済みであること、背景、要件、acceptance criteria、non-goals、risk flags、needs-preflight などを構造化して残せること。
-- Orchestrator は作成済み WorkItem queue を見て、実装順序・割り込み・preflight 要否・coder/reviewer 起動を判断できること。
-- Orchestrator が WorkItem 不十分と判断した場合、必要な質問や修正要求を Intake Pod 経由でユーザーに戻せること。
-- 専用 Inbox storage / UI を初期要件にしないこと。action-required state は Pod metadata / current state に近い形で持ち、既存 multi-Pod polling / display で見えるようにすること。
-- action-required Pod は、ユーザーが対応するまで見落とされにくい表示・状態を持つこと。
-- Intake 結果や WorkItem 操作は audit 可能で、git history / work item thread に経緯が残ること。
-- secret / private context を WorkItem 本文・thread・artifact・diagnostics に不用意に書かないこと。
-- work item store への並行書き込みが壊れないよう、atomicity / locking / conflict handling を設計すること。
+- Use `Ticket` as the product/code concept name.
+- Keep existing `work-items/` storage as the LocalTicketBackend path for now.
+- Do not rename the storage directory in this umbrella.
+- Keep git history + ticket files authoritative.
+- Preserve compatibility with `tickets.sh` until a replacement is explicitly accepted.
+- Keep Ticket authority separate from delegated filesystem write scope.
+- Avoid exposing arbitrary file writes through Ticket tools.
+- Keep Intake focused on clarification and Ticket creation/update; it must not schedule implementation itself.
+- Keep Orchestrator responsible for routing/scheduling decisions, not Intake.
+- Do not introduce an unattended scheduler in the MVP.
 
 ## Acceptance criteria
 
-- Insomnia 内部から、少なくとも `tickets.sh create/show/list/comment/review/close/doctor` に相当する操作を型付きに実行できる。
-- Intake Pod がユーザーと合意した内容を正式 WorkItem として作成できる。
-- Orchestrator は Intake が作成した WorkItem を、再解釈 gate なしに scheduling 対象として扱える。
-- WorkItem が不十分な場合は、Orchestrator が action-required state を通じて Intake / user に差し戻せる。
-- `--multi` 系 UI で、通常の Pod 状態に加えて user action required な Intake Pod を認識できる。
-- 専用 Inbox storage を導入しなくても、未対応のユーザー確認要求が見落とされない。
-- 既存 `work-items/` と git history に基づく運用・監査が継続できる。
+- This umbrella records the Ticket terminology decision and split plan.
+- Child tickets exist for:
+  - local files backend;
+  - built-in feature tools;
+  - intake workflow;
+  - orchestrator routing.
+- Child tickets state their dependencies, scope, non-goals, and acceptance criteria clearly enough for preflight/implementation sequencing.
+- Historical `WorkItem` wording in this ticket is either removed or explicitly described as old terminology.
+- `tickets.sh doctor` passes after the split.
+
+## Non-goals
+
+- Renaming `work-items/` to `tickets/`.
+- Replacing `tickets.sh` immediately.
+- Building a scheduler/lease system.
+- Building a TUI spawned-Pod panel.
+- Changing the session-local Task tool.
+- Integrating with GitHub Issues, Linear, MCP, or external trackers in this umbrella.

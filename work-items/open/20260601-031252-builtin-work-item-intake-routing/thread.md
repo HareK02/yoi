@@ -249,3 +249,72 @@ This preserves the desired detachable shape: feature state remains in the featur
 
 
 ---
+
+<!-- event: decision author: hare at: 2026-06-05T04:03:37Z -->
+
+## Decision
+
+Decision: use `Ticket` as the durable orchestration record concept.
+
+Rationale:
+
+- `WorkItem` is not a preferred product/code name.
+- `Work*` naming feels too enterprise/work-order-like for this system.
+- `Issue` overemphasizes problems/bugs and does not fit design, cleanup, investigation, and orchestration records as well.
+- `Task` is already used for session-local progress tracking and implies a smaller unit.
+- `Ticket` is broad enough for requests, bugs, design work, implementation tasks, reviews, spikes, and orchestration epics while remaining natural in the current repository workflow.
+
+Terminology:
+
+- `Ticket` is the durable orchestration record.
+- `Task` remains session-local progress tracking.
+- `Assignment` is a concrete delegation from Orchestrator to a coder/reviewer/investigator Pod.
+- `IntentPacket` is a short implementation/review contract derived from a Ticket.
+- `LocalTicketBackend` is the current `work-items/` markdown/thread/artifact storage backend.
+
+Scope decision:
+
+- Keep `work-items/` as the current storage path for now.
+- Do not rename `work-items/` in this phase.
+- Treat the old WorkItem wording as historical terminology being replaced by Ticket.
+
+
+---
+
+<!-- event: plan author: hare at: 2026-06-05T04:03:37Z -->
+
+## Plan
+
+Plan: split the original broad built-in intake/routing ticket into implementation-sized Ticket tickets.
+
+The parent ticket is now an umbrella for the Ticket-driven intake/orchestration path. The implementation sequence is:
+
+1. `ticket-local-files-backend`
+   - Add the code-facing Ticket domain/backend layer and LocalTicketBackend over current `work-items/` files.
+
+2. `ticket-built-in-feature-tools`
+   - Expose typed Ticket operations as a built-in Pod feature/tool surface with Ticket backend authority, not arbitrary filesystem write scope.
+
+3. `ticket-intake-workflow`
+   - Add the Intake workflow/profile that clarifies user intent and creates/updates Tickets after user agreement.
+
+4. `ticket-orchestrator-routing`
+   - Add explicit Orchestrator routing classification and intent-packet production for Tickets.
+
+`tui-spawned-pod-panel` is not part of this path; it may be useful UI work later, but it is not what is currently needed for the multi-agent system.
+
+
+---
+
+<!-- event: comment author: hare at: 2026-06-05T04:04:42Z -->
+
+## Comment
+
+Added current terminology/design artifact:
+
+- `artifacts/ticket-definition-and-api-shape-20260605.md`
+
+The earlier `workitem-definition-and-api-shape-20260601.md` is now explicitly marked superseded and retained only as historical context.
+
+
+---
