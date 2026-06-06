@@ -2,12 +2,12 @@
 id: 20260605-210704-workspace-panel-orchestrator-lifecycle
 slug: workspace-panel-orchestrator-lifecycle
 title: Workspace panel orchestrator lifecycle
-status: open
+status: closed
 kind: task
 priority: P1
 labels: [tui, pod, orchestrator, panel]
 created_at: 2026-06-05T21:07:04Z
-updated_at: 2026-06-05T23:32:34Z
+updated_at: 2026-06-06T04:23:48Z
 assignee: null
 legacy_ticket: null
 ---
