@@ -7,7 +7,7 @@ kind: task
 priority: P1
 labels: [ticket, intake, orchestrator, handoff]
 created_at: 2026-06-05T21:07:04Z
-updated_at: 2026-06-05T21:07:04Z
+updated_at: 2026-06-06T04:49:16Z
 assignee: null
 legacy_ticket: null
 ---
