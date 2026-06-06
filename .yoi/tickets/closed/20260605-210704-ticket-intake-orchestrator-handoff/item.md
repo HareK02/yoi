@@ -2,12 +2,12 @@
 id: 20260605-210704-ticket-intake-orchestrator-handoff
 slug: ticket-intake-orchestrator-handoff
 title: Ticket intake to orchestrator handoff
-status: open
+status: closed
 kind: task
 priority: P1
 labels: [ticket, intake, orchestrator, handoff]
 created_at: 2026-06-05T21:07:04Z
-updated_at: 2026-06-06T04:49:16Z
+updated_at: 2026-06-06T05:27:40Z
 assignee: null
 legacy_ticket: null
 ---
