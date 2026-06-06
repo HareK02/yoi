@@ -38,3 +38,21 @@ Updated per user direction:
 
 
 ---
+
+<!-- event: decision author: hare at: 2026-06-06T22:14:29Z -->
+
+## Decision
+
+Updated based on thread/event-log discussion and split out companion work.
+
+Decision:
+- Do not delete Ticket threads.
+- Do not use threads as freeform AI conversation dumps.
+- Use `item.md` frontmatter for current workflow state, `item.md` body for the current Ticket snapshot, `thread.md` as a concise typed append-only event log, and Pod/session logs for full conversations.
+- Workflow state transitions should eventually update frontmatter and append a `state_changed` event as one logical backend operation.
+- Intake should write a bounded `intake_summary` when materializing/marking a Ticket ready, not copy the full Intake conversation.
+
+Created companion ticket `typed-ticket-thread-event-log` for the typed thread event model/API so `explicit-ticket-workflow-state` can stay focused on current-state fields and panel semantics.
+
+
+---

@@ -7,7 +7,7 @@ kind: task
 priority: P1
 labels: [ticket, tui, orchestration, panel, state]
 created_at: 2026-06-06T21:54:03Z
-updated_at: 2026-06-06T22:04:15Z
+updated_at: 2026-06-06T22:14:29Z
 assignee: null
 legacy_ticket: null
 ---
@@ -90,6 +90,21 @@ The panel composer/status area should also be simplified. Do not put verbose tar
 
 The panel action currently called `Go` should become `Queue`, because the user is queuing a ready Ticket rather than approving implementation details.
 
+## Thread/event-log relationship
+
+Current workflow state should live in frontmatter, but every workflow state transition should be explainable through a concise append-only thread event. The thread should become a typed event log, not a freeform conversation transcript.
+
+This is split into companion ticket `typed-ticket-thread-event-log` so this Ticket can focus on current-state fields and panel semantics while the companion defines/implements the event-log API.
+
+Desired split:
+
+- `item.md` frontmatter: current workflow state authority.
+- `item.md` body: current Ticket snapshot.
+- `thread.md`: typed append-only events such as `state_changed`, `intake_summary`, `decision`, `implementation_report`, `review`, and `close`.
+- Pod/session logs: full conversations/runtime transcript.
+
+State mutations should eventually use backend APIs that update frontmatter and append a `state_changed` event as one logical operation. Intake should write a concise `intake_summary` instead of copying the full Intake conversation into the Ticket thread.
+
 ## Requirements
 
 - Add explicit workflow state fields to the Ticket model/parser/writer and tool/CLI surfaces as needed.
@@ -103,8 +118,8 @@ The panel action currently called `Go` should become `Queue`, because the user i
 - Remove or demote current panel heuristics that infer phase/action from labels, title text, `readiness`, `needs_preflight`, or thread event presence.
 - Rename panel `Go` action to `Queue` and make it transition `ready -> queued`.
 - Queue action must re-check current Ticket state before mutation.
-- Queue action records a durable thread decision/comment and sets `queued_by` / `queued_at` if those fields are adopted.
-- Orchestrator should treat `queued` as schedulable and set `inprogress` when it starts work.
+- Queue action records a durable typed `state_changed` / decision event and sets `queued_by` / `queued_at` if those fields are adopted.
+- Orchestrator should treat `queued` as schedulable and set `inprogress` when it starts work, with a typed state transition event once the companion event-log API exists.
 - Intake should set `workflow_state = ready` when the Ticket is fully materialized and ready to queue.
 - Done/close flow should set `workflow_state = done` or derive it consistently from close status.
 - Do not store transient `activity` in Ticket frontmatter.
@@ -112,7 +127,7 @@ The panel action currently called `Go` should become `Queue`, because the user i
 
 ## Non-goals
 
-- Building a scheduler/lease system.
+- Building the full typed thread event-log API; companion ticket `typed-ticket-thread-event-log` owns that, though this ticket should align with it.
 - Persisting live Pod activity into Tickets.
 - Reintroducing human approve/reject gates for every review loop.
 - Reintroducing `--multi` or `:ticket`.
@@ -130,3 +145,4 @@ The panel action currently called `Go` should become `Queue`, because the user i
 - Review/rework activity does not create a separate workflow state; it remains `inprogress` plus runtime/thread detail.
 - No persistent `activity` field is required for current Pod activity.
 - Existing tests cover default/migration behavior, panel display, Queue dispatch, and stale-state rejection.
+- Companion ticket `typed-ticket-thread-event-log` exists and captures the append-only state transition / Intake summary event-log work if not implemented in the same change series.
