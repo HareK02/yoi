@@ -1,0 +1,104 @@
+---
+id: 20260606-215403-explicit-ticket-workflow-state
+slug: explicit-ticket-workflow-state
+title: Replace inferred panel Ticket state with explicit workflow state
+status: open
+kind: task
+priority: P1
+labels: [ticket, tui, orchestration, panel, state]
+created_at: 2026-06-06T21:54:03Z
+updated_at: 2026-06-06T21:54:48Z
+assignee: null
+legacy_ticket: null
+---
+
+## Background
+
+The first-pass workspace panel derives Ticket phase/action/status from labels, title text, readiness fields, and thread events such as `plan`, `implementation_report`, and `review`. That was useful for bootstrapping the panel, but it makes the panel infer workflow state instead of reading explicit Ticket state.
+
+The desired model is simpler and more durable: Ticket records should carry a small explicit workflow state, while transient execution activity remains derived from live Pod/session state and is not persisted into Ticket frontmatter.
+
+## Goal
+
+Replace panel-inferred Ticket workflow state with explicit Ticket workflow fields and update the panel/Orchestrator/Intake flows to use those fields.
+
+## Target state model
+
+Use a small durable state machine:
+
+```text
+intake -> ready -> queued -> inprogress -> done
+```
+
+Meanings:
+
+- `intake`: Intake Pod and user are clarifying/materializing the Ticket.
+- `ready`: Intake is complete; the Ticket is ready for a human to queue.
+- `queued`: Human queued the Ticket; Orchestrator may schedule it when resources/priority allow.
+- `inprogress`: Orchestrator/coder/reviewer/validator work is underway. Review/rework loops stay inside this state.
+- `done`: completed/closed.
+
+`blocked` is not a workflow state. Blocking/user attention is an overlay such as `attention_required`.
+
+`review` is not a workflow state. Review/rework/validation are runtime activity or thread events inside `inprogress`.
+
+## Durable fields
+
+Add explicit current-state fields to Ticket frontmatter, for example:
+
+```yaml
+workflow_state: intake | ready | queued | inprogress | done
+attention_required: null | "..."
+queued_by: null | "user"
+queued_at: null | "2026-..."
+```
+
+Exact field names can be refined during implementation, but the semantics should remain:
+
+- `workflow_state` is the durable Ticket workflow state.
+- `attention_required` is a durable human-attention overlay, not a separate workflow state.
+- `queued_by` / `queued_at` are durable facts recorded when the user queues a ready Ticket.
+
+Do not persist `activity` in Ticket frontmatter. Current activity such as implementing/reviewing/validating should be displayed by combining Ticket state with live Pod/session/role-launch metadata and latest thread events.
+
+## Flow
+
+- `intake -> ready` is completed through Intake Pod conversation and Ticket materialization.
+- `ready -> queued` is the normal human panel action.
+- `queued -> inprogress` is performed by Orchestrator scheduling.
+- `inprogress -> done` is performed by Orchestrator/review/close flow when complete.
+
+The panel action currently called `Go` should become `Queue`, because the user is queuing a ready Ticket rather than approving implementation details.
+
+## Requirements
+
+- Add explicit workflow state fields to the Ticket model/parser/writer and tool/CLI surfaces as needed.
+- Migrate or default existing Tickets safely without relying on labels/title/thread-event heuristics as authoritative state.
+- Update `yoi panel` to display `workflow_state` directly.
+- Remove or demote current panel heuristics that infer phase/action from labels, title text, `readiness`, `needs_preflight`, or thread event presence.
+- Rename panel `Go` action to `Queue` and make it transition `ready -> queued`.
+- Queue action must re-check current Ticket state before mutation.
+- Queue action records a durable thread decision/comment and sets `queued_by` / `queued_at` if those fields are adopted.
+- Orchestrator should treat `queued` as schedulable and set `inprogress` when it starts work.
+- Intake should set `workflow_state = ready` when the Ticket is fully materialized and ready to queue.
+- Done/close flow should set `workflow_state = done` or derive it consistently from close status.
+- Do not store transient `activity` in Ticket frontmatter.
+- Preserve no-Ticket workspace Pod-centric panel behavior.
+
+## Non-goals
+
+- Building a scheduler/lease system.
+- Persisting live Pod activity into Tickets.
+- Reintroducing human approve/reject gates for every review loop.
+- Reintroducing `--multi` or `:ticket`.
+- Layout-only tuning unrelated to explicit state.
+
+## Acceptance criteria
+
+- New/updated Tickets can carry explicit workflow state.
+- Panel rows show workflow state from Ticket fields rather than inferred phase/status.
+- Ready Tickets show `Queue` rather than `Go`.
+- Queue action transitions only `ready -> queued` and rejects stale/invalid states.
+- Review/rework activity does not create a separate workflow state; it remains `inprogress` plus runtime/thread detail.
+- No persistent `activity` field is required for current Pod activity.
+- Existing tests cover default/migration behavior, panel display, Queue dispatch, and stale-state rejection.
