@@ -16,3 +16,16 @@ Before layout/display tuning, the panel should support a minimal safe action dis
 
 
 ---
+
+<!-- event: plan author: hare at: 2026-06-06T05:30:26Z -->
+
+## Plan
+
+Preflight result: `implementation-ready` as the final first-pass panel slice before layout/display tuning.
+
+The first panel slices now provide display, Orchestrator lifecycle, Intake launch, and handoff. This ticket should replace blanket display-only Ticket actions with minimal safe dispatch, especially Go and Defer, while keeping Review/Close safe if a full inline flow is not yet available.
+
+Detailed delegation intent is recorded in `artifacts/delegation-intent.md`.
+
+
+---
