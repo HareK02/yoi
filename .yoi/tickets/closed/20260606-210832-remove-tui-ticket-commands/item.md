@@ -2,12 +2,12 @@
 id: 20260606-210832-remove-tui-ticket-commands
 slug: remove-tui-ticket-commands
 title: Remove obsolete TUI :ticket commands
-status: open
+status: closed
 kind: task
 priority: P2
 labels: [tui, ticket, cleanup, panel]
 created_at: 2026-06-06T21:08:32Z
-updated_at: 2026-06-06T21:09:49Z
+updated_at: 2026-06-06T21:28:39Z
 assignee: null
 legacy_ticket: null
 ---
