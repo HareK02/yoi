@@ -2,12 +2,12 @@
 id: 20260606-052903-workspace-panel-ticket-action-dispatch
 slug: workspace-panel-ticket-action-dispatch
 title: Workspace panel Ticket action dispatch
-status: open
+status: closed
 kind: task
 priority: P1
 labels: [tui, ticket, orchestration, panel]
 created_at: 2026-06-06T05:29:03Z
-updated_at: 2026-06-06T05:30:26Z
+updated_at: 2026-06-06T06:04:40Z
 assignee: null
 legacy_ticket: null
 ---
