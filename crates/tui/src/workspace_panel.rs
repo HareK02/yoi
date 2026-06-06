@@ -13,6 +13,7 @@ use crate::pod_list::{PodList, PodListEntry, StoredMetadataState};
 pub(crate) struct WorkspacePanelViewModel {
     pub(crate) header: WorkspacePanelHeader,
     pub(crate) rows: Vec<PanelRow>,
+    pub(crate) composer: WorkspacePanelComposer,
 }
 
 impl WorkspacePanelViewModel {
@@ -31,6 +32,7 @@ impl WorkspacePanelViewModel {
                 diagnostics: Vec::new(),
             },
             rows: Vec::new(),
+            composer: WorkspacePanelComposer::companion_only(),
         }
     }
 
@@ -46,6 +48,44 @@ pub(crate) struct WorkspacePanelHeader {
     pub(crate) ticket_configured: bool,
     pub(crate) orchestrator: Option<OrchestratorPanelState>,
     pub(crate) diagnostics: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ComposerTarget {
+    Companion,
+    TicketIntake,
+}
+
+impl ComposerTarget {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Companion => "Companion",
+            Self::TicketIntake => "Ticket Intake",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorkspacePanelComposer {
+    pub(crate) available_targets: Vec<ComposerTarget>,
+}
+
+impl WorkspacePanelComposer {
+    pub(crate) fn companion_only() -> Self {
+        Self {
+            available_targets: vec![ComposerTarget::Companion],
+        }
+    }
+
+    pub(crate) fn ticket_enabled() -> Self {
+        Self {
+            available_targets: vec![ComposerTarget::Companion, ComposerTarget::TicketIntake],
+        }
+    }
+
+    pub(crate) fn is_available(&self, target: ComposerTarget) -> bool {
+        self.available_targets.contains(&target)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -386,6 +426,7 @@ pub(crate) fn build_workspace_panel(
         TicketConfigAvailability::Absent => {}
         TicketConfigAvailability::Usable => {
             model.header.ticket_configured = true;
+            model.composer = WorkspacePanelComposer::ticket_enabled();
             match TicketConfig::load_workspace(workspace_root) {
                 Ok(config) => {
                     model.header.ticket_root = config.backend_root().to_path_buf();
@@ -938,6 +979,10 @@ mod tests {
         let model = build_workspace_panel(temp.path(), &live_pods(&["idle"]));
 
         assert!(model.header.diagnostics.is_empty());
+        assert_eq!(
+            model.composer.available_targets,
+            vec![ComposerTarget::Companion]
+        );
         assert_eq!(model.rows.len(), 1);
         assert_eq!(model.rows[0].key, PanelRowKey::Pod("idle".to_string()));
         assert!(model.rows[0].ticket.is_none());
@@ -957,6 +1002,10 @@ mod tests {
         });
 
         let model = build_workspace_panel(temp.path(), &empty_pods());
+        assert_eq!(
+            model.composer.available_targets,
+            vec![ComposerTarget::Companion, ComposerTarget::TicketIntake]
+        );
         let rows = model
             .rows
             .iter()
@@ -1164,6 +1213,10 @@ mod tests {
         let model = build_workspace_panel(temp.path(), &empty_pods());
 
         assert!(model.header.ticket_configured);
+        assert_eq!(
+            model.composer.available_targets,
+            vec![ComposerTarget::Companion]
+        );
         assert!(model.header.diagnostics.iter().any(|diagnostic| {
             diagnostic.contains("Ticket config is unusable")
                 && diagnostic.contains("not a regular file")

@@ -2,8 +2,11 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use client::ticket_role::{TicketRole, TicketRoleLaunchContext};
-use client::{PodRuntimeCommand, SpawnConfig, launch_ticket_role_pod, spawn_pod};
+use client::ticket_role::{
+    TicketRole, TicketRoleLaunchContext, TicketRoleLaunchError, TicketRoleLaunchResult,
+    launch_ticket_role_pod,
+};
+use client::{PodRuntimeCommand, SpawnConfig, spawn_pod};
 use crossterm::event::{Event as TermEvent, KeyCode, KeyEvent, KeyModifiers, poll, read};
 use pod_store::FsPodStore;
 use protocol::stream::{JsonLineReader, JsonLineWriter};
@@ -25,9 +28,9 @@ use crate::pod_list::{
     read_stored_pod_infos,
 };
 use crate::workspace_panel::{
-    ActionPriority, NextUserAction, OrchestratorLifecyclePlan, OrchestratorPanelState,
-    OrchestratorPanelStatus, OrchestratorPodPresence, PanelRow, PanelRowKey,
-    TicketConfigAvailability, WorkspacePanelViewModel, bounded_panel_diagnostic,
+    ActionPriority, ComposerTarget, NextUserAction, OrchestratorLifecyclePlan,
+    OrchestratorPanelState, OrchestratorPanelStatus, OrchestratorPodPresence, PanelRow,
+    PanelRowKey, TicketConfigAvailability, WorkspacePanelViewModel, bounded_panel_diagnostic,
     build_workspace_panel, decide_orchestrator_lifecycle, orchestrator_pod_presence,
     ticket_config_availability, workspace_orchestrator_pod_name,
 };
@@ -141,6 +144,16 @@ pub(crate) async fn run(
                     app.reload_or_notice().await;
                     next_poll = Instant::now() + MULTI_POD_POLL_INTERVAL;
                 }
+                MultiPodAction::LaunchIntake(request) => {
+                    pending_reload.abort();
+                    terminal.draw(|f| draw(f, app))?;
+                    let result =
+                        launch_ticket_role_pod(request.context, request.runtime_command, |_| {})
+                            .await;
+                    app.finish_intake_launch(result);
+                    app.reload_or_notice().await;
+                    next_poll = Instant::now() + MULTI_POD_POLL_INTERVAL;
+                }
             },
             TermEvent::Paste(text) => app.input.insert_paste(text),
             TermEvent::Resize(_, _) => {}
@@ -242,13 +255,21 @@ pub(crate) struct DirectSendRequest {
     segments: Vec<Segment>,
 }
 
+#[derive(Debug)]
+pub(crate) struct IntakeLaunchRequest {
+    context: TicketRoleLaunchContext,
+    runtime_command: PodRuntimeCommand,
+}
+
 pub(crate) struct MultiPodApp {
     pub(crate) list: PodList,
     pub(crate) panel: WorkspacePanelViewModel,
     pub(crate) input: InputBuffer,
     selected_row: Option<PanelRowKey>,
+    composer_target: ComposerTarget,
     notice: Option<String>,
     sending: bool,
+    runtime_command: PodRuntimeCommand,
 }
 
 impl MultiPodApp {
@@ -258,7 +279,9 @@ impl MultiPodApp {
     ) -> Result<Self, MultiPodError> {
         let snapshot = load_multi_pod_snapshot(
             selected_name,
-            OrchestratorLifecycleMode::Ensure { runtime_command },
+            OrchestratorLifecycleMode::Ensure {
+                runtime_command: runtime_command.clone(),
+            },
         )
         .await?;
         let mut app = Self {
@@ -266,10 +289,13 @@ impl MultiPodApp {
             panel: snapshot.panel,
             input: InputBuffer::new(),
             selected_row: None,
+            composer_target: ComposerTarget::Companion,
             notice: None,
             sending: false,
+            runtime_command,
         };
         app.ensure_selection_visible();
+        app.ensure_composer_target_available();
         Ok(app)
     }
 
@@ -321,6 +347,7 @@ impl MultiPodApp {
         self.panel = snapshot.panel;
         self.selected_row = previous_row.filter(|key| self.panel.row(key).is_some());
         self.ensure_selection_visible();
+        self.ensure_composer_target_available();
     }
 
     fn selected_panel_row(&self) -> Option<&PanelRow> {
@@ -451,6 +478,34 @@ impl MultiPodApp {
         self.selected_row = Some(key);
     }
 
+    fn ensure_composer_target_available(&mut self) {
+        if !self.panel.composer.is_available(self.composer_target) {
+            self.composer_target = ComposerTarget::Companion;
+        }
+    }
+
+    pub(crate) fn cycle_composer_target(&mut self) {
+        let targets = &self.panel.composer.available_targets;
+        if targets.len() <= 1 {
+            self.composer_target = ComposerTarget::Companion;
+            self.notice = Some(
+                "Ticket Intake target is unavailable without usable Ticket config.".to_string(),
+            );
+            return;
+        }
+        let current = targets
+            .iter()
+            .position(|target| *target == self.composer_target)
+            .unwrap_or(0);
+        let next = targets[(current + 1) % targets.len()];
+        self.composer_target = next;
+        self.notice = Some(format!("Composer target: {}", next.label()));
+    }
+
+    pub(crate) fn composer_target(&self) -> ComposerTarget {
+        self.composer_target
+    }
+
     pub(crate) fn prepare_open(&mut self) -> Option<OpenPodRequest> {
         let (pod_name, socket_override) = {
             let entry = match self.selected_pod_entry() {
@@ -544,6 +599,56 @@ impl MultiPodApp {
         }
     }
 
+    pub(crate) fn prepare_intake_launch(&mut self) -> Option<IntakeLaunchRequest> {
+        if !self
+            .panel
+            .composer
+            .is_available(ComposerTarget::TicketIntake)
+        {
+            self.composer_target = ComposerTarget::Companion;
+            self.notice = Some(
+                "Ticket Intake target is unavailable without usable Ticket config.".to_string(),
+            );
+            return None;
+        }
+        let body = Segment::flatten_to_text(&self.input.submit_segments());
+        if body.trim().is_empty() {
+            self.notice = Some("Ticket Intake input is empty; type a request first.".to_string());
+            return None;
+        }
+        let mut context =
+            TicketRoleLaunchContext::new(current_workspace_root(), TicketRole::Intake);
+        context.user_instruction = Some(body);
+        self.sending = true;
+        self.notice = Some("Launching Ticket Intake…".to_string());
+        Some(IntakeLaunchRequest {
+            context,
+            runtime_command: self.runtime_command.clone(),
+        })
+    }
+
+    pub(crate) fn finish_intake_launch(
+        &mut self,
+        result: Result<TicketRoleLaunchResult, TicketRoleLaunchError>,
+    ) {
+        self.sending = false;
+        match result {
+            Ok(result) => {
+                let pod_name = result.plan.pod_name;
+                self.input.clear();
+                self.notice = Some(bounded_panel_diagnostic(format!(
+                    "Launched Ticket Intake Pod {pod_name}."
+                )));
+            }
+            Err(error) => {
+                self.notice = Some(format!(
+                    "Intake launch failed; composer kept: {}",
+                    bounded_panel_diagnostic(error.to_string())
+                ));
+            }
+        }
+    }
+
     fn handle_key(&mut self, key: KeyEvent) -> MultiPodAction {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
@@ -567,12 +672,20 @@ impl MultiPodApp {
                 self.select_next();
                 MultiPodAction::None
             }
+            KeyCode::Char('t') if ctrl => {
+                self.cycle_composer_target();
+                MultiPodAction::None
+            }
             KeyCode::Char('o') if !ctrl && !alt => MultiPodAction::Open,
             KeyCode::Char('r') if !ctrl && !alt => MultiPodAction::Refresh,
             KeyCode::Enter if alt => {
                 self.input.insert_newline();
                 MultiPodAction::None
             }
+            KeyCode::Enter if self.composer_target == ComposerTarget::TicketIntake => self
+                .prepare_intake_launch()
+                .map(MultiPodAction::LaunchIntake)
+                .unwrap_or(MultiPodAction::None),
             KeyCode::Enter if self.composer_is_blank() => MultiPodAction::Open,
             KeyCode::Enter => self
                 .prepare_send()
@@ -617,6 +730,7 @@ enum MultiPodAction {
     Open,
     Refresh,
     Send(DirectSendRequest),
+    LaunchIntake(IntakeLaunchRequest),
 }
 
 #[derive(Debug, Clone)]
@@ -1222,7 +1336,13 @@ fn input_area_height(render: &crate::input::InputRender, terminal_height: u16) -
 }
 
 fn draw_title(frame: &mut Frame<'_>, app: &MultiPodApp, area: Rect) {
-    let guidance = if app.panel.header.ticket_configured {
+    let guidance = if app
+        .panel
+        .composer
+        .is_available(ComposerTarget::TicketIntake)
+    {
+        "  Ticket actions are display-only · Enter uses composer target · Ctrl+T target · o open/attach · r refresh"
+    } else if app.panel.header.ticket_configured {
         "  Ticket actions are display-only · Enter sends to selected idle Pod · o open/attach · r refresh"
     } else {
         "  Pod-centric view · Enter sends to selected idle Pod · o open/attach · r refresh"
@@ -1485,7 +1605,7 @@ fn draw_separator(frame: &mut Frame<'_>, area: Rect) {
 }
 
 fn draw_target_status(frame: &mut Frame<'_>, app: &MultiPodApp, area: Rect) {
-    let line = if let Some(row) = app
+    let mut line = if let Some(row) = app
         .selected_panel_row()
         .filter(|row| row.is_ticket_action())
     {
@@ -1544,7 +1664,21 @@ fn draw_target_status(frame: &mut Frame<'_>, app: &MultiPodApp, area: Rect) {
             )),
         }
     };
-    frame.render_widget(Paragraph::new(line), area);
+    let mut prefix = vec![
+        Span::styled("composer ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            app.composer_target().label(),
+            Style::default()
+                .fg(match app.composer_target() {
+                    ComposerTarget::Companion => Color::Green,
+                    ComposerTarget::TicketIntake => Color::Magenta,
+                })
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  ·  ", Style::default().fg(Color::DarkGray)),
+    ];
+    prefix.append(&mut line.spans);
+    frame.render_widget(Paragraph::new(Line::from(prefix)), area);
 }
 
 fn draw_input(frame: &mut Frame<'_>, render: &crate::input::InputRender, area: Rect) {
@@ -1566,19 +1700,40 @@ fn draw_input(frame: &mut Frame<'_>, render: &crate::input::InputRender, area: R
 }
 
 fn draw_actionbar(frame: &mut Frame<'_>, app: &MultiPodApp, area: Rect) {
-    let left = if app.sending {
+    let left = if app.sending && app.composer_target() == ComposerTarget::TicketIntake {
+        "launching Ticket Intake…".to_string()
+    } else if app.sending {
         "sending…".to_string()
     } else if let Some(notice) = app.notice.as_deref() {
         notice.to_string()
     } else if let Some(reason) = app.selected_send_disabled_reason() {
         reason
     } else {
-        "idle live target: Enter sends directly without opening conversation".to_string()
+        match app.composer_target() {
+            ComposerTarget::Companion => {
+                "idle live target: Enter sends directly without opening conversation".to_string()
+            }
+            ComposerTarget::TicketIntake => {
+                "Ticket Intake target: Enter launches Intake with composer text".to_string()
+            }
+        }
     };
-    let right = "↑/↓ select  Enter send  o open  r refresh  Esc quit";
+    let right = if app
+        .panel
+        .composer
+        .is_available(ComposerTarget::TicketIntake)
+    {
+        "↑/↓ select  Enter use target  Ctrl+T target  o open  r refresh  Esc quit"
+    } else {
+        "↑/↓ select  Enter send  o open  r refresh  Esc quit"
+    };
+    let left_width = area
+        .width
+        .saturating_sub(right.width() as u16)
+        .saturating_sub(2) as usize;
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            truncate_with_ellipsis(&left, area.width.saturating_sub(42) as usize),
+            truncate_with_ellipsis(&left, left_width),
             Style::default().fg(Color::DarkGray),
         ))),
         area,
@@ -2194,6 +2349,126 @@ mod tests {
     }
 
     #[test]
+    fn multi_composer_target_switch_preserves_typed_text() {
+        let mut app = ticket_enabled_app(vec![live_info("idle", PodStatus::Idle)]);
+        app.input.insert_str("draft intake request");
+
+        assert!(matches!(app.composer_target(), ComposerTarget::Companion));
+        assert!(matches!(
+            app.handle_key(modified_key(KeyCode::Char('t'), KeyModifiers::CONTROL)),
+            MultiPodAction::None
+        ));
+
+        assert!(matches!(
+            app.composer_target(),
+            ComposerTarget::TicketIntake
+        ));
+        assert_eq!(input_text(&app), "draft intake request");
+        assert!(app.notice.as_deref().unwrap().contains("Ticket Intake"));
+    }
+
+    #[test]
+    fn multi_no_ticket_workspace_exposes_only_companion_target() {
+        let mut app = test_app(vec![live_info("idle", PodStatus::Idle)]);
+        app.input.insert_str("draft message");
+
+        app.cycle_composer_target();
+
+        assert_eq!(
+            app.panel.composer.available_targets,
+            vec![ComposerTarget::Companion]
+        );
+        assert!(matches!(app.composer_target(), ComposerTarget::Companion));
+        assert_eq!(input_text(&app), "draft message");
+        assert!(app.notice.as_deref().unwrap().contains("unavailable"));
+    }
+
+    #[test]
+    fn multi_ticket_intake_rejects_empty_input() {
+        let mut app = ticket_enabled_app(vec![live_info("idle", PodStatus::Idle)]);
+        app.cycle_composer_target();
+        app.input.insert_str("  \n\t");
+
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Enter)),
+            MultiPodAction::None
+        ));
+
+        assert!(matches!(
+            app.composer_target(),
+            ComposerTarget::TicketIntake
+        ));
+        assert!(!app.sending);
+        assert_eq!(input_text(&app), "  \n\t");
+        assert!(app.notice.as_deref().unwrap().contains("input is empty"));
+    }
+
+    #[test]
+    fn multi_ticket_intake_enter_builds_launch_request_not_direct_send() {
+        let mut app = ticket_enabled_app(vec![live_info("idle", PodStatus::Idle)]);
+        app.cycle_composer_target();
+        app.input.insert_str("please intake this work");
+
+        let request = match app.handle_key(key(KeyCode::Enter)) {
+            MultiPodAction::LaunchIntake(request) => request,
+            MultiPodAction::Send(_) => panic!("Ticket Intake target must not direct-send"),
+            _ => panic!("Ticket Intake target should launch Intake"),
+        };
+
+        assert_eq!(request.context.role, TicketRole::Intake);
+        assert_eq!(
+            request.context.user_instruction.as_deref(),
+            Some("please intake this work")
+        );
+        assert_eq!(request.runtime_command.program(), Path::new("/tmp/yoi"));
+        assert!(app.sending);
+        assert!(app.notice.as_deref().unwrap().contains("Launching"));
+        assert_eq!(input_text(&app), "please intake this work");
+    }
+
+    #[test]
+    fn multi_ticket_intake_finish_success_clears_composer_and_reports_pod() {
+        let mut app = ticket_enabled_app(vec![live_info("idle", PodStatus::Idle)]);
+        app.cycle_composer_target();
+        app.input.insert_str("please intake this work");
+        app.sending = true;
+
+        app.finish_intake_launch(Ok(TicketRoleLaunchResult {
+            plan: client::ticket_role::TicketRoleLaunchPlan {
+                workspace_root: PathBuf::from("/tmp/workspace"),
+                role: TicketRole::Intake,
+                pod_name: "intake-pod".to_string(),
+                profile: "builtin:default".to_string(),
+                workflow: "ticket-intake-workflow".to_string(),
+                launch_prompt_ref: None,
+                run_segments: vec![],
+            },
+            ready: client::SpawnReady {
+                pod_name: "intake-pod".to_string(),
+                socket_path: PathBuf::from("/tmp/intake.sock"),
+            },
+        }));
+
+        assert!(!app.sending);
+        assert_eq!(input_text(&app), "");
+        assert!(app.notice.as_deref().unwrap().contains("intake-pod"));
+    }
+
+    #[test]
+    fn multi_ticket_intake_finish_failure_keeps_composer() {
+        let mut app = ticket_enabled_app(vec![live_info("idle", PodStatus::Idle)]);
+        app.cycle_composer_target();
+        app.input.insert_str("please keep this");
+        app.sending = true;
+
+        app.finish_intake_launch(Err(TicketRoleLaunchError::EmptyPodName));
+
+        assert!(!app.sending);
+        assert_eq!(input_text(&app), "please keep this");
+        assert!(app.notice.as_deref().unwrap().contains("composer kept"));
+    }
+
+    #[test]
     fn multi_empty_enter_on_non_openable_row_matches_o_diagnostic() {
         let mut enter_app = test_app(vec![unreachable_live_info("unreachable")]);
         assert!(matches!(
@@ -2223,6 +2498,15 @@ mod tests {
         ))
     }
 
+    fn ticket_enabled_app(live: Vec<LivePodInfo>) -> MultiPodApp {
+        let mut panel = WorkspacePanelViewModel::empty(Path::new("test"));
+        panel.composer = crate::workspace_panel::WorkspacePanelComposer::ticket_enabled();
+        app_with_panel(
+            PodList::from_sources(PodVisibilitySource::ResumePicker, vec![], live, None, 10),
+            panel,
+        )
+    }
+
     fn app_with_list(list: PodList) -> MultiPodApp {
         app_with_panel(list, WorkspacePanelViewModel::empty(Path::new("test")))
     }
@@ -2233,10 +2517,13 @@ mod tests {
             panel,
             input: InputBuffer::new(),
             selected_row: None,
+            composer_target: ComposerTarget::Companion,
             notice: None,
             sending: false,
+            runtime_command: PodRuntimeCommand::for_executable("/tmp/yoi"),
         };
         app.ensure_selection_visible();
+        app.ensure_composer_target_available();
         app
     }
 
@@ -2320,6 +2607,10 @@ mod tests {
     }
 
     fn key(code: KeyCode) -> KeyEvent {
-        KeyEvent::new(code, KeyModifiers::NONE)
+        modified_key(code, KeyModifiers::NONE)
+    }
+
+    fn modified_key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, modifiers)
     }
 }
