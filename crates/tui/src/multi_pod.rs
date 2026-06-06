@@ -20,6 +20,11 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 use session_store::FsStore;
+use ticket::config::TicketConfig;
+use ticket::{
+    LocalTicketBackend, NewTicketEvent, TicketBackend, TicketEventKind, TicketIdOrSlug,
+    TicketStatus,
+};
 use tokio::net::UnixStream;
 use unicode_width::UnicodeWidthStr;
 
@@ -32,8 +37,8 @@ use crate::workspace_panel::{
     ActionPriority, ComposerTarget, NextUserAction, OrchestratorLifecyclePlan,
     OrchestratorPanelState, OrchestratorPanelStatus, OrchestratorPodPresence, PanelRow,
     PanelRowKey, TicketConfigAvailability, WorkspacePanelViewModel, bounded_panel_diagnostic,
-    build_workspace_panel, decide_orchestrator_lifecycle, orchestrator_pod_presence,
-    ticket_config_availability, workspace_orchestrator_pod_name,
+    build_current_ticket_row, build_workspace_panel, decide_orchestrator_lifecycle,
+    orchestrator_pod_presence, ticket_config_availability, workspace_orchestrator_pod_name,
 };
 
 const MAX_ENTRIES: usize = 50;
@@ -142,6 +147,14 @@ pub(crate) async fn run(
                     terminal.draw(|f| draw(f, app))?;
                     let result = send_run_and_confirm(&request.socket_path, request.segments).await;
                     app.finish_send(result);
+                    app.reload_or_notice().await;
+                    next_poll = Instant::now() + MULTI_POD_POLL_INTERVAL;
+                }
+                MultiPodAction::DispatchTicketAction(request) => {
+                    pending_reload.abort();
+                    terminal.draw(|f| draw(f, app))?;
+                    let result = dispatch_ticket_action(request).await;
+                    app.finish_ticket_action_dispatch(result);
                     app.reload_or_notice().await;
                     next_poll = Instant::now() + MULTI_POD_POLL_INTERVAL;
                 }
@@ -430,6 +443,12 @@ impl MultiPodApp {
             .and_then(|key| self.panel.row(key))
     }
 
+    fn selected_ticket_action(&self) -> Option<NextUserAction> {
+        self.selected_panel_row()
+            .filter(|row| row.is_ticket_action())
+            .and_then(|row| row.next_action)
+    }
+
     fn selected_pod_entry(&self) -> Option<&PodListEntry> {
         match self.selected_row.as_ref() {
             Some(PanelRowKey::Pod(name)) => {
@@ -457,7 +476,8 @@ impl MultiPodApp {
                     .clone()
                     .or_else(|| row.key_hint.clone())
                     .unwrap_or_else(|| {
-                        "Ticket actions are display-only in this first panel slice.".to_string()
+                        "Press Enter to dispatch this Ticket action; stale Tickets are re-checked before any mutation."
+                            .to_string()
                     }),
             );
         }
@@ -673,6 +693,55 @@ impl MultiPodApp {
         }
     }
 
+    pub(crate) fn prepare_ticket_action_dispatch(&mut self) -> Option<TicketActionRequest> {
+        let row = match self.selected_panel_row() {
+            Some(row) if row.is_ticket_action() => row,
+            Some(row) if row.ticket.is_some() => {
+                self.notice = Some("Selected Ticket row has no inline action.".to_string());
+                return None;
+            }
+            _ => {
+                self.notice = Some("No Ticket action is selected.".to_string());
+                return None;
+            }
+        };
+        let Some(action) = row.next_action else {
+            self.notice = Some("Selected Ticket row has no inline action.".to_string());
+            return None;
+        };
+        let (ticket_id, ticket_slug) = {
+            let Some(ticket) = row.ticket.as_ref() else {
+                self.notice = Some("No Ticket action is selected.".to_string());
+                return None;
+            };
+            (ticket.id.clone(), ticket.slug.clone())
+        };
+        let orchestrator = ticket_action_orchestrator_target(&self.panel, &self.list);
+        self.sending = true;
+        self.notice = Some(format!(
+            "Dispatching {} for Ticket {}…",
+            action.label(),
+            ticket_slug
+        ));
+        Some(TicketActionRequest {
+            workspace_root: current_workspace_root(),
+            ticket_id,
+            action,
+            orchestrator,
+        })
+    }
+
+    pub(crate) fn finish_ticket_action_dispatch(
+        &mut self,
+        result: Result<TicketActionOutcome, TicketActionError>,
+    ) {
+        self.sending = false;
+        self.notice = Some(match result {
+            Ok(outcome) => outcome.notice,
+            Err(error) => error.to_string(),
+        });
+    }
+
     pub(crate) fn prepare_intake_launch(&mut self) -> Option<IntakeLaunchRequest> {
         if !self
             .panel
@@ -786,6 +855,13 @@ impl MultiPodApp {
                 self.input.insert_newline();
                 MultiPodAction::None
             }
+            KeyCode::Enter
+                if self.composer_is_blank() && self.selected_ticket_action().is_some() =>
+            {
+                self.prepare_ticket_action_dispatch()
+                    .map(MultiPodAction::DispatchTicketAction)
+                    .unwrap_or(MultiPodAction::None)
+            }
             KeyCode::Enter if self.composer_target == ComposerTarget::TicketIntake => self
                 .prepare_intake_launch()
                 .map(MultiPodAction::LaunchIntake)
@@ -834,6 +910,7 @@ enum MultiPodAction {
     Open,
     Refresh,
     Send(DirectSendRequest),
+    DispatchTicketAction(TicketActionRequest),
     LaunchIntake(IntakeLaunchRequest),
 }
 
@@ -1093,6 +1170,290 @@ async fn load_pod_list(
     ))
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct TicketActionRequest {
+    workspace_root: PathBuf,
+    ticket_id: String,
+    action: NextUserAction,
+    orchestrator: Option<OrchestratorNotifyTarget>,
+}
+
+#[derive(Debug, Clone)]
+struct OrchestratorNotifyTarget {
+    pod_name: String,
+    socket_path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TicketActionOutcome {
+    notice: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TicketActionError {
+    BackendConfig(String),
+    Ticket(String),
+    Stale(String),
+}
+
+impl std::fmt::Display for TicketActionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BackendConfig(message) => write!(f, "Ticket action unavailable: {message}"),
+            Self::Ticket(message) => write!(f, "Ticket action failed: {message}"),
+            Self::Stale(message) => write!(f, "Ticket action rejected: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for TicketActionError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OrchestratorNotificationOutcome {
+    Sent { pod_name: String },
+    Skipped(String),
+    Warning(String),
+}
+
+impl OrchestratorNotificationOutcome {
+    fn sentence(&self) -> String {
+        match self {
+            Self::Sent { pod_name } => format!("workspace Orchestrator {pod_name} notified"),
+            Self::Skipped(reason) => format!("workspace Orchestrator not notified: {reason}"),
+            Self::Warning(message) => {
+                format!("workspace Orchestrator notification warning: {message}")
+            }
+        }
+    }
+}
+
+fn ticket_action_orchestrator_target(
+    panel: &WorkspacePanelViewModel,
+    list: &PodList,
+) -> Option<OrchestratorNotifyTarget> {
+    let orchestrator = panel.header.orchestrator.as_ref()?;
+    if !orchestrator_status_is_peer_reachable(orchestrator.status) {
+        return None;
+    }
+    let entry = list
+        .entries
+        .iter()
+        .find(|entry| entry.name == orchestrator.pod_name)?;
+    if !entry.actions.can_open {
+        return None;
+    }
+    let live = entry.live.as_ref()?;
+    if !live.reachable {
+        return None;
+    }
+    Some(OrchestratorNotifyTarget {
+        pod_name: orchestrator.pod_name.clone(),
+        socket_path: live.socket_path.clone(),
+    })
+}
+
+async fn dispatch_ticket_action(
+    request: TicketActionRequest,
+) -> Result<TicketActionOutcome, TicketActionError> {
+    match ticket_config_availability(&request.workspace_root) {
+        TicketConfigAvailability::Usable => {}
+        TicketConfigAvailability::Absent => {
+            return Err(TicketActionError::Stale(
+                "Ticket config is absent; workspace panel no longer exposes Ticket actions"
+                    .to_string(),
+            ));
+        }
+        TicketConfigAvailability::Unusable(message) => {
+            return Err(TicketActionError::Stale(format!(
+                "Ticket config is unusable; workspace panel no longer exposes Ticket actions: {message}"
+            )));
+        }
+    }
+    let config = TicketConfig::load_workspace(&request.workspace_root)
+        .map_err(|error| TicketActionError::BackendConfig(error.to_string()))?;
+    let backend = LocalTicketBackend::new(config.backend_root());
+    let authority_pods = PodList::from_sources(
+        PodVisibilitySource::ResumePicker,
+        Vec::new(),
+        Vec::new(),
+        None,
+        0,
+    );
+    let current_row = build_current_ticket_row(&backend, &request.ticket_id, &authority_pods)
+        .map_err(|error| TicketActionError::Ticket(error.to_string()))?;
+    let current_ticket = current_row
+        .ticket
+        .as_ref()
+        .ok_or_else(|| TicketActionError::Stale("current row is not a Ticket".to_string()))?;
+    let current_action = current_row.next_action.ok_or_else(|| {
+        TicketActionError::Stale("current Ticket no longer has an inline action".to_string())
+    })?;
+    if current_action != request.action {
+        return Err(TicketActionError::Stale(format!(
+            "current action is {} but selected action was {}; reload and retry",
+            current_action.label(),
+            request.action.label()
+        )));
+    }
+
+    match request.action {
+        NextUserAction::Go | NextUserAction::ApproveIntake => {
+            append_panel_decision(&backend, &request.ticket_id, panel_go_body(current_ticket))?;
+            let notification =
+                notify_workspace_orchestrator(request.orchestrator, current_ticket).await;
+            Ok(TicketActionOutcome {
+                notice: format!(
+                    "Recorded Panel Go for Ticket {}; {}. No implementation was started.",
+                    current_ticket.slug,
+                    notification.sentence()
+                ),
+            })
+        }
+        NextUserAction::Defer => {
+            append_panel_decision(
+                &backend,
+                &request.ticket_id,
+                panel_defer_body(current_ticket),
+            )?;
+            let mut moved = false;
+            if current_ticket
+                .status
+                .eq_ignore_ascii_case(TicketStatus::Open.as_str())
+            {
+                backend
+                    .set_status(
+                        TicketIdOrSlug::Id(request.ticket_id.clone()),
+                        TicketStatus::Pending,
+                    )
+                    .map_err(|error| TicketActionError::Ticket(error.to_string()))?;
+                moved = true;
+            }
+            let notice = if moved {
+                format!(
+                    "Recorded Panel Defer for Ticket {} and moved it to pending.",
+                    current_ticket.slug
+                )
+            } else {
+                format!(
+                    "Recorded Panel Defer for Ticket {}; status was already {}.",
+                    current_ticket.slug, current_ticket.status
+                )
+            };
+            Ok(TicketActionOutcome { notice })
+        }
+        NextUserAction::Review => Ok(TicketActionOutcome {
+            notice: format!(
+                "Review for Ticket {} requires explicit approve/request-changes evidence; no review was recorded.",
+                current_ticket.slug
+            ),
+        }),
+        NextUserAction::Close => Ok(TicketActionOutcome {
+            notice: format!(
+                "Close for Ticket {} requires explicit resolution text; no close was recorded.",
+                current_ticket.slug
+            ),
+        }),
+        NextUserAction::Clarify
+        | NextUserAction::Edit
+        | NextUserAction::OpenPod
+        | NextUserAction::SendToPod
+        | NextUserAction::Wait => Ok(TicketActionOutcome {
+            notice: format!(
+                "{} for Ticket {} has no safe inline workspace-panel dispatch; use the Ticket workflow.",
+                request.action.label(),
+                current_ticket.slug
+            ),
+        }),
+    }
+}
+
+fn append_panel_decision(
+    backend: &LocalTicketBackend,
+    ticket_id: &str,
+    body: String,
+) -> Result<(), TicketActionError> {
+    let mut event = NewTicketEvent::new(TicketEventKind::Decision, body);
+    event.author = Some("workspace-panel".to_string());
+    backend
+        .add_event(TicketIdOrSlug::Id(ticket_id.to_owned()), event)
+        .map_err(|error| TicketActionError::Ticket(error.to_string()))
+}
+
+fn panel_go_body(ticket: &crate::workspace_panel::TicketPanelEntry) -> String {
+    format!(
+        "Panel Go recorded by a human for Ticket `{}` (`{}`). The workspace Orchestrator may route or run preflight after re-checking current Ticket authority. This is not authorization to start implementation directly and does not enqueue or spawn coder/reviewer Pods.",
+        ticket.slug, ticket.id
+    )
+}
+
+fn panel_defer_body(ticket: &crate::workspace_panel::TicketPanelEntry) -> String {
+    format!(
+        "Panel Defer recorded by a human for Ticket `{}` (`{}`). Keep this Ticket out of immediate Orchestrator routing until a later explicit Go; no scheduler or implementation Pod was started.",
+        ticket.slug, ticket.id
+    )
+}
+
+async fn notify_workspace_orchestrator(
+    target: Option<OrchestratorNotifyTarget>,
+    ticket: &crate::workspace_panel::TicketPanelEntry,
+) -> OrchestratorNotificationOutcome {
+    let Some(target) = target else {
+        return OrchestratorNotificationOutcome::Skipped(
+            "no live reachable Orchestrator socket is available".to_string(),
+        );
+    };
+    let message = format!(
+        "Workspace panel Go for Ticket `{}` (`{}`): human authorized Orchestrator routing/preflight. Re-check Ticket authority before acting. Do not start implementation directly from this notification; follow routing/preflight gates.",
+        ticket.slug, ticket.id
+    );
+    match send_notify_only(&target.socket_path, message).await {
+        Ok(()) => OrchestratorNotificationOutcome::Sent {
+            pod_name: target.pod_name,
+        },
+        Err(error) => OrchestratorNotificationOutcome::Warning(format!(
+            "{} at {}: {}",
+            target.pod_name,
+            target.socket_path.display(),
+            error
+        )),
+    }
+}
+
+async fn send_notify_only(socket: &Path, message: String) -> Result<(), DirectSendError> {
+    let stream = tokio::time::timeout(SOCKET_OP_TIMEOUT, UnixStream::connect(socket))
+        .await
+        .map_err(|_| DirectSendError::Io("connect timed out".into()))?
+        .map_err(|e| DirectSendError::Io(format!("connect: {e}")))?;
+    let (reader, writer) = stream.into_split();
+    let mut reader = JsonLineReader::new(reader);
+    let mut writer = JsonLineWriter::new(writer);
+
+    loop {
+        let event = tokio::time::timeout(SOCKET_OP_TIMEOUT, reader.next::<Event>())
+            .await
+            .map_err(|_| DirectSendError::Io("read initial Snapshot timed out".into()))?
+            .map_err(|e| DirectSendError::Io(format!("read initial Snapshot: {e}")))?;
+        match event {
+            Some(Event::Snapshot { .. }) => break,
+            Some(Event::Alert(_)) => continue,
+            Some(Event::Error { code, message }) => {
+                return Err(DirectSendError::Rejected { code, message });
+            }
+            Some(_) => continue,
+            None => {
+                return Err(DirectSendError::Io(
+                    "connection closed before initial Snapshot".into(),
+                ));
+            }
+        }
+    }
+
+    tokio::time::timeout(SOCKET_OP_TIMEOUT, writer.write(&Method::Notify { message }))
+        .await
+        .map_err(|_| DirectSendError::Io("write timed out".into()))?
+        .map_err(|e| DirectSendError::Io(format!("write: {e}")))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DirectSendError {
     AlreadyRunning,
@@ -1219,7 +1580,7 @@ fn selected_ticket_notice(row: Option<&PanelRow>) -> String {
         Some(row) if row.is_ticket_action() => {
             let action = row.next_action.map(NextUserAction::label).unwrap_or("View");
             format!(
-                "{action} for Ticket '{}' is display-only in this slice; use Ticket commands/workflows after re-checking state.",
+                "Press Enter to dispatch {action} for Ticket '{}' after re-checking current Ticket authority.",
                 row.title
             )
         }
@@ -1454,9 +1815,9 @@ fn draw_title(frame: &mut Frame<'_>, app: &MultiPodApp, area: Rect) {
         .composer
         .is_available(ComposerTarget::TicketIntake)
     {
-        "  Ticket actions are display-only · Enter uses composer target · Ctrl+T target · o open/attach · r refresh"
+        "  Enter dispatches selected Ticket action · Ctrl+T target · o open/attach · r refresh"
     } else if app.panel.header.ticket_configured {
-        "  Ticket actions are display-only · Enter sends to selected idle Pod · o open/attach · r refresh"
+        "  Enter dispatches selected Ticket action · Enter sends to selected idle Pod when no Ticket action is selected · o open/attach · r refresh"
     } else {
         "  Pod-centric view · Enter sends to selected idle Pod · o open/attach · r refresh"
     };
@@ -1739,7 +2100,7 @@ fn draw_target_status(frame: &mut Frame<'_>, app: &MultiPodApp, area: Rect) {
                 Style::default().fg(Color::Magenta),
             ),
             Span::styled(
-                " display-only; re-check Ticket before dispatch",
+                " dispatch via Enter; re-checks Ticket before mutation",
                 Style::default().fg(Color::DarkGray),
             ),
         ])
@@ -1891,7 +2252,235 @@ mod tests {
     use crate::pod_list::{LivePodInfo, PodEntrySummary, StoredMetadataState, StoredPodInfo};
     use std::fs;
     use tempfile::TempDir;
-    use ticket::{LocalTicketBackend, NewTicket, TicketBackend};
+    use ticket::{LocalTicketBackend, MarkdownText, NewTicket, TicketBackend, TicketReview};
+
+    fn ready_ticket_workspace(slug: &str) -> (TempDir, String, LocalTicketBackend) {
+        let temp = TempDir::new().unwrap();
+        fs::create_dir_all(temp.path().join(".yoi")).unwrap();
+        fs::write(
+            temp.path().join(".yoi/ticket.config.toml"),
+            "[backend]\nprovider = \"builtin:yoi_local\"\nroot = \".yoi/tickets\"\n",
+        )
+        .unwrap();
+        let backend = LocalTicketBackend::new(temp.path().join(".yoi/tickets"));
+        let ticket = backend
+            .create(NewTicket {
+                slug: Some(slug.to_string()),
+                title: "Ready panel ticket".to_string(),
+                body: MarkdownText::from("Ready for panel action"),
+                kind: "task".to_string(),
+                priority: "P2".to_string(),
+                author: None,
+                assignee: None,
+                labels: Vec::new(),
+                readiness: Some("ready".to_string()),
+                action_required: None,
+                needs_preflight: Some(true),
+                risk_flags: Vec::new(),
+                legacy_ticket: None,
+            })
+            .unwrap();
+        (temp, ticket.id, backend)
+    }
+
+    fn request_for(
+        temp: &TempDir,
+        ticket_id: String,
+        action: NextUserAction,
+    ) -> TicketActionRequest {
+        TicketActionRequest {
+            workspace_root: temp.path().to_path_buf(),
+            ticket_id,
+            action,
+            orchestrator: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn ticket_go_action_records_decision_without_starting_implementation() {
+        let (temp, ticket_id, backend) = ready_ticket_workspace("panel-go");
+
+        let outcome =
+            dispatch_ticket_action(request_for(&temp, ticket_id.clone(), NextUserAction::Go))
+                .await
+                .unwrap();
+
+        assert!(outcome.notice.contains("Recorded Panel Go"));
+        assert!(outcome.notice.contains("No implementation was started"));
+        let ticket = backend.show(TicketIdOrSlug::Id(ticket_id)).unwrap();
+        assert_eq!(ticket.meta.status.as_local(), Some(TicketStatus::Open));
+        let decision = ticket
+            .events
+            .iter()
+            .find(|event| {
+                event.kind == TicketEventKind::Decision
+                    && event.body.as_str().contains("Panel Go recorded")
+            })
+            .expect("panel Go decision is recorded");
+        assert_eq!(decision.author.as_deref(), Some("workspace-panel"));
+        assert!(decision.body.as_str().contains("does not enqueue or spawn"));
+    }
+
+    #[tokio::test]
+    async fn ticket_action_rejects_stale_selected_action() {
+        let (temp, ticket_id, _backend) = ready_ticket_workspace("panel-stale");
+
+        let error = dispatch_ticket_action(request_for(&temp, ticket_id, NextUserAction::Close))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("current action is Go"));
+    }
+
+    #[tokio::test]
+    async fn ticket_action_rejects_stale_absent_config_without_mutation() {
+        let (temp, ticket_id, backend) = ready_ticket_workspace("panel-no-config");
+        fs::remove_file(temp.path().join(".yoi/ticket.config.toml")).unwrap();
+
+        let error =
+            dispatch_ticket_action(request_for(&temp, ticket_id.clone(), NextUserAction::Go))
+                .await
+                .unwrap_err();
+
+        assert!(error.to_string().contains("Ticket config is absent"));
+        let ticket = backend.show(TicketIdOrSlug::Id(ticket_id)).unwrap();
+        assert!(!ticket.events.iter().any(|event| {
+            event.kind == TicketEventKind::Decision
+                && event.body.as_str().contains("Panel Go recorded")
+        }));
+    }
+
+    #[tokio::test]
+    async fn ticket_defer_action_records_decision_for_pending_ticket() {
+        let (temp, ticket_id, backend) = ready_ticket_workspace("panel-defer");
+        backend
+            .set_status(TicketIdOrSlug::Id(ticket_id.clone()), TicketStatus::Pending)
+            .unwrap();
+
+        let outcome =
+            dispatch_ticket_action(request_for(&temp, ticket_id.clone(), NextUserAction::Defer))
+                .await
+                .unwrap();
+
+        assert!(outcome.notice.contains("Recorded Panel Defer"));
+        let ticket = backend.show(TicketIdOrSlug::Id(ticket_id)).unwrap();
+        assert_eq!(ticket.meta.status.as_local(), Some(TicketStatus::Pending));
+        assert!(ticket.events.iter().any(|event| {
+            event.kind == TicketEventKind::Decision
+                && event.body.as_str().contains("Panel Defer recorded")
+        }));
+    }
+
+    #[tokio::test]
+    async fn ticket_close_action_requires_explicit_resolution() {
+        let (temp, ticket_id, backend) = ready_ticket_workspace("panel-close");
+        backend
+            .add_event(
+                TicketIdOrSlug::Id(ticket_id.clone()),
+                NewTicketEvent::new(TicketEventKind::ImplementationReport, "implemented"),
+            )
+            .unwrap();
+        backend
+            .review(
+                TicketIdOrSlug::Id(ticket_id.clone()),
+                TicketReview::approve("reviewed"),
+            )
+            .unwrap();
+
+        let outcome =
+            dispatch_ticket_action(request_for(&temp, ticket_id.clone(), NextUserAction::Close))
+                .await
+                .unwrap();
+
+        assert!(outcome.notice.contains("requires explicit resolution text"));
+        let ticket = backend.show(TicketIdOrSlug::Id(ticket_id)).unwrap();
+        assert_eq!(ticket.meta.status.as_local(), Some(TicketStatus::Open));
+        assert!(ticket.resolution.is_none());
+    }
+
+    #[tokio::test]
+    async fn ticket_review_action_does_not_silently_approve() {
+        let (temp, ticket_id, backend) = ready_ticket_workspace("panel-review");
+        backend
+            .add_event(
+                TicketIdOrSlug::Id(ticket_id.clone()),
+                NewTicketEvent::new(TicketEventKind::ImplementationReport, "implemented"),
+            )
+            .unwrap();
+
+        let outcome = dispatch_ticket_action(request_for(
+            &temp,
+            ticket_id.clone(),
+            NextUserAction::Review,
+        ))
+        .await
+        .unwrap();
+
+        assert!(
+            outcome
+                .notice
+                .contains("requires explicit approve/request-changes")
+        );
+        let ticket = backend.show(TicketIdOrSlug::Id(ticket_id)).unwrap();
+        assert!(
+            !ticket
+                .events
+                .iter()
+                .any(|event| event.kind == TicketEventKind::Review)
+        );
+    }
+
+    #[tokio::test]
+    async fn ticket_go_notification_sends_notify_when_socket_available() {
+        let temp = TempDir::new().unwrap();
+        let socket_path = temp.path().join("orchestrator.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, writer) = stream.into_split();
+            let mut reader = JsonLineReader::new(reader);
+            let mut writer = JsonLineWriter::new(writer);
+            writer
+                .write(&Event::Snapshot {
+                    entries: Vec::new(),
+                    greeting: protocol::Greeting {
+                        pod_name: "test-orchestrator".to_string(),
+                        cwd: temp.path().display().to_string(),
+                        provider: "test".to_string(),
+                        model: "test".to_string(),
+                        scope_summary: "test".to_string(),
+                        tools: Vec::new(),
+                        context_window: 0,
+                        context_tokens: 0,
+                    },
+                    status: PodStatus::Idle,
+                })
+                .await
+                .unwrap();
+            reader.next::<Method>().await.unwrap().unwrap()
+        });
+
+        send_notify_only(&socket_path, "panel Go".to_string())
+            .await
+            .unwrap();
+        let method = server.await.unwrap();
+        assert!(matches!(
+            method,
+            Method::Notify { message } if message == "panel Go"
+        ));
+    }
+
+    #[test]
+    fn no_ticket_selection_keeps_enter_pod_centric() {
+        let mut app = test_app(vec![live_info("alpha", PodStatus::Idle)]);
+
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Enter)),
+            MultiPodAction::Open
+        ));
+        assert!(app.prepare_ticket_action_dispatch().is_none());
+        assert_eq!(app.notice.as_deref(), Some("No Ticket action is selected."));
+    }
 
     #[test]
     fn multi_ticket_action_rows_precede_pods_and_pod_actions_still_work() {

@@ -3,8 +3,9 @@ use std::path::{Path, PathBuf};
 use protocol::PodStatus;
 use ticket::config::{TICKET_CONFIG_RELATIVE_PATH, TicketConfig};
 use ticket::{
-    ExtensibleTicketStatus, LocalTicketBackend, TicketBackend, TicketEvent, TicketEventKind,
-    TicketFilter, TicketIdOrSlug, TicketReviewResult, TicketStatus, TicketSummary,
+    ExtensibleTicketStatus, LocalTicketBackend, TicketBackend, TicketError, TicketEvent,
+    TicketEventKind, TicketFilter, TicketIdOrSlug, TicketMeta, TicketReviewResult, TicketStatus,
+    TicketSummary,
 };
 
 use crate::pod_list::{PodList, PodListEntry, StoredMetadataState};
@@ -470,6 +471,37 @@ pub(crate) fn build_workspace_panel(
             .then_with(|| a.title.cmp(&b.title))
     });
     model
+}
+
+pub(crate) fn build_current_ticket_row(
+    backend: &LocalTicketBackend,
+    ticket_id: &str,
+    pods: &PodList,
+) -> ticket::Result<PanelRow> {
+    let ticket = backend.show(TicketIdOrSlug::Id(ticket_id.to_owned()))?;
+    if ticket.meta.status.as_local() == Some(TicketStatus::Closed) {
+        return Err(TicketError::Conflict(format!(
+            "Ticket {ticket_id} is already closed"
+        )));
+    }
+    let summary = ticket_summary_from_meta(&ticket.meta);
+    Ok(ticket_row(summary, &ticket.events, pods))
+}
+
+fn ticket_summary_from_meta(meta: &TicketMeta) -> TicketSummary {
+    TicketSummary {
+        id: meta.id.clone(),
+        slug: meta.slug.clone(),
+        title: meta.title.clone(),
+        status: meta.status.clone(),
+        kind: meta.kind.clone(),
+        priority: meta.priority.clone(),
+        labels: meta.labels.clone(),
+        readiness: meta.readiness.clone(),
+        needs_preflight: meta.needs_preflight,
+        action_required: meta.action_required.clone(),
+        updated_at: meta.updated_at.clone(),
+    }
 }
 
 fn build_ticket_rows(
