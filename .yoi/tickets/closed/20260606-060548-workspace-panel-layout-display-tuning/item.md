@@ -2,12 +2,12 @@
 id: 20260606-060548-workspace-panel-layout-display-tuning
 slug: workspace-panel-layout-display-tuning
 title: Workspace panel layout and display tuning
-status: open
+status: closed
 kind: task
 priority: P2
 labels: [tui, ticket, orchestration, panel, ux]
 created_at: 2026-06-06T06:05:48Z
-updated_at: 2026-06-06T09:32:01Z
+updated_at: 2026-06-06T21:16:52Z
 assignee: null
 legacy_ticket: null
 ---
