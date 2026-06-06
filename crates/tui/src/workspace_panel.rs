@@ -4,8 +4,7 @@ use protocol::PodStatus;
 use ticket::config::{TICKET_CONFIG_RELATIVE_PATH, TicketConfig};
 use ticket::{
     ExtensibleTicketStatus, LocalTicketBackend, TicketBackend, TicketError, TicketEvent,
-    TicketEventKind, TicketFilter, TicketIdOrSlug, TicketMeta, TicketReviewResult, TicketStatus,
-    TicketSummary,
+    TicketFilter, TicketIdOrSlug, TicketMeta, TicketStatus, TicketSummary, TicketWorkflowState,
 };
 
 use crate::pod_list::{PodList, PodListEntry, StoredMetadataState};
@@ -152,32 +151,16 @@ pub(crate) enum PanelRowKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum ActionPriority {
     UserReply,
-    ReadyForGo,
-    Decision,
+    ReadyForQueue,
     Blocked,
     ActiveWork,
     Background,
 }
 
-impl ActionPriority {
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            Self::UserReply => "user action",
-            Self::ReadyForGo => "ready",
-            Self::Decision => "decision",
-            Self::Blocked => "blocked",
-            Self::ActiveWork => "active",
-            Self::Background => "background",
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NextUserAction {
     Clarify,
-    ApproveIntake,
-    Go,
-    Review,
+    Queue,
     Close,
     Defer,
     Edit,
@@ -190,46 +173,13 @@ impl NextUserAction {
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Clarify => "Clarify",
-            Self::ApproveIntake => "Approve",
-            Self::Go => "Go",
-            Self::Review => "Review",
+            Self::Queue => "Queue",
             Self::Close => "Close",
             Self::Defer => "Defer",
             Self::Edit => "Edit",
             Self::Wait => "Wait",
             Self::OpenPod => "Open",
             Self::SendToPod => "Send",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TicketPanelPhase {
-    Intake,
-    RequirementsSync,
-    Preflight,
-    Spike,
-    Implementing,
-    Reviewing,
-    CloseReady,
-    Blocked,
-    Open,
-    Pending,
-}
-
-impl TicketPanelPhase {
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            Self::Intake => "intake",
-            Self::RequirementsSync => "requirements",
-            Self::Preflight => "preflight",
-            Self::Spike => "spike",
-            Self::Implementing => "implementing",
-            Self::Reviewing => "review",
-            Self::CloseReady => "close-ready",
-            Self::Blocked => "blocked",
-            Self::Open => "open",
-            Self::Pending => "pending",
         }
     }
 }
@@ -243,7 +193,9 @@ pub(crate) struct TicketPanelEntry {
     pub(crate) kind: String,
     pub(crate) priority: String,
     pub(crate) labels: Vec<String>,
-    pub(crate) phase: TicketPanelPhase,
+    pub(crate) workflow_state: TicketWorkflowState,
+    pub(crate) workflow_state_explicit: bool,
+    pub(crate) attention_required: Option<String>,
     pub(crate) next_action: Option<NextUserAction>,
     pub(crate) updated_at: Option<String>,
     pub(crate) latest_event_kind: Option<String>,
@@ -270,7 +222,6 @@ pub(crate) struct PanelRow {
 impl PanelRow {
     pub(crate) fn is_ticket_action(&self) -> bool {
         !matches!(self.kind, PanelRowKind::Pod)
-            && (self.priority != ActionPriority::Background || self.next_action.is_some())
     }
 }
 
@@ -500,6 +451,11 @@ fn ticket_summary_from_meta(meta: &TicketMeta) -> TicketSummary {
         readiness: meta.readiness.clone(),
         needs_preflight: meta.needs_preflight,
         action_required: meta.action_required.clone(),
+        workflow_state: meta.workflow_state,
+        workflow_state_explicit: meta.workflow_state_explicit,
+        attention_required: meta.attention_required.clone(),
+        queued_by: meta.queued_by.clone(),
+        queued_at: meta.queued_at.clone(),
         updated_at: meta.updated_at.clone(),
     }
 }
@@ -521,7 +477,7 @@ fn build_ticket_rows(
 
 fn ticket_row(summary: TicketSummary, events: &[TicketEvent], pods: &PodList) -> PanelRow {
     let related_pods = related_pods_for_ticket(&summary, pods);
-    let derived = derive_ticket_state(&summary, events);
+    let derived = derive_ticket_state(&summary);
     let latest_event = events.last();
     let entry = TicketPanelEntry {
         id: summary.id.clone(),
@@ -531,7 +487,9 @@ fn ticket_row(summary: TicketSummary, events: &[TicketEvent], pods: &PodList) ->
         kind: summary.kind.clone(),
         priority: summary.priority.clone(),
         labels: summary.labels.clone(),
-        phase: derived.phase,
+        workflow_state: summary.workflow_state,
+        workflow_state_explicit: summary.workflow_state_explicit,
+        attention_required: summary.attention_required.clone(),
         next_action: derived.action,
         updated_at: summary.updated_at.clone(),
         latest_event_kind: latest_event.map(|event| event.kind.as_str().to_string()),
@@ -545,7 +503,7 @@ fn ticket_row(summary: TicketSummary, events: &[TicketEvent], pods: &PodList) ->
         kind: derived.kind,
         title: summary.title,
         subtitle,
-        status: derived.status,
+        status: summary.workflow_state.as_str().to_string(),
         priority: derived.priority,
         next_action: derived.action,
         ticket: Some(entry),
@@ -558,8 +516,6 @@ fn ticket_row(summary: TicketSummary, events: &[TicketEvent], pods: &PodList) ->
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DerivedTicketState {
     kind: PanelRowKind,
-    phase: TicketPanelPhase,
-    status: String,
     priority: ActionPriority,
     action: Option<NextUserAction>,
     disabled_reason: Option<String>,
@@ -567,239 +523,91 @@ struct DerivedTicketState {
     blocked_reason: Option<String>,
 }
 
-fn derive_ticket_state(summary: &TicketSummary, events: &[TicketEvent]) -> DerivedTicketState {
-    let action_required = summary.action_required.as_deref().map(str::trim);
-    let action_required_lc = action_required.map(lowercase);
-    let intake = is_intake_ticket(summary);
-    let spike = is_spike_ticket(summary);
-
-    if let Some(reason) = action_required_lc.as_deref() {
-        if reason.contains("block") || reason.contains("blocked") {
-            return DerivedTicketState {
-                kind: PanelRowKind::Blocked,
-                phase: TicketPanelPhase::Blocked,
-                status: "blocked".to_string(),
-                priority: ActionPriority::Blocked,
-                action: Some(NextUserAction::Edit),
-                disabled_reason: Some(
-                    "Requires an explicit human/project decision before work continues."
-                        .to_string(),
-                ),
-                key_hint: Some("Edit/decide in Ticket; no automatic unblock".to_string()),
-                blocked_reason: action_required.map(ToOwned::to_owned),
-            };
-        }
-        return DerivedTicketState {
-            kind: if intake {
-                PanelRowKind::Intake
-            } else {
-                PanelRowKind::Ticket
-            },
-            phase: if intake {
-                TicketPanelPhase::Intake
-            } else {
-                TicketPanelPhase::RequirementsSync
-            },
-            status: action_required.unwrap_or("action required").to_string(),
-            priority: ActionPriority::UserReply,
-            action: Some(if intake {
-                NextUserAction::ApproveIntake
-            } else {
-                NextUserAction::Clarify
-            }),
-            disabled_reason: None,
-            key_hint: Some(
-                "Human response is required; dispatch must re-check Ticket state".to_string(),
-            ),
-            blocked_reason: None,
-        };
-    }
-
-    let latest_impl = latest_event_index(events, TicketEventKind::ImplementationReport);
-    let latest_review = latest_event_index(events, TicketEventKind::Review);
-    let latest_plan = latest_event_index(events, TicketEventKind::Plan);
-    let latest_review_result = latest_review.and_then(|index| events[index].status.as_deref());
-
-    if latest_review_result == Some(TicketReviewResult::Approve.as_str())
-        && latest_review > latest_impl
-    {
-        return DerivedTicketState {
-            kind: PanelRowKind::Review,
-            phase: TicketPanelPhase::CloseReady,
-            status: "review approved".to_string(),
-            priority: ActionPriority::Decision,
-            action: Some(NextUserAction::Close),
-            disabled_reason: None,
-            key_hint: Some("Close affordance only; closing must write a resolution".to_string()),
-            blocked_reason: None,
-        };
-    }
-
-    if latest_impl.is_some() && latest_impl > latest_review {
-        return DerivedTicketState {
-            kind: PanelRowKind::Review,
-            phase: TicketPanelPhase::Reviewing,
-            status: "implementation reported".to_string(),
-            priority: ActionPriority::Decision,
-            action: Some(NextUserAction::Review),
-            disabled_reason: None,
-            key_hint: Some("Review affordance only; inspect evidence before approving".to_string()),
-            blocked_reason: None,
-        };
-    }
-
-    if latest_review_result == Some(TicketReviewResult::RequestChanges.as_str()) {
-        return DerivedTicketState {
-            kind: PanelRowKind::ActiveWork,
-            phase: TicketPanelPhase::Implementing,
-            status: "changes requested".to_string(),
-            priority: ActionPriority::ActiveWork,
-            action: Some(NextUserAction::Wait),
-            disabled_reason: Some("Waiting for implementation changes after review.".to_string()),
-            key_hint: None,
-            blocked_reason: None,
-        };
-    }
-
+fn derive_ticket_state(summary: &TicketSummary) -> DerivedTicketState {
     if summary.status.as_local() == Some(TicketStatus::Pending) {
         return DerivedTicketState {
             kind: PanelRowKind::Blocked,
-            phase: TicketPanelPhase::Pending,
-            status: "pending/deferred".to_string(),
             priority: ActionPriority::Blocked,
             action: Some(NextUserAction::Defer),
             disabled_reason: Some(
-                "Pending Ticket is shown for visibility; no automation is implied.".to_string(),
+                "Pending Ticket is deferred; queueing is disabled until it is reopened and readied."
+                    .to_string(),
             ),
-            key_hint: None,
+            key_hint: Some("Open/defer operation lives in Ticket controls".to_string()),
             blocked_reason: None,
         };
     }
 
-    if intake {
+    if let Some(reason) = summary
+        .attention_required
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
         return DerivedTicketState {
-            kind: PanelRowKind::Intake,
-            phase: TicketPanelPhase::Intake,
-            status: "intake draft".to_string(),
+            kind: PanelRowKind::Blocked,
             priority: ActionPriority::UserReply,
-            action: Some(NextUserAction::ApproveIntake),
-            disabled_reason: None,
-            key_hint: Some("Approve/edit intake before routing".to_string()),
-            blocked_reason: None,
+            action: Some(NextUserAction::Edit),
+            disabled_reason: Some(
+                "attention_required is set; resolve it before queueing or routing.".to_string(),
+            ),
+            key_hint: Some(
+                "Resolve attention_required in the Ticket frontmatter/thread".to_string(),
+            ),
+            blocked_reason: Some(reason.to_string()),
         };
     }
 
-    if looks_ready_for_go(summary) {
-        return DerivedTicketState {
+    match summary.workflow_state {
+        TicketWorkflowState::Ready => DerivedTicketState {
             kind: PanelRowKind::Ticket,
-            phase: if summary.needs_preflight.unwrap_or(false) {
-                TicketPanelPhase::Preflight
-            } else {
-                TicketPanelPhase::Open
-            },
-            status: "ready for Go".to_string(),
-            priority: ActionPriority::ReadyForGo,
-            action: Some(NextUserAction::Go),
+            priority: ActionPriority::ReadyForQueue,
+            action: Some(NextUserAction::Queue),
             disabled_reason: None,
             key_hint: Some(
-                "Go is an authorization affordance; routing/preflight gates still apply"
-                    .to_string(),
+                "Queue transitions ready -> queued and may notify Orchestrator".to_string(),
             ),
             blocked_reason: None,
-        };
-    }
-
-    if spike && latest_plan.is_some() {
-        return DerivedTicketState {
+        },
+        TicketWorkflowState::Queued => DerivedTicketState {
             kind: PanelRowKind::ActiveWork,
-            phase: TicketPanelPhase::Spike,
-            status: "spike running".to_string(),
             priority: ActionPriority::ActiveWork,
             action: Some(NextUserAction::Wait),
-            disabled_reason: Some("Spike has a plan but no implementation report yet.".to_string()),
+            disabled_reason: Some("Ticket is queued for Orchestrator routing.".to_string()),
             key_hint: None,
             blocked_reason: None,
-        };
-    }
-
-    if spike {
-        return DerivedTicketState {
-            kind: PanelRowKind::Ticket,
-            phase: TicketPanelPhase::Spike,
-            status: "spike needed".to_string(),
+        },
+        TicketWorkflowState::InProgress => DerivedTicketState {
+            kind: PanelRowKind::ActiveWork,
+            priority: ActionPriority::ActiveWork,
+            action: Some(NextUserAction::Wait),
+            disabled_reason: Some("Ticket is already in progress.".to_string()),
+            key_hint: None,
+            blocked_reason: None,
+        },
+        TicketWorkflowState::Done => DerivedTicketState {
+            kind: PanelRowKind::Review,
             priority: ActionPriority::Background,
-            action: None,
+            action: Some(NextUserAction::Close),
             disabled_reason: Some(
-                "Spike candidate is shown as background until explicitly readied or planned."
-                    .to_string(),
+                "workflow_state is done; close if a resolution is still missing.".to_string(),
             ),
             key_hint: None,
             blocked_reason: None,
-        };
-    }
-
-    if latest_plan.is_some() {
-        return DerivedTicketState {
-            kind: PanelRowKind::ActiveWork,
-            phase: TicketPanelPhase::Implementing,
-            status: "planned/active".to_string(),
-            priority: ActionPriority::ActiveWork,
-            action: Some(NextUserAction::Wait),
+        },
+        TicketWorkflowState::Intake => DerivedTicketState {
+            kind: PanelRowKind::Intake,
+            priority: ActionPriority::Background,
+            action: Some(NextUserAction::Clarify),
             disabled_reason: Some(
-                "Ticket has a plan but no implementation report yet.".to_string(),
+                "Ticket is still in intake; mark it ready before queueing.".to_string(),
             ),
-            key_hint: None,
+            key_hint: Some(
+                "Intake/Orchestrator helpers can set workflow_state = ready".to_string(),
+            ),
             blocked_reason: None,
-        };
+        },
     }
-
-    DerivedTicketState {
-        kind: PanelRowKind::Ticket,
-        phase: TicketPanelPhase::Open,
-        status: "open backlog".to_string(),
-        priority: ActionPriority::Background,
-        action: None,
-        disabled_reason: Some(
-            "Open Ticket is not marked ready; keep it out of the action section for now."
-                .to_string(),
-        ),
-        key_hint: None,
-        blocked_reason: None,
-    }
-}
-
-fn looks_ready_for_go(summary: &TicketSummary) -> bool {
-    summary
-        .readiness
-        .as_deref()
-        .map(lowercase)
-        .is_some_and(|value| value.contains("ready"))
-        || summary.needs_preflight.unwrap_or(false)
-        || summary
-            .labels
-            .iter()
-            .any(|label| lowercase(label).contains("ready"))
-}
-
-fn is_intake_ticket(summary: &TicketSummary) -> bool {
-    summary.kind == "intake"
-        || summary.labels.iter().any(|label| label == "intake")
-        || lowercase(&summary.slug).contains("intake")
-        || lowercase(&summary.title).contains("intake")
-}
-
-fn is_spike_ticket(summary: &TicketSummary) -> bool {
-    lowercase(&summary.kind).contains("spike")
-        || summary
-            .labels
-            .iter()
-            .any(|label| lowercase(label).contains("spike"))
-        || lowercase(&summary.slug).contains("spike")
-        || lowercase(&summary.title).contains("spike")
-}
-
-fn latest_event_index(events: &[TicketEvent], kind: TicketEventKind) -> Option<usize> {
-    events.iter().rposition(|event| event.kind == kind)
 }
 
 fn related_pods_for_ticket(summary: &TicketSummary, pods: &PodList) -> Vec<String> {
@@ -822,11 +630,13 @@ fn related_pods_for_ticket(summary: &TicketSummary, pods: &PodList) -> Vec<Strin
 
 fn ticket_subtitle(entry: &TicketPanelEntry) -> Option<String> {
     let mut parts = vec![format!(
-        "{} · {} · {}",
+        "{} · {}",
         entry.slug,
-        entry.phase.label(),
-        entry.priority
+        entry.workflow_state.as_str()
     )];
+    if let Some(reason) = entry.attention_required.as_deref() {
+        parts.push(format!("attention: {reason}"));
+    }
     if !entry.related_pods.is_empty() {
         parts.push(format!("pods: {}", entry.related_pods.join(", ")));
     }
@@ -941,7 +751,7 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
-    use ticket::{MarkdownText, NewTicket, NewTicketEvent, TicketReview};
+    use ticket::{NewTicket, TicketWorkflowState};
 
     fn empty_pods() -> PodList {
         PodList::from_sources(
@@ -1021,16 +831,16 @@ mod tests {
     }
 
     #[test]
-    fn workspace_panel_prioritizes_human_actions_before_background_pods() {
+    fn workspace_panel_uses_explicit_workflow_state_for_queue_priority() {
         let temp = TempDir::new().unwrap();
         write_ticket_config(temp.path());
         let backend = LocalTicketBackend::new(temp.path().join(".yoi/tickets"));
         create_ticket(&backend, "Ready Ticket", "ready-ticket", |input| {
-            input.readiness = Some("implementation-ready".to_string());
+            input.workflow_state = Some(TicketWorkflowState::Ready);
         });
         create_ticket(&backend, "Needs User", "needs-user", |input| {
-            input.action_required = Some("answer clarification".to_string());
-            input.labels = vec!["intake".to_string()];
+            input.workflow_state = Some(TicketWorkflowState::Ready);
+            input.attention_required = Some("answer clarification".to_string());
         });
 
         let model = build_workspace_panel(temp.path(), &empty_pods());
@@ -1041,128 +851,99 @@ mod tests {
         let rows = model
             .rows
             .iter()
-            .map(|row| (row.title.as_str(), row.priority, row.next_action))
+            .map(|row| {
+                (
+                    row.title.as_str(),
+                    row.status.as_str(),
+                    row.priority,
+                    row.next_action,
+                )
+            })
             .collect::<Vec<_>>();
 
         assert_eq!(rows[0].0, "Needs User");
-        assert_eq!(rows[0].1, ActionPriority::UserReply);
-        assert_eq!(rows[0].2, Some(NextUserAction::ApproveIntake));
+        assert_eq!(rows[0].1, "ready");
+        assert_eq!(rows[0].2, ActionPriority::UserReply);
+        assert_eq!(rows[0].3, Some(NextUserAction::Edit));
         assert_eq!(rows[1].0, "Ready Ticket");
-        assert_eq!(rows[1].1, ActionPriority::ReadyForGo);
-        assert_eq!(rows[1].2, Some(NextUserAction::Go));
+        assert_eq!(rows[1].1, "ready");
+        assert_eq!(rows[1].2, ActionPriority::ReadyForQueue);
+        assert_eq!(rows[1].3, Some(NextUserAction::Queue));
     }
 
     #[test]
-    fn workspace_panel_derives_spike_phase_without_marking_unready_spikes_ready_for_go() {
+    fn workspace_panel_does_not_infer_workflow_state_from_labels_readiness_or_thread() {
         let temp = TempDir::new().unwrap();
         write_ticket_config(temp.path());
         let backend = LocalTicketBackend::new(temp.path().join(".yoi/tickets"));
         create_ticket(
             &backend,
-            "Investigate Spike",
-            "investigate-spike",
+            "Readiness Heuristic",
+            "readiness-heuristic",
             |input| {
-                input.labels = vec!["spike".to_string()];
+                input.readiness = Some("implementation-ready".to_string());
+                input.needs_preflight = Some(false);
             },
         );
-        create_ticket(&backend, "Running Spike", "running-spike", |input| {
-            input.kind = "spike".to_string();
+        create_ticket(&backend, "Label Heuristic", "label-heuristic", |input| {
+            input.labels = vec!["spike".to_string(), "intake".to_string()];
         });
-        backend
-            .add_event(
-                TicketIdOrSlug::Query("running-spike".to_string()),
-                NewTicketEvent::new(TicketEventKind::Plan, "Run the spike."),
-            )
-            .unwrap();
+        create_ticket(&backend, "Queued Explicit", "queued-explicit", |input| {
+            input.workflow_state = Some(TicketWorkflowState::Queued);
+        });
 
         let model = build_workspace_panel(temp.path(), &empty_pods());
-        let needed = model
+        let readiness = model
             .rows
             .iter()
-            .find(|row| row.title == "Investigate Spike")
+            .find(|row| row.title == "Readiness Heuristic")
             .unwrap();
-        let running = model
+        let label = model
             .rows
             .iter()
-            .find(|row| row.title == "Running Spike")
+            .find(|row| row.title == "Label Heuristic")
+            .unwrap();
+        let queued = model
+            .rows
+            .iter()
+            .find(|row| row.title == "Queued Explicit")
             .unwrap();
 
-        assert_eq!(
-            needed.ticket.as_ref().unwrap().phase,
-            TicketPanelPhase::Spike
-        );
-        assert_eq!(needed.priority, ActionPriority::Background);
-        assert_eq!(needed.next_action, None);
-        assert!(!needed.is_ticket_action());
-        assert_eq!(
-            running.ticket.as_ref().unwrap().phase,
-            TicketPanelPhase::Spike
-        );
-        assert_eq!(running.priority, ActionPriority::ActiveWork);
-        assert_eq!(running.next_action, Some(NextUserAction::Wait));
+        assert_eq!(readiness.status, "intake");
+        assert_eq!(readiness.next_action, Some(NextUserAction::Clarify));
+        assert_eq!(label.status, "intake");
+        assert_eq!(label.next_action, Some(NextUserAction::Clarify));
+        assert_eq!(queued.status, "queued");
+        assert_eq!(queued.next_action, Some(NextUserAction::Wait));
     }
 
     #[test]
-    fn workspace_panel_keeps_ordinary_open_backlog_out_of_action_section() {
+    fn workspace_panel_defaults_missing_open_state_to_intake_and_displays_done_state() {
         let temp = TempDir::new().unwrap();
         write_ticket_config(temp.path());
         let backend = LocalTicketBackend::new(temp.path().join(".yoi/tickets"));
         create_ticket(&backend, "Plain Backlog", "plain-backlog", |_| {});
+        create_ticket(&backend, "Done Explicit", "done-explicit", |input| {
+            input.workflow_state = Some(TicketWorkflowState::Done);
+        });
 
         let model = build_workspace_panel(temp.path(), &empty_pods());
-        let row = model
+        let backlog = model
             .rows
             .iter()
             .find(|row| row.title == "Plain Backlog")
             .unwrap();
-
-        assert_eq!(row.priority, ActionPriority::Background);
-        assert_eq!(row.next_action, None);
-        assert!(!row.is_ticket_action());
-    }
-
-    #[test]
-    fn workspace_panel_derives_review_and_close_actions_from_thread_roles() {
-        let temp = TempDir::new().unwrap();
-        write_ticket_config(temp.path());
-        let backend = LocalTicketBackend::new(temp.path().join(".yoi/tickets"));
-        create_ticket(&backend, "Needs Review", "needs-review", |_| {});
-        create_ticket(&backend, "Close Ready", "close-ready", |_| {});
-        backend
-            .add_event(
-                TicketIdOrSlug::Query("needs-review".to_string()),
-                NewTicketEvent::new(TicketEventKind::ImplementationReport, "Implemented."),
-            )
-            .unwrap();
-        backend
-            .add_event(
-                TicketIdOrSlug::Query("close-ready".to_string()),
-                NewTicketEvent::new(TicketEventKind::ImplementationReport, "Implemented."),
-            )
-            .unwrap();
-        backend
-            .review(
-                TicketIdOrSlug::Query("close-ready".to_string()),
-                TicketReview::approve(MarkdownText::new("Approved.")),
-            )
-            .unwrap();
-
-        let model = build_workspace_panel(temp.path(), &empty_pods());
-        let review = model
+        let done = model
             .rows
             .iter()
-            .find(|row| row.title == "Needs Review")
-            .unwrap();
-        let close = model
-            .rows
-            .iter()
-            .find(|row| row.title == "Close Ready")
+            .find(|row| row.title == "Done Explicit")
             .unwrap();
 
-        assert_eq!(review.priority, ActionPriority::Decision);
-        assert_eq!(review.next_action, Some(NextUserAction::Review));
-        assert_eq!(close.priority, ActionPriority::Decision);
-        assert_eq!(close.next_action, Some(NextUserAction::Close));
+        assert_eq!(backlog.status, "intake");
+        assert_eq!(backlog.next_action, Some(NextUserAction::Clarify));
+        assert!(backlog.is_ticket_action());
+        assert_eq!(done.status, "done");
+        assert_eq!(done.next_action, Some(NextUserAction::Close));
     }
 
     #[test]

@@ -23,7 +23,7 @@ use session_store::FsStore;
 use ticket::config::TicketConfig;
 use ticket::{
     LocalTicketBackend, NewTicketEvent, TicketBackend, TicketEventKind, TicketIdOrSlug,
-    TicketStatus,
+    TicketStatus, TicketWorkflowState,
 };
 use tokio::net::UnixStream;
 use unicode_width::UnicodeWidthStr;
@@ -1297,13 +1297,24 @@ async fn dispatch_ticket_action(
     }
 
     match request.action {
-        NextUserAction::Go | NextUserAction::ApproveIntake => {
-            append_panel_decision(&backend, &request.ticket_id, panel_go_body(current_ticket))?;
+        NextUserAction::Queue => {
+            if current_ticket.workflow_state != TicketWorkflowState::Ready {
+                return Err(TicketActionError::Stale(
+                    "Queue is only valid while workflow_state is ready; reload and retry"
+                        .to_string(),
+                ));
+            }
+            backend
+                .queue_ready(
+                    TicketIdOrSlug::Id(request.ticket_id.clone()),
+                    "workspace-panel",
+                )
+                .map_err(|error| TicketActionError::Ticket(error.to_string()))?;
             let notification =
                 notify_workspace_orchestrator(request.orchestrator, current_ticket).await;
             Ok(TicketActionOutcome {
                 notice: format!(
-                    "Recorded Panel Go for Ticket {}; {}. No implementation was started.",
+                    "Queued Ticket {}; {}. No implementation was started.",
                     current_ticket.slug,
                     notification.sentence()
                 ),
@@ -1341,12 +1352,6 @@ async fn dispatch_ticket_action(
             };
             Ok(TicketActionOutcome { notice })
         }
-        NextUserAction::Review => Ok(TicketActionOutcome {
-            notice: format!(
-                "Review for Ticket {} requires explicit approve/request-changes evidence; no review was recorded.",
-                current_ticket.slug
-            ),
-        }),
         NextUserAction::Close => Ok(TicketActionOutcome {
             notice: format!(
                 "Close for Ticket {} requires explicit resolution text; no close was recorded.",
@@ -1379,16 +1384,9 @@ fn append_panel_decision(
         .map_err(|error| TicketActionError::Ticket(error.to_string()))
 }
 
-fn panel_go_body(ticket: &crate::workspace_panel::TicketPanelEntry) -> String {
-    format!(
-        "Panel Go recorded by a human for Ticket `{}` (`{}`). The workspace Orchestrator may route or run preflight after re-checking current Ticket authority. This is not authorization to start implementation directly and does not enqueue or spawn coder/reviewer Pods.",
-        ticket.slug, ticket.id
-    )
-}
-
 fn panel_defer_body(ticket: &crate::workspace_panel::TicketPanelEntry) -> String {
     format!(
-        "Panel Defer recorded by a human for Ticket `{}` (`{}`). Keep this Ticket out of immediate Orchestrator routing until a later explicit Go; no scheduler or implementation Pod was started.",
+        "Panel Defer recorded by a human for Ticket `{}` (`{}`). Keep this Ticket out of immediate Orchestrator routing until a later explicit Queue; no scheduler or implementation Pod was started.",
         ticket.slug, ticket.id
     )
 }
@@ -1403,7 +1401,7 @@ async fn notify_workspace_orchestrator(
         );
     };
     let message = format!(
-        "Workspace panel Go for Ticket `{}` (`{}`): human authorized Orchestrator routing/preflight. Re-check Ticket authority before acting. Do not start implementation directly from this notification; follow routing/preflight gates.",
+        "Workspace panel Queue for Ticket `{}` (`{}`): human authorized Orchestrator routing/preflight. Re-check Ticket authority before acting. Do not start implementation directly from this notification; follow routing/preflight gates.",
         ticket.slug, ticket.id
     );
     match send_notify_only(&target.socket_path, message).await {
@@ -1941,7 +1939,7 @@ fn panel_action_header_line(total: usize, width: u16) -> Line<'static> {
     } else {
         format!(" {total} rows")
     };
-    let text = truncate_with_ellipsis(&format!("--actions{detail}---"), width as usize);
+    let text = truncate_with_ellipsis(&format!("--tickets{detail}---"), width as usize);
     Line::from(Span::styled(
         text,
         Style::default()
@@ -1950,14 +1948,9 @@ fn panel_action_header_line(total: usize, width: u16) -> Line<'static> {
     ))
 }
 
-const TICKET_PRIORITY_COLUMN_WIDTH: usize = 11;
-const TICKET_ACTION_COLUMN_WIDTH: usize = 7;
-const TICKET_STATUS_COLUMN_WIDTH: usize = 24;
-const TICKET_PHASE_COLUMN_WIDTH: usize = 12;
+const TICKET_STATE_COLUMN_WIDTH: usize = 10;
 const TICKET_ID_COLUMN_WIDTH: usize = 32;
 const POD_STATUS_COLUMN_WIDTH: usize = 18;
-const POD_ACTION_COLUMN_WIDTH: usize = 8;
-const POD_KIND_COLUMN_WIDTH: usize = 3;
 
 fn panel_row_line(row: &PanelRow, selected: bool, width: u16) -> Line<'static> {
     let marker = if selected { "▶ " } else { "  " };
@@ -1968,12 +1961,6 @@ fn panel_row_line(row: &PanelRow, selected: bool, width: u16) -> Line<'static> {
     } else {
         Style::default().fg(Color::Magenta)
     };
-    let action = row.next_action.map(NextUserAction::label).unwrap_or("View");
-    let phase = row
-        .ticket
-        .as_ref()
-        .map(|ticket| ticket.phase.label())
-        .unwrap_or("-");
     let ticket_ref = panel_ticket_reference(row);
     let mut spans = Vec::new();
     let mut remaining = width as usize;
@@ -1992,30 +1979,9 @@ fn panel_row_line(row: &PanelRow, selected: bool, width: u16) -> Line<'static> {
     );
     push_column_span(
         &mut spans,
-        row.priority.label(),
-        TICKET_PRIORITY_COLUMN_WIDTH,
-        panel_priority_style(row.priority),
-        &mut remaining,
-    );
-    push_column_span(
-        &mut spans,
-        action,
-        TICKET_ACTION_COLUMN_WIDTH,
-        Style::default().fg(Color::Magenta),
-        &mut remaining,
-    );
-    push_column_span(
-        &mut spans,
         &row.status,
-        TICKET_STATUS_COLUMN_WIDTH,
-        Style::default().fg(Color::DarkGray),
-        &mut remaining,
-    );
-    push_column_span(
-        &mut spans,
-        phase,
-        TICKET_PHASE_COLUMN_WIDTH,
-        Style::default().fg(Color::DarkGray),
+        TICKET_STATE_COLUMN_WIDTH,
+        panel_priority_style(row.priority),
         &mut remaining,
     );
     push_column_span(
@@ -2085,10 +2051,7 @@ fn padded_cell(value: &str, width: usize) -> String {
 fn panel_priority_style(priority: ActionPriority) -> Style {
     match priority {
         ActionPriority::UserReply => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        ActionPriority::ReadyForGo => Style::default().fg(Color::Green),
-        ActionPriority::Decision => Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD),
+        ActionPriority::ReadyForQueue => Style::default().fg(Color::Green),
         ActionPriority::Blocked => Style::default().fg(Color::Red),
         ActionPriority::ActiveWork => Style::default().fg(Color::Cyan),
         ActionPriority::Background => Style::default().fg(Color::DarkGray),
@@ -2132,13 +2095,6 @@ fn row_line(entry: &PodListEntry, selected: bool, width: u16) -> Line<'static> {
         Style::default().fg(Color::Cyan)
     };
     let (status, status_style) = row_status_label(entry);
-    let action = if entry.actions.can_send_now {
-        "send"
-    } else if entry.actions.can_open {
-        "open"
-    } else {
-        "disabled"
-    };
     let mut spans = Vec::new();
     let mut remaining = width as usize;
 
@@ -2161,20 +2117,6 @@ fn row_line(entry: &PodListEntry, selected: bool, width: u16) -> Line<'static> {
         status_style,
         &mut remaining,
     );
-    push_column_span(
-        &mut spans,
-        action,
-        POD_ACTION_COLUMN_WIDTH,
-        Style::default().fg(Color::DarkGray),
-        &mut remaining,
-    );
-    push_column_span(
-        &mut spans,
-        "pod",
-        POD_KIND_COLUMN_WIDTH,
-        Style::default().fg(Color::DarkGray),
-        &mut remaining,
-    );
     push_bounded_span(&mut spans, entry.name.as_str(), name_style, &mut remaining);
 
     Line::from(spans)
@@ -2191,80 +2133,48 @@ fn draw_separator(frame: &mut Frame<'_>, area: Rect) {
 }
 
 fn draw_target_status(frame: &mut Frame<'_>, app: &MultiPodApp, area: Rect) {
-    let mut line = if let Some(row) = app
+    let target = if let Some(row) = app
         .selected_panel_row()
         .filter(|row| row.is_ticket_action())
     {
+        let action = row.next_action.map(NextUserAction::label).unwrap_or("View");
         Line::from(vec![
-            Span::styled("action ", Style::default().fg(Color::DarkGray)),
+            Span::styled("composer ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                row.title.clone(),
-                Style::default().add_modifier(Modifier::BOLD),
+                app.composer_target().label(),
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
             ),
-            Span::raw("  "),
+            Span::styled(" · ticket ", Style::default().fg(Color::DarkGray)),
+            Span::styled(row.status.clone(), panel_priority_style(row.priority)),
+            Span::styled(" · ", Style::default().fg(Color::DarkGray)),
+            Span::styled(action, Style::default().fg(Color::Magenta)),
+        ])
+    } else if let Some(entry) = app.selected_pod_entry() {
+        let (status, status_style) = row_status_label(entry);
+        Line::from(vec![
+            Span::styled("composer ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                format!("[{}]", row.priority.label()),
-                panel_priority_style(row.priority),
+                app.composer_target().label(),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
             ),
-            Span::raw("  "),
-            Span::styled(
-                row.next_action.map(NextUserAction::label).unwrap_or("View"),
-                Style::default().fg(Color::Magenta),
-            ),
-            Span::styled(
-                " dispatch via Enter; re-checks Ticket before mutation",
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled(" · pod ", Style::default().fg(Color::DarkGray)),
+            Span::styled(status.to_string(), status_style),
         ])
     } else {
-        match app.selected_pod_entry() {
-            Some(entry) => {
-                let (status, status_style) = row_status_label(entry);
-                let send_text = if entry.actions.can_send_now {
-                    "send enabled"
-                } else {
-                    "send disabled"
-                };
-                Line::from(vec![
-                    Span::styled("target ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(
-                        entry.name.clone(),
-                        Style::default().add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw("  "),
-                    Span::styled(format!("[{status}]"), status_style),
-                    Span::raw("  "),
-                    Span::styled(
-                        send_text,
-                        if entry.actions.can_send_now {
-                            Style::default().fg(Color::Green)
-                        } else {
-                            Style::default().fg(Color::DarkGray)
-                        },
-                    ),
-                ])
-            }
-            None => Line::from(Span::styled(
-                "target — none",
+        Line::from(vec![
+            Span::styled("composer ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                app.composer_target().label(),
                 Style::default().fg(Color::DarkGray),
-            )),
-        }
+            ),
+            Span::styled(" · no selection", Style::default().fg(Color::DarkGray)),
+        ])
     };
-    let mut prefix = vec![
-        Span::styled("composer ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            app.composer_target().label(),
-            Style::default()
-                .fg(match app.composer_target() {
-                    ComposerTarget::Companion => Color::Green,
-                    ComposerTarget::TicketIntake => Color::Magenta,
-                })
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("  ·  ", Style::default().fg(Color::DarkGray)),
-    ];
-    prefix.append(&mut line.spans);
-    frame.render_widget(Paragraph::new(Line::from(prefix)), area);
+    frame.render_widget(Paragraph::new(target), area);
 }
 
 fn draw_input(frame: &mut Frame<'_>, render: &crate::input::InputRender, area: Rect) {
@@ -2364,7 +2274,10 @@ mod tests {
     use crate::pod_list::{LivePodInfo, PodEntrySummary, StoredMetadataState, StoredPodInfo};
     use std::fs;
     use tempfile::TempDir;
-    use ticket::{LocalTicketBackend, MarkdownText, NewTicket, TicketBackend, TicketReview};
+    use ticket::{
+        LocalTicketBackend, MarkdownText, NewTicket, TicketBackend, TicketEventKind, TicketReview,
+        TicketStateChange, TicketWorkflowState,
+    };
 
     fn ready_ticket_workspace(slug: &str) -> (TempDir, String, LocalTicketBackend) {
         let temp = TempDir::new().unwrap();
@@ -2385,9 +2298,13 @@ mod tests {
                 author: None,
                 assignee: None,
                 labels: Vec::new(),
-                readiness: Some("ready".to_string()),
+                readiness: None,
                 action_required: None,
-                needs_preflight: Some(true),
+                workflow_state: Some(TicketWorkflowState::Ready),
+                attention_required: None,
+                queued_by: None,
+                queued_at: None,
+                needs_preflight: None,
                 risk_flags: Vec::new(),
                 legacy_ticket: None,
             })
@@ -2409,28 +2326,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ticket_go_action_records_decision_without_starting_implementation() {
-        let (temp, ticket_id, backend) = ready_ticket_workspace("panel-go");
+    async fn ticket_queue_action_transitions_ready_ticket_without_starting_implementation() {
+        let (temp, ticket_id, backend) = ready_ticket_workspace("panel-queue");
 
         let outcome =
-            dispatch_ticket_action(request_for(&temp, ticket_id.clone(), NextUserAction::Go))
+            dispatch_ticket_action(request_for(&temp, ticket_id.clone(), NextUserAction::Queue))
                 .await
                 .unwrap();
 
-        assert!(outcome.notice.contains("Recorded Panel Go"));
+        assert!(outcome.notice.contains("Queued Ticket"));
         assert!(outcome.notice.contains("No implementation was started"));
         let ticket = backend.show(TicketIdOrSlug::Id(ticket_id)).unwrap();
         assert_eq!(ticket.meta.status.as_local(), Some(TicketStatus::Open));
-        let decision = ticket
+        assert_eq!(ticket.meta.workflow_state, TicketWorkflowState::Queued);
+        assert_eq!(ticket.meta.queued_by.as_deref(), Some("workspace-panel"));
+        assert!(ticket.meta.queued_at.is_some());
+        let state_change = ticket
             .events
             .iter()
             .find(|event| {
-                event.kind == TicketEventKind::Decision
-                    && event.body.as_str().contains("Panel Go recorded")
+                event.kind == TicketEventKind::StateChanged
+                    && event.state_field.as_deref() == Some("workflow_state")
+                    && event.from.as_deref() == Some("ready")
+                    && event.to.as_deref() == Some("queued")
             })
-            .expect("panel Go decision is recorded");
-        assert_eq!(decision.author.as_deref(), Some("workspace-panel"));
-        assert!(decision.body.as_str().contains("does not enqueue or spawn"));
+            .expect("queue state_changed event is recorded");
+        assert_eq!(state_change.author.as_deref(), Some("workspace-panel"));
     }
 
     #[tokio::test]
@@ -2441,7 +2362,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(error.to_string().contains("current action is Go"));
+        assert!(error.to_string().contains("current action is Queue"));
     }
 
     #[tokio::test]
@@ -2450,15 +2371,17 @@ mod tests {
         fs::remove_file(temp.path().join(".yoi/ticket.config.toml")).unwrap();
 
         let error =
-            dispatch_ticket_action(request_for(&temp, ticket_id.clone(), NextUserAction::Go))
+            dispatch_ticket_action(request_for(&temp, ticket_id.clone(), NextUserAction::Queue))
                 .await
                 .unwrap_err();
 
         assert!(error.to_string().contains("Ticket config is absent"));
         let ticket = backend.show(TicketIdOrSlug::Id(ticket_id)).unwrap();
+        assert_eq!(ticket.meta.workflow_state, TicketWorkflowState::Ready);
+        assert!(ticket.meta.queued_by.is_none());
         assert!(!ticket.events.iter().any(|event| {
-            event.kind == TicketEventKind::Decision
-                && event.body.as_str().contains("Panel Go recorded")
+            event.kind == TicketEventKind::StateChanged
+                && event.state_field.as_deref() == Some("workflow_state")
         }));
     }
 
@@ -2498,6 +2421,31 @@ mod tests {
                 TicketReview::approve("reviewed"),
             )
             .unwrap();
+        backend
+            .queue_ready(TicketIdOrSlug::Id(ticket_id.clone()), "panel")
+            .unwrap();
+        backend
+            .set_workflow_state(
+                TicketIdOrSlug::Id(ticket_id.clone()),
+                TicketStateChange::new(
+                    "queued",
+                    "inprogress",
+                    "implemented",
+                    "Implementation started.",
+                ),
+            )
+            .unwrap();
+        backend
+            .set_workflow_state(
+                TicketIdOrSlug::Id(ticket_id.clone()),
+                TicketStateChange::new(
+                    "inprogress",
+                    "done",
+                    "implemented",
+                    "Ready for close diagnostic.",
+                ),
+            )
+            .unwrap();
 
         let outcome =
             dispatch_ticket_action(request_for(&temp, ticket_id.clone(), NextUserAction::Close))
@@ -2520,19 +2468,12 @@ mod tests {
             )
             .unwrap();
 
-        let outcome = dispatch_ticket_action(request_for(
-            &temp,
-            ticket_id.clone(),
-            NextUserAction::Review,
-        ))
-        .await
-        .unwrap();
+        let error =
+            dispatch_ticket_action(request_for(&temp, ticket_id.clone(), NextUserAction::Wait))
+                .await
+                .unwrap_err();
 
-        assert!(
-            outcome
-                .notice
-                .contains("requires explicit approve/request-changes")
-        );
+        assert!(error.to_string().contains("current action is Queue"));
         let ticket = backend.show(TicketIdOrSlug::Id(ticket_id)).unwrap();
         assert!(
             !ticket
@@ -2543,7 +2484,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ticket_go_notification_sends_notify_when_socket_available() {
+    async fn ticket_queue_notification_sends_notify_when_socket_available() {
         let temp = TempDir::new().unwrap();
         let socket_path = temp.path().join("orchestrator.sock");
         let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
@@ -2572,13 +2513,13 @@ mod tests {
             reader.next::<Method>().await.unwrap().unwrap()
         });
 
-        send_notify_only(&socket_path, "panel Go".to_string())
+        send_notify_only(&socket_path, "panel Queue".to_string())
             .await
             .unwrap();
         let method = server.await.unwrap();
         assert!(matches!(
             method,
-            Method::Notify { message } if message == "panel Go"
+            Method::Notify { message } if message == "panel Queue"
         ));
     }
 
@@ -2810,38 +2751,27 @@ mod tests {
         let review_row = panel_test_ticket_row(
             "workspace-panel-composer-targets",
             "Workspace panel composer targets",
-            ActionPriority::Decision,
-            NextUserAction::Review,
-            "implementation reported",
-            crate::workspace_panel::TicketPanelPhase::Reviewing,
+            ActionPriority::ActiveWork,
+            NextUserAction::Wait,
+            "inprogress",
         );
         let ready_row = panel_test_ticket_row(
             "ticket-slug",
             "Long Ticket title that should be rendered after short columns",
-            ActionPriority::ReadyForGo,
-            NextUserAction::Go,
-            "ready for Go",
-            crate::workspace_panel::TicketPanelPhase::Preflight,
+            ActionPriority::ReadyForQueue,
+            NextUserAction::Queue,
+            "ready",
         );
 
         let review_line = plain_line(&panel_row_line(&review_row, true, 160));
         let ready_line = plain_line(&panel_row_line(&ready_row, false, 160));
-        let action_start = 2 + TICKET_PRIORITY_COLUMN_WIDTH + 1;
-        let status_start = action_start + TICKET_ACTION_COLUMN_WIDTH + 1;
-        let phase_start = status_start + TICKET_STATUS_COLUMN_WIDTH + 1;
-        let id_start = phase_start + TICKET_PHASE_COLUMN_WIDTH + 1;
+        let state_start = 2;
+        let id_start = state_start + TICKET_STATE_COLUMN_WIDTH + 1;
         let title_start = id_start + TICKET_ID_COLUMN_WIDTH + 1;
 
         assert!(!review_line.starts_with("▶ Workspace panel composer targets"));
-        assert_eq!(display_column(&review_line, "Review"), action_start);
-        assert_eq!(display_column(&ready_line, "Go"), action_start);
-        assert_eq!(
-            display_column(&review_line, "implementation reported"),
-            status_start
-        );
-        assert_eq!(display_column(&ready_line, "ready for Go"), status_start);
-        assert_eq!(display_column(&review_line, "review"), phase_start);
-        assert_eq!(display_column(&ready_line, "preflight"), phase_start);
+        assert_eq!(display_column(&review_line, "inprogress"), state_start);
+        assert_eq!(display_column(&ready_line, "ready"), state_start);
         assert_eq!(
             display_column(&review_line, "workspace-panel-composer-targets"),
             id_start
@@ -2862,24 +2792,13 @@ mod tests {
         let row = panel_test_ticket_row(
             "ticket-slug",
             "Very long Ticket title that should truncate only after the aligned short columns",
-            ActionPriority::ReadyForGo,
-            NextUserAction::Go,
-            "ready for Go",
-            crate::workspace_panel::TicketPanelPhase::Preflight,
+            ActionPriority::ReadyForQueue,
+            NextUserAction::Queue,
+            "ready",
         );
 
         let line = plain_line(&panel_row_line(&row, false, 112));
-        let title_start = 2
-            + TICKET_PRIORITY_COLUMN_WIDTH
-            + 1
-            + TICKET_ACTION_COLUMN_WIDTH
-            + 1
-            + TICKET_STATUS_COLUMN_WIDTH
-            + 1
-            + TICKET_PHASE_COLUMN_WIDTH
-            + 1
-            + TICKET_ID_COLUMN_WIDTH
-            + 1;
+        let title_start = 2 + TICKET_STATE_COLUMN_WIDTH + 1 + TICKET_ID_COLUMN_WIDTH + 1;
 
         assert_eq!(line.width(), 112);
         assert_eq!(
@@ -2911,15 +2830,11 @@ mod tests {
 
         let idle_line = plain_line(&row_line(idle, false, 120));
         let running_line = plain_line(&row_line(running, false, 120));
-        let action_start = 2 + POD_STATUS_COLUMN_WIDTH + 1;
-        let kind_start = action_start + POD_ACTION_COLUMN_WIDTH + 1;
-        let name_start = kind_start + POD_KIND_COLUMN_WIDTH + 1;
+        let name_start = 2 + POD_STATUS_COLUMN_WIDTH + 1;
 
         assert!(!running_line.starts_with("  very-long-background-worker-name"));
-        assert_eq!(display_column(&idle_line, "send"), action_start);
-        assert_eq!(display_column(&running_line, "open"), action_start);
-        assert_eq!(display_column(&idle_line, "pod"), kind_start);
-        assert_eq!(display_column(&running_line, "pod"), kind_start);
+        assert_eq!(display_column(&idle_line, "live idle"), 2);
+        assert_eq!(display_column(&running_line, "live running"), 2);
         assert_eq!(display_column(&idle_line, "companion"), name_start);
         assert_eq!(
             display_column(&running_line, "very-long-background-worker-name"),
@@ -2928,7 +2843,7 @@ mod tests {
     }
 
     #[test]
-    fn panel_pod_name_truncates_after_status_action_and_kind() {
+    fn panel_pod_name_truncates_after_status() {
         let app = test_app(vec![live_info(
             "very-long-background-worker-name-that-keeps-going",
             PodStatus::Running,
@@ -2936,23 +2851,10 @@ mod tests {
         let entry = app.list.selected_entry().unwrap();
 
         let line = plain_line(&row_line(entry, false, 58));
-        let name_start = 2
-            + POD_STATUS_COLUMN_WIDTH
-            + 1
-            + POD_ACTION_COLUMN_WIDTH
-            + 1
-            + POD_KIND_COLUMN_WIDTH
-            + 1;
+        let name_start = 2 + POD_STATUS_COLUMN_WIDTH + 1;
 
         assert_eq!(line.width(), 58);
-        assert_eq!(
-            display_column(&line, "open"),
-            2 + POD_STATUS_COLUMN_WIDTH + 1
-        );
-        assert_eq!(
-            display_column(&line, "pod"),
-            name_start - POD_KIND_COLUMN_WIDTH - 1
-        );
+        assert_eq!(display_column(&line, "live running"), 2);
         assert_eq!(display_column(&line, "very-long"), name_start);
         assert!(line.ends_with('…'));
     }
@@ -3556,7 +3458,6 @@ mod tests {
         priority: ActionPriority,
         next_action: NextUserAction,
         status: &str,
-        phase: crate::workspace_panel::TicketPanelPhase,
     ) -> PanelRow {
         let ticket = crate::workspace_panel::TicketPanelEntry {
             id: format!("20260606-000000-{slug}"),
@@ -3566,7 +3467,10 @@ mod tests {
             kind: "task".to_string(),
             priority: "P2".to_string(),
             labels: Vec::new(),
-            phase,
+            workflow_state: TicketWorkflowState::parse(status)
+                .unwrap_or(TicketWorkflowState::Intake),
+            workflow_state_explicit: true,
+            attention_required: None,
             next_action: Some(next_action),
             updated_at: None,
             latest_event_kind: Some("implementation_report".to_string()),
