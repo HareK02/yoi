@@ -23,3 +23,18 @@ Decision recorded:
 
 
 ---
+
+<!-- event: decision author: hare at: 2026-06-06T22:04:15Z -->
+
+## Decision
+
+Updated per user direction:
+
+- Ticket row should not expose priority/action/status/phase as separate permanent columns; they are redundant once explicit workflow state exists.
+- Ticket rows should be essentially `state + slug/id + title`.
+- Pod rows should likewise be essentially `pod-state + pod-name`.
+- Operations such as Queue/Defer/Open/Send should move to selected-row actionbar/key hints instead of row columns.
+- Composer/status bar should be kept concise; verbose target/help/diagnostic text should move to actionbar or detail/diagnostic areas.
+
+
+---

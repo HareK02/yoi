@@ -7,7 +7,7 @@ kind: task
 priority: P1
 labels: [ticket, tui, orchestration, panel, state]
 created_at: 2026-06-06T21:54:03Z
-updated_at: 2026-06-06T21:54:48Z
+updated_at: 2026-06-06T22:04:15Z
 assignee: null
 legacy_ticket: null
 ---
@@ -61,6 +61,26 @@ Exact field names can be refined during implementation, but the semantics should
 
 Do not persist `activity` in Ticket frontmatter. Current activity such as implementing/reviewing/validating should be displayed by combining Ticket state with live Pod/session/role-launch metadata and latest thread events.
 
+## Panel display simplification
+
+Once explicit workflow state exists, the panel row should stop showing multiple near-synonymous columns such as priority/action/status/phase. For Ticket rows, the main list should show only the durable state plus identity/title:
+
+```text
+<sel> <state> <slug-or-id> <title>
+```
+
+Actions such as `Queue`, `Defer`, or `Open` should move to the actionbar/key-hint area for the selected row, not occupy a permanent row column. Ticket priority and other metadata can appear in the detail pane when useful, not as primary list columns.
+
+Pod rows should follow the same principle:
+
+```text
+<sel> <pod-state> <pod-name>
+```
+
+Pod operations such as send/open should also be shown as selected-row key hints/actions, not as a permanent noisy row column.
+
+The panel composer/status area should also be simplified. Do not put verbose target/help/diagnostic text in the status bar. Keep the status bar concise and stable; put transient guidance/errors in the actionbar or detail/diagnostic area instead.
+
 ## Flow
 
 - `intake -> ready` is completed through Intake Pod conversation and Ticket materialization.
@@ -75,6 +95,11 @@ The panel action currently called `Go` should become `Queue`, because the user i
 - Add explicit workflow state fields to the Ticket model/parser/writer and tool/CLI surfaces as needed.
 - Migrate or default existing Tickets safely without relying on labels/title/thread-event heuristics as authoritative state.
 - Update `yoi panel` to display `workflow_state` directly.
+- Simplify Ticket rows to state + identity/title only: remove permanent priority/action/status/phase columns from the main row.
+- Simplify Pod rows to pod-state + pod-name only: remove permanent action/kind columns from the main row.
+- Move row-specific operations such as Queue/Defer/Open/Send to selected-row actionbar/key hints rather than always-visible row columns.
+- Keep composer/status bar text concise; avoid verbose target/help/diagnostic clutter in the status bar.
+- Put transient guidance/errors in the actionbar or diagnostic/detail area instead of the status bar.
 - Remove or demote current panel heuristics that infer phase/action from labels, title text, `readiness`, `needs_preflight`, or thread event presence.
 - Rename panel `Go` action to `Queue` and make it transition `ready -> queued`.
 - Queue action must re-check current Ticket state before mutation.
@@ -91,13 +116,16 @@ The panel action currently called `Go` should become `Queue`, because the user i
 - Persisting live Pod activity into Tickets.
 - Reintroducing human approve/reject gates for every review loop.
 - Reintroducing `--multi` or `:ticket`.
-- Layout-only tuning unrelated to explicit state.
+- Layout-only tuning unrelated to explicit state, except the required state-only row/statusbar simplification described above.
 
 ## Acceptance criteria
 
 - New/updated Tickets can carry explicit workflow state.
 - Panel rows show workflow state from Ticket fields rather than inferred phase/status.
-- Ready Tickets show `Queue` rather than `Go`.
+- Ticket rows use a minimal `state + slug/id + title` shape; priority/action/status/phase are not permanent main-list columns.
+- Pod rows use a minimal `pod-state + pod-name` shape; operations are shown as selected-row key hints/actions, not permanent main-list columns.
+- Composer/status bar text is concise and does not contain verbose target/help/diagnostic clutter.
+- Ready Tickets show `Queue` rather than `Go` as the selected-row actionbar/key-hint action.
 - Queue action transitions only `ready -> queued` and rejects stale/invalid states.
 - Review/rework activity does not create a separate workflow state; it remains `inprogress` plus runtime/thread detail.
 - No persistent `activity` field is required for current Pod activity.
