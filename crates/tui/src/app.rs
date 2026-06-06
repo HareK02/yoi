@@ -11,8 +11,7 @@ use crate::block::{
 };
 use crate::cache::FileCache;
 use crate::command::{
-    CommandAction, CommandCandidate, CommandEnvironment, CommandExecution, CommandInputMode,
-    CommandRegistry,
+    CommandCandidate, CommandEnvironment, CommandExecution, CommandInputMode, CommandRegistry,
 };
 use crate::input::InputBuffer;
 use crate::scroll::Scroll;
@@ -247,7 +246,6 @@ pub struct App {
     pub input_mode: CommandInputMode,
     pub command_registry: CommandRegistry,
     command_completion_selected: Option<usize>,
-    pending_command_action: Option<CommandAction>,
     pub quit: bool,
     /// 2-tap guard for `Ctrl-C` when the Pod is not running. First press
     /// records the instant; a second press within the timeout exits the
@@ -316,7 +314,6 @@ impl App {
             input_mode: CommandInputMode::Composer,
             command_registry: CommandRegistry::default(),
             command_completion_selected: None,
-            pending_command_action: None,
             quit: false,
             quit_confirm: None,
             blocks: Vec::new(),
@@ -1629,12 +1626,7 @@ impl App {
             self.rewind_picker = None;
             self.rewind_request_pending = true;
         }
-        self.pending_command_action = result.action;
         result.method
-    }
-
-    pub fn take_pending_command_action(&mut self) -> Option<CommandAction> {
-        self.pending_command_action.take()
     }
 
     fn push_command_diagnostic(&mut self, message: impl Into<String>) {

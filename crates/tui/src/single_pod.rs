@@ -20,14 +20,9 @@ use ratatui::backend::CrosstermBackend;
 use session_store::SegmentId;
 use tokio::sync::mpsc;
 
-use client::ticket_role::TicketRef;
-use client::{
-    PodClient, PodRuntimeCommand, TicketRoleLaunchContext, TicketRoleLaunchError,
-    launch_ticket_role_pod,
-};
+use client::{PodClient, PodRuntimeCommand};
 
 use crate::app::{ActionbarNoticeLevel, ActionbarNoticeSource, App};
-use crate::command::{CommandAction, TicketRoleCommand};
 use crate::picker::PickerOutcome;
 use crate::spawn::{SpawnOutcome, SpawnReady};
 use crate::{multi_pod, picker, spawn, ui};
@@ -304,7 +299,6 @@ type TerminalEventResult = io::Result<TermEvent>;
 const TERMINAL_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const TERMINAL_EVENT_DRAIN_LIMIT: usize = 64;
 const POD_EVENT_DRAIN_LIMIT: usize = 32;
-const TICKET_ROLE_NOTICE_DURATION: Duration = Duration::from_secs(5);
 
 struct TerminalEventReader {
     stop: Arc<AtomicBool>,
@@ -487,14 +481,12 @@ async fn handle_terminal_event(
     app: &mut App,
     client: &mut PodClient,
     event: TermEvent,
-    runtime_command: &PodRuntimeCommand,
+    _runtime_command: &PodRuntimeCommand,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match event {
         TermEvent::Key(key) => {
             if let Some(method) = handle_key(app, key) {
                 client.send(&method).await?;
-            } else if let Some(action) = app.take_pending_command_action() {
-                handle_command_action(app, action, runtime_command).await;
             }
         }
         TermEvent::Mouse(mouse) => {
@@ -540,96 +532,6 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
         MouseEventKind::ScrollUp => app.scroll.scroll_up(WHEEL_LINES),
         MouseEventKind::ScrollDown => app.scroll.scroll_down(WHEEL_LINES),
         _ => {}
-    }
-}
-
-async fn handle_command_action(
-    app: &mut App,
-    action: CommandAction,
-    runtime_command: &PodRuntimeCommand,
-) {
-    match action {
-        CommandAction::TicketRole(command) => {
-            handle_ticket_role_command(app, command, runtime_command).await;
-        }
-    }
-}
-
-async fn handle_ticket_role_command(
-    app: &mut App,
-    command: TicketRoleCommand,
-    runtime_command: &PodRuntimeCommand,
-) {
-    let role_label = command.role.as_str();
-    app.flash_actionbar_notice(
-        format!("Launching ticket {role_label} Pod..."),
-        ActionbarNoticeLevel::Info,
-        ActionbarNoticeSource::Tui,
-        TICKET_ROLE_NOTICE_DURATION,
-    );
-
-    let workspace_root = match std::env::current_dir() {
-        Ok(path) => path,
-        Err(err) => {
-            app.flash_actionbar_notice(
-                format!("Ticket role launch failed: could not resolve current directory: {err}"),
-                ActionbarNoticeLevel::Error,
-                ActionbarNoticeSource::Tui,
-                TICKET_ROLE_NOTICE_DURATION,
-            );
-            return;
-        }
-    };
-
-    let context = ticket_role_launch_context(workspace_root, command);
-    let mut progress = Vec::new();
-    match launch_ticket_role_pod(context, runtime_command.clone(), |message| {
-        progress.push(message.to_owned());
-    })
-    .await
-    {
-        Ok(result) => {
-            let profile = result.plan.profile;
-            app.flash_actionbar_notice(
-                format!(
-                    "Launched ticket {role_label} Pod `{}` with profile `{profile}`",
-                    result.ready.pod_name
-                ),
-                ActionbarNoticeLevel::Info,
-                ActionbarNoticeSource::Tui,
-                TICKET_ROLE_NOTICE_DURATION,
-            );
-        }
-        Err(err) => {
-            app.flash_actionbar_notice(
-                format_ticket_role_launch_error(&err),
-                ActionbarNoticeLevel::Error,
-                ActionbarNoticeSource::Tui,
-                TICKET_ROLE_NOTICE_DURATION,
-            );
-        }
-    }
-}
-
-fn ticket_role_launch_context(
-    workspace_root: std::path::PathBuf,
-    command: TicketRoleCommand,
-) -> TicketRoleLaunchContext {
-    let mut context = TicketRoleLaunchContext::new(workspace_root, command.role);
-    context.ticket = command.ticket.map(TicketRef::slug);
-    context.user_instruction = command.instruction;
-    context
-}
-
-fn format_ticket_role_launch_error(error: &TicketRoleLaunchError) -> String {
-    match error {
-        TicketRoleLaunchError::UnsupportedInheritProfile => concat!(
-            "Ticket role launch failed: role profile is `inherit`. ",
-            "Top-level TUI ticket launches require concrete role profiles in ",
-            ".yoi/ticket.config.toml until an inheritance-aware launch path exists."
-        )
-        .to_owned(),
-        _ => format!("Ticket role launch failed: {error}"),
     }
 }
 
@@ -1924,40 +1826,6 @@ mod tests {
         for c in text.chars() {
             assert!(handle_key(app, key(KeyCode::Char(c))).is_none());
         }
-    }
-
-    #[test]
-    fn ticket_role_launch_context_uses_slug_reference_and_instruction() {
-        let context = ticket_role_launch_context(
-            PathBuf::from("/tmp/workspace"),
-            TicketRoleCommand {
-                role: client::ticket_role::TicketRole::Coder,
-                ticket: Some("abc-123".to_owned()),
-                instruction: Some("focus parser tests".to_owned()),
-            },
-        );
-        assert_eq!(context.role, client::ticket_role::TicketRole::Coder);
-        assert_eq!(context.workspace_root, PathBuf::from("/tmp/workspace"));
-        assert_eq!(
-            context
-                .ticket
-                .as_ref()
-                .and_then(|ticket| ticket.slug.as_deref()),
-            Some("abc-123")
-        );
-        assert_eq!(
-            context.user_instruction.as_deref(),
-            Some("focus parser tests")
-        );
-        assert!(context.pod_name.is_none());
-    }
-
-    #[test]
-    fn unsupported_inherit_profile_message_explains_tui_boundary() {
-        let message =
-            format_ticket_role_launch_error(&TicketRoleLaunchError::UnsupportedInheritProfile);
-        assert!(message.contains("Top-level TUI ticket launches require concrete role profiles"));
-        assert!(message.contains(".yoi/ticket.config.toml"));
     }
 
     fn key(code: KeyCode) -> KeyEvent {

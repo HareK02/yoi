@@ -1,6 +1,6 @@
 # Tickets and development workflow
 
-Yoi project work is tracked through Tickets. For normal use, interact with Tickets through the TUI role commands, Ticket tools, and Ticket workflows. Git history plus Ticket files remain the authoritative state-transition record behind those interfaces.
+Yoi project work is tracked through Tickets. For normal use, interact with Tickets through `yoi panel`, Ticket tools, the `yoi ticket ...` CLI, and Ticket workflows. Git history plus Ticket files remain the authoritative state-transition record behind those interfaces.
 
 The current local backend stores Ticket files under `.yoi/tickets/`. That storage detail matters for maintainers and backend compatibility, but it is not the primary user-facing workflow.
 
@@ -20,11 +20,11 @@ A Ticket may represent a feature, bug, cleanup, design decision, investigation, 
 
 Use the highest-level interface that matches the work:
 
-- In the TUI, use `:ticket ...` commands to launch fixed Ticket-role Pods.
+- Use `yoi panel` for the Ticket/Intake/Orchestrator workspace UI and role-launch actions.
 - Inside Pods, use typed Ticket tools to create, inspect, comment, review, and close Tickets.
 - For multi-step work, follow the Ticket Intake, Orchestrator Routing, Preflight, and Multi-agent workflows.
 
-Maintainers can inspect the local `.yoi/tickets/` files directly when debugging storage, but normal user instructions should go through TUI role actions, Ticket tools, or `yoi ticket ...`.
+Maintainers can inspect the local `.yoi/tickets/` files directly when debugging storage, but normal user instructions should go through `yoi panel`, Ticket tools, or `yoi ticket ...`.
 
 ## Ticket tools inside Pods
 
@@ -118,7 +118,7 @@ If `.yoi/ticket.config.toml` is missing, defaults are:
   - reviewer: `multi-agent-workflow`
   - investigator: `ticket-orchestrator-routing`
 
-Important: top-level TUI Ticket role launches cannot execute `profile = "inherit"` because top-level launch has no parent Profile to inherit from. Configure concrete role profiles in `.yoi/ticket.config.toml` before using TUI role-launch commands.
+Important: top-level Ticket role launches cannot execute `profile = "inherit"` because top-level launch has no parent Profile to inherit from. Configure concrete role profiles in `.yoi/ticket.config.toml` before using `yoi panel` role-launch actions.
 
 ## Workflow lifecycle
 
@@ -219,61 +219,50 @@ Before closing, verify concrete evidence:
 
 Close with a resolution that summarizes what changed, key commits, validation, review status, and remaining follow-ups.
 
-## TUI Ticket role actions
+## Workspace panel Ticket role actions
 
-TUI exposes explicit commands for fixed Ticket roles:
+`yoi panel` is the active Ticket/Intake/Orchestrator UI. It owns fixed Ticket role-launch actions and uses the shared client Ticket role launcher. The single-Pod TUI no longer supports `:ticket ...` commands; typing them in command mode is treated like any other unknown command.
 
-```text
-:ticket intake <context...>
-:ticket route <ticket-id-or-slug> [instruction...]
-:ticket investigate <ticket-id-or-slug> [instruction...]
-:ticket implement <ticket-id-or-slug> [instruction...]
-:ticket review <ticket-id-or-slug> [instruction...]
-```
+Role actions map to the same fixed roles configured in `.yoi/ticket.config.toml`:
 
-These commands call the shared client Ticket role launcher. TUI does not construct `SpawnConfig`, Profile semantics, workflow segments, or prompt content directly.
-
-Command mapping:
-
-- `intake` launches the intake role without an existing Ticket and requires freeform context.
-- `route` launches the orchestrator role for an existing Ticket.
-- `investigate` launches the investigator role for a read-only spike/investigation.
-- `implement` launches the coder role for an implementation assignment.
-- `review` launches the reviewer role for review.
+- intake launches the intake role without an existing Ticket and requires freeform context.
+- route launches the orchestrator role for an existing Ticket.
+- investigate launches the investigator role for a read-only spike/investigation.
+- implement launches the coder role for an implementation assignment.
+- review launches the reviewer role for review.
 
 All actions are explicit and user-triggered. They are not a scheduler, queue, spawned-Pod panel, or automatic maintainer loop.
 
-### TUI execution path
+### Panel execution path
 
-The TUI path is:
+The role-launch path is:
 
 ```text
-User types :ticket ... in the TUI
-  -> TUI parses the command into a fixed Ticket role action
-  -> TUI builds a TicketRoleLaunchContext
+User triggers a Ticket action in yoi panel
+  -> panel builds a TicketRoleLaunchContext
   -> client Ticket role launcher reads .yoi/ticket.config.toml
   -> launcher selects the role Profile and workflow
   -> launcher spawns the role Pod
   -> launcher sends Method::Run with WorkflowInvoke + Text segments
   -> launcher waits for run-acceptance evidence
-  -> TUI shows success/failure in the actionbar
+  -> panel reports success/failure
 ```
 
-The launched Pod receives dynamic Ticket/action context as its first committed run input. The TUI does not inject hidden context, does not write Ticket files directly, and does not construct prompt/workflow segments by hand.
+The launched Pod receives dynamic Ticket/action context as its first committed run input. The panel does not inject hidden context, does not write Ticket files directly, and does not construct prompt/workflow segments by hand.
 
 The first run input contains:
 
 - the selected fixed role;
 - the workflow slug from `.yoi/ticket.config.toml`;
-- Ticket id/slug when the command targets an existing Ticket;
-- freeform user instruction/context from the command;
+- Ticket id/slug when the action targets an existing Ticket;
+- freeform user instruction/context from the action;
 - configured `launch_prompt` reference if present, as an unresolved reference for future prompt resolution.
 
 The selected Profile supplies durable system/role behavior. `ticket.config.toml` does not override system instruction.
 
-### TUI setup
+### Panel setup
 
-Because top-level TUI role launches cannot inherit a parent Profile, configure concrete role profiles before using these commands:
+Because top-level role launches cannot inherit a parent Profile, configure concrete role profiles before using panel role actions:
 
 ```toml
 # .yoi/ticket.config.toml
@@ -303,48 +292,13 @@ profile = "project:investigator"
 workflow = "ticket-orchestrator-routing"
 ```
 
-If a role still uses `profile = "inherit"`, TUI will fail closed with a diagnostic explaining that a concrete profile is required.
+If a role still uses `profile = "inherit"`, the panel fails closed with a diagnostic explaining that a concrete profile is required.
 
-### TUI usage examples
-
-Create or refine a Ticket from a broad request:
-
-```text
-:ticket intake Add a safer retry policy for stream-open provider failures
-```
-
-Route an existing Ticket:
-
-```text
-:ticket route ticket-local-files-backend classify next action and record routing decision
-```
-
-Start a read-only investigation role:
-
-```text
-:ticket investigate plugin-extension-surface map current feature API boundaries
-```
-
-Launch a coder role for an implementation-ready Ticket:
-
-```text
-:ticket implement ticket-config-role-profile-mapping implement the accepted MVP only
-```
-
-Launch a reviewer role:
-
-```text
-:ticket review tui-ticket-role-actions review diff against Ticket requirements
-```
-
-After launch, inspect the created Pod through normal Pod/TUI surfaces. The command confirms launch/run acceptance; it does not mean the role Pod completed the assignment.
-
-### TUI troubleshooting
+### Panel troubleshooting
 
 - `profile = "inherit"`: configure a concrete role Profile in `.yoi/ticket.config.toml`.
 - malformed `.yoi/ticket.config.toml`: fix the config and retry.
-- missing Ticket id/slug for `route`, `investigate`, `implement`, or `review`: provide the target Ticket.
-- empty `:ticket intake`: provide the request/context to clarify.
+- missing Ticket id/slug for route, investigate, implement, or review actions: provide the target Ticket.
 - launch success but no visible completion: attach to or inspect the launched Pod; completion notifications are hints, not authority.
 
 ## Granularity
@@ -399,7 +353,7 @@ The current LocalTicketBackend stores records under:
   resolution.md   # closed Tickets only
 ```
 
-Backend integrations must preserve this format until an explicit migration changes it. The repository-root `work-items/` path is no longer a live mutable backend; do not recreate it for Ticket records. Human users should prefer TUI role actions or Ticket tools; maintainers may use `yoi ticket ...` when working directly with repository records.
+Backend integrations must preserve this format until an explicit migration changes it. The repository-root `work-items/` path is no longer a live mutable backend; do not recreate it for Ticket records. Human users should prefer `yoi panel`, Ticket tools, or `yoi ticket ...` when working directly with repository records.
 
 ## Validation
 
