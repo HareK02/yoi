@@ -7,7 +7,7 @@ kind: task
 priority: P2
 labels: [tui, ticket, orchestration, panel, ux]
 created_at: 2026-06-06T06:05:48Z
-updated_at: 2026-06-06T08:36:49Z
+updated_at: 2026-06-06T09:32:01Z
 assignee: null
 legacy_ticket: null
 ---

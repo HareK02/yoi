@@ -33,3 +33,20 @@ This should be handled in the layout/display tuning ticket, not by changing back
 
 
 ---
+
+<!-- event: plan author: hare at: 2026-06-06T09:32:01Z -->
+
+## Plan
+
+Preflight result: `implementation-ready` as a focused layout/display pass.
+
+Implementation should rework panel row rendering into aligned columns with short comparable fields first and long variable text last:
+- Ticket/action rows: move Ticket title to the end; align priority/action/status/phase/id-or-slug first.
+- Pod rows: move Pod id/name to the end; align status/action/kind first.
+
+This should not change Ticket backend semantics, action dispatch, Orchestrator lifecycle, Intake handoff, no-Ticket behavior, or the thin ViewModel boundary.
+
+Detailed delegation intent is recorded in `artifacts/delegation-intent.md`.
+
+
+---
