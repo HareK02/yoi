@@ -18,6 +18,7 @@ use crate::{PodClient, PodRuntimeCommand, SpawnConfig, SpawnError, SpawnReady, s
 const MAX_FIELD_CHARS: usize = 8_000;
 const MAX_POD_NAME_CHARS: usize = 80;
 const RUN_ACCEPTANCE_TIMEOUT: Duration = Duration::from_secs(10);
+const PRE_RUN_ACTION_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Ticket identifier carried by a role launch request.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -71,6 +72,31 @@ impl TicketRef {
     }
 }
 
+/// Auditable panel handoff target included in a Ticket Intake launch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TicketIntakeHandoff {
+    pub orchestrator_pod: String,
+    pub workspace_label: String,
+}
+
+impl TicketIntakeHandoff {
+    pub fn new(orchestrator_pod: impl Into<String>, workspace_label: impl Into<String>) -> Self {
+        Self {
+            orchestrator_pod: orchestrator_pod.into(),
+            workspace_label: workspace_label.into(),
+        }
+    }
+
+    fn append_prompt_lines(&self, out: &mut String) {
+        out.push_str("\nPanel handoff:\n");
+        push_bounded_bullet(out, "workspace", &self.workspace_label);
+        push_bounded_bullet(out, "workspace_orchestrator_pod", &self.orchestrator_pod);
+        out.push_str("- When Intake has clarified the request and created/updated the Ticket, notify/report readiness to this Orchestrator.\n");
+        out.push_str("- Handoff report fields: created_or_updated_ticket_id_or_slug, readiness, needs_preflight, risk_flags, user_go_required, intake_summary.\n");
+        out.push_str("- Do not start implementation automatically; wait for Orchestrator routing/preflight and human Go gates.\n");
+    }
+}
+
 /// Typed input for constructing a Ticket role launch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TicketRoleLaunchContext {
@@ -79,6 +105,7 @@ pub struct TicketRoleLaunchContext {
     pub pod_name: Option<String>,
     pub ticket: Option<TicketRef>,
     pub user_instruction: Option<String>,
+    pub intake_handoff: Option<TicketIntakeHandoff>,
     pub intent_packet: Option<String>,
     pub worktree_path: Option<PathBuf>,
     pub branch: Option<String>,
@@ -94,6 +121,7 @@ impl TicketRoleLaunchContext {
             pod_name: None,
             ticket: None,
             user_instruction: None,
+            intake_handoff: None,
             intent_packet: None,
             worktree_path: None,
             branch: None,
@@ -145,6 +173,26 @@ impl TicketRoleLaunchPlan {
 pub struct TicketRoleLaunchResult {
     pub plan: TicketRoleLaunchPlan,
     pub ready: SpawnReady,
+    pub pre_run_warnings: Vec<TicketRolePreRunWarning>,
+}
+
+/// Non-fatal diagnostic produced by bounded pre-run launch actions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TicketRolePreRunWarning {
+    pub message: String,
+}
+
+/// Optional bounded actions executed after spawn readiness and before the first Run.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TicketRoleLaunchOptions {
+    pub pre_run_peer_registrations: Vec<String>,
+}
+
+impl TicketRoleLaunchOptions {
+    pub fn with_pre_run_peer_registration(mut self, pod_name: impl Into<String>) -> Self {
+        self.pre_run_peer_registrations.push(pod_name.into());
+        self
+    }
 }
 
 #[derive(Debug, Error)]
@@ -231,6 +279,26 @@ pub async fn launch_ticket_role_pod<F>(
 where
     F: FnMut(&str),
 {
+    launch_ticket_role_pod_with_options(
+        context,
+        runtime_command,
+        progress,
+        TicketRoleLaunchOptions::default(),
+    )
+    .await
+}
+
+/// Spawn the Pod, run bounded pre-run launch options while it is still idle,
+/// then send the first `Method::Run` input and wait for acceptance evidence.
+pub async fn launch_ticket_role_pod_with_options<F>(
+    context: TicketRoleLaunchContext,
+    runtime_command: PodRuntimeCommand,
+    progress: F,
+    options: TicketRoleLaunchOptions,
+) -> Result<TicketRoleLaunchResult, TicketRoleLaunchError>
+where
+    F: FnMut(&str),
+{
     let plan = plan_ticket_role_launch(context)?;
     let ready = spawn_pod(plan.spawn_config(runtime_command)?, progress).await?;
     let mut client = PodClient::connect(&ready.socket_path)
@@ -239,12 +307,95 @@ where
             socket_path: ready.socket_path.clone(),
             source,
         })?;
+    let pre_run_warnings = run_pre_run_options_then_send_run(&mut client, &plan, &options).await?;
+    wait_for_run_acceptance(&mut client, &plan.run_segments, RUN_ACCEPTANCE_TIMEOUT).await?;
+    Ok(TicketRoleLaunchResult {
+        plan,
+        ready,
+        pre_run_warnings,
+    })
+}
+
+async fn run_pre_run_options_then_send_run(
+    client: &mut PodClient,
+    plan: &TicketRoleLaunchPlan,
+    options: &TicketRoleLaunchOptions,
+) -> Result<Vec<TicketRolePreRunWarning>, TicketRoleLaunchError> {
+    let pre_run_warnings = perform_pre_run_peer_registrations(
+        client,
+        &options.pre_run_peer_registrations,
+        PRE_RUN_ACTION_TIMEOUT,
+    )
+    .await;
     client
         .send(&plan.run_method())
         .await
         .map_err(|source| TicketRoleLaunchError::SendRun { source })?;
-    wait_for_run_acceptance(&mut client, &plan.run_segments, RUN_ACCEPTANCE_TIMEOUT).await?;
-    Ok(TicketRoleLaunchResult { plan, ready })
+    Ok(pre_run_warnings)
+}
+
+async fn perform_pre_run_peer_registrations(
+    client: &mut PodClient,
+    peer_names: &[String],
+    timeout: Duration,
+) -> Vec<TicketRolePreRunWarning> {
+    let mut warnings = Vec::new();
+    for peer_name in peer_names {
+        if peer_name.trim().is_empty() {
+            warnings.push(TicketRolePreRunWarning {
+                message: "pre-run peer registration skipped: peer Pod name is empty".to_string(),
+            });
+            continue;
+        }
+        if let Err(message) = pre_run_register_peer(client, peer_name, timeout).await {
+            warnings.push(TicketRolePreRunWarning { message });
+        }
+    }
+    warnings
+}
+
+async fn pre_run_register_peer(
+    client: &mut PodClient,
+    peer_name: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    if let Err(source) = client
+        .send(&Method::RegisterPeer {
+            name: peer_name.to_string(),
+        })
+        .await
+    {
+        return Err(format!(
+            "pre-run peer registration for {peer_name} failed while sending request: {source}"
+        ));
+    }
+
+    let wait = async {
+        loop {
+            let Some(event) = client.next_event().await else {
+                return Err(format!(
+                    "pre-run peer registration for {peer_name} failed: connection closed before response"
+                ));
+            };
+            match event {
+                Event::PeerRegistered { .. } => return Ok(()),
+                Event::Error { code, message } => {
+                    return Err(format!(
+                        "pre-run peer registration for {peer_name} failed with {code:?}: {message}"
+                    ));
+                }
+                _ => {}
+            }
+        }
+    };
+
+    tokio::time::timeout(timeout, wait)
+        .await
+        .unwrap_or_else(|_| {
+            Err(format!(
+                "pre-run peer registration for {peer_name} timed out before first Run"
+            ))
+        })
 }
 
 async fn wait_for_run_acceptance(
@@ -307,6 +458,10 @@ fn build_launch_prompt(
     match non_empty(context.user_instruction.as_deref()) {
         Some(instruction) => push_bounded_section(&mut out, "User/action instruction", instruction),
         None => out.push_str("\nUser/action instruction: not specified\n"),
+    }
+
+    if let Some(handoff) = &context.intake_handoff {
+        handoff.append_prompt_lines(&mut out);
     }
 
     if let Some(intent_packet) = non_empty(context.intent_packet.as_deref()) {
@@ -431,7 +586,10 @@ fn non_empty(value: Option<&str>) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use protocol::{Greeting, PodStatus};
     use tempfile::TempDir;
+    use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+    use tokio::net::UnixListener;
 
     fn write_config(workspace: &std::path::Path, content: &str) {
         let dir = workspace.join(".yoi");
@@ -444,6 +602,152 @@ mod tests {
             Segment::Text { content } => content,
             other => panic!("expected text segment, got {other:?}"),
         }
+    }
+
+    async fn write_test_event<W>(writer: &mut W, event: Event)
+    where
+        W: AsyncWrite + Unpin,
+    {
+        writer
+            .write_all(serde_json::to_string(&event).unwrap().as_bytes())
+            .await
+            .unwrap();
+        writer.write_all(b"\n").await.unwrap();
+    }
+
+    fn test_snapshot() -> Event {
+        Event::Snapshot {
+            entries: vec![],
+            greeting: Greeting {
+                pod_name: "ticket-intake".to_string(),
+                cwd: "/tmp".to_string(),
+                provider: "test".to_string(),
+                model: "test".to_string(),
+                scope_summary: "test".to_string(),
+                tools: vec![],
+                context_window: 0,
+                context_tokens: 0,
+            },
+            status: PodStatus::Idle,
+        }
+    }
+
+    fn test_launch_plan(workspace: &std::path::Path) -> TicketRoleLaunchPlan {
+        TicketRoleLaunchPlan {
+            workspace_root: workspace.to_path_buf(),
+            role: TicketRole::Intake,
+            pod_name: "ticket-intake".to_string(),
+            profile: "project:intake".to_string(),
+            workflow: "ticket-intake-workflow".to_string(),
+            launch_prompt_ref: None,
+            run_segments: vec![Segment::Text {
+                content: "intake request".to_string(),
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn pre_run_peer_registration_is_sent_before_first_run_submission() {
+        let temp = TempDir::new().unwrap();
+        let socket_path = temp.path().join("pod.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            write_test_event(&mut writer, test_snapshot()).await;
+            let mut reader = BufReader::new(reader);
+
+            let mut first = String::new();
+            reader.read_line(&mut first).await.unwrap();
+            match serde_json::from_str::<Method>(&first).unwrap() {
+                Method::RegisterPeer { name } => assert_eq!(name, "workspace-orchestrator"),
+                method => panic!("expected RegisterPeer before Run, got {method:?}"),
+            }
+            write_test_event(
+                &mut writer,
+                Event::PeerRegistered {
+                    result: serde_json::json!({"peer": "workspace-orchestrator"}),
+                },
+            )
+            .await;
+
+            let mut second = String::new();
+            reader.read_line(&mut second).await.unwrap();
+            match serde_json::from_str::<Method>(&second).unwrap() {
+                Method::Run { input } => {
+                    assert_eq!(
+                        input,
+                        test_launch_plan(std::path::Path::new("/tmp")).run_segments
+                    )
+                }
+                method => panic!("expected Run after pre-run RegisterPeer, got {method:?}"),
+            }
+        });
+
+        let mut client = PodClient::connect(&socket_path).await.unwrap();
+        let options = TicketRoleLaunchOptions::default()
+            .with_pre_run_peer_registration("workspace-orchestrator");
+        let warnings = run_pre_run_options_then_send_run(
+            &mut client,
+            &test_launch_plan(std::path::Path::new("/tmp")),
+            &options,
+        )
+        .await
+        .unwrap();
+
+        server.await.unwrap();
+        assert!(warnings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pre_run_peer_registration_failure_warns_but_still_sends_run() {
+        let temp = TempDir::new().unwrap();
+        let socket_path = temp.path().join("pod.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            write_test_event(&mut writer, test_snapshot()).await;
+            let mut reader = BufReader::new(reader);
+
+            let mut first = String::new();
+            reader.read_line(&mut first).await.unwrap();
+            assert!(matches!(
+                serde_json::from_str::<Method>(&first).unwrap(),
+                Method::RegisterPeer { .. }
+            ));
+            write_test_event(
+                &mut writer,
+                Event::Error {
+                    code: protocol::ErrorCode::InvalidRequest,
+                    message: "peer metadata unavailable".to_string(),
+                },
+            )
+            .await;
+
+            let mut second = String::new();
+            reader.read_line(&mut second).await.unwrap();
+            assert!(matches!(
+                serde_json::from_str::<Method>(&second).unwrap(),
+                Method::Run { .. }
+            ));
+        });
+
+        let mut client = PodClient::connect(&socket_path).await.unwrap();
+        let options = TicketRoleLaunchOptions::default()
+            .with_pre_run_peer_registration("workspace-orchestrator");
+        let warnings = run_pre_run_options_then_send_run(
+            &mut client,
+            &test_launch_plan(std::path::Path::new("/tmp")),
+            &options,
+        )
+        .await
+        .unwrap();
+
+        server.await.unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].message.contains("InvalidRequest"));
+        assert!(warnings[0].message.contains("workspace-orchestrator"));
     }
 
     #[test]
@@ -533,6 +837,20 @@ workflow = "ticket-review-workflow"
         assert!(intake_text.contains("Role: intake"));
         assert!(intake_text.contains("Clarify and materialize"));
         assert!(intake_text.contains("Workflow: ticket-intake-workflow"));
+
+        let mut handoff_intake = TicketRoleLaunchContext::new(temp.path(), TicketRole::Intake);
+        handoff_intake.intake_handoff = Some(TicketIntakeHandoff::new(
+            "panel-orchestrator-demo",
+            "Demo workspace",
+        ));
+        let handoff_plan = plan_ticket_role_launch(handoff_intake).unwrap();
+        let handoff_text = text_segment(&handoff_plan);
+        assert!(handoff_text.contains("Panel handoff:"));
+        assert!(handoff_text.contains("workspace_orchestrator_pod: panel-orchestrator-demo"));
+        assert!(handoff_text.contains("workspace: Demo workspace"));
+        assert!(handoff_text.contains("created_or_updated_ticket_id_or_slug"));
+        assert!(handoff_text.contains("Do not start implementation automatically"));
+        assert!(handoff_text.contains("human Go gates"));
 
         let mut orchestrator = TicketRoleLaunchContext::new(temp.path(), TicketRole::Orchestrator);
         orchestrator.ticket = Some(TicketRef::slug("launcher"));

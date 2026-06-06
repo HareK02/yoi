@@ -3,8 +3,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use client::ticket_role::{
-    TicketRole, TicketRoleLaunchContext, TicketRoleLaunchError, TicketRoleLaunchResult,
-    launch_ticket_role_pod,
+    TicketIntakeHandoff, TicketRole, TicketRoleLaunchContext, TicketRoleLaunchError,
+    TicketRoleLaunchOptions, TicketRoleLaunchResult, launch_ticket_role_pod,
+    launch_ticket_role_pod_with_options,
 };
 use client::{PodRuntimeCommand, SpawnConfig, spawn_pod};
 use crossterm::event::{Event as TermEvent, KeyCode, KeyEvent, KeyModifiers, poll, read};
@@ -147,9 +148,7 @@ pub(crate) async fn run(
                 MultiPodAction::LaunchIntake(request) => {
                     pending_reload.abort();
                     terminal.draw(|f| draw(f, app))?;
-                    let result =
-                        launch_ticket_role_pod(request.context, request.runtime_command, |_| {})
-                            .await;
+                    let result = launch_intake_with_handoff(request).await;
                     app.finish_intake_launch(result);
                     app.reload_or_notice().await;
                     next_poll = Instant::now() + MULTI_POD_POLL_INTERVAL;
@@ -259,6 +258,81 @@ pub(crate) struct DirectSendRequest {
 pub(crate) struct IntakeLaunchRequest {
     context: TicketRoleLaunchContext,
     runtime_command: PodRuntimeCommand,
+    peer_registration: IntakePeerRegistrationRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum IntakePeerRegistrationRequest {
+    Register { orchestrator_pod: String },
+    Skip { reason: String },
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct IntakeLaunchOutcome {
+    launch: TicketRoleLaunchResult,
+    peer_registration: IntakePeerRegistrationStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum IntakePeerRegistrationStatus {
+    Registered { orchestrator_pod: String },
+    Warning { message: String },
+}
+
+impl IntakePeerRegistrationStatus {
+    fn warning(message: impl Into<String>) -> Self {
+        Self::Warning {
+            message: bounded_panel_diagnostic(message.into()),
+        }
+    }
+}
+
+pub(crate) type IntakeLaunchResult = Result<IntakeLaunchOutcome, TicketRoleLaunchError>;
+
+pub(crate) async fn launch_intake_with_handoff(request: IntakeLaunchRequest) -> IntakeLaunchResult {
+    let (options, orchestrator_pod, skip_warning) = match request.peer_registration.clone() {
+        IntakePeerRegistrationRequest::Register { orchestrator_pod } => (
+            TicketRoleLaunchOptions::default()
+                .with_pre_run_peer_registration(orchestrator_pod.clone()),
+            Some(orchestrator_pod),
+            None,
+        ),
+        IntakePeerRegistrationRequest::Skip { reason } => (
+            TicketRoleLaunchOptions::default(),
+            None,
+            Some(IntakePeerRegistrationStatus::warning(format!(
+                "handoff peer registration skipped: {reason}"
+            ))),
+        ),
+    };
+    let launch = launch_ticket_role_pod_with_options(
+        request.context,
+        request.runtime_command,
+        |_| {},
+        options,
+    )
+    .await?;
+    let peer_registration = match (orchestrator_pod, skip_warning) {
+        (_, Some(warning)) => warning,
+        (Some(orchestrator_pod), None) if launch.pre_run_warnings.is_empty() => {
+            IntakePeerRegistrationStatus::Registered { orchestrator_pod }
+        }
+        (Some(_), None) => IntakePeerRegistrationStatus::warning(
+            launch
+                .pre_run_warnings
+                .iter()
+                .map(|warning| warning.message.as_str())
+                .collect::<Vec<_>>()
+                .join("; "),
+        ),
+        (None, None) => IntakePeerRegistrationStatus::warning(
+            "handoff peer registration skipped: no Orchestrator target",
+        ),
+    };
+    Ok(IntakeLaunchOutcome {
+        launch,
+        peer_registration,
+    })
 }
 
 pub(crate) struct MultiPodApp {
@@ -619,25 +693,55 @@ impl MultiPodApp {
         let mut context =
             TicketRoleLaunchContext::new(current_workspace_root(), TicketRole::Intake);
         context.user_instruction = Some(body);
+        let peer_registration = match self.panel.header.orchestrator.as_ref() {
+            Some(orchestrator) => {
+                context.intake_handoff = Some(TicketIntakeHandoff::new(
+                    orchestrator.pod_name.clone(),
+                    self.panel.header.workspace_label.clone(),
+                ));
+                if orchestrator_status_is_peer_reachable(orchestrator.status) {
+                    IntakePeerRegistrationRequest::Register {
+                        orchestrator_pod: orchestrator.pod_name.clone(),
+                    }
+                } else {
+                    IntakePeerRegistrationRequest::Skip {
+                        reason: format!(
+                            "workspace Orchestrator {} is {}; launch input still carries the auditable handoff target",
+                            orchestrator.pod_name,
+                            orchestrator.status.label()
+                        ),
+                    }
+                }
+            }
+            None => IntakePeerRegistrationRequest::Skip {
+                reason: "workspace Orchestrator is not configured for this panel".to_string(),
+            },
+        };
         self.sending = true;
         self.notice = Some("Launching Ticket Intake…".to_string());
         Some(IntakeLaunchRequest {
             context,
             runtime_command: self.runtime_command.clone(),
+            peer_registration,
         })
     }
 
-    pub(crate) fn finish_intake_launch(
-        &mut self,
-        result: Result<TicketRoleLaunchResult, TicketRoleLaunchError>,
-    ) {
+    pub(crate) fn finish_intake_launch(&mut self, result: IntakeLaunchResult) {
         self.sending = false;
         match result {
             Ok(result) => {
-                let pod_name = result.plan.pod_name;
+                let pod_name = result.launch.plan.pod_name;
                 self.input.clear();
+                let peer_notice = match result.peer_registration {
+                    IntakePeerRegistrationStatus::Registered { orchestrator_pod } => {
+                        format!(" Handoff peer registered with {orchestrator_pod}.")
+                    }
+                    IntakePeerRegistrationStatus::Warning { message } => {
+                        format!(" Handoff warning: {message}")
+                    }
+                };
                 self.notice = Some(bounded_panel_diagnostic(format!(
-                    "Launched Ticket Intake Pod {pod_name}."
+                    "Launched Ticket Intake Pod {pod_name}.{peer_notice}"
                 )));
             }
             Err(error) => {
@@ -953,6 +1057,15 @@ async fn spawn_orchestrator_pod(
 
 fn current_workspace_root() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+fn orchestrator_status_is_peer_reachable(status: OrchestratorPanelStatus) -> bool {
+    matches!(
+        status,
+        OrchestratorPanelStatus::Live
+            | OrchestratorPanelStatus::Restored
+            | OrchestratorPanelStatus::Spawned
+    )
 }
 
 async fn load_exact_pod_presence(pod_name: &str) -> Result<OrchestratorPodPresence, MultiPodError> {
@@ -2421,9 +2534,46 @@ mod tests {
             Some("please intake this work")
         );
         assert_eq!(request.runtime_command.program(), Path::new("/tmp/yoi"));
+        assert_eq!(
+            request.context.intake_handoff,
+            Some(TicketIntakeHandoff::new("test-orchestrator", "test"))
+        );
+        assert_eq!(
+            request.peer_registration,
+            IntakePeerRegistrationRequest::Register {
+                orchestrator_pod: "test-orchestrator".to_string()
+            }
+        );
         assert!(app.sending);
         assert!(app.notice.as_deref().unwrap().contains("Launching"));
         assert_eq!(input_text(&app), "please intake this work");
+    }
+
+    #[test]
+    fn multi_ticket_intake_handoff_skips_peer_registration_when_orchestrator_not_live() {
+        let mut app = ticket_enabled_app_with_orchestrator(
+            vec![live_info("idle", PodStatus::Idle)],
+            OrchestratorPanelStatus::Unavailable,
+        );
+        app.cycle_composer_target();
+        app.input.insert_str("please intake this work");
+
+        let request = match app.handle_key(key(KeyCode::Enter)) {
+            MultiPodAction::LaunchIntake(request) => request,
+            _ => panic!("Ticket Intake target should launch Intake"),
+        };
+
+        assert_eq!(
+            request.context.intake_handoff,
+            Some(TicketIntakeHandoff::new("test-orchestrator", "test"))
+        );
+        match request.peer_registration {
+            IntakePeerRegistrationRequest::Skip { reason } => {
+                assert!(reason.contains("test-orchestrator"));
+                assert!(reason.contains("unavailable"));
+            }
+            other => panic!("expected peer registration skip, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2433,25 +2583,33 @@ mod tests {
         app.input.insert_str("please intake this work");
         app.sending = true;
 
-        app.finish_intake_launch(Ok(TicketRoleLaunchResult {
-            plan: client::ticket_role::TicketRoleLaunchPlan {
-                workspace_root: PathBuf::from("/tmp/workspace"),
-                role: TicketRole::Intake,
-                pod_name: "intake-pod".to_string(),
-                profile: "builtin:default".to_string(),
-                workflow: "ticket-intake-workflow".to_string(),
-                launch_prompt_ref: None,
-                run_segments: vec![],
+        app.finish_intake_launch(Ok(IntakeLaunchOutcome {
+            launch: TicketRoleLaunchResult {
+                plan: client::ticket_role::TicketRoleLaunchPlan {
+                    workspace_root: PathBuf::from("/tmp/workspace"),
+                    role: TicketRole::Intake,
+                    pod_name: "intake-pod".to_string(),
+                    profile: "builtin:default".to_string(),
+                    workflow: "ticket-intake-workflow".to_string(),
+                    launch_prompt_ref: None,
+                    run_segments: vec![],
+                },
+                ready: client::SpawnReady {
+                    pod_name: "intake-pod".to_string(),
+                    socket_path: PathBuf::from("/tmp/intake.sock"),
+                },
+                pre_run_warnings: vec![],
             },
-            ready: client::SpawnReady {
-                pod_name: "intake-pod".to_string(),
-                socket_path: PathBuf::from("/tmp/intake.sock"),
+            peer_registration: IntakePeerRegistrationStatus::Registered {
+                orchestrator_pod: "test-orchestrator".to_string(),
             },
         }));
 
         assert!(!app.sending);
         assert_eq!(input_text(&app), "");
-        assert!(app.notice.as_deref().unwrap().contains("intake-pod"));
+        let notice = app.notice.as_deref().unwrap();
+        assert!(notice.contains("intake-pod"));
+        assert!(notice.contains("Handoff peer registered"));
     }
 
     #[test]
@@ -2499,8 +2657,20 @@ mod tests {
     }
 
     fn ticket_enabled_app(live: Vec<LivePodInfo>) -> MultiPodApp {
+        ticket_enabled_app_with_orchestrator(live, OrchestratorPanelStatus::Live)
+    }
+
+    fn ticket_enabled_app_with_orchestrator(
+        live: Vec<LivePodInfo>,
+        orchestrator_status: OrchestratorPanelStatus,
+    ) -> MultiPodApp {
         let mut panel = WorkspacePanelViewModel::empty(Path::new("test"));
         panel.composer = crate::workspace_panel::WorkspacePanelComposer::ticket_enabled();
+        panel.header.orchestrator = Some(OrchestratorPanelState::new(
+            "test-orchestrator",
+            orchestrator_status,
+            None,
+        ));
         app_with_panel(
             PodList::from_sources(PodVisibilitySource::ResumePicker, vec![], live, None, 10),
             panel,

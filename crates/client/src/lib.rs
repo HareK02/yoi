@@ -18,7 +18,8 @@ pub use runtime_command::PodRuntimeCommand;
 pub use pod_client::PodClient;
 pub use spawn::{SpawnConfig, SpawnError, SpawnReady, spawn_pod};
 pub use ticket_role::{
-    TicketRef, TicketRoleLaunchContext, TicketRoleLaunchError, TicketRoleLaunchPlan,
-    TicketRoleLaunchResult, launch_ticket_role_pod, plan_ticket_role_launch,
+    TicketRef, TicketRoleLaunchContext, TicketRoleLaunchError, TicketRoleLaunchOptions,
+    TicketRoleLaunchPlan, TicketRoleLaunchResult, TicketRolePreRunWarning, launch_ticket_role_pod,
+    launch_ticket_role_pod_with_options, plan_ticket_role_launch,
     plan_ticket_role_launch_with_config,
 };
