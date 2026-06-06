@@ -1,4 +1,3 @@
-use client::ticket_role::TicketRole;
 use protocol::Method;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,22 +49,9 @@ pub struct CommandEnvironment {
     pub paused: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CommandAction {
-    TicketRole(TicketRoleCommand),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TicketRoleCommand {
-    pub role: TicketRole,
-    pub ticket: Option<String>,
-    pub instruction: Option<String>,
-}
-
 #[derive(Debug, Clone)]
 pub struct CommandExecution {
     pub method: Option<Method>,
-    pub action: Option<CommandAction>,
     pub diagnostics: Vec<CommandDiagnostic>,
     pub exit_command_mode: bool,
     pub clear_input: bool,
@@ -75,7 +61,6 @@ impl CommandExecution {
     pub fn diagnostic(message: impl Into<String>) -> Self {
         Self {
             method: None,
-            action: None,
             diagnostics: vec![CommandDiagnostic::new(message)],
             exit_command_mode: false,
             clear_input: false,
@@ -85,17 +70,6 @@ impl CommandExecution {
     pub fn notice(message: impl Into<String>) -> Self {
         Self {
             method: None,
-            action: None,
-            diagnostics: vec![CommandDiagnostic::new(message)],
-            exit_command_mode: true,
-            clear_input: true,
-        }
-    }
-
-    pub fn local_action(message: impl Into<String>, action: CommandAction) -> Self {
-        Self {
-            method: None,
-            action: Some(action),
             diagnostics: vec![CommandDiagnostic::new(message)],
             exit_command_mode: true,
             clear_input: true,
@@ -190,15 +164,6 @@ impl CommandRegistry {
             argument_parser: peer_args,
             can_execute: peer_available,
             executor: peer_command,
-        });
-        registry.register(CommandSpec {
-            name: "ticket",
-            aliases: &[],
-            usage: "ticket <intake|route|investigate|implement|review> ...",
-            description: "Launch a fixed Ticket role Pod using .yoi/ticket.config.toml.",
-            argument_parser: ticket_args,
-            can_execute: always_available,
-            executor: ticket_command,
         });
         registry
     }
@@ -357,37 +322,6 @@ fn peer_args(raw: &str) -> Result<CommandArgs, CommandDiagnostic> {
     }
 }
 
-fn ticket_args(raw: &str) -> Result<CommandArgs, CommandDiagnostic> {
-    let args = CommandArgs::parse_whitespace(raw);
-    let Some(action) = args.argv().first().map(String::as_str) else {
-        return Err(CommandDiagnostic::new(
-            "Invalid arguments. Usage: ticket <intake|route|investigate|implement|review> ...",
-        ));
-    };
-    match action {
-        "intake" if args.argv().len() >= 2 => Ok(args),
-        "intake" => Err(CommandDiagnostic::new(
-            "Invalid arguments. Usage: ticket intake <context...>",
-        )),
-        "route" | "investigate" | "implement" | "review" if args.argv().len() >= 2 => Ok(args),
-        "route" => Err(CommandDiagnostic::new(
-            "Invalid arguments. Usage: ticket route <ticket-id-or-slug> [instruction...]",
-        )),
-        "investigate" => Err(CommandDiagnostic::new(
-            "Invalid arguments. Usage: ticket investigate <ticket-id-or-slug> [instruction...]",
-        )),
-        "implement" => Err(CommandDiagnostic::new(
-            "Invalid arguments. Usage: ticket implement <ticket-id-or-slug> [instruction...]",
-        )),
-        "review" => Err(CommandDiagnostic::new(
-            "Invalid arguments. Usage: ticket review <ticket-id-or-slug> [instruction...]",
-        )),
-        _ => Err(CommandDiagnostic::new(format!(
-            "Unknown ticket action: {action}. Usage: ticket <intake|route|investigate|implement|review> ..."
-        ))),
-    }
-}
-
 fn compact_available(environment: &CommandEnvironment) -> Result<(), CommandDiagnostic> {
     if !environment.connected {
         return Err(CommandDiagnostic::new(
@@ -476,7 +410,6 @@ fn compact_command(invocation: CommandInvocation<'_>) -> CommandExecution {
     let _ = invocation.args.raw();
     CommandExecution {
         method: Some(Method::Compact),
-        action: None,
         diagnostics: vec![CommandDiagnostic::new("compact requested")],
         exit_command_mode: true,
         clear_input: true,
@@ -489,7 +422,6 @@ fn rewind_command(invocation: CommandInvocation<'_>) -> CommandExecution {
     let _ = invocation.args.raw();
     CommandExecution {
         method: Some(Method::ListRewindTargets),
-        action: None,
         diagnostics: vec![CommandDiagnostic::new("rewind picker requested")],
         exit_command_mode: true,
         clear_input: true,
@@ -502,87 +434,11 @@ fn peer_command(invocation: CommandInvocation<'_>) -> CommandExecution {
     let name = invocation.args.argv()[0].clone();
     CommandExecution {
         method: Some(Method::RegisterPeer { name: name.clone() }),
-        action: None,
         diagnostics: vec![CommandDiagnostic::new(format!(
             "peer metadata registration requested with `{name}`"
         ))],
         exit_command_mode: true,
         clear_input: true,
-    }
-}
-
-fn ticket_command(invocation: CommandInvocation<'_>) -> CommandExecution {
-    let _ = invocation.command;
-    let _ = invocation.environment;
-    let Some((action, rest)) = split_first_word(invocation.args.raw()) else {
-        return CommandExecution::diagnostic(
-            "Invalid arguments. Usage: ticket <intake|route|investigate|implement|review> ...",
-        );
-    };
-
-    let Some(role) = ticket_role_for_action(action) else {
-        return CommandExecution::diagnostic(format!(
-            "Unknown ticket action: {action}. Usage: ticket <intake|route|investigate|implement|review> ..."
-        ));
-    };
-
-    let (ticket, instruction) = if action == "intake" {
-        let Some(instruction) = non_empty_string(rest) else {
-            return CommandExecution::diagnostic(
-                "Invalid arguments. Usage: ticket intake <context...>",
-            );
-        };
-        (None, Some(instruction))
-    } else {
-        let Some((ticket, rest)) = split_first_word(rest) else {
-            return CommandExecution::diagnostic(format!(
-                "Invalid arguments. Usage: ticket {action} <ticket-id-or-slug> [instruction...]"
-            ));
-        };
-        (Some(ticket.to_owned()), non_empty_string(rest))
-    };
-
-    CommandExecution::local_action(
-        format!("ticket {action} launch requested"),
-        CommandAction::TicketRole(TicketRoleCommand {
-            role,
-            ticket,
-            instruction,
-        }),
-    )
-}
-
-fn ticket_role_for_action(action: &str) -> Option<TicketRole> {
-    match action {
-        "intake" => Some(TicketRole::Intake),
-        "route" => Some(TicketRole::Orchestrator),
-        "investigate" => Some(TicketRole::Investigator),
-        "implement" => Some(TicketRole::Coder),
-        "review" => Some(TicketRole::Reviewer),
-        _ => None,
-    }
-}
-
-fn split_first_word(raw: &str) -> Option<(&str, &str)> {
-    let trimmed = raw.trim_start();
-    if trimmed.is_empty() {
-        return None;
-    }
-    match trimmed.find(char::is_whitespace) {
-        Some(idx) => {
-            let (word, rest) = trimmed.split_at(idx);
-            Some((word, rest.trim_start()))
-        }
-        None => Some((trimmed, "")),
-    }
-}
-
-fn non_empty_string(raw: &str) -> Option<String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_owned())
     }
 }
 
@@ -723,86 +579,15 @@ mod tests {
     }
 
     #[test]
-    fn ticket_intake_command_returns_local_ticket_action() {
+    fn ticket_command_is_unknown() {
         let registry = CommandRegistry::builtins();
         let result = registry.dispatch("ticket intake add role shortcuts", &env());
         assert!(result.method.is_none());
-        assert!(result.exit_command_mode);
-        assert!(result.clear_input);
-        assert!(result.diagnostics[0].message.contains("ticket intake"));
-        assert!(matches!(
-            result.action,
-            Some(CommandAction::TicketRole(TicketRoleCommand {
-                role: TicketRole::Intake,
-                ticket: None,
-                instruction: Some(ref instruction),
-            })) if instruction == "add role shortcuts"
-        ));
-    }
-
-    #[test]
-    fn ticket_intake_requires_context() {
-        let registry = CommandRegistry::builtins();
-        for command in ["ticket intake", "ticket intake    "] {
-            let result = registry.dispatch(command, &env());
-            assert!(result.method.is_none());
-            assert!(result.action.is_none());
-            assert!(!result.exit_command_mode);
-            assert_eq!(
-                result.diagnostics[0].message,
-                "Invalid arguments. Usage: ticket intake <context...>"
-            );
-        }
-    }
-
-    #[test]
-    fn ticket_role_commands_map_to_fixed_roles() {
-        let registry = CommandRegistry::builtins();
-        for (command, role) in [
-            ("route", TicketRole::Orchestrator),
-            ("investigate", TicketRole::Investigator),
-            ("implement", TicketRole::Coder),
-            ("review", TicketRole::Reviewer),
-        ] {
-            let result =
-                registry.dispatch(&format!("ticket {command} abc-123 extra context"), &env());
-            assert!(result.method.is_none());
-            assert!(matches!(
-                result.action,
-                Some(CommandAction::TicketRole(TicketRoleCommand {
-                    role: actual_role,
-                    ticket: Some(ref ticket),
-                    instruction: Some(ref instruction),
-                })) if actual_role == role && ticket == "abc-123" && instruction == "extra context"
-            ));
-        }
-    }
-
-    #[test]
-    fn ticket_non_intake_requires_ticket_reference() {
-        let registry = CommandRegistry::builtins();
-        let result = registry.dispatch("ticket implement", &env());
-        assert!(result.method.is_none());
-        assert!(result.action.is_none());
         assert!(!result.exit_command_mode);
         assert!(
             result.diagnostics[0]
                 .message
-                .contains("ticket implement <ticket-id-or-slug>")
-        );
-    }
-
-    #[test]
-    fn ticket_unknown_action_is_local_diagnostic() {
-        let registry = CommandRegistry::builtins();
-        let result = registry.dispatch("ticket close abc-123", &env());
-        assert!(result.method.is_none());
-        assert!(result.action.is_none());
-        assert!(!result.exit_command_mode);
-        assert!(
-            result.diagnostics[0]
-                .message
-                .contains("Unknown ticket action")
+                .contains("Unknown command: ticket")
         );
     }
 
