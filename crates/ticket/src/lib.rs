@@ -35,6 +35,8 @@ const REQUIRED_FIELDS: [&str; 11] = [
     "assignee",
     "legacy_ticket",
 ];
+const MAX_STATE_CHANGE_REASON_BYTES: usize = 1024;
+const MAX_INTAKE_SUMMARY_BODY_BYTES: usize = 16 * 1024;
 
 pub type Result<T> = std::result::Result<T, TicketError>;
 
@@ -211,6 +213,8 @@ pub enum TicketEventKind {
     Decision,
     ImplementationReport,
     Review,
+    StateChanged,
+    IntakeSummary,
     StatusChanged,
     Close,
     Other(String),
@@ -225,6 +229,8 @@ impl TicketEventKind {
             Self::Decision => "decision",
             Self::ImplementationReport => "implementation_report",
             Self::Review => "review",
+            Self::StateChanged => "state_changed",
+            Self::IntakeSummary => "intake_summary",
             Self::StatusChanged => "status_changed",
             Self::Close => "close",
             Self::Other(value) => value.as_str(),
@@ -239,6 +245,8 @@ impl TicketEventKind {
             Self::Decision => "Decision".to_string(),
             Self::ImplementationReport => "Implementation report".to_string(),
             Self::Review => "Review".to_string(),
+            Self::StateChanged => "State changed".to_string(),
+            Self::IntakeSummary => "Intake summary".to_string(),
             Self::StatusChanged => "Status changed".to_string(),
             Self::Close => "Closed".to_string(),
             Self::Other(value) => value.clone(),
@@ -255,6 +263,8 @@ impl From<&str> for TicketEventKind {
             "decision" => Self::Decision,
             "implementation_report" => Self::ImplementationReport,
             "review" => Self::Review,
+            "state_changed" => Self::StateChanged,
+            "intake_summary" => Self::IntakeSummary,
             "status_changed" => Self::StatusChanged,
             "close" | "closed" => Self::Close,
             other => Self::Other(other.to_string()),
@@ -315,6 +325,51 @@ impl NewTicketEvent {
     pub fn new(kind: TicketEventKind, body: impl Into<MarkdownText>) -> Self {
         Self {
             kind,
+            author: None,
+            body: body.into(),
+            references: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TicketStateChange {
+    pub from: String,
+    pub to: String,
+    pub author: Option<String>,
+    pub reason: String,
+    pub body: MarkdownText,
+    pub references: Vec<TicketReference>,
+}
+
+impl TicketStateChange {
+    pub fn new(
+        from: impl Into<String>,
+        to: impl Into<String>,
+        reason: impl Into<String>,
+        body: impl Into<MarkdownText>,
+    ) -> Self {
+        Self {
+            from: from.into(),
+            to: to.into(),
+            author: None,
+            reason: reason.into(),
+            body: body.into(),
+            references: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TicketIntakeSummary {
+    pub author: Option<String>,
+    pub body: MarkdownText,
+    pub references: Vec<TicketReference>,
+}
+
+impl TicketIntakeSummary {
+    pub fn new(body: impl Into<MarkdownText>) -> Self {
+        Self {
             author: None,
             body: body.into(),
             references: Vec::new(),
@@ -457,9 +512,14 @@ pub struct TicketEvent {
     pub author: Option<String>,
     pub at: Option<String>,
     pub status: Option<String>,
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub reason: Option<String>,
+    pub state_field: Option<String>,
     pub heading: Option<String>,
     pub body: MarkdownText,
     pub references: Vec<TicketReference>,
+    pub attributes: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -529,6 +589,14 @@ pub trait TicketBackend {
     fn show(&self, id: TicketIdOrSlug) -> Result<Ticket>;
     fn create(&self, input: NewTicket) -> Result<TicketRef>;
     fn add_event(&self, id: TicketIdOrSlug, event: NewTicketEvent) -> Result<()>;
+    fn add_state_changed(&self, id: TicketIdOrSlug, change: TicketStateChange) -> Result<()>;
+    fn add_intake_summary(&self, id: TicketIdOrSlug, summary: TicketIntakeSummary) -> Result<()>;
+    fn set_state_field(
+        &self,
+        id: TicketIdOrSlug,
+        field: &str,
+        change: TicketStateChange,
+    ) -> Result<()>;
     fn review(&self, id: TicketIdOrSlug, review: TicketReview) -> Result<()>;
     fn set_status(&self, id: TicketIdOrSlug, status: TicketStatus) -> Result<()>;
     fn close(&self, id: TicketIdOrSlug, resolution: MarkdownText) -> Result<()>;
@@ -668,9 +736,18 @@ impl LocalTicketBackend {
         heading: &str,
         author: &str,
         status: Option<&str>,
+        attrs: &[(&str, &str)],
         body: &MarkdownText,
     ) -> Result<()> {
         let at = now_utc();
+        let mut event_attrs = vec![("event", event), ("author", author), ("at", at.as_str())];
+        if let Some(status) = status {
+            event_attrs.push(("status", status));
+        }
+        event_attrs.extend_from_slice(attrs);
+        let comment = render_event_comment(&event_attrs)?;
+        let entry = format!("\n{comment}\n\n## {heading}\n\n{}\n\n---\n", body.as_str());
+
         let thread = dir.join("thread.md");
         if !thread.exists() {
             File::create(&thread).map_err(|e| io_err(&thread, e))?;
@@ -679,15 +756,51 @@ impl LocalTicketBackend {
             .append(true)
             .open(&thread)
             .map_err(|e| io_err(&thread, e))?;
-        write!(file, "\n<!-- event: {event} author: {author} at: {at}")
-            .map_err(|e| io_err(&thread, e))?;
-        if let Some(status) = status {
-            write!(file, " status: {status}").map_err(|e| io_err(&thread, e))?;
-        }
-        write!(file, " -->\n\n## {heading}\n\n{}\n\n---\n", body.as_str())
+        file.write_all(entry.as_bytes())
             .map_err(|e| io_err(&thread, e))?;
         file.sync_data().map_err(|e| io_err(&thread, e))?;
         self.set_frontmatter_fields(&dir.join("item.md"), &[("updated_at", at.as_str())])
+    }
+
+    fn append_state_changed_event(
+        &self,
+        dir: &Path,
+        change: &TicketStateChange,
+        state_field: Option<&str>,
+    ) -> Result<()> {
+        validate_state_change(change)?;
+        let author = change.author.clone().unwrap_or_else(default_author);
+        let mut attrs = vec![
+            ("from", change.from.as_str()),
+            ("to", change.to.as_str()),
+            ("reason", change.reason.as_str()),
+        ];
+        if let Some(state_field) = state_field {
+            attrs.push(("field", state_field));
+        }
+        self.append_thread_event(
+            dir,
+            TicketEventKind::StateChanged.as_str(),
+            &TicketEventKind::StateChanged.heading(),
+            &author,
+            None,
+            &attrs,
+            &change.body,
+        )
+    }
+
+    fn append_intake_summary_event(&self, dir: &Path, summary: &TicketIntakeSummary) -> Result<()> {
+        validate_intake_summary(summary)?;
+        let author = summary.author.clone().unwrap_or_else(default_author);
+        self.append_thread_event(
+            dir,
+            TicketEventKind::IntakeSummary.as_str(),
+            &TicketEventKind::IntakeSummary.heading(),
+            &author,
+            None,
+            &[],
+            &summary.body,
+        )
     }
 
     fn set_frontmatter_fields(&self, item: &Path, updates: &[(&str, &str)]) -> Result<()> {
@@ -765,9 +878,18 @@ impl TicketBackend for LocalTicketBackend {
             )));
         }
         ensure_child_of(&self.root, &dir)?;
+        let created = now_utc();
+        let author = input
+            .author
+            .unwrap_or_else(|| "LocalTicketBackend".to_string());
+        let create_comment = render_event_comment(&[
+            ("event", TicketEventKind::Create.as_str()),
+            ("author", &author),
+            ("at", &created),
+        ])?;
+
         fs::create_dir_all(dir.join("artifacts")).map_err(|e| io_err(&dir, e))?;
         atomic_write(&dir.join("artifacts/.gitkeep"), b"")?;
-        let created = now_utc();
         let mut fields = Vec::new();
         fields.push(("id".to_string(), id.clone()));
         fields.push(("slug".to_string(), slug.clone()));
@@ -800,11 +922,8 @@ impl TicketBackend for LocalTicketBackend {
         }
         let item = serialize_item(&fields, input.body.as_str());
         atomic_write(&dir.join("item.md"), item.as_bytes())?;
-        let author = input
-            .author
-            .unwrap_or_else(|| "LocalTicketBackend".to_string());
         let thread = format!(
-            "<!-- event: create author: {author} at: {created} -->\n\n## Created\n\nCreated by LocalTicketBackend create.\n\n---\n"
+            "{create_comment}\n\n## Created\n\nCreated by LocalTicketBackend create.\n\n---\n"
         );
         atomic_write(&dir.join("thread.md"), thread.as_bytes())?;
         Ok(TicketRef {
@@ -824,8 +943,47 @@ impl TicketBackend for LocalTicketBackend {
             &event.kind.heading(),
             &author,
             None,
+            &[],
             &event.body,
         )
+    }
+
+    fn add_state_changed(&self, id: TicketIdOrSlug, change: TicketStateChange) -> Result<()> {
+        let _lock = self.acquire_lock()?;
+        let dir = self.find_ticket_dir(&id)?;
+        self.append_state_changed_event(&dir, &change, None)
+    }
+
+    fn add_intake_summary(&self, id: TicketIdOrSlug, summary: TicketIntakeSummary) -> Result<()> {
+        let _lock = self.acquire_lock()?;
+        let dir = self.find_ticket_dir(&id)?;
+        self.append_intake_summary_event(&dir, &summary)
+    }
+
+    fn set_state_field(
+        &self,
+        id: TicketIdOrSlug,
+        field: &str,
+        change: TicketStateChange,
+    ) -> Result<()> {
+        validate_state_field_name(field)?;
+        let _lock = self.acquire_lock()?;
+        let dir = self.find_ticket_dir(&id)?;
+        let item = dir.join("item.md");
+        let parsed = read_item_file(&item)?;
+        let current = parsed
+            .frontmatter
+            .get(field)
+            .map(String::as_str)
+            .unwrap_or("");
+        if current != change.from.as_str() {
+            return Err(TicketError::Conflict(format!(
+                "state field `{field}` changed concurrently: expected `{}`, found `{current}`",
+                change.from
+            )));
+        }
+        self.append_state_changed_event(&dir, &change, Some(field))?;
+        self.set_frontmatter_fields(&item, &[(field, change.to.as_str())])
     }
 
     fn review(&self, id: TicketIdOrSlug, review: TicketReview) -> Result<()> {
@@ -838,6 +996,7 @@ impl TicketBackend for LocalTicketBackend {
             &review.result.heading(),
             &author,
             Some(review.result.as_str()),
+            &[],
             &review.body,
         )
     }
@@ -873,6 +1032,7 @@ impl TicketBackend for LocalTicketBackend {
             "Status changed",
             &author,
             Some(status.as_str()),
+            &[],
             &body,
         )
     }
@@ -915,6 +1075,7 @@ impl TicketBackend for LocalTicketBackend {
             "Closed",
             &author,
             Some("closed"),
+            &[],
             &resolution,
         )
     }
@@ -1270,6 +1431,114 @@ fn replace_frontmatter_fields(
     Ok(out)
 }
 
+fn render_event_comment(attrs: &[(&str, &str)]) -> Result<String> {
+    let mut out = String::from("<!--");
+    for (key, value) in attrs {
+        validate_event_attr(key, value)?;
+        out.push(' ');
+        out.push_str(key);
+        out.push_str(": ");
+        out.push_str(&format_event_attr_value(value));
+    }
+    out.push_str(" -->");
+    Ok(out)
+}
+
+fn format_event_attr_value(value: &str) -> String {
+    if !value.is_empty()
+        && !value.chars().any(char::is_whitespace)
+        && !value.contains('"')
+        && !value.contains('\\')
+        && !value.contains("-->")
+    {
+        return value.to_string();
+    }
+    let mut out = String::from("\"");
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            _ => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn validate_event_attr(key: &str, value: &str) -> Result<()> {
+    if key.trim().is_empty() || key.chars().any(char::is_whitespace) || key.contains(':') {
+        return Err(TicketError::Conflict(format!(
+            "thread event attribute key is invalid: {key:?}"
+        )));
+    }
+    if value.contains('\n') || value.contains('\r') || value.contains("-->") {
+        return Err(TicketError::Conflict(format!(
+            "thread event attribute `{key}` must be a single safe comment value"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_required_event_value(label: &str, value: &str) -> Result<()> {
+    if value.trim().is_empty() {
+        return Err(TicketError::Conflict(format!(
+            "state_changed event requires non-empty {label}"
+        )));
+    }
+    validate_event_attr(label, value)
+}
+
+fn validate_state_change(change: &TicketStateChange) -> Result<()> {
+    validate_required_event_value("from", &change.from)?;
+    validate_required_event_value("to", &change.to)?;
+    validate_required_event_value("reason", &change.reason)?;
+    if change.reason.len() > MAX_STATE_CHANGE_REASON_BYTES {
+        return Err(TicketError::Conflict(format!(
+            "state_changed reason exceeds {MAX_STATE_CHANGE_REASON_BYTES} bytes"
+        )));
+    }
+    if let Some(author) = change.author.as_deref() {
+        validate_required_event_value("author", author)?;
+    }
+    if change.body.as_str().len() > MAX_INTAKE_SUMMARY_BODY_BYTES {
+        return Err(TicketError::Conflict(format!(
+            "state_changed body exceeds {MAX_INTAKE_SUMMARY_BODY_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_intake_summary(summary: &TicketIntakeSummary) -> Result<()> {
+    let body = summary.body.as_str();
+    if body.trim().is_empty() {
+        return Err(TicketError::Conflict(
+            "intake_summary event requires a non-empty body".to_string(),
+        ));
+    }
+    if body.len() > MAX_INTAKE_SUMMARY_BODY_BYTES {
+        return Err(TicketError::Conflict(format!(
+            "intake_summary body exceeds {MAX_INTAKE_SUMMARY_BODY_BYTES} bytes"
+        )));
+    }
+    if let Some(author) = summary.author.as_deref() {
+        validate_required_event_value("author", author)?;
+    }
+    Ok(())
+}
+
+fn validate_state_field_name(field: &str) -> Result<()> {
+    if field.trim().is_empty()
+        || field.chars().any(char::is_whitespace)
+        || field.contains(':')
+        || field.contains("--")
+    {
+        return Err(TicketError::Conflict(format!(
+            "state field name is invalid: {field:?}"
+        )));
+    }
+    Ok(())
+}
+
 fn parse_thread(path: &Path) -> Result<Vec<TicketEvent>> {
     let content = fs::read_to_string(path).map_err(|e| io_err(path, e))?;
     let mut events = Vec::new();
@@ -1318,9 +1587,14 @@ fn parse_thread(path: &Path) -> Result<Vec<TicketEvent>> {
                 author: attrs.get("author").cloned(),
                 at: attrs.get("at").cloned(),
                 status: attrs.get("status").cloned(),
+                from: attrs.get("from").cloned(),
+                to: attrs.get("to").cloned(),
+                reason: attrs.get("reason").cloned(),
+                state_field: attrs.get("field").cloned(),
                 heading,
                 body: MarkdownText::new(body),
                 references: Vec::new(),
+                attributes: attrs,
             });
         } else {
             idx += 1;
@@ -1330,16 +1604,69 @@ fn parse_thread(path: &Path) -> Result<Vec<TicketEvent>> {
 }
 
 fn parse_event_comment(comment: &str) -> BTreeMap<String, String> {
-    // Thread event comments use unquoted `key: value` pairs separated by spaces.
-    // Values currently do not contain spaces; this parser intentionally preserves
-    // the local file format instead of treating thread.md as strict YAML.
     let mut attrs = BTreeMap::new();
-    let mut iter = comment.split_whitespace().peekable();
-    while let Some(token) = iter.next() {
-        if let Some(key) = token.strip_suffix(':') {
-            if let Some(value) = iter.next() {
-                attrs.insert(key.to_string(), value.to_string());
+    let mut chars = comment.char_indices().peekable();
+    while let Some((_, ch)) = chars.peek().copied() {
+        if ch.is_whitespace() {
+            chars.next();
+            continue;
+        }
+        let start = chars.peek().map(|(idx, _)| *idx).unwrap_or(comment.len());
+        while let Some((_, ch)) = chars.peek().copied() {
+            if ch == ':' || ch.is_whitespace() {
+                break;
             }
+            chars.next();
+        }
+        let end = chars.peek().map(|(idx, _)| *idx).unwrap_or(comment.len());
+        if chars.peek().map(|(_, ch)| *ch) != Some(':') {
+            while let Some((_, ch)) = chars.peek().copied() {
+                if ch.is_whitespace() {
+                    break;
+                }
+                chars.next();
+            }
+            continue;
+        }
+        chars.next();
+        while let Some((_, ch)) = chars.peek().copied() {
+            if ch.is_whitespace() {
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        let value = if chars.peek().map(|(_, ch)| *ch) == Some('"') {
+            chars.next();
+            let mut value = String::new();
+            let mut escaped = false;
+            for (_, ch) in chars.by_ref() {
+                if escaped {
+                    value.push(ch);
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == '"' {
+                    break;
+                } else {
+                    value.push(ch);
+                }
+            }
+            value
+        } else {
+            let value_start = chars.peek().map(|(idx, _)| *idx).unwrap_or(comment.len());
+            while let Some((_, ch)) = chars.peek().copied() {
+                if ch.is_whitespace() {
+                    break;
+                }
+                chars.next();
+            }
+            let value_end = chars.peek().map(|(idx, _)| *idx).unwrap_or(comment.len());
+            comment[value_start..value_end].to_string()
+        };
+        let key = &comment[start..end];
+        if !key.is_empty() {
+            attrs.insert(key.to_string(), value);
         }
     }
     attrs
@@ -1347,6 +1674,7 @@ fn parse_event_comment(comment: &str) -> BTreeMap<String, String> {
 
 fn doctor_thread_events(path: &Path, report: &mut TicketDoctorReport) -> Result<()> {
     let content = fs::read_to_string(path).map_err(|e| io_err(path, e))?;
+    let mut intake_summary_lines = Vec::new();
     for (line_no, line) in content.lines().enumerate() {
         let trimmed = line.trim();
         if trimmed.starts_with("<!-- event:") && !trimmed.ends_with("-->") {
@@ -1364,7 +1692,13 @@ fn doctor_thread_events(path: &Path, report: &mut TicketDoctorReport) -> Result<
             .and_then(|v| v.strip_suffix(" -->"))
         {
             let attrs = parse_event_comment(comment);
-            if attrs.contains_key("event") && attrs.get("at").is_none() {
+            let Some(event) = attrs.get("event").map(String::as_str) else {
+                continue;
+            };
+            if attrs
+                .get("at")
+                .map_or(true, |value| value.trim().is_empty())
+            {
                 report.push_error(
                     format!(
                         "thread event missing at: {}:{}",
@@ -1374,8 +1708,8 @@ fn doctor_thread_events(path: &Path, report: &mut TicketDoctorReport) -> Result<
                     Some(path.to_path_buf()),
                 );
             }
-            if attrs.get("event").map(String::as_str) == Some("review") {
-                match attrs.get("status").map(String::as_str) {
+            match event {
+                "review" => match attrs.get("status").map(String::as_str) {
                     Some("approve" | "request_changes") => {}
                     _ => report.push_warning(
                         format!(
@@ -1385,7 +1719,56 @@ fn doctor_thread_events(path: &Path, report: &mut TicketDoctorReport) -> Result<
                         ),
                         Some(path.to_path_buf()),
                     ),
+                },
+                "state_changed" => {
+                    for key in ["from", "to", "reason", "author"] {
+                        if attrs.get(key).map_or(true, |value| value.trim().is_empty()) {
+                            report.push_error(
+                                format!(
+                                    "state_changed event missing {key}: {}:{}",
+                                    path.display(),
+                                    line_no + 1
+                                ),
+                                Some(path.to_path_buf()),
+                            );
+                        }
+                    }
                 }
+                "intake_summary" => {
+                    if attrs
+                        .get("author")
+                        .map_or(true, |value| value.trim().is_empty())
+                    {
+                        report.push_error(
+                            format!(
+                                "intake_summary event missing author: {}:{}",
+                                path.display(),
+                                line_no + 1
+                            ),
+                            Some(path.to_path_buf()),
+                        );
+                    }
+                    intake_summary_lines.push(line_no + 1);
+                }
+                _ => {}
+            }
+        }
+    }
+    if !intake_summary_lines.is_empty() {
+        let summaries = parse_thread(path)?
+            .into_iter()
+            .filter(|event| event.kind == TicketEventKind::IntakeSummary);
+        for (idx, event) in summaries.enumerate() {
+            if event.body.as_str().trim().is_empty() {
+                let line = intake_summary_lines.get(idx).copied().unwrap_or_default();
+                report.push_error(
+                    format!(
+                        "intake_summary event missing body at {}:{}",
+                        path.display(),
+                        line
+                    ),
+                    Some(path.to_path_buf()),
+                );
             }
         }
     }
@@ -1616,6 +1999,202 @@ action_required: none
         assert!(thread.contains("<!-- event: close"));
         let report = backend.doctor().unwrap();
         assert!(report.is_ok(), "{:?}", report.diagnostics);
+    }
+
+    #[test]
+    fn invalid_thread_event_attributes_do_not_modify_thread() {
+        let tmp = TempDir::new().unwrap();
+        let backend = backend(&tmp);
+        let ticket = backend
+            .create(NewTicket::new("Append Safety Ticket"))
+            .unwrap();
+        let thread_path = tmp
+            .path()
+            .join("tickets/open")
+            .join(&ticket.id)
+            .join("thread.md");
+        let original = fs::read_to_string(&thread_path).unwrap();
+
+        let mut comment = NewTicketEvent::new(TicketEventKind::Comment, "This must not append.");
+        comment.author = Some("bad\nauthor".into());
+        assert!(matches!(
+            backend.add_event(TicketIdOrSlug::Id(ticket.id.clone()), comment),
+            Err(TicketError::Conflict(_))
+        ));
+        assert_eq!(fs::read_to_string(&thread_path).unwrap(), original);
+
+        let mut review = TicketReview::approve("This must not append either.");
+        review.author = Some("bad-->author".into());
+        assert!(matches!(
+            backend.review(TicketIdOrSlug::Id(ticket.id.clone()), review),
+            Err(TicketError::Conflict(_))
+        ));
+        assert_eq!(fs::read_to_string(&thread_path).unwrap(), original);
+
+        let invalid_kind = NewTicketEvent::new(
+            TicketEventKind::Other("bad\nevent".into()),
+            "Invalid event kind.",
+        );
+        assert!(matches!(
+            backend.add_event(TicketIdOrSlug::Id(ticket.id.clone()), invalid_kind),
+            Err(TicketError::Conflict(_))
+        ));
+        assert_eq!(fs::read_to_string(&thread_path).unwrap(), original);
+    }
+
+    #[test]
+    fn create_rejects_invalid_author_before_writing_ticket_record() {
+        let tmp = TempDir::new().unwrap();
+        let backend = backend(&tmp);
+        let mut input = NewTicket::new("Invalid Author Ticket");
+        input.slug = Some("invalid-author-ticket".into());
+        input.author = Some("bad-->author".into());
+
+        assert!(matches!(
+            backend.create(input),
+            Err(TicketError::Conflict(_))
+        ));
+        let open_dir = tmp.path().join("tickets/open");
+        let entries = fs::read_dir(open_dir).unwrap().count();
+        assert_eq!(entries, 0);
+    }
+
+    #[test]
+    fn state_changed_and_intake_summary_events_round_trip() {
+        let tmp = TempDir::new().unwrap();
+        let backend = backend(&tmp);
+        let ticket = backend
+            .create(NewTicket::new("Typed Thread Ticket"))
+            .unwrap();
+        let mut change = TicketStateChange::new(
+            "preflight",
+            "implementation-ready",
+            "preflight approved",
+            "Preflight finished; implementation can begin.",
+        );
+        change.author = Some("orchestrator".into());
+        backend
+            .add_state_changed(TicketIdOrSlug::Id(ticket.id.clone()), change)
+            .unwrap();
+        let mut summary = TicketIntakeSummary::new("## Accepted intent\n\nImplement typed events.");
+        summary.author = Some("intake".into());
+        backend
+            .add_intake_summary(TicketIdOrSlug::Id(ticket.id.clone()), summary)
+            .unwrap();
+
+        let record = backend.show(TicketIdOrSlug::Id(ticket.id.clone())).unwrap();
+        let state_event = record
+            .events
+            .iter()
+            .find(|event| event.kind == TicketEventKind::StateChanged)
+            .unwrap();
+        assert_eq!(state_event.from.as_deref(), Some("preflight"));
+        assert_eq!(state_event.to.as_deref(), Some("implementation-ready"));
+        assert_eq!(state_event.reason.as_deref(), Some("preflight approved"));
+        assert_eq!(state_event.author.as_deref(), Some("orchestrator"));
+        assert_eq!(
+            state_event.attributes.get("reason").map(String::as_str),
+            Some("preflight approved")
+        );
+        assert!(
+            record
+                .events
+                .iter()
+                .any(|event| event.kind == TicketEventKind::IntakeSummary
+                    && event.body.as_str().contains("Accepted intent"))
+        );
+        let thread = fs::read_to_string(
+            tmp.path()
+                .join("tickets/open")
+                .join(&ticket.id)
+                .join("thread.md"),
+        )
+        .unwrap();
+        assert!(thread.contains("event: state_changed"));
+        assert!(thread.contains("reason: \"preflight approved\""));
+        assert!(thread.contains("event: intake_summary"));
+        let report = backend.doctor().unwrap();
+        assert!(report.is_ok(), "{:?}", report.diagnostics);
+    }
+
+    #[test]
+    fn set_state_field_updates_frontmatter_and_appends_transition() {
+        let tmp = TempDir::new().unwrap();
+        let backend = backend(&tmp);
+        let ticket = backend
+            .create(NewTicket::new("State Field Ticket"))
+            .unwrap();
+        let item = tmp
+            .path()
+            .join("tickets/open")
+            .join(&ticket.id)
+            .join("item.md");
+        backend
+            .set_frontmatter_fields(&item, &[("readiness", "preflight")])
+            .unwrap();
+
+        let mut change = TicketStateChange::new(
+            "preflight",
+            "implementation-ready",
+            "requirements accepted",
+            "Implementation is authorized.",
+        );
+        change.author = Some("orchestrator".into());
+        backend
+            .set_state_field(TicketIdOrSlug::Id(ticket.id.clone()), "readiness", change)
+            .unwrap();
+
+        let record = backend.show(TicketIdOrSlug::Id(ticket.id.clone())).unwrap();
+        assert_eq!(
+            record.meta.readiness.as_deref(),
+            Some("implementation-ready")
+        );
+        let event = record
+            .events
+            .iter()
+            .find(|event| event.kind == TicketEventKind::StateChanged)
+            .unwrap();
+        assert_eq!(event.state_field.as_deref(), Some("readiness"));
+        let stale = TicketStateChange::new(
+            "preflight",
+            "done",
+            "stale update",
+            "This must be rejected.",
+        );
+        assert!(matches!(
+            backend.set_state_field(TicketIdOrSlug::Id(ticket.id), "readiness", stale),
+            Err(TicketError::Conflict(_))
+        ));
+    }
+
+    #[test]
+    fn doctor_validates_typed_thread_event_attributes() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("tickets");
+        fs::create_dir_all(root.join("open/bad/artifacts")).unwrap();
+        fs::write(
+            root.join("open/bad/item.md"),
+            "---\nid: bad\nslug: bad\ntitle: Bad\nstatus: open\nkind: task\npriority: P2\nlabels: []\ncreated_at: x\nupdated_at: x\nassignee: null\nlegacy_ticket: null\n---\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("open/bad/thread.md"),
+            "<!-- event: state_changed author: bot at: now from: queued -->\n\n## State changed\n\n---\n\n<!-- event: intake_summary author: bot at: now -->\n\n## Intake summary\n\n---\n",
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("pending")).unwrap();
+        fs::create_dir_all(root.join("closed")).unwrap();
+        let report = LocalTicketBackend::new(&root).doctor().unwrap();
+        let messages = report
+            .diagnostics
+            .iter()
+            .map(|d| d.message.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!report.is_ok());
+        assert!(messages.contains("state_changed event missing to"));
+        assert!(messages.contains("state_changed event missing reason"));
+        assert!(messages.contains("intake_summary event missing body"));
     }
 
     #[test]

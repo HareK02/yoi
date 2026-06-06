@@ -607,6 +607,11 @@ fn ticket_json(
                 "author": event.author,
                 "at": event.at,
                 "status": event.status,
+                "from": event.from,
+                "to": event.to,
+                "reason": event.reason,
+                "state_field": event.state_field,
+                "attributes": event.attributes,
                 "heading": event.heading,
                 "body": truncate_text(event.body.as_str(), body_max_bytes),
             })

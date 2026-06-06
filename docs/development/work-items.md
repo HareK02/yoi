@@ -353,7 +353,7 @@ The current LocalTicketBackend stores records under:
   resolution.md   # closed Tickets only
 ```
 
-Backend integrations must preserve this format until an explicit migration changes it. The repository-root `work-items/` path is no longer a live mutable backend; do not recreate it for Ticket records. Human users should prefer `yoi panel`, Ticket tools, or `yoi ticket ...` when working directly with repository records.
+Backend integrations must preserve this format until an explicit migration changes it. `thread.md` is an append-only typed event log: existing events such as `create`, `comment`, `plan`, `decision`, `implementation_report`, `review`, `status_changed`, and `close` remain valid, while `state_changed` records durable transition metadata (`from`, `to`, `reason`, optional `field`, plus `author` and `at`) and `intake_summary` records the bounded Intake outcome body. Thread events are audit history, not current-state authority; current state belongs in `item.md` frontmatter or the owning backend record. The repository-root `work-items/` path is no longer a live mutable backend; do not recreate it for Ticket records. Human users should prefer `yoi panel`, Ticket tools, or `yoi ticket ...` when working directly with repository records.
 
 ## Validation
 
