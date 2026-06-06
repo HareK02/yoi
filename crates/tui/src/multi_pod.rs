@@ -1950,44 +1950,136 @@ fn panel_action_header_line(total: usize, width: u16) -> Line<'static> {
     ))
 }
 
+const TICKET_PRIORITY_COLUMN_WIDTH: usize = 11;
+const TICKET_ACTION_COLUMN_WIDTH: usize = 7;
+const TICKET_STATUS_COLUMN_WIDTH: usize = 24;
+const TICKET_PHASE_COLUMN_WIDTH: usize = 12;
+const TICKET_ID_COLUMN_WIDTH: usize = 32;
+const POD_STATUS_COLUMN_WIDTH: usize = 18;
+const POD_ACTION_COLUMN_WIDTH: usize = 8;
+const POD_KIND_COLUMN_WIDTH: usize = 3;
+
 fn panel_row_line(row: &PanelRow, selected: bool, width: u16) -> Line<'static> {
     let marker = if selected { "▶ " } else { "  " };
+    let title_style = if selected {
+        Style::default()
+            .fg(Color::Magenta)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Magenta)
+    };
     let action = row.next_action.map(NextUserAction::label).unwrap_or("View");
-    let status_style = panel_priority_style(row.priority);
-    let mut text = format!(
-        "{marker}{}  [{}]  {action}: {}",
-        row.title,
-        row.priority.label(),
-        row.status
-    );
-    if let Some(subtitle) = row.subtitle.as_deref() {
-        text.push_str("  ");
-        text.push_str(subtitle);
-    }
-    let truncated = truncate_with_ellipsis(&text, width as usize);
-    let prefix = format!("{marker}{}  ", row.title);
-    let status_prefix = format!("{prefix}[{}]", row.priority.label());
+    let phase = row
+        .ticket
+        .as_ref()
+        .map(|ticket| ticket.phase.label())
+        .unwrap_or("-");
+    let ticket_ref = panel_ticket_reference(row);
     let mut spans = Vec::new();
-    spans.push(Span::styled(
-        prefix.clone(),
+    let mut remaining = width as usize;
+
+    push_bounded_span(
+        &mut spans,
+        marker,
         if selected {
             Style::default()
                 .fg(Color::Magenta)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::Magenta)
+            Style::default().fg(Color::DarkGray)
         },
-    ));
-    spans.push(Span::styled(
-        format!("[{}]", row.priority.label()),
-        status_style,
-    ));
-    let rest = truncated.strip_prefix(&status_prefix).unwrap_or("");
-    spans.push(Span::styled(
-        rest.to_string(),
+        &mut remaining,
+    );
+    push_column_span(
+        &mut spans,
+        row.priority.label(),
+        TICKET_PRIORITY_COLUMN_WIDTH,
+        panel_priority_style(row.priority),
+        &mut remaining,
+    );
+    push_column_span(
+        &mut spans,
+        action,
+        TICKET_ACTION_COLUMN_WIDTH,
+        Style::default().fg(Color::Magenta),
+        &mut remaining,
+    );
+    push_column_span(
+        &mut spans,
+        &row.status,
+        TICKET_STATUS_COLUMN_WIDTH,
         Style::default().fg(Color::DarkGray),
-    ));
+        &mut remaining,
+    );
+    push_column_span(
+        &mut spans,
+        phase,
+        TICKET_PHASE_COLUMN_WIDTH,
+        Style::default().fg(Color::DarkGray),
+        &mut remaining,
+    );
+    push_column_span(
+        &mut spans,
+        &ticket_ref,
+        TICKET_ID_COLUMN_WIDTH,
+        Style::default().fg(Color::DarkGray),
+        &mut remaining,
+    );
+    push_bounded_span(&mut spans, row.title.as_str(), title_style, &mut remaining);
+
     Line::from(spans)
+}
+
+fn panel_ticket_reference(row: &PanelRow) -> String {
+    row.ticket
+        .as_ref()
+        .map(|ticket| {
+            if ticket.slug.is_empty() {
+                ticket.id.clone()
+            } else {
+                ticket.slug.clone()
+            }
+        })
+        .unwrap_or_else(|| match &row.key {
+            PanelRowKey::Ticket(id) => id.clone(),
+            PanelRowKey::Pod(name) => name.clone(),
+        })
+}
+
+fn push_column_span(
+    spans: &mut Vec<Span<'static>>,
+    value: &str,
+    column_width: usize,
+    style: Style,
+    remaining: &mut usize,
+) {
+    if *remaining == 0 {
+        return;
+    }
+    let mut content = padded_cell(value, column_width);
+    content.push(' ');
+    push_bounded_span(spans, &content, style, remaining);
+}
+
+fn push_bounded_span(
+    spans: &mut Vec<Span<'static>>,
+    value: &str,
+    style: Style,
+    remaining: &mut usize,
+) {
+    if *remaining == 0 || value.is_empty() {
+        return;
+    }
+    let content = truncate_with_ellipsis(value, *remaining);
+    *remaining = remaining.saturating_sub(content.width());
+    spans.push(Span::styled(content, style));
+}
+
+fn padded_cell(value: &str, width: usize) -> String {
+    let mut cell = truncate_with_ellipsis(value, width);
+    let padding = width.saturating_sub(cell.width());
+    cell.extend(std::iter::repeat_n(' ', padding));
+    cell
 }
 
 fn panel_priority_style(priority: ActionPriority) -> Style {
@@ -2047,24 +2139,44 @@ fn row_line(entry: &PodListEntry, selected: bool, width: u16) -> Line<'static> {
     } else {
         "disabled"
     };
-    let mut text = format!("{marker}{}  [{status}]  {action}", entry.name);
-    if let Some(preview) = entry.summary.preview.as_deref() {
-        text.push_str("  ");
-        text.push_str(preview);
-    }
-    let truncated = truncate_with_ellipsis(&text, width as usize);
     let mut spans = Vec::new();
-    let prefix = format!("{marker}{}", entry.name);
-    let visible_prefix = format!("{marker}{}  ", entry.name);
-    spans.push(Span::styled(visible_prefix, name_style));
-    spans.push(Span::styled(format!("[{status}]"), status_style));
-    let rest = truncated
-        .strip_prefix(&format!("{prefix}  [{status}]"))
-        .unwrap_or("");
-    spans.push(Span::styled(
-        rest.to_string(),
+    let mut remaining = width as usize;
+
+    push_bounded_span(
+        &mut spans,
+        marker,
+        if selected {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        },
+        &mut remaining,
+    );
+    push_column_span(
+        &mut spans,
+        status,
+        POD_STATUS_COLUMN_WIDTH,
+        status_style,
+        &mut remaining,
+    );
+    push_column_span(
+        &mut spans,
+        action,
+        POD_ACTION_COLUMN_WIDTH,
         Style::default().fg(Color::DarkGray),
-    ));
+        &mut remaining,
+    );
+    push_column_span(
+        &mut spans,
+        "pod",
+        POD_KIND_COLUMN_WIDTH,
+        Style::default().fg(Color::DarkGray),
+        &mut remaining,
+    );
+    push_bounded_span(&mut spans, entry.name.as_str(), name_style, &mut remaining);
+
     Line::from(spans)
 }
 
@@ -2515,7 +2627,7 @@ mod tests {
             .collect::<Vec<_>>();
         let ticket_line = lines
             .iter()
-            .position(|line| line.contains("Needs Human Reply"))
+            .position(|line| line.contains("needs-human-reply"))
             .unwrap();
         let pod_line = lines.iter().position(|line| line.contains("idle")).unwrap();
         assert!(ticket_line < pod_line);
@@ -2691,6 +2803,158 @@ mod tests {
 
             assert_eq!(label, expected_label);
         }
+    }
+
+    #[test]
+    fn panel_ticket_rows_use_aligned_columns_before_title() {
+        let review_row = panel_test_ticket_row(
+            "workspace-panel-composer-targets",
+            "Workspace panel composer targets",
+            ActionPriority::Decision,
+            NextUserAction::Review,
+            "implementation reported",
+            crate::workspace_panel::TicketPanelPhase::Reviewing,
+        );
+        let ready_row = panel_test_ticket_row(
+            "ticket-slug",
+            "Long Ticket title that should be rendered after short columns",
+            ActionPriority::ReadyForGo,
+            NextUserAction::Go,
+            "ready for Go",
+            crate::workspace_panel::TicketPanelPhase::Preflight,
+        );
+
+        let review_line = plain_line(&panel_row_line(&review_row, true, 160));
+        let ready_line = plain_line(&panel_row_line(&ready_row, false, 160));
+        let action_start = 2 + TICKET_PRIORITY_COLUMN_WIDTH + 1;
+        let status_start = action_start + TICKET_ACTION_COLUMN_WIDTH + 1;
+        let phase_start = status_start + TICKET_STATUS_COLUMN_WIDTH + 1;
+        let id_start = phase_start + TICKET_PHASE_COLUMN_WIDTH + 1;
+        let title_start = id_start + TICKET_ID_COLUMN_WIDTH + 1;
+
+        assert!(!review_line.starts_with("▶ Workspace panel composer targets"));
+        assert_eq!(display_column(&review_line, "Review"), action_start);
+        assert_eq!(display_column(&ready_line, "Go"), action_start);
+        assert_eq!(
+            display_column(&review_line, "implementation reported"),
+            status_start
+        );
+        assert_eq!(display_column(&ready_line, "ready for Go"), status_start);
+        assert_eq!(display_column(&review_line, "review"), phase_start);
+        assert_eq!(display_column(&ready_line, "preflight"), phase_start);
+        assert_eq!(
+            display_column(&review_line, "workspace-panel-composer-targets"),
+            id_start
+        );
+        assert_eq!(display_column(&ready_line, "ticket-slug"), id_start);
+        assert_eq!(
+            display_column(&review_line, "Workspace panel composer targets"),
+            title_start
+        );
+        assert_eq!(
+            display_column(&ready_line, "Long Ticket title"),
+            title_start
+        );
+    }
+
+    #[test]
+    fn panel_ticket_title_truncates_after_stable_columns() {
+        let row = panel_test_ticket_row(
+            "ticket-slug",
+            "Very long Ticket title that should truncate only after the aligned short columns",
+            ActionPriority::ReadyForGo,
+            NextUserAction::Go,
+            "ready for Go",
+            crate::workspace_panel::TicketPanelPhase::Preflight,
+        );
+
+        let line = plain_line(&panel_row_line(&row, false, 112));
+        let title_start = 2
+            + TICKET_PRIORITY_COLUMN_WIDTH
+            + 1
+            + TICKET_ACTION_COLUMN_WIDTH
+            + 1
+            + TICKET_STATUS_COLUMN_WIDTH
+            + 1
+            + TICKET_PHASE_COLUMN_WIDTH
+            + 1
+            + TICKET_ID_COLUMN_WIDTH
+            + 1;
+
+        assert_eq!(line.width(), 112);
+        assert_eq!(
+            display_column(&line, "ticket-slug"),
+            title_start - TICKET_ID_COLUMN_WIDTH - 1
+        );
+        assert_eq!(display_column(&line, "Very long Ticket"), title_start);
+        assert!(line.ends_with('…'));
+    }
+
+    #[test]
+    fn panel_pod_rows_use_aligned_columns_before_pod_name() {
+        let app = test_app(vec![
+            live_info("companion", PodStatus::Idle),
+            live_info("very-long-background-worker-name", PodStatus::Running),
+        ]);
+        let idle = app
+            .list
+            .entries
+            .iter()
+            .find(|entry| entry.name == "companion")
+            .unwrap();
+        let running = app
+            .list
+            .entries
+            .iter()
+            .find(|entry| entry.name == "very-long-background-worker-name")
+            .unwrap();
+
+        let idle_line = plain_line(&row_line(idle, false, 120));
+        let running_line = plain_line(&row_line(running, false, 120));
+        let action_start = 2 + POD_STATUS_COLUMN_WIDTH + 1;
+        let kind_start = action_start + POD_ACTION_COLUMN_WIDTH + 1;
+        let name_start = kind_start + POD_KIND_COLUMN_WIDTH + 1;
+
+        assert!(!running_line.starts_with("  very-long-background-worker-name"));
+        assert_eq!(display_column(&idle_line, "send"), action_start);
+        assert_eq!(display_column(&running_line, "open"), action_start);
+        assert_eq!(display_column(&idle_line, "pod"), kind_start);
+        assert_eq!(display_column(&running_line, "pod"), kind_start);
+        assert_eq!(display_column(&idle_line, "companion"), name_start);
+        assert_eq!(
+            display_column(&running_line, "very-long-background-worker-name"),
+            name_start
+        );
+    }
+
+    #[test]
+    fn panel_pod_name_truncates_after_status_action_and_kind() {
+        let app = test_app(vec![live_info(
+            "very-long-background-worker-name-that-keeps-going",
+            PodStatus::Running,
+        )]);
+        let entry = app.list.selected_entry().unwrap();
+
+        let line = plain_line(&row_line(entry, false, 58));
+        let name_start = 2
+            + POD_STATUS_COLUMN_WIDTH
+            + 1
+            + POD_ACTION_COLUMN_WIDTH
+            + 1
+            + POD_KIND_COLUMN_WIDTH
+            + 1;
+
+        assert_eq!(line.width(), 58);
+        assert_eq!(
+            display_column(&line, "open"),
+            2 + POD_STATUS_COLUMN_WIDTH + 1
+        );
+        assert_eq!(
+            display_column(&line, "pod"),
+            name_start - POD_KIND_COLUMN_WIDTH - 1
+        );
+        assert_eq!(display_column(&line, "very-long"), name_start);
+        assert!(line.ends_with('…'));
     }
 
     #[test]
@@ -3286,6 +3550,45 @@ mod tests {
         app
     }
 
+    fn panel_test_ticket_row(
+        slug: &str,
+        title: &str,
+        priority: ActionPriority,
+        next_action: NextUserAction,
+        status: &str,
+        phase: crate::workspace_panel::TicketPanelPhase,
+    ) -> PanelRow {
+        let ticket = crate::workspace_panel::TicketPanelEntry {
+            id: format!("20260606-000000-{slug}"),
+            slug: slug.to_string(),
+            title: title.to_string(),
+            status: "open".to_string(),
+            kind: "task".to_string(),
+            priority: "P2".to_string(),
+            labels: Vec::new(),
+            phase,
+            next_action: Some(next_action),
+            updated_at: None,
+            latest_event_kind: Some("implementation_report".to_string()),
+            latest_event_excerpt: Some("latest event stays out of the primary row".to_string()),
+            blocked_reason: None,
+            related_pods: Vec::new(),
+        };
+        PanelRow {
+            key: PanelRowKey::Ticket(ticket.id.clone()),
+            kind: crate::workspace_panel::PanelRowKind::Ticket,
+            title: title.to_string(),
+            subtitle: Some("slug · priority · latest event".to_string()),
+            status: status.to_string(),
+            priority,
+            next_action: Some(next_action),
+            ticket: Some(ticket),
+            related_pods: Vec::new(),
+            disabled_reason: None,
+            key_hint: Some("Enter".to_string()),
+        }
+    }
+
     fn closed_list(count: usize, selected: Option<&str>) -> PodList {
         PodList::from_sources(
             PodVisibilitySource::ResumePicker,
@@ -3359,6 +3662,11 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect()
+    }
+
+    fn display_column(text: &str, needle: &str) -> usize {
+        let byte_index = text.find(needle).unwrap();
+        text[..byte_index].width()
     }
 
     fn input_text(app: &MultiPodApp) -> String {
