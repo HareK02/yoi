@@ -2,12 +2,12 @@
 id: 20260605-210704-workspace-panel-composer-targets
 slug: workspace-panel-composer-targets
 title: Workspace panel composer targets
-status: open
+status: closed
 kind: task
 priority: P1
 labels: [tui, composer, intake, panel]
 created_at: 2026-06-05T21:07:04Z
-updated_at: 2026-06-06T04:24:53Z
+updated_at: 2026-06-06T04:47:31Z
 assignee: null
 legacy_ticket: null
 ---
