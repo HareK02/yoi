@@ -56,3 +56,18 @@ Created companion ticket `typed-ticket-thread-event-log` for the typed thread ev
 
 
 ---
+
+<!-- event: plan author: hare at: 2026-06-06T22:49:29Z -->
+
+## Plan
+
+Preflight result: `implementation-ready` after `typed-ticket-thread-event-log`.
+
+This ticket should add explicit durable Ticket workflow fields and update the panel to stop using inferred state/action/status columns. The core workflow is `intake -> ready -> queued -> inprogress -> done`; `ready -> queued` is the normal human panel action and should be shown as `Queue`, not `Go`.
+
+Implementation should use the newly-added typed thread event APIs for state transitions where practical, simplify panel rows to state + identity/title, and keep transient Pod activity out of Ticket frontmatter.
+
+Detailed delegation intent is recorded in `artifacts/delegation-intent.md`.
+
+
+---
