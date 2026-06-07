@@ -140,3 +140,40 @@ Created two follow-up tickets from the `.yoi` sparse checkout / memory-root disc
 These are relevant to Orchestrator merge/worktree automation because branch-local dossiers and workflow edits should be possible without copying generated memory into child worktrees.
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-06-07T06:38:16Z -->
+
+## Implementation report
+
+## Implementation report
+
+Coder Pod `orchestrator-merge-coder-20260607` completed implementation in `.worktree/orchestrator-merge-completion`.
+
+Commit:
+- `cb17728 orchestrator: add merge completion guidance`
+
+Observed diff:
+- `crates/client/src/ticket_role.rs` only.
+
+Implementation summary:
+- Extended Orchestrator role guidance with merge-completion instructions for reviewed in-progress Tickets with merge-ready dossiers.
+- Guidance requires the Ticket to be `inprogress` and the dossier branch/worktree/commits to match the branch being merged.
+- Requires independent reviewer approval in the dossier or an explicit human override decision.
+- Requires main workspace safety / unrelated dirty change awareness.
+- Distinguishes dogfooding/workspace merge authority from conservative/missing authorization mode, which stops at the dossier.
+- Preserves branch-local reviewer verdict vs final main Ticket approval boundary.
+- Defines the authorized sequence: stop/reclaim coder/reviewer Pods where appropriate, merge, post-merge validation, record review/merge/validation outcome in Ticket thread, transition `inprogress -> done` or close, then cleanup worktree/branch unless explicitly kept.
+- Added tests covering merge-completion guidance / dossier requirements.
+
+Reported validation:
+- `cargo test -p client ticket_role --lib`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo build -p yoi`
+- `nix build .#yoi`
+
+Parent-side workflow patch needed: none observed from the implementation; child diff is code/prompt-generation only.
+
+External review will be delegated before merge.
+
+---
