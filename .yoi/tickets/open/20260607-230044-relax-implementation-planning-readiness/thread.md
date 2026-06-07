@@ -86,3 +86,87 @@ For this Ticket, additional preflight is not required before implementation if t
 Implementation should use this as the binding policy boundary and update workflow wording accordingly. Escalate only if the wording would weaken authority/product/API/design-boundary gates rather than narrowing unnecessary preflight churn.
 
 ---
+
+<!-- event: decision author: orchestrator at: 2026-06-07T23:09:28Z -->
+
+## Decision
+
+Routing decision: implementation_ready
+
+Reason:
+- Human recorded the missing policy boundary directly in the Ticket thread and explicitly authorized proceeding.
+- The human decision clarifies that `needs_preflight: true` and risk flags are strong signals, not unconditional blockers, when the missing design/policy boundary has already been supplied.
+- Intent, constraints, acceptance criteria, binding decisions, implementation latitude, and escalation conditions are now reviewable enough for coder/reviewer handoff.
+
+Evidence checked:
+- Ticket body requirements, non-goals, acceptance criteria, and affected workflow paths.
+- Intake summary and prior `preflight_needed` routing decision.
+- Human decision at `2026-06-07T23:08:01Z` supplying the binding policy boundary.
+- Workspace state: main workspace clean; no branch/worktree exists for this slug; separate `parse-ticket-frontmatter-as-yaml` worktree/Pod is active but isolated.
+- Visible Pods: intake peer for this Ticket is idle; no coder/reviewer Pods are active for this Ticket.
+
+IntentPacket:
+
+Intent:
+- Relax workflow wording so Ticket readiness and implementation handoff focus on clear intent, constraints, acceptance criteria, and reviewability rather than prematurely fixed implementation tactics.
+
+Binding decisions / invariants:
+- Preflight is not removed; it remains mandatory when implementation would silently decide product/API/UX/authority-boundary questions or weaken explicit design constraints.
+- Human/Orchestrator/Ticket-recorded design decisions and invariants remain binding. A coder must follow them or escalate/record a justified deviation.
+- `ready` means ready for Orchestrator routing, not fully implementation-planned.
+- `implementation_ready` may include bounded implementation uncertainty when intent, constraints, acceptance criteria, reviewer judgment basis, and escalation conditions are clear.
+- `needs_preflight: true` and risk flags are strong signals, not unconditional hard blockers, if a human decision has already supplied the missing boundary.
+
+Implementation latitude:
+- The coder may choose exact wording and file-local organization after inspecting the workflow docs/prompts/tests.
+- The coder may decide whether `.yoi/workflow/multi-agent-workflow.md` or role prompt/test wording needs updates, based on whether existing text over-demands pre-decided implementation plans.
+- The coder may keep the change docs/workflow-only if no runtime prompt/tests are affected.
+
+Requirements:
+- Update `.yoi/workflow/ticket-intake-workflow.md`.
+- Update `.yoi/workflow/ticket-orchestrator-routing.md`.
+- Update `.yoi/workflow/ticket-preflight-workflow.md`.
+- Update `.yoi/workflow/multi-agent-workflow.md` if needed.
+- Adjust role prompt wording/tests if generated prompt guidance currently over-demands pre-decided implementation plans.
+- Intent packet guidance must distinguish binding decisions/invariants, implementation latitude, and escalation conditions.
+- Reviewer guidance must judge implementation against recorded intent, constraints, acceptance criteria, and explicit decisions—not unrecorded preferred tactics.
+- Example wording should make coder investigation acceptable when intent is clear and risks are bounded.
+
+Non-goals:
+- Do not change Ticket state machine names.
+- Do not weaken product/API/authority/design-boundary gates.
+- Do not make coders silently decide product/API/authority questions.
+- Do not introduce scheduler/lease/workflow-state redesign.
+
+Escalate if:
+- The wording would weaken authority/product/API/design-boundary gates rather than narrowing unnecessary preflight churn.
+- A runtime prompt/resource/test change is larger than wording alignment.
+- Existing workflow docs contain a contradictory policy that cannot be reconciled with this Ticket without broader redesign.
+
+Validation:
+- `target/debug/yoi ticket doctor` or equivalent built binary doctor.
+- `cargo fmt --check`.
+- `git diff --check`.
+- If code, prompt runtime resources, or tests are changed, run focused tests and `nix build .#yoi`; if docs/workflow-only, report why Nix build was not needed.
+
+Current code/docs map:
+- `.yoi/workflow/ticket-intake-workflow.md`
+- `.yoi/workflow/ticket-orchestrator-routing.md`
+- `.yoi/workflow/ticket-preflight-workflow.md`
+- `.yoi/workflow/multi-agent-workflow.md`
+- Search role prompts/tests only if workflow docs reveal generated guidance is out of sync.
+
+Critical risks:
+- Replacing too-strict preflight churn with too-loose implementation authority.
+- Ambiguous reviewer instructions that evaluate against hidden preferences instead of recorded intent.
+- Over-editing workflow docs beyond this policy cleanup.
+
+---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-07T23:09:32Z from: queued to: inprogress reason: orchestrator_acceptance_after_human_policy_boundary field: workflow_state -->
+
+## State changed
+
+Orchestrator accepted the queued Ticket for implementation after the human decision supplied the policy boundary for bounded implementation latitude versus binding design/authority decisions. Worktree and sibling coder/reviewer routing may proceed from this accepted in-progress state.
+
+---

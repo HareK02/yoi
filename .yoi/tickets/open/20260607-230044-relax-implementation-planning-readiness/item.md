@@ -6,9 +6,9 @@ status: open
 kind: task
 priority: P2
 labels: [workflow, ticket, orchestrator, preflight, review]
-workflow_state: queued
+workflow_state: inprogress
 created_at: 2026-06-07T23:00:44Z
-updated_at: 2026-06-07T23:08:01Z
+updated_at: 2026-06-07T23:09:32Z
 assignee: null
 legacy_ticket: null
 queued_by: workspace-panel
