@@ -123,3 +123,31 @@ External review will be delegated before merge.
 
 
 ---
+
+<!-- event: review author: hare at: 2026-06-07T10:15:40Z status: approve -->
+
+## Review: approve
+
+Approved by `orchestrator-diagnostic-reviewer-20260607`.
+
+No blocking findings. The implementation matches the ticket intent and is merge-ready.
+
+Evidence:
+- `Ensure` vs `Observe` is preserved. Initial load uses `Ensure`; refresh paths use `Observe`; observe does not restore/spawn.
+- Prior actionable failure is retained across plain observe `missing` / `stopped` for the same Pod name.
+- Plain missing without prior failure remains plain missing.
+- Stale failures are cleared when Orchestrator becomes `live`, `spawned`, or `restored`.
+- New `Unavailable` diagnostics supersede older ones.
+- Ticket actionbar gating remains separate; lifecycle diagnostics remain in `panel.header.diagnostics`.
+- Worktree is clean and merge-tree against current `develop` reports no conflict.
+
+Reviewer validation:
+- `CARGO_TARGET_DIR=/tmp/yoi-review-target cargo test -p tui multi_orchestrator --lib`
+- `CARGO_TARGET_DIR=/tmp/yoi-review-target cargo test -p tui --lib`
+- `cargo fmt --check`
+- `git diff --check develop...HEAD`
+- `nix build .#yoi --no-link`
+- `CARGO_TARGET_DIR=/tmp/yoi-review-target cargo run -p yoi -- ticket doctor`
+
+
+---
