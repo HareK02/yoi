@@ -34,14 +34,11 @@ Make the workspace Orchestrator execute accepted in-progress Tickets through wor
 - Spawn reviewer Pods as Orchestrator siblings, not coder children, with read-only scope by default.
 - Coder task prompts must include an intent packet: intent, requirements, invariants, non-goals, escalation conditions, validation expectations, worktree path, and branch.
 - Reviewer task prompts must focus on Ticket intent, diff, invariants, validation adequacy, and blocker/non-blocker classification.
-- Orchestrator must record progress in the Ticket thread at meaningful checkpoints:
-  - accepted worktree/branch plan;
-  - coder delegated;
-  - coder completed or blocked;
-  - reviewer delegated;
-  - review approved/requested changes;
-  - fix loop outcome.
-- Orchestrator must not merge in this ticket's scope. It should produce a merge-ready dossier for `orchestrator-merge-completion`.
+- Orchestrator must record durable progress without misrepresenting branch-local review as main-branch Ticket approval:
+  - main Ticket thread may record accepted worktree/branch plan, coder delegated, coder completed/blocked, reviewer delegated, and fix-loop progress;
+  - reviewer verdicts for an unmerged implementation branch should be captured in the merge-ready dossier or branch-scoped review report, not as a final main-branch Ticket approval event before merge;
+  - if a reviewer requests changes, the Orchestrator may record a concise progress/blocker summary in the Ticket thread, but the branch remains unapproved until the fix loop and final merge-completion phase.
+- Orchestrator must not merge in this ticket's scope. It should produce a merge-ready dossier for `orchestrator-merge-completion` that includes the independent reviewer verdict and validation evidence.
 - If compaction occurs, workflow obligations should remain understandable; relate to `preserve-active-workflows-across-compaction` but do not block first implementation on it.
 
 ## Non-goals
@@ -57,6 +54,6 @@ Make the workspace Orchestrator execute accepted in-progress Tickets through wor
 - Orchestrator has builtin/role guidance or implementation wiring that follows `worktree-workflow` and `multi-agent-workflow` for accepted Tickets.
 - Worktree creation excludes `.yoi`.
 - Coder and reviewer Pods are spawned as siblings under Orchestrator with the expected scopes.
-- Progress is recorded in the Ticket thread.
-- A merge-ready dossier format is produced after review approval and validation.
+- Progress is recorded durably, while branch-local review verdicts are kept in the merge-ready dossier/review report rather than committed as final main-branch Ticket approval before merge.
+- A merge-ready dossier format is produced after branch review and validation.
 - Tests or prompt/resource tests cover the worktree/coder/reviewer routing instructions and scope boundaries.

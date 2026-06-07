@@ -8,7 +8,7 @@ priority: P1
 labels: [orchestrator, merge, ticket, workflow, validation]
 workflow_state: intake
 created_at: 2026-06-07T03:52:31Z
-updated_at: 2026-06-07T03:52:31Z
+updated_at: 2026-06-07T05:00:22Z
 assignee: null
 legacy_ticket: null
 ---
@@ -28,7 +28,9 @@ Implement Orchestrator merge/completion behavior for reviewed in-progress Ticket
 - Define the merge authority boundary clearly:
   - in local dogfooding mode/workspace policy, Orchestrator may merge/cleanup/close after review approval and validation;
   - otherwise Orchestrator must stop at a merge-ready dossier with human action required.
-- Require an independent reviewer approval before merge, unless a human explicitly overrides and records a decision.
+- Require an independent reviewer approval in the merge-ready dossier before merge, unless a human explicitly overrides and records a decision.
+- Treat the reviewer verdict before merge as branch-scoped evidence, not a final main-branch Ticket approval event.
+- Commit main-branch Ticket review/approval and completion records only in the merge-completion phase, after the branch is merged or as part of the same controlled completion sequence, so the main Ticket history does not claim approval for code that is not in main.
 - Require a merge-ready dossier including:
   - Ticket id/slug;
   - branch/worktree;
@@ -48,7 +50,7 @@ Implement Orchestrator merge/completion behavior for reviewed in-progress Ticket
   - `git diff --check`;
   - `target/debug/yoi ticket doctor` where applicable.
 - Use broader validation (`cargo check --workspace --all-targets`, `nix build .#yoi`, etc.) when risk or touched files warrant it.
-- Record implementation/review/merge/validation outcome in the Ticket thread.
+- Record review/merge/validation outcome in the Ticket thread during the merge-completion phase, after confirming that the reviewed branch is the branch being merged.
 - Transition `inprogress -> done` or close the Ticket according to typed Ticket workflow rules.
 - Remove merged child worktree and delete merged branch unless the user/workflow explicitly asks to keep them.
 - Stop coder/reviewer Pods and reclaim scopes after completion.
@@ -66,6 +68,6 @@ Implement Orchestrator merge/completion behavior for reviewed in-progress Ticket
 - Orchestrator has explicit merge/completion guidance or implementation wiring based on `multi-agent-workflow`.
 - Reviewed in-progress Tickets can be merged, validated, closed/done, and cleaned up by Orchestrator in authorized dogfooding mode.
 - Conservative mode or missing authorization stops at merge-ready dossier rather than merging.
-- Ticket thread records the merge/completion decision and validation evidence.
+- Ticket thread records branch-reviewed merge/completion decision and validation evidence in the merge-completion phase, not as premature main-branch approval before merge.
 - Worktrees/branches/Pods are cleaned up after successful merge/close.
 - Tests or prompt/resource tests cover merge authority boundary and required dossier/validation fields.
