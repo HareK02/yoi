@@ -65,3 +65,24 @@ Ticket intake complete; workflow_state intake -> ready.
 
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-06-07T04:58:26Z -->
+
+## Implementation report
+
+## Delegation
+
+Implementation delegated to child Pod `orchestrator-routing-coder-20260607` in worktree `.worktree/orchestrator-queued-ticket-routing` on branch `work/orchestrator-queued-ticket-routing`.
+
+Scope:
+- Update Panel Queue notice and Orchestrator notification wording to actively trigger routing.
+- Preserve the contract that implementation side effects occur only after `queued -> inprogress` acceptance.
+- Update focused TUI tests.
+- Do not implement worktree/coder/reviewer routing, merge completion, or the orchestration plan tool in this ticket.
+
+Workflow note:
+- Child worktree excludes `.yoi`, so workflow file updates under `.yoi/workflow` must be reported back for parent-side application rather than edited in the child worktree.
+
+The child should commit implementation work in the child worktree and report diff/tests. Merge, review, Ticket closure, workflow file updates, and cleanup remain with the parent/human workflow.
+
+---
