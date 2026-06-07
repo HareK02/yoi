@@ -2,13 +2,13 @@
 id: 20260607-001651-workspace-panel-remove-direct-pod-send
 slug: workspace-panel-remove-direct-pod-send
 title: Remove workspace panel direct Pod send
-status: open
+status: closed
 kind: task
 priority: P1
 labels: [tui, panel, companion, cleanup]
-workflow_state: ready
+workflow_state: done
 created_at: 2026-06-07T00:16:51Z
-updated_at: 2026-06-07T01:33:27Z
+updated_at: 2026-06-07T02:00:58Z
 assignee: null
 legacy_ticket: null
 ---

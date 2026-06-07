@@ -84,3 +84,59 @@ Scope:
 The child should commit implementation work in the child worktree and report diff/tests. Merge, review, Ticket closure, and cleanup remain with the parent/human workflow.
 
 ---
+
+<!-- event: review author: INSOMNIA at: 2026-06-07T02:00:40Z status: approve -->
+
+## Review: approve
+
+Approved after reviewing the child implementation and post-merge validation.
+
+Review notes:
+- The workspace panel no longer sends non-empty Companion composer input to the selected Pod via direct `Method::Run`.
+- Non-empty Companion submit now keeps the draft and reports that the real Companion lifecycle is not connected yet.
+- Empty Enter and `o` still open/attach the selected Pod.
+- Ticket Intake Enter still builds the Intake launch request and is not treated as direct selected-Pod send.
+- Pod rows now advertise open behavior rather than send behavior.
+
+Validation run after merge:
+- `cargo test -p tui multi_pod --lib`
+- `cargo test -p tui workspace_panel --lib`
+- `cargo fmt --check`
+- `git diff --check`
+
+---
+
+<!-- event: state_changed author: hare at: 2026-06-07T02:00:58Z from: ready to: done reason: closed field: workflow_state -->
+
+## State changed
+
+Ticket closed; workflow_state set to done.
+
+
+---
+
+<!-- event: close author: hare at: 2026-06-07T02:00:58Z status: closed -->
+
+## Closed
+
+Implemented and merged.
+
+Summary:
+- Removed the workspace panel path that treated the `Companion` composer target as direct selected-Pod `Method::Run` sending.
+- Non-empty Companion submit now preserves the draft and reports that the real Companion lifecycle is not connected yet.
+- Preserved Pod open/attach behavior through empty Enter / `o`.
+- Preserved Ticket Intake composer launch behavior.
+- Updated Pod row action/key-hint behavior away from direct-send semantics.
+- Updated focused tests for the new behavior.
+
+Merged implementation:
+- Child commit: `393cde9 tui: remove panel direct pod send`
+- Main merge commit: `merge: remove panel direct pod send`
+
+Validation after merge:
+- `cargo test -p tui multi_pod --lib`
+- `cargo test -p tui workspace_panel --lib`
+- `cargo fmt --check`
+- `git diff --check`
+
+---
