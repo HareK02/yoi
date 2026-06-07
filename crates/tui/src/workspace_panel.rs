@@ -29,6 +29,7 @@ impl WorkspacePanelViewModel {
                 ticket_root: workspace_root
                     .join(ticket::config::DEFAULT_TICKET_BACKEND_RELATIVE_PATH),
                 ticket_configured: false,
+                companion: None,
                 orchestrator: None,
                 diagnostics: Vec::new(),
             },
@@ -47,6 +48,7 @@ pub(crate) struct WorkspacePanelHeader {
     pub(crate) workspace_label: String,
     pub(crate) ticket_root: PathBuf,
     pub(crate) ticket_configured: bool,
+    pub(crate) companion: Option<CompanionPanelState>,
     pub(crate) orchestrator: Option<OrchestratorPanelState>,
     pub(crate) diagnostics: Vec<String>,
 }
@@ -86,6 +88,50 @@ impl WorkspacePanelComposer {
 
     pub(crate) fn is_available(&self, target: ComposerTarget) -> bool {
         self.available_targets.contains(&target)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CompanionPanelState {
+    pub(crate) pod_name: String,
+    pub(crate) status: CompanionPanelStatus,
+    pub(crate) detail: Option<String>,
+}
+
+impl CompanionPanelState {
+    pub(crate) fn new(
+        pod_name: impl Into<String>,
+        status: CompanionPanelStatus,
+        detail: Option<String>,
+    ) -> Self {
+        Self {
+            pod_name: pod_name.into(),
+            status,
+            detail,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompanionPanelStatus {
+    Live,
+    Restored,
+    Spawned,
+    Stopped,
+    Missing,
+    Unavailable,
+}
+
+impl CompanionPanelStatus {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Live => "live",
+            Self::Restored => "restored",
+            Self::Spawned => "spawned",
+            Self::Stopped => "stopped/restorable",
+            Self::Missing => "missing",
+            Self::Unavailable => "unavailable",
+        }
     }
 }
 
@@ -260,6 +306,22 @@ pub(crate) enum TicketConfigAvailability {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CompanionPodPresence {
+    Live,
+    Restorable,
+    Missing,
+    Unavailable(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CompanionLifecyclePlan {
+    ReportLive,
+    Restore,
+    Spawn,
+    Unavailable(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum OrchestratorPodPresence {
     Live,
     Restorable,
@@ -274,6 +336,16 @@ pub(crate) enum OrchestratorLifecyclePlan {
     Restore,
     Spawn,
     Unavailable(String),
+}
+
+pub(crate) fn workspace_companion_pod_name(workspace_root: &Path) -> String {
+    let seed = workspace_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("workspace");
+    sanitise_pod_name_component(seed, MAX_POD_NAME_CHARS)
+        .filter(|component| !component.is_empty())
+        .unwrap_or_else(|| "workspace".to_string())
 }
 
 pub(crate) fn workspace_orchestrator_pod_name(workspace_root: &Path) -> String {
@@ -312,6 +384,43 @@ fn sanitise_pod_name_component(value: &str, max_chars: usize) -> Option<String> 
         None
     } else {
         Some(trimmed.chars().take(max_chars).collect())
+    }
+}
+
+pub(crate) fn companion_pod_presence(pod_name: &str, pods: &PodList) -> CompanionPodPresence {
+    let Some(entry) = pods.entries.iter().find(|entry| entry.name == pod_name) else {
+        return CompanionPodPresence::Missing;
+    };
+    if entry.live.as_ref().is_some_and(|live| live.reachable) {
+        return CompanionPodPresence::Live;
+    }
+    if entry.actions.can_restore {
+        return CompanionPodPresence::Restorable;
+    }
+    let reason = entry
+        .actions
+        .disabled_reason
+        .clone()
+        .or_else(|| {
+            entry
+                .diagnostics
+                .first()
+                .map(|diagnostic| diagnostic.message.clone())
+        })
+        .unwrap_or_else(|| "pod state is not live, restorable, or spawn-safe".to_string());
+    CompanionPodPresence::Unavailable(reason)
+}
+
+pub(crate) fn decide_companion_lifecycle(
+    presence: &CompanionPodPresence,
+) -> CompanionLifecyclePlan {
+    match presence {
+        CompanionPodPresence::Live => CompanionLifecyclePlan::ReportLive,
+        CompanionPodPresence::Restorable => CompanionLifecyclePlan::Restore,
+        CompanionPodPresence::Missing => CompanionLifecyclePlan::Spawn,
+        CompanionPodPresence::Unavailable(message) => CompanionLifecyclePlan::Unavailable(format!(
+            "Workspace Companion Pod state is unusable: {message}"
+        )),
     }
 }
 
@@ -1093,6 +1202,52 @@ mod tests {
                 .unwrap()
                 .contains("claim: ticket-claimed-intake (live)")
         );
+    }
+
+    #[test]
+    fn workspace_companion_pod_name_is_workspace_basename_without_suffix() {
+        assert_eq!(
+            workspace_companion_pod_name(Path::new("/home/hare/Projects/yoi")),
+            "yoi"
+        );
+        assert_eq!(
+            workspace_companion_pod_name(Path::new("/tmp/Yoi Workspace")),
+            "yoi-workspace"
+        );
+        assert_eq!(
+            workspace_companion_pod_name(Path::new("/tmp/.strange_日本語!!")),
+            "strange"
+        );
+        assert_eq!(
+            workspace_companion_pod_name(Path::new("/tmp/___")),
+            "workspace"
+        );
+        let long = "a".repeat(120);
+        let name = workspace_companion_pod_name(&PathBuf::from(format!("/tmp/{long}")));
+        assert_eq!(name.chars().count(), 80);
+        assert!(!name.ends_with("-companion"));
+    }
+
+    #[test]
+    fn companion_lifecycle_decisions_follow_pod_state_without_ticket_gate() {
+        assert_eq!(
+            decide_companion_lifecycle(&CompanionPodPresence::Live),
+            CompanionLifecyclePlan::ReportLive
+        );
+        assert_eq!(
+            decide_companion_lifecycle(&CompanionPodPresence::Restorable),
+            CompanionLifecyclePlan::Restore
+        );
+        assert_eq!(
+            decide_companion_lifecycle(&CompanionPodPresence::Missing),
+            CompanionLifecyclePlan::Spawn
+        );
+        assert!(matches!(
+            decide_companion_lifecycle(&CompanionPodPresence::Unavailable(
+                "corrupt metadata".to_string()
+            )),
+            CompanionLifecyclePlan::Unavailable(message) if message.contains("corrupt metadata")
+        ));
     }
 
     #[test]
