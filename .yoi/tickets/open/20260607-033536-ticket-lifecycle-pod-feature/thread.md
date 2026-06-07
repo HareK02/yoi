@@ -131,3 +131,36 @@ Reported follow-up:
 External review will be delegated before merge.
 
 ---
+
+<!-- event: review author: ticket-lifecycle-feature-reviewer-20260607 at: 2026-06-07T04:02:48Z status: approve -->
+
+## Review: approve
+
+Approved.
+
+Evidence reviewed:
+- Feature identity remains Ticket-domain (`builtin:ticket`), not Orchestrator-specific.
+- `TicketFeatureAccess::ReadOnly` maps only to read/status tools (`TicketList`, `TicketShow`, `TicketDoctor`).
+- Feature descriptor and installation register only the tools allowed by the selected access level.
+- Lifecycle/default access preserves existing full Ticket tool behavior.
+- Tests cover read-only descriptor/install and lifecycle install behavior.
+- `TicketWorkflowStateTool` still delegates to backend workflow-state enforcement; allowed transitions remain enforced by typed Ticket backend/tool paths.
+- Updated queued acceptance wording is guidance only, not a replacement for backend transition validation.
+- Keeping `HostAuthority::TicketBackend` for read-only access is acceptable for this ticket because the boundary here is model-visible tool exposure, not a separate storage-level read-only backend authority.
+
+Reviewer validation:
+- `cargo test -p pod ticket --lib`
+- `cargo test -p ticket tool --lib`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo check --workspace --all-targets`
+- `nix build .#yoi`
+- `git merge-tree --write-tree develop HEAD`
+
+Merge readiness:
+- Worktree clean.
+- Branch contains implementation commit `3d662bc pod: split ticket feature access levels`.
+- Merge-tree against current `develop` is clean.
+- No requested changes.
+
+---

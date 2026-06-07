@@ -8,7 +8,7 @@ priority: P1
 labels: [ticket, pod-feature, tools, orchestration, workflow]
 workflow_state: ready
 created_at: 2026-06-07T03:35:36Z
-updated_at: 2026-06-07T03:58:12Z
+updated_at: 2026-06-07T04:02:48Z
 assignee: null
 legacy_ticket: null
 ---
