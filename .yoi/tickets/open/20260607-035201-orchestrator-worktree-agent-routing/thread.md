@@ -77,3 +77,25 @@ Ticket intake complete; workflow_state intake -> ready.
 
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-06-07T05:40:37Z -->
+
+## Implementation report
+
+## Delegation
+
+Implementation delegated to child Pod `orchestrator-agent-routing-coder-20260607` in worktree `.worktree/orchestrator-worktree-agent-routing` on branch `work/orchestrator-worktree-agent-routing`.
+
+Scope:
+- Add builtin/role guidance or focused implementation wiring for accepted `inprogress` Tickets to proceed through worktree + coder/reviewer sibling routing.
+- Follow `worktree-workflow` and `multi-agent-workflow` contracts.
+- Preserve `.yoi` exclusion in child worktrees and main-workspace authority for Ticket/workflow records.
+- Stop at merge-ready dossier; do not implement merge/close.
+- Keep branch-local reviewer verdicts out of final main Ticket approval until merge-completion.
+
+Workflow note:
+- Child worktree excludes `.yoi`; if workflow file updates are needed, the child should report an exact parent-side patch rather than editing `.yoi`.
+
+The child should commit implementation work in the child worktree and report diff/tests. Merge, review, Ticket closure, workflow file updates, and cleanup remain with the parent/human workflow.
+
+---

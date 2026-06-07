@@ -8,7 +8,7 @@ priority: P1
 labels: [orchestrator, worktree, pod, review, workflow]
 workflow_state: ready
 created_at: 2026-06-07T03:52:01Z
-updated_at: 2026-06-07T05:39:48Z
+updated_at: 2026-06-07T05:40:37Z
 assignee: null
 legacy_ticket: null
 ---
