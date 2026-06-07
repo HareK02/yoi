@@ -71,3 +71,24 @@ Ticket intake complete; workflow_state intake -> ready.
 
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-06-07T03:48:50Z -->
+
+## Implementation report
+
+## Delegation
+
+Implementation delegated to child Pod `ticket-lifecycle-feature-coder-20260607` in worktree `.worktree/ticket-lifecycle-pod-feature` on branch `work/ticket-lifecycle-pod-feature`.
+
+Scope:
+- Refine the existing built-in Ticket-domain feature (`builtin:ticket`) rather than creating an Orchestrator-specific feature.
+- Add explicit read-only/status vs mutating/lifecycle tool subset support.
+- Keep Ticket transition enforcement in typed backend/tool paths.
+- Do not implement full Orchestrator automation or composite `StartTicketWork` in this ticket.
+
+Parallel note:
+- This is running alongside `ticket-init-role-profile-scaffold`; expected code overlap is low. The child was instructed to keep changes localized and report any conflict risk.
+
+The child should commit implementation work in the child worktree and report diff/tests. Merge, review, Ticket closure, and cleanup remain with the parent/human workflow.
+
+---
