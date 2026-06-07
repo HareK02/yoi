@@ -89,3 +89,33 @@ Scope:
 The child should commit implementation work in the child worktree and report diff/tests. Merge, review, Ticket closure, and cleanup remain with the parent/human workflow.
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-06-07T03:38:25Z -->
+
+## Implementation report
+
+## Implementation report
+
+Coder Pod `role-launch-config-validation-coder-20260607` completed implementation in `.worktree/ticket-role-launch-config-strict-validation`.
+
+Commit:
+- `30a07b7 ticket: validate role launch config`
+
+Reported summary:
+- Added explicit launch-readiness metadata for fixed Ticket roles without breaking backend-only config loading.
+- Added typed validation failures for missing role table, missing `profile`, top-level `inherit`, and profile selector resolution failure.
+- Updated `plan_ticket_role_launch(_with_config)` to validate launch readiness before plan/spawn.
+- Kept `TicketRoleLaunchPlan::spawn_config` defensive rejection of `inherit`.
+- Added focused tests for backend-only configs, partial roles, missing profile, explicit inherit, unresolvable selectors, and successful concrete `builtin:default` launch planning.
+
+Reported validation:
+- `cargo test -p ticket config --lib`
+- `cargo test -p client ticket_role --lib`
+- `cargo test -p tui multi_pod --lib`
+- `cargo fmt --check`
+- `git diff --check`
+- `nix build .#yoi`
+
+External review delegated to `role-launch-config-validation-reviewer-20260607`.
+
+---
