@@ -6,9 +6,9 @@ status: open
 kind: task
 priority: P2
 labels: [tui, panel, companion, pod]
-workflow_state: intake
+workflow_state: ready
 created_at: 2026-06-07T00:16:51Z
-updated_at: 2026-06-07T01:21:43Z
+updated_at: 2026-06-07T10:17:33Z
 assignee: null
 legacy_ticket: null
 ---
@@ -26,8 +26,11 @@ Restore or spawn a workspace-named Companion Pod when `yoi panel` opens, and rou
 ## Requirements
 
 - Define the Companion Pod naming rule.
-  - It should be based on the workspace name/path, consistent with existing default Pod naming where practical.
-  - Avoid colliding with the workspace Orchestrator name.
+  - Use the workspace directory basename as the Companion Pod id/name.
+  - For this repository, the Companion Pod id/name is `yoi`.
+  - Do not add a `-companion` suffix or introduce a separate companion-specific id for the normal workspace Companion.
+  - This intentionally lets `yoi panel` treat an existing default workspace Pod named `yoi` as the Companion when it is live/restorable.
+  - Avoid colliding with the workspace Orchestrator name, which remains distinct (for example `yoi-orchestrator`).
 - On `yoi panel` open:
   - if Companion is live, use it;
   - if restorable, restore it;
