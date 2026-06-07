@@ -94,3 +94,35 @@ Scope:
 The child should commit implementation work in the child worktree and report diff/tests. Merge, review, Ticket closure, and cleanup remain with the parent/human workflow.
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-06-07T03:58:12Z -->
+
+## Implementation report
+
+## Implementation report
+
+Coder Pod `ticket-init-scaffold-coder-20260607` completed implementation in `.worktree/ticket-init-role-profile-scaffold`.
+
+Commit:
+- `f265098 ticket: add ticket config init scaffold`
+
+Reported summary:
+- Added narrow `yoi ticket init`.
+- It creates `.yoi/ticket.config.toml` only when missing and ensures `.yoi/tickets` exists.
+- Existing `.yoi/ticket.config.toml` is not overwritten and fails with an actionable diagnostic.
+- Added reusable `ticket_config_scaffold()` in `crates/ticket/src/config.rs`.
+- Generated config includes backend provider/root plus fixed roles intake/orchestrator/coder/reviewer/investigator.
+- Each generated role uses explicit `profile = "builtin:default"` and explicit default `workflow`.
+- Added tests for config shape, CLI init/no-overwrite behavior, CLI help, and launch planning for Intake/Orchestrator from the scaffold.
+
+Reported validation:
+- `cargo test -p ticket config --lib`
+- `cargo test -p client ticket_role --lib`
+- `cargo test -p yoi ticket`
+- `cargo fmt --check`
+- `git diff --check`
+- `nix build .#yoi`
+
+External review will be delegated before merge.
+
+---

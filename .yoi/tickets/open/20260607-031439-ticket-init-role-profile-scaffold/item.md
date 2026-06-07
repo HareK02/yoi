@@ -8,7 +8,7 @@ priority: P1
 labels: [ticket, config, init, profiles, panel]
 workflow_state: ready
 created_at: 2026-06-07T03:14:39Z
-updated_at: 2026-06-07T03:44:16Z
+updated_at: 2026-06-07T03:58:12Z
 assignee: null
 legacy_ticket: null
 ---

@@ -92,3 +92,42 @@ Parallel note:
 The child should commit implementation work in the child worktree and report diff/tests. Merge, review, Ticket closure, and cleanup remain with the parent/human workflow.
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-06-07T03:58:12Z -->
+
+## Implementation report
+
+## Implementation report
+
+Coder Pod `ticket-lifecycle-feature-coder-20260607` completed implementation in `.worktree/ticket-lifecycle-pod-feature`.
+
+Commit:
+- `3d662bc pod: split ticket feature access levels`
+
+Reported summary:
+- Added `TicketFeatureAccess::{ReadOnly, Lifecycle}` for `builtin:ticket`.
+- Preserved default full lifecycle behavior for `ticket_tools_feature(...)`.
+- Added `ticket_tools_feature_with_access(...)` and constructors/accessors for explicit access selection.
+- Feature descriptors declare only tools allowed by the configured access level.
+- Feature installation registers only the configured subset.
+- Added Ticket tool name partitions:
+  - `TICKET_READ_ONLY_TOOL_NAMES`: `TicketList`, `TicketShow`, `TicketDoctor`;
+  - `TICKET_MUTATING_TOOL_NAMES`: create/comment/review/intake-ready/workflow-state/status/close.
+- Updated `TicketWorkflowState` tool description with the `queued -> inprogress` acceptance contract.
+- Added tests proving read-only install excludes mutating tools and lifecycle install exposes lifecycle tools.
+
+Reported validation:
+- `cargo test -p pod ticket --lib`
+- `cargo test -p ticket tool --lib`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo check --workspace --all-targets`
+- `nix build .#yoi`
+
+Reported follow-up:
+- Call sites still use the default full lifecycle access. Companion/status-specific callers can opt into read-only access once integration points are selected.
+- Host authority remains `HostAuthority::TicketBackend`; read-only boundary is enforced by subset exposure rather than a separate read-only backend authority.
+
+External review will be delegated before merge.
+
+---
