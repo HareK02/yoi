@@ -79,3 +79,35 @@ Scope:
 The child should commit implementation work in the child worktree and report diff/tests. Merge, review, Ticket closure, and cleanup remain with the parent/human workflow.
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-06-07T07:28:48Z -->
+
+## Implementation report
+
+## Implementation report
+
+Coder Pod `narrow-yoi-worktree-coder-20260607` completed implementation in `.worktree/narrow-yoi-worktree-sparse-exclusions`.
+
+Commit:
+- `ee85b51 workflow: narrow yoi worktree sparse exclusions`
+
+Reported summary:
+- Updated `.yoi/workflow/worktree-workflow.md` so child worktrees may include tracked `.yoi` project records.
+- Replaced broad `.yoi/**` sparse exclusion guidance with narrower exclusions for `.yoi/memory`, logs, locks, local/runtime/cache/tmp/session/socket/pod state, and secret-like paths.
+- Updated validation guidance to allow `.yoi` while checking `.yoi/memory` and local/runtime/log/lock/secret-like paths are absent.
+- Added explicit Ticket edit policy: branch-local artifacts/dossiers may live in child worktrees; active orchestration progress and final review/approval/close stay main-workspace responsibilities.
+- Updated `.yoi/workflow/multi-agent-workflow.md` to stop describing `.yoi` as broadly excluded and to clarify child-worktree project-record boundaries.
+- Updated generated role guidance/tests in `crates/client/src/ticket_role.rs` and `crates/tui/src/multi_pod.rs`.
+- Did not implement memory root detection and did not recreate `.yoi/memory`.
+
+Reported validation:
+- `cargo test -p client ticket_role --lib`
+- `cargo test -p tui ticket_queue_notification --lib`
+- `target/debug/yoi ticket doctor`
+- `cargo fmt --check`
+- `git diff --check`
+- `nix build .#yoi`
+
+External review will be delegated before merge.
+
+---
