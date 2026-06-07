@@ -10,7 +10,7 @@ yoi を yoi で開発する際の、worktree + coder Pod + 外部 reviewer Pod +
 
 worktree の機械的作成手順は `$user/worktree-workflow`、ユーザー依頼の Ticket 化は `$user/ticket-intake-workflow`、Ticket の next action 分類は `$user/ticket-orchestrator-routing`、実装前の要件同期・反証 preflight は `$user/ticket-preflight-workflow` に分ける。
 
-この Workflow は、対象 ticket が implementation-ready であることを前提にする。設計境界・仕様・authority boundary が未同期の場合は、worktree 作成や coder Pod 起動の前に `ticket-preflight-workflow` を通す。
+この Workflow は、対象 ticket が implementation-ready であることを前提にする。implementation-ready は full implementation plan ではなく、recorded intent / constraints / acceptance criteria / explicit decisions / escalation conditions に基づいて coder が bounded investigation を進め、reviewer が判断できる状態を指す。設計境界・仕様・authority boundary が未同期の場合は、worktree 作成や coder Pod 起動の前に `ticket-preflight-workflow` を通す。
 
 ## 目的
 
@@ -57,13 +57,13 @@ reviewer Pod
 以下が揃っている時に使う。
 
 - 対象 ticket または ticket 群が決まっている。
-- ticket の背景・要件・完了条件から実装方針が概ね導ける。
+- ticket の背景・意図・制約・受け入れ条件から、実装調査と局所 tactic 選択を coder に委ねても product / API / UX / authority / design-boundary decision を silently 固定しないと判断できる。
 - worktree 作成と git 書き込み操作について、人間の許可がある。
 - main workspace の unrelated dirty changes を把握している。
-- 下位 orchestrator に渡す intent / invariant / non-goals / escalation 条件を短く書ける。
+- 下位 orchestrator に渡す binding decisions / invariants、implementation latitude、non-goals、escalation conditions を短く書ける。
 - 設計境界・仕様・authority boundary に不確定要素がある場合、`ticket-preflight-workflow` の結果が ticket thread に記録されている。
 
-設計方針が複数自然に導ける場合、protocol / scope / permission / history persistence に触れる場合、ticket 自体の再定義が必要な場合は、実装委譲前に `ticket-preflight-workflow` を通し、必要なら人間へ戻す。ただし下位 orchestrator に探索だけを委譲することはできる。
+product / API / UX / authority / design-boundary 方針が複数自然に導ける場合、protocol / scope / permission / history persistence に触れる場合、ticket 自体の再定義が必要な場合は、実装委譲前に `ticket-preflight-workflow` を通し、必要なら人間へ戻す。実装ファイルの探索、既存コード読解、局所的な構成選択のような bounded implementation uncertainty は、intent / constraints / acceptance criteria / escalation conditions が明確なら coder に委ねてよい。
 
 ## Intent packet
 
@@ -75,24 +75,31 @@ reviewer Pod
 Intent:
 - 何を実現するか。
 
-Requirements:
-- 完了時に満たすべき observable な要件。
-
-Invariants:
-- 壊してはいけない設計境界。
+Binding decisions / invariants:
+- 人間/Orchestrator/Ticket に記録済みで coder / reviewer が従うべき decision。
+- 壊してはいけない設計境界、authority boundary、明示制約。
 - 残してはいけない旧概念や互換層。
 
-Non-goals:
-- 今回やらないこと。
+Requirements / acceptance criteria:
+- 完了時に満たすべき observable な要件と reviewer が判断できる基準。
+
+Implementation latitude:
+- Coder が調査しながら選んでよい local tactic / file-local organization / bounded uncertainty。
+
+Non-goals / constraints:
+- 今回やらないこと、触ってはいけない場所。
 
 Escalate if:
-- 親へ戻すべき判断条件。
+- 親へ戻すべき判断条件。特に product / API / UX / authority boundary / explicit design constraint を変える必要が出た場合。
 
 Validation:
 - 実行すべき format / build / test / doctor。
+
+Reviewer focus:
+- reviewer が確認すべき critical risks。
 ```
 
-reviewer には coder の実装方針ではなく、この intent packet と diff を中心に読ませる。
+reviewer には coder の実装方針ではなく、この intent packet と diff を中心に読ませる。reviewer は recorded intent / constraints / acceptance criteria / explicit decisions に照らして判断し、不記録の preferred tactic を基準にしない。
 
 ## orchestrator の責務
 
@@ -159,9 +166,10 @@ reviewer には coder の実装方針ではなく、この intent packet と dif
 - main workspace の管理ファイルを書かない。
 - child worktree 内の tracked `.yoi` project records は ticket 要件に必要な branch-local artifact/dossier として扱ってよい。
 - `.yoi/memory`、local/runtime state、logs、locks、secret-like files を child worktree に作らない。
-- intent / requirements / invariants / non-goals を読んでから実装する。
+- intent / requirements / acceptance criteria / binding decisions / invariants / non-goals / implementation latitude を読んでから実装する。
+- 実装ファイルの探索、既存コード読解、局所的な tactic 選択は、intent packet の implementation latitude 内で行ってよい。
 - 指定された build / test / format を実行する。
-- ticket 要件外の設計変更、依存関係追加、scope / permission / history persistence / prompt context 加工原則に触れる変更が必要なら止めて orchestrator に報告する。
+- ticket 要件外または binding decisions/invariants 外の設計変更、依存関係追加、scope / permission / history persistence / prompt context 加工原則に触れる変更が必要なら止めて orchestrator に報告する。
 - 完了時に以下を報告する。
   - worktree path / branch
   - commit hash（commit した場合）
@@ -180,8 +188,8 @@ reviewer は coder の subordinate ではない。orchestrator 配下の sibling
 - 実際のコード変更が概念的に何を変えたかを説明する。
 - 親や上位 orchestrator が line-by-line diff を読まずに判断できるよう、以下を整理する。
   - 変更の概念モデル
-  - intent / requirements との対応
-  - invariant 違反の有無
+  - recorded intent / constraints / acceptance criteria / explicit decisions との対応
+  - binding decisions / invariants 違反の有無
   - 旧概念・禁止語彙・不要な互換層の残存
   - validation の妥当性
   - blocker / non-blocker / follow-up

@@ -8,7 +8,7 @@ requires: []
 
 Yoi の multi-agent 運用で、ユーザーの依頼をいきなり実装委譲せず、まず **合意済み Ticket** に変換するための Workflow。
 
-Intake の目的は、ユーザーの意図・要件・受け入れ条件・未決定点を明確にし、Orchestrator が次の routing を判断できる Ticket を作ることである。Intake は scheduler ではなく、coder / reviewer Pod を起動しない。
+Intake の目的は、ユーザーの意図・要件・制約・受け入れ条件・未決定点を明確にし、Orchestrator が次の routing を判断できる Ticket を作ることである。Intake は scheduler ではなく、coder / reviewer Pod を起動しない。
 
 ## 位置づけ
 
@@ -25,6 +25,10 @@ User request / conversation
 - `Assignment` は Orchestrator から coder / reviewer / investigator Pod への具体的委譲。
 - `IntentPacket` は Ticket から抽出して Assignment に渡す短い実装・レビュー契約。
 
+Intake は、要件同期と Ticket 化を担当する。実装の起動・worktree 作成・review 委譲・merge 判断は Orchestrator 側の責務である。`ready` は Orchestrator が routing できる状態を意味し、実装戦術がすべて事前固定されていることを意味しない。
+
+Ticket に残す内容は、binding decisions / invariants、implementation latitude、escalation conditions を区別する。Coder が調査しながら局所的な実装手段を選べる余地は残してよいが、product / API / UX / authority boundary / explicit design constraint を silently 決める余地を残してはならない。
+
 ## Intake の責務
 
 Intake は以下を行う。
@@ -35,6 +39,7 @@ Intake は以下を行う。
 - 不足している要件を質問する。
 - Ticket の title / slug / kind / priority / labels を提案する。
 - background / requirements / acceptance criteria / non-goals / escalation conditions を整理する。
+- binding decisions / invariants と implementation latitude を分けて書く。
 - readiness / needs_preflight / risk flags を明示する。
 - ユーザー合意後に Ticket を作成する。
 - 既存 Ticket の refinement を求められた場合は、TicketComment で経緯を残す。
@@ -112,8 +117,9 @@ Ticket 作成または更新前に、readiness を明示する。
 
 ```text
 implementation_ready:
-- 要件・受け入れ条件・non-goals / invariants が明確。
-- 実装方針が一意または十分絞れている。
+- 意図・制約・受け入れ条件・non-goals / invariants が明確。
+- Reviewer が判断できる基準と escalation conditions が明確。
+- 実装調査や局所的な tactic 選択は残っていてよいが、product / API / UX / authority boundary / explicit design constraint を coder が silently 決める余地はない。
 - validation が書ける。
 
 requirements_sync_needed:
@@ -142,7 +148,7 @@ unspecified:
 - 複数の自然な設計方針があるもの。
 - reviewer が diff だけでは見落としやすい設計リスク。
 
-risk flags は短い語でよい。
+risk flags は短い語でよい。`needs_preflight: true` と risk flags は強い signal だが、missing boundary がすでに人間/Orchestrator の Ticket-recorded decision で補われている場合は、その decision を根拠に Orchestrator が routing できる。preflight は、実装が product / API / UX / authority boundary / explicit design constraint を silently 決める場合には mandatory のままである。
 
 例:
 
@@ -198,7 +204,7 @@ Related tickets/docs:
 
 - `TicketCreate` を使う。
 - title / slug / kind / priority / labels / body を指定する。
-- body に readiness / needs_preflight / risk flags を Markdown で明記する。
+- body に readiness / needs_preflight / risk flags と、binding decisions / invariants、implementation latitude、escalation conditions を Markdown で明記する。
 
 既存 Ticket refinement の場合:
 
@@ -227,7 +233,11 @@ Intake はここで止まる。implementation / worktree / coder / reviewer 起�
 
 ## Acceptance criteria
 
-## Non-goals
+## Binding decisions / invariants
+
+## Implementation latitude
+
+## Non-goals / constraints
 
 ## Readiness
 

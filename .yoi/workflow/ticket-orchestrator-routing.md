@@ -12,6 +12,8 @@ Yoi の multi-agent 運用で、Intake や人間が作成した Ticket を Orche
 
 Panel Queue / queued notification は、人間が Orchestrator に routing を開始してよいと許可した signal であり、unattended scheduler ではない。implementation side effect に進む場合は、Orchestrator が Ticket と workspace state を再確認し、unblocked と判断してから `queued -> inprogress` を記録する必要がある。
 
+`ready` は Orchestrator routing に十分な状態であり、実装戦術が事前にすべて固定されている状態ではない。Orchestrator は、recorded intent / constraints / acceptance criteria / explicit decisions / escalation conditions が揃っていれば、bounded implementation uncertainty を残したまま implementation-ready と判断してよい。
+
 ## 位置づけ
 
 ```text
@@ -111,9 +113,9 @@ Action:
 
 - profile / manifest / scope / permission / session / history / Pod metadata / prompt context に触れる。
 - public API / plugin / feature boundary / storage migration / security / secrets に触れる。
-- 複数の自然な実装方針がある。
+- 複数の自然な product / API / UX / authority / design-boundary 方針があり、human / Orchestrator decision なしでは固定できない。
 - implementation-ready に見えるが、reviewer が diff だけでは見落としやすい設計リスクがある。
-- `needs_preflight: true` または同等の記述が Ticket にある。
+- `needs_preflight: true` または同等の記述が Ticket にある。ただし、missing boundary がすでに Ticket/thread の explicit human/Orchestrator decision で補われている場合は、その decision を binding として扱い、残る不確実性が実装 tactic に閉じているかを確認して routing できる。
 
 Action:
 
@@ -145,10 +147,12 @@ Action:
 
 条件:
 
-- background / requirements / acceptance criteria が明確。
-- non-goals / invariants / escalation conditions が必要十分。
+- intent / constraints / acceptance criteria が明確。
+- binding decisions / invariants と implementation latitude が区別されている。
+- reviewer が判断する basis と escalation conditions が明確。
 - validation が書ける。
-- design / authority boundary の未決定がない、または preflight 済み。
+- design / authority boundary の未決定がない、または preflight / human decision で補われている。
+- 残る不確実性が bounded implementation investigation / local tactic selection に閉じている。
 - IntentPacket を短く書ける。
 
 Action:
@@ -170,6 +174,7 @@ Action:
 Action:
 
 - reviewer Pod 起動または追加 validation を提案する。
+- reviewer は recorded intent / constraints / acceptance criteria / explicit decisions に照らして判断する。不記録の好みや Orchestrator の未共有 preferred tactic を基準にしない。
 - `TicketComment` に review target と確認観点を記録する。
 - blocker 未解決のまま merge-ready としない。
 
@@ -268,7 +273,7 @@ Action:
 
 例:
 
-- implementation-ready だが authority boundary に触れる → `preflight_needed`
+- implementation-ready に見えるが authority boundary の explicit decision がない → `preflight_needed`; explicit decision が Ticket/thread にあるなら binding として IntentPacket に載せる。
 - 実装済みだが review がない → `review_needed`
 - 要件が曖昧で spike も必要そう → `requirements_sync_needed` を優先し、調査問いを明確化する
 - 完了しているが close 権限がない → `close_ready` として dossier を返す
@@ -306,17 +311,20 @@ Escalate if:
 Intent:
 - 何を実現するか。
 
-Requirements:
-- 完了時に満たす observable な要件。
+Binding decisions / invariants:
+- 人間/Orchestrator/Ticket に記録済みで coder / reviewer が従うべき decision と、壊してはいけない design / authority boundary。
 
-Invariants:
-- 壊してはいけない design / authority boundary。
+Requirements / acceptance criteria:
+- 完了時に満たす observable な要件と reviewer が判断できる基準。
 
-Non-goals:
-- 今回やらないこと。
+Implementation latitude:
+- Coder が調査しながら選んでよい local tactic / file-local organization / bounded uncertainty。
+
+Non-goals / constraints:
+- 今回やらないこと、触ってはいけない場所。
 
 Escalate if:
-- 親/人間に戻す判断条件。
+- 親/人間に戻す判断条件。特に product / API / UX / authority boundary / explicit design constraint を変える必要が出た場合。
 
 Validation:
 - 実行すべき format / build / test / doctor。
@@ -324,8 +332,8 @@ Validation:
 Current code map:
 - 実装対象と触ってはいけない場所。
 
-Critical risks:
-- reviewer にも見てほしい失敗パターン。
+Critical risks / reviewer focus:
+- reviewer にも見てほしい失敗パターン。reviewer は recorded intent / constraints / acceptance criteria / explicit decisions に照らして判断し、不記録の preferred tactic を基準にしない。
 ```
 
 IntentPacket が短く書けない場合、`implementation_ready` ではなく `preflight_needed` または `requirements_sync_needed` に戻す。

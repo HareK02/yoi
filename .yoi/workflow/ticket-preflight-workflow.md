@@ -8,20 +8,20 @@ requires: []
 
 yoi プロジェクトで ticket を実装に渡す前に、要件・前提・設計境界・反証観点を同期するための Workflow。これは **実装前の gate** であり、worktree 作成や coder / reviewer Pod の起動は `multi-agent-workflow` / `worktree-workflow` 側で扱う。
 
-目的は「ticket があるから実装する」状態を避け、ticket が **実装可能な仕様** なのか、**調査 ticket** なのか、**人間との仕様同期が必要な未決定 ticket** なのかを明確にすることである。
+目的は「ticket があるから実装する」状態を避け、ticket が **実装可能な intent / constraints / acceptance criteria** を持つのか、**調査 ticket** なのか、**人間との仕様同期が必要な未決定 ticket** なのかを明確にすることである。実装 tactic をすべて事前固定する必要はないが、product / API / UX / authority boundary / explicit design constraint を coder が silently 決める余地は残さない。
 
 ## 適用する場面
 
 以下のいずれかに当てはまる ticket は、実装委譲前にこの Workflow を通す。
 
 - profile / manifest / scope / permission / session / history / pod-store / prompt context など authority boundary に触れる。
-- ticket の文面から複数の自然な設計方針が導ける。
+- ticket の文面から複数の自然な product / API / UX / authority / design-boundary 方針が導け、人間/Orchestrator decision なしでは固定できない。
 - 「どう実装するか」以前に「何を仕様とするか」が曖昧である。
 - 既存 implementation plan があるが、抽象化・責務境界・ユーザー体験に疑問がある。
 - 過去 decision / memory / docs / ticket thread と矛盾しそうである。
-- coder Pod に渡す intent packet を短く書けない。
+- coder Pod に渡す intent packet で、binding decisions / invariants、implementation latitude、escalation conditions を区別して短く書けない。
 
-小さなバグ修正や仕様が明確な局所変更では、この Workflow は省略してよい。ただし省略理由が曖昧な場合は preflight する。
+小さなバグ修正や仕様が明確な局所変更では、この Workflow は省略してよい。ただし省略理由が曖昧な場合は preflight する。`needs_preflight: true` や risk flags は強い signal だが、missing boundary がすでに Ticket/thread の explicit human/Orchestrator decision で補われている場合は、その decision を binding として扱い、残る不確実性が実装 tactic に閉じているかを確認して実装へ進められる。
 
 ## Ticket 記録方針
 
@@ -52,7 +52,11 @@ yoi プロジェクトで ticket を実装に渡す前に、要件・前提・�
 
 ```text
 implementation-ready:
-- 要件・受け入れ条件・invariant が明確で、実装方針が一意または十分絞れている。
+- intent / constraints / acceptance criteria / reviewer judgment basis が明確。
+- binding decisions / invariants と implementation latitude が区別されている。
+- bounded implementation investigation や local tactic 選択は残っていてよい。
+- product / API / UX / authority boundary / explicit design constraint を coder が silently 決める余地がない。
+- validation と escalation conditions が明確。
 
 requirements-sync-needed:
 - ticket の目的は見えているが、仕様・用語・責務境界・ユーザー体験の同期が必要。
@@ -64,7 +68,7 @@ blocked-needs-human-decision:
 - 複数方針があり、AI が勝手に決めると設計境界や product API を固定してしまう。
 ```
 
-`implementation-ready` 以外は、coder Pod に実装を委譲しない。
+`implementation-ready` 以外は、coder Pod に実装を委譲しない。`implementation-ready` は full implementation plan ではなく、Orchestrator / coder / reviewer が同じ recorded intent と制約に基づいて判断できる状態である。
 
 ### 3. 要件同期
 
@@ -95,7 +99,7 @@ Current code map:
 
 ### 5. 批判的 preflight
 
-実装方針を一度疑う。以下の問いに答える。
+実装戦術の候補を一度疑う。以下の問いに答える。目的は tactic の固定ではなく、実装が product/API/authority/design-boundary decision を隠れて固定しないことを確認することである。
 
 - この ticket は本当に実装 ticket か、それとも仕様同期 ticket か。
 - 最も自然に見える実装が失敗するとしたらどこか。
@@ -116,17 +120,20 @@ Current code map:
 Intent:
 - 何を実現するか。
 
-Requirements:
-- observable な完了条件。
+Binding decisions / invariants:
+- 人間/Orchestrator/Ticket に記録済みで coder / reviewer が従うべき decision と、壊してはいけない authority boundary / design boundary。
 
-Invariants:
-- 壊してはいけない authority boundary / design boundary。
+Requirements / acceptance criteria:
+- observable な完了条件と reviewer が判断できる基準。
 
-Non-goals:
-- 今回やらないこと。
+Implementation latitude:
+- Coder が調査しながら選んでよい local tactic / file-local organization / bounded uncertainty。
+
+Non-goals / constraints:
+- 今回やらないこと、触ってはいけない場所。
 
 Escalate if:
-- 親/人間に戻す判断条件。
+- 親/人間に戻す判断条件。特に product / API / UX / authority boundary / explicit design constraint を変える必要が出た場合。
 
 Validation:
 - focused test / broader check / doctor / docs 更新。
@@ -134,15 +141,15 @@ Validation:
 Current code map:
 - 実装対象と触ってはいけない場所。
 
-Critical risks:
-- reviewer にも見てほしい失敗パターン。
+Critical risks / reviewer focus:
+- reviewer にも見てほしい失敗パターン。reviewer は recorded intent / constraints / acceptance criteria / explicit decisions に照らして判断し、不記録の preferred tactic を基準にしない。
 ```
 
 この intent packet が短く書けない場合は、実装委譲せず requirements-sync-needed とする。
 
 ## review への引き継ぎ
 
-preflight で出た critical risks は reviewer Pod にも渡す。reviewer は diff だけでなく、ticket の前提・要件・invariant と preflight の反証観点を読む。
+preflight で出た critical risks は reviewer Pod にも渡す。reviewer は diff だけでなく、ticket の recorded intent / constraints / acceptance criteria / explicit decisions と preflight の反証観点を読む。reviewer は不記録の preferred tactic ではなく、記録済みの意図・制約・受け入れ条件・binding decisions に対して実装が十分かを判断する。
 
 reviewer に期待すること:
 
