@@ -1,7 +1,7 @@
 ---
 id: 20260528-001748-compact-session-log-exploration
 slug: compact-session-log-exploration
-title: Compact: session log 探索型の要約入力に変更する
+title: 'Compact: session log 探索型の要約入力に変更する'
 status: closed
 kind: task
 priority: P2

@@ -1,7 +1,7 @@
 ---
 id: 20260604-223500-task-tools-builtin-plugin
 slug: task-tools-builtin-plugin
-title: Feature: extract Task tools as builtin module
+title: 'Feature: extract Task tools as builtin module'
 status: closed
 kind: task
 priority: P1

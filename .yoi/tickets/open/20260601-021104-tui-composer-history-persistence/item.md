@@ -1,7 +1,7 @@
 ---
 id: 20260601-021104-tui-composer-history-persistence
 slug: tui-composer-history-persistence
-title: TUI: persist composer input recall history per workspace
+title: 'TUI: persist composer input recall history per workspace'
 status: open
 kind: task
 priority: P2

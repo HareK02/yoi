@@ -1,7 +1,7 @@
 ---
 id: 20260527-000018-tui-user-model-setup
 slug: tui-user-model-setup
-title: TUI: ユーザーマニフェストのモデル設定 wizard
+title: 'TUI: ユーザーマニフェストのモデル設定 wizard'
 status: open
 kind: task
 priority: P2

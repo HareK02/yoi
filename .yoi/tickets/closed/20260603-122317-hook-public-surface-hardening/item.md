@@ -1,7 +1,7 @@
 ---
 id: 20260603-122317-hook-public-surface-hardening
 slug: hook-public-surface-hardening
-title: Hook: harden public hook surface before plugin exposure
+title: 'Hook: harden public hook surface before plugin exposure'
 status: closed
 kind: task
 priority: P1

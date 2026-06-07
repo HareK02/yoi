@@ -1,7 +1,7 @@
 ---
 id: 20260531-064550-rename-pod-command-crate-to-insomnia
 slug: rename-pod-command-crate-to-insomnia
-title: CLI: rename pod-command crate to insomnia
+title: 'CLI: rename pod-command crate to insomnia'
 status: closed
 kind: task
 priority: P2

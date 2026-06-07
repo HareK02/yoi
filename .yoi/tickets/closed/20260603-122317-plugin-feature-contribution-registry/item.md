@@ -1,7 +1,7 @@
 ---
 id: 20260603-122317-plugin-feature-contribution-registry
 slug: plugin-feature-contribution-registry
-title: Plugin: feature contribution registry for built-in and external capabilities
+title: 'Plugin: feature contribution registry for built-in and external capabilities'
 status: closed
 kind: feature
 priority: P1

@@ -1,7 +1,7 @@
 ---
 id: 20260601-132955-tui-peer-pod-handshake-command
 slug: tui-peer-pod-handshake-command
-title: TUI: add peer Pod handshake and messaging command
+title: 'TUI: add peer Pod handshake and messaging command'
 status: closed
 kind: task
 priority: P2

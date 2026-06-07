@@ -1,7 +1,7 @@
 ---
 id: 20260531-054728-remove-insomnia-pod-binary
 slug: remove-insomnia-pod-binary
-title: CLI: remove insomnia-pod installed/runtime alias
+title: 'CLI: remove insomnia-pod installed/runtime alias'
 status: closed
 kind: task
 priority: P2

@@ -1,7 +1,7 @@
 ---
 id: 20260531-005557-single-binary-insomnia-cli
 slug: single-binary-insomnia-cli
-title: CLI: migrate toward a single insomnia binary
+title: 'CLI: migrate toward a single insomnia binary'
 status: closed
 kind: task
 priority: P2

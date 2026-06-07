@@ -1,7 +1,7 @@
 ---
 id: 20260530-062852-refresh-stale-docs
 slug: refresh-stale-docs
-title: Docs: refresh stale architecture and operation docs
+title: 'Docs: refresh stale architecture and operation docs'
 status: closed
 kind: task
 priority: P2

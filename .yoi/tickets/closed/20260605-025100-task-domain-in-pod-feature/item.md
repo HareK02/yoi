@@ -1,7 +1,7 @@
 ---
 id: 20260605-025100-task-domain-in-pod-feature
 slug: task-domain-in-pod-feature
-title: Task: move Task domain out of tools into pod built-in feature
+title: 'Task: move Task domain out of tools into pod built-in feature'
 status: closed
 kind: task
 priority: P1

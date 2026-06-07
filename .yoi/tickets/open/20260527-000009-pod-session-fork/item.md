@@ -1,7 +1,7 @@
 ---
 id: 20260527-000009-pod-session-fork
 slug: pod-session-fork
-title: Pod: 任意ターンからの Fork（複数ターン巻き戻し）
+title: 'Pod: 任意ターンからの Fork（複数ターン巻き戻し）'
 status: open
 kind: task
 priority: P2

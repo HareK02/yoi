@@ -1,7 +1,7 @@
 ---
 id: 20260531-045034-spawn-through-insomnia-pod-subcommand
 slug: spawn-through-insomnia-pod-subcommand
-title: CLI: spawn Pods through insomnia pod runtime
+title: 'CLI: spawn Pods through insomnia pod runtime'
 status: closed
 kind: task
 priority: P2

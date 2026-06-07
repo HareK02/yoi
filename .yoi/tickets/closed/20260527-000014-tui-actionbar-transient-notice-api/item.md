@@ -1,7 +1,7 @@
 ---
 id: 20260527-000014-tui-actionbar-transient-notice-api
 slug: tui-actionbar-transient-notice-api
-title: TUI: actionbar transient notice API
+title: 'TUI: actionbar transient notice API'
 status: closed
 kind: task
 priority: P2

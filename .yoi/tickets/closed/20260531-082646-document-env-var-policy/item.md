@@ -1,7 +1,7 @@
 ---
 id: 20260531-082646-document-env-var-policy
 slug: document-env-var-policy
-title: Docs: document environment variable policy
+title: 'Docs: document environment variable policy'
 status: closed
 kind: task
 priority: P2

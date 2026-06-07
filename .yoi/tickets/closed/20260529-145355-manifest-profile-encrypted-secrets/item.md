@@ -1,7 +1,7 @@
 ---
 id: 20260529-145355-manifest-profile-encrypted-secrets
 slug: manifest-profile-encrypted-secrets
-title: Manifest/Profile: local key-value secret store
+title: 'Manifest/Profile: local key-value secret store'
 status: closed
 kind: feature
 priority: P2

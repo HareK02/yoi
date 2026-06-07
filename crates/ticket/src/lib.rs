@@ -12,6 +12,7 @@ use std::path::{Component, Path, PathBuf};
 
 use chrono::Utc;
 use fs4::fs_std::FileExt;
+use serde_yaml::{Mapping as YamlMapping, Value as YamlValue};
 use thiserror::Error;
 
 pub mod config;
@@ -789,7 +790,7 @@ impl LocalTicketBackend {
         let meta = ticket_meta(parsed.frontmatter.clone());
         let document = TicketDocument {
             body: MarkdownText::new(parsed.body),
-            raw_frontmatter: parsed.frontmatter,
+            raw_frontmatter: parsed.frontmatter.raw,
         };
         let thread_path = dir.join("thread.md");
         let events = if thread_path.exists() {
@@ -1021,33 +1022,52 @@ impl TicketBackend for LocalTicketBackend {
         fs::create_dir_all(dir.join("artifacts")).map_err(|e| io_err(&dir, e))?;
         atomic_write(&dir.join("artifacts/.gitkeep"), b"")?;
         let mut fields = Vec::new();
-        fields.push(("id".to_string(), id.clone()));
-        fields.push(("slug".to_string(), slug.clone()));
-        fields.push(("title".to_string(), input.title));
-        fields.push(("status".to_string(), "open".to_string()));
-        fields.push(("kind".to_string(), input.kind));
-        fields.push(("priority".to_string(), input.priority));
+        fields.push(("id".to_string(), format_yaml_string_scalar(&id)));
+        fields.push(("slug".to_string(), format_yaml_string_scalar(&slug)));
+        fields.push((
+            "title".to_string(),
+            format_yaml_string_scalar(input.title.as_str()),
+        ));
+        fields.push(("status".to_string(), format_yaml_string_scalar("open")));
+        fields.push((
+            "kind".to_string(),
+            format_yaml_string_scalar(input.kind.as_str()),
+        ));
+        fields.push((
+            "priority".to_string(),
+            format_yaml_string_scalar(input.priority.as_str()),
+        ));
         fields.push(("labels".to_string(), labels_yaml(&input.labels)));
         fields.push((
             "workflow_state".to_string(),
-            input
-                .workflow_state
-                .unwrap_or(TicketWorkflowState::Intake)
-                .as_str()
-                .to_string(),
+            format_yaml_string_scalar(
+                input
+                    .workflow_state
+                    .unwrap_or(TicketWorkflowState::Intake)
+                    .as_str(),
+            ),
         ));
-        fields.push(("created_at".to_string(), created.clone()));
-        fields.push(("updated_at".to_string(), created.clone()));
+        fields.push((
+            "created_at".to_string(),
+            format_yaml_string_scalar(&created),
+        ));
+        fields.push((
+            "updated_at".to_string(),
+            format_yaml_string_scalar(&created),
+        ));
         fields.push((
             "assignee".to_string(),
-            input.assignee.unwrap_or_else(|| "null".to_string()),
+            yaml_string_or_null(input.assignee.as_deref()),
         ));
         fields.push((
             "legacy_ticket".to_string(),
-            input.legacy_ticket.unwrap_or_else(|| "null".to_string()),
+            yaml_string_or_null(input.legacy_ticket.as_deref()),
         ));
         if let Some(readiness) = input.readiness {
-            fields.push(("readiness".to_string(), readiness));
+            fields.push((
+                "readiness".to_string(),
+                format_yaml_string_scalar(readiness.as_str()),
+            ));
         }
         if let Some(needs_preflight) = input.needs_preflight {
             fields.push(("needs_preflight".to_string(), needs_preflight.to_string()));
@@ -1056,16 +1076,28 @@ impl TicketBackend for LocalTicketBackend {
             fields.push(("risk_flags".to_string(), labels_yaml(&input.risk_flags)));
         }
         if let Some(action_required) = input.action_required {
-            fields.push(("action_required".to_string(), action_required));
+            fields.push((
+                "action_required".to_string(),
+                format_yaml_string_scalar(action_required.as_str()),
+            ));
         }
         if let Some(attention_required) = input.attention_required {
-            fields.push(("attention_required".to_string(), attention_required));
+            fields.push((
+                "attention_required".to_string(),
+                format_yaml_string_scalar(attention_required.as_str()),
+            ));
         }
         if let Some(queued_by) = input.queued_by {
-            fields.push(("queued_by".to_string(), queued_by));
+            fields.push((
+                "queued_by".to_string(),
+                format_yaml_string_scalar(queued_by.as_str()),
+            ));
         }
         if let Some(queued_at) = input.queued_at {
-            fields.push(("queued_at".to_string(), queued_at));
+            fields.push((
+                "queued_at".to_string(),
+                format_yaml_string_scalar(queued_at.as_str()),
+            ));
         }
         let item = serialize_item(&fields, input.body.as_str());
         atomic_write(&dir.join("item.md"), item.as_bytes())?;
@@ -1520,8 +1552,39 @@ impl Drop for BackendLock {
 
 #[derive(Debug, Clone)]
 struct ParsedItem {
-    frontmatter: BTreeMap<String, String>,
+    frontmatter: TicketItemFrontmatter,
     body: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct TicketItemFrontmatter {
+    id: Option<String>,
+    slug: Option<String>,
+    title: Option<String>,
+    status: Option<String>,
+    kind: Option<String>,
+    priority: Option<String>,
+    labels: Vec<String>,
+    created_at: Option<String>,
+    updated_at: Option<String>,
+    assignee: Option<String>,
+    legacy_ticket: Option<String>,
+    readiness: Option<String>,
+    needs_preflight: Option<bool>,
+    risk_flags: Vec<String>,
+    action_required: Option<String>,
+    workflow_state: Option<TicketWorkflowState>,
+    workflow_state_explicit: bool,
+    attention_required: Option<String>,
+    queued_by: Option<String>,
+    queued_at: Option<String>,
+    raw: BTreeMap<String, String>,
+}
+
+impl TicketItemFrontmatter {
+    fn get(&self, key: &str) -> Option<&String> {
+        self.raw.get(key)
+    }
 }
 
 fn read_item_file(path: &Path) -> Result<ParsedItem> {
@@ -1540,17 +1603,15 @@ fn parse_item(content: &str) -> std::result::Result<ParsedItem, String> {
     if first != "---" {
         return Err("item.md missing frontmatter opener".to_string());
     }
-    let mut frontmatter = BTreeMap::new();
     let mut found_close = false;
+    let mut frontmatter_lines = Vec::new();
     let mut body = String::new();
     for line in &mut lines {
         if line == "---" {
             found_close = true;
             break;
         }
-        if let Some((key, value)) = line.split_once(':') {
-            frontmatter.insert(key.trim().to_string(), value.trim_start().to_string());
-        }
+        frontmatter_lines.push(line);
     }
     if !found_close {
         return Err("item.md missing frontmatter closer".to_string());
@@ -1562,87 +1623,223 @@ fn parse_item(content: &str) -> std::result::Result<ParsedItem, String> {
             body.push('\n');
         }
     }
+    let frontmatter = parse_ticket_frontmatter(&frontmatter_lines.join("\n"))?;
     Ok(ParsedItem { frontmatter, body })
 }
 
-fn ticket_meta(frontmatter: BTreeMap<String, String>) -> TicketMeta {
-    let id = frontmatter.get("id").cloned().unwrap_or_default();
-    let slug = frontmatter.get("slug").cloned().unwrap_or_default();
-    let title = frontmatter.get("title").cloned().unwrap_or_default();
-    let status = frontmatter
-        .get("status")
-        .map(|value| ExtensibleTicketStatus::from(value.as_str()))
-        .unwrap_or_else(|| ExtensibleTicketStatus::Other(String::new()));
-    let kind = frontmatter.get("kind").cloned().unwrap_or_default();
-    let priority = frontmatter.get("priority").cloned().unwrap_or_default();
-    let labels = frontmatter
-        .get("labels")
-        .map(|value| parse_yaml_list(value))
-        .unwrap_or_default();
-    let risk_flags = frontmatter
-        .get("risk_flags")
-        .or_else(|| frontmatter.get("risks"))
-        .map(|value| parse_yaml_list(value))
-        .unwrap_or_default();
-    let workflow_state_explicit = frontmatter.contains_key("workflow_state");
-    let workflow_state = frontmatter
-        .get("workflow_state")
-        .and_then(|value| TicketWorkflowState::parse(value))
-        .unwrap_or_else(|| TicketWorkflowState::default_for_status(&status));
-    TicketMeta {
-        id,
-        slug,
-        title,
-        status,
-        kind,
-        priority,
-        labels,
-        created_at: frontmatter.get("created_at").cloned(),
-        updated_at: frontmatter.get("updated_at").cloned(),
-        assignee: frontmatter.get("assignee").cloned().filter(|v| v != "null"),
-        legacy_ticket: frontmatter
-            .get("legacy_ticket")
-            .cloned()
-            .filter(|v| v != "null"),
-        readiness: frontmatter.get("readiness").cloned(),
-        needs_preflight: frontmatter
-            .get("needs_preflight")
-            .or_else(|| frontmatter.get("needs-preflight"))
-            .and_then(|value| parse_bool(value)),
-        risk_flags,
-        action_required: frontmatter.get("action_required").cloned(),
+fn parse_ticket_frontmatter(content: &str) -> std::result::Result<TicketItemFrontmatter, String> {
+    let value: YamlValue =
+        serde_yaml::from_str(content).map_err(|err| format!("invalid YAML frontmatter: {err}"))?;
+    let mapping = match value {
+        YamlValue::Mapping(mapping) => mapping,
+        YamlValue::Null => YamlMapping::new(),
+        other => {
+            return Err(format!(
+                "frontmatter must be a YAML mapping, found {}",
+                yaml_kind(&other)
+            ));
+        }
+    };
+
+    let mut raw = BTreeMap::new();
+    for (key, value) in &mapping {
+        let YamlValue::String(key) = key else {
+            return Err("frontmatter keys must be strings".to_string());
+        };
+        raw.insert(key.clone(), raw_frontmatter_value(value)?);
+    }
+
+    let workflow_state_explicit = mapping.contains_key(YamlValue::String("workflow_state".into()));
+    let workflow_state_value = yaml_string(&mapping, "workflow_state")?;
+    let workflow_state = match workflow_state_value.as_deref() {
+        Some(value) => Some(TicketWorkflowState::parse(value).ok_or_else(|| {
+            format!("invalid workflow_state '{value}': expected intake, ready, queued, inprogress, or done")
+        })?),
+        None => None,
+    };
+
+    Ok(TicketItemFrontmatter {
+        id: yaml_string(&mapping, "id")?,
+        slug: yaml_string(&mapping, "slug")?,
+        title: yaml_string(&mapping, "title")?,
+        status: yaml_string(&mapping, "status")?,
+        kind: yaml_string(&mapping, "kind")?,
+        priority: yaml_string(&mapping, "priority")?,
+        labels: yaml_string_list(&mapping, "labels")?,
+        created_at: yaml_string(&mapping, "created_at")?,
+        updated_at: yaml_string(&mapping, "updated_at")?,
+        assignee: yaml_string(&mapping, "assignee")?,
+        legacy_ticket: yaml_string(&mapping, "legacy_ticket")?,
+        readiness: yaml_string(&mapping, "readiness")?,
+        needs_preflight: yaml_bool(&mapping, "needs_preflight")?,
+        risk_flags: yaml_string_list(&mapping, "risk_flags")?,
+        action_required: yaml_string(&mapping, "action_required")?,
         workflow_state,
         workflow_state_explicit,
-        attention_required: frontmatter.get("attention_required").cloned(),
-        queued_by: frontmatter.get("queued_by").cloned(),
-        queued_at: frontmatter.get("queued_at").cloned(),
-        raw: frontmatter,
+        attention_required: yaml_string(&mapping, "attention_required")?,
+        queued_by: yaml_string(&mapping, "queued_by")?,
+        queued_at: yaml_string(&mapping, "queued_at")?,
+        raw,
+    })
+}
+
+fn yaml_key(key: &str) -> YamlValue {
+    YamlValue::String(key.to_string())
+}
+
+fn yaml_get<'a>(mapping: &'a YamlMapping, key: &str) -> Option<&'a YamlValue> {
+    mapping.get(yaml_key(key))
+}
+
+fn yaml_string(mapping: &YamlMapping, key: &str) -> std::result::Result<Option<String>, String> {
+    match yaml_get(mapping, key) {
+        Some(YamlValue::Null) | None => Ok(None),
+        Some(YamlValue::String(value)) => Ok(Some(value.clone())),
+        Some(value) => Err(format!(
+            "frontmatter field `{key}` must be a YAML string or null, found {}",
+            yaml_kind(value)
+        )),
     }
 }
 
-fn parse_bool(value: &str) -> Option<bool> {
-    match value.trim() {
-        "true" | "yes" | "1" => Some(true),
-        "false" | "no" | "0" => Some(false),
-        _ => None,
+fn yaml_bool(mapping: &YamlMapping, key: &str) -> std::result::Result<Option<bool>, String> {
+    match yaml_get(mapping, key) {
+        Some(YamlValue::Null) | None => Ok(None),
+        Some(YamlValue::Bool(value)) => Ok(Some(*value)),
+        Some(value) => Err(format!(
+            "frontmatter field `{key}` must be a YAML boolean or null, found {}",
+            yaml_kind(value)
+        )),
     }
 }
 
-fn parse_yaml_list(value: &str) -> Vec<String> {
-    let trimmed = value.trim();
-    if let Some(inner) = trimmed.strip_prefix('[').and_then(|v| v.strip_suffix(']')) {
-        return inner
-            .split(',')
-            .map(|part| part.trim().trim_matches('"').trim_matches('\''))
-            .filter(|part| !part.is_empty())
-            .map(ToOwned::to_owned)
-            .collect();
+fn yaml_string_list(mapping: &YamlMapping, key: &str) -> std::result::Result<Vec<String>, String> {
+    match yaml_get(mapping, key) {
+        Some(YamlValue::Null) | None => Ok(Vec::new()),
+        Some(YamlValue::Sequence(values)) => values
+            .iter()
+            .enumerate()
+            .map(|(idx, value)| match value {
+                YamlValue::String(value) => Ok(value.clone()),
+                other => Err(format!(
+                    "frontmatter field `{key}` item {idx} must be a YAML string, found {}",
+                    yaml_kind(other)
+                )),
+            })
+            .collect(),
+        Some(value) => Err(format!(
+            "frontmatter field `{key}` must be a YAML sequence or null, found {}",
+            yaml_kind(value)
+        )),
     }
-    if trimmed.is_empty() || trimmed == "null" {
-        Vec::new()
-    } else {
-        vec![trimmed.to_string()]
+}
+
+fn raw_frontmatter_value(value: &YamlValue) -> std::result::Result<String, String> {
+    match value {
+        YamlValue::Null => Ok("null".to_string()),
+        YamlValue::Bool(value) => Ok(value.to_string()),
+        YamlValue::Number(value) => Ok(value.to_string()),
+        YamlValue::String(value) => Ok(value.clone()),
+        YamlValue::Sequence(values) => values
+            .iter()
+            .map(|value| match value {
+                YamlValue::String(value) => Ok(format_yaml_string_scalar(value)),
+                other => Err(format!(
+                    "frontmatter sequence values must be strings, found {}",
+                    yaml_kind(other)
+                )),
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map(|values| format!("[{}]", values.join(", "))),
+        YamlValue::Mapping(_) => Err("frontmatter nested mappings are not supported".to_string()),
+        YamlValue::Tagged(tagged) => raw_frontmatter_value(&tagged.value),
     }
+}
+
+fn yaml_kind(value: &YamlValue) -> &'static str {
+    match value {
+        YamlValue::Null => "null",
+        YamlValue::Bool(_) => "boolean",
+        YamlValue::Number(_) => "number",
+        YamlValue::String(_) => "string",
+        YamlValue::Sequence(_) => "sequence",
+        YamlValue::Mapping(_) => "mapping",
+        YamlValue::Tagged(_) => "tagged value",
+    }
+}
+
+fn ticket_meta(frontmatter: TicketItemFrontmatter) -> TicketMeta {
+    let status = frontmatter
+        .status
+        .as_deref()
+        .map(ExtensibleTicketStatus::from)
+        .unwrap_or_else(|| ExtensibleTicketStatus::Other(String::new()));
+    let workflow_state = frontmatter
+        .workflow_state
+        .unwrap_or_else(|| TicketWorkflowState::default_for_status(&status));
+    TicketMeta {
+        id: frontmatter.id.unwrap_or_default(),
+        slug: frontmatter.slug.unwrap_or_default(),
+        title: frontmatter.title.unwrap_or_default(),
+        status,
+        kind: frontmatter.kind.unwrap_or_default(),
+        priority: frontmatter.priority.unwrap_or_default(),
+        labels: frontmatter.labels,
+        created_at: frontmatter.created_at,
+        updated_at: frontmatter.updated_at,
+        assignee: frontmatter.assignee,
+        legacy_ticket: frontmatter.legacy_ticket,
+        readiness: frontmatter.readiness,
+        needs_preflight: frontmatter.needs_preflight,
+        risk_flags: frontmatter.risk_flags,
+        action_required: frontmatter.action_required,
+        workflow_state,
+        workflow_state_explicit: frontmatter.workflow_state_explicit,
+        attention_required: frontmatter.attention_required,
+        queued_by: frontmatter.queued_by,
+        queued_at: frontmatter.queued_at,
+        raw: frontmatter.raw,
+    }
+}
+
+fn format_yaml_string_scalar(value: &str) -> String {
+    let reserved = matches!(
+        value,
+        "" | "null"
+            | "Null"
+            | "NULL"
+            | "~"
+            | "true"
+            | "True"
+            | "TRUE"
+            | "false"
+            | "False"
+            | "FALSE"
+    );
+    let plain_safe = !reserved
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '/' | '.'));
+    if plain_safe {
+        return value.to_string();
+    }
+
+    let mut out = String::from("'");
+    for ch in value.chars() {
+        if ch == '\'' {
+            out.push_str("''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+fn yaml_string_or_null(value: Option<&str>) -> String {
+    value
+        .map(format_yaml_string_scalar)
+        .unwrap_or_else(|| "null".to_string())
 }
 
 fn labels_yaml(labels: &[String]) -> String {
@@ -1655,6 +1852,7 @@ fn labels_yaml(labels: &[String]) -> String {
             .iter()
             .map(|label| label.trim())
             .filter(|label| !label.is_empty())
+            .map(format_yaml_string_scalar)
             .collect::<Vec<_>>()
             .join(", ")
     )
@@ -1697,7 +1895,7 @@ fn replace_frontmatter_fields(
         if let Some((key, _)) = line.split_once(':') {
             let key = key.trim().to_string();
             if let Some((_, value)) = updates.iter().find(|(update_key, _)| *update_key == key) {
-                *line = format!("{key}: {value}");
+                *line = format!("{key}: {}", format_yaml_string_scalar(value));
                 seen.insert(key);
             }
         }
@@ -1705,7 +1903,10 @@ fn replace_frontmatter_fields(
     let mut insert_at = end;
     for (key, value) in updates {
         if !seen.contains(*key) {
-            lines.insert(insert_at, format!("{key}: {value}"));
+            lines.insert(
+                insert_at,
+                format!("{key}: {}", format_yaml_string_scalar(value)),
+            );
             insert_at += 1;
         }
     }
@@ -2238,6 +2439,63 @@ queued_at: 2026-06-05T00:01:00Z
     }
 
     #[test]
+    fn yaml_frontmatter_preserves_typed_nulls_lists_bools_and_quoted_strings() {
+        let frontmatter = parse_ticket_frontmatter(
+            r#"labels:
+  - ticket
+  - backend
+risk_flags: [low, local]
+assignee: ~
+legacy_ticket:
+attention_required: null
+action_required: "null"
+readiness: "~"
+needs_preflight: false
+workflow_state: intake
+"#,
+        )
+        .unwrap();
+        let meta = ticket_meta(frontmatter);
+        assert_eq!(meta.labels, vec!["ticket", "backend"]);
+        assert_eq!(meta.risk_flags, vec!["low", "local"]);
+        assert_eq!(meta.assignee, None);
+        assert_eq!(meta.legacy_ticket, None);
+        assert_eq!(meta.attention_required, None);
+        assert_eq!(meta.action_required.as_deref(), Some("null"));
+        assert_eq!(meta.readiness.as_deref(), Some("~"));
+        assert_eq!(meta.needs_preflight, Some(false));
+        assert_eq!(meta.workflow_state, TicketWorkflowState::Intake);
+        assert!(meta.workflow_state_explicit);
+    }
+
+    #[test]
+    fn yaml_frontmatter_rejects_legacy_raw_string_fallbacks() {
+        let labels_error = parse_ticket_frontmatter("labels: ticket").unwrap_err();
+        assert!(
+            labels_error.contains("must be a YAML sequence"),
+            "{labels_error}"
+        );
+
+        let bool_error = parse_ticket_frontmatter("needs_preflight: 1").unwrap_err();
+        assert!(
+            bool_error.contains("must be a YAML boolean"),
+            "{bool_error}"
+        );
+
+        let workflow_error = parse_ticket_frontmatter("workflow_state: almost").unwrap_err();
+        assert!(
+            workflow_error.contains("invalid workflow_state"),
+            "{workflow_error}"
+        );
+    }
+
+    #[test]
+    fn yaml_frontmatter_rejects_invalid_yaml() {
+        let err = parse_ticket_frontmatter("labels: [ticket").unwrap_err();
+        assert!(err.contains("invalid YAML frontmatter"), "{err}");
+    }
+
+    #[test]
     fn create_writes_local_ticket_layout() {
         let tmp = TempDir::new().unwrap();
         let backend = backend(&tmp);
@@ -2468,15 +2726,14 @@ queued_at: 2026-06-05T00:01:00Z
     fn workflow_state_defaults_and_queue_transition_round_trip() {
         let tmp = TempDir::new().unwrap();
         let backend = backend(&tmp);
-        let mut missing_frontmatter = BTreeMap::new();
-        missing_frontmatter.insert("status".to_string(), "open".to_string());
-        let missing_meta = ticket_meta(missing_frontmatter);
+        let missing_meta = ticket_meta(
+            parse_ticket_frontmatter("status: open").expect("missing workflow state parses"),
+        );
         assert_eq!(missing_meta.workflow_state, TicketWorkflowState::Intake);
         assert!(!missing_meta.workflow_state_explicit);
 
-        let mut closed_frontmatter = BTreeMap::new();
-        closed_frontmatter.insert("status".to_string(), "closed".to_string());
-        let closed_meta = ticket_meta(closed_frontmatter);
+        let closed_meta =
+            ticket_meta(parse_ticket_frontmatter("status: closed").expect("closed default parses"));
         assert_eq!(closed_meta.workflow_state, TicketWorkflowState::Done);
         assert!(!closed_meta.workflow_state_explicit);
 

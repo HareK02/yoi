@@ -1140,6 +1140,46 @@ mod tests {
     }
 
     #[test]
+    fn workspace_panel_treats_yaml_null_attention_required_as_unblocked_intake() {
+        let temp = TempDir::new().unwrap();
+        write_ticket_config(temp.path());
+        let backend = LocalTicketBackend::new(temp.path().join(".yoi/tickets"));
+        let ticket_ref = backend
+            .create({
+                let mut input = NewTicket::new("Null Attention Intake");
+                input.slug = Some("null-attention-intake".to_string());
+                input.workflow_state = Some(TicketWorkflowState::Intake);
+                input
+            })
+            .unwrap();
+        let item_path = temp
+            .path()
+            .join(".yoi/tickets/open")
+            .join(&ticket_ref.id)
+            .join("item.md");
+        let item = fs::read_to_string(&item_path).unwrap();
+        fs::write(
+            &item_path,
+            item.replace(
+                "workflow_state: intake\ncreated_at:",
+                "workflow_state: intake\nattention_required: null\ncreated_at:",
+            ),
+        )
+        .unwrap();
+
+        let model = build_workspace_panel(temp.path(), &empty_pods());
+        let row = model
+            .rows
+            .iter()
+            .find(|row| row.title == "Null Attention Intake")
+            .unwrap();
+
+        assert_eq!(row.status, "intake");
+        assert_eq!(row.next_action, Some(NextUserAction::Clarify));
+        assert_eq!(row.priority, ActionPriority::Background);
+    }
+
+    #[test]
     fn workspace_panel_defaults_missing_open_state_to_intake_and_displays_done_state() {
         let temp = TempDir::new().unwrap();
         write_ticket_config(temp.path());

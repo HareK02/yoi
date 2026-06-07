@@ -1,7 +1,7 @@
 ---
 id: 20260527-000016-tui-picker-live-pending-pods
 slug: tui-picker-live-pending-pods
-title: TUI picker: live pending Pod の表示優先と状態補完
+title: 'TUI picker: live pending Pod の表示優先と状態補完'
 status: closed
 kind: task
 priority: P2

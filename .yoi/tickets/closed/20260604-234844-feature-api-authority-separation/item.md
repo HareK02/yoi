@@ -1,7 +1,7 @@
 ---
 id: 20260604-234844-feature-api-authority-separation
 slug: feature-api-authority-separation
-title: Feature API: separate internal modules from external-plugin authority model
+title: 'Feature API: separate internal modules from external-plugin authority model'
 status: closed
 kind: task
 priority: P1

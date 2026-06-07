@@ -1,7 +1,7 @@
 ---
 id: 20260527-000015-tui-navigation-mode-design
 slug: tui-navigation-mode-design
-title: TUI: navigation mode / block focus の設計
+title: 'TUI: navigation mode / block focus の設計'
 status: open
 kind: task
 priority: P2

@@ -1,7 +1,7 @@
 ---
 id: 20260531-010005-plugin-extension-surface
 slug: plugin-extension-surface
-title: Plugin: define extension surface for hooks and tools
+title: 'Plugin: define extension surface for hooks and tools'
 status: open
 kind: feature
 priority: P2

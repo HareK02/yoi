@@ -1,7 +1,7 @@
 ---
 id: 20260531-085959-eliminate-test-only-env-vars
 slug: eliminate-test-only-env-vars
-title: Tests: eliminate test-only environment variables
+title: 'Tests: eliminate test-only environment variables'
 status: closed
 kind: task
 priority: P2

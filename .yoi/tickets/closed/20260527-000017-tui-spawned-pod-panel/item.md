@@ -1,7 +1,7 @@
 ---
 id: 20260527-000017-tui-spawned-pod-panel
 slug: tui-spawned-pod-panel
-title: TUI: spawned child Pod の一覧と一時 attach
+title: 'TUI: spawned child Pod の一覧と一時 attach'
 status: closed
 kind: task
 priority: P2

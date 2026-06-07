@@ -1,7 +1,7 @@
 ---
 id: 20260530-215928-webfetch-local-reader-markdown
 slug: webfetch-local-reader-markdown
-title: WebFetch: replace readability dependency with Markdown-preserving local reader
+title: 'WebFetch: replace readability dependency with Markdown-preserving local reader'
 status: closed
 kind: task
 priority: P2

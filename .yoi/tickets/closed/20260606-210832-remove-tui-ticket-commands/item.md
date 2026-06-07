@@ -1,7 +1,7 @@
 ---
 id: 20260606-210832-remove-tui-ticket-commands
 slug: remove-tui-ticket-commands
-title: Remove obsolete TUI :ticket commands
+title: 'Remove obsolete TUI :ticket commands'
 status: closed
 kind: task
 priority: P2
