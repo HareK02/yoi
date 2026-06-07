@@ -4,11 +4,11 @@ slug: workspace-panel-companion-interface
 title: Workspace panel Companion interface
 status: open
 kind: task
-priority: P1
+priority: P2
 labels: [tui, panel, companion, orchestration]
 workflow_state: intake
 created_at: 2026-06-07T00:16:51Z
-updated_at: 2026-06-07T02:02:21Z
+updated_at: 2026-06-07T03:13:01Z
 assignee: null
 legacy_ticket: null
 ---

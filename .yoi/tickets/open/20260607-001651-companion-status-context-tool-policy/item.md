@@ -4,7 +4,7 @@ slug: companion-status-context-tool-policy
 title: Companion status context and tool policy
 status: open
 kind: task
-priority: P1
+priority: P2
 labels: [companion, profile, prompt, tools, panel]
 workflow_state: intake
 created_at: 2026-06-07T00:16:51Z

@@ -63,3 +63,15 @@ This follow-up fixes the intended `queued` semantics:
 This remains separate from Companion lifecycle and local role/session registry work, but may consume the registry once available to avoid duplicate ownership.
 
 ---
+
+<!-- event: decision author: hare at: 2026-06-07T03:13:01Z -->
+
+## Decision
+
+## Priority adjustment
+
+Companion work is useful but not required for near-term panel operation. The panel can still be used by manually attaching/opening Pods, and the direct selected-Pod send path has already been removed.
+
+Decision: downgrade Companion-related follow-up priority to P2 so near-term focus can stay on Ticket role config strictness/init, Orchestrator queue automation, and workflow/compaction reliability.
+
+---

@@ -4,7 +4,7 @@ slug: workspace-panel-companion-pod-lifecycle
 title: Workspace panel Companion Pod lifecycle
 status: open
 kind: task
-priority: P1
+priority: P2
 labels: [tui, panel, companion, pod]
 workflow_state: intake
 created_at: 2026-06-07T00:16:51Z
