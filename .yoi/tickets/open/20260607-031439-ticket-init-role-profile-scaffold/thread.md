@@ -75,3 +75,22 @@ Ticket intake complete; workflow_state intake -> ready.
 
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-06-07T03:44:16Z -->
+
+## Implementation report
+
+## Delegation
+
+Implementation delegated to child Pod `ticket-init-scaffold-coder-20260607` in worktree `.worktree/ticket-init-role-profile-scaffold` on branch `work/ticket-init-role-profile-scaffold`.
+
+Scope:
+- Add a narrow `yoi ticket init` scaffold command.
+- Generate explicit backend and fixed role profile/workflow config in `.yoi/ticket.config.toml`.
+- Use concrete role profiles in the generated config; explicit `builtin:default` is acceptable for the first pass.
+- Do not loosen strict role launch validation or add runtime fallback.
+- Do not overwrite existing config in the first pass.
+
+The child should commit implementation work in the child worktree and report diff/tests. Merge, review, Ticket closure, and cleanup remain with the parent/human workflow.
+
+---
