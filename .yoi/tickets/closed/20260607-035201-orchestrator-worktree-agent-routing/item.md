@@ -2,13 +2,13 @@
 id: 20260607-035201-orchestrator-worktree-agent-routing
 slug: orchestrator-worktree-agent-routing
 title: Orchestrator worktree agent routing
-status: open
+status: closed
 kind: task
 priority: P1
 labels: [orchestrator, worktree, pod, review, workflow]
-workflow_state: ready
+workflow_state: done
 created_at: 2026-06-07T03:52:01Z
-updated_at: 2026-06-07T05:55:11Z
+updated_at: 2026-06-07T05:55:57Z
 assignee: null
 legacy_ticket: null
 ---
