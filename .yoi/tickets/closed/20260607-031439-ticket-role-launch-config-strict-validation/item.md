@@ -2,13 +2,13 @@
 id: 20260607-031439-ticket-role-launch-config-strict-validation
 slug: ticket-role-launch-config-strict-validation
 title: Strictly validate Ticket role launch config
-status: open
+status: closed
 kind: task
 priority: P1
 labels: [ticket, config, validation, panel, profiles]
-workflow_state: ready
+workflow_state: done
 created_at: 2026-06-07T03:14:39Z
-updated_at: 2026-06-07T03:42:05Z
+updated_at: 2026-06-07T03:42:39Z
 assignee: null
 legacy_ticket: null
 ---
