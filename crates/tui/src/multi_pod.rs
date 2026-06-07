@@ -383,6 +383,7 @@ pub(crate) struct MultiPodApp {
     notice: Option<String>,
     sending: bool,
     runtime_command: PodRuntimeCommand,
+    last_orchestrator_lifecycle_failure: Option<OrchestratorPanelState>,
 }
 
 impl MultiPodApp {
@@ -397,6 +398,8 @@ impl MultiPodApp {
             },
         )
         .await?;
+        let last_orchestrator_lifecycle_failure =
+            orchestrator_lifecycle_failure_from_panel(&snapshot.panel);
         let mut app = Self {
             list: snapshot.list,
             panel: snapshot.panel,
@@ -406,6 +409,7 @@ impl MultiPodApp {
             notice: None,
             sending: false,
             runtime_command,
+            last_orchestrator_lifecycle_failure,
         };
         app.ensure_selection_visible();
         app.ensure_composer_target_available();
@@ -439,6 +443,7 @@ impl MultiPodApp {
     }
 
     fn apply_reloaded_snapshot(&mut self, mut snapshot: MultiPodSnapshot) {
+        self.apply_orchestrator_lifecycle_memory(&mut snapshot.panel);
         let previous_selected_pod = self.list.selected_name.clone();
         snapshot.list.selected_name = previous_selected_pod
             .filter(|name| {
@@ -461,6 +466,35 @@ impl MultiPodApp {
         self.selected_row = previous_row.filter(|key| self.panel.row(key).is_some());
         self.ensure_selection_visible();
         self.ensure_composer_target_available();
+    }
+
+    fn apply_orchestrator_lifecycle_memory(&mut self, panel: &mut WorkspacePanelViewModel) {
+        let Some(state) = panel.header.orchestrator.as_ref() else {
+            self.last_orchestrator_lifecycle_failure = None;
+            return;
+        };
+
+        match state.status {
+            OrchestratorPanelStatus::Unavailable => {
+                self.last_orchestrator_lifecycle_failure =
+                    orchestrator_lifecycle_failure_from_panel(panel);
+            }
+            OrchestratorPanelStatus::Live
+            | OrchestratorPanelStatus::Spawned
+            | OrchestratorPanelStatus::Restored => {
+                self.last_orchestrator_lifecycle_failure = None;
+            }
+            OrchestratorPanelStatus::Missing | OrchestratorPanelStatus::Stopped => {
+                if let Some(previous) = self.last_orchestrator_lifecycle_failure.clone() {
+                    if previous.pod_name == state.pod_name {
+                        panel.header.orchestrator = Some(previous.clone());
+                        append_unique_diagnostic(panel, previous.detail.as_deref());
+                    } else {
+                        self.last_orchestrator_lifecycle_failure = None;
+                    }
+                }
+            }
+        }
     }
 
     fn selected_panel_row(&self) -> Option<&PanelRow> {
@@ -1038,6 +1072,31 @@ enum MultiPodAction {
 struct MultiPodSnapshot {
     list: PodList,
     panel: WorkspacePanelViewModel,
+}
+
+fn orchestrator_lifecycle_failure_from_panel(
+    panel: &WorkspacePanelViewModel,
+) -> Option<OrchestratorPanelState> {
+    let state = panel.header.orchestrator.as_ref()?;
+    if state.status == OrchestratorPanelStatus::Unavailable && state.detail.is_some() {
+        Some(state.clone())
+    } else {
+        None
+    }
+}
+
+fn append_unique_diagnostic(panel: &mut WorkspacePanelViewModel, diagnostic: Option<&str>) {
+    let Some(diagnostic) = diagnostic else {
+        return;
+    };
+    if !panel
+        .header
+        .diagnostics
+        .iter()
+        .any(|existing| existing == diagnostic)
+    {
+        panel.header.diagnostics.push(diagnostic.to_string());
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2814,6 +2873,117 @@ mod tests {
         assert!(notice.contains("boom"));
     }
 
+    #[test]
+    fn multi_orchestrator_failure_persists_over_plain_observe_missing() {
+        let detail =
+            "could not spawn workspace Orchestrator: delegated scope conflicts with writer";
+        let mut app = app_with_panel(
+            empty_test_list(),
+            panel_with_orchestrator(OrchestratorPanelStatus::Unavailable, Some(detail)),
+        );
+
+        app.apply_reloaded_snapshot(MultiPodSnapshot {
+            list: empty_test_list(),
+            panel: panel_with_orchestrator(OrchestratorPanelStatus::Missing, None),
+        });
+
+        let orchestrator = app.panel.header.orchestrator.as_ref().unwrap();
+        assert_eq!(orchestrator.status, OrchestratorPanelStatus::Unavailable);
+        assert_eq!(orchestrator.detail.as_deref(), Some(detail));
+        assert_eq!(
+            app.panel
+                .header
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.as_str() == detail)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn multi_orchestrator_plain_missing_remains_when_no_prior_failure_exists() {
+        let mut app = app_with_panel(
+            empty_test_list(),
+            panel_with_orchestrator(OrchestratorPanelStatus::Missing, None),
+        );
+
+        app.apply_reloaded_snapshot(MultiPodSnapshot {
+            list: empty_test_list(),
+            panel: panel_with_orchestrator(OrchestratorPanelStatus::Missing, None),
+        });
+
+        let orchestrator = app.panel.header.orchestrator.as_ref().unwrap();
+        assert_eq!(orchestrator.status, OrchestratorPanelStatus::Missing);
+        assert!(orchestrator.detail.is_none());
+        assert!(app.panel.header.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn multi_orchestrator_failure_clears_after_live_lifecycle() {
+        let detail =
+            "could not spawn workspace Orchestrator: delegated scope conflicts with writer";
+        let mut app = app_with_panel(
+            empty_test_list(),
+            panel_with_orchestrator(OrchestratorPanelStatus::Unavailable, Some(detail)),
+        );
+
+        app.apply_reloaded_snapshot(MultiPodSnapshot {
+            list: empty_test_list(),
+            panel: panel_with_orchestrator(OrchestratorPanelStatus::Live, None),
+        });
+        assert_eq!(
+            app.panel.header.orchestrator.as_ref().unwrap().status,
+            OrchestratorPanelStatus::Live
+        );
+
+        app.apply_reloaded_snapshot(MultiPodSnapshot {
+            list: empty_test_list(),
+            panel: panel_with_orchestrator(OrchestratorPanelStatus::Missing, None),
+        });
+
+        let orchestrator = app.panel.header.orchestrator.as_ref().unwrap();
+        assert_eq!(orchestrator.status, OrchestratorPanelStatus::Missing);
+        assert!(orchestrator.detail.is_none());
+    }
+
+    #[test]
+    fn multi_orchestrator_failure_supersedes_prior_failure() {
+        let old_detail = "could not spawn workspace Orchestrator: old scope conflict";
+        let new_detail = "could not restore workspace Orchestrator: socket refused";
+        let mut app = app_with_panel(
+            empty_test_list(),
+            panel_with_orchestrator(OrchestratorPanelStatus::Unavailable, Some(old_detail)),
+        );
+
+        app.apply_reloaded_snapshot(MultiPodSnapshot {
+            list: empty_test_list(),
+            panel: panel_with_orchestrator(OrchestratorPanelStatus::Unavailable, Some(new_detail)),
+        });
+        app.apply_reloaded_snapshot(MultiPodSnapshot {
+            list: empty_test_list(),
+            panel: panel_with_orchestrator(OrchestratorPanelStatus::Missing, None),
+        });
+
+        let orchestrator = app.panel.header.orchestrator.as_ref().unwrap();
+        assert_eq!(orchestrator.status, OrchestratorPanelStatus::Unavailable);
+        assert_eq!(orchestrator.detail.as_deref(), Some(new_detail));
+        assert!(
+            !app.panel
+                .header
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic == old_detail)
+        );
+        assert!(
+            app.panel
+                .header
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic == new_detail)
+        );
+    }
+
     #[tokio::test]
     async fn multi_poll_reload_does_not_overlap_in_flight_reload() {
         let mut app = test_app(vec![live_info("alpha", PodStatus::Idle)]);
@@ -3567,7 +3737,28 @@ mod tests {
         app_with_panel(list, WorkspacePanelViewModel::empty(Path::new("test")))
     }
 
+    fn empty_test_list() -> PodList {
+        PodList::from_sources(PodVisibilitySource::ResumePicker, vec![], vec![], None, 10)
+    }
+
+    fn panel_with_orchestrator(
+        status: OrchestratorPanelStatus,
+        detail: Option<&str>,
+    ) -> WorkspacePanelViewModel {
+        let mut panel = WorkspacePanelViewModel::empty(Path::new("test"));
+        panel.header.orchestrator = Some(OrchestratorPanelState::new(
+            "test-orchestrator",
+            status,
+            detail.map(str::to_string),
+        ));
+        if let Some(detail) = detail {
+            panel.header.diagnostics.push(detail.to_string());
+        }
+        panel
+    }
+
     fn app_with_panel(list: PodList, panel: WorkspacePanelViewModel) -> MultiPodApp {
+        let last_orchestrator_lifecycle_failure = orchestrator_lifecycle_failure_from_panel(&panel);
         let mut app = MultiPodApp {
             list,
             panel,
@@ -3577,6 +3768,7 @@ mod tests {
             notice: None,
             sending: false,
             runtime_command: PodRuntimeCommand::for_executable("/tmp/yoi"),
+            last_orchestrator_lifecycle_failure,
         };
         app.ensure_selection_visible();
         app.ensure_composer_target_available();
