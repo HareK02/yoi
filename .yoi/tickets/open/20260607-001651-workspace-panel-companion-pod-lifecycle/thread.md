@@ -117,3 +117,49 @@ Requested validation:
 
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-06-07T10:40:36Z -->
+
+## Implementation report
+
+## Implementation report
+
+Coder Pod `companion-lifecycle-coder-20260607` completed implementation in `.worktree/workspace-panel-companion-pod-lifecycle`.
+
+Commit:
+- `ba0c9d5 feat: wire panel companion lifecycle`
+
+Reported summary:
+- Added real workspace Companion Pod lifecycle for `yoi panel`.
+  - Companion Pod name is resolved from workspace basename, with no `-companion` suffix.
+  - Live Pods are reused, restorable Pods are restored, missing Pods are spawned through normal default/Companion profile startup.
+  - Panel close does not stop Companion.
+- Wired `Companion` composer submit to the workspace Companion Pod via `Method::Run`.
+  - It no longer routes to arbitrary selected Pods.
+  - Empty composer behavior still preserves selected-Pod open/attach behavior.
+  - Busy/unavailable Companion states keep the draft and surface bounded diagnostics.
+- Kept Ticket Intake separate.
+  - Ticket Intake target still launches Intake handoff and does not append to Companion history.
+- Added focused tests for Companion naming, lifecycle decisions, no-Ticket Companion availability, composer routing, and Intake separation.
+
+Changed files:
+- `crates/tui/src/multi_pod.rs`
+- `crates/tui/src/workspace_panel.rs`
+
+Reported validation:
+- `cargo test -p tui companion --lib`
+- `cargo test -p tui multi_pod --lib`
+- `cargo test -p tui workspace_panel --lib`
+- `cargo test -p tui --lib`
+- `cargo fmt --check`
+- `git diff --check`
+- `nix build .#yoi`
+- `result/bin/yoi ticket doctor`
+
+Caveat:
+- `target/debug/yoi` was not used for `ticket doctor`; coder used the Nix-built `result/bin/yoi` after `nix build .#yoi`.
+
+External review will be delegated before merge.
+
+
+---

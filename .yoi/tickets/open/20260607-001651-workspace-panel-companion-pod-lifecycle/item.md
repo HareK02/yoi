@@ -8,7 +8,7 @@ priority: P2
 labels: [tui, panel, companion, pod]
 workflow_state: ready
 created_at: 2026-06-07T00:16:51Z
-updated_at: 2026-06-07T10:18:01Z
+updated_at: 2026-06-07T10:40:36Z
 assignee: null
 legacy_ticket: null
 ---
