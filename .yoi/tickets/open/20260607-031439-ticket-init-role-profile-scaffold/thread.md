@@ -126,3 +126,35 @@ Reported validation:
 External review will be delegated before merge.
 
 ---
+
+<!-- event: review author: ticket-init-scaffold-reviewer-20260607 at: 2026-06-07T04:04:17Z status: approve -->
+
+## Review: approve
+
+Approved.
+
+Evidence:
+- Runtime fallback was not loosened. Strict role launch validation still requires configured role table/profile and rejects top-level `inherit` before launch.
+- `ticket_config_scaffold()` writes explicit backend config and all fixed role tables: intake, orchestrator, coder, reviewer, investigator.
+- Each generated role has explicit `profile = "builtin:default"` and explicit default `workflow`.
+- Launch validation coverage plans both Intake and Orchestrator from the scaffolded config.
+- `yoi ticket init` refuses to overwrite existing `.yoi/ticket.config.toml`, uses create-new behavior, and reports an actionable diagnostic.
+- Command shape is scoped to `yoi ticket init`; no broad product init or runtime implicit fallback was introduced.
+
+Reviewer validation:
+- `cargo test -p ticket config --lib`
+- `cargo test -p client ticket_role --lib`
+- `cargo test -p yoi ticket`
+- `cargo fmt --check`
+- `git diff --check develop...HEAD`
+- `nix build --no-link .#yoi`
+
+Merge readiness:
+- Branch is behind current `develop` only by Ticket metadata changes.
+- Implementation changes are limited to `crates/client/src/ticket_role.rs`, `crates/ticket/src/config.rs`, and `crates/yoi/src/ticket_cli.rs`.
+- `git merge-tree` showed no conflicts.
+
+Dogfooding note:
+- The main workspace's existing `.yoi/ticket.config.toml` remains backend-only, so a separate main-workspace config update is needed after merge if this workspace should use explicit Ticket role profiles.
+
+---
