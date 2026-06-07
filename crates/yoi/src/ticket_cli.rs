@@ -1,8 +1,12 @@
 use std::fmt;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use ticket::config::TicketConfig;
+use ticket::config::{
+    DEFAULT_TICKET_BACKEND_RELATIVE_PATH, TICKET_CONFIG_RELATIVE_PATH, TicketConfig,
+    ticket_config_scaffold,
+};
 use ticket::{
     LocalTicketBackend, MarkdownText, NewTicket, NewTicketEvent, TicketBackend,
     TicketDoctorSeverity, TicketEventKind, TicketFilter, TicketIdOrSlug, TicketReview,
@@ -17,6 +21,7 @@ pub enum TicketCli {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TicketCommand {
+    Init,
     Create(CreateOptions),
     List(ListOptions),
     Show { query: String },
@@ -129,12 +134,24 @@ impl From<ticket::config::TicketConfigError> for TicketCliError {
     }
 }
 
+impl From<std::io::Error> for TicketCliError {
+    fn from(error: std::io::Error) -> Self {
+        Self::new(error.to_string())
+    }
+}
+
 pub fn parse_ticket_args(args: &[String]) -> Result<TicketCli, TicketCliError> {
     if args.is_empty() || args.iter().any(|arg| arg == "--help" || arg == "-h") {
         return Ok(TicketCli::Help);
     }
 
     let command = match args[0].as_str() {
+        "init" => {
+            if args.len() != 1 {
+                return Err(TicketCliError::new("ticket init takes no arguments"));
+            }
+            TicketCommand::Init
+        }
         "create" => TicketCommand::Create(parse_create(&args[1..])?),
         "list" => TicketCommand::List(parse_list(&args[1..])?),
         "show" => TicketCommand::Show {
@@ -185,17 +202,59 @@ fn run_command(
     command: TicketCommand,
     workspace: &Path,
 ) -> Result<TicketCliOutput, TicketCliError> {
-    let backend = backend_for_workspace(workspace)?;
     match command {
-        TicketCommand::Create(options) => create(&backend, options),
-        TicketCommand::List(options) => list(&backend, options),
-        TicketCommand::Show { query } => show(&backend, query),
-        TicketCommand::Comment(options) => comment(&backend, options),
-        TicketCommand::Review(options) => review(&backend, options),
-        TicketCommand::Status(options) => status(&backend, options),
-        TicketCommand::Close(options) => close(&backend, options),
-        TicketCommand::Doctor => doctor(&backend),
+        TicketCommand::Init => init(workspace),
+        command => {
+            let backend = backend_for_workspace(workspace)?;
+            match command {
+                TicketCommand::Create(options) => create(&backend, options),
+                TicketCommand::List(options) => list(&backend, options),
+                TicketCommand::Show { query } => show(&backend, query),
+                TicketCommand::Comment(options) => comment(&backend, options),
+                TicketCommand::Review(options) => review(&backend, options),
+                TicketCommand::Status(options) => status(&backend, options),
+                TicketCommand::Close(options) => close(&backend, options),
+                TicketCommand::Doctor => doctor(&backend),
+                TicketCommand::Init => unreachable!("init handled before backend setup"),
+            }
+        }
     }
+}
+
+fn init(workspace: &Path) -> Result<TicketCliOutput, TicketCliError> {
+    let config_path = workspace.join(TICKET_CONFIG_RELATIVE_PATH);
+    if config_path.exists() {
+        return Err(TicketCliError::new(format!(
+            "ticket config already exists at {}; refusing to overwrite. Edit it manually or remove it before running `yoi ticket init`.",
+            config_path.display()
+        )));
+    }
+
+    let yoi_dir = workspace.join(".yoi");
+    fs::create_dir_all(&yoi_dir)?;
+    let tickets_dir = workspace.join(DEFAULT_TICKET_BACKEND_RELATIVE_PATH);
+    fs::create_dir_all(&tickets_dir)?;
+
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&config_path)
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                TicketCliError::new(format!(
+                    "ticket config already exists at {}; refusing to overwrite. Edit it manually or remove it before running `yoi ticket init`.",
+                    config_path.display()
+                ))
+            } else {
+                TicketCliError::from(error)
+            }
+        })?;
+    file.write_all(ticket_config_scaffold().as_bytes())?;
+
+    Ok(success(format!(
+        "created\t{}\nensured\t{}\n",
+        TICKET_CONFIG_RELATIVE_PATH, DEFAULT_TICKET_BACKEND_RELATIVE_PATH
+    )))
 }
 
 fn backend_for_workspace(workspace: &Path) -> Result<LocalTicketBackend, TicketCliError> {
@@ -745,7 +804,7 @@ fn default_author() -> String {
 }
 
 fn help_text() -> &'static str {
-    "yoi ticket\n\nUsage:\n  yoi ticket create --title <title> [--slug <slug>] [--kind <kind>] [--priority P2] [--label a,b]\n  yoi ticket list [--status open|pending|closed|all]\n  yoi ticket show <id-or-slug>\n  yoi ticket comment <id-or-slug> [--role comment|plan|decision|implementation_report] (--file <path>|--message <text>)\n  yoi ticket review <id-or-slug> (--approve|--request-changes) (--file <path>|--message <text>)\n  yoi ticket status <id-or-slug> <open|pending|closed>\n  yoi ticket close <id-or-slug> (--resolution <text>|--file <path>)\n  yoi ticket doctor\n\nOptions:\n  -h, --help    Print help\n\nBackend:\n  Uses the workspace Ticket config at .yoi/ticket.config.toml when present.\n  Supported provider: builtin:yoi_local.\n  Without config, the local backend root is <cwd>/.yoi/tickets.\n"
+    "yoi ticket\n\nUsage:\n  yoi ticket init\n  yoi ticket create --title <title> [--slug <slug>] [--kind <kind>] [--priority P2] [--label a,b]\n  yoi ticket list [--status open|pending|closed|all]\n  yoi ticket show <id-or-slug>\n  yoi ticket comment <id-or-slug> [--role comment|plan|decision|implementation_report] (--file <path>|--message <text>)\n  yoi ticket review <id-or-slug> (--approve|--request-changes) (--file <path>|--message <text>)\n  yoi ticket status <id-or-slug> <open|pending|closed>\n  yoi ticket close <id-or-slug> (--resolution <text>|--file <path>)\n  yoi ticket doctor\n\nOptions:\n  -h, --help    Print help\n\nBackend:\n  `yoi ticket init` writes .yoi/ticket.config.toml with explicit fixed role profiles.\n  Uses the workspace Ticket config at .yoi/ticket.config.toml when present.\n  Supported provider: builtin:yoi_local.\n  Without config, the local backend root is <cwd>/.yoi/tickets.\n"
 }
 
 #[cfg(test)]
@@ -753,6 +812,7 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
     use ticket::TicketEventKind;
+    use ticket::config::TicketRole;
 
     fn args(items: &[&str]) -> Vec<String> {
         items.iter().map(|item| item.to_string()).collect()
@@ -761,6 +821,54 @@ mod tests {
     fn run(temp: &TempDir, items: &[&str]) -> TicketCliOutput {
         let cli = parse_ticket_args(&args(items)).unwrap();
         run_in_workspace(cli, temp.path()).unwrap()
+    }
+
+    #[test]
+    fn ticket_cli_init_writes_explicit_ticket_config_scaffold() {
+        let temp = TempDir::new().unwrap();
+
+        let initialized = run(&temp, &["init"]);
+        assert_eq!(initialized.status, TicketCliStatus::Success);
+        assert!(
+            initialized
+                .stdout
+                .contains("created\t.yoi/ticket.config.toml")
+        );
+        assert!(initialized.stdout.contains("ensured\t.yoi/tickets"));
+        assert!(temp.path().join(".yoi/tickets").exists());
+
+        let config = fs::read_to_string(temp.path().join(".yoi/ticket.config.toml")).unwrap();
+        assert!(config.contains("[backend]\n"));
+        assert!(config.contains("provider = \"builtin:yoi_local\""));
+        assert!(config.contains("root = \".yoi/tickets\""));
+        for role in TicketRole::ALL {
+            assert!(config.contains(&format!(
+                "[roles.{role}]\nprofile = \"builtin:default\"\nworkflow = \"{}\"",
+                role.default_workflow()
+            )));
+        }
+    }
+
+    #[test]
+    fn ticket_cli_init_does_not_overwrite_existing_config() {
+        let temp = TempDir::new().unwrap();
+        fs::create_dir_all(temp.path().join(".yoi")).unwrap();
+        let config_path = temp.path().join(".yoi/ticket.config.toml");
+        fs::write(
+            &config_path,
+            "[backend]\nprovider = \"builtin:yoi_local\"\n",
+        )
+        .unwrap();
+
+        let cli = parse_ticket_args(&args(&["init"])).unwrap();
+        let err = run_in_workspace(cli, temp.path()).unwrap_err();
+        assert!(err.to_string().contains("already exists"));
+        assert!(err.to_string().contains("refusing to overwrite"));
+        assert!(err.to_string().contains("yoi ticket init"));
+        assert_eq!(
+            fs::read_to_string(config_path).unwrap(),
+            "[backend]\nprovider = \"builtin:yoi_local\"\n"
+        );
     }
 
     #[test]
@@ -942,6 +1050,7 @@ mod tests {
     fn ticket_cli_help_lists_required_commands() {
         let help = parse_ticket_args(&args(&["--help"])).unwrap();
         let output = run_in_workspace(help, Path::new(".")).unwrap();
+        assert!(output.stdout.contains("yoi ticket init"));
         assert!(output.stdout.contains("yoi ticket create"));
         assert!(output.stdout.contains("yoi ticket doctor"));
     }

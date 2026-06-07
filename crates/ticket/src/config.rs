@@ -16,6 +16,33 @@ use thiserror::Error;
 pub const TICKET_CONFIG_RELATIVE_PATH: &str = ".yoi/ticket.config.toml";
 /// Workspace-relative default root for the built-in local Ticket backend.
 pub const DEFAULT_TICKET_BACKEND_RELATIVE_PATH: &str = ".yoi/tickets";
+/// Concrete profile selector used by the initial Ticket role scaffold.
+pub const TICKET_CONFIG_SCAFFOLD_PROFILE: &str = "builtin:default";
+
+/// Return the explicit workspace Ticket config scaffold written by `yoi ticket init`.
+///
+/// The scaffold intentionally configures every fixed Ticket role with a concrete
+/// profile so strict role launch planning can validate the config without runtime
+/// fallback.
+pub fn ticket_config_scaffold() -> String {
+    let mut out = String::from("[backend]\n");
+    out.push_str(&format!(
+        "provider = \"{}\"\n",
+        TicketBackendProvider::BuiltinYoiLocal.as_str()
+    ));
+    out.push_str(&format!(
+        "root = \"{}\"\n",
+        DEFAULT_TICKET_BACKEND_RELATIVE_PATH
+    ));
+    for role in TicketRole::ALL {
+        out.push_str(&format!(
+            "\n[roles.{role}]\nprofile = \"{}\"\nworkflow = \"{}\"\n",
+            TICKET_CONFIG_SCAFFOLD_PROFILE,
+            role.default_workflow()
+        ));
+    }
+    out
+}
 
 #[derive(Debug, Error)]
 pub enum TicketConfigError {
@@ -644,6 +671,36 @@ workflow = "ticket-orchestrator-routing"
             config.workflow_for(TicketRole::Investigator).as_str(),
             "ticket-orchestrator-routing"
         );
+    }
+
+    #[test]
+    fn scaffold_config_includes_backend_and_all_fixed_roles() {
+        let temp = TempDir::new().unwrap();
+        let scaffold = ticket_config_scaffold();
+
+        assert!(scaffold.contains("[backend]\n"));
+        assert!(scaffold.contains("provider = \"builtin:yoi_local\""));
+        assert!(scaffold.contains("root = \".yoi/tickets\""));
+        for role in TicketRole::ALL {
+            assert!(scaffold.contains(&format!("[roles.{role}]")));
+            assert!(scaffold.contains(&format!(
+                "[roles.{role}]\nprofile = \"builtin:default\"\nworkflow = \"{}\"",
+                role.default_workflow()
+            )));
+        }
+
+        let config = TicketConfig::from_toml(
+            temp.path(),
+            temp.path().join(TICKET_CONFIG_RELATIVE_PATH),
+            &scaffold,
+        )
+        .unwrap();
+        assert_eq!(config.backend_root(), temp.path().join(".yoi/tickets"));
+        for role in TicketRole::ALL {
+            let role_config = config.role_launch_config(role).unwrap();
+            assert_eq!(role_config.profile.as_str(), "builtin:default");
+            assert_eq!(role_config.workflow.as_str(), role.default_workflow());
+        }
     }
 
     #[test]

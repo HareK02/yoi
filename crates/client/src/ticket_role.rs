@@ -890,6 +890,33 @@ profile = "project:no-such-ticket-role-profile"
     }
 
     #[test]
+    fn scaffold_config_allows_intake_and_orchestrator_launch_planning() {
+        let temp = TempDir::new().unwrap();
+        write_config(temp.path(), &ticket::config::ticket_config_scaffold());
+
+        let intake = plan_ticket_role_launch(TicketRoleLaunchContext::new(
+            temp.path(),
+            TicketRole::Intake,
+        ))
+        .unwrap();
+        assert_eq!(intake.role, TicketRole::Intake);
+        assert_eq!(intake.profile, "builtin:default");
+        assert_eq!(intake.workflow, TicketRole::Intake.default_workflow());
+
+        let orchestrator = plan_ticket_role_launch(TicketRoleLaunchContext::new(
+            temp.path(),
+            TicketRole::Orchestrator,
+        ))
+        .unwrap();
+        assert_eq!(orchestrator.role, TicketRole::Orchestrator);
+        assert_eq!(orchestrator.profile, "builtin:default");
+        assert_eq!(
+            orchestrator.workflow,
+            TicketRole::Orchestrator.default_workflow()
+        );
+    }
+
+    #[test]
     fn spawn_config_still_rejects_inherit_profile_defensively() {
         let temp = TempDir::new().unwrap();
         let mut plan = test_launch_plan(temp.path());
