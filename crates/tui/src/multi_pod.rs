@@ -1458,7 +1458,7 @@ async fn dispatch_ticket_action(
                 notify_workspace_orchestrator(request.orchestrator, current_ticket).await;
             Ok(TicketActionOutcome {
                 notice: format!(
-                    "Queued Ticket {}; {}. No implementation was started.",
+                    "Queued Ticket {}; {}. Orchestrator routing is authorized; implementation side effects still require queued -> inprogress acceptance.",
                     current_ticket.slug,
                     notification.sentence()
                 ),
@@ -1534,6 +1534,18 @@ fn panel_defer_body(ticket: &crate::workspace_panel::TicketPanelEntry) -> String
     )
 }
 
+fn orchestrator_queue_notification_message(
+    ticket: &crate::workspace_panel::TicketPanelEntry,
+) -> String {
+    let title = ticket.title.replace(['\r', '\n'], " ");
+    format!(
+        "Workspace panel Queue for Ticket `{}` (`{}`), title `{}`: human authorized Orchestrator routing; this is not an unattended scheduler. Read the Ticket and inspect current workspace state. If unblocked, record routing and transition workflow_state queued -> inprogress before any worktree/SpawnPod implementation side effects. If blocked, record a concise reason and leave the Ticket queued or explicitly defer it.",
+        ticket.slug,
+        ticket.id,
+        title.trim()
+    )
+}
+
 async fn notify_workspace_orchestrator(
     target: Option<OrchestratorNotifyTarget>,
     ticket: &crate::workspace_panel::TicketPanelEntry,
@@ -1543,10 +1555,7 @@ async fn notify_workspace_orchestrator(
             "no live reachable Orchestrator socket is available".to_string(),
         );
     };
-    let message = format!(
-        "Workspace panel Queue for Ticket `{}` (`{}`): human authorized Orchestrator routing/preflight. Re-check Ticket authority before acting. Do not start implementation directly from this notification; follow routing/preflight gates.",
-        ticket.slug, ticket.id
-    );
+    let message = orchestrator_queue_notification_message(ticket);
     match send_notify_only(&target.socket_path, message).await {
         Ok(()) => OrchestratorNotificationOutcome::Sent {
             pod_name: target.pod_name,
@@ -2402,7 +2411,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ticket_queue_action_transitions_ready_ticket_without_starting_implementation() {
+    async fn ticket_queue_action_transitions_ready_ticket_and_authorizes_orchestrator_routing() {
         let (temp, ticket_id, backend) = ready_ticket_workspace("panel-queue");
 
         let outcome =
@@ -2411,7 +2420,13 @@ mod tests {
                 .unwrap();
 
         assert!(outcome.notice.contains("Queued Ticket"));
-        assert!(outcome.notice.contains("No implementation was started"));
+        assert!(
+            outcome
+                .notice
+                .contains("Orchestrator routing is authorized")
+        );
+        assert!(outcome.notice.contains("queued -> inprogress acceptance"));
+        assert!(!outcome.notice.contains("No implementation was started"));
         let ticket = backend.show(TicketIdOrSlug::Id(ticket_id)).unwrap();
         assert_eq!(ticket.meta.status.as_local(), Some(TicketStatus::Open));
         assert_eq!(ticket.meta.workflow_state, TicketWorkflowState::Queued);
@@ -2557,6 +2572,32 @@ mod tests {
                 .iter()
                 .any(|event| event.kind == TicketEventKind::Review)
         );
+    }
+
+    #[test]
+    fn ticket_queue_notification_message_carries_routing_contract() {
+        let row = panel_test_ticket_row(
+            "route-ticket",
+            "Route queued\nTicket",
+            ActionPriority::ReadyForQueue,
+            NextUserAction::Queue,
+            "queued",
+        );
+        let ticket = row.ticket.as_ref().unwrap();
+
+        let message = orchestrator_queue_notification_message(ticket);
+
+        assert!(message.contains("Ticket `route-ticket` (`20260606-000000-route-ticket`)"));
+        assert!(message.contains("title `Route queued Ticket`"));
+        assert!(message.contains("human authorized Orchestrator routing"));
+        assert!(message.contains("not an unattended scheduler"));
+        assert!(message.contains("Read the Ticket"));
+        assert!(message.contains("inspect current workspace state"));
+        assert!(message.contains("transition workflow_state queued -> inprogress"));
+        assert!(message.contains("before any worktree/SpawnPod implementation side effects"));
+        assert!(message.contains("If blocked, record a concise reason"));
+        assert!(message.contains("leave the Ticket queued or explicitly defer"));
+        assert!(!message.contains("Do not start implementation directly"));
     }
 
     #[tokio::test]
