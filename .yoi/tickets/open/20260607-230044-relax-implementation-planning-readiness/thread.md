@@ -183,3 +183,53 @@ Coder delegated:
 - Instructions: update workflow guidance to distinguish ready-for-routing, implementation handoff with bounded implementation latitude, binding decisions/invariants, and escalation conditions; keep preflight mandatory for product/API/UX/authority-boundary uncertainty; update reviewer guidance to judge against recorded intent/constraints/acceptance/explicit decisions; run validation and commit locally. No merge, close, main workspace edits, or cleanup delegated.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-07T23:25:23Z -->
+
+## Implementation report
+
+Coder completed implementation:
+- Pod: `coder-relax-implementation-planning-readiness`
+- Branch/worktree: `ticket/relax-implementation-planning-readiness` at `.worktree/relax-implementation-planning-readiness`
+- Commit: `1e2d1d8 docs: relax implementation readiness wording`
+- Child worktree status: clean
+
+Files changed:
+- `.yoi/workflow/ticket-intake-workflow.md`
+- `.yoi/workflow/ticket-orchestrator-routing.md`
+- `.yoi/workflow/ticket-preflight-workflow.md`
+- `.yoi/workflow/multi-agent-workflow.md`
+- `crates/client/src/ticket_role.rs`
+
+Implementation summary:
+- Clarified that `ready` means ready for Orchestrator routing, not fully implementation-planned.
+- Relaxed `implementation_ready` to allow bounded coder investigation/local tactic choice when intent, constraints, acceptance criteria, reviewer judgment basis, and escalation conditions are clear.
+- Preserved preflight as mandatory for product/API/UX/authority/design-boundary uncertainty or attempts to weaken explicit constraints.
+- Distinguished binding decisions/invariants, implementation latitude, and escalation conditions in IntentPacket guidance.
+- Clarified that `needs_preflight: true` and risk flags are strong signals, not unconditional blockers when a Ticket-recorded human/Orchestrator decision already supplies the missing boundary.
+- Updated reviewer guidance to judge against recorded intent, constraints, acceptance criteria, and explicit decisions rather than unrecorded preferred tactics.
+- Updated generated role guidance/tests in `ticket_role.rs` to align Orchestrator/Coder/Reviewer prompts.
+
+Reported validation:
+- `target/debug/yoi ticket doctor` — unavailable in child
+- `cargo fmt --check` — passed
+- `cargo test -p client generated_prompt_covers_intake_orchestrator_coder_and_reviewer_context -- --nocapture` — passed
+- `git diff --check` — passed
+- `nix build .#yoi` — passed, run because generated runtime role guidance/tests changed
+
+Next action:
+- Delegate independent read-only reviewer inspection of commit `1e2d1d8` against the Ticket intent and acceptance criteria before preparing a merge-ready dossier.
+
+---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-07T23:25:49Z -->
+
+## Implementation report
+
+Reviewer delegated:
+- Pod: `reviewer-relax-implementation-planning-readiness`
+- Review target: commit `1e2d1d8` on branch `ticket/relax-implementation-planning-readiness`
+- Scope: read-only child worktree plus git metadata needed to inspect the branch.
+- Instructions: inspect workflow wording and generated role guidance/test alignment against the Ticket's binding policy boundary; return `approve` or `request_changes` with blocker/non-blocker separation. No file edits, Ticket writes, merge, close, or cleanup delegated.
+
+---

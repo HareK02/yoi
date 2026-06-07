@@ -203,3 +203,190 @@ Coder delegated:
 - Instructions: implement strict YAML-compatible Ticket item frontmatter parsing, migrate existing project Ticket records minimally, add parser and workspace panel regression tests, run focused validation plus `cargo fmt --check`, `git diff --check`, Ticket doctor, and `nix build .#yoi`, then commit locally on the child branch. No merge, close, main workspace edits, or cleanup delegated.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-07T23:14:08Z -->
+
+## Implementation report
+
+Coder completed implementation:
+- Pod: `coder-parse-ticket-frontmatter-as-yaml`
+- Branch/worktree: `ticket/parse-ticket-frontmatter-as-yaml` at `.worktree/parse-ticket-frontmatter-as-yaml`
+- Commit: `10d7844fc84683429e24671bf01dd57885a40084` (`ticket: parse item frontmatter as YAML`)
+- Child worktree status: clean
+
+Implementation summary:
+- Replaced raw Ticket `item.md` frontmatter parsing with strict YAML parsing in `crates/ticket/src/lib.rs`.
+- Added typed handling for YAML nulls, sequences, booleans, quoted string values, and clear parse/type errors.
+- Removed tolerant raw-string fallbacks that conflict with YAML semantics.
+- Added focused parser tests and workspace panel regression coverage for `workflow_state: intake` plus `attention_required: null` deriving `Clarify`, not `Edit`.
+- Updated `crates/ticket/Cargo.toml`, `Cargo.lock`, and `package.nix` for `serde_yaml` / Nix cargo hash.
+- Migrated 48 existing `.yoi/tickets/**/item.md` files by quoting YAML-unsafe title values with colons; no bodies, threads, resolutions, or non-frontmatter content were rewritten.
+
+Reported validation:
+- `cargo test -p ticket --lib` — passed
+- `cargo test -p tui workspace_panel --lib` — passed
+- `cargo fmt --check` — passed
+- `git diff --check` — passed
+- `target/debug/yoi ticket doctor` — passed
+- `nix build .#yoi` — passed
+
+Next action:
+- Delegate independent read-only reviewer inspection of commit `10d7844` against the Ticket intent, strict-YAML preflight boundary, migration minimality, and validation evidence before preparing a merge-ready dossier.
+
+---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-07T23:14:34Z -->
+
+## Implementation report
+
+Reviewer delegated:
+- Pod: `reviewer-parse-ticket-frontmatter-as-yaml`
+- Review target: commit `10d7844` on branch `ticket/parse-ticket-frontmatter-as-yaml`
+- Scope: read-only child worktree plus git metadata needed to inspect the branch.
+- Instructions: inspect parser semantics, clear failure behavior, minimal Ticket record migration, workspace panel regression coverage, dependency/package changes, and validation evidence; return `approve` or `request_changes` with blocker/non-blocker separation. No file edits, Ticket writes, merge, close, or cleanup delegated.
+
+---
+
+<!-- event: review author: reviewer-parse-ticket-frontmatter-as-yaml at: 2026-06-07T23:18:48Z status: request_changes -->
+
+## Review: request changes
+
+Branch-local reviewer verdict: request changes.
+
+Blocker:
+- The parser now correctly treats schema string fields as YAML strings, but the Ticket frontmatter writer can still emit numeric-looking or otherwise ambiguous string values as plain YAML scalars. Examples such as `title: 123`, `labels: [123]`, `risk_flags: [1]`, or `assignee: 42` would be emitted as non-string YAML scalars and then rejected by the strict parser on the next read. The backend must not create/update Ticket records that its own parser rejects.
+
+Requested fix:
+- Make string serialization conservative, preferably always quote schema string values, or prove round-trip string-ness under `serde_yaml` before emitting plain scalars.
+- Add regression tests for numeric-looking strings at least for `title`, `labels`, and `risk_flags`; optional string fields such as `assignee`/`attention_required` should also be covered if they share the helper.
+
+Positive findings:
+- Strict YAML parsing direction is correct.
+- Null/list/bool parsing and clear failure behavior are covered.
+- Workspace panel regression coverage is present.
+- Migration appears limited to necessary `title:` frontmatter normalization.
+- Dependency/package changes looked coherent and coder-reported validation was appropriate.
+
+Validation expected after fix:
+- `cargo test -p ticket --lib`
+- `cargo test -p tui workspace_panel --lib`
+- `target/debug/yoi ticket doctor` or equivalent
+- `nix build .#yoi` if dependency/package outputs remain changed.
+
+---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-07T23:22:43Z -->
+
+## Implementation report
+
+Coder completed reviewer-blocker fix:
+- Pod: `coder-parse-ticket-frontmatter-as-yaml`
+- Branch/worktree: `ticket/parse-ticket-frontmatter-as-yaml` at `.worktree/parse-ticket-frontmatter-as-yaml`
+- New commit: `dbdccc5 ticket: quote frontmatter strings conservatively`
+- Branch commits now: `10d7844` + `dbdccc5`
+- Child worktree status: clean
+
+Fix summary:
+- `format_yaml_string_scalar` now emits schema string values as single-quoted YAML scalars conservatively.
+- Applies to scalar string fields such as `title`, `assignee`, `attention_required`, list items in `labels`/`risk_flags`, and string updates through `set_frontmatter_fields`.
+- Added regression coverage for ambiguous/numeric-looking user strings: `title: "123"`, `labels: ["123", "01"]`, `risk_flags: ["1", "42"]`, `assignee: "42"`, `attention_required: "0"`, and `action_required: "true"`.
+- No extra Ticket migration rewrite was needed for the fix.
+
+Reported validation after fix:
+- `cargo test -p ticket --lib` — passed
+- `cargo test -p tui workspace_panel --lib` — passed
+- `cargo fmt --check` — passed
+- `git diff --check` — passed
+- `target/debug/yoi ticket doctor` — passed
+- `nix build .#yoi` — passed
+
+Next action:
+- Send the updated branch back to the reviewer for focused re-review of the prior blocker and final merge-ready verdict.
+
+---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-07T23:25:23Z -->
+
+## Implementation report
+
+Merge-ready dossier for `orchestrator-merge-completion`
+
+Ticket:
+- Id: `20260607-223233-parse-ticket-frontmatter-as-yaml`
+- Slug: `parse-ticket-frontmatter-as-yaml`
+- Workflow state: `inprogress`
+
+Branch/worktree:
+- Branch: `ticket/parse-ticket-frontmatter-as-yaml`
+- Worktree: `.worktree/parse-ticket-frontmatter-as-yaml`
+- Child worktree status: clean (`## ticket/parse-ticket-frontmatter-as-yaml`)
+
+Commits:
+- `10d7844 ticket: parse item frontmatter as YAML`
+- `dbdccc5 ticket: quote frontmatter strings conservatively`
+- Diff vs `develop`: 53 files changed; source/package changes in `crates/ticket`, `crates/tui/src/workspace_panel.rs`, `Cargo.lock`, `package.nix`; 48 `.yoi/tickets/**/item.md` records minimally normalized.
+
+Intent/invariant check:
+- Intent satisfied: Ticket `item.md` frontmatter now parses through strict YAML-compatible typed metadata rather than raw `key: value` strings.
+- Human/preflight boundary followed: old tolerant raw-string semantics that conflict with YAML were not preserved.
+- YAML null/list/bool semantics are handled; invalid/wrong-typed frontmatter fails clearly.
+- Writer/parser round-trip invariant restored by conservative quoting of schema string values.
+- Scope stayed within parser/emitter correctness, minimal project Ticket record normalization, package dependency updates, and workspace panel regression coverage; Ticket lifecycle/state/action model was not redesigned.
+
+Implementation summary:
+- Replaced raw frontmatter parsing in `crates/ticket/src/lib.rs` with `serde_yaml::Value`-based strict parsing and typed helpers.
+- Added validation/error paths for wrong YAML field types.
+- Added tests for null values, quoted `"null"` as string where valid, list fields, bool fields, invalid types, and conservative string emission.
+- Added workspace panel regression coverage so `workflow_state: intake` plus `attention_required: null` derives `Clarify` rather than `Edit`.
+- Added `serde_yaml` to `crates/ticket/Cargo.toml`, updated `Cargo.lock`, and updated `package.nix` cargo hash.
+- Normalized existing Ticket item frontmatter by quoting YAML-unsafe `title:` values containing colons; no body/thread/resolution rewrite was introduced.
+
+Coder evidence:
+- Pod: `coder-parse-ticket-frontmatter-as-yaml`
+- Initial implementation commit: `10d7844`
+- Reviewer-fix commit: `dbdccc5`
+- Coder-reported final status: child worktree clean.
+- Coder-reported validation after fix:
+  - `cargo test -p ticket --lib` — passed
+  - `cargo test -p tui workspace_panel --lib` — passed
+  - `cargo fmt --check` — passed
+  - `git diff --check` — passed
+  - `target/debug/yoi ticket doctor` — passed
+  - `nix build .#yoi` — passed
+
+Reviewer evidence:
+- Pod: `reviewer-parse-ticket-frontmatter-as-yaml`
+- First verdict: request_changes due writer emitting ambiguous numeric-looking schema strings as plain YAML scalars.
+- Blocker resolution: reviewer approved after focused re-review of commit `dbdccc5`.
+- Reviewer inspected branch/worktree state, prior-to-fix delta, focused `crates/ticket/src/lib.rs` diff, migration scope, packaging/dependency diff, `git diff --check`, and `target/debug/yoi ticket doctor`.
+- Final branch-local verdict: approve.
+
+Blockers / findings:
+- Resolved blocker: strict parser could reject records written by the backend if schema strings were emitted as ambiguous plain YAML scalars.
+- Fix: schema string values are conservatively single-quoted, including list entries and update paths; regression tests cover numeric/ambiguous strings.
+- No remaining reviewer blockers or non-blocker required changes.
+
+Validation performed by orchestrator:
+- Confirmed child branch HEAD, clean status, commit list, and diff stat/name-status against `develop`.
+- Ran typed `TicketDoctor`: 0 errors; existing repository-wide warnings remain unrelated/truncated.
+
+Residual risks:
+- `serde_yaml` dependency/package change is larger than parser-only code but was validated by coder-reported `nix build .#yoi` and reviewer packaging inspection.
+- Ticket migration touches many item files, but the diff is intentionally limited to frontmatter title quoting needed for valid YAML parsing.
+- Broader historical Ticket warnings remain but are unrelated to this change.
+
+Current main workspace dirty state:
+- Main branch has local Ticket record modifications for this Ticket's routing/review/dossier events.
+- No source-code changes are present in the main workspace outside child worktrees.
+
+Pods / cleanup state:
+- Coder Pod is idle/reachable.
+- Reviewer Pod is idle/reachable.
+- Worktree and branch are retained for merge-completion.
+- No merge, final main-branch approval, close, or cleanup has been performed.
+
+Parent/human decision needed:
+- Authorize merge-completion if desired. Without explicit merge authority, stop here with this dossier.
+- Merge-completion should independently verify branch/worktree/commit identity, main workspace safety, and validation requirements before merge/close/cleanup.
+
+---
