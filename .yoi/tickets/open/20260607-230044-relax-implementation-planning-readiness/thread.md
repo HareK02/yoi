@@ -233,3 +233,85 @@ Reviewer delegated:
 - Instructions: inspect workflow wording and generated role guidance/test alignment against the Ticket's binding policy boundary; return `approve` or `request_changes` with blocker/non-blocker separation. No file edits, Ticket writes, merge, close, or cleanup delegated.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-07T23:29:55Z -->
+
+## Implementation report
+
+Merge-ready dossier for `orchestrator-merge-completion`
+
+Ticket:
+- Id: `20260607-230044-relax-implementation-planning-readiness`
+- Slug: `relax-implementation-planning-readiness`
+- Workflow state: `inprogress`
+
+Branch/worktree:
+- Branch: `ticket/relax-implementation-planning-readiness`
+- Worktree: `.worktree/relax-implementation-planning-readiness`
+- Child worktree status: clean (`## ticket/relax-implementation-planning-readiness`)
+
+Commits:
+- `1e2d1d8 docs: relax implementation readiness wording`
+- Diff vs `develop`: 5 files changed, 99 insertions, 60 deletions.
+
+Intent/invariant check:
+- Intent satisfied: workflow and generated role guidance now frame readiness around clear intent, constraints, acceptance criteria, reviewer judgment basis, and escalation conditions rather than pre-decided implementation tactics.
+- Preflight boundary preserved: product/API/UX/authority/design-boundary uncertainty still requires preflight or an explicit recorded decision.
+- Human/Orchestrator/Ticket-recorded decisions and invariants remain binding; coder latitude is bounded to implementation investigation/local tactics within recorded constraints.
+- No scheduler/lease/workflow-state redesign or Ticket state machine change was introduced.
+
+Implementation summary:
+- Updated `.yoi/workflow/ticket-intake-workflow.md` to distinguish ready-for-routing from fully implementation-planned.
+- Updated `.yoi/workflow/ticket-orchestrator-routing.md` to allow `implementation_ready` with bounded implementation uncertainty when reviewable intent/constraints/acceptance/escalation are clear.
+- Updated `.yoi/workflow/ticket-preflight-workflow.md` to keep preflight mandatory for design/authority uncertainty while allowing recorded decisions to satisfy missing boundaries.
+- Updated `.yoi/workflow/multi-agent-workflow.md` so coder/reviewer handoff distinguishes binding decisions/invariants, implementation latitude, and escalation conditions.
+- Updated `crates/client/src/ticket_role.rs` generated role guidance and prompt coverage test assertions to align Orchestrator/Coder/Reviewer behavior with the new wording.
+
+Coder evidence:
+- Pod: `coder-relax-implementation-planning-readiness`
+- Commit: `1e2d1d8`
+- Coder-reported status: child worktree clean.
+- Coder-reported validation:
+  - `target/debug/yoi ticket doctor` — unavailable in child
+  - `cargo fmt --check` — passed
+  - `cargo test -p client generated_prompt_covers_intake_orchestrator_coder_and_reviewer_context -- --nocapture` — passed
+  - `git diff --check` — passed
+  - `nix build .#yoi` — passed, run because generated runtime role guidance/tests changed
+
+Reviewer evidence:
+- Pod: `reviewer-relax-implementation-planning-readiness`
+- Branch-local verdict: approve.
+- Reviewer inspected Ticket records, human/orchestrator policy boundary, diff against `develop...HEAD`, workflow docs, generated guidance strings, and prompt test updates.
+- Reviewer independently ran:
+  - `cargo fmt --check` — passed
+  - `git diff --check develop...HEAD` — passed
+  - `./result/bin/yoi ticket doctor` — passed (`doctor: ok`) using the existing Nix build result
+- Reviewer did not independently rerun the focused client test or Nix build, judging coder evidence sufficient after direct diff/test inspection.
+
+Blockers / findings:
+- No reviewer blockers.
+- No non-blocking change requests.
+
+Validation performed by orchestrator:
+- Confirmed child branch HEAD, clean status, and diff stat/name-status against `develop`.
+- Main workspace is clean apart from being ahead of `origin/develop`.
+
+Residual risks:
+- Prompt coverage tests are substring-based, so they verify key policy phrases rather than every nuance. Reviewer judged this acceptable because workflow docs carry the authoritative detailed guidance.
+- Relaxed wording must be applied with discipline: `needs_preflight`/risk flags are strong signals, not unconditional blockers only when the missing boundary is already explicitly recorded.
+
+Current main workspace dirty state:
+- This dossier event modifies the Ticket record until committed.
+- No source-code changes are present in the main workspace outside child worktrees.
+
+Pods / cleanup state:
+- Coder Pod is idle/reachable.
+- Reviewer Pod is idle/reachable.
+- Worktree and branch are retained for merge-completion.
+- No merge, final main-branch approval, close, or cleanup has been performed.
+
+Parent/human decision needed:
+- Authorize merge-completion if desired. Without explicit merge authority, stop here with this dossier.
+- Merge-completion should independently verify branch/worktree/commit identity, main workspace safety, and validation requirements before merge/close/cleanup.
+
+---

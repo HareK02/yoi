@@ -8,7 +8,7 @@ priority: P2
 labels: [workflow, ticket, orchestrator, preflight, review]
 workflow_state: inprogress
 created_at: 2026-06-07T23:00:44Z
-updated_at: 2026-06-07T23:25:49Z
+updated_at: 2026-06-07T23:29:55Z
 assignee: null
 legacy_ticket: null
 queued_by: workspace-panel
