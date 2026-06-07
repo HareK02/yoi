@@ -94,3 +94,25 @@ Ticket intake complete; workflow_state intake -> ready.
 
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-06-07T06:16:17Z -->
+
+## Implementation report
+
+## Delegation
+
+Implementation delegated to child Pod `orchestrator-merge-coder-20260607` in worktree `.worktree/orchestrator-merge-completion` on branch `work/orchestrator-merge-completion`.
+
+Scope:
+- Add Orchestrator merge/completion guidance for reviewed in-progress Tickets with merge-ready dossiers.
+- Preserve branch-local reviewer verdict vs final main Ticket approval boundary.
+- Define dogfooding merge authority vs conservative stop-at-dossier behavior.
+- Include post-merge validation, Ticket completion, worktree/branch/Pod cleanup guidance.
+- Do not implement queue routing or worktree/coder/reviewer routing.
+
+Workflow note:
+- Child worktree excludes `.yoi`; if workflow file updates are needed, the child should report an exact parent-side patch rather than editing `.yoi`.
+
+The child should commit implementation work in the child worktree and report diff/tests. Merge, review, Ticket closure, workflow file updates, and cleanup remain with the parent/human workflow.
+
+---
