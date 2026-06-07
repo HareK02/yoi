@@ -63,3 +63,26 @@ Escalate if:
 - Prompt/resource changes are required beyond workflow docs and need separate validation scope.
 
 ---
+
+<!-- event: decision author: hare at: 2026-06-07T23:08:01Z -->
+
+## Decision
+
+## Human decision: human-provided intent can satisfy preflight boundary for this policy cleanup
+
+This Ticket itself exists to relax over-eager preflight/planning gates. The current Orchestrator routed it as `preflight_needed` mainly because Intake recorded `needs_preflight: true` and risk flags such as `workflow-policy`, `orchestration-semantics`, `reviewer-handoff`, and `prompt-guidance`.
+
+That reaction is useful evidence for the problem this Ticket should fix: current guidance can mechanically classify workflow-policy changes as preflight-needed even when the human has already provided the intended boundary.
+
+For this Ticket, additional preflight is not required before implementation if the implementation follows this human decision:
+
+- Prioritize clarifying user/project intent over freezing implementation tactics early.
+- Leave bounded implementation-investigation latitude to the coder when the intent, constraints, and acceptance criteria are clear enough for review.
+- Reviewer should judge whether the implementation matches recorded intent, explicit constraints, acceptance criteria, and binding design decisions.
+- If a design approach/invariant is explicitly recorded by the human, Orchestrator, or Ticket thread, the coder must follow it or escalate/record a justified deviation.
+- Preflight remains mandatory when implementation would otherwise silently decide product/API/UX/authority-boundary questions or weaken explicit design constraints.
+- `needs_preflight: true` and risk flags should be treated as strong signals, not unconditional hard blockers, when a human decision has already supplied the missing policy boundary.
+
+Implementation should use this as the binding policy boundary and update workflow wording accordingly. Escalate only if the wording would weaken authority/product/API/design-boundary gates rather than narrowing unnecessary preflight churn.
+
+---
