@@ -107,3 +107,33 @@ Review focus:
 The reviewer is instructed not to modify files and to return approve/request-changes guidance with evidence and merge-readiness notes.
 
 ---
+
+<!-- event: review author: panel-role-session-registry-reviewer-20260607 at: 2026-06-07T02:11:38Z status: request_changes -->
+
+## Review: request changes
+
+Request changes.
+
+Blockers:
+
+1. Semantic conflict with current `develop`: direct Pod send is reintroduced. `workspace-panel-remove-direct-pod-send` has landed, but this branch still carries the old direct-send path and adds back `DirectSendRequest`, `prepare_send`, `finish_send`, `DirectSendError`, `NextUserAction::SendToPod`, and Pod-row direct-send behavior. The registry branch must be rebased/resolved so it preserves current panel behavior: no selected-Pod direct send, Pod rows open/attach only.
+
+2. The role session record is missing required fields. The Ticket requires local role sessions to include at least role, pod name, origin, created/updated timestamps, and related Ticket refs. Implemented `RoleSessionRecord` only has pod_name, role, optional session_id, and ticket_ids. Add origin, created_at, updated_at, and keep related Ticket refs compatible with the non-1:1 Intake/Ticket model.
+
+3. Launch failure / registry recording can lose local coordination state. Existing-Ticket path claims before launch, but `launch_intake_with_handoff` releases the claim on any launch error. `launch_ticket_role_pod_with_options` can fail after `spawn_pod` succeeds during connect, pre-run/send, or run-acceptance, leaving a live/restorable/stale Pod with no claim and allowing a later second launch. Successful pre-Ticket Intake registry recording is also best-effort only, so a successful launch can silently fail to be represented.
+
+Non-blocking concerns:
+- Claim creation uses `create_new`, which is good for one-claim invariant, but the file is visible before JSON content is fully written; transient partial reads can produce poor diagnostics.
+- `role-sessions.json` updates are read-modify-write without locking, so concurrent `record_session` calls can lose refs.
+- Workspace key/path behavior is likely acceptable for local user-data but should be a conscious decision; symlinked/moved workspaces create distinct registries, and full workspace_root is stored in JSON.
+
+Positive evidence:
+- Registry files are under user data dir, not `.yoi/tickets`.
+- The implementation does not modify git-tracked Ticket files for local Pod assignment.
+- Normal existing-Ticket Intake checks existing claim and refuses a second Pod, with status derived from current Pod list.
+- Panel display preserves interim `ticket-*` heuristic while adding claim Pod names.
+- Pre-Ticket Intake names are unique and do not require Ticket id.
+
+Merge readiness: not merge-ready. Needs rebase/semantic conflict fix against current `develop`, schema additions, and failure-behavior hardening, followed by focused tests and build validation.
+
+---
