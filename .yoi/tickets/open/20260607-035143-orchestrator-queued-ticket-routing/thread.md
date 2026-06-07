@@ -115,3 +115,24 @@ Parent-side workflow update:
 - The workflow now treats Panel Queue / queued notification as routing authorization, requires `queued -> inprogress` before implementation side effects, and documents blocked queued handling.
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-06-07T05:08:38Z -->
+
+## Implementation report
+
+## Review delegation
+
+External review delegated to `orchestrator-routing-reviewer-20260607`.
+
+Review scope:
+- Child implementation commit `ccf43f8 tui: update queued ticket routing notification` in `.worktree/orchestrator-queued-ticket-routing`.
+- Parent-side workflow update in `.yoi/workflow/ticket-orchestrator-routing.md` committed on `develop` in `df6d7ee`.
+
+Review focus:
+- Queue notice/notification should actively authorize Orchestrator routing without implying passive no-op behavior.
+- Notification must not instruct blind implementation Pod spawning.
+- Workflow must require `queued -> inprogress` acceptance before worktree/SpawnPod side effects.
+- Worktree/coder/reviewer routing, merge completion, and plan-tool behavior must remain out of scope.
+- Focused tests should cover the changed wording/contract.
+
+---
