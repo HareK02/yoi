@@ -144,11 +144,6 @@ pub(crate) async fn run(
                         return Ok(MultiPodOutcome::Open(request));
                     }
                 }
-                MultiPodAction::Refresh => {
-                    if !pending_reload.start() {
-                        app.notice = Some("Refresh already in progress.".to_string());
-                    }
-                }
                 MultiPodAction::DispatchTicketAction(request) => {
                     pending_reload.abort();
                     terminal.draw(|f| draw(f, app))?;
@@ -1193,20 +1188,10 @@ impl MultiPodApp {
                 self.select_next();
                 MultiPodAction::None
             }
-            KeyCode::Char('k') if !ctrl && !alt => {
-                self.select_prev();
-                MultiPodAction::None
-            }
-            KeyCode::Char('j') if !ctrl && !alt => {
-                self.select_next();
-                MultiPodAction::None
-            }
             KeyCode::Char('t') if ctrl => {
                 self.cycle_composer_target();
                 MultiPodAction::None
             }
-            KeyCode::Char('o') if !ctrl && !alt => MultiPodAction::Open,
-            KeyCode::Char('r') if !ctrl && !alt => MultiPodAction::Refresh,
             KeyCode::Enter if alt => {
                 self.input.insert_newline();
                 MultiPodAction::None
@@ -1272,7 +1257,6 @@ enum MultiPodAction {
     None,
     Quit,
     Open,
-    Refresh,
     DispatchTicketAction(TicketActionRequest),
     LaunchIntake(IntakeLaunchRequest),
     SendCompanion(CompanionSendRequest),
@@ -2147,7 +2131,7 @@ fn open_disabled_reason(entry: &PodListEntry) -> String {
         }
         return match live.status {
             Some(PodStatus::Running) => {
-                "Selected Pod is running; press o or empty Enter to open/attach.".to_string()
+                "Selected Pod is running; press empty Enter to open/attach.".to_string()
             }
             Some(PodStatus::Paused) => {
                 "Selected Pod is paused; open it explicitly to resume or start a new turn."
@@ -2158,7 +2142,7 @@ fn open_disabled_reason(entry: &PodListEntry) -> String {
         };
     }
     if entry.stored.is_some() {
-        return "Selected Pod is stopped; press o or empty Enter to restore/open.".to_string();
+        return "Selected Pod is stopped; press empty Enter to restore/open.".to_string();
     }
     entry
         .actions
@@ -2407,11 +2391,11 @@ fn draw_title(frame: &mut Frame<'_>, app: &MultiPodApp, area: Rect) {
         .composer
         .is_available(ComposerTarget::TicketIntake)
     {
-        "  Empty Enter dispatches selected Ticket action · Ctrl+T target · o/empty Enter open/attach · r refresh"
+        "  Empty Enter dispatches selected Ticket action/open · Ctrl+T target"
     } else if app.panel.header.ticket_configured {
-        "  Empty Enter dispatches selected Ticket action · o/empty Enter open/attach Pod · r refresh"
+        "  Empty Enter dispatches selected Ticket action/open Pod"
     } else {
-        "  Pod-centric view · o/empty Enter open/attach selected Pod · r refresh"
+        "  Pod-centric view · empty Enter open/attach selected Pod"
     };
     let mut spans = vec![
         Span::styled(
@@ -2836,9 +2820,9 @@ fn draw_actionbar(frame: &mut Frame<'_>, app: &MultiPodApp, area: Rect) {
         .composer
         .is_available(ComposerTarget::TicketIntake)
     {
-        "↑/↓ select  Empty Enter target/open  Ctrl+T target  o open  r refresh  Esc quit"
+        "↑/↓ select  Empty Enter target/open  Ctrl+T target  Esc quit"
     } else {
-        "↑/↓ select  Empty Enter open  non-empty Enter diagnose  o open  r refresh  Esc quit"
+        "↑/↓ select  Empty Enter open  non-empty Enter diagnose  Esc quit"
     };
     let left_width = area
         .width
@@ -3255,6 +3239,39 @@ mod tests {
                 .unwrap()
                 .contains("Workspace Companion is unavailable")
         );
+    }
+
+    #[test]
+    fn multi_bare_panel_letters_append_to_composer_and_arrows_select() {
+        let mut app = test_app(vec![
+            live_info("alpha", PodStatus::Idle),
+            live_info("beta", PodStatus::Idle),
+        ]);
+        assert_eq!(app.list.selected_entry().unwrap().name, "alpha");
+
+        for c in ['j', 'k', 'o', 'r'] {
+            assert!(matches!(
+                app.handle_key(key(KeyCode::Char(c))),
+                MultiPodAction::None
+            ));
+        }
+
+        assert_eq!(input_text(&app), "jkor");
+        assert_eq!(app.list.selected_entry().unwrap().name, "alpha");
+
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Down)),
+            MultiPodAction::None
+        ));
+        assert_eq!(input_text(&app), "jkor");
+        assert_eq!(app.list.selected_entry().unwrap().name, "beta");
+
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Up)),
+            MultiPodAction::None
+        ));
+        assert_eq!(input_text(&app), "jkor");
+        assert_eq!(app.list.selected_entry().unwrap().name, "alpha");
     }
 
     #[test]
@@ -4205,23 +4222,15 @@ mod tests {
     }
 
     #[test]
-    fn multi_empty_enter_on_non_openable_row_matches_o_diagnostic() {
-        let mut enter_app = test_app(vec![unreachable_live_info("unreachable")]);
+    fn multi_empty_enter_on_non_openable_row_reports_open_diagnostic() {
+        let mut app = test_app(vec![unreachable_live_info("unreachable")]);
         assert!(matches!(
-            enter_app.handle_key(key(KeyCode::Enter)),
+            app.handle_key(key(KeyCode::Enter)),
             MultiPodAction::Open
         ));
-        assert!(enter_app.prepare_open().is_none());
-        let enter_notice = enter_app.notice.clone();
+        assert!(app.prepare_open().is_none());
 
-        let mut open_app = test_app(vec![unreachable_live_info("unreachable")]);
-        assert!(matches!(
-            open_app.handle_key(key(KeyCode::Char('o'))),
-            MultiPodAction::Open
-        ));
-        assert!(open_app.prepare_open().is_none());
-
-        assert_eq!(enter_notice, open_app.notice);
+        assert!(app.notice.as_deref().unwrap().contains("cannot be opened"));
     }
 
     fn test_app(live: Vec<LivePodInfo>) -> MultiPodApp {
