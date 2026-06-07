@@ -66,3 +66,21 @@ Ticket intake complete; workflow_state intake -> ready.
 
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-06-07T01:33:27Z -->
+
+## Implementation report
+
+## Delegation
+
+Implementation delegated to child Pod `remove-direct-pod-send-coder-20260607` in worktree `.worktree/workspace-panel-remove-direct-pod-send` on branch `work/workspace-panel-remove-direct-pod-send`.
+
+Scope:
+- Remove selected-Pod direct send from `yoi panel` Companion composer behavior.
+- Keep Pod open/attach and Ticket Intake launch working.
+- Show a bounded diagnostic for Companion composer submit until real Companion lifecycle exists.
+- Update focused `multi_pod` / `workspace_panel` tests and run focused validation.
+
+The child should commit implementation work in the child worktree and report diff/tests. Merge, review, Ticket closure, and cleanup remain with the parent/human workflow.
+
+---
