@@ -548,9 +548,9 @@ fn append_orchestrator_agent_routing_guidance(out: &mut String) {
     out.push_str("\nOrchestrator worktree + agent routing guidance:\n");
     out.push_str("- Treat `ticket-orchestrator-routing` as the routing gate. Read the Ticket and workspace state first; `ready -> queued` authorizes routing, not implementation side effects.\n");
     out.push_str("- Create worktrees or spawn coder/reviewer Pods only after `workflow_state = inprogress` is already recorded and accepted. If the Ticket is still queued and unblocked, record `queued -> inprogress` before any worktree/SpawnPod side effect.\n");
-    out.push_str("- Use `worktree-workflow` for the mechanical worktree plan: create `.worktree/<task-name>`, exclude `.yoi` from the child worktree, and keep the main workspace as the authority for Ticket, workflow, docs, and memory records.\n");
+    out.push_str("- Use `worktree-workflow` for the mechanical worktree plan: create `.worktree/<task-name>`, keep tracked `.yoi` project records visible in the child worktree, exclude `.yoi/memory` plus local/runtime/log/lock/secret-like `.yoi` paths, and keep active orchestration progress plus final review/approval/close in the main workspace unless explicitly designed otherwise.\n");
     out.push_str("- Use `multi-agent-workflow` for the sibling loop: coder and reviewer are siblings under this Orchestrator; coder gets narrow write scope to the child worktree; reviewer is read-only by default.\n");
-    out.push_str("- Give the coder an intent packet, child worktree/branch, validation commands, and report expectations; require Bash commands to `cd` into the child worktree and prohibit editing main-workspace `.yoi`/Ticket/workflow/docs records.\n");
+    out.push_str("- Give the coder an intent packet, child worktree/branch, validation commands, and report expectations; require Bash commands to `cd` into the child worktree, prohibit editing main-workspace `.yoi`/Ticket/workflow/docs records, and prohibit creating generated memory/local/runtime/secret-like files in the child worktree.\n");
     out.push_str("- Give the reviewer the Ticket intent, diff/commits, validation evidence, and blocker/non-blocker criteria; keep branch-local reviewer verdicts in the review report or merge-ready dossier rather than recording them as final main-branch Ticket approval.\n");
     out.push_str("- Ticket thread progress may record worktree plan, coder delegated/completed/blocked, reviewer delegated, blocker/fix-loop summaries, and merge-ready dossier pointer; do not merge, close, or record final main approval in this routing/branch-review phase.\n");
     out.push_str("- Stop at a merge-ready dossier for `orchestrator-merge-completion` containing Ticket id/slug, branch/worktree, commits, intent/invariant check, implementation summary, coder/reviewer Pods, blockers fixed or rejected findings with reasons, validation performed, residual risks, dirty state, and parent/human decision needs if any.\n");
@@ -567,7 +567,8 @@ fn append_orchestrator_agent_routing_guidance(out: &mut String) {
 
 fn append_coder_agent_routing_guidance(out: &mut String) {
     out.push_str("\nCoder worktree routing guidance:\n");
-    out.push_str("- Implement only in the provided child worktree/branch. Use `cd <worktree>` before Bash commands and do not edit main-workspace `.yoi`, Ticket, workflow, docs, or memory records.\n");
+    out.push_str("- Implement only in the provided child worktree/branch. Use `cd <worktree>` before Bash commands and do not edit main-workspace `.yoi`, Ticket, workflow, docs, or memory records; child-worktree `.yoi` project records may be visible when they are part of the branch.\n");
+    out.push_str("- Do not create `.yoi/memory`, local/runtime state, logs, locks, caches, sockets, or secret-like files in the child worktree.\n");
     out.push_str("- Treat the intent packet, invariants, non-goals, validation expectations, and report expectations as the contract. Escalate to Orchestrator rather than expanding scope when design, permission, history, prompt-context, dependency, or Ticket-boundary questions appear.\n");
     out.push_str("- Report worktree path, branch, commits/status, changed files, implementation summary, validation run, unresolved notes, and whether the branch is ready for external review. Do not merge, push, close Tickets, or delete worktrees.\n");
 }
@@ -1077,6 +1078,12 @@ workflow = "ticket-review-workflow"
         assert!(orchestrator_text.contains("cargo check --workspace --all-targets"));
         assert!(orchestrator_text.contains("workflow_state = inprogress"));
         assert!(orchestrator_text.contains("worktree-workflow"));
+        assert!(orchestrator_text.contains("keep tracked `.yoi` project records visible"));
+        assert!(orchestrator_text.contains("exclude `.yoi/memory`"));
+        assert!(
+            orchestrator_text
+                .contains("prohibit creating generated memory/local/runtime/secret-like files")
+        );
         assert!(orchestrator_text.contains("multi-agent-workflow"));
         assert!(orchestrator_text.contains("coder and reviewer are siblings"));
         assert!(orchestrator_text.contains("branch-local reviewer verdicts"));
@@ -1097,6 +1104,8 @@ workflow = "ticket-review-workflow"
         assert!(coder_text.contains("cargo test -p client ticket_role"));
         assert!(coder_text.contains("provided child worktree/branch"));
         assert!(coder_text.contains("do not edit main-workspace `.yoi`"));
+        assert!(coder_text.contains("child-worktree `.yoi` project records may be visible"));
+        assert!(coder_text.contains("Do not create `.yoi/memory`"));
         assert!(coder_text.contains("Do not merge, push, close Tickets, or delete worktrees"));
 
         let mut reviewer = TicketRoleLaunchContext::new(temp.path(), TicketRole::Reviewer);
