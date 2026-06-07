@@ -190,3 +190,16 @@ Critical risks:
 Orchestrator accepted the queued Ticket for implementation after preflight recorded the strict YAML parsing and project-local migration boundary. Worktree and sibling coder/reviewer routing may proceed from this accepted in-progress state.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-07T22:59:45Z -->
+
+## Implementation report
+
+Coder delegated:
+- Pod: `coder-parse-ticket-frontmatter-as-yaml`
+- Worktree: `.worktree/parse-ticket-frontmatter-as-yaml`
+- Branch: `ticket/parse-ticket-frontmatter-as-yaml`
+- Scope: read access to main workspace only for startup/cwd; write access to the child worktree.
+- Instructions: implement strict YAML-compatible Ticket item frontmatter parsing, migrate existing project Ticket records minimally, add parser and workspace panel regression tests, run focused validation plus `cargo fmt --check`, `git diff --check`, Ticket doctor, and `nix build .#yoi`, then commit locally on the child branch. No merge, close, main workspace edits, or cleanup delegated.
+
+---
