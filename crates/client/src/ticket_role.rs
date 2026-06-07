@@ -552,8 +552,17 @@ fn append_orchestrator_agent_routing_guidance(out: &mut String) {
     out.push_str("- Use `multi-agent-workflow` for the sibling loop: coder and reviewer are siblings under this Orchestrator; coder gets narrow write scope to the child worktree; reviewer is read-only by default.\n");
     out.push_str("- Give the coder an intent packet, child worktree/branch, validation commands, and report expectations; require Bash commands to `cd` into the child worktree and prohibit editing main-workspace `.yoi`/Ticket/workflow/docs records.\n");
     out.push_str("- Give the reviewer the Ticket intent, diff/commits, validation evidence, and blocker/non-blocker criteria; keep branch-local reviewer verdicts in the review report or merge-ready dossier rather than recording them as final main-branch Ticket approval.\n");
-    out.push_str("- Ticket thread progress may record worktree plan, coder delegated/completed/blocked, reviewer delegated, blocker/fix-loop summaries, and merge-ready dossier pointer; do not merge, close, or record final main approval in this phase.\n");
-    out.push_str("- Stop at a merge-ready dossier for `orchestrator-merge-completion` containing branch, commits, conceptual implementation summary, validation evidence, coder/reviewer evidence, blocker loop outcome, residual risk, and parent decision needs.\n");
+    out.push_str("- Ticket thread progress may record worktree plan, coder delegated/completed/blocked, reviewer delegated, blocker/fix-loop summaries, and merge-ready dossier pointer; do not merge, close, or record final main approval in this routing/branch-review phase.\n");
+    out.push_str("- Stop at a merge-ready dossier for `orchestrator-merge-completion` containing Ticket id/slug, branch/worktree, commits, intent/invariant check, implementation summary, coder/reviewer Pods, blockers fixed or rejected findings with reasons, validation performed, residual risks, dirty state, and parent/human decision needs if any.\n");
+
+    out.push_str("\nOrchestrator merge-completion guidance:\n");
+    out.push_str("- Enter merge-completion only for an `inprogress` Ticket with a merge-ready dossier. Conservative or missing authorization mode stops at the dossier; do not infer merge authority from public/default configuration.\n");
+    out.push_str("- Required dossier fields before merge: Ticket id/slug; branch/worktree; commits; intent/invariant check; implementation summary; coder/reviewer Pods; blockers fixed or rejected findings with reasons; validation performed; residual risks; dirty state; parent/human decision needs if any.\n");
+    out.push_str("- Before merging, verify the dossier branch/worktree/commits match the branch to merge, independent reviewer approval exists in the dossier or an explicit human override decision is recorded, the main workspace is safe, and unrelated dirty changes are understood.\n");
+    out.push_str("- Merge only when dogfooding/workspace policy grants merge authority. If authority is unavailable, record/return the dossier and stop without merge, close, final main Ticket approval, or cleanup.\n");
+    out.push_str("- Preserve the boundary: branch-local reviewer verdicts are dossier evidence; final main-branch Ticket approval or close happens only during authorized merge-completion after merge and validation evidence.\n");
+    out.push_str("- Authorized sequence: stop/reclaim coder and reviewer Pods where appropriate; merge with `git merge --no-ff <branch>` or the project-agreed method; run post-merge validation appropriate to the change; record review, merge, and validation outcomes in the Ticket thread during merge-completion; transition `inprogress -> done` or close according to typed Ticket workflow rules; then remove the merged child worktree and delete the merged branch unless explicitly kept.\n");
+    out.push_str("- Post-merge validation baseline: run focused tests from the Ticket/dossier, `cargo fmt --check`, `git diff --check`, and `target/debug/yoi ticket doctor` where applicable; add broader validation such as `cargo check --workspace --all-targets`, `nix build .#yoi`, or equivalent when risk, API surface, packaging, runtime resources, prompts, or touched files warrant it.\n");
 }
 
 fn append_coder_agent_routing_guidance(out: &mut String) {
@@ -1104,6 +1113,66 @@ workflow = "ticket-review-workflow"
         assert!(reviewer_text.contains("read-only by default"));
         assert!(reviewer_text.contains("branch-local reviewer verdict"));
         assert!(reviewer_text.contains("Do not record final main-branch Ticket approval"));
+    }
+
+    #[test]
+    fn orchestrator_prompt_covers_merge_completion_authority_and_dossier_boundaries() {
+        let temp = TempDir::new().unwrap();
+        write_builtin_role_config(temp.path(), &[TicketRole::Orchestrator]);
+        let mut orchestrator = TicketRoleLaunchContext::new(temp.path(), TicketRole::Orchestrator);
+        orchestrator.ticket = Some(TicketRef::slug("orchestrator-merge-completion"));
+        orchestrator.intent_packet =
+            Some("Complete an already-reviewed merge-ready Ticket.".into());
+        orchestrator.validation = vec!["cargo test -p client ticket_role --lib".into()];
+
+        let plan = plan_ticket_role_launch(orchestrator).unwrap();
+        let text = text_segment(&plan);
+
+        assert!(text.contains("Orchestrator merge-completion guidance"));
+        assert!(text.contains("`inprogress` Ticket with a merge-ready dossier"));
+        assert!(text.contains("Conservative or missing authorization mode stops at the dossier"));
+        assert!(text.contains("do not infer merge authority"));
+        assert!(text.contains("dossier branch/worktree/commits match the branch to merge"));
+        assert!(text.contains("independent reviewer approval exists in the dossier"));
+        assert!(text.contains("explicit human override decision is recorded"));
+        assert!(text.contains("the main workspace is safe"));
+        assert!(text.contains("unrelated dirty changes are understood"));
+        assert!(text.contains("dogfooding/workspace policy grants merge authority"));
+        assert!(text.contains("branch-local reviewer verdicts are dossier evidence"));
+        assert!(text.contains("final main-branch Ticket approval or close happens only during authorized merge-completion"));
+        assert!(text.contains("stop/reclaim coder and reviewer Pods"));
+        assert!(text.contains("git merge --no-ff <branch>"));
+        assert!(text.contains("run post-merge validation appropriate to the change"));
+        assert!(
+            text.contains("record review, merge, and validation outcomes in the Ticket thread")
+        );
+        assert!(text.contains(
+            "transition `inprogress -> done` or close according to typed Ticket workflow rules"
+        ));
+        assert!(text.contains(
+            "remove the merged child worktree and delete the merged branch unless explicitly kept"
+        ));
+        assert!(text.contains("Required dossier fields before merge"));
+        assert!(text.contains("Ticket id/slug"));
+        assert!(text.contains("branch/worktree"));
+        assert!(text.contains("commits"));
+        assert!(text.contains("intent/invariant check"));
+        assert!(text.contains("implementation summary"));
+        assert!(text.contains("coder/reviewer Pods"));
+        assert!(text.contains("blockers fixed or rejected findings with reasons"));
+        assert!(text.contains("validation performed"));
+        assert!(text.contains("residual risks"));
+        assert!(text.contains("dirty state"));
+        assert!(text.contains("parent/human decision needs if any"));
+        assert!(text.contains("Post-merge validation baseline"));
+        assert!(text.contains("focused tests from the Ticket/dossier"));
+        assert!(text.contains("cargo fmt --check"));
+        assert!(text.contains("git diff --check"));
+        assert!(text.contains("target/debug/yoi ticket doctor"));
+        assert!(text.contains("where applicable"));
+        assert!(text.contains("cargo check --workspace --all-targets"));
+        assert!(text.contains("nix build .#yoi"));
+        assert!(text.contains("when risk, API surface, packaging, runtime resources, prompts, or touched files warrant it"));
     }
 
     #[test]
