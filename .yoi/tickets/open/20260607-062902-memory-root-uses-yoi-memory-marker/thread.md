@@ -71,3 +71,26 @@ Ticket intake complete; workflow_state intake -> ready.
 
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-06-07T07:45:55Z -->
+
+## Implementation report
+
+## Delegation
+
+Implementation delegated to child Pod `memory-root-marker-coder-20260607` in worktree `.worktree/memory-root-uses-yoi-memory-marker` on branch `work/memory-root-uses-yoi-memory-marker`.
+
+The worktree uses the new narrowed sparse rules:
+- `.yoi` project records are visible;
+- `.yoi/memory` is absent.
+
+Scope:
+- Keep `.yoi` as project records marker.
+- Resolve memory from explicit `memory.workspace_root` or nearest ancestor `.yoi/memory`.
+- Do not treat `.yoi` alone as memory root.
+- Do not add broad memory enable/disable redesign.
+- Do not change child worktree sparse rules; that has already landed.
+
+The child should commit implementation work in the child worktree and report diff/tests. Merge, review, Ticket closure, and cleanup remain with the parent/human workflow.
+
+---

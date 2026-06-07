@@ -8,7 +8,7 @@ priority: P1
 labels: [memory, workspace, worktree, config]
 workflow_state: ready
 created_at: 2026-06-07T06:29:02Z
-updated_at: 2026-06-07T07:45:01Z
+updated_at: 2026-06-07T07:45:55Z
 assignee: null
 legacy_ticket: null
 ---
