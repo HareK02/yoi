@@ -94,3 +94,35 @@ Scope:
 The child should commit implementation work in the child worktree and report diff/tests. Merge, review, Ticket closure, and cleanup remain with the parent/human workflow.
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-06-07T07:53:06Z -->
+
+## Implementation report
+
+## Implementation report
+
+Coder Pod `memory-root-marker-coder-20260607` completed implementation in `.worktree/memory-root-uses-yoi-memory-marker`.
+
+Commit:
+- `9ed6613 memory: resolve repo memory by memory marker`
+
+Reported summary:
+- Updated `WorkspaceLayout::resolve` to honor explicit `memory.workspace_root` exactly.
+- Without explicit root, it searches `default_root` ancestors for the nearest `.yoi/memory` marker.
+- `.yoi` alone is never treated as a memory root marker.
+- If no marker exists, it falls back to `default_root` as documented no-marker compatibility behavior.
+- Added focused tests for explicit root, ancestor marker selection, child worktree project records without memory, and `.yoi`-alone non-marker behavior.
+- Updated `MemoryConfig` docs for marker-based implicit resolution.
+
+Reported validation:
+- `cargo test -p memory workspace --lib`
+- `cargo test -p pod memory --lib`
+- `cargo test -p yoi memory` (reported no lib target)
+- `cargo fmt --check`
+- `git diff --check`
+- `target/debug/yoi ticket doctor`
+- `nix build .#yoi`
+
+External review will be delegated before merge.
+
+---
