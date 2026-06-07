@@ -51,3 +51,41 @@ Keep Orchestrator lifecycle diagnostics visible across panel refreshes until sup
 
 
 ---
+
+<!-- event: plan author: hare at: 2026-06-07T10:00:33Z -->
+
+## Plan
+
+## Delegation intent
+
+Implement `workspace-orchestrator-spawn-diagnostic-persistence` in a dedicated worktree.
+
+Worktree:
+- `.worktree/workspace-orchestrator-spawn-diagnostic-persistence`
+- branch `work/workspace-orchestrator-spawn-diagnostic-persistence`
+
+Coder Pod:
+- `orchestrator-diagnostic-coder-20260607`
+
+Scope and boundaries:
+- Keep Orchestrator scope policy unchanged. The observed scope conflict with the current `yoi` Pod is expected for dogfooding and should remain a visible diagnostic, not be solved by loosening scope.
+- Preserve the current `Ensure` vs `Observe` lifecycle distinction. `Observe` refresh must not retry spawn.
+- Persist or carry forward the most recent actionable Orchestrator lifecycle failure from an `Ensure` attempt so a later `Observe` result of plain `missing` does not erase it.
+- Clear/supersede stale lifecycle failures when Orchestrator becomes live/restored/spawned or when a newer lifecycle diagnostic is produced.
+- Keep Ticket actionbar gate messages separate from Orchestrator lifecycle diagnostics.
+- Prefer a small panel/app-state model change plus focused tests over broad UI restructuring.
+
+Relevant code map:
+- `crates/tui/src/multi_pod.rs`: panel load/reload, `OrchestratorLifecycleMode::{Ensure, Observe}`, `orchestrator_lifecycle`, `spawn_orchestrator_pod`, snapshot assembly.
+- `crates/tui/src/workspace_panel.rs`: panel model/header diagnostics rendering and actionbar behavior.
+- `crates/client/src/ticket_role.rs`: Ticket role Pod launch path; errors from spawn/connect/initial Run should remain available to the TUI lifecycle layer.
+
+Requested validation:
+- Focused TUI tests covering diagnostic persistence and clearing.
+- `cargo test -p tui ... --lib` for affected tests.
+- `cargo fmt --check`.
+- `git diff --check`.
+- `target/debug/yoi ticket doctor`.
+
+
+---
