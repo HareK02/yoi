@@ -106,7 +106,7 @@ reviewer には coder の実装方針ではなく、この intent packet と dif
 
 2. worktree 作成
    - `$user/worktree-workflow` に従い `./.worktree/<task-name>` を作る。
-   - `.yoi` を sparse checkout で除外する。
+   - `.yoi` 自体は除外しない。tracked project records は child worktree に存在してよく、`.yoi/memory` と local/runtime/log/lock/secret-like paths だけを sparse checkout で除外する。
 
 3. coder Pod spawn
    - read scope: main workspace 全体。
@@ -117,6 +117,8 @@ reviewer には coder の実装方針ではなく、この intent packet と dif
      - intent packet
      - Bash は必ず child worktree に `cd` すること
      - main workspace の `TODO.md` / `tickets/` / `docs/report/` / `.yoi` は編集しないこと
+     - child worktree 内の tracked `.yoi` project records は実装対象に必要な branch-local artifacts/dossiers として編集してよいが、`.yoi/memory` や local/runtime/secret-like files は作らないこと
+     - active orchestration progress と最終 review/approval/close は main workspace の責任として残すこと
      - 範囲外事項
      - 実行すべき build / test / format
      - 完了報告項目
@@ -155,6 +157,8 @@ reviewer には coder の実装方針ではなく、この intent packet と dif
 
 - child worktree 内でのみ実装する。
 - main workspace の管理ファイルを書かない。
+- child worktree 内の tracked `.yoi` project records は ticket 要件に必要な branch-local artifact/dossier として扱ってよい。
+- `.yoi/memory`、local/runtime state、logs、locks、secret-like files を child worktree に作らない。
 - intent / requirements / invariants / non-goals を読んでから実装する。
 - 指定された build / test / format を実行する。
 - ticket 要件外の設計変更、依存関係追加、scope / permission / history persistence / prompt context 加工原則に触れる変更が必要なら止めて orchestrator に報告する。
@@ -191,7 +195,7 @@ coder Pod には child worktree 内での commit を許可してよい。
 - commit は ticket 内で意味のある粒度にする。
   - 例: `feat: ...`、`fix: ...`、`test: ...`、`docs: ...`
 - coder Pod は merge / push / branch deletion / worktree remove をしない。
-- coder Pod は `TODO.md` / ticket の完了処理 commit をしない。
+- coder Pod は main workspace の Ticket 完了処理 commit、最終 review/approval/close をしない。child worktree 側には branch-local dossier や実装証跡を残してよい。
 - orchestrator は review 時に commit 粒度も確認する。
 - 必要な修正は、原則追加 commit として積む。履歴改変や squash は人間の明示指示がある時だけ行う。
 
