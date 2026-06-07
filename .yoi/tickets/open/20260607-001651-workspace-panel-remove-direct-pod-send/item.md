@@ -6,9 +6,9 @@ status: open
 kind: task
 priority: P1
 labels: [tui, panel, companion, cleanup]
-workflow_state: intake
+workflow_state: ready
 created_at: 2026-06-07T00:16:51Z
-updated_at: 2026-06-07T00:16:51Z
+updated_at: 2026-06-07T01:32:18Z
 assignee: null
 legacy_ticket: null
 ---
