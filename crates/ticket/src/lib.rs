@@ -1803,27 +1803,6 @@ fn ticket_meta(frontmatter: TicketItemFrontmatter) -> TicketMeta {
 }
 
 fn format_yaml_string_scalar(value: &str) -> String {
-    let reserved = matches!(
-        value,
-        "" | "null"
-            | "Null"
-            | "NULL"
-            | "~"
-            | "true"
-            | "True"
-            | "TRUE"
-            | "false"
-            | "False"
-            | "FALSE"
-    );
-    let plain_safe = !reserved
-        && value
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '/' | '.'));
-    if plain_safe {
-        return value.to_string();
-    }
-
     let mut out = String::from("'");
     for ch in value.chars() {
         if ch == '\'' {
@@ -2510,6 +2489,45 @@ workflow_state: intake
         let record = backend.show(TicketIdOrSlug::Id(ticket.id.clone())).unwrap();
         assert_eq!(record.meta.workflow_state, TicketWorkflowState::Intake);
         assert!(record.meta.workflow_state_explicit);
+        let report = backend.doctor().unwrap();
+        assert!(report.is_ok(), "{:?}", report.diagnostics);
+    }
+
+    #[test]
+    fn create_round_trips_numeric_looking_string_frontmatter_values() {
+        let tmp = TempDir::new().unwrap();
+        let backend = backend(&tmp);
+        let mut input = NewTicket::new("123");
+        input.slug = Some("numeric-looking-strings".to_string());
+        input.labels = vec!["123".into(), "01".into()];
+        input.risk_flags = vec!["1".into(), "42".into()];
+        input.assignee = Some("42".into());
+        input.attention_required = Some("0".into());
+        input.action_required = Some("true".into());
+        let ticket = backend.create(input).unwrap();
+
+        let record = backend.show(TicketIdOrSlug::Id(ticket.id.clone())).unwrap();
+        assert_eq!(record.meta.title, "123");
+        assert_eq!(record.meta.labels, vec!["123", "01"]);
+        assert_eq!(record.meta.risk_flags, vec!["1", "42"]);
+        assert_eq!(record.meta.assignee.as_deref(), Some("42"));
+        assert_eq!(record.meta.attention_required.as_deref(), Some("0"));
+        assert_eq!(record.meta.action_required.as_deref(), Some("true"));
+
+        let item = fs::read_to_string(
+            tmp.path()
+                .join("tickets/open")
+                .join(&ticket.id)
+                .join("item.md"),
+        )
+        .unwrap();
+        assert!(item.contains("title: '123'"), "{item}");
+        assert!(item.contains("labels: ['123', '01']"), "{item}");
+        assert!(item.contains("risk_flags: ['1', '42']"), "{item}");
+        assert!(item.contains("assignee: '42'"), "{item}");
+        assert!(item.contains("attention_required: '0'"), "{item}");
+        assert!(item.contains("action_required: 'true'"), "{item}");
+
         let report = backend.doctor().unwrap();
         assert!(report.is_ok(), "{:?}", report.diagnostics);
     }
