@@ -1,3 +1,4 @@
+use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -37,12 +38,14 @@ use crate::role_session_registry::{
     PanelRegistryStore, RelatedTicketRef, RoleSessionOrigin, TicketClaimResult,
 };
 use crate::workspace_panel::{
-    ActionPriority, ComposerTarget, NextUserAction, OrchestratorLifecyclePlan,
+    ActionPriority, CompanionLifecyclePlan, CompanionPanelState, CompanionPanelStatus,
+    CompanionPodPresence, ComposerTarget, NextUserAction, OrchestratorLifecyclePlan,
     OrchestratorPanelState, OrchestratorPanelStatus, OrchestratorPodPresence, PanelRow,
     PanelRowKey, TicketConfigAvailability, TicketLocalClaimStatus, WorkspacePanelViewModel,
     bounded_panel_diagnostic, build_current_ticket_row, build_workspace_panel,
-    decide_orchestrator_lifecycle, local_claim_status_for_pod, orchestrator_pod_presence,
-    ticket_config_availability, workspace_orchestrator_pod_name,
+    companion_pod_presence, decide_companion_lifecycle, decide_orchestrator_lifecycle,
+    local_claim_status_for_pod, orchestrator_pod_presence, ticket_config_availability,
+    workspace_companion_pod_name, workspace_orchestrator_pod_name,
 };
 
 const MAX_ENTRIES: usize = 50;
@@ -159,6 +162,14 @@ pub(crate) async fn run(
                     terminal.draw(|f| draw(f, app))?;
                     let result = launch_intake_with_handoff(request).await;
                     app.finish_intake_launch(result);
+                    app.reload_or_notice().await;
+                    next_poll = Instant::now() + MULTI_POD_POLL_INTERVAL;
+                }
+                MultiPodAction::SendCompanion(request) => {
+                    pending_reload.abort();
+                    terminal.draw(|f| draw(f, app))?;
+                    let result = dispatch_companion_message(request).await;
+                    app.finish_companion_send(result);
                     app.reload_or_notice().await;
                     next_poll = Instant::now() + MULTI_POD_POLL_INTERVAL;
                 }
@@ -305,7 +316,105 @@ impl IntakePeerRegistrationStatus {
 
 pub(crate) type IntakeLaunchResult = Result<IntakeLaunchOutcome, TicketRoleLaunchError>;
 
-pub(crate) async fn launch_intake_with_handoff(request: IntakeLaunchRequest) -> IntakeLaunchResult {
+pub(crate) async fn dispatch_companion_message(
+    request: CompanionSendRequest,
+) -> Result<CompanionSendOutcome, CompanionSendError> {
+    let stream = tokio::time::timeout(SOCKET_OP_TIMEOUT, UnixStream::connect(&request.socket_path))
+        .await
+        .map_err(|_| CompanionSendError::Rejected {
+            pod_name: request.pod_name.clone(),
+            message: "connect timed out".to_string(),
+        })?
+        .map_err(|source| CompanionSendError::Connect {
+            pod_name: request.pod_name.clone(),
+            source,
+        })?;
+    let (read_half, write_half) = stream.into_split();
+    let mut reader = JsonLineReader::new(read_half);
+    let mut writer = JsonLineWriter::new(write_half);
+
+    loop {
+        let event = tokio::time::timeout(SOCKET_OP_TIMEOUT, reader.next::<Event>())
+            .await
+            .map_err(|_| CompanionSendError::Rejected {
+                pod_name: request.pod_name.clone(),
+                message: "initial Snapshot timed out".to_string(),
+            })?
+            .map_err(|source| CompanionSendError::Read {
+                pod_name: request.pod_name.clone(),
+                source,
+            })?;
+        match event {
+            Some(Event::Snapshot { .. }) => break,
+            Some(Event::Alert(_)) => continue,
+            Some(Event::Error { message, .. }) => {
+                return Err(CompanionSendError::Rejected {
+                    pod_name: request.pod_name,
+                    message,
+                });
+            }
+            Some(_) => continue,
+            None => {
+                return Err(CompanionSendError::Closed {
+                    pod_name: request.pod_name,
+                });
+            }
+        }
+    }
+
+    tokio::time::timeout(
+        SOCKET_OP_TIMEOUT,
+        writer.write(&Method::Run {
+            input: request.segments,
+        }),
+    )
+    .await
+    .map_err(|_| CompanionSendError::Rejected {
+        pod_name: request.pod_name.clone(),
+        message: "write timed out".to_string(),
+    })?
+    .map_err(|source| CompanionSendError::Write {
+        pod_name: request.pod_name.clone(),
+        source,
+    })?;
+
+    loop {
+        match tokio::time::timeout(SOCKET_OP_TIMEOUT, reader.next::<Event>()).await {
+            Ok(Ok(Some(Event::UserMessage { .. }))) => {
+                return Ok(CompanionSendOutcome {
+                    notice: format!("Sent to Companion {}.", request.pod_name),
+                });
+            }
+            Ok(Ok(Some(Event::Error { message, .. }))) => {
+                return Err(CompanionSendError::Rejected {
+                    pod_name: request.pod_name,
+                    message,
+                });
+            }
+            Ok(Ok(Some(Event::Snapshot { .. } | Event::Alert(_)))) => continue,
+            Ok(Ok(Some(_))) => continue,
+            Ok(Ok(None)) => {
+                return Err(CompanionSendError::Closed {
+                    pod_name: request.pod_name,
+                });
+            }
+            Ok(Err(source)) => {
+                return Err(CompanionSendError::Read {
+                    pod_name: request.pod_name,
+                    source,
+                });
+            }
+            Err(_) => {
+                return Err(CompanionSendError::Rejected {
+                    pod_name: request.pod_name,
+                    message: "acceptance read timed out".to_string(),
+                });
+            }
+        }
+    }
+}
+
+async fn launch_intake_with_handoff(request: IntakeLaunchRequest) -> IntakeLaunchResult {
     let (options, orchestrator_pod, skip_warning) = match request.peer_registration.clone() {
         IntakePeerRegistrationRequest::Register { orchestrator_pod } => (
             TicketRoleLaunchOptions::default()
@@ -383,6 +492,7 @@ pub(crate) struct MultiPodApp {
     notice: Option<String>,
     sending: bool,
     runtime_command: PodRuntimeCommand,
+    last_companion_lifecycle_failure: Option<CompanionPanelState>,
     last_orchestrator_lifecycle_failure: Option<OrchestratorPanelState>,
 }
 
@@ -398,6 +508,8 @@ impl MultiPodApp {
             },
         )
         .await?;
+        let last_companion_lifecycle_failure =
+            companion_lifecycle_failure_from_panel(&snapshot.panel);
         let last_orchestrator_lifecycle_failure =
             orchestrator_lifecycle_failure_from_panel(&snapshot.panel);
         let mut app = Self {
@@ -409,6 +521,7 @@ impl MultiPodApp {
             notice: None,
             sending: false,
             runtime_command,
+            last_companion_lifecycle_failure,
             last_orchestrator_lifecycle_failure,
         };
         app.ensure_selection_visible();
@@ -443,6 +556,7 @@ impl MultiPodApp {
     }
 
     fn apply_reloaded_snapshot(&mut self, mut snapshot: MultiPodSnapshot) {
+        self.apply_companion_lifecycle_memory(&mut snapshot.panel);
         self.apply_orchestrator_lifecycle_memory(&mut snapshot.panel);
         let previous_selected_pod = self.list.selected_name.clone();
         snapshot.list.selected_name = previous_selected_pod
@@ -466,6 +580,35 @@ impl MultiPodApp {
         self.selected_row = previous_row.filter(|key| self.panel.row(key).is_some());
         self.ensure_selection_visible();
         self.ensure_composer_target_available();
+    }
+
+    fn apply_companion_lifecycle_memory(&mut self, panel: &mut WorkspacePanelViewModel) {
+        let Some(state) = panel.header.companion.as_ref() else {
+            self.last_companion_lifecycle_failure = None;
+            return;
+        };
+
+        match state.status {
+            CompanionPanelStatus::Unavailable => {
+                self.last_companion_lifecycle_failure =
+                    companion_lifecycle_failure_from_panel(panel);
+            }
+            CompanionPanelStatus::Live
+            | CompanionPanelStatus::Spawned
+            | CompanionPanelStatus::Restored => {
+                self.last_companion_lifecycle_failure = None;
+            }
+            CompanionPanelStatus::Missing | CompanionPanelStatus::Stopped => {
+                if let Some(previous) = self.last_companion_lifecycle_failure.clone() {
+                    if previous.pod_name == state.pod_name {
+                        panel.header.companion = Some(previous.clone());
+                        append_unique_diagnostic(panel, previous.detail.as_deref());
+                    } else {
+                        self.last_companion_lifecycle_failure = None;
+                    }
+                }
+            }
+        }
     }
 
     fn apply_orchestrator_lifecycle_memory(&mut self, panel: &mut WorkspacePanelViewModel) {
@@ -704,16 +847,82 @@ impl MultiPodApp {
         segments_are_blank(&self.input.submit_segments())
     }
 
-    pub(crate) fn reject_companion_submit(&mut self) {
+    pub(crate) fn prepare_companion_send(&mut self) -> Option<CompanionSendRequest> {
         let segments = self.input.submit_segments();
         if segments_are_blank(&segments) {
             self.notice = Some("Composer is empty.".to_string());
-            return;
+            return None;
         }
+        let Some(companion) = self.panel.header.companion.as_ref() else {
+            self.notice = Some("Workspace Companion is unavailable; draft kept.".to_string());
+            return None;
+        };
+        if matches!(
+            companion.status,
+            CompanionPanelStatus::Unavailable
+                | CompanionPanelStatus::Missing
+                | CompanionPanelStatus::Stopped
+        ) {
+            let detail = companion
+                .detail
+                .as_deref()
+                .unwrap_or("workspace Companion is not live yet");
+            self.notice = Some(bounded_panel_diagnostic(format!(
+                "Companion {} is {}: {detail}; draft kept.",
+                companion.pod_name,
+                companion.status.label()
+            )));
+            return None;
+        }
+        let Some(entry) = self
+            .list
+            .entries
+            .iter()
+            .find(|entry| entry.name == companion.pod_name)
+        else {
+            self.notice = Some(format!(
+                "Companion {} is not in the current Pod list; refresh and retry. Draft kept.",
+                companion.pod_name
+            ));
+            return None;
+        };
+        let Some(live) = entry.live.as_ref().filter(|live| live.reachable) else {
+            self.notice = Some(format!(
+                "Companion {} is not reachable; refresh and retry. Draft kept.",
+                companion.pod_name
+            ));
+            return None;
+        };
+        if live.status == Some(PodStatus::Running) {
+            self.notice = Some(format!(
+                "Companion {} is busy; wait for it to become idle or open it for inspection. Draft kept.",
+                companion.pod_name
+            ));
+            return None;
+        }
+        self.sending = true;
+        self.notice = Some(format!("Sending to Companion {}…", companion.pod_name));
+        Some(CompanionSendRequest {
+            pod_name: companion.pod_name.clone(),
+            socket_path: live.socket_path.clone(),
+            segments,
+        })
+    }
+
+    pub(crate) fn finish_companion_send(
+        &mut self,
+        result: Result<CompanionSendOutcome, CompanionSendError>,
+    ) {
         self.sending = false;
-        self.notice = Some(bounded_panel_diagnostic(
-            "Companion composer is not wired to a Companion Pod yet; draft kept. Press o or empty Enter to open/attach the selected Pod.",
-        ));
+        match result {
+            Ok(outcome) => {
+                self.input.clear();
+                self.notice = Some(outcome.notice);
+            }
+            Err(error) => {
+                self.notice = Some(bounded_panel_diagnostic(error.to_string()));
+            }
+        }
     }
 
     pub(crate) fn prepare_ticket_action_dispatch(&mut self) -> Option<TicketActionRequest> {
@@ -1022,10 +1231,10 @@ impl MultiPodApp {
                 .map(MultiPodAction::LaunchIntake)
                 .unwrap_or(MultiPodAction::None),
             KeyCode::Enter if self.composer_is_blank() => MultiPodAction::Open,
-            KeyCode::Enter => {
-                self.reject_companion_submit();
-                MultiPodAction::None
-            }
+            KeyCode::Enter => self
+                .prepare_companion_send()
+                .map(MultiPodAction::SendCompanion)
+                .unwrap_or(MultiPodAction::None),
             KeyCode::Backspace => {
                 self.input.delete_before();
                 MultiPodAction::None
@@ -1066,12 +1275,24 @@ enum MultiPodAction {
     Refresh,
     DispatchTicketAction(TicketActionRequest),
     LaunchIntake(IntakeLaunchRequest),
+    SendCompanion(CompanionSendRequest),
 }
 
 #[derive(Debug, Clone)]
 struct MultiPodSnapshot {
     list: PodList,
     panel: WorkspacePanelViewModel,
+}
+
+fn companion_lifecycle_failure_from_panel(
+    panel: &WorkspacePanelViewModel,
+) -> Option<CompanionPanelState> {
+    let state = panel.header.companion.as_ref()?;
+    if state.status == CompanionPanelStatus::Unavailable && state.detail.is_some() {
+        Some(state.clone())
+    } else {
+        None
+    }
 }
 
 fn orchestrator_lifecycle_failure_from_panel(
@@ -1110,7 +1331,29 @@ async fn load_multi_pod_snapshot(
     lifecycle_mode: OrchestratorLifecycleMode,
 ) -> Result<MultiPodSnapshot, MultiPodError> {
     let workspace_root = current_workspace_root();
-    let mut list = load_pod_list(selected_name.clone(), MAX_ENTRIES).await?;
+    let companion_pod_name = workspace_companion_pod_name(&workspace_root);
+    let list_selected_name = selected_name
+        .clone()
+        .or_else(|| Some(companion_pod_name.clone()));
+    let mut list = load_pod_list(list_selected_name.clone(), MAX_ENTRIES).await?;
+    let companion_presence = load_exact_companion_pod_presence(&companion_pod_name).await?;
+    let companion = match lifecycle_mode.clone() {
+        OrchestratorLifecycleMode::Ensure { runtime_command } => {
+            ensure_workspace_companion(
+                &workspace_root,
+                companion_pod_name,
+                companion_presence,
+                runtime_command,
+            )
+            .await
+        }
+        OrchestratorLifecycleMode::Observe => {
+            observe_workspace_companion(companion_pod_name, companion_presence)
+        }
+    };
+    if companion.reload_pods {
+        list = load_pod_list(list_selected_name.clone(), MAX_ENTRIES).await?;
+    }
     let config = ticket_config_availability(&workspace_root);
     let orchestrator_pod_name = workspace_orchestrator_pod_name(&workspace_root);
     let orchestrator_presence = match &config {
@@ -1135,12 +1378,119 @@ async fn load_multi_pod_snapshot(
         }
     };
     if orchestrator.reload_pods {
-        list = load_pod_list(selected_name, MAX_ENTRIES).await?;
+        list = load_pod_list(list_selected_name, MAX_ENTRIES).await?;
     }
     let mut panel = build_workspace_panel(&workspace_root, &list);
+    panel.header.companion = companion.state;
+    panel.header.diagnostics.extend(companion.diagnostics);
     panel.header.orchestrator = orchestrator.state;
     panel.header.diagnostics.extend(orchestrator.diagnostics);
     Ok(MultiPodSnapshot { list, panel })
+}
+
+#[derive(Debug, Clone)]
+struct CompanionLifecycleReport {
+    state: Option<CompanionPanelState>,
+    diagnostics: Vec<String>,
+    reload_pods: bool,
+}
+
+impl CompanionLifecycleReport {
+    fn with_state(state: CompanionPanelState) -> Self {
+        Self {
+            state: Some(state),
+            diagnostics: Vec::new(),
+            reload_pods: false,
+        }
+    }
+
+    fn unavailable(pod_name: String, detail: String) -> Self {
+        let detail = bounded_panel_diagnostic(detail);
+        Self {
+            state: Some(CompanionPanelState::new(
+                pod_name,
+                CompanionPanelStatus::Unavailable,
+                Some(detail.clone()),
+            )),
+            diagnostics: vec![detail],
+            reload_pods: false,
+        }
+    }
+
+    fn mark_reload(mut self) -> Self {
+        self.reload_pods = true;
+        self
+    }
+}
+
+async fn ensure_workspace_companion(
+    workspace_root: &Path,
+    pod_name: String,
+    presence: CompanionPodPresence,
+    runtime_command: PodRuntimeCommand,
+) -> CompanionLifecycleReport {
+    match decide_companion_lifecycle(&presence) {
+        CompanionLifecyclePlan::ReportLive => CompanionLifecycleReport::with_state(
+            CompanionPanelState::new(pod_name, CompanionPanelStatus::Live, None),
+        ),
+        CompanionLifecyclePlan::Restore => {
+            match restore_workspace_companion_pod(
+                workspace_root,
+                &pod_name,
+                runtime_command.clone(),
+            )
+            .await
+            {
+                Ok(()) => CompanionLifecycleReport::with_state(CompanionPanelState::new(
+                    pod_name,
+                    CompanionPanelStatus::Restored,
+                    Some("restored existing Pod state".to_string()),
+                ))
+                .mark_reload(),
+                Err(error) => CompanionLifecycleReport::unavailable(
+                    pod_name,
+                    format!("could not restore workspace Companion: {error}"),
+                ),
+            }
+        }
+        CompanionLifecyclePlan::Spawn => {
+            match spawn_workspace_companion_pod(workspace_root, &pod_name, runtime_command).await {
+                Ok(()) => CompanionLifecycleReport::with_state(CompanionPanelState::new(
+                    pod_name,
+                    CompanionPanelStatus::Spawned,
+                    Some("launched with default Companion profile".to_string()),
+                ))
+                .mark_reload(),
+                Err(error) => CompanionLifecycleReport::unavailable(
+                    pod_name,
+                    format!("could not spawn workspace Companion: {error}"),
+                ),
+            }
+        }
+        CompanionLifecyclePlan::Unavailable(message) => {
+            CompanionLifecycleReport::unavailable(pod_name, message)
+        }
+    }
+}
+
+fn observe_workspace_companion(
+    pod_name: String,
+    presence: CompanionPodPresence,
+) -> CompanionLifecycleReport {
+    match presence {
+        CompanionPodPresence::Live => CompanionLifecycleReport::with_state(
+            CompanionPanelState::new(pod_name, CompanionPanelStatus::Live, None),
+        ),
+        CompanionPodPresence::Restorable => CompanionLifecycleReport::with_state(
+            CompanionPanelState::new(pod_name, CompanionPanelStatus::Stopped, None),
+        ),
+        CompanionPodPresence::Missing => CompanionLifecycleReport::with_state(
+            CompanionPanelState::new(pod_name, CompanionPanelStatus::Missing, None),
+        ),
+        CompanionPodPresence::Unavailable(message) => {
+            CompanionLifecycleReport::unavailable(pod_name, message)
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1279,6 +1629,38 @@ async fn orchestrator_lifecycle(
     }
 }
 
+async fn restore_workspace_companion_pod(
+    workspace_root: &Path,
+    pod_name: &str,
+    runtime_command: PodRuntimeCommand,
+) -> Result<(), client::SpawnError> {
+    let config = SpawnConfig {
+        runtime_command,
+        pod_name: pod_name.to_string(),
+        profile: None,
+        cwd: workspace_root.to_path_buf(),
+        resume_from: None,
+        resume_by_pod_name: true,
+    };
+    spawn_pod(config, |_| {}).await.map(|_| ())
+}
+
+async fn spawn_workspace_companion_pod(
+    workspace_root: &Path,
+    pod_name: &str,
+    runtime_command: PodRuntimeCommand,
+) -> Result<(), client::SpawnError> {
+    let config = SpawnConfig {
+        runtime_command,
+        pod_name: pod_name.to_string(),
+        profile: None,
+        cwd: workspace_root.to_path_buf(),
+        resume_from: None,
+        resume_by_pod_name: false,
+    };
+    spawn_pod(config, |_| {}).await.map(|_| ())
+}
+
 async fn restore_orchestrator_pod(
     workspace_root: &Path,
     pod_name: &str,
@@ -1348,6 +1730,13 @@ fn existing_ticket_claim_notice(
     }
 }
 
+async fn load_exact_companion_pod_presence(
+    pod_name: &str,
+) -> Result<CompanionPodPresence, MultiPodError> {
+    let list = load_pod_list(Some(pod_name.to_string()), usize::MAX).await?;
+    Ok(companion_pod_presence(pod_name, &list))
+}
+
 async fn load_exact_pod_presence(pod_name: &str) -> Result<OrchestratorPodPresence, MultiPodError> {
     let list = load_pod_list(Some(pod_name.to_string()), usize::MAX).await?;
     Ok(orchestrator_pod_presence(pod_name, &list))
@@ -1372,6 +1761,68 @@ async fn load_pod_list(
         max_entries,
     ))
 }
+
+#[derive(Debug, Clone)]
+pub(crate) struct CompanionSendRequest {
+    pub(crate) pod_name: String,
+    pub(crate) socket_path: PathBuf,
+    pub(crate) segments: Vec<Segment>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CompanionSendOutcome {
+    pub(crate) notice: String,
+}
+
+#[derive(Debug)]
+pub(crate) enum CompanionSendError {
+    Connect {
+        pod_name: String,
+        source: std::io::Error,
+    },
+    Write {
+        pod_name: String,
+        source: std::io::Error,
+    },
+    Read {
+        pod_name: String,
+        source: std::io::Error,
+    },
+    Rejected {
+        pod_name: String,
+        message: String,
+    },
+    Closed {
+        pod_name: String,
+    },
+}
+
+impl fmt::Display for CompanionSendError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Connect { pod_name, source } => {
+                write!(f, "Companion {pod_name} is unreachable: {source}")
+            }
+            Self::Write { pod_name, source } => {
+                write!(f, "Failed to send to Companion {pod_name}: {source}")
+            }
+            Self::Read { pod_name, source } => {
+                write!(f, "Failed while waiting for Companion {pod_name}: {source}")
+            }
+            Self::Rejected { pod_name, message } => {
+                write!(f, "Companion {pod_name} rejected the message: {message}")
+            }
+            Self::Closed { pod_name } => {
+                write!(
+                    f,
+                    "Companion {pod_name} closed the socket before accepting the message"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for CompanionSendError {}
 
 #[derive(Debug, Clone)]
 pub(crate) struct TicketActionRequest {
@@ -1969,6 +2420,16 @@ fn draw_title(frame: &mut Frame<'_>, app: &MultiPodApp, area: Rect) {
         ),
         Span::styled(guidance, Style::default().fg(Color::DarkGray)),
     ];
+    if let Some(companion) = &app.panel.header.companion {
+        spans.push(Span::styled(
+            " · companion ",
+            Style::default().fg(Color::DarkGray),
+        ));
+        spans.push(Span::styled(
+            companion.status.label(),
+            companion_status_style(companion.status),
+        ));
+    }
     if let Some(orchestrator) = &app.panel.header.orchestrator {
         spans.push(Span::styled(
             " · orchestrator ",
@@ -1980,6 +2441,18 @@ fn draw_title(frame: &mut Frame<'_>, app: &MultiPodApp, area: Rect) {
         ));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn companion_status_style(status: CompanionPanelStatus) -> Style {
+    match status {
+        CompanionPanelStatus::Live
+        | CompanionPanelStatus::Restored
+        | CompanionPanelStatus::Spawned => Style::default().fg(Color::Green),
+        CompanionPanelStatus::Stopped | CompanionPanelStatus::Missing => {
+            Style::default().fg(Color::Yellow)
+        }
+        CompanionPanelStatus::Unavailable => Style::default().fg(Color::Red),
+    }
 }
 
 fn orchestrator_status_style(status: OrchestratorPanelStatus) -> Style {
@@ -2780,7 +3253,7 @@ mod tests {
             app.notice
                 .as_deref()
                 .unwrap()
-                .contains("Companion composer is not wired")
+                .contains("Workspace Companion is unavailable")
         );
     }
 
@@ -3388,32 +3861,81 @@ mod tests {
     }
 
     #[test]
-    fn multi_companion_submit_keeps_composer_contents() {
-        let mut app = test_app(vec![live_info("idle", PodStatus::Idle)]);
+    fn multi_companion_submit_routes_to_workspace_companion_not_selected_pod() {
+        let mut app = companion_app(
+            vec![
+                live_info("alpha", PodStatus::Idle),
+                live_info("yoi", PodStatus::Idle),
+            ],
+            CompanionPanelStatus::Live,
+        );
+        let alpha_index = app
+            .list
+            .entries
+            .iter()
+            .position(|entry| entry.name == "alpha")
+            .unwrap();
+        app.list.select_index(alpha_index);
+        app.input.insert_str("send to companion");
+
+        let request = match app.handle_key(key(KeyCode::Enter)) {
+            MultiPodAction::SendCompanion(request) => request,
+            _ => panic!("Companion target should send to the workspace Companion"),
+        };
+
+        assert_eq!(request.pod_name, "yoi");
+        assert_eq!(request.socket_path, PathBuf::from("/tmp/yoi.sock"));
+        assert!(app.sending);
+        assert_eq!(input_text(&app), "send to companion");
+        assert!(app.notice.as_deref().unwrap().contains("Companion yoi"));
+    }
+
+    #[test]
+    fn multi_companion_submit_unavailable_keeps_composer_contents() {
+        let mut app = companion_app(vec![], CompanionPanelStatus::Missing);
         app.input.insert_str("keep me");
         let before = input_text(&app);
 
-        app.reject_companion_submit();
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Enter)),
+            MultiPodAction::None
+        ));
 
         assert_eq!(input_text(&app), before);
         assert!(!app.sending);
-        assert!(
-            app.notice
-                .as_deref()
-                .unwrap()
-                .contains("Companion composer is not wired")
-        );
+        assert!(app.notice.as_deref().unwrap().contains("draft kept"));
     }
 
     #[test]
     fn multi_companion_submit_empty_reports_empty_composer() {
-        let mut app = test_app(vec![live_info("idle", PodStatus::Idle)]);
+        let mut app = companion_app(
+            vec![live_info("yoi", PodStatus::Idle)],
+            CompanionPanelStatus::Live,
+        );
 
-        app.reject_companion_submit();
+        assert!(app.prepare_companion_send().is_none());
 
         assert_eq!(input_text(&app), "");
         assert!(!app.sending);
         assert_eq!(app.notice.as_deref(), Some("Composer is empty."));
+    }
+
+    #[test]
+    fn multi_companion_finish_success_clears_composer() {
+        let mut app = companion_app(
+            vec![live_info("yoi", PodStatus::Idle)],
+            CompanionPanelStatus::Live,
+        );
+        app.input.insert_str("done");
+        app.sending = true;
+
+        app.finish_companion_send(Ok(CompanionSendOutcome {
+            notice: "Sent to Companion yoi.".to_string(),
+        }));
+
+        assert_eq!(input_text(&app), "");
+        assert!(!app.sending);
+        assert_eq!(app.notice.as_deref(), Some("Sent to Companion yoi."));
     }
 
     #[test]
@@ -3513,7 +4035,7 @@ mod tests {
             app.notice
                 .as_deref()
                 .unwrap()
-                .contains("Companion composer is not wired")
+                .contains("Workspace Companion is unavailable")
         );
     }
 
@@ -3712,6 +4234,15 @@ mod tests {
         ))
     }
 
+    fn companion_app(live: Vec<LivePodInfo>, status: CompanionPanelStatus) -> MultiPodApp {
+        let mut panel = WorkspacePanelViewModel::empty(Path::new("test"));
+        panel.header.companion = Some(CompanionPanelState::new("yoi", status, None));
+        app_with_panel(
+            PodList::from_sources(PodVisibilitySource::ResumePicker, vec![], live, None, 10),
+            panel,
+        )
+    }
+
     fn ticket_enabled_app(live: Vec<LivePodInfo>) -> MultiPodApp {
         ticket_enabled_app_with_orchestrator(live, OrchestratorPanelStatus::Live)
     }
@@ -3722,6 +4253,11 @@ mod tests {
     ) -> MultiPodApp {
         let mut panel = WorkspacePanelViewModel::empty(Path::new("test"));
         panel.composer = crate::workspace_panel::WorkspacePanelComposer::ticket_enabled();
+        panel.header.companion = Some(CompanionPanelState::new(
+            "yoi",
+            CompanionPanelStatus::Live,
+            None,
+        ));
         panel.header.orchestrator = Some(OrchestratorPanelState::new(
             "test-orchestrator",
             orchestrator_status,
@@ -3758,6 +4294,7 @@ mod tests {
     }
 
     fn app_with_panel(list: PodList, panel: WorkspacePanelViewModel) -> MultiPodApp {
+        let last_companion_lifecycle_failure = companion_lifecycle_failure_from_panel(&panel);
         let last_orchestrator_lifecycle_failure = orchestrator_lifecycle_failure_from_panel(&panel);
         let mut app = MultiPodApp {
             list,
@@ -3768,6 +4305,7 @@ mod tests {
             notice: None,
             sending: false,
             runtime_command: PodRuntimeCommand::for_executable("/tmp/yoi"),
+            last_companion_lifecycle_failure,
             last_orchestrator_lifecycle_failure,
         };
         app.ensure_selection_visible();
