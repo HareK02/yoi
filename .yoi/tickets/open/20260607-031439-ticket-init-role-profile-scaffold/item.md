@@ -6,9 +6,9 @@ status: open
 kind: task
 priority: P1
 labels: [ticket, config, init, profiles, panel]
-workflow_state: intake
+workflow_state: ready
 created_at: 2026-06-07T03:14:39Z
-updated_at: 2026-06-07T03:14:39Z
+updated_at: 2026-06-07T03:43:38Z
 assignee: null
 legacy_ticket: null
 ---
