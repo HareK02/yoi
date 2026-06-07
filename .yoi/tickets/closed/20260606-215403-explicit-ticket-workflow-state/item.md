@@ -2,14 +2,15 @@
 id: 20260606-215403-explicit-ticket-workflow-state
 slug: explicit-ticket-workflow-state
 title: Replace inferred panel Ticket state with explicit workflow state
-status: open
+status: closed
 kind: task
 priority: P1
 labels: [ticket, tui, orchestration, panel, state]
 created_at: 2026-06-06T21:54:03Z
-updated_at: 2026-06-06T22:49:29Z
+updated_at: 2026-06-07T00:08:04Z
 assignee: null
 legacy_ticket: null
+workflow_state: done
 ---
 
 ## Background
