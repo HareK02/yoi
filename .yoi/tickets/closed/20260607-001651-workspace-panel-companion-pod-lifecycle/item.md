@@ -2,13 +2,13 @@
 id: 20260607-001651-workspace-panel-companion-pod-lifecycle
 slug: workspace-panel-companion-pod-lifecycle
 title: Workspace panel Companion Pod lifecycle
-status: open
+status: closed
 kind: task
 priority: P2
 labels: [tui, panel, companion, pod]
-workflow_state: ready
+workflow_state: done
 created_at: 2026-06-07T00:16:51Z
-updated_at: 2026-06-07T20:45:05Z
+updated_at: 2026-06-07T20:45:36Z
 assignee: null
 legacy_ticket: null
 ---
