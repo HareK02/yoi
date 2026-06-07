@@ -8,7 +8,7 @@ priority: P1
 labels: [companion, profile, prompt, tools, panel]
 workflow_state: intake
 created_at: 2026-06-07T00:16:51Z
-updated_at: 2026-06-07T01:21:43Z
+updated_at: 2026-06-07T02:45:32Z
 assignee: null
 legacy_ticket: null
 ---

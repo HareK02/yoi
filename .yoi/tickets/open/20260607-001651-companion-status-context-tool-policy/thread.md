@@ -17,3 +17,28 @@ When local role session / Ticket claim overlay support is added, it can become o
 Default Companion policy should still prohibit direct mutation of Ticket records and direct role Pod spawning/claiming unless a later explicit design grants that authority.
 
 ---
+
+<!-- event: decision author: hare at: 2026-06-07T02:45:32Z -->
+
+## Decision
+
+## Companion Bash policy decision
+
+Default Companion policy should not include Bash.
+
+Rationale:
+- Companion and Orchestrator both operate around the workspace root, but only Orchestrator should hold workspace operation authority.
+- Companion is a human-facing status/understanding assistant, not an actor that creates orchestration side effects.
+- Bash is too broad to treat as safely read-only by prompt alone. Even seemingly read-only commands can touch git locks/index state, build caches, `target/`, package caches, or long-running CPU/IO resources.
+- Adding reliable read-only constraints to Bash would become a sandbox/policy redesign, not a small Companion-policy detail.
+
+Policy:
+- Default Companion: no Bash, no direct file writes, no Ticket mutation, no SpawnPod/worktree/merge authority.
+- Prefer typed read/status tools and derived panel/registry/Ticket/Pod context for situational awareness.
+- If future dogfooding shows Companion needs shell diagnostics, create a separate explicit design/ticket for an opt-in diagnostic Bash/read-only shell capability rather than adding Bash to the default Companion profile.
+
+Operational trigger for revisiting:
+- Users repeatedly want Companion to perform clear shell-based diagnostics; or
+- Prompt-level "read-only" instructions prove insufficient and Companion attempts or performs unsafe Bash actions.
+
+---
