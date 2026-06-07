@@ -1539,7 +1539,7 @@ fn orchestrator_queue_notification_message(
 ) -> String {
     let title = ticket.title.replace(['\r', '\n'], " ");
     format!(
-        "Workspace panel Queue for Ticket `{}` (`{}`), title `{}`: human authorized Orchestrator routing; this is not an unattended scheduler. Read the Ticket and inspect current workspace state. If unblocked, record routing and transition workflow_state queued -> inprogress before any worktree/SpawnPod implementation side effects. If blocked, record a concise reason and leave the Ticket queued or explicitly defer it.",
+        "Workspace panel Queue for Ticket `{}` (`{}`), title `{}`: human authorized Orchestrator routing; this is not an unattended scheduler. Read the Ticket and inspect current workspace state. If unblocked, record routing and transition workflow_state queued -> inprogress before any worktree/SpawnPod implementation side effects. After inprogress acceptance, use worktree-workflow for `.worktree/<task-name>` creation with `.yoi` excluded, then use multi-agent-workflow to run sibling coder/reviewer Pods (coder narrow child-worktree write scope, reviewer read-only by default) and stop at a merge-ready dossier without merge/close/final approval. If blocked, record a concise reason and leave the Ticket queued or explicitly defer it.",
         ticket.slug,
         ticket.id,
         title.trim()
@@ -2595,6 +2595,16 @@ mod tests {
         assert!(message.contains("inspect current workspace state"));
         assert!(message.contains("transition workflow_state queued -> inprogress"));
         assert!(message.contains("before any worktree/SpawnPod implementation side effects"));
+        assert!(message.contains("After inprogress acceptance"));
+        assert!(message.contains("worktree-workflow"));
+        assert!(message.contains("`.worktree/<task-name>`"));
+        assert!(message.contains("`.yoi` excluded"));
+        assert!(message.contains("multi-agent-workflow"));
+        assert!(message.contains("sibling coder/reviewer Pods"));
+        assert!(message.contains("coder narrow child-worktree write scope"));
+        assert!(message.contains("reviewer read-only by default"));
+        assert!(message.contains("merge-ready dossier"));
+        assert!(message.contains("without merge/close/final approval"));
         assert!(message.contains("If blocked, record a concise reason"));
         assert!(message.contains("leave the Ticket queued or explicitly defer"));
         assert!(!message.contains("Do not start implementation directly"));

@@ -530,7 +530,44 @@ fn build_launch_prompt(
         );
     }
 
+    append_role_execution_guidance(&mut out, context.role);
+
     out
+}
+
+fn append_role_execution_guidance(out: &mut String, role: TicketRole) {
+    match role {
+        TicketRole::Orchestrator => append_orchestrator_agent_routing_guidance(out),
+        TicketRole::Coder => append_coder_agent_routing_guidance(out),
+        TicketRole::Reviewer => append_reviewer_agent_routing_guidance(out),
+        TicketRole::Intake | TicketRole::Investigator => {}
+    }
+}
+
+fn append_orchestrator_agent_routing_guidance(out: &mut String) {
+    out.push_str("\nOrchestrator worktree + agent routing guidance:\n");
+    out.push_str("- Treat `ticket-orchestrator-routing` as the routing gate. Read the Ticket and workspace state first; `ready -> queued` authorizes routing, not implementation side effects.\n");
+    out.push_str("- Create worktrees or spawn coder/reviewer Pods only after `workflow_state = inprogress` is already recorded and accepted. If the Ticket is still queued and unblocked, record `queued -> inprogress` before any worktree/SpawnPod side effect.\n");
+    out.push_str("- Use `worktree-workflow` for the mechanical worktree plan: create `.worktree/<task-name>`, exclude `.yoi` from the child worktree, and keep the main workspace as the authority for Ticket, workflow, docs, and memory records.\n");
+    out.push_str("- Use `multi-agent-workflow` for the sibling loop: coder and reviewer are siblings under this Orchestrator; coder gets narrow write scope to the child worktree; reviewer is read-only by default.\n");
+    out.push_str("- Give the coder an intent packet, child worktree/branch, validation commands, and report expectations; require Bash commands to `cd` into the child worktree and prohibit editing main-workspace `.yoi`/Ticket/workflow/docs records.\n");
+    out.push_str("- Give the reviewer the Ticket intent, diff/commits, validation evidence, and blocker/non-blocker criteria; keep branch-local reviewer verdicts in the review report or merge-ready dossier rather than recording them as final main-branch Ticket approval.\n");
+    out.push_str("- Ticket thread progress may record worktree plan, coder delegated/completed/blocked, reviewer delegated, blocker/fix-loop summaries, and merge-ready dossier pointer; do not merge, close, or record final main approval in this phase.\n");
+    out.push_str("- Stop at a merge-ready dossier for `orchestrator-merge-completion` containing branch, commits, conceptual implementation summary, validation evidence, coder/reviewer evidence, blocker loop outcome, residual risk, and parent decision needs.\n");
+}
+
+fn append_coder_agent_routing_guidance(out: &mut String) {
+    out.push_str("\nCoder worktree routing guidance:\n");
+    out.push_str("- Implement only in the provided child worktree/branch. Use `cd <worktree>` before Bash commands and do not edit main-workspace `.yoi`, Ticket, workflow, docs, or memory records.\n");
+    out.push_str("- Treat the intent packet, invariants, non-goals, validation expectations, and report expectations as the contract. Escalate to Orchestrator rather than expanding scope when design, permission, history, prompt-context, dependency, or Ticket-boundary questions appear.\n");
+    out.push_str("- Report worktree path, branch, commits/status, changed files, implementation summary, validation run, unresolved notes, and whether the branch is ready for external review. Do not merge, push, close Tickets, or delete worktrees.\n");
+}
+
+fn append_reviewer_agent_routing_guidance(out: &mut String) {
+    out.push_str("\nReviewer worktree routing guidance:\n");
+    out.push_str("- Review as a sibling of the coder under Orchestrator, read-only by default. Read the Ticket/intent packet, branch diff or commits, and validation evidence before judging.\n");
+    out.push_str("- Classify findings as blockers, non-blocking follow-ups, or parent-decision items against the intent, requirements, invariants, and non-goals; include concrete file/line evidence where useful.\n");
+    out.push_str("- Keep the branch-local reviewer verdict in the review report for the Orchestrator merge-ready dossier. Do not record final main-branch Ticket approval, merge, close, push, or instruct the coder directly.\n");
 }
 
 fn default_pod_name(role: TicketRole, ticket: Option<&TicketRef>) -> String {
@@ -982,13 +1019,14 @@ workflow = "ticket-review-workflow"
     }
 
     #[test]
-    fn generated_prompt_covers_intake_orchestrator_and_reviewer_context() {
+    fn generated_prompt_covers_intake_orchestrator_coder_and_reviewer_context() {
         let temp = TempDir::new().unwrap();
         write_builtin_role_config(
             temp.path(),
             &[
                 TicketRole::Intake,
                 TicketRole::Orchestrator,
+                TicketRole::Coder,
                 TicketRole::Reviewer,
             ],
         );
@@ -1028,6 +1066,29 @@ workflow = "ticket-review-workflow"
         assert!(orchestrator_text.contains("Role: orchestrator"));
         assert!(orchestrator_text.contains("Route to implementation after preflight."));
         assert!(orchestrator_text.contains("cargo check --workspace --all-targets"));
+        assert!(orchestrator_text.contains("workflow_state = inprogress"));
+        assert!(orchestrator_text.contains("worktree-workflow"));
+        assert!(orchestrator_text.contains("multi-agent-workflow"));
+        assert!(orchestrator_text.contains("coder and reviewer are siblings"));
+        assert!(orchestrator_text.contains("branch-local reviewer verdicts"));
+        assert!(orchestrator_text.contains("merge-ready dossier"));
+        assert!(orchestrator_text.contains("do not merge, close, or record final main approval"));
+
+        let mut coder = TicketRoleLaunchContext::new(temp.path(), TicketRole::Coder);
+        coder.ticket = Some(TicketRef::id("20260605-190330-ticket-role-pod-launcher"));
+        coder.worktree_path = Some(PathBuf::from("/tmp/yoi-code"));
+        coder.branch = Some("work/ticket-role-pod-launcher".into());
+        coder.validation = vec!["cargo test -p client ticket_role".into()];
+        coder.report_expectations = vec!["implementation report with validation".into()];
+        let coder_plan = plan_ticket_role_launch(coder).unwrap();
+        let coder_text = text_segment(&coder_plan);
+        assert!(coder_text.contains("Role: coder"));
+        assert!(coder_text.contains("path: /tmp/yoi-code"));
+        assert!(coder_text.contains("branch: work/ticket-role-pod-launcher"));
+        assert!(coder_text.contains("cargo test -p client ticket_role"));
+        assert!(coder_text.contains("provided child worktree/branch"));
+        assert!(coder_text.contains("do not edit main-workspace `.yoi`"));
+        assert!(coder_text.contains("Do not merge, push, close Tickets, or delete worktrees"));
 
         let mut reviewer = TicketRoleLaunchContext::new(temp.path(), TicketRole::Reviewer);
         reviewer.ticket = Some(TicketRef::id("20260605-190330-ticket-role-pod-launcher"));
@@ -1040,6 +1101,9 @@ workflow = "ticket-review-workflow"
         assert!(reviewer_text.contains("path: /tmp/yoi-review"));
         assert!(reviewer_text.contains("branch: work/ticket-role-pod-launcher"));
         assert!(reviewer_text.contains("approve or request changes"));
+        assert!(reviewer_text.contains("read-only by default"));
+        assert!(reviewer_text.contains("branch-local reviewer verdict"));
+        assert!(reviewer_text.contains("Do not record final main-branch Ticket approval"));
     }
 
     #[test]
