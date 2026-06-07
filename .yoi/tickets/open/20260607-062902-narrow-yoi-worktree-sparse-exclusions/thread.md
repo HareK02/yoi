@@ -57,3 +57,25 @@ Ticket intake complete; workflow_state intake -> ready.
 
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-06-07T07:15:31Z -->
+
+## Implementation report
+
+## Delegation
+
+Implementation delegated to child Pod `narrow-yoi-worktree-coder-20260607` in worktree `.worktree/narrow-yoi-worktree-sparse-exclusions` on branch `work/narrow-yoi-worktree-sparse-exclusions`.
+
+This worktree intentionally uses the proposed narrower sparse rules:
+- includes `.yoi` project records;
+- excludes `.yoi/memory`, memory logs, ticket backend lock, and local/runtime paths.
+
+Scope:
+- Update `worktree-workflow` and `multi-agent-workflow` away from `.yoi` whole-directory exclusion.
+- Define project-record vs generated-memory/local-runtime boundaries.
+- Update role guidance/tests if they still say child worktrees exclude all `.yoi`.
+- Do not implement memory-root detection; `memory-root-uses-yoi-memory-marker` follows after this.
+
+The child should commit implementation work in the child worktree and report diff/tests. Merge, review, Ticket closure, and cleanup remain with the parent/human workflow.
+
+---
