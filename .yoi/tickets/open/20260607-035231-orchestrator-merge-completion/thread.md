@@ -177,3 +177,60 @@ Parent-side workflow patch needed: none observed from the implementation; child 
 External review will be delegated before merge.
 
 ---
+
+<!-- event: review author: orchestrator-merge-reviewer-20260607 at: 2026-06-07T06:41:49Z status: request_changes -->
+
+## Review: request changes
+
+Request changes.
+
+The implementation gets the merge authority and branch-review boundary right, but it does not yet satisfy the ticket's required dossier/validation specificity, and the added test does not cover those missing fields.
+
+Positive evidence:
+- Merge authority boundary is good: conservative/missing authorization stops at the dossier and merge authority is not inferred from public/default config.
+- Branch-local reviewer verdict vs final main Ticket approval boundary is preserved.
+- Queue routing and worktree/coder/reviewer routing were not reimplemented beyond guidance; child commit changes only `crates/client/src/ticket_role.rs`.
+
+Blockers:
+1. Merge-ready dossier fields are not explicit enough. The current text lists branch, worktree path, commits, implementation summary, validation evidence, coder/reviewer evidence, blocker loop outcome, residual risk, and parent decision needs, but the ticket explicitly requires Ticket id/slug, intent/invariant check, coder/reviewer Pods, blockers fixed or rejected findings with reasons, validation performed, and dirty state. Several are missing or only implied.
+
+2. Post-merge validation baseline is too generic. The ticket requires explicit minimum baseline guidance: focused tests from Ticket/dossier, `cargo fmt --check`, `git diff --check`, `target/debug/yoi ticket doctor` where applicable, plus broader validation such as `cargo check --workspace --all-targets` / `nix build .#yoi` when risk or touched files warrant it.
+
+3. Test coverage mirrors the same gap. The new test covers authority, branch/worktree/commit matching, reviewer approval/override, main workspace safety, branch-local boundary, merge command, cleanup, and generic validation evidence, but does not assert the missing dossier fields or required validation baseline commands.
+
+Reviewer validation:
+- `cargo test -p client ticket_role --lib`
+- `cargo fmt --check`
+- `git diff --check develop..HEAD`
+- `cargo build -p yoi`
+- `target/debug/yoi ticket doctor` from main workspace
+- `nix build .#yoi` (dirty-tree warning only; generated `result` symlink removed)
+- merge-tree check against current `develop`
+
+Merge readiness: not merge-ready until dossier/validation guidance and tests are explicit.
+
+---
+
+<!-- event: review author: orchestrator-merge-reviewer-20260607 at: 2026-06-07T06:46:06Z status: approve -->
+
+## Review: approve
+
+Approved after fixup commit `33abf3f`.
+
+Evidence:
+- Dossier fields are now explicit in `crates/client/src/ticket_role.rs`, including Ticket id/slug, branch/worktree, commits, intent/invariant check, implementation summary, coder/reviewer Pods, blockers fixed or rejected findings with reasons, validation performed, residual risks, dirty state, and parent/human decision needs.
+- Post-merge validation baseline is explicit: focused Ticket/dossier tests, `cargo fmt --check`, `git diff --check`, `target/debug/yoi ticket doctor` where applicable, plus broader validation including `cargo check --workspace --all-targets` and `nix build .#yoi` when risk/touched files warrant it.
+- Tests now assert the required dossier fields and validation baseline/broader-validation guidance.
+- Merge authority remains explicit; conservative/missing authorization stops at the dossier and does not infer authority from public/default config.
+- Branch-local reviewer verdict vs final main Ticket approval boundary remains preserved.
+- Diff remains limited to `crates/client/src/ticket_role.rs`; no queue/worktree/coder/reviewer scheduler or TUI behavior was added.
+
+Reviewer validation:
+- `cargo test -p client ticket_role --lib`
+- `cargo fmt --check`
+- `git diff --check develop...HEAD`
+- `git merge-tree --write-tree develop HEAD`
+
+Operational note from reviewer: main workspace dirty-state should be checked before merge; observed dirtiness was Ticket files/backend lock from orchestration records, not a branch implementation issue.
+
+---
