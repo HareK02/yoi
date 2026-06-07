@@ -166,7 +166,6 @@ pub(crate) enum NextUserAction {
     Edit,
     Wait,
     OpenPod,
-    SendToPod,
 }
 
 impl NextUserAction {
@@ -179,7 +178,6 @@ impl NextUserAction {
             Self::Edit => "Edit",
             Self::Wait => "Wait",
             Self::OpenPod => "Open",
-            Self::SendToPod => "Send",
         }
     }
 }
@@ -652,9 +650,7 @@ fn pod_rows(pods: &PodList) -> Vec<PanelRow> {
 
 fn pod_row(entry: &PodListEntry) -> PanelRow {
     let status = pod_status_label(entry).to_string();
-    let next_action = if entry.actions.can_send_now {
-        Some(NextUserAction::SendToPod)
-    } else if entry.actions.can_open {
+    let next_action = if entry.actions.can_open {
         Some(NextUserAction::OpenPod)
     } else {
         None
@@ -680,7 +676,7 @@ fn pod_row(entry: &PodListEntry) -> PanelRow {
         ticket: None,
         related_pods: Vec::new(),
         disabled_reason: entry.actions.disabled_reason.clone(),
-        key_hint: Some("Pod rows preserve existing open/direct-send behavior".to_string()),
+        key_hint: Some("Press o or empty Enter to open/attach this Pod".to_string()),
     }
 }
 
