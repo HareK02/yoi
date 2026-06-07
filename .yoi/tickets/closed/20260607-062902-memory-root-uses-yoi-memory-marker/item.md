@@ -2,13 +2,13 @@
 id: 20260607-062902-memory-root-uses-yoi-memory-marker
 slug: memory-root-uses-yoi-memory-marker
 title: Use .yoi/memory marker for repo-local memory root
-status: open
+status: closed
 kind: task
 priority: P1
 labels: [memory, workspace, worktree, config]
-workflow_state: ready
+workflow_state: done
 created_at: 2026-06-07T06:29:02Z
-updated_at: 2026-06-07T07:58:15Z
+updated_at: 2026-06-07T07:59:04Z
 assignee: null
 legacy_ticket: null
 ---
