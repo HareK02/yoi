@@ -163,3 +163,36 @@ External review will be delegated before merge.
 
 
 ---
+
+<!-- event: review author: hare at: 2026-06-07T20:45:05Z status: approve -->
+
+## Review: approve
+
+Approved by `companion-lifecycle-reviewer-20260607`.
+
+No review-blocking issues were found in `ba0c9d5` against `develop`.
+
+Evidence:
+- Companion naming is the workspace basename, with no `-companion` suffix; this repository resolves to `yoi`.
+- Live/restorable/missing Companion lifecycle is distinct from Orchestrator lifecycle and does not depend on Ticket config gating.
+- Missing Companion spawn/restore uses ordinary Pod startup rather than Ticket role launch; Orchestrator remains the only changed path using `TicketRole::Orchestrator`.
+- Panel close does not stop Companion.
+- Non-empty Companion composer submit targets the workspace Companion Pod from panel header state, not the selected Pod.
+- Ticket Intake remains separate and builds an Intake launch request with `TicketRole::Intake`; it does not send to Companion history.
+- Companion is not modeled as a Ticket role.
+- No `--multi`, `:ticket`, or selected-Pod direct-send route was reintroduced.
+
+Reviewer validation:
+- `cargo test -p tui companion --lib`
+- `cargo test -p tui multi_pod --lib`
+- `cargo test -p tui workspace_panel --lib`
+- `cargo test -p tui --lib`
+- `cargo fmt --check`
+- `git diff --check develop...HEAD`
+- `nix build .#yoi`
+- `result/bin/yoi ticket doctor`
+
+Worktree status was clean after validation, and the diff is limited to `crates/tui/src/multi_pod.rs` and `crates/tui/src/workspace_panel.rs`.
+
+
+---
