@@ -89,3 +89,37 @@ Requested validation:
 
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-06-07T10:10:37Z -->
+
+## Implementation report
+
+## Implementation report
+
+Coder Pod `orchestrator-diagnostic-coder-20260607` completed implementation in `.worktree/workspace-orchestrator-spawn-diagnostic-persistence`.
+
+Commit:
+- `e15e9b7 fix: persist orchestrator lifecycle diagnostics`
+
+Reported summary:
+- Added `MultiPodApp` state to remember the latest actionable workspace Orchestrator lifecycle failure.
+- Later `Observe` refreshes that only report plain `missing` / `stopped` keep the prior actionable diagnostic visible.
+- Stored diagnostic is cleared when the Orchestrator becomes `live`, `spawned`, or `restored`.
+- A newer `Unavailable` lifecycle diagnostic supersedes the older one.
+- Actionbar behavior and Ticket gate messages were not changed.
+
+Reported validation:
+- `cargo test -p tui multi_orchestrator --lib`
+- `cargo test -p tui --lib`
+- `cargo fmt --check`
+- `git diff --check`
+- `nix build .#yoi`
+- `./result/bin/yoi ticket doctor`
+
+Caveat:
+- `target/debug/yoi ticket doctor` was not available inside the child worktree; coder used the Nix-built binary after `nix build .#yoi`.
+
+External review will be delegated before merge.
+
+
+---

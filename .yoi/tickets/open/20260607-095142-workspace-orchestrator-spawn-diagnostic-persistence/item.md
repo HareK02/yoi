@@ -8,7 +8,7 @@ priority: P2
 labels: [tui, panel, orchestrator, diagnostic]
 workflow_state: intake
 created_at: 2026-06-07T09:51:42Z
-updated_at: 2026-06-07T10:00:33Z
+updated_at: 2026-06-07T10:10:37Z
 assignee: null
 legacy_ticket: null
 ---
