@@ -69,3 +69,23 @@ Ticket intake complete; workflow_state intake -> ready.
 
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-06-07T01:42:51Z -->
+
+## Implementation report
+
+## Delegation
+
+Implementation delegated to child Pod `panel-role-session-registry-coder-20260607` in worktree `.worktree/workspace-panel-local-role-session-registry` on branch `work/workspace-panel-local-role-session-registry`.
+
+Scope:
+- Add a durable user-data workspace-scoped local role session registry and Ticket claim index.
+- Enforce one active local Pod claim per Ticket while allowing a role session/Intake Pod to relate to zero or more Tickets.
+- Keep local Pod assignment out of git-tracked Ticket metadata/thread.
+- Preserve no-polling semantics and the interim `ticket-*` Pod visibility path.
+
+Coordination note: `workspace-panel-remove-direct-pod-send` is active in parallel and may touch `multi_pod.rs` / `workspace_panel.rs`; the child was instructed to keep the registry implementation additive/localized and report likely conflicts.
+
+The child should commit implementation work in the child worktree and report diff/tests. Merge, review, Ticket closure, and cleanup remain with the parent/human workflow.
+
+---
