@@ -46,3 +46,20 @@ A new child ticket `workspace-panel-local-role-session-registry` covers the loca
 - The panel should not poll and automatically start Intake for newly-created `workflow_state = intake` Tickets; starting/claiming remains an explicit action.
 
 ---
+
+<!-- event: decision author: hare at: 2026-06-07T02:02:21Z -->
+
+## Decision
+
+## Orchestrator automation follow-up
+
+Created `workspace-panel-orchestrator-queue-automation` to cover the missing end-to-end route from Panel Intake/Queue into Orchestrator-managed work.
+
+This follow-up fixes the intended `queued` semantics:
+- `queued` means the human authorized Orchestrator routing;
+- the Orchestrator should inspect Ticket/workspace state and start if unblocked;
+- conflicts, dependency blockers, preflight gaps, and capacity constraints are Orchestrator decisions, not reasons for the panel to stay passive forever.
+
+This remains separate from Companion lifecycle and local role/session registry work, but may consume the registry once available to avoid duplicate ownership.
+
+---
