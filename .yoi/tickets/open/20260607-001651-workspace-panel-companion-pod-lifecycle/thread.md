@@ -75,3 +75,45 @@ Validation expected:
 
 
 ---
+
+<!-- event: plan author: hare at: 2026-06-07T10:18:01Z -->
+
+## Plan
+
+## Delegation intent
+
+Implement `workspace-panel-companion-pod-lifecycle` in a dedicated worktree.
+
+Worktree:
+- `.worktree/workspace-panel-companion-pod-lifecycle`
+- branch `work/workspace-panel-companion-pod-lifecycle`
+
+Coder Pod:
+- `companion-lifecycle-coder-20260607`
+
+Key decision to preserve:
+- Companion Pod id/name is the workspace directory basename.
+- In this repository, the Companion Pod id/name is `yoi`.
+- Do not use `yoi-companion` for the normal workspace Companion.
+- `yoi panel` should treat an existing live/restorable default workspace Pod named `yoi` as the Companion.
+- Workspace Orchestrator remains distinct, e.g. `yoi-orchestrator`.
+
+Scope and boundaries:
+- Companion is not a Ticket role; do not route this through `TicketRole` or `.yoi/ticket.config.toml` role slots.
+- Preserve Ticket Intake as a separate composer target and separate history path.
+- Do not reintroduce selected-Pod direct send, `--multi`, or `:ticket`.
+- Panel close must not stop Companion.
+- Existing live `yoi` Pod may own workspace write scope; lifecycle should reuse/route to it instead of spawning a duplicate with a conflicting scope.
+- Keep diagnostics bounded and visible.
+- Avoid broad UI restructuring.
+
+Requested validation:
+- Focused TUI tests for Companion naming/lifecycle decisions and composer routing separation.
+- Existing panel/orchestrator tests affected by lifecycle changes.
+- `cargo test -p tui ... --lib` for affected tests.
+- `cargo fmt --check`.
+- `git diff --check`.
+- `target/debug/yoi ticket doctor`.
+
+
+---
