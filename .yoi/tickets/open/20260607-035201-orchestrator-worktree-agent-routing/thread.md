@@ -132,3 +132,31 @@ Reported validation:
 Parent-side workflow patch needed: none reported.
 
 ---
+
+<!-- event: review author: orchestrator-agent-routing-reviewer-20260607 at: 2026-06-07T05:55:11Z status: approve -->
+
+## Review: approve
+
+Approved.
+
+Evidence:
+- Role-specific guidance in `crates/client/src/ticket_role.rs` gates worktree/Pod side effects on `workflow_state = inprogress`, names `worktree-workflow` and `multi-agent-workflow`, excludes `.yoi`, keeps Ticket/workflow/docs/memory authority in the main workspace, and stops at a merge-ready dossier.
+- Coder guidance limits work to the child worktree/branch, forbids main-workspace `.yoi` / Ticket / workflow / docs / memory edits, requires validation/status reporting, and forbids merge/push/close/delete.
+- Reviewer guidance states sibling/read-only-by-default review, diff/validation-based judgement, blocker classification, branch-local verdict capture, and no final main-branch approval/merge/close/push.
+- Panel Queue notification guidance preserves the queue/inprogress boundary and only mentions `.worktree/<task-name>`, `.yoi` exclusion, sibling coder/reviewer Pods, and merge-ready dossier after inprogress acceptance.
+- No broad scheduler or worktree manager was added; the diff is prompt/notification guidance plus focused tests.
+- Tests cover the prompt/notification contract for this slice.
+
+Reviewer validation:
+- `cargo test -p client ticket_role -- --nocapture`
+- `cargo test -p tui ticket_queue_notification_message_carries_routing_contract -- --nocapture`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo build -p yoi`
+- `nix build .#yoi --no-link`
+- child-built `yoi ticket doctor` against main workspace
+- `git merge-tree --write-tree develop HEAD`
+
+Merge readiness: approved; implementation worktree clean and merge-tree against current `develop` succeeded.
+
+---
