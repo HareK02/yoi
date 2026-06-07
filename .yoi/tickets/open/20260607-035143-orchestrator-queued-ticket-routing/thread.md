@@ -136,3 +136,28 @@ Review focus:
 - Focused tests should cover the changed wording/contract.
 
 ---
+
+<!-- event: review author: orchestrator-routing-reviewer-20260607 at: 2026-06-07T05:12:59Z status: approve -->
+
+## Review: approve
+
+Approved.
+
+Evidence:
+- Panel Queue no longer presents passive/no-op semantics. It records `ready -> queued`, notifies the workspace Orchestrator, and reports that Orchestrator routing is authorized while implementation side effects still require `queued -> inprogress` acceptance.
+- Orchestrator notification includes Ticket slug/id/title and instructs the Orchestrator to read the Ticket, inspect workspace state, transition `queued -> inprogress` before worktree/SpawnPod side effects when unblocked, and record a concise blocked/defer reason when blocked.
+- Wording does not encourage blind implementation Pod spawning from notification alone.
+- Parent-side `.yoi/workflow/ticket-orchestrator-routing.md` update matches the queued acceptance contract.
+- No worktree/coder/reviewer/merge implementation leaked into this ticket; child diff is limited to `crates/tui/src/multi_pod.rs` wording/tests.
+- Focused tests cover Queue notice and Orchestrator notification contract.
+
+Reviewer validation:
+- `cargo test -p tui multi_pod --lib`
+- `cargo fmt --check`
+- `git diff --check develop...HEAD`
+- `nix build .#yoi`
+- `git merge-tree --write-tree develop HEAD`
+
+Merge readiness: approved; merge-tree against current `develop` succeeded. The workflow update is already present on `develop`.
+
+---
