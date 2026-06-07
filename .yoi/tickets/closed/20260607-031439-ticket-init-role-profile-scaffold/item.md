@@ -2,13 +2,13 @@
 id: 20260607-031439-ticket-init-role-profile-scaffold
 slug: ticket-init-role-profile-scaffold
 title: Scaffold explicit Ticket role profiles in init config
-status: open
+status: closed
 kind: task
 priority: P1
 labels: [ticket, config, init, profiles, panel]
-workflow_state: ready
+workflow_state: done
 created_at: 2026-06-07T03:14:39Z
-updated_at: 2026-06-07T04:04:17Z
+updated_at: 2026-06-07T04:05:15Z
 assignee: null
 legacy_ticket: null
 ---

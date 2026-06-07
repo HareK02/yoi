@@ -1,3 +1,23 @@
 [backend]
 provider = "builtin:yoi_local"
 root = ".yoi/tickets"
+
+[roles.intake]
+profile = "builtin:default"
+workflow = "ticket-intake-workflow"
+
+[roles.orchestrator]
+profile = "builtin:default"
+workflow = "ticket-orchestrator-routing"
+
+[roles.coder]
+profile = "builtin:default"
+workflow = "multi-agent-workflow"
+
+[roles.reviewer]
+profile = "builtin:default"
+workflow = "multi-agent-workflow"
+
+[roles.investigator]
+profile = "builtin:default"
+workflow = "ticket-preflight-workflow"
