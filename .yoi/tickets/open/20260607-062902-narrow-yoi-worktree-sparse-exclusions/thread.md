@@ -111,3 +111,75 @@ Reported validation:
 External review will be delegated before merge.
 
 ---
+
+<!-- event: review author: narrow-yoi-worktree-reviewer-20260607 at: 2026-06-07T07:34:37Z status: request_changes -->
+
+## Review: request changes
+
+Request changes.
+
+Blocker:
+- `worktree-workflow` sparse-checkout rules do not exclude recursive `.yoi/**/_logs/**`, even though the Ticket explicitly requires generated log paths under `.yoi/**/_logs/**` to remain out of child worktrees.
+
+Evidence:
+- `.yoi/workflow/worktree-workflow.md` only excludes root log dirs:
+  - `!/.yoi/logs/`
+  - `!/.yoi/logs/**`
+  - `!/.yoi/_logs/`
+  - `!/.yoi/_logs/**`
+- There is no committed recursive `_logs` sparse rule.
+- The validation block checks for any `*/_logs` directory, so a tracked nested `.yoi/<project-record>/_logs/...` path would be allowed by sparse-checkout and then fail validation rather than being excluded by the rules.
+
+Suggested minimal fix:
+- Add recursive sparse exclusions such as:
+  - `!/.yoi/**/_logs/`
+  - `!/.yoi/**/_logs/**`
+- Consider whether the same recursive treatment is intended for `logs`, `locks`, `local`, `runtime`, `pods`, `sessions`, `sockets`, `tmp`, `cache`, and `secrets`; the required blocker is strongest for `_logs` because the Ticket names `.yoi/**/_logs/**` explicitly.
+
+Other checks passed:
+- Workflow docs no longer require whole-directory `.yoi` exclusion.
+- Project records are allowed in child worktrees.
+- Ticket edit policy is clear enough and keeps final review/approval/close as main-workspace responsibilities.
+- Generated role guidance/tests align with the new boundary.
+- Memory root detection was not changed.
+
+Reviewer validation:
+- `cargo test -p client ticket_role --lib`
+- `cargo test -p tui ticket_queue_notification --lib`
+- `target/debug/yoi ticket doctor`
+- `cargo fmt --check`
+- `git diff --check develop...HEAD`
+- `nix build .#yoi`
+- `git merge-tree --write-tree develop HEAD`
+
+Merge readiness: not ready until recursive `_logs` sparse exclusion is fixed.
+
+---
+
+<!-- event: review author: narrow-yoi-worktree-reviewer-20260607 at: 2026-06-07T07:37:53Z status: approve -->
+
+## Review: approve
+
+Approved after fixup commit `6f33275`.
+
+Evidence:
+- Previous blocker is fixed in `.yoi/workflow/worktree-workflow.md`: sparse rules now include both `!/.yoi/**/_logs/` and `!/.yoi/**/_logs/**`.
+- Nearby guidance explicitly says generated log trees exclude root `_logs` and recursive `.yoi/**/_logs/**`.
+- No broad `.yoi/**` exclusion was reintroduced.
+- `.yoi` project records remain allowed in child worktrees.
+- Generated/local state remains excluded: `.yoi/memory`, logs, locks, local/runtime/pods/sessions/sockets/tmp/cache/secrets, local overrides, and secret-like files remain listed in sparse rules.
+- Ticket edit policy remains intact: active orchestration progress and final review/approval/close remain main-workspace responsibilities.
+- Memory root detection was not changed; diff remains limited to workflow/guidance files.
+
+Reviewer validation:
+- `cargo test -p client ticket_role --lib`
+- `cargo test -p tui ticket_queue_notification --lib`
+- `target/debug/yoi ticket doctor`
+- `cargo fmt --check`
+- `git diff --check develop...HEAD`
+- `nix build .#yoi`
+- `git merge-tree --write-tree develop HEAD`
+
+Merge readiness: approved; worktree clean at `6f33275`.
+
+---
