@@ -6,9 +6,9 @@ status: open
 kind: task
 priority: P1
 labels: [ticket, yaml, parser, bug, panel]
-workflow_state: inprogress
+workflow_state: done
 created_at: 2026-06-07T22:32:33Z
-updated_at: 2026-06-07T23:25:23Z
+updated_at: 2026-06-07T23:38:32Z
 assignee: null
 legacy_ticket: null
 queued_by: workspace-panel

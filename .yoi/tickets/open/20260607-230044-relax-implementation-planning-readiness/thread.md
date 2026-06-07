@@ -315,3 +315,78 @@ Parent/human decision needed:
 - Merge-completion should independently verify branch/worktree/commit identity, main workspace safety, and validation requirements before merge/close/cleanup.
 
 ---
+
+<!-- event: review author: orchestrator at: 2026-06-07T23:37:58Z status: approve -->
+
+## Review: approve
+
+Final merge-completion review: approved after authorized merge of `ticket/relax-implementation-planning-readiness` with `--no-ff`, verification of the merge-ready dossier and branch identity, and successful post-merge validation.
+
+Merge:
+- Branch: `ticket/relax-implementation-planning-readiness`
+- Merge commit: `3079606 merge: relax implementation planning readiness`
+
+Post-merge validation:
+- `cargo test -p ticket --lib` — passed as part of combined validation
+- `cargo test -p tui workspace_panel --lib` — passed as part of combined validation
+- `cargo test -p client generated_prompt_covers_intake_orchestrator_coder_and_reviewer_context -- --nocapture` — passed
+- `cargo fmt --check` — passed
+- `git diff --check` — passed
+- `cargo run -p yoi -- ticket doctor` — passed (`doctor: ok`)
+- `nix build .#yoi` — passed
+
+No blockers remain. This review records the main-workspace merge-completion approval; the earlier reviewer Pod verdict remains branch-local evidence.
+
+---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-07T23:38:06Z -->
+
+## Implementation report
+
+Merge-completion implementation report:
+
+Merged:
+- Branch: `ticket/relax-implementation-planning-readiness`
+- Method: `git merge --no-ff ticket/relax-implementation-planning-readiness -m "merge: relax implementation planning readiness"`
+- Merge commit: `3079606 merge: relax implementation planning readiness`
+- Delegated coder/reviewer Pods were stopped before merge and their scopes reclaimed.
+
+Post-merge validation:
+- `cargo test -p ticket --lib` — passed as part of combined validation
+- `cargo test -p tui workspace_panel --lib` — passed as part of combined validation
+- `cargo test -p client generated_prompt_covers_intake_orchestrator_coder_and_reviewer_context -- --nocapture` — passed
+- `cargo fmt --check` — passed
+- `git diff --check` — passed
+- `cargo run -p yoi -- ticket doctor` — passed (`doctor: ok`)
+- `nix build .#yoi` — passed
+
+Cleanup status:
+- Coder Pod stopped and scope reclaimed.
+- Reviewer Pod stopped and scope reclaimed.
+- Worktree/branch cleanup follows this validation report.
+
+No merge blockers remain.
+
+---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-07T23:38:15Z from: inprogress to: done reason: merge_completed_validated field: workflow_state -->
+
+## State changed
+
+Merge-completion finished: branch was merged into `develop`, post-merge validation passed, main-workspace approval was recorded, and delegated Pods were stopped. Local status is left open because this request authorized merge, not Ticket close/resolution.
+
+---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-07T23:38:32Z -->
+
+## Implementation report
+
+Merge-completion cleanup completed:
+- Merge commit: `3079606 merge: relax implementation planning readiness`
+- Removed child worktree: `.worktree/relax-implementation-planning-readiness`
+- Deleted merged branch: `ticket/relax-implementation-planning-readiness`
+- Stopped delegated Pods: `coder-relax-implementation-planning-readiness`, `reviewer-relax-implementation-planning-readiness`
+- Final workflow state: `done`
+- Final local status: left open; no `TicketClose` was performed because the user authorized merge, not close/resolution.
+
+---
