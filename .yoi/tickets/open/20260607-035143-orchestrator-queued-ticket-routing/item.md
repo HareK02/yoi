@@ -8,7 +8,7 @@ priority: P1
 labels: [panel, orchestrator, ticket, routing, workflow]
 workflow_state: ready
 created_at: 2026-06-07T03:51:43Z
-updated_at: 2026-06-07T04:58:26Z
+updated_at: 2026-06-07T05:07:50Z
 assignee: null
 legacy_ticket: null
 ---

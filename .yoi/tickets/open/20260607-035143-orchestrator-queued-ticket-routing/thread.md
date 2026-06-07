@@ -86,3 +86,32 @@ Workflow note:
 The child should commit implementation work in the child worktree and report diff/tests. Merge, review, Ticket closure, workflow file updates, and cleanup remain with the parent/human workflow.
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-06-07T05:07:50Z -->
+
+## Implementation report
+
+## Implementation report
+
+Coder Pod `orchestrator-routing-coder-20260607` completed the child-worktree code slice in `.worktree/orchestrator-queued-ticket-routing`.
+
+Commit:
+- `ccf43f8 tui: update queued ticket routing notification`
+
+Reported summary:
+- Updated Panel Queue notice so it says Orchestrator routing is authorized and implementation side effects still require `queued -> inprogress` acceptance.
+- Updated Orchestrator notification text to include Ticket slug/id/title and instruct Orchestrator to read the Ticket, inspect workspace state, transition `queued -> inprogress` before worktree/SpawnPod side effects when unblocked, and record a concise blocked reason when blocked.
+- Added focused tests for the routing notification contract.
+- Did not implement worktree/coder/reviewer routing, merge completion, or plan-tool behavior.
+
+Reported validation:
+- `cargo test -p tui multi_pod --lib`
+- `cargo fmt --check`
+- `git diff --check`
+- `nix build .#yoi`
+
+Parent-side workflow update:
+- Applied the reported `.yoi/workflow/ticket-orchestrator-routing.md` update in the main workspace because child worktrees exclude `.yoi`.
+- The workflow now treats Panel Queue / queued notification as routing authorization, requires `queued -> inprogress` before implementation side effects, and documents blocked queued handling.
+
+---

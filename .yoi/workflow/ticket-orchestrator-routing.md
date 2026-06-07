@@ -10,6 +10,8 @@ Yoi の multi-agent 運用で、Intake や人間が作成した Ticket を Orche
 
 これは scheduler ではない。目的は、Ticket の fields / body / thread / artifacts / 現在の repository/Pod 状態を明示的に確認し、隠れた会話状態ではなく Ticket に基づいて routing 判断を残すことである。
 
+Panel Queue / queued notification は、人間が Orchestrator に routing を開始してよいと許可した signal であり、unattended scheduler ではない。implementation side effect に進む場合は、Orchestrator が Ticket と workspace state を再確認し、unblocked と判断してから `queued -> inprogress` を記録する必要がある。
+
 ## 位置づけ
 
 ```text
@@ -22,6 +24,7 @@ TicketCreate / TicketComment
 - Intake は Ticket の materialization を担当する。
 - Orchestrator は Ticket の next action を分類する。
 - `ticket-preflight-workflow` は実装前の設計・要件 gate。
+- `ready -> queued` は人間が Orchestrator routing を許可した状態であり、worktree 作成や Pod 起動の許可そのものではない。
 - `multi-agent-workflow` は coder / reviewer Pod と worktree を使う実装・レビュー loop。
 - この Workflow は自動 scheduler / lease / unattended maintainer ではない。
 
@@ -33,15 +36,19 @@ Orchestrator は以下を行う。
 - 必要に応じて関連 Ticket を `TicketList` / `TicketShow` で確認する。
 - Ticket body / thread / artifacts / resolution / review / implementation report を読む。
 - repository 状態、関連 docs/code、既存 worktree、visible Pods を必要に応じて明示的に確認する。
+- queued notification を受けた場合も、Ticket と workspace state を再確認してから routing する。
 - next action を routing classification として決める。
 - routing decision を `TicketComment` で Ticket thread に記録する。
 - implementation-ready の場合は `multi-agent-workflow` に渡す `IntentPacket` を作る。
+- implementation-ready かつ Ticket が `queued` の場合は、worktree 作成 / implementation Pod `SpawnPod` / coder routing などの side effect の前に、既存の typed Ticket backend/tool path で `queued -> inprogress` を記録する。
 - preflight-needed の場合は coder Pod に直投げせず、`ticket-preflight-workflow` に接続する。
 
 ## Orchestrator がしないこと
 
 - 自動 scheduler として unattended に実行しない。
-- 人間/上位 Orchestrator の許可なしに coder / reviewer / investigator Pod を起動しない。
+- Panel Queue / queued notification だけを unattended scheduler trigger として扱わない。
+- `queued -> inprogress` acceptance なしに worktree 作成、implementation Pod `SpawnPod`、coder/reviewer routing を行わない。
+- 人間/上位 Orchestrator の許可または明示的な routing acceptance なしに coder / reviewer / investigator Pod を起動しない。
 - 設計境界の未決定を勝手に implementation-ready として固定しない。
 - merge / close / cleanup 権限を持たない場面で勝手に完了処理しない。
 - Ticket tools があるからといって arbitrary filesystem write を行わない。
@@ -55,10 +62,25 @@ Orchestrator は以下を行う。
 - `TicketShow`: 対象 Ticket の body / thread / artifacts / resolution 確認。
 - `TicketComment`: routing decision / intent packet / blocked reason / next question の記録。
 - `TicketStatus`: pending/open などの状態整理が明示的に許可された場合だけ使う。
+- `TicketWorkflowState`: `queued -> inprogress` acceptance など、workflow_state 遷移が明示的に許可・必要な場合だけ使う。
 - `TicketClose`: 完了権限と resolution が揃っている場合だけ使う。
 - `TicketDoctor`: routing 前後の整合性確認。
 
 `TicketCreate` は通常 Intake の責務だが、routing 中に follow-up Ticket が必要だと判断した場合は、ユーザー/上位 Orchestrator の合意後にだけ使う。
+
+## Queued acceptance contract
+
+`workflow_state = queued` は、Ticket が routing 対象として人間により Orchestrator へ渡された状態である。Orchestrator は queued notification を受けたら、Ticket と workspace state を読んで、次のどちらかを行う。
+
+- unblocked と判断する場合: `queued -> inprogress` を記録してから worktree 作成、implementation/review Pod spawn、その他の implementation side effect に進む。
+- blocked / not-ready と判断する場合: concise な理由を Ticket thread に記録し、queued のまま待つか、既存の Ticket status/state mechanism で明示的に defer/block する。
+
+Invariant:
+
+- `queued -> inprogress` は Orchestrator acceptance marker であり、coder Pod が既に動いていることの後追い記録ではない。
+- `queued -> inprogress` に失敗した場合、implementation/review Pod を spawn しない。
+- `inprogress` acceptance 後に worktree/spawn/first-run が失敗した場合は、queued に黙って戻さず、in-progress Ticket に failure/block/recovery note を記録する。
+- Queue notification だけを根拠に blind spawn しない。必ず Ticket と workspace state を再確認する。
 
 ## Routing classification
 
