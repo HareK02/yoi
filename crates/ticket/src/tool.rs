@@ -14,8 +14,8 @@ use serde_json::{Value, json};
 use crate::{
     ExtensibleTicketStatus, LocalTicketBackend, MarkdownText, NewTicket, NewTicketEvent, Ticket,
     TicketBackend, TicketDoctorDiagnostic, TicketDoctorReport, TicketDoctorSeverity, TicketError,
-    TicketEventKind, TicketIdOrSlug, TicketRef, TicketReview, TicketReviewResult, TicketStatus,
-    TicketSummary,
+    TicketEventKind, TicketIdOrSlug, TicketIntakeSummary, TicketRef, TicketReview,
+    TicketReviewResult, TicketStateChange, TicketStatus, TicketSummary, TicketWorkflowState,
 };
 
 const DEFAULT_LIST_LIMIT: usize = 100;
@@ -29,12 +29,14 @@ const MAX_BODY_MAX_BYTES: usize = 64 * 1024;
 const DEFAULT_DIAGNOSTIC_LIMIT: usize = 100;
 const MAX_DIAGNOSTIC_LIMIT: usize = 500;
 
-pub const TICKET_TOOL_NAMES: [&str; 8] = [
+pub const TICKET_TOOL_NAMES: [&str; 10] = [
     "TicketCreate",
     "TicketList",
     "TicketShow",
     "TicketComment",
     "TicketReview",
+    "TicketIntakeReady",
+    "TicketWorkflowState",
     "TicketStatus",
     "TicketClose",
     "TicketDoctor",
@@ -54,6 +56,12 @@ const COMMENT_DESCRIPTION: &str = "Append a typed Ticket thread event. `role` mu
 configured Ticket backend root.";
 const REVIEW_DESCRIPTION: &str = "Append a Ticket review event. `result` must be `approve` or \
 `request_changes`; `body` is Markdown. Writes stay inside the configured Ticket backend root.";
+const INTAKE_READY_DESCRIPTION: &str = "Mark an existing Ticket intake as ready through the typed \
+Ticket backend. The tool appends a bounded `intake_summary`, appends a typed `state_changed` event \
+for `workflow_state`, and transitions workflow_state to `ready`.";
+const WORKFLOW_STATE_DESCRIPTION: &str = "Transition Ticket `workflow_state` through the typed \
+Ticket backend with a bounded `state_changed` event. This does not move local open/pending/closed \
+status; use `TicketStatus` or `TicketClose` for local status changes.";
 const STATUS_DESCRIPTION: &str = "Move a Ticket between non-closed local statuses through the typed \
 Ticket backend. Use `TicketClose` for closing because closed Tickets require a resolution accepted \
 by `yoi ticket doctor`.";
@@ -103,6 +111,40 @@ struct TicketCreateParams {
     /// Optional action-required frontmatter value.
     #[serde(default)]
     action_required: Option<String>,
+    /// Optional workflow_state frontmatter value. Defaults to `intake`.
+    #[serde(default)]
+    workflow_state: Option<TicketWorkflowStateParam>,
+    /// Optional attention_required overlay frontmatter value.
+    #[serde(default)]
+    attention_required: Option<String>,
+    /// Optional queued_by frontmatter value.
+    #[serde(default)]
+    queued_by: Option<String>,
+    /// Optional queued_at frontmatter value.
+    #[serde(default)]
+    queued_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum TicketWorkflowStateParam {
+    Intake,
+    Ready,
+    Queued,
+    Inprogress,
+    Done,
+}
+
+impl TicketWorkflowStateParam {
+    fn into_state(self) -> TicketWorkflowState {
+        match self {
+            Self::Intake => TicketWorkflowState::Intake,
+            Self::Ready => TicketWorkflowState::Ready,
+            Self::Queued => TicketWorkflowState::Queued,
+            Self::Inprogress => TicketWorkflowState::InProgress,
+            Self::Done => TicketWorkflowState::Done,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -213,6 +255,40 @@ struct TicketStatusParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct TicketIntakeReadyParams {
+    /// Ticket id or slug.
+    ticket: String,
+    /// Concise bounded intake summary to append as a typed intake_summary event.
+    intake_summary: String,
+    /// Optional author for both intake_summary and state_changed events.
+    #[serde(default)]
+    author: Option<String>,
+    /// Reason attached to the state_changed event. Defaults to `intake_ready`.
+    #[serde(default)]
+    reason: Option<String>,
+    /// Optional state_changed body. If omitted, a concise default is used.
+    #[serde(default)]
+    state_change_body: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct TicketWorkflowStateParams {
+    /// Ticket id or slug.
+    ticket: String,
+    /// Expected current workflow_state. The backend rejects stale transitions.
+    from: TicketWorkflowStateParam,
+    /// Target workflow_state.
+    to: TicketWorkflowStateParam,
+    /// Reason attached to the typed state_changed event.
+    reason: String,
+    /// Markdown body for the typed state_changed event.
+    body: String,
+    /// Optional thread author.
+    #[serde(default)]
+    author: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct TicketCloseParams {
     /// Ticket id or slug.
     ticket: String,
@@ -279,6 +355,16 @@ struct TicketReviewTool {
 }
 
 #[derive(Clone)]
+struct TicketIntakeReadyTool {
+    backend: LocalTicketBackend,
+}
+
+#[derive(Clone)]
+struct TicketWorkflowStateTool {
+    backend: LocalTicketBackend,
+}
+
+#[derive(Clone)]
 struct TicketStatusTool {
     backend: LocalTicketBackend,
 }
@@ -316,6 +402,12 @@ impl Tool for TicketCreateTool {
         input.needs_preflight = params.needs_preflight;
         input.risk_flags = params.risk_flags;
         input.action_required = params.action_required;
+        input.workflow_state = params
+            .workflow_state
+            .map(TicketWorkflowStateParam::into_state);
+        input.attention_required = params.attention_required;
+        input.queued_by = params.queued_by;
+        input.queued_at = params.queued_at;
 
         let created = self
             .backend
@@ -471,6 +563,76 @@ impl Tool for TicketReviewTool {
 }
 
 #[async_trait]
+impl Tool for TicketIntakeReadyTool {
+    async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError> {
+        let params: TicketIntakeReadyParams = parse_input("TicketIntakeReady", input_json)?;
+        let from = TicketWorkflowState::Intake;
+        let reason = params.reason.unwrap_or_else(|| "intake_ready".to_string());
+        let body = params.state_change_body.unwrap_or_else(|| {
+            format!(
+                "Ticket intake complete; workflow_state {} -> ready.\n",
+                from.as_str()
+            )
+        });
+        let mut summary = TicketIntakeSummary::new(params.intake_summary);
+        summary.author = params.author.clone();
+        let mut change = TicketStateChange::new(
+            from.as_str(),
+            TicketWorkflowState::Ready.as_str(),
+            reason,
+            body,
+        );
+        change.author = params.author;
+        self.backend
+            .mark_intake_ready(
+                TicketIdOrSlug::Query(params.ticket.clone()),
+                summary,
+                change,
+            )
+            .map_err(|error| backend_error("TicketIntakeReady", error))?;
+        Ok(json_output(
+            format!("Marked ticket {} workflow_state ready", params.ticket),
+            json!({ "ticket": params.ticket, "workflow_state": "ready", "ok": true }),
+        ))
+    }
+}
+
+#[async_trait]
+impl Tool for TicketWorkflowStateTool {
+    async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError> {
+        let params: TicketWorkflowStateParams = parse_input("TicketWorkflowState", input_json)?;
+        let from = params.from.into_state();
+        let to = params.to.into_state();
+        if from == to {
+            return Err(ToolError::InvalidArgument(
+                "workflow_state transition must change state".to_string(),
+            ));
+        }
+        let mut change =
+            TicketStateChange::new(from.as_str(), to.as_str(), params.reason, params.body);
+        change.author = params.author;
+        self.backend
+            .set_workflow_state(TicketIdOrSlug::Query(params.ticket.clone()), change)
+            .map_err(|error| backend_error("TicketWorkflowState", error))?;
+        Ok(json_output(
+            format!(
+                "Transitioned ticket {} workflow_state {} -> {}",
+                params.ticket,
+                from.as_str(),
+                to.as_str()
+            ),
+            json!({
+                "ticket": params.ticket,
+                "from": from.as_str(),
+                "to": to.as_str(),
+                "workflow_state": to.as_str(),
+                "ok": true
+            }),
+        ))
+    }
+}
+
+#[async_trait]
 impl Tool for TicketStatusTool {
     async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError> {
         let params: TicketStatusParams = parse_input("TicketStatus", input_json)?;
@@ -586,6 +748,11 @@ fn ticket_summary_json(ticket: TicketSummary) -> Value {
         "readiness": ticket.readiness,
         "needs_preflight": ticket.needs_preflight,
         "action_required": ticket.action_required,
+        "workflow_state": ticket.workflow_state.as_str(),
+        "workflow_state_explicit": ticket.workflow_state_explicit,
+        "attention_required": ticket.attention_required,
+        "queued_by": ticket.queued_by,
+        "queued_at": ticket.queued_at,
         "updated_at": ticket.updated_at,
     })
 }
@@ -641,6 +808,11 @@ fn ticket_json(
             "needs_preflight": ticket.meta.needs_preflight,
             "risk_flags": ticket.meta.risk_flags,
             "action_required": ticket.meta.action_required,
+            "workflow_state": ticket.meta.workflow_state.as_str(),
+            "workflow_state_explicit": ticket.meta.workflow_state_explicit,
+            "attention_required": ticket.meta.attention_required,
+            "queued_by": ticket.meta.queued_by,
+            "queued_at": ticket.meta.queued_at,
         },
         "body": truncate_text(ticket.document.body.as_str(), body_max_bytes),
         "events": {
@@ -736,6 +908,10 @@ fn input_schema(name: &str) -> Value {
         "TicketShow" => serde_json::to_value(schemars::schema_for!(TicketShowParams)),
         "TicketComment" => serde_json::to_value(schemars::schema_for!(TicketCommentParams)),
         "TicketReview" => serde_json::to_value(schemars::schema_for!(TicketReviewParams)),
+        "TicketIntakeReady" => serde_json::to_value(schemars::schema_for!(TicketIntakeReadyParams)),
+        "TicketWorkflowState" => {
+            serde_json::to_value(schemars::schema_for!(TicketWorkflowStateParams))
+        }
         "TicketStatus" => serde_json::to_value(schemars::schema_for!(TicketStatusParams)),
         "TicketClose" => serde_json::to_value(schemars::schema_for!(TicketCloseParams)),
         "TicketDoctor" => serde_json::to_value(schemars::schema_for!(TicketDoctorParams)),
@@ -759,6 +935,8 @@ impl_from_backend!(TicketListTool);
 impl_from_backend!(TicketShowTool);
 impl_from_backend!(TicketCommentTool);
 impl_from_backend!(TicketReviewTool);
+impl_from_backend!(TicketIntakeReadyTool);
+impl_from_backend!(TicketWorkflowStateTool);
 impl_from_backend!(TicketStatusTool);
 impl_from_backend!(TicketCloseTool);
 impl_from_backend!(TicketDoctorTool);
@@ -771,6 +949,16 @@ pub fn ticket_tools(backend: LocalTicketBackend) -> Vec<ToolDefinition> {
         tool_definition::<TicketShowTool>("TicketShow", SHOW_DESCRIPTION, backend.clone()),
         tool_definition::<TicketCommentTool>("TicketComment", COMMENT_DESCRIPTION, backend.clone()),
         tool_definition::<TicketReviewTool>("TicketReview", REVIEW_DESCRIPTION, backend.clone()),
+        tool_definition::<TicketIntakeReadyTool>(
+            "TicketIntakeReady",
+            INTAKE_READY_DESCRIPTION,
+            backend.clone(),
+        ),
+        tool_definition::<TicketWorkflowStateTool>(
+            "TicketWorkflowState",
+            WORKFLOW_STATE_DESCRIPTION,
+            backend.clone(),
+        ),
         tool_definition::<TicketStatusTool>("TicketStatus", STATUS_DESCRIPTION, backend.clone()),
         tool_definition::<TicketCloseTool>("TicketClose", CLOSE_DESCRIPTION, backend.clone()),
         tool_definition::<TicketDoctorTool>("TicketDoctor", DOCTOR_DESCRIPTION, backend),
@@ -911,6 +1099,217 @@ mod tests {
                 .iter()
                 .any(|event| event.kind == TicketEventKind::StatusChanged)
         );
+    }
+
+    #[tokio::test]
+    async fn ticket_workflow_tools_mark_ready_and_transition_state() {
+        let temp = TempDir::new().unwrap();
+        let backend = backend(&temp);
+        let created = backend.create(NewTicket::new("Workflow Tool")).unwrap();
+        let intake_ready = tool_by_name(backend.clone(), "TicketIntakeReady");
+        let workflow = tool_by_name(backend.clone(), "TicketWorkflowState");
+
+        intake_ready
+            .execute(
+                &json!({
+                    "ticket": created.slug,
+                    "intake_summary": "Requirements accepted; implementation can be queued.",
+                    "author": "intake-pod"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        backend
+            .queue_ready(TicketIdOrSlug::Id(created.id.clone()), "panel")
+            .unwrap();
+        workflow
+            .execute(
+                &json!({
+                    "ticket": created.slug,
+                    "from": "queued",
+                    "to": "inprogress",
+                    "reason": "orchestrator_started",
+                    "body": "Orchestrator started implementation.\n",
+                    "author": "orchestrator"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        workflow
+            .execute(
+                &json!({
+                    "ticket": created.slug,
+                    "from": "inprogress",
+                    "to": "done",
+                    "reason": "implementation_complete",
+                    "body": "Implementation finished and is ready for close.\n",
+                    "author": "orchestrator"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+
+        let record = backend.show(TicketIdOrSlug::Query(created.slug)).unwrap();
+        assert_eq!(record.meta.workflow_state, TicketWorkflowState::Done);
+        assert_eq!(record.meta.status.as_local(), Some(TicketStatus::Open));
+        assert!(
+            record
+                .events
+                .iter()
+                .any(|event| event.kind == TicketEventKind::IntakeSummary)
+        );
+        let transitions = record
+            .events
+            .iter()
+            .filter(|event| {
+                event.kind == TicketEventKind::StateChanged
+                    && event.state_field.as_deref() == Some("workflow_state")
+            })
+            .map(|event| (event.from.as_deref(), event.to.as_deref()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            transitions,
+            vec![
+                (Some("intake"), Some("ready")),
+                (Some("ready"), Some("queued")),
+                (Some("queued"), Some("inprogress")),
+                (Some("inprogress"), Some("done"))
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn ticket_workflow_tool_rejects_stale_transition_without_status_move() {
+        let temp = TempDir::new().unwrap();
+        let backend = backend(&temp);
+        let created = backend
+            .create(NewTicket::new("Stale Workflow Tool"))
+            .unwrap();
+        let workflow = tool_by_name(backend.clone(), "TicketWorkflowState");
+
+        let error = workflow
+            .execute(
+                &json!({
+                    "ticket": created.id,
+                    "from": "queued",
+                    "to": "inprogress",
+                    "reason": "orchestrator_started",
+                    "body": "Should not apply.\n"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("workflow_state changed concurrently")
+        );
+        let record = backend.show(TicketIdOrSlug::Query(created.slug)).unwrap();
+        assert_eq!(record.meta.workflow_state, TicketWorkflowState::Intake);
+        assert_eq!(record.meta.status.as_local(), Some(TicketStatus::Open));
+        assert!(!record.events.iter().any(|event| {
+            event.kind == TicketEventKind::StateChanged
+                && event.state_field.as_deref() == Some("workflow_state")
+        }));
+    }
+
+    #[tokio::test]
+    async fn ticket_workflow_tool_rejects_disallowed_transition_graph_edges() {
+        let temp = TempDir::new().unwrap();
+        let backend = backend(&temp);
+        let workflow = tool_by_name(backend.clone(), "TicketWorkflowState");
+
+        let mut ready_input = NewTicket::new("Ready Bypass");
+        ready_input.workflow_state = Some(TicketWorkflowState::Ready);
+        let ready = backend.create(ready_input).unwrap();
+        let ready_error = workflow
+            .execute(
+                &json!({
+                    "ticket": ready.id,
+                    "from": "ready",
+                    "to": "inprogress",
+                    "reason": "bypass_queue",
+                    "body": "Should not bypass Queue.\n"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap_err();
+        assert!(ready_error.to_string().contains("not allowed"));
+
+        let mut done_input = NewTicket::new("Backward Bypass");
+        done_input.workflow_state = Some(TicketWorkflowState::Done);
+        let done = backend.create(done_input).unwrap();
+        let backward_error = workflow
+            .execute(
+                &json!({
+                    "ticket": done.id,
+                    "from": "done",
+                    "to": "intake",
+                    "reason": "backwards",
+                    "body": "Should not move backwards.\n"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap_err();
+        assert!(backward_error.to_string().contains("not allowed"));
+
+        let mut queued_input = NewTicket::new("Skip Bypass");
+        queued_input.workflow_state = Some(TicketWorkflowState::Queued);
+        let queued = backend.create(queued_input).unwrap();
+        let skip_error = workflow
+            .execute(
+                &json!({
+                    "ticket": queued.id,
+                    "from": "queued",
+                    "to": "done",
+                    "reason": "skip_inprogress",
+                    "body": "Should not skip inprogress.\n"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap_err();
+        assert!(skip_error.to_string().contains("not allowed"));
+    }
+
+    #[tokio::test]
+    async fn ticket_intake_ready_tool_rejects_non_intake_ticket() {
+        let temp = TempDir::new().unwrap();
+        let backend = backend(&temp);
+        let mut input = NewTicket::new("Already Ready");
+        input.workflow_state = Some(TicketWorkflowState::Ready);
+        let created = backend.create(input).unwrap();
+        let intake_ready = tool_by_name(backend.clone(), "TicketIntakeReady");
+
+        let error = intake_ready
+            .execute(
+                &json!({
+                    "ticket": created.id,
+                    "intake_summary": "Should not rewrite ready ticket."
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("workflow_state changed concurrently")
+        );
+        let record = backend.show(TicketIdOrSlug::Query(created.slug)).unwrap();
+        assert_eq!(record.meta.workflow_state, TicketWorkflowState::Ready);
+        assert!(!record.events.iter().any(|event| {
+            event.kind == TicketEventKind::StateChanged
+                && event.state_field.as_deref() == Some("workflow_state")
+        }));
     }
 
     #[tokio::test]
