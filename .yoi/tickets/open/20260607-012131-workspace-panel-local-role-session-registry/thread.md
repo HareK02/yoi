@@ -137,3 +137,29 @@ Positive evidence:
 Merge readiness: not merge-ready. Needs rebase/semantic conflict fix against current `develop`, schema additions, and failure-behavior hardening, followed by focused tests and build validation.
 
 ---
+
+<!-- event: review author: panel-role-session-registry-reviewer-20260607 at: 2026-06-07T02:34:09Z status: approve -->
+
+## Review: approve
+
+Approved after fixup commit `2f3f54b`.
+
+Reviewer verified:
+- The selected-Pod direct-send path is not reintroduced; no `DirectSendRequest`, `prepare_send`, `finish_send`, `DirectSendError`, or `NextUserAction::SendToPod` panel path remains.
+- Pod rows use open/attach-style behavior and Companion non-empty submit remains rejected with the Companion lifecycle diagnostic.
+- `RoleSessionRecord` includes `role`, `pod_name`, `origin`, `created_at`, `updated_at`, `related_tickets`, and optional `session_id`.
+- `RoleSessionOrigin` distinguishes pre-Ticket Intake from existing-Ticket claims.
+- Related Tickets are represented as a vector, preserving 0..N Ticket relationships.
+- Existing-Ticket claim is created before launch and is not broadly released after launch failures that may have spawned a Pod.
+- Pre-Ticket successful launch surfaces registry recording failure as a warning/diagnostic.
+- Claim files avoid visible partial JSON by writing a temp file then linking into place.
+- `role-sessions.json` updates use a local lock guard.
+- Live/restorable/stale status is derived from current Pod list/metadata at panel render time.
+- Local Pod assignment is stored under user data panel workspace storage, not `.yoi/tickets`.
+- `git merge-tree --write-tree develop work/workspace-panel-local-role-session-registry` exits 0, and no semantic conflict with current direct-send removal was found.
+
+Non-blocking follow-ups:
+- Registry lock has no stale-lock recovery.
+- Temp claim files may remain after a crash before link/cleanup, though they are not read as claim JSON.
+
+---
