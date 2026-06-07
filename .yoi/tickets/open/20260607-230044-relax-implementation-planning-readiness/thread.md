@@ -170,3 +170,16 @@ Critical risks:
 Orchestrator accepted the queued Ticket for implementation after the human decision supplied the policy boundary for bounded implementation latitude versus binding design/authority decisions. Worktree and sibling coder/reviewer routing may proceed from this accepted in-progress state.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-07T23:10:10Z -->
+
+## Implementation report
+
+Coder delegated:
+- Pod: `coder-relax-implementation-planning-readiness`
+- Worktree: `.worktree/relax-implementation-planning-readiness`
+- Branch: `ticket/relax-implementation-planning-readiness`
+- Scope: read access to main workspace only for startup/cwd; write access to the child worktree.
+- Instructions: update workflow guidance to distinguish ready-for-routing, implementation handoff with bounded implementation latitude, binding decisions/invariants, and escalation conditions; keep preflight mandatory for product/API/UX/authority-boundary uncertainty; update reviewer guidance to judge against recorded intent/constraints/acceptance/explicit decisions; run validation and commit locally. No merge, close, main workspace edits, or cleanup delegated.
+
+---
