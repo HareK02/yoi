@@ -165,17 +165,19 @@ pub struct WebFetchConfig {
 }
 
 /// Memory subsystem configuration. Presence in the manifest enables
-/// memory; the workspace root defaults to the Pod's pwd unless an
-/// explicit override is given.
+/// memory; `workspace_root` pins the memory workspace explicitly. When it
+/// is absent, memory resolution searches upward from the Pod's pwd for a
+/// `.yoi/memory` marker rather than treating `.yoi` project records alone
+/// as a memory root.
 ///
 /// All fields are `Option`; defaults are applied at the consumer
 /// (`.unwrap_or(defaults::...)`). This keeps cascade `merge` simple
 /// (`upper.x.or(self.x)`) without a separate partial/resolved split.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MemoryConfig {
-    /// Override for the workspace root. When `None`, the Pod's pwd
-    /// (resolved at construction time) is used. When set, must be an
-    /// absolute path.
+    /// Override for the memory workspace root. When `None`, consumers resolve
+    /// the root from their default path and ancestor `.yoi/memory` markers.
+    /// When set, must be an absolute path.
     #[serde(default)]
     pub workspace_root: Option<PathBuf>,
     /// Maximum number of records returned by `MemoryQuery` /

@@ -1,10 +1,9 @@
 //! Workspace-level path layout for the memory subsystem.
 //!
-//! `WorkspaceLayout` carries the workspace root (typically the Pod's
-//! pwd). All yoi-managed content lives under the conventional
-//! `<root>/.yoi/` subdirectory — the same place that holds
-//! `profiles.toml`, `prompts/`, workflow, knowledge, and generated
-//! memory. The trees inside it:
+//! `WorkspaceLayout` carries the root used by the memory subsystem.
+//! All yoi-managed memory content lives under the conventional
+//! `<root>/.yoi/` subdirectory — alongside workspace project records
+//! such as workflow and generated durable memory. The trees inside it:
 //!
 //! - `<root>/.yoi/workflow/<slug>.md`
 //! - `<root>/.yoi/knowledge/<slug>.md`
@@ -18,9 +17,9 @@
 //! Workflows are human-managed and live one level up under
 //! `.yoi/workflow/`.
 //!
-//! Configuring `[memory]` with an empty body is therefore sufficient
-//! for any workspace that already uses the `.yoi/` convention; no
-//! `workspace_root` override is needed.
+//! `memory.workspace_root` pins this root explicitly. Without an explicit
+//! root, resolution searches upward from the Pod pwd for a `.yoi/memory`
+//! marker; `.yoi` project records alone are not a memory marker.
 
 use std::path::{Path, PathBuf};
 
@@ -82,17 +81,26 @@ impl WorkspaceLayout {
         Self { root: root.into() }
     }
 
-    /// Resolve a layout from a `MemoryConfig`, falling back to
-    /// `default_root` (typically the Pod's pwd) when the manifest does
-    /// not pin `workspace_root` explicitly. Single source of truth for
-    /// the `workspace_root.unwrap_or(pwd)` convention used across the
-    /// codebase (controller wiring, scope-deny build, system-prompt
-    /// resident-injection).
+    /// Resolve a layout from a `MemoryConfig`.
+    ///
+    /// An explicit `memory.workspace_root` is honored exactly. Without an
+    /// explicit root, resolution searches `default_root` and its ancestors for
+    /// the nearest `.yoi/memory` directory. This keeps child worktrees that
+    /// contain `.yoi` project records such as tickets or workflows from
+    /// becoming independent memory roots merely because they contain `.yoi`.
+    ///
+    /// If no memory marker exists, this falls back to `default_root` because
+    /// existing call sites require a concrete layout. That fallback is a
+    /// no-marker compatibility path, not a `.yoi` marker interpretation; it
+    /// must not be used as evidence that `.yoi` alone enables repo-local
+    /// memory.
     pub fn resolve(cfg: &manifest::MemoryConfig, default_root: &Path) -> Self {
-        let root = cfg
-            .workspace_root
-            .clone()
-            .unwrap_or_else(|| default_root.to_path_buf());
+        if let Some(root) = &cfg.workspace_root {
+            return Self::new(root.clone());
+        }
+
+        let root =
+            find_memory_marker_root(default_root).unwrap_or_else(|| default_root.to_path_buf());
         Self::new(root)
     }
 
@@ -225,6 +233,13 @@ impl WorkspaceLayout {
     }
 }
 
+fn find_memory_marker_root(default_root: &Path) -> Option<PathBuf> {
+    default_root
+        .ancestors()
+        .find(|ancestor| ancestor.join(YOI_DIR).join(MEMORY_DIR).is_dir())
+        .map(Path::to_path_buf)
+}
+
 fn classify_kinded_md(
     rel: &Path,
     kind: RecordKind,
@@ -257,6 +272,7 @@ fn classify_kinded_md(
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use tempfile::TempDir;
 
     fn layout() -> WorkspaceLayout {
         WorkspaceLayout::new(PathBuf::from("/ws"))
@@ -379,9 +395,45 @@ mod tests {
     }
 
     #[test]
-    fn resolve_falls_back_to_default_when_workspace_root_missing() {
+    fn resolve_selects_nearest_ancestor_memory_marker_when_workspace_root_missing() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().join("workspace");
+        let child = workspace.join(".worktree/child");
+        std::fs::create_dir_all(workspace.join(".yoi/memory")).unwrap();
+        std::fs::create_dir_all(&child).unwrap();
+
         let cfg = manifest::MemoryConfig::default();
-        let layout = WorkspaceLayout::resolve(&cfg, Path::new("/fallback"));
-        assert_eq!(layout.root(), Path::new("/fallback"));
+        let layout = WorkspaceLayout::resolve(&cfg, &child);
+        assert_eq!(layout.root(), workspace.as_path());
+    }
+
+    #[test]
+    fn resolve_ignores_child_project_records_without_memory_marker() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().join("workspace");
+        let child = workspace.join(".worktree/child");
+        std::fs::create_dir_all(workspace.join(".yoi/memory")).unwrap();
+        std::fs::create_dir_all(child.join(".yoi/tickets")).unwrap();
+        std::fs::create_dir_all(child.join(".yoi/workflow")).unwrap();
+
+        let cfg = manifest::MemoryConfig::default();
+        let layout = WorkspaceLayout::resolve(&cfg, &child);
+        assert_eq!(layout.root(), workspace.as_path());
+    }
+
+    #[test]
+    fn yoi_project_records_alone_do_not_define_memory_marker_root() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().join("workspace");
+        let child = workspace.join("child");
+        std::fs::create_dir_all(workspace.join(".yoi/tickets")).unwrap();
+        std::fs::create_dir_all(workspace.join(".yoi/workflow")).unwrap();
+        std::fs::create_dir_all(&child).unwrap();
+
+        assert_eq!(find_memory_marker_root(&child), None);
+
+        let cfg = manifest::MemoryConfig::default();
+        let layout = WorkspaceLayout::resolve(&cfg, &child);
+        assert_eq!(layout.root(), child.as_path());
     }
 }
