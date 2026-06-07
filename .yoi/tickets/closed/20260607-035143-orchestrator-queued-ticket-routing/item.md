@@ -2,13 +2,13 @@
 id: 20260607-035143-orchestrator-queued-ticket-routing
 slug: orchestrator-queued-ticket-routing
 title: Orchestrator queued Ticket routing
-status: open
+status: closed
 kind: task
 priority: P1
 labels: [panel, orchestrator, ticket, routing, workflow]
-workflow_state: ready
+workflow_state: done
 created_at: 2026-06-07T03:51:43Z
-updated_at: 2026-06-07T05:12:59Z
+updated_at: 2026-06-07T05:13:36Z
 assignee: null
 legacy_ticket: null
 ---
