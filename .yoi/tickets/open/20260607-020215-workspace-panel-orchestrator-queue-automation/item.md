@@ -33,8 +33,18 @@ Implement a first-class Panel -> Intake/Queue -> Orchestrator automation path wh
 
 - `ready`: Ticket is materialized and can be queued by the human.
 - `queued`: Human has authorized Orchestrator routing. The Orchestrator should inspect current state and start work if unblocked.
-- `inprogress`: Orchestrator has accepted/started the Ticket and owns routing/coordination until completion or an explicit block.
+- `inprogress`: Orchestrator has accepted the Ticket as its durable responsibility marker and owns routing/coordination until completion, explicit defer, or explicit block. It does not merely mean that a coder Pod is already running.
 - `done`: Implementation/review/merge outcome is complete and the Ticket can be closed or has been closed.
+
+## Orchestrator acceptance contract
+
+- `inprogress` is the durable Orchestrator acceptance marker for a queued Ticket.
+- Orchestrator must inspect the Ticket and current workspace state before accepting queued work.
+- Orchestrator must transition `queued -> inprogress` before creating implementation worktrees or spawning implementation/review Pods, unless a typed operation performs the acceptance and side-effect setup atomically.
+- If `queued -> inprogress` fails, Orchestrator must not spawn implementation/review Pods for that Ticket.
+- After `inprogress` acceptance, worktree/spawn/first-run failures should be recorded as progress/block/failure on the in-progress Ticket rather than silently reverting to queued or starting a duplicate route.
+- The short-term implementation may enforce this through Orchestrator prompt/workflow text plus the existing typed Ticket workflow-state tool.
+- The long-term target is a typed Orchestrator operation such as `AcceptQueuedTicket` or `StartTicketWork` that validates the queued state, records acceptance, establishes any local claim/lease, and returns the bounded context needed for worktree/Pod launch.
 
 ## Requirements
 
@@ -43,8 +53,10 @@ Implement a first-class Panel -> Intake/Queue -> Orchestrator automation path wh
   - read the Ticket and current workflow state;
   - inspect active worktrees/branches/Pods and queued/inprogress Tickets where available;
   - decide whether there are conflicts, dependency blockers, preflight gaps, or capacity constraints;
-  - if unblocked, transition `queued -> inprogress` using the typed Ticket workflow tool/path;
+  - if unblocked, transition `queued -> inprogress` using the typed Ticket workflow tool/path before implementation side effects;
   - if blocked, record a concise reason and leave the Ticket queued or defer through the existing Ticket status/state mechanism as appropriate.
+- Ensure Orchestrator cannot create implementation worktrees or spawn implementation/review Pods for a queued Ticket until the Ticket is already accepted as `inprogress` or the same typed operation atomically accepts it.
+- Add or design toward a typed accept/start operation for Orchestrator routing so the `queued -> inprogress` acceptance contract is not only prompt-enforced.
 - Connect Orchestrator routing to the existing Ticket workflows:
   - `ticket-preflight-workflow` when requirements/design readiness are uncertain;
   - `worktree-workflow` for worktree creation/management;
@@ -72,6 +84,8 @@ Implement a first-class Panel -> Intake/Queue -> Orchestrator automation path wh
 
 - Queue notification/prompt semantics say that Orchestrator should route and start if unblocked.
 - A queued Ticket can be accepted by the Orchestrator, moved to `inprogress`, and routed to implementation through existing worktree/coder/reviewer workflows.
+- Implementation/review Pod spawning is prevented for a queued Ticket unless the Ticket has already been accepted as `inprogress` or a typed accept/start operation performs that transition atomically.
+- If acceptance fails, no implementation side effects occur; if post-acceptance side effects fail, the failure/block is recorded on the in-progress Ticket.
 - Blocking conditions are recorded instead of silently doing nothing.
 - The panel can distinguish at least queued-waiting, in-progress, and blocked/deferred outcomes from Orchestrator routing.
 - The path from Panel Intake -> ready Ticket -> Queue -> Orchestrator routing is documented and covered by focused tests or integration-style unit tests around the routing logic.
