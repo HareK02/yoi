@@ -8,6 +8,7 @@ mod markdown;
 mod multi_pod;
 mod picker;
 mod pod_list;
+mod role_session_registry;
 mod scroll;
 mod single_pod;
 mod spawn;

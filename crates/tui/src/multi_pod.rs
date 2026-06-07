@@ -1,11 +1,11 @@
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use client::ticket_role::{
-    TicketIntakeHandoff, TicketRole, TicketRoleLaunchContext, TicketRoleLaunchError,
+    TicketIntakeHandoff, TicketRef, TicketRole, TicketRoleLaunchContext, TicketRoleLaunchError,
     TicketRoleLaunchOptions, TicketRoleLaunchResult, launch_ticket_role_pod,
-    launch_ticket_role_pod_with_options,
+    launch_ticket_role_pod_with_options, plan_ticket_role_launch,
 };
 use client::{PodRuntimeCommand, SpawnConfig, spawn_pod};
 use crossterm::event::{Event as TermEvent, KeyCode, KeyEvent, KeyModifiers, poll, read};
@@ -33,12 +33,14 @@ use crate::pod_list::{
     PodList, PodListEntry, PodVisibilitySource, StoredMetadataState, read_reachable_live_pod_infos,
     read_stored_pod_infos,
 };
+use crate::role_session_registry::{PanelRegistryStore, TicketClaimResult};
 use crate::workspace_panel::{
     ActionPriority, ComposerTarget, NextUserAction, OrchestratorLifecyclePlan,
     OrchestratorPanelState, OrchestratorPanelStatus, OrchestratorPodPresence, PanelRow,
-    PanelRowKey, TicketConfigAvailability, WorkspacePanelViewModel, bounded_panel_diagnostic,
-    build_current_ticket_row, build_workspace_panel, decide_orchestrator_lifecycle,
-    orchestrator_pod_presence, ticket_config_availability, workspace_orchestrator_pod_name,
+    PanelRowKey, TicketConfigAvailability, TicketLocalClaimStatus, WorkspacePanelViewModel,
+    bounded_panel_diagnostic, build_current_ticket_row, build_workspace_panel,
+    decide_orchestrator_lifecycle, local_claim_status_for_pod, orchestrator_pod_presence,
+    ticket_config_availability, workspace_orchestrator_pod_name,
 };
 
 const MAX_ENTRIES: usize = 50;
@@ -272,6 +274,21 @@ pub(crate) struct IntakeLaunchRequest {
     context: TicketRoleLaunchContext,
     runtime_command: PodRuntimeCommand,
     peer_registration: IntakePeerRegistrationRequest,
+    registry_update: IntakeRegistryUpdate,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum IntakeRegistryUpdate {
+    RecordSession {
+        registry_root: PathBuf,
+        pod_name: String,
+        ticket_ids: Vec<String>,
+    },
+    ClaimedTicket {
+        registry_root: PathBuf,
+        ticket_id: String,
+        pod_name: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -318,13 +335,43 @@ pub(crate) async fn launch_intake_with_handoff(request: IntakeLaunchRequest) -> 
             ))),
         ),
     };
-    let launch = launch_ticket_role_pod_with_options(
+    let launch = match launch_ticket_role_pod_with_options(
         request.context,
         request.runtime_command,
         |_| {},
         options,
     )
-    .await?;
+    .await
+    {
+        Ok(launch) => launch,
+        Err(error) => {
+            if let IntakeRegistryUpdate::ClaimedTicket {
+                registry_root,
+                ticket_id,
+                pod_name,
+            } = &request.registry_update
+            {
+                let _ = PanelRegistryStore::from_root(registry_root.clone())
+                    .release_ticket_claim(ticket_id, pod_name);
+            }
+            return Err(error);
+        }
+    };
+    match &request.registry_update {
+        IntakeRegistryUpdate::RecordSession {
+            registry_root,
+            pod_name,
+            ticket_ids,
+        } => {
+            let _ = PanelRegistryStore::from_root(registry_root.clone()).record_session(
+                pod_name.clone(),
+                TicketRole::Intake.as_str().to_string(),
+                None,
+                ticket_ids.clone(),
+            );
+        }
+        IntakeRegistryUpdate::ClaimedTicket { .. } => {}
+    };
     let peer_registration = match (orchestrator_pod, skip_warning) {
         (_, Some(warning)) => warning,
         (Some(orchestrator_pod), None) if launch.pre_run_warnings.is_empty() => {
@@ -742,27 +789,11 @@ impl MultiPodApp {
         });
     }
 
-    pub(crate) fn prepare_intake_launch(&mut self) -> Option<IntakeLaunchRequest> {
-        if !self
-            .panel
-            .composer
-            .is_available(ComposerTarget::TicketIntake)
-        {
-            self.composer_target = ComposerTarget::Companion;
-            self.notice = Some(
-                "Ticket Intake target is unavailable without usable Ticket config.".to_string(),
-            );
-            return None;
-        }
-        let body = Segment::flatten_to_text(&self.input.submit_segments());
-        if body.trim().is_empty() {
-            self.notice = Some("Ticket Intake input is empty; type a request first.".to_string());
-            return None;
-        }
-        let mut context =
-            TicketRoleLaunchContext::new(current_workspace_root(), TicketRole::Intake);
-        context.user_instruction = Some(body);
-        let peer_registration = match self.panel.header.orchestrator.as_ref() {
+    fn prepare_intake_peer_registration(
+        &self,
+        context: &mut TicketRoleLaunchContext,
+    ) -> IntakePeerRegistrationRequest {
+        match self.panel.header.orchestrator.as_ref() {
             Some(orchestrator) => {
                 context.intake_handoff = Some(TicketIntakeHandoff::new(
                     orchestrator.pod_name.clone(),
@@ -785,13 +816,148 @@ impl MultiPodApp {
             None => IntakePeerRegistrationRequest::Skip {
                 reason: "workspace Orchestrator is not configured for this panel".to_string(),
             },
+        }
+    }
+
+    pub(crate) fn prepare_intake_launch(&mut self) -> Option<IntakeLaunchRequest> {
+        if !self
+            .panel
+            .composer
+            .is_available(ComposerTarget::TicketIntake)
+        {
+            self.composer_target = ComposerTarget::Companion;
+            self.notice = Some(
+                "Ticket Intake target is unavailable without usable Ticket config.".to_string(),
+            );
+            return None;
+        }
+        let body = Segment::flatten_to_text(&self.input.submit_segments());
+        if body.trim().is_empty() {
+            self.notice = Some("Ticket Intake input is empty; type a request first.".to_string());
+            return None;
+        }
+        let mut context =
+            TicketRoleLaunchContext::new(current_workspace_root(), TicketRole::Intake);
+        let pod_name = unique_preticket_intake_pod_name();
+        context.pod_name = Some(pod_name.clone());
+        context.user_instruction = Some(body);
+        let store = match PanelRegistryStore::default_for_workspace(&context.workspace_root) {
+            Ok(store) => store,
+            Err(error) => {
+                self.notice = Some(format!("Ticket Intake registry unavailable: {error}"));
+                return None;
+            }
         };
+        let registry_update = IntakeRegistryUpdate::RecordSession {
+            registry_root: store.root().to_path_buf(),
+            pod_name,
+            ticket_ids: Vec::new(),
+        };
+        let peer_registration = self.prepare_intake_peer_registration(&mut context);
         self.sending = true;
         self.notice = Some("Launching Ticket Intake…".to_string());
         Some(IntakeLaunchRequest {
             context,
             runtime_command: self.runtime_command.clone(),
             peer_registration,
+            registry_update,
+        })
+    }
+
+    pub(crate) fn prepare_existing_ticket_intake_launch(&mut self) -> Option<IntakeLaunchRequest> {
+        let row = match self.selected_panel_row() {
+            Some(row) if row.is_ticket_action() => row,
+            Some(row) if row.ticket.is_some() => {
+                self.notice = Some("Selected Ticket row has no Intake action.".to_string());
+                return None;
+            }
+            _ => {
+                self.notice = Some("No Ticket Intake action is selected.".to_string());
+                return None;
+            }
+        };
+        let Some(action) = row.next_action else {
+            self.notice = Some("Selected Ticket row has no Intake action.".to_string());
+            return None;
+        };
+        if action != NextUserAction::Clarify {
+            self.notice = Some(format!(
+                "{} is not handled by Ticket Intake launch.",
+                action.label()
+            ));
+            return None;
+        }
+        let Some(ticket) = row.ticket.as_ref() else {
+            self.notice = Some("No Ticket Intake action is selected.".to_string());
+            return None;
+        };
+        let ticket_id = ticket.id.clone();
+        let ticket_slug = ticket.slug.clone();
+        let mut context =
+            TicketRoleLaunchContext::new(current_workspace_root(), TicketRole::Intake);
+        context.ticket = Some(TicketRef {
+            id: Some(ticket_id.clone()),
+            slug: Some(ticket_slug.clone()),
+        });
+        context.user_instruction = Some(format!(
+            "Continue Intake for existing Ticket {ticket_id} ({ticket_slug}). Do not create a duplicate Ticket unless the user explicitly requests one."
+        ));
+        let store = match PanelRegistryStore::default_for_workspace(&context.workspace_root) {
+            Ok(store) => store,
+            Err(error) => {
+                self.notice = Some(format!("Ticket Intake registry unavailable: {error}"));
+                return None;
+            }
+        };
+        match store.claim_for_ticket(&ticket_id) {
+            Ok(Some(claim)) => {
+                let status = local_claim_status_for_pod(&claim.pod_name, &self.list);
+                self.notice = Some(existing_ticket_claim_notice(
+                    &ticket_id,
+                    &claim.pod_name,
+                    status,
+                ));
+                return None;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                self.notice = Some(format!("Ticket claim diagnostic required: {error}"));
+                return None;
+            }
+        }
+        let planned = match plan_ticket_role_launch(context.clone()) {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.notice = Some(format!(
+                    "Ticket Intake launch plan failed; no claim written: {}",
+                    bounded_panel_diagnostic(error.to_string())
+                ));
+                return None;
+            }
+        };
+        context.pod_name = Some(planned.pod_name.clone());
+        match store.claim_ticket(&ticket_id, &planned.pod_name, TicketRole::Intake.as_str()) {
+            Ok(TicketClaimResult::Claimed) | Ok(TicketClaimResult::AlreadyOwned(_)) => {}
+            Err(error) => {
+                self.notice = Some(format!("Ticket claim diagnostic required: {error}"));
+                return None;
+            }
+        }
+        let peer_registration = self.prepare_intake_peer_registration(&mut context);
+        self.sending = true;
+        self.notice = Some(format!(
+            "Launching Ticket Intake for {} as {}…",
+            ticket_slug, planned.pod_name
+        ));
+        Some(IntakeLaunchRequest {
+            context,
+            runtime_command: self.runtime_command.clone(),
+            peer_registration,
+            registry_update: IntakeRegistryUpdate::ClaimedTicket {
+                registry_root: store.root().to_path_buf(),
+                ticket_id,
+                pod_name: planned.pod_name,
+            },
         })
     }
 
@@ -854,6 +1020,14 @@ impl MultiPodApp {
             KeyCode::Enter if alt => {
                 self.input.insert_newline();
                 MultiPodAction::None
+            }
+            KeyCode::Enter
+                if self.composer_is_blank()
+                    && self.selected_ticket_action() == Some(NextUserAction::Clarify) =>
+            {
+                self.prepare_existing_ticket_intake_launch()
+                    .map(MultiPodAction::LaunchIntake)
+                    .unwrap_or(MultiPodAction::None)
             }
             KeyCode::Enter
                 if self.composer_is_blank() && self.selected_ticket_action().is_some() =>
@@ -1143,6 +1317,30 @@ fn orchestrator_status_is_peer_reachable(status: OrchestratorPanelStatus) -> boo
             | OrchestratorPanelStatus::Restored
             | OrchestratorPanelStatus::Spawned
     )
+}
+
+fn unique_preticket_intake_pod_name() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!("ticket-intake-{nanos:x}")
+}
+
+fn existing_ticket_claim_notice(
+    ticket_id: &str,
+    pod_name: &str,
+    status: TicketLocalClaimStatus,
+) -> String {
+    match status {
+        TicketLocalClaimStatus::Live | TicketLocalClaimStatus::Restorable => format!(
+            "Ticket {ticket_id} is already claimed by local Intake Pod {pod_name} ({}); select/open that Pod instead of starting a second Intake.",
+            status.label()
+        ),
+        TicketLocalClaimStatus::Stale => format!(
+            "Ticket {ticket_id} has a stale local Intake claim for {pod_name}; explicit reclaim/diagnostic is required before starting a replacement."
+        ),
+    }
 }
 
 async fn load_exact_pod_presence(pod_name: &str) -> Result<OrchestratorPodPresence, MultiPodError> {
@@ -3477,6 +3675,7 @@ mod tests {
             latest_event_excerpt: Some("latest event stays out of the primary row".to_string()),
             blocked_reason: None,
             related_pods: Vec::new(),
+            local_claim: None,
         };
         PanelRow {
             key: PanelRowKey::Ticket(ticket.id.clone()),

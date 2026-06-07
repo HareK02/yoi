@@ -8,6 +8,7 @@ use ticket::{
 };
 
 use crate::pod_list::{PodList, PodListEntry, StoredMetadataState};
+use crate::role_session_registry::{PanelRegistrySnapshot, PanelRegistryStore};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WorkspacePanelViewModel {
@@ -202,6 +203,31 @@ pub(crate) struct TicketPanelEntry {
     pub(crate) latest_event_excerpt: Option<String>,
     pub(crate) blocked_reason: Option<String>,
     pub(crate) related_pods: Vec<String>,
+    pub(crate) local_claim: Option<TicketLocalClaimEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TicketLocalClaimEntry {
+    pub(crate) pod_name: String,
+    pub(crate) role: String,
+    pub(crate) status: TicketLocalClaimStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TicketLocalClaimStatus {
+    Live,
+    Restorable,
+    Stale,
+}
+
+impl TicketLocalClaimStatus {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Live => "live",
+            Self::Restorable => "restorable",
+            Self::Stale => "stale",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -373,7 +399,49 @@ pub(crate) fn build_workspace_panel(
     workspace_root: &Path,
     pods: &PodList,
 ) -> WorkspacePanelViewModel {
-    let mut model = WorkspacePanelViewModel::empty(workspace_root);
+    let registry = match PanelRegistryStore::default_for_workspace(workspace_root)
+        .and_then(|store| store.snapshot())
+    {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            let mut snapshot = PanelRegistrySnapshot::empty();
+            // Keep panel rendering available even when the local registry is corrupt or
+            // unavailable; the diagnostic is attached below after the header is initialized.
+            snapshot.claims.clear();
+            snapshot.sessions.clear();
+            let mut model = WorkspacePanelViewModel::empty(workspace_root);
+            model
+                .header
+                .diagnostics
+                .push(bounded_panel_diagnostic(format!(
+                    "Panel local role registry unavailable: {error}"
+                )));
+            return build_workspace_panel_with_registry_model(
+                model,
+                workspace_root,
+                pods,
+                &snapshot,
+            );
+        }
+    };
+    build_workspace_panel_with_registry(workspace_root, pods, &registry)
+}
+
+fn build_workspace_panel_with_registry(
+    workspace_root: &Path,
+    pods: &PodList,
+    registry: &PanelRegistrySnapshot,
+) -> WorkspacePanelViewModel {
+    let model = WorkspacePanelViewModel::empty(workspace_root);
+    build_workspace_panel_with_registry_model(model, workspace_root, pods, registry)
+}
+
+fn build_workspace_panel_with_registry_model(
+    mut model: WorkspacePanelViewModel,
+    workspace_root: &Path,
+    pods: &PodList,
+    registry: &PanelRegistrySnapshot,
+) -> WorkspacePanelViewModel {
     match ticket_config_availability(workspace_root) {
         TicketConfigAvailability::Absent => {}
         TicketConfigAvailability::Usable => {
@@ -383,7 +451,7 @@ pub(crate) fn build_workspace_panel(
                 Ok(config) => {
                     model.header.ticket_root = config.backend_root().to_path_buf();
                     let backend = LocalTicketBackend::new(config.backend_root().to_path_buf());
-                    match build_ticket_rows(&backend, pods) {
+                    match build_ticket_rows(&backend, pods, registry) {
                         Ok(rows) => model.rows.extend(rows),
                         Err(error) => {
                             model
@@ -436,7 +504,8 @@ pub(crate) fn build_current_ticket_row(
         )));
     }
     let summary = ticket_summary_from_meta(&ticket.meta);
-    Ok(ticket_row(summary, &ticket.events, pods))
+    let registry = PanelRegistrySnapshot::empty();
+    Ok(ticket_row(summary, &ticket.events, pods, &registry))
 }
 
 fn ticket_summary_from_meta(meta: &TicketMeta) -> TicketSummary {
@@ -463,6 +532,7 @@ fn ticket_summary_from_meta(meta: &TicketMeta) -> TicketSummary {
 fn build_ticket_rows(
     backend: &LocalTicketBackend,
     pods: &PodList,
+    registry: &PanelRegistrySnapshot,
 ) -> ticket::Result<Vec<PanelRow>> {
     let mut rows = Vec::new();
     for summary in backend.list(TicketFilter::all())? {
@@ -470,13 +540,19 @@ fn build_ticket_rows(
             continue;
         }
         let ticket = backend.show(TicketIdOrSlug::Query(summary.slug.clone()))?;
-        rows.push(ticket_row(summary, &ticket.events, pods));
+        rows.push(ticket_row(summary, &ticket.events, pods, registry));
     }
     Ok(rows)
 }
 
-fn ticket_row(summary: TicketSummary, events: &[TicketEvent], pods: &PodList) -> PanelRow {
-    let related_pods = related_pods_for_ticket(&summary, pods);
+fn ticket_row(
+    summary: TicketSummary,
+    events: &[TicketEvent],
+    pods: &PodList,
+    registry: &PanelRegistrySnapshot,
+) -> PanelRow {
+    let local_claim = local_claim_for_ticket(&summary, pods, registry);
+    let related_pods = related_pods_for_ticket(&summary, pods, registry);
     let derived = derive_ticket_state(&summary);
     let latest_event = events.last();
     let entry = TicketPanelEntry {
@@ -496,6 +572,7 @@ fn ticket_row(summary: TicketSummary, events: &[TicketEvent], pods: &PodList) ->
         latest_event_excerpt: latest_event.and_then(|event| excerpt(event.body.as_str(), 72)),
         blocked_reason: derived.blocked_reason.clone(),
         related_pods: related_pods.clone(),
+        local_claim,
     };
     let subtitle = ticket_subtitle(&entry);
     PanelRow {
@@ -610,22 +687,60 @@ fn derive_ticket_state(summary: &TicketSummary) -> DerivedTicketState {
     }
 }
 
-fn related_pods_for_ticket(summary: &TicketSummary, pods: &PodList) -> Vec<String> {
+fn related_pods_for_ticket(
+    summary: &TicketSummary,
+    pods: &PodList,
+    registry: &PanelRegistrySnapshot,
+) -> Vec<String> {
     let slug = lowercase(&summary.slug);
     let id = lowercase(&summary.id);
-    pods.entries
-        .iter()
-        .filter_map(|pod| {
-            let name = lowercase(&pod.name);
-            if (!slug.is_empty() && name.contains(&slug)) || (!id.is_empty() && name.contains(&id))
-            {
-                Some(pod.name.clone())
-            } else {
-                None
-            }
-        })
-        .take(5)
-        .collect()
+    let mut names = Vec::new();
+    if let Some(claim) = registry.claim_for_ticket(&summary.id) {
+        names.push(claim.pod_name.clone());
+    }
+    for pod in pods.entries.iter().filter_map(|pod| {
+        let name = lowercase(&pod.name);
+        if (!slug.is_empty() && name.contains(&slug)) || (!id.is_empty() && name.contains(&id)) {
+            Some(pod.name.clone())
+        } else {
+            None
+        }
+    }) {
+        if !names.iter().any(|existing| existing == &pod) {
+            names.push(pod);
+        }
+        if names.len() >= 5 {
+            break;
+        }
+    }
+    names
+}
+
+fn local_claim_for_ticket(
+    summary: &TicketSummary,
+    pods: &PodList,
+    registry: &PanelRegistrySnapshot,
+) -> Option<TicketLocalClaimEntry> {
+    let claim = registry.claim_for_ticket(&summary.id)?;
+    let status = local_claim_status_for_pod(&claim.pod_name, pods);
+    Some(TicketLocalClaimEntry {
+        pod_name: claim.pod_name.clone(),
+        role: claim.role.clone(),
+        status,
+    })
+}
+
+pub(crate) fn local_claim_status_for_pod(pod_name: &str, pods: &PodList) -> TicketLocalClaimStatus {
+    let Some(entry) = pods.entries.iter().find(|entry| entry.name == pod_name) else {
+        return TicketLocalClaimStatus::Stale;
+    };
+    if entry.live.as_ref().is_some_and(|live| live.reachable) {
+        return TicketLocalClaimStatus::Live;
+    }
+    if entry.actions.can_restore {
+        return TicketLocalClaimStatus::Restorable;
+    }
+    TicketLocalClaimStatus::Stale
 }
 
 fn ticket_subtitle(entry: &TicketPanelEntry) -> Option<String> {
@@ -636,6 +751,13 @@ fn ticket_subtitle(entry: &TicketPanelEntry) -> Option<String> {
     )];
     if let Some(reason) = entry.attention_required.as_deref() {
         parts.push(format!("attention: {reason}"));
+    }
+    if let Some(claim) = entry.local_claim.as_ref() {
+        parts.push(format!(
+            "claim: {} ({})",
+            claim.pod_name,
+            claim.status.label()
+        ));
     }
     if !entry.related_pods.is_empty() {
         parts.push(format!("pods: {}", entry.related_pods.join(", ")));
@@ -944,6 +1066,42 @@ mod tests {
         assert!(backlog.is_ticket_action());
         assert_eq!(done.status, "done");
         assert_eq!(done.next_action, Some(NextUserAction::Close));
+    }
+
+    #[test]
+    fn workspace_panel_displays_local_ticket_claim_status() {
+        let temp = TempDir::new().unwrap();
+        write_ticket_config(temp.path());
+        let backend = LocalTicketBackend::new(temp.path().join(".yoi/tickets"));
+        create_ticket(&backend, "Claimed Intake", "claimed-intake", |_| {});
+        let summary = backend.list(TicketFilter::all()).unwrap().remove(0);
+        let store = PanelRegistryStore::from_root(temp.path().join("local-registry"));
+        store
+            .claim_ticket(&summary.id, "ticket-claimed-intake", "intake")
+            .unwrap();
+        let registry = store.snapshot().unwrap();
+
+        let model = build_workspace_panel_with_registry(
+            temp.path(),
+            &live_pods(&["ticket-claimed-intake"]),
+            &registry,
+        );
+        let row = model
+            .rows
+            .iter()
+            .find(|row| row.title == "Claimed Intake")
+            .unwrap();
+        let claim = row.ticket.as_ref().unwrap().local_claim.as_ref().unwrap();
+
+        assert_eq!(claim.pod_name, "ticket-claimed-intake");
+        assert_eq!(claim.status, TicketLocalClaimStatus::Live);
+        assert_eq!(row.related_pods, vec!["ticket-claimed-intake"]);
+        assert!(
+            row.subtitle
+                .as_deref()
+                .unwrap()
+                .contains("claim: ticket-claimed-intake (live)")
+        );
     }
 
     #[test]
