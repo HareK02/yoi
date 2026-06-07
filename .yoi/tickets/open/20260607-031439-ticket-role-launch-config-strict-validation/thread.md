@@ -119,3 +119,35 @@ Reported validation:
 External review delegated to `role-launch-config-validation-reviewer-20260607`.
 
 ---
+
+<!-- event: review author: role-launch-config-validation-reviewer-20260607 at: 2026-06-07T03:42:05Z status: approve -->
+
+## Review: approve
+
+Approved.
+
+Reviewer found no blockers and judged the implementation merge-ready.
+
+Evidence:
+- Strict launch readiness is separated from backend config loading: backend-only config still loads, while `role_launch_config` rejects missing role table, missing role `profile`, and explicit top-level `inherit`.
+- No implicit launch fallback was added: role launch planning uses launch-specific validation instead of internal default role config access.
+- Early validation happens before plan/spawn, including profile selector resolution where possible.
+- `TicketRoleLaunchPlan::spawn_config` still defensively rejects `inherit`.
+- Backend-only `.yoi/ticket.config.toml` still parses/exposes backend root while role launch fails with `MissingRoleTable`.
+- Diagnostics are bounded/actionable on panel surfaces.
+- Explicit concrete `builtin:default` launch planning works; unresolvable selectors fail before spawn.
+- Init/scaffold generation was not implemented in this ticket.
+
+Reviewer validation:
+- `cargo test -p ticket config --lib`
+- `cargo test -p client ticket_role --lib`
+- `cargo test -p tui multi_pod --lib`
+- `cargo fmt --check`
+- `git diff --check`
+- `nix build .#yoi`
+
+Merge readiness:
+- `git merge-tree --write-tree develop HEAD` exited 0.
+- Worktree status clean.
+
+---
