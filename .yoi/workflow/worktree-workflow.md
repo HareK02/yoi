@@ -60,6 +60,8 @@ git -C .worktree/<task-name> sparse-checkout set --no-cone \
   '!/.yoi/logs/**' \
   '!/.yoi/_logs/' \
   '!/.yoi/_logs/**' \
+  '!/.yoi/**/_logs/' \
+  '!/.yoi/**/_logs/**' \
   '!/.yoi/locks/' \
   '!/.yoi/locks/**' \
   '!/.yoi/**/*.log' \
@@ -88,7 +90,7 @@ git -C .worktree/<task-name> sparse-checkout set --no-cone \
   '!/.yoi/**/*.secret.*'
 ```
 
-この sparse-checkout は `.yoi` 自体を除外しない。`.yoi/memory` は generated/personal memory marker として child worktree から外す。memory root detection の実装変更はこの Workflow では扱わない。
+この sparse-checkout は `.yoi` 自体を除外しない。`.yoi/memory` は generated/personal memory marker として child worktree から外し、generated log trees は root `_logs` だけでなく recursive `.yoi/**/_logs/**` も外す。memory root detection の実装変更はこの Workflow では扱わない。
 
 確認する。
 
