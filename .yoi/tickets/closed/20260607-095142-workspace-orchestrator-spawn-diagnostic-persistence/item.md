@@ -2,13 +2,13 @@
 id: 20260607-095142-workspace-orchestrator-spawn-diagnostic-persistence
 slug: workspace-orchestrator-spawn-diagnostic-persistence
 title: Keep workspace Orchestrator spawn diagnostics visible
-status: open
+status: closed
 kind: task
 priority: P2
 labels: [tui, panel, orchestrator, diagnostic]
-workflow_state: intake
+workflow_state: done
 created_at: 2026-06-07T09:51:42Z
-updated_at: 2026-06-07T10:15:40Z
+updated_at: 2026-06-07T10:16:08Z
 assignee: null
 legacy_ticket: null
 ---
