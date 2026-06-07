@@ -126,3 +126,30 @@ Reported validation:
 External review will be delegated before merge.
 
 ---
+
+<!-- event: review author: memory-root-marker-reviewer-20260607 at: 2026-06-07T07:58:15Z status: approve -->
+
+## Review: approve
+
+Approved.
+
+Evidence:
+- Explicit `memory.workspace_root` behavior is preserved: `WorkspaceLayout::resolve` returns the explicit root before marker search.
+- Implicit resolution now searches ancestors for `.yoi/memory` only, using nearest-ancestor order.
+- `.yoi` alone is not treated as a memory marker; the resolver never checks `.yoi` by itself, and test coverage verifies project records alone do not define the memory marker root.
+- Child worktree behavior is covered: a child `.yoi/tickets` / `.yoi/workflow` without child `.yoi/memory` resolves to the ancestor workspace that has `.yoi/memory`.
+- No-marker fallback to `default_root` is acceptable for this slice as documented compatibility behavior and is not based on `.yoi` presence. A stricter no-marker-disabled behavior can be a future enable/disable redesign if desired.
+- No broad memory enable/disable redesign or user-data overlay fallback was introduced.
+
+Reviewer validation:
+- `cargo test -p memory workspace --lib`
+- `cargo test -p pod memory --lib`
+- `cargo fmt --check`
+- `git diff --check develop...HEAD`
+- `target/debug/yoi ticket doctor`
+- `nix build .#yoi`
+- `git merge-tree --write-tree develop HEAD`
+
+Merge readiness: approved; implementation worktree clean and merge-tree against current `develop` succeeded.
+
+---
