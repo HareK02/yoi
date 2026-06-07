@@ -1,12 +1,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
 const REGISTRY_VERSION: u32 = 1;
 const REGISTRY_FILE: &str = "role-sessions.json";
+const REGISTRY_LOCK_FILE: &str = "role-sessions.lock";
 const CLAIMS_DIR: &str = "ticket-claims";
 
 #[derive(Debug, Clone)]
@@ -24,17 +27,37 @@ pub(crate) struct RoleSessionRegistry {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct RoleSessionRecord {
-    pub pod_name: String,
     pub role: String,
+    pub pod_name: String,
+    pub origin: RoleSessionOrigin,
+    pub created_at: String,
+    pub updated_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
     #[serde(default)]
-    pub ticket_ids: Vec<String>,
+    pub related_tickets: Vec<RelatedTicketRef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RoleSessionOrigin {
+    PreTicketIntake,
+    TicketClaim,
+    RoleLaunch,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct RelatedTicketRef {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slug: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct TicketClaim {
     pub ticket_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ticket_slug: Option<String>,
     pub pod_name: String,
     pub role: String,
 }
@@ -144,37 +167,46 @@ impl PanelRegistryStore {
         &self,
         pod_name: impl Into<String>,
         role: impl Into<String>,
+        origin: RoleSessionOrigin,
         session_id: Option<String>,
-        ticket_ids: impl IntoIterator<Item = String>,
+        related_tickets: impl IntoIterator<Item = RelatedTicketRef>,
     ) -> Result<(), PanelRegistryError> {
         let pod_name = pod_name.into();
         let role = role.into();
-        let mut registry = self.load_registry()?;
-        registry.version = REGISTRY_VERSION;
-        if let Some(workspace_root) = self.workspace_root.as_ref() {
-            registry.workspace_root = workspace_root.clone();
-        }
-        let mut tickets: BTreeSet<String> = registry
-            .sessions
-            .get(&pod_name)
-            .map(|record| record.ticket_ids.iter().cloned().collect())
-            .unwrap_or_default();
-        tickets.extend(ticket_ids);
-        registry.sessions.insert(
-            pod_name.clone(),
-            RoleSessionRecord {
-                pod_name,
-                role,
-                session_id,
-                ticket_ids: tickets.into_iter().collect(),
-            },
-        );
-        self.save_registry(&registry)
+        let related_tickets: Vec<RelatedTicketRef> = related_tickets.into_iter().collect();
+        self.update_registry(|registry| {
+            let now = now_timestamp_string();
+            let mut tickets: BTreeSet<RelatedTicketRef> = registry
+                .sessions
+                .get(&pod_name)
+                .map(|record| record.related_tickets.iter().cloned().collect())
+                .unwrap_or_default();
+            tickets.extend(related_tickets);
+            let created_at = registry
+                .sessions
+                .get(&pod_name)
+                .map(|record| record.created_at.clone())
+                .unwrap_or_else(|| now.clone());
+            registry.sessions.insert(
+                pod_name.clone(),
+                RoleSessionRecord {
+                    role,
+                    pod_name,
+                    origin,
+                    created_at,
+                    updated_at: now,
+                    session_id,
+                    related_tickets: tickets.into_iter().collect(),
+                },
+            );
+            Ok(())
+        })
     }
 
     pub(crate) fn claim_ticket(
         &self,
         ticket_id: &str,
+        ticket_slug: Option<&str>,
         pod_name: &str,
         role: &str,
     ) -> Result<TicketClaimResult, PanelRegistryError> {
@@ -182,25 +214,21 @@ impl PanelRegistryStore {
         let claim_path = self.claim_path(ticket_id);
         let claim = TicketClaim {
             ticket_id: ticket_id.to_string(),
+            ticket_slug: ticket_slug.map(ToOwned::to_owned),
             pod_name: pod_name.to_string(),
             role: role.to_string(),
         };
-        let bytes = serde_json::to_vec_pretty(&claim)?;
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&claim_path)
-        {
-            Ok(mut file) => {
-                if let Err(error) = file.write_all(&bytes).and_then(|()| file.write_all(b"\n")) {
-                    let _ = fs::remove_file(&claim_path);
-                    return Err(error.into());
-                }
+        match self.create_claim_file(&claim_path, &claim) {
+            Ok(()) => {
                 if let Err(error) = self.record_session(
                     pod_name.to_string(),
                     role.to_string(),
+                    RoleSessionOrigin::TicketClaim,
                     None,
-                    [ticket_id.to_string()],
+                    [RelatedTicketRef {
+                        id: ticket_id.to_string(),
+                        slug: ticket_slug.map(ToOwned::to_owned),
+                    }],
                 ) {
                     let _ = fs::remove_file(&claim_path);
                     return Err(error);
@@ -237,30 +265,63 @@ impl PanelRegistryStore {
         }
     }
 
-    pub(crate) fn release_ticket_claim(
+    fn update_registry(
         &self,
-        ticket_id: &str,
-        pod_name: &str,
+        update: impl FnOnce(&mut RoleSessionRegistry) -> Result<(), PanelRegistryError>,
     ) -> Result<(), PanelRegistryError> {
-        match self.load_claim(ticket_id) {
-            Ok(claim) if claim.pod_name == pod_name => {
-                fs::remove_file(self.claim_path(ticket_id))?;
-                Ok(())
-            }
-            Ok(_) => Ok(()),
-            Err(PanelRegistryError::Io(error)) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error),
+        fs::create_dir_all(&self.root)?;
+        let _lock = self.acquire_registry_lock()?;
+        let mut registry = self.load_registry()?;
+        registry.version = REGISTRY_VERSION;
+        if let Some(workspace_root) = self.workspace_root.as_ref() {
+            registry.workspace_root = workspace_root.clone();
         }
+        update(&mut registry)?;
+        self.save_registry(&registry)
+    }
+
+    fn acquire_registry_lock(&self) -> Result<RegistryLockGuard, PanelRegistryError> {
+        let lock_path = self.root.join(REGISTRY_LOCK_FILE);
+        for _ in 0..50 {
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock_path)
+            {
+                Ok(_) => return Ok(RegistryLockGuard { path: lock_path }),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(PanelRegistryError::Io(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "timed out acquiring panel role session registry lock",
+        )))
     }
 
     fn save_registry(&self, registry: &RoleSessionRegistry) -> Result<(), PanelRegistryError> {
-        fs::create_dir_all(&self.root)?;
         let path = self.registry_path();
-        let temp_path = path.with_extension("json.tmp");
+        let temp_path = path.with_extension(format!("json.{}.tmp", now_timestamp_string()));
         let bytes = serde_json::to_vec_pretty(registry)?;
         fs::write(&temp_path, [&bytes[..], b"\n"].concat())?;
         fs::rename(temp_path, path)?;
         Ok(())
+    }
+
+    fn create_claim_file(&self, claim_path: &Path, claim: &TicketClaim) -> io::Result<()> {
+        let temp_path = self
+            .claims_dir()
+            .join(format!(".{}.tmp", now_timestamp_string()));
+        let bytes = serde_json::to_vec_pretty(claim).map_err(io::Error::other)?;
+        fs::write(&temp_path, [&bytes[..], b"\n"].concat())?;
+        let link_result = fs::hard_link(&temp_path, claim_path);
+        let remove_result = fs::remove_file(&temp_path);
+        match (link_result, remove_result) {
+            (Ok(()), Ok(())) | (Ok(()), Err(_)) => Ok(()),
+            (Err(error), _) => Err(error),
+        }
     }
 
     fn load_claims(&self) -> Result<Vec<TicketClaim>, PanelRegistryError> {
@@ -269,7 +330,12 @@ impl PanelRegistryStore {
             Ok(entries) => {
                 for entry in entries {
                     let entry = entry?;
-                    if entry.file_type()?.is_file() {
+                    if entry.file_type()?.is_file()
+                        && entry
+                            .path()
+                            .extension()
+                            .is_some_and(|extension| extension == "json")
+                    {
                         let bytes = fs::read(entry.path())?;
                         claims.push(serde_json::from_slice(&bytes)?);
                     }
@@ -293,6 +359,16 @@ impl PanelRegistryStore {
     fn claim_path(&self, ticket_id: &str) -> PathBuf {
         self.claims_dir()
             .join(format!("{}.json", encode_path_component(ticket_id)))
+    }
+}
+
+struct RegistryLockGuard {
+    path: PathBuf,
+}
+
+impl Drop for RegistryLockGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
     }
 }
 
@@ -359,6 +435,13 @@ fn encode_path_component(value: &str) -> String {
     encoded
 }
 
+fn now_timestamp_string() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos().to_string())
+        .unwrap_or_else(|_| "0".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -376,7 +459,13 @@ mod tests {
         assert_ne!(store.root(), other.root());
 
         store
-            .record_session("ticket-intake-preticket", "intake", None, [])
+            .record_session(
+                "ticket-intake-preticket",
+                "intake",
+                RoleSessionOrigin::PreTicketIntake,
+                None,
+                [],
+            )
             .unwrap();
         assert_eq!(store.load_registry().unwrap().workspace_root, "/repo/yoi");
     }
@@ -387,18 +476,17 @@ mod tests {
         let store = PanelRegistryStore::from_root(temp.path().join("registry"));
 
         assert!(matches!(
-            store.claim_ticket("T-1", "ticket-one-intake", "intake"),
+            store.claim_ticket("T-1", Some("ticket-one"), "ticket-one-intake", "intake"),
             Ok(TicketClaimResult::Claimed)
         ));
 
         let error = store
-            .claim_ticket("T-1", "ticket-two-intake", "intake")
+            .claim_ticket("T-1", Some("ticket-one"), "ticket-two-intake", "intake")
             .unwrap_err();
         assert!(matches!(error, PanelRegistryError::TicketAlreadyClaimed(_)));
-        assert_eq!(
-            store.claim_for_ticket("T-1").unwrap().unwrap().pod_name,
-            "ticket-one-intake"
-        );
+        let claim = store.claim_for_ticket("T-1").unwrap().unwrap();
+        assert_eq!(claim.pod_name, "ticket-one-intake");
+        assert_eq!(claim.ticket_slug.as_deref(), Some("ticket-one"));
     }
 
     #[test]
@@ -407,14 +495,30 @@ mod tests {
         let store = PanelRegistryStore::from_root(temp.path().join("registry"));
 
         store
-            .record_session("ticket-intake-preticket", "intake", None, [])
+            .record_session(
+                "ticket-intake-preticket",
+                "intake",
+                RoleSessionOrigin::PreTicketIntake,
+                None,
+                [],
+            )
             .unwrap();
         store
             .record_session(
                 "ticket-intake-shared",
                 "intake",
+                RoleSessionOrigin::RoleLaunch,
                 None,
-                ["T-1".to_string(), "T-2".to_string()],
+                [
+                    RelatedTicketRef {
+                        id: "T-1".to_string(),
+                        slug: Some("one".to_string()),
+                    },
+                    RelatedTicketRef {
+                        id: "T-2".to_string(),
+                        slug: Some("two".to_string()),
+                    },
+                ],
             )
             .unwrap();
 
@@ -430,7 +534,23 @@ mod tests {
             .find(|session| session.pod_name == "ticket-intake-shared")
             .unwrap();
 
-        assert!(preticket.ticket_ids.is_empty());
-        assert_eq!(shared.ticket_ids, vec!["T-1", "T-2"]);
+        assert!(preticket.related_tickets.is_empty());
+        assert_eq!(shared.role, "intake");
+        assert_eq!(shared.origin, RoleSessionOrigin::RoleLaunch);
+        assert!(!shared.created_at.is_empty());
+        assert!(!shared.updated_at.is_empty());
+        assert_eq!(
+            shared.related_tickets,
+            vec![
+                RelatedTicketRef {
+                    id: "T-1".to_string(),
+                    slug: Some("one".to_string()),
+                },
+                RelatedTicketRef {
+                    id: "T-2".to_string(),
+                    slug: Some("two".to_string()),
+                },
+            ]
+        );
     }
 }

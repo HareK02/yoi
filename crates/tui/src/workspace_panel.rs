@@ -167,7 +167,6 @@ pub(crate) enum NextUserAction {
     Edit,
     Wait,
     OpenPod,
-    SendToPod,
 }
 
 impl NextUserAction {
@@ -180,7 +179,6 @@ impl NextUserAction {
             Self::Edit => "Edit",
             Self::Wait => "Wait",
             Self::OpenPod => "Open",
-            Self::SendToPod => "Send",
         }
     }
 }
@@ -404,11 +402,6 @@ pub(crate) fn build_workspace_panel(
     {
         Ok(snapshot) => snapshot,
         Err(error) => {
-            let mut snapshot = PanelRegistrySnapshot::empty();
-            // Keep panel rendering available even when the local registry is corrupt or
-            // unavailable; the diagnostic is attached below after the header is initialized.
-            snapshot.claims.clear();
-            snapshot.sessions.clear();
             let mut model = WorkspacePanelViewModel::empty(workspace_root);
             model
                 .header
@@ -420,7 +413,7 @@ pub(crate) fn build_workspace_panel(
                 model,
                 workspace_root,
                 pods,
-                &snapshot,
+                &PanelRegistrySnapshot::empty(),
             );
         }
     };
@@ -774,9 +767,7 @@ fn pod_rows(pods: &PodList) -> Vec<PanelRow> {
 
 fn pod_row(entry: &PodListEntry) -> PanelRow {
     let status = pod_status_label(entry).to_string();
-    let next_action = if entry.actions.can_send_now {
-        Some(NextUserAction::SendToPod)
-    } else if entry.actions.can_open {
+    let next_action = if entry.actions.can_open {
         Some(NextUserAction::OpenPod)
     } else {
         None
@@ -802,7 +793,7 @@ fn pod_row(entry: &PodListEntry) -> PanelRow {
         ticket: None,
         related_pods: Vec::new(),
         disabled_reason: entry.actions.disabled_reason.clone(),
-        key_hint: Some("Pod rows preserve existing open/direct-send behavior".to_string()),
+        key_hint: Some("Press o or empty Enter to open/attach this Pod".to_string()),
     }
 }
 
@@ -1077,7 +1068,7 @@ mod tests {
         let summary = backend.list(TicketFilter::all()).unwrap().remove(0);
         let store = PanelRegistryStore::from_root(temp.path().join("local-registry"));
         store
-            .claim_ticket(&summary.id, "ticket-claimed-intake", "intake")
+            .claim_ticket(&summary.id, None, "ticket-claimed-intake", "intake")
             .unwrap();
         let registry = store.snapshot().unwrap();
 
