@@ -27,3 +27,22 @@ Split child tickets were created for direct-send removal, Companion lifecycle, a
 
 
 ---
+
+<!-- event: decision author: hare at: 2026-06-07T01:21:43Z -->
+
+## Decision
+
+## Local role/session overlay split
+
+The Companion/panel redesign should not store Ticket↔local Pod assignment in git-tracked Ticket metadata. Local Pod names, runtime/session identity, socket/restorable state, and current claims are per-machine runtime concerns.
+
+A new child ticket `workspace-panel-local-role-session-registry` covers the local overlay model:
+
+- Ticket project records keep workflow state and auditable summaries only.
+- A Ticket may have at most one active local Pod claim at a time.
+- A Pod/session may relate to zero or more Tickets.
+- Intake is not 1:1 with Ticket: pre-Ticket Intake may have no Ticket yet, and one Intake session may materialize/split into multiple Tickets.
+- Existing `ticket-*` Pod visibility in the panel is acceptable as an interim access path until the registry UI/model exists.
+- The panel should not poll and automatically start Intake for newly-created `workflow_state = intake` Tickets; starting/claiming remains an explicit action.
+
+---

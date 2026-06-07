@@ -8,7 +8,7 @@ priority: P1
 labels: [tui, panel, companion, orchestration]
 workflow_state: intake
 created_at: 2026-06-07T00:16:51Z
-updated_at: 2026-06-07T00:18:58Z
+updated_at: 2026-06-07T01:21:43Z
 assignee: null
 legacy_ticket: null
 ---
@@ -45,6 +45,9 @@ Redesign the workspace panel composer around a real workspace Companion Pod and 
 
 3. `companion-status-context-tool-policy`
    - Define Companion prompt/profile/tool policy: status-awareness and human assistance, no direct repository writes or Ticket mutations.
+
+4. `workspace-panel-local-role-session-registry`
+   - Define the local user-data overlay for role sessions and Ticket claims; keep local Pod assignment out of git-tracked Ticket metadata.
 
 ## Non-goals
 
