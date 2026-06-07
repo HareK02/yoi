@@ -116,3 +116,27 @@ Workflow note:
 The child should commit implementation work in the child worktree and report diff/tests. Merge, review, Ticket closure, workflow file updates, and cleanup remain with the parent/human workflow.
 
 ---
+
+<!-- event: decision author: hare at: 2026-06-07T06:29:12Z -->
+
+## Decision
+
+## Related worktree/memory boundary follow-ups
+
+Created two follow-up tickets from the `.yoi` sparse checkout / memory-root discussion:
+
+- `narrow-yoi-worktree-sparse-exclusions`
+  - Stop excluding all `.yoi/**` from child worktrees.
+  - Include tracked Yoi project records such as tickets/workflows/config where appropriate.
+  - Continue excluding generated memory, logs, locks, local/runtime/secret-like files.
+  - Define child-vs-main Ticket edit policy for branch-local artifacts vs final orchestration records.
+
+- `memory-root-uses-yoi-memory-marker`
+  - Keep `.yoi` as the Yoi project records marker.
+  - Stop treating `.yoi` alone as the memory root marker.
+  - Use explicit memory config or nearest ancestor `.yoi/memory` as repo-local memory root.
+  - Ensure child worktrees containing `.yoi/tickets` but not `.yoi/memory` do not become independent memory workspaces.
+
+These are relevant to Orchestrator merge/worktree automation because branch-local dossiers and workflow edits should be possible without copying generated memory into child worktrees.
+
+---
