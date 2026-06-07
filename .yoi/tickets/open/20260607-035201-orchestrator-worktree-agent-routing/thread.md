@@ -99,3 +99,36 @@ Workflow note:
 The child should commit implementation work in the child worktree and report diff/tests. Merge, review, Ticket closure, workflow file updates, and cleanup remain with the parent/human workflow.
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-06-07T05:49:40Z -->
+
+## Implementation report
+
+## Implementation report
+
+Coder Pod `orchestrator-agent-routing-coder-20260607` completed implementation in `.worktree/orchestrator-worktree-agent-routing`.
+
+Commit:
+- `c7d6bb8 orchestrator: add agent routing guidance`
+
+Reported summary:
+- Added generated role guidance in `crates/client/src/ticket_role.rs`:
+  - Orchestrator: route only after `workflow_state = inprogress`, use `worktree-workflow` and `multi-agent-workflow`, record bounded Ticket-thread progress, and stop at merge-ready dossier.
+  - Coder: operate only in child worktree/branch, avoid main `.yoi`/Ticket/workflow/docs records, report validation/status, and do not merge/close/delete.
+  - Reviewer: read-only by default, review branch diff/validation against intent, keep branch-local verdict in dossier/report, and do not record final main approval.
+- Expanded `crates/tui/src/multi_pod.rs` Queue notification guidance to mention the post-acceptance worktree/coder/reviewer sibling route and stopping at merge-ready dossier.
+- Added prompt-generation and queue-notification tests for these contracts.
+- Did not edit/copy `.yoi` workflow files in the child worktree.
+
+Reported validation:
+- `cargo test -p client ticket_role -- --nocapture`
+- `cargo test -p tui ticket_queue_notification_message_carries_routing_contract -- --nocapture`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo build -p yoi`
+- child-built `yoi ticket doctor` against the main workspace
+- `nix build .#yoi`
+
+Parent-side workflow patch needed: none reported.
+
+---
