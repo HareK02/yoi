@@ -71,3 +71,21 @@ Ticket intake complete; workflow_state intake -> ready.
 
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-06-07T03:21:41Z -->
+
+## Implementation report
+
+## Delegation
+
+Implementation delegated to child Pod `role-launch-config-validation-coder-20260607` in worktree `.worktree/ticket-role-launch-config-strict-validation` on branch `work/ticket-role-launch-config-strict-validation`.
+
+Scope:
+- Add strict runtime validation for Ticket role launch config.
+- Keep backend availability separate from role-launch readiness.
+- Reject missing role config and top-level `inherit` before spawn with actionable diagnostics.
+- Do not implement init/scaffold generation here; `ticket-init-role-profile-scaffold` follows after this lands.
+
+The child should commit implementation work in the child worktree and report diff/tests. Merge, review, Ticket closure, and cleanup remain with the parent/human workflow.
+
+---
