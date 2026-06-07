@@ -1,7 +1,7 @@
 ---
 id: 20260601-020202-tui-keys-inline-viewport-ui
 slug: tui-keys-inline-viewport-ui
-title: TUI: align insomnia keys UI with inline viewport style
+title: 'TUI: align insomnia keys UI with inline viewport style'
 status: closed
 kind: task
 priority: P2

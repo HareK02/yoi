@@ -1,7 +1,7 @@
 ---
 id: 20260531-223506-memory-prompt-conditional-lookup
 slug: memory-prompt-conditional-lookup
-title: Memory prompt: conditional guidance and proactive lookup
+title: 'Memory prompt: conditional guidance and proactive lookup'
 status: closed
 kind: task
 priority: P2

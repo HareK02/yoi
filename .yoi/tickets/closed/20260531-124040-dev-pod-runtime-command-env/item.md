@@ -1,7 +1,7 @@
 ---
 id: 20260531-124040-dev-pod-runtime-command-env
 slug: dev-pod-runtime-command-env
-title: Dev: add Pod runtime executable override env
+title: 'Dev: add Pod runtime executable override env'
 status: closed
 kind: task
 priority: P2

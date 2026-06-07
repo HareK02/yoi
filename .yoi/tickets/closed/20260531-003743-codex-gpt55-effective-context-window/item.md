@@ -1,7 +1,7 @@
 ---
 id: 20260531-003743-codex-gpt55-effective-context-window
 slug: codex-gpt55-effective-context-window
-title: Provider: make codex gpt-5.5 context window effective
+title: 'Provider: make codex gpt-5.5 context window effective'
 status: closed
 kind: task
 priority: P2

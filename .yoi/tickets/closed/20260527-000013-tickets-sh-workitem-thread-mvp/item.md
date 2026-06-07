@@ -1,7 +1,7 @@
 ---
 id: 20260527-000013-tickets-sh-workitem-thread-mvp
 slug: tickets-sh-workitem-thread-mvp
-title: Ticket 管理: tickets.sh による WorkItem / Thread MVP
+title: 'Ticket 管理: tickets.sh による WorkItem / Thread MVP'
 status: closed
 kind: task
 priority: P2

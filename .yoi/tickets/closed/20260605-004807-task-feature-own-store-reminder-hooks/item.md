@@ -1,7 +1,7 @@
 ---
 id: 20260605-004807-task-feature-own-store-reminder-hooks
 slug: task-feature-own-store-reminder-hooks
-title: Task: move TaskStore and reminders into Task feature
+title: 'Task: move TaskStore and reminders into Task feature'
 status: closed
 kind: task
 priority: P1

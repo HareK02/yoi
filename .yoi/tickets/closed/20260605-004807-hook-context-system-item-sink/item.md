@@ -1,7 +1,7 @@
 ---
 id: 20260605-004807-hook-context-system-item-sink
 slug: hook-context-system-item-sink
-title: Hook: add context handles for host-mediated SystemItem append
+title: 'Hook: add context handles for host-mediated SystemItem append'
 status: closed
 kind: feature
 priority: P1

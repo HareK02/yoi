@@ -1,7 +1,7 @@
 ---
 id: 20260527-000012-spawnpod-initial-run-confirmation
 slug: spawnpod-initial-run-confirmation
-title: SpawnPod: initial Run delivery confirmation
+title: 'SpawnPod: initial Run delivery confirmation'
 status: closed
 kind: task
 priority: P2

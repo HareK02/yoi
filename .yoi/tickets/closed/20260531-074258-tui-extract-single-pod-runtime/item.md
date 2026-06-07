@@ -1,7 +1,7 @@
 ---
 id: 20260531-074258-tui-extract-single-pod-runtime
 slug: tui-extract-single-pod-runtime
-title: TUI: extract single-Pod runtime loop from main.rs
+title: 'TUI: extract single-Pod runtime loop from main.rs'
 status: closed
 kind: task
 priority: P2

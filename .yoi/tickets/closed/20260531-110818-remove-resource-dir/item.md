@@ -1,7 +1,7 @@
 ---
 id: 20260531-110818-remove-resource-dir
 slug: remove-resource-dir
-title: Manifest: remove filesystem resource_dir dependency
+title: 'Manifest: remove filesystem resource_dir dependency'
 status: closed
 kind: task
 priority: P2

@@ -1,7 +1,7 @@
 ---
 id: 20260527-000004-manual-turn-rollback
 slug: manual-turn-rollback
-title: Pod/TUI: 手動 rewind 導線
+title: 'Pod/TUI: 手動 rewind 導線'
 status: closed
 kind: task
 priority: P2

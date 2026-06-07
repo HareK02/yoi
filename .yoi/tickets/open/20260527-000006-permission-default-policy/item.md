@@ -1,7 +1,7 @@
 ---
 id: 20260527-000006-permission-default-policy
 slug: permission-default-policy
-title: Permission: allow-all 既定 policy への整理
+title: 'Permission: allow-all 既定 policy への整理'
 status: open
 kind: task
 priority: P2

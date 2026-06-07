@@ -1,7 +1,7 @@
 ---
 id: 20260531-111956-insomnia-crate-cli-owner
 slug: insomnia-crate-cli-owner
-title: CLI: make insomnia crate own binary entrypoint and CLI dispatch
+title: 'CLI: make insomnia crate own binary entrypoint and CLI dispatch'
 status: closed
 kind: task
 priority: P2

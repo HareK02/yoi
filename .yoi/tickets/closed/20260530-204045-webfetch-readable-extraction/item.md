@@ -1,7 +1,7 @@
 ---
 id: 20260530-204045-webfetch-readable-extraction
 slug: webfetch-readable-extraction
-title: WebFetch: extract main HTML content with lightweight readability
+title: 'WebFetch: extract main HTML content with lightweight readability'
 status: closed
 kind: task
 priority: P2

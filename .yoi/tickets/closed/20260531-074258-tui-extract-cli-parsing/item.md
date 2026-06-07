@@ -1,7 +1,7 @@
 ---
 id: 20260531-074258-tui-extract-cli-parsing
 slug: tui-extract-cli-parsing
-title: TUI: extract CLI parsing from main.rs
+title: 'TUI: extract CLI parsing from main.rs'
 status: closed
 kind: task
 priority: P2

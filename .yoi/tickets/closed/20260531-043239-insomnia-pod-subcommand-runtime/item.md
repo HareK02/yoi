@@ -1,7 +1,7 @@
 ---
 id: 20260531-043239-insomnia-pod-subcommand-runtime
 slug: insomnia-pod-subcommand-runtime
-title: CLI: add insomnia pod runtime entrypoint
+title: 'CLI: add insomnia pod runtime entrypoint'
 status: closed
 kind: task
 priority: P2

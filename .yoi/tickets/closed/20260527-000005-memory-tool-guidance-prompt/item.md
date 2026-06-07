@@ -1,7 +1,7 @@
 ---
 id: 20260527-000005-memory-tool-guidance-prompt
 slug: memory-tool-guidance-prompt
-title: プロンプト: memory / knowledge tool 利用タイミングのガイダンス
+title: 'プロンプト: memory / knowledge tool 利用タイミングのガイダンス'
 status: closed
 kind: task
 priority: P2

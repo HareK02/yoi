@@ -1,7 +1,7 @@
 ---
 id: 20260527-000008-pod-scope-persistence-authority
 slug: pod-scope-persistence-authority
-title: Pod: scope 永続化 authority の整理
+title: 'Pod: scope 永続化 authority の整理'
 status: closed
 kind: task
 priority: P2
