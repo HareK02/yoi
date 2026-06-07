@@ -5,7 +5,7 @@
 //! launch prompts, and workflows so this crate remains independent from `pod`
 //! and `manifest` runtime resolution.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -84,6 +84,13 @@ impl TicketConfig {
 
     pub fn role(&self, role: TicketRole) -> &TicketRoleConfig {
         self.roles.get(role)
+    }
+
+    pub fn role_launch_config(
+        &self,
+        role: TicketRole,
+    ) -> Result<&TicketRoleConfig, TicketRoleLaunchConfigError> {
+        self.roles.launch_config(role)
     }
 
     pub fn profile_for(&self, role: TicketRole) -> &ProfileSelectorRef {
@@ -200,6 +207,8 @@ impl fmt::Display for TicketRole {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TicketRoleProfiles {
     inner: BTreeMap<TicketRole, TicketRoleConfig>,
+    configured_roles: BTreeSet<TicketRole>,
+    profile_configured_roles: BTreeSet<TicketRole>,
 }
 
 impl TicketRoleProfiles {
@@ -207,6 +216,31 @@ impl TicketRoleProfiles {
         self.inner
             .get(&role)
             .expect("TicketRoleProfiles always contains all fixed roles")
+    }
+
+    pub fn role_is_configured(&self, role: TicketRole) -> bool {
+        self.configured_roles.contains(&role)
+    }
+
+    pub fn profile_is_configured(&self, role: TicketRole) -> bool {
+        self.profile_configured_roles.contains(&role)
+    }
+
+    pub fn launch_config(
+        &self,
+        role: TicketRole,
+    ) -> Result<&TicketRoleConfig, TicketRoleLaunchConfigError> {
+        if !self.role_is_configured(role) {
+            return Err(TicketRoleLaunchConfigError::MissingRoleTable { role });
+        }
+        if !self.profile_is_configured(role) {
+            return Err(TicketRoleLaunchConfigError::MissingProfile { role });
+        }
+        let config = self.get(role);
+        if config.profile.as_str() == "inherit" {
+            return Err(TicketRoleLaunchConfigError::InheritProfile { role });
+        }
+        Ok(config)
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (TicketRole, &TicketRoleConfig)> {
@@ -222,8 +256,28 @@ impl Default for TicketRoleProfiles {
             .into_iter()
             .map(|role| (role, TicketRoleConfig::default_for_role(role)))
             .collect();
-        Self { inner }
+        Self {
+            inner,
+            configured_roles: BTreeSet::new(),
+            profile_configured_roles: BTreeSet::new(),
+        }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum TicketRoleLaunchConfigError {
+    #[error(
+        "Ticket role `{role}` is not launch-configured; add `[roles.{role}]` with `profile = \"builtin:default\"` or another executable concrete profile selector"
+    )]
+    MissingRoleTable { role: TicketRole },
+    #[error(
+        "Ticket role `{role}` has no launch profile; set `[roles.{role}].profile` to `builtin:default` or another executable concrete profile selector"
+    )]
+    MissingProfile { role: TicketRole },
+    #[error(
+        "Ticket role `{role}` uses `profile = \"inherit\"`; top-level Ticket role launch requires an explicit executable profile selector such as `builtin:default` or a project/user profile"
+    )]
+    InheritProfile { role: TicketRole },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -407,7 +461,12 @@ impl RawTicketConfig {
                 path: path.to_path_buf(),
                 message: format!("unknown Ticket role `{name}`"),
             })?;
+            let profile_configured = raw_role.profile.is_some();
             roles.inner.insert(role, raw_role.resolve(role));
+            roles.configured_roles.insert(role);
+            if profile_configured {
+                roles.profile_configured_roles.insert(role);
+            }
         }
         Ok(TicketConfig {
             backend: self.backend.resolve(workspace_root).map_err(|message| {
@@ -467,7 +526,8 @@ impl RawBackendConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawTicketRoleConfig {
-    profile: ProfileSelectorRef,
+    #[serde(default)]
+    profile: Option<ProfileSelectorRef>,
     #[serde(default)]
     launch_prompt: Option<PromptRef>,
     #[serde(default)]
@@ -477,7 +537,7 @@ struct RawTicketRoleConfig {
 impl RawTicketRoleConfig {
     fn resolve(self, role: TicketRole) -> TicketRoleConfig {
         TicketRoleConfig {
-            profile: self.profile,
+            profile: self.profile.unwrap_or_else(ProfileSelectorRef::inherit),
             launch_prompt: self.launch_prompt,
             workflow: self
                 .workflow
@@ -603,6 +663,100 @@ profile = "project:coder"
         assert!(coder.launch_prompt.is_none());
         assert_eq!(coder.workflow.as_str(), "multi-agent-workflow");
         assert_eq!(config.profile_for(TicketRole::Reviewer).as_str(), "inherit");
+    }
+
+    #[test]
+    fn backend_only_config_is_not_role_launch_ready() {
+        let temp = TempDir::new().unwrap();
+        write_config(
+            temp.path(),
+            r#"
+[backend]
+provider = "builtin:yoi_local"
+root = ".yoi/tickets"
+"#,
+        );
+
+        let config = TicketConfig::load_workspace(temp.path()).unwrap();
+        assert_eq!(config.backend.root, temp.path().join(".yoi/tickets"));
+        assert_eq!(
+            config.role_launch_config(TicketRole::Intake).unwrap_err(),
+            TicketRoleLaunchConfigError::MissingRoleTable {
+                role: TicketRole::Intake
+            }
+        );
+    }
+
+    #[test]
+    fn partial_role_config_only_marks_configured_roles_launch_ready() {
+        let temp = TempDir::new().unwrap();
+        write_config(
+            temp.path(),
+            r#"
+[roles.intake]
+profile = "builtin:default"
+"#,
+        );
+
+        let config = TicketConfig::load_workspace(temp.path()).unwrap();
+        assert_eq!(
+            config
+                .role_launch_config(TicketRole::Intake)
+                .unwrap()
+                .profile
+                .as_str(),
+            "builtin:default"
+        );
+        assert_eq!(
+            config
+                .role_launch_config(TicketRole::Orchestrator)
+                .unwrap_err(),
+            TicketRoleLaunchConfigError::MissingRoleTable {
+                role: TicketRole::Orchestrator
+            }
+        );
+    }
+
+    #[test]
+    fn role_table_without_profile_is_not_role_launch_ready() {
+        let temp = TempDir::new().unwrap();
+        write_config(
+            temp.path(),
+            r#"
+[roles.orchestrator]
+workflow = "ticket-orchestrator-routing"
+"#,
+        );
+
+        let config = TicketConfig::load_workspace(temp.path()).unwrap();
+        assert_eq!(
+            config
+                .role_launch_config(TicketRole::Orchestrator)
+                .unwrap_err(),
+            TicketRoleLaunchConfigError::MissingProfile {
+                role: TicketRole::Orchestrator
+            }
+        );
+    }
+
+    #[test]
+    fn inherit_profile_is_not_role_launch_ready() {
+        let temp = TempDir::new().unwrap();
+        write_config(
+            temp.path(),
+            r#"
+[roles.intake]
+profile = "inherit"
+"#,
+        );
+
+        let config = TicketConfig::load_workspace(temp.path()).unwrap();
+        assert_eq!(
+            config.role_launch_config(TicketRole::Intake).unwrap_err(),
+            TicketRoleLaunchConfigError::InheritProfile {
+                role: TicketRole::Intake
+            }
+        );
     }
 
     #[test]

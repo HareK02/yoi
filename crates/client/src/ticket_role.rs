@@ -8,10 +8,11 @@ use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use manifest::{ProfileDiscovery, ProfileResolveOptions, ProfileResolver, ProfileSelector};
 use protocol::{ErrorCode, Event, InvokeKind, Method, Segment};
 use thiserror::Error;
 pub use ticket::config::TicketRole;
-use ticket::config::{TicketConfig, TicketConfigError};
+use ticket::config::{TicketConfig, TicketConfigError, TicketRoleLaunchConfigError};
 
 use crate::{PodClient, PodRuntimeCommand, SpawnConfig, SpawnError, SpawnReady, spawn_pod};
 
@@ -199,6 +200,16 @@ impl TicketRoleLaunchOptions {
 pub enum TicketRoleLaunchError {
     #[error(transparent)]
     Config(#[from] TicketConfigError),
+    #[error(transparent)]
+    LaunchConfig(#[from] TicketRoleLaunchConfigError),
+    #[error(
+        "Ticket role `{role}` profile selector `{selector}` is not resolvable before launch: {message}. Configure `[roles.{role}].profile` with an executable concrete profile selector such as `builtin:default` or a project/user profile"
+    )]
+    ProfileResolution {
+        role: TicketRole,
+        selector: String,
+        message: String,
+    },
     #[error("Ticket role Pod name must not be empty")]
     EmptyPodName,
     #[error(
@@ -239,7 +250,7 @@ pub fn plan_ticket_role_launch_with_config(
     context: TicketRoleLaunchContext,
     config: &TicketConfig,
 ) -> Result<TicketRoleLaunchPlan, TicketRoleLaunchError> {
-    let role_config = config.role(context.role);
+    let role_config = config.role_launch_config(context.role)?;
     let profile = role_config.profile.as_str().to_string();
     let workflow = role_config.workflow.as_str().to_string();
     let launch_prompt_ref = role_config
@@ -251,6 +262,7 @@ pub fn plan_ticket_role_launch_with_config(
         Some(name) => name.to_string(),
         None => default_pod_name(context.role, context.ticket.as_ref()),
     };
+    validate_ticket_role_profile(context.role, &profile, &context.workspace_root, &pod_name)?;
     let prompt = build_launch_prompt(&context, &profile, &workflow, launch_prompt_ref.as_deref());
 
     Ok(TicketRoleLaunchPlan {
@@ -267,6 +279,35 @@ pub fn plan_ticket_role_launch_with_config(
             },
         ],
     })
+}
+
+fn validate_ticket_role_profile(
+    role: TicketRole,
+    profile: &str,
+    workspace_root: &std::path::Path,
+    pod_name: &str,
+) -> Result<(), TicketRoleLaunchError> {
+    let selector = ProfileSelector::parse_cli(profile);
+    let registry = ProfileDiscovery::for_cwd(workspace_root)
+        .discover()
+        .map_err(|source| TicketRoleLaunchError::ProfileResolution {
+            role,
+            selector: profile.to_string(),
+            message: source.to_string(),
+        })?;
+    ProfileResolver::new()
+        .with_workspace_base(workspace_root)
+        .resolve_from_registry(
+            &selector,
+            &registry,
+            ProfileResolveOptions::with_pod_name(pod_name),
+        )
+        .map(|_| ())
+        .map_err(|source| TicketRoleLaunchError::ProfileResolution {
+            role,
+            selector: profile.to_string(),
+            message: source.to_string(),
+        })
 }
 
 /// Spawn the Pod, connect to its socket, send the first `Method::Run` input,
@@ -597,6 +638,16 @@ mod tests {
         std::fs::write(dir.join("ticket.config.toml"), content).unwrap();
     }
 
+    fn write_builtin_role_config(workspace: &std::path::Path, roles: &[TicketRole]) {
+        let mut config = String::new();
+        for role in roles {
+            config.push_str(&format!(
+                "\n[roles.{role}]\nprofile = \"builtin:default\"\n"
+            ));
+        }
+        write_config(workspace, &config);
+    }
+
     fn text_segment(plan: &TicketRoleLaunchPlan) -> &str {
         match &plan.run_segments[1] {
             Segment::Text { content } => content,
@@ -751,26 +802,103 @@ mod tests {
     }
 
     #[test]
-    fn default_config_role_launch_plan_uses_defaults() {
+    fn default_config_role_launch_plan_requires_explicit_role_config() {
         let temp = TempDir::new().unwrap();
         let mut context = TicketRoleLaunchContext::new(temp.path(), TicketRole::Coder);
         context.ticket = Some(TicketRef::slug("Ticket Role Pod Launcher"));
 
+        let err = plan_ticket_role_launch(context).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("Ticket role `coder` is not launch-configured")
+        );
+        assert!(err.to_string().contains("[roles.coder]"));
+    }
+
+    #[test]
+    fn backend_only_config_is_not_sufficient_for_role_launch_plan() {
+        let temp = TempDir::new().unwrap();
+        write_config(
+            temp.path(),
+            r#"
+[backend]
+provider = "builtin:yoi_local"
+root = ".yoi/tickets"
+"#,
+        );
+        let context = TicketRoleLaunchContext::new(temp.path(), TicketRole::Intake);
+
+        let err = plan_ticket_role_launch(context).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("Ticket role `intake` is not launch-configured")
+        );
+    }
+
+    #[test]
+    fn explicit_inherit_profile_fails_before_launch_planning() {
+        let temp = TempDir::new().unwrap();
+        write_config(
+            temp.path(),
+            r#"
+[roles.intake]
+profile = "inherit"
+"#,
+        );
+        let context = TicketRoleLaunchContext::new(temp.path(), TicketRole::Intake);
+
+        let err = plan_ticket_role_launch(context).unwrap_err();
+
+        assert!(err.to_string().contains("profile = \"inherit\""));
+        assert!(err.to_string().contains("top-level Ticket role launch"));
+    }
+
+    #[test]
+    fn unresolvable_profile_selector_fails_before_spawn() {
+        let temp = TempDir::new().unwrap();
+        write_config(
+            temp.path(),
+            r#"
+[roles.intake]
+profile = "project:no-such-ticket-role-profile"
+"#,
+        );
+        let context = TicketRoleLaunchContext::new(temp.path(), TicketRole::Intake);
+
+        let err = plan_ticket_role_launch(context).unwrap_err();
+
+        assert!(
+            err.to_string().contains(
+                "profile selector `project:no-such-ticket-role-profile` is not resolvable"
+            )
+        );
+        assert!(err.to_string().contains("[roles.intake].profile"));
+    }
+
+    #[test]
+    fn full_concrete_role_config_allows_launch_planning() {
+        let temp = TempDir::new().unwrap();
+        write_builtin_role_config(temp.path(), &[TicketRole::Intake]);
+        let context = TicketRoleLaunchContext::new(temp.path(), TicketRole::Intake);
+
         let plan = plan_ticket_role_launch(context).unwrap();
 
-        assert_eq!(plan.role, TicketRole::Coder);
-        assert_eq!(plan.pod_name, "ticket-coder-ticket-role-pod-launcher");
-        assert_eq!(plan.profile, "inherit");
-        assert_eq!(plan.workflow, "multi-agent-workflow");
-        assert_eq!(plan.launch_prompt_ref, None);
-        assert!(matches!(
-            &plan.run_segments[0],
-            Segment::WorkflowInvoke { slug } if slug == "multi-agent-workflow"
-        ));
-        assert!(text_segment(&plan).contains("Profile selector: inherit"));
+        assert_eq!(plan.role, TicketRole::Intake);
+        assert_eq!(plan.profile, "builtin:default");
+    }
+
+    #[test]
+    fn spawn_config_still_rejects_inherit_profile_defensively() {
+        let temp = TempDir::new().unwrap();
+        let mut plan = test_launch_plan(temp.path());
+        plan.profile = "inherit".to_string();
+
         let err = plan
             .spawn_config(PodRuntimeCommand::for_executable("/bin/yoi"))
             .unwrap_err();
+
         assert!(matches!(
             err,
             TicketRoleLaunchError::UnsupportedInheritProfile
@@ -785,7 +913,7 @@ mod tests {
             temp.path(),
             r#"
 [roles.reviewer]
-profile = "project:reviewer"
+profile = "builtin:default"
 launch_prompt = "$workspace/ticket/reviewer/launch"
 workflow = "ticket-review-workflow"
 "#,
@@ -802,7 +930,7 @@ workflow = "ticket-review-workflow"
         let text = text_segment(&plan);
 
         assert_eq!(plan.pod_name, "reviewer-fixed");
-        assert_eq!(plan.profile, "project:reviewer");
+        assert_eq!(plan.profile, "builtin:default");
         assert_eq!(plan.workflow, "ticket-review-workflow");
         assert_eq!(
             plan.launch_prompt_ref.as_deref(),
@@ -816,19 +944,27 @@ workflow = "ticket-review-workflow"
             "Configured launch_prompt ref (unresolved): $workspace/ticket/reviewer/launch"
         ));
         assert!(text.contains("Workflow: ticket-review-workflow"));
-        assert!(text.contains("Profile selector: project:reviewer"));
+        assert!(text.contains("Profile selector: builtin:default"));
         assert!(!text.contains("system_instruction"));
         let spawn = plan
             .spawn_config(PodRuntimeCommand::for_executable("/bin/yoi"))
             .unwrap();
         assert_eq!(spawn.pod_name, "reviewer-fixed");
-        assert_eq!(spawn.profile.as_deref(), Some("project:reviewer"));
+        assert_eq!(spawn.profile.as_deref(), Some("builtin:default"));
         assert_eq!(spawn.cwd, temp.path());
     }
 
     #[test]
     fn generated_prompt_covers_intake_orchestrator_and_reviewer_context() {
         let temp = TempDir::new().unwrap();
+        write_builtin_role_config(
+            temp.path(),
+            &[
+                TicketRole::Intake,
+                TicketRole::Orchestrator,
+                TicketRole::Reviewer,
+            ],
+        );
 
         let mut intake = TicketRoleLaunchContext::new(temp.path(), TicketRole::Intake);
         intake.user_instruction = Some("Clarify and materialize this request as a Ticket.".into());
@@ -882,6 +1018,7 @@ workflow = "ticket-review-workflow"
     #[test]
     fn caller_provided_pod_name_is_used_exactly() {
         let temp = TempDir::new().unwrap();
+        write_builtin_role_config(temp.path(), &[TicketRole::Intake]);
         let mut context = TicketRoleLaunchContext::new(temp.path(), TicketRole::Intake);
         context.pod_name = Some("custom-intake-pod".into());
 
