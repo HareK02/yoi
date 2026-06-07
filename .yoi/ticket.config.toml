@@ -3,21 +3,17 @@ provider = "builtin:yoi_local"
 root = ".yoi/tickets"
 
 [roles.intake]
-profile = "builtin:default"
+profile = "project:intake"
 workflow = "ticket-intake-workflow"
 
 [roles.orchestrator]
-profile = "builtin:default"
+profile = "project:orchestrator"
 workflow = "ticket-orchestrator-routing"
 
 [roles.coder]
-profile = "builtin:default"
+profile = "project:coder"
 workflow = "multi-agent-workflow"
 
 [roles.reviewer]
-profile = "builtin:default"
+profile = "project:reviewer"
 workflow = "multi-agent-workflow"
-
-[roles.investigator]
-profile = "builtin:default"
-workflow = "ticket-preflight-workflow"
