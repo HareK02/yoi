@@ -42,6 +42,18 @@ pub const TICKET_TOOL_NAMES: [&str; 10] = [
     "TicketDoctor",
 ];
 
+pub const TICKET_READ_ONLY_TOOL_NAMES: [&str; 3] = ["TicketList", "TicketShow", "TicketDoctor"];
+
+pub const TICKET_MUTATING_TOOL_NAMES: [&str; 7] = [
+    "TicketCreate",
+    "TicketComment",
+    "TicketReview",
+    "TicketIntakeReady",
+    "TicketWorkflowState",
+    "TicketStatus",
+    "TicketClose",
+];
+
 const CREATE_DESCRIPTION: &str = "Create a Ticket through the configured typed Ticket backend. \
 Inputs mirror the Ticket `item.md` fields; `title` is required, `body` is Markdown, and the \
 backend assigns the id and writes the local Ticket file layout under the configured backend root.";
@@ -61,7 +73,9 @@ Ticket backend. The tool appends a bounded `intake_summary`, appends a typed `st
 for `workflow_state`, and transitions workflow_state to `ready`.";
 const WORKFLOW_STATE_DESCRIPTION: &str = "Transition Ticket `workflow_state` through the typed \
 Ticket backend with a bounded `state_changed` event. This does not move local open/pending/closed \
-status; use `TicketStatus` or `TicketClose` for local status changes.";
+status; use `TicketStatus` or `TicketClose` for local status changes. Treat `queued -> inprogress` \
+as the implementation acceptance step: implementation side effects should happen only after that \
+transition is accepted and recorded.";
 const STATUS_DESCRIPTION: &str = "Move a Ticket between non-closed local statuses through the typed \
 Ticket backend. Use `TicketClose` for closing because closed Tickets require a resolution accepted \
 by `yoi ticket doctor`.";
@@ -987,6 +1001,50 @@ mod tests {
                 (meta.name == name).then_some(tool)
             })
             .expect("tool exists")
+    }
+
+    #[test]
+    fn ticket_tool_name_partitions_are_explicit() {
+        assert_eq!(
+            TICKET_READ_ONLY_TOOL_NAMES,
+            ["TicketList", "TicketShow", "TicketDoctor"]
+        );
+        assert_eq!(
+            TICKET_MUTATING_TOOL_NAMES,
+            [
+                "TicketCreate",
+                "TicketComment",
+                "TicketReview",
+                "TicketIntakeReady",
+                "TicketWorkflowState",
+                "TicketStatus",
+                "TicketClose"
+            ]
+        );
+        for name in TICKET_READ_ONLY_TOOL_NAMES {
+            assert!(TICKET_TOOL_NAMES.contains(&name));
+            assert!(!TICKET_MUTATING_TOOL_NAMES.contains(&name));
+        }
+        for name in TICKET_MUTATING_TOOL_NAMES {
+            assert!(TICKET_TOOL_NAMES.contains(&name));
+            assert!(!TICKET_READ_ONLY_TOOL_NAMES.contains(&name));
+        }
+        assert_eq!(
+            TICKET_READ_ONLY_TOOL_NAMES.len() + TICKET_MUTATING_TOOL_NAMES.len(),
+            TICKET_TOOL_NAMES.len()
+        );
+    }
+
+    #[test]
+    fn workflow_state_tool_description_explains_queued_acceptance() {
+        let temp = TempDir::new().unwrap();
+        let definition = ticket_tools(backend(&temp))
+            .into_iter()
+            .find(|definition| definition().0.name == "TicketWorkflowState")
+            .expect("workflow state tool exists");
+        let (meta, _) = definition();
+        assert!(meta.description.contains("queued -> inprogress"));
+        assert!(meta.description.contains("implementation side effects"));
     }
 
     #[tokio::test]

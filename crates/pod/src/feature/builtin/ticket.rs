@@ -9,8 +9,7 @@ use std::path::{Path, PathBuf};
 use ticket::{
     LocalTicketBackend,
     config::{DEFAULT_TICKET_BACKEND_RELATIVE_PATH, TicketConfig},
-    tool::TICKET_TOOL_NAMES,
-    tool::ticket_tools,
+    tool::{TICKET_READ_ONLY_TOOL_NAMES, TICKET_TOOL_NAMES, ticket_tools},
 };
 
 use crate::feature::{
@@ -24,33 +23,68 @@ const FEATURE_DESCRIPTION: &str = "Typed local Ticket work-item operations over 
 The tools operate through the ticket crate backend and do not grant generic filesystem write scope.";
 const AUTHORITY_REASON: &str = "Use a configured local Ticket backend root for typed work-item operations without generic filesystem write authority.";
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TicketFeatureAccess {
+    /// Status/diagnostic access for views such as Companion that must not mutate Tickets.
+    ReadOnly,
+    /// Full Ticket lifecycle access, including the read-only tools and all mutating Ticket tools.
+    Lifecycle,
+}
+
+impl TicketFeatureAccess {
+    pub fn tool_names(self) -> &'static [&'static str] {
+        match self {
+            Self::ReadOnly => &TICKET_READ_ONLY_TOOL_NAMES,
+            Self::Lifecycle => &TICKET_TOOL_NAMES,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct TicketFeature {
     backend_root: PathBuf,
     config_error: Option<String>,
+    access: TicketFeatureAccess,
 }
 
 impl TicketFeature {
     pub fn new(backend_root: impl Into<PathBuf>) -> Self {
+        Self::new_with_access(backend_root, TicketFeatureAccess::Lifecycle)
+    }
+
+    pub fn new_with_access(backend_root: impl Into<PathBuf>, access: TicketFeatureAccess) -> Self {
         Self {
             backend_root: backend_root.into(),
             config_error: None,
+            access,
         }
     }
 
     pub fn for_workspace(workspace: impl AsRef<Path>) -> Self {
+        Self::for_workspace_with_access(workspace, TicketFeatureAccess::Lifecycle)
+    }
+
+    pub fn for_workspace_with_access(
+        workspace: impl AsRef<Path>,
+        access: TicketFeatureAccess,
+    ) -> Self {
         let workspace = workspace.as_ref();
         match TicketConfig::load_workspace(workspace) {
-            Ok(config) => Self::new(config.backend_root().to_path_buf()),
+            Ok(config) => Self::new_with_access(config.backend_root().to_path_buf(), access),
             Err(error) => Self {
                 backend_root: workspace.join(DEFAULT_TICKET_BACKEND_RELATIVE_PATH),
                 config_error: Some(error.to_string()),
+                access,
             },
         }
     }
 
     pub fn backend_root(&self) -> &Path {
         &self.backend_root
+    }
+
+    pub fn access(&self) -> TicketFeatureAccess {
+        self.access
     }
 
     fn authority(&self) -> HostAuthority {
@@ -87,8 +121,8 @@ impl FeatureModule for TicketFeature {
                 self.authority(),
                 AUTHORITY_REASON,
             ));
-        for name in TICKET_TOOL_NAMES {
-            descriptor = descriptor.with_tool(ToolDeclaration::new(name, tool_description(name)));
+        for name in self.access.tool_names() {
+            descriptor = descriptor.with_tool(ToolDeclaration::new(*name, tool_description(name)));
         }
         descriptor
     }
@@ -116,10 +150,14 @@ impl FeatureModule for TicketFeature {
         };
         let authority = self.authority();
         let backend = LocalTicketBackend::new(usable_root);
+        let allowed_tool_names = self.access.tool_names();
         let mut tools = context.tools();
         for definition in ticket_tools(backend) {
             let (meta, _) = definition();
             let name = meta.name.clone();
+            if !allowed_tool_names.contains(&name.as_str()) {
+                continue;
+            }
             tools.register(
                 ToolContribution::new(name, definition)
                     .with_required_host_authorities(vec![authority.clone()]),
@@ -140,6 +178,12 @@ fn tool_description(name: &str) -> &'static str {
             "Append a comment/plan/decision/implementation_report event to a Ticket."
         }
         "TicketReview" => "Append an approve/request_changes review event to a Ticket.",
+        "TicketIntakeReady" => {
+            "Mark an intake Ticket ready and append the typed intake summary/state transition events."
+        }
+        "TicketWorkflowState" => {
+            "Transition Ticket workflow_state; queued -> inprogress is the accepted implementation start, so implementation side effects should happen only after that transition is accepted and recorded."
+        }
         "TicketStatus" => "Move a Ticket between open and pending; use TicketClose for closed.",
         "TicketClose" => "Close a Ticket with a resolution through the typed local Ticket backend.",
         "TicketDoctor" => "Run typed local Ticket backend consistency checks.",
@@ -149,6 +193,13 @@ fn tool_description(name: &str) -> &'static str {
 
 pub fn ticket_tools_feature(workspace: impl AsRef<Path>) -> TicketFeature {
     TicketFeature::for_workspace(workspace)
+}
+
+pub fn ticket_tools_feature_with_access(
+    workspace: impl AsRef<Path>,
+    access: TicketFeatureAccess,
+) -> TicketFeature {
+    TicketFeature::for_workspace_with_access(workspace, access)
 }
 
 #[cfg(test)]
@@ -191,6 +242,95 @@ mod tests {
             descriptor.requested_host_authorities[0].authority,
             HostAuthority::TicketBackend { .. }
         ));
+    }
+
+    #[test]
+    fn read_only_descriptor_declares_only_status_tools() {
+        let temp = TempDir::new().unwrap();
+        let feature = ticket_tools_feature_with_access(temp.path(), TicketFeatureAccess::ReadOnly);
+        let descriptor = feature.descriptor();
+        assert_eq!(feature.access(), TicketFeatureAccess::ReadOnly);
+        assert_eq!(descriptor.tools.len(), TICKET_READ_ONLY_TOOL_NAMES.len());
+        assert_eq!(
+            descriptor
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            TICKET_READ_ONLY_TOOL_NAMES
+        );
+        assert_eq!(descriptor.requested_host_authorities.len(), 1);
+    }
+
+    #[test]
+    fn read_only_installation_does_not_expose_mutating_tools() {
+        let temp = TempDir::new().unwrap();
+        make_ticket_root(&temp.path().join(DEFAULT_TICKET_BACKEND_RELATIVE_PATH));
+        let mut pending_tools = Vec::new();
+        let mut hooks = HookRegistryBuilder::default();
+        let report = FeatureRegistryBuilder::new()
+            .with_module(ticket_tools_feature_with_access(
+                temp.path(),
+                TicketFeatureAccess::ReadOnly,
+            ))
+            .install_into_pending(&mut pending_tools, &mut hooks);
+
+        assert_eq!(pending_tools.len(), TICKET_READ_ONLY_TOOL_NAMES.len());
+        assert_eq!(
+            report.reports[0].installed_tools,
+            TICKET_READ_ONLY_TOOL_NAMES
+        );
+        let pending_names = pending_tools
+            .iter()
+            .map(|definition| definition().0.name)
+            .collect::<Vec<_>>();
+        assert_eq!(pending_names, TICKET_READ_ONLY_TOOL_NAMES);
+        for name in ticket::tool::TICKET_MUTATING_TOOL_NAMES {
+            assert!(
+                !report.reports[0]
+                    .installed_tools
+                    .iter()
+                    .any(|tool| tool == name)
+            );
+            assert!(!pending_names.iter().any(|tool| tool == name));
+        }
+    }
+
+    #[test]
+    fn lifecycle_installation_exposes_lifecycle_tools() {
+        let temp = TempDir::new().unwrap();
+        make_ticket_root(&temp.path().join(DEFAULT_TICKET_BACKEND_RELATIVE_PATH));
+        let mut pending_tools = Vec::new();
+        let mut hooks = HookRegistryBuilder::default();
+        let report = FeatureRegistryBuilder::new()
+            .with_module(ticket_tools_feature_with_access(
+                temp.path(),
+                TicketFeatureAccess::Lifecycle,
+            ))
+            .install_into_pending(&mut pending_tools, &mut hooks);
+
+        assert_eq!(pending_tools.len(), TICKET_TOOL_NAMES.len());
+        assert_eq!(report.reports[0].installed_tools, TICKET_TOOL_NAMES);
+        for name in ticket::tool::TICKET_MUTATING_TOOL_NAMES {
+            assert!(
+                report.reports[0]
+                    .installed_tools
+                    .iter()
+                    .any(|tool| tool == name)
+            );
+        }
+        assert!(
+            report.reports[0]
+                .installed_tools
+                .iter()
+                .any(|tool| tool == "TicketIntakeReady")
+        );
+        assert!(
+            report.reports[0]
+                .installed_tools
+                .iter()
+                .any(|tool| tool == "TicketWorkflowState")
+        );
     }
 
     #[test]
