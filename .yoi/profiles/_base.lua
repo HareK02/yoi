@@ -7,7 +7,7 @@ return function(opts)
         slug = opts.slug,
         description = opts.description,
 
-        scope = scope.workspace_write(),
+        scope = opts.scope or scope.workspace_read(),
 
         session = {
             record_event_trace = true,
