@@ -2,13 +2,13 @@
 id: 20260607-062902-narrow-yoi-worktree-sparse-exclusions
 slug: narrow-yoi-worktree-sparse-exclusions
 title: Narrow child worktree .yoi sparse exclusions
-status: open
+status: closed
 kind: task
 priority: P1
 labels: [worktree, workflow, memory, ticket, orchestration]
-workflow_state: ready
+workflow_state: done
 created_at: 2026-06-07T06:29:02Z
-updated_at: 2026-06-07T07:37:53Z
+updated_at: 2026-06-07T07:38:29Z
 assignee: null
 legacy_ticket: null
 ---
