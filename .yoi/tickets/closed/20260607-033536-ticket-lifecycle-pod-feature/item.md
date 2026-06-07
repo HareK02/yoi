@@ -2,13 +2,13 @@
 id: 20260607-033536-ticket-lifecycle-pod-feature
 slug: ticket-lifecycle-pod-feature
 title: Ticket lifecycle pod feature
-status: open
+status: closed
 kind: task
 priority: P1
 labels: [ticket, pod-feature, tools, orchestration, workflow]
-workflow_state: ready
+workflow_state: done
 created_at: 2026-06-07T03:35:36Z
-updated_at: 2026-06-07T04:02:48Z
+updated_at: 2026-06-07T04:03:33Z
 assignee: null
 legacy_ticket: null
 ---
