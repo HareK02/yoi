@@ -2,14 +2,15 @@
 id: 20260527-000017-tui-spawned-pod-panel
 slug: tui-spawned-pod-panel
 title: TUI: spawned child Pod の一覧と一時 attach
-status: pending
+status: closed
 kind: task
 priority: P2
 labels: [migrated]
 created_at: 2026-05-27T00:00:17Z
-updated_at: 2026-06-05T04:03:38Z
+updated_at: 2026-06-07T03:14:39Z
 assignee: null
 legacy_ticket: tickets/tui-spawned-pod-panel.md
+workflow_state: done
 ---
 
 ## Migration reference

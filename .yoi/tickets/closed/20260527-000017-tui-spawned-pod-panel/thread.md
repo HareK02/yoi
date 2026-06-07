@@ -18,3 +18,22 @@ This ticket is not closed as technically invalid; it is moved out of the active 
 
 
 ---
+
+<!-- event: state_changed author: hare at: 2026-06-07T03:14:39Z from: intake to: done reason: closed field: workflow_state -->
+
+## State changed
+
+Ticket closed; workflow_state set to done.
+
+
+---
+
+<!-- event: close author: hare at: 2026-06-07T03:14:39Z status: closed -->
+
+## Closed
+
+Closed as intentionally not planned.
+
+The old migrated spawned-Pod panel idea has been superseded by the workspace panel, Pod list/open/attach behavior, Ticket role launching, and the local role session registry. The remaining direction is not to revive this standalone spawned-child panel ticket. Future panel work should be tracked through the newer workspace panel / orchestration tickets.
+
+---
