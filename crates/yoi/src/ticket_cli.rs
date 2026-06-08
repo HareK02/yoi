@@ -849,6 +849,7 @@ mod tests {
                 role.default_workflow()
             )));
         }
+        assert!(!config.contains("[roles.investigator]"));
     }
 
     #[test]
