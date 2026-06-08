@@ -205,3 +205,106 @@ Next recovery options:
 No merge, close, final approval, or cleanup has occurred.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-08T11:30:25Z -->
+
+## Implementation report
+
+Delegation recovery succeeded after Orchestrator relaunch.
+
+Spawned sibling Coder Pod:
+- Pod: `coder-remove-fixed-investigator-ticket-role`
+- Worktree: `.worktree/remove-fixed-investigator-ticket-role`
+- Scope: read access to workspace root entry plus write access limited to the child worktree.
+
+The first spawn attempt still failed because the child startup checked the parent workspace `pwd`; the retry added a non-recursive read grant on `/home/hare/Projects/yoi` while keeping write authority limited to the worktree.
+
+---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-08T11:46:07Z -->
+
+## Implementation report
+
+Coder implementation completed and was handed to sibling Reviewer.
+
+Coder Pod:
+- `coder-remove-fixed-investigator-ticket-role`
+- Commit: `427a270 ticket: remove fixed investigator role`
+- Worktree status before review: clean branch `remove-fixed-investigator-ticket-role`
+- Stopped after collecting output to reclaim delegated worktree scope.
+
+Reviewer Pod:
+- `reviewer-remove-fixed-investigator-ticket-role`
+- Reviewing commit `427a270` against the fixed-role removal invariants.
+
+Orchestrator pre-review evidence: changed files are limited to Ticket role config/CLI plus workflow/docs wording; a quick scoped search found remaining investigator references only in expected test/migration-note contexts.
+
+---
+
+<!-- event: review author: reviewer-remove-fixed-investigator-ticket-role at: 2026-06-08T11:53:33Z status: approve -->
+
+## Review: approve
+
+Reviewed commit `427a270` (`ticket: remove fixed investigator role`) on branch `remove-fixed-investigator-ticket-role` in worktree `/home/hare/Projects/yoi/.worktree/remove-fixed-investigator-ticket-role`.
+
+Evidence:
+- `TicketRole::ALL` is now only `intake`, `orchestrator`, `coder`, `reviewer`; no `TicketRole::Investigator` remains in the active role model.
+- Ticket config loading rejects unknown role tables by parsing `[roles.*]` keys through `TicketRole::parse`; the added `stale_investigator_role_config_is_rejected` test checks `[roles.investigator]` fails with `unsupported Ticket role \`investigator\`` and lists supported roles.
+- Config scaffold / `yoi ticket init` assertions now check `[roles.investigator]` is absent while the four remaining role tables are present.
+- Maintained docs/workflows no longer present `investigator` as a fixed role or config slot. Remaining maintained references are the intentional migration note and tests. Historical Ticket records still contain old text, which is audit history rather than maintained docs.
+- Orchestrator/planning wording still permits task-specific read-only helper Pods for investigation (`task-specific helper Pod`, `read-only investigation helper Pod`, and `spike_needed -> read-only investigation plan / Pod`).
+- No TUI `:ticket investigate` path or generic arbitrary role registry was reintroduced; `intake` remains a fixed role.
+
+Validation run by reviewer:
+- `cargo test -p ticket config`
+- `cargo test -p client ticket_role`
+- `cargo test -p yoi ticket_cli_init`
+- `cargo test -p tui workspace_panel`
+- `cargo test -p tui multi_ticket_intake`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo run -q -p yoi -- ticket doctor`
+- `cargo check --workspace`
+- `nix build .#yoi --no-link`
+
+Result: approve. No required changes found.
+
+---
+
+<!-- event: state_changed author: hare at: 2026-06-08T11:55:21Z from: inprogress to: done reason: closed field: workflow_state -->
+
+## State changed
+
+Ticket closed; workflow_state を done に設定しました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-06-08T11:55:21Z status: closed -->
+
+## 完了
+
+Implemented and merged.
+
+Summary:
+- Removed `investigator` from the fixed Ticket role set; remaining fixed roles are `intake`, `orchestrator`, `coder`, and `reviewer`.
+- Updated Ticket config parsing and scaffold tests so `[roles.investigator]` is not emitted and stale `[roles.investigator]` config is rejected with a clear unsupported-role diagnostic.
+- Updated role docs/workflow wording so investigation remains an optional task-specific helper Pod tactic rather than a configured fixed Ticket role.
+- Preserved `intake` and existing planning/ready/queued/inprogress/done workflow semantics.
+
+Implementation:
+- Coder commit: `427a270 ticket: remove fixed investigator role`
+- Merge commit: `b552372 merge: remove fixed investigator ticket role`
+- Reviewer: approved by `reviewer-remove-fixed-investigator-ticket-role`.
+
+Validation:
+- Coder/reviewer focused role/config/panel tests passed.
+- Post-merge validation passed:
+  - `cargo fmt --check`
+  - `git diff --check`
+  - `cargo run -q -p yoi -- ticket doctor`
+  - `cargo check --workspace`
+  - `nix build .#yoi`
+
+
+---

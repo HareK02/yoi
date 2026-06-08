@@ -2,13 +2,13 @@
 id: 20260607-084344-remove-fixed-investigator-ticket-role
 slug: remove-fixed-investigator-ticket-role
 title: Remove fixed investigator Ticket role
-status: open
+status: 'closed'
 kind: task
 priority: P2
 labels: [ticket, orchestration, role, cleanup]
-workflow_state: 'inprogress'
+workflow_state: 'done'
 created_at: 2026-06-07T08:43:44Z
-updated_at: '2026-06-08T11:18:27Z'
+updated_at: '2026-06-08T11:55:21Z'
 assignee: null
 legacy_ticket: null
 queued_by: 'workspace-panel'
