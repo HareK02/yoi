@@ -202,3 +202,46 @@ Status:
 - Merge authority is still required; no merge, close, final approval, or cleanup has occurred.
 
 ---
+
+<!-- event: review author: orchestrator at: 2026-06-08T01:59:52Z status: approve -->
+
+## Review: approve
+
+Final merge-completion approval after coordinated bundle merge and validation.
+
+Evidence:
+- Implemented as part of branch `runtime-workspace-context`.
+- Reviewer approved after fix-loop.
+- Post-merge validation passed, including focused profile/spawn/entrypoint/CLI/TUI tests, `cargo check -q`, `cargo fmt --check`, `git diff --check`, ticket doctor, and `nix build .#yoi`.
+- Cleanup completed for the merged runtime-workspace branch/worktree and coder/reviewer Pods.
+
+---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-08T01:59:59Z from: inprogress to: done reason: merged_and_validated field: workflow_state -->
+
+## State changed
+
+Completed as part of the merged runtime workspace identity bundle; post-merge validation passed and cleanup completed.
+
+---
+
+<!-- event: close author: hare at: 2026-06-08T02:00:18Z status: closed -->
+
+## Closed
+
+Completed as part of the coordinated runtime workspace / Pod identity bundle.
+
+Summary:
+- Removed Profile slug/source/registry-derived Pod identity fallback.
+- Kept Profile selection as reusable recipe selection only.
+- Updated startup/spawn paths so runtime Pod identity is supplied explicitly via `--pod` and is not inferred from Profile metadata.
+- Removed the hidden session-specific identity split that preserved old Profile startup behavior.
+
+Merged branch:
+- `runtime-workspace-context` via merge commit `b7a533f`.
+
+Validation and cleanup:
+- Post-merge focused tests, `cargo check -q`, `cargo fmt --check`, `git diff --check`, ticket doctor, and `nix build .#yoi` passed.
+- Runtime-workspace coder/reviewer Pods, worktree, and branch were cleaned up.
+
+---

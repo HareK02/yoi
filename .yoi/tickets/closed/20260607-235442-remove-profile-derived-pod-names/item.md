@@ -2,13 +2,13 @@
 id: '20260607-235442-remove-profile-derived-pod-names'
 slug: 'remove-profile-derived-pod-names'
 title: 'Remove Profile-derived Pod names'
-status: 'open'
+status: 'closed'
 kind: 'task'
 priority: 'P1'
 labels: ['profile', 'pod', 'identity', 'manifest', 'bug']
-workflow_state: 'inprogress'
+workflow_state: 'done'
 created_at: '2026-06-07T23:54:42Z'
-updated_at: '2026-06-08T01:53:53Z'
+updated_at: '2026-06-08T02:00:18Z'
 assignee: null
 legacy_ticket: null
 queued_by: 'workspace-panel'

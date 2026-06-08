@@ -2,13 +2,13 @@
 id: '20260607-235505-use-workspace-basename-for-default-pod-name'
 slug: 'use-workspace-basename-for-default-pod-name'
 title: 'Use workspace basename for default Pod name'
-status: 'open'
+status: 'closed'
 kind: 'task'
 priority: 'P1'
 labels: ['pod', 'identity', 'workspace', 'cli', 'panel']
-workflow_state: 'inprogress'
+workflow_state: 'done'
 created_at: '2026-06-07T23:55:05Z'
-updated_at: '2026-06-08T01:53:54Z'
+updated_at: '2026-06-08T02:00:18Z'
 assignee: null
 legacy_ticket: null
 queued_by: 'workspace-panel'

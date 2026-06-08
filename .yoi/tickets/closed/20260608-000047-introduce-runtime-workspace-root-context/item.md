@@ -2,13 +2,13 @@
 id: '20260608-000047-introduce-runtime-workspace-root-context'
 slug: 'introduce-runtime-workspace-root-context'
 title: 'Introduce runtime workspace root context'
-status: 'open'
+status: 'closed'
 kind: 'task'
 priority: 'P1'
 labels: ['workspace', 'pod', 'profile', 'cli', 'panel', 'memory']
-workflow_state: 'inprogress'
+workflow_state: 'done'
 created_at: '2026-06-08T00:00:47Z'
-updated_at: '2026-06-08T01:53:43Z'
+updated_at: '2026-06-08T02:00:18Z'
 assignee: null
 legacy_ticket: null
 queued_by: 'workspace-panel'

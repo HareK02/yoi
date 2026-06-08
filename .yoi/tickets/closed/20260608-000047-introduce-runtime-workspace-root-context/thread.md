@@ -481,3 +481,61 @@ Parent/human decision needs:
 - Merge authority is still required. This Orchestrator routing/review phase stops here without merge, close, final main-branch approval, or cleanup.
 
 ---
+
+<!-- event: review author: orchestrator at: 2026-06-08T01:59:52Z status: approve -->
+
+## Review: approve
+
+Final merge-completion approval after merge to `develop` and post-merge validation.
+
+Evidence:
+- Merged branch `runtime-workspace-context` with `--no-ff`.
+- Reviewer `reviewer-runtime-workspace-context` approved after coder fix-loop.
+- Post-merge validation passed: focused manifest/client/pod/yoi/tui tests, `cargo check -q`, `cargo fmt --check`, `git diff --check`, `cargo run -q -p yoi -- ticket doctor`, and `nix build .#yoi`.
+- Coder/reviewer Pods stopped and delegated scope reclaimed.
+- Merged worktree removed and branch deleted.
+
+This approval is for the merged main-branch result, not merely the branch-local reviewer verdict.
+
+---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-08T01:59:59Z from: inprogress to: done reason: merged_and_validated field: workflow_state -->
+
+## State changed
+
+Merged to `develop`, post-merge validation passed, final merge-completion approval recorded, and runtime-workspace branch/worktree/Pods cleaned up.
+
+---
+
+<!-- event: close author: hare at: 2026-06-08T02:00:18Z status: closed -->
+
+## Closed
+
+Merged and completed the coordinated runtime workspace / Pod identity bundle.
+
+Summary:
+- Introduced explicit separation of runtime workspace root, runtime Pod identity, and Profile selector across startup/profile/client/TUI/Pod paths.
+- Removed Profile-derived Pod identity fallback and preserved Profile as recipe selection only.
+- Default Pod identity now derives from runtime workspace basename with generic fallback; explicit `--pod` remains authoritative.
+- `--session ... --pod ...` is accepted for restore, and hidden `--session-pod-name` was removed.
+- Panel Companion/Orchestrator and Ticket role naming remain explicit and distinct.
+
+Merged branch/worktree:
+- Branch: `runtime-workspace-context`
+- Commits: `b6af761`, `15f54df`
+- Merge commit on `develop`: `b7a533f`
+
+Validation passed after merge:
+- focused manifest/client/pod/yoi/tui tests
+- `cargo check -q`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo run -q -p yoi -- ticket doctor`
+- `nix build .#yoi`
+
+Cleanup completed:
+- Stopped coder/reviewer Pods and reclaimed scope.
+- Removed `.worktree/runtime-workspace-context`.
+- Deleted branch `runtime-workspace-context`.
+
+---
