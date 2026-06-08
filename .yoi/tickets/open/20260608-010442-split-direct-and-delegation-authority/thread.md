@@ -262,3 +262,37 @@ Pending:
 - No merge, close, final approval, or cleanup has occurred.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-08T06:38:27Z -->
+
+## Implementation report
+
+Coder fix-loop completed and reviewer re-review delegated.
+
+Coder follow-up:
+- Commit: `f43c8ac fix: validate delegation path sets exactly`
+- Worktree: clean on branch `split-direct-and-delegation-authority`.
+- Fixes claimed:
+  - `DelegationScope` subset checks now compare recursive/non-recursive path-set inclusion rather than only rule target containment.
+  - `recursive=false /repo` allows exact `recursive=false /repo` but rejects `recursive=false /repo/child`.
+  - `recursive=true /repo` allows `recursive=false /repo/child`.
+  - deny overlap now compares path sets, so deny `recursive=false /repo` rejects request `recursive=true /repo/child`.
+  - Added focused regression tests in `crates/manifest/src/scope.rs` and `crates/pod/tests/spawn_pod_test.rs`.
+
+Coder validation reported:
+- `cargo test -p manifest delegation_ --lib`
+- `cargo test -p manifest --lib`
+- `cargo test -p pod spawn_pod --test spawn_pod_test`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo run -q -p yoi -- ticket doctor`
+- `nix build .#yoi`
+
+Action taken:
+- Sent updated commits and prior blocker checklist to `reviewer-split-direct-delegation` for read-only re-review.
+
+Pending:
+- Await reviewer verdict before merge-ready dossier / merge-completion.
+- No merge, close, final approval, or cleanup has occurred.
+
+---
