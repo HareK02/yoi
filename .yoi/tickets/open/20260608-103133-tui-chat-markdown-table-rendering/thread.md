@@ -130,3 +130,72 @@ Coder-reported validation:
 - `nix build .#yoi` -> OK
 
 ---
+
+<!-- event: review author: reviewer at: 2026-06-08T13:28:34Z status: approve -->
+
+## Review: approve
+
+Approve.
+
+Review evidence:
+- Reviewed commit `f767ec7a5945aff588fe0b8ce224b30efe4c2a85` on branch `tui-chat-markdown-table-rendering`; the only changed source file is `crates/tui/src/markdown.rs`.
+- The change stays in the TUI Markdown rendering layer: it enables `pulldown_cmark::Options::ENABLE_TABLES` in the existing renderer and collects/renders table events into display-only `Line` output. I did not find changes to Pod history, session logs, worker history, prompt context, or stored message text.
+- The renderer is used by the normal assistant chat/conversation rendering path (`ui.rs`) and this commit does not touch Ticket panel, `yoi ticket show`, docs rendering, or WebFetch extraction surfaces.
+- Table rendering keeps cell text for ragged/extra-column rows, pads missing cells, computes display widths with `unicode-width`, and falls back to ordinary event handling for non-table Markdown. Tests cover simple tables, alignment, ragged/too-wide safety, malformed table fallback, and non-table pipe text.
+
+Validation run from the worktree:
+- `cargo test -p tui markdown -- --nocapture` passed.
+- `cargo fmt --check` passed.
+- `git diff --check f767ec7a5945aff588fe0b8ce224b30efe4c2a85^ f767ec7a5945aff588fe0b8ce224b30efe4c2a85` passed.
+- `cargo check --workspace` passed.
+- `nix build .#yoi` passed.
+
+No blocking issues found.
+
+---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-08T13:29:26Z -->
+
+## Implementation report
+
+Merge-ready dossier for human/orchestrator approval.
+
+Status:
+- Implementation branch: `tui-chat-markdown-table-rendering`
+- Worktree: `.worktree/tui-chat-markdown-table-rendering`
+- Commit under review: `f767ec7a5945aff588fe0b8ce224b30efe4c2a85 tui: render markdown pipe tables in chat`
+- Reviewer: `reviewer-tui-chat-markdown-table-rendering`
+- Review result: approved; no blocking findings.
+
+Intent / invariant check:
+- Makes ordinary Markdown pipe tables readable in the normal TUI chat/conversation Markdown renderer.
+- Changes display/rendering behavior only.
+- Does not mutate Pod history, session logs, worker history, prompt context, or stored message text.
+- Does not expand scope to Ticket panel, `yoi ticket show`, docs rendering, or WebFetch extraction.
+- Does not add a new large Markdown dependency or broad TUI rendering abstraction rewrite.
+
+Implementation summary:
+- Enables `pulldown-cmark` `Options::ENABLE_TABLES` in `crates/tui/src/markdown.rs`.
+- Adds table event collection/rendering into readable monospace rows with separators and alignment-aware padding.
+- Keeps ragged/extra-column/wide table content visible and pads missing cells.
+- Adds focused tests for simple table rendering, ragged/wide safety, and non-table pipe text regression.
+
+Validation evidence:
+- Coder reported pass:
+  - `cargo test -p tui markdown -- --nocapture`
+  - `cargo fmt --check`
+  - `git diff --check`
+  - `cargo check --workspace`
+  - `nix build .#yoi`
+- Reviewer independently ran and passed:
+  - `cargo test -p tui markdown -- --nocapture`
+  - `cargo fmt --check`
+  - `git diff --check f767ec7a5945aff588fe0b8ce224b30efe4c2a85^ f767ec7a5945aff588fe0b8ce224b30efe4c2a85`
+  - `cargo check --workspace`
+  - `nix build .#yoi`
+
+Residual risks / notes:
+- This is intentionally a pragmatic table renderer, not a full GFM table compatibility project.
+- Final merge/close/cleanup is intentionally not performed here without explicit merge approval.
+
+---

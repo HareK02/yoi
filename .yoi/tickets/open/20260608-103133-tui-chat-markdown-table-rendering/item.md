@@ -8,7 +8,7 @@ priority: 'P2'
 labels: ['tui', 'chat', 'markdown', 'rendering', 'ux']
 workflow_state: 'inprogress'
 created_at: '2026-06-08T10:31:33Z'
-updated_at: '2026-06-08T13:26:21Z'
+updated_at: '2026-06-08T13:29:26Z'
 assignee: null
 risk_flags: ['tui-rendering', 'markdown']
 queued_by: 'workspace-panel'
