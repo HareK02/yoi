@@ -15,10 +15,11 @@ use async_trait::async_trait;
 use client::PodRuntimeCommand;
 use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use manifest::{
-    CompactionConfigPartial, FileUploadLimitsPartial, Permission, PermissionConfigPartial,
-    PodManifest, PodManifestConfig, PodMetaConfig, ProfileDiscovery, ProfileError, ProfileRegistry,
-    ProfileRegistrySource, ProfileResolveOptions, ProfileResolver, ProfileSelector, ScopeConfig,
-    ScopeRule, SessionConfigPartial, SharedScope, ToolOutputLimitsPartial, WorkerManifestConfig,
+    CompactionConfigPartial, DelegationScope, FileUploadLimitsPartial, Permission,
+    PermissionConfigPartial, PodManifest, PodManifestConfig, PodMetaConfig, ProfileDiscovery,
+    ProfileError, ProfileRegistry, ProfileRegistrySource, ProfileResolveOptions, ProfileResolver,
+    ProfileSelector, ScopeConfig, ScopeRule, SessionConfigPartial, SharedScope,
+    ToolOutputLimitsPartial, WorkerManifestConfig,
 };
 use serde::Deserialize;
 use tokio::net::UnixStream;
@@ -54,7 +55,8 @@ struct SpawnPodInput {
     /// First message sent to the spawned Pod via `Method::Run`.
     task: String,
     /// Allow rules delegated to the spawned Pod. Must be a subset of the
-    /// spawner's effective write scope.
+    /// spawner's explicit delegation authority; direct tool scope alone is not
+    /// sufficient.
     scope: Vec<ScopeRuleInput>,
 }
 
@@ -248,6 +250,10 @@ pub struct SpawnPodTool {
     /// `effective_write` semantics: Write is the only permission
     /// tracked across Pods, so revocation only touches Write.
     spawner_scope: SharedScope,
+    /// Filesystem scope this Pod is allowed to subdelegate to children.
+    /// This is intentionally separate from `spawner_scope`, which authorizes
+    /// the current Pod's own direct tools.
+    delegation_scope: DelegationScope,
 }
 
 impl SpawnPodTool {
@@ -261,6 +267,7 @@ impl SpawnPodTool {
         spawner_manifest: PodManifest,
         available_profiles: AvailableProfiles,
         spawner_scope: SharedScope,
+        delegation_scope: DelegationScope,
         runtime_command: Option<PodRuntimeCommand>,
     ) -> Self {
         Self {
@@ -274,6 +281,7 @@ impl SpawnPodTool {
             spawner_manifest,
             available_profiles,
             spawner_scope,
+            delegation_scope,
         }
     }
 }
@@ -295,6 +303,7 @@ impl Tool for SpawnPodTool {
         }
 
         let scope_allow = parse_scope(&input.scope)?;
+        self.validate_delegation_scope(&scope_allow)?;
 
         let spawn_selector =
             parse_spawn_profile_selector(input.profile.as_deref()).map_err(|msg| {
@@ -469,6 +478,28 @@ impl SpawnPodTool {
             Ok(()) => Ok(()),
             Err(e) => Err(annotate_with_stderr(e, &stderr_path).await),
         }
+    }
+
+    fn validate_delegation_scope(&self, scope_allow: &[ScopeRule]) -> Result<(), ToolError> {
+        if self.delegation_scope.is_empty() && !scope_allow.is_empty() {
+            return Err(ToolError::InvalidArgument(
+                "SpawnPod requires delegation authority, but this Pod has no delegation scope grant; direct filesystem scope only authorizes this Pod's own tools".into(),
+            ));
+        }
+        for rule in scope_allow {
+            let allowed = self
+                .delegation_scope
+                .allows_rule(rule)
+                .map_err(|error| ToolError::InvalidArgument(error.to_string()))?;
+            if !allowed {
+                return Err(ToolError::InvalidArgument(format!(
+                    "requested child scope {} {:?} is outside this Pod's delegation scope grant",
+                    rule.target.display(),
+                    rule.permission
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn release_reservation(&self, lock_path: &Path, pod_name: &str) {
@@ -654,6 +685,8 @@ fn manifest_to_reusable_config(manifest: &PodManifest) -> PodManifestConfig {
             allow: manifest.scope.allow.clone(),
             deny: manifest.scope.deny.clone(),
         },
+        // `inherit` reuses behavioral configuration, not subdelegation authority.
+        delegation_scope: ScopeConfig::default(),
         session: Some(SessionConfigPartial {
             record_event_trace: Some(manifest.session.record_event_trace),
         }),
@@ -857,6 +890,8 @@ fn spawn_pod_tool_impl(
             spawner_manifest.clone(),
             available_profiles,
             spawner_scope.clone(),
+            DelegationScope::from_config(&spawner_manifest.delegation_scope)
+                .expect("resolved Pod manifest has a valid delegation scope"),
             runtime_command.clone(),
         ));
         (meta, tool)

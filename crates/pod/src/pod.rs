@@ -22,8 +22,8 @@ use tracing::{info, warn};
 use crate::segment_log_sink::SegmentLogSink;
 
 use manifest::{
-    Permission, PodManifest, PodManifestConfig, ResolveError, Scope, ScopeConfig, ScopeError,
-    ScopeRule, SharedScope, WorkerManifest,
+    DelegationScope, Permission, PodManifest, PodManifestConfig, ResolveError, Scope, ScopeConfig,
+    ScopeError, ScopeRule, SharedScope, WorkerManifest,
 };
 
 use crate::compact::state::CompactState;
@@ -238,6 +238,9 @@ pub struct Pod<C: LlmClient, St: Store> {
     /// compact worker) so scope updates propagate to every consumer
     /// at the next permission check.
     scope: SharedScope,
+    /// Filesystem authority this Pod may pass to spawned children. Direct tools
+    /// continue to use `scope`; SpawnPod validates requested child scope here.
+    delegation_scope: DelegationScope,
     hook_builder: HookRegistryBuilder,
     interceptor_installed: bool,
     /// Shared compaction state (present when threshold is configured).
@@ -415,6 +418,7 @@ impl<C: LlmClient + Clone + 'static, St: Store + Clone + 'static> Pod<C, St> {
             segment_state: self.segment_state.clone(),
             pwd: self.pwd.clone(),
             scope: self.scope.clone(),
+            delegation_scope: self.delegation_scope.clone(),
             hook_builder: HookRegistryBuilder::new(),
             interceptor_installed: false,
             compact_state: None,
@@ -585,6 +589,8 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         let session_id = session_store::new_session_id();
         let segment_id = session_store::new_segment_id();
         let prompts = PromptCatalog::builtins_only()?;
+        let delegation_scope =
+            DelegationScope::from_config(&manifest.delegation_scope).map_err(PodError::Scope)?;
         let mut pod = Self {
             manifest,
             worker: Some(worker),
@@ -593,6 +599,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             segment_state: SegmentState::new(session_id, segment_id, 0),
             pwd,
             scope: SharedScope::new(scope),
+            delegation_scope,
             hook_builder: HookRegistryBuilder::new(),
             interceptor_installed: false,
             compact_state: None,
@@ -3724,6 +3731,7 @@ where
             segment_state: SegmentState::new(session_id, segment_id, 0),
             pwd: common.pwd,
             scope: SharedScope::new(common.scope),
+            delegation_scope: common.delegation_scope,
             hook_builder: HookRegistryBuilder::new(),
             interceptor_installed: false,
             compact_state: None,
@@ -3802,6 +3810,7 @@ where
             segment_state: SegmentState::new(session_id, segment_id, 0),
             pwd: common.pwd,
             scope: SharedScope::new(common.scope),
+            delegation_scope: common.delegation_scope,
             hook_builder: HookRegistryBuilder::new(),
             interceptor_installed: false,
             compact_state: None,
@@ -3979,6 +3988,7 @@ where
             segment_state: SegmentState::new(session_id, segment_id, state.entries_count),
             pwd: common.pwd,
             scope: SharedScope::new(common.scope),
+            delegation_scope: common.delegation_scope,
             hook_builder: HookRegistryBuilder::new(),
             interceptor_installed: false,
             compact_state: None,
@@ -4606,6 +4616,7 @@ pub enum PodError {
 struct PodCommon {
     pwd: PathBuf,
     scope: Scope,
+    delegation_scope: DelegationScope,
     client: Box<dyn LlmClient>,
     prompts: Arc<PromptCatalog>,
     workflow_registry: workflow_crate::WorkflowRegistry,
@@ -4719,6 +4730,8 @@ fn prepare_pod_common_from_scope(
     if !scope.is_readable(&pwd) {
         return Err(PodError::PwdOutsideScope { pwd });
     }
+    let delegation_scope =
+        DelegationScope::from_config(&manifest.delegation_scope).map_err(PodError::Scope)?;
 
     let client = provider::build_client(&manifest.model)?;
     let prompts = PromptCatalog::load(loader, manifest.pod.prompt_pack.as_deref())?;
@@ -4744,6 +4757,7 @@ fn prepare_pod_common_from_scope(
     Ok(PodCommon {
         pwd,
         scope,
+        delegation_scope,
         client,
         prompts,
         workflow_registry,

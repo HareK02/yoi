@@ -32,6 +32,127 @@ struct ResolvedRule {
     recursive: bool,
 }
 
+/// Parsed filesystem authority this Pod may pass to spawned children.
+///
+/// Unlike [`Scope`], an empty allow list is valid and means no delegation
+/// authority. Direct tools never consult this type.
+#[derive(Debug, Clone)]
+pub struct DelegationScope {
+    allow: Vec<ResolvedRule>,
+    deny: Vec<ResolvedRule>,
+}
+
+impl DelegationScope {
+    pub fn from_config(config: &ScopeConfig) -> Result<Self, ScopeError> {
+        let allow = config
+            .allow
+            .iter()
+            .map(resolve_rule)
+            .collect::<Result<Vec<_>, _>>()?;
+        let deny = config
+            .deny
+            .iter()
+            .map(resolve_rule)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self { allow, deny })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.allow.is_empty()
+    }
+
+    pub fn allows_rule(&self, requested: &ScopeRule) -> Result<bool, ScopeError> {
+        let requested = resolve_rule(requested)?;
+        let covered = self
+            .allow
+            .iter()
+            .any(|candidate| rule_covers(candidate, &requested));
+        if !covered {
+            return Ok(false);
+        }
+        let denied = self
+            .deny
+            .iter()
+            .any(|deny| denial_overlaps_requested(deny, &requested));
+        Ok(!denied)
+    }
+}
+
+fn permission_covers(available: Permission, requested: Permission) -> bool {
+    match (available, requested) {
+        (Permission::Write, Permission::Write)
+        | (Permission::Write, Permission::Read)
+        | (Permission::Read, Permission::Read) => true,
+        (Permission::Read, Permission::Write) => false,
+    }
+}
+
+fn permission_denies_requested(denied: Permission, requested: Permission) -> bool {
+    match (denied, requested) {
+        (Permission::Write, Permission::Write)
+        | (Permission::Read, Permission::Read)
+        | (Permission::Read, Permission::Write) => true,
+        (Permission::Write, Permission::Read) => false,
+    }
+}
+
+fn rule_covers(available: &ResolvedRule, requested: &ResolvedRule) -> bool {
+    permission_covers(available.permission, requested.permission)
+        && rule_path_set_contains(available, requested)
+}
+
+fn denial_overlaps_requested(deny: &ResolvedRule, requested: &ResolvedRule) -> bool {
+    permission_denies_requested(deny.permission, requested.permission)
+        && rule_path_sets_overlap(deny, requested)
+}
+
+fn rule_path_set_contains(available: &ResolvedRule, requested: &ResolvedRule) -> bool {
+    match (available.recursive, requested.recursive) {
+        // A recursive grant contains every possible requested path below its target.
+        (true, _) => requested.target.starts_with(&available.target),
+        // A non-recursive grant contains only the target and its direct children;
+        // a recursive request always includes descendants beyond that finite-depth
+        // set.
+        (false, true) => false,
+        // Two non-recursive rules have the same finite-depth set only when their
+        // target is identical. A request rooted at a direct child would also grant
+        // that child's children, which are grandchildren of `available.target`.
+        (false, false) => requested.target == available.target,
+    }
+}
+
+fn rule_path_sets_overlap(left: &ResolvedRule, right: &ResolvedRule) -> bool {
+    match (left.recursive, right.recursive) {
+        (true, true) => {
+            left.target.starts_with(&right.target) || right.target.starts_with(&left.target)
+        }
+        (true, false) => recursive_and_non_recursive_sets_overlap(left, right),
+        (false, true) => recursive_and_non_recursive_sets_overlap(right, left),
+        (false, false) => {
+            left.target == right.target
+                || direct_child(&left.target, &right.target)
+                || direct_child(&right.target, &left.target)
+        }
+    }
+}
+
+fn recursive_and_non_recursive_sets_overlap(
+    recursive: &ResolvedRule,
+    non_recursive: &ResolvedRule,
+) -> bool {
+    // The non-recursive set is `{target} + direct children`. It overlaps a
+    // recursive subtree when either the non-recursive target is inside that
+    // subtree, or the recursive subtree begins at the non-recursive target or
+    // one of its direct children.
+    non_recursive.target.starts_with(&recursive.target)
+        || recursive.target == non_recursive.target
+        || direct_child(&recursive.target, &non_recursive.target)
+}
+
+fn direct_child(child: &Path, parent: &Path) -> bool {
+    child.parent().is_some_and(|candidate| candidate == parent)
+}
+
 /// Errors raised when constructing a [`Scope`] from a [`ScopeConfig`].
 #[derive(Debug, thiserror::Error)]
 pub enum ScopeError {
@@ -419,12 +540,16 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    fn allow_rule(target: &Path, permission: Permission) -> ScopeRule {
+    fn rule(target: &Path, permission: Permission, recursive: bool) -> ScopeRule {
         ScopeRule {
             target: target.to_path_buf(),
             permission,
-            recursive: true,
+            recursive,
         }
+    }
+
+    fn allow_rule(target: &Path, permission: Permission) -> ScopeRule {
+        rule(target, permission, true)
     }
 
     #[test]
@@ -540,6 +665,80 @@ mod tests {
         let scope = Scope::from_config(&cfg).unwrap();
         assert!(scope.is_writable(&dir.path().join("top.txt")));
         assert!(!scope.is_writable(&nested.join("deep.txt")));
+    }
+
+    #[test]
+    fn delegation_non_recursive_grant_rejects_child_non_recursive_request() {
+        let dir = TempDir::new().unwrap();
+        let child = dir.path().join("child");
+        std::fs::create_dir(&child).unwrap();
+        let delegation = DelegationScope::from_config(&ScopeConfig {
+            allow: vec![rule(dir.path(), Permission::Write, false)],
+            deny: Vec::new(),
+        })
+        .unwrap();
+
+        assert!(
+            !delegation
+                .allows_rule(&rule(&child, Permission::Write, false))
+                .unwrap(),
+            "a non-recursive child request includes grandchildren outside the parent non-recursive grant"
+        );
+    }
+
+    #[test]
+    fn delegation_non_recursive_grant_allows_exact_non_recursive_request() {
+        let dir = TempDir::new().unwrap();
+        let delegation = DelegationScope::from_config(&ScopeConfig {
+            allow: vec![rule(dir.path(), Permission::Write, false)],
+            deny: Vec::new(),
+        })
+        .unwrap();
+
+        assert!(
+            delegation
+                .allows_rule(&rule(dir.path(), Permission::Write, false))
+                .unwrap(),
+            "identical non-recursive path sets should be delegable"
+        );
+    }
+
+    #[test]
+    fn delegation_recursive_grant_allows_child_non_recursive_request() {
+        let dir = TempDir::new().unwrap();
+        let child = dir.path().join("child");
+        std::fs::create_dir(&child).unwrap();
+        let delegation = DelegationScope::from_config(&ScopeConfig {
+            allow: vec![rule(dir.path(), Permission::Write, true)],
+            deny: Vec::new(),
+        })
+        .unwrap();
+
+        assert!(
+            delegation
+                .allows_rule(&rule(&child, Permission::Write, false))
+                .unwrap(),
+            "recursive parent grants cover non-recursive child path sets"
+        );
+    }
+
+    #[test]
+    fn delegation_non_recursive_deny_overlaps_child_recursive_request() {
+        let dir = TempDir::new().unwrap();
+        let child = dir.path().join("child");
+        std::fs::create_dir(&child).unwrap();
+        let delegation = DelegationScope::from_config(&ScopeConfig {
+            allow: vec![rule(dir.path(), Permission::Write, true)],
+            deny: vec![rule(dir.path(), Permission::Write, false)],
+        })
+        .unwrap();
+
+        assert!(
+            !delegation
+                .allows_rule(&rule(&child, Permission::Write, true))
+                .unwrap(),
+            "non-recursive deny at the parent includes the direct child path requested recursively"
+        );
     }
 
     #[test]

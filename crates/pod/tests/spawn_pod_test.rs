@@ -175,20 +175,38 @@ fn dummy_model() -> ModelManifest {
 }
 
 fn dummy_manifest(allow_root: &Path) -> PodManifest {
+    dummy_manifest_with_delegation(allow_root, true)
+}
+
+fn dummy_manifest_with_delegation(allow_root: &Path, allow_delegation: bool) -> PodManifest {
+    let direct_scope = ScopeConfig {
+        allow: vec![ScopeRule {
+            target: allow_root.to_path_buf(),
+            permission: Permission::Write,
+            recursive: true,
+        }],
+        deny: Vec::new(),
+    };
+    let delegation_scope = if allow_delegation {
+        direct_scope.clone()
+    } else {
+        ScopeConfig::default()
+    };
+    dummy_manifest_with_scopes(direct_scope, delegation_scope)
+}
+
+fn dummy_manifest_with_scopes(
+    direct_scope: ScopeConfig,
+    delegation_scope: ScopeConfig,
+) -> PodManifest {
     PodManifestConfig {
         pod: PodMetaConfig {
             name: Some("root".into()),
             prompt_pack: None,
         },
         model: dummy_model(),
-        scope: ScopeConfig {
-            allow: vec![ScopeRule {
-                target: allow_root.to_path_buf(),
-                permission: Permission::Write,
-                recursive: true,
-            }],
-            deny: Vec::new(),
-        },
+        scope: direct_scope,
+        delegation_scope,
         ..Default::default()
     }
     .try_into()
@@ -306,6 +324,125 @@ async fn spawn_pod_delegates_scope_and_sends_run() {
 }
 
 #[tokio::test]
+async fn spawn_pod_requires_explicit_delegation_even_with_direct_scope() {
+    let _env = EnvGuard::acquire();
+
+    let allow_root = TempDir::new().unwrap();
+    let (_tmp, runtime_base, spawner_socket, spawner_rd) =
+        setup_spawner("root", allow_root.path()).await;
+
+    let manifest = dummy_manifest_with_delegation(allow_root.path(), false);
+    let direct = Scope::from_config(&manifest.scope).unwrap();
+    assert!(direct.is_writable(&allow_root.path().join("direct.txt")));
+
+    let registry = SpawnedPodRegistry::new(spawner_rd.clone());
+    let def = spawn_pod_tool_with_runtime_command(
+        "root".into(),
+        spawner_socket,
+        runtime_base,
+        allow_root.path().to_path_buf(),
+        registry,
+        None,
+        manifest,
+        shared_scope_for(allow_root.path()),
+        builtin_prompts(),
+        mock_runtime_command(),
+    );
+    let (_meta, tool) = def();
+
+    let input = json!({
+        "name": "child-no-delegation",
+        "task": "hello",
+        "profile": "inherit",
+        "scope": [{
+            "target": allow_root.path().to_str().unwrap(),
+            "permission": "write"
+        }]
+    })
+    .to_string();
+
+    let err = tool.execute(&input).await.unwrap_err();
+    match err {
+        ToolError::InvalidArgument(message) => {
+            assert!(message.contains("no delegation scope grant"), "{message}");
+            assert!(message.contains("direct filesystem scope"), "{message}");
+        }
+        other => panic!("expected InvalidArgument, got {other:?}"),
+    }
+
+    clear_env();
+}
+
+#[tokio::test]
+async fn spawn_pod_rejects_child_non_recursive_scope_under_parent_non_recursive_delegation() {
+    let _env = EnvGuard::acquire();
+
+    let allow_root = TempDir::new().unwrap();
+    let child = allow_root.path().join("child");
+    std::fs::create_dir(&child).unwrap();
+    let (_tmp, runtime_base, spawner_socket, spawner_rd) =
+        setup_spawner("root", allow_root.path()).await;
+
+    let direct_scope = ScopeConfig {
+        allow: vec![ScopeRule {
+            target: allow_root.path().to_path_buf(),
+            permission: Permission::Write,
+            recursive: true,
+        }],
+        deny: Vec::new(),
+    };
+    let delegation_scope = ScopeConfig {
+        allow: vec![ScopeRule {
+            target: allow_root.path().to_path_buf(),
+            permission: Permission::Write,
+            recursive: false,
+        }],
+        deny: Vec::new(),
+    };
+    let manifest = dummy_manifest_with_scopes(direct_scope, delegation_scope);
+
+    let registry = SpawnedPodRegistry::new(spawner_rd.clone());
+    let def = spawn_pod_tool_with_runtime_command(
+        "root".into(),
+        spawner_socket,
+        runtime_base,
+        allow_root.path().to_path_buf(),
+        registry,
+        None,
+        manifest,
+        shared_scope_for(allow_root.path()),
+        builtin_prompts(),
+        mock_runtime_command(),
+    );
+    let (_meta, tool) = def();
+
+    let input = json!({
+        "name": "child-nonrecursive-overgrant",
+        "task": "hello",
+        "profile": "inherit",
+        "scope": [{
+            "target": child.to_str().unwrap(),
+            "permission": "write",
+            "recursive": false
+        }]
+    })
+    .to_string();
+
+    let err = tool.execute(&input).await.unwrap_err();
+    match err {
+        ToolError::InvalidArgument(message) => {
+            assert!(
+                message.contains("outside this Pod's delegation scope grant"),
+                "{message}"
+            );
+        }
+        other => panic!("expected InvalidArgument, got {other:?}"),
+    }
+
+    clear_env();
+}
+
+#[tokio::test]
 async fn spawn_pod_rejects_scope_outside_spawner() {
     let _env = EnvGuard::acquire();
 
@@ -346,8 +483,8 @@ async fn spawn_pod_rejects_scope_outside_spawner() {
     match err {
         ToolError::InvalidArgument(msg) => {
             assert!(
-                msg.contains("not within"),
-                "expected NotSubset wording: {msg}"
+                msg.contains("outside this Pod's delegation scope grant"),
+                "expected delegation-scope wording: {msg}"
             );
         }
         other => panic!("expected InvalidArgument, got {other:?}"),

@@ -38,6 +38,9 @@ pub struct PodManifestConfig {
     pub worker: WorkerManifestConfig,
     #[serde(default)]
     pub scope: ScopeConfig,
+    /// Scope that may be subdelegated to spawned child Pods. Defaults empty.
+    #[serde(default)]
+    pub delegation_scope: ScopeConfig,
     #[serde(default)]
     pub session: Option<SessionConfigPartial>,
     /// Optional `[permissions]` section. `None` means the permission layer
@@ -243,6 +246,7 @@ impl PodManifestConfig {
     ///
     /// Affected fields: `model.auth.file`,
     /// `scope.allow[].target`, `scope.deny[].target`,
+    /// `delegation_scope.allow[].target`, `delegation_scope.deny[].target`,
     /// `compaction.model.auth.file`.
     pub fn resolve_paths(mut self, base: &Path) -> Self {
         debug_assert!(
@@ -258,6 +262,12 @@ impl PodManifestConfig {
             rule.target = join_if_relative(base, &rule.target);
         }
         for rule in &mut self.scope.deny {
+            rule.target = join_if_relative(base, &rule.target);
+        }
+        for rule in &mut self.delegation_scope.allow {
+            rule.target = join_if_relative(base, &rule.target);
+        }
+        for rule in &mut self.delegation_scope.deny {
             rule.target = join_if_relative(base, &rule.target);
         }
         if let Some(ref mut memory) = self.memory
@@ -288,6 +298,7 @@ impl PodManifestConfig {
             model: self.model.merge(upper.model),
             worker: self.worker.merge(upper.worker),
             scope: merge_scope(self.scope, upper.scope),
+            delegation_scope: merge_scope(self.delegation_scope, upper.delegation_scope),
             session: merge_option(self.session, upper.session, SessionConfigPartial::merge),
             permissions: merge_option(
                 self.permissions,
@@ -588,6 +599,12 @@ impl TryFrom<PodManifestConfig> for PodManifest {
         for rule in &cfg.scope.deny {
             ensure_absolute("scope.deny.target", &rule.target)?;
         }
+        for rule in &cfg.delegation_scope.allow {
+            ensure_absolute("delegation_scope.allow.target", &rule.target)?;
+        }
+        for rule in &cfg.delegation_scope.deny {
+            ensure_absolute("delegation_scope.deny.target", &rule.target)?;
+        }
         let session = SessionConfig {
             record_event_trace: cfg
                 .session
@@ -670,6 +687,7 @@ impl TryFrom<PodManifestConfig> for PodManifest {
             model: cfg.model,
             worker,
             scope: cfg.scope,
+            delegation_scope: cfg.delegation_scope,
             session,
             permissions,
             compaction,
@@ -715,6 +733,7 @@ mod tests {
                 }],
                 deny: Vec::new(),
             },
+            delegation_scope: ScopeConfig::default(),
             permissions: None,
             session: None,
             compaction: None,
