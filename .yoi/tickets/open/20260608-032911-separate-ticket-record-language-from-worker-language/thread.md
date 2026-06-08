@@ -252,3 +252,84 @@ Pending:
 - No merge, close, final approval, or cleanup has occurred for this Ticket.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-08T08:18:46Z -->
+
+## Implementation report
+
+Merge-ready dossier: Ticket record language policy
+
+Ticket id/slug:
+- `20260608-032911-separate-ticket-record-language-from-worker-language` / `separate-ticket-record-language-from-worker-language`
+
+Branch/worktree:
+- Branch: `separate-ticket-record-language-from-worker-language`
+- Worktree: `.worktree/separate-ticket-record-language-from-worker-language`
+- Current branch commit:
+  - `fb261bb feat: add ticket record language config`
+
+Intent / invariant check:
+- `worker.language` remains conversational response language.
+- `memory.language` remains memory/Knowledge generation language.
+- New `ticket.language` config controls durable Ticket record language and role guidance where Ticket records are written.
+- Existing Tickets were not bulk-translated or rewritten by the implementation commit.
+- Role prompt guidance is committed launch input, not hidden context-only injection.
+- Non-translateable literals such as paths, commands, logs, identifiers, and quoted text remain outside language conversion policy.
+
+Implementation summary:
+- Added optional `[ticket].language` config parsing and blank-string validation.
+- Added scaffold/example support for `yoi ticket init`.
+- Set this repository's `.yoi/ticket.config.toml` to `[ticket] language = "Japanese"`.
+- Added Ticket record language to `TicketRoleLaunchContext` and role launch prompt guidance independent from worker/memory language.
+- Added `LocalTicketBackend::with_record_language()` / `record_language()` and propagated configured language through CLI, built-in Ticket feature, and Panel backend construction.
+- Added minimal generated-text coverage for Japanese, including create default body/thread, prominent state/close/intake-ready generated events, and Panel auto-close resolution.
+- Preserved default behavior when config is absent and falls back to English/default generated text for unsupported backend generated languages.
+
+Files touched:
+- `.yoi/ticket.config.toml`
+- `crates/ticket/src/config.rs`
+- `crates/ticket/src/lib.rs`
+- `crates/ticket/src/tool.rs`
+- `crates/client/src/ticket_role.rs`
+- `crates/pod/src/feature/builtin/ticket.rs`
+- `crates/tui/src/workspace_panel.rs`
+- `crates/tui/src/multi_pod.rs`
+- `crates/yoi/src/ticket_cli.rs`
+
+Coder / reviewer Pods:
+- Coder: `coder-ticket-record-language`
+- Reviewer: `reviewer-ticket-record-language`
+
+Review evidence:
+- Reviewer verdict: `approve`.
+- Reviewer confirmed config parsing/scaffold/default/blank rejection, role prompt propagation independent from worker/memory language, durable prompt input path rather than hidden context injection, config propagation through CLI/feature/Panel backends, and no implementation-commit bulk rewrite of existing Tickets.
+
+Validation performed by coder and/or reviewer:
+- `cargo test -p ticket config::tests --lib`
+- `cargo test -p ticket create_uses_configured_japanese_record_language_for_generated_defaults --lib`
+- `cargo test -p client configured_ticket_record_language_is_included_in_role_prompt --lib`
+- `cargo test -p yoi ticket_cli_init_writes_explicit_ticket_config_scaffold`
+- `cargo test -p client ticket_role --lib`
+- `cargo test -p ticket --lib`
+- `cargo check -p pod -p tui`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo run -q -p yoi -- ticket doctor`
+- `nix build .#yoi`
+
+Blockers fixed or rejected findings:
+- No reviewer blockers.
+
+Residual risks:
+- Japanese generated-text coverage is intentionally minimal, not full localization. Generic thread headings, some Panel/Defer decision bodies, and tool success output may remain English unless separately localized later.
+- Japanese handling helpers are duplicated between Ticket crate and TUI for now; centralization may be useful if supported languages or generated paths expand.
+- Branch was reviewed before later main merges that touched `crates/client/src/ticket_role.rs`; merge-completion must preserve both this Ticket's language guidance and later cwd/intake role guidance.
+
+Dirty state:
+- Child worktree is clean at `fb261bb`.
+- Main workspace has unrelated Ticket-record edits for queued/intake work; they are outside this branch's core implementation paths and are understood.
+
+Parent/human decision needs:
+- User has authorized merge-completion and cleanup after approved work. Proceeding to merge-completion unless merge conflict or post-merge validation fails.
+
+---
