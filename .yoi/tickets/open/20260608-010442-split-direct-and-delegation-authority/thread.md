@@ -236,3 +236,29 @@ Pending:
 - No merge, close, final approval, or cleanup has occurred for this Ticket.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-08T06:31:13Z -->
+
+## Implementation report
+
+Reviewer returned `request_changes`; coder fix-loop delegated.
+
+Reviewer verdict:
+- `request_changes`
+
+Blocker:
+- `DelegationScope::allows_rule` / `rule_covers` over-approves subset delegation for `recursive = false` parent grants.
+- A parent grant such as `/repo` with `recursive = false` permits only `/repo` and direct children, but a requested child grant `/repo/child` with `recursive = false` permits `/repo/child` plus its direct children. That includes `/repo/child/grandchild`, which exceeds the parent grant.
+- Current `direct_child(&requested.target, &available.target)` coverage treats this as allowed, weakening path validation.
+
+Related reviewer concern:
+- Deny overlap logic around the same code may under-detect overlaps for non-recursive deny versus recursive request, e.g. deny `/repo` non-recursive should overlap a recursive request rooted at `/repo/child` because the deny covers `/repo/child`.
+
+Action taken:
+- Sent fix-loop instructions to `coder-split-direct-delegation` with required subset/overlap tests for recursive/non-recursive semantics.
+
+Pending:
+- Await coder fix report and reviewer re-review.
+- No merge, close, final approval, or cleanup has occurred.
+
+---
