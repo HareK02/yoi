@@ -2,13 +2,13 @@
 id: '20260608-015630-abort-podclient-reader-task-on-drop'
 slug: 'abort-podclient-reader-task-on-drop'
 title: 'Abort PodClient reader task on drop'
-status: 'open'
+status: 'closed'
 kind: 'task'
 priority: 'P1'
 labels: ['client', 'pod', 'tui', 'fd-leak', 'bug']
-workflow_state: 'inprogress'
+workflow_state: 'done'
 created_at: '2026-06-08T01:56:30Z'
-updated_at: '2026-06-08T02:52:51Z'
+updated_at: '2026-06-08T02:54:31Z'
 assignee: null
 legacy_ticket: null
 queued_by: 'workspace-panel'
