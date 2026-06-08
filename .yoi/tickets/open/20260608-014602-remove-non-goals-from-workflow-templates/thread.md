@@ -147,3 +147,42 @@ Stop condition:
 - This Orchestrator will stop at a merge-ready dossier; no merge, close, final approval, or cleanup in this phase.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-08T02:05:05Z -->
+
+## Implementation report
+
+Coder completed and reviewer delegated.
+
+Coder result:
+- Pod: `coder-remove-non-goals-workflow`
+- Commit: `783cd42 workflow: replace non-goals template language`
+- Worktree status: clean after commit.
+- Diff against `develop`: 6 files changed, 38 insertions, 43 deletions.
+
+Files touched by coder:
+- `.yoi/workflow/ticket-intake-workflow.md`
+- `.yoi/workflow/ticket-orchestrator-routing.md`
+- `.yoi/workflow/ticket-preflight-workflow.md`
+- `.yoi/workflow/multi-agent-workflow.md`
+- `crates/client/src/ticket_role.rs`
+- `docs/development/work-items.md`
+
+Coder reported validation:
+- `cargo fmt --check`
+- `cargo test -p client ticket_role`
+- maintained-hit search excluding historic Tickets and generated/target paths
+- `git diff --check`
+- `cargo run -q -p yoi -- ticket doctor`
+- `nix build .#yoi`
+
+Reviewer delegation:
+- Spawned sibling reviewer Pod: `reviewer-remove-non-goals-workflow`.
+- Reviewer scope: read-only child worktree plus non-recursive parent-root read required by launch cwd validation.
+- Reviewer was instructed to judge against the recorded Ticket requirements and binding decisions.
+
+Pending:
+- Await reviewer verdict before merge-ready dossier.
+- No merge, close, final approval, or cleanup has occurred for this Ticket.
+
+---

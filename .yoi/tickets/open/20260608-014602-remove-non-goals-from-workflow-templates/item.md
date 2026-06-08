@@ -8,7 +8,7 @@ priority: 'P2'
 labels: ['workflow', 'prompt', 'ticket', 'orchestration', 'cleanup']
 workflow_state: 'inprogress'
 created_at: '2026-06-08T01:46:02Z'
-updated_at: '2026-06-08T01:50:56Z'
+updated_at: '2026-06-08T02:05:05Z'
 assignee: null
 legacy_ticket: null
 queued_by: 'workspace-panel'
