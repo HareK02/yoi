@@ -180,3 +180,66 @@ Pending:
 - No merge, close, final approval, or cleanup has occurred for this Ticket.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-08T02:52:51Z -->
+
+## Implementation report
+
+Merge-ready dossier: PodClient reader task cleanup
+
+Ticket id/slug:
+- `20260608-015630-abort-podclient-reader-task-on-drop` / `abort-podclient-reader-task-on-drop`
+
+Branch/worktree:
+- Branch: `abort-podclient-reader-task-on-drop`
+- Worktree: `.worktree/abort-podclient-reader-task-on-drop`
+- Current branch commit:
+  - `aec75b3 fix: abort PodClient reader task on drop`
+
+Intent / invariant check:
+- `PodClient` now owns the background reader task spawned by `PodClient::connect()`.
+- Dropping `PodClient` aborts the reader task and releases the socket read half without relying on remote close.
+- Live client send/receive behavior remains intact.
+- No Pod socket protocol, event format, controller behavior, registry semantics, or panel polling policy changes were introduced.
+
+Implementation summary:
+- Added an owned `reader_task: JoinHandle<()>` field to `PodClient`.
+- Stored the `tokio::spawn` handle for the background reader task.
+- Implemented `Drop` for `PodClient` to call `reader_task.abort()`.
+- Added focused regression tests for alive receive/send behavior, repeated connect/drop cleanup, and aborting a blocked reader task.
+
+Files touched:
+- `crates/client/src/pod_client.rs`
+
+Coder / reviewer Pods:
+- Coder: `coder-abort-podclient-reader`
+- Reviewer: `reviewer-abort-podclient-reader`
+
+Review evidence:
+- Reviewer verdict: `approve`.
+- Reviewer inspected `develop...aec75b3`, confirmed only `crates/client/src/pod_client.rs` changed, and confirmed the owned `JoinHandle` + `Drop::abort` implementation.
+- Reviewer confirmed public client methods remain unchanged and the regression tests target the reported leak mode, including a blocked reader on incomplete JSON.
+
+Validation performed by coder and/or reviewer:
+- `cargo test -p client pod_client --lib`
+- `cargo test -p client --lib`
+- `cargo test -p tui pod_list --lib`
+- `cargo fmt --check`
+- `git diff --check develop...aec75b3`
+- `cargo run -q -p yoi -- ticket doctor`
+- `nix build .#yoi`
+
+Blockers fixed or rejected findings:
+- No reviewer blockers.
+
+Residual risks:
+- `Drop` aborts but cannot await task cancellation completion; reviewer judged this normal for `Drop`, and the observable socket cleanup tests cover the required behavior.
+
+Dirty state:
+- Child worktree is clean at `aec75b3`.
+- Main workspace has unrelated Ticket-record edits for other active/new Tickets; they are outside this branch's touched paths and are understood.
+
+Parent/human decision needs:
+- User has authorized merge-completion and cleanup after approved work. Proceeding to merge-completion unless post-merge validation fails.
+
+---

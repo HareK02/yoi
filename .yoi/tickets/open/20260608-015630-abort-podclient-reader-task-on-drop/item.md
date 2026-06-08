@@ -8,7 +8,7 @@ priority: 'P1'
 labels: ['client', 'pod', 'tui', 'fd-leak', 'bug']
 workflow_state: 'inprogress'
 created_at: '2026-06-08T01:56:30Z'
-updated_at: '2026-06-08T02:50:42Z'
+updated_at: '2026-06-08T02:52:51Z'
 assignee: null
 legacy_ticket: null
 queued_by: 'workspace-panel'
