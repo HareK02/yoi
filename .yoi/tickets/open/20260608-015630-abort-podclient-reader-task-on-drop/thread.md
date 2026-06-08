@@ -112,3 +112,29 @@ Critical risks / reviewer focus:
 Accepted queued implementation after reading the Ticket, workspace state, and `PodClient` code map. This acceptance precedes worktree creation and coder/reviewer Pod spawning.
 
 ---
+
+<!-- event: plan author: orchestrator at: 2026-06-08T02:42:29Z -->
+
+## Plan
+
+Implementation routing accepted and worktree created.
+
+Worktree plan:
+- Branch: `abort-podclient-reader-task-on-drop`
+- Worktree: `.worktree/abort-podclient-reader-task-on-drop`
+- Base: `89b4369 ticket: route podclient reader cleanup`
+- Scope: implement `PodClient` reader-task owned cancellation and focused cleanup tests.
+
+Delegation plan:
+- Spawn sibling coder Pod with write scope limited to `.worktree/abort-podclient-reader-task-on-drop`.
+- Coder must run Bash commands from the child worktree, not from the main workspace.
+- Coder must not edit main-workspace `.yoi` / Ticket / workflow / docs records, and must not create generated memory/local/runtime/secret-like files.
+- Reviewer will be spawned read-only after coder reports diff/commits and validation evidence.
+
+Concurrency note:
+- Main workspace has unrelated Ticket-record edits for other queued/intake work. This implementation is isolated to the child worktree and should not edit those records.
+
+Stop/completion policy:
+- Because the human authorized cleanup after completion, this Orchestrator will proceed through reviewer approval, merge-completion validation, Ticket close, Pod stop, worktree removal, and branch deletion if the branch is approved and merge authority remains clear.
+
+---
