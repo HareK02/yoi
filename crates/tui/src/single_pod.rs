@@ -203,7 +203,6 @@ pub(crate) async fn run_panel(
                         return Err(error);
                     }
                 }
-                app.reload_or_notice().await;
             }
         }
     }
