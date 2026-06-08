@@ -71,6 +71,8 @@ pod_orchestration_guidance_section = "{% include \"$yoi/common/pod-orchestration
 spawn_pod_tool_description = """\
 Spawn a new Pod process to work on a delegated task. The spawner's write scope is reduced by the scope passed here; the spawned Pod receives its own socket and starts running `task` immediately. The spawned Pod outlives the spawner's current turn and can be contacted again through its socket path.
 
+Optional `cwd`: when provided, it is the child process/tool default working directory only. It must be an absolute existing directory covered by the child's delegated readable scope, and it does not change workspace/Profile/memory/Ticket roots or grant authority.
+
 Profile selection: `profile` may be omitted or set to `default` to use the effective child default profile, set to `inherit` to derive reusable child configuration from this Pod, or set to one of the registry selectors below. Raw/path profile selectors are not accepted by SpawnPod. `scope` is always the only delegated filesystem capability; profile scope is replaced by the explicit SpawnPod scope.
 
 Default profile: {{ default_profile }}

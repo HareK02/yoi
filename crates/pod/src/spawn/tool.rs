@@ -18,7 +18,7 @@ use manifest::{
     CompactionConfigPartial, DelegationScope, FileUploadLimitsPartial, Permission,
     PermissionConfigPartial, PodManifest, PodManifestConfig, PodMetaConfig, ProfileDiscovery,
     ProfileError, ProfileRegistry, ProfileRegistrySource, ProfileResolveOptions, ProfileResolver,
-    ProfileSelector, ScopeConfig, ScopeRule, SessionConfigPartial, SharedScope,
+    ProfileSelector, Scope, ScopeConfig, ScopeRule, SessionConfigPartial, SharedScope,
     ToolOutputLimitsPartial, WorkerManifestConfig,
 };
 use serde::Deserialize;
@@ -52,6 +52,11 @@ struct SpawnPodInput {
     /// Instruction-file reference (e.g. `$yoi/default`, `$user/my-agent`).
     #[serde(default)]
     instruction: Option<String>,
+    /// Child process/tool working directory. This is not the runtime workspace
+    /// root and grants no filesystem authority. When omitted, the spawned Pod
+    /// starts in the spawner's current working directory.
+    #[serde(default)]
+    cwd: Option<PathBuf>,
     /// First message sent to the spawned Pod via `Method::Run`.
     task: String,
     /// Allow rules delegated to the spawned Pod. Must be a subset of the
@@ -304,6 +309,7 @@ impl Tool for SpawnPodTool {
 
         let scope_allow = parse_scope(&input.scope)?;
         self.validate_delegation_scope(&scope_allow)?;
+        let child_cwd = validate_spawn_cwd(input.cwd.as_deref(), &scope_allow, &self.spawner_pwd)?;
 
         let spawn_selector =
             parse_spawn_profile_selector(input.profile.as_deref()).map_err(|msg| {
@@ -349,7 +355,12 @@ impl Tool for SpawnPodTool {
         // entry on exit.
 
         let start_outcome = self
-            .exec_child(&input.name, &spawn_config_json, &predicted_socket)
+            .exec_child(
+                &input.name,
+                &spawn_config_json,
+                &predicted_socket,
+                &child_cwd,
+            )
             .await;
         if let Err(e) = start_outcome {
             self.release_reservation(&lock_path, &input.name);
@@ -422,6 +433,7 @@ impl SpawnPodTool {
         pod_name: &str,
         spawn_config_json: &str,
         predicted_socket: &Path,
+        child_cwd: &Path,
     ) -> Result<(), ToolError> {
         let runtime_command = match &self.runtime_command {
             Some(command) => command.clone(),
@@ -458,7 +470,7 @@ impl SpawnPodTool {
             .arg(&self.callback_socket)
             .arg("--spawn-config-json")
             .arg(spawn_config_json)
-            .current_dir(&self.spawner_pwd)
+            .current_dir(child_cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::from(stderr_file))
@@ -529,6 +541,60 @@ fn parse_scope(rules: &[ScopeRuleInput]) -> Result<Vec<ScopeRule>, ToolError> {
             })
         })
         .collect()
+}
+
+fn validate_spawn_cwd(
+    cwd: Option<&Path>,
+    scope_allow: &[ScopeRule],
+    default_cwd: &Path,
+) -> Result<PathBuf, ToolError> {
+    let Some(cwd) = cwd else {
+        return Ok(default_cwd.to_path_buf());
+    };
+    if !cwd.is_absolute() {
+        return Err(ToolError::InvalidArgument(format!(
+            "SpawnPod.cwd must be absolute: {}",
+            cwd.display()
+        )));
+    }
+    let metadata = std::fs::metadata(cwd).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            ToolError::InvalidArgument(format!("SpawnPod.cwd does not exist: {}", cwd.display()))
+        } else {
+            ToolError::InvalidArgument(format!(
+                "SpawnPod.cwd is not usable: {}: {e}",
+                cwd.display()
+            ))
+        }
+    })?;
+    if !metadata.is_dir() {
+        return Err(ToolError::InvalidArgument(format!(
+            "SpawnPod.cwd must be a directory: {}",
+            cwd.display()
+        )));
+    }
+    let canonical = std::fs::canonicalize(cwd).map_err(|e| {
+        ToolError::InvalidArgument(format!(
+            "SpawnPod.cwd is not usable: {}: {e}",
+            cwd.display()
+        ))
+    })?;
+    let child_scope = Scope::from_config(&ScopeConfig {
+        allow: scope_allow.to_vec(),
+        deny: Vec::new(),
+    })
+    .map_err(|e| {
+        ToolError::InvalidArgument(format!(
+            "requested child scope cannot validate SpawnPod.cwd: {e}"
+        ))
+    })?;
+    if !child_scope.is_readable(&canonical) {
+        return Err(ToolError::InvalidArgument(format!(
+            "SpawnPod.cwd {} is outside the child's delegated readable scope; cwd grants no authority, so add an explicit read or write scope rule covering it",
+            cwd.display()
+        )));
+    }
+    Ok(canonical)
 }
 
 /// Serialise the internal manifest config that gets handed to the child
@@ -909,6 +975,63 @@ mod tests {
             target: path.to_path_buf(),
             permission,
             recursive: true,
+        }
+    }
+
+    #[test]
+    fn spawn_pod_input_schema_includes_optional_cwd() {
+        let schema = serde_json::to_value(schemars::schema_for!(SpawnPodInput)).unwrap();
+        let properties = schema
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .expect("schema properties");
+        assert!(properties.contains_key("cwd"), "schema: {schema}");
+        let required = schema
+            .get("required")
+            .and_then(serde_json::Value::as_array)
+            .expect("schema required list");
+        assert!(
+            !required.iter().any(|value| value.as_str() == Some("cwd")),
+            "cwd must remain optional: {schema}"
+        );
+    }
+
+    #[test]
+    fn spawn_pod_validate_cwd_requires_absolute_existing_directory_in_child_scope() {
+        let root = TempDir::new().unwrap();
+        let child_cwd = root.path().join("child");
+        std::fs::create_dir(&child_cwd).unwrap();
+        let file_path = root.path().join("file.txt");
+        std::fs::write(&file_path, "not a dir").unwrap();
+        let outside = TempDir::new().unwrap();
+        let missing = root.path().join("missing");
+        let rules = vec![abs_rule(root.path(), Permission::Write)];
+
+        assert_eq!(
+            validate_spawn_cwd(None, &rules, root.path()).unwrap(),
+            root.path()
+        );
+        assert_eq!(
+            validate_spawn_cwd(Some(&child_cwd), &rules, root.path()).unwrap(),
+            std::fs::canonicalize(&child_cwd).unwrap()
+        );
+
+        for (cwd, expected) in [
+            (Path::new("relative"), "must be absolute"),
+            (missing.as_path(), "does not exist"),
+            (file_path.as_path(), "must be a directory"),
+            (
+                outside.path(),
+                "outside the child's delegated readable scope",
+            ),
+        ] {
+            let err = validate_spawn_cwd(Some(cwd), &rules, root.path()).unwrap_err();
+            match err {
+                ToolError::InvalidArgument(message) => {
+                    assert!(message.contains(expected), "{message}")
+                }
+                other => panic!("expected InvalidArgument, got {other:?}"),
+            }
         }
     }
 

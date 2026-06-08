@@ -145,6 +145,30 @@ fn mock_runtime_command() -> PodRuntimeCommand {
     PodRuntimeCommand::new(which_true(), Vec::new())
 }
 
+fn cwd_recording_runtime_command(script_path: &Path, output_path: &Path) -> PodRuntimeCommand {
+    std::fs::write(script_path, "pwd > \"$1\"\n").unwrap();
+    PodRuntimeCommand::new(
+        which_sh(),
+        vec![
+            script_path.as_os_str().to_os_string(),
+            output_path.as_os_str().to_os_string(),
+        ],
+    )
+}
+
+async fn read_recorded_pwd(output_path: &Path) -> String {
+    for _ in 0..50 {
+        if let Ok(content) = std::fs::read_to_string(output_path) {
+            return content.trim_end().to_string();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!(
+        "runtime command did not record pwd at {}",
+        output_path.display()
+    );
+}
+
 /// `/bin/true` only exists on FHS-compliant systems. Resolve it via PATH
 /// so the tests work regardless of distro.
 fn which_true() -> String {
@@ -158,6 +182,19 @@ fn which_true() -> String {
         }
     }
     "/bin/true".into()
+}
+
+fn which_sh() -> String {
+    for dir in std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
+        .unwrap_or_default()
+    {
+        let candidate = dir.join("sh");
+        if candidate.is_file() {
+            return candidate.to_string_lossy().into_owned();
+        }
+    }
+    "/bin/sh".into()
 }
 
 /// Tests don't exercise the model — they intercept the spawned
@@ -229,6 +266,108 @@ fn clear_env() {
     unsafe {
         std::env::remove_var("YOI_RUNTIME_DIR");
     }
+}
+
+#[tokio::test]
+async fn spawn_pod_runs_child_process_in_provided_cwd() {
+    let _env = EnvGuard::acquire();
+
+    let allow_root = TempDir::new().unwrap();
+    let child_cwd = allow_root.path().join("child-cwd");
+    std::fs::create_dir(&child_cwd).unwrap();
+    let script = allow_root.path().join("record-pwd.sh");
+    let output_path = allow_root.path().join("pwd.txt");
+    let (_tmp, runtime_base, spawner_socket, spawner_rd) =
+        setup_spawner("root", allow_root.path()).await;
+
+    let (_predicted_socket, listener) = bind_mock_pod_socket(&runtime_base, "child-cwd").await;
+    let received = accept_one_method(listener);
+
+    let registry = SpawnedPodRegistry::new(spawner_rd);
+    let def = spawn_pod_tool_with_runtime_command(
+        "root".into(),
+        spawner_socket,
+        runtime_base,
+        allow_root.path().to_path_buf(),
+        registry,
+        None,
+        dummy_manifest(allow_root.path()),
+        shared_scope_for(allow_root.path()),
+        builtin_prompts(),
+        cwd_recording_runtime_command(&script, &output_path),
+    );
+    let (_meta, tool) = def();
+
+    let input = json!({
+        "name": "child-cwd",
+        "task": "hello",
+        "profile": "inherit",
+        "cwd": child_cwd.to_str().unwrap(),
+        "scope": [{
+            "target": allow_root.path().to_str().unwrap(),
+            "permission": "write"
+        }]
+    })
+    .to_string();
+
+    tool.execute(&input).await.unwrap();
+    assert!(matches!(received.await.unwrap(), Some(Method::Run { .. })));
+    assert_eq!(
+        read_recorded_pwd(&output_path).await,
+        child_cwd.to_str().unwrap()
+    );
+
+    clear_env();
+}
+
+#[tokio::test]
+async fn spawn_pod_omitted_cwd_preserves_spawner_pwd() {
+    let _env = EnvGuard::acquire();
+
+    let allow_root = TempDir::new().unwrap();
+    let script = allow_root.path().join("record-pwd.sh");
+    let output_path = allow_root.path().join("pwd.txt");
+    let (_tmp, runtime_base, spawner_socket, spawner_rd) =
+        setup_spawner("root", allow_root.path()).await;
+
+    let (_predicted_socket, listener) =
+        bind_mock_pod_socket(&runtime_base, "child-default-cwd").await;
+    let received = accept_one_method(listener);
+
+    let registry = SpawnedPodRegistry::new(spawner_rd);
+    let def = spawn_pod_tool_with_runtime_command(
+        "root".into(),
+        spawner_socket,
+        runtime_base,
+        allow_root.path().to_path_buf(),
+        registry,
+        None,
+        dummy_manifest(allow_root.path()),
+        shared_scope_for(allow_root.path()),
+        builtin_prompts(),
+        cwd_recording_runtime_command(&script, &output_path),
+    );
+    let (_meta, tool) = def();
+
+    let input = json!({
+        "name": "child-default-cwd",
+        "task": "hello",
+        "profile": "inherit",
+        "scope": [{
+            "target": allow_root.path().to_str().unwrap(),
+            "permission": "write"
+        }]
+    })
+    .to_string();
+
+    tool.execute(&input).await.unwrap();
+    assert!(matches!(received.await.unwrap(), Some(Method::Run { .. })));
+    assert_eq!(
+        read_recorded_pwd(&output_path).await,
+        allow_root.path().to_str().unwrap()
+    );
+
+    clear_env();
 }
 
 #[tokio::test]
