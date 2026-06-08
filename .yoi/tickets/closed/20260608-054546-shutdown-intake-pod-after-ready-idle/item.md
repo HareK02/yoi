@@ -2,13 +2,13 @@
 id: '20260608-054546-shutdown-intake-pod-after-ready-idle'
 slug: 'shutdown-intake-pod-after-ready-idle'
 title: 'Shutdown Intake Pod after TicketIntakeReady returns to Idle'
-status: 'open'
+status: 'closed'
 kind: 'task'
 priority: 'P2'
 labels: ['ticket', 'intake', 'pod', 'lifecycle', 'panel']
-workflow_state: 'inprogress'
+workflow_state: 'done'
 created_at: '2026-06-08T05:45:46Z'
-updated_at: '2026-06-08T08:10:43Z'
+updated_at: '2026-06-08T08:12:36Z'
 assignee: null
 legacy_ticket: null
 queued_by: 'workspace-panel'
