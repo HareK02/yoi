@@ -102,3 +102,31 @@ Spawned sibling Coder Pod:
 Note: an unrelated Ticket record update (`tui-composer-history-persistence` ready state) and project known-issues/objective records were committed before routing so the main workspace was clean enough for implementation side effects.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-08T13:26:21Z -->
+
+## Implementation report
+
+Coder implementation completed and is ready for sibling review.
+
+Coder Pod:
+- `coder-tui-chat-markdown-table-rendering`
+- Commit: `f767ec7a5945aff588fe0b8ce224b30efe4c2a85 tui: render markdown pipe tables in chat`
+- Worktree status before review: clean branch `tui-chat-markdown-table-rendering`
+- Stopped after collecting output to reclaim delegated worktree scope.
+
+Implementation summary:
+- Adds `pulldown-cmark` table event handling to `crates/tui/src/markdown.rs`.
+- Enables `Options::ENABLE_TABLES` in the TUI chat Markdown renderer.
+- Converts ordinary Markdown pipe tables into readable monospace rows with box separators and alignment-aware padding.
+- Keeps changes in the rendering layer only; no Pod/session/history/context storage changes.
+- Adds focused tests for readable table rendering, malformed/ragged/wide safety, and non-table pipe text regression.
+
+Coder-reported validation:
+- `cargo test -p tui markdown -- --nocapture` -> 17 passed
+- `cargo fmt --check` -> OK
+- `git diff --check` -> OK
+- `cargo check --workspace` -> OK
+- `nix build .#yoi` -> OK
+
+---
