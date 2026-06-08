@@ -226,3 +226,55 @@ Critical risks / reviewer focus:
 Accepted queued implementation bundle after shared preflight boundary and routing IntentPacket were recorded. This acceptance precedes worktree creation and coder/reviewer Pod spawning.
 
 ---
+
+<!-- event: plan author: orchestrator at: 2026-06-08T00:58:10Z -->
+
+## Plan
+
+Implementation routing accepted and worktree created.
+
+Worktree plan:
+- Branch: `runtime-workspace-context`
+- Worktree: `.worktree/runtime-workspace-context`
+- Base: `9df7f4e ticket: record workspace identity routing`
+- Scope: coordinated implementation bundle for `introduce-runtime-workspace-root-context`, `remove-profile-derived-pod-names`, and `use-workspace-basename-for-default-pod-name`.
+
+Delegation plan:
+- Spawn sibling coder Pod with write scope limited to `.worktree/runtime-workspace-context`.
+- Coder must run Bash commands from the child worktree, not from the main workspace.
+- Coder must not edit main-workspace `.yoi` / Ticket / workflow / docs records, and must not create generated memory/local/runtime/secret-like files.
+- Reviewer will be spawned read-only after coder reports diff/commits and validation evidence.
+
+Stop condition:
+- This Orchestrator will stop at a merge-ready dossier; no merge, close, final approval, or cleanup in this phase.
+
+---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-08T00:59:49Z -->
+
+## Implementation report
+
+Implementation delegation blocked after inprogress acceptance.
+
+What succeeded:
+- Transitioned the coordinated bundle Tickets from `queued` to `inprogress` before implementation side effects.
+- Created branch/worktree `runtime-workspace-context` at `.worktree/runtime-workspace-context`.
+
+Blocker:
+- Spawning the sibling coder Pod with narrow delegated scope to the child worktree failed:
+  - requested scope: `/home/hare/Projects/yoi/.worktree/runtime-workspace-context`
+  - error: `requested scope ... is not within spawner yoi-orchestrator's effective scope`
+- Retrying at `/home/hare/Projects/yoi/.worktree` failed with the same scope-boundary error.
+
+Current state:
+- No coder/reviewer Pods were spawned.
+- No implementation edits have been made in the worktree.
+- The Ticket remains `inprogress` because the Orchestrator already accepted the queued bundle and created the worktree; this is now an in-progress delegation/scope recovery issue rather than a queued routing issue.
+
+Next recovery options:
+- Relaunch/restore an Orchestrator whose delegable scope includes `.worktree/**` and spawn the coder with narrow worktree scope.
+- Or explicitly authorize a different delegation scope/path if the current scope policy intentionally excludes `.worktree`.
+
+No merge, close, cleanup, or final approval has occurred.
+
+---
