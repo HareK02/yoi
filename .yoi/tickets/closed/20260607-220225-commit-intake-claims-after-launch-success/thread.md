@@ -272,3 +272,66 @@ Parent/human decision needs:
 - User has authorized merge-completion and cleanup after approved work. Proceeding to merge-completion unless post-merge validation fails.
 
 ---
+
+<!-- event: review author: orchestrator at: 2026-06-08T03:32:34Z status: approve -->
+
+## Review: approve
+
+Final merge-completion approval after merge to `develop` and post-merge validation.
+
+Evidence:
+- Merged branch `commit-intake-claims-after-launch-success` with `--no-ff`.
+- Reviewer `reviewer-commit-intake-claims` approved the branch-local implementation.
+- Post-merge validation passed: `cargo test -p tui role_session_registry --lib`, `cargo test -p tui multi_pod --lib`, `cargo check -q`, `cargo fmt --check`, `git diff --check`, `cargo run -q -p yoi -- ticket doctor`, and `nix build .#yoi`.
+- Coder/reviewer Pods stopped and delegated scope reclaimed.
+- Merged worktree removed and branch deleted.
+
+This approval is for the merged main-branch result, not merely the branch-local reviewer verdict.
+
+---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-08T03:32:34Z from: inprogress to: done reason: merged_and_validated field: workflow_state -->
+
+## State changed
+
+Merged to `develop`, post-merge validation passed, final merge-completion approval recorded, and Intake claim branch/worktree/Pods cleaned up.
+
+---
+
+<!-- event: close author: hare at: 2026-06-08T03:32:46Z status: closed -->
+
+## Closed
+
+Merged and completed the Intake claim commit timing fix.
+
+Summary:
+- Existing-Ticket Intake durable claim persistence now happens only after `launch_ticket_role_pod_with_options(...).await?` returns successfully with launch/run acceptance evidence.
+- Pre-launch durable `claim_ticket(...)` was removed from `prepare_existing_ticket_intake_launch`.
+- Deferred `IntakeRegistryUpdate::ClaimTicket` is committed by `commit_intake_registry_update(...)` after launch success.
+- Existing live/restorable claims still block duplicate Intake launch before launch preparation.
+- In-flight duplicate protection remains transient via `self.sending`; it is not a durable claim.
+- Peer registration/handoff ordering is preserved.
+
+Merged branch/worktree:
+- Branch: `commit-intake-claims-after-launch-success`
+- Commit: `6797be3 fix: defer intake claim until launch acceptance`
+- Merge commit on `develop`: `3bc4ab2 merge: defer intake claims until launch success`
+
+Validation passed after merge:
+- `cargo test -p tui role_session_registry --lib`
+- `cargo test -p tui multi_pod --lib`
+- `cargo check -q`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo run -q -p yoi -- ticket doctor`
+- `nix build .#yoi`
+
+Cleanup completed:
+- Stopped coder/reviewer Pods and reclaimed scope.
+- Removed `.worktree/commit-intake-claims-after-launch-success`.
+- Deleted branch `commit-intake-claims-after-launch-success`.
+
+Residual note:
+- There is still no full mocked/integration test that drives spawn/connect/run-acceptance failure through `launch_intake_with_handoff` and then asserts registry emptiness. Reviewer accepted the explicit `await?` before registry commit and focused tests as sufficient for this Ticket.
+
+---

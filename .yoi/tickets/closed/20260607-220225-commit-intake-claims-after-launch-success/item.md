@@ -2,13 +2,13 @@
 id: 20260607-220225-commit-intake-claims-after-launch-success
 slug: commit-intake-claims-after-launch-success
 title: Commit Intake ticket claims only after successful launch
-status: open
+status: 'closed'
 kind: task
 priority: P1
 labels: [tui, panel, ticket, intake, bug]
-workflow_state: 'inprogress'
+workflow_state: 'done'
 created_at: 2026-06-07T22:02:25Z
-updated_at: '2026-06-08T03:31:31Z'
+updated_at: '2026-06-08T03:32:46Z'
 assignee: null
 legacy_ticket: null
 queued_by: 'workspace-panel'
