@@ -9,7 +9,6 @@ labels: [cli, packaging, tui, pod]
 created_at: 2026-05-29T00:13:26Z
 updated_at: 2026-05-29T00:39:08Z
 assignee: null
-legacy_ticket: null
 ---
 
 ## Background

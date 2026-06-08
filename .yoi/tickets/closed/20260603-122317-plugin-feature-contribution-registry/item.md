@@ -9,7 +9,6 @@ labels: [plugin, registry, tools, hooks, orchestration]
 created_at: 2026-06-03T12:23:17Z
 updated_at: 2026-06-04T22:26:37Z
 assignee: null
-legacy_ticket: null
 ---
 
 ## Issue

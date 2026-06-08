@@ -9,7 +9,6 @@ labels: [compaction, token-accounting]
 created_at: 2026-06-01T00:16:16Z
 updated_at: 2026-06-01T01:10:06Z
 assignee: null
-legacy_ticket: null
 ---
 
 ## Background

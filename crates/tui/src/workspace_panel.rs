@@ -621,7 +621,6 @@ fn ticket_summary_from_meta(meta: &TicketMeta) -> TicketSummary {
         priority: meta.priority.clone(),
         labels: meta.labels.clone(),
         readiness: meta.readiness.clone(),
-        needs_preflight: meta.needs_preflight,
         action_required: meta.action_required.clone(),
         workflow_state: meta.workflow_state,
         workflow_state_explicit: meta.workflow_state_explicit,
@@ -1103,7 +1102,6 @@ mod tests {
             "readiness-heuristic",
             |input| {
                 input.readiness = Some("implementation-ready".to_string());
-                input.needs_preflight = Some(false);
             },
         );
         create_ticket(&backend, "Label Heuristic", "label-heuristic", |input| {

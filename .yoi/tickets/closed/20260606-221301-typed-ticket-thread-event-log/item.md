@@ -9,7 +9,6 @@ labels: [ticket, orchestration, state, audit]
 created_at: 2026-06-06T22:13:01Z
 updated_at: 2026-06-06T22:48:18Z
 assignee: null
-legacy_ticket: null
 ---
 
 ## Background

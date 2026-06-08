@@ -9,7 +9,6 @@ labels: [hooks, feature-registry, history, task-reminder]
 created_at: 2026-06-05T00:48:07Z
 updated_at: 2026-06-05T01:26:06Z
 assignee: null
-legacy_ticket: null
 ---
 
 ## Issue

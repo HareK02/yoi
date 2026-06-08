@@ -9,7 +9,6 @@ labels: [ticket, feature, tool, orchestration]
 created_at: 2026-06-05T04:01:04Z
 updated_at: 2026-06-05T06:00:22Z
 assignee: null
-legacy_ticket: null
 ---
 
 ## Background

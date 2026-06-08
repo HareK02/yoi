@@ -9,7 +9,6 @@ labels: [pod, workflow, prompt]
 created_at: 2026-05-27T19:44:21Z
 updated_at: 2026-06-01T01:24:59Z
 assignee: null
-legacy_ticket: null
 ---
 
 ## Background

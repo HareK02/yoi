@@ -9,7 +9,6 @@ labels: [cli, pod, cargo]
 created_at: 2026-05-31T06:45:50Z
 updated_at: 2026-05-31T06:49:44Z
 assignee: null
-legacy_ticket: null
 ---
 
 ## Background

@@ -9,7 +9,6 @@ labels: [cli, architecture, nix]
 created_at: 2026-05-31T00:55:57Z
 updated_at: 2026-05-31T12:15:50Z
 assignee: null
-legacy_ticket: null
 ---
 
 ## Background

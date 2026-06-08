@@ -9,7 +9,6 @@ labels: [session-store, pod-store, pod, persistence, architecture]
 created_at: 2026-05-29T20:58:44Z
 updated_at: 2026-05-30T00:10:45Z
 assignee: null
-legacy_ticket: null
 ---
 
 ## Background

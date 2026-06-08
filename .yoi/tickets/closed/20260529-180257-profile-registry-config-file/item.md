@@ -9,7 +9,6 @@ labels: [manifest, profiles, config]
 created_at: 2026-05-29T18:02:57Z
 updated_at: 2026-05-29T18:11:10Z
 assignee: null
-legacy_ticket: null
 ---
 
 ## Background

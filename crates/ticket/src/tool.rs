@@ -110,9 +110,6 @@ struct TicketCreateParams {
     /// Optional assignee frontmatter value.
     #[serde(default)]
     assignee: Option<String>,
-    /// Optional legacy ticket reference frontmatter value.
-    #[serde(default)]
-    legacy_ticket: Option<String>,
     /// Optional readiness frontmatter value.
     #[serde(default)]
     readiness: Option<String>,
@@ -139,7 +136,6 @@ struct TicketCreateParams {
 #[derive(Debug, Clone, Copy, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 enum TicketWorkflowStateParam {
-    #[serde(alias = "intake")]
     Planning,
     Ready,
     Queued,
@@ -409,7 +405,6 @@ impl Tool for TicketCreateTool {
         }
         input.author = params.author;
         input.assignee = params.assignee;
-        input.legacy_ticket = params.legacy_ticket;
         input.readiness = params.readiness;
         input.risk_flags = params.risk_flags;
         input.action_required = params.action_required;
@@ -757,7 +752,6 @@ fn ticket_summary_json(ticket: TicketSummary) -> Value {
         "priority": ticket.priority,
         "labels": ticket.labels,
         "readiness": ticket.readiness,
-        "needs_preflight": ticket.needs_preflight,
         "action_required": ticket.action_required,
         "workflow_state": ticket.workflow_state.as_str(),
         "workflow_state_explicit": ticket.workflow_state_explicit,
@@ -814,9 +808,7 @@ fn ticket_json(
             "created_at": ticket.meta.created_at,
             "updated_at": ticket.meta.updated_at,
             "assignee": ticket.meta.assignee,
-            "legacy_ticket": ticket.meta.legacy_ticket,
             "readiness": ticket.meta.readiness,
-            "needs_preflight": ticket.meta.needs_preflight,
             "risk_flags": ticket.meta.risk_flags,
             "action_required": ticket.meta.action_required,
             "workflow_state": ticket.meta.workflow_state.as_str(),
@@ -1068,20 +1060,29 @@ mod tests {
         assert!(created.summary.contains("Created ticket"));
         let created_json: Value = serde_json::from_str(&created.content.unwrap()).unwrap();
         let id = created_json["id"].as_str().unwrap().to_string();
+        let created_text = created_json.to_string();
+        assert!(!created_text.contains("legacy_ticket"));
+        assert!(!created_text.contains("needs_preflight"));
 
         let listed = list
             .execute(&json!({ "status": "open", "label": "tool" }).to_string())
             .await
             .unwrap();
         assert!(listed.summary.contains("Listed 1 ticket"));
-        assert!(listed.content.unwrap().contains("Tool Created"));
+        let listed_content = listed.content.unwrap();
+        assert!(listed_content.contains("Tool Created"));
+        assert!(!listed_content.contains("legacy_ticket"));
+        assert!(!listed_content.contains("needs_preflight"));
 
         let shown = show
             .execute(&json!({ "id": id, "event_limit": 10 }).to_string())
             .await
             .unwrap();
         assert!(shown.summary.contains("tool-created"));
-        assert!(shown.content.unwrap().contains("Created by tool"));
+        let shown_content = shown.content.unwrap();
+        assert!(shown_content.contains("Created by tool"));
+        assert!(!shown_content.contains("legacy_ticket"));
+        assert!(!shown_content.contains("needs_preflight"));
 
         let report = doctor.execute(&json!({}).to_string()).await.unwrap();
         assert!(report.summary.contains("0 error(s)"));
@@ -1370,7 +1371,7 @@ mod tests {
                 &json!({
                     "ticket": done.id,
                     "from": "done",
-                    "to": "intake",
+                    "to": "planning",
                     "reason": "backwards",
                     "body": "Should not move backwards.\n"
                 })
@@ -1459,7 +1460,17 @@ mod tests {
     #[test]
     fn ticket_tool_definitions_have_expected_names_and_schemas() {
         let temp = TempDir::new().unwrap();
-        let names = ticket_tools(backend(&temp))
+        let tools = ticket_tools(backend(&temp));
+        let create_schema = tools
+            .iter()
+            .map(|definition| definition().0)
+            .find(|meta| meta.name == "TicketCreate")
+            .unwrap()
+            .input_schema
+            .to_string();
+        assert!(!create_schema.contains("legacy_ticket"));
+        assert!(!create_schema.contains("needs_preflight"));
+        let names = tools
             .into_iter()
             .map(|definition| definition().0)
             .map(|meta| {

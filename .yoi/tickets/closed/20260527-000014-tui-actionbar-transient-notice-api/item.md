@@ -9,7 +9,6 @@ labels: [migrated]
 created_at: 2026-05-27T00:00:14Z
 updated_at: 2026-05-29T03:57:35Z
 assignee: null
-legacy_ticket: tickets/tui-actionbar-transient-notice-api.md
 ---
 
 ## Migration reference

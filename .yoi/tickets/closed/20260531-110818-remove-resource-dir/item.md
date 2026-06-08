@@ -9,7 +9,6 @@ labels: [manifest, profile, nix, env, cleanup]
 created_at: 2026-05-31T11:08:18Z
 updated_at: 2026-05-31T11:58:28Z
 assignee: null
-legacy_ticket: null
 ---
 
 ## Background

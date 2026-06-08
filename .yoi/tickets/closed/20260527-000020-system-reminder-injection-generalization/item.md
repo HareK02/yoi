@@ -9,7 +9,6 @@ labels: [pod, llm-worker, history, system-reminder]
 created_at: 2026-05-27T00:00:20Z
 updated_at: 2026-05-29T05:05:43Z
 assignee: null
-legacy_ticket: null
 ---
 
 ## Background

@@ -10,7 +10,6 @@ workflow_state: done
 created_at: 2026-06-07T22:32:33Z
 updated_at: 2026-06-07T23:38:32Z
 assignee: null
-legacy_ticket: null
 queued_by: workspace-panel
 queued_at: 2026-06-07T22:43:03Z
 ---
@@ -21,7 +20,6 @@ Ticket `item.md` frontmatter is written in YAML-like syntax and uses YAML null v
 
 ```yaml
 assignee: null
-legacy_ticket: null
 attention_required: null
 queued_by: null
 queued_at: null

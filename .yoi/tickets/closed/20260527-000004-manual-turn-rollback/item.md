@@ -9,7 +9,6 @@ labels: [tui, pod, ux]
 created_at: 2026-05-27T00:00:04Z
 updated_at: 2026-05-29T03:09:22Z
 assignee: null
-legacy_ticket: tickets/manual-turn-rollback.md
 ---
 
 ## Background

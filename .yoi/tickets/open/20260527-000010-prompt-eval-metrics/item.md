@@ -10,7 +10,6 @@ workflow_state: planning
 created_at: 2026-05-27T00:00:10Z
 updated_at: 2026-05-27T00:00:10Z
 assignee: null
-legacy_ticket: tickets/prompt-eval-metrics.md
 ---
 
 ## Migration reference

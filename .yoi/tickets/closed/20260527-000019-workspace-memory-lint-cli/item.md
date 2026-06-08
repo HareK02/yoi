@@ -9,7 +9,6 @@ labels: [migrated, memory, cli]
 created_at: 2026-05-27T00:00:19Z
 updated_at: 2026-05-31T02:15:17Z
 assignee: null
-legacy_ticket: null
 ---
 
 ## Background

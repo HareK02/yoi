@@ -9,7 +9,6 @@ labels: [profiles, manifest, nix, config]
 created_at: 2026-05-29T18:33:18Z
 updated_at: 2026-05-29T19:38:49Z
 assignee: null
-legacy_ticket: null
 ---
 
 ## Background

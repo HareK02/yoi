@@ -10,7 +10,6 @@ workflow_state: planning
 created_at: 2026-05-27T00:00:09Z
 updated_at: 2026-05-27T00:00:09Z
 assignee: null
-legacy_ticket: tickets/pod-session-fork.md
 ---
 
 ## Migration reference

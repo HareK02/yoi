@@ -9,7 +9,6 @@ labels: [plugin, feature-registry, tasks]
 created_at: 2026-06-04T22:35:00Z
 updated_at: 2026-06-05T00:05:55Z
 assignee: null
-legacy_ticket: null
 ---
 
 ## Issue

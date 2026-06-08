@@ -9,7 +9,6 @@ labels: [docs, config, security]
 created_at: 2026-05-31T08:26:46Z
 updated_at: 2026-05-31T08:29:40Z
 assignee: null
-legacy_ticket: null
 ---
 
 ## Background

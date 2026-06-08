@@ -9,7 +9,6 @@ labels: [migrated]
 created_at: 2026-05-27T00:00:12Z
 updated_at: 2026-05-28T13:24:48Z
 assignee: null
-legacy_ticket: tickets/spawnpod-initial-run-confirmation.md
 ---
 
 ## Migration reference

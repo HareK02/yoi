@@ -9,7 +9,6 @@ labels: [migrated]
 created_at: 2026-05-27T00:00:13Z
 updated_at: 2026-05-27T19:28:41Z
 assignee: null
-legacy_ticket: tickets/tickets-sh-workitem-thread-mvp.md
 ---
 
 ## Migration reference
@@ -74,7 +73,6 @@ labels: [maintainer, workflow]
 created_at: 2026-05-26T12:34:56Z
 updated_at: 2026-05-26T12:34:56Z
 assignee: null
-legacy_ticket: tickets/foo.md
 ---
 
 ## Background

@@ -9,7 +9,6 @@ labels: [pod, tools, orchestration]
 created_at: 2026-05-31T02:28:21Z
 updated_at: 2026-05-31T03:00:15Z
 assignee: null
-legacy_ticket: null
 ---
 
 ## Background

@@ -9,7 +9,6 @@ labels: [ticket, migration, storage]
 created_at: 2026-06-05T20:30:06Z
 updated_at: 2026-06-05T21:51:58Z
 assignee: null
-legacy_ticket: null
 ---
 
 ## Background

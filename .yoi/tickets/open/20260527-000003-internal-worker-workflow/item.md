@@ -10,7 +10,6 @@ workflow_state: planning
 created_at: 2026-05-27T00:00:03Z
 updated_at: 2026-05-27T00:00:03Z
 assignee: null
-legacy_ticket: tickets/internal-worker-workflow.md
 ---
 
 ## Migration reference

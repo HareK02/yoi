@@ -9,7 +9,6 @@ labels: [pod, manifest, tools, workflow]
 created_at: 2026-05-29T20:55:40Z
 updated_at: 2026-05-30T05:19:46Z
 assignee: null
-legacy_ticket: null
 ---
 
 ## Background
