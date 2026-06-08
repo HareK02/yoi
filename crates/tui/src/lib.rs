@@ -2,6 +2,7 @@ mod app;
 mod block;
 mod cache;
 mod command;
+mod composer_history;
 mod input;
 pub mod keys;
 mod markdown;

@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use protocol::{
@@ -12,6 +13,9 @@ use crate::block::{
 use crate::cache::FileCache;
 use crate::command::{
     CommandCandidate, CommandEnvironment, CommandExecution, CommandInputMode, CommandRegistry,
+};
+use crate::composer_history::{
+    COMPOSER_INPUT_HISTORY_LIMIT, ComposerHistoryStore, segments_are_blank,
 };
 use crate::input::InputBuffer;
 use crate::scroll::Scroll;
@@ -107,8 +111,6 @@ impl QueuedInput {
     }
 }
 
-const COMPOSER_INPUT_HISTORY_LIMIT: usize = 100;
-
 struct ComposerInputHistory {
     entries: VecDeque<Vec<Segment>>,
     browse: Option<ComposerInputHistoryBrowse>,
@@ -127,18 +129,26 @@ impl ComposerInputHistory {
         }
     }
 
-    fn record(&mut self, segments: Vec<Segment>) {
+    fn with_entries(entries: VecDeque<Vec<Segment>>) -> Self {
+        Self {
+            entries,
+            browse: None,
+        }
+    }
+
+    fn record(&mut self, segments: Vec<Segment>) -> bool {
         if segments_are_blank(&segments) {
-            return;
+            return false;
         }
         self.browse = None;
         if self.entries.back() == Some(&segments) {
-            return;
+            return false;
         }
         if self.entries.len() == COMPOSER_INPUT_HISTORY_LIMIT {
             self.entries.pop_front();
         }
         self.entries.push_back(segments);
+        true
     }
 
     fn is_browsing(&self) -> bool {
@@ -283,6 +293,9 @@ pub struct App {
     /// TUI-local readline-style composer input history. This is intentionally
     /// client-side only: recalled entries are plain drafts until submitted again.
     input_history: ComposerInputHistory,
+    /// User-data backed persistence for composer recall entries. The saved
+    /// contents are private input drafts and must not be logged or sent to Pod.
+    input_history_store: Option<ComposerHistoryStore>,
     /// Local submit state kept until the accepted run either completes
     /// normally or reports that the empty assistant turn was rolled back.
     pending_submit_rollback: Option<RollbackSubmitState>,
@@ -330,9 +343,70 @@ impl App {
             task_pane_scroll: 0,
             queued_inputs: VecDeque::new(),
             input_history: ComposerInputHistory::new(),
+            input_history_store: None,
             pending_submit_rollback: None,
             last_rolled_back_input: None,
         }
+    }
+
+    pub fn new_with_persistent_input_history(pod_name: String, workspace_root: &Path) -> Self {
+        let mut app = Self::new(pod_name);
+        match ComposerHistoryStore::default_for_workspace(workspace_root) {
+            Ok(Some(store)) => {
+                match store.load() {
+                    Ok(entries) => {
+                        app.input_history = ComposerInputHistory::with_entries(entries);
+                    }
+                    Err(_) => {
+                        app.flash_actionbar_notice(
+                            "Could not load saved composer input history; starting with empty local history.",
+                            ActionbarNoticeLevel::Warn,
+                            ActionbarNoticeSource::Tui,
+                            Duration::from_secs(8),
+                        );
+                    }
+                }
+                app.input_history_store = Some(store);
+            }
+            Ok(None) => {
+                app.flash_actionbar_notice(
+                    "Composer input history persistence is disabled because the yoi data directory could not be resolved.",
+                    ActionbarNoticeLevel::Warn,
+                    ActionbarNoticeSource::Tui,
+                    Duration::from_secs(8),
+                );
+            }
+            Err(_) => {
+                app.flash_actionbar_notice(
+                    "Composer input history persistence is disabled because the history store could not be initialized.",
+                    ActionbarNoticeLevel::Warn,
+                    ActionbarNoticeSource::Tui,
+                    Duration::from_secs(8),
+                );
+            }
+        }
+        app
+    }
+
+    #[cfg(test)]
+    fn new_with_input_history_store(pod_name: String, store: ComposerHistoryStore) -> Self {
+        let mut app = Self::new(pod_name);
+        match store.load() {
+            Ok(entries) => {
+                app.input_history = ComposerInputHistory::with_entries(entries);
+            }
+            Err(_) => {
+                app.flash_actionbar_notice_at(
+                    "Could not load saved composer input history; starting with empty local history.",
+                    ActionbarNoticeLevel::Warn,
+                    ActionbarNoticeSource::Tui,
+                    Instant::now(),
+                    Duration::from_secs(8),
+                );
+            }
+        }
+        app.input_history_store = Some(store);
+        app
     }
 
     pub fn toggle_task_pane(&mut self) {
@@ -556,7 +630,7 @@ impl App {
             }
             return None;
         }
-        self.input_history.record(segments.clone());
+        self.record_input_history(segments.clone());
         if self.running {
             self.queued_inputs.push_back(QueuedInput::new(segments));
             self.input.clear();
@@ -580,6 +654,23 @@ impl App {
             turn_before: self.turn_index,
         });
         Method::Run { input: segments }
+    }
+
+    fn record_input_history(&mut self, segments: Vec<Segment>) {
+        if !self.input_history.record(segments) {
+            return;
+        }
+        let Some(store) = &self.input_history_store else {
+            return;
+        };
+        if store.save(&self.input_history.entries).is_err() {
+            self.flash_actionbar_notice(
+                "Could not save composer input history; continuing with in-memory local history.",
+                ActionbarNoticeLevel::Warn,
+                ActionbarNoticeSource::Tui,
+                Duration::from_secs(8),
+            );
+        }
     }
 
     pub fn queued_input_count(&self) -> usize {
@@ -1934,17 +2025,6 @@ fn rollback_input_preview(text: &str) -> String {
     one_line
 }
 
-/// True if the submitted segment list carries no user-visible content
-/// (only whitespace / newlines, no paste, no typed atoms). Used to
-/// decide whether an empty Enter should be a no-op or trigger a
-/// `Resume` when the Pod is paused.
-fn segments_are_blank(segments: &[Segment]) -> bool {
-    segments.iter().all(|s| match s {
-        Segment::Text { content } => content.trim().is_empty(),
-        _ => false,
-    })
-}
-
 pub fn alert_source_label(source: AlertSource) -> &'static str {
     match source {
         AlertSource::Pod => "pod",
@@ -2026,6 +2106,146 @@ mod actionbar_notice_tests {
 
         app.clear_expired_actionbar_notice(now + duration);
         assert!(app.current_actionbar_notice(now).is_none());
+    }
+}
+
+#[cfg(test)]
+mod composer_history_persistence_tests {
+    use super::*;
+    use crate::composer_history::{COMPOSER_INPUT_HISTORY_LIMIT, ComposerHistoryStore};
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn recall_history_survives_reload_for_same_workspace() {
+        let data_dir = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        let store = ComposerHistoryStore::for_data_dir(data_dir.path(), workspace.path());
+        let mut app = App::new_with_input_history_store("test".into(), store.clone());
+        submit_text(&mut app, "first synthetic entry");
+        submit_text(&mut app, "second synthetic entry");
+
+        let mut reloaded = App::new_with_input_history_store("test".into(), store);
+        assert!(reloaded.browse_input_history_older());
+        assert_eq!(input_text(&reloaded), "second synthetic entry");
+        assert!(reloaded.browse_input_history_older());
+        assert_eq!(input_text(&reloaded), "first synthetic entry");
+    }
+
+    #[test]
+    fn recall_histories_are_separated_by_workspace() {
+        let data_dir = TempDir::new().unwrap();
+        let workspace_a = TempDir::new().unwrap();
+        let workspace_b = TempDir::new().unwrap();
+        let store_a = ComposerHistoryStore::for_data_dir(data_dir.path(), workspace_a.path());
+        let store_b = ComposerHistoryStore::for_data_dir(data_dir.path(), workspace_b.path());
+        let mut app_a = App::new_with_input_history_store("test".into(), store_a.clone());
+        let mut app_b = App::new_with_input_history_store("test".into(), store_b.clone());
+
+        submit_text(&mut app_a, "workspace a synthetic entry");
+        submit_text(&mut app_b, "workspace b synthetic entry");
+
+        let mut reloaded_a = App::new_with_input_history_store("test".into(), store_a);
+        let mut reloaded_b = App::new_with_input_history_store("test".into(), store_b);
+        assert!(reloaded_a.browse_input_history_older());
+        assert!(reloaded_b.browse_input_history_older());
+        assert_eq!(input_text(&reloaded_a), "workspace a synthetic entry");
+        assert_eq!(input_text(&reloaded_b), "workspace b synthetic entry");
+    }
+
+    #[test]
+    fn persistence_keeps_typed_segments_instead_of_flattening() {
+        let data_dir = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        let store = ComposerHistoryStore::for_data_dir(data_dir.path(), workspace.path());
+        let mut app = App::new_with_input_history_store("test".into(), store.clone());
+        app.input.replace_with_segments(&[
+            Segment::text("inspect "),
+            Segment::FileRef {
+                path: "src/lib.rs".into(),
+            },
+        ]);
+        assert!(matches!(app.submit_input(), Some(Method::Run { .. })));
+
+        let mut reloaded = App::new_with_input_history_store("test".into(), store);
+        assert!(reloaded.browse_input_history_older());
+        let segments = reloaded.input.submit_segments();
+        assert_eq!(segments.len(), 2);
+        assert!(matches!(&segments[0], Segment::Text { content } if content == "inspect "));
+        assert!(matches!(&segments[1], Segment::FileRef { path } if path == "src/lib.rs"));
+    }
+
+    #[test]
+    fn persistence_bounds_history_and_suppresses_consecutive_duplicates() {
+        let data_dir = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        let store = ComposerHistoryStore::for_data_dir(data_dir.path(), workspace.path());
+        let mut app = App::new_with_input_history_store("test".into(), store.clone());
+        submit_text(&mut app, "duplicate synthetic entry");
+        submit_text(&mut app, "duplicate synthetic entry");
+        for i in 0..COMPOSER_INPUT_HISTORY_LIMIT + 5 {
+            submit_text(&mut app, &format!("bounded synthetic entry {i}"));
+        }
+
+        let reloaded = App::new_with_input_history_store("test".into(), store);
+        assert_eq!(
+            reloaded.input_history.entries.len(),
+            COMPOSER_INPUT_HISTORY_LIMIT
+        );
+        assert_eq!(
+            reloaded.input_history.entries.front(),
+            Some(&vec![Segment::text("bounded synthetic entry 5")])
+        );
+        assert_eq!(
+            reloaded.input_history.entries.back(),
+            Some(&vec![Segment::text("bounded synthetic entry 34")])
+        );
+    }
+
+    #[test]
+    fn corrupt_history_file_falls_back_to_empty_with_bounded_warning() {
+        let data_dir = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        let store = ComposerHistoryStore::for_data_dir(data_dir.path(), workspace.path());
+        fs::create_dir_all(store.path().parent().unwrap()).unwrap();
+        fs::write(store.path(), b"not json").unwrap();
+
+        let app = App::new_with_input_history_store("test".into(), store);
+        assert_eq!(app.input_history.entries.len(), 0);
+        let notice = app.current_actionbar_notice(Instant::now()).unwrap();
+        assert_eq!(notice.level, ActionbarNoticeLevel::Warn);
+        assert!(
+            notice
+                .text
+                .contains("Could not load saved composer input history")
+        );
+        assert!(!notice.text.contains("not json"));
+    }
+
+    #[test]
+    fn persistence_does_not_write_workspace_yoi_directory() {
+        let data_dir = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        let store = ComposerHistoryStore::for_data_dir(data_dir.path(), workspace.path());
+        let mut app = App::new_with_input_history_store("test".into(), store);
+        submit_text(&mut app, "synthetic entry outside workspace yoi");
+
+        assert!(data_dir.path().join("composer-history").exists());
+        assert!(!workspace.path().join(".yoi").exists());
+    }
+
+    fn submit_text(app: &mut App, text: &str) -> Vec<Segment> {
+        for c in text.chars() {
+            app.insert_char(c);
+        }
+        match app.submit_input() {
+            Some(Method::Run { input }) => input,
+            other => panic!("expected Run, got {other:?}"),
+        }
+    }
+
+    fn input_text(app: &App) -> String {
+        Segment::flatten_to_text(&app.input.submit_segments())
     }
 }
 
