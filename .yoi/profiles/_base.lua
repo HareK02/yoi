@@ -15,6 +15,7 @@ return function(opts)
 
         worker = {
             reasoning = "high",
+            language = opts.language or "Japanese",
         },
 
         model = {
