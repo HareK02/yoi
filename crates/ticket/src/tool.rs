@@ -68,14 +68,14 @@ const COMMENT_DESCRIPTION: &str = "Append a typed Ticket thread event. `role` mu
 configured Ticket backend root.";
 const REVIEW_DESCRIPTION: &str = "Append a Ticket review event. `result` must be `approve` or \
 `request_changes`; `body` is Markdown. Writes stay inside the configured Ticket backend root.";
-const INTAKE_READY_DESCRIPTION: &str = "Mark an existing Ticket intake as ready through the typed \
+const INTAKE_READY_DESCRIPTION: &str = "Mark an existing Ticket planning lane ready through the typed \
 Ticket backend. The tool appends a bounded `intake_summary`, appends a typed `state_changed` event \
 for `workflow_state`, and transitions workflow_state to `ready`.";
 const WORKFLOW_STATE_DESCRIPTION: &str = "Transition Ticket `workflow_state` through the typed \
 Ticket backend with a bounded `state_changed` event. This does not move local open/pending/closed \
 status; use `TicketStatus` or `TicketClose` for local status changes. Treat `queued -> inprogress` \
 as the implementation acceptance step: implementation side effects should happen only after that \
-transition is accepted and recorded.";
+transition is accepted and recorded. Orchestrator may return `ready` or `queued` Tickets to `planning` only with a concrete missing decision/information reason.";
 const STATUS_DESCRIPTION: &str = "Move a Ticket between non-closed local statuses through the typed \
 Ticket backend. Use `TicketClose` for closing because closed Tickets require a resolution accepted \
 by `yoi ticket doctor`.";
@@ -116,16 +116,13 @@ struct TicketCreateParams {
     /// Optional readiness frontmatter value.
     #[serde(default)]
     readiness: Option<String>,
-    /// Optional preflight flag frontmatter value.
-    #[serde(default)]
-    needs_preflight: Option<bool>,
     /// Optional risk flag frontmatter values.
     #[serde(default)]
     risk_flags: Vec<String>,
     /// Optional action-required frontmatter value.
     #[serde(default)]
     action_required: Option<String>,
-    /// Optional workflow_state frontmatter value. Defaults to `intake`.
+    /// Optional workflow_state frontmatter value. Defaults to `planning`.
     #[serde(default)]
     workflow_state: Option<TicketWorkflowStateParam>,
     /// Optional attention_required overlay frontmatter value.
@@ -142,7 +139,8 @@ struct TicketCreateParams {
 #[derive(Debug, Clone, Copy, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 enum TicketWorkflowStateParam {
-    Intake,
+    #[serde(alias = "intake")]
+    Planning,
     Ready,
     Queued,
     Inprogress,
@@ -152,7 +150,7 @@ enum TicketWorkflowStateParam {
 impl TicketWorkflowStateParam {
     fn into_state(self) -> TicketWorkflowState {
         match self {
-            Self::Intake => TicketWorkflowState::Intake,
+            Self::Planning => TicketWorkflowState::Planning,
             Self::Ready => TicketWorkflowState::Ready,
             Self::Queued => TicketWorkflowState::Queued,
             Self::Inprogress => TicketWorkflowState::InProgress,
@@ -277,7 +275,7 @@ struct TicketIntakeReadyParams {
     /// Optional author for both intake_summary and state_changed events.
     #[serde(default)]
     author: Option<String>,
-    /// Reason attached to the state_changed event. Defaults to `intake_ready`.
+    /// Reason attached to the state_changed event. Defaults to `planning_ready`.
     #[serde(default)]
     reason: Option<String>,
     /// Optional state_changed body. If omitted, a concise default is used.
@@ -413,7 +411,6 @@ impl Tool for TicketCreateTool {
         input.assignee = params.assignee;
         input.legacy_ticket = params.legacy_ticket;
         input.readiness = params.readiness;
-        input.needs_preflight = params.needs_preflight;
         input.risk_flags = params.risk_flags;
         input.action_required = params.action_required;
         input.workflow_state = params
@@ -580,8 +577,10 @@ impl Tool for TicketReviewTool {
 impl Tool for TicketIntakeReadyTool {
     async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError> {
         let params: TicketIntakeReadyParams = parse_input("TicketIntakeReady", input_json)?;
-        let from = TicketWorkflowState::Intake;
-        let reason = params.reason.unwrap_or_else(|| "intake_ready".to_string());
+        let from = TicketWorkflowState::Planning;
+        let reason = params
+            .reason
+            .unwrap_or_else(|| "planning_ready".to_string());
         let body = params.state_change_body.unwrap_or_else(|| {
             self.backend
                 .default_intake_ready_state_change_body(from.as_str())
@@ -1229,12 +1228,77 @@ mod tests {
         assert_eq!(
             transitions,
             vec![
-                (Some("intake"), Some("ready")),
+                (Some("planning"), Some("ready")),
                 (Some("ready"), Some("queued")),
                 (Some("queued"), Some("inprogress")),
                 (Some("inprogress"), Some("done"))
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn ticket_workflow_tool_allows_return_to_planning_from_ready_and_queued() {
+        let temp = TempDir::new().unwrap();
+        let backend = backend(&temp);
+        let workflow = tool_by_name(backend.clone(), "TicketWorkflowState");
+
+        let mut ready_input = NewTicket::new("Ready Needs Planning");
+        ready_input.workflow_state = Some(TicketWorkflowState::Ready);
+        let ready = backend.create(ready_input).unwrap();
+        workflow
+            .execute(
+                &json!({
+                    "ticket": ready.id,
+                    "from": "ready",
+                    "to": "planning",
+                    "reason": "missing_acceptance_decision",
+                    "body": "Missing decision: clarify acceptance criteria before queueing.\n",
+                    "author": "orchestrator"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        let ready_record = backend.show(TicketIdOrSlug::Query(ready.slug)).unwrap();
+        assert_eq!(
+            ready_record.meta.workflow_state,
+            TicketWorkflowState::Planning
+        );
+        assert!(ready_record.events.iter().any(|event| {
+            event.kind == TicketEventKind::StateChanged
+                && event.from.as_deref() == Some("ready")
+                && event.to.as_deref() == Some("planning")
+                && event.reason.as_deref() == Some("missing_acceptance_decision")
+        }));
+
+        let mut queued_input = NewTicket::new("Queued Needs Planning");
+        queued_input.workflow_state = Some(TicketWorkflowState::Queued);
+        let queued = backend.create(queued_input).unwrap();
+        workflow
+            .execute(
+                &json!({
+                    "ticket": queued.id,
+                    "from": "queued",
+                    "to": "planning",
+                    "reason": "missing_authority_decision",
+                    "body": "Missing decision: define authority boundary before implementation side effects.\n",
+                    "author": "orchestrator"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        let queued_record = backend.show(TicketIdOrSlug::Query(queued.slug)).unwrap();
+        assert_eq!(
+            queued_record.meta.workflow_state,
+            TicketWorkflowState::Planning
+        );
+        assert!(queued_record.events.iter().any(|event| {
+            event.kind == TicketEventKind::StateChanged
+                && event.from.as_deref() == Some("queued")
+                && event.to.as_deref() == Some("planning")
+                && event.reason.as_deref() == Some("missing_authority_decision")
+        }));
     }
 
     #[tokio::test]
@@ -1266,7 +1330,7 @@ mod tests {
                 .contains("workflow_state changed concurrently")
         );
         let record = backend.show(TicketIdOrSlug::Query(created.slug)).unwrap();
-        assert_eq!(record.meta.workflow_state, TicketWorkflowState::Intake);
+        assert_eq!(record.meta.workflow_state, TicketWorkflowState::Planning);
         assert_eq!(record.meta.status.as_local(), Some(TicketStatus::Open));
         assert!(!record.events.iter().any(|event| {
             event.kind == TicketEventKind::StateChanged
@@ -1336,7 +1400,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ticket_intake_ready_tool_rejects_non_intake_ticket() {
+    async fn ticket_intake_ready_tool_rejects_non_planning_ticket() {
         let temp = TempDir::new().unwrap();
         let backend = backend(&temp);
         let mut input = NewTicket::new("Already Ready");

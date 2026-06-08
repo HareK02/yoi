@@ -63,7 +63,7 @@ impl ComposerTarget {
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Companion => "Companion",
-            Self::TicketIntake => "Ticket Intake",
+            Self::TicketIntake => "Ticket Planning",
         }
     }
 }
@@ -187,7 +187,7 @@ pub(crate) enum PanelRowKey {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PanelRowKind {
-    Intake,
+    Planning,
     Ticket,
     Review,
     Blocked,
@@ -775,16 +775,14 @@ fn derive_ticket_state(summary: &TicketSummary) -> DerivedTicketState {
             key_hint: None,
             blocked_reason: None,
         },
-        TicketWorkflowState::Intake => DerivedTicketState {
-            kind: PanelRowKind::Intake,
+        TicketWorkflowState::Planning => DerivedTicketState {
+            kind: PanelRowKind::Planning,
             priority: ActionPriority::Background,
             action: Some(NextUserAction::Clarify),
             disabled_reason: Some(
-                "Ticket is still in intake; mark it ready before queueing.".to_string(),
+                "Ticket is still in planning; mark it ready before queueing.".to_string(),
             ),
-            key_hint: Some(
-                "Intake/Orchestrator helpers can set workflow_state = ready".to_string(),
-            ),
+            key_hint: Some("Planning/Intake helpers can set workflow_state = ready".to_string()),
             blocked_reason: None,
         },
     }
@@ -1132,24 +1130,24 @@ mod tests {
             .find(|row| row.title == "Queued Explicit")
             .unwrap();
 
-        assert_eq!(readiness.status, "intake");
+        assert_eq!(readiness.status, "planning");
         assert_eq!(readiness.next_action, Some(NextUserAction::Clarify));
-        assert_eq!(label.status, "intake");
+        assert_eq!(label.status, "planning");
         assert_eq!(label.next_action, Some(NextUserAction::Clarify));
         assert_eq!(queued.status, "queued");
         assert_eq!(queued.next_action, Some(NextUserAction::Wait));
     }
 
     #[test]
-    fn workspace_panel_treats_yaml_null_attention_required_as_unblocked_intake() {
+    fn workspace_panel_treats_yaml_null_attention_required_as_unblocked_planning() {
         let temp = TempDir::new().unwrap();
         write_ticket_config(temp.path());
         let backend = LocalTicketBackend::new(temp.path().join(".yoi/tickets"));
         let ticket_ref = backend
             .create({
-                let mut input = NewTicket::new("Null Attention Intake");
+                let mut input = NewTicket::new("Null Attention Planning");
                 input.slug = Some("null-attention-intake".to_string());
-                input.workflow_state = Some(TicketWorkflowState::Intake);
+                input.workflow_state = Some(TicketWorkflowState::Planning);
                 input
             })
             .unwrap();
@@ -1162,8 +1160,8 @@ mod tests {
         fs::write(
             &item_path,
             item.replace(
-                "workflow_state: intake\ncreated_at:",
-                "workflow_state: intake\nattention_required: null\ncreated_at:",
+                "workflow_state: planning\ncreated_at:",
+                "workflow_state: planning\nattention_required: null\ncreated_at:",
             ),
         )
         .unwrap();
@@ -1172,16 +1170,16 @@ mod tests {
         let row = model
             .rows
             .iter()
-            .find(|row| row.title == "Null Attention Intake")
+            .find(|row| row.title == "Null Attention Planning")
             .unwrap();
 
-        assert_eq!(row.status, "intake");
+        assert_eq!(row.status, "planning");
         assert_eq!(row.next_action, Some(NextUserAction::Clarify));
         assert_eq!(row.priority, ActionPriority::Background);
     }
 
     #[test]
-    fn workspace_panel_defaults_missing_open_state_to_intake_and_displays_done_state() {
+    fn workspace_panel_defaults_missing_open_state_to_planning_and_displays_done_state() {
         let temp = TempDir::new().unwrap();
         write_ticket_config(temp.path());
         let backend = LocalTicketBackend::new(temp.path().join(".yoi/tickets"));
@@ -1202,7 +1200,7 @@ mod tests {
             .find(|row| row.title == "Done Explicit")
             .unwrap();
 
-        assert_eq!(backlog.status, "intake");
+        assert_eq!(backlog.status, "planning");
         assert_eq!(backlog.next_action, Some(NextUserAction::Clarify));
         assert!(backlog.is_ticket_action());
         assert_eq!(done.status, "done");
@@ -1214,7 +1212,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         write_ticket_config(temp.path());
         let backend = LocalTicketBackend::new(temp.path().join(".yoi/tickets"));
-        create_ticket(&backend, "Claimed Intake", "claimed-intake", |_| {});
+        create_ticket(&backend, "Claimed Planning", "claimed-intake", |_| {});
         let summary = backend.list(TicketFilter::all()).unwrap().remove(0);
         let store = PanelRegistryStore::from_root(temp.path().join("local-registry"));
         store
@@ -1230,7 +1228,7 @@ mod tests {
         let row = model
             .rows
             .iter()
-            .find(|row| row.title == "Claimed Intake")
+            .find(|row| row.title == "Claimed Planning")
             .unwrap();
         let claim = row.ticket.as_ref().unwrap().local_claim.as_ref().unwrap();
 

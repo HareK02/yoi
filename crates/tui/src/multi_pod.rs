@@ -4680,7 +4680,7 @@ mod tests {
             priority: "P2".to_string(),
             labels: Vec::new(),
             workflow_state: TicketWorkflowState::parse(status)
-                .unwrap_or(TicketWorkflowState::Intake),
+                .unwrap_or(TicketWorkflowState::Planning),
             workflow_state_explicit: true,
             attention_required: None,
             next_action: Some(next_action),

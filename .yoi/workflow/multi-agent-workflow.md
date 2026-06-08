@@ -8,9 +8,9 @@ requires: []
 
 yoi を yoi で開発する際の、worktree + coder Pod + 外部 reviewer Pod + orchestrator Pod の標準フロー。これは **最上位 Pod が細かい code review を抱えず、下位 orchestrator が実装と外部レビューの loop を完了状態まで運ぶためのフロー** である。
 
-worktree の機械的作成手順は `$user/worktree-workflow`、ユーザー依頼の Ticket 化は `$user/ticket-intake-workflow`、Ticket の next action 分類は `$user/ticket-orchestrator-routing`、実装前の要件同期・反証 preflight は `$user/ticket-preflight-workflow` に分ける。
+worktree の機械的作成手順は `$user/worktree-workflow`、ユーザー依頼の Ticket 化は `$user/ticket-intake-workflow`、Ticket の next action 分類は `$user/ticket-orchestrator-routing`、実装前の要件同期・反証 planning sync は `$user/ticket-planning sync-workflow` に分ける。
 
-この Workflow は、対象 ticket が implementation-ready であることを前提にする。implementation-ready は full implementation plan ではなく、recorded intent / binding decisions / invariants / implementation latitude / acceptance criteria / escalation conditions に基づいて coder が bounded investigation を進め、reviewer が判断できる状態を指す。設計境界・仕様・authority boundary が未同期の場合は、worktree 作成や coder Pod 起動の前に `ticket-preflight-workflow` を通す。
+この Workflow は、対象 ticket が implementation-ready であることを前提にする。implementation-ready は full implementation plan ではなく、recorded intent / binding decisions / invariants / implementation latitude / acceptance criteria / escalation conditions に基づいて coder が bounded investigation を進め、reviewer が判断できる状態を指す。設計境界・仕様・authority boundary が未同期の場合は、worktree 作成や coder Pod 起動の前に `ticket-planning sync-workflow` を通す。
 
 ## 目的
 
@@ -61,9 +61,9 @@ reviewer Pod
 - worktree 作成と git 書き込み操作について、人間の許可がある。
 - main workspace の unrelated dirty changes を把握している。
 - 下位 orchestrator に渡す binding decisions / invariants、implementation latitude、escalation conditions を短く書ける。
-- 設計境界・仕様・authority boundary に不確定要素がある場合、`ticket-preflight-workflow` の結果が ticket thread に記録されている。
+- 設計境界・仕様・authority boundary に不確定要素がある場合、`ticket-planning sync-workflow` の結果が ticket thread に記録されている。
 
-product / API / UX / authority / design-boundary 方針が複数自然に導ける場合、protocol / scope / permission / history persistence に触れる場合、ticket 自体の再定義が必要な場合は、実装委譲前に `ticket-preflight-workflow` を通し、必要なら人間へ戻す。実装ファイルの探索、既存コード読解、局所的な構成選択のような bounded implementation uncertainty は、intent / binding decisions / invariants / implementation latitude / acceptance criteria / escalation conditions が明確なら coder に委ねてよい。
+product / API / UX / authority / design-boundary 方針が複数自然に導ける場合、protocol / scope / permission / history persistence に触れる場合、ticket 自体の再定義が必要な場合は、実装委譲前に `ticket-planning sync-workflow` を通し、必要なら人間へ戻す。実装ファイルの探索、既存コード読解、局所的な構成選択のような bounded implementation uncertainty は、intent / binding decisions / invariants / implementation latitude / acceptance criteria / escalation conditions が明確なら coder に委ねてよい。
 
 ## Intent packet
 
@@ -106,7 +106,7 @@ reviewer には coder の実装方針ではなく、この intent packet と dif
    - `git status --short --branch`
    - 対象 ticket / ticket 群
    - 関連 TODO / docs / 既存 worktree
-   - preflight が必要な ticket では、`ticket-preflight-workflow` の分類・要件同期・critical risks
+   - planning sync が必要な ticket では、`ticket-planning sync-workflow` の分類・要件同期・critical risks
 
 2. worktree 作成
    - `$user/worktree-workflow` に従い `./.worktree/<task-name>` を作る。

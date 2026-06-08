@@ -1,172 +1,74 @@
 ---
-description: ticket を実装委譲する前に、要件・前提・設計境界・反証観点を同期し、Ticket thread に記録する preflight フロー
+description: 互換 slug を残した Ticket planning / requirements sync workflow。preflight を独立 lane や workflow_state として扱わない。
 model_invokation: true
 user_invocable: true
 requires: []
 ---
-# Ticket Preflight Workflow
 
-yoi プロジェクトで ticket を実装に渡す前に、要件・前提・設計境界・反証観点を同期するための Workflow。これは **実装前の gate** であり、worktree 作成や coder / reviewer Pod の起動は `multi-agent-workflow` / `worktree-workflow` 側で扱う。
+# Ticket Planning / Requirements Sync Workflow
 
-目的は「ticket があるから実装する」状態を避け、ticket が **実装可能な intent / binding decisions / invariants / implementation latitude / acceptance criteria / escalation conditions** を持つのか、**調査 ticket** なのか、**人間との仕様同期が必要な未決定 ticket** なのかを明確にすることである。実装 tactic をすべて事前固定する必要はないが、product / API / UX / authority boundary / explicit design constraint を coder が silently 決める余地は残さない。
+このファイル名は既存の workflow discovery / durable references 互換のために残す。新しい概念としての `preflight` state / lane / long-lived operation は作らない。ここで扱う作業は、Ticket を `planning` に戻して不足している決定・情報・受け入れ条件を同期するための planning activity である。
 
-## 適用する場面
+## 目的
 
-以下のいずれかに当てはまる ticket は、実装委譲前にこの Workflow を通す。
+実装に入る前または Orchestrator routing 中に、具体的な未決定事項が見つかった Ticket を planning に戻し、Ticket thread に監査可能な形で同期内容を残す。
 
-- profile / manifest / scope / permission / session / history / pod-store / prompt context など authority boundary に触れる。
-- ticket の文面から複数の自然な product / API / UX / authority / design-boundary 方針が導け、人間/Orchestrator decision なしでは固定できない。
-- 「どう実装するか」以前に「何を仕様とするか」が曖昧である。
-- 既存 implementation plan があるが、抽象化・責務境界・ユーザー体験に疑問がある。
-- 過去 decision / memory / docs / ticket thread と矛盾しそうである。
-- coder Pod に渡す intent packet で、binding decisions / invariants、implementation latitude、escalation conditions を区別して短く書けない。
+この workflow は次をしてはいけない。
 
-小さなバグ修正や仕様が明確な局所変更では、この Workflow は省略してよい。ただし省略理由が曖昧な場合は preflight する。`needs_preflight: true` や risk flags は強い signal だが、missing boundary がすでに Ticket/thread の explicit human/Orchestrator decision で補われている場合は、その decision を binding として扱い、残る不確実性が実装 tactic に閉じているかを確認して実装へ進められる。
+- `preflight` を workflow_state として扱う。
+- `needs_preflight` を stop gate として新規に書く。
+- 「リスクがある」だけで Ticket を戻す。
+- Coder / Reviewer / worktree mechanics を再設計する。
 
-## Ticket 記録方針
+## 適用条件
 
-作業管理の authority は `.yoi/tickets/` に保存される Ticket と git history である。preflight の結果は、口頭の会話だけで終わらせず、Ticket tool または `yoi ticket ...` で ticket の `thread.md` または `item.md` に残す。
+次のいずれかを満たす場合に使う。
 
-- 新規の前提・要件・受け入れ条件は、必要に応じて `item.md` を更新する。
-- 調査結果・実装前 plan は `TicketComment` または `yoi ticket comment <ticket> --role plan --file <file>` で残す。
-- 採用/却下した設計判断、実装停止判断、仕様同期の結論は `--role decision` で残す。
-- 実装に入ってよい状態になったら、その根拠を intent packet として ticket thread に残す。
-- 仕様が未決定なら、実装 ticket にせず requirements-sync / spike / design ticket として切り分ける。
-- ticket の timestamp/frontmatter が更新される場合は、関連変更と一緒に commit する。
-- ticket 作成・更新・レビュー・完了は git commit で記録する。push はしない。
+- `planning` Ticket の要件・受け入れ条件・制約を明確化する。
+- `ready` または `queued` Ticket について、Orchestrator が実装開始前に具体的な不足情報・未決定事項を特定した。
+- 既存 Ticket に legacy `intake` / `needs_preflight` 表記があり、planning terminology へ整理する必要がある。
+
+適用しない条件:
+
+- Orchestrator が具体的な不足項目を言語化できない。
+- 単に変更範囲が広い、リスクが高い、またはレビュー観点が多いだけである。
+- すでに `queued -> inprogress` が記録され、実装 side effect が始まっている。
+
+この場合は Ticket を戻さず、IntentPacket に escalation / reviewer focus を明記して進める。
 
 ## 手順
 
-### 1. 状態確認
+1. Ticket の current frontmatter と recent thread を読む。
+2. 不足している decision / information / acceptance condition を箇条書きで特定する。
+3. `ready` または `queued` から戻す場合は、typed state change で `to = planning` を記録する。reason/body には具体的な不足項目を含める。
+4. 既存の claimed live/restorable Intake/Planning Pod があり、利用可能な通知経路がある場合は、その Pod に同じ不足理由を通知する。実用的な経路が無い場合は follow-up として report する。
+5. Ticket body または thread に requirements sync 結果を残す。
+6. Ticket が queue 可能になったら `planning -> ready` を typed state change / `TicketIntakeReady` で記録する。
 
-- `git status --short --branch`
-- 対象 ticket の `item.md` / `thread.md` / artifacts
-- 関連 ticket / docs / workflow / Knowledge / memory decision
-- 既存 worktree / branch / running Pod の有無
+## 記録テンプレート
 
-この段階で unrelated dirty changes がある場合は、preflight の記録だけを行うか、人間に確認してから進める。
+```markdown
+## Planning sync
 
-### 2. ticket の種類を分類する
+Missing decisions / information:
+- ...
 
-以下のどれかに分類する。
+Decisions made:
+- ...
 
-```text
-implementation-ready:
-- intent / binding decisions / invariants / implementation latitude / acceptance criteria / reviewer judgment basis が明確。
-- binding decisions / invariants と implementation latitude が区別されている。
-- bounded implementation investigation や local tactic 選択は残っていてよい。
-- product / API / UX / authority boundary / explicit design constraint を coder が silently 決める余地がない。
-- validation と escalation conditions が明確。
+Acceptance criteria changes:
+- ...
 
-requirements-sync-needed:
-- ticket の目的は見えているが、仕様・用語・責務境界・ユーザー体験の同期が必要。
+Risk / reviewer focus:
+- ...
 
-spike-needed:
-- 技術的実現性・依存関係・ライセンス・性能・diagnostics などを先に調べる必要がある。
-
-blocked-needs-human-decision:
-- 複数方針があり、AI が勝手に決めると設計境界や product API を固定してしまう。
+Readiness:
+- Keep in planning because ...
+- or mark ready because ...
 ```
-
-`implementation-ready` 以外は、coder Pod に実装を委譲しない。`implementation-ready` は full implementation plan ではなく、Orchestrator / coder / reviewer が同じ recorded intent と制約に基づいて判断できる状態である。
-
-### 3. 要件同期
-
-最低限、以下を確認する。
-
-- 完了時に observable に何が変わるか。
-- ticket の主語は何か: user-facing behavior / internal architecture / cleanup / investigation。
-- 用語が既存設計と一致しているか。
-- binding decision として残す具体的な除外・authority boundary は何か。
-- 後方互換が必要か、不要な互換層を作ろうとしていないか。
-- 既存の authority boundary を変えるか。
-- runtime state / persisted state / config / profile / manifest / session log / pod metadata のどれが authority か。
-
-必要なら ticket `item.md` の Background / Requirements / Acceptance criteria を更新する。
-
-### 4. 現行コードと過去判断の map を作る
-
-実装前に、少なくとも関連する current code paths を列挙する。
-
-```text
-Current code map:
-- file/function: 現在の責務
-- file/function: 変更候補
-- file/function: 触ってはいけない境界
-```
-
-この map は簡潔でよい。目的は coder Pod が blind に探しながら設計を固定するのを防ぐこと。
-
-### 5. 批判的 preflight
-
-実装戦術の候補を一度疑う。以下の問いに答える。目的は tactic の固定ではなく、実装が product/API/authority/design-boundary decision を隠れて固定しないことを確認することである。
-
-- この ticket は本当に実装 ticket か、それとも仕様同期 ticket か。
-- 最も自然に見える実装が失敗するとしたらどこか。
-- 抽象化に失敗して「別名の同じもの」を作っていないか。
-- runtime-bound な値を reusable config に混ぜていないか。
-- profile / manifest / scope / session / pod-store などの authority を逆転させていないか。
-- user-facing API を安易に public contract 化していないか。
-- external dependency / license / portability / packaging の問題はないか。
-- reviewer が diff だけ読んでも見落とす設計リスクは何か。
-
-この問いへの答えを `plan` または `decision` として ticket thread に残す。
-
-### 6. intent packet を作る
-
-実装に入ってよい場合だけ、`multi-agent-workflow` に渡す intent packet を作る。
-
-```text
-Intent:
-- 何を実現するか。
-
-Binding decisions / invariants:
-- 人間/Orchestrator/Ticket に記録済みで coder / reviewer が従うべき decision と、壊してはいけない authority boundary / design boundary。
-- 具体的な除外・触れてはいけない場所が binding decision である場合はここに書く。
-
-Requirements / acceptance criteria:
-- observable な完了条件と reviewer が判断できる基準。
-
-Implementation latitude:
-- Coder が調査しながら選んでよい local tactic / file-local organization / bounded uncertainty。
-
-Escalate if:
-- 親/人間に戻す判断条件。特に product / API / UX / authority boundary / explicit design constraint を変える必要が出た場合。
-
-Validation:
-- focused test / broader check / doctor / docs 更新。
-
-Current code map:
-- 実装対象と触ってはいけない場所。
-
-Critical risks / reviewer focus:
-- reviewer にも見てほしい失敗パターン。reviewer は recorded intent / binding decisions / invariants / implementation latitude / acceptance criteria / explicit escalation conditions に照らして判断し、不記録の preferred tactic を基準にしない。
-```
-
-この intent packet が短く書けない場合は、実装委譲せず requirements-sync-needed とする。
-
-## review への引き継ぎ
-
-preflight で出た critical risks は reviewer Pod にも渡す。reviewer は diff だけでなく、ticket の recorded intent / binding decisions / invariants / implementation latitude / acceptance criteria / explicit escalation conditions と preflight の反証観点を読む。reviewer は不記録の preferred tactic ではなく、記録済みの intent / binding decisions / invariants / implementation latitude / acceptance criteria に対して実装が十分かを判断する。
-
-reviewer に期待すること:
-
-- 実装が preflight の intent に対応しているか。
-- 抽象化失敗や authority boundary 違反がないか。
-- preflight で挙げた失敗パターンに落ちていないか。
-- validation がリスクに対して十分か。
 
 ## 完了条件
 
-この Workflow 自体の完了条件は、次のいずれかである。
-
-- ticket が `implementation-ready` になり、intent packet が thread に記録されている。
-- ticket が `requirements-sync-needed` / `spike-needed` / `blocked-needs-human-decision` として整理され、次に人間へ戻す問いまたは follow-up ticket が明確になっている。
-- ticket 自体が不要/誤りと判断され、理由が decision として記録されている。
-
-## この Workflow でしないこと
-
-- worktree を作成しない。
-- coder Pod に実装を委譲しない。
-- merge / close しない。
-- 仕様未決定のまま「小さく実装してみる」ことで public API を固定しない。
+- Ticket に具体的な不足項目または解決済み decision が記録されている。
+- `planning` に戻した場合、state_changed event に from/to/reason/body が残っている。
+- `ready` に進める場合、未解決の blocking attention/action が残っていない。

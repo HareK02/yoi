@@ -176,7 +176,7 @@ impl From<TicketStatus> for ExtensibleTicketStatus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum TicketWorkflowState {
-    Intake,
+    Planning,
     Ready,
     Queued,
     InProgress,
@@ -186,7 +186,7 @@ pub enum TicketWorkflowState {
 impl TicketWorkflowState {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Intake => "intake",
+            Self::Planning => "planning",
             Self::Ready => "ready",
             Self::Queued => "queued",
             Self::InProgress => "inprogress",
@@ -196,7 +196,7 @@ impl TicketWorkflowState {
 
     pub fn parse(value: &str) -> Option<Self> {
         match value {
-            "intake" => Some(Self::Intake),
+            "planning" | "intake" => Some(Self::Planning),
             "ready" => Some(Self::Ready),
             "queued" => Some(Self::Queued),
             "inprogress" => Some(Self::InProgress),
@@ -208,12 +208,12 @@ impl TicketWorkflowState {
     pub fn default_for_status(status: &ExtensibleTicketStatus) -> Self {
         match status {
             ExtensibleTicketStatus::Closed => Self::Done,
-            _ => Self::Intake,
+            _ => Self::Planning,
         }
     }
 
-    pub fn is_intake_ready_transition(from: Self, to: Self) -> bool {
-        from == Self::Intake && to == Self::Ready
+    pub fn is_planning_ready_transition(from: Self, to: Self) -> bool {
+        from == Self::Planning && to == Self::Ready
     }
 
     pub fn is_queue_transition(from: Self, to: Self) -> bool {
@@ -223,7 +223,10 @@ impl TicketWorkflowState {
     pub fn is_role_transition(from: Self, to: Self) -> bool {
         matches!(
             (from, to),
-            (Self::Queued, Self::InProgress) | (Self::InProgress, Self::Done)
+            (Self::Queued, Self::InProgress)
+                | (Self::InProgress, Self::Done)
+                | (Self::Ready, Self::Planning)
+                | (Self::Queued, Self::Planning)
         )
     }
 }
@@ -495,6 +498,7 @@ pub struct NewTicket {
     pub assignee: Option<String>,
     pub legacy_ticket: Option<String>,
     pub readiness: Option<String>,
+    /// Legacy metadata accepted for existing records only; not a workflow stop gate.
     pub needs_preflight: Option<bool>,
     pub risk_flags: Vec<String>,
     pub action_required: Option<String>,
@@ -566,6 +570,7 @@ pub struct TicketMeta {
     pub assignee: Option<String>,
     pub legacy_ticket: Option<String>,
     pub readiness: Option<String>,
+    /// Legacy metadata accepted for existing records only; not a workflow stop gate.
     pub needs_preflight: Option<bool>,
     pub risk_flags: Vec<String>,
     pub action_required: Option<String>,
@@ -587,6 +592,7 @@ pub struct TicketSummary {
     pub priority: String,
     pub labels: Vec<String>,
     pub readiness: Option<String>,
+    /// Legacy metadata accepted for existing records only; not a workflow stop gate.
     pub needs_preflight: Option<bool>,
     pub action_required: Option<String>,
     pub workflow_state: TicketWorkflowState,
@@ -737,9 +743,9 @@ impl LocalTicketBackend {
 
     pub fn default_intake_ready_state_change_body(&self, from: &str) -> String {
         if is_japanese_record_language(self.record_language()) {
-            format!("Ticket intake が完了しました。workflow_state {from} -> ready。\n")
+            format!("Ticket planning が完了しました。workflow_state {from} -> ready。\n")
         } else {
-            format!("Ticket intake complete; workflow_state {from} -> ready.\n")
+            format!("Ticket planning complete; workflow_state {from} -> ready.\n")
         }
     }
 
@@ -1130,7 +1136,7 @@ impl TicketBackend for LocalTicketBackend {
             format_yaml_string_scalar(
                 input
                     .workflow_state
-                    .unwrap_or(TicketWorkflowState::Intake)
+                    .unwrap_or(TicketWorkflowState::Planning)
                     .as_str(),
             ),
         ));
@@ -1279,7 +1285,7 @@ impl TicketBackend for LocalTicketBackend {
         })?;
         if !TicketWorkflowState::is_role_transition(from, to) {
             return Err(TicketError::Conflict(format!(
-                "workflow_state transition {} -> {} is not allowed through set_workflow_state; use dedicated intake-ready or queue APIs for gated transitions",
+                "workflow_state transition {} -> {} is not allowed through set_workflow_state; use dedicated planning-ready or queue APIs for gated transitions",
                 from.as_str(),
                 to.as_str()
             )));
@@ -1307,9 +1313,9 @@ impl TicketBackend for LocalTicketBackend {
                 change.to
             ))
         })?;
-        if !TicketWorkflowState::is_intake_ready_transition(from, to) {
+        if !TicketWorkflowState::is_planning_ready_transition(from, to) {
             return Err(TicketError::Conflict(format!(
-                "mark_intake_ready only allows workflow_state intake -> ready, got {} -> {}",
+                "mark_intake_ready only allows workflow_state planning -> ready, got {} -> {}",
                 from.as_str(),
                 to.as_str()
             )));
@@ -1747,7 +1753,7 @@ fn parse_ticket_frontmatter(content: &str) -> std::result::Result<TicketItemFron
     let workflow_state_value = yaml_string(&mapping, "workflow_state")?;
     let workflow_state = match workflow_state_value.as_deref() {
         Some(value) => Some(TicketWorkflowState::parse(value).ok_or_else(|| {
-            format!("invalid workflow_state '{value}': expected intake, ready, queued, inprogress, or done")
+            format!("invalid workflow_state '{value}': expected planning, ready, queued, inprogress, done, or legacy intake")
         })?),
         None => None,
     };
@@ -2471,6 +2477,55 @@ mod tests {
     }
 
     #[test]
+    fn workflow_state_parses_legacy_intake_as_planning_and_emits_planning() {
+        assert_eq!(
+            TicketWorkflowState::parse("planning"),
+            Some(TicketWorkflowState::Planning)
+        );
+        assert_eq!(
+            TicketWorkflowState::parse("intake"),
+            Some(TicketWorkflowState::Planning)
+        );
+        assert_eq!(TicketWorkflowState::Planning.as_str(), "planning");
+        assert_eq!(
+            TicketWorkflowState::default_for_status(&ExtensibleTicketStatus::Open),
+            TicketWorkflowState::Planning
+        );
+    }
+
+    #[test]
+    fn workflow_state_transition_graph_allows_planning_lane_and_returns() {
+        assert!(TicketWorkflowState::is_planning_ready_transition(
+            TicketWorkflowState::Planning,
+            TicketWorkflowState::Ready
+        ));
+        assert!(TicketWorkflowState::is_queue_transition(
+            TicketWorkflowState::Ready,
+            TicketWorkflowState::Queued
+        ));
+        assert!(TicketWorkflowState::is_role_transition(
+            TicketWorkflowState::Queued,
+            TicketWorkflowState::InProgress
+        ));
+        assert!(TicketWorkflowState::is_role_transition(
+            TicketWorkflowState::InProgress,
+            TicketWorkflowState::Done
+        ));
+        assert!(TicketWorkflowState::is_role_transition(
+            TicketWorkflowState::Ready,
+            TicketWorkflowState::Planning
+        ));
+        assert!(TicketWorkflowState::is_role_transition(
+            TicketWorkflowState::Queued,
+            TicketWorkflowState::Planning
+        ));
+        assert!(!TicketWorkflowState::is_role_transition(
+            TicketWorkflowState::Planning,
+            TicketWorkflowState::Queued
+        ));
+    }
+
+    #[test]
     fn parses_item_frontmatter_and_optional_fields() {
         let item = r#"---
 id: 20260605-000000-example
@@ -2537,7 +2592,7 @@ workflow_state: intake
         assert_eq!(meta.action_required.as_deref(), Some("null"));
         assert_eq!(meta.readiness.as_deref(), Some("~"));
         assert_eq!(meta.needs_preflight, Some(false));
-        assert_eq!(meta.workflow_state, TicketWorkflowState::Intake);
+        assert_eq!(meta.workflow_state, TicketWorkflowState::Planning);
         assert!(meta.workflow_state_explicit);
     }
 
@@ -2581,7 +2636,7 @@ workflow_state: intake
         assert!(dir.join("artifacts/.gitkeep").exists());
         assert_eq!(ticket.slug, "example-ticket");
         let record = backend.show(TicketIdOrSlug::Id(ticket.id.clone())).unwrap();
-        assert_eq!(record.meta.workflow_state, TicketWorkflowState::Intake);
+        assert_eq!(record.meta.workflow_state, TicketWorkflowState::Planning);
         assert!(record.meta.workflow_state_explicit);
         let report = backend.doctor().unwrap();
         assert!(report.is_ok(), "{:?}", report.diagnostics);
@@ -2754,10 +2809,10 @@ workflow_state: intake
             .create(NewTicket::new("Typed Thread Ticket"))
             .unwrap();
         let mut change = TicketStateChange::new(
-            "preflight",
+            "requirements-sync",
             "implementation-ready",
-            "preflight approved",
-            "Preflight finished; implementation can begin.",
+            "requirements approved",
+            "Planning sync finished; implementation can begin.",
         );
         change.author = Some("orchestrator".into());
         backend
@@ -2775,13 +2830,13 @@ workflow_state: intake
             .iter()
             .find(|event| event.kind == TicketEventKind::StateChanged)
             .unwrap();
-        assert_eq!(state_event.from.as_deref(), Some("preflight"));
+        assert_eq!(state_event.from.as_deref(), Some("requirements-sync"));
         assert_eq!(state_event.to.as_deref(), Some("implementation-ready"));
-        assert_eq!(state_event.reason.as_deref(), Some("preflight approved"));
+        assert_eq!(state_event.reason.as_deref(), Some("requirements approved"));
         assert_eq!(state_event.author.as_deref(), Some("orchestrator"));
         assert_eq!(
             state_event.attributes.get("reason").map(String::as_str),
-            Some("preflight approved")
+            Some("requirements approved")
         );
         assert!(
             record
@@ -2798,7 +2853,7 @@ workflow_state: intake
         )
         .unwrap();
         assert!(thread.contains("event: state_changed"));
-        assert!(thread.contains("reason: \"preflight approved\""));
+        assert!(thread.contains("reason: \"requirements approved\""));
         assert!(thread.contains("event: intake_summary"));
         let report = backend.doctor().unwrap();
         assert!(report.is_ok(), "{:?}", report.diagnostics);
@@ -2817,11 +2872,11 @@ workflow_state: intake
             .join(&ticket.id)
             .join("item.md");
         backend
-            .set_frontmatter_fields(&item, &[("readiness", "preflight")])
+            .set_frontmatter_fields(&item, &[("readiness", "requirements-sync")])
             .unwrap();
 
         let mut change = TicketStateChange::new(
-            "preflight",
+            "requirements-sync",
             "implementation-ready",
             "requirements accepted",
             "Implementation is authorized.",
@@ -2843,7 +2898,7 @@ workflow_state: intake
             .unwrap();
         assert_eq!(event.state_field.as_deref(), Some("readiness"));
         let stale = TicketStateChange::new(
-            "preflight",
+            "requirements-sync",
             "done",
             "stale update",
             "This must be rejected.",
@@ -2861,7 +2916,7 @@ workflow_state: intake
         let missing_meta = ticket_meta(
             parse_ticket_frontmatter("status: open").expect("missing workflow state parses"),
         );
-        assert_eq!(missing_meta.workflow_state, TicketWorkflowState::Intake);
+        assert_eq!(missing_meta.workflow_state, TicketWorkflowState::Planning);
         assert!(!missing_meta.workflow_state_explicit);
 
         let closed_meta =
@@ -2896,14 +2951,14 @@ workflow_state: intake
     fn workflow_queue_rejects_non_ready_ticket_without_mutation() {
         let tmp = TempDir::new().unwrap();
         let backend = backend(&tmp);
-        let ticket = backend.create(NewTicket::new("Intake Ticket")).unwrap();
+        let ticket = backend.create(NewTicket::new("Planning Ticket")).unwrap();
 
         assert!(matches!(
             backend.queue_ready(TicketIdOrSlug::Id(ticket.id.clone()), "workspace-panel"),
             Err(TicketError::Conflict(_))
         ));
         let record = backend.show(TicketIdOrSlug::Id(ticket.id)).unwrap();
-        assert_eq!(record.meta.workflow_state, TicketWorkflowState::Intake);
+        assert_eq!(record.meta.workflow_state, TicketWorkflowState::Planning);
         assert!(record.meta.queued_by.is_none());
         assert!(
             !record
@@ -2921,7 +2976,7 @@ workflow_state: intake
             .create(NewTicket::new("Generic Workflow Bypass"))
             .unwrap();
         let change = TicketStateChange::new(
-            "intake",
+            "planning",
             "done",
             "bypass",
             "Generic state field API must not mutate workflow_state.",
@@ -2936,18 +2991,18 @@ workflow_state: intake
             Err(TicketError::Conflict(_))
         ));
         let record = backend.show(TicketIdOrSlug::Id(ticket.id)).unwrap();
-        assert_eq!(record.meta.workflow_state, TicketWorkflowState::Intake);
+        assert_eq!(record.meta.workflow_state, TicketWorkflowState::Planning);
     }
 
     #[test]
     fn mark_intake_ready_records_summary_and_state_change() {
         let tmp = TempDir::new().unwrap();
         let backend = backend(&tmp);
-        let ticket = backend.create(NewTicket::new("Intake Ready")).unwrap();
+        let ticket = backend.create(NewTicket::new("Planning Ready")).unwrap();
         let mut summary = TicketIntakeSummary::new("Concise accepted requirements.");
         summary.author = Some("intake".to_string());
         let mut change =
-            TicketStateChange::new("intake", "ready", "accepted", "Ticket is ready to queue.");
+            TicketStateChange::new("planning", "ready", "accepted", "Ticket is ready to queue.");
         change.author = Some("intake".to_string());
 
         backend
@@ -2964,7 +3019,7 @@ workflow_state: intake
         assert!(record.events.iter().any(|event| {
             event.kind == TicketEventKind::StateChanged
                 && event.state_field.as_deref() == Some("workflow_state")
-                && event.from.as_deref() == Some("intake")
+                && event.from.as_deref() == Some("planning")
                 && event.to.as_deref() == Some("ready")
         }));
     }
