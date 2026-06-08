@@ -32,6 +32,104 @@ struct ResolvedRule {
     recursive: bool,
 }
 
+/// Parsed filesystem authority this Pod may pass to spawned children.
+///
+/// Unlike [`Scope`], an empty allow list is valid and means no delegation
+/// authority. Direct tools never consult this type.
+#[derive(Debug, Clone)]
+pub struct DelegationScope {
+    allow: Vec<ResolvedRule>,
+    deny: Vec<ResolvedRule>,
+}
+
+impl DelegationScope {
+    pub fn from_config(config: &ScopeConfig) -> Result<Self, ScopeError> {
+        let allow = config
+            .allow
+            .iter()
+            .map(resolve_rule)
+            .collect::<Result<Vec<_>, _>>()?;
+        let deny = config
+            .deny
+            .iter()
+            .map(resolve_rule)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self { allow, deny })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.allow.is_empty()
+    }
+
+    pub fn allows_rule(&self, requested: &ScopeRule) -> Result<bool, ScopeError> {
+        let requested = resolve_rule(requested)?;
+        let covered = self
+            .allow
+            .iter()
+            .any(|candidate| rule_covers(candidate, &requested));
+        if !covered {
+            return Ok(false);
+        }
+        let denied = self
+            .deny
+            .iter()
+            .any(|deny| denial_overlaps_requested(deny, &requested));
+        Ok(!denied)
+    }
+}
+
+fn permission_covers(available: Permission, requested: Permission) -> bool {
+    match (available, requested) {
+        (Permission::Write, Permission::Write)
+        | (Permission::Write, Permission::Read)
+        | (Permission::Read, Permission::Read) => true,
+        (Permission::Read, Permission::Write) => false,
+    }
+}
+
+fn permission_denies_requested(denied: Permission, requested: Permission) -> bool {
+    match (denied, requested) {
+        (Permission::Write, Permission::Write)
+        | (Permission::Read, Permission::Read)
+        | (Permission::Read, Permission::Write) => true,
+        (Permission::Write, Permission::Read) => false,
+    }
+}
+
+fn rule_covers(available: &ResolvedRule, requested: &ResolvedRule) -> bool {
+    if !permission_covers(available.permission, requested.permission) {
+        return false;
+    }
+    if available.recursive {
+        return requested.target.starts_with(&available.target);
+    }
+    !requested.recursive
+        && (requested.target == available.target
+            || direct_child(&requested.target, &available.target))
+}
+
+fn denial_overlaps_requested(deny: &ResolvedRule, requested: &ResolvedRule) -> bool {
+    if !permission_denies_requested(deny.permission, requested.permission) {
+        return false;
+    }
+    match (deny.recursive, requested.recursive) {
+        (true, true) => {
+            deny.target.starts_with(&requested.target) || requested.target.starts_with(&deny.target)
+        }
+        (true, false) => requested.target.starts_with(&deny.target),
+        (false, true) => deny.target.starts_with(&requested.target),
+        (false, false) => {
+            deny.target == requested.target
+                || direct_child(&deny.target, &requested.target)
+                || direct_child(&requested.target, &deny.target)
+        }
+    }
+}
+
+fn direct_child(child: &Path, parent: &Path) -> bool {
+    child.parent().is_some_and(|candidate| candidate == parent)
+}
+
 /// Errors raised when constructing a [`Scope`] from a [`ScopeConfig`].
 #[derive(Debug, thiserror::Error)]
 pub enum ScopeError {

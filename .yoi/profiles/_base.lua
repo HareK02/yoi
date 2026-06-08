@@ -8,6 +8,7 @@ return function(opts)
         description = opts.description,
 
         scope = opts.scope or scope.workspace_read(),
+        delegation_scope = opts.delegation_scope,
 
         session = {
             record_event_trace = true,

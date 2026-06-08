@@ -565,6 +565,10 @@ fn resolve_lua_profile_value(
         model: profile.model.unwrap_or_default(),
         worker: profile.worker.unwrap_or_default(),
         scope: profile_scope_to_config(profile.scope, workspace_base),
+        delegation_scope: profile_delegation_scope_to_config(
+            profile.delegation_scope,
+            workspace_base,
+        ),
         session: profile.session,
         permissions: profile.permissions,
         compaction,
@@ -619,6 +623,8 @@ struct ProfileConfig {
     worker: Option<WorkerManifestConfig>,
     #[serde(default)]
     scope: Option<ProfileScopeConfig>,
+    #[serde(default)]
+    delegation_scope: Option<ProfileScopeConfig>,
     #[serde(default)]
     session: Option<SessionConfigPartial>,
     #[serde(default)]
@@ -1134,11 +1140,33 @@ fn profile_scope_to_config(
     scope: Option<ProfileScopeConfig>,
     workspace_base: &Path,
 ) -> ScopeConfig {
+    profile_scope_intent_to_config(
+        scope,
+        workspace_base,
+        Some(ProfileScopeIntent::WorkspaceWrite),
+    )
+}
+
+fn profile_delegation_scope_to_config(
+    scope: Option<ProfileScopeConfig>,
+    workspace_base: &Path,
+) -> ScopeConfig {
+    profile_scope_intent_to_config(scope, workspace_base, None)
+}
+
+fn profile_scope_intent_to_config(
+    scope: Option<ProfileScopeConfig>,
+    workspace_base: &Path,
+    default_intent: Option<ProfileScopeIntent>,
+) -> ScopeConfig {
     let intent = match scope {
         Some(ProfileScopeConfig::Intent { intent }) | Some(ProfileScopeConfig::String(intent)) => {
-            intent
+            Some(intent)
         }
-        None => ProfileScopeIntent::WorkspaceWrite,
+        None => default_intent,
+    };
+    let Some(intent) = intent else {
+        return ScopeConfig::default();
     };
     let permission = match intent {
         ProfileScopeIntent::WorkspaceRead => Permission::Read,
@@ -1419,6 +1447,7 @@ return profile {
             Some(ReasoningControl::Effort(ReasoningEffort::High))
         );
         assert_eq!(resolved.manifest.scope.allow[0].target, workspace);
+        assert!(resolved.manifest.delegation_scope.allow.is_empty());
         assert_eq!(
             resolved.manifest.scope.allow[0].permission,
             Permission::Read
@@ -1446,6 +1475,7 @@ return yoi.profile {
   slug = "main",
   model = shared.model,
   scope = yoi.scope.workspace_write(),
+  delegation_scope = yoi.scope.workspace_write(),
 }
 "#,
         );
@@ -1462,6 +1492,14 @@ return yoi.profile {
         );
         assert_eq!(
             resolved.manifest.scope.allow[0].permission,
+            Permission::Write
+        );
+        assert_eq!(
+            resolved.manifest.delegation_scope.allow[0].target,
+            tmp.path().canonicalize().unwrap()
+        );
+        assert_eq!(
+            resolved.manifest.delegation_scope.allow[0].permission,
             Permission::Write
         );
     }

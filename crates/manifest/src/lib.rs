@@ -21,7 +21,7 @@ pub use profile::{
     resolve_profile_artifact,
 };
 pub use protocol::{Permission, ScopeRule};
-pub use scope::{Scope, ScopeError, SharedScope};
+pub use scope::{DelegationScope, Scope, ScopeError, SharedScope};
 
 use std::collections::HashMap;
 use std::num::NonZeroU32;
@@ -40,7 +40,12 @@ pub struct PodManifest {
     pub pod: PodMeta,
     pub model: ModelManifest,
     pub worker: WorkerManifest,
+    /// Direct filesystem authority for this Pod's own tools.
     pub scope: ScopeConfig,
+    /// Filesystem authority this Pod may pass to spawned children. Missing
+    /// metadata/config defaults to no delegation authority.
+    #[serde(default)]
+    pub delegation_scope: ScopeConfig,
     /// Session/debug persistence settings. Defaults keep extra traces off.
     #[serde(default)]
     pub session: SessionConfig,
@@ -644,11 +649,24 @@ permission = "write"
         assert!(manifest.model.auth.is_none());
         assert_eq!(manifest.scope.allow.len(), 1);
         assert!(manifest.scope.deny.is_empty());
+        assert!(manifest.delegation_scope.allow.is_empty());
+        assert!(manifest.delegation_scope.deny.is_empty());
         assert_eq!(manifest.worker.instruction, defaults::DEFAULT_INSTRUCTION);
         assert!(manifest.worker.top_p.is_none());
         assert!(manifest.worker.top_k.is_none());
         assert!(manifest.worker.stop_sequences.is_empty());
         assert!(manifest.web.is_none());
+    }
+
+    #[test]
+    fn deserialize_old_manifest_snapshot_defaults_to_no_delegation() {
+        let manifest = PodManifest::from_toml(MINIMAL_REQUIRED).unwrap();
+        let mut snapshot = serde_json::to_value(&manifest).unwrap();
+        snapshot.as_object_mut().unwrap().remove("delegation_scope");
+        let restored: PodManifest = serde_json::from_value(snapshot).unwrap();
+        assert_eq!(restored.scope.allow.len(), 1);
+        assert!(restored.delegation_scope.allow.is_empty());
+        assert!(restored.delegation_scope.deny.is_empty());
     }
 
     #[test]
@@ -702,6 +720,14 @@ recursive = false
 [[scope.deny]]
 target = "/abs/project/secrets.rs"
 permission = "write"
+
+[[delegation_scope.allow]]
+target = "/abs/project/tasks"
+permission = "write"
+
+[[delegation_scope.deny]]
+target = "/abs/project/tasks/private"
+permission = "write"
 "#;
         let manifest = PodManifest::from_toml(toml).unwrap();
         assert_eq!(manifest.pod.name, "code-reviewer");
@@ -728,6 +754,12 @@ permission = "write"
         assert!(!allow[1].recursive);
         assert_eq!(manifest.scope.deny.len(), 1);
         assert_eq!(manifest.scope.deny[0].permission, Permission::Write);
+        assert_eq!(manifest.delegation_scope.allow.len(), 1);
+        assert_eq!(
+            manifest.delegation_scope.allow[0].permission,
+            Permission::Write
+        );
+        assert_eq!(manifest.delegation_scope.deny.len(), 1);
     }
 
     #[test]
