@@ -90,3 +90,57 @@ Escalate if:
 - Background reload cancellation/ordering needs a new durable scheduler or lease concept rather than a local UI guard.
 
 ---
+
+<!-- event: intake_summary author: intake at: 2026-06-07T23:57:14Z -->
+
+## Intake summary
+
+Existing Ticket is already sufficiently clarified for routing. Scope covers non-blocking `yoi panel` transition UX: immediate redraw on nested-Pod return with background refresh, visible progress before panel-originated Pod launch/restore/open/attach waits, and practical reduction of first-draw blocking while preserving Ticket workflow semantics, Pod restore/spawn authority, input handling, and reload correctness. Readiness: implementation_ready. needs_preflight: true. risk_flags: [tui-lifecycle, async-reload, pod-attach, orchestrator-observation].
+
+---
+
+<!-- event: state_changed author: intake at: 2026-06-07T23:57:14Z from: intake to: ready reason: intake_ready field: workflow_state -->
+
+## State changed
+
+Intake reconfirmed the existing Ticket as ready for Orchestrator routing. No duplicate Ticket was created. Prior thread context already records the queued attempt and Orchestrator preflight-needed decision; implementation must not start from Intake.
+
+---
+
+<!-- event: state_changed author: workspace-panel at: 2026-06-08T00:02:21Z from: ready to: queued reason: queued field: workflow_state -->
+
+## State changed
+
+Ticket queued for Orchestrator routing.
+
+
+---
+
+<!-- event: decision author: orchestrator at: 2026-06-08T00:02:48Z -->
+
+## Decision
+
+Routing decision: preflight_needed
+
+Reason:
+- This Ticket is still queued for routing, but the recorded scope touches async TUI lifecycle, background reload ordering/guarding, Pod launch/restore/attach progress states, and Orchestrator observation timing.
+- The thread explicitly records `needs_preflight: true` risk context and an earlier Orchestrator decision that preflight must cover transition paths, reload overlap prevention, input/selection preservation, synchronous correctness boundaries, and test strategy.
+- No subsequent preflight decision or design note is present that converts those risks into binding implementation invariants.
+- Current workspace state also contains unrelated dirty/untracked Ticket records, so implementation side effects should not start from this routing pass.
+
+Evidence checked:
+- Ticket body: background, requirements, non-goals, and acceptance criteria.
+- Thread: intake summaries, user scope clarification, prior `preflight_needed` routing decision, and latest `ready -> queued` event.
+- Workspace state: `develop` has modified Ticket files for this queued Ticket plus unrelated untracked Ticket records; no matching worktree or branch exists for this slug.
+- Visible Pods: only the Intake peer for this Ticket and this Orchestrator are live; no coder/reviewer implementation Pods are active.
+
+Next action:
+- Run `ticket-preflight-workflow` and record the concise preflight/design note before implementation delegation.
+- Leave this Ticket queued for now; do not transition `queued -> inprogress`, create `.worktree/workspace-panel-nonblocking-transitions`, or spawn coder/reviewer Pods until preflight records that implementation may proceed.
+
+Escalate if:
+- The non-blocking first-draw or attach-return path requires a broad TUI runtime-loop rewrite.
+- Pod launch/restore progress states would require changing spawn/restore authority semantics.
+- Background reload ordering requires a durable scheduler/lease rather than a local UI guard.
+
+---

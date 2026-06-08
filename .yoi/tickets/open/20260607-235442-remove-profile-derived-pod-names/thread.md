@@ -172,3 +172,11 @@ Escalate if:
 - Implementation tries to preserve old Profile-derived names for compatibility rather than removing the design problem.
 
 ---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-08T00:57:20Z from: queued to: inprogress reason: orchestrator_acceptance field: workflow_state -->
+
+## State changed
+
+Accepted as part of the coordinated runtime workspace / Pod identity implementation bundle. This acceptance precedes worktree creation and coder/reviewer Pod spawning.
+
+---

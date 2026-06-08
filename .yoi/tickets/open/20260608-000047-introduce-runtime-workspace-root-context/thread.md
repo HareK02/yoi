@@ -218,3 +218,11 @@ Critical risks / reviewer focus:
 - Memory root and project root must not be collapsed.
 
 ---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-08T00:57:20Z from: queued to: inprogress reason: orchestrator_acceptance field: workflow_state -->
+
+## State changed
+
+Accepted queued implementation bundle after shared preflight boundary and routing IntentPacket were recorded. This acceptance precedes worktree creation and coder/reviewer Pod spawning.
+
+---
