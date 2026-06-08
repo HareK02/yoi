@@ -83,3 +83,22 @@ Validation:
 - `nix build .#yoi` before final completion because TUI/package behavior changes.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-08T13:16:57Z -->
+
+## Implementation report
+
+Implementation routing started.
+
+Worktree/branch:
+- Worktree: `.worktree/tui-chat-markdown-table-rendering`
+- Branch: `tui-chat-markdown-table-rendering`
+- Base/routing commit: `60609ec ticket: route tui markdown table rendering`
+
+Spawned sibling Coder Pod:
+- `coder-tui-chat-markdown-table-rendering`
+- Scope: non-recursive read on parent workspace root plus recursive write limited to the child worktree.
+
+Note: an unrelated Ticket record update (`tui-composer-history-persistence` ready state) and project known-issues/objective records were committed before routing so the main workspace was clean enough for implementation side effects.
+
+---
