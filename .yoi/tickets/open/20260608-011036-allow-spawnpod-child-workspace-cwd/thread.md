@@ -240,3 +240,31 @@ Pending:
 - No merge, close, final approval, or cleanup has occurred for this Ticket.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-08T07:32:03Z -->
+
+## Implementation report
+
+Reviewer returned `request_changes`; coder fix-loop delegated.
+
+Reviewer verdict:
+- `request_changes`
+
+Blocker:
+- Current implementation makes `cwd` affect spawned child runtime workspace/context instead of only child process/tool working directory.
+
+Reviewer evidence:
+- `SpawnPod` launches the child command with `.current_dir(child_cwd)`.
+- The child `yoi pod --adopt` entrypoint defaults `--workspace` to `.` and resolves it through `std::env::current_dir()`.
+- Runtime setup then sets current_dir to that workspace and `Pod::new` captures current pwd for workspace-like context, memory layout, and workflow loading.
+- Therefore `cwd=<repo>/.worktree/<task>` causes the child runtime to derive workspace/memory/workflow context from the worktree, violating the Ticket invariant that `cwd` is not runtime workspace root and must not affect project/Ticket/workflow/memory/Profile context.
+
+Action taken:
+- Sent fix-loop instructions to `coder-spawnpod-child-cwd`.
+- Required fix: preserve inherited runtime workspace root/context separately from requested tool/Bash `cwd`; ensure omitted `cwd` preserves existing behavior; keep validation independent from authority; add tests that fail against the blocked implementation rather than only fake-command `pwd` tests.
+
+Pending:
+- Await coder fix report and reviewer re-review.
+- No merge, close, final approval, or cleanup has occurred.
+
+---
