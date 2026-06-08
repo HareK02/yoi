@@ -312,6 +312,10 @@ pub struct Pod<C: LlmClient, St: Store> {
     /// `Method::PodEvent` reports upward (turn end, error, shutdown,
     /// scope sub-delegation).
     callback_socket: Option<PathBuf>,
+    /// Transient launch role for Ticket role sessions. This is process-local
+    /// runtime identity used by controller policy; it is not model-visible and
+    /// is not persisted into Ticket claim/session records.
+    runtime_ticket_role: Option<String>,
     /// Central catalog of Pod-level prompt strings (compaction system
     /// prompt, notification wrapper, interrupt notes, trailing system
     /// sections, ...). Built from the 4-layer overlay in
@@ -435,6 +439,7 @@ impl<C: LlmClient + Clone + 'static, St: Store + Clone + 'static> Pod<C, St> {
             pending_attachments: Arc::new(Mutex::new(Vec::<SystemItem>::new())),
             scope_allocation: None,
             callback_socket: None,
+            runtime_ticket_role: None,
             prompts: self.prompts.clone(),
             workflow_registry: self.workflow_registry.clone(),
             memory_layout: self.memory_layout.clone(),
@@ -616,6 +621,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             pending_attachments: Arc::new(Mutex::new(Vec::<SystemItem>::new())),
             scope_allocation: None,
             callback_socket: None,
+            runtime_ticket_role: None,
             prompts,
             workflow_registry: workflow_crate::WorkflowRegistry::empty(),
             memory_layout: None,
@@ -693,6 +699,17 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     /// The Pod's manifest.
     pub fn manifest(&self) -> &PodManifest {
         &self.manifest
+    }
+
+    /// Process-local Ticket role marker supplied by the role launcher.
+    pub fn runtime_ticket_role(&self) -> Option<&str> {
+        self.runtime_ticket_role.as_deref()
+    }
+
+    /// Set the process-local Ticket role marker. Intended for entrypoint
+    /// launch metadata, not for model-visible prompts or durable claims.
+    pub fn set_runtime_ticket_role(&mut self, role: Option<String>) {
+        self.runtime_ticket_role = role;
     }
 
     /// The Pod's working directory.
@@ -3748,6 +3765,7 @@ where
             pending_attachments: Arc::new(Mutex::new(Vec::<SystemItem>::new())),
             scope_allocation: Some(scope_allocation),
             callback_socket: None,
+            runtime_ticket_role: None,
             prompts: common.prompts,
             workflow_registry: common.workflow_registry,
             memory_layout: common.memory_layout,
@@ -3827,6 +3845,7 @@ where
             pending_attachments: Arc::new(Mutex::new(Vec::<SystemItem>::new())),
             scope_allocation: Some(scope_allocation),
             callback_socket: Some(callback_socket),
+            runtime_ticket_role: None,
             prompts: common.prompts,
             workflow_registry: common.workflow_registry,
             memory_layout: common.memory_layout,
@@ -4007,6 +4026,7 @@ where
             pending_attachments: Arc::new(Mutex::new(Vec::<SystemItem>::new())),
             scope_allocation: Some(scope_allocation),
             callback_socket: None,
+            runtime_ticket_role: None,
             prompts: common.prompts,
             workflow_registry: common.workflow_registry,
             memory_layout: common.memory_layout,
