@@ -2,13 +2,13 @@
 id: '20260608-010442-split-direct-and-delegation-authority'
 slug: 'split-direct-and-delegation-authority'
 title: 'Split direct and delegation authority for Pods'
-status: 'open'
+status: 'closed'
 kind: 'task'
 priority: 'P1'
 labels: ['pod', 'scope', 'delegation', 'orchestrator', 'security', 'profile']
-workflow_state: 'inprogress'
+workflow_state: 'done'
 created_at: '2026-06-08T01:04:42Z'
-updated_at: '2026-06-08T06:40:40Z'
+updated_at: '2026-06-08T06:43:52Z'
 assignee: null
 legacy_ticket: null
 queued_by: 'workspace-panel'
