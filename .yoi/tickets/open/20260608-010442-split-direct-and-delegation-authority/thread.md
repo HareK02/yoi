@@ -296,3 +296,88 @@ Pending:
 - No merge, close, final approval, or cleanup has occurred.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-08T06:40:40Z -->
+
+## Implementation report
+
+Merge-ready dossier: direct/delegation authority split
+
+Ticket id/slug:
+- `20260608-010442-split-direct-and-delegation-authority` / `split-direct-and-delegation-authority`
+
+Branch/worktree:
+- Branch: `split-direct-and-delegation-authority`
+- Worktree: `.worktree/split-direct-and-delegation-authority`
+- Current branch commits:
+  - `a4a9b00 feat: split direct and delegation scope authority`
+  - `f43c8ac fix: validate delegation path sets exactly`
+
+Intent / invariant check:
+- Direct scope and delegation/subdelegation scope are now represented separately.
+- Direct scope continues to authorize the current Pod's own tools.
+- `SpawnPod` validates requested child scope against delegation authority, not direct scope.
+- Missing old delegation metadata defaults to no delegation/fail-closed for child delegation.
+- Broad direct workspace/write scope no longer implies broad child delegation.
+- Role defaults intentionally grant delegation to Orchestrator only in the project profile updates; Companion/Intake/Coder/Reviewer remain without broad delegation.
+- Registry allocation/reclaim and direct tool scope semantics were not intentionally weakened.
+
+Implementation summary:
+- Added `delegation_scope` to manifest/profile resolution separately from direct `scope`.
+- Added `DelegationScope` representation and validation helpers in manifest scope handling.
+- Updated Pod runtime/config snapshot paths to carry delegation grants durably/replayably with missing delegation defaulting to none.
+- Updated `SpawnPod` validation/diagnostics to use delegation grant.
+- Updated project role Profiles so Orchestrator explicitly receives workspace-write delegation and base/non-orchestrator roles do not inherit it.
+- Added regression tests for no-delegation denial, explicit delegation success, over-delegation rejection, missing-old-metadata default, Profile Lua delegation resolution, recursive/non-recursive path-set subset handling, and deny overlap behavior.
+
+Files touched:
+- `.yoi/profiles/_base.lua`
+- `.yoi/profiles/orchestrator.lua`
+- `crates/manifest/src/config.rs`
+- `crates/manifest/src/lib.rs`
+- `crates/manifest/src/profile.rs`
+- `crates/manifest/src/scope.rs`
+- `crates/pod/src/pod.rs`
+- `crates/pod/src/spawn/tool.rs`
+- `crates/pod/tests/spawn_pod_test.rs`
+
+Coder / reviewer Pods:
+- Coder: `coder-split-direct-delegation`
+- Reviewer: `reviewer-split-direct-delegation`
+
+Review evidence:
+- Initial reviewer verdict: `request_changes` for recursive=false path-set over-delegation and deny-overlap under-detection.
+- Coder fix commit: `f43c8ac fix: validate delegation path sets exactly`.
+- Re-review verdict: `approve`.
+- Reviewer confirmed `recursive=false /repo` no longer permits `recursive=false /repo/child`, `recursive=true /repo` permits `recursive=false /repo/child`, deny `recursive=false /repo` overlaps request `recursive=true /repo/child`, direct/delegation split remains intact, missing delegation metadata fails closed, and role grants remain intentional.
+
+Validation performed by coder and/or reviewer:
+- `cargo test -p manifest profile --lib`
+- `cargo test -p manifest deserialize_old_manifest_snapshot_defaults_to_no_delegation --lib`
+- `cargo test -p manifest delegation_ --lib`
+- `cargo test -p manifest --lib`
+- `cargo test -p pod spawn_pod --test spawn_pod_test`
+- `cargo test -p pod-registry`
+- `cargo check -q`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo run -q -p yoi -- ticket doctor`
+- `nix build .#yoi`
+
+Blockers fixed or rejected findings:
+- Fixed: recursive=false delegation subset over-approval.
+- Fixed: non-recursive deny vs recursive request overlap under-detection.
+- No remaining reviewer blockers.
+
+Residual risks:
+- The implementation conservatively rejects delegating non-recursive direct-child scope from a non-recursive parent grant because path validation is path-based rather than file/directory-aware. Reviewer accepted this safety-first behavior.
+- Future support for child Pods that themselves may subdelegate will require an explicit separate child-delegation request/validation/persistence surface; this is outside the current Ticket.
+
+Dirty state:
+- Child worktree is clean at `f43c8ac`.
+- Main workspace has unrelated Ticket-record edits for queued/preflight work; they are outside this branch's touched paths and are understood.
+
+Parent/human decision needs:
+- User has authorized merge-completion and cleanup after approved work. Proceeding to merge-completion unless post-merge validation fails.
+
+---
