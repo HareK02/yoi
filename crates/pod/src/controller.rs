@@ -17,6 +17,10 @@ use crate::pod::{Pod, PodError, PodRunResult, SystemItemCommitter};
 use crate::runtime::dir::RuntimeDir;
 use crate::segment_log_sink::SegmentLogSink;
 use crate::shared_state::PodSharedState;
+use crate::shutdown_after_idle::{
+    ShutdownAfterIdleRequest, TicketIntakeReadyShutdownHook, is_ticket_intake_role,
+    take_shutdown_request_after_status,
+};
 use crate::spawn::comm_tools::{read_pod_output_tool, send_to_pod_tool, stop_pod_tool};
 use crate::spawn::registry::SpawnedPodRegistry;
 use crate::spawn::tool::spawn_pod_tool;
@@ -221,6 +225,16 @@ impl PodController {
             spawned_registry.clone(),
         );
 
+        // Intake role Pods self-terminate only after a successful
+        // TicketIntakeReady turn has fully settled back to Idle. The request
+        // is transient controller state, not model-visible context or ticket
+        // claim metadata.
+        let shutdown_after_idle = ShutdownAfterIdleRequest::default();
+        pod.add_post_tool_call_hook(TicketIntakeReadyShutdownHook::new(
+            shutdown_after_idle.clone(),
+            is_ticket_intake_role(pod.runtime_ticket_role()),
+        ));
+
         // Materialise pending tool factories so the greeting reflects
         // the actual registered set instead of a hand-maintained mirror.
         pod.worker().tool_server_handle().flush_pending();
@@ -282,6 +296,7 @@ impl PodController {
             spawned_registry,
             shutdown_tx,
             socket_server,
+            shutdown_after_idle,
         ));
 
         Ok((handle, shutdown_rx))
@@ -592,6 +607,7 @@ async fn controller_loop<C, St>(
     spawned_registry: Arc<SpawnedPodRegistry>,
     shutdown_tx: oneshot::Sender<()>,
     socket_server: SocketServer,
+    shutdown_after_idle: ShutdownAfterIdleRequest,
 ) where
     C: LlmClient + Clone + 'static,
     St: Store + PodMetadataStore + Clone + 'static,
@@ -675,6 +691,10 @@ async fn controller_loop<C, St>(
             finish_controller_run(&mut pod, &shared_state, &runtime_dir, &event_tx, new_status)
                 .await;
             if shutdown {
+                let _ = event_tx.send(Event::Shutdown);
+                break;
+            }
+            if take_shutdown_request_after_status(&shutdown_after_idle, new_status) {
                 let _ = event_tx.send(Event::Shutdown);
                 break;
             }

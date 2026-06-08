@@ -9,6 +9,7 @@ use manifest::{
 };
 use pod_store::{CombinedStore, FsPodStore, PodMetadataStore};
 use session_store::{FsStore, SegmentId, Store};
+use ticket::config::TicketRole;
 
 #[derive(Debug, Parser)]
 #[command(about = "Spawn a Pod process from a profile or a single manifest file")]
@@ -64,6 +65,10 @@ struct Cli {
     /// callbacks upward. Required alongside `--adopt`.
     #[arg(long, value_name = "PATH", requires = "adopt")]
     callback: Option<PathBuf>,
+
+    /// Process-local Ticket role marker supplied by the Ticket role launcher.
+    #[arg(long, hide = true)]
+    ticket_role: Option<String>,
 
     /// Resume or create a Pod by name. If name-keyed Pod state exists,
     /// the active session/segment recorded there is restored; otherwise a
@@ -342,7 +347,7 @@ async fn run_cli_inner(cli: Cli) -> ExitCode {
     };
     let store = CombinedStore::new(session_store, pod_store);
 
-    let pod = if cli.adopt {
+    let mut pod = if cli.adopt {
         let callback = match cli.callback.clone() {
             Some(p) => p,
             None => {
@@ -423,6 +428,13 @@ async fn run_cli_inner(cli: Cli) -> ExitCode {
             }
         }
     };
+    if let Some(role) = cli.ticket_role.clone() {
+        if TicketRole::parse(&role).is_none() {
+            eprintln!("error: invalid --ticket-role {role:?}");
+            return ExitCode::FAILURE;
+        }
+        pod.set_runtime_ticket_role(Some(role));
+    }
     let pod_name = pod.manifest().pod.name.clone();
 
     // Spawn the controller (starts socket server)

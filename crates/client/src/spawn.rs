@@ -32,6 +32,9 @@ pub struct SpawnConfig {
     /// Optional reusable Profile selector. Pod identity is always supplied
     /// separately with `--pod`; profile selection must not imply a name.
     pub profile: Option<String>,
+    /// Process-local Ticket role marker supplied only by Ticket role launches.
+    /// This does not alter prompts, manifests, or Ticket claim records.
+    pub ticket_role: Option<String>,
     /// Explicit runtime workspace root. The child uses it as process cwd and
     /// receives it via `--workspace` so startup does not infer workspace
     /// identity from the parent process cwd.
@@ -122,6 +125,9 @@ fn runtime_args(config: &SpawnConfig) -> Vec<String> {
         if let Some(profile) = &config.profile {
             args.extend(["--profile".to_string(), profile.clone()]);
         }
+    }
+    if let Some(ticket_role) = &config.ticket_role {
+        args.extend(["--ticket-role".to_string(), ticket_role.clone()]);
     }
     args
 }
@@ -327,6 +333,7 @@ mod tests {
             runtime_command: PodRuntimeCommand::new("/bin/yoi", vec![OsString::from("pod")]),
             pod_name: "explicit-pod".to_string(),
             profile: Some("project:companion".to_string()),
+            ticket_role: None,
             workspace_root: PathBuf::from("/work/other-project"),
             resume_from: None,
         }
@@ -360,6 +367,26 @@ mod tests {
                 "00000000-0000-0000-0000-000000000000",
                 "--pod",
                 "explicit-pod",
+            ]
+        );
+    }
+
+    #[test]
+    fn runtime_args_pass_ticket_role_marker_when_present() {
+        let mut config = base_config();
+        config.ticket_role = Some("intake".to_string());
+
+        assert_eq!(
+            runtime_args(&config),
+            vec![
+                "--workspace",
+                "/work/other-project",
+                "--pod",
+                "explicit-pod",
+                "--profile",
+                "project:companion",
+                "--ticket-role",
+                "intake",
             ]
         );
     }
