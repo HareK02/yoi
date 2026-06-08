@@ -240,3 +240,37 @@ Pending:
 - No merge, close, final approval, or cleanup has occurred for this Ticket.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-08T09:09:28Z -->
+
+## Implementation report
+
+Reviewer returned `request_changes`; coder fix-loop delegated.
+
+Reviewer verdict:
+- `request_changes`
+
+Blockers:
+1. Workflow docs reference a non-existent planning-sync workflow slug:
+   - `.yoi/workflow/multi-agent-workflow.md`
+   - `.yoi/workflow/ticket-intake-workflow.md`
+   - references such as `ticket-planning sync-workflow` / `$user/ticket-planning sync-workflow` have no matching workflow file and contain a space inside the apparent slug.
+   - Since `ticket-preflight-workflow.md` remains as compatibility slug rewritten toward planning/requirements sync, references should use the actual compatibility slug or a deliberate new real slug.
+2. Maintained docs still present “Preflight” as a normal lifecycle gate:
+   - `docs/development/work-items.md` still says “Ticket Intake, Orchestrator Routing, Preflight, and Multi-agent workflows” and “Preflight or spike when needed.”
+   - This conflicts with the binding decision to not preserve standalone Preflight as a workflow state/lane/long-lived gate.
+
+Reviewer non-blocking observations:
+- Rust implementation and focused tests look sound.
+- Existing tracked Ticket records containing `workflow_state: intake` are acceptable because legacy parse normalizes to `Planning` and doctor passes.
+- `needs_preflight` remaining as legacy metadata/model output is acceptable if it is no longer a public tool input/stop gate.
+- “Ticket Intake” wording remains acceptable where it means role/persona rather than workflow state.
+
+Action taken:
+- Sent fix-loop instructions to `coder-replace-intake-planning` with the workflow slug and docs wording blockers.
+
+Pending:
+- Await coder fix report and reviewer re-review.
+- No merge, close, final approval, or cleanup has occurred.
+
+---
