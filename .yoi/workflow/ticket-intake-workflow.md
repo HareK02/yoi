@@ -22,7 +22,7 @@ User request / conversation
 
 - `Ticket` は durable orchestration record。
 - `Task` は session-local progress tracking。
-- `Assignment` は Orchestrator から coder / reviewer / investigator Pod への具体的委譲。
+- `Assignment` は Orchestrator から coder / reviewer Pod、または task-specific helper Pod への具体的委譲。
 - `IntentPacket` は Ticket から抽出して Assignment に渡す短い実装・レビュー契約。
 
 Intake は、要件同期と Ticket 化を担当する。実装の起動・worktree 作成・review 委譲・merge 判断は Orchestrator 側の責務である。`ready` は Orchestrator が routing できる状態を意味し、実装戦術がすべて事前固定されていることを意味しない。
@@ -47,7 +47,7 @@ Intake は以下を行う。
 
 ## Intake がしないこと
 
-- coder / reviewer / investigator Pod を起動しない。
+- coder / reviewer Pod や read-only investigation helper Pod を起動しない。
 - worktree を作らない。
 - merge / close / branch cleanup をしない。
 - implementation-ready でない Ticket を実装に投げない。

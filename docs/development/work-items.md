@@ -10,7 +10,7 @@ Do not treat ad-hoc chat summaries, memory records, or Pod notifications as the 
 
 - `Ticket`: durable project/orchestration record. It contains requirements, decisions, plans, implementation reports, reviews, artifacts, and resolution history.
 - `Task`: session-local progress tracking inside a Pod. It is not the project record.
-- `Assignment`: a concrete delegation from an Orchestrator to a coder/reviewer/investigator Pod.
+- `Assignment`: a concrete delegation from an Orchestrator to a coder/reviewer Pod or task-specific helper Pod.
 - `IntentPacket`: the short implementation/review contract derived from a Ticket and handed to an Assignment.
 - `LocalTicketBackend`: the current `.yoi/tickets/` markdown/thread/artifacts storage backend.
 
@@ -80,11 +80,6 @@ workflow = "multi-agent-workflow"
 profile = "project:reviewer"
 launch_prompt = "$workspace/ticket/reviewer/launch"
 workflow = "multi-agent-workflow"
-
-[roles.investigator]
-profile = "project:investigator"
-launch_prompt = "$workspace/ticket/investigator/launch"
-workflow = "ticket-orchestrator-routing"
 ```
 
 Fixed roles are:
@@ -93,9 +88,10 @@ Fixed roles are:
 - `orchestrator`
 - `coder`
 - `reviewer`
-- `investigator`
 
 This is not an arbitrary role registry. The fixed roles are the roles required by Ticket orchestration.
+Stale `[roles.investigator]` config is rejected as an unsupported fixed role; remove it and,
+when a spike is useful, let the Orchestrator create an ordinary task-specific read-only helper Pod.
 
 `profile` selects the Pod runtime Profile for that role. The selected Profile owns durable role/system behavior. `ticket.config.toml` does not have a role-level `system_instruction` field.
 
@@ -116,7 +112,6 @@ If `.yoi/ticket.config.toml` is missing, defaults are:
   - orchestrator: `ticket-orchestrator-routing`
   - coder: `multi-agent-workflow`
   - reviewer: `multi-agent-workflow`
-  - investigator: `ticket-orchestrator-routing`
 
 Important: top-level Ticket role launches cannot execute `profile = "inherit"` because top-level launch has no parent Profile to inherit from. Configure concrete role profiles in `.yoi/ticket.config.toml` before using `yoi panel` role-launch actions.
 
@@ -227,7 +222,6 @@ Role actions map to the same fixed roles configured in `.yoi/ticket.config.toml`
 
 - intake launches the intake role without an existing Ticket and requires freeform context.
 - route launches the orchestrator role for an existing Ticket.
-- investigate launches the investigator role for a read-only spike/investigation.
 - implement launches the coder role for an implementation assignment.
 - review launches the reviewer role for review.
 
@@ -286,10 +280,6 @@ workflow = "multi-agent-workflow"
 [roles.reviewer]
 profile = "project:reviewer"
 workflow = "multi-agent-workflow"
-
-[roles.investigator]
-profile = "project:investigator"
-workflow = "ticket-orchestrator-routing"
 ```
 
 If a role still uses `profile = "inherit"`, the panel fails closed with a diagnostic explaining that a concrete profile is required.
@@ -298,7 +288,7 @@ If a role still uses `profile = "inherit"`, the panel fails closed with a diagno
 
 - `profile = "inherit"`: configure a concrete role Profile in `.yoi/ticket.config.toml`.
 - malformed `.yoi/ticket.config.toml`: fix the config and retry.
-- missing Ticket id/slug for route, investigate, implement, or review actions: provide the target Ticket.
+- missing Ticket id/slug for route, implement, or review actions: provide the target Ticket.
 - launch success but no visible completion: attach to or inspect the launched Pod; completion notifications are hints, not authority.
 
 ## Granularity

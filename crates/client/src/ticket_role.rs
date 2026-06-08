@@ -553,7 +553,7 @@ fn append_role_execution_guidance(out: &mut String, role: TicketRole) {
         TicketRole::Orchestrator => append_orchestrator_agent_routing_guidance(out),
         TicketRole::Coder => append_coder_agent_routing_guidance(out),
         TicketRole::Reviewer => append_reviewer_agent_routing_guidance(out),
-        TicketRole::Intake | TicketRole::Investigator => {}
+        TicketRole::Intake => {}
     }
 }
 

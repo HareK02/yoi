@@ -50,7 +50,7 @@ Orchestrator は以下を行う。
 - 自動 scheduler として unattended に実行しない。
 - Panel Queue / queued notification だけを unattended scheduler trigger として扱わない。
 - `queued -> inprogress` acceptance なしに worktree 作成、implementation Pod `SpawnPod`、coder/reviewer routing を行わない。
-- 人間/上位 Orchestrator の許可または明示的な routing acceptance なしに coder / reviewer / investigator Pod を起動しない。
+- 人間/上位 Orchestrator の許可または明示的な routing acceptance なしに coder / reviewer Pod や read-only investigation helper Pod を起動しない。
 - 設計境界の未決定を勝手に implementation-ready として固定しない。
 - merge / close / cleanup 権限を持たない場面で勝手に完了処理しない。
 - Ticket tools があるからといって arbitrary filesystem write を行わない。
@@ -139,7 +139,7 @@ Action:
 Action:
 
 - read-only investigation を提案する。
-- 許可があれば investigator Pod を read-only scope で起動できる。
+- 許可があれば task-specific read-only helper Pod を普通の scoped Pod として起動できる。
 - `TicketComment` に調査問い・scope・完了条件を記録する。
 - 実装 worktree はまだ作らない。
 

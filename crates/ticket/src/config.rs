@@ -194,17 +194,19 @@ pub enum TicketRole {
     Orchestrator,
     Coder,
     Reviewer,
-    Investigator,
 }
 
 impl TicketRole {
-    pub const ALL: [TicketRole; 5] = [
+    pub const ALL: [TicketRole; 4] = [
         TicketRole::Intake,
         TicketRole::Orchestrator,
         TicketRole::Coder,
         TicketRole::Reviewer,
-        TicketRole::Investigator,
     ];
+
+    pub fn supported_names() -> Vec<&'static str> {
+        Self::ALL.iter().map(|role| role.as_str()).collect()
+    }
 
     pub fn as_str(self) -> &'static str {
         match self {
@@ -212,7 +214,6 @@ impl TicketRole {
             Self::Orchestrator => "orchestrator",
             Self::Coder => "coder",
             Self::Reviewer => "reviewer",
-            Self::Investigator => "investigator",
         }
     }
 
@@ -222,7 +223,6 @@ impl TicketRole {
             "orchestrator" => Some(Self::Orchestrator),
             "coder" => Some(Self::Coder),
             "reviewer" => Some(Self::Reviewer),
-            "investigator" => Some(Self::Investigator),
             _ => None,
         }
     }
@@ -232,7 +232,6 @@ impl TicketRole {
             Self::Intake => "ticket-intake-workflow",
             Self::Orchestrator => "ticket-orchestrator-routing",
             Self::Coder | Self::Reviewer => "multi-agent-workflow",
-            Self::Investigator => "ticket-orchestrator-routing",
         }
     }
 }
@@ -550,7 +549,10 @@ impl RawTicketConfig {
         for (name, raw_role) in self.roles {
             let role = TicketRole::parse(&name).ok_or_else(|| TicketConfigError::Invalid {
                 path: path.to_path_buf(),
-                message: format!("unknown Ticket role `{name}`"),
+                message: format!(
+                    "unsupported Ticket role `{name}`; supported fixed roles: {}",
+                    TicketRole::supported_names().join(", ")
+                ),
             })?;
             let profile_configured = raw_role.profile.is_some();
             roles.inner.insert(role, raw_role.resolve(role));
@@ -711,11 +713,6 @@ workflow = "multi-agent-workflow"
 profile = "project:reviewer"
 launch_prompt = "$workspace/ticket/reviewer/launch"
 workflow = "multi-agent-workflow"
-
-[roles.investigator]
-profile = "default"
-launch_prompt = "$workspace/ticket/investigator/launch"
-workflow = "ticket-orchestrator-routing"
 "#,
         );
 
@@ -738,8 +735,8 @@ workflow = "ticket-orchestrator-routing"
             "$workspace/ticket/reviewer/launch"
         );
         assert_eq!(
-            config.workflow_for(TicketRole::Investigator).as_str(),
-            "ticket-orchestrator-routing"
+            config.workflow_for(TicketRole::Reviewer).as_str(),
+            "multi-agent-workflow"
         );
     }
 
@@ -759,6 +756,7 @@ workflow = "ticket-orchestrator-routing"
                 role.default_workflow()
             )));
         }
+        assert!(!scaffold.contains("[roles.investigator]"));
 
         let config = TicketConfig::from_toml(
             temp.path(),
@@ -899,7 +897,41 @@ profile = "inherit"
         );
 
         let error = TicketConfig::load_workspace(temp.path()).unwrap_err();
-        assert!(error.to_string().contains("unknown Ticket role `operator`"));
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported Ticket role `operator`")
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("intake, orchestrator, coder, reviewer")
+        );
+    }
+
+    #[test]
+    fn stale_investigator_role_config_is_rejected() {
+        let temp = TempDir::new().unwrap();
+        write_config(
+            temp.path(),
+            r#"
+[roles.investigator]
+profile = "builtin:default"
+workflow = "ticket-orchestrator-routing"
+"#,
+        );
+
+        let error = TicketConfig::load_workspace(temp.path()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported Ticket role `investigator`")
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("intake, orchestrator, coder, reviewer")
+        );
     }
 
     #[test]
