@@ -2,13 +2,13 @@
 id: '20260608-103133-tui-chat-markdown-table-rendering'
 slug: 'tui-chat-markdown-table-rendering'
 title: 'TUI chat view should render Markdown tables'
-status: 'open'
+status: 'closed'
 kind: 'bug'
 priority: 'P2'
 labels: ['tui', 'chat', 'markdown', 'rendering', 'ux']
-workflow_state: 'inprogress'
+workflow_state: 'done'
 created_at: '2026-06-08T10:31:33Z'
-updated_at: '2026-06-08T13:29:26Z'
+updated_at: '2026-06-08T23:36:49Z'
 assignee: null
 risk_flags: ['tui-rendering', 'markdown']
 queued_by: 'workspace-panel'
