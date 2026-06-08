@@ -7,7 +7,7 @@ kind: task
 priority: P2
 labels: [tui, panel, ux, performance]
 created_at: 2026-06-06T23:35:20Z
-updated_at: '2026-06-08T00:02:48Z'
+updated_at: '2026-06-08T01:36:56Z'
 assignee: null
 legacy_ticket: null
 workflow_state: 'queued'

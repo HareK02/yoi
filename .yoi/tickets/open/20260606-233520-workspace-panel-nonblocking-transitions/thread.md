@@ -144,3 +144,42 @@ Escalate if:
 - Background reload ordering requires a durable scheduler/lease rather than a local UI guard.
 
 ---
+
+<!-- event: decision author: hare at: 2026-06-08T01:36:56Z -->
+
+## Decision
+
+## Binding decision: non-blocking transition scope
+
+This Ticket should implement non-blocking UX for three panel-local wait points:
+
+1. Process/Pod transition waits
+   - Panel-originated Pod spawn / restore / attach / open should show a visible progress state before awaiting runtime socket connect, restore, or spawn completion.
+   - Example states: `launching`, `restoring`, `attaching`.
+
+2. Composer submit/send confirmation waits
+   - Companion send, existing Ticket clarify/intake launch, and Ticket action dispatch should give immediate visible feedback that submit/dispatch started.
+   - On busy/rejected/failed send, preserve the draft where appropriate and surface a bounded diagnostic.
+   - On success, clear/update only according to the existing submit semantics.
+
+3. Initial panel first draw
+   - `yoi panel` should show an initial/loading/minimal panel before non-essential full snapshot, Orchestrator ensure/observe, or slow local runtime checks complete where practical.
+   - Background completion should update the panel state/diagnostics once ready.
+
+Implementation boundaries:
+
+- Reuse or extend existing local pending-task guards such as `PendingReload` where practical.
+- Prevent duplicate overlapping reload/transition tasks.
+- Preserve selected row and composer draft across background refreshes unless the submitted operation succeeds and intentionally clears the draft.
+- Keep enough synchronous checks to avoid presenting actions that would immediately violate known local state invariants.
+
+Non-goals are limited to adjacent changes that could naturally be mixed into this work:
+
+- Do not change Pod spawn/restore/attach authority, identity, or metadata semantics.
+- Do not change Ticket workflow-state/action semantics.
+- Do not introduce a durable scheduler/lease/background-job system.
+- Do not rewrite the entire TUI runtime loop.
+
+Everything else should not be listed as a non-goal unless the implementation discovers it is an actual adjacent risk. Unrelated exclusions add noise and should be avoided.
+
+---
