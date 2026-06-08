@@ -229,3 +229,55 @@ Stop/completion policy:
 - Because the human authorized cleanup after completion, this Orchestrator will proceed through reviewer approval, merge-completion validation, Ticket close, Pod stop, worktree removal, and branch deletion if the branch is approved and merge authority remains clear.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-08T08:02:48Z -->
+
+## Implementation report
+
+Coder completed and reviewer delegated.
+
+Coder result:
+- Pod: `coder-shutdown-intake-idle`
+- Commit: `61c3231 pod: stop intake after ready idle`
+- Worktree status: clean after commit.
+- Diff against `develop`: 9 files changed, 252 insertions, 1 deletion.
+
+Files touched by coder:
+- `crates/pod/src/shutdown_after_idle.rs`
+- `crates/pod/src/controller.rs`
+- `crates/pod/src/pod.rs`
+- `crates/pod/src/entrypoint.rs`
+- `crates/client/src/spawn.rs`
+- `crates/client/src/ticket_role.rs`
+- `crates/tui/src/spawn.rs`
+- `crates/tui/src/multi_pod.rs`
+- `crates/pod/src/lib.rs`
+
+Coder reported implementation:
+- Ticket role launcher passes a non-model-visible hidden CLI marker `--ticket-role <role>` to Pod runtime.
+- Pod stores process-local `runtime_ticket_role`, not durable Ticket claim/session state.
+- `TicketIntakeReady` post-tool-call hook schedules transient shutdown only when runtime role is `intake`, tool name is `TicketIntakeReady`, and result is success (`!is_error`).
+- Controller runs shutdown after `finish_controller_run(...)` has completed final response/history commit/status transition and current status is Idle.
+- If the Pod is not Idle, the shutdown request is not consumed; deterministic rule is defer until next Idle, so active turns are not interrupted.
+
+Coder reported validation:
+- `cargo test -p pod shutdown_after_idle --lib`
+- `cargo test -p pod --lib`
+- `cargo test -p client runtime_args --lib`
+- `cargo test -p client ticket_role --lib`
+- `cargo check`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo run -q -p yoi -- ticket doctor`
+- `nix build .#yoi`
+
+Reviewer delegation:
+- Spawned sibling reviewer Pod: `reviewer-shutdown-intake-idle`.
+- Reviewer scope: read-only child worktree plus non-recursive parent-root read required by current launch cwd behavior.
+- Reviewer was instructed to judge against the recorded Ticket requirements and binding decisions.
+
+Pending:
+- Await reviewer verdict before merge-ready dossier / merge-completion.
+- No merge, close, final approval, or cleanup has occurred for this Ticket.
+
+---
