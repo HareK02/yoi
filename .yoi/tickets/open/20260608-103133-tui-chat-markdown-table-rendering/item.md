@@ -6,9 +6,9 @@ status: 'open'
 kind: 'bug'
 priority: 'P2'
 labels: ['tui', 'chat', 'markdown', 'rendering', 'ux']
-workflow_state: 'queued'
+workflow_state: 'inprogress'
 created_at: '2026-06-08T10:31:33Z'
-updated_at: '2026-06-08T13:13:23Z'
+updated_at: '2026-06-08T13:15:07Z'
 assignee: null
 risk_flags: ['tui-rendering', 'markdown']
 queued_by: 'workspace-panel'
