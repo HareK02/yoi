@@ -152,3 +152,56 @@ Critical risks / reviewer focus:
 Accepted queued implementation after reading the Ticket, workspace state, and fixed-role code map. This acceptance precedes worktree creation and coder/reviewer Pod spawning.
 
 ---
+
+<!-- event: plan author: orchestrator at: 2026-06-08T11:17:39Z -->
+
+## Plan
+
+Implementation routing accepted and worktree created.
+
+Worktree plan:
+- Branch: `remove-fixed-investigator-ticket-role`
+- Worktree: `.worktree/remove-fixed-investigator-ticket-role`
+- Base: `dc65b7d ticket: route investigator role cleanup`
+- Scope: remove fixed Investigator Ticket role from role config/scaffold/runtime/prompt/workflow/doc surfaces while preserving generic read-only investigation as an ad-hoc tactic.
+
+Delegation plan:
+- Spawn sibling coder Pod with write scope limited to `.worktree/remove-fixed-investigator-ticket-role`.
+- Coder should run commands from the child worktree. The live Orchestrator may not expose `SpawnPod.cwd` until restart, so the task packet uses explicit `cd` instructions.
+- Coder must not edit main-workspace `.yoi` / Ticket / workflow / docs records, and must not create generated memory/local/runtime/secret-like files.
+- Reviewer will be spawned read-only after coder reports diff/commits and validation evidence.
+
+Dirty-state note:
+- Main workspace has unrelated Ticket-record edits/untracked Ticket records. This implementation is isolated in the child worktree and must not edit those records.
+
+Stop/completion policy:
+- Because the human authorized cleanup after completion, this Orchestrator will proceed through reviewer approval, merge-completion validation, Ticket close, Pod stop, worktree removal, and branch deletion if the branch is approved and merge authority remains clear.
+
+---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-08T11:18:27Z -->
+
+## Implementation report
+
+Implementation delegation blocked after inprogress acceptance.
+
+What succeeded:
+- Transitioned Ticket from `queued` to `inprogress` before implementation side effects.
+- Created branch/worktree `remove-fixed-investigator-ticket-role` at `.worktree/remove-fixed-investigator-ticket-role`.
+
+Blocker:
+- Spawning sibling coder Pod failed because this live Orchestrator was started before/without the newly explicit delegation grant:
+  - error: `SpawnPod requires delegation authority, but this Pod has no delegation scope grant; direct filesystem scope only authorizes this Pod's own tools`
+
+Current state:
+- No coder/reviewer Pods were spawned.
+- No implementation edits have been made in the worktree.
+- The Ticket remains `inprogress` because routing acceptance and worktree creation already happened; this is now a delegation-scope recovery issue.
+
+Next recovery options:
+- Restore/relaunch an Orchestrator with explicit delegation authority for this workspace and continue by spawning the coder with narrow worktree write scope.
+- Or explicitly authorize this Orchestrator to implement directly in the child worktree, though that would bypass the sibling coder/reviewer workflow and should be treated as a separate instruction.
+
+No merge, close, final approval, or cleanup has occurred.
+
+---
