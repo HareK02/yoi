@@ -105,3 +105,26 @@ Escalate if:
 - The intended implementation should be done directly by the current Orchestrator despite missing delegation authority; that would bypass the sibling coder/reviewer workflow and needs explicit instruction.
 
 ---
+
+<!-- event: decision author: orchestrator at: 2026-06-08T12:10:29Z -->
+
+## Decision
+
+Routing decision: waiting_for_schema_cleanup
+
+`ticket-orchestration-plan-tool` remains queued, but implementation is intentionally ordered after `remove-legacy-ticket-schema-fields`.
+
+Reason:
+- The plan tool introduces a new durable Ticket-domain API/storage/query surface.
+- `remove-legacy-ticket-schema-fields` is a lower-level cleanup of current Ticket schema/tool/API output and local Ticket record migration.
+- Running both in parallel would create unnecessary conflict risk across the Ticket backend/tool surfaces and local `.yoi/tickets` records.
+
+Next action:
+- Complete and merge `remove-legacy-ticket-schema-fields` first.
+- Re-read this Ticket against the stricter schema after that lands, then accept or re-plan it from queued state.
+
+State decision:
+- Leave this Ticket `queued`.
+- Do not create a worktree or spawn coder/reviewer for it yet.
+
+---

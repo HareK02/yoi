@@ -70,3 +70,61 @@ Ticket を `workspace-panel` が queued にしました。
 
 
 ---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-08T12:10:29Z from: queued to: inprogress reason: orchestrator_acceptance field: workflow_state -->
+
+## State changed
+
+Accepted queued implementation after reading the Ticket, intake refinement, current workspace state, and queued Ticket set. This Ticket is a lower-level Ticket schema/API cleanup and should land before implementing the queued orchestration plan tool to avoid overlapping Ticket backend/tool API churn.
+
+---
+
+<!-- event: decision author: orchestrator at: 2026-06-08T12:10:29Z -->
+
+## Decision
+
+Routing decision: implementation_ready
+
+Reason:
+- The Ticket has clear implementation-ready requirements from Intake: remove obsolete `legacy_ticket` and `needs_preflight` current schema/API surfaces, reject `workflow_state: intake`, and migrate local Ticket records.
+- The change is broad but bounded to Ticket schema/tool/API/panel/docs/tests and local Ticket record migration.
+- This should run before `ticket-orchestration-plan-tool`, because the plan tool introduces a new durable Ticket-domain surface and should be implemented on top of the stricter current Ticket schema.
+
+Evidence checked:
+- Ticket body and thread, including Intake refinement and queued event.
+- Open queued Ticket list: `remove-legacy-ticket-schema-fields` and `ticket-orchestration-plan-tool` are the current queued Tickets.
+- Main workspace dirty state was only Ticket-record updates/new Ticket records; those have been committed separately before implementation routing.
+
+IntentPacket:
+
+Intent:
+- Remove obsolete Ticket schema compatibility and current API exposure for `legacy_ticket`, `needs_preflight`, and `workflow_state: intake`.
+
+Binding decisions / invariants:
+- New/current Ticket frontmatter must not write `legacy_ticket` or `needs_preflight`.
+- `TicketCreate`, `TicketShow`, `TicketList`, panel/view-model output, and current tool/CLI surfaces must stop exposing those fields as current metadata.
+- `workflow_state: intake` must be rejected, not normalized to `planning`.
+- Missing workflow_state may remain a bounded migration fallback to `planning` if needed, but must not reintroduce `intake` vocabulary.
+- Existing local `.yoi/tickets/**/item.md` records must be migrated to the stricter schema; historical `thread.md` / `resolution.md` prose remains audit history unless a fixture requires explicit rewrite.
+- Do not introduce a replacement generic external issue field; typed relations are out of scope and belong to `typed-ticket-relation-metadata`.
+- Do not change role workflow semantics or the planning/ready/queued/inprogress/done model beyond rejecting the legacy `intake` alias.
+
+Implementation latitude:
+- Coder may choose whether migration is performed by a temporary script/manual rewrite, but the resulting diff should stay schema-focused.
+- Coder may keep internal migration-only parsing helpers if strictly needed and not exposed as current API.
+- Coder should update tests/fixtures/prompts/docs narrowly where they assert legacy fields or intake alias.
+
+Escalate if:
+- Any non-null `legacy_ticket` value is found whose deletion would lose current relation information.
+- External/runtime compatibility requirements are found that still require `needs_preflight` or `workflow_state: intake` acceptance.
+- The change requires adding typed relation metadata or broader Ticket identity redesign.
+
+Validation:
+- Focused Ticket schema/parser/writer/tool output tests.
+- Focused yoi Ticket CLI/tool tests and panel/view-model tests if outputs change.
+- `cargo fmt --check`.
+- `git diff --check`.
+- `cargo run -q -p yoi -- ticket doctor` with migrated local records.
+- `cargo check --workspace` and final `nix build .#yoi` because code/tool/schema/resources may change.
+
+---

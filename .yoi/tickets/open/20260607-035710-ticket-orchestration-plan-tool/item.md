@@ -8,7 +8,7 @@ priority: P1
 labels: [ticket, orchestrator, planning, workflow, tools]
 workflow_state: 'queued'
 created_at: 2026-06-07T03:57:10Z
-updated_at: '2026-06-08T11:21:42Z'
+updated_at: '2026-06-08T12:10:29Z'
 assignee: null
 legacy_ticket: null
 queued_by: 'workspace-panel'
