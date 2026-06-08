@@ -333,3 +333,36 @@ Pending:
 - No merge, close, final approval, or cleanup has occurred.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-08T01:43:05Z -->
+
+## Implementation report
+
+Reviewer returned `request_changes`; coder fix-loop delegated.
+
+Reviewer verdict:
+- `request_changes`
+
+Blockers:
+1. Client spawn emits `--session ... --pod ...`, but `crates/pod/src/entrypoint.rs` still rejects `--session` with `--pod`.
+2. Top-level `yoi --session ... --pod ...` is still rejected in `crates/yoi/src/main.rs`, contradicting the binding decision that `--pod` is runtime identity for restore and fresh create.
+3. Hidden `--session-pod-name` remains in `crates/pod/src/entrypoint.rs` as a session-specific identity path, preserving the old split this bundle is meant to remove/collapse.
+
+Reviewer evidence:
+- Reviewed diff `develop...b6af761`.
+- Ran focused tests for client/pod/yoi/tui/manifest/memory paths.
+- Focused CLI probes showed both top-level and `yoi pod` restore forms reject `--session ... --pod ...`.
+
+Non-blocking reviewer observations:
+- Profile-derived identity removal looked aligned.
+- Panel Companion/Orchestrator naming looked aligned.
+- Ticket role explicit names looked aligned.
+- Memory-root behavior did not appear conflated.
+
+Action taken:
+- Sent fix-loop instructions to `coder-runtime-workspace-context-2` with the three blockers and required focused tests.
+- Reviewer approval is pending after coder fix report and re-review.
+
+No merge, close, final approval, or cleanup has occurred.
+
+---
