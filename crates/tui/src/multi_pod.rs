@@ -102,18 +102,26 @@ pub(crate) struct OpenPodRequest {
 pub(crate) async fn load_app(
     runtime_command: PodRuntimeCommand,
 ) -> Result<MultiPodApp, MultiPodError> {
-    MultiPodApp::load(None, runtime_command).await
+    Ok(MultiPodApp::loading(runtime_command))
 }
 
 pub(crate) async fn run(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut MultiPodApp,
 ) -> Result<MultiPodOutcome, MultiPodError> {
-    if app.panel.rows.is_empty() && app.panel.header.diagnostics.is_empty() {
+    if app.panel.rows.is_empty()
+        && app.panel.header.diagnostics.is_empty()
+        && app.enter_reload.is_none()
+    {
         return Err(MultiPodError::NoPods);
     }
 
     let mut pending_reload = PendingReload::default();
+    if let Some(mode) = app.enter_reload.take() {
+        if pending_reload.start(mode) {
+            app.refreshing = true;
+        }
+    }
     let mut next_poll = Instant::now() + MULTI_POD_POLL_INTERVAL;
 
     loop {
@@ -125,7 +133,7 @@ pub(crate) async fn run(
 
         let now = Instant::now();
         if now >= next_poll {
-            pending_reload.start();
+            pending_reload.start(OrchestratorLifecycleMode::Observe);
             next_poll = now + MULTI_POD_POLL_INTERVAL;
             continue;
         }
@@ -141,6 +149,7 @@ pub(crate) async fn run(
                 MultiPodAction::Quit => return Ok(MultiPodOutcome::Quit),
                 MultiPodAction::Open => {
                     if let Some(request) = app.prepare_open() {
+                        terminal.draw(|f| draw(f, app))?;
                         return Ok(MultiPodOutcome::Open(request));
                     }
                 }
@@ -149,7 +158,9 @@ pub(crate) async fn run(
                     terminal.draw(|f| draw(f, app))?;
                     let result = dispatch_ticket_action(request).await;
                     app.finish_ticket_action_dispatch(result);
-                    app.reload_or_notice().await;
+                    if pending_reload.start(OrchestratorLifecycleMode::Observe) {
+                        app.refreshing = true;
+                    }
                     next_poll = Instant::now() + MULTI_POD_POLL_INTERVAL;
                 }
                 MultiPodAction::LaunchIntake(request) => {
@@ -157,7 +168,9 @@ pub(crate) async fn run(
                     terminal.draw(|f| draw(f, app))?;
                     let result = launch_intake_with_handoff(request).await;
                     app.finish_intake_launch(result);
-                    app.reload_or_notice().await;
+                    if pending_reload.start(OrchestratorLifecycleMode::Observe) {
+                        app.refreshing = true;
+                    }
                     next_poll = Instant::now() + MULTI_POD_POLL_INTERVAL;
                 }
                 MultiPodAction::SendCompanion(request) => {
@@ -165,7 +178,9 @@ pub(crate) async fn run(
                     terminal.draw(|f| draw(f, app))?;
                     let result = dispatch_companion_message(request).await;
                     app.finish_companion_send(result);
-                    app.reload_or_notice().await;
+                    if pending_reload.start(OrchestratorLifecycleMode::Observe) {
+                        app.refreshing = true;
+                    }
                     next_poll = Instant::now() + MULTI_POD_POLL_INTERVAL;
                 }
             },
@@ -181,12 +196,12 @@ struct PendingReload {
 }
 
 impl PendingReload {
-    fn start(&mut self) -> bool {
+    fn start(&mut self, lifecycle_mode: OrchestratorLifecycleMode) -> bool {
         if self.handle.is_some() {
             return false;
         }
-        self.handle = Some(tokio::spawn(async {
-            load_multi_pod_snapshot(None, OrchestratorLifecycleMode::Observe).await
+        self.handle = Some(tokio::spawn(async move {
+            load_multi_pod_snapshot(None, lifecycle_mode).await
         }));
         true
     }
@@ -486,50 +501,47 @@ pub(crate) struct MultiPodApp {
     composer_target: ComposerTarget,
     notice: Option<String>,
     sending: bool,
+    refreshing: bool,
+    enter_reload: Option<OrchestratorLifecycleMode>,
     runtime_command: PodRuntimeCommand,
     last_companion_lifecycle_failure: Option<CompanionPanelState>,
     last_orchestrator_lifecycle_failure: Option<OrchestratorPanelState>,
 }
 
 impl MultiPodApp {
-    async fn load(
-        selected_name: Option<String>,
-        runtime_command: PodRuntimeCommand,
-    ) -> Result<Self, MultiPodError> {
-        let snapshot = load_multi_pod_snapshot(
-            selected_name,
-            OrchestratorLifecycleMode::Ensure {
-                runtime_command: runtime_command.clone(),
-            },
-        )
-        .await?;
-        let last_companion_lifecycle_failure =
-            companion_lifecycle_failure_from_panel(&snapshot.panel);
-        let last_orchestrator_lifecycle_failure =
-            orchestrator_lifecycle_failure_from_panel(&snapshot.panel);
-        let mut app = Self {
-            list: snapshot.list,
-            panel: snapshot.panel,
+    fn loading(runtime_command: PodRuntimeCommand) -> Self {
+        let workspace_root = current_workspace_root();
+        let mut panel = WorkspacePanelViewModel::empty(&workspace_root);
+        panel
+            .header
+            .diagnostics
+            .push("Loading workspace dashboard…".to_string());
+        Self {
+            list: PodList::from_sources(
+                PodVisibilitySource::ResumePicker,
+                Vec::new(),
+                Vec::new(),
+                None,
+                MAX_ENTRIES,
+            ),
+            panel,
             input: InputBuffer::new(),
             selected_row: None,
             composer_target: ComposerTarget::Companion,
             notice: None,
             sending: false,
+            refreshing: true,
+            enter_reload: Some(OrchestratorLifecycleMode::Ensure {
+                runtime_command: runtime_command.clone(),
+            }),
             runtime_command,
-            last_companion_lifecycle_failure,
-            last_orchestrator_lifecycle_failure,
-        };
-        app.ensure_selection_visible();
-        app.ensure_composer_target_available();
-        Ok(app)
-    }
-
-    pub(crate) async fn reload_or_notice(&mut self) {
-        let result = load_multi_pod_snapshot(None, OrchestratorLifecycleMode::Observe).await;
-        self.apply_reload_result(result);
+            last_companion_lifecycle_failure: None,
+            last_orchestrator_lifecycle_failure: None,
+        }
     }
 
     fn apply_reload_result(&mut self, result: Result<MultiPodSnapshot, MultiPodError>) {
+        self.refreshing = false;
         match result {
             Ok(snapshot) => self.apply_reloaded_snapshot(snapshot),
             Err(error) => {
@@ -799,7 +811,7 @@ impl MultiPodApp {
     }
 
     pub(crate) fn prepare_open(&mut self) -> Option<OpenPodRequest> {
-        let (pod_name, socket_override) = {
+        let (pod_name, socket_override, progress) = {
             let entry = match self.selected_pod_entry() {
                 Some(entry) => entry,
                 None => {
@@ -811,12 +823,20 @@ impl MultiPodApp {
                 self.notice = Some("Selected Pod cannot be opened from this view.".to_string());
                 return None;
             }
+            let progress = if entry.live.as_ref().is_some_and(|live| live.reachable) {
+                "Attaching to"
+            } else if entry.stored.is_some() {
+                "Restoring/opening"
+            } else {
+                "Opening"
+            };
             (
                 entry.name.clone(),
                 entry.attach_socket_path().map(PathBuf::from),
+                progress,
             )
         };
-        self.notice = Some(format!("Opening {pod_name}…"));
+        self.notice = Some(format!("{progress} {pod_name}…"));
         Some(OpenPodRequest {
             pod_name,
             socket_override,
@@ -830,12 +850,16 @@ impl MultiPodApp {
     ) {
         match result {
             Ok(()) => {
-                self.notice = Some(format!("Returned from {pod_name}."));
+                self.notice = Some(format!("Returned from {pod_name}. Refreshing workspace…"));
             }
             Err(error) => {
-                self.notice = Some(format!("Open failed for {pod_name}: {error}"));
+                self.notice = Some(format!(
+                    "Open failed for {pod_name}: {error}. Refreshing workspace…"
+                ));
             }
         }
+        self.refreshing = true;
+        self.enter_reload = Some(OrchestratorLifecycleMode::Observe);
     }
 
     fn composer_is_blank(&self) -> bool {
@@ -2797,6 +2821,14 @@ fn draw_actionbar(frame: &mut Frame<'_>, app: &MultiPodApp, area: Rect) {
         "launching Ticket Intake…".to_string()
     } else if app.sending {
         "working…".to_string()
+    } else if app.refreshing {
+        match app.notice.as_deref() {
+            Some(notice) if notice.contains("Refreshing") || notice.contains("refreshing") => {
+                notice.to_string()
+            }
+            Some(notice) => format!("{notice} Refreshing workspace…"),
+            None => "Refreshing workspace…".to_string(),
+        }
     } else if let Some(notice) = app.notice.as_deref() {
         notice.to_string()
     } else if let Some(reason) = app.selected_open_disabled_reason() {
@@ -3966,7 +3998,12 @@ mod tests {
         );
         assert_eq!(app.list.selected_entry().unwrap().name, "alpha");
         assert_eq!(input_text(&app), "draft survives open");
-        assert!(app.notice.as_deref().unwrap().contains("Opening alpha"));
+        assert!(
+            app.notice
+                .as_deref()
+                .unwrap()
+                .contains("Attaching to alpha")
+        );
     }
 
     #[test]
@@ -3986,6 +4023,51 @@ mod tests {
                 .unwrap()
                 .contains("Open failed for alpha")
         );
+        assert!(app.refreshing);
+        assert!(matches!(
+            app.enter_reload,
+            Some(OrchestratorLifecycleMode::Observe)
+        ));
+    }
+
+    #[test]
+    fn multi_loading_app_defers_initial_snapshot_to_enter_reload() {
+        let app = MultiPodApp::loading(PodRuntimeCommand::for_executable("/tmp/yoi"));
+
+        assert!(app.panel.rows.is_empty());
+        assert!(
+            app.panel
+                .header
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains("Loading workspace dashboard"))
+        );
+        assert!(app.refreshing);
+        assert!(matches!(
+            app.enter_reload,
+            Some(OrchestratorLifecycleMode::Ensure { .. })
+        ));
+    }
+
+    #[test]
+    fn multi_open_success_requests_background_reload_without_dropping_state() {
+        let mut app = test_app(vec![live_info("alpha", PodStatus::Idle)]);
+        app.input.insert_str("keep this draft");
+
+        app.finish_open("alpha", Ok(()));
+
+        assert_eq!(input_text(&app), "keep this draft");
+        assert!(
+            app.notice
+                .as_deref()
+                .unwrap()
+                .contains("Refreshing workspace")
+        );
+        assert!(app.refreshing);
+        assert!(matches!(
+            app.enter_reload,
+            Some(OrchestratorLifecycleMode::Observe)
+        ));
     }
 
     #[test]
@@ -4015,7 +4097,12 @@ mod tests {
             Some(PathBuf::from("/tmp/alpha.sock"))
         );
         assert_eq!(input_text(&app), "");
-        assert!(app.notice.as_deref().unwrap().contains("Opening alpha"));
+        assert!(
+            app.notice
+                .as_deref()
+                .unwrap()
+                .contains("Attaching to alpha")
+        );
     }
 
     #[test]
@@ -4310,6 +4397,8 @@ mod tests {
             composer_target: ComposerTarget::Companion,
             notice: None,
             sending: false,
+            refreshing: false,
+            enter_reload: None,
             runtime_command: PodRuntimeCommand::for_executable("/tmp/yoi"),
             last_companion_lifecycle_failure,
             last_orchestrator_lifecycle_failure,
