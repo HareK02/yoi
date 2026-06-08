@@ -193,3 +193,62 @@ Policy for this Ticket:
 This resolves the implementation block and authorizes Coder to continue the schema cleanup.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-08T12:39:28Z -->
+
+## Implementation report
+
+Coder implementation completed.
+
+Commit:
+- `934a4b58026784c64f50359c6be3681566c0dac1 ticket: remove legacy schema fields`
+
+Coder summary:
+- Removed `legacy_ticket` from current Ticket schema/metadata/summary/tool input-output/CLI show output.
+- Removed `needs_preflight` from current schema/metadata/summary/panel/tool output.
+- Rejected `workflow_state: intake` instead of treating it as a planning alias.
+- Migrated local `.yoi/tickets/**/item.md` frontmatter to remove `legacy_ticket`, including non-null values as authorized.
+- Reported no remaining `legacy_ticket`, `needs_preflight`, or `workflow_state: intake` frontmatter entries.
+
+Coder validation reported all passed:
+- `cargo test -p ticket --lib`
+- `cargo test -p yoi ticket_cli`
+- `cargo test -p tui workspace_panel`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo run -q -p yoi -- ticket doctor`
+- `cargo check --workspace`
+- `nix build .#yoi`
+
+Orchestrator quick checks:
+- Worktree branch is clean at `934a4b5`.
+- Grep over `.yoi/tickets/**/item.md` found no frontmatter matches for `legacy_ticket`, `needs_preflight`, or `workflow_state: intake`; one remaining historical closed Ticket body example mentions an old `workflow_state: intake | ready | ...` state list, which should be reviewed as historical prose vs stale maintained example.
+
+---
+
+<!-- event: review author: reviewer at: 2026-06-08T12:45:30Z status: approve -->
+
+## Review: approve
+
+## Review result: approve
+
+Reviewed commit `934a4b58026784c64f50359c6be3681566c0dac1` in worktree `.worktree/remove-legacy-ticket-schema-fields` against the Ticket requirements.
+
+Evidence:
+- `crates/ticket/src/lib.rs` no longer requires or models `legacy_ticket` / `needs_preflight` in `NewTicket`, `TicketMeta`, or `TicketSummary`; `REQUIRED_FIELDS` no longer includes `legacy_ticket`; `TicketWorkflowState::parse("intake")` returns `None` and frontmatter parsing reports it as invalid.
+- `crates/ticket/src/tool.rs` `TicketCreateParams`, summary JSON, and show JSON no longer include `legacy_ticket` or `needs_preflight`; schema tests assert those names are absent from `TicketCreate` schema and tool outputs.
+- `crates/yoi/src/ticket_cli.rs` create/list surfaces do not expose those fields, and `show` filters obsolete frontmatter keys from rendered raw frontmatter.
+- `crates/tui/src/workspace_panel.rs` panel rows derive from `TicketSummary` without `needs_preflight`; no current panel/schema code references the removed field.
+- Frontmatter scan over `.yoi/tickets/*/*/item.md` found no `legacy_ticket`, `needs_preflight`, or `workflow_state: intake` in current frontmatter. Remaining broad text hits are Ticket body/thread/artifact historical or requirement prose, not current frontmatter/schema/API metadata.
+- Focused maintained docs/prompts/workflow search over `crates`, `resources`, `docs`, and `.yoi/workflow` found only negative tests/assertions for the retired names.
+
+Validation run by reviewer:
+- `cargo test -p ticket --lib`
+- `cargo test -p yoi ticket_cli`
+- `cargo test -p tui workspace_panel`
+- `cargo run -q -p yoi -- ticket doctor`
+- `nix build .#yoi`
+
+All passed. No blocking findings.
+
+---
