@@ -10,7 +10,6 @@ workflow_state: 'done'
 created_at: '2026-06-08T01:10:36Z'
 updated_at: '2026-06-08T08:17:51Z'
 assignee: null
-legacy_ticket: null
 queued_by: 'workspace-panel'
 queued_at: '2026-06-08T03:06:04Z'
 ---

@@ -9,7 +9,6 @@ labels: [pod, profile, session-trace, debuggability]
 created_at: 2026-05-29T23:54:08Z
 updated_at: 2026-05-30T00:38:28Z
 assignee: null
-legacy_ticket: null
 ---
 
 ## Background

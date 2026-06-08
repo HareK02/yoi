@@ -9,7 +9,6 @@ labels: [plugin, feature-registry, permissions, architecture]
 created_at: 2026-06-04T23:48:44Z
 updated_at: 2026-06-05T05:11:56Z
 assignee: null
-legacy_ticket: null
 ---
 
 ## Issue

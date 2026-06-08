@@ -9,7 +9,6 @@ labels: [tui, keys, ui]
 created_at: 2026-06-01T02:02:02Z
 updated_at: 2026-06-01T02:23:12Z
 assignee: null
-legacy_ticket: null
 ---
 
 ## Issue

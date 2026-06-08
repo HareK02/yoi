@@ -10,7 +10,6 @@ workflow_state: planning
 created_at: 2026-05-27T00:00:06Z
 updated_at: 2026-05-27T00:00:06Z
 assignee: null
-legacy_ticket: tickets/permission-default-policy.md
 ---
 
 ## Migration reference

@@ -3054,9 +3054,7 @@ mod tests {
             attention_required: None,
             queued_by: None,
             queued_at: None,
-            needs_preflight: None,
             risk_flags: Vec::new(),
-            legacy_ticket: None,
         };
         configure(&mut input);
         let ticket = backend.create(input).unwrap();

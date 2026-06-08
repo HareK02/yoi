@@ -9,7 +9,6 @@ labels: [tui, ticket, orchestration, panel]
 created_at: 2026-06-05T21:07:03Z
 updated_at: 2026-06-06T06:05:38Z
 assignee: null
-legacy_ticket: null
 ---
 
 ## Background

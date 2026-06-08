@@ -16,7 +16,7 @@ requires: []
 この workflow は次をしてはいけない。
 
 - `preflight` を workflow_state として扱う。
-- `needs_preflight` を stop gate として新規に書く。
+- `preflight` vocabulary を current Ticket metadata として新規に書く。
 - 「リスクがある」だけで Ticket を戻す。
 - Coder / Reviewer / worktree mechanics を再設計する。
 
@@ -26,7 +26,7 @@ requires: []
 
 - `planning` Ticket の要件・受け入れ条件・制約を明確化する。
 - `ready` または `queued` Ticket について、Orchestrator が実装開始前に具体的な不足情報・未決定事項を特定した。
-- 既存 Ticket に legacy `intake` / `needs_preflight` 表記があり、planning terminology へ整理する必要がある。
+- 既存 Ticket に obsolete state vocabulary が残っており、planning terminology へ整理する必要がある。
 
 適用しない条件:
 

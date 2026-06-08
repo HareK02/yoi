@@ -9,7 +9,6 @@ labels: [provider, models, catalog]
 created_at: 2026-05-31T00:37:43Z
 updated_at: 2026-05-31T01:58:24Z
 assignee: null
-legacy_ticket: null
 ---
 
 ## Background

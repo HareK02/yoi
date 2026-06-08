@@ -9,7 +9,6 @@ labels: [cli, pod, client, nix]
 created_at: 2026-05-31T04:50:34Z
 updated_at: 2026-05-31T05:27:04Z
 assignee: null
-legacy_ticket: null
 ---
 
 ## Background

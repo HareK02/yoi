@@ -9,7 +9,6 @@ labels: [migrated]
 created_at: 2026-05-27T00:00:11Z
 updated_at: 2026-05-29T04:31:10Z
 assignee: null
-legacy_ticket: tickets/session-todo-reminder.md
 ---
 
 ## Migration reference

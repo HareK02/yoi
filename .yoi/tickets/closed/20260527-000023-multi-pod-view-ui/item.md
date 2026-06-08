@@ -9,7 +9,6 @@ labels: [tui, pod]
 created_at: 2026-05-27T00:00:23Z
 updated_at: 2026-05-28T16:09:01Z
 assignee: null
-legacy_ticket: null
 ---
 
 ## Background

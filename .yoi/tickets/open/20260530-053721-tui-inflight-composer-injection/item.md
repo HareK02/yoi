@@ -10,7 +10,6 @@ workflow_state: planning
 created_at: 2026-05-30T05:37:21Z
 updated_at: 2026-05-30T05:38:11Z
 assignee: null
-legacy_ticket: null
 ---
 
 ## Background

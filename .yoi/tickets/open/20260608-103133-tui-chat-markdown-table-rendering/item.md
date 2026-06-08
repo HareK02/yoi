@@ -10,7 +10,6 @@ workflow_state: 'ready'
 created_at: '2026-06-08T10:31:33Z'
 updated_at: '2026-06-08T10:31:40Z'
 assignee: null
-legacy_ticket: null
 risk_flags: ['tui-rendering', 'markdown']
 ---
 

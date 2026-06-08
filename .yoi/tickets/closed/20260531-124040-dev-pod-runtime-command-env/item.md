@@ -9,7 +9,6 @@ labels: [cli, pod, env, dev]
 created_at: 2026-05-31T12:40:40Z
 updated_at: 2026-05-31T20:41:56Z
 assignee: null
-legacy_ticket: null
 ---
 
 ## Background

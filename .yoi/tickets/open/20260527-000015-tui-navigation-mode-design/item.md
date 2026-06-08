@@ -10,7 +10,6 @@ workflow_state: planning
 created_at: 2026-05-27T00:00:15Z
 updated_at: 2026-05-27T00:00:15Z
 assignee: null
-legacy_ticket: tickets/tui-navigation-mode-design.md
 ---
 
 ## Migration reference

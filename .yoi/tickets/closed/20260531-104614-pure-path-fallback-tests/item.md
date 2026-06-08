@@ -9,7 +9,6 @@ labels: [test, env, manifest, cleanup]
 created_at: 2026-05-31T10:46:14Z
 updated_at: 2026-05-31T10:54:49Z
 assignee: null
-legacy_ticket: null
 ---
 
 ## Background

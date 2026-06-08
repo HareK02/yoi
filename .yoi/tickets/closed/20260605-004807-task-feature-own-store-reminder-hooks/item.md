@@ -9,7 +9,6 @@ labels: [tasks, hooks, feature-registry, history]
 created_at: 2026-06-05T00:48:07Z
 updated_at: 2026-06-05T02:24:23Z
 assignee: null
-legacy_ticket: null
 ---
 
 ## Issue

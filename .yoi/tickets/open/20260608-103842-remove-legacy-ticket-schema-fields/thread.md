@@ -193,3 +193,27 @@ Policy for this Ticket:
 This resolves the implementation block and authorizes Coder to continue the schema cleanup.
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-06-08T12:36:29Z -->
+
+## Implementation report
+
+Implemented legacy Ticket schema field removal.
+
+- Removed current schema/API exposure for `legacy_ticket` and `needs_preflight` from Ticket metadata, summaries, tool output, and create inputs.
+- Rejected `workflow_state: intake` instead of treating it as a planning alias.
+- Migrated current local Ticket `item.md` frontmatter to remove obsolete `legacy_ticket` / `needs_preflight` entries, including non-null migration breadcrumbs.
+- Updated focused tests for create/list/show/tool output and panel metadata behavior.
+
+Validation completed before this report:
+- `cargo test -p ticket --lib`
+- `cargo test -p yoi ticket_cli`
+- `cargo test -p tui workspace_panel`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo run -q -p yoi -- ticket doctor`
+- `cargo check --workspace`
+- `nix build .#yoi`
+
+
+---

@@ -9,7 +9,6 @@ labels: [ticket, backend, migration, cli]
 created_at: 2026-06-05T20:30:06Z
 updated_at: 2026-06-05T22:13:53Z
 assignee: null
-legacy_ticket: null
 ---
 
 ## Background

@@ -9,7 +9,6 @@ labels: [tui, composer, intake, panel]
 created_at: 2026-06-05T21:07:04Z
 updated_at: 2026-06-06T04:47:31Z
 assignee: null
-legacy_ticket: null
 ---
 
 ## Background

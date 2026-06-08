@@ -9,7 +9,6 @@ labels: [manifest, profiles, secrets, security, cli, tui]
 created_at: 2026-05-29T14:53:55Z
 updated_at: 2026-05-31T22:23:34Z
 assignee: null
-legacy_ticket: null
 ---
 
 ## Background

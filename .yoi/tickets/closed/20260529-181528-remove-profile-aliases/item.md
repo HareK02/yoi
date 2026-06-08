@@ -9,7 +9,6 @@ labels: [profiles, config, simplification]
 created_at: 2026-05-29T18:15:28Z
 updated_at: 2026-05-29T18:20:44Z
 assignee: null
-legacy_ticket: null
 ---
 
 ## Background

@@ -9,7 +9,6 @@ labels: [ticket, pod, role, orchestration]
 created_at: 2026-06-05T19:03:30Z
 updated_at: 2026-06-05T19:34:06Z
 assignee: null
-legacy_ticket: null
 ---
 
 ## Background

@@ -9,7 +9,6 @@ labels: [web, tools, html]
 created_at: 2026-05-30T21:59:28Z
 updated_at: 2026-05-30T22:21:39Z
 assignee: null
-legacy_ticket: null
 ---
 
 ## Background

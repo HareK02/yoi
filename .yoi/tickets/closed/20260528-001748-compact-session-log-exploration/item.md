@@ -9,7 +9,6 @@ labels: [compact, session-log]
 created_at: 2026-05-28T00:17:48Z
 updated_at: 2026-05-28T03:41:42Z
 assignee: null
-legacy_ticket: null
 ---
 
 # Compact: session log 探索型の要約入力に変更する

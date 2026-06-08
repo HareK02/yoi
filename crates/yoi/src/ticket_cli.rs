@@ -326,6 +326,9 @@ fn show(backend: &LocalTicketBackend, query: String) -> Result<TicketCliOutput, 
 
     stdout.push_str("\n## item.md\n\n---\n");
     for (key, value) in &ticket.document.raw_frontmatter {
+        if is_obsolete_ticket_frontmatter_key(key) {
+            continue;
+        }
         stdout.push_str(&format!("{key}: {value}\n"));
     }
     stdout.push_str("---\n\n");
@@ -386,6 +389,10 @@ fn show(backend: &LocalTicketBackend, query: String) -> Result<TicketCliOutput, 
     }
 
     Ok(success(stdout))
+}
+
+fn is_obsolete_ticket_frontmatter_key(key: &str) -> bool {
+    matches!(key, "legacy_ticket" | "needs_preflight")
 }
 
 fn comment(
@@ -899,14 +906,27 @@ mod tests {
         assert!(created.stdout.contains("\tcli-created\topen"));
         assert!(temp.path().join(".yoi/tickets/open").exists());
         assert!(!temp.path().join("work-items").exists());
+        let created_item = fs::read_to_string(
+            temp.path()
+                .join(".yoi/tickets/open")
+                .join(created.stdout.split('\t').nth(1).unwrap())
+                .join("item.md"),
+        )
+        .unwrap();
+        assert!(!created_item.contains("legacy_ticket:"));
+        assert!(!created_item.contains("needs_preflight:"));
 
         let listed = run(&temp, &["list", "--status", "open"]);
         assert!(listed.stdout.contains("status\tid\tslug"));
         assert!(listed.stdout.contains("CLI Created"));
+        assert!(!listed.stdout.contains("legacy_ticket"));
+        assert!(!listed.stdout.contains("needs_preflight"));
 
         let shown = run(&temp, &["show", "cli-created"]);
         assert!(shown.stdout.contains("# CLI Created"));
         assert!(shown.stdout.contains("Labels: ticket, cli"));
+        assert!(!shown.stdout.contains("legacy_ticket"));
+        assert!(!shown.stdout.contains("needs_preflight"));
 
         let commented = run(
             &temp,

@@ -9,7 +9,6 @@ labels: [migrated]
 created_at: 2026-05-27T00:00:08Z
 updated_at: 2026-05-30T05:57:16Z
 assignee: null
-legacy_ticket: tickets/pod-scope-persistence-authority.md
 ---
 
 ## Migration reference

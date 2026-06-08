@@ -23,7 +23,7 @@ const STATUSES: [TicketStatus; 3] = [
     TicketStatus::Pending,
     TicketStatus::Closed,
 ];
-const REQUIRED_FIELDS: [&str; 11] = [
+const REQUIRED_FIELDS: [&str; 10] = [
     "id",
     "slug",
     "title",
@@ -34,7 +34,6 @@ const REQUIRED_FIELDS: [&str; 11] = [
     "created_at",
     "updated_at",
     "assignee",
-    "legacy_ticket",
 ];
 const MAX_STATE_CHANGE_REASON_BYTES: usize = 1024;
 const MAX_INTAKE_SUMMARY_BODY_BYTES: usize = 16 * 1024;
@@ -196,7 +195,7 @@ impl TicketWorkflowState {
 
     pub fn parse(value: &str) -> Option<Self> {
         match value {
-            "planning" | "intake" => Some(Self::Planning),
+            "planning" => Some(Self::Planning),
             "ready" => Some(Self::Ready),
             "queued" => Some(Self::Queued),
             "inprogress" => Some(Self::InProgress),
@@ -496,10 +495,7 @@ pub struct NewTicket {
     pub body: MarkdownText,
     pub author: Option<String>,
     pub assignee: Option<String>,
-    pub legacy_ticket: Option<String>,
     pub readiness: Option<String>,
-    /// Legacy metadata accepted for existing records only; not a workflow stop gate.
-    pub needs_preflight: Option<bool>,
     pub risk_flags: Vec<String>,
     pub action_required: Option<String>,
     pub workflow_state: Option<TicketWorkflowState>,
@@ -519,9 +515,7 @@ impl NewTicket {
             body: MarkdownText::new(DEFAULT_TICKET_BODY),
             author: None,
             assignee: None,
-            legacy_ticket: None,
             readiness: None,
-            needs_preflight: None,
             risk_flags: Vec::new(),
             action_required: None,
             workflow_state: None,
@@ -568,10 +562,7 @@ pub struct TicketMeta {
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
     pub assignee: Option<String>,
-    pub legacy_ticket: Option<String>,
     pub readiness: Option<String>,
-    /// Legacy metadata accepted for existing records only; not a workflow stop gate.
-    pub needs_preflight: Option<bool>,
     pub risk_flags: Vec<String>,
     pub action_required: Option<String>,
     pub workflow_state: TicketWorkflowState,
@@ -592,8 +583,6 @@ pub struct TicketSummary {
     pub priority: String,
     pub labels: Vec<String>,
     pub readiness: Option<String>,
-    /// Legacy metadata accepted for existing records only; not a workflow stop gate.
-    pub needs_preflight: Option<bool>,
     pub action_required: Option<String>,
     pub workflow_state: TicketWorkflowState,
     pub workflow_state_explicit: bool,
@@ -1053,7 +1042,6 @@ impl TicketBackend for LocalTicketBackend {
                 priority: meta.priority,
                 labels: meta.labels,
                 readiness: meta.readiness,
-                needs_preflight: meta.needs_preflight,
                 action_required: meta.action_required,
                 workflow_state: meta.workflow_state,
                 workflow_state_explicit: meta.workflow_state_explicit,
@@ -1152,18 +1140,11 @@ impl TicketBackend for LocalTicketBackend {
             "assignee".to_string(),
             yaml_string_or_null(input.assignee.as_deref()),
         ));
-        fields.push((
-            "legacy_ticket".to_string(),
-            yaml_string_or_null(input.legacy_ticket.as_deref()),
-        ));
         if let Some(readiness) = input.readiness {
             fields.push((
                 "readiness".to_string(),
                 format_yaml_string_scalar(readiness.as_str()),
             ));
-        }
-        if let Some(needs_preflight) = input.needs_preflight {
-            fields.push(("needs_preflight".to_string(), needs_preflight.to_string()));
         }
         if !input.risk_flags.is_empty() {
             fields.push(("risk_flags".to_string(), labels_yaml(&input.risk_flags)));
@@ -1668,9 +1649,7 @@ struct TicketItemFrontmatter {
     created_at: Option<String>,
     updated_at: Option<String>,
     assignee: Option<String>,
-    legacy_ticket: Option<String>,
     readiness: Option<String>,
-    needs_preflight: Option<bool>,
     risk_flags: Vec<String>,
     action_required: Option<String>,
     workflow_state: Option<TicketWorkflowState>,
@@ -1753,7 +1732,7 @@ fn parse_ticket_frontmatter(content: &str) -> std::result::Result<TicketItemFron
     let workflow_state_value = yaml_string(&mapping, "workflow_state")?;
     let workflow_state = match workflow_state_value.as_deref() {
         Some(value) => Some(TicketWorkflowState::parse(value).ok_or_else(|| {
-            format!("invalid workflow_state '{value}': expected planning, ready, queued, inprogress, done, or legacy intake")
+            format!("invalid workflow_state '{value}': expected planning, ready, queued, inprogress, or done")
         })?),
         None => None,
     };
@@ -1769,9 +1748,7 @@ fn parse_ticket_frontmatter(content: &str) -> std::result::Result<TicketItemFron
         created_at: yaml_string(&mapping, "created_at")?,
         updated_at: yaml_string(&mapping, "updated_at")?,
         assignee: yaml_string(&mapping, "assignee")?,
-        legacy_ticket: yaml_string(&mapping, "legacy_ticket")?,
         readiness: yaml_string(&mapping, "readiness")?,
-        needs_preflight: yaml_bool(&mapping, "needs_preflight")?,
         risk_flags: yaml_string_list(&mapping, "risk_flags")?,
         action_required: yaml_string(&mapping, "action_required")?,
         workflow_state,
@@ -1797,17 +1774,6 @@ fn yaml_string(mapping: &YamlMapping, key: &str) -> std::result::Result<Option<S
         Some(YamlValue::String(value)) => Ok(Some(value.clone())),
         Some(value) => Err(format!(
             "frontmatter field `{key}` must be a YAML string or null, found {}",
-            yaml_kind(value)
-        )),
-    }
-}
-
-fn yaml_bool(mapping: &YamlMapping, key: &str) -> std::result::Result<Option<bool>, String> {
-    match yaml_get(mapping, key) {
-        Some(YamlValue::Null) | None => Ok(None),
-        Some(YamlValue::Bool(value)) => Ok(Some(*value)),
-        Some(value) => Err(format!(
-            "frontmatter field `{key}` must be a YAML boolean or null, found {}",
             yaml_kind(value)
         )),
     }
@@ -1888,9 +1854,7 @@ fn ticket_meta(frontmatter: TicketItemFrontmatter) -> TicketMeta {
         created_at: frontmatter.created_at,
         updated_at: frontmatter.updated_at,
         assignee: frontmatter.assignee,
-        legacy_ticket: frontmatter.legacy_ticket,
         readiness: frontmatter.readiness,
-        needs_preflight: frontmatter.needs_preflight,
         risk_flags: frontmatter.risk_flags,
         action_required: frontmatter.action_required,
         workflow_state,
@@ -2477,15 +2441,12 @@ mod tests {
     }
 
     #[test]
-    fn workflow_state_parses_legacy_intake_as_planning_and_emits_planning() {
+    fn workflow_state_rejects_legacy_intake_alias() {
         assert_eq!(
             TicketWorkflowState::parse("planning"),
             Some(TicketWorkflowState::Planning)
         );
-        assert_eq!(
-            TicketWorkflowState::parse("intake"),
-            Some(TicketWorkflowState::Planning)
-        );
+        assert_eq!(TicketWorkflowState::parse("intake"), None);
         assert_eq!(TicketWorkflowState::Planning.as_str(), "planning");
         assert_eq!(
             TicketWorkflowState::default_for_status(&ExtensibleTicketStatus::Open),
@@ -2538,9 +2499,7 @@ labels: [ticket, backend]
 created_at: 2026-06-05T00:00:00Z
 updated_at: 2026-06-05T00:00:00Z
 assignee: null
-legacy_ticket: null
 readiness: implementation-ready
-needs_preflight: false
 risk_flags: [low, local]
 action_required: none
 workflow_state: ready
@@ -2556,7 +2515,6 @@ queued_at: 2026-06-05T00:01:00Z
         assert_eq!(meta.id, "20260605-000000-example");
         assert_eq!(meta.labels, vec!["ticket", "backend"]);
         assert_eq!(meta.readiness.as_deref(), Some("implementation-ready"));
-        assert_eq!(meta.needs_preflight, Some(false));
         assert_eq!(meta.risk_flags, vec!["low", "local"]);
         assert_eq!(meta.action_required.as_deref(), Some("none"));
         assert_eq!(meta.workflow_state, TicketWorkflowState::Ready);
@@ -2567,19 +2525,17 @@ queued_at: 2026-06-05T00:01:00Z
     }
 
     #[test]
-    fn yaml_frontmatter_preserves_typed_nulls_lists_bools_and_quoted_strings() {
+    fn yaml_frontmatter_preserves_typed_nulls_lists_and_quoted_strings() {
         let frontmatter = parse_ticket_frontmatter(
             r#"labels:
   - ticket
   - backend
 risk_flags: [low, local]
 assignee: ~
-legacy_ticket:
 attention_required: null
 action_required: "null"
 readiness: "~"
-needs_preflight: false
-workflow_state: intake
+workflow_state: planning
 "#,
         )
         .unwrap();
@@ -2587,11 +2543,9 @@ workflow_state: intake
         assert_eq!(meta.labels, vec!["ticket", "backend"]);
         assert_eq!(meta.risk_flags, vec!["low", "local"]);
         assert_eq!(meta.assignee, None);
-        assert_eq!(meta.legacy_ticket, None);
         assert_eq!(meta.attention_required, None);
         assert_eq!(meta.action_required.as_deref(), Some("null"));
         assert_eq!(meta.readiness.as_deref(), Some("~"));
-        assert_eq!(meta.needs_preflight, Some(false));
         assert_eq!(meta.workflow_state, TicketWorkflowState::Planning);
         assert!(meta.workflow_state_explicit);
     }
@@ -2604,16 +2558,16 @@ workflow_state: intake
             "{labels_error}"
         );
 
-        let bool_error = parse_ticket_frontmatter("needs_preflight: 1").unwrap_err();
-        assert!(
-            bool_error.contains("must be a YAML boolean"),
-            "{bool_error}"
-        );
-
         let workflow_error = parse_ticket_frontmatter("workflow_state: almost").unwrap_err();
         assert!(
             workflow_error.contains("invalid workflow_state"),
             "{workflow_error}"
+        );
+
+        let intake_error = parse_ticket_frontmatter("workflow_state: intake").unwrap_err();
+        assert!(
+            intake_error.contains("invalid workflow_state"),
+            "{intake_error}"
         );
     }
 
@@ -2635,6 +2589,9 @@ workflow_state: intake
         assert!(dir.join("thread.md").exists());
         assert!(dir.join("artifacts/.gitkeep").exists());
         assert_eq!(ticket.slug, "example-ticket");
+        let item = fs::read_to_string(dir.join("item.md")).unwrap();
+        assert!(!item.contains("legacy_ticket:"));
+        assert!(!item.contains("needs_preflight:"));
         let record = backend.show(TicketIdOrSlug::Id(ticket.id.clone())).unwrap();
         assert_eq!(record.meta.workflow_state, TicketWorkflowState::Planning);
         assert!(record.meta.workflow_state_explicit);
@@ -3055,7 +3012,7 @@ workflow_state: intake
         fs::create_dir_all(root.join("open/bad/artifacts")).unwrap();
         fs::write(
             root.join("open/bad/item.md"),
-            "---\nid: bad\nslug: bad\ntitle: Bad\nstatus: open\nkind: task\npriority: P2\nworkflow_state: almost\nlabels: []\ncreated_at: x\nupdated_at: x\nassignee: null\nlegacy_ticket: null\n---\n",
+            "---\nid: bad\nslug: bad\ntitle: Bad\nstatus: open\nkind: task\npriority: P2\nworkflow_state: almost\nlabels: []\ncreated_at: x\nupdated_at: x\nassignee: null\n---\n",
         )
         .unwrap();
         fs::write(root.join("open/bad/thread.md"), "").unwrap();
@@ -3080,7 +3037,7 @@ workflow_state: intake
         fs::create_dir_all(root.join("open/bad/artifacts")).unwrap();
         fs::write(
             root.join("open/bad/item.md"),
-            "---\nid: bad\nslug: bad\ntitle: Bad\nstatus: open\nkind: task\npriority: P2\nlabels: []\ncreated_at: x\nupdated_at: x\nassignee: null\nlegacy_ticket: null\n---\n",
+            "---\nid: bad\nslug: bad\ntitle: Bad\nstatus: open\nkind: task\npriority: P2\nlabels: []\ncreated_at: x\nupdated_at: x\nassignee: null\n---\n",
         )
         .unwrap();
         fs::write(
@@ -3110,7 +3067,7 @@ workflow_state: intake
         fs::create_dir_all(root.join("open/bad/artifacts")).unwrap();
         fs::write(
             root.join("open/bad/item.md"),
-            "---\nid: other\nslug: dup\ntitle: Bad\nstatus: pending\nkind: task\npriority: P2\nlabels: []\ncreated_at: x\nupdated_at: x\nassignee: null\nlegacy_ticket: null\n---\n",
+            "---\nid: other\nslug: dup\ntitle: Bad\nstatus: pending\nkind: task\npriority: P2\nlabels: []\ncreated_at: x\nupdated_at: x\nassignee: null\n---\n",
         )
         .unwrap();
         fs::write(
@@ -3121,7 +3078,7 @@ workflow_state: intake
         fs::create_dir_all(root.join("pending/other/artifacts")).unwrap();
         fs::write(
             root.join("pending/other/item.md"),
-            "---\nid: other\nslug: dup\ntitle: Dup\nstatus: pending\nkind: task\npriority: P2\nlabels: []\ncreated_at: x\nupdated_at: x\nassignee: null\nlegacy_ticket: null\n---\n",
+            "---\nid: other\nslug: dup\ntitle: Dup\nstatus: pending\nkind: task\npriority: P2\nlabels: []\ncreated_at: x\nupdated_at: x\nassignee: null\n---\n",
         )
         .unwrap();
         fs::write(root.join("pending/other/thread.md"), "").unwrap();
@@ -3167,7 +3124,7 @@ workflow_state: intake
         fs::create_dir_all(root.join("open/bad/artifacts")).unwrap();
         fs::write(
             root.join("open/bad/item.md"),
-            "---\nid: ../bad\nslug: bad\ntitle: Bad\nstatus: open\nkind: task\npriority: P2\nlabels: []\ncreated_at: x\nupdated_at: x\nassignee: null\nlegacy_ticket: null\n---\n",
+            "---\nid: ../bad\nslug: bad\ntitle: Bad\nstatus: open\nkind: task\npriority: P2\nlabels: []\ncreated_at: x\nupdated_at: x\nassignee: null\n---\n",
         )
         .unwrap();
         fs::write(root.join("open/bad/thread.md"), "").unwrap();

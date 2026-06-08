@@ -8,9 +8,8 @@ priority: 'P1'
 labels: ['ticket', 'schema', 'migration', 'cleanup']
 workflow_state: 'inprogress'
 created_at: '2026-06-08T10:38:42Z'
-updated_at: '2026-06-08T12:17:50Z'
+updated_at: '2026-06-08T12:36:29Z'
 assignee: null
-legacy_ticket: null
 queued_by: 'workspace-panel'
 queued_at: '2026-06-08T11:21:33Z'
 ---

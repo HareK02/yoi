@@ -9,7 +9,6 @@ labels: [branding, rename, release-hygiene]
 created_at: 2026-06-01T08:06:14Z
 updated_at: 2026-06-01T09:49:11Z
 assignee: null
-legacy_ticket: null
 ---
 
 ## Background

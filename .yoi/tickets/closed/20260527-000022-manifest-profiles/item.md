@@ -9,7 +9,6 @@ labels: [manifest, profiles, nix, tui]
 created_at: 2026-05-27T00:00:22Z
 updated_at: 2026-05-29T17:45:59Z
 assignee: null
-legacy_ticket: null
 ---
 
 ## Migration reference

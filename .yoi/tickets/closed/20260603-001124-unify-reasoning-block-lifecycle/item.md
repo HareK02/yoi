@@ -9,7 +9,6 @@ labels: [llm-worker, reasoning, timeline]
 created_at: 2026-06-03T00:11:24Z
 updated_at: 2026-06-03T02:15:02Z
 assignee: null
-legacy_ticket: null
 ---
 
 ## Background

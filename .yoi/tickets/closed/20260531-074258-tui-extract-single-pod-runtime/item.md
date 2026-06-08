@@ -9,7 +9,6 @@ labels: [tui, cleanup]
 created_at: 2026-05-31T07:42:58Z
 updated_at: 2026-05-31T13:57:02Z
 assignee: null
-legacy_ticket: null
 ---
 
 ## Background

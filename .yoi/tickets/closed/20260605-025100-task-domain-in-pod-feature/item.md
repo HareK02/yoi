@@ -9,7 +9,6 @@ labels: [tasks, feature-registry, crate-boundary, tools]
 created_at: 2026-06-05T02:51:00Z
 updated_at: 2026-06-05T03:26:31Z
 assignee: null
-legacy_ticket: null
 ---
 
 ## Issue

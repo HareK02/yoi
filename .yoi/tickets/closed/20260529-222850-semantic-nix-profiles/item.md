@@ -9,7 +9,6 @@ labels: [manifest, profiles, nix, architecture]
 created_at: 2026-05-29T22:28:50Z
 updated_at: 2026-05-30T03:52:39Z
 assignee: null
-legacy_ticket: null
 ---
 
 ## Background

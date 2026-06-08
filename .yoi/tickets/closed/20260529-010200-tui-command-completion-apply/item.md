@@ -9,7 +9,6 @@ labels: [tui, commands, ux]
 created_at: 2026-05-29T01:02:00Z
 updated_at: 2026-05-29T02:08:56Z
 assignee: null
-legacy_ticket: null
 ---
 
 ## Background
