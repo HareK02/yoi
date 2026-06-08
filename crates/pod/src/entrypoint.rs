@@ -39,10 +39,6 @@ struct Cli {
     #[arg(long, value_name = "PATH")]
     project: Option<PathBuf>,
 
-    /// Internal typed pod-name override for session restore launched by the TUI.
-    #[arg(long, value_name = "NAME", requires = "session", hide = true)]
-    session_pod_name: Option<String>,
-
     /// Internal resolved manifest config for delegated child Pod spawning.
     #[arg(
         long,
@@ -85,7 +81,7 @@ struct Cli {
     /// concurrent writers are prevented by the pod-registry.
     /// Mutually exclusive with `--adopt` (spawned children always start
     /// fresh).
-    #[arg(long, value_name = "UUID", conflicts_with_all = ["adopt", "pod"])]
+    #[arg(long, value_name = "UUID", conflicts_with_all = ["adopt"])]
     session: Option<SegmentId>,
 }
 
@@ -101,9 +97,8 @@ fn runtime_workspace_root(cli: &Cli) -> Result<PathBuf, String> {
 }
 
 fn runtime_pod_name(cli: &Cli, workspace_root: &Path) -> String {
-    cli.session_pod_name
+    cli.pod
         .as_deref()
-        .or(cli.pod.as_deref())
         .map(str::to_string)
         .unwrap_or_else(|| default_pod_name_for_workspace(workspace_root))
 }
@@ -171,7 +166,7 @@ where
 }
 
 fn apply_session_restore_overrides(manifest: &mut PodManifest, cli: &Cli) -> Result<(), String> {
-    if let Some(pod_name) = cli.session_pod_name.as_deref().or(cli.pod.as_deref()) {
+    if let Some(pod_name) = cli.pod.as_deref() {
         manifest.pod.name = pod_name.to_string();
     }
     Ok(())
@@ -733,12 +728,28 @@ permission = "write"
     }
 
     #[test]
-    fn pod_flag_conflicts_with_session() {
-        let segment_id = session_store::new_segment_id();
-        let segment_id = segment_id.to_string();
-        let err = Cli::try_parse_from(["yoi pod", "--pod", "agent", "--session", &segment_id])
-            .unwrap_err();
-        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    fn pod_flag_is_runtime_identity_for_session_restore() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().join("explicit-workspace");
+        let store = tmp.path().join("sessions");
+        std::fs::create_dir(&workspace).unwrap();
+        let segment_id = session_store::new_segment_id().to_string();
+        let cli = Cli::try_parse_from([
+            "yoi pod",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--session",
+            &segment_id,
+            "--pod",
+            "explicit-name",
+            "--store",
+            store.to_str().unwrap(),
+        ])
+        .unwrap();
+
+        assert_eq!(cli.session.unwrap().to_string(), segment_id);
+        assert_eq!(cli.pod.as_deref(), Some("explicit-name"));
+        assert_eq!(runtime_pod_name(&cli, &workspace), "explicit-name");
     }
 
     #[test]
@@ -833,6 +844,20 @@ permission = "write"
         let cli = Cli::try_parse_from(["yoi pod", "--profile", "p.lua", "--pod", "agent"]).unwrap();
         assert_eq!(cli.profile.as_deref(), Some("p.lua"));
         assert_eq!(cli.pod.as_deref(), Some("agent"));
+    }
+
+    #[test]
+    fn old_session_pod_name_identity_alias_is_rejected() {
+        let segment_id = session_store::new_segment_id().to_string();
+        let err = Cli::try_parse_from([
+            "yoi pod",
+            "--session",
+            &segment_id,
+            "--session-pod-name",
+            "agent",
+        ])
+        .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
     }
 
     #[test]

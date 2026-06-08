@@ -297,11 +297,6 @@ fn parse_args_slice(args: &[String]) -> Result<Mode, ParseError> {
             "--profile can only be used for fresh spawn".to_string(),
         ));
     }
-    if pod_name.is_some() && session.is_some() {
-        return Err(ParseError(
-            "--pod and --session are mutually exclusive".to_string(),
-        ));
-    }
     if pod_name.is_some() && resume {
         return Err(ParseError(
             "--pod and --resume are mutually exclusive".to_string(),
@@ -324,12 +319,24 @@ fn parse_args_slice(args: &[String]) -> Result<Mode, ParseError> {
     }
 
     let pod_name = pod_name.or(positional);
+    if socket_override.is_some() && session.is_some() {
+        return Err(ParseError(
+            "--socket can only be used with --pod attach mode".to_string(),
+        ));
+    }
+
     if let Some(profile) = profile {
         return Ok(Mode::Tui {
             mode: LaunchMode::Spawn {
                 pod_name,
                 profile: Some(profile),
             },
+            workspace_root,
+        });
+    }
+    if let Some(id) = session {
+        return Ok(Mode::Tui {
+            mode: LaunchMode::ResumeWithSession { id, pod_name },
             workspace_root,
         });
     }
@@ -348,13 +355,6 @@ fn parse_args_slice(args: &[String]) -> Result<Mode, ParseError> {
             workspace_root,
         });
     }
-    if let Some(id) = session {
-        return Ok(Mode::Tui {
-            mode: LaunchMode::ResumeWithSession(id),
-            workspace_root,
-        });
-    }
-
     Ok(Mode::Tui {
         mode: LaunchMode::Spawn {
             pod_name: None,
@@ -563,13 +563,29 @@ mod tests {
     }
 
     #[test]
-    fn parse_rejects_pod_and_session() {
-        let segment_id = session_store::new_segment_id().to_string();
-        let err = parse_args_from(["--pod", "agent", "--session", &segment_id]).unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            "--pod and --session are mutually exclusive"
-        );
+    fn parse_session_accepts_explicit_runtime_pod_identity() {
+        let segment_id = session_store::new_segment_id();
+        match parse_args_from([
+            "--session",
+            &segment_id.to_string(),
+            "--pod",
+            "explicit-name",
+        ])
+        .unwrap()
+        {
+            Mode::Tui {
+                mode:
+                    LaunchMode::ResumeWithSession {
+                        id,
+                        pod_name: Some(pod_name),
+                    },
+                ..
+            } => {
+                assert_eq!(id, segment_id);
+                assert_eq!(pod_name, "explicit-name");
+            }
+            _ => panic!("expected ResumeWithSession mode with explicit pod name"),
+        }
     }
 
     #[test]

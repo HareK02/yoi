@@ -54,7 +54,10 @@ pub enum LaunchMode {
     Resume,
     /// `yoi --session <UUID>`: skip the picker, go straight to the
     /// resume name dialog with `id` baked in.
-    ResumeWithSession(SegmentId),
+    ResumeWithSession {
+        id: SegmentId,
+        pod_name: Option<String>,
+    },
     /// `yoi panel`: open the workspace panel from the current workspace.
     Panel,
 }
@@ -93,8 +96,8 @@ pub async fn launch(options: LaunchOptions) -> ExitCode {
             socket_override,
         } => single_pod::run_pod_name(pod_name, socket_override, runtime_command).await,
         LaunchMode::Resume => single_pod::run_resume(runtime_command).await,
-        LaunchMode::ResumeWithSession(id) => {
-            single_pod::run_spawn(Some(id), None, None, runtime_command).await
+        LaunchMode::ResumeWithSession { id, pod_name } => {
+            single_pod::run_spawn(Some(id), pod_name, None, runtime_command).await
         }
         LaunchMode::Panel => single_pod::run_panel(runtime_command).await,
     };
