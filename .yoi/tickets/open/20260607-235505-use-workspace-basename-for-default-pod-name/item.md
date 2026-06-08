@@ -8,7 +8,7 @@ priority: 'P1'
 labels: ['pod', 'identity', 'workspace', 'cli', 'panel']
 workflow_state: 'inprogress'
 created_at: '2026-06-07T23:55:05Z'
-updated_at: '2026-06-08T00:57:20Z'
+updated_at: '2026-06-08T01:53:54Z'
 assignee: null
 legacy_ticket: null
 queued_by: 'workspace-panel'

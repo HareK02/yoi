@@ -398,3 +398,86 @@ Pending:
 - No merge, close, final approval, or cleanup has occurred.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-08T01:53:43Z -->
+
+## Implementation report
+
+Merge-ready dossier: runtime workspace / Pod identity bundle
+
+Ticket id/slug:
+- Primary: `20260608-000047-introduce-runtime-workspace-root-context` / `introduce-runtime-workspace-root-context`
+- Related: `20260607-235442-remove-profile-derived-pod-names` / `remove-profile-derived-pod-names`
+- Related: `20260607-235505-use-workspace-basename-for-default-pod-name` / `use-workspace-basename-for-default-pod-name`
+
+Branch/worktree:
+- Branch: `runtime-workspace-context`
+- Worktree: `.worktree/runtime-workspace-context`
+- Base routing commit: `9df7f4e ticket: record workspace identity routing`
+- Current branch commits:
+  - `b6af761 runtime: separate workspace pod and profile identity`
+  - `15f54df runtime: use pod flag for session identity`
+
+Intent / invariant check:
+- `--workspace <path>` is runtime workspace root.
+- `--pod <name>` is runtime Pod identity for restore and fresh create.
+- `--profile <selector>` remains reusable Profile recipe selection only.
+- Profile fields, Profile slug/source, and registry names no longer define or imply `pod.name` in the reviewed startup/profile paths.
+- Default Pod name derives from sanitized runtime workspace basename with generic fallback.
+- Workspace Orchestrator remains distinct from Companion/default workspace Pod.
+- Ticket role/task Pods keep explicit launcher-provided names.
+- `.yoi` project records, `.yoi/memory` memory root, and runtime workspace root were not collapsed.
+- Existing Pod metadata migration/archive/fresh-start UX remains out of scope.
+
+Implementation summary:
+- Added explicit workspace/default Pod naming helpers in profile/startup paths.
+- Removed Profile-derived default Pod naming fallback.
+- Reworked client spawn, TUI spawn/multi-pod/single-pod, Pod entrypoint, Ticket role launcher, and top-level CLI parsing so runtime workspace root, Pod identity, and Profile selector are separate.
+- Preserved explicit role/task Pod names.
+- Fixed reviewer blocker by making `--session ... --pod ...` accepted at top-level and Pod runtime boundaries and removing hidden `--session-pod-name` split.
+- Added focused regression tests covering non-`yoi` workspace/default naming, `project:companion`, explicit `--pod` precedence, and session restore identity parsing.
+
+Coder / reviewer Pods:
+- Coder: `coder-runtime-workspace-context-2`
+- Reviewer: `reviewer-runtime-workspace-context`
+
+Review evidence:
+- Initial reviewer verdict: `request_changes` for stale session restore identity split.
+- Coder fix commit: `15f54df runtime: use pod flag for session identity`.
+- Re-review verdict: `approve`.
+- Reviewer verified `--session ... --pod ...` parser/runtime acceptance, removal/rejection of `--session-pod-name`, explicit `--pod` restore identity propagation, Panel Companion/Orchestrator naming consistency, Ticket role explicit naming, and no memory/project/workspace root conflation in reviewed paths.
+
+Validation performed by coder and/or reviewer:
+- `cargo test -q -p manifest profile`
+- `cargo test -q -p client spawn`
+- `cargo test -q -p pod entrypoint`
+- `cargo test -q -p yoi parse_`
+- `cargo test -q -p yoi parse_session_accepts_explicit_runtime_pod_identity`
+- `cargo test -q -p tui workspace_panel`
+- `cargo test -q -p tui spawn`
+- `cargo check -q`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo run -q -p yoi -- ticket doctor`
+- `nix build .#yoi`
+- Orchestrator also checked child worktree status, branch commits, diff stat, and `git diff --check develop...HEAD`.
+
+Blockers fixed or rejected findings:
+- Fixed: Pod runtime rejected `--session ... --pod ...`.
+- Fixed: top-level `yoi --session ... --pod ...` was rejected.
+- Fixed: hidden `--session-pod-name` preserved an old identity split.
+- No rejected reviewer blockers remain.
+
+Residual risks:
+- Broader live restore behavior still lacks a full existing-session E2E fixture; reviewer judged parser/runtime wiring and focused unit coverage sufficient for this Ticket.
+- Final merge validation should still be run from main after merge because this touches CLI/startup/profile/runtime paths and Nix packaging.
+
+Dirty state:
+- Main workspace was clean before recording this dossier.
+- Child worktree `.worktree/runtime-workspace-context` is clean at `15f54df`.
+- Coder/reviewer Pods are currently idle and still available for follow-up unless the merge-completion owner chooses to stop/reclaim them.
+
+Parent/human decision needs:
+- Merge authority is still required. This Orchestrator routing/review phase stops here without merge, close, final main-branch approval, or cleanup.
+
+---
