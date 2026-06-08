@@ -274,3 +274,36 @@ Pending:
 - No merge, close, final approval, or cleanup has occurred.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-08T09:14:49Z -->
+
+## Implementation report
+
+Coder fix-loop completed and reviewer re-review delegated.
+
+Coder follow-up:
+- Commit: `eddb33c docs: fix planning sync workflow references`
+- Worktree: clean on branch `replace-intake-state-with-planning`.
+- Fixes claimed:
+  - Replaced invalid/non-existent planning-sync workflow references with the actual compatibility slug `ticket-preflight-workflow` / `$user/ticket-preflight-workflow`.
+  - Clarified that `ticket-preflight-workflow` is now a planning/requirements-sync compatibility entry point rather than standalone Preflight state/lane.
+  - Updated `docs/development/work-items.md` to remove Preflight as an ordinary lifecycle gate and use planning/requirements-sync wording.
+  - Focused searches no longer find `ticket-planning`, `planning sync-workflow`, `Preflight`, or `preflight_needed`; remaining `preflight` / `needs_preflight` references are reported as legacy compatibility/metadata only.
+
+Coder validation reported:
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo test -p ticket --lib`
+- `cargo test -p tui workspace_panel --lib`
+- `cargo test -p yoi ticket_cli`
+- `cargo run -q -p yoi -- ticket doctor`
+- `nix build .#yoi`
+
+Action taken:
+- Sent updated commits and prior blocker checklist to `reviewer-replace-intake-planning` for read-only re-review.
+
+Pending:
+- Await reviewer verdict before merge-ready dossier / merge-completion.
+- No merge, close, final approval, or cleanup has occurred.
+
+---
