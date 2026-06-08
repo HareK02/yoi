@@ -1013,7 +1013,7 @@ impl MultiPodApp {
         self.sending = false;
         self.notice = Some(match result {
             Ok(outcome) => outcome.notice,
-            Err(error) => error.to_string(),
+            Err(error) => bounded_panel_diagnostic(error.to_string()),
         });
     }
 
@@ -1956,6 +1956,9 @@ async fn dispatch_ticket_action(
     let config = TicketConfig::load_workspace(&request.workspace_root)
         .map_err(|error| TicketActionError::BackendConfig(error.to_string()))?;
     let backend = LocalTicketBackend::new(config.backend_root());
+    if request.action == NextUserAction::Close {
+        return dispatch_panel_close(&backend, &request.ticket_id);
+    }
     let authority_pods = PodList::from_sources(
         PodVisibilitySource::ResumePicker,
         Vec::new(),
@@ -2036,12 +2039,7 @@ async fn dispatch_ticket_action(
             };
             Ok(TicketActionOutcome { notice })
         }
-        NextUserAction::Close => Ok(TicketActionOutcome {
-            notice: format!(
-                "Close for Ticket {} requires explicit resolution text; no close was recorded.",
-                current_ticket.slug
-            ),
-        }),
+        NextUserAction::Close => unreachable!("Close action is handled before row dispatch"),
         NextUserAction::Clarify
         | NextUserAction::Edit
         | NextUserAction::OpenPod
@@ -2053,6 +2051,75 @@ async fn dispatch_ticket_action(
             ),
         }),
     }
+}
+
+fn dispatch_panel_close(
+    backend: &LocalTicketBackend,
+    ticket_id: &str,
+) -> Result<TicketActionOutcome, TicketActionError> {
+    let ticket = backend
+        .show(TicketIdOrSlug::Id(ticket_id.to_owned()))
+        .map_err(|error| TicketActionError::Ticket(error.to_string()))?;
+    if let Some(blocker) = panel_close_blocker(&ticket) {
+        return Err(TicketActionError::Stale(blocker));
+    }
+
+    let resolution = panel_close_resolution(&ticket);
+    backend
+        .close(TicketIdOrSlug::Id(ticket_id.to_owned()), resolution)
+        .map_err(|error| TicketActionError::Ticket(error.to_string()))?;
+
+    Ok(TicketActionOutcome {
+        notice: format!(
+            "Closed Ticket {}; deterministic resolution recorded because workflow_state was already done.",
+            ticket.meta.slug
+        ),
+    })
+}
+
+fn panel_close_blocker(ticket: &ticket::Ticket) -> Option<String> {
+    let slug = ticket.meta.slug.as_str();
+    if ticket.meta.status.as_local() != Some(TicketStatus::Open) {
+        return Some(format!(
+            "Close blocked for Ticket {slug}: local status is {}, expected open; no close was recorded.",
+            ticket.meta.status.as_str()
+        ));
+    }
+    if ticket.meta.workflow_state != TicketWorkflowState::Done {
+        return Some(format!(
+            "Close blocked for Ticket {slug}: workflow_state is {}, expected done; no close was recorded.",
+            ticket.meta.workflow_state.as_str()
+        ));
+    }
+    if let Some(reason) = non_empty_ticket_field(ticket.meta.attention_required.as_deref()) {
+        return Some(format!(
+            "Close blocked for Ticket {slug}: attention_required is set ({}); no close was recorded.",
+            bounded_panel_diagnostic(reason)
+        ));
+    }
+    if let Some(reason) = non_empty_ticket_field(ticket.meta.action_required.as_deref()) {
+        return Some(format!(
+            "Close blocked for Ticket {slug}: action_required is set ({}); no close was recorded.",
+            bounded_panel_diagnostic(reason)
+        ));
+    }
+    if ticket.resolution.is_some() {
+        return Some(format!(
+            "Close blocked for Ticket {slug}: resolution.md already exists; no close was recorded."
+        ));
+    }
+    None
+}
+
+fn non_empty_ticket_field(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+fn panel_close_resolution(ticket: &ticket::Ticket) -> ticket::MarkdownText {
+    ticket::MarkdownText::new(format!(
+        "Closed from the workspace Panel because Ticket `{}` (`{}`) had already reached `workflow_state: done`.\n\nNo implementation work, workflow-state change, Orchestrator/Companion launch, or worker invocation was started by this Close action.\n",
+        ticket.meta.slug, ticket.meta.id
+    ))
 }
 
 fn append_panel_decision(
@@ -2930,11 +2997,15 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
     use ticket::{
-        LocalTicketBackend, MarkdownText, NewTicket, TicketBackend, TicketEventKind, TicketReview,
-        TicketStateChange, TicketWorkflowState,
+        LocalTicketBackend, MarkdownText, NewTicket, TicketBackend, TicketEventKind,
+        TicketWorkflowState,
     };
 
-    fn ready_ticket_workspace(slug: &str) -> (TempDir, String, LocalTicketBackend) {
+    fn ticket_workspace(
+        slug: &str,
+        workflow_state: TicketWorkflowState,
+        configure: impl FnOnce(&mut NewTicket),
+    ) -> (TempDir, String, LocalTicketBackend) {
         let temp = TempDir::new().unwrap();
         fs::create_dir_all(temp.path().join(".yoi")).unwrap();
         fs::write(
@@ -2943,28 +3014,36 @@ mod tests {
         )
         .unwrap();
         let backend = LocalTicketBackend::new(temp.path().join(".yoi/tickets"));
-        let ticket = backend
-            .create(NewTicket {
-                slug: Some(slug.to_string()),
-                title: "Ready panel ticket".to_string(),
-                body: MarkdownText::from("Ready for panel action"),
-                kind: "task".to_string(),
-                priority: "P2".to_string(),
-                author: None,
-                assignee: None,
-                labels: Vec::new(),
-                readiness: None,
-                action_required: None,
-                workflow_state: Some(TicketWorkflowState::Ready),
-                attention_required: None,
-                queued_by: None,
-                queued_at: None,
-                needs_preflight: None,
-                risk_flags: Vec::new(),
-                legacy_ticket: None,
-            })
-            .unwrap();
+        let mut input = NewTicket {
+            slug: Some(slug.to_string()),
+            title: "Ready panel ticket".to_string(),
+            body: MarkdownText::from("Ready for panel action"),
+            kind: "task".to_string(),
+            priority: "P2".to_string(),
+            author: None,
+            assignee: None,
+            labels: Vec::new(),
+            readiness: None,
+            action_required: None,
+            workflow_state: Some(workflow_state),
+            attention_required: None,
+            queued_by: None,
+            queued_at: None,
+            needs_preflight: None,
+            risk_flags: Vec::new(),
+            legacy_ticket: None,
+        };
+        configure(&mut input);
+        let ticket = backend.create(input).unwrap();
         (temp, ticket.id, backend)
+    }
+
+    fn ready_ticket_workspace(slug: &str) -> (TempDir, String, LocalTicketBackend) {
+        ticket_workspace(slug, TicketWorkflowState::Ready, |_| {})
+    }
+
+    fn done_ticket_workspace(slug: &str) -> (TempDir, String, LocalTicketBackend) {
+        ticket_workspace(slug, TicketWorkflowState::Done, |_| {})
     }
 
     fn request_for(
@@ -3016,14 +3095,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ticket_action_rejects_stale_selected_action() {
-        let (temp, ticket_id, _backend) = ready_ticket_workspace("panel-stale");
+    async fn ticket_close_action_blocks_non_done_ticket_without_mutation() {
+        let (temp, ticket_id, backend) = ready_ticket_workspace("panel-not-done");
 
-        let error = dispatch_ticket_action(request_for(&temp, ticket_id, NextUserAction::Close))
-            .await
-            .unwrap_err();
+        let error =
+            dispatch_ticket_action(request_for(&temp, ticket_id.clone(), NextUserAction::Close))
+                .await
+                .unwrap_err();
 
-        assert!(error.to_string().contains("current action is Queue"));
+        assert!(error.to_string().contains("workflow_state is ready"));
+        let ticket = backend.show(TicketIdOrSlug::Id(ticket_id)).unwrap();
+        assert_eq!(ticket.meta.status.as_local(), Some(TicketStatus::Open));
+        assert_eq!(ticket.meta.workflow_state, TicketWorkflowState::Ready);
+        assert!(ticket.resolution.is_none());
     }
 
     #[tokio::test]
@@ -3068,55 +3152,101 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ticket_close_action_requires_explicit_resolution() {
-        let (temp, ticket_id, backend) = ready_ticket_workspace("panel-close");
-        backend
-            .add_event(
-                TicketIdOrSlug::Id(ticket_id.clone()),
-                NewTicketEvent::new(TicketEventKind::ImplementationReport, "implemented"),
-            )
-            .unwrap();
-        backend
-            .review(
-                TicketIdOrSlug::Id(ticket_id.clone()),
-                TicketReview::approve("reviewed"),
-            )
-            .unwrap();
-        backend
-            .queue_ready(TicketIdOrSlug::Id(ticket_id.clone()), "panel")
-            .unwrap();
-        backend
-            .set_workflow_state(
-                TicketIdOrSlug::Id(ticket_id.clone()),
-                TicketStateChange::new(
-                    "queued",
-                    "inprogress",
-                    "implemented",
-                    "Implementation started.",
-                ),
-            )
-            .unwrap();
-        backend
-            .set_workflow_state(
-                TicketIdOrSlug::Id(ticket_id.clone()),
-                TicketStateChange::new(
-                    "inprogress",
-                    "done",
-                    "implemented",
-                    "Ready for close diagnostic.",
-                ),
-            )
-            .unwrap();
+    async fn ticket_close_action_closes_done_ticket_with_deterministic_resolution() {
+        let (temp, ticket_id, backend) = done_ticket_workspace("panel-close");
 
         let outcome =
             dispatch_ticket_action(request_for(&temp, ticket_id.clone(), NextUserAction::Close))
                 .await
                 .unwrap();
 
-        assert!(outcome.notice.contains("requires explicit resolution text"));
+        assert!(outcome.notice.contains("Closed Ticket panel-close"));
+        assert!(outcome.notice.contains("workflow_state was already done"));
+        let ticket = backend.show(TicketIdOrSlug::Id(ticket_id)).unwrap();
+        assert_eq!(ticket.meta.status.as_local(), Some(TicketStatus::Closed));
+        assert_eq!(ticket.meta.workflow_state, TicketWorkflowState::Done);
+        let resolution = ticket
+            .resolution
+            .as_ref()
+            .expect("Panel Close records resolution.md")
+            .as_str();
+        assert!(resolution.contains("workflow_state: done"));
+        assert!(resolution.contains("No implementation work"));
+        assert!(resolution.contains("workflow-state change"));
+        assert!(resolution.contains("worker invocation"));
+        assert!(ticket.events.iter().any(|event| {
+            event.kind == TicketEventKind::Close && event.body.as_str().contains("workspace Panel")
+        }));
+    }
+
+    #[tokio::test]
+    async fn ticket_close_action_blocks_action_required_without_mutation() {
+        let (temp, ticket_id, backend) = ticket_workspace(
+            "panel-close-action-required",
+            TicketWorkflowState::Done,
+            |input| {
+                input.action_required = Some("human decision needed".to_string());
+            },
+        );
+
+        let error =
+            dispatch_ticket_action(request_for(&temp, ticket_id.clone(), NextUserAction::Close))
+                .await
+                .unwrap_err();
+
+        assert!(error.to_string().contains("action_required is set"));
+        assert!(error.to_string().contains("no close was recorded"));
+        let ticket = backend.show(TicketIdOrSlug::Id(ticket_id)).unwrap();
+        assert_eq!(ticket.meta.status.as_local(), Some(TicketStatus::Open));
+        assert_eq!(ticket.meta.workflow_state, TicketWorkflowState::Done);
+        assert!(ticket.resolution.is_none());
+    }
+
+    #[tokio::test]
+    async fn ticket_close_action_blocks_attention_required_without_mutation() {
+        let (temp, ticket_id, backend) = ticket_workspace(
+            "panel-close-attention-required",
+            TicketWorkflowState::Done,
+            |input| {
+                input.attention_required = Some("needs reply".to_string());
+            },
+        );
+
+        let error =
+            dispatch_ticket_action(request_for(&temp, ticket_id.clone(), NextUserAction::Close))
+                .await
+                .unwrap_err();
+
+        assert!(error.to_string().contains("attention_required is set"));
         let ticket = backend.show(TicketIdOrSlug::Id(ticket_id)).unwrap();
         assert_eq!(ticket.meta.status.as_local(), Some(TicketStatus::Open));
         assert!(ticket.resolution.is_none());
+    }
+
+    #[tokio::test]
+    async fn ticket_close_action_blocks_existing_resolution_without_moving_ticket() {
+        let (temp, ticket_id, backend) = done_ticket_workspace("panel-close-resolution");
+        fs::write(
+            temp.path()
+                .join(".yoi/tickets/open")
+                .join(&ticket_id)
+                .join("resolution.md"),
+            "Already resolved\n",
+        )
+        .unwrap();
+
+        let error =
+            dispatch_ticket_action(request_for(&temp, ticket_id.clone(), NextUserAction::Close))
+                .await
+                .unwrap_err();
+
+        assert!(error.to_string().contains("resolution.md already exists"));
+        let ticket = backend.show(TicketIdOrSlug::Id(ticket_id)).unwrap();
+        assert_eq!(ticket.meta.status.as_local(), Some(TicketStatus::Open));
+        assert_eq!(
+            ticket.resolution.as_ref().unwrap().as_str(),
+            "Already resolved\n"
+        );
     }
 
     #[tokio::test]
