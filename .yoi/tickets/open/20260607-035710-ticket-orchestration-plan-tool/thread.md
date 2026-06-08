@@ -231,3 +231,28 @@ Validation completed:
 - `nix build .#yoi`
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-08T13:18:35Z -->
+
+## Implementation report
+
+Coder implementation completed and was handed to sibling Reviewer.
+
+Coder Pod:
+- `coder-ticket-orchestration-plan-tool`
+- Commit: `b28b7759f51e7c9c7ccaaa15358b475e3889952c ticket: add orchestration plan tools`
+- Worktree status before review: clean branch `ticket-orchestration-plan-tool`
+- Stopped after collecting output to reclaim delegated worktree scope.
+
+Reviewer Pod:
+- `reviewer-ticket-orchestration-plan-tool`
+- Reviewing commit `b28b775` against the orchestration-plan tool invariants.
+
+Coder-reported design summary:
+- Storage: per-Ticket `artifacts/orchestration-plan.jsonl` typed JSONL artifact.
+- Backend API: append/query orchestration plan records.
+- LLM tools: `TicketOrchestrationPlanRecord` and `TicketOrchestrationPlanQuery`.
+- Capability split: query in read-only Ticket tool set; record in mutating/lifecycle Ticket tool set.
+- Supported kinds include ordering, dependency, conflict, waiting/capacity, and accepted-plan records.
+
+---
