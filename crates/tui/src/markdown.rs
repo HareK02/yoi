@@ -5,9 +5,10 @@
 //! features get styled) and exclusions are documented in
 //! `tickets/tui-assistant-markdown.md`.
 
-use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Alignment, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use unicode_width::UnicodeWidthStr;
 
 const LIST_INDENT: &str = "  ";
 const RULE_WIDTH: usize = 40;
@@ -15,7 +16,8 @@ const RULE_WIDTH: usize = 40;
 pub fn render(text: &str, base: Style) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut r = Renderer::new(base);
-    let parser = Parser::new_ext(text, Options::ENABLE_STRIKETHROUGH);
+    let options = Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES;
+    let parser = Parser::new_ext(text, options);
     for event in parser {
         r.handle(event, &mut out);
     }
@@ -37,6 +39,7 @@ struct Renderer {
     image_depth: u32,
     heading: Option<HeadingLevel>,
     in_code_block: bool,
+    table: Option<TableState>,
 
     /// One entry per open list. `Some(n)` carries the next ordinal to
     /// emit for an ordered list; `None` means a bullet list.
@@ -44,6 +47,132 @@ struct Renderer {
 
     has_emitted: bool,
     just_blanked: bool,
+}
+
+#[derive(Debug)]
+struct TableState {
+    alignments: Vec<Alignment>,
+    rows: Vec<TableRow>,
+    current_row: Option<TableRow>,
+    current_cell: Option<String>,
+    in_header: bool,
+}
+
+#[derive(Debug)]
+struct TableRow {
+    cells: Vec<String>,
+    is_header: bool,
+}
+
+impl TableState {
+    fn new(alignments: Vec<Alignment>) -> Self {
+        Self {
+            alignments,
+            rows: Vec::new(),
+            current_row: None,
+            current_cell: None,
+            in_header: false,
+        }
+    }
+
+    fn start_row(&mut self) {
+        self.finish_cell();
+        self.finish_row();
+        self.current_row = Some(TableRow {
+            cells: Vec::new(),
+            is_header: self.in_header,
+        });
+    }
+
+    fn finish_row(&mut self) {
+        self.finish_cell();
+        if let Some(row) = self.current_row.take() {
+            self.rows.push(row);
+        }
+    }
+
+    fn start_cell(&mut self) {
+        self.finish_cell();
+        if self.current_row.is_none() {
+            self.current_row = Some(TableRow {
+                cells: Vec::new(),
+                is_header: self.in_header,
+            });
+        }
+        self.current_cell = Some(String::new());
+    }
+
+    fn finish_cell(&mut self) {
+        if let Some(cell) = self.current_cell.take() {
+            let row = self.current_row.get_or_insert_with(|| TableRow {
+                cells: Vec::new(),
+                is_header: self.in_header,
+            });
+            row.cells.push(collapse_cell_whitespace(&cell));
+        }
+    }
+
+    fn push_text(&mut self, text: &str) {
+        if self.current_cell.is_none() {
+            self.start_cell();
+        }
+        if let Some(cell) = self.current_cell.as_mut() {
+            cell.push_str(text);
+        }
+    }
+
+    fn push_separator(&mut self) {
+        if self.current_cell.is_none() {
+            self.start_cell();
+        }
+        if let Some(cell) = self.current_cell.as_mut() {
+            cell.push(' ');
+        }
+    }
+
+    fn finish(mut self) -> Self {
+        self.finish_row();
+        self
+    }
+}
+
+fn collapse_cell_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn render_table_row(row: &TableRow, alignments: &[Alignment], widths: &[usize]) -> String {
+    widths
+        .iter()
+        .enumerate()
+        .map(|(idx, width)| {
+            let cell = row.cells.get(idx).map_or("", String::as_str);
+            let alignment = alignments.get(idx).copied().unwrap_or(Alignment::None);
+            align_table_cell(cell, *width, alignment)
+        })
+        .collect::<Vec<_>>()
+        .join(" │ ")
+}
+
+fn render_table_separator(widths: &[usize]) -> String {
+    widths
+        .iter()
+        .map(|width| "─".repeat(*width))
+        .collect::<Vec<_>>()
+        .join("─┼─")
+}
+
+fn align_table_cell(cell: &str, width: usize, alignment: Alignment) -> String {
+    let cell_width = UnicodeWidthStr::width(cell);
+    let padding = width.saturating_sub(cell_width);
+    match alignment {
+        Alignment::Right => format!("{}{}", " ".repeat(padding), cell),
+        Alignment::Center => {
+            let left = padding / 2;
+            let right = padding - left;
+            format!("{}{}{}", " ".repeat(left), cell, " ".repeat(right))
+        }
+        Alignment::Left | Alignment::None => format!("{}{}", cell, " ".repeat(padding)),
+    }
 }
 
 impl Renderer {
@@ -61,6 +190,7 @@ impl Renderer {
             image_depth: 0,
             heading: None,
             in_code_block: false,
+            table: None,
             list_stack: Vec::new(),
             has_emitted: false,
             just_blanked: false,
@@ -103,18 +233,23 @@ impl Renderer {
         self.current.push(Span::styled(content, style));
     }
 
+    fn emit_spans_line(&mut self, spans: Vec<Span<'static>>, out: &mut Vec<Line<'static>>) {
+        let mut prefixed: Vec<Span<'static>> = self.line_prefix.clone();
+        if let Some(m) = self.pending_marker.take() {
+            prefixed.push(m);
+        }
+        prefixed.extend(spans);
+        out.push(Line::from(prefixed));
+        self.has_emitted = true;
+        self.just_blanked = false;
+    }
+
     fn flush_line(&mut self, out: &mut Vec<Line<'static>>) {
         if self.current.is_empty() && self.pending_marker.is_none() {
             return;
         }
-        let mut spans: Vec<Span<'static>> = self.line_prefix.clone();
-        if let Some(m) = self.pending_marker.take() {
-            spans.push(m);
-        }
-        spans.extend(self.current.drain(..));
-        out.push(Line::from(spans));
-        self.has_emitted = true;
-        self.just_blanked = false;
+        let spans: Vec<Span<'static>> = self.current.drain(..).collect();
+        self.emit_spans_line(spans, out);
     }
 
     fn emit_blank(&mut self, out: &mut Vec<Line<'static>>) {
@@ -126,6 +261,11 @@ impl Renderer {
     }
 
     fn handle(&mut self, ev: Event<'_>, out: &mut Vec<Line<'static>>) {
+        if self.table.is_some() {
+            self.handle_table_event(ev, out);
+            return;
+        }
+
         match ev {
             Event::Start(tag) => self.start(tag, out),
             Event::End(tag) => self.end(tag, out),
@@ -169,6 +309,84 @@ impl Renderer {
         }
     }
 
+    fn handle_table_event(&mut self, ev: Event<'_>, out: &mut Vec<Line<'static>>) {
+        if matches!(ev, Event::End(TagEnd::Table)) {
+            if let Some(table) = self.table.take() {
+                self.render_table(table, out);
+            }
+            return;
+        }
+
+        let Some(table) = self.table.as_mut() else {
+            return;
+        };
+
+        match ev {
+            Event::Start(Tag::Table(_)) => {}
+            Event::Start(Tag::TableHead) => table.in_header = true,
+            Event::Start(Tag::TableRow) => table.start_row(),
+            Event::Start(Tag::TableCell) => table.start_cell(),
+            Event::End(TagEnd::TableCell) => table.finish_cell(),
+            Event::End(TagEnd::TableRow) => table.finish_row(),
+            Event::End(TagEnd::TableHead) => {
+                table.finish_row();
+                table.in_header = false;
+            }
+            Event::Text(s) | Event::Code(s) => table.push_text(&s),
+            Event::SoftBreak | Event::HardBreak => table.push_separator(),
+            _ => {}
+        }
+    }
+
+    fn render_table(&mut self, table: TableState, out: &mut Vec<Line<'static>>) {
+        let table = table.finish();
+        if table.rows.is_empty() {
+            return;
+        }
+
+        let column_count = table
+            .rows
+            .iter()
+            .map(|row| row.cells.len())
+            .max()
+            .unwrap_or(0)
+            .max(table.alignments.len());
+        if column_count == 0 {
+            return;
+        }
+
+        let mut widths = vec![1; column_count];
+        for row in &table.rows {
+            for (idx, cell) in row.cells.iter().enumerate() {
+                widths[idx] = widths[idx].max(UnicodeWidthStr::width(cell.as_str()));
+            }
+        }
+
+        let separator = render_table_separator(&widths);
+        let mut emitted_header_separator = false;
+        for (idx, row) in table.rows.iter().enumerate() {
+            let text = render_table_row(row, &table.alignments, &widths);
+            let style = if row.is_header {
+                self.base.add_modifier(Modifier::BOLD)
+            } else {
+                self.base
+            };
+            self.emit_spans_line(vec![Span::styled(text, style)], out);
+
+            let next_is_body = table.rows.get(idx + 1).map_or(true, |next| !next.is_header);
+            if row.is_header && next_is_body && !emitted_header_separator {
+                self.emit_spans_line(
+                    vec![Span::styled(
+                        separator.clone(),
+                        Style::default().fg(Color::DarkGray),
+                    )],
+                    out,
+                );
+                emitted_header_separator = true;
+            }
+        }
+    }
+
     fn start(&mut self, tag: Tag<'_>, out: &mut Vec<Line<'static>>) {
         match tag {
             Tag::Paragraph => {
@@ -181,6 +399,11 @@ impl Renderer {
             Tag::CodeBlock(_) => {
                 self.emit_blank(out);
                 self.in_code_block = true;
+            }
+            Tag::Table(alignments) => {
+                self.flush_line(out);
+                self.emit_blank(out);
+                self.table = Some(TableState::new(alignments));
             }
             Tag::List(start) => {
                 // Close any in-flight line (in tight nested lists the
@@ -267,6 +490,9 @@ impl Renderer {
     }
 
     fn finish(&mut self, out: &mut Vec<Line<'static>>) {
+        if let Some(table) = self.table.take() {
+            self.render_table(table, out);
+        }
         self.flush_line(out);
         while matches!(out.last(), Some(l) if l.spans.iter().all(|s| s.content.is_empty())) {
             out.pop();
@@ -382,5 +608,29 @@ mod tests {
         // Streaming partial: opener arrived, closer hasn't.
         let lines = render_plain("hello **world");
         assert_eq!(lines, vec!["hello **world"]);
+    }
+
+    #[test]
+    fn markdown_pipe_table_renders_as_readable_rows() {
+        let lines = render_plain("| Name | Age |\n| --- | ---: |\n| Alice | 42 |\n| Bob | 7 |");
+        assert_eq!(
+            lines,
+            vec!["Name  │ Age", "──────┼────", "Alice │  42", "Bob   │   7",]
+        );
+    }
+
+    #[test]
+    fn non_table_pipe_text_stays_plain_text() {
+        let lines = render_plain("alpha | beta");
+        assert_eq!(lines, vec!["alpha | beta"]);
+    }
+
+    #[test]
+    fn ragged_and_wide_table_keeps_cell_content() {
+        let long_value = "abcdefghijklmnopqrstuvwxyz0123456789";
+        let input = format!("| Key | Value |\n| --- | --- |\n| one | {long_value} |\n| two |");
+        let lines = render_plain(&input);
+        assert!(lines.iter().any(|line| line.contains(long_value)));
+        assert!(lines.iter().any(|line| line.contains("two")));
     }
 }
