@@ -170,3 +170,29 @@ Critical risks / reviewer focus:
 Accepted queued implementation after user confirmation and routing IntentPacket were recorded. This acceptance precedes worktree creation and coder/reviewer Pod spawning.
 
 ---
+
+<!-- event: plan author: orchestrator at: 2026-06-08T07:41:39Z -->
+
+## Plan
+
+Implementation routing accepted and worktree created.
+
+Worktree plan:
+- Branch: `separate-ticket-record-language-from-worker-language`
+- Worktree: `.worktree/separate-ticket-record-language-from-worker-language`
+- Base: `17ac5b0 ticket: route ticket record language implementation`
+- Scope: add optional Ticket record language config and propagate it to role guidance/generated Ticket-record paths where practical.
+
+Delegation plan:
+- Spawn sibling coder Pod with write scope limited to `.worktree/separate-ticket-record-language-from-worker-language`.
+- Coder must run Bash commands from the child worktree, not from the main workspace.
+- Coder must not edit main-workspace `.yoi` / Ticket / workflow / docs records, and must not create generated memory/local/runtime/secret-like files.
+- Reviewer will be spawned read-only after coder reports diff/commits and validation evidence.
+
+Concurrency note:
+- `allow-spawnpod-child-workspace-cwd` and `shutdown-intake-pod-after-ready-idle` are active in separate worktrees. This language-policy implementation must remain isolated and should not depend on those unmerged branches.
+
+Stop/completion policy:
+- Because the human authorized cleanup after completion, this Orchestrator will proceed through reviewer approval, merge-completion validation, Ticket close, Pod stop, worktree removal, and branch deletion if the branch is approved and merge authority remains clear.
+
+---
