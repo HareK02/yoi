@@ -66,6 +66,8 @@ Orchestrator は以下を行う。
 - `TicketComment`: routing decision / intent packet / blocked reason / next question の記録。
 - `TicketStatus`: pending/open などの状態整理が明示的に許可された場合だけ使う。
 - `TicketWorkflowState`: `queued -> inprogress` acceptance、`inprogress -> done`、または concrete missing decision/information reason を伴う `ready|queued -> planning` に使う。
+- `TicketOrchestrationPlanQuery`: 対象 Ticket や関連 Ticket の ordering / blocker / conflict / waiting-capacity / accepted-plan 記録を読む。queued acceptance 前に必ず確認する。
+- `TicketOrchestrationPlanRecord`: Orchestrator が routing 中に project-relevant な ordering / dependency / conflict / capacity/waiting / accepted-plan decision を残す。これは queue reorder、自動起動、workflow_state 変更ではない。
 - `TicketClose`: 完了権限と resolution が揃っている場合だけ使う。
 - `TicketDoctor`: routing 前後の整合性確認。
 
@@ -73,9 +75,10 @@ Orchestrator は以下を行う。
 
 ## Queued acceptance contract
 
-`workflow_state = queued` は、Ticket が routing 対象として人間により Orchestrator へ渡された状態である。Orchestrator は queued notification を受けたら、Ticket と workspace state を読んで、次のどちらかを行う。
+`workflow_state = queued` は、Ticket が routing 対象として人間により Orchestrator へ渡された状態である。Orchestrator は queued notification を受けたら、Ticket、workspace state、対象 Ticket の `TicketOrchestrationPlanQuery` 記録を読んで、次のどちらかを行う。
 
 - unblocked と判断する場合: `queued -> inprogress` を記録してから worktree 作成、implementation/review Pod spawn、その他の implementation side effect に進む。
+  - `before` / `after` / `blocked_by` / `blocks` / `conflicts_with` / `do_not_parallelize` / waiting-capacity 記録がある場合、それを acceptance 判断の入力にする。記録は自動 scheduler ではないため、実際に進めるかどうかは Orchestrator が読んだうえで明示的に決める。
 - concrete missing decision / information がある場合: `TicketWorkflowState` で `queued -> planning` を記録し、reason/body に不足項目を残す。既存の claimed live/restorable Intake/Planning Pod があり、既存通知経路が使える場合は同じ理由を通知する。
 - external action 待ちなど planning では解決しない blocker の場合: concise な理由を Ticket thread に記録し、queued のまま待つか、既存の Ticket status/state mechanism で明示的に defer/block する。
 
@@ -160,6 +163,7 @@ Action:
 Action:
 
 - `IntentPacket` を作る。
+- project-relevant な ordering / blocker / conflict / capacity decision や accepted work plan がある場合は、`TicketOrchestrationPlanRecord` に bounded typed record として残す。local session/socket/raw model output は入れない。
 - `TicketComment` に routing decision と IntentPacket を記録する。
 - 許可があれば `multi-agent-workflow` に接続し、worktree + coder/reviewer sibling loop に進む。
 

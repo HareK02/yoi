@@ -196,6 +196,12 @@ fn tool_description(name: &str) -> &'static str {
         }
         "TicketStatus" => "Move a Ticket between open and pending; use TicketClose for closed.",
         "TicketClose" => "Close a Ticket with a resolution through the typed local Ticket backend.",
+        "TicketOrchestrationPlanRecord" => {
+            "Append a durable typed Ticket orchestration plan record without changing workflow_state or starting work."
+        }
+        "TicketOrchestrationPlanQuery" => {
+            "Query durable Ticket orchestration plan records by Ticket and/or relation kind."
+        }
         "TicketDoctor" => "Run typed local Ticket backend consistency checks.",
         _ => "Typed Ticket backend tool.",
     }
@@ -411,7 +417,7 @@ profile = "inherit"
         assert_eq!(report.reports[0].diagnostics.len(), 1);
         let message = &report.reports[0].diagnostics[0].message;
         assert!(message.contains("Ticket tools not registered"));
-        assert!(message.contains("unknown Ticket role `operator`"));
+        assert!(message.contains("unsupported Ticket role `operator`"));
     }
 
     #[test]

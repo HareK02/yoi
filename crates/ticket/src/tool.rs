@@ -12,7 +12,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{
-    ExtensibleTicketStatus, LocalTicketBackend, MarkdownText, NewTicket, NewTicketEvent, Ticket,
+    AcceptedOrchestrationPlan, ExtensibleTicketStatus, LocalTicketBackend, MarkdownText,
+    NewOrchestrationPlanRecord, NewTicket, NewTicketEvent, OrchestrationPlanKind, Ticket,
     TicketBackend, TicketDoctorDiagnostic, TicketDoctorReport, TicketDoctorSeverity, TicketError,
     TicketEventKind, TicketIdOrSlug, TicketIntakeSummary, TicketRef, TicketReview,
     TicketReviewResult, TicketStateChange, TicketStatus, TicketSummary, TicketWorkflowState,
@@ -29,7 +30,7 @@ const MAX_BODY_MAX_BYTES: usize = 64 * 1024;
 const DEFAULT_DIAGNOSTIC_LIMIT: usize = 100;
 const MAX_DIAGNOSTIC_LIMIT: usize = 500;
 
-pub const TICKET_TOOL_NAMES: [&str; 10] = [
+pub const TICKET_TOOL_NAMES: [&str; 12] = [
     "TicketCreate",
     "TicketList",
     "TicketShow",
@@ -39,12 +40,19 @@ pub const TICKET_TOOL_NAMES: [&str; 10] = [
     "TicketWorkflowState",
     "TicketStatus",
     "TicketClose",
+    "TicketOrchestrationPlanRecord",
+    "TicketOrchestrationPlanQuery",
     "TicketDoctor",
 ];
 
-pub const TICKET_READ_ONLY_TOOL_NAMES: [&str; 3] = ["TicketList", "TicketShow", "TicketDoctor"];
+pub const TICKET_READ_ONLY_TOOL_NAMES: [&str; 4] = [
+    "TicketList",
+    "TicketShow",
+    "TicketOrchestrationPlanQuery",
+    "TicketDoctor",
+];
 
-pub const TICKET_MUTATING_TOOL_NAMES: [&str; 7] = [
+pub const TICKET_MUTATING_TOOL_NAMES: [&str; 8] = [
     "TicketCreate",
     "TicketComment",
     "TicketReview",
@@ -52,6 +60,7 @@ pub const TICKET_MUTATING_TOOL_NAMES: [&str; 7] = [
     "TicketWorkflowState",
     "TicketStatus",
     "TicketClose",
+    "TicketOrchestrationPlanRecord",
 ];
 
 const CREATE_DESCRIPTION: &str = "Create a Ticket through the configured typed Ticket backend. \
@@ -82,6 +91,12 @@ by `yoi ticket doctor`.";
 const CLOSE_DESCRIPTION: &str = "Close a Ticket with a Markdown resolution through the typed Ticket \
 backend. The backend moves the Ticket to closed/, writes resolution.md, updates item.md, and appends \
 a close event.";
+const ORCHESTRATION_PLAN_RECORD_DESCRIPTION: &str = "Append a typed Ticket orchestration plan record \
+for ordering, dependency, conflict, waiting/capacity, or accepted-plan decisions. Records are durable \
+Ticket artifacts and do not move workflow_state, reorder queues, or start work.";
+const ORCHESTRATION_PLAN_QUERY_DESCRIPTION: &str = "Query durable Ticket orchestration plan records by \
+Ticket id/slug and/or relation kind. This is read-only planning context; Orchestrator must still make \
+explicit workflow_state decisions.";
 const DOCTOR_DESCRIPTION: &str = "Run typed Ticket backend consistency checks and return bounded \
 diagnostics through the typed backend without shelling out to external commands.";
 
@@ -304,6 +319,90 @@ struct TicketCloseParams {
     resolution: String,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum OrchestrationPlanKindParam {
+    Before,
+    After,
+    BlockedBy,
+    Blocks,
+    ConflictsWith,
+    DoNotParallelize,
+    WaitingCapacityNote,
+    AcceptedPlan,
+}
+
+impl OrchestrationPlanKindParam {
+    fn into_kind(self) -> OrchestrationPlanKind {
+        match self {
+            Self::Before => OrchestrationPlanKind::Before,
+            Self::After => OrchestrationPlanKind::After,
+            Self::BlockedBy => OrchestrationPlanKind::BlockedBy,
+            Self::Blocks => OrchestrationPlanKind::Blocks,
+            Self::ConflictsWith => OrchestrationPlanKind::ConflictsWith,
+            Self::DoNotParallelize => OrchestrationPlanKind::DoNotParallelize,
+            Self::WaitingCapacityNote => OrchestrationPlanKind::WaitingCapacityNote,
+            Self::AcceptedPlan => OrchestrationPlanKind::AcceptedPlan,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct AcceptedOrchestrationPlanParams {
+    /// Bounded project-relevant accepted plan summary.
+    summary: String,
+    /// Optional branch name for the accepted plan. Do not include runtime/session/socket details.
+    #[serde(default)]
+    branch: Option<String>,
+    /// Optional worktree path for the accepted plan. Do not include runtime/session/socket details.
+    #[serde(default)]
+    worktree: Option<String>,
+    /// Optional bounded role/work allocation plan. Do not include raw model output or private runtime details.
+    #[serde(default)]
+    role_plan: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct TicketOrchestrationPlanRecordParams {
+    /// Ticket id or slug that owns this orchestration plan record.
+    ticket: String,
+    /// Record kind: before/after, blocked_by/blocks, conflicts_with/do_not_parallelize, waiting_capacity_note, or accepted_plan.
+    kind: OrchestrationPlanKindParam,
+    /// Related Ticket id/slug for ordering, dependency, and conflict records.
+    #[serde(default)]
+    related_ticket: Option<String>,
+    /// Optional bounded rationale/note. Required for waiting_capacity_note.
+    #[serde(default)]
+    note: Option<String>,
+    /// Accepted plan fields. Required for accepted_plan and invalid for other kinds.
+    #[serde(default)]
+    accepted_plan: Option<AcceptedOrchestrationPlanParams>,
+    /// Optional record author.
+    #[serde(default)]
+    author: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct TicketOrchestrationPlanQueryParams {
+    /// Optional Ticket id or slug to query. Omit to query across the backend root.
+    #[serde(default)]
+    ticket: Option<String>,
+    /// Optional relation kind filter.
+    #[serde(default)]
+    relation_kind: Option<OrchestrationPlanKindParam>,
+    /// Maximum records to return. Defaults to 100, max 200.
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct TicketOrchestrationPlanQueryOutput {
+    count: usize,
+    returned: usize,
+    truncated: bool,
+    records: Vec<Value>,
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct TicketDoctorParams {
     /// Maximum diagnostics to return. Defaults to 100, max 500.
@@ -379,6 +478,16 @@ struct TicketStatusTool {
 
 #[derive(Clone)]
 struct TicketCloseTool {
+    backend: LocalTicketBackend,
+}
+
+#[derive(Clone)]
+struct TicketOrchestrationPlanRecordTool {
+    backend: LocalTicketBackend,
+}
+
+#[derive(Clone)]
+struct TicketOrchestrationPlanQueryTool {
     backend: LocalTicketBackend,
 }
 
@@ -674,6 +783,75 @@ impl Tool for TicketCloseTool {
 }
 
 #[async_trait]
+impl Tool for TicketOrchestrationPlanRecordTool {
+    async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError> {
+        let params: TicketOrchestrationPlanRecordParams =
+            parse_input("TicketOrchestrationPlanRecord", input_json)?;
+        let accepted_plan = params.accepted_plan.map(|plan| AcceptedOrchestrationPlan {
+            summary: plan.summary,
+            branch: plan.branch,
+            worktree: plan.worktree,
+            role_plan: plan.role_plan,
+        });
+        let record = NewOrchestrationPlanRecord {
+            kind: params.kind.into_kind(),
+            related_ticket: params.related_ticket,
+            note: params.note,
+            accepted_plan,
+            author: params.author,
+        };
+        let output = self
+            .backend
+            .add_orchestration_plan_record(TicketIdOrSlug::Query(params.ticket.clone()), record)
+            .map_err(|error| backend_error("TicketOrchestrationPlanRecord", error))?;
+        Ok(json_output(
+            format!(
+                "Recorded orchestration plan {} for ticket {}",
+                output.kind, params.ticket
+            ),
+            output,
+        ))
+    }
+}
+
+#[async_trait]
+impl Tool for TicketOrchestrationPlanQueryTool {
+    async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError> {
+        let params: TicketOrchestrationPlanQueryParams =
+            parse_input("TicketOrchestrationPlanQuery", input_json)?;
+        let limit = bounded(params.limit, DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT);
+        let ticket = params.ticket.clone().map(TicketIdOrSlug::Query);
+        let kind = params
+            .relation_kind
+            .map(OrchestrationPlanKindParam::into_kind);
+        let records = self
+            .backend
+            .query_orchestration_plan_records(ticket, kind)
+            .map_err(|error| backend_error("TicketOrchestrationPlanQuery", error))?;
+        let count = records.len();
+        let truncated = count > limit;
+        let returned_records = records
+            .into_iter()
+            .take(limit)
+            .map(|record| serde_json::to_value(record).unwrap_or_else(|_| json!({})))
+            .collect::<Vec<_>>();
+        Ok(json_output(
+            format!(
+                "Found {} orchestration plan record(s){}",
+                count,
+                if truncated { " (truncated)" } else { "" }
+            ),
+            TicketOrchestrationPlanQueryOutput {
+                count,
+                returned: returned_records.len(),
+                truncated,
+                records: returned_records,
+            },
+        ))
+    }
+}
+
+#[async_trait]
 impl Tool for TicketDoctorTool {
     async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError> {
         let params: TicketDoctorParams = parse_input("TicketDoctor", input_json)?;
@@ -917,6 +1095,12 @@ fn input_schema(name: &str) -> Value {
         }
         "TicketStatus" => serde_json::to_value(schemars::schema_for!(TicketStatusParams)),
         "TicketClose" => serde_json::to_value(schemars::schema_for!(TicketCloseParams)),
+        "TicketOrchestrationPlanRecord" => {
+            serde_json::to_value(schemars::schema_for!(TicketOrchestrationPlanRecordParams))
+        }
+        "TicketOrchestrationPlanQuery" => {
+            serde_json::to_value(schemars::schema_for!(TicketOrchestrationPlanQueryParams))
+        }
         "TicketDoctor" => serde_json::to_value(schemars::schema_for!(TicketDoctorParams)),
         _ => Ok(json!({})),
     }
@@ -942,6 +1126,8 @@ impl_from_backend!(TicketIntakeReadyTool);
 impl_from_backend!(TicketWorkflowStateTool);
 impl_from_backend!(TicketStatusTool);
 impl_from_backend!(TicketCloseTool);
+impl_from_backend!(TicketOrchestrationPlanRecordTool);
+impl_from_backend!(TicketOrchestrationPlanQueryTool);
 impl_from_backend!(TicketDoctorTool);
 
 /// Build all MVP Ticket tool definitions over one local backend root.
@@ -964,6 +1150,16 @@ pub fn ticket_tools(backend: LocalTicketBackend) -> Vec<ToolDefinition> {
         ),
         tool_definition::<TicketStatusTool>("TicketStatus", STATUS_DESCRIPTION, backend.clone()),
         tool_definition::<TicketCloseTool>("TicketClose", CLOSE_DESCRIPTION, backend.clone()),
+        tool_definition::<TicketOrchestrationPlanRecordTool>(
+            "TicketOrchestrationPlanRecord",
+            ORCHESTRATION_PLAN_RECORD_DESCRIPTION,
+            backend.clone(),
+        ),
+        tool_definition::<TicketOrchestrationPlanQueryTool>(
+            "TicketOrchestrationPlanQuery",
+            ORCHESTRATION_PLAN_QUERY_DESCRIPTION,
+            backend.clone(),
+        ),
         tool_definition::<TicketDoctorTool>("TicketDoctor", DOCTOR_DESCRIPTION, backend),
     ]
 }
@@ -996,7 +1192,12 @@ mod tests {
     fn ticket_tool_name_partitions_are_explicit() {
         assert_eq!(
             TICKET_READ_ONLY_TOOL_NAMES,
-            ["TicketList", "TicketShow", "TicketDoctor"]
+            [
+                "TicketList",
+                "TicketShow",
+                "TicketOrchestrationPlanQuery",
+                "TicketDoctor"
+            ]
         );
         assert_eq!(
             TICKET_MUTATING_TOOL_NAMES,
@@ -1007,7 +1208,8 @@ mod tests {
                 "TicketIntakeReady",
                 "TicketWorkflowState",
                 "TicketStatus",
-                "TicketClose"
+                "TicketClose",
+                "TicketOrchestrationPlanRecord"
             ]
         );
         for name in TICKET_READ_ONLY_TOOL_NAMES {
@@ -1434,6 +1636,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ticket_orchestration_plan_tools_record_and_query_without_state_changes() {
+        let temp = TempDir::new().unwrap();
+        let backend = backend(&temp);
+        let first = backend.create(NewTicket::new("Plan Tool First")).unwrap();
+        let second = backend.create(NewTicket::new("Plan Tool Second")).unwrap();
+        let record = tool_by_name(backend.clone(), "TicketOrchestrationPlanRecord");
+        let query = tool_by_name(backend.clone(), "TicketOrchestrationPlanQuery");
+
+        let recorded = record
+            .execute(
+                &json!({
+                    "ticket": first.slug,
+                    "kind": "blocked_by",
+                    "related_ticket": second.slug,
+                    "note": "Wait for the second Ticket's API boundary decision.",
+                    "author": "orchestrator"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            recorded
+                .summary
+                .contains("Recorded orchestration plan blocked_by")
+        );
+
+        let found = query
+            .execute(
+                &json!({
+                    "ticket": first.id,
+                    "relation_kind": "blocked_by"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        let found_json: Value = serde_json::from_str(&found.content.unwrap()).unwrap();
+        assert_eq!(found_json["count"], 1);
+        assert_eq!(found_json["records"][0]["kind"], "blocked_by");
+        assert_eq!(found_json["records"][0]["related_ticket"], second.slug);
+
+        let current = backend.show(TicketIdOrSlug::Id(first.id)).unwrap();
+        assert_eq!(current.meta.workflow_state, TicketWorkflowState::Planning);
+    }
+
+    #[tokio::test]
     async fn ticket_show_requires_exactly_one_identifier() {
         let temp = TempDir::new().unwrap();
         let show = tool_by_name(backend(&temp), "TicketShow");
@@ -1470,6 +1719,23 @@ mod tests {
             .to_string();
         assert!(!create_schema.contains("legacy_ticket"));
         assert!(!create_schema.contains("needs_preflight"));
+        let plan_record_schema = tools
+            .iter()
+            .map(|definition| definition().0)
+            .find(|meta| meta.name == "TicketOrchestrationPlanRecord")
+            .unwrap()
+            .input_schema
+            .to_string();
+        assert!(plan_record_schema.contains("accepted_plan"));
+        assert!(plan_record_schema.contains("related_ticket"));
+        let plan_query_schema = tools
+            .iter()
+            .map(|definition| definition().0)
+            .find(|meta| meta.name == "TicketOrchestrationPlanQuery")
+            .unwrap()
+            .input_schema
+            .to_string();
+        assert!(plan_query_schema.contains("relation_kind"));
         let names = tools
             .into_iter()
             .map(|definition| definition().0)
