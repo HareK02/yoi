@@ -2,13 +2,13 @@
 id: '20260608-014602-remove-non-goals-from-workflow-templates'
 slug: 'remove-non-goals-from-workflow-templates'
 title: 'Remove Non-goals from workflow templates'
-status: 'open'
+status: 'closed'
 kind: 'task'
 priority: 'P2'
 labels: ['workflow', 'prompt', 'ticket', 'orchestration', 'cleanup']
-workflow_state: 'inprogress'
+workflow_state: 'done'
 created_at: '2026-06-08T01:46:02Z'
-updated_at: '2026-06-08T02:21:20Z'
+updated_at: '2026-06-08T02:23:16Z'
 assignee: null
 legacy_ticket: null
 queued_by: 'workspace-panel'
