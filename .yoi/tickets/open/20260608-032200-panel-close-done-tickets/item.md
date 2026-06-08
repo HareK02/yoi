@@ -6,11 +6,13 @@ status: 'open'
 kind: 'task'
 priority: 'P2'
 labels: ['tui', 'panel', 'ticket', 'close', 'workflow-state']
-workflow_state: 'intake'
+workflow_state: 'inprogress'
 created_at: '2026-06-08T03:22:00Z'
-updated_at: '2026-06-08T03:22:00Z'
+updated_at: '2026-06-08T05:50:11Z'
 assignee: null
 legacy_ticket: null
+queued_by: 'workspace-panel'
+queued_at: '2026-06-08T05:46:20Z'
 ---
 
 ## Background
