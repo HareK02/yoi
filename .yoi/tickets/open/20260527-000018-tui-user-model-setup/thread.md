@@ -5,3 +5,67 @@
 Migrated from tickets/tui-user-model-setup.md. No legacy review file was present at migration time.
 
 ---
+
+<!-- event: decision author: ticket-intake at: 2026-06-08T07:29:01Z -->
+
+## Decision
+
+## Intake refinement: current Yoi context
+
+This is an existing migrated Ticket; no duplicate Ticket was created. The original body remains useful for the desired wizard shape, but several migrated assumptions are stale and must be treated as superseded where they conflict with current Yoi code and project decisions.
+
+### Current request snapshot
+
+Add an interactive TUI setup flow that helps a first-time user choose a provider/model from the provider catalog and persist a user-level default model configuration so a normal fresh `yoi` spawn can resolve a model without manual TOML editing.
+
+### Binding decisions / invariants
+
+- Product entrypoint is the installed `yoi` binary, not an old standalone `tui`/`insomnia` binary. The CLI surface should be chosen under the `yoi` CLI owner boundary; the migrated `tui setup-model` spelling is only historical/placeholder text.
+- Current config paths use `manifest::paths::config_dir()` with default `$XDG_CONFIG_HOME/yoi` / `$HOME/.config/yoi`, not `~/.config/insomnia`.
+- Normal reusable runtime configuration is Profile-oriented. The implementation must decide, with preflight, whether this wizard writes/updates `profiles.toml`, a profile-local model fragment, or another explicit user config surface; it must not silently reintroduce the removed ambient manifest-cascade model.
+- Current catalog auth hints are `AuthHint::None`, `AuthHint::ApiKey`, `AuthHint::SecretRef { ref_ }`, and `AuthHint::CodexOAuth`; the migrated `ApiKey { env: Option<String> }` flow is stale.
+- Secret values must not be written into Ticket bodies, logs, diagnostics, or generated artifacts. Prefer the existing local secret-store / `yoi keys` boundary for normal provider credentials; raw `model.auth.file` remains a low-level explicit-file source, not the default UX if a safer secret-ref path is available.
+- The wizard must be cancel-safe: no user config/secret writes before explicit confirmation, and failed parsing/writing must leave existing config usable.
+
+### Implementation latitude
+
+- The exact command name may be settled during preflight, but should fit existing `yoi` CLI semantics and help text.
+- A simple vertical provider/model list is sufficient for the first implementation; search/filtering can be deferred unless preflight finds the catalog size makes it necessary.
+- If only one model exists for the selected provider, skipping the model-choice step is acceptable.
+- Preview may show the generated/surgical config change rather than a full diff, as long as overwrite of an existing model/default is explicit.
+
+### Acceptance criteria
+
+- A first-time user can launch the setup flow from the `yoi` CLI without entering normal Pod spawn by accident.
+- The flow loads current `provider::catalog::load_providers()` and `load_models()` data, displays provider/model choices, and handles all current `AuthHint` variants.
+- The confirmed result persists a user-level default model/profile configuration at the current Yoi config path, without storing plaintext secrets in config by default.
+- Existing user config with an existing model/default is detected and requires overwrite confirmation; malformed config is reported and not rewritten.
+- Esc/Ctrl-C cancel before confirmation leaves files unchanged.
+- After setup, a normal fresh `yoi` spawn can resolve the selected model/profile without a model-resolve error.
+- Validation includes focused Rust tests for CLI parsing/config rendering/update behavior and `nix build .#yoi` because this changes CLI/TUI/runtime resources/packaging-visible code.
+
+### Readiness / routing signal
+
+- readiness: spike_needed
+- needs_preflight: true
+- risk_flags: [cli-ux, profiles-config, secrets, auth-boundary, migration-staleness, tui]
+
+This Ticket is ready for Orchestrator routing to preflight/spike, not direct implementation. Preflight should first settle the current user-config write target and command spelling, then either update the Ticket body or record a concise binding decision before implementation.
+
+---
+
+<!-- event: intake_summary author: ticket-intake at: 2026-06-08T07:29:10Z -->
+
+## Intake summary
+
+Updated existing Ticket 20260527-000018-tui-user-model-setup in place; no duplicate was created. The migrated request is now clarified as a Yoi CLI/TUI first-run model setup flow, with stale `tui`/`insomnia`/old AuthHint assumptions explicitly superseded in the thread. Routing readiness is spike/preflight, not direct implementation: first settle current `yoi` command spelling and the user-level config write target for Profile-oriented model defaults, then implement the wizard. needs_preflight=true; risk_flags=[cli-ux, profiles-config, secrets, auth-boundary, migration-staleness, tui].
+
+---
+
+<!-- event: state_changed author: ticket-intake at: 2026-06-08T07:29:10Z from: intake to: ready reason: intake_ready field: workflow_state -->
+
+## State changed
+
+Intake clarification completed for the existing Ticket. The Ticket is ready for Orchestrator routing to preflight/spike; implementation should not begin until the preflight decisions called out in the intake summary are recorded.
+
+---

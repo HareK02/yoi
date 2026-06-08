@@ -7,9 +7,10 @@ kind: task
 priority: P2
 labels: [migrated]
 created_at: 2026-05-27T00:00:18Z
-updated_at: 2026-05-27T00:00:18Z
+updated_at: '2026-06-08T07:29:10Z'
 assignee: null
 legacy_ticket: tickets/tui-user-model-setup.md
+workflow_state: 'ready'
 ---
 
 ## Migration reference
