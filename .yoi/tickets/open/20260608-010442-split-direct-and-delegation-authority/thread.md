@@ -156,3 +156,29 @@ Critical risks / reviewer focus:
 Accepted queued implementation after reading the Ticket, implementation-direction decision, workspace state, and authority/scope code map. This acceptance precedes worktree creation and coder/reviewer Pod spawning.
 
 ---
+
+<!-- event: plan author: orchestrator at: 2026-06-08T05:47:43Z -->
+
+## Plan
+
+Implementation routing accepted and worktree created.
+
+Worktree plan:
+- Branch: `split-direct-and-delegation-authority`
+- Worktree: `.worktree/split-direct-and-delegation-authority`
+- Base: `fa39f92 ticket: route direct delegation authority split`
+- Scope: split direct tool scope from child-delegation scope for `SpawnPod`, profile/runtime metadata, and diagnostics.
+
+Delegation plan:
+- Spawn sibling coder Pod with write scope limited to `.worktree/split-direct-and-delegation-authority`.
+- Coder must run Bash commands from the child worktree, not from the main workspace.
+- Coder must not edit main-workspace `.yoi` / Ticket / workflow / docs records, and must not create generated memory/local/runtime/secret-like files.
+- Reviewer will be spawned read-only after coder reports diff/commits and validation evidence.
+
+Concurrency note:
+- Newly queued panel/Ticket-language/shutdown Tickets exist in main workspace records, but this implementation must remain isolated to the child worktree and should not edit unrelated Ticket records.
+
+Stop/completion policy:
+- Because the human authorized cleanup after completion, this Orchestrator will proceed through reviewer approval, merge-completion validation, Ticket close, Pod stop, worktree removal, and branch deletion if the branch is approved and merge authority remains clear.
+
+---
