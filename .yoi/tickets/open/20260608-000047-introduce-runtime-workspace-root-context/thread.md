@@ -298,3 +298,38 @@ Coder packet:
 Reviewer delegation remains pending until coder reports diff/commits and validation evidence.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-08T01:36:01Z -->
+
+## Implementation report
+
+Coder completed and reviewer delegated.
+
+Coder result:
+- Pod: `coder-runtime-workspace-context-2`
+- Commit: `b6af761 runtime: separate workspace pod and profile identity`
+- Worktree status: clean after commit.
+- Diff against `develop`: 9 files changed, 479 insertions, 216 deletions.
+- Coder reported successful focused tests, `cargo check -q`, `cargo fmt --check`, `git diff --check`, `cargo run -q -p yoi -- ticket doctor`, and `nix build .#yoi`.
+
+Files touched by coder:
+- `crates/manifest/src/profile.rs`
+- `crates/client/src/spawn.rs`
+- `crates/client/src/ticket_role.rs`
+- `crates/pod/src/entrypoint.rs`
+- `crates/tui/src/lib.rs`
+- `crates/tui/src/multi_pod.rs`
+- `crates/tui/src/single_pod.rs`
+- `crates/tui/src/spawn.rs`
+- `crates/yoi/src/main.rs`
+
+Reviewer delegation:
+- Spawned sibling reviewer Pod: `reviewer-runtime-workspace-context`.
+- Reviewer scope: read-only child worktree plus non-recursive parent-root read required by launch cwd validation.
+- Reviewer was instructed to judge against the recorded shared boundary decisions and acceptance criteria, not unrecorded preferred tactics.
+
+Pending:
+- Await reviewer verdict before merge-ready dossier.
+- No merge, close, final approval, or cleanup has occurred.
+
+---
