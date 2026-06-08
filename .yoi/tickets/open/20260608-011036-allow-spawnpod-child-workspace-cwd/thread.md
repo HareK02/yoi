@@ -268,3 +268,36 @@ Pending:
 - No merge, close, final approval, or cleanup has occurred.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-08T08:08:10Z -->
+
+## Implementation report
+
+Coder fix-loop completed and reviewer re-review delegated.
+
+Coder follow-up:
+- Commit: `248744f fix: keep SpawnPod cwd separate`
+- Worktree: clean on branch `allow-spawnpod-child-workspace-cwd`.
+- Fixes claimed:
+  - `SpawnPod.cwd` is passed as hidden `--tool-cwd`, while child runtime still receives inherited `--workspace <parent workspace root>`.
+  - Child process launch current_dir is workspace root, not tool cwd, preventing runtime context from being derived from the tool cwd.
+  - Adopted child startup separates runtime workspace context from tool cwd.
+  - `Pod` stores `workspace_root` and `pwd` separately; memory/Ticket/workflow/Profile context uses `workspace_root`, while Bash/tools/ScopedFs use `pwd`.
+  - Ticket role coder guidance no longer assumes mandatory `cd <worktree>` when SpawnPod cwd is available.
+  - Added tests proving runtime workspace and tool cwd stay separate, omitted cwd preserves prior pwd behavior, and memory layout derives from workspace root rather than tool cwd.
+
+Coder validation reported:
+- `cargo test -p pod spawn_pod`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo run -q -p yoi -- ticket doctor`
+- `nix build .#yoi`
+
+Action taken:
+- Sent updated commits and prior blocker checklist to `reviewer-spawnpod-child-cwd` for read-only re-review.
+
+Pending:
+- Await reviewer verdict before merge-ready dossier / merge-completion.
+- No merge, close, final approval, or cleanup has occurred.
+
+---
