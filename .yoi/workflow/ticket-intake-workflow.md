@@ -276,6 +276,6 @@ Ticket の body は Markdown/freeform を維持する。すべてを strict sche
 
 ## 他 Workflow への接続
 
-- `ticket-planning sync-workflow`: legacy slug の互換入口。新規 routing は standalone planning sync ではなく planning return/requirements sync として扱う。
+- `ticket-preflight-workflow`: legacy compatibility slug の planning/requirements sync 入口。新規 routing は standalone preflight ではなく planning return/requirements sync として扱う。
 - `multi-agent-workflow`: Orchestrator が implementation_ready と判断した後に接続する。
 - `ticket-orchestrator-routing`: この Workflow が作った Ticket を routing する後続 Workflow。

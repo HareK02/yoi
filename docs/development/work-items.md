@@ -22,7 +22,7 @@ Use the highest-level interface that matches the work:
 
 - Use `yoi panel` for the Ticket/Intake/Orchestrator workspace UI and role-launch actions.
 - Inside Pods, use typed Ticket tools to create, inspect, comment, review, and close Tickets.
-- For multi-step work, follow the Ticket Intake, Orchestrator Routing, Preflight, and Multi-agent workflows.
+- For multi-step work, follow the Ticket Intake, Orchestrator Routing, planning/requirements-sync, and Multi-agent workflows.
 
 Maintainers can inspect the local `.yoi/tickets/` files directly when debugging storage, but normal user instructions should go through `yoi panel`, Ticket tools, or `yoi ticket ...`.
 
@@ -126,7 +126,7 @@ Ticket-driven development normally moves through these gates:
 
 1. Intake
 2. Orchestrator routing
-3. Preflight or spike when needed
+3. Planning/requirements sync or spike when needed
 4. Implementation assignment
 5. Review
 6. Merge / validation / cleanup
