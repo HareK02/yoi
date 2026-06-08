@@ -18,7 +18,10 @@ enum Mode {
     Ticket(ticket_cli::TicketCli),
     PodRuntime(Vec<String>),
     Keys,
-    Tui(LaunchMode),
+    Tui {
+        mode: LaunchMode,
+        workspace_root: PathBuf,
+    },
 }
 
 #[derive(Debug)]
@@ -75,7 +78,10 @@ async fn main() -> ExitCode {
         },
         Mode::PodRuntime(args) => pod::entrypoint::run_cli_from("yoi pod", args).await,
         Mode::Keys => tui::keys::launch().await,
-        Mode::Tui(mode) => {
+        Mode::Tui {
+            mode,
+            workspace_root,
+        } => {
             let runtime_command = match PodRuntimeCommand::resolve() {
                 Ok(command) => command,
                 Err(e) => {
@@ -86,6 +92,7 @@ async fn main() -> ExitCode {
             tui::launch(LaunchOptions {
                 mode,
                 runtime_command,
+                workspace_root,
             })
             .await
         }
@@ -107,7 +114,14 @@ where
 
 fn parse_args_slice(args: &[String]) -> Result<Mode, ParseError> {
     if args.is_empty() {
-        return Ok(Mode::Tui(LaunchMode::Spawn { profile: None }));
+        return Ok(Mode::Tui {
+            mode: LaunchMode::Spawn {
+                pod_name: None,
+                profile: None,
+            },
+            workspace_root: std::env::current_dir()
+                .map_err(|e| ParseError(format!("failed to resolve current directory: {e}")))?,
+        });
     }
 
     match args[0].as_str() {
@@ -119,10 +133,10 @@ fn parse_args_slice(args: &[String]) -> Result<Mode, ParseError> {
             return Ok(Mode::Ticket(ticket_cli));
         }
         "panel" => {
-            if args.len() != 1 {
-                return Err(ParseError("yoi panel does not accept arguments".into()));
-            }
-            return Ok(Mode::Tui(LaunchMode::Panel));
+            return Ok(Mode::Tui {
+                mode: LaunchMode::Panel,
+                workspace_root: parse_panel_workspace(&args[1..])?,
+            });
         }
         "keys" => {
             if args.len() != 1 {
@@ -140,14 +154,20 @@ fn parse_args_slice(args: &[String]) -> Result<Mode, ParseError> {
             return Ok(Mode::MemoryLint(options));
         }
         "memory" => {
-            return Ok(Mode::Tui(LaunchMode::PodName {
-                pod_name: "memory".to_string(),
-                socket_override: None,
-            }));
+            return Ok(Mode::Tui {
+                mode: LaunchMode::PodName {
+                    pod_name: "memory".to_string(),
+                    socket_override: None,
+                },
+                workspace_root: std::env::current_dir()
+                    .map_err(|e| ParseError(format!("failed to resolve current directory: {e}")))?,
+            });
         }
         _ => {}
     }
 
+    let mut workspace_root = std::env::current_dir()
+        .map_err(|e| ParseError(format!("failed to resolve current directory: {e}")))?;
     let mut resume = false;
     let mut session = None;
     let mut pod_name = None;
@@ -190,6 +210,16 @@ fn parse_args_slice(args: &[String]) -> Result<Mode, ParseError> {
                 socket_override = Some(PathBuf::from(value));
                 i += 2;
             }
+            "--workspace" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| ParseError("--workspace requires a value".to_string()))?;
+                if value.starts_with('-') {
+                    return Err(ParseError("--workspace requires a value".to_string()));
+                }
+                workspace_root = PathBuf::from(value);
+                i += 2;
+            }
             "--profile" => {
                 let value = args
                     .get(i + 1)
@@ -224,6 +254,14 @@ fn parse_args_slice(args: &[String]) -> Result<Mode, ParseError> {
                 socket_override = Some(PathBuf::from(value));
                 i += 1;
             }
+            arg if arg.starts_with("--workspace=") => {
+                let value = arg.trim_start_matches("--workspace=");
+                if value.is_empty() {
+                    return Err(ParseError("--workspace requires a value".to_string()));
+                }
+                workspace_root = PathBuf::from(value);
+                i += 1;
+            }
             arg if arg.starts_with("--profile=") => {
                 let value = arg.trim_start_matches("--profile=");
                 if value.is_empty() {
@@ -253,11 +291,7 @@ fn parse_args_slice(args: &[String]) -> Result<Mode, ParseError> {
     }
 
     if profile.is_some()
-        && (resume
-            || session.is_some()
-            || pod_name.is_some()
-            || positional.is_some()
-            || socket_override.is_some())
+        && (resume || session.is_some() || positional.is_some() || socket_override.is_some())
     {
         return Err(ParseError(
             "--profile can only be used for fresh spawn".to_string(),
@@ -290,20 +324,66 @@ fn parse_args_slice(args: &[String]) -> Result<Mode, ParseError> {
     }
 
     let pod_name = pod_name.or(positional);
+    if let Some(profile) = profile {
+        return Ok(Mode::Tui {
+            mode: LaunchMode::Spawn {
+                pod_name,
+                profile: Some(profile),
+            },
+            workspace_root,
+        });
+    }
     if let Some(pod_name) = pod_name {
-        return Ok(Mode::Tui(LaunchMode::PodName {
-            pod_name,
-            socket_override,
-        }));
+        return Ok(Mode::Tui {
+            mode: LaunchMode::PodName {
+                pod_name,
+                socket_override,
+            },
+            workspace_root,
+        });
     }
     if resume {
-        return Ok(Mode::Tui(LaunchMode::Resume));
+        return Ok(Mode::Tui {
+            mode: LaunchMode::Resume,
+            workspace_root,
+        });
     }
     if let Some(id) = session {
-        return Ok(Mode::Tui(LaunchMode::ResumeWithSession(id)));
+        return Ok(Mode::Tui {
+            mode: LaunchMode::ResumeWithSession(id),
+            workspace_root,
+        });
     }
 
-    Ok(Mode::Tui(LaunchMode::Spawn { profile }))
+    Ok(Mode::Tui {
+        mode: LaunchMode::Spawn {
+            pod_name: None,
+            profile: None,
+        },
+        workspace_root,
+    })
+}
+
+fn parse_panel_workspace(args: &[String]) -> Result<PathBuf, ParseError> {
+    match args {
+        [] => std::env::current_dir()
+            .map_err(|e| ParseError(format!("failed to resolve current directory: {e}"))),
+        [flag, value] if flag == "--workspace" => Ok(PathBuf::from(value)),
+        [flag] if flag.starts_with("--workspace=") => {
+            let value = flag.trim_start_matches("--workspace=");
+            if value.is_empty() {
+                Err(ParseError("--workspace requires a value".to_string()))
+            } else {
+                Ok(PathBuf::from(value))
+            }
+        }
+        [flag] if flag == "--workspace" => {
+            Err(ParseError("--workspace requires a value".to_string()))
+        }
+        _ => Err(ParseError(
+            "yoi panel accepts only --workspace <PATH>".to_string(),
+        )),
+    }
 }
 
 fn parse_session_id(value: &str) -> Result<SegmentId, ParseError> {
@@ -314,7 +394,7 @@ fn parse_session_id(value: &str) -> Result<SegmentId, ParseError> {
 
 fn print_help() {
     println!(
-        "yoi\n\nUsage:\n  yoi [OPTIONS] [POD_NAME]\n  yoi panel\n  yoi keys\n  yoi pod [POD_OPTIONS]\n  yoi ticket <COMMAND> [OPTIONS]\n  yoi memory lint [OPTIONS]\n\nOptions:\n  -r, --resume           Open the Pod picker and resume/attach a Pod\n      --pod <NAME>       Attach/restore/create a Pod by name\n      --socket <PATH>    Attach to a specific Pod socket with --pod\n      --session <UUID>   Resume a specific session segment\n      --profile <REF>    Start a fresh Pod from a profile\n  -h, --help             Print help\n"
+        "yoi\n\nUsage:\n  yoi [OPTIONS] [POD_NAME]\n  yoi panel [--workspace <PATH>]\n  yoi keys\n  yoi pod [POD_OPTIONS]\n  yoi ticket <COMMAND> [OPTIONS]\n  yoi memory lint [OPTIONS]\n\nOptions:\n  -r, --resume           Open the Pod picker and resume/attach a Pod\n      --workspace <PATH> Runtime workspace root (defaults to cwd)\n      --pod <NAME>       Attach/restore/create a Pod by name\n      --socket <PATH>    Attach to a specific Pod socket with --pod\n      --session <UUID>   Resume a specific session segment\n      --profile <REF>    Select a reusable Profile recipe\n  -h, --help             Print help\n"
     );
 }
 
@@ -331,10 +411,14 @@ mod tests {
     #[test]
     fn parse_pod_name_mode() {
         match parse_args_from(["--pod", "agent", "--socket", "/tmp/agent.sock"]).unwrap() {
-            Mode::Tui(LaunchMode::PodName {
-                pod_name,
-                socket_override,
-            }) => {
+            Mode::Tui {
+                mode:
+                    LaunchMode::PodName {
+                        pod_name,
+                        socket_override,
+                    },
+                ..
+            } => {
                 assert_eq!(pod_name, "agent");
                 assert_eq!(socket_override, Some(PathBuf::from("/tmp/agent.sock")));
             }
@@ -345,10 +429,14 @@ mod tests {
     #[test]
     fn parse_positional_name_uses_pod_name_mode() {
         match parse_args_from(["agent"]).unwrap() {
-            Mode::Tui(LaunchMode::PodName {
-                pod_name,
-                socket_override,
-            }) => {
+            Mode::Tui {
+                mode:
+                    LaunchMode::PodName {
+                        pod_name,
+                        socket_override,
+                    },
+                ..
+            } => {
                 assert_eq!(pod_name, "agent");
                 assert_eq!(socket_override, None);
             }
@@ -359,10 +447,14 @@ mod tests {
     #[test]
     fn parse_memory_alone_remains_positional_pod_name() {
         match parse_args_from(["memory"]).unwrap() {
-            Mode::Tui(LaunchMode::PodName {
-                pod_name,
-                socket_override,
-            }) => {
+            Mode::Tui {
+                mode:
+                    LaunchMode::PodName {
+                        pod_name,
+                        socket_override,
+                    },
+                ..
+            } => {
                 assert_eq!(pod_name, "memory");
                 assert_eq!(socket_override, None);
             }
@@ -405,10 +497,14 @@ mod tests {
     #[test]
     fn parse_literal_pod_name_still_available_with_flag() {
         match parse_args_from(["--pod", "pod"]).unwrap() {
-            Mode::Tui(LaunchMode::PodName {
-                pod_name,
-                socket_override,
-            }) => {
+            Mode::Tui {
+                mode:
+                    LaunchMode::PodName {
+                        pod_name,
+                        socket_override,
+                    },
+                ..
+            } => {
                 assert_eq!(pod_name, "pod");
                 assert_eq!(socket_override, None);
             }
@@ -458,7 +554,10 @@ mod tests {
     #[test]
     fn memory_lint_with_other_second_word_remains_positional_pod_name() {
         match parse_args_from(["memory", "other"]).unwrap() {
-            Mode::Tui(LaunchMode::PodName { pod_name, .. }) => assert_eq!(pod_name, "memory"),
+            Mode::Tui {
+                mode: LaunchMode::PodName { pod_name, .. },
+                ..
+            } => assert_eq!(pod_name, "memory"),
             _ => panic!("expected PodName mode"),
         }
     }
@@ -498,9 +597,23 @@ mod tests {
 
     #[test]
     fn parse_profile_spawn_mode() {
-        match parse_args_from(["--profile", "/profiles/coder.lua"]).unwrap() {
-            Mode::Tui(LaunchMode::Spawn { profile }) => {
-                assert_eq!(profile, Some("/profiles/coder.lua".to_string()));
+        match parse_args_from([
+            "--workspace",
+            "/tmp/other-workspace",
+            "--profile",
+            "project:companion",
+            "--pod",
+            "agent",
+        ])
+        .unwrap()
+        {
+            Mode::Tui {
+                mode: LaunchMode::Spawn { pod_name, profile },
+                workspace_root,
+            } => {
+                assert_eq!(pod_name, Some("agent".to_string()));
+                assert_eq!(profile, Some("project:companion".to_string()));
+                assert_eq!(workspace_root, PathBuf::from("/tmp/other-workspace"));
             }
             _ => panic!("expected Spawn mode"),
         }
@@ -554,8 +667,11 @@ mod tests {
 
     #[test]
     fn parse_panel_mode() {
-        match parse_args_from(["panel"]).unwrap() {
-            Mode::Tui(LaunchMode::Panel) => {}
+        match parse_args_from(["panel", "--workspace", "/tmp/other-workspace"]).unwrap() {
+            Mode::Tui {
+                mode: LaunchMode::Panel,
+                workspace_root,
+            } => assert_eq!(workspace_root, PathBuf::from("/tmp/other-workspace")),
             _ => panic!("expected Panel mode"),
         }
     }

@@ -162,9 +162,8 @@ impl TicketRoleLaunchPlan {
             runtime_command,
             pod_name: self.pod_name.clone(),
             profile: Some(self.profile.clone()),
-            cwd: self.workspace_root.clone(),
+            workspace_root: self.workspace_root.clone(),
             resume_from: None,
-            resume_by_pod_name: false,
         })
     }
 }
@@ -1025,7 +1024,7 @@ workflow = "ticket-review-workflow"
             .unwrap();
         assert_eq!(spawn.pod_name, "reviewer-fixed");
         assert_eq!(spawn.profile.as_deref(), Some("builtin:default"));
-        assert_eq!(spawn.cwd, temp.path());
+        assert_eq!(spawn.workspace_root, temp.path());
     }
 
     #[test]

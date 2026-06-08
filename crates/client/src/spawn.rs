@@ -29,18 +29,16 @@ pub struct SpawnConfig {
     /// (`manifest::paths::pod_runtime_dir`) の解決と、ready 行に乗る
     /// 名前との突き合わせに使う。
     pub pod_name: String,
-    /// Optional profile selector. When present the child is launched with
-    /// `--profile`; the Pod name is supplied through `--profile-pod-name` so
-    /// profile evaluation stays separate from `--pod` restore semantics.
+    /// Optional reusable Profile selector. Pod identity is always supplied
+    /// separately with `--pod`; profile selection must not imply a name.
     pub profile: Option<String>,
-    /// pod の current_dir。
-    pub cwd: PathBuf,
+    /// Explicit runtime workspace root. The child uses it as process cwd and
+    /// receives it via `--workspace` so startup does not infer workspace
+    /// identity from the parent process cwd.
+    pub workspace_root: PathBuf,
     /// `Some(id)` のとき `--session <id>` を付与し、当該セッションから
     /// resume させる。
     pub resume_from: Option<Uuid>,
-    /// true のとき `--pod <pod_name>` を付与し、pod 側で name-keyed state
-    /// があれば resume、なければ同名の新規 Pod として起動させる。
-    pub resume_by_pod_name: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,6 +105,27 @@ impl From<io::Error> for SpawnError {
     }
 }
 
+fn runtime_args(config: &SpawnConfig) -> Vec<String> {
+    let mut args = vec![
+        "--workspace".to_string(),
+        config.workspace_root.display().to_string(),
+    ];
+    if let Some(id) = config.resume_from {
+        args.extend([
+            "--session".to_string(),
+            id.to_string(),
+            "--pod".to_string(),
+            config.pod_name.clone(),
+        ]);
+    } else {
+        args.extend(["--pod".to_string(), config.pod_name.clone()]);
+        if let Some(profile) = &config.profile {
+            args.extend(["--profile".to_string(), profile.clone()]);
+        }
+    }
+    args
+}
+
 /// pod を spawn し、`YOI-READY` ハンドシェイクが終わるまで待つ。
 ///
 /// `progress` は ready 行を見つけるまでに観測した stderr の各行で呼ばれる
@@ -124,27 +143,13 @@ where
     let mut command = Command::new(config.runtime_command.program());
     command
         .args(config.runtime_command.prefix_args())
-        .current_dir(&config.cwd)
+        .current_dir(&config.workspace_root)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(stderr_file))
         .process_group(0);
-    if let Some(profile) = &config.profile {
-        command
-            .arg("--profile")
-            .arg(profile)
-            .arg("--profile-pod-name")
-            .arg(&config.pod_name);
-    }
-    if config.resume_by_pod_name && config.profile.is_none() {
-        command.arg("--pod").arg(&config.pod_name);
-    }
-    if let Some(id) = config.resume_from {
-        command
-            .arg("--session")
-            .arg(id.to_string())
-            .arg("--session-pod-name")
-            .arg(&config.pod_name);
+    for arg in runtime_args(&config) {
+        command.arg(arg);
     }
     let mut child = command
         .spawn()
@@ -309,5 +314,53 @@ impl StderrTail {
     }
     fn into_string(self) -> String {
         self.lines.into_iter().collect::<Vec<_>>().join(" | ")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+
+    fn base_config() -> SpawnConfig {
+        SpawnConfig {
+            runtime_command: PodRuntimeCommand::new("/bin/yoi", vec![OsString::from("pod")]),
+            pod_name: "explicit-pod".to_string(),
+            profile: Some("project:companion".to_string()),
+            workspace_root: PathBuf::from("/work/other-project"),
+            resume_from: None,
+        }
+    }
+
+    #[test]
+    fn runtime_args_keep_workspace_pod_and_profile_separate() {
+        assert_eq!(
+            runtime_args(&base_config()),
+            vec![
+                "--workspace",
+                "/work/other-project",
+                "--pod",
+                "explicit-pod",
+                "--profile",
+                "project:companion",
+            ]
+        );
+    }
+
+    #[test]
+    fn runtime_args_use_session_mode_without_profile_identity_alias() {
+        let mut config = base_config();
+        config.resume_from = Some(Uuid::nil());
+        assert_eq!(
+            runtime_args(&config),
+            vec![
+                "--workspace",
+                "/work/other-project",
+                "--session",
+                "00000000-0000-0000-0000-000000000000",
+                "--pod",
+                "explicit-pod",
+            ]
+        );
     }
 }

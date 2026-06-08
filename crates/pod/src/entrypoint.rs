@@ -19,15 +19,14 @@ struct Cli {
     #[arg(
         long,
         value_name = "PROFILE",
-        conflicts_with_all = ["manifest", "project", "pod", "session", "adopt"]
+        conflicts_with_all = ["manifest", "project", "session", "adopt"]
     )]
     profile: Option<String>,
 
-    /// Pod name override for a freshly-created profile Pod. This does not use
-    /// `--pod` restore semantics, so it must not attach/restore existing Pod
-    /// state by re-evaluating the profile source.
-    #[arg(long, value_name = "NAME", requires = "profile", conflicts_with_all = ["pod", "session", "adopt"])]
-    profile_pod_name: Option<String>,
+    /// Runtime workspace root for profile discovery, default Pod naming, and process context.
+    /// Defaults to the current directory.
+    #[arg(long, value_name = "PATH")]
+    workspace: Option<PathBuf>,
 
     /// Manifest TOML to use directly as a one-file compatibility/debug input.
     /// This bypasses profile discovery but still applies builtin defaults and
@@ -73,7 +72,7 @@ struct Cli {
     /// Resume or create a Pod by name. If name-keyed Pod state exists,
     /// the active session/segment recorded there is restored; otherwise a
     /// fresh top-level Pod is created with this name.
-    #[arg(long, value_name = "NAME", conflicts_with_all = ["session", "adopt"])]
+    #[arg(long, value_name = "NAME", conflicts_with_all = ["adopt"])]
     pod: Option<String>,
 
     /// Require `--pod` to restore existing Pod state instead of creating a
@@ -90,6 +89,51 @@ struct Cli {
     session: Option<SegmentId>,
 }
 
+fn runtime_workspace_root(cli: &Cli) -> Result<PathBuf, String> {
+    let raw = cli.workspace.as_deref().unwrap_or_else(|| Path::new("."));
+    if raw.is_absolute() {
+        Ok(raw.to_path_buf())
+    } else {
+        std::env::current_dir()
+            .map_err(|e| format!("failed to resolve current directory for workspace: {e}"))
+            .map(|cwd| cwd.join(raw))
+    }
+}
+
+fn runtime_pod_name(cli: &Cli, workspace_root: &Path) -> String {
+    cli.session_pod_name
+        .as_deref()
+        .or(cli.pod.as_deref())
+        .map(str::to_string)
+        .unwrap_or_else(|| default_pod_name_for_workspace(workspace_root))
+}
+
+fn default_pod_name_for_workspace(workspace_root: &Path) -> String {
+    let raw = workspace_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("workspace");
+    sanitise_pod_name(raw)
+}
+
+fn sanitise_pod_name(raw: &str) -> String {
+    let name: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    if name.chars().any(|c| c.is_ascii_alphanumeric()) {
+        name
+    } else {
+        "workspace".to_string()
+    }
+}
+
 fn resolve_manifest(cli: &Cli) -> Result<(PodManifest, PromptLoader), String> {
     resolve_manifest_with_profile_loader(cli, load_profile)
 }
@@ -99,15 +143,17 @@ fn resolve_manifest_with_profile_loader<F>(
     load_profile_fn: F,
 ) -> Result<(PodManifest, PromptLoader), String>
 where
-    F: FnOnce(&ProfileSelector, Option<&str>) -> Result<(PodManifest, PromptLoader), String>,
+    F: FnOnce(&ProfileSelector, &Path, &str) -> Result<(PodManifest, PromptLoader), String>,
 {
+    let workspace_root = runtime_workspace_root(cli)?;
+    let runtime_pod_name = runtime_pod_name(cli, &workspace_root);
     let mut manifest_and_loader = if let Some(config_json) = cli.spawn_config_json.as_deref() {
         load_spawn_config_json(config_json)?
     } else if let Some(profile) = &cli.profile {
         let selector = ProfileSelector::parse_cli(profile);
-        load_profile_fn(&selector, cli.profile_pod_name.as_deref())?
+        load_profile_fn(&selector, &workspace_root, &runtime_pod_name)?
     } else if let Some(path) = &cli.manifest {
-        load_single_manifest(path, cli.pod.as_deref())?
+        load_single_manifest(path, cli.pod.as_deref(), &runtime_pod_name)?
     } else {
         if cli.project.is_some() {
             return Err(
@@ -117,7 +163,7 @@ where
             );
         }
         let selector = ProfileSelector::Default;
-        load_profile_fn(&selector, cli.pod.as_deref())?
+        load_profile_fn(&selector, &workspace_root, &runtime_pod_name)?
     };
 
     apply_session_restore_overrides(&mut manifest_and_loader.0, cli)?;
@@ -125,7 +171,7 @@ where
 }
 
 fn apply_session_restore_overrides(manifest: &mut PodManifest, cli: &Cli) -> Result<(), String> {
-    if let Some(pod_name) = cli.session_pod_name.as_deref() {
+    if let Some(pod_name) = cli.session_pod_name.as_deref().or(cli.pod.as_deref()) {
         manifest.pod.name = pod_name.to_string();
     }
     Ok(())
@@ -141,14 +187,11 @@ fn load_spawn_config_json(config_json: &str) -> Result<(PodManifest, PromptLoade
 
 fn load_profile(
     selector: &ProfileSelector,
-    pod_name_override: Option<&str>,
+    workspace_root: &Path,
+    pod_name: &str,
 ) -> Result<(PodManifest, PromptLoader), String> {
-    let cwd = std::env::current_dir()
-        .map_err(|e| format!("failed to resolve current directory for profile: {e}"))?;
-    let resolver = ProfileResolver::new().with_workspace_base(cwd);
-    let options = pod_name_override
-        .map(ProfileResolveOptions::with_pod_name)
-        .unwrap_or_default();
+    let resolver = ProfileResolver::new().with_workspace_base(workspace_root);
+    let options = ProfileResolveOptions::with_pod_name(pod_name);
     let resolved = resolver.resolve(selector, options).map_err(|e| {
         format!(
             "failed to resolve profile {}: {e}",
@@ -160,7 +203,8 @@ fn load_profile(
 
 fn load_single_manifest(
     path: &Path,
-    pod_name_override: Option<&str>,
+    explicit_pod_name: Option<&str>,
+    default_pod_name: &str,
 ) -> Result<(PodManifest, PromptLoader), String> {
     let toml = std::fs::read_to_string(path)
         .map_err(|e| format!("failed to read manifest {}: {e}", path.display()))?;
@@ -182,8 +226,10 @@ fn load_single_manifest(
             .map_err(|e| format!("failed to parse manifest {}: {e}", path.display()))?
             .resolve_paths(base_dir),
     );
-    if let Some(pod_name) = pod_name_override {
+    if let Some(pod_name) = explicit_pod_name {
         config.pod.name = Some(pod_name.to_string());
+    } else if config.pod.name.is_none() {
+        config.pod.name = Some(default_pod_name.to_string());
     }
     let manifest = PodManifest::try_from(config)
         .map_err(|e| format!("failed to resolve manifest {}: {e}", path.display()))?;
@@ -237,6 +283,13 @@ fn exit_code_from_i32(code: i32) -> ExitCode {
 }
 
 async fn run_cli_inner(cli: Cli) -> ExitCode {
+    let workspace_root = match runtime_workspace_root(&cli) {
+        Ok(root) => root,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     let (mut manifest, loader) = match resolve_manifest(&cli) {
         Ok(pair) => pair,
         Err(e) => {
@@ -244,6 +297,14 @@ async fn run_cli_inner(cli: Cli) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    if let Err(e) = std::env::set_current_dir(&workspace_root) {
+        eprintln!(
+            "error: failed to enter runtime workspace {}: {e}",
+            workspace_root.display()
+        );
+        return ExitCode::FAILURE;
+    }
 
     // Initialize persistent store. `paths::sessions_dir()` only
     // returns None when none of YOI_HOME / YOI_DATA_DIR /
@@ -538,22 +599,20 @@ permission = "write"
             "yoi pod",
             "--profile",
             profile.to_str().unwrap(),
-            "--profile-pod-name",
+            "--pod",
             "from-profile-name",
         ])
         .unwrap();
         let mut called = false;
 
         let (manifest, loader) =
-            resolve_manifest_with_profile_loader(&cli, |selector, pod_name| {
+            resolve_manifest_with_profile_loader(&cli, |selector, _workspace_root, pod_name| {
                 called = true;
                 assert_eq!(selector, &ProfileSelector::path(profile.clone()));
-                assert_eq!(pod_name, Some("from-profile-name"));
+                assert_eq!(pod_name, "from-profile-name");
                 let mut manifest =
                     PodManifest::from_toml(&manifest_toml("from-profile", tmp.path())).unwrap();
-                if let Some(pod_name) = pod_name {
-                    manifest.pod.name = pod_name.to_string();
-                }
+                manifest.pod.name = pod_name.to_string();
                 Ok((manifest, PromptLoader::builtins_only()))
             })
             .unwrap();
@@ -571,14 +630,14 @@ permission = "write"
             "yoi pod",
             "--profile",
             "project:coder",
-            "--profile-pod-name",
+            "--pod",
             "from-profile-name",
         ])
         .unwrap();
         let mut called = false;
 
         let (manifest, _loader) =
-            resolve_manifest_with_profile_loader(&cli, |selector, pod_name| {
+            resolve_manifest_with_profile_loader(&cli, |selector, _workspace_root, pod_name| {
                 called = true;
                 assert_eq!(
                     selector,
@@ -589,9 +648,7 @@ permission = "write"
                 );
                 let mut manifest =
                     PodManifest::from_toml(&manifest_toml("from-profile", tmp.path())).unwrap();
-                if let Some(pod_name) = pod_name {
-                    manifest.pod.name = pod_name.to_string();
-                }
+                manifest.pod.name = pod_name.to_string();
                 Ok((manifest, PromptLoader::builtins_only()))
             })
             .unwrap();
@@ -601,31 +658,74 @@ permission = "write"
     }
 
     #[test]
-    fn normal_startup_uses_default_profile() {
+    fn profile_without_explicit_pod_uses_workspace_basename_not_selector() {
         let tmp = TempDir::new().unwrap();
-        let cli = Cli::try_parse_from(["yoi pod"]).unwrap();
+        let workspace = tmp.path().join("other-workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let cli = Cli::try_parse_from([
+            "yoi pod",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--profile",
+            "project:companion",
+        ])
+        .unwrap();
         let mut called = false;
 
         let (manifest, _loader) =
-            resolve_manifest_with_profile_loader(&cli, |selector, pod_name| {
+            resolve_manifest_with_profile_loader(&cli, |selector, workspace_root, pod_name| {
                 called = true;
-                assert_eq!(selector, &ProfileSelector::Default);
-                assert_eq!(pod_name, None);
-                let manifest =
-                    PodManifest::from_toml(&manifest_toml("from-default-profile", tmp.path()))
+                assert_eq!(
+                    selector,
+                    &ProfileSelector::source_named(
+                        manifest::ProfileRegistrySource::Project,
+                        "companion"
+                    )
+                );
+                assert_eq!(workspace_root, workspace.as_path());
+                assert_eq!(pod_name, "other-workspace");
+                let mut manifest =
+                    PodManifest::from_toml(&manifest_toml("profile-selector-name", tmp.path()))
                         .unwrap();
+                manifest.pod.name = pod_name.to_string();
                 Ok((manifest, PromptLoader::builtins_only()))
             })
             .unwrap();
 
         assert!(called);
-        assert_eq!(manifest.pod.name, "from-default-profile");
+        assert_eq!(manifest.pod.name, "other-workspace");
+    }
+
+    #[test]
+    fn normal_startup_uses_default_profile() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().join("runtime-workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let cli =
+            Cli::try_parse_from(["yoi pod", "--workspace", workspace.to_str().unwrap()]).unwrap();
+        let mut called = false;
+
+        let (manifest, _loader) =
+            resolve_manifest_with_profile_loader(&cli, |selector, _workspace_root, pod_name| {
+                called = true;
+                assert_eq!(selector, &ProfileSelector::Default);
+                assert_eq!(pod_name, "runtime-workspace");
+                let mut manifest =
+                    PodManifest::from_toml(&manifest_toml("from-default-profile", tmp.path()))
+                        .unwrap();
+                manifest.pod.name = pod_name.to_string();
+                Ok((manifest, PromptLoader::builtins_only()))
+            })
+            .unwrap();
+
+        assert!(called);
+        assert_eq!(manifest.pod.name, "runtime-workspace");
     }
 
     #[test]
     fn project_flag_no_longer_enables_ambient_manifest_cascade() {
         let cli = Cli::try_parse_from(["yoi pod", "--project", "."]).unwrap();
-        let err = resolve_manifest_with_profile_loader(&cli, |_, _| {
+        let err = resolve_manifest_with_profile_loader(&cli, |_, _, _| {
             panic!("default profile loader must not run when deprecated --project is present")
         })
         .unwrap_err();
@@ -700,16 +800,14 @@ permission = "write"
         let mut called = false;
 
         let (manifest, _loader) =
-            resolve_manifest_with_profile_loader(&cli, |selector, pod_name| {
+            resolve_manifest_with_profile_loader(&cli, |selector, _workspace_root, pod_name| {
                 called = true;
                 assert_eq!(selector, &ProfileSelector::Default);
-                assert_eq!(pod_name, Some("agent"));
+                assert_eq!(pod_name, "agent");
                 let mut manifest =
                     PodManifest::from_toml(&manifest_toml("from-default-profile", tmp.path()))
                         .unwrap();
-                if let Some(pod_name) = pod_name {
-                    manifest.pod.name = pod_name.to_string();
-                }
+                manifest.pod.name = pod_name.to_string();
                 Ok((manifest, PromptLoader::builtins_only()))
             })
             .unwrap();
@@ -723,7 +821,6 @@ permission = "write"
         let segment_id = session_store::new_segment_id().to_string();
         for args in [
             vec!["yoi pod", "--profile", "p.lua", "--manifest", "m.toml"],
-            vec!["yoi pod", "--profile", "p.lua", "--pod", "agent"],
             vec!["yoi pod", "--profile", "p.lua", "--session", &segment_id],
         ] {
             let err = Cli::try_parse_from(args).unwrap_err();
@@ -732,23 +829,16 @@ permission = "write"
     }
 
     #[test]
-    fn profile_pod_name_requires_profile() {
-        let err = Cli::try_parse_from(["yoi pod", "--profile-pod-name", "agent"]).unwrap_err();
-        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    fn profile_and_pod_are_independent_startup_inputs() {
+        let cli = Cli::try_parse_from(["yoi pod", "--profile", "p.lua", "--pod", "agent"]).unwrap();
+        assert_eq!(cli.profile.as_deref(), Some("p.lua"));
+        assert_eq!(cli.pod.as_deref(), Some("agent"));
     }
 
     #[test]
-    fn profile_pod_name_is_not_restore_pod_flag() {
-        let cli = Cli::try_parse_from([
-            "yoi pod",
-            "--profile",
-            "p.lua",
-            "--profile-pod-name",
-            "agent",
-        ])
-        .unwrap();
-        assert_eq!(cli.profile_pod_name.as_deref(), Some("agent"));
-        assert!(cli.pod.is_none());
+    fn removed_profile_pod_name_alias_is_rejected() {
+        let err = Cli::try_parse_from(["yoi pod", "--profile-pod-name", "agent"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
     }
 
     #[test]
