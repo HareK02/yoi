@@ -74,3 +74,98 @@ Escalate if:
 - Tool default cwd cannot be made consistent without changing Bash/tool execution semantics more broadly.
 
 ---
+
+<!-- event: decision author: orchestrator at: 2026-06-08T07:06:17Z -->
+
+## Decision
+
+Routing decision: implementation_ready
+
+Correction:
+- The previous `preflight_needed` routing decision was too conservative. The Ticket body already fixes the core authority boundary: `cwd` is intentionally separate from runtime workspace root, Profile discovery, project/Ticket/memory roots, and Pod identity.
+- The remaining choices are bounded implementation details rather than preflight blockers.
+
+Reason:
+- The Ticket explicitly states that `SpawnPod.cwd` is optional child process/tool working-directory context, not workspace context and not an authority grant.
+- It already records that `cwd` does not replace delegated scope and does not change profile/manifest/workspace-root semantics.
+- The recently merged direct/delegation authority split strengthens the surrounding invariant: child scope delegation remains explicit and independent from process cwd.
+- Requirements and acceptance criteria are observable: schema/input support, validation/diagnostics, child process current_dir/default Bash cwd, workflow guidance, and tests.
+
+Evidence checked:
+- Ticket body and thread, including the user clarification that the Ticket exists specifically to separate workspace and cwd.
+- Workspace state: no existing matching worktree/branch; main workspace clean before this routing update.
+- Existing workflow pain observed earlier: spawned child Pods currently validate/run from parent cwd and require non-recursive parent read grants even when implementation work should be rooted in a child worktree.
+- Related completed Ticket: `split-direct-and-delegation-authority` has now separated direct scope from delegation authority, so `cwd` can remain a process context without implying child authority.
+
+IntentPacket:
+
+Intent:
+- Add an optional `cwd` field to `SpawnPod` so the parent can choose the child process/tool default working directory independently from runtime workspace context and delegated scope.
+
+Binding decisions / invariants:
+- `cwd` means child process/tool working directory only.
+- `cwd` is not runtime workspace root.
+- `cwd` does not affect Profile discovery, project record root, Ticket config root, workflow registry, memory root discovery, Pod name/default identity, or role launch workspace context.
+- `cwd` grants no read/write authority. Child filesystem access remains controlled by explicit delegated `scope` and, after the direct/delegation split, by the parent's delegation authority.
+- Omitted `cwd` preserves existing behavior as closely as possible.
+- Provided `cwd` must be absolute, exist, and be a directory.
+- Provided `cwd` must be readable/usable under the child effective direct scope, or launch must fail clearly. This prevents starting a child in a directory it cannot inspect/use.
+- Worktree/multi-agent workflows should set coder `cwd` to the child worktree while still delegating explicit read/write scope to that worktree.
+- Reviewer `cwd` is a workflow convenience, not an authority signal.
+
+Requirements / acceptance criteria:
+- Extend `SpawnPod` tool input/schema with optional `cwd`.
+- Validate `cwd` before child launch and return clear errors for relative, missing, non-directory, or not-in-child-scope paths.
+- Start the spawned Pod process with `cwd` as its process current directory when provided.
+- Ensure the child Bash/tool default cwd is the provided `cwd` so commands no longer need mandatory `cd <worktree> && ...` wrappers.
+- Preserve existing behavior for callers that omit `cwd`.
+- Keep delegated scope validation independent from `cwd`.
+- Update multi-agent/worktree workflow guidance and/or generated launch prompt wording where maintained guidance currently tells coders to `cd` into worktrees because SpawnPod cannot set cwd.
+- Add focused tests for schema/validation and child launch cwd behavior where practical.
+
+Implementation latitude:
+- Coder may choose exact Rust field names/types and validation helper placement.
+- Coder may update only maintained workflow/prompt guidance that directly references child worktree `cd` workarounds.
+- If runtime process cwd is easier to validate via child direct scope than parent authority, prefer child-scope validation because `cwd` is for the child's usable environment, not a parent capability grant.
+- Coder may leave role launcher/Profile workspace-root behavior untouched unless a test proves `cwd` currently contaminates it.
+
+Escalate if:
+- Adding `cwd` requires changing workspace-root/Profile/memory-root semantics.
+- Child process current_dir cannot be changed without broad runtime command redesign.
+- A safe validation rule cannot be expressed without granting authority via `cwd`.
+- Existing spawned Pod registry/scope accounting assumes child process cwd is always the parent cwd in a way that cannot be localized.
+
+Validation:
+- Focused tests for `SpawnPod` input/schema validation.
+- Tests or probes proving provided `cwd` becomes the child process/tool default cwd while omitted `cwd` preserves current behavior.
+- SpawnPod scope/delegation tests to ensure `cwd` does not bypass delegated scope.
+- `cargo test -p pod spawn_pod --test spawn_pod_test` or focused equivalent.
+- `cargo test -p protocol` / schema tests if tool input types live there.
+- `cargo fmt --check`.
+- `git diff --check`.
+- `cargo run -q -p yoi -- ticket doctor`.
+- Because tool schema/runtime/workflow guidance may change, final merge-completion should include `nix build .#yoi`.
+
+Current code map:
+- `crates/pod/src/tools/pod_management.rs` or current SpawnPod tool input/handler path.
+- `crates/pod/src/spawn/tool.rs` and related runtime spawn implementation after the authority split.
+- `crates/protocol/src/lib.rs` if tool schemas/input structs are protocol-owned.
+- `crates/pod/tests/spawn_pod_test.rs` for SpawnPod behavior tests.
+- Workflow guidance files for worktree/multi-agent coder instructions.
+
+Critical risks / reviewer focus:
+- `cwd` must not become a hidden workspace-root or authority source.
+- Relative/missing/out-of-scope cwd must fail clearly before launch.
+- Omitted `cwd` must preserve existing launch behavior.
+- Child direct tools must run from `cwd` by default when provided.
+- Delegated scope and delegation authority validation must remain independent and stricter than cwd convenience.
+
+---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-08T07:06:29Z from: queued to: inprogress reason: orchestrator_acceptance field: workflow_state -->
+
+## State changed
+
+Accepted queued implementation after correcting the prior over-conservative preflight routing and recording an implementation-ready IntentPacket. This acceptance precedes worktree creation and coder/reviewer Pod spawning.
+
+---

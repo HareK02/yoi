@@ -6,9 +6,9 @@ status: 'open'
 kind: 'task'
 priority: 'P2'
 labels: ['pod', 'spawn', 'cwd', 'worktree', 'orchestration']
-workflow_state: 'queued'
+workflow_state: 'inprogress'
 created_at: '2026-06-08T01:10:36Z'
-updated_at: '2026-06-08T03:07:33Z'
+updated_at: '2026-06-08T07:06:29Z'
 assignee: null
 legacy_ticket: null
 queued_by: 'workspace-panel'
