@@ -6,11 +6,13 @@ status: 'open'
 kind: 'task'
 priority: 'P1'
 labels: ['pod', 'identity', 'workspace', 'cli', 'panel']
-workflow_state: 'intake'
+workflow_state: 'queued'
 created_at: '2026-06-07T23:55:05Z'
-updated_at: '2026-06-07T23:55:05Z'
+updated_at: '2026-06-08T00:52:41Z'
 assignee: null
 legacy_ticket: null
+queued_by: 'workspace-panel'
+queued_at: '2026-06-08T00:33:01Z'
 ---
 
 ## Background
