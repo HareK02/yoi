@@ -6,9 +6,9 @@ status: open
 kind: task
 priority: P2
 labels: [tui, composer, history, persistence]
-workflow_state: planning
+workflow_state: 'ready'
 created_at: 2026-06-01T02:11:04Z
-updated_at: 2026-06-05T23:01:38Z
+updated_at: '2026-06-08T13:14:53Z'
 assignee: null
 ---
 
