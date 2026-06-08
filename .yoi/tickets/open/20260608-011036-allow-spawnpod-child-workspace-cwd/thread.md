@@ -301,3 +301,83 @@ Pending:
 - No merge, close, final approval, or cleanup has occurred.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-08T08:13:38Z -->
+
+## Implementation report
+
+Merge-ready dossier: SpawnPod child cwd
+
+Ticket id/slug:
+- `20260608-011036-allow-spawnpod-child-workspace-cwd` / `allow-spawnpod-child-workspace-cwd`
+
+Branch/worktree:
+- Branch: `allow-spawnpod-child-workspace-cwd`
+- Worktree: `.worktree/allow-spawnpod-child-workspace-cwd`
+- Current branch commits:
+  - `3dd7707 feat: add SpawnPod cwd`
+  - `248744f fix: keep SpawnPod cwd separate`
+
+Intent / invariant check:
+- `SpawnPod.cwd` is child process/tool working directory only.
+- Runtime workspace/project/Ticket/workflow/memory/Profile context remains inherited through explicit workspace root and is not derived from tool cwd.
+- `cwd` grants no authority; child filesystem access remains controlled by explicit delegated direct scope and parent delegation authority.
+- Omitted `cwd` preserves current/spawner-pwd behavior.
+- Invalid/missing/non-directory/not-child-readable-scope cwd is rejected before launch.
+
+Implementation summary:
+- Added optional `SpawnPodInput.cwd`.
+- Added validation for relative/missing/non-directory/not-child-scope-readable cwd.
+- Initial implementation blocker was fixed by separating runtime workspace root from tool cwd:
+  - child runtime receives explicit `--workspace <parent workspace root>`;
+  - child tool cwd is passed separately as hidden `--tool-cwd`;
+  - command launch current_dir remains workspace root, not tool cwd;
+  - Pod stores `workspace_root` and `pwd` separately.
+- Updated nested SpawnPod registration so inherited workspace root and current tool pwd remain distinct.
+- Updated maintained prompt/workflow guidance to use `SpawnPod.cwd` as non-authority child working directory while still delegating explicit scope.
+
+Files touched:
+- `.yoi/workflow/multi-agent-workflow.md`
+- `.yoi/workflow/worktree-workflow.md`
+- `crates/client/src/ticket_role.rs`
+- `crates/pod/src/controller.rs`
+- `crates/pod/src/entrypoint.rs`
+- `crates/pod/src/pod.rs`
+- `crates/pod/src/spawn/tool.rs`
+- `crates/pod/tests/spawn_pod_test.rs`
+- `resources/prompts/internal.toml`
+
+Coder / reviewer Pods:
+- Coder: `coder-spawnpod-child-cwd`
+- Reviewer: `reviewer-spawnpod-child-cwd`
+
+Review evidence:
+- Initial reviewer verdict: `request_changes` because `Command::current_dir(child_cwd)` caused child runtime workspace context to be derived from cwd.
+- Coder fix commit: `248744f fix: keep SpawnPod cwd separate`.
+- Re-review verdict: `approve`.
+- Reviewer confirmed runtime workspace and tool cwd are now separated, memory/workflow layout uses workspace root, tool cwd is used for default tool/Bash cwd, omitted cwd preserves behavior, and validation remains non-authority.
+
+Validation performed by coder and/or reviewer:
+- `cargo test -p pod spawn_pod --test spawn_pod_test`
+- `cargo test -p pod spawn_pod`
+- `cargo fmt --check`
+- `git diff --check develop...HEAD`
+- `cargo run -q -p yoi -- ticket doctor`
+- `nix build .#yoi`
+
+Blockers fixed or rejected findings:
+- Fixed: `cwd` no longer changes runtime workspace/project/Ticket/workflow/memory context.
+- No remaining reviewer blockers.
+
+Residual risks:
+- Child effective direct scope must be readable for both inherited workspace root and tool cwd. This is intentional and keeps cwd non-authoritative, but manual callers must include workspace read scope when using a worktree cwd.
+- Restore behavior for an already-spawned Pod's distinct tool cwd was not deeply audited beyond launch-time requirements; reviewer judged launch and nested SpawnPod behavior sufficient for this Ticket.
+
+Dirty state:
+- Child worktree is clean at `248744f`.
+- Main workspace has unrelated active worktrees/Ticket-record changes for Ticket language work; they are outside this branch's core implementation paths and understood. Note that both branches touch `crates/client/src/ticket_role.rs`, so later Ticket-language merge may need normal conflict awareness.
+
+Parent/human decision needs:
+- User has authorized merge-completion and cleanup after approved work. Proceeding to merge-completion unless post-merge validation fails.
+
+---
