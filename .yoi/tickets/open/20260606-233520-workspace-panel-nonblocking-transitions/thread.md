@@ -276,3 +276,29 @@ Critical risks / reviewer focus:
 Accepted queued implementation after human preflight supplementation and routing IntentPacket were recorded. This acceptance precedes worktree creation and coder/reviewer Pod spawning.
 
 ---
+
+<!-- event: plan author: orchestrator at: 2026-06-08T02:08:45Z -->
+
+## Plan
+
+Implementation routing accepted and worktree created.
+
+Worktree plan:
+- Branch: `workspace-panel-nonblocking-transitions`
+- Worktree: `.worktree/workspace-panel-nonblocking-transitions`
+- Base: `e3df223 ticket: route workspace panel nonblocking transitions`
+- Scope: implement non-blocking workspace panel transition UX for panel-local wait points recorded in the binding decision.
+
+Delegation plan:
+- Spawn sibling coder Pod with write scope limited to `.worktree/workspace-panel-nonblocking-transitions`.
+- Coder must run Bash commands from the child worktree, not from the main workspace.
+- Coder must not edit main-workspace `.yoi` / Ticket / workflow / docs records, and must not create generated memory/local/runtime/secret-like files.
+- Reviewer will be spawned read-only after coder reports diff/commits and validation evidence.
+
+Concurrency note:
+- `remove-non-goals-from-workflow-templates` remains active in a separate worktree/review loop. This panel implementation must remain isolated and should not edit that worktree or depend on unmerged workflow-template changes.
+
+Stop/completion policy:
+- Because the human authorized cleanup after completion, this Orchestrator will proceed through reviewer approval, merge-completion validation, Ticket close, Pod stop, worktree removal, and branch deletion if the branch is approved and merge authority remains clear.
+
+---
