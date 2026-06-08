@@ -208,3 +208,67 @@ Pending:
 - No merge, close, final approval, or cleanup has occurred for this Ticket.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-08T03:31:31Z -->
+
+## Implementation report
+
+Merge-ready dossier: Intake claim commit timing
+
+Ticket id/slug:
+- `20260607-220225-commit-intake-claims-after-launch-success` / `commit-intake-claims-after-launch-success`
+
+Branch/worktree:
+- Branch: `commit-intake-claims-after-launch-success`
+- Worktree: `.worktree/commit-intake-claims-after-launch-success`
+- Current branch commit:
+  - `6797be3 fix: defer intake claim until launch acceptance`
+
+Intent / invariant check:
+- Durable local Intake claims now represent confirmed launched/restorable Intake Pods, not speculative launch attempts.
+- Existing-Ticket Intake durable claim persistence is deferred until after `launch_ticket_role_pod_with_options(...).await?` returns successfully with launch/run acceptance evidence.
+- Existing live/restorable claims still block duplicate Intake launch before launch preparation.
+- In-flight duplicate prevention is transient via `self.sending`, not durable.
+- Peer registration/handoff ordering is preserved; peer options are prepared before launch and durable registry commit happens only after launch returns.
+- Ticket workflow-state semantics, Orchestrator lifecycle, Companion routing, and unrelated stale-claim cleanup policy were not changed.
+
+Implementation summary:
+- Removed the pre-launch `claim_ticket(...)` call from `prepare_existing_ticket_intake_launch`.
+- Changed `IntakeRegistryUpdate` so existing-Ticket Intake carries a deferred `ClaimTicket` update.
+- Added `commit_intake_registry_update(...)` to centralize post-success registry/session persistence.
+- Added focused tests for deferred claim commit, exactly-one claim/session on repeated commit, and conflict-as-diagnostic/no-overwrite behavior.
+
+Files touched:
+- `crates/tui/src/multi_pod.rs`
+
+Coder / reviewer Pods:
+- Coder: `coder-commit-intake-claims`
+- Reviewer: `reviewer-commit-intake-claims`
+
+Review evidence:
+- Reviewer verdict: `approve`.
+- Reviewer confirmed the old pre-launch claim write was removed, deferred claim commit occurs only after successful `launch_ticket_role_pod_with_options(...).await?`, existing-claim duplicate blocking remains, peer registration/handoff ordering is preserved, and added tests cover the targeted registry boundary.
+
+Validation performed by coder and/or reviewer:
+- `cargo test -p tui role_session_registry --lib`
+- `cargo test -p tui multi_pod --lib`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo run -q -p yoi -- ticket doctor`
+- `nix build .#yoi`
+
+Blockers fixed or rejected findings:
+- No reviewer blockers.
+
+Residual risks:
+- No full mocked/integration test drives `launch_intake_with_handoff` through spawn/connect/run-acceptance failure and then asserts the registry stays empty. Reviewer judged the explicit `await?` before `commit_intake_registry_update` sufficient for this Ticket.
+- If post-success registry commit fails, launch has already succeeded and the UI reports a registry warning rather than rolling back the launched Pod. This matches the post-success-commit direction and remains an operational diagnostic case.
+
+Dirty state:
+- Child worktree is clean at `6797be3`.
+- Main workspace has unrelated newly created Ticket records for other Intake work; they are outside this branch's touched paths and are understood.
+
+Parent/human decision needs:
+- User has authorized merge-completion and cleanup after approved work. Proceeding to merge-completion unless post-merge validation fails.
+
+---
