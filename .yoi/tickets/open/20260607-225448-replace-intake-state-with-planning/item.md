@@ -6,11 +6,13 @@ status: open
 kind: task
 priority: P1
 labels: [ticket, workflow-state, orchestrator, panel, intake, planning]
-workflow_state: 'ready'
+workflow_state: 'inprogress'
 created_at: 2026-06-07T22:54:48Z
-updated_at: '2026-06-08T07:22:47Z'
+updated_at: '2026-06-08T08:37:22Z'
 assignee: null
 legacy_ticket: null
+queued_by: 'workspace-panel'
+queued_at: '2026-06-08T08:35:07Z'
 ---
 
 ## Background
