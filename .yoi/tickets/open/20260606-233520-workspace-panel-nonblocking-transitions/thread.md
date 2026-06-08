@@ -183,3 +183,96 @@ Non-goals are limited to adjacent changes that could naturally be mixed into thi
 Everything else should not be listed as a non-goal unless the implementation discovers it is an actual adjacent risk. Unrelated exclusions add noise and should be avoided.
 
 ---
+
+<!-- event: decision author: orchestrator at: 2026-06-08T02:08:16Z -->
+
+## Decision
+
+Routing decision: implementation_ready
+
+Reason:
+- The new human binding decision supplies the missing preflight boundary for the previously recorded `preflight_needed` routing decision.
+- The implementation scope is now fixed to three panel-local wait points: process/Pod transition waits, composer submit/send confirmation waits, and practical initial panel first-draw work.
+- Binding boundaries explicitly preserve Pod spawn/restore/attach authority, identity, metadata semantics, Ticket workflow-state/action semantics, local-only pending guards, input/selection/draft preservation, and no durable scheduler/runtime-loop rewrite.
+- Remaining uncertainty is bounded TUI implementation investigation: exact local progress-state representation, `PendingReload` extension points, and test seams.
+
+Evidence checked:
+- Ticket body requirements and acceptance criteria.
+- Thread decisions, including the latest `Binding decision: non-blocking transition scope`.
+- Code map search for `PendingReload`, `reload_or_notice`, `prepare_open`, `finish_open`, `load_multi_pod_snapshot`, `OrchestratorLifecycleMode`, `run_pod_name_nested`, composer submit paths, and existing progress strings.
+- Workspace state: no branch/worktree exists for this Ticket; unrelated dirty Ticket records exist in the main workspace, but the user explicitly asked to proceed if ready and this work will be isolated in a child worktree.
+- Active work: `remove-non-goals-from-workflow-templates` is in separate worktree/review and touches workflow/docs/client role text, not the panel TUI implementation paths for this Ticket.
+- Ticket doctor: 0 errors; existing warnings are unrelated legacy closed-Ticket diagnostics.
+
+IntentPacket:
+
+Intent:
+- Make `yoi panel` transitions feel immediate by showing the next panel/progress state before slow local/runtime work completes, while preserving the existing authority and workflow semantics.
+
+Binding decisions / invariants:
+- Scope is limited to three panel-local wait points:
+  1. Panel-originated Pod spawn / restore / attach / open should show visible `launching` / `restoring` / `attaching` style progress before awaiting runtime socket connect, restore, or spawn completion.
+  2. Companion send, existing Ticket clarify/intake launch, and Ticket action dispatch should give immediate visible feedback that submit/dispatch started.
+  3. Initial `yoi panel` should show an initial/loading/minimal panel before non-essential full snapshot, Orchestrator ensure/observe, or slow local runtime checks complete where practical.
+- Preserve Pod spawn/restore/attach authority, identity, and metadata semantics.
+- Preserve Ticket workflow-state/action semantics and role-launch policy.
+- Do not introduce a durable scheduler, lease, or background-job system.
+- Do not rewrite the entire TUI runtime loop or replace the single-Pod TUI.
+- Reuse or extend local pending-task guards such as `PendingReload` where practical.
+- Prevent duplicate overlapping reload/transition tasks.
+- Preserve selected row and composer draft across background refreshes unless the submitted operation succeeds and intentionally clears the draft.
+- Keep enough synchronous checks to avoid presenting actions that would immediately violate known local state invariants.
+
+Requirements / acceptance criteria:
+- Returning from nested Pod should redraw the previous panel immediately with a concise refreshing notice, then perform snapshot reload in the background.
+- Avoid awaiting `app.reload_or_notice().await` on the attach-return path before the panel is visible.
+- Opening/attaching/restoring/launching a Pod from the panel should visibly enter a progress state before slow socket/restore/spawn waits.
+- Composer submit/dispatch paths should show immediate sending/launching/dispatching feedback and preserve drafts on busy/rejected/failed sends where existing semantics require it.
+- Initial panel open should avoid blocking first draw on non-essential snapshot/Orchestrator work where practical, using a minimal/loading state or equivalent.
+- Background completion must update Pod state, Ticket rows, Orchestrator state, diagnostics, selection, and composer target consistently.
+- Preserve no-Ticket Pod-centric behavior.
+- Tests should cover non-blocking return/reload and practical progress-state behavior.
+
+Implementation latitude:
+- Coder may choose the exact local state names/types, whether to extend `PendingReload` or introduce adjacent local guards, and which paths can safely remain synchronous.
+- Coder may split implementation if initial first-draw requires a smaller practical subset, but must report any acceptance criterion not fully achieved.
+- Coder may add focused unit tests around app state transitions rather than full E2E.
+
+Escalate if:
+- Initial first draw cannot be improved without a broad TUI runtime-loop rewrite.
+- Progress states require changing Pod spawn/restore/attach authority or metadata semantics.
+- Background reload ordering requires durable scheduler/lease semantics rather than local UI guards.
+- The implementation would drop composer text/selection unexpectedly or allow duplicate overlapping reloads.
+
+Validation:
+- Focused TUI tests for `multi_pod` / workspace panel transition behavior.
+- Existing no-Ticket and Ticket-enabled panel tests.
+- `cargo test -q -p tui multi_` or more focused equivalent selected by coder.
+- `cargo test -q -p tui workspace_panel`.
+- `cargo fmt --check`.
+- `git diff --check`.
+- `cargo run -q -p yoi -- ticket doctor`.
+- Because TUI/runtime behavior is touched, final validation should include `nix build .#yoi` before merge-completion unless explicitly waived.
+
+Current code map:
+- `crates/tui/src/multi_pod.rs`: `PendingReload`, `run_multi_pod_tui`, `MultiPodApp::load`, `reload_or_notice`, `prepare_open`, `finish_open`, `load_multi_pod_snapshot`, `OrchestratorLifecycleMode`, composer submit/action handling, existing tests.
+- `crates/tui/src/spawn.rs`: nested Pod open/connect/restore path and existing `attaching` strings.
+- `crates/tui/src/workspace_panel.rs`: panel model/action/progress/status rendering.
+- `crates/tui/src/lib.rs` and `crates/tui/src/single_pod.rs`: nested single-Pod return boundary as needed.
+
+Critical risks / reviewer focus:
+- Return-from-nested-Pod path must not block on snapshot reload before drawing the panel.
+- Progress states must not imply authority changes or successful launch/restore before acceptance/evidence exists.
+- Duplicate reload/transition tasks must be guarded.
+- Selection/composer draft must survive background refresh unless success semantics intentionally clear it.
+- Initial first draw should improve only where practical without a large runtime-loop rewrite.
+
+---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-08T02:08:22Z from: queued to: inprogress reason: orchestrator_acceptance field: workflow_state -->
+
+## State changed
+
+Accepted queued implementation after human preflight supplementation and routing IntentPacket were recorded. This acceptance precedes worktree creation and coder/reviewer Pod spawning.
+
+---
