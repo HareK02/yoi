@@ -74,3 +74,99 @@ Escalate if:
 - The implementation would blur Ticket record authority with memory-language generation rules.
 
 ---
+
+<!-- event: decision author: orchestrator at: 2026-06-08T07:41:03Z -->
+
+## Decision
+
+Routing decision: implementation_ready
+
+Correction:
+- The previous `preflight_needed` decision was too conservative for the current Ticket state. The Ticket body and Intake summary already fix the product boundary: `worker.language` controls conversational prose, while `ticket.language` controls durable Ticket records and generated Ticket event/resolution/scaffold text.
+- Remaining uncertainty is bounded implementation policy and test coverage, not a human-blocking design question.
+
+Reason:
+- The canonical config shape is already selected by the Ticket as `[ticket].language`, with explicit instruction not to overload `[worker].language` or Profile settings.
+- Backward compatibility is clear: absence of `ticket.language` preserves current/default behavior.
+- The non-migration rule is clear: existing Tickets are not bulk-translated or rewritten.
+- The language boundary is explicit enough for coder/reviewer: do not translate protocol literals, file paths, commands, logs, identifiers, or quoted external text merely because Ticket language is set.
+- Role-launch prompt exposure and typed generated-record coverage can be implemented incrementally where practical, as long as the policy is documented and tests cover representative paths.
+
+Evidence checked:
+- Ticket body and thread, including Intake readiness and prior routing note.
+- Workspace state: no matching branch/worktree exists; active `allow-spawnpod-child-workspace-cwd` and `shutdown-intake-pod-after-ready-idle` worktrees are separate and touch different code paths.
+- Code map search for Ticket config/scaffold, worker/memory language handling, Ticket role launch prompt/context, typed Ticket generated events/resolutions, and Panel close deterministic resolution paths.
+- Ticket doctor: 0 errors; existing warnings are unrelated legacy closed-Ticket diagnostics.
+
+IntentPacket:
+
+Intent:
+- Add explicit Ticket record language configuration and propagate it to durable Ticket record generation and role guidance without changing normal worker response language.
+
+Binding decisions / invariants:
+- `worker.language` remains conversation/prose response language for Pods.
+- `memory.language` remains memory/Knowledge generation language.
+- New `ticket.language` is durable Ticket record language for Ticket item/thread/resolution generated text and role guidance where Ticket records are written.
+- Preferred config shape is `[ticket].language` in `.yoi/ticket.config.toml`.
+- Absence of `ticket.language` preserves current/default behavior.
+- Existing Tickets are not bulk-translated or rewritten.
+- Do not translate protocol literals, file paths, commands, logs, identifiers, or quoted external text merely because Ticket language is configured.
+- Do not implement hidden context-only language injection. Language guidance must come from committed config/tool/workflow/launch-prompt paths.
+- Do not make worker response language override durable Ticket record language.
+
+Requirements / acceptance criteria:
+- Extend Ticket config parser/scaffold to support optional `[ticket].language`.
+- Update this project's `.yoi/ticket.config.toml` to set the desired Ticket record language.
+- Expose Ticket record language to Ticket role launch prompt/context so Intake/Orchestrator/Coder/Reviewer know which language to use for Ticket comments/reviews/decisions.
+- Make typed Ticket-generated text consult configured Ticket record language where practical, at minimum for scaffold/default generated bodies or prominent generated event/resolution paths selected by coder.
+- Preserve current behavior when `ticket.language` is absent.
+- Document/encode the policy clearly enough that reviewer can distinguish implemented paths from future localization work.
+- Add tests for config parsing/scaffold/default behavior and at least one role prompt or generated record path.
+
+Implementation latitude:
+- Coder may choose minimal practical first coverage for generated text paths, but must report which generated paths consult `ticket.language` and which remain future work.
+- Coder may use simple language labels/instructions rather than full translation infrastructure.
+- Coder may leave existing Ticket bodies/threads/resolutions untouched.
+- Coder may update maintained workflow/prompt guidance if it directly tells agents what language to use for Ticket records.
+
+Escalate if:
+- Implementing `ticket.language` requires migrating existing Tickets.
+- Typed Ticket backend localization would require broad translation catalogs rather than a minimal policy/instruction pass-through.
+- Role launch prompt language guidance cannot be passed through committed prompt/history/tool paths.
+- Any path would conflate Ticket record language with memory extraction language or normal worker prose language.
+
+Validation:
+- Ticket config parser/scaffold tests.
+- Role launch prompt/context tests verifying Ticket record language is included independently from worker language.
+- Focused generated-record test for at least one configured-language path.
+- `cargo test -p ticket ...` / `cargo test -p client ...` / `cargo test -p yoi ...` focused equivalents selected by coder.
+- `cargo fmt --check`.
+- `git diff --check`.
+- `cargo run -q -p yoi -- ticket doctor`.
+- Because config/scaffold/runtime prompt behavior may change, final merge-completion should include `nix build .#yoi`.
+
+Current code map:
+- `crates/ticket/src/config.rs` and Ticket config scaffold helpers.
+- `crates/yoi/src/ticket_cli.rs`: `yoi ticket init` scaffold tests and CLI examples.
+- `crates/client/src/ticket_role.rs`: `TicketRoleLaunchContext`, role prompt rendering, launch prompt construction.
+- `crates/tui/src/multi_pod.rs` and `workspace_panel.rs`: role launch/context construction and Panel generated resolution paths.
+- `crates/ticket/src/lib.rs`: typed Ticket generated events, default bodies, close behavior.
+- `.yoi/ticket.config.toml`: project-local desired Ticket record language.
+- `resources/prompts` / maintained workflow files only if they contain active role guidance that should mention Ticket record language.
+
+Critical risks / reviewer focus:
+- `ticket.language` must remain independent from `worker.language`.
+- Existing absent-config behavior must not regress.
+- Role prompt guidance must be durable/committed, not hidden context injection.
+- Existing records must not be bulk rewritten.
+- Generated text coverage must be explicit; partial coverage is acceptable only if policy/future-work boundary is clear.
+
+---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-08T07:41:11Z from: queued to: inprogress reason: orchestrator_acceptance field: workflow_state -->
+
+## State changed
+
+Accepted queued implementation after user confirmation and routing IntentPacket were recorded. This acceptance precedes worktree creation and coder/reviewer Pod spawning.
+
+---
