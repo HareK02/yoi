@@ -8,7 +8,7 @@ priority: 'P2'
 labels: ['pod', 'spawn', 'cwd', 'worktree', 'orchestration']
 workflow_state: 'inprogress'
 created_at: '2026-06-08T01:10:36Z'
-updated_at: '2026-06-08T07:06:29Z'
+updated_at: '2026-06-08T07:07:00Z'
 assignee: null
 legacy_ticket: null
 queued_by: 'workspace-panel'

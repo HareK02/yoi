@@ -169,3 +169,26 @@ Critical risks / reviewer focus:
 Accepted queued implementation after correcting the prior over-conservative preflight routing and recording an implementation-ready IntentPacket. This acceptance precedes worktree creation and coder/reviewer Pod spawning.
 
 ---
+
+<!-- event: plan author: orchestrator at: 2026-06-08T07:07:00Z -->
+
+## Plan
+
+Implementation routing accepted and worktree created.
+
+Worktree plan:
+- Branch: `allow-spawnpod-child-workspace-cwd`
+- Worktree: `.worktree/allow-spawnpod-child-workspace-cwd`
+- Base: `15cf4a1 ticket: route spawnpod cwd implementation`
+- Scope: add optional `SpawnPod.cwd` as child process/tool working-directory context, separate from workspace root and delegated authority.
+
+Delegation plan:
+- Spawn sibling coder Pod with write scope limited to `.worktree/allow-spawnpod-child-workspace-cwd`.
+- Coder must run Bash commands from the child worktree for now because the current live `SpawnPod` tool does not yet support `cwd`; implementing that support is the Ticket goal.
+- Coder must not edit main-workspace `.yoi` / Ticket / workflow / docs records, and must not create generated memory/local/runtime/secret-like files.
+- Reviewer will be spawned read-only after coder reports diff/commits and validation evidence.
+
+Stop/completion policy:
+- Because the human authorized cleanup after completion, this Orchestrator will proceed through reviewer approval, merge-completion validation, Ticket close, Pod stop, worktree removal, and branch deletion if the branch is approved and merge authority remains clear.
+
+---
