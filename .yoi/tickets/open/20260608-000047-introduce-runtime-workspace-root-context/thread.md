@@ -366,3 +366,35 @@ Action taken:
 No merge, close, final approval, or cleanup has occurred.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-08T01:49:15Z -->
+
+## Implementation report
+
+Coder fix-loop completed and reviewer re-review delegated.
+
+Coder follow-up:
+- Commit: `15f54df runtime: use pod flag for session identity`
+- Worktree: clean on branch `runtime-workspace-context`.
+- Fixes claimed:
+  - Removed hidden `--session-pod-name` identity path.
+  - Allowed Pod runtime `--session <uuid> --pod <name>` and made `--pod` the session identity flag.
+  - Allowed top-level `yoi --session <uuid> --pod <name>` and passed explicit Pod name through `LaunchMode::ResumeWithSession`.
+  - Added focused tests for top-level parser acceptance, Pod CLI acceptance, and hidden alias rejection.
+
+Coder validation reported:
+- focused manifest/client/pod/yoi/tui tests
+- `cargo check -q`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo run -q -p yoi -- ticket doctor`
+- `nix build .#yoi`
+
+Action taken:
+- Sent updated commits and prior blocker checklist to `reviewer-runtime-workspace-context` for read-only re-review.
+
+Pending:
+- Await reviewer verdict before merge-ready dossier.
+- No merge, close, final approval, or cleanup has occurred.
+
+---
