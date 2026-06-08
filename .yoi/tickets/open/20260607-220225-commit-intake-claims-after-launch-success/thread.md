@@ -166,3 +166,45 @@ Stop/completion policy:
 - Because the human authorized cleanup after completion, this Orchestrator will proceed through reviewer approval, merge-completion validation, Ticket close, Pod stop, worktree removal, and branch deletion if the branch is approved and merge authority remains clear.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-08T03:24:12Z -->
+
+## Implementation report
+
+Coder completed and reviewer delegated.
+
+Coder result:
+- Pod: `coder-commit-intake-claims`
+- Commit: `6797be3 fix: defer intake claim until launch acceptance`
+- Worktree status: clean after commit.
+- Diff against `develop`: 1 file changed, 137 insertions, 36 deletions.
+
+Files touched by coder:
+- `crates/tui/src/multi_pod.rs`
+
+Coder reported implementation:
+- Moved existing-Ticket Intake durable claim persistence from `prepare_existing_ticket_intake_launch` to the post-launch path after `launch_ticket_role_pod_with_options(...)` succeeds.
+- `IntakeRegistryUpdate` now carries a deferred `ClaimTicket` update instead of marking the claim as already done.
+- Added `commit_intake_registry_update(...)` to centralize post-success registry/session persistence for both pre-ticket Intake session recording and existing-Ticket claim commits.
+- Added a transient in-flight guard via `self.sending` so repeated launch attempts in the same panel instance are rejected while launch is ongoing.
+- Preserved existing duplicate prevention: an already-present claim is still checked before launch and blocks duplicate Intake launch.
+- Preserved peer registration/handoff ordering; peer registration options are still prepared before launch, while durable claim commit happens only after launch acceptance returns.
+
+Coder reported validation:
+- `cargo test -p tui role_session_registry --lib`
+- `cargo test -p tui multi_pod --lib`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo run -q -p yoi -- ticket doctor`
+- `nix build .#yoi`
+
+Reviewer delegation:
+- Spawned sibling reviewer Pod: `reviewer-commit-intake-claims`.
+- Reviewer scope: read-only child worktree plus non-recursive parent-root read required by launch cwd validation.
+- Reviewer was instructed to judge against the recorded Ticket requirements and binding decisions.
+
+Pending:
+- Await reviewer verdict before merge-ready dossier / merge-completion.
+- No merge, close, final approval, or cleanup has occurred for this Ticket.
+
+---
