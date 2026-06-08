@@ -196,3 +196,59 @@ Stop/completion policy:
 - Because the human authorized cleanup after completion, this Orchestrator will proceed through reviewer approval, merge-completion validation, Ticket close, Pod stop, worktree removal, and branch deletion if the branch is approved and merge authority remains clear.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-08T08:04:24Z -->
+
+## Implementation report
+
+Coder completed and reviewer delegated.
+
+Coder result:
+- Pod: `coder-ticket-record-language`
+- Commit: `fb261bb feat: add ticket record language config`
+- Worktree status: clean after commit.
+- Diff against `develop`: 9 files changed, 310 insertions, 28 deletions.
+
+Files touched by coder:
+- `.yoi/ticket.config.toml`
+- `crates/ticket/src/config.rs`
+- `crates/ticket/src/lib.rs`
+- `crates/ticket/src/tool.rs`
+- `crates/client/src/ticket_role.rs`
+- `crates/pod/src/feature/builtin/ticket.rs`
+- `crates/tui/src/workspace_panel.rs`
+- `crates/tui/src/multi_pod.rs`
+- `crates/yoi/src/ticket_cli.rs`
+
+Coder reported implementation:
+- Added optional `[ticket].language` parsing with blank-string rejection and a commented scaffold example in `yoi ticket init` output.
+- Set this repository's `.yoi/ticket.config.toml` to `[ticket] language = "Japanese"`.
+- Added `ticket_record_language` to `TicketRoleLaunchContext` and role launch prompt guidance, independent from worker/memory language.
+- Added `LocalTicketBackend::with_record_language()` / `record_language()` and propagates config language through CLI, built-in Ticket feature, and Panel backend construction.
+- Added minimal generated-text coverage for configured Japanese: create default item body, initial create thread event, queue/status/close generated events, `TicketIntakeReady` default body, and workspace Panel auto-close resolution.
+- No existing Tickets were bulk-translated or rewritten.
+- Arbitrary language names flow to role prompt/context; typed backend generated strings use explicit Japanese handling and otherwise fall back to default English rather than pretending to be a full localization catalog.
+
+Coder reported validation:
+- `cargo test -p ticket config::tests --lib`
+- `cargo test -p ticket create_uses_configured_japanese_record_language_for_generated_defaults --lib`
+- `cargo test -p client configured_ticket_record_language_is_included_in_role_prompt --lib`
+- `cargo test -p yoi ticket_cli_init_writes_explicit_ticket_config_scaffold`
+- `cargo check -p pod -p tui`
+- `cargo test -p ticket --lib`
+- `cargo test -p client ticket_role --lib`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo run -q -p yoi -- ticket doctor`
+- `nix build .#yoi`
+
+Reviewer delegation:
+- Spawned sibling reviewer Pod: `reviewer-ticket-record-language`.
+- Reviewer scope: read-only child worktree plus non-recursive parent-root read required by current launch cwd behavior.
+- Reviewer was instructed to judge against the recorded Ticket requirements and binding decisions.
+
+Pending:
+- Await reviewer verdict before merge-ready dossier / merge-completion.
+- No merge, close, final approval, or cleanup has occurred for this Ticket.
+
+---
