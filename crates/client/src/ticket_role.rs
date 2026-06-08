@@ -551,7 +551,7 @@ fn append_orchestrator_agent_routing_guidance(out: &mut String) {
     out.push_str("- Use `worktree-workflow` for the mechanical worktree plan: create `.worktree/<task-name>`, keep tracked `.yoi` project records visible in the child worktree, exclude `.yoi/memory` plus local/runtime/log/lock/secret-like `.yoi` paths, and keep active orchestration progress plus final review/approval/close in the main workspace unless explicitly designed otherwise.\n");
     out.push_str("- Use `multi-agent-workflow` for the sibling loop: coder and reviewer are siblings under this Orchestrator; coder gets narrow write scope to the child worktree; reviewer is read-only by default.\n");
     out.push_str("- Give the coder an intent packet that distinguishes binding decisions/invariants, implementation latitude, escalation conditions, child worktree/branch, validation commands, and report expectations; require Bash commands to `cd` into the child worktree, prohibit editing main-workspace `.yoi`/Ticket/workflow/docs records, and prohibit creating generated memory/local/runtime/secret-like files in the child worktree.\n");
-    out.push_str("- Give the reviewer the recorded Ticket intent, constraints, acceptance criteria, explicit decisions, diff/commits, validation evidence, and blocker/non-blocker criteria; reviewer judgment is against recorded requirements and decisions, not unrecorded preferred tactics. Keep branch-local reviewer verdicts in the review report or merge-ready dossier rather than recording them as final main-branch Ticket approval.\n");
+    out.push_str("- Give the reviewer the recorded Ticket intent, binding decisions/invariants, implementation latitude, acceptance criteria, explicit escalation conditions, diff/commits, validation evidence, and blocker/non-blocker criteria; reviewer judgment is against recorded requirements and decisions, not unrecorded preferred tactics. Keep branch-local reviewer verdicts in the review report or merge-ready dossier rather than recording them as final main-branch Ticket approval.\n");
     out.push_str("- Ticket thread progress may record worktree plan, coder delegated/completed/blocked, reviewer delegated, blocker/fix-loop summaries, and merge-ready dossier pointer; do not merge, close, or record final main approval in this routing/branch-review phase.\n");
     out.push_str("- Stop at a merge-ready dossier for `orchestrator-merge-completion` containing Ticket id/slug, branch/worktree, commits, intent/invariant check, implementation summary, coder/reviewer Pods, blockers fixed or rejected findings with reasons, validation performed, residual risks, dirty state, and parent/human decision needs if any.\n");
 
@@ -569,14 +569,14 @@ fn append_coder_agent_routing_guidance(out: &mut String) {
     out.push_str("\nCoder worktree routing guidance:\n");
     out.push_str("- Implement only in the provided child worktree/branch. Use `cd <worktree>` before Bash commands and do not edit main-workspace `.yoi`, Ticket, workflow, docs, or memory records; child-worktree `.yoi` project records may be visible when they are part of the branch.\n");
     out.push_str("- Do not create `.yoi/memory`, local/runtime state, logs, locks, caches, sockets, or secret-like files in the child worktree.\n");
-    out.push_str("- Treat the intent packet, binding decisions/invariants, constraints/non-goals, implementation latitude, validation expectations, and report expectations as the contract. Investigate and choose local tactics only within the recorded implementation latitude; escalate to Orchestrator rather than expanding scope when design, permission, history, prompt-context, dependency, or Ticket-boundary questions appear.\n");
+    out.push_str("- Treat the intent packet, binding decisions/invariants, implementation latitude, validation expectations, and report expectations as the contract. Investigate and choose local tactics only within the recorded implementation latitude; escalate to Orchestrator rather than expanding scope when design, permission, history, prompt-context, dependency, or Ticket-boundary questions appear.\n");
     out.push_str("- Report worktree path, branch, commits/status, changed files, implementation summary, validation run, unresolved notes, and whether the branch is ready for external review. Do not merge, push, close Tickets, or delete worktrees.\n");
 }
 
 fn append_reviewer_agent_routing_guidance(out: &mut String) {
     out.push_str("\nReviewer worktree routing guidance:\n");
-    out.push_str("- Review as a sibling of the coder under Orchestrator, read-only by default. Read the Ticket/intent packet, branch diff or commits, and validation evidence before judging. Judge implementation against recorded intent, constraints, acceptance criteria, and explicit decisions, not unrecorded preferred tactics.\n");
-    out.push_str("- Classify findings as blockers, non-blocking follow-ups, or parent-decision items against the recorded intent, constraints, acceptance criteria, binding decisions/invariants, and non-goals; include concrete file/line evidence where useful.\n");
+    out.push_str("- Review as a sibling of the coder under Orchestrator, read-only by default. Read the Ticket/intent packet, branch diff or commits, and validation evidence before judging. Judge implementation against recorded intent, binding decisions/invariants, implementation latitude, acceptance criteria, and explicit escalation conditions, not unrecorded preferred tactics.\n");
+    out.push_str("- Classify findings as blockers, non-blocking follow-ups, or parent-decision items against the recorded intent, binding decisions/invariants, implementation latitude, acceptance criteria, and explicit escalation conditions; include concrete file/line evidence where useful.\n");
     out.push_str("- Keep the branch-local reviewer verdict in the review report for the Orchestrator merge-ready dossier. Do not record final main-branch Ticket approval, merge, close, push, or instruct the coder directly.\n");
 }
 
@@ -1124,7 +1124,7 @@ workflow = "ticket-review-workflow"
         assert!(reviewer_text.contains("branch: work/ticket-role-pod-launcher"));
         assert!(reviewer_text.contains("approve or request changes"));
         assert!(reviewer_text.contains("read-only by default"));
-        assert!(reviewer_text.contains("recorded intent, constraints, acceptance criteria"));
+        assert!(reviewer_text.contains("recorded intent, binding decisions/invariants"));
         assert!(reviewer_text.contains("not unrecorded preferred tactics"));
         assert!(reviewer_text.contains("branch-local reviewer verdict"));
         assert!(reviewer_text.contains("Do not record final main-branch Ticket approval"));

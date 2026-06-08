@@ -12,7 +12,7 @@ Yoi の multi-agent 運用で、Intake や人間が作成した Ticket を Orche
 
 Panel Queue / queued notification は、人間が Orchestrator に routing を開始してよいと許可した signal であり、unattended scheduler ではない。implementation side effect に進む場合は、Orchestrator が Ticket と workspace state を再確認し、unblocked と判断してから `queued -> inprogress` を記録する必要がある。
 
-`ready` は Orchestrator routing に十分な状態であり、実装戦術が事前にすべて固定されている状態ではない。Orchestrator は、recorded intent / constraints / acceptance criteria / explicit decisions / escalation conditions が揃っていれば、bounded implementation uncertainty を残したまま implementation-ready と判断してよい。
+`ready` は Orchestrator routing に十分な状態であり、実装戦術が事前にすべて固定されている状態ではない。Orchestrator は、recorded intent / binding decisions / invariants / implementation latitude / acceptance criteria / escalation conditions が揃っていれば、bounded implementation uncertainty を残したまま implementation-ready と判断してよい。
 
 ## 位置づけ
 
@@ -96,7 +96,7 @@ Orchestrator は対象 Ticket を以下のいずれかに分類する。
 
 - Ticket の目的は見えるが、observable な完了条件が書けない。
 - ユーザー判断がないと product/API/UX を固定してしまう。
-- acceptance criteria または non-goals が不足している。
+- acceptance criteria、binding decisions / invariants、または escalation conditions が不足している。
 - existing decisions / docs / closed Tickets と矛盾する可能性がある。
 
 Action:
@@ -147,7 +147,7 @@ Action:
 
 条件:
 
-- intent / constraints / acceptance criteria が明確。
+- intent / binding decisions / invariants / implementation latitude / acceptance criteria が明確。
 - binding decisions / invariants と implementation latitude が区別されている。
 - reviewer が判断する basis と escalation conditions が明確。
 - validation が書ける。
@@ -174,7 +174,7 @@ Action:
 Action:
 
 - reviewer Pod 起動または追加 validation を提案する。
-- reviewer は recorded intent / constraints / acceptance criteria / explicit decisions に照らして判断する。不記録の好みや Orchestrator の未共有 preferred tactic を基準にしない。
+- reviewer は recorded intent / binding decisions / invariants / implementation latitude / acceptance criteria / explicit escalation conditions に照らして判断する。不記録の好みや Orchestrator の未共有 preferred tactic を基準にしない。
 - `TicketComment` に review target と確認観点を記録する。
 - blocker 未解決のまま merge-ready としない。
 
@@ -260,7 +260,8 @@ Action:
 - Background
 - Requirements
 - Acceptance criteria
-- Non-goals / invariants
+- Binding decisions / invariants
+- Implementation latitude
 - Readiness / needs_preflight / risk flags
 - Escalation conditions
 - Validation
@@ -313,15 +314,13 @@ Intent:
 
 Binding decisions / invariants:
 - 人間/Orchestrator/Ticket に記録済みで coder / reviewer が従うべき decision と、壊してはいけない design / authority boundary。
+- 具体的な除外・触れてはいけない場所が binding decision である場合はここに書く。
 
 Requirements / acceptance criteria:
 - 完了時に満たす observable な要件と reviewer が判断できる基準。
 
 Implementation latitude:
 - Coder が調査しながら選んでよい local tactic / file-local organization / bounded uncertainty。
-
-Non-goals / constraints:
-- 今回やらないこと、触ってはいけない場所。
 
 Escalate if:
 - 親/人間に戻す判断条件。特に product / API / UX / authority boundary / explicit design constraint を変える必要が出た場合。
@@ -333,7 +332,7 @@ Current code map:
 - 実装対象と触ってはいけない場所。
 
 Critical risks / reviewer focus:
-- reviewer にも見てほしい失敗パターン。reviewer は recorded intent / constraints / acceptance criteria / explicit decisions に照らして判断し、不記録の preferred tactic を基準にしない。
+- reviewer にも見てほしい失敗パターン。reviewer は recorded intent / binding decisions / invariants / implementation latitude / acceptance criteria / explicit escalation conditions に照らして判断し、不記録の preferred tactic を基準にしない。
 ```
 
 IntentPacket が短く書けない場合、`implementation_ready` ではなく `preflight_needed` または `requirements_sync_needed` に戻す。
