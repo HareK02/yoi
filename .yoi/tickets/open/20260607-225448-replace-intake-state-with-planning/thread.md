@@ -159,3 +159,26 @@ Critical risks / reviewer focus:
 Accepted queued implementation after reading the Ticket, workspace state, and workflow-state code map. This acceptance precedes worktree creation and coder/reviewer Pod spawning.
 
 ---
+
+<!-- event: plan author: orchestrator at: 2026-06-08T08:37:56Z -->
+
+## Plan
+
+Implementation routing accepted and worktree created.
+
+Worktree plan:
+- Branch: `replace-intake-state-with-planning`
+- Worktree: `.worktree/replace-intake-state-with-planning`
+- Base: `cb234b8 ticket: route planning workflow-state replacement`
+- Scope: replace user-facing workflow-state `intake` with planning terminology, remove standalone preflight/needs_preflight routing concepts, and update tests/docs/prompts/panel/tool behavior.
+
+Delegation plan:
+- Spawn sibling coder Pod with write scope limited to `.worktree/replace-intake-state-with-planning`.
+- Coder should run commands from the child worktree; current live Orchestrator may not yet expose the newly merged `SpawnPod.cwd` schema until restart, so the task packet still includes explicit `cd` instructions.
+- Coder must not edit main-workspace `.yoi` / Ticket / workflow / docs records, and must not create generated memory/local/runtime/secret-like files.
+- Reviewer will be spawned read-only after coder reports diff/commits and validation evidence.
+
+Stop/completion policy:
+- Because the human authorized cleanup after completion, this Orchestrator will proceed through reviewer approval, merge-completion validation, Ticket close, Pod stop, worktree removal, and branch deletion if the branch is approved and merge authority remains clear.
+
+---
