@@ -120,3 +120,30 @@ Critical risks / reviewer focus:
 Accepted queued implementation after reading the Ticket, workspace state, and maintained workflow-template hits. This acceptance precedes worktree creation and coder/reviewer Pod spawning.
 
 ---
+
+<!-- event: plan author: orchestrator at: 2026-06-08T01:50:56Z -->
+
+## Plan
+
+Implementation routing accepted and worktree created.
+
+Worktree plan:
+- Branch: `remove-non-goals-workflow-templates`
+- Worktree: `.worktree/remove-non-goals-workflow-templates`
+- Base: `b45d8f1 ticket: route workflow template non-goals cleanup`
+- Initial maintained workflow hits:
+  - `.yoi/workflow/ticket-intake-workflow.md`
+  - `.yoi/workflow/ticket-orchestrator-routing.md`
+  - `.yoi/workflow/ticket-preflight-workflow.md`
+  - `.yoi/workflow/multi-agent-workflow.md`
+
+Delegation plan:
+- Spawn sibling coder Pod with write scope limited to `.worktree/remove-non-goals-workflow-templates`.
+- Coder must run Bash commands from the child worktree, not from the main workspace.
+- Coder must not edit main-workspace `.yoi` / Ticket / workflow / docs records, and must not rewrite historic Ticket artifacts.
+- Reviewer will be spawned read-only after coder reports diff/commits and validation evidence.
+
+Stop condition:
+- This Orchestrator will stop at a merge-ready dossier; no merge, close, final approval, or cleanup in this phase.
+
+---
