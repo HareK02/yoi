@@ -186,3 +186,70 @@ Pending:
 - No merge, close, final approval, or cleanup has occurred for this Ticket.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-08T02:21:20Z -->
+
+## Implementation report
+
+Merge-ready dossier: workflow template non-goals cleanup
+
+Ticket id/slug:
+- `20260608-014602-remove-non-goals-from-workflow-templates` / `remove-non-goals-from-workflow-templates`
+
+Branch/worktree:
+- Branch: `remove-non-goals-workflow-templates`
+- Worktree: `.worktree/remove-non-goals-workflow-templates`
+- Current branch commit:
+  - `783cd42 workflow: replace non-goals template language`
+
+Intent / invariant check:
+- Maintained workflow templates and role guidance no longer use generic `Non-goals` / `Non-goals / constraints` buckets or the broad `やらないことは何か。` prompt.
+- Concrete exclusions remain expressible as binding decisions, invariants, authority boundaries, implementation latitude, and escalation conditions.
+- Historical Ticket records/artifacts were not rewritten.
+- Ticket workflow/state model, validation guidance, reviewer basis, and escalation guidance were preserved.
+
+Implementation summary:
+- Rewrote maintained workflow templates to replace generic non-goals language with `Binding decisions / invariants`, `Implementation latitude`, and concrete boundary wording.
+- Updated Ticket role prompt guidance in `crates/client/src/ticket_role.rs` so reviewer/coder basis no longer includes broad non-goals buckets.
+- Updated development work-item documentation to match the maintained workflow language.
+
+Files touched:
+- `.yoi/workflow/ticket-intake-workflow.md`
+- `.yoi/workflow/ticket-orchestrator-routing.md`
+- `.yoi/workflow/ticket-preflight-workflow.md`
+- `.yoi/workflow/multi-agent-workflow.md`
+- `crates/client/src/ticket_role.rs`
+- `docs/development/work-items.md`
+
+Coder / reviewer Pods:
+- Coder: `coder-remove-non-goals-workflow`
+- Reviewer: `reviewer-remove-non-goals-workflow`
+
+Review evidence:
+- Reviewer verdict: `approve`.
+- Reviewer confirmed maintained templates/examples remove old `Non-goals` wording and replace it with binding decisions/invariants, implementation latitude, and escalation-focused language.
+- Reviewer confirmed Intake no longer asks the broad `やらないことは何か。` prompt.
+- Reviewer confirmed no historic Ticket artifacts were touched.
+
+Validation performed by coder and/or reviewer:
+- `cargo fmt --check`
+- `cargo test -p client ticket_role`
+- maintained old-term search excluding historic Tickets and generated paths
+- `git diff --check develop...HEAD`
+- `cargo run -q -p yoi -- ticket doctor`
+- `nix build .#yoi --no-link`
+
+Blockers fixed or rejected findings:
+- No reviewer blockers.
+
+Residual risks:
+- Some Japanese role/scope sections still say a workflow does not do or handle specific things. Reviewer judged these as concrete role/authority/scope boundaries, not generic optional non-goals buckets.
+
+Dirty state:
+- Child worktree is clean at `783cd42`.
+- Main workspace has unrelated Ticket-record changes for other active/new Tickets; they are outside this branch's touched paths and are understood.
+
+Parent/human decision needs:
+- User has authorized merge-completion and cleanup after approved work. Proceeding to merge-completion unless validation fails.
+
+---
