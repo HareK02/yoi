@@ -145,3 +145,42 @@ Routing context:
 - This Ticket is now the active TUI implementation work.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-08T23:55:25Z -->
+
+## Implementation report
+
+Coder implementation completed and is ready for sibling review.
+
+Coder Pod:
+- `coder-tui-composer-history-persistence`
+- Commit: `64b7ff7c7c6f93c85e0c091ed5526e1e382ea023 tui: persist composer history`
+- Worktree status before review: clean branch `tui-composer-history-persistence`
+- Stopped after collecting output to reclaim delegated worktree scope.
+
+Implementation summary:
+- Adds user-data-backed TUI composer recall history persistence under `<data_dir>/composer-history/workspaces/<workspace-label>-<fnv64-key>/history.json`.
+- Stores workspace metadata plus typed `Segment` vectors; does not flatten input to strings.
+- Bounds history to 30 entries, skips blank inputs, and suppresses consecutive duplicates.
+- Loads history on single-Pod TUI startup and saves on submit while keeping recall non-destructive/TUI-local.
+- Corrupt history files fall back to empty history with a bounded actionbar warning that does not include saved entry contents.
+
+Changed files:
+- `crates/tui/src/composer_history.rs`
+- `crates/tui/src/app.rs`
+- `crates/tui/src/lib.rs`
+- `crates/tui/src/single_pod.rs`
+
+Coder validation reported passed:
+- `cargo test -p tui composer_history`
+- `cargo test -p tui input_history`
+- `cargo test -p tui completion_flow_tests`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo check --workspace`
+- `nix build .#yoi`
+
+Coder note:
+- Full `cargo test -p tui` still fails at pre-existing `multi_composer_target_switch_preserves_typed_text`; `multi_pod.rs` was not modified.
+
+---
