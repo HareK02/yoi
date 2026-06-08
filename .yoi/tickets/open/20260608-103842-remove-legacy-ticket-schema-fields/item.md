@@ -6,11 +6,13 @@ status: 'open'
 kind: 'task'
 priority: 'P1'
 labels: ['ticket', 'schema', 'migration', 'cleanup']
-workflow_state: 'planning'
+workflow_state: 'queued'
 created_at: '2026-06-08T10:38:42Z'
-updated_at: '2026-06-08T10:38:42Z'
+updated_at: '2026-06-08T11:21:33Z'
 assignee: null
 legacy_ticket: null
+queued_by: 'workspace-panel'
+queued_at: '2026-06-08T11:21:33Z'
 ---
 
 ## Background

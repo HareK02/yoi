@@ -6,7 +6,7 @@ status: open
 kind: task
 priority: P2
 labels: [pod, panel, cli, lifecycle, metadata]
-workflow_state: 'queued'
+workflow_state: 'planning'
 created_at: 2026-06-07T23:45:30Z
 updated_at: '2026-06-08T03:49:14Z'
 assignee: null

@@ -6,9 +6,9 @@ status: 'open'
 kind: 'task'
 priority: 'P1'
 labels: ['ticket', 'orchestrator', 'planning', 'workflow', 'prompt']
-workflow_state: planning
+workflow_state: 'ready'
 created_at: '2026-06-08T07:17:22Z'
-updated_at: '2026-06-08T07:17:22Z'
+updated_at: '2026-06-08T10:58:29Z'
 assignee: null
 legacy_ticket: null
 ---
