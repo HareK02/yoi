@@ -128,3 +128,51 @@ Validation:
 - `cargo check --workspace` and final `nix build .#yoi` because code/tool/schema/resources may change.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-08T12:11:20Z -->
+
+## Implementation report
+
+Implementation routing started.
+
+Worktree/branch:
+- Worktree: `.worktree/remove-legacy-ticket-schema-fields`
+- Branch: `remove-legacy-ticket-schema-fields`
+- Base/routing commit: `fdb9f50 ticket: route queued schema cleanup`
+
+Spawned sibling Coder Pod:
+- `coder-remove-legacy-ticket-schema-fields`
+- Scope: non-recursive read on parent workspace root plus recursive write limited to the child worktree.
+
+The queued `ticket-orchestration-plan-tool` Ticket is intentionally left queued until this lower-level schema cleanup lands, to avoid overlapping Ticket backend/API and local Ticket-record migration surfaces.
+
+---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-08T12:13:26Z -->
+
+## Implementation report
+
+Implementation blocked during required migration pre-check.
+
+Coder found non-null `legacy_ticket` values before making code/docs/Ticket record edits. Per the routing packet, deletion of non-null `legacy_ticket` values must not happen silently because it may discard current relation/history information.
+
+Summary:
+- Worktree: `.worktree/remove-legacy-ticket-schema-fields`
+- Branch: `remove-legacy-ticket-schema-fields`
+- Code/docs/Ticket record changes: none
+- Commit: none
+- Validation: pre-check only
+- Non-null occurrences: 32 total
+  - 30 closed historical Tickets with old legacy ids
+  - 2 open Tickets:
+    - `.yoi/tickets/open/20260608-092854-typed-ticket-relation-metadata/item.md`: `legacy_ticket: 20260608-010000-typed-ticket-relation-metadata`
+    - `.yoi/tickets/open/20260608-095529-ticket-orchestration-plan-tool/item.md`: `legacy_ticket: 20260608-020000-ticket-orchestration-plan-tool`
+
+Needed decision before implementation continues:
+- Either authorize deleting these `legacy_ticket` values as obsolete migration breadcrumbs,
+- or choose a preservation/migration policy, such as copying non-null values into bounded Ticket thread migration notes before removing the field,
+- or defer this Ticket back to planning to design typed relation/external-reference handling separately.
+
+No merge, close, or implementation edits have occurred.
+
+---
