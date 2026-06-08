@@ -111,3 +111,29 @@ Critical risks / reviewer focus:
 Accepted queued implementation after reading the Ticket, workspace state, and Panel/Ticket close code map. This acceptance precedes worktree creation and coder/reviewer Pod spawning.
 
 ---
+
+<!-- event: plan author: orchestrator at: 2026-06-08T05:50:36Z -->
+
+## Plan
+
+Implementation routing accepted and worktree created.
+
+Worktree plan:
+- Branch: `panel-close-done-tickets`
+- Worktree: `.worktree/panel-close-done-tickets`
+- Base: `c6e8f6a ticket: route panel close done tickets`
+- Scope: implement safe workspace Panel close action for already-done Tickets using the typed Ticket backend.
+
+Delegation plan:
+- Spawn sibling coder Pod with write scope limited to `.worktree/panel-close-done-tickets`.
+- Coder must run Bash commands from the child worktree, not from the main workspace.
+- Coder must not edit main-workspace `.yoi` / Ticket / workflow / docs records, and must not create generated memory/local/runtime/secret-like files.
+- Reviewer will be spawned read-only after coder reports diff/commits and validation evidence.
+
+Concurrency note:
+- `split-direct-and-delegation-authority` is active in a separate worktree. This Panel close implementation must remain isolated and should not edit that worktree or depend on unmerged authority-split changes.
+
+Stop/completion policy:
+- Because the human authorized cleanup after completion, this Orchestrator will proceed through reviewer approval, merge-completion validation, Ticket close, Pod stop, worktree removal, and branch deletion if the branch is approved and merge authority remains clear.
+
+---
