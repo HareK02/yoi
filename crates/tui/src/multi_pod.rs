@@ -294,7 +294,12 @@ pub(crate) enum IntakeRegistryUpdate {
         origin: RoleSessionOrigin,
         related_tickets: Vec<RelatedTicketRef>,
     },
-    ClaimedTicket,
+    ClaimTicket {
+        registry_root: PathBuf,
+        ticket_id: String,
+        ticket_slug: Option<String>,
+        pod_name: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -447,28 +452,7 @@ async fn launch_intake_with_handoff(request: IntakeLaunchRequest) -> IntakeLaunc
         options,
     )
     .await?;
-    let registry_warning = match request.registry_update {
-        IntakeRegistryUpdate::RecordSession {
-            registry_root,
-            pod_name,
-            origin,
-            related_tickets,
-        } => PanelRegistryStore::from_root(registry_root)
-            .record_session(
-                pod_name,
-                TicketRole::Intake.as_str().to_string(),
-                origin,
-                None,
-                related_tickets,
-            )
-            .err()
-            .map(|error| {
-                bounded_panel_diagnostic(format!(
-                    "local role session registry could not be updated after Intake launch: {error}"
-                ))
-            }),
-        IntakeRegistryUpdate::ClaimedTicket => None,
-    };
+    let registry_warning = commit_intake_registry_update(request.registry_update);
     let peer_registration = match (orchestrator_pod, skip_warning) {
         (_, Some(warning)) => warning,
         (Some(orchestrator_pod), None) if launch.pre_run_warnings.is_empty() => {
@@ -491,6 +475,46 @@ async fn launch_intake_with_handoff(request: IntakeLaunchRequest) -> IntakeLaunc
         peer_registration,
         registry_warning,
     })
+}
+
+fn commit_intake_registry_update(update: IntakeRegistryUpdate) -> Option<String> {
+    match update {
+        IntakeRegistryUpdate::RecordSession {
+            registry_root,
+            pod_name,
+            origin,
+            related_tickets,
+        } => PanelRegistryStore::from_root(registry_root)
+            .record_session(
+                pod_name,
+                TicketRole::Intake.as_str().to_string(),
+                origin,
+                None,
+                related_tickets,
+            )
+            .err()
+            .map(|error| {
+                bounded_panel_diagnostic(format!(
+                    "local role session registry could not be updated after Intake launch: {error}"
+                ))
+            }),
+        IntakeRegistryUpdate::ClaimTicket {
+            registry_root,
+            ticket_id,
+            ticket_slug,
+            pod_name,
+        } => match PanelRegistryStore::from_root(registry_root).claim_ticket(
+            &ticket_id,
+            ticket_slug.as_deref(),
+            &pod_name,
+            TicketRole::Intake.as_str(),
+        ) {
+            Ok(TicketClaimResult::Claimed) | Ok(TicketClaimResult::AlreadyOwned(_)) => None,
+            Err(error) => Some(bounded_panel_diagnostic(format!(
+                "local Ticket Intake claim could not be committed after launch acceptance: {error}"
+            ))),
+        },
+    }
 }
 
 pub(crate) struct MultiPodApp {
@@ -1069,6 +1093,13 @@ impl MultiPodApp {
     }
 
     pub(crate) fn prepare_existing_ticket_intake_launch(&mut self) -> Option<IntakeLaunchRequest> {
+        if self.sending {
+            self.notice = Some(
+                "Ticket Intake launch is already in progress; wait for it to finish before retrying."
+                    .to_string(),
+            );
+            return None;
+        }
         let row = match self.selected_panel_row() {
             Some(row) if row.is_ticket_action() => row,
             Some(row) if row.ticket.is_some() => {
@@ -1140,18 +1171,7 @@ impl MultiPodApp {
             }
         };
         context.pod_name = Some(planned.pod_name.clone());
-        match store.claim_ticket(
-            &ticket_id,
-            Some(&ticket_slug),
-            &planned.pod_name,
-            TicketRole::Intake.as_str(),
-        ) {
-            Ok(TicketClaimResult::Claimed) | Ok(TicketClaimResult::AlreadyOwned(_)) => {}
-            Err(error) => {
-                self.notice = Some(format!("Ticket claim diagnostic required: {error}"));
-                return None;
-            }
-        }
+        let pod_name = planned.pod_name.clone();
         let peer_registration = self.prepare_intake_peer_registration(&mut context);
         self.sending = true;
         self.notice = Some(format!(
@@ -1162,7 +1182,12 @@ impl MultiPodApp {
             context,
             runtime_command: self.runtime_command.clone(),
             peer_registration,
-            registry_update: IntakeRegistryUpdate::ClaimedTicket,
+            registry_update: IntakeRegistryUpdate::ClaimTicket {
+                registry_root: store.root().to_path_buf(),
+                ticket_id,
+                ticket_slug: Some(ticket_slug),
+                pod_name,
+            },
         })
     }
 
@@ -4303,6 +4328,82 @@ mod tests {
         assert!(!app.sending);
         assert_eq!(input_text(&app), "please keep this");
         assert!(app.notice.as_deref().unwrap().contains("composer kept"));
+    }
+
+    #[test]
+    fn intake_registry_update_claim_is_durable_only_after_commit() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("registry");
+        let store = PanelRegistryStore::from_root(root.clone());
+        let update = IntakeRegistryUpdate::ClaimTicket {
+            registry_root: root,
+            ticket_id: "20260608-000000-existing".to_string(),
+            ticket_slug: Some("existing".to_string()),
+            pod_name: "existing-intake".to_string(),
+        };
+
+        assert!(
+            store
+                .claim_for_ticket("20260608-000000-existing")
+                .unwrap()
+                .is_none(),
+            "holding a pending Intake registry update must not persist a Ticket claim"
+        );
+
+        assert!(commit_intake_registry_update(update.clone()).is_none());
+        assert!(
+            store
+                .claim_for_ticket("20260608-000000-existing")
+                .unwrap()
+                .is_some(),
+            "the claim is persisted only by the post-acceptance commit step"
+        );
+
+        assert!(commit_intake_registry_update(update).is_none());
+        let snapshot = store.snapshot().unwrap();
+        assert_eq!(snapshot.claims.len(), 1);
+        assert_eq!(snapshot.sessions.len(), 1);
+        assert_eq!(snapshot.sessions[0].pod_name, "existing-intake");
+        assert_eq!(snapshot.sessions[0].origin, RoleSessionOrigin::TicketClaim);
+        assert_eq!(snapshot.sessions[0].related_tickets.len(), 1);
+        assert_eq!(
+            snapshot.sessions[0].related_tickets[0].id,
+            "20260608-000000-existing"
+        );
+    }
+
+    #[test]
+    fn intake_registry_update_claim_conflict_is_diagnostic_not_overwrite() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("registry");
+        let store = PanelRegistryStore::from_root(root.clone());
+        store
+            .claim_ticket(
+                "20260608-000001-existing",
+                Some("existing"),
+                "first-intake",
+                TicketRole::Intake.as_str(),
+            )
+            .unwrap();
+
+        let warning = commit_intake_registry_update(IntakeRegistryUpdate::ClaimTicket {
+            registry_root: root,
+            ticket_id: "20260608-000001-existing".to_string(),
+            ticket_slug: Some("existing".to_string()),
+            pod_name: "second-intake".to_string(),
+        })
+        .expect("conflicting post-success claim should be reported");
+
+        assert!(warning.contains("could not be committed"));
+        let claim = store
+            .claim_for_ticket("20260608-000001-existing")
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim.pod_name, "first-intake");
+        let snapshot = store.snapshot().unwrap();
+        assert_eq!(snapshot.claims.len(), 1);
+        assert_eq!(snapshot.sessions.len(), 1);
+        assert_eq!(snapshot.sessions[0].pod_name, "first-intake");
     }
 
     #[test]
