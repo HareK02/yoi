@@ -278,3 +278,23 @@ Next recovery options:
 No merge, close, cleanup, or final approval has occurred.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-08T01:04:44Z -->
+
+## Implementation report
+
+Coder delegation retried after scope authorization.
+
+Result:
+- Spawned sibling coder Pod: `coder-runtime-workspace-context-2`.
+- Delegated write scope: `/home/hare/Projects/yoi/.worktree/runtime-workspace-context`.
+- Added a non-recursive read grant on `/home/hare/Projects/yoi` only because the spawned runtime currently validates its launch cwd; coder was instructed not to inspect/edit main-workspace files and to run all commands from the child worktree.
+
+Coder packet:
+- Implements the coordinated runtime workspace / Pod identity bundle for this Ticket plus `remove-profile-derived-pod-names` and `use-workspace-basename-for-default-pod-name`.
+- Must preserve the shared boundary decision: `--workspace` runtime workspace root, `--pod` runtime Pod identity, `--profile` recipe selection only, no Profile-derived Pod names.
+- Must stop after implementation report; no merge, close, final approval, or main-workspace Ticket edits.
+
+Reviewer delegation remains pending until coder reports diff/commits and validation evidence.
+
+---
