@@ -145,6 +145,31 @@ fn mock_runtime_command() -> PodRuntimeCommand {
     PodRuntimeCommand::new(which_true(), Vec::new())
 }
 
+fn cwd_recording_runtime_command(script_path: &Path, output_path: &Path) -> PodRuntimeCommand {
+    let output = output_path.display();
+    std::fs::write(
+        script_path,
+        format!(
+            "tmp=\"{output}.tmp\"\npwd > \"$tmp\"\nprintf '%s\\n' \"$@\" >> \"$tmp\"\nmv \"$tmp\" \"{output}\"\n"
+        ),
+    )
+    .unwrap();
+    PodRuntimeCommand::new(which_sh(), vec![script_path.as_os_str().to_os_string()])
+}
+
+async fn read_recorded_runtime_invocation(output_path: &Path) -> Vec<String> {
+    for _ in 0..50 {
+        if let Ok(content) = std::fs::read_to_string(output_path) {
+            return content.lines().map(str::to_owned).collect();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!(
+        "runtime command did not record invocation at {}",
+        output_path.display()
+    );
+}
+
 /// `/bin/true` only exists on FHS-compliant systems. Resolve it via PATH
 /// so the tests work regardless of distro.
 fn which_true() -> String {
@@ -158,6 +183,19 @@ fn which_true() -> String {
         }
     }
     "/bin/true".into()
+}
+
+fn which_sh() -> String {
+    for dir in std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
+        .unwrap_or_default()
+    {
+        let candidate = dir.join("sh");
+        if candidate.is_file() {
+            return candidate.to_string_lossy().into_owned();
+        }
+    }
+    "/bin/sh".into()
 }
 
 /// Tests don't exercise the model — they intercept the spawned
@@ -232,6 +270,124 @@ fn clear_env() {
 }
 
 #[tokio::test]
+async fn spawn_pod_launches_runtime_in_workspace_and_passes_tool_cwd() {
+    let _env = EnvGuard::acquire();
+
+    let allow_root = TempDir::new().unwrap();
+    let child_cwd = allow_root.path().join("child-cwd");
+    std::fs::create_dir(&child_cwd).unwrap();
+    let script = allow_root.path().join("record-pwd.sh");
+    let output_path = allow_root.path().join("pwd.txt");
+    let (_tmp, runtime_base, spawner_socket, spawner_rd) =
+        setup_spawner("root", allow_root.path()).await;
+
+    let (_predicted_socket, listener) = bind_mock_pod_socket(&runtime_base, "child-cwd").await;
+    let received = accept_one_method(listener);
+
+    let registry = SpawnedPodRegistry::new(spawner_rd);
+    let def = spawn_pod_tool_with_runtime_command(
+        "root".into(),
+        spawner_socket,
+        runtime_base,
+        allow_root.path().to_path_buf(),
+        allow_root.path().to_path_buf(),
+        registry,
+        None,
+        dummy_manifest(allow_root.path()),
+        shared_scope_for(allow_root.path()),
+        builtin_prompts(),
+        cwd_recording_runtime_command(&script, &output_path),
+    );
+    let (_meta, tool) = def();
+
+    let input = json!({
+        "name": "child-cwd",
+        "task": "hello",
+        "profile": "inherit",
+        "cwd": child_cwd.to_str().unwrap(),
+        "scope": [{
+            "target": allow_root.path().to_str().unwrap(),
+            "permission": "write"
+        }]
+    })
+    .to_string();
+
+    tool.execute(&input).await.unwrap();
+    assert!(matches!(received.await.unwrap(), Some(Method::Run { .. })));
+    let invocation = read_recorded_runtime_invocation(&output_path).await;
+    assert_eq!(invocation[0], allow_root.path().to_str().unwrap());
+    assert!(
+        invocation
+            .windows(2)
+            .any(|pair| pair[0] == "--workspace" && pair[1] == allow_root.path().to_str().unwrap()),
+        "invocation should carry inherited workspace root: {invocation:?}"
+    );
+    assert!(
+        invocation
+            .windows(2)
+            .any(|pair| pair[0] == "--tool-cwd" && pair[1] == child_cwd.to_str().unwrap()),
+        "invocation should carry tool cwd separately: {invocation:?}"
+    );
+
+    clear_env();
+}
+
+#[tokio::test]
+async fn spawn_pod_omitted_cwd_preserves_spawner_pwd() {
+    let _env = EnvGuard::acquire();
+
+    let allow_root = TempDir::new().unwrap();
+    let script = allow_root.path().join("record-pwd.sh");
+    let output_path = allow_root.path().join("pwd.txt");
+    let (_tmp, runtime_base, spawner_socket, spawner_rd) =
+        setup_spawner("root", allow_root.path()).await;
+
+    let (_predicted_socket, listener) =
+        bind_mock_pod_socket(&runtime_base, "child-default-cwd").await;
+    let received = accept_one_method(listener);
+
+    let registry = SpawnedPodRegistry::new(spawner_rd);
+    let def = spawn_pod_tool_with_runtime_command(
+        "root".into(),
+        spawner_socket,
+        runtime_base,
+        allow_root.path().to_path_buf(),
+        allow_root.path().to_path_buf(),
+        registry,
+        None,
+        dummy_manifest(allow_root.path()),
+        shared_scope_for(allow_root.path()),
+        builtin_prompts(),
+        cwd_recording_runtime_command(&script, &output_path),
+    );
+    let (_meta, tool) = def();
+
+    let input = json!({
+        "name": "child-default-cwd",
+        "task": "hello",
+        "profile": "inherit",
+        "scope": [{
+            "target": allow_root.path().to_str().unwrap(),
+            "permission": "write"
+        }]
+    })
+    .to_string();
+
+    tool.execute(&input).await.unwrap();
+    assert!(matches!(received.await.unwrap(), Some(Method::Run { .. })));
+    let invocation = read_recorded_runtime_invocation(&output_path).await;
+    assert_eq!(invocation[0], allow_root.path().to_str().unwrap());
+    assert!(
+        invocation
+            .windows(2)
+            .any(|pair| pair[0] == "--tool-cwd" && pair[1] == allow_root.path().to_str().unwrap()),
+        "omitted cwd should preserve spawner pwd as tool cwd: {invocation:?}"
+    );
+
+    clear_env();
+}
+
+#[tokio::test]
 async fn spawn_pod_delegates_scope_and_sends_run() {
     let _env = EnvGuard::acquire();
 
@@ -248,6 +404,7 @@ async fn spawn_pod_delegates_scope_and_sends_run() {
         "root".into(),
         spawner_socket.clone(),
         runtime_base.clone(),
+        allow_root.path().to_path_buf(),
         allow_root.path().to_path_buf(),
         registry,
         None,
@@ -341,6 +498,7 @@ async fn spawn_pod_requires_explicit_delegation_even_with_direct_scope() {
         spawner_socket,
         runtime_base,
         allow_root.path().to_path_buf(),
+        allow_root.path().to_path_buf(),
         registry,
         None,
         manifest,
@@ -407,6 +565,7 @@ async fn spawn_pod_rejects_child_non_recursive_scope_under_parent_non_recursive_
         spawner_socket,
         runtime_base,
         allow_root.path().to_path_buf(),
+        allow_root.path().to_path_buf(),
         registry,
         None,
         manifest,
@@ -457,6 +616,7 @@ async fn spawn_pod_rejects_scope_outside_spawner() {
         "root".into(),
         spawner_socket,
         runtime_base,
+        allow_root.path().to_path_buf(),
         allow_root.path().to_path_buf(),
         registry,
         None,
@@ -530,6 +690,7 @@ async fn spawn_pod_rolls_back_reservation_when_socket_never_appears() {
         "root".into(),
         spawner_socket,
         runtime_base,
+        allow_root.path().to_path_buf(),
         allow_root.path().to_path_buf(),
         registry,
         None,

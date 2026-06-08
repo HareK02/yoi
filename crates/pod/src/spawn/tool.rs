@@ -18,7 +18,7 @@ use manifest::{
     CompactionConfigPartial, DelegationScope, FileUploadLimitsPartial, Permission,
     PermissionConfigPartial, PodManifest, PodManifestConfig, PodMetaConfig, ProfileDiscovery,
     ProfileError, ProfileRegistry, ProfileRegistrySource, ProfileResolveOptions, ProfileResolver,
-    ProfileSelector, ScopeConfig, ScopeRule, SessionConfigPartial, SharedScope,
+    ProfileSelector, Scope, ScopeConfig, ScopeRule, SessionConfigPartial, SharedScope,
     ToolOutputLimitsPartial, WorkerManifestConfig,
 };
 use serde::Deserialize;
@@ -52,6 +52,11 @@ struct SpawnPodInput {
     /// Instruction-file reference (e.g. `$yoi/default`, `$user/my-agent`).
     #[serde(default)]
     instruction: Option<String>,
+    /// Child process/tool working directory. This is not the runtime workspace
+    /// root and grants no filesystem authority. When omitted, the spawned Pod
+    /// starts in the spawner's current working directory.
+    #[serde(default)]
+    cwd: Option<PathBuf>,
     /// First message sent to the spawned Pod via `Method::Run`.
     task: String,
     /// Allow rules delegated to the spawned Pod. Must be a subset of the
@@ -219,8 +224,11 @@ pub struct SpawnPodTool {
     /// Root of the `$XDG_RUNTIME_DIR/yoi/` tree, used to predict
     /// the spawned Pod's socket path before the child has bound it.
     runtime_base: PathBuf,
-    /// Directory the spawned Pod should run in when the LLM did not
-    /// override it. Defaults to the spawner's pwd — see module docs.
+    /// Inherited runtime workspace root for Profile/project/Ticket/workflow/
+    /// memory context. SpawnPod `cwd` must not affect this value.
+    workspace_root: PathBuf,
+    /// Directory the spawned Pod's tools should use when the LLM did not
+    /// override it. Defaults to the spawner's tool pwd.
     spawner_pwd: PathBuf,
     /// Optional typed runtime command injected by tests. Production resolves
     /// the runtime command from `std::env::current_exe()` at launch time.
@@ -261,6 +269,7 @@ impl SpawnPodTool {
         spawner_name: String,
         callback_socket: PathBuf,
         runtime_base: PathBuf,
+        workspace_root: PathBuf,
         spawner_pwd: PathBuf,
         registry: Arc<SpawnedPodRegistry>,
         parent_socket: Option<PathBuf>,
@@ -274,6 +283,7 @@ impl SpawnPodTool {
             spawner_name,
             callback_socket,
             runtime_base,
+            workspace_root,
             spawner_pwd,
             runtime_command,
             registry,
@@ -304,6 +314,7 @@ impl Tool for SpawnPodTool {
 
         let scope_allow = parse_scope(&input.scope)?;
         self.validate_delegation_scope(&scope_allow)?;
+        let child_cwd = validate_spawn_cwd(input.cwd.as_deref(), &scope_allow, &self.spawner_pwd)?;
 
         let spawn_selector =
             parse_spawn_profile_selector(input.profile.as_deref()).map_err(|msg| {
@@ -349,7 +360,12 @@ impl Tool for SpawnPodTool {
         // entry on exit.
 
         let start_outcome = self
-            .exec_child(&input.name, &spawn_config_json, &predicted_socket)
+            .exec_child(
+                &input.name,
+                &spawn_config_json,
+                &predicted_socket,
+                &child_cwd,
+            )
             .await;
         if let Err(e) = start_outcome {
             self.release_reservation(&lock_path, &input.name);
@@ -422,6 +438,7 @@ impl SpawnPodTool {
         pod_name: &str,
         spawn_config_json: &str,
         predicted_socket: &Path,
+        child_cwd: &Path,
     ) -> Result<(), ToolError> {
         let runtime_command = match &self.runtime_command {
             Some(command) => command.clone(),
@@ -458,7 +475,11 @@ impl SpawnPodTool {
             .arg(&self.callback_socket)
             .arg("--spawn-config-json")
             .arg(spawn_config_json)
-            .current_dir(&self.spawner_pwd)
+            .arg("--workspace")
+            .arg(&self.workspace_root)
+            .arg("--tool-cwd")
+            .arg(child_cwd)
+            .current_dir(&self.workspace_root)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::from(stderr_file))
@@ -531,14 +552,67 @@ fn parse_scope(rules: &[ScopeRuleInput]) -> Result<Vec<ScopeRule>, ToolError> {
         .collect()
 }
 
+fn validate_spawn_cwd(
+    cwd: Option<&Path>,
+    scope_allow: &[ScopeRule],
+    default_cwd: &Path,
+) -> Result<PathBuf, ToolError> {
+    let Some(cwd) = cwd else {
+        return Ok(default_cwd.to_path_buf());
+    };
+    if !cwd.is_absolute() {
+        return Err(ToolError::InvalidArgument(format!(
+            "SpawnPod.cwd must be absolute: {}",
+            cwd.display()
+        )));
+    }
+    let metadata = std::fs::metadata(cwd).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            ToolError::InvalidArgument(format!("SpawnPod.cwd does not exist: {}", cwd.display()))
+        } else {
+            ToolError::InvalidArgument(format!(
+                "SpawnPod.cwd is not usable: {}: {e}",
+                cwd.display()
+            ))
+        }
+    })?;
+    if !metadata.is_dir() {
+        return Err(ToolError::InvalidArgument(format!(
+            "SpawnPod.cwd must be a directory: {}",
+            cwd.display()
+        )));
+    }
+    let canonical = std::fs::canonicalize(cwd).map_err(|e| {
+        ToolError::InvalidArgument(format!(
+            "SpawnPod.cwd is not usable: {}: {e}",
+            cwd.display()
+        ))
+    })?;
+    let child_scope = Scope::from_config(&ScopeConfig {
+        allow: scope_allow.to_vec(),
+        deny: Vec::new(),
+    })
+    .map_err(|e| {
+        ToolError::InvalidArgument(format!(
+            "requested child scope cannot validate SpawnPod.cwd: {e}"
+        ))
+    })?;
+    if !child_scope.is_readable(&canonical) {
+        return Err(ToolError::InvalidArgument(format!(
+            "SpawnPod.cwd {} is outside the child's delegated readable scope; cwd grants no authority, so add an explicit read or write scope rule covering it",
+            cwd.display()
+        )));
+    }
+    Ok(canonical)
+}
+
 /// Serialise the internal manifest config that gets handed to the child
 /// Pod runtime process via the hidden `--spawn-config-json` flag.
 /// `PodManifestConfig`'s `Serialize` impl is the single source of truth for the
 /// internal handoff shape.
 ///
-/// The child's working directory is set separately via
-/// `Command::current_dir` (see [`SpawnPodTool::exec_child`]) — it is
-/// not part of the manifest.
+/// The child's tool working directory is carried separately through
+/// the child runtime entrypoint; it is not part of the manifest.
 impl SpawnPodTool {
     fn build_spawn_config_json(
         &self,
@@ -550,7 +624,7 @@ impl SpawnPodTool {
         build_spawn_config_json_for_profile(
             &self.spawner_manifest,
             &self.available_profiles,
-            &self.spawner_pwd,
+            &self.workspace_root,
             name,
             instruction_override,
             scope_allow,
@@ -562,7 +636,7 @@ impl SpawnPodTool {
 fn build_spawn_config_json_for_profile(
     spawner_manifest: &PodManifest,
     available_profiles: &AvailableProfiles,
-    spawner_pwd: &Path,
+    workspace_root: &Path,
     name: &str,
     instruction_override: Option<&str>,
     scope_allow: &[ScopeRule],
@@ -584,7 +658,7 @@ fn build_spawn_config_json_for_profile(
                 SpawnProfileSelector::Inherit => unreachable!(),
             };
             let resolved = ProfileResolver::new()
-                .with_workspace_base(spawner_pwd)
+                .with_workspace_base(workspace_root)
                 .resolve_from_registry(
                     &profile_selector,
                     registry,
@@ -801,6 +875,7 @@ pub fn spawn_pod_tool(
     spawner_name: String,
     callback_socket: PathBuf,
     runtime_base: PathBuf,
+    workspace_root: PathBuf,
     spawner_pwd: PathBuf,
     registry: Arc<SpawnedPodRegistry>,
     parent_socket: Option<PathBuf>,
@@ -812,6 +887,7 @@ pub fn spawn_pod_tool(
         spawner_name,
         callback_socket,
         runtime_base,
+        workspace_root,
         spawner_pwd,
         registry,
         parent_socket,
@@ -827,6 +903,7 @@ pub fn spawn_pod_tool_with_runtime_command(
     spawner_name: String,
     callback_socket: PathBuf,
     runtime_base: PathBuf,
+    workspace_root: PathBuf,
     spawner_pwd: PathBuf,
     registry: Arc<SpawnedPodRegistry>,
     parent_socket: Option<PathBuf>,
@@ -839,6 +916,7 @@ pub fn spawn_pod_tool_with_runtime_command(
         spawner_name,
         callback_socket,
         runtime_base,
+        workspace_root,
         spawner_pwd,
         registry,
         parent_socket,
@@ -853,6 +931,7 @@ fn spawn_pod_tool_impl(
     spawner_name: String,
     callback_socket: PathBuf,
     runtime_base: PathBuf,
+    workspace_root: PathBuf,
     spawner_pwd: PathBuf,
     registry: Arc<SpawnedPodRegistry>,
     parent_socket: Option<PathBuf>,
@@ -864,7 +943,7 @@ fn spawn_pod_tool_impl(
     Arc::new(move || {
         let schema = schemars::schema_for!(SpawnPodInput);
         let schema_value = serde_json::to_value(schema).unwrap_or(serde_json::json!({}));
-        let available_profiles = AvailableProfiles::discover(&spawner_pwd);
+        let available_profiles = AvailableProfiles::discover(&workspace_root);
         let description = prompts
             .spawn_pod_tool_description(
                 &available_profiles.compact_list(),
@@ -884,6 +963,7 @@ fn spawn_pod_tool_impl(
             spawner_name.clone(),
             callback_socket.clone(),
             runtime_base.clone(),
+            workspace_root.clone(),
             spawner_pwd.clone(),
             registry.clone(),
             parent_socket.clone(),
@@ -909,6 +989,63 @@ mod tests {
             target: path.to_path_buf(),
             permission,
             recursive: true,
+        }
+    }
+
+    #[test]
+    fn spawn_pod_input_schema_includes_optional_cwd() {
+        let schema = serde_json::to_value(schemars::schema_for!(SpawnPodInput)).unwrap();
+        let properties = schema
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .expect("schema properties");
+        assert!(properties.contains_key("cwd"), "schema: {schema}");
+        let required = schema
+            .get("required")
+            .and_then(serde_json::Value::as_array)
+            .expect("schema required list");
+        assert!(
+            !required.iter().any(|value| value.as_str() == Some("cwd")),
+            "cwd must remain optional: {schema}"
+        );
+    }
+
+    #[test]
+    fn spawn_pod_validate_cwd_requires_absolute_existing_directory_in_child_scope() {
+        let root = TempDir::new().unwrap();
+        let child_cwd = root.path().join("child");
+        std::fs::create_dir(&child_cwd).unwrap();
+        let file_path = root.path().join("file.txt");
+        std::fs::write(&file_path, "not a dir").unwrap();
+        let outside = TempDir::new().unwrap();
+        let missing = root.path().join("missing");
+        let rules = vec![abs_rule(root.path(), Permission::Write)];
+
+        assert_eq!(
+            validate_spawn_cwd(None, &rules, root.path()).unwrap(),
+            root.path()
+        );
+        assert_eq!(
+            validate_spawn_cwd(Some(&child_cwd), &rules, root.path()).unwrap(),
+            std::fs::canonicalize(&child_cwd).unwrap()
+        );
+
+        for (cwd, expected) in [
+            (Path::new("relative"), "must be absolute"),
+            (missing.as_path(), "does not exist"),
+            (file_path.as_path(), "must be a directory"),
+            (
+                outside.path(),
+                "outside the child's delegated readable scope",
+            ),
+        ] {
+            let err = validate_spawn_cwd(Some(cwd), &rules, root.path()).unwrap_err();
+            match err {
+                ToolError::InvalidArgument(message) => {
+                    assert!(message.contains(expected), "{message}")
+                }
+                other => panic!("expected InvalidArgument, got {other:?}"),
+            }
         }
     }
 

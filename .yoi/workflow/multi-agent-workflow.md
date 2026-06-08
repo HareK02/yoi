@@ -119,7 +119,7 @@ reviewer には coder の実装方針ではなく、この intent packet と dif
      - child worktree path / branch
      - 対象 ticket path
      - intent packet
-     - Bash は必ず child worktree に `cd` すること
+     - SpawnPod の `cwd` は child worktree に設定すること（`cwd` は process/tool default cwd であり、scope/authority ではない）
      - main workspace の `TODO.md` / `tickets/` / `docs/report/` / `.yoi` は編集しないこと
      - child worktree 内の tracked `.yoi` project records は実装対象に必要な branch-local artifacts/dossiers として編集してよいが、`.yoi/memory` や local/runtime/secret-like files は作らないこと
      - active orchestration progress と最終 review/approval/close は main workspace の責任として残すこと

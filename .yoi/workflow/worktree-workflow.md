@@ -116,7 +116,7 @@ fi
 
 ## Pod へ渡す scope
 
-Pod を使う場合、Pod の cwd は main workspace のままになる。必ず作業対象が child worktree であることを明示し、Bash 実行時は毎回 `cd <repo>/.worktree/<task-name> && ...` させる。
+Pod を使う場合、coder Pod の SpawnPod `cwd` は child worktree に設定する。`cwd` は child process/tool default cwd だけを変え、runtime workspace root・project record root・scope/authority は変えないため、下の明示 scope は別途渡す。
 
 coder Pod 推奨 scope:
 
