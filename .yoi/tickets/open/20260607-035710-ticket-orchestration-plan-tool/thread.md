@@ -66,3 +66,42 @@ This Ticket should assume that planning-lane behavior exists before the Orchestr
 Do not add a Plan-tool-specific `preflight_needed` state or requirement here. At most, the tool may observe the resulting planning/queued/inprogress Ticket states produced by the workflow model.
 
 ---
+
+<!-- event: state_changed author: workspace-panel at: 2026-06-08T11:21:13Z from: ready to: queued reason: queued field: workflow_state -->
+
+## State changed
+
+Ticket を `workspace-panel` が queued にしました。
+
+
+---
+
+<!-- event: decision author: orchestrator at: 2026-06-08T11:21:42Z -->
+
+## Decision
+
+Routing decision: blocked_action_required
+
+Reason:
+- The dependency recorded in this Ticket is now satisfied: `replace-intake-state-with-planning` has been merged and closed, so the planning/queued/inprogress workflow model is available.
+- However, this live Orchestrator cannot currently delegate implementation work because it was started before/without an explicit `delegation_scope` grant after the direct/delegation authority split.
+- A previous attempted coder spawn for `remove-fixed-investigator-ticket-role` failed with: `SpawnPod requires delegation authority, but this Pod has no delegation scope grant; direct filesystem scope only authorizes this Pod's own tools`.
+- This Ticket introduces a new durable Ticket-domain tool/API/storage surface and should use the sibling coder/reviewer workflow, not direct ad-hoc implementation from this restricted Orchestrator.
+
+Evidence checked:
+- Ticket body and thread, including the dependency ordering note requiring `replace-intake-state-with-planning` first.
+- Current workspace state and worktrees.
+- Visible Pods / delegation state from the prior SpawnPod failure in this same live Orchestrator.
+
+Next action:
+- Relaunch/restore an Orchestrator with explicit delegation authority for this workspace, then route this queued Ticket again.
+- Once delegation authority is available, this Ticket can be classified as implementation-ready or planning-sync-ready against the now-merged planning workflow model.
+
+State decision:
+- Leave this Ticket `queued` for now.
+- Do not transition `queued -> inprogress`, create a worktree, or spawn coder/reviewer Pods from this restricted Orchestrator.
+
+Escalate if:
+- The intended implementation should be done directly by the current Orchestrator despite missing delegation authority; that would bypass the sibling coder/reviewer workflow and needs explicit instruction.
+
+---
