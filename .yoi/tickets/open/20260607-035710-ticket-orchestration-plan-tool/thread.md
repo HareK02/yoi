@@ -208,3 +208,26 @@ Spawned sibling Coder Pod:
 The previously queued schema cleanup dependency is complete and closed, so this Ticket is now the active queued-route implementation.
 
 ---
+
+<!-- event: implementation_report author: coder at: 2026-06-08T13:15:33Z -->
+
+## Implementation report
+
+Coder implementation completed for lightweight Ticket orchestration plan tools.
+
+Storage/tool design:
+- Added typed JSONL artifact storage at `artifacts/orchestration-plan.jsonl` per Ticket.
+- Added append/query backend API and LLM tools `TicketOrchestrationPlanRecord` / `TicketOrchestrationPlanQuery`.
+- Query is read-only and works by Ticket id/slug and/or relation kind; record creation is in the mutating Ticket capability set.
+- Plan records do not mutate `workflow_state`, reorder queues, start work, or store local runtime/socket/session details.
+
+Validation completed:
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo run -q -p yoi -- ticket doctor`
+- `cargo check --workspace`
+- `cargo test -p ticket`
+- `cargo test -p pod feature::builtin::ticket`
+- `nix build .#yoi`
+
+---
