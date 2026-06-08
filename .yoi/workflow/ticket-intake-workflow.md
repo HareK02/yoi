@@ -38,8 +38,9 @@ Intake は以下を行う。
 - 必要に応じて関連 docs / code / workflow / history を読む。
 - 不足している要件を質問する。
 - Ticket の title / slug / kind / priority / labels を提案する。
-- background / requirements / acceptance criteria / non-goals / escalation conditions を整理する。
+- background / requirements / acceptance criteria / escalation conditions を整理する。
 - binding decisions / invariants と implementation latitude を分けて書く。
+- 具体的な除外や触れてはいけない境界が binding decision である場合は、generic な除外リストではなく invariant / escalation condition として明記する。
 - readiness / needs_preflight / risk flags を明示する。
 - ユーザー合意後に Ticket を作成する。
 - 既存 Ticket の refinement を求められた場合は、TicketComment で経緯を残す。
@@ -103,7 +104,7 @@ Ticket tools が利用できない環境では、勝手に file write で代替�
 - observable な完了条件は何か。
 - Ticket の種類は何か: feature / bug / cleanup / design / spike / workflow / docs / release / orchestration。
 - 受け入れ条件は何か。
-- やらないことは何か。
+- binding decision として残す具体的な除外・authority boundary はあるか。
 - 後方互換が必要か。
 - authority boundary / scope / permission / history / prompt context に触れるか。
 - validation は何で確認できるか。
@@ -117,7 +118,7 @@ Ticket 作成または更新前に、readiness を明示する。
 
 ```text
 implementation_ready:
-- 意図・制約・受け入れ条件・non-goals / invariants が明確。
+- 意図・受け入れ条件・binding decisions / invariants / implementation latitude が明確。
 - Reviewer が判断できる基準と escalation conditions が明確。
 - 実装調査や局所的な tactic 選択は残っていてよいが、product / API / UX / authority boundary / explicit design constraint を coder が silently 決める余地はない。
 - validation が書ける。
@@ -178,7 +179,9 @@ Requirements:
 
 Acceptance criteria:
 
-Non-goals:
+Binding decisions / invariants:
+
+Implementation latitude:
 
 Escalation conditions:
 
@@ -236,8 +239,6 @@ Intake はここで止まる。implementation / worktree / coder / reviewer 起�
 ## Binding decisions / invariants
 
 ## Implementation latitude
-
-## Non-goals / constraints
 
 ## Readiness
 

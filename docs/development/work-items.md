@@ -142,7 +142,7 @@ Intake should:
 
 - clarify user intent;
 - check duplicate/related Tickets;
-- draft background, requirements, acceptance criteria, non-goals, readiness, risk flags, and validation;
+- draft background, requirements, acceptance criteria, binding decisions/invariants, implementation latitude, readiness, risk flags, and validation;
 - create or update the Ticket only after user agreement.
 
 Intake should not schedule implementation, spawn coder/reviewer Pods, create worktrees, merge, or close Tickets.
@@ -173,7 +173,7 @@ Preflight should resolve or record:
 
 - requirements and acceptance criteria;
 - current code map;
-- invariants and non-goals;
+- binding decisions/invariants and implementation latitude;
 - critical risks and failure modes;
 - implementation-ready vs requirements-sync/spike/blocked classification.
 
@@ -187,8 +187,8 @@ The Orchestrator should prepare an `IntentPacket` with:
 
 - intent;
 - requirements;
-- invariants;
-- non-goals;
+- binding decisions/invariants;
+- implementation latitude;
 - escalation conditions;
 - validation;
 - current code map;
@@ -316,7 +316,7 @@ A useful Ticket states:
 - background and motivation;
 - requirements;
 - acceptance criteria;
-- relevant constraints and non-goals;
+- relevant binding decisions/invariants, implementation latitude, and escalation conditions;
 - readiness / preflight needs / risk flags when relevant;
 - implementation reports when work is submitted;
 - reviews;

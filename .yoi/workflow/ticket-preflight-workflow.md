@@ -8,7 +8,7 @@ requires: []
 
 yoi プロジェクトで ticket を実装に渡す前に、要件・前提・設計境界・反証観点を同期するための Workflow。これは **実装前の gate** であり、worktree 作成や coder / reviewer Pod の起動は `multi-agent-workflow` / `worktree-workflow` 側で扱う。
 
-目的は「ticket があるから実装する」状態を避け、ticket が **実装可能な intent / constraints / acceptance criteria** を持つのか、**調査 ticket** なのか、**人間との仕様同期が必要な未決定 ticket** なのかを明確にすることである。実装 tactic をすべて事前固定する必要はないが、product / API / UX / authority boundary / explicit design constraint を coder が silently 決める余地は残さない。
+目的は「ticket があるから実装する」状態を避け、ticket が **実装可能な intent / binding decisions / invariants / implementation latitude / acceptance criteria / escalation conditions** を持つのか、**調査 ticket** なのか、**人間との仕様同期が必要な未決定 ticket** なのかを明確にすることである。実装 tactic をすべて事前固定する必要はないが、product / API / UX / authority boundary / explicit design constraint を coder が silently 決める余地は残さない。
 
 ## 適用する場面
 
@@ -52,7 +52,7 @@ yoi プロジェクトで ticket を実装に渡す前に、要件・前提・�
 
 ```text
 implementation-ready:
-- intent / constraints / acceptance criteria / reviewer judgment basis が明確。
+- intent / binding decisions / invariants / implementation latitude / acceptance criteria / reviewer judgment basis が明確。
 - binding decisions / invariants と implementation latitude が区別されている。
 - bounded implementation investigation や local tactic 選択は残っていてよい。
 - product / API / UX / authority boundary / explicit design constraint を coder が silently 決める余地がない。
@@ -77,7 +77,7 @@ blocked-needs-human-decision:
 - 完了時に observable に何が変わるか。
 - ticket の主語は何か: user-facing behavior / internal architecture / cleanup / investigation。
 - 用語が既存設計と一致しているか。
-- 何をやらないか。
+- binding decision として残す具体的な除外・authority boundary は何か。
 - 後方互換が必要か、不要な互換層を作ろうとしていないか。
 - 既存の authority boundary を変えるか。
 - runtime state / persisted state / config / profile / manifest / session log / pod metadata のどれが authority か。
@@ -122,15 +122,13 @@ Intent:
 
 Binding decisions / invariants:
 - 人間/Orchestrator/Ticket に記録済みで coder / reviewer が従うべき decision と、壊してはいけない authority boundary / design boundary。
+- 具体的な除外・触れてはいけない場所が binding decision である場合はここに書く。
 
 Requirements / acceptance criteria:
 - observable な完了条件と reviewer が判断できる基準。
 
 Implementation latitude:
 - Coder が調査しながら選んでよい local tactic / file-local organization / bounded uncertainty。
-
-Non-goals / constraints:
-- 今回やらないこと、触ってはいけない場所。
 
 Escalate if:
 - 親/人間に戻す判断条件。特に product / API / UX / authority boundary / explicit design constraint を変える必要が出た場合。
@@ -142,14 +140,14 @@ Current code map:
 - 実装対象と触ってはいけない場所。
 
 Critical risks / reviewer focus:
-- reviewer にも見てほしい失敗パターン。reviewer は recorded intent / constraints / acceptance criteria / explicit decisions に照らして判断し、不記録の preferred tactic を基準にしない。
+- reviewer にも見てほしい失敗パターン。reviewer は recorded intent / binding decisions / invariants / implementation latitude / acceptance criteria / explicit escalation conditions に照らして判断し、不記録の preferred tactic を基準にしない。
 ```
 
 この intent packet が短く書けない場合は、実装委譲せず requirements-sync-needed とする。
 
 ## review への引き継ぎ
 
-preflight で出た critical risks は reviewer Pod にも渡す。reviewer は diff だけでなく、ticket の recorded intent / constraints / acceptance criteria / explicit decisions と preflight の反証観点を読む。reviewer は不記録の preferred tactic ではなく、記録済みの意図・制約・受け入れ条件・binding decisions に対して実装が十分かを判断する。
+preflight で出た critical risks は reviewer Pod にも渡す。reviewer は diff だけでなく、ticket の recorded intent / binding decisions / invariants / implementation latitude / acceptance criteria / explicit escalation conditions と preflight の反証観点を読む。reviewer は不記録の preferred tactic ではなく、記録済みの intent / binding decisions / invariants / implementation latitude / acceptance criteria に対して実装が十分かを判断する。
 
 reviewer に期待すること:
 
