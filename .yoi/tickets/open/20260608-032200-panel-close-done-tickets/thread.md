@@ -137,3 +137,44 @@ Stop/completion policy:
 - Because the human authorized cleanup after completion, this Orchestrator will proceed through reviewer approval, merge-completion validation, Ticket close, Pod stop, worktree removal, and branch deletion if the branch is approved and merge authority remains clear.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-08T06:03:26Z -->
+
+## Implementation report
+
+Coder completed and reviewer delegated.
+
+Coder result:
+- Pod: `coder-panel-close-done`
+- Commit: `6d41ed3 tui: close done tickets from panel`
+- Worktree status: clean after commit.
+- Diff against `develop`: 1 file changed, 207 insertions, 77 deletions.
+
+Files touched by coder:
+- `crates/tui/src/multi_pod.rs`
+
+Coder reported implementation:
+- Added Panel Close dispatch using `LocalTicketBackend::close` for safe open/done Tickets only.
+- Safe conditions checked: open status, `workflow_state == done`, empty/unset `attention_required`, empty/unset `action_required`, and no existing `resolution.md`.
+- Generated deterministic resolution text noting that the Ticket had already reached `workflow_state: done`, and that the close action did not start implementation/workflow-state changes or launch Orchestrator/Companion/workers.
+- Unsafe close attempts do not mutate and return bounded diagnostics.
+- Added focused tests for success, generated resolution content, non-done blocking, `action_required` blocking, `attention_required` blocking, and existing resolution blocking.
+
+Coder reported validation:
+- `cargo test -p tui multi_pod --lib`
+- `cargo test -p tui workspace_panel --lib`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo run -q -p yoi -- ticket doctor`
+- `nix build .#yoi`
+
+Reviewer delegation:
+- Spawned sibling reviewer Pod: `reviewer-panel-close-done`.
+- Reviewer scope: read-only child worktree plus non-recursive parent-root read required by launch cwd validation.
+- Reviewer was instructed to judge against the recorded Ticket requirements and binding decisions.
+
+Pending:
+- Await reviewer verdict before merge-ready dossier / merge-completion.
+- No merge, close, final approval, or cleanup has occurred for this Ticket.
+
+---

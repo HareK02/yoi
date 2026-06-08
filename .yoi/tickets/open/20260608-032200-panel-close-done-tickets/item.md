@@ -8,7 +8,7 @@ priority: 'P2'
 labels: ['tui', 'panel', 'ticket', 'close', 'workflow-state']
 workflow_state: 'inprogress'
 created_at: '2026-06-08T03:22:00Z'
-updated_at: '2026-06-08T05:50:36Z'
+updated_at: '2026-06-08T06:03:26Z'
 assignee: null
 legacy_ticket: null
 queued_by: 'workspace-panel'

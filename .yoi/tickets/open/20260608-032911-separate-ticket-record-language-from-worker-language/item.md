@@ -6,11 +6,13 @@ status: 'open'
 kind: 'task'
 priority: 'P2'
 labels: ['ticket', 'language', 'config', 'profile', 'workflow']
-workflow_state: 'intake'
+workflow_state: 'queued'
 created_at: '2026-06-08T03:29:11Z'
-updated_at: '2026-06-08T03:29:11Z'
+updated_at: '2026-06-08T06:03:40Z'
 assignee: null
 legacy_ticket: null
+queued_by: 'workspace-panel'
+queued_at: '2026-06-08T05:51:29Z'
 ---
 
 ## Background
