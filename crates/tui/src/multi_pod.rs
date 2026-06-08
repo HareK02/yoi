@@ -1958,7 +1958,8 @@ async fn dispatch_ticket_action(
     }
     let config = TicketConfig::load_workspace(&request.workspace_root)
         .map_err(|error| TicketActionError::BackendConfig(error.to_string()))?;
-    let backend = LocalTicketBackend::new(config.backend_root());
+    let backend = LocalTicketBackend::new(config.backend_root())
+        .with_record_language(config.ticket_record_language());
     if request.action == NextUserAction::Close {
         return dispatch_panel_close(&backend, &request.ticket_id);
     }
@@ -2067,7 +2068,7 @@ fn dispatch_panel_close(
         return Err(TicketActionError::Stale(blocker));
     }
 
-    let resolution = panel_close_resolution(&ticket);
+    let resolution = panel_close_resolution(&ticket, backend.record_language());
     backend
         .close(TicketIdOrSlug::Id(ticket_id.to_owned()), resolution)
         .map_err(|error| TicketActionError::Ticket(error.to_string()))?;
@@ -2118,11 +2119,32 @@ fn non_empty_ticket_field(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
 }
 
-fn panel_close_resolution(ticket: &ticket::Ticket) -> ticket::MarkdownText {
-    ticket::MarkdownText::new(format!(
-        "Closed from the workspace Panel because Ticket `{}` (`{}`) had already reached `workflow_state: done`.\n\nNo implementation work, workflow-state change, Orchestrator/Companion launch, or worker invocation was started by this Close action.\n",
-        ticket.meta.slug, ticket.meta.id
-    ))
+fn panel_close_resolution(
+    ticket: &ticket::Ticket,
+    record_language: Option<&str>,
+) -> ticket::MarkdownText {
+    if is_japanese_ticket_record_language(record_language) {
+        ticket::MarkdownText::new(format!(
+            "Ticket `{}` (`{}`) はすでに `workflow_state: done` に到達していたため、workspace Panel から close しました。\n\nこの Close action によって、実装作業、workflow-state 変更、Orchestrator/Companion launch、worker invocation は開始されていません。\n",
+            ticket.meta.slug, ticket.meta.id
+        ))
+    } else {
+        ticket::MarkdownText::new(format!(
+            "Closed from the workspace Panel because Ticket `{}` (`{}`) had already reached `workflow_state: done`.\n\nNo implementation work, workflow-state change, Orchestrator/Companion launch, or worker invocation was started by this Close action.\n",
+            ticket.meta.slug, ticket.meta.id
+        ))
+    }
+}
+
+fn is_japanese_ticket_record_language(language: Option<&str>) -> bool {
+    let Some(language) = language else {
+        return false;
+    };
+    let language = language.trim();
+    language.eq_ignore_ascii_case("japanese")
+        || language.eq_ignore_ascii_case("ja")
+        || language.eq_ignore_ascii_case("ja-JP")
+        || language.contains("日本語")
 }
 
 fn append_panel_decision(

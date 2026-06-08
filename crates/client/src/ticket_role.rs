@@ -107,6 +107,7 @@ pub struct TicketRoleLaunchContext {
     pub ticket: Option<TicketRef>,
     pub user_instruction: Option<String>,
     pub intake_handoff: Option<TicketIntakeHandoff>,
+    pub ticket_record_language: Option<String>,
     pub intent_packet: Option<String>,
     pub worktree_path: Option<PathBuf>,
     pub branch: Option<String>,
@@ -123,6 +124,7 @@ impl TicketRoleLaunchContext {
             ticket: None,
             user_instruction: None,
             intake_handoff: None,
+            ticket_record_language: None,
             intent_packet: None,
             worktree_path: None,
             branch: None,
@@ -247,9 +249,12 @@ pub fn plan_ticket_role_launch(
 
 /// Construct a launch plan from an already-loaded Ticket config.
 pub fn plan_ticket_role_launch_with_config(
-    context: TicketRoleLaunchContext,
+    mut context: TicketRoleLaunchContext,
     config: &TicketConfig,
 ) -> Result<TicketRoleLaunchPlan, TicketRoleLaunchError> {
+    if context.ticket_record_language.is_none() {
+        context.ticket_record_language = config.ticket_record_language().map(str::to_string);
+    }
     let role_config = config.role_launch_config(context.role)?;
     let profile = role_config.profile.as_str().to_string();
     let workflow = role_config.workflow.as_str().to_string();
@@ -487,6 +492,14 @@ fn build_launch_prompt(
             prompt_ref,
         ),
         None => out.push_str("Configured launch_prompt ref: none\n"),
+    }
+    out.push('\n');
+    match non_empty(context.ticket_record_language.as_deref()) {
+        Some(language) => {
+            push_bounded_field(&mut out, "Ticket record language", language);
+            out.push_str("Ticket record language guidance: write durable Ticket item/thread/resolution text and Ticket tool bodies in this language. This does not change normal worker response language or memory/Knowledge generation language. Do not translate protocol literals, file paths, commands, logs, identifiers, or quoted external text solely because this language is configured.\n");
+        }
+        None => out.push_str("Ticket record language: not configured; preserve existing/default Ticket record language behavior.\n"),
     }
     out.push('\n');
 
@@ -934,6 +947,31 @@ profile = "project:no-such-ticket-role-profile"
 
         assert_eq!(plan.role, TicketRole::Intake);
         assert_eq!(plan.profile, "builtin:default");
+    }
+
+    #[test]
+    fn configured_ticket_record_language_is_included_in_role_prompt() {
+        let temp = TempDir::new().unwrap();
+        write_config(
+            temp.path(),
+            r#"
+[ticket]
+language = "Japanese"
+
+[roles.intake]
+profile = "builtin:default"
+"#,
+        );
+        let context = TicketRoleLaunchContext::new(temp.path(), TicketRole::Intake);
+
+        let plan = plan_ticket_role_launch(context).unwrap();
+        let text = text_segment(&plan);
+
+        assert!(text.contains("Ticket record language: Japanese"));
+        assert!(text.contains("write durable Ticket item/thread/resolution text"));
+        assert!(text.contains("does not change normal worker response language"));
+        assert!(text.contains("memory/Knowledge generation language"));
+        assert!(text.contains("Do not translate protocol literals"));
     }
 
     #[test]

@@ -2,6 +2,9 @@
 provider = "builtin:yoi_local"
 root = ".yoi/tickets"
 
+[ticket]
+language = "Japanese"
+
 [roles.intake]
 profile = "project:intake"
 workflow = "ticket-intake-workflow"

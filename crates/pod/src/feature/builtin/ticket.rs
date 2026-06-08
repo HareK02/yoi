@@ -43,6 +43,7 @@ impl TicketFeatureAccess {
 #[derive(Clone, Debug)]
 pub struct TicketFeature {
     backend_root: PathBuf,
+    record_language: Option<String>,
     config_error: Option<String>,
     access: TicketFeatureAccess,
 }
@@ -55,6 +56,7 @@ impl TicketFeature {
     pub fn new_with_access(backend_root: impl Into<PathBuf>, access: TicketFeatureAccess) -> Self {
         Self {
             backend_root: backend_root.into(),
+            record_language: None,
             config_error: None,
             access,
         }
@@ -70,9 +72,16 @@ impl TicketFeature {
     ) -> Self {
         let workspace = workspace.as_ref();
         match TicketConfig::load_workspace(workspace) {
-            Ok(config) => Self::new_with_access(config.backend_root().to_path_buf(), access),
+            Ok(config) => {
+                let backend_root = config.backend_root().to_path_buf();
+                let record_language = config.ticket_record_language().map(str::to_string);
+                let mut feature = Self::new_with_access(backend_root, access);
+                feature.record_language = record_language;
+                feature
+            }
             Err(error) => Self {
                 backend_root: workspace.join(DEFAULT_TICKET_BACKEND_RELATIVE_PATH),
+                record_language: None,
                 config_error: Some(error.to_string()),
                 access,
             },
@@ -149,7 +158,8 @@ impl FeatureModule for TicketFeature {
             }
         };
         let authority = self.authority();
-        let backend = LocalTicketBackend::new(usable_root);
+        let backend = LocalTicketBackend::new(usable_root)
+            .with_record_language(self.record_language.as_deref());
         let allowed_tool_names = self.access.tool_names();
         let mut tools = context.tools();
         for definition in ticket_tools(backend) {

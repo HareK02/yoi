@@ -583,10 +583,8 @@ impl Tool for TicketIntakeReadyTool {
         let from = TicketWorkflowState::Intake;
         let reason = params.reason.unwrap_or_else(|| "intake_ready".to_string());
         let body = params.state_change_body.unwrap_or_else(|| {
-            format!(
-                "Ticket intake complete; workflow_state {} -> ready.\n",
-                from.as_str()
-            )
+            self.backend
+                .default_intake_ready_state_change_body(from.as_str())
         });
         let mut summary = TicketIntakeSummary::new(params.intake_summary);
         summary.author = params.author.clone();
