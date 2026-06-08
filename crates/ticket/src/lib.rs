@@ -38,6 +38,26 @@ const REQUIRED_FIELDS: [&str; 11] = [
 ];
 const MAX_STATE_CHANGE_REASON_BYTES: usize = 1024;
 const MAX_INTAKE_SUMMARY_BODY_BYTES: usize = 16 * 1024;
+const DEFAULT_TICKET_BODY: &str =
+    "## Background\n\nCreated by LocalTicketBackend.\n\n## Acceptance criteria\n\n- TBD\n";
+const JAPANESE_TICKET_BODY: &str =
+    "## 背景\n\nLocalTicketBackend によって作成されました。\n\n## 受け入れ条件\n\n- 未定\n";
+
+fn normalized_record_language(language: &str) -> Option<String> {
+    let language = language.trim();
+    (!language.is_empty()).then(|| language.to_string())
+}
+
+fn is_japanese_record_language(language: Option<&str>) -> bool {
+    let Some(language) = language else {
+        return false;
+    };
+    let language = language.trim();
+    language.eq_ignore_ascii_case("japanese")
+        || language.eq_ignore_ascii_case("ja")
+        || language.eq_ignore_ascii_case("ja-JP")
+        || language.contains("日本語")
+}
 
 pub type Result<T> = std::result::Result<T, TicketError>;
 
@@ -492,9 +512,7 @@ impl NewTicket {
             kind: "task".to_string(),
             priority: "P2".to_string(),
             labels: Vec::new(),
-            body: MarkdownText::new(
-                "## Background\n\nCreated by LocalTicketBackend.\n\n## Acceptance criteria\n\n- TBD\n",
-            ),
+            body: MarkdownText::new(DEFAULT_TICKET_BODY),
             author: None,
             assignee: None,
             legacy_ticket: None,
@@ -693,15 +711,84 @@ pub trait TicketBackend {
 #[derive(Debug, Clone)]
 pub struct LocalTicketBackend {
     root: PathBuf,
+    record_language: Option<String>,
 }
 
 impl LocalTicketBackend {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            record_language: None,
+        }
+    }
+
+    pub fn with_record_language(mut self, language: Option<&str>) -> Self {
+        self.record_language = language.and_then(normalized_record_language);
+        self
+    }
+
+    pub fn record_language(&self) -> Option<&str> {
+        self.record_language.as_deref()
     }
 
     pub fn root(&self) -> &Path {
         self.root.as_path()
+    }
+
+    pub fn default_intake_ready_state_change_body(&self, from: &str) -> String {
+        if is_japanese_record_language(self.record_language()) {
+            format!("Ticket intake が完了しました。workflow_state {from} -> ready。\n")
+        } else {
+            format!("Ticket intake complete; workflow_state {from} -> ready.\n")
+        }
+    }
+
+    fn generated_heading(&self, default: &'static str, japanese: &'static str) -> &'static str {
+        if is_japanese_record_language(self.record_language()) {
+            japanese
+        } else {
+            default
+        }
+    }
+
+    fn generated_default_body(&self) -> &'static str {
+        if is_japanese_record_language(self.record_language()) {
+            JAPANESE_TICKET_BODY
+        } else {
+            DEFAULT_TICKET_BODY
+        }
+    }
+
+    fn created_event_body(&self) -> &'static str {
+        if is_japanese_record_language(self.record_language()) {
+            "LocalTicketBackend によって作成されました。"
+        } else {
+            "Created by LocalTicketBackend create."
+        }
+    }
+
+    fn queued_ready_body(&self, queued_by: &str) -> String {
+        if is_japanese_record_language(self.record_language()) {
+            format!("Ticket を `{queued_by}` が queued にしました。\n")
+        } else {
+            "Ticket queued for Orchestrator routing.\n".to_string()
+        }
+    }
+
+    fn status_changed_body(&self, status: TicketStatus) -> String {
+        if is_japanese_record_language(self.record_language()) {
+            format!("Ticket status を `{}` に変更しました。\n", status.as_str())
+        } else {
+            format!("Status changed to `{}`.\n", status.as_str())
+        }
+    }
+
+    fn closed_workflow_state_body(&self) -> &'static str {
+        if is_japanese_record_language(self.record_language()) {
+            "Ticket closed; workflow_state を done に設定しました。\n"
+        } else {
+            "Ticket closed; workflow_state set to done.\n"
+        }
     }
 
     fn ensure_backend_dirs(&self) -> Result<()> {
@@ -1099,10 +1186,17 @@ impl TicketBackend for LocalTicketBackend {
                 format_yaml_string_scalar(queued_at.as_str()),
             ));
         }
-        let item = serialize_item(&fields, input.body.as_str());
+        let item_body = if input.body.as_str() == DEFAULT_TICKET_BODY {
+            self.generated_default_body()
+        } else {
+            input.body.as_str()
+        };
+        let item = serialize_item(&fields, item_body);
         atomic_write(&dir.join("item.md"), item.as_bytes())?;
         let thread = format!(
-            "{create_comment}\n\n## Created\n\nCreated by LocalTicketBackend create.\n\n---\n"
+            "{create_comment}\n\n## {}\n\n{}\n\n---\n",
+            self.generated_heading("Created", "作成"),
+            self.created_event_body()
         );
         atomic_write(&dir.join("thread.md"), thread.as_bytes())?;
         Ok(TicketRef {
@@ -1243,7 +1337,7 @@ impl TicketBackend for LocalTicketBackend {
             TicketWorkflowState::Ready.as_str(),
             TicketWorkflowState::Queued.as_str(),
             "queued",
-            "Ticket queued for Orchestrator routing.\n",
+            self.queued_ready_body(queued_by),
         );
         change.author = Some(queued_by.to_string());
         self.apply_workflow_state_change(
@@ -1294,11 +1388,11 @@ impl TicketBackend for LocalTicketBackend {
         }
         self.set_frontmatter_fields(&new_dir.join("item.md"), &[("status", status.as_str())])?;
         let author = default_author();
-        let body = MarkdownText::new(format!("Status changed to `{}`.\n", status.as_str()));
+        let body = MarkdownText::new(self.status_changed_body(status));
         self.append_thread_event(
             &new_dir,
             "status_changed",
-            "Status changed",
+            self.generated_heading("Status changed", "ステータス変更"),
             &author,
             Some(status.as_str()),
             &[],
@@ -1336,7 +1430,7 @@ impl TicketBackend for LocalTicketBackend {
                 current_workflow_state.as_str(),
                 TicketWorkflowState::Done.as_str(),
                 "closed",
-                "Ticket closed; workflow_state set to done.\n",
+                self.closed_workflow_state_body(),
             );
             change.author = Some(default_author());
             self.append_state_changed_event(&closed_dir, &change, Some("workflow_state"))?;
@@ -1357,7 +1451,7 @@ impl TicketBackend for LocalTicketBackend {
         self.append_thread_event(
             &closed_dir,
             "close",
-            "Closed",
+            self.generated_heading("Closed", "完了"),
             &author,
             Some("closed"),
             &[],
@@ -2491,6 +2585,26 @@ workflow_state: intake
         assert!(record.meta.workflow_state_explicit);
         let report = backend.doctor().unwrap();
         assert!(report.is_ok(), "{:?}", report.diagnostics);
+    }
+
+    #[test]
+    fn create_uses_configured_japanese_record_language_for_generated_defaults() {
+        let tmp = TempDir::new().unwrap();
+        let backend = LocalTicketBackend::new(tmp.path().join("tickets"))
+            .with_record_language(Some("Japanese"));
+
+        let created = backend.create(NewTicket::new("日本語レコード")).unwrap();
+        let dir = backend
+            .root()
+            .join(TicketStatus::Open.as_str())
+            .join(created.id.as_str());
+        let item = fs::read_to_string(dir.join("item.md")).unwrap();
+        let thread = fs::read_to_string(dir.join("thread.md")).unwrap();
+
+        assert!(item.contains("## 背景"));
+        assert!(item.contains("LocalTicketBackend によって作成されました。"));
+        assert!(thread.contains("## 作成"));
+        assert!(thread.contains("LocalTicketBackend によって作成されました。"));
     }
 
     #[test]

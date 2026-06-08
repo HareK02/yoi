@@ -34,6 +34,9 @@ pub fn ticket_config_scaffold() -> String {
         "root = \"{}\"\n",
         DEFAULT_TICKET_BACKEND_RELATIVE_PATH
     ));
+    out.push_str(
+        "\n# Optional durable Ticket record language. When unset, generated Ticket text keeps current defaults.\n# [ticket]\n# language = \"Japanese\"\n",
+    );
     for role in TicketRole::ALL {
         out.push_str(&format!(
             "\n[roles.{role}]\nprofile = \"{}\"\nworkflow = \"{}\"\n",
@@ -65,6 +68,7 @@ pub enum TicketConfigError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TicketConfig {
     pub backend: TicketBackendConfig,
+    pub ticket: TicketRecordConfig,
     pub roles: TicketRoleProfiles,
 }
 
@@ -73,6 +77,7 @@ impl TicketConfig {
         let workspace_root = workspace_root.as_ref();
         Self {
             backend: TicketBackendConfig::default_for_workspace(workspace_root),
+            ticket: TicketRecordConfig::default(),
             roles: TicketRoleProfiles::default(),
         }
     }
@@ -107,6 +112,13 @@ impl TicketConfig {
 
     pub fn backend_root(&self) -> &Path {
         self.backend.root.as_path()
+    }
+
+    pub fn ticket_record_language(&self) -> Option<&str> {
+        self.ticket
+            .language
+            .as_ref()
+            .map(TicketRecordLanguage::as_str)
     }
 
     pub fn role(&self, role: TicketRole) -> &TicketRoleConfig {
@@ -228,6 +240,41 @@ impl TicketRole {
 impl fmt::Display for TicketRole {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TicketRecordConfig {
+    pub language: Option<TicketRecordLanguage>,
+}
+
+impl Default for TicketRecordConfig {
+    fn default() -> Self {
+        Self { language: None }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TicketRecordLanguage(String);
+
+impl TicketRecordLanguage {
+    pub fn new(language: impl Into<String>) -> Result<Self, String> {
+        let language = normalized_non_empty(language, "ticket record language")?;
+        Ok(Self(language))
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl<'de> Deserialize<'de> for TicketRecordLanguage {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        TicketRecordLanguage::new(value).map_err(serde::de::Error::custom)
     }
 }
 
@@ -473,7 +520,24 @@ struct RawTicketConfig {
     #[serde(default)]
     backend: RawBackendConfig,
     #[serde(default)]
+    ticket: RawTicketRecordConfig,
+    #[serde(default)]
     roles: BTreeMap<String, RawTicketRoleConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTicketRecordConfig {
+    #[serde(default)]
+    language: Option<TicketRecordLanguage>,
+}
+
+impl RawTicketRecordConfig {
+    fn resolve(self) -> TicketRecordConfig {
+        TicketRecordConfig {
+            language: self.language,
+        }
+    }
 }
 
 impl RawTicketConfig {
@@ -502,6 +566,7 @@ impl RawTicketConfig {
                     message,
                 }
             })?,
+            ticket: self.ticket.resolve(),
             roles,
         })
     }
@@ -605,6 +670,7 @@ mod tests {
             config.backend.root,
             temp.path().join(DEFAULT_TICKET_BACKEND_RELATIVE_PATH)
         );
+        assert_eq!(config.ticket_record_language(), None);
         for role in TicketRole::ALL {
             let role_config = config.role(role);
             assert_eq!(role_config.profile.as_str(), "inherit");
@@ -622,6 +688,9 @@ mod tests {
 [backend]
 provider = "builtin:yoi_local"
 root = "custom-tickets"
+
+[ticket]
+language = "Japanese"
 
 [roles.intake]
 profile = "project:intake"
@@ -656,6 +725,7 @@ workflow = "ticket-orchestrator-routing"
             TicketBackendProvider::BuiltinYoiLocal
         );
         assert_eq!(config.backend.root, temp.path().join("custom-tickets"));
+        assert_eq!(config.ticket_record_language(), Some("Japanese"));
         assert_eq!(
             config.profile_for(TicketRole::Intake).as_str(),
             "project:intake"
@@ -681,6 +751,7 @@ workflow = "ticket-orchestrator-routing"
         assert!(scaffold.contains("[backend]\n"));
         assert!(scaffold.contains("provider = \"builtin:yoi_local\""));
         assert!(scaffold.contains("root = \".yoi/tickets\""));
+        assert!(scaffold.contains("# [ticket]\n# language = \"Japanese\""));
         for role in TicketRole::ALL {
             assert!(scaffold.contains(&format!("[roles.{role}]")));
             assert!(scaffold.contains(&format!(
@@ -866,6 +937,29 @@ root = "legacy-tickets"
             TicketBackendProvider::BuiltinYoiLocal
         );
         assert_eq!(config.backend_root(), temp.path().join("legacy-tickets"));
+    }
+
+    #[test]
+    fn rejects_empty_ticket_record_language() {
+        let temp = TempDir::new().unwrap();
+        write_config(
+            temp.path(),
+            r#"
+[backend]
+provider = "builtin:yoi_local"
+root = ".yoi/tickets"
+
+[ticket]
+language = "   "
+"#,
+        );
+
+        let error = TicketConfig::load_workspace(temp.path()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("ticket record language must not be empty")
+        );
     }
 
     #[test]

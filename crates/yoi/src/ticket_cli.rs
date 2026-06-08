@@ -259,7 +259,8 @@ fn init(workspace: &Path) -> Result<TicketCliOutput, TicketCliError> {
 
 fn backend_for_workspace(workspace: &Path) -> Result<LocalTicketBackend, TicketCliError> {
     let config = TicketConfig::load_workspace(workspace)?;
-    Ok(LocalTicketBackend::new(config.backend_root().to_path_buf()))
+    Ok(LocalTicketBackend::new(config.backend_root().to_path_buf())
+        .with_record_language(config.ticket_record_language()))
 }
 
 fn create(
@@ -804,7 +805,7 @@ fn default_author() -> String {
 }
 
 fn help_text() -> &'static str {
-    "yoi ticket\n\nUsage:\n  yoi ticket init\n  yoi ticket create --title <title> [--slug <slug>] [--kind <kind>] [--priority P2] [--label a,b]\n  yoi ticket list [--status open|pending|closed|all]\n  yoi ticket show <id-or-slug>\n  yoi ticket comment <id-or-slug> [--role comment|plan|decision|implementation_report] (--file <path>|--message <text>)\n  yoi ticket review <id-or-slug> (--approve|--request-changes) (--file <path>|--message <text>)\n  yoi ticket status <id-or-slug> <open|pending|closed>\n  yoi ticket close <id-or-slug> (--resolution <text>|--file <path>)\n  yoi ticket doctor\n\nOptions:\n  -h, --help    Print help\n\nBackend:\n  `yoi ticket init` writes .yoi/ticket.config.toml with explicit fixed role profiles.\n  Uses the workspace Ticket config at .yoi/ticket.config.toml when present.\n  Supported provider: builtin:yoi_local.\n  Without config, the local backend root is <cwd>/.yoi/tickets.\n"
+    "yoi ticket\n\nUsage:\n  yoi ticket init\n  yoi ticket create --title <title> [--slug <slug>] [--kind <kind>] [--priority P2] [--label a,b]\n  yoi ticket list [--status open|pending|closed|all]\n  yoi ticket show <id-or-slug>\n  yoi ticket comment <id-or-slug> [--role comment|plan|decision|implementation_report] (--file <path>|--message <text>)\n  yoi ticket review <id-or-slug> (--approve|--request-changes) (--file <path>|--message <text>)\n  yoi ticket status <id-or-slug> <open|pending|closed>\n  yoi ticket close <id-or-slug> (--resolution <text>|--file <path>)\n  yoi ticket doctor\n\nOptions:\n  -h, --help    Print help\n\nBackend:\n  `yoi ticket init` writes .yoi/ticket.config.toml with explicit fixed role profiles and an optional commented [ticket].language setting.\n  Uses the workspace Ticket config at .yoi/ticket.config.toml when present.\n  Supported provider: builtin:yoi_local.\n  Without config, the local backend root is <cwd>/.yoi/tickets.\n"
 }
 
 #[cfg(test)]
@@ -841,6 +842,7 @@ mod tests {
         assert!(config.contains("[backend]\n"));
         assert!(config.contains("provider = \"builtin:yoi_local\""));
         assert!(config.contains("root = \".yoi/tickets\""));
+        assert!(config.contains("# [ticket]\n# language = \"Japanese\""));
         for role in TicketRole::ALL {
             assert!(config.contains(&format!(
                 "[roles.{role}]\nprofile = \"builtin:default\"\nworkflow = \"{}\"",

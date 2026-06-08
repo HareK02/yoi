@@ -552,7 +552,8 @@ fn build_workspace_panel_with_registry_model(
             match TicketConfig::load_workspace(workspace_root) {
                 Ok(config) => {
                     model.header.ticket_root = config.backend_root().to_path_buf();
-                    let backend = LocalTicketBackend::new(config.backend_root().to_path_buf());
+                    let backend = LocalTicketBackend::new(config.backend_root().to_path_buf())
+                        .with_record_language(config.ticket_record_language());
                     match build_ticket_rows(&backend, pods, registry) {
                         Ok(rows) => model.rows.extend(rows),
                         Err(error) => {
