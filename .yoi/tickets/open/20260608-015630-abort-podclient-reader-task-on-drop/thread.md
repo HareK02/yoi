@@ -138,3 +138,45 @@ Stop/completion policy:
 - Because the human authorized cleanup after completion, this Orchestrator will proceed through reviewer approval, merge-completion validation, Ticket close, Pod stop, worktree removal, and branch deletion if the branch is approved and merge authority remains clear.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-08T02:50:42Z -->
+
+## Implementation report
+
+Coder completed and reviewer delegated.
+
+Coder result:
+- Pod: `coder-abort-podclient-reader`
+- Commit: `aec75b3 fix: abort PodClient reader task on drop`
+- Worktree status: clean after commit.
+- Diff against `develop`: 1 file changed, 143 insertions, 2 deletions.
+
+Files touched by coder:
+- `crates/client/src/pod_client.rs`
+
+Coder reported implementation:
+- Added owned `reader_task: JoinHandle<()>` field to `PodClient`.
+- Stored the background reader task created by `PodClient::connect()`.
+- Implemented `Drop` for `PodClient` to abort the reader task.
+- Preserved send and receive behavior while `PodClient` is alive.
+- Added focused tests for receiving while alive, sending while alive, repeated connect/drop connection cleanup, and aborting a blocked reader so the Unix socket read half is released.
+
+Coder reported validation:
+- `cargo test -p client pod_client --lib`
+- `cargo test -p client --lib`
+- `cargo test -p tui pod_list --lib`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo run -q -p yoi -- ticket doctor`
+- `nix build .#yoi`
+
+Reviewer delegation:
+- Spawned sibling reviewer Pod: `reviewer-abort-podclient-reader`.
+- Reviewer scope: read-only child worktree plus non-recursive parent-root read required by launch cwd validation.
+- Reviewer was instructed to judge against the recorded Ticket requirements and binding decisions.
+
+Pending:
+- Await reviewer verdict before merge-ready dossier / merge-completion.
+- No merge, close, final approval, or cleanup has occurred for this Ticket.
+
+---
