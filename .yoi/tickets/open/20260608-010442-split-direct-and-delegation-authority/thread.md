@@ -182,3 +182,57 @@ Stop/completion policy:
 - Because the human authorized cleanup after completion, this Orchestrator will proceed through reviewer approval, merge-completion validation, Ticket close, Pod stop, worktree removal, and branch deletion if the branch is approved and merge authority remains clear.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-08T06:24:20Z -->
+
+## Implementation report
+
+Coder completed and reviewer delegated.
+
+Coder result:
+- Pod: `coder-split-direct-delegation`
+- Commit: `a4a9b00 feat: split direct and delegation scope authority`
+- Worktree status: clean after commit.
+- Diff against `develop`: 9 files changed, 320 insertions, 20 deletions.
+
+Files touched by coder:
+- `.yoi/profiles/_base.lua`
+- `.yoi/profiles/orchestrator.lua`
+- `crates/manifest/src/config.rs`
+- `crates/manifest/src/lib.rs`
+- `crates/manifest/src/profile.rs`
+- `crates/manifest/src/scope.rs`
+- `crates/pod/src/pod.rs`
+- `crates/pod/src/spawn/tool.rs`
+- `crates/pod/tests/spawn_pod_test.rs`
+
+Coder reported implementation:
+- Added `delegation_scope` to manifest/profile resolution separately from direct `scope`.
+- Added `DelegationScope` type and changed `SpawnPod` requested child scope validation to check delegation grant rather than direct tool scope.
+- Missing `delegation_scope` in old metadata/snapshots defaults to no delegation.
+- `inherit` Profile does not implicitly inherit subdelegation authority.
+- `.yoi/profiles/orchestrator.lua` explicitly gets workspace-write delegation; Companion/Intake/Coder/Reviewer remain without delegation grant.
+- Added tests for direct scope with delegation denied, explicit grant success, over-delegation rejection diagnostics, old snapshot no-delegation default, and Profile Lua delegation resolution.
+
+Coder reported validation:
+- `cargo test -p manifest profile --lib`
+- `cargo test -p manifest deserialize_old_manifest_snapshot_defaults_to_no_delegation --lib`
+- `cargo test -p manifest --lib`
+- `cargo test -p pod spawn_pod --test spawn_pod_test`
+- `cargo test -p pod-registry`
+- `cargo check -q`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo run -q -p yoi -- ticket doctor`
+- `nix build .#yoi`
+
+Reviewer delegation:
+- Spawned sibling reviewer Pod: `reviewer-split-direct-delegation`.
+- Reviewer scope: read-only child worktree plus non-recursive parent-root read required by launch cwd validation.
+- Reviewer was instructed to judge against the recorded Ticket requirements and binding decisions.
+
+Pending:
+- Await reviewer verdict before merge-ready dossier / merge-completion.
+- No merge, close, final approval, or cleanup has occurred for this Ticket.
+
+---
