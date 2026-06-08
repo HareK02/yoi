@@ -192,3 +192,51 @@ Stop/completion policy:
 - Because the human authorized cleanup after completion, this Orchestrator will proceed through reviewer approval, merge-completion validation, Ticket close, Pod stop, worktree removal, and branch deletion if the branch is approved and merge authority remains clear.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-08T07:25:03Z -->
+
+## Implementation report
+
+Coder completed and reviewer delegated.
+
+Coder result:
+- Pod: `coder-spawnpod-child-cwd`
+- Commit: `3dd7707 feat: add SpawnPod cwd`
+- Worktree status: clean after commit.
+- Diff against `develop`: 6 files changed, 270 insertions, 6 deletions.
+
+Files touched by coder:
+- `crates/pod/src/spawn/tool.rs`
+- `crates/pod/tests/spawn_pod_test.rs`
+- `resources/prompts/internal.toml`
+- `crates/client/src/ticket_role.rs`
+- `.yoi/workflow/multi-agent-workflow.md`
+- `.yoi/workflow/worktree-workflow.md`
+
+Coder reported implementation:
+- Added `SpawnPodInput.cwd: Option<PathBuf>`.
+- Validates relative, missing, non-directory, and not-child-readable-scope `cwd` before launch with `InvalidArgument` diagnostics.
+- Omitted `cwd` preserves existing spawner-pwd behavior.
+- Provided `cwd` is passed to child process `Command::current_dir(...)`.
+- Added focused tests for schema/validation, provided cwd becoming child process cwd, and omitted cwd preserving previous behavior.
+- Updated maintained SpawnPod and multi-agent/worktree guidance to describe `cwd` as non-authority child working directory.
+
+Coder reported validation:
+- `cargo test -p pod spawn_pod --test spawn_pod_test`
+- `cargo test -p pod spawn_pod`
+- `cargo fmt`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo run -q -p yoi -- ticket doctor`
+- `nix build .#yoi`
+
+Reviewer delegation:
+- Spawned sibling reviewer Pod: `reviewer-spawnpod-child-cwd`.
+- Reviewer scope: read-only child worktree plus non-recursive parent-root read required by current launch cwd behavior.
+- Reviewer was instructed to judge against the recorded Ticket requirements and binding decisions.
+
+Pending:
+- Await reviewer verdict before merge-ready dossier / merge-completion.
+- No merge, close, final approval, or cleanup has occurred for this Ticket.
+
+---
