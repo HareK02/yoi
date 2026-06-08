@@ -6,7 +6,7 @@ status: 'open'
 kind: 'task'
 priority: 'P1'
 labels: ['ticket', 'orchestrator', 'planning', 'panel', 'taskstore', 'queue']
-workflow_state: 'intake'
+workflow_state: planning
 created_at: '2026-06-08T06:12:35Z'
 updated_at: '2026-06-08T06:27:33Z'
 assignee: null
@@ -22,7 +22,7 @@ ready -> queued
   -> notify workspace Orchestrator
 ```
 
-That is not enough for robust orchestration. Queued Tickets can remain after missed notifications, Orchestrator restarts, preflight returns, capacity limits, or multi-ticket coordination. The Orchestrator also needs a lightweight way to remember planned queued work across turns without relying only on session memory.
+That is not enough for robust orchestration. Queued Tickets can remain after missed notifications, Orchestrator restarts, planning returns, capacity limits, or multi-ticket coordination. The Orchestrator also needs a lightweight way to remember planned queued work across turns without relying only on session memory.
 
 There is an existing related Ticket:
 
@@ -44,7 +44,7 @@ The OrchestrationPlan store should distinguish at least:
 
 - `new_queued`: Tickets with `workflow_state = queued` that have not yet been incorporated into the OrchestrationPlan.
 - `planned_queued`: queued Tickets that the Orchestrator has considered and placed into an explicit plan/order/waiting set, but has not yet accepted as `inprogress`.
-- `inprogress`: Tickets accepted by the Orchestrator and currently awaiting worktree/coder/reviewer/preflight/merge/cleanup progress.
+- `inprogress`: Tickets accepted by the Orchestrator and currently awaiting worktree/coder/reviewer/planning-sync/merge/cleanup progress.
 
 The names do not need to become final public API names, but the state distinction is required.
 
@@ -55,7 +55,7 @@ The names do not need to become final public API names, but the state distinctio
 - Provide a mechanism to identify Tickets that need Orchestrator attention, including at least:
   - `workflow_state = queued` Tickets not yet present in the OrchestrationPlan (`new_queued`);
   - planned queued Tickets that are not blocked/capacity-limited and can be started when there is no active in-progress work;
-  - `workflow_state = inprogress` Tickets accepted by Orchestrator whose next action is not merely waiting for an active coder/reviewer/preflight/merge step;
+  - `workflow_state = inprogress` Tickets accepted by Orchestrator whose next action is not merely waiting for an active coder/reviewer/planning-sync/merge step;
   - queued Tickets left behind after Orchestrator restart, missed notification, or previous capacity stop.
 - On Panel open/Orchestrator restore/spawn, or explicit user action, surface a bounded work list to the Orchestrator when there is actionable work.
 - Avoid unbounded background polling. Prefer explicit events, Panel lifecycle kick, and explicit user/Orchestrator actions.
@@ -65,7 +65,7 @@ The names do not need to become final public API names, but the state distinctio
 
 - If `new_queued` work exists and the Orchestrator is idle/not occupied by an active in-progress operation, kick or notify the Orchestrator so it can incorporate those Tickets into the plan.
 - If no active `inprogress` work exists and runnable `planned_queued` work exists, kick or notify the Orchestrator so it can accept/start the next planned Ticket rather than waiting indefinitely for user instruction.
-- If active `inprogress` work exists and the next expected event is coder/reviewer/preflight/merge completion, do not re-kick merely because queued/planned queued work also exists.
+- If active `inprogress` work exists and the next expected event is coder/reviewer/planning-sync/merge completion, do not re-kick merely because queued/planned queued work also exists.
 - If planned queued work is blocked, dependency-waiting, conflict-waiting, or capacity-limited, record the reason so the Panel/user can see why nothing starts.
 - A re-kick is an attention signal plus bounded context, not authority to bypass `queued -> inprogress` acceptance or spawn implementation Pods without inspection.
 
@@ -116,7 +116,7 @@ The names do not need to become final public API names, but the state distinctio
 
 - Do not turn the Panel itself into the scheduler.
 - Do not auto-start unqueued Tickets.
-- Do not re-kick continuously while active coder/reviewer/preflight/merge work is already in progress.
+- Do not re-kick continuously while active coder/reviewer/planning-sync/merge work is already in progress.
 - Do not blindly spawn coder Pods from re-kick without Orchestrator inspection and `queued -> inprogress` acceptance.
 - Do not implement a full dependency graph solver in the first version.
 
@@ -125,7 +125,7 @@ The names do not need to become final public API names, but the state distinctio
 - The system can distinguish new queued work, planned queued work, and accepted in-progress work.
 - New queued Tickets are not left unnoticed while the Orchestrator is otherwise idle.
 - Runnable planned queued Tickets are not left unstarted when there is no active in-progress work and capacity/policy allows progress.
-- The system does not re-kick merely because queued/planned work exists while Orchestrator-managed in-progress work is waiting on coder/reviewer/preflight/merge completion.
+- The system does not re-kick merely because queued/planned work exists while Orchestrator-managed in-progress work is waiting on coder/reviewer/planning-sync/merge completion.
 - Missed/stale queued Tickets can be surfaced to the Orchestrator without requiring the user to manually requeue each one.
 - The Orchestrator can record and query a lightweight Ticket orchestration plan covering active targets, order/dependency/conflict/capacity, state bucket, and next actions.
 - Plan records survive compaction and do not rely solely on session-lifetime TaskStore state.

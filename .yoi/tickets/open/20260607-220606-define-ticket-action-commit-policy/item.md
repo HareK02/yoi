@@ -6,7 +6,7 @@ status: open
 kind: task
 priority: P2
 labels: [ticket, intake, panel, git, workflow]
-workflow_state: intake
+workflow_state: planning
 created_at: 2026-06-07T22:06:06Z
 updated_at: 2026-06-07T22:06:06Z
 assignee: null
@@ -28,13 +28,13 @@ The project workflow treats Ticket records as git-authored project records, but 
 
 ## Goal
 
-Define and implement the commit policy for Ticket state transitions performed by Intake/Panel actions, especially `intake -> ready`.
+Define and implement the commit policy for Ticket state transitions performed by Intake/Panel actions, especially `planning -> ready`.
 
 ## Questions to resolve
 
-- Should Intake/Panel auto-commit Ticket-only metadata/thread changes such as `intake -> ready`?
+- Should Intake/Panel auto-commit Ticket-only metadata/thread changes such as `planning -> ready`?
 - If yes, which actions are safe to auto-commit?
-  - `intake -> ready`
+  - `planning -> ready`
   - `ready -> queued`
   - `queued -> inprogress`
   - action_required / attention_required updates
@@ -56,7 +56,7 @@ Define and implement the commit policy for Ticket state transitions performed by
 ## Acceptance criteria
 
 - The project has an explicit documented policy for commits after Intake/Panel Ticket state changes.
-- `intake -> ready` behavior follows that policy consistently.
+- `planning -> ready` behavior follows that policy consistently.
 - Dirty Ticket-only state after a Panel/Intake action is either committed safely or clearly surfaced to the user.
 - Tests cover the selected behavior where practical.
 - `target/debug/yoi ticket doctor`, `cargo fmt --check`, and `git diff --check` pass.

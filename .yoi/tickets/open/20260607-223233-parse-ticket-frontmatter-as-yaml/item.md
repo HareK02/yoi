@@ -34,11 +34,11 @@ Observed bug:
 - `workspace-panel-nonblocking-transitions` has:
 
 ```yaml
-workflow_state: intake
+workflow_state: planning
 attention_required: null
 ```
 
-- Panel should derive `Clarify` from `workflow_state: intake`.
+- Panel should derive `Clarify` from `workflow_state: planning`.
 - Instead, `attention_required` is interpreted as set and Panel derives `Edit` with an `attention_required is set` blocker.
 
 YAML `null` is valid YAML; the bug is that Ticket frontmatter is not consistently parsed as YAML/null-aware data.
@@ -71,7 +71,6 @@ At minimum verify:
 - `assignee`
 - `legacy_ticket`
 - `readiness`
-- `needs_preflight`
 - `risk_flags`
 - `action_required`
 - `workflow_state`
@@ -83,7 +82,7 @@ At minimum verify:
 ## Acceptance criteria
 
 - A Ticket with `attention_required: null` is parsed with `attention_required == None`.
-- A Ticket with `workflow_state: intake` and `attention_required: null` derives Panel action `Clarify`, not `Edit`.
+- A Ticket with `workflow_state: planning` and `attention_required: null` derives Panel action `Clarify`, not `Edit`.
 - Existing nullable fields no longer rely on per-field ad-hoc string `"null"` filtering.
 - YAML sequence labels/risk flags parse correctly.
 - Existing Ticket fixture tests and `target/debug/yoi ticket doctor` pass.

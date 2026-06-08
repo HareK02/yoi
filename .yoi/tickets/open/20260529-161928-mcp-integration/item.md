@@ -6,6 +6,7 @@ status: open
 kind: feature
 priority: P2
 labels: [mcp, tools, security, profiles]
+workflow_state: planning
 created_at: 2026-05-29T16:19:28Z
 updated_at: 2026-05-29T16:19:28Z
 assignee: null

@@ -6,6 +6,7 @@ status: open
 kind: feature
 priority: P2
 labels: [tui, worker, interrupt, ux]
+workflow_state: planning
 created_at: 2026-05-30T05:37:21Z
 updated_at: 2026-05-30T05:38:11Z
 assignee: null

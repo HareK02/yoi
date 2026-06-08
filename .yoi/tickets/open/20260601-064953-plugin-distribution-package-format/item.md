@@ -6,6 +6,7 @@ status: open
 kind: feature
 priority: P2
 labels: [plugin, distribution, workspace, user]
+workflow_state: planning
 created_at: 2026-06-01T06:49:53Z
 updated_at: 2026-06-01T06:50:33Z
 assignee: null

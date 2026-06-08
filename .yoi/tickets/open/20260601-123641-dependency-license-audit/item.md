@@ -6,6 +6,7 @@ status: open
 kind: task
 priority: P2
 labels: [audit, dependencies, license]
+workflow_state: planning
 created_at: 2026-06-01T12:36:41Z
 updated_at: 2026-06-01T13:08:45Z
 assignee: null

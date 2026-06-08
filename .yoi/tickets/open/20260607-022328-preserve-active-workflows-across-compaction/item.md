@@ -6,7 +6,7 @@ status: open
 kind: task
 priority: P1
 labels: [workflow, compaction, history, orchestration]
-workflow_state: intake
+workflow_state: planning
 created_at: 2026-06-07T02:23:28Z
 updated_at: 2026-06-07T02:23:28Z
 assignee: null

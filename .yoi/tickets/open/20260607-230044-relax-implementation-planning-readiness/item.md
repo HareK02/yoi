@@ -5,7 +5,7 @@ title: Relax implementation planning readiness toward intent and reviewability
 status: open
 kind: task
 priority: P2
-labels: [workflow, ticket, orchestrator, preflight, review]
+labels: [workflow, ticket, orchestrator, planning, review]
 workflow_state: done
 created_at: 2026-06-07T23:00:44Z
 updated_at: 2026-06-07T23:38:32Z
@@ -17,15 +17,15 @@ queued_at: 2026-06-07T23:03:35Z
 
 ## Background
 
-Current Intake / Preflight / Orchestrator workflow wording tends to require implementation strategy to be narrowed too early. In practice, the most reliable implementation investigation often happens when the implementation Pod/coder reads the code and attempts the change in the scoped worktree.
+Current Intake / Planning / Orchestrator workflow wording tends to require implementation strategy to be narrowed too early. In practice, the most reliable implementation investigation often happens when the implementation Pod/coder reads the code and attempts the change in the scoped worktree.
 
 The higher-level planning/intake stage should prioritize clarifying intent, constraints, and reviewable outcomes rather than over-specifying the implementation approach. Reviewers need enough intent and acceptance criteria to judge whether the implementation matches the user's/project's intent; coders should retain room to discover the best local implementation path unless a design decision is explicitly fixed.
 
 Current problem:
 
 - Intake/Planning `ready` and Orchestrator `implementation_ready` are easy to interpret as requiring a nearly fixed implementation plan.
-- Orchestrator may over-classify tickets as `preflight_needed` when some uncertainty could safely be resolved by the coder during implementation and checked by reviewer.
-- This creates extra preflight churn and can make the workflow feel stalled.
+- Orchestrator may over-return Tickets to planning when some uncertainty could safely be resolved by the coder during implementation and checked by reviewer.
+- This creates extra planning-return churn and can make the workflow feel stalled.
 
 Desired direction:
 
@@ -33,11 +33,11 @@ Desired direction:
 - Keep implementation judgment available to the coder where safe.
 - Make reviewer validation against intent the key quality gate.
 - Treat explicit design decisions/invariants as binding when present.
-- Use preflight for genuine design-boundary/product/API/authority uncertainty, not every implementation unknown.
+- Use return-to-planning for genuine design-boundary/product/API/authority uncertainty, not every implementation unknown.
 
 ## Goal
 
-Adjust Ticket Intake/Planning, Orchestrator routing, and Preflight workflow guidance so readiness is based on clear intent and reviewability, while preserving coder discretion for implementation details unless constrained by explicit decisions.
+Adjust Ticket Intake/Planning, Orchestrator routing, and Planning workflow guidance so readiness is based on clear intent and reviewability, while preserving coder discretion for implementation details unless constrained by explicit decisions.
 
 ## Requirements
 
@@ -55,13 +55,13 @@ Adjust Ticket Intake/Planning, Orchestrator routing, and Preflight workflow guid
 
 ### Orchestrator routing
 
-- Narrow `preflight_needed` so it is reserved for real design/product/API/authority-boundary uncertainty, not ordinary code investigation or implementation tactic selection.
+- Narrow return-to-planning so it is reserved for real design/product/API/authority-boundary uncertainty, not ordinary code investigation or implementation tactic selection.
 - Make `implementation_ready` allow bounded implementation uncertainty when:
   - intent and acceptance criteria are clear;
   - coder can investigate safely within scope;
   - reviewer can evaluate against recorded intent;
   - escalation conditions are defined.
-- Keep `preflight_needed` for cases where implementing would implicitly decide product/API/UX/authority boundaries or violate known design constraints.
+- Keep return-to-planning for cases where implementing would implicitly decide product/API/UX/authority boundaries or violate known design constraints.
 - Require Orchestrator to record whether implementation latitude is allowed and what must be escalated.
 
 ### Coder/reviewer handoff
@@ -77,13 +77,13 @@ Adjust Ticket Intake/Planning, Orchestrator routing, and Preflight workflow guid
 
 - Update `.yoi/workflow/ticket-intake-workflow.md`.
 - Update `.yoi/workflow/ticket-orchestrator-routing.md`.
-- Update `.yoi/workflow/ticket-preflight-workflow.md`.
+- Update the planning/requirements-sync workflow guidance.
 - Update `.yoi/workflow/multi-agent-workflow.md` if needed to reflect coder latitude and reviewer intent-checking.
 - Adjust role prompt wording/tests if generated prompt guidance currently over-demands pre-decided implementation plans.
 
 ## Non-goals
 
-- Do not remove preflight; narrow when it is required.
+- Do not remove return-to-planning; narrow when it is required.
 - Do not allow coders to make product/API/authority decisions silently.
 - Do not weaken explicit design decisions or invariants recorded by humans/Orchestrator.
 - Do not change Ticket state machine names in this ticket unless it is already being handled by the planning-state rename work.
@@ -91,9 +91,9 @@ Adjust Ticket Intake/Planning, Orchestrator routing, and Preflight workflow guid
 ## Acceptance criteria
 
 - Workflows clearly distinguish ready-for-routing, implementation handoff, and fully specified implementation plan.
-- Orchestrator routing guidance no longer treats ordinary implementation investigation as automatic `preflight_needed`.
+- Orchestrator routing guidance no longer treats ordinary implementation investigation as automatic return-to-planning.
 - Intent packet template includes sections for binding decisions, implementation latitude, and escalation conditions.
 - Reviewer guidance focuses on intent/constraints/acceptance criteria and explicit decisions.
 - Example wording makes clear that coder investigation is acceptable when intent is clear and risks are bounded.
-- Existing Ticket/preflight tests or prompt tests are updated if affected.
+- Existing Ticket planning/routing tests or prompt tests are updated if affected.
 - `target/debug/yoi ticket doctor`, `cargo fmt --check`, and `git diff --check` pass.

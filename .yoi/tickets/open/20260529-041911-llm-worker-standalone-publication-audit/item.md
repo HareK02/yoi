@@ -6,6 +6,7 @@ status: open
 kind: audit
 priority: P2
 labels: [llm-worker, docs, api, release]
+workflow_state: planning
 created_at: 2026-05-29T04:19:11Z
 updated_at: 2026-05-29T04:19:11Z
 assignee: null

@@ -6,6 +6,7 @@ status: open
 kind: task
 priority: P2
 labels: [migrated]
+workflow_state: planning
 created_at: 2026-05-27T00:00:03Z
 updated_at: 2026-05-27T00:00:03Z
 assignee: null

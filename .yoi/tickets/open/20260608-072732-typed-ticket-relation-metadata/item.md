@@ -6,7 +6,7 @@ status: 'open'
 kind: 'task'
 priority: 'P1'
 labels: ['ticket', 'relations', 'planning', 'panel', 'orchestrator']
-workflow_state: 'intake'
+workflow_state: planning
 created_at: '2026-06-08T07:27:32Z'
 updated_at: '2026-06-08T07:28:29Z'
 assignee: null

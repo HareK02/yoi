@@ -6,7 +6,7 @@ status: open
 kind: task
 priority: P1
 labels: [panel, orchestrator, ticket, automation, workflow]
-workflow_state: intake
+workflow_state: planning
 created_at: 2026-06-07T02:02:15Z
 updated_at: 2026-06-07T03:57:24Z
 assignee: null
@@ -21,7 +21,7 @@ The panel currently has pieces of the Ticket orchestration path:
 - Intake can materialize or update a Ticket and mark it `workflow_state = ready`.
 - Panel can Queue a ready Ticket, transitioning `ready -> queued` and notifying the workspace Orchestrator.
 
-However, the intended semantics of `queued` are stronger than a passive notification. Once a human queues a Ticket, the Orchestrator should treat it as eligible for routing and proceed if the workspace state allows it. The Orchestrator, not the panel, should decide whether work can start now or should wait because of conflicts, dependencies, capacity, or preflight gaps.
+However, the intended semantics of `queued` are stronger than a passive notification. Once a human queues a Ticket, the Orchestrator should treat it as eligible for routing and proceed if the workspace state allows it. The Orchestrator, not the panel, should decide whether work can start now or should wait because of conflicts, dependencies, capacity, or planning/readiness gaps.
 
 The current route is not yet a complete automated path from Panel/Intake through Orchestrator-managed implementation, review, merge, and Ticket completion.
 
@@ -52,13 +52,13 @@ Implement a first-class Panel -> Intake/Queue -> Orchestrator automation path wh
 - Add Orchestrator-side handling for queued Tickets:
   - read the Ticket and current workflow state;
   - inspect active worktrees/branches/Pods and queued/inprogress Tickets where available;
-  - decide whether there are conflicts, dependency blockers, preflight gaps, or capacity constraints;
+  - decide whether there are conflicts, dependency blockers, planning/readiness gaps, or capacity constraints;
   - if unblocked, transition `queued -> inprogress` using the typed Ticket workflow tool/path before implementation side effects;
   - if blocked, record a concise reason and leave the Ticket queued or defer through the existing Ticket status/state mechanism as appropriate.
 - Ensure Orchestrator cannot create implementation worktrees or spawn implementation/review Pods for a queued Ticket until the Ticket is already accepted as `inprogress` or the same typed operation atomically accepts it.
 - Add or design toward a typed accept/start operation for Orchestrator routing so the `queued -> inprogress` acceptance contract is not only prompt-enforced.
 - Connect Orchestrator routing to the existing Ticket workflows:
-  - `ticket-preflight-workflow` when requirements/design readiness are uncertain;
+  - the planning/requirements-sync workflow when requirements/design readiness are uncertain;
   - `worktree-workflow` for worktree creation/management;
   - `multi-agent-workflow` or equivalent sibling coder/reviewer routing for implementation and review.
 - Ensure Orchestrator can spawn or coordinate implementation/review Pods only after the queued Ticket has been accepted as in progress and scope/worktree boundaries are clear.

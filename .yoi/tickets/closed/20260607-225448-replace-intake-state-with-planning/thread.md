@@ -465,3 +465,22 @@ Residual notes:
 - `ticket-preflight-workflow` filename remains as a compatibility slug, but its content now explicitly describes planning/requirements sync rather than a separate workflow state/lane/long-lived operation.
 
 ---
+
+<!-- event: decision author: hare at: 2026-06-08T10:19:05Z -->
+
+## Decision
+
+## Local migration and compatibility direction
+
+After the local Ticket record migration, do not preserve long-term compatibility for state-as-`intake` or `needs_preflight` / `preflight_needed` records.
+
+Direction:
+- migrate open local Ticket records to explicit `workflow_state: planning`;
+- remove legacy preflight frontmatter fields from open Ticket records;
+- treat any remaining historical mentions in thread logs as audit history, not current workflow inputs;
+- update code/prompts/workflows toward the new model rather than adding broad compatibility branches for the old local data shape.
+
+Compatibility should be limited to bounded migration/error diagnostics where needed, not a permanent runtime surface.
+
+
+---

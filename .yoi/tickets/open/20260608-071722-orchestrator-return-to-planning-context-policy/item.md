@@ -6,7 +6,7 @@ status: 'open'
 kind: 'task'
 priority: 'P1'
 labels: ['ticket', 'orchestrator', 'planning', 'workflow', 'prompt']
-workflow_state: 'intake'
+workflow_state: planning
 created_at: '2026-06-08T07:17:22Z'
 updated_at: '2026-06-08T07:17:22Z'
 assignee: null
@@ -15,9 +15,9 @@ legacy_ticket: null
 
 ## Background
 
-`replace-intake-state-with-planning` removes the standalone `preflight` concept and represents implementation-readiness gaps as a return to the `planning` lane with a visible reason.
+`replace-intake-state-with-planning` represents implementation-readiness gaps as a return to the `planning` lane with a visible reason.
 
-That creates an important follow-up requirement for Orchestrator routing: returning a Ticket to planning must not become the new form of blind preflight rejection. The Orchestrator should not look only at Ticket text, `risk_flags`, or broad risky domains and decide to stop. It must consider relevant project context before deciding that implementation cannot proceed.
+That creates an important follow-up requirement for Orchestrator routing: returning a Ticket to planning must not become the new form of blind planning rejection. The Orchestrator should not look only at Ticket text, `risk_flags`, or broad risky domains and decide to stop. It must consider relevant project context before deciding that implementation cannot proceed.
 
 The recent `allow-spawnpod-child-workspace-cwd` discussion exposed the failure mode: a Ticket can touch authority/Pod/scope areas while still containing enough binding decisions and acceptance criteria to route to implementation. In that case, risk should become reviewer focus and escalation conditions, not an automatic return to planning.
 
@@ -28,7 +28,7 @@ Update Orchestrator routing guidance so a Ticket is returned to planning only wh
 ## Requirements
 
 - Treat this as a follow-up to `replace-intake-state-with-planning`.
-  - First remove/fold the standalone `preflight` concept into planning.
+  - First settle the planning-state model.
   - Then apply this policy to the Orchestrator's return-to-planning decision.
 - Update `ticket-orchestrator-routing` or equivalent prompt/workflow guidance.
 - Before returning a queued/ready Ticket to planning, the Orchestrator must inspect enough context to distinguish:
@@ -52,7 +52,7 @@ Update Orchestrator routing guidance so a Ticket is returned to planning only wh
 
 ## Non-goals
 
-- Reintroducing `preflight` as a separate operation, state, or lane.
+- Reintroducing a separate readiness-check operation, state, or lane outside planning.
 - Making every queued Ticket require extensive code archaeology.
 - Removing Orchestrator judgment; the point is to make the judgment evidence-based.
 - Letting coder Pods silently decide product/API/authority boundaries that are genuinely missing.

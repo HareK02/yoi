@@ -6,7 +6,7 @@ status: open
 kind: task
 priority: P2
 labels: [ticket, workflow, git, process, cleanup]
-workflow_state: intake
+workflow_state: planning
 created_at: 2026-06-07T22:43:09Z
 updated_at: 2026-06-07T22:43:09Z
 assignee: null
@@ -18,7 +18,7 @@ legacy_ticket: null
 Recent Ticket-driven / multi-agent work has produced many small commits where most commits are Ticket record lifecycle events rather than implementation changes. A typical implemented Ticket currently creates commits such as:
 
 ```text
-ticket: preflight ...
+ticket: planning ...
 ticket: delegate ...
 feat/fix: ...
 ticket: report implementation ...
@@ -41,7 +41,7 @@ Define and implement a lower-noise commit policy for Ticket lifecycle records pr
 - Reduce commit count caused by one-event-per-commit Ticket record updates.
 - Define which Ticket lifecycle events should be batched together.
 - Candidate batching policy:
-  - Combine preflight + delegation into one `ticket: delegate ...` commit when done in one orchestration step.
+  - Combine planning + delegation into one `ticket: delegate ...` commit when done in one orchestration step.
   - Combine implementation report + reviewer approval into one `ticket: approve ...` commit when approval is known before committing the record.
   - Batch multiple newly discovered follow-up Tickets into one `ticket: add ... tasks` commit when created in the same conversation/decision burst.
   - Keep close commits separate when they move open -> closed and write `resolution.md`, unless a better policy is explicitly chosen.

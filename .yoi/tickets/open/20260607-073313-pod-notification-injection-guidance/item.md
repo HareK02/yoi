@@ -6,7 +6,7 @@ status: open
 kind: task
 priority: P2
 labels: [pod, notification, prompt, orchestration, ux]
-workflow_state: intake
+workflow_state: planning
 created_at: 2026-06-07T07:33:13Z
 updated_at: 2026-06-07T07:33:13Z
 assignee: null
