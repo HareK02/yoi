@@ -256,3 +256,86 @@ Coder-reported design summary:
 - Supported kinds include ordering, dependency, conflict, waiting/capacity, and accepted-plan records.
 
 ---
+
+<!-- event: review author: reviewer at: 2026-06-08T13:22:06Z status: approve -->
+
+## Review: approve
+
+Review result: approve.
+
+Evidence:
+- Inspected commit `b28b7759f51e7c9c7ccaaa15358b475e3889952c` and changed files `.yoi/workflow/ticket-orchestrator-routing.md`, `crates/pod/src/feature/builtin/ticket.rs`, `crates/ticket/src/lib.rs`, and `crates/ticket/src/tool.rs`.
+- Storage is per-Ticket `artifacts/orchestration-plan.jsonl`; records are JSONL under the Ticket backend root and validated by `ticket doctor`.
+- Backend/tool surface supports recording and querying by Ticket plus relation kind with kinds `before`, `after`, `blocked_by`, `blocks`, `conflicts_with`, `do_not_parallelize`, `waiting_capacity_note`, and `accepted_plan`.
+- Query tool is registered in the read-only Ticket tool set; record tool is kept out of read-only and available only in mutating/lifecycle tool sets.
+- The implementation stores bounded Ticket/project planning fields and does not change workflow_state, reorder queues, start work, implement a scheduler, or introduce broad relation-graph validation.
+- Orchestrator workflow guidance now tells queued routing to consult plan records and to record durable project-relevant plan decisions.
+
+Validation run from the review worktree passed:
+- `cargo fmt --check`
+- `git diff --check b28b7759f51e7c9c7ccaaa15358b475e3889952c^ b28b7759f51e7c9c7ccaaa15358b475e3889952c`
+- `cargo test -p ticket orchestration_plan`
+- `cargo test -p pod feature::builtin::ticket`
+- `cargo run -q -p yoi -- ticket doctor`
+- `cargo check --workspace`
+- `nix build .#yoi`
+
+---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-08T13:23:45Z -->
+
+## Implementation report
+
+Merge-ready dossier for human/orchestrator approval.
+
+Status:
+- Implementation branch: `ticket-orchestration-plan-tool`
+- Worktree: `.worktree/ticket-orchestration-plan-tool`
+- Commit under review: `b28b7759f51e7c9c7ccaaa15358b475e3889952c ticket: add orchestration plan tools`
+- Reviewer: `reviewer-ticket-orchestration-plan-tool`
+- Review result: approved; no blocking findings.
+
+Intent / invariant check:
+- Adds a lightweight Ticket-domain orchestration plan/note surface.
+- Does not implement a scheduler, background queue runner, dependency graph solver, TaskStore replacement, or typed Ticket relation metadata.
+- Does not change Ticket workflow_state semantics or move Tickets automatically.
+- Keeps local runtime/session/socket/raw model output out of git-tracked plan records.
+
+Implementation summary:
+- Adds typed `OrchestrationPlanKind` / `OrchestrationPlanRecord` support.
+- Stores records as per-Ticket `artifacts/orchestration-plan.jsonl` JSONL.
+- Adds backend append/query APIs, including query by Ticket id/slug and kind filter.
+- Adds LLM tools `TicketOrchestrationPlanRecord` and `TicketOrchestrationPlanQuery`.
+- Exposes query in read-only Ticket tools and record mutation only in mutating/lifecycle Ticket tools.
+- Adds validation and `ticket doctor` diagnostics for orchestration-plan artifacts.
+- Updates Orchestrator routing workflow guidance to query/record plan context before accepting queued Tickets.
+
+Reviewer evidence:
+- Required record classes are covered: before, after, blocked_by, blocks, conflicts_with, do_not_parallelize, waiting_capacity_note, accepted_plan.
+- Accepted-plan fields are bounded project-relevant fields (`summary`, `branch`, `worktree`, `role_plan`).
+- Validation rejects malformed records such as missing related Ticket for relation kinds, invalid accepted-plan combinations, missing waiting notes, oversized/single-line field violations, and artifact owner mismatch.
+- Capability split was checked in `crates/pod/src/feature/builtin/ticket.rs`.
+
+Validation evidence:
+- Coder reported pass:
+  - `cargo fmt --check`
+  - `git diff --check`
+  - `cargo run -q -p yoi -- ticket doctor`
+  - `cargo check --workspace`
+  - `cargo test -p ticket`
+  - `cargo test -p pod feature::builtin::ticket`
+  - `nix build .#yoi`
+- Reviewer independently ran and passed:
+  - `cargo fmt --check`
+  - `git diff --check b28b7759f51e7c9c7ccaaa15358b475e3889952c^ b28b7759f51e7c9c7ccaaa15358b475e3889952c`
+  - `cargo test -p ticket orchestration_plan`
+  - `cargo test -p pod feature::builtin::ticket`
+  - `cargo run -q -p yoi -- ticket doctor`
+  - `cargo check --workspace`
+  - `nix build .#yoi`
+
+Residual risks / notes:
+- This is intentionally execution-plan metadata, not intrinsic project-level Ticket relations. `typed-ticket-relation-metadata` remains separate.
+- Final merge/close/cleanup is intentionally not performed here without explicit merge approval.
+
+---

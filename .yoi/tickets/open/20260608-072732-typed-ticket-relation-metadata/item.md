@@ -8,7 +8,7 @@ priority: 'P1'
 labels: ['ticket', 'relations', 'planning', 'panel', 'orchestrator']
 workflow_state: planning
 created_at: '2026-06-08T07:27:32Z'
-updated_at: '2026-06-08T07:28:29Z'
+updated_at: '2026-06-08T13:22:42Z'
 assignee: null
 ---
 

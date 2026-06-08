@@ -35,3 +35,25 @@ Considerations:
 The implementation should decide whether unresolved dependencies make Queue invalid, require confirmation, or allow Queue with a visible blocked state. The important requirement is that dependency relation metadata is not only an Orchestrator input; it should also inform the human Queue gate.
 
 ---
+
+<!-- event: decision author: hare at: 2026-06-08T13:22:42Z -->
+
+## Decision
+
+## Design consideration: avoid recreating umbrella Tickets through parent/child relations
+
+Umbrella Tickets are being deprecated as long-lived broad progress containers. This affects relation design.
+
+Parent/child relation kinds can easily recreate the umbrella pattern if they imply that one Ticket is a broad container whose close condition depends on manually inspecting child sufficiency. Therefore relation kinds such as `parent` / `child` should be reconsidered before implementation.
+
+Design guidance:
+
+- Keep concrete dependency/blocking relations distinct from broad grouping.
+- Prefer `Objective` records for medium-term goal/strategy grouping.
+- If decomposition needs to be represented, consider whether a relation such as `derived_from`, `split_from`, or `related` is safer than `parent` / `child`.
+- Do not make relation metadata imply that a broad umbrella Ticket should remain open as a progress container.
+- Any relation kind that approximates parent/child must define clear close semantics and avoid ambiguity around whether all child work is sufficient.
+
+This Ticket should explicitly decide whether to include parent/child relations at all in the first version.
+
+---
