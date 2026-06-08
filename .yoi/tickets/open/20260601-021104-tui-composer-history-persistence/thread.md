@@ -124,3 +124,24 @@ Validation:
 - `nix build .#yoi` before final completion because TUI behavior/packaging changes.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-08T23:38:48Z -->
+
+## Implementation report
+
+Implementation routing started after the previously deferred TUI table-rendering work was merged and cleaned up.
+
+Worktree/branch:
+- Worktree: `.worktree/tui-composer-history-persistence`
+- Branch: `tui-composer-history-persistence`
+- Base/routing commit: `ff5f985 ticket: route composer history persistence`
+
+Spawned sibling Coder Pod:
+- `coder-tui-composer-history-persistence`
+- Scope: non-recursive read on parent workspace root plus recursive write limited to the child worktree.
+
+Routing context:
+- The earlier `defer_parallel_tui_work` decision is resolved because `tui-chat-markdown-table-rendering` has been merged, closed, and cleaned up.
+- This Ticket is now the active TUI implementation work.
+
+---
