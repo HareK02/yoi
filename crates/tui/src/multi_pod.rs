@@ -1622,9 +1622,8 @@ async fn restore_workspace_companion_pod(
         runtime_command,
         pod_name: pod_name.to_string(),
         profile: None,
-        cwd: workspace_root.to_path_buf(),
+        workspace_root: workspace_root.to_path_buf(),
         resume_from: None,
-        resume_by_pod_name: true,
     };
     spawn_pod(config, |_| {}).await.map(|_| ())
 }
@@ -1638,9 +1637,8 @@ async fn spawn_workspace_companion_pod(
         runtime_command,
         pod_name: pod_name.to_string(),
         profile: None,
-        cwd: workspace_root.to_path_buf(),
+        workspace_root: workspace_root.to_path_buf(),
         resume_from: None,
-        resume_by_pod_name: false,
     };
     spawn_pod(config, |_| {}).await.map(|_| ())
 }
@@ -1654,9 +1652,8 @@ async fn restore_orchestrator_pod(
         runtime_command,
         pod_name: pod_name.to_string(),
         profile: None,
-        cwd: workspace_root.to_path_buf(),
+        workspace_root: workspace_root.to_path_buf(),
         resume_from: None,
-        resume_by_pod_name: true,
     };
     spawn_pod(config, |_| {}).await.map(|_| ())
 }

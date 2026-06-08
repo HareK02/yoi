@@ -215,10 +215,11 @@ fn is_recoverable_multi_open_error(error: &(dyn std::error::Error + 'static)) ->
 
 pub(crate) async fn run_spawn(
     resume_from: Option<SegmentId>,
+    pod_name: Option<String>,
     profile: Option<String>,
     runtime_command: PodRuntimeCommand,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let ready = match spawn::run(resume_from, profile, runtime_command.clone()).await? {
+    let ready = match spawn::run(resume_from, pod_name, profile, runtime_command.clone()).await? {
         SpawnOutcome::Ready(r) => r,
         SpawnOutcome::Cancelled => return Ok(()),
     };

@@ -75,6 +75,7 @@ type InlineTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 /// passes `--session <id>` to the spawned Pod runtime child.
 pub async fn run(
     resume_from: Option<SegmentId>,
+    pod_name: Option<String>,
     profile: Option<String>,
     runtime_command: PodRuntimeCommand,
 ) -> Result<SpawnOutcome, SpawnError> {
@@ -90,15 +91,16 @@ pub async fn run(
         defaults.default_profile_index,
     );
 
+    let selected_name = pod_name.unwrap_or(defaults.default_name);
+    let immediate = resume_from.is_some() || profile.is_some() && !selected_name.is_empty();
     let mut form = Form {
         cwd: defaults.cwd.clone(),
         scope_origin: defaults.scope_origin,
-        name_cursor: defaults.default_name.chars().count(),
-        name: defaults.default_name,
+        name_cursor: selected_name.chars().count(),
+        name: selected_name,
         message: None,
         editing: true,
         resume_from,
-        resume_by_pod_name: false,
         profile_choices,
         profile_index,
     };
@@ -106,34 +108,41 @@ pub async fn run(
     let mut terminal = make_inline_terminal()?;
 
     // Phase 1: confirm / cancel.
-    loop {
-        terminal.draw(|f| draw_form(f, &form))?;
-        match poll_event()? {
-            None => continue,
-            Some(Action::Submit) => {
-                if form.name.trim().is_empty() {
-                    form.message = Some(("name is required".to_string(), MessageKind::Error));
-                    continue;
+    if !immediate {
+        loop {
+            terminal.draw(|f| draw_form(f, &form))?;
+            match poll_event()? {
+                None => continue,
+                Some(Action::Submit) => {
+                    if form.name.trim().is_empty() {
+                        form.message = Some(("name is required".to_string(), MessageKind::Error));
+                        continue;
+                    }
+                    break;
                 }
-                break;
+                Some(Action::Cancel) => {
+                    form.editing = false;
+                    form.message = Some(("cancelled".to_string(), MessageKind::Info));
+                    terminal.draw(|f| draw_form(f, &form))?;
+                    drop(terminal);
+                    return Ok(SpawnOutcome::Cancelled);
+                }
+                Some(Action::Char(c)) => form.insert_char(c),
+                Some(Action::Backspace) => form.backspace(),
+                Some(Action::Delete) => form.delete_forward(),
+                Some(Action::Left) => form.move_left(),
+                Some(Action::Right) => form.move_right(),
+                Some(Action::Home) => form.name_cursor = 0,
+                Some(Action::End) => form.name_cursor = form.name.chars().count(),
+                Some(Action::ProfileNext) => form.cycle_profile_next(),
+                Some(Action::ProfilePrev) => form.cycle_profile_prev(),
             }
-            Some(Action::Cancel) => {
-                form.editing = false;
-                form.message = Some(("cancelled".to_string(), MessageKind::Info));
-                terminal.draw(|f| draw_form(f, &form))?;
-                drop(terminal);
-                return Ok(SpawnOutcome::Cancelled);
-            }
-            Some(Action::Char(c)) => form.insert_char(c),
-            Some(Action::Backspace) => form.backspace(),
-            Some(Action::Delete) => form.delete_forward(),
-            Some(Action::Left) => form.move_left(),
-            Some(Action::Right) => form.move_right(),
-            Some(Action::Home) => form.name_cursor = 0,
-            Some(Action::End) => form.name_cursor = form.name.chars().count(),
-            Some(Action::ProfileNext) => form.cycle_profile_next(),
-            Some(Action::ProfilePrev) => form.cycle_profile_prev(),
         }
+    } else if form.name.trim().is_empty() {
+        return Err(SpawnError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "name is required",
+        )));
     }
 
     // Phase 2: launch pod and wait for ready line. Drop the cursor
@@ -290,7 +299,6 @@ fn form_for_pod_name(pod_name: String, defaults: SpawnDefaults) -> Form {
         message: Some(("resuming pod...".to_string(), MessageKind::Progress)),
         editing: false,
         resume_from: None,
-        resume_by_pod_name: true,
         profile_choices: Vec::new(),
         profile_index: 0,
     }
@@ -370,9 +378,8 @@ async fn wait_for_ready(
         runtime_command: runtime_command.clone(),
         pod_name: form.name.clone(),
         profile: form.selected_profile_selector(),
-        cwd: form.cwd.clone(),
+        workspace_root: form.cwd.clone(),
         resume_from: form.resume_from,
-        resume_by_pod_name: form.resume_by_pod_name,
     };
     let ready = spawn_pod(config, |line| {
         form.message = Some((line.to_string(), MessageKind::Progress));
@@ -418,9 +425,6 @@ struct Form {
     /// child pod is launched with `--session <id>` so it restores
     /// from `id` and appends to the same session log.
     resume_from: Option<SegmentId>,
-    /// When true, launch the child with `--pod <name>` so the pod process
-    /// resolves name-keyed state before falling back to fresh creation.
-    resume_by_pod_name: bool,
     /// Optional profile choices passed with `--profile` for
     /// fresh spawns. This is not used for resume/attach flows because those must
     /// restore Pod state rather than re-evaluate a profile source.
@@ -622,7 +626,6 @@ mod tests {
             message: None,
             editing: true,
             resume_from: None,
-            resume_by_pod_name: false,
             profile_choices: Vec::new(),
             profile_index: 0,
         }
@@ -642,7 +645,6 @@ mod tests {
         assert_eq!(f.name, "agent");
         assert_eq!(f.name_cursor, "agent".chars().count());
         assert_eq!(f.resume_from, None);
-        assert!(f.resume_by_pod_name);
         assert!(!f.editing);
         assert_eq!(
             f.message,

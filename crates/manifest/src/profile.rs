@@ -24,7 +24,6 @@ const PROFILE_FORMAT_V1: &str = "yoi.lua-profile.v1";
 const BUILTIN_DEFAULT_PROFILE_NAME: &str = "default";
 const BUILTIN_DEFAULT_PROFILE: &str = include_str!("../../../resources/profiles/default.lua");
 const BUILTIN_MODEL_CATALOG: &str = include_str!("../../../resources/models/builtin.toml");
-const DEFAULT_POD_NAME: &str = "yoi";
 const WORKSPACE_OVERRIDE_LOCAL_FILENAME: &str = "override.local.toml";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -551,7 +550,7 @@ fn resolve_lua_profile_value(
     validate_profile_paths(&profile)?;
     let pod_name = options
         .pod_name
-        .unwrap_or_else(|| derive_pod_name(&source, profile.slug.as_deref()));
+        .ok_or(ProfileError::MissingRuntimePodName)?;
     let profile_meta = Some(ProfileMetadata {
         name: profile.slug.clone().or_else(|| source_name(&source)),
         description: profile.description.clone(),
@@ -1221,18 +1220,6 @@ fn builtin_model_context_window(reference: &str) -> Option<u64> {
     }
     None
 }
-fn derive_pod_name(source: &ProfileSource, slug: Option<&str>) -> String {
-    if matches!(source, ProfileSource::Registry { source: ProfileRegistrySource::Builtin, name, .. } if name == BUILTIN_DEFAULT_PROFILE_NAME)
-        || slug == Some(BUILTIN_DEFAULT_PROFILE_NAME)
-    {
-        return DEFAULT_POD_NAME.to_string();
-    }
-    let raw = slug
-        .map(str::to_string)
-        .or_else(|| source_name(source))
-        .unwrap_or_else(|| DEFAULT_POD_NAME.to_string());
-    sanitise_pod_name(&raw)
-}
 fn source_name(source: &ProfileSource) -> Option<String> {
     match source {
         ProfileSource::Path { path } => path
@@ -1240,23 +1227,6 @@ fn source_name(source: &ProfileSource) -> Option<String> {
             .and_then(|s| s.to_str())
             .map(str::to_string),
         ProfileSource::Registry { name, .. } => Some(name.clone()),
-    }
-}
-fn sanitise_pod_name(raw: &str) -> String {
-    let name: String = raw
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    if name.is_empty() {
-        DEFAULT_POD_NAME.to_string()
-    } else {
-        name
     }
 }
 fn canonicalize_existing_dir(path: &Path) -> Result<PathBuf, ProfileError> {
@@ -1295,7 +1265,7 @@ pub fn resolve_profile_artifact(
         source,
         base_dir,
         base_dir,
-        ProfileResolveOptions::default(),
+        ProfileResolveOptions::with_pod_name("artifact-pod"),
         raw_artifact.clone(),
         raw_artifact,
         None,
@@ -1342,6 +1312,8 @@ pub enum ProfileError {
     InvalidWorkspaceOverride { path: PathBuf, message: String },
     #[error("no default profile is configured")]
     NoDefaultProfile,
+    #[error("profile resolution requires an explicit runtime Pod name")]
+    MissingRuntimePodName,
     #[error("profile not found: {selector}")]
     ProfileNotFound { selector: String },
     #[error("ambiguous profile name `{name}`; use a source-qualified selector such as {matches:?}")]
@@ -1404,6 +1376,16 @@ mod tests {
         assert_eq!(default.path, None);
         assert_eq!(default.provenance, "builtin:default");
     }
+    #[test]
+    fn profile_resolution_requires_runtime_pod_name() {
+        let tmp = TempDir::new().unwrap();
+        let err = ProfileResolver::new()
+            .with_workspace_base(tmp.path())
+            .resolve(&ProfileSelector::Default, ProfileResolveOptions::default())
+            .unwrap_err();
+        assert!(matches!(err, ProfileError::MissingRuntimePodName));
+    }
+
     #[test]
     fn resolves_plain_lua_profile_with_runtime_pod_name_and_scope_intent() {
         let tmp = TempDir::new().unwrap();
@@ -1570,9 +1552,12 @@ return profile {
         let tmp = TempDir::new().unwrap();
         let resolved = ProfileResolver::new()
             .with_workspace_base(tmp.path())
-            .resolve(&ProfileSelector::Default, ProfileResolveOptions::default())
+            .resolve(
+                &ProfileSelector::source_named(ProfileRegistrySource::Builtin, "default"),
+                ProfileResolveOptions::with_pod_name("runtime-workspace"),
+            )
             .unwrap();
-        assert_eq!(resolved.manifest.pod.name, "yoi");
+        assert_eq!(resolved.manifest.pod.name, "runtime-workspace");
         assert_eq!(
             resolved.manifest.model.ref_.as_deref(),
             Some("codex-oauth/gpt-5.5")
@@ -1621,10 +1606,13 @@ record_event_trace = false
 
         let resolved = ProfileResolver::new()
             .with_workspace_base(&nested)
-            .resolve(&ProfileSelector::Default, ProfileResolveOptions::default())
+            .resolve(
+                &ProfileSelector::Default,
+                ProfileResolveOptions::with_pod_name("runtime-pod"),
+            )
             .unwrap();
 
-        assert_eq!(resolved.manifest.pod.name, "yoi");
+        assert_eq!(resolved.manifest.pod.name, "runtime-pod");
         assert_eq!(resolved.manifest.worker.language, "ja");
         assert!(!resolved.manifest.session.record_event_trace);
         assert_eq!(
@@ -1678,7 +1666,10 @@ language = "nested"
 
         let resolved = ProfileResolver::new()
             .with_workspace_base(&child)
-            .resolve(&ProfileSelector::Default, ProfileResolveOptions::default())
+            .resolve(
+                &ProfileSelector::Default,
+                ProfileResolveOptions::with_pod_name("runtime-pod"),
+            )
             .unwrap();
 
         assert_eq!(resolved.manifest.worker.language, "nested");
@@ -1710,7 +1701,10 @@ language = "nested"
 
         let err = ProfileResolver::new()
             .with_workspace_base(tmp.path())
-            .resolve(&ProfileSelector::Default, ProfileResolveOptions::default())
+            .resolve(
+                &ProfileSelector::Default,
+                ProfileResolveOptions::with_pod_name("runtime-pod"),
+            )
             .unwrap_err();
         assert!(matches!(err, ProfileError::InvalidWorkspaceOverride { .. }));
         assert!(err.to_string().contains("pod.name"));
