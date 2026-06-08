@@ -2,13 +2,13 @@
 id: '20260608-032200-panel-close-done-tickets'
 slug: 'panel-close-done-tickets'
 title: 'Close done Tickets from workspace panel'
-status: 'open'
+status: 'closed'
 kind: 'task'
 priority: 'P2'
 labels: ['tui', 'panel', 'ticket', 'close', 'workflow-state']
-workflow_state: 'inprogress'
+workflow_state: 'done'
 created_at: '2026-06-08T03:22:00Z'
-updated_at: '2026-06-08T06:09:31Z'
+updated_at: '2026-06-08T06:10:59Z'
 assignee: null
 legacy_ticket: null
 queued_by: 'workspace-panel'
