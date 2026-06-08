@@ -21,3 +21,12 @@ LocalTicketBackend によって作成されました。
 要件・受け入れ条件・invariant・validation が揃っており、Orchestrator が implementation routing できる状態になった。
 
 ---
+
+<!-- event: state_changed author: workspace-panel at: 2026-06-08T13:13:23Z from: ready to: queued reason: queued field: workflow_state -->
+
+## State changed
+
+Ticket を `workspace-panel` が queued にしました。
+
+
+---

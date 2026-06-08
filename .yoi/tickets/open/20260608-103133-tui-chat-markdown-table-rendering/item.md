@@ -6,11 +6,13 @@ status: 'open'
 kind: 'bug'
 priority: 'P2'
 labels: ['tui', 'chat', 'markdown', 'rendering', 'ux']
-workflow_state: 'ready'
+workflow_state: 'queued'
 created_at: '2026-06-08T10:31:33Z'
-updated_at: '2026-06-08T10:31:40Z'
+updated_at: '2026-06-08T13:13:23Z'
 assignee: null
 risk_flags: ['tui-rendering', 'markdown']
+queued_by: 'workspace-panel'
+queued_at: '2026-06-08T13:13:23Z'
 ---
 
 ## Background
