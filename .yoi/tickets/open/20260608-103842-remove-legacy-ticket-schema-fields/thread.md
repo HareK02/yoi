@@ -176,3 +176,20 @@ Needed decision before implementation continues:
 No merge, close, or implementation edits have occurred.
 
 ---
+
+<!-- event: decision author: orchestrator at: 2026-06-08T12:17:50Z -->
+
+## Decision
+
+Human decision received: delete `legacy_ticket` values even when non-null.
+
+Policy for this Ticket:
+- Treat existing non-null `legacy_ticket` frontmatter values as obsolete migration breadcrumbs rather than current relation authority.
+- Remove `legacy_ticket` from all current local Ticket `item.md` frontmatter, including closed historical Tickets and open Tickets.
+- Do not add a replacement generic external issue field in this Ticket.
+- Continue to keep historical thread/resolution prose intact unless a test fixture requires a narrow update.
+- The separate `typed-ticket-relation-metadata` Ticket remains the place to design durable typed relations if needed later.
+
+This resolves the implementation block and authorizes Coder to continue the schema cleanup.
+
+---
