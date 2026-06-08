@@ -182,3 +182,61 @@ Stop/completion policy:
 - Because the human authorized cleanup after completion, this Orchestrator will proceed through reviewer approval, merge-completion validation, Ticket close, Pod stop, worktree removal, and branch deletion if the branch is approved and merge authority remains clear.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-08T09:02:18Z -->
+
+## Implementation report
+
+Coder completed and reviewer delegated.
+
+Coder result:
+- Pod: `coder-replace-intake-planning`
+- Commit: `ada6db9 feat: replace intake workflow state with planning`
+- Worktree status: clean after commit.
+- Diff against `develop`: 11 files changed, 290 insertions, 270 deletions.
+
+Files touched by coder:
+- `.yoi/workflow/multi-agent-workflow.md`
+- `.yoi/workflow/ticket-intake-workflow.md`
+- `.yoi/workflow/ticket-orchestrator-routing.md`
+- `.yoi/workflow/ticket-preflight-workflow.md`
+- `crates/client/src/ticket_role.rs`
+- `crates/ticket/src/lib.rs`
+- `crates/ticket/src/tool.rs`
+- `crates/tui/src/multi_pod.rs`
+- `crates/tui/src/workspace_panel.rs`
+- `docs/development/work-items.md`
+- `docs/development/workflows.md`
+
+Coder reported implementation:
+- Replaced user-facing/model-output `TicketWorkflowState::Intake` with `Planning`.
+- Legacy `workflow_state: intake` parses as `Planning`; emitted/default state is `planning`.
+- Updated transition graph to `planning -> ready -> queued -> inprogress -> done`, and allowed reasoned `ready/queued -> planning` returns through typed state-change events.
+- Preserved Intake role/tool names where they refer to role identity (`TicketIntakeReady`, Intake role/profile/persona).
+- Removed new `needs_preflight` input from `TicketCreate`; legacy metadata remains for read compatibility and is no longer a stop gate.
+- Updated Panel terminology/actions toward planning/clarification/preparation.
+- Kept `ticket-preflight-workflow.md` as compatibility slug, but rewrote it toward planning / requirements sync rather than standalone preflight state/lane.
+
+Coder reported validation:
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo test -p ticket --lib`
+- `cargo test -p ticket workflow_state --lib`
+- `cargo test -p ticket ticket_workflow_tool --lib`
+- `cargo test -p ticket ticket_intake_ready_tool --lib`
+- `cargo test -p tui workspace_panel --lib`
+- `cargo test -p yoi ticket_cli`
+- `cargo check --workspace`
+- `cargo run -q -p yoi -- ticket doctor`
+- `nix build .#yoi`
+
+Reviewer delegation:
+- Spawned sibling reviewer Pod: `reviewer-replace-intake-planning`.
+- Reviewer scope: read-only child worktree plus non-recursive parent-root read required by current live launch behavior.
+- Reviewer was instructed to judge against the recorded Ticket requirements and binding decisions.
+
+Pending:
+- Await reviewer verdict before merge-ready dossier / merge-completion.
+- No merge, close, final approval, or cleanup has occurred for this Ticket.
+
+---
