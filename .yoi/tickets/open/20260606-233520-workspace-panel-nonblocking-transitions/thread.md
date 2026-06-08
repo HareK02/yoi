@@ -302,3 +302,46 @@ Stop/completion policy:
 - Because the human authorized cleanup after completion, this Orchestrator will proceed through reviewer approval, merge-completion validation, Ticket close, Pod stop, worktree removal, and branch deletion if the branch is approved and merge authority remains clear.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-08T02:20:50Z -->
+
+## Implementation report
+
+Coder completed and reviewer delegated.
+
+Coder result:
+- Pod: `coder-workspace-panel-nonblocking`
+- Commit: `12a4f39 tui: make panel transitions nonblocking`
+- Worktree status: clean after commit.
+- Diff against `develop`: 2 files changed, 133 insertions, 45 deletions.
+
+Files touched by coder:
+- `crates/tui/src/multi_pod.rs`
+- `crates/tui/src/single_pod.rs`
+
+Coder reported implementation:
+- Initial panel constructs a minimal/loading panel immediately and defers full snapshot plus Orchestrator/Companion ensure into enter-time background reload.
+- `PendingReload` now carries `OrchestratorLifecycleMode`, allowing initial `Ensure` and follow-up `Observe` reloads.
+- Returning from nested Pod no longer awaits `app.reload_or_notice().await`; it marks refreshing and requests observe reload on re-entry.
+- Opening a Pod redraws immediately with attach/restore/open progress before entering nested single-Pod path.
+- Companion send, Ticket Intake launch, and Ticket action dispatch start background refresh after dispatch completion instead of blocking on synchronous reload.
+- Added local `refreshing` / enter-reload UI state and focused tests.
+
+Coder reported validation:
+- `cargo test -q -p tui multi_`
+- `cargo test -q -p tui workspace_panel`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo run -q -p yoi -- ticket doctor`
+- `nix build .#yoi`
+
+Reviewer delegation:
+- Spawned sibling reviewer Pod: `reviewer-workspace-panel-nonblocking`.
+- Reviewer scope: read-only child worktree plus non-recursive parent-root read required by launch cwd validation.
+- Reviewer was instructed to judge against the recorded Ticket requirements and binding decisions.
+
+Pending:
+- Await reviewer verdict before merge-ready dossier / merge-completion.
+- No merge, close, final approval, or cleanup has occurred for this Ticket.
+
+---
