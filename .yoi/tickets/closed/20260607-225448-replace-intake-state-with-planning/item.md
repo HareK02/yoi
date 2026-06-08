@@ -2,13 +2,13 @@
 id: 20260607-225448-replace-intake-state-with-planning
 slug: replace-intake-state-with-planning
 title: Replace Ticket intake state with planning state
-status: open
+status: 'closed'
 kind: task
 priority: P1
 labels: [ticket, workflow-state, orchestrator, panel, intake, planning]
-workflow_state: 'inprogress'
+workflow_state: 'done'
 created_at: 2026-06-07T22:54:48Z
-updated_at: '2026-06-08T09:17:24Z'
+updated_at: '2026-06-08T09:19:17Z'
 assignee: null
 legacy_ticket: null
 queued_by: 'workspace-panel'
