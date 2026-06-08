@@ -345,3 +345,75 @@ Pending:
 - No merge, close, final approval, or cleanup has occurred for this Ticket.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-08T02:27:05Z -->
+
+## Implementation report
+
+Merge-ready dossier: workspace panel non-blocking transitions
+
+Ticket id/slug:
+- `20260606-233520-workspace-panel-nonblocking-transitions` / `workspace-panel-nonblocking-transitions`
+
+Branch/worktree:
+- Branch: `workspace-panel-nonblocking-transitions`
+- Worktree: `.worktree/workspace-panel-nonblocking-transitions`
+- Current branch commit:
+  - `12a4f39 tui: make panel transitions nonblocking`
+
+Intent / invariant check:
+- Panel transitions now provide immediate visible progress/loading states before slow local/runtime waits where practical.
+- Pod spawn/restore/attach authority, identity, and metadata semantics are preserved.
+- Ticket workflow-state/action semantics and role-launch policy are preserved.
+- No durable scheduler, lease, background-job system, or broad runtime-loop rewrite was introduced.
+- Local pending reload/transition state remains TUI-local and guarded by a single pending handle.
+- Selection/composer state preservation semantics were reviewed; successful sends intentionally clear composer text, while rejected/busy/failed paths preserve it.
+
+Implementation summary:
+- Added practical initial loading/minimal panel construction and moved full snapshot/Orchestrator ensure into enter-time background reload.
+- Extended `PendingReload` to carry `OrchestratorLifecycleMode`, enabling initial `Ensure` and follow-up `Observe` reloads.
+- Changed nested Pod return path so it requests background observe reload and marks refreshing instead of awaiting `reload_or_notice().await` before drawing the panel.
+- Added visible open/attach/restore progress before entering slow nested single-Pod path.
+- Changed Companion send, Ticket Intake launch, and Ticket action dispatch paths to draw immediate feedback and start background refresh after dispatch completion.
+- Added focused tests for initial deferred loading, open-return refreshing state, and open progress wording.
+
+Files touched:
+- `crates/tui/src/multi_pod.rs`
+- `crates/tui/src/single_pod.rs`
+
+Coder / reviewer Pods:
+- Coder: `coder-workspace-panel-nonblocking`
+- Reviewer: `reviewer-workspace-panel-nonblocking`
+
+Review evidence:
+- Reviewer verdict: `approve`.
+- Reviewer confirmed first draw is practically non-blocking via minimal `MultiPodApp` plus enter-time `PendingReload`.
+- Reviewer confirmed attach/open return no longer awaits synchronous reload before making panel visible.
+- Reviewer confirmed progress is drawn before slow nested open/restore/attach waits.
+- Reviewer confirmed Companion send, Ticket Intake launch, and Ticket action dispatch provide immediate feedback and refresh afterward.
+- Reviewer confirmed background reload updates Pod list, panel rows, diagnostics, Orchestrator/Companion header state, selection visibility, and composer target availability.
+- Reviewer confirmed duplicate overlapping reloads are guarded by one `PendingReload` handle and pending tasks are aborted on explicit abort/drop.
+- Reviewer confirmed Ticket authority semantics and no-Ticket Pod-centric behavior are preserved.
+
+Validation performed by coder and/or reviewer:
+- `cargo test -q -p tui multi_`
+- `cargo test -q -p tui workspace_panel`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo run -q -p yoi -- ticket doctor`
+- `nix build .#yoi`
+
+Blockers fixed or rejected findings:
+- No reviewer blockers.
+
+Residual risks:
+- Coverage remains unit/focused rather than E2E terminal/process interaction, so the subjective "felt immediate" behavior is validated structurally rather than by real terminal timing. This matches the project E2E gap and is acceptable for this Ticket.
+
+Dirty state:
+- Child worktree is clean at `12a4f39`.
+- Main workspace has unrelated Ticket-record changes for other active/new Tickets; they are outside this branch's touched paths and are understood.
+
+Parent/human decision needs:
+- User has authorized merge-completion and cleanup after approved work. Proceeding to merge-completion unless post-merge validation fails.
+
+---
