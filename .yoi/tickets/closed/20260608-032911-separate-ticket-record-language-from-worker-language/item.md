@@ -2,13 +2,13 @@
 id: '20260608-032911-separate-ticket-record-language-from-worker-language'
 slug: 'separate-ticket-record-language-from-worker-language'
 title: 'Separate Ticket record language from worker response language'
-status: 'open'
+status: 'closed'
 kind: 'task'
 priority: 'P2'
 labels: ['ticket', 'language', 'config', 'profile', 'workflow']
-workflow_state: 'inprogress'
+workflow_state: 'done'
 created_at: '2026-06-08T03:29:11Z'
-updated_at: '2026-06-08T08:18:46Z'
+updated_at: '2026-06-08T08:21:55Z'
 assignee: null
 legacy_ticket: null
 queued_by: 'workspace-panel'
