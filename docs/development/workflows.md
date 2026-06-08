@@ -12,7 +12,7 @@ Current workflow themes include:
 
 - Intake clarification before materializing user requests as Tickets
 - Orchestrator routing from Tickets to the next workflow/action
-- preflight before delegating uncertain Ticket work
+- planning/requirements synchronization when concrete missing decisions or information block routing
 - worktree setup and cleanup
 - sibling coder/reviewer Pod orchestration
 - human-gated maintenance and merge readiness

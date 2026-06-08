@@ -17,7 +17,7 @@ User request / conversation
   -> Ticket Intake Workflow
   -> TicketCreate / TicketComment
   -> Orchestrator routing
-  -> preflight / spike / implementation / review / blocked / close
+  -> planning sync / spike / implementation / review / blocked / close
 ```
 
 - `Ticket` は durable orchestration record。
@@ -41,7 +41,7 @@ Intake は以下を行う。
 - background / requirements / acceptance criteria / escalation conditions を整理する。
 - binding decisions / invariants と implementation latitude を分けて書く。
 - 具体的な除外や触れてはいけない境界が binding decision である場合は、generic な除外リストではなく invariant / escalation condition として明記する。
-- readiness / needs_preflight / risk flags を明示する。
+- readiness / open questions / risk flags を明示する。
 - ユーザー合意後に Ticket を作成する。
 - 既存 Ticket の refinement を求められた場合は、TicketComment で経緯を残す。
 
@@ -136,9 +136,9 @@ unspecified:
 - どうしても分類不能な時だけ使う。理由を Ticket に書く。
 ```
 
-### 5. needs_preflight / risk flags を付ける
+### 5. open questions / risk flags を付ける
 
-以下に触れる Ticket は `needs_preflight: true` 相当として扱い、Ticket body に明記する。
+以下に触れる Ticket は risk flags と reviewer/orchestrator focus を Ticket body に短く明記する。これは stop gate ではない。具体的な未決定 decision / information がある場合だけ、blocking open question として記録する。
 
 - profile / manifest / scope / permission。
 - session / history / Pod metadata / persistence。
@@ -149,7 +149,7 @@ unspecified:
 - 複数の自然な設計方針があるもの。
 - reviewer が diff だけでは見落としやすい設計リスク。
 
-risk flags は短い語でよい。`needs_preflight: true` と risk flags は強い signal だが、missing boundary がすでに人間/Orchestrator の Ticket-recorded decision で補われている場合は、その decision を根拠に Orchestrator が routing できる。preflight は、実装が product / API / UX / authority boundary / explicit design constraint を silently 決める場合には mandatory のままである。
+risk flags は短い語でよい。missing boundary がすでに人間/Orchestrator の Ticket-recorded decision で補われている場合は、その decision を根拠に Orchestrator が routing できる。単に risk があるだけなら Orchestrator は Ticket を戻さず、IntentPacket に escalation / reviewer focus を明記して進める。
 
 例:
 
@@ -170,7 +170,7 @@ Kind:
 Priority:
 Labels:
 Readiness:
-Needs preflight:
+Needs planning sync:
 Risk flags:
 
 Background:
@@ -207,7 +207,7 @@ Related tickets/docs:
 
 - `TicketCreate` を使う。
 - title / slug / kind / priority / labels / body を指定する。
-- body に readiness / needs_preflight / risk flags と、binding decisions / invariants、implementation latitude、escalation conditions を Markdown で明記する。
+- body に readiness / open questions / risk flags と、binding decisions / invariants、implementation latitude、escalation conditions を Markdown で明記する。
 
 既存 Ticket refinement の場合:
 
@@ -221,7 +221,7 @@ Related tickets/docs:
 
 - 作成/更新した Ticket id / slug / title。
 - readiness。
-- needs_preflight / risk flags。
+- open questions / risk flags。
 - 次に Orchestrator が取るべき routing 候補。
 - 未決定点があれば、そのまま明示する。
 
@@ -243,7 +243,6 @@ Intake はここで止まる。implementation / worktree / coder / reviewer 起�
 ## Readiness
 
 - readiness: implementation_ready | requirements_sync_needed | spike_needed | blocked | unspecified
-- needs_preflight: true | false
 - risk_flags: [...]
 
 ## Escalation conditions
@@ -277,6 +276,6 @@ Ticket の body は Markdown/freeform を維持する。すべてを strict sche
 
 ## 他 Workflow への接続
 
-- `ticket-preflight-workflow`: needs_preflight が true、または implementation_ready か不安な場合に接続する。
+- `ticket-preflight-workflow`: legacy compatibility slug の planning/requirements sync 入口。新規 routing は standalone preflight ではなく planning return/requirements sync として扱う。
 - `multi-agent-workflow`: Orchestrator が implementation_ready と判断した後に接続する。
 - `ticket-orchestrator-routing`: この Workflow が作った Ticket を routing する後続 Workflow。

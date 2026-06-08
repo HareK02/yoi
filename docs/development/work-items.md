@@ -22,7 +22,7 @@ Use the highest-level interface that matches the work:
 
 - Use `yoi panel` for the Ticket/Intake/Orchestrator workspace UI and role-launch actions.
 - Inside Pods, use typed Ticket tools to create, inspect, comment, review, and close Tickets.
-- For multi-step work, follow the Ticket Intake, Orchestrator Routing, Preflight, and Multi-agent workflows.
+- For multi-step work, follow the Ticket Intake, Orchestrator Routing, planning/requirements-sync, and Multi-agent workflows.
 
 Maintainers can inspect the local `.yoi/tickets/` files directly when debugging storage, but normal user instructions should go through `yoi panel`, Ticket tools, or `yoi ticket ...`.
 
@@ -126,7 +126,7 @@ Ticket-driven development normally moves through these gates:
 
 1. Intake
 2. Orchestrator routing
-3. Preflight or spike when needed
+3. Planning/requirements sync or spike when needed
 4. Implementation assignment
 5. Review
 6. Merge / validation / cleanup
@@ -154,7 +154,7 @@ Use `ticket-orchestrator-routing` to classify the next action for an existing Ti
 Routing classifications include:
 
 - `requirements_sync_needed`
-- `preflight_needed`
+- `return_to_planning`
 - `spike_needed`
 - `implementation_ready`
 - `review_needed`
@@ -165,11 +165,11 @@ Routing classifications include:
 
 Routing decisions should be recorded with `TicketComment` using `plan` or `decision` role. The decision should state the classification, evidence checked, reason, next action, and escalation conditions.
 
-### 3. Preflight
+### 3. Planning/requirements sync
 
-Use `ticket-preflight-workflow` before implementation when the Ticket touches design/authority boundaries, has multiple natural implementation strategies, or cannot produce a short IntentPacket.
+Use `ticket-preflight-workflow` only as a legacy compatibility slug for planning/requirements sync. Return `ready` or `queued` Tickets to `planning` only when the Orchestrator can name a concrete missing decision or information item.
 
-Preflight should resolve or record:
+Planning sync should resolve or record:
 
 - requirements and acceptance criteria;
 - current code map;
@@ -177,7 +177,7 @@ Preflight should resolve or record:
 - critical risks and failure modes;
 - implementation-ready vs requirements-sync/spike/blocked classification.
 
-Do not send preflight-needed Tickets directly to coder Pods.
+Do not send Tickets with unresolved concrete missing decisions/information directly to coder Pods. Risk alone should proceed with an IntentPacket plus escalation/reviewer focus.
 
 ### 4. Implementation assignment
 
@@ -317,7 +317,7 @@ A useful Ticket states:
 - requirements;
 - acceptance criteria;
 - relevant binding decisions/invariants, implementation latitude, and escalation conditions;
-- readiness / preflight needs / risk flags when relevant;
+- readiness, open questions, and risk flags when relevant;
 - implementation reports when work is submitted;
 - reviews;
 - final resolution when closed.

@@ -92,8 +92,8 @@ impl TicketIntakeHandoff {
         out.push_str("\nPanel handoff:\n");
         push_bounded_bullet(out, "workspace", &self.workspace_label);
         push_bounded_bullet(out, "workspace_orchestrator_pod", &self.orchestrator_pod);
-        out.push_str("- When Intake has clarified the request and created/updated the Ticket, use the typed Ticket tool surface to append `intake_summary` and set `workflow_state = ready` when the Ticket is ready to queue.\n");
-        out.push_str("- Handoff report fields: created_or_updated_ticket_id_or_slug, workflow_state, needs_preflight, risk_flags, intake_summary.\n");
+        out.push_str("- When Intake has clarified the request and created/updated the Ticket, use the typed Ticket tool surface to append `intake_summary` and set `workflow_state = ready` when the Ticket is ready to queue; use planning language for Tickets that still need clarification/preparation.\n");
+        out.push_str("- Handoff report fields: created_or_updated_ticket_id_or_slug, workflow_state, open_questions_or_risk_flags, intake_summary.\n");
         out.push_str("- Do not start implementation automatically; the user queues a ready Ticket via panel (`ready -> queued`), and Orchestrator treats `queued` as schedulable before moving it to `inprogress` when starting.\n");
     }
 }
@@ -1108,12 +1108,12 @@ workflow = "ticket-review-workflow"
 
         let mut orchestrator = TicketRoleLaunchContext::new(temp.path(), TicketRole::Orchestrator);
         orchestrator.ticket = Some(TicketRef::slug("launcher"));
-        orchestrator.intent_packet = Some("Route to implementation after preflight.".into());
+        orchestrator.intent_packet = Some("Route to implementation after planning sync.".into());
         orchestrator.validation = vec!["cargo check --workspace --all-targets".into()];
         let orchestrator_plan = plan_ticket_role_launch(orchestrator).unwrap();
         let orchestrator_text = text_segment(&orchestrator_plan);
         assert!(orchestrator_text.contains("Role: orchestrator"));
-        assert!(orchestrator_text.contains("Route to implementation after preflight."));
+        assert!(orchestrator_text.contains("Route to implementation after planning sync."));
         assert!(orchestrator_text.contains("cargo check --workspace --all-targets"));
         assert!(orchestrator_text.contains("workflow_state = inprogress"));
         assert!(orchestrator_text.contains("worktree-workflow"));

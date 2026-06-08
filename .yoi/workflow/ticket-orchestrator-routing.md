@@ -1,5 +1,5 @@
 ---
-description: Ticket を読み、Orchestrator が preflight / spike / implementation / review / blocked / close へ明示的に routing する workflow
+description: Ticket を読み、Orchestrator が planning return / spike / implementation / review / blocked / close へ明示的に routing する workflow
 model_invokation: true
 user_invocable: true
 requires: []
@@ -19,13 +19,13 @@ Panel Queue / queued notification は、人間が Orchestrator に routing を�
 ```text
 TicketCreate / TicketComment
   -> Ticket Orchestrator Routing Workflow
-  -> requirements sync / preflight / spike / implementation / review / blocked / close / pending
+  -> planning return / requirements sync / spike / implementation / review / blocked / close / pending
   -> 必要に応じて他 Workflow へ接続
 ```
 
-- Intake は Ticket の materialization を担当する。
-- Orchestrator は Ticket の next action を分類する。
-- `ticket-preflight-workflow` は実装前の設計・要件 gate。
+- Intake は Ticket の materialization と planning/clarification を担当する role であり、workflow_state 名ではない。
+- workflow_state は `planning -> ready -> queued -> inprogress -> done` を基本遷移とする。
+- `ticket-preflight-workflow` は legacy slug 互換の planning/requirements sync entry であり、`preflight` を独立 state / lane / long-lived operation として扱わない。
 - `ready -> queued` は人間が Orchestrator routing を許可した状態であり、worktree 作成や Pod 起動の許可そのものではない。
 - `multi-agent-workflow` は coder / reviewer Pod と worktree を使う実装・レビュー loop。
 - この Workflow は自動 scheduler / lease / unattended maintainer ではない。
@@ -43,7 +43,7 @@ Orchestrator は以下を行う。
 - routing decision を `TicketComment` で Ticket thread に記録する。
 - implementation-ready の場合は `multi-agent-workflow` に渡す `IntentPacket` を作る。
 - implementation-ready かつ Ticket が `queued` の場合は、worktree 作成 / implementation Pod `SpawnPod` / coder routing などの side effect の前に、既存の typed Ticket backend/tool path で `queued -> inprogress` を記録する。
-- preflight-needed の場合は coder Pod に直投げせず、`ticket-preflight-workflow` に接続する。
+- `ready` または `queued` に具体的な不足 decision / information がある場合だけ、typed state-change/routing event 付きで `planning` に戻す。
 
 ## Orchestrator がしないこと
 
@@ -55,6 +55,7 @@ Orchestrator は以下を行う。
 - merge / close / cleanup 権限を持たない場面で勝手に完了処理しない。
 - Ticket tools があるからといって arbitrary filesystem write を行わない。
 - Notification だけを完了証拠にしない。Pod output / diff / validation / Ticket evidence を確認する。
+- 具体的な不足項目を言語化できない場合に、単に risky という理由だけで `planning` に戻さない。その場合は IntentPacket に escalation / reviewer focus を明記して進める。
 
 ## 使用する Ticket tools
 
@@ -64,7 +65,7 @@ Orchestrator は以下を行う。
 - `TicketShow`: 対象 Ticket の body / thread / artifacts / resolution 確認。
 - `TicketComment`: routing decision / intent packet / blocked reason / next question の記録。
 - `TicketStatus`: pending/open などの状態整理が明示的に許可された場合だけ使う。
-- `TicketWorkflowState`: `queued -> inprogress` acceptance など、workflow_state 遷移が明示的に許可・必要な場合だけ使う。
+- `TicketWorkflowState`: `queued -> inprogress` acceptance、`inprogress -> done`、または concrete missing decision/information reason を伴う `ready|queued -> planning` に使う。
 - `TicketClose`: 完了権限と resolution が揃っている場合だけ使う。
 - `TicketDoctor`: routing 前後の整合性確認。
 
@@ -75,7 +76,8 @@ Orchestrator は以下を行う。
 `workflow_state = queued` は、Ticket が routing 対象として人間により Orchestrator へ渡された状態である。Orchestrator は queued notification を受けたら、Ticket と workspace state を読んで、次のどちらかを行う。
 
 - unblocked と判断する場合: `queued -> inprogress` を記録してから worktree 作成、implementation/review Pod spawn、その他の implementation side effect に進む。
-- blocked / not-ready と判断する場合: concise な理由を Ticket thread に記録し、queued のまま待つか、既存の Ticket status/state mechanism で明示的に defer/block する。
+- concrete missing decision / information がある場合: `TicketWorkflowState` で `queued -> planning` を記録し、reason/body に不足項目を残す。既存の claimed live/restorable Intake/Planning Pod があり、既存通知経路が使える場合は同じ理由を通知する。
+- external action 待ちなど planning では解決しない blocker の場合: concise な理由を Ticket thread に記録し、queued のまま待つか、既存の Ticket status/state mechanism で明示的に defer/block する。
 
 Invariant:
 
@@ -86,11 +88,11 @@ Invariant:
 
 ## Routing classification
 
-Orchestrator は対象 Ticket を以下のいずれかに分類する。
+Orchestrator は対象 Ticket を以下のいずれかに分類する。複数に見える場合は、次に必要な action が最も早いものを選ぶ。
 
 ### `requirements_sync_needed`
 
-仕様・用語・UX・責務境界・受け入れ条件が未同期。
+まだ `planning` に留めるべき、または `planning -> ready` に進める前に clarification が必要な状態。
 
 条件:
 
@@ -101,27 +103,27 @@ Orchestrator は対象 Ticket を以下のいずれかに分類する。
 
 Action:
 
-- Intake / human に戻す。
+- Intake / human / Planning sync に戻す。
 - `TicketComment` で不足情報と質問を記録する。
 - coder Pod は起動しない。
 
-### `preflight_needed`
+### `return_to_planning`
 
-実装前に設計境界・要件・反証観点を同期すべき状態。
+`ready` または `queued` とされているが、実装 side effect 前に具体的な不足 decision / information が見つかった状態。
 
 条件:
 
-- profile / manifest / scope / permission / session / history / Pod metadata / prompt context に触れる。
-- public API / plugin / feature boundary / storage migration / security / secrets に触れる。
-- 複数の自然な product / API / UX / authority / design-boundary 方針があり、human / Orchestrator decision なしでは固定できない。
-- implementation-ready に見えるが、reviewer が diff だけでは見落としやすい設計リスクがある。
-- `needs_preflight: true` または同等の記述が Ticket にある。ただし、missing boundary がすでに Ticket/thread の explicit human/Orchestrator decision で補われている場合は、その decision を binding として扱い、残る不確実性が実装 tactic に閉じているかを確認して routing できる。
+- product / API / UX / authority boundary / storage migration / security / secrets などについて、実装前に決めなければならない具体項目がある。
+- 複数の自然な方針があり、human / Orchestrator decision なしでは固定できない。
+- acceptance criteria、binding decisions、または escalation conditions に、実装可否を左右する具体的欠落がある。
 
 Action:
 
-- `ticket-preflight-workflow` に接続する。
-- `TicketComment` で preflight reason を記録する。
-- preflight が implementation-ready にするまで coder Pod は起動しない。
+- `TicketWorkflowState` で `ready -> planning` または `queued -> planning` を記録する。
+- reason/body に具体的な不足項目を含める。
+- `TicketComment` で routing decision と質問を記録する。
+- 既存の claimed live/restorable Intake/Planning Pod があり、既存通知経路が使える場合は同じ理由を通知する。実用的な経路がない場合は follow-up として report する。
+- planning が再度 `ready` にするまで coder Pod は起動しない。
 
 ### `spike_needed`
 
@@ -151,7 +153,7 @@ Action:
 - binding decisions / invariants と implementation latitude が区別されている。
 - reviewer が判断する basis と escalation conditions が明確。
 - validation が書ける。
-- design / authority boundary の未決定がない、または preflight / human decision で補われている。
+- design / authority boundary の未決定がない、または planning return / human decision で補われている。
 - 残る不確実性が bounded implementation investigation / local tactic selection に閉じている。
 - IntentPacket を短く書ける。
 
@@ -184,7 +186,7 @@ Action:
 
 条件:
 
-- design/product/security 判断が必要。
+- design/product/security 判断が必要だが、planning で同期すれば進められる種類ではない。
 - credential / secret / environment / external service が必要。
 - 別 Ticket / branch / upstream change の完了待ち。
 - scope/permission が不足している。
@@ -262,7 +264,7 @@ Action:
 - Acceptance criteria
 - Binding decisions / invariants
 - Implementation latitude
-- Readiness / needs_preflight / risk flags
+- Readiness / open questions / risk flags
 - Escalation conditions
 - Validation
 - Thread の plan / decision / implementation_report / review
@@ -270,11 +272,10 @@ Action:
 
 ### 3. Classification を決める
 
-1つに決める。複数に見える場合は、次に必要な action が最も早いものを選ぶ。
-
 例:
 
-- implementation-ready に見えるが authority boundary の explicit decision がない → `preflight_needed`; explicit decision が Ticket/thread にあるなら binding として IntentPacket に載せる。
+- implementation-ready に見えるが authority boundary の explicit decision がない → concrete missing decision として `return_to_planning`; explicit decision が Ticket/thread にあるなら binding として IntentPacket に載せる。
+- implementation-ready に見えるが単に risk が高い → `implementation_ready` とし、IntentPacket に escalation / reviewer focus を明記する。
 - 実装済みだが review がない → `review_needed`
 - 要件が曖昧で spike も必要そう → `requirements_sync_needed` を優先し、調査問いを明確化する
 - 完了しているが close 権限がない → `close_ready` として dossier を返す
@@ -335,12 +336,12 @@ Critical risks / reviewer focus:
 - reviewer にも見てほしい失敗パターン。reviewer は recorded intent / binding decisions / invariants / implementation latitude / acceptance criteria / explicit escalation conditions に照らして判断し、不記録の preferred tactic を基準にしない。
 ```
 
-IntentPacket が短く書けない場合、`implementation_ready` ではなく `preflight_needed` または `requirements_sync_needed` に戻す。
+IntentPacket が短く書けない場合、`implementation_ready` ではなく `return_to_planning` または `requirements_sync_needed` に戻す。
 
 ### 6. 後続 Workflow へ接続する
 
-- `requirements_sync_needed` → `ticket-intake-workflow` / human
-- `preflight_needed` → `ticket-preflight-workflow`
+- `requirements_sync_needed` → `ticket-intake-workflow` / human / planning sync
+- `return_to_planning` → `ticket-preflight-workflow`（legacy compatibility slug の planning sync entry）
 - `spike_needed` → read-only investigation plan / Pod（許可後）
 - `implementation_ready` → `multi-agent-workflow`
 - `review_needed` → reviewer Pod / review workflow
@@ -353,8 +354,9 @@ IntentPacket が短く書けない場合、`implementation_ready` ではなく `
 この Workflow の完了条件は次のいずれかである。
 
 - routing decision が Ticket に記録され、次に接続する Workflow / human action が明確である。
+- `ready` / `queued` を `planning` に戻した場合、typed state-change/routing event に concrete missing decision / information reason が残っている。
 - implementation-ready Ticket について IntentPacket が Ticket に記録され、`multi-agent-workflow` に渡せる。
-- requirements-sync / preflight / spike / blocked / review / close-ready の理由と次 action が Ticket に記録されている。
+- requirements-sync / planning return / spike / blocked / review / close-ready の理由と次 action が Ticket に記録されている。
 - routing 不要と判断され、その理由が明確である。
 
 ## この Workflow で固定しないもの
