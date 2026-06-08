@@ -140,3 +140,29 @@ Critical risks / reviewer focus:
 Accepted queued implementation after reading the Ticket, workspace state, and Intake claim lifecycle code map. This acceptance precedes worktree creation and coder/reviewer Pod spawning.
 
 ---
+
+<!-- event: plan author: orchestrator at: 2026-06-08T03:08:56Z -->
+
+## Plan
+
+Implementation routing accepted and worktree created.
+
+Worktree plan:
+- Branch: `commit-intake-claims-after-launch-success`
+- Worktree: `.worktree/commit-intake-claims-after-launch-success`
+- Base: `d2a040d ticket: route intake claim and spawn cwd tickets`
+- Scope: implement post-success existing-Ticket Intake claim commit and focused tests.
+
+Delegation plan:
+- Spawn sibling coder Pod with write scope limited to `.worktree/commit-intake-claims-after-launch-success`.
+- Coder must run Bash commands from the child worktree, not from the main workspace.
+- Coder must not edit main-workspace `.yoi` / Ticket / workflow / docs records, and must not create generated memory/local/runtime/secret-like files.
+- Reviewer will be spawned read-only after coder reports diff/commits and validation evidence.
+
+Related queued/preflight note:
+- `allow-spawnpod-child-workspace-cwd` was routed as `preflight_needed` and remains queued; do not depend on the future `SpawnPod.cwd` field for this implementation.
+
+Stop/completion policy:
+- Because the human authorized cleanup after completion, this Orchestrator will proceed through reviewer approval, merge-completion validation, Ticket close, Pod stop, worktree removal, and branch deletion if the branch is approved and merge authority remains clear.
+
+---

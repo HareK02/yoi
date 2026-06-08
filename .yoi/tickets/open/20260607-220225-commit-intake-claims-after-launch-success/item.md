@@ -8,7 +8,7 @@ priority: P1
 labels: [tui, panel, ticket, intake, bug]
 workflow_state: 'inprogress'
 created_at: 2026-06-07T22:02:25Z
-updated_at: '2026-06-08T03:08:26Z'
+updated_at: '2026-06-08T03:08:56Z'
 assignee: null
 legacy_ticket: null
 queued_by: 'workspace-panel'
