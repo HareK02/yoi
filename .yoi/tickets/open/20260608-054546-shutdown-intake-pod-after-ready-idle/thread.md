@@ -281,3 +281,81 @@ Pending:
 - No merge, close, final approval, or cleanup has occurred for this Ticket.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-08T08:10:43Z -->
+
+## Implementation report
+
+Merge-ready dossier: Intake Pod shutdown after ready idle
+
+Ticket id/slug:
+- `20260608-054546-shutdown-intake-pod-after-ready-idle` / `shutdown-intake-pod-after-ready-idle`
+
+Branch/worktree:
+- Branch: `shutdown-intake-pod-after-ready-idle`
+- Worktree: `.worktree/shutdown-intake-pod-after-ready-idle`
+- Current branch commit:
+  - `61c3231 pod: stop intake after ready idle`
+
+Intent / invariant check:
+- Successful `TicketIntakeReady` schedules shutdown only for actual Ticket Intake role Pods.
+- Failed `TicketIntakeReady`, non-Intake roles, and other tools do not schedule shutdown.
+- Shutdown happens after `finish_controller_run(...)` completes final response/history/session/status work and the new status is Idle.
+- Shutdown signal is transient runtime state, not model-visible prompt text and not durable Ticket/claim mutation.
+- Local role-session/Ticket claims are preserved; stopping the live Pod does not delete/release claims.
+- Clean shutdown uses the ordinary controller shutdown path.
+
+Implementation summary:
+- Added process-local runtime Ticket role marker passed by Ticket role launcher as hidden `--ticket-role <role>`.
+- Added `shutdown_after_idle` logic and hook for successful `TicketIntakeReady` tool results.
+- Registered the hook during Pod setup and evaluated pending shutdown after run completion when status is Idle.
+- Ensured Companion/manual spawn/restore/non-role paths use no runtime Ticket role marker.
+- Added tests for success, failure, role mismatch, other tools, non-Idle behavior, and role launch/runtime args.
+
+Files touched:
+- `crates/pod/src/shutdown_after_idle.rs`
+- `crates/pod/src/controller.rs`
+- `crates/pod/src/pod.rs`
+- `crates/pod/src/entrypoint.rs`
+- `crates/pod/src/lib.rs`
+- `crates/client/src/spawn.rs`
+- `crates/client/src/ticket_role.rs`
+- `crates/tui/src/spawn.rs`
+- `crates/tui/src/multi_pod.rs`
+
+Coder / reviewer Pods:
+- Coder: `coder-shutdown-intake-idle`
+- Reviewer: `reviewer-shutdown-intake-idle`
+
+Review evidence:
+- Reviewer verdict: `approve`.
+- Reviewer verified role-marker propagation is limited to Ticket role launch path, `TicketIntakeReadyShutdownHook` schedules only for intake role plus successful `TicketIntakeReady`, and controller shutdown check runs after `finish_controller_run(...)` and only for Idle status.
+- Reviewer confirmed manual/Companion/non-role paths remain `ticket_role: None`, and claim/session registries are not touched.
+
+Validation performed by coder and/or reviewer:
+- `cargo test -p pod shutdown_after_idle --lib`
+- `cargo test -p client runtime_args --lib`
+- `cargo test -p client ticket_role --lib`
+- `cargo test -p pod --lib`
+- `cargo check`
+- `cargo fmt --check`
+- `git diff --check develop...HEAD`
+- `cargo run -q -p yoi -- ticket doctor`
+- `nix build .#yoi`
+
+Blockers fixed or rejected findings:
+- No reviewer blockers.
+
+Residual risks:
+- Hidden `--ticket-role` is not an authorization boundary; manually starting a Pod with `--ticket-role intake` opts that Pod into self-shutdown behavior only and does not grant Ticket authority or control over other Pods.
+- Generic restore of an old Intake role session will not automatically regain the process-local role marker unless launched through the Ticket role path; this matches the non-durable shutdown-signal boundary for this Ticket.
+- Ordering coverage is focused/unit-level rather than full E2E, consistent with the current project E2E gap.
+
+Dirty state:
+- Child worktree is clean at `61c3231`.
+- Main workspace has unrelated active worktree/Ticket-record changes for other in-progress Tickets; they are outside this branch's touched paths and are understood.
+
+Parent/human decision needs:
+- User has authorized merge-completion and cleanup after approved work. Proceeding to merge-completion unless post-merge validation fails.
+
+---
