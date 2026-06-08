@@ -2,15 +2,15 @@
 id: 20260606-233520-workspace-panel-nonblocking-transitions
 slug: workspace-panel-nonblocking-transitions
 title: Make workspace panel transitions non-blocking
-status: open
+status: 'closed'
 kind: task
 priority: P2
 labels: [tui, panel, ux, performance]
 created_at: 2026-06-06T23:35:20Z
-updated_at: '2026-06-08T02:27:05Z'
+updated_at: '2026-06-08T02:29:21Z'
 assignee: null
 legacy_ticket: null
-workflow_state: 'inprogress'
+workflow_state: 'done'
 queued_by: 'workspace-panel'
 queued_at: '2026-06-08T00:02:21Z'
 ---
