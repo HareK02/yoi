@@ -128,3 +128,64 @@ State decision:
 - Do not create a worktree or spawn coder/reviewer for it yet.
 
 ---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-08T12:50:49Z from: queued to: inprogress reason: orchestrator_acceptance field: workflow_state -->
+
+## State changed
+
+Accepted queued implementation after re-reading the Ticket, its dependency notes, current queued set, and workspace state. The previously blocking lower-level schema cleanup (`remove-legacy-ticket-schema-fields`) has landed and closed, so this Ticket can proceed on the stricter Ticket schema.
+
+---
+
+<!-- event: decision author: orchestrator at: 2026-06-08T12:50:49Z -->
+
+## Decision
+
+Routing decision: implementation_ready
+
+Reason:
+- The recorded dependency/order on `replace-intake-state-with-planning` is satisfied.
+- The explicit waiting decision on `remove-legacy-ticket-schema-fields` is now satisfied; that Ticket has been merged and closed, including stricter current Ticket schema/API surfaces.
+- This Ticket has clear requirements and bounded non-goals: implement a lightweight Ticket/orchestration-domain plan surface, not a scheduler, TaskStore replacement, or generic role/session registry.
+
+IntentPacket:
+
+Intent:
+- Add a typed, durable Ticket orchestration plan/note surface for Orchestrator routing decisions about Ticket ordering, blockers, conflicts, capacity waiting, and accepted implementation plans.
+
+Design direction / binding decisions:
+- Treat this as a Ticket-domain capability, implemented in the existing Ticket backend/tool surface rather than as generic TaskStore or local runtime registry state.
+- Prefer a small append/query API with two LLM-facing tools, e.g. one mutating record tool and one read/query tool. Exact names/schema are implementation latitude, but the tool names and JSON schema should be clear and typed.
+- Durable storage should live under the Ticket backend root and be git-trackable. A simple per-Ticket artifact such as `artifacts/orchestration-plan.jsonl` is acceptable if records are validated, append-only enough for audit, and queryable by Ticket id/slug and relation kind.
+- Query must work by Ticket id/slug and by relation kind; relation records should be bounded and typed, not arbitrary conversation dumps.
+- Supported relation/note classes must cover at least: before/after ordering, blocked_by/blocks dependency, conflicts_with/do_not_parallelize conflict, waiting/capacity notes, and accepted_plan summaries.
+- Accepted plan summaries may include bounded project-relevant plan fields such as branch/worktree/role plan, but must not store sockets, raw session ids, model output, local runtime claims, or secret/private environment details in git-tracked Ticket records.
+- Keep Ticket `workflow_state` semantics unchanged: planning/ready/queued/inprogress/done remain authority, and plan records do not move Tickets by themselves.
+- The tool must not automatically reorder/schedule queued Tickets; Orchestrator reads it as context and still makes explicit `queued -> inprogress` acceptance decisions.
+- Read-only Ticket capability should be able to query plan records if normal Ticket read-only tools can inspect Ticket records; mutating plan recording should require the same lifecycle/mutating Ticket capability level as other Ticket writes.
+- Integrate Orchestrator prompt/workflow guidance so queued routing consults these records before acceptance. Do not make Companion a mutating orchestration actor.
+
+Implementation latitude:
+- Coder may choose exact record IDs/timestamps/author fields and whether to expose relation kind names as `before`, `after`, `blocked_by`, `blocks`, `conflicts_with`, `do_not_parallelize`, `waiting`, `accepted_plan` or a similarly clear enum.
+- Coder may implement storage as typed artifacts or typed thread events, but should justify the choice in tests/implementation report and ensure validation/queryability.
+- Coder may add doctor validation for the new durable record format if artifacts are used.
+- Coder may update local workflows/prompts/docs narrowly to teach Orchestrator to query these records before routing queued Tickets.
+
+Escalate if:
+- Implementation requires a new scheduling engine, automatic dependency graph solver, or background queue runner.
+- Implementation needs to store local runtime/session/socket details in git-tracked Ticket records.
+- The design would alter Ticket workflow_state transitions or bypass the human Queue gate.
+- The tool surface cannot be added without broad plugin/feature-capability redesign.
+
+Validation:
+- Focused backend tests for record creation, validation, persistence, and query by Ticket and relation kind.
+- Tool schema/tests for record/query tools and capability tool lists if changed.
+- CLI/panel tests only if those surfaces are intentionally exposed in this first version; otherwise no CLI/panel UI is required.
+- Prompt/workflow resource checks or tests where available.
+- `cargo fmt --check`.
+- `git diff --check`.
+- `cargo run -q -p yoi -- ticket doctor`.
+- `cargo check --workspace`.
+- `nix build .#yoi` before final completion.
+
+---
