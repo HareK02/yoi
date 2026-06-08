@@ -307,3 +307,91 @@ Pending:
 - No merge, close, final approval, or cleanup has occurred.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-08T09:17:24Z -->
+
+## Implementation report
+
+Merge-ready dossier: planning workflow-state replacement
+
+Ticket id/slug:
+- `20260607-225448-replace-intake-state-with-planning` / `replace-intake-state-with-planning`
+
+Branch/worktree:
+- Branch: `replace-intake-state-with-planning`
+- Worktree: `.worktree/replace-intake-state-with-planning`
+- Current branch commits:
+  - `ada6db9 feat: replace intake workflow state with planning`
+  - `eddb33c docs: fix planning sync workflow references`
+
+Intent / invariant check:
+- User-facing/model-output workflow state `intake` is replaced with planning-oriented `planning`.
+- Intake remains a role/profile/persona/tool name where appropriate, separate from workflow state.
+- `preflight` is not preserved as a separate workflow state, lane, or long-lived gate.
+- Legacy `workflow_state: intake` parses compatibly as planning; emitted/default state is `planning`.
+- Auditability is preserved through typed state-change/routing events.
+- Legacy `needs_preflight` remains only as compatibility metadata/model output, not as a new public stop gate.
+
+Implementation summary:
+- Replaced `TicketWorkflowState::Intake` with `Planning` in model/tool paths.
+- Updated transition graph to `planning -> ready -> queued -> inprogress -> done`.
+- Added reasoned `ready/queued -> planning` return transitions.
+- Updated `TicketIntakeReady` to remain Intake-role named while performing `planning -> ready` state transition.
+- Updated Panel labels/actions and planning/clarification/preparation terminology.
+- Removed new `needs_preflight` tool input exposure while preserving legacy storage/read compatibility.
+- Reworked active workflow/docs terminology; retained `ticket-preflight-workflow` only as compatibility slug with planning/requirements-sync content.
+- Fixed reviewer-blocked invalid planning-sync workflow slug references and remaining maintained-doc Preflight lifecycle wording.
+
+Files touched:
+- `.yoi/workflow/multi-agent-workflow.md`
+- `.yoi/workflow/ticket-intake-workflow.md`
+- `.yoi/workflow/ticket-orchestrator-routing.md`
+- `.yoi/workflow/ticket-preflight-workflow.md`
+- `crates/client/src/ticket_role.rs`
+- `crates/ticket/src/lib.rs`
+- `crates/ticket/src/tool.rs`
+- `crates/tui/src/multi_pod.rs`
+- `crates/tui/src/workspace_panel.rs`
+- `docs/development/work-items.md`
+- `docs/development/workflows.md`
+
+Coder / reviewer Pods:
+- Coder: `coder-replace-intake-planning`
+- Reviewer: `reviewer-replace-intake-planning`
+
+Review evidence:
+- Initial reviewer verdict: `request_changes` for invalid/non-existent workflow slug references and maintained docs still presenting Preflight as a normal lifecycle gate.
+- Coder fix commit: `eddb33c docs: fix planning sync workflow references`.
+- Re-review verdict: `approve`.
+- Reviewer confirmed blocker terms were removed from active maintained files outside historical `.yoi/tickets`, and that `ticket-preflight-workflow` is clearly described as a planning/requirements-sync compatibility slug rather than standalone Preflight gate.
+
+Validation performed by coder and/or reviewer:
+- `cargo fmt --check`
+- `git diff --check develop...HEAD`
+- `cargo test -p ticket --lib`
+- `cargo test -p ticket workflow_state --lib`
+- `cargo test -p ticket ticket_workflow_tool --lib`
+- `cargo test -p ticket ticket_intake_ready_tool --lib`
+- `cargo test -p tui workspace_panel --lib`
+- `cargo test -p yoi ticket_cli`
+- `cargo check --workspace`
+- `cargo run -q -p yoi -- ticket doctor`
+- `nix build .#yoi`
+
+Blockers fixed or rejected findings:
+- Fixed: invalid `ticket-planning sync-workflow` / `$user/ticket-planning sync-workflow` references.
+- Fixed: maintained docs presenting Preflight as ordinary lifecycle gate.
+- No remaining reviewer blockers.
+
+Residual risks:
+- Historical `.yoi/tickets/**` records still contain old `Preflight`, `preflight_needed`, and `needs_preflight` text. This is acceptable because they are durable historical records/audit artifacts, not active workflow/tool/docs guidance.
+- `ticket-preflight-workflow` remains as compatibility slug; its filename still contains `preflight`, but content explicitly frames it as planning/requirements sync compatibility and not a separate state/lane/operation.
+
+Dirty state:
+- Child worktree is clean at `eddb33c`.
+- Main workspace has unrelated Ticket-record changes for other Intake/Planning work; they are outside this branch's touched paths and understood.
+
+Parent/human decision needs:
+- User has authorized merge-completion and cleanup after approved work. Proceeding to merge-completion unless post-merge validation fails.
+
+---
