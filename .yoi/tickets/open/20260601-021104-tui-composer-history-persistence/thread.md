@@ -36,3 +36,34 @@ Updated based on user direction:
 Intake 確認により、既存 Ticket は実装 routing 可能な状態です。未解決の blocking open question はありません。主な reviewer focus は user-data persistence 境界、private/secret 混入前提の非露出、workspace 分離、既存 TUI recall semantics の回帰防止です。
 
 ---
+
+<!-- event: state_changed author: workspace-panel at: 2026-06-08T13:19:06Z from: ready to: queued reason: queued field: workflow_state -->
+
+## State changed
+
+Ticket を `workspace-panel` が queued にしました。
+
+
+---
+
+<!-- event: decision author: orchestrator at: 2026-06-08T13:19:31Z -->
+
+## Decision
+
+Routing decision: defer_parallel_tui_work
+
+This Ticket is queued and implementation-ready, but I am intentionally not accepting it to `inprogress` yet.
+
+Reason:
+- There is already an active queued-route TUI implementation in progress: `tui-chat-markdown-table-rendering`, with Coder Pod `coder-tui-chat-markdown-table-rendering` running in `.worktree/tui-chat-markdown-table-rendering`.
+- `tui-composer-history-persistence` also touches TUI composer/input behavior and likely adjacent tests/helpers.
+- Running both TUI changes concurrently would raise conflict/review risk without a clear need; this Ticket can follow immediately after the table-rendering Ticket reaches merge-ready or lands.
+
+State decision:
+- Leave this Ticket `queued`.
+- Do not create a worktree or spawn a coder for it yet.
+
+Next action:
+- Re-read this Ticket after `tui-chat-markdown-table-rendering` finishes review/merge routing, then accept it from queued if still unblocked.
+
+---
