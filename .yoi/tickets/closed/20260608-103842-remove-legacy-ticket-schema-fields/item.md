@@ -2,13 +2,13 @@
 id: '20260608-103842-remove-legacy-ticket-schema-fields'
 slug: 'remove-legacy-ticket-schema-fields'
 title: 'Remove legacy Ticket schema fields and intake compatibility'
-status: 'open'
+status: 'closed'
 kind: 'task'
 priority: 'P1'
 labels: ['ticket', 'schema', 'migration', 'cleanup']
-workflow_state: 'inprogress'
+workflow_state: 'done'
 created_at: '2026-06-08T10:38:42Z'
-updated_at: '2026-06-08T12:45:30Z'
+updated_at: '2026-06-08T12:49:24Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-06-08T11:21:33Z'
