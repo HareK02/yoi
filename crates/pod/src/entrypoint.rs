@@ -28,6 +28,12 @@ struct Cli {
     #[arg(long, value_name = "PATH")]
     workspace: Option<PathBuf>,
 
+    /// Internal spawned child process/tool working directory. This is separate
+    /// from `--workspace`; adopted Pods use `--workspace` for runtime context
+    /// and this path for tool defaults.
+    #[arg(long, value_name = "PATH", requires = "adopt", hide = true)]
+    tool_cwd: Option<PathBuf>,
+
     /// Manifest TOML to use directly as a one-file compatibility/debug input.
     /// This bypasses profile discovery but still applies builtin defaults and
     /// the same required-field validation boundary.
@@ -94,6 +100,17 @@ fn runtime_workspace_root(cli: &Cli) -> Result<PathBuf, String> {
             .map_err(|e| format!("failed to resolve current directory for workspace: {e}"))
             .map(|cwd| cwd.join(raw))
     }
+}
+
+fn runtime_tool_cwd(cli: &Cli, workspace_root: &Path) -> Result<PathBuf, String> {
+    let raw = cli.tool_cwd.as_deref().unwrap_or(workspace_root);
+    let path = if raw.is_absolute() {
+        raw.to_path_buf()
+    } else {
+        workspace_root.join(raw)
+    };
+    std::fs::canonicalize(&path)
+        .map_err(|e| format!("failed to resolve tool cwd {}: {e}", path.display()))
 }
 
 fn runtime_pod_name(cli: &Cli, workspace_root: &Path) -> String {
@@ -350,8 +367,33 @@ async fn run_cli_inner(cli: Cli) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        match Pod::from_manifest_spawned(manifest, store, loader, callback).await {
-            Ok(p) => p,
+        let tool_cwd = match runtime_tool_cwd(&cli, &workspace_root) {
+            Ok(path) => path,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        match Pod::from_manifest_spawned_with_context(
+            manifest,
+            store,
+            loader,
+            callback,
+            workspace_root.clone(),
+            tool_cwd.clone(),
+        )
+        .await
+        {
+            Ok(p) => {
+                if let Err(e) = std::env::set_current_dir(&tool_cwd) {
+                    eprintln!(
+                        "error: failed to enter tool cwd {}: {e}",
+                        tool_cwd.display()
+                    );
+                    return ExitCode::FAILURE;
+                }
+                p
+            }
             Err(e) => {
                 eprintln!("error: failed to create spawned pod: {e}");
                 return ExitCode::FAILURE;

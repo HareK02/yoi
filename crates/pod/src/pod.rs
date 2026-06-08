@@ -231,8 +231,11 @@ pub struct Pod<C: LlmClient, St: Store> {
     /// `segment_id` and append tally. `self.segment_id()` is a thin
     /// wrapper over `segment_state.segment_id()`.
     segment_state: Arc<SegmentState>,
-    /// Absolute working directory of the Pod.
+    /// Absolute tool/process working directory of the Pod.
     pwd: PathBuf,
+    /// Absolute runtime workspace root used for project records, workflow,
+    /// memory, Ticket config, Profile context, and spawned-child inheritance.
+    workspace_root: PathBuf,
     /// Shared, atomically-swappable view of the Pod's resolved scope.
     /// Cloned out to `ScopedFs` instances (builtin tools, fs_view,
     /// compact worker) so scope updates propagate to every consumer
@@ -417,6 +420,7 @@ impl<C: LlmClient + Clone + 'static, St: Store + Clone + 'static> Pod<C, St> {
             pod_metadata_writer: None,
             segment_state: self.segment_state.clone(),
             pwd: self.pwd.clone(),
+            workspace_root: self.workspace_root.clone(),
             scope: self.scope.clone(),
             delegation_scope: self.delegation_scope.clone(),
             hook_builder: HookRegistryBuilder::new(),
@@ -597,6 +601,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             store,
             pod_metadata_writer: None,
             segment_state: SegmentState::new(session_id, segment_id, 0),
+            workspace_root: pwd.clone(),
             pwd,
             scope: SharedScope::new(scope),
             delegation_scope,
@@ -695,9 +700,15 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         &self.manifest
     }
 
-    /// The Pod's working directory.
+    /// The Pod's tool/process working directory.
     pub fn pwd(&self) -> &Path {
         &self.pwd
+    }
+
+    /// The Pod's runtime workspace root. This stays separate from `pwd` for
+    /// spawned children whose SpawnPod `cwd` only changes tool defaults.
+    pub fn workspace_root(&self) -> &Path {
+        &self.workspace_root
     }
 
     /// The Pod's directory scope, as a shared atomically-swappable
@@ -1239,7 +1250,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 .map(|d| d.name)
                 .collect()
         };
-        let agents_md_read = read_agents_md(&self.pwd);
+        let agents_md_read = read_agents_md(&self.workspace_root);
         for warning in agents_md_read.warnings {
             if let Some(n) = alerter.as_ref() {
                 n.alert(AlertLevel::Warn, AlertSource::AgentsMd, warning);
@@ -2784,7 +2795,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         // `Some(0)` means disabled, same as `None`. Otherwise the
         // `tokens_since >= 0` comparison would fire on every post-run.
         let Some(threshold) = memory_cfg.extract_threshold.filter(|n| *n > 0) else {
-            let layout = memory::WorkspaceLayout::resolve(&memory_cfg, &self.pwd);
+            let layout = memory::WorkspaceLayout::resolve(&memory_cfg, &self.workspace_root);
             let model = memory_cfg
                 .extract_model
                 .as_ref()
@@ -2814,7 +2825,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                 .is_err()
             {
-                let layout = memory::WorkspaceLayout::resolve(&memory_cfg, &self.pwd);
+                let layout = memory::WorkspaceLayout::resolve(&memory_cfg, &self.workspace_root);
                 let model = memory_cfg
                     .extract_model
                     .as_ref()
@@ -2870,7 +2881,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     ) -> Result<ExtractDecision, PodError> {
         use memory::extract;
 
-        let layout = memory::WorkspaceLayout::resolve(memory_cfg, &self.pwd);
+        let layout = memory::WorkspaceLayout::resolve(memory_cfg, &self.workspace_root);
         let model = memory_cfg
             .extract_model
             .as_ref()
@@ -3193,7 +3204,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         let files_threshold = memory_cfg.consolidation_threshold_files.filter(|n| *n > 0);
         let bytes_threshold = memory_cfg.consolidation_threshold_bytes.filter(|n| *n > 0);
         if files_threshold.is_none() && bytes_threshold.is_none() {
-            let layout = memory::WorkspaceLayout::resolve(&memory_cfg, &self.pwd);
+            let layout = memory::WorkspaceLayout::resolve(&memory_cfg, &self.workspace_root);
             let model = memory_cfg
                 .consolidation_model
                 .as_ref()
@@ -3221,7 +3232,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                 .is_err()
             {
-                let layout = memory::WorkspaceLayout::resolve(&memory_cfg, &self.pwd);
+                let layout = memory::WorkspaceLayout::resolve(&memory_cfg, &self.workspace_root);
                 let model = memory_cfg
                     .consolidation_model
                     .as_ref()
@@ -3274,7 +3285,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     ) -> Result<ConsolidateDecision, PodError> {
         use memory::consolidate;
 
-        let layout = memory::WorkspaceLayout::resolve(memory_cfg, &self.pwd);
+        let layout = memory::WorkspaceLayout::resolve(memory_cfg, &self.workspace_root);
         let model = memory_cfg
             .consolidation_model
             .as_ref()
@@ -3730,6 +3741,7 @@ where
             pod_metadata_writer,
             segment_state: SegmentState::new(session_id, segment_id, 0),
             pwd: common.pwd,
+            workspace_root: common.workspace_root,
             scope: SharedScope::new(common.scope),
             delegation_scope: common.delegation_scope,
             hook_builder: HookRegistryBuilder::new(),
@@ -3784,7 +3796,34 @@ where
         loader: PromptLoader,
         callback_socket: PathBuf,
     ) -> Result<Self, PodError> {
-        let mut common = prepare_pod_common(&manifest, &loader, /* parse_template */ true)?;
+        let pwd = current_pwd()?;
+        Self::from_manifest_spawned_with_context(
+            manifest,
+            store,
+            loader,
+            callback_socket,
+            pwd.clone(),
+            pwd,
+        )
+        .await
+    }
+
+    pub async fn from_manifest_spawned_with_context(
+        manifest: PodManifest,
+        store: St,
+        loader: PromptLoader,
+        callback_socket: PathBuf,
+        workspace_root: PathBuf,
+        tool_cwd: PathBuf,
+    ) -> Result<Self, PodError> {
+        let mut common = prepare_pod_common_with_context(
+            &manifest,
+            &loader,
+            /* parse_template */ true,
+            workspace_root,
+            tool_cwd,
+            manifest.scope.clone(),
+        )?;
         let skill_shadows = std::mem::take(&mut common.skill_shadows);
 
         // A spawned child starts its own conversation, so it mints a
@@ -3809,6 +3848,7 @@ where
             pod_metadata_writer,
             segment_state: SegmentState::new(session_id, segment_id, 0),
             pwd: common.pwd,
+            workspace_root: common.workspace_root,
             scope: SharedScope::new(common.scope),
             delegation_scope: common.delegation_scope,
             hook_builder: HookRegistryBuilder::new(),
@@ -3987,6 +4027,7 @@ where
             pod_metadata_writer,
             segment_state: SegmentState::new(session_id, segment_id, state.entries_count),
             pwd: common.pwd,
+            workspace_root: common.workspace_root,
             scope: SharedScope::new(common.scope),
             delegation_scope: common.delegation_scope,
             hook_builder: HookRegistryBuilder::new(),
@@ -4610,11 +4651,13 @@ pub enum PodError {
 }
 
 /// Bundle of resources that every high-level Pod constructor needs:
-/// pwd, scope, an LLM client, the prompt catalog, and (optionally) a
-/// parsed system-prompt template. Built once by [`prepare_pod_common`]
-/// from the resolved manifest and then split into Pod fields.
+/// tool pwd, runtime workspace root, scope, an LLM client, the prompt catalog,
+/// and (optionally) a parsed system-prompt template. Built once by
+/// [`prepare_pod_common`] from the resolved manifest and then split into Pod
+/// fields.
 struct PodCommon {
     pwd: PathBuf,
+    workspace_root: PathBuf,
     scope: Scope,
     delegation_scope: DelegationScope,
     client: Box<dyn LlmClient>,
@@ -4705,8 +4748,9 @@ fn prepare_pod_common(
     parse_template: bool,
 ) -> Result<PodCommon, PodError> {
     let pwd = current_pwd()?;
-    let scope = build_scope_with_memory(manifest, &pwd)?;
-    prepare_pod_common_from_scope(manifest, loader, parse_template, pwd, scope)
+    let workspace_root = pwd.clone();
+    let scope = build_scope_with_memory(manifest, &workspace_root)?;
+    prepare_pod_common_from_scope(manifest, loader, parse_template, workspace_root, pwd, scope)
 }
 
 fn prepare_pod_common_with_scope(
@@ -4716,17 +4760,45 @@ fn prepare_pod_common_with_scope(
     scope_config: ScopeConfig,
 ) -> Result<PodCommon, PodError> {
     let pwd = current_pwd()?;
+    let workspace_root = pwd.clone();
     let scope = Scope::from_config(&scope_config).map_err(PodError::Scope)?;
-    prepare_pod_common_from_scope(manifest, loader, parse_template, pwd, scope)
+    prepare_pod_common_from_scope(manifest, loader, parse_template, workspace_root, pwd, scope)
+}
+
+fn prepare_pod_common_with_context(
+    manifest: &PodManifest,
+    loader: &PromptLoader,
+    parse_template: bool,
+    workspace_root: PathBuf,
+    pwd: PathBuf,
+    scope_config: ScopeConfig,
+) -> Result<PodCommon, PodError> {
+    let workspace_root =
+        std::fs::canonicalize(&workspace_root).map_err(|source| PodError::InvalidPwd {
+            pwd: workspace_root.clone(),
+            source,
+        })?;
+    let pwd = std::fs::canonicalize(&pwd).map_err(|source| PodError::InvalidPwd {
+        pwd: pwd.clone(),
+        source,
+    })?;
+    let scope = Scope::from_config(&scope_config).map_err(PodError::Scope)?;
+    prepare_pod_common_from_scope(manifest, loader, parse_template, workspace_root, pwd, scope)
 }
 
 fn prepare_pod_common_from_scope(
     manifest: &PodManifest,
     loader: &PromptLoader,
     parse_template: bool,
+    workspace_root: PathBuf,
     pwd: PathBuf,
     scope: Scope,
 ) -> Result<PodCommon, PodError> {
+    if !scope.is_readable(&workspace_root) {
+        return Err(PodError::PwdOutsideScope {
+            pwd: workspace_root,
+        });
+    }
     if !scope.is_readable(&pwd) {
         return Err(PodError::PwdOutsideScope { pwd });
     }
@@ -4738,7 +4810,7 @@ fn prepare_pod_common_from_scope(
     let memory_layout = manifest
         .memory
         .as_ref()
-        .map(|mem| memory::WorkspaceLayout::resolve(mem, &pwd));
+        .map(|mem| memory::WorkspaceLayout::resolve(mem, &workspace_root));
     let mut workflow_registry = match memory_layout.as_ref() {
         Some(layout) => workflow_crate::load_workflows(layout).map_err(PodError::WorkflowLoad)?,
         None => workflow_crate::WorkflowRegistry::empty(),
@@ -4756,6 +4828,7 @@ fn prepare_pod_common_from_scope(
 
     Ok(PodCommon {
         pwd,
+        workspace_root,
         scope,
         delegation_scope,
         client,
@@ -4859,6 +4932,70 @@ fn current_pwd() -> Result<PathBuf, PodError> {
     })?;
     cwd.canonicalize()
         .map_err(|source| PodError::InvalidPwd { pwd: cwd, source })
+}
+
+#[cfg(test)]
+mod spawned_context_tests {
+    use super::*;
+
+    #[test]
+    fn spawn_pod_context_keeps_workspace_root_separate_from_tool_pwd() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace_root = tmp.path().join("workspace-root");
+        let tool_cwd = tmp.path().join("child-worktree");
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        std::fs::create_dir_all(&tool_cwd).unwrap();
+
+        let mut manifest = minimal_manifest_for_context_test(&workspace_root, &tool_cwd);
+        manifest.memory = Some(manifest::MemoryConfig::default());
+        let common = prepare_pod_common_with_context(
+            &manifest,
+            &PromptLoader::builtins_only(),
+            false,
+            workspace_root.clone(),
+            tool_cwd.clone(),
+            manifest.scope.clone(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            common.workspace_root,
+            workspace_root.canonicalize().unwrap()
+        );
+        assert_eq!(common.pwd, tool_cwd.canonicalize().unwrap());
+        assert_eq!(
+            common.memory_layout.as_ref().unwrap().root(),
+            workspace_root.canonicalize().unwrap()
+        );
+    }
+
+    fn minimal_manifest_for_context_test(workspace_root: &Path, tool_cwd: &Path) -> PodManifest {
+        let toml_str = format!(
+            r#"
+[pod]
+name = "spawn-context-test"
+
+[model]
+scheme = "anthropic"
+model_id = "claude-sonnet-4-20250514"
+
+[worker]
+
+[[scope.allow]]
+target = "{}"
+permission = "read"
+
+[[scope.allow]]
+target = "{}"
+permission = "write"
+"#,
+            workspace_root.display(),
+            tool_cwd.display()
+        );
+        let mut manifest = PodManifest::from_toml(&toml_str).unwrap();
+        manifest.model.auth = Some(manifest::AuthRef::None);
+        manifest
+    }
 }
 
 #[cfg(test)]

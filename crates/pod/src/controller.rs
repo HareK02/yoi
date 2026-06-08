@@ -493,6 +493,7 @@ where
     // below so the worker borrow doesn't conflict with reads on `pod`.
     let scope_handle = pod.scope().clone();
     let pwd = pod.pwd().to_path_buf();
+    let workspace_root = pod.workspace_root().to_path_buf();
     let task_feature = pod.task_feature();
     let session_id_for_usage = pod.segment_id().to_string();
     let memory_config = pod.manifest().memory.clone();
@@ -523,7 +524,9 @@ where
 
     let mut feature_registry = FeatureRegistryBuilder::new();
     feature_registry.add_module(task_feature);
-    feature_registry.add_module(crate::feature::builtin::ticket_tools_feature(&pwd));
+    feature_registry.add_module(crate::feature::builtin::ticket_tools_feature(
+        &workspace_root,
+    ));
     let _feature_install_report = pod.install_features(feature_registry);
 
     let worker = pod.worker_mut();
@@ -534,7 +537,7 @@ where
     // their built-in linter. Companion deny rules on the generic CRUD
     // scope were already applied during `Pod::from_manifest`.
     if let Some(mem) = memory_config.as_ref() {
-        let layout = memory::WorkspaceLayout::resolve(mem, &pwd);
+        let layout = memory::WorkspaceLayout::resolve(mem, &workspace_root);
         let query_cfg = memory::tool::QueryConfig::from(mem);
         worker.register_tool(memory::tool::read_tool_with_usage(
             layout.clone(),
@@ -554,6 +557,7 @@ where
         spawner_name.clone(),
         spawner_socket,
         runtime_base.clone(),
+        workspace_root.clone(),
         pwd.clone(),
         spawned_registry.clone(),
         self_parent_socket,
