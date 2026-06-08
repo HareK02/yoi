@@ -67,3 +67,60 @@ Next action:
 - Re-read this Ticket after `tui-chat-markdown-table-rendering` finishes review/merge routing, then accept it from queued if still unblocked.
 
 ---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-08T23:38:02Z from: queued to: inprogress reason: orchestrator_acceptance field: workflow_state -->
+
+## State changed
+
+Accepted queued implementation after re-reading the Ticket and current workspace state. The previously active TUI table-rendering work has been reviewed, merged, closed, and cleaned up, so the earlier parallel-TUI-work deferral no longer applies.
+
+---
+
+<!-- event: decision author: orchestrator at: 2026-06-08T23:38:02Z -->
+
+## Decision
+
+Routing decision: implementation_ready
+
+Reason:
+- This Ticket has clear storage, privacy, workspace-separation, and recall-semantics requirements.
+- The earlier deferral behind `tui-chat-markdown-table-rendering` is resolved: that Ticket has been merged, closed, and cleaned up.
+- Main workspace is clean and there are no active implementation worktrees, so implementation side effects can proceed safely.
+
+IntentPacket:
+
+Intent:
+- Persist TUI composer input recall history per workspace in user data, while preserving the existing TUI-local/non-destructive recall semantics.
+
+Binding decisions / invariants:
+- Store composer history under the existing user data dir, not under workspace `./.yoi/`.
+- Workspace histories must be separated by a stable/path-safe workspace key and include metadata sufficient to identify the source workspace/display name.
+- Store typed `Segment` vectors, not lossy flattened strings, so structured input recall remains possible.
+- Persist only non-blank entries, suppress consecutive duplicates, and bound stored history to about 30 entries per workspace.
+- Recalled input must not affect conversation state until the user explicitly submits it.
+- Do not mutate Pod protocol, worker history, transcript/session logs, model context, or stored message history for recall operations.
+- Treat history content as potentially private/secret: avoid diagnostics/logs/snapshots/tickets/model context exposure of saved entries.
+- Corrupt history files must not make TUI startup fatal; fall back to empty history with a bounded warning if needed.
+- Preserve existing multiline cursor navigation, Up/Down browse, draft restore, and edit-on-recall behavior.
+
+Implementation latitude:
+- Coder may choose the exact on-disk user-data path/key encoding if it is stable, path-safe, data-dir aware, and workspace-scoped.
+- Coder may add a small persistence module near existing TUI composer history code or shared user-data helpers if present.
+- Coder should prefer focused unit tests with temporary data dirs/workspaces for persistence, separation, bounding, duplicate suppression, corrupt-file fallback, and no workspace-file creation.
+- If interactive confirmation is still useful, include exact manual steps in the implementation report, but do not rely on manual-only validation if focused tests are practical.
+
+Escalate if:
+- The implementation requires changing Pod protocol/history/session serialization.
+- The implementation would store history under workspace `.yoi/`.
+- Existing composer history representation cannot preserve typed `Segment` vectors without a larger input model redesign.
+- Secret/private content would be emitted into logs/diagnostics/tests/tickets/model context.
+
+Validation:
+- Focused TUI composer history persistence tests for same-workspace recall after reload, workspace separation, max-size bound, consecutive duplicate suppression, corrupt-file fallback, and no workspace `.yoi` output.
+- Existing TUI composer history/navigation tests if present.
+- `cargo fmt --check`.
+- `git diff --check`.
+- `cargo check --workspace`.
+- `nix build .#yoi` before final completion because TUI behavior/packaging changes.
+
+---
