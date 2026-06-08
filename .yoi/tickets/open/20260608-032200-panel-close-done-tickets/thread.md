@@ -178,3 +178,66 @@ Pending:
 - No merge, close, final approval, or cleanup has occurred for this Ticket.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-08T06:09:31Z -->
+
+## Implementation report
+
+Merge-ready dossier: panel close done Tickets
+
+Ticket id/slug:
+- `20260608-032200-panel-close-done-tickets` / `panel-close-done-tickets`
+
+Branch/worktree:
+- Branch: `panel-close-done-tickets`
+- Worktree: `.worktree/panel-close-done-tickets`
+- Current branch commit:
+  - `6d41ed3 tui: close done tickets from panel`
+
+Intent / invariant check:
+- Panel `Close` now closes only safe open Tickets already at `workflow_state: done`.
+- The close action uses `LocalTicketBackend::close(...)`; it does not manually move files.
+- Resolution text is deterministic/non-LLM and records that the Ticket was already done and no implementation/workflow-state/worker action was started by the close.
+- Unsafe attempts return bounded diagnostics before mutation.
+- Panel refresh is triggered after the action path so closed rows disappear from open list.
+
+Implementation summary:
+- Added `NextUserAction::Close` dispatch handling in `crates/tui/src/multi_pod.rs`.
+- Added backend reload/safe-close guard for local status open, `workflow_state == done`, no non-empty `attention_required`, no non-empty `action_required`, and no existing `resolution.md`.
+- Added deterministic resolution builder.
+- Added focused tests for success, generated resolution content, non-done block, `action_required` block, `attention_required` block, and existing resolution block.
+
+Files touched:
+- `crates/tui/src/multi_pod.rs`
+
+Coder / reviewer Pods:
+- Coder: `coder-panel-close-done`
+- Reviewer: `reviewer-panel-close-done`
+
+Review evidence:
+- Reviewer verdict: `approve`.
+- Reviewer confirmed backend close is used, safe-close checks match Ticket requirements, unsafe cases return before mutation, deterministic resolution text is non-LLM, dispatch diagnostics are bounded, and reload is scheduled after dispatch.
+- Reviewer noted non-open status has implementation guard but no dedicated test; judged non-blocking because other unsafe cases and success path are covered.
+
+Validation performed by coder and/or reviewer:
+- `cargo test -p tui multi_pod --lib`
+- `cargo test -p tui workspace_panel --lib`
+- `git diff --check develop...HEAD`
+- `cargo fmt --check`
+- `cargo run -q -p yoi -- ticket doctor`
+- `nix build .#yoi`
+
+Blockers fixed or rejected findings:
+- No reviewer blockers.
+
+Residual risks:
+- Non-open local status blocker lacks a dedicated focused test, though implementation explicitly checks `ticket.meta.status.as_local() == Some(TicketStatus::Open)` before closing.
+
+Dirty state:
+- Child worktree is clean at `6d41ed3`.
+- Main workspace has unrelated Ticket-record edits and an active `split-direct-and-delegation-authority` worktree; they are outside this branch's touched paths and are understood.
+
+Parent/human decision needs:
+- User has authorized merge-completion and cleanup after approved work. Proceeding to merge-completion unless post-merge validation fails.
+
+---
