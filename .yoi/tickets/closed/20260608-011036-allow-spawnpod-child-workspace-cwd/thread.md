@@ -381,3 +381,67 @@ Parent/human decision needs:
 - User has authorized merge-completion and cleanup after approved work. Proceeding to merge-completion unless post-merge validation fails.
 
 ---
+
+<!-- event: review author: orchestrator at: 2026-06-08T08:17:33Z status: approve -->
+
+## Review: approve
+
+Final merge-completion approval after merge to `develop` and post-merge validation.
+
+Evidence:
+- Merged branch `allow-spawnpod-child-workspace-cwd` with `--no-ff`; a merge conflict in `crates/pod/src/pod.rs` was resolved by preserving both the Intake role marker methods and the new tool/process cwd documentation.
+- Reviewer `reviewer-spawnpod-child-cwd` approved after fix-loop.
+- Post-merge validation passed: `cargo test -p pod spawn_pod --test spawn_pod_test`, `cargo test -p pod spawn_pod`, `cargo check -q`, `cargo fmt --check`, `git diff --check`, `cargo run -q -p yoi -- ticket doctor`, and `nix build .#yoi`.
+- Coder/reviewer Pods stopped and delegated scope reclaimed.
+- Merged worktree removed and branch deleted.
+
+This approval is for the merged main-branch result, not merely the branch-local reviewer verdict.
+
+---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-08T08:17:33Z from: inprogress to: done reason: merged_and_validated field: workflow_state -->
+
+## State changed
+
+Merged to `develop`, post-merge validation passed, final merge-completion approval recorded, and SpawnPod cwd branch/worktree/Pods cleaned up.
+
+---
+
+<!-- event: close author: hare at: 2026-06-08T08:17:51Z status: closed -->
+
+## Closed
+
+Merged and completed `SpawnPod.cwd` support.
+
+Summary:
+- Added optional `SpawnPodInput.cwd` for child process/tool working directory.
+- Validates `cwd` before launch: absolute, existing directory, and usable under the child effective direct scope.
+- Preserves omitted-`cwd` behavior.
+- Separates runtime workspace context from tool cwd: child runtime receives inherited `--workspace`, while requested tool cwd is passed separately as hidden `--tool-cwd`.
+- `Pod` now separates `workspace_root` from `pwd`; workspace/project/Ticket/workflow/memory/Profile context uses `workspace_root`, while tools/Bash/ScopedFs use `pwd`.
+- Updated maintained multi-agent/worktree guidance to use `SpawnPod.cwd` as non-authority convenience while keeping delegated scope explicit.
+
+Merged branch/worktree:
+- Branch: `allow-spawnpod-child-workspace-cwd`
+- Commits: `3dd7707`, `248744f`
+- Merge commit on `develop`: `05df656 merge: allow SpawnPod child cwd`
+
+Validation passed after merge:
+- `cargo test -p pod spawn_pod --test spawn_pod_test`
+- `cargo test -p pod spawn_pod`
+- `cargo check -q`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo run -q -p yoi -- ticket doctor`
+- `nix build .#yoi`
+
+Cleanup completed:
+- Stopped coder/reviewer Pods and reclaimed scope.
+- Removed `.worktree/allow-spawnpod-child-workspace-cwd`.
+- Deleted branch `allow-spawnpod-child-workspace-cwd`.
+
+Residual notes:
+- Manual callers using a worktree cwd must still delegate readable workspace context plus explicit worktree scope; `cwd` grants no authority.
+- Restore behavior for already-spawned Pods with distinct tool cwd was not deeply audited beyond launch-time/nested SpawnPod behavior and remains a possible future refinement if needed.
+
+---

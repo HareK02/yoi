@@ -2,13 +2,13 @@
 id: '20260608-011036-allow-spawnpod-child-workspace-cwd'
 slug: 'allow-spawnpod-child-workspace-cwd'
 title: 'Allow SpawnPod to specify child cwd'
-status: 'open'
+status: 'closed'
 kind: 'task'
 priority: 'P2'
 labels: ['pod', 'spawn', 'cwd', 'worktree', 'orchestration']
-workflow_state: 'inprogress'
+workflow_state: 'done'
 created_at: '2026-06-08T01:10:36Z'
-updated_at: '2026-06-08T08:13:38Z'
+updated_at: '2026-06-08T08:17:51Z'
 assignee: null
 legacy_ticket: null
 queued_by: 'workspace-panel'
