@@ -466,3 +466,82 @@ Coder validation reported passed:
 Coder reports no remaining risks.
 
 ---
+
+<!-- event: review author: reviewer-panel-display-composer-keys at: 2026-06-09T11:24:48Z status: approve -->
+
+## Review: approve
+
+## Re-review result: approve
+
+The request-changes blocker is fixed. In the selected Ticket row + non-empty global composer state, Panel display now prioritizes the composer target Enter behavior instead of selected-row action hints.
+
+Evidence:
+- `crates/tui/src/multi_pod.rs` `handle_key` still gates selected Ticket row actions on `composer_is_blank()`, so non-empty composer text enters the global composer submission path.
+- `target_status_line` now returns an explicit `focus global composer · composer <target> · Enter <composer behavior>` line before selected-row status whenever the composer is non-blank.
+- `actionbar_left_text` now checks `!app.composer_is_blank()` before `selected_open_disabled_reason()`, so non-empty composer text shows `Companion target: Enter sends/keeps draft...` or `Ticket Intake target: Enter launches Intake...` instead of row action text.
+- Regression test `selected_ticket_row_with_non_empty_composer_shows_composer_enter_behavior` covers a selected Queue row plus non-empty Companion draft and asserts the actionbar/status describe composer Enter behavior and omit the row action.
+
+Other requirements re-checked:
+- `Ctrl+T` is not a Panel target switch and no Panel top/actionbar/help literal advertises it; only normal single-Pod handling and the regression test name/path remain.
+- `Tab` is the Panel target switch path; the shared composer keymap leaves `Tab` for caller-level completion/target handling, and the Panel has no active completion source to exercise beyond this boundary.
+- Bare letters remain composer text, not Panel row shortcuts.
+- Shared `composer_keys` is used by both normal TUI and Panel composer editing.
+- `Esc` clears Panel focus toward the global composer; `Ctrl+C`/`Ctrl+D` quit.
+- Changed source scope remains TUI-only; I did not find Ticket backend/schema/tool changes.
+
+Validation run from `/home/hare/Projects/yoi/.worktree/panel-display-composer-keys`:
+- `cargo test -p tui selected_ticket_row_with_non_empty_composer_shows_composer_enter_behavior` — passed
+- `cargo test -p tui multi_ctrl_t_does_not_switch_composer_target` — passed
+- `cargo test -p tui multi_bare_panel_letters_append_to_composer_and_arrows_select_when_blank` — passed
+- `cargo test -p tui multi_esc_clears_panel_focus_without_quitting` — passed
+- `cargo test -p tui ticket_queue_notification_message_carries_routing_contract` — passed
+- `cargo test -p tui panel_ticket_rows_use_aligned_columns_before_title` — passed
+- `cargo test -p tui panel_ticket_title_truncates_after_stable_columns` — passed
+- `cargo test -p tui` — passed (`291 passed`)
+- `cargo fmt --check` — passed
+- `git diff --check` — passed
+- `cargo run -q -p yoi -- ticket doctor` — passed (`doctor: ok`)
+- `cargo check --workspace` — passed
+- `nix build .#yoi` — passed
+
+Residual risks:
+- No blocking residual risks found. Completion-priority for Panel `Tab` could not be runtime-tested because the current Panel does not expose an active completion popup/source; the implementation leaves that priority boundary with the caller as intended.
+
+---
+
+<!-- event: review author: reviewer-panel-display-composer-keys at: 2026-06-09T11:25:57Z status: approve -->
+
+## Review: approve
+
+Review result: approve
+
+Evidence:
+- `handle_key` still dispatches selected Ticket row actions only when `composer_is_blank()`.
+- With non-empty composer text, `target_status_line` returns `focus global composer · composer <target> · Enter <composer behavior>` before selected-row action status, so Enter behavior is described as composer-target submission.
+- `actionbar_left_text` checks `!app.composer_is_blank()` before selected-row disabled/action reasons, so selected Ticket row + non-empty composer does not show row-action hints.
+- Regression test `selected_ticket_row_with_non_empty_composer_shows_composer_enter_behavior` verifies selected Queue row + non-empty Companion draft displays composer Enter behavior and does not display row action.
+- `Ctrl+T` remains removed from Panel target switching/help/actionbar and is not a Panel target switch.
+- `Tab` remains Panel target switch path. Since Panel currently has no active completion source, runtime completion priority is confirmed at the boundary design level: shared composer keymap leaves Tab to caller-level handling.
+- Bare letter shortcuts are not restored; `j/k/o/r` are composer text.
+- `composer_keys` is shared by normal TUI and Panel composer editing.
+- `Esc` returns focus toward global composer/no-selection; `Ctrl+C`/`Ctrl+D` quit.
+- Changes are limited to TUI source; no Ticket backend/schema/tool changes.
+
+Reviewer validation:
+- `cargo test -p tui selected_ticket_row_with_non_empty_composer_shows_composer_enter_behavior`
+- `cargo test -p tui multi_ctrl_t_does_not_switch_composer_target`
+- `cargo test -p tui multi_bare_panel_letters_append_to_composer_and_arrows_select_when_blank`
+- `cargo test -p tui multi_esc_clears_panel_focus_without_quitting`
+- `cargo test -p tui ticket_queue_notification_message_carries_routing_contract`
+- `cargo test -p tui panel_ticket_rows_use_aligned_columns_before_title`
+- `cargo test -p tui panel_ticket_title_truncates_after_stable_columns`
+- `cargo test -p tui` (291 passed)
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo run -q -p yoi -- ticket doctor`
+- `cargo check --workspace`
+- `nix build .#yoi`
+
+Residual risk: no blocking risk. Panel has no active completion popup/source yet, so Tab completion priority remains verified at the caller-boundary design level rather than by an active completion UI scenario.
+
+---

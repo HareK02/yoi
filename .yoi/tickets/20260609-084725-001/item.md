@@ -2,7 +2,7 @@
 title: 'Improve workspace panel display and composer key handling'
 state: 'inprogress'
 created_at: '2026-06-09T08:47:25Z'
-updated_at: '2026-06-09T11:21:05Z'
+updated_at: '2026-06-09T11:25:57Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['tui-input', 'ux-consistency']
