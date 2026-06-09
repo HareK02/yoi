@@ -262,7 +262,7 @@ async fn send_to_pod_delivers_run_method() {
     let def = send_to_pod_tool(registry);
     let (_meta, tool) = def();
     let input = json!({ "name": "child", "message": "hello there" }).to_string();
-    let output: ToolOutput = tool.execute(&input).await.unwrap();
+    let output: ToolOutput = tool.execute(&input, Default::default()).await.unwrap();
     assert!(
         output.summary.contains("child"),
         "summary: {}",
@@ -285,7 +285,7 @@ async fn send_to_pod_errors_on_unknown_pod() {
     let def = send_to_pod_tool(registry);
     let (_meta, tool) = def();
     let input = json!({ "name": "nope", "message": "hi" }).to_string();
-    let err = tool.execute(&input).await.unwrap_err();
+    let err = tool.execute(&input, Default::default()).await.unwrap_err();
     assert!(err.to_string().contains("no spawned pod"), "{err}");
 }
 
@@ -307,7 +307,7 @@ async fn send_to_pod_errors_when_pod_already_running() {
     let def = send_to_pod_tool(registry);
     let (_meta, tool) = def();
     let input = json!({ "name": "child", "message": "hi" }).to_string();
-    let err = tool.execute(&input).await.unwrap_err();
+    let err = tool.execute(&input, Default::default()).await.unwrap_err();
     assert!(
         err.to_string().contains("already running"),
         "expected AlreadyRunning wording: {err}"
@@ -341,13 +341,13 @@ async fn read_pod_output_returns_new_assistant_text_then_empty_on_second_call() 
     let (_meta, tool) = def();
     let input = json!({ "name": "child" }).to_string();
 
-    let first: ToolOutput = tool.execute(&input).await.unwrap();
+    let first: ToolOutput = tool.execute(&input, Default::default()).await.unwrap();
     let body = first.content.expect("first read should have content");
     assert!(body.contains("hi back"), "body: {body}");
     assert!(body.contains("still working"), "body: {body}");
 
     // Cursor now points past all items — second call returns no new text.
-    let second: ToolOutput = tool.execute(&input).await.unwrap();
+    let second: ToolOutput = tool.execute(&input, Default::default()).await.unwrap();
     assert!(
         second.content.is_none(),
         "unexpected content: {:?}",
@@ -371,7 +371,7 @@ async fn read_pod_output_reports_stopped_on_dead_socket() {
     let def = read_pod_output_tool(registry);
     let (_meta, tool) = def();
     let input = json!({ "name": "child" }).to_string();
-    let output: ToolOutput = tool.execute(&input).await.unwrap();
+    let output: ToolOutput = tool.execute(&input, Default::default()).await.unwrap();
     assert!(output.summary.contains("stopped"), "{}", output.summary);
 }
 
@@ -452,7 +452,7 @@ async fn stop_pod_sends_shutdown_and_releases_scope() {
     let def = stop_pod_tool(registry.clone());
     let (_meta, tool) = def();
     let input = json!({ "name": "child" }).to_string();
-    let output: ToolOutput = tool.execute(&input).await.unwrap();
+    let output: ToolOutput = tool.execute(&input, Default::default()).await.unwrap();
     assert!(output.summary.contains("stopped"), "{}", output.summary);
 
     // The child got a Shutdown.
@@ -497,7 +497,7 @@ async fn stop_pod_succeeds_even_when_child_unreachable() {
     let def = stop_pod_tool(registry.clone());
     let (_meta, tool) = def();
     let input = json!({ "name": "child" }).to_string();
-    let output: ToolOutput = tool.execute(&input).await.unwrap();
+    let output: ToolOutput = tool.execute(&input, Default::default()).await.unwrap();
     assert!(output.summary.contains("stopped"), "{}", output.summary);
 
     // Registry no longer knows about the child.
@@ -545,7 +545,7 @@ async fn restored_registry_uses_pod_state_without_runtime_file() {
     let def = send_to_pod_tool(restored.clone());
     let (_meta, tool) = def();
     let input = json!({ "name": "child", "message": "after restart" }).to_string();
-    tool.execute(&input).await.unwrap();
+    tool.execute(&input, Default::default()).await.unwrap();
     match received.recv().await.expect("expected Run") {
         Method::Run { input } => match input.as_slice() {
             [protocol::Segment::Text { content }] => assert_eq!(content, "after restart"),
@@ -556,7 +556,7 @@ async fn restored_registry_uses_pod_state_without_runtime_file() {
 
     let def = stop_pod_tool(restored.clone());
     let (_meta, tool) = def();
-    tool.execute(&json!({ "name": "child" }).to_string())
+    tool.execute(&json!({ "name": "child" }).to_string(), Default::default())
         .await
         .unwrap();
     assert!(matches!(

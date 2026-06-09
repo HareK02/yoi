@@ -752,7 +752,11 @@ impl<St> Tool for ListPodsTool<St>
 where
     St: PodMetadataStore + Clone + Send + Sync + 'static,
 {
-    async fn execute(&self, _input_json: &str) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        _input_json: &str,
+        _ctx: llm_worker::tool::ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
         let items = self
             .discovery
             .list_visible()
@@ -775,7 +779,11 @@ impl<St> Tool for RestorePodTool<St>
 where
     St: PodMetadataStore + Clone + Send + Sync + 'static,
 {
-    async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input_json: &str,
+        _ctx: llm_worker::tool::ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
         let input: PodNameInput = serde_json::from_str(input_json)
             .map_err(|e| ToolError::InvalidArgument(format!("invalid RestorePod input: {e}")))?;
         let result = self
@@ -847,7 +855,11 @@ impl<St> Tool for SendToPeerPodTool<St>
 where
     St: PodMetadataStore + Clone + Send + Sync + 'static,
 {
-    async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input_json: &str,
+        _ctx: llm_worker::tool::ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
         let input: SendToPeerPodInput = serde_json::from_str(input_json)
             .map_err(|e| ToolError::InvalidArgument(format!("invalid SendToPeerPod input: {e}")))?;
         let detail = self
@@ -1392,7 +1404,7 @@ mod tests {
 
         let (_, tool) = send_to_peer_pod_tool(discovery)();
         let output = tool
-            .execute(r#"{"name":"target","message":"hello"}"#)
+            .execute(r#"{"name":"target","message":"hello"}"#, Default::default())
             .await
             .unwrap();
         assert_eq!(output.summary, "sent peer message to `target`");

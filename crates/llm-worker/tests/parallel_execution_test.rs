@@ -2,8 +2,8 @@
 //!
 //! Verify that Worker executes multiple tools in parallel.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -12,7 +12,9 @@ use llm_worker::interceptor::{
     Interceptor, PostToolAction, PreToolAction, ToolCallInfo, ToolResultInfo,
 };
 use llm_worker::llm_client::event::{Event, ResponseStatus, StatusEvent};
-use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput, ToolResult};
+use llm_worker::tool::{
+    Tool, ToolDefinition, ToolError, ToolExecutionContext, ToolMeta, ToolOutput, ToolResult,
+};
 
 mod common;
 use common::MockLlmClient;
@@ -59,10 +61,51 @@ impl SlowTool {
 
 #[async_trait]
 impl Tool for SlowTool {
-    async fn execute(&self, _input_json: &str) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        _input_json: &str,
+        _ctx: llm_worker::tool::ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
         self.call_count.fetch_add(1, Ordering::SeqCst);
         tokio::time::sleep(Duration::from_millis(self.delay_ms)).await;
         Ok(format!("Completed after {}ms", self.delay_ms).into())
+    }
+}
+
+#[derive(Clone)]
+struct ContextRecordingTool {
+    name: String,
+    contexts: Arc<Mutex<Vec<ToolExecutionContext>>>,
+}
+
+impl ContextRecordingTool {
+    fn new(name: impl Into<String>, contexts: Arc<Mutex<Vec<ToolExecutionContext>>>) -> Self {
+        Self {
+            name: name.into(),
+            contexts,
+        }
+    }
+
+    fn definition(&self) -> ToolDefinition {
+        let tool = self.clone();
+        Arc::new(move || {
+            let meta = ToolMeta::new(&tool.name)
+                .description("Records tool execution context")
+                .input_schema(serde_json::json!({"type": "object"}));
+            (meta, Arc::new(tool.clone()) as Arc<dyn Tool>)
+        })
+    }
+}
+
+#[async_trait]
+impl Tool for ContextRecordingTool {
+    async fn execute(
+        &self,
+        _input_json: &str,
+        ctx: ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
+        self.contexts.lock().unwrap().push(ctx);
+        Ok("recorded".to_string().into())
     }
 }
 
@@ -92,10 +135,18 @@ async fn test_parallel_tool_execution() {
         }),
     ];
 
-    let client = MockLlmClient::new(events);
+    let client = MockLlmClient::with_responses(vec![
+        events,
+        vec![
+            Event::text_block_start(0),
+            Event::text_delta(0, "Done"),
+            Event::text_block_stop(0, None),
+            Event::Status(StatusEvent {
+                status: ResponseStatus::Completed,
+            }),
+        ],
+    ]);
     let mut worker = Worker::new(client);
-
-    // Each tool waits 100ms
     let tool1 = SlowTool::new("slow_tool_1", 100);
     let tool2 = SlowTool::new("slow_tool_2", 100);
     let tool3 = SlowTool::new("slow_tool_3", 100);
@@ -129,7 +180,201 @@ async fn test_parallel_tool_execution() {
     println!("Parallel execution completed in {:?}", elapsed);
 }
 
-/// Hook: pre_tool_call - verify that skipped tools are not executed
+#[tokio::test]
+async fn test_tool_execution_context_order_and_batch_id() {
+    let client = MockLlmClient::with_responses(vec![
+        vec![
+            Event::tool_use_start(0, "call_a", "record_a"),
+            Event::tool_input_delta(0, r#"{}"#),
+            Event::tool_use_stop(0),
+            Event::tool_use_start(1, "call_b", "record_b"),
+            Event::tool_input_delta(1, r#"{}"#),
+            Event::tool_use_stop(1),
+            Event::tool_use_start(2, "call_c", "record_c"),
+            Event::tool_input_delta(2, r#"{}"#),
+            Event::tool_use_stop(2),
+            Event::Status(StatusEvent {
+                status: ResponseStatus::Completed,
+            }),
+        ],
+        vec![
+            Event::text_block_start(0),
+            Event::text_delta(0, "Done"),
+            Event::text_block_stop(0, None),
+            Event::Status(StatusEvent {
+                status: ResponseStatus::Completed,
+            }),
+        ],
+    ]);
+    let mut worker = Worker::new(client);
+    let contexts = Arc::new(Mutex::new(Vec::new()));
+
+    worker.register_tool(ContextRecordingTool::new("record_a", contexts.clone()).definition());
+    worker.register_tool(ContextRecordingTool::new("record_b", contexts.clone()).definition());
+    worker.register_tool(ContextRecordingTool::new("record_c", contexts.clone()).definition());
+
+    let _ = worker.run("record contexts").await;
+
+    let mut contexts = contexts.lock().unwrap().clone();
+    contexts.sort_by_key(|ctx| ctx.call_index);
+
+    assert_eq!(contexts.len(), 3);
+    assert_eq!(contexts[0].call_id, "call_a");
+    assert_eq!(contexts[0].call_index, 0);
+    assert_eq!(contexts[1].call_id, "call_b");
+    assert_eq!(contexts[1].call_index, 1);
+    assert_eq!(contexts[2].call_id, "call_c");
+    assert_eq!(contexts[2].call_index, 2);
+    assert_eq!(contexts[0].batch_id, contexts[1].batch_id);
+    assert_eq!(contexts[1].batch_id, contexts[2].batch_id);
+}
+
+#[tokio::test]
+async fn test_tool_execution_context_batch_id_changes_between_batches() {
+    let client = MockLlmClient::with_responses(vec![
+        vec![
+            Event::tool_use_start(0, "call_first", "record"),
+            Event::tool_input_delta(0, r#"{}"#),
+            Event::tool_use_stop(0),
+            Event::Status(StatusEvent {
+                status: ResponseStatus::Completed,
+            }),
+        ],
+        vec![
+            Event::tool_use_start(0, "call_second", "record"),
+            Event::tool_input_delta(0, r#"{}"#),
+            Event::tool_use_stop(0),
+            Event::Status(StatusEvent {
+                status: ResponseStatus::Completed,
+            }),
+        ],
+        vec![
+            Event::text_block_start(0),
+            Event::text_delta(0, "Done"),
+            Event::text_block_stop(0, None),
+            Event::Status(StatusEvent {
+                status: ResponseStatus::Completed,
+            }),
+        ],
+    ]);
+    let mut worker = Worker::new(client);
+    let contexts = Arc::new(Mutex::new(Vec::new()));
+
+    worker.register_tool(ContextRecordingTool::new("record", contexts.clone()).definition());
+
+    let _ = worker.run("record batches").await;
+
+    let contexts = contexts.lock().unwrap().clone();
+    assert_eq!(contexts.len(), 2);
+    assert_eq!(contexts[0].call_id, "call_first");
+    assert_eq!(contexts[0].call_index, 0);
+    assert_eq!(contexts[1].call_id, "call_second");
+    assert_eq!(contexts[1].call_index, 0);
+    assert_ne!(contexts[0].batch_id, contexts[1].batch_id);
+}
+
+#[tokio::test]
+async fn test_tool_execution_context_for_skipped_and_synthetic_paths() {
+    let client = MockLlmClient::with_responses(vec![
+        vec![
+            Event::tool_use_start(0, "call_run", "record"),
+            Event::tool_input_delta(0, r#"{}"#),
+            Event::tool_use_stop(0),
+            Event::tool_use_start(1, "call_skip", "skip_tool"),
+            Event::tool_input_delta(1, r#"{}"#),
+            Event::tool_use_stop(1),
+            Event::tool_use_start(2, "call_synth", "synthetic_tool"),
+            Event::tool_input_delta(2, r#"{}"#),
+            Event::tool_use_stop(2),
+            Event::Status(StatusEvent {
+                status: ResponseStatus::Completed,
+            }),
+        ],
+        vec![
+            Event::text_block_start(0),
+            Event::text_delta(0, "Done"),
+            Event::text_block_stop(0, None),
+            Event::Status(StatusEvent {
+                status: ResponseStatus::Completed,
+            }),
+        ],
+    ]);
+    let mut worker = Worker::new(client);
+    let executed_contexts = Arc::new(Mutex::new(Vec::new()));
+    let pre_contexts = Arc::new(Mutex::new(Vec::new()));
+    let post_contexts = Arc::new(Mutex::new(Vec::new()));
+
+    worker
+        .register_tool(ContextRecordingTool::new("record", executed_contexts.clone()).definition());
+    worker.register_tool(
+        ContextRecordingTool::new("skip_tool", executed_contexts.clone()).definition(),
+    );
+    worker.register_tool(
+        ContextRecordingTool::new("synthetic_tool", executed_contexts.clone()).definition(),
+    );
+
+    struct ContextPolicy {
+        pre_contexts: Arc<Mutex<Vec<ToolExecutionContext>>>,
+        post_contexts: Arc<Mutex<Vec<ToolExecutionContext>>>,
+    }
+
+    #[async_trait]
+    impl Interceptor for ContextPolicy {
+        async fn pre_tool_call(&self, info: &mut ToolCallInfo) -> PreToolAction {
+            self.pre_contexts.lock().unwrap().push(info.context.clone());
+            match info.call.name.as_str() {
+                "skip_tool" => PreToolAction::Skip,
+                "synthetic_tool" => PreToolAction::SyntheticResult(ToolResult::from_output(
+                    &info.call.id,
+                    ToolOutput::from("synthetic result".to_string()),
+                )),
+                _ => PreToolAction::Continue,
+            }
+        }
+
+        async fn post_tool_call(&self, info: &mut ToolResultInfo) -> PostToolAction {
+            self.post_contexts
+                .lock()
+                .unwrap()
+                .push(info.context.clone());
+            PostToolAction::Continue
+        }
+    }
+
+    worker.set_interceptor(ContextPolicy {
+        pre_contexts: pre_contexts.clone(),
+        post_contexts: post_contexts.clone(),
+    });
+
+    let _ = worker.run("record skipped and synthetic contexts").await;
+
+    let mut pre_contexts = pre_contexts.lock().unwrap().clone();
+    pre_contexts.sort_by_key(|ctx| ctx.call_index);
+    assert_eq!(pre_contexts.len(), 3);
+    assert_eq!(pre_contexts[0].call_id, "call_run");
+    assert_eq!(pre_contexts[0].call_index, 0);
+    assert_eq!(pre_contexts[1].call_id, "call_skip");
+    assert_eq!(pre_contexts[1].call_index, 1);
+    assert_eq!(pre_contexts[2].call_id, "call_synth");
+    assert_eq!(pre_contexts[2].call_index, 2);
+    assert_eq!(pre_contexts[0].batch_id, pre_contexts[1].batch_id);
+    assert_eq!(pre_contexts[1].batch_id, pre_contexts[2].batch_id);
+
+    let executed_contexts = executed_contexts.lock().unwrap().clone();
+    assert_eq!(executed_contexts.len(), 1);
+    assert_eq!(executed_contexts[0].call_id, "call_run");
+    assert_eq!(executed_contexts[0].call_index, 0);
+
+    let mut post_contexts = post_contexts.lock().unwrap().clone();
+    post_contexts.sort_by_key(|ctx| ctx.call_index);
+    assert_eq!(post_contexts.len(), 2);
+    assert_eq!(post_contexts[0].call_id, "call_run");
+    assert_eq!(post_contexts[0].call_index, 0);
+    assert_eq!(post_contexts[1].call_id, "call_synth");
+    assert_eq!(post_contexts[1].call_index, 2);
+    assert_eq!(post_contexts[0].batch_id, post_contexts[1].batch_id);
+}
+
 #[tokio::test]
 async fn test_before_tool_call_skip() {
     let events = vec![
@@ -220,7 +465,11 @@ async fn test_post_tool_call_modification() {
 
     #[async_trait]
     impl Tool for SimpleTool {
-        async fn execute(&self, _: &str) -> Result<ToolOutput, ToolError> {
+        async fn execute(
+            &self,
+            _: &str,
+            _ctx: llm_worker::tool::ToolExecutionContext,
+        ) -> Result<ToolOutput, ToolError> {
             Ok("Original Result".to_string().into())
         }
     }

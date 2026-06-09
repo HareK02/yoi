@@ -42,7 +42,11 @@ struct WriteTool {
 
 #[async_trait]
 impl Tool for WriteTool {
-    async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input_json: &str,
+        _ctx: llm_worker::tool::ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
         let params: WriteParams = serde_json::from_str(input_json)
             .map_err(|e| ToolError::InvalidArgument(format!("invalid MemoryWrite input: {e}")))?;
 
@@ -229,7 +233,10 @@ mod tests {
             "kind": "summary",
             "content": content,
         });
-        let out = tool.execute(&inp.to_string()).await.unwrap();
+        let out = tool
+            .execute(&inp.to_string(), Default::default())
+            .await
+            .unwrap();
         assert!(out.summary.contains("Created"));
         assert!(path.exists());
     }
@@ -249,7 +256,10 @@ mod tests {
             "slug": "foo",
             "content": content,
         });
-        let err = tool.execute(&inp.to_string()).await.unwrap_err();
+        let err = tool
+            .execute(&inp.to_string(), Default::default())
+            .await
+            .unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("status") || msg.contains("missing"), "{msg}");
     }
@@ -271,7 +281,10 @@ mod tests {
             "slug": "foo",
             "content": initial,
         });
-        let out = tool.execute(&inp.to_string()).await.unwrap();
+        let out = tool
+            .execute(&inp.to_string(), Default::default())
+            .await
+            .unwrap();
         assert!(out.summary.contains("Overwrote"));
     }
 
@@ -283,7 +296,10 @@ mod tests {
             "kind": "decision",
             "content": "ignored",
         });
-        let err = tool.execute(&inp.to_string()).await.unwrap_err();
+        let err = tool
+            .execute(&inp.to_string(), Default::default())
+            .await
+            .unwrap_err();
         assert!(matches!(err, ToolError::InvalidArgument(_)));
     }
 
@@ -298,7 +314,11 @@ mod tests {
             "slug": "foo",
             "content": bad,
         });
-        assert!(tool.execute(&inp.to_string()).await.is_err());
+        assert!(
+            tool.execute(&inp.to_string(), Default::default())
+                .await
+                .is_err()
+        );
         assert!(!path.exists());
     }
 
@@ -312,7 +332,10 @@ mod tests {
             "slug": "wf",
             "content": "---\n---\n",
         });
-        let err = tool.execute(&inp.to_string()).await.unwrap_err();
+        let err = tool
+            .execute(&inp.to_string(), Default::default())
+            .await
+            .unwrap_err();
         assert!(matches!(err, ToolError::InvalidArgument(_)));
     }
 }

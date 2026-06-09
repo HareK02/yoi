@@ -1351,7 +1351,11 @@ struct HangingTool;
 
 #[async_trait]
 impl Tool for HangingTool {
-    async fn execute(&self, _input: &str) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        _input: &str,
+        _ctx: llm_worker::tool::ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
         std::future::pending::<()>().await;
         unreachable!()
     }

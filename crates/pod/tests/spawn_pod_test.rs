@@ -312,7 +312,7 @@ async fn spawn_pod_launches_runtime_in_workspace_and_passes_tool_cwd() {
     })
     .to_string();
 
-    tool.execute(&input).await.unwrap();
+    tool.execute(&input, Default::default()).await.unwrap();
     assert!(matches!(received.await.unwrap(), Some(Method::Run { .. })));
     let invocation = read_recorded_runtime_invocation(&output_path).await;
     assert_eq!(invocation[0], allow_root.path().to_str().unwrap());
@@ -373,7 +373,7 @@ async fn spawn_pod_omitted_cwd_preserves_spawner_pwd() {
     })
     .to_string();
 
-    tool.execute(&input).await.unwrap();
+    tool.execute(&input, Default::default()).await.unwrap();
     assert!(matches!(received.await.unwrap(), Some(Method::Run { .. })));
     let invocation = read_recorded_runtime_invocation(&output_path).await;
     assert_eq!(invocation[0], allow_root.path().to_str().unwrap());
@@ -433,7 +433,7 @@ async fn spawn_pod_delegates_scope_and_sends_run() {
             .is_writable(&allow_root.path().join("a.txt"))
     );
 
-    let output: ToolOutput = tool.execute(&input).await.unwrap();
+    let output: ToolOutput = tool.execute(&input, Default::default()).await.unwrap();
     assert!(
         output.summary.contains("child"),
         "summary: {}",
@@ -519,7 +519,7 @@ async fn spawn_pod_requires_explicit_delegation_even_with_direct_scope() {
     })
     .to_string();
 
-    let err = tool.execute(&input).await.unwrap_err();
+    let err = tool.execute(&input, Default::default()).await.unwrap_err();
     match err {
         ToolError::InvalidArgument(message) => {
             assert!(message.contains("no delegation scope grant"), "{message}");
@@ -587,7 +587,7 @@ async fn spawn_pod_rejects_child_non_recursive_scope_under_parent_non_recursive_
     })
     .to_string();
 
-    let err = tool.execute(&input).await.unwrap_err();
+    let err = tool.execute(&input, Default::default()).await.unwrap_err();
     match err {
         ToolError::InvalidArgument(message) => {
             assert!(
@@ -639,7 +639,7 @@ async fn spawn_pod_rejects_scope_outside_spawner() {
     })
     .to_string();
 
-    let err = tool.execute(&input).await.unwrap_err();
+    let err = tool.execute(&input, Default::default()).await.unwrap_err();
     match err {
         ToolError::InvalidArgument(msg) => {
             assert!(
@@ -712,7 +712,7 @@ async fn spawn_pod_rolls_back_reservation_when_socket_never_appears() {
     })
     .to_string();
 
-    let err = tool.execute(&input).await.unwrap_err();
+    let err = tool.execute(&input, Default::default()).await.unwrap_err();
     match err {
         ToolError::ExecutionFailed(msg) => {
             assert!(

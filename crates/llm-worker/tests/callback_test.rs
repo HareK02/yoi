@@ -218,7 +218,11 @@ struct FixedOutputTool {
 
 #[async_trait]
 impl Tool for FixedOutputTool {
-    async fn execute(&self, _input_json: &str) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        _input_json: &str,
+        _ctx: llm_worker::tool::ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
         Ok(self.output.clone())
     }
 }
@@ -289,7 +293,11 @@ struct ErroringTool {
 
 #[async_trait]
 impl Tool for ErroringTool {
-    async fn execute(&self, _input_json: &str) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        _input_json: &str,
+        _ctx: llm_worker::tool::ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
         Err(ToolError::ExecutionFailed(self.message.clone()))
     }
 }

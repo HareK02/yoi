@@ -66,13 +66,13 @@ fn setup() -> (TempDir, TempDir, Registry) {
 }
 
 async fn call(tool: &Arc<dyn Tool>, input: serde_json::Value) -> llm_worker::tool::ToolOutput {
-    tool.execute(&input.to_string())
+    tool.execute(&input.to_string(), Default::default())
         .await
         .expect("tool execution failed")
 }
 
 async fn call_err(tool: &Arc<dyn Tool>, input: serde_json::Value) -> llm_worker::tool::ToolError {
-    tool.execute(&input.to_string())
+    tool.execute(&input.to_string(), Default::default())
         .await
         .expect_err("expected error")
 }

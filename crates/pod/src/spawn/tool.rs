@@ -298,7 +298,11 @@ impl SpawnPodTool {
 
 #[async_trait]
 impl Tool for SpawnPodTool {
-    async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input_json: &str,
+        _ctx: llm_worker::tool::ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
         let input: SpawnPodInput = serde_json::from_str(input_json)
             .map_err(|e| ToolError::InvalidArgument(format!("invalid SpawnPod input: {e}")))?;
 

@@ -62,7 +62,11 @@ struct SendToPodTool {
 
 #[async_trait]
 impl Tool for SendToPodTool {
-    async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input_json: &str,
+        _ctx: llm_worker::tool::ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
         let input: SendToPodInput = serde_json::from_str(input_json)
             .map_err(|e| ToolError::InvalidArgument(format!("invalid SendToPod input: {e}")))?;
         let record = self
@@ -123,7 +127,11 @@ struct ReadPodOutputTool {
 
 #[async_trait]
 impl Tool for ReadPodOutputTool {
-    async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input_json: &str,
+        _ctx: llm_worker::tool::ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
         let input: NameInput = serde_json::from_str(input_json)
             .map_err(|e| ToolError::InvalidArgument(format!("invalid ReadPodOutput input: {e}")))?;
         let record = self
@@ -197,7 +205,11 @@ struct StopPodTool {
 
 #[async_trait]
 impl Tool for StopPodTool {
-    async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input_json: &str,
+        _ctx: llm_worker::tool::ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
         let input: NameInput = serde_json::from_str(input_json)
             .map_err(|e| ToolError::InvalidArgument(format!("invalid StopPod input: {e}")))?;
         let record = self

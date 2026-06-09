@@ -10,7 +10,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::Item;
-use crate::tool::{Tool, ToolCall, ToolMeta, ToolResult};
+use crate::tool::{Tool, ToolCall, ToolExecutionContext, ToolMeta, ToolResult};
 
 // =============================================================================
 // Action Enums
@@ -107,6 +107,8 @@ pub struct ToolCallInfo {
     pub meta: ToolMeta,
     /// Tool instance (for state access).
     pub tool: Arc<dyn Tool>,
+    /// Response-local execution context for this call.
+    pub context: ToolExecutionContext,
 }
 
 /// Context for post-tool-call decisions.
@@ -119,6 +121,8 @@ pub struct ToolResultInfo {
     pub meta: ToolMeta,
     /// Tool instance (for state access).
     pub tool: Arc<dyn Tool>,
+    /// Response-local execution context for this call.
+    pub context: ToolExecutionContext,
 }
 
 // =============================================================================

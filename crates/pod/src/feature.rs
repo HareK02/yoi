@@ -1292,7 +1292,11 @@ mod tests {
 
     #[async_trait]
     impl Tool for DummyTool {
-        async fn execute(&self, _input_json: &str) -> Result<ToolOutput, ToolError> {
+        async fn execute(
+            &self,
+            _input_json: &str,
+            _ctx: llm_worker::tool::ToolExecutionContext,
+        ) -> Result<ToolOutput, ToolError> {
             Ok(ToolOutput::from("ok".to_string()))
         }
     }

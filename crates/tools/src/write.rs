@@ -30,7 +30,11 @@ pub(crate) struct WriteTool {
 
 #[async_trait]
 impl Tool for WriteTool {
-    async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input_json: &str,
+        _ctx: llm_worker::tool::ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
         let params: WriteParams = serde_json::from_str(input_json)
             .map_err(|e| ToolError::InvalidArgument(format!("invalid Write input: {e}")))?;
 
@@ -118,7 +122,10 @@ mod tests {
             "file_path": file.to_str().unwrap(),
             "content": "hello\n",
         });
-        let out = tool.execute(&input.to_string()).await.unwrap();
+        let out = tool
+            .execute(&input.to_string(), Default::default())
+            .await
+            .unwrap();
         assert!(out.summary.contains("Created"));
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello\n");
     }
@@ -135,7 +142,10 @@ mod tests {
             "file_path": file.to_str().unwrap(),
             "content": "new",
         });
-        let err = tool.execute(&input.to_string()).await.unwrap_err();
+        let err = tool
+            .execute(&input.to_string(), Default::default())
+            .await
+            .unwrap_err();
         assert!(matches!(err, ToolError::InvalidArgument(_)));
     }
 
@@ -148,7 +158,10 @@ mod tests {
         let read_def = read_tool(fs.clone(), tracker.clone());
         let (_, reader) = read_def();
         let read_in = serde_json::json!({ "file_path": file.to_str().unwrap() });
-        reader.execute(&read_in.to_string()).await.unwrap();
+        reader
+            .execute(&read_in.to_string(), Default::default())
+            .await
+            .unwrap();
 
         let write_def = write_tool(fs, tracker);
         let (_, writer) = write_def();
@@ -156,7 +169,10 @@ mod tests {
             "file_path": file.to_str().unwrap(),
             "content": "new\n",
         });
-        let out = writer.execute(&write_in.to_string()).await.unwrap();
+        let out = writer
+            .execute(&write_in.to_string(), Default::default())
+            .await
+            .unwrap();
         assert!(out.summary.contains("Overwrote"));
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "new\n");
     }
@@ -171,7 +187,10 @@ mod tests {
         let read_def = read_tool(fs.clone(), tracker.clone());
         let (_, reader) = read_def();
         reader
-            .execute(&serde_json::json!({ "file_path": file.to_str().unwrap() }).to_string())
+            .execute(
+                &serde_json::json!({ "file_path": file.to_str().unwrap() }).to_string(),
+                Default::default(),
+            )
             .await
             .unwrap();
 
@@ -187,6 +206,7 @@ mod tests {
                     "content": "new",
                 })
                 .to_string(),
+                Default::default(),
             )
             .await
             .unwrap_err();
@@ -205,7 +225,10 @@ mod tests {
             "file_path": outside.path().join("x.txt").to_str().unwrap(),
             "content": "x",
         });
-        let err = tool.execute(&input.to_string()).await.unwrap_err();
+        let err = tool
+            .execute(&input.to_string(), Default::default())
+            .await
+            .unwrap_err();
         assert!(matches!(err, ToolError::InvalidArgument(_)));
     }
 }

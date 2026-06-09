@@ -47,7 +47,11 @@ struct EditTool {
 
 #[async_trait]
 impl Tool for EditTool {
-    async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input_json: &str,
+        _ctx: llm_worker::tool::ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
         let params: EditParams = serde_json::from_str(input_json)
             .map_err(|e| ToolError::InvalidArgument(format!("invalid MemoryEdit input: {e}")))?;
 
@@ -316,7 +320,10 @@ mod tests {
             "old_string": "body body",
             "new_string": "edited",
         });
-        let out = tool.execute(&inp.to_string()).await.unwrap();
+        let out = tool
+            .execute(&inp.to_string(), Default::default())
+            .await
+            .unwrap();
         assert!(out.summary.contains("1 replacement"));
         let after = std::fs::read_to_string(&path).unwrap();
         assert!(after.contains("edited"));
@@ -335,7 +342,10 @@ mod tests {
             "old_string": "status: open\n",
             "new_string": "",
         });
-        let err = tool.execute(&inp.to_string()).await.unwrap_err();
+        let err = tool
+            .execute(&inp.to_string(), Default::default())
+            .await
+            .unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("status") || msg.contains("missing"));
 
@@ -354,7 +364,10 @@ mod tests {
             "old_string": "x",
             "new_string": "y",
         });
-        let err = tool.execute(&inp.to_string()).await.unwrap_err();
+        let err = tool
+            .execute(&inp.to_string(), Default::default())
+            .await
+            .unwrap_err();
         assert!(matches!(err, ToolError::ExecutionFailed(_)));
     }
 
@@ -369,7 +382,10 @@ mod tests {
             "old_string": "x",
             "new_string": "y",
         });
-        let err = tool.execute(&inp.to_string()).await.unwrap_err();
+        let err = tool
+            .execute(&inp.to_string(), Default::default())
+            .await
+            .unwrap_err();
         assert!(matches!(err, ToolError::InvalidArgument(_)));
     }
 }

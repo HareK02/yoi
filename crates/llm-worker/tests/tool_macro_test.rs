@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use schemars;
 use serde;
 
+use llm_worker::ToolExecutionContext;
 use llm_worker_macros::tool_registry;
 
 // =============================================================================
@@ -42,6 +43,15 @@ impl SimpleContext {
     async fn get_prefix(&self) -> String {
         self.prefix.clone()
     }
+
+    /// Tool that observes execution context
+    #[tool]
+    async fn context_echo(&self, ctx: ToolExecutionContext, message: String) -> String {
+        format!(
+            "{}:{}:{}:{}",
+            ctx.batch_id, ctx.call_index, ctx.call_id, message
+        )
+    }
 }
 
 #[tokio::test]
@@ -74,7 +84,9 @@ async fn test_basic_tool_generation() {
     );
 
     // Execution test
-    let result = tool.execute(r#"{"message": "World"}"#).await;
+    let result = tool
+        .execute(r#"{"message": "World"}"#, Default::default())
+        .await;
     assert!(result.is_ok(), "Should execute successfully");
     let output = result.unwrap();
     assert!(
@@ -97,7 +109,9 @@ async fn test_multiple_arguments() {
 
     assert_eq!(meta.name, "add");
 
-    let result = tool.execute(r#"{"a": 10, "b": 20}"#).await;
+    let result = tool
+        .execute(r#"{"a": 10, "b": 20}"#, Default::default())
+        .await;
     assert!(result.is_ok());
     let output = result.unwrap();
     assert!(
@@ -118,7 +132,7 @@ async fn test_no_arguments() {
     assert_eq!(meta.name, "get_prefix");
 
     // Call with empty JSON object
-    let result = tool.execute(r#"{}"#).await;
+    let result = tool.execute(r#"{}"#, Default::default()).await;
     assert!(result.is_ok());
     let output = result.unwrap();
     assert!(
@@ -137,7 +151,9 @@ async fn test_invalid_arguments() {
     let (_, tool) = ctx.greet_definition()();
 
     // Invalid JSON
-    let result = tool.execute(r#"{"wrong_field": "value"}"#).await;
+    let result = tool
+        .execute(r#"{"wrong_field": "value"}"#, Default::default())
+        .await;
     assert!(result.is_err(), "Should fail with invalid arguments");
 }
 
@@ -175,7 +191,7 @@ async fn test_result_return_type_success() {
     let ctx = FallibleContext;
     let (_, tool) = ctx.validate_definition()();
 
-    let result = tool.execute(r#"{"value": 42}"#).await;
+    let result = tool.execute(r#"{"value": 42}"#, Default::default()).await;
     assert!(result.is_ok(), "Should succeed for positive value");
     let output = result.unwrap();
     assert!(
@@ -190,7 +206,7 @@ async fn test_result_return_type_error() {
     let ctx = FallibleContext;
     let (_, tool) = ctx.validate_definition()();
 
-    let result = tool.execute(r#"{"value": -1}"#).await;
+    let result = tool.execute(r#"{"value": -1}"#, Default::default()).await;
     assert!(result.is_err(), "Should fail for negative value");
 
     let err = result.unwrap_err();
@@ -228,9 +244,9 @@ async fn test_sync_method() {
     let (_, tool) = ctx.increment_definition()();
 
     // Execute 3 times
-    let result1 = tool.execute(r#"{}"#).await;
-    let result2 = tool.execute(r#"{}"#).await;
-    let result3 = tool.execute(r#"{}"#).await;
+    let result1 = tool.execute(r#"{}"#, Default::default()).await;
+    let result2 = tool.execute(r#"{}"#, Default::default()).await;
+    let result3 = tool.execute(r#"{}"#, Default::default()).await;
 
     assert!(result1.is_ok());
     assert!(result2.is_ok());
@@ -238,6 +254,24 @@ async fn test_sync_method() {
 
     // Counter should be 3
     assert_eq!(ctx.counter.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn test_tool_macro_passes_execution_context() {
+    let ctx = SimpleContext {
+        prefix: "Test".to_string(),
+    };
+    let (_, tool) = ctx.context_echo_definition()();
+
+    let output = tool
+        .execute(
+            r#"{"message":"hello"}"#,
+            ToolExecutionContext::new("call-ctx", "batch-ctx", 7),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(output.summary, "\"batch-ctx:7:call-ctx:hello\"");
 }
 
 // =============================================================================

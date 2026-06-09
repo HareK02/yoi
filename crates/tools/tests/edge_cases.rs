@@ -66,13 +66,17 @@ async fn unicode_path_and_content() {
                 "content": content,
             })
             .to_string(),
+            Default::default(),
         )
         .await
         .unwrap();
 
     let read = reg.get("Read");
     let out = read
-        .execute(&json!({ "file_path": file.to_str().unwrap() }).to_string())
+        .execute(
+            &json!({ "file_path": file.to_str().unwrap() }).to_string(),
+            Default::default(),
+        )
         .await
         .unwrap();
     let body = out.content.unwrap();
@@ -98,7 +102,10 @@ async fn symlink_to_outside_scope_is_rejected_for_write() {
     // target sits outside the scope.
     let read = reg.get("Read");
     let read_err = read
-        .execute(&json!({ "file_path": link.to_str().unwrap() }).to_string())
+        .execute(
+            &json!({ "file_path": link.to_str().unwrap() }).to_string(),
+            Default::default(),
+        )
         .await
         .unwrap_err();
     assert!(
@@ -119,6 +126,7 @@ async fn symlink_to_outside_scope_is_rejected_for_write() {
                 "content": "overwritten",
             })
             .to_string(),
+            Default::default(),
         )
         .await
         .unwrap_err();
@@ -147,7 +155,10 @@ async fn broken_symlink_reports_target_and_repair_hint() {
 
     let read = reg.get("Read");
     let err = read
-        .execute(&json!({ "file_path": link.to_str().unwrap() }).to_string())
+        .execute(
+            &json!({ "file_path": link.to_str().unwrap() }).to_string(),
+            Default::default(),
+        )
         .await
         .unwrap_err();
     let msg = format!("{err}");
@@ -165,7 +176,10 @@ async fn empty_file_read_and_edit() {
 
     let read = reg.get("Read");
     let out = read
-        .execute(&json!({ "file_path": file.to_str().unwrap() }).to_string())
+        .execute(
+            &json!({ "file_path": file.to_str().unwrap() }).to_string(),
+            Default::default(),
+        )
         .await
         .unwrap();
     assert!(out.summary.contains("0 line"));
@@ -180,6 +194,7 @@ async fn empty_file_read_and_edit() {
                 "new_string": "bar",
             })
             .to_string(),
+            Default::default(),
         )
         .await
         .unwrap_err();
@@ -196,7 +211,10 @@ async fn very_long_single_line() {
 
     let read = reg.get("Read");
     let out = read
-        .execute(&json!({ "file_path": file.to_str().unwrap() }).to_string())
+        .execute(
+            &json!({ "file_path": file.to_str().unwrap() }).to_string(),
+            Default::default(),
+        )
         .await
         .unwrap();
     // Should return exactly 1 line
@@ -208,7 +226,10 @@ async fn relative_path_is_rejected() {
     let (_dir, _spill, reg) = setup();
     let read = reg.get("Read");
     let err = read
-        .execute(&json!({ "file_path": "relative.txt" }).to_string())
+        .execute(
+            &json!({ "file_path": "relative.txt" }).to_string(),
+            Default::default(),
+        )
         .await
         .unwrap_err();
     assert!(format!("{err}").contains("absolute"));
@@ -219,7 +240,10 @@ async fn directory_target_is_rejected_for_read() {
     let (dir, _spill, reg) = setup();
     let read = reg.get("Read");
     let err = read
-        .execute(&json!({ "file_path": dir.path().to_str().unwrap() }).to_string())
+        .execute(
+            &json!({ "file_path": dir.path().to_str().unwrap() }).to_string(),
+            Default::default(),
+        )
         .await
         .unwrap_err();
     assert!(format!("{err}").contains("directory"));
@@ -237,6 +261,7 @@ async fn deeply_nested_new_file_is_created() {
                 "content": "deep\n",
             })
             .to_string(),
+            Default::default(),
         )
         .await
         .unwrap();
@@ -250,9 +275,12 @@ async fn replace_preserves_unicode() {
     std::fs::write(&file, "🦀 rust 🦀\n").unwrap();
 
     let read = reg.get("Read");
-    read.execute(&json!({ "file_path": file.to_str().unwrap() }).to_string())
-        .await
-        .unwrap();
+    read.execute(
+        &json!({ "file_path": file.to_str().unwrap() }).to_string(),
+        Default::default(),
+    )
+    .await
+    .unwrap();
 
     let edit = reg.get("Edit");
     edit.execute(
@@ -262,6 +290,7 @@ async fn replace_preserves_unicode() {
             "new_string": "ラスト",
         })
         .to_string(),
+        Default::default(),
     )
     .await
     .unwrap();
@@ -282,6 +311,7 @@ async fn grep_handles_unicode_pattern() {
                 "output_mode": "content",
             })
             .to_string(),
+            Default::default(),
         )
         .await
         .unwrap();

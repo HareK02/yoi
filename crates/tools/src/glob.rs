@@ -35,7 +35,11 @@ pub(crate) struct GlobTool {
 
 #[async_trait]
 impl Tool for GlobTool {
-    async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input_json: &str,
+        _ctx: llm_worker::tool::ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
         let params: GlobParams = serde_json::from_str(input_json)
             .map_err(|e| ToolError::InvalidArgument(format!("invalid Glob input: {e}")))?;
 
@@ -239,7 +243,10 @@ mod tests {
         assert_eq!(meta.name, "Glob");
 
         let inp = serde_json::json!({ "pattern": "**/*.rs" });
-        let out = tool.execute(&inp.to_string()).await.unwrap();
+        let out = tool
+            .execute(&inp.to_string(), Default::default())
+            .await
+            .unwrap();
         assert!(out.summary.contains("2 file(s)"));
         let body = out.content.unwrap();
         assert!(body.contains("a.rs"));
@@ -261,7 +268,10 @@ mod tests {
         let def = glob_tool(fs);
         let (_, tool) = def();
         let inp = serde_json::json!({ "pattern": "*.rs" });
-        let out = tool.execute(&inp.to_string()).await.unwrap();
+        let out = tool
+            .execute(&inp.to_string(), Default::default())
+            .await
+            .unwrap();
         let body = out.content.unwrap();
         let new_pos = body.find("new.rs").unwrap();
         let old_pos = body.find("old.rs").unwrap();
@@ -274,7 +284,10 @@ mod tests {
         let def = glob_tool(fs);
         let (_, tool) = def();
         let inp = serde_json::json!({ "pattern": "**/*.nonexistent" });
-        let out = tool.execute(&inp.to_string()).await.unwrap();
+        let out = tool
+            .execute(&inp.to_string(), Default::default())
+            .await
+            .unwrap();
         assert!(out.summary.contains("No files"));
         assert!(out.content.is_none());
     }
@@ -285,7 +298,10 @@ mod tests {
         let def = glob_tool(fs);
         let (_, tool) = def();
         let inp = serde_json::json!({ "pattern": "[unterminated" });
-        let err = tool.execute(&inp.to_string()).await.unwrap_err();
+        let err = tool
+            .execute(&inp.to_string(), Default::default())
+            .await
+            .unwrap_err();
         assert!(matches!(err, ToolError::InvalidArgument(_)));
     }
 
@@ -317,7 +333,10 @@ mod tests {
         let def = glob_tool(fs);
         let (_, tool) = def();
         let inp = serde_json::json!({ "pattern": "**/*.rs" });
-        let out = tool.execute(&inp.to_string()).await.unwrap();
+        let out = tool
+            .execute(&inp.to_string(), Default::default())
+            .await
+            .unwrap();
         let body = out.content.unwrap_or_default();
         assert!(body.contains("visible.rs"));
         assert!(
@@ -335,7 +354,10 @@ mod tests {
         let def = glob_tool(fs);
         let (_, tool) = def();
         let inp = serde_json::json!({ "pattern": "*.rs" });
-        let out = tool.execute(&inp.to_string()).await.unwrap();
+        let out = tool
+            .execute(&inp.to_string(), Default::default())
+            .await
+            .unwrap();
         let body = out.content.unwrap();
         assert!(body.contains(".hidden.rs"));
         assert!(body.contains("visible.rs"));
@@ -358,7 +380,10 @@ mod tests {
             "path": link.to_str().unwrap(),
             "pattern": "**/*.rs",
         });
-        let err = tool.execute(&inp.to_string()).await.unwrap_err();
+        let err = tool
+            .execute(&inp.to_string(), Default::default())
+            .await
+            .unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("Glob does not follow symlink directories"),

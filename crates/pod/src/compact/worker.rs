@@ -151,7 +151,11 @@ struct SearchSessionLogTool {
 
 #[async_trait]
 impl Tool for SearchSessionLogTool {
-    async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input_json: &str,
+        _ctx: llm_worker::tool::ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
         let params: SearchSessionParams = serde_json::from_str(input_json).map_err(|e| {
             ToolError::InvalidArgument(format!("invalid search_session_log input: {e}"))
         })?;
@@ -206,7 +210,11 @@ struct ReadSessionItemsTool {
 
 #[async_trait]
 impl Tool for ReadSessionItemsTool {
-    async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input_json: &str,
+        _ctx: llm_worker::tool::ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
         let params: ReadSessionParams = serde_json::from_str(input_json).map_err(|e| {
             ToolError::InvalidArgument(format!("invalid read_session_items input: {e}"))
         })?;
@@ -368,7 +376,11 @@ struct MarkReadRequiredTool {
 
 #[async_trait]
 impl Tool for MarkReadRequiredTool {
-    async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input_json: &str,
+        _ctx: llm_worker::tool::ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
         let params: MarkParams = serde_json::from_str(input_json).map_err(|e| {
             ToolError::InvalidArgument(format!("invalid mark_read_required input: {e}"))
         })?;
@@ -425,7 +437,11 @@ struct AddReferenceTool {
 
 #[async_trait]
 impl Tool for AddReferenceTool {
-    async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input_json: &str,
+        _ctx: llm_worker::tool::ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
         let params: ReferenceParams = serde_json::from_str(input_json)
             .map_err(|e| ToolError::InvalidArgument(format!("invalid add_reference input: {e}")))?;
         let mut guard = self.ctx.lock().expect("compact worker context poisoned");
@@ -449,7 +465,11 @@ struct WriteSummaryTool {
 
 #[async_trait]
 impl Tool for WriteSummaryTool {
-    async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input_json: &str,
+        _ctx: llm_worker::tool::ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
         let params: SummaryParams = serde_json::from_str(input_json)
             .map_err(|e| ToolError::InvalidArgument(format!("invalid write_summary input: {e}")))?;
         let mut guard = self.ctx.lock().expect("compact worker context poisoned");
@@ -749,7 +769,7 @@ mod tests {
             ctx: ctx.clone(),
         });
         let input = serde_json::json!({ "file_path": path.to_str().unwrap() }).to_string();
-        let out = tool.execute(&input).await.unwrap();
+        let out = tool.execute(&input, Default::default()).await.unwrap();
 
         assert!(out.summary.starts_with("Marked"));
         let guard = ctx.lock().unwrap();
@@ -770,7 +790,7 @@ mod tests {
             ctx: ctx.clone(),
         });
         let input = serde_json::json!({ "file_path": path.to_str().unwrap() }).to_string();
-        let res = tool.execute(&input).await;
+        let res = tool.execute(&input, Default::default()).await;
 
         assert!(matches!(res, Err(ToolError::ExecutionFailed(_))));
         let guard = ctx.lock().unwrap();
@@ -784,11 +804,11 @@ mod tests {
         let tool: Arc<dyn Tool> = Arc::new(WriteSummaryTool { ctx: ctx.clone() });
 
         let first = serde_json::json!({ "text": "first" }).to_string();
-        let out1 = tool.execute(&first).await.unwrap();
+        let out1 = tool.execute(&first, Default::default()).await.unwrap();
         assert!(out1.summary.contains("recorded"));
 
         let second = serde_json::json!({ "text": "second" }).to_string();
-        let out2 = tool.execute(&second).await.unwrap();
+        let out2 = tool.execute(&second, Default::default()).await.unwrap();
         assert!(out2.summary.contains("replaced"));
 
         assert_eq!(ctx.lock().unwrap().summary.as_deref(), Some("second"));
@@ -801,8 +821,8 @@ mod tests {
 
         let p = "/abs/path.rs";
         let input = serde_json::json!({ "file_path": p }).to_string();
-        tool.execute(&input).await.unwrap();
-        tool.execute(&input).await.unwrap();
+        tool.execute(&input, Default::default()).await.unwrap();
+        tool.execute(&input, Default::default()).await.unwrap();
 
         let guard = ctx.lock().unwrap();
         assert_eq!(guard.references.len(), 1);
@@ -823,7 +843,7 @@ mod tests {
             state: Arc::new(SessionLogToolState { items }),
         });
         let input = serde_json::json!({ "query": "compact", "limit": 10 }).to_string();
-        let out = tool.execute(&input).await.unwrap();
+        let out = tool.execute(&input, Default::default()).await.unwrap();
         let content = out.content.unwrap();
 
         assert!(content.contains("investigate compact failure"));
@@ -842,7 +862,7 @@ mod tests {
             state: Arc::new(SessionLogToolState { items }),
         });
         let input = serde_json::json!({ "offset": 0, "limit": 1, "mode": "full" }).to_string();
-        let out = tool.execute(&input).await.unwrap();
+        let out = tool.execute(&input, Default::default()).await.unwrap();
         let content = out.content.unwrap();
 
         assert!(content.contains("raw trace detail"));

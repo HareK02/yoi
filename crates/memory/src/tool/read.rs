@@ -45,7 +45,11 @@ struct ReadTool {
 
 #[async_trait]
 impl Tool for ReadTool {
-    async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input_json: &str,
+        _ctx: llm_worker::tool::ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
         let params: ReadParams = serde_json::from_str(input_json)
             .map_err(|e| ToolError::InvalidArgument(format!("invalid MemoryRead input: {e}")))?;
 
@@ -225,7 +229,10 @@ mod tests {
 
         let (_meta, tool) = read_tool(layout)();
         let inp = serde_json::json!({ "kind": "decision", "slug": "foo" });
-        let out = tool.execute(&inp.to_string()).await.unwrap();
+        let out = tool
+            .execute(&inp.to_string(), Default::default())
+            .await
+            .unwrap();
         let body = out.content.unwrap();
         assert!(body.contains("     1\talpha"));
         assert!(body.contains("     2\tbeta"));
@@ -240,7 +247,10 @@ mod tests {
 
         let (_, tool) = read_tool(layout)();
         let inp = serde_json::json!({ "kind": "summary" });
-        let out = tool.execute(&inp.to_string()).await.unwrap();
+        let out = tool
+            .execute(&inp.to_string(), Default::default())
+            .await
+            .unwrap();
         assert!(out.content.unwrap().contains("summary body"));
     }
 
@@ -249,7 +259,10 @@ mod tests {
         let (_dir, layout) = setup();
         let (_, tool) = read_tool(layout)();
         let inp = serde_json::json!({ "kind": "summary", "slug": "x" });
-        let err = tool.execute(&inp.to_string()).await.unwrap_err();
+        let err = tool
+            .execute(&inp.to_string(), Default::default())
+            .await
+            .unwrap_err();
         assert!(matches!(err, ToolError::InvalidArgument(_)));
     }
 
@@ -258,7 +271,10 @@ mod tests {
         let (_dir, layout) = setup();
         let (_, tool) = read_tool(layout)();
         let inp = serde_json::json!({ "kind": "decision" });
-        let err = tool.execute(&inp.to_string()).await.unwrap_err();
+        let err = tool
+            .execute(&inp.to_string(), Default::default())
+            .await
+            .unwrap_err();
         assert!(matches!(err, ToolError::InvalidArgument(_)));
     }
 
@@ -267,7 +283,10 @@ mod tests {
         let (_dir, layout) = setup();
         let (_, tool) = read_tool(layout)();
         let inp = serde_json::json!({ "kind": "decision", "slug": "Bad-Slug" });
-        let err = tool.execute(&inp.to_string()).await.unwrap_err();
+        let err = tool
+            .execute(&inp.to_string(), Default::default())
+            .await
+            .unwrap_err();
         assert!(matches!(err, ToolError::InvalidArgument(_)));
     }
 
@@ -280,7 +299,10 @@ mod tests {
 
         let (_, tool) = read_tool(layout)();
         let inp = serde_json::json!({ "kind": "knowledge", "slug": "policy" });
-        let out = tool.execute(&inp.to_string()).await.unwrap();
+        let out = tool
+            .execute(&inp.to_string(), Default::default())
+            .await
+            .unwrap();
         assert!(out.content.unwrap().contains("k"));
     }
 
@@ -293,7 +315,9 @@ mod tests {
 
         let (_, tool) = read_tool_with_usage(layout.clone(), "session-1")();
         let inp = serde_json::json!({ "kind": "decision", "slug": "foo" });
-        tool.execute(&inp.to_string()).await.unwrap();
+        tool.execute(&inp.to_string(), Default::default())
+            .await
+            .unwrap();
 
         let report = usage::build_usage_report(&layout).unwrap();
         assert_eq!(report.records.len(), 1);
@@ -310,7 +334,10 @@ mod tests {
         let (_dir, layout) = setup();
         let (_, tool) = read_tool(layout)();
         let inp = serde_json::json!({ "kind": "decision", "slug": "missing" });
-        let err = tool.execute(&inp.to_string()).await.unwrap_err();
+        let err = tool
+            .execute(&inp.to_string(), Default::default())
+            .await
+            .unwrap_err();
         assert!(matches!(err, ToolError::ExecutionFailed(_)));
     }
 }

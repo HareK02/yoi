@@ -54,7 +54,11 @@ struct WriteExtractedTool {
 
 #[async_trait]
 impl Tool for WriteExtractedTool {
-    async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input_json: &str,
+        _ctx: llm_worker::tool::ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
         let payload: ExtractedPayload = serde_json::from_str(input_json).map_err(|e| {
             ToolError::InvalidArgument(format!("invalid write_extracted input: {e}"))
         })?;
@@ -122,7 +126,7 @@ mod tests {
             "requests": []
         })
         .to_string();
-        let out = tool.execute(&input).await.unwrap();
+        let out = tool.execute(&input, Default::default()).await.unwrap();
         assert!(out.summary.contains("decisions=1"));
         let payload = ctx.take_payload().unwrap();
         assert_eq!(payload.decisions.len(), 1);
@@ -137,7 +141,7 @@ mod tests {
         let first =
             serde_json::json!({"decisions": [], "discussions": [], "attempts": [], "requests": []})
                 .to_string();
-        tool.execute(&first).await.unwrap();
+        tool.execute(&first, Default::default()).await.unwrap();
 
         let second = serde_json::json!({
             "decisions": [],
@@ -146,7 +150,7 @@ mod tests {
             "requests": []
         })
         .to_string();
-        tool.execute(&second).await.unwrap();
+        tool.execute(&second, Default::default()).await.unwrap();
 
         let payload = ctx.take_payload().unwrap();
         assert_eq!(payload.attempts.len(), 1);
@@ -157,7 +161,7 @@ mod tests {
     async fn invalid_json_returns_invalid_argument() {
         let ctx = Arc::new(ExtractWorkerContext::new());
         let tool: Arc<dyn Tool> = Arc::new(WriteExtractedTool { ctx: ctx.clone() });
-        let res = tool.execute("not json").await;
+        let res = tool.execute("not json", Default::default()).await;
         assert!(matches!(res, Err(ToolError::InvalidArgument(_))));
         assert!(ctx.take_payload().is_none());
     }

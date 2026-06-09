@@ -562,7 +562,11 @@ struct TicketDoctorTool {
 
 #[async_trait]
 impl Tool for TicketCreateTool {
-    async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input_json: &str,
+        _ctx: llm_worker::tool::ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
         let params: TicketCreateParams = parse_input("TicketCreate", input_json)?;
         let mut input = NewTicket::new(params.title);
         if let Some(body) = params.body {
@@ -594,7 +598,11 @@ impl Tool for TicketCreateTool {
 
 #[async_trait]
 impl Tool for TicketListTool {
-    async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input_json: &str,
+        _ctx: llm_worker::tool::ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
         let params: TicketListParams = parse_input("TicketList", input_json)?;
         let state = params.state.unwrap_or(TicketListStateParam::All);
         let (filter, state_filter) = state.as_filter();
@@ -629,7 +637,11 @@ impl Tool for TicketListTool {
 
 #[async_trait]
 impl Tool for TicketShowTool {
-    async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input_json: &str,
+        _ctx: llm_worker::tool::ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
         let params: TicketShowParams = parse_input("TicketShow", input_json)?;
         let query = id_or_query(params.id, params.query)?;
         let event_limit = bounded(params.event_limit, DEFAULT_EVENT_LIMIT, MAX_EVENT_LIMIT);
@@ -661,7 +673,11 @@ impl Tool for TicketShowTool {
 
 #[async_trait]
 impl Tool for TicketCommentTool {
-    async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input_json: &str,
+        _ctx: llm_worker::tool::ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
         let params: TicketCommentParams = parse_input("TicketComment", input_json)?;
         let kind = match params.role {
             TicketCommentRoleParam::Comment => TicketEventKind::Comment,
@@ -684,7 +700,11 @@ impl Tool for TicketCommentTool {
 
 #[async_trait]
 impl Tool for TicketReviewTool {
-    async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input_json: &str,
+        _ctx: llm_worker::tool::ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
         let params: TicketReviewParams = parse_input("TicketReview", input_json)?;
         let result = match params.result {
             TicketReviewResultParam::Approve => TicketReviewResult::Approve,
@@ -708,7 +728,11 @@ impl Tool for TicketReviewTool {
 
 #[async_trait]
 impl Tool for TicketIntakeReadyTool {
-    async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input_json: &str,
+        _ctx: llm_worker::tool::ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
         let params: TicketIntakeReadyParams = parse_input("TicketIntakeReady", input_json)?;
         let from = TicketWorkflowState::Planning;
         let reason = params
@@ -743,7 +767,11 @@ impl Tool for TicketIntakeReadyTool {
 
 #[async_trait]
 impl Tool for TicketWorkflowStateTool {
-    async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input_json: &str,
+        _ctx: llm_worker::tool::ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
         let params: TicketWorkflowStateParams = parse_input("TicketWorkflowState", input_json)?;
         let from = params.from.into_state();
         let to = params.to.into_state();
@@ -778,7 +806,11 @@ impl Tool for TicketWorkflowStateTool {
 
 #[async_trait]
 impl Tool for TicketCloseTool {
-    async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input_json: &str,
+        _ctx: llm_worker::tool::ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
         let params: TicketCloseParams = parse_input("TicketClose", input_json)?;
         self.backend
             .close(
@@ -795,7 +827,11 @@ impl Tool for TicketCloseTool {
 
 #[async_trait]
 impl Tool for TicketRelationRecordTool {
-    async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input_json: &str,
+        _ctx: llm_worker::tool::ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
         let params: TicketRelationRecordParams = parse_input("TicketRelationRecord", input_json)?;
         let relation = NewTicketRelation {
             kind: params.kind.into_kind(),
@@ -819,7 +855,11 @@ impl Tool for TicketRelationRecordTool {
 
 #[async_trait]
 impl Tool for TicketRelationQueryTool {
-    async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input_json: &str,
+        _ctx: llm_worker::tool::ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
         let params: TicketRelationQueryParams = parse_input("TicketRelationQuery", input_json)?;
         let limit = bounded(params.limit, DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT);
         let ticket = params.ticket.clone().map(TicketIdOrSlug::Id);
@@ -853,7 +893,11 @@ impl Tool for TicketRelationQueryTool {
 
 #[async_trait]
 impl Tool for TicketOrchestrationPlanRecordTool {
-    async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input_json: &str,
+        _ctx: llm_worker::tool::ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
         let params: TicketOrchestrationPlanRecordParams =
             parse_input("TicketOrchestrationPlanRecord", input_json)?;
         let accepted_plan = params.accepted_plan.map(|plan| AcceptedOrchestrationPlan {
@@ -885,7 +929,11 @@ impl Tool for TicketOrchestrationPlanRecordTool {
 
 #[async_trait]
 impl Tool for TicketOrchestrationPlanQueryTool {
-    async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input_json: &str,
+        _ctx: llm_worker::tool::ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
         let params: TicketOrchestrationPlanQueryParams =
             parse_input("TicketOrchestrationPlanQuery", input_json)?;
         let limit = bounded(params.limit, DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT);
@@ -922,7 +970,11 @@ impl Tool for TicketOrchestrationPlanQueryTool {
 
 #[async_trait]
 impl Tool for TicketDoctorTool {
-    async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input_json: &str,
+        _ctx: llm_worker::tool::ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
         let params: TicketDoctorParams = parse_input("TicketDoctor", input_json)?;
         let limit = bounded(params.limit, DEFAULT_DIAGNOSTIC_LIMIT, MAX_DIAGNOSTIC_LIMIT);
         let report = self
@@ -1377,6 +1429,7 @@ mod tests {
                     "body": "## Background\n\nCreated by tool.\n"
                 })
                 .to_string(),
+                Default::default(),
             )
             .await
             .unwrap();
@@ -1388,7 +1441,10 @@ mod tests {
         assert!(!created_text.contains("needs_preflight"));
 
         let listed = list
-            .execute(&json!({ "state": "planning" }).to_string())
+            .execute(
+                &json!({ "state": "planning" }).to_string(),
+                Default::default(),
+            )
             .await
             .unwrap();
         assert!(listed.summary.contains("Listed 1 ticket"));
@@ -1398,7 +1454,10 @@ mod tests {
         assert!(!listed_content.contains("needs_preflight"));
 
         let shown = show
-            .execute(&json!({ "id": id, "event_limit": 10 }).to_string())
+            .execute(
+                &json!({ "id": id, "event_limit": 10 }).to_string(),
+                Default::default(),
+            )
             .await
             .unwrap();
         assert!(shown.summary.contains(&id));
@@ -1407,7 +1466,10 @@ mod tests {
         assert!(!shown_content.contains("legacy_ticket"));
         assert!(!shown_content.contains("needs_preflight"));
 
-        let report = doctor.execute(&json!({}).to_string()).await.unwrap();
+        let report = doctor
+            .execute(&json!({}).to_string(), Default::default())
+            .await
+            .unwrap();
         assert!(report.summary.contains("0 error(s)"));
     }
 
@@ -1431,6 +1493,7 @@ mod tests {
                     "author": "test"
                 })
                 .to_string(),
+                Default::default(),
             )
             .await
             .unwrap();
@@ -1440,7 +1503,10 @@ mod tests {
         assert_eq!(recorded_json["target"], target.id);
 
         let queried = query
-            .execute(&json!({ "ticket": target.id.clone() }).to_string())
+            .execute(
+                &json!({ "ticket": target.id.clone() }).to_string(),
+                Default::default(),
+            )
             .await
             .unwrap();
         let queried_json: Value = serde_json::from_str(&queried.content.unwrap()).unwrap();
@@ -1448,7 +1514,10 @@ mod tests {
         assert_eq!(queried_json["relations"][0]["ticket_id"], source.id);
 
         let shown = show
-            .execute(&json!({ "id": target.id.clone() }).to_string())
+            .execute(
+                &json!({ "id": target.id.clone() }).to_string(),
+                Default::default(),
+            )
             .await
             .unwrap();
         let shown_json: Value = serde_json::from_str(&shown.content.unwrap()).unwrap();
@@ -1476,6 +1545,7 @@ mod tests {
                     "body": "Implemented."
                 })
                 .to_string(),
+                Default::default(),
             )
             .await
             .unwrap();
@@ -1487,6 +1557,7 @@ mod tests {
                     "body": "Looks good."
                 })
                 .to_string(),
+                Default::default(),
             )
             .await
             .unwrap();
@@ -1494,11 +1565,15 @@ mod tests {
             .execute(
                 &json!({ "ticket": created.id, "resolution": "Done via TicketClose.\n" })
                     .to_string(),
+                Default::default(),
             )
             .await
             .unwrap();
 
-        let report = doctor.execute(&json!({}).to_string()).await.unwrap();
+        let report = doctor
+            .execute(&json!({}).to_string(), Default::default())
+            .await
+            .unwrap();
         assert!(report.summary.contains("0 error(s)"));
         let closed = backend.show(TicketIdOrSlug::Id(created.id)).unwrap();
         assert!(closed.resolution.is_some());
@@ -1538,6 +1613,7 @@ mod tests {
                     "author": "intake-pod"
                 })
                 .to_string(),
+                Default::default(),
             )
             .await
             .unwrap();
@@ -1555,6 +1631,7 @@ mod tests {
                     "author": "orchestrator"
                 })
                 .to_string(),
+                Default::default(),
             )
             .await
             .unwrap();
@@ -1569,6 +1646,7 @@ mod tests {
                     "author": "orchestrator"
                 })
                 .to_string(),
+                Default::default(),
             )
             .await
             .unwrap();
@@ -1621,6 +1699,7 @@ mod tests {
                     "author": "orchestrator"
                 })
                 .to_string(),
+                Default::default(),
             )
             .await
             .unwrap();
@@ -1650,6 +1729,7 @@ mod tests {
                     "author": "orchestrator"
                 })
                 .to_string(),
+            Default::default(),
             )
             .await
             .unwrap();
@@ -1685,6 +1765,7 @@ mod tests {
                     "body": "Should not apply.\n"
                 })
                 .to_string(),
+                Default::default(),
             )
             .await
             .unwrap_err();
@@ -1717,6 +1798,7 @@ mod tests {
                     "body": "Should not bypass Queue.\n"
                 })
                 .to_string(),
+                Default::default(),
             )
             .await
             .unwrap_err();
@@ -1735,6 +1817,7 @@ mod tests {
                     "body": "Should not move backwards.\n"
                 })
                 .to_string(),
+                Default::default(),
             )
             .await
             .unwrap_err();
@@ -1753,6 +1836,7 @@ mod tests {
                     "body": "Should not skip inprogress.\n"
                 })
                 .to_string(),
+                Default::default(),
             )
             .await
             .unwrap_err();
@@ -1775,6 +1859,7 @@ mod tests {
                     "intake_summary": "Should not rewrite ready ticket."
                 })
                 .to_string(),
+                Default::default(),
             )
             .await
             .unwrap_err();
@@ -1807,6 +1892,7 @@ mod tests {
                     "author": "orchestrator"
                 })
                 .to_string(),
+                Default::default(),
             )
             .await
             .unwrap();
@@ -1823,6 +1909,7 @@ mod tests {
                     "relation_kind": "blocked_by"
                 })
                 .to_string(),
+                Default::default(),
             )
             .await
             .unwrap();
@@ -1840,7 +1927,10 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let show = tool_by_name(backend(&temp), "TicketShow");
         let error = show
-            .execute(&json!({ "id": "a", "query": "b" }).to_string())
+            .execute(
+                &json!({ "id": "a", "query": "b" }).to_string(),
+                Default::default(),
+            )
             .await
             .unwrap_err();
         assert!(matches!(error, ToolError::InvalidArgument(_)));
@@ -1852,7 +1942,10 @@ mod tests {
         let backend = backend(&temp);
         let create = tool_by_name(backend.clone(), "TicketCreate");
         let output = create
-            .execute(&json!({ "title": "Escape" }).to_string())
+            .execute(
+                &json!({ "title": "Escape" }).to_string(),
+                Default::default(),
+            )
             .await
             .unwrap();
         let value: Value = serde_json::from_str(&output.content.unwrap()).unwrap();
