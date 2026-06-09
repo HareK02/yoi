@@ -57,7 +57,6 @@ pub fn core_builtin_tools(
     fs: ScopedFs,
     tracker: Tracker,
     bash_output_dir: std::path::PathBuf,
-    web_config: Option<manifest::WebConfig>,
 ) -> Vec<llm_worker::tool::ToolDefinition> {
     vec![
         read_tool(fs.clone(), tracker.clone()),
@@ -66,6 +65,13 @@ pub fn core_builtin_tools(
         glob_tool(fs.clone()),
         grep_tool(fs.clone()),
         bash_tool(fs, bash_output_dir),
+    ]
+}
+
+pub fn web_builtin_tools(
+    web_config: Option<manifest::WebConfig>,
+) -> Vec<llm_worker::tool::ToolDefinition> {
+    vec![
         web_search_tool(web::WebTools::new(web_config.clone())),
         web_fetch_tool(web::WebTools::new(web_config)),
     ]

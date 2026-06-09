@@ -13,7 +13,9 @@ use std::rc::Rc;
 use mlua::{Lua, LuaOptions, LuaSerdeExt, RegistryKey, StdLib, Table, Value as LuaValue};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{CompactionConfigPartial, PermissionConfigPartial, SessionConfigPartial};
+use crate::config::{
+    CompactionConfigPartial, FeatureConfigPartial, PermissionConfigPartial, SessionConfigPartial,
+};
 use crate::model::{AuthRef, ModelManifest};
 use crate::{
     MemoryConfig, Permission, PodManifest, PodManifestConfig, PodMetaConfig, ResolveError,
@@ -571,6 +573,7 @@ fn resolve_lua_profile_value(
         ),
         session: profile.session,
         permissions: profile.permissions,
+        feature: profile.feature,
         compaction,
         web: profile.web,
         memory: profile.memory,
@@ -629,6 +632,8 @@ struct ProfileConfig {
     session: Option<SessionConfigPartial>,
     #[serde(default)]
     permissions: Option<PermissionConfigPartial>,
+    #[serde(default)]
+    feature: FeatureConfigPartial,
     #[serde(default)]
     compaction: Option<serde_json::Value>,
     #[serde(default)]
@@ -1457,6 +1462,57 @@ return profile {
             Some("coder")
         );
     }
+    #[test]
+    fn resolves_lua_profile_feature_flags_without_runtime_state() {
+        let tmp = TempDir::new().unwrap();
+        let profile = write_profile(
+            tmp.path(),
+            "feature.lua",
+            r#"
+local profile = require("yoi.profile")
+local scope = require("yoi.scope")
+return profile {
+  slug = "feature",
+  model = { scheme = "anthropic", model_id = "claude-sonnet-4-20250514" },
+  scope = scope.workspace_read(),
+  delegation_scope = scope.workspace_write(),
+  feature = {
+    task = { enabled = true },
+    memory = { enabled = false },
+    web = { enabled = true },
+    pod_management = { enabled = true },
+    ticket = { enabled = true, access = "read_only" },
+    ticket_orchestration = { enabled = false },
+  },
+}
+"#,
+        );
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let resolved = ProfileResolver::new()
+            .with_workspace_base(&workspace)
+            .resolve(
+                &ProfileSelector::path(&profile),
+                ProfileResolveOptions::with_pod_name("runtime-pod"),
+            )
+            .unwrap();
+        assert_eq!(resolved.manifest.pod.name, "runtime-pod");
+        assert!(resolved.manifest.feature.task.enabled);
+        assert!(!resolved.manifest.feature.memory.enabled);
+        assert!(resolved.manifest.feature.web.enabled);
+        assert!(resolved.manifest.feature.pod_management.enabled);
+        assert!(resolved.manifest.feature.ticket.enabled);
+        assert_eq!(
+            resolved.manifest.feature.ticket.access,
+            crate::TicketFeatureAccessConfig::ReadOnly
+        );
+        assert!(!resolved.manifest.feature.ticket_orchestration.enabled);
+        assert_eq!(
+            resolved.manifest.delegation_scope.allow[0].target,
+            workspace
+        );
+    }
+
     #[test]
     fn host_modules_and_local_require_work() {
         let tmp = TempDir::new().unwrap();

@@ -16,9 +16,10 @@ use serde::{Deserialize, Serialize};
 use crate::defaults;
 use crate::model::{AuthRef, ModelManifest, ReasoningControl};
 use crate::{
-    CompactionConfig, FileUploadLimits, MemoryConfig, PodManifest, PodMeta, ScopeConfig,
-    SessionConfig, SkillsConfig, ToolOutputLimits, ToolPermissionConfig, ToolPermissionRule,
-    WebConfig, WorkerManifest,
+    CompactionConfig, FeatureConfig, FeatureFlagConfig, FileUploadLimits, MemoryConfig,
+    PodManifest, PodMeta, ScopeConfig, SessionConfig, SkillsConfig, TicketFeatureAccessConfig,
+    TicketFeatureConfig, ToolOutputLimits, ToolPermissionConfig, ToolPermissionRule, WebConfig,
+    WorkerManifest,
 };
 
 /// Partial-form Pod manifest. Every field is optional; one or more
@@ -47,6 +48,10 @@ pub struct PodManifestConfig {
     /// is disabled; `Some` requires `default_action` during final resolve.
     #[serde(default)]
     pub permissions: Option<PermissionConfigPartial>,
+    /// Explicit built-in feature/tool-surface enablement. Absent flags resolve
+    /// disabled after cascade merge.
+    #[serde(default)]
+    pub feature: FeatureConfigPartial,
     #[serde(default)]
     pub compaction: Option<CompactionConfigPartial>,
     /// First-class web tool opt-in. See [`WebConfig`].
@@ -58,6 +63,146 @@ pub struct PodManifestConfig {
     /// External Agent Skills directories. See [`crate::SkillsConfig`].
     #[serde(default)]
     pub skills: Option<SkillsConfig>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FeatureConfigPartial {
+    #[serde(default)]
+    pub task: Option<FeatureFlagConfigPartial>,
+    #[serde(default)]
+    pub memory: Option<FeatureFlagConfigPartial>,
+    #[serde(default)]
+    pub web: Option<FeatureFlagConfigPartial>,
+    #[serde(default)]
+    pub pod_management: Option<FeatureFlagConfigPartial>,
+    #[serde(default)]
+    pub ticket: Option<TicketFeatureConfigPartial>,
+    #[serde(default)]
+    pub ticket_orchestration: Option<FeatureFlagConfigPartial>,
+}
+
+impl FeatureConfigPartial {
+    fn merge(self, other: Self) -> Self {
+        Self {
+            task: merge_option(self.task, other.task, FeatureFlagConfigPartial::merge),
+            memory: merge_option(self.memory, other.memory, FeatureFlagConfigPartial::merge),
+            web: merge_option(self.web, other.web, FeatureFlagConfigPartial::merge),
+            pod_management: merge_option(
+                self.pod_management,
+                other.pod_management,
+                FeatureFlagConfigPartial::merge,
+            ),
+            ticket: merge_option(self.ticket, other.ticket, TicketFeatureConfigPartial::merge),
+            ticket_orchestration: merge_option(
+                self.ticket_orchestration,
+                other.ticket_orchestration,
+                FeatureFlagConfigPartial::merge,
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FeatureFlagConfigPartial {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+}
+
+impl FeatureFlagConfigPartial {
+    fn merge(self, other: Self) -> Self {
+        Self {
+            enabled: other.enabled.or(self.enabled),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TicketFeatureConfigPartial {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub access: Option<TicketFeatureAccessConfig>,
+}
+
+impl TicketFeatureConfigPartial {
+    fn merge(self, other: Self) -> Self {
+        Self {
+            enabled: other.enabled.or(self.enabled),
+            access: other.access.or(self.access),
+        }
+    }
+}
+
+impl From<FeatureConfigPartial> for FeatureConfig {
+    fn from(value: FeatureConfigPartial) -> Self {
+        Self {
+            task: value.task.map(FeatureFlagConfig::from).unwrap_or_default(),
+            memory: value
+                .memory
+                .map(FeatureFlagConfig::from)
+                .unwrap_or_default(),
+            web: value.web.map(FeatureFlagConfig::from).unwrap_or_default(),
+            pod_management: value
+                .pod_management
+                .map(FeatureFlagConfig::from)
+                .unwrap_or_default(),
+            ticket: value
+                .ticket
+                .map(TicketFeatureConfig::from)
+                .unwrap_or_default(),
+            ticket_orchestration: value
+                .ticket_orchestration
+                .map(FeatureFlagConfig::from)
+                .unwrap_or_default(),
+        }
+    }
+}
+
+impl From<FeatureFlagConfigPartial> for FeatureFlagConfig {
+    fn from(value: FeatureFlagConfigPartial) -> Self {
+        Self {
+            enabled: value.enabled.unwrap_or_default(),
+        }
+    }
+}
+
+impl From<FeatureFlagConfig> for FeatureFlagConfigPartial {
+    fn from(value: FeatureFlagConfig) -> Self {
+        Self {
+            enabled: Some(value.enabled),
+        }
+    }
+}
+
+impl From<TicketFeatureConfigPartial> for TicketFeatureConfig {
+    fn from(value: TicketFeatureConfigPartial) -> Self {
+        Self {
+            enabled: value.enabled.unwrap_or_default(),
+            access: value.access.unwrap_or_default(),
+        }
+    }
+}
+
+impl From<TicketFeatureConfig> for TicketFeatureConfigPartial {
+    fn from(value: TicketFeatureConfig) -> Self {
+        Self {
+            enabled: Some(value.enabled),
+            access: Some(value.access),
+        }
+    }
+}
+
+impl From<FeatureConfig> for FeatureConfigPartial {
+    fn from(value: FeatureConfig) -> Self {
+        Self {
+            task: Some(value.task.into()),
+            memory: Some(value.memory.into()),
+            web: Some(value.web.into()),
+            pod_management: Some(value.pod_management.into()),
+            ticket: Some(value.ticket.into()),
+            ticket_orchestration: Some(value.ticket_orchestration.into()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -305,6 +450,7 @@ impl PodManifestConfig {
                 upper.permissions,
                 PermissionConfigPartial::merge,
             ),
+            feature: self.feature.merge(upper.feature),
             compaction: merge_option(
                 self.compaction,
                 upper.compaction,
@@ -690,6 +836,7 @@ impl TryFrom<PodManifestConfig> for PodManifest {
             delegation_scope: cfg.delegation_scope,
             session,
             permissions,
+            feature: FeatureConfig::from(cfg.feature),
             compaction,
             web: cfg.web,
             memory: cfg.memory,
@@ -735,6 +882,7 @@ mod tests {
             },
             delegation_scope: ScopeConfig::default(),
             permissions: None,
+            feature: FeatureConfigPartial::default(),
             session: None,
             compaction: None,
             web: None,
@@ -1278,6 +1426,125 @@ worker_max_turns = 7
             manifest.compaction.unwrap().worker_max_turns,
             defaults::COMPACT_WORKER_MAX_TURNS
         );
+    }
+
+    #[test]
+    fn feature_flags_default_disabled_in_resolved_manifest() {
+        let manifest: PodManifest = minimal_valid().try_into().unwrap();
+        assert!(!manifest.feature.task.enabled);
+        assert!(!manifest.feature.memory.enabled);
+        assert!(!manifest.feature.web.enabled);
+        assert!(!manifest.feature.pod_management.enabled);
+        assert!(!manifest.feature.ticket.enabled);
+        assert!(!manifest.feature.ticket_orchestration.enabled);
+    }
+
+    #[test]
+    fn from_toml_parses_explicit_feature_flags() {
+        let cfg = PodManifestConfig::from_toml(
+            r#"
+[feature.task]
+enabled = true
+
+[feature.ticket]
+enabled = true
+access = "read_only"
+
+[feature.ticket_orchestration]
+enabled = true
+"#,
+        )
+        .unwrap();
+        let manifest: PodManifest = PodManifestConfig::builtin_defaults()
+            .merge(cfg)
+            .merge(PodManifestConfig {
+                pod: PodMetaConfig {
+                    name: Some("feature-test".into()),
+                    prompt_pack: None,
+                },
+                model: ModelManifest {
+                    scheme: Some(SchemeKind::Anthropic),
+                    model_id: Some("m".into()),
+                    ..Default::default()
+                },
+                scope: ScopeConfig {
+                    allow: vec![ScopeRule {
+                        target: abs("/pod"),
+                        permission: Permission::Read,
+                        recursive: true,
+                    }],
+                    deny: Vec::new(),
+                },
+                ..Default::default()
+            })
+            .try_into()
+            .unwrap();
+        assert!(manifest.feature.task.enabled);
+        assert!(manifest.feature.ticket.enabled);
+        assert_eq!(
+            manifest.feature.ticket.access,
+            TicketFeatureAccessConfig::ReadOnly
+        );
+        assert!(manifest.feature.ticket_orchestration.enabled);
+        assert!(!manifest.feature.memory.enabled);
+    }
+
+    #[test]
+    fn feature_flags_merge_as_partial_profile_layers() {
+        let base = PodManifestConfig::from_toml(
+            r#"
+[feature.memory]
+enabled = true
+
+[feature.ticket]
+enabled = true
+access = "read_only"
+"#,
+        )
+        .unwrap();
+        let upper = PodManifestConfig::from_toml(
+            r#"
+[feature.ticket]
+access = "lifecycle"
+
+[feature.web]
+enabled = true
+"#,
+        )
+        .unwrap();
+        let manifest: PodManifest = PodManifestConfig::builtin_defaults()
+            .merge(base)
+            .merge(upper)
+            .merge(PodManifestConfig {
+                pod: PodMetaConfig {
+                    name: Some("feature-merge-test".into()),
+                    prompt_pack: None,
+                },
+                model: ModelManifest {
+                    scheme: Some(SchemeKind::Anthropic),
+                    model_id: Some("m".into()),
+                    ..Default::default()
+                },
+                scope: ScopeConfig {
+                    allow: vec![ScopeRule {
+                        target: abs("/pod"),
+                        permission: Permission::Read,
+                        recursive: true,
+                    }],
+                    deny: Vec::new(),
+                },
+                ..Default::default()
+            })
+            .try_into()
+            .unwrap();
+        assert!(manifest.feature.memory.enabled);
+        assert!(manifest.feature.ticket.enabled);
+        assert_eq!(
+            manifest.feature.ticket.access,
+            TicketFeatureAccessConfig::Lifecycle
+        );
+        assert!(manifest.feature.web.enabled);
+        assert!(!manifest.feature.pod_management.enabled);
     }
 
     #[test]

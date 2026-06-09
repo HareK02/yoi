@@ -9,7 +9,11 @@ use std::path::{Path, PathBuf};
 use ticket::{
     LocalTicketBackend,
     config::{DEFAULT_TICKET_BACKEND_RELATIVE_PATH, TicketConfig},
-    tool::{TICKET_READ_ONLY_TOOL_NAMES, TICKET_TOOL_NAMES, ticket_tools},
+    tool::{
+        TICKET_BASE_READ_ONLY_TOOL_NAMES, TICKET_BASE_TOOL_NAMES,
+        TICKET_ORCHESTRATION_READ_ONLY_TOOL_NAMES, TICKET_ORCHESTRATION_TOOL_NAMES,
+        TICKET_READ_ONLY_TOOL_NAMES, TICKET_TOOL_NAMES, ticket_tools,
+    },
 };
 
 use crate::feature::{
@@ -32,10 +36,17 @@ pub enum TicketFeatureAccess {
 }
 
 impl TicketFeatureAccess {
-    pub fn tool_names(self) -> &'static [&'static str] {
+    pub fn base_tool_names(self) -> &'static [&'static str] {
         match self {
-            Self::ReadOnly => &TICKET_READ_ONLY_TOOL_NAMES,
-            Self::Lifecycle => &TICKET_TOOL_NAMES,
+            Self::ReadOnly => &TICKET_BASE_READ_ONLY_TOOL_NAMES,
+            Self::Lifecycle => &TICKET_BASE_TOOL_NAMES,
+        }
+    }
+
+    pub fn orchestration_tool_names(self) -> &'static [&'static str] {
+        match self {
+            Self::ReadOnly => &TICKET_ORCHESTRATION_READ_ONLY_TOOL_NAMES,
+            Self::Lifecycle => &TICKET_ORCHESTRATION_TOOL_NAMES,
         }
     }
 }
@@ -46,6 +57,8 @@ pub struct TicketFeature {
     record_language: Option<String>,
     config_error: Option<String>,
     access: TicketFeatureAccess,
+    include_base_tools: bool,
+    include_orchestration_tools: bool,
 }
 
 impl TicketFeature {
@@ -54,11 +67,21 @@ impl TicketFeature {
     }
 
     pub fn new_with_access(backend_root: impl Into<PathBuf>, access: TicketFeatureAccess) -> Self {
+        Self::new_with_options(backend_root, Some(access), true)
+    }
+
+    pub fn new_with_options(
+        backend_root: impl Into<PathBuf>,
+        access: Option<TicketFeatureAccess>,
+        include_orchestration_tools: bool,
+    ) -> Self {
         Self {
             backend_root: backend_root.into(),
             record_language: None,
             config_error: None,
-            access,
+            access: access.unwrap_or(TicketFeatureAccess::Lifecycle),
+            include_base_tools: access.is_some(),
+            include_orchestration_tools,
         }
     }
 
@@ -70,21 +93,35 @@ impl TicketFeature {
         workspace: impl AsRef<Path>,
         access: TicketFeatureAccess,
     ) -> Self {
+        Self::for_workspace_with_options(workspace, Some(access), true)
+    }
+
+    pub fn for_workspace_with_options(
+        workspace: impl AsRef<Path>,
+        access: Option<TicketFeatureAccess>,
+        include_orchestration_tools: bool,
+    ) -> Self {
         let workspace = workspace.as_ref();
         match TicketConfig::load_workspace(workspace) {
             Ok(config) => {
                 let backend_root = config.backend_root().to_path_buf();
                 let record_language = config.ticket_record_language().map(str::to_string);
-                let mut feature = Self::new_with_access(backend_root, access);
+                let mut feature =
+                    Self::new_with_options(backend_root, access, include_orchestration_tools);
                 feature.record_language = record_language;
                 feature
             }
-            Err(error) => Self {
-                backend_root: workspace.join(DEFAULT_TICKET_BACKEND_RELATIVE_PATH),
-                record_language: None,
-                config_error: Some(error.to_string()),
-                access,
-            },
+            Err(error) => {
+                let access_value = access.unwrap_or(TicketFeatureAccess::Lifecycle);
+                Self {
+                    backend_root: workspace.join(DEFAULT_TICKET_BACKEND_RELATIVE_PATH),
+                    record_language: None,
+                    config_error: Some(error.to_string()),
+                    access: access_value,
+                    include_base_tools: access.is_some(),
+                    include_orchestration_tools,
+                }
+            }
         }
     }
 
@@ -94,6 +131,23 @@ impl TicketFeature {
 
     pub fn access(&self) -> TicketFeatureAccess {
         self.access
+    }
+
+    fn enabled_tool_names(&self) -> Vec<&'static str> {
+        if self.include_base_tools && self.include_orchestration_tools {
+            return match self.access {
+                TicketFeatureAccess::ReadOnly => TICKET_READ_ONLY_TOOL_NAMES.to_vec(),
+                TicketFeatureAccess::Lifecycle => TICKET_TOOL_NAMES.to_vec(),
+            };
+        }
+        let mut names = Vec::new();
+        if self.include_base_tools {
+            names.extend_from_slice(self.access.base_tool_names());
+        }
+        if self.include_orchestration_tools {
+            names.extend_from_slice(self.access.orchestration_tool_names());
+        }
+        names
     }
 
     fn authority(&self) -> HostAuthority {
@@ -122,7 +176,8 @@ impl FeatureModule for TicketFeature {
                 self.authority(),
                 AUTHORITY_REASON,
             ));
-        for name in self.access.tool_names() {
+        let enabled_tool_names = self.enabled_tool_names();
+        for name in &enabled_tool_names {
             descriptor = descriptor.with_tool(ToolDeclaration::new(*name, tool_description(name)));
         }
         descriptor
@@ -152,12 +207,15 @@ impl FeatureModule for TicketFeature {
         let authority = self.authority();
         let backend = LocalTicketBackend::new(usable_root)
             .with_record_language(self.record_language.as_deref());
-        let allowed_tool_names = self.access.tool_names();
+        let allowed_tool_names = self.enabled_tool_names();
         let mut tools = context.tools();
         for definition in ticket_tools(backend) {
             let (meta, _) = definition();
             let name = meta.name.clone();
-            if !allowed_tool_names.contains(&name.as_str()) {
+            if !allowed_tool_names
+                .iter()
+                .any(|allowed| *allowed == name.as_str())
+            {
                 continue;
             }
             tools.register(
@@ -211,12 +269,24 @@ pub fn ticket_tools_feature_with_access(
     TicketFeature::for_workspace_with_access(workspace, access)
 }
 
+pub fn ticket_tools_feature_with_options(
+    workspace: impl AsRef<Path>,
+    access: Option<TicketFeatureAccess>,
+    include_orchestration_tools: bool,
+) -> TicketFeature {
+    TicketFeature::for_workspace_with_options(workspace, access, include_orchestration_tools)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::feature::{FeatureRegistryBuilder, FeatureRuntimeKind};
     use crate::hook::HookRegistryBuilder;
     use tempfile::TempDir;
+    use ticket::tool::{
+        TICKET_BASE_TOOL_NAMES, TICKET_ORCHESTRATION_TOOL_NAMES, TICKET_READ_ONLY_TOOL_NAMES,
+        TICKET_TOOL_NAMES,
+    };
 
     fn make_ticket_root(root: &Path) {
         std::fs::create_dir_all(root).unwrap();
@@ -267,6 +337,40 @@ mod tests {
             TICKET_READ_ONLY_TOOL_NAMES
         );
         assert_eq!(descriptor.requested_host_authorities.len(), 1);
+    }
+
+    #[test]
+    fn descriptor_can_expose_base_ticket_without_orchestration_tools() {
+        let temp = TempDir::new().unwrap();
+        let feature = ticket_tools_feature_with_options(
+            temp.path(),
+            Some(TicketFeatureAccess::Lifecycle),
+            false,
+        );
+        let descriptor = feature.descriptor();
+        assert_eq!(
+            descriptor
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            TICKET_BASE_TOOL_NAMES
+        );
+    }
+
+    #[test]
+    fn descriptor_can_expose_orchestration_only_tools() {
+        let temp = TempDir::new().unwrap();
+        let feature = ticket_tools_feature_with_options(temp.path(), None, true);
+        let descriptor = feature.descriptor();
+        assert_eq!(
+            descriptor
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            TICKET_ORCHESTRATION_TOOL_NAMES
+        );
     }
 
     #[test]

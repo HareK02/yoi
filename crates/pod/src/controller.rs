@@ -4,6 +4,7 @@ use std::sync::atomic::Ordering;
 
 use llm_worker::WorkerError;
 use llm_worker::llm_client::client::LlmClient;
+use manifest::TicketFeatureAccessConfig;
 use pod_store::PodMetadataStore;
 use session_store::Store;
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -223,7 +224,7 @@ impl PodController {
             runtime_dir.socket_path(),
             runtime_base.to_path_buf(),
             spawned_registry.clone(),
-        );
+        )?;
 
         // Intake role Pods self-terminate only after a successful
         // TicketIntakeReady turn has fully settled back to Idle. The request
@@ -499,7 +500,7 @@ fn register_pod_tools<C, St>(
     spawner_socket: PathBuf,
     runtime_base: PathBuf,
     spawned_registry: Arc<SpawnedPodRegistry>,
-) -> tools::ScopedFs
+) -> std::io::Result<tools::ScopedFs>
 where
     C: LlmClient + Clone + 'static,
     St: Store + PodMetadataStore + Clone + 'static,
@@ -513,6 +514,7 @@ where
     let session_id_for_usage = pod.segment_id().to_string();
     let memory_config = pod.manifest().memory.clone();
     let web_config = pod.manifest().web.clone();
+    let feature_config = pod.manifest().feature.clone();
     let spawner_name = pod.manifest().pod.name.clone();
     let spawner_manifest = pod.manifest().clone();
     let prompts = pod.prompts().clone();
@@ -534,24 +536,47 @@ where
         fs,
         tracker.clone(),
         bash_output_dir,
-        web_config,
     ));
+    if feature_config.web.enabled {
+        pod.worker_mut()
+            .register_tools(tools::web_builtin_tools(web_config));
+    }
 
     let mut feature_registry = FeatureRegistryBuilder::new();
-    feature_registry.add_module(task_feature);
-    feature_registry.add_module(crate::feature::builtin::ticket_tools_feature(
-        &workspace_root,
-    ));
+    if feature_config.task.enabled {
+        feature_registry.add_module(task_feature);
+    }
+    if feature_config.ticket.enabled || feature_config.ticket_orchestration.enabled {
+        let ticket_access = match feature_config.ticket.access {
+            TicketFeatureAccessConfig::ReadOnly => {
+                crate::feature::builtin::ticket::TicketFeatureAccess::ReadOnly
+            }
+            TicketFeatureAccessConfig::Lifecycle => {
+                crate::feature::builtin::ticket::TicketFeatureAccess::Lifecycle
+            }
+        };
+        feature_registry.add_module(
+            crate::feature::builtin::ticket::ticket_tools_feature_with_options(
+                &workspace_root,
+                feature_config.ticket.enabled.then_some(ticket_access),
+                feature_config.ticket_orchestration.enabled,
+            ),
+        );
+    }
     let _feature_install_report = pod.install_features(feature_registry);
 
     let worker = pod.worker_mut();
 
-    // Memory subsystem opt-in. When `[memory]` is present in the
-    // manifest, register the memory-specific Read/Write/Edit tools that
-    // target `<workspace>/memory/` and `<workspace>/knowledge/` with
-    // their built-in linter. Companion deny rules on the generic CRUD
-    // scope were already applied during `Pod::from_manifest`.
-    if let Some(mem) = memory_config.as_ref() {
+    // Memory tools require both explicit feature exposure and memory storage
+    // configuration. This keeps resident-memory config separate from the
+    // model-visible Memory*/Knowledge* tool surface.
+    if feature_config.memory.enabled {
+        let mem = memory_config.as_ref().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "[feature.memory].enabled = true requires a [memory] configuration section",
+            )
+        })?;
         let layout = memory::WorkspaceLayout::resolve(mem, &workspace_root);
         let query_cfg = memory::tool::QueryConfig::from(mem);
         worker.register_tool(memory::tool::read_tool_with_usage(
@@ -567,28 +592,39 @@ where
 
     // Pod-orchestration tools (SpawnPod + the four comm tools) share
     // the Pod-scoped `SpawnedPodRegistry` (also consumed by the main
-    // loop's `PodEvent` handler).
-    worker.register_tool(spawn_pod_tool(
-        spawner_name.clone(),
-        spawner_socket,
-        runtime_base.clone(),
-        workspace_root.clone(),
-        pwd.clone(),
-        spawned_registry.clone(),
-        self_parent_socket,
-        spawner_manifest,
-        scope_handle,
-        prompts,
-    ));
-    worker.register_tool(send_to_pod_tool(spawned_registry.clone()));
-    worker.register_tool(read_pod_output_tool(spawned_registry.clone()));
-    worker.register_tool(stop_pod_tool(spawned_registry.clone()));
-    let discovery = PodDiscovery::new(pod_store, spawner_name, runtime_base, pwd, spawned_registry);
-    worker.register_tool(list_pods_tool(discovery.clone()));
-    worker.register_tool(restore_pod_tool(discovery.clone()));
-    worker.register_tool(send_to_peer_pod_tool(discovery));
+    // loop's `PodEvent` handler). Expose them only behind the explicit
+    // profile feature and require delegation authority up front so enabling
+    // the surface cannot imply broad child scope by accident.
+    if feature_config.pod_management.enabled {
+        if spawner_manifest.delegation_scope.allow.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "[feature.pod_management].enabled = true requires non-empty [[delegation_scope.allow]]",
+            ));
+        }
+        worker.register_tool(spawn_pod_tool(
+            spawner_name.clone(),
+            spawner_socket,
+            runtime_base.clone(),
+            workspace_root.clone(),
+            pwd.clone(),
+            spawned_registry.clone(),
+            self_parent_socket,
+            spawner_manifest,
+            scope_handle,
+            prompts,
+        ));
+        worker.register_tool(send_to_pod_tool(spawned_registry.clone()));
+        worker.register_tool(read_pod_output_tool(spawned_registry.clone()));
+        worker.register_tool(stop_pod_tool(spawned_registry.clone()));
+        let discovery =
+            PodDiscovery::new(pod_store, spawner_name, runtime_base, pwd, spawned_registry);
+        worker.register_tool(list_pods_tool(discovery.clone()));
+        worker.register_tool(restore_pod_tool(discovery.clone()));
+        worker.register_tool(send_to_peer_pod_tool(discovery));
+    }
     pod.attach_tracker(tracker);
-    fs_for_view
+    Ok(fs_for_view)
 }
 
 /// Idle/Paused event loop. Each iteration either fires a staged
