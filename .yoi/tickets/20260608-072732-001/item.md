@@ -1,8 +1,8 @@
 ---
 title: "Add non-hierarchical typed Ticket relations"
-state: 'inprogress'
+state: 'closed'
 created_at: "2026-06-08T07:27:32Z"
-updated_at: '2026-06-09T06:28:28Z'
+updated_at: '2026-06-09T06:31:17Z'
 queued_by: "workspace-panel"
 queued_at: "2026-06-09T02:27:31Z"
 ---
