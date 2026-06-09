@@ -2,13 +2,13 @@
 id: '20260608-132230-deprecate-umbrella-tickets'
 slug: 'deprecate-umbrella-tickets'
 title: 'Deprecate umbrella Tickets'
-status: 'open'
+status: 'closed'
 kind: 'task'
 priority: 'P2'
 labels: ['ticket', 'workflow', 'documentation', 'planning']
-workflow_state: 'inprogress'
+workflow_state: 'done'
 created_at: '2026-06-08T13:22:30Z'
-updated_at: '2026-06-09T01:37:59Z'
+updated_at: '2026-06-09T02:04:40Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-06-09T01:14:14Z'
