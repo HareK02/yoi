@@ -185,3 +185,23 @@ Review focus includes schema/tool/API/output removal, doctor behavior for obsole
 Note: the initial reviewer prompt accidentally included a stale full commit hash; the branch HEAD in the worktree is the authority and is `3afdd89`.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-09T12:22:09Z -->
+
+## Implementation report
+
+Reviewer requested changes on the initial implementation because CLI `show` still printed obsolete legacy frontmatter keys through the raw-frontmatter fallback. Fix applied on branch `remove-action-attention-ticket-fields`:
+
+- Added `action_required` and `attention_required` to the obsolete frontmatter key filter used by CLI show output.
+- Added a regression test that injects legacy obsolete overlay fields and verifies `ticket show` omits both keys and values.
+
+Fix commit: `94db2dc fix: hide obsolete ticket fields in cli show`
+
+Validation after fix:
+- `cargo test -p yoi ticket_cli_show_omits_obsolete_overlay_fields_from_legacy_frontmatter`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo run -q -p yoi -- ticket doctor`
+- `cargo check --workspace`
+
+---

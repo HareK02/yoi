@@ -156,3 +156,60 @@ Reviewer Pod:
 Review focus includes explicit bool feature authority, concrete resolved Manifest feature values, disabled feature tool omission from schema, role profile surfaces, authority/fail-closed preservation, and the `feature.pods` vs implementation-reported `feature.pod_management` naming mismatch.
 
 ---
+
+<!-- event: review author: reviewer-profile-feature-flags-tool-surface at: 2026-06-09T12:18:57Z status: request_changes -->
+
+## Review: request changes
+
+Review result: request_changes.
+
+Findings:
+
+1. Coder role still enables Task tools by default. Ticket/review focus requires the Coder profile not to expose Ticket management, Ticket orchestration, Task, or Pod orchestration by default. The implementation correctly disables Ticket, Ticket orchestration, and Pod management in `.yoi/profiles/coder.lua`, but leaves `feature.task.enabled = true`, and controller registration registers Task tools whenever that flag is enabled. This means the Coder tool schema still exposes TaskCreate/TaskUpdate/etc.
+   - `.yoi/profiles/coder.lua:8-14`
+   - `crates/pod/src/controller.rs:545-548`
+
+2. The user-facing Pod feature flag name does not match the Ticket spec. The Ticket names the initial group `feature.pods`, but the implementation exposes only `feature.pod_management`. Since manifest/Profile config currently ignores unknown subfields rather than rejecting or aliasing them, a profile following the Ticket text with `feature.pods.enabled = true` would not enable Pod-management tools, and would likely fail only indirectly at missing-tool time. Either align the name with the Ticket or update the accepted spec and reject/diagnose the old spelling explicitly.
+   - `.yoi/tickets/20260609-082209-001/item.md:31-37`, `.yoi/tickets/20260609-082209-001/item.md:56-59`
+   - `crates/manifest/src/config.rs:77-84`
+   - `crates/manifest/src/lib.rs:95-101`
+
+Validation run:
+
+- `cargo fmt --check` passed
+- `git diff --check HEAD^..HEAD` passed
+- `cargo run -q -p yoi -- ticket doctor` passed
+- `cargo check --workspace` passed
+- `cargo test -p manifest feature --lib` passed
+- `cargo test -p pod feature --tests` passed
+- `cargo test -p pod pod_management_feature_requires_delegation_scope --test controller_test` passed
+- `cargo test -p tools --test integration` passed
+
+Positive checks: disabled optional surfaces are omitted from registry by `controller.rs` gating rather than merely denied at execution; resolved feature structs use concrete booleans; Ticket base and orchestration registration are separable; web registration is omitted when `feature.web.enabled=false` and still uses existing provider/config fail-closed checks when enabled; enabling Ticket/Pod management still goes through host-authority/delegation checks.
+
+---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-09T12:22:09Z -->
+
+## Implementation report
+
+Reviewer requested changes on the initial implementation. Fix applied on branch `profile-feature-flags-tool-surface`:
+
+- Renamed the user-facing profile feature from `feature.pod_management` to the Ticket-specified `feature.pods`.
+- Kept internal prompt helper naming unchanged where it describes derived tool capabilities rather than profile syntax.
+- Set project Coder profile `feature.task.enabled = false` so Coder no longer exposes Task tools by default.
+
+Fix commit: `2fd37af fix: align pod feature flag naming`
+
+Validation after fix:
+- `cargo fmt`
+- `cargo test -p manifest feature --lib`
+- `cargo test -p pod feature --tests`
+- `cargo test -p pod pods_feature_requires_delegation_scope --test controller_test`
+- `cargo test -p tools --test integration`
+- `git diff --check`
+- `cargo run -q -p yoi -- ticket doctor`
+- `cargo check --workspace`
+- `cargo fmt --check`
+
+---
