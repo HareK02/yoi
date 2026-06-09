@@ -30,3 +30,85 @@ Ticket を `workspace-panel` が queued にしました。
 
 
 ---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-09T06:59:15Z from: queued to: inprogress reason: orchestrator_acceptance field: state -->
+
+## State changed
+
+Accepted queued implementation after reading the Ticket body/thread and current workspace state. The Ticket has concrete library/CLI/report/privacy acceptance criteria and does not depend on the just-landed Objective work. Implementation can proceed with synthetic fixture tests and read-only analysis semantics.
+
+---
+
+<!-- event: decision author: orchestrator at: 2026-06-09T06:59:15Z -->
+
+## Decision
+
+Routing decision: implementation_ready
+
+Evidence checked:
+- Ticket body and Intake summary.
+- Current workspace state after Objective records merged, closed, and cleaned up.
+- Current worktree state: no active implementation worktree remains.
+- Current queued set: this is the only queued Ticket.
+
+Reason:
+- The Ticket is specific enough for implementation: add a reusable `session-analytics` crate, structured report model, and thin `yoi session analyze <path> --json` CLI.
+- The privacy boundary is explicit: default output must not dump raw user input, file contents, secrets, or raw session snippets.
+- The non-goals are clear: no pruning/compaction behavior changes, no TUI dashboard, no prompt/tool guidance auto-rewrite, no LLM semantic summarization.
+
+IntentPacket:
+
+Intent:
+- Add read-only session JSONL analytics that extracts structured tool/session metrics and suspicious-pattern diagnostics without exposing raw content by default.
+
+Binding decisions / invariants:
+- Add a reusable library crate, e.g. `crates/session-analytics`, with an API such as `analyze_session(path) -> SessionReport`.
+- Add a thin product CLI surface, e.g. `yoi session analyze <session-jsonl-or-path> --json`, that calls the library and avoids duplicating analytics logic.
+- Prefer streaming/bounded parsing for large JSONL files; do not unnecessarily read huge files into memory if line-by-line parsing is practical.
+- Analysis is read-only and has no runtime side effects.
+- The analytics crate must stay independent from TUI rendering and Pod runtime side effects; runtime crates must not depend on analytics.
+- Reuse current session/log schema types only where dependency direction remains healthy.
+- Structured report should include at least:
+  - tool usage counts by name/kind;
+  - tool calls per turn;
+  - failed tool call counts;
+  - repeated `Read` by path and by path+offset/limit;
+  - whether repeated reads had intervening write/edit observations;
+  - edit/write churn by path;
+  - edit/write argument byte-size estimates and large replacement diagnostics;
+  - `replace_all` usage;
+  - observable tool result sizes/large/truncated indicators where available;
+  - prune/compaction events and bounded correlation with subsequent repeated reads/tool calls;
+  - malformed/unknown entry diagnostics.
+- Suspicious diagnostics must be framed as observations, not automatic blame. Re-reading after mutation or validation may be correct.
+- Default CLI/report output must avoid raw user input/file contents/session snippets. It may include paths, counts, byte sizes, turn/timestamp indexes, and hashes if useful.
+- Tests should use synthetic/minimal session JSONL fixtures rather than relying on private local sessions.
+- Do not implement a full dashboard, prompt auto-fixer, semantic summarizer, or Worker pruning/compaction behavior changes.
+
+Implementation latitude:
+- Coder may choose exact report struct field names and JSON format if machine-readable and test-covered.
+- Coder may add a small JSONL adapter tolerant of unknown/malformed records with bounded diagnostics if current session log enum parsing is too strict.
+- Coder may keep initial path input file-only; `--latest`, `--pod`, directory aggregation, and Markdown output can remain future work.
+- If current session schema is too hard to reuse without unhealthy dependencies, implement a minimal analytics event parser for the observed JSONL shape and document the limitation.
+
+Escalate if:
+- Implementing this requires changing session writer/history schemas or Worker compaction behavior.
+- Avoiding raw-content exposure conflicts with required metrics.
+- Healthy crate dependency direction would require a larger session-schema extraction refactor.
+- Real local session data would need to be read for tests/validation; use synthetic fixtures instead unless explicitly authorized.
+
+Validation:
+- Focused unit tests for repeated reads with/without intervening edit/write.
+- Focused tests for large edit argument sizing and replace_all observations.
+- Focused tests for tool failure counting and tool calls per turn.
+- Focused tests for large/truncated result observations if representable in fixtures.
+- Focused tests for compaction/prune event correlation as correlation only.
+- Focused tests for malformed/unknown JSONL entries producing bounded diagnostics.
+- CLI JSON output test for `yoi session analyze <path> --json` or equivalent.
+- `cargo fmt --check`.
+- `git diff --check`.
+- `cargo run -q -p yoi -- ticket doctor`.
+- `cargo check --workspace`.
+- `nix build .#yoi`.
+
+---
