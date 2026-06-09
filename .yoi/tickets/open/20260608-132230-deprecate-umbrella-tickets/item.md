@@ -8,7 +8,7 @@ priority: 'P2'
 labels: ['ticket', 'workflow', 'documentation', 'planning']
 workflow_state: 'inprogress'
 created_at: '2026-06-08T13:22:30Z'
-updated_at: '2026-06-09T01:33:23Z'
+updated_at: '2026-06-09T01:37:59Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-06-09T01:14:14Z'

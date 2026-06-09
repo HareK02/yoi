@@ -228,3 +228,74 @@ Coder validation reported passed:
 Coder did not run `cargo check --workspace` because only docs/workflow/Ticket thread files changed.
 
 ---
+
+<!-- event: review author: reviewer at: 2026-06-09T01:36:52Z status: approve -->
+
+## Review: approve
+
+Reviewed commit `1349a75` (`ticket: deprecate umbrella containers`) against the Ticket invariants.
+
+Evidence checked:
+
+- Changed files are limited to maintained docs/workflow guidance plus the requested migration note thread: `docs/development/work-items.md`, `.yoi/workflow/{ticket-intake-workflow,ticket-orchestrator-routing,ticket-preflight-workflow,multi-agent-workflow}.md`, and `.yoi/tickets/open/20260607-020215-workspace-panel-orchestrator-queue-automation/thread.md`.
+- `docs/development/work-items.md` now defines Tickets as concrete work items that can be implemented/reviewed/validated/closed independently, disallows new broad umbrella/progress-container Tickets, explicitly forbids parent/child, sub-ticket, umbrella, part-of, contains, and hierarchy/container substitutes, preserves the carve-out for concrete planning/design/investigation Tickets, and documents superseded/decomposed retirement guidance for existing umbrellas.
+- Intake/Planning workflow guidance now avoids creating umbrella/progress-container Tickets and hierarchy/container relations during split/refinement while still allowing concrete investigation/design/planning Tickets when requested.
+- Orchestrator routing guidance now routes broad splits to concrete implementable Tickets / Objective context / split decision records, includes existing umbrella retirement/close-resolution guidance, and disallows hierarchy/container substitutes.
+- `multi-agent-workflow` clarifies that Pod delegation and multi-Ticket coordination are not Ticket hierarchy and should use concrete Tickets plus Objective/non-hierarchical relation context.
+- `workspace-panel-orchestrator-queue-automation` has an explicit migration/close recommendation saying to close the existing umbrella as superseded/decomposed once concrete follow-up Tickets/Objectives are confirmed, and that this does not implement backend schema, workflow_state, Objective records, or typed relations.
+- Focused grep over maintained docs/workflows found no conflicting active umbrella/parent-child guidance outside historical Ticket records/artifacts.
+
+Validation run:
+
+- `git diff --check 1349a75^ 1349a75` passed.
+- `cargo run -q -p yoi -- ticket doctor` passed (`doctor: ok`).
+- Focused text validation for umbrella deprecation, hierarchy prohibition, concrete planning carve-out, existing umbrella retirement guidance, and the queue-automation migration note passed.
+- `nix build .#yoi` passed.
+
+Decision: approve. The implementation satisfies the documentation/workflow policy cleanup without introducing Objective record implementation, typed relation implementation, Ticket backend schema changes, workflow_state semantic changes, broad historical migration, or thread rewrites.
+
+---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-09T01:37:59Z -->
+
+## Implementation report
+
+Merge-ready dossier for human/orchestrator approval.
+
+Status:
+- Implementation branch: `deprecate-umbrella-tickets`
+- Worktree: `.worktree/deprecate-umbrella-tickets`
+- Commit under review: `1349a75 ticket: deprecate umbrella containers`
+- Reviewer: `reviewer-deprecate-umbrella-tickets`
+- Review result: approved; no blocking findings.
+
+Intent / invariant check:
+- Deprecates long-lived umbrella/progress-container Tickets in maintained workflow/docs guidance.
+- Keeps Tickets as concrete work items that can be implemented, reviewed, validated, and closed on their own terms.
+- Does not implement Objective records, typed Ticket relation metadata, backend schema changes, workflow_state semantics changes, broad historical migration, or thread rewrites.
+- Preserves the carve-out for concrete planning/design/investigation Tickets when the user asks for a concrete work item.
+- Prohibits hierarchy/container substitutes such as parent/child, sub-ticket, umbrella, part-of, and contains.
+
+Implementation summary:
+- Updated `docs/development/work-items.md` and workflow guidance to avoid creating new umbrella/progress-container Tickets.
+- Aligned broad-request split guidance around concrete implementable Tickets, durable split decisions, Objective context, and future non-hierarchical typed relations.
+- Added existing umbrella retirement guidance: close as superseded/decomposed once concrete follow-ups and Objective context exist; resolution should list completed concrete Tickets plus remaining follow-up Tickets/Objectives.
+- Recorded a migration/close recommendation on `workspace-panel-orchestrator-queue-automation`, clarifying that retiring the container role does not mean all future concerns are complete.
+
+Validation evidence:
+- Coder reported pass:
+  - focused text validation for umbrella/progress-container deprecation, hierarchy-relation prohibition, concrete planning carve-out, and existing umbrella retirement guidance
+  - `git diff --check`
+  - `cargo run -q -p yoi -- ticket doctor`
+  - `nix build .#yoi`
+- Reviewer independently passed:
+  - `git diff --check 1349a75^ 1349a75`
+  - `cargo run -q -p yoi -- ticket doctor`
+  - focused text validation / grep
+  - `nix build .#yoi`
+
+Residual risks / notes:
+- `cargo check --workspace` was intentionally not run because this is docs/workflow/Ticket-thread-only and `nix build .#yoi` covered package/resource integrity.
+- Final merge/close/cleanup is intentionally not performed here without explicit merge approval.
+
+---
