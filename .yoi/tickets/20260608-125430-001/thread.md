@@ -204,3 +204,55 @@ Routing context:
 - This is now the active implementation work for the deferred Objective record Ticket.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-09T06:49:43Z -->
+
+## Implementation report
+
+Coder implementation completed and is ready for sibling review.
+
+Coder Pod:
+- `coder-objective-records-for-medium-term-goals`
+- Commit: `be1207254708bea4035235b4cc49186817b83156 objective: add lightweight records`
+- Worktree status before review: clean branch `objective-records-for-medium-term-goals`
+- Stopped after collecting output to reclaim delegated worktree scope.
+
+Selected design:
+- Objective records live at `.yoi/objectives/<objective-id>/item.md`.
+- Objective IDs are path-derived opaque canonical IDs; title/slug words are not authority.
+- Objective frontmatter fields: `title`, `state: active|paused|done|archived`, `created_at`, `updated_at`, `linked_tickets`.
+- Required Markdown sections: Goal, Motivation/background, Strategy/design direction, Success criteria/exit conditions, Decision context.
+- Objective-to-Ticket links use canonical Ticket IDs and are non-blocking context links, not Ticket dependency/blocking/ordering relations.
+
+Implementation summary:
+- Added top-level `yoi objective` CLI with create/list/show/doctor commands.
+- Objective create/doctor validate linked Tickets against the configured Ticket backend root.
+- Objective doctor validates frontmatter, state, timestamps, required body sections, and linked Ticket existence.
+- Updated Intake/Orchestrator/work-item guidance so Objective context remains distinct from Tickets, TicketRelation, OrchestrationPlan, and Pod/session claims.
+- Updated Nix package hash for the changed Cargo dependency graph.
+
+Changed files:
+- `.yoi/workflow/ticket-intake-workflow.md`
+- `.yoi/workflow/ticket-orchestrator-routing.md`
+- `Cargo.lock`
+- `crates/yoi/Cargo.toml`
+- `crates/yoi/src/main.rs`
+- `crates/yoi/src/objective_cli.rs`
+- `docs/development/work-items.md`
+- `package.nix`
+
+Coder validation reported passed:
+- `cargo test -p yoi objective_cli`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo run -q -p yoi -- objective doctor`
+- `cargo run -q -p yoi -- ticket doctor`
+- `cargo check --workspace`
+- `nix build .#yoi`
+
+Residual risks noted by coder:
+- Objective surface is intentionally minimal CLI/backend only; Panel UX, Objective thread/artifacts, roadmap/OKR/scheduling are not implemented.
+- Objective show uses exact Objective ID lookup only; prefix/title query is intentionally omitted to preserve opaque ID authority.
+- `linked_tickets` validates Ticket existence but does not write Ticket relation metadata, preserving the non-blocking boundary.
+
+---
