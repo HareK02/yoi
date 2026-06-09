@@ -43,6 +43,8 @@ Orchestrator は以下を行う。
 - queued notification を受けた場合も、Ticket と workspace state を再確認してから routing する。
 - next action を routing classification として決める。
 - routing decision を `TicketComment` で Ticket thread に記録する。
+- broad request や split/refinement では、long-lived umbrella/progress-container Ticket ではなく concrete implementable Ticket、Objective context、split decision record を使う。
+- 既存 umbrella/progress-container Ticket が concrete follow-up Ticket / Objective context で置き換え済みなら、superseded/decomposed として退役・close する routing を検討する。
 - implementation-ready の場合は `multi-agent-workflow` に渡す `IntentPacket` を作る。
 - implementation-ready かつ Ticket が `queued` の場合は、worktree 作成 / implementation Pod `SpawnPod` / coder routing などの side effect の前に、既存の typed Ticket backend/tool path で `queued -> inprogress` を記録する。
 - `ready` または `queued` に concrete missing decision / information がある場合だけ、typed state-change/routing event 付きで `planning` に戻す。その event/comment には missing item、checked context、implementation latitude では足りない理由、次の planning question/action を含める。
@@ -56,6 +58,8 @@ Orchestrator は以下を行う。
 - 設計境界の未決定を勝手に implementation-ready として固定しない。
 - merge / close / cleanup 権限を持たない場面で勝手に完了処理しない。
 - Ticket tools があるからといって arbitrary filesystem write を行わない。
+- broad multi-Ticket effort のために新しい umbrella/progress-container Ticket を作らない。
+- parent/child、sub-ticket、umbrella、part-of、contains などの hierarchy/container relation を split/refinement の代替として扱わない。
 - Notification だけを完了証拠にしない。Pod output / diff / validation / Ticket evidence を確認する。
 - 具体的な不足項目を言語化できない場合に、単に risky という理由だけで `planning` に戻さない。その場合は IntentPacket に escalation / reviewer focus を明記して進める。
 - risk flags / risky domain / authority-adjacent domain を automatic stop gate として扱わない。これらは bounded context lookup、IntentPacket invariant、reviewer focus、escalation condition に反映する signal である。
@@ -222,10 +226,12 @@ Action:
 - review / validation / merge / cleanup evidence が揃っている。
 - resolution を書ける。
 - close 権限がある。
+- 既存 umbrella/progress-container Ticket については、concrete follow-up Ticket と必要な Objective context が存在し、container role を superseded/decomposed として退役できる。
 
 Action:
 
 - `TicketClose` または既存 close workflow で resolution を記録する。
+- umbrella/progress-container Ticket を退役する close resolution では、関連作業がすべて完了したという意味ではなく container role を retired したことを明記し、完了済み concrete Ticket と残る follow-up Ticket / Objective を列挙する。
 - close 権限がない場合は merge-ready / close-ready dossier を親/人間に提出する。
 
 ### `defer_pending`
@@ -236,7 +242,7 @@ Action:
 
 - 優先度・タイミングの理由で後回し。
 - 依存はあるが active blocker として扱うほどではない。
-- umbrella / roadmap 的に保持する。
+- broad request が concrete implementable Ticket に分解され、Objective context や split decision record の作成待ちである。
 
 Action:
 
@@ -389,7 +395,7 @@ IntentPacket が短く書けない場合、`implementation_ready` ではなく `
 - `review_needed` → reviewer Pod / review workflow
 - `blocked_action_required` → human / parent Orchestrator
 - `close_ready` → close workflow / maintainer decision
-- `defer_pending` → pending / roadmap management
+- `defer_pending` → pending / Objective or split-decision follow-up management
 
 ## 完了条件
 

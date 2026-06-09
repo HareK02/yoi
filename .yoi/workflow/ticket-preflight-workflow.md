@@ -18,6 +18,8 @@ requires: []
 - `preflight` を workflow_state として扱う。
 - `preflight` vocabulary を current Ticket metadata として新規に書く。
 - 「リスクがある」だけで Ticket を戻す。
+- broad effort の進捗を保持するためだけの umbrella/progress-container Ticket を作る。
+- parent/child、sub-ticket、part-of、contains などの hierarchy/container relation を split/refinement の代替として設計する。
 - Coder / Reviewer / worktree mechanics を再設計する。
 
 ## 適用条件
@@ -25,6 +27,7 @@ requires: []
 次のいずれかを満たす場合に使う。
 
 - `planning` Ticket の要件・受け入れ条件・制約を明確化する。
+- ユーザーが concrete work item として求めた initial planning / design / investigation Ticket の scope と acceptance criteria を明確化する。
 - `ready` または `queued` Ticket について、Orchestrator が Ticket/thread/artifacts、関連 Ticket/plan、関連 workflow/docs/code、durable project context、workspace evidence の relevant subset を bounded に確認したうえで、実装開始前に concrete missing decision / information を特定した。
 - 既存 Ticket に obsolete state vocabulary が残っており、planning terminology へ整理する必要がある。
 
@@ -43,7 +46,7 @@ requires: []
 3. 不足している decision / information / acceptance condition を箇条書きで特定し、なぜ coder/reviewer の implementation latitude や escalation condition では足りないかを書く。
 4. `ready` または `queued` から戻す場合は、typed state change で `to = planning` を記録する。reason/body には concrete missing item、checked context、implementation latitude では足りない理由、次の planning question/action を含める。
 5. 既存の claimed live/restorable Intake/Planning Pod があり、利用可能な通知経路がある場合は、その Pod に同じ不足理由を通知する。実用的な経路が無い場合は follow-up として report する。
-6. Ticket body または thread に requirements sync 結果を残す。
+6. Ticket body または thread に requirements sync 結果を残す。広い依頼を分割する場合は、concrete follow-up Ticket / Objective context / split decision record へ責務を分け、umbrella container や hierarchy relation を作らないことを記録する。
 7. Ticket が queue 可能になったら `planning -> ready` を typed state change / `TicketIntakeReady` で記録する。
 
 ## 記録テンプレート

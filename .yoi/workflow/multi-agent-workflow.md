@@ -1,5 +1,5 @@
 ---
-description: worktree と sibling の coder / reviewer Pod を使い、下位 orchestrator が複数 ticket の実装・外部レビュー・修正・完了準備を管理する orchestration フロー
+description: worktree と sibling の coder / reviewer Pod を使い、下位 orchestrator が concrete Ticket 群の実装・外部レビュー・修正・完了準備を管理する orchestration フロー
 model_invokation: true
 user_invocable: true
 requires: []
@@ -20,7 +20,7 @@ worktree の機械的作成手順は `$user/worktree-workflow`、ユーザー依
 - orchestrator は coder / reviewer のやり取り、修正 loop、validation、merge-ready dossier 作成に責任を持つ。
 - 最上位 orchestrator は、コードを直接理解し切ることではなく、委譲した intent / 要件 / invariant に沿って下位 orchestrator が完了まで運んだかを acceptance する。
 
-## 階層モデル
+## Pod coordination model
 
 基本形は以下。
 
@@ -32,8 +32,8 @@ worktree の機械的作成手順は `$user/worktree-workflow`、ユーザー依
   - final merge / ticket close / main workspace validation を行う
   - 原則として line-by-line code review を主業務にしない
 
-下位 orchestrator Pod（area / epic / ticket-group coordinator）
-  - 連続した複数 ticket または大きめの ticket 群を完了状態まで運ぶ
+下位 orchestrator Pod（area / concrete-ticket-set coordinator）
+  - 連続した複数 concrete Ticket または大きめの concrete Ticket を完了状態まで運ぶ
   - worktree / branch / coder / reviewer / validation / 修正 loop を管理する
   - coder と reviewer を sibling として扱う
   - 親には merge-ready dossier と残論点だけを返す
@@ -50,13 +50,15 @@ reviewer Pod
   - intent / 要件 / invariant に反する blocker を分類して返す
 ```
 
-一段だけで足りる小さい ticket では、最上位 orchestrator が直接 coder / reviewer sibling を扱ってよい。複数 ticket や設計境界をまたぐ作業では、最上位の下に下位 orchestrator を挟む。
+一段だけで足りる小さい concrete Ticket では、最上位 orchestrator が直接 coder / reviewer sibling を扱ってよい。複数 concrete Ticket や設計境界をまたぐ作業では、最上位の下に下位 orchestrator を挟む。
+
+この Pod coordination model は runtime delegation の形であり、Ticket hierarchy を作る根拠ではない。複数 Ticket を扱う場合も各 Ticket は concrete work item として独立に実装・レビュー・検証・close できる必要がある。broad effort の進捗コンテナとして umbrella Ticket、parent/child Ticket、sub-ticket、part-of、contains などを作らない。中期的な目的や戦略は Objective context に置き、typed Ticket relations が利用可能な場合も dependency / related / blocking / replacement などの非階層メタデータに限る。
 
 ## 開始条件
 
 以下が揃っている時に使う。
 
-- 対象 ticket または ticket 群が決まっている。
+- 対象 concrete Ticket または concrete Ticket 群が決まっている。
 - ticket の背景・意図・制約・受け入れ条件から、実装調査と局所 tactic 選択を coder に委ねても product / API / UX / authority / design-boundary decision を silently 固定しないと判断できる。
 - worktree 作成と git 書き込み操作について、人間の許可がある。
 - main workspace の unrelated dirty changes を把握している。

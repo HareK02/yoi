@@ -87,3 +87,22 @@ Decision:
 - Keep this separate from the core queued routing / worktree-agent / merge-completion slices so the first automation path can still rely on prompt/workflow sequencing while gaining a durable place for ordering/dependency decisions.
 
 ---
+
+<!-- event: decision author: coder at: 2026-06-09T01:26:26Z -->
+
+## Decision
+
+## Umbrella/progress-container migration recommendation
+
+This Ticket currently functions as a long-lived umbrella/progress container for the concrete Orchestrator automation slices created in the thread:
+
+- `orchestrator-queued-ticket-routing`
+- `orchestrator-worktree-agent-routing`
+- `orchestrator-merge-completion`
+- related Objective/context follow-up for orchestration planning as needed
+
+Recommendation: do not keep this Ticket open merely to track aggregate progress. Once the concrete follow-up Tickets and any needed Objective context are confirmed, close this Ticket as superseded/decomposed. The close resolution should make clear that the umbrella/container role is retired, not that every future Panel Queue -> Orchestrator concern is complete, and should list completed concrete Tickets plus remaining follow-up Tickets/Objectives.
+
+No backend schema, workflow_state, Objective record implementation, or typed relation implementation is required for this migration note.
+
+---
