@@ -180,3 +180,52 @@ Next action:
 - Re-read this Ticket after the ToolExecutionContext API migration lands, or earlier if explicitly prioritized.
 
 ---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-09T10:19:34Z from: queued to: inprogress reason: orchestrator_acceptance_parallel_capacity field: state -->
+
+## State changed
+
+Accepted queued implementation under the updated parallel-capacity policy. This Ticket is TUI panel/composer UX work and is independent from the active ToolExecutionContext migration except for normal workspace validation. It can run in a separate worktree with separate write scope.
+
+---
+
+<!-- event: decision author: orchestrator at: 2026-06-09T10:19:34Z -->
+
+## Decision
+
+Routing decision: implementation_ready_parallel
+
+Updated user instruction: prefer parallel work when Tickets are independent or expected conflicts are small/manageable.
+
+Reason:
+- This Ticket is focused on TUI panel display/composer key handling.
+- It is independent from the active ToolExecutionContext API migration and the TicketList output work, aside from normal shared validation.
+- It can run in a separate worktree with a separate Coder scope.
+
+IntentPacket:
+
+Intent:
+- Improve Panel display and composer key handling so global composer text entry, selected-row actions, target switching, and focus states are explicit and less ambiguous.
+
+Binding decisions / invariants:
+- Remove `Ctrl+T` from Panel top line/actionbar/help and stop using it for Panel target switching.
+- Use `Tab` for Panel target switching, but completion state has priority when active.
+- Preserve no bare-letter shortcuts; normal typed letters go to composer text.
+- Share or abstract composer editing/key handling rather than adding ad-hoc Panel-only editing behavior.
+- Support normal composer editing operations including cursor movement, line start/end, deletion, history, and `Ctrl+Left` / `Ctrl+Right` where terminal events make that possible.
+- Make focus/model explicit: selected row, item action focus, or global composer target.
+- Global composer text must not imply it applies to a selected Ticket unless such a feature is explicitly added.
+- `Esc` backs out of action/list focus toward global composer/no-selection; `Ctrl+C` is the reliable quit key.
+
+Reviewer focus:
+- Verify the UI answers “what will Enter do now?” in selected-row/action/global-composer states.
+- Verify target switching/completion `Tab` priority.
+- Verify composer key handling is shared/compatible with normal TUI where practical.
+- Verify no bare-letter shortcuts are reintroduced.
+
+Validation:
+- Focused TUI/panel key handling/display tests where feasible.
+- Manual or test evidence for top/actionbar `Ctrl+T` removal and `Tab` target switch.
+- `cargo fmt --check`, `git diff --check`, `cargo run -q -p yoi -- ticket doctor`, `cargo check --workspace`, `nix build .#yoi`.
+
+---

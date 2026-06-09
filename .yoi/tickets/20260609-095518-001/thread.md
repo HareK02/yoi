@@ -53,3 +53,23 @@ Next action:
 - Re-read this Ticket after that lands, then accept from queued if still unblocked.
 
 ---
+
+<!-- event: decision author: orchestrator at: 2026-06-09T10:19:34Z -->
+
+## Decision
+
+Routing decision update: still_waiting_due_surface_overlap
+
+The user asked to prefer parallel work when conflicts are absent or expected to be small. I re-evaluated this Ticket under that policy and am still leaving it queued.
+
+Reason:
+- This Ticket removes `action_required` / `attention_required` from Ticket schema/tool API/Panel behavior.
+- `20260609-085212-001` now runs in parallel and also changes TicketList/tool output.
+- `20260609-084725-001` now runs in parallel and changes Panel behavior/key/display.
+- Running this cleanup at the same time would overlap both active Ticket tool output and Panel behavior surfaces; this is more than a small mechanical conflict.
+
+State decision:
+- Leave this Ticket `queued`.
+- Re-read and route it after either TicketList output slimming or Panel display work lands, depending on which surface remains active.
+
+---

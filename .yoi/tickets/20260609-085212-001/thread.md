@@ -101,3 +101,51 @@ Next action:
 - Re-read this Ticket and accept from queued if still unblocked.
 
 ---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-09T10:19:34Z from: queued to: inprogress reason: orchestrator_acceptance_parallel_capacity field: state -->
+
+## State changed
+
+Accepted queued implementation under the updated parallel-capacity policy. The active ToolExecutionContext branch changes core Tool execution plumbing, while this Ticket changes the bounded TicketList output surface. There may be a small mechanical conflict around the TicketList tool implementation, but it is expected to be localized and manageable, so parallel work is preferred.
+
+---
+
+<!-- event: decision author: orchestrator at: 2026-06-09T10:19:34Z -->
+
+## Decision
+
+Routing decision: implementation_ready_parallel
+
+Updated user instruction: prefer parallel work when Tickets are independent or expected conflicts are small/manageable.
+
+Reason:
+- This Ticket changes `TicketList` output/tool/CLI/workflow guidance.
+- `20260609-093050-001` changes the core Tool execution context API. The overlap is expected to be a localized mechanical merge in tool execution signatures / TicketList implementation, not a design conflict.
+- Running this in parallel should improve throughput while preserving separate worktrees and explicit review.
+
+IntentPacket:
+
+Intent:
+- Make `TicketList` a lightweight bounded overview/selection surface and keep detailed authority in `TicketShow`.
+
+Binding decisions / invariants:
+- Default `TicketList` output must not include body/thread/artifact details.
+- Per-Ticket summary must be short and bounded: canonical id, title, state, minimal timestamp, and short attention/blocking hints if any.
+- Long titles/diagnostics must be truncated.
+- Default/max limits should be smaller and context-safe, especially for `state=all` / closed-inclusive listing.
+- Tool output is the priority for context safety; CLI should remain human-readable without huge default JSON/Markdown.
+- `TicketList` is not routing/close/implementation authority; Orchestrator must read `TicketShow` for decisions.
+- Do not change Ticket backend schema, TicketShow detail, Ticket relation/Objectives/OrchestrationPlan design.
+
+Reviewer focus:
+- Verify no body/thread/artifact prose leaks into list output.
+- Verify output remains useful for selection and backlog overview.
+- Verify default limits and truncation are bounded and tested.
+- Watch for small merge interactions with the ToolExecutionContext branch; resolve by using the new context API without expanding scope.
+
+Validation:
+- Focused tests for long-title truncation, large-list limits, all/closed cap, JSON/tool output shape, no body/thread leakage.
+- CLI list output tests.
+- `cargo fmt --check`, `git diff --check`, `cargo run -q -p yoi -- ticket doctor`, `cargo check --workspace`, `nix build .#yoi`.
+
+---
