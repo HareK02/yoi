@@ -6,10 +6,12 @@ status: 'open'
 kind: 'task'
 priority: 'P1'
 labels: ['ticket', 'schema', 'identity', 'migration', 'orchestrator']
-workflow_state: 'planning'
+workflow_state: 'queued'
 created_at: '2026-06-08T11:09:40Z'
-updated_at: '2026-06-09T00:16:54Z'
+updated_at: '2026-06-09T02:13:30Z'
 assignee: null
+queued_by: 'workspace-panel'
+queued_at: '2026-06-09T02:13:30Z'
 ---
 
 ## Background

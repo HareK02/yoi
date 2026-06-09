@@ -112,3 +112,71 @@ Reviewer は diff だけでなく、CLI / typed Ticket tools / Panel / Orchestra
 上記 open questions に user/maintainer decision が入れば、Ticket を `implementation_ready` として `ready` にできる。未回答のまま進める場合は、先に design/spike として routing し、実装 Ticket とは分けるのが安全。
 
 ---
+
+<!-- event: decision author: intake at: 2026-06-09T02:13:15Z -->
+
+## Decision
+
+## User decision: target Ticket schema and storage shape
+
+User/maintainer decision for this Ticket:
+
+- Lifecycle field は `state` に統一する。`status` と `workflow_state` の二軸 current state は廃止する。
+- `done` と `closed` は一旦 distinct states として分離したままにする。
+  - `done`: 実装・review・merge 等は完了しているが、resolution/close 処理前の状態。
+  - `closed`: resolution が記録され、Ticket lifecycle が終了した状態。
+- `pending` は不要。pending bucket/status は current model から削除する。
+- filesystem layout は状態 bucket を持たず、すべて平坦に `.yoi/tickets/<ticket-id>/` に置く。
+  - open/pending/closed directory bucket は authority ではなくなり、current layout からも外す。
+- canonical Ticket ID は directory name から derive し、frontmatter には `id` を重複保存しない。
+- `kind` / `labels` 等の core frontmatter 削除もこの Ticket の scope に含める。
+
+### Updated target direction
+
+Current frontmatter は少なくとも以下へ縮小する方向で実装する。
+
+```yaml
+title: component: concise action
+state: planning
+created_at: ...
+updated_at: ...
+```
+
+Canonical identity は `.yoi/tickets/<ticket-id>/` の `<ticket-id>`。`slug`、frontmatter `id`、directory bucket、freeform `kind`、unmanaged `labels` は current schema authority から外す。
+
+### Implementation latitude
+
+- Timestamp/counter ID の exact format、collision suffix、高解像度 timestamp のどれを使うかは、opaque ID・安定 lookup・testability を満たす範囲で実装側が選べる。
+- Existing local records は新 layout/schema に migration する。unreleased local data として扱い、明示的に必要にならない限り permanent slug alias や旧 bucket layout の長期互換層は作らない。
+- `priority`、`action_required`、`attention_required`、`queued_at` 等の周辺 field は、削除・置換・維持の判断を「具体的な現在動作を持つか」で監査し、core identity/lifecycle simplification を歪めない範囲で扱う。
+
+### Reviewer focus
+
+Reviewer は、CLI / typed Ticket tools / Panel / role-session claims / Orchestrator guidance / relation metadata が、旧 `slug`、frontmatter `id`、`status`/`workflow_state` 二軸、open/pending/closed bucket を authority として残していないことを重点確認する。
+
+---
+
+<!-- event: intake_summary author: intake at: 2026-06-09T02:13:23Z -->
+
+## Intake summary
+
+Ticket schema simplification の binding decisions が揃った。Lifecycle は `state` に統一し、`done` と `closed` は一旦分離、`pending` は廃止する。Filesystem layout は `.yoi/tickets/<ticket-id>/` の平坦構造にし、canonical ID は directory name から derive して frontmatter に重複保存しない。`slug`、frontmatter `id`、freeform `kind`、unmanaged `labels`、open/pending/closed bucket、`status`/`workflow_state` 二軸 state は current schema authority から外す。実装前に Orchestrator/Coder は CLI・typed tools・Panel・role-session claims・Orchestrator guidance・relation metadata の旧 identity/state 依存を監査し、local records を新 layout/schema に migrate すること。
+
+---
+
+<!-- event: state_changed author: intake at: 2026-06-09T02:13:23Z from: planning to: ready reason: planning_ready field: workflow_state -->
+
+## State changed
+
+必要な schema/lifecycle/storage layout の判断が user decision として記録されたため、Orchestrator が実装 routing できる状態になった。
+
+---
+
+<!-- event: state_changed author: workspace-panel at: 2026-06-09T02:13:30Z from: ready to: queued reason: queued field: workflow_state -->
+
+## State changed
+
+Ticket を `workspace-panel` が queued にしました。
+
+
+---
