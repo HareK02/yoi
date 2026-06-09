@@ -9,8 +9,8 @@ use ticket::config::{
 };
 use ticket::{
     LocalTicketBackend, MarkdownText, NewTicket, NewTicketEvent, TicketBackend,
-    TicketDoctorSeverity, TicketEventKind, TicketFilter, TicketIdOrSlug, TicketReview,
-    TicketReviewResult, TicketWorkflowState,
+    TicketDoctorSeverity, TicketEventKind, TicketFilter, TicketIdOrSlug, TicketIntakeSummary,
+    TicketReview, TicketReviewResult, TicketWorkflowState,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -416,33 +416,52 @@ fn state(
     backend: &LocalTicketBackend,
     options: StateOptions,
 ) -> Result<TicketCliOutput, TicketCliError> {
-    let (from, to) = match options.state {
-        StateTarget::Planning => (TicketWorkflowState::Planning, TicketWorkflowState::Planning),
-        StateTarget::Ready => (TicketWorkflowState::Planning, TicketWorkflowState::Ready),
-        StateTarget::Queued => (TicketWorkflowState::Ready, TicketWorkflowState::Queued),
-        StateTarget::InProgress => (TicketWorkflowState::Queued, TicketWorkflowState::InProgress),
-        StateTarget::Done => (TicketWorkflowState::InProgress, TicketWorkflowState::Done),
+    let id = TicketIdOrSlug::Query(options.query.clone());
+    let target_state = match options.state {
+        StateTarget::Planning => TicketWorkflowState::Planning,
+        StateTarget::Ready => TicketWorkflowState::Ready,
+        StateTarget::Queued => TicketWorkflowState::Queued,
+        StateTarget::InProgress => TicketWorkflowState::InProgress,
+        StateTarget::Done => TicketWorkflowState::Done,
         StateTarget::Closed => {
             return Err(TicketCliError::new(
                 "yoi ticket state <ticket> closed cannot write resolution.md; use `yoi ticket close <ticket> --resolution <text>` instead",
             ));
         }
     };
-    backend.set_workflow_state(
-        TicketIdOrSlug::Query(options.query.clone()),
-        ticket::TicketStateChange {
-            from: from.as_str().to_string(),
-            to: to.as_str().to_string(),
-            reason: "cli_state".to_string(),
-            author: Some("yoi ticket".to_string()),
-            body: format!("State changed to `{}`.\n", to.as_str()).into(),
-            references: Vec::new(),
-        },
-    )?;
+    let current = backend.show(id.clone())?;
+    let ticket_id = current.meta.id.clone();
+    match target_state {
+        TicketWorkflowState::Ready => backend.mark_intake_ready(
+            id,
+            TicketIntakeSummary::new("Marked ready by `yoi ticket state`."),
+            ticket::TicketStateChange {
+                from: current.meta.workflow_state.as_str().to_string(),
+                to: TicketWorkflowState::Ready.as_str().to_string(),
+                reason: "cli_state".to_string(),
+                author: Some("yoi ticket".to_string()),
+                body: "Marked ready by `yoi ticket state`.\n".into(),
+                references: Vec::new(),
+            },
+        )?,
+        TicketWorkflowState::Queued => backend.queue_ready(id, "yoi ticket")?,
+        _ => {
+            let from = current.meta.workflow_state;
+            let change = ticket::TicketStateChange {
+                from: from.as_str().to_string(),
+                to: target_state.as_str().to_string(),
+                reason: "cli_state".to_string(),
+                author: Some("yoi ticket".to_string()),
+                body: format!("State changed to `{}`.\n", target_state.as_str()).into(),
+                references: Vec::new(),
+            };
+            backend.set_workflow_state(id, change)?;
+        }
+    }
     Ok(success(format!(
         "state\t{}\t{}\n",
-        options.query,
-        to.as_str()
+        ticket_id,
+        target_state.as_str()
     )))
 }
 
@@ -811,6 +830,15 @@ mod tests {
         run_in_workspace(cli, temp.path()).unwrap()
     }
 
+    fn created_id(output: &TicketCliOutput) -> String {
+        output
+            .stdout
+            .strip_prefix("created\t")
+            .and_then(|rest| rest.lines().next())
+            .expect("create output contains created id")
+            .to_string()
+    }
+
     #[test]
     fn ticket_cli_init_writes_explicit_ticket_config_scaffold() {
         let temp = TempDir::new().unwrap();
@@ -862,49 +890,40 @@ mod tests {
     }
 
     #[test]
-    fn ticket_cli_create_list_show_comment_review_status_close_and_doctor() {
+    fn ticket_cli_create_list_show_comment_review_state_close_and_doctor() {
         let temp = TempDir::new().unwrap();
 
-        let created = run(
-            &temp,
-            &[
-                "create",
-                "--title",
-                "CLI Created",
-                "--slug",
-                "cli-created",
-                "--kind",
-                "task",
-                "--priority",
-                "P1",
-                "--label",
-                "ticket,cli",
-            ],
-        );
+        let created = run(&temp, &["create", "--title", "CLI Created"]);
         assert_eq!(created.status, TicketCliStatus::Success);
         assert!(created.stdout.contains("created\t"));
-        assert!(created.stdout.contains("\tcli-created\topen"));
-        assert!(temp.path().join(".yoi/tickets/open").exists());
+        let ticket_id = created_id(&created);
+        assert!(temp.path().join(".yoi/tickets").join(&ticket_id).exists());
         assert!(!temp.path().join("work-items").exists());
         let created_item = fs::read_to_string(
             temp.path()
-                .join(".yoi/tickets/open")
-                .join(created.stdout.split('\t').nth(1).unwrap())
+                .join(".yoi/tickets")
+                .join(&ticket_id)
                 .join("item.md"),
         )
         .unwrap();
+        assert!(created_item.contains("state:"));
+        assert!(created_item.contains("planning"));
         assert!(!created_item.contains("legacy_ticket:"));
         assert!(!created_item.contains("needs_preflight:"));
+        assert!(!created_item.contains("slug:"));
+        assert!(!created_item.contains("workflow_state:"));
 
-        let listed = run(&temp, &["list", "--status", "open"]);
-        assert!(listed.stdout.contains("status\tid\tslug"));
+        let listed = run(&temp, &["list", "--state", "planning"]);
+        assert!(listed.stdout.contains("state\tid\ttitle"));
+        assert!(listed.stdout.contains(&ticket_id));
         assert!(listed.stdout.contains("CLI Created"));
         assert!(!listed.stdout.contains("legacy_ticket"));
         assert!(!listed.stdout.contains("needs_preflight"));
 
-        let shown = run(&temp, &["show", "cli-created"]);
+        let shown = run(&temp, &["show", &ticket_id]);
         assert!(shown.stdout.contains("# CLI Created"));
-        assert!(shown.stdout.contains("Labels: ticket, cli"));
+        assert!(shown.stdout.contains(&format!("ID: {ticket_id}")));
+        assert!(shown.stdout.contains("State: planning"));
         assert!(!shown.stdout.contains("legacy_ticket"));
         assert!(!shown.stdout.contains("needs_preflight"));
 
@@ -912,7 +931,7 @@ mod tests {
             &temp,
             &[
                 "comment",
-                "cli-created",
+                &ticket_id,
                 "--role",
                 "implementation_report",
                 "--message",
@@ -922,44 +941,62 @@ mod tests {
         assert!(
             commented
                 .stdout
-                .contains("appended\tcli-created\timplementation_report")
+                .contains(&format!("appended\t{}\timplementation_report", ticket_id))
         );
 
         let reviewed = run(
             &temp,
             &[
                 "review",
-                "cli-created",
+                &ticket_id,
                 "--approve",
                 "--message",
                 "Looks good.",
             ],
         );
-        assert!(reviewed.stdout.contains("reviewed\tcli-created\tapprove"));
+        assert!(
+            reviewed
+                .stdout
+                .contains(&format!("reviewed\t{}\tapprove", ticket_id))
+        );
 
-        let pending = run(&temp, &["status", "cli-created", "pending"]);
-        assert!(pending.stdout.contains("status\tcli-created\tpending"));
+        let ready = run(&temp, &["state", &ticket_id, "ready"]);
+        assert_eq!(ready.stdout, format!("state\t{}\tready\n", ticket_id));
+        let ready_listed = run(&temp, &["list", "--state", "ready"]);
+        assert!(ready_listed.stdout.contains(&ticket_id));
+
+        let queued = run(&temp, &["state", &ticket_id, "queued"]);
+        assert_eq!(queued.stdout, format!("state\t{}\tqueued\n", ticket_id));
+        let queued_listed = run(&temp, &["list", "--state", "queued"]);
+        assert!(queued_listed.stdout.contains(&ticket_id));
+
+        let inprogress = run(&temp, &["state", &ticket_id, "inprogress"]);
+        assert_eq!(
+            inprogress.stdout,
+            format!("state\t{}\tinprogress\n", ticket_id)
+        );
+        let inprogress_listed = run(&temp, &["list", "--state", "inprogress"]);
+        assert!(inprogress_listed.stdout.contains(&ticket_id));
+
+        let done = run(&temp, &["state", &ticket_id, "done"]);
+        assert_eq!(done.stdout, format!("state\t{}\tdone\n", ticket_id));
+        let done_listed = run(&temp, &["list", "--state", "done"]);
+        assert!(done_listed.stdout.contains(&ticket_id));
 
         let closed = run(
             &temp,
-            &[
-                "close",
-                "cli-created",
-                "--resolution",
-                "Done via yoi ticket.",
-            ],
+            &["close", &ticket_id, "--resolution", "Done via yoi ticket."],
         );
-        assert!(closed.stdout.contains("closed\tcli-created"));
+        assert!(closed.stdout.contains(&format!("closed\t{}", ticket_id)));
 
         let doctor = run(&temp, &["doctor"]);
         assert_eq!(doctor.status, TicketCliStatus::Success);
         assert_eq!(doctor.stdout, "doctor: ok\n");
 
         let backend = LocalTicketBackend::new(temp.path().join(".yoi/tickets"));
-        let ticket = backend
-            .show(TicketIdOrSlug::Query("cli-created".to_string()))
-            .unwrap();
+        let ticket = backend.show(TicketIdOrSlug::Id(ticket_id.clone())).unwrap();
         assert!(ticket.resolution.is_some());
+        assert_eq!(ticket.meta.workflow_state, TicketWorkflowState::Closed);
         assert!(
             ticket
                 .events
@@ -984,28 +1021,11 @@ mod tests {
         )
         .unwrap();
 
-        run(
-            &temp,
-            &[
-                "create",
-                "--title",
-                "Configured Root",
-                "--slug",
-                "configured-root",
-            ],
-        );
+        let created = run(&temp, &["create", "--title", "Configured Root"]);
+        let ticket_id = created_id(&created);
 
-        assert!(
-            temp.path()
-                .join("custom-tickets/open")
-                .read_dir()
-                .unwrap()
-                .any(|entry| entry
-                    .unwrap()
-                    .file_name()
-                    .to_string_lossy()
-                    .contains("configured-root"))
-        );
+        assert!(temp.path().join("custom-tickets").join(ticket_id).exists());
+        assert!(!temp.path().join("custom-tickets/open").exists());
         assert!(!temp.path().join("work-items").exists());
     }
 
@@ -1038,13 +1058,11 @@ mod tests {
     }
 
     #[test]
-    fn ticket_cli_status_closed_requires_close_command() {
+    fn ticket_cli_state_closed_requires_close_command() {
         let temp = TempDir::new().unwrap();
-        run(
-            &temp,
-            &["create", "--title", "Close Me", "--slug", "close-me"],
-        );
-        let cli = parse_ticket_args(&args(&["status", "close-me", "closed"])).unwrap();
+        let created = run(&temp, &["create", "--title", "Close Me"]);
+        let ticket_id = created_id(&created);
+        let cli = parse_ticket_args(&args(&["state", &ticket_id, "closed"])).unwrap();
         let err = run_in_workspace(cli, temp.path()).unwrap_err();
         assert!(err.to_string().contains("use `yoi ticket close"));
     }

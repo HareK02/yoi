@@ -59,8 +59,6 @@ pub enum TicketError {
         query: String,
         matches: Vec<PathBuf>,
     },
-    #[error("invalid local ticket status for mutation: {0}")]
-    InvalidLocalStatus(String),
     #[error("invalid ticket filename component: {0}")]
     InvalidPathComponent(String),
     #[error("ticket path escapes configured root: {path}")]
@@ -83,7 +81,6 @@ fn io_err(path: impl Into<PathBuf>, source: io::Error) -> TicketError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum TicketStatus {
     Open,
-    Pending,
     Closed,
 }
 
@@ -91,7 +88,6 @@ impl TicketStatus {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Open => "open",
-            Self::Pending => "pending",
             Self::Closed => "closed",
         }
     }
@@ -99,7 +95,6 @@ impl TicketStatus {
     pub fn parse_local(value: &str) -> Option<Self> {
         match value {
             "open" => Some(Self::Open),
-            "pending" => Some(Self::Pending),
             "closed" => Some(Self::Closed),
             _ => None,
         }
@@ -115,7 +110,6 @@ impl fmt::Display for TicketStatus {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ExtensibleTicketStatus {
     Open,
-    Pending,
     Closed,
     Other(String),
 }
@@ -124,7 +118,6 @@ impl ExtensibleTicketStatus {
     pub fn as_str(&self) -> &str {
         match self {
             Self::Open => "open",
-            Self::Pending => "pending",
             Self::Closed => "closed",
             Self::Other(value) => value.as_str(),
         }
@@ -133,7 +126,6 @@ impl ExtensibleTicketStatus {
     pub fn as_local(&self) -> Option<TicketStatus> {
         match self {
             Self::Open => Some(TicketStatus::Open),
-            Self::Pending => Some(TicketStatus::Pending),
             Self::Closed => Some(TicketStatus::Closed),
             Self::Other(_) => None,
         }
@@ -144,7 +136,6 @@ impl From<&str> for ExtensibleTicketStatus {
     fn from(value: &str) -> Self {
         match value {
             "open" => Self::Open,
-            "pending" => Self::Pending,
             "closed" => Self::Closed,
             other => Self::Other(other.to_string()),
         }
@@ -155,7 +146,6 @@ impl From<TicketStatus> for ExtensibleTicketStatus {
     fn from(value: TicketStatus) -> Self {
         match value {
             TicketStatus::Open => Self::Open,
-            TicketStatus::Pending => Self::Pending,
             TicketStatus::Closed => Self::Closed,
         }
     }
@@ -530,13 +520,6 @@ impl TicketFilter {
     pub fn state(state: TicketWorkflowState) -> Self {
         Self { state: Some(state) }
     }
-
-    pub fn status(status: TicketStatus) -> Self {
-        match status {
-            TicketStatus::Closed => Self::state(TicketWorkflowState::Closed),
-            TicketStatus::Open | TicketStatus::Pending => Self::all(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -791,7 +774,6 @@ pub trait TicketBackend {
     ) -> Result<()>;
     fn queue_ready(&self, id: TicketIdOrSlug, queued_by: &str) -> Result<()>;
     fn review(&self, id: TicketIdOrSlug, review: TicketReview) -> Result<()>;
-    fn set_status(&self, id: TicketIdOrSlug, status: TicketStatus) -> Result<()>;
     fn close(&self, id: TicketIdOrSlug, resolution: MarkdownText) -> Result<()>;
     fn add_orchestration_plan_record(
         &self,
@@ -873,19 +855,11 @@ impl LocalTicketBackend {
         }
     }
 
-    fn state_changed_body(&self, state: TicketWorkflowState) -> String {
-        if is_japanese_record_language(self.record_language()) {
-            format!("Ticket state を `{}` に変更しました。\n", state.as_str())
-        } else {
-            format!("State changed to `{}`.\n", state.as_str())
-        }
-    }
-
     fn closed_workflow_state_body(&self) -> &'static str {
         if is_japanese_record_language(self.record_language()) {
-            "Ticket closed; workflow_state を done に設定しました。\n"
+            "Ticket を closed にしました。\n"
         } else {
-            "Ticket closed; workflow_state set to done.\n"
+            "Ticket closed.\n"
         }
     }
 
@@ -1438,29 +1412,6 @@ impl TicketBackend for LocalTicketBackend {
             Some(review.result.as_str()),
             &[],
             &review.body,
-        )
-    }
-
-    fn set_status(&self, id: TicketIdOrSlug, status: TicketStatus) -> Result<()> {
-        let target_state = match status {
-            TicketStatus::Closed => TicketWorkflowState::Closed,
-            TicketStatus::Open | TicketStatus::Pending => TicketWorkflowState::Planning,
-        };
-        let _lock = self.acquire_lock()?;
-        self.ensure_backend_dirs()?;
-        let dir = self.find_ticket_dir(&id)?;
-        let current_state = self.ticket_workflow_state_from_dir(&dir)?;
-        let at = now_utc();
-        let change = TicketStateChange::new(
-            current_state.as_str(),
-            target_state.as_str(),
-            "state_changed",
-            self.state_changed_body(target_state),
-        );
-        self.append_state_changed_event(&dir, &change, Some("state"))?;
-        self.set_frontmatter_fields(
-            &dir.join("item.md"),
-            &[(("state"), target_state.as_str()), ("updated_at", &at)],
         )
     }
 
@@ -3448,23 +3399,6 @@ state: planning
         let err = backend.create(NewTicket::new("Locked")).unwrap_err();
         FileExt::unlock(&file).unwrap();
         assert!(matches!(err, TicketError::Locked { .. }));
-    }
-
-    #[test]
-    fn rejects_unsafe_components_for_status_moves() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path().join("tickets");
-        fs::create_dir_all(root.join("20260609-000000-001/artifacts")).unwrap();
-        fs::write(
-            root.join("20260609-000000-001/item.md"),
-            "---\ntitle: Safe\nstate: planning\ncreated_at: x\nupdated_at: x\n---\n",
-        )
-        .unwrap();
-        fs::write(root.join("20260609-000000-001/thread.md"), "").unwrap();
-        let err = LocalTicketBackend::new(&root)
-            .set_status(TicketIdOrSlug::Id("../bad".into()), TicketStatus::Pending)
-            .unwrap_err();
-        assert!(matches!(err, TicketError::InvalidPathComponent(_)));
     }
 
     #[test]

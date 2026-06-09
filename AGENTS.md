@@ -51,16 +51,16 @@ docs-only など Nix build の価値が低い変更で省略する場合は、�
 
 ### 基本コマンド
 
-- 新規作成: `yoi ticket create --title "..." [--slug slug] [--kind task] [--priority P2] [--label a,b]`
-- 一覧: `yoi ticket list [--status open|pending|closed|all]`
-- 詳細: `yoi ticket show <id-or-slug>`
-- コメント / 計画 / 判断 / 実装報告: `yoi ticket comment <id-or-slug> [--role comment|plan|decision|implementation_report] [--file path]`
-- レビュー記録: `yoi ticket review <id-or-slug> --approve|--request-changes [--file path]`
-- 状態変更: `yoi ticket status <id-or-slug> open|pending`
-- 完了: `yoi ticket close <id-or-slug> [--resolution text|--file path]`
+- 新規作成: `yoi ticket create --title "..." [--priority P2]`
+- 一覧: `yoi ticket list [--state planning|ready|queued|inprogress|done|closed|all]`
+- 詳細: `yoi ticket show <ticket-id>`
+- コメント / 計画 / 判断 / 実装報告: `yoi ticket comment <ticket-id> [--role comment|plan|decision|implementation_report] [--file path]`
+- レビュー記録: `yoi ticket review <ticket-id> --approve|--request-changes [--file path]`
+- 状態変更: `yoi ticket state <ticket-id> planning|ready|queued|inprogress|done`
+- 完了: `yoi ticket close <ticket-id> [--resolution text|--file path]`
 - 整合性確認: `yoi ticket doctor`
 
-`yoi ticket` は typed Ticket backend 経由で `.yoi/tickets/{open,pending,closed}/<id>/` 配下の `item.md`、`thread.md`、`artifacts/` を扱う。完了時は `resolution.md` も作られる。手でファイルを作るより、原則として `yoi ticket` または Ticket tools を使うこと。
+`yoi ticket` は typed Ticket backend 経由で flat な `.yoi/tickets/<ticket-id>/` 配下の `item.md`、`thread.md`、`artifacts/` を扱う。Ticket identity はこのディレクトリ名である canonical ID のみで、title/slug words を含む alias や `open`/`pending`/`closed` bucket は現在の authority ではない。現在の lifecycle は frontmatter の `state` だけで表し、`done` と `closed` は区別する。完了時は同じ Ticket ディレクトリ内に `resolution.md` も作られる。手でファイルを作るより、原則として `yoi ticket` または Ticket tools を使うこと。
 
 ### Work item の粒度
 
@@ -71,10 +71,10 @@ docs-only など Nix build の価値が低い変更で省略する場合は、�
 
 ### ライフサイクル
 
-- 作成: `yoi ticket create ...` で `.yoi/tickets/open/...` を作成し、必要な前提を書いて commit する。
+- 作成: `yoi ticket create ...` で `.yoi/tickets/<ticket-id>/` を作成し、必要な前提を書いて commit する。出力された canonical ID を以後の操作に使う。
 - 詳細化・前提変更: `item.md` を更新し、必要に応じて `yoi ticket comment` で `thread.md` に経緯を残して commit する。
-- レビュー: `yoi ticket review <id-or-slug> --approve|--request-changes` で `thread.md` にレビュー結果を追記して commit する。
-- 完了: `yoi ticket close <id-or-slug>` で `.yoi/tickets/closed/...` に移動し、`resolution.md` と完了状態を commit する。
+- レビュー: `yoi ticket review <ticket-id> --approve|--request-changes` で `thread.md` にレビュー結果を追記して commit する。
+- 完了: `yoi ticket close <ticket-id>` で `state: closed` と `resolution.md` を同じ flat Ticket ディレクトリに記録して commit する。
 
 worktree と併用して作業を進める場合、必ずブランチを切る前に対象 work item を作成・詳細化して commit してから切ること。
 

@@ -16,7 +16,7 @@ use crate::{
     NewTicket, NewTicketEvent, OrchestrationPlanKind, Ticket, TicketBackend,
     TicketDoctorDiagnostic, TicketDoctorReport, TicketDoctorSeverity, TicketError, TicketEventKind,
     TicketIdOrSlug, TicketIntakeSummary, TicketReview, TicketReviewResult, TicketStateChange,
-    TicketStatus, TicketSummary, TicketWorkflowState,
+    TicketSummary, TicketWorkflowState,
 };
 
 const DEFAULT_LIST_LIMIT: usize = 100;
@@ -30,7 +30,7 @@ const MAX_BODY_MAX_BYTES: usize = 64 * 1024;
 const DEFAULT_DIAGNOSTIC_LIMIT: usize = 100;
 const MAX_DIAGNOSTIC_LIMIT: usize = 500;
 
-pub const TICKET_TOOL_NAMES: [&str; 12] = [
+pub const TICKET_TOOL_NAMES: [&str; 11] = [
     "TicketCreate",
     "TicketList",
     "TicketShow",
@@ -38,7 +38,6 @@ pub const TICKET_TOOL_NAMES: [&str; 12] = [
     "TicketReview",
     "TicketIntakeReady",
     "TicketWorkflowState",
-    "TicketStatus",
     "TicketClose",
     "TicketOrchestrationPlanRecord",
     "TicketOrchestrationPlanQuery",
@@ -52,13 +51,12 @@ pub const TICKET_READ_ONLY_TOOL_NAMES: [&str; 4] = [
     "TicketDoctor",
 ];
 
-pub const TICKET_MUTATING_TOOL_NAMES: [&str; 8] = [
+pub const TICKET_MUTATING_TOOL_NAMES: [&str; 7] = [
     "TicketCreate",
     "TicketComment",
     "TicketReview",
     "TicketIntakeReady",
     "TicketWorkflowState",
-    "TicketStatus",
     "TicketClose",
     "TicketOrchestrationPlanRecord",
 ];
@@ -84,9 +82,6 @@ const WORKFLOW_STATE_DESCRIPTION: &str = "Transition Ticket `state` through the 
 Ticket backend with a bounded `state_changed` event. Treat `queued -> inprogress` \
 as the implementation acceptance step: implementation side effects should happen only after that \
 transition is accepted and recorded. Orchestrator may return `ready` or `queued` Tickets to `planning` only with a concrete missing decision/information reason.";
-const STATUS_DESCRIPTION: &str = "Move a Ticket between non-closed local statees through the typed \
-Ticket backend. Use `TicketClose` for closing because closed Tickets require a resolution accepted \
-by `yoi ticket doctor`.";
 const CLOSE_DESCRIPTION: &str = "Close a Ticket with a Markdown resolution through the typed Ticket \
 backend. The backend sets `state: closed`, writes resolution.md, updates item.md, and appends \
 a close event.";
@@ -272,21 +267,6 @@ struct TicketReviewParams {
     /// Optional thread author.
     #[serde(default)]
     author: Option<String>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-#[serde(rename_all = "snake_case")]
-enum TicketStatusParam {
-    Open,
-    Pending,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct TicketStatusParams {
-    /// Ticket id.
-    ticket: String,
-    /// New state. Use `TicketClose` for `closed`.
-    state: TicketStatusParam,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -479,11 +459,6 @@ struct TicketIntakeReadyTool {
 
 #[derive(Clone)]
 struct TicketWorkflowStateTool {
-    backend: LocalTicketBackend,
-}
-
-#[derive(Clone)]
-struct TicketStatusTool {
     backend: LocalTicketBackend,
 }
 
@@ -719,24 +694,6 @@ impl Tool for TicketWorkflowStateTool {
                 "state": to.as_str(),
                 "ok": true
             }),
-        ))
-    }
-}
-
-#[async_trait]
-impl Tool for TicketStatusTool {
-    async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError> {
-        let params: TicketStatusParams = parse_input("TicketStatus", input_json)?;
-        let state = match params.state {
-            TicketStatusParam::Open => TicketStatus::Open,
-            TicketStatusParam::Pending => TicketStatus::Pending,
-        };
-        self.backend
-            .set_status(TicketIdOrSlug::Query(params.ticket.clone()), state)
-            .map_err(|error| backend_error("TicketStatus", error))?;
-        Ok(json_output(
-            format!("Moved ticket {} to {}", params.ticket, state.as_str()),
-            json!({ "ticket": params.ticket, "state": state.as_str(), "ok": true }),
         ))
     }
 }
@@ -1039,7 +996,6 @@ fn input_schema(name: &str) -> Value {
         "TicketWorkflowState" => {
             serde_json::to_value(schemars::schema_for!(TicketWorkflowStateParams))
         }
-        "TicketStatus" => serde_json::to_value(schemars::schema_for!(TicketStatusParams)),
         "TicketClose" => serde_json::to_value(schemars::schema_for!(TicketCloseParams)),
         "TicketOrchestrationPlanRecord" => {
             serde_json::to_value(schemars::schema_for!(TicketOrchestrationPlanRecordParams))
@@ -1070,7 +1026,6 @@ impl_from_backend!(TicketCommentTool);
 impl_from_backend!(TicketReviewTool);
 impl_from_backend!(TicketIntakeReadyTool);
 impl_from_backend!(TicketWorkflowStateTool);
-impl_from_backend!(TicketStatusTool);
 impl_from_backend!(TicketCloseTool);
 impl_from_backend!(TicketOrchestrationPlanRecordTool);
 impl_from_backend!(TicketOrchestrationPlanQueryTool);
@@ -1094,7 +1049,6 @@ pub fn ticket_tools(backend: LocalTicketBackend) -> Vec<ToolDefinition> {
             WORKFLOW_STATE_DESCRIPTION,
             backend.clone(),
         ),
-        tool_definition::<TicketStatusTool>("TicketStatus", STATUS_DESCRIPTION, backend.clone()),
         tool_definition::<TicketCloseTool>("TicketClose", CLOSE_DESCRIPTION, backend.clone()),
         tool_definition::<TicketOrchestrationPlanRecordTool>(
             "TicketOrchestrationPlanRecord",
@@ -1153,7 +1107,6 @@ mod tests {
                 "TicketReview",
                 "TicketIntakeReady",
                 "TicketWorkflowState",
-                "TicketStatus",
                 "TicketClose",
                 "TicketOrchestrationPlanRecord"
             ]
@@ -1351,7 +1304,6 @@ mod tests {
 
         let record = backend.show(TicketIdOrSlug::Id(created.id)).unwrap();
         assert_eq!(record.meta.workflow_state, TicketWorkflowState::Done);
-        assert_eq!(record.meta.status.as_local(), Some(TicketStatus::Open));
         assert!(
             record
                 .events
@@ -1469,7 +1421,6 @@ mod tests {
         assert!(error.to_string().contains("state changed concurrently"));
         let record = backend.show(TicketIdOrSlug::Id(created.id)).unwrap();
         assert_eq!(record.meta.workflow_state, TicketWorkflowState::Planning);
-        assert_eq!(record.meta.status.as_local(), Some(TicketStatus::Open));
         assert!(!record.events.iter().any(|event| {
             event.kind == TicketEventKind::StateChanged
                 && event.state_field.as_deref() == Some("state")
