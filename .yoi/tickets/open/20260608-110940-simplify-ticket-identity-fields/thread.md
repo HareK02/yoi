@@ -623,3 +623,37 @@ Required fix:
 - Re-run focused validation and core checks before re-review.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-09T04:59:07Z -->
+
+## Implementation report
+
+Coder fix-loop for fourth reviewer request_changes completed and is ready for re-review.
+
+Coder Pod:
+- `coder-simplify-ticket-identity-fields`
+- New fix commit: `a6326a9 fix: align ticket intake state wording`
+- Branch status after fix: clean
+- Stopped after collecting output to reclaim delegated worktree scope.
+
+Fix summary:
+- Updated `.yoi/workflow/ticket-intake-workflow.md` so Intake no longer proposes canonical ID, `kind`, or unmanaged `labels` as current/core fields.
+- Clarified that storage assigns the opaque/path-derived canonical ID.
+- Reframed Intake draft/core guidance around title, priority, body/request snapshot, acceptance conditions, readiness/action/attention fields.
+- Updated `crates/ticket/src/lib.rs` generated intake-ready audit/error text from `workflow_state ... -> ready` to `state ... -> ready`.
+
+Coder validation reported passed:
+- Focused grep/text validation: removed old Intake proposal patterns and stale `workflow_state planning -> ready` generated vocabulary; positive check shows generated text now uses `state {from} -> ready`.
+- `cargo test -p ticket`
+- `cargo test -p yoi ticket_cli`
+- `cargo test -p tui ticket_close_action_blocks_existing_resolution_without_moving_ticket`
+- `cargo test -p pod ticket`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo run -q -p yoi -- ticket doctor` -> `doctor: ok`
+- `cargo check --workspace`
+- `nix build .#yoi`
+
+Coder reports no remaining risks.
+
+---
