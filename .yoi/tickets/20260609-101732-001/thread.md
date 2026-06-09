@@ -93,3 +93,40 @@ Parallel-routing rationale:
 - It is expected to have only small/managed conflicts with active work and no runtime scheduler changes.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-09T10:42:37Z -->
+
+## Implementation report
+
+Coder implementation completed and is ready for sibling review.
+
+Coder Pod:
+- `coder-orchestrator-parallel-queued-work`
+- Commit: `492fe06832c30a08a982f469080041a290b1c228 workflow: prefer parallel queued starts`
+- Worktree status before review: clean branch `orchestrator-parallel-queued-work`
+- Stopped after collecting output to reclaim delegated worktree scope.
+
+Implementation summary:
+- Updated Orchestrator routing guidance to prefer starting additional independent queued Tickets during explicit queue review/routing when capacity exists, instead of waiting for the first active Ticket by default.
+- Added required checks before parallel start: Ticket body/thread/artifacts, Ticket relations, OrchestrationPlan, dirty state, visible Pods, worktrees/branches, conflict/dependency notes.
+- Preserved and strengthened the `queued -> inprogress` gate before implementation side effects.
+- Explicitly disallowed starting unqueued Tickets just to fill capacity.
+- Added bounded idle/defer reasons such as dependency, conflict, capacity, dirty workspace, migration boundary, and human gate.
+- Updated multi-agent workflow to require separate worktrees/branches/narrow write scopes for parallel Coder Pods and read-only Reviewer default.
+- Restated standing merge/validate/close/cleanup policy after reviewer approval, with migration/runtime/human gates as stop conditions.
+
+Changed files:
+- `.yoi/workflow/ticket-orchestrator-routing.md`
+- `.yoi/workflow/multi-agent-workflow.md`
+
+Coder validation reported passed:
+- Focused text validation for parallel preference.
+- Focused text validation for safety checks / bounded defer reasons.
+- Focused text validation for no scheduler / no unqueued start.
+- `git diff --check`
+- `cargo run -q -p yoi -- ticket doctor`
+- `nix build .#yoi`
+
+`cargo check --workspace` was not run because only workflow resource/docs changed.
+
+---

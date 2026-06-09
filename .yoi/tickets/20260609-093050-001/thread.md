@@ -163,3 +163,61 @@ Residual notes:
 - No scheduling, serialization, per-resource locks, same-file queueing, or `parallel_tool_calls=false` equivalent was added.
 
 ---
+
+<!-- event: review author: reviewer at: 2026-06-09T10:41:41Z status: approve -->
+
+## Review: approve
+
+## Review result: approve
+
+Reviewed commit `d8aed7befe6ff739cbee1b49221d3b8be35a57d7` on branch `tool-execution-context`.
+
+Evidence:
+- `ToolExecutionContext` is added as a small value object with `call_id`, `batch_id`, and `call_index`, and `Tool::execute` / `ToolServerHandle::call_tool` now receive it.
+- Worker assigns `tool-batch-{n}` once per `execute_tools` invocation, enumerates model-returned tool calls for 0-based `call_index`, synchronizes `call_id` after pre-interceptor call mutation, and passes the context into execution and post interceptors.
+- Approved calls are still executed through `join_all`; no serial/resource scheduling policy, same-file mutex/queue, `parallel_tool_calls=false`, or conflict solver was introduced.
+- Interceptor info structs expose context only as metadata; no lock/permit lifecycle is introduced into interceptors.
+- Macro generation filters `ToolExecutionContext` out of JSON arguments while passing it as a non-schema parameter; built-in/manual tools were migrated to the new signature and no old `Tool::execute(input_json)` implementation remains.
+- Context contains only response-local ids/order and does not expose Worker/history/session mutable handles; existing scope/host-authority/Ticket/web checks remain in the migrated tool bodies.
+
+Focused validation run by reviewer:
+- `cargo test -p llm-worker --test parallel_execution_test test_tool_execution_context -- --nocapture` — passed (3 tests).
+- `cargo test -p llm-worker --test parallel_execution_test test_parallel_tool_execution -- --nocapture` — passed.
+- `cargo test -p llm-worker --test tool_macro_test -- --nocapture` — passed (9 tests).
+- `cargo check -p llm-worker -p tools -p ticket` — passed.
+- `git diff --check && cargo fmt --check` — passed.
+- `cargo run -q -p yoi -- ticket doctor` — `doctor: ok`.
+
+Residual risk:
+- `batch_id` is Worker-local (`tool-batch-{n}`), not a durable globally unique id across process/session reconstruction. That matches the implementation report and is acceptable for this ticket, but should not be treated as persistent cross-session identity.
+
+---
+
+<!-- event: review author: reviewer-tool-execution-context at: 2026-06-09T10:43:02Z status: approve -->
+
+## Review: approve
+
+Review result: approve
+
+Evidence:
+- `ToolExecutionContext` carries `call_id`, `batch_id`, and `call_index` as response-local execution context.
+- `Tool::execute` / `ToolServerHandle::call_tool` receive context.
+- Worker assigns one `tool-batch-{n}` per tool batch and 0-based `call_index` in LLM-returned tool-call order.
+- `call_id` is synchronized after pre-interceptor mutation before tool execution and post-interceptor reporting.
+- Approved tool calls continue to execute in parallel with `join_all`; no serial policy, resource scheduler, same-file mutex, mutation queue, or `parallel_tool_calls=false` equivalent was introduced.
+- `ToolCallInfo` / `ToolResultInfo` expose context as metadata without lock/permit lifecycle.
+- Macro-generated tools treat `ToolExecutionContext` as a non-schema parameter, not an LLM JSON argument.
+- Built-in/manual tools are migrated to the new API and the old `Tool::execute(input_json)` implementation pattern is not retained as a compatibility surface.
+- Context carries response-local identity/order only and is not Worker/history/session mutable access; scope, host-authority, Ticket, and web safety boundaries are not weakened.
+
+Reviewer validation:
+- `cargo test -p llm-worker --test parallel_execution_test test_tool_execution_context -- --nocapture`
+- `cargo test -p llm-worker --test parallel_execution_test test_parallel_tool_execution -- --nocapture`
+- `cargo test -p llm-worker --test tool_macro_test -- --nocapture`
+- `cargo check -p llm-worker -p tools -p ticket`
+- `git diff --check && cargo fmt --check`
+- `cargo run -q -p yoi -- ticket doctor`
+
+All passed. Residual note: `batch_id` is Worker-local (`tool-batch-{n}`), not a durable/global identity across process/session reconstruction. This is acceptable for this Ticket but should not be treated as a persistent external artifact key without a future design.
+
+---

@@ -2,7 +2,7 @@
 title: 'Tool実行にToolExecutionContextを渡す'
 state: 'inprogress'
 created_at: '2026-06-09T09:30:50Z'
-updated_at: '2026-06-09T10:33:45Z'
+updated_at: '2026-06-09T10:43:02Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-06-09T10:01:00Z'
