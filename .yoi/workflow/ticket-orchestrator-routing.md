@@ -14,6 +14,8 @@ Panel Queue / queued notification は、人間が Orchestrator に routing を�
 
 `ready` は Orchestrator routing に十分な状態であり、実装戦術が事前にすべて固定されている状態ではない。Orchestrator は、recorded intent / binding decisions / invariants / implementation latitude / acceptance criteria / escalation conditions が揃っていれば、bounded implementation uncertainty を残したまま implementation-ready と判断してよい。
 
+`ready` / `queued` を `planning` に戻す判断は、Ticket text や risk flags だけで決めない。Orchestrator は、Ticket thread/artifacts、関連 Ticket / orchestration plan、関連 workflow/docs/code、durable project context、現在の repository/Pod/worktree 状態のうち relevant なものを bounded に確認し、実装前に必要な concrete missing decision / information が残っている場合だけ planning return とする。risk flags と risky domain は context lookup と reviewer focus の signal であり、automatic stop gate ではない。
+
 ## 位置づけ
 
 ```text
@@ -43,7 +45,7 @@ Orchestrator は以下を行う。
 - routing decision を `TicketComment` で Ticket thread に記録する。
 - implementation-ready の場合は `multi-agent-workflow` に渡す `IntentPacket` を作る。
 - implementation-ready かつ Ticket が `queued` の場合は、worktree 作成 / implementation Pod `SpawnPod` / coder routing などの side effect の前に、既存の typed Ticket backend/tool path で `queued -> inprogress` を記録する。
-- `ready` または `queued` に具体的な不足 decision / information がある場合だけ、typed state-change/routing event 付きで `planning` に戻す。
+- `ready` または `queued` に concrete missing decision / information がある場合だけ、typed state-change/routing event 付きで `planning` に戻す。その event/comment には missing item、checked context、implementation latitude では足りない理由、次の planning question/action を含める。
 
 ## Orchestrator がしないこと
 
@@ -56,6 +58,7 @@ Orchestrator は以下を行う。
 - Ticket tools があるからといって arbitrary filesystem write を行わない。
 - Notification だけを完了証拠にしない。Pod output / diff / validation / Ticket evidence を確認する。
 - 具体的な不足項目を言語化できない場合に、単に risky という理由だけで `planning` に戻さない。その場合は IntentPacket に escalation / reviewer focus を明記して進める。
+- risk flags / risky domain / authority-adjacent domain を automatic stop gate として扱わない。これらは bounded context lookup、IntentPacket invariant、reviewer focus、escalation condition に反映する signal である。
 
 ## 使用する Ticket tools
 
@@ -75,11 +78,12 @@ Orchestrator は以下を行う。
 
 ## Queued acceptance contract
 
-`workflow_state = queued` は、Ticket が routing 対象として人間により Orchestrator へ渡された状態である。Orchestrator は queued notification を受けたら、Ticket、workspace state、対象 Ticket の `TicketOrchestrationPlanQuery` 記録を読んで、次のどちらかを行う。
+`workflow_state = queued` は、Ticket が routing 対象として人間により Orchestrator へ渡された状態である。Orchestrator は queued notification を受けたら、Ticket、workspace state、対象 Ticket の `TicketOrchestrationPlanQuery` 記録、risk domain に応じた bounded project context を読んで、次のどちらかを行う。
 
 - unblocked と判断する場合: `queued -> inprogress` を記録してから worktree 作成、implementation/review Pod spawn、その他の implementation side effect に進む。
   - `before` / `after` / `blocked_by` / `blocks` / `conflicts_with` / `do_not_parallelize` / waiting-capacity 記録がある場合、それを acceptance 判断の入力にする。記録は自動 scheduler ではないため、実際に進めるかどうかは Orchestrator が読んだうえで明示的に決める。
-- concrete missing decision / information がある場合: `TicketWorkflowState` で `queued -> planning` を記録し、reason/body に不足項目を残す。既存の claimed live/restorable Intake/Planning Pod があり、既存通知経路が使える場合は同じ理由を通知する。
+  - risk flags / risky domain がある場合は、IntentPacket に invariants / reviewer focus / escalation conditions を入れる。risk flag だけを `queued -> planning` の理由にしない。
+- concrete missing decision / information がある場合: `TicketWorkflowState` で `queued -> planning` を記録し、reason/body と `TicketComment` に不足項目、checked context、なぜ coder の implementation latitude では解決できないか、次の planning question/action を残す。既存の claimed live/restorable Intake/Planning Pod があり、既存通知経路が使える場合は同じ理由を通知する。
 - external action 待ちなど planning では解決しない blocker の場合: concise な理由を Ticket thread に記録し、queued のまま待つか、既存の Ticket status/state mechanism で明示的に defer/block する。
 
 Invariant:
@@ -112,19 +116,25 @@ Action:
 
 ### `return_to_planning`
 
-`ready` または `queued` とされているが、実装 side effect 前に具体的な不足 decision / information が見つかった状態。
+`ready` または `queued` とされているが、bounded project-context checks の後でも、実装 side effect 前に解決すべき concrete missing decision / information が残っている状態。
 
 条件:
 
 - product / API / UX / authority boundary / storage migration / security / secrets などについて、実装前に決めなければならない具体項目がある。
 - 複数の自然な方針があり、human / Orchestrator decision なしでは固定できない。
 - acceptance criteria、binding decisions、または escalation conditions に、実装可否を左右する具体的欠落がある。
+- Ticket text / risk flags だけではなく、関連 Ticket/thread/artifacts、orchestration plan、関連 workflow/docs/code、durable project context、現在の workspace evidence の relevant subset を確認しても、既存 recorded decision が見つからない。
+- その不足は coder の bounded implementation latitude / local tactic selection では安全に解消できない。
 
 Action:
 
 - `TicketWorkflowState` で `ready -> planning` または `queued -> planning` を記録する。
-- reason/body に具体的な不足項目を含める。
-- `TicketComment` で routing decision と質問を記録する。
+- reason/body と `TicketComment` に以下を明記する。
+  - concrete missing decision / information。
+  - context checked（Ticket thread/artifacts、関連 Ticket/plan、docs/workflow/code/durable context/workspace state のうち実際に確認したもの）。
+  - why implementation latitude is insufficient（なぜ coder/reviewer の local tactic や escalation condition では足りないか）。
+  - next planning question/action。
+- risk flag / risky domain だけを return reason にしない。
 - 既存の claimed live/restorable Intake/Planning Pod があり、既存通知経路が使える場合は同じ理由を通知する。実用的な経路がない場合は follow-up として report する。
 - planning が再度 `ready` にするまで coder Pod は起動しない。
 
@@ -157,12 +167,13 @@ Action:
 - reviewer が判断する basis と escalation conditions が明確。
 - validation が書ける。
 - design / authority boundary の未決定がない、または planning return / human decision で補われている。
+- risk flags / risky domain は context lookup と reviewer focus に反映済みで、bounded context check 後に concrete missing decision / information が残っていない。
 - 残る不確実性が bounded implementation investigation / local tactic selection に閉じている。
 - IntentPacket を短く書ける。
 
 Action:
 
-- `IntentPacket` を作る。
+- `IntentPacket` を作る。risky-but-specified Ticket では、risk を stop reason にせず、binding invariants / implementation latitude / escalation conditions / Critical risks / reviewer focus として記録する。
 - project-relevant な ordering / blocker / conflict / capacity decision や accepted work plan がある場合は、`TicketOrchestrationPlanRecord` に bounded typed record として残す。local session/socket/raw model output は入れない。
 - `TicketComment` に routing decision と IntentPacket を記録する。
 - 許可があれば `multi-agent-workflow` に接続し、worktree + coder/reviewer sibling loop に進む。
@@ -273,18 +284,39 @@ Action:
 - Validation
 - Thread の plan / decision / implementation_report / review
 - Artifacts / branch / commit references
+- risk flags が示す domain（authority-boundary / scope / permission / Pod / persistence / prompt-context / public-api など）
 
-### 3. Classification を決める
+### 3. Bounded project-context checks を行う
+
+Ticket evidence だけで planning return を決めない。risk flags や risky domain がある場合は、必要な最小限の project context を確認する。
+
+代表的な確認先:
+
+- Ticket thread/artifacts/resolution と関連 Ticket。
+- `TicketOrchestrationPlanQuery` の accepted-plan / ordering / blocker / conflict 記録。
+- 関連 workflow/docs/design/development docs。
+- 現在の code map や既存 implementation pattern。
+- durable memory/Knowledge/project decisions（利用可能で、判断に関係する場合）。
+- repository / branch / worktree / visible Pod state。
+
+目的は broad repository archaeology ではなく、以下を区別できるだけの bounded check である。
+
+- genuinely missing binding decision / requirement / invariant / acceptance criterion。
+- Ticket thread、関連 Ticket、docs/workflows/code、durable context にすでに記録された decision。
+- coder が implementation latitude の中で選べる local tactic / bounded investigation。
+
+### 4. Classification を決める
 
 例:
 
-- implementation-ready に見えるが authority boundary の explicit decision がない → concrete missing decision として `return_to_planning`; explicit decision が Ticket/thread にあるなら binding として IntentPacket に載せる。
+- implementation-ready に見えるが authority boundary の explicit decision がなく、bounded context check でも recorded decision がない → concrete missing decision として `return_to_planning`; routing record に missing item / checked context / implementation latitude では足りない理由 / next question を書く。
 - implementation-ready に見えるが単に risk が高い → `implementation_ready` とし、IntentPacket に escalation / reviewer focus を明記する。
+- `allow-spawnpod-child-workspace-cwd` のように scope / Pod / authority-adjacent domain に触れるが、intent、authority invariants、implementation latitude、escalation conditions が指定済み → `implementation_ready`。context check で既存 SpawnPod scope/cwd policy と workflow invariants を確認し、reviewer focus に authority leakage / workspace-cwd separation / delegation-scope preservation を入れる。risk domain だけを理由に `planning` へ戻さない。
 - 実装済みだが review がない → `review_needed`
 - 要件が曖昧で spike も必要そう → `requirements_sync_needed` を優先し、調査問いを明確化する
 - 完了しているが close 権限がない → `close_ready` として dossier を返す
 
-### 4. Routing decision を Ticket に記録する
+### 5. Routing decision を Ticket に記録する
 
 `TicketComment` の role は通常 `decision` または `plan` を使う。
 
@@ -298,9 +330,15 @@ Reason:
 
 Evidence checked:
 - Ticket body / thread / artifacts
-- related Ticket(s)
+- related Ticket(s) / orchestration plan records
 - code/docs/workflow paths
 - branch/worktree/Pod state if relevant
+
+If returning to planning:
+- Missing decision/information: ...
+- Context checked: summarize the relevant subset from Evidence checked above
+- Why implementation latitude is insufficient: ...
+- Next planning question/action: ...
 
 Next action:
 - ...
@@ -309,7 +347,7 @@ Escalate if:
 - ...
 ```
 
-### 5. IntentPacket を作る（implementation_ready の場合）
+### 6. IntentPacket を作る（implementation_ready の場合）
 
 `multi-agent-workflow` に渡す前に、以下を短くまとめる。
 
@@ -342,7 +380,7 @@ Critical risks / reviewer focus:
 
 IntentPacket が短く書けない場合、`implementation_ready` ではなく `return_to_planning` または `requirements_sync_needed` に戻す。
 
-### 6. 後続 Workflow へ接続する
+### 7. 後続 Workflow へ接続する
 
 - `requirements_sync_needed` → `ticket-intake-workflow` / human / planning sync
 - `return_to_planning` → `ticket-preflight-workflow`（legacy compatibility slug の planning sync entry）
@@ -358,7 +396,7 @@ IntentPacket が短く書けない場合、`implementation_ready` ではなく `
 この Workflow の完了条件は次のいずれかである。
 
 - routing decision が Ticket に記録され、次に接続する Workflow / human action が明確である。
-- `ready` / `queued` を `planning` に戻した場合、typed state-change/routing event に concrete missing decision / information reason が残っている。
+- `ready` / `queued` を `planning` に戻した場合、typed state-change/routing event に concrete missing decision / information、checked context、implementation latitude では足りない理由、次の planning question/action が残っている。
 - implementation-ready Ticket について IntentPacket が Ticket に記録され、`multi-agent-workflow` に渡せる。
 - requirements-sync / planning return / spike / blocked / review / close-ready の理由と次 action が Ticket に記録されている。
 - routing 不要と判断され、その理由が明確である。

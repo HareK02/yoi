@@ -158,11 +158,11 @@ Routing classifications include:
 - `defer_pending`
 - `closed_or_noop`
 
-Routing decisions should be recorded with `TicketComment` using `plan` or `decision` role. The decision should state the classification, evidence checked, reason, next action, and escalation conditions.
+Routing decisions should be recorded with `TicketComment` using `plan` or `decision` role. The decision should state the classification, evidence checked, reason, next action, and escalation conditions. For `return_to_planning`, the record must also state the concrete missing decision/information, context checked, why implementation latitude is insufficient, and the next planning question/action.
 
 ### 3. Planning/requirements sync
 
-Use `ticket-preflight-workflow` only as a legacy compatibility slug for planning/requirements sync. Return `ready` or `queued` Tickets to `planning` only when the Orchestrator can name a concrete missing decision or information item.
+Use `ticket-preflight-workflow` only as a legacy compatibility slug for planning/requirements sync. Return `ready` or `queued` Tickets to `planning` only when the Orchestrator can name a concrete missing decision or information item after bounded project-context checks; risk flags and risky domains are context-lookup and reviewer-focus signals, not automatic stop gates.
 
 Planning sync should resolve or record:
 
@@ -172,7 +172,7 @@ Planning sync should resolve or record:
 - critical risks and failure modes;
 - implementation-ready vs requirements-sync/spike/blocked classification.
 
-Do not send Tickets with unresolved concrete missing decisions/information directly to coder Pods. Risk alone should proceed with an IntentPacket plus escalation/reviewer focus.
+Do not send Tickets with unresolved concrete missing decisions/information directly to coder Pods. If no concrete missing item remains after bounded checks, risky-but-specified Tickets should proceed with an IntentPacket plus escalation conditions and reviewer focus.
 
 ### 4. Implementation assignment
 

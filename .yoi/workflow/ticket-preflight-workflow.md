@@ -11,7 +11,7 @@ requires: []
 
 ## 目的
 
-実装に入る前または Orchestrator routing 中に、具体的な未決定事項が見つかった Ticket を planning に戻し、Ticket thread に監査可能な形で同期内容を残す。
+実装に入る前または Orchestrator routing 中に、bounded project-context checks 後も concrete missing decision / information / acceptance condition が残る Ticket を planning に戻し、Ticket thread に監査可能な形で同期内容を残す。
 
 この workflow は次をしてはいけない。
 
@@ -25,12 +25,12 @@ requires: []
 次のいずれかを満たす場合に使う。
 
 - `planning` Ticket の要件・受け入れ条件・制約を明確化する。
-- `ready` または `queued` Ticket について、Orchestrator が実装開始前に具体的な不足情報・未決定事項を特定した。
+- `ready` または `queued` Ticket について、Orchestrator が Ticket/thread/artifacts、関連 Ticket/plan、関連 workflow/docs/code、durable project context、workspace evidence の relevant subset を bounded に確認したうえで、実装開始前に concrete missing decision / information を特定した。
 - 既存 Ticket に obsolete state vocabulary が残っており、planning terminology へ整理する必要がある。
 
 適用しない条件:
 
-- Orchestrator が具体的な不足項目を言語化できない。
+- Orchestrator が具体的な不足項目、checked context、implementation latitude では足りない理由を言語化できない。
 - 単に変更範囲が広い、リスクが高い、またはレビュー観点が多いだけである。
 - すでに `queued -> inprogress` が記録され、実装 side effect が始まっている。
 
@@ -39,11 +39,12 @@ requires: []
 ## 手順
 
 1. Ticket の current frontmatter と recent thread を読む。
-2. 不足している decision / information / acceptance condition を箇条書きで特定する。
-3. `ready` または `queued` から戻す場合は、typed state change で `to = planning` を記録する。reason/body には具体的な不足項目を含める。
-4. 既存の claimed live/restorable Intake/Planning Pod があり、利用可能な通知経路がある場合は、その Pod に同じ不足理由を通知する。実用的な経路が無い場合は follow-up として report する。
-5. Ticket body または thread に requirements sync 結果を残す。
-6. Ticket が queue 可能になったら `planning -> ready` を typed state change / `TicketIntakeReady` で記録する。
+2. `ready` / `queued` から planning に戻す場合は、関連 Ticket/plan、docs/workflow/code、durable project context、workspace state の relevant subset を bounded に確認する。
+3. 不足している decision / information / acceptance condition を箇条書きで特定し、なぜ coder/reviewer の implementation latitude や escalation condition では足りないかを書く。
+4. `ready` または `queued` から戻す場合は、typed state change で `to = planning` を記録する。reason/body には concrete missing item、checked context、implementation latitude では足りない理由、次の planning question/action を含める。
+5. 既存の claimed live/restorable Intake/Planning Pod があり、利用可能な通知経路がある場合は、その Pod に同じ不足理由を通知する。実用的な経路が無い場合は follow-up として report する。
+6. Ticket body または thread に requirements sync 結果を残す。
+7. Ticket が queue 可能になったら `planning -> ready` を typed state change / `TicketIntakeReady` で記録する。
 
 ## 記録テンプレート
 
@@ -51,6 +52,17 @@ requires: []
 ## Planning sync
 
 Missing decisions / information:
+- ...
+
+Context checked:
+- Ticket/thread/artifacts: ...
+- related Ticket/plan: ...
+- docs/workflow/code/durable/workspace context: ...
+
+Why implementation latitude is insufficient:
+- ...
+
+Next planning question/action:
 - ...
 
 Decisions made:
@@ -70,5 +82,5 @@ Readiness:
 ## 完了条件
 
 - Ticket に具体的な不足項目または解決済み decision が記録されている。
-- `planning` に戻した場合、state_changed event に from/to/reason/body が残っている。
+- `planning` に戻した場合、state_changed event または thread に concrete missing decision / information、checked context、implementation latitude では足りない理由、次の planning question/action が残っている。
 - `ready` に進める場合、未解決の blocking attention/action が残っていない。

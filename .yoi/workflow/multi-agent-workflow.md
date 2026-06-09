@@ -61,9 +61,9 @@ reviewer Pod
 - worktree 作成と git 書き込み操作について、人間の許可がある。
 - main workspace の unrelated dirty changes を把握している。
 - 下位 orchestrator に渡す binding decisions / invariants、implementation latitude、escalation conditions を短く書ける。
-- 設計境界・仕様・authority boundary に不確定要素がある場合、planning/requirements sync 互換入口 `ticket-preflight-workflow` の結果が ticket thread に記録されている。
+- 設計境界・仕様・authority boundary に不確定要素があり、bounded project-context checks 後も concrete missing decision / information が残る場合、planning/requirements sync 互換入口 `ticket-preflight-workflow` の結果が ticket thread に記録されている。
 
-product / API / UX / authority / design-boundary 方針が複数自然に導ける場合、protocol / scope / permission / history persistence に触れる場合、ticket 自体の再定義が必要な場合は、実装委譲前に planning/requirements sync 互換入口 `ticket-preflight-workflow` を通し、必要なら人間へ戻す。実装ファイルの探索、既存コード読解、局所的な構成選択のような bounded implementation uncertainty は、intent / binding decisions / invariants / implementation latitude / acceptance criteria / escalation conditions が明確なら coder に委ねてよい。
+product / API / UX / authority / design-boundary 方針が複数自然に導ける場合、ticket 自体の再定義が必要な場合、または protocol / scope / permission / history persistence に触れる作業で bounded project-context checks 後も concrete missing decision / information が残る場合は、実装委譲前に planning/requirements sync 互換入口 `ticket-preflight-workflow` を通し、必要なら人間へ戻す。scope / Pod / permission / persistence のような authority-adjacent domain は reviewer focus と context lookup の signal であり、intent / binding decisions / invariants / implementation latitude / acceptance criteria / escalation conditions が明確なら coder に委ねてよい。実装ファイルの探索、既存コード読解、局所的な構成選択のような bounded implementation uncertainty も同様に coder に委ねてよい。
 
 ## Intent packet
 
