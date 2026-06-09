@@ -381,3 +381,46 @@ Required fix direction:
 - Update `AGENTS.md` to the new Ticket commands/layout and exact ID guidance.
 
 ---
+
+<!-- event: implementation_report author: coder at: 2026-06-09T04:04:33Z -->
+
+## Implementation report
+
+Fix loop update: removed current TicketStatus mutating tool/backend status move path and pending status handling; updated panel/TUI action model to state-only Queue/Close/Edit/Wait/Open without Defer; refreshed yoi ticket CLI tests to canonical ID, `list --state`, `state`, and flat `.yoi/tickets/<ticket-id>/` assertions; updated AGENTS.md current Ticket guidance. Validation passed locally: `cargo test -p ticket`, `cargo test -p yoi ticket_cli`, `cargo test -p tui ticket_action --no-run`, `cargo test -p tui workspace_panel`, `cargo test -p tui ticket_action`, `cargo fmt --check`, `git diff --check`, `cargo run -q -p yoi -- ticket doctor`, `cargo check --workspace`, and `nix build .#yoi`.
+
+---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-09T04:06:54Z -->
+
+## Implementation report
+
+Coder fix-loop for reviewer request_changes completed and is ready for re-review.
+
+Coder Pod:
+- `coder-simplify-ticket-identity-fields`
+- New fix commit: `21114fd fix: remove stale ticket status surfaces`
+- Branch status after fix: clean
+- Stopped after collecting output to reclaim delegated worktree scope.
+
+Fix summary:
+- Removed current `TicketStatus` mutating tool surface and related schema registration.
+- Removed backend `set_status()` and stale pending status mutation path.
+- Removed panel/TUI `Defer` / pending-status current action path and updated focused tests to canonical `state` behavior.
+- Updated yoi CLI tests away from `--slug`, `--status`, bucket paths, and old lookup expectations toward canonical IDs, `list --state`, `state <ticket-id> ...`, and flat paths.
+- Updated `AGENTS.md` to flat `.yoi/tickets/<ticket-id>/`, canonical exact ID, `state` lifecycle, and no slug/bucket/pending authority.
+
+Coder validation reported passed:
+- `cargo test -p ticket`
+- `cargo test -p yoi ticket_cli`
+- `cargo test -p tui ticket_action --no-run`
+- `cargo test -p tui workspace_panel`
+- `cargo test -p tui ticket_action`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo run -q -p yoi -- ticket doctor` -> `doctor: ok`
+- `cargo check --workspace`
+- `nix build .#yoi` (dirty-tree warning only; build succeeded)
+
+Coder reports no remaining risks or unresolved removal conflicts.
+
+---
