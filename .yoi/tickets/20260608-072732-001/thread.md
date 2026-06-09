@@ -269,3 +269,59 @@ Routing context:
 - This Ticket is the active lower-level Ticket relation/reference implementation work.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-09T06:19:32Z -->
+
+## Implementation report
+
+Coder implementation completed and is ready for sibling review.
+
+Coder Pod:
+- `coder-typed-ticket-relation-metadata`
+- Commit: `4601ad2b41d6c51c9d445ca2291726a658c42ab5 ticket: add typed relation metadata`
+- Worktree status before review: clean branch `typed-ticket-relation-metadata`
+- Stopped after collecting output to reclaim delegated worktree scope.
+
+Selected design:
+- Store forward project-level Ticket relation metadata per Ticket as typed JSON at `.yoi/tickets/<ticket-id>/artifacts/relations.json`.
+- Stored relation kinds: `depends_on`, `blocks`, `related`, `supersedes`, `duplicate_of`.
+- Derived inverse views are computed, not stored: `blocked_by`, `dependency_of`, `superseded_by`, `duplicated_by`.
+- Relation authority uses canonical opaque Ticket IDs only.
+- Unresolved `depends_on` and incoming unresolved `blocks` are treated as queue/acceptance blockers; `related` does not block; `supersedes` / `duplicate_of` are visible diagnostics only.
+
+Implementation summary:
+- Added typed relation structs, artifact read/write, backend relation query/view, and doctor validation in `crates/ticket`.
+- Added `TicketRelationRecord` / `TicketRelationQuery` tools and relation JSON in TicketShow/List-related output.
+- Added CLI relation commands: `yoi ticket relation add ...` and `yoi ticket relation list ...`.
+- Updated workspace panel to display unresolved relation blockers for ready Tickets.
+- Updated Orchestrator/work-item guidance to distinguish Ticket relations from OrchestrationPlan execution records.
+
+Changed files:
+- `.yoi/workflow/ticket-orchestrator-routing.md`
+- `crates/ticket/src/lib.rs`
+- `crates/ticket/src/tool.rs`
+- `crates/tui/src/workspace_panel.rs`
+- `crates/yoi/src/ticket_cli.rs`
+- `docs/development/work-items.md`
+
+Coder validation reported passed:
+- `cargo test -q -p ticket ticket_relations`
+- `cargo test -q -p ticket queue_gate_rejects`
+- `cargo test -q -p ticket doctor_validates_ticket_relations`
+- `cargo test -q -p ticket ticket_relation_tools_record`
+- `cargo test -q -p ticket ticket_tool_name_partitions_are_explicit`
+- `cargo test -q -p yoi ticket_cli_records_lists_and_shows_relations`
+- `cargo test -q -p tui workspace_panel_marks_ready_ticket_with_unresolved_relation_blocked`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo run -q -p yoi -- ticket doctor`
+- `cargo check --workspace`
+- `nix build .#yoi`
+
+Residual risks noted by coder:
+- No relation delete/update operation in this first version.
+- Derived inverse view scans relation artifacts; acceptable for current local scale but may need index/cache if Ticket counts grow.
+- Cycle detection is bounded and intentionally not a scheduler/dependency solver.
+- `supersedes` / `duplicate_of` do not automatically close/block/transition Tickets.
+
+---
