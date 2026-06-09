@@ -1,8 +1,8 @@
 ---
 title: "Define Objective records for medium-term goals"
-state: "queued"
+state: 'inprogress'
 created_at: "2026-06-08T12:54:30Z"
-updated_at: '2026-06-09T05:42:43Z'
+updated_at: '2026-06-09T06:32:20Z'
 queued_by: "workspace-panel"
 queued_at: "2026-06-09T02:27:33Z"
 ---

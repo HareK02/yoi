@@ -116,3 +116,69 @@ Next action:
 - Re-read Objective records against the resulting relation/reference model, then accept from queued if still unblocked.
 
 ---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-09T06:32:20Z from: queued to: inprogress reason: orchestrator_acceptance field: state -->
+
+## State changed
+
+Accepted queued implementation after `typed-ticket-relation-metadata` landed, was validated, closed, and cleaned up. Objective records can now be designed against the flat canonical Ticket ID model and the newly available non-hierarchical Ticket relation metadata surface.
+
+---
+
+<!-- event: decision author: orchestrator at: 2026-06-09T06:32:20Z -->
+
+## Decision
+
+Routing decision: implementation_ready
+
+Evidence checked:
+- Ticket body and Intake refinement.
+- Prior deferral decisions for identity simplification and typed relation metadata.
+- OrchestrationPlan record requiring this Ticket to run after `20260608-072732-001`.
+- Current state: `simplify-ticket-identity-fields` and `typed-ticket-relation-metadata` are merged, validated, closed, and cleaned up.
+- Current Ticket model: flat canonical Ticket IDs, `state` lifecycle, and typed non-hierarchical Ticket relations are available.
+
+Reason:
+- The previous blockers are resolved.
+- The Ticket has explicit binding decisions and clear acceptance criteria.
+- This can proceed as a lightweight Objective record design/minimal implementation without replacing Tickets, typed Ticket relations, OrchestrationPlan, or Pod/session claims.
+
+IntentPacket:
+
+Intent:
+- Define and implement the first lightweight Objective record surface for medium-term goals, using local git-trackable project records and canonical Ticket IDs for links.
+
+Binding decisions / invariants:
+- Objective is a first-class project record distinct from Ticket, TicketRelation, OrchestrationPlan, and Pod/session claims.
+- Objective captures medium-term goal, motivation/background, strategy/design direction, success criteria/exit conditions, decision context, linked Tickets, and current Objective lifecycle if useful.
+- Objective does not replace Tickets. Tickets remain implementable work items and implementation authority remains each Ticket body/thread/artifacts plus explicit Ticket relations and OrchestrationPlan records.
+- Objective-to-Ticket links are not dependency/blocking relations. A Ticket linked to an Objective does not depend on every other linked Ticket.
+- Use canonical opaque Ticket IDs for Objective links; do not use title/slug words as link authority.
+- Keep the first version lightweight and Markdown/local-file oriented under a clear `.yoi/` path.
+- Avoid roadmap scheduling, milestones, OKRs, dependency graph solving, and making Objectives mandatory for every Ticket.
+- Do not implement or alter typed Ticket relation metadata except by using the already-landed relation concepts in docs/guidance where relevant.
+- Do not implement broad Panel UX if a minimal record/API/CLI surface is sufficient for this first version; note future UX follow-ups if needed.
+- Orchestrator/Intake guidance should say Objective context is judgment/background context, not a substitute for reading the Ticket.
+
+Implementation latitude:
+- Coder may choose exact storage path, e.g. `.yoi/objectives/<objective-id>/item.md` plus artifacts/thread if useful, if it is simple, typed enough, and git-trackable.
+- Coder may choose whether this first version is docs/design + minimal backend/CLI/tool skeleton or a fuller reader/writer/list/show implementation, but it must satisfy the acceptance criteria and remain bounded.
+- If implementing code, add focused parser/writer/doctor/CLI tests; if only designing, update docs/workflows and record a concrete implementation path with validation.
+- Prefer a path-derived opaque Objective ID model consistent with the new Ticket identity direction if IDs are introduced.
+
+Escalate if:
+- Objective starts to duplicate Ticket dependency/blocking relations, OrchestrationPlan execution decisions, or Pod/session runtime claims.
+- The design requires a full roadmap/OKR/scheduling system.
+- Objective links require changing Ticket relation metadata or Ticket identity semantics.
+- Storage/API shape requires a broad project-record framework beyond the first Objective surface.
+
+Validation:
+- If code/storage is implemented: focused Objective parser/writer/list/show/doctor/CLI tests and Ticket-link validation tests.
+- If docs/design only: focused text validation that Objective is distinct from Ticket/TicketRelation/OrchestrationPlan/Pod claims, Objective links are non-blocking/non-dependency, and Ticket body/thread remains authority.
+- `cargo fmt --check` if code/tests touched.
+- `git diff --check`.
+- `cargo run -q -p yoi -- ticket doctor`.
+- `cargo check --workspace` if code/tests touched.
+- `nix build .#yoi` if resources/docs/code/package inputs are touched.
+
+---
