@@ -8,7 +8,7 @@ requires: []
 
 yoi を yoi で開発する際の、worktree + coder Pod + 外部 reviewer Pod + orchestrator Pod の標準フロー。これは **最上位 Pod が細かい code review を抱えず、下位 orchestrator が実装と外部レビューの loop を完了状態まで運ぶためのフロー** である。
 
-worktree の機械的作成手順は `$user/worktree-workflow`、ユーザー依頼の Ticket 化は `$user/ticket-intake-workflow`、Ticket の next action 分類は `$user/ticket-orchestrator-routing`、実装前の planning/requirements sync は compatibility slug `$user/ticket-preflight-workflow` に分ける。
+worktree の機械的作成手順は `$user/worktree-workflow`、ユーザー依頼の Ticket 化は `$user/ticket-intake-workflow`、Ticket の next action 分類は `$user/ticket-orchestrator-routing`、実装前の planning/requirements sync は compatibility canonical id `$user/ticket-preflight-workflow` に分ける。
 
 この Workflow は、対象 ticket が implementation-ready であることを前提にする。implementation-ready は full implementation plan ではなく、recorded intent / binding decisions / invariants / implementation latitude / acceptance criteria / escalation conditions に基づいて coder が bounded investigation を進め、reviewer が判断できる状態を指す。設計境界・仕様・authority boundary が未同期の場合は、worktree 作成や coder Pod 起動の前に planning/requirements sync 互換入口として `ticket-preflight-workflow` を通す。
 
@@ -105,7 +105,7 @@ reviewer には coder の実装方針ではなく、この intent packet と dif
 下位 orchestrator を挟まない場合は、以下を最上位 orchestrator が行う。下位 orchestrator を挟む場合は、最上位は intent packet を渡し、以下の実務を下位に委譲する。
 
 1. 状態確認
-   - `git status --short --branch`
+   - `git state --short --branch`
    - 対象 ticket / ticket 群
    - 関連 TODO / docs / 既存 worktree
    - planning sync が必要な ticket では、互換入口 `ticket-preflight-workflow` の分類・要件同期・critical risks
@@ -131,7 +131,7 @@ reviewer には coder の実装方針ではなく、この intent packet と dif
 
 4. coder 完了確認
    - `ReadPodOutput` で報告を読む。
-   - 通知が来ない場合でも、worktree の `git status` / `git diff` / test で完了状態を確認する。
+   - 通知が来ない場合でも、worktree の `git state` / `git diff` / test で完了状態を確認する。
    - coder が止まった場合、worktree 状態を見て再 spawn / rollback / 親 escalation を判断する。
 
 5. reviewer Pod spawn

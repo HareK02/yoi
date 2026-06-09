@@ -12,11 +12,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{
-    AcceptedOrchestrationPlan, ExtensibleTicketStatus, LocalTicketBackend, MarkdownText,
-    NewOrchestrationPlanRecord, NewTicket, NewTicketEvent, OrchestrationPlanKind, Ticket,
-    TicketBackend, TicketDoctorDiagnostic, TicketDoctorReport, TicketDoctorSeverity, TicketError,
-    TicketEventKind, TicketIdOrSlug, TicketIntakeSummary, TicketRef, TicketReview,
-    TicketReviewResult, TicketStateChange, TicketStatus, TicketSummary, TicketWorkflowState,
+    AcceptedOrchestrationPlan, LocalTicketBackend, MarkdownText, NewOrchestrationPlanRecord,
+    NewTicket, NewTicketEvent, OrchestrationPlanKind, Ticket, TicketBackend,
+    TicketDoctorDiagnostic, TicketDoctorReport, TicketDoctorSeverity, TicketError, TicketEventKind,
+    TicketIdOrSlug, TicketIntakeSummary, TicketReview, TicketReviewResult, TicketStateChange,
+    TicketSummary, TicketWorkflowState,
 };
 
 const DEFAULT_LIST_LIMIT: usize = 100;
@@ -30,7 +30,7 @@ const MAX_BODY_MAX_BYTES: usize = 64 * 1024;
 const DEFAULT_DIAGNOSTIC_LIMIT: usize = 100;
 const MAX_DIAGNOSTIC_LIMIT: usize = 500;
 
-pub const TICKET_TOOL_NAMES: [&str; 12] = [
+pub const TICKET_TOOL_NAMES: [&str; 11] = [
     "TicketCreate",
     "TicketList",
     "TicketShow",
@@ -38,7 +38,6 @@ pub const TICKET_TOOL_NAMES: [&str; 12] = [
     "TicketReview",
     "TicketIntakeReady",
     "TicketWorkflowState",
-    "TicketStatus",
     "TicketClose",
     "TicketOrchestrationPlanRecord",
     "TicketOrchestrationPlanQuery",
@@ -52,13 +51,12 @@ pub const TICKET_READ_ONLY_TOOL_NAMES: [&str; 4] = [
     "TicketDoctor",
 ];
 
-pub const TICKET_MUTATING_TOOL_NAMES: [&str; 8] = [
+pub const TICKET_MUTATING_TOOL_NAMES: [&str; 7] = [
     "TicketCreate",
     "TicketComment",
     "TicketReview",
     "TicketIntakeReady",
     "TicketWorkflowState",
-    "TicketStatus",
     "TicketClose",
     "TicketOrchestrationPlanRecord",
 ];
@@ -67,9 +65,9 @@ const CREATE_DESCRIPTION: &str = "Create a Ticket through the configured typed T
 Inputs mirror the Ticket `item.md` fields; `title` is required, `body` is Markdown, and the \
 backend assigns the id and writes the local Ticket file layout under the configured backend root.";
 const LIST_DESCRIPTION: &str = "List Tickets from the configured typed Ticket backend. Filter by \
-status (`open`, `pending`, `closed`, or `all`) and optionally kind/priority/label. Output is a \
+state (`planning`, `ready`, `queued`, `inprogress`, `done`, `closed`, or `all`). Output is a \
 bounded JSON summary list, not full ticket bodies.";
-const SHOW_DESCRIPTION: &str = "Show one Ticket by id, slug, or exact query through the configured \
+const SHOW_DESCRIPTION: &str = "Show one Ticket by id or exact query through the configured \
 typed Ticket backend. Output includes bounded Markdown body, recent thread events, resolution, and \
 artifact metadata.";
 const COMMENT_DESCRIPTION: &str = "Append a typed Ticket thread event. `role` must be `comment`, \
@@ -79,24 +77,20 @@ const REVIEW_DESCRIPTION: &str = "Append a Ticket review event. `result` must be
 `request_changes`; `body` is Markdown. Writes stay inside the configured Ticket backend root.";
 const INTAKE_READY_DESCRIPTION: &str = "Mark an existing Ticket planning lane ready through the typed \
 Ticket backend. The tool appends a bounded `intake_summary`, appends a typed `state_changed` event \
-for `workflow_state`, and transitions workflow_state to `ready`.";
-const WORKFLOW_STATE_DESCRIPTION: &str = "Transition Ticket `workflow_state` through the typed \
-Ticket backend with a bounded `state_changed` event. This does not move local open/pending/closed \
-status; use `TicketStatus` or `TicketClose` for local status changes. Treat `queued -> inprogress` \
+for `state`, and transitions state to `ready`.";
+const WORKFLOW_STATE_DESCRIPTION: &str = "Transition Ticket `state` through the typed \
+Ticket backend with a bounded `state_changed` event. Treat `queued -> inprogress` \
 as the implementation acceptance step: implementation side effects should happen only after that \
 transition is accepted and recorded. Orchestrator may return `ready` or `queued` Tickets to `planning` only with a concrete missing decision/information reason.";
-const STATUS_DESCRIPTION: &str = "Move a Ticket between non-closed local statuses through the typed \
-Ticket backend. Use `TicketClose` for closing because closed Tickets require a resolution accepted \
-by `yoi ticket doctor`.";
 const CLOSE_DESCRIPTION: &str = "Close a Ticket with a Markdown resolution through the typed Ticket \
-backend. The backend moves the Ticket to closed/, writes resolution.md, updates item.md, and appends \
+backend. The backend sets `state: closed`, writes resolution.md, updates item.md, and appends \
 a close event.";
 const ORCHESTRATION_PLAN_RECORD_DESCRIPTION: &str = "Append a typed Ticket orchestration plan record \
 for ordering, dependency, conflict, waiting/capacity, or accepted-plan decisions. Records are durable \
-Ticket artifacts and do not move workflow_state, reorder queues, or start work.";
+Ticket artifacts and do not move state, reorder queues, or start work.";
 const ORCHESTRATION_PLAN_QUERY_DESCRIPTION: &str = "Query durable Ticket orchestration plan records by \
-Ticket id/slug and/or relation kind. This is read-only planning context; Orchestrator must still make \
-explicit workflow_state decisions.";
+Ticket id and/or relation kind. This is read-only planning context; Orchestrator must still make \
+explicit state decisions.";
 const DOCTOR_DESCRIPTION: &str = "Run typed Ticket backend consistency checks and return bounded \
 diagnostics through the typed backend without shelling out to external commands.";
 
@@ -104,18 +98,6 @@ diagnostics through the typed backend without shelling out to external commands.
 struct TicketCreateParams {
     /// Ticket title. Must not be empty.
     title: String,
-    /// Optional slug seed. The local backend slugifies this value.
-    #[serde(default)]
-    slug: Option<String>,
-    /// Ticket kind. Defaults to `task`.
-    #[serde(default)]
-    kind: Option<String>,
-    /// Ticket priority. Defaults to `P2`.
-    #[serde(default)]
-    priority: Option<String>,
-    /// Ticket labels.
-    #[serde(default)]
-    labels: Vec<String>,
     /// Markdown body for item.md. If omitted, a small default body is used.
     #[serde(default)]
     body: Option<String>,
@@ -134,9 +116,9 @@ struct TicketCreateParams {
     /// Optional action-required frontmatter value.
     #[serde(default)]
     action_required: Option<String>,
-    /// Optional workflow_state frontmatter value. Defaults to `planning`.
+    /// Optional state frontmatter value. Defaults to `planning`.
     #[serde(default)]
-    workflow_state: Option<TicketWorkflowStateParam>,
+    state: Option<TicketWorkflowStateParam>,
     /// Optional attention_required overlay frontmatter value.
     #[serde(default)]
     attention_required: Option<String>,
@@ -156,6 +138,7 @@ enum TicketWorkflowStateParam {
     Queued,
     Inprogress,
     Done,
+    Closed,
 }
 
 impl TicketWorkflowStateParam {
@@ -166,47 +149,71 @@ impl TicketWorkflowStateParam {
             Self::Queued => TicketWorkflowState::Queued,
             Self::Inprogress => TicketWorkflowState::InProgress,
             Self::Done => TicketWorkflowState::Done,
+            Self::Closed => TicketWorkflowState::Closed,
         }
     }
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
-enum TicketListStatusParam {
-    Open,
-    Pending,
+enum TicketListStateParam {
+    Planning,
+    Ready,
+    Queued,
+    Inprogress,
+    Done,
     Closed,
     All,
 }
 
+impl TicketListStateParam {
+    fn as_filter(self) -> (crate::TicketFilter, &'static str) {
+        match self {
+            Self::Planning => (
+                crate::TicketFilter::state(TicketWorkflowState::Planning),
+                "planning",
+            ),
+            Self::Ready => (
+                crate::TicketFilter::state(TicketWorkflowState::Ready),
+                "ready",
+            ),
+            Self::Queued => (
+                crate::TicketFilter::state(TicketWorkflowState::Queued),
+                "queued",
+            ),
+            Self::Inprogress => (
+                crate::TicketFilter::state(TicketWorkflowState::InProgress),
+                "inprogress",
+            ),
+            Self::Done => (
+                crate::TicketFilter::state(TicketWorkflowState::Done),
+                "done",
+            ),
+            Self::Closed => (
+                crate::TicketFilter::state(TicketWorkflowState::Closed),
+                "closed",
+            ),
+            Self::All => (crate::TicketFilter::all(), "all"),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct TicketListParams {
-    /// Status filter. Defaults to `open`; use `all` to include closed and pending Tickets.
+    /// State filter. Defaults to all Tickets.
     #[serde(default)]
-    status: Option<TicketListStatusParam>,
+    state: Option<TicketListStateParam>,
     /// Maximum number of summaries to return. Defaults to 100, max 200.
     #[serde(default)]
     limit: Option<usize>,
-    /// Optional exact kind filter.
-    #[serde(default)]
-    kind: Option<String>,
-    /// Optional exact priority filter.
-    #[serde(default)]
-    priority: Option<String>,
-    /// Optional label that must be present.
-    #[serde(default)]
-    label: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct TicketShowParams {
-    /// Ticket id. Exactly one of `id`, `slug`, or `query` must be provided.
+    /// Ticket id. Exactly one of `id` or `query` must be provided.
     #[serde(default)]
     id: Option<String>,
-    /// Ticket slug. Exactly one of `id`, `slug`, or `query` must be provided.
-    #[serde(default)]
-    slug: Option<String>,
-    /// Exact id-or-slug query. Exactly one of `id`, `slug`, or `query` must be provided.
+    /// Exact ticket id query. Exactly one of `id` or `query` must be provided.
     #[serde(default)]
     query: Option<String>,
     /// Maximum number of most-recent thread events to return. Defaults to 20, max 100.
@@ -231,7 +238,7 @@ enum TicketCommentRoleParam {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct TicketCommentParams {
-    /// Ticket id or slug.
+    /// Ticket id.
     ticket: String,
     /// Thread event role: `comment`, `plan`, `decision`, or `implementation_report`.
     role: TicketCommentRoleParam,
@@ -251,7 +258,7 @@ enum TicketReviewResultParam {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct TicketReviewParams {
-    /// Ticket id or slug.
+    /// Ticket id.
     ticket: String,
     /// Review result: `approve` or `request_changes`.
     result: TicketReviewResultParam,
@@ -263,23 +270,8 @@ struct TicketReviewParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-#[serde(rename_all = "snake_case")]
-enum TicketStatusParam {
-    Open,
-    Pending,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct TicketStatusParams {
-    /// Ticket id or slug.
-    ticket: String,
-    /// New status. Use `TicketClose` for `closed`.
-    status: TicketStatusParam,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct TicketIntakeReadyParams {
-    /// Ticket id or slug.
+    /// Ticket id.
     ticket: String,
     /// Concise bounded intake summary to append as a typed intake_summary event.
     intake_summary: String,
@@ -296,11 +288,11 @@ struct TicketIntakeReadyParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct TicketWorkflowStateParams {
-    /// Ticket id or slug.
+    /// Ticket id.
     ticket: String,
-    /// Expected current workflow_state. The backend rejects stale transitions.
+    /// Expected current state. The backend rejects stale transitions.
     from: TicketWorkflowStateParam,
-    /// Target workflow_state.
+    /// Target state.
     to: TicketWorkflowStateParam,
     /// Reason attached to the typed state_changed event.
     reason: String,
@@ -313,7 +305,7 @@ struct TicketWorkflowStateParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct TicketCloseParams {
-    /// Ticket id or slug.
+    /// Ticket id.
     ticket: String,
     /// Markdown resolution written to resolution.md and thread.md.
     resolution: String,
@@ -364,11 +356,11 @@ struct AcceptedOrchestrationPlanParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct TicketOrchestrationPlanRecordParams {
-    /// Ticket id or slug that owns this orchestration plan record.
+    /// Ticket id that owns this orchestration plan record.
     ticket: String,
     /// Record kind: before/after, blocked_by/blocks, conflicts_with/do_not_parallelize, waiting_capacity_note, or accepted_plan.
     kind: OrchestrationPlanKindParam,
-    /// Related Ticket id/slug for ordering, dependency, and conflict records.
+    /// Related Ticket id for ordering, dependency, and conflict records.
     #[serde(default)]
     related_ticket: Option<String>,
     /// Optional bounded rationale/note. Required for waiting_capacity_note.
@@ -384,7 +376,7 @@ struct TicketOrchestrationPlanRecordParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct TicketOrchestrationPlanQueryParams {
-    /// Optional Ticket id or slug to query. Omit to query across the backend root.
+    /// Optional Ticket id to query. Omit to query across the backend root.
     #[serde(default)]
     ticket: Option<String>,
     /// Optional relation kind filter.
@@ -413,13 +405,12 @@ struct TicketDoctorParams {
 #[derive(Debug, Serialize)]
 struct TicketRefOutput {
     id: String,
-    slug: String,
-    status: String,
+    state: String,
 }
 
 #[derive(Debug, Serialize)]
 struct TicketListOutput {
-    status_filter: String,
+    state_filter: String,
     count: usize,
     returned: usize,
     truncated: bool,
@@ -472,11 +463,6 @@ struct TicketWorkflowStateTool {
 }
 
 #[derive(Clone)]
-struct TicketStatusTool {
-    backend: LocalTicketBackend,
-}
-
-#[derive(Clone)]
 struct TicketCloseTool {
     backend: LocalTicketBackend,
 }
@@ -501,14 +487,6 @@ impl Tool for TicketCreateTool {
     async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError> {
         let params: TicketCreateParams = parse_input("TicketCreate", input_json)?;
         let mut input = NewTicket::new(params.title);
-        input.slug = params.slug;
-        if let Some(kind) = params.kind {
-            input.kind = kind;
-        }
-        if let Some(priority) = params.priority {
-            input.priority = priority;
-        }
-        input.labels = params.labels;
         if let Some(body) = params.body {
             input.body = MarkdownText::new(body);
         }
@@ -517,9 +495,7 @@ impl Tool for TicketCreateTool {
         input.readiness = params.readiness;
         input.risk_flags = params.risk_flags;
         input.action_required = params.action_required;
-        input.workflow_state = params
-            .workflow_state
-            .map(TicketWorkflowStateParam::into_state);
+        input.workflow_state = params.state.map(TicketWorkflowStateParam::into_state);
         input.attention_required = params.attention_required;
         input.queued_by = params.queued_by;
         input.queued_at = params.queued_at;
@@ -529,13 +505,11 @@ impl Tool for TicketCreateTool {
             .create(input)
             .map_err(|error| backend_error("TicketCreate", error))?;
         Ok(json_output(
-            format!(
-                "Created ticket {} ({}) status {}",
-                created.id,
-                created.slug,
-                created.status.as_str()
-            ),
-            ticket_ref_output(created),
+            format!("Created ticket {}", created.id),
+            json!(TicketRefOutput {
+                id: created.id,
+                state: "planning".to_string(),
+            }),
         ))
     }
 }
@@ -544,35 +518,13 @@ impl Tool for TicketCreateTool {
 impl Tool for TicketListTool {
     async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError> {
         let params: TicketListParams = parse_input("TicketList", input_json)?;
-        let status = params.status.unwrap_or(TicketListStatusParam::Open);
-        let filter = match status {
-            TicketListStatusParam::Open => crate::TicketFilter::status(TicketStatus::Open),
-            TicketListStatusParam::Pending => crate::TicketFilter::status(TicketStatus::Pending),
-            TicketListStatusParam::Closed => crate::TicketFilter::status(TicketStatus::Closed),
-            TicketListStatusParam::All => crate::TicketFilter::all(),
-        };
-        let status_filter = match status {
-            TicketListStatusParam::Open => "open",
-            TicketListStatusParam::Pending => "pending",
-            TicketListStatusParam::Closed => "closed",
-            TicketListStatusParam::All => "all",
-        };
+        let state = params.state.unwrap_or(TicketListStateParam::All);
+        let (filter, state_filter) = state.as_filter();
         let limit = bounded(params.limit, DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT);
-        let mut tickets = self
+        let tickets = self
             .backend
             .list(filter)
             .map_err(|error| backend_error("TicketList", error))?;
-        tickets.retain(|ticket| {
-            params.kind.as_ref().is_none_or(|kind| ticket.kind == *kind)
-                && params
-                    .priority
-                    .as_ref()
-                    .is_none_or(|priority| ticket.priority == *priority)
-                && params
-                    .label
-                    .as_ref()
-                    .is_none_or(|label| ticket.labels.iter().any(|item| item == label))
-        });
         let count = tickets.len();
         let returned_tickets: Vec<_> = tickets
             .into_iter()
@@ -580,7 +532,7 @@ impl Tool for TicketListTool {
             .map(ticket_summary_json)
             .collect();
         let output = TicketListOutput {
-            status_filter: status_filter.to_string(),
+            state_filter: state_filter.to_string(),
             count,
             returned: returned_tickets.len(),
             truncated: count > returned_tickets.len(),
@@ -588,7 +540,7 @@ impl Tool for TicketListTool {
         };
         Ok(json_output(
             format!(
-                "Listed {} ticket(s) for status {status_filter}{}",
+                "Listed {} ticket(s) for state {state_filter}{}",
                 output.returned,
                 if output.truncated { " (truncated)" } else { "" }
             ),
@@ -601,7 +553,7 @@ impl Tool for TicketListTool {
 impl Tool for TicketShowTool {
     async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError> {
         let params: TicketShowParams = parse_input("TicketShow", input_json)?;
-        let query = id_or_slug(params.id, params.slug, params.query)?;
+        let query = id_or_query(params.id, params.query)?;
         let event_limit = bounded(params.event_limit, DEFAULT_EVENT_LIMIT, MAX_EVENT_LIMIT);
         let artifact_limit = bounded(
             params.artifact_limit,
@@ -618,10 +570,9 @@ impl Tool for TicketShowTool {
             .show(query)
             .map_err(|error| backend_error("TicketShow", error))?;
         let summary = format!(
-            "Ticket {} ({}) status {}",
+            "Ticket {} state {}",
             ticket.meta.id,
-            ticket.meta.slug,
-            status_as_str(&ticket.meta.status)
+            ticket.meta.workflow_state.as_str()
         );
         Ok(json_output(
             summary,
@@ -706,8 +657,8 @@ impl Tool for TicketIntakeReadyTool {
             )
             .map_err(|error| backend_error("TicketIntakeReady", error))?;
         Ok(json_output(
-            format!("Marked ticket {} workflow_state ready", params.ticket),
-            json!({ "ticket": params.ticket, "workflow_state": "ready", "ok": true }),
+            format!("Marked ticket {} state ready", params.ticket),
+            json!({ "ticket": params.ticket, "state": "ready", "ok": true }),
         ))
     }
 }
@@ -720,7 +671,7 @@ impl Tool for TicketWorkflowStateTool {
         let to = params.to.into_state();
         if from == to {
             return Err(ToolError::InvalidArgument(
-                "workflow_state transition must change state".to_string(),
+                "state transition must change state".to_string(),
             ));
         }
         let mut change =
@@ -731,7 +682,7 @@ impl Tool for TicketWorkflowStateTool {
             .map_err(|error| backend_error("TicketWorkflowState", error))?;
         Ok(json_output(
             format!(
-                "Transitioned ticket {} workflow_state {} -> {}",
+                "Transitioned ticket {} state {} -> {}",
                 params.ticket,
                 from.as_str(),
                 to.as_str()
@@ -740,27 +691,9 @@ impl Tool for TicketWorkflowStateTool {
                 "ticket": params.ticket,
                 "from": from.as_str(),
                 "to": to.as_str(),
-                "workflow_state": to.as_str(),
+                "state": to.as_str(),
                 "ok": true
             }),
-        ))
-    }
-}
-
-#[async_trait]
-impl Tool for TicketStatusTool {
-    async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError> {
-        let params: TicketStatusParams = parse_input("TicketStatus", input_json)?;
-        let status = match params.status {
-            TicketStatusParam::Open => TicketStatus::Open,
-            TicketStatusParam::Pending => TicketStatus::Pending,
-        };
-        self.backend
-            .set_status(TicketIdOrSlug::Query(params.ticket.clone()), status)
-            .map_err(|error| backend_error("TicketStatus", error))?;
-        Ok(json_output(
-            format!("Moved ticket {} to {}", params.ticket, status.as_str()),
-            json!({ "ticket": params.ticket, "status": status.as_str(), "ok": true }),
         ))
     }
 }
@@ -777,7 +710,7 @@ impl Tool for TicketCloseTool {
             .map_err(|error| backend_error("TicketClose", error))?;
         Ok(json_output(
             format!("Closed ticket {}", params.ticket),
-            json!({ "ticket": params.ticket, "status": "closed", "ok": true }),
+            json!({ "ticket": params.ticket, "state": "closed", "ok": true }),
         ))
     }
 }
@@ -886,21 +819,15 @@ fn bounded(value: Option<usize>, default: usize, max: usize) -> usize {
     value.unwrap_or(default).clamp(1, max)
 }
 
-fn id_or_slug(
-    id: Option<String>,
-    slug: Option<String>,
-    query: Option<String>,
-) -> Result<TicketIdOrSlug, ToolError> {
-    let provided = id.iter().chain(slug.iter()).chain(query.iter()).count();
+fn id_or_query(id: Option<String>, query: Option<String>) -> Result<TicketIdOrSlug, ToolError> {
+    let provided = id.iter().chain(query.iter()).count();
     if provided != 1 {
         return Err(ToolError::InvalidArgument(
-            "exactly one of id, slug, or query must be provided".to_string(),
+            "exactly one of id or query must be provided".to_string(),
         ));
     }
     if let Some(id) = id {
         Ok(TicketIdOrSlug::Id(id))
-    } else if let Some(slug) = slug {
-        Ok(TicketIdOrSlug::Slug(slug))
     } else {
         Ok(TicketIdOrSlug::Query(
             query.expect("provided count checked"),
@@ -908,31 +835,13 @@ fn id_or_slug(
     }
 }
 
-fn status_as_str(status: &ExtensibleTicketStatus) -> &str {
-    status.as_str()
-}
-
-fn ticket_ref_output(ticket: TicketRef) -> TicketRefOutput {
-    TicketRefOutput {
-        id: ticket.id,
-        slug: ticket.slug,
-        status: ticket.status.as_str().to_string(),
-    }
-}
-
 fn ticket_summary_json(ticket: TicketSummary) -> Value {
     json!({
         "id": ticket.id,
-        "slug": ticket.slug,
         "title": ticket.title,
-        "status": status_as_str(&ticket.status),
-        "kind": ticket.kind,
-        "priority": ticket.priority,
-        "labels": ticket.labels,
+        "state": ticket.workflow_state.as_str(),
         "readiness": ticket.readiness,
         "action_required": ticket.action_required,
-        "workflow_state": ticket.workflow_state.as_str(),
-        "workflow_state_explicit": ticket.workflow_state_explicit,
         "attention_required": ticket.attention_required,
         "queued_by": ticket.queued_by,
         "queued_at": ticket.queued_at,
@@ -956,7 +865,7 @@ fn ticket_json(
                 "kind": event.kind.as_str(),
                 "author": event.author,
                 "at": event.at,
-                "status": event.status,
+                "state": event.status,
                 "from": event.from,
                 "to": event.to,
                 "reason": event.reason,
@@ -977,20 +886,14 @@ fn ticket_json(
     json!({
         "meta": {
             "id": ticket.meta.id,
-            "slug": ticket.meta.slug,
             "title": ticket.meta.title,
-            "status": status_as_str(&ticket.meta.status),
-            "kind": ticket.meta.kind,
-            "priority": ticket.meta.priority,
-            "labels": ticket.meta.labels,
+            "state": ticket.meta.workflow_state.as_str(),
             "created_at": ticket.meta.created_at,
             "updated_at": ticket.meta.updated_at,
             "assignee": ticket.meta.assignee,
             "readiness": ticket.meta.readiness,
             "risk_flags": ticket.meta.risk_flags,
             "action_required": ticket.meta.action_required,
-            "workflow_state": ticket.meta.workflow_state.as_str(),
-            "workflow_state_explicit": ticket.meta.workflow_state_explicit,
             "attention_required": ticket.meta.attention_required,
             "queued_by": ticket.meta.queued_by,
             "queued_at": ticket.meta.queued_at,
@@ -1093,7 +996,6 @@ fn input_schema(name: &str) -> Value {
         "TicketWorkflowState" => {
             serde_json::to_value(schemars::schema_for!(TicketWorkflowStateParams))
         }
-        "TicketStatus" => serde_json::to_value(schemars::schema_for!(TicketStatusParams)),
         "TicketClose" => serde_json::to_value(schemars::schema_for!(TicketCloseParams)),
         "TicketOrchestrationPlanRecord" => {
             serde_json::to_value(schemars::schema_for!(TicketOrchestrationPlanRecordParams))
@@ -1124,7 +1026,6 @@ impl_from_backend!(TicketCommentTool);
 impl_from_backend!(TicketReviewTool);
 impl_from_backend!(TicketIntakeReadyTool);
 impl_from_backend!(TicketWorkflowStateTool);
-impl_from_backend!(TicketStatusTool);
 impl_from_backend!(TicketCloseTool);
 impl_from_backend!(TicketOrchestrationPlanRecordTool);
 impl_from_backend!(TicketOrchestrationPlanQueryTool);
@@ -1148,7 +1049,6 @@ pub fn ticket_tools(backend: LocalTicketBackend) -> Vec<ToolDefinition> {
             WORKFLOW_STATE_DESCRIPTION,
             backend.clone(),
         ),
-        tool_definition::<TicketStatusTool>("TicketStatus", STATUS_DESCRIPTION, backend.clone()),
         tool_definition::<TicketCloseTool>("TicketClose", CLOSE_DESCRIPTION, backend.clone()),
         tool_definition::<TicketOrchestrationPlanRecordTool>(
             "TicketOrchestrationPlanRecord",
@@ -1207,7 +1107,6 @@ mod tests {
                 "TicketReview",
                 "TicketIntakeReady",
                 "TicketWorkflowState",
-                "TicketStatus",
                 "TicketClose",
                 "TicketOrchestrationPlanRecord"
             ]
@@ -1227,12 +1126,12 @@ mod tests {
     }
 
     #[test]
-    fn workflow_state_tool_description_explains_queued_acceptance() {
+    fn state_tool_description_explains_queued_acceptance() {
         let temp = TempDir::new().unwrap();
         let definition = ticket_tools(backend(&temp))
             .into_iter()
             .find(|definition| definition().0.name == "TicketWorkflowState")
-            .expect("workflow state tool exists");
+            .expect("state tool exists");
         let (meta, _) = definition();
         assert!(meta.description.contains("queued -> inprogress"));
         assert!(meta.description.contains("implementation side effects"));
@@ -1251,8 +1150,6 @@ mod tests {
             .execute(
                 &json!({
                     "title": "Tool Created",
-                    "slug": "tool-created",
-                    "labels": ["ticket", "tool"],
                     "body": "## Background\n\nCreated by tool.\n"
                 })
                 .to_string(),
@@ -1267,7 +1164,7 @@ mod tests {
         assert!(!created_text.contains("needs_preflight"));
 
         let listed = list
-            .execute(&json!({ "status": "open", "label": "tool" }).to_string())
+            .execute(&json!({ "state": "planning" }).to_string())
             .await
             .unwrap();
         assert!(listed.summary.contains("Listed 1 ticket"));
@@ -1280,7 +1177,7 @@ mod tests {
             .execute(&json!({ "id": id, "event_limit": 10 }).to_string())
             .await
             .unwrap();
-        assert!(shown.summary.contains("tool-created"));
+        assert!(shown.summary.contains(&id));
         let shown_content = shown.content.unwrap();
         assert!(shown_content.contains("Created by tool"));
         assert!(!shown_content.contains("legacy_ticket"));
@@ -1291,20 +1188,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ticket_tools_comment_review_status_and_close_are_doctor_clean() {
+    async fn ticket_tools_comment_review_state_and_close_are_doctor_clean() {
         let temp = TempDir::new().unwrap();
         let backend = backend(&temp);
         let created = backend.create(NewTicket::new("Flow Tool")).unwrap();
         let comment = tool_by_name(backend.clone(), "TicketComment");
         let review = tool_by_name(backend.clone(), "TicketReview");
-        let status = tool_by_name(backend.clone(), "TicketStatus");
         let close = tool_by_name(backend.clone(), "TicketClose");
         let doctor = tool_by_name(backend.clone(), "TicketDoctor");
 
         comment
             .execute(
                 &json!({
-                    "ticket": created.slug,
+                    "ticket": created.id.clone(),
                     "role": "implementation_report",
                     "body": "Implemented."
                 })
@@ -1315,16 +1211,12 @@ mod tests {
         review
             .execute(
                 &json!({
-                    "ticket": created.id,
+                    "ticket": created.id.clone(),
                     "result": "approve",
                     "body": "Looks good."
                 })
                 .to_string(),
             )
-            .await
-            .unwrap();
-        status
-            .execute(&json!({ "ticket": created.slug, "status": "pending" }).to_string())
             .await
             .unwrap();
         close
@@ -1337,7 +1229,7 @@ mod tests {
 
         let report = doctor.execute(&json!({}).to_string()).await.unwrap();
         assert!(report.summary.contains("0 error(s)"));
-        let closed = backend.show(TicketIdOrSlug::Query(created.slug)).unwrap();
+        let closed = backend.show(TicketIdOrSlug::Id(created.id)).unwrap();
         assert!(closed.resolution.is_some());
         assert!(
             closed
@@ -1355,7 +1247,7 @@ mod tests {
             closed
                 .events
                 .iter()
-                .any(|event| event.kind == TicketEventKind::StatusChanged)
+                .any(|event| event.kind == TicketEventKind::StateChanged)
         );
     }
 
@@ -1370,7 +1262,7 @@ mod tests {
         intake_ready
             .execute(
                 &json!({
-                    "ticket": created.slug,
+                    "ticket": created.id.clone(),
                     "intake_summary": "Requirements accepted; implementation can be queued.",
                     "author": "intake-pod"
                 })
@@ -1384,7 +1276,7 @@ mod tests {
         workflow
             .execute(
                 &json!({
-                    "ticket": created.slug,
+                    "ticket": created.id.clone(),
                     "from": "queued",
                     "to": "inprogress",
                     "reason": "orchestrator_started",
@@ -1398,7 +1290,7 @@ mod tests {
         workflow
             .execute(
                 &json!({
-                    "ticket": created.slug,
+                    "ticket": created.id.clone(),
                     "from": "inprogress",
                     "to": "done",
                     "reason": "implementation_complete",
@@ -1410,9 +1302,8 @@ mod tests {
             .await
             .unwrap();
 
-        let record = backend.show(TicketIdOrSlug::Query(created.slug)).unwrap();
+        let record = backend.show(TicketIdOrSlug::Id(created.id)).unwrap();
         assert_eq!(record.meta.workflow_state, TicketWorkflowState::Done);
-        assert_eq!(record.meta.status.as_local(), Some(TicketStatus::Open));
         assert!(
             record
                 .events
@@ -1424,7 +1315,7 @@ mod tests {
             .iter()
             .filter(|event| {
                 event.kind == TicketEventKind::StateChanged
-                    && event.state_field.as_deref() == Some("workflow_state")
+                    && event.state_field.as_deref() == Some("state")
             })
             .map(|event| (event.from.as_deref(), event.to.as_deref()))
             .collect::<Vec<_>>();
@@ -1462,7 +1353,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let ready_record = backend.show(TicketIdOrSlug::Query(ready.slug)).unwrap();
+        let ready_record = backend.show(TicketIdOrSlug::Id(ready.id)).unwrap();
         assert_eq!(
             ready_record.meta.workflow_state,
             TicketWorkflowState::Planning
@@ -1491,7 +1382,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let queued_record = backend.show(TicketIdOrSlug::Query(queued.slug)).unwrap();
+        let queued_record = backend.show(TicketIdOrSlug::Id(queued.id)).unwrap();
         assert_eq!(
             queued_record.meta.workflow_state,
             TicketWorkflowState::Planning
@@ -1505,7 +1396,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ticket_workflow_tool_rejects_stale_transition_without_status_move() {
+    async fn ticket_workflow_tool_rejects_stale_transition_without_state_move() {
         let temp = TempDir::new().unwrap();
         let backend = backend(&temp);
         let created = backend
@@ -1516,7 +1407,7 @@ mod tests {
         let error = workflow
             .execute(
                 &json!({
-                    "ticket": created.id,
+                    "ticket": created.id.clone(),
                     "from": "queued",
                     "to": "inprogress",
                     "reason": "orchestrator_started",
@@ -1527,17 +1418,12 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(
-            error
-                .to_string()
-                .contains("workflow_state changed concurrently")
-        );
-        let record = backend.show(TicketIdOrSlug::Query(created.slug)).unwrap();
+        assert!(error.to_string().contains("state changed concurrently"));
+        let record = backend.show(TicketIdOrSlug::Id(created.id)).unwrap();
         assert_eq!(record.meta.workflow_state, TicketWorkflowState::Planning);
-        assert_eq!(record.meta.status.as_local(), Some(TicketStatus::Open));
         assert!(!record.events.iter().any(|event| {
             event.kind == TicketEventKind::StateChanged
-                && event.state_field.as_deref() == Some("workflow_state")
+                && event.state_field.as_deref() == Some("state")
         }));
     }
 
@@ -1614,7 +1500,7 @@ mod tests {
         let error = intake_ready
             .execute(
                 &json!({
-                    "ticket": created.id,
+                    "ticket": created.id.clone(),
                     "intake_summary": "Should not rewrite ready ticket."
                 })
                 .to_string(),
@@ -1622,16 +1508,12 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(
-            error
-                .to_string()
-                .contains("workflow_state changed concurrently")
-        );
-        let record = backend.show(TicketIdOrSlug::Query(created.slug)).unwrap();
+        assert!(error.to_string().contains("state changed concurrently"));
+        let record = backend.show(TicketIdOrSlug::Id(created.id)).unwrap();
         assert_eq!(record.meta.workflow_state, TicketWorkflowState::Ready);
         assert!(!record.events.iter().any(|event| {
             event.kind == TicketEventKind::StateChanged
-                && event.state_field.as_deref() == Some("workflow_state")
+                && event.state_field.as_deref() == Some("state")
         }));
     }
 
@@ -1647,9 +1529,9 @@ mod tests {
         let recorded = record
             .execute(
                 &json!({
-                    "ticket": first.slug,
+                    "ticket": first.id.clone(),
                     "kind": "blocked_by",
-                    "related_ticket": second.slug,
+                    "related_ticket": second.id.clone(),
                     "note": "Wait for the second Ticket's API boundary decision.",
                     "author": "orchestrator"
                 })
@@ -1676,7 +1558,7 @@ mod tests {
         let found_json: Value = serde_json::from_str(&found.content.unwrap()).unwrap();
         assert_eq!(found_json["count"], 1);
         assert_eq!(found_json["records"][0]["kind"], "blocked_by");
-        assert_eq!(found_json["records"][0]["related_ticket"], second.slug);
+        assert_eq!(found_json["records"][0]["related_ticket"], second.id);
 
         let current = backend.show(TicketIdOrSlug::Id(first.id)).unwrap();
         assert_eq!(current.meta.workflow_state, TicketWorkflowState::Planning);
@@ -1687,22 +1569,26 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let show = tool_by_name(backend(&temp), "TicketShow");
         let error = show
-            .execute(&json!({ "id": "a", "slug": "b" }).to_string())
+            .execute(&json!({ "id": "a", "query": "b" }).to_string())
             .await
             .unwrap_err();
         assert!(matches!(error, ToolError::InvalidArgument(_)));
     }
 
     #[tokio::test]
-    async fn ticket_create_slug_path_traversal_is_sanitized_under_backend_root() {
+    async fn ticket_create_uses_opaque_id_under_backend_root() {
         let temp = TempDir::new().unwrap();
         let backend = backend(&temp);
         let create = tool_by_name(backend.clone(), "TicketCreate");
-        create
-            .execute(&json!({ "title": "Escape", "slug": "../escape" }).to_string())
+        let output = create
+            .execute(&json!({ "title": "Escape" }).to_string())
             .await
             .unwrap();
+        let value: Value = serde_json::from_str(&output.content.unwrap()).unwrap();
+        let id = value["id"].as_str().unwrap();
+        assert!(!id.contains("escape"));
         assert!(!temp.path().join("escape").exists());
+        assert!(temp.path().join("tickets").join(id).is_dir());
         assert_eq!(backend.list(crate::TicketFilter::all()).unwrap().len(), 1);
     }
 

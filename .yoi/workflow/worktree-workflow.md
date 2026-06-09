@@ -95,7 +95,7 @@ git -C .worktree/<task-name> sparse-checkout set --no-cone \
 確認する。
 
 ```bash
-git -C .worktree/<task-name> status --short --branch
+git -C .worktree/<task-name> state --short --branch
 test ! -e .worktree/<task-name>/.yoi/memory
 if test -d .worktree/<task-name>/.yoi; then
   test ! -e .worktree/<task-name>/.yoi/override.local.toml

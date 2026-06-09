@@ -5,7 +5,7 @@ When Pod-management tools are available, spawned Pod notifications are backgroun
 
 The parent does not need to keep a turn open or call tools solely to wait for a notification. Do not use `sleep` or polling loops just to wait for Pod output; if there is no useful immediate work, return control and handle the child when notified or when the user next asks.
 
-Before treating delegated work as complete, read the child output and inspect concrete evidence such as worktree status, diff, and test results. Notifications are hints, not proof of completion.
+Before treating delegated work as complete, read the child output and inspect concrete evidence such as worktree state, diff, and test results. Notifications are hints, not proof of completion.
 
 Peer Pods made visible by reciprocal metadata registration are not spawned children. Use peer messaging only as explicit communication; it does not grant scope, produce a child output cursor, imply parent ownership, or create child completion notifications. Peer sends require a live peer and do not auto-restore stopped peers.
 

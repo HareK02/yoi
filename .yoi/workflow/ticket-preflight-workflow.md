@@ -1,5 +1,5 @@
 ---
-description: 互換 slug を残した Ticket planning / requirements sync workflow。preflight を独立 lane や workflow_state として扱わない。
+description: 互換 canonical id を残した Ticket planning / requirements sync workflow。preflight を独立 lane や state として扱わない。
 model_invokation: true
 user_invocable: true
 requires: []
@@ -15,7 +15,7 @@ requires: []
 
 この workflow は次をしてはいけない。
 
-- `preflight` を workflow_state として扱う。
+- `preflight` を state として扱う。
 - `preflight` vocabulary を current Ticket metadata として新規に書く。
 - 「リスクがある」だけで Ticket を戻す。
 - broad effort の進捗を保持するためだけの umbrella/progress-container Ticket を作る。

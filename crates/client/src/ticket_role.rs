@@ -25,49 +25,26 @@ const PRE_RUN_ACTION_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TicketRef {
     pub id: Option<String>,
-    pub slug: Option<String>,
 }
 
 impl TicketRef {
     pub fn id(id: impl Into<String>) -> Self {
         Self {
             id: Some(id.into()),
-            slug: None,
-        }
-    }
-
-    pub fn slug(slug: impl Into<String>) -> Self {
-        Self {
-            id: None,
-            slug: Some(slug.into()),
-        }
-    }
-
-    pub fn id_slug(id: impl Into<String>, slug: impl Into<String>) -> Self {
-        Self {
-            id: Some(id.into()),
-            slug: Some(slug.into()),
         }
     }
 
     fn pod_name_seed(&self) -> Option<&str> {
-        non_empty(self.slug.as_deref()).or_else(|| non_empty(self.id.as_deref()))
+        non_empty(self.id.as_deref())
     }
 
     fn append_prompt_lines(&self, out: &mut String) {
-        match (
-            non_empty(self.id.as_deref()),
-            non_empty(self.slug.as_deref()),
-        ) {
-            (None, None) => out.push_str("Target Ticket: not specified\n"),
-            (id, slug) => {
+        match non_empty(self.id.as_deref()) {
+            None => out.push_str("Target Ticket: not specified\n"),
+            Some(id) => {
                 out.push_str("Target Ticket:\n");
-                if let Some(id) = id {
-                    push_bounded_bullet(out, "id", id);
-                }
-                if let Some(slug) = slug {
-                    push_bounded_bullet(out, "slug", slug);
-                }
+                push_bounded_bullet(out, "id", id);
+                out.push_str("- Treat the Ticket id as an opaque storage id. Read TicketShow body/thread/artifacts before routing or implementation; do not infer requirements from id or title alone.\n");
             }
         }
     }
@@ -92,8 +69,8 @@ impl TicketIntakeHandoff {
         out.push_str("\nPanel handoff:\n");
         push_bounded_bullet(out, "workspace", &self.workspace_label);
         push_bounded_bullet(out, "workspace_orchestrator_pod", &self.orchestrator_pod);
-        out.push_str("- When Intake has clarified the request and created/updated the Ticket, use the typed Ticket tool surface to append `intake_summary` and set `workflow_state = ready` when the Ticket is ready to queue; use planning language for Tickets that still need clarification/preparation.\n");
-        out.push_str("- Handoff report fields: created_or_updated_ticket_id_or_slug, workflow_state, open_questions_or_risk_flags, intake_summary.\n");
+        out.push_str("- When Intake has clarified the request and created/updated the Ticket, use the typed Ticket tool surface to append `intake_summary` and set `state = ready` when the Ticket is ready to queue; use planning language for Tickets that still need clarification/preparation.\n");
+        out.push_str("- Handoff report fields: created_or_updated_ticket_id, state, open_questions_or_risk_flags, intake_summary.\n");
         out.push_str("- Do not start implementation automatically; the user queues a ready Ticket via panel (`ready -> queued`), and Orchestrator treats `queued` as schedulable before moving it to `inprogress` when starting.\n");
     }
 }
@@ -560,17 +537,17 @@ fn append_role_execution_guidance(out: &mut String, role: TicketRole) {
 fn append_orchestrator_agent_routing_guidance(out: &mut String) {
     out.push_str("\nOrchestrator worktree + agent routing guidance:\n");
     out.push_str("- Treat `ticket-orchestrator-routing` as the routing gate. Read the Ticket and workspace state first; `ready -> queued` authorizes routing, not implementation side effects.\n");
-    out.push_str("- Create worktrees or spawn coder/reviewer Pods only after `workflow_state = inprogress` is already recorded and accepted. If the Ticket is still queued and unblocked, record `queued -> inprogress` before any worktree/SpawnPod side effect.\n");
+    out.push_str("- Create worktrees or spawn coder/reviewer Pods only after `state = inprogress` is already recorded and accepted. If the Ticket is still queued and unblocked, record `queued -> inprogress` before any worktree/SpawnPod side effect.\n");
     out.push_str("- Use `worktree-workflow` for the mechanical worktree plan: create `.worktree/<task-name>`, keep tracked `.yoi` project records visible in the child worktree, exclude `.yoi/memory` plus local/runtime/log/lock/secret-like `.yoi` paths, and keep active orchestration progress plus final review/approval/close in the main workspace unless explicitly designed otherwise.\n");
     out.push_str("- Use `multi-agent-workflow` for the sibling loop: coder and reviewer are siblings under this Orchestrator; coder gets narrow write scope to the child worktree; reviewer is read-only by default.\n");
     out.push_str("- Give the coder an intent packet that distinguishes binding decisions/invariants, implementation latitude, escalation conditions, child worktree/branch, validation commands, and report expectations; set SpawnPod `cwd` to the child worktree while delegating explicit scope separately, prohibit editing main-workspace `.yoi`/Ticket/workflow/docs records, and prohibit creating generated memory/local/runtime/secret-like files in the child worktree.\n");
     out.push_str("- Give the reviewer the recorded Ticket intent, binding decisions/invariants, implementation latitude, acceptance criteria, explicit escalation conditions, diff/commits, validation evidence, and blocker/non-blocker criteria; reviewer judgment is against recorded requirements and decisions, not unrecorded preferred tactics. Keep branch-local reviewer verdicts in the review report or merge-ready dossier rather than recording them as final main-branch Ticket approval.\n");
     out.push_str("- Ticket thread progress may record worktree plan, coder delegated/completed/blocked, reviewer delegated, blocker/fix-loop summaries, and merge-ready dossier pointer; do not merge, close, or record final main approval in this routing/branch-review phase.\n");
-    out.push_str("- Stop at a merge-ready dossier for `orchestrator-merge-completion` containing Ticket id/slug, branch/worktree, commits, intent/invariant check, implementation summary, coder/reviewer Pods, blockers fixed or rejected findings with reasons, validation performed, residual risks, dirty state, and parent/human decision needs if any.\n");
+    out.push_str("- Stop at a merge-ready dossier for `orchestrator-merge-completion` containing Ticket id, branch/worktree, commits, intent/invariant check, implementation summary, coder/reviewer Pods, blockers fixed or rejected findings with reasons, validation performed, residual risks, dirty state, and parent/human decision needs if any.\n");
 
     out.push_str("\nOrchestrator merge-completion guidance:\n");
     out.push_str("- Enter merge-completion only for an `inprogress` Ticket with a merge-ready dossier. Conservative or missing authorization mode stops at the dossier; do not infer merge authority from public/default configuration.\n");
-    out.push_str("- Required dossier fields before merge: Ticket id/slug; branch/worktree; commits; intent/invariant check; implementation summary; coder/reviewer Pods; blockers fixed or rejected findings with reasons; validation performed; residual risks; dirty state; parent/human decision needs if any.\n");
+    out.push_str("- Required dossier fields before merge: Ticket id; branch/worktree; commits; intent/invariant check; implementation summary; coder/reviewer Pods; blockers fixed or rejected findings with reasons; validation performed; residual risks; dirty state; parent/human decision needs if any.\n");
     out.push_str("- Before merging, verify the dossier branch/worktree/commits match the branch to merge, independent reviewer approval exists in the dossier or an explicit human override decision is recorded, the main workspace is safe, and unrelated dirty changes are understood.\n");
     out.push_str("- Merge only when dogfooding/workspace policy grants merge authority. If authority is unavailable, record/return the dossier and stop without merge, close, final main Ticket approval, or cleanup.\n");
     out.push_str("- Preserve the boundary: branch-local reviewer verdicts are dossier evidence; final main-branch Ticket approval or close happens only during authorized merge-completion after merge and validation evidence.\n");
@@ -865,7 +842,7 @@ mod tests {
     fn default_config_role_launch_plan_requires_explicit_role_config() {
         let temp = TempDir::new().unwrap();
         let mut context = TicketRoleLaunchContext::new(temp.path(), TicketRole::Coder);
-        context.ticket = Some(TicketRef::slug("Ticket Role Pod Launcher"));
+        context.ticket = Some(TicketRef::id("Ticket Role Pod Launcher"));
 
         let err = plan_ticket_role_launch(context).unwrap_err();
 
@@ -1032,10 +1009,7 @@ workflow = "ticket-review-workflow"
         );
         let mut context = TicketRoleLaunchContext::new(temp.path(), TicketRole::Reviewer);
         context.pod_name = Some("reviewer-fixed".to_string());
-        context.ticket = Some(TicketRef::id_slug(
-            "20260605-190330-ticket-role-pod-launcher",
-            "ticket-role-pod-launcher",
-        ));
+        context.ticket = Some(TicketRef::id("20260605-190330-ticket-role-pod-launcher"));
         context.user_instruction = Some("Review the submitted implementation.".to_string());
 
         let plan = plan_ticket_role_launch(context).unwrap();
@@ -1098,8 +1072,8 @@ workflow = "ticket-review-workflow"
         assert!(handoff_text.contains("Panel handoff:"));
         assert!(handoff_text.contains("workspace_orchestrator_pod: panel-orchestrator-demo"));
         assert!(handoff_text.contains("workspace: Demo workspace"));
-        assert!(handoff_text.contains("created_or_updated_ticket_id_or_slug"));
-        assert!(handoff_text.contains("workflow_state"));
+        assert!(handoff_text.contains("created_or_updated_ticket_id"));
+        assert!(handoff_text.contains("state"));
         assert!(handoff_text.contains("Ticket tool surface"));
         assert!(handoff_text.contains("ready -> queued"));
         assert!(handoff_text.contains("queued` as schedulable"));
@@ -1107,7 +1081,7 @@ workflow = "ticket-review-workflow"
         assert!(!handoff_text.contains("human Go gates"));
 
         let mut orchestrator = TicketRoleLaunchContext::new(temp.path(), TicketRole::Orchestrator);
-        orchestrator.ticket = Some(TicketRef::slug("launcher"));
+        orchestrator.ticket = Some(TicketRef::id("launcher"));
         orchestrator.intent_packet = Some("Route to implementation after planning sync.".into());
         orchestrator.validation = vec!["cargo check --workspace --all-targets".into()];
         let orchestrator_plan = plan_ticket_role_launch(orchestrator).unwrap();
@@ -1115,7 +1089,7 @@ workflow = "ticket-review-workflow"
         assert!(orchestrator_text.contains("Role: orchestrator"));
         assert!(orchestrator_text.contains("Route to implementation after planning sync."));
         assert!(orchestrator_text.contains("cargo check --workspace --all-targets"));
-        assert!(orchestrator_text.contains("workflow_state = inprogress"));
+        assert!(orchestrator_text.contains("state = inprogress"));
         assert!(orchestrator_text.contains("worktree-workflow"));
         assert!(orchestrator_text.contains("keep tracked `.yoi` project records visible"));
         assert!(orchestrator_text.contains("exclude `.yoi/memory`"));
@@ -1174,7 +1148,7 @@ workflow = "ticket-review-workflow"
         let temp = TempDir::new().unwrap();
         write_builtin_role_config(temp.path(), &[TicketRole::Orchestrator]);
         let mut orchestrator = TicketRoleLaunchContext::new(temp.path(), TicketRole::Orchestrator);
-        orchestrator.ticket = Some(TicketRef::slug("orchestrator-merge-completion"));
+        orchestrator.ticket = Some(TicketRef::id("orchestrator-merge-completion"));
         orchestrator.intent_packet =
             Some("Complete an already-reviewed merge-ready Ticket.".into());
         orchestrator.validation = vec!["cargo test -p client ticket_role --lib".into()];
@@ -1207,7 +1181,7 @@ workflow = "ticket-review-workflow"
             "remove the merged child worktree and delete the merged branch unless explicitly kept"
         ));
         assert!(text.contains("Required dossier fields before merge"));
-        assert!(text.contains("Ticket id/slug"));
+        assert!(text.contains("Ticket id"));
         assert!(text.contains("branch/worktree"));
         assert!(text.contains("commits"));
         assert!(text.contains("intent/invariant check"));

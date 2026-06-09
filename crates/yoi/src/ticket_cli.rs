@@ -9,8 +9,8 @@ use ticket::config::{
 };
 use ticket::{
     LocalTicketBackend, MarkdownText, NewTicket, NewTicketEvent, TicketBackend,
-    TicketDoctorSeverity, TicketEventKind, TicketFilter, TicketIdOrSlug, TicketReview,
-    TicketReviewResult, TicketStatus,
+    TicketDoctorSeverity, TicketEventKind, TicketFilter, TicketIdOrSlug, TicketIntakeSummary,
+    TicketReview, TicketReviewResult, TicketWorkflowState,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,7 +27,7 @@ pub enum TicketCommand {
     Show { query: String },
     Comment(CommentOptions),
     Review(ReviewOptions),
-    Status(StatusOptions),
+    State(StateOptions),
     Close(CloseOptions),
     Doctor,
 }
@@ -35,23 +35,22 @@ pub enum TicketCommand {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateOptions {
     pub title: String,
-    pub slug: Option<String>,
-    pub kind: String,
-    pub priority: String,
-    pub labels: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ListStatus {
-    Open,
-    Pending,
+pub enum ListState {
+    Planning,
+    Ready,
+    Queued,
+    InProgress,
+    Done,
     Closed,
     All,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListOptions {
-    pub status: ListStatus,
+    pub state: ListState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,16 +68,19 @@ pub struct ReviewOptions {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StatusTarget {
-    Open,
-    Pending,
+pub enum StateTarget {
+    Planning,
+    Ready,
+    Queued,
+    InProgress,
+    Done,
     Closed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StatusOptions {
+pub struct StateOptions {
     pub query: String,
-    pub status: StatusTarget,
+    pub state: StateTarget,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,7 +161,7 @@ pub fn parse_ticket_args(args: &[String]) -> Result<TicketCli, TicketCliError> {
         },
         "comment" => TicketCommand::Comment(parse_comment(&args[1..])?),
         "review" => TicketCommand::Review(parse_review(&args[1..])?),
-        "status" => TicketCommand::Status(parse_status(&args[1..])?),
+        "state" => TicketCommand::State(parse_state(&args[1..])?),
         "close" => TicketCommand::Close(parse_close(&args[1..])?),
         "doctor" => {
             if args.len() != 1 {
@@ -212,7 +214,7 @@ fn run_command(
                 TicketCommand::Show { query } => show(&backend, query),
                 TicketCommand::Comment(options) => comment(&backend, options),
                 TicketCommand::Review(options) => review(&backend, options),
-                TicketCommand::Status(options) => status(&backend, options),
+                TicketCommand::State(options) => state(&backend, options),
                 TicketCommand::Close(options) => close(&backend, options),
                 TicketCommand::Doctor => doctor(&backend),
                 TicketCommand::Init => unreachable!("init handled before backend setup"),
@@ -268,42 +270,33 @@ fn create(
     options: CreateOptions,
 ) -> Result<TicketCliOutput, TicketCliError> {
     let mut input = NewTicket::new(options.title);
-    input.slug = options.slug;
-    input.kind = options.kind;
-    input.priority = options.priority;
-    input.labels = options.labels;
     input.author = Some("yoi ticket".to_string());
 
     let created = backend.create(input)?;
-    Ok(success(format!(
-        "created\t{}\t{}\t{}\n",
-        created.id,
-        created.slug,
-        created.status.as_str()
-    )))
+    Ok(success(format!("created\t{}\n", created.id)))
 }
 
 fn list(
     backend: &LocalTicketBackend,
     options: ListOptions,
 ) -> Result<TicketCliOutput, TicketCliError> {
-    let filter = match options.status {
-        ListStatus::Open => TicketFilter::status(TicketStatus::Open),
-        ListStatus::Pending => TicketFilter::status(TicketStatus::Pending),
-        ListStatus::Closed => TicketFilter::status(TicketStatus::Closed),
-        ListStatus::All => TicketFilter::all(),
+    let filter = match options.state {
+        ListState::Planning => TicketFilter::state(TicketWorkflowState::Planning),
+        ListState::Ready => TicketFilter::state(TicketWorkflowState::Ready),
+        ListState::Queued => TicketFilter::state(TicketWorkflowState::Queued),
+        ListState::InProgress => TicketFilter::state(TicketWorkflowState::InProgress),
+        ListState::Done => TicketFilter::state(TicketWorkflowState::Done),
+        ListState::Closed => TicketFilter::state(TicketWorkflowState::Closed),
+        ListState::All => TicketFilter::all(),
     };
     let tickets = backend.list(filter)?;
-    let mut stdout = String::from("status\tid\tslug\ttitle\tkind\tpriority\tupdated_at\n");
+    let mut stdout = String::from("state\tid\ttitle\tupdated_at\n");
     for ticket in tickets {
         stdout.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-            ticket.status.as_str(),
+            "{}\t{}\t{}\t{}\n",
+            ticket.workflow_state.as_str(),
             ticket.id,
-            ticket.slug,
             ticket.title,
-            ticket.kind,
-            ticket.priority,
             ticket.updated_at.unwrap_or_default()
         ));
     }
@@ -314,12 +307,8 @@ fn show(backend: &LocalTicketBackend, query: String) -> Result<TicketCliOutput, 
     let ticket = backend.show(TicketIdOrSlug::Query(query))?;
     let mut stdout = String::new();
     stdout.push_str(&format!("# {}\n\n", ticket.meta.title));
-    stdout.push_str(&format!("Status: {}\n", ticket.meta.status.as_str()));
+    stdout.push_str(&format!("State: {}\n", ticket.meta.workflow_state.as_str()));
     stdout.push_str(&format!("ID: {}\n", ticket.meta.id));
-    stdout.push_str(&format!("Slug: {}\n", ticket.meta.slug));
-    stdout.push_str(&format!("Kind: {}\n", ticket.meta.kind));
-    stdout.push_str(&format!("Priority: {}\n", ticket.meta.priority));
-    stdout.push_str(&format!("Labels: {}\n", ticket.meta.labels.join(", ")));
     if let Some(updated_at) = &ticket.meta.updated_at {
         stdout.push_str(&format!("Updated: {updated_at}\n"));
     }
@@ -423,24 +412,56 @@ fn review(
     )))
 }
 
-fn status(
+fn state(
     backend: &LocalTicketBackend,
-    options: StatusOptions,
+    options: StateOptions,
 ) -> Result<TicketCliOutput, TicketCliError> {
-    let status = match options.status {
-        StatusTarget::Open => TicketStatus::Open,
-        StatusTarget::Pending => TicketStatus::Pending,
-        StatusTarget::Closed => {
+    let id = TicketIdOrSlug::Query(options.query.clone());
+    let target_state = match options.state {
+        StateTarget::Planning => TicketWorkflowState::Planning,
+        StateTarget::Ready => TicketWorkflowState::Ready,
+        StateTarget::Queued => TicketWorkflowState::Queued,
+        StateTarget::InProgress => TicketWorkflowState::InProgress,
+        StateTarget::Done => TicketWorkflowState::Done,
+        StateTarget::Closed => {
             return Err(TicketCliError::new(
-                "yoi ticket status <ticket> closed cannot write resolution.md; use `yoi ticket close <ticket> --resolution <text>` instead",
+                "yoi ticket state <ticket> closed cannot write resolution.md; use `yoi ticket close <ticket> --resolution <text>` instead",
             ));
         }
     };
-    backend.set_status(TicketIdOrSlug::Query(options.query.clone()), status)?;
+    let current = backend.show(id.clone())?;
+    let ticket_id = current.meta.id.clone();
+    match target_state {
+        TicketWorkflowState::Ready => backend.mark_intake_ready(
+            id,
+            TicketIntakeSummary::new("Marked ready by `yoi ticket state`."),
+            ticket::TicketStateChange {
+                from: current.meta.workflow_state.as_str().to_string(),
+                to: TicketWorkflowState::Ready.as_str().to_string(),
+                reason: "cli_state".to_string(),
+                author: Some("yoi ticket".to_string()),
+                body: "Marked ready by `yoi ticket state`.\n".into(),
+                references: Vec::new(),
+            },
+        )?,
+        TicketWorkflowState::Queued => backend.queue_ready(id, "yoi ticket")?,
+        _ => {
+            let from = current.meta.workflow_state;
+            let change = ticket::TicketStateChange {
+                from: from.as_str().to_string(),
+                to: target_state.as_str().to_string(),
+                reason: "cli_state".to_string(),
+                author: Some("yoi ticket".to_string()),
+                body: format!("State changed to `{}`.\n", target_state.as_str()).into(),
+                references: Vec::new(),
+            };
+            backend.set_workflow_state(id, change)?;
+        }
+    }
     Ok(success(format!(
-        "status\t{}\t{}\n",
-        options.query,
-        status.as_str()
+        "state\t{}\t{}\n",
+        ticket_id,
+        target_state.as_str()
     )))
 }
 
@@ -490,18 +511,10 @@ fn success(stdout: String) -> TicketCliOutput {
 
 fn parse_create(args: &[String]) -> Result<CreateOptions, TicketCliError> {
     let mut title = None;
-    let mut slug = None;
-    let mut kind = "task".to_string();
-    let mut priority = "P2".to_string();
-    let mut labels = Vec::new();
     let mut i = 0;
     while i < args.len() {
         match option_with_value(args, &mut i)? {
             Some(("--title", value)) => title = Some(value),
-            Some(("--slug", value)) => slug = Some(value),
-            Some(("--kind", value)) => kind = value,
-            Some(("--priority", value)) => priority = value,
-            Some(("--label", value)) => labels.extend(parse_labels(&value)),
             Some((name, _)) => {
                 return Err(TicketCliError::new(format!(
                     "unknown create argument: {name}"
@@ -519,21 +532,15 @@ fn parse_create(args: &[String]) -> Result<CreateOptions, TicketCliError> {
     if title.trim().is_empty() {
         return Err(TicketCliError::new("create --title must not be empty"));
     }
-    Ok(CreateOptions {
-        title,
-        slug,
-        kind,
-        priority,
-        labels,
-    })
+    Ok(CreateOptions { title })
 }
 
 fn parse_list(args: &[String]) -> Result<ListOptions, TicketCliError> {
-    let mut status = ListStatus::Open;
+    let mut state = ListState::All;
     let mut i = 0;
     while i < args.len() {
         match option_with_value(args, &mut i)? {
-            Some(("--status", value)) => status = parse_list_status(&value)?,
+            Some(("--state", value)) => state = parse_list_state(&value)?,
             Some((name, _)) => {
                 return Err(TicketCliError::new(format!(
                     "unknown list argument: {name}"
@@ -547,12 +554,12 @@ fn parse_list(args: &[String]) -> Result<ListOptions, TicketCliError> {
             }
         }
     }
-    Ok(ListOptions { status })
+    Ok(ListOptions { state })
 }
 
 fn parse_comment(args: &[String]) -> Result<CommentOptions, TicketCliError> {
     if args.is_empty() || args[0].starts_with('-') {
-        return Err(TicketCliError::new("comment requires <id-or-slug>"));
+        return Err(TicketCliError::new("comment requires <id>"));
     }
     let query = args[0].clone();
     let mut role = TicketEventKind::Comment;
@@ -586,7 +593,7 @@ fn parse_comment(args: &[String]) -> Result<CommentOptions, TicketCliError> {
 
 fn parse_review(args: &[String]) -> Result<ReviewOptions, TicketCliError> {
     if args.is_empty() || args[0].starts_with('-') {
-        return Err(TicketCliError::new("review requires <id-or-slug>"));
+        return Err(TicketCliError::new("review requires <id>"));
     }
     let query = args[0].clone();
     let mut approve = false;
@@ -642,21 +649,21 @@ fn parse_review(args: &[String]) -> Result<ReviewOptions, TicketCliError> {
     })
 }
 
-fn parse_status(args: &[String]) -> Result<StatusOptions, TicketCliError> {
+fn parse_state(args: &[String]) -> Result<StateOptions, TicketCliError> {
     if args.len() != 2 {
         return Err(TicketCliError::new(
-            "status requires <id-or-slug> <open|pending|closed>",
+            "state requires <id> <planning|ready|queued|inprogress|done|closed>",
         ));
     }
-    Ok(StatusOptions {
+    Ok(StateOptions {
         query: args[0].clone(),
-        status: parse_status_target(&args[1])?,
+        state: parse_state_target(&args[1])?,
     })
 }
 
 fn parse_close(args: &[String]) -> Result<CloseOptions, TicketCliError> {
     if args.is_empty() || args[0].starts_with('-') {
-        return Err(TicketCliError::new("close requires <id-or-slug>"));
+        return Err(TicketCliError::new("close requires <id>"));
     }
     let query = args[0].clone();
     let mut file = None;
@@ -687,9 +694,7 @@ fn parse_close(args: &[String]) -> Result<CloseOptions, TicketCliError> {
 
 fn parse_one_positional(command: &str, args: &[String]) -> Result<String, TicketCliError> {
     if args.len() != 1 || args[0].starts_with('-') {
-        Err(TicketCliError::new(format!(
-            "{command} requires <id-or-slug>"
-        )))
+        Err(TicketCliError::new(format!("{command} requires <id>")))
     } else {
         Ok(args[0].clone())
     }
@@ -702,11 +707,7 @@ fn option_with_value(
     let arg = &args[*i];
     for name in [
         "--title",
-        "--slug",
-        "--kind",
-        "--priority",
-        "--label",
-        "--status",
+        "--state",
         "--role",
         "--file",
         "--message",
@@ -733,30 +734,28 @@ fn option_with_value(
     Ok(None)
 }
 
-fn parse_labels(value: &str) -> impl Iterator<Item = String> + '_ {
-    value
-        .split(',')
-        .map(str::trim)
-        .filter(|label| !label.is_empty())
-        .map(ToOwned::to_owned)
-}
-
-fn parse_list_status(value: &str) -> Result<ListStatus, TicketCliError> {
+fn parse_list_state(value: &str) -> Result<ListState, TicketCliError> {
     match value {
-        "open" => Ok(ListStatus::Open),
-        "pending" => Ok(ListStatus::Pending),
-        "closed" => Ok(ListStatus::Closed),
-        "all" => Ok(ListStatus::All),
-        _ => Err(TicketCliError::new(format!("invalid status: {value}"))),
+        "planning" => Ok(ListState::Planning),
+        "ready" => Ok(ListState::Ready),
+        "queued" => Ok(ListState::Queued),
+        "inprogress" => Ok(ListState::InProgress),
+        "done" => Ok(ListState::Done),
+        "closed" => Ok(ListState::Closed),
+        "all" => Ok(ListState::All),
+        _ => Err(TicketCliError::new(format!("invalid state: {value}"))),
     }
 }
 
-fn parse_status_target(value: &str) -> Result<StatusTarget, TicketCliError> {
+fn parse_state_target(value: &str) -> Result<StateTarget, TicketCliError> {
     match value {
-        "open" => Ok(StatusTarget::Open),
-        "pending" => Ok(StatusTarget::Pending),
-        "closed" => Ok(StatusTarget::Closed),
-        _ => Err(TicketCliError::new(format!("invalid status: {value}"))),
+        "planning" => Ok(StateTarget::Planning),
+        "ready" => Ok(StateTarget::Ready),
+        "queued" => Ok(StateTarget::Queued),
+        "inprogress" => Ok(StateTarget::InProgress),
+        "done" => Ok(StateTarget::Done),
+        "closed" => Ok(StateTarget::Closed),
+        _ => Err(TicketCliError::new(format!("invalid state: {value}"))),
     }
 }
 
@@ -812,7 +811,7 @@ fn default_author() -> String {
 }
 
 fn help_text() -> &'static str {
-    "yoi ticket\n\nUsage:\n  yoi ticket init\n  yoi ticket create --title <title> [--slug <slug>] [--kind <kind>] [--priority P2] [--label a,b]\n  yoi ticket list [--status open|pending|closed|all]\n  yoi ticket show <id-or-slug>\n  yoi ticket comment <id-or-slug> [--role comment|plan|decision|implementation_report] (--file <path>|--message <text>)\n  yoi ticket review <id-or-slug> (--approve|--request-changes) (--file <path>|--message <text>)\n  yoi ticket status <id-or-slug> <open|pending|closed>\n  yoi ticket close <id-or-slug> (--resolution <text>|--file <path>)\n  yoi ticket doctor\n\nOptions:\n  -h, --help    Print help\n\nBackend:\n  `yoi ticket init` writes .yoi/ticket.config.toml with explicit fixed role profiles and an optional commented [ticket].language setting.\n  Uses the workspace Ticket config at .yoi/ticket.config.toml when present.\n  Supported provider: builtin:yoi_local.\n  Without config, the local backend root is <cwd>/.yoi/tickets.\n"
+    "yoi ticket\n\nUsage:\n  yoi ticket init\n  yoi ticket create --title <title>\n  yoi ticket list [--state planning|ready|queued|inprogress|done|closed|all]\n  yoi ticket show <id>\n  yoi ticket comment <id> [--role comment|plan|decision|implementation_report] (--file <path>|--message <text>)\n  yoi ticket review <id> (--approve|--request-changes) (--file <path>|--message <text>)\n  yoi ticket state <id> <planning|ready|queued|inprogress|done|closed>\n  yoi ticket close <id> (--resolution <text>|--file <path>)\n  yoi ticket doctor\n\nOptions:\n  -h, --help    Print help\n\nBackend:\n  `yoi ticket init` writes .yoi/ticket.config.toml with explicit fixed role profiles and an optional commented [ticket].language setting.\n  Uses the workspace Ticket config at .yoi/ticket.config.toml when present.\n  Supported provider: builtin:yoi_local.\n  Without config, the local backend root is <cwd>/.yoi/tickets.\n"
 }
 
 #[cfg(test)]
@@ -829,6 +828,15 @@ mod tests {
     fn run(temp: &TempDir, items: &[&str]) -> TicketCliOutput {
         let cli = parse_ticket_args(&args(items)).unwrap();
         run_in_workspace(cli, temp.path()).unwrap()
+    }
+
+    fn created_id(output: &TicketCliOutput) -> String {
+        output
+            .stdout
+            .strip_prefix("created\t")
+            .and_then(|rest| rest.lines().next())
+            .expect("create output contains created id")
+            .to_string()
     }
 
     #[test]
@@ -882,49 +890,40 @@ mod tests {
     }
 
     #[test]
-    fn ticket_cli_create_list_show_comment_review_status_close_and_doctor() {
+    fn ticket_cli_create_list_show_comment_review_state_close_and_doctor() {
         let temp = TempDir::new().unwrap();
 
-        let created = run(
-            &temp,
-            &[
-                "create",
-                "--title",
-                "CLI Created",
-                "--slug",
-                "cli-created",
-                "--kind",
-                "task",
-                "--priority",
-                "P1",
-                "--label",
-                "ticket,cli",
-            ],
-        );
+        let created = run(&temp, &["create", "--title", "CLI Created"]);
         assert_eq!(created.status, TicketCliStatus::Success);
         assert!(created.stdout.contains("created\t"));
-        assert!(created.stdout.contains("\tcli-created\topen"));
-        assert!(temp.path().join(".yoi/tickets/open").exists());
+        let ticket_id = created_id(&created);
+        assert!(temp.path().join(".yoi/tickets").join(&ticket_id).exists());
         assert!(!temp.path().join("work-items").exists());
         let created_item = fs::read_to_string(
             temp.path()
-                .join(".yoi/tickets/open")
-                .join(created.stdout.split('\t').nth(1).unwrap())
+                .join(".yoi/tickets")
+                .join(&ticket_id)
                 .join("item.md"),
         )
         .unwrap();
+        assert!(created_item.contains("state:"));
+        assert!(created_item.contains("planning"));
         assert!(!created_item.contains("legacy_ticket:"));
         assert!(!created_item.contains("needs_preflight:"));
+        assert!(!created_item.contains("slug:"));
+        assert!(!created_item.contains("workflow_state:"));
 
-        let listed = run(&temp, &["list", "--status", "open"]);
-        assert!(listed.stdout.contains("status\tid\tslug"));
+        let listed = run(&temp, &["list", "--state", "planning"]);
+        assert!(listed.stdout.contains("state\tid\ttitle"));
+        assert!(listed.stdout.contains(&ticket_id));
         assert!(listed.stdout.contains("CLI Created"));
         assert!(!listed.stdout.contains("legacy_ticket"));
         assert!(!listed.stdout.contains("needs_preflight"));
 
-        let shown = run(&temp, &["show", "cli-created"]);
+        let shown = run(&temp, &["show", &ticket_id]);
         assert!(shown.stdout.contains("# CLI Created"));
-        assert!(shown.stdout.contains("Labels: ticket, cli"));
+        assert!(shown.stdout.contains(&format!("ID: {ticket_id}")));
+        assert!(shown.stdout.contains("State: planning"));
         assert!(!shown.stdout.contains("legacy_ticket"));
         assert!(!shown.stdout.contains("needs_preflight"));
 
@@ -932,7 +931,7 @@ mod tests {
             &temp,
             &[
                 "comment",
-                "cli-created",
+                &ticket_id,
                 "--role",
                 "implementation_report",
                 "--message",
@@ -942,44 +941,62 @@ mod tests {
         assert!(
             commented
                 .stdout
-                .contains("appended\tcli-created\timplementation_report")
+                .contains(&format!("appended\t{}\timplementation_report", ticket_id))
         );
 
         let reviewed = run(
             &temp,
             &[
                 "review",
-                "cli-created",
+                &ticket_id,
                 "--approve",
                 "--message",
                 "Looks good.",
             ],
         );
-        assert!(reviewed.stdout.contains("reviewed\tcli-created\tapprove"));
+        assert!(
+            reviewed
+                .stdout
+                .contains(&format!("reviewed\t{}\tapprove", ticket_id))
+        );
 
-        let pending = run(&temp, &["status", "cli-created", "pending"]);
-        assert!(pending.stdout.contains("status\tcli-created\tpending"));
+        let ready = run(&temp, &["state", &ticket_id, "ready"]);
+        assert_eq!(ready.stdout, format!("state\t{}\tready\n", ticket_id));
+        let ready_listed = run(&temp, &["list", "--state", "ready"]);
+        assert!(ready_listed.stdout.contains(&ticket_id));
+
+        let queued = run(&temp, &["state", &ticket_id, "queued"]);
+        assert_eq!(queued.stdout, format!("state\t{}\tqueued\n", ticket_id));
+        let queued_listed = run(&temp, &["list", "--state", "queued"]);
+        assert!(queued_listed.stdout.contains(&ticket_id));
+
+        let inprogress = run(&temp, &["state", &ticket_id, "inprogress"]);
+        assert_eq!(
+            inprogress.stdout,
+            format!("state\t{}\tinprogress\n", ticket_id)
+        );
+        let inprogress_listed = run(&temp, &["list", "--state", "inprogress"]);
+        assert!(inprogress_listed.stdout.contains(&ticket_id));
+
+        let done = run(&temp, &["state", &ticket_id, "done"]);
+        assert_eq!(done.stdout, format!("state\t{}\tdone\n", ticket_id));
+        let done_listed = run(&temp, &["list", "--state", "done"]);
+        assert!(done_listed.stdout.contains(&ticket_id));
 
         let closed = run(
             &temp,
-            &[
-                "close",
-                "cli-created",
-                "--resolution",
-                "Done via yoi ticket.",
-            ],
+            &["close", &ticket_id, "--resolution", "Done via yoi ticket."],
         );
-        assert!(closed.stdout.contains("closed\tcli-created"));
+        assert!(closed.stdout.contains(&format!("closed\t{}", ticket_id)));
 
         let doctor = run(&temp, &["doctor"]);
         assert_eq!(doctor.status, TicketCliStatus::Success);
         assert_eq!(doctor.stdout, "doctor: ok\n");
 
         let backend = LocalTicketBackend::new(temp.path().join(".yoi/tickets"));
-        let ticket = backend
-            .show(TicketIdOrSlug::Query("cli-created".to_string()))
-            .unwrap();
+        let ticket = backend.show(TicketIdOrSlug::Id(ticket_id.clone())).unwrap();
         assert!(ticket.resolution.is_some());
+        assert_eq!(ticket.meta.workflow_state, TicketWorkflowState::Closed);
         assert!(
             ticket
                 .events
@@ -1004,28 +1021,11 @@ mod tests {
         )
         .unwrap();
 
-        run(
-            &temp,
-            &[
-                "create",
-                "--title",
-                "Configured Root",
-                "--slug",
-                "configured-root",
-            ],
-        );
+        let created = run(&temp, &["create", "--title", "Configured Root"]);
+        let ticket_id = created_id(&created);
 
-        assert!(
-            temp.path()
-                .join("custom-tickets/open")
-                .read_dir()
-                .unwrap()
-                .any(|entry| entry
-                    .unwrap()
-                    .file_name()
-                    .to_string_lossy()
-                    .contains("configured-root"))
-        );
+        assert!(temp.path().join("custom-tickets").join(ticket_id).exists());
+        assert!(!temp.path().join("custom-tickets/open").exists());
         assert!(!temp.path().join("work-items").exists());
     }
 
@@ -1058,13 +1058,11 @@ mod tests {
     }
 
     #[test]
-    fn ticket_cli_status_closed_requires_close_command() {
+    fn ticket_cli_state_closed_requires_close_command() {
         let temp = TempDir::new().unwrap();
-        run(
-            &temp,
-            &["create", "--title", "Close Me", "--slug", "close-me"],
-        );
-        let cli = parse_ticket_args(&args(&["status", "close-me", "closed"])).unwrap();
+        let created = run(&temp, &["create", "--title", "Close Me"]);
+        let ticket_id = created_id(&created);
+        let cli = parse_ticket_args(&args(&["state", &ticket_id, "closed"])).unwrap();
         let err = run_in_workspace(cli, temp.path()).unwrap_err();
         assert!(err.to_string().contains("use `yoi ticket close"));
     }

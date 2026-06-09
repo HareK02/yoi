@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use protocol::PodStatus;
 use ticket::config::{TICKET_CONFIG_RELATIVE_PATH, TicketConfig};
 use ticket::{
-    ExtensibleTicketStatus, LocalTicketBackend, TicketBackend, TicketError, TicketEvent,
-    TicketFilter, TicketIdOrSlug, TicketMeta, TicketStatus, TicketSummary, TicketWorkflowState,
+    LocalTicketBackend, TicketBackend, TicketError, TicketEvent, TicketFilter, TicketIdOrSlug,
+    TicketMeta, TicketSummary, TicketWorkflowState,
 };
 
 use crate::pod_list::{PodList, PodListEntry, StoredMetadataState};
@@ -199,7 +199,6 @@ pub(crate) enum PanelRowKind {
 pub(crate) enum ActionPriority {
     UserReply,
     ReadyForQueue,
-    Blocked,
     ActiveWork,
     Background,
 }
@@ -209,7 +208,6 @@ pub(crate) enum NextUserAction {
     Clarify,
     Queue,
     Close,
-    Defer,
     Edit,
     Wait,
     OpenPod,
@@ -221,7 +219,6 @@ impl NextUserAction {
             Self::Clarify => "Clarify",
             Self::Queue => "Queue",
             Self::Close => "Close",
-            Self::Defer => "Defer",
             Self::Edit => "Edit",
             Self::Wait => "Wait",
             Self::OpenPod => "Open",
@@ -232,12 +229,8 @@ impl NextUserAction {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TicketPanelEntry {
     pub(crate) id: String,
-    pub(crate) slug: String,
     pub(crate) title: String,
-    pub(crate) status: String,
-    pub(crate) kind: String,
     pub(crate) priority: String,
-    pub(crate) labels: Vec<String>,
     pub(crate) workflow_state: TicketWorkflowState,
     pub(crate) workflow_state_explicit: bool,
     pub(crate) attention_required: Option<String>,
@@ -601,7 +594,7 @@ pub(crate) fn build_current_ticket_row(
     pods: &PodList,
 ) -> ticket::Result<PanelRow> {
     let ticket = backend.show(TicketIdOrSlug::Id(ticket_id.to_owned()))?;
-    if ticket.meta.status.as_local() == Some(TicketStatus::Closed) {
+    if ticket.meta.workflow_state == TicketWorkflowState::Closed {
         return Err(TicketError::Conflict(format!(
             "Ticket {ticket_id} is already closed"
         )));
@@ -638,10 +631,10 @@ fn build_ticket_rows(
 ) -> ticket::Result<Vec<PanelRow>> {
     let mut rows = Vec::new();
     for summary in backend.list(TicketFilter::all())? {
-        if summary.status.as_local() == Some(TicketStatus::Closed) {
+        if summary.workflow_state == TicketWorkflowState::Closed {
             continue;
         }
-        let ticket = backend.show(TicketIdOrSlug::Query(summary.slug.clone()))?;
+        let ticket = backend.show(TicketIdOrSlug::Query(summary.id.clone()))?;
         rows.push(ticket_row(summary, &ticket.events, pods, registry));
     }
     Ok(rows)
@@ -659,12 +652,8 @@ fn ticket_row(
     let latest_event = events.last();
     let entry = TicketPanelEntry {
         id: summary.id.clone(),
-        slug: summary.slug.clone(),
         title: summary.title.clone(),
-        status: summary.status.as_str().to_string(),
-        kind: summary.kind.clone(),
         priority: summary.priority.clone(),
-        labels: summary.labels.clone(),
         workflow_state: summary.workflow_state,
         workflow_state_explicit: summary.workflow_state_explicit,
         attention_required: summary.attention_required.clone(),
@@ -703,20 +692,6 @@ struct DerivedTicketState {
 }
 
 fn derive_ticket_state(summary: &TicketSummary) -> DerivedTicketState {
-    if summary.status.as_local() == Some(TicketStatus::Pending) {
-        return DerivedTicketState {
-            kind: PanelRowKind::Blocked,
-            priority: ActionPriority::Blocked,
-            action: Some(NextUserAction::Defer),
-            disabled_reason: Some(
-                "Pending Ticket is deferred; queueing is disabled until it is reopened and readied."
-                    .to_string(),
-            ),
-            key_hint: Some("Open/defer operation lives in Ticket controls".to_string()),
-            blocked_reason: None,
-        };
-    }
-
     if let Some(reason) = summary
         .attention_required
         .as_deref()
@@ -769,7 +744,7 @@ fn derive_ticket_state(summary: &TicketSummary) -> DerivedTicketState {
             priority: ActionPriority::Background,
             action: Some(NextUserAction::Close),
             disabled_reason: Some(
-                "workflow_state is done; close if a resolution is still missing.".to_string(),
+                "state is done; close if a resolution is still missing.".to_string(),
             ),
             key_hint: None,
             blocked_reason: None,
@@ -781,7 +756,15 @@ fn derive_ticket_state(summary: &TicketSummary) -> DerivedTicketState {
             disabled_reason: Some(
                 "Ticket is still in planning; mark it ready before queueing.".to_string(),
             ),
-            key_hint: Some("Planning/Intake helpers can set workflow_state = ready".to_string()),
+            key_hint: Some("Planning/Intake helpers can set state = ready".to_string()),
+            blocked_reason: None,
+        },
+        TicketWorkflowState::Closed => DerivedTicketState {
+            kind: PanelRowKind::Review,
+            priority: ActionPriority::Background,
+            action: Some(NextUserAction::Wait),
+            disabled_reason: Some("Ticket is closed.".to_string()),
+            key_hint: None,
             blocked_reason: None,
         },
     }
@@ -792,7 +775,6 @@ fn related_pods_for_ticket(
     pods: &PodList,
     registry: &PanelRegistrySnapshot,
 ) -> Vec<String> {
-    let slug = lowercase(&summary.slug);
     let id = lowercase(&summary.id);
     let mut names = Vec::new();
     if let Some(claim) = registry.claim_for_ticket(&summary.id) {
@@ -800,7 +782,7 @@ fn related_pods_for_ticket(
     }
     for pod in pods.entries.iter().filter_map(|pod| {
         let name = lowercase(&pod.name);
-        if (!slug.is_empty() && name.contains(&slug)) || (!id.is_empty() && name.contains(&id)) {
+        if !id.is_empty() && name.contains(&id) {
             Some(pod.name.clone())
         } else {
             None
@@ -844,11 +826,7 @@ pub(crate) fn local_claim_status_for_pod(pod_name: &str, pods: &PodList) -> Tick
 }
 
 fn ticket_subtitle(entry: &TicketPanelEntry) -> Option<String> {
-    let mut parts = vec![format!(
-        "{} · {}",
-        entry.slug,
-        entry.workflow_state.as_str()
-    )];
+    let mut parts = vec![format!("{} · {}", entry.id, entry.workflow_state.as_str())];
     if let Some(reason) = entry.attention_required.as_deref() {
         parts.push(format!("attention: {reason}"));
     }
@@ -960,10 +938,6 @@ fn lowercase(value: &str) -> String {
 }
 
 #[allow(dead_code)]
-fn _status_label(status: &ExtensibleTicketStatus) -> &str {
-    status.as_str()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -986,11 +960,9 @@ mod tests {
     fn create_ticket(
         backend: &LocalTicketBackend,
         title: &str,
-        slug: &str,
         configure: impl FnOnce(&mut NewTicket),
     ) {
         let mut input = NewTicket::new(title);
-        input.slug = Some(slug.to_string());
         configure(&mut input);
         backend.create(input).unwrap();
     }
@@ -1029,14 +1001,9 @@ mod tests {
     fn workspace_panel_without_ticket_config_is_pod_only() {
         let temp = TempDir::new().unwrap();
         let backend = LocalTicketBackend::new(temp.path().join(".yoi/tickets"));
-        create_ticket(
-            &backend,
-            "Hidden Without Config",
-            "hidden-without-config",
-            |input| {
-                input.action_required = Some("answer me".to_string());
-            },
-        );
+        create_ticket(&backend, "Hidden Without Config", |input| {
+            input.action_required = Some("answer me".to_string());
+        });
 
         let model = build_workspace_panel(temp.path(), &live_pods(&["idle"]));
 
@@ -1055,10 +1022,10 @@ mod tests {
         let temp = TempDir::new().unwrap();
         write_ticket_config(temp.path());
         let backend = LocalTicketBackend::new(temp.path().join(".yoi/tickets"));
-        create_ticket(&backend, "Ready Ticket", "ready-ticket", |input| {
+        create_ticket(&backend, "Ready Ticket", |input| {
             input.workflow_state = Some(TicketWorkflowState::Ready);
         });
-        create_ticket(&backend, "Needs User", "needs-user", |input| {
+        create_ticket(&backend, "Needs User", |input| {
             input.workflow_state = Some(TicketWorkflowState::Ready);
             input.attention_required = Some("answer clarification".to_string());
         });
@@ -1092,22 +1059,15 @@ mod tests {
     }
 
     #[test]
-    fn workspace_panel_does_not_infer_workflow_state_from_labels_readiness_or_thread() {
+    fn workspace_panel_does_not_infer_workflow_state_from_readiness_or_title() {
         let temp = TempDir::new().unwrap();
         write_ticket_config(temp.path());
         let backend = LocalTicketBackend::new(temp.path().join(".yoi/tickets"));
-        create_ticket(
-            &backend,
-            "Readiness Heuristic",
-            "readiness-heuristic",
-            |input| {
-                input.readiness = Some("implementation-ready".to_string());
-            },
-        );
-        create_ticket(&backend, "Label Heuristic", "label-heuristic", |input| {
-            input.labels = vec!["spike".to_string(), "intake".to_string()];
+        create_ticket(&backend, "Readiness Heuristic", |input| {
+            input.readiness = Some("implementation-ready".to_string());
         });
-        create_ticket(&backend, "Queued Explicit", "queued-explicit", |input| {
+        create_ticket(&backend, "Queued Words Are Not State", |_| {});
+        create_ticket(&backend, "Queued Explicit", |input| {
             input.workflow_state = Some(TicketWorkflowState::Queued);
         });
 
@@ -1117,10 +1077,10 @@ mod tests {
             .iter()
             .find(|row| row.title == "Readiness Heuristic")
             .unwrap();
-        let label = model
+        let title = model
             .rows
             .iter()
-            .find(|row| row.title == "Label Heuristic")
+            .find(|row| row.title == "Queued Words Are Not State")
             .unwrap();
         let queued = model
             .rows
@@ -1128,11 +1088,20 @@ mod tests {
             .find(|row| row.title == "Queued Explicit")
             .unwrap();
 
-        assert_eq!(readiness.status, "planning");
+        assert_eq!(
+            readiness.ticket.as_ref().unwrap().workflow_state,
+            TicketWorkflowState::Planning
+        );
         assert_eq!(readiness.next_action, Some(NextUserAction::Clarify));
-        assert_eq!(label.status, "planning");
-        assert_eq!(label.next_action, Some(NextUserAction::Clarify));
-        assert_eq!(queued.status, "queued");
+        assert_eq!(
+            title.ticket.as_ref().unwrap().workflow_state,
+            TicketWorkflowState::Planning
+        );
+        assert_eq!(title.next_action, Some(NextUserAction::Clarify));
+        assert_eq!(
+            queued.ticket.as_ref().unwrap().workflow_state,
+            TicketWorkflowState::Queued
+        );
         assert_eq!(queued.next_action, Some(NextUserAction::Wait));
     }
 
@@ -1144,22 +1113,21 @@ mod tests {
         let ticket_ref = backend
             .create({
                 let mut input = NewTicket::new("Null Attention Planning");
-                input.slug = Some("null-attention-intake".to_string());
                 input.workflow_state = Some(TicketWorkflowState::Planning);
                 input
             })
             .unwrap();
         let item_path = temp
             .path()
-            .join(".yoi/tickets/open")
+            .join(".yoi/tickets")
             .join(&ticket_ref.id)
             .join("item.md");
         let item = fs::read_to_string(&item_path).unwrap();
         fs::write(
             &item_path,
             item.replace(
-                "workflow_state: planning\ncreated_at:",
-                "workflow_state: planning\nattention_required: null\ncreated_at:",
+                "state: planning\ncreated_at:",
+                "state: planning\nattention_required: null\ncreated_at:",
             ),
         )
         .unwrap();
@@ -1181,8 +1149,8 @@ mod tests {
         let temp = TempDir::new().unwrap();
         write_ticket_config(temp.path());
         let backend = LocalTicketBackend::new(temp.path().join(".yoi/tickets"));
-        create_ticket(&backend, "Plain Backlog", "plain-backlog", |_| {});
-        create_ticket(&backend, "Done Explicit", "done-explicit", |input| {
+        create_ticket(&backend, "Plain Backlog", |_| {});
+        create_ticket(&backend, "Done Explicit", |input| {
             input.workflow_state = Some(TicketWorkflowState::Done);
         });
 
@@ -1210,7 +1178,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         write_ticket_config(temp.path());
         let backend = LocalTicketBackend::new(temp.path().join(".yoi/tickets"));
-        create_ticket(&backend, "Claimed Planning", "claimed-intake", |_| {});
+        create_ticket(&backend, "Claimed Planning", |_| {});
         let summary = backend.list(TicketFilter::all()).unwrap().remove(0);
         let store = PanelRegistryStore::from_root(temp.path().join("local-registry"));
         store
