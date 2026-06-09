@@ -21,6 +21,7 @@ User request / conversation
 ```
 
 - `Ticket` は durable orchestration record。
+- `Objective` は medium-term goal / motivation / strategy / success criteria / decision context の project record。Objective context は判断背景であり、Ticket body/thread/artifacts を読む代替ではない。
 - `Task` は session-local progress tracking。
 - `Assignment` は Orchestrator から coder / reviewer Pod、または task-specific helper Pod への具体的委譲。
 - `IntentPacket` は Ticket から抽出して Assignment に渡す短い実装・レビュー契約。
@@ -39,6 +40,7 @@ Intake は以下を行う。
 - 不足している要件を質問する。
 - 作成または refinement する Ticket が、実装・レビュー・検証・完了判断を単独で行える concrete work item であるか確認する。
 - 広い依頼を分割する場合は、進捗コンテナとしての umbrella Ticket ではなく、concrete Ticket / Objective context / split decision record に責務を分ける。
+- Objective-to-Ticket links を提案する場合は canonical opaque Ticket ID だけを使い、dependency / blocking / ordering relation として扱わない。
 - Ticket の title / body/request snapshot / acceptance criteria / priority / readiness / action_required / attention_required を、現在の要件として意味がある範囲で提案する。
 - canonical ID は Ticket 作成/storage が opaque な path-derived value として割り当てるため、Intake はユーザー向け metadata として提案しない。
 - background / requirements / acceptance criteria / escalation conditions を整理する。

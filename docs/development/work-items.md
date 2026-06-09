@@ -9,7 +9,7 @@ Do not treat ad-hoc chat summaries, memory records, or Pod notifications as the 
 ## Concepts
 
 - `Ticket`: durable project/orchestration record. It contains requirements, decisions, plans, implementation reports, reviews, artifacts, and resolution history.
-- `Objective`: medium-term goal, motivation, strategy, and success-criteria context. Objective records are a policy concept here; this document does not define their storage/schema.
+- `Objective`: first-class medium-term goal record. It stores goal, motivation/background, strategy/design direction, success criteria/exit conditions, decision context, current Objective lifecycle, and canonical Ticket links under `.yoi/objectives/<objective-id>/item.md`. Objective context is judgment/background context; it is not implementation authority and does not replace reading each Ticket body/thread/artifacts.
 - `Task`: session-local progress tracking inside a Pod. It is not the project record.
 - `Assignment`: a concrete delegation from an Orchestrator to a coder/reviewer Pod or task-specific helper Pod.
 - `IntentPacket`: the short implementation/review contract derived from a Ticket and handed to an Assignment.
@@ -23,6 +23,7 @@ A Ticket may represent a feature, bug, cleanup, design decision, investigation, 
 Use the highest-level interface that matches the work:
 
 - Use `yoi panel` for the Ticket/Intake/Orchestrator workspace UI and role-launch actions.
+- Use `yoi objective ...` for lightweight medium-term Objective records and their non-blocking canonical Ticket links.
 - Inside Pods, use typed Ticket tools to create, inspect, comment, review, and close Tickets.
 - For multi-step work, follow the Ticket Intake, Orchestrator Routing, planning/requirements-sync, and Multi-agent workflows.
 
@@ -55,6 +56,54 @@ Use them when a Pod needs to materialize or update project records:
 - Maintainer closes a Ticket with a resolution when merge/validation/cleanup evidence is complete.
 
 Do not bypass workflow gates just because Ticket tools are available. Ticket mutation is a project-record operation and should remain auditable.
+
+## Objective records
+
+Objectives are lightweight medium-term project records, not Tickets, Ticket relations, OrchestrationPlan execution records, or Pod/session claims. Use them when a goal spans several concrete Tickets and the durable motivation, design direction, success criteria, or decision context would otherwise be repeated or lost.
+
+The local Objective surface stores records under:
+
+```text
+.yoi/objectives/<objective-id>
+  item.md
+```
+
+`<objective-id>` is the canonical opaque path-derived id. Do not treat Objective titles or slug words as link authority.
+
+`item.md` uses YAML frontmatter plus Markdown body:
+
+```yaml
+---
+title: "Improve orchestration evidence"
+state: "active"        # active|paused|done|archived
+created_at: "2026-06-09T00:00:00Z"
+updated_at: "2026-06-09T00:00:00Z"
+linked_tickets: ["20260608-125430-001"]
+---
+```
+
+The Markdown body should include these sections:
+
+- `## Goal`
+- `## Motivation / background`
+- `## Strategy / design direction`
+- `## Success criteria / exit conditions`
+- `## Decision context`
+
+Linked Tickets must be canonical opaque Ticket ids that exist in the configured Ticket backend root. Objective-to-Ticket links are context links only: they are not dependency, blocking, ordering, ownership, or scheduling relations. Use typed Ticket relations for Ticket-to-Ticket dependency/blocking/related metadata, OrchestrationPlan records for routing/execution plans, and Pod/session claims for runtime ownership hints.
+
+Objective lifecycle is only Objective lifecycle. `active`, `paused`, `done`, and `archived` do not drive Ticket `state`, do not authorize implementation, and do not close linked Tickets. A role reading Objective context must still inspect each Ticket body, thread, artifacts, explicit Ticket relations, and OrchestrationPlan records before acting.
+
+The maintainer CLI is:
+
+```sh
+yoi objective create --title "..." [--ticket <ticket-id> ...]
+yoi objective list [--state active|paused|done|archived|all]
+yoi objective show <objective-id>
+yoi objective doctor
+```
+
+The first version intentionally does not implement roadmap scheduling, milestones, OKRs, graph solving, Objective-mandatory Ticket creation, Objective thread/artifact history, or broad panel UX. Future UX can surface Objective context around Tickets as long as it remains background context and never substitutes for reading the Ticket.
 
 ## Ticket configuration
 
