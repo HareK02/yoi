@@ -1535,7 +1535,10 @@ mod tests {
         ));
         backend.create(ticket).unwrap();
 
-        let listed = list.execute(&json!({}).to_string()).await.unwrap();
+        let listed = list
+            .execute(&json!({}).to_string(), Default::default())
+            .await
+            .unwrap();
         let listed_json: Value = serde_json::from_str(&listed.content.unwrap()).unwrap();
         let title = listed_json["tickets"][0]["title"].as_str().unwrap();
         assert!(title.chars().count() <= LIST_TITLE_MAX_CHARS);
@@ -1556,7 +1559,10 @@ mod tests {
                 .unwrap();
         }
 
-        let default_list = list.execute(&json!({}).to_string()).await.unwrap();
+        let default_list = list
+            .execute(&json!({}).to_string(), Default::default())
+            .await
+            .unwrap();
         let default_json: Value = serde_json::from_str(&default_list.content.unwrap()).unwrap();
         assert_eq!(
             default_json["count"].as_u64(),
@@ -1577,7 +1583,10 @@ mod tests {
         );
 
         let high_limit = list
-            .execute(&json!({ "limit": MAX_LIST_LIMIT + 500 }).to_string())
+            .execute(
+                &json!({ "limit": MAX_LIST_LIMIT + 500 }).to_string(),
+                Default::default(),
+            )
             .await
             .unwrap();
         let high_json: Value = serde_json::from_str(&high_limit.content.unwrap()).unwrap();
@@ -1607,7 +1616,7 @@ mod tests {
         }
 
         let all = list
-            .execute(&json!({ "state": "all" }).to_string())
+            .execute(&json!({ "state": "all" }).to_string(), Default::default())
             .await
             .unwrap();
         let all_json: Value = serde_json::from_str(&all.content.unwrap()).unwrap();
@@ -1619,7 +1628,10 @@ mod tests {
         assert_eq!(all_json["truncated"].as_bool(), Some(true));
 
         let closed = list
-            .execute(&json!({ "state": "closed" }).to_string())
+            .execute(
+                &json!({ "state": "closed" }).to_string(),
+                Default::default(),
+            )
             .await
             .unwrap();
         let closed_json: Value = serde_json::from_str(&closed.content.unwrap()).unwrap();
@@ -1671,12 +1683,16 @@ mod tests {
                     "resolution": format!("Resolution {resolution_secret}")
                 })
                 .to_string(),
+                Default::default(),
             )
             .await
             .unwrap();
 
         let listed = list
-            .execute(&json!({ "state": "closed" }).to_string())
+            .execute(
+                &json!({ "state": "closed" }).to_string(),
+                Default::default(),
+            )
             .await
             .unwrap();
         let listed_content = listed.content.unwrap();
