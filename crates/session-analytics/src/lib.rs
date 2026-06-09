@@ -6,7 +6,7 @@
 //! diagnostics; raw user messages, tool arguments, and tool output snippets are
 //! not emitted.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -21,6 +21,8 @@ const LARGE_RESULT_BYTES: usize = 16 * 1024;
 const LARGE_RESULT_LINES: usize = 200;
 const LARGE_READ_LINES: usize = 1_000;
 const LARGE_GREP_HEAD_LIMIT: u64 = 250;
+const TOP_TOOL_CALL_RESPONSES_LIMIT: usize = 20;
+const MAX_EDIT_ROUND_TRIP_OBSERVATIONS: usize = 100;
 
 #[derive(Debug, Error)]
 pub enum AnalyzeError {
@@ -42,6 +44,7 @@ pub struct SessionReport {
     pub input: InputSummary,
     pub entries: EntrySummary,
     pub tool_usage: ToolUsageSummary,
+    pub response_batches: ResponseBatchingSummary,
     pub file_reads: FileReadSummary,
     pub edits: EditWriteSummary,
     pub tool_results: ToolResultSizeSummary,
@@ -87,6 +90,122 @@ pub struct ToolUsageObservation {
     pub turn_index: u64,
     pub tool_name: String,
     pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResponseBatchingSummary {
+    pub total_responses: u64,
+    pub tool_call_responses: u64,
+    pub total_tool_calls: u64,
+    pub tools_per_response: ToolCountDistribution,
+    pub tools_per_response_histogram: Vec<ToolCountHistogramBucket>,
+    pub top_tool_call_responses: Vec<ResponseToolCallCount>,
+    pub edit_batches: EditBatchingSummary,
+    pub edit_round_trips: EditRoundTripSummary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolCountDistribution {
+    pub avg_milli: u64,
+    pub p50: u64,
+    pub p90: u64,
+    pub max: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolCountHistogramBucket {
+    pub tool_call_count: u64,
+    pub response_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResponseToolCallCount {
+    pub response_index: u64,
+    pub turn_index: u64,
+    pub start_line: u64,
+    pub end_line: u64,
+    pub tool_call_count: u64,
+    pub edit_call_count: u64,
+    pub tool_counts_by_name: BTreeMap<String, u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EditBatchingSummary {
+    pub responses_containing_edit: u64,
+    pub total_edit_calls: u64,
+    pub edit_calls_per_response: Vec<ResponseEditCallCount>,
+    pub edit_calls_per_edit_response: ToolCountDistribution,
+    pub same_file_multi_edit_responses: Vec<SameFileMultiEditResponse>,
+    pub files_touched_per_edit_response: Vec<FilesTouchedPerEditResponse>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResponseEditCallCount {
+    pub response_index: u64,
+    pub turn_index: u64,
+    pub start_line: u64,
+    pub end_line: u64,
+    pub edit_call_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SameFileMultiEditResponse {
+    pub response_index: u64,
+    pub turn_index: u64,
+    pub start_line: u64,
+    pub end_line: u64,
+    pub path: String,
+    pub edit_call_count: u64,
+    pub old_string_bytes_total: u64,
+    pub new_string_bytes_total: u64,
+    pub large_argument_fields: Vec<String>,
+    pub replace_all_count: u64,
+    pub observation: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FilesTouchedPerEditResponse {
+    pub response_index: u64,
+    pub turn_index: u64,
+    pub start_line: u64,
+    pub end_line: u64,
+    pub edit_call_count: u64,
+    pub file_count: u64,
+    pub paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EditRoundTripSummary {
+    pub pure_edit_only_streaks: Vec<EditOnlyStreak>,
+    pub interrupted_or_annotated_sequences: Vec<InterruptedEditSequence>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EditOnlyStreak {
+    pub file_path: String,
+    pub response_start_index: u64,
+    pub response_end_index: u64,
+    pub start_line: u64,
+    pub end_line: u64,
+    pub streak_length: u64,
+    pub edit_call_count: u64,
+    pub observation: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InterruptedEditSequence {
+    pub file_path: String,
+    pub before_response_index: u64,
+    pub after_response_index: u64,
+    pub break_response_start_index: u64,
+    pub break_response_end_index: u64,
+    pub start_line: u64,
+    pub end_line: u64,
+    pub break_tool_names: Vec<String>,
+    pub break_contains_read: bool,
+    pub break_contains_bash: bool,
+    pub break_contains_test_like_bash: bool,
+    pub observation: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -224,6 +343,25 @@ struct ToolCallRecord {
 }
 
 #[derive(Debug, Clone)]
+struct ResponseToolCallRecord {
+    name: String,
+    path: Option<String>,
+    old_string_bytes: Option<u64>,
+    new_string_bytes: Option<u64>,
+    replace_all: bool,
+    test_like_bash: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ResponseRecord {
+    response_index: u64,
+    turn_index: u64,
+    start_line: u64,
+    end_line: u64,
+    tool_calls: Vec<ResponseToolCallRecord>,
+}
+
+#[derive(Debug, Clone)]
 struct ReadRecord {
     offset: Option<u64>,
     limit: Option<u64>,
@@ -290,6 +428,8 @@ struct Analyzer {
     context_seq: u64,
     last_context_event: Option<ContextLifecycleEvent>,
     repeated_tool_after_context: Vec<ContextCorrelationObservation>,
+    current_response: Option<ResponseRecord>,
+    responses: Vec<ResponseRecord>,
 }
 
 impl Analyzer {
@@ -350,6 +490,8 @@ impl Analyzer {
             context_seq: 0,
             last_context_event: None,
             repeated_tool_after_context: Vec::new(),
+            current_response: None,
+            responses: Vec::new(),
         }
     }
 
@@ -379,6 +521,7 @@ impl Analyzer {
 
     fn consume_entry(&mut self, line: u64, value: &Value) {
         let Some(kind) = value.get("kind").and_then(Value::as_str) else {
+            self.finish_current_response();
             self.unknown_entries += 1;
             self.add_diagnostic(
                 Some(line),
@@ -388,12 +531,26 @@ impl Analyzer {
             return;
         };
 
+        if kind != "assistant_item" {
+            self.finish_current_response();
+        }
+
         match kind {
             "segment_start" => {
                 if value.get("compacted_from").is_some_and(|v| !v.is_null()) {
                     self.record_context_event(line, "segment_compacted_from");
                 }
                 if let Some(history) = value.get("history").and_then(Value::as_array) {
+                    if history
+                        .iter()
+                        .any(|item| item.get("kind").and_then(Value::as_str) == Some("tool_call"))
+                    {
+                        self.add_diagnostic(
+                            Some(line),
+                            "response_boundary_approximation",
+                            "segment_start.history contains tool calls; response-level metrics exclude seeded history because exact assistant response boundaries are not explicit",
+                        );
+                    }
                     for item in history {
                         self.consume_history_item(line, item, true);
                     }
@@ -401,6 +558,7 @@ impl Analyzer {
             }
             "assistant_item" => {
                 if let Some(item) = value.get("item") {
+                    self.begin_or_continue_response(line);
                     self.consume_history_item(line, item, false);
                 } else {
                     self.add_diagnostic(Some(line), "unknown_entry", "assistant_item lacks `item`");
@@ -434,6 +592,66 @@ impl Analyzer {
                     format!("unknown session entry kind `{other}`"),
                 );
             }
+        }
+    }
+
+    fn begin_or_continue_response(&mut self, line: u64) {
+        if let Some(response) = self.current_response.as_mut() {
+            response.end_line = line;
+            return;
+        }
+        self.current_response = Some(ResponseRecord {
+            response_index: self.responses.len() as u64,
+            turn_index: self.current_turn,
+            start_line: line,
+            end_line: line,
+            tool_calls: Vec::new(),
+        });
+    }
+
+    fn finish_current_response(&mut self) {
+        if let Some(response) = self.current_response.take() {
+            self.responses.push(response);
+        }
+    }
+
+    fn record_response_tool_call(&mut self, line: u64, name: &str, args: Option<&Value>) {
+        let path = args.and_then(path_arg).map(str::to_owned);
+        let old_string_bytes = args
+            .and_then(|args| args.get("old_string"))
+            .and_then(Value::as_str)
+            .map(|text| byte_len(text) as u64);
+        let new_string_bytes = args
+            .and_then(|args| args.get("new_string"))
+            .and_then(Value::as_str)
+            .map(|text| byte_len(text) as u64);
+        let replace_all = args
+            .and_then(|args| args.get("replace_all"))
+            .and_then(Value::as_bool)
+            == Some(true);
+        let test_like_bash = name == "Bash"
+            && args
+                .and_then(|args| args.get("command"))
+                .and_then(Value::as_str)
+                .is_some_and(bash_command_looks_like_test);
+        if self.current_response.is_none() {
+            self.add_diagnostic(
+                Some(line),
+                "response_boundary_approximation",
+                "top-level tool_call was observed without an open assistant response; created a synthetic response boundary",
+            );
+            self.begin_or_continue_response(line);
+        }
+        if let Some(response) = self.current_response.as_mut() {
+            response.end_line = line;
+            response.tool_calls.push(ResponseToolCallRecord {
+                name: name.to_string(),
+                path,
+                old_string_bytes,
+                new_string_bytes,
+                replace_all,
+                test_like_bash,
+            });
         }
     }
 
@@ -518,6 +736,9 @@ impl Analyzer {
             });
         }
 
+        if !seeded_history {
+            self.record_response_tool_call(line, name, args_value.as_ref());
+        }
         self.consume_tool_specific_call(line, name, args_value.as_ref());
     }
 
@@ -812,7 +1033,9 @@ impl Analyzer {
         }
     }
 
-    fn finish(self) -> SessionReport {
+    fn finish(mut self) -> SessionReport {
+        self.finish_current_response();
+        let response_batches = build_response_batching_summary(&self.responses);
         let (repeated_by_path, repeated_read_context) =
             build_repeated_by_path(&self.read_stats_by_path);
         let repeated_by_range = build_repeated_by_range(&self.read_stats_by_range);
@@ -855,6 +1078,7 @@ impl Analyzer {
                 calls_per_turn,
                 observations: self.tool_usage_observations,
             },
+            response_batches,
             file_reads: FileReadSummary {
                 total_read_calls: self.total_read_calls,
                 repeated_by_path,
@@ -881,6 +1105,383 @@ impl Analyzer {
             diagnostics: self.diagnostics,
         }
     }
+}
+
+fn build_response_batching_summary(responses: &[ResponseRecord]) -> ResponseBatchingSummary {
+    let tool_counts = responses
+        .iter()
+        .map(|response| response.tool_calls.len() as u64)
+        .collect::<Vec<_>>();
+    let total_tool_calls = tool_counts.iter().sum::<u64>();
+    let mut histogram = BTreeMap::<u64, u64>::new();
+    for count in &tool_counts {
+        *histogram.entry(*count).or_default() += 1;
+    }
+    let tools_per_response_histogram = histogram
+        .into_iter()
+        .map(
+            |(tool_call_count, response_count)| ToolCountHistogramBucket {
+                tool_call_count,
+                response_count,
+            },
+        )
+        .collect();
+    let mut top_tool_call_responses = responses
+        .iter()
+        .filter(|response| !response.tool_calls.is_empty())
+        .map(response_tool_call_count)
+        .collect::<Vec<_>>();
+    top_tool_call_responses.sort_by(|left, right| {
+        right
+            .tool_call_count
+            .cmp(&left.tool_call_count)
+            .then_with(|| left.start_line.cmp(&right.start_line))
+    });
+    top_tool_call_responses.truncate(TOP_TOOL_CALL_RESPONSES_LIMIT);
+
+    ResponseBatchingSummary {
+        total_responses: responses.len() as u64,
+        tool_call_responses: tool_counts.iter().filter(|count| **count > 0).count() as u64,
+        total_tool_calls,
+        tools_per_response: distribution(&tool_counts),
+        tools_per_response_histogram,
+        top_tool_call_responses,
+        edit_batches: build_edit_batching_summary(responses),
+        edit_round_trips: build_edit_round_trip_summary(responses),
+    }
+}
+
+fn response_tool_call_count(response: &ResponseRecord) -> ResponseToolCallCount {
+    let mut tool_counts_by_name = BTreeMap::new();
+    let mut edit_call_count = 0_u64;
+    for call in &response.tool_calls {
+        *tool_counts_by_name.entry(call.name.clone()).or_default() += 1;
+        if call.name == "Edit" {
+            edit_call_count += 1;
+        }
+    }
+    ResponseToolCallCount {
+        response_index: response.response_index,
+        turn_index: response.turn_index,
+        start_line: response.start_line,
+        end_line: response.end_line,
+        tool_call_count: response.tool_calls.len() as u64,
+        edit_call_count,
+        tool_counts_by_name,
+    }
+}
+
+fn build_edit_batching_summary(responses: &[ResponseRecord]) -> EditBatchingSummary {
+    let mut edit_counts_per_response = Vec::new();
+    let mut edit_counts_for_edit_responses = Vec::new();
+    let mut same_file_multi_edit_responses = Vec::new();
+    let mut files_touched_per_edit_response = Vec::new();
+    let mut total_edit_calls = 0_u64;
+
+    for response in responses {
+        let edit_calls = response
+            .tool_calls
+            .iter()
+            .filter(|call| call.name == "Edit")
+            .collect::<Vec<_>>();
+        let edit_call_count = edit_calls.len() as u64;
+        total_edit_calls += edit_call_count;
+        edit_counts_per_response.push(ResponseEditCallCount {
+            response_index: response.response_index,
+            turn_index: response.turn_index,
+            start_line: response.start_line,
+            end_line: response.end_line,
+            edit_call_count,
+        });
+        if edit_calls.is_empty() {
+            continue;
+        }
+        edit_counts_for_edit_responses.push(edit_call_count);
+
+        let paths = edit_calls
+            .iter()
+            .filter_map(|call| call.path.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let file_count = paths.len() as u64;
+        files_touched_per_edit_response.push(FilesTouchedPerEditResponse {
+            response_index: response.response_index,
+            turn_index: response.turn_index,
+            start_line: response.start_line,
+            end_line: response.end_line,
+            edit_call_count,
+            file_count,
+            paths: paths.clone(),
+        });
+
+        let mut by_path: BTreeMap<String, Vec<&ResponseToolCallRecord>> = BTreeMap::new();
+        for call in &edit_calls {
+            if let Some(path) = &call.path {
+                by_path.entry(path.clone()).or_default().push(call);
+            }
+        }
+        for (path, calls) in by_path {
+            if calls.len() < 2 {
+                continue;
+            }
+            let mut large_argument_fields = BTreeSet::new();
+            let mut old_string_bytes_total = 0_u64;
+            let mut new_string_bytes_total = 0_u64;
+            let mut replace_all_count = 0_u64;
+            let same_file_edit_call_count = calls.len() as u64;
+            for call in calls {
+                if let Some(bytes) = call.old_string_bytes {
+                    old_string_bytes_total += bytes;
+                    if bytes > LARGE_EDIT_ARGUMENT_BYTES as u64 {
+                        large_argument_fields.insert("old_string".to_string());
+                    }
+                }
+                if let Some(bytes) = call.new_string_bytes {
+                    new_string_bytes_total += bytes;
+                    if bytes > LARGE_EDIT_ARGUMENT_BYTES as u64 {
+                        large_argument_fields.insert("new_string".to_string());
+                    }
+                }
+                if call.replace_all {
+                    replace_all_count += 1;
+                }
+            }
+            same_file_multi_edit_responses.push(SameFileMultiEditResponse {
+                response_index: response.response_index,
+                turn_index: response.turn_index,
+                start_line: response.start_line,
+                end_line: response.end_line,
+                path,
+                edit_call_count: same_file_edit_call_count,
+                old_string_bytes_total,
+                new_string_bytes_total,
+                large_argument_fields: large_argument_fields.into_iter().collect(),
+                replace_all_count,
+                observation: "possible batching opportunity: multiple Edit calls in one assistant response touched the same file; arguments are summarized without raw content".to_string(),
+            });
+        }
+    }
+
+    EditBatchingSummary {
+        responses_containing_edit: edit_counts_for_edit_responses.len() as u64,
+        total_edit_calls,
+        edit_calls_per_response: edit_counts_per_response,
+        edit_calls_per_edit_response: distribution(&edit_counts_for_edit_responses),
+        same_file_multi_edit_responses,
+        files_touched_per_edit_response,
+    }
+}
+
+fn build_edit_round_trip_summary(responses: &[ResponseRecord]) -> EditRoundTripSummary {
+    let mut pure_edit_only_streaks = Vec::new();
+    let mut current_file: Option<String> = None;
+    let mut current_responses: Vec<&ResponseRecord> = Vec::new();
+
+    for response in responses {
+        if let Some(path) = edit_only_single_file(response) {
+            if current_file.as_deref() == Some(path) {
+                current_responses.push(response);
+            } else {
+                flush_edit_streak(
+                    &mut pure_edit_only_streaks,
+                    &current_file,
+                    &current_responses,
+                );
+                current_file = Some(path.to_string());
+                current_responses = vec![response];
+            }
+        } else {
+            flush_edit_streak(
+                &mut pure_edit_only_streaks,
+                &current_file,
+                &current_responses,
+            );
+            current_file = None;
+            current_responses.clear();
+        }
+    }
+    flush_edit_streak(
+        &mut pure_edit_only_streaks,
+        &current_file,
+        &current_responses,
+    );
+    pure_edit_only_streaks.truncate(MAX_EDIT_ROUND_TRIP_OBSERVATIONS);
+
+    EditRoundTripSummary {
+        pure_edit_only_streaks,
+        interrupted_or_annotated_sequences: build_interrupted_edit_sequences(responses),
+    }
+}
+
+fn flush_edit_streak(
+    streaks: &mut Vec<EditOnlyStreak>,
+    file: &Option<String>,
+    responses: &[&ResponseRecord],
+) {
+    if responses.len() < 2 {
+        return;
+    }
+    let Some(file_path) = file else {
+        return;
+    };
+    let first = responses.first().expect("non-empty responses");
+    let last = responses.last().expect("non-empty responses");
+    let edit_call_count = responses
+        .iter()
+        .map(|response| response.tool_calls.len() as u64)
+        .sum();
+    streaks.push(EditOnlyStreak {
+        file_path: file_path.clone(),
+        response_start_index: first.response_index,
+        response_end_index: last.response_index,
+        start_line: first.start_line,
+        end_line: last.end_line,
+        streak_length: responses.len() as u64,
+        edit_call_count,
+        observation: "possible batching opportunity: consecutive edit-only assistant responses touched the same file; inspect whether edits were independent before changing behavior".to_string(),
+    });
+}
+
+fn build_interrupted_edit_sequences(responses: &[ResponseRecord]) -> Vec<InterruptedEditSequence> {
+    let mut observations = Vec::new();
+    for start_index in 0..responses.len() {
+        if observations.len() >= MAX_EDIT_ROUND_TRIP_OBSERVATIONS {
+            break;
+        }
+        let Some(file_path) = edit_only_single_file(&responses[start_index]) else {
+            continue;
+        };
+        let mut break_index = start_index + 1;
+        let mut break_responses = Vec::new();
+        while break_index < responses.len() {
+            if let Some(next_file_path) = edit_only_single_file(&responses[break_index]) {
+                if next_file_path == file_path && !break_responses.is_empty() {
+                    observations.push(interrupted_edit_sequence(
+                        file_path,
+                        &responses[start_index],
+                        &responses[break_index],
+                        &break_responses,
+                    ));
+                }
+                break;
+            }
+            if responses[break_index].tool_calls.is_empty() {
+                break;
+            }
+            break_responses.push(&responses[break_index]);
+            break_index += 1;
+        }
+    }
+    observations
+}
+
+fn interrupted_edit_sequence(
+    file_path: &str,
+    before: &ResponseRecord,
+    after: &ResponseRecord,
+    break_responses: &[&ResponseRecord],
+) -> InterruptedEditSequence {
+    let mut break_tool_names = BTreeSet::new();
+    let mut break_contains_read = false;
+    let mut break_contains_bash = false;
+    let mut break_contains_test_like_bash = false;
+    for response in break_responses {
+        for call in &response.tool_calls {
+            break_tool_names.insert(call.name.clone());
+            if call.name == "Read" {
+                break_contains_read = true;
+            }
+            if call.name == "Bash" {
+                break_contains_bash = true;
+            }
+            if call.test_like_bash {
+                break_contains_test_like_bash = true;
+            }
+        }
+    }
+    let first_break = break_responses.first().expect("non-empty break responses");
+    let last_break = break_responses.last().expect("non-empty break responses");
+    InterruptedEditSequence {
+        file_path: file_path.to_string(),
+        before_response_index: before.response_index,
+        after_response_index: after.response_index,
+        break_response_start_index: first_break.response_index,
+        break_response_end_index: last_break.response_index,
+        start_line: before.start_line,
+        end_line: after.end_line,
+        break_tool_names: break_tool_names.into_iter().collect(),
+        break_contains_read,
+        break_contains_bash,
+        break_contains_test_like_bash,
+        observation: "edit-only responses to the same file were separated by Read/Bash/test-like tool use; treat as an annotated sequence rather than automatic blame".to_string(),
+    }
+}
+
+fn edit_only_single_file(response: &ResponseRecord) -> Option<&str> {
+    if response.tool_calls.is_empty() || response.tool_calls.iter().any(|call| call.name != "Edit")
+    {
+        return None;
+    }
+    let mut path = None;
+    for call in &response.tool_calls {
+        let call_path = call.path.as_deref()?;
+        if let Some(existing) = path {
+            if existing != call_path {
+                return None;
+            }
+        } else {
+            path = Some(call_path);
+        }
+    }
+    path
+}
+
+fn distribution(values: &[u64]) -> ToolCountDistribution {
+    if values.is_empty() {
+        return ToolCountDistribution {
+            avg_milli: 0,
+            p50: 0,
+            p90: 0,
+            max: 0,
+        };
+    }
+    let total = values.iter().sum::<u64>();
+    ToolCountDistribution {
+        avg_milli: ((total * 1000) + (values.len() as u64 / 2)) / values.len() as u64,
+        p50: percentile(values, 50),
+        p90: percentile(values, 90),
+        max: values.iter().copied().max().unwrap_or(0),
+    }
+}
+
+fn percentile(values: &[u64], percentile: u64) -> u64 {
+    if values.is_empty() {
+        return 0;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    let len = sorted.len() as u64;
+    let rank = ((len * percentile).saturating_add(99) / 100).max(1);
+    sorted[(rank - 1) as usize]
+}
+
+fn bash_command_looks_like_test(command: &str) -> bool {
+    let lowered = command.to_ascii_lowercase();
+    [
+        "cargo test",
+        "cargo nextest",
+        "nix build",
+        "nix flake check",
+        "npm test",
+        "pnpm test",
+        "yarn test",
+        "pytest",
+        "go test",
+        "swift test",
+    ]
+    .iter()
+    .any(|needle| lowered.contains(needle))
 }
 
 fn build_repeated_by_path(
@@ -1267,6 +1868,222 @@ mod tests {
             report.tool_usage.observations[0]
                 .detail
                 .contains("observation")
+        );
+    }
+    #[test]
+    fn response_metrics_group_multiple_tools_in_one_assistant_response() {
+        let fixture = write_fixture(&[
+            tool_call("r1", "Read", serde_json::json!({"file_path":"/tmp/a"})),
+            tool_call(
+                "g1",
+                "Grep",
+                serde_json::json!({"path":"/tmp","pattern":"x"}),
+            ),
+            tool_result("r1", "ok", None, false),
+            tool_result("g1", "ok", None, false),
+        ]);
+        let report = analyze_session(fixture.path()).unwrap();
+
+        assert_eq!(report.response_batches.total_responses, 1);
+        assert_eq!(report.response_batches.tool_call_responses, 1);
+        assert_eq!(report.response_batches.total_tool_calls, 2);
+        assert_eq!(report.response_batches.tools_per_response.avg_milli, 2000);
+        assert_eq!(report.response_batches.tools_per_response.p50, 2);
+        assert_eq!(report.response_batches.tools_per_response.p90, 2);
+        assert_eq!(report.response_batches.tools_per_response.max, 2);
+        assert_eq!(
+            report.response_batches.tools_per_response_histogram,
+            vec![ToolCountHistogramBucket {
+                tool_call_count: 2,
+                response_count: 1
+            }]
+        );
+        assert_eq!(
+            report.response_batches.top_tool_call_responses[0].tool_call_count,
+            2
+        );
+        assert_eq!(
+            report.response_batches.top_tool_call_responses[0]
+                .tool_counts_by_name
+                .get("Read"),
+            Some(&1)
+        );
+    }
+
+    #[test]
+    fn edit_metrics_report_multiple_same_file_edits_in_one_response() {
+        let fixture = write_fixture(&[
+            tool_call(
+                "e1",
+                "Edit",
+                serde_json::json!({"file_path":"/tmp/a","old_string":"a","new_string":"b"}),
+            ),
+            tool_call(
+                "e2",
+                "Edit",
+                serde_json::json!({"file_path":"/tmp/a","old_string":"c","new_string":"d","replace_all":true}),
+            ),
+            tool_result("e1", "ok", None, false),
+            tool_result("e2", "ok", None, false),
+        ]);
+        let report = analyze_session(fixture.path()).unwrap();
+        let edit_batches = &report.response_batches.edit_batches;
+
+        assert_eq!(edit_batches.responses_containing_edit, 1);
+        assert_eq!(edit_batches.total_edit_calls, 2);
+        assert_eq!(edit_batches.edit_calls_per_response[0].edit_call_count, 2);
+        assert_eq!(
+            edit_batches.files_touched_per_edit_response[0].file_count,
+            1
+        );
+        assert_eq!(
+            edit_batches.files_touched_per_edit_response[0].paths,
+            vec!["/tmp/a".to_string()]
+        );
+        let same_file = &edit_batches.same_file_multi_edit_responses[0];
+        assert_eq!(same_file.path, "/tmp/a");
+        assert_eq!(same_file.edit_call_count, 2);
+        assert_eq!(same_file.old_string_bytes_total, 2);
+        assert_eq!(same_file.new_string_bytes_total, 2);
+        assert_eq!(same_file.replace_all_count, 1);
+        assert!(
+            same_file
+                .observation
+                .contains("possible batching opportunity")
+        );
+    }
+
+    #[test]
+    fn consecutive_edit_only_responses_to_same_file_report_pure_streak() {
+        let fixture = write_fixture(&[
+            tool_call(
+                "e1",
+                "Edit",
+                serde_json::json!({"file_path":"/tmp/a","old_string":"a","new_string":"b"}),
+            ),
+            tool_result("e1", "ok", None, false),
+            tool_call(
+                "e2",
+                "Edit",
+                serde_json::json!({"file_path":"/tmp/a","old_string":"c","new_string":"d"}),
+            ),
+            tool_result("e2", "ok", None, false),
+        ]);
+        let report = analyze_session(fixture.path()).unwrap();
+        let streak = &report
+            .response_batches
+            .edit_round_trips
+            .pure_edit_only_streaks[0];
+
+        assert_eq!(streak.file_path, "/tmp/a");
+        assert_eq!(streak.response_start_index, 0);
+        assert_eq!(streak.response_end_index, 1);
+        assert_eq!(streak.start_line, 1);
+        assert_eq!(streak.end_line, 3);
+        assert_eq!(streak.streak_length, 2);
+        assert_eq!(streak.edit_call_count, 2);
+        assert!(streak.observation.contains("possible batching opportunity"));
+        assert!(
+            report
+                .response_batches
+                .edit_round_trips
+                .interrupted_or_annotated_sequences
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn interleaved_read_or_test_step_breaks_edit_only_streak() {
+        let fixture = write_fixture(&[
+            tool_call(
+                "e1",
+                "Edit",
+                serde_json::json!({"file_path":"/tmp/a","old_string":"a","new_string":"b"}),
+            ),
+            tool_result("e1", "ok", None, false),
+            tool_call("r1", "Read", serde_json::json!({"file_path":"/tmp/a"})),
+            tool_result("r1", "ok", None, false),
+            tool_call(
+                "b1",
+                "Bash",
+                serde_json::json!({"command":"cargo test -p session-analytics"}),
+            ),
+            tool_result("b1", "ok", None, false),
+            tool_call(
+                "e2",
+                "Edit",
+                serde_json::json!({"file_path":"/tmp/a","old_string":"c","new_string":"d"}),
+            ),
+            tool_result("e2", "ok", None, false),
+        ]);
+        let report = analyze_session(fixture.path()).unwrap();
+
+        assert!(
+            report
+                .response_batches
+                .edit_round_trips
+                .pure_edit_only_streaks
+                .is_empty()
+        );
+        let interrupted = &report
+            .response_batches
+            .edit_round_trips
+            .interrupted_or_annotated_sequences[0];
+        assert_eq!(interrupted.file_path, "/tmp/a");
+        assert_eq!(interrupted.before_response_index, 0);
+        assert_eq!(interrupted.break_response_start_index, 1);
+        assert_eq!(interrupted.break_response_end_index, 2);
+        assert_eq!(interrupted.after_response_index, 3);
+        assert_eq!(
+            interrupted.break_tool_names,
+            vec!["Bash".to_string(), "Read".to_string()]
+        );
+        assert!(interrupted.break_contains_read);
+        assert!(interrupted.break_contains_bash);
+        assert!(interrupted.break_contains_test_like_bash);
+        assert!(interrupted.observation.contains("automatic blame"));
+    }
+
+    #[test]
+    fn sessions_with_no_edits_have_empty_edit_batch_and_round_trip_metrics() {
+        let fixture = write_fixture(&[
+            tool_call("r1", "Read", serde_json::json!({"file_path":"/tmp/a"})),
+            tool_result("r1", "ok", None, false),
+        ]);
+        let report = analyze_session(fixture.path()).unwrap();
+
+        assert_eq!(
+            report
+                .response_batches
+                .edit_batches
+                .responses_containing_edit,
+            0
+        );
+        assert_eq!(report.response_batches.edit_batches.total_edit_calls, 0);
+        assert_eq!(
+            report.response_batches.edit_batches.edit_calls_per_response[0].edit_call_count,
+            0
+        );
+        assert!(
+            report
+                .response_batches
+                .edit_batches
+                .same_file_multi_edit_responses
+                .is_empty()
+        );
+        assert!(
+            report
+                .response_batches
+                .edit_round_trips
+                .pure_edit_only_streaks
+                .is_empty()
+        );
+        assert!(
+            report
+                .response_batches
+                .edit_round_trips
+                .interrupted_or_annotated_sequences
+                .is_empty()
         );
     }
 }
