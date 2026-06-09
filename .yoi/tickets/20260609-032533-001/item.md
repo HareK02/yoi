@@ -1,8 +1,8 @@
 ---
 title: "セッション解析ツールを追加する"
-state: 'inprogress'
+state: 'closed'
 created_at: "2026-06-09T03:25:33Z"
-updated_at: '2026-06-09T07:37:41Z'
+updated_at: '2026-06-09T07:40:53Z'
 queued_by: 'workspace-panel'
 queued_at: '2026-06-09T06:56:20Z'
 ---
