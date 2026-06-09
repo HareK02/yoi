@@ -3,6 +3,7 @@ mod block;
 mod cache;
 mod command;
 mod composer_history;
+mod composer_keys;
 mod input;
 pub mod keys;
 mod markdown;
