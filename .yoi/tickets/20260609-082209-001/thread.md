@@ -142,3 +142,17 @@ Validation passed:
 - `nix build .#yoi`
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-09T12:10:16Z -->
+
+## Implementation report
+
+Reviewer routed after coder implementation commit `f0f6cc9`.
+
+Reviewer Pod:
+- `reviewer-profile-feature-flags-tool-surface`
+- Worktree: `.worktree/profile-feature-flags-tool-surface`
+
+Review focus includes explicit bool feature authority, concrete resolved Manifest feature values, disabled feature tool omission from schema, role profile surfaces, authority/fail-closed preservation, and the `feature.pods` vs implementation-reported `feature.pod_management` naming mismatch.
+
+---

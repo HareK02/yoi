@@ -169,3 +169,19 @@ Validation:
 - `nix build .#yoi`
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-09T12:10:16Z -->
+
+## Implementation report
+
+Reviewer routed after coder implementation commit `3afdd89`.
+
+Reviewer Pod:
+- `reviewer-remove-action-attention-ticket-fields`
+- Worktree: `.worktree/remove-action-attention-ticket-fields`
+
+Review focus includes schema/tool/API/output removal, doctor behavior for obsolete fields, panel ready→Queue behavior despite historical overlays, maintained docs/workflows/resources cleanup, no replacement vague field, and no unrelated lifecycle/identity/relation changes.
+
+Note: the initial reviewer prompt accidentally included a stale full commit hash; the branch HEAD in the worktree is the authority and is `3afdd89`.
+
+---
