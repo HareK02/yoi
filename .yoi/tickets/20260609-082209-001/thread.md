@@ -213,3 +213,70 @@ Validation after fix:
 - `cargo fmt --check`
 
 ---
+
+<!-- event: review author: reviewer-profile-feature-flags-tool-surface-r2 at: 2026-06-09T12:27:05Z status: request_changes -->
+
+## Review: request changes
+
+Re-review result: request_changes.
+
+Prior findings status:
+- Fixed: user-facing Profile/Manifest syntax is now `feature.pods`; controller error/test/profile resources use `[feature.pods]`, and remaining `pod_management` references are internal prompt capability helper names rather than profile syntax.
+- Fixed for Coder: `.yoi/profiles/coder.lua` now sets `feature.task.enabled = false` and keeps Ticket/Ticket orchestration/Pods disabled.
+
+Blocking finding:
+
+1. Several project role profiles still expose Task tools by default despite the Ticket role defaults saying these roles should disable Task. `register_pod_tools` registers TaskCreate/TaskUpdate/TaskGet/TaskList whenever `feature_config.task.enabled` is true, so these profile defaults are model-visible tool-surface grants, not inert metadata.
+   - `.yoi/profiles/intake.lua:7-13` has `task = { enabled = true }`, but the Ticket says Intake `task = disabled`.
+   - `.yoi/profiles/reviewer.lua:7-13` has `task = { enabled = true }`, but the Ticket says Reviewer `task = disabled`.
+   - `.yoi/profiles/companion.lua:7-13` has `task = { enabled = true }`, but the Ticket says Companion `task = disabled`.
+   - `.yoi/profiles/orchestrator.lua:8-14` has `task = { enabled = true }`; the Ticket says Orchestrator task should be disabled unless explicitly justified. I do not see a recorded justification in the implementation/report.
+   - `.yoi/profiles/_base.lua:32-38` and `resources/profiles/default.lua:29-35` also keep Task enabled by default; this may be fine for the builtin/default coding profile if intentional, but the project role profiles above need to match the Ticket or document an accepted deviation.
+   - Registration path: `crates/pod/src/controller.rs:545-548`.
+
+Secondary gap:
+- The acceptance condition asks for tests covering tool definition lists for Orchestrator, Coder, Intake, Reviewer, and Companion profiles. The current focused tests cover synthetic feature manifests and the Coder profile was fixed by file inspection, but I did not find role-profile tool-list tests that would catch the Intake/Reviewer/Companion Task exposure.
+
+Validation run:
+- `cargo test -p manifest feature --lib` passed (4 tests).
+- `cargo test -p pod feature --tests` passed (45 lib tests plus 3 controller feature tests; other filtered test binaries had 0 matching tests).
+- `cargo test -p pod pods_feature_requires_delegation_scope --test controller_test` passed (1 test).
+- `cargo test -p tools --test integration` passed (14 tests).
+- `cargo fmt --check` passed.
+- `git diff --check` passed.
+- `cargo run -q -p yoi -- ticket doctor` passed (`doctor: ok`).
+- `git status --short` is clean.
+
+Merge readiness: not merge-ready until the remaining project role defaults and role-profile tool-list test coverage are aligned with the Ticket.
+
+---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-09T12:32:00Z -->
+
+## Implementation report
+
+Second review requested one remaining change set:
+
+- Project role profiles beyond Coder (`intake`, `reviewer`, `companion`, and `orchestrator`) still inherited/used `feature.task.enabled = true`, contrary to the Ticket's explicit role defaults.
+- There was no regression test that asserted role-like tool surfaces across Orchestrator/Coder/Intake/Reviewer/Companion.
+
+Fix applied on branch `profile-feature-flags-tool-surface`:
+
+- Set `feature.task.enabled = false` in the remaining project role profiles.
+- Added controller regression test `project_role_tool_surfaces_keep_task_disabled_and_pods_role_scoped`, covering the five role-like tool surfaces for Task tool absence and Pod tool exposure only where intended.
+
+Fix commit: `507863f fix: lock project role feature surfaces`
+
+Validation after fix:
+- `cargo fmt`
+- `cargo test -p pod project_role_tool_surfaces_keep_task_disabled_and_pods_role_scoped --test controller_test`
+- `cargo test -p pod pods_feature_requires_delegation_scope --test controller_test`
+- `cargo test -p manifest feature --lib`
+- `cargo test -p pod feature --tests`
+- `cargo test -p tools --test integration`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo run -q -p yoi -- ticket doctor`
+- `cargo check --workspace`
+
+---

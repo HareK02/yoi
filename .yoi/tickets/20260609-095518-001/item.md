@@ -2,7 +2,7 @@
 title: 'action_requiredとattention_requiredをTicket schemaから削除する'
 state: 'inprogress'
 created_at: '2026-06-09T09:55:18Z'
-updated_at: '2026-06-09T12:22:09Z'
+updated_at: '2026-06-09T12:28:22Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-06-09T10:11:38Z'

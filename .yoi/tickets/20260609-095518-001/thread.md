@@ -205,3 +205,32 @@ Validation after fix:
 - `cargo check --workspace`
 
 ---
+
+<!-- event: review author: reviewer at: 2026-06-09T12:28:22Z status: approve -->
+
+## Review: approve
+
+Re-review result: approve.
+
+Focus:
+- Verified prior finding is addressed: CLI `ticket show` now filters `action_required` and `attention_required` from `ticket.document.raw_frontmatter` through `is_obsolete_ticket_frontmatter_key`.
+- Verified regression coverage: `ticket_cli_show_omits_obsolete_overlay_fields_from_legacy_frontmatter` injects both obsolete overlay fields into legacy frontmatter and asserts both keys and values are absent from `ticket show` output.
+- Checked repository search for remaining current-surface mentions; remaining `action_required` / `attention_required` occurrences are obsolete-field diagnostics/filters and tests only.
+- No new regression found in the fix commit.
+
+Validation run in `.worktree/remove-action-attention-ticket-fields`:
+- `cargo test -p yoi ticket_cli::tests::ticket_cli_show_omits_obsolete_overlay_fields_from_legacy_frontmatter -- --exact` — pass (1 test).
+- `cargo test -p yoi ticket_cli::tests -- --nocapture` — pass (12 tests).
+- `cargo check -p yoi` — pass.
+- `git diff --check` — pass.
+- `cargo fmt --check` — pass.
+- `cargo run -q -p yoi -- ticket doctor` — pass (`doctor: ok`).
+- `nix build .#yoi` — pass; `result` points to `/nix/store/n4bxl2fmwk85gfpq7bf59fd8mny1dl9r-yoi-0.1.0`.
+
+Merge readiness:
+- Approved and merge-ready from review perspective.
+
+Residual risks:
+- No branch-specific residual risk found. Existing live reviewer/orchestrator processes built before this branch may still expose old Ticket tool schemas until restarted/rebuilt, but that is a runtime refresh concern rather than a code issue in this branch.
+
+---
