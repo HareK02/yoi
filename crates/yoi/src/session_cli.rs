@@ -157,6 +157,12 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&output.stdout).unwrap();
         assert_eq!(value["tool_usage"]["total_tool_calls"], 1);
         assert_eq!(value["tool_usage"]["counts_by_tool"]["Read"], 1);
+        assert_eq!(value["response_batches"]["total_responses"], 1);
+        assert_eq!(value["response_batches"]["total_tool_calls"], 1);
+        assert_eq!(
+            value["response_batches"]["tools_per_response_histogram"][0]["tool_call_count"],
+            1
+        );
     }
 
     #[test]
