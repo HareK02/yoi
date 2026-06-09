@@ -72,3 +72,24 @@ Validation:
 - `git diff --check`, `cargo run -q -p yoi -- ticket doctor`, `nix build .#yoi` if packaged resources/docs are touched.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-09T10:36:44Z -->
+
+## Implementation report
+
+Implementation routing started in parallel with the current active work set.
+
+Worktree/branch:
+- Worktree: `.worktree/orchestrator-parallel-queued-work`
+- Branch: `orchestrator-parallel-queued-work`
+- Base/routing commit: `5d9e227 ticket: route analytics batching and parallel guidance`
+
+Spawned sibling Coder Pod:
+- `coder-orchestrator-parallel-queued-work`
+- Scope: non-recursive read on parent workspace root plus recursive write limited to the child worktree.
+
+Parallel-routing rationale:
+- This workflow/docs Ticket encodes the user's updated parallel-capacity preference.
+- It is expected to have only small/managed conflicts with active work and no runtime scheduler changes.
+
+---
