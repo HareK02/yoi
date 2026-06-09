@@ -58,3 +58,53 @@ Validation は既存 acceptance criteria の通り、`target/debug/yoi ticket do
 Intake refinement により、意図・受け入れ条件・binding decisions / invariants・implementation latitude・escalation conditions が揃ったため ready に遷移します。
 
 ---
+
+<!-- event: decision author: hare at: 2026-06-09T01:00:46Z -->
+
+## Decision
+
+## Decision: no hierarchy relations
+
+Umbrella Ticket deprecation also means not replacing umbrellas with Ticket hierarchy relations.
+
+Do not introduce or use these relation concepts for current Ticket work:
+
+- `parent` / `child`;
+- `sub-ticket`;
+- `umbrella`;
+- `part_of` / `contains` decomposition semantics.
+
+Concrete split work should become separate implementable Tickets. Medium-term context belongs in Objectives. Ticket relations should stay non-hierarchical: dependency, blocking, related, supersedes, duplicate/replacement, and similar direct relations.
+
+---
+
+<!-- event: state_changed author: workspace-panel at: 2026-06-09T01:14:14Z from: ready to: queued reason: queued field: workflow_state -->
+
+## State changed
+
+Ticket を `workspace-panel` が queued にしました。
+
+
+---
+
+<!-- event: decision author: orchestrator at: 2026-06-09T01:14:47Z -->
+
+## Decision
+
+Routing decision: defer_pending_policy_merge
+
+This Ticket is queued and appears implementation-ready, but I am intentionally not accepting it to `inprogress` yet.
+
+Reason:
+- There is an approved merge-ready workflow/docs branch pending: `orchestrator-return-to-planning-context-policy` at commit `8576615`.
+- `deprecate-umbrella-tickets` is also a workflow/docs/planning policy cleanup and is likely to touch adjacent files such as Orchestrator/Intake/Planning guidance and work-item docs.
+- Running it before the pending policy branch is merged or otherwise resolved would create unnecessary conflict/review risk across the same maintained policy surfaces.
+
+State decision:
+- Leave this Ticket `queued`.
+- Do not create a worktree or spawn a coder yet.
+
+Next action:
+- After `orchestrator-return-to-planning-context-policy` is merged/closed/cleaned up or explicitly held back, re-read this Ticket and accept it from queued if still unblocked.
+
+---

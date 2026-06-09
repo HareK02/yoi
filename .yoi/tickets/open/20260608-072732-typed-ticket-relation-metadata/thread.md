@@ -57,3 +57,89 @@ Design guidance:
 This Ticket should explicitly decide whether to include parent/child relations at all in the first version.
 
 ---
+
+<!-- event: decision author: hare at: 2026-06-09T01:00:53Z -->
+
+## Decision
+
+## Decision: relation first version excludes hierarchy
+
+The first version of typed Ticket relations must not include hierarchy/container relation kinds. Exclude:
+
+- `parent` / `child`;
+- `sub-ticket`;
+- `umbrella`;
+- `part_of` / `contains`.
+
+This avoids recreating umbrella Tickets under another schema. The relation feature should focus on non-hierarchical direct relationships: dependency, blocking, related, supersedes, duplicate/replacement. Medium-term grouping belongs to Objective records, not Ticket hierarchy.
+
+---
+
+<!-- event: decision author: intake at: 2026-06-09T01:02:08Z -->
+
+## Decision
+
+## Intake refinement: ready にするための設計決定
+
+この Ticket は新規 Ticket ではなく、既存 Ticket の refinement として扱う。Orchestrator が routing できるよう、未決定だった relation kind / inverse / queue gate の境界を次の通り固定する。
+
+### Readiness
+
+- readiness: implementation_ready
+- risk_flags: [ticket-schema, workflow-state, panel, orchestrator-routing]
+
+### Binding decisions / invariants
+
+- first version の保存対象 relation kind は非階層 relation のみに限定する。
+  - `depends_on`: この Ticket が対象 Ticket の完了/解決を必要とする。
+  - `blocks`: この Ticket が対象 Ticket の実行/完了を妨げる。
+  - `related`: 非 blocking の関連。
+  - `supersedes`: この Ticket が対象 Ticket を置き換える。
+  - `duplicate_of`: この Ticket が対象 Ticket の duplicate である。
+- `blocked_by` / `superseded_by` / duplicate 逆一覧などの inverse view は保存済み forward relation から導出する。first version では inverse relation kind を別途保存して整合性を二重管理しない。
+- `parent` / `child` / `sub-ticket` / `umbrella` / `part_of` / `contains` は first version で扱わない。Ticket relation metadata で umbrella Ticket を再作成しない。
+- relation metadata は project-level Ticket record であり、Pod/session claim、worktree、branch ownership、coder/reviewer assignment、capacity、current planned order、`do_not_parallelize` を保存しない。これらは local role session registry / OrchestrationPlan / Pod metadata の責務に残す。
+- Queue gate は unresolved blocking relation を無視してはならない。
+  - 対象 Ticket の unresolved `depends_on` と incoming unresolved `blocks` は、Panel/CLI の `ready -> queued` 操作で visible reason 付きの block/diagnostic にする。
+  - `related` は queue を block しない。
+  - `supersedes` / `duplicate_of` は replacement/duplicate として visible diagnostic にする。自動的に全 relation を blocking 扱いしない。
+  - Orchestrator は `queued -> inprogress` acceptance 時に relation を再確認する。Queue gate の判定は Orchestrator の再確認を省略する根拠ではない。
+
+### Implementation latitude
+
+- durable storage の具体形は、typed backend が検証でき、git-trackable で、`TicketShow` / `ticket doctor` / Panel summary から読める限り実装側で選んでよい。例: `item.md` frontmatter の typed field、または Ticket artifacts 配下の typed record。
+- CLI の具体的な relation 操作名・オプション名、Panel 上の短い表示文言、cycle 検出の bounded な実装方式は実装側で選んでよい。
+- `depends_on` と `blocks` は利用者が自然な方向で記録できる relation kind として両方残すが、表示・validation では inverse view を導出して重複/矛盾を診断してよい。
+
+### Escalation conditions
+
+- hierarchy/container semantics を追加したくなった場合。
+- inverse relation を保存しないと実装できない設計にしたくなった場合。
+- queue gate を unresolved dependency でも通常 queue 可能にしたくなった場合。
+- relation metadata に Pod/session/worktree/assignment/capacity/current-batch order を保存したくなった場合。
+- public Ticket schema または role workflow guidance で relation kind 名を上記から変更したくなった場合。
+
+### Validation focus
+
+- `ticket doctor` が dangling reference、invalid kind、self relation、obvious dependency/blocking cycle を bounded diagnostic として検出すること。
+- `TicketShow` が forward relation と derived inverse view を理解できる形で表示すること。
+- Panel/CLI が unresolved dependency/blocker を queue 前に visible にすること。
+- Intake/Planning と Orchestrator guidance が project-level relation metadata と OrchestrationPlan runtime decision を混同しないこと。
+
+---
+
+<!-- event: intake_summary author: intake at: 2026-06-09T01:02:17Z -->
+
+## Intake summary
+
+既存 Ticket を refinement し、typed Ticket relation metadata の first version を非階層 relation に限定して implementation_ready にした。保存 relation kind は `depends_on` / `blocks` / `related` / `supersedes` / `duplicate_of`、inverse view は forward relation から導出し、`parent` / `child` / `sub-ticket` / `umbrella` / `part_of` / `contains` は扱わない。unresolved `depends_on` と incoming unresolved `blocks` は Panel/CLI queue gate で visible block/diagnostic にし、Orchestrator は acceptance 時に再確認する。runtime claims や OrchestrationPlan execution decisions は relation metadata に保存しない。blocking open questions はない。
+
+---
+
+<!-- event: state_changed author: intake at: 2026-06-09T01:02:17Z from: planning to: ready reason: intake_ready field: workflow_state -->
+
+## State changed
+
+Intake refinement により、relation kind、inverse relation の扱い、queue gate 境界、binding invariants、implementation latitude、escalation conditions が揃ったため ready に遷移する。
+
+---
