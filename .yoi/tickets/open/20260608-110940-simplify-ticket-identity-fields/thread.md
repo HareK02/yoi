@@ -424,3 +424,44 @@ Coder validation reported passed:
 Coder reports no remaining risks or unresolved removal conflicts.
 
 ---
+
+<!-- event: review author: reviewer-simplify-ticket-identity-fields at: 2026-06-09T04:16:11Z status: request_changes -->
+
+## Review: request changes
+
+Review result: request_changes
+
+The requested focused validation now passes, but stale old-layout/current-guidance surfaces remain and block merge.
+
+Blockers:
+
+1. Built-in Ticket feature still requires old bucket layout.
+   - `crates/pod/src/feature/builtin/ticket.rs` `usable_backend_root()` still requires `open`, `pending`, and `closed` directories.
+   - In the new flat `.yoi/tickets/<ticket-id>/` layout this would cause built-in Ticket tool registration to be warning-skipped.
+   - Tests encode the stale expectation: `make_ticket_root()` creates old buckets and `does_not_register_ticket_tools_when_root_lacks_state_dirs` asserts old behavior.
+   - Fix direction: validate the flat Ticket backend root/current marker semantics instead, and update pod feature tests accordingly. Do not reintroduce open/pending/closed buckets.
+
+2. Workflow guidance still exposes `TicketStatus` / pending routing.
+   - `.yoi/workflow/ticket-intake-workflow.md` still mentions `TicketStatus` and `open / pending Ticket` lookup.
+   - `.yoi/workflow/ticket-orchestrator-routing.md` still mentions `TicketStatus`, pending/open state cleanup, `defer_pending`, routing target `pending`, and moving Tickets to pending.
+   - Fix direction: update guidance to canonical `state` lifecycle and remove pending/TicketStatus/defer_pending current routing target. Defer/block decisions should be expressed through planning/queued/inprogress/done/closed plus attention/planning records as appropriate, not pending status.
+
+3. Maintained development docs still contain old pending/create guidance.
+   - `docs/development/work-items.md` still mentions `defer_pending`, `yoi ticket state <id> open|pending`, and old `create --kind --label` style.
+   - Fix direction: update to current flat layout, canonical ID, `state`, and new minimal create/list/state guidance.
+
+Validation evidence from reviewer:
+- Passed: `cargo test -p yoi ticket_cli`, `cargo test -p tui ticket_action --no-run`, `cargo test -p ticket`, `cargo test -p tui workspace_panel`, `cargo test -p tui ticket_action`, `cargo fmt --check`, `git diff --check`, `cargo run -q -p yoi -- ticket doctor`, `cargo check --workspace`, `nix build .#yoi`.
+- Additional `cargo test -p pod ticket` passed but with stale old-bucket expectations, confirming the remaining issue is encoded authority/guidance rather than a compile failure.
+
+Positive evidence:
+- The flat Ticket layout and canonical `state` model are mostly implemented.
+- `TicketStatusTool` / `TicketStatusParam` are no longer in current ticket tool registration.
+- Exact canonical ID lookup works.
+
+Required before re-review:
+- Fix the built-in Ticket feature root validation/tests for flat layout.
+- Remove/update stale `TicketStatus` / pending / `defer_pending` guidance from maintained workflow/docs.
+- Run at minimum: `cargo test -p pod ticket`, `cargo test -p ticket`, `cargo test -p yoi ticket_cli`, `cargo test -p tui ticket_action --no-run`, `cargo fmt --check`, `git diff --check`, `cargo run -q -p yoi -- ticket doctor`, `cargo check --workspace`, `nix build .#yoi`.
+
+---
