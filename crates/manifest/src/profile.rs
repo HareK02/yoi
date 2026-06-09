@@ -1819,6 +1819,112 @@ language = "nested"
         assert!(err.to_string().contains("Lua profiles must end in .lua"));
     }
     #[test]
+    fn actual_project_role_profiles_resolve_explicit_feature_defaults() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().join("workspace");
+        let profiles_dir = tmp.path().join(".yoi/profiles");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&profiles_dir).unwrap();
+        for (name, content) in [
+            (
+                "_base.lua",
+                include_str!("../../../.yoi/profiles/_base.lua"),
+            ),
+            (
+                "coder.lua",
+                include_str!("../../../.yoi/profiles/coder.lua"),
+            ),
+            (
+                "intake.lua",
+                include_str!("../../../.yoi/profiles/intake.lua"),
+            ),
+            (
+                "orchestrator.lua",
+                include_str!("../../../.yoi/profiles/orchestrator.lua"),
+            ),
+            (
+                "reviewer.lua",
+                include_str!("../../../.yoi/profiles/reviewer.lua"),
+            ),
+            (
+                "companion.lua",
+                include_str!("../../../.yoi/profiles/companion.lua"),
+            ),
+        ] {
+            std::fs::write(profiles_dir.join(name), content).unwrap();
+        }
+
+        struct Expected {
+            role: &'static str,
+            ticket: bool,
+            ticket_orchestration: bool,
+            pods: bool,
+        }
+
+        for expected in [
+            Expected {
+                role: "orchestrator",
+                ticket: true,
+                ticket_orchestration: true,
+                pods: true,
+            },
+            Expected {
+                role: "coder",
+                ticket: false,
+                ticket_orchestration: false,
+                pods: false,
+            },
+            Expected {
+                role: "intake",
+                ticket: true,
+                ticket_orchestration: false,
+                pods: false,
+            },
+            Expected {
+                role: "reviewer",
+                ticket: false,
+                ticket_orchestration: false,
+                pods: false,
+            },
+            Expected {
+                role: "companion",
+                ticket: false,
+                ticket_orchestration: false,
+                pods: false,
+            },
+        ] {
+            let resolved = ProfileResolver::new()
+                .with_workspace_base(&workspace)
+                .resolve(
+                    &ProfileSelector::path(profiles_dir.join(format!("{}.lua", expected.role))),
+                    ProfileResolveOptions::with_pod_name(format!("{}-pod", expected.role)),
+                )
+                .unwrap();
+            let feature = &resolved.manifest.feature;
+            assert!(
+                !feature.task.enabled,
+                "{} profile must explicitly keep Task tools disabled",
+                expected.role
+            );
+            assert_eq!(
+                feature.ticket.enabled, expected.ticket,
+                "{} ticket feature default mismatch",
+                expected.role
+            );
+            assert_eq!(
+                feature.ticket_orchestration.enabled, expected.ticket_orchestration,
+                "{} ticket orchestration feature default mismatch",
+                expected.role
+            );
+            assert_eq!(
+                feature.pods.enabled, expected.pods,
+                "{} Pod feature default mismatch",
+                expected.role
+            );
+        }
+    }
+
+    #[test]
     fn discovery_reads_user_and_project_registry_and_project_default_wins() {
         let tmp = TempDir::new().unwrap();
         let user_config = tmp.path().join("profiles.toml");
