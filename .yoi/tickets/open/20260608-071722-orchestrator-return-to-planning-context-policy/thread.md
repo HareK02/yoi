@@ -147,3 +147,37 @@ Routing context:
 - This Ticket is now the active routed implementation work.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-09T00:19:47Z -->
+
+## Implementation report
+
+Coder implementation completed and is ready for sibling review.
+
+Coder Pod:
+- `coder-orchestrator-return-to-planning-context-policy`
+- Commit: `8576615 workflow: tighten orchestrator planning return policy`
+- Worktree status before review: clean branch `orchestrator-return-to-planning-context-policy`
+- Stopped after collecting output to reclaim delegated worktree scope.
+
+Implementation summary:
+- Tightened Orchestrator routing workflow so returning `ready` / `queued` Tickets to `planning` requires concrete missing decision/information evidence after bounded project-context checks.
+- Clarified risk flags / risky domains / authority-adjacent work as context lookup, IntentPacket invariant, reviewer-focus, and escalation signals rather than automatic stop gates.
+- Added risky-but-specified guidance and an `allow-spawnpod-child-workspace-cwd`-style example for proceeding with reviewer focus when work is specified.
+- Updated related planning/preflight and multi-agent workflow wording plus work-item docs.
+
+Changed files:
+- `.yoi/workflow/ticket-orchestrator-routing.md`
+- `.yoi/workflow/ticket-preflight-workflow.md`
+- `.yoi/workflow/multi-agent-workflow.md`
+- `docs/development/work-items.md`
+
+Coder validation reported passed:
+- Focused workflow/prompt text validation for risky-but-specified -> implementation_ready, genuinely missing decision -> return_to_planning, and risk flag alone insufficient.
+- `git diff --check`
+- `cargo run -q -p yoi -- ticket doctor`
+- `nix build .#yoi`
+
+Coder did not run `cargo check --workspace` because only docs/workflow resources changed.
+
+---

@@ -8,7 +8,7 @@ priority: 'P1'
 labels: ['ticket', 'orchestrator', 'planning', 'workflow', 'prompt']
 workflow_state: 'inprogress'
 created_at: '2026-06-08T07:17:22Z'
-updated_at: '2026-06-09T00:07:10Z'
+updated_at: '2026-06-09T00:19:47Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-06-09T00:04:21Z'
