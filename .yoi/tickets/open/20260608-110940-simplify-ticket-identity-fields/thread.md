@@ -338,3 +338,46 @@ Completion boundary reminder:
 - Per human instruction, if review approves and the branch merges cleanly, stop at merge-complete/validation boundary. Do not close this Ticket or clean up the worktree/branch until runtime/tooling is refreshed or explicit follow-up is given, because the merge changes the Ticket storage schema/layout.
 
 ---
+
+<!-- event: review author: reviewer-simplify-ticket-identity-fields at: 2026-06-09T03:27:14Z status: request_changes -->
+
+## Review: request changes
+
+Review result: request_changes
+
+The core direction is aligned, but current authoritative surfaces still expose old `status` / `pending` / `slug` / bucket-model behavior, and focused CLI/panel tests fail.
+
+Blocking issues:
+
+1. Ticket tool/backend surface still exposes `TicketStatus` / `pending`.
+   - `crates/ticket/src/tool.rs` still registers `TicketStatus` as a mutating tool.
+   - `TicketStatusParam::{Open, Pending}` and `TicketStatusTool` still accept/return pending-style state.
+   - `crates/ticket/src/lib.rs` still has `set_status()` mapping old `TicketStatus::Pending` into planning.
+   - This violates the invariant that pending bucket/status is removed and `state` is canonical.
+
+2. Panel/TUI still has pending/status dependencies.
+   - `crates/tui/src/workspace_panel.rs` `derive_ticket_state()` still treats `TicketStatus::Pending` specially for Defer.
+   - `cargo test -p tui ticket_action --no-run` fails with stale references (`TicketStatus`, `workflow_state_field`, old `TicketPanelEntry` fields, pending defer action test).
+
+3. CLI unit tests still assert old slug/status/bucket behavior.
+   - `cargo test -p yoi ticket_cli` fails: 5 passed, 3 failed.
+   - Failing tests still pass `--slug` and panic on `unknown create argument: --slug`.
+
+4. `AGENTS.md` still presents old commands/layout as authoritative guidance.
+   - Mentions `--slug`, `--kind`, `--label`, `--status`, `open|pending|closed`, `id-or-slug`, `.yoi/tickets/{open,pending,closed}/<id>/`, and close moving to `closed/`.
+
+Positive evidence:
+- Flat `.yoi/tickets/<ticket-id>/` layout is present.
+- `cargo run -q -p yoi -- ticket doctor` passes with `doctor: ok`.
+- `ticket list --state all` and exact ID show work.
+- Old slug lookup fails as expected.
+- `cargo test -p ticket`, `cargo fmt --check`, `git diff --check`, `cargo check --workspace`, and `nix build .#yoi` passed.
+
+Required fix direction:
+- Remove or explicitly retire `TicketStatus` / `pending` from current Ticket tools/backend mutation surface, or make retained compatibility non-current and not user/tool-visible.
+- Update panel/current action model to use canonical `state` only, with no pending/defer status path.
+- Update `cargo test -p yoi ticket_cli` tests to new CLI behavior: `create --title`, `list --state`, `state <id> ...`, exact ID lookup, flat path assertions.
+- Update TUI/panel tests to compile and assert canonical ID/state behavior.
+- Update `AGENTS.md` to the new Ticket commands/layout and exact ID guidance.
+
+---
