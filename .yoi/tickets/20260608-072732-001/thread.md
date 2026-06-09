@@ -247,3 +247,25 @@ Validation:
 - `nix build .#yoi`.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-09T05:43:42Z -->
+
+## Implementation report
+
+Implementation routing started.
+
+Worktree/branch:
+- Worktree: `.worktree/typed-ticket-relation-metadata`
+- Branch: `typed-ticket-relation-metadata`
+- Base/routing commit: `41a61d7 ticket: route typed relation metadata`
+
+Spawned sibling Coder Pod:
+- `coder-typed-ticket-relation-metadata`
+- Scope: non-recursive read on parent workspace root plus recursive write limited to the child worktree.
+
+Routing context:
+- `simplify-ticket-identity-fields` is merged, closed, cleaned up, and the flat Ticket layout is active.
+- `objective-records-for-medium-term-goals` remains queued behind this work; durable orchestration plan records now encode that ordering.
+- This Ticket is the active lower-level Ticket relation/reference implementation work.
+
+---
