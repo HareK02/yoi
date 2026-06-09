@@ -189,3 +189,42 @@ Routing context:
 - This Ticket is now the active routed policy/workflow implementation work.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-09T01:33:23Z -->
+
+## Implementation report
+
+Coder implementation completed and is ready for sibling review.
+
+Coder Pod:
+- `coder-deprecate-umbrella-tickets`
+- Commit: `1349a75 ticket: deprecate umbrella containers`
+- Worktree status before review: clean branch `deprecate-umbrella-tickets`
+- Stopped after collecting output to reclaim delegated worktree scope.
+
+Implementation summary:
+- Updated workflow/docs guidance to deprecate long-lived umbrella/progress-container Tickets.
+- Clarified that Tickets should be concrete work items implementable/reviewable/validatable/closable on their own terms.
+- Added broad-request split guidance: create concrete Tickets, record split decisions, use Objective context for medium-term strategy, and keep future typed relations non-hierarchical.
+- Prohibited parent/child, sub-ticket, umbrella, part-of, contains, and similar hierarchy/container relation substitutes.
+- Preserved the carve-out for initial concrete planning/design/investigation Tickets.
+- Added existing-umbrella retirement guidance: close as superseded/decomposed once concrete follow-up Tickets and Objective context exist, with a resolution that lists completed concrete work and remaining follow-ups.
+- Recorded a migration/close recommendation on `workspace-panel-orchestrator-queue-automation`.
+
+Changed files:
+- `docs/development/work-items.md`
+- `.yoi/workflow/ticket-intake-workflow.md`
+- `.yoi/workflow/ticket-orchestrator-routing.md`
+- `.yoi/workflow/ticket-preflight-workflow.md`
+- `.yoi/workflow/multi-agent-workflow.md`
+- `.yoi/tickets/open/20260607-020215-workspace-panel-orchestrator-queue-automation/thread.md`
+
+Coder validation reported passed:
+- Focused text validation for umbrella/progress-container deprecation, hierarchy-relation prohibition, concrete planning carve-out, and existing umbrella retirement guidance.
+- `git diff --check`
+- `cargo run -q -p yoi -- ticket doctor`
+- `nix build .#yoi`
+
+Coder did not run `cargo check --workspace` because only docs/workflow/Ticket thread files changed.
+
+---

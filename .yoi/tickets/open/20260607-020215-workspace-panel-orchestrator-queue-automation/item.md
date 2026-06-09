@@ -8,7 +8,7 @@ priority: P1
 labels: [panel, orchestrator, ticket, automation, workflow]
 workflow_state: planning
 created_at: 2026-06-07T02:02:15Z
-updated_at: 2026-06-07T03:57:24Z
+updated_at: '2026-06-09T01:26:26Z'
 assignee: null
 ---
 
