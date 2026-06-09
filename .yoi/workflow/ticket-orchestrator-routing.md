@@ -39,11 +39,13 @@ Orchestrator は以下を行う。
 - Ticket を `TicketShow` で読む。
 - 必要に応じて関連 Ticket を `TicketList` / `TicketShow` で確認する。
 - Ticket body / thread / artifacts / resolution / review / implementation report を読む。
+- Ticket が Objective context と結びついている場合は、Objective を medium-term goal / motivation / strategy / success criteria / decision context として読む。ただし Objective context は判断背景であり、Ticket body/thread/artifacts や explicit Ticket relations / OrchestrationPlan records を読む代替ではない。
 - repository 状態、関連 docs/code、既存 worktree、visible Pods を必要に応じて明示的に確認する。
 - queued notification を受けた場合も、Ticket と workspace state を再確認してから routing する。
 - next action を routing classification として決める。
 - routing decision を `TicketComment` で Ticket thread に記録する。
 - broad request や split/refinement では、long-lived umbrella/progress-container Ticket ではなく concrete implementable Ticket、Objective context、split decision record を使う。
+- Objective-to-Ticket links は canonical opaque Ticket ID による non-blocking context link として扱い、dependency / blocking / ordering / ownership / scheduling relation と解釈しない。
 - 既存 umbrella/progress-container Ticket が concrete follow-up Ticket / Objective context で置き換え済みなら、superseded/decomposed として退役・close する routing を検討する。
 - implementation-ready の場合は `multi-agent-workflow` に渡す `IntentPacket` を作る。
 - implementation-ready かつ Ticket が `queued` の場合は、worktree 作成 / implementation Pod `SpawnPod` / coder routing などの side effect の前に、既存の typed Ticket backend/tool path で `queued -> inprogress` を記録する。

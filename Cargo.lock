@@ -4772,12 +4772,14 @@ dependencies = [
 name = "yoi"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "client",
  "manifest",
  "memory",
  "pod",
  "serde",
  "serde_json",
+ "serde_yaml",
  "session-store",
  "tempfile",
  "ticket",

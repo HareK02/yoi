@@ -1,4 +1,5 @@
 mod memory_lint;
+mod objective_cli;
 mod ticket_cli;
 
 use std::fmt;
@@ -15,6 +16,7 @@ enum Mode {
     Help,
     MemoryLintHelp,
     MemoryLint(LintCliOptions),
+    Objective(objective_cli::ObjectiveCli),
     Ticket(ticket_cli::TicketCli),
     PodRuntime(Vec<String>),
     Keys,
@@ -60,6 +62,19 @@ async fn main() -> ExitCode {
             Ok(LintStatus::Failed) => ExitCode::FAILURE,
             Err(e) => {
                 eprintln!("yoi memory lint: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        Mode::Objective(cli) => match objective_cli::run(cli) {
+            Ok(output) => {
+                print!("{}", output.stdout);
+                match output.status {
+                    objective_cli::ObjectiveCliStatus::Success => ExitCode::SUCCESS,
+                    objective_cli::ObjectiveCliStatus::Failure => ExitCode::FAILURE,
+                }
+            }
+            Err(e) => {
+                eprintln!("yoi objective: {e}");
                 ExitCode::FAILURE
             }
         },
@@ -127,6 +142,11 @@ fn parse_args_slice(args: &[String]) -> Result<Mode, ParseError> {
     match args[0].as_str() {
         "--help" | "-h" => return Ok(Mode::Help),
         "pod" => return Ok(Mode::PodRuntime(args[1..].to_vec())),
+        "objective" => {
+            let objective_cli = objective_cli::parse_objective_args(&args[1..])
+                .map_err(|e| ParseError(e.to_string()))?;
+            return Ok(Mode::Objective(objective_cli));
+        }
         "ticket" => {
             let ticket_cli =
                 ticket_cli::parse_ticket_args(&args[1..]).map_err(|e| ParseError(e.to_string()))?;
@@ -394,7 +414,7 @@ fn parse_session_id(value: &str) -> Result<SegmentId, ParseError> {
 
 fn print_help() {
     println!(
-        "yoi\n\nUsage:\n  yoi [OPTIONS] [POD_NAME]\n  yoi panel [--workspace <PATH>]\n  yoi keys\n  yoi pod [POD_OPTIONS]\n  yoi ticket <COMMAND> [OPTIONS]\n  yoi memory lint [OPTIONS]\n\nOptions:\n  -r, --resume           Open the Pod picker and resume/attach a Pod\n      --workspace <PATH> Runtime workspace root (defaults to cwd)\n      --pod <NAME>       Attach/restore/create a Pod by name\n      --socket <PATH>    Attach to a specific Pod socket with --pod\n      --session <UUID>   Resume a specific session segment\n      --profile <REF>    Select a reusable Profile recipe\n  -h, --help             Print help\n"
+        "yoi\n\nUsage:\n  yoi [OPTIONS] [POD_NAME]\n  yoi panel [--workspace <PATH>]\n  yoi keys\n  yoi pod [POD_OPTIONS]\n  yoi objective <COMMAND> [OPTIONS]\n  yoi ticket <COMMAND> [OPTIONS]\n  yoi memory lint [OPTIONS]\n\nOptions:\n  -r, --resume           Open the Pod picker and resume/attach a Pod\n      --workspace <PATH> Runtime workspace root (defaults to cwd)\n      --pod <NAME>       Attach/restore/create a Pod by name\n      --socket <PATH>    Attach to a specific Pod socket with --pod\n      --session <UUID>   Resume a specific session segment\n      --profile <REF>    Select a reusable Profile recipe\n  -h, --help             Print help\n"
     );
 }
 
