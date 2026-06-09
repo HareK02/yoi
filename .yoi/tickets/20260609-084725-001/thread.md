@@ -423,3 +423,46 @@ Validation evidence from reviewer:
   - `multi_pod::tests::panel_ticket_title_truncates_after_stable_columns`
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-09T11:21:05Z -->
+
+## Implementation report
+
+Coder fix-loop completed and is ready for re-review.
+
+Coder Pod:
+- `coder-panel-display-composer-keys`
+- New fix commit: `573b02fbfc258d9cdce01955a9e11fd2998fbcfd tui: clarify panel composer enter hints`
+- Branch status after fix: clean
+- Stopped after collecting output to reclaim delegated worktree scope.
+
+Fix summary:
+- When a Ticket row is selected but the global composer contains non-empty text, actionbar / target status now prioritizes the composer target `Enter` behavior instead of row action hints.
+- Added regression test `selected_ticket_row_with_non_empty_composer_shows_composer_enter_behavior`.
+- Updated branch-local panel row / queue notification tests to the current canonical Ticket ID display/wording.
+
+Classification of reviewer-noted full TUI failures:
+- `ticket_queue_notification_message_carries_routing_contract`: branch-local expectation drift from canonical Ticket id + title / planning return wording; fixed.
+- `panel_ticket_rows_use_aligned_columns_before_title`: branch-local expectation drift from canonical ID display; fixed while preserving stable-column assertion.
+- `panel_ticket_title_truncates_after_stable_columns`: same canonical-ID display expectation drift; fixed.
+
+Coder validation reported passed:
+- `cargo test -p tui composer_keys`
+- `cargo test -p tui multi_composer`
+- `cargo test -p tui multi_ctrl_t_does_not_switch_composer_target`
+- `cargo test -p tui multi_bare_panel_letters_append_to_composer_and_arrows_select_when_blank`
+- `cargo test -p tui multi_esc_clears_panel_focus_without_quitting`
+- `cargo test -p tui selected_ticket_row_with_non_empty_composer_shows_composer_enter_behavior`
+- `cargo test -p tui ticket_queue_notification_message_carries_routing_contract`
+- `cargo test -p tui panel_ticket_rows_use_aligned_columns_before_title`
+- `cargo test -p tui panel_ticket_title_truncates_after_stable_columns`
+- `cargo test -p tui`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo run -q -p yoi -- ticket doctor`
+- `cargo check --workspace`
+- `nix build .#yoi`
+
+Coder reports no remaining risks.
+
+---
