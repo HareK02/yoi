@@ -133,3 +133,58 @@ Routing context:
 - Handoff explicitly requires synthetic/minimal session fixtures for validation and avoids reading private real local session contents.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-09T07:26:46Z -->
+
+## Implementation report
+
+Coder implementation completed and is ready for sibling review.
+
+Coder Pod:
+- `coder-session-analytics-tooling`
+- Commit: `c1809b37b1816a73e18c7587b9952cf4fc7b43f3 feat: add session analytics tooling`
+- Worktree status before review: clean branch `session-analytics-tooling`
+- Stopped after collecting output to reclaim delegated worktree scope.
+
+Selected design:
+- Added `crates/session-analytics` with public `analyze_session(path) -> SessionReport`.
+- Parser is a tolerant `serde_json::Value` JSONL parser using `BufReader::lines()` instead of tightly coupling analytics to runtime schema enums.
+- Report avoids raw user input, raw tool arguments, raw file contents, and raw tool output snippets by default; it reports paths, counts, byte/line sizes, line/turn indexes, bounded diagnostics, and observation text.
+- Added thin CLI `yoi session analyze <SESSION_JSONL_PATH> --json` that delegates to the library crate.
+
+Implementation summary:
+- Tool usage summary: counts by tool name/kind, calls per turn, failed tool result count, and Bash file-inspection-like heuristic observations.
+- Repeated reads: by path and path+offset/limit, with intervening Edit/Write observation and post-context-lifecycle correlation.
+- Edit/write churn: counts by path, repeated edits, argument byte-size estimates, large replacement diagnostics, and `replace_all` observations.
+- Tool result size: output byte/line sizes, large result observations, and saved/truncated Bash result indicators.
+- Context lifecycle: observes `segment_start.compacted_from` and context/prune/compact-like extension events; correlation only, not causation.
+- Robustness: malformed/unknown JSONL entries produce bounded diagnostics; unreadable input file remains an error.
+
+Changed files:
+- `Cargo.toml`
+- `Cargo.lock`
+- `package.nix`
+- `crates/session-analytics/Cargo.toml`
+- `crates/session-analytics/src/lib.rs`
+- `crates/yoi/Cargo.toml`
+- `crates/yoi/src/main.rs`
+- `crates/yoi/src/session_cli.rs`
+
+Coder validation reported passed:
+- `cargo test -p session-analytics`
+- `cargo test -p yoi session_cli`
+- `cargo test -p yoi parse_session_analyze_uses_session_mode`
+- `cargo fmt --check`
+- `git diff --check`
+- `git diff --cached --check`
+- `cargo run -q -p yoi -- ticket doctor` -> `doctor: ok`
+- `cargo check --workspace`
+- `nix build .#yoi`
+- `result/bin/yoi session analyze --help`
+
+Residual risks noted by coder:
+- Parser is intentionally tolerant and may emit more diagnostics if future session JSONL shapes change.
+- Context lifecycle support is based on currently observable `segment_start.compacted_from` and context/prune/compact-like extension events.
+- Bash file-inspection detection is a lightweight heuristic and should be treated as an observation, not automatic blame.
+
+---
