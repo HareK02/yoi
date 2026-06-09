@@ -473,7 +473,10 @@ fn show(backend: &LocalTicketBackend, query: String) -> Result<TicketCliOutput, 
 }
 
 fn is_obsolete_ticket_frontmatter_key(key: &str) -> bool {
-    matches!(key, "legacy_ticket" | "needs_preflight")
+    matches!(
+        key,
+        "legacy_ticket" | "needs_preflight" | "action_required" | "attention_required"
+    )
 }
 
 fn comment(
@@ -1319,6 +1322,36 @@ mod tests {
                 .iter()
                 .any(|event| event.kind == TicketEventKind::Review)
         );
+    }
+
+    #[test]
+    fn ticket_cli_show_omits_obsolete_overlay_fields_from_legacy_frontmatter() {
+        let temp = TempDir::new().unwrap();
+        let created = run(&temp, &["create", "--title", "Legacy Overlay"]);
+        let ticket_id = created_id(&created);
+        let item_path = temp
+            .path()
+            .join(".yoi/tickets")
+            .join(&ticket_id)
+            .join("item.md");
+        let item = fs::read_to_string(&item_path).unwrap();
+        fs::write(
+            &item_path,
+            item.replacen(
+                "---\n",
+                "---\naction_required: legacy action\nattention_required: legacy attention\n",
+                1,
+            ),
+        )
+        .unwrap();
+
+        let shown = run(&temp, &["show", &ticket_id]);
+        assert_eq!(shown.status, TicketCliStatus::Success);
+        assert!(shown.stdout.contains("# Legacy Overlay"));
+        assert!(!shown.stdout.contains("action_required"));
+        assert!(!shown.stdout.contains("attention_required"));
+        assert!(!shown.stdout.contains("legacy action"));
+        assert!(!shown.stdout.contains("legacy attention"));
     }
 
     #[test]
