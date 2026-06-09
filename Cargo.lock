@@ -3200,6 +3200,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "session-analytics"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "session-metrics"
 version = "0.1.0"
 dependencies = [
@@ -4780,6 +4790,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "session-analytics",
  "session-store",
  "tempfile",
  "ticket",

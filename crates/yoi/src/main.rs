@@ -1,5 +1,6 @@
 mod memory_lint;
 mod objective_cli;
+mod session_cli;
 mod ticket_cli;
 
 use std::fmt;
@@ -17,6 +18,7 @@ enum Mode {
     MemoryLintHelp,
     MemoryLint(LintCliOptions),
     Objective(objective_cli::ObjectiveCli),
+    Session(session_cli::SessionCli),
     Ticket(ticket_cli::TicketCli),
     PodRuntime(Vec<String>),
     Keys,
@@ -75,6 +77,18 @@ async fn main() -> ExitCode {
             }
             Err(e) => {
                 eprintln!("yoi objective: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        Mode::Session(cli) => match session_cli::run(cli) {
+            Ok(output) => {
+                print!("{}", output.stdout);
+                match output.status {
+                    session_cli::SessionCliStatus::Success => ExitCode::SUCCESS,
+                }
+            }
+            Err(e) => {
+                eprintln!("yoi session: {e}");
                 ExitCode::FAILURE
             }
         },
@@ -146,6 +160,11 @@ fn parse_args_slice(args: &[String]) -> Result<Mode, ParseError> {
             let objective_cli = objective_cli::parse_objective_args(&args[1..])
                 .map_err(|e| ParseError(e.to_string()))?;
             return Ok(Mode::Objective(objective_cli));
+        }
+        "session" => {
+            let session_cli = session_cli::parse_session_args(&args[1..])
+                .map_err(|e| ParseError(e.to_string()))?;
+            return Ok(Mode::Session(session_cli));
         }
         "ticket" => {
             let ticket_cli =
@@ -414,7 +433,7 @@ fn parse_session_id(value: &str) -> Result<SegmentId, ParseError> {
 
 fn print_help() {
     println!(
-        "yoi\n\nUsage:\n  yoi [OPTIONS] [POD_NAME]\n  yoi panel [--workspace <PATH>]\n  yoi keys\n  yoi pod [POD_OPTIONS]\n  yoi objective <COMMAND> [OPTIONS]\n  yoi ticket <COMMAND> [OPTIONS]\n  yoi memory lint [OPTIONS]\n\nOptions:\n  -r, --resume           Open the Pod picker and resume/attach a Pod\n      --workspace <PATH> Runtime workspace root (defaults to cwd)\n      --pod <NAME>       Attach/restore/create a Pod by name\n      --socket <PATH>    Attach to a specific Pod socket with --pod\n      --session <UUID>   Resume a specific session segment\n      --profile <REF>    Select a reusable Profile recipe\n  -h, --help             Print help\n"
+        "yoi\n\nUsage:\n  yoi [OPTIONS] [POD_NAME]\n  yoi panel [--workspace <PATH>]\n  yoi keys\n  yoi pod [POD_OPTIONS]\n  yoi objective <COMMAND> [OPTIONS]\n  yoi session analyze <SESSION_JSONL_PATH> --json\n  yoi ticket <COMMAND> [OPTIONS]\n  yoi memory lint [OPTIONS]\n\nOptions:\n  -r, --resume           Open the Pod picker and resume/attach a Pod\n      --workspace <PATH> Runtime workspace root (defaults to cwd)\n      --pod <NAME>       Attach/restore/create a Pod by name\n      --socket <PATH>    Attach to a specific Pod socket with --pod\n      --session <UUID>   Resume a specific session segment\n      --profile <REF>    Select a reusable Profile recipe\n  -h, --help             Print help\n"
     );
 }
 
@@ -495,6 +514,17 @@ mod tests {
         match parse_args_from(["ticket", "doctor"]).unwrap() {
             Mode::Ticket(ticket_cli::TicketCli::Command(ticket_cli::TicketCommand::Doctor)) => {}
             _ => panic!("expected Ticket doctor mode"),
+        }
+    }
+
+    #[test]
+    fn parse_session_analyze_uses_session_mode() {
+        match parse_args_from(["session", "analyze", "/tmp/session.jsonl", "--json"]).unwrap() {
+            Mode::Session(session_cli::SessionCli::Analyze(options)) => {
+                assert_eq!(options.path, PathBuf::from("/tmp/session.jsonl"));
+                assert!(options.json);
+            }
+            _ => panic!("expected Session analyze mode"),
         }
     }
 
