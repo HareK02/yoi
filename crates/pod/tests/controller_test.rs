@@ -304,7 +304,7 @@ permission = "write"
 }
 
 #[tokio::test]
-async fn pod_management_feature_requires_delegation_scope() {
+async fn pods_feature_requires_delegation_scope() {
     let manifest = r#"
 [pod]
 name = "pod-management-feature-test"
@@ -317,7 +317,7 @@ model_id = "test-model"
 [worker]
 max_tokens = 100
 
-[feature.pod_management]
+[feature.pods]
 enabled = true
 
 [[scope.allow]]
@@ -331,7 +331,7 @@ permission = "write"
     assert!(result.is_err());
     let message = result.err().unwrap().to_string();
     assert!(
-        message.contains("[feature.pod_management].enabled = true requires non-empty"),
+        message.contains("[feature.pods].enabled = true requires non-empty"),
         "unexpected error: {message}"
     );
 }

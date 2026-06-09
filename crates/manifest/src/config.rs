@@ -74,7 +74,7 @@ pub struct FeatureConfigPartial {
     #[serde(default)]
     pub web: Option<FeatureFlagConfigPartial>,
     #[serde(default)]
-    pub pod_management: Option<FeatureFlagConfigPartial>,
+    pub pods: Option<FeatureFlagConfigPartial>,
     #[serde(default)]
     pub ticket: Option<TicketFeatureConfigPartial>,
     #[serde(default)]
@@ -87,11 +87,7 @@ impl FeatureConfigPartial {
             task: merge_option(self.task, other.task, FeatureFlagConfigPartial::merge),
             memory: merge_option(self.memory, other.memory, FeatureFlagConfigPartial::merge),
             web: merge_option(self.web, other.web, FeatureFlagConfigPartial::merge),
-            pod_management: merge_option(
-                self.pod_management,
-                other.pod_management,
-                FeatureFlagConfigPartial::merge,
-            ),
+            pods: merge_option(self.pods, other.pods, FeatureFlagConfigPartial::merge),
             ticket: merge_option(self.ticket, other.ticket, TicketFeatureConfigPartial::merge),
             ticket_orchestration: merge_option(
                 self.ticket_orchestration,
@@ -142,10 +138,7 @@ impl From<FeatureConfigPartial> for FeatureConfig {
                 .map(FeatureFlagConfig::from)
                 .unwrap_or_default(),
             web: value.web.map(FeatureFlagConfig::from).unwrap_or_default(),
-            pod_management: value
-                .pod_management
-                .map(FeatureFlagConfig::from)
-                .unwrap_or_default(),
+            pods: value.pods.map(FeatureFlagConfig::from).unwrap_or_default(),
             ticket: value
                 .ticket
                 .map(TicketFeatureConfig::from)
@@ -198,7 +191,7 @@ impl From<FeatureConfig> for FeatureConfigPartial {
             task: Some(value.task.into()),
             memory: Some(value.memory.into()),
             web: Some(value.web.into()),
-            pod_management: Some(value.pod_management.into()),
+            pods: Some(value.pods.into()),
             ticket: Some(value.ticket.into()),
             ticket_orchestration: Some(value.ticket_orchestration.into()),
         }
@@ -1434,7 +1427,7 @@ worker_max_turns = 7
         assert!(!manifest.feature.task.enabled);
         assert!(!manifest.feature.memory.enabled);
         assert!(!manifest.feature.web.enabled);
-        assert!(!manifest.feature.pod_management.enabled);
+        assert!(!manifest.feature.pods.enabled);
         assert!(!manifest.feature.ticket.enabled);
         assert!(!manifest.feature.ticket_orchestration.enabled);
     }
@@ -1544,7 +1537,7 @@ enabled = true
             TicketFeatureAccessConfig::Lifecycle
         );
         assert!(manifest.feature.web.enabled);
-        assert!(!manifest.feature.pod_management.enabled);
+        assert!(!manifest.feature.pods.enabled);
     }
 
     #[test]

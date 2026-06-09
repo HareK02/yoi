@@ -8,7 +8,7 @@ return base {
         task = { enabled = true },
         memory = { enabled = true },
         web = { enabled = true },
-        pod_management = { enabled = false },
+        pods = { enabled = false },
         ticket = { enabled = true, access = "lifecycle" },
         ticket_orchestration = { enabled = false },
     },

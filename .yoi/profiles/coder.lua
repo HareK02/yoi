@@ -6,10 +6,10 @@ return base {
     description = "Coder role profile: GPT-5.5 with bundled default behavior",
     model_ref = "codex-oauth/gpt-5.5",
     feature = {
-        task = { enabled = true },
+        task = { enabled = false },
         memory = { enabled = true },
         web = { enabled = true },
-        pod_management = { enabled = false },
+        pods = { enabled = false },
         ticket = { enabled = false, access = "lifecycle" },
         ticket_orchestration = { enabled = false },
     },

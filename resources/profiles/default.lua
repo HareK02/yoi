@@ -30,7 +30,7 @@ return profile {
         task = { enabled = true },
         memory = { enabled = true },
         web = { enabled = true },
-        pod_management = { enabled = false },
+        pods = { enabled = false },
         ticket = { enabled = false, access = "lifecycle" },
         ticket_orchestration = { enabled = false },
     },

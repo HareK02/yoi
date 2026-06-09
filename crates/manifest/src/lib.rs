@@ -97,7 +97,7 @@ pub struct FeatureConfig {
     #[serde(default)]
     pub web: FeatureFlagConfig,
     #[serde(default)]
-    pub pod_management: FeatureFlagConfig,
+    pub pods: FeatureFlagConfig,
     #[serde(default)]
     pub ticket: TicketFeatureConfig,
     #[serde(default)]
@@ -110,7 +110,7 @@ impl Default for FeatureConfig {
             task: FeatureFlagConfig::disabled(),
             memory: FeatureFlagConfig::disabled(),
             web: FeatureFlagConfig::disabled(),
-            pod_management: FeatureFlagConfig::disabled(),
+            pods: FeatureFlagConfig::disabled(),
             ticket: TicketFeatureConfig::default(),
             ticket_orchestration: FeatureFlagConfig::disabled(),
         }

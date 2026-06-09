@@ -595,11 +595,11 @@ where
     // loop's `PodEvent` handler). Expose them only behind the explicit
     // profile feature and require delegation authority up front so enabling
     // the surface cannot imply broad child scope by accident.
-    if feature_config.pod_management.enabled {
+    if feature_config.pods.enabled {
         if spawner_manifest.delegation_scope.allow.is_empty() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "[feature.pod_management].enabled = true requires non-empty [[delegation_scope.allow]]",
+                "[feature.pods].enabled = true requires non-empty [[delegation_scope.allow]]",
             ));
         }
         worker.register_tool(spawn_pod_tool(

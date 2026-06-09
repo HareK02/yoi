@@ -1480,7 +1480,7 @@ return profile {
     task = { enabled = true },
     memory = { enabled = false },
     web = { enabled = true },
-    pod_management = { enabled = true },
+    pods = { enabled = true },
     ticket = { enabled = true, access = "read_only" },
     ticket_orchestration = { enabled = false },
   },
@@ -1500,7 +1500,7 @@ return profile {
         assert!(resolved.manifest.feature.task.enabled);
         assert!(!resolved.manifest.feature.memory.enabled);
         assert!(resolved.manifest.feature.web.enabled);
-        assert!(resolved.manifest.feature.pod_management.enabled);
+        assert!(resolved.manifest.feature.pods.enabled);
         assert!(resolved.manifest.feature.ticket.enabled);
         assert_eq!(
             resolved.manifest.feature.ticket.access,
