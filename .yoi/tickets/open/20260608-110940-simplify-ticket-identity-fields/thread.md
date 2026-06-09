@@ -500,3 +500,32 @@ Coder validation reported passed:
 Coder reports no remaining requested surface or design conflict.
 
 ---
+
+<!-- event: review author: reviewer-simplify-ticket-identity-fields at: 2026-06-09T04:35:54Z status: request_changes -->
+
+## Review: request changes
+
+Review result: request_changes
+
+The previous three blockers were fixed, and the requested validation set passed. However, one stale old-bucket TUI test setup remains and a focused test fails.
+
+Blocking issue:
+- `crates/tui/src/multi_pod.rs` still contains an old bucket path in test setup:
+  - `.yoi/tickets/open/done-ticket`
+- Focused test failure:
+  - `cargo test -p tui ticket_close_action_blocks_existing_resolution_without_moving_ticket`
+  - exits 101 because the test writes `resolution.md` under `.yoi/tickets/open/done-ticket/`, but the current flat layout no longer creates that parent path.
+
+This is a test/helper path rather than production runtime behavior, but the Ticket requires completion of the flat `.yoi/tickets/<ticket-id>/` migration and no current old-bucket route. Executable tests should not encode old bucket paths.
+
+Positive evidence:
+- Built-in Ticket feature root validation no longer requires `open/`, `pending/`, `closed/` buckets.
+- Maintained workflows/docs no longer expose `TicketStatus`, pending routing, or `defer_pending` as current guidance.
+- Main requested validation passed: `cargo test -p pod ticket`, `cargo test -p ticket`, `cargo test -p yoi ticket_cli`, `cargo test -p tui ticket_action --no-run`, `cargo test -p tui workspace_panel`, `cargo fmt --check`, `git diff --check`, `cargo run -q -p yoi -- ticket doctor`, `cargo check --workspace`, `nix build .#yoi`.
+
+Required fix:
+- Update the stale TUI test setup in `crates/tui/src/multi_pod.rs` to the flat layout/current state schema.
+- Run the failing focused test: `cargo test -p tui ticket_close_action_blocks_existing_resolution_without_moving_ticket`.
+- Re-run the relevant focused validation and core checks before re-review.
+
+---
