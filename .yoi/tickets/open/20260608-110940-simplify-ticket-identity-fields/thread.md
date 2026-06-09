@@ -68,3 +68,47 @@ updated_at: ...
 Additional fields should justify a concrete behavior. Search/display hints without management authority should be removed or moved to separately designed features.
 
 ---
+
+<!-- event: plan author: intake at: 2026-06-09T00:16:54Z -->
+
+## Plan
+
+## Intake assessment: requirements sync needed
+
+この Ticket は既存 identity simplification に加えて、`status` / `workflow_state` / `kind` / `labels` を含む core Ticket frontmatter simplification へ scope が拡張されている。方向性は明確だが、実装前に schema/API/UX と移行方針として固定すべき判断が残っているため、現時点では `workflow_state: planning` のまま requirements sync が必要。
+
+### 既に決まっていること
+
+- canonical Ticket identity は title-derived slug words を含めない timestamp/counter primary key へ寄せる。
+- `slug` は required/current frontmatter および canonical lookup key から外す。
+- agents / Orchestrator は ID/title だけから意味を推測せず、routing/実装前に `TicketShow` の body/thread/artifacts を読む。
+- core frontmatter simplification は identity だけでなく lifecycle/kind/labels も対象に含める。
+- `kind` は required freeform field として残さない方向。
+- `labels` は unmanaged taxonomy として core required/current schema から外す方向。
+
+### 実装前に固定すべき open questions
+
+1. lifecycle field の最終名を `state` に変更するか、既存名 `workflow_state` を保持して single lifecycle field にするか。
+2. `done` と `closed` を distinct lifecycle states として残すか、close/resolution の表現をどう統合するか。
+3. `pending` bucket/status を完全に廃止するか、`deferred` / `parked` などの lifecycle state として置き換えるか。
+4. canonical ID を frontmatter に `id` として保持するか、directory name から derive するか。
+5. legacy slug/path lookup を migration-only としてどこまで読むか。unreleased local data として一括 migration し、current schema では permanent alias を作らない方針でよいか。
+6. `kind` / `labels` removal をこの Ticket の実装 scope に含めて同時 migration するか、identity/lifecycle の破壊的変更と分けるか。
+
+### Risk flags / reviewer focus
+
+- `ticket-schema`
+- `storage-migration`
+- `workflow-state`
+- `panel-actions`
+- `orchestrator-routing`
+- `backward-compatibility`
+- `typed-tool-api`
+
+Reviewer は diff だけでなく、CLI / typed Ticket tools / Panel / Orchestrator routing / local role-session claims / future relation metadata が、slug や two-axis state を authority として残していないことを確認する必要がある。
+
+### 次の Intake action
+
+上記 open questions に user/maintainer decision が入れば、Ticket を `implementation_ready` として `ready` にできる。未回答のまま進める場合は、先に design/spike として routing し、実装 Ticket とは分けるのが安全。
+
+---

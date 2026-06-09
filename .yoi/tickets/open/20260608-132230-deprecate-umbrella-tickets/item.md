@@ -6,9 +6,9 @@ status: 'open'
 kind: 'task'
 priority: 'P2'
 labels: ['ticket', 'workflow', 'documentation', 'planning']
-workflow_state: 'planning'
+workflow_state: 'ready'
 created_at: '2026-06-08T13:22:30Z'
-updated_at: '2026-06-08T13:22:30Z'
+updated_at: '2026-06-09T00:16:38Z'
 assignee: null
 ---
 
