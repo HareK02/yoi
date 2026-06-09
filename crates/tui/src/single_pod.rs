@@ -23,6 +23,7 @@ use tokio::sync::mpsc;
 use client::{PodClient, PodRuntimeCommand};
 
 use crate::app::{ActionbarNoticeLevel, ActionbarNoticeSource, App};
+use crate::composer_keys::{ComposerEditAction, composer_edit_action};
 use crate::picker::PickerOutcome;
 use crate::spawn::{SpawnOutcome, SpawnReady};
 use crate::{multi_pod, picker, spawn, ui};
@@ -537,6 +538,26 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
     }
 }
 
+fn apply_composer_edit_action(app: &mut App, action: ComposerEditAction) -> Option<Method> {
+    match action {
+        ComposerEditAction::InsertChar(c) => app.insert_char(c),
+        ComposerEditAction::InsertNewline => app.insert_newline(),
+        ComposerEditAction::DeleteBefore => app.delete_char_before(),
+        ComposerEditAction::DeleteAfter => app.delete_char_after(),
+        ComposerEditAction::DeleteWordBefore => app.delete_word_before_cursor(),
+        ComposerEditAction::MoveLeft => app.move_cursor_left(),
+        ComposerEditAction::MoveRight => app.move_cursor_right(),
+        ComposerEditAction::MoveWordLeft => app.move_cursor_word_left(),
+        ComposerEditAction::MoveWordRight => app.move_cursor_word_right(),
+        ComposerEditAction::MoveStart => app.move_cursor_start(),
+        ComposerEditAction::MoveHome => app.move_cursor_home(),
+        ComposerEditAction::MoveEnd => app.move_cursor_end(),
+        ComposerEditAction::MoveUp => app.move_cursor_up(),
+        ComposerEditAction::MoveDown => app.move_cursor_down(),
+    }
+    app.refresh_completion()
+}
+
 fn handle_key(app: &mut App, key: KeyEvent) -> Option<Method> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
@@ -579,25 +600,20 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Option<Method> {
         KeyCode::Char(c) if c.eq_ignore_ascii_case(&'r') && ctrl => {
             Some(app.request_rewind_picker())
         }
-        KeyCode::Char('a') if ctrl => {
-            app.move_cursor_start();
-            Some(app.refresh_completion())
-        }
-        KeyCode::Left if ctrl || alt => {
-            app.move_cursor_word_left();
-            Some(app.refresh_completion())
-        }
-        KeyCode::Right if ctrl || alt => {
-            app.move_cursor_word_right();
-            Some(app.refresh_completion())
-        }
-        KeyCode::Backspace if ctrl || alt => {
-            app.delete_word_before_cursor();
-            Some(app.refresh_completion())
-        }
-        KeyCode::Char('w') if ctrl => {
-            app.delete_word_before_cursor();
-            Some(app.refresh_completion())
+        _ if composer_edit_action(key).is_some_and(ComposerEditAction::is_modifier_action) => {
+            if app.is_command_mode()
+                && matches!(
+                    composer_edit_action(key),
+                    Some(ComposerEditAction::InsertNewline)
+                )
+            {
+                Some(None)
+            } else {
+                Some(apply_composer_edit_action(
+                    app,
+                    composer_edit_action(key).expect("checked above"),
+                ))
+            }
         }
         KeyCode::Char('u') if ctrl && app.is_command_mode() => {
             app.clear_command_input();
@@ -746,62 +762,40 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Option<Method> {
             None
         }
         KeyCode::Enter => app.submit_input(),
-        KeyCode::Backspace => {
-            app.delete_char_before();
-            app.refresh_completion()
-        }
-        KeyCode::Delete => {
-            app.delete_char_after();
-            app.refresh_completion()
-        }
-        KeyCode::Left => {
-            app.move_cursor_left();
-            app.refresh_completion()
-        }
-        KeyCode::Right => {
-            app.move_cursor_right();
-            app.refresh_completion()
-        }
-        KeyCode::Up => {
-            if app.can_browse_input_history_older() && app.browse_input_history_older() {
-                app.refresh_completion()
-            } else {
-                app.move_cursor_up();
-                app.refresh_completion()
+        _ if composer_edit_action(key).is_some() => {
+            match composer_edit_action(key).expect("checked above") {
+                ComposerEditAction::MoveUp => {
+                    if app.can_browse_input_history_older() && app.browse_input_history_older() {
+                        app.refresh_completion()
+                    } else {
+                        apply_composer_edit_action(app, ComposerEditAction::MoveUp)
+                    }
+                }
+                ComposerEditAction::MoveDown => {
+                    if app.can_browse_input_history_newer() && app.browse_input_history_newer() {
+                        app.refresh_completion()
+                    } else {
+                        apply_composer_edit_action(app, ComposerEditAction::MoveDown)
+                    }
+                }
+                ComposerEditAction::InsertChar(':') if !alt && app.input.is_empty() => {
+                    app.enter_command_mode();
+                    None
+                }
+                ComposerEditAction::InsertChar(c) => {
+                    // Whitespace ends an in-flight completion token. Try the
+                    // auto-confirm path first so an exact match (e.g. typed
+                    // `@src/main.rs` matches the only popup entry) becomes a
+                    // chip on the way out. Directories also commit here —
+                    // ending with a space is an explicit "I want this dir"
+                    // signal, not a drill-in.
+                    if c.is_whitespace() {
+                        app.chipify_completion_if_exact_match();
+                    }
+                    apply_composer_edit_action(app, ComposerEditAction::InsertChar(c))
+                }
+                action => apply_composer_edit_action(app, action),
             }
-        }
-        KeyCode::Down => {
-            if app.can_browse_input_history_newer() && app.browse_input_history_newer() {
-                app.refresh_completion()
-            } else {
-                app.move_cursor_down();
-                app.refresh_completion()
-            }
-        }
-        KeyCode::Home => {
-            app.move_cursor_home();
-            app.refresh_completion()
-        }
-        KeyCode::End => {
-            app.move_cursor_end();
-            app.refresh_completion()
-        }
-        KeyCode::Char(':') if !alt && app.input.is_empty() => {
-            app.enter_command_mode();
-            None
-        }
-        KeyCode::Char(c) => {
-            // Whitespace ends an in-flight completion token. Try the
-            // auto-confirm path first so an exact match (e.g. typed
-            // `@src/main.rs` matches the only popup entry) becomes a
-            // chip on the way out. Directories also commit here —
-            // ending with a space is an explicit "I want this dir"
-            // signal, not a drill-in.
-            if c.is_whitespace() {
-                app.chipify_completion_if_exact_match();
-            }
-            app.insert_char(c);
-            app.refresh_completion()
         }
         _ => None,
     }
