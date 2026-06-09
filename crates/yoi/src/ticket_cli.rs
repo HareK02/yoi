@@ -988,18 +988,6 @@ fn parse_list_limit(value: &str) -> Result<usize, TicketCliError> {
 
 fn ticket_cli_hints(ticket: &TicketSummary) -> String {
     let mut hints = Vec::new();
-    if let Some(attention) = ticket.attention_required.as_deref() {
-        hints.push(format!(
-            "attention:{}",
-            truncate_inline(attention, LIST_HINT_MAX_CHARS)
-        ));
-    }
-    if let Some(action) = ticket.action_required.as_deref() {
-        hints.push(format!(
-            "action:{}",
-            truncate_inline(action, LIST_HINT_MAX_CHARS)
-        ));
-    }
     if let Some(readiness) = ticket.readiness.as_deref() {
         hints.push(format!(
             "readiness:{}",

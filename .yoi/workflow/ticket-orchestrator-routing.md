@@ -214,7 +214,7 @@ Action:
 - `TicketComment` に review target と確認観点を記録する。
 - blocker 未解決のまま merge-ready としない。
 
-### `blocked_action_required`
+### `blocked_by_dependency_or_missing_authority`
 
 人間判断または外部イベント待ち。
 
@@ -229,7 +229,7 @@ Action:
 
 - 必要な判断・外部 action を短く書く。
 - `TicketComment` に blocked reason と next question を記録する。
-- 必要に応じて attention / action-required frontmatter や orchestration plan の blocker/waiting-capacity 記録で、待ち理由を current state とは別に表す。lifecycle 外の storage bucket へ移す route は使わない。
+- 必要に応じて typed relation metadata や orchestration plan の blocker/waiting-capacity 記録で、待ち理由を current state とは別に表す。lifecycle 外の storage bucket へ移す route は使わない。
 
 ### `close_ready`
 
@@ -393,7 +393,7 @@ IntentPacket が短く書けない場合、`implementation_ready` ではなく `
 - `spike_needed` → read-only investigation plan / Pod（許可後）
 - `implementation_ready` → `multi-agent-workflow`
 - `review_needed` → reviewer Pod / review workflow
-- `blocked_action_required` → human / parent Orchestrator
+- concrete blocker / missing decision → human / parent Orchestrator
 - `close_ready` → close workflow / maintainer decision
 
 ## 完了条件
@@ -410,7 +410,7 @@ IntentPacket が短く書けない場合、`implementation_ready` ではなく `
 
 - unattended scheduler。
 - LeaseStore / queue persistence。
-- action-required dashboard UI。
+- queue/dashboard UI。
 - automatic Pod spawning policy。
 - TicketUpdate tool の導入。
 - external tracker integration。

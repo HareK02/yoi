@@ -208,7 +208,7 @@ Routing classifications include:
 - `spike_needed`
 - `implementation_ready`
 - `review_needed`
-- `blocked_action_required`
+- `blocked_by_dependency_or_missing_authority`
 - `close_ready`
 - `closed_or_noop`
 
