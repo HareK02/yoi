@@ -1197,8 +1197,6 @@ mod tests {
             .execute(
                 &json!({
                     "title": "Tool Created",
-                    "slug": "tool-created",
-                    "labels": ["ticket", "tool"],
                     "body": "## Background\n\nCreated by tool.\n"
                 })
                 .to_string(),
@@ -1213,7 +1211,7 @@ mod tests {
         assert!(!created_text.contains("needs_preflight"));
 
         let listed = list
-            .execute(&json!({ "state": "open", "label": "tool" }).to_string())
+            .execute(&json!({ "state": "planning" }).to_string())
             .await
             .unwrap();
         assert!(listed.summary.contains("Listed 1 ticket"));
@@ -1226,7 +1224,7 @@ mod tests {
             .execute(&json!({ "id": id, "event_limit": 10 }).to_string())
             .await
             .unwrap();
-        assert!(shown.summary.contains("tool-created"));
+        assert!(shown.summary.contains(&id));
         let shown_content = shown.content.unwrap();
         assert!(shown_content.contains("Created by tool"));
         assert!(!shown_content.contains("legacy_ticket"));
@@ -1243,14 +1241,13 @@ mod tests {
         let created = backend.create(NewTicket::new("Flow Tool")).unwrap();
         let comment = tool_by_name(backend.clone(), "TicketComment");
         let review = tool_by_name(backend.clone(), "TicketReview");
-        let state = tool_by_name(backend.clone(), "TicketStatus");
         let close = tool_by_name(backend.clone(), "TicketClose");
         let doctor = tool_by_name(backend.clone(), "TicketDoctor");
 
         comment
             .execute(
                 &json!({
-                    "ticket": created.slug,
+                    "ticket": created.id.clone(),
                     "role": "implementation_report",
                     "body": "Implemented."
                 })
@@ -1261,16 +1258,12 @@ mod tests {
         review
             .execute(
                 &json!({
-                    "ticket": created.id,
+                    "ticket": created.id.clone(),
                     "result": "approve",
                     "body": "Looks good."
                 })
                 .to_string(),
             )
-            .await
-            .unwrap();
-        state
-            .execute(&json!({ "ticket": created.slug, "state": "pending" }).to_string())
             .await
             .unwrap();
         close
@@ -1283,7 +1276,7 @@ mod tests {
 
         let report = doctor.execute(&json!({}).to_string()).await.unwrap();
         assert!(report.summary.contains("0 error(s)"));
-        let closed = backend.show(TicketIdOrSlug::Query(created.slug)).unwrap();
+        let closed = backend.show(TicketIdOrSlug::Id(created.id)).unwrap();
         assert!(closed.resolution.is_some());
         assert!(
             closed
@@ -1301,7 +1294,7 @@ mod tests {
             closed
                 .events
                 .iter()
-                .any(|event| event.kind == TicketEventKind::StatusChanged)
+                .any(|event| event.kind == TicketEventKind::StateChanged)
         );
     }
 
@@ -1316,7 +1309,7 @@ mod tests {
         intake_ready
             .execute(
                 &json!({
-                    "ticket": created.slug,
+                    "ticket": created.id.clone(),
                     "intake_summary": "Requirements accepted; implementation can be queued.",
                     "author": "intake-pod"
                 })
@@ -1330,7 +1323,7 @@ mod tests {
         workflow
             .execute(
                 &json!({
-                    "ticket": created.slug,
+                    "ticket": created.id.clone(),
                     "from": "queued",
                     "to": "inprogress",
                     "reason": "orchestrator_started",
@@ -1344,7 +1337,7 @@ mod tests {
         workflow
             .execute(
                 &json!({
-                    "ticket": created.slug,
+                    "ticket": created.id.clone(),
                     "from": "inprogress",
                     "to": "done",
                     "reason": "implementation_complete",
@@ -1356,7 +1349,7 @@ mod tests {
             .await
             .unwrap();
 
-        let record = backend.show(TicketIdOrSlug::Query(created.slug)).unwrap();
+        let record = backend.show(TicketIdOrSlug::Id(created.id)).unwrap();
         assert_eq!(record.meta.workflow_state, TicketWorkflowState::Done);
         assert_eq!(record.meta.status.as_local(), Some(TicketStatus::Open));
         assert!(
@@ -1408,7 +1401,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let ready_record = backend.show(TicketIdOrSlug::Query(ready.slug)).unwrap();
+        let ready_record = backend.show(TicketIdOrSlug::Id(ready.id)).unwrap();
         assert_eq!(
             ready_record.meta.workflow_state,
             TicketWorkflowState::Planning
@@ -1437,7 +1430,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let queued_record = backend.show(TicketIdOrSlug::Query(queued.slug)).unwrap();
+        let queued_record = backend.show(TicketIdOrSlug::Id(queued.id)).unwrap();
         assert_eq!(
             queued_record.meta.workflow_state,
             TicketWorkflowState::Planning
@@ -1462,7 +1455,7 @@ mod tests {
         let error = workflow
             .execute(
                 &json!({
-                    "ticket": created.id,
+                    "ticket": created.id.clone(),
                     "from": "queued",
                     "to": "inprogress",
                     "reason": "orchestrator_started",
@@ -1474,7 +1467,7 @@ mod tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("state changed concurrently"));
-        let record = backend.show(TicketIdOrSlug::Query(created.slug)).unwrap();
+        let record = backend.show(TicketIdOrSlug::Id(created.id)).unwrap();
         assert_eq!(record.meta.workflow_state, TicketWorkflowState::Planning);
         assert_eq!(record.meta.status.as_local(), Some(TicketStatus::Open));
         assert!(!record.events.iter().any(|event| {
@@ -1556,7 +1549,7 @@ mod tests {
         let error = intake_ready
             .execute(
                 &json!({
-                    "ticket": created.id,
+                    "ticket": created.id.clone(),
                     "intake_summary": "Should not rewrite ready ticket."
                 })
                 .to_string(),
@@ -1565,7 +1558,7 @@ mod tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("state changed concurrently"));
-        let record = backend.show(TicketIdOrSlug::Query(created.slug)).unwrap();
+        let record = backend.show(TicketIdOrSlug::Id(created.id)).unwrap();
         assert_eq!(record.meta.workflow_state, TicketWorkflowState::Ready);
         assert!(!record.events.iter().any(|event| {
             event.kind == TicketEventKind::StateChanged
@@ -1585,9 +1578,9 @@ mod tests {
         let recorded = record
             .execute(
                 &json!({
-                    "ticket": first.slug,
+                    "ticket": first.id.clone(),
                     "kind": "blocked_by",
-                    "related_ticket": second.slug,
+                    "related_ticket": second.id.clone(),
                     "note": "Wait for the second Ticket's API boundary decision.",
                     "author": "orchestrator"
                 })
@@ -1614,7 +1607,7 @@ mod tests {
         let found_json: Value = serde_json::from_str(&found.content.unwrap()).unwrap();
         assert_eq!(found_json["count"], 1);
         assert_eq!(found_json["records"][0]["kind"], "blocked_by");
-        assert_eq!(found_json["records"][0]["related_ticket"], second.slug);
+        assert_eq!(found_json["records"][0]["related_ticket"], second.id);
 
         let current = backend.show(TicketIdOrSlug::Id(first.id)).unwrap();
         assert_eq!(current.meta.workflow_state, TicketWorkflowState::Planning);
@@ -1625,22 +1618,26 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let show = tool_by_name(backend(&temp), "TicketShow");
         let error = show
-            .execute(&json!({ "id": "a", "slug": "b" }).to_string())
+            .execute(&json!({ "id": "a", "query": "b" }).to_string())
             .await
             .unwrap_err();
         assert!(matches!(error, ToolError::InvalidArgument(_)));
     }
 
     #[tokio::test]
-    async fn ticket_create_slug_path_traversal_is_sanitized_under_backend_root() {
+    async fn ticket_create_uses_opaque_id_under_backend_root() {
         let temp = TempDir::new().unwrap();
         let backend = backend(&temp);
         let create = tool_by_name(backend.clone(), "TicketCreate");
-        create
-            .execute(&json!({ "title": "Escape", "slug": "../escape" }).to_string())
+        let output = create
+            .execute(&json!({ "title": "Escape" }).to_string())
             .await
             .unwrap();
+        let value: Value = serde_json::from_str(&output.content.unwrap()).unwrap();
+        let id = value["id"].as_str().unwrap();
+        assert!(!id.contains("escape"));
         assert!(!temp.path().join("escape").exists());
+        assert!(temp.path().join("tickets").join(id).is_dir());
         assert_eq!(backend.list(crate::TicketFilter::all()).unwrap().len(), 1);
     }
 

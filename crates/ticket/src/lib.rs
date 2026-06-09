@@ -2827,20 +2827,15 @@ mod tests {
     #[test]
     fn parses_item_frontmatter_and_optional_fields() {
         let item = r#"---
-id: 20260605-000000-example
-slug: example
 title: Example
-status: open
-kind: task
+state: ready
 priority: P1
-labels: [ticket, backend]
 created_at: 2026-06-05T00:00:00Z
 updated_at: 2026-06-05T00:00:00Z
 assignee: null
 readiness: implementation-ready
 risk_flags: [low, local]
 action_required: none
-workflow_state: ready
 attention_required: none
 queued_by: workspace-panel
 queued_at: 2026-06-05T00:01:00Z
@@ -2850,8 +2845,9 @@ queued_at: 2026-06-05T00:01:00Z
 "#;
         let parsed = parse_item(item).unwrap();
         let meta = ticket_meta(parsed.frontmatter, "20260609-000000-001".to_string());
-        assert_eq!(meta.id, "20260605-000000-example");
-        assert_eq!(meta.labels, vec!["ticket", "backend"]);
+        assert_eq!(meta.id, "20260609-000000-001");
+        assert_eq!(meta.slug, "20260609-000000-001");
+        assert!(meta.labels.is_empty());
         assert_eq!(meta.readiness.as_deref(), Some("implementation-ready"));
         assert_eq!(meta.risk_flags, vec!["low", "local"]);
         assert_eq!(meta.action_required.as_deref(), Some("none"));
@@ -2865,20 +2861,17 @@ queued_at: 2026-06-05T00:01:00Z
     #[test]
     fn yaml_frontmatter_preserves_typed_nulls_lists_and_quoted_strings() {
         let frontmatter = parse_ticket_frontmatter(
-            r#"labels:
-  - ticket
-  - backend
-risk_flags: [low, local]
+            r#"risk_flags: [low, local]
 assignee: ~
 attention_required: null
 action_required: "null"
 readiness: "~"
-workflow_state: planning
+state: planning
 "#,
         )
         .unwrap();
         let meta = ticket_meta(frontmatter, "20260609-000000-001".to_string());
-        assert_eq!(meta.labels, vec!["ticket", "backend"]);
+        assert!(meta.labels.is_empty());
         assert_eq!(meta.risk_flags, vec!["low", "local"]);
         assert_eq!(meta.assignee, None);
         assert_eq!(meta.attention_required, None);
@@ -2896,17 +2889,11 @@ workflow_state: planning
             "{labels_error}"
         );
 
-        let workflow_error = parse_ticket_frontmatter("workflow_state: almost").unwrap_err();
-        assert!(
-            workflow_error.contains("invalid workflow_state"),
-            "{workflow_error}"
-        );
+        let state_error = parse_ticket_frontmatter("state: almost").unwrap_err();
+        assert!(state_error.contains("invalid state"), "{state_error}");
 
-        let intake_error = parse_ticket_frontmatter("workflow_state: intake").unwrap_err();
-        assert!(
-            intake_error.contains("invalid workflow_state"),
-            "{intake_error}"
-        );
+        let intake_error = parse_ticket_frontmatter("state: intake").unwrap_err();
+        assert!(intake_error.contains("invalid state"), "{intake_error}");
     }
 
     #[test]
@@ -2922,12 +2909,31 @@ workflow_state: planning
         let mut input = NewTicket::new("Example Ticket");
         input.labels = vec!["ticket".into(), "backend".into()];
         let ticket = backend.create(input).unwrap();
-        let dir = tmp.path().join("tickets/open").join(&ticket.id);
+        let dir = tmp.path().join("tickets").join(&ticket.id);
         assert!(dir.join("item.md").exists());
         assert!(dir.join("thread.md").exists());
         assert!(dir.join("artifacts/.gitkeep").exists());
-        assert_eq!(ticket.slug, "example-ticket");
+        assert!(!ticket.id.contains("example"));
+        assert_eq!(ticket.slug, ticket.id);
         let item = fs::read_to_string(dir.join("item.md")).unwrap();
+        assert!(
+            item.contains("state: planning")
+                || item.contains("state: \"planning\"")
+                || item.contains("state: 'planning'")
+        );
+        for obsolete in [
+            "id:",
+            "slug:",
+            "status:",
+            "workflow_state:",
+            "kind:",
+            "labels:",
+        ] {
+            assert!(
+                !item.contains(obsolete),
+                "obsolete field {obsolete} in {item}"
+            );
+        }
         assert!(!item.contains("legacy_ticket:"));
         assert!(!item.contains("needs_preflight:"));
         let record = backend.show(TicketIdOrSlug::Id(ticket.id.clone())).unwrap();
@@ -2944,10 +2950,7 @@ workflow_state: planning
             .with_record_language(Some("Japanese"));
 
         let created = backend.create(NewTicket::new("日本語レコード")).unwrap();
-        let dir = backend
-            .root()
-            .join(TicketStatus::Open.as_str())
-            .join(created.id.as_str());
+        let dir = backend.root().join(created.id.as_str());
         let item = fs::read_to_string(dir.join("item.md")).unwrap();
         let thread = fs::read_to_string(dir.join("thread.md")).unwrap();
 
@@ -2962,8 +2965,6 @@ workflow_state: planning
         let tmp = TempDir::new().unwrap();
         let backend = backend(&tmp);
         let mut input = NewTicket::new("123");
-        input.slug = Some("numeric-looking-strings".to_string());
-        input.labels = vec!["123".into(), "01".into()];
         input.risk_flags = vec!["1".into(), "42".into()];
         input.assignee = Some("42".into());
         input.attention_required = Some("0".into());
@@ -2972,21 +2973,16 @@ workflow_state: planning
 
         let record = backend.show(TicketIdOrSlug::Id(ticket.id.clone())).unwrap();
         assert_eq!(record.meta.title, "123");
-        assert_eq!(record.meta.labels, vec!["123", "01"]);
+        assert!(record.meta.labels.is_empty());
         assert_eq!(record.meta.risk_flags, vec!["1", "42"]);
         assert_eq!(record.meta.assignee.as_deref(), Some("42"));
         assert_eq!(record.meta.attention_required.as_deref(), Some("0"));
         assert_eq!(record.meta.action_required.as_deref(), Some("true"));
 
-        let item = fs::read_to_string(
-            tmp.path()
-                .join("tickets/open")
-                .join(&ticket.id)
-                .join("item.md"),
-        )
-        .unwrap();
+        let item = fs::read_to_string(tmp.path().join("tickets").join(&ticket.id).join("item.md"))
+            .unwrap();
         assert!(item.contains("title: '123'"), "{item}");
-        assert!(item.contains("labels: ['123', '01']"), "{item}");
+        assert!(!item.contains("labels:"), "{item}");
         assert!(item.contains("risk_flags: ['1', '42']"), "{item}");
         assert!(item.contains("assignee: '42'"), "{item}");
         assert!(item.contains("attention_required: '0'"), "{item}");
@@ -3003,7 +2999,7 @@ workflow_state: planning
         let ticket = backend.create(NewTicket::new("Flow Ticket")).unwrap();
         backend
             .add_event(
-                TicketIdOrSlug::Slug(ticket.slug.clone()),
+                TicketIdOrSlug::Id(ticket.id.clone()),
                 NewTicketEvent::new(TicketEventKind::Plan, "Implementation plan."),
             )
             .unwrap();
@@ -3013,22 +3009,27 @@ workflow_state: planning
                 TicketReview::approve("Looks good."),
             )
             .unwrap();
+        let mut summary = TicketIntakeSummary::new("Ready for queue.");
+        summary.author = Some("test".to_string());
+        let mut change = TicketStateChange::new(
+            "planning",
+            "ready",
+            "ready_for_queue",
+            MarkdownText::new("Ready for queue."),
+        );
+        change.author = Some("test".to_string());
         backend
-            .set_status(TicketIdOrSlug::Id(ticket.id.clone()), TicketStatus::Pending)
+            .mark_intake_ready(TicketIdOrSlug::Id(ticket.id.clone()), summary, change)
             .unwrap();
-        let pending_item = tmp
-            .path()
-            .join("tickets/pending")
-            .join(&ticket.id)
-            .join("item.md");
-        assert!(pending_item.exists());
+        let current_item = tmp.path().join("tickets").join(&ticket.id).join("item.md");
+        assert!(current_item.exists());
         backend
             .close(
                 TicketIdOrSlug::Id(ticket.id.clone()),
                 MarkdownText::new("Done.\n"),
             )
             .unwrap();
-        let closed_dir = tmp.path().join("tickets/closed").join(&ticket.id);
+        let closed_dir = tmp.path().join("tickets").join(&ticket.id);
         assert!(closed_dir.join("resolution.md").exists());
         let thread = fs::read_to_string(closed_dir.join("thread.md")).unwrap();
         assert!(thread.contains("<!-- event: review"));
@@ -3047,7 +3048,7 @@ workflow_state: planning
             .unwrap();
         let thread_path = tmp
             .path()
-            .join("tickets/open")
+            .join("tickets")
             .join(&ticket.id)
             .join("thread.md");
         let original = fs::read_to_string(&thread_path).unwrap();
@@ -3084,16 +3085,17 @@ workflow_state: planning
         let tmp = TempDir::new().unwrap();
         let backend = backend(&tmp);
         let mut input = NewTicket::new("Invalid Author Ticket");
-        input.slug = Some("invalid-author-ticket".into());
         input.author = Some("bad-->author".into());
 
         assert!(matches!(
             backend.create(input),
             Err(TicketError::Conflict(_))
         ));
-        let open_dir = tmp.path().join("tickets/open");
-        let entries = fs::read_dir(open_dir).unwrap().count();
-        assert_eq!(entries, 0);
+        let ticket_dirs = fs::read_dir(tmp.path().join("tickets"))
+            .unwrap()
+            .filter(|entry| entry.as_ref().is_ok_and(|entry| entry.path().is_dir()))
+            .count();
+        assert_eq!(ticket_dirs, 0);
     }
 
     #[test]
@@ -3142,7 +3144,7 @@ workflow_state: planning
         );
         let thread = fs::read_to_string(
             tmp.path()
-                .join("tickets/open")
+                .join("tickets")
                 .join(&ticket.id)
                 .join("thread.md"),
         )
@@ -3161,11 +3163,7 @@ workflow_state: planning
         let ticket = backend
             .create(NewTicket::new("State Field Ticket"))
             .unwrap();
-        let item = tmp
-            .path()
-            .join("tickets/open")
-            .join(&ticket.id)
-            .join("item.md");
+        let item = tmp.path().join("tickets").join(&ticket.id).join("item.md");
         backend
             .set_frontmatter_fields(&item, &[("readiness", "requirements-sync")])
             .unwrap();
@@ -3205,11 +3203,11 @@ workflow_state: planning
     }
 
     #[test]
-    fn workflow_state_defaults_and_queue_transition_round_trip() {
+    fn state_defaults_and_queue_transition_round_trip() {
         let tmp = TempDir::new().unwrap();
         let backend = backend(&tmp);
         let missing_meta = ticket_meta(
-            parse_ticket_frontmatter("state: planning").expect("missing state parses"),
+            parse_ticket_frontmatter("title: Missing State").expect("missing state parses"),
             "20260609-000000-001".to_string(),
         );
         assert_eq!(missing_meta.workflow_state, TicketWorkflowState::Planning);
@@ -3219,8 +3217,8 @@ workflow_state: planning
             parse_ticket_frontmatter("state: closed").expect("closed state parses"),
             "20260609-000000-002".to_string(),
         );
-        assert_eq!(closed_meta.workflow_state, TicketWorkflowState::Done);
-        assert!(!closed_meta.workflow_state_explicit);
+        assert_eq!(closed_meta.workflow_state, TicketWorkflowState::Closed);
+        assert!(closed_meta.workflow_state_explicit);
 
         let mut ready_input = NewTicket::new("Ready Workflow");
         ready_input.workflow_state = Some(TicketWorkflowState::Ready);
@@ -3239,7 +3237,7 @@ workflow_state: planning
             .iter()
             .find(|event| event.kind == TicketEventKind::StateChanged)
             .unwrap();
-        assert_eq!(event.state_field.as_deref(), Some("workflow_state"));
+        assert_eq!(event.state_field.as_deref(), Some("state"));
         assert_eq!(event.from.as_deref(), Some("ready"));
         assert_eq!(event.to.as_deref(), Some("queued"));
         assert_eq!(event.reason.as_deref(), Some("queued"));
@@ -3267,7 +3265,7 @@ workflow_state: planning
     }
 
     #[test]
-    fn workflow_state_cannot_be_changed_through_generic_state_field_api() {
+    fn state_cannot_be_changed_through_generic_field_api() {
         let tmp = TempDir::new().unwrap();
         let backend = backend(&tmp);
         let ticket = backend
@@ -3277,15 +3275,11 @@ workflow_state: planning
             "planning",
             "done",
             "bypass",
-            "Generic state field API must not mutate workflow_state.",
+            "Generic field API must not mutate state.",
         );
 
         assert!(matches!(
-            backend.set_state_field(
-                TicketIdOrSlug::Id(ticket.id.clone()),
-                "workflow_state",
-                change
-            ),
+            backend.set_state_field(TicketIdOrSlug::Id(ticket.id.clone()), "state", change),
             Err(TicketError::Conflict(_))
         ));
         let record = backend.show(TicketIdOrSlug::Id(ticket.id)).unwrap();
@@ -3316,14 +3310,14 @@ workflow_state: planning
         );
         assert!(record.events.iter().any(|event| {
             event.kind == TicketEventKind::StateChanged
-                && event.state_field.as_deref() == Some("workflow_state")
+                && event.state_field.as_deref() == Some("state")
                 && event.from.as_deref() == Some("planning")
                 && event.to.as_deref() == Some("ready")
         }));
     }
 
     #[test]
-    fn close_sets_workflow_state_done() {
+    fn close_sets_state_closed() {
         let tmp = TempDir::new().unwrap();
         let backend = backend(&tmp);
         let mut input = NewTicket::new("Close Workflow");
@@ -3338,27 +3332,25 @@ workflow_state: planning
             .unwrap();
         let record = backend.show(TicketIdOrSlug::Id(ticket.id)).unwrap();
         assert_eq!(record.meta.status, ExtensibleTicketStatus::Closed);
-        assert_eq!(record.meta.workflow_state, TicketWorkflowState::Done);
+        assert_eq!(record.meta.workflow_state, TicketWorkflowState::Closed);
         assert!(record.events.iter().any(|event| {
             event.kind == TicketEventKind::StateChanged
-                && event.state_field.as_deref() == Some("workflow_state")
-                && event.to.as_deref() == Some("done")
+                && event.state_field.as_deref() == Some("state")
+                && event.to.as_deref() == Some("closed")
         }));
     }
 
     #[test]
-    fn doctor_reports_invalid_workflow_state() {
+    fn doctor_reports_invalid_state() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().join("tickets");
-        fs::create_dir_all(root.join("open/bad/artifacts")).unwrap();
+        fs::create_dir_all(root.join("20260609-000000-001/artifacts")).unwrap();
         fs::write(
-            root.join("open/bad/item.md"),
-            "---\nid: bad\nslug: bad\ntitle: Bad\nstatus: open\nkind: task\npriority: P2\nworkflow_state: almost\nlabels: []\ncreated_at: x\nupdated_at: x\nassignee: null\n---\n",
+            root.join("20260609-000000-001/item.md"),
+            "---\ntitle: Bad\nstate: almost\ncreated_at: x\nupdated_at: x\n---\n",
         )
         .unwrap();
-        fs::write(root.join("open/bad/thread.md"), "").unwrap();
-        fs::create_dir_all(root.join("pending")).unwrap();
-        fs::create_dir_all(root.join("closed")).unwrap();
+        fs::write(root.join("20260609-000000-001/thread.md"), "").unwrap();
 
         let report = LocalTicketBackend::new(&root).doctor().unwrap();
         let messages = report
@@ -3368,26 +3360,24 @@ workflow_state: planning
             .collect::<Vec<_>>()
             .join("\n");
         assert!(!report.is_ok());
-        assert!(messages.contains("invalid workflow_state"));
+        assert!(messages.contains("invalid state"), "{messages}");
     }
 
     #[test]
     fn doctor_validates_typed_thread_event_attributes() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().join("tickets");
-        fs::create_dir_all(root.join("open/bad/artifacts")).unwrap();
+        fs::create_dir_all(root.join("20260609-000000-001/artifacts")).unwrap();
         fs::write(
-            root.join("open/bad/item.md"),
-            "---\nid: bad\nslug: bad\ntitle: Bad\nstatus: open\nkind: task\npriority: P2\nlabels: []\ncreated_at: x\nupdated_at: x\nassignee: null\n---\n",
+            root.join("20260609-000000-001/item.md"),
+            "---\ntitle: Bad\nstate: planning\ncreated_at: x\nupdated_at: x\n---\n",
         )
         .unwrap();
         fs::write(
-            root.join("open/bad/thread.md"),
+            root.join("20260609-000000-001/thread.md"),
             "<!-- event: state_changed author: bot at: now from: queued -->\n\n## State changed\n\n---\n\n<!-- event: intake_summary author: bot at: now -->\n\n## Intake summary\n\n---\n",
         )
         .unwrap();
-        fs::create_dir_all(root.join("pending")).unwrap();
-        fs::create_dir_all(root.join("closed")).unwrap();
         let report = LocalTicketBackend::new(&root).doctor().unwrap();
         let messages = report
             .diagnostics
@@ -3405,25 +3395,24 @@ workflow_state: planning
     fn doctor_reports_core_consistency_errors() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().join("tickets");
-        fs::create_dir_all(root.join("open/bad/artifacts")).unwrap();
+        fs::create_dir_all(root.join("open/legacy/artifacts")).unwrap();
         fs::write(
-            root.join("open/bad/item.md"),
-            "---\nid: other\nslug: dup\ntitle: Bad\nstatus: pending\nkind: task\npriority: P2\nlabels: []\ncreated_at: x\nupdated_at: x\nassignee: null\n---\n",
+            root.join("open/legacy/item.md"),
+            "---\ntitle: Legacy\nstate: planning\ncreated_at: x\nupdated_at: x\n---\n",
+        )
+        .unwrap();
+        fs::write(root.join("open/legacy/thread.md"), "").unwrap();
+        fs::create_dir_all(root.join("20260609-000000-001/artifacts")).unwrap();
+        fs::write(
+            root.join("20260609-000000-001/item.md"),
+            "---\nid: old\nslug: old\ntitle: Bad\nstatus: pending\nworkflow_state: ready\nkind: task\nlabels: []\ncreated_at: x\nupdated_at: x\n---\n",
         )
         .unwrap();
         fs::write(
-            root.join("open/bad/thread.md"),
+            root.join("20260609-000000-001/thread.md"),
             "<!-- event: review author: a at: now -->\n",
         )
         .unwrap();
-        fs::create_dir_all(root.join("pending/other/artifacts")).unwrap();
-        fs::write(
-            root.join("pending/other/item.md"),
-            "---\nid: other\nslug: dup\ntitle: Dup\nstatus: pending\nkind: task\npriority: P2\nlabels: []\ncreated_at: x\nupdated_at: x\nassignee: null\n---\n",
-        )
-        .unwrap();
-        fs::write(root.join("pending/other/thread.md"), "").unwrap();
-        fs::create_dir_all(root.join("closed")).unwrap();
         let report = LocalTicketBackend::new(&root).doctor().unwrap();
         let messages = report
             .diagnostics
@@ -3432,10 +3421,13 @@ workflow_state: planning
             .collect::<Vec<_>>()
             .join("\n");
         assert!(!report.is_ok());
-        assert!(messages.contains("directory id mismatch"));
-        assert!(messages.contains("status mismatch"));
-        assert!(messages.contains("duplicate id: other"));
-        assert!(messages.contains("duplicate slug: dup"));
+        assert!(messages.contains("legacy ticket bucket remains"));
+        assert!(messages.contains("obsolete current frontmatter field 'id'"));
+        assert!(messages.contains("obsolete current frontmatter field 'slug'"));
+        assert!(messages.contains("obsolete current frontmatter field 'status'"));
+        assert!(messages.contains("obsolete current frontmatter field 'workflow_state'"));
+        assert!(messages.contains("obsolete current frontmatter field 'kind'"));
+        assert!(messages.contains("obsolete current frontmatter field 'labels'"));
         assert!(messages.contains("review event missing valid status"));
     }
 
@@ -3462,17 +3454,15 @@ workflow_state: planning
     fn rejects_unsafe_components_for_status_moves() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().join("tickets");
-        fs::create_dir_all(root.join("open/bad/artifacts")).unwrap();
+        fs::create_dir_all(root.join("20260609-000000-001/artifacts")).unwrap();
         fs::write(
-            root.join("open/bad/item.md"),
-            "---\nid: ../bad\nslug: bad\ntitle: Bad\nstatus: open\nkind: task\npriority: P2\nlabels: []\ncreated_at: x\nupdated_at: x\nassignee: null\n---\n",
+            root.join("20260609-000000-001/item.md"),
+            "---\ntitle: Safe\nstate: planning\ncreated_at: x\nupdated_at: x\n---\n",
         )
         .unwrap();
-        fs::write(root.join("open/bad/thread.md"), "").unwrap();
-        fs::create_dir_all(root.join("pending")).unwrap();
-        fs::create_dir_all(root.join("closed")).unwrap();
+        fs::write(root.join("20260609-000000-001/thread.md"), "").unwrap();
         let err = LocalTicketBackend::new(&root)
-            .set_status(TicketIdOrSlug::Slug("bad".into()), TicketStatus::Pending)
+            .set_status(TicketIdOrSlug::Id("../bad".into()), TicketStatus::Pending)
             .unwrap_err();
         assert!(matches!(err, TicketError::InvalidPathComponent(_)));
     }
@@ -3489,7 +3479,7 @@ workflow_state: planning
                 TicketIdOrSlug::Id(first.id.clone()),
                 NewOrchestrationPlanRecord {
                     kind: OrchestrationPlanKind::Before,
-                    related_ticket: Some(second.slug.clone()),
+                    related_ticket: Some(second.id.clone()),
                     note: Some(
                         "First must land before second because both touch routing.".to_string(),
                     ),
@@ -3503,7 +3493,7 @@ workflow_state: planning
 
         backend
             .add_orchestration_plan_record(
-                TicketIdOrSlug::Slug(first.slug.clone()),
+                TicketIdOrSlug::Id(first.id.clone()),
                 NewOrchestrationPlanRecord {
                     kind: OrchestrationPlanKind::AcceptedPlan,
                     related_ticket: None,
@@ -3523,7 +3513,7 @@ workflow_state: planning
             .unwrap();
 
         let ticket_records = backend
-            .query_orchestration_plan_records(Some(TicketIdOrSlug::Query(first.slug.clone())), None)
+            .query_orchestration_plan_records(Some(TicketIdOrSlug::Query(first.id.clone())), None)
             .unwrap();
         assert_eq!(ticket_records.len(), 2);
         assert!(
@@ -3538,13 +3528,12 @@ workflow_state: planning
         assert_eq!(before_records.len(), 1);
         assert_eq!(
             before_records[0].related_ticket.as_deref(),
-            Some(second.slug.as_str())
+            Some(second.id.as_str())
         );
 
         let path = temp
             .path()
             .join("tickets")
-            .join("open")
             .join(&first.id)
             .join("artifacts")
             .join(ORCHESTRATION_PLAN_ARTIFACT);
@@ -3579,7 +3568,6 @@ workflow_state: planning
         let artifact = temp
             .path()
             .join("tickets")
-            .join("open")
             .join(&ticket.id)
             .join("artifacts")
             .join(ORCHESTRATION_PLAN_ARTIFACT);
