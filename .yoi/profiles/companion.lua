@@ -5,7 +5,7 @@ return base {
     description = "Companion role profile: GPT-5.5 with bundled default behavior",
     model_ref = "codex-oauth/gpt-5.5",
     feature = {
-        task = { enabled = true },
+        task = { enabled = false },
         memory = { enabled = true },
         web = { enabled = true },
         pods = { enabled = false },

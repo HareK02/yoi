@@ -304,6 +304,98 @@ permission = "write"
 }
 
 #[tokio::test]
+async fn project_role_tool_surfaces_keep_task_disabled_and_pods_role_scoped() {
+    struct Case {
+        role: &'static str,
+        pods_enabled: bool,
+    }
+
+    let cases = [
+        Case {
+            role: "orchestrator",
+            pods_enabled: true,
+        },
+        Case {
+            role: "coder",
+            pods_enabled: false,
+        },
+        Case {
+            role: "intake",
+            pods_enabled: false,
+        },
+        Case {
+            role: "reviewer",
+            pods_enabled: false,
+        },
+        Case {
+            role: "companion",
+            pods_enabled: false,
+        },
+    ];
+
+    for case in cases {
+        let delegation = if case.pods_enabled {
+            r#"
+[[delegation_scope.allow]]
+target = "/tmp"
+permission = "write"
+"#
+        } else {
+            ""
+        };
+        let manifest = format!(
+            r#"
+[pod]
+name = "role-surface-{role}"
+pwd = "./"
+
+[model]
+scheme = "anthropic"
+model_id = "test-model"
+
+[worker]
+max_tokens = 100
+
+[feature.task]
+enabled = false
+
+[feature.pods]
+enabled = {pods_enabled}
+
+[[scope.allow]]
+target = "./"
+permission = "write"
+{delegation}
+"#,
+            role = case.role,
+            pods_enabled = case.pods_enabled,
+            delegation = delegation,
+        );
+        let client = MockClient::new(simple_text_events());
+        let client_for_assert = client.clone();
+        let pod = make_pod_with_pwd_and_manifest(client, &manifest).await.0;
+        let handle = spawn_controller(pod).await;
+
+        handle.send(Method::run_text("Hello")).await.unwrap();
+        wait_for_status(&handle, PodStatus::Idle).await;
+
+        let request = wait_for_captured_request(&client_for_assert).await;
+        let names = request_tool_names(&request);
+        assert!(
+            !names.iter().any(|name| name == "TaskCreate"),
+            "{} role must not expose Task tools: {names:?}",
+            case.role
+        );
+        assert_eq!(
+            names.iter().any(|name| name == "SpawnPod"),
+            case.pods_enabled,
+            "{} role Pod tool exposure mismatch: {names:?}",
+            case.role
+        );
+    }
+}
+
+#[tokio::test]
 async fn pods_feature_requires_delegation_scope() {
     let manifest = r#"
 [pod]

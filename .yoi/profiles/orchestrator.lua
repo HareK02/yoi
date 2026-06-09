@@ -6,7 +6,7 @@ return base {
     description = "Orchestrator role profile: GPT-5.5 with bundled default behavior",
     delegation_scope = scope.workspace_write(),
     feature = {
-        task = { enabled = true },
+        task = { enabled = false },
         memory = { enabled = true },
         web = { enabled = true },
         pods = { enabled = true },
