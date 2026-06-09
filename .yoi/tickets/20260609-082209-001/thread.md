@@ -21,3 +21,12 @@ LocalTicketBackend によって作成されました。
 Intake が既存 Ticket の要件を確認し、Orchestrator が routing できる状態と判断したため planning から ready に遷移します。実装はまだ開始しません。
 
 ---
+
+<!-- event: state_changed author: workspace-panel at: 2026-06-09T10:31:11Z from: ready to: queued reason: queued field: state -->
+
+## State changed
+
+Ticket を `workspace-panel` が queued にしました。
+
+
+---

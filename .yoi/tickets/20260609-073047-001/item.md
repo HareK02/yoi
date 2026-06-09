@@ -1,9 +1,11 @@
 ---
 title: 'Ticket と Objective の ID を base32 timestamp 形式に統一する'
-state: 'planning'
+state: 'queued'
 created_at: '2026-06-09T07:30:47Z'
-updated_at: '2026-06-09T07:30:47Z'
+updated_at: '2026-06-09T10:31:17Z'
 assignee: null
+queued_by: 'workspace-panel'
+queued_at: '2026-06-09T10:31:17Z'
 ---
 
 ## 背景

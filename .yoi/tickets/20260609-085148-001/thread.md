@@ -21,3 +21,12 @@ LocalTicketBackend によって作成されました。
 Intake で既存 Ticket の本文・thread・artifacts と関連する closed Ticket `20260609-032533-001` を確認した。要件は実装・レビュー・検証できる粒度まで整理済みであり、planning から ready にする。
 
 ---
+
+<!-- event: state_changed author: workspace-panel at: 2026-06-09T10:31:14Z from: ready to: queued reason: queued field: state -->
+
+## State changed
+
+Ticket を `workspace-panel` が queued にしました。
+
+
+---
