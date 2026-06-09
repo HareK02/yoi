@@ -198,3 +198,34 @@ Reported validation:
 Reviewer should verify migration/reference correctness and whether the committed mapping artifact under the migrated current Ticket is the right durable location.
 
 ---
+
+<!-- event: review author: reviewer-base32-record-ids at: 2026-06-09T13:24:34Z status: approve -->
+
+## Review: approve
+
+Approved after external review of implementation commit `4203988 feat: unify project record ids`.
+
+Findings:
+- Shared `crates/project-record` helper is used by both Ticket and Objective creation paths.
+- Fixed-width 13-char base32 Unix epoch millisecond IDs preserve lexicographic chronological order.
+- Collision handling uses bounded `+1ms` retry with no suffix/counter/random tail.
+- `created_at` / `updated_at` remain human-readable frontmatter and are not silently replaced by collision-adjusted ID timestamps.
+- Ticket and Objective current validation/list/show/doctor paths use canonical record IDs.
+- Repository migration is coherent across Ticket dirs, Objective dirs, relation artifacts, orchestration-plan artifacts, linked tickets, docs, and tests.
+- `id-migration-map.txt` under the migrated Ticket artifact is acceptable audit evidence and does not pollute schema/list/doctor behavior.
+
+Validation run by reviewer and passed:
+- `git diff --check HEAD^..HEAD`
+- `cargo test -q -p project-record`
+- `cargo test -q -p ticket`
+- `cargo test -q -p yoi objective_cli`
+- `cargo fmt --check`
+- `cargo run -q -p yoi -- ticket doctor`
+- `cargo run -q -p yoi -- objective doctor`
+- `cargo check --workspace`
+- `nix build .#yoi`
+- `git status --short --untracked-files=all`
+
+Result: approve, merge-ready. Residual risk: migration map intentionally retains old ID strings for audit; not a blocker.
+
+---
