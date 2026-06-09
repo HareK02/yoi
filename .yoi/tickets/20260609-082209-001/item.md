@@ -2,7 +2,7 @@
 title: 'Profile feature flagsでtool surfaceを制御する'
 state: 'inprogress'
 created_at: '2026-06-09T08:22:09Z'
-updated_at: '2026-06-09T12:38:26Z'
+updated_at: '2026-06-09T12:42:04Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-06-09T10:31:11Z'

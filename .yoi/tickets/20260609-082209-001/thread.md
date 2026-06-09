@@ -344,3 +344,33 @@ Validation after fix:
 - `cargo check --workspace`
 
 ---
+
+<!-- event: review author: reviewer-profile-feature-flags-tool-surface-r4 at: 2026-06-09T12:42:04Z status: approve -->
+
+## Review: approve
+
+Fourth-pass final re-review result: approve.
+
+Evidence:
+- Prior naming finding remains fixed: user-facing feature syntax is `feature.pods` and the controller error/test/profile surfaces use `[feature.pods]`.
+- Prior role-default finding remains fixed: actual project Coder/Intake/Orchestrator/Reviewer/Companion profiles set `feature.task.enabled = false`; Orchestrator enables Ticket lifecycle, Ticket orchestration, and Pods, while Coder/Reviewer/Companion do not expose Ticket/Ticket orchestration/Pods and Intake exposes basic Ticket only.
+- Prior test-coverage finding is now satisfied by the combination of:
+  - `actual_project_role_profiles_resolve_explicit_feature_defaults`, which loads the actual project role Lua files with `include_str!`, resolves all five role profiles, and asserts Task/Ticket/Ticket-orchestration/Pods defaults; and
+  - `project_role_tool_surfaces_keep_task_disabled_and_pods_role_scoped`, which verifies the controller tool definition list omits Task tools and exposes Pod tools only when the resolved feature flag enables them.
+- The registration path is feature-config driven (`register_pod_tools` checks `feature_config.*.enabled`) rather than role-name driven, so the actual-profile default regression plus controller surface regression covers the previous drift mode.
+
+Validation run in this pass:
+- `cargo test -p manifest actual_project_role_profiles_resolve_explicit_feature_defaults --lib` passed.
+- `cargo test -p pod project_role_tool_surfaces_keep_task_disabled_and_pods_role_scoped --test controller_test` passed.
+- `cargo fmt --check` passed.
+- `git diff --check` passed.
+- `cargo run -q -p yoi -- ticket doctor` passed (`doctor: ok`).
+- `nix build .#yoi` passed.
+- `git status --short` was clean before recording this review.
+
+Merge readiness: approved and merge-ready from review perspective.
+
+Residual risks:
+- The project role coverage is compositional rather than a single E2E test that launches via `project:<role>` selectors and asserts each actual role's live tool schema. Given the current controller path uses resolved manifest feature flags directly, this is acceptable for this Ticket; an E2E selector/schema test can be added later if the role launcher path gains additional behavior.
+
+---
