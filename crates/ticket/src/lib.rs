@@ -23,8 +23,11 @@ const REQUIRED_FIELDS: [&str; 4] = ["title", "state", "created_at", "updated_at"
 const MAX_STATE_CHANGE_REASON_BYTES: usize = 1024;
 const MAX_INTAKE_SUMMARY_BODY_BYTES: usize = 16 * 1024;
 const ORCHESTRATION_PLAN_ARTIFACT: &str = "orchestration-plan.jsonl";
+const TICKET_RELATIONS_ARTIFACT: &str = "relations.json";
 const MAX_ORCHESTRATION_PLAN_TEXT_BYTES: usize = 16 * 1024;
 const MAX_ORCHESTRATION_PLAN_FIELD_BYTES: usize = 1024;
+const MAX_TICKET_RELATION_NOTE_BYTES: usize = 16 * 1024;
+const MAX_TICKET_RELATION_FIELD_BYTES: usize = 1024;
 const DEFAULT_TICKET_BODY: &str =
     "## Background\n\nCreated by LocalTicketBackend.\n\n## Acceptance criteria\n\n- TBD\n";
 const JAPANESE_TICKET_BODY: &str =
@@ -531,6 +534,107 @@ pub struct TicketRef {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum TicketRelationKind {
+    DependsOn,
+    Blocks,
+    Related,
+    Supersedes,
+    DuplicateOf,
+}
+
+impl TicketRelationKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DependsOn => "depends_on",
+            Self::Blocks => "blocks",
+            Self::Related => "related",
+            Self::Supersedes => "supersedes",
+            Self::DuplicateOf => "duplicate_of",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "depends_on" => Some(Self::DependsOn),
+            "blocks" => Some(Self::Blocks),
+            "related" => Some(Self::Related),
+            "supersedes" => Some(Self::Supersedes),
+            "duplicate_of" => Some(Self::DuplicateOf),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for TicketRelationKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewTicketRelation {
+    pub kind: TicketRelationKind,
+    pub target: String,
+    pub note: Option<String>,
+    pub author: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TicketRelation {
+    pub ticket_id: String,
+    pub kind: TicketRelationKind,
+    pub target: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    pub author: String,
+    pub at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TicketRelationArtifact {
+    version: u32,
+    #[serde(default)]
+    relations: Vec<TicketRelation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DerivedTicketRelation {
+    pub source_ticket: String,
+    pub inverse_kind: String,
+    pub forward_kind: TicketRelationKind,
+    pub note: Option<String>,
+    pub author: String,
+    pub at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TicketRelationBlocker {
+    pub blocking_ticket: String,
+    pub reason_kind: String,
+    pub relation_kind: TicketRelationKind,
+    pub note: Option<String>,
+    pub blocking_state: TicketWorkflowState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TicketRelationNotice {
+    pub related_ticket: String,
+    pub kind: TicketRelationKind,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TicketRelationView {
+    pub outgoing: Vec<TicketRelation>,
+    pub incoming: Vec<DerivedTicketRelation>,
+    pub blockers: Vec<TicketRelationBlocker>,
+    pub notices: Vec<TicketRelationNotice>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum OrchestrationPlanKind {
     Before,
     After,
@@ -702,6 +806,7 @@ pub struct Ticket {
     pub document: TicketDocument,
     pub events: Vec<TicketEvent>,
     pub artifacts: Vec<TicketArtifactRef>,
+    pub relations: TicketRelationView,
     pub resolution: Option<MarkdownText>,
 }
 
@@ -775,6 +880,17 @@ pub trait TicketBackend {
     fn queue_ready(&self, id: TicketIdOrSlug, queued_by: &str) -> Result<()>;
     fn review(&self, id: TicketIdOrSlug, review: TicketReview) -> Result<()>;
     fn close(&self, id: TicketIdOrSlug, resolution: MarkdownText) -> Result<()>;
+    fn add_ticket_relation(
+        &self,
+        id: TicketIdOrSlug,
+        relation: NewTicketRelation,
+    ) -> Result<TicketRelation>;
+    fn query_ticket_relations(
+        &self,
+        ticket: Option<TicketIdOrSlug>,
+        kind: Option<TicketRelationKind>,
+    ) -> Result<Vec<TicketRelation>>;
+    fn relation_view(&self, id: TicketIdOrSlug) -> Result<TicketRelationView>;
     fn add_orchestration_plan_record(
         &self,
         id: TicketIdOrSlug,
@@ -950,6 +1066,7 @@ impl LocalTicketBackend {
             Vec::new()
         };
         let artifacts = collect_artifacts(&dir.join("artifacts"))?;
+        let relations = self.relation_view_for_meta(&meta)?;
         let resolution_path = dir.join("resolution.md");
         let resolution = if resolution_path.exists() {
             Some(MarkdownText::new(
@@ -963,6 +1080,7 @@ impl LocalTicketBackend {
             document,
             events,
             artifacts,
+            relations,
             resolution,
         })
     }
@@ -1094,6 +1212,52 @@ impl LocalTicketBackend {
 
     fn orchestration_plan_path(&self, dir: &Path) -> PathBuf {
         dir.join("artifacts").join(ORCHESTRATION_PLAN_ARTIFACT)
+    }
+
+    fn ticket_relations_path(&self, dir: &Path) -> PathBuf {
+        dir.join("artifacts").join(TICKET_RELATIONS_ARTIFACT)
+    }
+
+    fn read_ticket_relations_for_dir(&self, dir: &Path) -> Result<Vec<TicketRelation>> {
+        let item = dir.join("item.md");
+        let meta = ticket_meta_for_dir(dir, read_item_file(&item)?.frontmatter)?;
+        let path = self.ticket_relations_path(dir);
+        read_ticket_relations_artifact(&path, Some(&meta))
+    }
+
+    fn all_ticket_relation_records(&self) -> Result<Vec<TicketRelation>> {
+        let mut relations = Vec::new();
+        for dir in self.iter_ticket_dirs(TicketFilter::all())? {
+            relations.extend(self.read_ticket_relations_for_dir(&dir)?);
+        }
+        relations.sort_by(|a, b| {
+            a.ticket_id
+                .cmp(&b.ticket_id)
+                .then_with(|| a.kind.cmp(&b.kind))
+                .then_with(|| a.target.cmp(&b.target))
+                .then_with(|| a.at.cmp(&b.at))
+        });
+        Ok(relations)
+    }
+
+    fn relation_view_for_meta(&self, meta: &TicketMeta) -> Result<TicketRelationView> {
+        let states = self.ticket_state_index()?;
+        let all = self.all_ticket_relation_records()?;
+        Ok(relation_view_from_records(meta, &all, &states))
+    }
+
+    fn ticket_state_index(&self) -> Result<HashMap<String, TicketWorkflowState>> {
+        let mut states = HashMap::new();
+        for dir in self.iter_ticket_dirs(TicketFilter::all())? {
+            let item = dir.join("item.md");
+            let meta = ticket_meta_for_dir(&dir, read_item_file(&item)?.frontmatter)?;
+            states.insert(meta.id, meta.workflow_state);
+        }
+        Ok(states)
+    }
+
+    fn relation_blockers_for_meta(&self, meta: &TicketMeta) -> Result<Vec<TicketRelationBlocker>> {
+        Ok(self.relation_view_for_meta(meta)?.blockers)
     }
 
     fn read_orchestration_plan_records_for_dir(
@@ -1337,6 +1501,18 @@ impl TicketBackend for LocalTicketBackend {
         }
         let _lock = self.acquire_lock()?;
         let dir = self.find_ticket_dir(&id)?;
+        if from == TicketWorkflowState::Queued && to == TicketWorkflowState::InProgress {
+            let item = dir.join("item.md");
+            let meta = ticket_meta_for_dir(&dir, read_item_file(&item)?.frontmatter)?;
+            let blockers = self.relation_blockers_for_meta(&meta)?;
+            if !blockers.is_empty() {
+                return Err(TicketError::Conflict(format!(
+                    "ticket {} has unresolved blocking relation(s): {}",
+                    meta.id,
+                    format_relation_blockers(&blockers)
+                )));
+            }
+        }
         self.apply_workflow_state_change(&dir, from, to, change, &[])
     }
 
@@ -1383,6 +1559,16 @@ impl TicketBackend for LocalTicketBackend {
         validate_required_event_value("queued_by", queued_by)?;
         let _lock = self.acquire_lock()?;
         let dir = self.find_ticket_dir(&id)?;
+        let item = dir.join("item.md");
+        let meta = ticket_meta_for_dir(&dir, read_item_file(&item)?.frontmatter)?;
+        let blockers = self.relation_blockers_for_meta(&meta)?;
+        if !blockers.is_empty() {
+            return Err(TicketError::Conflict(format!(
+                "ticket {} has unresolved blocking relation(s): {}",
+                meta.id,
+                format_relation_blockers(&blockers)
+            )));
+        }
         let at = now_utc();
         let mut change = TicketStateChange::new(
             TicketWorkflowState::Ready.as_str(),
@@ -1449,6 +1635,106 @@ impl TicketBackend for LocalTicketBackend {
             &[],
             &resolution,
         )
+    }
+
+    fn add_ticket_relation(
+        &self,
+        id: TicketIdOrSlug,
+        relation: NewTicketRelation,
+    ) -> Result<TicketRelation> {
+        validate_new_ticket_relation(&relation)?;
+        let _lock = self.acquire_lock()?;
+        self.ensure_backend_dirs()?;
+        let dir = self.find_ticket_dir(&id)?;
+        let item = dir.join("item.md");
+        let meta = ticket_meta_for_dir(&dir, read_item_file(&item)?.frontmatter)?;
+        if relation.target.trim() == meta.id {
+            return Err(TicketError::Conflict(format!(
+                "ticket relation cannot target itself: {}",
+                meta.id
+            )));
+        }
+        let target_id = relation.target.trim().to_string();
+        let target_dir = self.ticket_dir(&target_id)?;
+        if !target_dir.join("item.md").is_file() {
+            return Err(TicketError::NotFound(target_id));
+        }
+        let artifacts = dir.join("artifacts");
+        fs::create_dir_all(&artifacts).map_err(|e| io_err(&artifacts, e))?;
+        let path = self.ticket_relations_path(&dir);
+        ensure_child_of(&artifacts, &path)?;
+        let mut relations = read_ticket_relations_artifact(&path, Some(&meta))?;
+        if relations
+            .iter()
+            .any(|existing| existing.kind == relation.kind && existing.target == target_id)
+        {
+            return Err(TicketError::Conflict(format!(
+                "ticket relation already exists: {} {} {}",
+                meta.id, relation.kind, target_id
+            )));
+        }
+        let at = now_utc();
+        let output = TicketRelation {
+            ticket_id: meta.id.clone(),
+            kind: relation.kind,
+            target: target_id,
+            note: relation
+                .note
+                .map(trim_owned)
+                .filter(|note| !note.is_empty()),
+            author: relation
+                .author
+                .map(trim_owned)
+                .unwrap_or_else(default_author),
+            at: at.clone(),
+        };
+        validate_ticket_relation(&output, Some(&meta))?;
+        relations.push(output.clone());
+        relations.sort_by(|a, b| a.kind.cmp(&b.kind).then_with(|| a.target.cmp(&b.target)));
+        write_ticket_relations_artifact(&path, &relations)?;
+        self.set_frontmatter_fields(&item, &[("updated_at", &at)])?;
+        Ok(output)
+    }
+
+    fn query_ticket_relations(
+        &self,
+        ticket: Option<TicketIdOrSlug>,
+        kind: Option<TicketRelationKind>,
+    ) -> Result<Vec<TicketRelation>> {
+        let mut relations = Vec::new();
+        if let Some(ticket) = ticket {
+            let dir = self.find_ticket_dir(&ticket)?;
+            let source_id = ticket_id_from_dir(&dir)?;
+            relations.extend(self.read_ticket_relations_for_dir(&dir)?);
+            relations.extend(
+                self.all_ticket_relation_records()?
+                    .into_iter()
+                    .filter(|relation| relation.target == source_id),
+            );
+        } else {
+            relations.extend(self.all_ticket_relation_records()?);
+        }
+        if let Some(kind) = kind {
+            relations.retain(|relation| relation.kind == kind);
+        }
+        relations.sort_by(|a, b| {
+            a.ticket_id
+                .cmp(&b.ticket_id)
+                .then_with(|| a.kind.cmp(&b.kind))
+                .then_with(|| a.target.cmp(&b.target))
+                .then_with(|| a.at.cmp(&b.at))
+        });
+        relations.dedup_by(|a, b| {
+            a.ticket_id == b.ticket_id && a.kind == b.kind && a.target == b.target && a.at == b.at
+        });
+        Ok(relations)
+    }
+
+    fn relation_view(&self, id: TicketIdOrSlug) -> Result<TicketRelationView> {
+        let dir = self.find_ticket_dir(&id)?;
+        let item = dir.join("item.md");
+        let meta = ticket_meta_for_dir(&dir, read_item_file(&item)?.frontmatter)?;
+        self.relation_view_for_meta(&meta)
     }
 
     fn add_orchestration_plan_record(
@@ -1529,6 +1815,8 @@ impl TicketBackend for LocalTicketBackend {
 
         let mut ids: HashMap<String, PathBuf> = HashMap::new();
         let mut duplicate_ids: BTreeSet<String> = BTreeSet::new();
+        let mut state_index: HashMap<String, TicketWorkflowState> = HashMap::new();
+        let mut relation_records: Vec<TicketRelation> = Vec::new();
 
         for legacy_bucket in ["open", "pending", "closed"] {
             let legacy_dir = self.root.join(legacy_bucket);
@@ -1604,6 +1892,9 @@ impl TicketBackend for LocalTicketBackend {
                 ),
                 _ => {}
             }
+            if let Ok(meta) = ticket_meta_for_dir(&dir, parsed.frontmatter.clone()) {
+                state_index.insert(meta.id.clone(), meta.workflow_state);
+            }
             if parsed.frontmatter.get("state").map(String::as_str) == Some("closed")
                 && !dir.join("resolution.md").is_file()
             {
@@ -1618,6 +1909,12 @@ impl TicketBackend for LocalTicketBackend {
             if artifacts.exists() {
                 doctor_artifacts(&artifacts, &mut report)?;
                 let meta = ticket_meta_for_dir(&dir, parsed.frontmatter.clone())?;
+                doctor_ticket_relations_artifact(
+                    &artifacts.join(TICKET_RELATIONS_ARTIFACT),
+                    &meta,
+                    &mut report,
+                    &mut relation_records,
+                )?;
                 doctor_orchestration_plan_artifact(
                     &artifacts.join(ORCHESTRATION_PLAN_ARTIFACT),
                     &meta,
@@ -1625,6 +1922,9 @@ impl TicketBackend for LocalTicketBackend {
                 )?;
             }
         }
+        doctor_ticket_relation_references(&relation_records, &ids, &state_index, &mut report);
+        doctor_ticket_relation_cycles(&relation_records, &state_index, &mut report);
+
         for duplicate in duplicate_ids {
             report.push_error(format!("duplicate id: {duplicate}"), None);
         }
@@ -1945,6 +2245,318 @@ fn ticket_meta(frontmatter: TicketItemFrontmatter, id: String) -> TicketMeta {
 
 fn trim_owned(value: String) -> String {
     value.trim().to_string()
+}
+
+fn relation_inverse_kind(kind: TicketRelationKind) -> &'static str {
+    match kind {
+        TicketRelationKind::DependsOn => "dependency_of",
+        TicketRelationKind::Blocks => "blocked_by",
+        TicketRelationKind::Related => "related",
+        TicketRelationKind::Supersedes => "superseded_by",
+        TicketRelationKind::DuplicateOf => "duplicated_by",
+    }
+}
+
+fn relation_notice_for_outgoing(relation: &TicketRelation) -> Option<TicketRelationNotice> {
+    match relation.kind {
+        TicketRelationKind::Supersedes => Some(TicketRelationNotice {
+            related_ticket: relation.target.clone(),
+            kind: relation.kind,
+            message: format!(
+                "ticket supersedes {}; verify replacement before routing",
+                relation.target
+            ),
+        }),
+        TicketRelationKind::DuplicateOf => Some(TicketRelationNotice {
+            related_ticket: relation.target.clone(),
+            kind: relation.kind,
+            message: format!(
+                "ticket is duplicate of {}; avoid duplicate implementation",
+                relation.target
+            ),
+        }),
+        _ => None,
+    }
+}
+
+fn relation_notice_for_incoming(relation: &TicketRelation) -> Option<TicketRelationNotice> {
+    match relation.kind {
+        TicketRelationKind::Supersedes => Some(TicketRelationNotice {
+            related_ticket: relation.ticket_id.clone(),
+            kind: relation.kind,
+            message: format!(
+                "ticket is superseded by {}; verify replacement before routing",
+                relation.ticket_id
+            ),
+        }),
+        TicketRelationKind::DuplicateOf => Some(TicketRelationNotice {
+            related_ticket: relation.ticket_id.clone(),
+            kind: relation.kind,
+            message: format!(
+                "ticket has duplicate {}; avoid duplicate implementation",
+                relation.ticket_id
+            ),
+        }),
+        _ => None,
+    }
+}
+
+fn ticket_state_resolved(state: TicketWorkflowState) -> bool {
+    matches!(
+        state,
+        TicketWorkflowState::Done | TicketWorkflowState::Closed
+    )
+}
+
+fn relation_view_from_records(
+    meta: &TicketMeta,
+    records: &[TicketRelation],
+    states: &HashMap<String, TicketWorkflowState>,
+) -> TicketRelationView {
+    let mut view = TicketRelationView::default();
+    for relation in records {
+        if relation.ticket_id == meta.id {
+            view.outgoing.push(relation.clone());
+            if relation.kind == TicketRelationKind::DependsOn {
+                let state = states
+                    .get(&relation.target)
+                    .copied()
+                    .unwrap_or(TicketWorkflowState::Planning);
+                if !ticket_state_resolved(state) {
+                    view.blockers.push(TicketRelationBlocker {
+                        blocking_ticket: relation.target.clone(),
+                        reason_kind: "depends_on".to_string(),
+                        relation_kind: relation.kind,
+                        note: relation.note.clone(),
+                        blocking_state: state,
+                    });
+                }
+            }
+            if let Some(notice) = relation_notice_for_outgoing(relation) {
+                view.notices.push(notice);
+            }
+        }
+        if relation.target == meta.id {
+            view.incoming.push(DerivedTicketRelation {
+                source_ticket: relation.ticket_id.clone(),
+                inverse_kind: relation_inverse_kind(relation.kind).to_string(),
+                forward_kind: relation.kind,
+                note: relation.note.clone(),
+                author: relation.author.clone(),
+                at: relation.at.clone(),
+            });
+            if relation.kind == TicketRelationKind::Blocks {
+                let state = states
+                    .get(&relation.ticket_id)
+                    .copied()
+                    .unwrap_or(TicketWorkflowState::Planning);
+                if !ticket_state_resolved(state) {
+                    view.blockers.push(TicketRelationBlocker {
+                        blocking_ticket: relation.ticket_id.clone(),
+                        reason_kind: "blocked_by".to_string(),
+                        relation_kind: relation.kind,
+                        note: relation.note.clone(),
+                        blocking_state: state,
+                    });
+                }
+            }
+            if let Some(notice) = relation_notice_for_incoming(relation) {
+                view.notices.push(notice);
+            }
+        }
+    }
+    view.outgoing.sort_by(|a, b| {
+        a.kind
+            .cmp(&b.kind)
+            .then_with(|| a.target.cmp(&b.target))
+            .then_with(|| a.at.cmp(&b.at))
+    });
+    view.incoming.sort_by(|a, b| {
+        a.inverse_kind
+            .cmp(&b.inverse_kind)
+            .then_with(|| a.source_ticket.cmp(&b.source_ticket))
+            .then_with(|| a.at.cmp(&b.at))
+    });
+    view.blockers.sort_by(|a, b| {
+        a.reason_kind
+            .cmp(&b.reason_kind)
+            .then_with(|| a.blocking_ticket.cmp(&b.blocking_ticket))
+    });
+    view.notices.sort_by(|a, b| {
+        a.kind
+            .cmp(&b.kind)
+            .then_with(|| a.related_ticket.cmp(&b.related_ticket))
+    });
+    view
+}
+
+fn format_relation_blockers(blockers: &[TicketRelationBlocker]) -> String {
+    blockers
+        .iter()
+        .map(|blocker| {
+            format!(
+                "{} via {} (state: {})",
+                blocker.blocking_ticket, blocker.reason_kind, blocker.blocking_state
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn validate_relation_optional_text(
+    label: &str,
+    value: Option<&str>,
+    max_bytes: usize,
+) -> Result<()> {
+    if let Some(value) = value {
+        if value.as_bytes().len() > max_bytes {
+            return Err(TicketError::Conflict(format!(
+                "ticket relation {label} exceeds {max_bytes} bytes"
+            )));
+        }
+        if value.contains('\0') {
+            return Err(TicketError::Conflict(format!(
+                "ticket relation {label} must not contain NUL bytes"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_relation_optional_single_line(
+    label: &str,
+    value: Option<&str>,
+    max_bytes: usize,
+) -> Result<()> {
+    validate_relation_optional_text(label, value, max_bytes)?;
+    if let Some(value) = value {
+        if value.contains('\n') || value.contains('\r') {
+            return Err(TicketError::Conflict(format!(
+                "ticket relation {label} must be a single line"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_new_ticket_relation(relation: &NewTicketRelation) -> Result<()> {
+    let target = relation.target.trim();
+    validate_relation_optional_single_line(
+        "target",
+        Some(target),
+        MAX_TICKET_RELATION_FIELD_BYTES,
+    )?;
+    if target.is_empty() {
+        return Err(TicketError::Conflict(
+            "ticket relation target must not be empty".to_string(),
+        ));
+    }
+    validate_relation_optional_text(
+        "note",
+        relation.note.as_deref(),
+        MAX_TICKET_RELATION_NOTE_BYTES,
+    )?;
+    validate_relation_optional_single_line(
+        "author",
+        relation.author.as_deref(),
+        MAX_TICKET_RELATION_FIELD_BYTES,
+    )
+}
+
+fn validate_ticket_relation(relation: &TicketRelation, meta: Option<&TicketMeta>) -> Result<()> {
+    validate_relation_optional_single_line(
+        "ticket_id",
+        Some(&relation.ticket_id),
+        MAX_TICKET_RELATION_FIELD_BYTES,
+    )?;
+    validate_relation_optional_single_line(
+        "target",
+        Some(&relation.target),
+        MAX_TICKET_RELATION_FIELD_BYTES,
+    )?;
+    validate_relation_optional_text(
+        "note",
+        relation.note.as_deref(),
+        MAX_TICKET_RELATION_NOTE_BYTES,
+    )?;
+    validate_relation_optional_single_line(
+        "author",
+        Some(&relation.author),
+        MAX_TICKET_RELATION_FIELD_BYTES,
+    )?;
+    validate_relation_optional_single_line(
+        "at",
+        Some(&relation.at),
+        MAX_TICKET_RELATION_FIELD_BYTES,
+    )?;
+    if let Some(meta) = meta {
+        if relation.ticket_id != meta.id {
+            return Err(TicketError::Conflict(format!(
+                "ticket relation targets {} but artifact belongs to {}",
+                relation.ticket_id, meta.id
+            )));
+        }
+    }
+    if relation.ticket_id == relation.target {
+        return Err(TicketError::Conflict(format!(
+            "ticket relation cannot target itself: {}",
+            relation.ticket_id
+        )));
+    }
+    Ok(())
+}
+
+fn read_ticket_relations_artifact(
+    path: &Path,
+    meta: Option<&TicketMeta>,
+) -> Result<Vec<TicketRelation>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let content = fs::read_to_string(path).map_err(|e| io_err(path, e))?;
+    let artifact: TicketRelationArtifact =
+        serde_json::from_str(&content).map_err(|e| TicketError::Parse {
+            path: path.to_path_buf(),
+            message: format!("invalid ticket relations artifact: {e}"),
+        })?;
+    if artifact.version != 1 {
+        return Err(TicketError::Parse {
+            path: path.to_path_buf(),
+            message: format!(
+                "unsupported ticket relations artifact version {}",
+                artifact.version
+            ),
+        });
+    }
+    let mut seen = BTreeSet::new();
+    for relation in &artifact.relations {
+        validate_ticket_relation(relation, meta).map_err(|err| TicketError::Parse {
+            path: path.to_path_buf(),
+            message: format!("invalid ticket relation: {err}"),
+        })?;
+        if !seen.insert((relation.kind, relation.target.clone())) {
+            return Err(TicketError::Parse {
+                path: path.to_path_buf(),
+                message: format!(
+                    "duplicate ticket relation {} {}",
+                    relation.kind, relation.target
+                ),
+            });
+        }
+    }
+    Ok(artifact.relations)
+}
+
+fn write_ticket_relations_artifact(path: &Path, relations: &[TicketRelation]) -> Result<()> {
+    let artifact = TicketRelationArtifact {
+        version: 1,
+        relations: relations.to_vec(),
+    };
+    let content = serde_json::to_string_pretty(&artifact).map_err(|e| TicketError::Parse {
+        path: path.to_path_buf(),
+        message: format!("failed to serialize ticket relations artifact: {e}"),
+    })? + "\n";
+    fs::write(path, content).map_err(|e| io_err(path, e))
 }
 
 fn trim_accepted_orchestration_plan(plan: AcceptedOrchestrationPlan) -> AcceptedOrchestrationPlan {
@@ -2618,6 +3230,156 @@ fn collect_artifacts_inner(
         }
     }
     Ok(())
+}
+
+fn doctor_ticket_relations_artifact(
+    path: &Path,
+    meta: &TicketMeta,
+    report: &mut TicketDoctorReport,
+    relation_records: &mut Vec<TicketRelation>,
+) -> Result<()> {
+    match read_ticket_relations_artifact(path, Some(meta)) {
+        Ok(relations) => {
+            relation_records.extend(relations);
+            Ok(())
+        }
+        Err(TicketError::Parse { message, .. }) => {
+            report.push_error(message, Some(path.to_path_buf()));
+            Ok(())
+        }
+        Err(TicketError::Conflict(message)) => {
+            report.push_error(message, Some(path.to_path_buf()));
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn doctor_ticket_relation_references(
+    relations: &[TicketRelation],
+    ticket_dirs: &HashMap<String, PathBuf>,
+    _states: &HashMap<String, TicketWorkflowState>,
+    report: &mut TicketDoctorReport,
+) {
+    for relation in relations {
+        let path = ticket_dirs
+            .get(&relation.ticket_id)
+            .map(|dir| dir.join("artifacts").join(TICKET_RELATIONS_ARTIFACT));
+        if relation.ticket_id == relation.target {
+            report.push_error(
+                format!(
+                    "ticket relation cannot target itself: {} {} {}",
+                    relation.ticket_id, relation.kind, relation.target
+                ),
+                path.clone(),
+            );
+        }
+        if !ticket_dirs.contains_key(&relation.target) {
+            report.push_error(
+                format!(
+                    "ticket relation has dangling target: {} {} {}",
+                    relation.ticket_id, relation.kind, relation.target
+                ),
+                path,
+            );
+        }
+    }
+}
+
+fn doctor_ticket_relation_cycles(
+    relations: &[TicketRelation],
+    states: &HashMap<String, TicketWorkflowState>,
+    report: &mut TicketDoctorReport,
+) {
+    let mut graph: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for relation in relations {
+        if !matches!(
+            relation.kind,
+            TicketRelationKind::DependsOn | TicketRelationKind::Blocks
+        ) {
+            continue;
+        }
+        if !states.contains_key(&relation.ticket_id) || !states.contains_key(&relation.target) {
+            continue;
+        }
+        let (waiter, blocker) = match relation.kind {
+            TicketRelationKind::DependsOn => (&relation.ticket_id, &relation.target),
+            TicketRelationKind::Blocks => (&relation.target, &relation.ticket_id),
+            _ => unreachable!(),
+        };
+        graph
+            .entry(waiter.clone())
+            .or_default()
+            .push(blocker.clone());
+    }
+    let mut reported = BTreeSet::new();
+    for start in graph.keys() {
+        let mut path = Vec::new();
+        detect_relation_cycle(start, start, &graph, &mut path, &mut reported, report);
+        if reported.len() >= 32 {
+            report.push_warning(
+                "ticket relation cycle diagnostics truncated after 32 cycles".to_string(),
+                None,
+            );
+            break;
+        }
+    }
+}
+
+fn detect_relation_cycle(
+    start: &str,
+    current: &str,
+    graph: &BTreeMap<String, Vec<String>>,
+    path: &mut Vec<String>,
+    reported: &mut BTreeSet<String>,
+    report: &mut TicketDoctorReport,
+) {
+    if path.len() > 64 {
+        return;
+    }
+    path.push(current.to_string());
+    if let Some(nexts) = graph.get(current) {
+        for next in nexts {
+            if next == start {
+                let mut cycle = path.clone();
+                cycle.push(start.to_string());
+                let key = canonical_cycle_key(&cycle);
+                if reported.insert(key) {
+                    report.push_error(
+                        format!(
+                            "ticket relation dependency/blocking cycle: {}",
+                            cycle.join(" -> ")
+                        ),
+                        None,
+                    );
+                }
+                continue;
+            }
+            if path.iter().any(|value| value == next) {
+                continue;
+            }
+            detect_relation_cycle(start, next, graph, path, reported, report);
+            if reported.len() >= 32 {
+                break;
+            }
+        }
+    }
+    path.pop();
+}
+
+fn canonical_cycle_key(cycle: &[String]) -> String {
+    if cycle.len() <= 1 {
+        return String::new();
+    }
+    let nodes = &cycle[..cycle.len() - 1];
+    let Some((idx, _)) = nodes.iter().enumerate().min_by(|(_, a), (_, b)| a.cmp(b)) else {
+        return String::new();
+    };
+    let mut ordered = Vec::new();
+    for offset in 0..nodes.len() {
+        ordered.push(nodes[(idx + offset) % nodes.len()].clone());
+    }
+    ordered.join(" -> ")
 }
 
 fn doctor_orchestration_plan_artifact(
@@ -3399,6 +4161,209 @@ state: planning
         let err = backend.create(NewTicket::new("Locked")).unwrap_err();
         FileExt::unlock(&file).unwrap();
         assert!(matches!(err, TicketError::Locked { .. }));
+    }
+
+    #[test]
+    fn ticket_relations_store_forward_and_derive_inverse_blockers() {
+        let tmp = TempDir::new().unwrap();
+        let backend = backend(&tmp);
+        let mut ready_input = NewTicket::new("Ready Relation Source");
+        ready_input.workflow_state = Some(TicketWorkflowState::Ready);
+        let source = backend.create(ready_input).unwrap();
+        let target = backend
+            .create(NewTicket::new("Planning Dependency"))
+            .unwrap();
+
+        let relation = backend
+            .add_ticket_relation(
+                TicketIdOrSlug::Id(source.id.clone()),
+                NewTicketRelation {
+                    kind: TicketRelationKind::DependsOn,
+                    target: target.id.clone(),
+                    note: Some("needs dependency first".to_string()),
+                    author: Some("test".to_string()),
+                },
+            )
+            .unwrap();
+        assert_eq!(relation.ticket_id, source.id);
+        assert_eq!(relation.kind, TicketRelationKind::DependsOn);
+        assert_eq!(relation.target, target.id);
+
+        let source_show = backend.show(TicketIdOrSlug::Id(source.id.clone())).unwrap();
+        assert_eq!(source_show.relations.outgoing.len(), 1);
+        assert_eq!(source_show.relations.blockers.len(), 1);
+        assert_eq!(source_show.relations.blockers[0].blocking_ticket, target.id);
+        assert_eq!(source_show.relations.blockers[0].reason_kind, "depends_on");
+
+        let target_show = backend.show(TicketIdOrSlug::Id(target.id.clone())).unwrap();
+        assert_eq!(target_show.relations.incoming.len(), 1);
+        assert_eq!(target_show.relations.incoming[0].source_ticket, source.id);
+        assert_eq!(
+            target_show.relations.incoming[0].inverse_kind,
+            "dependency_of"
+        );
+
+        let queried = backend
+            .query_ticket_relations(
+                Some(TicketIdOrSlug::Id(target.id.clone())),
+                Some(TicketRelationKind::DependsOn),
+            )
+            .unwrap();
+        assert_eq!(queried.len(), 1);
+        assert_eq!(backend.doctor().unwrap().error_count(), 0);
+    }
+
+    #[test]
+    fn queue_gate_rejects_unresolved_dependency_and_incoming_blocker() {
+        let tmp = TempDir::new().unwrap();
+        let backend = backend(&tmp);
+        let mut blocked_input = NewTicket::new("Blocked Ready");
+        blocked_input.workflow_state = Some(TicketWorkflowState::Ready);
+        let blocked = backend.create(blocked_input).unwrap();
+        let dependency = backend.create(NewTicket::new("Dependency")).unwrap();
+        backend
+            .add_ticket_relation(
+                TicketIdOrSlug::Id(blocked.id.clone()),
+                NewTicketRelation {
+                    kind: TicketRelationKind::DependsOn,
+                    target: dependency.id.clone(),
+                    note: None,
+                    author: Some("test".to_string()),
+                },
+            )
+            .unwrap();
+        let err = backend
+            .queue_ready(TicketIdOrSlug::Id(blocked.id.clone()), "test")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unresolved blocking relation"), "{err}");
+        assert!(err.contains(&dependency.id), "{err}");
+
+        let mut incoming_input = NewTicket::new("Incoming Blocked Ready");
+        incoming_input.workflow_state = Some(TicketWorkflowState::Ready);
+        let incoming = backend.create(incoming_input).unwrap();
+        let blocker = backend.create(NewTicket::new("Blocker")).unwrap();
+        backend
+            .add_ticket_relation(
+                TicketIdOrSlug::Id(blocker.id.clone()),
+                NewTicketRelation {
+                    kind: TicketRelationKind::Blocks,
+                    target: incoming.id.clone(),
+                    note: None,
+                    author: Some("test".to_string()),
+                },
+            )
+            .unwrap();
+        let err = backend
+            .queue_ready(TicketIdOrSlug::Id(incoming.id.clone()), "test")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unresolved blocking relation"), "{err}");
+        assert!(err.contains(&blocker.id), "{err}");
+    }
+
+    #[test]
+    fn doctor_validates_ticket_relations() {
+        let tmp = TempDir::new().unwrap();
+        let backend = backend(&tmp);
+        let first = backend.create(NewTicket::new("First")).unwrap();
+        let second = backend.create(NewTicket::new("Second")).unwrap();
+        backend
+            .add_ticket_relation(
+                TicketIdOrSlug::Id(first.id.clone()),
+                NewTicketRelation {
+                    kind: TicketRelationKind::DependsOn,
+                    target: second.id.clone(),
+                    note: None,
+                    author: Some("test".to_string()),
+                },
+            )
+            .unwrap();
+        backend
+            .add_ticket_relation(
+                TicketIdOrSlug::Id(second.id.clone()),
+                NewTicketRelation {
+                    kind: TicketRelationKind::DependsOn,
+                    target: first.id.clone(),
+                    note: None,
+                    author: Some("test".to_string()),
+                },
+            )
+            .unwrap();
+
+        let report = backend.doctor().unwrap();
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("cycle")),
+            "{:?}",
+            report.diagnostics
+        );
+
+        let artifacts = tmp.path().join("tickets").join(&first.id).join("artifacts");
+        fs::write(
+            artifacts.join(TICKET_RELATIONS_ARTIFACT),
+            format!(
+                r#"{{
+  "version": 1,
+  "relations": [
+    {{"ticket_id":"{}","kind":"related","target":"{}","author":"test","at":"2026-06-09T00:00:00Z"}}
+  ]
+}}
+"#,
+                first.id, first.id
+            ),
+        )
+        .unwrap();
+        let report = backend.doctor().unwrap();
+        assert!(report.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("ticket relation cannot target itself")
+        }));
+
+        fs::write(
+            artifacts.join(TICKET_RELATIONS_ARTIFACT),
+            format!(
+                r#"{{
+  "version": 1,
+  "relations": [
+    {{"ticket_id":"{}","kind":"related","target":"missing-ticket","author":"test","at":"2026-06-09T00:00:01Z"}}
+  ]
+}}
+"#,
+                first.id
+            ),
+        )
+        .unwrap();
+        let report = backend.doctor().unwrap();
+        assert!(report.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("ticket relation has dangling target")
+        }));
+
+        fs::write(
+            artifacts.join(TICKET_RELATIONS_ARTIFACT),
+            format!(
+                r#"{{
+  "version": 1,
+  "relations": [
+    {{"ticket_id":"{}","kind":"parent","target":"{}","author":"test","at":"2026-06-09T00:00:00Z"}}
+  ]
+}}
+"#,
+                first.id, second.id
+            ),
+        )
+        .unwrap();
+        let report = backend.doctor().unwrap();
+        assert!(report.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("invalid ticket relations artifact")
+        }));
     }
 
     #[test]

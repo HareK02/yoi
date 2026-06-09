@@ -13,10 +13,10 @@ use serde_json::{Value, json};
 
 use crate::{
     AcceptedOrchestrationPlan, LocalTicketBackend, MarkdownText, NewOrchestrationPlanRecord,
-    NewTicket, NewTicketEvent, OrchestrationPlanKind, Ticket, TicketBackend,
+    NewTicket, NewTicketEvent, NewTicketRelation, OrchestrationPlanKind, Ticket, TicketBackend,
     TicketDoctorDiagnostic, TicketDoctorReport, TicketDoctorSeverity, TicketError, TicketEventKind,
-    TicketIdOrSlug, TicketIntakeSummary, TicketReview, TicketReviewResult, TicketStateChange,
-    TicketSummary, TicketWorkflowState,
+    TicketIdOrSlug, TicketIntakeSummary, TicketRelationKind, TicketReview, TicketReviewResult,
+    TicketStateChange, TicketSummary, TicketWorkflowState,
 };
 
 const DEFAULT_LIST_LIMIT: usize = 100;
@@ -30,7 +30,7 @@ const MAX_BODY_MAX_BYTES: usize = 64 * 1024;
 const DEFAULT_DIAGNOSTIC_LIMIT: usize = 100;
 const MAX_DIAGNOSTIC_LIMIT: usize = 500;
 
-pub const TICKET_TOOL_NAMES: [&str; 11] = [
+pub const TICKET_TOOL_NAMES: [&str; 13] = [
     "TicketCreate",
     "TicketList",
     "TicketShow",
@@ -39,25 +39,29 @@ pub const TICKET_TOOL_NAMES: [&str; 11] = [
     "TicketIntakeReady",
     "TicketWorkflowState",
     "TicketClose",
+    "TicketRelationRecord",
+    "TicketRelationQuery",
     "TicketOrchestrationPlanRecord",
     "TicketOrchestrationPlanQuery",
     "TicketDoctor",
 ];
 
-pub const TICKET_READ_ONLY_TOOL_NAMES: [&str; 4] = [
+pub const TICKET_READ_ONLY_TOOL_NAMES: [&str; 5] = [
     "TicketList",
     "TicketShow",
+    "TicketRelationQuery",
     "TicketOrchestrationPlanQuery",
     "TicketDoctor",
 ];
 
-pub const TICKET_MUTATING_TOOL_NAMES: [&str; 7] = [
+pub const TICKET_MUTATING_TOOL_NAMES: [&str; 8] = [
     "TicketCreate",
     "TicketComment",
     "TicketReview",
     "TicketIntakeReady",
     "TicketWorkflowState",
     "TicketClose",
+    "TicketRelationRecord",
     "TicketOrchestrationPlanRecord",
 ];
 
@@ -85,6 +89,11 @@ transition is accepted and recorded. Orchestrator may return `ready` or `queued`
 const CLOSE_DESCRIPTION: &str = "Close a Ticket with a Markdown resolution through the typed Ticket \
 backend. The backend sets `state: closed`, writes resolution.md, updates item.md, and appends \
 a close event.";
+const RELATION_RECORD_DESCRIPTION: &str = "Record a forward typed Ticket-to-Ticket relation as durable \
+project-level metadata. Supported kinds are depends_on, blocks, related, supersedes, and duplicate_of; \
+inverse views are derived, not stored.";
+const RELATION_QUERY_DESCRIPTION: &str = "Query durable typed Ticket relation metadata. When a Ticket \
+is provided, both outgoing records owned by it and incoming forward records that target it are returned.";
 const ORCHESTRATION_PLAN_RECORD_DESCRIPTION: &str = "Append a typed Ticket orchestration plan record \
 for ordering, dependency, conflict, waiting/capacity, or accepted-plan decisions. Records are durable \
 Ticket artifacts and do not move state, reorder queues, or start work.";
@@ -313,6 +322,65 @@ struct TicketCloseParams {
 
 #[derive(Debug, Clone, Copy, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
+enum TicketRelationKindParam {
+    DependsOn,
+    Blocks,
+    Related,
+    Supersedes,
+    DuplicateOf,
+}
+
+impl TicketRelationKindParam {
+    fn into_kind(self) -> TicketRelationKind {
+        match self {
+            Self::DependsOn => TicketRelationKind::DependsOn,
+            Self::Blocks => TicketRelationKind::Blocks,
+            Self::Related => TicketRelationKind::Related,
+            Self::Supersedes => TicketRelationKind::Supersedes,
+            Self::DuplicateOf => TicketRelationKind::DuplicateOf,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct TicketRelationRecordParams {
+    /// Ticket id that owns the forward relation.
+    ticket: String,
+    /// Forward relation kind: depends_on, blocks, related, supersedes, or duplicate_of.
+    kind: TicketRelationKindParam,
+    /// Target canonical Ticket id. Title/slug words are not accepted as relation authority.
+    target: String,
+    /// Optional bounded rationale/note.
+    #[serde(default)]
+    note: Option<String>,
+    /// Optional record author.
+    #[serde(default)]
+    author: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct TicketRelationQueryParams {
+    /// Optional Ticket id to query. Includes outgoing and incoming forward records for that id.
+    #[serde(default)]
+    ticket: Option<String>,
+    /// Optional forward relation kind filter.
+    #[serde(default)]
+    kind: Option<TicketRelationKindParam>,
+    /// Maximum records to return. Defaults to 100, max 200.
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct TicketRelationQueryOutput {
+    count: usize,
+    returned: usize,
+    truncated: bool,
+    relations: Vec<Value>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
 enum OrchestrationPlanKindParam {
     Before,
     After,
@@ -464,6 +532,16 @@ struct TicketWorkflowStateTool {
 
 #[derive(Clone)]
 struct TicketCloseTool {
+    backend: LocalTicketBackend,
+}
+
+#[derive(Clone)]
+struct TicketRelationRecordTool {
+    backend: LocalTicketBackend,
+}
+
+#[derive(Clone)]
+struct TicketRelationQueryTool {
     backend: LocalTicketBackend,
 }
 
@@ -716,6 +794,64 @@ impl Tool for TicketCloseTool {
 }
 
 #[async_trait]
+impl Tool for TicketRelationRecordTool {
+    async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError> {
+        let params: TicketRelationRecordParams = parse_input("TicketRelationRecord", input_json)?;
+        let relation = NewTicketRelation {
+            kind: params.kind.into_kind(),
+            target: params.target.clone(),
+            note: params.note,
+            author: params.author,
+        };
+        let output = self
+            .backend
+            .add_ticket_relation(TicketIdOrSlug::Id(params.ticket.clone()), relation)
+            .map_err(|error| backend_error("TicketRelationRecord", error))?;
+        Ok(json_output(
+            format!(
+                "Recorded ticket relation {} {} {}",
+                output.ticket_id, output.kind, output.target
+            ),
+            ticket_relation_json(&output),
+        ))
+    }
+}
+
+#[async_trait]
+impl Tool for TicketRelationQueryTool {
+    async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError> {
+        let params: TicketRelationQueryParams = parse_input("TicketRelationQuery", input_json)?;
+        let limit = bounded(params.limit, DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT);
+        let ticket = params.ticket.clone().map(TicketIdOrSlug::Id);
+        let kind = params.kind.map(TicketRelationKindParam::into_kind);
+        let relations = self
+            .backend
+            .query_ticket_relations(ticket, kind)
+            .map_err(|error| backend_error("TicketRelationQuery", error))?;
+        let count = relations.len();
+        let truncated = count > limit;
+        let returned_relations = relations
+            .into_iter()
+            .take(limit)
+            .map(|relation| ticket_relation_json(&relation))
+            .collect::<Vec<_>>();
+        Ok(json_output(
+            format!(
+                "Found {} ticket relation(s){}",
+                count,
+                if truncated { " (truncated)" } else { "" }
+            ),
+            TicketRelationQueryOutput {
+                count,
+                returned: returned_relations.len(),
+                truncated,
+                relations: returned_relations,
+            },
+        ))
+    }
+}
+
+#[async_trait]
 impl Tool for TicketOrchestrationPlanRecordTool {
     async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError> {
         let params: TicketOrchestrationPlanRecordParams =
@@ -849,6 +985,73 @@ fn ticket_summary_json(ticket: TicketSummary) -> Value {
     })
 }
 
+fn ticket_relation_json(relation: &crate::TicketRelation) -> Value {
+    json!({
+        "ticket_id": relation.ticket_id,
+        "kind": relation.kind.as_str(),
+        "target": relation.target,
+        "note": relation.note,
+        "author": relation.author,
+        "at": relation.at,
+    })
+}
+
+fn ticket_relations_json(ticket: &Ticket) -> Value {
+    let outgoing: Vec<_> = ticket
+        .relations
+        .outgoing
+        .iter()
+        .map(ticket_relation_json)
+        .collect();
+    let incoming: Vec<_> = ticket
+        .relations
+        .incoming
+        .iter()
+        .map(|relation| {
+            json!({
+                "source_ticket": relation.source_ticket,
+                "inverse_kind": relation.inverse_kind,
+                "forward_kind": relation.forward_kind.as_str(),
+                "note": relation.note,
+                "author": relation.author,
+                "at": relation.at,
+            })
+        })
+        .collect();
+    let blockers: Vec<_> = ticket
+        .relations
+        .blockers
+        .iter()
+        .map(|blocker| {
+            json!({
+                "blocking_ticket": blocker.blocking_ticket,
+                "reason_kind": blocker.reason_kind,
+                "relation_kind": blocker.relation_kind.as_str(),
+                "note": blocker.note,
+                "blocking_state": blocker.blocking_state.as_str(),
+            })
+        })
+        .collect();
+    let notices: Vec<_> = ticket
+        .relations
+        .notices
+        .iter()
+        .map(|notice| {
+            json!({
+                "related_ticket": notice.related_ticket,
+                "kind": notice.kind.as_str(),
+                "message": notice.message,
+            })
+        })
+        .collect();
+    json!({
+        "outgoing": outgoing,
+        "incoming": incoming,
+        "blockers": blockers,
+        "notices": notices,
+    })
+}
+
 fn ticket_json(
     ticket: &Ticket,
     event_limit: usize,
@@ -911,6 +1114,7 @@ fn ticket_json(
             "truncated": artifact_count > artifacts.len(),
             "items": artifacts,
         },
+        "relations": ticket_relations_json(ticket),
         "resolution": ticket.resolution.as_ref().map(|resolution| truncate_text(resolution.as_str(), body_max_bytes)),
     })
 }
@@ -997,6 +1201,12 @@ fn input_schema(name: &str) -> Value {
             serde_json::to_value(schemars::schema_for!(TicketWorkflowStateParams))
         }
         "TicketClose" => serde_json::to_value(schemars::schema_for!(TicketCloseParams)),
+        "TicketRelationRecord" => {
+            serde_json::to_value(schemars::schema_for!(TicketRelationRecordParams))
+        }
+        "TicketRelationQuery" => {
+            serde_json::to_value(schemars::schema_for!(TicketRelationQueryParams))
+        }
         "TicketOrchestrationPlanRecord" => {
             serde_json::to_value(schemars::schema_for!(TicketOrchestrationPlanRecordParams))
         }
@@ -1027,6 +1237,8 @@ impl_from_backend!(TicketReviewTool);
 impl_from_backend!(TicketIntakeReadyTool);
 impl_from_backend!(TicketWorkflowStateTool);
 impl_from_backend!(TicketCloseTool);
+impl_from_backend!(TicketRelationRecordTool);
+impl_from_backend!(TicketRelationQueryTool);
 impl_from_backend!(TicketOrchestrationPlanRecordTool);
 impl_from_backend!(TicketOrchestrationPlanQueryTool);
 impl_from_backend!(TicketDoctorTool);
@@ -1050,6 +1262,16 @@ pub fn ticket_tools(backend: LocalTicketBackend) -> Vec<ToolDefinition> {
             backend.clone(),
         ),
         tool_definition::<TicketCloseTool>("TicketClose", CLOSE_DESCRIPTION, backend.clone()),
+        tool_definition::<TicketRelationRecordTool>(
+            "TicketRelationRecord",
+            RELATION_RECORD_DESCRIPTION,
+            backend.clone(),
+        ),
+        tool_definition::<TicketRelationQueryTool>(
+            "TicketRelationQuery",
+            RELATION_QUERY_DESCRIPTION,
+            backend.clone(),
+        ),
         tool_definition::<TicketOrchestrationPlanRecordTool>(
             "TicketOrchestrationPlanRecord",
             ORCHESTRATION_PLAN_RECORD_DESCRIPTION,
@@ -1095,6 +1317,7 @@ mod tests {
             [
                 "TicketList",
                 "TicketShow",
+                "TicketRelationQuery",
                 "TicketOrchestrationPlanQuery",
                 "TicketDoctor"
             ]
@@ -1108,6 +1331,7 @@ mod tests {
                 "TicketIntakeReady",
                 "TicketWorkflowState",
                 "TicketClose",
+                "TicketRelationRecord",
                 "TicketOrchestrationPlanRecord"
             ]
         );
@@ -1185,6 +1409,53 @@ mod tests {
 
         let report = doctor.execute(&json!({}).to_string()).await.unwrap();
         assert!(report.summary.contains("0 error(s)"));
+    }
+
+    #[tokio::test]
+    async fn ticket_relation_tools_record_query_and_show_derived_view() {
+        let temp = TempDir::new().unwrap();
+        let backend = backend(&temp);
+        let source = backend.create(NewTicket::new("Relation Source")).unwrap();
+        let target = backend.create(NewTicket::new("Relation Target")).unwrap();
+        let record = tool_by_name(backend.clone(), "TicketRelationRecord");
+        let query = tool_by_name(backend.clone(), "TicketRelationQuery");
+        let show = tool_by_name(backend.clone(), "TicketShow");
+
+        let recorded = record
+            .execute(
+                &json!({
+                    "ticket": source.id.clone(),
+                    "kind": "depends_on",
+                    "target": target.id.clone(),
+                    "note": "target first",
+                    "author": "test"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        assert!(recorded.summary.contains("Recorded ticket relation"));
+        let recorded_json: Value = serde_json::from_str(&recorded.content.unwrap()).unwrap();
+        assert_eq!(recorded_json["kind"], "depends_on");
+        assert_eq!(recorded_json["target"], target.id);
+
+        let queried = query
+            .execute(&json!({ "ticket": target.id.clone() }).to_string())
+            .await
+            .unwrap();
+        let queried_json: Value = serde_json::from_str(&queried.content.unwrap()).unwrap();
+        assert_eq!(queried_json["count"], 1);
+        assert_eq!(queried_json["relations"][0]["ticket_id"], source.id);
+
+        let shown = show
+            .execute(&json!({ "id": target.id.clone() }).to_string())
+            .await
+            .unwrap();
+        let shown_json: Value = serde_json::from_str(&shown.content.unwrap()).unwrap();
+        assert_eq!(
+            shown_json["relations"]["incoming"][0]["inverse_kind"],
+            "dependency_of"
+        );
     }
 
     #[tokio::test]

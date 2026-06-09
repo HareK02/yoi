@@ -69,9 +69,10 @@ Orchestrator は以下を行う。
 利用可能なら、以下を使う。
 
 - `TicketList`: routing 候補や関連 Ticket の確認。
-- `TicketShow`: 対象 Ticket の body / thread / artifacts / resolution 確認。
+- `TicketShow`: 対象 Ticket の body / thread / artifacts / resolution / typed relation metadata と derived inverse/blocker view を確認。
 - `TicketComment`: routing decision / intent packet / blocked reason / next question の記録。
 - `TicketWorkflowState`: `queued -> inprogress` acceptance、`inprogress -> done`、または concrete missing decision/information reason を伴う `ready|queued -> planning` に使う。
+- `TicketRelationQuery`: project-level の forward relation (`depends_on` / `blocks` / `related` / `supersedes` / `duplicate_of`) を読む。`depends_on` と incoming unresolved `blocks` は queue/acceptance blocker であり、`related` は blocker ではない。`supersedes` / `duplicate_of` は visible diagnostic として扱い、自動的な lifecycle 変更や scheduler 判断にはしない。
 - `TicketOrchestrationPlanQuery`: 対象 Ticket や関連 Ticket の ordering / blocker / conflict / waiting-capacity / accepted-plan 記録を読む。queued acceptance 前に必ず確認する。
 - `TicketOrchestrationPlanRecord`: Orchestrator が routing 中に project-relevant な ordering / dependency / conflict / capacity/waiting / accepted-plan decision を残す。これは queue reorder、自動起動、state 変更ではない。
 - `TicketClose`: 完了権限と resolution が揃っている場合だけ使う。
@@ -80,6 +81,9 @@ Orchestrator は以下を行う。
 `TicketCreate` は通常 Intake の責務だが、routing 中に follow-up Ticket が必要だと判断した場合は、ユーザー/上位 Orchestrator の合意後にだけ使う。
 
 ## Queued acceptance contract
+
+- `queued -> inprogress` acceptance の直前に `TicketShow` / `TicketRelationQuery` の relation blockers を再確認する。unresolved `depends_on` や incoming unresolved `blocks` が残る場合は implementation side effect を始めず、理由を thread に残して `planning` へ戻すか blocked diagnostic として停止する。
+- Relation metadata は project-level constraint であり、OrchestrationPlan は runtime ordering/capacity decision である。relation を OrchestrationPlan で代替しないし、OrchestrationPlan を durable dependency authority として扱わない。
 
 `state = queued` は、Ticket が routing 対象として人間により Orchestrator へ渡された状態である。Orchestrator は queued notification を受けたら、Ticket、workspace state、対象 Ticket の `TicketOrchestrationPlanQuery` 記録、risk domain に応じた bounded project context を読んで、次のどちらかを行う。
 

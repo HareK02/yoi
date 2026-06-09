@@ -4,7 +4,7 @@ use protocol::PodStatus;
 use ticket::config::{TICKET_CONFIG_RELATIVE_PATH, TicketConfig};
 use ticket::{
     LocalTicketBackend, TicketBackend, TicketError, TicketEvent, TicketFilter, TicketIdOrSlug,
-    TicketMeta, TicketSummary, TicketWorkflowState,
+    TicketMeta, TicketRelationBlocker, TicketSummary, TicketWorkflowState,
 };
 
 use crate::pod_list::{PodList, PodListEntry, StoredMetadataState};
@@ -601,7 +601,13 @@ pub(crate) fn build_current_ticket_row(
     }
     let summary = ticket_summary_from_meta(&ticket.meta);
     let registry = PanelRegistrySnapshot::empty();
-    Ok(ticket_row(summary, &ticket.events, pods, &registry))
+    Ok(ticket_row(
+        summary,
+        &ticket.events,
+        &ticket.relations.blockers,
+        pods,
+        &registry,
+    ))
 }
 
 fn ticket_summary_from_meta(meta: &TicketMeta) -> TicketSummary {
@@ -635,7 +641,13 @@ fn build_ticket_rows(
             continue;
         }
         let ticket = backend.show(TicketIdOrSlug::Query(summary.id.clone()))?;
-        rows.push(ticket_row(summary, &ticket.events, pods, registry));
+        rows.push(ticket_row(
+            summary,
+            &ticket.events,
+            &ticket.relations.blockers,
+            pods,
+            registry,
+        ));
     }
     Ok(rows)
 }
@@ -643,12 +655,13 @@ fn build_ticket_rows(
 fn ticket_row(
     summary: TicketSummary,
     events: &[TicketEvent],
+    relation_blockers: &[TicketRelationBlocker],
     pods: &PodList,
     registry: &PanelRegistrySnapshot,
 ) -> PanelRow {
     let local_claim = local_claim_for_ticket(&summary, pods, registry);
     let related_pods = related_pods_for_ticket(&summary, pods, registry);
-    let derived = derive_ticket_state(&summary);
+    let derived = derive_ticket_state(&summary, relation_blockers);
     let latest_event = events.last();
     let entry = TicketPanelEntry {
         id: summary.id.clone(),
@@ -691,7 +704,37 @@ struct DerivedTicketState {
     blocked_reason: Option<String>,
 }
 
-fn derive_ticket_state(summary: &TicketSummary) -> DerivedTicketState {
+fn derive_ticket_state(
+    summary: &TicketSummary,
+    relation_blockers: &[TicketRelationBlocker],
+) -> DerivedTicketState {
+    if !relation_blockers.is_empty() {
+        let blockers = relation_blockers
+            .iter()
+            .take(3)
+            .map(|blocker| {
+                format!(
+                    "{} via {} (state: {})",
+                    blocker.blocking_ticket,
+                    blocker.reason_kind,
+                    blocker.blocking_state.as_str()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        return DerivedTicketState {
+            kind: PanelRowKind::Blocked,
+            priority: ActionPriority::UserReply,
+            action: Some(NextUserAction::Edit),
+            disabled_reason: Some(
+                "Unresolved Ticket relation blocks queueing; resolve dependency/blocker before ready -> queued."
+                    .to_string(),
+            ),
+            key_hint: Some("Open the Ticket relation diagnostics before queueing".to_string()),
+            blocked_reason: Some(blockers),
+        };
+    }
+
     if let Some(reason) = summary
         .attention_required
         .as_deref()
@@ -945,7 +988,7 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
-    use ticket::{NewTicket, TicketWorkflowState};
+    use ticket::{NewTicket, NewTicketRelation, TicketRelationKind, TicketWorkflowState};
 
     fn empty_pods() -> PodList {
         PodList::from_sources(
@@ -1103,6 +1146,56 @@ mod tests {
             TicketWorkflowState::Queued
         );
         assert_eq!(queued.next_action, Some(NextUserAction::Wait));
+    }
+
+    #[test]
+    fn workspace_panel_marks_ready_ticket_with_unresolved_relation_blocked() {
+        let temp = TempDir::new().unwrap();
+        write_ticket_config(temp.path());
+        let backend = LocalTicketBackend::new(temp.path().join(".yoi/tickets"));
+        let mut ready_input = NewTicket::new("Ready Blocked By Relation");
+        ready_input.workflow_state = Some(TicketWorkflowState::Ready);
+        let ready = backend.create(ready_input).unwrap();
+        let dependency = backend
+            .create(NewTicket::new("Relation Dependency"))
+            .unwrap();
+        backend
+            .add_ticket_relation(
+                TicketIdOrSlug::Id(ready.id.clone()),
+                NewTicketRelation {
+                    kind: TicketRelationKind::DependsOn,
+                    target: dependency.id.clone(),
+                    note: None,
+                    author: Some("test".to_string()),
+                },
+            )
+            .unwrap();
+
+        let model = build_workspace_panel(temp.path(), &empty_pods());
+        let row = model
+            .rows
+            .iter()
+            .find(|row| row.title == "Ready Blocked By Relation")
+            .unwrap();
+
+        assert_eq!(row.kind, PanelRowKind::Blocked);
+        assert_eq!(row.next_action, Some(NextUserAction::Edit));
+        assert_eq!(row.priority, ActionPriority::UserReply);
+        assert!(
+            row.disabled_reason
+                .as_deref()
+                .unwrap()
+                .contains("Unresolved Ticket relation")
+        );
+        assert!(
+            row.ticket
+                .as_ref()
+                .unwrap()
+                .blocked_reason
+                .as_deref()
+                .unwrap()
+                .contains(&dependency.id)
+        );
     }
 
     #[test]
