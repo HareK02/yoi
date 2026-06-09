@@ -10,8 +10,13 @@ use ticket::config::{
 use ticket::{
     LocalTicketBackend, MarkdownText, NewTicket, NewTicketEvent, NewTicketRelation, TicketBackend,
     TicketDoctorSeverity, TicketEventKind, TicketFilter, TicketIdOrSlug, TicketIntakeSummary,
-    TicketRelationKind, TicketReview, TicketReviewResult, TicketWorkflowState,
+    TicketRelationKind, TicketReview, TicketReviewResult, TicketSummary, TicketWorkflowState,
 };
+
+const DEFAULT_LIST_LIMIT: usize = 50;
+const MAX_LIST_LIMIT: usize = 100;
+const LIST_TITLE_MAX_CHARS: usize = 96;
+const LIST_HINT_MAX_CHARS: usize = 80;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TicketCli {
@@ -52,6 +57,7 @@ pub enum ListState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListOptions {
     pub state: ListState,
+    pub limit: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -312,14 +318,28 @@ fn list(
         ListState::All => TicketFilter::all(),
     };
     let tickets = backend.list(filter)?;
-    let mut stdout = String::from("state\tid\ttitle\tupdated_at\n");
-    for ticket in tickets {
+    let count = tickets.len();
+    let limit = options
+        .limit
+        .unwrap_or(DEFAULT_LIST_LIMIT)
+        .min(MAX_LIST_LIMIT);
+    let mut stdout = String::from("state\tid\ttitle\tupdated_at\thints\n");
+    for ticket in tickets.into_iter().take(limit) {
+        let title = truncate_inline(ticket.title.as_str(), LIST_TITLE_MAX_CHARS);
+        let updated_at = ticket.updated_at.as_deref().unwrap_or_default();
+        let hints = ticket_cli_hints(&ticket);
         stdout.push_str(&format!(
-            "{}\t{}\t{}\t{}\n",
+            "{}\t{}\t{}\t{}\t{}\n",
             ticket.workflow_state.as_str(),
-            ticket.id,
-            ticket.title,
-            ticket.updated_at.unwrap_or_default()
+            ticket.id.as_str(),
+            title,
+            updated_at,
+            hints
+        ));
+    }
+    if count > limit {
+        stdout.push_str(&format!(
+            "# truncated: returned {limit} of {count}; use --limit up to {MAX_LIST_LIMIT} or a narrower --state, then yoi ticket show <id> for details\n"
         ));
     }
     Ok(success(stdout))
@@ -656,10 +676,12 @@ fn parse_create(args: &[String]) -> Result<CreateOptions, TicketCliError> {
 
 fn parse_list(args: &[String]) -> Result<ListOptions, TicketCliError> {
     let mut state = ListState::All;
+    let mut limit = None;
     let mut i = 0;
     while i < args.len() {
         match option_with_value(args, &mut i)? {
             Some(("--state", value)) => state = parse_list_state(&value)?,
+            Some(("--limit", value)) => limit = Some(parse_list_limit(&value)?),
             Some((name, _)) => {
                 return Err(TicketCliError::new(format!(
                     "unknown list argument: {name}"
@@ -673,7 +695,7 @@ fn parse_list(args: &[String]) -> Result<ListOptions, TicketCliError> {
             }
         }
     }
-    Ok(ListOptions { state })
+    Ok(ListOptions { state, limit })
 }
 
 fn parse_relation(args: &[String]) -> Result<RelationOptions, TicketCliError> {
@@ -922,6 +944,7 @@ fn option_with_value(
         "--kind",
         "--target",
         "--note",
+        "--limit",
     ] {
         if arg == name {
             let value = args
@@ -955,6 +978,47 @@ fn parse_list_state(value: &str) -> Result<ListState, TicketCliError> {
         "all" => Ok(ListState::All),
         _ => Err(TicketCliError::new(format!("invalid state: {value}"))),
     }
+}
+
+fn parse_list_limit(value: &str) -> Result<usize, TicketCliError> {
+    value
+        .parse::<usize>()
+        .map_err(|_| TicketCliError::new(format!("invalid limit: {value}")))
+}
+
+fn ticket_cli_hints(ticket: &TicketSummary) -> String {
+    let mut hints = Vec::new();
+    if let Some(attention) = ticket.attention_required.as_deref() {
+        hints.push(format!(
+            "attention:{}",
+            truncate_inline(attention, LIST_HINT_MAX_CHARS)
+        ));
+    }
+    if let Some(action) = ticket.action_required.as_deref() {
+        hints.push(format!(
+            "action:{}",
+            truncate_inline(action, LIST_HINT_MAX_CHARS)
+        ));
+    }
+    if let Some(readiness) = ticket.readiness.as_deref() {
+        hints.push(format!(
+            "readiness:{}",
+            truncate_inline(readiness, LIST_HINT_MAX_CHARS)
+        ));
+    }
+    hints.join("; ")
+}
+
+fn truncate_inline(text: &str, max_chars: usize) -> String {
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() <= max_chars {
+        return normalized;
+    }
+    let marker = "...";
+    let take = max_chars.saturating_sub(marker.chars().count());
+    let mut out = normalized.chars().take(take).collect::<String>();
+    out.push_str(marker);
+    out
 }
 
 fn parse_state_target(value: &str) -> Result<StateTarget, TicketCliError> {
@@ -1021,7 +1085,7 @@ fn default_author() -> String {
 }
 
 fn help_text() -> &'static str {
-    "yoi ticket\n\nUsage:\n  yoi ticket init\n  yoi ticket create --title <title>\n  yoi ticket list [--state planning|ready|queued|inprogress|done|closed|all]\n  yoi ticket show <id>\n  yoi ticket comment <id> [--role comment|plan|decision|implementation_report] (--file <path>|--message <text>)\n  yoi ticket review <id> (--approve|--request-changes) (--file <path>|--message <text>)\n  yoi ticket state <id> <planning|ready|queued|inprogress|done|closed>\n  yoi ticket close <id> (--resolution <text>|--file <path>)\n  yoi ticket relation add --ticket <id> --kind <depends_on|blocks|related|supersedes|duplicate_of> --target <id> [--note <text>]\n  yoi ticket relation list [--ticket <id>] [--kind <kind>]\n  yoi ticket doctor\n\nOptions:\n  -h, --help    Print help\n\nBackend:\n  `yoi ticket init` writes .yoi/ticket.config.toml with explicit fixed role profiles and an optional commented [ticket].language setting.\n  Uses the workspace Ticket config at .yoi/ticket.config.toml when present.\n  Supported provider: builtin:yoi_local.\n  Without config, the local backend root is <cwd>/.yoi/tickets.\n"
+    "yoi ticket\n\nUsage:\n  yoi ticket init\n  yoi ticket create --title <title>\n  yoi ticket list [--state planning|ready|queued|inprogress|done|closed|all] [--limit <n>]\n  yoi ticket show <id>\n  yoi ticket comment <id> [--role comment|plan|decision|implementation_report] (--file <path>|--message <text>)\n  yoi ticket review <id> (--approve|--request-changes) (--file <path>|--message <text>)\n  yoi ticket state <id> <planning|ready|queued|inprogress|done|closed>\n  yoi ticket close <id> (--resolution <text>|--file <path>)\n  yoi ticket relation add --ticket <id> --kind <depends_on|blocks|related|supersedes|duplicate_of> --target <id> [--note <text>]\n  yoi ticket relation list [--ticket <id>] [--kind <kind>]\n  yoi ticket doctor\n\nOptions:\n  -h, --help    Print help\n\nBackend:\n  `yoi ticket init` writes .yoi/ticket.config.toml with explicit fixed role profiles and an optional commented [ticket].language setting.\n  Uses the workspace Ticket config at .yoi/ticket.config.toml when present.\n  Supported provider: builtin:yoi_local.\n  Without config, the local backend root is <cwd>/.yoi/tickets.\n"
 }
 
 #[cfg(test)]
@@ -1097,6 +1161,54 @@ mod tests {
             fs::read_to_string(config_path).unwrap(),
             "[backend]\nprovider = \"builtin:yoi_local\"\n"
         );
+    }
+
+    #[test]
+    fn ticket_cli_list_is_bounded_and_truncates_titles() {
+        let temp = TempDir::new().unwrap();
+        let long_title = format!("Long {}", "x".repeat(LIST_TITLE_MAX_CHARS + 40));
+        let first = run(&temp, &["create", "--title", long_title.as_str()]);
+        assert_eq!(first.status, TicketCliStatus::Success);
+        for index in 0..DEFAULT_LIST_LIMIT {
+            let title = format!("Ticket {index:03}");
+            let created = run(&temp, &["create", "--title", title.as_str()]);
+            assert_eq!(created.status, TicketCliStatus::Success);
+        }
+
+        let listed = run(&temp, &["list", "--state", "all"]);
+        assert_eq!(listed.status, TicketCliStatus::Success);
+        assert!(listed.stdout.contains("# truncated: returned"));
+        let non_note_lines = listed
+            .stdout
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .count();
+        assert_eq!(non_note_lines, DEFAULT_LIST_LIMIT + 1);
+        let first_ticket_line = listed.stdout.lines().nth(1).unwrap();
+        let listed_title = first_ticket_line.split('\t').nth(2).unwrap();
+        assert!(listed_title.starts_with("Long "));
+        assert!(listed_title.chars().count() <= LIST_TITLE_MAX_CHARS);
+        assert!(listed_title.ends_with("..."));
+    }
+
+    #[test]
+    fn ticket_cli_list_limit_is_capped() {
+        let temp = TempDir::new().unwrap();
+        for index in 0..(MAX_LIST_LIMIT + 5) {
+            let title = format!("Ticket {index:03}");
+            let created = run(&temp, &["create", "--title", title.as_str()]);
+            assert_eq!(created.status, TicketCliStatus::Success);
+        }
+
+        let listed = run(&temp, &["list", "--state", "all", "--limit", "1000"]);
+        assert_eq!(listed.status, TicketCliStatus::Success);
+        assert!(listed.stdout.contains("# truncated: returned"));
+        let non_note_lines = listed
+            .stdout
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .count();
+        assert_eq!(non_note_lines, MAX_LIST_LIMIT + 1);
     }
 
     #[test]

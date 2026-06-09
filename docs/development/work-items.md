@@ -34,8 +34,8 @@ Maintainers can inspect the local `.yoi/tickets/` files directly when debugging 
 Pods with the Ticket built-in feature can use typed Ticket tools:
 
 - `TicketCreate`
-- `TicketList`
-- `TicketShow`
+- `TicketList` — lightweight bounded overview for selecting ids; it returns short summaries only and must not be used as body/thread/artifact authority.
+- `TicketShow` — detailed authority for a single Ticket, including body/thread/artifact metadata/resolution context subject to its own bounds.
 - `TicketComment`
 - `TicketReview`
 - `TicketWorkflowState`
@@ -387,7 +387,7 @@ The product CLI exposes the typed Ticket backend for repository maintenance and 
 
 ```sh
 yoi ticket create --title "..." [--priority P2]
-yoi ticket list [--state planning|ready|queued|inprogress|done|closed|all]
+yoi ticket list [--state planning|ready|queued|inprogress|done|closed|all] [--limit n]
 yoi ticket show <id>
 yoi ticket comment <id> [--role comment|plan|decision|implementation_report] [--file path]
 yoi ticket review <id> --approve|--request-changes [--file path]
@@ -395,6 +395,8 @@ yoi ticket state <id> <planning|ready|queued|inprogress|done>
 yoi ticket close <id> [--resolution text|--file path]
 yoi ticket doctor
 ```
+
+`yoi ticket list` is a capped overview/selection command. It should remain readable for humans and safe for model context: use it to find a canonical id, then use `yoi ticket show <id>` before routing, closing, planning, or implementation decisions.
 
 `yoi ticket state` records current lifecycle transitions among active states. Closing must use `yoi ticket close` so the backend writes the required `resolution.md` and passes `yoi ticket doctor`; `done` and `closed` remain distinct states.
 

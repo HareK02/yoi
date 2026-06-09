@@ -19,8 +19,10 @@ use crate::{
     TicketStateChange, TicketSummary, TicketWorkflowState,
 };
 
-const DEFAULT_LIST_LIMIT: usize = 100;
-const MAX_LIST_LIMIT: usize = 200;
+const DEFAULT_LIST_LIMIT: usize = 50;
+const MAX_LIST_LIMIT: usize = 100;
+const LIST_TITLE_MAX_CHARS: usize = 96;
+const LIST_HINT_MAX_CHARS: usize = 80;
 const DEFAULT_EVENT_LIMIT: usize = 20;
 const MAX_EVENT_LIMIT: usize = 100;
 const DEFAULT_ARTIFACT_LIMIT: usize = 50;
@@ -68,9 +70,10 @@ pub const TICKET_MUTATING_TOOL_NAMES: [&str; 8] = [
 const CREATE_DESCRIPTION: &str = "Create a Ticket through the configured typed Ticket backend. \
 Inputs mirror the Ticket `item.md` fields; `title` is required, `body` is Markdown, and the \
 backend assigns the id and writes the local Ticket file layout under the configured backend root.";
-const LIST_DESCRIPTION: &str = "List Tickets from the configured typed Ticket backend. Filter by \
-state (`planning`, `ready`, `queued`, `inprogress`, `done`, `closed`, or `all`). Output is a \
-bounded JSON summary list, not full ticket bodies.";
+const LIST_DESCRIPTION: &str = "List Tickets from the configured typed Ticket backend as a \
+lightweight bounded overview for selection only. Filter by state (`planning`, `ready`, `queued`, \
+`inprogress`, `done`, `closed`, or `all`). Output is short summaries only; use TicketShow before \
+routing, closing, planning, or implementation decisions.";
 const SHOW_DESCRIPTION: &str = "Show one Ticket by id or exact query through the configured \
 typed Ticket backend. Output includes bounded Markdown body, recent thread events, resolution, and \
 artifact metadata.";
@@ -212,7 +215,7 @@ struct TicketListParams {
     /// State filter. Defaults to all Tickets.
     #[serde(default)]
     state: Option<TicketListStateParam>,
-    /// Maximum number of summaries to return. Defaults to 100, max 200.
+    /// Maximum number of summaries to return. Defaults to 50, max 100.
     #[serde(default)]
     limit: Option<usize>,
 }
@@ -482,7 +485,18 @@ struct TicketListOutput {
     count: usize,
     returned: usize,
     truncated: bool,
-    tickets: Vec<Value>,
+    limit: usize,
+    tickets: Vec<TicketListTicketOutput>,
+}
+
+#[derive(Debug, Serialize)]
+struct TicketListTicketOutput {
+    id: String,
+    title: String,
+    state: String,
+    updated_at: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    hints: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -614,6 +628,7 @@ impl Tool for TicketListTool {
             count,
             returned: returned_tickets.len(),
             truncated: count > returned_tickets.len(),
+            limit,
             tickets: returned_tickets,
         };
         Ok(json_output(
@@ -971,18 +986,38 @@ fn id_or_query(id: Option<String>, query: Option<String>) -> Result<TicketIdOrSl
     }
 }
 
-fn ticket_summary_json(ticket: TicketSummary) -> Value {
-    json!({
-        "id": ticket.id,
-        "title": ticket.title,
-        "state": ticket.workflow_state.as_str(),
-        "readiness": ticket.readiness,
-        "action_required": ticket.action_required,
-        "attention_required": ticket.attention_required,
-        "queued_by": ticket.queued_by,
-        "queued_at": ticket.queued_at,
-        "updated_at": ticket.updated_at,
-    })
+fn ticket_summary_json(ticket: TicketSummary) -> TicketListTicketOutput {
+    let hints = ticket_list_hints(&ticket);
+    TicketListTicketOutput {
+        id: ticket.id,
+        title: truncate_inline(ticket.title.as_str(), LIST_TITLE_MAX_CHARS),
+        state: ticket.workflow_state.as_str().to_string(),
+        updated_at: ticket.updated_at,
+        hints,
+    }
+}
+
+fn ticket_list_hints(ticket: &TicketSummary) -> Vec<String> {
+    let mut hints = Vec::new();
+    if let Some(attention) = ticket.attention_required.as_deref() {
+        hints.push(format!(
+            "attention:{}",
+            truncate_inline(attention, LIST_HINT_MAX_CHARS)
+        ));
+    }
+    if let Some(action) = ticket.action_required.as_deref() {
+        hints.push(format!(
+            "action:{}",
+            truncate_inline(action, LIST_HINT_MAX_CHARS)
+        ));
+    }
+    if let Some(readiness) = ticket.readiness.as_deref() {
+        hints.push(format!(
+            "readiness:{}",
+            truncate_inline(readiness, LIST_HINT_MAX_CHARS)
+        ));
+    }
+    hints
 }
 
 fn ticket_relation_json(relation: &crate::TicketRelation) -> Value {
@@ -1148,6 +1183,18 @@ fn diagnostic_json(diagnostic: TicketDoctorDiagnostic) -> Value {
         "message": diagnostic.message,
         "path": diagnostic.path.map(|path| path.display().to_string()),
     })
+}
+
+fn truncate_inline(text: &str, max_chars: usize) -> String {
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() <= max_chars {
+        return normalized;
+    }
+    let marker = "...";
+    let take = max_chars.saturating_sub(marker.chars().count());
+    let mut out = normalized.chars().take(take).collect::<String>();
+    out.push_str(marker);
+    out
 }
 
 fn truncate_text(text: &str, max_bytes: usize) -> String {
@@ -1409,6 +1456,188 @@ mod tests {
 
         let report = doctor.execute(&json!({}).to_string()).await.unwrap();
         assert!(report.summary.contains("0 error(s)"));
+    }
+
+    #[tokio::test]
+    async fn ticket_list_tool_truncates_long_titles_and_hints() {
+        let temp = TempDir::new().unwrap();
+        let backend = backend(&temp);
+        let list = tool_by_name(backend.clone(), "TicketList");
+        let mut ticket = NewTicket::new(format!(
+            "Long Title {}",
+            "x".repeat(LIST_TITLE_MAX_CHARS + 40)
+        ));
+        ticket.attention_required = Some(format!(
+            "Needs attention {}",
+            "a".repeat(LIST_HINT_MAX_CHARS + 40)
+        ));
+        backend.create(ticket).unwrap();
+
+        let listed = list.execute(&json!({}).to_string()).await.unwrap();
+        let listed_json: Value = serde_json::from_str(&listed.content.unwrap()).unwrap();
+        let title = listed_json["tickets"][0]["title"].as_str().unwrap();
+        assert!(title.chars().count() <= LIST_TITLE_MAX_CHARS);
+        assert!(title.ends_with("..."));
+        let hint = listed_json["tickets"][0]["hints"][0].as_str().unwrap();
+        assert!(hint.chars().count() <= "attention:".chars().count() + LIST_HINT_MAX_CHARS);
+        assert!(hint.ends_with("..."));
+    }
+
+    #[tokio::test]
+    async fn ticket_list_tool_default_and_max_limits_are_bounded() {
+        let temp = TempDir::new().unwrap();
+        let backend = backend(&temp);
+        let list = tool_by_name(backend.clone(), "TicketList");
+        for index in 0..(MAX_LIST_LIMIT + 5) {
+            backend
+                .create(NewTicket::new(format!("Ticket {index:03}")))
+                .unwrap();
+        }
+
+        let default_list = list.execute(&json!({}).to_string()).await.unwrap();
+        let default_json: Value = serde_json::from_str(&default_list.content.unwrap()).unwrap();
+        assert_eq!(
+            default_json["count"].as_u64(),
+            Some((MAX_LIST_LIMIT + 5) as u64)
+        );
+        assert_eq!(
+            default_json["returned"].as_u64(),
+            Some(DEFAULT_LIST_LIMIT as u64)
+        );
+        assert_eq!(
+            default_json["limit"].as_u64(),
+            Some(DEFAULT_LIST_LIMIT as u64)
+        );
+        assert_eq!(default_json["truncated"].as_bool(), Some(true));
+        assert_eq!(
+            default_json["tickets"].as_array().unwrap().len(),
+            DEFAULT_LIST_LIMIT
+        );
+
+        let high_limit = list
+            .execute(&json!({ "limit": MAX_LIST_LIMIT + 500 }).to_string())
+            .await
+            .unwrap();
+        let high_json: Value = serde_json::from_str(&high_limit.content.unwrap()).unwrap();
+        assert_eq!(high_json["returned"].as_u64(), Some(MAX_LIST_LIMIT as u64));
+        assert_eq!(high_json["limit"].as_u64(), Some(MAX_LIST_LIMIT as u64));
+        assert_eq!(high_json["truncated"].as_bool(), Some(true));
+        assert_eq!(
+            high_json["tickets"].as_array().unwrap().len(),
+            MAX_LIST_LIMIT
+        );
+    }
+
+    #[tokio::test]
+    async fn ticket_list_tool_caps_all_and_closed_default_listing() {
+        let temp = TempDir::new().unwrap();
+        let backend = backend(&temp);
+        let list = tool_by_name(backend.clone(), "TicketList");
+        for index in 0..(DEFAULT_LIST_LIMIT + 3) {
+            let mut ticket = NewTicket::new(format!("Closed Ticket {index:03}"));
+            ticket.workflow_state = Some(TicketWorkflowState::Closed);
+            backend.create(ticket).unwrap();
+        }
+        for index in 0..3 {
+            backend
+                .create(NewTicket::new(format!("Planning Ticket {index:03}")))
+                .unwrap();
+        }
+
+        let all = list
+            .execute(&json!({ "state": "all" }).to_string())
+            .await
+            .unwrap();
+        let all_json: Value = serde_json::from_str(&all.content.unwrap()).unwrap();
+        assert_eq!(all_json["state_filter"], "all");
+        assert_eq!(
+            all_json["returned"].as_u64(),
+            Some(DEFAULT_LIST_LIMIT as u64)
+        );
+        assert_eq!(all_json["truncated"].as_bool(), Some(true));
+
+        let closed = list
+            .execute(&json!({ "state": "closed" }).to_string())
+            .await
+            .unwrap();
+        let closed_json: Value = serde_json::from_str(&closed.content.unwrap()).unwrap();
+        assert_eq!(closed_json["state_filter"], "closed");
+        assert_eq!(
+            closed_json["count"].as_u64(),
+            Some((DEFAULT_LIST_LIMIT + 3) as u64)
+        );
+        assert_eq!(
+            closed_json["returned"].as_u64(),
+            Some(DEFAULT_LIST_LIMIT as u64)
+        );
+        assert_eq!(closed_json["truncated"].as_bool(), Some(true));
+    }
+
+    #[tokio::test]
+    async fn ticket_list_tool_omits_body_thread_artifact_and_resolution_content() {
+        let temp = TempDir::new().unwrap();
+        let backend = backend(&temp);
+        let list = tool_by_name(backend.clone(), "TicketList");
+        let close = tool_by_name(backend.clone(), "TicketClose");
+        let body_secret = "ITEM_BODY_SECRET_DO_NOT_LIST";
+        let thread_secret = "THREAD_SECRET_DO_NOT_LIST";
+        let artifact_secret = "ARTIFACT_SECRET_DO_NOT_LIST";
+        let resolution_secret = "RESOLUTION_SECRET_DO_NOT_LIST";
+        let mut ticket = NewTicket::new("Leak Probe");
+        ticket.body = MarkdownText::new(format!("Item body {body_secret}"));
+        ticket.workflow_state = Some(TicketWorkflowState::Done);
+        let created = backend.create(ticket).unwrap();
+        backend
+            .add_event(
+                TicketIdOrSlug::Id(created.id.clone()),
+                NewTicketEvent::new(TicketEventKind::Comment, format!("Thread {thread_secret}")),
+            )
+            .unwrap();
+        std::fs::write(
+            temp.path()
+                .join("tickets")
+                .join(&created.id)
+                .join("artifacts")
+                .join("secret.txt"),
+            artifact_secret,
+        )
+        .unwrap();
+        close
+            .execute(
+                &json!({
+                    "ticket": created.id,
+                    "resolution": format!("Resolution {resolution_secret}")
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+
+        let listed = list
+            .execute(&json!({ "state": "closed" }).to_string())
+            .await
+            .unwrap();
+        let listed_content = listed.content.unwrap();
+        for secret in [
+            body_secret,
+            thread_secret,
+            artifact_secret,
+            resolution_secret,
+        ] {
+            assert!(!listed_content.contains(secret));
+        }
+        let listed_json: Value = serde_json::from_str(&listed_content).unwrap();
+        let ticket = listed_json["tickets"][0].as_object().unwrap();
+        for forbidden_key in [
+            "body",
+            "document",
+            "events",
+            "thread",
+            "artifacts",
+            "resolution",
+        ] {
+            assert!(!ticket.contains_key(forbidden_key));
+        }
     }
 
     #[tokio::test]

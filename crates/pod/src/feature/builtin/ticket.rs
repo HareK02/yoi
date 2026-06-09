@@ -172,9 +172,11 @@ impl FeatureModule for TicketFeature {
 fn tool_description(name: &str) -> &'static str {
     match name {
         "TicketCreate" => "Create a Ticket through the typed local Ticket backend.",
-        "TicketList" => "List Tickets through the typed local Ticket backend with bounded output.",
+        "TicketList" => {
+            "List Tickets as a lightweight bounded overview for id selection; use TicketShow before decisions."
+        }
         "TicketShow" => {
-            "Show one Ticket through the typed local Ticket backend with bounded output."
+            "Show one Ticket through the typed local Ticket backend as the detailed authority."
         }
         "TicketComment" => {
             "Append a comment/plan/decision/implementation_report event to a Ticket."
