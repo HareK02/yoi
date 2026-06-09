@@ -1,8 +1,8 @@
 ---
 title: 'session analyticsにresponse単位のbatching指標を追加する'
-state: 'inprogress'
+state: 'closed'
 created_at: '2026-06-09T08:51:48Z'
-updated_at: '2026-06-09T11:04:16Z'
+updated_at: '2026-06-09T11:07:40Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-06-09T10:31:14Z'

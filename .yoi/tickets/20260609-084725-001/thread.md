@@ -343,3 +343,83 @@ Residual note:
 - Panel currently has no active completion popup/source, so completion-priority for `Tab` is expressed as the caller consuming Tab before target switching when completion exists.
 
 ---
+
+<!-- event: review author: reviewer at: 2026-06-09T11:04:31Z status: request_changes -->
+
+## Review: request changes
+
+## Review result: request changes
+
+The implementation satisfies several mechanical invariants, but I found a remaining Panel display/focus ambiguity that is in scope for this Ticket.
+
+### Blocking issue
+
+When a Ticket/action row is selected and the global composer contains text, `Enter` no longer dispatches the selected row action; it sends/launches through the global composer target. That behavior is encoded in `MultiPodApp::handle_key` by requiring `composer_is_blank()` before selected-ticket actions and falling through to the composer target for non-empty input. However, the rendered actionbar still prioritizes `selected_open_disabled_reason()` whenever a row is selected, without checking whether the composer is non-empty. This can still tell the user the selected Ticket row action is what Enter does while Enter actually uses the global composer target.
+
+Relevant evidence:
+- `crates/tui/src/multi_pod.rs`: selected-ticket actions are Enter-only when `self.input.is_blank()`.
+- `crates/tui/src/multi_pod.rs`: `draw_actionbar` chooses `selected_open_disabled_reason()` before the generic target hint and does not account for non-empty composer text.
+- `crates/tui/src/multi_pod.rs`: `draw_target_status` shows both selected-row focus and composer target, but it still does not make the non-empty-composer Enter behavior authoritative enough to override the selected row action hint.
+
+This leaves the exact mixed state the Ticket called out: selected Ticket row + bottom composer text + unclear/contradictory Enter semantics. Please either make typing/non-empty composer shift focus/display to the global composer, or make the actionbar/target status explicitly prioritize the composer-target Enter action whenever the composer is non-empty, with a regression test for the selected-row + non-empty-composer case.
+
+### Focused checks that passed
+
+- `Ctrl+T` no longer appears to be a Panel target switch in the changed Panel key path; `Tab` handles Panel target switching.
+- Bare panel letters go through the shared composer key handling path rather than row shortcuts.
+- Shared `composer_keys` is used by both normal TUI and the workspace panel for cursor movement, deletion, word movement/deletion, and newline insertion where supported.
+- Changed files are limited to TUI files; I did not find broad Ticket backend/schema/tool changes.
+
+### Validation run
+
+Passed:
+- `cargo test -p tui composer_keys`
+- `cargo test -p tui multi_composer`
+- `cargo test -p tui multi_ctrl_t_does_not_switch_composer_target`
+- `cargo test -p tui multi_bare_panel_letters_append_to_composer_and_arrows_select_when_blank`
+- `cargo test -p tui multi_esc_clears_panel_focus_without_quitting`
+- `cargo fmt --check`
+- `git diff --check HEAD^..HEAD`
+- `cargo check --workspace`
+- `nix build .#yoi`
+- `cargo run -q -p yoi -- ticket doctor`
+
+Also ran broader `cargo test -p tui`, which failed in existing Panel tests (`ticket_queue_notification_message_carries_routing_contract`, `panel_ticket_rows_use_aligned_columns_before_title`, `panel_ticket_title_truncates_after_stable_columns`). These do not appear to be the new focused composer-key tests, but the package test suite is not fully green at this commit and should be classified before merge.
+
+---
+
+<!-- event: review author: reviewer-panel-display-composer-keys at: 2026-06-09T11:07:23Z status: request_changes -->
+
+## Review: request changes
+
+Review result: request_changes
+
+Blocking issue:
+- UI/actionbar can still be ambiguous when a Ticket row is selected and the global composer contains text.
+- In `crates/tui/src/multi_pod.rs`, selected Ticket action dispatch only happens when `composer_is_blank()`.
+- If composer text is non-empty, `Enter` acts on the global composer target (Companion send / Ticket Intake launch), not the selected row.
+- However, `draw_actionbar` still prioritizes selected row action/disabled reason and does not consider whether composer text is non-empty.
+- This can show a row-action hint while actual `Enter` submits composer text to the global target, violating the requirement that global composer text must not imply it applies to a selected Ticket and that display/focus messaging answers what Enter does now.
+
+Required fix:
+- Make actionbar/target status prioritize the global composer Enter behavior when composer text is non-empty, or move focus/display to global composer/no-selection when text entry begins.
+- Add a regression test for the state: selected Ticket row + non-empty composer text => actionbar/status describes composer-target Enter behavior, not row action.
+
+Validation evidence from reviewer:
+- Passed:
+  - `cargo test -p tui composer_keys`
+  - `cargo test -p tui multi_composer`
+  - `cargo test -p tui multi_ctrl_t_does_not_switch_composer_target`
+  - `cargo test -p tui multi_bare_panel_letters_append_to_composer_and_arrows_select_when_blank`
+  - `cargo test -p tui multi_esc_clears_panel_focus_without_quitting`
+  - `cargo fmt --check`
+  - `git diff --check HEAD^..HEAD`
+  - `cargo check --workspace`
+  - `nix build .#yoi`
+  - `cargo run -q -p yoi -- ticket doctor`
+- Additional full `cargo test -p tui` was attempted and failed in 3 broader panel tests. These failures are not clearly from the new composer-key focused tests, but should be classified before merge if relevant:
+  - `multi_pod::tests::ticket_queue_notification_message_carries_routing_contract`
+  - `multi_pod::tests::panel_ticket_rows_use_aligned_columns_before_title`
+  - `multi_pod::tests::panel_ticket_title_truncates_after_stable_columns`
+
+---
