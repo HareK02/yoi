@@ -174,3 +174,76 @@ Next action:
 - After `simplify-ticket-identity-fields` is merged/closed/cleaned up or explicitly held back, re-read this Ticket against the new identity model and accept it from queued if still unblocked.
 
 ---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-09T05:42:43Z from: queued to: inprogress reason: orchestrator_acceptance field: state -->
+
+## State changed
+
+Accepted queued implementation after identity simplification landed, was closed, and the workspace was verified clean on the flat Ticket layout. This Ticket is the lower-level project-level Ticket relation/reference surface, so it should run before Objective records, which may reference Tickets and relation concepts.
+
+---
+
+<!-- event: decision author: orchestrator at: 2026-06-09T05:42:43Z -->
+
+## Decision
+
+Routing decision: implementation_ready
+
+Evidence checked:
+- Ticket body/thread, including Intake refinement and explicit first-version relation decisions.
+- Current flat Ticket identity state after `simplify-ticket-identity-fields` landed and closed.
+- Current queued set: `typed-ticket-relation-metadata` and `objective-records-for-medium-term-goals`.
+- Orchestration plan records: none existed before this routing; I recorded that typed relations should run before Objective records.
+- Workspace/worktree state: main workspace clean enough to route, no active implementation worktree.
+
+Reason:
+- The Ticket has concrete binding decisions: non-hierarchical relation kinds only, forward stored relations with derived inverse views, queue-gate diagnostics for unresolved dependencies/blockers, and clear separation from OrchestrationPlan/runtime claims.
+- It is lower-level than Objective records because Objective links should target stable canonical Ticket IDs and relation/reference semantics.
+- No concrete missing decision remains that requires returning to planning.
+
+IntentPacket:
+
+Intent:
+- Add typed, durable, non-hierarchical project-level Ticket-to-Ticket relation metadata on top of the flat canonical Ticket ID/state model.
+
+Binding decisions / invariants:
+- Supported stored relation kinds for first version: `depends_on`, `blocks`, `related`, `supersedes`, `duplicate_of`.
+- Do not support hierarchy/container kinds: no `parent`, `child`, `sub-ticket`, `umbrella`, `part_of`, or `contains`.
+- Store forward relations only; derive inverse views such as blocked-by / superseded-by / duplicate inverse from forward records.
+- Relations are project-level Ticket metadata and must not store Pod/session claims, worktree paths, branch ownership, coder/reviewer assignments, capacity, current planned order, or `do_not_parallelize` execution-plan state.
+- Store relations durably under the Ticket backend in a typed, git-trackable, backend-validated form.
+- Use canonical opaque Ticket IDs only. Do not use title/slug words as relation authority.
+- `TicketShow` must display relation metadata including useful inverse view.
+- `ticket doctor` must validate dangling references, invalid kinds, self relations, and obvious dependency/blocking cycles with bounded diagnostics.
+- Panel/CLI queue gate should not ignore unresolved blocking relations: unresolved `depends_on` and incoming unresolved `blocks` must be visible as block/diagnostic before `ready -> queued` and rechecked by Orchestrator at acceptance.
+- `related` does not block queue; `supersedes` / `duplicate_of` produce visible replacement/duplicate diagnostics but are not automatically all blocking.
+- Orchestrator routing treats relations as input constraints distinct from OrchestrationPlan runtime decisions.
+- Do not implement Objective records here.
+- Do not implement a full scheduler/dependency graph solver.
+- Do not change Pod protocol/history/session semantics.
+
+Implementation latitude:
+- Coder may choose typed artifact vs current Ticket metadata field if it is validated, git-trackable, queryable, and works with flat IDs.
+- CLI/tool names and exact Panel hint wording are implementation latitude if acceptance criteria are met.
+- Cycle detection may be bounded and documented/test-covered.
+- If the queue gate cannot be fully enforced in Panel/CLI without broad UI redesign, implement visible diagnostics and escalate the exact remaining gap rather than silently skipping it.
+
+Reviewer focus:
+- Verify relation storage is typed/validated and does not rely only on Markdown thread prose.
+- Verify canonical ID references and local record migration/test fixtures use flat IDs.
+- Verify no hierarchy/container relation kind slips in as current behavior.
+- Verify OrchestrationPlan and Ticket relations remain distinct.
+- Verify doctor and queue/panel/list/show surfaces expose unresolved dependency/blocker information before Orchestrator starts work.
+
+Validation:
+- Focused Ticket backend/parser/writer/doctor tests for relations, dangling references, invalid kinds, self relation, cycles, derived inverse views.
+- Focused CLI/tool/schema tests for relation create/show/list/query or equivalent surfaces.
+- Focused panel/queue-gate tests for unresolved dependency/blocker visibility if touched.
+- Workflow/prompt/doc checks for Intake/Planning/Orchestrator relation guidance.
+- `cargo fmt --check`.
+- `git diff --check`.
+- `cargo run -q -p yoi -- ticket doctor`.
+- `cargo check --workspace`.
+- `nix build .#yoi`.
+
+---

@@ -93,3 +93,26 @@ Next action:
 - After `simplify-ticket-identity-fields` is merged/closed/cleaned up or explicitly held back, re-read this Ticket against the new identity model and accept it from queued if still unblocked.
 
 ---
+
+<!-- event: decision author: orchestrator at: 2026-06-09T05:42:43Z -->
+
+## Decision
+
+Routing decision: waiting_for_relation_metadata
+
+`objective-records-for-medium-term-goals` remains queued, but implementation is intentionally ordered after `typed-ticket-relation-metadata`.
+
+Reason:
+- Objective records need stable Ticket link/reference semantics.
+- `typed-ticket-relation-metadata` is the lower-level non-hierarchical Ticket relation/reference surface that should land first.
+- Running both in parallel would create avoidable conflict in project-record guidance, Ticket link semantics, panel/CLI display, and Orchestrator/Intake wording.
+
+State decision:
+- Leave this Ticket `queued`.
+- Do not create a worktree or spawn a coder yet.
+
+Next action:
+- Complete and merge `typed-ticket-relation-metadata` first.
+- Re-read Objective records against the resulting relation/reference model, then accept from queued if still unblocked.
+
+---
