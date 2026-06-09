@@ -15,6 +15,7 @@ members = [
     "crates/provider",
     "crates/pod-registry",
     "crates/session-metrics",
+    "crates/session-analytics",
     "crates/lint-common",
     "crates/tools",
     "crates/tui",
@@ -43,6 +44,7 @@ pod-store = { path = "crates/pod-store" }
 protocol = { path = "crates/protocol" }
 provider = { path = "crates/provider" }
 session-metrics = { path = "crates/session-metrics" }
+session-analytics = { path = "crates/session-analytics" }
 session-store = { path = "crates/session-store" }
 secrets = { path = "crates/secrets" }
 tools = { path = "crates/tools" }

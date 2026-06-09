@@ -11,6 +11,7 @@ memory = { workspace = true }
 manifest = { workspace = true }
 pod = { workspace = true }
 session-store = { workspace = true }
+session-analytics = { workspace = true }
 ticket = { workspace = true }
 tui = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
