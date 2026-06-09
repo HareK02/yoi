@@ -2,13 +2,13 @@
 id: '20260608-071722-orchestrator-return-to-planning-context-policy'
 slug: 'orchestrator-return-to-planning-context-policy'
 title: 'Require project context before Orchestrator returns Tickets to planning'
-status: 'open'
+status: 'closed'
 kind: 'task'
 priority: 'P1'
 labels: ['ticket', 'orchestrator', 'planning', 'workflow', 'prompt']
-workflow_state: 'inprogress'
+workflow_state: 'done'
 created_at: '2026-06-08T07:17:22Z'
-updated_at: '2026-06-09T00:24:31Z'
+updated_at: '2026-06-09T01:18:52Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-06-09T00:04:21Z'
