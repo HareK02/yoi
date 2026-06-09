@@ -168,3 +168,24 @@ Validation:
 - `nix build .#yoi` if workflows/resources/docs included in package inputs are touched.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-09T01:20:28Z -->
+
+## Implementation report
+
+Implementation routing started after the previously blocking policy branch was merged and cleaned up.
+
+Worktree/branch:
+- Worktree: `.worktree/deprecate-umbrella-tickets`
+- Branch: `deprecate-umbrella-tickets`
+- Base/routing commit: `8db8d7d ticket: route umbrella deprecation`
+
+Spawned sibling Coder Pod:
+- `coder-deprecate-umbrella-tickets`
+- Scope: non-recursive read on parent workspace root plus recursive write limited to the child worktree.
+
+Routing context:
+- `orchestrator-return-to-planning-context-policy` is merged, validated, closed, and cleaned up.
+- This Ticket is now the active routed policy/workflow implementation work.
+
+---
