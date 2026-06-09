@@ -251,3 +251,95 @@ Parallel-routing rationale:
 - Coder was instructed to avoid Ticket backend/tool output changes unless necessary.
 
 ---
+
+<!-- event: implementation_report author: coder at: 2026-06-09T10:49:47Z -->
+
+## Implementation report
+
+Implemented panel display/composer key handling updates on branch `panel-display-composer-keys`.
+
+Summary:
+- Added shared `composer_keys` keymap for readline-style composer editing and reused it from both normal TUI input handling and workspace panel input handling.
+- Removed Panel `Ctrl+T` target switching; Panel now uses `Tab` for global composer target switching. `Ctrl+T` is no longer a Panel target shortcut.
+- Kept bare letters as composer text and added focused tests for `j/k/o/r` text entry.
+- Added explicit Panel focus state (`global composer`, `selected row`, `item action`) and status/actionbar/title wording that distinguishes global composer target from selected rows.
+- `Esc` clears Panel selection/focus back to the global composer target; `Ctrl+C` remains quit.
+- Added shared key handling coverage for word motion/delete and Panel focus/target transitions.
+
+Files changed:
+- `crates/tui/src/composer_keys.rs`
+- `crates/tui/src/lib.rs`
+- `crates/tui/src/multi_pod.rs`
+- `crates/tui/src/single_pod.rs`
+- `crates/tui/src/workspace_panel.rs`
+
+Validation:
+- `cargo test -p tui composer_keys` — passed
+- `cargo test -p tui multi_composer` — passed
+- `cargo test -p tui multi_ctrl_t_does_not_switch_composer_target` — passed
+- `cargo test -p tui multi_bare_panel_letters_append_to_composer_and_arrows_select_when_blank` — passed
+- `cargo test -p tui multi_esc_clears_panel_focus_without_quitting` — passed
+- `cargo fmt --check` — passed
+- `git diff --check` — passed
+- `cargo run -q -p yoi -- ticket doctor` — passed (`doctor: ok`)
+- `cargo check --workspace` — passed
+- `nix build .#yoi` — passed
+
+Commit: `20f06b3` (`tui: clarify panel focus and composer keys`).
+
+Reviewer notes:
+- The workspace panel does not currently expose an active completion popup/source; the Tab handling path is now isolated as the target-switch path, with completion ownership documented in the shared key handling boundary for future completion integration.
+- Row Enter behavior is preserved for dispatch/open, while Right marks item-action focus and status text makes that model explicit.
+
+---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-09T10:55:20Z -->
+
+## Implementation report
+
+Coder implementation completed and is ready for sibling review.
+
+Coder Pod:
+- `coder-panel-display-composer-keys`
+- Commit: `20f06b3 tui: clarify panel focus and composer keys`
+- Worktree status before review: clean branch `panel-display-composer-keys`
+- Stopped after collecting output to reclaim delegated worktree scope.
+
+UI/key handling design:
+- Panel target switching moved from `Ctrl+T` to `Tab`.
+- `Ctrl+T` no longer switches targets in Panel.
+- Bare letters such as `j/k/o/r` remain composer text, not shortcuts.
+- Panel focus is explicit: global composer, selected row, or item action.
+- Composer send target is displayed as global composer target and does not imply selected Ticket target.
+- `Esc` clears Panel selection/focus toward global composer/no-selection; `Ctrl+C` remains quit.
+- `Right` can move into item action focus while row `Enter` behavior is preserved.
+
+Implementation summary:
+- Added shared `composer_keys` keymap used by normal TUI and workspace panel.
+- Shared editing covers insert, Alt+Enter newline, backspace/delete, left/right, word left/right, word delete, Home/End; caller keeps Up/Down history/list/completion context.
+- Updated Panel help/top/actionbar wording to remove `Ctrl+T` and ambiguous empty Enter wording.
+- Added/updated Panel tests for Tab switching, Ctrl+T non-switching, bare-letter regression, shared word motion/delete, Esc focus clear, and Ctrl+C quit.
+
+Changed files:
+- `crates/tui/src/composer_keys.rs`
+- `crates/tui/src/lib.rs`
+- `crates/tui/src/multi_pod.rs`
+- `crates/tui/src/single_pod.rs`
+- `crates/tui/src/workspace_panel.rs`
+
+Coder validation reported passed:
+- `cargo test -p tui composer_keys`
+- `cargo test -p tui multi_composer`
+- `cargo test -p tui multi_ctrl_t_does_not_switch_composer_target`
+- `cargo test -p tui multi_bare_panel_letters_append_to_composer_and_arrows_select_when_blank`
+- `cargo test -p tui multi_esc_clears_panel_focus_without_quitting`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo run -q -p yoi -- ticket doctor`
+- `cargo check --workspace`
+- `nix build .#yoi`
+
+Residual note:
+- Panel currently has no active completion popup/source, so completion-priority for `Tab` is expressed as the caller consuming Tab before target switching when completion exists.
+
+---

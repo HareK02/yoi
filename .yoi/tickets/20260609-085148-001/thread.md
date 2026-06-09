@@ -94,3 +94,49 @@ Parallel-routing rationale:
 - Coder was instructed to use synthetic fixtures and preserve the privacy boundary.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-09T10:55:20Z -->
+
+## Implementation report
+
+Coder implementation completed and is ready for sibling review.
+
+Coder Pod:
+- `coder-session-analytics-response-batching`
+- Commit: `963db29d960d23b40e32d6b07db88f52b914a72d analytics: add response batching metrics`
+- Worktree status before review: clean branch `session-analytics-response-batching`
+- Stopped after collecting output to reclaim delegated worktree scope.
+
+Response boundary design:
+- Best-effort response grouping uses consecutive top-level `kind: "assistant_item"` JSONL entries as one assistant response.
+- Non-assistant entries such as `tool_result`, `turn_end`, or `segment_start` close the current response group.
+- Seeded `segment_start.history` is excluded from response-level metrics because exact original response boundaries are not explicit; a `response_boundary_approximation` diagnostic records this limitation.
+- Metrics live under `response_batches` and remain distinct from user-turn metrics.
+
+Implementation summary:
+- Added response-level tool metrics: total responses, tool-call responses, total tool calls, avg/p50/p90/max tools per response, histogram, and top tool-call responses.
+- Added Edit batching metrics: responses containing Edit, total Edit calls, calls per response, same-file multi-Edit responses, files touched per Edit response, large-argument summary fields, and `replace_all` count.
+- Added consecutive edit round-trip metrics: pure same-file edit-only streaks and interrupted/annotated sequences when Read/Bash/test-like steps intervene.
+- Preserved privacy boundary: no raw user input, raw tool args, raw file contents, raw session snippets, or raw tool output content in default JSON output.
+
+Changed files:
+- `crates/session-analytics/src/lib.rs`
+- `crates/yoi/src/session_cli.rs`
+
+Coder validation reported passed:
+- `cargo test -p session-analytics`
+- `cargo test -p yoi run_session_analyze_outputs_json`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo run -q -p yoi -- ticket doctor`
+- `cargo check --workspace`
+- `nix build .#yoi`
+
+Focused tests covered multiple tools in one response, same-response same-file edits, consecutive edit-only responses, interleaved Read/test-like Bash interruption/annotation, sessions with no edits, existing analytics behavior, and CLI JSON shape.
+
+Residual notes:
+- Response boundaries are best-effort for current JSONL shape.
+- Percentile/avg output is count-based and `avg_milli` avoids floating-point JSON instability.
+- Bash test detection is heuristic and only annotates interrupted edit sequences; it is not blame/policy classification.
+
+---
