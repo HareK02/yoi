@@ -29,7 +29,11 @@ struct MemoryDeleteTool {
 
 #[async_trait]
 impl Tool for MemoryDeleteTool {
-    async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input_json: &str,
+        _ctx: llm_worker::tool::ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
         let params: DeleteParams = serde_json::from_str(input_json)
             .map_err(|e| ToolError::InvalidArgument(format!("invalid MemoryDelete input: {e}")))?;
         let path = params
@@ -139,7 +143,10 @@ mod tests {
 
         let (_, tool) = delete_tool(layout.clone())();
         let out = tool
-            .execute(r#"{"kind":"decision","slug":"obsolete"}"#)
+            .execute(
+                r#"{"kind":"decision","slug":"obsolete"}"#,
+                Default::default(),
+            )
             .await
             .unwrap();
         assert!(out.summary.contains("Deleted"));

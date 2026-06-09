@@ -58,7 +58,11 @@ impl MockWeatherTool {
 
 #[async_trait]
 impl Tool for MockWeatherTool {
-    async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input_json: &str,
+        _ctx: llm_worker::tool::ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
         self.call_count.fetch_add(1, Ordering::SeqCst);
 
         // Parse input

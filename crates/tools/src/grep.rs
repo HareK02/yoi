@@ -82,7 +82,11 @@ pub(crate) struct GrepTool {
 
 #[async_trait]
 impl Tool for GrepTool {
-    async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input_json: &str,
+        _ctx: llm_worker::tool::ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
         let params: GrepParams = serde_json::from_str(input_json)
             .map_err(|e| ToolError::InvalidArgument(format!("invalid Grep input: {e}")))?;
 
@@ -563,7 +567,10 @@ mod tests {
         let def = grep_tool(scoped);
         let (_, tool) = def();
         let inp = serde_json::json!({ "pattern": "needle" });
-        let out = tool.execute(&inp.to_string()).await.unwrap();
+        let out = tool
+            .execute(&inp.to_string(), Default::default())
+            .await
+            .unwrap();
         let body = out.content.unwrap_or_default();
         assert!(body.contains("visible.txt"));
         assert!(
@@ -583,7 +590,10 @@ mod tests {
         assert_eq!(meta.name, "Grep");
 
         let inp = serde_json::json!({ "pattern": "bravo" });
-        let out = tool.execute(&inp.to_string()).await.unwrap();
+        let out = tool
+            .execute(&inp.to_string(), Default::default())
+            .await
+            .unwrap();
         assert!(out.summary.contains("1 file"));
         assert!(out.content.unwrap().contains("a.txt"));
     }
@@ -599,7 +609,10 @@ mod tests {
             "pattern": "two",
             "output_mode": "content",
         });
-        let out = tool.execute(&inp.to_string()).await.unwrap();
+        let out = tool
+            .execute(&inp.to_string(), Default::default())
+            .await
+            .unwrap();
         let body = out.content.unwrap();
         assert!(body.contains(":2:two"));
     }
@@ -616,7 +629,10 @@ mod tests {
             "pattern": "x",
             "output_mode": "count",
         });
-        let out = tool.execute(&inp.to_string()).await.unwrap();
+        let out = tool
+            .execute(&inp.to_string(), Default::default())
+            .await
+            .unwrap();
         let body = out.content.unwrap();
         assert!(body.contains("a.txt:3"));
         assert!(body.contains("b.txt:1"));
@@ -635,7 +651,10 @@ mod tests {
             "-i": true,
             "output_mode": "content",
         });
-        let out = tool.execute(&inp.to_string()).await.unwrap();
+        let out = tool
+            .execute(&inp.to_string(), Default::default())
+            .await
+            .unwrap();
         assert!(out.content.unwrap().contains("HELLO"));
     }
 
@@ -654,7 +673,10 @@ mod tests {
             "output_mode": "content",
             "-C": 1,
         });
-        let out = tool.execute(&inp.to_string()).await.unwrap();
+        let out = tool
+            .execute(&inp.to_string(), Default::default())
+            .await
+            .unwrap();
         let body = out.content.unwrap();
         // should contain: line2 (before context), MATCH, line4 (after context)
         assert!(body.contains("line2"));
@@ -677,7 +699,10 @@ mod tests {
             "multiline": true,
             "output_mode": "content",
         });
-        let out = tool.execute(&inp.to_string()).await.unwrap();
+        let out = tool
+            .execute(&inp.to_string(), Default::default())
+            .await
+            .unwrap();
         let body = out.content.unwrap();
         assert!(body.contains("foo"));
     }
@@ -694,7 +719,10 @@ mod tests {
             "pattern": "target",
             "glob": "*.rs",
         });
-        let out = tool.execute(&inp.to_string()).await.unwrap();
+        let out = tool
+            .execute(&inp.to_string(), Default::default())
+            .await
+            .unwrap();
         let body = out.content.unwrap();
         assert!(body.contains("a.rs"));
         assert!(!body.contains("b.txt"));
@@ -712,7 +740,10 @@ mod tests {
             "pattern": "target",
             "type": "rust",
         });
-        let out = tool.execute(&inp.to_string()).await.unwrap();
+        let out = tool
+            .execute(&inp.to_string(), Default::default())
+            .await
+            .unwrap();
         let body = out.content.unwrap();
         assert!(body.contains("a.rs"));
         assert!(!body.contains("b.py"));
@@ -731,7 +762,10 @@ mod tests {
             "pattern": "x",
             "head_limit": 2,
         });
-        let out = tool.execute(&inp.to_string()).await.unwrap();
+        let out = tool
+            .execute(&inp.to_string(), Default::default())
+            .await
+            .unwrap();
         let body = out.content.unwrap();
         assert_eq!(body.lines().count(), 2);
         assert!(out.summary.contains("truncated at 2"));
@@ -752,7 +786,10 @@ mod tests {
             "offset": 3,
             "head_limit": 10,
         });
-        let out = tool.execute(&inp.to_string()).await.unwrap();
+        let out = tool
+            .execute(&inp.to_string(), Default::default())
+            .await
+            .unwrap();
         let body = out.content.unwrap();
         // We skipped 3, so only 2 should remain.
         assert_eq!(body.lines().count(), 2);
@@ -769,7 +806,10 @@ mod tests {
         let def = grep_tool(fs);
         let (_, tool) = def();
         let inp = serde_json::json!({ "pattern": "needle" });
-        let out = tool.execute(&inp.to_string()).await.unwrap();
+        let out = tool
+            .execute(&inp.to_string(), Default::default())
+            .await
+            .unwrap();
         let body = out.content.unwrap();
         assert!(body.contains("b.txt"));
         assert!(!body.contains("a.bin"));
@@ -781,7 +821,10 @@ mod tests {
         let def = grep_tool(fs);
         let (_, tool) = def();
         let inp = serde_json::json!({ "pattern": "(" });
-        let err = tool.execute(&inp.to_string()).await.unwrap_err();
+        let err = tool
+            .execute(&inp.to_string(), Default::default())
+            .await
+            .unwrap_err();
         assert!(matches!(err, ToolError::InvalidArgument(_)));
     }
 
@@ -794,7 +837,10 @@ mod tests {
             "pattern": "x",
             "type": "nonexistent",
         });
-        let err = tool.execute(&inp.to_string()).await.unwrap_err();
+        let err = tool
+            .execute(&inp.to_string(), Default::default())
+            .await
+            .unwrap_err();
         assert!(matches!(err, ToolError::InvalidArgument(_)));
     }
 
@@ -805,7 +851,10 @@ mod tests {
         let def = grep_tool(fs);
         let (_, tool) = def();
         let inp = serde_json::json!({ "pattern": "zzz" });
-        let out = tool.execute(&inp.to_string()).await.unwrap();
+        let out = tool
+            .execute(&inp.to_string(), Default::default())
+            .await
+            .unwrap();
         assert_eq!(out.summary, "No files matched");
         assert!(out.content.is_none());
     }

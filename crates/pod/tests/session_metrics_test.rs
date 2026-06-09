@@ -79,7 +79,11 @@ struct BigContentTool {
 
 #[async_trait]
 impl Tool for BigContentTool {
-    async fn execute(&self, _input: &str) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        _input: &str,
+        _ctx: llm_worker::tool::ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
         Ok(ToolOutput {
             summary: self.summary.into(),
             content: Some(self.content.clone()),

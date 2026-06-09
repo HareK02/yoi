@@ -126,7 +126,11 @@ struct KnowledgeQueryTool {
 
 #[async_trait]
 impl Tool for MemoryQueryTool {
-    async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input_json: &str,
+        _ctx: llm_worker::tool::ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
         let params: MemoryQueryParams = serde_json::from_str(input_json)
             .map_err(|e| ToolError::InvalidArgument(format!("invalid MemoryQuery input: {e}")))?;
         let needle = match params.query.as_deref() {
@@ -240,7 +244,11 @@ impl Tool for MemoryQueryTool {
 
 #[async_trait]
 impl Tool for KnowledgeQueryTool {
-    async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input_json: &str,
+        _ctx: llm_worker::tool::ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
         let params: KnowledgeQueryParams = serde_json::from_str(input_json).map_err(|e| {
             ToolError::InvalidArgument(format!("invalid KnowledgeQuery input: {e}"))
         })?;
@@ -568,7 +576,10 @@ mod tests {
         write_decision(dir.path(), "beta", "no match here\n");
         let (_, tool) = memory_query_tool(layout, QueryConfig::default())();
         let inp = serde_json::json!({ "query": "ollama" });
-        let out = tool.execute(&inp.to_string()).await.unwrap();
+        let out = tool
+            .execute(&inp.to_string(), Default::default())
+            .await
+            .unwrap();
         let records: Vec<OwnedMemoryRecord> = parse_records(&out);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].slug, "alpha");
@@ -596,7 +607,7 @@ mod tests {
         .unwrap();
 
         let (_, tool) = memory_query_tool(layout, QueryConfig::default())();
-        let out = tool.execute("{}").await.unwrap();
+        let out = tool.execute("{}", Default::default()).await.unwrap();
         let records: Vec<OwnedMemoryRecord> = parse_records(&out);
         let mut slugs: Vec<&str> = records.iter().map(|r| r.slug.as_str()).collect();
         slugs.sort();
@@ -616,7 +627,10 @@ mod tests {
         .unwrap();
         let (_, tool) = memory_query_tool(layout, QueryConfig::default())();
         let inp = serde_json::json!({ "query": "needle" });
-        let out = tool.execute(&inp.to_string()).await.unwrap();
+        let out = tool
+            .execute(&inp.to_string(), Default::default())
+            .await
+            .unwrap();
         let records: Vec<OwnedMemoryRecord> = parse_records(&out);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].slug, "summary");
@@ -633,7 +647,10 @@ mod tests {
 
         let (_, tool) = memory_query_tool(layout, QueryConfig::default())();
         let inp = serde_json::json!({ "query": "needle" });
-        let out = tool.execute(&inp.to_string()).await.unwrap();
+        let out = tool
+            .execute(&inp.to_string(), Default::default())
+            .await
+            .unwrap();
         let records: Vec<OwnedMemoryRecord> = parse_records(&out);
         assert!(records.is_empty(), "got records: {:?}", out.content);
     }
@@ -653,8 +670,14 @@ mod tests {
         let (_, memory_tool) = memory_query_tool(layout.clone(), QueryConfig::default())();
         let (_, knowledge_tool) = knowledge_query_tool(layout.clone(), QueryConfig::default())();
         let inp = serde_json::json!({ "query": "needle" });
-        memory_tool.execute(&inp.to_string()).await.unwrap();
-        knowledge_tool.execute(&inp.to_string()).await.unwrap();
+        memory_tool
+            .execute(&inp.to_string(), Default::default())
+            .await
+            .unwrap();
+        knowledge_tool
+            .execute(&inp.to_string(), Default::default())
+            .await
+            .unwrap();
 
         let report = crate::usage::build_usage_report(&layout).unwrap();
         assert!(report.records.is_empty());
@@ -673,7 +696,10 @@ mod tests {
         };
         let (_, tool) = memory_query_tool(layout, cfg)();
         let inp = serde_json::json!({ "query": "needle" });
-        let out = tool.execute(&inp.to_string()).await.unwrap();
+        let out = tool
+            .execute(&inp.to_string(), Default::default())
+            .await
+            .unwrap();
         let records: Vec<OwnedMemoryRecord> = parse_records(&out);
         assert_eq!(records.len(), 3);
     }
@@ -692,7 +718,10 @@ mod tests {
         };
         let (_, tool) = memory_query_tool(layout, cfg)();
         let inp = serde_json::json!({ "query": "needle" });
-        let out = tool.execute(&inp.to_string()).await.unwrap();
+        let out = tool
+            .execute(&inp.to_string(), Default::default())
+            .await
+            .unwrap();
         let records: Vec<OwnedMemoryRecord> = parse_records(&out);
         assert_eq!(records.len(), 1);
         let e = records[0].excerpt.as_deref().unwrap();
@@ -708,7 +737,10 @@ mod tests {
         let (_dir, layout) = setup();
         let (_, tool) = memory_query_tool(layout, QueryConfig::default())();
         let inp = serde_json::json!({ "query": "   " });
-        let err = tool.execute(&inp.to_string()).await.unwrap_err();
+        let err = tool
+            .execute(&inp.to_string(), Default::default())
+            .await
+            .unwrap_err();
         assert!(matches!(err, ToolError::InvalidArgument(_)));
     }
 
@@ -724,7 +756,10 @@ mod tests {
         );
         let (_, tool) = knowledge_query_tool(layout, QueryConfig::default())();
         let inp = serde_json::json!({ "query": "ollama" });
-        let out = tool.execute(&inp.to_string()).await.unwrap();
+        let out = tool
+            .execute(&inp.to_string(), Default::default())
+            .await
+            .unwrap();
         let records: Vec<OwnedKnowledgeRecord> = parse_records(&out);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].slug, "policy");
@@ -748,7 +783,7 @@ mod tests {
         write_knowledge(dir.path(), "h1", "howto", "d2", "body\n");
 
         let (_, tool) = knowledge_query_tool(layout, QueryConfig::default())();
-        let out = tool.execute("{}").await.unwrap();
+        let out = tool.execute("{}", Default::default()).await.unwrap();
         let records: Vec<OwnedKnowledgeRecord> = parse_records(&out);
         let mut slugs: Vec<&str> = records.iter().map(|r| r.slug.as_str()).collect();
         slugs.sort();
@@ -764,7 +799,10 @@ mod tests {
 
         let (_, tool) = knowledge_query_tool(layout, QueryConfig::default())();
         let inp = serde_json::json!({ "query": "needle", "kind": "howto" });
-        let out = tool.execute(&inp.to_string()).await.unwrap();
+        let out = tool
+            .execute(&inp.to_string(), Default::default())
+            .await
+            .unwrap();
         let records: Vec<OwnedKnowledgeRecord> = parse_records(&out);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].slug, "h1");
@@ -778,7 +816,10 @@ mod tests {
 
         let (_, tool) = knowledge_query_tool(layout, QueryConfig::default())();
         let inp = serde_json::json!({ "kind": "howto" });
-        let out = tool.execute(&inp.to_string()).await.unwrap();
+        let out = tool
+            .execute(&inp.to_string(), Default::default())
+            .await
+            .unwrap();
         let records: Vec<OwnedKnowledgeRecord> = parse_records(&out);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].slug, "h1");
@@ -792,7 +833,10 @@ mod tests {
 
         let (_, tool) = knowledge_query_tool(layout, QueryConfig::default())();
         let inp = serde_json::json!({ "query": "xyzzy" });
-        let out = tool.execute(&inp.to_string()).await.unwrap();
+        let out = tool
+            .execute(&inp.to_string(), Default::default())
+            .await
+            .unwrap();
         let records: Vec<OwnedKnowledgeRecord> = parse_records(&out);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].slug, "p");
@@ -804,7 +848,10 @@ mod tests {
         write_knowledge(dir.path(), "p", "policy", "d", "no match\n");
         let (_, tool) = knowledge_query_tool(layout, QueryConfig::default())();
         let inp = serde_json::json!({ "query": "absent" });
-        let out = tool.execute(&inp.to_string()).await.unwrap();
+        let out = tool
+            .execute(&inp.to_string(), Default::default())
+            .await
+            .unwrap();
         let records: Vec<OwnedKnowledgeRecord> = parse_records(&out);
         assert!(records.is_empty());
     }

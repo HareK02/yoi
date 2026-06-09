@@ -36,7 +36,11 @@ pub(crate) struct ReadTool {
 
 #[async_trait]
 impl Tool for ReadTool {
-    async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input_json: &str,
+        _ctx: llm_worker::tool::ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
         let params: ReadParams = serde_json::from_str(input_json)
             .map_err(|e| ToolError::InvalidArgument(format!("invalid Read input: {e}")))?;
         let offset = params.offset.unwrap_or(0);
@@ -155,7 +159,10 @@ mod tests {
         assert_eq!(meta.name, "Read");
 
         let input = serde_json::json!({ "file_path": file.to_str().unwrap() });
-        let out = tool.execute(&input.to_string()).await.unwrap();
+        let out = tool
+            .execute(&input.to_string(), Default::default())
+            .await
+            .unwrap();
         assert!(out.summary.contains("Read 3 line(s)"));
         let body = out.content.unwrap();
         assert!(body.contains("     1\talpha"));
@@ -178,7 +185,10 @@ mod tests {
             "offset": 1,
             "limit": 2,
         });
-        let out = tool.execute(&input.to_string()).await.unwrap();
+        let out = tool
+            .execute(&input.to_string(), Default::default())
+            .await
+            .unwrap();
         assert!(out.summary.contains("[2..3] of 5"));
         let body = out.content.unwrap();
         assert!(body.contains("     2\t2"));
@@ -193,7 +203,10 @@ mod tests {
         let input = serde_json::json!({
             "file_path": dir.path().join("nope.txt").to_str().unwrap()
         });
-        let err = tool.execute(&input.to_string()).await.unwrap_err();
+        let err = tool
+            .execute(&input.to_string(), Default::default())
+            .await
+            .unwrap_err();
         assert!(matches!(err, ToolError::ExecutionFailed(_)));
     }
 
@@ -202,7 +215,10 @@ mod tests {
         let (_dir, fs, tracker) = setup();
         let def = read_tool(fs, tracker);
         let (_, tool) = def();
-        let err = tool.execute("not json").await.unwrap_err();
+        let err = tool
+            .execute("not json", Default::default())
+            .await
+            .unwrap_err();
         assert!(matches!(err, ToolError::InvalidArgument(_)));
     }
 }

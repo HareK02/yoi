@@ -101,7 +101,11 @@ impl Drop for BashTool {
 
 #[async_trait]
 impl Tool for BashTool {
-    async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input_json: &str,
+        _ctx: llm_worker::tool::ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
         let params: BashParams = serde_json::from_str(input_json)
             .map_err(|e| ToolError::InvalidArgument(format!("invalid Bash input: {e}")))?;
         let timeout_secs = params
@@ -394,7 +398,10 @@ mod tests {
         assert_eq!(meta.name, "Bash");
 
         let inp = serde_json::json!({ "command": "echo hello" });
-        let out = tool.execute(&inp.to_string()).await.unwrap();
+        let out = tool
+            .execute(&inp.to_string(), Default::default())
+            .await
+            .unwrap();
         assert_eq!(out.summary, "$ echo hello");
         assert_eq!(out.content.as_deref().map(str::trim), Some("hello"));
     }
@@ -407,7 +414,10 @@ mod tests {
         let inp = serde_json::json!({
             "command": "echo out; echo err 1>&2",
         });
-        let out = tool.execute(&inp.to_string()).await.unwrap();
+        let out = tool
+            .execute(&inp.to_string(), Default::default())
+            .await
+            .unwrap();
         let body = out.content.unwrap();
         assert!(body.contains("out"));
         assert!(body.contains("err"));
@@ -419,7 +429,10 @@ mod tests {
         let tool = make_tool(&h);
 
         let inp = serde_json::json!({ "command": "exit 7" });
-        let out = tool.execute(&inp.to_string()).await.unwrap();
+        let out = tool
+            .execute(&inp.to_string(), Default::default())
+            .await
+            .unwrap();
         assert!(out.summary.contains("exit 7"), "summary: {}", out.summary);
         assert!(
             out.content.is_none(),
@@ -441,12 +454,16 @@ mod tests {
                 "command": format!("cd {}", sub.to_str().unwrap()),
             })
             .to_string(),
+            Default::default(),
         )
         .await
         .unwrap();
 
         let pwd_out = tool
-            .execute(&serde_json::json!({ "command": "pwd" }).to_string())
+            .execute(
+                &serde_json::json!({ "command": "pwd" }).to_string(),
+                Default::default(),
+            )
             .await
             .unwrap();
         let body = pwd_out.content.unwrap();
@@ -467,7 +484,10 @@ mod tests {
             "command": "sleep 30",
             "timeout": 1,
         });
-        let out = tool.execute(&inp.to_string()).await.unwrap();
+        let out = tool
+            .execute(&inp.to_string(), Default::default())
+            .await
+            .unwrap();
         assert!(
             out.summary.contains("timed out"),
             "summary: {}",
@@ -480,7 +500,10 @@ mod tests {
         let h = setup();
         let tool = make_tool(&h);
 
-        let err = tool.execute("not json").await.unwrap_err();
+        let err = tool
+            .execute("not json", Default::default())
+            .await
+            .unwrap_err();
         assert!(matches!(err, ToolError::InvalidArgument(_)));
     }
 
@@ -494,7 +517,10 @@ mod tests {
         let inp = serde_json::json!({
             "command": "for i in $(seq 1 200); do echo line $i; done",
         });
-        let out = tool.execute(&inp.to_string()).await.unwrap();
+        let out = tool
+            .execute(&inp.to_string(), Default::default())
+            .await
+            .unwrap();
         let body = out.content.expect("expected content");
 
         assert!(
@@ -523,7 +549,10 @@ mod tests {
         let inp = serde_json::json!({
             "command": "printf 'x%.0s' {1..20480}",
         });
-        let out = tool.execute(&inp.to_string()).await.unwrap();
+        let out = tool
+            .execute(&inp.to_string(), Default::default())
+            .await
+            .unwrap();
         let body = out.content.unwrap();
         assert!(
             body.contains(spill_dir.to_str().unwrap()),
@@ -542,7 +571,10 @@ mod tests {
             "command": "(sleep 0.05; echo bg) &",
             "timeout": 5,
         });
-        let out = tool.execute(&inp.to_string()).await.unwrap();
+        let out = tool
+            .execute(&inp.to_string(), Default::default())
+            .await
+            .unwrap();
         assert!(
             !out.summary.contains("timed out"),
             "summary: {}",
@@ -559,7 +591,9 @@ mod tests {
         let inp = serde_json::json!({
             "command": "for i in $(seq 1 200); do echo $i; done",
         });
-        tool.execute(&inp.to_string()).await.unwrap();
+        tool.execute(&inp.to_string(), Default::default())
+            .await
+            .unwrap();
 
         // The spill dir should now contain exactly one bash-*.log file.
         let files_before: Vec<_> = std::fs::read_dir(&spill_dir)

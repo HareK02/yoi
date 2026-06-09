@@ -136,7 +136,11 @@ impl CountingTool {
 
 #[async_trait]
 impl Tool for CountingTool {
-    async fn execute(&self, _input_json: &str) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        _input_json: &str,
+        _ctx: llm_worker::tool::ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(format!("{}-ok", self.name).into())
     }

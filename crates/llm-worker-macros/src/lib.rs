@@ -90,17 +90,25 @@ fn extract_doc_comment(attrs: &[Attribute]) -> String {
 /// Extract description from #[description = "..."] attribute
 fn extract_description_attr(attrs: &[syn::Attribute]) -> Option<String> {
     for attr in attrs {
-        if attr.path().is_ident("description") {
-            if let Meta::NameValue(meta) = &attr.meta {
-                if let syn::Expr::Lit(expr_lit) = &meta.value {
-                    if let Lit::Str(lit_str) = &expr_lit.lit {
-                        return Some(lit_str.value());
-                    }
-                }
-            }
+        if attr.path().is_ident("description")
+            && let Meta::NameValue(meta) = &attr.meta
+            && let syn::Expr::Lit(expr_lit) = &meta.value
+            && let Lit::Str(lit_str) = &expr_lit.lit
+        {
+            return Some(lit_str.value());
         }
     }
     None
+}
+
+fn is_tool_execution_context_type(ty: &Type) -> bool {
+    let Type::Path(path) = ty else {
+        return false;
+    };
+    path.path
+        .segments
+        .last()
+        .is_some_and(|segment| segment.ident == "ToolExecutionContext")
 }
 
 /// Generate Tool implementation from a method
@@ -123,8 +131,10 @@ fn generate_tool_impl(self_ty: &Type, method: &syn::ImplItemFn) -> proc_macro2::
         description
     };
 
-    // Parse arguments (excluding self)
-    let args: Vec<_> = sig
+    // Parse method arguments (excluding self). A parameter typed as
+    // ToolExecutionContext is supplied from the execution context and is not
+    // exposed in the JSON input schema.
+    let method_args: Vec<_> = sig
         .inputs
         .iter()
         .filter_map(|arg| {
@@ -135,9 +145,14 @@ fn generate_tool_impl(self_ty: &Type, method: &syn::ImplItemFn) -> proc_macro2::
             }
         })
         .collect();
+    let json_args: Vec<_> = method_args
+        .iter()
+        .copied()
+        .filter(|pat_type| !is_tool_execution_context_type(pat_type.ty.as_ref()))
+        .collect();
 
     // Generate argument struct fields
-    let arg_fields: Vec<_> = args
+    let arg_fields: Vec<_> = json_args
         .iter()
         .map(|pat_type| {
             let pat = &pat_type.pat;
@@ -165,11 +180,13 @@ fn generate_tool_impl(self_ty: &Type, method: &syn::ImplItemFn) -> proc_macro2::
         })
         .collect();
 
-    // Code to expand arguments in execute
-    let arg_names: Vec<_> = args
+    // Code to expand method arguments in execute
+    let call_args: Vec<_> = method_args
         .iter()
         .map(|pat_type| {
-            if let Pat::Ident(pat_ident) = pat_type.pat.as_ref() {
+            if is_tool_execution_context_type(pat_type.ty.as_ref()) {
+                quote! { ctx.clone() }
+            } else if let Pat::Ident(pat_ident) = pat_type.pat.as_ref() {
                 let ident = &pat_ident.ident;
                 quote! { args.#ident }
             } else {
@@ -177,6 +194,11 @@ fn generate_tool_impl(self_ty: &Type, method: &syn::ImplItemFn) -> proc_macro2::
             }
         })
         .collect();
+    let method_call = if call_args.is_empty() {
+        quote! { self.ctx.#method_name() }
+    } else {
+        quote! { self.ctx.#method_name(#(#call_args),*) }
+    };
 
     // Check if method is async
     let is_async = sig.asyncness.is_some();
@@ -218,13 +240,13 @@ fn generate_tool_impl(self_ty: &Type, method: &syn::ImplItemFn) -> proc_macro2::
     };
 
     // Execute body handling for no arguments case
-    let execute_body = if args.is_empty() {
+    let execute_body = if json_args.is_empty() {
         quote! {
-            // Allow empty JSON object even with no arguments
+            // Allow empty JSON object even with no JSON arguments
             let _: #args_struct_name = serde_json::from_str(input_json)
                 .unwrap_or(#args_struct_name {});
 
-            let result = self.ctx.#method_name()#awaiter;
+            let result = #method_call #awaiter;
             #result_handling
         }
     } else {
@@ -232,7 +254,7 @@ fn generate_tool_impl(self_ty: &Type, method: &syn::ImplItemFn) -> proc_macro2::
             let args: #args_struct_name = serde_json::from_str(input_json)
                 .map_err(|e| ::llm_worker::tool::ToolError::InvalidArgument(e.to_string()))?;
 
-            let result = self.ctx.#method_name(#(#arg_names),*)#awaiter;
+            let result = #method_call #awaiter;
             #result_handling
         }
     };
@@ -247,7 +269,8 @@ fn generate_tool_impl(self_ty: &Type, method: &syn::ImplItemFn) -> proc_macro2::
 
         #[async_trait::async_trait]
         impl ::llm_worker::tool::Tool for #tool_struct_name {
-            async fn execute(&self, input_json: &str) -> Result<::llm_worker::tool::ToolOutput, ::llm_worker::tool::ToolError> {
+            async fn execute(&self, input_json: &str, ctx: ::llm_worker::tool::ToolExecutionContext) -> Result<::llm_worker::tool::ToolOutput, ::llm_worker::tool::ToolError> {
+                let _ = &ctx;
                 #execute_body
             }
         }

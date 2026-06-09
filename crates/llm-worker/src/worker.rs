@@ -26,8 +26,8 @@ use crate::{
     timeline::event::{ErrorEvent, StatusEvent, UsageEvent},
     timeline::{TextBlockCollector, ThinkingBlockCollector, Timeline, ToolCallCollector},
     tool::{
-        ToolCall, ToolDefinition as WorkerToolDefinition, ToolError, ToolOutputLimits, ToolResult,
-        truncate_content,
+        ToolCall, ToolDefinition as WorkerToolDefinition, ToolError, ToolExecutionContext,
+        ToolOutputLimits, ToolResult, truncate_content,
     },
     tool_server::{ToolServer, ToolServerHandle},
 };
@@ -187,6 +187,10 @@ pub struct Worker<C: LlmClient, S: WorkerState = Mutable> {
     /// LlmCall count (per-Worker running counter, monotonic). Unlike
     /// `turn_count` this never collapses retries.
     llm_call_count: usize,
+    /// Tool execution batch count (per-Worker running counter, monotonic).
+    /// Each batch corresponds to one collected assistant tool-call set or one
+    /// resumed pending tool-call set.
+    tool_execution_batch_count: usize,
     /// Maximum number of AgentTurns (None = unlimited)
     max_turns: Option<u32>,
     /// AgentTurn-start callbacks (1:1 with LlmCall today)
@@ -912,19 +916,23 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
     ) -> Result<ToolExecutionResult, WorkerError> {
         use futures::future::join_all;
 
-        // Map from tool call ID to (ToolCall, Meta, Tool)
+        // Map from tool call ID to (ToolCall, Meta, Tool, Context)
         // Retained because it's needed for PostToolCall hooks
         let mut call_info_map = HashMap::new();
         let mut synthetic_results = Vec::new();
+        let batch_id = format!("tool-batch-{}", self.tool_execution_batch_count);
+        self.tool_execution_batch_count += 1;
 
         // Phase 1: Apply pre_tool_call interceptor (determine skip/abort/synthetic result)
         let mut approved_calls = Vec::new();
-        for mut tool_call in tool_calls {
+        for (call_index, mut tool_call) in tool_calls.into_iter().enumerate() {
+            let context = ToolExecutionContext::new(&tool_call.id, &batch_id, call_index);
             if let Some((meta, tool)) = self.tool_server.get_tool(&tool_call.name) {
                 let mut info = ToolCallInfo {
                     call: tool_call.clone(),
                     meta,
                     tool,
+                    context,
                 };
 
                 match self.interceptor.pre_tool_call(&mut info).await {
@@ -934,9 +942,11 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
                     }
                     PreToolAction::SyntheticResult(result) => {
                         let tool_call = info.call;
+                        let mut context = info.context;
+                        context.call_id = tool_call.id.clone();
                         call_info_map.insert(
                             tool_call.id.clone(),
-                            (tool_call, info.meta.clone(), info.tool.clone()),
+                            (tool_call, info.meta.clone(), info.tool.clone(), context),
                         );
                         synthetic_results.push(result);
                         continue;
@@ -953,26 +963,37 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
 
                 // Reflect changes made by interceptor
                 tool_call = info.call;
+                let mut context = info.context;
+                context.call_id = tool_call.id.clone();
 
                 call_info_map.insert(
                     tool_call.id.clone(),
-                    (tool_call.clone(), info.meta.clone(), info.tool.clone()),
+                    (
+                        tool_call.clone(),
+                        info.meta.clone(),
+                        info.tool.clone(),
+                        context.clone(),
+                    ),
                 );
-                approved_calls.push(tool_call);
+                approved_calls.push((tool_call, context));
             } else {
                 // Unknown tools go into approved list as-is (will error at execution)
-                approved_calls.push(tool_call);
+                let context = ToolExecutionContext::new(&tool_call.id, &batch_id, call_index);
+                approved_calls.push((tool_call, context));
             }
         }
 
         // Phase 2: Execute approved tools in parallel (cancellable)
         let futures: Vec<_> = approved_calls
             .into_iter()
-            .map(|tool_call| {
+            .map(|(tool_call, context)| {
                 let tool_server = self.tool_server.clone();
                 async move {
                     let input_json = serde_json::to_string(&tool_call.input).unwrap_or_default();
-                    match tool_server.call_tool(&tool_call.name, &input_json).await {
+                    match tool_server
+                        .call_tool(&tool_call.name, &input_json, context)
+                        .await
+                    {
                         Ok(output) => ToolResult::from_output(&tool_call.id, output),
                         Err(e) => ToolResult::error(&tool_call.id, e.to_string()),
                     }
@@ -996,12 +1017,15 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
 
         // Phase 3: Apply post_tool_call interceptor
         for tool_result in &mut results {
-            if let Some((tool_call, meta, tool)) = call_info_map.get(&tool_result.tool_use_id) {
+            if let Some((tool_call, meta, tool, context)) =
+                call_info_map.get(&tool_result.tool_use_id)
+            {
                 let mut info = ToolResultInfo {
                     call: tool_call.clone(),
                     result: tool_result.clone(),
                     meta: meta.clone(),
                     tool: tool.clone(),
+                    context: context.clone(),
                 };
 
                 match self.interceptor.post_tool_call(&mut info).await {
@@ -1026,7 +1050,7 @@ impl<C: LlmClient, S: WorkerState> Worker<C, S> {
                 let Some(content) = tool_result.content.as_mut() else {
                     continue;
                 };
-                let Some((tool_call, _, _)) = call_info_map.get(&tool_result.tool_use_id) else {
+                let Some((tool_call, _, _, _)) = call_info_map.get(&tool_result.tool_use_id) else {
                     continue;
                 };
                 let limit = limits.limit_for(&tool_call.name);
@@ -1628,6 +1652,7 @@ impl<C: LlmClient> Worker<C, Mutable> {
             locked_prefix_len: 0,
             turn_count: 0,
             llm_call_count: 0,
+            tool_execution_batch_count: 0,
             max_turns: None,
             turn_start_cbs: Vec::new(),
             turn_end_cbs: Vec::new(),
@@ -1892,6 +1917,7 @@ impl<C: LlmClient> Worker<C, Mutable> {
             locked_prefix_len,
             turn_count: self.turn_count,
             llm_call_count: self.llm_call_count,
+            tool_execution_batch_count: self.tool_execution_batch_count,
             max_turns: self.max_turns,
             turn_start_cbs: self.turn_start_cbs,
             turn_end_cbs: self.turn_end_cbs,
@@ -1984,6 +2010,7 @@ impl<C: LlmClient> Worker<C, Locked> {
             locked_prefix_len: 0,
             turn_count: self.turn_count,
             llm_call_count: self.llm_call_count,
+            tool_execution_batch_count: self.tool_execution_batch_count,
             max_turns: self.max_turns,
             turn_start_cbs: self.turn_start_cbs,
             turn_end_cbs: self.turn_end_cbs,

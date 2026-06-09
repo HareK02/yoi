@@ -73,7 +73,11 @@ step: leave the task as-is, summarize the problem to the user, and end the turn.
 
 #[async_trait]
 impl Tool for TaskCreateTool {
-    async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input_json: &str,
+        _ctx: llm_worker::tool::ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
         let params: TaskCreateParams = serde_json::from_str(input_json)
             .map_err(|e| ToolError::InvalidArgument(format!("invalid TaskCreate input: {e}")))?;
         let created = self.store.create(params.subject, params.description);
@@ -93,7 +97,11 @@ impl Tool for TaskCreateTool {
 
 #[async_trait]
 impl Tool for TaskListTool {
-    async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input_json: &str,
+        _ctx: llm_worker::tool::ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
         let _: TaskListParams = serde_json::from_str(input_json)
             .map_err(|e| ToolError::InvalidArgument(format!("invalid TaskList input: {e}")))?;
         let tasks = self.store.list();
@@ -106,7 +114,11 @@ impl Tool for TaskListTool {
 
 #[async_trait]
 impl Tool for TaskGetTool {
-    async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input_json: &str,
+        _ctx: llm_worker::tool::ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
         let params: TaskGetParams = serde_json::from_str(input_json)
             .map_err(|e| ToolError::InvalidArgument(format!("invalid TaskGet input: {e}")))?;
         let task = self.store.get(params.taskid).ok_or_else(|| {
@@ -122,7 +134,11 @@ impl Tool for TaskGetTool {
 
 #[async_trait]
 impl Tool for TaskUpdateTool {
-    async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input_json: &str,
+        _ctx: llm_worker::tool::ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
         let params: TaskUpdateParams = serde_json::from_str(input_json)
             .map_err(|e| ToolError::InvalidArgument(format!("invalid TaskUpdate input: {e}")))?;
         let updated = self
@@ -241,14 +257,20 @@ mod tests {
         let update = tool(task_update_tool(store.clone()));
 
         let out = create
-            .execute(r#"{"subject":"implement","description":"write code"}"#)
+            .execute(
+                r#"{"subject":"implement","description":"write code"}"#,
+                Default::default(),
+            )
             .await
             .unwrap();
         assert!(out.summary.contains("Created task 1"));
         assert_eq!(store.get(1).unwrap().status, TaskStatus::Pending);
 
         let out = update
-            .execute(r#"{"taskid":1,"status":"inprogress","subject":"implement tasks"}"#)
+            .execute(
+                r#"{"taskid":1,"status":"inprogress","subject":"implement tasks"}"#,
+                Default::default(),
+            )
             .await
             .unwrap();
         assert!(out.summary.contains("Updated task 1"));
@@ -256,11 +278,14 @@ mod tests {
         assert_eq!(task.status, TaskStatus::Inprogress);
         assert_eq!(task.subject, "implement tasks");
 
-        let out = get.execute(r#"{"taskid":1}"#).await.unwrap();
+        let out = get
+            .execute(r#"{"taskid":1}"#, Default::default())
+            .await
+            .unwrap();
         assert!(out.summary.contains("Task 1 (inprogress)"));
         assert!(out.content.unwrap().contains("implement tasks"));
 
-        let out = list.execute("{}").await.unwrap();
+        let out = list.execute("{}", Default::default()).await.unwrap();
         assert!(out.summary.contains("1 task(s)"));
         let content = out.content.unwrap();
         assert!(content.contains("\"taskid\": 1"));
@@ -273,11 +298,14 @@ mod tests {
         store.create("s".into(), "d".into());
         let update = tool(task_update_tool(store));
 
-        let err = update.execute(r#"{"taskid":1}"#).await.unwrap_err();
+        let err = update
+            .execute(r#"{"taskid":1}"#, Default::default())
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("at least one"));
 
         let err = update
-            .execute(r#"{"taskid":99,"status":"deleted"}"#)
+            .execute(r#"{"taskid":99,"status":"deleted"}"#, Default::default())
             .await
             .unwrap_err();
         assert!(err.to_string().contains("taskid 99 not found"));

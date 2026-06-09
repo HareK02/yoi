@@ -36,7 +36,11 @@ pub(crate) struct EditTool {
 
 #[async_trait]
 impl Tool for EditTool {
-    async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        input_json: &str,
+        _ctx: llm_worker::tool::ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
         let params: EditParams = serde_json::from_str(input_json)
             .map_err(|e| ToolError::InvalidArgument(format!("invalid Edit input: {e}")))?;
 
@@ -169,7 +173,10 @@ mod tests {
         let def = read_tool(fs.clone(), tracker.clone());
         let (_, reader) = def();
         let inp = serde_json::json!({ "file_path": file.to_str().unwrap() });
-        reader.execute(&inp.to_string()).await.unwrap();
+        reader
+            .execute(&inp.to_string(), Default::default())
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -188,7 +195,10 @@ mod tests {
             "old_string": "foo bar",
             "new_string": "foo baz",
         });
-        let out = tool.execute(&inp.to_string()).await.unwrap();
+        let out = tool
+            .execute(&inp.to_string(), Default::default())
+            .await
+            .unwrap();
         assert!(out.summary.contains("1 replacement"));
         assert_eq!(
             std::fs::read_to_string(&file).unwrap(),
@@ -212,7 +222,10 @@ mod tests {
             "new_string": "y",
             "replace_all": true,
         });
-        let out = tool.execute(&inp.to_string()).await.unwrap();
+        let out = tool
+            .execute(&inp.to_string(), Default::default())
+            .await
+            .unwrap();
         assert!(out.summary.contains("3 replacements"));
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "y y y\n");
     }
@@ -231,7 +244,10 @@ mod tests {
             "old_string": "a",
             "new_string": "b",
         });
-        let err = tool.execute(&inp.to_string()).await.unwrap_err();
+        let err = tool
+            .execute(&inp.to_string(), Default::default())
+            .await
+            .unwrap_err();
         assert!(matches!(err, ToolError::InvalidArgument(_)));
     }
 
@@ -249,7 +265,10 @@ mod tests {
             "old_string": "world",
             "new_string": "x",
         });
-        let err = tool.execute(&inp.to_string()).await.unwrap_err();
+        let err = tool
+            .execute(&inp.to_string(), Default::default())
+            .await
+            .unwrap_err();
         assert!(matches!(err, ToolError::InvalidArgument(_)));
     }
 
@@ -266,7 +285,10 @@ mod tests {
             "old_string": "foo",
             "new_string": "bar",
         });
-        let err = tool.execute(&inp.to_string()).await.unwrap_err();
+        let err = tool
+            .execute(&inp.to_string(), Default::default())
+            .await
+            .unwrap_err();
         assert!(matches!(err, ToolError::InvalidArgument(_)));
     }
 
@@ -287,7 +309,10 @@ mod tests {
             "old_string": "foo",
             "new_string": "bar",
         });
-        let err = tool.execute(&inp.to_string()).await.unwrap_err();
+        let err = tool
+            .execute(&inp.to_string(), Default::default())
+            .await
+            .unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("modified externally"), "{msg}");
     }

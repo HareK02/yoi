@@ -491,6 +491,7 @@ mod tests {
             },
             meta,
             tool,
+            context: llm_worker::tool::ToolExecutionContext::new("call-id", "test-batch", 0),
         }
     }
 
@@ -898,6 +899,7 @@ mod tests {
             ),
             meta: info.meta,
             tool: info.tool,
+            context: info.context,
         };
 
         let action = interceptor.post_tool_call(&mut result_info).await;

@@ -4,7 +4,9 @@ use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
 use crate::llm_client::ToolDefinition as LlmToolDefinition;
-use crate::tool::{Tool, ToolDefinition as WorkerToolDefinition, ToolMeta, ToolOutput};
+use crate::tool::{
+    Tool, ToolDefinition as WorkerToolDefinition, ToolExecutionContext, ToolMeta, ToolOutput,
+};
 
 type ToolMap = HashMap<String, (ToolMeta, Arc<dyn Tool>)>;
 
@@ -117,6 +119,7 @@ impl ToolServerHandle {
         &self,
         name: &str,
         input_json: &str,
+        ctx: ToolExecutionContext,
     ) -> Result<ToolOutput, ToolServerError> {
         let tool = {
             let guard = self.tools.lock().unwrap_or_else(|e| e.into_inner());
@@ -125,7 +128,7 @@ impl ToolServerHandle {
                 .ok_or_else(|| ToolServerError::ToolNotFound(name.to_string()))?;
             Arc::clone(tool)
         };
-        tool.execute(input_json)
+        tool.execute(input_json, ctx)
             .await
             .map_err(|e| ToolServerError::ToolExecution(e.to_string()))
     }
@@ -187,7 +190,11 @@ mod tests {
 
     #[async_trait]
     impl Tool for EchoTool {
-        async fn execute(&self, input_json: &str) -> Result<ToolOutput, ToolError> {
+        async fn execute(
+            &self,
+            input_json: &str,
+            _ctx: crate::tool::ToolExecutionContext,
+        ) -> Result<ToolOutput, ToolError> {
             Ok(input_json.to_string().into())
         }
     }
@@ -236,12 +243,15 @@ mod tests {
         handle.register_tool(def("echo"));
         handle.flush_pending();
 
-        let out = handle.call_tool("echo", r#"{"x":1}"#).await.expect("call");
+        let out = handle
+            .call_tool("echo", r#"{"x":1}"#, Default::default())
+            .await
+            .expect("call");
         assert_eq!(out.summary, r#"{"x":1}"#);
         assert!(out.content.is_none());
 
         let err = handle
-            .call_tool("missing", "{}")
+            .call_tool("missing", "{}", Default::default())
             .await
             .expect_err("missing tool");
         assert_eq!(err, ToolServerError::ToolNotFound("missing".to_string()));
@@ -298,7 +308,11 @@ mod tests {
 
         #[async_trait]
         impl Tool for FixedTool {
-            async fn execute(&self, _input_json: &str) -> Result<ToolOutput, ToolError> {
+            async fn execute(
+                &self,
+                _input_json: &str,
+                _ctx: crate::tool::ToolExecutionContext,
+            ) -> Result<ToolOutput, ToolError> {
                 Ok("replaced".to_string().into())
             }
         }
@@ -327,7 +341,11 @@ mod tests {
 
         #[async_trait]
         impl Tool for ConstTool {
-            async fn execute(&self, _input_json: &str) -> Result<ToolOutput, ToolError> {
+            async fn execute(
+                &self,
+                _input_json: &str,
+                _ctx: crate::tool::ToolExecutionContext,
+            ) -> Result<ToolOutput, ToolError> {
                 Ok("const".to_string().into())
             }
         }
@@ -342,7 +360,10 @@ mod tests {
         });
         handle.replace(replacement).expect("replace");
 
-        let out = handle.call_tool("echo", "{}").await.expect("call");
+        let out = handle
+            .call_tool("echo", "{}", Default::default())
+            .await
+            .expect("call");
         assert_eq!(out.summary, "const");
     }
 
@@ -360,7 +381,11 @@ mod tests {
 
         #[async_trait]
         impl Tool for GatedTool {
-            async fn execute(&self, _input_json: &str) -> Result<ToolOutput, ToolError> {
+            async fn execute(
+                &self,
+                _input_json: &str,
+                _ctx: crate::tool::ToolExecutionContext,
+            ) -> Result<ToolOutput, ToolError> {
                 self.started.notify_one();
                 self.finish.notified().await;
                 Ok("done".to_string().into())
@@ -384,7 +409,7 @@ mod tests {
         handle.flush_pending();
 
         let h = handle.clone();
-        let call = tokio::spawn(async move { h.call_tool("slow", "{}").await });
+        let call = tokio::spawn(async move { h.call_tool("slow", "{}", Default::default()).await });
 
         // Wait until the tool is actually executing.
         started.notified().await;
@@ -413,7 +438,11 @@ mod tests {
 
         #[async_trait]
         impl Tool for OldTool {
-            async fn execute(&self, _input_json: &str) -> Result<ToolOutput, ToolError> {
+            async fn execute(
+                &self,
+                _input_json: &str,
+                _ctx: crate::tool::ToolExecutionContext,
+            ) -> Result<ToolOutput, ToolError> {
                 self.started.notify_one();
                 self.finish.notified().await;
                 Ok("old".to_string().into())
@@ -437,7 +466,7 @@ mod tests {
         handle.flush_pending();
 
         let h = handle.clone();
-        let call = tokio::spawn(async move { h.call_tool("t", "{}").await });
+        let call = tokio::spawn(async move { h.call_tool("t", "{}", Default::default()).await });
 
         // Wait until the old tool is mid-execution.
         started.notified().await;
@@ -447,7 +476,11 @@ mod tests {
 
         #[async_trait]
         impl Tool for NewTool {
-            async fn execute(&self, _input_json: &str) -> Result<ToolOutput, ToolError> {
+            async fn execute(
+                &self,
+                _input_json: &str,
+                _ctx: crate::tool::ToolExecutionContext,
+            ) -> Result<ToolOutput, ToolError> {
                 Ok("new".to_string().into())
             }
         }
@@ -469,7 +502,10 @@ mod tests {
         assert_eq!(result.expect("call").summary, "old");
 
         // New calls use the replacement.
-        let out = handle.call_tool("t", "{}").await.expect("call");
+        let out = handle
+            .call_tool("t", "{}", Default::default())
+            .await
+            .expect("call");
         assert_eq!(out.summary, "new");
     }
 

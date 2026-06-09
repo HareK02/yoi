@@ -54,7 +54,11 @@ struct MockWeatherTool;
 
 #[async_trait]
 impl Tool for MockWeatherTool {
-    async fn execute(&self, _input_json: &str) -> Result<ToolOutput, ToolError> {
+    async fn execute(
+        &self,
+        _input_json: &str,
+        _ctx: llm_worker::tool::ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
         Ok("Sunny, 25C".to_string().into())
     }
 }
