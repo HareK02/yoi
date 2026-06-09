@@ -10,7 +10,7 @@ Yoi の multi-agent 運用で、Intake や人間が作成した Ticket を Orche
 
 これは scheduler ではない。目的は、Ticket の fields / body / thread / artifacts / 現在の repository/Pod 状態を明示的に確認し、隠れた会話状態ではなく Ticket に基づいて routing 判断を残すことである。
 
-Panel Queue / queued notification は、人間が Orchestrator に routing を開始してよいと許可した signal であり、unattended scheduler ではない。implementation side effect に進む場合は、Orchestrator が Ticket と workspace state を再確認し、unblocked と判断してから `queued -> inprogress` を記録する必要がある。
+Panel Queue / queued notification は、人間が Orchestrator に routing を開始してよいと許可した signal であり、unattended scheduler ではない。implementation side effect に進む場合は、Orchestrator が Ticket と workspace state を再確認し、unblocked と判断してから `queued -> inprogress` を記録する必要がある。明示的な routing / queue review / panel kick の中で、独立した queued Ticket と coder/reviewer capacity が複数あるなら、1件ずつ完了を待つことを default にせず、安全確認を満たす範囲で追加 Ticket の並列開始を優先する。
 
 `ready` は Orchestrator routing に十分な状態であり、実装戦術が事前にすべて固定されている状態ではない。Orchestrator は、recorded intent / binding decisions / invariants / implementation latitude / acceptance criteria / escalation conditions が揃っていれば、bounded implementation uncertainty を残したまま implementation-ready と判断してよい。
 
@@ -49,6 +49,8 @@ Orchestrator は以下を行う。
 - 既存 umbrella/progress-container Ticket が concrete follow-up Ticket / Objective context で置き換え済みなら、superseded/decomposed として退役・close する routing を検討する。
 - implementation-ready の場合は `multi-agent-workflow` に渡す `IntentPacket` を作る。
 - implementation-ready かつ Ticket が `queued` の場合は、worktree 作成 / implementation Pod `SpawnPod` / coder routing などの side effect の前に、既存の typed Ticket backend/tool path で `queued -> inprogress` を記録する。
+- 明示的な queue review 中に、他にも queued Ticket が見え、capacity が空いている場合は、各 Ticket について relation / orchestration-plan / dirty state / visible Pods / worktree / conflict risk を確認し、独立して受理できるものを同じ routing pass で追加の `queued -> inprogress` 候補にする。
+- queued Ticket を capacity が見える状態で idle のまま残す場合は、dependency / conflict / capacity / missing planning decision / dirty workspace / reviewer-coder bottleneck / migration boundary / human gate のいずれかに絞った bounded reason を Ticket thread または `TicketOrchestrationPlanRecord` に残す。
 - `ready` または `queued` に concrete missing decision / information がある場合だけ、typed state-change/routing event 付きで `planning` に戻す。その event/comment には missing item、checked context、implementation latitude では足りない理由、次の planning question/action を含める。
 
 ## Orchestrator がしないこと
@@ -57,6 +59,7 @@ Orchestrator は以下を行う。
 - Panel Queue / queued notification だけを unattended scheduler trigger として扱わない。
 - `queued -> inprogress` acceptance なしに worktree 作成、implementation Pod `SpawnPod`、coder/reviewer routing を行わない。
 - 人間/上位 Orchestrator の許可または明示的な routing acceptance なしに coder / reviewer Pod や read-only investigation helper Pod を起動しない。
+- unqueued Ticket を capacity 埋めのために開始しない。parallel start の候補は、個別に `queued` であり、人間が routing を許可済みの Ticket に限る。
 - 設計境界の未決定を勝手に implementation-ready として固定しない。
 - merge / close / cleanup 権限を持たない場面で勝手に完了処理しない。
 - Ticket tools があるからといって arbitrary filesystem write を行わない。
@@ -94,6 +97,13 @@ Orchestrator は以下を行う。
   - risk flags / risky domain がある場合は、IntentPacket に invariants / reviewer focus / escalation conditions を入れる。risk flag だけを `queued -> planning` の理由にしない。
 - concrete missing decision / information がある場合: `TicketWorkflowState` で `queued -> planning` を記録し、reason/body と `TicketComment` に不足項目、checked context、なぜ coder の implementation latitude では解決できないか、次の planning question/action を残す。既存の claimed live/restorable Intake/Planning Pod があり、既存通知経路が使える場合は同じ理由を通知する。
 - external action 待ちなど planning では解決しない blocker の場合: concise な理由を Ticket thread に記録し、必要に応じて attention / action-required frontmatter や `TicketOrchestrationPlanRecord` の blocker/waiting-capacity 記録で明示する。lifecycle 外の storage bucket を routing target にしない。
+
+Parallel acceptance pass:
+
+- 明示的な queue review 中に複数の queued Ticket が見える場合、Orchestrator は最初の1件の完了待ちを default にしない。各 Ticket について Ticket body/thread/artifacts、TicketRelationQuery、TicketOrchestrationPlanQuery、workspace/worktree dirty state、visible Pods、既存 branches、conflict/dependency notes を確認する。
+- 追加で開始してよいのは、blocking relation/dependency がなく、`do_not_parallelize` または applicable conflict record がなく、source/write surfaces が disjoint または conflict risk が小さく機械的で、coder/reviewer follow-up capacity があり、acceptance basis となる Ticket thread/plan/workspace records を side effect 前に記録・commit でき、別 worktree/branch/scope を切れる Ticket だけである。
+- capacity が見えるのに queued Ticket を idle にする場合は、dependency / conflict / capacity / missing planning decision / dirty workspace / reviewer-coder bottleneck / migration boundary / human gate のいずれかの bounded reason を記録する。
+- この pass は scheduler、background runner、resource graph solver、automatic queue drain loop ではない。unqueued Ticket を開始せず、各 Ticket の `queued -> inprogress` acceptance を個別に記録する。
 
 Invariant:
 
