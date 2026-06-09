@@ -263,3 +263,24 @@ Validation:
 - `nix build .#yoi`.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-09T02:15:46Z -->
+
+## Implementation report
+
+Implementation routing started.
+
+Worktree/branch:
+- Worktree: `.worktree/simplify-ticket-identity-fields`
+- Branch: `simplify-ticket-identity-fields`
+- Base/routing commit: `48efcc7 ticket: route identity simplification`
+
+Spawned sibling Coder Pod:
+- `coder-simplify-ticket-identity-fields`
+- Scope: non-recursive read on parent workspace root plus recursive write limited to the child worktree.
+
+Routing context:
+- The workspace was clean and no active implementation worktree existed before acceptance.
+- This is a broad/high-risk schema/storage migration, so the handoff emphasizes audit-first implementation, complete local Ticket record migration, buildable coherent stopping points, and escalation if permanent legacy compatibility or a larger storage-provider redesign is discovered.
+
+---

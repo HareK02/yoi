@@ -62,3 +62,34 @@ Validation は既存 acceptance criteria の通り `target/debug/yoi ticket doct
 Intake refinement により目的・受け入れ条件・binding decisions / invariants・implementation latitude・escalation conditions が揃ったため、workflow_state を ready にする。
 
 ---
+
+<!-- event: state_changed author: workspace-panel at: 2026-06-09T02:27:33Z from: ready to: queued reason: queued field: workflow_state -->
+
+## State changed
+
+Ticket を `workspace-panel` が queued にしました。
+
+
+---
+
+<!-- event: decision author: orchestrator at: 2026-06-09T02:28:14Z -->
+
+## Decision
+
+Routing decision: defer_pending_ticket_identity_migration
+
+This Ticket is queued and appears implementation-ready, but I am intentionally not accepting it to `inprogress` yet.
+
+Reason:
+- `simplify-ticket-identity-fields` is already active, with Coder Pod `coder-simplify-ticket-identity-fields` running in `.worktree/simplify-ticket-identity-fields`.
+- Objective record design/linking depends on stable Ticket identity and reference semantics, and the active Ticket is changing canonical Ticket identity, flat layout, state, and lookup surfaces.
+- Implementing Objective link/reference guidance before the identity simplification lands would create avoidable conflict and may choose reference shapes that immediately need migration.
+
+State decision:
+- Leave this Ticket `queued`.
+- Do not create a worktree or spawn a coder yet.
+
+Next action:
+- After `simplify-ticket-identity-fields` is merged/closed/cleaned up or explicitly held back, re-read this Ticket against the new identity model and accept it from queued if still unblocked.
+
+---

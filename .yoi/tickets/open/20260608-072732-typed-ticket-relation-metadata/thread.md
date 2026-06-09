@@ -143,3 +143,34 @@ This avoids recreating umbrella Tickets under another schema. The relation featu
 Intake refinement により、relation kind、inverse relation の扱い、queue gate 境界、binding invariants、implementation latitude、escalation conditions が揃ったため ready に遷移する。
 
 ---
+
+<!-- event: state_changed author: workspace-panel at: 2026-06-09T02:27:31Z from: ready to: queued reason: queued field: workflow_state -->
+
+## State changed
+
+Ticket を `workspace-panel` が queued にしました。
+
+
+---
+
+<!-- event: decision author: orchestrator at: 2026-06-09T02:28:14Z -->
+
+## Decision
+
+Routing decision: defer_pending_ticket_identity_migration
+
+This Ticket is queued and appears implementation-ready, but I am intentionally not accepting it to `inprogress` yet.
+
+Reason:
+- `simplify-ticket-identity-fields` is already active, with Coder Pod `coder-simplify-ticket-identity-fields` running in `.worktree/simplify-ticket-identity-fields`.
+- This Ticket depends on the same Ticket backend/schema/API/panel/doctor surfaces and explicitly needs canonical Ticket references.
+- Implementing typed relations before the identity simplification lands would risk building relation storage and validation on soon-to-change identity/layout/state semantics.
+
+State decision:
+- Leave this Ticket `queued`.
+- Do not create a worktree or spawn a coder yet.
+
+Next action:
+- After `simplify-ticket-identity-fields` is merged/closed/cleaned up or explicitly held back, re-read this Ticket against the new identity model and accept it from queued if still unblocked.
+
+---
