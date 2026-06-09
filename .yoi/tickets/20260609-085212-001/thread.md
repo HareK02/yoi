@@ -171,3 +171,43 @@ Parallel-routing rationale:
 - Any non-mechanical design conflict should be escalated rather than broadened.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-09T10:39:36Z -->
+
+## Implementation report
+
+Coder implementation completed and is ready for sibling review.
+
+Coder Pod:
+- `coder-ticketlist-output-lightweight`
+- Commit: `7368416e54609517c2252beb6ae98f73fb7935ee ticket: lighten ticket list output`
+- Worktree status before review: clean branch `ticketlist-output-lightweight`
+- Stopped after collecting output to reclaim delegated worktree scope.
+
+Summary/output design:
+- `TicketList` default limit is now 50, max limit 100.
+- JSON/tool output is a short summary only: `id`, truncated `title`, `state`, `updated_at`, and short `hints`.
+- Output includes `count`, `returned`, `truncated`, and `limit` metadata.
+- `body`, `thread`, `events`, `artifacts`, and `resolution` content are not emitted from `TicketList`.
+- CLI `yoi ticket list` uses the same bounded policy and adds `--limit <n>` with cap/truncation note.
+- `TicketShow` detail output is unchanged.
+
+Changed files:
+- `crates/ticket/src/tool.rs`
+- `crates/yoi/src/ticket_cli.rs`
+- `crates/pod/src/feature/builtin/ticket.rs`
+- `docs/development/work-items.md`
+
+Coder validation reported passed:
+- `cargo test -p ticket ticket_list_tool`
+- `cargo test -p yoi ticket_cli_list`
+- `cargo test -p yoi ticket_cli_create_list_show_comment_review_state_close_and_doctor`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo run -q -p yoi -- ticket doctor`
+- `cargo check --workspace`
+- `nix build .#yoi`
+
+Coder reports no conflict with the ToolExecutionContext branch.
+
+---
