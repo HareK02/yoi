@@ -8,7 +8,7 @@ priority: 'P1'
 labels: ['ticket', 'schema', 'identity', 'migration', 'orchestrator']
 workflow_state: 'inprogress'
 created_at: '2026-06-08T11:09:40Z'
-updated_at: '2026-06-09T04:16:11Z'
+updated_at: '2026-06-09T04:28:16Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-06-09T02:13:30Z'

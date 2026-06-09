@@ -465,3 +465,38 @@ Required before re-review:
 - Run at minimum: `cargo test -p pod ticket`, `cargo test -p ticket`, `cargo test -p yoi ticket_cli`, `cargo test -p tui ticket_action --no-run`, `cargo fmt --check`, `git diff --check`, `cargo run -q -p yoi -- ticket doctor`, `cargo check --workspace`, `nix build .#yoi`.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-09T04:28:16Z -->
+
+## Implementation report
+
+Coder fix-loop for second reviewer request_changes completed and is ready for re-review.
+
+Coder Pod:
+- `coder-simplify-ticket-identity-fields`
+- New fix commit: `8fe4b82 fix: align ticket flat-state surfaces`
+- Branch status after fix: clean
+- Stopped after collecting output to reclaim delegated worktree scope.
+
+Fix summary:
+- Updated built-in Ticket feature backend-root validation to accept flat `.yoi/tickets/<ticket-id>/` root and removed `open/`, `pending/`, `closed/` bucket requirements.
+- Updated pod feature tests so flat backend root registers Ticket tools instead of requiring old bucket dirs.
+- Removed stale `TicketStatus` / pending guidance from Intake and Orchestrator workflows.
+- Removed `pending` / `defer_pending` routing target guidance and described defer/block via attention/action-required or orchestration plan blocker/waiting-capacity records.
+- Updated `docs/development/work-items.md` for flat layout, canonical opaque Ticket IDs, current `create/list/state` guidance, and distinct `done` vs `closed` close semantics.
+
+Coder validation reported passed:
+- `cargo test -p pod ticket`
+- `cargo test -p ticket`
+- `cargo test -p yoi ticket_cli`
+- `cargo test -p tui ticket_action --no-run`
+- `cargo test -p tui workspace_panel`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo run -q -p yoi -- ticket doctor` -> `doctor: ok`
+- `cargo check --workspace`
+- `nix build .#yoi`
+
+Coder reports no remaining requested surface or design conflict.
+
+---
