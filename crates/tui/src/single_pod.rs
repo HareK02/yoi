@@ -69,7 +69,8 @@ async fn run_connected_pod(
     client: PodClient,
     runtime_command: PodRuntimeCommand,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut app = App::new(pod_name);
+    let workspace_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let mut app = App::new_with_persistent_input_history(pod_name, &workspace_root);
     app.connected = true;
     run_loop(terminal, &mut app, client, runtime_command).await
 }
@@ -273,7 +274,8 @@ async fn run(
     socket_path: &std::path::Path,
     runtime_command: PodRuntimeCommand,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut app = App::new(pod_name);
+    let workspace_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let mut app = App::new_with_persistent_input_history(pod_name, &workspace_root);
 
     match PodClient::connect(socket_path).await {
         Ok(client) => {
