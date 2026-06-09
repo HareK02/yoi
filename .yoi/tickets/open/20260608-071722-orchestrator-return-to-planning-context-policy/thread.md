@@ -126,3 +126,24 @@ Validation:
 - `nix build .#yoi` if resources/tests/package inputs are touched.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-09T00:07:10Z -->
+
+## Implementation report
+
+Implementation routing started.
+
+Worktree/branch:
+- Worktree: `.worktree/orchestrator-return-to-planning-context-policy`
+- Branch: `orchestrator-return-to-planning-context-policy`
+- Base/routing commit: `9f35442 ticket: route return-to-planning policy`
+
+Spawned sibling Coder Pod:
+- `coder-orchestrator-return-to-planning-context-policy`
+- Scope: non-recursive read on parent workspace root plus recursive write limited to the child worktree.
+
+Routing context:
+- The previous composer-history implementation was merged, validated, closed, and cleaned up before this new queued Ticket was accepted.
+- This Ticket is now the active routed implementation work.
+
+---
