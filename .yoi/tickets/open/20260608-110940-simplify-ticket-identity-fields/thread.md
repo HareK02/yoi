@@ -657,3 +657,33 @@ Coder validation reported passed:
 Coder reports no remaining risks.
 
 ---
+
+<!-- event: review author: reviewer-simplify-ticket-identity-fields at: 2026-06-09T05:04:45Z status: approve -->
+
+## Review: approve
+
+Review result: approve
+
+Fourth fix-loop request_changes items are resolved. No additional blocking findings.
+
+Evidence:
+- `.yoi/workflow/ticket-intake-workflow.md` no longer asks Intake to propose `canonical id`, `kind`, or unmanaged `labels` as current/core fields.
+- Intake guidance now treats canonical ID as storage-assigned opaque/path-derived identity and focuses drafts on title, priority, body/request snapshot, acceptance conditions, readiness/action/attention fields.
+- `crates/ticket/src/lib.rs` generated intake-ready audit/thread text now uses `state {from} -> ready` wording rather than stale `workflow_state ... -> ready` vocabulary.
+- Product/workflow/docs searches did not find blocker-level stale old-bucket current guidance.
+- Remaining `workflow_state` occurrences are internal compatibility/API/transition helper names rather than generated intake-ready audit text or current frontmatter authority.
+
+Validation passed from the worktree:
+- `cargo test -p ticket`
+- `cargo test -p yoi ticket_cli`
+- `cargo test -p tui ticket_close_action_blocks_existing_resolution_without_moving_ticket`
+- `cargo test -p pod ticket`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo run -q -p yoi -- ticket doctor` -> `doctor: ok`
+- `cargo check --workspace`
+- `nix build .#yoi`
+
+Worktree remained clean after review.
+
+---
