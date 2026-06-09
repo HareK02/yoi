@@ -256,3 +256,34 @@ Residual risks noted by coder:
 - `linked_tickets` validates Ticket existence but does not write Ticket relation metadata, preserving the non-blocking boundary.
 
 ---
+
+<!-- event: review author: reviewer at: 2026-06-09T06:55:24Z status: approve -->
+
+## Review: approve
+
+Approved review for commit `be1207254708bea4035235b4cc49186817b83156` (`objective: add lightweight records`).
+
+Evidence checked:
+- `crates/yoi/src/objective_cli.rs` implements a local Markdown Objective record at `.yoi/objectives/<objective-id>/item.md`, with path-derived opaque Objective IDs and required sections for Goal, Motivation/background, Strategy/design direction, Success criteria/exit conditions, and Decision context.
+- Objective frontmatter is limited to Objective metadata (`title`, `state`, timestamps, `linked_tickets`) and does not create or mutate TicketRelation, OrchestrationPlan, Pod/session, or Panel state.
+- Linked Tickets are checked as safe single path components under the configured Ticket backend root and require an existing `item.md`; slug/title/path-word references without a canonical Ticket directory are rejected.
+- `doctor` validates malformed frontmatter/state/timestamps, missing required sections, unsafe IDs, and missing linked Ticket records.
+- Intake/Orchestrator/work-item docs describe Objective context as background/judgment context only; Tickets remain implementation authority, Objective links are non-blocking, and Objectives are not mandatory.
+- Keeping the initial implementation in the product `yoi` CLI is acceptable for the first lightweight local-file surface and avoids introducing a premature feature crate boundary.
+- Cargo changes add only the dependencies needed by this CLI/parser (`chrono`, `serde_yaml`), and `package.nix` updates the cargo hash accordingly.
+
+Validation run from the review worktree:
+- `cargo test -p yoi objective_cli`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo run -q -p yoi -- objective doctor`
+- `cargo run -q -p yoi -- ticket doctor`
+- `cargo check --workspace`
+- `nix build .#yoi`
+- Manual temp-workspace validation: canonical Ticket ID link create succeeds; slug/title-like missing link is rejected; malformed Objective with invalid state, missing sections, and missing linked Ticket makes `objective doctor` fail.
+
+Residual risks:
+- Objective remains a minimal CLI/local-file surface; Panel display, Objective artifacts/threading, reverse Ticket display, and richer project-record abstractions are intentionally future work.
+- Link validation is exact local backend existence validation rather than a separate Ticket-query API, which is consistent with the current flat local backend but should be revisited if Objective support moves into a shared library/provider boundary.
+
+---
