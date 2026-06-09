@@ -93,3 +93,25 @@ Validation:
 - `nix build .#yoi`.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-09T10:05:03Z -->
+
+## Implementation report
+
+Implementation routing started.
+
+Worktree/branch:
+- Worktree: `.worktree/tool-execution-context`
+- Branch: `tool-execution-context`
+- Base/routing commit: `b21fab8 ticket: route tool execution context`
+
+Spawned sibling Coder Pod:
+- `coder-tool-execution-context`
+- Scope: non-recursive read on parent workspace root plus recursive write limited to the child worktree.
+
+Routing context:
+- This is the active implementation work.
+- `20260609-085212-001` (`TicketListの出力を軽量化する`) is intentionally left queued until this core Tool execution API migration lands.
+- `20260609-084725-001` is also left queued for capacity/sequencing while this core migration is active.
+
+---
