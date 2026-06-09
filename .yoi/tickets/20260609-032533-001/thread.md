@@ -188,3 +188,44 @@ Residual risks noted by coder:
 - Bash file-inspection detection is a lightweight heuristic and should be treated as an observation, not automatic blame.
 
 ---
+
+<!-- event: review author: reviewer-session-analytics-tooling at: 2026-06-09T07:37:41Z status: approve -->
+
+## Review: approve
+
+## Review result: approve
+
+Reviewed commit `c1809b37b1816a73e18c7587b9952cf4fc7b43f3` on branch `session-analytics-tooling` in worktree `.worktree/session-analytics-tooling`.
+
+### Evidence
+
+- The implementation adds `crates/session-analytics` with public `analyze_session(path) -> SessionReport` and a tolerant JSONL parser using `BufReader::lines()` / per-line `serde_json::Value` parsing.
+- The product CLI adds a thin `yoi session analyze <SESSION_JSONL_PATH> --json` surface through `crates/yoi/src/session_cli.rs`; analytics logic remains in the library crate.
+- Changed files are limited to workspace/package metadata, the new analytics crate, and the top-level product CLI wiring. I did not find changes to Worker pruning/compaction, Pod protocol/history/session writer semantics, TUI dashboarding, prompt auto-fixing, or summarization behavior.
+- Dependency direction is healthy for this Ticket: `session-analytics` depends only on `serde`, `serde_json`, and `thiserror` plus test `tempfile`; `cargo tree -i session-analytics --workspace` shows the product `yoi` crate as the consumer, not runtime/TUI crates.
+- Privacy boundary checked with a synthetic fixture containing secret-like user/file/tool argument/tool output strings. JSON output did not include raw `Read` content, `Edit` old/new strings, Bash command arguments, or Bash result content; it emitted paths, counts, byte/line sizes, line/turn indexes, and bounded observations.
+- Malformed and unknown JSONL entries are counted and surfaced as bounded diagnostics instead of crashing the whole report; unreadable input remains an error.
+- Tests are synthetic/minimal fixtures in the new crate / CLI tests, not private local sessions.
+
+### Validation run
+
+Passed:
+
+- `cargo test -p session-analytics`
+- `cargo test -p yoi session_cli`
+- `cargo test -p yoi parse_session_analyze_uses_session_mode`
+- synthetic CLI JSON privacy/metrics assertion fixture created during review
+- `cargo fmt --check`
+- `git diff --check HEAD~1..HEAD`
+- `cargo check --workspace`
+- `nix build .#yoi`
+- `result/bin/yoi session analyze --help`
+- `git diff --exit-code` / `git status --short` clean after review
+
+### Residual risks / notes
+
+- Tool result size reporting is most detailed for large-result and truncated/saved Bash observations; this meets the Ticket acceptance focus, but future aggregation could add per-tool output-size histograms if analysis needs it.
+- Repeated-read and Bash-file-inspection diagnostics are correctly framed as observations/correlations rather than automatic blame.
+- The new top-level `session` subcommand reserves that literal bare token; explicit `--pod session` remains the escape hatch for a Pod named `session`.
+
+---
