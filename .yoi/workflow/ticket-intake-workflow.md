@@ -37,6 +37,8 @@ Intake は以下を行う。
 - 既存 Ticket を確認し、duplicate / related work を探す。
 - 必要に応じて関連 docs / code / workflow / history を読む。
 - 不足している要件を質問する。
+- 作成または refinement する Ticket が、実装・レビュー・検証・完了判断を単独で行える concrete work item であるか確認する。
+- 広い依頼を分割する場合は、進捗コンテナとしての umbrella Ticket ではなく、concrete Ticket / Objective context / split decision record に責務を分ける。
 - Ticket の title / slug / kind / priority / labels を提案する。
 - background / requirements / acceptance criteria / escalation conditions を整理する。
 - binding decisions / invariants と implementation latitude を分けて書く。
@@ -53,6 +55,8 @@ Intake は以下を行う。
 - implementation-ready でない Ticket を実装に投げない。
 - unattended scheduler として自動実行しない。
 - ユーザー合意なしに official Ticket を作らない。
+- broad effort の進捗を保持するためだけの long-lived umbrella / progress-container Ticket を作らない。
+- parent/child、sub-ticket、umbrella、part-of、contains などの hierarchy/container relation を split の代替として提案しない。
 - secrets / private context を Ticket body / thread / artifacts / diagnostics に保存しない。
 - arbitrary filesystem write で `work-items/` を編集しない。Ticket 操作は Ticket tools を使う。
 
@@ -92,10 +96,23 @@ Ticket tools が利用できない環境では、勝手に file write で代替�
 
 - 同じ目的の open / pending Ticket がないか。
 - closed Ticket の判断・resolution と矛盾しないか。
-- umbrella Ticket / follow-up Ticket が既にあるか。
-- 既存 Ticket の refinement で足りるか、新規 Ticket が必要か。
+- 既存の umbrella/progress-container Ticket が、superseded/decomposed として退役できる状態か。
+- 既存 concrete follow-up Ticket や Objective context で足りるか、新規 concrete Ticket が必要か。
 
 既存 Ticket の更新で足りる場合、新規 Ticket を作らず、ユーザーに更新案を提示する。
+
+### 2.5. Broad request の split policy
+
+1つの依頼が複数の implementable work item を含む場合、Intake は以下を提案する。
+
+- broad effort を表す umbrella/progress-container Ticket は新規作成しない。
+- concrete slice ごとに、単独で実装・レビュー・検証・close できる Ticket を作る。
+- split した理由と残した範囲は、関連 Ticket の thread、必要なら Objective context に記録する。
+- Objective は中期的な目的・方針・success criteria を保持するために使う。Objective record の実装や schema 追加はこの workflow の責務ではない。
+- typed Ticket relation が利用可能になった場合も、dependency / related / blocking / replacement / supersedes などの非階層メタデータに限る。
+- parent/child、sub-ticket、part-of、contains のような hierarchy/container relation を作らない。
+
+ユーザーが「まず調査 Ticket」「設計 Ticket」「計画 Ticket」を concrete work item として求める場合は作成してよい。禁止されるのは、他の concrete Ticket の進捗を持つためだけに長期 open となる container Ticket である。
 
 ### 3. 要件を同期する
 

@@ -9,12 +9,13 @@ Do not treat ad-hoc chat summaries, memory records, or Pod notifications as the 
 ## Concepts
 
 - `Ticket`: durable project/orchestration record. It contains requirements, decisions, plans, implementation reports, reviews, artifacts, and resolution history.
+- `Objective`: medium-term goal, motivation, strategy, and success-criteria context. Objective records are a policy concept here; this document does not define their storage/schema.
 - `Task`: session-local progress tracking inside a Pod. It is not the project record.
 - `Assignment`: a concrete delegation from an Orchestrator to a coder/reviewer Pod or task-specific helper Pod.
 - `IntentPacket`: the short implementation/review contract derived from a Ticket and handed to an Assignment.
 - `LocalTicketBackend`: the current `.yoi/tickets/` markdown/thread/artifacts storage backend.
 
-A Ticket may represent a feature, bug, cleanup, design decision, investigation, workflow change, release task, or orchestration umbrella. The common requirement is that the closed Ticket explains a completed outcome.
+A Ticket may represent a feature, bug, cleanup, design decision, investigation, workflow change, release task, or orchestration task. The common requirement is that the Ticket is a concrete work item that can be implemented, reviewed, validated, and closed on its own terms.
 
 ## User-facing entry points
 
@@ -293,11 +294,22 @@ If a role still uses `profile = "inherit"`, the panel fails closed with a diagno
 
 ## Granularity
 
-One Ticket should describe a complete change that can be explained as a feature, behavior, design decision, investigation result, or maintenance outcome when closed.
+One Ticket should describe a complete change that can be explained as a feature, behavior, design decision, investigation result, or maintenance outcome when closed. It should be concrete enough to implement, review, validate, and close without relying on another open Ticket as its progress container.
 
 Avoid Tickets that only mirror an implementation step unless that step is independently reviewable and useful. Phase/step lists inside a Ticket are execution order, not a separate dependency system.
 
-Use umbrella Tickets only to track a split. Child Tickets should be independently reviewable and closeable.
+Do not create new umbrella Tickets for broad multi-Ticket efforts. When a request is too broad for one concrete work item:
+
+- create concrete implementable Tickets for the slices;
+- record the split decision in the relevant Ticket thread, Objective context, or both;
+- use Objectives for medium-term goal, motivation, strategy, and success-criteria context when that context would outlive one concrete Ticket;
+- once typed Ticket relations exist, use them only for non-hierarchical dependency, related, blocking, superseded-by, duplicate, or replacement metadata;
+- do not replace umbrellas with parent/child, sub-ticket, umbrella, part-of, contains, or other hierarchy/container relations;
+- do not keep a separate umbrella Ticket open merely as a progress container.
+
+This policy does not forbid an initial concrete planning, design, or investigation Ticket when the user asks for one. The deprecated pattern is a long-lived umbrella/progress-container Ticket whose main purpose is to keep a broad effort open while other concrete Tickets carry the actual work.
+
+Existing umbrella Tickets may be retired without rewriting history. Once concrete follow-up Tickets and any needed Objective context exist, close the umbrella as superseded/decomposed. The close resolution should state that the container role is retired, not that every related future concern is complete, and should list completed concrete Tickets plus remaining follow-up Tickets/Objectives.
 
 ## Ticket contents
 
