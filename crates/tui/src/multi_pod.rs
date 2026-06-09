@@ -3143,7 +3143,7 @@ mod tests {
         let (temp, ticket_id, backend) = done_ticket_workspace("panel-close-resolution");
         fs::write(
             temp.path()
-                .join(".yoi/tickets/open")
+                .join(".yoi/tickets")
                 .join(&ticket_id)
                 .join("resolution.md"),
             "Already resolved\n",
