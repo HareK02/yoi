@@ -12,6 +12,7 @@ use std::path::{Component, Path, PathBuf};
 
 use chrono::Utc;
 use fs4::fs_std::FileExt;
+use project_record::{allocate_record_id, unix_epoch_millis_now, validate_record_id};
 use serde::{Deserialize, Serialize};
 use serde_yaml::{Mapping as YamlMapping, Value as YamlValue};
 use thiserror::Error;
@@ -1305,21 +1306,17 @@ impl TicketBackend for LocalTicketBackend {
                 "ticket title must not be empty".to_string(),
             ));
         }
-        let stamp = compact_now_utc();
-        let mut counter = 1_u32;
-        let (id, dir) = loop {
-            let candidate = format!("{stamp}-{counter:03}");
-            let dir = self.ticket_dir(&candidate)?;
-            if !dir.exists() {
-                break (candidate, dir);
-            }
-            counter += 1;
-            if counter > 999 {
-                return Err(TicketError::Conflict(format!(
-                    "too many ticket id collisions for timestamp {stamp}"
-                )));
-            }
-        };
+        let base_millis = unix_epoch_millis_now().map_err(|err| {
+            TicketError::Conflict(format!("failed to read ticket id timestamp: {err}"))
+        })?;
+        let id = allocate_record_id(base_millis, |candidate| match self.ticket_dir(candidate) {
+            Ok(dir) => dir.exists(),
+            Err(_) => true,
+        })
+        .map_err(|err| {
+            TicketError::Conflict(format!("failed to allocate unique ticket id: {err}"))
+        })?;
+        let dir = self.ticket_dir(&id)?;
         let created = now_utc();
         let author = input
             .author
@@ -2180,6 +2177,9 @@ fn ticket_id_from_dir(dir: &Path) -> Result<String> {
         )));
     };
     ensure_safe_component(name)?;
+    validate_record_id(name).map_err(|err| {
+        TicketError::InvalidPathComponent(format!("{name} is not a canonical record id: {err}"))
+    })?;
     Ok(name.to_string())
 }
 
@@ -3536,9 +3536,9 @@ queued_at: 2026-06-05T00:01:00Z
 ## Body
 "#;
         let parsed = parse_item(item).unwrap();
-        let meta = ticket_meta(parsed.frontmatter, "20260609-000000-001".to_string());
-        assert_eq!(meta.id, "20260609-000000-001");
-        assert_eq!(meta.slug, "20260609-000000-001");
+        let meta = ticket_meta(parsed.frontmatter, "0000000000001".to_string());
+        assert_eq!(meta.id, "0000000000001");
+        assert_eq!(meta.slug, "0000000000001");
         assert!(meta.labels.is_empty());
         assert_eq!(meta.readiness.as_deref(), Some("implementation-ready"));
         assert_eq!(meta.risk_flags, vec!["low", "local"]);
@@ -3558,7 +3558,7 @@ state: planning
 "#,
         )
         .unwrap();
-        let meta = ticket_meta(frontmatter, "20260609-000000-001".to_string());
+        let meta = ticket_meta(frontmatter, "0000000000001".to_string());
         assert!(meta.labels.is_empty());
         assert_eq!(meta.risk_flags, vec!["low", "local"]);
         assert_eq!(meta.assignee, None);
@@ -3600,6 +3600,8 @@ state: planning
         assert!(dir.join("thread.md").exists());
         assert!(dir.join("artifacts/.gitkeep").exists());
         assert!(!ticket.id.contains("example"));
+        assert_eq!(ticket.id.len(), project_record::RECORD_ID_WIDTH);
+        validate_record_id(&ticket.id).unwrap();
         assert_eq!(ticket.slug, ticket.id);
         let item = fs::read_to_string(dir.join("item.md")).unwrap();
         assert!(
@@ -3892,14 +3894,14 @@ state: planning
         let backend = backend(&tmp);
         let missing_meta = ticket_meta(
             parse_ticket_frontmatter("title: Missing State").expect("missing state parses"),
-            "20260609-000000-001".to_string(),
+            "0000000000001".to_string(),
         );
         assert_eq!(missing_meta.workflow_state, TicketWorkflowState::Planning);
         assert!(!missing_meta.workflow_state_explicit);
 
         let closed_meta = ticket_meta(
             parse_ticket_frontmatter("state: closed").expect("closed state parses"),
-            "20260609-000000-002".to_string(),
+            "0000000000002".to_string(),
         );
         assert_eq!(closed_meta.workflow_state, TicketWorkflowState::Closed);
         assert!(closed_meta.workflow_state_explicit);
@@ -4028,13 +4030,13 @@ state: planning
     fn doctor_reports_invalid_state() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().join("tickets");
-        fs::create_dir_all(root.join("20260609-000000-001/artifacts")).unwrap();
+        fs::create_dir_all(root.join("0000000000001/artifacts")).unwrap();
         fs::write(
-            root.join("20260609-000000-001/item.md"),
+            root.join("0000000000001/item.md"),
             "---\ntitle: Bad\nstate: almost\ncreated_at: x\nupdated_at: x\n---\n",
         )
         .unwrap();
-        fs::write(root.join("20260609-000000-001/thread.md"), "").unwrap();
+        fs::write(root.join("0000000000001/thread.md"), "").unwrap();
 
         let report = LocalTicketBackend::new(&root).doctor().unwrap();
         let messages = report
@@ -4051,14 +4053,14 @@ state: planning
     fn doctor_validates_typed_thread_event_attributes() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().join("tickets");
-        fs::create_dir_all(root.join("20260609-000000-001/artifacts")).unwrap();
+        fs::create_dir_all(root.join("0000000000001/artifacts")).unwrap();
         fs::write(
-            root.join("20260609-000000-001/item.md"),
+            root.join("0000000000001/item.md"),
             "---\ntitle: Bad\nstate: planning\ncreated_at: x\nupdated_at: x\n---\n",
         )
         .unwrap();
         fs::write(
-            root.join("20260609-000000-001/thread.md"),
+            root.join("0000000000001/thread.md"),
             "<!-- event: state_changed author: bot at: now from: queued -->\n\n## State changed\n\n---\n\n<!-- event: intake_summary author: bot at: now -->\n\n## Intake summary\n\n---\n",
         )
         .unwrap();
@@ -4086,14 +4088,14 @@ state: planning
         )
         .unwrap();
         fs::write(root.join("open/legacy/thread.md"), "").unwrap();
-        fs::create_dir_all(root.join("20260609-000000-001/artifacts")).unwrap();
+        fs::create_dir_all(root.join("0000000000001/artifacts")).unwrap();
         fs::write(
-            root.join("20260609-000000-001/item.md"),
+            root.join("0000000000001/item.md"),
             "---\nid: old\nslug: old\ntitle: Bad\nstatus: pending\nworkflow_state: ready\nkind: task\nlabels: []\naction_required: human\nattention_required: true\ncreated_at: x\nupdated_at: x\n---\n",
         )
         .unwrap();
         fs::write(
-            root.join("20260609-000000-001/thread.md"),
+            root.join("0000000000001/thread.md"),
             "<!-- event: review author: a at: now -->\n",
         )
         .unwrap();

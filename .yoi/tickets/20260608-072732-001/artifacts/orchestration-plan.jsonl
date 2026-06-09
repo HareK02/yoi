@@ -1,1 +1,0 @@
-{"id":"orch-plan-20260609-054243-1","ticket_id":"20260608-072732-001","kind":"before","related_ticket":"20260608-125430-001","note":"Route typed Ticket relation metadata before Objective records so Objective linking/design can target the stable canonical Ticket relation/reference surface after identity simplification.","author":"orchestrator","at":"2026-06-09T05:42:43Z"}

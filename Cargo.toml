@@ -21,6 +21,7 @@ members = [
     "crates/tui",
     "crates/memory",
     "crates/ticket",
+    "crates/project-record",
     "crates/workflow",
 ]
 
@@ -37,6 +38,7 @@ manifest = { path = "crates/manifest" }
 lint-common = { path = "crates/lint-common" }
 memory = { path = "crates/memory" }
 ticket = { path = "crates/ticket" }
+project-record = { path = "crates/project-record" }
 pod = { path = "crates/pod" }
 yoi = { path = "crates/yoi" }
 pod-registry = { path = "crates/pod-registry" }

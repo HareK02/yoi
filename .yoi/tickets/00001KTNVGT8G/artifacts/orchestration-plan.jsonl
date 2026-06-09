@@ -1,0 +1,1 @@
+{"id":"orch-plan-20260609-100341-1","ticket_id":"00001KTNVGT8G","kind":"before","related_ticket":"00001KTNSA2K0","note":"Run the ToolExecutionContext API migration before slimming TicketList output because TicketList is an LLM tool surface that may need to adopt the new execution context API shape.","author":"orchestrator","at":"2026-06-09T10:03:41Z"}
