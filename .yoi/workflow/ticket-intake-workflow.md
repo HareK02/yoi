@@ -41,7 +41,7 @@ Intake は以下を行う。
 - 作成または refinement する Ticket が、実装・レビュー・検証・完了判断を単独で行える concrete work item であるか確認する。
 - 広い依頼を分割する場合は、進捗コンテナとしての umbrella Ticket ではなく、concrete Ticket / Objective context / split decision record に責務を分ける。
 - Objective-to-Ticket links を提案する場合は canonical opaque Ticket ID だけを使い、dependency / blocking / ordering relation として扱わない。
-- Ticket の title / body/request snapshot / acceptance criteria / priority / readiness / action_required / attention_required を、現在の要件として意味がある範囲で提案する。
+- Ticket の title / body/request snapshot / acceptance criteria / priority / readiness / risk flags を、現在の要件として意味がある範囲で提案する。
 - canonical ID は Ticket 作成/storage が opaque な path-derived value として割り当てるため、Intake はユーザー向け metadata として提案しない。
 - background / requirements / acceptance criteria / escalation conditions を整理する。
 - binding decisions / invariants と implementation latitude を分けて書く。
@@ -229,7 +229,7 @@ canonical ID は作成時に storage が opaque/path-derived value として割�
 新規 Ticket の場合:
 
 - `TicketCreate` を使う。
-- title / priority / body と、必要な readiness / action_required / attention_required を指定する。canonical ID は storage が割り当てる。
+- title / priority / body と、必要な readiness / risk flags を指定する。canonical ID は storage が割り当てる。
 - body に readiness / open questions / risk flags と、binding decisions / invariants、implementation latitude、escalation conditions を Markdown で明記する。
 
 既存 Ticket refinement の場合:

@@ -2109,28 +2109,12 @@ fn panel_close_blocker(ticket: &ticket::Ticket) -> Option<String> {
             ticket.meta.workflow_state.as_str()
         ));
     }
-    if let Some(reason) = non_empty_ticket_field(ticket.meta.attention_required.as_deref()) {
-        return Some(format!(
-            "Close blocked for Ticket {ticket_id}: attention_required is set ({}); no close was recorded.",
-            bounded_panel_diagnostic(reason)
-        ));
-    }
-    if let Some(reason) = non_empty_ticket_field(ticket.meta.action_required.as_deref()) {
-        return Some(format!(
-            "Close blocked for Ticket {ticket_id}: action_required is set ({}); no close was recorded.",
-            bounded_panel_diagnostic(reason)
-        ));
-    }
     if ticket.resolution.is_some() {
         return Some(format!(
             "Close blocked for Ticket {ticket_id}: resolution.md already exists; no close was recorded."
         ));
     }
     None
-}
-
-fn non_empty_ticket_field(value: Option<&str>) -> Option<&str> {
-    value.map(str::trim).filter(|value| !value.is_empty())
 }
 
 fn panel_close_resolution(
@@ -3296,48 +3280,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ticket_close_action_blocks_action_required_without_mutation() {
-        let (temp, ticket_id, backend) = ticket_workspace(
-            "panel-close-action-required",
-            TicketWorkflowState::Done,
-            |input| {
-                input.action_required = Some("human decision needed".to_string());
-            },
-        );
-
-        let error =
-            dispatch_ticket_action(request_for(&temp, ticket_id.clone(), NextUserAction::Close))
-                .await
-                .unwrap_err();
-
-        assert!(error.to_string().contains("action_required is set"));
-        assert!(error.to_string().contains("no close was recorded"));
-        let ticket = backend.show(TicketIdOrSlug::Id(ticket_id)).unwrap();
-        assert_eq!(ticket.meta.workflow_state, TicketWorkflowState::Done);
-        assert!(ticket.resolution.is_none());
-    }
-
-    #[tokio::test]
-    async fn ticket_close_action_blocks_attention_required_without_mutation() {
-        let (temp, ticket_id, backend) = ticket_workspace(
-            "panel-close-attention-required",
-            TicketWorkflowState::Done,
-            |input| {
-                input.attention_required = Some("needs reply".to_string());
-            },
-        );
-
-        let error =
-            dispatch_ticket_action(request_for(&temp, ticket_id.clone(), NextUserAction::Close))
-                .await
-                .unwrap_err();
-
-        assert!(error.to_string().contains("attention_required is set"));
-        let ticket = backend.show(TicketIdOrSlug::Id(ticket_id)).unwrap();
-        assert!(ticket.resolution.is_none());
-    }
-
-    #[tokio::test]
     async fn ticket_close_action_blocks_existing_resolution_without_moving_ticket() {
         let (temp, ticket_id, backend) = done_ticket_workspace("panel-close-resolution");
         fs::write(
@@ -3489,8 +3431,8 @@ mod tests {
         )
         .unwrap();
         let backend = LocalTicketBackend::new(temp.path().join(".yoi/tickets"));
-        let mut ticket = NewTicket::new("Needs Human Reply");
-        ticket.action_required = Some("answer intake question".to_string());
+        let mut ticket = NewTicket::new("Ready Ticket");
+        ticket.workflow_state = Some(TicketWorkflowState::Ready);
         backend.create(ticket).unwrap();
         let list = PodList::from_sources(
             PodVisibilitySource::ResumePicker,
@@ -3502,7 +3444,7 @@ mod tests {
         let panel = build_workspace_panel(temp.path(), &list);
         let mut app = app_with_panel(list, panel);
 
-        assert_eq!(app.selected_panel_row().unwrap().title, "Needs Human Reply");
+        assert_eq!(app.selected_panel_row().unwrap().title, "Ready Ticket");
         assert_eq!(app.selected_open_eligibility(), OpenEligibility::Disabled);
         let lines = list_lines(&app, 100, 6)
             .into_iter()
@@ -3510,7 +3452,7 @@ mod tests {
             .collect::<Vec<_>>();
         let ticket_line = lines
             .iter()
-            .position(|line| line.contains("Needs Human Reply"))
+            .position(|line| line.contains("Ready Ticket"))
             .unwrap();
         let pod_line = lines.iter().position(|line| line.contains("idle")).unwrap();
         assert!(ticket_line < pod_line);
@@ -4885,7 +4827,6 @@ mod tests {
             workflow_state: TicketWorkflowState::parse(state)
                 .unwrap_or(TicketWorkflowState::Planning),
             workflow_state_explicit: true,
-            attention_required: None,
             next_action: Some(next_action),
             updated_at: None,
             latest_event_kind: Some("implementation_report".to_string()),

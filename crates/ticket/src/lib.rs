@@ -481,9 +481,7 @@ pub struct NewTicket {
     pub assignee: Option<String>,
     pub readiness: Option<String>,
     pub risk_flags: Vec<String>,
-    pub action_required: Option<String>,
     pub workflow_state: Option<TicketWorkflowState>,
-    pub attention_required: Option<String>,
     pub queued_by: Option<String>,
     pub queued_at: Option<String>,
 }
@@ -501,9 +499,7 @@ impl NewTicket {
             assignee: None,
             readiness: None,
             risk_flags: Vec::new(),
-            action_required: None,
             workflow_state: None,
-            attention_required: None,
             queued_by: None,
             queued_at: None,
         }
@@ -744,10 +740,8 @@ pub struct TicketMeta {
     pub assignee: Option<String>,
     pub readiness: Option<String>,
     pub risk_flags: Vec<String>,
-    pub action_required: Option<String>,
     pub workflow_state: TicketWorkflowState,
     pub workflow_state_explicit: bool,
-    pub attention_required: Option<String>,
     pub queued_by: Option<String>,
     pub queued_at: Option<String>,
     pub raw: BTreeMap<String, String>,
@@ -763,10 +757,8 @@ pub struct TicketSummary {
     pub priority: String,
     pub labels: Vec<String>,
     pub readiness: Option<String>,
-    pub action_required: Option<String>,
     pub workflow_state: TicketWorkflowState,
     pub workflow_state_explicit: bool,
-    pub attention_required: Option<String>,
     pub queued_by: Option<String>,
     pub queued_at: Option<String>,
     pub updated_at: Option<String>,
@@ -1290,10 +1282,8 @@ impl TicketBackend for LocalTicketBackend {
                 priority: meta.priority,
                 labels: meta.labels,
                 readiness: meta.readiness,
-                action_required: meta.action_required,
                 workflow_state: meta.workflow_state,
                 workflow_state_explicit: meta.workflow_state_explicit,
-                attention_required: meta.attention_required,
                 queued_by: meta.queued_by,
                 queued_at: meta.queued_at,
                 updated_at: meta.updated_at,
@@ -1376,18 +1366,6 @@ impl TicketBackend for LocalTicketBackend {
         }
         if !input.risk_flags.is_empty() {
             fields.push(("risk_flags".to_string(), labels_yaml(&input.risk_flags)));
-        }
-        if let Some(action_required) = input.action_required {
-            fields.push((
-                "action_required".to_string(),
-                format_yaml_string_scalar(action_required.as_str()),
-            ));
-        }
-        if let Some(attention_required) = input.attention_required {
-            fields.push((
-                "attention_required".to_string(),
-                format_yaml_string_scalar(attention_required.as_str()),
-            ));
         }
         if let Some(queued_by) = input.queued_by {
             fields.push((
@@ -1874,7 +1852,16 @@ impl TicketBackend for LocalTicketBackend {
                     );
                 }
             }
-            for obsolete in ["id", "slug", "status", "workflow_state", "kind", "labels"] {
+            for obsolete in [
+                "id",
+                "slug",
+                "status",
+                "workflow_state",
+                "kind",
+                "labels",
+                "action_required",
+                "attention_required",
+            ] {
                 if parsed.frontmatter.get(obsolete).is_some() {
                     report.push_error(
                         format!(
@@ -1994,12 +1981,10 @@ struct TicketItemFrontmatter {
     assignee: Option<String>,
     readiness: Option<String>,
     risk_flags: Vec<String>,
-    action_required: Option<String>,
     workflow_state: Option<TicketWorkflowState>,
     workflow_state_explicit: bool,
     state: Option<TicketWorkflowState>,
     state_explicit: bool,
-    attention_required: Option<String>,
     queued_by: Option<String>,
     queued_at: Option<String>,
     raw: BTreeMap<String, String>,
@@ -2103,12 +2088,10 @@ fn parse_ticket_frontmatter(content: &str) -> std::result::Result<TicketItemFron
         assignee: yaml_string(&mapping, "assignee")?,
         readiness: yaml_string(&mapping, "readiness")?,
         risk_flags: yaml_string_list(&mapping, "risk_flags")?,
-        action_required: yaml_string(&mapping, "action_required")?,
         workflow_state,
         workflow_state_explicit,
         state,
         state_explicit,
-        attention_required: yaml_string(&mapping, "attention_required")?,
         queued_by: yaml_string(&mapping, "queued_by")?,
         queued_at: yaml_string(&mapping, "queued_at")?,
         raw,
@@ -2233,10 +2216,8 @@ fn ticket_meta(frontmatter: TicketItemFrontmatter, id: String) -> TicketMeta {
         assignee: frontmatter.assignee,
         readiness: frontmatter.readiness,
         risk_flags: frontmatter.risk_flags,
-        action_required: frontmatter.action_required,
         workflow_state,
         workflow_state_explicit: frontmatter.state_explicit,
-        attention_required: frontmatter.attention_required,
         queued_by: frontmatter.queued_by,
         queued_at: frontmatter.queued_at,
         raw: frontmatter.raw,
@@ -3548,8 +3529,6 @@ updated_at: 2026-06-05T00:00:00Z
 assignee: null
 readiness: implementation-ready
 risk_flags: [low, local]
-action_required: none
-attention_required: none
 queued_by: workspace-panel
 queued_at: 2026-06-05T00:01:00Z
 ---
@@ -3563,10 +3542,8 @@ queued_at: 2026-06-05T00:01:00Z
         assert!(meta.labels.is_empty());
         assert_eq!(meta.readiness.as_deref(), Some("implementation-ready"));
         assert_eq!(meta.risk_flags, vec!["low", "local"]);
-        assert_eq!(meta.action_required.as_deref(), Some("none"));
         assert_eq!(meta.workflow_state, TicketWorkflowState::Ready);
         assert!(meta.workflow_state_explicit);
-        assert_eq!(meta.attention_required.as_deref(), Some("none"));
         assert_eq!(meta.queued_by.as_deref(), Some("workspace-panel"));
         assert_eq!(meta.queued_at.as_deref(), Some("2026-06-05T00:01:00Z"));
     }
@@ -3576,8 +3553,6 @@ queued_at: 2026-06-05T00:01:00Z
         let frontmatter = parse_ticket_frontmatter(
             r#"risk_flags: [low, local]
 assignee: ~
-attention_required: null
-action_required: "null"
 readiness: "~"
 state: planning
 "#,
@@ -3587,8 +3562,6 @@ state: planning
         assert!(meta.labels.is_empty());
         assert_eq!(meta.risk_flags, vec!["low", "local"]);
         assert_eq!(meta.assignee, None);
-        assert_eq!(meta.attention_required, None);
-        assert_eq!(meta.action_required.as_deref(), Some("null"));
         assert_eq!(meta.readiness.as_deref(), Some("~"));
         assert_eq!(meta.workflow_state, TicketWorkflowState::Planning);
         assert!(meta.workflow_state_explicit);
@@ -3641,6 +3614,8 @@ state: planning
             "workflow_state:",
             "kind:",
             "labels:",
+            "action_required:",
+            "attention_required:",
         ] {
             assert!(
                 !item.contains(obsolete),
@@ -3680,8 +3655,6 @@ state: planning
         let mut input = NewTicket::new("123");
         input.risk_flags = vec!["1".into(), "42".into()];
         input.assignee = Some("42".into());
-        input.attention_required = Some("0".into());
-        input.action_required = Some("true".into());
         let ticket = backend.create(input).unwrap();
 
         let record = backend.show(TicketIdOrSlug::Id(ticket.id.clone())).unwrap();
@@ -3689,8 +3662,6 @@ state: planning
         assert!(record.meta.labels.is_empty());
         assert_eq!(record.meta.risk_flags, vec!["1", "42"]);
         assert_eq!(record.meta.assignee.as_deref(), Some("42"));
-        assert_eq!(record.meta.attention_required.as_deref(), Some("0"));
-        assert_eq!(record.meta.action_required.as_deref(), Some("true"));
 
         let item = fs::read_to_string(tmp.path().join("tickets").join(&ticket.id).join("item.md"))
             .unwrap();
@@ -3698,8 +3669,8 @@ state: planning
         assert!(!item.contains("labels:"), "{item}");
         assert!(item.contains("risk_flags: ['1', '42']"), "{item}");
         assert!(item.contains("assignee: '42'"), "{item}");
-        assert!(item.contains("attention_required: '0'"), "{item}");
-        assert!(item.contains("action_required: 'true'"), "{item}");
+        assert!(!item.contains("attention_required:"), "{item}");
+        assert!(!item.contains("action_required:"), "{item}");
 
         let report = backend.doctor().unwrap();
         assert!(report.is_ok(), "{:?}", report.diagnostics);
@@ -4118,7 +4089,7 @@ state: planning
         fs::create_dir_all(root.join("20260609-000000-001/artifacts")).unwrap();
         fs::write(
             root.join("20260609-000000-001/item.md"),
-            "---\nid: old\nslug: old\ntitle: Bad\nstatus: pending\nworkflow_state: ready\nkind: task\nlabels: []\ncreated_at: x\nupdated_at: x\n---\n",
+            "---\nid: old\nslug: old\ntitle: Bad\nstatus: pending\nworkflow_state: ready\nkind: task\nlabels: []\naction_required: human\nattention_required: true\ncreated_at: x\nupdated_at: x\n---\n",
         )
         .unwrap();
         fs::write(
@@ -4141,6 +4112,8 @@ state: planning
         assert!(messages.contains("obsolete current frontmatter field 'workflow_state'"));
         assert!(messages.contains("obsolete current frontmatter field 'kind'"));
         assert!(messages.contains("obsolete current frontmatter field 'labels'"));
+        assert!(messages.contains("obsolete current frontmatter field 'action_required'"));
+        assert!(messages.contains("obsolete current frontmatter field 'attention_required'"));
         assert!(messages.contains("review event missing valid status"));
     }
 

@@ -125,15 +125,9 @@ struct TicketCreateParams {
     /// Optional risk flag frontmatter values.
     #[serde(default)]
     risk_flags: Vec<String>,
-    /// Optional action-required frontmatter value.
-    #[serde(default)]
-    action_required: Option<String>,
     /// Optional state frontmatter value. Defaults to `planning`.
     #[serde(default)]
     state: Option<TicketWorkflowStateParam>,
-    /// Optional attention_required overlay frontmatter value.
-    #[serde(default)]
-    attention_required: Option<String>,
     /// Optional queued_by frontmatter value.
     #[serde(default)]
     queued_by: Option<String>,
@@ -590,9 +584,7 @@ impl Tool for TicketCreateTool {
         input.assignee = params.assignee;
         input.readiness = params.readiness;
         input.risk_flags = params.risk_flags;
-        input.action_required = params.action_required;
         input.workflow_state = params.state.map(TicketWorkflowStateParam::into_state);
-        input.attention_required = params.attention_required;
         input.queued_by = params.queued_by;
         input.queued_at = params.queued_at;
 
@@ -1051,18 +1043,6 @@ fn ticket_summary_json(ticket: TicketSummary) -> TicketListTicketOutput {
 
 fn ticket_list_hints(ticket: &TicketSummary) -> Vec<String> {
     let mut hints = Vec::new();
-    if let Some(attention) = ticket.attention_required.as_deref() {
-        hints.push(format!(
-            "attention:{}",
-            truncate_inline(attention, LIST_HINT_MAX_CHARS)
-        ));
-    }
-    if let Some(action) = ticket.action_required.as_deref() {
-        hints.push(format!(
-            "action:{}",
-            truncate_inline(action, LIST_HINT_MAX_CHARS)
-        ));
-    }
     if let Some(readiness) = ticket.readiness.as_deref() {
         hints.push(format!(
             "readiness:{}",
@@ -1183,8 +1163,6 @@ fn ticket_json(
             "assignee": ticket.meta.assignee,
             "readiness": ticket.meta.readiness,
             "risk_flags": ticket.meta.risk_flags,
-            "action_required": ticket.meta.action_required,
-            "attention_required": ticket.meta.attention_required,
             "queued_by": ticket.meta.queued_by,
             "queued_at": ticket.meta.queued_at,
         },
@@ -1486,6 +1464,8 @@ mod tests {
         let created_text = created_json.to_string();
         assert!(!created_text.contains("legacy_ticket"));
         assert!(!created_text.contains("needs_preflight"));
+        assert!(!created_text.contains("action_required"));
+        assert!(!created_text.contains("attention_required"));
 
         let listed = list
             .execute(
@@ -1512,6 +1492,8 @@ mod tests {
         assert!(shown_content.contains("Created by tool"));
         assert!(!shown_content.contains("legacy_ticket"));
         assert!(!shown_content.contains("needs_preflight"));
+        assert!(!shown_content.contains("action_required"));
+        assert!(!shown_content.contains("attention_required"));
 
         let report = doctor
             .execute(&json!({}).to_string(), Default::default())
@@ -1529,8 +1511,8 @@ mod tests {
             "Long Title {}",
             "x".repeat(LIST_TITLE_MAX_CHARS + 40)
         ));
-        ticket.attention_required = Some(format!(
-            "Needs attention {}",
+        ticket.readiness = Some(format!(
+            "Ready after review {}",
             "a".repeat(LIST_HINT_MAX_CHARS + 40)
         ));
         backend.create(ticket).unwrap();
@@ -1544,7 +1526,7 @@ mod tests {
         assert!(title.chars().count() <= LIST_TITLE_MAX_CHARS);
         assert!(title.ends_with("..."));
         let hint = listed_json["tickets"][0]["hints"][0].as_str().unwrap();
-        assert!(hint.chars().count() <= "attention:".chars().count() + LIST_HINT_MAX_CHARS);
+        assert!(hint.chars().count() <= "readiness:".chars().count() + LIST_HINT_MAX_CHARS);
         assert!(hint.ends_with("..."));
     }
 
@@ -2214,6 +2196,8 @@ mod tests {
             .to_string();
         assert!(!create_schema.contains("legacy_ticket"));
         assert!(!create_schema.contains("needs_preflight"));
+        assert!(!create_schema.contains("action_required"));
+        assert!(!create_schema.contains("attention_required"));
         let plan_record_schema = tools
             .iter()
             .map(|definition| definition().0)

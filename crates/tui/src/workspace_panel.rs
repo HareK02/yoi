@@ -233,7 +233,6 @@ pub(crate) struct TicketPanelEntry {
     pub(crate) priority: String,
     pub(crate) workflow_state: TicketWorkflowState,
     pub(crate) workflow_state_explicit: bool,
-    pub(crate) attention_required: Option<String>,
     pub(crate) next_action: Option<NextUserAction>,
     pub(crate) updated_at: Option<String>,
     pub(crate) latest_event_kind: Option<String>,
@@ -620,10 +619,8 @@ fn ticket_summary_from_meta(meta: &TicketMeta) -> TicketSummary {
         priority: meta.priority.clone(),
         labels: meta.labels.clone(),
         readiness: meta.readiness.clone(),
-        action_required: meta.action_required.clone(),
         workflow_state: meta.workflow_state,
         workflow_state_explicit: meta.workflow_state_explicit,
-        attention_required: meta.attention_required.clone(),
         queued_by: meta.queued_by.clone(),
         queued_at: meta.queued_at.clone(),
         updated_at: meta.updated_at.clone(),
@@ -669,7 +666,6 @@ fn ticket_row(
         priority: summary.priority.clone(),
         workflow_state: summary.workflow_state,
         workflow_state_explicit: summary.workflow_state_explicit,
-        attention_required: summary.attention_required.clone(),
         next_action: derived.action,
         updated_at: summary.updated_at.clone(),
         latest_event_kind: latest_event.map(|event| event.kind.as_str().to_string()),
@@ -732,26 +728,6 @@ fn derive_ticket_state(
             ),
             key_hint: Some("Open the Ticket relation diagnostics before queueing".to_string()),
             blocked_reason: Some(blockers),
-        };
-    }
-
-    if let Some(reason) = summary
-        .attention_required
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        return DerivedTicketState {
-            kind: PanelRowKind::Blocked,
-            priority: ActionPriority::UserReply,
-            action: Some(NextUserAction::Edit),
-            disabled_reason: Some(
-                "attention_required is set; resolve it before queueing or routing.".to_string(),
-            ),
-            key_hint: Some(
-                "Resolve attention_required in the Ticket frontmatter/thread".to_string(),
-            ),
-            blocked_reason: Some(reason.to_string()),
         };
     }
 
@@ -870,9 +846,6 @@ pub(crate) fn local_claim_status_for_pod(pod_name: &str, pods: &PodList) -> Tick
 
 fn ticket_subtitle(entry: &TicketPanelEntry) -> Option<String> {
     let mut parts = vec![format!("{} · {}", entry.id, entry.workflow_state.as_str())];
-    if let Some(reason) = entry.attention_required.as_deref() {
-        parts.push(format!("attention: {reason}"));
-    }
     if let Some(claim) = entry.local_claim.as_ref() {
         parts.push(format!(
             "claim: {} ({})",
@@ -1044,9 +1017,7 @@ mod tests {
     fn workspace_panel_without_ticket_config_is_pod_only() {
         let temp = TempDir::new().unwrap();
         let backend = LocalTicketBackend::new(temp.path().join(".yoi/tickets"));
-        create_ticket(&backend, "Hidden Without Config", |input| {
-            input.action_required = Some("answer me".to_string());
-        });
+        create_ticket(&backend, "Hidden Without Config", |_| {});
 
         let model = build_workspace_panel(temp.path(), &live_pods(&["idle"]));
 
@@ -1068,37 +1039,22 @@ mod tests {
         create_ticket(&backend, "Ready Ticket", |input| {
             input.workflow_state = Some(TicketWorkflowState::Ready);
         });
-        create_ticket(&backend, "Needs User", |input| {
-            input.workflow_state = Some(TicketWorkflowState::Ready);
-            input.attention_required = Some("answer clarification".to_string());
-        });
+        create_ticket(&backend, "Planning Ticket", |_| {});
 
         let model = build_workspace_panel(temp.path(), &empty_pods());
         assert_eq!(
             model.composer.available_targets,
             vec![ComposerTarget::Companion, ComposerTarget::TicketIntake]
         );
-        let rows = model
+        let row = model
             .rows
             .iter()
-            .map(|row| {
-                (
-                    row.title.as_str(),
-                    row.status.as_str(),
-                    row.priority,
-                    row.next_action,
-                )
-            })
-            .collect::<Vec<_>>();
+            .find(|row| row.title == "Ready Ticket")
+            .unwrap();
 
-        assert_eq!(rows[0].0, "Needs User");
-        assert_eq!(rows[0].1, "ready");
-        assert_eq!(rows[0].2, ActionPriority::UserReply);
-        assert_eq!(rows[0].3, Some(NextUserAction::Edit));
-        assert_eq!(rows[1].0, "Ready Ticket");
-        assert_eq!(rows[1].1, "ready");
-        assert_eq!(rows[1].2, ActionPriority::ReadyForQueue);
-        assert_eq!(rows[1].3, Some(NextUserAction::Queue));
+        assert_eq!(row.status, "ready");
+        assert_eq!(row.priority, ActionPriority::ReadyForQueue);
+        assert_eq!(row.next_action, Some(NextUserAction::Queue));
     }
 
     #[test]
@@ -1196,45 +1152,6 @@ mod tests {
                 .unwrap()
                 .contains(&dependency.id)
         );
-    }
-
-    #[test]
-    fn workspace_panel_treats_yaml_null_attention_required_as_unblocked_planning() {
-        let temp = TempDir::new().unwrap();
-        write_ticket_config(temp.path());
-        let backend = LocalTicketBackend::new(temp.path().join(".yoi/tickets"));
-        let ticket_ref = backend
-            .create({
-                let mut input = NewTicket::new("Null Attention Planning");
-                input.workflow_state = Some(TicketWorkflowState::Planning);
-                input
-            })
-            .unwrap();
-        let item_path = temp
-            .path()
-            .join(".yoi/tickets")
-            .join(&ticket_ref.id)
-            .join("item.md");
-        let item = fs::read_to_string(&item_path).unwrap();
-        fs::write(
-            &item_path,
-            item.replace(
-                "state: planning\ncreated_at:",
-                "state: planning\nattention_required: null\ncreated_at:",
-            ),
-        )
-        .unwrap();
-
-        let model = build_workspace_panel(temp.path(), &empty_pods());
-        let row = model
-            .rows
-            .iter()
-            .find(|row| row.title == "Null Attention Planning")
-            .unwrap();
-
-        assert_eq!(row.status, "planning");
-        assert_eq!(row.next_action, Some(NextUserAction::Clarify));
-        assert_eq!(row.priority, ActionPriority::Background);
     }
 
     #[test]
