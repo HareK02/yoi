@@ -94,3 +94,25 @@ Validation:
 - `cargo fmt --check`, `git diff --check`, `cargo run -q -p yoi -- ticket doctor`, `cargo check --workspace`, `nix build .#yoi`.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-09T11:31:52Z -->
+
+## Implementation report
+
+Implementation routing started in parallel with the Ticket action/attention field cleanup.
+
+Worktree/branch:
+- Worktree: `.worktree/profile-feature-flags-tool-surface`
+- Branch: `profile-feature-flags-tool-surface`
+- Base/routing commit: `41133e0 ticket: route feature flags and attention cleanup`
+
+Spawned sibling Coder Pod:
+- `coder-profile-feature-flags-tool-surface`
+- Scope: non-recursive read on parent workspace root plus recursive write limited to the child worktree.
+
+Parallel-routing rationale:
+- ToolExecutionContext, TicketList, Panel, and session analytics work have landed.
+- This Ticket is mostly Profile/feature/tool-surface registration.
+- It is expected to have only small/manageable overlap with the Ticket schema field cleanup running in parallel.
+
+---
