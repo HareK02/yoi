@@ -2,7 +2,7 @@
 
 Yoi project work is tracked through Tickets. For normal use, interact with Tickets through `yoi panel`, Ticket tools, the `yoi ticket ...` CLI, and Ticket workflows. Git history plus Ticket files remain the authoritative state-transition record behind those interfaces.
 
-The current local backend stores each Ticket in the flat `.yoi/tickets/<ticket-id>/` layout. The directory name is the canonical opaque Ticket id; slugs and frontmatter `id`/`slug` fields are not current-state authority. That storage detail matters for maintainers and backend compatibility, but it is not the primary user-facing workflow.
+The current local backend stores each Ticket in the flat `.yoi/tickets/<ticket-id>/` layout. The directory name is the canonical opaque Ticket id: a fixed-width Crockford base32 Unix epoch millisecond timestamp. Slugs and frontmatter `id`/`slug` fields are not current-state authority. That storage detail matters for maintainers and backend compatibility, but it is not the primary user-facing workflow.
 
 Do not treat ad-hoc chat summaries, memory records, or Pod notifications as the final source of project state. Notifications are hints to inspect concrete state, not proof of completion.
 
@@ -68,7 +68,7 @@ The local Objective surface stores records under:
   item.md
 ```
 
-`<objective-id>` is the canonical opaque path-derived id. Do not treat Objective titles or slug words as link authority.
+`<objective-id>` is the canonical opaque path-derived id: a fixed-width Crockford base32 Unix epoch millisecond timestamp. Do not treat Objective titles or slug words as link authority.
 
 `item.md` uses YAML frontmatter plus Markdown body:
 
@@ -78,7 +78,7 @@ title: "Improve orchestration evidence"
 state: "active"        # active|paused|done|archived
 created_at: "2026-06-09T00:00:00Z"
 updated_at: "2026-06-09T00:00:00Z"
-linked_tickets: ["20260608-125430-001"]
+linked_tickets: ["00001KTKMS0VG"]
 ---
 ```
 

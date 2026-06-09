@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "relations": [
+    {
+      "ticket_id": "00001KTNMN02R",
+      "kind": "related",
+      "target": "00001KTKES290",
+      "note": "非ブロッキング関連。先行の Ticket identity/frontmatter 簡素化で timestamp/counter 型の opaque canonical ID と flat layout が導入済みで、本 Ticket はその ID 形式を Ticket / Objective 共通の fixed-width base32 epoch-milliseconds 形式へさらに統一する follow-up。",
+      "author": "intake",
+      "at": "2026-06-09T10:26:20Z"
+    }
+  ]
+}

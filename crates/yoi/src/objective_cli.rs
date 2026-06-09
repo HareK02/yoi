@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use chrono::Utc;
+use project_record::{allocate_record_id, unix_epoch_millis_now, validate_record_id};
 use serde::Deserialize;
 use ticket::config::TicketConfig;
 
@@ -198,21 +199,13 @@ fn create(
 
     let root = objective_root(workspace);
     fs::create_dir_all(&root)?;
-    let stamp = Utc::now().format("%Y%m%d-%H%M%S").to_string();
-    let mut counter = 1_u32;
-    let (id, dir) = loop {
-        let candidate = format!("{stamp}-{counter:03}");
-        let dir = root.join(&candidate);
-        if !dir.exists() {
-            break (candidate, dir);
-        }
-        counter += 1;
-        if counter > 999 {
-            return Err(ObjectiveCliError::new(format!(
-                "too many objective id collisions for timestamp {stamp}"
-            )));
-        }
-    };
+    let base_millis = unix_epoch_millis_now().map_err(|error| {
+        ObjectiveCliError::new(format!("failed to read objective id timestamp: {error}"))
+    })?;
+    let id = allocate_record_id(base_millis, |candidate| root.join(candidate).exists()).map_err(
+        |error| ObjectiveCliError::new(format!("failed to allocate unique objective id: {error}")),
+    )?;
+    let dir = root.join(&id);
 
     fs::create_dir_all(&dir)?;
     fs::write(
@@ -425,7 +418,9 @@ fn validate_record_component(value: &str) -> Result<(), ObjectiveCliError> {
         )));
     }
     match path.components().next() {
-        Some(Component::Normal(_)) => Ok(()),
+        Some(Component::Normal(_)) => validate_record_id(value).map_err(|error| {
+            ObjectiveCliError::new(format!("{value} is not a canonical record id: {error}"))
+        }),
         _ => Err(ObjectiveCliError::new(format!(
             "invalid path-derived id component: {value}"
         ))),
@@ -631,7 +626,7 @@ mod tests {
     #[test]
     fn objective_cli_creates_lists_and_shows_records() {
         let temp = TempDir::new().unwrap();
-        create_ticket_dir(&temp, "20260608-125430-001");
+        create_ticket_dir(&temp, "00001KTKMS0VG");
 
         let created = run(
             &temp,
@@ -640,10 +635,12 @@ mod tests {
                 "--title",
                 "Medium-term goal",
                 "--ticket",
-                "20260608-125430-001",
+                "00001KTKMS0VG",
             ],
         );
         let objective_id = created_id(&created);
+        validate_record_id(&objective_id).unwrap();
+        assert_eq!(objective_id.len(), project_record::RECORD_ID_WIDTH);
         assert!(
             temp.path()
                 .join(".yoi/objectives")
@@ -654,7 +651,7 @@ mod tests {
 
         let listed = run(&temp, &["list", "--state", "active"]);
         assert!(listed.stdout.contains(&objective_id));
-        assert!(listed.stdout.contains("20260608-125430-001"));
+        assert!(listed.stdout.contains("00001KTKMS0VG"));
 
         let shown = run(&temp, &["show", &objective_id]);
         assert!(shown.stdout.contains("# Medium-term goal"));
@@ -663,7 +660,7 @@ mod tests {
                 .stdout
                 .contains("## Success criteria / exit conditions")
         );
-        assert!(shown.stdout.contains("20260608-125430-001"));
+        assert!(shown.stdout.contains("00001KTKMS0VG"));
     }
 
     #[test]
@@ -674,24 +671,24 @@ mod tests {
             "--title",
             "Broken link",
             "--ticket",
-            "missing-ticket",
+            "0000000000ABC",
         ]))
         .unwrap();
         let err = run_in_workspace(cli, temp.path()).unwrap_err();
         assert!(
             err.to_string()
-                .contains("linked ticket missing-ticket does not exist")
+                .contains("linked ticket 0000000000ABC does not exist")
         );
     }
 
     #[test]
     fn objective_doctor_reports_invalid_linked_ticket() {
         let temp = TempDir::new().unwrap();
-        let dir = temp.path().join(".yoi/objectives/20260609-000000-001");
+        let dir = temp.path().join(".yoi/objectives/0000000000001");
         fs::create_dir_all(&dir).unwrap();
         fs::write(
             dir.join("item.md"),
-            "---\ntitle: \"Goal\"\nstate: \"active\"\ncreated_at: \"2026-06-09T00:00:00Z\"\nupdated_at: \"2026-06-09T00:00:00Z\"\nlinked_tickets: [\"missing\"]\n---\n\n## Goal\n\nText\n\n## Motivation / background\n\nText\n\n## Strategy / design direction\n\nText\n\n## Success criteria / exit conditions\n\n- Text\n\n## Decision context\n\n- Text\n",
+            "---\ntitle: \"Goal\"\nstate: \"active\"\ncreated_at: \"2026-06-09T00:00:00Z\"\nupdated_at: \"2026-06-09T00:00:00Z\"\nlinked_tickets: [\"0000000000ABD\"]\n---\n\n## Goal\n\nText\n\n## Motivation / background\n\nText\n\n## Strategy / design direction\n\nText\n\n## Success criteria / exit conditions\n\n- Text\n\n## Decision context\n\n- Text\n",
         )
         .unwrap();
 
@@ -700,14 +697,14 @@ mod tests {
         assert!(
             output
                 .stdout
-                .contains("linked ticket missing does not exist")
+                .contains("linked ticket 0000000000ABD does not exist")
         );
     }
 
     #[test]
     fn objective_doctor_accepts_well_formed_records() {
         let temp = TempDir::new().unwrap();
-        create_ticket_dir(&temp, "20260608-125430-001");
+        create_ticket_dir(&temp, "00001KTKMS0VG");
         run(
             &temp,
             &[
@@ -715,7 +712,7 @@ mod tests {
                 "--title",
                 "Good objective",
                 "--ticket",
-                "20260608-125430-001",
+                "00001KTKMS0VG",
             ],
         );
 

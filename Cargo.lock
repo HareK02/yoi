@@ -2443,6 +2443,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "project-record"
+version = "0.1.0"
+
+[[package]]
 name = "protocol"
 version = "0.1.0"
 dependencies = [
@@ -3639,6 +3643,7 @@ dependencies = [
  "chrono",
  "fs4",
  "llm-worker",
+ "project-record",
  "schemars",
  "serde",
  "serde_json",
@@ -4787,6 +4792,7 @@ dependencies = [
  "manifest",
  "memory",
  "pod",
+ "project-record",
  "serde",
  "serde_json",
  "serde_yaml",
