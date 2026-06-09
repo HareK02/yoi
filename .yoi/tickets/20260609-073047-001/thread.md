@@ -161,3 +161,40 @@ Runtime note:
 - The Pod was therefore launched with `builtin:default` as a runtime workaround, with explicit Coder-role instructions in the handoff. This is a session-runtime workaround only, not a project configuration change.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-09T13:12:25Z -->
+
+## Implementation report
+
+Coder implementation completed on branch `base32-record-ids`.
+
+Implementation commit:
+- `4203988d747d4e8ae4d30f63a015835566fd4900` / `feat: unify project record ids`
+
+Reported design:
+- Alphabet: `0123456789ABCDEFGHJKMNPQRSTVWXYZ`
+- Width: 13 chars, fixed-width base32 Unix epoch milliseconds.
+- Collision handling: path collision retries by `+1ms`, bounded at 1000 attempts, no suffix/counter/random tail.
+- `created_at` remains real human-readable creation time; ID timestamp may diverge on collision-adjusted allocation.
+
+Reported migration:
+- 173 Ticket dirs migrated.
+- 1 Objective dir migrated.
+- 174 total mapping entries.
+- Mapping artifact: `.yoi/tickets/00001KTNMN02R/artifacts/id-migration-map.txt`.
+
+Reported validation:
+- `cargo test -q -p project-record`
+- `cargo test -q -p ticket`
+- `cargo test -q -p yoi objective_cli`
+- `cargo fmt --check`
+- `git diff --check`
+- `git diff --cached --check`
+- `cargo run -q -p yoi -- ticket doctor`
+- `cargo run -q -p yoi -- objective doctor`
+- `cargo check --workspace`
+- `nix build .#yoi`
+
+Reviewer should verify migration/reference correctness and whether the committed mapping artifact under the migrated current Ticket is the right durable location.
+
+---
