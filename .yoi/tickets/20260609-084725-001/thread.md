@@ -159,3 +159,24 @@ Ticket を `workspace-panel` が queued にしました。
 
 
 ---
+
+<!-- event: decision author: orchestrator at: 2026-06-09T10:03:41Z -->
+
+## Decision
+
+Routing decision: waiting_capacity_parallelism
+
+This Ticket remains queued for now.
+
+Reason:
+- `20260609-093050-001` is being accepted as the active core tool execution API migration.
+- This Ticket is TUI panel/composer UX work and is implementation-ready, but it is better sequenced after the core tool API migration to keep review/validation focused and avoid broad parallel changes.
+
+State decision:
+- Leave this Ticket `queued`.
+- Do not create a worktree or spawn a coder yet.
+
+Next action:
+- Re-read this Ticket after the ToolExecutionContext API migration lands, or earlier if explicitly prioritized.
+
+---

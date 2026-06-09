@@ -78,3 +78,26 @@ Ticket を `workspace-panel` が queued にしました。
 
 
 ---
+
+<!-- event: decision author: orchestrator at: 2026-06-09T10:03:41Z -->
+
+## Decision
+
+Routing decision: waiting_for_tool_execution_context
+
+This Ticket remains queued for now.
+
+Reason:
+- `20260609-093050-001` (`Tool実行にToolExecutionContextを渡す`) changes the core tool execution API.
+- This Ticket changes `TicketList`, which is an LLM tool surface and should target the stable post-migration execution context API.
+- Running both in parallel would create avoidable conflicts across tool schema/execution code.
+
+State decision:
+- Leave this Ticket `queued`.
+- Do not create a worktree or spawn a coder yet.
+
+Next action:
+- Complete and merge `20260609-093050-001` first.
+- Re-read this Ticket and accept from queued if still unblocked.
+
+---

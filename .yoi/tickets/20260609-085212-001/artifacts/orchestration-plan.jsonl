@@ -1,0 +1,1 @@
+{"id":"orch-plan-20260609-100341-1","ticket_id":"20260609-085212-001","kind":"after","related_ticket":"20260609-093050-001","note":"Wait for the ToolExecutionContext API migration before changing TicketList output/tool behavior so the TicketList implementation targets the stable tool execution context interface.","author":"orchestrator","at":"2026-06-09T10:03:41Z"}
