@@ -56,12 +56,7 @@ fn setup() -> (TempDir, TempDir, Registry) {
     let scope = scope_with_spill(dir.path(), spill.path());
     let fs = ScopedFs::new(scope, dir.path().to_path_buf());
     let tracker = Tracker::new();
-    let reg = Registry::new(core_builtin_tools(
-        fs,
-        tracker,
-        spill.path().to_path_buf(),
-        None,
-    ));
+    let reg = Registry::new(core_builtin_tools(fs, tracker, spill.path().to_path_buf()));
     (dir, spill, reg)
 }
 
@@ -82,19 +77,7 @@ fn core_builtin_tools_registers_full_set() {
     let (_dir, _spill, reg) = setup();
     let mut names = reg.names();
     names.sort();
-    assert_eq!(
-        names,
-        vec![
-            "Bash",
-            "Edit",
-            "Glob",
-            "Grep",
-            "Read",
-            "WebFetch",
-            "WebSearch",
-            "Write"
-        ]
-    );
+    assert_eq!(names, vec!["Bash", "Edit", "Glob", "Grep", "Read", "Write"]);
 }
 
 #[test]
@@ -287,20 +270,11 @@ async fn edit_requires_read_across_tools() {
 #[tokio::test]
 async fn deterministic_tool_order_is_registration_order() {
     let (_dir, _spill, reg) = setup();
-    // Registration order from core_builtin_tools(): Read, Write, Edit, Glob, Grep, Bash, WebSearch, WebFetch
+    // Registration order from core_builtin_tools(): Read, Write, Edit, Glob, Grep, Bash
     let names: Vec<&str> = reg.entries.iter().map(|(m, _)| m.name.as_str()).collect();
     assert_eq!(
         names,
-        vec![
-            "Read",
-            "Write",
-            "Edit",
-            "Glob",
-            "Grep",
-            "Bash",
-            "WebSearch",
-            "WebFetch",
-        ]
+        vec!["Read", "Write", "Edit", "Glob", "Grep", "Bash",]
     );
 }
 
@@ -308,16 +282,7 @@ async fn deterministic_tool_order_is_registration_order() {
 #[test]
 fn tool_names_match_reference_spec() {
     let (_dir, _spill, reg) = setup();
-    for expected in [
-        "Read",
-        "Write",
-        "Edit",
-        "Glob",
-        "Grep",
-        "Bash",
-        "WebSearch",
-        "WebFetch",
-    ] {
+    for expected in ["Read", "Write", "Edit", "Glob", "Grep", "Bash"] {
         assert!(
             reg.entries.iter().any(|(m, _)| m.name == expected),
             "missing tool {expected}"
@@ -337,7 +302,6 @@ async fn tracker_recent_files_tracks_read_write_edit() {
         fs,
         tracker.clone(),
         spill.path().to_path_buf(),
-        None,
     ));
 
     let a = dir.path().join("a.txt");

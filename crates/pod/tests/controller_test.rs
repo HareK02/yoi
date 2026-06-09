@@ -215,6 +215,219 @@ async fn wait_for_status(handle: &PodHandle, status: PodStatus) {
 
 // ---------------------------------------------------------------------------
 
+fn request_tool_names(request: &Request) -> Vec<String> {
+    let mut names = request
+        .tools
+        .iter()
+        .map(|tool| tool.name.clone())
+        .collect::<Vec<_>>();
+    names.sort();
+    names
+}
+
+async fn wait_for_captured_request(client: &MockClient) -> Request {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let requests = client.captured_requests();
+        if let Some(request) = requests.into_iter().next() {
+            return request;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for captured LLM request"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn feature_flags_default_to_core_tool_surface_only() {
+    let client = MockClient::new(simple_text_events());
+    let client_for_assert = client.clone();
+    let pod = make_pod(client).await;
+    let handle = spawn_controller(pod).await;
+
+    handle.send(Method::run_text("Hello")).await.unwrap();
+    wait_for_status(&handle, PodStatus::Idle).await;
+
+    let request = wait_for_captured_request(&client_for_assert).await;
+    let names = request_tool_names(&request);
+    assert_eq!(names, vec!["Bash", "Edit", "Glob", "Grep", "Read", "Write"]);
+    assert!(!names.iter().any(|name| name == "TaskCreate"));
+    assert!(!names.iter().any(|name| name == "WebSearch"));
+    assert!(!names.iter().any(|name| name == "SpawnPod"));
+}
+
+#[tokio::test]
+async fn enabled_task_and_web_features_register_their_tools() {
+    let manifest = r#"
+[pod]
+name = "feature-test-pod"
+pwd = "./"
+
+[model]
+scheme = "anthropic"
+model_id = "test-model"
+
+[worker]
+max_tokens = 100
+
+[feature.task]
+enabled = true
+
+[feature.web]
+enabled = true
+
+[web]
+enabled = false
+
+[[scope.allow]]
+target = "./"
+permission = "write"
+"#;
+    let client = MockClient::new(simple_text_events());
+    let client_for_assert = client.clone();
+    let pod = make_pod_with_pwd_and_manifest(client, manifest).await.0;
+    let handle = spawn_controller(pod).await;
+
+    handle.send(Method::run_text("Hello")).await.unwrap();
+    wait_for_status(&handle, PodStatus::Idle).await;
+
+    let request = wait_for_captured_request(&client_for_assert).await;
+    let names = request_tool_names(&request);
+    assert!(names.iter().any(|name| name == "TaskCreate"));
+    assert!(names.iter().any(|name| name == "TaskUpdate"));
+    assert!(names.iter().any(|name| name == "WebSearch"));
+    assert!(names.iter().any(|name| name == "WebFetch"));
+    assert!(!names.iter().any(|name| name == "SpawnPod"));
+    assert!(!names.iter().any(|name| name == "MemoryRead"));
+}
+
+#[tokio::test]
+async fn project_role_tool_surfaces_keep_task_disabled_and_pods_role_scoped() {
+    struct Case {
+        role: &'static str,
+        pods_enabled: bool,
+    }
+
+    let cases = [
+        Case {
+            role: "orchestrator",
+            pods_enabled: true,
+        },
+        Case {
+            role: "coder",
+            pods_enabled: false,
+        },
+        Case {
+            role: "intake",
+            pods_enabled: false,
+        },
+        Case {
+            role: "reviewer",
+            pods_enabled: false,
+        },
+        Case {
+            role: "companion",
+            pods_enabled: false,
+        },
+    ];
+
+    for case in cases {
+        let delegation = if case.pods_enabled {
+            r#"
+[[delegation_scope.allow]]
+target = "/tmp"
+permission = "write"
+"#
+        } else {
+            ""
+        };
+        let manifest = format!(
+            r#"
+[pod]
+name = "role-surface-{role}"
+pwd = "./"
+
+[model]
+scheme = "anthropic"
+model_id = "test-model"
+
+[worker]
+max_tokens = 100
+
+[feature.task]
+enabled = false
+
+[feature.pods]
+enabled = {pods_enabled}
+
+[[scope.allow]]
+target = "./"
+permission = "write"
+{delegation}
+"#,
+            role = case.role,
+            pods_enabled = case.pods_enabled,
+            delegation = delegation,
+        );
+        let client = MockClient::new(simple_text_events());
+        let client_for_assert = client.clone();
+        let pod = make_pod_with_pwd_and_manifest(client, &manifest).await.0;
+        let handle = spawn_controller(pod).await;
+
+        handle.send(Method::run_text("Hello")).await.unwrap();
+        wait_for_status(&handle, PodStatus::Idle).await;
+
+        let request = wait_for_captured_request(&client_for_assert).await;
+        let names = request_tool_names(&request);
+        assert!(
+            !names.iter().any(|name| name == "TaskCreate"),
+            "{} role must not expose Task tools: {names:?}",
+            case.role
+        );
+        assert_eq!(
+            names.iter().any(|name| name == "SpawnPod"),
+            case.pods_enabled,
+            "{} role Pod tool exposure mismatch: {names:?}",
+            case.role
+        );
+    }
+}
+
+#[tokio::test]
+async fn pods_feature_requires_delegation_scope() {
+    let manifest = r#"
+[pod]
+name = "pod-management-feature-test"
+pwd = "./"
+
+[model]
+scheme = "anthropic"
+model_id = "test-model"
+
+[worker]
+max_tokens = 100
+
+[feature.pods]
+enabled = true
+
+[[scope.allow]]
+target = "./"
+permission = "write"
+"#;
+    let client = MockClient::new(simple_text_events());
+    let pod = make_pod_with_pwd_and_manifest(client, manifest).await.0;
+    let tmp = tempfile::tempdir().unwrap();
+    let result = PodController::spawn(pod, tmp.path()).await;
+    assert!(result.is_err());
+    let message = result.err().unwrap().to_string();
+    assert!(
+        message.contains("[feature.pods].enabled = true requires non-empty"),
+        "unexpected error: {message}"
+    );
+}
+
 #[tokio::test]
 async fn run_end_returns_to_idle_without_busy_status() {
     let client = MockClient::new(simple_text_events());

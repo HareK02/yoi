@@ -13,7 +13,9 @@ use std::rc::Rc;
 use mlua::{Lua, LuaOptions, LuaSerdeExt, RegistryKey, StdLib, Table, Value as LuaValue};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{CompactionConfigPartial, PermissionConfigPartial, SessionConfigPartial};
+use crate::config::{
+    CompactionConfigPartial, FeatureConfigPartial, PermissionConfigPartial, SessionConfigPartial,
+};
 use crate::model::{AuthRef, ModelManifest};
 use crate::{
     MemoryConfig, Permission, PodManifest, PodManifestConfig, PodMetaConfig, ResolveError,
@@ -571,6 +573,7 @@ fn resolve_lua_profile_value(
         ),
         session: profile.session,
         permissions: profile.permissions,
+        feature: profile.feature,
         compaction,
         web: profile.web,
         memory: profile.memory,
@@ -629,6 +632,8 @@ struct ProfileConfig {
     session: Option<SessionConfigPartial>,
     #[serde(default)]
     permissions: Option<PermissionConfigPartial>,
+    #[serde(default)]
+    feature: FeatureConfigPartial,
     #[serde(default)]
     compaction: Option<serde_json::Value>,
     #[serde(default)]
@@ -1458,6 +1463,57 @@ return profile {
         );
     }
     #[test]
+    fn resolves_lua_profile_feature_flags_without_runtime_state() {
+        let tmp = TempDir::new().unwrap();
+        let profile = write_profile(
+            tmp.path(),
+            "feature.lua",
+            r#"
+local profile = require("yoi.profile")
+local scope = require("yoi.scope")
+return profile {
+  slug = "feature",
+  model = { scheme = "anthropic", model_id = "claude-sonnet-4-20250514" },
+  scope = scope.workspace_read(),
+  delegation_scope = scope.workspace_write(),
+  feature = {
+    task = { enabled = true },
+    memory = { enabled = false },
+    web = { enabled = true },
+    pods = { enabled = true },
+    ticket = { enabled = true, access = "read_only" },
+    ticket_orchestration = { enabled = false },
+  },
+}
+"#,
+        );
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let resolved = ProfileResolver::new()
+            .with_workspace_base(&workspace)
+            .resolve(
+                &ProfileSelector::path(&profile),
+                ProfileResolveOptions::with_pod_name("runtime-pod"),
+            )
+            .unwrap();
+        assert_eq!(resolved.manifest.pod.name, "runtime-pod");
+        assert!(resolved.manifest.feature.task.enabled);
+        assert!(!resolved.manifest.feature.memory.enabled);
+        assert!(resolved.manifest.feature.web.enabled);
+        assert!(resolved.manifest.feature.pods.enabled);
+        assert!(resolved.manifest.feature.ticket.enabled);
+        assert_eq!(
+            resolved.manifest.feature.ticket.access,
+            crate::TicketFeatureAccessConfig::ReadOnly
+        );
+        assert!(!resolved.manifest.feature.ticket_orchestration.enabled);
+        assert_eq!(
+            resolved.manifest.delegation_scope.allow[0].target,
+            workspace
+        );
+    }
+
+    #[test]
     fn host_modules_and_local_require_work() {
         let tmp = TempDir::new().unwrap();
         std::fs::write(
@@ -1762,6 +1818,112 @@ language = "nested"
         assert!(matches!(err, ProfileError::UnsupportedProfileType { .. }));
         assert!(err.to_string().contains("Lua profiles must end in .lua"));
     }
+    #[test]
+    fn actual_project_role_profiles_resolve_explicit_feature_defaults() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().join("workspace");
+        let profiles_dir = tmp.path().join(".yoi/profiles");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&profiles_dir).unwrap();
+        for (name, content) in [
+            (
+                "_base.lua",
+                include_str!("../../../.yoi/profiles/_base.lua"),
+            ),
+            (
+                "coder.lua",
+                include_str!("../../../.yoi/profiles/coder.lua"),
+            ),
+            (
+                "intake.lua",
+                include_str!("../../../.yoi/profiles/intake.lua"),
+            ),
+            (
+                "orchestrator.lua",
+                include_str!("../../../.yoi/profiles/orchestrator.lua"),
+            ),
+            (
+                "reviewer.lua",
+                include_str!("../../../.yoi/profiles/reviewer.lua"),
+            ),
+            (
+                "companion.lua",
+                include_str!("../../../.yoi/profiles/companion.lua"),
+            ),
+        ] {
+            std::fs::write(profiles_dir.join(name), content).unwrap();
+        }
+
+        struct Expected {
+            role: &'static str,
+            ticket: bool,
+            ticket_orchestration: bool,
+            pods: bool,
+        }
+
+        for expected in [
+            Expected {
+                role: "orchestrator",
+                ticket: true,
+                ticket_orchestration: true,
+                pods: true,
+            },
+            Expected {
+                role: "coder",
+                ticket: false,
+                ticket_orchestration: false,
+                pods: false,
+            },
+            Expected {
+                role: "intake",
+                ticket: true,
+                ticket_orchestration: false,
+                pods: false,
+            },
+            Expected {
+                role: "reviewer",
+                ticket: false,
+                ticket_orchestration: false,
+                pods: false,
+            },
+            Expected {
+                role: "companion",
+                ticket: false,
+                ticket_orchestration: false,
+                pods: false,
+            },
+        ] {
+            let resolved = ProfileResolver::new()
+                .with_workspace_base(&workspace)
+                .resolve(
+                    &ProfileSelector::path(profiles_dir.join(format!("{}.lua", expected.role))),
+                    ProfileResolveOptions::with_pod_name(format!("{}-pod", expected.role)),
+                )
+                .unwrap();
+            let feature = &resolved.manifest.feature;
+            assert!(
+                !feature.task.enabled,
+                "{} profile must explicitly keep Task tools disabled",
+                expected.role
+            );
+            assert_eq!(
+                feature.ticket.enabled, expected.ticket,
+                "{} ticket feature default mismatch",
+                expected.role
+            );
+            assert_eq!(
+                feature.ticket_orchestration.enabled, expected.ticket_orchestration,
+                "{} ticket orchestration feature default mismatch",
+                expected.role
+            );
+            assert_eq!(
+                feature.pods.enabled, expected.pods,
+                "{} Pod feature default mismatch",
+                expected.role
+            );
+        }
+    }
+
     #[test]
     fn discovery_reads_user_and_project_registry_and_project_default_wins() {
         let tmp = TempDir::new().unwrap();

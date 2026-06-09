@@ -10,4 +10,5 @@ pub mod ticket;
 pub use task::{TaskFeature, task_tools_feature};
 pub use ticket::{
     TicketFeature, TicketFeatureAccess, ticket_tools_feature, ticket_tools_feature_with_access,
+    ticket_tools_feature_with_options,
 };

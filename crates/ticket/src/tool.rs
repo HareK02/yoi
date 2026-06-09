@@ -32,6 +32,31 @@ const MAX_BODY_MAX_BYTES: usize = 64 * 1024;
 const DEFAULT_DIAGNOSTIC_LIMIT: usize = 100;
 const MAX_DIAGNOSTIC_LIMIT: usize = 500;
 
+pub const TICKET_BASE_TOOL_NAMES: [&str; 9] = [
+    "TicketCreate",
+    "TicketList",
+    "TicketShow",
+    "TicketComment",
+    "TicketReview",
+    "TicketIntakeReady",
+    "TicketWorkflowState",
+    "TicketClose",
+    "TicketDoctor",
+];
+
+pub const TICKET_BASE_READ_ONLY_TOOL_NAMES: [&str; 3] =
+    ["TicketList", "TicketShow", "TicketDoctor"];
+
+pub const TICKET_ORCHESTRATION_TOOL_NAMES: [&str; 4] = [
+    "TicketRelationRecord",
+    "TicketRelationQuery",
+    "TicketOrchestrationPlanRecord",
+    "TicketOrchestrationPlanQuery",
+];
+
+pub const TICKET_ORCHESTRATION_READ_ONLY_TOOL_NAMES: [&str; 2] =
+    ["TicketRelationQuery", "TicketOrchestrationPlanQuery"];
+
 pub const TICKET_TOOL_NAMES: [&str; 13] = [
     "TicketCreate",
     "TicketList",

@@ -53,18 +53,20 @@ pub struct PodManifest {
     /// permission layer is disabled and tool calls run as before.
     #[serde(default)]
     pub permissions: Option<ToolPermissionConfig>,
+    /// Explicit built-in feature/tool-surface enablement. Omitted feature flags
+    /// resolve disabled so Profile authors choose the exposed built-in surfaces.
+    #[serde(default)]
+    pub feature: FeatureConfig,
     #[serde(default)]
     pub compaction: Option<CompactionConfig>,
-    /// Memory subsystem opt-in. Presence of `[memory]` in TOML enables
-    /// the memory tools (MemoryRead / MemoryWrite / MemoryEdit) and
-    /// causes Pod to deny generic write access to `<workspace>/memory/`
-    /// and `<workspace>/knowledge/`. Absent ⇒ legacy behaviour, no
-    /// memory tools registered.
+    /// Memory subsystem configuration. Presence of `[memory]` configures memory
+    /// storage, extraction, consolidation, and resident injection, but memory
+    /// tools are surfaced only when `[feature.memory].enabled = true`.
     #[serde(default)]
     pub memory: Option<MemoryConfig>,
-    /// First-class web tools configuration. Absent or `enabled = false` keeps
-    /// WebSearch/WebFetch registered but disabled, so no network access occurs
-    /// unless a manifest explicitly opts in.
+    /// First-class web tools configuration. Network access remains fail-closed
+    /// under this config; WebSearch/WebFetch schemas are surfaced only when
+    /// `[feature.web].enabled = true`.
     #[serde(default)]
     pub web: Option<WebConfig>,
     /// External Agent Skills (`SKILL.md`) directories to ingest as
@@ -80,6 +82,94 @@ pub struct PodManifest {
     /// validated snapshot over current profile files or one-file Manifest input.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<profile::ProfileManifestSnapshot>,
+}
+
+/// Explicit built-in feature/tool-surface enablement. These flags are
+/// profile/config data only: they do not carry runtime Pod names, sockets,
+/// sessions, secrets, or resolved host state. Tool registration still applies
+/// the normal scope, host-authority, backend, memory, and network checks.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FeatureConfig {
+    #[serde(default)]
+    pub task: FeatureFlagConfig,
+    #[serde(default)]
+    pub memory: FeatureFlagConfig,
+    #[serde(default)]
+    pub web: FeatureFlagConfig,
+    #[serde(default)]
+    pub pods: FeatureFlagConfig,
+    #[serde(default)]
+    pub ticket: TicketFeatureConfig,
+    #[serde(default)]
+    pub ticket_orchestration: FeatureFlagConfig,
+}
+
+impl Default for FeatureConfig {
+    fn default() -> Self {
+        Self {
+            task: FeatureFlagConfig::disabled(),
+            memory: FeatureFlagConfig::disabled(),
+            web: FeatureFlagConfig::disabled(),
+            pods: FeatureFlagConfig::disabled(),
+            ticket: TicketFeatureConfig::default(),
+            ticket_orchestration: FeatureFlagConfig::disabled(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FeatureFlagConfig {
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+impl FeatureFlagConfig {
+    pub const fn disabled() -> Self {
+        Self { enabled: false }
+    }
+
+    pub const fn enabled() -> Self {
+        Self { enabled: true }
+    }
+}
+
+impl Default for FeatureFlagConfig {
+    fn default() -> Self {
+        Self::disabled()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TicketFeatureConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Which non-orchestration Ticket surface to expose when `enabled = true`.
+    /// Orchestration-plan/relation tools are controlled independently by
+    /// `[feature.ticket_orchestration].enabled`.
+    #[serde(default)]
+    pub access: TicketFeatureAccessConfig,
+}
+
+impl Default for TicketFeatureConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            access: TicketFeatureAccessConfig::Lifecycle,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TicketFeatureAccessConfig {
+    ReadOnly,
+    Lifecycle,
+}
+
+impl Default for TicketFeatureAccessConfig {
+    fn default() -> Self {
+        Self::Lifecycle
+    }
 }
 
 /// External Agent Skills (`SKILL.md`) ingest configuration. Skills are

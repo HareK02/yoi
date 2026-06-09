@@ -26,6 +26,15 @@ return profile {
         worker_context_max_tokens = 100000,
     },
 
+    feature = {
+        task = { enabled = true },
+        memory = { enabled = true },
+        web = { enabled = true },
+        pods = { enabled = false },
+        ticket = { enabled = false, access = "lifecycle" },
+        ticket_orchestration = { enabled = false },
+    },
+
     memory = {
         extract_threshold = 50000,
         consolidation_threshold_files = 5,

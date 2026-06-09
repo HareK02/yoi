@@ -43,12 +43,7 @@ fn setup() -> (TempDir, TempDir, Registry) {
     let scope = Scope::from_config(&config).unwrap();
     let fs = ScopedFs::new(scope, dir.path().to_path_buf());
     let tracker = Tracker::new();
-    let reg = Registry::new(core_builtin_tools(
-        fs,
-        tracker,
-        spill.path().to_path_buf(),
-        None,
-    ));
+    let reg = Registry::new(core_builtin_tools(fs, tracker, spill.path().to_path_buf()));
     (dir, spill, reg)
 }
 
