@@ -2860,12 +2860,35 @@ fn draw_separator(frame: &mut Frame<'_>, area: Rect) {
 }
 
 fn draw_target_status(frame: &mut Frame<'_>, app: &MultiPodApp, area: Rect) {
+    frame.render_widget(Paragraph::new(target_status_line(app)), area);
+}
+
+fn target_status_line(app: &MultiPodApp) -> Line<'static> {
+    if !app.composer_is_blank() {
+        return Line::from(vec![
+            Span::styled("focus ", Style::default().fg(Color::DarkGray)),
+            Span::styled("global composer", Style::default().fg(Color::Cyan)),
+            Span::styled(" · composer ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                app.composer_target().label(),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" · Enter ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                composer_enter_status_text(app),
+                Style::default().fg(Color::Green),
+            ),
+        ]);
+    }
+
     let focus_label = match app.effective_focus() {
         PanelFocus::GlobalComposer => "global composer",
         PanelFocus::Row => "selected row",
         PanelFocus::ItemAction => "item action",
     };
-    let target = if let Some(row) = app
+    if let Some(row) = app
         .selected_panel_row()
         .filter(|row| row.is_ticket_action())
     {
@@ -2911,8 +2934,7 @@ fn draw_target_status(frame: &mut Frame<'_>, app: &MultiPodApp, area: Rect) {
             ),
             Span::styled(" · no selection", Style::default().fg(Color::DarkGray)),
         ])
-    };
-    frame.render_widget(Paragraph::new(target), area);
+    }
 }
 
 fn draw_input(frame: &mut Frame<'_>, render: &crate::input::InputRender, area: Rect) {
@@ -2933,8 +2955,97 @@ fn draw_input(frame: &mut Frame<'_>, render: &crate::input::InputRender, area: R
     }
 }
 
-fn draw_actionbar(frame: &mut Frame<'_>, app: &MultiPodApp, area: Rect) {
-    let left = if app.sending && app.composer_target() == ComposerTarget::TicketIntake {
+fn composer_enter_status_text(app: &MultiPodApp) -> String {
+    match app.composer_target() {
+        ComposerTarget::Companion => companion_enter_status_text(app),
+        ComposerTarget::TicketIntake => "launch Intake with composer text".to_string(),
+    }
+}
+
+fn composer_enter_actionbar_text(app: &MultiPodApp) -> String {
+    match app.composer_target() {
+        ComposerTarget::Companion => companion_enter_actionbar_text(app),
+        ComposerTarget::TicketIntake => {
+            "Ticket Intake target: Enter launches Intake with composer text".to_string()
+        }
+    }
+}
+
+fn companion_enter_status_text(app: &MultiPodApp) -> String {
+    match companion_send_availability(app) {
+        CompanionSendAvailability::Ready => "send composer text to workspace Companion".to_string(),
+        CompanionSendAvailability::Unavailable(reason) => format!("keep draft; {reason}"),
+    }
+}
+
+fn companion_enter_actionbar_text(app: &MultiPodApp) -> String {
+    match companion_send_availability(app) {
+        CompanionSendAvailability::Ready => {
+            "Companion target: Enter sends composer text to workspace Companion".to_string()
+        }
+        CompanionSendAvailability::Unavailable(reason) => {
+            format!("Companion target: Enter keeps draft; {reason}")
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CompanionSendAvailability {
+    Ready,
+    Unavailable(String),
+}
+
+fn companion_send_availability(app: &MultiPodApp) -> CompanionSendAvailability {
+    let Some(companion) = app.panel.header.companion.as_ref() else {
+        return CompanionSendAvailability::Unavailable(
+            "workspace Companion is unavailable".to_string(),
+        );
+    };
+    if matches!(
+        companion.status,
+        CompanionPanelStatus::Unavailable
+            | CompanionPanelStatus::Missing
+            | CompanionPanelStatus::Stopped
+    ) {
+        return CompanionSendAvailability::Unavailable(format!(
+            "workspace Companion is {}",
+            companion.status.label()
+        ));
+    }
+    let Some(entry) = app
+        .list
+        .entries
+        .iter()
+        .find(|entry| entry.name == companion.pod_name)
+    else {
+        return CompanionSendAvailability::Unavailable(format!(
+            "workspace Companion `{}` is not in the Pod list",
+            companion.pod_name
+        ));
+    };
+    let Some(live) = entry.live.as_ref() else {
+        return CompanionSendAvailability::Unavailable(format!(
+            "workspace Companion `{}` is stopped",
+            companion.pod_name
+        ));
+    };
+    if !live.reachable {
+        return CompanionSendAvailability::Unavailable(format!(
+            "workspace Companion `{}` is unreachable",
+            companion.pod_name
+        ));
+    }
+    if live.status == Some(PodStatus::Running) {
+        return CompanionSendAvailability::Unavailable(format!(
+            "workspace Companion `{}` is running",
+            companion.pod_name
+        ));
+    }
+    CompanionSendAvailability::Ready
+}
+
+fn actionbar_left_text(app: &MultiPodApp) -> String {
+    if app.sending && app.composer_target() == ComposerTarget::TicketIntake {
         "launching Ticket Intake…".to_string()
     } else if app.sending {
         "working…".to_string()
@@ -2946,6 +3057,8 @@ fn draw_actionbar(frame: &mut Frame<'_>, app: &MultiPodApp, area: Rect) {
             Some(notice) => format!("{notice} Refreshing workspace…"),
             None => "Refreshing workspace…".to_string(),
         }
+    } else if !app.composer_is_blank() {
+        composer_enter_actionbar_text(app)
     } else if let Some(notice) = app.notice.as_deref() {
         notice.to_string()
     } else if let Some(reason) = app.selected_open_disabled_reason() {
@@ -2960,8 +3073,21 @@ fn draw_actionbar(frame: &mut Frame<'_>, app: &MultiPodApp, area: Rect) {
                 "Ticket Intake target: Enter launches Intake with composer text".to_string()
             }
         }
-    };
-    let right = if app
+    }
+}
+
+fn actionbar_right_text(app: &MultiPodApp) -> &'static str {
+    if !app.composer_is_blank() {
+        if app
+            .panel
+            .composer
+            .is_available(ComposerTarget::TicketIntake)
+        {
+            "↑/↓ row  Enter composer target  Tab target  Esc composer  Ctrl+C quit"
+        } else {
+            "↑/↓ row  Enter composer target  Esc composer  Ctrl+C quit"
+        }
+    } else if app
         .panel
         .composer
         .is_available(ComposerTarget::TicketIntake)
@@ -2969,7 +3095,12 @@ fn draw_actionbar(frame: &mut Frame<'_>, app: &MultiPodApp, area: Rect) {
         "↑/↓ row  Enter row action/open  Right action focus  Tab target  Esc composer  Ctrl+C quit"
     } else {
         "↑/↓ row  Enter row action/open  Right action focus  Esc composer  Ctrl+C quit"
-    };
+    }
+}
+
+fn draw_actionbar(frame: &mut Frame<'_>, app: &MultiPodApp, area: Rect) {
+    let left = actionbar_left_text(app);
+    let right = actionbar_right_text(app);
     let left_width = area
         .width
         .saturating_sub(right.width() as u16)
@@ -3269,8 +3400,9 @@ mod tests {
 
         let message = orchestrator_queue_notification_message(ticket);
 
-        assert!(message.contains("Ticket `route-ticket` (`20260606-000000-route-ticket`)"));
-        assert!(message.contains("title `Route queued Ticket`"));
+        assert!(
+            message.contains("Ticket `20260606-000000-route-ticket`, title `Route queued Ticket`")
+        );
         assert!(message.contains("human authorized Orchestrator routing"));
         assert!(message.contains("not an unattended scheduler"));
         assert!(message.contains("Read the Ticket"));
@@ -3291,7 +3423,7 @@ mod tests {
         assert!(message.contains("merge-ready dossier"));
         assert!(message.contains("without merge/close/final approval"));
         assert!(message.contains("If blocked, record a concise reason"));
-        assert!(message.contains("leave the Ticket queued or explicitly defer"));
+        assert!(message.contains("leave the Ticket queued or return it to planning"));
         assert!(!message.contains("Do not start implementation directly"));
     }
 
@@ -3403,6 +3535,49 @@ mod tests {
                 .unwrap()
                 .contains("Workspace Companion is unavailable")
         );
+    }
+
+    #[test]
+    fn selected_ticket_row_with_non_empty_composer_shows_composer_enter_behavior() {
+        let mut panel = WorkspacePanelViewModel::empty(Path::new("test"));
+        panel.header.companion = Some(CompanionPanelState::new(
+            "yoi",
+            CompanionPanelStatus::Live,
+            None,
+        ));
+        panel.rows.push(panel_test_ticket_row(
+            "queue-me",
+            "Queue Me",
+            ActionPriority::ReadyForQueue,
+            NextUserAction::Queue,
+            "ready",
+        ));
+        let list = PodList::from_sources(
+            PodVisibilitySource::ResumePicker,
+            vec![],
+            vec![live_info("yoi", PodStatus::Idle)],
+            None,
+            10,
+        );
+        let mut app = app_with_panel(list, panel);
+        app.input.insert_str("draft to companion");
+
+        assert_eq!(
+            app.selected_ticket_action(),
+            Some(NextUserAction::Queue),
+            "selected row remains a Ticket action row"
+        );
+        let actionbar_left = actionbar_left_text(&app);
+        let actionbar_right = actionbar_right_text(&app);
+        let target_status = plain_line(&target_status_line(&app));
+
+        assert!(actionbar_left.contains("Companion target: Enter sends composer text"));
+        assert!(actionbar_right.contains("Enter composer target"));
+        assert!(!actionbar_left.contains("Queue"));
+        assert!(!actionbar_right.contains("row action/open"));
+        assert!(target_status.contains("focus global composer"));
+        assert!(target_status.contains("Enter send composer text to workspace Companion"));
+        assert!(!target_status.contains("action Queue"));
     }
 
     #[test]
@@ -3737,11 +3912,16 @@ mod tests {
         assert!(!review_line.starts_with("▶ Workspace panel composer targets"));
         assert_eq!(display_column(&review_line, "inprogress"), state_start);
         assert_eq!(display_column(&ready_line, "ready"), state_start);
+        let review_id = review_row.ticket.as_ref().unwrap().id.as_str();
+        let ready_id = ready_row.ticket.as_ref().unwrap().id.as_str();
         assert_eq!(
-            display_column(&review_line, "workspace-panel-composer-targets"),
+            display_column(
+                &review_line,
+                &truncate_with_ellipsis(review_id, TICKET_ID_COLUMN_WIDTH)
+            ),
             id_start
         );
-        assert_eq!(display_column(&ready_line, "ticket-id"), id_start);
+        assert_eq!(display_column(&ready_line, ready_id), id_start);
         assert_eq!(
             display_column(&review_line, "Workspace panel composer targets"),
             title_start
@@ -3766,8 +3946,9 @@ mod tests {
         let title_start = 2 + TICKET_STATE_COLUMN_WIDTH + 1 + TICKET_ID_COLUMN_WIDTH + 1;
 
         assert_eq!(line.width(), 112);
+        let row_id = row.ticket.as_ref().unwrap().id.as_str();
         assert_eq!(
-            display_column(&line, "ticket-id"),
+            display_column(&line, row_id),
             title_start - TICKET_ID_COLUMN_WIDTH - 1
         );
         assert_eq!(display_column(&line, "Very long Ticket"), title_start);
