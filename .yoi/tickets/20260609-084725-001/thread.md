@@ -150,3 +150,12 @@ Reviewer focus:
 - Verify that `Ctrl+C` exits reliably from the redesigned Panel states.
 
 ---
+
+<!-- event: state_changed author: workspace-panel at: 2026-06-09T10:01:08Z from: ready to: queued reason: queued field: state -->
+
+## State changed
+
+Ticket を `workspace-panel` が queued にしました。
+
+
+---

@@ -1,13 +1,13 @@
 ---
 title: 'Improve workspace panel display and composer key handling'
-state: 'ready'
+state: 'queued'
 created_at: '2026-06-09T08:47:25Z'
-updated_at: '2026-06-09T09:50:15Z'
+updated_at: '2026-06-09T10:01:08Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['tui-input', 'ux-consistency']
-action_required: 'User has confirmed Tab replaces Ctrl+T for Panel target switching, with composer completion taking priority if present.'
-attention_required: 'Keep Panel composer editing behavior shared with the normal chat composer rather than adding divergent ad-hoc key handling.'
+queued_by: 'workspace-panel'
+queued_at: '2026-06-09T10:01:08Z'
 ---
 
 ## Background

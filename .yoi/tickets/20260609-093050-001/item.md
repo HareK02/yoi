@@ -1,9 +1,11 @@
 ---
 title: 'Tool実行にToolExecutionContextを渡す'
-state: 'planning'
+state: 'queued'
 created_at: '2026-06-09T09:30:50Z'
-updated_at: '2026-06-09T09:30:50Z'
+updated_at: '2026-06-09T10:01:00Z'
 assignee: null
+queued_by: 'workspace-panel'
+queued_at: '2026-06-09T10:01:00Z'
 ---
 
 ## 背景

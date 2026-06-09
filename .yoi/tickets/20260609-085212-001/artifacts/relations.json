@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "relations": [
+    {
+      "ticket_id": "20260609-085212-001",
+      "kind": "related",
+      "target": "20260609-073047-001",
+      "note": "非ブロッキング関連。ID 形式変更は TicketList の ID 表示長や tests に影響し得るが、本 Ticket は canonical id を不透明文字列として扱うため先後関係は不要。",
+      "author": "intake",
+      "at": "2026-06-09T09:55:43Z"
+    }
+  ]
+}
