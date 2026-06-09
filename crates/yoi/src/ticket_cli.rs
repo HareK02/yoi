@@ -8,9 +8,9 @@ use ticket::config::{
     ticket_config_scaffold,
 };
 use ticket::{
-    LocalTicketBackend, MarkdownText, NewTicket, NewTicketEvent, TicketBackend,
+    LocalTicketBackend, MarkdownText, NewTicket, NewTicketEvent, NewTicketRelation, TicketBackend,
     TicketDoctorSeverity, TicketEventKind, TicketFilter, TicketIdOrSlug, TicketIntakeSummary,
-    TicketReview, TicketReviewResult, TicketWorkflowState,
+    TicketRelationKind, TicketReview, TicketReviewResult, TicketWorkflowState,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,6 +29,7 @@ pub enum TicketCommand {
     Review(ReviewOptions),
     State(StateOptions),
     Close(CloseOptions),
+    Relation(RelationOptions),
     Doctor,
 }
 
@@ -87,6 +88,25 @@ pub struct StateOptions {
 pub struct CloseOptions {
     pub query: String,
     pub resolution: BodySource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RelationAction {
+    Add {
+        ticket: String,
+        kind: TicketRelationKind,
+        target: String,
+        note: Option<String>,
+    },
+    List {
+        ticket: Option<String>,
+        kind: Option<TicketRelationKind>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelationOptions {
+    pub action: RelationAction,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -163,6 +183,7 @@ pub fn parse_ticket_args(args: &[String]) -> Result<TicketCli, TicketCliError> {
         "review" => TicketCommand::Review(parse_review(&args[1..])?),
         "state" => TicketCommand::State(parse_state(&args[1..])?),
         "close" => TicketCommand::Close(parse_close(&args[1..])?),
+        "relation" => TicketCommand::Relation(parse_relation(&args[1..])?),
         "doctor" => {
             if args.len() != 1 {
                 return Err(TicketCliError::new("ticket doctor takes no arguments"));
@@ -216,6 +237,7 @@ fn run_command(
                 TicketCommand::Review(options) => review(&backend, options),
                 TicketCommand::State(options) => state(&backend, options),
                 TicketCommand::Close(options) => close(&backend, options),
+                TicketCommand::Relation(options) => relation(&backend, options),
                 TicketCommand::Doctor => doctor(&backend),
                 TicketCommand::Init => unreachable!("init handled before backend setup"),
             }
@@ -362,6 +384,56 @@ fn show(backend: &LocalTicketBackend, query: String) -> Result<TicketCliOutput, 
         }
     }
 
+    if !ticket.relations.outgoing.is_empty()
+        || !ticket.relations.incoming.is_empty()
+        || !ticket.relations.blockers.is_empty()
+        || !ticket.relations.notices.is_empty()
+    {
+        stdout.push_str("\n## relations\n\n");
+        if !ticket.relations.outgoing.is_empty() {
+            stdout.push_str("### outgoing\n\n");
+            for relation in &ticket.relations.outgoing {
+                stdout.push_str(&format!("- {} {}", relation.kind.as_str(), relation.target));
+                if let Some(note) = &relation.note {
+                    stdout.push_str(&format!(" — {}", note.replace('\n', " ")));
+                }
+                stdout.push('\n');
+            }
+        }
+        if !ticket.relations.incoming.is_empty() {
+            stdout.push_str("### incoming / derived inverse\n\n");
+            for relation in &ticket.relations.incoming {
+                stdout.push_str(&format!(
+                    "- {} {} (forward: {})",
+                    relation.inverse_kind,
+                    relation.source_ticket,
+                    relation.forward_kind.as_str()
+                ));
+                if let Some(note) = &relation.note {
+                    stdout.push_str(&format!(" — {}", note.replace('\n', " ")));
+                }
+                stdout.push('\n');
+            }
+        }
+        if !ticket.relations.blockers.is_empty() {
+            stdout.push_str("### unresolved queue blockers\n\n");
+            for blocker in &ticket.relations.blockers {
+                stdout.push_str(&format!(
+                    "- {} via {} (state: {})\n",
+                    blocker.blocking_ticket,
+                    blocker.reason_kind,
+                    blocker.blocking_state.as_str()
+                ));
+            }
+        }
+        if !ticket.relations.notices.is_empty() {
+            stdout.push_str("### notices\n\n");
+            for notice in &ticket.relations.notices {
+                stdout.push_str(&format!("- {}\n", notice.message));
+            }
+        }
+    }
+
     if !ticket.artifacts.is_empty() {
         stdout.push_str("\n## artifacts\n\n");
         for artifact in &ticket.artifacts {
@@ -476,6 +548,53 @@ fn close(
     Ok(success(format!("closed\t{}\n", options.query)))
 }
 
+fn relation(
+    backend: &LocalTicketBackend,
+    options: RelationOptions,
+) -> Result<TicketCliOutput, TicketCliError> {
+    match options.action {
+        RelationAction::Add {
+            ticket,
+            kind,
+            target,
+            note,
+        } => {
+            let created = backend.add_ticket_relation(
+                TicketIdOrSlug::Query(ticket.clone()),
+                NewTicketRelation {
+                    kind,
+                    target: target.clone(),
+                    note,
+                    author: Some("yoi ticket".to_string()),
+                },
+            )?;
+            Ok(success(format!(
+                "relation\t{}\t{}\t{}\n",
+                created.ticket_id,
+                created.kind.as_str(),
+                created.target
+            )))
+        }
+        RelationAction::List { ticket, kind } => {
+            let ticket = ticket.map(TicketIdOrSlug::Query);
+            let relations = backend.query_ticket_relations(ticket, kind)?;
+            let mut stdout = String::from("ticket\tkind\ttarget\tauthor\tat\tnote\n");
+            for relation in relations {
+                stdout.push_str(&format!(
+                    "{}\t{}\t{}\t{}\t{}\t{}\n",
+                    relation.ticket_id,
+                    relation.kind.as_str(),
+                    relation.target,
+                    relation.author,
+                    relation.at,
+                    relation.note.unwrap_or_default().replace('\n', " ")
+                ));
+            }
+            Ok(success(stdout))
+        }
+    }
+}
+
 fn doctor(backend: &LocalTicketBackend) -> Result<TicketCliOutput, TicketCliError> {
     let report = backend.doctor()?;
     let mut stdout = String::new();
@@ -555,6 +674,93 @@ fn parse_list(args: &[String]) -> Result<ListOptions, TicketCliError> {
         }
     }
     Ok(ListOptions { state })
+}
+
+fn parse_relation(args: &[String]) -> Result<RelationOptions, TicketCliError> {
+    if args.is_empty() {
+        return Err(TicketCliError::new(
+            "ticket relation requires `add` or `list`",
+        ));
+    }
+    match args[0].as_str() {
+        "add" => parse_relation_add(&args[1..]),
+        "list" => parse_relation_list(&args[1..]),
+        other => Err(TicketCliError::new(format!(
+            "unknown ticket relation action: {other}"
+        ))),
+    }
+}
+
+fn parse_relation_add(args: &[String]) -> Result<RelationOptions, TicketCliError> {
+    let mut ticket = None;
+    let mut kind = None;
+    let mut target = None;
+    let mut note = None;
+    let mut i = 0;
+    while i < args.len() {
+        match option_with_value(args, &mut i)? {
+            Some(("--ticket", value)) => ticket = Some(value),
+            Some(("--kind", value)) => kind = Some(parse_relation_kind(&value)?),
+            Some(("--target", value)) => target = Some(value),
+            Some(("--note", value)) => note = Some(value),
+            Some((name, _)) => {
+                return Err(TicketCliError::new(format!(
+                    "unknown relation add argument: {name}"
+                )));
+            }
+            None => {
+                return Err(TicketCliError::new(format!(
+                    "unknown relation add argument: {}",
+                    args[i]
+                )));
+            }
+        }
+    }
+    let ticket = ticket.ok_or_else(|| TicketCliError::new("relation add requires --ticket"))?;
+    let kind = kind.ok_or_else(|| TicketCliError::new("relation add requires --kind"))?;
+    let target = target.ok_or_else(|| TicketCliError::new("relation add requires --target"))?;
+    Ok(RelationOptions {
+        action: RelationAction::Add {
+            ticket,
+            kind,
+            target,
+            note,
+        },
+    })
+}
+
+fn parse_relation_list(args: &[String]) -> Result<RelationOptions, TicketCliError> {
+    let mut ticket = None;
+    let mut kind = None;
+    let mut i = 0;
+    while i < args.len() {
+        match option_with_value(args, &mut i)? {
+            Some(("--ticket", value)) => ticket = Some(value),
+            Some(("--kind", value)) => kind = Some(parse_relation_kind(&value)?),
+            Some((name, _)) => {
+                return Err(TicketCliError::new(format!(
+                    "unknown relation list argument: {name}"
+                )));
+            }
+            None => {
+                return Err(TicketCliError::new(format!(
+                    "unknown relation list argument: {}",
+                    args[i]
+                )));
+            }
+        }
+    }
+    Ok(RelationOptions {
+        action: RelationAction::List { ticket, kind },
+    })
+}
+
+fn parse_relation_kind(value: &str) -> Result<TicketRelationKind, TicketCliError> {
+    TicketRelationKind::parse(value).ok_or_else(|| {
+        TicketCliError::new(format!(
+            "unknown relation kind `{value}`; expected depends_on, blocks, related, supersedes, or duplicate_of"
+        ))
+    })
 }
 
 fn parse_comment(args: &[String]) -> Result<CommentOptions, TicketCliError> {
@@ -712,6 +918,10 @@ fn option_with_value(
         "--file",
         "--message",
         "--resolution",
+        "--ticket",
+        "--kind",
+        "--target",
+        "--note",
     ] {
         if arg == name {
             let value = args
@@ -811,7 +1021,7 @@ fn default_author() -> String {
 }
 
 fn help_text() -> &'static str {
-    "yoi ticket\n\nUsage:\n  yoi ticket init\n  yoi ticket create --title <title>\n  yoi ticket list [--state planning|ready|queued|inprogress|done|closed|all]\n  yoi ticket show <id>\n  yoi ticket comment <id> [--role comment|plan|decision|implementation_report] (--file <path>|--message <text>)\n  yoi ticket review <id> (--approve|--request-changes) (--file <path>|--message <text>)\n  yoi ticket state <id> <planning|ready|queued|inprogress|done|closed>\n  yoi ticket close <id> (--resolution <text>|--file <path>)\n  yoi ticket doctor\n\nOptions:\n  -h, --help    Print help\n\nBackend:\n  `yoi ticket init` writes .yoi/ticket.config.toml with explicit fixed role profiles and an optional commented [ticket].language setting.\n  Uses the workspace Ticket config at .yoi/ticket.config.toml when present.\n  Supported provider: builtin:yoi_local.\n  Without config, the local backend root is <cwd>/.yoi/tickets.\n"
+    "yoi ticket\n\nUsage:\n  yoi ticket init\n  yoi ticket create --title <title>\n  yoi ticket list [--state planning|ready|queued|inprogress|done|closed|all]\n  yoi ticket show <id>\n  yoi ticket comment <id> [--role comment|plan|decision|implementation_report] (--file <path>|--message <text>)\n  yoi ticket review <id> (--approve|--request-changes) (--file <path>|--message <text>)\n  yoi ticket state <id> <planning|ready|queued|inprogress|done|closed>\n  yoi ticket close <id> (--resolution <text>|--file <path>)\n  yoi ticket relation add --ticket <id> --kind <depends_on|blocks|related|supersedes|duplicate_of> --target <id> [--note <text>]\n  yoi ticket relation list [--ticket <id>] [--kind <kind>]\n  yoi ticket doctor\n\nOptions:\n  -h, --help    Print help\n\nBackend:\n  `yoi ticket init` writes .yoi/ticket.config.toml with explicit fixed role profiles and an optional commented [ticket].language setting.\n  Uses the workspace Ticket config at .yoi/ticket.config.toml when present.\n  Supported provider: builtin:yoi_local.\n  Without config, the local backend root is <cwd>/.yoi/tickets.\n"
 }
 
 #[cfg(test)]
@@ -1008,6 +1218,58 @@ mod tests {
                 .events
                 .iter()
                 .any(|event| event.kind == TicketEventKind::Review)
+        );
+    }
+
+    #[test]
+    fn ticket_cli_records_lists_and_shows_relations() {
+        let temp = TempDir::new().unwrap();
+        let source = created_id(&run(&temp, &["create", "--title", "Relation Source"]));
+        let target = created_id(&run(&temp, &["create", "--title", "Relation Target"]));
+
+        let added = run(
+            &temp,
+            &[
+                "relation",
+                "add",
+                "--ticket",
+                &source,
+                "--kind",
+                "depends_on",
+                "--target",
+                &target,
+                "--note",
+                "target first",
+            ],
+        );
+        assert_eq!(
+            added.stdout,
+            format!("relation\t{source}\tdepends_on\t{target}\n")
+        );
+
+        let listed = run(&temp, &["relation", "list", "--ticket", &target]);
+        assert!(listed.stdout.contains("ticket\tkind\ttarget"));
+        assert!(
+            listed
+                .stdout
+                .contains(&format!("{source}\tdepends_on\t{target}"))
+        );
+
+        let shown_source = run(&temp, &["show", &source]);
+        assert!(shown_source.stdout.contains("## relations"));
+        assert!(
+            shown_source
+                .stdout
+                .contains(&format!("- depends_on {target}"))
+        );
+        assert!(shown_source.stdout.contains("unresolved queue blockers"));
+
+        let shown_target = run(&temp, &["show", &target]);
+        assert!(shown_target.stdout.contains("incoming / derived inverse"));
+        assert!(
+            shown_target
+                .stdout
+                .contains(&format!("dependency_of {source}"))
         );
     }
 

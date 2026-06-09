@@ -14,6 +14,7 @@ Do not treat ad-hoc chat summaries, memory records, or Pod notifications as the 
 - `Assignment`: a concrete delegation from an Orchestrator to a coder/reviewer Pod or task-specific helper Pod.
 - `IntentPacket`: the short implementation/review contract derived from a Ticket and handed to an Assignment.
 - `LocalTicketBackend`: the current `.yoi/tickets/` markdown/thread/artifacts storage backend.
+- `Ticket relation`: durable project-level Ticket-to-Ticket metadata stored as forward canonical-id relations (`depends_on`, `blocks`, `related`, `supersedes`, `duplicate_of`). Inverse views such as `blocked_by` are derived, not stored.
 
 A Ticket may represent a feature, bug, cleanup, design decision, investigation, workflow change, release task, or orchestration task. The common requirement is that the Ticket is a concrete work item that can be implemented, reviewed, validated, and closed on its own terms.
 
@@ -38,9 +39,13 @@ Pods with the Ticket built-in feature can use typed Ticket tools:
 - `TicketReview`
 - `TicketWorkflowState`
 - `TicketClose`
+- `TicketRelationRecord`
+- `TicketRelationQuery`
 - `TicketDoctor`
 
 These tools operate through the typed Ticket backend. They are not arbitrary filesystem write permission to `.yoi/tickets/`.
+
+Relation tools are for non-hierarchical project metadata only. Use canonical opaque Ticket ids, store forward relations only, and keep runtime execution planning (capacity, ordering decisions, do-not-parallelize notes, Pod/session/worktree ownership) in OrchestrationPlan or session-local records instead of relation metadata. Unresolved `depends_on` and incoming unresolved `blocks` are queue/acceptance blockers; `related` is not blocking, and `supersedes` / `duplicate_of` are diagnostics rather than automatic lifecycle transitions.
 
 Use them when a Pod needs to materialize or update project records:
 
