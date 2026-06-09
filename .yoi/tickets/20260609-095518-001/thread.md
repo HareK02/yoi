@@ -21,3 +21,35 @@ LocalTicketBackend によって作成されました。
 Intake classified this Ticket as ready to queue: the purpose, schema/tool/panel/doc scope, non-goals, acceptance criteria, validation expectations, and migration/compatibility boundary are explicit enough for Orchestrator routing.
 
 ---
+
+<!-- event: state_changed author: workspace-panel at: 2026-06-09T10:11:38Z from: ready to: queued reason: queued field: state -->
+
+## State changed
+
+Ticket を `workspace-panel` が queued にしました。
+
+
+---
+
+<!-- event: decision author: orchestrator at: 2026-06-09T10:12:07Z -->
+
+## Decision
+
+Routing decision: waiting_for_active_tool_api_migration
+
+This Ticket is queued and appears implementation-ready, but I am intentionally not accepting it to `inprogress` yet.
+
+Reason:
+- `20260609-093050-001` (`Tool実行にToolExecutionContextを渡す`) is already active, with Coder Pod `coder-tool-execution-context` running in `.worktree/tool-execution-context`.
+- This Ticket touches Ticket schema, Ticket tool API output/input, and Panel action behavior.
+- Running it in parallel with a core Tool execution API migration would create avoidable conflict across tool/Ticket surfaces and make review less reliable.
+
+State decision:
+- Leave this Ticket `queued`.
+- Do not create a worktree or spawn a coder yet.
+
+Next action:
+- Complete and merge `20260609-093050-001` first.
+- Re-read this Ticket after that lands, then accept from queued if still unblocked.
+
+---
