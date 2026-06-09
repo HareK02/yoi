@@ -57,3 +57,12 @@ Validation:
 Intake refinement completed. Ticket has enough intent, acceptance criteria, binding invariants, implementation latitude, escalation conditions, and validation guidance for Orchestrator routing.
 
 ---
+
+<!-- event: state_changed author: workspace-panel at: 2026-06-09T00:04:21Z from: ready to: queued reason: queued field: workflow_state -->
+
+## State changed
+
+Ticket を `workspace-panel` が queued にしました。
+
+
+---
