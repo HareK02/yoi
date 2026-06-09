@@ -93,3 +93,22 @@ State decision:
 - Re-read when active worktrees are merged/closed or the workspace is otherwise quiescent enough for a record migration.
 
 ---
+
+<!-- event: decision author: orchestrator at: 2026-06-09T11:30:25Z -->
+
+## Decision
+
+Routing decision update: still_waiting_record_migration_window
+
+This Ticket remains queued for now despite the increased parallelism preference.
+
+Reason:
+- This is a broad Ticket/Objective ID migration that will touch project record paths and many references.
+- I am starting two smaller independent workstreams now (`20260609-082209-001` and `20260609-095518-001`).
+- Running another record identity migration in parallel with active Ticket schema/profile work would create high migration/merge risk, not a small mechanical conflict.
+
+State decision:
+- Leave this Ticket queued.
+- Re-read and route after current active schema/profile work lands or if the workspace is otherwise quiescent enough for a record migration.
+
+---

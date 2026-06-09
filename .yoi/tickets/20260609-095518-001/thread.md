@@ -73,3 +73,50 @@ State decision:
 - Re-read and route it after either TicketList output slimming or Panel display work lands, depending on which surface remains active.
 
 ---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-09T11:30:25Z from: queued to: inprogress reason: orchestrator_acceptance_parallel_capacity field: state -->
+
+## State changed
+
+Accepted queued implementation after TicketList and Panel display work landed and workspace is clean. This Ticket removes obsolete action/attention fields from current Ticket schema/tool/API/panel behavior and can proceed in parallel with Profile feature-flag work because expected conflicts are small/manageable.
+
+---
+
+<!-- event: decision author: orchestrator at: 2026-06-09T11:30:25Z -->
+
+## Decision
+
+Routing decision: implementation_ready_parallel
+
+Reason:
+- The earlier blockers are resolved: ToolExecutionContext, TicketList output slimming, and Panel composer/display work have landed.
+- This Ticket is a bounded Ticket schema/API/panel cleanup to remove obsolete `action_required` and `attention_required` fields.
+- It can run in parallel with Profile feature flags work because expected overlap is small/manageable.
+
+IntentPacket:
+
+Intent:
+- Remove `action_required` and `attention_required` from current Ticket schema/tool/API/panel behavior, replacing any remaining current behavior with existing state/relation/orchestration-plan concepts where appropriate.
+
+Binding decisions / invariants:
+- New/current Ticket frontmatter must not include `action_required` or `attention_required`.
+- Current parser/schema/tool/CLI/panel surfaces must not expose those fields as current metadata.
+- Existing local Ticket records must be migrated to remove the fields.
+- Do not replace them with another generic vague field.
+- Use canonical `state`, Ticket relations, OrchestrationPlan waiting/blocker notes, and thread events for concrete state/context where appropriate.
+- Historical thread/resolution prose may remain audit history unless it is a current fixture or maintained guidance.
+- Do not change Ticket identity, lifecycle state model, relation metadata semantics, or Objective semantics.
+- Do not implement a broad panel UX redesign here.
+
+Reviewer focus:
+- Verify all current frontmatter records are migrated.
+- Verify TicketCreate/List/Show/tool schemas and Panel view models no longer carry action/attention fields.
+- Verify maintained guidance no longer treats these fields as current authority.
+- Verify doctor catches obsolete fields if appropriate.
+
+Validation:
+- Focused Ticket schema/parser/writer/tool tests.
+- Focused yoi CLI/list/show tests and panel/view model tests if touched.
+- `cargo fmt --check`, `git diff --check`, `cargo run -q -p yoi -- ticket doctor`, `cargo check --workspace`, `nix build .#yoi`.
+
+---
