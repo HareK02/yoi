@@ -66,3 +66,63 @@ Ticket を `workspace-panel` が queued にしました。
 
 
 ---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-09T00:06:25Z from: queued to: inprogress reason: orchestrator_acceptance field: workflow_state -->
+
+## State changed
+
+Accepted queued implementation after reading the Ticket, current Orchestrator routing workflow guidance, workspace state, visible Pod/worktree state, and the recently merged orchestration-plan/tool changes. No active implementation worktree is present; the requested change is bounded to routing prompt/workflow guidance and tests/resources.
+
+---
+
+<!-- event: decision author: orchestrator at: 2026-06-09T00:06:25Z -->
+
+## Decision
+
+Routing decision: implementation_ready
+
+Evidence checked:
+- Ticket body and acceptance criteria for `orchestrator-return-to-planning-context-policy`.
+- Current `.yoi/workflow/ticket-orchestrator-routing.md`, including existing `return_to_planning`, `implementation_ready`, and queued acceptance sections.
+- Current workspace/worktree state after merging and cleaning up the previous TUI/composer work.
+- Visible Pod state: no active sibling coder/reviewer for earlier work remains.
+- Recent merged context: `replace-intake-state-with-planning`, `ticket-orchestration-plan-tool`, and queued-routing behavior already require explicit queued acceptance and durable evidence.
+- `TicketOrchestrationPlanQuery` is documented in the workflow, but this current orchestrator session's tool list does not expose the newly merged tool, so there was no callable plan-query surface to inspect for this Ticket.
+
+Reason:
+- The Ticket has concrete requirements and acceptance criteria.
+- The change is policy/prompt/workflow guidance, not a broad runtime redesign.
+- Current workflow text already contains some related clauses, so implementation should be a bounded tightening: make the evidence/context requirement explicit, ensure risky-but-specified Tickets can proceed, and add/adjust focused validation.
+
+IntentPacket:
+
+Intent:
+- Strengthen Orchestrator routing guidance so returning ready/queued Tickets to `planning` requires concrete missing information/decision evidence after bounded project-context checks, not just Ticket text or risk flags.
+
+Binding decisions / invariants:
+- Do not reintroduce a separate readiness/preflight state or lane.
+- Do not change Ticket workflow states or transition semantics.
+- Do not make every queued Ticket require broad repository archaeology.
+- Risk flags and risky domains are context lookup and reviewer-focus signals, not automatic stop gates.
+- If returning to planning, the routing record must include the concrete missing decision/information, context checked, why implementation latitude is insufficient, and the next planning question/action.
+- If no concrete missing item remains after bounded context checks, a risky-but-specified Ticket should proceed as implementation_ready with IntentPacket invariants, escalation conditions, and reviewer focus.
+- Keep the change in maintained routing workflow/prompt/resource docs and focused validation; avoid runtime scheduler/orchestration refactors.
+
+Implementation latitude:
+- Coder may update `.yoi/workflow/ticket-orchestrator-routing.md`, resource prompts/workflows, and tests that validate workflow/prompt guidance.
+- If there is no existing prompt-resource test harness, coder may add a narrow text validation test in the most appropriate existing crate, or document why focused grep/resource validation is the right evidence.
+- Include or reference an example equivalent to `allow-spawnpod-child-workspace-cwd`: authority-adjacent but specified work should proceed with reviewer focus rather than return to planning solely because it touches authority/scope/Pod concerns.
+
+Escalate if:
+- Implementation requires changing Ticket backend workflow_state semantics.
+- Existing tests/resources imply a conflicting policy that must be resolved by human decision.
+- A broad prompt/workflow templating redesign would be needed instead of a narrow guidance update.
+
+Validation:
+- Focused workflow/prompt validation or tests covering: risky but specified Ticket -> implementation-ready; genuinely missing decision -> return to planning; risk flag alone is insufficient.
+- `git diff --check`.
+- `cargo run -q -p yoi -- ticket doctor`.
+- `cargo check --workspace` if code/tests are touched.
+- `nix build .#yoi` if resources/tests/package inputs are touched.
+
+---
