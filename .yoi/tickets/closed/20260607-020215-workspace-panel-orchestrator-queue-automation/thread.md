@@ -106,3 +106,32 @@ Recommendation: do not keep this Ticket open merely to track aggregate progress.
 No backend schema, workflow_state, Objective record implementation, or typed relation implementation is required for this migration note.
 
 ---
+
+<!-- event: state_changed author: hare at: 2026-06-09T04:44:35Z from: planning to: done reason: closed field: workflow_state -->
+
+## State changed
+
+Ticket closed; workflow_state を done に設定しました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-06-09T04:44:35Z status: closed -->
+
+## 完了
+
+Closed as an obsolete umbrella/progress-container Ticket.
+
+This Ticket's original role was to collect the broad Panel Queue -> Orchestrator automation effort. That umbrella pattern is now deprecated: concrete work should live in implementable Tickets, medium-term context should live in Objectives, and Ticket relations should remain non-hierarchical.
+
+The concrete slices recorded in this Ticket thread were split out and handled separately:
+
+- `orchestrator-queued-ticket-routing`
+- `orchestrator-worktree-agent-routing`
+- `orchestrator-merge-completion`
+
+Remaining or follow-up concerns are tracked by concrete Tickets/Objectives instead of this umbrella, including active queued-work planning/re-kick, non-hierarchical Ticket relations, Objective records, and umbrella deprecation work.
+
+This close does not assert that every future Panel Queue -> Orchestrator concern is complete; it retires this Ticket as a broad container.
+
+---

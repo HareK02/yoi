@@ -2,13 +2,13 @@
 id: 20260607-020215-workspace-panel-orchestrator-queue-automation
 slug: workspace-panel-orchestrator-queue-automation
 title: Workspace panel Orchestrator queue automation
-status: open
+status: 'closed'
 kind: task
 priority: P1
 labels: [panel, orchestrator, ticket, automation, workflow]
-workflow_state: planning
+workflow_state: 'done'
 created_at: 2026-06-07T02:02:15Z
-updated_at: '2026-06-09T01:26:26Z'
+updated_at: '2026-06-09T04:44:35Z'
 assignee: null
 ---
 
