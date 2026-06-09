@@ -54,11 +54,14 @@ reviewer Pod
 
 この Pod coordination model は runtime delegation の形であり、Ticket hierarchy を作る根拠ではない。複数 Ticket を扱う場合も各 Ticket は concrete work item として独立に実装・レビュー・検証・close できる必要がある。broad effort の進捗コンテナとして umbrella Ticket、parent/child Ticket、sub-ticket、part-of、contains などを作らない。中期的な目的や戦略は Objective context に置き、typed Ticket relations が利用可能な場合も dependency / related / blocking / replacement などの非階層メタデータに限る。
 
+明示的な queue review や routing kick の中で、独立した queued Ticket が複数あり coder/reviewer capacity が残っているなら、最初の Ticket の完了を待つことを default にしない。Orchestrator は各 Ticket の relation metadata、OrchestrationPlan records、Ticket thread、workspace/worktree dirty state、visible Pods、既存 branch、conflict notes を確認し、blocking relation や `do_not_parallelize` がなく、write surface が disjoint または conflict risk が小さく機械的に処理できるものを、別 worktree・別 branch・別 narrow write scope で並列開始する。これは background scheduler や queue drain loop ではなく、人間が queued にした Ticket だけを、その場の明示的な acceptance 判断で `queued -> inprogress` に進める運用である。
+
 ## 開始条件
 
 以下が揃っている時に使う。
 
 - 対象 concrete Ticket または concrete Ticket 群が決まっている。
+- Ticket lifecycle を使う場合、対象はすでに `inprogress` であるか、worktree 作成・Pod spawn・coder routing の前に Orchestrator が個別に `queued -> inprogress` acceptance を記録できる `queued` Ticket に限る。unqueued Ticket は capacity 埋めの対象にしない。
 - ticket の背景・意図・制約・受け入れ条件から、実装調査と局所 tactic 選択を coder に委ねても product / API / UX / authority / design-boundary decision を silently 固定しないと判断できる。
 - worktree 作成と git 書き込み操作について、人間の許可がある。
 - main workspace の unrelated dirty changes を把握している。
@@ -107,10 +110,13 @@ reviewer には coder の実装方針ではなく、この intent packet と dif
 1. 状態確認
    - `git state --short --branch`
    - 対象 ticket / ticket 群
+   - relation metadata / OrchestrationPlan records / do_not_parallelize / conflict or dependency notes
+   - visible Pods、既存 worktree/branch、coder/reviewer follow-up capacity
    - 関連 TODO / docs / 既存 worktree
    - planning sync が必要な ticket では、互換入口 `ticket-preflight-workflow` の分類・要件同期・critical risks
 
 2. worktree 作成
+   - 対象 Ticket が `queued` なら、この step の前に typed Ticket backend/tool path で `queued -> inprogress` を記録する。これより前に branch 作成、worktree 作成、Pod spawn、実装調査依頼などの implementation side effect を行わない。
    - `$user/worktree-workflow` に従い `./.worktree/<task-name>` を作る。
    - `.yoi` 自体は除外しない。tracked project records は child worktree に存在してよく、`.yoi/memory` と local/runtime/log/lock/secret-like paths だけを sparse checkout で除外する。
 
@@ -210,6 +216,8 @@ coder Pod には child worktree 内での commit を許可してよい。
 
 ### Approve
 
+reviewer が approve し blocker が残っていない場合、明示的な standing policy として merge / validate / close / cleanup まで進める。migration boundary、runtime refresh boundary、未解決の human gate が明示されている時だけ、merge-ready dossier で止める。
+
 1. coder Pod / reviewer Pod を停止し、scope を回収する。
 2. orchestrator が merge-ready dossier を確認する。
 3. 最上位 orchestrator が必要最小限の spot check を行う。
@@ -236,11 +244,14 @@ coder Pod には child worktree 内での commit を許可してよい。
 ## 並列実装時の注意
 
 - 1 ticket = 1 worktree = 1 branch を基本にする。
-- 複数 Pod に同じ write scope を渡さない。
+- 複数 Pod に同じ write scope を渡さない。parallel Coder Pod は別 worktree と narrow write scope を持つ。
 - parent / orchestrator は coder の write scope 配下を直接編集しない。
-- reviewer は read-only を基本にする。review artifact を書かせる場合は ticket artifacts など限定 scope にする。
-- 依存関係がある ticket は、土台 branch を merge してから次 worktree を切る。
+- reviewer は read-only を基本にする。明示的に別 scope を与える判断がない限り、review artifact を書かせる場合も ticket artifacts など限定 scope にする。
+- independent queued Ticket は、blocking relation/dependency がなく、`do_not_parallelize` や relevant `conflicts_with` がなく、source/write surface が disjoint または conflict risk が小さく機械的で、coder/reviewer follow-up capacity があり、workspace records を side effect 前に commit でき、別 worktree/branch/scope を切れる場合に並列開始を優先する。
+- 依存関係がある ticket、同一 migration boundary や同一 schema/tool/panel surface を大きく触る ticket、または reviewer/coder bottleneck がある ticket は、土台 branch を merge してから次 worktree を切るか、bounded defer reason を記録して idle にする。
+- capacity が見えるのに queued Ticket を開始しない場合、dependency / conflict / capacity / missing planning decision / dirty workspace / reviewer-coder bottleneck / migration boundary / human gate のいずれかを bounded reason として Ticket thread または `TicketOrchestrationPlanRecord` に残す。
 - parallel に走らせた Pod の完了通知は取りこぼしうるため、`ReadPodOutput` と worktree 状態で確認する。
+- この節は自動 scheduler、background runner、resource graph solver、automatic queue drain loop を導入しない。parallel start は明示的な routing/acceptance の結果であり、unqueued Ticket を開始する根拠ではない。
 
 ## merge-ready dossier の標準形
 
