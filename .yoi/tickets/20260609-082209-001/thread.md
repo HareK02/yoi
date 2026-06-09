@@ -280,3 +280,67 @@ Validation after fix:
 - `cargo check --workspace`
 
 ---
+
+<!-- event: review author: reviewer-profile-feature-flags-tool-surface-r3 at: 2026-06-09T12:35:10Z status: request_changes -->
+
+## Review: request changes
+
+Third-pass re-review result: request_changes.
+
+Prior findings status:
+- Fixed in the actual project role profile files: user-facing syntax is `feature.pods`, Coder has `feature.task.enabled = false`, and Intake/Reviewer/Companion/Orchestrator now also set `feature.task.enabled = false`.
+- Focused validation still passes for the new controller test and the Pods feature delegation guard.
+
+Blocking finding:
+
+1. The added regression test does not actually cover the project role defaults it claims to protect. `project_role_tool_surfaces_keep_task_disabled_and_pods_role_scoped` loops over role names, but it constructs a synthetic TOML manifest in the test body with `[feature.task] enabled = false` and `[feature.pods] enabled = {pods_enabled}`. The role name is used only in `pod.name`; the test never resolves `project:orchestrator`, `project:coder`, `project:intake`, `project:reviewer`, or `project:companion`, and it never reads `.yoi/profiles/*.lua` / `.yoi/profiles.toml`. As a result, re-enabling Task tools in any project role profile would not fail this test.
+   - `crates/pod/tests/controller_test.rs:307-395`
+   - actual profile defaults inspected at `.yoi/profiles/orchestrator.lua`, `.yoi/profiles/coder.lua`, `.yoi/profiles/intake.lua`, `.yoi/profiles/reviewer.lua`, `.yoi/profiles/companion.lua`
+
+Why this blocks merge:
+- The Ticket acceptance condition explicitly asks that tests cover tool definition lists for Orchestrator, Coder, Intake, Reviewer, and Companion profiles.
+- The previous review finding was about role defaults, not only the low-level controller behavior for arbitrary feature flags. The current test proves the controller obeys a synthetic manifest, but not that the shipped/project role defaults produce the intended tool surfaces.
+
+Suggested fix:
+- Add/replace coverage that resolves the actual five project profiles (for example via the Profile resolver/registry against `.yoi/profiles.toml`) and then asserts the resulting tool definitions/schema surface.
+- At minimum, assert all Task tools are absent for all five roles and Pod tools are present only for Orchestrator; preferably also assert the relevant Ticket/Ticket-orchestration exposure for Orchestrator/Coder/Intake/Reviewer/Companion per the Ticket defaults.
+
+Validation run:
+- `cargo test -p pod project_role_tool_surfaces_keep_task_disabled_and_pods_role_scoped --test controller_test` passed.
+- `cargo test -p pod pods_feature_requires_delegation_scope --test controller_test` passed.
+- `cargo test -p manifest feature --lib` passed.
+- `cargo fmt --check` passed.
+- `git diff --check` passed.
+- `cargo run -q -p yoi -- ticket doctor` passed (`doctor: ok`).
+- `git status --short --branch` was clean before recording this review.
+
+Merge readiness: not merge-ready until role-default regression coverage loads/asserts the actual project role profiles.
+
+---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-09T12:38:26Z -->
+
+## Implementation report
+
+Third review requested one remaining test-coverage fix: the existing role-surface test used synthetic manifests, so it could drift from actual project role profile files.
+
+Fix applied on branch `profile-feature-flags-tool-surface`:
+
+- Added manifest regression test `actual_project_role_profiles_resolve_explicit_feature_defaults`.
+- The test loads the actual project role Profile Lua files via `include_str!`, resolves Coder/Intake/Orchestrator/Reviewer/Companion profiles, and asserts explicit feature defaults for Task, Ticket, Ticket orchestration, and Pods.
+
+Fix commit: `656048a test: cover project role feature profiles`
+
+Validation after fix:
+- `cargo fmt`
+- `cargo test -p manifest actual_project_role_profiles_resolve_explicit_feature_defaults --lib`
+- `cargo test -p pod project_role_tool_surfaces_keep_task_disabled_and_pods_role_scoped --test controller_test`
+- `cargo test -p manifest feature --lib`
+- `cargo test -p pod feature --tests`
+- `cargo test -p tools --test integration`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo run -q -p yoi -- ticket doctor`
+- `cargo check --workspace`
+
+---
