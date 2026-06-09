@@ -149,3 +149,25 @@ Validation:
 - `cargo fmt --check`, `git diff --check`, `cargo run -q -p yoi -- ticket doctor`, `cargo check --workspace`, `nix build .#yoi`.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-09T10:21:06Z -->
+
+## Implementation report
+
+Implementation routing started in parallel with the active ToolExecutionContext migration.
+
+Worktree/branch:
+- Worktree: `.worktree/ticketlist-output-lightweight`
+- Branch: `ticketlist-output-lightweight`
+- Base/routing commit: `d95b3ff ticket: route parallel ticketlist and panel work`
+
+Spawned sibling Coder Pod:
+- `coder-ticketlist-output-lightweight`
+- Scope: non-recursive read on parent workspace root plus recursive write limited to the child worktree.
+
+Parallel-routing rationale:
+- User asked to prefer parallel work when conflicts are absent or expected small.
+- Overlap with ToolExecutionContext should be localized/mechanical around tool execution signatures and TicketList implementation.
+- Any non-mechanical design conflict should be escalated rather than broadened.
+
+---

@@ -229,3 +229,25 @@ Validation:
 - `cargo fmt --check`, `git diff --check`, `cargo run -q -p yoi -- ticket doctor`, `cargo check --workspace`, `nix build .#yoi`.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-09T10:21:06Z -->
+
+## Implementation report
+
+Implementation routing started in parallel with the active ToolExecutionContext and TicketList work.
+
+Worktree/branch:
+- Worktree: `.worktree/panel-display-composer-keys`
+- Branch: `panel-display-composer-keys`
+- Base/routing commit: `d95b3ff ticket: route parallel ticketlist and panel work`
+
+Spawned sibling Coder Pod:
+- `coder-panel-display-composer-keys`
+- Scope: non-recursive read on parent workspace root plus recursive write limited to the child worktree.
+
+Parallel-routing rationale:
+- User asked to prefer parallel work when conflicts are absent or expected small.
+- This Ticket is primarily TUI panel/composer UX and is independent from the core ToolExecutionContext migration and TicketList output shaping.
+- Coder was instructed to avoid Ticket backend/tool output changes unless necessary.
+
+---

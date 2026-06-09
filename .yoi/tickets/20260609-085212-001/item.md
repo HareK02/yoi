@@ -2,7 +2,7 @@
 title: 'TicketListの出力を軽量化する'
 state: 'inprogress'
 created_at: '2026-06-09T08:52:12Z'
-updated_at: '2026-06-09T10:19:34Z'
+updated_at: '2026-06-09T10:21:06Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-06-09T10:01:28Z'
