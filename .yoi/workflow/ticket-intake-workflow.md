@@ -39,7 +39,8 @@ Intake は以下を行う。
 - 不足している要件を質問する。
 - 作成または refinement する Ticket が、実装・レビュー・検証・完了判断を単独で行える concrete work item であるか確認する。
 - 広い依頼を分割する場合は、進捗コンテナとしての umbrella Ticket ではなく、concrete Ticket / Objective context / split decision record に責務を分ける。
-- Ticket の title / canonical id / kind / priority / labels を提案する。
+- Ticket の title / body/request snapshot / acceptance criteria / priority / readiness / action_required / attention_required を、現在の要件として意味がある範囲で提案する。
+- canonical ID は Ticket 作成/storage が opaque な path-derived value として割り当てるため、Intake はユーザー向け metadata として提案しない。
 - background / requirements / acceptance criteria / escalation conditions を整理する。
 - binding decisions / invariants と implementation latitude を分けて書く。
 - 具体的な除外や触れてはいけない境界が binding decision である場合は、generic な除外リストではなく invariant / escalation condition として明記する。
@@ -119,7 +120,7 @@ Ticket tools が利用できない環境では、勝手に file write で代替�
 最低限、以下を確認する。
 
 - observable な完了条件は何か。
-- Ticket の種類は何か: feature / bug / cleanup / design / spike / workflow / docs / release / orchestration。
+- 作業の種類・影響範囲は prose として body に書けばよいが、current Ticket core metadata として扱わない。
 - 受け入れ条件は何か。
 - binding decision として残す具体的な除外・authority boundary はあるか。
 - 後方互換が必要か。
@@ -183,12 +184,13 @@ risk_flags: [authority-boundary, persistence, prompt-context, public-api]
 ```text
 Title:
 
-Kind:
 Priority:
-Labels:
 Readiness:
-Needs planning sync:
+Action required:
+Attention required:
 Risk flags:
+
+Body / request snapshot:
 
 Background:
 
@@ -207,6 +209,8 @@ Validation:
 Related tickets/docs:
 ```
 
+canonical ID は作成時に storage が opaque/path-derived value として割り当てるため、draft では提案しない。
+
 この時点ではまだ Ticket を作らない。
 
 ### 7. ユーザー合意を取る
@@ -223,7 +227,7 @@ Related tickets/docs:
 新規 Ticket の場合:
 
 - `TicketCreate` を使う。
-- title / canonical id / kind / priority / labels / body を指定する。
+- title / priority / body と、必要な readiness / action_required / attention_required を指定する。canonical ID は storage が割り当てる。
 - body に readiness / open questions / risk flags と、binding decisions / invariants、implementation latitude、escalation conditions を Markdown で明記する。
 
 既存 Ticket refinement の場合:
@@ -236,7 +240,7 @@ Related tickets/docs:
 
 ユーザーへ以下を返す。
 
-- 作成/更新した Ticket id / canonical id / title。
+- 作成/更新した Ticket の system-assigned id / title。
 - readiness。
 - open questions / risk flags。
 - 次に Orchestrator が取るべき routing 候補。
@@ -293,6 +297,6 @@ Ticket の body は Markdown/freeform を維持する。すべてを strict sche
 
 ## 他 Workflow への接続
 
-- `ticket-preflight-workflow`: legacy compatibility canonical id の planning/requirements sync 入口。新規 routing は standalone preflight ではなく planning return/requirements sync として扱う。
+- `ticket-preflight-workflow`: legacy compatibility planning/requirements sync 入口。新規 routing は standalone preflight ではなく planning return/requirements sync として扱う。
 - `multi-agent-workflow`: Orchestrator が implementation_ready と判断した後に接続する。
 - `ticket-orchestrator-routing`: この Workflow が作った Ticket を routing する後続 Workflow。

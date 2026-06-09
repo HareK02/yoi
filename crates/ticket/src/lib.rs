@@ -817,9 +817,9 @@ impl LocalTicketBackend {
 
     pub fn default_intake_ready_state_change_body(&self, from: &str) -> String {
         if is_japanese_record_language(self.record_language()) {
-            format!("Ticket planning が完了しました。workflow_state {from} -> ready。\n")
+            format!("Ticket planning が完了しました。state {from} -> ready。\n")
         } else {
-            format!("Ticket planning complete; workflow_state {from} -> ready.\n")
+            format!("Ticket planning complete; state {from} -> ready.\n")
         }
     }
 
@@ -1360,7 +1360,7 @@ impl TicketBackend for LocalTicketBackend {
         })?;
         if !TicketWorkflowState::is_planning_ready_transition(from, to) {
             return Err(TicketError::Conflict(format!(
-                "mark_intake_ready only allows workflow_state planning -> ready, got {} -> {}",
+                "mark_intake_ready only allows state planning -> ready, got {} -> {}",
                 from.as_str(),
                 to.as_str()
             )));
