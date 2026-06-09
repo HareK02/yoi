@@ -30,3 +30,45 @@ Ticket を `workspace-panel` が queued にしました。
 
 
 ---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-09T10:35:08Z from: queued to: inprogress reason: orchestrator_acceptance_parallel_capacity field: state -->
+
+## State changed
+
+Accepted queued implementation under the updated parallel-capacity policy. This is workflow guidance for starting independent queued work in parallel, matching the user's current routing preference. It is docs/workflow-oriented and expected conflicts are small/manageable.
+
+---
+
+<!-- event: decision author: orchestrator at: 2026-06-09T10:35:08Z -->
+
+## Decision
+
+Routing decision: implementation_ready_parallel
+
+Reason:
+- The user explicitly requested more parallelism when conflicts are absent or small.
+- This Ticket updates Orchestrator/multi-agent workflow guidance to encode that same policy.
+- It is workflow/docs-oriented and can run alongside active code changes with expected small conflict risk.
+
+IntentPacket:
+
+Intent:
+- Update Orchestrator and multi-agent workflow guidance so independent queued work with available capacity is started in parallel after explicit safety checks, rather than waiting one Ticket at a time by default.
+
+Binding decisions / invariants:
+- Orchestrator is not an automatic background scheduler.
+- Do not start unqueued Tickets.
+- No implementation side effects before `queued -> inprogress` acceptance.
+- No blind spawn from queue notifications alone.
+- Respect unresolved `depends_on` / incoming blocker relations, `do_not_parallelize`, conflict records, workspace dirty state, and shared write-scope constraints.
+- Use separate worktrees/branches/write scopes for parallel Coder Pods.
+- Reviewer remains read-only unless explicitly scoped otherwise.
+- If queued work is left idle while capacity appears available, record a bounded reason: dependency, conflict, capacity, missing planning decision, workspace dirty state, reviewer/coder bottleneck, or human gate.
+- Distinguish active work waiting on coder/reviewer output from idle Orchestrator queue-review moments.
+
+Validation:
+- Focused workflow/prompt text validation or tests showing parallel start is preferred when safety checks pass.
+- Validation that safety invariants remain explicit.
+- `git diff --check`, `cargo run -q -p yoi -- ticket doctor`, `nix build .#yoi` if packaged resources/docs are touched.
+
+---

@@ -30,3 +30,46 @@ Ticket を `workspace-panel` が queued にしました。
 
 
 ---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-09T10:35:08Z from: queued to: inprogress reason: orchestrator_acceptance_parallel_capacity field: state -->
+
+## State changed
+
+Accepted queued implementation under the updated parallel-capacity policy. This Ticket extends the already-landed session analytics crate and is independent from the active ToolExecutionContext, TicketList, and Panel worktrees.
+
+---
+
+<!-- event: decision author: orchestrator at: 2026-06-09T10:35:08Z -->
+
+## Decision
+
+Routing decision: implementation_ready_parallel
+
+Reason:
+- This Ticket extends `session-analytics`, a recently landed and currently inactive area.
+- It is independent from active ToolExecutionContext, TicketList output, and Panel UX work.
+- User asked to prefer parallel work when conflicts are absent or expected small.
+
+IntentPacket:
+
+Intent:
+- Add assistant-response-level tool batching and edit round-trip metrics to `session-analytics` so tool-use speed patterns can be evaluated in structured JSON.
+
+Binding decisions / invariants:
+- Infer assistant response / tool-result cycle units from session JSONL as best-effort analytics.
+- Add response-level tool call metrics: total responses, tool-call responses, total tool calls, avg/p50/p90/max, histogram, top responses by tool call count.
+- Add edit batching metrics: Edit calls per response, responses containing Edit, same-file multiple Edit calls in one response, files touched per edit response, and correlation with large edit args where possible.
+- Add consecutive edit-only response streak metrics by file/path and response range, distinguishing pure edit-only streaks from sequences broken/annotated by Read/Bash/test/result-dependent steps.
+- Diagnostics must be observations such as possible batching opportunity, not blame or policy enforcement.
+- Preserve existing privacy boundary: no raw user input, raw tool args, raw file contents, raw session snippets, or raw tool output content in default output.
+- Do not change prompt/workflow behavior, implement EditBatch/ordered patch tools, or force batching policy.
+
+Validation:
+- Tests for single response with multiple tools.
+- Tests for same-response same-file multiple Edit.
+- Tests for consecutive edit-only responses to same file.
+- Tests for interleaved Read/test step breaking or annotating streak.
+- Tests for sessions with no edits.
+- `cargo fmt --check`, `git diff --check`, `cargo run -q -p yoi -- ticket doctor`, `cargo check --workspace`, `nix build .#yoi`.
+
+---

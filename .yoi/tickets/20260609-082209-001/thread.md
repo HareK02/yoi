@@ -30,3 +30,22 @@ Ticket を `workspace-panel` が queued にしました。
 
 
 ---
+
+<!-- event: decision author: orchestrator at: 2026-06-09T10:35:08Z -->
+
+## Decision
+
+Routing decision: waiting_for_core_tool_surface_stability
+
+This Ticket remains queued for now, despite the updated parallelism preference.
+
+Reason:
+- This Ticket changes Profile/Manifest feature flags and conditional tool registration across Task/Ticket/Ticket orchestration/Pod/Memory/Web tool surfaces.
+- `20260609-093050-001` is still under review and changes the core Tool execution API.
+- Running both together would overlap deeply in ToolRegistry/tool surface registration and test expectations, not just create a small mechanical conflict.
+
+State decision:
+- Leave this Ticket `queued`.
+- Re-read after ToolExecutionContext lands and active tool-surface branches settle.
+
+---

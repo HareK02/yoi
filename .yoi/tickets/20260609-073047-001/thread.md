@@ -74,3 +74,22 @@ Ticket を `workspace-panel` が queued にしました。
 
 
 ---
+
+<!-- event: decision author: orchestrator at: 2026-06-09T10:35:08Z -->
+
+## Decision
+
+Routing decision: waiting_for_active_record_churn_to_settle
+
+This Ticket remains queued for now, despite the updated parallelism preference.
+
+Reason:
+- This Ticket is a broad Ticket/Objective ID migration touching current project-record paths and internal references.
+- There are multiple active worktrees currently writing Ticket records and code.
+- Running a storage/ID migration in parallel with active Ticket record churn would create high merge/migration risk, not a small conflict.
+
+State decision:
+- Leave this Ticket `queued`.
+- Re-read when active worktrees are merged/closed or the workspace is otherwise quiescent enough for a record migration.
+
+---
