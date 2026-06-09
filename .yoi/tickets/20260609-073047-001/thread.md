@@ -140,3 +140,24 @@ Implementation boundaries:
 Review focus should include migration correctness, relation/reference updates, doctor behavior, and whether base32 timestamp IDs remain stable/sortable under collision handling.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-09T12:47:58Z -->
+
+## Implementation report
+
+Implementation routing started.
+
+Worktree/branch:
+- Worktree: `.worktree/base32-record-ids`
+- Branch: `base32-record-ids`
+- Base/routing commit: `0803bc3 ticket: accept base32 id migration`
+
+Spawned sibling implementation Pod:
+- `coder-base32-record-ids`
+- Scope: non-recursive read on parent workspace root plus recursive write limited to the child worktree.
+
+Runtime note:
+- The current orchestrator session is still running the pre-Profile-feature-flags binary, so `project:coder` cannot decode the newly merged `feature` profile field until the process is refreshed.
+- The Pod was therefore launched with `builtin:default` as a runtime workaround, with explicit Coder-role instructions in the handoff. This is a session-runtime workaround only, not a project configuration change.
+
+---
