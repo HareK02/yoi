@@ -98,7 +98,7 @@ when a spike is useful, let the Orchestrator create an ordinary task-specific re
 
 `launch_prompt` is a per-action first-run prompt reference for future prompt resolution. Current launcher behavior exposes the ref but does not treat it as system instruction.
 
-`workflow` is the workflow the launched role should follow. Workflow state and phase-specific prompt injection are future work; any dynamic prompt content must be committed as history before it affects model context.
+`workflow` is the workflow the launched role should follow. State and phase-specific prompt injection are future work; any dynamic prompt content must be committed as history before it affects model context.
 
 `provider = "builtin:yoi_local"` selects Yoi's built-in local Ticket backend. `root = ".yoi/tickets"` is the canonical local storage root for this repository. Legacy `kind = "local"` is accepted only as a short transitional alias; new configs should use `provider`.
 
@@ -163,7 +163,7 @@ Routing decisions should be recorded with `TicketComment` using `plan` or `decis
 
 ### 3. Planning/requirements sync
 
-Use `ticket-preflight-workflow` only as a legacy compatibility slug for planning/requirements sync. Return `ready` or `queued` Tickets to `planning` only when the Orchestrator can name a concrete missing decision or information item after bounded project-context checks; risk flags and risky domains are context-lookup and reviewer-focus signals, not automatic stop gates.
+Use `ticket-preflight-workflow` only as a legacy compatibility canonical id for planning/requirements sync. Return `ready` or `queued` Tickets to `planning` only when the Orchestrator can name a concrete missing decision or information item after bounded project-context checks; risk flags and risky domains are context-lookup and reviewer-focus signals, not automatic stop gates.
 
 Planning sync should resolve or record:
 
@@ -207,13 +207,13 @@ Unless explicitly authorized otherwise, final merge, cleanup, design-boundary de
 Before closing, verify concrete evidence:
 
 - child Pod output via `ReadPodOutput`;
-- worktree status and diff;
+- worktree state and diff;
 - validation command output;
 - review result;
 - Ticket requirements and acceptance criteria;
 - merge/cleanup state in the main workspace.
 
-Close with a resolution that summarizes what changed, key commits, validation, review status, and remaining follow-ups.
+Close with a resolution that summarizes what changed, key commits, validation, review state, and remaining follow-ups.
 
 ## Workspace panel Ticket role actions
 
@@ -248,8 +248,8 @@ The launched Pod receives dynamic Ticket/action context as its first committed r
 The first run input contains:
 
 - the selected fixed role;
-- the workflow slug from `.yoi/ticket.config.toml`;
-- Ticket id/slug when the action targets an existing Ticket;
+- the workflow canonical id from `.yoi/ticket.config.toml`;
+- Ticket id when the action targets an existing Ticket;
 - freeform user instruction/context from the action;
 - configured `launch_prompt` reference if present, as an unresolved reference for future prompt resolution.
 
@@ -289,7 +289,7 @@ If a role still uses `profile = "inherit"`, the panel fails closed with a diagno
 
 - `profile = "inherit"`: configure a concrete role Profile in `.yoi/ticket.config.toml`.
 - malformed `.yoi/ticket.config.toml`: fix the config and retry.
-- missing Ticket id/slug for route, implement, or review actions: provide the target Ticket.
+- missing Ticket id for route, implement, or review actions: provide the target Ticket.
 - launch success but no visible completion: attach to or inspect the launched Pod; completion notifications are hints, not authority.
 
 ## Granularity
@@ -333,29 +333,29 @@ Do not store secrets, credentials, private prompt contents, or raw logs containi
 The product CLI exposes the typed Ticket backend for repository maintenance and validation. It operates on the configured `.yoi/tickets/` storage and is the preferred command-line surface when editing Tickets outside a Pod.
 
 ```sh
-yoi ticket create --title "..." [--slug slug] [--kind task] [--priority P2] [--label a,b]
-yoi ticket list [--status open|pending|closed|all]
-yoi ticket show <id-or-slug>
-yoi ticket comment <id-or-slug> [--role comment|plan|decision|implementation_report] [--file path]
-yoi ticket review <id-or-slug> --approve|--request-changes [--file path]
-yoi ticket status <id-or-slug> open|pending
-yoi ticket close <id-or-slug> [--resolution text|--file path]
+yoi ticket create --title "..." [--canonical id canonical id] [--kind task] [--priority P2] [--label a,b]
+yoi ticket list [--state planning|ready|queued|inprogress|done|closed|all]
+yoi ticket show <id>
+yoi ticket comment <id> [--role comment|plan|decision|implementation_report] [--file path]
+yoi ticket review <id> --approve|--request-changes [--file path]
+yoi ticket state <id> open|pending
+yoi ticket close <id> [--resolution text|--file path]
 yoi ticket doctor
 ```
 
-`yoi ticket status` intentionally does not close Tickets. Closing must use `yoi ticket close` so the backend writes the required `resolution.md` and passes `yoi ticket doctor`.
+`yoi ticket state` intentionally does not close Tickets. Closing must use `yoi ticket close` so the backend writes the required `resolution.md` and passes `yoi ticket doctor`.
 
 The current LocalTicketBackend stores records under:
 
 ```text
-.yoi/tickets/{open,pending,closed}/<id>/
+.yoi/tickets/<ticket-id>
   item.md
   thread.md
   artifacts/
   resolution.md   # closed Tickets only
 ```
 
-Backend integrations must preserve this format until an explicit migration changes it. `thread.md` is an append-only typed event log: existing events such as `create`, `comment`, `plan`, `decision`, `implementation_report`, `review`, `status_changed`, and `close` remain valid, while `state_changed` records durable transition metadata (`from`, `to`, `reason`, optional `field`, plus `author` and `at`) and `intake_summary` records the bounded Intake outcome body. Thread events are audit history, not current-state authority; current state belongs in `item.md` frontmatter or the owning backend record. The repository-root `work-items/` path is no longer a live mutable backend; do not recreate it for Ticket records. Human users should prefer `yoi panel`, Ticket tools, or `yoi ticket ...` when working directly with repository records.
+Backend integrations must preserve this format until an explicit migration changes it. `thread.md` is an append-only typed event log: existing events such as `create`, `comment`, `plan`, `decision`, `implementation_report`, `review`, `state_changed`, and `close` remain valid, while `state_changed` records durable transition metadata (`from`, `to`, `reason`, optional `field`, plus `author` and `at`) and `intake_summary` records the bounded Intake outcome body. Thread events are audit history, not current-state authority; current state belongs in `item.md` frontmatter or the owning backend record. The repository-root `work-items/` path is no longer a live mutable backend; do not recreate it for Ticket records. Human users should prefer `yoi panel`, Ticket tools, or `yoi ticket ...` when working directly with repository records.
 
 ## Validation
 

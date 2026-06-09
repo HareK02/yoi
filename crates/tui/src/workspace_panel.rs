@@ -638,10 +638,10 @@ fn build_ticket_rows(
 ) -> ticket::Result<Vec<PanelRow>> {
     let mut rows = Vec::new();
     for summary in backend.list(TicketFilter::all())? {
-        if summary.status.as_local() == Some(TicketStatus::Closed) {
+        if summary.workflow_state == TicketWorkflowState::Closed {
             continue;
         }
-        let ticket = backend.show(TicketIdOrSlug::Query(summary.slug.clone()))?;
+        let ticket = backend.show(TicketIdOrSlug::Query(summary.id.clone()))?;
         rows.push(ticket_row(summary, &ticket.events, pods, registry));
     }
     Ok(rows)
@@ -659,12 +659,12 @@ fn ticket_row(
     let latest_event = events.last();
     let entry = TicketPanelEntry {
         id: summary.id.clone(),
-        slug: summary.slug.clone(),
+        slug: String::new(),
         title: summary.title.clone(),
-        status: summary.status.as_str().to_string(),
-        kind: summary.kind.clone(),
+        status: summary.workflow_state.as_str().to_string(),
+        kind: String::new(),
         priority: summary.priority.clone(),
-        labels: summary.labels.clone(),
+        labels: Vec::new(),
         workflow_state: summary.workflow_state,
         workflow_state_explicit: summary.workflow_state_explicit,
         attention_required: summary.attention_required.clone(),
@@ -769,7 +769,7 @@ fn derive_ticket_state(summary: &TicketSummary) -> DerivedTicketState {
             priority: ActionPriority::Background,
             action: Some(NextUserAction::Close),
             disabled_reason: Some(
-                "workflow_state is done; close if a resolution is still missing.".to_string(),
+                "state is done; close if a resolution is still missing.".to_string(),
             ),
             key_hint: None,
             blocked_reason: None,
@@ -781,7 +781,15 @@ fn derive_ticket_state(summary: &TicketSummary) -> DerivedTicketState {
             disabled_reason: Some(
                 "Ticket is still in planning; mark it ready before queueing.".to_string(),
             ),
-            key_hint: Some("Planning/Intake helpers can set workflow_state = ready".to_string()),
+            key_hint: Some("Planning/Intake helpers can set state = ready".to_string()),
+            blocked_reason: None,
+        },
+        TicketWorkflowState::Closed => DerivedTicketState {
+            kind: PanelRowKind::Review,
+            priority: ActionPriority::Background,
+            action: Some(NextUserAction::Wait),
+            disabled_reason: Some("Ticket is closed.".to_string()),
+            key_hint: None,
             blocked_reason: None,
         },
     }
@@ -792,7 +800,6 @@ fn related_pods_for_ticket(
     pods: &PodList,
     registry: &PanelRegistrySnapshot,
 ) -> Vec<String> {
-    let slug = lowercase(&summary.slug);
     let id = lowercase(&summary.id);
     let mut names = Vec::new();
     if let Some(claim) = registry.claim_for_ticket(&summary.id) {
@@ -800,7 +807,7 @@ fn related_pods_for_ticket(
     }
     for pod in pods.entries.iter().filter_map(|pod| {
         let name = lowercase(&pod.name);
-        if (!slug.is_empty() && name.contains(&slug)) || (!id.is_empty() && name.contains(&id)) {
+        if !id.is_empty() && name.contains(&id) {
             Some(pod.name.clone())
         } else {
             None
@@ -844,11 +851,7 @@ pub(crate) fn local_claim_status_for_pod(pod_name: &str, pods: &PodList) -> Tick
 }
 
 fn ticket_subtitle(entry: &TicketPanelEntry) -> Option<String> {
-    let mut parts = vec![format!(
-        "{} · {}",
-        entry.slug,
-        entry.workflow_state.as_str()
-    )];
+    let mut parts = vec![format!("{} · {}", entry.id, entry.workflow_state.as_str())];
     if let Some(reason) = entry.attention_required.as_deref() {
         parts.push(format!("attention: {reason}"));
     }

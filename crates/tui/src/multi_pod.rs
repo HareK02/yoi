@@ -24,7 +24,7 @@ use session_store::FsStore;
 use ticket::config::TicketConfig;
 use ticket::{
     LocalTicketBackend, NewTicketEvent, TicketBackend, TicketEventKind, TicketIdOrSlug,
-    TicketStatus, TicketWorkflowState,
+    TicketWorkflowState,
 };
 use tokio::net::UnixStream;
 use unicode_width::UnicodeWidthStr;
@@ -1127,15 +1127,11 @@ impl MultiPodApp {
             return None;
         };
         let ticket_id = ticket.id.clone();
-        let ticket_slug = ticket.slug.clone();
         let mut context =
             TicketRoleLaunchContext::new(current_workspace_root(), TicketRole::Intake);
-        context.ticket = Some(TicketRef {
-            id: Some(ticket_id.clone()),
-            slug: Some(ticket_slug.clone()),
-        });
+        context.ticket = Some(TicketRef::id(ticket_id.clone()));
         context.user_instruction = Some(format!(
-            "Continue Intake for existing Ticket {ticket_id} ({ticket_slug}). Do not create a duplicate Ticket unless the user explicitly requests one."
+            "Continue Intake for existing Ticket {ticket_id}. Do not create a duplicate Ticket unless the user explicitly requests one. Read TicketShow body/thread/artifacts before making routing or requirements decisions."
         ));
         let store = match PanelRegistryStore::default_for_workspace(&context.workspace_root) {
             Ok(store) => store,
@@ -1176,7 +1172,7 @@ impl MultiPodApp {
         self.sending = true;
         self.notice = Some(format!(
             "Launching Ticket Intake for {} as {}…",
-            ticket_slug, planned.pod_name
+            ticket_id, planned.pod_name
         ));
         Some(IntakeLaunchRequest {
             context,
@@ -1185,7 +1181,7 @@ impl MultiPodApp {
             registry_update: IntakeRegistryUpdate::ClaimTicket {
                 registry_root: store.root().to_path_buf(),
                 ticket_id,
-                ticket_slug: Some(ticket_slug),
+                ticket_slug: None,
                 pod_name,
             },
         })
@@ -1991,8 +1987,7 @@ async fn dispatch_ticket_action(
         NextUserAction::Queue => {
             if current_ticket.workflow_state != TicketWorkflowState::Ready {
                 return Err(TicketActionError::Stale(
-                    "Queue is only valid while workflow_state is ready; reload and retry"
-                        .to_string(),
+                    "Queue is only valid while state is ready; reload and retry".to_string(),
                 ));
             }
             backend
@@ -2006,7 +2001,7 @@ async fn dispatch_ticket_action(
             Ok(TicketActionOutcome {
                 notice: format!(
                     "Queued Ticket {}; {}. Orchestrator routing is authorized; implementation side effects still require queued -> inprogress acceptance.",
-                    current_ticket.slug,
+                    current_ticket.id,
                     notification.sentence()
                 ),
             })
@@ -2017,31 +2012,13 @@ async fn dispatch_ticket_action(
                 &request.ticket_id,
                 panel_defer_body(current_ticket),
             )?;
-            let mut moved = false;
-            if current_ticket
-                .status
-                .eq_ignore_ascii_case(TicketStatus::Open.as_str())
-            {
-                backend
-                    .set_status(
-                        TicketIdOrSlug::Id(request.ticket_id.clone()),
-                        TicketStatus::Pending,
-                    )
-                    .map_err(|error| TicketActionError::Ticket(error.to_string()))?;
-                moved = true;
-            }
-            let notice = if moved {
-                format!(
-                    "Recorded Panel Defer for Ticket {} and moved it to pending.",
-                    current_ticket.slug
-                )
-            } else {
-                format!(
-                    "Recorded Panel Defer for Ticket {}; status was already {}.",
-                    current_ticket.slug, current_ticket.status
-                )
-            };
-            Ok(TicketActionOutcome { notice })
+            Ok(TicketActionOutcome {
+                notice: format!(
+                    "Recorded Panel Defer for Ticket {}; state remains {}.",
+                    current_ticket.id,
+                    current_ticket.workflow_state.as_str()
+                ),
+            })
         }
         NextUserAction::Close => unreachable!("Close action is handled before row dispatch"),
         NextUserAction::Clarify
@@ -2075,41 +2052,40 @@ fn dispatch_panel_close(
 
     Ok(TicketActionOutcome {
         notice: format!(
-            "Closed Ticket {}; deterministic resolution recorded because workflow_state was already done.",
-            ticket.meta.slug
+            "Closed Ticket {}; deterministic resolution recorded because state was already done.",
+            ticket.meta.id
         ),
     })
 }
 
 fn panel_close_blocker(ticket: &ticket::Ticket) -> Option<String> {
-    let slug = ticket.meta.slug.as_str();
-    if ticket.meta.status.as_local() != Some(TicketStatus::Open) {
+    let ticket_id = ticket.meta.id.as_str();
+    if ticket.meta.workflow_state == TicketWorkflowState::Closed {
         return Some(format!(
-            "Close blocked for Ticket {slug}: local status is {}, expected open; no close was recorded.",
-            ticket.meta.status.as_str()
+            "Close blocked for Ticket {ticket_id}: state is already closed; no close was recorded."
         ));
     }
     if ticket.meta.workflow_state != TicketWorkflowState::Done {
         return Some(format!(
-            "Close blocked for Ticket {slug}: workflow_state is {}, expected done; no close was recorded.",
+            "Close blocked for Ticket {ticket_id}: state is {}, expected done; no close was recorded.",
             ticket.meta.workflow_state.as_str()
         ));
     }
     if let Some(reason) = non_empty_ticket_field(ticket.meta.attention_required.as_deref()) {
         return Some(format!(
-            "Close blocked for Ticket {slug}: attention_required is set ({}); no close was recorded.",
+            "Close blocked for Ticket {ticket_id}: attention_required is set ({}); no close was recorded.",
             bounded_panel_diagnostic(reason)
         ));
     }
     if let Some(reason) = non_empty_ticket_field(ticket.meta.action_required.as_deref()) {
         return Some(format!(
-            "Close blocked for Ticket {slug}: action_required is set ({}); no close was recorded.",
+            "Close blocked for Ticket {ticket_id}: action_required is set ({}); no close was recorded.",
             bounded_panel_diagnostic(reason)
         ));
     }
     if ticket.resolution.is_some() {
         return Some(format!(
-            "Close blocked for Ticket {slug}: resolution.md already exists; no close was recorded."
+            "Close blocked for Ticket {ticket_id}: resolution.md already exists; no close was recorded."
         ));
     }
     None
@@ -2125,13 +2101,13 @@ fn panel_close_resolution(
 ) -> ticket::MarkdownText {
     if is_japanese_ticket_record_language(record_language) {
         ticket::MarkdownText::new(format!(
-            "Ticket `{}` (`{}`) はすでに `workflow_state: done` に到達していたため、workspace Panel から close しました。\n\nこの Close action によって、実装作業、workflow-state 変更、Orchestrator/Companion launch、worker invocation は開始されていません。\n",
-            ticket.meta.slug, ticket.meta.id
+            "Ticket `{}` (`{}`) はすでに `state: done` に到達していたため、workspace Panel から close しました。\n\nこの Close action によって、実装作業、state 変更、Orchestrator/Companion launch、worker invocation は開始されていません。\n",
+            ticket.meta.id, ticket.meta.title
         ))
     } else {
         ticket::MarkdownText::new(format!(
-            "Closed from the workspace Panel because Ticket `{}` (`{}`) had already reached `workflow_state: done`.\n\nNo implementation work, workflow-state change, Orchestrator/Companion launch, or worker invocation was started by this Close action.\n",
-            ticket.meta.slug, ticket.meta.id
+            "Closed from the workspace Panel because Ticket `{}` (`{}`) had already reached `state: done`.\n\nNo implementation work, state change, Orchestrator/Companion launch, or worker invocation was started by this Close action.\n",
+            ticket.meta.id, ticket.meta.title
         ))
     }
 }
@@ -2171,7 +2147,7 @@ fn orchestrator_queue_notification_message(
 ) -> String {
     let title = ticket.title.replace(['\r', '\n'], " ");
     format!(
-        "Workspace panel Queue for Ticket `{}` (`{}`), title `{}`: human authorized Orchestrator routing; this is not an unattended scheduler. Read the Ticket and inspect current workspace state. If unblocked, record routing and transition workflow_state queued -> inprogress before any worktree/SpawnPod implementation side effects. After inprogress acceptance, use worktree-workflow for `.worktree/<task-name>` creation with tracked `.yoi` project records visible and `.yoi/memory` plus local/runtime/log/lock/secret-like `.yoi` paths excluded, then use multi-agent-workflow to run sibling coder/reviewer Pods (coder narrow child-worktree write scope, reviewer read-only by default) and stop at a merge-ready dossier without merge/close/final approval. If blocked, record a concise reason and leave the Ticket queued or explicitly defer it.",
+        "Workspace panel Queue for Ticket `{}` (`{}`), title `{}`: human authorized Orchestrator routing; this is not an unattended scheduler. Read the Ticket and inspect current workspace state. If unblocked, record routing and transition state queued -> inprogress before any worktree/SpawnPod implementation side effects. After inprogress acceptance, use worktree-workflow for `.worktree/<task-name>` creation with tracked `.yoi` project records visible and `.yoi/memory` plus local/runtime/log/lock/secret-like `.yoi` paths excluded, then use multi-agent-workflow to run sibling coder/reviewer Pods (coder narrow child-worktree write scope, reviewer read-only by default) and stop at a merge-ready dossier without merge/close/final approval. If blocked, record a concise reason and leave the Ticket queued or explicitly defer it.",
         ticket.slug,
         ticket.id,
         title.trim()
@@ -3028,7 +3004,7 @@ mod tests {
 
     fn ticket_workspace(
         slug: &str,
-        workflow_state: TicketWorkflowState,
+        state: TicketWorkflowState,
         configure: impl FnOnce(&mut NewTicket),
     ) -> (TempDir, String, LocalTicketBackend) {
         let temp = TempDir::new().unwrap();
@@ -3050,7 +3026,7 @@ mod tests {
             labels: Vec::new(),
             readiness: None,
             action_required: None,
-            workflow_state: Some(workflow_state),
+            state: Some(state),
             attention_required: None,
             queued_by: None,
             queued_at: None,
@@ -3109,7 +3085,7 @@ mod tests {
             .iter()
             .find(|event| {
                 event.kind == TicketEventKind::StateChanged
-                    && event.state_field.as_deref() == Some("workflow_state")
+                    && event.workflow_state_field.as_deref() == Some("state")
                     && event.from.as_deref() == Some("ready")
                     && event.to.as_deref() == Some("queued")
             })
@@ -3126,7 +3102,7 @@ mod tests {
                 .await
                 .unwrap_err();
 
-        assert!(error.to_string().contains("workflow_state is ready"));
+        assert!(error.to_string().contains("state is ready"));
         let ticket = backend.show(TicketIdOrSlug::Id(ticket_id)).unwrap();
         assert_eq!(ticket.meta.status.as_local(), Some(TicketStatus::Open));
         assert_eq!(ticket.meta.workflow_state, TicketWorkflowState::Ready);
@@ -3149,7 +3125,7 @@ mod tests {
         assert!(ticket.meta.queued_by.is_none());
         assert!(!ticket.events.iter().any(|event| {
             event.kind == TicketEventKind::StateChanged
-                && event.state_field.as_deref() == Some("workflow_state")
+                && event.workflow_state_field.as_deref() == Some("state")
         }));
     }
 
@@ -3184,7 +3160,7 @@ mod tests {
                 .unwrap();
 
         assert!(outcome.notice.contains("Closed Ticket panel-close"));
-        assert!(outcome.notice.contains("workflow_state was already done"));
+        assert!(outcome.notice.contains("state was already done"));
         let ticket = backend.show(TicketIdOrSlug::Id(ticket_id)).unwrap();
         assert_eq!(ticket.meta.status.as_local(), Some(TicketStatus::Closed));
         assert_eq!(ticket.meta.workflow_state, TicketWorkflowState::Done);
@@ -3193,9 +3169,9 @@ mod tests {
             .as_ref()
             .expect("Panel Close records resolution.md")
             .as_str();
-        assert!(resolution.contains("workflow_state: done"));
+        assert!(resolution.contains("state: done"));
         assert!(resolution.contains("No implementation work"));
-        assert!(resolution.contains("workflow-state change"));
+        assert!(resolution.contains("state change"));
         assert!(resolution.contains("worker invocation"));
         assert!(ticket.events.iter().any(|event| {
             event.kind == TicketEventKind::Close && event.body.as_str().contains("workspace Panel")
@@ -3316,7 +3292,7 @@ mod tests {
         assert!(message.contains("not an unattended scheduler"));
         assert!(message.contains("Read the Ticket"));
         assert!(message.contains("inspect current workspace state"));
-        assert!(message.contains("transition workflow_state queued -> inprogress"));
+        assert!(message.contains("transition state queued -> inprogress"));
         assert!(message.contains("before any worktree/SpawnPod implementation side effects"));
         assert!(message.contains("After inprogress acceptance"));
         assert!(message.contains("worktree-workflow"));
@@ -4677,9 +4653,8 @@ mod tests {
             kind: "task".to_string(),
             priority: "P2".to_string(),
             labels: Vec::new(),
-            workflow_state: TicketWorkflowState::parse(status)
-                .unwrap_or(TicketWorkflowState::Planning),
-            workflow_state_explicit: true,
+            state: TicketWorkflowState::parse(status).unwrap_or(TicketWorkflowState::Planning),
+            state_explicit: true,
             attention_required: None,
             next_action: Some(next_action),
             updated_at: None,

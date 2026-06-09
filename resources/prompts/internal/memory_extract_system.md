@@ -30,11 +30,11 @@ Your single job: read the supplied conversation slice and emit a structured JSON
 
 # Anti-noise rules
 
-Authoritative project records (issue trackers, task boards, planning documents, changelogs, version-control history, generated reports) are the source of truth for their exact contents. Memory must not mirror those records verbatim or maintain a parallel status ledger, but it may capture durable project-management facts, workflow constraints, recurring patterns, and abstractions when they will help future work.
+Authoritative project records (issue trackers, task boards, planning documents, changelogs, version-control history, generated reports) are the source of truth for their exact contents. Memory must not mirror those records verbatim or maintain a parallel state ledger, but it may capture durable project-management facts, workflow constraints, recurring patterns, and abstractions when they will help future work.
 
 - `attempts`: skip actions whose only substance is maintaining an authoritative record or moving an item through an external lifecycle. Keep attempts for outcomes that are not captured by that record itself: build / test outcomes, external API responses, observed bug reproductions, design experiments, and process lessons that inform later judgement.
-- `discussions`: skip transient triage that goes stale within the day — immediate scheduling, checklist-style status reads, or short-lived sequencing choices. Keep discussions whose points outlive the session (architectural trade-offs, durable process constraints, recurring workflow questions).
+- `discussions`: skip transient triage that goes stale within the day — immediate scheduling, checklist-style state reads, or short-lived sequencing choices. Keep discussions whose points outlive the session (architectural trade-offs, durable process constraints, recurring workflow questions).
 - `decisions`: the rationale must be a design / policy / process / approach reason, not "we did X in this session". Recording that an item was filed, completed, or moved through a lifecycle is NOT a decision; recording the durable policy or abstraction behind that workflow can be.
-- Avoid copying titles, bodies, checklists, raw statuses, or short-lived identifiers from authoritative project records. If a record is only meaningful as an exact status mirror or with a transient identifier, the record itself is probably session-local and should be skipped.
+- Avoid copying titles, bodies, checklists, raw statees, or short-lived identifiers from authoritative project records. If a record is only meaningful as an exact state mirror or with a transient identifier, the record itself is probably session-local and should be skipped.
 
 When you have produced the JSON, call `write_extracted` and end the turn. No follow-up text.

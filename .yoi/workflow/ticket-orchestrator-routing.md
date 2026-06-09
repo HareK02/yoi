@@ -25,9 +25,9 @@ TicketCreate / TicketComment
   -> 必要に応じて他 Workflow へ接続
 ```
 
-- Intake は Ticket の materialization と planning/clarification を担当する role であり、workflow_state 名ではない。
-- workflow_state は `planning -> ready -> queued -> inprogress -> done` を基本遷移とする。
-- `ticket-preflight-workflow` は legacy slug 互換の planning/requirements sync entry であり、`preflight` を独立 state / lane / long-lived operation として扱わない。
+- Intake は Ticket の materialization と planning/clarification を担当する role であり、state 名ではない。
+- state は `planning -> ready -> queued -> inprogress -> done` を基本遷移とする。
+- `ticket-preflight-workflow` は legacy canonical id 互換の planning/requirements sync entry であり、`preflight` を独立 state / lane / long-lived operation として扱わない。
 - `ready -> queued` は人間が Orchestrator routing を許可した状態であり、worktree 作成や Pod 起動の許可そのものではない。
 - `multi-agent-workflow` は coder / reviewer Pod と worktree を使う実装・レビュー loop。
 - この Workflow は自動 scheduler / lease / unattended maintainer ではない。
@@ -74,7 +74,7 @@ Orchestrator は以下を行う。
 - `TicketStatus`: pending/open などの状態整理が明示的に許可された場合だけ使う。
 - `TicketWorkflowState`: `queued -> inprogress` acceptance、`inprogress -> done`、または concrete missing decision/information reason を伴う `ready|queued -> planning` に使う。
 - `TicketOrchestrationPlanQuery`: 対象 Ticket や関連 Ticket の ordering / blocker / conflict / waiting-capacity / accepted-plan 記録を読む。queued acceptance 前に必ず確認する。
-- `TicketOrchestrationPlanRecord`: Orchestrator が routing 中に project-relevant な ordering / dependency / conflict / capacity/waiting / accepted-plan decision を残す。これは queue reorder、自動起動、workflow_state 変更ではない。
+- `TicketOrchestrationPlanRecord`: Orchestrator が routing 中に project-relevant な ordering / dependency / conflict / capacity/waiting / accepted-plan decision を残す。これは queue reorder、自動起動、state 変更ではない。
 - `TicketClose`: 完了権限と resolution が揃っている場合だけ使う。
 - `TicketDoctor`: routing 前後の整合性確認。
 
@@ -82,13 +82,13 @@ Orchestrator は以下を行う。
 
 ## Queued acceptance contract
 
-`workflow_state = queued` は、Ticket が routing 対象として人間により Orchestrator へ渡された状態である。Orchestrator は queued notification を受けたら、Ticket、workspace state、対象 Ticket の `TicketOrchestrationPlanQuery` 記録、risk domain に応じた bounded project context を読んで、次のどちらかを行う。
+`state = queued` は、Ticket が routing 対象として人間により Orchestrator へ渡された状態である。Orchestrator は queued notification を受けたら、Ticket、workspace state、対象 Ticket の `TicketOrchestrationPlanQuery` 記録、risk domain に応じた bounded project context を読んで、次のどちらかを行う。
 
 - unblocked と判断する場合: `queued -> inprogress` を記録してから worktree 作成、implementation/review Pod spawn、その他の implementation side effect に進む。
   - `before` / `after` / `blocked_by` / `blocks` / `conflicts_with` / `do_not_parallelize` / waiting-capacity 記録がある場合、それを acceptance 判断の入力にする。記録は自動 scheduler ではないため、実際に進めるかどうかは Orchestrator が読んだうえで明示的に決める。
   - risk flags / risky domain がある場合は、IntentPacket に invariants / reviewer focus / escalation conditions を入れる。risk flag だけを `queued -> planning` の理由にしない。
 - concrete missing decision / information がある場合: `TicketWorkflowState` で `queued -> planning` を記録し、reason/body と `TicketComment` に不足項目、checked context、なぜ coder の implementation latitude では解決できないか、次の planning question/action を残す。既存の claimed live/restorable Intake/Planning Pod があり、既存通知経路が使える場合は同じ理由を通知する。
-- external action 待ちなど planning では解決しない blocker の場合: concise な理由を Ticket thread に記録し、queued のまま待つか、既存の Ticket status/state mechanism で明示的に defer/block する。
+- external action 待ちなど planning では解決しない blocker の場合: concise な理由を Ticket thread に記録し、queued のまま待つか、既存の Ticket state/state mechanism で明示的に defer/block する。
 
 Invariant:
 
@@ -268,7 +268,7 @@ Action:
 
 ### 1. 状態確認
 
-- `git status --short --branch`
+- `git state --short --branch`
 - `TicketShow <target>`
 - 関連 Ticket の `TicketList` / `TicketShow`
 - 必要に応じて docs/code/workflow/history
@@ -389,7 +389,7 @@ IntentPacket が短く書けない場合、`implementation_ready` ではなく `
 ### 7. 後続 Workflow へ接続する
 
 - `requirements_sync_needed` → `ticket-intake-workflow` / human / planning sync
-- `return_to_planning` → `ticket-preflight-workflow`（legacy compatibility slug の planning sync entry）
+- `return_to_planning` → `ticket-preflight-workflow`（legacy compatibility canonical id の planning sync entry）
 - `spike_needed` → read-only investigation plan / Pod（許可後）
 - `implementation_ready` → `multi-agent-workflow`
 - `review_needed` → reviewer Pod / review workflow

@@ -25,7 +25,7 @@ A parent/orchestrator must verify:
 
 - child output via `ReadPodOutput`
 - live/restorable state via Pod tools when relevant
-- worktree status and diff
+- worktree state and diff
 - validation command output
 - Ticket requirements and acceptance criteria
 

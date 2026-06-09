@@ -110,11 +110,11 @@ impl TicketFeature {
         if !root.is_dir() {
             return Err("ticket backend root is not a directory".to_string());
         }
-        for status_dir in ["open", "pending", "closed"] {
-            let dir = root.join(status_dir);
+        for state_dir in ["open", "pending", "closed"] {
+            let dir = root.join(state_dir);
             if !dir.is_dir() {
                 return Err(format!(
-                    "ticket backend root is missing required {status_dir}/ directory"
+                    "ticket backend root is missing required {state_dir}/ directory"
                 ));
             }
         }
@@ -192,12 +192,14 @@ fn tool_description(name: &str) -> &'static str {
             "Mark an intake Ticket ready and append the typed intake summary/state transition events."
         }
         "TicketWorkflowState" => {
-            "Transition Ticket workflow_state; queued -> inprogress is the accepted implementation start, so implementation side effects should happen only after that transition is accepted and recorded."
+            "Transition Ticket state; queued -> inprogress is the accepted implementation start, so implementation side effects should happen only after that transition is accepted and recorded."
         }
-        "TicketStatus" => "Move a Ticket between open and pending; use TicketClose for closed.",
+        "TicketStateCompat" => {
+            "Move a Ticket between open and pending; use TicketClose for closed."
+        }
         "TicketClose" => "Close a Ticket with a resolution through the typed local Ticket backend.",
         "TicketOrchestrationPlanRecord" => {
-            "Append a durable typed Ticket orchestration plan record without changing workflow_state or starting work."
+            "Append a durable typed Ticket orchestration plan record without changing state or starting work."
         }
         "TicketOrchestrationPlanQuery" => {
             "Query durable Ticket orchestration plan records by Ticket and/or relation kind."
@@ -261,7 +263,7 @@ mod tests {
     }
 
     #[test]
-    fn read_only_descriptor_declares_only_status_tools() {
+    fn read_only_descriptor_declares_only_state_tools() {
         let temp = TempDir::new().unwrap();
         let feature = ticket_tools_feature_with_access(temp.path(), TicketFeatureAccess::ReadOnly);
         let descriptor = feature.descriptor();
@@ -467,7 +469,7 @@ provider = "github"
     }
 
     #[test]
-    fn does_not_register_ticket_tools_when_root_lacks_status_dirs() {
+    fn does_not_register_ticket_tools_when_root_lacks_state_dirs() {
         let temp = TempDir::new().unwrap();
         std::fs::create_dir_all(temp.path().join(DEFAULT_TICKET_BACKEND_RELATIVE_PATH)).unwrap();
         let mut pending_tools = Vec::new();

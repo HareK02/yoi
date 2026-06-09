@@ -39,7 +39,7 @@ Intake は以下を行う。
 - 不足している要件を質問する。
 - 作成または refinement する Ticket が、実装・レビュー・検証・完了判断を単独で行える concrete work item であるか確認する。
 - 広い依頼を分割する場合は、進捗コンテナとしての umbrella Ticket ではなく、concrete Ticket / Objective context / split decision record に責務を分ける。
-- Ticket の title / slug / kind / priority / labels を提案する。
+- Ticket の title / canonical id / kind / priority / labels を提案する。
 - background / requirements / acceptance criteria / escalation conditions を整理する。
 - binding decisions / invariants と implementation latitude を分けて書く。
 - 具体的な除外や触れてはいけない境界が binding decision である場合は、generic な除外リストではなく invariant / escalation condition として明記する。
@@ -70,7 +70,7 @@ Intake は以下を行う。
 - `TicketComment`: 既存 Ticket refinement / decision / plan の記録。
 - `TicketDoctor`: 必要に応じた整合性確認。
 
-Intake は `TicketReview`, `TicketStatus`, `TicketClose` を通常使わない。review / status transition / close は Orchestrator または reviewer / maintainer workflow の責務である。
+Intake は `TicketReview`, `TicketStatus`, `TicketClose` を通常使わない。review / state transition / close は Orchestrator または reviewer / maintainer workflow の責務である。
 
 Ticket tools が利用できない環境では、勝手に file write で代替しない。ユーザーまたは Orchestrator に「Ticket tools がないため materialize できない」と報告し、必要なら `yoi ticket` を使える人間/親 workflow に戻す。
 
@@ -223,7 +223,7 @@ Related tickets/docs:
 新規 Ticket の場合:
 
 - `TicketCreate` を使う。
-- title / slug / kind / priority / labels / body を指定する。
+- title / canonical id / kind / priority / labels / body を指定する。
 - body に readiness / open questions / risk flags と、binding decisions / invariants、implementation latitude、escalation conditions を Markdown で明記する。
 
 既存 Ticket refinement の場合:
@@ -236,7 +236,7 @@ Related tickets/docs:
 
 ユーザーへ以下を返す。
 
-- 作成/更新した Ticket id / slug / title。
+- 作成/更新した Ticket id / canonical id / title。
 - readiness。
 - open questions / risk flags。
 - 次に Orchestrator が取るべき routing 候補。
@@ -293,6 +293,6 @@ Ticket の body は Markdown/freeform を維持する。すべてを strict sche
 
 ## 他 Workflow への接続
 
-- `ticket-preflight-workflow`: legacy compatibility slug の planning/requirements sync 入口。新規 routing は standalone preflight ではなく planning return/requirements sync として扱う。
+- `ticket-preflight-workflow`: legacy compatibility canonical id の planning/requirements sync 入口。新規 routing は standalone preflight ではなく planning return/requirements sync として扱う。
 - `multi-agent-workflow`: Orchestrator が implementation_ready と判断した後に接続する。
 - `ticket-orchestrator-routing`: この Workflow が作った Ticket を routing する後続 Workflow。
