@@ -70,7 +70,7 @@ Intake は以下を行う。
 - `TicketComment`: 既存 Ticket refinement / decision / plan の記録。
 - `TicketDoctor`: 必要に応じた整合性確認。
 
-Intake は `TicketReview`, `TicketStatus`, `TicketClose` を通常使わない。review / state transition / close は Orchestrator または reviewer / maintainer workflow の責務である。
+Intake は `TicketReview`, `TicketWorkflowState`, `TicketClose` を通常使わない。review / state transition / close は Orchestrator または reviewer / maintainer workflow の責務である。
 
 Ticket tools が利用できない環境では、勝手に file write で代替しない。ユーザーまたは Orchestrator に「Ticket tools がないため materialize できない」と報告し、必要なら `yoi ticket` を使える人間/親 workflow に戻す。
 
@@ -94,7 +94,7 @@ Ticket tools が利用できない環境では、勝手に file write で代替�
 
 確認観点:
 
-- 同じ目的の open / pending Ticket がないか。
+- 同じ目的の未完了 Ticket がないか。
 - closed Ticket の判断・resolution と矛盾しないか。
 - 既存の umbrella/progress-container Ticket が、superseded/decomposed として退役できる状態か。
 - 既存 concrete follow-up Ticket や Objective context で足りるか、新規 concrete Ticket が必要か。

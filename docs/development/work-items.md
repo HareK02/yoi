@@ -2,7 +2,7 @@
 
 Yoi project work is tracked through Tickets. For normal use, interact with Tickets through `yoi panel`, Ticket tools, the `yoi ticket ...` CLI, and Ticket workflows. Git history plus Ticket files remain the authoritative state-transition record behind those interfaces.
 
-The current local backend stores Ticket files under `.yoi/tickets/`. That storage detail matters for maintainers and backend compatibility, but it is not the primary user-facing workflow.
+The current local backend stores each Ticket in the flat `.yoi/tickets/<ticket-id>/` layout. The directory name is the canonical opaque Ticket id; slugs and frontmatter `id`/`slug` fields are not current-state authority. That storage detail matters for maintainers and backend compatibility, but it is not the primary user-facing workflow.
 
 Do not treat ad-hoc chat summaries, memory records, or Pod notifications as the final source of project state. Notifications are hints to inspect concrete state, not proof of completion.
 
@@ -36,7 +36,7 @@ Pods with the Ticket built-in feature can use typed Ticket tools:
 - `TicketShow`
 - `TicketComment`
 - `TicketReview`
-- `TicketStatus`
+- `TicketWorkflowState`
 - `TicketClose`
 - `TicketDoctor`
 
@@ -156,14 +156,13 @@ Routing classifications include:
 - `review_needed`
 - `blocked_action_required`
 - `close_ready`
-- `defer_pending`
 - `closed_or_noop`
 
 Routing decisions should be recorded with `TicketComment` using `plan` or `decision` role. The decision should state the classification, evidence checked, reason, next action, and escalation conditions. For `return_to_planning`, the record must also state the concrete missing decision/information, context checked, why implementation latitude is insufficient, and the next planning question/action.
 
 ### 3. Planning/requirements sync
 
-Use `ticket-preflight-workflow` only as a legacy compatibility canonical id for planning/requirements sync. Return `ready` or `queued` Tickets to `planning` only when the Orchestrator can name a concrete missing decision or information item after bounded project-context checks; risk flags and risky domains are context-lookup and reviewer-focus signals, not automatic stop gates.
+Use `ticket-preflight-workflow` only as a legacy-compatible planning/requirements sync entry. Return `ready` or `queued` Tickets to `planning` only when the Orchestrator can name a concrete missing decision or information item after bounded project-context checks; risk flags and risky domains are context-lookup and reviewer-focus signals, not automatic stop gates.
 
 Planning sync should resolve or record:
 
@@ -333,17 +332,17 @@ Do not store secrets, credentials, private prompt contents, or raw logs containi
 The product CLI exposes the typed Ticket backend for repository maintenance and validation. It operates on the configured `.yoi/tickets/` storage and is the preferred command-line surface when editing Tickets outside a Pod.
 
 ```sh
-yoi ticket create --title "..." [--canonical id canonical id] [--kind task] [--priority P2] [--label a,b]
+yoi ticket create --title "..." [--priority P2]
 yoi ticket list [--state planning|ready|queued|inprogress|done|closed|all]
 yoi ticket show <id>
 yoi ticket comment <id> [--role comment|plan|decision|implementation_report] [--file path]
 yoi ticket review <id> --approve|--request-changes [--file path]
-yoi ticket state <id> open|pending
+yoi ticket state <id> <planning|ready|queued|inprogress|done>
 yoi ticket close <id> [--resolution text|--file path]
 yoi ticket doctor
 ```
 
-`yoi ticket state` intentionally does not close Tickets. Closing must use `yoi ticket close` so the backend writes the required `resolution.md` and passes `yoi ticket doctor`.
+`yoi ticket state` records current lifecycle transitions among active states. Closing must use `yoi ticket close` so the backend writes the required `resolution.md` and passes `yoi ticket doctor`; `done` and `closed` remain distinct states.
 
 The current LocalTicketBackend stores records under:
 

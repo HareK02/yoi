@@ -110,14 +110,6 @@ impl TicketFeature {
         if !root.is_dir() {
             return Err("ticket backend root is not a directory".to_string());
         }
-        for state_dir in ["open", "pending", "closed"] {
-            let dir = root.join(state_dir);
-            if !dir.is_dir() {
-                return Err(format!(
-                    "ticket backend root is missing required {state_dir}/ directory"
-                ));
-            }
-        }
         Ok(root)
     }
 }
@@ -194,9 +186,6 @@ fn tool_description(name: &str) -> &'static str {
         "TicketWorkflowState" => {
             "Transition Ticket state; queued -> inprogress is the accepted implementation start, so implementation side effects should happen only after that transition is accepted and recorded."
         }
-        "TicketStateCompat" => {
-            "Move a Ticket between open and pending; use TicketClose for closed."
-        }
         "TicketClose" => "Close a Ticket with a resolution through the typed local Ticket backend.",
         "TicketOrchestrationPlanRecord" => {
             "Append a durable typed Ticket orchestration plan record without changing state or starting work."
@@ -228,9 +217,7 @@ mod tests {
     use tempfile::TempDir;
 
     fn make_ticket_root(root: &Path) {
-        std::fs::create_dir_all(root.join("open")).unwrap();
-        std::fs::create_dir_all(root.join("pending")).unwrap();
-        std::fs::create_dir_all(root.join("closed")).unwrap();
+        std::fs::create_dir_all(root).unwrap();
     }
 
     fn write_ticket_config(workspace: &Path, content: &str) {
@@ -469,21 +456,21 @@ provider = "github"
     }
 
     #[test]
-    fn does_not_register_ticket_tools_when_root_lacks_state_dirs() {
+    fn registers_ticket_tools_for_flat_backend_root() {
         let temp = TempDir::new().unwrap();
-        std::fs::create_dir_all(temp.path().join(DEFAULT_TICKET_BACKEND_RELATIVE_PATH)).unwrap();
+        let root = temp.path().join(DEFAULT_TICKET_BACKEND_RELATIVE_PATH);
+        std::fs::create_dir_all(&root).unwrap();
         let mut pending_tools = Vec::new();
         let mut hooks = HookRegistryBuilder::default();
         let report = FeatureRegistryBuilder::new()
             .with_module(ticket_tools_feature(temp.path()))
             .install_into_pending(&mut pending_tools, &mut hooks);
 
-        assert!(pending_tools.is_empty());
-        assert!(report.reports[0].installed_tools.is_empty());
-        assert!(
-            report.reports[0].diagnostics[0]
-                .message
-                .contains("missing required open/ directory")
-        );
+        assert_eq!(pending_tools.len(), TICKET_TOOL_NAMES.len());
+        assert_eq!(report.reports[0].installed_tools, TICKET_TOOL_NAMES);
+        assert!(report.reports[0].diagnostics.is_empty());
+        assert!(!root.join("open").exists());
+        assert!(!root.join("pending").exists());
+        assert!(!root.join("closed").exists());
     }
 }
