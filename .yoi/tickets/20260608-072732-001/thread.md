@@ -325,3 +325,32 @@ Residual risks noted by coder:
 - `supersedes` / `duplicate_of` do not automatically close/block/transition Tickets.
 
 ---
+
+<!-- event: review author: reviewer at: 2026-06-09T06:28:28Z status: approve -->
+
+## Review: approve
+
+Approved review for commit `4601ad2b41d6c51c9d445ca2291726a658c42ab5`.
+
+Evidence checked:
+- `TicketRelationKind` stores only `depends_on`, `blocks`, `related`, `supersedes`, and `duplicate_of`; hierarchy/container names are not supported as current relation kinds.
+- Relation storage is a typed `artifacts/relations.json` artifact with versioned JSON, `deny_unknown_fields`, owner-ticket validation, self/duplicate validation, and canonical Ticket-id lookup for targets.
+- Inverse relation views are derived through `TicketShow`/CLI output; only forward records are written.
+- Queue gates reject unresolved outgoing `depends_on` and incoming unresolved `blocks` at both `ready -> queued` and `queued -> inprogress`; Panel rows use the derived blocker view rather than silently offering Queue.
+- `TicketRelationQuery` is read-only and `TicketRelationRecord` is mutating in the ticket tool partitions.
+- Orchestrator guidance explicitly separates project-level relation metadata from OrchestrationPlan runtime ordering/capacity records.
+
+Validation run from the worktree:
+- `cargo test -q -p ticket ticket_relations`
+- `cargo test -q -p ticket queue_gate_rejects`
+- `cargo test -q -p ticket doctor_validates_ticket_relations`
+- `cargo test -q -p ticket ticket_relation_tools_record`
+- `cargo test -q -p ticket ticket_tool_name_partitions_are_explicit`
+- `cargo test -q -p yoi ticket_cli_records_lists_and_shows_relations`
+- `cargo test -q -p tui workspace_panel_marks_ready_ticket_with_unresolved_relation_blocked`
+- `cargo run -q -p yoi -- ticket doctor`
+- `nix build .#yoi`
+
+Residual risk: `TicketShow` tool description still summarizes the old output shape and does not mention relations, but the returned JSON and CLI display include relation metadata; this is documentation polish rather than a correctness blocker.
+
+---
