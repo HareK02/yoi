@@ -142,3 +142,30 @@ Parallel-routing rationale:
 - It is expected to have only small/manageable overlap with Profile feature-flag work.
 
 ---
+
+<!-- event: implementation_report author: coder at: 2026-06-09T12:04:53Z -->
+
+## Implementation report
+
+Implemented removal of `action_required` and `attention_required` from current Ticket schema/tool/API/panel behavior.
+
+Summary:
+- Removed both fields from `NewTicket`, parsed/public metadata structs, list/show JSON output, TicketCreate params/schema, CLI list hints, and workspace panel row state.
+- Removed Panel ready-ticket blocker and safe-close guards that depended on those fields; relation blockers continue to block via existing relation metadata.
+- Added doctor obsolete-frontmatter diagnostics for both fields and updated focused tests to assert new writes/schema/output omit them.
+- Updated maintained Intake/Orchestrator workflow guidance and development routing classification text away from the obsolete fields.
+- Checked local `.yoi/tickets/**/item.md` frontmatter: no `action_required` or `attention_required` entries were present, so no non-null current values required migration or replacement.
+
+Validation:
+- `cargo test -p ticket`
+- `cargo test -p tui workspace_panel`
+- `cargo test -p tui ticket_close_action`
+- `cargo test -p yoi ticket`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo run -q -p yoi -- ticket doctor`
+- `cargo check --workspace`
+- frontmatter grep/awk check for `.yoi/tickets/*/item.md`
+- `nix build .#yoi`
+
+---

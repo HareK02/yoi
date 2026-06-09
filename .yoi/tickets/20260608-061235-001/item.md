@@ -1,8 +1,8 @@
 ---
 title: "Prevent idle starvation in Ticket orchestration planning"
-state: "planning"
+state: 'ready'
 created_at: "2026-06-08T06:12:35Z"
-updated_at: "2026-06-08T06:27:33Z"
+updated_at: '2026-06-09T11:35:29Z'
 ---
 
 ## Background

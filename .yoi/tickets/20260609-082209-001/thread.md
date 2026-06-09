@@ -116,3 +116,29 @@ Parallel-routing rationale:
 - It is expected to have only small/manageable overlap with the Ticket schema field cleanup running in parallel.
 
 ---
+
+<!-- event: implementation_report author: coder at: 2026-06-09T12:05:22Z -->
+
+## Implementation report
+
+Implemented Profile feature flags for built-in tool-surface registration.
+
+Summary:
+- Added resolved `feature` config with explicit flags for `task`, `memory`, `web`, `pod_management`, `ticket`, and `ticket_orchestration` plus Ticket `access = "read_only" | "lifecycle"`.
+- Changed controller registration so optional built-in surfaces are registered only when enabled by Profile/config; core filesystem/process tools remain static and scope-gated.
+- Kept safety boundaries: web tools still fail closed under web config, memory feature requires `[memory]`, pod-management feature requires non-empty delegation scope, Ticket tools still use backend host authority.
+- Split Ticket base and orchestration tool declarations so Ticket orchestration can be surfaced independently.
+- Migrated project role profiles and builtin default profile to explicit feature settings.
+
+Validation passed:
+- `cargo test -p manifest feature --lib`
+- `cargo test -p pod feature --tests`
+- `cargo test -p pod pod_management_feature_requires_delegation_scope --test controller_test`
+- `cargo test -p tools --test integration`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo run -q -p yoi -- ticket doctor`
+- `cargo check --workspace`
+- `nix build .#yoi`
+
+---
