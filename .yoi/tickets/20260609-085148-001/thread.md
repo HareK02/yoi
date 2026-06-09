@@ -140,3 +140,65 @@ Residual notes:
 - Bash test detection is heuristic and only annotates interrupted edit sequences; it is not blame/policy classification.
 
 ---
+
+<!-- event: review author: reviewer at: 2026-06-09T11:03:25Z status: approve -->
+
+## Review: approve
+
+## Review result: approve
+
+Reviewed commit `963db29d960d23b40e32d6b07db88f52b914a72d` against Ticket `20260609-085148-001`.
+
+Evidence:
+- Diff scope is limited to `crates/session-analytics/src/lib.rs` and `crates/yoi/src/session_cli.rs`; no prompt, workflow, tool behavior, or batching-policy/enforcement changes were introduced.
+- `SessionReport` exposes `response_batches` in JSON with response-level tool metrics, histogram/top responses, nested Edit batching metrics, and edit round-trip/annotated-sequence metrics.
+- Response grouping is best-effort over contiguous top-level `assistant_item` entries; non-assistant entries close the response. Seeded `segment_start.history` tool calls are excluded from response metrics and add a `response_boundary_approximation` diagnostic.
+- New observations use bounded diagnostic language such as “possible batching opportunity” / “not automatic blame”; no policy enforcement or judgment of small edits is present.
+- Privacy boundary was checked with a synthetic JSONL fixture containing sentinel raw `old_string`, `new_string`, and tool output content. The JSON report preserved paths/counts/sizes/indexes and did not include the raw sentinel values.
+- Tests added synthetic fixtures for response-level tool grouping, same-file multi-Edit response metrics, pure consecutive edit-only streaks, Read/Bash/test-like interrupted sequences, no-edit sessions, and CLI JSON field exposure.
+
+Validation run from the worktree:
+- `cargo test -p session-analytics`
+- `cargo test -p yoi run_session_analyze_outputs_json`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo check --workspace`
+- custom synthetic JSON/privacy assertion using `target/debug/yoi session analyze --json`
+- `cargo run -q -p yoi -- ticket doctor`
+- `nix build .#yoi`
+
+Residual risk:
+- Assistant response boundaries remain inherently approximate because session JSONL does not carry an explicit response id; the implementation reports this for seeded history and otherwise keeps the metrics best-effort rather than authoritative.
+
+No blocking issues found.
+
+---
+
+<!-- event: review author: reviewer-session-analytics-response-batching at: 2026-06-09T11:04:16Z status: approve -->
+
+## Review: approve
+
+Review result: approve
+
+Evidence:
+- Change scope is limited to `crates/session-analytics/src/lib.rs` and `crates/yoi/src/session_cli.rs`; no prompt/workflow behavior, tool behavior, or batching policy enforcement was added.
+- JSON report adds machine-readable `response_batches` fields covering response-level metrics, Edit batching metrics, and edit round-trip metrics.
+- Assistant response boundary is clearly best-effort: consecutive top-level `assistant_item` entries are grouped, non-assistant entries close a response, and seeded `segment_start.history` tool calls are excluded from response-level metrics with a `response_boundary_approximation` diagnostic.
+- Diagnostics are observational (`possible batching opportunity` / not automatic blame), not policy enforcement or blame for small edits.
+- Synthetic privacy fixture with raw `old_string`, `new_string`, and tool output sentinel was analyzed via `yoi session analyze --json`; raw sentinel content did not appear in output. Output stays at paths/counts/sizes/indexes/line ranges.
+- Tests are synthetic/minimal fixtures, not private local sessions. They cover response grouping, same-file multi-Edit, pure consecutive edit-only streaks, Read/Bash/test-like interruption, no-edit case, and CLI JSON exposure.
+
+Reviewer validation:
+- `cargo test -p session-analytics`
+- `cargo test -p yoi run_session_analyze_outputs_json`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo check --workspace`
+- custom synthetic JSON/privacy assertion using `target/debug/yoi session analyze --json`
+- `cargo run -q -p yoi -- ticket doctor`
+- `nix build .#yoi`
+
+Residual risk:
+- Session JSONL lacks explicit response ids, so response boundaries are inherently approximate. The implementation reports this boundedly and treats the feature as best-effort analytics, which is acceptable for this Ticket.
+
+---
