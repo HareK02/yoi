@@ -529,3 +529,59 @@ Required fix:
 - Re-run the relevant focused validation and core checks before re-review.
 
 ---
+
+<!-- event: implementation_report author: coder at: 2026-06-09T04:40:07Z -->
+
+## Implementation report
+
+Third review fix-loop update: removed the remaining stale old-bucket TUI test setup in `crates/tui/src/multi_pod.rs` by writing `resolution.md` under the flat `.yoi/tickets/<ticket-id>/` test fixture path. Re-scanned `crates/tui/src` for `.yoi/tickets/open`, `.yoi/tickets/pending`, and `.yoi/tickets/closed`; no matches remain. Focused pending/slug-current-authority searches only found non-Ticket pending UI/task terminology and local role-session display slug metadata, not old Ticket bucket/current-state setup.
+
+Validation passed:
+- `cargo test -p tui ticket_close_action_blocks_existing_resolution_without_moving_ticket`
+- `cargo test -p tui ticket_action --no-run`
+- `cargo test -p tui workspace_panel`
+- `cargo test -p ticket`
+- `cargo test -p yoi ticket_cli`
+- `cargo test -p pod ticket`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo run -q -p yoi -- ticket doctor` (`doctor: ok`)
+- `cargo check --workspace`
+- `nix build .#yoi` (dirty-tree warning only while uncommitted)
+
+No remaining risks identified for the requested blocker.
+
+---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-09T04:41:51Z -->
+
+## Implementation report
+
+Coder fix-loop for third reviewer request_changes completed and is ready for re-review.
+
+Coder Pod:
+- `coder-simplify-ticket-identity-fields`
+- New fix commit: `6ca27f3 fix: use flat ticket path in tui test`
+- Branch status after fix: clean
+- Stopped after collecting output to reclaim delegated worktree scope.
+
+Fix summary:
+- Updated `crates/tui/src/multi_pod.rs` test fixture `ticket_close_action_blocks_existing_resolution_without_moving_ticket` from old `.yoi/tickets/open/<ticket-id>/resolution.md` to flat `.yoi/tickets/<ticket-id>/resolution.md`.
+- Re-searched `crates/tui/src` for `.yoi/tickets/open`, `.yoi/tickets/pending`, `.yoi/tickets/closed`; coder reports no matches.
+
+Coder validation reported passed:
+- `cargo test -p tui ticket_close_action_blocks_existing_resolution_without_moving_ticket`
+- `cargo test -p tui ticket_action --no-run`
+- `cargo test -p tui workspace_panel`
+- `cargo test -p ticket`
+- `cargo test -p yoi ticket_cli`
+- `cargo test -p pod ticket`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo run -q -p yoi -- ticket doctor` -> `doctor: ok`
+- `cargo check --workspace`
+- `nix build .#yoi`
+
+Coder reports no remaining risks.
+
+---
