@@ -115,3 +115,51 @@ Routing context:
 - `20260609-084725-001` is also left queued for capacity/sequencing while this core migration is active.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-09T10:33:45Z -->
+
+## Implementation report
+
+Coder implementation completed and is ready for sibling review.
+
+Coder Pod:
+- `coder-tool-execution-context`
+- Commit: `d8aed7befe6ff739cbee1b49221d3b8be35a57d7 tool: add execution context`
+- Worktree status before review: clean branch `tool-execution-context`
+- Stopped after collecting output to reclaim delegated worktree scope.
+
+Selected design:
+- Added `llm_worker::tool::ToolExecutionContext` with `call_id`, `batch_id`, and `call_index`.
+- `batch_id` is Worker-local monotonic (`tool-batch-{n}`) and shared across one `execute_and_commit_tools` batch.
+- `call_index` is 0-based order from the LLM-returned tool call array.
+- `call_id` is synchronized to any pre-interceptor-mutated tool call id before execution/post context.
+
+Implementation summary:
+- `Tool::execute` and `ToolServer::call_tool` now receive `ToolExecutionContext`.
+- Worker assigns context while preserving parallel approved tool execution via `join_all`.
+- `ToolCallInfo` / `ToolResultInfo` expose context.
+- skipped / synthetic / post-tool paths have context available.
+- Built-in tools, Ticket tools, Memory tools, Pod tools, test fixtures, and macro-generated Tool implementations were migrated.
+- `llm-worker-macros` excludes `ToolExecutionContext` parameters from JSON schema and supplies them from execution context.
+- Added direct/default context helpers for low-level direct tests; Worker path passes explicit batch context.
+
+Validation reported passed:
+- `cargo test -p llm-worker --test tool_macro_test`
+- `cargo test -p llm-worker --test parallel_execution_test`
+- `cargo test -p llm-worker`
+- `cargo test -p tools -p ticket`
+- `cargo test -p memory`
+- `cargo test -p pod --tests --no-run`
+- `cargo test --workspace --no-run`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo check --workspace`
+- `cargo run -q -p yoi -- ticket doctor`
+- `nix build .#yoi`
+
+Residual notes:
+- `batch_id` is not globally durable.
+- Resumed pending tool calls receive a fresh execution batch id.
+- No scheduling, serialization, per-resource locks, same-file queueing, or `parallel_tool_calls=false` equivalent was added.
+
+---
