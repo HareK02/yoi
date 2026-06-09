@@ -108,3 +108,63 @@ Next action:
 - After `orchestrator-return-to-planning-context-policy` is merged/closed/cleaned up or explicitly held back, re-read this Ticket and accept it from queued if still unblocked.
 
 ---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-09T01:19:38Z from: queued to: inprogress reason: orchestrator_acceptance field: workflow_state -->
+
+## State changed
+
+Accepted queued implementation after re-reading the Ticket and current workspace state. The earlier deferral condition has been resolved: `orchestrator-return-to-planning-context-policy` was merged, validated, closed, and cleaned up, so there is no longer a pending adjacent policy branch blocking this work.
+
+---
+
+<!-- event: decision author: orchestrator at: 2026-06-09T01:19:38Z -->
+
+## Decision
+
+Routing decision: implementation_ready
+
+Evidence checked:
+- Ticket body and thread, including Intake refinement and the explicit `no hierarchy relations` decision.
+- Current workspace/worktree state after merging and cleaning up `orchestrator-return-to-planning-context-policy`.
+- Current open worktree list: no active implementation worktree remains.
+- The prior `defer_pending_policy_merge` blocker is resolved.
+
+Reason:
+- This is a bounded workflow/docs/planning policy cleanup.
+- It does not require implementing Objective records or typed relation metadata.
+- Requirements and acceptance criteria are concrete, including the migration/close recommendation for `workspace-panel-orchestrator-queue-automation`.
+
+IntentPacket:
+
+Intent:
+- Deprecate long-lived umbrella/progress-container Tickets and align Intake/Planning/Orchestrator/work-item guidance around concrete Tickets, Objectives, and non-hierarchical relation concepts.
+
+Binding decisions / invariants:
+- Do not create or endorse new umbrella Tickets for broad multi-Ticket efforts.
+- Tickets should be concrete work items that can be implemented, reviewed, validated, and closed on their own terms.
+- Splitting broad requests should produce concrete implementable Tickets and durable decision context, not parent/child or umbrella containers.
+- Do not introduce or use hierarchy/container relations such as parent/child, sub-ticket, umbrella, part_of, or contains as replacements.
+- Typed Ticket relation design/implementation remains out of scope; relation wording must stay non-hierarchical and defer implementation details to `typed-ticket-relation-metadata`.
+- Objective record design/implementation remains out of scope; Objective references may be conceptual/policy guidance only.
+- Existing umbrella Tickets may be closed as superseded/decomposed once concrete follow-up Tickets/Objective context exists; that close means the container role is retired, not that all related future concerns are complete.
+- Preserve the ability to create an initial concrete planning/design/investigation Ticket when the user asks for a concrete work item; the deprecated pattern is the long-lived progress container.
+- Do not rewrite historical thread history or migrate every historical umbrella immediately.
+
+Implementation latitude:
+- Update maintained workflow docs, resource prompts/workflows, and development docs narrowly.
+- Add or update focused validation where practical. If there is no resource-test harness, focused grep/resource validation plus `git diff --check`, `ticket doctor`, and Nix build is acceptable for docs/workflow-only changes.
+- For `workspace-panel-orchestrator-queue-automation`, either record a clear migration/close recommendation in that Ticket thread or create a narrow follow-up if direct closure is not appropriate.
+
+Escalate if:
+- The implementation requires changing Ticket backend schema/workflow states.
+- Objective records or typed Ticket relation metadata must be implemented to express the policy.
+- The wording would accidentally prohibit concrete initial planning/design/investigation Tickets.
+- Broad historical migration or thread rewriting appears necessary.
+
+Validation:
+- Focused text validation for: no new umbrella/progress-container guidance; no parent/child/sub-ticket/part_of hierarchy replacement; concrete planning Ticket carve-out preserved; existing umbrella retirement guidance present.
+- `git diff --check`.
+- `cargo run -q -p yoi -- ticket doctor` or equivalent current binary Ticket doctor.
+- `nix build .#yoi` if workflows/resources/docs included in package inputs are touched.
+
+---
