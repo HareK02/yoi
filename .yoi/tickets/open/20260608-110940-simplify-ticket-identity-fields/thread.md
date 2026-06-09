@@ -284,3 +284,57 @@ Routing context:
 - This is a broad/high-risk schema/storage migration, so the handoff emphasizes audit-first implementation, complete local Ticket record migration, buildable coherent stopping points, and escalation if permanent legacy compatibility or a larger storage-provider redesign is discovered.
 
 ---
+
+<!-- event: decision author: orchestrator at: 2026-06-09T03:03:16Z -->
+
+## Decision
+
+Human completion-boundary decision for this Ticket:
+
+For `simplify-ticket-identity-fields`, stop at the merge-complete boundary.
+
+Reason:
+- The branch migrates local Ticket records from the old bucket layout to the new flat identity/state schema.
+- At merge time, the repository data layout changes, while the currently running Orchestrator/Ticket tools may still be the pre-merge binary/schema.
+
+Operational rule:
+- Continue coder fix-loop and reviewer workflow normally.
+- If reviewer approves and post-review checks are clean, merge the branch.
+- After the merge commit and immediate validation/build as appropriate, stop and report.
+- Do not close the Ticket, delete the worktree/branch, or continue queued routing until the runtime/tooling has been deliberately refreshed or the user gives explicit follow-up instructions for post-migration completion.
+
+This Ticket intentionally overrides the broader standing instruction to auto-close/cleanup reviewer-approved work, because the migration changes the Ticket storage schema used by those completion tools.
+
+---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-09T03:17:20Z -->
+
+## Implementation report
+
+Coder fix-loop completed and is ready for sibling review.
+
+Coder Pod:
+- `coder-simplify-ticket-identity-fields`
+- Implementation commit: `191a875 ticket: simplify ticket identity fields`
+- Fix-loop commit: `591db3f test: update ticket schema expectations`
+- Worktree status before review: clean branch `simplify-ticket-identity-fields`
+- Stopped after collecting output to reclaim delegated worktree scope.
+
+Fix-loop summary:
+- Updated Ticket crate tests from stale bucket/status/workflow_state/slug expectations to the new flat layout, canonical ID, and `state` schema.
+- Updated close tests to distinguish `done` vs `closed` and assert `state: closed` plus `resolution.md`.
+- Updated doctor/tool tests for legacy bucket detection, obsolete frontmatter field detection, invalid `state`, canonical ID lookup, `state` filters, and orchestration-plan canonical-ID references.
+- No unresolved design conflict was reported.
+
+Coder validation reported passed:
+- `cargo test -p ticket` -> 59 passed, 0 failed
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo run -q -p yoi -- ticket doctor` -> `doctor: ok`
+- `cargo check --workspace`
+- `nix build .#yoi`
+
+Completion boundary reminder:
+- Per human instruction, if review approves and the branch merges cleanly, stop at merge-complete/validation boundary. Do not close this Ticket or clean up the worktree/branch until runtime/tooling is refreshed or explicit follow-up is given, because the merge changes the Ticket storage schema/layout.
+
+---
