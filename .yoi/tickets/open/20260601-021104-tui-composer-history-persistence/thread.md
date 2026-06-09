@@ -184,3 +184,80 @@ Coder note:
 - Full `cargo test -p tui` still fails at pre-existing `multi_composer_target_switch_preserves_typed_text`; `multi_pod.rs` was not modified.
 
 ---
+
+<!-- event: review author: reviewer at: 2026-06-08T23:59:44Z status: approve -->
+
+## Review: approve
+
+Approved.
+
+Review evidence:
+- Inspected commit `64b7ff7c7c6f93c85e0c091ed5526e1e382ea023` on branch `tui-composer-history-persistence`; changed files are limited to TUI app/persistence wiring (`crates/tui/src/app.rs`, `crates/tui/src/composer_history.rs`, `crates/tui/src/lib.rs`, `crates/tui/src/single_pod.rs`).
+- `ComposerHistoryStore` stores under `manifest::paths::data_dir()/composer-history/workspaces/<label>-<fnv64-key>/history.json`, includes `version`, `workspace.root`, `workspace.label`, `workspace.key`, and preserves `entries: Vec<Vec<Segment>>`.
+- History normalization and submit path keep only non-blank entries, suppress consecutive duplicates, and bound per-workspace history to `COMPOSER_INPUT_HISTORY_LIMIT = 30`.
+- Recall paths remain local `App`/`InputBuffer` edits: Up/Down browse only replaces composer segments and returns no Pod method; `Method::Run` is still produced only through explicit submit.
+- Load/save warnings are generic actionbar notices and do not include stored entry contents; corrupt JSON falls back to empty in-memory history without startup failure.
+
+Validation run from worktree:
+- `cargo test -p tui composer_history`
+- `cargo test -p tui input_history`
+- `cargo test -p tui completion_flow_tests`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo check --workspace`
+- `nix build .#yoi`
+
+No blocking issues found.
+
+---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-09T00:00:35Z -->
+
+## Implementation report
+
+Merge-ready dossier for human/orchestrator approval.
+
+Status:
+- Implementation branch: `tui-composer-history-persistence`
+- Worktree: `.worktree/tui-composer-history-persistence`
+- Commit under review: `64b7ff7c7c6f93c85e0c091ed5526e1e382ea023 tui: persist composer history`
+- Reviewer: `reviewer-tui-composer-history-persistence`
+- Review result: approved; no blocking findings.
+
+Intent / invariant check:
+- Persists TUI composer input recall history per workspace.
+- Uses user data dir storage, not workspace `./.yoi/`.
+- Stores typed `Segment` vectors with workspace metadata, not flattened strings.
+- Preserves recall as TUI-local/non-destructive; no Pod protocol, worker history, session transcript, or model-context changes.
+- Keeps saved entry contents out of warnings/logging/tickets/model context; corrupt-file fallback warning is generic.
+
+Implementation summary:
+- Adds `crates/tui/src/composer_history.rs` for user-data-backed storage.
+- Stores history at `composer-history/workspaces/<workspace-label>-<fnv64-key>/history.json` under `manifest::paths::data_dir()`.
+- Stores `version`, `workspace.root`, `workspace.label`, `workspace.key`, and `entries: Vec<Vec<Segment>>`.
+- Loads history for single-Pod TUI startup and persists on explicit submit.
+- Skips blank entries, suppresses consecutive duplicates, and bounds stored history to `COMPOSER_INPUT_HISTORY_LIMIT = 30`.
+
+Validation evidence:
+- Coder reported pass:
+  - `cargo test -p tui composer_history`
+  - `cargo test -p tui input_history`
+  - `cargo test -p tui completion_flow_tests`
+  - `cargo fmt --check`
+  - `git diff --check`
+  - `cargo check --workspace`
+  - `nix build .#yoi`
+- Reviewer independently ran and passed the same validation set:
+  - `cargo test -p tui composer_history`
+  - `cargo test -p tui input_history`
+  - `cargo test -p tui completion_flow_tests`
+  - `cargo fmt --check`
+  - `git diff --check`
+  - `cargo check --workspace`
+  - `nix build .#yoi`
+
+Residual risks / notes:
+- Broader `cargo test -p tui` still has a pre-existing unrelated failure in `multi_composer_target_switch_preserves_typed_text`; this implementation did not modify `multi_pod.rs`.
+- Final merge/close/cleanup is intentionally not performed here without explicit merge approval.
+
+---

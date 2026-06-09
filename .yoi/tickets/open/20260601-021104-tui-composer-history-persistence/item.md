@@ -8,7 +8,7 @@ priority: P2
 labels: [tui, composer, history, persistence]
 workflow_state: 'inprogress'
 created_at: 2026-06-01T02:11:04Z
-updated_at: '2026-06-08T23:55:25Z'
+updated_at: '2026-06-09T00:00:35Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-06-08T13:19:06Z'
