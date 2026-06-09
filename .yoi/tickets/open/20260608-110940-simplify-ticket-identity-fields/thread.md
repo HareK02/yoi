@@ -180,3 +180,86 @@ Ticket を `workspace-panel` が queued にしました。
 
 
 ---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-09T02:14:31Z from: queued to: inprogress reason: orchestrator_acceptance field: workflow_state -->
+
+## State changed
+
+Accepted queued implementation after reading the Ticket body/thread, binding user decisions from Intake, current workspace state, and visible worktree/Pod state. No active implementation worktree remains. This is high-risk/broad Ticket schema/storage migration, but the required decisions are explicit enough to proceed with strict implementation invariants, migration evidence, and reviewer focus rather than returning to planning.
+
+---
+
+<!-- event: decision author: orchestrator at: 2026-06-09T02:14:31Z -->
+
+## Decision
+
+Routing decision: implementation_ready
+
+Evidence checked:
+- Ticket body, expanded scope decision, Intake assessment, user binding decision, Intake summary, and queued event.
+- Current workspace state: clean after committing queued event.
+- Worktree list: only main workspace, no active implementation worktree.
+- Visible Pods: no active sibling coder/reviewer from previous work remains.
+
+Reason:
+- This is a broad and high-risk schema/storage migration, but the Ticket now contains explicit binding decisions for identity, lifecycle, path layout, and core frontmatter simplification.
+- Returning to planning would need a concrete missing decision; after reading the Ticket/thread, the main open questions have user decisions.
+- Proceed with a strict audit-first implementation and reviewer focus.
+
+IntentPacket:
+
+Intent:
+- Simplify current Ticket identity/storage/frontmatter around path-derived opaque timestamp/counter IDs, a single lifecycle `state`, and minimal current frontmatter, while migrating local Ticket records and updating all current Ticket surfaces.
+
+Binding decisions / invariants:
+- Canonical Ticket identity is the directory name under flat `.yoi/tickets/<ticket-id>/`.
+- The canonical ID must be opaque timestamp/counter style and must not include title/slug words.
+- Frontmatter must not duplicate canonical identity as current `id`.
+- `slug` is not a required/current field and is not a canonical lookup key.
+- `status` and `workflow_state` must not remain independent current state axes; use one canonical lifecycle field named `state`.
+- `done` and `closed` remain distinct states for now:
+  - `done`: implementation/review/merge complete but resolution/close handling not yet final;
+  - `closed`: resolution recorded and Ticket lifecycle ended.
+- `pending` bucket/status is removed from the current model.
+- Current filesystem layout is flat `.yoi/tickets/<ticket-id>/`, not `.yoi/tickets/{open,pending,closed}/...`.
+- `kind` and unmanaged `labels` are removed from current required/core frontmatter.
+- New Ticket records should use minimal current frontmatter, approximately `title`, `state`, `created_at`, `updated_at` plus only fields with concrete current behavior that survive audit.
+- Existing local `.yoi/tickets` records must be migrated to the new layout/schema.
+- Permanent slug aliases / long-term old bucket compatibility should not be added unless a concrete current requirement is discovered; this is unreleased local data.
+- Exact canonical ID lookup remains; title/search UX may be list/search-oriented but must not make slug canonical.
+- Panel actions, role/session claims, tool/API outputs, Ticket doctor, CLI, Orchestrator guidance, and future relation/orchestration-plan references must use canonical IDs, not slug/path-derived title words.
+- Agents/Orchestrator guidance must reinforce reading `TicketShow` body/thread/artifacts before routing/implementation; do not infer requirements from ID/title alone.
+- Do not implement full typed Ticket relation metadata here.
+- Do not remove `title`.
+- Do not change Pod protocol/history/session semantics except where Ticket storage references are legitimately updated.
+
+Implementation latitude:
+- Coder may choose timestamp collision strategy (counter suffix or higher-resolution timestamp) if deterministic/testable and ID remains opaque.
+- Coder may keep tightly scoped migration-only parser/lookup helpers if needed to read old local records during migration, but current writers/tools/docs must emit/use the new schema/layout.
+- Coder may split implementation internally into commits if useful, but should report a coherent final branch state.
+- Coder should stop and report if the change proves too large to keep the repository buildable or if a hidden external compatibility requirement requires long-term legacy aliases.
+
+Reviewer focus:
+- Verify there is no old authoritative dependency on slug, frontmatter id, open/pending/closed buckets, status/workflow_state two-axis state, freeform kind, or unmanaged labels in current CLI/tools/panel/backend/claims/docs.
+- Verify local record migration is complete and `ticket doctor` validates the new flat layout/schema.
+- Verify exact lookup and user-facing display remain usable with `id + title`.
+- Verify close/resolution semantics distinguish `done` vs `closed` as decided.
+- Verify legacy compatibility is migration-only and does not reintroduce permanent slug authority.
+
+Escalate if:
+- Implementation requires a broad backward-compatibility layer for old slug/bucket layouts.
+- The change cannot keep the repo in a buildable state while migrating records.
+- Existing code depends on old directory buckets in a way that requires a larger storage-provider redesign.
+- Tool schema changes would require external plugin/capability redesign beyond Ticket built-in tools.
+
+Validation:
+- Focused Ticket backend/parser/writer/doctor/create/list/show/query tests for flat layout, path-derived ID, `state`, collision handling, and migrated records.
+- Focused tool schema/output tests for TicketCreate/List/Show/WorkflowState/Close/Status-equivalent behavior.
+- Focused panel/role-session/orchestrator guidance tests where surfaces changed.
+- `cargo fmt --check`.
+- `git diff --check`.
+- `cargo run -q -p yoi -- ticket doctor` or the new equivalent if command behavior changes.
+- `cargo check --workspace`.
+- `nix build .#yoi`.
+
+---
