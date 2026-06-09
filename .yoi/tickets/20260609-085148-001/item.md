@@ -1,8 +1,8 @@
 ---
 title: 'session analyticsにresponse単位のbatching指標を追加する'
-state: 'planning'
+state: 'ready'
 created_at: '2026-06-09T08:51:48Z'
-updated_at: '2026-06-09T08:51:48Z'
+updated_at: '2026-06-09T10:20:52Z'
 assignee: null
 ---
 

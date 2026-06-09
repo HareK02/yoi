@@ -465,3 +465,22 @@ Merge-completion cleanup completed:
 - Final local status: left open; no `TicketClose` was performed because the user authorized merge, not close/resolution.
 
 ---
+
+<!-- event: state_changed author: hare at: 2026-06-09T10:20:56Z from: done to: closed reason: closed field: state -->
+
+## State changed
+
+Ticket を closed にしました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-06-09T10:20:56Z status: closed -->
+
+## 完了
+
+Closed as completed.
+
+The YAML frontmatter parsing work was implemented and the Ticket was already in `state: done`. This close records final lifecycle completion; implementation details, validation, and review history remain in `thread.md`.
+
+---

@@ -1,8 +1,8 @@
 ---
 title: "Parse Ticket frontmatter as YAML"
-state: "done"
+state: 'closed'
 created_at: "2026-06-07T22:32:33Z"
-updated_at: "2026-06-07T23:38:32Z"
+updated_at: '2026-06-09T10:20:56Z'
 queued_by: "workspace-panel"
 queued_at: "2026-06-07T22:43:03Z"
 ---

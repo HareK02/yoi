@@ -1,8 +1,8 @@
 ---
 title: 'Profile feature flagsでtool surfaceを制御する'
-state: 'planning'
+state: 'ready'
 created_at: '2026-06-09T08:22:09Z'
-updated_at: '2026-06-09T08:22:09Z'
+updated_at: '2026-06-09T10:20:48Z'
 assignee: null
 ---
 

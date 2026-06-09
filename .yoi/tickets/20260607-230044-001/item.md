@@ -1,8 +1,8 @@
 ---
 title: "Relax implementation planning readiness toward intent and reviewability"
-state: "done"
+state: 'closed'
 created_at: "2026-06-07T23:00:44Z"
-updated_at: "2026-06-07T23:38:32Z"
+updated_at: '2026-06-09T10:21:07Z'
 queued_by: "workspace-panel"
 queued_at: "2026-06-07T23:03:35Z"
 ---

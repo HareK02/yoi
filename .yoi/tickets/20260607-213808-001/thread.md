@@ -348,3 +348,22 @@ Merge-completion cleanup completed:
 Final workspace status after cleanup/record commit was clean apart from being ahead of `origin/develop`.
 
 ---
+
+<!-- event: state_changed author: hare at: 2026-06-09T10:20:49Z from: done to: closed reason: closed field: state -->
+
+## State changed
+
+Ticket を closed にしました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-06-09T10:20:49Z status: closed -->
+
+## 完了
+
+Closed as completed.
+
+The workspace panel bare-letter shortcut issue was implemented and the Ticket was already in `state: done`. This close records final lifecycle completion; implementation details and review history remain in `thread.md`.
+
+---
