@@ -112,3 +112,31 @@ State decision:
 - Re-read and route after current active schema/profile work lands or if the workspace is otherwise quiescent enough for a record migration.
 
 ---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-09T12:46:44Z from: queued to: inprogress reason: implementation_acceptance field: state -->
+
+## State changed
+
+Accepting queued implementation now that the parallel Profile feature-flag and Ticket schema cleanup branches are landed, validated, closed, and cleaned up. This Ticket is broad record/path migration work, so it is intentionally started only after workspace quiescence.
+
+---
+
+<!-- event: decision author: orchestrator at: 2026-06-09T12:46:44Z -->
+
+## Decision
+
+Routing decision:
+
+Start implementation now. The earlier high-conflict schema/profile work is complete, leaving this broad Ticket/Object ID and path migration as the only queued work.
+
+Implementation boundaries:
+- Use a dedicated worktree/branch.
+- Keep migration coherent across Ticket and Objective records, lookup paths, relation metadata, CLI/tool outputs, doctor, and tests.
+- Preserve `created_at` / `updated_at` as human-readable frontmatter.
+- Keep IDs title/slug-free, fixed-width, lexicographically chronological, path-safe, and collision-handled by `+1ms` retry rather than suffixes.
+- Do not introduce old-name compatibility aliases unless needed for a bounded migration/lookup bridge and test-covered.
+- Treat current `.yoi/tickets` and `.yoi/objectives` records as project data to migrate in the branch.
+
+Review focus should include migration correctness, relation/reference updates, doctor behavior, and whether base32 timestamp IDs remain stable/sortable under collision handling.
+
+---
