@@ -2,7 +2,7 @@
 title: 'Orchestratorに独立queued workの並列開始を促す'
 state: 'inprogress'
 created_at: '2026-06-09T10:17:32Z'
-updated_at: '2026-06-09T10:42:37Z'
+updated_at: '2026-06-09T10:46:18Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-06-09T10:31:16Z'

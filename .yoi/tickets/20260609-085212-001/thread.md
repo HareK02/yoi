@@ -211,3 +211,76 @@ Coder validation reported passed:
 Coder reports no conflict with the ToolExecutionContext branch.
 
 ---
+
+<!-- event: review author: reviewer at: 2026-06-09T10:43:25Z status: approve -->
+
+## Review: approve
+
+## Review result: approve
+
+Reviewed commit `7368416e54609517c2252beb6ae98f73fb7935ee` on branch `ticketlist-output-lightweight` in worktree `.worktree/ticketlist-output-lightweight`.
+
+### Evidence
+
+- `TicketList` tool output is now a summary model (`state_filter`, `count`, `returned`, `truncated`, `limit`, `tickets`) where each ticket contains only `id`, truncated `title`, `state`, `updated_at`, and optional short `hints`.
+- `TicketList` does not serialize item body, thread/events, artifacts, or resolution content. The focused leak test creates sentinel body/thread/artifact/resolution strings and asserts none appear in list output, and also asserts forbidden keys are absent from each ticket entry.
+- Limits are bounded with default `50` and max `100`; tests cover default truncation, excessive requested limit capping, and `all`/`closed` default cap behavior.
+- Long title and hint truncation are covered for the LLM-facing tool output and CLI title truncation is covered separately.
+- CLI `yoi ticket list` is a bounded tabular overview with `--limit` and a truncation note that points users to `yoi ticket show <id>` for details; it does not dump Markdown/JSON bodies by default.
+- `TicketShow` remains detailed: tool `TicketShow` still returns bounded body, recent thread events, artifact metadata, relations, and resolution; CLI `show` remains the detailed Markdown-oriented output.
+- Tool descriptions and `docs/development/work-items.md` now explicitly state List is overview/selection and Show is the detailed authority before routing/close/planning/implementation decisions.
+- No Ticket backend schema, relation, Objective, or OrchestrationPlan design changes were found in the reviewed diff.
+
+### Validation run
+
+- `cargo test -p ticket ticket_list_tool` — passed (`4` tests).
+- `cargo test -p yoi ticket_cli_list` — passed (`2` tests).
+- `cargo test -p yoi ticket_cli_create_list_show_comment_review_state_close_and_doctor` — passed.
+- `cargo test -p ticket ticket_tools_create_list_show_and_doctor` — passed.
+- `cargo fmt --check` — passed.
+- `git diff --check` — passed.
+- `cargo run -q -p yoi -- ticket doctor` — passed (`doctor: ok`).
+- `cargo check --workspace` — passed.
+- `nix build .#yoi` — passed.
+- Manual CLI smoke check: `cargo run -q -p yoi -- ticket list --state all --limit 3` returned only `state/id/title/updated_at/hints` rows plus a truncation note.
+
+### Residual risks
+
+- If the parallel ToolExecutionContext branch lands first, final merge may need a small mechanical adaptation around tool execution plumbing, but this implementation's TicketList data-shape and policy are sound.
+- CLI `--limit 0` is parsed as zero while the tool clamps limits to at least one; this is not a context-safety or leakage issue and is not blocking for this Ticket's requirements.
+
+---
+
+<!-- event: review author: reviewer-ticketlist-output-lightweight at: 2026-06-09T10:45:45Z status: approve -->
+
+## Review: approve
+
+Review result: approve
+
+Evidence:
+- `TicketList` tool output is a bounded overview model with `state_filter`, `count`, `returned`, `truncated`, `limit`, and `tickets`.
+- Each ticket entry includes only `id`, truncated `title`, `state`, `updated_at`, and short `hints`.
+- `body`, `thread/events`, `artifacts`, and `resolution` content are not emitted from `TicketList`.
+- Sentinel tests verify body/thread/artifact/resolution strings do not leak into list output and forbidden detailed keys are absent from entries.
+- Default limit is 50 and max limit is 100, including `state=all` / closed-inclusive listing tests.
+- Long title and hint truncation are tested; CLI title truncation and truncation note are covered.
+- CLI `yoi ticket list` remains a bounded table and points detailed use to `yoi ticket show <id>`.
+- `TicketShow` remains detailed and includes body, recent thread events, artifact metadata, relations, and resolution.
+- Docs/tool descriptions preserve `List = overview/selection` and `Show = detailed authority`.
+- No Ticket backend schema, TicketRelation, Objective, or OrchestrationPlan design change was introduced.
+
+Reviewer validation:
+- `cargo test -p ticket ticket_list_tool`
+- `cargo test -p yoi ticket_cli_list`
+- `cargo test -p yoi ticket_cli_create_list_show_comment_review_state_close_and_doctor`
+- `cargo test -p ticket ticket_tools_create_list_show_and_doctor`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo run -q -p yoi -- ticket doctor`
+- `cargo check --workspace`
+- `nix build .#yoi`
+- manual CLI smoke: `cargo run -q -p yoi -- ticket list --state all --limit 3`
+
+All passed. Residual note: if ToolExecutionContext lands first, final merge may need mechanical API adjustment around tool execution plumbing. This does not affect the bounded TicketList output policy.
+
+---
