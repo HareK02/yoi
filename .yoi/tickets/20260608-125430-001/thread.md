@@ -182,3 +182,25 @@ Validation:
 - `nix build .#yoi` if resources/docs/code/package inputs are touched.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-09T06:33:20Z -->
+
+## Implementation report
+
+Implementation routing started after the previously required typed Ticket relation metadata surface landed.
+
+Worktree/branch:
+- Worktree: `.worktree/objective-records-for-medium-term-goals`
+- Branch: `objective-records-for-medium-term-goals`
+- Base/routing commit: `4b3be3f ticket: route objective records`
+
+Spawned sibling Coder Pod:
+- `coder-objective-records-for-medium-term-goals`
+- Scope: non-recursive read on parent workspace root plus recursive write limited to the child worktree.
+
+Routing context:
+- `simplify-ticket-identity-fields` is complete and the flat canonical Ticket ID/state model is active.
+- `typed-ticket-relation-metadata` is complete, so Objective links can now be designed against stable non-hierarchical Ticket relation/reference semantics.
+- This is now the active implementation work for the deferred Objective record Ticket.
+
+---
