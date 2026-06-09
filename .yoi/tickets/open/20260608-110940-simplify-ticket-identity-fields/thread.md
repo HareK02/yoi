@@ -585,3 +585,41 @@ Coder validation reported passed:
 Coder reports no remaining risks.
 
 ---
+
+<!-- event: review author: reviewer-simplify-ticket-identity-fields at: 2026-06-09T04:50:13Z status: request_changes -->
+
+## Review: request changes
+
+Review result: request_changes
+
+The previous TUI flat-path blocker is fixed and all requested validation passed, but two stale current-authority/guidance surfaces remain.
+
+Blockers:
+
+1. `.yoi/workflow/ticket-intake-workflow.md` still asks Intake to propose old identity/core metadata:
+   - `Ticket record fields proposal: title / canonical id / kind / priority / labels / body / explicit acceptance conditions.`
+   - `Proposed title / canonical id / priority / labels.`
+   - `Proposed title / canonical id / kind / priority / labels;`
+
+   This conflicts with the current invariants:
+   - canonical ID is opaque/path-derived and should not be proposed by Intake as an external/current field;
+   - `kind` and unmanaged `labels` are no longer current core frontmatter authority.
+
+2. `crates/ticket/src/lib.rs` still emits generated thread/audit text with stale `workflow_state` vocabulary:
+   - `planning_ready: workflow_state planning -> ready.`
+   - `workflow_state planning -> ready.`
+
+   Frontmatter uses `state`; generated current-visible audit text should say `state planning -> ready` or equivalent.
+
+Positive evidence:
+- Previous TUI blocker is fixed.
+- `crates/tui/src` has no `.yoi/tickets/open|pending|closed` matches.
+- Current `.yoi/tickets/*/item.md` frontmatter scan found all records using `state` and no obsolete `id`, `slug`, `kind`, `labels`, `status`, `workflow_state`, `legacy_ticket`, or `needs_preflight` frontmatter.
+- Validation passed: targeted TUI close test, `cargo test -p pod ticket`, `cargo test -p ticket`, `cargo test -p yoi ticket_cli`, `cargo test -p tui ticket_action --no-run`, `cargo test -p tui workspace_panel`, `cargo fmt --check`, `git diff --check`, `cargo run -q -p yoi -- ticket doctor`, `cargo check --workspace`, `nix build .#yoi`.
+
+Required fix:
+- Update Intake workflow guidance so Intake proposes title/body/acceptance/current behavioral metadata only, not canonical id/kind/labels as core fields.
+- Update generated event text in `crates/ticket/src/lib.rs` from `workflow_state` to canonical `state` vocabulary.
+- Re-run focused validation and core checks before re-review.
+
+---
