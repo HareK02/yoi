@@ -181,3 +181,78 @@ Coder validation reported passed:
 Coder did not run `cargo check --workspace` because only docs/workflow resources changed.
 
 ---
+
+<!-- event: review author: reviewer at: 2026-06-09T00:23:32Z status: approve -->
+
+## Review: approve
+
+Review result: approve
+
+Scope reviewed:
+- Commit `8576615` (`workflow: tighten orchestrator planning return policy`).
+- Changed files: `.yoi/workflow/ticket-orchestrator-routing.md`, `.yoi/workflow/ticket-preflight-workflow.md`, `.yoi/workflow/multi-agent-workflow.md`, `docs/development/work-items.md`.
+- Ticket body/thread and orchestration plan records for this Ticket (`TicketOrchestrationPlanQuery`: 0 records).
+- Targeted stale-guidance search across `.yoi/workflow`, `docs`, and `resources/prompts` for preflight/planning/risk/return-to-planning terminology.
+
+Findings:
+- No separate readiness/preflight state or lane is reintroduced. `ticket-orchestrator-routing.md` keeps workflow_state as `planning -> ready -> queued -> inprogress -> done` and describes `ticket-preflight-workflow` only as a legacy planning/requirements-sync slug; `ticket-preflight-workflow.md` explicitly says not to treat `preflight` as a state/lane/current metadata vocabulary.
+- Ticket workflow-state and queued acceptance semantics remain unchanged. The updated guidance still requires `queued -> inprogress` before worktree/spawn/implementation side effects and does not add a new transition.
+- Returning `ready`/`queued` Tickets to `planning` now requires concrete missing decision/information plus checked context, why implementation latitude is insufficient, and next planning question/action.
+- Risk flags/risky domains are consistently documented as bounded context lookup, IntentPacket/reviewer focus, and escalation signals rather than automatic stop gates.
+- The guidance stays bounded: it names targeted context sources and explicitly says the purpose is not broad repository archaeology.
+- Risky-but-specified work is allowed to proceed as `implementation_ready`; the routing examples include the required `allow-spawnpod-child-workspace-cwd`-equivalent authority/scope/Pod example with reviewer focus rather than planning return solely for risk category.
+- Maintained workflow/docs are aligned. I did not find conflicting authority-adjacent automatic-stop wording in `.yoi/workflow`, `docs`, or `resources/prompts` searches.
+
+Validation run in the worktree:
+- Focused text validation via grep assertions for risky-but-specified -> `implementation_ready`, concrete missing item requirements, risk-alone insufficiency, bounded context/non-archaeology wording, preflight compatibility wording, multi-agent proceed-with-reviewer-focus wording, and work-items docs alignment.
+- `git diff --check 8576615^ 8576615` passed.
+- `cargo run -q -p yoi -- ticket doctor` passed (`doctor: ok`).
+- `nix build .#yoi` passed.
+- Worktree remained clean after review.
+
+I did not run `cargo check --workspace`; the diff is workflow/docs text only, and `nix build .#yoi` plus Ticket doctor covered packaging/runtime-resource integrity for this change.
+
+---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-09T00:24:31Z -->
+
+## Implementation report
+
+Merge-ready dossier for human/orchestrator approval.
+
+Status:
+- Implementation branch: `orchestrator-return-to-planning-context-policy`
+- Worktree: `.worktree/orchestrator-return-to-planning-context-policy`
+- Commit under review: `8576615 workflow: tighten orchestrator planning return policy`
+- Reviewer: `reviewer-orchestrator-return-to-planning-context-policy`
+- Review result: approved; no blocking findings.
+
+Intent / invariant check:
+- Strengthens Orchestrator routing guidance so `ready` / `queued` Tickets are returned to `planning` only when a concrete missing decision/information remains after bounded project-context checks.
+- Keeps workflow_state semantics unchanged: `planning -> ready -> queued -> inprogress -> done`.
+- Does not reintroduce preflight/readiness as a separate state/lane.
+- Keeps risk flags and authority-adjacent domains as context lookup / reviewer-focus / escalation signals, not automatic stop gates.
+- Allows risky-but-specified Tickets to proceed as `implementation_ready` with IntentPacket invariants, escalation conditions, and reviewer focus.
+
+Implementation summary:
+- Updated `ticket-orchestrator-routing` to require concrete missing-item evidence, checked context, implementation-latitude insufficiency, and next planning action before planning return.
+- Added an `allow-spawnpod-child-workspace-cwd`-style authority/scope/Pod example showing specified risky work proceeding with reviewer focus.
+- Aligned `ticket-preflight-workflow`, `multi-agent-workflow`, and work-item docs with the same policy.
+
+Validation evidence:
+- Coder reported pass:
+  - focused workflow/prompt text validation for risky-but-specified -> implementation_ready, genuinely missing decision -> return_to_planning, and risk flag alone insufficient
+  - `git diff --check`
+  - `cargo run -q -p yoi -- ticket doctor`
+  - `nix build .#yoi`
+- Reviewer independently passed:
+  - focused grep/text validation across `.yoi/workflow`, `docs`, and `resources/prompts`
+  - `git diff --check 8576615^ 8576615`
+  - `cargo run -q -p yoi -- ticket doctor`
+  - `nix build .#yoi`
+
+Residual risks / notes:
+- `cargo check --workspace` was intentionally not run by coder/reviewer because the implementation is workflow/docs text only; `nix build .#yoi` and Ticket doctor were used for packaging/resource integrity.
+- Final merge/close/cleanup is intentionally not performed here without explicit merge approval.
+
+---
