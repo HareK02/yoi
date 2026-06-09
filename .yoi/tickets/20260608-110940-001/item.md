@@ -1,8 +1,8 @@
 ---
 title: "Simplify Ticket identity to timestamp key and title"
-state: "inprogress"
+state: 'closed'
 created_at: "2026-06-08T11:09:40Z"
-updated_at: "2026-06-09T05:04:45Z"
+updated_at: '2026-06-09T05:41:12Z'
 queued_by: "workspace-panel"
 queued_at: "2026-06-09T02:13:30Z"
 ---
