@@ -48,3 +48,12 @@ Accepting implementation after workspace inspection. Expected overlap with TUI m
 
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-06-10T08:11:58Z -->
+
+## Implementation report
+
+Implemented directly in worktree .worktree/prompt-resource-centralization because Pod-management tools are not available in this API session.\n\nBranch/commit:\n- prompt-resource-centralization / 342d5cf refactor: move ticket role prompts to resources\n\nSummary:\n- Moved Ticket role launch guidance strings from crates/client/src/ticket_role.rs into resources/prompts/ticket_role/*.md.\n- Added workspace/user override lookup for ticket_role prompt fragments before falling back to embedded resources.\n- Kept Rust code responsible for runtime composition, bounded dynamic fields, and segment assembly.\n- Added regression coverage for workspace prompt override behavior.\n\nValidation:\n- cargo fmt\n- cargo test -p client ticket_role --lib\n- git diff --check\n- cargo check -p client\n\nPending:\n- External review/merge validation not yet performed.\n- TUI model setup wizard worktree exists but implementation has not started.
+
+
+---
