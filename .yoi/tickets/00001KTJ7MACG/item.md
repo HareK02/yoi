@@ -1,8 +1,8 @@
 ---
 title: "Add Pod archive and fresh-start path"
-state: "planning"
+state: 'closed'
 created_at: "2026-06-07T23:45:30Z"
-updated_at: "2026-06-08T03:49:14Z"
+updated_at: '2026-06-10T09:29:55Z'
 queued_by: "workspace-panel"
 queued_at: "2026-06-08T03:48:46Z"
 ---

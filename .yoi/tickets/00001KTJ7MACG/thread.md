@@ -96,3 +96,21 @@ Escalate if:
 - Panel support would become a broad Pod manager rather than a bounded explicit fresh-start path.
 
 ---
+
+<!-- event: state_changed author: hare at: 2026-06-10T09:29:55Z from: planning to: closed reason: closed field: state -->
+
+## State changed
+
+Ticket を closed にしました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-06-10T09:29:55Z status: closed -->
+
+## 完了
+
+現時点では fresh-start-path を独立機能として実装しない方針に変更する。問題の実体は Pod 名の restorable metadata 衝突と古い Pod/session 履歴の蓄積であり、fresh start 専用 UX ではなく、Pod 名を明示的に空ける archive/delete と storage cleanup/prune の設計で扱う。既存の通常 lifecycle（restorable -> restore、missing -> spawn）は維持し、restore bypass の専用 path は作らない。必要になれば Pod/session storage cleanup commands として別 Ticket を切る。
+
+
+---
