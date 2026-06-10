@@ -1,12 +1,8 @@
-local profile = require("yoi.profile")
-local scope = require("yoi.scope")
-local compact = require("yoi.compact")
-
-return profile {
+return yoi.profile {
     slug = "default",
-    description = "Bundled default Yoi coding profile",
+    description = "Default Yoi coding profile",
 
-    scope = scope.workspace_write(),
+    scope = yoi.scope.workspace_write(),
 
     session = {
         record_event_trace = true,
@@ -16,11 +12,9 @@ return profile {
         reasoning = "high",
     },
 
-    model = {
-        ref = "codex-oauth/gpt-5.5",
-    },
+    model = yoi.models.catalog("codex-oauth/gpt-5.5"),
 
-    compaction = compact.tokens {
+    compaction = yoi.compact.tokens {
         threshold = 240000,
         request_threshold = 270000,
         worker_context_max_tokens = 100000,
