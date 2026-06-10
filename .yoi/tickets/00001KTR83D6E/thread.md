@@ -66,3 +66,34 @@ IntentPacket:
 - Validation: `cargo fmt`, `cargo test -p tools mutation`, focused `cargo test -p tools`, `git diff --check`, `target/debug/yoi ticket doctor`, and broader build before merge if touched surfaces require it.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-10T09:29:06Z -->
+
+## Implementation report
+
+Implementation report
+
+Branch/worktree: `serialize-file-mutations` / `.worktree/serialize-file-mutations`
+Commit:
+- `40130143 fix: serialize same-file mutations`
+
+Summary:
+- Added a shared per-target-file mutation guard to `Tracker`, keyed by canonical target path where possible.
+- `Edit` and `Write` acquire this guard around their critical read/verify/write/record sections, so same-file mutations serialize while Worker-level parallel tool execution remains intact.
+- Different files use different guards and are not globally serialized.
+- The guard uses `ToolExecutionContext` for response-local diagnostics/correlation (`batch_id`, `call_index`) without making it a Worker/session authority handle.
+- Added tests for equivalent-path guard blocking, different-file non-blocking, same-batch `Write` then `Edit` order, and failed mutation guard release.
+
+Validation run in branch:
+- `cargo fmt`
+- `cargo test -p tools --lib` passed.
+- `cargo test -p tools mutation_guard --lib` passed.
+- `cargo test -p tools write_then_edit_same_file_same_batch_uses_call_order --lib` passed.
+- `cargo test -p tools failed_same_file_mutation_releases_guard_for_followup --lib` passed.
+- `cargo check -p tools` passed.
+- `git diff --check` passed.
+
+Notes:
+- `nix build .#yoi` not yet run on this branch; Orchestrator should run it before/after merge because this changes tool runtime code and crate feature configuration.
+
+---
