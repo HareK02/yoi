@@ -2,7 +2,7 @@
 title: "TUI: ユーザーマニフェストのモデル設定 wizard"
 state: 'inprogress'
 created_at: "2026-05-27T00:00:18Z"
-updated_at: '2026-06-10T09:08:59Z'
+updated_at: '2026-06-10T09:16:45Z'
 queued_by: 'yoi ticket'
 queued_at: '2026-06-10T07:59:32Z'
 ---

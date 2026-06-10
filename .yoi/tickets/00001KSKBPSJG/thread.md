@@ -170,3 +170,34 @@ Next action:
 - Do not treat this as planning uncertainty; the current blocker is write/delegation authority for implementation side effects.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-10T09:16:45Z -->
+
+## Implementation report
+
+Implementation report
+
+Branch/worktree: `tui-model-setup-wizard` / `.worktree/tui-model-setup-wizard`
+Commits:
+- `6bb023e9 merge develop into setup wizard worktree` (brought branch up to current `develop` before implementation)
+- `32be6075 feat: add setup model command`
+
+Summary:
+- Added a top-level `yoi setup-model` command that enters a one-shot setup path separate from normal Pod startup.
+- Added `tui::setup_model` to list catalog-backed models/providers, prompt for a default selection, and persist user Profile config under the normal user config directory.
+- Persistence writes `profiles.toml` with `default = "user:default"` and `[profile.default] path = "profiles/default.lua"`, plus generated `profiles/default.lua` using the selected model ref.
+- The setup path does not start/attach a Pod, create sessions, or write workspace `.yoi` records.
+- Added CLI parser tests for `setup-model` and persistence tests for generated profile config.
+
+Validation run in branch:
+- `cargo fmt`
+- `cargo test -p tui setup_model --lib` passed.
+- `cargo test -p yoi parse_setup_model --bin yoi` passed.
+- `cargo check -p yoi` passed.
+- `git diff --check` passed.
+
+Notes:
+- `nix build .#yoi` was not run in the branch yet; Orchestrator should run it before merge because this touches CLI/TUI/config/package source surfaces.
+- The implementation uses a simple bounded terminal setup flow rather than broad TUI refactoring.
+
+---
