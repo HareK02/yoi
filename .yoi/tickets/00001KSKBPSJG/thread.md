@@ -105,3 +105,45 @@ Accepting implementation after workspace inspection. Expected overlap with promp
 
 
 ---
+
+<!-- event: plan author: orchestrator at: 2026-06-10T09:02:02Z -->
+
+## Plan
+
+Routing decision: implementation_ready
+
+Reason:
+- Ticket is already `inprogress`; relation query and orchestration-plan query show no blockers.
+- Existing thread marked this as needing a small preflight. Bounded code/context check resolved the implementation-shaping decisions without needing another planning round.
+
+Evidence checked:
+- Ticket body/thread/artifacts for `00001KSKBPSJG`.
+- Relation records: none.
+- Orchestration plan records: none before this routing pass.
+- Current worktree/branch state: `.worktree/tui-model-setup-wizard` exists and has no implementation commit yet.
+- Current CLI surface in `crates/yoi/src/main.rs` includes top-level `panel`, `keys`, `pod`, `ticket`, `objective`, `session`, `memory lint`; setup is not yet present.
+- Profile/config surface in `crates/manifest/src/paths.rs` and `crates/manifest/src/profile.rs`; active reusable Profiles are Lua-first with user registry/config under the normal config root.
+- Provider/model catalog resources under `resources/providers` and `resources/models`.
+
+Binding decisions / invariants:
+- Add an explicit one-shot setup entry point `yoi setup-model`; it must not run normal Pod startup, create sessions, attach sockets, or spawn Pods while configuring.
+- Persist the result as a user default Profile through normal Profile mechanisms: user `profiles.toml` plus a generated user Profile Lua file (for example `profiles/default.lua`) under the normal config root. Do not write workspace `.yoi`, Ticket records, session history, runtime/local/secret-like files, or project records from the setup wizard.
+- Do not introduce legacy manifest authority or new environment-variable configuration surfaces.
+- Keep existing startup/profile semantics intact; the setup wizard only creates/updates config that normal startup already knows how to consume.
+- If provider credential handling needs more than selecting/recording an existing auth hint/ref, escalate rather than inventing a new secret store flow.
+
+Implementation latitude:
+- Exact TUI layout and internal state machine organization are up to coder, bounded by the one-shot setup and persistence invariants.
+- Coder may choose the generated profile name/path if it is deterministic, user-config scoped, and unambiguous from the default selector.
+- Coder may keep the catalog/model choice set modest and testable for the first implementation.
+
+Validation:
+- Focused CLI/parser and setup persistence tests.
+- Focused TUI/setup module tests where practical.
+- `cargo fmt --check` or `cargo fmt`, `git diff --check`, focused cargo tests, and broader `cargo check`/`nix build .#yoi` before merge because this touches CLI/TUI/config/package source surfaces.
+
+Escalate if:
+- The implementation requires changing Profile registry semantics, secret-store behavior, normal Pod launch behavior, or workspace `.yoi` authority.
+- Credential entry/storage cannot be limited to an existing explicit auth reference/hint.
+
+---

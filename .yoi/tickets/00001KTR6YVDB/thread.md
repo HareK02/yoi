@@ -57,3 +57,50 @@ Implemented directly in worktree .worktree/prompt-resource-centralization becaus
 
 
 ---
+
+<!-- event: plan author: orchestrator at: 2026-06-10T09:00:04Z -->
+
+## Plan
+
+Routing update: review_needed
+
+Reason:
+- Implementation report exists for branch `prompt-resource-centralization` / commit `342d5cf8`, but independent review and merge validation are not yet recorded.
+
+Evidence checked:
+- Ticket body/thread/artifacts and relation/orchestration-plan records.
+- Worktree status for `.worktree/prompt-resource-centralization` is clean and branch has commit `342d5cf8` over `develop`.
+- Visible Pods showed no existing child reviewer.
+
+Next action:
+- Spawned branch-local reviewer Pod `reviewer-prompt-resource-centralization` with read-only scope over the worktree and this Ticket. Reviewer is asked for approve/request_changes, blockers, notes, and focused validation evidence.
+
+Boundary:
+- This is branch-local review evidence only; no main-branch Ticket approval, merge, close, or cleanup is recorded by this routing step.
+
+---
+
+<!-- event: review author: reviewer-prompt-resource-centralization at: 2026-06-10T09:06:45Z status: approve -->
+
+## Review: approve
+
+Branch-local review verdict: approve
+
+Evidence:
+- Reviewed branch diff from merge-base `76165b47d664cb02a79c16272fbb5f8377a693bb` against `develop`.
+- Verified production `crates/client/src/ticket_role.rs` no longer hardcodes the large LLM-facing Ticket role launch / intake handoff / orchestrator / coder / reviewer prompt prose; prompt fragments now live under `resources/prompts/ticket_role/*.md`.
+- Verified runtime values remain sectioned/bounded and resource lookup order is workspace `.yoi/prompts/ticket_role/*.md` -> user prompts dir -> builtin embedded resource.
+- Verified existing semantics and tests cover representative builtin prompt generation and workspace override behavior.
+
+Validation run by reviewer:
+- `cargo test -p client ticket_role --lib` passed.
+- `git diff --check $(git merge-base HEAD develop)..HEAD` passed.
+- `nix build .#yoi` passed.
+
+Non-blocking notes:
+- Dedicated user-level prompt override test could be added later, but workspace override exercises the same loader path sufficiently for this change.
+- Prompt text fragments remain in test assertions only; this is not production prompt hardcoding.
+
+This is branch-local review evidence; final main-branch approval/close still belongs to merge-completion.
+
+---
