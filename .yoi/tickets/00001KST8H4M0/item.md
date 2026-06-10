@@ -1,8 +1,8 @@
 ---
 title: "MCP integration as external tool/resource/prompt provider"
-state: "planning"
+state: 'closed'
 created_at: "2026-05-29T16:19:28Z"
-updated_at: "2026-05-29T16:19:28Z"
+updated_at: '2026-06-10T07:50:19Z'
 ---
 
 ## Background
