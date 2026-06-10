@@ -144,3 +144,74 @@ Parent/human decision needs:
 - User requested inprogress消化; proceed with authorized merge-completion for this inprogress Ticket.
 
 ---
+
+<!-- event: review author: orchestrator at: 2026-06-10T09:08:18Z status: approve -->
+
+## Review: approve
+
+Main-branch review/merge-completion approval.
+
+Verified before merge:
+- Merge-ready dossier matched branch `prompt-resource-centralization`, worktree `.worktree/prompt-resource-centralization`, and implementation commit `342d5cf8`.
+- Branch-local independent review approved with no blockers.
+- Main workspace dirty state was limited to committed Ticket routing/dossier records.
+
+Merged:
+- `git merge --no-ff prompt-resource-centralization -m "merge: prompt resource centralization"`
+- Merge commit: `9aaa3232 merge: prompt resource centralization`
+
+Post-merge validation:
+- `cargo fmt --check` passed.
+- `git diff --check` passed.
+- `cargo test -p client ticket_role --lib` passed.
+- `target/debug/yoi ticket doctor` passed.
+- typed `TicketDoctor` reported 0 errors and 3 pre-existing diagnostics.
+- `nix build .#yoi` passed.
+
+Result: approve.
+
+---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-10T09:08:18Z from: inprogress to: done reason: merged_and_validated field: state -->
+
+## State changed
+
+Merged branch `prompt-resource-centralization` with merge commit `9aaa3232`; branch-local review approved and post-merge validation passed (`cargo fmt --check`, `git diff --check`, `cargo test -p client ticket_role --lib`, `target/debug/yoi ticket doctor`, `nix build .#yoi`).
+
+---
+
+<!-- event: state_changed author: hare at: 2026-06-10T09:08:26Z from: done to: closed reason: closed field: state -->
+
+## State changed
+
+Ticket を closed にしました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-06-10T09:08:26Z status: closed -->
+
+## 完了
+
+完了しました。
+
+実施内容:
+- Branch `prompt-resource-centralization` を `develop` に `--no-ff` merge しました。
+- Merge commit: `9aaa3232 merge: prompt resource centralization`
+- LLM 向け Ticket role launch prompt prose は `crates/client/src/ticket_role.rs` の production hardcoding から `resources/prompts/ticket_role/*.md` へ移動されました。
+- Rust 側は runtime dynamic fields の sectioned/bounded composition と workspace/user/builtin prompt resource lookup を担当します。
+- Workspace prompt override の regression coverage が追加されています。
+
+確認:
+- Branch-local reviewer `reviewer-prompt-resource-centralization` が approve。
+- `cargo fmt --check` passed。
+- `git diff --check` passed。
+- `cargo test -p client ticket_role --lib` passed。
+- `target/debug/yoi ticket doctor` passed。
+- typed `TicketDoctor` は 0 errors / 3 pre-existing diagnostics。
+- `nix build .#yoi` passed。
+
+残作業:
+- なし。user-level prompt override 専用 test は将来の追加余地として non-blocking note に留めました。
+
+---
