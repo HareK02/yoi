@@ -140,3 +140,37 @@ IntentPacket:
 - Validation: `cargo fmt`, manifest profile tests, client Ticket role tests if touched, `target/debug/yoi ticket doctor`, and `nix build .#yoi`.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-10T15:15:21Z -->
+
+## Implementation report
+
+Implementation report
+
+Branch/worktree: `builtin-role-profiles` / `.worktree/builtin-role-profiles`
+Commit:
+- `52afdda4 feat: add builtin role profiles`
+
+Summary:
+- Added bundled role Profiles under `resources/profiles`: `companion.lua`, `intake.lua`, `orchestrator.lua`, `coder.lua`, `reviewer.lua`.
+- Registered those Profiles as builtin selectors: `builtin:companion`, `builtin:intake`, `builtin:orchestrator`, `builtin:coder`, `builtin:reviewer`.
+- Role Profiles use global `yoi` / `yoi.profile.extend("builtin:default", ...)` style and keep prompt/workflow prose out of Profile artifacts.
+- Migrated this workspace `.yoi/ticket.config.toml` role selectors from `project:*` to `builtin:*` selectors.
+- Replaced project-local role Profile files with builtin resource Profiles; `.yoi/profiles.toml` now only points the workspace default at `builtin:companion`.
+- Updated Ticket config scaffold defaults to role-specific builtin selectors and adjusted client role launch tests.
+- Added manifest tests for builtin role registry/resolution and role tool policy.
+
+Validation run in branch:
+- `cargo fmt --check` passed.
+- `cargo test -p manifest profile --lib` passed (23 passed).
+- `cargo test -p ticket config --lib` passed (20 passed).
+- `cargo test -p client ticket_role --lib` passed.
+- `cargo check -p manifest -p ticket` passed.
+- `git diff --check` passed.
+- `nix build .#yoi` passed.
+
+Notes:
+- Builtin role Profiles intentionally inherit common reusable defaults from `builtin:default`; project-specific Ticket backend/language/workflow config remains in `.yoi/ticket.config.toml` rather than moving into Profiles.
+- The removed project-local role Profile files were policy presets rather than project data, so moving them to embedded resources satisfies the migration goal.
+
+---
