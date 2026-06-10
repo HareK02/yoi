@@ -878,13 +878,12 @@ fn install_lua_api(lua: &Lua, module_root: LocalModuleRoot) -> Result<(), Profil
         .map_err(ProfileError::Lua)?;
     let globals = lua.globals();
     globals.set("require", require).map_err(ProfileError::Lua)?;
-    globals
-        .set(
-            "profile",
-            lua.create_function(|_, table: Table| Ok(table))
-                .map_err(ProfileError::Lua)?,
-        )
+    let yoi = yoi_module(lua).map_err(ProfileError::Lua)?;
+    let profile = yoi
+        .get::<mlua::Value>("profile")
         .map_err(ProfileError::Lua)?;
+    globals.set("yoi", yoi).map_err(ProfileError::Lua)?;
+    globals.set("profile", profile).map_err(ProfileError::Lua)?;
     for denied in [
         "os",
         "io",
@@ -970,23 +969,73 @@ fn require_module(
 
 fn host_module(lua: &Lua, name: &str) -> mlua::Result<Option<LuaValue>> {
     match name {
-        "yoi" => {
-            let t = lua.create_table()?;
-            t.set("profile", profile_function(lua)?)?;
-            t.set("models", models_module(lua)?)?;
-            t.set("compact", compact_module(lua)?)?;
-            t.set("scope", scope_module(lua)?)?;
-            Ok(Some(LuaValue::Table(t)))
-        }
-        "yoi.profile" => Ok(Some(LuaValue::Function(profile_function(lua)?))),
+        "yoi" => Ok(Some(LuaValue::Table(yoi_module(lua)?))),
+        "yoi.profile" => Ok(Some(LuaValue::Table(profile_module(lua)?))),
         "yoi.models" => Ok(Some(LuaValue::Table(models_module(lua)?))),
         "yoi.compact" => Ok(Some(LuaValue::Table(compact_module(lua)?))),
         "yoi.scope" => Ok(Some(LuaValue::Table(scope_module(lua)?))),
         _ => Ok(None),
     }
 }
-fn profile_function(lua: &Lua) -> mlua::Result<mlua::Function> {
-    lua.create_function(|_, table: Table| Ok(table))
+fn yoi_module(lua: &Lua) -> mlua::Result<Table> {
+    let t = lua.create_table()?;
+    t.set("profile", profile_module(lua)?)?;
+    t.set("models", models_module(lua)?)?;
+    t.set("compact", compact_module(lua)?)?;
+    t.set("scope", scope_module(lua)?)?;
+    Ok(t)
+}
+fn profile_module(lua: &Lua) -> mlua::Result<Table> {
+    let module = lua.create_table()?;
+    module.set(
+        "import",
+        lua.create_function(|lua, reference: String| import_profile_artifact(lua, &reference))?,
+    )?;
+    module.set(
+        "extend",
+        lua.create_function(|lua, (reference, overrides): (String, LuaValue)| {
+            let base_value = import_profile_artifact(lua, &reference)?;
+            let mut base_json: serde_json::Value = lua.from_value(base_value)?;
+            let override_json: serde_json::Value = lua.from_value(overrides)?;
+            deep_merge_profile_json(&mut base_json, override_json);
+            lua.to_value(&base_json)
+        })?,
+    )?;
+    let meta = lua.create_table()?;
+    meta.set(
+        "__call",
+        lua.create_function(|_, (_this, table): (LuaValue, Table)| Ok(table))?,
+    )?;
+    module.set_metatable(Some(meta))?;
+    Ok(module)
+}
+fn import_profile_artifact(lua: &Lua, reference: &str) -> mlua::Result<LuaValue> {
+    let source = match reference {
+        "builtin:default" | "default" => BUILTIN_DEFAULT_PROFILE,
+        other => {
+            return Err(mlua::Error::RuntimeError(format!(
+                "unsupported profile import `{other}`"
+            )));
+        }
+    };
+    lua.load(source).set_name(reference).eval::<LuaValue>()
+}
+fn deep_merge_profile_json(base: &mut serde_json::Value, overrides: serde_json::Value) {
+    match (base, overrides) {
+        (serde_json::Value::Object(base), serde_json::Value::Object(overrides)) => {
+            for (key, value) in overrides {
+                match base.get_mut(&key) {
+                    Some(existing) => deep_merge_profile_json(existing, value),
+                    None => {
+                        base.insert(key, value);
+                    }
+                }
+            }
+        }
+        (base, override_value) => {
+            *base = override_value;
+        }
+    }
 }
 fn models_module(lua: &Lua) -> mlua::Result<Table> {
     let t = lua.create_table()?;
@@ -1559,6 +1608,71 @@ return yoi.profile {
             Permission::Write
         );
     }
+    #[test]
+    fn global_yoi_import_and_extend_builtin_profile() {
+        let tmp = TempDir::new().unwrap();
+        let profile = write_profile(
+            tmp.path(),
+            "extended.lua",
+            r#"
+local imported = yoi.profile.import("builtin:default")
+assert(imported.model.ref == "codex-oauth/gpt-5.5")
+return yoi.profile.extend("builtin:default", {
+  slug = "extended",
+  model = yoi.models.catalog("anthropic/claude-sonnet-4-6"),
+  feature = {
+    task = { enabled = false },
+    pods = { enabled = true },
+  },
+  compaction = { kind = "tokens", threshold = 123, request_threshold = 456 },
+})
+"#,
+        );
+        let resolved = ProfileResolver::new()
+            .with_workspace_base(tmp.path())
+            .resolve(
+                &ProfileSelector::path(profile),
+                ProfileResolveOptions::with_pod_name("p"),
+            )
+            .unwrap();
+        assert_eq!(
+            resolved.manifest.model.ref_.as_deref(),
+            Some("anthropic/claude-sonnet-4-6")
+        );
+        assert!(!resolved.manifest.feature.task.enabled);
+        assert!(resolved.manifest.feature.pods.enabled);
+        assert_eq!(
+            resolved.manifest.compaction.as_ref().unwrap().threshold,
+            Some(123)
+        );
+        assert_eq!(
+            resolved.profile.as_ref().unwrap().name.as_deref(),
+            Some("extended")
+        );
+    }
+
+    #[test]
+    fn global_yoi_extend_keeps_profile_validation_boundary() {
+        let tmp = TempDir::new().unwrap();
+        let profile = write_profile(
+            tmp.path(),
+            "bad.lua",
+            r#"
+return yoi.profile.extend("builtin:default", {
+  pod = { name = "not-runtime" },
+})
+"#,
+        );
+        let err = ProfileResolver::new()
+            .with_workspace_base(tmp.path())
+            .resolve(
+                &ProfileSelector::path(profile),
+                ProfileResolveOptions::with_pod_name("p"),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("field `pod`"));
+    }
+
     #[test]
     fn sandbox_denies_unsafe_libraries() {
         let tmp = TempDir::new().unwrap();
