@@ -117,3 +117,34 @@ Notes:
 - Import support is currently explicit for `builtin:default`; broad user/project selector import can be added as a follow-up if desired, but this covers the requested builtin composition surface and preserves authority boundaries.
 
 ---
+
+<!-- event: review author: reviewer-lua-profile-yoi-api at: 2026-06-10T09:53:05Z status: approve -->
+
+## Review: approve
+
+Branch-local review verdict: approve
+
+Blockers: none.
+
+Evidence:
+- Diff from `develop` merge-base touches only `crates/manifest/src/profile.rs` and `resources/profiles/default.lua`.
+- Global `yoi` is available for filesystem and embedded builtin Profiles.
+- `require("yoi")`, `require("yoi.profile")`, `require("yoi.models")`, and local `require("shared")` behavior are covered by tests and preserved.
+- `yoi.profile.import("builtin:default")` evaluates the builtin default Lua as a raw Profile artifact, not a resolved Manifest.
+- `yoi.profile.extend("builtin:default", overrides)` recursively merges objects and replaces non-object values; final artifacts still pass through existing Profile validation.
+- Runtime-bound field contamination is rejected by a `pod` override test; existing validation tests continue covering `scope.allow` / `scope.deny` and absolute path boundaries.
+- Bundled `resources/profiles/default.lua` uses global `yoi` style.
+
+Validation run by reviewer:
+- `cargo test -p manifest profile --lib` passed (22 passed).
+- `cargo check -p manifest` passed.
+- `git diff --check $(git merge-base HEAD develop)..HEAD` passed.
+- `nix build .#yoi` passed.
+
+Non-blocking notes:
+- Import/extend currently supports `builtin:default` and alias `default`; this matches the recorded known scope note.
+- List replacement does not have a dedicated assertion, but implementation treats JSON arrays as non-object values and therefore replaces them.
+
+This is branch-local review evidence; final main-branch approval/close belongs to merge-completion.
+
+---
