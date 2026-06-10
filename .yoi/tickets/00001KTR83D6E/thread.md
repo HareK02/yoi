@@ -97,3 +97,32 @@ Notes:
 - `nix build .#yoi` not yet run on this branch; Orchestrator should run it before/after merge because this changes tool runtime code and crate feature configuration.
 
 ---
+
+<!-- event: review author: reviewer-serialize-file-mutations at: 2026-06-10T09:37:59Z status: approve -->
+
+## Review: approve
+
+Branch-local review verdict: approve
+
+Blockers: none.
+
+Evidence:
+- Diff is limited to `crates/tools`; Worker-wide scheduler semantics were not changed.
+- Serialization is closed over built-in `Write`/`Edit` mutation boundary.
+- `Write` and `Edit` share the same `Tracker` per-target-file guard.
+- Guard covers `Write` existing check/read/verify/write/record and `Edit` read/verify/transform/write/record critical sections.
+- Path keying canonicalizes target path/canonical parent/lexical fallback, while different files use different mutexes.
+- Tests cover same-file write→edit ordering, failed mutation release, equivalent path guard, and different-file non-blocking.
+
+Validation run by reviewer:
+- `cargo test -p tools --lib` passed (99 passed).
+- `cargo check -p tools` passed.
+- `git diff --check $(git merge-base HEAD develop)..HEAD` passed.
+- `nix build .#yoi` passed.
+
+Non-blocking note:
+- `ToolExecutionContext` is currently used for diagnostics/correlation, not a full call-index scheduler. Current Worker approved-call order and early guard acquisition satisfy the requirement, but future changes that add awaits before guard acquisition should re-check ordering guarantees.
+
+This is branch-local review evidence; final main-branch approval/close belongs to merge-completion.
+
+---
