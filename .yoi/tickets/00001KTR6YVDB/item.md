@@ -1,8 +1,8 @@
 ---
 title: 'LLM向けプロンプト直書きを廃止してresources/promptsへ集約する'
-state: 'inprogress'
+state: 'closed'
 created_at: '2026-06-10T07:29:13Z'
-updated_at: '2026-06-10T07:59:33Z'
+updated_at: '2026-06-10T09:08:26Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-06-10T07:49:23Z'

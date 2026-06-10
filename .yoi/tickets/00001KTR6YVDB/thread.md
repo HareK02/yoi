@@ -48,3 +48,170 @@ Accepting implementation after workspace inspection. Expected overlap with TUI m
 
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-06-10T08:11:58Z -->
+
+## Implementation report
+
+Implemented directly in worktree .worktree/prompt-resource-centralization because Pod-management tools are not available in this API session.\n\nBranch/commit:\n- prompt-resource-centralization / 342d5cf refactor: move ticket role prompts to resources\n\nSummary:\n- Moved Ticket role launch guidance strings from crates/client/src/ticket_role.rs into resources/prompts/ticket_role/*.md.\n- Added workspace/user override lookup for ticket_role prompt fragments before falling back to embedded resources.\n- Kept Rust code responsible for runtime composition, bounded dynamic fields, and segment assembly.\n- Added regression coverage for workspace prompt override behavior.\n\nValidation:\n- cargo fmt\n- cargo test -p client ticket_role --lib\n- git diff --check\n- cargo check -p client\n\nPending:\n- External review/merge validation not yet performed.\n- TUI model setup wizard worktree exists but implementation has not started.
+
+
+---
+
+<!-- event: plan author: orchestrator at: 2026-06-10T09:00:04Z -->
+
+## Plan
+
+Routing update: review_needed
+
+Reason:
+- Implementation report exists for branch `prompt-resource-centralization` / commit `342d5cf8`, but independent review and merge validation are not yet recorded.
+
+Evidence checked:
+- Ticket body/thread/artifacts and relation/orchestration-plan records.
+- Worktree status for `.worktree/prompt-resource-centralization` is clean and branch has commit `342d5cf8` over `develop`.
+- Visible Pods showed no existing child reviewer.
+
+Next action:
+- Spawned branch-local reviewer Pod `reviewer-prompt-resource-centralization` with read-only scope over the worktree and this Ticket. Reviewer is asked for approve/request_changes, blockers, notes, and focused validation evidence.
+
+Boundary:
+- This is branch-local review evidence only; no main-branch Ticket approval, merge, close, or cleanup is recorded by this routing step.
+
+---
+
+<!-- event: review author: reviewer-prompt-resource-centralization at: 2026-06-10T09:06:45Z status: approve -->
+
+## Review: approve
+
+Branch-local review verdict: approve
+
+Evidence:
+- Reviewed branch diff from merge-base `76165b47d664cb02a79c16272fbb5f8377a693bb` against `develop`.
+- Verified production `crates/client/src/ticket_role.rs` no longer hardcodes the large LLM-facing Ticket role launch / intake handoff / orchestrator / coder / reviewer prompt prose; prompt fragments now live under `resources/prompts/ticket_role/*.md`.
+- Verified runtime values remain sectioned/bounded and resource lookup order is workspace `.yoi/prompts/ticket_role/*.md` -> user prompts dir -> builtin embedded resource.
+- Verified existing semantics and tests cover representative builtin prompt generation and workspace override behavior.
+
+Validation run by reviewer:
+- `cargo test -p client ticket_role --lib` passed.
+- `git diff --check $(git merge-base HEAD develop)..HEAD` passed.
+- `nix build .#yoi` passed.
+
+Non-blocking notes:
+- Dedicated user-level prompt override test could be added later, but workspace override exercises the same loader path sufficiently for this change.
+- Prompt text fragments remain in test assertions only; this is not production prompt hardcoding.
+
+This is branch-local review evidence; final main-branch approval/close still belongs to merge-completion.
+
+---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-10T09:07:14Z -->
+
+## Implementation report
+
+Merge-ready dossier for merge-completion
+
+Ticket id: `00001KTR6YVDB`
+Branch/worktree: `prompt-resource-centralization` / `.worktree/prompt-resource-centralization`
+Commits: `342d5cf8 refactor: move ticket role prompts to resources`
+
+Intent / invariant check:
+- Move LLM-facing Ticket role launch prompt prose out of Rust hardcoding into `resources/prompts`-managed resources.
+- Preserve runtime dynamic composition, bounded fields, role launch semantics, and override behavior.
+- Keep workflow markdown authority and avoid moving UI/diagnostic/protocol literals unnecessarily.
+
+Implementation summary:
+- `crates/client/src/ticket_role.rs` now loads Ticket role prompt fragments from `resources/prompts/ticket_role/*.md` with workspace/user/builtin fallback.
+- Runtime values remain assembled by Rust as sectioned/bounded context.
+- Regression coverage includes resource-backed launch prompt generation and workspace override behavior.
+
+Coder/reviewer evidence:
+- Implementation report recorded branch/commit and validation: `cargo fmt`, `cargo test -p client ticket_role --lib`, `git diff --check`, `cargo check -p client`.
+- Branch-local reviewer Pod `reviewer-prompt-resource-centralization` approved.
+- Reviewer validation: `cargo test -p client ticket_role --lib`, `git diff --check $(git merge-base HEAD develop)..HEAD`, `nix build .#yoi` all passed.
+
+Blockers fixed or rejected findings:
+- No blockers.
+- Non-blocking user-level override test suggestion rejected for this change because workspace override covers the same loader path sufficiently.
+
+Residual risks:
+- Low; resource packaging and prompt-resource lookup are the main risk, covered by reviewer `nix build .#yoi` and focused tests.
+
+Dirty state:
+- Routing/review records were committed separately as `41f74490 ticket: record routing progress`; main workspace is expected clean before merge.
+
+Parent/human decision needs:
+- User requested inprogress消化; proceed with authorized merge-completion for this inprogress Ticket.
+
+---
+
+<!-- event: review author: orchestrator at: 2026-06-10T09:08:18Z status: approve -->
+
+## Review: approve
+
+Main-branch review/merge-completion approval.
+
+Verified before merge:
+- Merge-ready dossier matched branch `prompt-resource-centralization`, worktree `.worktree/prompt-resource-centralization`, and implementation commit `342d5cf8`.
+- Branch-local independent review approved with no blockers.
+- Main workspace dirty state was limited to committed Ticket routing/dossier records.
+
+Merged:
+- `git merge --no-ff prompt-resource-centralization -m "merge: prompt resource centralization"`
+- Merge commit: `9aaa3232 merge: prompt resource centralization`
+
+Post-merge validation:
+- `cargo fmt --check` passed.
+- `git diff --check` passed.
+- `cargo test -p client ticket_role --lib` passed.
+- `target/debug/yoi ticket doctor` passed.
+- typed `TicketDoctor` reported 0 errors and 3 pre-existing diagnostics.
+- `nix build .#yoi` passed.
+
+Result: approve.
+
+---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-10T09:08:18Z from: inprogress to: done reason: merged_and_validated field: state -->
+
+## State changed
+
+Merged branch `prompt-resource-centralization` with merge commit `9aaa3232`; branch-local review approved and post-merge validation passed (`cargo fmt --check`, `git diff --check`, `cargo test -p client ticket_role --lib`, `target/debug/yoi ticket doctor`, `nix build .#yoi`).
+
+---
+
+<!-- event: state_changed author: hare at: 2026-06-10T09:08:26Z from: done to: closed reason: closed field: state -->
+
+## State changed
+
+Ticket を closed にしました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-06-10T09:08:26Z status: closed -->
+
+## 完了
+
+完了しました。
+
+実施内容:
+- Branch `prompt-resource-centralization` を `develop` に `--no-ff` merge しました。
+- Merge commit: `9aaa3232 merge: prompt resource centralization`
+- LLM 向け Ticket role launch prompt prose は `crates/client/src/ticket_role.rs` の production hardcoding から `resources/prompts/ticket_role/*.md` へ移動されました。
+- Rust 側は runtime dynamic fields の sectioned/bounded composition と workspace/user/builtin prompt resource lookup を担当します。
+- Workspace prompt override の regression coverage が追加されています。
+
+確認:
+- Branch-local reviewer `reviewer-prompt-resource-centralization` が approve。
+- `cargo fmt --check` passed。
+- `git diff --check` passed。
+- `cargo test -p client ticket_role --lib` passed。
+- `target/debug/yoi ticket doctor` passed。
+- typed `TicketDoctor` は 0 errors / 3 pre-existing diagnostics。
+- `nix build .#yoi` passed。
+
+残作業:
+- なし。user-level prompt override 専用 test は将来の追加余地として non-blocking note に留めました。
+
+---

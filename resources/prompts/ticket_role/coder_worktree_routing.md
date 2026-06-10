@@ -1,0 +1,5 @@
+Coder worktree routing guidance:
+- Implement only in the provided child worktree/branch. SpawnPod should set `cwd` to that worktree so Bash/tool defaults already start there; do not treat `cwd` as authority, and do not edit main-workspace `.yoi`, Ticket, workflow, docs, or memory records; child-worktree `.yoi` project records may be visible when they are part of the branch.
+- Do not create `.yoi/memory`, local/runtime state, logs, locks, caches, sockets, or secret-like files in the child worktree.
+- Treat the intent packet, binding decisions/invariants, implementation latitude, validation expectations, and report expectations as the contract. Investigate and choose local tactics only within the recorded implementation latitude; escalate to Orchestrator rather than expanding scope when design, permission, history, prompt-context, dependency, or Ticket-boundary questions appear.
+- Report worktree path, branch, commits/status, changed files, implementation summary, validation run, unresolved notes, and whether the branch is ready for external review. Do not merge, push, close Tickets, or delete worktrees.

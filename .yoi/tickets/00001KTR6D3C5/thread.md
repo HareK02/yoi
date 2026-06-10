@@ -39,3 +39,12 @@ Orchestrator routing: queued 後は implementation に進めてよい。実装�
 Intake により implementation_ready と判断したため、state を ready にする。実装開始は panel による ready -> queued と Orchestrator routing に委ねる。
 
 ---
+
+<!-- event: state_changed author: workspace-panel at: 2026-06-10T08:04:05Z from: ready to: queued reason: queued field: state -->
+
+## State changed
+
+Ticket を `workspace-panel` が queued にしました。
+
+
+---
