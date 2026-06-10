@@ -104,3 +104,39 @@ Ticket を `workspace-panel` が queued にしました。
 
 
 ---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-10T15:00:32Z from: queued to: inprogress reason: orchestrator_queue_acceptance field: state -->
+
+## State changed
+
+Queue acceptance: dirty Ticket records were committed (`a0b688e2`), relation query has no blockers, orchestration-plan query has only the prior temporary waiting note, workspace state is clean, and user explicitly authorized continuing. Implementation side effects may proceed after this recorded acceptance.
+
+---
+
+<!-- event: plan author: orchestrator at: 2026-06-10T15:00:32Z -->
+
+## Plan
+
+Routing decision: implementation_ready
+
+Reason:
+- Ticket is `queued`, user authorized continuing, and dirty workspace blocker was resolved by committing unrelated Ticket records in `a0b688e2`.
+- Relation query has no blockers; orchestration plan only had the temporary waiting note from the dirty-state gate.
+- Ticket body/thread contain concrete requirements, binding decisions, non-goals, acceptance criteria, and reviewer focus.
+
+Evidence checked:
+- Ticket body/thread/artifacts.
+- `TicketRelationQuery`: no blockers.
+- `TicketOrchestrationPlanQuery`: prior waiting note only.
+- Workspace state after commit: clean.
+- Relevant context: closed `00001KTR6D3C5` already added global `yoi` and `yoi.profile.import/extend`; closed prompt-resource Ticket keeps LLM-facing prompt prose out of Profiles.
+
+IntentPacket:
+- Intent: migrate standard project role Profiles into builtin reusable role policy presets and update this workspace Ticket role config to select those builtin Profiles.
+- Binding decisions / invariants: builtin Profiles carry role-level feature/tool policy and reusable defaults only; do not embed LLM-facing prompt/workflow prose; do not include runtime-bound fields, concrete paths, Pod/session state, resolved Manifest, concrete delegated scope/path, project language/backend/workflow/model/secret pins, or environment-specific web secret refs as role contract; final artifacts must pass Profile validation.
+- Requirements / acceptance criteria: `builtin:companion`, `builtin:intake`, `builtin:orchestrator`, `builtin:coder`, `builtin:reviewer` resolve through the normal builtin Profile registry/resolver; `.yoi/ticket.config.toml` role selectors use builtin selectors; current project-local role profile handling is removed or explicitly justified; role feature/tool policy remains equivalent to current project role policy; tests cover resolver/registry and role config/launcher as needed.
+- Implementation latitude: exact Lua file organization and whether project-local profiles are deleted or kept as thin overrides may be chosen during implementation, but the reason must be recorded. Project-specific values may remain in config or local overrides.
+- Escalate if implementation requires broad Profile selector/registry redesign, embedding prompt/workflow prose into Profiles, weakening validation, or expanding role tool authority beyond the recorded policy.
+- Validation: `cargo fmt`, manifest profile tests, client Ticket role tests if touched, `target/debug/yoi ticket doctor`, and `nix build .#yoi`.
+
+---
