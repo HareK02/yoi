@@ -39,7 +39,7 @@ impl Tool for EditTool {
     async fn execute(
         &self,
         input_json: &str,
-        _ctx: llm_worker::tool::ToolExecutionContext,
+        ctx: llm_worker::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let params: EditParams = serde_json::from_str(input_json)
             .map_err(|e| ToolError::InvalidArgument(format!("invalid Edit input: {e}")))?;
@@ -60,6 +60,8 @@ impl Tool for EditTool {
                 "old_string and new_string are identical".into(),
             ));
         }
+
+        let _mutation_permit = self.tracker.acquire_mutation(&params.file_path, &ctx).await;
 
         // Load current content and verify it matches the recorded hash.
         let current_bytes = self.fs.read_bytes(&params.file_path)?;

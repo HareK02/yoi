@@ -38,7 +38,9 @@
 //! ```
 
 use std::collections::{HashMap, VecDeque};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+
+use llm_worker::tool::ToolExecutionContext;
 use std::sync::{Arc, Mutex};
 
 use sha2::{Digest, Sha256};
@@ -58,6 +60,60 @@ fn hash_bytes(bytes: &[u8]) -> ContentHash {
     hasher.finalize().into()
 }
 
+#[derive(Debug, Clone, Default)]
+struct FileMutationCoordinator {
+    locks: Arc<tokio::sync::Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>>,
+}
+
+pub(crate) struct FileMutationPermit {
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+}
+
+impl FileMutationCoordinator {
+    async fn acquire(&self, path: &Path) -> FileMutationPermit {
+        let key = file_mutation_key(path);
+        let lock = {
+            let mut locks = self.locks.lock().await;
+            locks
+                .entry(key)
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        FileMutationPermit {
+            _guard: lock.lock_owned().await,
+        }
+    }
+}
+
+fn file_mutation_key(path: &Path) -> PathBuf {
+    if let Ok(canonical) = path.canonicalize() {
+        return canonical;
+    }
+    if let (Some(parent), Some(file_name)) = (path.parent(), path.file_name())
+        && let Ok(canonical_parent) = parent.canonicalize()
+    {
+        return canonical_parent.join(file_name);
+    }
+    normalize_path_lexically(path)
+}
+
+fn normalize_path_lexically(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            Component::Normal(part) => normalized.push(part),
+            Component::RootDir | Component::Prefix(_) => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
+}
+
 #[derive(Debug, Default)]
 struct Inner {
     /// Hash of each file's last observed contents, keyed by canonical path.
@@ -74,12 +130,32 @@ struct Inner {
 #[derive(Debug, Clone, Default)]
 pub struct Tracker {
     inner: Arc<Mutex<Inner>>,
+    mutations: FileMutationCoordinator,
 }
 
 impl Tracker {
     /// Create an empty tracker. Typically called once per session.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Acquire the per-target-file mutation guard shared by `Write` and `Edit`.
+    ///
+    /// The guard is keyed by canonical target path where possible so equivalent
+    /// paths serialize through the same lock. Worker still executes tool calls in
+    /// parallel; this only gates the critical filesystem mutation section for
+    /// builtin file mutation tools.
+    pub(crate) async fn acquire_mutation(
+        &self,
+        path: &Path,
+        ctx: &ToolExecutionContext,
+    ) -> FileMutationPermit {
+        tracing::debug!(
+            batch_id = %ctx.batch_id,
+            call_index = ctx.call_index,
+            "acquire file mutation guard"
+        );
+        self.mutations.acquire(path).await
     }
 
     /// Record that `path` has been observed with the given content bytes.
@@ -346,5 +422,51 @@ mod tests {
             let name = format!("f{i:02}.txt");
             assert!(recent.iter().all(|p| !p.ends_with(&name)));
         }
+    }
+
+    #[tokio::test]
+    async fn mutation_guard_blocks_equivalent_paths_until_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("target.txt");
+        fs::write(&file, "x").unwrap();
+        let equivalent = dir.path().join("sub").join("..").join("target.txt");
+        fs::create_dir(dir.path().join("sub")).unwrap();
+        let tracker = Tracker::new();
+        let first = tracker
+            .acquire_mutation(&file, &ToolExecutionContext::new("a", "batch", 0))
+            .await;
+
+        let second_ctx = ToolExecutionContext::new("b", "batch", 1);
+        let second = tracker.acquire_mutation(&equivalent, &second_ctx);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), second)
+                .await
+                .is_err()
+        );
+
+        drop(first);
+        tracker
+            .acquire_mutation(&equivalent, &ToolExecutionContext::new("b", "batch", 1))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn mutation_guard_does_not_block_different_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let first_file = dir.path().join("a.txt");
+        let second_file = dir.path().join("b.txt");
+        fs::write(&first_file, "a").unwrap();
+        fs::write(&second_file, "b").unwrap();
+        let tracker = Tracker::new();
+        let _first = tracker
+            .acquire_mutation(&first_file, &ToolExecutionContext::new("a", "batch", 0))
+            .await;
+
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            tracker.acquire_mutation(&second_file, &ToolExecutionContext::new("b", "batch", 1)),
+        )
+        .await
+        .expect("different files should not share a mutation guard");
     }
 }
