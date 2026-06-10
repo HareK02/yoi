@@ -222,3 +222,81 @@ Validation after fixes:
 Reviewer `reviewer-builtin-role-profiles` has been asked to re-review the amended branch.
 
 ---
+
+<!-- event: review author: reviewer-builtin-role-profiles at: 2026-06-10T15:26:06Z status: approve -->
+
+## Review: approve
+
+Branch-local review verdict: approve
+
+Blockers: none.
+
+Reviewer confirmed previous blockers are resolved:
+- Role builtin Profiles are standalone `yoi.profile { ... }` artifacts rather than extending `builtin:default`.
+- Prompt/workflow prose, model ref, and web secret ref are not embedded in role builtin Profiles.
+- `companion` / `intake` / `orchestrator` / `reviewer` use read scope; `coder` is the only write-scope role; `orchestrator` keeps reusable `delegation_scope = workspace_write()` intent.
+
+Non-blocking notes:
+- Some custom concrete profile tests still use `builtin:default`, but scaffold/role-default launch tests now verify role-specific builtin defaults.
+
+Validation run by reviewer:
+- `cargo fmt --check` passed.
+- `cargo test -p manifest profile --lib` passed.
+- `cargo test -p ticket config --lib` passed.
+- `cargo test -p client ticket_role --lib` passed.
+- `cargo check -p manifest -p ticket` passed.
+- `git diff --check $(git merge-base HEAD develop)..HEAD` passed.
+- `nix build .#yoi` passed.
+
+This is branch-local review evidence; no final main-branch approval/close was recorded by reviewer.
+
+---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-10T15:26:32Z -->
+
+## Implementation report
+
+Merge-ready dossier
+
+Ticket id: `00001KTRG8N9J`
+Branch/worktree: `builtin-role-profiles` / `.worktree/builtin-role-profiles`
+Commits:
+- `85c06dc6 feat: add builtin role profiles`
+
+Intent / invariant check:
+- Standard role policy presets are moved from project-local `.yoi/profiles` into embedded builtin Profiles under `resources/profiles`.
+- Builtin role Profiles contain reusable role feature/tool/scope policy only.
+- Prompt/workflow prose, runtime-bound fields, concrete paths, Pod/session state, project Ticket backend/language/workflow config, model pins, and web secret refs are not embedded in role builtin Profiles.
+
+Implementation summary:
+- Added `builtin:companion`, `builtin:intake`, `builtin:orchestrator`, `builtin:coder`, and `builtin:reviewer` to the builtin Profile registry/resolver path.
+- Added standalone global-`yoi` Lua Profile resources for each role.
+- Migrated `.yoi/ticket.config.toml` role selectors to builtin selectors.
+- Removed project-local role Profile Lua files; `.yoi/profiles.toml` now only points default to `builtin:companion`.
+- Updated Ticket config scaffold and client role launch expectations to role-specific builtin defaults.
+- Added tests for builtin role registration/resolution and role policy boundaries.
+
+Coder/reviewer Pods:
+- Implementation was done directly by Orchestrator in the worktree because this session previously could not delegate write scope to coder Pods.
+- Reviewer Pod: `reviewer-builtin-role-profiles`.
+
+Blockers fixed or rejected findings:
+- Fixed reviewer blocker: role Profiles no longer inherit `builtin:default` write scope, model ref, or web secret.
+- Fixed reviewer blocker: read/write role scope and absence of model/web config are now asserted in tests.
+- No remaining blockers. Non-blocking: some custom concrete profile tests still use `builtin:default`, which is acceptable because role-default scaffold/launch tests cover the migrated default role selectors.
+
+Validation performed:
+- Orchestrator after fixes: `cargo fmt --check`, `cargo test -p manifest profile --lib`, `cargo test -p ticket config --lib`, `cargo test -p client ticket_role --lib`, `cargo check -p manifest -p ticket`, `git diff --check`, `nix build .#yoi` passed.
+- Reviewer after fixes: same focused validation plus `git diff --check $(git merge-base HEAD develop)..HEAD` and `nix build .#yoi` passed.
+
+Residual risks:
+- Low. Main remaining risk is whether broad future user/project profile import is desired; this Ticket only requires builtin role selector migration and current role policy boundaries.
+
+Dirty state:
+- Main workspace has only Ticket review/dossier records pending commit at dossier time.
+- Worktree branch is clean.
+
+Parent/human decision needs:
+- Panel launch guidance for this Ticket said to stop at merge-ready dossier without merge/close/final approval. Explicit merge-completion authorization is needed before merging `builtin-role-profiles`, running post-merge validation, closing the Ticket, and cleaning the worktree/branch.
+
+---
