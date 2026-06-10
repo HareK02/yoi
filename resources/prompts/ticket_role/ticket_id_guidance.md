@@ -1,0 +1,1 @@
+- Treat the Ticket id as an opaque storage id. Read TicketShow body/thread/artifacts before routing or implementation; do not infer requirements from id or title alone.
