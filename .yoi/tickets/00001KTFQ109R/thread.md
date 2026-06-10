@@ -42,3 +42,21 @@ Operational trigger for revisiting:
 - Prompt-level "read-only" instructions prove insufficient and Companion attempts or performs unsafe Bash actions.
 
 ---
+
+<!-- event: state_changed author: hare at: 2026-06-10T10:03:36Z from: planning to: closed reason: closed field: state -->
+
+## State changed
+
+Ticket を closed にしました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-06-10T10:03:36Z status: closed -->
+
+## 完了
+
+Companion の lifecycle / panel integration は 00001KTFQ109T で実装済み。Companion を含む project role profile の tool surface / feature policy は 00001KTNQK1V8 で実装済み。残る prompt 文言整理は LLM-facing prompt の resources/prompts 集約チケット側で扱うため、この古い計画チケットは完了扱いで閉じる。
+
+
+---

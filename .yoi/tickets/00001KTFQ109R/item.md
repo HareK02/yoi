@@ -1,8 +1,8 @@
 ---
 title: "Companion status context and tool policy"
-state: "planning"
+state: 'closed'
 created_at: "2026-06-07T00:16:51Z"
-updated_at: "2026-06-07T02:45:32Z"
+updated_at: '2026-06-10T10:03:36Z'
 ---
 
 ## Background
