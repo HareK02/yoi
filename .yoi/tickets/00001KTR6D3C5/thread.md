@@ -148,3 +148,81 @@ Non-blocking notes:
 This is branch-local review evidence; final main-branch approval/close belongs to merge-completion.
 
 ---
+
+<!-- event: review author: orchestrator at: 2026-06-10T09:55:10Z status: approve -->
+
+## Review: approve
+
+Main-branch review/merge-completion approval.
+
+Verified before merge:
+- Branch-local reviewer approved with no blockers.
+- Merge target matched branch `lua-profile-yoi-api` / worktree `.worktree/lua-profile-yoi-api` and implementation commit `4e1a08c2`.
+- Diff touches `crates/manifest/src/profile.rs` and `resources/profiles/default.lua` as expected.
+
+Merged:
+- `git merge --no-ff lua-profile-yoi-api -m "merge: lua profile yoi api"`
+- Merge commit: `15dc176e merge: lua profile yoi api`
+
+Post-merge validation:
+- `cargo fmt --check` passed.
+- `git diff --check` passed.
+- `cargo test -p manifest profile --lib` passed (22 passed).
+- `cargo check -p manifest` passed.
+- `target/debug/yoi ticket doctor` passed.
+- typed `TicketDoctor` reported 0 errors and 3 pre-existing diagnostics.
+- `nix build .#yoi` passed.
+
+Result: approve.
+
+---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-10T09:55:10Z from: inprogress to: done reason: merged_and_validated field: state -->
+
+## State changed
+
+Merged branch `lua-profile-yoi-api` with merge commit `15dc176e`; branch-local review approved and post-merge validation passed (`cargo fmt --check`, `git diff --check`, `cargo test -p manifest profile --lib`, `cargo check -p manifest`, `target/debug/yoi ticket doctor`, `nix build .#yoi`).
+
+---
+
+<!-- event: state_changed author: hare at: 2026-06-10T09:55:23Z from: done to: closed reason: closed field: state -->
+
+## State changed
+
+Ticket を closed にしました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-06-10T09:55:23Z status: closed -->
+
+## 完了
+
+完了しました。
+
+実施内容:
+- Lua Profile evaluator に global `yoi` を注入しました。
+- `yoi.profile` / `require("yoi.profile")` は callable table になり、既存の `local profile = require("yoi.profile"); return profile { ... }` 互換を保ちながら `import` / `extend` を提供します。
+- `yoi.profile.import("builtin:default")` は resolved Manifest ではなく raw builtin Profile artifact を返します。
+- `yoi.profile.extend("builtin:default", overrides)` は object を再帰 merge し、scalar/list など non-object は置換します。
+- 最終 artifact は既存 Profile validation に通され、runtime-bound field（例: `pod`）の混入は reject されます。
+- `resources/profiles/default.lua` を global `yoi` style に更新しました。
+
+Merge:
+- Branch: `lua-profile-yoi-api`
+- Merge commit: `15dc176e merge: lua profile yoi api`
+
+確認:
+- Branch-local reviewer `reviewer-lua-profile-yoi-api` が approve。
+- `cargo fmt --check` passed。
+- `git diff --check` passed。
+- `cargo test -p manifest profile --lib` passed（22 passed）。
+- `cargo check -p manifest` passed。
+- `target/debug/yoi ticket doctor` passed。
+- typed `TicketDoctor` は 0 errors / 3 pre-existing diagnostics。
+- `nix build .#yoi` passed。
+
+残作業:
+- なし。import/extend は現時点では `builtin:default` / `default` に限定しています。より広い user/project selector import が必要なら follow-up Ticket として扱えます。
+
+---
