@@ -12,6 +12,7 @@ mod picker;
 mod pod_list;
 mod role_session_registry;
 mod scroll;
+pub mod setup_model;
 mod single_pod;
 mod spawn;
 mod task;

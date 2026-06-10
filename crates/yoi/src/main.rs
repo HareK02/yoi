@@ -22,6 +22,7 @@ enum Mode {
     Ticket(ticket_cli::TicketCli),
     PodRuntime(Vec<String>),
     Keys,
+    SetupModel,
     Tui {
         mode: LaunchMode,
         workspace_root: PathBuf,
@@ -107,6 +108,7 @@ async fn main() -> ExitCode {
         },
         Mode::PodRuntime(args) => pod::entrypoint::run_cli_from("yoi pod", args).await,
         Mode::Keys => tui::keys::launch().await,
+        Mode::SetupModel => tui::setup_model::launch().await,
         Mode::Tui {
             mode,
             workspace_root,
@@ -182,6 +184,14 @@ fn parse_args_slice(args: &[String]) -> Result<Mode, ParseError> {
                 return Err(ParseError("yoi keys does not accept arguments".into()));
             }
             return Ok(Mode::Keys);
+        }
+        "setup-model" => {
+            if args.len() != 1 {
+                return Err(ParseError(
+                    "yoi setup-model does not accept arguments".into(),
+                ));
+            }
+            return Ok(Mode::SetupModel);
         }
         "memory" if args.get(1).map(String::as_str) == Some("lint") => {
             let lint_args = &args[2..];
@@ -542,6 +552,20 @@ mod tests {
             Mode::Keys => {}
             _ => panic!("expected Keys mode"),
         }
+    }
+
+    #[test]
+    fn parse_setup_model_subcommand() {
+        match parse_args_from(["setup-model"]).unwrap() {
+            Mode::SetupModel => {}
+            _ => panic!("expected SetupModel mode"),
+        }
+    }
+
+    #[test]
+    fn parse_setup_model_rejects_arguments() {
+        let err = parse_args_from(["setup-model", "extra"]).unwrap_err();
+        assert_eq!(err.to_string(), "yoi setup-model does not accept arguments");
     }
 
     #[test]
