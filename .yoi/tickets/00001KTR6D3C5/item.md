@@ -2,7 +2,7 @@
 title: 'Lua Profileに組み込みyoi APIとimport/extendを追加する'
 state: 'inprogress'
 created_at: '2026-06-10T07:19:31Z'
-updated_at: '2026-06-10T09:32:26Z'
+updated_at: '2026-06-10T09:36:53Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-06-10T08:04:05Z'

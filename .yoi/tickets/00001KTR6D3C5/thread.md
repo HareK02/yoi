@@ -84,3 +84,36 @@ IntentPacket:
 - Validation: `cargo fmt`, `cargo test -p manifest profile --lib` or narrower named tests plus broader manifest tests, `target/debug/yoi ticket doctor`, and `nix build .#yoi` before merge because runtime resources/Profile evaluation/package resources are touched.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-10T09:36:53Z -->
+
+## Implementation report
+
+Implementation report
+
+Branch/worktree: `lua-profile-yoi-api` / `.worktree/lua-profile-yoi-api`
+Commit:
+- `4e1a08c2 feat: add yoi profile lua api`
+
+Summary:
+- Injected global `yoi` into Lua Profile evaluation so filesystem and embedded Profiles can use `yoi.profile`, `yoi.models`, `yoi.compact`, and `yoi.scope` without local `require` boilerplate.
+- Changed `yoi.profile`/`require("yoi.profile")` into a callable table, preserving legacy `local profile = require("yoi.profile"); return profile { ... }` behavior while adding `yoi.profile.import` and `yoi.profile.extend`.
+- Added `yoi.profile.import("builtin:default")` for raw builtin Profile artifact import and `yoi.profile.extend("builtin:default", overrides)` with recursive object merge and scalar/list replacement semantics.
+- Kept final resolved artifact behind existing reusable Profile validation; an extend override containing runtime-bound `pod` is rejected.
+- Updated bundled `resources/profiles/default.lua` to global `yoi` style.
+- Added tests for import/extend, validation boundary, host modules/local require, and builtin default evaluation.
+
+Validation run in branch:
+- `cargo fmt`
+- `cargo test -p manifest global_yoi_import_and_extend_builtin_profile --lib` passed.
+- `cargo test -p manifest global_yoi_extend_keeps_profile_validation_boundary --lib` passed.
+- `cargo test -p manifest host_modules_and_local_require_work --lib` passed.
+- `cargo test -p manifest builtin_default_resolves_without_external_evaluator --lib` passed.
+- `cargo check -p manifest` passed.
+- `git diff --check` passed.
+
+Notes:
+- `nix build .#yoi` not yet run on this branch; Orchestrator should run it before merge because runtime resources/Profile evaluation/package resources are touched.
+- Import support is currently explicit for `builtin:default`; broad user/project selector import can be added as a follow-up if desired, but this covers the requested builtin composition surface and preserves authority boundaries.
+
+---
