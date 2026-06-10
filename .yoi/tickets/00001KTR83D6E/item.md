@@ -1,8 +1,8 @@
 ---
 title: 'Edit/Writeの同一ファイル変更をToolExecutionContextで直列化する'
-state: 'inprogress'
+state: 'closed'
 created_at: '2026-06-10T07:49:10Z'
-updated_at: '2026-06-10T09:37:59Z'
+updated_at: '2026-06-10T09:40:36Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-06-10T08:10:58Z'
