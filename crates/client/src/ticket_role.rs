@@ -4,8 +4,9 @@
 //! host-side Pod spawning behind the `client` crate so UI callers do not need to
 //! depend on `pod` internals.
 
+use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use manifest::{ProfileDiscovery, ProfileResolveOptions, ProfileResolver, ProfileSelector};
@@ -38,13 +39,13 @@ impl TicketRef {
         non_empty(self.id.as_deref())
     }
 
-    fn append_prompt_lines(&self, out: &mut String) {
+    fn append_prompt_lines(&self, out: &mut String, prompts: &TicketRolePromptTemplates) {
         match non_empty(self.id.as_deref()) {
             None => out.push_str("Target Ticket: not specified\n"),
             Some(id) => {
                 out.push_str("Target Ticket:\n");
                 push_bounded_bullet(out, "id", id);
-                out.push_str("- Treat the Ticket id as an opaque storage id. Read TicketShow body/thread/artifacts before routing or implementation; do not infer requirements from id or title alone.\n");
+                push_prompt_fragment(out, &prompts.ticket_id_guidance);
             }
         }
     }
@@ -65,13 +66,11 @@ impl TicketIntakeHandoff {
         }
     }
 
-    fn append_prompt_lines(&self, out: &mut String) {
+    fn append_prompt_lines(&self, out: &mut String, prompts: &TicketRolePromptTemplates) {
         out.push_str("\nPanel handoff:\n");
         push_bounded_bullet(out, "workspace", &self.workspace_label);
         push_bounded_bullet(out, "workspace_orchestrator_pod", &self.orchestrator_pod);
-        out.push_str("- When Intake has clarified the request and created/updated the Ticket, use the typed Ticket tool surface to append `intake_summary` and set `state = ready` when the Ticket is ready to queue; use planning language for Tickets that still need clarification/preparation.\n");
-        out.push_str("- Handoff report fields: created_or_updated_ticket_id, state, open_questions_or_risk_flags, intake_summary.\n");
-        out.push_str("- Do not start implementation automatically; the user queues a ready Ticket via panel (`ready -> queued`), and Orchestrator treats `queued` as schedulable before moving it to `inprogress` when starting.\n");
+        push_prompt_fragment(out, &prompts.intake_handoff);
     }
 }
 
@@ -450,15 +449,110 @@ async fn wait_for_run_acceptance(
         .map_err(|_| TicketRoleLaunchError::RunAcceptanceTimeout)?
 }
 
+#[derive(Debug, Clone)]
+struct TicketRolePromptTemplates {
+    launch_preamble: String,
+    ticket_id_guidance: String,
+    record_language_configured: String,
+    record_language_unconfigured: String,
+    intake_handoff: String,
+    orchestrator_worktree_routing: String,
+    orchestrator_merge_completion: String,
+    coder_worktree_routing: String,
+    reviewer_worktree_routing: String,
+}
+
+impl TicketRolePromptTemplates {
+    fn load(workspace_root: &Path) -> Self {
+        Self {
+            launch_preamble: load_ticket_role_prompt(
+                workspace_root,
+                "launch_preamble",
+                include_str!("../../../resources/prompts/ticket_role/launch_preamble.md"),
+            ),
+            ticket_id_guidance: load_ticket_role_prompt(
+                workspace_root,
+                "ticket_id_guidance",
+                include_str!("../../../resources/prompts/ticket_role/ticket_id_guidance.md"),
+            ),
+            record_language_configured: load_ticket_role_prompt(
+                workspace_root,
+                "record_language_configured",
+                include_str!(
+                    "../../../resources/prompts/ticket_role/record_language_configured.md"
+                ),
+            ),
+            record_language_unconfigured: load_ticket_role_prompt(
+                workspace_root,
+                "record_language_unconfigured",
+                include_str!(
+                    "../../../resources/prompts/ticket_role/record_language_unconfigured.md"
+                ),
+            ),
+            intake_handoff: load_ticket_role_prompt(
+                workspace_root,
+                "intake_handoff",
+                include_str!("../../../resources/prompts/ticket_role/intake_handoff.md"),
+            ),
+            orchestrator_worktree_routing: load_ticket_role_prompt(
+                workspace_root,
+                "orchestrator_worktree_routing",
+                include_str!(
+                    "../../../resources/prompts/ticket_role/orchestrator_worktree_routing.md"
+                ),
+            ),
+            orchestrator_merge_completion: load_ticket_role_prompt(
+                workspace_root,
+                "orchestrator_merge_completion",
+                include_str!(
+                    "../../../resources/prompts/ticket_role/orchestrator_merge_completion.md"
+                ),
+            ),
+            coder_worktree_routing: load_ticket_role_prompt(
+                workspace_root,
+                "coder_worktree_routing",
+                include_str!("../../../resources/prompts/ticket_role/coder_worktree_routing.md"),
+            ),
+            reviewer_worktree_routing: load_ticket_role_prompt(
+                workspace_root,
+                "reviewer_worktree_routing",
+                include_str!("../../../resources/prompts/ticket_role/reviewer_worktree_routing.md"),
+            ),
+        }
+    }
+}
+
+fn load_ticket_role_prompt(workspace_root: &Path, name: &str, builtin: &str) -> String {
+    let relative = Path::new("ticket_role").join(format!("{name}.md"));
+    for candidate in [
+        Some(workspace_root.join(".yoi/prompts").join(&relative)),
+        manifest::paths::user_prompts_dir().map(|dir| dir.join(&relative)),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Ok(text) = fs::read_to_string(candidate) {
+            return text;
+        }
+    }
+    builtin.to_string()
+}
+
+fn push_prompt_fragment(out: &mut String, fragment: &str) {
+    out.push_str(fragment.trim_end());
+    out.push('\n');
+}
+
 fn build_launch_prompt(
     context: &TicketRoleLaunchContext,
     profile: &str,
     workflow: &str,
     launch_prompt_ref: Option<&str>,
 ) -> String {
+    let prompts = TicketRolePromptTemplates::load(&context.workspace_root);
     let mut out = String::new();
-    out.push_str("# Ticket role launch\n\n");
-    out.push_str("Profile supplies durable system/role behavior. The workflow segment supplies the procedural flow. This generated launch prompt supplies only the concrete Ticket/action context for the first committed user task.\n\n");
+    push_prompt_fragment(&mut out, &prompts.launch_preamble);
+    out.push('\n');
     push_bounded_field(&mut out, "Role", context.role.as_str());
     push_bounded_field(&mut out, "Profile selector", profile);
     push_bounded_field(&mut out, "Workflow", workflow);
@@ -474,14 +568,14 @@ fn build_launch_prompt(
     match non_empty(context.ticket_record_language.as_deref()) {
         Some(language) => {
             push_bounded_field(&mut out, "Ticket record language", language);
-            out.push_str("Ticket record language guidance: write durable Ticket item/thread/resolution text and Ticket tool bodies in this language. This does not change normal worker response language or memory/Knowledge generation language. Do not translate protocol literals, file paths, commands, logs, identifiers, or quoted external text solely because this language is configured.\n");
+            push_prompt_fragment(&mut out, &prompts.record_language_configured);
         }
-        None => out.push_str("Ticket record language: not configured; preserve existing/default Ticket record language behavior.\n"),
+        None => push_prompt_fragment(&mut out, &prompts.record_language_unconfigured),
     }
     out.push('\n');
 
     if let Some(ticket) = &context.ticket {
-        ticket.append_prompt_lines(&mut out);
+        ticket.append_prompt_lines(&mut out, &prompts);
     } else {
         out.push_str("Target Ticket: not specified\n");
     }
@@ -492,7 +586,7 @@ fn build_launch_prompt(
     }
 
     if let Some(handoff) = &context.intake_handoff {
-        handoff.append_prompt_lines(&mut out);
+        handoff.append_prompt_lines(&mut out, &prompts);
     }
 
     if let Some(intent_packet) = non_empty(context.intent_packet.as_deref()) {
@@ -520,54 +614,33 @@ fn build_launch_prompt(
         );
     }
 
-    append_role_execution_guidance(&mut out, context.role);
+    append_role_execution_guidance(&mut out, context.role, &prompts);
 
     out
 }
 
-fn append_role_execution_guidance(out: &mut String, role: TicketRole) {
+fn append_role_execution_guidance(
+    out: &mut String,
+    role: TicketRole,
+    prompts: &TicketRolePromptTemplates,
+) {
     match role {
-        TicketRole::Orchestrator => append_orchestrator_agent_routing_guidance(out),
-        TicketRole::Coder => append_coder_agent_routing_guidance(out),
-        TicketRole::Reviewer => append_reviewer_agent_routing_guidance(out),
+        TicketRole::Orchestrator => {
+            out.push('\n');
+            push_prompt_fragment(out, &prompts.orchestrator_worktree_routing);
+            out.push('\n');
+            push_prompt_fragment(out, &prompts.orchestrator_merge_completion);
+        }
+        TicketRole::Coder => {
+            out.push('\n');
+            push_prompt_fragment(out, &prompts.coder_worktree_routing);
+        }
+        TicketRole::Reviewer => {
+            out.push('\n');
+            push_prompt_fragment(out, &prompts.reviewer_worktree_routing);
+        }
         TicketRole::Intake => {}
     }
-}
-
-fn append_orchestrator_agent_routing_guidance(out: &mut String) {
-    out.push_str("\nOrchestrator worktree + agent routing guidance:\n");
-    out.push_str("- Treat `ticket-orchestrator-routing` as the routing gate. Read the Ticket and workspace state first; `ready -> queued` authorizes routing, not implementation side effects.\n");
-    out.push_str("- Create worktrees or spawn coder/reviewer Pods only after `state = inprogress` is already recorded and accepted. If the Ticket is still queued and unblocked, record `queued -> inprogress` before any worktree/SpawnPod side effect.\n");
-    out.push_str("- Use `worktree-workflow` for the mechanical worktree plan: create `.worktree/<task-name>`, keep tracked `.yoi` project records visible in the child worktree, exclude `.yoi/memory` plus local/runtime/log/lock/secret-like `.yoi` paths, and keep active orchestration progress plus final review/approval/close in the main workspace unless explicitly designed otherwise.\n");
-    out.push_str("- Use `multi-agent-workflow` for the sibling loop: coder and reviewer are siblings under this Orchestrator; coder gets narrow write scope to the child worktree; reviewer is read-only by default.\n");
-    out.push_str("- Give the coder an intent packet that distinguishes binding decisions/invariants, implementation latitude, escalation conditions, child worktree/branch, validation commands, and report expectations; set SpawnPod `cwd` to the child worktree while delegating explicit scope separately, prohibit editing main-workspace `.yoi`/Ticket/workflow/docs records, and prohibit creating generated memory/local/runtime/secret-like files in the child worktree.\n");
-    out.push_str("- Give the reviewer the recorded Ticket intent, binding decisions/invariants, implementation latitude, acceptance criteria, explicit escalation conditions, diff/commits, validation evidence, and blocker/non-blocker criteria; reviewer judgment is against recorded requirements and decisions, not unrecorded preferred tactics. Keep branch-local reviewer verdicts in the review report or merge-ready dossier rather than recording them as final main-branch Ticket approval.\n");
-    out.push_str("- Ticket thread progress may record worktree plan, coder delegated/completed/blocked, reviewer delegated, blocker/fix-loop summaries, and merge-ready dossier pointer; do not merge, close, or record final main approval in this routing/branch-review phase.\n");
-    out.push_str("- Stop at a merge-ready dossier for `orchestrator-merge-completion` containing Ticket id, branch/worktree, commits, intent/invariant check, implementation summary, coder/reviewer Pods, blockers fixed or rejected findings with reasons, validation performed, residual risks, dirty state, and parent/human decision needs if any.\n");
-
-    out.push_str("\nOrchestrator merge-completion guidance:\n");
-    out.push_str("- Enter merge-completion only for an `inprogress` Ticket with a merge-ready dossier. Conservative or missing authorization mode stops at the dossier; do not infer merge authority from public/default configuration.\n");
-    out.push_str("- Required dossier fields before merge: Ticket id; branch/worktree; commits; intent/invariant check; implementation summary; coder/reviewer Pods; blockers fixed or rejected findings with reasons; validation performed; residual risks; dirty state; parent/human decision needs if any.\n");
-    out.push_str("- Before merging, verify the dossier branch/worktree/commits match the branch to merge, independent reviewer approval exists in the dossier or an explicit human override decision is recorded, the main workspace is safe, and unrelated dirty changes are understood.\n");
-    out.push_str("- Merge only when dogfooding/workspace policy grants merge authority. If authority is unavailable, record/return the dossier and stop without merge, close, final main Ticket approval, or cleanup.\n");
-    out.push_str("- Preserve the boundary: branch-local reviewer verdicts are dossier evidence; final main-branch Ticket approval or close happens only during authorized merge-completion after merge and validation evidence.\n");
-    out.push_str("- Authorized sequence: stop/reclaim coder and reviewer Pods where appropriate; merge with `git merge --no-ff <branch>` or the project-agreed method; run post-merge validation appropriate to the change; record review, merge, and validation outcomes in the Ticket thread during merge-completion; transition `inprogress -> done` or close according to typed Ticket workflow rules; then remove the merged child worktree and delete the merged branch unless explicitly kept.\n");
-    out.push_str("- Post-merge validation baseline: run focused tests from the Ticket/dossier, `cargo fmt --check`, `git diff --check`, and `target/debug/yoi ticket doctor` where applicable; add broader validation such as `cargo check --workspace --all-targets`, `nix build .#yoi`, or equivalent when risk, API surface, packaging, runtime resources, prompts, or touched files warrant it.\n");
-}
-
-fn append_coder_agent_routing_guidance(out: &mut String) {
-    out.push_str("\nCoder worktree routing guidance:\n");
-    out.push_str("- Implement only in the provided child worktree/branch. SpawnPod should set `cwd` to that worktree so Bash/tool defaults already start there; do not treat `cwd` as authority, and do not edit main-workspace `.yoi`, Ticket, workflow, docs, or memory records; child-worktree `.yoi` project records may be visible when they are part of the branch.\n");
-    out.push_str("- Do not create `.yoi/memory`, local/runtime state, logs, locks, caches, sockets, or secret-like files in the child worktree.\n");
-    out.push_str("- Treat the intent packet, binding decisions/invariants, implementation latitude, validation expectations, and report expectations as the contract. Investigate and choose local tactics only within the recorded implementation latitude; escalate to Orchestrator rather than expanding scope when design, permission, history, prompt-context, dependency, or Ticket-boundary questions appear.\n");
-    out.push_str("- Report worktree path, branch, commits/status, changed files, implementation summary, validation run, unresolved notes, and whether the branch is ready for external review. Do not merge, push, close Tickets, or delete worktrees.\n");
-}
-
-fn append_reviewer_agent_routing_guidance(out: &mut String) {
-    out.push_str("\nReviewer worktree routing guidance:\n");
-    out.push_str("- Review as a sibling of the coder under Orchestrator, read-only by default. Read the Ticket/intent packet, branch diff or commits, and validation evidence before judging. Judge implementation against recorded intent, binding decisions/invariants, implementation latitude, acceptance criteria, and explicit escalation conditions, not unrecorded preferred tactics.\n");
-    out.push_str("- Classify findings as blockers, non-blocking follow-ups, or parent-decision items against the recorded intent, binding decisions/invariants, implementation latitude, acceptance criteria, and explicit escalation conditions; include concrete file/line evidence where useful.\n");
-    out.push_str("- Keep the branch-local reviewer verdict in the review report for the Orchestrator merge-ready dossier. Do not record final main-branch Ticket approval, merge, close, push, or instruct the coder directly.\n");
 }
 
 fn default_pod_name(role: TicketRole, ticket: Option<&TicketRef>) -> String {
@@ -1201,6 +1274,27 @@ workflow = "ticket-review-workflow"
         assert!(text.contains("cargo check --workspace --all-targets"));
         assert!(text.contains("nix build .#yoi"));
         assert!(text.contains("when risk, API surface, packaging, runtime resources, prompts, or touched files warrant it"));
+    }
+
+    #[test]
+    fn workspace_prompt_override_replaces_ticket_role_fragment() {
+        let temp = TempDir::new().unwrap();
+        write_builtin_role_config(temp.path(), &[TicketRole::Orchestrator]);
+        let override_dir = temp.path().join(".yoi/prompts/ticket_role");
+        std::fs::create_dir_all(&override_dir).unwrap();
+        std::fs::write(
+            override_dir.join("orchestrator_worktree_routing.md"),
+            "Orchestrator worktree + agent routing guidance:\n- WORKSPACE OVERRIDE MARKER\n",
+        )
+        .unwrap();
+
+        let mut orchestrator = TicketRoleLaunchContext::new(temp.path(), TicketRole::Orchestrator);
+        orchestrator.ticket = Some(TicketRef::id("prompt-resource-override"));
+        let plan = plan_ticket_role_launch(orchestrator).unwrap();
+        let text = text_segment(&plan);
+
+        assert!(text.contains("WORKSPACE OVERRIDE MARKER"));
+        assert!(!text.contains("Use `multi-agent-workflow`"));
     }
 
     #[test]
