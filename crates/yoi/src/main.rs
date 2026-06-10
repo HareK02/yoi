@@ -22,6 +22,7 @@ enum Mode {
     Ticket(ticket_cli::TicketCli),
     PodRuntime(Vec<String>),
     Keys,
+    SetupModel,
     Tui {
         mode: LaunchMode,
         workspace_root: PathBuf,
@@ -107,6 +108,7 @@ async fn main() -> ExitCode {
         },
         Mode::PodRuntime(args) => pod::entrypoint::run_cli_from("yoi pod", args).await,
         Mode::Keys => tui::keys::launch().await,
+        Mode::SetupModel => tui::setup_model::launch().await,
         Mode::Tui {
             mode,
             workspace_root,
@@ -182,6 +184,14 @@ fn parse_args_slice(args: &[String]) -> Result<Mode, ParseError> {
                 return Err(ParseError("yoi keys does not accept arguments".into()));
             }
             return Ok(Mode::Keys);
+        }
+        "setup-model" => {
+            if args.len() != 1 {
+                return Err(ParseError(
+                    "yoi setup-model does not accept arguments".into(),
+                ));
+            }
+            return Ok(Mode::SetupModel);
         }
         "memory" if args.get(1).map(String::as_str) == Some("lint") => {
             let lint_args = &args[2..];
@@ -433,7 +443,7 @@ fn parse_session_id(value: &str) -> Result<SegmentId, ParseError> {
 
 fn print_help() {
     println!(
-        "yoi\n\nUsage:\n  yoi [OPTIONS] [POD_NAME]\n  yoi panel [--workspace <PATH>]\n  yoi keys\n  yoi pod [POD_OPTIONS]\n  yoi objective <COMMAND> [OPTIONS]\n  yoi session analyze <SESSION_JSONL_PATH> --json\n  yoi ticket <COMMAND> [OPTIONS]\n  yoi memory lint [OPTIONS]\n\nOptions:\n  -r, --resume           Open the Pod picker and resume/attach a Pod\n      --workspace <PATH> Runtime workspace root (defaults to cwd)\n      --pod <NAME>       Attach/restore/create a Pod by name\n      --socket <PATH>    Attach to a specific Pod socket with --pod\n      --session <UUID>   Resume a specific session segment\n      --profile <REF>    Select a reusable Profile recipe\n  -h, --help             Print help\n"
+        "yoi\n\nUsage:\n  yoi [OPTIONS] [POD_NAME]\n  yoi panel [--workspace <PATH>]\n  yoi keys\n  yoi setup-model\n  yoi pod [POD_OPTIONS]\n  yoi objective <COMMAND> [OPTIONS]\n  yoi session analyze <SESSION_JSONL_PATH> --json\n  yoi ticket <COMMAND> [OPTIONS]\n  yoi memory lint [OPTIONS]\n\nOptions:\n  -r, --resume           Open the Pod picker and resume/attach a Pod\n      --workspace <PATH> Runtime workspace root (defaults to cwd)\n      --pod <NAME>       Attach/restore/create a Pod by name\n      --socket <PATH>    Attach to a specific Pod socket with --pod\n      --session <UUID>   Resume a specific session segment\n      --profile <REF>    Select a reusable Profile recipe\n  -h, --help             Print help\n"
     );
 }
 
@@ -542,6 +552,20 @@ mod tests {
             Mode::Keys => {}
             _ => panic!("expected Keys mode"),
         }
+    }
+
+    #[test]
+    fn parse_setup_model_subcommand() {
+        match parse_args_from(["setup-model"]).unwrap() {
+            Mode::SetupModel => {}
+            _ => panic!("expected SetupModel mode"),
+        }
+    }
+
+    #[test]
+    fn parse_setup_model_rejects_arguments() {
+        let err = parse_args_from(["setup-model", "extra"]).unwrap_err();
+        assert_eq!(err.to_string(), "yoi setup-model does not accept arguments");
     }
 
     #[test]

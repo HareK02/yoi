@@ -3965,6 +3965,7 @@ dependencies = [
  "pod-registry",
  "pod-store",
  "protocol",
+ "provider",
  "pulldown-cmark",
  "ratatui",
  "secrets",
