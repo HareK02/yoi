@@ -147,3 +147,26 @@ Escalate if:
 - Credential entry/storage cannot be limited to an existing explicit auth reference/hint.
 
 ---
+
+<!-- event: plan author: orchestrator at: 2026-06-10T09:08:59Z -->
+
+## Plan
+
+Routing update: blocked_by_dependency_or_missing_authority
+
+Reason:
+- This Ticket remains `inprogress` and has an accepted implementation plan for `.worktree/tui-model-setup-wizard`, but the current Orchestrator process cannot delegate write scope to the child worktree.
+- Attempted `SpawnPod` for `coder-tui-model-setup-wizard` with write scope limited to the child worktree failed: requested scope `/home/hare/Projects/yoi/.worktree/tui-model-setup-wizard` is not within the spawner effective scope.
+- Retrying with broader `/home/hare/Projects/yoi` write scope also failed for the same effective-scope reason.
+- Direct file write to the child worktree through the available tool scope is read-only, so the Orchestrator cannot safely implement the Ticket in this session either.
+
+Evidence checked:
+- Ticket body/thread/artifacts and relation/orchestration-plan records.
+- Current CLI/profile/provider code map was boundedly inspected and the accepted plan was recorded.
+- Worktree `.worktree/tui-model-setup-wizard` exists, but no coder was spawned and no implementation files were changed.
+
+Next action:
+- Continue this Ticket from a Pod/session with delegated write scope for `.worktree/tui-model-setup-wizard`, or explicitly re-route/clean up the existing inprogress worktree.
+- Do not treat this as planning uncertainty; the current blocker is write/delegation authority for implementation side effects.
+
+---
