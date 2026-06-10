@@ -48,3 +48,39 @@ Ticket を `workspace-panel` が queued にしました。
 
 
 ---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-10T09:32:26Z from: queued to: inprogress reason: orchestrator_queue_acceptance field: state -->
+
+## State changed
+
+Queue acceptance: relation query has no blockers, existing orchestration plan only has the prior human-gate waiting note, workspace is clean, and user explicitly requested continuing inprogress/queued consumption. Implementation side effects will proceed in a dedicated worktree/branch with review before merge-completion.
+
+---
+
+<!-- event: plan author: orchestrator at: 2026-06-10T09:32:26Z -->
+
+## Plan
+
+Routing decision: implementation_ready
+
+Reason:
+- Ticket is `queued`, relation query has no blockers, and existing orchestration plan only contains a prior human-gate waiting note.
+- User explicitly requested continuing inprogress/queued work; this satisfies the prior human gate.
+- The Ticket contains clear binding requirements, acceptance criteria, non-goals, and reviewer focus.
+
+Evidence checked:
+- Ticket body/thread/artifacts.
+- `TicketRelationQuery`: no relations/blockers.
+- `TicketOrchestrationPlanQuery`: one waiting note from prior target-unspecified routing pass.
+- Current workspace state is clean; existing inprogress worktrees use separate branches/scopes.
+- Code map target: `crates/manifest/src/profile.rs`, Lua Profile helper/builtin loading paths, `resources/profiles/default.lua`, and manifest crate profile tests.
+
+IntentPacket:
+- Intent: make reusable Lua Profiles feel like a small DSL by injecting global `yoi` helpers and adding raw Profile artifact import/extend composition.
+- Binding decisions / invariants: Profiles remain Lua-first reusable recipes only; import/extend must not import resolved runtime Manifest or allow runtime-bound/concrete authority fields; final artifact still goes through existing Profile validation; project-local `require("_base")` keeps working; no tombstone/nil deletion semantics in this Ticket; bundled default Profile moves to global `yoi` style.
+- Requirements / acceptance criteria: filesystem and embedded Profiles can access global `yoi`; `yoi.profile.import("builtin:default")` returns a raw Profile artifact; `yoi.profile.extend("builtin:default", overrides)` deep-merges nested tables while replacing scalars/lists; validation rejects runtime-bound or concrete authority contamination; require alias handling is fixed by tests; manifest targeted tests pass.
+- Implementation latitude: decide whether legacy `require("yoi")` / `require("yoi.*")` aliases remain supported or are deprecated, but fix the behavior in tests; local organization and helper names may vary if the public `yoi.profile.import/extend` surface is preserved.
+- Escalate if implementation requires changing Profile authority boundaries, permitting resolved Manifest import, changing runtime startup semantics, or adding deletion/tombstone semantics.
+- Validation: `cargo fmt`, `cargo test -p manifest profile --lib` or narrower named tests plus broader manifest tests, `target/debug/yoi ticket doctor`, and `nix build .#yoi` before merge because runtime resources/Profile evaluation/package resources are touched.
+
+---
