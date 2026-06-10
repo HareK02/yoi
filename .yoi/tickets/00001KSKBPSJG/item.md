@@ -1,8 +1,10 @@
 ---
 title: "TUI: ユーザーマニフェストのモデル設定 wizard"
-state: "ready"
+state: 'inprogress'
 created_at: "2026-05-27T00:00:18Z"
-updated_at: "2026-06-08T07:29:10Z"
+updated_at: '2026-06-10T07:59:32Z'
+queued_by: 'yoi ticket'
+queued_at: '2026-06-10T07:59:32Z'
 ---
 
 ## Migration reference

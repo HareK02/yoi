@@ -69,3 +69,39 @@ Updated existing Ticket 20260527-000018-tui-user-model-setup in place; no duplic
 Intake clarification completed for the existing Ticket. The Ticket is ready for Orchestrator routing to preflight/spike; implementation should not begin until the preflight decisions called out in the intake summary are recorded.
 
 ---
+
+<!-- event: state_changed author: "yoi ticket" at: 2026-06-10T07:59:32Z from: ready to: queued reason: queued field: state -->
+
+## State changed
+
+Ticket を `yoi ticket` が queued にしました。
+
+
+---
+
+<!-- event: decision author: hare at: 2026-06-10T07:59:32Z -->
+
+## Decision
+
+Human authorized Queue from workspace panel notification; Orchestrator read the Ticket and will accept before implementation side effects.
+
+
+---
+
+<!-- event: state_changed author: "yoi ticket" at: 2026-06-10T07:59:32Z from: queued to: inprogress reason: cli_state field: state -->
+
+## State changed
+
+State changed to `inprogress`.
+
+
+---
+
+<!-- event: decision author: hare at: 2026-06-10T07:59:32Z -->
+
+## Decision
+
+Accepting implementation after workspace inspection. Expected overlap with prompt-resource cleanup is low, so route in parallel in a dedicated worktree.
+
+
+---

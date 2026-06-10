@@ -30,3 +30,21 @@ Ticket を `workspace-panel` が queued にしました。
 
 
 ---
+
+<!-- event: state_changed author: "yoi ticket" at: 2026-06-10T07:59:33Z from: queued to: inprogress reason: cli_state field: state -->
+
+## State changed
+
+State changed to `inprogress`.
+
+
+---
+
+<!-- event: decision author: hare at: 2026-06-10T07:59:33Z -->
+
+## Decision
+
+Accepting implementation after workspace inspection. Expected overlap with TUI model setup wizard is low, so route in parallel in a dedicated worktree.
+
+
+---
