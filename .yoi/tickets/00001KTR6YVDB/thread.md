@@ -104,3 +104,43 @@ Non-blocking notes:
 This is branch-local review evidence; final main-branch approval/close still belongs to merge-completion.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-10T09:07:14Z -->
+
+## Implementation report
+
+Merge-ready dossier for merge-completion
+
+Ticket id: `00001KTR6YVDB`
+Branch/worktree: `prompt-resource-centralization` / `.worktree/prompt-resource-centralization`
+Commits: `342d5cf8 refactor: move ticket role prompts to resources`
+
+Intent / invariant check:
+- Move LLM-facing Ticket role launch prompt prose out of Rust hardcoding into `resources/prompts`-managed resources.
+- Preserve runtime dynamic composition, bounded fields, role launch semantics, and override behavior.
+- Keep workflow markdown authority and avoid moving UI/diagnostic/protocol literals unnecessarily.
+
+Implementation summary:
+- `crates/client/src/ticket_role.rs` now loads Ticket role prompt fragments from `resources/prompts/ticket_role/*.md` with workspace/user/builtin fallback.
+- Runtime values remain assembled by Rust as sectioned/bounded context.
+- Regression coverage includes resource-backed launch prompt generation and workspace override behavior.
+
+Coder/reviewer evidence:
+- Implementation report recorded branch/commit and validation: `cargo fmt`, `cargo test -p client ticket_role --lib`, `git diff --check`, `cargo check -p client`.
+- Branch-local reviewer Pod `reviewer-prompt-resource-centralization` approved.
+- Reviewer validation: `cargo test -p client ticket_role --lib`, `git diff --check $(git merge-base HEAD develop)..HEAD`, `nix build .#yoi` all passed.
+
+Blockers fixed or rejected findings:
+- No blockers.
+- Non-blocking user-level override test suggestion rejected for this change because workspace override covers the same loader path sufficiently.
+
+Residual risks:
+- Low; resource packaging and prompt-resource lookup are the main risk, covered by reviewer `nix build .#yoi` and focused tests.
+
+Dirty state:
+- Routing/review records were committed separately as `41f74490 ticket: record routing progress`; main workspace is expected clean before merge.
+
+Parent/human decision needs:
+- User requested inprogress消化; proceed with authorized merge-completion for this inprogress Ticket.
+
+---
