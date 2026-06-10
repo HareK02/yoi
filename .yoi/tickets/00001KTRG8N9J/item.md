@@ -2,7 +2,7 @@
 title: 'Project role profilesをbuiltin profilesへ移行する'
 state: 'inprogress'
 created_at: '2026-06-10T10:11:51Z'
-updated_at: '2026-06-10T15:15:21Z'
+updated_at: '2026-06-10T15:23:55Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-06-10T11:16:43Z'

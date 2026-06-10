@@ -174,3 +174,51 @@ Notes:
 - The removed project-local role Profile files were policy presets rather than project data, so moving them to embedded resources satisfies the migration goal.
 
 ---
+
+<!-- event: review author: reviewer-builtin-role-profiles at: 2026-06-10T15:23:44Z status: request_changes -->
+
+## Review: request changes
+
+Branch-local review verdict: request_changes
+
+Blockers:
+- Role Profiles extended `builtin:default`, which leaked `scope = workspace_write()` into companion/intake/orchestrator/reviewer. Reviewer and companion must remain read-only; only coder should have workspace write by role policy.
+- Role Profiles inherited `builtin:default` model and web secret values (`codex-oauth/gpt-5.5`, `web/brave/default`), which made project/environment-specific pins part of the reusable role contract.
+
+Validation run by reviewer passed:
+- `cargo test -p manifest profile --lib`
+- `cargo test -p ticket config --lib`
+- `cargo test -p client ticket_role --lib`
+- `cargo check -p manifest -p ticket`
+- `git diff --check $(git merge-base HEAD develop)..HEAD`
+- `nix build .#yoi`
+
+No files were modified by reviewer.
+
+---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-10T15:23:55Z -->
+
+## Implementation report
+
+Fix-loop implementation report
+
+Reviewer blockers fixed in amended implementation commit `85c06dc6`:
+- Role builtin Profiles no longer extend `builtin:default`; they are standalone `yoi.profile { ... }` artifacts.
+- `companion`, `intake`, `orchestrator`, and `reviewer` explicitly use `yoi.scope.workspace_read()`.
+- `coder` is the only role Profile using `yoi.scope.workspace_write()`.
+- Role Profiles no longer inherit `model.ref` or `web.search.api_key_secret` from `builtin:default`.
+- Manifest role-policy test now asserts role scope, absence of model ref, and absence of web config for each builtin role Profile.
+
+Validation after fixes:
+- `cargo fmt --check` passed.
+- `cargo test -p manifest profile --lib` passed (23 passed).
+- `cargo test -p ticket config --lib` passed (20 passed).
+- `cargo test -p client ticket_role --lib` passed.
+- `cargo check -p manifest -p ticket` passed.
+- `git diff --check` passed.
+- `nix build .#yoi` passed.
+
+Reviewer `reviewer-builtin-role-profiles` has been asked to re-review the amended branch.
+
+---
