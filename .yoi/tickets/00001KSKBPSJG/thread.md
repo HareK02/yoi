@@ -201,3 +201,27 @@ Notes:
 - The implementation uses a simple bounded terminal setup flow rather than broad TUI refactoring.
 
 ---
+
+<!-- event: review author: reviewer-tui-model-setup-wizard at: 2026-06-10T09:29:42Z status: approve -->
+
+## Review: approve
+
+Branch-local review verdict: approve
+
+Blockers: none.
+
+Reviewer confirmed after fixes:
+- `package.nix` cargoHash was updated and `nix build .#yoi` passed.
+- Top-level help now lists `yoi setup-model`.
+- Tracked worktree is clean.
+
+Validation run by reviewer:
+- `cargo test -p tui setup_model --lib` passed.
+- `cargo test -p yoi setup_model --bin yoi` passed.
+- `cargo check -p yoi` passed.
+- `git diff --check $(git merge-base HEAD develop)..HEAD` passed.
+- `nix build .#yoi` passed.
+
+This is branch-local review evidence; final main-branch approval/close belongs to merge-completion.
+
+---
