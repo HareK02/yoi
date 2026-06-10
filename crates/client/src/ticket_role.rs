@@ -1035,7 +1035,7 @@ profile = "builtin:default"
         ))
         .unwrap();
         assert_eq!(intake.role, TicketRole::Intake);
-        assert_eq!(intake.profile, "builtin:default");
+        assert_eq!(intake.profile, TicketRole::Intake.default_profile());
         assert_eq!(intake.workflow, TicketRole::Intake.default_workflow());
 
         let orchestrator = plan_ticket_role_launch(TicketRoleLaunchContext::new(
@@ -1044,7 +1044,10 @@ profile = "builtin:default"
         ))
         .unwrap();
         assert_eq!(orchestrator.role, TicketRole::Orchestrator);
-        assert_eq!(orchestrator.profile, "builtin:default");
+        assert_eq!(
+            orchestrator.profile,
+            TicketRole::Orchestrator.default_profile()
+        );
         assert_eq!(
             orchestrator.workflow,
             TicketRole::Orchestrator.default_workflow()

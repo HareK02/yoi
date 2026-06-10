@@ -1,9 +1,9 @@
-local base = require("_base")
+return yoi.profile {
+    slug = "coder",
+    description = "Coder role profile with bundled reusable policy",
 
-return base {
-    slug = "companion",
-    description = "Companion role profile: GPT-5.5 with bundled default behavior",
-    model_ref = "codex-oauth/gpt-5.5",
+    scope = yoi.scope.workspace_write(),
+
     feature = {
         task = { enabled = false },
         memory = { enabled = true },
@@ -12,5 +12,4 @@ return base {
         ticket = { enabled = false, access = "lifecycle" },
         ticket_orchestration = { enabled = false },
     },
-    language = "Japanese",
 }

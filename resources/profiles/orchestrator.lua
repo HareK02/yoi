@@ -1,10 +1,9 @@
-local base = require("_base")
-local scope = require("yoi.scope")
-
-return base {
+return yoi.profile {
     slug = "orchestrator",
-    description = "Orchestrator role profile: GPT-5.5 with bundled default behavior",
-    delegation_scope = scope.workspace_write(),
+    description = "Orchestrator role profile with bundled reusable policy",
+
+    scope = yoi.scope.workspace_read(),
+
     feature = {
         task = { enabled = false },
         memory = { enabled = true },
@@ -13,6 +12,6 @@ return base {
         ticket = { enabled = true, access = "lifecycle" },
         ticket_orchestration = { enabled = true },
     },
-    model_ref = "codex-oauth/gpt-5.5",
-    language = "Japanese",
+
+    delegation_scope = yoi.scope.workspace_write(),
 }

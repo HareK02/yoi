@@ -1,10 +1,9 @@
-local base = require("_base")
-local scope = require("yoi.scope")
+return yoi.profile {
+    slug = "reviewer",
+    description = "Reviewer role profile with bundled reusable policy",
 
-return base {
-    slug = "coder",
-    description = "Coder role profile: GPT-5.5 with bundled default behavior",
-    model_ref = "codex-oauth/gpt-5.5",
+    scope = yoi.scope.workspace_read(),
+
     feature = {
         task = { enabled = false },
         memory = { enabled = true },
@@ -13,6 +12,4 @@ return base {
         ticket = { enabled = false, access = "lifecycle" },
         ticket_orchestration = { enabled = false },
     },
-    language = "Japanese",
-    scope = scope.workspace_write(),
 }

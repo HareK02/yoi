@@ -16,8 +16,6 @@ use thiserror::Error;
 pub const TICKET_CONFIG_RELATIVE_PATH: &str = ".yoi/ticket.config.toml";
 /// Workspace-relative default root for the built-in local Ticket backend.
 pub const DEFAULT_TICKET_BACKEND_RELATIVE_PATH: &str = ".yoi/tickets";
-/// Concrete profile selector used by the initial Ticket role scaffold.
-pub const TICKET_CONFIG_SCAFFOLD_PROFILE: &str = "builtin:default";
 
 /// Return the explicit workspace Ticket config scaffold written by `yoi ticket init`.
 ///
@@ -40,7 +38,7 @@ pub fn ticket_config_scaffold() -> String {
     for role in TicketRole::ALL {
         out.push_str(&format!(
             "\n[roles.{role}]\nprofile = \"{}\"\nworkflow = \"{}\"\n",
-            TICKET_CONFIG_SCAFFOLD_PROFILE,
+            role.default_profile(),
             role.default_workflow()
         ));
     }
@@ -234,6 +232,15 @@ impl TicketRole {
             Self::Coder | Self::Reviewer => "multi-agent-workflow",
         }
     }
+
+    pub fn default_profile(self) -> &'static str {
+        match self {
+            Self::Intake => "builtin:intake",
+            Self::Orchestrator => "builtin:orchestrator",
+            Self::Coder => "builtin:coder",
+            Self::Reviewer => "builtin:reviewer",
+        }
+    }
 }
 
 impl fmt::Display for TicketRole {
@@ -340,15 +347,15 @@ impl Default for TicketRoleProfiles {
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum TicketRoleLaunchConfigError {
     #[error(
-        "Ticket role `{role}` is not launch-configured; add `[roles.{role}]` with `profile = \"builtin:default\"` or another executable concrete profile selector"
+        "Ticket role `{role}` is not launch-configured; add `[roles.{role}]` with the role builtin profile or another executable concrete profile selector"
     )]
     MissingRoleTable { role: TicketRole },
     #[error(
-        "Ticket role `{role}` has no launch profile; set `[roles.{role}].profile` to `builtin:default` or another executable concrete profile selector"
+        "Ticket role `{role}` has no launch profile; set `[roles.{role}].profile` to the role builtin profile or another executable concrete profile selector"
     )]
     MissingProfile { role: TicketRole },
     #[error(
-        "Ticket role `{role}` uses `profile = \"inherit\"`; top-level Ticket role launch requires an explicit executable profile selector such as `builtin:default` or a project/user profile"
+        "Ticket role `{role}` uses `profile = \"inherit\"`; top-level Ticket role launch requires an explicit executable profile selector such as the role builtin profile or a project/user profile"
     )]
     InheritProfile { role: TicketRole },
 }
@@ -752,7 +759,8 @@ workflow = "multi-agent-workflow"
         for role in TicketRole::ALL {
             assert!(scaffold.contains(&format!("[roles.{role}]")));
             assert!(scaffold.contains(&format!(
-                "[roles.{role}]\nprofile = \"builtin:default\"\nworkflow = \"{}\"",
+                "[roles.{role}]\nprofile = \"{}\"\nworkflow = \"{}\"",
+                role.default_profile(),
                 role.default_workflow()
             )));
         }
@@ -767,7 +775,7 @@ workflow = "multi-agent-workflow"
         assert_eq!(config.backend_root(), temp.path().join(".yoi/tickets"));
         for role in TicketRole::ALL {
             let role_config = config.role_launch_config(role).unwrap();
-            assert_eq!(role_config.profile.as_str(), "builtin:default");
+            assert_eq!(role_config.profile.as_str(), role.default_profile());
             assert_eq!(role_config.workflow.as_str(), role.default_workflow());
         }
     }
