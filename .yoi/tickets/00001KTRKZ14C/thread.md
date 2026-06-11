@@ -173,3 +173,82 @@ Validation after fix:
 Nix build remains skipped because the branch is docs-only and does not change code, packaging, runtime resources, prompt resources, or workflow resources.
 
 ---
+
+<!-- event: review author: reviewer-workflow-public-dogfood-split at: 2026-06-11T02:33:09Z status: approve -->
+
+## Review: approve
+
+Branch-local review verdict: approve
+
+Blockers: none.
+
+Reviewer confirmed previous blocker is resolved:
+- The slug / `.yoi/ticket.config.toml` migration plan now has explicit mapping and a concrete `yoi-dogfood-*` policy.
+- The document clearly states that generic builtin `multi-agent-workflow` should not be shadowed by this repository's dogfood semantics.
+
+Non-blocking notes:
+- The existing “Workspace-local dogfood workflows” section still mentions current slug `worktree-workflow`, but the new migration decision section explicitly maps the follow-up name to `yoi-dogfood-worktree-workflow`, so this can be aligned during follow-up implementation.
+
+Validation run by reviewer:
+- `git diff --check $(git merge-base HEAD develop)..HEAD` passed.
+- `/home/hare/Projects/yoi/target/debug/yoi ticket doctor` passed.
+- Nix build not run; docs-only change and no code/packaging/runtime-resource/prompt-resource changes.
+
+No files were modified by reviewer and no final main-branch approval/close was recorded.
+
+---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-11T02:33:31Z -->
+
+## Implementation report
+
+Merge-ready dossier
+
+Ticket id: `00001KTRKZ14C`
+Branch/worktree: `workflow-public-dogfood-split` / `.worktree/workflow-public-dogfood-split`
+Commits:
+- `21a25e12 docs: split public and dogfood workflows`
+
+Intent / invariant check:
+- This is a design/audit Ticket, not builtin workflow loader implementation.
+- The branch records public builtin workflow vs Yoi dogfood workflow separation, source/provenance/priority, resource-placement decision, resident policy, slug/config migration plan, stale vocabulary cleanup, and follow-up implementation boundaries.
+- No runtime resources, prompt resources, code, Ticket lifecycle states, role Profile policy, scheduler/queue behavior, or builtin workflow loader code are changed.
+
+Implementation summary:
+- Added `docs/design/workflows-public-dogfood-split.md`.
+- Added a short pointer from `docs/development/workflows.md` to the design/audit document.
+- Audited all five current `.yoi/workflow/*.md` files.
+- Chose `resources/workflows/<slug>.md` for future builtin workflow resources and recorded source priority/provenance behavior.
+- Decided resident core: `ticket-intake-workflow` and `ticket-orchestrator-routing`; optional builtin: generic `multi-agent-workflow`; compatibility-only: `ticket-preflight-workflow`; workspace dogfood: explicit `yoi-dogfood-*` slugs.
+- Added explicit `.yoi/ticket.config.toml` migration mapping after reviewer request.
+
+Coder/reviewer evidence:
+- Implementation was done directly by Orchestrator in the worktree because this is a docs/design artifact and this session previously had coder write-scope delegation limitations.
+- Reviewer Pod: `reviewer-workflow-public-dogfood-split`.
+- Initial reviewer verdict: `request_changes` for ambiguous slug/config migration plan.
+- Fix-loop amended implementation to `21a25e12` with explicit role selector mapping and `yoi-dogfood-*` policy.
+- Final reviewer verdict: approve.
+
+Blockers fixed or rejected findings:
+- Fixed: explicit mapping for intake/orchestrator/coder/reviewer workflow selectors.
+- Fixed: generic builtin `multi-agent-workflow` is reserved and should not be shadowed by Yoi dogfood semantics.
+- Non-blocking: existing doc section still mentions current `worktree-workflow` slug; migration decision maps follow-up to `yoi-dogfood-worktree-workflow`, so implementation follow-up can align naming.
+
+Validation performed:
+- Orchestrator: `git diff --check` passed.
+- Orchestrator: `/home/hare/Projects/yoi/target/debug/yoi ticket doctor` passed.
+- Reviewer: `git diff --check $(git merge-base HEAD develop)..HEAD` passed.
+- Reviewer: `/home/hare/Projects/yoi/target/debug/yoi ticket doctor` passed.
+- `nix build .#yoi` intentionally not run because this branch is docs-only and does not touch code, packaging, runtime resources, prompt resources, or workflow resources.
+
+Residual risks:
+- Low for this design/audit Ticket. Follow-up implementation still needs loader/provenance code, public workflow text cleanup, dogfood workflow renaming, stale vocabulary sweep, and launch provenance display.
+
+Dirty state:
+- Main workspace has only this Ticket review/dossier record pending commit at dossier time.
+- Worktree branch is clean.
+
+Parent/human decision needs:
+- Panel launch guidance for this Ticket said to stop at merge-ready dossier without merge/close/final approval. Explicit merge-completion authorization is needed before merging `workflow-public-dogfood-split`, running post-merge validation, closing the Ticket, and cleaning the worktree/branch.
+
+---
