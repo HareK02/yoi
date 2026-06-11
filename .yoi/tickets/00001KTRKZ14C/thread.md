@@ -88,3 +88,36 @@ IntentPacket:
 - Validation: `target/debug/yoi ticket doctor`, `git diff --check`; docs-only/Ticket-only changes can skip `nix build .#yoi` with explicit reason unless runtime resources/code are touched.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-11T02:27:17Z -->
+
+## Implementation report
+
+Implementation report
+
+Branch/worktree: `workflow-public-dogfood-split` / `.worktree/workflow-public-dogfood-split`
+Commit:
+- `96a3500b docs: split public and dogfood workflows`
+
+Summary:
+- Added `docs/design/workflows-public-dogfood-split.md` as the durable design/audit artifact for this Ticket.
+- Audited current `.yoi/workflow/*.md` into public builtin candidates and Yoi dogfood/project-local material.
+- Recorded the proposed builtin workflow source/provenance model: add `WorkflowSource::Builtin` or equivalent typed provenance, with source labels visible in workflow/role launch diagnostics.
+- Recorded source priority: explicit path/file selector, workspace `.yoi/workflow/<slug>.md`, future user workflow directory, builtin `resources/workflows/<slug>.md`, then explicitly enabled skill/plugin workflow sources.
+- Chose `resources/workflows/<slug>.md` rather than `resources/prompts` for builtin workflow resources because workflows need slug/source/provenance/listing semantics distinct from prompt fragments.
+- Recorded resident policy: core builtin resident workflows are intake and orchestrator routing; multi-agent is builtin-available but optional; Git worktree isolation remains project-local/default-disabled.
+- Recorded slug/migration direction for `ticket-intake-workflow`, `ticket-orchestrator-routing`, `ticket-preflight-workflow`, `multi-agent-workflow`, and `worktree-workflow`.
+- Recorded stale vocabulary cleanup plan for `Action required`, `Attention required`, and preflight lane language.
+- Added a short pointer from `docs/development/workflows.md` to the design/audit document.
+
+Validation run in branch:
+- `git diff --check` passed.
+- `/home/hare/Projects/yoi/target/debug/yoi ticket doctor` passed.
+
+Nix build:
+- Skipped because this branch is docs-only and does not change code, packaging, runtime resources, or prompt resources.
+
+Notes:
+- This Ticket intentionally does not implement builtin workflow loading or move workflow text into runtime resources. The document defines follow-up implementation boundaries for loader/provenance, public workflow text cleanup, dogfood retention, vocabulary migration, and launch provenance display.
+
+---
