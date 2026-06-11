@@ -2,7 +2,7 @@
 title: 'Panel Orchestrator起動時に専用orchestration worktreeを自動作成・再利用する'
 state: 'inprogress'
 created_at: '2026-06-11T05:15:14Z'
-updated_at: '2026-06-11T07:54:44Z'
+updated_at: '2026-06-11T08:04:39Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-06-11T07:41:37Z'

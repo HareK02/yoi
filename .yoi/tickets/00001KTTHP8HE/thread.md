@@ -132,3 +132,52 @@ Notes:
 - This keeps filesystem Ticket backend authority and does not add push automation or destructive cleanup. Dirty/unknown orchestration worktree state must be handled explicitly by the operator.
 
 ---
+
+<!-- event: review author: reviewer-panel-orchestration-worktree at: 2026-06-11T08:04:39Z status: request_changes -->
+
+## Review: request changes
+
+Branch-local review verdict: request_changes
+
+Blocker:
+- Existing expected-path Git worktrees are only checked with `git rev-parse --is-inside-work-tree`; the implementation does not verify that the existing worktree is on the expected `orchestration/<workspace-orchestrator-pod-name>` branch or belongs to the same Git repository/common dir as the original workspace. A conflicting worktree or unrelated repo at the expected path could be reused as the Orchestrator runtime root.
+
+Non-blocking notes:
+- Path naming, create/reuse flow, dirty refusal, and root population are directionally correct.
+- Reviewer recommended branch/common-dir validation and tests for wrong-branch and unrelated-repo expected-path cases.
+
+Validation run by reviewer before request_changes:
+- `cargo test -p tui orchestration --lib` passed.
+- `cargo test -p client ticket_role --lib` passed.
+- `git diff --check $(git merge-base HEAD develop)..HEAD` passed.
+- `/home/hare/Projects/yoi/target/debug/yoi ticket doctor` passed.
+- `nix build .#yoi` passed.
+
+No files were modified by reviewer.
+
+---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-11T08:04:39Z -->
+
+## Implementation report
+
+Fix-loop implementation report
+
+Reviewer blocker fixed in amended implementation commit `67f9009b`:
+- Existing expected-path orchestration worktrees now validate current branch equals the expected `orchestration/<workspace-orchestrator-pod-name>` branch before reuse.
+- Existing expected-path orchestration worktrees now validate `git rev-parse --git-common-dir` matches the original workspace's Git common dir, so an unrelated repository at the expected path is rejected.
+- Wrong-branch and unrelated-repo cases return diagnostics without deleting files.
+- Added tests for wrong-branch expected path and unrelated repository with expected branch at the expected path.
+
+Validation after fix:
+- `cargo fmt --check` passed.
+- `cargo test -p tui orchestration --lib` passed.
+- `cargo test -p tui existing_ --lib` passed.
+- `cargo test -p client ticket_role --lib` passed.
+- `git diff --check` passed.
+- `/home/hare/Projects/yoi/target/debug/yoi ticket doctor` passed.
+- `nix build .#yoi` passed.
+
+Reviewer `reviewer-panel-orchestration-worktree` has been asked to re-review the amended branch.
+
+---
