@@ -1,8 +1,8 @@
 ---
 title: 'Orchestratorを専用worktreeで実行し実装worktreeをworkspace root配下に作る'
-state: 'inprogress'
+state: 'closed'
 created_at: '2026-06-11T03:20:32Z'
-updated_at: '2026-06-11T04:58:54Z'
+updated_at: '2026-06-11T05:00:04Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-06-11T04:33:46Z'
