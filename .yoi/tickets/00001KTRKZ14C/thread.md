@@ -252,3 +252,88 @@ Parent/human decision needs:
 - Panel launch guidance for this Ticket said to stop at merge-ready dossier without merge/close/final approval. Explicit merge-completion authorization is needed before merging `workflow-public-dogfood-split`, running post-merge validation, closing the Ticket, and cleaning the worktree/branch.
 
 ---
+
+<!-- event: review author: orchestrator at: 2026-06-11T03:48:14Z status: approve -->
+
+## Review: approve
+
+Main-branch review/merge-completion approval.
+
+Verified before merge:
+- Merge-ready dossier matched Ticket `00001KTRKZ14C`, branch `workflow-public-dogfood-split`, worktree `.worktree/workflow-public-dogfood-split`, and implementation commit `21a25e12`.
+- Branch-local reviewer `reviewer-workflow-public-dogfood-split` approved after blocker fix.
+- User explicitly authorized proceeding to merge-completion.
+
+Merged:
+- `git merge --no-ff workflow-public-dogfood-split -m "merge: workflow public dogfood split"`
+- Merge commit: `1c2cde51 merge: workflow public dogfood split`
+
+Post-merge validation:
+- `git diff --check` passed.
+- `target/debug/yoi ticket doctor` passed.
+- typed `TicketDoctor` reported 0 errors and 3 pre-existing diagnostics.
+
+Nix build:
+- Not run because the merged branch is docs-only and does not touch code, packaging, runtime resources, prompt resources, or workflow resources.
+
+Result: approve.
+
+---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-11T03:48:14Z from: inprogress to: done reason: merged_and_validated field: state -->
+
+## State changed
+
+Merged branch `workflow-public-dogfood-split` with merge commit `1c2cde51`; branch-local review approved after fix and post-merge validation passed (`git diff --check`, `target/debug/yoi ticket doctor`, typed `TicketDoctor` 0 errors / 3 pre-existing diagnostics). `nix build .#yoi` intentionally skipped because this is docs-only and does not touch code, packaging, runtime resources, prompt resources, or workflow resources.
+
+---
+
+<!-- event: state_changed author: hare at: 2026-06-11T03:48:35Z from: done to: closed reason: closed field: state -->
+
+## State changed
+
+Ticket を closed にしました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-06-11T03:48:35Z status: closed -->
+
+## 完了
+
+完了しました。
+
+実施内容:
+- `docs/design/workflows-public-dogfood-split.md` を追加し、現行 `.yoi/workflow/*.md` を public builtin 候補と Yoi dogfood/project-local material に分類しました。
+- builtin workflow source/provenance 方針として `WorkflowSource::Builtin` または同等の typed provenance を記録しました。
+- source priority を記録しました: explicit path/file selector、workspace `.yoi/workflow/<slug>.md`、future user workflow directory、builtin `resources/workflows/<slug>.md`、explicitly enabled skill/plugin sources。
+- builtin workflow resource placement は `resources/prompts` ではなく `resources/workflows/<slug>.md` とする判断と理由を記録しました。
+- resident policy を記録しました: core builtin は `ticket-intake-workflow` / `ticket-orchestrator-routing`、generic `multi-agent-workflow` は optional builtin、`ticket-preflight-workflow` は compatibility-only、dogfood workflows は explicit `yoi-dogfood-*` slugs。
+- reviewer 指摘を受け、`.yoi/ticket.config.toml` migration mapping を明確化しました。
+  - Intake: `ticket-intake-workflow`
+  - Orchestrator: `ticket-orchestrator-routing`
+  - Coder/Reviewer: `yoi-dogfood-multi-agent-workflow`
+  - Worktree helper: `yoi-dogfood-worktree-workflow`
+- stale `Action required` / `Attention required` / preflight lane vocabulary cleanup plan と follow-up implementation boundaries を記録しました。
+- `docs/development/workflows.md` に design/audit document への pointer を追加しました。
+
+Merge:
+- Branch: `workflow-public-dogfood-split`
+- Implementation commit: `21a25e12 docs: split public and dogfood workflows`
+- Merge commit: `1c2cde51 merge: workflow public dogfood split`
+
+確認:
+- Branch-local reviewer `reviewer-workflow-public-dogfood-split` が初回 request_changes 後、修正済み branch を approve。
+- `git diff --check` passed。
+- `target/debug/yoi ticket doctor` passed。
+- typed `TicketDoctor` は 0 errors / 3 pre-existing diagnostics。
+- `nix build .#yoi` は docs-only で code / packaging / runtime resources / prompt resources / workflow resources を変更していないため省略しました。
+
+残作業:
+- builtin workflow loader/provenance 実装。
+- public workflow text cleanup。
+- dogfood workflow rename / config migration implementation。
+- stale vocabulary sweep。
+- role launch workflow provenance display。
+
+---
