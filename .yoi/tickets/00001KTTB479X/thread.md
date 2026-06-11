@@ -175,3 +175,30 @@ Validation after fix:
 Reviewer `reviewer-orchestrator-worktree-layout` has been asked to re-review the amended branch.
 
 ---
+
+<!-- event: review author: reviewer-orchestrator-worktree-layout at: 2026-06-11T04:58:54Z status: approve -->
+
+## Review: approve
+
+Branch-local review verdict: approve
+
+Blockers: none.
+
+Reviewer confirmed previous blocker is resolved:
+- `.yoi/workflow/multi-agent-workflow.md` now says implementation worktrees are created under the recorded original workspace root and merge-completion runs against the recorded merge target workspace.
+- Strengthened tests confirm `TicketRoleLaunchPlan` root fields and that `SpawnConfig.workspace_root` remains the role runtime workspace root.
+
+Non-blocking notes:
+- Some generic explanatory text still says `main workspace`, but it no longer instructs cwd-relative worktree creation or merge target inference and is not a blocker.
+- Production caller paths that populate distinct original/target roots remain a follow-up boundary; this Ticket's testable root context and guidance scope is satisfied.
+
+Validation run by reviewer:
+- `cargo fmt --check` passed.
+- `cargo test -p client ticket_role --lib` passed (18 passed).
+- `git diff --check $(git merge-base HEAD develop)..HEAD` passed.
+- `/home/hare/Projects/yoi/target/debug/yoi ticket doctor` passed.
+- `nix build .#yoi --no-link` passed.
+
+No files were modified by reviewer and no final main-branch approval/close was recorded by reviewer.
+
+---
