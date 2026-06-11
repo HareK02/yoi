@@ -1,8 +1,10 @@
 ---
 title: "Builtin Workflow and Knowledge resources"
-state: 'ready'
+state: 'inprogress'
 created_at: "2026-06-07T07:27:08Z"
-updated_at: '2026-06-11T07:56:31Z'
+updated_at: '2026-06-11T08:30:37Z'
+queued_by: 'workspace-panel'
+queued_at: '2026-06-11T08:29:19Z'
 ---
 
 ## Background

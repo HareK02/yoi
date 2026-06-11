@@ -82,3 +82,48 @@ Created by LocalTicketBackend create.
 Intake refinement により、要件・invariants・implementation latitude・risk flags・validation focus が揃ったため、Orchestrator が routing できる状態として ready にする。実装 side effect はまだ開始しない。
 
 ---
+
+<!-- event: state_changed author: workspace-panel at: 2026-06-11T08:29:19Z from: ready to: queued reason: queued field: state -->
+
+## State changed
+
+Ticket を `workspace-panel` が queued にしました。
+
+
+---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-11T08:30:37Z from: queued to: inprogress reason: orchestrator_queue_acceptance field: state -->
+
+## State changed
+
+Queue acceptance: relation query has no blockers, orchestration-plan query has no records, unrelated planning Ticket record was committed (`cd831ec4`), and the remaining dirty state is this Ticket's panel queue update. The Ticket is implementation_ready based on Intake refinement and closed design Ticket `00001KTRKZ14C`. Standing merge-completion authorization is in effect after reviewer approval and safe-workspace checks. Implementation side effects may proceed after this recorded acceptance.
+
+---
+
+<!-- event: plan author: orchestrator at: 2026-06-11T08:30:37Z -->
+
+## Plan
+
+Routing decision: implementation_ready
+
+Reason:
+- Ticket is `queued`, user/panel authorized routing, relation query has no blockers, and orchestration-plan query has no records.
+- Intake refinement marks the Ticket implementation-ready and ties it to closed design Ticket `00001KTRKZ14C`.
+- Workspace dirty state was checked and unrelated planning Ticket record was committed before acceptance.
+
+Evidence checked:
+- Ticket body/thread/artifacts and Intake refinement.
+- `TicketRelationQuery`: no blockers.
+- `TicketOrchestrationPlanQuery`: no records before this routing pass.
+- Workspace/worktree/branch state: main worktree only before acceptance.
+- Relevant design context: closed workflow split design (`00001KTRKZ14C`) selected `resources/workflows/<slug>.md`, builtin source/provenance, workspace override priority, resident core/optional policy, and dogfood/public split.
+
+IntentPacket:
+- Intent: add first-pass builtin Workflow and Knowledge resources as embedded runtime resources with provenance-visible lookup and workspace override/fallback, without requiring broad migration of current role prompt guidance.
+- Binding decisions / invariants: keep workflow/knowledge/prompt resource boundaries separate; do not hide dogfood workflow semantics under public builtin slugs; workspace records must override builtin fallback; provenance must be visible; do not inject hidden cross-turn context; do not introduce secret/private builtin Knowledge; keep existing project `.yoi/workflow` and Knowledge support working.
+- Requirements / acceptance criteria: explicit source-qualified builtin slug lookup; workspace fallback/override behavior; source/provenance in workflow launch context and Knowledge context/lookup; bundled resources under `resources/workflows` and `resources/knowledge` or equivalent non-prompt directories; tests for builtin lookup, override precedence, missing fallback/diagnostics, and package resource availability; `nix build .#yoi` before completion.
+- Implementation latitude: if user-level resource directories need new public API, implement workspace+builtin first and record user-source as follow-up; shared resolver or thin domain-specific resolvers are both acceptable if behavior is aligned.
+- Escalate if selector syntax changes break existing workflow invocation or `.yoi/ticket.config.toml`, or if Knowledge schema/Profile authority changes become necessary.
+- Validation: focused resolver/role launch/Knowledge tests, `cargo fmt --check`, `git diff --check`, `target/debug/yoi ticket doctor`, and `nix build .#yoi`.
+
+---
