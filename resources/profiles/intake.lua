@@ -1,4 +1,4 @@
-return yoi.profile {
+return yoi.profile.extend("builtin:default", {
     slug = "intake",
     description = "Intake role profile with bundled reusable policy",
 
@@ -12,4 +12,4 @@ return yoi.profile {
         ticket = { enabled = true, access = "lifecycle" },
         ticket_orchestration = { enabled = false },
     },
-}
+})

@@ -1,4 +1,4 @@
-return yoi.profile {
+return yoi.profile.extend("builtin:default", {
     slug = "orchestrator",
     description = "Orchestrator role profile with bundled reusable policy",
 
@@ -14,4 +14,4 @@ return yoi.profile {
     },
 
     delegation_scope = yoi.scope.workspace_write(),
-}
+})

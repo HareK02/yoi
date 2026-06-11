@@ -1566,16 +1566,16 @@ mod tests {
         assert!(!companion.feature.pods.enabled);
         assert!(!companion.feature.ticket.enabled);
         assert_eq!(companion.scope.allow[0].permission, Permission::Read);
-        assert!(companion.model.ref_.is_none());
-        assert!(companion.web.is_none());
+        assert_eq!(companion.model.ref_.as_deref(), Some("codex-oauth/gpt-5.5"));
+        assert!(companion.web.is_some());
 
         let intake = resolve("intake");
         assert!(!intake.feature.task.enabled);
         assert!(!intake.feature.pods.enabled);
         assert!(intake.feature.ticket.enabled);
         assert_eq!(intake.scope.allow[0].permission, Permission::Read);
-        assert!(intake.model.ref_.is_none());
-        assert!(intake.web.is_none());
+        assert_eq!(intake.model.ref_.as_deref(), Some("codex-oauth/gpt-5.5"));
+        assert!(intake.web.is_some());
         assert!(!intake.feature.ticket_orchestration.enabled);
 
         let orchestrator = resolve("orchestrator");
@@ -1584,8 +1584,8 @@ mod tests {
         assert!(orchestrator.feature.ticket.enabled);
         assert!(orchestrator.feature.ticket_orchestration.enabled);
         assert_eq!(orchestrator.scope.allow[0].permission, Permission::Read);
-        assert!(orchestrator.model.ref_.is_none());
-        assert!(orchestrator.web.is_none());
+        assert_eq!(orchestrator.model.ref_.as_deref(), Some("codex-oauth/gpt-5.5"));
+        assert!(orchestrator.web.is_some());
         assert_eq!(
             orchestrator.delegation_scope.allow[0].permission,
             Permission::Write
@@ -1595,16 +1595,16 @@ mod tests {
         assert!(!coder.feature.task.enabled);
         assert!(!coder.feature.pods.enabled);
         assert_eq!(coder.scope.allow[0].permission, Permission::Write);
-        assert!(coder.model.ref_.is_none());
-        assert!(coder.web.is_none());
+        assert_eq!(coder.model.ref_.as_deref(), Some("codex-oauth/gpt-5.5"));
+        assert!(coder.web.is_some());
 
         let reviewer = resolve("reviewer");
         assert!(!reviewer.feature.task.enabled);
         assert!(!reviewer.feature.pods.enabled);
         assert!(!reviewer.feature.ticket.enabled);
         assert_eq!(reviewer.scope.allow[0].permission, Permission::Read);
-        assert!(reviewer.model.ref_.is_none());
-        assert!(reviewer.web.is_none());
+        assert_eq!(reviewer.model.ref_.as_deref(), Some("codex-oauth/gpt-5.5"));
+        assert!(reviewer.web.is_some());
     }
 
     #[test]
