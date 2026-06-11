@@ -121,3 +121,55 @@ Notes:
 - This Ticket intentionally does not implement builtin workflow loading or move workflow text into runtime resources. The document defines follow-up implementation boundaries for loader/provenance, public workflow text cleanup, dogfood retention, vocabulary migration, and launch provenance display.
 
 ---
+
+<!-- event: review author: reviewer-workflow-public-dogfood-split at: 2026-06-11T02:30:27Z status: request_changes -->
+
+## Review: request changes
+
+Branch-local review verdict: request_changes
+
+Blocker:
+- Slug/migration plan is not concrete enough for the Ticket acceptance criteria. `docs/design/workflows-public-dogfood-split.md` leaves the key choice open as “overrides or dogfood-only slugs” and “Keep or rename workspace-local dogfood workflows”. The Ticket asks to decide whether dogfood workflows keep same-slug workspace overrides or move to explicit `yoi-dogfood-*`-style slugs, with rationale.
+- Reviewer requested an explicit mapping for current selectors in `.yoi/ticket.config.toml`: intake, orchestrator, coder, reviewer.
+- Reviewer specifically requested clarification for how generic builtin `multi-agent-workflow` and the Yoi dogfood multi-agent/merge/worktree extension will be selected without accidental shadowing.
+
+Non-blocking notes:
+- Diff is docs-only.
+- The document audits all five current `.yoi/workflow/*.md` files.
+- Source/provenance, source priority, workspace override vs builtin fallback, and `resources/workflows/<slug>.md` placement rationale are clear.
+- Stale vocabulary cleanup and follow-up implementation boundaries are mostly clear, aside from the slug/config migration ambiguity.
+
+Validation run by reviewer:
+- `git diff --check $(git merge-base HEAD develop)..HEAD` passed.
+- `/home/hare/Projects/yoi/target/debug/yoi ticket doctor` passed.
+- Nix build not run; change is docs-only.
+
+No files were modified by reviewer.
+
+---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-11T02:31:54Z -->
+
+## Implementation report
+
+Fix-loop implementation report
+
+Reviewer blocker fixed in amended implementation commit `21a25e12`:
+- Added an explicit `Slug and .yoi/ticket.config.toml migration decision` section to `docs/design/workflows-public-dogfood-split.md`.
+- Recorded that workflows with dogfood semantics must use explicit dogfood slugs rather than same-slug workspace overrides.
+- Recorded concrete planned mapping:
+  - `[roles.intake].workflow` -> `ticket-intake-workflow` (builtin core by default).
+  - `[roles.orchestrator].workflow` -> `ticket-orchestrator-routing` (builtin core by default; dogfood mechanics supplied explicitly elsewhere).
+  - `[roles.coder].workflow` -> `yoi-dogfood-multi-agent-workflow` (workspace-local dogfood workflow).
+  - `[roles.reviewer].workflow` -> `yoi-dogfood-multi-agent-workflow` (workspace-local dogfood workflow).
+  - `ticket-preflight-workflow` -> compatibility-only, non-resident.
+  - `yoi-dogfood-worktree-workflow` -> workspace-local helper referenced by the dogfood multi-agent workflow.
+- Clarified that `multi-agent-workflow` is reserved for the generic builtin role loop and should not be shadowed by this repository's dogfood workflow after builtin loading exists.
+
+Validation after fix:
+- `git diff --check` passed.
+- `/home/hare/Projects/yoi/target/debug/yoi ticket doctor` passed.
+
+Nix build remains skipped because the branch is docs-only and does not change code, packaging, runtime resources, prompt resources, or workflow resources.
+
+---
