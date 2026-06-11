@@ -25,8 +25,60 @@ use crate::{
 const PROFILE_FORMAT_V1: &str = "yoi.lua-profile.v1";
 const BUILTIN_DEFAULT_PROFILE_NAME: &str = "default";
 const BUILTIN_DEFAULT_PROFILE: &str = include_str!("../../../resources/profiles/default.lua");
+const BUILTIN_COMPANION_PROFILE: &str = include_str!("../../../resources/profiles/companion.lua");
+const BUILTIN_INTAKE_PROFILE: &str = include_str!("../../../resources/profiles/intake.lua");
+const BUILTIN_ORCHESTRATOR_PROFILE: &str =
+    include_str!("../../../resources/profiles/orchestrator.lua");
+const BUILTIN_CODER_PROFILE: &str = include_str!("../../../resources/profiles/coder.lua");
+const BUILTIN_REVIEWER_PROFILE: &str = include_str!("../../../resources/profiles/reviewer.lua");
 const BUILTIN_MODEL_CATALOG: &str = include_str!("../../../resources/models/builtin.toml");
 const WORKSPACE_OVERRIDE_LOCAL_FILENAME: &str = "override.local.toml";
+
+struct BuiltinProfile {
+    name: &'static str,
+    label: &'static str,
+    content: &'static str,
+    description: &'static str,
+}
+
+const BUILTIN_PROFILES: &[BuiltinProfile] = &[
+    BuiltinProfile {
+        name: BUILTIN_DEFAULT_PROFILE_NAME,
+        label: "builtin:default",
+        content: BUILTIN_DEFAULT_PROFILE,
+        description: "Bundled default Yoi coding profile",
+    },
+    BuiltinProfile {
+        name: "companion",
+        label: "builtin:companion",
+        content: BUILTIN_COMPANION_PROFILE,
+        description: "Bundled Companion role profile",
+    },
+    BuiltinProfile {
+        name: "intake",
+        label: "builtin:intake",
+        content: BUILTIN_INTAKE_PROFILE,
+        description: "Bundled Intake role profile",
+    },
+    BuiltinProfile {
+        name: "orchestrator",
+        label: "builtin:orchestrator",
+        content: BUILTIN_ORCHESTRATOR_PROFILE,
+        description: "Bundled Orchestrator role profile",
+    },
+    BuiltinProfile {
+        name: "coder",
+        label: "builtin:coder",
+        content: BUILTIN_CODER_PROFILE,
+        description: "Bundled Coder role profile",
+    },
+    BuiltinProfile {
+        name: "reviewer",
+        label: "builtin:reviewer",
+        content: BUILTIN_REVIEWER_PROFILE,
+        description: "Bundled Reviewer role profile",
+    },
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -798,13 +850,15 @@ fn find_project_profiles_from(start: &Path) -> Option<PathBuf> {
 }
 
 fn add_builtin_profiles(registry: &mut ProfileRegistry) {
-    registry.push_entry(ProfileRegistryEntry::embedded(
-        ProfileRegistrySource::Builtin,
-        BUILTIN_DEFAULT_PROFILE_NAME,
-        "builtin:default",
-        BUILTIN_DEFAULT_PROFILE,
-        Some("Bundled default Yoi coding profile".into()),
-    ));
+    for profile in BUILTIN_PROFILES {
+        registry.push_entry(ProfileRegistryEntry::embedded(
+            ProfileRegistrySource::Builtin,
+            profile.name,
+            profile.label,
+            profile.content,
+            Some(profile.description.into()),
+        ));
+    }
 }
 
 fn parse_profile_ref(raw: &str) -> (Option<ProfileRegistrySource>, String) {
@@ -1010,15 +1064,18 @@ fn profile_module(lua: &Lua) -> mlua::Result<Table> {
     Ok(module)
 }
 fn import_profile_artifact(lua: &Lua, reference: &str) -> mlua::Result<LuaValue> {
-    let source = match reference {
-        "builtin:default" | "default" => BUILTIN_DEFAULT_PROFILE,
-        other => {
-            return Err(mlua::Error::RuntimeError(format!(
-                "unsupported profile import `{other}`"
-            )));
-        }
-    };
-    lua.load(source).set_name(reference).eval::<LuaValue>()
+    let profile = builtin_profile_by_ref(reference).ok_or_else(|| {
+        mlua::Error::RuntimeError(format!("unsupported profile import `{reference}`"))
+    })?;
+    lua.load(profile.content)
+        .set_name(profile.label)
+        .eval::<LuaValue>()
+}
+fn builtin_profile_by_ref(reference: &str) -> Option<&'static BuiltinProfile> {
+    let name = reference.strip_prefix("builtin:").unwrap_or(reference);
+    BUILTIN_PROFILES
+        .iter()
+        .find(|profile| profile.name == name || profile.label == reference)
 }
 fn deep_merge_profile_json(base: &mut serde_json::Value, overrides: serde_json::Value) {
     match (base, overrides) {
@@ -1458,6 +1515,98 @@ mod tests {
         assert_eq!(default.path, None);
         assert_eq!(default.provenance, "builtin:default");
     }
+    #[test]
+    fn builtin_role_profiles_are_registered_and_resolve() {
+        let tmp = TempDir::new().unwrap();
+        let registry = ProfileDiscovery::with_sources(None, None)
+            .discover()
+            .unwrap();
+        for expected in ["companion", "intake", "orchestrator", "coder", "reviewer"] {
+            let entry = registry
+                .select(&ProfileSelector::source_named(
+                    ProfileRegistrySource::Builtin,
+                    expected,
+                ))
+                .unwrap();
+            assert_eq!(entry.source, ProfileRegistrySource::Builtin);
+            assert_eq!(entry.path, None);
+            assert_eq!(entry.provenance, format!("builtin:{expected}"));
+
+            let resolved = ProfileResolver::new()
+                .with_workspace_base(tmp.path())
+                .resolve(
+                    &ProfileSelector::source_named(ProfileRegistrySource::Builtin, expected),
+                    ProfileResolveOptions::with_pod_name("role-pod"),
+                )
+                .unwrap();
+            assert_eq!(
+                resolved.profile.as_ref().unwrap().name.as_deref(),
+                Some(expected)
+            );
+            assert_eq!(resolved.manifest.pod.name, "role-pod");
+        }
+    }
+
+    #[test]
+    fn builtin_role_profiles_preserve_role_tool_policy() {
+        let tmp = TempDir::new().unwrap();
+        let resolve = |role: &str| {
+            ProfileResolver::new()
+                .with_workspace_base(tmp.path())
+                .resolve(
+                    &ProfileSelector::source_named(ProfileRegistrySource::Builtin, role),
+                    ProfileResolveOptions::with_pod_name("role-pod"),
+                )
+                .unwrap()
+                .manifest
+        };
+
+        let companion = resolve("companion");
+        assert!(!companion.feature.task.enabled);
+        assert!(!companion.feature.pods.enabled);
+        assert!(!companion.feature.ticket.enabled);
+        assert_eq!(companion.scope.allow[0].permission, Permission::Read);
+        assert!(companion.model.ref_.is_none());
+        assert!(companion.web.is_none());
+
+        let intake = resolve("intake");
+        assert!(!intake.feature.task.enabled);
+        assert!(!intake.feature.pods.enabled);
+        assert!(intake.feature.ticket.enabled);
+        assert_eq!(intake.scope.allow[0].permission, Permission::Read);
+        assert!(intake.model.ref_.is_none());
+        assert!(intake.web.is_none());
+        assert!(!intake.feature.ticket_orchestration.enabled);
+
+        let orchestrator = resolve("orchestrator");
+        assert!(!orchestrator.feature.task.enabled);
+        assert!(orchestrator.feature.pods.enabled);
+        assert!(orchestrator.feature.ticket.enabled);
+        assert!(orchestrator.feature.ticket_orchestration.enabled);
+        assert_eq!(orchestrator.scope.allow[0].permission, Permission::Read);
+        assert!(orchestrator.model.ref_.is_none());
+        assert!(orchestrator.web.is_none());
+        assert_eq!(
+            orchestrator.delegation_scope.allow[0].permission,
+            Permission::Write
+        );
+
+        let coder = resolve("coder");
+        assert!(!coder.feature.task.enabled);
+        assert!(!coder.feature.pods.enabled);
+        assert_eq!(coder.scope.allow[0].permission, Permission::Write);
+        assert!(coder.model.ref_.is_none());
+        assert!(coder.web.is_none());
+
+        let reviewer = resolve("reviewer");
+        assert!(!reviewer.feature.task.enabled);
+        assert!(!reviewer.feature.pods.enabled);
+        assert!(!reviewer.feature.ticket.enabled);
+        assert_eq!(reviewer.scope.allow[0].permission, Permission::Read);
+        assert!(reviewer.model.ref_.is_none());
+        assert!(reviewer.web.is_none());
+    }
+
     #[test]
     fn profile_resolution_requires_runtime_pod_name() {
         let tmp = TempDir::new().unwrap();
@@ -1932,112 +2081,6 @@ language = "nested"
         assert!(matches!(err, ProfileError::UnsupportedProfileType { .. }));
         assert!(err.to_string().contains("Lua profiles must end in .lua"));
     }
-    #[test]
-    fn actual_project_role_profiles_resolve_explicit_feature_defaults() {
-        let tmp = TempDir::new().unwrap();
-        let workspace = tmp.path().join("workspace");
-        let profiles_dir = tmp.path().join(".yoi/profiles");
-        std::fs::create_dir_all(&workspace).unwrap();
-        std::fs::create_dir_all(&profiles_dir).unwrap();
-        for (name, content) in [
-            (
-                "_base.lua",
-                include_str!("../../../.yoi/profiles/_base.lua"),
-            ),
-            (
-                "coder.lua",
-                include_str!("../../../.yoi/profiles/coder.lua"),
-            ),
-            (
-                "intake.lua",
-                include_str!("../../../.yoi/profiles/intake.lua"),
-            ),
-            (
-                "orchestrator.lua",
-                include_str!("../../../.yoi/profiles/orchestrator.lua"),
-            ),
-            (
-                "reviewer.lua",
-                include_str!("../../../.yoi/profiles/reviewer.lua"),
-            ),
-            (
-                "companion.lua",
-                include_str!("../../../.yoi/profiles/companion.lua"),
-            ),
-        ] {
-            std::fs::write(profiles_dir.join(name), content).unwrap();
-        }
-
-        struct Expected {
-            role: &'static str,
-            ticket: bool,
-            ticket_orchestration: bool,
-            pods: bool,
-        }
-
-        for expected in [
-            Expected {
-                role: "orchestrator",
-                ticket: true,
-                ticket_orchestration: true,
-                pods: true,
-            },
-            Expected {
-                role: "coder",
-                ticket: false,
-                ticket_orchestration: false,
-                pods: false,
-            },
-            Expected {
-                role: "intake",
-                ticket: true,
-                ticket_orchestration: false,
-                pods: false,
-            },
-            Expected {
-                role: "reviewer",
-                ticket: false,
-                ticket_orchestration: false,
-                pods: false,
-            },
-            Expected {
-                role: "companion",
-                ticket: false,
-                ticket_orchestration: false,
-                pods: false,
-            },
-        ] {
-            let resolved = ProfileResolver::new()
-                .with_workspace_base(&workspace)
-                .resolve(
-                    &ProfileSelector::path(profiles_dir.join(format!("{}.lua", expected.role))),
-                    ProfileResolveOptions::with_pod_name(format!("{}-pod", expected.role)),
-                )
-                .unwrap();
-            let feature = &resolved.manifest.feature;
-            assert!(
-                !feature.task.enabled,
-                "{} profile must explicitly keep Task tools disabled",
-                expected.role
-            );
-            assert_eq!(
-                feature.ticket.enabled, expected.ticket,
-                "{} ticket feature default mismatch",
-                expected.role
-            );
-            assert_eq!(
-                feature.ticket_orchestration.enabled, expected.ticket_orchestration,
-                "{} ticket orchestration feature default mismatch",
-                expected.role
-            );
-            assert_eq!(
-                feature.pods.enabled, expected.pods,
-                "{} Pod feature default mismatch",
-                expected.role
-            );
-        }
-    }
-
     #[test]
     fn discovery_reads_user_and_project_registry_and_project_default_wins() {
         let tmp = TempDir::new().unwrap();

@@ -6,17 +6,17 @@ root = ".yoi/tickets"
 language = "Japanese"
 
 [roles.intake]
-profile = "project:intake"
+profile = "builtin:intake"
 workflow = "ticket-intake-workflow"
 
 [roles.orchestrator]
-profile = "project:orchestrator"
+profile = "builtin:orchestrator"
 workflow = "ticket-orchestrator-routing"
 
 [roles.coder]
-profile = "project:coder"
+profile = "builtin:coder"
 workflow = "multi-agent-workflow"
 
 [roles.reviewer]
-profile = "project:reviewer"
+profile = "builtin:reviewer"
 workflow = "multi-agent-workflow"
