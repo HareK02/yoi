@@ -181,3 +181,52 @@ Validation after fix:
 Reviewer `reviewer-panel-orchestration-worktree` has been asked to re-review the amended branch.
 
 ---
+
+<!-- event: review author: reviewer-panel-orchestration-worktree at: 2026-06-11T08:08:18Z status: request_changes -->
+
+## Review: request changes
+
+Branch-local review verdict: request_changes
+
+Blocker:
+- `ensure_orchestration_worktree` still treats “inside a Git worktree” as “is the dedicated orchestration worktree”. Because the expected path is under the original repo, a plain directory at `.worktree/orchestration/<stem>` can inherit the parent repo. If the original workspace is currently on the expected branch, branch/common-dir checks pass even though `rev-parse --show-toplevel` is the original workspace root, not the expected path.
+- Expected fix: verify canonical `git rev-parse --show-toplevel` equals canonical `layout.path`; reject mismatch without cleanup. Add a test for the inherited-parent-worktree case.
+
+Non-blocking notes:
+- Previous wrong-branch and unrelated-repo blocker cases are now covered and rejected without deletion.
+- Spawn/root separation still looks correct: Orchestrator launch context uses orchestration `workspace_root`, with original/target roots preserved for prompt routing and implementation worktree root calculation.
+
+Validation run by reviewer:
+- `cargo test -p tui orchestration --lib` passed.
+- `cargo test -p tui existing_ --lib` passed.
+- `cargo test -p client ticket_role --lib` passed.
+- `git diff --check $(git merge-base HEAD develop)..HEAD` passed.
+- `/home/hare/Projects/yoi/target/debug/yoi ticket doctor` passed.
+- `nix build .#yoi --no-link` passed.
+
+---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-11T08:10:46Z -->
+
+## Implementation report
+
+Second fix-loop implementation report
+
+Reviewer blocker fixed in amended implementation commit `00e11b3d`:
+- Existing expected-path orchestration directories now validate canonical `git rev-parse --show-toplevel` equals the canonical expected orchestration worktree path before branch/common-dir/clean checks.
+- A plain directory under the parent repository that merely inherits the parent's Git worktree is rejected as “not the worktree root” and left untouched.
+- Added test `inherited_parent_worktree_directory_is_rejected_without_cleanup` for this exact case.
+
+Validation after fix:
+- `cargo fmt --check` passed.
+- `cargo test -p tui orchestration --lib` passed.
+- `cargo test -p tui existing_ --lib` passed.
+- `cargo test -p tui inherited_parent_worktree_directory_is_rejected_without_cleanup --lib` passed.
+- `cargo test -p client ticket_role --lib` passed.
+- `git diff --check` passed.
+- `/home/hare/Projects/yoi/target/debug/yoi ticket doctor` passed.
+- `nix build .#yoi` passed.
+
+Reviewer `reviewer-panel-orchestration-worktree` has been asked to re-review the amended branch.
+
+---
