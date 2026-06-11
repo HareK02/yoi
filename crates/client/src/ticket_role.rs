@@ -78,6 +78,7 @@ impl TicketIntakeHandoff {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TicketRoleLaunchContext {
     pub workspace_root: PathBuf,
+    pub cwd: Option<PathBuf>,
     pub original_workspace_root: Option<PathBuf>,
     pub target_workspace_root: Option<PathBuf>,
     pub role: TicketRole,
@@ -97,6 +98,7 @@ impl TicketRoleLaunchContext {
     pub fn new(workspace_root: impl Into<PathBuf>, role: TicketRole) -> Self {
         Self {
             workspace_root: workspace_root.into(),
+            cwd: None,
             original_workspace_root: None,
             target_workspace_root: None,
             role,
@@ -111,6 +113,11 @@ impl TicketRoleLaunchContext {
             validation: Vec::new(),
             report_expectations: Vec::new(),
         }
+    }
+
+    pub fn with_cwd(mut self, root: impl Into<PathBuf>) -> Self {
+        self.cwd = Some(root.into());
+        self
     }
 
     pub fn with_original_workspace_root(mut self, root: impl Into<PathBuf>) -> Self {
@@ -144,6 +151,7 @@ impl TicketRoleLaunchContext {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TicketRoleLaunchPlan {
     pub workspace_root: PathBuf,
+    pub cwd: Option<PathBuf>,
     pub original_workspace_root: PathBuf,
     pub target_workspace_root: PathBuf,
     pub implementation_worktree_root: PathBuf,
@@ -175,6 +183,7 @@ impl TicketRoleLaunchPlan {
             profile: Some(self.profile.clone()),
             ticket_role: Some(self.role.as_str().to_string()),
             workspace_root: self.workspace_root.clone(),
+            cwd: self.cwd.clone(),
             resume_from: None,
         })
     }
@@ -285,6 +294,7 @@ pub fn plan_ticket_role_launch_with_config(
 
     Ok(TicketRoleLaunchPlan {
         workspace_root: context.workspace_root,
+        cwd: context.cwd,
         original_workspace_root,
         target_workspace_root,
         implementation_worktree_root,
@@ -678,6 +688,9 @@ fn append_workspace_routing_context(out: &mut String, context: &TicketRoleLaunch
         "role_workspace_root",
         &context.workspace_root.display().to_string(),
     );
+    if let Some(cwd) = &context.cwd {
+        push_bounded_bullet(out, "role_cwd", &cwd.display().to_string());
+    }
     push_bounded_bullet(
         out,
         "original_workspace_root",
@@ -875,6 +888,7 @@ mod tests {
     fn test_launch_plan(workspace: &std::path::Path) -> TicketRoleLaunchPlan {
         TicketRoleLaunchPlan {
             workspace_root: workspace.to_path_buf(),
+            cwd: None,
             original_workspace_root: workspace.to_path_buf(),
             target_workspace_root: workspace.to_path_buf(),
             implementation_worktree_root: workspace.join(".worktree"),
@@ -1330,6 +1344,7 @@ workflow = "ticket-review-workflow"
             .spawn_config(PodRuntimeCommand::for_executable("/bin/yoi"))
             .unwrap();
         assert_eq!(spawn_config.workspace_root, temp.path());
+        assert_eq!(spawn_config.cwd, None);
 
         assert!(text.contains("Workspace routing context:"));
         assert!(text.contains("role_workspace_root"));

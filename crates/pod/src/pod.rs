@@ -232,7 +232,7 @@ pub struct Pod<C: LlmClient, St: Store> {
     /// wrapper over `segment_state.segment_id()`.
     segment_state: Arc<SegmentState>,
     /// Absolute tool/process working directory of the Pod.
-    pwd: PathBuf,
+    cwd: PathBuf,
     /// Absolute runtime workspace root used for project records, workflow,
     /// memory, Ticket config, Profile context, and spawned-child inheritance.
     workspace_root: PathBuf,
@@ -423,7 +423,7 @@ impl<C: LlmClient + Clone + 'static, St: Store + Clone + 'static> Pod<C, St> {
             store: self.store.clone(),
             pod_metadata_writer: None,
             segment_state: self.segment_state.clone(),
-            pwd: self.pwd.clone(),
+            cwd: self.cwd.clone(),
             workspace_root: self.workspace_root.clone(),
             scope: self.scope.clone(),
             delegation_scope: self.delegation_scope.clone(),
@@ -577,7 +577,7 @@ impl<C: LlmClient + Clone + 'static, St: Store + Clone + 'static> Pod<C, St> {
 impl<C: LlmClient, St: Store> Pod<C, St> {
     /// Create a new Pod from a pre-built Worker and store.
     ///
-    /// Callers must pre-resolve `pwd` (absolute) and build a [`Scope`]
+    /// Callers must pre-resolve `cwd` (absolute) and build a [`Scope`]
     /// — typically via [`Scope::from_config`] when coming from a
     /// manifest, or [`Scope::writable`] in tests.
     ///
@@ -589,7 +589,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         manifest: PodManifest,
         worker: Worker<C>,
         store: St,
-        pwd: PathBuf,
+        cwd: PathBuf,
         scope: Scope,
     ) -> Result<Self, PodError> {
         // Segment creation is deferred to `ensure_segment_head` at first
@@ -606,8 +606,8 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             store,
             pod_metadata_writer: None,
             segment_state: SegmentState::new(session_id, segment_id, 0),
-            workspace_root: pwd.clone(),
-            pwd,
+            workspace_root: cwd.clone(),
+            cwd,
             scope: SharedScope::new(scope),
             delegation_scope,
             hook_builder: HookRegistryBuilder::new(),
@@ -718,11 +718,11 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     }
 
     /// The Pod's tool/process working directory.
-    pub fn pwd(&self) -> &Path {
-        &self.pwd
+    pub fn cwd(&self) -> &Path {
+        &self.cwd
     }
 
-    /// The Pod's runtime workspace root. This stays separate from `pwd` for
+    /// The Pod's runtime workspace root. This stays separate from `cwd` for
     /// spawned children whose SpawnPod `cwd` only changes tool defaults.
     pub fn workspace_root(&self) -> &Path {
         &self.workspace_root
@@ -1325,7 +1325,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         let scope_snapshot = self.scope.snapshot();
         let ctx = SystemPromptContext {
             now: chrono::Utc::now(),
-            cwd: &self.pwd,
+            cwd: &self.cwd,
             language: worker_language,
             scope: &scope_snapshot,
             tool_names,
@@ -1562,7 +1562,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     fn resolve_file_refs(&self, segments: &[Segment]) -> Vec<SystemItem> {
         let view = crate::fs_view::PodFsView::new(tools::ScopedFs::with_shared_scope(
             self.scope.clone(),
-            self.pwd.clone(),
+            self.cwd.clone(),
         ));
         let mut out = Vec::new();
         for seg in segments {
@@ -2461,11 +2461,11 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             auto_read_budget,
         )));
 
-        // Build an independent compact worker. Scope and pwd are shared
+        // Build an independent compact worker. Scope and cwd are shared
         // with the main Pod (reads go through the same policy) but the
         // Tracker is fresh — compact-time reads must not pollute the
         // main session's recency list, which feeds `default_refs` above.
-        let scoped_fs = tools::ScopedFs::with_shared_scope(self.scope.clone(), self.pwd.clone());
+        let scoped_fs = tools::ScopedFs::with_shared_scope(self.scope.clone(), self.cwd.clone());
         let summary_tracker = tools::Tracker::new();
         let summary_client: Box<dyn LlmClient> = self.build_compactor_client()?;
         let summary_system_prompt = self
@@ -3708,7 +3708,7 @@ where
     /// process's `std::env::current_dir()` — callers that want a
     /// different cwd must `cd` before constructing the Pod (e.g. the
     /// `SpawnPod` tool sets `Command::current_dir` on the child). The
-    /// captured pwd is canonicalised and validated against
+    /// captured cwd is canonicalised and validated against
     /// `manifest.scope`.
     ///
     /// `loader` is installed into the system-prompt template
@@ -3720,7 +3720,25 @@ where
         store: St,
         loader: PromptLoader,
     ) -> Result<Self, PodError> {
-        let mut common = prepare_pod_common(&manifest, &loader, /* parse_template */ true)?;
+        let cwd = current_cwd()?;
+        Self::from_manifest_with_context(manifest, store, loader, cwd.clone(), cwd).await
+    }
+
+    pub async fn from_manifest_with_context(
+        manifest: PodManifest,
+        store: St,
+        loader: PromptLoader,
+        workspace_root: PathBuf,
+        cwd: PathBuf,
+    ) -> Result<Self, PodError> {
+        let mut common = prepare_pod_common_with_context(
+            &manifest,
+            &loader,
+            /* parse_template */ true,
+            workspace_root,
+            cwd,
+            manifest.scope.clone(),
+        )?;
         let skill_shadows = std::mem::take(&mut common.skill_shadows);
 
         // Segment creation is deferred to the first run (see
@@ -3757,7 +3775,7 @@ where
             store,
             pod_metadata_writer,
             segment_state: SegmentState::new(session_id, segment_id, 0),
-            pwd: common.pwd,
+            cwd: common.cwd,
             workspace_root: common.workspace_root,
             scope: SharedScope::new(common.scope),
             delegation_scope: common.delegation_scope,
@@ -3814,14 +3832,14 @@ where
         loader: PromptLoader,
         callback_socket: PathBuf,
     ) -> Result<Self, PodError> {
-        let pwd = current_pwd()?;
+        let cwd = current_cwd()?;
         Self::from_manifest_spawned_with_context(
             manifest,
             store,
             loader,
             callback_socket,
-            pwd.clone(),
-            pwd,
+            cwd.clone(),
+            cwd,
         )
         .await
     }
@@ -3832,14 +3850,14 @@ where
         loader: PromptLoader,
         callback_socket: PathBuf,
         workspace_root: PathBuf,
-        tool_cwd: PathBuf,
+        cwd: PathBuf,
     ) -> Result<Self, PodError> {
         let mut common = prepare_pod_common_with_context(
             &manifest,
             &loader,
             /* parse_template */ true,
             workspace_root,
-            tool_cwd,
+            cwd,
             manifest.scope.clone(),
         )?;
         let skill_shadows = std::mem::take(&mut common.skill_shadows);
@@ -3865,7 +3883,7 @@ where
             store,
             pod_metadata_writer,
             segment_state: SegmentState::new(session_id, segment_id, 0),
-            pwd: common.pwd,
+            cwd: common.cwd,
             workspace_root: common.workspace_root,
             scope: SharedScope::new(common.scope),
             delegation_scope: common.delegation_scope,
@@ -3918,6 +3936,26 @@ where
         store: St,
         loader: PromptLoader,
     ) -> Result<Self, PodError> {
+        let cwd = current_cwd()?;
+        Self::restore_from_pod_metadata_with_context(
+            pod_name,
+            manifest,
+            store,
+            loader,
+            cwd.clone(),
+            cwd,
+        )
+        .await
+    }
+
+    pub async fn restore_from_pod_metadata_with_context(
+        pod_name: &str,
+        manifest: PodManifest,
+        store: St,
+        loader: PromptLoader,
+        workspace_root: PathBuf,
+        cwd: PathBuf,
+    ) -> Result<Self, PodError> {
         let metadata =
             store
                 .read_by_name(pod_name)?
@@ -3936,15 +3974,36 @@ where
                 session_id: active.session_id,
             })?;
         let manifest = match metadata.resolved_manifest_snapshot {
-            Some(snapshot) => serde_json::from_value(snapshot).map_err(|source| {
-                PodError::PodMetadataManifestSnapshot {
-                    pod_name: pod_name.to_string(),
-                    source,
+            Some(snapshot) => {
+                let mut restored: PodManifest =
+                    serde_json::from_value(snapshot).map_err(|source| {
+                        PodError::PodMetadataManifestSnapshot {
+                            pod_name: pod_name.to_string(),
+                            source,
+                        }
+                    })?;
+                if !manifest.scope.allow.is_empty() || !manifest.scope.deny.is_empty() {
+                    restored.scope = manifest.scope;
                 }
-            })?,
+                if !manifest.delegation_scope.allow.is_empty()
+                    || !manifest.delegation_scope.deny.is_empty()
+                {
+                    restored.delegation_scope = manifest.delegation_scope;
+                }
+                restored
+            }
             None => manifest,
         };
-        Self::restore_from_manifest(active.session_id, segment_id, manifest, store, loader).await
+        Self::restore_from_manifest_with_context(
+            active.session_id,
+            segment_id,
+            manifest,
+            store,
+            loader,
+            workspace_root,
+            cwd,
+        )
+        .await
     }
 
     /// Restore a Pod from an existing session log.
@@ -3971,6 +4030,28 @@ where
         store: St,
         loader: PromptLoader,
     ) -> Result<Self, PodError> {
+        let cwd = current_cwd()?;
+        Self::restore_from_manifest_with_context(
+            session_id,
+            segment_id,
+            manifest,
+            store,
+            loader,
+            cwd.clone(),
+            cwd,
+        )
+        .await
+    }
+
+    pub async fn restore_from_manifest_with_context(
+        session_id: SessionId,
+        segment_id: SegmentId,
+        manifest: PodManifest,
+        store: St,
+        loader: PromptLoader,
+        workspace_root: PathBuf,
+        cwd: PathBuf,
+    ) -> Result<Self, PodError> {
         // Read raw entries once so we can both reconstruct state and
         // seed the broadcast sink's mirror with the same prefix that
         // sits on disk.
@@ -3982,10 +4063,12 @@ where
         let mirror_entries: Vec<LogEntry> = raw_entries.clone();
         let scope_config = effective_restore_scope_config(&store, &manifest)?;
 
-        let mut common = prepare_pod_common_with_scope(
+        let mut common = prepare_pod_common_with_context(
             &manifest,
             &loader,
             /* parse_template */ false,
+            workspace_root,
+            cwd,
             scope_config,
         )?;
         let skill_shadows = std::mem::take(&mut common.skill_shadows);
@@ -4045,7 +4128,7 @@ where
             store,
             pod_metadata_writer,
             segment_state: SegmentState::new(session_id, segment_id, state.entries_count),
-            pwd: common.pwd,
+            cwd: common.cwd,
             workspace_root: common.workspace_root,
             scope: SharedScope::new(common.scope),
             delegation_scope: common.delegation_scope,
@@ -4584,12 +4667,12 @@ pub enum PodError {
     #[error(transparent)]
     Scope(ScopeError),
 
-    #[error("pwd is not readable under the configured scope: {}", .pwd.display())]
-    PwdOutsideScope { pwd: PathBuf },
+    #[error("cwd is not readable under the configured scope: {}", .cwd.display())]
+    CwdOutsideScope { cwd: PathBuf },
 
-    #[error("failed to resolve pwd {}: {source}", .pwd.display())]
-    InvalidPwd {
-        pwd: PathBuf,
+    #[error("failed to resolve cwd {}: {source}", .cwd.display())]
+    InvalidCwd {
+        cwd: PathBuf,
         #[source]
         source: std::io::Error,
     },
@@ -4671,12 +4754,12 @@ pub enum PodError {
 }
 
 /// Bundle of resources that every high-level Pod constructor needs:
-/// tool pwd, runtime workspace root, scope, an LLM client, the prompt catalog,
+/// cwd, runtime workspace root, scope, an LLM client, the prompt catalog,
 /// and (optionally) a parsed system-prompt template. Built once by
-/// [`prepare_pod_common`] from the resolved manifest and then split into Pod
+/// [`prepare_pod_common_with_context`] from the resolved manifest and then split into Pod
 /// fields.
 struct PodCommon {
-    pwd: PathBuf,
+    cwd: PathBuf,
     workspace_root: PathBuf,
     scope: Scope,
     delegation_scope: DelegationScope,
@@ -4752,58 +4835,42 @@ fn delegated_write_rule_to_deny(rule: PodSpawnedScopeRule) -> Option<ScopeRule> 
     (rule.permission == Permission::Write).then_some(rule)
 }
 
-/// Resolve pwd / scope / LLM client / prompt catalog from a validated
-/// manifest. Used by `from_manifest`, `from_manifest_spawned`,
-/// and `restore_from_manifest` so they share one definition of "what
-/// pieces fall out of a manifest".
+/// Build the runtime pieces that are derivable directly from the resolved
+/// manifest. Used by new, spawned, and restored Pods so they share one
+/// definition of "what pieces fall out of a manifest".
 ///
-/// `parse_template` controls whether the manifest's instruction is
-/// parsed as a system-prompt template. New Pods always parse so the
-/// template is rendered at first turn; restored Pods skip parsing
-/// because the saved session log replays a previously-rendered
-/// `system_prompt` verbatim.
-fn prepare_pod_common(
-    manifest: &PodManifest,
-    loader: &PromptLoader,
-    parse_template: bool,
-) -> Result<PodCommon, PodError> {
-    let pwd = current_pwd()?;
-    let workspace_root = pwd.clone();
-    let scope = build_scope_with_memory(manifest, &workspace_root)?;
-    prepare_pod_common_from_scope(manifest, loader, parse_template, workspace_root, pwd, scope)
-}
-
-fn prepare_pod_common_with_scope(
-    manifest: &PodManifest,
-    loader: &PromptLoader,
-    parse_template: bool,
-    scope_config: ScopeConfig,
-) -> Result<PodCommon, PodError> {
-    let pwd = current_pwd()?;
-    let workspace_root = pwd.clone();
-    let scope = Scope::from_config(&scope_config).map_err(PodError::Scope)?;
-    prepare_pod_common_from_scope(manifest, loader, parse_template, workspace_root, pwd, scope)
-}
-
+/// `parse_template` controls whether the manifest's instruction is parsed as a
+/// system-prompt template. New Pods always parse so the template is rendered at
+/// first turn; restored Pods skip parsing because the saved session log replays
+/// a previously-rendered `system_prompt` verbatim.
 fn prepare_pod_common_with_context(
     manifest: &PodManifest,
     loader: &PromptLoader,
     parse_template: bool,
     workspace_root: PathBuf,
-    pwd: PathBuf,
+    cwd: PathBuf,
     scope_config: ScopeConfig,
 ) -> Result<PodCommon, PodError> {
     let workspace_root =
-        std::fs::canonicalize(&workspace_root).map_err(|source| PodError::InvalidPwd {
-            pwd: workspace_root.clone(),
+        std::fs::canonicalize(&workspace_root).map_err(|source| PodError::InvalidCwd {
+            cwd: workspace_root.clone(),
             source,
         })?;
-    let pwd = std::fs::canonicalize(&pwd).map_err(|source| PodError::InvalidPwd {
-        pwd: pwd.clone(),
+    let cwd = std::fs::canonicalize(&cwd).map_err(|source| PodError::InvalidCwd {
+        cwd: cwd.clone(),
         source,
     })?;
+    let mut scope_config = scope_config;
+    if let Some(mem) = manifest.memory.as_ref() {
+        let layout = memory::WorkspaceLayout::resolve(mem, &workspace_root);
+        scope_config.deny.extend(memory::deny_write_rules(&layout));
+        scope_config
+            .deny
+            .extend(workflow_crate::deny_write_rules(&layout));
+    }
+    scope_config.allow.extend(skill_dir_read_rules(manifest));
     let scope = Scope::from_config(&scope_config).map_err(PodError::Scope)?;
-    prepare_pod_common_from_scope(manifest, loader, parse_template, workspace_root, pwd, scope)
+    prepare_pod_common_from_scope(manifest, loader, parse_template, workspace_root, cwd, scope)
 }
 
 fn prepare_pod_common_from_scope(
@@ -4811,16 +4878,16 @@ fn prepare_pod_common_from_scope(
     loader: &PromptLoader,
     parse_template: bool,
     workspace_root: PathBuf,
-    pwd: PathBuf,
+    cwd: PathBuf,
     scope: Scope,
 ) -> Result<PodCommon, PodError> {
     if !scope.is_readable(&workspace_root) {
-        return Err(PodError::PwdOutsideScope {
-            pwd: workspace_root,
+        return Err(PodError::CwdOutsideScope {
+            cwd: workspace_root,
         });
     }
-    if !scope.is_readable(&pwd) {
-        return Err(PodError::PwdOutsideScope { pwd });
+    if !scope.is_readable(&cwd) {
+        return Err(PodError::CwdOutsideScope { cwd });
     }
     let delegation_scope =
         DelegationScope::from_config(&manifest.delegation_scope).map_err(PodError::Scope)?;
@@ -4847,7 +4914,7 @@ fn prepare_pod_common_from_scope(
     };
 
     Ok(PodCommon {
-        pwd,
+        cwd,
         workspace_root,
         scope,
         delegation_scope,
@@ -4900,28 +4967,6 @@ where
     }
 }
 
-/// Build the Pod's runtime [`Scope`] from the manifest, layering the
-/// memory subsystem's deny-write rules on top when `[memory]` is
-/// present, and read-allow rules for any external Agent Skills
-/// directories ingested. The deny rules cap generic CRUD tools so they
-/// cannot touch `<workspace>/memory/` or `<workspace>/knowledge/` while
-/// the memory tools (registered separately) bypass `ScopedFs` and write
-/// through `std::fs` directly. Skill directories are added at
-/// `Permission::Read` so the agent can `Read` `scripts/` / `references/`
-/// / `assets/` referenced by the Workflow body.
-fn build_scope_with_memory(manifest: &PodManifest, pwd: &Path) -> Result<Scope, PodError> {
-    let mut scope_config = manifest.scope.clone();
-    if let Some(mem) = manifest.memory.as_ref() {
-        let layout = memory::WorkspaceLayout::resolve(mem, pwd);
-        scope_config.deny.extend(memory::deny_write_rules(&layout));
-        scope_config
-            .deny
-            .extend(workflow_crate::deny_write_rules(&layout));
-    }
-    scope_config.allow.extend(skill_dir_read_rules(manifest));
-    Scope::from_config(&scope_config).map_err(PodError::Scope)
-}
-
 /// Allow-rules granting `Read` access to every skill directory the Pod
 /// will ingest from the manifest's `[skills] directories`. Returned
 /// rules are recursive so the entire skill bundle (`SKILL.md` +
@@ -4941,17 +4986,17 @@ fn skill_dir_read_rules(manifest: &PodManifest) -> Vec<ScopeRule> {
         .collect()
 }
 
-/// Snapshot the process's current working directory as the Pod's pwd,
+/// Snapshot the process's current working directory as the Pod's cwd,
 /// canonicalising symlinks and any `.`/`..` components. The Pod keeps
 /// this value for its lifetime; changes to the process-wide cwd after
 /// construction do not affect scope checks or the system prompt.
-fn current_pwd() -> Result<PathBuf, PodError> {
-    let cwd = std::env::current_dir().map_err(|source| PodError::InvalidPwd {
-        pwd: PathBuf::from("."),
+fn current_cwd() -> Result<PathBuf, PodError> {
+    let cwd = std::env::current_dir().map_err(|source| PodError::InvalidCwd {
+        cwd: PathBuf::from("."),
         source,
     })?;
     cwd.canonicalize()
-        .map_err(|source| PodError::InvalidPwd { pwd: cwd, source })
+        .map_err(|source| PodError::InvalidCwd { cwd: cwd, source })
 }
 
 #[cfg(test)]
@@ -4962,18 +5007,18 @@ mod spawned_context_tests {
     fn spawn_pod_context_keeps_workspace_root_separate_from_tool_pwd() {
         let tmp = tempfile::tempdir().unwrap();
         let workspace_root = tmp.path().join("workspace-root");
-        let tool_cwd = tmp.path().join("child-worktree");
+        let cwd = tmp.path().join("child-worktree");
         std::fs::create_dir_all(&workspace_root).unwrap();
-        std::fs::create_dir_all(&tool_cwd).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
 
-        let mut manifest = minimal_manifest_for_context_test(&workspace_root, &tool_cwd);
+        let mut manifest = minimal_manifest_for_context_test(&workspace_root, &cwd);
         manifest.memory = Some(manifest::MemoryConfig::default());
         let common = prepare_pod_common_with_context(
             &manifest,
             &PromptLoader::builtins_only(),
             false,
             workspace_root.clone(),
-            tool_cwd.clone(),
+            cwd.clone(),
             manifest.scope.clone(),
         )
         .unwrap();
@@ -4982,14 +5027,14 @@ mod spawned_context_tests {
             common.workspace_root,
             workspace_root.canonicalize().unwrap()
         );
-        assert_eq!(common.pwd, tool_cwd.canonicalize().unwrap());
+        assert_eq!(common.cwd, cwd.canonicalize().unwrap());
         assert_eq!(
             common.memory_layout.as_ref().unwrap().root(),
             workspace_root.canonicalize().unwrap()
         );
     }
 
-    fn minimal_manifest_for_context_test(workspace_root: &Path, tool_cwd: &Path) -> PodManifest {
+    fn minimal_manifest_for_context_test(workspace_root: &Path, cwd: &Path) -> PodManifest {
         let toml_str = format!(
             r#"
 [pod]
@@ -5010,7 +5055,7 @@ target = "{}"
 permission = "write"
 "#,
             workspace_root.display(),
-            tool_cwd.display()
+            cwd.display()
         );
         let mut manifest = PodManifest::from_toml(&toml_str).unwrap();
         manifest.model.auth = Some(manifest::AuthRef::None);
@@ -5226,10 +5271,10 @@ mod build_summary_prompt_tests {
         let dir = tempfile::tempdir().unwrap();
         let manifest = minimal_manifest_with_skills(vec![]);
         let store = session_store::FsStore::new(dir.path().join("sessions")).unwrap();
-        let pwd = dir.path().join("workspace");
-        std::fs::create_dir_all(&pwd).unwrap();
-        let scope = Scope::writable(&pwd).unwrap();
-        let mut pod = Pod::new(manifest, Worker::new(NoopClient), store, pwd, scope)
+        let cwd = dir.path().join("workspace");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let scope = Scope::writable(&cwd).unwrap();
+        let mut pod = Pod::new(manifest, Worker::new(NoopClient), store, cwd, scope)
             .await
             .unwrap();
         pod.ensure_segment_head().unwrap();
@@ -5371,10 +5416,10 @@ mod build_summary_prompt_tests {
         let dir = tempfile::tempdir().unwrap();
         let manifest = minimal_manifest_with_skills(vec![]);
         let store = session_store::FsStore::new(dir.path().join("sessions")).unwrap();
-        let pwd = dir.path().join("workspace");
-        std::fs::create_dir_all(&pwd).unwrap();
-        let scope = Scope::writable(&pwd).unwrap();
-        let mut pod = Pod::new(manifest, Worker::new(NoopClient), store, pwd, scope)
+        let cwd = dir.path().join("workspace");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let scope = Scope::writable(&cwd).unwrap();
+        let mut pod = Pod::new(manifest, Worker::new(NoopClient), store, cwd, scope)
             .await
             .unwrap();
 
@@ -5474,24 +5519,24 @@ mod build_summary_prompt_tests {
     ) -> String {
         let dir = tempfile::tempdir().unwrap();
         let store = session_store::FsStore::new(dir.path().join("sessions")).unwrap();
-        let pwd = dir.path().join("workspace");
-        std::fs::create_dir_all(&pwd).unwrap();
+        let cwd = dir.path().join("workspace");
+        std::fs::create_dir_all(&cwd).unwrap();
         if let Some(doc) = summary_doc {
-            std::fs::create_dir_all(pwd.join(".yoi/memory")).unwrap();
-            std::fs::write(pwd.join(".yoi/memory/summary.md"), doc).unwrap();
+            std::fs::create_dir_all(cwd.join(".yoi/memory")).unwrap();
+            std::fs::write(cwd.join(".yoi/memory/summary.md"), doc).unwrap();
         }
         if include_knowledge {
-            std::fs::create_dir_all(pwd.join(".yoi/knowledge")).unwrap();
+            std::fs::create_dir_all(cwd.join(".yoi/knowledge")).unwrap();
             std::fs::write(
-                pwd.join(".yoi/knowledge/resident-policy.md"),
+                cwd.join(".yoi/knowledge/resident-policy.md"),
                 knowledge_doc("knowledge resident desc"),
             )
             .unwrap();
         }
         if include_workflow {
-            std::fs::create_dir_all(pwd.join(".yoi/workflow")).unwrap();
+            std::fs::create_dir_all(cwd.join(".yoi/workflow")).unwrap();
             std::fs::write(
-                pwd.join(".yoi/workflow/resident-flow.md"),
+                cwd.join(".yoi/workflow/resident-flow.md"),
                 workflow_doc("workflow resident desc"),
             )
             .unwrap();
@@ -5499,15 +5544,15 @@ mod build_summary_prompt_tests {
 
         let mut manifest = minimal_manifest_with_skills(vec![]);
         manifest.memory = memory_config;
-        let scope = Scope::writable(&pwd).unwrap();
-        let mut pod = Pod::new(manifest, Worker::new(NoopClient), store, pwd.clone(), scope)
+        let scope = Scope::writable(&cwd).unwrap();
+        let mut pod = Pod::new(manifest, Worker::new(NoopClient), store, cwd.clone(), scope)
             .await
             .unwrap();
         pod.memory_layout = pod
             .manifest
             .memory
             .as_ref()
-            .map(|mem| memory::WorkspaceLayout::resolve(mem, &pwd));
+            .map(|mem| memory::WorkspaceLayout::resolve(mem, &cwd));
         if let Some(layout) = pod.memory_layout.as_ref() {
             pod.workflow_registry = workflow_crate::load_workflows(layout).unwrap();
         }

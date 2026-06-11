@@ -52,7 +52,7 @@ impl Tool for GlobTool {
         let base = params
             .path
             .clone()
-            .unwrap_or_else(|| self.fs.pwd().to_path_buf());
+            .unwrap_or_else(|| self.fs.cwd().to_path_buf());
         let pattern = params.pattern.clone();
         let scope = self.fs.scope().clone();
 

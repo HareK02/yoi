@@ -29,12 +29,6 @@ struct Cli {
     #[arg(long, value_name = "PATH")]
     workspace: Option<PathBuf>,
 
-    /// Internal spawned child process/tool working directory. This is separate
-    /// from `--workspace`; adopted Pods use `--workspace` for runtime context
-    /// and this path for tool defaults.
-    #[arg(long, value_name = "PATH", requires = "adopt", hide = true)]
-    tool_cwd: Option<PathBuf>,
-
     /// Manifest TOML to use directly as a one-file compatibility/debug input.
     /// This bypasses profile discovery but still applies builtin defaults and
     /// the same required-field validation boundary.
@@ -105,17 +99,6 @@ fn runtime_workspace_root(cli: &Cli) -> Result<PathBuf, String> {
             .map_err(|e| format!("failed to resolve current directory for workspace: {e}"))
             .map(|cwd| cwd.join(raw))
     }
-}
-
-fn runtime_tool_cwd(cli: &Cli, workspace_root: &Path) -> Result<PathBuf, String> {
-    let raw = cli.tool_cwd.as_deref().unwrap_or(workspace_root);
-    let path = if raw.is_absolute() {
-        raw.to_path_buf()
-    } else {
-        workspace_root.join(raw)
-    };
-    std::fs::canonicalize(&path)
-        .map_err(|e| format!("failed to resolve tool cwd {}: {e}", path.display()))
 }
 
 fn runtime_pod_name(cli: &Cli, workspace_root: &Path) -> String {
@@ -300,6 +283,13 @@ fn exit_code_from_i32(code: i32) -> ExitCode {
 }
 
 async fn run_cli_inner(cli: Cli) -> ExitCode {
+    let cwd = match std::env::current_dir() {
+        Ok(path) => path,
+        Err(e) => {
+            eprintln!("error: failed to resolve current directory: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     let workspace_root = match runtime_workspace_root(&cli) {
         Ok(root) => root,
         Err(e) => {
@@ -314,15 +304,6 @@ async fn run_cli_inner(cli: Cli) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-
-    if let Err(e) = std::env::set_current_dir(&workspace_root) {
-        eprintln!(
-            "error: failed to enter runtime workspace {}: {e}",
-            workspace_root.display()
-        );
-        return ExitCode::FAILURE;
-    }
-
     // Initialize persistent store. `paths::sessions_dir()` only
     // returns None when none of YOI_HOME / YOI_DATA_DIR /
     // HOME is set — surface that as a hard error to match the
@@ -372,33 +353,17 @@ async fn run_cli_inner(cli: Cli) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        let tool_cwd = match runtime_tool_cwd(&cli, &workspace_root) {
-            Ok(path) => path,
-            Err(e) => {
-                eprintln!("error: {e}");
-                return ExitCode::FAILURE;
-            }
-        };
         match Pod::from_manifest_spawned_with_context(
             manifest,
             store,
             loader,
             callback,
             workspace_root.clone(),
-            tool_cwd.clone(),
+            cwd.clone(),
         )
         .await
         {
-            Ok(p) => {
-                if let Err(e) = std::env::set_current_dir(&tool_cwd) {
-                    eprintln!(
-                        "error: failed to enter tool cwd {}: {e}",
-                        tool_cwd.display()
-                    );
-                    return ExitCode::FAILURE;
-                }
-                p
-            }
+            Ok(p) => p,
             Err(e) => {
                 eprintln!("error: failed to create spawned pod: {e}");
                 return ExitCode::FAILURE;
@@ -418,12 +383,14 @@ async fn run_cli_inner(cli: Cli) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        match Pod::restore_from_manifest(
+        match Pod::restore_from_manifest_with_context(
             source_session_id,
             source_segment_id,
             manifest,
             store,
             loader,
+            workspace_root.clone(),
+            cwd.clone(),
         )
         .await
         {
@@ -437,7 +404,16 @@ async fn run_cli_inner(cli: Cli) -> ExitCode {
         manifest.pod.name = pod_name.to_string();
         match store.read_by_name(pod_name) {
             Ok(Some(_)) => {
-                match Pod::restore_from_pod_metadata(pod_name, manifest, store, loader).await {
+                match Pod::restore_from_pod_metadata_with_context(
+                    pod_name,
+                    manifest,
+                    store,
+                    loader,
+                    workspace_root.clone(),
+                    cwd.clone(),
+                )
+                .await
+                {
                     Ok(p) => p,
                     Err(e) => {
                         eprintln!("error: failed to restore pod {pod_name}: {e}");
@@ -449,20 +425,38 @@ async fn run_cli_inner(cli: Cli) -> ExitCode {
                 eprintln!("error: pod state missing for {pod_name}");
                 return ExitCode::FAILURE;
             }
-            Ok(None) => match Pod::from_manifest(manifest, store, loader).await {
-                Ok(p) => p,
-                Err(e) => {
-                    eprintln!("error: failed to create pod {pod_name}: {e}");
-                    return ExitCode::FAILURE;
+            Ok(None) => {
+                match Pod::from_manifest_with_context(
+                    manifest,
+                    store,
+                    loader,
+                    workspace_root.clone(),
+                    cwd.clone(),
+                )
+                .await
+                {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("error: failed to create pod {pod_name}: {e}");
+                        return ExitCode::FAILURE;
+                    }
                 }
-            },
+            }
             Err(e) => {
                 eprintln!("error: failed to read pod state for {pod_name}: {e}");
                 return ExitCode::FAILURE;
             }
         }
     } else {
-        match Pod::from_manifest(manifest, store, loader).await {
+        match Pod::from_manifest_with_context(
+            manifest,
+            store,
+            loader,
+            workspace_root.clone(),
+            cwd.clone(),
+        )
+        .await
+        {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("error: failed to create pod: {e}");
@@ -478,7 +472,6 @@ async fn run_cli_inner(cli: Cli) -> ExitCode {
         pod.set_runtime_ticket_role(Some(role));
     }
     let pod_name = pod.manifest().pod.name.clone();
-
     // Spawn the controller (starts socket server)
     let runtime_base = match paths::runtime_dir() {
         Some(d) => d,

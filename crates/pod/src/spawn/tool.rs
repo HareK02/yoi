@@ -228,8 +228,8 @@ pub struct SpawnPodTool {
     /// memory context. SpawnPod `cwd` must not affect this value.
     workspace_root: PathBuf,
     /// Directory the spawned Pod's tools should use when the LLM did not
-    /// override it. Defaults to the spawner's tool pwd.
-    spawner_pwd: PathBuf,
+    /// override it. Defaults to the spawner's cwd.
+    spawner_cwd: PathBuf,
     /// Optional typed runtime command injected by tests. Production resolves
     /// the runtime command from `std::env::current_exe()` at launch time.
     runtime_command: Option<PodRuntimeCommand>,
@@ -270,7 +270,7 @@ impl SpawnPodTool {
         callback_socket: PathBuf,
         runtime_base: PathBuf,
         workspace_root: PathBuf,
-        spawner_pwd: PathBuf,
+        spawner_cwd: PathBuf,
         registry: Arc<SpawnedPodRegistry>,
         parent_socket: Option<PathBuf>,
         spawner_manifest: PodManifest,
@@ -284,7 +284,7 @@ impl SpawnPodTool {
             callback_socket,
             runtime_base,
             workspace_root,
-            spawner_pwd,
+            spawner_cwd,
             runtime_command,
             registry,
             parent_socket,
@@ -318,7 +318,7 @@ impl Tool for SpawnPodTool {
 
         let scope_allow = parse_scope(&input.scope)?;
         self.validate_delegation_scope(&scope_allow)?;
-        let child_cwd = validate_spawn_cwd(input.cwd.as_deref(), &scope_allow, &self.spawner_pwd)?;
+        let child_cwd = validate_spawn_cwd(input.cwd.as_deref(), &scope_allow, &self.spawner_cwd)?;
 
         let spawn_selector =
             parse_spawn_profile_selector(input.profile.as_deref()).map_err(|msg| {
@@ -481,9 +481,7 @@ impl SpawnPodTool {
             .arg(spawn_config_json)
             .arg("--workspace")
             .arg(&self.workspace_root)
-            .arg("--tool-cwd")
-            .arg(child_cwd)
-            .current_dir(&self.workspace_root)
+            .current_dir(child_cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::from(stderr_file))
@@ -881,7 +879,7 @@ pub fn spawn_pod_tool(
     callback_socket: PathBuf,
     runtime_base: PathBuf,
     workspace_root: PathBuf,
-    spawner_pwd: PathBuf,
+    spawner_cwd: PathBuf,
     registry: Arc<SpawnedPodRegistry>,
     parent_socket: Option<PathBuf>,
     spawner_manifest: PodManifest,
@@ -893,7 +891,7 @@ pub fn spawn_pod_tool(
         callback_socket,
         runtime_base,
         workspace_root,
-        spawner_pwd,
+        spawner_cwd,
         registry,
         parent_socket,
         spawner_manifest,
@@ -909,7 +907,7 @@ pub fn spawn_pod_tool_with_runtime_command(
     callback_socket: PathBuf,
     runtime_base: PathBuf,
     workspace_root: PathBuf,
-    spawner_pwd: PathBuf,
+    spawner_cwd: PathBuf,
     registry: Arc<SpawnedPodRegistry>,
     parent_socket: Option<PathBuf>,
     spawner_manifest: PodManifest,
@@ -922,7 +920,7 @@ pub fn spawn_pod_tool_with_runtime_command(
         callback_socket,
         runtime_base,
         workspace_root,
-        spawner_pwd,
+        spawner_cwd,
         registry,
         parent_socket,
         spawner_manifest,
@@ -937,7 +935,7 @@ fn spawn_pod_tool_impl(
     callback_socket: PathBuf,
     runtime_base: PathBuf,
     workspace_root: PathBuf,
-    spawner_pwd: PathBuf,
+    spawner_cwd: PathBuf,
     registry: Arc<SpawnedPodRegistry>,
     parent_socket: Option<PathBuf>,
     spawner_manifest: PodManifest,
@@ -969,7 +967,7 @@ fn spawn_pod_tool_impl(
             callback_socket.clone(),
             runtime_base.clone(),
             workspace_root.clone(),
-            spawner_pwd.clone(),
+            spawner_cwd.clone(),
             registry.clone(),
             parent_socket.clone(),
             spawner_manifest.clone(),

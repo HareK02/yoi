@@ -35,10 +35,14 @@ pub struct SpawnConfig {
     /// Process-local Ticket role marker supplied only by Ticket role launches.
     /// This does not alter prompts, manifests, or Ticket claim records.
     pub ticket_role: Option<String>,
-    /// Explicit runtime workspace root. The child uses it as process cwd and
-    /// receives it via `--workspace` so startup does not infer workspace
-    /// identity from the parent process cwd.
+    /// Explicit runtime workspace root. The child receives it via
+    /// `--workspace` so startup does not infer workspace identity from the
+    /// parent process cwd.
     pub workspace_root: PathBuf,
+    /// Optional child process cwd. This is not runtime workspace identity and
+    /// is not passed as a CLI argument; the child observes it as its ordinary
+    /// process current directory.
+    pub cwd: Option<PathBuf>,
     /// `Some(id)` のとき `--session <id>` を付与し、当該セッションから
     /// resume させる。
     pub resume_from: Option<Uuid>,
@@ -149,7 +153,7 @@ where
     let mut command = Command::new(config.runtime_command.program());
     command
         .args(config.runtime_command.prefix_args())
-        .current_dir(&config.workspace_root)
+        .current_dir(config.cwd.as_ref().unwrap_or(&config.workspace_root))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(stderr_file))
@@ -335,6 +339,7 @@ mod tests {
             profile: Some("project:companion".to_string()),
             ticket_role: None,
             workspace_root: PathBuf::from("/work/other-project"),
+            cwd: None,
             resume_from: None,
         }
     }
@@ -372,9 +377,10 @@ mod tests {
     }
 
     #[test]
-    fn runtime_args_pass_ticket_role_marker_when_present() {
+    fn runtime_args_do_not_include_child_cwd() {
         let mut config = base_config();
-        config.ticket_role = Some("intake".to_string());
+        config.ticket_role = Some("orchestrator".to_string());
+        config.cwd = Some(PathBuf::from("/work/main/.worktree/orchestration/yoi"));
 
         assert_eq!(
             runtime_args(&config),
@@ -386,7 +392,7 @@ mod tests {
                 "--profile",
                 "project:companion",
                 "--ticket-role",
-                "intake",
+                "orchestrator",
             ]
         );
     }

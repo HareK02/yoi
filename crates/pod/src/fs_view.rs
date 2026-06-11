@@ -45,7 +45,7 @@ pub struct PodFsView {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileCandidate {
     /// 入力 prefix と整合する形のパス（prefix が absolute なら absolute、
-    /// relative なら pwd 相対）。
+    /// relative なら cwd 相対）。
     pub path: String,
     pub is_dir: bool,
 }
@@ -114,7 +114,7 @@ impl PodFsView {
     /// `path` を ScopedFs 経由で解決し、submit 時の `Segment::FileRef`
     /// attachment 用 system message を返す。
     ///
-    /// - `path` は relative なら pwd 相対、absolute なら absolute として解釈
+    /// - `path` は relative なら cwd 相対、absolute なら absolute として解釈
     /// - 通常ディレクトリは浅い entry listing として `[Dir: <path>]\n<body>` に展開する
     /// - ディレクトリ listing は hidden / gitignore を特別扱いせず、scope 上 readable な
     ///   直下 entry だけを最大 `DIR_FILE_REF_ENTRY_LIMIT` 件返す
@@ -126,7 +126,7 @@ impl PodFsView {
         let abs = if p.is_absolute() {
             p.to_path_buf()
         } else {
-            self.fs.pwd().join(p)
+            self.fs.cwd().join(p)
         };
 
         // 通常ディレクトリだけを FileRef listing として扱う。symlink を含むパスは
@@ -163,16 +163,16 @@ impl PodFsView {
 
     /// `prefix` にマッチするファイル / ディレクトリを scope 内で浅く列挙する。
     ///
-    /// - `prefix` が空 or `pwd` 相対のときは pwd 直下を見る
+    /// - `prefix` が空 or `cwd` 相対のときは cwd 直下を見る
     /// - `prefix` が末尾 `/` のときはそのディレクトリ直下を全列挙
     /// - 末尾が名前部分のときは、その名前を starts_with でフィルタ
     /// - scope 上 readable なエントリのみ返す
     /// - ディレクトリ → ファイル の順、各グループ内は名前昇順
     /// - 上限 `COMPLETION_LIMIT` 件で打ち切り（深い列挙はしない）
     pub fn list_file_completions(&self, prefix: &str) -> Vec<FileCandidate> {
-        let pwd = self.fs.pwd();
+        let cwd = self.fs.cwd();
         let scope = self.fs.scope();
-        let (dir, name_prefix, is_absolute) = split_prefix(prefix, pwd);
+        let (dir, name_prefix, is_absolute) = split_prefix(prefix, cwd);
 
         let read_dir = match std::fs::read_dir(&dir) {
             Ok(rd) => rd,
@@ -194,7 +194,7 @@ impl PodFsView {
             let display = if is_absolute {
                 path.display().to_string()
             } else {
-                path.strip_prefix(pwd)
+                path.strip_prefix(cwd)
                     .map(|p| p.display().to_string())
                     .unwrap_or_else(|_| path.display().to_string())
             };
@@ -343,7 +343,7 @@ fn format_range(offset: Option<usize>, limit: Option<usize>) -> String {
     }
 }
 
-fn split_prefix(prefix: &str, pwd: &Path) -> (PathBuf, String, bool) {
+fn split_prefix(prefix: &str, cwd: &Path) -> (PathBuf, String, bool) {
     let is_absolute = Path::new(prefix).is_absolute();
     let p = Path::new(prefix);
     let (parent, name) = if prefix.is_empty() || prefix.ends_with('/') {
@@ -359,9 +359,9 @@ fn split_prefix(prefix: &str, pwd: &Path) -> (PathBuf, String, bool) {
     let dir = if is_absolute {
         parent
     } else if parent.as_os_str().is_empty() {
-        pwd.to_path_buf()
+        cwd.to_path_buf()
     } else {
-        pwd.join(parent)
+        cwd.join(parent)
     };
     (dir, name, is_absolute)
 }

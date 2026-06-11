@@ -380,6 +380,7 @@ async fn wait_for_ready(
         profile: form.selected_profile_selector(),
         ticket_role: None,
         workspace_root: form.cwd.clone(),
+        cwd: None,
         resume_from: form.resume_from,
     };
     let ready = spawn_pod(config, |line| {

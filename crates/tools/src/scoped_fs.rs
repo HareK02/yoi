@@ -2,7 +2,7 @@
 //!
 //! `ScopedFs` is the write/read gate layered on top of a [`manifest::Scope`]
 //! and a Pod's working directory. The scope decides which paths are
-//! readable and writable; the pwd is carried alongside for convenience
+//! readable and writable; the cwd is carried alongside for convenience
 //! (Glob/Grep default their search base to it).
 //!
 //! `ScopedFs` is cheap to clone (`Arc` inside) and carries no per-session
@@ -20,7 +20,7 @@ use crate::error::ToolsError;
 #[derive(Debug)]
 struct ScopedFsInner {
     scope: SharedScope,
-    pwd: PathBuf,
+    cwd: PathBuf,
 }
 
 /// Scope-aware filesystem handle. Clone-cheap (`Arc` inside).
@@ -60,20 +60,20 @@ pub struct SymlinkInfo {
 }
 
 impl ScopedFs {
-    /// Create a new [`ScopedFs`] wrapping `scope` and `pwd` in a fresh
+    /// Create a new [`ScopedFs`] wrapping `scope` and `cwd` in a fresh
     /// [`SharedScope`]. Use [`ScopedFs::with_shared_scope`] when you
     /// need the resulting `ScopedFs` to share scope state with another
     /// holder of the `SharedScope` (typically the Pod).
-    pub fn new(scope: Scope, pwd: PathBuf) -> Self {
-        Self::with_shared_scope(SharedScope::new(scope), pwd)
+    pub fn new(scope: Scope, cwd: PathBuf) -> Self {
+        Self::with_shared_scope(SharedScope::new(scope), cwd)
     }
 
     /// Build a [`ScopedFs`] over an existing [`SharedScope`]. The
     /// resulting handle and any future updates the caller pushes to
     /// `scope` are observed by every clone of this `ScopedFs`.
-    pub fn with_shared_scope(scope: SharedScope, pwd: PathBuf) -> Self {
+    pub fn with_shared_scope(scope: SharedScope, cwd: PathBuf) -> Self {
         Self {
-            inner: Arc::new(ScopedFsInner { scope, pwd }),
+            inner: Arc::new(ScopedFsInner { scope, cwd }),
         }
     }
 
@@ -93,8 +93,8 @@ impl ScopedFs {
 
     /// The Pod's working directory. Glob/Grep default their search base
     /// to this path when callers omit an explicit `path` parameter.
-    pub fn pwd(&self) -> &Path {
-        &self.inner.pwd
+    pub fn cwd(&self) -> &Path {
+        &self.inner.cwd
     }
 
     // =========================================================================

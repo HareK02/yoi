@@ -96,7 +96,7 @@ impl Tool for GrepTool {
             "Grep"
         );
 
-        let default_base = self.fs.pwd().to_path_buf();
+        let default_base = self.fs.cwd().to_path_buf();
         let scope = self.fs.scope().clone();
         let report = tokio::task::spawn_blocking(move || run_grep(default_base, params, &scope))
             .await

@@ -76,7 +76,7 @@ pub(crate) struct BashParams {
 
 pub(crate) struct BashTool {
     /// Workspace root that every invocation starts in. Snapshot of
-    /// `ScopedFs::pwd()` at registration time; never mutated, since we
+    /// `ScopedFs::cwd()` at registration time; never mutated, since we
     /// don't track `cd` across calls.
     cwd: PathBuf,
     /// Directory to spill long outputs into. Caller is expected to have
@@ -329,7 +329,7 @@ fn shell_single_quote(s: &str) -> String {
 ///
 /// `output_dir` is where long outputs spill to; the caller is responsible
 /// for arranging that the path is in the agent's readable scope. Every
-/// invocation starts at `fs.pwd()` — the tool is intentionally stateless
+/// invocation starts at `fs.cwd()` — the tool is intentionally stateless
 /// w.r.t. the working directory.
 pub fn bash_tool(fs: ScopedFs, output_dir: PathBuf) -> ToolDefinition {
     Arc::new(move || {
@@ -339,7 +339,7 @@ pub fn bash_tool(fs: ScopedFs, output_dir: PathBuf) -> ToolDefinition {
             .description(DESCRIPTION)
             .input_schema(schema_value);
         let tool: Arc<dyn Tool> = Arc::new(BashTool {
-            cwd: fs.pwd().to_path_buf(),
+            cwd: fs.cwd().to_path_buf(),
             output_dir: output_dir.clone(),
             spilled_outputs: std::sync::Mutex::new(Vec::new()),
         });

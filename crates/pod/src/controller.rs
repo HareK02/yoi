@@ -508,7 +508,7 @@ where
     // Pod-immutable snapshots taken before the mutable worker borrow
     // below so the worker borrow doesn't conflict with reads on `pod`.
     let scope_handle = pod.scope().clone();
-    let pwd = pod.pwd().to_path_buf();
+    let cwd = pod.cwd().to_path_buf();
     let workspace_root = pod.workspace_root().to_path_buf();
     let task_feature = pod.task_feature();
     let session_id_for_usage = pod.segment_id().to_string();
@@ -526,7 +526,7 @@ where
     // ScopedFs (builtin tools, fs_view, compact worker) reads from it,
     // and any future scope mutation (SpawnPod-style revoke, future
     // GrantScope) propagates through it.
-    let fs = tools::ScopedFs::with_shared_scope(scope_handle.clone(), pwd.clone());
+    let fs = tools::ScopedFs::with_shared_scope(scope_handle.clone(), cwd.clone());
     let tracker = tools::Tracker::new();
     // Same ScopedFs also powers the IPC `ListCompletions` query — keep
     // a clone for the FS view we attach below, since the tools consume
@@ -607,7 +607,7 @@ where
             spawner_socket,
             runtime_base.clone(),
             workspace_root.clone(),
-            pwd.clone(),
+            cwd.clone(),
             spawned_registry.clone(),
             self_parent_socket,
             spawner_manifest,
@@ -618,7 +618,7 @@ where
         worker.register_tool(read_pod_output_tool(spawned_registry.clone()));
         worker.register_tool(stop_pod_tool(spawned_registry.clone()));
         let discovery =
-            PodDiscovery::new(pod_store, spawner_name, runtime_base, pwd, spawned_registry);
+            PodDiscovery::new(pod_store, spawner_name, runtime_base, cwd, spawned_registry);
         worker.register_tool(list_pods_tool(discovery.clone()));
         worker.register_tool(restore_pod_tool(discovery.clone()));
         worker.register_tool(send_to_peer_pod_tool(discovery));
@@ -664,7 +664,7 @@ async fn controller_loop<C, St>(
         pod.store().clone(),
         spawner_name.clone(),
         discovery_runtime_base,
-        pod.pwd().to_path_buf(),
+        pod.cwd().to_path_buf(),
         spawned_registry.clone(),
     );
     let mut pending: Option<PendingRun> = None;
@@ -1292,7 +1292,7 @@ where
         .collect();
     protocol::Greeting {
         pod_name: manifest.pod.name.clone(),
-        cwd: pod.pwd().display().to_string(),
+        cwd: pod.cwd().display().to_string(),
         provider: provider_name,
         model: model_id,
         scope_summary: pod.scope_snapshot().summary(),

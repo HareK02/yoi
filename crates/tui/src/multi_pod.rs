@@ -1693,9 +1693,10 @@ fn build_orchestrator_launch_context(
     pod_name: &str,
 ) -> TicketRoleLaunchContext {
     let mut context = TicketRoleLaunchContext::new(
-        orchestration_workspace_root.to_path_buf(),
+        original_workspace_root.to_path_buf(),
         TicketRole::Orchestrator,
     )
+    .with_cwd(orchestration_workspace_root.to_path_buf())
     .with_original_workspace_root(original_workspace_root.to_path_buf())
     .with_target_workspace_root(original_workspace_root.to_path_buf());
     context.pod_name = Some(pod_name.to_string());
@@ -1996,6 +1997,7 @@ async fn orchestrator_lifecycle(
             match prepare_orchestration_worktree_for_restore(workspace_root) {
                 Ok(worktree) => {
                     match restore_orchestrator_pod(
+                        workspace_root,
                         &worktree.layout.path,
                         &pod_name,
                         runtime_command.clone(),
@@ -2083,6 +2085,7 @@ async fn restore_workspace_companion_pod(
         profile: None,
         ticket_role: None,
         workspace_root: workspace_root.to_path_buf(),
+        cwd: None,
         resume_from: None,
     };
     spawn_pod(config, |_| {}).await.map(|_| ())
@@ -2099,12 +2102,14 @@ async fn spawn_workspace_companion_pod(
         profile: None,
         ticket_role: None,
         workspace_root: workspace_root.to_path_buf(),
+        cwd: None,
         resume_from: None,
     };
     spawn_pod(config, |_| {}).await.map(|_| ())
 }
 
 async fn restore_orchestrator_pod(
+    original_workspace_root: &Path,
     workspace_root: &Path,
     pod_name: &str,
     runtime_command: PodRuntimeCommand,
@@ -2113,8 +2118,9 @@ async fn restore_orchestrator_pod(
         runtime_command,
         pod_name: pod_name.to_string(),
         profile: None,
-        ticket_role: None,
-        workspace_root: workspace_root.to_path_buf(),
+        ticket_role: Some("orchestrator".to_string()),
+        workspace_root: original_workspace_root.to_path_buf(),
+        cwd: Some(workspace_root.to_path_buf()),
         resume_from: None,
     };
     spawn_pod(config, |_| {}).await.map(|_| ())

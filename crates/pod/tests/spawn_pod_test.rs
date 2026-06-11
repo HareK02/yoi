@@ -270,7 +270,7 @@ fn clear_env() {
 }
 
 #[tokio::test]
-async fn spawn_pod_launches_runtime_in_workspace_and_passes_tool_cwd() {
+async fn spawn_pod_launches_runtime_in_workspace_and_process_cwd() {
     let _env = EnvGuard::acquire();
 
     let allow_root = TempDir::new().unwrap();
@@ -315,7 +315,7 @@ async fn spawn_pod_launches_runtime_in_workspace_and_passes_tool_cwd() {
     tool.execute(&input, Default::default()).await.unwrap();
     assert!(matches!(received.await.unwrap(), Some(Method::Run { .. })));
     let invocation = read_recorded_runtime_invocation(&output_path).await;
-    assert_eq!(invocation[0], allow_root.path().to_str().unwrap());
+    assert_eq!(invocation[0], child_cwd.to_str().unwrap());
     assert!(
         invocation
             .windows(2)
@@ -323,17 +323,15 @@ async fn spawn_pod_launches_runtime_in_workspace_and_passes_tool_cwd() {
         "invocation should carry inherited workspace root: {invocation:?}"
     );
     assert!(
-        invocation
-            .windows(2)
-            .any(|pair| pair[0] == "--tool-cwd" && pair[1] == child_cwd.to_str().unwrap()),
-        "invocation should carry tool cwd separately: {invocation:?}"
+        !invocation.iter().any(|arg| arg == "--tool-cwd"),
+        "cwd should be process current directory, not a runtime argument: {invocation:?}"
     );
 
     clear_env();
 }
 
 #[tokio::test]
-async fn spawn_pod_omitted_cwd_preserves_spawner_pwd() {
+async fn spawn_pod_omitted_cwd_preserves_spawner_cwd() {
     let _env = EnvGuard::acquire();
 
     let allow_root = TempDir::new().unwrap();
@@ -378,10 +376,8 @@ async fn spawn_pod_omitted_cwd_preserves_spawner_pwd() {
     let invocation = read_recorded_runtime_invocation(&output_path).await;
     assert_eq!(invocation[0], allow_root.path().to_str().unwrap());
     assert!(
-        invocation
-            .windows(2)
-            .any(|pair| pair[0] == "--tool-cwd" && pair[1] == allow_root.path().to_str().unwrap()),
-        "omitted cwd should preserve spawner pwd as tool cwd: {invocation:?}"
+        !invocation.iter().any(|arg| arg == "--tool-cwd"),
+        "omitted cwd should preserve spawner cwd as process cwd: {invocation:?}"
     );
 
     clear_env();
