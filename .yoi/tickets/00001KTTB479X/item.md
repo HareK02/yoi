@@ -32,6 +32,7 @@ Ticket backend をすぐに Git 外 store へ移行するのではなく、ま�
 - Coder / Reviewer 用 implementation worktree は orchestration worktree から子として作らず、original workspace root の `.worktree/<ticket>` に sibling として作る。
 - Implementation branch の base は原則 main/target code branch とし、orchestration branch の Ticket churn を implementation branch に混ぜない。
 - Orchestrator prompt / workflow guidance では、`pwd` が orchestration worktree であることと、implementation worktree 作成時の root path を明示する。
+- merge-ready dossier は原則として停止点ではなく checkpoint とする。reviewer approval・安全な target workspace・未解決 human gate なし・standing merge authority が揃う場合、Orchestrator は merge / validation / close / cleanup まで進む。
 
 ## 要件
 
@@ -44,9 +45,18 @@ Ticket backend をすぐに Git 外 store へ移行するのではなく、ま�
   - Orchestrator `pwd` は orchestration worktree。
   - implementation worktree root は original workspace root の `.worktree`。
 - `worktree-workflow` / `multi-agent-workflow` / Orchestrator routing guidance を更新し、implementation worktree を Orchestrator `pwd` 相対に作らないようにする。
+- Orchestrator merge guidance を更新し、reviewer approve 後に必要条件が揃っている場合は merge-ready dossier で止まらず merge / post-merge validation / Ticket close or done transition / worktree cleanup まで進めるようにする。
+  - `resources/prompts/ticket_role/orchestrator_worktree_routing.md` の `Stop at a merge-ready dossier` 系の抑制を checkpoint 表現に変更する。
+  - `resources/prompts/ticket_role/orchestrator_merge_completion.md` に、dogfooding/workspace standing merge authority がある場合の自動継続条件を明記する。
+  - `.yoi/workflow/multi-agent-workflow.md` の approve 後 merge/validate/close/cleanup 方針と role prompt を矛盾させない。
+  - `resources/prompts/common/pod-orchestration.md` の一般安全則は維持し、Pod tool があるだけでは authority にならないことと、authorized Orchestrator workflow による merge-completion を区別する。
 - Implementation worktree creation は sibling layout を使う。
   - `<original-workspace-root>/.worktree/<ticket-or-task>`。
   - orchestration branch から nested/descendant branch を切らない。
+- merge target workspace / target branch を Orchestrator `pwd` と分離して明示する。
+  - Orchestrator `pwd` は orchestration worktree。
+  - implementation branch/worktree は original workspace root 配下の sibling worktree。
+  - merge / post-merge validation は configured target workspace / target branch で行う。
 - Orchestrator 専用 worktree の Ticket record churn を main workspace にいつ・何を publish するかは、この Ticket では最小方針を定義する。
   - 少なくとも active queue / in-progress coordination は main workspace に即時反映しない。
   - resolution / important decision / final report を publish するかどうかは後続または明示操作にできる。
@@ -65,6 +75,8 @@ Ticket backend をすぐに Git 外 store へ移行するのではなく、ま�
 - implementation branch に orchestration branch の Ticket churn が混ざらないことが設計上説明されている。
 - Panel/launcher 側で Orchestrator の cwd / ticket backend root / original workspace root の扱いがテスト可能な形になっている。
 - 既存の coder/reviewer delegation、worktree cleanup、merge-ready dossier 運用が新 layout と矛盾しない。
+- reviewer approval 済みで blocker / human gate が残っておらず、standing merge authority と safe target workspace が確認できる場合、Orchestrator guidance は dossier stop ではなく merge-completion 継続を促す。
+- merge-completion guidance は target workspace / target branch / post-merge validation / Ticket lifecycle transition / worktree and branch cleanup の実行場所を明確にしている。
 - targeted tests または workflow-level validation が追加・更新されている。
 - `target/debug/yoi ticket doctor` が通る。
 
@@ -72,6 +84,7 @@ Ticket backend をすぐに Git 外 store へ移行するのではなく、ま�
 
 - Ticket backend を SQLite/JSONL など Git 外 store に移行すること。
 - Git を使わない orchestration storage を新規設計すること。
-- Orchestrator が implementation branch を自動 merge / push すること。
+- Orchestrator が push すること。
+- authority・reviewer approval・safe target workspace・未解決 human gate なしを確認せずに merge すること。
 - main workspace の project record publication policy を完全に解くこと。
 - 既存 `.yoi/tickets` の履歴を大規模に移行・rewrite すること。
