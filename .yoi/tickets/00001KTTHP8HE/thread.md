@@ -256,3 +256,105 @@ Validation run by reviewer:
 - `nix build .#yoi --no-link` passed.
 
 ---
+
+<!-- event: review author: orchestrator at: 2026-06-11T08:14:15Z status: approve -->
+
+## Review: approve
+
+Main-branch review/merge-completion approval.
+
+Verified before merge:
+- Merge target matched branch `panel-orchestration-worktree`, worktree `.worktree/panel-orchestration-worktree`, and implementation commit `00e11b3d`.
+- Branch-local reviewer `reviewer-panel-orchestration-worktree` approved after unsafe-reuse blocker fixes.
+- Main workspace was clean before merge.
+- User has standing authorization to proceed through merge-completion when reviewer approval and safety checks pass.
+
+Merged:
+- `git merge --no-ff panel-orchestration-worktree -m "merge: panel orchestration worktree"`
+- Merge commit: `735b0c04 merge: panel orchestration worktree`
+
+Post-merge validation:
+- `cargo fmt --check` passed.
+- `cargo test -p tui orchestration --lib` passed.
+- `cargo test -p tui existing_ --lib` passed.
+- `cargo test -p tui inherited_parent_worktree_directory_is_rejected_without_cleanup --lib` passed.
+- `cargo test -p client ticket_role --lib` passed.
+- `git diff --check` passed.
+- `target/debug/yoi ticket doctor` passed.
+- typed `TicketDoctor` reported 0 errors and 3 pre-existing diagnostics.
+- `nix build .#yoi` passed.
+
+Result: approve.
+
+---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-11T08:14:15Z from: inprogress to: done reason: merged_and_validated field: state -->
+
+## State changed
+
+Merged branch `panel-orchestration-worktree` with merge commit `735b0c04`; branch-local reviewer approved after unsafe-reuse fixes and post-merge validation passed (`cargo fmt --check`, `cargo test -p tui orchestration --lib`, `cargo test -p tui existing_ --lib`, `cargo test -p tui inherited_parent_worktree_directory_is_rejected_without_cleanup --lib`, `cargo test -p client ticket_role --lib`, `git diff --check`, `target/debug/yoi ticket doctor`, typed `TicketDoctor` 0 errors / 3 pre-existing diagnostics, `nix build .#yoi`).
+
+---
+
+<!-- event: state_changed author: hare at: 2026-06-11T08:14:37Z from: done to: closed reason: closed field: state -->
+
+## State changed
+
+Ticket を closed にしました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-06-11T08:14:37Z status: closed -->
+
+## 完了
+
+完了しました。
+
+実施内容:
+- Panel Orchestrator spawn path で、original workspace root 配下に専用 orchestration worktree を自動作成・再利用するようにしました。
+  - path: `<original-workspace-root>/.worktree/orchestration/<workspace-orchestrator-pod-name>`
+  - branch: `orchestration/<workspace-orchestrator-pod-name>`
+- clean な既存 orchestration Git worktree は reuse します。
+- unsafe state は削除せず diagnostic で拒否します。
+  - path が directory でない
+  - Git worktree でない
+  - expected branch でない
+  - original workspace と Git common dir が異なる
+  - inherited parent worktree で expected path 自体が worktree top-level でない
+  - dirty orchestration worktree
+- Orchestrator の `SpawnConfig.workspace_root` は orchestration worktree root になります。
+- `TicketRoleLaunchContext` には original workspace root / target workspace root を渡し、prompt 上でも original / implementation / target roots が見える形を維持します。
+- Panel diagnostic に created/reused worktree path/branch または failure reason を出すようにしました。
+- tests を追加・更新しました。
+  - stable layout naming
+  - root population
+  - invalid existing path no-cleanup
+  - create/reuse
+  - dirty reuse refusal
+  - wrong branch refusal
+  - unrelated repo refusal
+  - inherited parent worktree refusal
+  - existing client prompt/spawn root behavior
+
+Merge:
+- Branch: `panel-orchestration-worktree`
+- Implementation commit: `00e11b3d feat: launch orchestrator from worktree`
+- Merge commit: `735b0c04 merge: panel orchestration worktree`
+
+確認:
+- Branch-local reviewer `reviewer-panel-orchestration-worktree` が2回 request_changes 後、修正済み branch を approve。
+- `cargo fmt --check` passed。
+- `cargo test -p tui orchestration --lib` passed。
+- `cargo test -p tui existing_ --lib` passed。
+- `cargo test -p tui inherited_parent_worktree_directory_is_rejected_without_cleanup --lib` passed。
+- `cargo test -p client ticket_role --lib` passed。
+- `git diff --check` passed。
+- `target/debug/yoi ticket doctor` passed。
+- typed `TicketDoctor` は 0 errors / 3 pre-existing diagnostics。
+- `nix build .#yoi` passed。
+
+残作業:
+- なし。今後の改善として、Panel 表示上の orchestration worktree status をより詳細に常時表示することは follow-up として扱えます。
+
+---
