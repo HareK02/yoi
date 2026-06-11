@@ -36,3 +36,7 @@ Notifications are hints to inspect state. They are not proof of completion.
 Unless explicitly authorized otherwise, final merge, cleanup, design-boundary decisions, and ticket closure remain the orchestrator/human responsibility.
 
 Child Pods may commit in delegated worktrees when the workflow allows it, but the merge-ready dossier should make the final decision auditable from repository records.
+
+## Public and dogfood workflow split
+
+Public builtin workflow candidates and this repository's dogfood-specific workflow mechanics are tracked in `docs/design/workflows-public-dogfood-split.md`.
