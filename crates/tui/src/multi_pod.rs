@@ -1769,6 +1769,35 @@ fn ensure_orchestration_worktree(
     })
 }
 
+fn prepare_orchestration_worktree_for_restore(
+    workspace_root: &Path,
+) -> Result<OrchestrationWorktreeReady, String> {
+    let layout = orchestration_worktree_layout(workspace_root);
+    if !layout.path.exists() {
+        return Err(format!(
+            "orchestration worktree is missing; cannot restore existing Pod state: {}",
+            layout.path.display()
+        ));
+    }
+    if !layout.path.is_dir() {
+        return Err(format!(
+            "orchestration worktree path exists but is not a directory: {}",
+            layout.path.display()
+        ));
+    }
+    if !git_inside_worktree(&layout.path) {
+        return Err(format!(
+            "orchestration worktree path exists but is not a Git worktree: {}",
+            layout.path.display()
+        ));
+    }
+    validate_existing_orchestration_worktree(workspace_root, &layout)?;
+    Ok(OrchestrationWorktreeReady {
+        layout,
+        status: OrchestrationWorktreeStatus::Reused,
+    })
+}
+
 fn validate_existing_orchestration_worktree(
     workspace_root: &Path,
     layout: &OrchestrationWorktreeLayout,
@@ -1964,17 +1993,35 @@ async fn orchestrator_lifecycle(
             OrchestratorPanelState::new(pod_name, OrchestratorPanelStatus::Live, None),
         ),
         OrchestratorLifecyclePlan::Restore => {
-            match restore_orchestrator_pod(workspace_root, &pod_name, runtime_command.clone()).await
-            {
-                Ok(()) => OrchestratorLifecycleReport::with_state(OrchestratorPanelState::new(
-                    pod_name,
-                    OrchestratorPanelStatus::Restored,
-                    Some("restored existing Pod state".to_string()),
-                ))
-                .mark_reload(),
+            match prepare_orchestration_worktree_for_restore(workspace_root) {
+                Ok(worktree) => {
+                    match restore_orchestrator_pod(
+                        &worktree.layout.path,
+                        &pod_name,
+                        runtime_command.clone(),
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            OrchestratorLifecycleReport::with_state(OrchestratorPanelState::new(
+                                pod_name,
+                                OrchestratorPanelStatus::Restored,
+                                Some(format!(
+                                    "restored existing Pod state in orchestration worktree {}",
+                                    worktree.layout.path.display()
+                                )),
+                            ))
+                            .mark_reload()
+                        }
+                        Err(error) => OrchestratorLifecycleReport::unavailable(
+                            pod_name,
+                            format!("could not restore workspace Orchestrator: {error}"),
+                        ),
+                    }
+                }
                 Err(error) => OrchestratorLifecycleReport::unavailable(
                     pod_name,
-                    format!("could not restore workspace Orchestrator: {error}"),
+                    format!("could not prepare orchestration worktree for restore: {error}"),
                 ),
             }
         }
@@ -3527,6 +3574,27 @@ mod tests {
         let err = ensure_orchestration_worktree(&root).unwrap_err();
         assert!(err.contains("dirty"));
         assert!(created.layout.path.join("dirty.txt").exists());
+    }
+
+    #[test]
+    fn restore_uses_existing_orchestration_worktree_even_when_dirty() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("repo");
+        init_test_repo(&root);
+        let created = ensure_orchestration_worktree(&root).unwrap();
+        std::fs::write(created.layout.path.join("orchestrator-notes.txt"), "dirty").unwrap();
+
+        let restored = prepare_orchestration_worktree_for_restore(&root).unwrap();
+
+        assert_eq!(restored.status, OrchestrationWorktreeStatus::Reused);
+        assert_eq!(restored.layout.path, created.layout.path);
+        assert_ne!(restored.layout.path, root);
+        assert!(
+            restored
+                .layout
+                .path
+                .ends_with(".worktree/orchestration/repo-orchestrator")
+        );
     }
 
     #[test]

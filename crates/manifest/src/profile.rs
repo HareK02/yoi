@@ -618,11 +618,11 @@ fn resolve_lua_profile_value(
         },
         model: profile.model.unwrap_or_default(),
         worker: profile.worker.unwrap_or_default(),
-        scope: profile_scope_to_config(profile.scope, workspace_base),
+        scope: profile_scope_to_config(profile.scope, workspace_base)?,
         delegation_scope: profile_delegation_scope_to_config(
             profile.delegation_scope,
             workspace_base,
-        ),
+        )?,
         session: profile.session,
         permissions: profile.permissions,
         feature: profile.feature,
@@ -699,8 +699,15 @@ struct ProfileConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 enum ProfileScopeConfig {
-    Intent { intent: ProfileScopeIntent },
+    Table(ProfileScopeTable),
     String(ProfileScopeIntent),
+}
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProfileScopeTable {
+    intent: ProfileScopeIntent,
+    #[serde(default)]
+    deny_write: Vec<PathBuf>,
 }
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1128,21 +1135,44 @@ fn scope_module(lua: &Lua) -> mlua::Result<Table> {
     let t = lua.create_table()?;
     t.set(
         "workspace_write",
-        lua.create_function(|lua, ()| {
-            let v = lua.create_table()?;
-            v.set("intent", "workspace_write")?;
-            Ok(v)
+        lua.create_function(|lua, options: LuaValue| {
+            scope_intent_table(lua, "workspace_write", options)
         })?,
     )?;
     t.set(
         "workspace_read",
-        lua.create_function(|lua, ()| {
-            let v = lua.create_table()?;
-            v.set("intent", "workspace_read")?;
-            Ok(v)
+        lua.create_function(|lua, options: LuaValue| {
+            scope_intent_table(lua, "workspace_read", options)
         })?,
     )?;
     Ok(t)
+}
+fn scope_intent_table(lua: &Lua, intent: &str, options: LuaValue) -> mlua::Result<Table> {
+    let v = lua.create_table()?;
+    v.set("intent", intent)?;
+    match options {
+        LuaValue::Nil => {}
+        LuaValue::Table(options) => {
+            for pair in options.pairs::<String, LuaValue>() {
+                let (key, value) = pair?;
+                match key.as_str() {
+                    "deny_write" => v.set("deny_write", value)?,
+                    other => {
+                        return Err(mlua::Error::RuntimeError(format!(
+                            "unsupported yoi.scope option `{other}`"
+                        )));
+                    }
+                }
+            }
+        }
+        other => {
+            return Err(mlua::Error::RuntimeError(format!(
+                "yoi.scope.{intent} options must be a table, got {}",
+                other.type_name()
+            )));
+        }
+    }
+    Ok(v)
 }
 
 fn validate_module_name(name: &str) -> Result<(), String> {
@@ -1250,47 +1280,61 @@ fn reject_absolute_auth_file(
 fn profile_scope_to_config(
     scope: Option<ProfileScopeConfig>,
     workspace_base: &Path,
-) -> ScopeConfig {
+) -> Result<ScopeConfig, ProfileError> {
     profile_scope_intent_to_config(
         scope,
         workspace_base,
         Some(ProfileScopeIntent::WorkspaceWrite),
+        "scope",
     )
 }
 
 fn profile_delegation_scope_to_config(
     scope: Option<ProfileScopeConfig>,
     workspace_base: &Path,
-) -> ScopeConfig {
-    profile_scope_intent_to_config(scope, workspace_base, None)
+) -> Result<ScopeConfig, ProfileError> {
+    profile_scope_intent_to_config(scope, workspace_base, None, "delegation_scope")
 }
 
 fn profile_scope_intent_to_config(
     scope: Option<ProfileScopeConfig>,
     workspace_base: &Path,
     default_intent: Option<ProfileScopeIntent>,
-) -> ScopeConfig {
-    let intent = match scope {
-        Some(ProfileScopeConfig::Intent { intent }) | Some(ProfileScopeConfig::String(intent)) => {
-            Some(intent)
-        }
-        None => default_intent,
+    field: &'static str,
+) -> Result<ScopeConfig, ProfileError> {
+    let (intent, deny_write) = match scope {
+        Some(ProfileScopeConfig::Table(table)) => (Some(table.intent), table.deny_write),
+        Some(ProfileScopeConfig::String(intent)) => (Some(intent), Vec::new()),
+        None => (default_intent, Vec::new()),
     };
     let Some(intent) = intent else {
-        return ScopeConfig::default();
+        return Ok(ScopeConfig::default());
     };
     let permission = match intent {
         ProfileScopeIntent::WorkspaceRead => Permission::Read,
         ProfileScopeIntent::WorkspaceWrite => Permission::Write,
     };
-    ScopeConfig {
+    let mut deny = Vec::new();
+    for path in deny_write {
+        if path.is_absolute() {
+            return Err(ProfileError::InvalidProfile(format!(
+                "field `{field}.deny_write` must be workspace-relative in reusable Profiles"
+            )));
+        }
+        deny.push(ScopeRule {
+            target: workspace_base.join(path),
+            permission: Permission::Write,
+            recursive: true,
+        });
+    }
+    Ok(ScopeConfig {
         allow: vec![ScopeRule {
             target: workspace_base.to_path_buf(),
             permission,
             recursive: true,
         }],
-        deny: Vec::new(),
-    }
+        deny,
+    })
 }
 fn profile_compaction_to_partial(
     value: Option<serde_json::Value>,
@@ -1565,7 +1609,10 @@ mod tests {
         assert!(!companion.feature.task.enabled);
         assert!(!companion.feature.pods.enabled);
         assert!(!companion.feature.ticket.enabled);
-        assert_eq!(companion.scope.allow[0].permission, Permission::Read);
+        assert_eq!(companion.scope.allow[0].permission, Permission::Write);
+        assert_eq!(companion.scope.deny.len(), 1);
+        assert_eq!(companion.scope.deny[0].permission, Permission::Write);
+        assert_eq!(companion.scope.deny[0].target, tmp.path().join(".worktree"));
         assert_eq!(companion.model.ref_.as_deref(), Some("codex-oauth/gpt-5.5"));
         assert!(companion.web.is_some());
 

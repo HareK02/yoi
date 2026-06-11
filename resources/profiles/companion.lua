@@ -2,7 +2,9 @@ return yoi.profile.extend("builtin:default", {
     slug = "companion",
     description = "Companion role profile with bundled reusable policy",
 
-    scope = yoi.scope.workspace_read(),
+    scope = yoi.scope.workspace_write({
+        deny_write = { ".worktree" },
+    }),
 
     feature = {
         task = { enabled = false },
