@@ -1,8 +1,8 @@
 ---
 title: "Define commit policy for Ticket state changes from Intake and Panel"
-state: "planning"
+state: 'closed'
 created_at: "2026-06-07T22:06:06Z"
-updated_at: "2026-06-07T22:06:06Z"
+updated_at: '2026-06-11T08:08:44Z'
 ---
 
 ## Background
