@@ -1,8 +1,8 @@
 ---
 title: "Builtin Workflow and Knowledge resources"
-state: "planning"
+state: 'ready'
 created_at: "2026-06-07T07:27:08Z"
-updated_at: "2026-06-07T07:27:08Z"
+updated_at: '2026-06-11T07:56:31Z'
 ---
 
 ## Background
