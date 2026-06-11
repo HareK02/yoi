@@ -1,127 +1,120 @@
 ---
-title: "Prevent idle starvation in Ticket orchestration planning"
+title: "Orchestrator Idle 時の queued Ticket 見落としを防ぐ"
 state: 'ready'
 created_at: "2026-06-08T06:12:35Z"
-updated_at: '2026-06-09T11:35:29Z'
+updated_at: '2026-06-11T14:51:19Z'
 ---
 
-## Background
+## 背景
 
-The current Panel Queue automation mostly handles the transition-time event:
+現在の Panel Queue automation は、主に次の遷移タイミングのイベントを扱っている。
 
 ```text
 ready -> queued
-  -> notify workspace Orchestrator
+  -> workspace Orchestrator に通知
 ```
 
-That is not enough for robust orchestration. Queued Tickets can remain after missed notifications, Orchestrator restarts, planning returns, capacity limits, or multi-ticket coordination. The Orchestrator also needs a lightweight way to remember planned queued work across turns without relying only on session memory.
+これだけでは、安定した orchestration には足りない。通知漏れ、Orchestrator restore/spawn、planning への差し戻し、capacity 制限、複数 Ticket の調整などにより、`queued` Ticket が残り続けることがある。
 
-There is an existing related Ticket:
+ただし、この Ticket は常時 polling する scheduler を作るものではない。目的は、実行可能な queued work があり、Orchestrator Pod の state が `Idle` で、`active_inprogress` が導出されていないときにだけ、bounded な work set を渡して starvation を防ぐことである。
 
-- `ticket-orchestration-plan-tool`
+## ゴール
 
-That Ticket asks for a TaskStore-like surface for Ticket ordering/dependency/conflict/capacity/accepted-plan records. This Ticket folds that need together with queued-backlog re-kick semantics into a narrower operational requirement:
+Orchestrator が `queued` work を見落とさず、かつ `active_inprogress` が導出されている間に無駄な re-kick を繰り返さないための **session-lifetime work set discovery / re-kick policy** を実装する。
 
-> If runnable queued work exists and the Orchestrator is otherwise idle, the system should not wait indefinitely for another user instruction. The Orchestrator should be kicked with a bounded work set so it can either incorporate new queued work into the plan or start the next planned queued Ticket.
+Orchestrator Pod の state が `Idle` で、進められる work が存在する場合は、bounded attention により次の inspection または acceptance/routing に進める。一方で、implementation side effects は必ず `queued -> inprogress` acceptance の記録後に限定し、blind spawn や duplicate start を起こさない。
 
-This is starvation prevention and explicit work-set planning, not a constant background scheduler loop.
+runtime 側で kick 可能かを見る判定は、Orchestrator Pod の state が `Idle` であることに限定する。re-kick を抑制するかどうかは、session-lifetime work set、role/session claims、visible Pod/worktree state から `active_inprogress` の有無として導出する。
 
-## Goal
+## 現在の前提
 
-Implement an Orchestrator attention/re-kick policy and planning store for active Ticket work: distinguish new queued work from planned queued work and accepted in-progress work, persist the plan, and kick the Orchestrator only when work can progress and no active Orchestrator-managed operation is already being waited on.
+- authoritative な Ticket lifecycle は frontmatter の `state` で表す。
+- `new_queued` / `planned_queued` / `active_inprogress` は新しい core Ticket state ではなく、現在の Ticket `state`、session-lifetime work set、role/session claims、visible Pod/worktree state から導出する分類として扱う。
+- work set は Task と同じく session-lifetime の runtime state として扱い、Ticket ごとの durable artifact log として積まない。
+- work set が失われた場合でも、Ticket `state = queued` から `new_queued` として再検出できればよい。失われた session-level ordering / waiting reason は再 inspection で作り直す。
+- Panel / lifecycle hook は Orchestrator に attention / kick を与えてよいが、unattended scheduler loop や常時 polling にはしない。
+- `queued` は Orchestrator が routing / start-if-unblocked を検討できる状態であり、実装・Pod spawn・worktree 作成などの side effect は `queued -> inprogress` 記録後に限る。
 
-## Planning model
+## Work-set classification
 
-The OrchestrationPlan store should distinguish at least:
+実装上は少なくとも次の区別を導出できるようにする。
 
-- `new_queued`: Tickets with `workflow_state = queued` that have not yet been incorporated into the OrchestrationPlan.
-- `planned_queued`: queued Tickets that the Orchestrator has considered and placed into an explicit plan/order/waiting set, but has not yet accepted as `inprogress`.
-- `inprogress`: Tickets accepted by the Orchestrator and currently awaiting worktree/coder/reviewer/planning-sync/merge/cleanup progress.
+- `new_queued`: Ticket `state = queued` だが、現在の Orchestrator session work set にまだ取り込まれていない Ticket。
+- `planned_queued`: Orchestrator が確認し、session work set の order / waiting set に置いたが、まだ `inprogress` として acceptance していない queued Ticket。
+- `active_inprogress`: Orchestrator が acceptance 済みで、coder/reviewer/planning-sync/merge/cleanup などの delegated step の完了待ちとして記録・観測できる Ticket。
+- `actionable_inprogress`: `inprogress` だが、次の action が delegated step の完了待ちではなく、Orchestrator の routing/判断/記録を必要とする Ticket。
 
-The names do not need to become final public API names, but the state distinction is required.
+この分類の名前は内部実装名として固定しなくてよいが、意味上の区別は必要である。
 
-## Requirements
+## 要件
 
-### Active work set discovery / re-kick
+### Work set discovery / re-kick
 
-- Provide a mechanism to identify Tickets that need Orchestrator attention, including at least:
-  - `workflow_state = queued` Tickets not yet present in the OrchestrationPlan (`new_queued`);
-  - planned queued Tickets that are not blocked/capacity-limited and can be started when there is no active in-progress work;
-  - `workflow_state = inprogress` Tickets accepted by Orchestrator whose next action is not merely waiting for an active coder/reviewer/planning-sync/merge step;
-  - queued Tickets left behind after Orchestrator restart, missed notification, or previous capacity stop.
-- On Panel open/Orchestrator restore/spawn, or explicit user action, surface a bounded work list to the Orchestrator when there is actionable work.
-- Avoid unbounded background polling. Prefer explicit events, Panel lifecycle kick, and explicit user/Orchestrator actions.
-- Prevent duplicate starts: re-kick should prompt inspection/planning or acceptance of the next planned item, not blindly start coder Pods.
+- Orchestrator attention が必要な Ticket を、少なくとも次の情報から導出する。
+  - Ticket frontmatter の `state`。
+  - Orchestrator session-lifetime work set。
+  - role/session claims。
+  - visible Pod/worktree state。
+- Panel open、Orchestrator restore/spawn、明示的な user action などの境界で、actionable work がある場合に bounded work list を Orchestrator へ提示できるようにする。
+- 無制限な background polling は避ける。明示イベント、Panel lifecycle kick、明示 user/Orchestrator action を優先する。
+- duplicate start を防ぐ。re-kick は inspection または次の planned item の acceptance を促すものであり、coder Pod を blind spawn しない。
 
 ### Re-kick / starvation-prevention semantics
 
-- If `new_queued` work exists and the Orchestrator is idle/not occupied by an active in-progress operation, kick or notify the Orchestrator so it can incorporate those Tickets into the plan.
-- If no active `inprogress` work exists and runnable `planned_queued` work exists, kick or notify the Orchestrator so it can accept/start the next planned Ticket rather than waiting indefinitely for user instruction.
-- If active `inprogress` work exists and the next expected event is coder/reviewer/planning-sync/merge completion, do not re-kick merely because queued/planned queued work also exists.
-- If planned queued work is blocked, dependency-waiting, conflict-waiting, or capacity-limited, record the reason so the Panel/user can see why nothing starts.
-- A re-kick is an attention signal plus bounded context, not authority to bypass `queued -> inprogress` acceptance or spawn implementation Pods without inspection.
+- `new_queued` work が存在し、Orchestrator Pod の state が `Idle` の場合、Orchestrator に kick/notify して inspection と session work set への取り込みを促す。
+- `active_inprogress` が導出されず、Orchestrator Pod の state が `Idle` で、unblocked かつ capacity/policy 上開始可能な `planned_queued` work がある場合、Orchestrator に kick/notify して次の Ticket の acceptance/routing に進める。
+- `active_inprogress` が導出されている場合、queued/planned queued work が存在するだけでは re-kick しない。
+- `planned_queued` work を開始しない理由が dependency / conflict / dirty workspace / capacity / human gate 等で説明できる場合は、session work set 上の bounded waiting/blocking reason として保持する。
+- re-kick は attention signal と bounded context であり、`queued -> inprogress` acceptance や inspection を迂回する authority ではない。
 
-### Orchestration plan record
+### Session work set semantics
 
-- Provide or define a TaskStore-like but Ticket-domain planning surface for Orchestrator use.
-- The plan should be scoped to Ticket orchestration and support records such as:
-  - current active target set;
-  - state bucket: `new_queued` / `planned_queued` / `inprogress` or equivalent;
-  - ordering: Ticket A before Ticket B;
-  - dependency/blocker: A blocks B / B blocked by A;
-  - conflict: do not run A and B in parallel;
-  - capacity/waiting notes;
-  - accepted work plan: worktree/branch/coder/reviewer plan;
-  - current next action for each target.
-- Distinguish durable project-relevant routing decisions from local runtime/session claims.
-  - Project-relevant decisions should live in Ticket records/thread/artifacts or a typed Ticket orchestration record under project authority.
-  - Local Pod/session claims remain in the local role session registry.
-- Records should survive compaction and be queryable by Ticket id/slug and relation kind.
-- Keep the first version lightweight; do not implement a full scheduler/graph solver.
+Orchestrator は、意味のある routing 境界で session work set を更新する。
 
-### Plan update semantics
+- new queued work を確認し、session work set に取り込んだとき。
+- `queued -> inprogress` acceptance を記録したとき。
+- `inprogress` Ticket の次の action が delegated step 待ちか、Orchestrator action かを判断したとき。
+- capacity stop により planned queued / waiting と reason を残すとき。
+- merge-ready / done に到達し、`active_inprogress` が導出されなくなったため次の planned queued Ticket を検討するとき。
 
-- The Orchestrator should update the plan at meaningful routing boundaries:
-  - new queued work incorporated into the plan;
-  - queued -> inprogress acceptance;
-  - inprogress -> blocked/waiting/planning/done;
-  - capacity stop -> leave planned queued/waiting with reason;
-  - merge-ready/done -> mark complete and consider the next planned queued Ticket if no active work remains.
-- Each update should produce a bounded, inspectable record of:
-  - what was considered;
-  - what was incorporated into the plan;
-  - what was accepted/started;
-  - what was blocked/deferred/returned to planning;
-  - what remains planned queued/waiting.
-- Re-kick should use the current plan/work set so the Orchestrator does not forget leftover queued Tickets between turns.
+session work set は bounded で、Orchestrator の現在 session における判断補助として扱う。
 
-### Relationship to existing work
+- 何を取り込んだか。
+- 次に acceptance / routing すべき候補は何か。
+- 何を waiting としたか。
+- waiting の理由は何か。
+- `active_inprogress` として re-kick を抑制する対象は何か。
 
-- This Ticket should either subsume or update `ticket-orchestration-plan-tool` so there is one coherent plan/re-kick design.
-- It should coordinate with:
-  - `replace-intake-state-with-planning` as a prerequisite that defines the planning lane before this plan/re-kick layer builds on it;
-  - `panel-close-done-tickets` for done -> closed handling;
-  - local role session registry for active Pod/session ownership;
-  - direct/delegation authority work for actual child Pod spawning.
+これらは project-level の永続ログではなく、Task と同様に session lifetime の状態でよい。ユーザー判断や Ticket lifecycle に残すべき内容が生じた場合だけ、Ticket comment / state transition / resolution など既存の durable surface に記録する。
 
-## Non-requirements
+## 非目標
 
-- Do not turn the Panel itself into the scheduler.
-- Do not auto-start unqueued Tickets.
-- Do not re-kick continuously while active coder/reviewer/planning-sync/merge work is already in progress.
-- Do not blindly spawn coder Pods from re-kick without Orchestrator inspection and `queued -> inprogress` acceptance.
-- Do not implement a full dependency graph solver in the first version.
+- Panel 自体を scheduler にすること。
+- `queued` になっていない Ticket を自動開始すること。
+- `active_inprogress` が導出されている間に継続的な re-kick を行うこと。
+- Orchestrator の inspection と `queued -> inprogress` acceptance なしに coder/reviewer Pod を spawn すること。
+- full dependency graph solver を最初の実装で作ること。
+- `new_queued` / `planned_queued` / `active_inprogress` を core Ticket state として追加すること。
+- volatile な orchestration work set を Ticket ごとの durable artifact log として保存すること。
 
-## Acceptance criteria
+## 受け入れ条件
 
-- The system can distinguish new queued work, planned queued work, and accepted in-progress work.
-- New queued Tickets are not left unnoticed while the Orchestrator is otherwise idle.
-- Runnable planned queued Tickets are not left unstarted when there is no active in-progress work and capacity/policy allows progress.
-- The system does not re-kick merely because queued/planned work exists while Orchestrator-managed in-progress work is waiting on coder/reviewer/planning-sync/merge completion.
-- Missed/stale queued Tickets can be surfaced to the Orchestrator without requiring the user to manually requeue each one.
-- The Orchestrator can record and query a lightweight Ticket orchestration plan covering active targets, order/dependency/conflict/capacity, state bucket, and next actions.
-- Plan records survive compaction and do not rely solely on session-lifetime TaskStore state.
-- Re-kick/plan updates leave an auditable record of what was incorporated, started, blocked, returned to planning, or left waiting.
-- Duplicate implementation starts are prevented by consulting current Ticket state, local role/session claims, and plan records.
-- Relevant workflows/prompts/docs are updated.
-- Focused tests, `target/debug/yoi ticket doctor`, `cargo fmt --check`, and `git diff --check` pass.
+- Orchestrator Pod の state が `Idle` のとき、`new_queued` work を検出して bounded work-list attention または session work set への取り込みに進める。
+- `active_inprogress` が導出されず、Orchestrator Pod の state が `Idle` で、`planned_queued` work が unblocked かつ capacity/policy 上開始可能なとき、Orchestrator が次の acceptance/routing を行える。
+- `active_inprogress` が導出されている間は、queued/planned work の存在だけで re-kick しない。
+- 開始しない `planned_queued` work には、session work set 上でユーザーに提示できる bounded waiting/blocking reason が残る。
+- 既存の human gate、`queued -> inprogress` acceptance step、dirty-workspace/dependency/conflict/capacity checks を迂回しない。
+- Ticket state、session work set、role/session claims、visible Pod/worktree state を確認し、duplicate Orchestrator/coder/reviewer/worktree start を起こさない。
+- missed/stale queued Tickets を、ユーザーが手で再 queue しなくても Orchestrator に提示できる。
+- Orchestrator session work set を失っても、`queued` Ticket を再検出して安全に再 inspection できる。
+
+## 検証
+
+- `nix build .#yoi` を通す。
+- Ticket / panel / orchestrator routing 周辺の既存テストまたは追加テストで、少なくとも次の主要分岐を確認する。
+  - Orchestrator Pod `Idle` state での queued detection。
+  - `active_inprogress` 導出時の re-kick suppression。
+  - session work set 上の waiting reason 保持。
+  - duplicate-start prevention。
+  - session work set が空でも `queued` Ticket から再検出できること。
+- 実装報告では、work-set classification に使った情報と、implementation side effects が `queued -> inprogress` 後に限定されていることを明示する。
