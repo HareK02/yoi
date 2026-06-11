@@ -1,9 +1,11 @@
 ---
 title: 'Project workflowsをpublic builtinとdogfood運用に分離する'
-state: 'ready'
+state: 'inprogress'
 created_at: '2026-06-10T11:16:30Z'
-updated_at: '2026-06-10T11:18:55Z'
+updated_at: '2026-06-11T02:24:22Z'
 assignee: null
+queued_by: 'workspace-panel'
+queued_at: '2026-06-11T02:23:39Z'
 ---
 
 ## 背景
