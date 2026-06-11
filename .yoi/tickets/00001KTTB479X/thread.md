@@ -97,3 +97,33 @@ IntentPacket:
 - Validation: focused tests for launcher/worktree context and prompt/workflow text where practical, `cargo fmt --check`, `git diff --check`, `target/debug/yoi ticket doctor`, and `nix build .#yoi`.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-11T04:46:32Z -->
+
+## Implementation report
+
+Implementation report
+
+Branch/worktree: `orchestrator-worktree-layout` / `.worktree/orchestrator-worktree-layout`
+Commit:
+- `834caba2 feat: track orchestration workspace roots`
+
+Summary:
+- Added `docs/design/orchestrator-worktree-layout.md` to record the four-root model: `role_workspace_root`, `original_workspace_root`, `implementation_worktree_root`, and `merge_target_workspace_root`.
+- Extended `TicketRoleLaunchContext` / `TicketRoleLaunchPlan` with original/target workspace roots and derived implementation worktree root.
+- Orchestrator launch prompts now emit a `Workspace routing context` section so the model-visible task can distinguish the role runtime/Ticket backend root from original implementation and merge target roots.
+- Updated Orchestrator worktree-routing and merge-completion prompt resources so implementation worktrees are created under the recorded original workspace root and merge/cleanup runs against the recorded target workspace, not accidental process cwd.
+- Updated `worktree-workflow` to use `<original-workspace-root>/.worktree/<task-name>` and `git -C <original-workspace-root> ...` instead of assuming the Orchestrator cwd is the repository root.
+- Adjusted client Ticket-role prompt tests to cover workspace routing context and standing merge-completion authority behavior.
+
+Validation run in branch:
+- `cargo fmt --check` passed.
+- `cargo test -p client ticket_role --lib` passed (18 passed).
+- `git diff --check` passed.
+- `/home/hare/Projects/yoi/target/debug/yoi ticket doctor` passed.
+- `nix build .#yoi` passed.
+
+Notes:
+- Panel/workspace orchestration can later populate `original_workspace_root` and `target_workspace_root` when launching an Orchestrator from a dedicated worktree. This branch adds the plan/prompt plumbing and workflow policy without changing Ticket storage backend authority or introducing Git-external project records.
+
+---
