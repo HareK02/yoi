@@ -127,3 +127,51 @@ Notes:
 - Panel/workspace orchestration can later populate `original_workspace_root` and `target_workspace_root` when launching an Orchestrator from a dedicated worktree. This branch adds the plan/prompt plumbing and workflow policy without changing Ticket storage backend authority or introducing Git-external project records.
 
 ---
+
+<!-- event: review author: reviewer-orchestrator-worktree-layout at: 2026-06-11T04:53:40Z status: request_changes -->
+
+## Review: request changes
+
+Branch-local review verdict: request_changes
+
+Blocker:
+- `.yoi/workflow/multi-agent-workflow.md` still contradicts the new root model. It still instructs creating `./.worktree/<task-name>` relative to Orchestrator cwd and frames read/write authority, orchestration authority, merge, validation, and lifecycle around `main workspace` instead of recorded original/target workspace roots. Because this workflow is advertised/resident and referenced by the updated Orchestrator prompt, it can reintroduce old behavior despite the updated `worktree-workflow`.
+
+Non-blocking notes:
+- `TicketRoleLaunchContext` / `TicketRoleLaunchPlan` root plumbing is directionally correct and generated Orchestrator prompt output exposes `role_workspace_root`, `original_workspace_root`, `implementation_worktree_root`, and `merge_target_workspace_root`.
+- Production callers still construct `TicketRoleLaunchContext::new(workspace_root, TicketRole::Orchestrator)` without supplying distinct original/target roots. This can be a follow-up boundary, but the branch is not a complete dedicated-orchestration-worktree launch path yet.
+- Tests cover new prompt wording and standing merge-completion wording, but should more strongly assert plan field values and that `SpawnConfig` stays on `role_workspace_root` when original/target roots differ.
+
+Validation run by reviewer:
+- `cargo test -p client ticket_role --lib` passed (18 passed).
+- `git diff --check $(git merge-base HEAD develop)..HEAD` passed.
+- `/home/hare/Projects/yoi/target/debug/yoi ticket doctor` passed.
+- `nix build .#yoi --no-link` passed.
+
+No files were modified by reviewer.
+
+---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-11T04:56:47Z -->
+
+## Implementation report
+
+Fix-loop implementation report
+
+Reviewer blocker fixed in amended implementation commit `e7c78f96`:
+- Updated `.yoi/workflow/multi-agent-workflow.md` so it no longer assumes Orchestrator cwd is the original repository root.
+- Multi-agent workflow now explicitly says implementation worktrees are created under the recorded original workspace root `.worktree`, and merge-completion runs against the recorded merge target workspace.
+- Replaced remaining `main workspace` merge/validation/Ticket-completion wording with recorded merge target / recorded Ticket backend wording where relevant.
+- Kept `.yoi` path-exclusion policy intact while clarifying Orchestrator workspace / Ticket backend authority boundaries.
+- Strengthened client tests to assert `TicketRoleLaunchPlan` root fields and that `SpawnConfig.workspace_root` remains the role runtime workspace root even when original/target roots differ.
+
+Validation after fix:
+- `cargo fmt --check` passed.
+- `cargo test -p client ticket_role --lib` passed (18 passed).
+- `git diff --check` passed.
+- `/home/hare/Projects/yoi/target/debug/yoi ticket doctor` passed.
+- `nix build .#yoi` passed.
+
+Reviewer `reviewer-orchestrator-worktree-layout` has been asked to re-review the amended branch.
+
+---
