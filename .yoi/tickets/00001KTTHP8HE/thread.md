@@ -101,3 +101,34 @@ IntentPacket:
 - Validation: focused panel/client tests, `cargo fmt --check`, `git diff --check`, `target/debug/yoi ticket doctor`, and `nix build .#yoi`.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-11T07:54:44Z -->
+
+## Implementation report
+
+Implementation report
+
+Branch/worktree: `panel-orchestration-worktree` / `.worktree/panel-orchestration-worktree`
+Commit:
+- `47ce4030 feat: launch orchestrator from worktree`
+
+Summary:
+- Panel Orchestrator spawn path now prepares a stable dedicated orchestration worktree under `<original-workspace-root>/.worktree/orchestration/<workspace-orchestrator-pod-name>` before spawning a workspace Orchestrator.
+- The orchestration worktree uses a stable branch `orchestration/<workspace-orchestrator-pod-name>` and is created with `git worktree add`; if it already exists as a clean Git worktree it is reused.
+- Unsafe existing paths are diagnosed without cleanup: non-directory, non-Git worktree, or dirty orchestration worktree state returns an unavailable Orchestrator panel state with a clear error.
+- Orchestrator `SpawnConfig.workspace_root` is now the dedicated orchestration worktree root, while `TicketRoleLaunchContext` receives the original workspace root and target workspace root so implementation worktrees and merge-completion still target the original workspace.
+- Spawn diagnostics include whether the orchestration worktree was created or reused and the path/branch used.
+- Added tests for stable layout naming, root population, invalid existing path diagnostics/no cleanup, create/reuse behavior, dirty reuse refusal, and existing launch-plan tests.
+
+Validation run in branch:
+- `cargo fmt --check` passed.
+- `cargo test -p tui orchestration --lib` passed.
+- `cargo test -p client ticket_role --lib` passed.
+- `git diff --check` passed.
+- `/home/hare/Projects/yoi/target/debug/yoi ticket doctor` passed.
+- `nix build .#yoi` passed.
+
+Notes:
+- This keeps filesystem Ticket backend authority and does not add push automation or destructive cleanup. Dirty/unknown orchestration worktree state must be handled explicitly by the operator.
+
+---
