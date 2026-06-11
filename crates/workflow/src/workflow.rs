@@ -27,19 +27,23 @@ pub const WORKFLOW_DESCRIPTION_HARD_CAP: usize = 1024;
 /// win over external skills.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkflowSource {
+    Builtin,
     /// `<workspace>/.yoi/workflow/<slug>.md`. Authored in-tree by
     /// the project.
     WorkspaceWorkflow,
     /// SKILL.md ingested from a `[skills] directories` entry in the
     /// manifest. `dir` is the skills root that contained
     /// `<slug>/SKILL.md`.
-    Skill { dir: PathBuf },
+    Skill {
+        dir: PathBuf,
+    },
 }
 
 impl WorkflowSource {
     /// Human-readable label used in shadow-notification messages.
     pub fn label(&self) -> &'static str {
         match self {
+            Self::Builtin => "builtin workflow",
             Self::WorkspaceWorkflow => "workspace workflow",
             Self::Skill { .. } => "skill",
         }
@@ -188,12 +192,93 @@ pub enum WorkflowLoadError {
     },
 }
 
+struct BuiltinWorkflowResource {
+    slug: &'static str,
+    content: &'static str,
+}
+
+const BUILTIN_WORKFLOWS: &[BuiltinWorkflowResource] = &[
+    BuiltinWorkflowResource {
+        slug: "ticket-intake-workflow",
+        content: include_str!("../../../resources/workflows/ticket-intake-workflow.md"),
+    },
+    BuiltinWorkflowResource {
+        slug: "ticket-orchestrator-routing",
+        content: include_str!("../../../resources/workflows/ticket-orchestrator-routing.md"),
+    },
+    BuiltinWorkflowResource {
+        slug: "multi-agent-workflow",
+        content: include_str!("../../../resources/workflows/multi-agent-workflow.md"),
+    },
+];
+
+fn builtin_workflow_records() -> Result<BTreeMap<Slug, WorkflowRecord>, WorkflowLoadError> {
+    let mut records = BTreeMap::new();
+    for resource in BUILTIN_WORKFLOWS {
+        let path = PathBuf::from(format!("builtin:{}", resource.slug));
+        records.insert(
+            Slug::parse(resource.slug).map_err(|source| WorkflowLoadError::InvalidSlug {
+                path: path.clone(),
+                source: source.into(),
+            })?,
+            parse_workflow_record(
+                Slug::parse(resource.slug).map_err(|source| WorkflowLoadError::InvalidSlug {
+                    path: path.clone(),
+                    source: source.into(),
+                })?,
+                path,
+                WorkflowSource::Builtin,
+                resource.content,
+            )?,
+        );
+    }
+    Ok(records)
+}
+
+fn parse_workflow_record(
+    slug: Slug,
+    path: PathBuf,
+    source: WorkflowSource,
+    raw: &str,
+) -> Result<WorkflowRecord, WorkflowLoadError> {
+    let (yaml, body) = split_frontmatter(raw).map_err(|source| WorkflowLoadError::Frontmatter {
+        path: path.clone(),
+        source,
+    })?;
+    warn_unknown_workflow_fields(&path, yaml);
+    let frontmatter: WorkflowFrontmatter =
+        serde_yaml::from_str(yaml).map_err(|err| WorkflowLoadError::Frontmatter {
+            path: path.clone(),
+            source: map_serde_workflow_error(err),
+        })?;
+    if frontmatter.model_invokation
+        && frontmatter.description.chars().count() > WORKFLOW_DESCRIPTION_HARD_CAP
+    {
+        return Err(WorkflowLoadError::DescriptionTooLong {
+            path,
+            actual: frontmatter.description.chars().count(),
+            limit: WORKFLOW_DESCRIPTION_HARD_CAP,
+        });
+    }
+    Ok(WorkflowRecord {
+        slug,
+        description: frontmatter.description,
+        model_invokation: frontmatter.model_invokation,
+        user_invocable: frontmatter.user_invocable,
+        requires: frontmatter.requires,
+        body: body.to_string(),
+        path,
+        source,
+    })
+}
+
 pub fn load_workflows(layout: &WorkspaceLayout) -> Result<WorkflowRegistry, WorkflowLoadError> {
+    let mut records = builtin_workflow_records()?;
     let dir = layout.workflow_dir();
     let entries = match std::fs::read_dir(&dir) {
         Ok(entries) => entries,
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
-            return Ok(WorkflowRegistry::empty());
+            return Ok(WorkflowRegistry { records });
         }
         Err(source) => return Err(WorkflowLoadError::ReadDir { dir, source }),
     };
@@ -211,7 +296,6 @@ pub fn load_workflows(layout: &WorkspaceLayout) -> Result<WorkflowRegistry, Work
     }
     paths.sort();
 
-    let mut records = BTreeMap::new();
     for path in paths {
         let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
             continue;
@@ -221,45 +305,18 @@ pub fn load_workflows(layout: &WorkspaceLayout) -> Result<WorkflowRegistry, Work
                 path: path.clone(),
                 source: source.into(),
             })?;
-        if records.contains_key(&slug) {
-            warn!(slug = %slug, path = %path.display(), "duplicate workflow slug encountered; keeping first record");
-            continue;
+        if let Some(existing) = records.get(&slug) {
+            if !matches!(existing.source, WorkflowSource::Builtin) {
+                warn!(slug = %slug, path = %path.display(), "duplicate workflow slug encountered; keeping first record");
+                continue;
+            }
         }
         let raw = std::fs::read_to_string(&path).map_err(|source| WorkflowLoadError::ReadFile {
             path: path.clone(),
             source,
         })?;
-        let (yaml, body) =
-            split_frontmatter(&raw).map_err(|source| WorkflowLoadError::Frontmatter {
-                path: path.clone(),
-                source,
-            })?;
-        warn_unknown_workflow_fields(&path, yaml);
-        let frontmatter: WorkflowFrontmatter =
-            serde_yaml::from_str(yaml).map_err(|err| WorkflowLoadError::Frontmatter {
-                path: path.clone(),
-                source: map_serde_workflow_error(err),
-            })?;
-        if frontmatter.model_invokation
-            && frontmatter.description.chars().count() > WORKFLOW_DESCRIPTION_HARD_CAP
-        {
-            return Err(WorkflowLoadError::DescriptionTooLong {
-                path,
-                actual: frontmatter.description.chars().count(),
-                limit: WORKFLOW_DESCRIPTION_HARD_CAP,
-            });
-        }
-
-        let record = WorkflowRecord {
-            slug: slug.clone(),
-            description: frontmatter.description,
-            model_invokation: frontmatter.model_invokation,
-            user_invocable: frontmatter.user_invocable,
-            requires: frontmatter.requires,
-            body: body.to_string(),
-            path: path.clone(),
-            source: WorkflowSource::WorkspaceWorkflow,
-        };
+        let record =
+            parse_workflow_record(slug.clone(), path, WorkflowSource::WorkspaceWorkflow, &raw)?;
         records.insert(slug.clone(), record);
     }
 
@@ -327,11 +384,11 @@ mod tests {
     }
 
     #[test]
-    fn missing_directory_loads_empty_registry() {
+    fn missing_directory_loads_builtin_registry() {
         let dir = TempDir::new().unwrap();
         let layout = WorkspaceLayout::new(dir.path().to_path_buf());
         let got = load_workflows(&layout).unwrap();
-        assert!(got.is_empty());
+        assert!(got.get(&Slug::parse("ghost").unwrap()).is_none());
     }
 
     #[test]
@@ -358,8 +415,40 @@ mod tests {
             "Body",
         );
         let got = load_workflows(&layout).unwrap();
-        assert_eq!(got.resident_entries()[0].slug, "auto");
-        assert!(got.list_user_invocable("").is_empty());
+        assert!(
+            got.resident_entries()
+                .iter()
+                .any(|entry| entry.slug == "auto")
+        );
+        assert!(!got.list_user_invocable("").contains(&"auto".to_string()));
+    }
+
+    #[test]
+    fn workspace_workflow_overrides_builtin_by_slug() {
+        let (dir, layout) = setup();
+        write_workflow(
+            dir.path(),
+            "ticket-intake-workflow",
+            "description: Workspace intake\nmodel_invokation: false",
+            "workspace override body",
+        );
+        let got = load_workflows(&layout).unwrap();
+        let slug = Slug::parse("ticket-intake-workflow").unwrap();
+        let record = got.get(&slug).unwrap();
+        assert_eq!(record.source, WorkflowSource::WorkspaceWorkflow);
+        assert_eq!(record.description, "Workspace intake");
+        assert_eq!(record.body, "workspace override body");
+    }
+
+    #[test]
+    fn builtin_workflow_records_have_visible_provenance() {
+        let dir = TempDir::new().unwrap();
+        let layout = WorkspaceLayout::new(dir.path().to_path_buf());
+        let got = load_workflows(&layout).unwrap();
+        let slug = Slug::parse("multi-agent-workflow").unwrap();
+        let record = got.get(&slug).unwrap();
+        assert_eq!(record.source, WorkflowSource::Builtin);
+        assert_eq!(record.path, PathBuf::from("builtin:multi-agent-workflow"));
     }
 
     #[test]
@@ -393,7 +482,7 @@ mod tests {
         )
         .unwrap();
         let got = load_workflows(&layout).unwrap();
-        assert!(got.is_empty());
+        assert!(got.get(&Slug::parse("ghost").unwrap()).is_none());
     }
 
     fn skill_record(slug: &str, path: &Path) -> WorkflowRecord {
