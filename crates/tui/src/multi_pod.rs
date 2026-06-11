@@ -1,6 +1,7 @@
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use client::ticket_role::{
@@ -1657,6 +1658,295 @@ fn observe_workspace_orchestrator(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OrchestrationWorktreeLayout {
+    path: PathBuf,
+    branch: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OrchestrationWorktreeStatus {
+    Created,
+    Reused,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OrchestrationWorktreeReady {
+    layout: OrchestrationWorktreeLayout,
+    status: OrchestrationWorktreeStatus,
+}
+
+fn orchestration_worktree_layout(workspace_root: &Path) -> OrchestrationWorktreeLayout {
+    let stem = workspace_orchestrator_pod_name(workspace_root);
+    OrchestrationWorktreeLayout {
+        path: workspace_root
+            .join(".worktree")
+            .join("orchestration")
+            .join(&stem),
+        branch: format!("orchestration/{stem}"),
+    }
+}
+
+fn build_orchestrator_launch_context(
+    original_workspace_root: &Path,
+    orchestration_workspace_root: &Path,
+    pod_name: &str,
+) -> TicketRoleLaunchContext {
+    let mut context = TicketRoleLaunchContext::new(
+        orchestration_workspace_root.to_path_buf(),
+        TicketRole::Orchestrator,
+    )
+    .with_original_workspace_root(original_workspace_root.to_path_buf())
+    .with_target_workspace_root(original_workspace_root.to_path_buf());
+    context.pod_name = Some(pod_name.to_string());
+    context.user_instruction = Some(
+        "Workspace panel opened for this Ticket-enabled workspace. Coordinate Ticket routing and wait for explicit follow-up before spawning role Pods."
+            .to_string(),
+    );
+    context
+}
+
+fn ensure_orchestration_worktree(
+    workspace_root: &Path,
+) -> Result<OrchestrationWorktreeReady, String> {
+    let layout = orchestration_worktree_layout(workspace_root);
+    if layout.path.exists() {
+        if !layout.path.is_dir() {
+            return Err(format!(
+                "orchestration worktree path exists but is not a directory: {}",
+                layout.path.display()
+            ));
+        }
+        if git_inside_worktree(&layout.path) {
+            validate_existing_orchestration_worktree(workspace_root, &layout)?;
+            if !git_worktree_clean(&layout.path) {
+                return Err(format!(
+                    "orchestration worktree is dirty; refusing automatic reuse: {}",
+                    layout.path.display()
+                ));
+            }
+            return Ok(OrchestrationWorktreeReady {
+                layout,
+                status: OrchestrationWorktreeStatus::Reused,
+            });
+        }
+        return Err(format!(
+            "orchestration worktree path exists but is not a Git worktree: {}",
+            layout.path.display()
+        ));
+    }
+
+    if let Some(parent) = layout.path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "could not create orchestration worktree parent {}: {error}",
+                parent.display()
+            )
+        })?;
+    }
+
+    let branch_exists = git_branch_exists(workspace_root, &layout.branch)?;
+    let mut command = Command::new("git");
+    command
+        .arg("-C")
+        .arg(workspace_root)
+        .arg("worktree")
+        .arg("add");
+    if branch_exists {
+        command.arg(&layout.path).arg(&layout.branch);
+    } else {
+        command
+            .arg(&layout.path)
+            .arg("-b")
+            .arg(&layout.branch)
+            .arg("HEAD");
+    }
+    run_git_command(command, "create orchestration worktree")?;
+
+    Ok(OrchestrationWorktreeReady {
+        layout,
+        status: OrchestrationWorktreeStatus::Created,
+    })
+}
+
+fn validate_existing_orchestration_worktree(
+    workspace_root: &Path,
+    layout: &OrchestrationWorktreeLayout,
+) -> Result<(), String> {
+    let expected_top_level = layout.path.canonicalize().map_err(|error| {
+        format!(
+            "could not canonicalize orchestration worktree path {}: {error}",
+            layout.path.display()
+        )
+    })?;
+    let actual_top_level = git_top_level(&layout.path)?;
+    if actual_top_level != expected_top_level {
+        return Err(format!(
+            "orchestration path {} is inside Git worktree {}, but is not the worktree root",
+            layout.path.display(),
+            actual_top_level.display()
+        ));
+    }
+
+    let current_branch = git_current_branch(&layout.path)?;
+    if current_branch.as_deref() != Some(layout.branch.as_str()) {
+        return Err(format!(
+            "orchestration worktree {} is on branch {:?}, expected {}",
+            layout.path.display(),
+            current_branch,
+            layout.branch
+        ));
+    }
+
+    let original_common = git_common_dir(workspace_root)?;
+    let worktree_common = git_common_dir(&layout.path)?;
+    if original_common != worktree_common {
+        return Err(format!(
+            "orchestration worktree {} belongs to a different Git repository ({} != {})",
+            layout.path.display(),
+            worktree_common.display(),
+            original_common.display()
+        ));
+    }
+    Ok(())
+}
+
+fn git_top_level(path: &Path) -> Result<PathBuf, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .arg("rev-parse")
+        .arg("--show-toplevel")
+        .output()
+        .map_err(|error| {
+            format!(
+                "could not query Git top-level for {}: {error}",
+                path.display()
+            )
+        })?;
+    if !output.status.success() {
+        return Err(format!(
+            "could not query Git top-level for {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    PathBuf::from(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .canonicalize()
+        .map_err(|error| {
+            format!(
+                "could not canonicalize Git top-level for {}: {error}",
+                path.display()
+            )
+        })
+}
+
+fn git_current_branch(path: &Path) -> Result<Option<String>, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .arg("branch")
+        .arg("--show-current")
+        .output()
+        .map_err(|error| {
+            format!(
+                "could not query current branch for {}: {error}",
+                path.display()
+            )
+        })?;
+    if !output.status.success() {
+        return Err(format!(
+            "could not query current branch for {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok((!branch.is_empty()).then_some(branch))
+}
+
+fn git_common_dir(path: &Path) -> Result<PathBuf, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .arg("rev-parse")
+        .arg("--git-common-dir")
+        .output()
+        .map_err(|error| {
+            format!(
+                "could not query Git common dir for {}: {error}",
+                path.display()
+            )
+        })?;
+    if !output.status.success() {
+        return Err(format!(
+            "could not query Git common dir for {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let raw = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim().to_string());
+    let common = if raw.is_absolute() {
+        raw
+    } else {
+        path.join(raw)
+    };
+    common.canonicalize().map_err(|error| {
+        format!(
+            "could not canonicalize Git common dir {}: {error}",
+            common.display()
+        )
+    })
+}
+
+fn git_inside_worktree(path: &Path) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .arg("rev-parse")
+        .arg("--is-inside-work-tree")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+fn git_worktree_clean(path: &Path) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .arg("status")
+        .arg("--porcelain")
+        .output()
+        .map(|output| output.status.success() && output.stdout.is_empty())
+        .unwrap_or(false)
+}
+
+fn git_branch_exists(workspace_root: &Path, branch: &str) -> Result<bool, String> {
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(workspace_root)
+        .arg("show-ref")
+        .arg("--verify")
+        .arg("--quiet")
+        .arg(format!("refs/heads/{branch}"))
+        .status()
+        .map_err(|error| format!("could not query orchestration branch `{branch}`: {error}"))?;
+    Ok(status.success())
+}
+
+fn run_git_command(mut command: Command, action: &str) -> Result<(), String> {
+    let output = command
+        .output()
+        .map_err(|error| format!("could not run git to {action}: {error}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let detail = if stderr.is_empty() { stdout } else { stderr };
+    Err(format!("git failed to {action}: {detail}"))
+}
+
 async fn orchestrator_lifecycle(
     workspace_root: &Path,
     config: TicketConfigAvailability,
@@ -1688,22 +1978,47 @@ async fn orchestrator_lifecycle(
                 ),
             }
         }
-        OrchestratorLifecyclePlan::Spawn => {
-            match spawn_orchestrator_pod(workspace_root, &pod_name, runtime_command).await {
-                Ok(profile) => {
-                    OrchestratorLifecycleReport::with_state(OrchestratorPanelState::new(
+        OrchestratorLifecyclePlan::Spawn => match ensure_orchestration_worktree(workspace_root) {
+            Ok(worktree) => {
+                let worktree_note = match worktree.status {
+                    OrchestrationWorktreeStatus::Created => format!(
+                        "created orchestration worktree {} on branch {}",
+                        worktree.layout.path.display(),
+                        worktree.layout.branch
+                    ),
+                    OrchestrationWorktreeStatus::Reused => format!(
+                        "reused orchestration worktree {} on branch {}",
+                        worktree.layout.path.display(),
+                        worktree.layout.branch
+                    ),
+                };
+                match spawn_orchestrator_pod(
+                    workspace_root,
+                    &worktree.layout.path,
+                    &pod_name,
+                    runtime_command,
+                )
+                .await
+                {
+                    Ok(profile) => {
+                        OrchestratorLifecycleReport::with_state(OrchestratorPanelState::new(
+                            pod_name,
+                            OrchestratorPanelStatus::Spawned,
+                            Some(format!("launched with profile {profile}; {worktree_note}")),
+                        ))
+                        .mark_reload()
+                    }
+                    Err(error) => OrchestratorLifecycleReport::unavailable(
                         pod_name,
-                        OrchestratorPanelStatus::Spawned,
-                        Some(format!("launched with profile {profile}")),
-                    ))
-                    .mark_reload()
+                        format!("could not spawn workspace Orchestrator: {error}"),
+                    ),
                 }
-                Err(error) => OrchestratorLifecycleReport::unavailable(
-                    pod_name,
-                    format!("could not spawn workspace Orchestrator: {error}"),
-                ),
             }
-        }
+            Err(error) => OrchestratorLifecycleReport::unavailable(
+                pod_name,
+                format!("could not prepare orchestration worktree: {error}"),
+            ),
+        },
         OrchestratorLifecyclePlan::Unavailable(message) => {
             OrchestratorLifecycleReport::unavailable(pod_name, message)
         }
@@ -1759,16 +2074,15 @@ async fn restore_orchestrator_pod(
 }
 
 async fn spawn_orchestrator_pod(
-    workspace_root: &Path,
+    original_workspace_root: &Path,
+    orchestration_workspace_root: &Path,
     pod_name: &str,
     runtime_command: PodRuntimeCommand,
 ) -> Result<String, client::TicketRoleLaunchError> {
-    let mut context =
-        TicketRoleLaunchContext::new(workspace_root.to_path_buf(), TicketRole::Orchestrator);
-    context.pod_name = Some(pod_name.to_string());
-    context.user_instruction = Some(
-        "Workspace panel opened for this Ticket-enabled workspace. Coordinate Ticket routing and wait for explicit follow-up before spawning role Pods."
-            .to_string(),
+    let context = build_orchestrator_launch_context(
+        original_workspace_root,
+        orchestration_workspace_root,
+        pod_name,
     );
     let result = launch_ticket_role_pod(context, runtime_command, |_| {}).await?;
     Ok(result.plan.profile)
@@ -3133,6 +3447,198 @@ fn truncate_with_ellipsis(s: &str, max_width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn orchestration_worktree_layout_is_stable_under_original_workspace_root() {
+        let root = Path::new("/tmp/Yoi Workspace");
+        let layout = orchestration_worktree_layout(root);
+        assert_eq!(
+            layout.path,
+            PathBuf::from("/tmp/Yoi Workspace/.worktree/orchestration/yoi-workspace-orchestrator")
+        );
+        assert_eq!(layout.branch, "orchestration/yoi-workspace-orchestrator");
+    }
+
+    #[test]
+    fn orchestrator_launch_context_uses_orchestration_root_for_runtime_workspace() {
+        let original = PathBuf::from("/repo/yoi");
+        let orchestration = original
+            .join(".worktree")
+            .join("orchestration")
+            .join("yoi-orchestrator");
+        let context =
+            build_orchestrator_launch_context(&original, &orchestration, "yoi-orchestrator");
+        assert_eq!(context.workspace_root, orchestration);
+        assert_eq!(
+            context.original_workspace_root.as_deref(),
+            Some(original.as_path())
+        );
+        assert_eq!(
+            context.target_workspace_root.as_deref(),
+            Some(original.as_path())
+        );
+    }
+
+    #[test]
+    fn invalid_existing_orchestration_path_is_diagnostic_not_cleanup() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let layout = orchestration_worktree_layout(&root);
+        std::fs::create_dir_all(&layout.path).unwrap();
+        std::fs::write(layout.path.join("keep.txt"), "do not delete").unwrap();
+
+        let err = ensure_orchestration_worktree(&root).unwrap_err();
+        assert!(err.contains("not a Git worktree"));
+        assert!(layout.path.join("keep.txt").exists());
+    }
+
+    #[test]
+    fn ensure_orchestration_worktree_creates_and_reuses_git_worktree() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        run_test_git(&root, &["init"]).unwrap();
+        std::fs::write(root.join("README.md"), "repo").unwrap();
+        run_test_git(&root, &["add", "README.md"]).unwrap();
+        run_test_git(
+            &root,
+            &[
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "user.name=Yoi Test",
+                "commit",
+                "-m",
+                "init",
+            ],
+        )
+        .unwrap();
+
+        let created = ensure_orchestration_worktree(&root).unwrap();
+        assert_eq!(created.status, OrchestrationWorktreeStatus::Created);
+        assert!(created.layout.path.exists());
+        assert!(git_inside_worktree(&created.layout.path));
+
+        let reused = ensure_orchestration_worktree(&root).unwrap();
+        assert_eq!(reused.status, OrchestrationWorktreeStatus::Reused);
+        assert_eq!(reused.layout, created.layout);
+
+        std::fs::write(created.layout.path.join("dirty.txt"), "dirty").unwrap();
+        let err = ensure_orchestration_worktree(&root).unwrap_err();
+        assert!(err.contains("dirty"));
+        assert!(created.layout.path.join("dirty.txt").exists());
+    }
+
+    #[test]
+    fn existing_wrong_branch_worktree_is_rejected_without_cleanup() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("repo");
+        init_test_repo(&root);
+        let layout = orchestration_worktree_layout(&root);
+        run_test_git(
+            &root,
+            &[
+                "worktree",
+                "add",
+                &layout.path.display().to_string(),
+                "-b",
+                "wrong-branch",
+                "HEAD",
+            ],
+        )
+        .unwrap();
+        std::fs::write(layout.path.join("keep.txt"), "keep").unwrap();
+        run_test_git(&layout.path, &["add", "keep.txt"]).unwrap();
+        run_test_git(
+            &layout.path,
+            &[
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "user.name=Yoi Test",
+                "commit",
+                "-m",
+                "keep",
+            ],
+        )
+        .unwrap();
+
+        let err = ensure_orchestration_worktree(&root).unwrap_err();
+        assert!(err.contains("expected orchestration"));
+        assert!(layout.path.join("keep.txt").exists());
+    }
+
+    #[test]
+    fn existing_unrelated_repo_with_expected_branch_is_rejected_without_cleanup() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("repo");
+        init_test_repo(&root);
+        let layout = orchestration_worktree_layout(&root);
+        std::fs::create_dir_all(&layout.path).unwrap();
+        init_test_repo(&layout.path);
+        run_test_git(&layout.path, &["checkout", "-b", &layout.branch]).unwrap();
+        std::fs::write(layout.path.join("unrelated.txt"), "keep").unwrap();
+        run_test_git(&layout.path, &["add", "unrelated.txt"]).unwrap();
+        run_test_git(
+            &layout.path,
+            &[
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "user.name=Yoi Test",
+                "commit",
+                "-m",
+                "unrelated",
+            ],
+        )
+        .unwrap();
+
+        let err = ensure_orchestration_worktree(&root).unwrap_err();
+        assert!(err.contains("different Git repository"));
+        assert!(layout.path.join("unrelated.txt").exists());
+    }
+
+    fn init_test_repo(root: &Path) {
+        std::fs::create_dir_all(root).unwrap();
+        run_test_git(root, &["init"]).unwrap();
+        std::fs::write(root.join("README.md"), "repo").unwrap();
+        run_test_git(root, &["add", "README.md"]).unwrap();
+        run_test_git(
+            root,
+            &[
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "user.name=Yoi Test",
+                "commit",
+                "-m",
+                "init",
+            ],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn inherited_parent_worktree_directory_is_rejected_without_cleanup() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("repo");
+        init_test_repo(&root);
+        let layout = orchestration_worktree_layout(&root);
+        run_test_git(&root, &["checkout", "-b", &layout.branch]).unwrap();
+        std::fs::create_dir_all(&layout.path).unwrap();
+        std::fs::write(layout.path.join("plain.txt"), "keep").unwrap();
+
+        let err = ensure_orchestration_worktree(&root).unwrap_err();
+        assert!(err.contains("not the worktree root"));
+        assert!(layout.path.join("plain.txt").exists());
+    }
+
+    fn run_test_git(root: &Path, args: &[&str]) -> Result<(), String> {
+        let mut command = Command::new("git");
+        command.arg("-C").arg(root).args(args);
+        run_git_command(command, "run test git")
+    }
+
     use crate::pod_list::{LivePodInfo, PodEntrySummary, StoredMetadataState, StoredPodInfo};
     use std::fs;
     use tempfile::TempDir;
@@ -4593,6 +5099,9 @@ mod tests {
             launch: TicketRoleLaunchResult {
                 plan: client::ticket_role::TicketRoleLaunchPlan {
                     workspace_root: PathBuf::from("/tmp/workspace"),
+                    original_workspace_root: PathBuf::from("/tmp/workspace"),
+                    target_workspace_root: PathBuf::from("/tmp/workspace"),
+                    implementation_worktree_root: PathBuf::from("/tmp/workspace/.worktree"),
                     role: TicketRole::Intake,
                     pod_name: "intake-pod".to_string(),
                     profile: "builtin:default".to_string(),

@@ -1584,7 +1584,10 @@ mod tests {
         assert!(orchestrator.feature.ticket.enabled);
         assert!(orchestrator.feature.ticket_orchestration.enabled);
         assert_eq!(orchestrator.scope.allow[0].permission, Permission::Read);
-        assert_eq!(orchestrator.model.ref_.as_deref(), Some("codex-oauth/gpt-5.5"));
+        assert_eq!(
+            orchestrator.model.ref_.as_deref(),
+            Some("codex-oauth/gpt-5.5")
+        );
         assert!(orchestrator.web.is_some());
         assert_eq!(
             orchestrator.delegation_scope.allow[0].permission,
