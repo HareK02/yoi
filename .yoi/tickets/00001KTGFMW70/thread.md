@@ -164,3 +164,32 @@ Notes:
 - This is a first-pass builtin resource implementation. It covers embedded builtin Workflow and Workflow-required Knowledge fallback/provenance. Broader KnowledgeQuery builtins and user-level workflow/knowledge resource directories remain follow-up boundaries if desired.
 
 ---
+
+<!-- event: review author: reviewer-builtin-workflow-knowledge-resources at: 2026-06-11T08:50:25Z status: approve -->
+
+## Review: approve
+
+Branch-local review verdict: approve
+
+Blockers: none.
+
+Non-blocking notes:
+- The implementation keeps the intended boundaries: workflows are embedded from `resources/workflows`, required workflow Knowledge is embedded separately from `resources/knowledge`, and prompt resources are not mixed into either path.
+- Workspace workflow files override builtin workflow fallback by slug, while existing skill shadow behavior remains intact.
+- Required Knowledge resolution checks workspace `.yoi/knowledge/<slug>.md` first and falls back to bundled Knowledge only on missing workspace file.
+- Workflow invocation/system items expose provenance for both workflow source and required Knowledge source.
+- The bundled Knowledge content is public design/process context and is only inserted through recorded workflow invocation system items, not hidden cross-turn context injection.
+- Broader builtin KnowledgeQuery/user-level resource directory behavior remains outside this branch’s scope, consistent with the provided scope note.
+
+Validation run by reviewer:
+- `cargo fmt --check` passed.
+- `cargo test -p workflow --lib` passed.
+- `cargo test -p pod workflow --lib` passed.
+- `cargo check -p workflow -p pod` passed.
+- `git diff --check $(git merge-base HEAD develop)..HEAD` passed.
+- `/home/hare/Projects/yoi/target/debug/yoi ticket doctor` passed.
+- `nix build .#yoi` passed.
+
+No files were intentionally modified and no final main-branch Ticket approval/close was recorded by reviewer.
+
+---
