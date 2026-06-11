@@ -78,6 +78,8 @@ impl TicketIntakeHandoff {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TicketRoleLaunchContext {
     pub workspace_root: PathBuf,
+    pub original_workspace_root: Option<PathBuf>,
+    pub target_workspace_root: Option<PathBuf>,
     pub role: TicketRole,
     pub pod_name: Option<String>,
     pub ticket: Option<TicketRef>,
@@ -95,6 +97,8 @@ impl TicketRoleLaunchContext {
     pub fn new(workspace_root: impl Into<PathBuf>, role: TicketRole) -> Self {
         Self {
             workspace_root: workspace_root.into(),
+            original_workspace_root: None,
+            target_workspace_root: None,
             role,
             pod_name: None,
             ticket: None,
@@ -108,12 +112,41 @@ impl TicketRoleLaunchContext {
             report_expectations: Vec::new(),
         }
     }
+
+    pub fn with_original_workspace_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.original_workspace_root = Some(root.into());
+        self
+    }
+
+    pub fn with_target_workspace_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.target_workspace_root = Some(root.into());
+        self
+    }
+
+    fn original_workspace_root(&self) -> &Path {
+        self.original_workspace_root
+            .as_deref()
+            .unwrap_or(&self.workspace_root)
+    }
+
+    fn target_workspace_root(&self) -> &Path {
+        self.target_workspace_root
+            .as_deref()
+            .unwrap_or_else(|| self.original_workspace_root())
+    }
+
+    fn implementation_worktree_root(&self) -> PathBuf {
+        self.original_workspace_root().join(".worktree")
+    }
 }
 
 /// Pure launch plan usable by TUI/CLI surfaces before executing the launch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TicketRoleLaunchPlan {
     pub workspace_root: PathBuf,
+    pub original_workspace_root: PathBuf,
+    pub target_workspace_root: PathBuf,
+    pub implementation_worktree_root: PathBuf,
     pub role: TicketRole,
     pub pod_name: String,
     pub profile: String,
@@ -246,8 +279,15 @@ pub fn plan_ticket_role_launch_with_config(
     validate_ticket_role_profile(context.role, &profile, &context.workspace_root, &pod_name)?;
     let prompt = build_launch_prompt(&context, &profile, &workflow, launch_prompt_ref.as_deref());
 
+    let original_workspace_root = context.original_workspace_root().to_path_buf();
+    let target_workspace_root = context.target_workspace_root().to_path_buf();
+    let implementation_worktree_root = context.implementation_worktree_root();
+
     Ok(TicketRoleLaunchPlan {
         workspace_root: context.workspace_root,
+        original_workspace_root,
+        target_workspace_root,
+        implementation_worktree_root,
         role: context.role,
         pod_name,
         profile,
@@ -580,6 +620,8 @@ fn build_launch_prompt(
         out.push_str("Target Ticket: not specified\n");
     }
 
+    append_workspace_routing_context(&mut out, context);
+
     match non_empty(context.user_instruction.as_deref()) {
         Some(instruction) => push_bounded_section(&mut out, "User/action instruction", instruction),
         None => out.push_str("\nUser/action instruction: not specified\n"),
@@ -617,6 +659,43 @@ fn build_launch_prompt(
     append_role_execution_guidance(&mut out, context.role, &prompts);
 
     out
+}
+
+fn append_workspace_routing_context(out: &mut String, context: &TicketRoleLaunchContext) {
+    let original_workspace_root = context.original_workspace_root();
+    let target_workspace_root = context.target_workspace_root();
+    let implementation_worktree_root = context.implementation_worktree_root();
+    let should_emit = context.original_workspace_root.is_some()
+        || context.target_workspace_root.is_some()
+        || context.role == TicketRole::Orchestrator;
+    if !should_emit {
+        return;
+    }
+
+    out.push_str("\nWorkspace routing context:\n");
+    push_bounded_bullet(
+        out,
+        "role_workspace_root",
+        &context.workspace_root.display().to_string(),
+    );
+    push_bounded_bullet(
+        out,
+        "original_workspace_root",
+        &original_workspace_root.display().to_string(),
+    );
+    push_bounded_bullet(
+        out,
+        "implementation_worktree_root",
+        &implementation_worktree_root.display().to_string(),
+    );
+    push_bounded_bullet(
+        out,
+        "merge_target_workspace_root",
+        &target_workspace_root.display().to_string(),
+    );
+    out.push_str(
+        "- Treat `role_workspace_root` as the launched role runtime workspace/Ticket backend root. Create implementation worktrees under `implementation_worktree_root`, not relative to the role cwd, and run merge-completion against `merge_target_workspace_root`.\n",
+    );
 }
 
 fn append_role_execution_guidance(
@@ -796,6 +875,9 @@ mod tests {
     fn test_launch_plan(workspace: &std::path::Path) -> TicketRoleLaunchPlan {
         TicketRoleLaunchPlan {
             workspace_root: workspace.to_path_buf(),
+            original_workspace_root: workspace.to_path_buf(),
+            target_workspace_root: workspace.to_path_buf(),
+            implementation_worktree_root: workspace.join(".worktree"),
             role: TicketRole::Intake,
             pod_name: "ticket-intake".to_string(),
             profile: "project:intake".to_string(),
@@ -1179,7 +1261,10 @@ workflow = "ticket-review-workflow"
         assert!(orchestrator_text.contains("binding decisions/invariants"));
         assert!(orchestrator_text.contains("not unrecorded preferred tactics"));
         assert!(orchestrator_text.contains("merge-ready dossier"));
-        assert!(orchestrator_text.contains("do not merge, close, or record final main approval"));
+        assert!(orchestrator_text.contains(
+            "Stop at a merge-ready dossier only when merge-completion authority is absent"
+        ));
+        assert!(orchestrator_text.contains("continue through merge, validation, Ticket close"));
 
         let mut coder = TicketRoleLaunchContext::new(temp.path(), TicketRole::Coder);
         coder.ticket = Some(TicketRef::id("20260605-190330-ticket-role-pod-launcher"));
@@ -1228,18 +1313,37 @@ workflow = "ticket-review-workflow"
         orchestrator.intent_packet =
             Some("Complete an already-reviewed merge-ready Ticket.".into());
         orchestrator.validation = vec!["cargo test -p client ticket_role --lib".into()];
+        orchestrator = orchestrator
+            .with_original_workspace_root(temp.path().join("original"))
+            .with_target_workspace_root(temp.path().join("target"));
 
         let plan = plan_ticket_role_launch(orchestrator).unwrap();
         let text = text_segment(&plan);
+        assert_eq!(plan.workspace_root, temp.path());
+        assert_eq!(plan.original_workspace_root, temp.path().join("original"));
+        assert_eq!(
+            plan.implementation_worktree_root,
+            temp.path().join("original").join(".worktree")
+        );
+        assert_eq!(plan.target_workspace_root, temp.path().join("target"));
+        let spawn_config = plan
+            .spawn_config(PodRuntimeCommand::for_executable("/bin/yoi"))
+            .unwrap();
+        assert_eq!(spawn_config.workspace_root, temp.path());
 
+        assert!(text.contains("Workspace routing context:"));
+        assert!(text.contains("role_workspace_root"));
+        assert!(text.contains("implementation_worktree_root"));
+        assert!(text.contains("merge_target_workspace_root"));
+        assert!(text.contains("not relative to the role cwd"));
         assert!(text.contains("Orchestrator merge-completion guidance"));
         assert!(text.contains("`inprogress` Ticket with a merge-ready dossier"));
         assert!(text.contains("Conservative or missing authorization mode stops at the dossier"));
-        assert!(text.contains("do not infer merge authority"));
+        assert!(text.contains("explicit user/standing policy may authorize continuing"));
         assert!(text.contains("dossier branch/worktree/commits match the branch to merge"));
         assert!(text.contains("independent reviewer approval exists in the dossier"));
         assert!(text.contains("explicit human override decision is recorded"));
-        assert!(text.contains("the main workspace is safe"));
+        assert!(text.contains("the merge target workspace is safe"));
         assert!(text.contains("unrelated dirty changes are understood"));
         assert!(text.contains("dogfooding/workspace policy grants merge authority"));
         assert!(text.contains("branch-local reviewer verdicts are dossier evidence"));
