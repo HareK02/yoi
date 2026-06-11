@@ -127,3 +127,40 @@ IntentPacket:
 - Validation: focused resolver/role launch/Knowledge tests, `cargo fmt --check`, `git diff --check`, `target/debug/yoi ticket doctor`, and `nix build .#yoi`.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-11T08:46:27Z -->
+
+## Implementation report
+
+Implementation report
+
+Branch/worktree: `builtin-workflow-knowledge-resources` / `.worktree/builtin-workflow-knowledge-resources`
+Commit:
+- `2418ad33 feat: add builtin workflow resources`
+
+Summary:
+- Added embedded builtin Workflow resources under `resources/workflows` for:
+  - `ticket-intake-workflow`
+  - `ticket-orchestrator-routing`
+  - `multi-agent-workflow`
+- Added embedded builtin Knowledge resource `resources/knowledge/workflow-resource-boundary.md` used by builtin workflows.
+- Added `WorkflowSource::Builtin` and builtin Workflow registry loading.
+- Workspace `.yoi/workflow/<slug>.md` records override builtin workflows by slug; skill records remain lower-priority and produce existing shadow messages.
+- Workflow system messages now include Workflow source provenance (`from builtin workflow`, `from workspace workflow`, etc.).
+- Workflow-required Knowledge resolution now falls back from workspace `.yoi/knowledge/<slug>.md` to builtin Knowledge resources and includes Knowledge source provenance (`from workspace` / `from builtin`).
+- Workspace Knowledge overrides builtin Knowledge for the same required slug.
+- Added/updated tests for builtin registry fallback, workspace override precedence, builtin provenance, builtin required Knowledge fallback, workspace Knowledge override, and existing workflow invocation behavior.
+
+Validation run in branch:
+- `cargo fmt --check` passed.
+- `cargo test -p workflow --lib` passed (34 passed).
+- `cargo test -p pod workflow --lib` passed (8 passed).
+- `cargo check -p workflow -p pod` passed.
+- `git diff --check` passed.
+- `/home/hare/Projects/yoi/target/debug/yoi ticket doctor` passed.
+- `nix build .#yoi` passed.
+
+Notes:
+- This is a first-pass builtin resource implementation. It covers embedded builtin Workflow and Workflow-required Knowledge fallback/provenance. Broader KnowledgeQuery builtins and user-level workflow/knowledge resource directories remain follow-up boundaries if desired.
+
+---
