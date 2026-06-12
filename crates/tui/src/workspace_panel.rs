@@ -894,7 +894,7 @@ fn pod_row(entry: &PodListEntry) -> PanelRow {
         ticket: None,
         related_pods: Vec::new(),
         disabled_reason: entry.actions.disabled_reason.clone(),
-        key_hint: Some("Enter opens/attaches; Right marks action focus".to_string()),
+        key_hint: Some("Enter opens/attaches for inspection".to_string()),
     }
 }
 
