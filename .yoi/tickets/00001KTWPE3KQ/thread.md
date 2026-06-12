@@ -128,3 +128,17 @@ Implementation worktree created for multi-agent handoff.
 - Next: spawn sibling coder with narrow write scope to the implementation worktree. Reviewer will be started after coder evidence is available.
 
 ---
+
+<!-- event: plan author: orchestrator at: 2026-06-12T08:47:16Z -->
+
+## Plan
+
+Coder delegated.
+
+- Coder Pod: `yoi-coder-panel-queue-sync`
+- Worktree: `/home/hare/Projects/yoi/.worktree/panel-queue-orchestrator-sync`
+- Branch: `ticket/panel-queue-orchestrator-sync`
+- Scope: read `/home/hare/Projects/yoi`, write `/home/hare/Projects/yoi/.worktree/panel-queue-orchestrator-sync`
+- Task: implement Panel Queue durable handoff with root/dev Queue commit, orchestration worktree ff-only sync, post-sync Ticket verification, and notify/kick ordering. Coder was instructed not to edit Orchestrator/main `.yoi` records or generated memory/runtime/secret-like paths.
+
+---
