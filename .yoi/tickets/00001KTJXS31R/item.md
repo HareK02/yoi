@@ -2,7 +2,7 @@
 title: "Orchestrator Idle 時の queued Ticket 見落としを防ぐ"
 state: 'inprogress'
 created_at: "2026-06-08T06:12:35Z"
-updated_at: '2026-06-12T15:47:50Z'
+updated_at: '2026-06-12T16:04:17Z'
 queued_by: 'workspace-panel'
 queued_at: '2026-06-12T14:49:40Z'
 ---

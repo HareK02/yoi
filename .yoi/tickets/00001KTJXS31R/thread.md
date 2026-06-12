@@ -277,3 +277,60 @@ Coder delegated.
 - Constraint: coder was instructed not to use root/original workspace for decision evidence or git/validation/cleanup, and not to create generated memory/local/runtime/log/lock/secret-like `.yoi` paths.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-12T16:04:17Z -->
+
+## Implementation report
+
+Coder completed implementation.
+
+Coder Pod:
+- `yoi-coder-idle-queued-rekick`
+
+Implementation branch/worktree:
+- Branch: `ticket/orchestrator-idle-queued-rekick`
+- Worktree: `/home/hare/Projects/yoi/.worktree/orchestrator-idle-queued-rekick`
+- Commit: `d2fae81a tui: add idle queued orchestrator attention`
+- Worktree status: clean
+
+Changed surfaces:
+- `crates/tui/src/multi_pod.rs`
+- `resources/prompts/panel/orchestrator_idle_queue_notice.md`
+
+Implementation summary:
+- Adds session-scoped `OrchestratorWorkSet` derived at Panel reload boundary.
+- Derives `active_inprogress`, new/actionable queued, planned queued, waiting reasons, and duplicate guards from Panel Ticket rows, local role-session claims, related Pods, blocked reasons, and live Orchestrator status.
+- Sends bounded Orchestrator attention only when Orchestrator is live/reachable/idle and queued work is actionable.
+- Suppresses attention when active_inprogress exists or duplicate-start guard indicates existing claim/Pod/worktree activity.
+- Retains waiting reason / planned queued information in Panel header detail for session-visible explanation.
+- Adds prompt resource `resources/prompts/panel/orchestrator_idle_queue_notice.md` for the attention payload, preserving the prompt-resource boundary.
+- Does not add scheduler loop, polling loop, queue drain loop, core Ticket states, or persistent work-set artifact store.
+
+Implementation note for reviewer attention:
+- Coder report used the phrase `workflow_state` for `TicketPanelEntry.workflow_state`; this is existing Panel model naming over the typed Ticket state enum, not reintroduction of obsolete Ticket frontmatter `workflow_state`.
+
+Orchestrator-verified evidence from child worktree:
+- `git status --short --branch`: clean on `ticket/orchestrator-idle-queued-rekick`
+- `cargo test -p tui queued_attention`: pass, 3 tests
+- `cargo test -p tui planned_queued_prompts`: pass, 1 test
+- `cargo test -p tui rediscovered_queued_work`: pass, 1 test
+- `cargo test -p tui active_inprogress_suppresses`: pass, 1 test
+- `cargo test -p tui idle_orchestrator_gets_bounded_attention`: pass, 1 test
+- `cargo test -p tui workspace_panel`: pass, 12 tests
+- `cargo check -p tui`: pass
+- `cargo fmt --check`: pass
+- `git diff --check orchestration/yoi-orchestrator...HEAD`: pass
+- `cargo run -p yoi -- ticket doctor`: `doctor: ok`
+- `nix build .#yoi`: pass
+
+Known broad-suite note from coder:
+- `cargo test -p tui` still fails unrelated existing/neighboring expectation tests:
+  - `multi_pod::tests::orchestrator_launch_context_uses_orchestration_root_for_runtime_workspace`
+  - `spawn::tests::profile_choices_use_project_registry_default`
+  - `spawn::tests::profile_choices_include_builtin_and_project_default_marker`
+- Focused tests for this Ticket pass; reviewer should confirm broad failures are unrelated and not introduced by this Ticket.
+
+Next:
+- Spawn read-only sibling reviewer against recorded intent, binding decisions/invariants, acceptance criteria, commit `d2fae81a`, diff, validation evidence, and known broad-suite failures.
+
+---
