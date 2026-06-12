@@ -2517,7 +2517,7 @@ fn orchestrator_queue_notification_message(
 ) -> String {
     let title = ticket.title.replace(['\r', '\n'], " ");
     format!(
-        "Workspace panel Queue for Ticket `{}`, title `{}`: human authorized Orchestrator routing; this is not an unattended scheduler. Read the Ticket and inspect current workspace state. If unblocked, record routing and transition state queued -> inprogress before any worktree/SpawnPod implementation side effects. After inprogress acceptance, use worktree-workflow for `.worktree/<task-name>` creation with tracked `.yoi` project records visible and `.yoi/memory` plus local/runtime/log/lock/secret-like `.yoi` paths excluded, then use multi-agent-workflow to run sibling coder/reviewer Pods (coder narrow child-worktree write scope, reviewer read-only by default) and stop at a merge-ready dossier without merge/close/final approval. If blocked, record a concise reason and leave the Ticket queued or return it to planning with the missing-information reason.",
+        "Workspace panel Queue for Ticket `{}`, title `{}`: human authorized Orchestrator routing; this is not an unattended scheduler. Read the Ticket and inspect current Orchestrator workspace state. If unblocked, record routing and transition state queued -> inprogress before any worktree/SpawnPod implementation side effects. After inprogress acceptance, use worktree-workflow for `.worktree/<task-name>` creation with tracked `.yoi` project records visible and `.yoi/memory` plus local/runtime/log/lock/secret-like `.yoi` paths excluded, then use multi-agent-workflow to run sibling coder/reviewer Pods (coder narrow child-worktree write scope, reviewer read-only by default). After reviewer approval and blocker resolution, integrate the implementation branch into the orchestration branch automatically, validate in the Orchestrator worktree, record the outcome, and clean up only child implementation worktrees/branches. Do not read, write, validate, merge, clean up, or run git operations in the root/original workspace. If blocked, record a concise reason and leave the Ticket queued or return it to planning with the missing-information reason.",
         ticket.id,
         title.trim()
     )
@@ -3926,7 +3926,7 @@ mod tests {
         assert!(message.contains("human authorized Orchestrator routing"));
         assert!(message.contains("not an unattended scheduler"));
         assert!(message.contains("Read the Ticket"));
-        assert!(message.contains("inspect current workspace state"));
+        assert!(message.contains("inspect current Orchestrator workspace state"));
         assert!(message.contains("transition state queued -> inprogress"));
         assert!(message.contains("before any worktree/SpawnPod implementation side effects"));
         assert!(message.contains("After inprogress acceptance"));
@@ -3940,8 +3940,12 @@ mod tests {
         assert!(message.contains("sibling coder/reviewer Pods"));
         assert!(message.contains("coder narrow child-worktree write scope"));
         assert!(message.contains("reviewer read-only by default"));
-        assert!(message.contains("merge-ready dossier"));
-        assert!(message.contains("without merge/close/final approval"));
+        assert!(message.contains(
+            "integrate the implementation branch into the orchestration branch automatically"
+        ));
+        assert!(message.contains("validate in the Orchestrator worktree"));
+        assert!(message.contains("clean up only child implementation worktrees/branches"));
+        assert!(message.contains("Do not read, write, validate, merge, clean up, or run git operations in the root/original workspace"));
         assert!(message.contains("If blocked, record a concise reason"));
         assert!(message.contains("leave the Ticket queued or return it to planning"));
         assert!(!message.contains("Do not start implementation directly"));

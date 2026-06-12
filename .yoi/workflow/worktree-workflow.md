@@ -1,34 +1,34 @@
 ---
-description: yoi プロジェクトで child git worktree を作成・管理するための機械的手順。coder Pod に作らせず、orchestrator Pod が original workspace root に対して実行する。
+description: yoi プロジェクトで child git worktree を作成・管理するための機械的手順。coder Pod に作らせず、orchestrator Pod が Orchestrator workspace/orchestration branch から実行する。
 model_invokation: true
 user_invocable: true
 requires: []
 ---
 # Worktree Workflow
 
-yoi プロジェクトで実装差分を main workspace から分離するため、`<original-workspace-root>/.worktree/<task-name>` に child git worktree を作る。これは **worktree の扱い方だけ** を定める Workflow であり、ticket 選定、coder / reviewer sibling の起動、外部レビュー、merge の運用は `$user/multi-agent-workflow` 側で扱う。
+yoi プロジェクトで実装差分を root/original workspace から分離するため、記録済み implementation worktree root の `.worktree/<task-name>` に child git worktree を作る。これは **worktree の扱い方だけ** を定める Workflow であり、ticket 選定、coder / reviewer sibling の起動、外部レビュー、orchestration branch への integration は `/multi-agent-workflow` 側で扱う。
 
-yoi では Pod の write scope が排他的に委譲されるため、child Pod の write scope は child worktree に限定する。child worktree は Yoi project records marker として tracked `.yoi` records を含んでよいが、generated/personal memory root `.yoi/memory`、local override、runtime state、logs、locks、secret-like files は出さない。Orchestrator workspace or recorded Ticket backend remains the authority for active orchestration progress and final review/approval/close.
+yoi では Pod の write scope が排他的に委譲されるため、child Pod の write scope は child worktree に限定する。child worktree は Yoi project records marker として tracked `.yoi` records を含んでよいが、generated/personal memory root `.yoi/memory`、local override、runtime state、logs、locks、secret-like files は出さない。Orchestrator workspace or recorded Ticket backend remains the place for active orchestration progress, review evidence, integration records, and Ticket lifecycle updates.
 
 ## 適用範囲
 
-この Workflow は親 Pod / 下位 orchestrator が original workspace root に対して実行する。Orchestrator が専用 worktree で動く場合でも、implementation worktree は Orchestrator cwd ではなく original workspace root 側で作成する。
+この Workflow は親 Pod / 下位 orchestrator が Orchestrator workspace/orchestration branch から実行する。root/original workspace は read/write/validation/cleanup/git 操作の対象にしない。implementation worktree は記録済み implementation worktree root 配下に作る。
 
 - coder Pod にこの Workflow を渡して worktree を作らせない。
 - coder Pod は、orchestrator が作成済みの child worktree を受け取り、その中で実装・build・test・報告を行う。
-- reviewer Pod は、coder Pod の子ではなく orchestrator 配下の sibling として、原則 read-only で main workspace と child worktree を読む。
-- ticket 作成、active orchestration progress、最終 review/approval/close は Orchestrator workspace または記録済み Ticket backend 側で扱う。
+- reviewer Pod は、coder Pod の子ではなく orchestrator 配下の sibling として、原則 read-only で child worktree と Orchestrator workspace の Ticket/context を読む。
+- ticket 作成、active orchestration progress、review evidence、integration、Ticket lifecycle update は Orchestrator workspace または記録済み Ticket backend 側で扱う。
 - branch-local artifacts / dossiers / docs/report / tracked `.yoi` project records は、実装対象に必要なら child worktree 内で扱ってよい。
 
 ## 原則
 
 - 1 ticket / 1 実装 task につき 1 worktree を作る。
 - 複数 ticket を下位 orchestrator に任せる場合も、実装差分は ticket / bounded task ごとに worktree を分ける。
-- worktree path は `<original-workspace-root>/.worktree/<task-name>`。
+- worktree path は `<implementation-worktree-root>/.worktree/<task-name>`。
 - branch 名は原則 `<task-name>` と同じ kebab-case。
 - child worktree には `.yoi` project records を出してよい。
 - child worktree では `.yoi/memory`、local/runtime/log/lock/secret-like paths を sparse checkout で除外する。
-- active orchestration progress と最終 review/approval/close は Orchestrator workspace または記録済み Ticket backend 側で扱う。branch-local artifacts/dossiers は child worktree 内に置いてよい。
+- active orchestration progress、review evidence、integration、Ticket lifecycle update は Orchestrator workspace または記録済み Ticket backend 側で扱う。branch-local artifacts/dossiers は child worktree 内に置いてよい。
 - push はしない。
 
 ## 事前確認
@@ -38,7 +38,7 @@ yoi では Pod の write scope が排他的に委譲されるため、child Pod 
 1. 対象 ticket / task が決まっているか。
 2. `<task-name>` が branch / path 名に使える kebab-case か。
 3. `git worktree add` を実行してよい許可があるか。
-4. main workspace に混ぜてはいけない未保存差分がないか。
+4. root/original workspace で実行しようとしていないか。
 5. 同名 branch / worktree が既に存在しないか。
 6. coder / reviewer を sibling として扱う orchestrator が誰か明確か。
 
@@ -46,13 +46,13 @@ yoi では Pod の write scope が排他的に委譲されるため、child Pod 
 
 ## 作成手順
 
-original workspace root で実行する。Orchestrator が別 worktree で動く場合は `git -C <original-workspace-root> ...` を使う。
+Orchestrator workspace で実行する。root/original workspace では実行しない。
 
 ```bash
-git -C <original-workspace-root> worktree add .worktree/<task-name> -b <task-name>
+git -C <orchestrator-workspace-root> worktree add <implementation-worktree-root>/.worktree/<task-name> -b <task-name> HEAD
 
-git -C <original-workspace-root>/.worktree/<task-name> sparse-checkout init --no-cone
-git -C <original-workspace-root>/.worktree/<task-name> sparse-checkout set --no-cone \
+git -C <implementation-worktree-root>/.worktree/<task-name> sparse-checkout init --no-cone
+git -C <implementation-worktree-root>/.worktree/<task-name> sparse-checkout set --no-cone \
   '/*' \
   '!/.yoi/memory/' \
   '!/.yoi/memory/**' \
@@ -95,11 +95,11 @@ git -C <original-workspace-root>/.worktree/<task-name> sparse-checkout set --no-
 確認する。
 
 ```bash
-git -C <original-workspace-root>/.worktree/<task-name> status --short --branch
-test ! -e <original-workspace-root>/.worktree/<task-name>/.yoi/memory
-if test -d <original-workspace-root>/.worktree/<task-name>/.yoi; then
-  test ! -e <original-workspace-root>/.worktree/<task-name>/.yoi/override.local.toml
-  test -z "$(find <original-workspace-root>/.worktree/<task-name>/.yoi \
+git -C <implementation-worktree-root>/.worktree/<task-name> status --short --branch
+test ! -e <implementation-worktree-root>/.worktree/<task-name>/.yoi/memory
+if test -d <implementation-worktree-root>/.worktree/<task-name>/.yoi; then
+  test ! -e <implementation-worktree-root>/.worktree/<task-name>/.yoi/override.local.toml
+  test -z "$(find <implementation-worktree-root>/.worktree/<task-name>/.yoi \
     \( -path '*/_logs' -o -path '*/logs' -o -path '*/locks' \
        -o -path '*/local' -o -path '*/runtime' -o -path '*/pods' \
        -o -path '*/sessions' -o -path '*/sockets' -o -path '*/tmp' \
@@ -121,15 +121,15 @@ Pod を使う場合、coder Pod の SpawnPod `cwd` は child worktree に設定�
 coder Pod 推奨 scope:
 
 ```text
-read:  <repo>
-write: <repo>/.worktree/<task-name>
+read:  <implementation-worktree-root>/.worktree/<task-name>
+write: <implementation-worktree-root>/.worktree/<task-name>
 ```
 
 reviewer Pod 推奨 scope:
 
 ```text
-read: <repo>
-read: <repo>/.worktree/<task-name>  # main workspace の read に含まれるなら別指定不要
+read: <implementation-worktree-root>/.worktree/<task-name>
+read: <orchestrator-workspace-root>  # Ticket/intent/review context が必要な範囲に限定する
 ```
 
 reviewer は原則 write scope を持たない。review artifact を書かせる必要がある場合だけ、ticket artifacts など限定 directory を write scope として渡す。
@@ -140,15 +140,15 @@ reviewer は原則 write scope を持たない。review artifact を書かせる
 
 - `.yoi/memory` を作らない / コピーしない / 復元しない。
 - local overrides、runtime sockets/state、Pod session mirrors、cache/tmp、logs、locks、secret-like files を作らない / コピーしない / commit しない。
-- main workspace の `TODO.md` / `tickets/` / `docs/report/` / `.yoi` を編集しない。
-- active orchestration progress と最終 review/approval/close を child worktree 内だけで完結させない。
+- root/original workspace の `TODO.md` / `tickets/` / `docs/report/` / `.yoi` を読まない・編集しない。
+- active orchestration progress、review evidence、integration、Ticket lifecycle update を child worktree 内だけで完結させない。
 - 実装対象に必要な tracked `.yoi` project records、branch-local artifacts / dossiers / docs/report は child worktree 内で扱ってよい。
 - merge / push / branch deletion / worktree remove をしない。
 - scope / permission / history persistence / prompt context 加工原則に関わる設計変更を無断で行わない。
 
 ## 完了時の扱い
 
-worktree 作成 Workflow としては、完了時に merge しない。merge、ticket 完了、worktree cleanup は記録済み merge target workspace に対して行う。merge-completion は `/multi-agent-workflow` または明示された上位 Orchestrator の権限で扱う。
+worktree 作成 Workflow としては、完了時に integration しない。orchestration branch への integration、Ticket 完了、child worktree cleanup は `/multi-agent-workflow` 側で Orchestrator workspace に対して行う。root/original workspace は対象にしない。
 
 coder Pod へ渡す完了報告項目の標準形:
 

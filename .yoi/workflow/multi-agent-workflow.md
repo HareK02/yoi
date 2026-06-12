@@ -17,7 +17,7 @@ worktree の機械的作成手順は `$user/worktree-workflow`、ユーザー依
 - 実装差分を ticket ごとの child worktree に隔離する。
 - coder Pod に narrow write scope を渡して実装させる。
 - reviewer Pod を coder の子ではなく **同じ orchestrator 配下の sibling** として立て、外部レビューを行わせる。
-- orchestrator は coder / reviewer のやり取り、修正 loop、validation、merge-ready dossier 作成に責任を持つ。
+- orchestrator は coder / reviewer のやり取り、修正 loop、orchestration branch への integration、validation、Ticket 記録、child worktree cleanup に責任を持つ。
 - 最上位 orchestrator は、コードを直接理解し切ることではなく、委譲した intent / 要件 / invariant に沿って下位 orchestrator が完了まで運んだかを acceptance する。
 
 ## Pod coordination model
@@ -29,14 +29,14 @@ worktree の機械的作成手順は `$user/worktree-workflow`、ユーザー依
   - 人間との会話相手
   - intent / 要件 / invariant / escalation 条件を定義
   - 複数の作業群を並列管理
-  - final merge / ticket close / main workspace validation を行う
+  - root/original workspace での read/write/validation/cleanup/git 操作を行う
   - 原則として line-by-line code review を主業務にしない
 
 下位 orchestrator Pod（area / concrete-ticket-set coordinator）
   - 連続した複数 concrete Ticket または大きめの concrete Ticket を完了状態まで運ぶ
   - worktree / branch / coder / reviewer / validation / 修正 loop を管理する
   - coder と reviewer を sibling として扱う
-  - 親には merge-ready dossier と残論点だけを返す
+  - orchestration branch 上の integration 結果と残論点だけを返す
 
 coder Pod
   - 指定 worktree / branch に実装する
@@ -64,7 +64,6 @@ reviewer Pod
 - Ticket lifecycle を使う場合、対象はすでに `inprogress` であるか、worktree 作成・Pod spawn・coder routing の前に Orchestrator が個別に `queued -> inprogress` acceptance を記録できる `queued` Ticket に限る。unqueued Ticket は capacity 埋めの対象にしない。
 - ticket の背景・意図・制約・受け入れ条件から、実装調査と局所 tactic 選択を coder に委ねても product / API / UX / authority / design-boundary decision を silently 固定しないと判断できる。
 - worktree 作成と git 書き込み操作について、人間の許可がある。
-- merge target workspace の unrelated dirty changes を把握している。
 - 下位 orchestrator に渡す binding decisions / invariants、implementation latitude、escalation conditions を短く書ける。
 - 設計境界・仕様・authority boundary に不確定要素があり、bounded project-context checks 後も concrete missing decision / information が残る場合、planning/requirements sync 互換入口 `ticket-preflight-workflow` の結果が ticket thread に記録されている。
 
@@ -117,9 +116,9 @@ reviewer には coder の実装方針ではなく、この intent packet と dif
 
 2. worktree 作成
    - 対象 Ticket が `queued` なら、この step の前に typed Ticket backend/tool path で `queued -> inprogress` を記録する。これより前に branch 作成、worktree 作成、Pod spawn、実装調査依頼などの implementation side effect を行わない。
-   - Orchestrator が dedicated orchestration worktree で動く場合でも、implementation worktree は Orchestrator cwd ではなく recorded original workspace root の `.worktree` 配下に作る。
-   - merge-completion は recorded merge target workspace で行い、Orchestrator cwd を merge target とみなさない。
-   - `$user/worktree-workflow` に従い `<original-workspace-root>/.worktree/<task-name>` を作る。
+   - Orchestrator が dedicated orchestration worktree で動く場合、作業対象は Orchestrator workspace/orchestration branch と child implementation worktree に限定する。root/original workspace は read/write/validation/cleanup/git 操作の対象ではない。
+   - implementation worktree は記録済み implementation worktree root の `.worktree` 配下に置く。root/original workspace は配置基準としてだけ扱い、作業対象にしない。
+   - implementation branch は Orchestrator workspace の current HEAD/orchestration branch HEAD から作り、reviewer approve 後は orchestration branch へ自動 integration する。
    - `.yoi` 自体は除外しない。tracked project records は child worktree に存在してよく、`.yoi/memory` と local/runtime/log/lock/secret-like paths だけを sparse checkout で除外する。
 
 3. coder Pod spawn
@@ -132,7 +131,7 @@ reviewer には coder の実装方針ではなく、この intent packet と dif
      - SpawnPod の `cwd` は child worktree に設定すること（`cwd` は process/tool default cwd であり、scope/authority ではない）
      - Orchestrator workspace / recorded Ticket backend の `TODO.md` / Ticket records / `docs/report/` / `.yoi` は編集しないこと
      - child worktree 内の tracked `.yoi` project records は実装対象に必要な branch-local artifacts/dossiers として編集してよいが、`.yoi/memory` や local/runtime/secret-like files は作らないこと
-     - active orchestration progress と最終 review/approval/close は Orchestrator workspace または recorded Ticket backend の責任として残すこと
+     - active orchestration progress、review、integration、Ticket lifecycle update は Orchestrator workspace または recorded Ticket backend の責任として残すこと
      - 遵守すべき binding decisions / invariants と escalation conditions
      - 実行すべき build / test / format
      - 完了報告項目
@@ -159,18 +158,18 @@ reviewer には coder の実装方針ではなく、この intent packet と dif
    - 修正後は focused validation を実行し、必要なら reviewer に再確認させる。
    - reviewer の blocker が未解決のまま親に提出しない。
 
-7. merge-ready dossier 作成
+7. orchestration branch integration
    - 親がコードを直接理解しなくても判断できるよう、変更の概念的説明と evidence をまとめる。
 
-8. merge / lifecycle
-   - 最上位 orchestrator または人間の許可を持つ orchestrator が recorded merge target workspace へ merge する。
-   - Ticket を完了処理して commit する。TODO cleanup が対象 Ticket の明示要件なら recorded merge target workspace で行う。
-   - recorded merge target workspace で必要な test / `cargo check --workspace` / `cargo fmt --check` を再実行する。
+8. integration / lifecycle
+   - reviewer approve と blocker 解消を確認し、implementation branch を Orchestrator workspace の orchestration branch へ integration する。
+   - Orchestrator workspace で必要な validation を実行し、Ticket thread に integration と validation の結果を記録する。
+   - Ticket を完了処理して commit する。TODO cleanup が対象 Ticket の明示要件なら child implementation worktree/branch に限定して行う。root/original workspace は触らない。
 
 ## coder Pod の責務
 
 - child worktree 内でのみ実装する。
-- main workspace の管理ファイルを書かない。
+- root/original workspace の管理ファイルを読まない・書かない。
 - child worktree 内の tracked `.yoi` project records は ticket 要件に必要な branch-local artifact/dossier として扱ってよい。
 - `.yoi/memory`、local/runtime state、logs、locks、secret-like files を child worktree に作らない。
 - intent / requirements / acceptance criteria / binding decisions / invariants / implementation latitude / escalation conditions を読んでから実装する。
@@ -218,14 +217,14 @@ coder Pod には child worktree 内での commit を許可してよい。
 
 ### Approve
 
-reviewer が approve し blocker が残っていない場合、明示的な standing policy として merge / validate / close / cleanup まで進める。migration boundary、runtime refresh boundary、未解決の human gate が明示されている時だけ、merge-ready dossier で止める。
+reviewer が approve し blocker が残っていない場合、Orchestrator workspace の orchestration branch への integration、validation、Ticket 記録、child worktree cleanup まで自動的に進める。root/original workspace への read/write/validation/cleanup/git 操作は行わない。
 
 1. coder Pod / reviewer Pod を停止し、scope を回収する。
-2. orchestrator が merge-ready dossier を確認する。
+2. orchestrator が Ticket、child worktree/branch、commits、reviewer verdict、validation evidence を確認する。
 3. 最上位 orchestrator が必要最小限の spot check を行う。
-4. recorded merge target workspace で `git merge --no-ff <branch>` する。
-5. Ticket を完了処理して commit する。TODO cleanup が対象 Ticket の明示要件なら同じ merge target workspace で行う。
-6. recorded merge target workspace で検証コマンドを再実行する。
+4. Orchestrator workspace の orchestration branch で implementation branch を merge または project-agreed method で integration する。
+5. Ticket を完了処理して commit する。TODO cleanup が対象 Ticket の明示要件なら child implementation worktree/branch に限定して行う。
+6. Orchestrator workspace/orchestration branch で検証コマンドを再実行する。root/original workspace では実行しない。
 7. 変更内容・commit・検証結果・残 dirty changes を報告する。
 
 ### Request changes
@@ -255,7 +254,7 @@ reviewer が approve し blocker が残っていない場合、明示的な stan
 - parallel に走らせた Pod の完了通知は取りこぼしうるため、`ReadPodOutput` と worktree 状態で確認する。
 - この節は自動 scheduler、background runner、resource graph solver、automatic queue drain loop を導入しない。parallel start は明示的な routing/acceptance の結果であり、unqueued Ticket を開始する根拠ではない。
 
-## merge-ready dossier の標準形
+## orchestration integration dossier の標準形
 
 ```text
 Status:

@@ -673,7 +673,6 @@ fn build_launch_prompt(
 
 fn append_workspace_routing_context(out: &mut String, context: &TicketRoleLaunchContext) {
     let original_workspace_root = context.original_workspace_root();
-    let target_workspace_root = context.target_workspace_root();
     let implementation_worktree_root = context.implementation_worktree_root();
     let should_emit = context.original_workspace_root.is_some()
         || context.target_workspace_root.is_some()
@@ -701,14 +700,15 @@ fn append_workspace_routing_context(out: &mut String, context: &TicketRoleLaunch
         "implementation_worktree_root",
         &implementation_worktree_root.display().to_string(),
     );
-    push_bounded_bullet(
-        out,
-        "merge_target_workspace_root",
-        &target_workspace_root.display().to_string(),
-    );
-    out.push_str(
-        "- Treat `role_workspace_root` as the launched role runtime workspace/Ticket backend root. Create implementation worktrees under `implementation_worktree_root`, not relative to the role cwd, and run merge-completion against `merge_target_workspace_root`. `implementation_worktree_root` is placement authority only; implementation branches are based on the Orchestrator workspace current HEAD / orchestration branch HEAD, not the merge-target workspace or `develop` HEAD.\n",
-    );
+    if context.role == TicketRole::Orchestrator {
+        out.push_str(
+            "- Treat `role_workspace_root` / `role_cwd` as the Orchestrator workspace on the orchestration branch. Use `implementation_worktree_root` only as the placement root for child implementation worktrees; do not operate on `original_workspace_root` itself. Root/original workspace reads, writes, validation, cleanup, and git operations are prohibited. Create implementation branches from the Orchestrator workspace current HEAD / orchestration branch HEAD and integrate reviewed work back into that orchestration branch automatically.\n",
+        );
+    } else {
+        out.push_str(
+            "- Treat `role_workspace_root` as the launched role runtime workspace/Ticket backend root. Create implementation worktrees under `implementation_worktree_root`, not relative to the role cwd, and run role work against the recorded workspace routing context.\n",
+        );
+    }
 }
 
 fn append_role_execution_guidance(
@@ -1274,11 +1274,11 @@ workflow = "ticket-review-workflow"
         assert!(orchestrator_text.contains("branch-local reviewer verdicts"));
         assert!(orchestrator_text.contains("binding decisions/invariants"));
         assert!(orchestrator_text.contains("not unrecorded preferred tactics"));
-        assert!(orchestrator_text.contains("merge-ready dossier"));
+        assert!(orchestrator_text.contains("integration outcome"));
         assert!(orchestrator_text.contains(
-            "Stop at a merge-ready dossier only when merge-completion authority is absent"
+            "integrate the implementation branch into the orchestration branch automatically"
         ));
-        assert!(orchestrator_text.contains("continue through merge, validation, Ticket close"));
+        assert!(orchestrator_text.contains("Root/original workspace reads, writes, validation, cleanup, and git operations are prohibited"));
 
         let mut coder = TicketRoleLaunchContext::new(temp.path(), TicketRole::Coder);
         coder.ticket = Some(TicketRef::id("20260605-190330-ticket-role-pod-launcher"));
@@ -1314,18 +1314,20 @@ workflow = "ticket-review-workflow"
         assert!(reviewer_text.contains("read-only by default"));
         assert!(reviewer_text.contains("recorded intent, binding decisions/invariants"));
         assert!(reviewer_text.contains("not unrecorded preferred tactics"));
-        assert!(reviewer_text.contains("branch-local reviewer verdict"));
-        assert!(reviewer_text.contains("Do not record final main-branch Ticket approval"));
+        assert!(reviewer_text.contains("Orchestrator-side integration"));
+        assert!(
+            reviewer_text
+                .contains("Do not merge, close, push, operate on the root/original workspace")
+        );
     }
 
     #[test]
-    fn orchestrator_prompt_covers_merge_completion_authority_and_dossier_boundaries() {
+    fn orchestrator_prompt_covers_orchestration_branch_integration_boundary() {
         let temp = TempDir::new().unwrap();
         write_builtin_role_config(temp.path(), &[TicketRole::Orchestrator]);
         let mut orchestrator = TicketRoleLaunchContext::new(temp.path(), TicketRole::Orchestrator);
-        orchestrator.ticket = Some(TicketRef::id("orchestrator-merge-completion"));
-        orchestrator.intent_packet =
-            Some("Complete an already-reviewed merge-ready Ticket.".into());
+        orchestrator.ticket = Some(TicketRef::id("orchestrator-integration"));
+        orchestrator.intent_packet = Some("Complete an already-reviewed Ticket.".into());
         orchestrator.validation = vec!["cargo test -p client ticket_role --lib".into()];
         orchestrator = orchestrator
             .with_original_workspace_root(temp.path().join("original"))
@@ -1349,56 +1351,24 @@ workflow = "ticket-review-workflow"
         assert!(text.contains("Workspace routing context:"));
         assert!(text.contains("role_workspace_root"));
         assert!(text.contains("implementation_worktree_root"));
-        assert!(text.contains("merge_target_workspace_root"));
-        assert!(text.contains("not relative to the role cwd"));
-        assert!(text.contains("`implementation_worktree_root` is placement authority only"));
-        assert!(text.contains("implementation branches are based on the Orchestrator workspace current HEAD / orchestration branch HEAD"));
-        assert!(text.contains("not the merge-target workspace or `develop` HEAD"));
-        assert!(text.contains("Orchestrator merge-completion guidance"));
-        assert!(text.contains("`inprogress` Ticket with a merge-ready dossier"));
-        assert!(text.contains("Conservative or missing authorization mode stops at the dossier"));
-        assert!(text.contains("explicit user/standing policy may authorize continuing"));
-        assert!(text.contains("dossier branch/worktree/commits match the branch to merge"));
-        assert!(text.contains("independent reviewer approval exists in the dossier"));
-        assert!(text.contains("explicit human override decision is recorded"));
-        assert!(text.contains("the merge target workspace is safe"));
-        assert!(text.contains("unrelated dirty changes are understood"));
-        assert!(text.contains("dogfooding/workspace policy grants merge authority"));
-        assert!(text.contains("branch-local reviewer verdicts are dossier evidence"));
-        assert!(text.contains("final main-branch Ticket approval or close happens only during authorized merge-completion"));
-        assert!(text.contains("stop/reclaim coder and reviewer Pods"));
-        assert!(text.contains("git merge --no-ff <branch>"));
-        assert!(text.contains("run post-merge validation appropriate to the change"));
+        assert!(text.contains("Orchestrator workspace on the orchestration branch"));
+        assert!(text.contains("Root/original workspace reads, writes, validation, cleanup, and git operations are prohibited"));
+        assert!(text.contains("Create implementation branches from the Orchestrator workspace current HEAD / orchestration branch HEAD"));
         assert!(
-            text.contains("record review, merge, and validation outcomes in the Ticket thread")
+            text.contains(
+                "integrate reviewed work back into that orchestration branch automatically"
+            )
         );
+        assert!(text.contains("Orchestrator implementation integration guidance"));
+        assert!(
+            text.contains("Integrate only within the Orchestrator workspace/orchestration branch")
+        );
+        assert!(text.contains("root/original workspace is not an integration target"));
+        assert!(text.contains("merge or otherwise integrate that implementation branch into the orchestration branch automatically"));
         assert!(text.contains(
-            "transition `inprogress -> done` or close according to typed Ticket workflow rules"
+            "Run post-integration validation from the Orchestrator workspace/orchestration branch"
         ));
-        assert!(text.contains(
-            "remove the merged child worktree and delete the merged branch unless explicitly kept"
-        ));
-        assert!(text.contains("Required dossier fields before merge"));
-        assert!(text.contains("Ticket id"));
-        assert!(text.contains("branch/worktree"));
-        assert!(text.contains("commits"));
-        assert!(text.contains("intent/invariant check"));
-        assert!(text.contains("implementation summary"));
-        assert!(text.contains("coder/reviewer Pods"));
-        assert!(text.contains("blockers fixed or rejected findings with reasons"));
-        assert!(text.contains("validation performed"));
-        assert!(text.contains("residual risks"));
-        assert!(text.contains("dirty state"));
-        assert!(text.contains("parent/human decision needs if any"));
-        assert!(text.contains("Post-merge validation baseline"));
-        assert!(text.contains("focused tests from the Ticket/dossier"));
-        assert!(text.contains("cargo fmt --check"));
-        assert!(text.contains("git diff --check"));
-        assert!(text.contains("target/debug/yoi ticket doctor"));
-        assert!(text.contains("where applicable"));
-        assert!(text.contains("cargo check --workspace --all-targets"));
-        assert!(text.contains("nix build .#yoi"));
-        assert!(text.contains("when risk, API surface, packaging, runtime resources, prompts, or touched files warrant it"));
+        assert!(text.contains("Cleanup is limited to the child implementation worktree/branch"));
     }
 
     #[test]
