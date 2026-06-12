@@ -226,3 +226,19 @@ Next:
 - Spawn read-only sibling reviewer against the recorded intent, binding decisions/invariants, acceptance criteria, implementation commit `a87d3154`, synced review head `724b79f1`, diff, validation evidence, and known broad-suite failures.
 
 ---
+
+<!-- event: plan author: orchestrator at: 2026-06-12T15:23:52Z -->
+
+## Plan
+
+Reviewer delegated.
+
+- Reviewer Pod: `yoi-reviewer-companion-progress-notify`
+- Target branch/worktree: `ticket/orchestrator-progress-companion-notify` at `/home/hare/Projects/yoi/.worktree/orchestrator-progress-companion-notify`
+- Implementation commit: `a87d3154 feat: weak companion progress notify`
+- Synced review head: `724b79f1 Merge branch 'orchestration/yoi-orchestrator' into ticket/orchestrator-progress-companion-notify`
+- Scope: read-only child worktree plus minimal non-recursive runtime-root read required by spawn validation.
+- Review basis: recorded IntentPacket, binding decisions/invariants, acceptance criteria, implementation summary, diff after syncing with current Orchestrator branch, focused validation evidence, `nix build` evidence, and known broad-suite failures.
+- Reviewer focus: no AutoKick/re-kick/scheduler behavior, legacy notify compatibility, bounded/history-backed progress notices, missing/stopped Companion no-op, no authority expansion, Panel freshness UI compatibility with merged focus model, and robust focused tests.
+
+---
