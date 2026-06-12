@@ -348,3 +348,50 @@ Next:
 - Request reviewer re-review of fix commit `61e6c068`, focusing on the prompt-resource boundary blocker, retention of weak notify safety invariants, dependency/package updates, and validation evidence.
 
 ---
+
+<!-- event: review author: reviewer:yoi-reviewer-companion-progress-notify at: 2026-06-12T15:42:21Z status: approve -->
+
+## Review: approve
+
+Approve.
+
+The previous requested-change blocker is resolved.
+
+Review findings:
+- Prompt/resource boundary is now satisfied:
+  - Companion progress notice framing lives in `resources/prompts/panel/companion_progress_notice.md`.
+  - Rust only builds bounded runtime values and renders the prompt resource via `minijinja`.
+  - `COMPANION_PROGRESS_NOTICE_TEMPLATE` uses `include_str!` to load the resource.
+  - `render_companion_progress_notice_template()` renders with strict `minijinja` undefined behavior.
+  - Focused test `companion_progress_notice_uses_prompt_resource_template` confirms rendering comes from the resource.
+  - Grep for prior hard-coded framing found no Rust production copy of the prompt text; only test assertion remains.
+- Weak notify invariants remain intact:
+  - Companion progress dispatch still uses `send_notify_only(..., false)`.
+  - `auto_run:false` controller behavior remains covered by pod controller tests.
+  - `auto_run:true` legacy behavior remains covered by protocol/controller tests.
+- Missing/stopped/unreachable Companion remains no-op:
+  - Target selection still requires Companion panel state to be peer-reachable and a live reachable socket.
+  - No spawn/restore path is introduced for progress delivery.
+- No Companion authority expansion found:
+  - The fix touches prompt rendering, TUI dependency metadata, `Cargo.lock`, and `package.nix`; it does not alter Companion profile/tool authority.
+- Bounded/sensitive-safe summary remains preserved:
+  - Runtime values are bounded before/after rendering.
+  - The summary still uses ticket id/state/title/ref and role pod status, not thread excerpts, diagnostics, Pod output, or provider error details.
+- Dependency/package updates are appropriate:
+  - `minijinja = "2.19.0"` is already used elsewhere in the workspace (`crates/pod`), so adding it to `crates/tui` does not introduce an unexpected new dependency family.
+  - `Cargo.lock` and `package.nix` `cargoHash` were updated, and `nix build .#yoi` passes.
+
+Reviewer-run validation:
+- `git diff --check orchestration/yoi-orchestrator...HEAD`: pass
+- `cargo test -p tui companion_progress -- --nocapture`: pass, 6 tests
+- `cargo test -p tui send_notify_only_can_deliver_weak_notification_without_auto_run -- --nocapture`: pass, 1 test
+- `cargo check -p protocol -p pod -p tui`: pass
+- `cargo fmt --check`: pass
+- `cargo run -p yoi -- ticket doctor`: `doctor: ok`
+- `nix build .#yoi`: pass
+- `cargo test -p protocol`: pass, 39 tests
+- `cargo test -p pod --test controller_test`: pass, 36 tests
+
+No blocking issues remain.
+
+---
