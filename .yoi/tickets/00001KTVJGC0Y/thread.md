@@ -120,3 +120,19 @@ Next action:
 Routing accepted for implementation. Ticket body/thread, relation blockers, orchestration plan, relevant Ticket language / tool / feature / prompt code map, current Orchestrator workspace state, and active parallel work were rechecked. No unresolved blocker or missing planning decision remains. Implementation side effects will start only after this accepted `queued -> inprogress` transition is recorded, using accepted plan `orch-plan-20260612-145344-1`.
 
 ---
+
+<!-- event: plan author: orchestrator at: 2026-06-12T14:54:49Z -->
+
+## Plan
+
+Implementation worktree created for multi-agent handoff.
+
+- Ticket: `00001KTVJGC0Y`
+- Branch: `ticket/ticket-language-guidance-all-tools`
+- Worktree: `/home/hare/Projects/yoi/.worktree/ticket-language-guidance-all-tools`
+- Base: Orchestrator workspace HEAD `76d358e8` (`orchestration/yoi-orchestrator`), including the accepted routing record and `queued -> inprogress` transition.
+- Parallel work note: active child worktrees are `panel-focus-composer-row-selection` and `orchestrator-progress-companion-notify`; this Ticket should stay within Ticket language/tool/feature/prompt guidance surfaces and avoid coupling to their implementation branches.
+- Scope rule: implementation work happens only in this child worktree. Root/original workspace must not be read, written, validated, merged, cleaned, or used for git operations.
+- Next: spawn sibling coder with narrow write scope to the implementation worktree. Reviewer will be started after coder evidence is available.
+
+---
