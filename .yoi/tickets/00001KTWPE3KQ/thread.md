@@ -178,3 +178,82 @@ Reviewer delegated.
 - Reviewer focus: durable Queue handoff ordering, root/orchestration worktree identity and cleanliness checks, ff-only-only sync, pathscope of Queue commit, no auto conflict/stash/rebase, notify only after sync + Ticket verification, and whether `--no-verify` is acceptable.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-12T09:12:16Z -->
+
+## Implementation report
+
+Merge-ready dossier (human/parent merge authority required before merge/close/cleanup)
+
+Ticket:
+- `00001KTWPE3KQ` — Panel Queue時にdevとOrchestrator worktreeを同期する
+
+Branch / worktree:
+- Branch: `ticket/panel-queue-orchestrator-sync`
+- Worktree: `/home/hare/Projects/yoi/.worktree/panel-queue-orchestrator-sync`
+- Implementation commit: `04a3c6e0` (`tui: make panel queue handoff durable`)
+
+Intent / invariant check:
+- Panel Queue action is now implemented as root/dev-side Ticket `ready -> queued` mutation plus Queue commit, ff-only sync into the dedicated orchestration worktree, then Orchestrator notify/kick only after sync and Ticket-state verification.
+- Automatic sync path is constrained to `git -C <orchestration_worktree> merge --ff-only <queue_commit_sha>`.
+- No automatic merge commit, rebase, stash, patch apply, conflict resolution, or dirty cleanup path was found.
+- Runtime workspace root / cwd / orchestration worktree / merge target separation remains path-explicit.
+
+Implementation summary:
+- `crates/tui/src/multi_pod.rs` changed.
+- Added Panel Queue preflight for root/orchestration Git identity, branch state, shared common dir, clean worktrees, root Ticket `ready` state, and orchestration-head ancestry.
+- Added root-side Queue commit creation scoped to the target Ticket record.
+- Added ff-only orchestration worktree sync and post-sync verification that orchestration HEAD contains the Queue commit and orchestration Ticket backend reads the Ticket as `queued`.
+- Added focused tests for successful Queue handoff, dirty root blocking, and orchestration branch divergence blocking.
+
+Coder evidence:
+- Coder Pod: `yoi-coder-panel-queue-sync`
+- Commit: `04a3c6e0`
+- Coder reported `cargo fmt --check`, `cargo check -p tui`, `cargo test -p tui ticket_queue_action -- --nocapture`, `git diff --check`, `nix build .#yoi`, and `./result/bin/yoi ticket doctor` passed. Full `cargo test -p tui` had unrelated existing failures reported by coder.
+
+Orchestrator validation evidence:
+- `git diff --check HEAD^..HEAD` — pass
+- `cargo test -p tui ticket_queue_action -- --nocapture` — pass
+- `cargo fmt --check` — pass
+- `cargo check -p tui --all-targets` — pass
+- `nix build .#yoi` — pass
+- `./result/bin/yoi ticket doctor` — `doctor: ok`
+
+Reviewer evidence:
+- Reviewer Pod: `yoi-reviewer-panel-queue-sync`
+- Verdict: approve.
+- Reviewer reran `git diff --check HEAD^..HEAD` and `cargo test -p tui ticket_queue_action -- --nocapture`; both passed.
+- Reviewer found pre-mutation checks, root-side mutation/commit, ff-only sync, notify-after-verify ordering, path-explicit workspace separation, and failure-message specificity acceptable.
+- Reviewer did not treat `--no-verify` as a blocker for the automatic target-Ticket-record metadata commit; noted the tradeoff that local commit hooks do not run.
+
+Blockers fixed / rejected findings:
+- No reviewer blocker.
+- `--no-verify` retained as non-blocking per reviewer rationale: hook-side effects are less acceptable for this narrow automatic Ticket metadata commit than skipping local hooks, with pathscope checks and post-validation covering the handoff.
+
+Residual risks:
+- If sync or verify fails after the root Queue commit is created, the root/dev side remains durably queued and committed; manual follow-up may be required.
+- Clean-worktree checks are preflight checks, not a global lock against concurrent filesystem/git changes during the action.
+- Current root workspace is dirty from separate Panel/user activity (`00001KTVPS6K3` queue attempt and `crates/tui/src/multi_pod.rs` local changes), so merge target safety must be rechecked before any merge.
+
+Dirty state:
+- Implementation worktree was checked clean after commit.
+- Orchestrator worktree has only Ticket dossier changes before this record is committed.
+- Root/merge-target workspace is dirty and must not be used for merge until understood/cleaned or explicitly authorized.
+
+Decision needs:
+- Explicit merge-completion authority is required before merging `ticket/panel-queue-orchestrator-sync` into the recorded merge target, marking final review/done/close, stopping cleanup, or deleting the worktree/branch.
+- If authority is granted later, recheck branch/worktree/commit identity, independent approval, target dirty state, and rerun post-merge validation before Ticket completion.
+
+---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-12T09:12:25Z -->
+
+## Implementation report
+
+Coder/reviewer Pods stopped after merge-ready dossier was recorded.
+
+- Stopped: `yoi-coder-panel-queue-sync`
+- Stopped: `yoi-reviewer-panel-queue-sync`
+- Implementation worktree/branch are retained for explicit merge-completion authority.
+
+---
