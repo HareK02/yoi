@@ -30,3 +30,93 @@ Ticket を `workspace-panel` が queued にしました。
 
 
 ---
+
+<!-- event: decision author: orchestrator at: 2026-06-12T14:54:15Z -->
+
+## Decision
+
+Routing decision: implementation_ready
+
+Reason:
+- Ticket body は `ticket.language` guidance を Ticket role launch prompt 専用ではなく、Ticket tools を持つすべての Pod に model-visible に届ける要件を明確に記録している。
+- `worker.language` / `memory.language` / `ticket.language` の責務分離、hidden context-only injection 禁止、既存 Ticket record の一括 rewrite 禁止が binding invariant として記録済みである。
+- risk flags は prompt-context / tool-description / feature-boundary / ticket-language / companion だが、bounded context check の結果、具体的な未決定 design/API/authority 判断は残っていない。実装方式は Ticket capability/tool surface または feature-scoped system prompt path の範囲で coder が選べる。
+- Relation blocker はなく、OrchestrationPlan に accepted plan `orch-plan-20260612-145344-1` を記録済み。
+- 現在 active coder は `00001KTVJFT6F`（Panel focus）と `00001KTTW04W2`（Companion progress notify）だが、この Ticket の主対象は Ticket language guidance の prompt/tool/feature boundary であり、Panel UI 変更とは独立している。Companion-adjacent確認はあるが、authority強化や progress notify implementation と結合しないように実装・reviewで確認する。
+
+Evidence checked:
+- Ticket body / thread: requirements, acceptance criteria, binding decisions, implementation latitude, escalation conditions, validation, intake summary, `ready -> queued` event を確認。
+- TicketRelationQuery: outgoing/incoming relation なし、blocker なし。
+- TicketOrchestrationPlanQuery: 既存 record なし、今回 accepted plan を記録。
+- Code/resource map: `ticket.language` / `Ticket record language` / Ticket tool/backend/feature/prompt surfaces を narrow search で確認。直近の role launch split により Ticket role first-run prompt から language guidance が外れているため、本 Ticket の universal delivery 実装が次の自然な境界であることを確認。
+- Workspace/Pod state: Orchestrator worktree clean、active child worktree は別 branch/scope。
+
+IntentPacket:
+
+Intent:
+- `ticket.language` guidance を Ticket role 固有の launch prompt ではなく、Ticket-writing tools を持つすべての Pod に durable/model-visible な形で届ける。
+- Companion-style non-Ticket-role context でも Ticket tool body / durable Ticket record を configured `ticket.language` に従って書く guidance が見えるようにする。
+
+Binding decisions / invariants:
+- `ticket.language` は durable Ticket record / Ticket tool body writing policy であり、Ticket role 固有 policy ではない。
+- `worker.language` は通常 prose、`memory.language` は Memory/Knowledge generation、`ticket.language` は durable Ticket records / Ticket tool bodies の責務に分ける。
+- `ticket.language` が設定されていても protocol literals、file paths、commands、logs、identifiers、quoted external text を不要に翻訳しない。
+- hidden context-only injection を作らない。guidance は tool surface / feature-scoped system prompt / committed prompt path など、モデルから見える根拠を残す。
+- 既存 Ticket records を翻訳・一括 rewrite しない。
+- Companion default authority を強化しない。
+
+Requirements / acceptance criteria:
+- Ticket tools を持つ non-Ticket-role Pod、特に Companion-style context でも guidance が model-visible になる。
+- Ticket role Pods でも同等 guidance が届き、既存挙動が退行しない。
+- guidance source は universal Ticket capability / tool surface または feature-scoped system prompt path にあり、Ticket role launch prompt 専用ではない。
+- `worker.language` が `ticket.language` を override しない。
+- focused test または snapshot-style verification で Ticket role と generic / Companion-style Ticket-capable context の両方を確認する。
+- `nix build .#yoi` が通る。
+
+Implementation latitude:
+- Ticket tool descriptions/schema text に configured Ticket language instruction を入れる方式、または Ticket feature/capability が有効な Pod への feature-scoped prompt guidance を使う方式を選んでよい。
+- 既存 architecture を広く作り替えず、現在の ToolRegistry/feature/prompt resource 境界に合う最小実装を選ぶ。
+- Tests は prompt snapshot 全体に brittle にせず、language guidance の存在/非混同を直接確認する。
+
+Escalate if:
+- Tool descriptions が configured Ticket language に依存できず、広い ToolRegistry redesign が必要になる。
+- feature-scoped prompt guidance が history に残らない context mutation を必要とする。
+- Companion の Ticket capability path から Ticket config にアクセスできない。
+- 実装が Ticket record language と worker response language を混同する。
+- Companion authority を増やす必要が出る。
+
+Validation:
+- Ticket role prompt/context の focused test。
+- generic / Companion-style Ticket-capable context の guidance 確認 test。
+- relevant focused `cargo test`。
+- `cargo fmt --check`。
+- `git diff --check`。
+- `./result/bin/yoi ticket doctor` または同等。
+- `nix build .#yoi`。
+
+Current code map:
+- `crates/ticket/src/config.rs`: `ticket.language` config parsing / validation。
+- `crates/ticket/src/tool.rs`: Ticket tool definitions/descriptions and tests。
+- `crates/pod/src/feature/builtin/ticket.rs`: Ticket feature registration/capability/tool exposure。
+- `crates/pod/src/prompt/*`: feature/system prompt integration if needed。
+- `crates/client/src/ticket_role.rs`: ensure Ticket role launch still receives guidance through the new universal path, not first-run Submit prose。
+
+Critical risks / reviewer focus:
+- guidance が Ticket role launch prompt 専用に戻っていないこと。
+- non-role Ticket-capable context にも model-visible に届くこと。
+- hidden ephemeral context injection ではなく、tool/feature/prompt surface として履歴・prompt根拠が残ること。
+- `worker.language` と `ticket.language` を混同しないこと。
+- Companion authority / Ticket mutation authority を強化しないこと。
+
+Next action:
+- `queued -> inprogress` を記録してから、branch `ticket/ticket-language-guidance-all-tools` / worktree `/home/hare/Projects/yoi/.worktree/ticket-language-guidance-all-tools` を作成し、sibling coder に narrow write scope で実装を委譲する。Reviewer は coder evidence 後に read-only で起動する。
+
+---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-12T14:54:22Z from: queued to: inprogress reason: orchestrator_acceptance field: state -->
+
+## State changed
+
+Routing accepted for implementation. Ticket body/thread, relation blockers, orchestration plan, relevant Ticket language / tool / feature / prompt code map, current Orchestrator workspace state, and active parallel work were rechecked. No unresolved blocker or missing planning decision remains. Implementation side effects will start only after this accepted `queued -> inprogress` transition is recorded, using accepted plan `orch-plan-20260612-145344-1`.
+
+---
