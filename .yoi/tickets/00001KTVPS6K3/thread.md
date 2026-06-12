@@ -193,3 +193,42 @@ Coder delegated.
 - Constraint: coder was instructed not to use root/original workspace for decision evidence or git/validation/cleanup, and not to create generated memory/local/runtime/log/lock/secret-like `.yoi` paths.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-12T12:56:48Z -->
+
+## Implementation report
+
+Coder completed implementation.
+
+Coder Pod:
+- `yoi-coder-role-launch-input`
+
+Implementation branch/worktree:
+- Branch: `ticket/shorten-ticket-role-launch-input`
+- Worktree: `/home/hare/Projects/yoi/.worktree/shorten-ticket-role-launch-input`
+- Commit: `949531a0 client: shorten ticket role launch input`
+- Worktree status: clean
+
+Changed surfaces:
+- `crates/client/src/ticket_role.rs`
+- `crates/manifest/src/profile.rs`
+- `crates/pod/src/prompt/loader.rs`
+- `resources/profiles/{intake,orchestrator,coder,reviewer}.lua`
+- `resources/prompts/role/{intake,orchestrator,coder,reviewer}.md`
+- removed obsolete `resources/prompts/ticket_role/*.md`
+- `resources/workflows/{multi-agent-workflow,ticket-intake-workflow,ticket-orchestrator-routing}.md`
+
+Orchestrator-verified evidence from child worktree:
+- `git status --short --branch` clean on `ticket/shorten-ticket-role-launch-input`
+- `cargo test -p client ticket_role --lib`: pass, 16 tests
+- `cargo test -p manifest builtin_role_profiles_are_registered_and_resolve --lib`: pass, 1 test
+- `cargo test -p pod builtin_ticket_role_instructions_resolve --lib`: pass, 1 test
+- `cargo fmt --check`: pass
+- `git diff --check orchestration/yoi-orchestrator...HEAD`: pass
+- `./result/bin/yoi ticket doctor`: `doctor: ok`
+- `nix build .#yoi`: pass
+
+Next:
+- Spawn read-only sibling reviewer against the recorded intent, binding decisions/invariants, acceptance criteria, commit `949531a0`, diff, and validation evidence.
+
+---
