@@ -142,3 +142,26 @@ Coder delegated.
 - Task: implement Panel Queue durable handoff with root/dev Queue commit, orchestration worktree ff-only sync, post-sync Ticket verification, and notify/kick ordering. Coder was instructed not to edit Orchestrator/main `.yoi` records or generated memory/runtime/secret-like paths.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-12T09:05:32Z -->
+
+## Implementation report
+
+Coder completed initial implementation.
+
+- Coder Pod: `yoi-coder-panel-queue-sync`
+- Implementation branch: `ticket/panel-queue-orchestrator-sync`
+- Implementation commit: `04a3c6e0` (`tui: make panel queue handoff durable`)
+- Worktree status checked clean.
+
+Orchestrator validation performed after coder handoff:
+- `git diff --check HEAD^..HEAD` — pass
+- `cargo test -p tui ticket_queue_action -- --nocapture` — pass
+- `cargo fmt --check` — pass
+- `cargo check -p tui --all-targets` — pass
+- `nix build .#yoi` — pass
+- `./result/bin/yoi ticket doctor` — `doctor: ok`
+
+Next: delegate independent reviewer against the recorded Ticket intent, accepted plan, implementation commit, and validation evidence.
+
+---
