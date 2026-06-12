@@ -396,3 +396,47 @@ Non-blocking risks:
 - Duplicate guard depends on the Panel’s existing visible claim/pod/worktree derivation, so it prevents duplicate starts for locally visible state but is not a full global scheduler/lock. This matches the Ticket’s bounded Panel-attention scope.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-12T16:11:43Z -->
+
+## Implementation report
+
+Integration completed in the Orchestrator workspace.
+
+Integrated implementation:
+- Ticket: `00001KTJXS31R`
+- Implementation branch: `ticket/orchestrator-idle-queued-rekick`
+- Implementation commit: `d2fae81a tui: add idle queued orchestrator attention`
+- Reviewer result: approve, no blockers
+- Orchestrator merge commit: `9538feb1 merge: idle queued orchestrator attention`
+- Integration target: `orchestration/yoi-orchestrator`
+
+Post-integration validation from Orchestrator worktree:
+- `cargo test -p tui queued_attention`: pass, 3 tests
+- `cargo test -p tui planned_queued_prompts`: pass, 1 test
+- `cargo test -p tui rediscovered_queued_work`: pass, 1 test
+- `cargo test -p tui active_inprogress_suppresses`: pass, 1 test
+- `cargo test -p tui idle_orchestrator_gets_bounded_attention`: pass, 1 test
+- `cargo test -p tui workspace_panel`: pass, 12 tests
+- `cargo check -p tui`: pass
+- `cargo fmt --check`: pass
+- `git diff --check HEAD~1..HEAD`: pass
+- `./result/bin/yoi ticket doctor`: `doctor: ok`
+- `nix build .#yoi`: pass
+
+Known broad-suite failures:
+- Existing broad `cargo test -p tui` failures noted by coder/reviewer remain outside this Ticket and were not blockers for focused implementation/review.
+
+Remaining non-blocking risks:
+- Failed attention delivery is not fingerprint-marked, so a repeatedly reachable-but-rejecting socket can retry on subsequent Panel reloads; this is consistent with existing notice behavior but may be noisy.
+- Duplicate guard is bounded to Panel-visible claim/Pod/worktree derivation and is not a full global scheduler/lock, matching this Ticket's scoped attention model.
+
+---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-12T16:11:51Z from: inprogress to: done reason: implementation_merged_and_validated field: state -->
+
+## State changed
+
+Implementation was merged into the Orchestrator branch, reviewer approved with no blockers, and post-integration validation passed. Cleanup and closure will be recorded next.
+
+---
