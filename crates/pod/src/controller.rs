@@ -555,9 +555,12 @@ where
                 crate::feature::builtin::ticket::TicketFeatureAccess::Lifecycle
             }
         };
+        // Ticket tools are typed operations over the currently checked-out work
+        // tree. Use the Pod cwd rather than the runtime workspace root so a
+        // dedicated Orchestrator worktree gets its own `.yoi/tickets` backend.
         feature_registry.add_module(
             crate::feature::builtin::ticket::ticket_tools_feature_with_options(
-                &workspace_root,
+                &cwd,
                 feature_config.ticket.enabled.then_some(ticket_access),
                 feature_config.ticket_orchestration.enabled,
             ),
