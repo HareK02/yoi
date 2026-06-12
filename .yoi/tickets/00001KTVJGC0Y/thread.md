@@ -217,3 +217,42 @@ Reviewer delegated.
 - Reviewer focus: universal Ticket tool/capability guidance, Ticket role and generic/Companion-style coverage, worker/memory/ticket language separation, no hidden context-only injection, no authority expansion, and robust focused tests.
 
 ---
+
+<!-- event: review author: reviewer:yoi-reviewer-ticket-language-guidance at: 2026-06-12T15:16:59Z status: approve -->
+
+## Review: approve
+
+Approve.
+
+Review target:
+- Worktree: `/home/hare/Projects/yoi/.worktree/ticket-language-guidance-all-tools`
+- Commit: `92c4dee7 ticket: guide Ticket tool language universally`
+
+Evidence:
+- 差分は `crates/ticket/src/tool.rs` と `crates/pod/src/feature/builtin/ticket.rs` に限定されている。
+- guidance は shared `ticket_tool_description(name, record_language)` で生成され、registered Ticket tools の `ToolMeta.description` と builtin Ticket feature の `ToolDeclaration` descriptions の両方に使われている。
+- guidance は Ticket tool / capability surface で model-visible であり、hidden context injection でも `ticket_role` launch prompt fragment でもない。
+- `ticket.language` は `worker.language` / `memory.language` と区別され、protocol literals、paths、commands、logs、identifiers、quoted external text は fidelity 優先で保持する guidance が明記されている。
+- read-only Companion-style access は read-only のままで、mutating tool exposure は拡大していない。
+- Ticket role-style lifecycle access も同じ universal tool-description path でカバーされている。
+- first-run Ticket role text は record-language guidance を launch prose に戻していない。
+
+Reviewer-run validation:
+- `cargo test -p ticket ticket_record_language_guidance`: pass
+- `cargo test -p pod ticket_language_guidance`: pass
+- `cargo test -p ticket`: pass, 68 tests
+- `cargo test -p client ticket_record_language_stays_out_of_first_run_text`: pass
+- `cargo fmt --check`: pass
+- `git diff --check orchestration/yoi-orchestrator...HEAD`: pass
+- `cargo run -p yoi -- ticket doctor`: `doctor: ok`
+- `nix build .#yoi`: pass
+
+Known broad `cargo test -p pod` failures:
+- Reviewer reproduced the two prompt assertion failures on HEAD, both for missing `worktree status, diff, and test results`.
+- This branch has no diff under `crates/pod/src/prompt` or `resources/prompts`, and implementation diff is confined to Ticket tool/feature files.
+- Together with Orchestrator’s base-branch verification, these failures are pre-existing/unrelated and not a blocker for this Ticket.
+
+Non-blocking risk:
+- When configured, language guidance is appended to every Ticket tool description, including read-only tools. This repeats some prompt text, but it is an intentional universal capability-surface tradeoff and satisfies the acceptance criteria.
+
+---
