@@ -2,7 +2,7 @@
 title: 'Ticket language guidance must apply to all Ticket tool users'
 state: 'inprogress'
 created_at: '2026-06-11T14:48:44Z'
-updated_at: '2026-06-12T14:55:42Z'
+updated_at: '2026-06-12T15:10:38Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['prompt-context', 'tool-description', 'feature-boundary', 'ticket-language', 'companion']

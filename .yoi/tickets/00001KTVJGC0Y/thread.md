@@ -152,3 +152,53 @@ Coder delegated.
 - Constraint: coder was instructed not to use root/original workspace for decision evidence or git/validation/cleanup, and not to create generated memory/local/runtime/log/lock/secret-like `.yoi` paths.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-12T15:10:38Z -->
+
+## Implementation report
+
+Coder completed implementation.
+
+Coder Pod:
+- `yoi-coder-ticket-language-guidance`
+
+Implementation branch/worktree:
+- Branch: `ticket/ticket-language-guidance-all-tools`
+- Worktree: `/home/hare/Projects/yoi/.worktree/ticket-language-guidance-all-tools`
+- Commit: `92c4dee7 ticket: guide Ticket tool language universally`
+- Worktree status: clean
+
+Changed surfaces:
+- `crates/ticket/src/tool.rs`
+- `crates/pod/src/feature/builtin/ticket.rs`
+
+Implementation summary:
+- Ticket tool `ToolMeta.description` now derives from configured `LocalTicketBackend::record_language()`.
+- Added shared `ticket_tool_description(name, record_language)` so all Ticket tool descriptions can include configured Ticket record language guidance.
+- Guidance distinguishes durable Ticket record / Ticket tool body text from normal `worker.language` prose and `memory.language` Memory/Knowledge generation.
+- Guidance preserves protocol literals, file paths, commands, logs, identifiers, and quoted external text when fidelity matters.
+- Feature descriptor `ToolDeclaration` descriptions use the same helper, so Ticket role launch is not the only guidance path.
+- Focused tests cover configured-language presence, unset-language omission, read-only Companion-style context, and lifecycle/Ticket-role-style context.
+- Companion/read-only authority was not changed.
+
+Orchestrator-verified evidence from child worktree:
+- `git status --short --branch`: clean on `ticket/ticket-language-guidance-all-tools`
+- `cargo test -p ticket ticket_record_language_guidance`: pass
+- `cargo test -p pod ticket_language_guidance`: pass
+- `cargo test -p ticket`: pass, 68 tests
+- `cargo fmt --check`: pass
+- `git diff --check`: pass
+- `cargo run -p yoi -- ticket doctor`: `doctor: ok`
+- `nix build .#yoi`: pass
+
+Known unrelated validation failure:
+- `cargo test -p pod` fails two prompt assertion tests:
+  - `prompt::catalog::tests::pod_orchestration_guidance_section_renders_resource_body`
+  - `prompt::system::tests::pod_orchestration_guidance_is_included_for_pod_management_tools`
+- The same two focused tests fail on current Orchestrator branch before this implementation is merged, with the same missing phrase `worktree status, diff, and test results`.
+- These failures are in Pod orchestration guidance prompt assertions, outside the Ticket tool language guidance change, but reviewer should confirm they are unrelated and not introduced by this Ticket.
+
+Next:
+- Spawn read-only sibling reviewer against the recorded intent, binding decisions/invariants, acceptance criteria, commit `92c4dee7`, diff, validation evidence, and known pre-existing unrelated `cargo test -p pod` failures.
+
+---
