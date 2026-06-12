@@ -2,7 +2,7 @@
 title: 'Orchestrator進捗をAutoKickなしでCompanionへ通知する'
 state: 'inprogress'
 created_at: '2026-06-11T08:15:24Z'
-updated_at: '2026-06-12T14:51:03Z'
+updated_at: '2026-06-12T14:51:31Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-06-11T10:31:56Z'
