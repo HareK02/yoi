@@ -4,7 +4,6 @@
 //! host-side Pod spawning behind the `client` crate so UI callers do not need to
 //! depend on `pod` internals.
 
-use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -39,13 +38,12 @@ impl TicketRef {
         non_empty(self.id.as_deref())
     }
 
-    fn append_prompt_lines(&self, out: &mut String, prompts: &TicketRolePromptTemplates) {
+    fn append_submit_lines(&self, out: &mut String) {
         match non_empty(self.id.as_deref()) {
             None => out.push_str("Target Ticket: not specified\n"),
             Some(id) => {
                 out.push_str("Target Ticket:\n");
                 push_bounded_bullet(out, "id", id);
-                push_prompt_fragment(out, &prompts.ticket_id_guidance);
             }
         }
     }
@@ -66,11 +64,10 @@ impl TicketIntakeHandoff {
         }
     }
 
-    fn append_prompt_lines(&self, out: &mut String, prompts: &TicketRolePromptTemplates) {
+    fn append_submit_lines(&self, out: &mut String) {
         out.push_str("\nPanel handoff:\n");
         push_bounded_bullet(out, "workspace", &self.workspace_label);
         push_bounded_bullet(out, "workspace_orchestrator_pod", &self.orchestrator_pod);
-        push_prompt_fragment(out, &prompts.intake_handoff);
     }
 }
 
@@ -286,7 +283,7 @@ pub fn plan_ticket_role_launch_with_config(
         None => default_pod_name(context.role, context.ticket.as_ref()),
     };
     validate_ticket_role_profile(context.role, &profile, &context.workspace_root, &pod_name)?;
-    let prompt = build_launch_prompt(&context, &profile, &workflow, launch_prompt_ref.as_deref());
+    let prompt = build_launch_prompt(&context);
 
     let original_workspace_root = context.original_workspace_root().to_path_buf();
     let target_workspace_root = context.target_workspace_root().to_path_buf();
@@ -499,154 +496,31 @@ async fn wait_for_run_acceptance(
         .map_err(|_| TicketRoleLaunchError::RunAcceptanceTimeout)?
 }
 
-#[derive(Debug, Clone)]
-struct TicketRolePromptTemplates {
-    launch_preamble: String,
-    ticket_id_guidance: String,
-    record_language_configured: String,
-    record_language_unconfigured: String,
-    intake_handoff: String,
-    orchestrator_worktree_routing: String,
-    orchestrator_merge_completion: String,
-    coder_worktree_routing: String,
-    reviewer_worktree_routing: String,
-}
-
-impl TicketRolePromptTemplates {
-    fn load(workspace_root: &Path) -> Self {
-        Self {
-            launch_preamble: load_ticket_role_prompt(
-                workspace_root,
-                "launch_preamble",
-                include_str!("../../../resources/prompts/ticket_role/launch_preamble.md"),
-            ),
-            ticket_id_guidance: load_ticket_role_prompt(
-                workspace_root,
-                "ticket_id_guidance",
-                include_str!("../../../resources/prompts/ticket_role/ticket_id_guidance.md"),
-            ),
-            record_language_configured: load_ticket_role_prompt(
-                workspace_root,
-                "record_language_configured",
-                include_str!(
-                    "../../../resources/prompts/ticket_role/record_language_configured.md"
-                ),
-            ),
-            record_language_unconfigured: load_ticket_role_prompt(
-                workspace_root,
-                "record_language_unconfigured",
-                include_str!(
-                    "../../../resources/prompts/ticket_role/record_language_unconfigured.md"
-                ),
-            ),
-            intake_handoff: load_ticket_role_prompt(
-                workspace_root,
-                "intake_handoff",
-                include_str!("../../../resources/prompts/ticket_role/intake_handoff.md"),
-            ),
-            orchestrator_worktree_routing: load_ticket_role_prompt(
-                workspace_root,
-                "orchestrator_worktree_routing",
-                include_str!(
-                    "../../../resources/prompts/ticket_role/orchestrator_worktree_routing.md"
-                ),
-            ),
-            orchestrator_merge_completion: load_ticket_role_prompt(
-                workspace_root,
-                "orchestrator_merge_completion",
-                include_str!(
-                    "../../../resources/prompts/ticket_role/orchestrator_merge_completion.md"
-                ),
-            ),
-            coder_worktree_routing: load_ticket_role_prompt(
-                workspace_root,
-                "coder_worktree_routing",
-                include_str!("../../../resources/prompts/ticket_role/coder_worktree_routing.md"),
-            ),
-            reviewer_worktree_routing: load_ticket_role_prompt(
-                workspace_root,
-                "reviewer_worktree_routing",
-                include_str!("../../../resources/prompts/ticket_role/reviewer_worktree_routing.md"),
-            ),
-        }
-    }
-}
-
-fn load_ticket_role_prompt(workspace_root: &Path, name: &str, builtin: &str) -> String {
-    let relative = Path::new("ticket_role").join(format!("{name}.md"));
-    for candidate in [
-        Some(workspace_root.join(".yoi/prompts").join(&relative)),
-        manifest::paths::user_prompts_dir().map(|dir| dir.join(&relative)),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        if let Ok(text) = fs::read_to_string(candidate) {
-            return text;
-        }
-    }
-    builtin.to_string()
-}
-
-fn push_prompt_fragment(out: &mut String, fragment: &str) {
-    out.push_str(fragment.trim_end());
-    out.push('\n');
-}
-
-fn build_launch_prompt(
-    context: &TicketRoleLaunchContext,
-    profile: &str,
-    workflow: &str,
-    launch_prompt_ref: Option<&str>,
-) -> String {
-    let prompts = TicketRolePromptTemplates::load(&context.workspace_root);
+fn build_launch_prompt(context: &TicketRoleLaunchContext) -> String {
     let mut out = String::new();
-    push_prompt_fragment(&mut out, &prompts.launch_preamble);
-    out.push('\n');
-    push_bounded_field(&mut out, "Role", context.role.as_str());
-    push_bounded_field(&mut out, "Profile selector", profile);
-    push_bounded_field(&mut out, "Workflow", workflow);
-    match launch_prompt_ref {
-        Some(prompt_ref) => push_bounded_field(
-            &mut out,
-            "Configured launch_prompt ref (unresolved)",
-            prompt_ref,
-        ),
-        None => out.push_str("Configured launch_prompt ref: none\n"),
-    }
-    out.push('\n');
-    match non_empty(context.ticket_record_language.as_deref()) {
-        Some(language) => {
-            push_bounded_field(&mut out, "Ticket record language", language);
-            push_prompt_fragment(&mut out, &prompts.record_language_configured);
-        }
-        None => push_prompt_fragment(&mut out, &prompts.record_language_unconfigured),
-    }
-    out.push('\n');
 
     if let Some(ticket) = &context.ticket {
-        ticket.append_prompt_lines(&mut out, &prompts);
+        ticket.append_submit_lines(&mut out);
     } else {
         out.push_str("Target Ticket: not specified\n");
     }
 
-    append_workspace_routing_context(&mut out, context);
-
-    match non_empty(context.user_instruction.as_deref()) {
-        Some(instruction) => push_bounded_section(&mut out, "User/action instruction", instruction),
-        None => out.push_str("\nUser/action instruction: not specified\n"),
+    if let Some(instruction) = non_empty(context.user_instruction.as_deref()) {
+        push_bounded_section(&mut out, "Action instruction", instruction);
     }
 
     if let Some(handoff) = &context.intake_handoff {
-        handoff.append_prompt_lines(&mut out, &prompts);
+        handoff.append_submit_lines(&mut out);
     }
 
     if let Some(intent_packet) = non_empty(context.intent_packet.as_deref()) {
         push_bounded_section(&mut out, "Intent packet", intent_packet);
     }
 
+    append_operation_targets(&mut out, context);
+
     if context.worktree_path.is_some() || non_empty(context.branch.as_deref()).is_some() {
-        out.push_str("\nWorktree context:\n");
+        out.push_str("\nWorktree target:\n");
         if let Some(path) = &context.worktree_path {
             push_bounded_bullet(&mut out, "path", &path.display().to_string());
         }
@@ -666,72 +540,29 @@ fn build_launch_prompt(
         );
     }
 
-    append_role_execution_guidance(&mut out, context.role, &prompts);
-
     out
 }
 
-fn append_workspace_routing_context(out: &mut String, context: &TicketRoleLaunchContext) {
-    let original_workspace_root = context.original_workspace_root();
-    let implementation_worktree_root = context.implementation_worktree_root();
-    let should_emit = context.original_workspace_root.is_some()
-        || context.target_workspace_root.is_some()
-        || context.role == TicketRole::Orchestrator;
-    if !should_emit {
+fn append_operation_targets(out: &mut String, context: &TicketRoleLaunchContext) {
+    if context.role != TicketRole::Orchestrator {
+        return;
+    }
+    if context.original_workspace_root.is_none() && context.target_workspace_root.is_none() {
         return;
     }
 
-    out.push_str("\nWorkspace routing context:\n");
-    push_bounded_bullet(
-        out,
-        "role_workspace_root",
-        &context.workspace_root.display().to_string(),
-    );
-    if let Some(cwd) = &context.cwd {
-        push_bounded_bullet(out, "role_cwd", &cwd.display().to_string());
-    }
-    push_bounded_bullet(
-        out,
-        "original_workspace_root",
-        &original_workspace_root.display().to_string(),
-    );
+    out.push_str("\nOrchestrator operation targets:\n");
     push_bounded_bullet(
         out,
         "implementation_worktree_root",
-        &implementation_worktree_root.display().to_string(),
+        &context.implementation_worktree_root().display().to_string(),
     );
-    if context.role == TicketRole::Orchestrator {
-        out.push_str(
-            "- Treat `role_workspace_root` / `role_cwd` as the Orchestrator workspace on the orchestration branch. Use `implementation_worktree_root` only as the placement root for child implementation worktrees; do not operate on `original_workspace_root` itself. Root/original workspace reads, writes, validation, cleanup, and git operations are prohibited. Create implementation branches from the Orchestrator workspace current HEAD / orchestration branch HEAD and integrate reviewed work back into that orchestration branch automatically.\n",
+    if context.target_workspace_root.is_some() {
+        push_bounded_bullet(
+            out,
+            "merge_target_workspace_root",
+            &context.target_workspace_root().display().to_string(),
         );
-    } else {
-        out.push_str(
-            "- Treat `role_workspace_root` as the launched role runtime workspace/Ticket backend root. Create implementation worktrees under `implementation_worktree_root`, not relative to the role cwd, and run role work against the recorded workspace routing context.\n",
-        );
-    }
-}
-
-fn append_role_execution_guidance(
-    out: &mut String,
-    role: TicketRole,
-    prompts: &TicketRolePromptTemplates,
-) {
-    match role {
-        TicketRole::Orchestrator => {
-            out.push('\n');
-            push_prompt_fragment(out, &prompts.orchestrator_worktree_routing);
-            out.push('\n');
-            push_prompt_fragment(out, &prompts.orchestrator_merge_completion);
-        }
-        TicketRole::Coder => {
-            out.push('\n');
-            push_prompt_fragment(out, &prompts.coder_worktree_routing);
-        }
-        TicketRole::Reviewer => {
-            out.push('\n');
-            push_prompt_fragment(out, &prompts.reviewer_worktree_routing);
-        }
-        TicketRole::Intake => {}
     }
 }
 
@@ -774,13 +605,6 @@ fn sanitise_pod_name_component(value: &str) -> String {
         .chars()
         .take(MAX_POD_NAME_CHARS)
         .collect()
-}
-
-fn push_bounded_field(out: &mut String, label: &str, value: &str) {
-    out.push_str(label);
-    out.push_str(": ");
-    out.push_str(&bounded(value));
-    out.push('\n');
 }
 
 fn push_bounded_bullet(out: &mut String, label: &str, value: &str) {
@@ -1096,7 +920,7 @@ profile = "project:no-such-ticket-role-profile"
     }
 
     #[test]
-    fn configured_ticket_record_language_is_included_in_role_prompt() {
+    fn ticket_record_language_stays_out_of_first_run_text() {
         let temp = TempDir::new().unwrap();
         write_config(
             temp.path(),
@@ -1113,11 +937,9 @@ profile = "builtin:default"
         let plan = plan_ticket_role_launch(context).unwrap();
         let text = text_segment(&plan);
 
-        assert!(text.contains("Ticket record language: Japanese"));
-        assert!(text.contains("write durable Ticket item/thread/resolution text"));
-        assert!(text.contains("does not change normal worker response language"));
-        assert!(text.contains("memory/Knowledge generation language"));
-        assert!(text.contains("Do not translate protocol literals"));
+        assert!(!text.contains("Ticket record language"));
+        assert!(!text.contains("Japanese"));
+        assert!(!text.contains("write durable Ticket item/thread/resolution text"));
     }
 
     #[test]
@@ -1168,7 +990,7 @@ profile = "builtin:default"
     }
 
     #[test]
-    fn configured_role_refs_are_exposed_in_plan_and_prompt() {
+    fn configured_role_refs_are_plan_metadata_not_submit_text() {
         let temp = TempDir::new().unwrap();
         write_config(
             temp.path(),
@@ -1198,12 +1020,16 @@ workflow = "ticket-review-workflow"
             &plan.run_segments[0],
             Segment::WorkflowInvoke { slug } if slug == "ticket-review-workflow"
         ));
-        assert!(text.contains(
-            "Configured launch_prompt ref (unresolved): $workspace/ticket/reviewer/launch"
-        ));
-        assert!(text.contains("Workflow: ticket-review-workflow"));
-        assert!(text.contains("Profile selector: builtin:default"));
+        assert!(!text.contains("Configured launch_prompt"));
+        assert!(!text.contains("$workspace/ticket/reviewer/launch"));
+        assert!(!text.contains("Workflow: ticket-review-workflow"));
+        assert!(!text.contains("Profile selector: builtin:default"));
+        assert!(!text.contains("Role: reviewer"));
         assert!(!text.contains("system_instruction"));
+        assert!(text.contains("Target Ticket:"));
+        assert!(text.contains("id: 20260605-190330-ticket-role-pod-launcher"));
+        assert!(text.contains("Action instruction:"));
+        assert!(text.contains("Review the submitted implementation."));
         let spawn = plan
             .spawn_config(PodRuntimeCommand::for_executable("/bin/yoi"))
             .unwrap();
@@ -1214,7 +1040,7 @@ workflow = "ticket-review-workflow"
     }
 
     #[test]
-    fn generated_prompt_covers_intake_orchestrator_coder_and_reviewer_context() {
+    fn submit_text_contains_only_ticket_action_and_per_launch_context() {
         let temp = TempDir::new().unwrap();
         write_builtin_role_config(
             temp.path(),
@@ -1230,9 +1056,11 @@ workflow = "ticket-review-workflow"
         intake.user_instruction = Some("Clarify and materialize this request as a Ticket.".into());
         let intake_plan = plan_ticket_role_launch(intake).unwrap();
         let intake_text = text_segment(&intake_plan);
-        assert!(intake_text.contains("Role: intake"));
+        assert!(intake_text.contains("Action instruction:"));
         assert!(intake_text.contains("Clarify and materialize"));
-        assert!(intake_text.contains("Workflow: ticket-intake-workflow"));
+        assert!(!intake_text.contains("Workflow:"));
+        assert!(!intake_text.contains("Profile selector:"));
+        assert!(!intake_text.contains("Role:"));
 
         let mut handoff_intake = TicketRoleLaunchContext::new(temp.path(), TicketRole::Intake);
         handoff_intake.intake_handoff = Some(TicketIntakeHandoff::new(
@@ -1244,13 +1072,9 @@ workflow = "ticket-review-workflow"
         assert!(handoff_text.contains("Panel handoff:"));
         assert!(handoff_text.contains("workspace_orchestrator_pod: panel-orchestrator-demo"));
         assert!(handoff_text.contains("workspace: Demo workspace"));
-        assert!(handoff_text.contains("created_or_updated_ticket_id"));
-        assert!(handoff_text.contains("state"));
-        assert!(handoff_text.contains("Ticket tool surface"));
-        assert!(handoff_text.contains("ready -> queued"));
-        assert!(handoff_text.contains("queued` as schedulable"));
-        assert!(!handoff_text.contains("user_go_required"));
-        assert!(!handoff_text.contains("human Go gates"));
+        assert!(!handoff_text.contains("created_or_updated_ticket_id"));
+        assert!(!handoff_text.contains("Ticket tool surface"));
+        assert!(!handoff_text.contains("ready -> queued"));
 
         let mut orchestrator = TicketRoleLaunchContext::new(temp.path(), TicketRole::Orchestrator);
         orchestrator.ticket = Some(TicketRef::id("launcher"));
@@ -1258,27 +1082,15 @@ workflow = "ticket-review-workflow"
         orchestrator.validation = vec!["cargo check --workspace --all-targets".into()];
         let orchestrator_plan = plan_ticket_role_launch(orchestrator).unwrap();
         let orchestrator_text = text_segment(&orchestrator_plan);
-        assert!(orchestrator_text.contains("Role: orchestrator"));
+        assert!(orchestrator_text.contains("id: launcher"));
         assert!(orchestrator_text.contains("Route to implementation after planning sync."));
         assert!(orchestrator_text.contains("cargo check --workspace --all-targets"));
-        assert!(orchestrator_text.contains("state = inprogress"));
-        assert!(orchestrator_text.contains("worktree-workflow"));
-        assert!(orchestrator_text.contains("keep tracked `.yoi` project records visible"));
-        assert!(orchestrator_text.contains("exclude `.yoi/memory`"));
-        assert!(
-            orchestrator_text
-                .contains("prohibit creating generated memory/local/runtime/secret-like files")
-        );
-        assert!(orchestrator_text.contains("multi-agent-workflow"));
-        assert!(orchestrator_text.contains("coder and reviewer are siblings"));
-        assert!(orchestrator_text.contains("branch-local reviewer verdicts"));
-        assert!(orchestrator_text.contains("binding decisions/invariants"));
-        assert!(orchestrator_text.contains("not unrecorded preferred tactics"));
-        assert!(orchestrator_text.contains("integration outcome"));
-        assert!(orchestrator_text.contains(
-            "integrate the implementation branch into the orchestration branch automatically"
-        ));
-        assert!(orchestrator_text.contains("Root/original workspace reads, writes, validation, cleanup, and git operations are prohibited"));
+        assert!(!orchestrator_text.contains("state = inprogress"));
+        assert!(!orchestrator_text.contains("worktree-workflow"));
+        assert!(!orchestrator_text.contains("multi-agent-workflow"));
+        assert!(!orchestrator_text.contains("root/original workspace reads"));
+        assert!(!orchestrator_text.contains("role_workspace_root"));
+        assert!(!orchestrator_text.contains("role_cwd"));
 
         let mut coder = TicketRoleLaunchContext::new(temp.path(), TicketRole::Coder);
         coder.ticket = Some(TicketRef::id("20260605-190330-ticket-role-pod-launcher"));
@@ -1288,17 +1100,13 @@ workflow = "ticket-review-workflow"
         coder.report_expectations = vec!["implementation report with validation".into()];
         let coder_plan = plan_ticket_role_launch(coder).unwrap();
         let coder_text = text_segment(&coder_plan);
-        assert!(coder_text.contains("Role: coder"));
         assert!(coder_text.contains("path: /tmp/yoi-code"));
         assert!(coder_text.contains("branch: work/ticket-role-pod-launcher"));
         assert!(coder_text.contains("cargo test -p client ticket_role"));
-        assert!(coder_text.contains("provided child worktree/branch"));
-        assert!(coder_text.contains("do not edit main-workspace `.yoi`"));
-        assert!(coder_text.contains("child-worktree `.yoi` project records may be visible"));
-        assert!(coder_text.contains("Do not create `.yoi/memory`"));
-        assert!(coder_text.contains("implementation latitude"));
-        assert!(coder_text.contains("choose local tactics"));
-        assert!(coder_text.contains("Do not merge, push, close Tickets, or delete worktrees"));
+        assert!(coder_text.contains("implementation report with validation"));
+        assert!(!coder_text.contains("provided child worktree/branch"));
+        assert!(!coder_text.contains("choose local tactics"));
+        assert!(!coder_text.contains("Do not merge, push"));
 
         let mut reviewer = TicketRoleLaunchContext::new(temp.path(), TicketRole::Reviewer);
         reviewer.ticket = Some(TicketRef::id("20260605-190330-ticket-role-pod-launcher"));
@@ -1307,22 +1115,16 @@ workflow = "ticket-review-workflow"
         reviewer.report_expectations = vec!["approve or request changes".into()];
         let reviewer_plan = plan_ticket_role_launch(reviewer).unwrap();
         let reviewer_text = text_segment(&reviewer_plan);
-        assert!(reviewer_text.contains("Role: reviewer"));
         assert!(reviewer_text.contains("path: /tmp/yoi-review"));
         assert!(reviewer_text.contains("branch: work/ticket-role-pod-launcher"));
         assert!(reviewer_text.contains("approve or request changes"));
-        assert!(reviewer_text.contains("read-only by default"));
-        assert!(reviewer_text.contains("recorded intent, binding decisions/invariants"));
-        assert!(reviewer_text.contains("not unrecorded preferred tactics"));
-        assert!(reviewer_text.contains("Orchestrator-side integration"));
-        assert!(
-            reviewer_text
-                .contains("Do not merge, close, push, operate on the root/original workspace")
-        );
+        assert!(!reviewer_text.contains("read-only by default"));
+        assert!(!reviewer_text.contains("Orchestrator-side integration"));
+        assert!(!reviewer_text.contains("Do not merge, close"));
     }
 
     #[test]
-    fn orchestrator_prompt_covers_orchestration_branch_integration_boundary() {
+    fn orchestrator_submit_exposes_operation_targets_without_runtime_workspace_context() {
         let temp = TempDir::new().unwrap();
         write_builtin_role_config(temp.path(), &[TicketRole::Orchestrator]);
         let mut orchestrator = TicketRoleLaunchContext::new(temp.path(), TicketRole::Orchestrator);
@@ -1348,50 +1150,17 @@ workflow = "ticket-review-workflow"
         assert_eq!(spawn_config.workspace_root, temp.path());
         assert_eq!(spawn_config.cwd, None);
 
-        assert!(text.contains("Workspace routing context:"));
-        assert!(text.contains("role_workspace_root"));
+        assert!(text.contains("Orchestrator operation targets:"));
         assert!(text.contains("implementation_worktree_root"));
-        assert!(text.contains("Orchestrator workspace on the orchestration branch"));
-        assert!(text.contains("Root/original workspace reads, writes, validation, cleanup, and git operations are prohibited"));
-        assert!(text.contains("Create implementation branches from the Orchestrator workspace current HEAD / orchestration branch HEAD"));
-        assert!(
-            text.contains(
-                "integrate reviewed work back into that orchestration branch automatically"
-            )
-        );
-        assert!(text.contains("Orchestrator implementation integration guidance"));
-        assert!(
-            text.contains("Integrate only within the Orchestrator workspace/orchestration branch")
-        );
-        assert!(text.contains("root/original workspace is not an integration target"));
-        assert!(text.contains("merge or otherwise integrate that implementation branch into the orchestration branch automatically"));
-        assert!(text.contains(
-            "Run post-integration validation from the Orchestrator workspace/orchestration branch"
-        ));
-        assert!(text.contains("Cleanup is limited to the child implementation worktree/branch"));
+        assert!(text.contains("merge_target_workspace_root"));
+        assert!(!text.contains("Workspace routing context:"));
+        assert!(!text.contains("role_workspace_root"));
+        assert!(!text.contains("role_cwd"));
+        assert!(!text.contains("original_workspace_root"));
+        assert!(!text.contains("Orchestrator workspace on the orchestration branch"));
+        assert!(!text.contains("Root/original workspace reads, writes, validation, cleanup, and git operations are prohibited"));
+        assert!(!text.contains("Orchestrator implementation integration guidance"));
     }
-
-    #[test]
-    fn workspace_prompt_override_replaces_ticket_role_fragment() {
-        let temp = TempDir::new().unwrap();
-        write_builtin_role_config(temp.path(), &[TicketRole::Orchestrator]);
-        let override_dir = temp.path().join(".yoi/prompts/ticket_role");
-        std::fs::create_dir_all(&override_dir).unwrap();
-        std::fs::write(
-            override_dir.join("orchestrator_worktree_routing.md"),
-            "Orchestrator worktree + agent routing guidance:\n- WORKSPACE OVERRIDE MARKER\n",
-        )
-        .unwrap();
-
-        let mut orchestrator = TicketRoleLaunchContext::new(temp.path(), TicketRole::Orchestrator);
-        orchestrator.ticket = Some(TicketRef::id("prompt-resource-override"));
-        let plan = plan_ticket_role_launch(orchestrator).unwrap();
-        let text = text_segment(&plan);
-
-        assert!(text.contains("WORKSPACE OVERRIDE MARKER"));
-        assert!(!text.contains("Use `multi-agent-workflow`"));
-    }
-
     #[test]
     fn caller_provided_pod_name_is_used_exactly() {
         let temp = TempDir::new().unwrap();

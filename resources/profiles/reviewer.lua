@@ -4,6 +4,10 @@ return yoi.profile.extend("builtin:default", {
 
     scope = yoi.scope.workspace_read(),
 
+    worker = {
+        instruction = "$yoi/role/reviewer",
+    },
+
     feature = {
         task = { enabled = false },
         memory = { enabled = true },

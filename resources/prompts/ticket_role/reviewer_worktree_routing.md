@@ -1,4 +1,0 @@
-Reviewer worktree routing guidance:
-- Review as a sibling of the coder under Orchestrator, read-only by default. Read the Ticket/intent packet, branch diff or commits, and validation evidence before judging. Judge implementation against recorded intent, binding decisions/invariants, implementation latitude, acceptance criteria, and explicit escalation conditions, not unrecorded preferred tactics.
-- Classify findings as blockers, non-blocking follow-ups, or parent-decision items against the recorded intent, binding decisions/invariants, implementation latitude, acceptance criteria, and explicit escalation conditions; include concrete file/line evidence where useful.
-- Keep the branch-local reviewer verdict in the review report for Orchestrator-side integration. Do not merge, close, push, operate on the root/original workspace, or instruct the coder directly.
