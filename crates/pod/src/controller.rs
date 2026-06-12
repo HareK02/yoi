@@ -125,6 +125,10 @@ impl PendingRun {
     }
 }
 
+fn should_auto_run_notification(status: PodStatus, auto_run: bool) -> bool {
+    auto_run && status == PodStatus::Idle
+}
+
 // ---------------------------------------------------------------------------
 // PodController — actor that owns a Pod
 // ---------------------------------------------------------------------------
@@ -774,7 +778,7 @@ async fn controller_loop<C, St>(
                 pending = Some(PendingRun::Run(input));
             }
 
-            Method::Notify { message } => {
+            Method::Notify { message, auto_run } => {
                 // Client-side live echo is delivered as `Event::SystemItem`
                 // once the interceptor commits the corresponding
                 // `LogEntry::SystemItem` entry — drained out of the
@@ -784,10 +788,10 @@ async fn controller_loop<C, St>(
                 // RUNNING / Paused: the buffer push is the entire
                 // operation; an in-flight turn (or the next
                 // Resume/Run) will drain it at its next
-                // pending_history_appends. IDLE: auto-start a turn so the LLM
-                // sees the buffered notification(s) without a human
-                // Run.
-                if shared_state.get_status() == PodStatus::Idle {
+                // pending_history_appends. IDLE: only `auto_run`
+                // notifications stage RunForNotification; weak progress
+                // notices stay queued until an explicit run/resume.
+                if should_auto_run_notification(shared_state.get_status(), auto_run) {
                     pending = Some(PendingRun::RunForNotification(protocol::InvokeKind::Notify));
                 }
             }
@@ -1145,7 +1149,7 @@ where
                                 .into(),
                         });
                     }
-                    Some(Method::Notify { message }) => {
+                    Some(Method::Notify { message, .. }) => {
                         // Live echo arrives via `Event::SystemItem` once
                         // the in-flight turn's next `pending_history_appends`
                         // drains this entry through the interceptor.
@@ -1335,6 +1339,14 @@ mod tests {
         assert!(
             !PendingRun::RunForNotification(protocol::InvokeKind::Notify).is_parent_originated()
         );
+    }
+
+    #[test]
+    fn notification_auto_run_gate_only_allows_idle_auto_run() {
+        assert!(should_auto_run_notification(PodStatus::Idle, true));
+        assert!(!should_auto_run_notification(PodStatus::Idle, false));
+        assert!(!should_auto_run_notification(PodStatus::Running, true));
+        assert!(!should_auto_run_notification(PodStatus::Paused, true));
     }
 
     struct DriveTurnEnv {

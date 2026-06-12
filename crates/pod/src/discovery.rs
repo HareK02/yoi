@@ -913,7 +913,14 @@ where
 }
 
 async fn send_peer_notify(socket_path: &Path, message: String) -> io::Result<()> {
-    connect_and_send(socket_path, &Method::Notify { message }).await
+    connect_and_send(
+        socket_path,
+        &Method::Notify {
+            message,
+            auto_run: true,
+        },
+    )
+    .await
 }
 
 fn json_content<T: Serialize>(value: &T) -> Result<String, ToolError> {
@@ -1395,7 +1402,8 @@ mod tests {
                 .await
                 .unwrap();
             let method = reader.next::<Method>().await.unwrap().unwrap();
-            if let Method::Notify { message } = method {
+            if let Method::Notify { message, auto_run } = method {
+                assert!(auto_run);
                 tx.send(message).await.unwrap();
             } else {
                 panic!("expected Notify, got {method:?}");

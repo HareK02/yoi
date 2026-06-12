@@ -21,6 +21,7 @@ use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget, Wrap};
+use serde::Serialize;
 use session_store::FsStore;
 use ticket::config::TicketConfig;
 use ticket::{LocalTicketBackend, TicketBackend, TicketIdOrSlug, TicketWorkflowState};
@@ -49,6 +50,11 @@ use crate::workspace_panel::{
 
 const MAX_ENTRIES: usize = 50;
 const CLOSED_VISIBLE_ROWS: usize = 3;
+const COMPANION_PROGRESS_MAX_TICKETS: usize = 5;
+const COMPANION_PROGRESS_MAX_TITLE_CHARS: usize = 80;
+const COMPANION_PROGRESS_MAX_MESSAGE_CHARS: usize = 1_800;
+const COMPANION_PROGRESS_NOTICE_TEMPLATE: &str =
+    include_str!("../../../resources/prompts/panel/companion_progress_notice.md");
 const SOCKET_OP_TIMEOUT: Duration = Duration::from_secs(3);
 const MULTI_POD_POLL_INTERVAL: Duration = Duration::from_millis(1_500);
 const TERMINAL_EVENT_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -126,6 +132,10 @@ pub(crate) async fn run(
     loop {
         if let Some(result) = pending_reload.finish_if_ready().await {
             app.apply_reload_result(result);
+            if let Some(request) = app.prepare_companion_progress_notice() {
+                let result = dispatch_companion_progress_notice(request).await;
+                app.finish_companion_progress_notice(result);
+            }
         }
 
         terminal.draw(|f| draw(f, app))?;
@@ -522,6 +532,79 @@ struct PanelDiagnostic {
     details: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CompanionProgressFreshness {
+    fingerprint: String,
+    updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CompanionProgressNotice {
+    message: String,
+    fingerprint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CompanionProgressNoticeRequest {
+    pod_name: String,
+    socket_path: PathBuf,
+    notice: CompanionProgressNotice,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CompanionProgressNoticeResult {
+    fingerprint: String,
+    updated_at: String,
+    error: Option<String>,
+}
+
+impl CompanionProgressNoticeResult {
+    fn sent(fingerprint: String, updated_at: String) -> Self {
+        Self {
+            fingerprint,
+            updated_at,
+            error: None,
+        }
+    }
+
+    fn failed(fingerprint: String, error: impl Into<String>) -> Self {
+        Self {
+            fingerprint,
+            updated_at: String::new(),
+            error: Some(error.into()),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct CompanionProgressTemplateContext {
+    companion: CompanionProgressTemplateRole,
+    orchestrator: CompanionProgressTemplateRole,
+    tickets: Vec<CompanionProgressTemplateTicket>,
+    omitted_ticket_count: usize,
+    role_pods: Vec<CompanionProgressTemplateRolePod>,
+}
+
+#[derive(Debug, Serialize)]
+struct CompanionProgressTemplateRole {
+    pod_name: String,
+    status: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CompanionProgressTemplateTicket {
+    id: String,
+    state: String,
+    title: String,
+    reference: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CompanionProgressTemplateRolePod {
+    name: String,
+    status: String,
+}
+
 pub(crate) struct MultiPodApp {
     pub(crate) list: PodList,
     pub(crate) panel: WorkspacePanelViewModel,
@@ -537,6 +620,7 @@ pub(crate) struct MultiPodApp {
     runtime_command: PodRuntimeCommand,
     last_companion_lifecycle_failure: Option<CompanionPanelState>,
     last_orchestrator_lifecycle_failure: Option<OrchestratorPanelState>,
+    companion_progress: Option<CompanionProgressFreshness>,
 }
 
 impl MultiPodApp {
@@ -570,6 +654,7 @@ impl MultiPodApp {
             runtime_command,
             last_companion_lifecycle_failure: None,
             last_orchestrator_lifecycle_failure: None,
+            companion_progress: None,
         }
     }
 
@@ -620,6 +705,50 @@ impl MultiPodApp {
         self.selected_row = previous_row.filter(|key| self.panel.row(key).is_some());
         self.ensure_selection_visible();
         self.ensure_composer_target_available();
+        self.apply_companion_progress_freshness();
+    }
+
+    fn prepare_companion_progress_notice(&mut self) -> Option<CompanionProgressNoticeRequest> {
+        let target = companion_progress_notice_target(&self.panel, &self.list)?;
+        let notice = companion_progress_notice(&self.panel, &self.list)?;
+        if self
+            .companion_progress
+            .as_ref()
+            .is_some_and(|freshness| freshness.fingerprint == notice.fingerprint)
+        {
+            self.apply_companion_progress_freshness();
+            return None;
+        }
+        Some(CompanionProgressNoticeRequest {
+            pod_name: target.pod_name,
+            socket_path: target.socket_path,
+            notice,
+        })
+    }
+
+    fn finish_companion_progress_notice(&mut self, result: CompanionProgressNoticeResult) {
+        if let Some(error) = result.error {
+            self.notice = Some(format!("Companion progress notice not delivered: {error}"));
+            return;
+        }
+        self.companion_progress = Some(CompanionProgressFreshness {
+            fingerprint: result.fingerprint,
+            updated_at: result.updated_at,
+        });
+        self.apply_companion_progress_freshness();
+    }
+
+    fn apply_companion_progress_freshness(&mut self) {
+        let Some(freshness) = self.companion_progress.as_ref() else {
+            return;
+        };
+        let Some(companion) = self.panel.header.companion.as_mut() else {
+            return;
+        };
+        companion.detail = Some(format!(
+            "progress context updated at {} (weak notify)",
+            freshness.updated_at
+        ));
     }
 
     fn apply_companion_lifecycle_memory(&mut self, panel: &mut WorkspacePanelViewModel) {
@@ -2289,6 +2418,160 @@ struct OrchestratorNotifyTarget {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct CompanionProgressNoticeTarget {
+    pod_name: String,
+    socket_path: PathBuf,
+}
+
+fn companion_progress_notice_target(
+    panel: &WorkspacePanelViewModel,
+    list: &PodList,
+) -> Option<CompanionProgressNoticeTarget> {
+    let companion = panel.header.companion.as_ref()?;
+    if !companion_status_is_peer_reachable(companion.status) {
+        return None;
+    }
+    let entry = list
+        .entries
+        .iter()
+        .find(|entry| entry.name == companion.pod_name)?;
+    let live = entry.live.as_ref()?;
+    if !live.reachable {
+        return None;
+    }
+    Some(CompanionProgressNoticeTarget {
+        pod_name: companion.pod_name.clone(),
+        socket_path: live.socket_path.clone(),
+    })
+}
+
+fn companion_status_is_peer_reachable(status: CompanionPanelStatus) -> bool {
+    matches!(
+        status,
+        CompanionPanelStatus::Live | CompanionPanelStatus::Restored | CompanionPanelStatus::Spawned
+    )
+}
+
+fn companion_progress_notice(
+    panel: &WorkspacePanelViewModel,
+    list: &PodList,
+) -> Option<CompanionProgressNotice> {
+    let companion = panel.header.companion.as_ref()?;
+    let orchestrator = panel.header.orchestrator.as_ref()?;
+    let ticket_rows = panel
+        .rows
+        .iter()
+        .filter_map(|row| row.ticket.as_ref().map(|ticket| (row, ticket)))
+        .collect::<Vec<_>>();
+    let tickets = ticket_rows
+        .iter()
+        .take(COMPANION_PROGRESS_MAX_TICKETS)
+        .map(|(row, ticket)| CompanionProgressTemplateTicket {
+            id: bounded_progress_text(&ticket.id, COMPANION_PROGRESS_MAX_TITLE_CHARS),
+            state: bounded_progress_text(&row.status, COMPANION_PROGRESS_MAX_TITLE_CHARS),
+            title: bounded_progress_text(&row.title, COMPANION_PROGRESS_MAX_TITLE_CHARS),
+            reference: format!(".yoi/tickets/{}", ticket.id),
+        })
+        .collect::<Vec<_>>();
+    let context = CompanionProgressTemplateContext {
+        companion: CompanionProgressTemplateRole {
+            pod_name: bounded_progress_text(
+                &companion.pod_name,
+                COMPANION_PROGRESS_MAX_TITLE_CHARS,
+            ),
+            status: companion.status.label().to_string(),
+        },
+        orchestrator: CompanionProgressTemplateRole {
+            pod_name: bounded_progress_text(
+                &orchestrator.pod_name,
+                COMPANION_PROGRESS_MAX_TITLE_CHARS,
+            ),
+            status: orchestrator.status.label().to_string(),
+        },
+        tickets,
+        omitted_ticket_count: ticket_rows
+            .len()
+            .saturating_sub(COMPANION_PROGRESS_MAX_TICKETS),
+        role_pods: bounded_role_pod_values(list, companion, orchestrator),
+    };
+    let rendered = render_companion_progress_notice_template(&context).ok()?;
+    let message = bounded_progress_text(&rendered, COMPANION_PROGRESS_MAX_MESSAGE_CHARS);
+    let fingerprint = message.clone();
+    Some(CompanionProgressNotice {
+        message,
+        fingerprint,
+    })
+}
+
+fn render_companion_progress_notice_template(
+    context: &CompanionProgressTemplateContext,
+) -> Result<String, minijinja::Error> {
+    let mut env = minijinja::Environment::new();
+    env.set_undefined_behavior(minijinja::UndefinedBehavior::Strict);
+    env.add_template(
+        "companion_progress_notice",
+        COMPANION_PROGRESS_NOTICE_TEMPLATE,
+    )?;
+    env.get_template("companion_progress_notice")?
+        .render(context)
+}
+
+fn bounded_role_pod_values(
+    list: &PodList,
+    companion: &CompanionPanelState,
+    orchestrator: &OrchestratorPanelState,
+) -> Vec<CompanionProgressTemplateRolePod> {
+    let mut role_pods = Vec::new();
+    for name in [&companion.pod_name, &orchestrator.pod_name] {
+        let Some(entry) = list.entries.iter().find(|entry| entry.name == *name) else {
+            continue;
+        };
+        role_pods.push(CompanionProgressTemplateRolePod {
+            name: bounded_progress_text(&entry.name, COMPANION_PROGRESS_MAX_TITLE_CHARS),
+            status: row_status_label(entry).0.to_string(),
+        });
+    }
+    role_pods
+}
+
+fn bounded_progress_text(input: &str, max_chars: usize) -> String {
+    let mut output = String::new();
+    for (idx, ch) in input.chars().enumerate() {
+        if idx >= max_chars {
+            output.push('…');
+            return output;
+        }
+        let sanitized = if ch.is_control() && ch != '\n' && ch != '\t' {
+            ' '
+        } else {
+            ch
+        };
+        output.push(sanitized);
+    }
+    output
+}
+
+fn progress_notice_timestamp() -> String {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => format!("unix:{}", duration.as_secs()),
+        Err(_) => "unix:0".to_string(),
+    }
+}
+
+async fn dispatch_companion_progress_notice(
+    request: CompanionProgressNoticeRequest,
+) -> CompanionProgressNoticeResult {
+    let fingerprint = request.notice.fingerprint.clone();
+    match send_notify_only(&request.socket_path, request.notice.message, false).await {
+        Ok(()) => CompanionProgressNoticeResult::sent(fingerprint, progress_notice_timestamp()),
+        Err(err) => CompanionProgressNoticeResult::failed(
+            fingerprint,
+            format!("{}: {}", request.pod_name, err),
+        ),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TicketActionOutcome {
     notice: String,
 }
@@ -3083,7 +3366,7 @@ async fn notify_workspace_orchestrator(
         );
     };
     let message = orchestrator_queue_notification_message(ticket);
-    match send_notify_only(&target.socket_path, message).await {
+    match send_notify_only(&target.socket_path, message, true).await {
         Ok(()) => OrchestratorNotificationOutcome::Sent {
             pod_name: target.pod_name,
         },
@@ -3096,7 +3379,11 @@ async fn notify_workspace_orchestrator(
     }
 }
 
-async fn send_notify_only(socket: &Path, message: String) -> Result<(), NotifySendError> {
+async fn send_notify_only(
+    socket: &Path,
+    message: String,
+    auto_run: bool,
+) -> Result<(), NotifySendError> {
     let stream = tokio::time::timeout(SOCKET_OP_TIMEOUT, UnixStream::connect(socket))
         .await
         .map_err(|_| NotifySendError::Io("connect timed out".into()))?
@@ -3125,10 +3412,13 @@ async fn send_notify_only(socket: &Path, message: String) -> Result<(), NotifySe
         }
     }
 
-    tokio::time::timeout(SOCKET_OP_TIMEOUT, writer.write(&Method::Notify { message }))
-        .await
-        .map_err(|_| NotifySendError::Io("write timed out".into()))?
-        .map_err(|e| NotifySendError::Io(format!("write: {e}")))
+    tokio::time::timeout(
+        SOCKET_OP_TIMEOUT,
+        writer.write(&Method::Notify { message, auto_run }),
+    )
+    .await
+    .map_err(|_| NotifySendError::Io("write timed out".into()))?
+    .map_err(|e| NotifySendError::Io(format!("write: {e}")))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3479,6 +3769,12 @@ fn draw_title(frame: &mut Frame<'_>, app: &MultiPodApp, area: Rect) {
             companion.status.label(),
             companion_status_style(companion.status),
         ));
+        if let Some(detail) = companion.detail.as_deref() {
+            spans.push(Span::styled(
+                format!(" ({detail})"),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
     }
     if let Some(orchestrator) = &app.panel.header.orchestrator {
         spans.push(Span::styled(
@@ -4638,14 +4934,223 @@ mod tests {
             reader.next::<Method>().await.unwrap().unwrap()
         });
 
-        send_notify_only(&socket_path, "panel Queue".to_string())
+        send_notify_only(&socket_path, "panel Queue".to_string(), true)
             .await
             .unwrap();
         let method = server.await.unwrap();
         assert!(matches!(
             method,
-            Method::Notify { message } if message == "panel Queue"
+            Method::Notify { message, auto_run: true } if message == "panel Queue"
         ));
+    }
+
+    #[tokio::test]
+    async fn send_notify_only_can_deliver_weak_notification_without_auto_run() {
+        let temp = TempDir::new().unwrap();
+        let socket_path = temp.path().join("companion.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, writer) = stream.into_split();
+            let mut reader = JsonLineReader::new(reader);
+            let mut writer = JsonLineWriter::new(writer);
+            writer
+                .write(&Event::Snapshot {
+                    entries: Vec::new(),
+                    greeting: protocol::Greeting {
+                        pod_name: "yoi".to_string(),
+                        cwd: temp.path().display().to_string(),
+                        provider: "test".to_string(),
+                        model: "test".to_string(),
+                        scope_summary: "test".to_string(),
+                        tools: Vec::new(),
+                        context_window: 0,
+                        context_tokens: 0,
+                    },
+                    status: PodStatus::Idle,
+                })
+                .await
+                .unwrap();
+            reader.next::<Method>().await.unwrap().unwrap()
+        });
+
+        send_notify_only(&socket_path, "panel progress".to_string(), false)
+            .await
+            .unwrap();
+        let method = server.await.unwrap();
+        assert!(matches!(
+            method,
+            Method::Notify { message, auto_run: false } if message == "panel progress"
+        ));
+    }
+
+    #[test]
+    fn companion_progress_notice_target_skips_missing_stopped_and_unreachable_without_spawn_restore()
+     {
+        let missing_app = ticket_enabled_app(vec![live_info("test-orchestrator", PodStatus::Idle)]);
+        assert!(companion_progress_notice_target(&missing_app.panel, &missing_app.list).is_none());
+
+        let mut stopped_panel = WorkspacePanelViewModel::empty(Path::new("test"));
+        stopped_panel.header.companion = Some(CompanionPanelState::new(
+            "yoi",
+            CompanionPanelStatus::Stopped,
+            None,
+        ));
+        stopped_panel.header.orchestrator = Some(OrchestratorPanelState::new(
+            "test-orchestrator",
+            OrchestratorPanelStatus::Live,
+            None,
+        ));
+        let stopped_list = PodList::from_sources(
+            PodVisibilitySource::ResumePicker,
+            vec![stopped_info("yoi")],
+            vec![live_info("test-orchestrator", PodStatus::Idle)],
+            None,
+            10,
+        );
+        assert!(companion_progress_notice_target(&stopped_panel, &stopped_list).is_none());
+
+        let mut unreachable = live_info("yoi", PodStatus::Idle);
+        unreachable.reachable = false;
+        let unreachable_app = ticket_enabled_app(vec![
+            unreachable,
+            live_info("test-orchestrator", PodStatus::Idle),
+        ]);
+        assert!(
+            companion_progress_notice_target(&unreachable_app.panel, &unreachable_app.list)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn companion_progress_notice_uses_prompt_resource_template() {
+        let first_resource_line = COMPANION_PROGRESS_NOTICE_TEMPLATE.lines().next().unwrap();
+        let context = CompanionProgressTemplateContext {
+            companion: CompanionProgressTemplateRole {
+                pod_name: "yoi".to_string(),
+                status: "Live".to_string(),
+            },
+            orchestrator: CompanionProgressTemplateRole {
+                pod_name: "test-orchestrator".to_string(),
+                status: "Live".to_string(),
+            },
+            tickets: vec![CompanionProgressTemplateTicket {
+                id: "RESOURCE-TICKET".to_string(),
+                state: "inprogress".to_string(),
+                title: "Rendered from runtime values".to_string(),
+                reference: ".yoi/tickets/RESOURCE-TICKET".to_string(),
+            }],
+            omitted_ticket_count: 0,
+            role_pods: vec![CompanionProgressTemplateRolePod {
+                name: "yoi".to_string(),
+                status: "idle".to_string(),
+            }],
+        };
+
+        let rendered = render_companion_progress_notice_template(&context).unwrap();
+        assert!(rendered.contains(first_resource_line));
+        assert!(rendered.contains("RESOURCE-TICKET"));
+        assert!(rendered.contains("Rendered from runtime values"));
+    }
+
+    #[test]
+    fn companion_progress_notice_is_bounded_and_excludes_sensitive_unbounded_fields() {
+        let mut app = ticket_enabled_app(vec![
+            live_info("yoi", PodStatus::Idle),
+            live_info("test-orchestrator", PodStatus::Running),
+        ]);
+        app.panel.rows = (0..12)
+            .map(|index| {
+                let mut row = panel_test_ticket_row(
+                    &format!("TICKET-{index}"),
+                    &format!("Visible title {index} {}", "x".repeat(140)),
+                    ActionPriority::Background,
+                    NextUserAction::Wait,
+                    "inprogress",
+                );
+                if let Some(ticket) = row.ticket.as_mut() {
+                    ticket.latest_event_excerpt = Some(
+                        "SECRET_PROVIDER_ERROR_TOKEN should never be copied into progress notices"
+                            .to_string(),
+                    );
+                }
+                row.subtitle = Some("private thread excerpt should stay out".to_string());
+                row
+            })
+            .collect();
+        app.panel
+            .header
+            .diagnostics
+            .push("diagnostic with SECRET_PROVIDER_ERROR_TOKEN should stay out".to_string());
+
+        let notice = companion_progress_notice(&app.panel, &app.list).unwrap();
+        assert!(notice.message.contains("TICKET-0"));
+        assert!(notice.message.contains("ref: .yoi/tickets/TICKET-0"));
+        assert!(notice.message.contains("more ticket(s) omitted"));
+        assert!(notice.message.chars().count() <= COMPANION_PROGRESS_MAX_MESSAGE_CHARS + 1);
+        assert!(!notice.message.contains("SECRET_PROVIDER_ERROR_TOKEN"));
+        assert!(!notice.message.contains("private thread excerpt"));
+        assert_eq!(notice.fingerprint, notice.message);
+    }
+
+    #[test]
+    fn companion_progress_notice_success_sets_panel_freshness_without_persisting_snapshot() {
+        let mut app = ticket_enabled_app(vec![
+            live_info("yoi", PodStatus::Idle),
+            live_info("test-orchestrator", PodStatus::Idle),
+        ]);
+        app.panel.rows.push(panel_test_ticket_row(
+            "TICKET-1",
+            "Implement progress notices",
+            ActionPriority::Background,
+            NextUserAction::Wait,
+            "inprogress",
+        ));
+
+        let request = app.prepare_companion_progress_notice().unwrap();
+        assert_eq!(request.pod_name, "yoi");
+        app.finish_companion_progress_notice(CompanionProgressNoticeResult::sent(
+            request.notice.fingerprint,
+            "unix:42".to_string(),
+        ));
+
+        let detail = app
+            .panel
+            .header
+            .companion
+            .as_ref()
+            .and_then(|companion| companion.detail.as_deref())
+            .unwrap();
+        assert!(detail.contains("unix:42"));
+        assert!(detail.contains("weak notify"));
+        assert!(app.prepare_companion_progress_notice().is_none());
+    }
+
+    #[test]
+    fn companion_progress_notice_target_accepts_live_running_companion() {
+        let app = ticket_enabled_app(vec![
+            live_info("yoi", PodStatus::Running),
+            live_info("test-orchestrator", PodStatus::Running),
+        ]);
+        let target = companion_progress_notice_target(&app.panel, &app.list).unwrap();
+        assert_eq!(target.pod_name, "yoi");
+        assert_eq!(target.socket_path, PathBuf::from("/tmp/yoi.sock"));
+    }
+
+    #[test]
+    fn companion_progress_failure_is_best_effort_and_does_not_mark_freshness() {
+        let mut app = ticket_enabled_app(vec![
+            live_info("yoi", PodStatus::Idle),
+            live_info("test-orchestrator", PodStatus::Idle),
+        ]);
+        let request = app.prepare_companion_progress_notice().unwrap();
+        app.finish_companion_progress_notice(CompanionProgressNoticeResult::failed(
+            request.notice.fingerprint,
+            "socket closed",
+        ));
+
+        assert!(app.companion_progress.is_none());
+        assert!(app.notice.as_deref().unwrap().contains("not delivered"));
     }
 
     #[test]
@@ -6058,6 +6563,7 @@ mod tests {
             runtime_command: PodRuntimeCommand::for_executable("/tmp/yoi"),
             last_companion_lifecycle_failure,
             last_orchestrator_lifecycle_failure,
+            companion_progress: None,
         };
         app.ensure_selection_visible();
         app.ensure_composer_target_available();
