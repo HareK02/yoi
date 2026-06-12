@@ -165,3 +165,16 @@ Orchestrator validation performed after coder handoff:
 Next: delegate independent reviewer against the recorded Ticket intent, accepted plan, implementation commit, and validation evidence.
 
 ---
+
+<!-- event: plan author: orchestrator at: 2026-06-12T09:06:03Z -->
+
+## Plan
+
+Reviewer delegated.
+
+- Reviewer Pod: `yoi-reviewer-panel-queue-sync`
+- Review target: `/home/hare/Projects/yoi/.worktree/panel-queue-orchestrator-sync`, branch `ticket/panel-queue-orchestrator-sync`, commit `04a3c6e0`
+- Scope: read-only `/home/hare/Projects/yoi`
+- Reviewer focus: durable Queue handoff ordering, root/orchestration worktree identity and cleanliness checks, ff-only-only sync, pathscope of Queue commit, no auto conflict/stash/rebase, notify only after sync + Ticket verification, and whether `--no-verify` is acceptable.
+
+---
