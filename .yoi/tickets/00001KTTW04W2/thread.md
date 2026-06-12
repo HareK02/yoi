@@ -284,3 +284,25 @@ Broad-suite failures:
 - These broad-suite failures do not appear caused by the progress-notify diff and are not the requested-change blocker.
 
 ---
+
+<!-- event: plan author: orchestrator at: 2026-06-12T15:31:01Z -->
+
+## Plan
+
+Fix loop delegated to coder.
+
+Reviewer blocker:
+- `companion_progress_notice()` hard-coded LLM-facing progress notice framing in Rust.
+- The notice reaches Companion model context through `Notify { auto_run: false }` / NotifyBuffer, so it must follow the prompt-resource boundary.
+
+Coder fix request:
+- Move progress notice framing/template to `resources/prompts` using existing resource conventions.
+- Keep Rust limited to bounded runtime values and resource rendering/loading.
+- Preserve weak notify semantics, live/reachable-only delivery, missing/stopped no spawn/restore, bounded/sensitive-safe summary, no persistent snapshot store, and no authority expansion.
+- Add/update focused tests proving resource-backed framing and bounded/sensitive-safe runtime values.
+
+Status:
+- Sent fix request to `yoi-coder-companion-progress-notify` on existing branch/worktree.
+- Reviewer verdict remains `request_changes` until coder fix and second review.
+
+---
