@@ -395,3 +395,49 @@ Reviewer-run validation:
 No blocking issues remain.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-12T15:43:51Z -->
+
+## Implementation report
+
+Integration completed in the Orchestrator workspace.
+
+Integrated implementation:
+- Ticket: `00001KTTW04W2`
+- Implementation branch: `ticket/orchestrator-progress-companion-notify`
+- Implementation commits:
+  - `a87d3154 feat: weak companion progress notify`
+  - `61e6c068 fix: resource-back companion progress notice`
+- Reviewer result: approve after fix-loop, no blockers remain
+- Orchestrator merge commit: `56b10a2d merge: companion weak progress notify`
+- Integration target: `orchestration/yoi-orchestrator`
+
+Post-integration validation from Orchestrator worktree:
+- `cargo test -p protocol`: pass, 39 tests
+- `cargo test -p pod --test controller_test`: pass, 36 tests
+- `cargo test -p tui companion_progress -- --nocapture`: pass, 6 tests
+- `cargo test -p tui send_notify_only_can_deliver_weak_notification_without_auto_run -- --nocapture`: pass, 1 test
+- `cargo check -p protocol -p pod -p tui`: pass
+- `cargo fmt --check`: pass
+- `git diff --check HEAD~1..HEAD`: pass
+- `./result/bin/yoi ticket doctor`: `doctor: ok`
+- `nix build .#yoi`: pass
+
+Fix-loop resolution:
+- Reviewer blocker about Rust-hard-coded LLM-facing progress notice framing was resolved by moving framing to `resources/prompts/panel/companion_progress_notice.md` and rendering it from bounded runtime values.
+
+Remaining known broad-suite failures:
+- Existing prompt/TUI broad-suite failures noted earlier remain outside this Ticket and were not blockers for the focused implementation/review.
+
+Remaining risks:
+- None blocking. Added `minijinja` dependency to `crates/tui`, already used elsewhere in workspace; `Cargo.lock` and `package.nix` were updated and Nix build passed.
+
+---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-12T15:43:57Z from: inprogress to: done reason: implementation_merged_and_validated field: state -->
+
+## State changed
+
+Implementation was merged into the Orchestrator branch after reviewer-requested fix, reviewer approved with no blockers, and post-integration validation passed. Cleanup and closure will be recorded next.
+
+---
