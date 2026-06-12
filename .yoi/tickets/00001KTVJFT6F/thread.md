@@ -252,3 +252,43 @@ Non-blocking risks:
 - None identified. The added tests directly cover key boundaries, draft protection, and target/row-selection display without brittle full UI snapshots.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-12T15:08:05Z -->
+
+## Implementation report
+
+Integration completed in the Orchestrator workspace.
+
+Integrated implementation:
+- Ticket: `00001KTVJFT6F`
+- Implementation branch: `ticket/panel-focus-composer-row-selection`
+- Implementation commit: `c5ef6f79 tui: clarify panel composer target and row selection`
+- Reviewer result: approve, no blockers
+- Orchestrator merge commit: `d6166c72 merge: panel focus composer row selection`
+- Integration target: `orchestration/yoi-orchestrator`
+
+Post-integration validation from Orchestrator worktree:
+- `cargo test -p tui selected_ticket_row_with_non_empty_composer_shows_composer_enter_behavior`: pass
+- `cargo test -p tui multi_esc_clears_row_selection_without_quitting_and_preserves_draft`: pass
+- `cargo test -p tui multi_composer_target_switch_preserves_typed_text`: pass
+- `cargo test -p tui multi_blank_ticket_intake_enter_uses_selected_row_and_preserves_input`: pass
+- `cargo fmt --check`: pass
+- `git diff --check HEAD~1..HEAD`: pass
+- `./result/bin/yoi ticket doctor`: `doctor: ok`
+- `nix build .#yoi`: pass
+
+Known unrelated validation failure remains:
+- `cargo test -p tui multi_ --lib` still includes pre-existing failure `multi_pod::tests::orchestrator_launch_context_uses_orchestration_root_for_runtime_workspace`; this was verified on the Orchestrator branch before merge and reviewed as unrelated to this Ticket.
+
+Remaining risks:
+- None identified by reviewer for this Ticket.
+
+---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-12T15:08:11Z from: inprogress to: done reason: implementation_merged_and_validated field: state -->
+
+## State changed
+
+Implementation was merged into the Orchestrator branch, reviewer approved with no blockers, and post-integration validation passed. Cleanup and closure will be recorded next.
+
+---
