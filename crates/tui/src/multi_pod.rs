@@ -3034,7 +3034,7 @@ fn panel_action_header_line(total: usize, width: u16) -> Line<'static> {
 }
 
 const TICKET_STATE_COLUMN_WIDTH: usize = 10;
-const TICKET_ID_COLUMN_WIDTH: usize = 32;
+const TICKET_ID_COLUMN_WIDTH: usize = 13;
 const POD_STATUS_COLUMN_WIDTH: usize = 18;
 
 fn panel_row_line(row: &PanelRow, selected: bool, width: u16) -> Line<'static> {
@@ -3912,7 +3912,7 @@ mod tests {
     #[test]
     fn ticket_queue_notification_message_carries_routing_contract() {
         let row = panel_test_ticket_row(
-            "route-ticket",
+            "00001KTTW04W2",
             "Route queued\nTicket",
             ActionPriority::ReadyForQueue,
             NextUserAction::Queue,
@@ -3922,9 +3922,7 @@ mod tests {
 
         let message = orchestrator_queue_notification_message(ticket);
 
-        assert!(
-            message.contains("Ticket `20260606-000000-route-ticket`, title `Route queued Ticket`")
-        );
+        assert!(message.contains("Ticket `00001KTTW04W2`, title `Route queued Ticket`"));
         assert!(message.contains("human authorized Orchestrator routing"));
         assert!(message.contains("not an unattended scheduler"));
         assert!(message.contains("Read the Ticket"));
@@ -4068,7 +4066,7 @@ mod tests {
             None,
         ));
         panel.rows.push(panel_test_ticket_row(
-            "queue-me",
+            "00001KTWPE3KQ",
             "Queue Me",
             ActionPriority::ReadyForQueue,
             NextUserAction::Queue,
@@ -4411,14 +4409,14 @@ mod tests {
     #[test]
     fn panel_ticket_rows_use_aligned_columns_before_title() {
         let review_row = panel_test_ticket_row(
-            "workspace-panel-composer-targets",
+            "00001KTX1QMG9",
             "Workspace panel composer targets",
             ActionPriority::ActiveWork,
             NextUserAction::Wait,
             "inprogress",
         );
         let ready_row = panel_test_ticket_row(
-            "ticket-id",
+            "00001KTTB479X",
             "Long Ticket title that should be rendered after short columns",
             ActionPriority::ReadyForQueue,
             NextUserAction::Queue,
@@ -4436,13 +4434,9 @@ mod tests {
         assert_eq!(display_column(&ready_line, "ready"), state_start);
         let review_id = review_row.ticket.as_ref().unwrap().id.as_str();
         let ready_id = ready_row.ticket.as_ref().unwrap().id.as_str();
-        assert_eq!(
-            display_column(
-                &review_line,
-                &truncate_with_ellipsis(review_id, TICKET_ID_COLUMN_WIDTH)
-            ),
-            id_start
-        );
+        assert_eq!(review_id.width(), TICKET_ID_COLUMN_WIDTH);
+        assert_eq!(ready_id.width(), TICKET_ID_COLUMN_WIDTH);
+        assert_eq!(display_column(&review_line, review_id), id_start);
         assert_eq!(display_column(&ready_line, ready_id), id_start);
         assert_eq!(
             display_column(&review_line, "Workspace panel composer targets"),
@@ -4457,18 +4451,19 @@ mod tests {
     #[test]
     fn panel_ticket_title_truncates_after_stable_columns() {
         let row = panel_test_ticket_row(
-            "ticket-id",
+            "00001KTTB479X",
             "Very long Ticket title that should truncate only after the aligned short columns",
             ActionPriority::ReadyForQueue,
             NextUserAction::Queue,
             "ready",
         );
 
-        let line = plain_line(&panel_row_line(&row, false, 112));
+        let line = plain_line(&panel_row_line(&row, false, 58));
         let title_start = 2 + TICKET_STATE_COLUMN_WIDTH + 1 + TICKET_ID_COLUMN_WIDTH + 1;
 
-        assert_eq!(line.width(), 112);
+        assert_eq!(line.width(), 58);
         let row_id = row.ticket.as_ref().unwrap().id.as_str();
+        assert_eq!(row_id.width(), TICKET_ID_COLUMN_WIDTH);
         assert_eq!(
             display_column(&line, row_id),
             title_start - TICKET_ID_COLUMN_WIDTH - 1
@@ -5173,6 +5168,7 @@ mod tests {
             launch: TicketRoleLaunchResult {
                 plan: client::ticket_role::TicketRoleLaunchPlan {
                     workspace_root: PathBuf::from("/tmp/workspace"),
+                    cwd: None,
                     original_workspace_root: PathBuf::from("/tmp/workspace"),
                     target_workspace_root: PathBuf::from("/tmp/workspace"),
                     implementation_worktree_root: PathBuf::from("/tmp/workspace/.worktree"),
@@ -5397,14 +5393,14 @@ mod tests {
     }
 
     fn panel_test_ticket_row(
-        id_suffix: &str,
+        id: &str,
         title: &str,
         priority: ActionPriority,
         next_action: NextUserAction,
         state: &str,
     ) -> PanelRow {
         let ticket = crate::workspace_panel::TicketPanelEntry {
-            id: format!("20260606-000000-{id_suffix}"),
+            id: id.to_string(),
             title: title.to_string(),
             priority: "P2".to_string(),
             workflow_state: TicketWorkflowState::parse(state)
