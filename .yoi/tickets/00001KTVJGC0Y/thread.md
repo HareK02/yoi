@@ -256,3 +256,43 @@ Non-blocking risk:
 - When configured, language guidance is appended to every Ticket tool description, including read-only tools. This repeats some prompt text, but it is an intentional universal capability-surface tradeoff and satisfies the acceptance criteria.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-12T15:19:24Z -->
+
+## Implementation report
+
+Integration completed in the Orchestrator workspace.
+
+Integrated implementation:
+- Ticket: `00001KTVJGC0Y`
+- Implementation branch: `ticket/ticket-language-guidance-all-tools`
+- Implementation commit: `92c4dee7 ticket: guide Ticket tool language universally`
+- Reviewer result: approve, no blockers
+- Orchestrator merge commit: `ec66cad8 merge: ticket language guidance for tool users`
+- Integration target: `orchestration/yoi-orchestrator`
+
+Post-integration validation from Orchestrator worktree:
+- `cargo test -p ticket ticket_record_language_guidance`: pass
+- `cargo test -p pod ticket_language_guidance`: pass
+- `cargo test -p client ticket_record_language_stays_out_of_first_run_text`: pass
+- `cargo test -p ticket`: pass, 68 tests
+- `cargo fmt --check`: pass
+- `git diff --check HEAD~1..HEAD`: pass
+- `./result/bin/yoi ticket doctor`: `doctor: ok`
+- `nix build .#yoi`: pass
+
+Known unrelated validation failure remains:
+- `cargo test -p pod` still includes pre-existing failures in Pod orchestration guidance prompt assertion tests. These were verified on the Orchestrator branch before merge and reviewed as unrelated to this Ticket.
+
+Remaining non-blocking risk:
+- When configured, Ticket language guidance is appended to every Ticket tool description, including read-only tools. This repeats some prompt text, but it is the accepted universal capability-surface tradeoff for this Ticket.
+
+---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-12T15:19:29Z from: inprogress to: done reason: implementation_merged_and_validated field: state -->
+
+## State changed
+
+Implementation was merged into the Orchestrator branch, reviewer approved with no blockers, and post-integration validation passed. Cleanup and closure will be recorded next.
+
+---
