@@ -118,3 +118,12 @@ Ticket 00001KTJXS31R は implementation_ready。残り範囲は既に実装済�
 Intake refinement により、既存の plan store 実装との差分、current `state` vocabulary、binding invariants、implementation latitude、validation focus が整理され、Orchestrator が routing できる状態になった。
 
 ---
+
+<!-- event: state_changed author: workspace-panel at: 2026-06-12T14:49:40Z from: ready to: queued reason: queued field: state -->
+
+## State changed
+
+Ticket を `workspace-panel` が queued にしました。
+
+
+---
