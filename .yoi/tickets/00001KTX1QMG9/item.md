@@ -1,8 +1,8 @@
 ---
 title: '実装ブランチをOrchestrator branch HEADから切る'
-state: 'inprogress'
+state: 'closed'
 created_at: '2026-06-12T04:34:05Z'
-updated_at: '2026-06-12T08:11:52Z'
+updated_at: '2026-06-12T08:15:54Z'
 assignee: null
 queued_by: 'yoi ticket'
 queued_at: '2026-06-12T08:11:52Z'

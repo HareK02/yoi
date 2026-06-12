@@ -707,7 +707,7 @@ fn append_workspace_routing_context(out: &mut String, context: &TicketRoleLaunch
         &target_workspace_root.display().to_string(),
     );
     out.push_str(
-        "- Treat `role_workspace_root` as the launched role runtime workspace/Ticket backend root. Create implementation worktrees under `implementation_worktree_root`, not relative to the role cwd, and run merge-completion against `merge_target_workspace_root`.\n",
+        "- Treat `role_workspace_root` as the launched role runtime workspace/Ticket backend root. Create implementation worktrees under `implementation_worktree_root`, not relative to the role cwd, and run merge-completion against `merge_target_workspace_root`. `implementation_worktree_root` is placement authority only; implementation branches are based on the Orchestrator workspace current HEAD / orchestration branch HEAD, not the merge-target workspace or `develop` HEAD.\n",
     );
 }
 
@@ -1351,6 +1351,9 @@ workflow = "ticket-review-workflow"
         assert!(text.contains("implementation_worktree_root"));
         assert!(text.contains("merge_target_workspace_root"));
         assert!(text.contains("not relative to the role cwd"));
+        assert!(text.contains("`implementation_worktree_root` is placement authority only"));
+        assert!(text.contains("implementation branches are based on the Orchestrator workspace current HEAD / orchestration branch HEAD"));
+        assert!(text.contains("not the merge-target workspace or `develop` HEAD"));
         assert!(text.contains("Orchestrator merge-completion guidance"));
         assert!(text.contains("`inprogress` Ticket with a merge-ready dossier"));
         assert!(text.contains("Conservative or missing authorization mode stops at the dossier"));
