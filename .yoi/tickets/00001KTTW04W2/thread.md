@@ -139,3 +139,35 @@ Decision:
 Explicit user follow-up authorized starting the previously accepted implementation plan. Ticket body/thread, relation blockers, accepted orchestration plan, current Orchestrator workspace state, and visible active work were rechecked. No unresolved blocker or missing planning decision remains. Implementation side effects will start only after this accepted `queued -> inprogress` transition is recorded.
 
 ---
+
+<!-- event: plan author: orchestrator at: 2026-06-12T14:51:31Z -->
+
+## Plan
+
+Implementation worktree created for multi-agent handoff.
+
+- Ticket: `00001KTTW04W2`
+- Branch: `ticket/orchestrator-progress-companion-notify`
+- Worktree: `/home/hare/Projects/yoi/.worktree/orchestrator-progress-companion-notify`
+- Base: Orchestrator workspace HEAD `05fe1f6f` (`orchestration/yoi-orchestrator`), including the accepted routing record and `queued -> inprogress` transition.
+- Concurrent work note: `00001KTVJFT6F` is active in `/home/hare/Projects/yoi/.worktree/panel-focus-composer-row-selection`; any Panel UI edits should be narrow and integration will recheck conflict risk.
+- Scope rule: implementation work happens only in this child worktree. Root/original workspace must not be read, written, validated, merged, cleaned, or used for git operations.
+- Next: spawn sibling coder with narrow write scope to the implementation worktree. Reviewer will be started after coder evidence is available.
+
+---
+
+<!-- event: plan author: orchestrator at: 2026-06-12T14:52:34Z -->
+
+## Plan
+
+Coder delegated.
+
+- Coder Pod: `yoi-coder-companion-progress-notify`
+- Worktree: `/home/hare/Projects/yoi/.worktree/orchestrator-progress-companion-notify`
+- Branch: `ticket/orchestrator-progress-companion-notify`
+- Scope: write `/home/hare/Projects/yoi/.worktree/orchestrator-progress-companion-notify`; read child worktree plus minimal non-recursive runtime-root read required by spawn validation.
+- Task: implement `Notify { auto_run: false }` weak progress notification semantics, bounded Orchestrator progress summary delivery to live/reachable Companion, missing/stopped no spawn/restore behavior, Panel freshness/last-updated indication, focused tests, and required validation.
+- Concurrent work note: `00001KTVJFT6F` has active coder work in another worktree and may edit Panel UI; coder was instructed to keep Panel changes narrow and report overlap if it becomes a blocker.
+- Constraint: coder was instructed not to use root/original workspace for decision evidence or git/validation/cleanup, and not to create generated memory/local/runtime/log/lock/secret-like `.yoi` paths.
+
+---

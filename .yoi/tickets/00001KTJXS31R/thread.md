@@ -127,3 +127,25 @@ Ticket を `workspace-panel` が queued にしました。
 
 
 ---
+
+<!-- event: decision author: orchestrator at: 2026-06-12T14:56:17Z -->
+
+## Decision
+
+Routing decision: leave queued for now (`waiting_capacity_note`)
+
+Reason:
+- This queue review already accepted and delegated three in-progress branches: `00001KTVJFT6F` (Panel focus model), `00001KTTW04W2` (Companion progress notification), and `00001KTVJGC0Y` (Ticket language guidance).
+- This Ticket concerns Orchestrator idle queued re-kick / active work-set behavior and overlaps conceptually with the active Companion progress notification and Panel lifecycle work. Starting it now would raise duplicate-start / scheduler-boundary / integration-conflict risk rather than safe independent parallelism.
+- Relation check: dependency relation target `00001KTG3MDFG` is closed, so this is not blocked by an unresolved relation; the current stop reason is capacity/conflict with active work.
+
+Evidence checked:
+- Ticket body/thread: active in-progress suppression, clean workspace gate, no queue-drain loop, active-work-set snapshot requirements, and escalation conditions.
+- TicketRelationQuery: two relation records checked; `depends_on` target `00001KTG3MDFG` is closed.
+- TicketOrchestrationPlanQuery: no prior records; added `waiting_capacity_note` `orch-plan-20260612-145604-1`.
+- Workspace/Pod state: Orchestrator worktree clean; active sibling coder Pods are running for Panel focus, Companion progress notification, and Ticket language guidance.
+
+Next action:
+- Keep `queued` and reconsider after at least Panel focus / Companion progress notification are merged or blocked, so this Ticket can validate against the current Panel/notification behavior without duplicate scheduler semantics.
+
+---

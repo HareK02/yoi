@@ -523,13 +523,6 @@ fn commit_intake_registry_update(update: IntakeRegistryUpdate) -> Option<String>
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PanelFocus {
-    GlobalComposer,
-    Row,
-    ItemAction,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PanelDiagnostic {
     title: String,
@@ -585,7 +578,6 @@ pub(crate) struct MultiPodApp {
     pub(crate) panel: WorkspacePanelViewModel,
     pub(crate) input: InputBuffer,
     selected_row: Option<PanelRowKey>,
-    focus: PanelFocus,
     composer_target: ComposerTarget,
     notice: Option<String>,
     panel_diagnostic: Option<PanelDiagnostic>,
@@ -618,7 +610,6 @@ impl MultiPodApp {
             panel,
             input: InputBuffer::new(),
             selected_row: None,
-            focus: PanelFocus::GlobalComposer,
             composer_target: ComposerTarget::Companion,
             notice: None,
             panel_diagnostic: None,
@@ -825,7 +816,7 @@ impl MultiPodApp {
                     .clone()
                     .or_else(|| row.key_hint.clone())
                     .unwrap_or_else(|| {
-                        "Enter dispatches this Ticket action; Right marks action focus; stale Tickets are re-checked before any mutation."
+                        "Enter dispatches this Ticket action after re-checking current Ticket authority."
                             .to_string()
                     }),
             );
@@ -919,37 +910,11 @@ impl MultiPodApp {
             self.list.selected_name = Some(name.clone());
         }
         self.selected_row = Some(key);
-        self.focus = PanelFocus::Row;
     }
 
-    fn clear_panel_focus(&mut self) {
+    fn clear_panel_selection(&mut self) {
         self.selected_row = None;
         self.list.selected_name = None;
-        self.focus = PanelFocus::GlobalComposer;
-    }
-
-    fn effective_focus(&self) -> PanelFocus {
-        if self.selected_row.is_none() {
-            PanelFocus::GlobalComposer
-        } else {
-            self.focus
-        }
-    }
-
-    fn focus_item_action(&mut self) {
-        if self.selected_row.is_some() {
-            self.focus = PanelFocus::ItemAction;
-        } else {
-            self.notice = Some("No row selected; use ↑/↓ to select a row first.".to_string());
-        }
-    }
-
-    fn focus_selected_row(&mut self) {
-        if self.selected_row.is_some() {
-            self.focus = PanelFocus::Row;
-        } else {
-            self.focus = PanelFocus::GlobalComposer;
-        }
     }
 
     fn ensure_composer_target_available(&mut self) {
@@ -1431,15 +1396,16 @@ impl MultiPodApp {
             KeyCode::Char('d') if ctrl => MultiPodAction::Quit,
             KeyCode::Char('c') if ctrl => MultiPodAction::Quit,
             KeyCode::Esc => {
-                self.clear_panel_focus();
-                self.notice = Some("Focus: global composer target; Ctrl+C quits.".to_string());
+                self.clear_panel_selection();
+                self.notice = Some(
+                    "Row selection cleared; composer draft and target are unchanged.".to_string(),
+                );
                 MultiPodAction::None
             }
             KeyCode::Tab => {
                 // Completion owns Tab before panel target switching when a
                 // completion popup exists. The workspace panel currently has
                 // no completion source, so this is the target switch path.
-                self.clear_panel_focus();
                 self.cycle_composer_target();
                 MultiPodAction::None
             }
@@ -1449,22 +1415,6 @@ impl MultiPodApp {
             }
             KeyCode::Down if self.composer_is_blank() => {
                 self.select_next();
-                MultiPodAction::None
-            }
-            KeyCode::Left
-                if self.composer_is_blank() && self.effective_focus() == PanelFocus::ItemAction =>
-            {
-                self.focus_selected_row();
-                MultiPodAction::None
-            }
-            KeyCode::Left
-                if self.composer_is_blank() && self.effective_focus() == PanelFocus::Row =>
-            {
-                self.clear_panel_focus();
-                MultiPodAction::None
-            }
-            KeyCode::Right if self.composer_is_blank() => {
-                self.focus_item_action();
                 MultiPodAction::None
             }
             KeyCode::Enter
@@ -1482,11 +1432,11 @@ impl MultiPodApp {
                     .map(MultiPodAction::DispatchTicketAction)
                     .unwrap_or(MultiPodAction::None)
             }
+            KeyCode::Enter if self.composer_is_blank() => MultiPodAction::Open,
             KeyCode::Enter if self.composer_target == ComposerTarget::TicketIntake => self
                 .prepare_intake_launch()
                 .map(MultiPodAction::LaunchIntake)
                 .unwrap_or(MultiPodAction::None),
-            KeyCode::Enter if self.composer_is_blank() => MultiPodAction::Open,
             KeyCode::Enter => self
                 .prepare_companion_send()
                 .map(MultiPodAction::SendCompanion)
@@ -3469,8 +3419,7 @@ fn open_disabled_reason(entry: &PodListEntry) -> String {
         }
         return match live.status {
             Some(PodStatus::Running) => {
-                "Selected Pod is running; Enter opens/attaches; Right marks action focus."
-                    .to_string()
+                "Selected Pod is running; Enter opens/attaches for inspection.".to_string()
             }
             Some(PodStatus::Paused) => {
                 "Selected Pod is paused; open it explicitly to resume or start a new turn."
@@ -3481,8 +3430,7 @@ fn open_disabled_reason(entry: &PodListEntry) -> String {
         };
     }
     if entry.stored.is_some() {
-        return "Selected Pod is stopped; Enter restores/opens; Right marks action focus."
-            .to_string();
+        return "Selected Pod is stopped; Enter restores/opens for inspection.".to_string();
     }
     entry
         .actions
@@ -3496,7 +3444,7 @@ fn selected_ticket_notice(row: Option<&PanelRow>) -> String {
         Some(row) if row.is_ticket_action() => {
             let action = row.next_action.map(NextUserAction::label).unwrap_or("View");
             format!(
-                "Enter dispatches {action} for Ticket '{}' after re-checking current Ticket authority; Right marks action focus.",
+                "Enter dispatches {action} for Ticket '{}' after re-checking current Ticket authority.",
                 row.title
             )
         }
@@ -3764,11 +3712,11 @@ fn draw_title(frame: &mut Frame<'_>, app: &MultiPodApp, area: Rect) {
         .composer
         .is_available(ComposerTarget::TicketIntake)
     {
-        "  Row focus: Enter dispatches row action · Right action focus · Tab target"
+        "  Row selection: blank Enter opens/dispatches · text Enter uses target · Tab target"
     } else if app.panel.header.ticket_configured {
-        "  Row focus: Enter opens/dispatches · Right action focus"
+        "  Row selection: blank Enter opens/dispatches · text Enter sends to Companion"
     } else {
-        "  Pod-centric view · Row focus: Enter opens · Right action focus"
+        "  Pod-centric view · Row selection: blank Enter opens · text Enter sends to Companion"
     };
     let mut spans = vec![
         Span::styled(
@@ -4111,73 +4059,71 @@ fn draw_target_status(frame: &mut Frame<'_>, app: &MultiPodApp, area: Rect) {
 fn target_status_line(app: &MultiPodApp) -> Line<'static> {
     if !app.composer_is_blank() {
         return Line::from(vec![
-            Span::styled("focus ", Style::default().fg(Color::DarkGray)),
-            Span::styled("global composer", Style::default().fg(Color::Cyan)),
-            Span::styled(" · composer ", Style::default().fg(Color::DarkGray)),
+            Span::styled("composer target ", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 app.composer_target().label(),
                 Style::default()
                     .fg(Color::Green)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(" · Enter ", Style::default().fg(Color::DarkGray)),
+            Span::styled(" · draft Enter ", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 composer_enter_status_text(app),
                 Style::default().fg(Color::Green),
             ),
+            Span::styled(
+                " · row selection waits until composer is blank",
+                Style::default().fg(Color::DarkGray),
+            ),
         ]);
     }
 
-    let focus_label = match app.effective_focus() {
-        PanelFocus::GlobalComposer => "global composer",
-        PanelFocus::Row => "selected row",
-        PanelFocus::ItemAction => "item action",
-    };
     if let Some(row) = app
         .selected_panel_row()
         .filter(|row| row.is_ticket_action())
     {
         let action = row.next_action.map(NextUserAction::label).unwrap_or("View");
         Line::from(vec![
-            Span::styled("focus ", Style::default().fg(Color::DarkGray)),
-            Span::styled(focus_label, Style::default().fg(Color::Cyan)),
-            Span::styled(" · composer ", Style::default().fg(Color::DarkGray)),
+            Span::styled("composer target ", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 app.composer_target().label(),
                 Style::default()
                     .fg(Color::Magenta)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(" · ticket ", Style::default().fg(Color::DarkGray)),
+            Span::styled(" · selected Ticket ", Style::default().fg(Color::DarkGray)),
             Span::styled(row.status.clone(), panel_priority_style(row.priority)),
-            Span::styled(" · action ", Style::default().fg(Color::DarkGray)),
+            Span::styled(" · blank Enter ", Style::default().fg(Color::DarkGray)),
             Span::styled(action, Style::default().fg(Color::Magenta)),
         ])
     } else if let Some(entry) = app.selected_pod_entry() {
         let (status, status_style) = row_status_label(entry);
         Line::from(vec![
-            Span::styled("focus ", Style::default().fg(Color::DarkGray)),
-            Span::styled(focus_label, Style::default().fg(Color::Cyan)),
-            Span::styled(" · composer ", Style::default().fg(Color::DarkGray)),
+            Span::styled("composer target ", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 app.composer_target().label(),
                 Style::default()
                     .fg(Color::Green)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(" · pod ", Style::default().fg(Color::DarkGray)),
+            Span::styled(" · selected Pod ", Style::default().fg(Color::DarkGray)),
             Span::styled(status.to_string(), status_style),
+            Span::styled(
+                " · blank Enter open/attach",
+                Style::default().fg(Color::DarkGray),
+            ),
         ])
     } else {
         Line::from(vec![
-            Span::styled("focus ", Style::default().fg(Color::DarkGray)),
-            Span::styled(focus_label, Style::default().fg(Color::Cyan)),
-            Span::styled(" · composer ", Style::default().fg(Color::DarkGray)),
+            Span::styled("composer target ", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 app.composer_target().label(),
                 Style::default().fg(Color::DarkGray),
             ),
-            Span::styled(" · no selection", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                " · no row selected · ↑/↓ selects a row",
+                Style::default().fg(Color::DarkGray),
+            ),
         ])
     }
 }
@@ -4311,11 +4257,11 @@ fn actionbar_left_text(app: &MultiPodApp) -> String {
     } else {
         match app.composer_target() {
             ComposerTarget::Companion => {
-                "Companion target pending; non-empty Enter keeps draft and reports a diagnostic"
+                "Composer target: Companion; type text to send, or use ↑/↓ then blank Enter for rows"
                     .to_string()
             }
             ComposerTarget::TicketIntake => {
-                "Ticket Intake target: Enter launches Intake with composer text".to_string()
+                "Composer target: Ticket Intake; type a request, then Enter launches Intake".to_string()
             }
         }
     }
@@ -4325,25 +4271,25 @@ fn actionbar_right_text(app: &MultiPodApp) -> &'static str {
     if app.panel_diagnostic_open {
         "F2/Esc close details  Ctrl+C quit"
     } else if app.panel_diagnostic.is_some() {
-        "F2 details  ↑/↓ row  Enter row action/open  Right action focus  Tab target  Esc composer  Ctrl+C quit"
+        "F2 details  ↑/↓ select row  Enter selected row  Tab target  Esc clear selection  Left/Right cursor  Ctrl+C quit"
     } else if !app.composer_is_blank() {
         if app
             .panel
             .composer
             .is_available(ComposerTarget::TicketIntake)
         {
-            "↑/↓ row  Enter composer target  Tab target  Esc composer  Ctrl+C quit"
+            "↑/↓ draft lines  Left/Right cursor  Enter composer target  Tab target  Esc clear selection  Ctrl+C quit"
         } else {
-            "↑/↓ row  Enter composer target  Esc composer  Ctrl+C quit"
+            "↑/↓ draft lines  Left/Right cursor  Enter composer target  Esc clear selection  Ctrl+C quit"
         }
     } else if app
         .panel
         .composer
         .is_available(ComposerTarget::TicketIntake)
     {
-        "↑/↓ row  Enter row action/open  Right action focus  Tab target  Esc composer  Ctrl+C quit"
+        "↑/↓ select row  Enter selected row  Tab target  Esc clear selection  Left/Right cursor  Ctrl+C quit"
     } else {
-        "↑/↓ row  Enter row action/open  Right action focus  Esc composer  Ctrl+C quit"
+        "↑/↓ select row  Enter selected row  Esc clear selection  Left/Right cursor  Ctrl+C quit"
     }
 }
 
@@ -5248,10 +5194,11 @@ mod tests {
         assert!(actionbar_left.contains("Companion target: Enter sends composer text"));
         assert!(actionbar_right.contains("Enter composer target"));
         assert!(!actionbar_left.contains("Queue"));
-        assert!(!actionbar_right.contains("row action/open"));
-        assert!(target_status.contains("focus global composer"));
-        assert!(target_status.contains("Enter send composer text to workspace Companion"));
-        assert!(!target_status.contains("action Queue"));
+        assert!(!actionbar_right.contains("selected row"));
+        assert!(target_status.contains("composer target Companion"));
+        assert!(target_status.contains("draft Enter send composer text to workspace Companion"));
+        assert!(target_status.contains("row selection waits until composer is blank"));
+        assert!(!target_status.contains("blank Enter Queue"));
     }
 
     #[test]
@@ -6162,21 +6109,23 @@ mod tests {
     }
 
     #[test]
-    fn multi_esc_clears_panel_focus_without_quitting() {
+    fn multi_esc_clears_row_selection_without_quitting_and_preserves_draft() {
         let mut app = ticket_enabled_app(vec![live_info("alpha", PodStatus::Idle)]);
+        app.input.insert_str("draft message");
 
         assert!(app.selected_row.is_some());
-        assert!(matches!(
-            app.handle_key(key(KeyCode::Right)),
-            MultiPodAction::None
-        ));
-        assert_eq!(app.effective_focus(), PanelFocus::ItemAction);
         assert!(matches!(
             app.handle_key(key(KeyCode::Esc)),
             MultiPodAction::None
         ));
         assert!(app.selected_row.is_none());
-        assert_eq!(app.effective_focus(), PanelFocus::GlobalComposer);
+        assert_eq!(input_text(&app), "draft message");
+        assert!(
+            app.notice
+                .as_deref()
+                .unwrap()
+                .contains("Row selection cleared")
+        );
         assert!(matches!(
             app.handle_key(modified_key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
             MultiPodAction::Quit
@@ -6189,6 +6138,7 @@ mod tests {
         app.input.insert_str("draft intake request");
 
         assert!(matches!(app.composer_target(), ComposerTarget::Companion));
+        let selected_before = app.selected_row.clone();
         assert!(matches!(
             app.handle_key(key(KeyCode::Tab)),
             MultiPodAction::None
@@ -6198,6 +6148,7 @@ mod tests {
             app.composer_target(),
             ComposerTarget::TicketIntake
         ));
+        assert_eq!(app.selected_row, selected_before);
         assert_eq!(input_text(&app), "draft intake request");
     }
 
@@ -6233,14 +6184,14 @@ mod tests {
     }
 
     #[test]
-    fn multi_ticket_intake_rejects_empty_input() {
+    fn multi_blank_ticket_intake_enter_uses_selected_row_and_preserves_input() {
         let mut app = ticket_enabled_app(vec![live_info("idle", PodStatus::Idle)]);
         app.cycle_composer_target();
         app.input.insert_str("  \n\t");
 
         assert!(matches!(
             app.handle_key(key(KeyCode::Enter)),
-            MultiPodAction::None
+            MultiPodAction::Open
         ));
 
         assert!(matches!(
@@ -6249,7 +6200,12 @@ mod tests {
         ));
         assert!(!app.sending);
         assert_eq!(input_text(&app), "  \n\t");
-        assert!(app.notice.as_deref().unwrap().contains("input is empty"));
+        assert!(
+            !app.notice
+                .as_deref()
+                .unwrap_or_default()
+                .contains("input is empty")
+        );
     }
 
     #[test]
@@ -6531,7 +6487,6 @@ mod tests {
             panel,
             input: InputBuffer::new(),
             selected_row: None,
-            focus: PanelFocus::GlobalComposer,
             composer_target: ComposerTarget::Companion,
             notice: None,
             panel_diagnostic: None,
