@@ -242,3 +242,45 @@ Reviewer delegated.
 - Reviewer focus: no AutoKick/re-kick/scheduler behavior, legacy notify compatibility, bounded/history-backed progress notices, missing/stopped Companion no-op, no authority expansion, Panel freshness UI compatibility with merged focus model, and robust focused tests.
 
 ---
+
+<!-- event: review author: reviewer:yoi-reviewer-companion-progress-notify at: 2026-06-12T15:30:03Z status: request_changes -->
+
+## Review: request changes
+
+Request changes.
+
+Blocker:
+- `crates/tui/src/multi_pod.rs` の `companion_progress_notice()` が、Companion の model context に入る progress notice の framing 文言を Rust に直書きしている。
+- この notice は `dispatch_companion_progress_notice()` から `Notify { auto_run: false }` として送られ、NotifyBuffer 経由で history-backed な SystemItem / LLM context になるため、単なる Panel UI 文言ではなく LLM-facing framing と判断する。
+- Ticket の明示要件「Prompt / workflow 文言を Rust code に直書きしない」「LLM-facing summary framing が必要な場合は `resources/prompts` 側に置く」に反している。
+
+Requested change:
+- Rust 側は bounded runtime values の組み立てに留める。
+- progress notice の framing/template は `resources/prompts` 配下へ移す。
+- template/resource rendering の focused test を追加または既存 `companion_progress` tests を更新し、framing が resource 側から来ることと bounded/sensitive-safe values が維持されることを確認する。
+
+Good evidence confirmed:
+- `auto_run:false` は idle Pod に `RunForNotification` を staged しない。
+- `auto_run:true` と legacy missing field の挙動は維持されている。
+- live/reachable Companion の socket に `Notify { auto_run: false }` を送るだけで、missing/stopped/unreachable では spawn/restore されない。
+- 通知内容は Ticket id/title/state、role pod status、short reason、`.yoi/tickets/<id>` ref に絞られ、thread excerpt / diagnostics / provider error token はテストで除外確認されている。
+- Companion profile / authority 強化は diff 上ない。
+- Panel freshness は header detail 表示で、composer target / row selection の focus model には干渉していない。
+
+Reviewer-run validation:
+- `git diff --check orchestration/yoi-orchestrator...HEAD`: pass
+- `cargo test -p protocol`: pass, 39 tests
+- `cargo test -p pod --test controller_test`: pass, 36 tests
+- `cargo test -p tui companion_progress -- --nocapture`: pass, 5 tests
+- `cargo test -p tui send_notify_only_can_deliver_weak_notification_without_auto_run -- --nocapture`: pass, 1 test
+- `cargo check -p protocol -p pod -p tui`: pass
+- `cargo fmt --check`: pass
+- `cargo run -p yoi -- ticket doctor`: `doctor: ok`
+- `nix build .#yoi`: pass
+
+Broad-suite failures:
+- `cargo test -p pod` currently fails 2 prompt-resource assertion tests.
+- `cargo test -p tui` currently fails 3 unrelated-looking tests.
+- These broad-suite failures do not appear caused by the progress-notify diff and are not the requested-change blocker.
+
+---
