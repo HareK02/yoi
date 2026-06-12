@@ -136,3 +136,19 @@ Implementation worktree created for multi-agent handoff.
 - Next: spawn sibling coder with narrow write scope to the implementation worktree. Reviewer will be started after coder evidence is available.
 
 ---
+
+<!-- event: plan author: orchestrator at: 2026-06-12T14:55:42Z -->
+
+## Plan
+
+Coder delegated.
+
+- Coder Pod: `yoi-coder-ticket-language-guidance`
+- Worktree: `/home/hare/Projects/yoi/.worktree/ticket-language-guidance-all-tools`
+- Branch: `ticket/ticket-language-guidance-all-tools`
+- Scope: write `/home/hare/Projects/yoi/.worktree/ticket-language-guidance-all-tools`; read child worktree plus minimal non-recursive runtime-root read required by spawn validation.
+- Task: make configured `ticket.language` guidance model-visible for all Ticket-capable Pods, including non-role Companion-style contexts; preserve worker/memory/ticket language boundaries; avoid hidden context-only injection; add focused tests and required validation.
+- Parallel work note: active sibling worktrees for Panel focus and Companion progress notification exist; coder was instructed to avoid coupling and report concrete merge/design conflict if found.
+- Constraint: coder was instructed not to use root/original workspace for decision evidence or git/validation/cleanup, and not to create generated memory/local/runtime/log/lock/secret-like `.yoi` paths.
+
+---
