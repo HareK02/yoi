@@ -1588,6 +1588,10 @@ mod tests {
                 Some(expected)
             );
             assert_eq!(resolved.manifest.pod.name, "role-pod");
+            if matches!(expected, "intake" | "orchestrator" | "coder" | "reviewer") {
+                let expected_instruction = format!("$yoi/role/{expected}");
+                assert_eq!(resolved.manifest.worker.instruction, expected_instruction);
+            }
         }
     }
 

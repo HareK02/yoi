@@ -4,6 +4,10 @@ return yoi.profile.extend("builtin:default", {
 
     scope = yoi.scope.workspace_read(),
 
+    worker = {
+        instruction = "$yoi/role/orchestrator",
+    },
+
     feature = {
         task = { enabled = false },
         memory = { enabled = true },

@@ -317,6 +317,16 @@ mod tests {
     }
 
     #[test]
+    fn builtin_ticket_role_instructions_resolve() {
+        let loader = PromptLoader::builtins_only();
+        for role in ["intake", "orchestrator", "coder", "reviewer"] {
+            let (reference, source) = loader.resolve(&format!("$yoi/role/{role}"), None).unwrap();
+            assert_eq!(reference.to_qualified_string(), format!("$yoi/role/{role}"));
+            assert!(source.contains("first committed user message"));
+        }
+    }
+
+    #[test]
     fn builtin_subdirectory_lookup() {
         let loader = PromptLoader::builtins_only();
         let (_, source) = loader.resolve("$yoi/common/tool-usage", None).unwrap();
