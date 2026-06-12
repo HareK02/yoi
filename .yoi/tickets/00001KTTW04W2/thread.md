@@ -171,3 +171,58 @@ Coder delegated.
 - Constraint: coder was instructed not to use root/original workspace for decision evidence or git/validation/cleanup, and not to create generated memory/local/runtime/log/lock/secret-like `.yoi` paths.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-12T15:23:02Z -->
+
+## Implementation report
+
+Coder completed implementation and branch was synchronized with current Orchestrator HEAD before review.
+
+Coder Pod:
+- `yoi-coder-companion-progress-notify`
+
+Implementation branch/worktree:
+- Branch: `ticket/orchestrator-progress-companion-notify`
+- Worktree: `/home/hare/Projects/yoi/.worktree/orchestrator-progress-companion-notify`
+- Implementation commit: `a87d3154 feat: weak companion progress notify`
+- Sync merge commit on implementation branch: `724b79f1 Merge branch 'orchestration/yoi-orchestrator' into ticket/orchestrator-progress-companion-notify`
+- Worktree status: clean
+
+Changed surfaces:
+- `crates/protocol/src/lib.rs`
+- `crates/pod/src/controller.rs`
+- `crates/pod/src/discovery.rs`
+- `crates/pod/tests/controller_test.rs`
+- `crates/tui/src/multi_pod.rs`
+
+Implementation summary:
+- Added `Method::Notify { auto_run: bool }`; missing `auto_run` defaults to `true`, `true` serializes like the old shape, and `false` is explicit.
+- Idle Pod `Notify { auto_run: false }` does not stage `RunForNotification`; explicit next run drains notification history-backed through existing paths.
+- Existing peer notify/discovery paths keep `auto_run: true`.
+- Panel sends bounded progress notices to live/reachable Companion only via weak `Notify { auto_run: false }`.
+- Missing/stopped/unreachable Companion is best-effort no-op; no spawn/restore.
+- Progress summary is bounded to Ticket id/title/state, role pod status, and `.yoi/tickets/<id>` refs; no full thread, long output, diagnostics, provider errors, or secret-like content.
+- Panel title shows Companion progress freshness/last-updated without adding a persistent snapshot store.
+- Companion profile/tool authority is unchanged.
+
+Orchestrator-verified evidence from child worktree after sync with current Orchestrator branch:
+- `git status --short --branch`: clean on `ticket/orchestrator-progress-companion-notify`
+- `cargo test -p protocol`: pass, 39 tests
+- `cargo test -p pod --test controller_test`: pass, 36 tests
+- `cargo test -p tui companion_progress -- --nocapture`: pass, 5 tests
+- `cargo test -p tui send_notify_only_can_deliver_weak_notification_without_auto_run -- --nocapture`: pass, 1 test
+- `cargo check -p protocol -p pod -p tui`: pass
+- `cargo fmt --check`: pass
+- `git diff --check orchestration/yoi-orchestrator...HEAD`: pass
+- `cargo run -p yoi -- ticket doctor`: `doctor: ok`
+- `nix build .#yoi`: pass
+
+Known unrelated validation failures from coder full-suite notes:
+- `cargo test -p pod` still fails existing prompt-resource assertion tests: `worker_instruction_override_from_resources`, `worker_instruction_uses_resource_template`.
+- `cargo test -p tui` still fails existing tests: `multi_pod::tests::orchestrator_launch_context_includes_ticket_and_workspace_facts`, `multi_pod::tests::spawn_or_restore_companion_restores_live_pod`, `multi_pod::tests::spawn_or_restore_companion_spawns_missing_pod`.
+- Focused weak-notify/progress tests pass; reviewer should confirm the broad failures are unrelated/pre-existing and not introduced by this Ticket.
+
+Next:
+- Spawn read-only sibling reviewer against the recorded intent, binding decisions/invariants, acceptance criteria, implementation commit `a87d3154`, synced review head `724b79f1`, diff, validation evidence, and known broad-suite failures.
+
+---
