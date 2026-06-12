@@ -262,3 +262,18 @@ Implementation worktree created for multi-agent handoff.
 - Next: spawn sibling coder with narrow write scope to the implementation worktree. Reviewer will be started after coder evidence is available.
 
 ---
+
+<!-- event: plan author: orchestrator at: 2026-06-12T15:47:50Z -->
+
+## Plan
+
+Coder delegated.
+
+- Coder Pod: `yoi-coder-idle-queued-rekick`
+- Worktree: `/home/hare/Projects/yoi/.worktree/orchestrator-idle-queued-rekick`
+- Branch: `ticket/orchestrator-idle-queued-rekick`
+- Scope: write `/home/hare/Projects/yoi/.worktree/orchestrator-idle-queued-rekick`; read child worktree plus minimal non-recursive runtime-root read required by spawn validation.
+- Task: implement bounded idle-Orchestrator queued-work attention / session work-set rediscovery without scheduler/polling/queue-drain behavior, preserve `queued -> inprogress` acceptance gate, suppress re-kick while active_inprogress work exists, prevent duplicate starts, and add focused tests plus required validation.
+- Constraint: coder was instructed not to use root/original workspace for decision evidence or git/validation/cleanup, and not to create generated memory/local/runtime/log/lock/secret-like `.yoi` paths.
+
+---
