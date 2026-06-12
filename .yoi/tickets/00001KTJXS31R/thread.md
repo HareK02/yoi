@@ -349,3 +349,50 @@ Reviewer delegated.
 - Reviewer focus: no scheduler/polling/queue-drain behavior, no acceptance-gate bypass, active_inprogress suppression, duplicate-start prevention, session-scoped work set, prompt-resource boundary, recent Panel/Companion behavior compatibility, and robust focused tests.
 
 ---
+
+<!-- event: review author: reviewer:yoi-reviewer-idle-queued-rekick at: 2026-06-12T16:10:24Z status: approve -->
+
+## Review: approve
+
+Approve.
+
+Review target:
+- Worktree: `/home/hare/Projects/yoi/.worktree/orchestrator-idle-queued-rekick`
+- Commit: `d2fae81a tui: add idle queued orchestrator attention`
+
+Evidence:
+- 差分は `crates/tui/src/multi_pod.rs` と `resources/prompts/panel/orchestrator_idle_queue_notice.md` のみ。
+- queued work への通知は idle かつ reachable な Orchestrator Pod に限定されている。
+- `Method::Notify { auto_run: true }` は bounded attention / re-kick として使われるだけで、Ticket 状態変更・Pod spawn・worktree 作成・queue drain は追加されていない。
+- Scheduler / queue drain / background worker は追加されていない。既存 Panel reload 後に fingerprint で重複抑制された通知を送る構成。
+- `queued -> inprogress` acceptance は bypass されていない。通知 payload は Ticket state verification と通常 acceptance 記録を明示し、implementation side effect は行わない。
+- `active_inprogress` suppression は実装されている。`TicketWorkflowState::InProgress` が存在する場合、queued attention は送られず、waiting reason として session work set に残る。
+- Duplicate-start guard は title/label ではなく、Ticket id に紐づく local claim / related visible Pods / worktree 表示情報から導出している。
+- Session work set は `MultiPodApp` 内の runtime/session-scoped state のみで、永続 per-Ticket artifact は追加されていない。
+- Prompt 本文は `resources/prompts/panel/orchestrator_idle_queue_notice.md` に置かれており、Rust 側は include/render の境界に留まっている。
+- `workflow_state` 命名は既存の typed `TicketWorkflowState` / Panel internal naming の利用であり、この差分で obsolete frontmatter authority を再導入しているものではない。
+
+Reviewer-run validation:
+- `cargo test -p tui queued_attention -- --nocapture`: pass, 3 tests
+- `cargo test -p tui planned_queued_prompts -- --nocapture`: pass
+- `cargo test -p tui rediscovered_queued_work -- --nocapture`: pass
+- `cargo test -p tui idle_orchestrator_gets_bounded_attention -- --nocapture`: pass
+- `cargo test -p tui active_inprogress_suppresses -- --nocapture`: pass
+- `cargo test -p tui workspace_panel -- --nocapture`: pass, 12 tests
+- `cargo check -p tui`: pass
+- `git diff --check orchestration/yoi-orchestrator...HEAD && cargo fmt --check`: pass
+
+Known broad-suite failures:
+- `cargo test -p tui`: expected broad-suite failure, 312 passed / 3 failed.
+- Failing tests:
+  - `multi_pod::tests::orchestrator_launch_context_uses_orchestration_root_for_runtime_workspace`
+  - `spawn::tests::profile_choices_use_project_registry_default`
+  - `spawn::tests::profile_choices_include_builtin_and_project_default_marker`
+- The two `spawn` failures are in untouched `crates/tui/src/spawn.rs`.
+- The `orchestrator_launch_context...` failure is in `multi_pod.rs`, but this diff does not touch `build_orchestrator_launch_context` or that test area; it remains the existing/neighboring expectation mismatch reported by coder. Not a blocker for this Ticket.
+
+Non-blocking risks:
+- Failed delivery is not fingerprint-marked, so a repeatedly reachable-but-rejecting socket can retry on subsequent Panel reloads; this is consistent with existing notice behavior but may be noisy.
+- Duplicate guard depends on the Panel’s existing visible claim/pod/worktree derivation, so it prevents duplicate starts for locally visible state but is not a full global scheduler/lock. This matches the Ticket’s bounded Panel-attention scope.
+
+---
