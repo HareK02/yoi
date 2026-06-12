@@ -166,3 +166,30 @@ Implementation worktree created for multi-agent handoff.
 - Next: spawn sibling coder with narrow write scope to the implementation worktree. Reviewer will be started after coder evidence is available.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-12T12:33:47Z -->
+
+## Implementation report
+
+Coder spawn initial attempt failed before socket creation.
+
+- Coder Pod name: `yoi-coder-role-launch-input`
+- Error: `cwd is not readable under the configured scope: /home/hare/Projects/yoi`
+- Recovery: retry with the same child worktree write scope plus minimal non-recursive read authority on the runtime workspace root required by spawn validation. The coder task still explicitly prohibits reading/writing/validating/merging/cleaning/running git in the root/original workspace and must operate from the child worktree only.
+
+---
+
+<!-- event: plan author: orchestrator at: 2026-06-12T12:34:21Z -->
+
+## Plan
+
+Coder delegated.
+
+- Coder Pod: `yoi-coder-role-launch-input`
+- Worktree: `/home/hare/Projects/yoi/.worktree/shorten-ticket-role-launch-input`
+- Branch: `ticket/shorten-ticket-role-launch-input`
+- Scope: write `/home/hare/Projects/yoi/.worktree/shorten-ticket-role-launch-input`; read child worktree plus minimal non-recursive runtime-root read required by spawn validation.
+- Task: shorten Ticket role launch first-run Submit input, move/keep role behavior in builtin Profile instruction, keep procedural guidance in Workflow, keep control-plane metadata out of first-run user text, add focused tests, validate with relevant cargo tests and `nix build .#yoi`.
+- Constraint: coder was instructed not to use root/original workspace for decision evidence or git/validation/cleanup, and not to create generated memory/local/runtime/log/lock/secret-like `.yoi` paths.
+
+---
