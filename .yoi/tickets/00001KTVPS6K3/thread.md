@@ -48,3 +48,12 @@ Escalate if:
 - The queued root-side changes should be manually committed/synced despite the current dirty workspace and active Queue-handoff fix.
 
 ---
+
+<!-- event: state_changed author: workspace-panel at: 2026-06-12T12:29:10Z from: ready to: queued reason: queued field: state -->
+
+## State changed
+
+Ticket を `workspace-panel` が queued にしました。
+
+
+---
