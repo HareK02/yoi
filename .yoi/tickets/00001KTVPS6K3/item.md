@@ -1,8 +1,8 @@
 ---
 title: 'Ticket role launch inputを短縮し、role behaviorをInstruction/Workflowへ分離する'
-state: 'inprogress'
+state: 'done'
 created_at: '2026-06-11T16:03:28Z'
-updated_at: '2026-06-12T13:06:54Z'
+updated_at: '2026-06-12T13:08:11Z'
 assignee: null
 risk_flags: ['prompt-context', 'workflow-boundary', 'role-launch']
 queued_by: 'workspace-panel'

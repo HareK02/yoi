@@ -272,3 +272,39 @@ Non-blocking risk:
 - 旧 `.yoi/prompts/ticket_role/*` override は、この surface の削除により launch Submit text には効かなくなる。今回の Ticket では既存 fragment の削除が許容されているため blocker ではないが、外部ユーザー向けには role behavior は Profile instruction、手順は Workflow override へ移す旨を後で案内すると安全。
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-12T13:08:07Z -->
+
+## Implementation report
+
+Integration completed in the Orchestrator workspace.
+
+Integrated implementation:
+- Ticket: `00001KTVPS6K3`
+- Implementation branch: `ticket/shorten-ticket-role-launch-input`
+- Implementation commit: `949531a0 client: shorten ticket role launch input`
+- Reviewer result: approve, no blockers
+- Orchestrator merge commit: `b18b8b5d merge: ticket role launch input split`
+- Integration target: `orchestration/yoi-orchestrator`
+
+Post-integration validation from Orchestrator worktree:
+- `cargo test -p client ticket_role --lib`: pass, 16 tests
+- `cargo test -p manifest builtin_role_profiles_are_registered_and_resolve --lib`: pass, 1 test
+- `cargo test -p pod builtin_ticket_role_instructions_resolve --lib`: pass, 1 test
+- `cargo fmt --check`: pass
+- `git diff --check HEAD~1..HEAD`: pass
+- `nix build .#yoi`: pass
+- `./result/bin/yoi ticket doctor`: `doctor: ok`
+
+Remaining non-blocking risk:
+- 旧 `.yoi/prompts/ticket_role/*` override は launch Submit text には効かなくなる。今回の Ticket では fragment 削除が許容されているため blocker ではないが、外部ユーザー向けには role behavior は Profile instruction、手順は Workflow override へ移す旨を後続で案内すると安全。
+
+---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-12T13:08:11Z from: inprogress to: done reason: implementation_merged_and_validated field: state -->
+
+## State changed
+
+Implementation was merged into the Orchestrator branch, reviewer approved, and post-integration validation passed. Cleanup and closure will be recorded next.
+
+---
