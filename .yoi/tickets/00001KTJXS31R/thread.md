@@ -334,3 +334,18 @@ Next:
 - Spawn read-only sibling reviewer against recorded intent, binding decisions/invariants, acceptance criteria, commit `d2fae81a`, diff, validation evidence, and known broad-suite failures.
 
 ---
+
+<!-- event: plan author: orchestrator at: 2026-06-12T16:05:08Z -->
+
+## Plan
+
+Reviewer delegated.
+
+- Reviewer Pod: `yoi-reviewer-idle-queued-rekick`
+- Target branch/worktree: `ticket/orchestrator-idle-queued-rekick` at `/home/hare/Projects/yoi/.worktree/orchestrator-idle-queued-rekick`
+- Commit under review: `d2fae81a tui: add idle queued orchestrator attention`
+- Scope: read-only child worktree plus minimal non-recursive runtime-root read required by spawn validation.
+- Review basis: recorded IntentPacket, binding decisions/invariants, acceptance criteria, implementation summary, diff, focused validation evidence, `nix build` evidence, and known broad-suite failures.
+- Reviewer focus: no scheduler/polling/queue-drain behavior, no acceptance-gate bypass, active_inprogress suppression, duplicate-start prevention, session-scoped work set, prompt-resource boundary, recent Panel/Companion behavior compatibility, and robust focused tests.
+
+---
