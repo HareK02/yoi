@@ -199,3 +199,18 @@ Next:
 - Spawn read-only sibling reviewer against the recorded intent, binding decisions/invariants, acceptance criteria, commit `c5ef6f79`, diff, focused validation evidence, `nix build` evidence, and the known pre-existing unrelated `multi_` failure.
 
 ---
+
+<!-- event: plan author: orchestrator at: 2026-06-12T15:01:54Z -->
+
+## Plan
+
+Reviewer delegated.
+
+- Reviewer Pod: `yoi-reviewer-panel-focus-model`
+- Target branch/worktree: `ticket/panel-focus-composer-row-selection` at `/home/hare/Projects/yoi/.worktree/panel-focus-composer-row-selection`
+- Commit under review: `c5ef6f79 tui: clarify panel composer target and row selection`
+- Scope: read-only child worktree plus minimal non-recursive runtime-root read required by spawn validation.
+- Review basis: recorded IntentPacket, binding decisions/invariants, acceptance criteria, implementation summary, diff, focused validation evidence, `nix build` evidence, and known pre-existing unrelated `multi_` failure evidence.
+- Reviewer focus: composer input protection, blank/non-blank Enter behavior, status/actionbar/key hint consistency, removal of user-visible `item action` / `Right action focus`, Ticket/Pod authority preservation, and staying within Panel scope.
+
+---
