@@ -155,3 +155,19 @@ Implementation worktree created for multi-agent handoff.
 - Next: spawn sibling coder with narrow write scope to the implementation worktree. Reviewer will be started after coder evidence is available.
 
 ---
+
+<!-- event: plan author: orchestrator at: 2026-06-12T14:52:34Z -->
+
+## Plan
+
+Coder delegated.
+
+- Coder Pod: `yoi-coder-companion-progress-notify`
+- Worktree: `/home/hare/Projects/yoi/.worktree/orchestrator-progress-companion-notify`
+- Branch: `ticket/orchestrator-progress-companion-notify`
+- Scope: write `/home/hare/Projects/yoi/.worktree/orchestrator-progress-companion-notify`; read child worktree plus minimal non-recursive runtime-root read required by spawn validation.
+- Task: implement `Notify { auto_run: false }` weak progress notification semantics, bounded Orchestrator progress summary delivery to live/reachable Companion, missing/stopped no spawn/restore behavior, Panel freshness/last-updated indication, focused tests, and required validation.
+- Concurrent work note: `00001KTVJFT6F` has active coder work in another worktree and may edit Panel UI; coder was instructed to keep Panel changes narrow and report overlap if it becomes a blocker.
+- Constraint: coder was instructed not to use root/original workspace for decision evidence or git/validation/cleanup, and not to create generated memory/local/runtime/log/lock/secret-like `.yoi` paths.
+
+---
