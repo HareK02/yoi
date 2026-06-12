@@ -134,3 +134,18 @@ Implementation worktree created for multi-agent handoff.
 - Next: spawn sibling coder with narrow write scope to the implementation worktree. Reviewer will be started after coder evidence is available.
 
 ---
+
+<!-- event: plan author: orchestrator at: 2026-06-12T14:46:41Z -->
+
+## Plan
+
+Coder delegated.
+
+- Coder Pod: `yoi-coder-panel-focus-model`
+- Worktree: `/home/hare/Projects/yoi/.worktree/panel-focus-composer-row-selection`
+- Branch: `ticket/panel-focus-composer-row-selection`
+- Scope: write `/home/hare/Projects/yoi/.worktree/panel-focus-composer-row-selection`; read child worktree plus minimal non-recursive runtime-root read required by spawn validation.
+- Task: simplify Panel focus model around composer target and row selection, remove/neutralize user-visible `item action focus` / `Right action focus`, align key hints/status/actionbar with actual behavior, add focused tests, validate with focused TUI tests and `nix build .#yoi`.
+- Constraint: coder was instructed not to use root/original workspace for decision evidence or git/validation/cleanup, and not to create generated memory/local/runtime/log/lock/secret-like `.yoi` paths.
+
+---
