@@ -21,3 +21,12 @@ Panel focus UX の不満を `yoi panel` 専用の concrete Ticket として整�
 Intake clarified the panel focus request and recorded an implementation-ready concrete Ticket. Human can queue it from the panel when ready.
 
 ---
+
+<!-- event: state_changed author: workspace-panel at: 2026-06-12T14:44:16Z from: ready to: queued reason: queued field: state -->
+
+## State changed
+
+Ticket を `workspace-panel` が queued にしました。
+
+
+---
