@@ -202,3 +202,18 @@ Next:
 - Spawn read-only sibling reviewer against the recorded intent, binding decisions/invariants, acceptance criteria, commit `92c4dee7`, diff, validation evidence, and known pre-existing unrelated `cargo test -p pod` failures.
 
 ---
+
+<!-- event: plan author: orchestrator at: 2026-06-12T15:11:23Z -->
+
+## Plan
+
+Reviewer delegated.
+
+- Reviewer Pod: `yoi-reviewer-ticket-language-guidance`
+- Target branch/worktree: `ticket/ticket-language-guidance-all-tools` at `/home/hare/Projects/yoi/.worktree/ticket-language-guidance-all-tools`
+- Commit under review: `92c4dee7 ticket: guide Ticket tool language universally`
+- Scope: read-only child worktree plus minimal non-recursive runtime-root read required by spawn validation.
+- Review basis: recorded IntentPacket, binding decisions/invariants, acceptance criteria, implementation summary, diff, focused validation evidence, `nix build` evidence, and known pre-existing unrelated `cargo test -p pod` failure evidence.
+- Reviewer focus: universal Ticket tool/capability guidance, Ticket role and generic/Companion-style coverage, worker/memory/ticket language separation, no hidden context-only injection, no authority expansion, and robust focused tests.
+
+---
