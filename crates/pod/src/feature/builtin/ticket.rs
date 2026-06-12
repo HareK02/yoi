@@ -12,7 +12,7 @@ use ticket::{
     tool::{
         TICKET_BASE_READ_ONLY_TOOL_NAMES, TICKET_BASE_TOOL_NAMES,
         TICKET_ORCHESTRATION_READ_ONLY_TOOL_NAMES, TICKET_ORCHESTRATION_TOOL_NAMES,
-        TICKET_READ_ONLY_TOOL_NAMES, TICKET_TOOL_NAMES, ticket_tools,
+        TICKET_READ_ONLY_TOOL_NAMES, TICKET_TOOL_NAMES, ticket_tool_description, ticket_tools,
     },
 };
 
@@ -178,7 +178,10 @@ impl FeatureModule for TicketFeature {
             ));
         let enabled_tool_names = self.enabled_tool_names();
         for name in &enabled_tool_names {
-            descriptor = descriptor.with_tool(ToolDeclaration::new(*name, tool_description(name)));
+            descriptor = descriptor.with_tool(ToolDeclaration::new(
+                *name,
+                ticket_tool_description(name, self.record_language.as_deref()),
+            ));
         }
         descriptor
     }
@@ -227,37 +230,6 @@ impl FeatureModule for TicketFeature {
     }
 }
 
-fn tool_description(name: &str) -> &'static str {
-    match name {
-        "TicketCreate" => "Create a Ticket through the typed local Ticket backend.",
-        "TicketList" => {
-            "List Tickets as a lightweight bounded overview for id selection; use TicketShow before decisions."
-        }
-        "TicketShow" => {
-            "Show one Ticket through the typed local Ticket backend as the detailed authority."
-        }
-        "TicketComment" => {
-            "Append a comment/plan/decision/implementation_report event to a Ticket."
-        }
-        "TicketReview" => "Append an approve/request_changes review event to a Ticket.",
-        "TicketIntakeReady" => {
-            "Mark an intake Ticket ready and append the typed intake summary/state transition events."
-        }
-        "TicketWorkflowState" => {
-            "Transition Ticket state; queued -> inprogress is the accepted implementation start, so implementation side effects should happen only after that transition is accepted and recorded."
-        }
-        "TicketClose" => "Close a Ticket with a resolution through the typed local Ticket backend.",
-        "TicketOrchestrationPlanRecord" => {
-            "Append a durable typed Ticket orchestration plan record without changing state or starting work."
-        }
-        "TicketOrchestrationPlanQuery" => {
-            "Query durable Ticket orchestration plan records by Ticket and/or relation kind."
-        }
-        "TicketDoctor" => "Run typed local Ticket backend consistency checks.",
-        _ => "Typed Ticket backend tool.",
-    }
-}
-
 pub fn ticket_tools_feature(workspace: impl AsRef<Path>) -> TicketFeature {
     TicketFeature::for_workspace(workspace)
 }
@@ -296,6 +268,19 @@ mod tests {
         let yoi_dir = workspace.join(".yoi");
         std::fs::create_dir_all(&yoi_dir).unwrap();
         std::fs::write(yoi_dir.join("ticket.config.toml"), content).unwrap();
+    }
+
+    fn pending_tool_description(
+        pending_tools: &[llm_worker::tool::ToolDefinition],
+        name: &str,
+    ) -> String {
+        pending_tools
+            .iter()
+            .find_map(|definition| {
+                let (meta, _) = definition();
+                (meta.name == name).then_some(meta.description)
+            })
+            .expect("tool exists")
     }
 
     #[test]
@@ -408,6 +393,45 @@ mod tests {
     }
 
     #[test]
+    fn read_only_companion_style_context_exposes_ticket_language_guidance() {
+        let temp = TempDir::new().unwrap();
+        write_ticket_config(
+            temp.path(),
+            r#"
+[ticket]
+language = "Japanese"
+"#,
+        );
+        make_ticket_root(&temp.path().join(DEFAULT_TICKET_BACKEND_RELATIVE_PATH));
+        let feature = ticket_tools_feature_with_access(temp.path(), TicketFeatureAccess::ReadOnly);
+        let descriptor = feature.descriptor();
+        let descriptor_description = descriptor
+            .tools
+            .iter()
+            .find(|tool| tool.name == "TicketShow")
+            .expect("TicketShow declared")
+            .description
+            .clone();
+        assert!(descriptor_description.contains("Ticket record language: Japanese"));
+
+        let mut pending_tools = Vec::new();
+        let mut hooks = HookRegistryBuilder::default();
+        let report = FeatureRegistryBuilder::new()
+            .with_module(feature)
+            .install_into_pending(&mut pending_tools, &mut hooks);
+
+        assert_eq!(pending_tools.len(), TICKET_READ_ONLY_TOOL_NAMES.len());
+        assert_eq!(
+            report.reports[0].installed_tools,
+            TICKET_READ_ONLY_TOOL_NAMES
+        );
+        let description = pending_tool_description(&pending_tools, "TicketShow");
+        assert!(description.contains("Ticket record language: Japanese"));
+        assert!(description.contains("distinct from worker.language"));
+        assert!(description.contains("Preserve protocol literals"));
+    }
+
+    #[test]
     fn lifecycle_installation_exposes_lifecycle_tools() {
         let temp = TempDir::new().unwrap();
         make_ticket_root(&temp.path().join(DEFAULT_TICKET_BACKEND_RELATIVE_PATH));
@@ -442,6 +466,35 @@ mod tests {
                 .iter()
                 .any(|tool| tool == "TicketWorkflowState")
         );
+    }
+
+    #[test]
+    fn lifecycle_ticket_role_style_context_exposes_ticket_language_guidance() {
+        let temp = TempDir::new().unwrap();
+        write_ticket_config(
+            temp.path(),
+            r#"
+[ticket]
+language = "Japanese"
+"#,
+        );
+        make_ticket_root(&temp.path().join(DEFAULT_TICKET_BACKEND_RELATIVE_PATH));
+        let mut pending_tools = Vec::new();
+        let mut hooks = HookRegistryBuilder::default();
+        let report = FeatureRegistryBuilder::new()
+            .with_module(ticket_tools_feature_with_access(
+                temp.path(),
+                TicketFeatureAccess::Lifecycle,
+            ))
+            .install_into_pending(&mut pending_tools, &mut hooks);
+
+        assert_eq!(pending_tools.len(), TICKET_TOOL_NAMES.len());
+        assert_eq!(report.reports[0].installed_tools, TICKET_TOOL_NAMES);
+        let description = pending_tool_description(&pending_tools, "TicketComment");
+        assert!(description.contains("Ticket record language: Japanese"));
+        assert!(description.contains("durable Ticket record and Ticket tool body text"));
+        assert!(description.contains("distinct from worker.language"));
+        assert!(description.contains("memory.language"));
     }
 
     #[test]
