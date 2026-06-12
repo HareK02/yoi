@@ -1,8 +1,8 @@
 ---
 title: 'Workspace panel の focus model を composer target と row selection に整理する'
-state: 'queued'
+state: 'inprogress'
 created_at: '2026-06-11T14:48:26Z'
-updated_at: '2026-06-12T14:44:16Z'
+updated_at: '2026-06-12T14:45:41Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['tui-ux', 'input-safety']
