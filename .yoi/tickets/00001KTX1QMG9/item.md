@@ -1,9 +1,11 @@
 ---
 title: '実装ブランチをOrchestrator branch HEADから切る'
-state: 'planning'
+state: 'inprogress'
 created_at: '2026-06-12T04:34:05Z'
-updated_at: '2026-06-12T04:34:15Z'
+updated_at: '2026-06-12T08:11:52Z'
 assignee: null
+queued_by: 'yoi ticket'
+queued_at: '2026-06-12T08:11:52Z'
 ---
 
 ## 背景
