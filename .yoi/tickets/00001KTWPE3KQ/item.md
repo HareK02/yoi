@@ -1,8 +1,8 @@
 ---
 title: 'Panel Queue時にdevとOrchestrator worktreeを同期する'
-state: 'inprogress'
+state: 'closed'
 created_at: '2026-06-12T01:16:39Z'
-updated_at: '2026-06-12T09:12:25Z'
+updated_at: '2026-06-12T12:26:26Z'
 assignee: null
 queued_by: 'yoi ticket'
 queued_at: '2026-06-12T02:39:25Z'
