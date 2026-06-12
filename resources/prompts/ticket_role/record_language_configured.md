@@ -1,1 +1,0 @@
-Ticket record language guidance: write durable Ticket item/thread/resolution text and Ticket tool bodies in this language. This does not change normal worker response language or memory/Knowledge generation language. Do not translate protocol literals, file paths, commands, logs, identifiers, or quoted external text solely because this language is configured.

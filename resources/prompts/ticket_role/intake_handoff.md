@@ -1,3 +1,0 @@
-- When Intake has clarified the request and created/updated the Ticket, use the typed Ticket tool surface to append `intake_summary` and set `state = ready` when the Ticket is ready to queue; use planning language for Tickets that still need clarification/preparation.
-- Handoff report fields: created_or_updated_ticket_id, state, open_questions_or_risk_flags, intake_summary.
-- Do not start implementation automatically; the user queues a ready Ticket via panel (`ready -> queued`), and Orchestrator treats `queued` as schedulable before moving it to `inprogress` when starting.
