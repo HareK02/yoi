@@ -232,3 +232,18 @@ Next:
 - Spawn read-only sibling reviewer against the recorded intent, binding decisions/invariants, acceptance criteria, commit `949531a0`, diff, and validation evidence.
 
 ---
+
+<!-- event: plan author: orchestrator at: 2026-06-12T12:57:29Z -->
+
+## Plan
+
+Reviewer delegated.
+
+- Reviewer Pod: `yoi-reviewer-role-launch-input`
+- Target branch/worktree: `ticket/shorten-ticket-role-launch-input` at `/home/hare/Projects/yoi/.worktree/shorten-ticket-role-launch-input`
+- Commit under review: `949531a0 client: shorten ticket role launch input`
+- Scope: read-only child worktree plus minimal non-recursive runtime-root read required by spawn validation.
+- Review basis: recorded IntentPacket, binding decisions/invariants, acceptance criteria, implementation summary, diff, and Orchestrator-verified validation evidence.
+- Reviewer focus: control-plane metadata absence from first-run user text, Instruction/Workflow/Submit boundary, no hidden dynamic context injection, profile instruction resolution, workflow/prompt override safety, and non-brittle tests.
+
+---
