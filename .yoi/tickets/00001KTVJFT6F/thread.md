@@ -214,3 +214,41 @@ Reviewer delegated.
 - Reviewer focus: composer input protection, blank/non-blank Enter behavior, status/actionbar/key hint consistency, removal of user-visible `item action` / `Right action focus`, Ticket/Pod authority preservation, and staying within Panel scope.
 
 ---
+
+<!-- event: review author: reviewer:yoi-reviewer-panel-focus-model at: 2026-06-12T15:07:09Z status: approve -->
+
+## Review: approve
+
+Approve.
+
+Review target:
+- Worktree: `/home/hare/Projects/yoi/.worktree/panel-focus-composer-row-selection`
+- Commit: `c5ef6f79 tui: clarify panel composer target and row selection`
+
+Evidence:
+- 差分は `crates/tui/src/multi_pod.rs` と `crates/tui/src/workspace_panel.rs` に限定され、single-Pod TUI transcript/block navigation は変更していない。
+- `Right action focus` / `global composer` / `item action` / `PanelFocus` / `ItemAction` は現行ツリー上で user-visible 文言・型として残っていない。
+- 非空 composer の `Enter` は composer target 送信 / Intake 起動に向き、row selection の Ticket action / Pod open は待機扱いになる。
+- 空 composer では selected row が `Enter` 対象になり、既存 Ticket action dispatch / Pod open 経路を使う。
+- `Tab` は composer target の切替のみで selected row と draft を保持する。
+- `Esc` は row selection を解除し、composer draft と target は保持する。
+- `Left` / `Right` は Panel focus 切替ではなく composer cursor 操作として扱われる。
+- Ticket action dispatch は従来通り stale/current authority re-check 経路を通り、`ready -> queued` などの明示 action semantics は弱められていない。
+- Companion send は workspace Companion 宛て固定の安全確認を維持し、selected Pod へ誤送信する形にはなっていない。
+
+Reviewer-run validation:
+- `cargo test -p tui selected_ticket_row_with_non_empty_composer_shows_composer_enter_behavior`: pass
+- `cargo test -p tui multi_esc_clears_row_selection_without_quitting_and_preserves_draft`: pass
+- `cargo test -p tui multi_composer_target_switch_preserves_typed_text`: pass
+- `cargo test -p tui multi_blank_ticket_intake_enter_uses_selected_row_and_preserves_input`: pass
+- `cargo fmt --check`: pass
+- `git diff --check orchestration/yoi-orchestrator...HEAD`: pass
+
+Known broad failure:
+- `cargo test -p tui multi_ --lib` fails only `multi_pod::tests::orchestrator_launch_context_uses_orchestration_root_for_runtime_workspace`.
+- The failure is the same `/repo/yoi` vs `/repo/yoi/.worktree/orchestration/yoi-orchestrator` mismatch already confirmed on the current Orchestrator branch, and this implementation does not change that launch-context path. It is pre-existing and not a blocker for this Ticket.
+
+Non-blocking risks:
+- None identified. The added tests directly cover key boundaries, draft protection, and target/row-selection display without brittle full UI snapshots.
+
+---
