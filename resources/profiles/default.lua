@@ -24,7 +24,7 @@ return yoi.profile {
         task = { enabled = true },
         memory = { enabled = true },
         web = { enabled = true },
-        pods = { enabled = false },
+        pods = { enabled = true },
         ticket = { enabled = false, access = "lifecycle" },
         ticket_orchestration = { enabled = false },
     },

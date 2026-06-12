@@ -7,11 +7,11 @@ return yoi.profile.extend("builtin:default", {
     }),
 
     feature = {
-        task = { enabled = false },
+        task = { enabled = true },
         memory = { enabled = true },
         web = { enabled = true },
-        pods = { enabled = false },
-        ticket = { enabled = false, access = "lifecycle" },
+        pods = { enabled = true },
+        ticket = { enabled = true, access = "lifecycle" },
         ticket_orchestration = { enabled = false },
     },
 })

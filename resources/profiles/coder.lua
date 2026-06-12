@@ -5,7 +5,7 @@ return yoi.profile.extend("builtin:default", {
     scope = yoi.scope.workspace_write(),
 
     feature = {
-        task = { enabled = false },
+        task = { enabled = true },
         memory = { enabled = true },
         web = { enabled = true },
         pods = { enabled = false },
