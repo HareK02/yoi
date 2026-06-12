@@ -306,3 +306,45 @@ Status:
 - Reviewer verdict remains `request_changes` until coder fix and second review.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-12T15:40:14Z -->
+
+## Implementation report
+
+Coder completed requested fix.
+
+Coder Pod:
+- `yoi-coder-companion-progress-notify`
+
+Implementation branch/worktree:
+- Branch: `ticket/orchestrator-progress-companion-notify`
+- Worktree: `/home/hare/Projects/yoi/.worktree/orchestrator-progress-companion-notify`
+- Original implementation commit: `a87d3154 feat: weak companion progress notify`
+- Sync merge commit: `724b79f1 Merge branch 'orchestration/yoi-orchestrator' into ticket/orchestrator-progress-companion-notify`
+- Fix commit: `61e6c068 fix: resource-back companion progress notice`
+- Worktree status: clean
+
+Fix summary:
+- Added `resources/prompts/panel/companion_progress_notice.md` for model-facing Companion progress notice framing.
+- Removed hard-coded progress notice framing from Rust.
+- Rust now builds bounded runtime values and renders the prompt resource via `minijinja`.
+- Added focused test proving the notice renders from the prompt resource.
+- Preserved live/reachable-only delivery, missing/stopped no-op, `auto_run:false`, bounded output, sensitive-field exclusion, and no persistent snapshot store.
+- Added `minijinja` to `crates/tui/Cargo.toml`, updated `Cargo.lock`, and updated `package.nix` `cargoHash` for Nix packaging.
+
+Orchestrator-verified evidence from child worktree after fix:
+- `git status --short --branch`: clean on `ticket/orchestrator-progress-companion-notify`
+- `cargo test -p protocol`: pass, 39 tests
+- `cargo test -p pod --test controller_test`: pass, 36 tests
+- `cargo test -p tui companion_progress -- --nocapture`: pass, 6 tests
+- `cargo test -p tui send_notify_only_can_deliver_weak_notification_without_auto_run -- --nocapture`: pass, 1 test
+- `cargo check -p protocol -p pod -p tui`: pass
+- `cargo fmt --check`: pass
+- `git diff --check orchestration/yoi-orchestrator...HEAD`: pass
+- `cargo run -p yoi -- ticket doctor`: `doctor: ok`
+- `nix build .#yoi`: pass
+
+Next:
+- Request reviewer re-review of fix commit `61e6c068`, focusing on the prompt-resource boundary blocker, retention of weak notify safety invariants, dependency/package updates, and validation evidence.
+
+---
