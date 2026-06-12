@@ -247,3 +247,28 @@ Reviewer delegated.
 - Reviewer focus: control-plane metadata absence from first-run user text, Instruction/Workflow/Submit boundary, no hidden dynamic context injection, profile instruction resolution, workflow/prompt override safety, and non-brittle tests.
 
 ---
+
+<!-- event: review author: reviewer:yoi-reviewer-role-launch-input at: 2026-06-12T13:06:54Z status: approve -->
+
+## Review: approve
+
+Approve.
+
+Review target:
+- Worktree: `/home/hare/Projects/yoi/.worktree/shorten-ticket-role-launch-input`
+- Commit: `949531a07ede4fd9f82787454ac4d996f25b272d`
+- Worktree status: clean
+
+Evidence:
+- `crates/client/src/ticket_role.rs` の first-run `Segment::Text` は `build_launch_prompt` で対象 Ticket、`Action instruction`、Panel handoff、intent packet、operation/worktree target、validation/report expectations に限定されている。
+- `profile` / `workflow` / `launch_prompt_ref` / workspace-root 系の制御情報は `TicketRoleLaunchPlan` / `SpawnConfig` 側に残り、Submit text には出ていない。
+- `WorkflowInvoke` は `Segment::WorkflowInvoke` として別 segment に維持されている。
+- unit tests は `Configured launch_prompt`、`Profile selector`、`Workflow:`、Ticket record language、`role_workspace_root` / `role_cwd` 等が first-run text に入らないことと、必要な path/branch/validation/report expectation が残ることを直接検証している。
+- builtin role Profiles は `worker.instruction = "$yoi/role/<role>"` を設定し、`resources/prompts/role/*` に role behavior が移っている。procedural guidance は `resources/workflows/*` に残っている。
+- 削除された `resources/prompts/ticket_role/*` への production code 参照は残っていない。prompt loader の `$user` / `$workspace` 解決機構と workflow invocation は維持されている。
+- `git diff --check orchestration/yoi-orchestrator...HEAD` は問題なし。Orchestrator が提示した focused cargo tests、`cargo fmt --check`、`ticket doctor`、`nix build .#yoi` の validation evidence は受け入れ可能。
+
+Non-blocking risk:
+- 旧 `.yoi/prompts/ticket_role/*` override は、この surface の削除により launch Submit text には効かなくなる。今回の Ticket では既存 fragment の削除が許容されているため blocker ではないが、外部ユーザー向けには role behavior は Profile instruction、手順は Workflow override へ移す旨を後で案内すると安全。
+
+---
