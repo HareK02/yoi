@@ -9,8 +9,8 @@ use std::thread;
 use std::time::Duration;
 
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event as TermEvent, KeyCode, KeyEvent,
-    KeyModifiers, MouseEvent, MouseEventKind,
+    self, DisableMouseCapture, Event as TermEvent, KeyCode, KeyEvent, KeyModifiers, MouseEvent,
+    MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
@@ -245,7 +245,10 @@ pub(crate) async fn run_spawn(
 
 fn enter_fullscreen() -> Result<FullscreenTerminal, Box<dyn std::error::Error>> {
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    // Do not enable mouse capture: terminal-native drag selection is more
+    // important than receiving mouse events in Yoi. Scroll-wheel handling below
+    // remains best-effort for terminals that still emit mouse events.
+    execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     Ok(Terminal::new(backend)?)
 }
@@ -253,11 +256,8 @@ fn enter_fullscreen() -> Result<FullscreenTerminal, Box<dyn std::error::Error>> 
 fn enter_fullscreen_existing(
     terminal: &mut FullscreenTerminal,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    execute!(
-        terminal.backend_mut(),
-        EnterAlternateScreen,
-        EnableMouseCapture
-    )?;
+    // Keep mouse capture disabled for terminal-native drag selection.
+    execute!(terminal.backend_mut(), EnterAlternateScreen)?;
     Ok(())
 }
 

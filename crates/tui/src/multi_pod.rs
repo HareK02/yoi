@@ -20,7 +20,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Widget};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget, Wrap};
 use session_store::FsStore;
 use ticket::config::TicketConfig;
 use ticket::{LocalTicketBackend, TicketBackend, TicketIdOrSlug, TicketWorkflowState};
@@ -523,6 +523,12 @@ enum PanelFocus {
     ItemAction,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PanelDiagnostic {
+    title: String,
+    details: String,
+}
+
 pub(crate) struct MultiPodApp {
     pub(crate) list: PodList,
     pub(crate) panel: WorkspacePanelViewModel,
@@ -531,6 +537,8 @@ pub(crate) struct MultiPodApp {
     focus: PanelFocus,
     composer_target: ComposerTarget,
     notice: Option<String>,
+    panel_diagnostic: Option<PanelDiagnostic>,
+    panel_diagnostic_open: bool,
     sending: bool,
     refreshing: bool,
     enter_reload: Option<OrchestratorLifecycleMode>,
@@ -561,6 +569,8 @@ impl MultiPodApp {
             focus: PanelFocus::GlobalComposer,
             composer_target: ComposerTarget::Companion,
             notice: None,
+            panel_diagnostic: None,
+            panel_diagnostic_open: false,
             sending: false,
             refreshing: true,
             enter_reload: Some(OrchestratorLifecycleMode::Ensure {
@@ -1045,6 +1055,21 @@ impl MultiPodApp {
         })
     }
 
+    fn set_panel_diagnostic(
+        &mut self,
+        title: impl Into<String>,
+        details: impl Into<String>,
+    ) -> String {
+        let title = title.into();
+        let details = details.into();
+        self.panel_diagnostic = Some(PanelDiagnostic {
+            title: title.clone(),
+            details: details.clone(),
+        });
+        self.panel_diagnostic_open = false;
+        format!("{} (F2 details)", bounded_panel_diagnostic(&details))
+    }
+
     pub(crate) fn finish_ticket_action_dispatch(
         &mut self,
         result: Result<TicketActionOutcome, TicketActionError>,
@@ -1052,7 +1077,14 @@ impl MultiPodApp {
         self.sending = false;
         self.notice = Some(match result {
             Ok(outcome) => outcome.notice,
-            Err(error) => bounded_panel_diagnostic(error.to_string()),
+            Err(error) => match error {
+                TicketActionError::Stale(message) => {
+                    self.set_panel_diagnostic("Ticket action rejected", message)
+                }
+                TicketActionError::BackendConfig(error) | TicketActionError::Ticket(error) => {
+                    self.set_panel_diagnostic("Ticket action failed", error)
+                }
+            },
         });
     }
 
@@ -1278,7 +1310,27 @@ impl MultiPodApp {
 
     fn handle_key(&mut self, key: KeyEvent) -> MultiPodAction {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if self.panel_diagnostic_open {
+            return match key.code {
+                KeyCode::Esc | KeyCode::F(2) => {
+                    self.panel_diagnostic_open = false;
+                    MultiPodAction::None
+                }
+                KeyCode::Char('d') if ctrl => MultiPodAction::Quit,
+                KeyCode::Char('c') if ctrl => MultiPodAction::Quit,
+                _ => MultiPodAction::None,
+            };
+        }
+
         match key.code {
+            KeyCode::F(2) => {
+                if self.panel_diagnostic.is_some() {
+                    self.panel_diagnostic_open = true;
+                } else {
+                    self.notice = Some("No Panel diagnostic details yet".to_string());
+                }
+                MultiPodAction::None
+            }
             KeyCode::Char('d') if ctrl => MultiPodAction::Quit,
             KeyCode::Char('c') if ctrl => MultiPodAction::Quit,
             KeyCode::Esc => {
@@ -3410,6 +3462,39 @@ fn draw(frame: &mut Frame<'_>, app: &mut MultiPodApp) {
     draw_target_status(frame, app, layout.target_status);
     draw_input(frame, &input_render, layout.input);
     draw_actionbar(frame, app, layout.actionbar);
+    if app.panel_diagnostic_open {
+        render_panel_diagnostic(frame, app, area);
+    }
+}
+
+fn panel_diagnostic_area(area: Rect) -> Rect {
+    let width = if area.width <= 20 {
+        area.width
+    } else {
+        area.width.saturating_sub(4).min(100).max(20)
+    };
+    let height = if area.height <= 8 {
+        area.height
+    } else {
+        area.height.saturating_sub(4).min(24).max(8)
+    };
+    let x = area.x + area.width.saturating_sub(width) / 2;
+    let y = area.y + area.height.saturating_sub(height) / 2;
+    Rect::new(x, y, width, height)
+}
+
+fn render_panel_diagnostic(frame: &mut Frame<'_>, app: &MultiPodApp, area: Rect) {
+    let Some(diagnostic) = app.panel_diagnostic.as_ref() else {
+        return;
+    };
+    let popup_area = panel_diagnostic_area(area);
+    let title = format!(" {} ", diagnostic.title);
+    let text = format!("{}\n\nF2/Esc: close", diagnostic.details);
+    let paragraph = Paragraph::new(text)
+        .block(Block::default().title(title).borders(Borders::ALL))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(Clear, popup_area);
+    frame.render_widget(paragraph, popup_area);
 }
 
 fn input_area_height(render: &crate::input::InputRender, terminal_height: u16) -> u16 {
@@ -3976,7 +4061,11 @@ fn actionbar_left_text(app: &MultiPodApp) -> String {
 }
 
 fn actionbar_right_text(app: &MultiPodApp) -> &'static str {
-    if !app.composer_is_blank() {
+    if app.panel_diagnostic_open {
+        "F2/Esc close details  Ctrl+C quit"
+    } else if app.panel_diagnostic.is_some() {
+        "F2 details  ↑/↓ row  Enter row action/open  Right action focus  Tab target  Esc composer  Ctrl+C quit"
+    } else if !app.composer_is_blank() {
         if app
             .panel
             .composer
@@ -6006,6 +6095,8 @@ mod tests {
             focus: PanelFocus::GlobalComposer,
             composer_target: ComposerTarget::Companion,
             notice: None,
+            panel_diagnostic: None,
+            panel_diagnostic_open: false,
             sending: false,
             refreshing: false,
             enter_reload: None,
@@ -6121,6 +6212,31 @@ mod tests {
             .iter()
             .map(|index| list.entries[*index].name.as_str())
             .collect()
+    }
+
+    #[test]
+    fn ticket_action_error_records_f2_diagnostic_details() {
+        let mut app = MultiPodApp::loading(PodRuntimeCommand::for_executable("/tmp/yoi"));
+        let long_error = "root-clean failed for Ticket 00001KTWPE3KQ at /home/hare/Projects/yoi: dirty file crates/tui/src/multi_pod.rs";
+
+        app.finish_ticket_action_dispatch(Err(TicketActionError::Stale(long_error.to_string())));
+
+        assert!(app.notice.as_deref().unwrap().contains("F2 details"));
+        let diagnostic = app.panel_diagnostic.as_ref().expect("diagnostic");
+        assert_eq!(diagnostic.title, "Ticket action rejected");
+        assert_eq!(diagnostic.details, long_error);
+        assert!(!app.panel_diagnostic_open);
+
+        assert!(matches!(
+            app.handle_key(key(KeyCode::F(2))),
+            MultiPodAction::None
+        ));
+        assert!(app.panel_diagnostic_open);
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Esc)),
+            MultiPodAction::None
+        ));
+        assert!(!app.panel_diagnostic_open);
     }
 
     fn plain_line(line: &Line<'_>) -> String {
