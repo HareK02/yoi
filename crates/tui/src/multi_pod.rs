@@ -21,6 +21,7 @@ use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget, Wrap};
+use serde::Serialize;
 use session_store::FsStore;
 use ticket::config::TicketConfig;
 use ticket::{LocalTicketBackend, TicketBackend, TicketIdOrSlug, TicketWorkflowState};
@@ -52,6 +53,8 @@ const CLOSED_VISIBLE_ROWS: usize = 3;
 const COMPANION_PROGRESS_MAX_TICKETS: usize = 5;
 const COMPANION_PROGRESS_MAX_TITLE_CHARS: usize = 80;
 const COMPANION_PROGRESS_MAX_MESSAGE_CHARS: usize = 1_800;
+const COMPANION_PROGRESS_NOTICE_TEMPLATE: &str =
+    include_str!("../../../resources/prompts/panel/companion_progress_notice.md");
 const SOCKET_OP_TIMEOUT: Duration = Duration::from_secs(3);
 const MULTI_POD_POLL_INTERVAL: Duration = Duration::from_millis(1_500);
 const TERMINAL_EVENT_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -571,6 +574,35 @@ impl CompanionProgressNoticeResult {
             error: Some(error.into()),
         }
     }
+}
+
+#[derive(Debug, Serialize)]
+struct CompanionProgressTemplateContext {
+    companion: CompanionProgressTemplateRole,
+    orchestrator: CompanionProgressTemplateRole,
+    tickets: Vec<CompanionProgressTemplateTicket>,
+    omitted_ticket_count: usize,
+    role_pods: Vec<CompanionProgressTemplateRolePod>,
+}
+
+#[derive(Debug, Serialize)]
+struct CompanionProgressTemplateRole {
+    pod_name: String,
+    status: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CompanionProgressTemplateTicket {
+    id: String,
+    state: String,
+    title: String,
+    reference: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CompanionProgressTemplateRolePod {
+    name: String,
+    status: String,
 }
 
 pub(crate) struct MultiPodApp {
@@ -2426,57 +2458,44 @@ fn companion_progress_notice(
 ) -> Option<CompanionProgressNotice> {
     let companion = panel.header.companion.as_ref()?;
     let orchestrator = panel.header.orchestrator.as_ref()?;
-    let mut lines = vec![
-        "Orchestrator progress context (read-only weak notification; no auto-run).".to_string(),
-        "Reason: workspace Panel refreshed bounded orchestration progress for Companion explanation."
-            .to_string(),
-        format!(
-            "Roles: Companion {} is {}; Orchestrator {} is {}.",
-            companion.pod_name,
-            companion.status.label(),
-            orchestrator.pod_name,
-            orchestrator.status.label()
-        ),
-    ];
-
-    let mut ticket_lines = Vec::new();
-    for row in panel.rows.iter().take(COMPANION_PROGRESS_MAX_TICKETS) {
-        let ticket_id = row
-            .ticket
-            .as_ref()
-            .map(|ticket| ticket.id.as_str())
-            .unwrap_or("unknown-ticket");
-        ticket_lines.push(format!(
-            "- {} [{}] {} (ref: .yoi/tickets/{})",
-            ticket_id,
-            row.status,
-            bounded_progress_text(&row.title, COMPANION_PROGRESS_MAX_TITLE_CHARS),
-            ticket_id
-        ));
-    }
-    if ticket_lines.is_empty() {
-        lines.push("Tickets: none visible in the current Panel snapshot.".to_string());
-    } else {
-        lines.push(format!(
-            "Tickets (first {} visible, bounded):",
-            ticket_lines.len()
-        ));
-        lines.extend(ticket_lines);
-        if panel.rows.len() > COMPANION_PROGRESS_MAX_TICKETS {
-            lines.push(format!(
-                "- … {} more ticket(s) omitted from this bounded notice.",
-                panel.rows.len() - COMPANION_PROGRESS_MAX_TICKETS
-            ));
-        }
-    }
-
-    let role_pod_lines = bounded_role_pod_lines(list, companion, orchestrator);
-    if !role_pod_lines.is_empty() {
-        lines.push("Role pod status snapshot:".to_string());
-        lines.extend(role_pod_lines);
-    }
-
-    let message = bounded_progress_text(&lines.join("\n"), COMPANION_PROGRESS_MAX_MESSAGE_CHARS);
+    let ticket_rows = panel
+        .rows
+        .iter()
+        .filter_map(|row| row.ticket.as_ref().map(|ticket| (row, ticket)))
+        .collect::<Vec<_>>();
+    let tickets = ticket_rows
+        .iter()
+        .take(COMPANION_PROGRESS_MAX_TICKETS)
+        .map(|(row, ticket)| CompanionProgressTemplateTicket {
+            id: bounded_progress_text(&ticket.id, COMPANION_PROGRESS_MAX_TITLE_CHARS),
+            state: bounded_progress_text(&row.status, COMPANION_PROGRESS_MAX_TITLE_CHARS),
+            title: bounded_progress_text(&row.title, COMPANION_PROGRESS_MAX_TITLE_CHARS),
+            reference: format!(".yoi/tickets/{}", ticket.id),
+        })
+        .collect::<Vec<_>>();
+    let context = CompanionProgressTemplateContext {
+        companion: CompanionProgressTemplateRole {
+            pod_name: bounded_progress_text(
+                &companion.pod_name,
+                COMPANION_PROGRESS_MAX_TITLE_CHARS,
+            ),
+            status: companion.status.label().to_string(),
+        },
+        orchestrator: CompanionProgressTemplateRole {
+            pod_name: bounded_progress_text(
+                &orchestrator.pod_name,
+                COMPANION_PROGRESS_MAX_TITLE_CHARS,
+            ),
+            status: orchestrator.status.label().to_string(),
+        },
+        tickets,
+        omitted_ticket_count: ticket_rows
+            .len()
+            .saturating_sub(COMPANION_PROGRESS_MAX_TICKETS),
+        role_pods: bounded_role_pod_values(list, companion, orchestrator),
+    };
+    let rendered = render_companion_progress_notice_template(&context).ok()?;
+    let message = bounded_progress_text(&rendered, COMPANION_PROGRESS_MAX_MESSAGE_CHARS);
     let fingerprint = message.clone();
     Some(CompanionProgressNotice {
         message,
@@ -2484,19 +2503,35 @@ fn companion_progress_notice(
     })
 }
 
-fn bounded_role_pod_lines(
+fn render_companion_progress_notice_template(
+    context: &CompanionProgressTemplateContext,
+) -> Result<String, minijinja::Error> {
+    let mut env = minijinja::Environment::new();
+    env.set_undefined_behavior(minijinja::UndefinedBehavior::Strict);
+    env.add_template(
+        "companion_progress_notice",
+        COMPANION_PROGRESS_NOTICE_TEMPLATE,
+    )?;
+    env.get_template("companion_progress_notice")?
+        .render(context)
+}
+
+fn bounded_role_pod_values(
     list: &PodList,
     companion: &CompanionPanelState,
     orchestrator: &OrchestratorPanelState,
-) -> Vec<String> {
-    let mut lines = Vec::new();
+) -> Vec<CompanionProgressTemplateRolePod> {
+    let mut role_pods = Vec::new();
     for name in [&companion.pod_name, &orchestrator.pod_name] {
         let Some(entry) = list.entries.iter().find(|entry| entry.name == *name) else {
             continue;
         };
-        lines.push(format!("- {}: {}", entry.name, row_status_label(entry).0));
+        role_pods.push(CompanionProgressTemplateRolePod {
+            name: bounded_progress_text(&entry.name, COMPANION_PROGRESS_MAX_TITLE_CHARS),
+            status: row_status_label(entry).0.to_string(),
+        });
     }
-    lines
+    role_pods
 }
 
 fn bounded_progress_text(input: &str, max_chars: usize) -> String {
@@ -4985,6 +5020,37 @@ mod tests {
             companion_progress_notice_target(&unreachable_app.panel, &unreachable_app.list)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn companion_progress_notice_uses_prompt_resource_template() {
+        let first_resource_line = COMPANION_PROGRESS_NOTICE_TEMPLATE.lines().next().unwrap();
+        let context = CompanionProgressTemplateContext {
+            companion: CompanionProgressTemplateRole {
+                pod_name: "yoi".to_string(),
+                status: "Live".to_string(),
+            },
+            orchestrator: CompanionProgressTemplateRole {
+                pod_name: "test-orchestrator".to_string(),
+                status: "Live".to_string(),
+            },
+            tickets: vec![CompanionProgressTemplateTicket {
+                id: "RESOURCE-TICKET".to_string(),
+                state: "inprogress".to_string(),
+                title: "Rendered from runtime values".to_string(),
+                reference: ".yoi/tickets/RESOURCE-TICKET".to_string(),
+            }],
+            omitted_ticket_count: 0,
+            role_pods: vec![CompanionProgressTemplateRolePod {
+                name: "yoi".to_string(),
+                status: "idle".to_string(),
+            }],
+        };
+
+        let rendered = render_companion_progress_notice_template(&context).unwrap();
+        assert!(rendered.contains(first_resource_line));
+        assert!(rendered.contains("RESOURCE-TICKET"));
+        assert!(rendered.contains("Rendered from runtime values"));
     }
 
     #[test]
