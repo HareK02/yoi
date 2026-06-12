@@ -1,11 +1,13 @@
 ---
 title: 'Ticket language guidance must apply to all Ticket tool users'
-state: 'ready'
+state: 'queued'
 created_at: '2026-06-11T14:48:44Z'
-updated_at: '2026-06-11T14:48:50Z'
+updated_at: '2026-06-12T14:49:39Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['prompt-context', 'tool-description', 'feature-boundary', 'ticket-language', 'companion']
+queued_by: 'workspace-panel'
+queued_at: '2026-06-12T14:49:39Z'
 ---
 
 ## Background

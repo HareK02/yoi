@@ -21,3 +21,12 @@ LocalTicketBackend によって作成されました。
 要件・受け入れ条件・binding decisions・実装余地・escalation conditions・validation が揃っているため、Orchestrator routing 可能な ready Ticket とする。
 
 ---
+
+<!-- event: state_changed author: workspace-panel at: 2026-06-12T14:49:39Z from: ready to: queued reason: queued field: state -->
+
+## State changed
+
+Ticket を `workspace-panel` が queued にしました。
+
+
+---
