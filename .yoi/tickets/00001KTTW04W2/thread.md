@@ -111,3 +111,31 @@ Next action:
 - ユーザー/上位 Orchestrator から実装開始の explicit follow-up が来たら、side effect 前に TicketShow / relation / orchestration plan / git/worktree state を再確認し、問題なければ `queued -> inprogress` を記録してから worktree 作成と sibling coder/reviewer routing に進む。
 
 ---
+
+<!-- event: decision author: orchestrator at: 2026-06-12T14:50:56Z -->
+
+## Decision
+
+Routing follow-up: implementation start authorized by user.
+
+Recheck summary:
+- Ticket remains `queued` and previously recorded `implementation_ready` still applies.
+- TicketRelationQuery: no unresolved `depends_on` / incoming `blocks` for this Ticket.
+- TicketOrchestrationPlan: accepted plan `orch-plan-20260611-160703-1` names branch/worktree and defers implementation until explicit follow-up; that follow-up has now arrived.
+- Orchestrator worktree is clean.
+- Visible active work: `00001KTVJFT6F` has coder `yoi-coder-panel-focus-model` running on a separate branch/worktree. There may be minor overlap in `crates/tui/src/multi_pod.rs` around Panel UI, so coder/reviewer must keep the Panel freshness change narrow and integration will recheck conflicts before merge.
+
+Decision:
+- Accept this Ticket now and proceed to `queued -> inprogress` before worktree/Pod side effects.
+- Use existing accepted plan branch `ticket/orchestrator-progress-companion-notify` and worktree `/home/hare/Projects/yoi/.worktree/orchestrator-progress-companion-notify`.
+- Continue to avoid root/original workspace operations; implementation side effects are limited to the child worktree and sibling Pods.
+
+---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-12T14:51:03Z from: queued to: inprogress reason: orchestrator_acceptance field: state -->
+
+## State changed
+
+Explicit user follow-up authorized starting the previously accepted implementation plan. Ticket body/thread, relation blockers, accepted orchestration plan, current Orchestrator workspace state, and visible active work were rechecked. No unresolved blocker or missing planning decision remains. Implementation side effects will start only after this accepted `queued -> inprogress` transition is recorded.
+
+---
