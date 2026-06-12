@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
-use manifest::{Permission, ScopeRule};
+use manifest::{DelegationScope, Permission, ScopeConfig, ScopeRule};
 use session_store::SegmentId;
 
 use crate::table::LockFileGuard;
@@ -86,6 +86,14 @@ pub(crate) fn read_rule(path: &str, recursive: bool) -> ScopeRule {
         permission: Permission::Read,
         recursive,
     }
+}
+
+pub(crate) fn delegation_scope(rules: Vec<ScopeRule>) -> DelegationScope {
+    DelegationScope::from_config(&ScopeConfig {
+        allow: rules,
+        deny: Vec::new(),
+    })
+    .expect("test delegation scope")
 }
 
 pub(crate) fn sock(name: &str) -> PathBuf {

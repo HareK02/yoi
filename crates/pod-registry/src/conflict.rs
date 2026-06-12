@@ -210,6 +210,7 @@ mod tests {
             std::process::id(),
             sock("b"),
             vec![write_rule("/src/core", true)],
+            &delegation_scope(vec![write_rule("/src", true)]),
         )
         .unwrap();
         // A different top-level Pod trying to register /src/core/x

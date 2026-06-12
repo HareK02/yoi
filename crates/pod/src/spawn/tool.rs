@@ -352,6 +352,7 @@ impl Tool for SpawnPodTool {
                 std::process::id(),
                 predicted_socket.clone(),
                 scope_allow.clone(),
+                &self.delegation_scope,
             )
             .map_err(pod_registry_err_to_tool)?;
         }
@@ -868,6 +869,7 @@ fn pod_registry_err_to_tool(e: ScopeLockError) -> ToolError {
         | ScopeLockError::WriteConflict { .. }
         | ScopeLockError::DuplicatePodName(_)
         | ScopeLockError::UnknownPod(_)
+        | ScopeLockError::InvalidScope { .. }
         | ScopeLockError::SegmentConflict { .. } => ToolError::InvalidArgument(e.to_string()),
         ScopeLockError::Io(_) => ToolError::ExecutionFailed(e.to_string()),
     }

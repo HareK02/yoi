@@ -3,7 +3,7 @@
 use std::io;
 use std::path::PathBuf;
 
-use manifest::ScopeRule;
+use manifest::{ScopeError, ScopeRule};
 use session_store::SegmentId;
 
 /// Errors raised by the mutating pod-registry operations.
@@ -20,10 +20,12 @@ pub enum ScopeLockError {
         competitor_rule: ScopeRule,
     },
     #[error(
-        "requested scope `{}` is not within spawner `{spawner}`'s effective scope",
+        "requested scope `{}` is not within spawner `{spawner}`'s delegation scope",
         .rule.target.display()
     )]
     NotSubset { spawner: String, rule: ScopeRule },
+    #[error("invalid delegation scope: {source}")]
+    InvalidScope { source: ScopeError },
     #[error("pod `{0}` is not registered")]
     UnknownPod(String),
     #[error(

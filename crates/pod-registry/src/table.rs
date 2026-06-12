@@ -245,6 +245,7 @@ mod tests {
             std::process::id(),
             sock("child"),
             vec![write_rule("/p/sub", true)],
+            &delegation_scope(vec![write_rule("/p", true)]),
         )
         .unwrap();
 

@@ -4,10 +4,10 @@
 use std::io;
 use std::path::PathBuf;
 
-use manifest::{Permission, ScopeRule};
+use manifest::{DelegationScope, Permission, ScopeRule};
 use session_store::SegmentId;
 
-use crate::conflict::{find_conflict_owner, find_conflict_owners, is_within_effective_write};
+use crate::conflict::{find_conflict_owner, find_conflict_owners};
 use crate::error::ScopeLockError;
 use crate::table::{Allocation, LockFileGuard};
 
@@ -106,8 +106,8 @@ pub fn register_pod_with_deny(
 }
 
 /// Register a spawned Pod whose scope is delegated from `spawner`.
-/// The requested scope must be within `spawner`'s effective write
-/// scope; overlap with any Pod other than `spawner` is a conflict.
+/// The requested scope must be within the spawner's delegation authority;
+/// overlap with any Pod other than `spawner` is a conflict.
 pub fn delegate_scope(
     guard: &mut LockFileGuard,
     spawner: &str,
@@ -115,6 +115,7 @@ pub fn delegate_scope(
     pid: u32,
     socket: PathBuf,
     scope_allow: Vec<ScopeRule>,
+    delegation_scope: &DelegationScope,
 ) -> Result<(), ScopeLockError> {
     reclaim_stale(guard);
     if guard.data().find(&spawned).is_some() {
@@ -124,7 +125,10 @@ pub fn delegate_scope(
         return Err(ScopeLockError::UnknownPod(spawner.into()));
     }
     for rule in &scope_allow {
-        if !is_within_effective_write(guard.data(), spawner, rule) {
+        let allowed = delegation_scope
+            .allows_rule(rule)
+            .map_err(|source| ScopeLockError::InvalidScope { source })?;
+        if !allowed {
             return Err(ScopeLockError::NotSubset {
                 spawner: spawner.into(),
                 rule: rule.clone(),
@@ -363,9 +367,40 @@ mod tests {
             std::process::id(),
             sock("b"),
             vec![write_rule("/docs", true)],
+            &delegation_scope(vec![write_rule("/src", true)]),
         )
         .unwrap_err();
         assert!(matches!(err, ScopeLockError::NotSubset { .. }));
+    }
+
+    #[test]
+    fn delegate_uses_delegation_scope_not_direct_effective_write() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("pods.json");
+        let mut g = open_empty(&path);
+        register_pod(
+            &mut g,
+            "orchestrator".into(),
+            std::process::id(),
+            sock("orchestrator"),
+            vec![read_rule("/workspace", true)],
+            sid(),
+        )
+        .unwrap();
+
+        delegate_scope(
+            &mut g,
+            "orchestrator",
+            "coder".into(),
+            std::process::id(),
+            sock("coder"),
+            vec![write_rule("/workspace/.worktree/task", true)],
+            &delegation_scope(vec![write_rule("/workspace", true)]),
+        )
+        .unwrap();
+
+        let coder = g.data().find("coder").expect("coder allocation");
+        assert_eq!(coder.delegated_from.as_deref(), Some("orchestrator"));
     }
 
     #[test]
@@ -389,6 +424,7 @@ mod tests {
             std::process::id(),
             sock("b"),
             vec![write_rule("/src/core", true)],
+            &delegation_scope(vec![write_rule("/src", true)]),
         )
         .unwrap();
         assert_eq!(g.data().allocations.len(), 2);
@@ -427,6 +463,7 @@ mod tests {
             std::process::id(),
             sock("b"),
             vec![write_rule("/src/core", true)],
+            &delegation_scope(vec![write_rule("/src", true)]),
         )
         .unwrap();
         // Sibling C from A tries to take /src/core/sub — already under B's scope.
@@ -437,10 +474,13 @@ mod tests {
             std::process::id(),
             sock("c"),
             vec![write_rule("/src/core/sub", true)],
+            &delegation_scope(vec![write_rule("/src", true)]),
         )
         .unwrap_err();
-        // NotSubset fires first because /src/core is no longer in A's effective.
-        assert!(matches!(err, ScopeLockError::NotSubset { .. }));
+        match err {
+            ScopeLockError::WriteConflict { competitor, .. } => assert_eq!(competitor, "b"),
+            other => panic!("expected WriteConflict, got {other:?}"),
+        }
     }
 
     #[test]
@@ -464,6 +504,7 @@ mod tests {
             std::process::id(),
             sock("b"),
             vec![write_rule("/src/core", true)],
+            &delegation_scope(vec![write_rule("/src", true)]),
         )
         .unwrap();
         delegate_scope(
@@ -473,6 +514,7 @@ mod tests {
             std::process::id(),
             sock("d"),
             vec![write_rule("/src/core/x", true)],
+            &delegation_scope(vec![write_rule("/src/core", true)]),
         )
         .unwrap();
         release_pod(&mut g, "b").unwrap();
@@ -571,6 +613,7 @@ mod tests {
             std::process::id(),
             sock("b"),
             vec![write_rule("/src/core", true)],
+            &delegation_scope(vec![write_rule("/src", true)]),
         )
         .unwrap();
         delegate_scope(
@@ -580,6 +623,7 @@ mod tests {
             std::process::id(),
             sock("d"),
             vec![write_rule("/src/core/x", true)],
+            &delegation_scope(vec![write_rule("/src/core", true)]),
         )
         .unwrap();
         // Simulate B crashing by rewriting its pid to one the probe
@@ -670,6 +714,7 @@ mod tests {
             std::process::id(),
             sock("b"),
             vec![write_rule("/src/core", true)],
+            &delegation_scope(vec![write_rule("/src", true)]),
         )
         .unwrap();
         assert!(!is_within_effective_write(
