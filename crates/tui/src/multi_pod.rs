@@ -2404,26 +2404,14 @@ async fn dispatch_ticket_action(
 
     match request.action {
         NextUserAction::Queue => {
-            if current_ticket.workflow_state != TicketWorkflowState::Ready {
-                return Err(TicketActionError::Stale(
-                    "Queue is only valid while state is ready; reload and retry".to_string(),
-                ));
-            }
-            backend
-                .queue_ready(
-                    TicketIdOrSlug::Id(request.ticket_id.clone()),
-                    "workspace-panel",
-                )
-                .map_err(|error| TicketActionError::Ticket(error.to_string()))?;
-            let notification =
-                notify_workspace_orchestrator(request.orchestrator, current_ticket).await;
-            Ok(TicketActionOutcome {
-                notice: format!(
-                    "Queued Ticket {}; {}. Orchestrator routing is authorized; implementation side effects still require queued -> inprogress acceptance.",
-                    current_ticket.id,
-                    notification.sentence()
-                ),
-            })
+            dispatch_panel_queue(
+                &request.workspace_root,
+                &backend,
+                &request.ticket_id,
+                request.orchestrator,
+                current_ticket,
+            )
+            .await
         }
         NextUserAction::Close => unreachable!("Close action is handled before row dispatch"),
         NextUserAction::Clarify
@@ -2437,6 +2425,566 @@ async fn dispatch_ticket_action(
             ),
         }),
     }
+}
+
+async fn dispatch_panel_queue(
+    workspace_root: &Path,
+    backend: &LocalTicketBackend,
+    ticket_id: &str,
+    orchestrator: Option<OrchestratorNotifyTarget>,
+    current_ticket: &crate::workspace_panel::TicketPanelEntry,
+) -> Result<TicketActionOutcome, TicketActionError> {
+    if current_ticket.workflow_state != TicketWorkflowState::Ready {
+        return Err(TicketActionError::Stale(format!(
+            "Queue handoff check `root-ticket-state` failed for Ticket {ticket_id} at {}: state is {}, expected ready; reload and retry",
+            backend.root().display(),
+            current_ticket.workflow_state.as_str()
+        )));
+    }
+
+    let preflight = prepare_panel_queue_handoff(workspace_root, backend, ticket_id)?;
+    backend
+        .queue_ready(TicketIdOrSlug::Id(ticket_id.to_owned()), "workspace-panel")
+        .map_err(|error| TicketActionError::Ticket(error.to_string()))?;
+    let commit = commit_panel_queue_ticket_record(&preflight)?;
+    let sync = sync_panel_queue_to_orchestration(&preflight, &commit)?;
+    verify_panel_queue_synced(&preflight, &commit)?;
+    let notification = notify_workspace_orchestrator(orchestrator, current_ticket).await;
+    Ok(TicketActionOutcome {
+        notice: format!(
+            "Queued Ticket {}; root Queue commit {}; orchestration sync {}; {}. Orchestrator routing is authorized; implementation side effects still require queued -> inprogress acceptance.",
+            ticket_id,
+            commit.sha,
+            sync.sentence(),
+            notification.sentence()
+        ),
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PanelQueueHandoffPreflight {
+    ticket_id: String,
+    root_top_level: PathBuf,
+    orchestration: OrchestrationWorktreeLayout,
+    ticket_record_dir: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PanelQueueCommit {
+    sha: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PanelQueueSync {
+    path: PathBuf,
+    branch: String,
+    head: String,
+}
+
+impl PanelQueueSync {
+    fn sentence(&self) -> String {
+        format!(
+            "ff-only synced {} ({}) to {}",
+            self.path.display(),
+            self.branch,
+            self.head
+        )
+    }
+}
+
+fn prepare_panel_queue_handoff(
+    workspace_root: &Path,
+    backend: &LocalTicketBackend,
+    ticket_id: &str,
+) -> Result<PanelQueueHandoffPreflight, TicketActionError> {
+    let root_top_level = git_top_level(workspace_root).map_err(|message| {
+        queue_check_failed("root-worktree-identity", ticket_id, workspace_root, message)
+    })?;
+    let expected_root = workspace_root.canonicalize().map_err(|error| {
+        queue_check_failed(
+            "root-worktree-identity",
+            ticket_id,
+            workspace_root,
+            format!("could not canonicalize root workspace path: {error}"),
+        )
+    })?;
+    if root_top_level != expected_root {
+        return Err(queue_check_failed(
+            "root-worktree-identity",
+            ticket_id,
+            workspace_root,
+            format!(
+                "Git top-level is {}, expected root workspace {}",
+                root_top_level.display(),
+                expected_root.display()
+            ),
+        ));
+    }
+
+    let root_branch = git_current_branch(&root_top_level).map_err(|message| {
+        queue_check_failed("root-branch", ticket_id, &root_top_level, message)
+    })?;
+    let root_branch = root_branch.ok_or_else(|| {
+        queue_check_failed(
+            "root-branch",
+            ticket_id,
+            &root_top_level,
+            "root workspace is detached; expected merge target branch".to_string(),
+        )
+    })?;
+    ensure_git_effective_user(&root_top_level).map_err(|message| {
+        queue_check_failed("root-git-user", ticket_id, &root_top_level, message)
+    })?;
+    ensure_git_clean("root-clean", ticket_id, &root_top_level)?;
+
+    let orchestration = orchestration_worktree_layout(&root_top_level);
+    if !orchestration.path.exists() {
+        return Err(queue_check_failed(
+            "orchestration-worktree-identity",
+            ticket_id,
+            &orchestration.path,
+            "dedicated orchestration worktree is missing; open the Panel with Orchestrator support before Queue".to_string(),
+        ));
+    }
+    validate_existing_orchestration_worktree(&root_top_level, &orchestration).map_err(
+        |message| {
+            queue_check_failed(
+                "orchestration-worktree-identity",
+                ticket_id,
+                &orchestration.path,
+                message,
+            )
+        },
+    )?;
+    ensure_git_clean("orchestration-clean", ticket_id, &orchestration.path)?;
+
+    let orchestration_branch = git_current_branch(&orchestration.path).map_err(|message| {
+        queue_check_failed(
+            "orchestration-branch",
+            ticket_id,
+            &orchestration.path,
+            message,
+        )
+    })?;
+    if orchestration_branch.as_deref() != Some(orchestration.branch.as_str()) {
+        return Err(queue_check_failed(
+            "orchestration-branch",
+            ticket_id,
+            &orchestration.path,
+            format!(
+                "orchestration branch is {:?}, expected {}",
+                orchestration_branch, orchestration.branch
+            ),
+        ));
+    }
+
+    let root_common = git_common_dir(&root_top_level).map_err(|message| {
+        queue_check_failed("shared-common-dir", ticket_id, &root_top_level, message)
+    })?;
+    let orchestration_common = git_common_dir(&orchestration.path).map_err(|message| {
+        queue_check_failed("shared-common-dir", ticket_id, &orchestration.path, message)
+    })?;
+    if root_common != orchestration_common {
+        return Err(queue_check_failed(
+            "shared-common-dir",
+            ticket_id,
+            &orchestration.path,
+            format!(
+                "orchestration common dir {} differs from root common dir {}",
+                orchestration_common.display(),
+                root_common.display()
+            ),
+        ));
+    }
+
+    ensure_ticket_state(
+        backend,
+        ticket_id,
+        TicketWorkflowState::Ready,
+        "root-ticket-state",
+        &root_top_level,
+    )?;
+
+    let orchestration_head = git_rev_parse(&orchestration.path, "HEAD").map_err(|message| {
+        queue_check_failed("branch-divergence", ticket_id, &orchestration.path, message)
+    })?;
+    let root_head = git_rev_parse(&root_top_level, "HEAD").map_err(|message| {
+        queue_check_failed("branch-divergence", ticket_id, &root_top_level, message)
+    })?;
+    ensure_git_ancestor(&root_top_level, &orchestration_head, &root_head).map_err(|message| {
+        queue_check_failed(
+            "branch-divergence",
+            ticket_id,
+            &orchestration.path,
+            format!(
+                "orchestration HEAD {orchestration_head} is not an ancestor of root branch {root_branch} HEAD {root_head}: {message}"
+            ),
+        )
+    })?;
+
+    let ticket_record_dir = backend.root().join(ticket_id);
+    if !ticket_record_dir.join("item.md").is_file() {
+        return Err(queue_check_failed(
+            "target-ticket-record",
+            ticket_id,
+            &ticket_record_dir,
+            "target Ticket item.md is missing".to_string(),
+        ));
+    }
+
+    Ok(PanelQueueHandoffPreflight {
+        ticket_id: ticket_id.to_string(),
+        root_top_level,
+        orchestration,
+        ticket_record_dir,
+    })
+}
+
+fn commit_panel_queue_ticket_record(
+    preflight: &PanelQueueHandoffPreflight,
+) -> Result<PanelQueueCommit, TicketActionError> {
+    let ticket_rel = path_relative_to_root(
+        &preflight.root_top_level,
+        &preflight.ticket_record_dir,
+        "target-ticket-record",
+        &preflight.ticket_id,
+    )?;
+    let mut add = Command::new("git");
+    add.arg("-C")
+        .arg(&preflight.root_top_level)
+        .arg("add")
+        .arg("--")
+        .arg(&ticket_rel);
+    run_git_command(add, "stage Queue Ticket record").map_err(|message| {
+        queue_check_failed(
+            "queue-commit-stage",
+            &preflight.ticket_id,
+            &preflight.ticket_record_dir,
+            message,
+        )
+    })?;
+
+    let staged = git_capture(
+        &preflight.root_top_level,
+        &["diff", "--cached", "--name-only"],
+        "list staged files",
+    )
+    .map_err(|message| {
+        queue_check_failed(
+            "queue-commit-pathscope",
+            &preflight.ticket_id,
+            &preflight.root_top_level,
+            message,
+        )
+    })?;
+    let staged_paths = staged
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>();
+    if staged_paths.is_empty() {
+        return Err(queue_check_failed(
+            "queue-commit-pathscope",
+            &preflight.ticket_id,
+            &preflight.ticket_record_dir,
+            "Queue mutation produced no staged Ticket record changes".to_string(),
+        ));
+    }
+    let ticket_rel_string = git_path_string(&ticket_rel);
+    let outside = staged_paths
+        .iter()
+        .find(|path| !git_status_path_is_inside(path, &ticket_rel_string));
+    if let Some(path) = outside {
+        return Err(queue_check_failed(
+            "queue-commit-pathscope",
+            &preflight.ticket_id,
+            &preflight.root_top_level,
+            format!(
+                "staged path {path} is outside target Ticket record {}",
+                ticket_rel.display()
+            ),
+        ));
+    }
+
+    let message = format!("ticket: queue {}", preflight.ticket_id);
+    let mut commit = Command::new("git");
+    commit
+        .arg("-C")
+        .arg(&preflight.root_top_level)
+        .arg("commit")
+        .arg("--no-verify")
+        .arg("-m")
+        .arg(message)
+        .arg("--")
+        .arg(&ticket_rel);
+    run_git_command(commit, "commit Queue Ticket record").map_err(|message| {
+        queue_check_failed(
+            "queue-commit-create",
+            &preflight.ticket_id,
+            &preflight.root_top_level,
+            message,
+        )
+    })?;
+    let sha = git_rev_parse(&preflight.root_top_level, "HEAD").map_err(|message| {
+        queue_check_failed(
+            "queue-commit-create",
+            &preflight.ticket_id,
+            &preflight.root_top_level,
+            message,
+        )
+    })?;
+    Ok(PanelQueueCommit { sha })
+}
+
+fn sync_panel_queue_to_orchestration(
+    preflight: &PanelQueueHandoffPreflight,
+    commit: &PanelQueueCommit,
+) -> Result<PanelQueueSync, TicketActionError> {
+    ensure_git_clean(
+        "orchestration-clean-before-sync",
+        &preflight.ticket_id,
+        &preflight.orchestration.path,
+    )?;
+    let mut merge = Command::new("git");
+    merge
+        .arg("-C")
+        .arg(&preflight.orchestration.path)
+        .arg("merge")
+        .arg("--ff-only")
+        .arg(&commit.sha);
+    run_git_command(
+        merge,
+        "ff-only sync Queue commit into orchestration worktree",
+    )
+    .map_err(|message| {
+        queue_check_failed(
+            "orchestration-ff-only-sync",
+            &preflight.ticket_id,
+            &preflight.orchestration.path,
+            message,
+        )
+    })?;
+    let head = git_rev_parse(&preflight.orchestration.path, "HEAD").map_err(|message| {
+        queue_check_failed(
+            "orchestration-ff-only-sync",
+            &preflight.ticket_id,
+            &preflight.orchestration.path,
+            message,
+        )
+    })?;
+    Ok(PanelQueueSync {
+        path: preflight.orchestration.path.clone(),
+        branch: preflight.orchestration.branch.clone(),
+        head,
+    })
+}
+
+fn verify_panel_queue_synced(
+    preflight: &PanelQueueHandoffPreflight,
+    commit: &PanelQueueCommit,
+) -> Result<(), TicketActionError> {
+    let head = git_rev_parse(&preflight.orchestration.path, "HEAD").map_err(|message| {
+        queue_check_failed(
+            "orchestration-sync-verify",
+            &preflight.ticket_id,
+            &preflight.orchestration.path,
+            message,
+        )
+    })?;
+    ensure_git_ancestor(&preflight.orchestration.path, &commit.sha, &head).map_err(|message| {
+        queue_check_failed(
+            "orchestration-sync-verify",
+            &preflight.ticket_id,
+            &preflight.orchestration.path,
+            format!(
+                "orchestration HEAD {head} does not contain Queue commit {}: {message}",
+                commit.sha
+            ),
+        )
+    })?;
+    let config = TicketConfig::load_workspace(&preflight.orchestration.path).map_err(|error| {
+        queue_check_failed(
+            "orchestration-ticket-state",
+            &preflight.ticket_id,
+            &preflight.orchestration.path,
+            error.to_string(),
+        )
+    })?;
+    let backend = LocalTicketBackend::new(config.backend_root())
+        .with_record_language(config.ticket_record_language());
+    ensure_ticket_state(
+        &backend,
+        &preflight.ticket_id,
+        TicketWorkflowState::Queued,
+        "orchestration-ticket-state",
+        &preflight.orchestration.path,
+    )
+}
+
+fn ensure_ticket_state(
+    backend: &LocalTicketBackend,
+    ticket_id: &str,
+    expected: TicketWorkflowState,
+    check: &'static str,
+    path: &Path,
+) -> Result<(), TicketActionError> {
+    let ticket = backend
+        .show(TicketIdOrSlug::Id(ticket_id.to_string()))
+        .map_err(|error| queue_check_failed(check, ticket_id, path, error.to_string()))?;
+    if ticket.meta.workflow_state != expected {
+        return Err(queue_check_failed(
+            check,
+            ticket_id,
+            path,
+            format!(
+                "state is {}, expected {}",
+                ticket.meta.workflow_state.as_str(),
+                expected.as_str()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_git_clean(
+    check: &'static str,
+    ticket_id: &str,
+    path: &Path,
+) -> Result<(), TicketActionError> {
+    let status = git_status_porcelain(path)
+        .map_err(|message| queue_check_failed(check, ticket_id, path, message))?;
+    if status.is_empty() {
+        return Ok(());
+    }
+    let detail = status.into_iter().take(6).collect::<Vec<_>>().join("; ");
+    Err(queue_check_failed(
+        check,
+        ticket_id,
+        path,
+        format!("worktree is dirty: {detail}"),
+    ))
+}
+
+fn ensure_git_effective_user(path: &Path) -> Result<(), String> {
+    let name = git_capture(path, &["config", "user.name"], "read git user.name")?;
+    let email = git_capture(path, &["config", "user.email"], "read git user.email")?;
+    if name.trim().is_empty() || email.trim().is_empty() {
+        return Err("git user.name and user.email must be configured before the Panel creates a Queue commit".to_string());
+    }
+    Ok(())
+}
+
+fn git_rev_parse(path: &Path, rev: &str) -> Result<String, String> {
+    git_capture(path, &["rev-parse", rev], "resolve Git revision")
+}
+
+fn git_status_porcelain(path: &Path) -> Result<Vec<String>, String> {
+    let output = git_capture(
+        path,
+        &["status", "--porcelain", "--untracked-files=normal"],
+        "read Git status",
+    )?;
+    Ok(output.lines().map(|line| line.to_string()).collect())
+}
+
+fn ensure_git_ancestor(path: &Path, ancestor: &str, descendant: &str) -> Result<(), String> {
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .arg("merge-base")
+        .arg("--is-ancestor")
+        .arg(ancestor)
+        .arg(descendant)
+        .status()
+        .map_err(|error| format!("could not run git merge-base --is-ancestor: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "git merge-base --is-ancestor {ancestor} {descendant} exited with {status}"
+        ))
+    }
+}
+
+fn git_capture(path: &Path, args: &[&str], action: &str) -> Result<String, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(args)
+        .output()
+        .map_err(|error| {
+            format!(
+                "could not run git to {action} at {}: {error}",
+                path.display()
+            )
+        })?;
+    if output.status.success() {
+        return Ok(String::from_utf8_lossy(&output.stdout).trim().to_string());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let detail = if stderr.is_empty() { stdout } else { stderr };
+    Err(format!(
+        "git failed to {action} at {}: {detail}",
+        path.display()
+    ))
+}
+
+fn path_relative_to_root(
+    root: &Path,
+    path: &Path,
+    check: &'static str,
+    ticket_id: &str,
+) -> Result<PathBuf, TicketActionError> {
+    let canonical = path.canonicalize().map_err(|error| {
+        queue_check_failed(
+            check,
+            ticket_id,
+            path,
+            format!("could not canonicalize path: {error}"),
+        )
+    })?;
+    canonical
+        .strip_prefix(root)
+        .map(PathBuf::from)
+        .map_err(|_| {
+            queue_check_failed(
+                check,
+                ticket_id,
+                path,
+                format!(
+                    "path {} is outside root Git top-level {}",
+                    canonical.display(),
+                    root.display()
+                ),
+            )
+        })
+}
+
+fn git_path_string(path: &Path) -> String {
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn git_status_path_is_inside(path: &str, parent: &str) -> bool {
+    path == parent
+        || path
+            .strip_prefix(parent)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+fn queue_check_failed(
+    check: &'static str,
+    ticket_id: &str,
+    path: &Path,
+    message: impl Into<String>,
+) -> TicketActionError {
+    TicketActionError::Stale(format!(
+        "Queue handoff check `{check}` failed for Ticket {ticket_id} at {}: {}",
+        path.display(),
+        message.into()
+    ))
 }
 
 fn dispatch_panel_close(
@@ -3675,21 +4223,11 @@ mod tests {
     fn init_test_repo(root: &Path) {
         std::fs::create_dir_all(root).unwrap();
         run_test_git(root, &["init"]).unwrap();
+        run_test_git(root, &["config", "user.email", "test@example.invalid"]).unwrap();
+        run_test_git(root, &["config", "user.name", "Yoi Test"]).unwrap();
         std::fs::write(root.join("README.md"), "repo").unwrap();
         run_test_git(root, &["add", "README.md"]).unwrap();
-        run_test_git(
-            root,
-            &[
-                "-c",
-                "user.email=test@example.invalid",
-                "-c",
-                "user.name=Yoi Test",
-                "commit",
-                "-m",
-                "init",
-            ],
-        )
-        .unwrap();
+        run_test_git(root, &["commit", "-m", "init"]).unwrap();
     }
 
     #[test]
@@ -3729,6 +4267,16 @@ mod tests {
         let temp = TempDir::new().unwrap();
         fs::create_dir_all(temp.path().join(".yoi")).unwrap();
         fs::write(
+            temp.path().join(".gitignore"),
+            ".worktree/\n.yoi/tickets/.ticket-backend.lock\n",
+        )
+        .unwrap();
+        fs::write(
+            temp.path().join(".yoi/.gitignore"),
+            "tickets/.ticket-backend.lock\n",
+        )
+        .unwrap();
+        fs::write(
             temp.path().join(".yoi/ticket.config.toml"),
             "[backend]\nprovider = \"builtin:yoi_local\"\nroot = \".yoi/tickets\"\n",
         )
@@ -3744,6 +4292,21 @@ mod tests {
 
     fn ready_ticket_workspace(title: &str) -> (TempDir, String, LocalTicketBackend) {
         ticket_workspace(title, TicketWorkflowState::Ready, |_| {})
+    }
+
+    fn ready_ticket_git_workspace(title: &str) -> (TempDir, String, LocalTicketBackend) {
+        let (temp, ticket_id, backend) = ready_ticket_workspace(title);
+        run_test_git(temp.path(), &["init"]).unwrap();
+        run_test_git(
+            temp.path(),
+            &["config", "user.email", "test@example.invalid"],
+        )
+        .unwrap();
+        run_test_git(temp.path(), &["config", "user.name", "Yoi Test"]).unwrap();
+        run_test_git(temp.path(), &["add", "."]).unwrap();
+        run_test_git(temp.path(), &["commit", "-m", "seed tickets"]).unwrap();
+        ensure_orchestration_worktree(temp.path()).unwrap();
+        (temp, ticket_id, backend)
     }
 
     fn done_ticket_workspace(title: &str) -> (TempDir, String, LocalTicketBackend) {
@@ -3765,14 +4328,23 @@ mod tests {
 
     #[tokio::test]
     async fn ticket_queue_action_transitions_ready_ticket_and_authorizes_orchestrator_routing() {
-        let (temp, ticket_id, backend) = ready_ticket_workspace("panel-queue");
+        let (temp, ticket_id, backend) = ready_ticket_git_workspace("panel-queue");
+        let root_head_before = git_rev_parse(temp.path(), "HEAD").unwrap();
 
         let outcome =
             dispatch_ticket_action(request_for(&temp, ticket_id.clone(), NextUserAction::Queue))
                 .await
                 .unwrap();
 
+        let root_head_after = git_rev_parse(temp.path(), "HEAD").unwrap();
+        let layout = orchestration_worktree_layout(temp.path());
+        let orchestration_head = git_rev_parse(&layout.path, "HEAD").unwrap();
+        assert_ne!(root_head_after, root_head_before);
+        assert_eq!(orchestration_head, root_head_after);
         assert!(outcome.notice.contains("Queued Ticket"));
+        assert!(outcome.notice.contains(&root_head_after));
+        assert!(outcome.notice.contains("root Queue commit"));
+        assert!(outcome.notice.contains("ff-only synced"));
         assert!(
             outcome
                 .notice
@@ -3780,7 +4352,7 @@ mod tests {
         );
         assert!(outcome.notice.contains("queued -> inprogress acceptance"));
         assert!(!outcome.notice.contains("No implementation was started"));
-        let ticket = backend.show(TicketIdOrSlug::Id(ticket_id)).unwrap();
+        let ticket = backend.show(TicketIdOrSlug::Id(ticket_id.clone())).unwrap();
         assert_eq!(ticket.meta.workflow_state, TicketWorkflowState::Queued);
         assert_eq!(ticket.meta.queued_by.as_deref(), Some("workspace-panel"));
         assert!(ticket.meta.queued_at.is_some());
@@ -3795,6 +4367,56 @@ mod tests {
             })
             .expect("queue state_changed event is recorded");
         assert_eq!(state_change.author.as_deref(), Some("workspace-panel"));
+        let orchestration_backend = LocalTicketBackend::new(layout.path.join(".yoi/tickets"));
+        let orchestration_ticket = orchestration_backend
+            .show(TicketIdOrSlug::Id(ticket_id))
+            .unwrap();
+        assert_eq!(
+            orchestration_ticket.meta.workflow_state,
+            TicketWorkflowState::Queued
+        );
+    }
+
+    #[tokio::test]
+    async fn ticket_queue_action_blocks_dirty_root_without_mutation() {
+        let (temp, ticket_id, backend) = ready_ticket_git_workspace("panel-dirty-root");
+        fs::write(temp.path().join("dirty.txt"), "dirty").unwrap();
+
+        let error =
+            dispatch_ticket_action(request_for(&temp, ticket_id.clone(), NextUserAction::Queue))
+                .await
+                .unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("root-clean"));
+        assert!(message.contains(&ticket_id));
+        assert!(message.contains(&temp.path().display().to_string()));
+        assert!(message.contains("dirty.txt"));
+        let ticket = backend.show(TicketIdOrSlug::Id(ticket_id)).unwrap();
+        assert_eq!(ticket.meta.workflow_state, TicketWorkflowState::Ready);
+        assert!(ticket.meta.queued_by.is_none());
+    }
+
+    #[tokio::test]
+    async fn ticket_queue_action_blocks_orchestration_branch_divergence() {
+        let (temp, ticket_id, backend) = ready_ticket_git_workspace("panel-diverged");
+        let layout = orchestration_worktree_layout(temp.path());
+        fs::write(layout.path.join("orchestrator-only.txt"), "diverged").unwrap();
+        run_test_git(&layout.path, &["add", "orchestrator-only.txt"]).unwrap();
+        run_test_git(&layout.path, &["commit", "-m", "orchestrator-only"]).unwrap();
+
+        let error =
+            dispatch_ticket_action(request_for(&temp, ticket_id.clone(), NextUserAction::Queue))
+                .await
+                .unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("branch-divergence"));
+        assert!(message.contains(&ticket_id));
+        assert!(message.contains(&layout.path.display().to_string()));
+        let ticket = backend.show(TicketIdOrSlug::Id(ticket_id)).unwrap();
+        assert_eq!(ticket.meta.workflow_state, TicketWorkflowState::Ready);
+        assert!(ticket.meta.queued_by.is_none());
     }
 
     #[tokio::test]
@@ -5173,6 +5795,7 @@ mod tests {
             launch: TicketRoleLaunchResult {
                 plan: client::ticket_role::TicketRoleLaunchPlan {
                     workspace_root: PathBuf::from("/tmp/workspace"),
+                    cwd: None,
                     original_workspace_root: PathBuf::from("/tmp/workspace"),
                     target_workspace_root: PathBuf::from("/tmp/workspace"),
                     implementation_worktree_root: PathBuf::from("/tmp/workspace/.worktree"),
