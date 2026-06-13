@@ -87,3 +87,35 @@ Escalate if:
 Ticket evidence、related E2E tickets、existing code map、Orchestrator worktree clean state を確認した。ユーザーが明示的に修正を依頼しており、blocking relation はない。実装 side effect の前に inprogress acceptance を記録する。
 
 ---
+
+<!-- event: review author: orchestrator at: 2026-06-13T17:31:57Z status: approve -->
+
+## Review: approve
+
+## Review: approve
+
+外部 Reviewer Pod 起動を試みたが、この Orchestrator の現在の delegation scope では child launch validation が要求する root workspace read grant を再委譲できず、Reviewer Pod を起動できなかった。そのため Orchestrator が実装 diff・validation・artifact を直接確認した。
+
+確認した実装:
+- `tests/e2e/src/lib.rs` に per-scenario `FixtureWorkspace` / `TempDir` 管理を追加。
+- fixture root 配下に `workspace`、`home`、`data`、`state`、`config`、`runtime` を作り、tested `yoi` には `env_clear()` + fixture-local `XDG_RUNTIME_DIR` を渡す。
+- `PanelHarness::spawn` と fixture setup command は host `XDG_RUNTIME_DIR` / host provider env を継承しない。
+- fixture snapshot / cleanup report / fixture metadata を `target/e2e-artifacts/<run>/` に保存し、fixture temp root は cleanup 後に存在しないことを記録する。
+- tests は hostile host `XDG_RUNTIME_DIR` を設定した状態でも fixture runtime policy を使う。
+- existing binary provider、mouse capture guard、quit pending barrier、env credential isolation は維持されている。
+
+Validation performed by Orchestrator:
+- `cargo fmt --check`: PASS
+- `git diff --check`: PASS
+- `cargo check -p yoi-e2e --all-targets --features e2e`: PASS
+- `XDG_RUNTIME_DIR=/tmp/yoi-e2e-host-runtime-leak-test OPENAI_API_KEY=host-secret ANTHROPIC_API_KEY=host-secret GEMINI_API_KEY=host-secret cargo test -p yoi-e2e --features e2e --test panel -- --nocapture`: PASS
+- artifact spot-check: recent `cleanup.json` records `cleanup_success: true` and `fixture_root_exists_after: false`。
+- `target/e2e-tmp` の直下に residual fixture temp root が残っていないことを確認。
+
+Notes:
+- Failure artifact は fixture snapshot を保存するため、host への leak ではなく `target/e2e-artifacts` に診断情報が残る。
+- Fixture-created `workspace` / `workspace-orchestrator` Pod metadata は fixture data dir / snapshot に閉じる。host runtime/data registry を読む経路は fixture `XDG_RUNTIME_DIR` + env clear により遮断されている。
+
+Decision: approve.
+
+---
