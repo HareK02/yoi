@@ -354,6 +354,18 @@ where
         }
     }
 
+    pub async fn send_weak_notify_to_live_peer(&self, peer_name: &str, message: String) -> bool {
+        let Ok(detail) = self.inspect(peer_name).await else {
+            return false;
+        };
+        if detail.visibility != VisibilityReason::Peer || !detail.live.reachable {
+            return false;
+        }
+        send_notify(&detail.live.socket_path, message, false)
+            .await
+            .is_ok()
+    }
+
     async fn live_for_name(&self, pod_name: &str, socket_override: Option<&Path>) -> LiveInfo {
         let socket_path = socket_override
             .map(Path::to_path_buf)
@@ -913,14 +925,11 @@ where
 }
 
 async fn send_peer_notify(socket_path: &Path, message: String) -> io::Result<()> {
-    connect_and_send(
-        socket_path,
-        &Method::Notify {
-            message,
-            auto_run: true,
-        },
-    )
-    .await
+    send_notify(socket_path, message, true).await
+}
+
+async fn send_notify(socket_path: &Path, message: String, auto_run: bool) -> io::Result<()> {
+    connect_and_send(socket_path, &Method::Notify { message, auto_run }).await
 }
 
 fn json_content<T: Serialize>(value: &T) -> Result<String, ToolError> {
@@ -1419,6 +1428,150 @@ mod tests {
         let message = rx.recv().await.unwrap();
         assert_eq!(message, "[Peer message from `source`]\nhello");
         target.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn weak_notify_to_live_peer_uses_notify_without_auto_run_and_noops_when_missing() {
+        let root = TempDir::new().unwrap();
+        let store_dir = root.path().join("store");
+        let runtime_base = root.path().join("runtime");
+        std::fs::create_dir_all(runtime_base.join("target")).unwrap();
+        let store = FsPodStore::new(&store_dir).unwrap();
+        store
+            .write(&PodMetadata {
+                pod_name: "source".into(),
+                active: None,
+                spawned_children: Vec::new(),
+                reclaimed_children: Vec::new(),
+                peers: vec![pod_store::PodPeer {
+                    pod_name: "target".into(),
+                }],
+                resolved_manifest_snapshot: None,
+            })
+            .unwrap();
+        store
+            .write(&PodMetadata {
+                pod_name: "target".into(),
+                active: None,
+                spawned_children: Vec::new(),
+                reclaimed_children: Vec::new(),
+                peers: vec![pod_store::PodPeer {
+                    pod_name: "source".into(),
+                }],
+                resolved_manifest_snapshot: None,
+            })
+            .unwrap();
+        let runtime_dir = Arc::new(RuntimeDir::create(&runtime_base, "source").await.unwrap());
+        let discovery = PodDiscovery::new(
+            store,
+            "source".into(),
+            runtime_base.clone(),
+            root.path().to_path_buf(),
+            SpawnedPodRegistry::new(runtime_dir),
+        );
+
+        let socket = runtime_base.join("target").join("sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let target = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut writer = JsonLineWriter::new(stream);
+            writer
+                .write(&Event::Snapshot {
+                    entries: Vec::new(),
+                    greeting: protocol::Greeting {
+                        pod_name: "target".into(),
+                        cwd: "/tmp".into(),
+                        provider: "test".into(),
+                        model: "test".into(),
+                        scope_summary: String::new(),
+                        tools: Vec::new(),
+                        context_window: 0,
+                        context_tokens: 0,
+                    },
+                    status: PodStatus::Idle,
+                })
+                .await
+                .unwrap();
+
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader_half, writer_half) = stream.into_split();
+            let mut reader = JsonLineReader::new(reader_half);
+            let mut writer = JsonLineWriter::new(writer_half);
+            writer
+                .write(&Event::Snapshot {
+                    entries: Vec::new(),
+                    greeting: protocol::Greeting {
+                        pod_name: "target".into(),
+                        cwd: "/tmp".into(),
+                        provider: "test".into(),
+                        model: "test".into(),
+                        scope_summary: String::new(),
+                        tools: Vec::new(),
+                        context_window: 0,
+                        context_tokens: 0,
+                    },
+                    status: PodStatus::Idle,
+                })
+                .await
+                .unwrap();
+            let method = reader.next::<Method>().await.unwrap().unwrap();
+            if let Method::Notify { message, auto_run } = method {
+                assert!(!auto_run);
+                tx.send(message).await.unwrap();
+            } else {
+                panic!("expected Notify, got {method:?}");
+            }
+        });
+
+        assert!(
+            discovery
+                .send_weak_notify_to_live_peer("target", "weak event".into())
+                .await
+        );
+        assert_eq!(rx.recv().await.unwrap(), "weak event");
+        target.await.unwrap();
+
+        assert!(
+            !discovery
+                .send_weak_notify_to_live_peer("missing", "no-op".into())
+                .await
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn weak_notify_does_not_send_to_spawned_child_visibility() {
+        let root = TempDir::new().unwrap();
+        let store_dir = root.path().join("store");
+        let runtime_base = root.path().join("runtime");
+        std::fs::create_dir_all(runtime_base.join("target")).unwrap();
+        let store = FsPodStore::new(&store_dir).unwrap();
+        let socket = runtime_base.join("target").join("sock");
+        store
+            .write(&PodMetadata {
+                pod_name: "source".into(),
+                active: None,
+                spawned_children: vec![child("target", &socket)],
+                reclaimed_children: Vec::new(),
+                peers: Vec::new(),
+                resolved_manifest_snapshot: None,
+            })
+            .unwrap();
+        store.write(&PodMetadata::new("target", None)).unwrap();
+        let runtime_dir = Arc::new(RuntimeDir::create(&runtime_base, "source").await.unwrap());
+        let discovery = PodDiscovery::new(
+            store,
+            "source".into(),
+            runtime_base,
+            root.path().to_path_buf(),
+            SpawnedPodRegistry::new(runtime_dir),
+        );
+
+        assert!(
+            !discovery
+                .send_weak_notify_to_live_peer("target", "must not send".into())
+                .await
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

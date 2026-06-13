@@ -17,6 +17,7 @@ pub mod workflow;
 mod interrupt_prep;
 mod permission;
 mod pod;
+mod ticket_event_notify;
 
 pub use compact::token_counter::{EstimateSource, SplitPoint, TokenEstimate};
 pub use controller::{PodController, PodHandle, ShutdownReceiver};
