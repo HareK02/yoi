@@ -26,3 +26,19 @@ Ticket を `workspace-panel` が queued にしました。
 
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-13T18:33:30Z -->
+
+## Implementation report
+
+Implementation handoff resumed successfully after retry.
+
+- Previous blocker was child launch validation requiring workspace root read grant.
+- Retried `SpawnPod` with explicit non-recursive read grant for `/home/hare/Projects/yoi` plus child worktree read/write scopes.
+- Coder Pod started: `coder-00001KV10SN02-e2e-critical`
+- Worktree: `/home/hare/Projects/yoi/.worktree/e2e-critical-path`
+- Branch: `ticket-00001KV10SN02-e2e-critical-path`
+
+The root workspace grant is non-recursive and is only for runtime launch validation. Coder instructions explicitly prohibit inspecting, writing, running git, validating, merging, or cleaning up in the root/original workspace.
+
+---
