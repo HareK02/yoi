@@ -7,6 +7,8 @@ use llm_worker::llm_client::client::LlmClient;
 use manifest::TicketFeatureAccessConfig;
 use pod_store::PodMetadataStore;
 use session_store::Store;
+use ticket::LocalTicketBackend;
+use ticket::config::TicketConfig;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::discovery::{PodDiscovery, list_pods_tool, restore_pod_tool, send_to_peer_pod_tool};
@@ -25,6 +27,9 @@ use crate::shutdown_after_idle::{
 use crate::spawn::comm_tools::{read_pod_output_tool, send_to_pod_tool, stop_pod_tool};
 use crate::spawn::registry::SpawnedPodRegistry;
 use crate::spawn::tool::spawn_pod_tool;
+use crate::ticket_event_notify::{
+    TicketEventCompanionNotifyHook, companion_pod_name_for_workspace,
+};
 use protocol::{
     AlertLevel, AlertSource, ErrorCode, Event, Method, PodStatus, RewindTargetId, RunResult,
     Segment, TurnResult,
@@ -229,6 +234,12 @@ impl PodController {
             runtime_base.to_path_buf(),
             spawned_registry.clone(),
         )?;
+
+        install_ticket_event_companion_notify_hook(
+            &mut pod,
+            runtime_base.to_path_buf(),
+            spawned_registry.clone(),
+        );
 
         // Intake role Pods self-terminate only after a successful
         // TicketIntakeReady turn has fully settled back to Idle. The request
@@ -492,6 +503,59 @@ fn wire_event_bridges_on_worker<C, St>(
     // through the session-log sink as a typed `LogEntry`, and clients
     // see it via `Event::Snapshot` + live `Event::Entry`. The
     // per-item commit channel is wired at the top of this function.
+}
+
+fn install_ticket_event_companion_notify_hook<C, St>(
+    pod: &mut Pod<C, St>,
+    runtime_base: PathBuf,
+    spawned_registry: Arc<SpawnedPodRegistry>,
+) where
+    C: LlmClient + Clone + 'static,
+    St: Store + PodMetadataStore + Clone + Send + Sync + 'static,
+{
+    if !is_ticket_orchestrator_role(pod.runtime_ticket_role()) {
+        return;
+    }
+
+    let ticket_feature = &pod.manifest().feature.ticket;
+    if !ticket_feature.enabled
+        || !matches!(ticket_feature.access, TicketFeatureAccessConfig::Lifecycle)
+    {
+        return;
+    }
+
+    let Some(companion_pod_name) = companion_pod_name_for_workspace(pod.workspace_root()) else {
+        return;
+    };
+    if companion_pod_name == pod.manifest().pod.name {
+        return;
+    }
+
+    let Ok(ticket_config) = TicketConfig::load_workspace(pod.cwd()) else {
+        return;
+    };
+    let backend_root = ticket_config.backend_root().to_path_buf();
+    if !backend_root.is_dir() {
+        return;
+    }
+
+    let discovery = PodDiscovery::new(
+        pod.pod_metadata_store(),
+        pod.manifest().pod.name.clone(),
+        runtime_base,
+        pod.cwd().to_path_buf(),
+        spawned_registry,
+    );
+    pod.add_post_tool_call_hook(TicketEventCompanionNotifyHook::new(
+        LocalTicketBackend::new(backend_root),
+        discovery,
+        companion_pod_name,
+    ));
+}
+
+fn is_ticket_orchestrator_role(role: Option<&str>) -> bool {
+    role.map(|role| role.eq_ignore_ascii_case("orchestrator"))
+        .unwrap_or(false)
 }
 
 /// Register the builtin file-manipulation tools, optional memory tools,

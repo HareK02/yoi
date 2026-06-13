@@ -728,6 +728,13 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         &self.workspace_root
     }
 
+    pub(crate) fn pod_metadata_store(&self) -> St
+    where
+        St: Clone,
+    {
+        self.store.clone()
+    }
+
     /// The Pod's directory scope, as a shared atomically-swappable
     /// handle. Clone it to share scope state with another consumer
     /// (e.g. a tool that needs to mutate scope dynamically).
