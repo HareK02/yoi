@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "relations": [
+    {
+      "ticket_id": "00001KV12W2RT",
+      "kind": "related",
+      "target": "00001KTR81P9X",
+      "note": "ready+waiting dependency display example",
+      "author": "yoi ticket",
+      "at": "2026-06-13T18:11:44Z"
+    },
+    {
+      "ticket_id": "00001KV12W2RT",
+      "kind": "related",
+      "target": "00001KV10SN02",
+      "note": "Panel row layout changes may affect mouse/wheel E2E expectations",
+      "author": "yoi ticket",
+      "at": "2026-06-13T18:11:44Z"
+    }
+  ]
+}

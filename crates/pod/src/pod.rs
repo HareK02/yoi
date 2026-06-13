@@ -4674,8 +4674,18 @@ pub enum PodError {
     #[error(transparent)]
     Scope(ScopeError),
 
+    #[error("workspace root is not readable under the configured scope: {}", .workspace_root.display())]
+    WorkspaceRootOutsideScope { workspace_root: PathBuf },
+
     #[error("cwd is not readable under the configured scope: {}", .cwd.display())]
     CwdOutsideScope { cwd: PathBuf },
+
+    #[error("failed to resolve workspace root {}: {source}", .workspace_root.display())]
+    InvalidWorkspaceRoot {
+        workspace_root: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 
     #[error("failed to resolve cwd {}: {source}", .cwd.display())]
     InvalidCwd {
@@ -4858,11 +4868,12 @@ fn prepare_pod_common_with_context(
     cwd: PathBuf,
     scope_config: ScopeConfig,
 ) -> Result<PodCommon, PodError> {
-    let workspace_root =
-        std::fs::canonicalize(&workspace_root).map_err(|source| PodError::InvalidCwd {
-            cwd: workspace_root.clone(),
+    let workspace_root = std::fs::canonicalize(&workspace_root).map_err(|source| {
+        PodError::InvalidWorkspaceRoot {
+            workspace_root: workspace_root.clone(),
             source,
-        })?;
+        }
+    })?;
     let cwd = std::fs::canonicalize(&cwd).map_err(|source| PodError::InvalidCwd {
         cwd: cwd.clone(),
         source,
@@ -4889,9 +4900,7 @@ fn prepare_pod_common_from_scope(
     scope: Scope,
 ) -> Result<PodCommon, PodError> {
     if !scope.is_readable(&workspace_root) {
-        return Err(PodError::CwdOutsideScope {
-            cwd: workspace_root,
-        });
+        return Err(PodError::WorkspaceRootOutsideScope { workspace_root });
     }
     if !scope.is_readable(&cwd) {
         return Err(PodError::CwdOutsideScope { cwd });
@@ -5039,6 +5048,80 @@ mod spawned_context_tests {
             common.memory_layout.as_ref().unwrap().root(),
             workspace_root.canonicalize().unwrap()
         );
+    }
+
+    #[test]
+    fn prepare_context_reports_workspace_root_when_workspace_root_is_unreadable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace_root = tmp.path().join("workspace-root");
+        let cwd = tmp.path().join("child-worktree");
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let manifest = minimal_manifest_for_context_test(&workspace_root, &cwd);
+        let err = match prepare_pod_common_with_context(
+            &manifest,
+            &PromptLoader::builtins_only(),
+            false,
+            workspace_root.clone(),
+            cwd.clone(),
+            ScopeConfig {
+                allow: vec![ScopeRule {
+                    target: cwd.clone(),
+                    permission: Permission::Read,
+                    recursive: true,
+                }],
+                deny: Vec::new(),
+            },
+        ) {
+            Ok(_) => panic!("expected workspace-root scope error"),
+            Err(err) => err,
+        };
+
+        match err {
+            PodError::WorkspaceRootOutsideScope {
+                workspace_root: got,
+            } => {
+                assert_eq!(got, workspace_root.canonicalize().unwrap());
+            }
+            other => panic!("expected workspace-root scope error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prepare_context_reports_cwd_when_only_cwd_is_unreadable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace_root = tmp.path().join("workspace-root");
+        let cwd = tmp.path().join("child-worktree");
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let manifest = minimal_manifest_for_context_test(&workspace_root, &cwd);
+        let err = match prepare_pod_common_with_context(
+            &manifest,
+            &PromptLoader::builtins_only(),
+            false,
+            workspace_root.clone(),
+            cwd.clone(),
+            ScopeConfig {
+                allow: vec![ScopeRule {
+                    target: workspace_root.clone(),
+                    permission: Permission::Read,
+                    recursive: true,
+                }],
+                deny: Vec::new(),
+            },
+        ) {
+            Ok(_) => panic!("expected cwd scope error"),
+            Err(err) => err,
+        };
+
+        match err {
+            PodError::CwdOutsideScope { cwd: got } => {
+                assert_eq!(got, cwd.canonicalize().unwrap());
+            }
+            other => panic!("expected cwd scope error, got {other:?}"),
+        }
     }
 
     fn minimal_manifest_for_context_test(workspace_root: &Path, cwd: &Path) -> PodManifest {

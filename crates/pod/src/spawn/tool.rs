@@ -61,7 +61,7 @@ struct SpawnPodInput {
     task: String,
     /// Allow rules delegated to the spawned Pod. Must be a subset of the
     /// spawner's explicit delegation authority; direct tool scope alone is not
-    /// sufficient.
+    /// sufficient. Omit `recursive` for normal workspace/worktree delegation; it defaults to true.
     scope: Vec<ScopeRuleInput>,
 }
 
