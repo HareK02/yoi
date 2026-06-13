@@ -2,7 +2,7 @@
 title: "E2E テストハーネス"
 state: "planning"
 created_at: "2026-05-27T00:00:02Z"
-updated_at: '2026-06-13T13:56:37Z'
+updated_at: '2026-06-13T14:03:56Z'
 ---
 
 ## Migration reference

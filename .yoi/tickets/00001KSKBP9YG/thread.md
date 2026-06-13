@@ -35,3 +35,31 @@ E2E scope refinement: TUI/Panel PTY 自動化もこの Ticket の範囲に含め
 - Probe は read-only observability であり、input/action path を bypass しないことを reviewer が確認する。
 
 ---
+
+<!-- event: decision author: orchestrator at: 2026-06-13T14:03:56Z -->
+
+## Decision
+
+E2E design decision: Playwright-like declarative test API と production binary 非混入を前提にする。
+
+Decision:
+- E2E は ad hoc shell / fixed sleep script ではなく、Rust の独立 crate から宣言的に scenario を書ける構造にする。
+- 例: `PanelHarness::spawn(...)`、`panel.wait_for(PanelReady)`、`panel.click(row("ticket", id))`、`panel.expect_selection(...)`、`panel.press(CtrlC)`、`panel.expect_exit_within(...)` のように、Playwright 的な wait/action/assertion API を提供する。
+- Harness crate は production binary / normal library API から独立させる。想定配置は `tests/e2e/` または `crates/e2e_harness` + integration tests で、通常 build / release package / normal `yoi` binary に test harness logic を混ぜない。
+- 本番 binary に混ぜる必要があるものは、原則として「既存 TUI state から read-only diagnostic event を emit するための最小 test hook」に限定する。その hook も normal runtime では無効で、明示 feature / hidden dev flag / cfg(test/e2e) 等でしか有効化しない。
+- E2E harness は production code の内部関数を直接呼んで state mutation しない。入力は PTY、観測は structured test events / terminal screen parser、assertion は harness 側で行う。
+- Structured events は protocol authority ではなく test observability artifact として扱う。Ticket/Pod authority や user-visible semantics を変えない。
+
+Rationale:
+- 今回の Panel mouse / Quit latency の失敗は、unit/focused tests と code-path review だけでは user-visible terminal behavior を保証できないことを示した。
+- 一方で fixed sleep + input script は再現性・診断性が低く、ready 状態や background work barrier を確認できない。
+- Playwright-like API なら、test は「何を待ち、何を入力し、何を観測するか」を宣言的に表現でき、失敗時に event log / screen dump / timing artifact を残せる。
+- Production binary への混入を避けることで、release behavior / binary size / authority surface / model-visible surfaces を汚さない。
+
+Acceptance refinement:
+- E2E test author が fixed sleep ではなく `wait_for` / `expect` / `within` を使って Panel/TUI scenario を書ける。
+- Mouse selection と Quit latency の regression は、この declarative harness API 上の scenario として表現される。
+- Test-only observability route は opt-in であり、release/normal execution では無効または到達不能であることを reviewer が確認する。
+- Failure artifact に scenario step、last observed events、screen snapshot、timing、binary path、workspace/runtime dirs が含まれる。
+
+---
