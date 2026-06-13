@@ -84,3 +84,47 @@ Escalate if:
 Ticket evidence、existing E2E harness code map、Orchestrator worktree clean state を確認した。ユーザーが明示的に修正を依頼しており、blocking relation はない。実装 side effect の前に inprogress acceptance を記録する。
 
 ---
+
+<!-- event: decision author: orchestrator at: 2026-06-13T15:49:47Z -->
+
+## Decision
+
+追加の critical gap: E2E subprocess environment が host credentials を継承し得る。
+
+Current finding:
+- `PanelHarness::spawn` と fixture setup の `run_yoi_capture` は `Command::new(binary)` に対して `env_clear()` を呼んでいない。
+- `HOME` / `XDG_*` は fixture dir に差し替えているが、通常の process environment は継承される。
+- そのため、現時点の Panel tests は LLM call を意図的に起こしていないものの、何らかの E2E path が provider/LLM call に到達した場合、host の `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / その他 provider credentials や secret-related env を見てしまう可能性がある。
+
+Decision:
+- E2E harness は default で host environment を継承してはならない。
+- `Command` 起動時は `env_clear()` を使い、必要最小限の env（`HOME`, `XDG_*`, `TERM`, `PATH`/`CARGO` 等 build/runtime に必要なもの、`YOI_TUI_TEST_EVENTS`, `YOI_POD_RUNTIME_COMMAND`, explicit test env）だけを allowlist で渡す。
+- Provider credentials / secret refs / network credentials は default deny。LLM/provider E2E を将来追加する場合は fixture provider / canned server / explicit test-only env で渡す。
+- Panel/TUI E2E は real LLM call が発生しないことを前提にし、host auth への依存を禁止する。
+
+Acceptance addition for `00001KV0TJVN5`:
+- Existing subprocess launches (`PanelHarness::spawn`, `run_yoi_capture`, cargo build provider where appropriate) must not leak host provider credentials to the tested `yoi` process。
+- At minimum, yoi subprocess env should be allowlisted and provider key names should be absent unless explicitly supplied by a future fixture provider test。
+
+---
+
+<!-- event: decision author: orchestrator at: 2026-06-13T15:53:07Z -->
+
+## Decision
+
+Environment-boundary reference added: `docs/development/environment.md` is binding context for this follow-up.
+
+Relevant policy:
+- Environment variables are a minimized runtime boundary.
+- Provider credentials and runtime configuration should not depend on ambient process state.
+- Tests should prefer typed fixtures/injection and mutate process environment only around thin env-reader behavior.
+- `YOI_POD_RUNTIME_COMMAND` is a development-only executable-path override, not a general ambient configuration channel.
+
+Implication for this Ticket:
+- E2E harness must not let tested `yoi` subprocesses inherit host env by default.
+- `PanelHarness::spawn` and fixture setup commands should use `env_clear()` plus an explicit allowlist.
+- Provider/secret/network credential env must be absent unless a future provider-fixture E2E explicitly injects test-only values.
+- Existing `YOI_*` test env should be limited to the feature-gated E2E observability/binary runtime paths and documented as test-only/dev-only surface, not normal runtime configuration.
+- The cargo build provider should avoid putting Cargo itself in the measured PTY path; any build env inheritance must be considered separately from the tested `yoi` subprocess env boundary.
+
+---
