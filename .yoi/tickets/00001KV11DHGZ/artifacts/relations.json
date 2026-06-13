@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "relations": [
+    {
+      "ticket_id": "00001KV11DHGZ",
+      "kind": "related",
+      "target": "00001KTZY8HK2",
+      "note": "mixed Orchestrator delegation depends on explicit profile scope replacement/override semantics",
+      "author": "yoi ticket",
+      "at": "2026-06-13T17:46:37Z"
+    }
+  ]
+}
