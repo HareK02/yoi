@@ -1,8 +1,8 @@
 ---
 title: "内部 Worker / 内部 Pod の Workflow 化"
-state: "planning"
+state: 'closed'
 created_at: "2026-05-27T00:00:03Z"
-updated_at: "2026-05-27T00:00:03Z"
+updated_at: '2026-06-13T09:56:34Z'
 ---
 
 ## Migration reference

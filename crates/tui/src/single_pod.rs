@@ -1,3 +1,4 @@
+use std::fmt;
 use std::future::Future;
 use std::io;
 use std::path::PathBuf;
@@ -12,8 +13,8 @@ use crossterm::event::{
     self, DisableMouseCapture, Event as TermEvent, KeyCode, KeyEvent, KeyModifiers, MouseEvent,
     MouseEventKind,
 };
-use crossterm::execute;
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::{Command, execute};
 use protocol::{Method, PodStatus};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -29,6 +30,33 @@ use crate::spawn::{SpawnOutcome, SpawnReady};
 use crate::{multi_pod, picker, spawn, ui};
 
 type FullscreenTerminal = Terminal<CrosstermBackend<io::Stdout>>;
+
+/// Enable the narrowest standard xterm mouse mode that still reports wheel
+/// events. Crossterm's `EnableMouseCapture` also enables button-event
+/// tracking (`?1002h`), which requests drag-motion reports and interferes
+/// with terminal text selection more aggressively. Normal tracking (`?1000h`)
+/// reports button presses, releases, and wheel notches, but does not request
+/// drag-motion reports; the TUI ignores the non-wheel events.
+#[derive(Debug, Clone, Copy)]
+struct EnableWheelMouseCapture;
+
+impl Command for EnableWheelMouseCapture {
+    fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
+        // 1000: normal mouse tracking (includes wheel button presses)
+        // 1006: SGR extended coordinates used by crossterm's parser
+        f.write_str("\x1B[?1000h\x1B[?1006h")
+    }
+
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> io::Result<()> {
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn is_ansi_code_supported(&self) -> bool {
+        true
+    }
+}
 
 fn resolve_socket(pod_name: &str, override_path: Option<PathBuf>) -> PathBuf {
     if let Some(p) = override_path {
@@ -245,10 +273,10 @@ pub(crate) async fn run_spawn(
 
 fn enter_fullscreen() -> Result<FullscreenTerminal, Box<dyn std::error::Error>> {
     let mut stdout = io::stdout();
-    // Do not enable mouse capture: terminal-native drag selection is more
-    // important than receiving mouse events in Yoi. Scroll-wheel handling below
-    // remains best-effort for terminals that still emit mouse events.
-    execute!(stdout, EnterAlternateScreen)?;
+    // Enable only normal mouse tracking for wheel events. Avoid crossterm's
+    // full mouse capture because it requests drag-motion events and breaks
+    // terminal-native text selection.
+    execute!(stdout, EnterAlternateScreen, EnableWheelMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     Ok(Terminal::new(backend)?)
 }
@@ -256,8 +284,13 @@ fn enter_fullscreen() -> Result<FullscreenTerminal, Box<dyn std::error::Error>> 
 fn enter_fullscreen_existing(
     terminal: &mut FullscreenTerminal,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Keep mouse capture disabled for terminal-native drag selection.
-    execute!(terminal.backend_mut(), EnterAlternateScreen)?;
+    // Re-enable the same least-intrusive wheel mouse mode after returning from
+    // nested inline screens.
+    execute!(
+        terminal.backend_mut(),
+        EnterAlternateScreen,
+        EnableWheelMouseCapture
+    )?;
     Ok(())
 }
 
@@ -900,6 +933,16 @@ fn handle_pause_or_quit(app: &mut App) -> Option<Method> {
 mod tests {
     use super::*;
     use protocol::{Event, RewindTarget, RewindTargetId, Segment};
+
+    #[test]
+    fn wheel_mouse_capture_uses_normal_tracking_without_drag_capture() {
+        let mut ansi = String::new();
+        Command::write_ansi(&EnableWheelMouseCapture, &mut ansi).unwrap();
+
+        assert_eq!(ansi, "\x1B[?1000h\x1B[?1006h");
+        assert!(!ansi.contains("?1002h"));
+        assert!(!ansi.contains("?1003h"));
+    }
 
     #[tokio::test]
     async fn terminal_event_is_selected_before_ready_pod_event() {

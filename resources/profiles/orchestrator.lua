@@ -2,7 +2,7 @@ return yoi.profile.extend("builtin:default", {
     slug = "orchestrator",
     description = "Orchestrator role profile with bundled reusable policy",
 
-    scope = yoi.scope.workspace_read(),
+    scope = "workspace_read",
 
     worker = {
         instruction = "$yoi/role/orchestrator",
@@ -17,5 +17,5 @@ return yoi.profile.extend("builtin:default", {
         ticket_orchestration = { enabled = true },
     },
 
-    delegation_scope = yoi.scope.workspace_write(),
+    delegation_scope = "workspace_write",
 })
