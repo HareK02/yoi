@@ -711,3 +711,47 @@ Reviewer-run validation:
 Non-blocking note:
 - `cargo test -p tui companion_progress` は 0 matched。Panel 非通知は TUI diff がないことと `rg` で確認している。将来の回帰防止には Panel reload/open が Companion event notify を呼ばない明示 test を追加してもよい。
 - Reviewer は read-only 方針を優先して `nix build .#yoi` を再実行せず、Orchestrator の pass 証跡を採用した。
+
+---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-13T04:21:40Z -->
+
+## Implementation report
+
+Integration completed in the Orchestrator workspace.
+
+Integrated implementation:
+- Ticket: `00001KTTW04W2`
+- Implementation branch: `ticket/orchestrator-ticket-event-companion-notify`
+- Implementation commits:
+  - `465ef100 feat: notify Companion on Orchestrator ticket events`
+  - `6f8571f7 fix: render ticket event notice from prompt resource`
+- Reviewer result: approve, no blockers
+- Orchestrator merge commit: `2e5a60f4 merge: companion ticket event notify`
+- Integration target: `orchestration/yoi-orchestrator`
+
+Post-integration validation from Orchestrator worktree:
+- `cargo test -p pod ticket_event_notify`: pass。
+- `cargo test -p pod ticket_event`: pass。
+- `cargo test -p pod weak_notify_to_live_peer_uses_notify_without_auto_run_and_noops_when_missing`: pass。
+- `cargo test -p tui companion_progress`: pass（0 matched; Panel feed remains absent）。
+- `rg` check confirmed no `companion_progress` / progress feed / `send_weak_notify` references in `crates/tui/src/multi_pod.rs`。
+- `cargo fmt --check`: pass。
+- `git diff --check HEAD~1..HEAD`: pass。
+- `./result/bin/yoi ticket doctor`: `doctor: ok`。
+- `nix build .#yoi`: pass。
+
+Behavior now:
+- Panel reload/open/periodic refresh does not send Companion notifications。
+- Orchestrator-role lifecycle Ticket tool post-call events can send bounded weak notifications to live/reachable Companion peer only。
+- Passive Ticket reads/lists/show/query do not notify。
+- missing/stopped/unreachable Companion remains no-op; no spawn/restore。
+- LLM-facing event notice framing is prompt-resource backed。
+
+---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-13T04:21:40Z from: inprogress to: done reason: implementation_merged_and_validated field: state -->
+
+## State changed
+
+Implementation was merged into the Orchestrator branch, reviewer approved with no blockers, and post-integration validation passed. Cleanup and closure will be recorded next.
