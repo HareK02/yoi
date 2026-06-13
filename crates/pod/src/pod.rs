@@ -3980,27 +3980,11 @@ where
                 pod_name: pod_name.to_string(),
                 session_id: active.session_id,
             })?;
-        let manifest = match metadata.resolved_manifest_snapshot {
-            Some(snapshot) => {
-                let mut restored: PodManifest =
-                    serde_json::from_value(snapshot).map_err(|source| {
-                        PodError::PodMetadataManifestSnapshot {
-                            pod_name: pod_name.to_string(),
-                            source,
-                        }
-                    })?;
-                if !manifest.scope.allow.is_empty() || !manifest.scope.deny.is_empty() {
-                    restored.scope = manifest.scope;
-                }
-                if !manifest.delegation_scope.allow.is_empty()
-                    || !manifest.delegation_scope.deny.is_empty()
-                {
-                    restored.delegation_scope = manifest.delegation_scope;
-                }
-                restored
-            }
-            None => manifest,
-        };
+        let manifest = restore_manifest_from_pod_metadata_snapshot(
+            pod_name,
+            metadata.resolved_manifest_snapshot,
+            manifest,
+        )?;
         Self::restore_from_manifest_with_context(
             active.session_id,
             segment_id,
@@ -4281,6 +4265,22 @@ fn request_config_from_worker_manifest(wm: &WorkerManifest) -> RequestConfig {
     config.stop_sequences = wm.stop_sequences.clone();
     config.reasoning = wm.reasoning.clone();
     config
+}
+
+fn restore_manifest_from_pod_metadata_snapshot(
+    pod_name: &str,
+    snapshot: Option<serde_json::Value>,
+    fallback: PodManifest,
+) -> Result<PodManifest, PodError> {
+    match snapshot {
+        Some(snapshot) => serde_json::from_value(snapshot).map_err(|source| {
+            PodError::PodMetadataManifestSnapshot {
+                pod_name: pod_name.to_string(),
+                source,
+            }
+        }),
+        None => Ok(fallback),
+    }
 }
 
 /// Result of a Pod run.
@@ -5067,6 +5067,83 @@ permission = "write"
         let mut manifest = PodManifest::from_toml(&toml_str).unwrap();
         manifest.model.auth = Some(manifest::AuthRef::None);
         manifest
+    }
+}
+
+#[cfg(test)]
+mod pod_metadata_restore_manifest_tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_preserves_saved_scope_over_current_manifest() {
+        let saved = PodManifest::from_toml(
+            r#"
+[pod]
+name = "restore-scope"
+
+[model]
+scheme = "anthropic"
+model_id = "claude-sonnet-4-20250514"
+
+[worker]
+instruction = "saved"
+
+[[scope.allow]]
+target = "/snapshot/workspace"
+permission = "read"
+
+[[delegation_scope.allow]]
+target = "/snapshot/workspace/.worktree"
+permission = "write"
+"#,
+        )
+        .unwrap();
+        let current = PodManifest::from_toml(
+            r#"
+[pod]
+name = "restore-scope"
+
+[model]
+scheme = "anthropic"
+model_id = "claude-sonnet-4-20250514"
+
+[worker]
+instruction = "current"
+
+[[scope.allow]]
+target = "/current/workspace"
+permission = "write"
+
+[[delegation_scope.allow]]
+target = "/current/workspace"
+permission = "write"
+"#,
+        )
+        .unwrap();
+
+        let restored = restore_manifest_from_pod_metadata_snapshot(
+            "restore-scope",
+            Some(serde_json::to_value(&saved).unwrap()),
+            current,
+        )
+        .unwrap();
+
+        assert_eq!(restored.worker.instruction, "saved");
+        assert_eq!(restored.scope.allow.len(), 1);
+        assert_eq!(
+            restored.scope.allow[0].target,
+            std::path::PathBuf::from("/snapshot/workspace")
+        );
+        assert_eq!(restored.scope.allow[0].permission, Permission::Read);
+        assert_eq!(restored.delegation_scope.allow.len(), 1);
+        assert_eq!(
+            restored.delegation_scope.allow[0].target,
+            std::path::PathBuf::from("/snapshot/workspace/.worktree")
+        );
+        assert_eq!(
+            restored.delegation_scope.allow[0].permission,
+            Permission::Write
+        );
     }
 }
 
