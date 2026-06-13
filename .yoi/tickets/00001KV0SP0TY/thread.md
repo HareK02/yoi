@@ -119,3 +119,38 @@ Residual risks / notes:
 
 
 ---
+
+<!-- event: review author: hare at: 2026-06-13T18:58:42Z status: approve -->
+
+## Review: approve
+
+## Review: approve
+
+Reviewed implementation commits `5549c50d` and `3faf7d7b` against Ticket `00001KV0SP0TY`.
+
+Evidence:
+- `crates/pod/src/feature.rs` removes the feature-layer `HostAuthority`, `HostAuthorityRequest`, `HostAuthorityGrantSet`, grant/denial/install-report semantics, and per-tool authority gates. The remaining feature API is contribution/lifecycle/diagnostic oriented: tools, hooks, background tasks, services, notifications, and install diagnostics.
+- No renamed equivalent authority/grant layer was introduced in `pod::feature`; remaining checks are ordinary contribution diagnostics such as duplicate tool names, undeclared tools/hooks/background tasks/services, service requirements, skipped contributions, and install errors.
+- `crates/pod/src/feature/builtin/ticket.rs` no longer requests or registers feature-layer host authority. Ticket tool exposure remains controlled by `TicketFeatureConfig` resolution, backend provider/root validation, and `TicketFeatureAccess` / base-orchestration tool selection. Missing/invalid backend roots and unsupported providers still fail closed without registering tools.
+- `crates/pod/src/feature/builtin/task/mod.rs` no longer describes task tools in host-authority terms; task hooks/tools still install through the normal feature registry path.
+- Source grep under `crates/**/*.rs` found no remaining `HostAuthority`, `HostAuthorityRequest`, `HostAuthorityGrantSet`, `host_authority`, `with_host_authority`, `requested_host_authorities`, or `required_host_authorities` symbols/terms.
+- Related Plugin/MCP planning Tickets inspected (`00001KTR81P9X`, `00001KTR82RB7`, `00001KSXRQ4G8`, `00001KT0Z4BK8`) state that Plugin/MCP permission/trust policy is not a `pod::feature` authority/grant dependency. The remaining mentions are negative boundary statements, not implementation reliance.
+
+Validation performed:
+- `git diff --check c4465a04..HEAD` — passed.
+- `cargo test -p pod feature:: --lib` — passed.
+- `cargo test -p pod feature::builtin::task --lib` — passed.
+- `cargo test -p ticket` — passed.
+- `cargo fmt --check` — passed.
+- `cargo check --workspace --all-targets` — passed.
+
+Not run:
+- `nix build .#yoi`; skipped because this review scope is source read-only with writes limited to `target/` and this Ticket record, and the change does not touch dependencies, `Cargo.lock`, packaging, or source filters.
+
+Risks / notes:
+- This intentionally removes the feature-layer authority gate rather than replacing it. Any future Plugin/MCP permission policy must be implemented in its owning layer and must not reintroduce this as a feature-layer grant API.
+
+Decision: approved.
+
+
+---
