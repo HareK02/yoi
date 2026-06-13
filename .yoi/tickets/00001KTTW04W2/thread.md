@@ -622,3 +622,55 @@ Implementation worktree created and coder delegated.
 - Coder Pod: `yoi-coder-event-companion-notify`
 - Scope: write child worktree only; read child worktree plus minimal non-recursive runtime-root read required by spawn validation。
 - Task: implement Panel-independent Companion notification for explicit Orchestrator/Pod Ticket events only, using bounded `Notify { auto_run:false }` event notices; do not reintroduce Panel periodic reload/snapshot feed.
+
+---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-13T04:09:50Z -->
+
+## Implementation report
+
+Coder completed implementation and prompt-resource fix.
+
+Coder Pod:
+- `yoi-coder-event-companion-notify`
+
+Implementation branch/worktree:
+- Branch: `ticket/orchestrator-ticket-event-companion-notify`
+- Worktree: `/home/hare/Projects/yoi/.worktree/orchestrator-ticket-event-companion-notify`
+- Implementation commits:
+  - `465ef100 feat: notify Companion on Orchestrator ticket events`
+  - `6f8571f7 fix: render ticket event notice from prompt resource`
+- Worktree status: clean
+
+Changed surfaces:
+- `crates/pod/src/controller.rs`
+- `crates/pod/src/discovery.rs`
+- `crates/pod/src/lib.rs`
+- `crates/pod/src/pod.rs`
+- `crates/pod/src/prompt/catalog.rs`
+- `crates/pod/src/ticket_event_notify.rs`
+- `resources/prompts/internal.toml`
+- `resources/prompts/pod/ticket_event_companion_notice.md`
+
+Implementation summary:
+- Added Orchestrator-role Ticket tool post-call hook for explicit Ticket event tools.
+- Event tools include state/comment/plan/decision/implementation_report/review/close paths; passive reads/lists are ignored.
+- The hook sends a bounded event-scoped weak notification to live/reachable Companion peer via `Notify { auto_run:false }`.
+- missing/stopped/unreachable Companion is no-op; no spawn/restore.
+- Panel reload/open/periodic refresh path is not used and Panel progress feed remains removed.
+- Ticket event notice framing is prompt-resource backed by `resources/prompts/pod/ticket_event_companion_notice.md`; Rust fills bounded runtime values and renders the resource.
+- Companion authority is not expanded.
+
+Orchestrator-verified validation:
+- `cargo test -p pod ticket_event_notify`: pass。
+- `cargo test -p pod ticket_event`: pass。
+- `cargo test -p pod weak_notify_to_live_peer_uses_notify_without_auto_run_and_noops_when_missing`: pass。
+- `cargo test -p tui companion_progress`: pass（0 matched; Panel feed tests remain absent）。
+- `rg` check confirmed no `companion_progress` / progress feed / `send_weak_notify` references in `crates/tui/src/multi_pod.rs`。
+- `cargo fmt --check`: pass。
+- `git diff --check orchestration/yoi-orchestrator...HEAD`: pass。
+- `cargo run -p yoi -- ticket doctor`: `doctor: ok`。
+- `nix build .#yoi`: pass。
+
+Next:
+- Spawn read-only reviewer for the Panel-independent event-triggered design, prompt-resource boundary, weak notify semantics, no snapshot feed, and authority/no-spawn invariants.
