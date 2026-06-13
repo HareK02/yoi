@@ -607,3 +607,18 @@ Next action:
 ## State changed
 
 Ticket body/thread、reopen decision、relation blockers、accepted plan、current Orchestrator workspace state、visible Pods を再確認した。未解決 blocker や missing planning decision は残っていないため、implementation side effect 前に `queued -> inprogress` acceptance を記録する。
+
+---
+
+<!-- event: plan author: orchestrator at: 2026-06-13T03:33:09Z -->
+
+## Plan
+
+Implementation worktree created and coder delegated.
+
+- Ticket: `00001KTTW04W2`
+- Branch: `ticket/orchestrator-ticket-event-companion-notify`
+- Worktree: `/home/hare/Projects/yoi/.worktree/orchestrator-ticket-event-companion-notify`
+- Coder Pod: `yoi-coder-event-companion-notify`
+- Scope: write child worktree only; read child worktree plus minimal non-recursive runtime-root read required by spawn validation。
+- Task: implement Panel-independent Companion notification for explicit Orchestrator/Pod Ticket events only, using bounded `Notify { auto_run:false }` event notices; do not reintroduce Panel periodic reload/snapshot feed.
