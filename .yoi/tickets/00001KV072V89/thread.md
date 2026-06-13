@@ -126,3 +126,59 @@ Next:
 - Coder の commit / implementation_report / validation evidence を確認後、Reviewer を read-only 基本で起動する。
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-06-13T11:15:00Z -->
+
+## Implementation report
+
+Implementation report for Ticket 00001KV072V89
+
+Summary:
+- Added panel row mouse hit testing in `crates/tui/src/multi_pod.rs` by recording selectable row rectangles during list rendering.
+- Handled left mouse button down events as selection-only operations for ticket/pod rows; non-row clicks are no-ops and diagnostic popups ignore clicks behind them.
+- Kept action execution on existing keyboard/action paths: clicked rows feed existing selected row behavior, including blank Enter, actionbar target status, and row detail selection.
+- Added focused tests for row hit testing, click selection, non-row click no-op/draft preservation, and composer/keyboard behavior preservation after click selection.
+
+Validation:
+- `cargo fmt -p tui` — passed.
+- `cargo fmt --check` — passed.
+- `cargo test -p tui mouse_ --lib` — passed (4 tests; includes the focused mouse tests plus existing wheel capture test matching the filter).
+- `cargo test -p tui row_hit_testing_maps_only_visible_selectable_rows --lib` — passed.
+- `cargo check -p tui --all-targets` — passed.
+- `git diff --check` — passed.
+- Additional broader check: `cargo test -p tui multi_pod --lib` ran; 85 tests passed and 1 existing/unrelated test failed (`multi_pod::tests::orchestrator_launch_context_uses_orchestration_root_for_runtime_workspace`, expected orchestration root vs `/repo/yoi`). The failure is outside the panel mouse selection change area.
+
+Commit:
+- `452c9df1` (`tui: select panel rows by mouse`)
+
+Residual risks:
+- Hit boxes are tied to the last rendered list area. This matches the current draw/event loop model; resize events trigger redraw, but stale hit boxes before the first draw would be ignored/empty.
+- MVP intentionally handles left-button down only; hover, release-to-action, detailed pane clicks, and drag/text selection remain out of scope.
+
+---
+
+<!-- event: review author: hare at: 2026-06-13T11:19:22Z status: approve -->
+
+## Review: approve
+
+Approve.
+
+Evidence:
+- Reviewed Ticket 00001KV072V89 and diff `20daae0c..HEAD` in `/home/hare/Projects/yoi/.worktree/panel-mouse-selection`.
+- Implementation adds a bounded `PanelRowHitBox` hit-test cache from the rendered list area and only handles primary-button `MouseEventKind::Down`; non-row/list-empty clicks return no selection change.
+- Click handling calls `select_panel_key` only. I found no mouse path invoking Queue/Open/Close, ticket lifecycle mutation, Pod attach/open, or destructive workflow actions.
+- Existing keyboard/composer paths remain the execution/action paths: blank Enter/actionbar/detail display consume the selected row after selection; text input, arrows, Enter, Esc, and Tab behavior is still handled by the existing key handlers.
+- Modal/diagnostic state is guarded by `panel_diagnostic_open`, so background row clicks do not change selection while diagnostics are shown.
+- Mouse terminal mode remains the existing least-intrusive normal mouse + SGR setup (`?1000h` + `?1006h` via the local narrow capture command), with no drag-capture mode added.
+- Tests added/updated cover row hit testing for visible selectable rows, left-click selection feeding existing blank-Enter behavior, non-row no-op/preserved draft, and keyboard/composer preservation; the no-Queue/Open/Close guarantee is enforced by the mouse handler only selecting rows and leaving action dispatch on existing key/action paths.
+
+Validation performed:
+- `cargo test -p tui mouse_ --lib` — passed.
+- `cargo test -p tui row_hit_testing_maps_only_visible_selectable_rows --lib` — passed.
+- `cargo fmt --check` — passed.
+- `git diff --check 20daae0c..HEAD` — passed.
+
+Risks / notes:
+- I did not run the broader `cargo test -p tui multi_pod --lib` suite because the requested focused coverage passed and that broader suite was noted as having a likely unrelated existing failure.
+
+---
