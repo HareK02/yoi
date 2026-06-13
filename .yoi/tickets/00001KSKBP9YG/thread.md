@@ -189,3 +189,43 @@ Next:
 - Coder の commit / implementation_report / validation evidence を確認後、Reviewer を read-only 基本で起動する。
 
 ---
+
+<!-- event: decision author: orchestrator at: 2026-06-13T14:31:31Z -->
+
+## Decision
+
+Design note: Panel mouse E2E は raw SGR sequence を固定送信するだけでは不十分。
+
+Rationale:
+- Harness が PTY に直接 `ESC [ < ... M` を書くと、実端末が mouse capture 有効時だけ mouse sequence を生成するという条件を bypass してしまい、今回のような「実端末ではイベントが来ない」系の不具合を見逃す可能性がある。
+- Mouse E2E は locator/row rect を使って coordinate を決めるだけでなく、TUI が mouse capture mode を有効化したことも検証する必要がある。
+
+追加すべき test harness 要件:
+- virtual terminal / screen parser は app output の terminal mode sequence（例: normal mouse + SGR mouse mode, `?1000h` / `?1006h` 相当）を tracking し、click helper は capture enabled が観測されていない場合に fail する。
+- もしくは explicit read-only structured event と terminal output assertion の両方で `mouse_capture_enabled` を確認する。
+- `click(row_selector)` は `rows_rendered` の rect から座標を選ぶが、raw SGR injection だけで成功扱いにしない。
+- assertion は `selection_changed` event、screen/actionbar/detail の secondary oracle、そして workflow action が発火していないことを組み合わせる。
+- これにより mouse selection E2E は面倒になるが、capture setup / coordinate mapping / event handling の user-visible path を分離して検証できる。
+
+---
+
+<!-- event: decision author: orchestrator at: 2026-06-13T14:40:42Z -->
+
+## Decision
+
+Coder first-slice review: changes requested before external review.
+
+The initial E2E harness direction is promising, but it does not yet satisfy the regression-prevention bar from this Ticket.
+
+Required changes sent to Coder:
+1. Mouse E2E must not pass solely by injecting raw SGR mouse bytes. Harness must track terminal mouse capture enable output (`?1000h` / `?1006h` equivalent) and fail `click(...)` / expose `expect_mouse_capture_enabled()` when capture was not observed.
+2. Production binary contamination must be reduced. The TUI JSONL observer currently appears to be available in normal builds via `YOI_TUI_TEST_EVENTS`; prefer explicit `e2e-test` feature/cfg gating so release/normal binary has the hook compiled out. Report if feature gating is too large.
+3. Quit latency E2E must wait for a real pending/background-work barrier at the moment of quit, not merely assert that `background_task_started` happened sometime earlier. Strengthen the scenario to prove Ctrl+C while pending work exists exits promptly.
+4. Update implementation_report and validation evidence after changes.
+
+Reason:
+- The mouse selection regression specifically needs to catch missing terminal mouse capture, which raw SGR injection can bypass.
+- The user explicitly requested a structure where E2E harness logic does not mix into the production binary.
+- The quit latency regression needs measured user-visible behavior under a synchronized pending-work condition, not a loose startup smoke test.
+
+---
