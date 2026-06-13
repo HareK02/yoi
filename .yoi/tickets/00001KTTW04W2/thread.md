@@ -536,3 +536,74 @@ Next planning/fix question:
 - 送る場合の payload を snapshot ではなく bounded event notice に縮小するか。
 
 Until this is resolved, current Companion progress notice implementation should be treated as defective and not closed.
+
+---
+
+<!-- event: decision author: orchestrator at: 2026-06-13T03:32:03Z -->
+
+## Decision
+
+Routing decision: implementation_ready（再設計）
+
+User decision:
+- Panel に依存しない形で進める。
+- Companion へ送るのは、Orchestrator の明示的な Ticket event 通知だけにする。
+- Panel periodic reload / snapshot feed / actionless mass notification は実装しない。
+
+Reason:
+- Reopen 後の不足点は、通知発生源と通知粒度だった。ユーザー判断により、発生源は Panel ではなく Orchestrator/Pod 側の Ticket event、粒度は snapshot ではなく event notice と確定した。
+- 既存 `Method::Notify { auto_run }` / idle no-run semantics は有効な基盤として残せる。
+- `auto_run:false` は Companion を起こさない weak notification として使うが、通知は history-backed context になるため、明示 Ticket event に限定する。
+- Relation blocker はなく、現在 visible child Pod はない。Orchestrator worktree は clean。
+
+IntentPacket:
+
+Intent:
+- Orchestrator が Ticket tool により明示的な Ticket event（state change / decision / plan / implementation_report / review / close など）を記録した時だけ、live/reachable Companion に bounded event notice を `Notify { auto_run:false }` で送る。
+
+Binding decisions / invariants:
+- Panel reload、Panel periodic refresh、Panel snapshot から Companion へ通知しない。
+- 長文 snapshot、Ticket list 全体、full thread、Pod output、diagnostics、provider error detail を送らない。
+- 通知は Orchestrator/Pod 側の明示 Ticket event に紐づく event notice に限定する。
+- `auto_run:false` を使い、idle Companion を起こさない。
+- missing/stopped/unreachable Companion を spawn/restore しない。
+- Companion authority を増やさない。
+- 通知は history-backed Notify として扱い、hidden context-only injection はしない。
+- LLM-facing framing が必要なら `resources/prompts` に置き、Rust は bounded runtime values の組み立てと rendering に留める。
+
+Requirements / acceptance criteria:
+- Ticket event 記録時に、live/reachable Companion が bounded event notice を weak Notify として受け取れる。
+- Panel を開いているだけでは Companion に通知が飛ばない。
+- 同一 event につき通知は高々一回で、periodic reload による再送がない。
+- 通知 payload は Ticket id/title/state、event kind、short summary、source path/ref 程度に限定される。
+- missing/stopped Companion で spawn/restore しない。
+- `auto_run:false` の idle no-run semantics は維持される。
+- focused tests で Panel 非依存、event-triggered delivery、no snapshot/feed、missing/stopped no-op、bounded/sensitive-safe content を確認する。
+- `nix build .#yoi` が通る。
+
+Next action:
+- branch `ticket/orchestrator-ticket-event-companion-notify` / worktree `/home/hare/Projects/yoi/.worktree/orchestrator-ticket-event-companion-notify` で sibling coder に実装を委譲する。
+
+---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-13T03:32:03Z from: planning to: ready reason: planning_ready field: state -->
+
+## State changed
+
+ユーザー判断により、通知発生源・粒度・非目標が確定したため implementation-ready とする。
+
+---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-13T03:32:03Z from: ready to: queued reason: user_authorized_queue field: state -->
+
+## State changed
+
+ユーザーが実装続行を明示したため、Orchestrator routing 対象として queued にする。
+
+---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-13T03:32:03Z from: queued to: inprogress reason: orchestrator_acceptance field: state -->
+
+## State changed
+
+Ticket body/thread、reopen decision、relation blockers、accepted plan、current Orchestrator workspace state、visible Pods を再確認した。未解決 blocker や missing planning decision は残っていないため、implementation side effect 前に `queued -> inprogress` acceptance を記録する。
