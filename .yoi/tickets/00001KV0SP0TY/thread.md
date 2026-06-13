@@ -163,3 +163,46 @@ Risks / notes:
 Decision: approved.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-13T19:01:55Z -->
+
+## Implementation report
+
+Integration outcome: merged and validated.
+
+- Implementation branch: `ticket-00001KV0SP0TY-remove-feature-hostauthority`
+- Implementation commits: `5549c50d feat: remove feature host authority API`, `3faf7d7b ticket: report host authority cleanup`
+- Review commit: `92e64bda ticket: approve host authority cleanup`
+- Orchestrator merge commit: `297e95ef merge: remove feature host authority`
+
+Reviewer result:
+- `approve`。feature-layer `HostAuthority` / `HostAuthorityRequest` / `HostAuthorityGrantSet`、grant/denial/install-report semantics、per-tool authority gates が削除され、renamed replacement authority layer は導入されていないことを確認済み。
+
+Orchestrator validation after merge:
+- `cargo test -p pod feature:: --lib`: PASS
+- `cargo test -p pod feature::builtin::task --lib`: PASS
+- `cargo test -p ticket`: PASS
+- `cargo fmt --check`: PASS
+- `git diff --check`: PASS
+- `cargo check --workspace --all-targets`: first attempt failed due to host disk full (`No space left on device`); after stopping HostAuthority child Pods and removing their child worktree/target, rerun PASS。
+
+Cleanup performed:
+- stopped `coder-00001KV0SP0TY-hostauthority` and `reviewer-00001KV0SP0TY-hostauthority`
+- removed child worktree `/home/hare/Projects/yoi/.worktree/remove-feature-hostauthority`
+- deleted branch `ticket-00001KV0SP0TY-remove-feature-hostauthority`
+
+Not run:
+- `nix build .#yoi`; skipped because dependencies / `Cargo.lock` / packaging/source filters were not changed and disk pressure was encountered during validation。
+
+Next:
+- mark Ticket done. Closure remains separate.
+
+---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-13T19:02:01Z from: inprogress to: done reason: merged_and_validated field: state -->
+
+## State changed
+
+Implementation branch was reviewed, approved, merged into the Orchestrator branch as `297e95ef`, and validated in the Orchestrator worktree. Focused pod/ticket tests, formatting, diff check, and `cargo check --workspace --all-targets` passed after cleanup freed disk space. Ticket implementation work is done; closure remains separate.
+
+---
