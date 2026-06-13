@@ -87,10 +87,41 @@ Escalate if:
 Ticket evidence、related E2E tickets、existing code map、Orchestrator worktree clean state を確認した。ユーザーが明示的に修正を依頼しており、blocking relation はない。実装 side effect の前に inprogress acceptance を記録する。
 
 ---
+<!-- event: implementation_report author: hare at: 2026-06-13T17:06:29Z -->
+
+## Implementation report
+
+Implemented scoped E2E tmp/runtime isolation for Ticket 00001KV0YK5S0.
+
+Files changed:
+- `tests/e2e/src/lib.rs`
+  - `FixtureWorkspace` now owns a `TempDir` under `target/e2e-tmp` and writes persistent scenario artifacts under `target/e2e-artifacts/<run-id>`.
+  - Each fixture creates isolated workspace, HOME, XDG data/state/config/runtime dirs and passes `XDG_RUNTIME_DIR` explicitly to all tested `yoi` subprocesses under `env_clear`.
+  - Fixture metadata records fixture root, workspace/home/XDG paths, runtime policy, env policy, and cleanup result.
+  - Cleanup snapshots the fixture tree into persistent artifacts, closes/removes the temp root, writes `cleanup.json`, and reports cleanup failure.
+- `tests/e2e/tests/panel.rs`
+  - Existing two Panel E2E tests now assert fixture path isolation, absence of host/runtime Pod marker leakage in rendered rows, and explicit fixture cleanup/removal after each scenario.
+
+Isolation/cleanup policy:
+- Tested `yoi` never inherits host env wholesale; fixture setup and Panel subprocesses use `env_clear` with an allowlist that includes only fixture HOME/XDG data/state/config/runtime plus test/runtime-specific variables.
+- `XDG_RUNTIME_DIR` is always a fixture-local runtime dir under the temporary fixture root.
+- Fixture-local Pod metadata markers (`workspace`, `workspace-orchestrator`) are created only inside fixture data home and panel rows assert no host/fixture runtime markers leak.
+- Artifacts persist outside the temp root in `target/e2e-artifacts`; cleanup snapshots selected fixture contents there before removing the temp root.
+
+Validation:
+- `cargo check -p yoi-e2e --all-targets --features e2e` — passed.
+- `cargo test -p yoi-e2e --features e2e --test panel -- --nocapture` — passed (2 tests).
+- `XDG_RUNTIME_DIR=/tmp/yoi-e2e-host-runtime-leak-test OPENAI_API_KEY=host-secret cargo test -p yoi-e2e --features e2e --test panel -- --nocapture` — passed (2 tests); artifacts show fixture `xdg_runtime_dir`, `host_xdg_runtime_dir_present: true`, and `cleanup_success: true`.
+- `YOI_E2E_BIN=target/debug/yoi cargo test -p yoi-e2e --features e2e --test panel -- --nocapture` — passed (2 tests).
+- `cargo fmt --check` — passed.
+- `git diff --check` — passed.
+
+Remaining gaps:
+- No known gaps within the delegated scope.
+
+---
 
 <!-- event: review author: orchestrator at: 2026-06-13T17:31:57Z status: approve -->
-
-## Review: approve
 
 ## Review: approve
 
