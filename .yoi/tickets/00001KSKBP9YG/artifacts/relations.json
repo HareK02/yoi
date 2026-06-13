@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "relations": [
+    {
+      "ticket_id": "00001KSKBP9YG",
+      "kind": "related",
+      "target": "00001KV0723PC",
+      "note": "Panel quit latency regression exposed need for measured PTY E2E, ready/barrier synchronization, and failure artifacts.",
+      "author": "orchestrator",
+      "at": "2026-06-13T13:56:37Z"
+    },
+    {
+      "ticket_id": "00001KSKBP9YG",
+      "kind": "related",
+      "target": "00001KV072V89",
+      "note": "Panel mouse selection regression exposed need for TUI/Panel PTY E2E with structured UI feedback and mouse input assertions.",
+      "author": "orchestrator",
+      "at": "2026-06-13T13:56:37Z"
+    }
+  ]
+}
