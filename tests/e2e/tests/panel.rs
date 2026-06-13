@@ -8,6 +8,7 @@ fn panel_mouse_click_selects_row_without_dispatching_action() -> yoi_e2e::Result
     let fixture = FixtureWorkspace::new(&binary)?;
     let mut panel = PanelHarness::spawn(fixture.panel_config(binary))?;
 
+    panel.expect_mouse_capture_enabled()?;
     let rows = panel.wait_for_rows(2)?;
     let selected = rows.selected.clone();
     let target = rows
@@ -40,19 +41,13 @@ fn panel_mouse_click_selects_row_without_dispatching_action() -> yoi_e2e::Result
 fn panel_ctrl_c_exits_promptly_after_background_barrier() -> yoi_e2e::Result<()> {
     let binary = yoi_binary();
     let fixture = FixtureWorkspace::new(&binary)?;
-    let mut panel = PanelHarness::spawn(fixture.panel_config(binary))?;
+    let mut panel =
+        PanelHarness::spawn(fixture.panel_config_holding_background_task(binary, "reload"))?;
 
     panel.wait_for("panel_ready", Duration::from_secs(5), |event| {
         event.event == "panel_ready"
     })?;
-    assert!(
-        panel
-            .events()?
-            .iter()
-            .any(|event| event.event == "background_task_started"),
-        "background task barrier was not observed; artifacts at {}",
-        panel.artifacts().dir.display()
-    );
+    panel.expect_background_task_pending("reload")?;
 
     let started = std::time::Instant::now();
     panel.press(KeyPress::CtrlC)?;

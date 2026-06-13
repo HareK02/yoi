@@ -264,6 +264,7 @@ impl PendingReload {
             }),
         );
         self.handle = Some(tokio::spawn(async move {
+            crate::e2e_observer::hold_background_task_if_requested("reload").await;
             load_multi_pod_snapshot(None, lifecycle_mode).await
         }));
         true

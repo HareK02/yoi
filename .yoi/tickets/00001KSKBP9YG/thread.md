@@ -219,3 +219,50 @@ Remaining gaps / risks:
 
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-06-13T15:00:29Z -->
+
+## Implementation report
+
+Follow-up implementation update for review-required changes:
+
+Mouse E2E false-positive prevention:
+- `PanelHarness` now tracks the PTY output for terminal mouse mode enable/disable escape sequences.
+- It requires both normal mouse tracking (`ESC[?1000h`, with disable `ESC[?1000l`) and SGR mouse mode (`ESC[?1006h`, with disable `ESC[?1006l`) to have been observed as currently enabled.
+- Added `PanelHarness::expect_mouse_capture_enabled()` and the Panel mouse E2E calls it before clicking.
+- `PanelHarness::click(...)` also fails with `MouseCaptureNotEnabled` if mouse capture has not been observed, so raw SGR mouse injection alone cannot make the test pass.
+
+Production binary contamination reduction:
+- Added explicit feature gates:
+  - `tui/e2e-test`
+  - `yoi/e2e-test = ["tui/e2e-test"]`
+- The `YOI_TUI_TEST_EVENTS` JSONL event path and the background-task hold seam are compiled only under `tui/e2e-test`.
+- Normal builds still type-check a no-op facade so call sites stay simple, but env-var observability/hold behavior is compiled out unless the feature is enabled.
+- E2E binary build command is now: `cargo build -p yoi --features e2e-test`.
+
+Quit latency barrier strengthening:
+- Added a feature-gated test-only seam `YOI_TUI_TEST_HOLD_BACKGROUND_TASK=reload` that holds the Panel reload task pending in the E2E binary until quit aborts it.
+- Added `PanelHarness::expect_background_task_pending("reload")`, which verifies that a `background_task_started` event exists and no matching `background_task_finished` or `background_task_aborted` event has superseded it.
+- The quit latency test now uses the hold seam and asserts pending reload work immediately before sending Ctrl+C through the PTY.
+
+Harness/artifact adjustment:
+- E2E fixture artifacts now persist under workspace `target/e2e-artifacts/...` instead of package-local temporary dirs, so failure artifacts remain inspectable.
+
+Validation after update:
+- `cargo fmt --check` — passed.
+- `cargo build -p yoi --features e2e-test` — passed.
+- `YOI_E2E_BIN=/home/hare/Projects/yoi/.worktree/e2e-harness/target/debug/yoi cargo test -p yoi-e2e --features e2e --test panel -- --nocapture` — passed (2 tests).
+- `git diff --check` — passed.
+- `cargo check -p tui --all-targets` — passed.
+- `cargo check -p yoi --all-targets` — passed.
+- `cargo check -p tui --all-targets --features e2e-test` — passed.
+- `cargo check -p yoi --all-targets --features e2e-test` — passed.
+- `cargo check -p yoi-e2e --all-targets --features e2e` — passed.
+
+Remaining gaps / risks:
+- The E2E harness remains Unix PTY based.
+- The screen artifact remains raw PTY output, not a parsed terminal snapshot.
+- The test-only pending-task hold intentionally changes timing only for the `e2e-test` binary; it is not compiled into normal builds.
+
+
+---

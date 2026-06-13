@@ -9,16 +9,17 @@ use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tempfile::TempDir;
 
 const DEFAULT_WAIT: Duration = Duration::from_secs(5);
 const DEFAULT_EXIT_WAIT: Duration = Duration::from_millis(1500);
+static FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub type Result<T> = std::result::Result<T, HarnessError>;
 
@@ -37,6 +38,9 @@ pub enum HarnessError {
         artifacts: PanelArtifacts,
     },
     MissingBinary(PathBuf),
+    MouseCaptureNotEnabled {
+        artifacts: PanelArtifacts,
+    },
     Protocol(String),
 }
 
@@ -62,8 +66,13 @@ impl std::fmt::Display for HarnessError {
             ),
             Self::MissingBinary(path) => write!(
                 f,
-                "missing yoi binary {}; run `cargo build -p yoi` or set YOI_E2E_BIN",
+                "missing yoi binary {}; run `cargo build -p yoi --features e2e-test` or set YOI_E2E_BIN",
                 path.display()
+            ),
+            Self::MouseCaptureNotEnabled { artifacts } => write!(
+                f,
+                "terminal mouse capture was not observed before mouse input; artifacts at {}",
+                artifacts.dir.display()
             ),
             Self::Protocol(message) => write!(f, "protocol error: {message}"),
         }
@@ -93,6 +102,7 @@ pub struct PanelHarnessConfig {
     pub xdg_state_home: PathBuf,
     pub xdg_config_home: PathBuf,
     pub terminal_size: (u16, u16),
+    pub hold_background_task: Option<String>,
     pub artifacts_dir: PathBuf,
 }
 
@@ -190,6 +200,7 @@ impl PanelHarness {
                     "columns": config.terminal_size.0,
                     "rows": config.terminal_size.1,
                 },
+                "hold_background_task": config.hold_background_task,
             }))?,
         )?;
 
@@ -212,6 +223,9 @@ impl PanelHarness {
             .stdin(Stdio::from(slave_for_stdin))
             .stdout(Stdio::from(slave_for_stdout))
             .stderr(Stdio::from(slave));
+        if let Some(task) = &config.hold_background_task {
+            command.env("YOI_TUI_TEST_HOLD_BACKGROUND_TASK", task);
+        }
         let child = command.spawn()?;
 
         let output = Arc::new(Mutex::new(Vec::new()));
@@ -298,7 +312,58 @@ impl PanelHarness {
         serde_json::from_value(event.data).map_err(HarnessError::from)
     }
 
+    pub fn expect_mouse_capture_enabled(&mut self) -> Result<()> {
+        let start = Instant::now();
+        loop {
+            if self.mouse_capture_enabled() {
+                return Ok(());
+            }
+            if start.elapsed() >= DEFAULT_WAIT {
+                self.flush_output_artifact()?;
+                return Err(HarnessError::MouseCaptureNotEnabled {
+                    artifacts: self.artifacts.clone(),
+                });
+            }
+            if let Some(status) = self.child.try_wait()? {
+                self.flush_output_artifact()?;
+                return Err(HarnessError::Protocol(format!(
+                    "process exited with {status} before mouse capture was enabled"
+                )));
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    pub fn expect_background_task_pending(&mut self, task: &str) -> Result<()> {
+        let start = Instant::now();
+        loop {
+            if background_task_is_pending(&self.events()?, task) {
+                return Ok(());
+            }
+            if start.elapsed() >= DEFAULT_WAIT {
+                self.flush_output_artifact()?;
+                return Err(HarnessError::Timeout {
+                    what: format!("background task {task:?} pending"),
+                    artifacts: self.artifacts.clone(),
+                });
+            }
+            if let Some(status) = self.child.try_wait()? {
+                self.flush_output_artifact()?;
+                return Err(HarnessError::Protocol(format!(
+                    "process exited with {status} before background task {task:?} was pending"
+                )));
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     pub fn click(&mut self, row: &RenderedPanelRow) -> Result<()> {
+        if !self.mouse_capture_enabled() {
+            self.flush_output_artifact()?;
+            return Err(HarnessError::MouseCaptureNotEnabled {
+                artifacts: self.artifacts.clone(),
+            });
+        }
         let x = row.rect.x.saturating_add(1);
         let y = row.rect.y;
         self.write_input(
@@ -332,9 +397,7 @@ impl PanelHarness {
         loop {
             if let Some(status) = self.child.try_wait()? {
                 self.flush_output_artifact()?;
-                if let Some(reader) = self.reader.take() {
-                    let _ = reader.join();
-                }
+                let _ = self.reader.take();
                 return Ok(status);
             }
             if start.elapsed() >= timeout {
@@ -394,6 +457,13 @@ impl PanelHarness {
         Ok(())
     }
 
+    fn mouse_capture_enabled(&self) -> bool {
+        self.output
+            .lock()
+            .map(|output| output_has_enabled_mouse_capture(&output))
+            .unwrap_or(false)
+    }
+
     fn flush_output_artifact(&self) -> Result<()> {
         if let Ok(output) = self.output.lock() {
             fs::write(&self.artifacts.output_log, &*output)?;
@@ -409,15 +479,13 @@ impl Drop for PanelHarness {
             let _ = self.child.wait();
         }
         let _ = self.flush_output_artifact();
-        if let Some(reader) = self.reader.take() {
-            let _ = reader.join();
-        }
+        let _ = self.reader.take();
     }
 }
 
 #[derive(Debug)]
 pub struct FixtureWorkspace {
-    _temp: TempDir,
+    pub root: PathBuf,
     pub workspace: PathBuf,
     pub home: PathBuf,
     pub xdg_data_home: PathBuf,
@@ -428,8 +496,22 @@ pub struct FixtureWorkspace {
 
 impl FixtureWorkspace {
     pub fn new(binary: &Path) -> Result<Self> {
-        let temp = tempfile::Builder::new().prefix("yoi-e2e-").tempdir()?;
-        let root = temp.path();
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .ok_or_else(|| {
+                HarnessError::Protocol("could not resolve workspace root for artifacts".to_owned())
+            })?
+            .to_path_buf();
+        let root = workspace_root
+            .join("target")
+            .join("e2e-artifacts")
+            .join(format!(
+                "{}-{}-{}",
+                std::process::id(),
+                now_ms(),
+                FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed)
+            ));
         let workspace = root.join("workspace");
         let home = root.join("home");
         let xdg_data_home = root.join("data");
@@ -485,7 +567,7 @@ impl FixtureWorkspace {
             "Planning E2E Ticket",
         )?;
         Ok(Self {
-            _temp: temp,
+            root,
             workspace,
             home,
             xdg_data_home,
@@ -504,8 +586,19 @@ impl FixtureWorkspace {
             xdg_state_home: self.xdg_state_home.clone(),
             xdg_config_home: self.xdg_config_home.clone(),
             terminal_size: (100, 32),
+            hold_background_task: None,
             artifacts_dir: self.artifacts_dir.clone(),
         }
+    }
+
+    pub fn panel_config_holding_background_task(
+        &self,
+        binary: PathBuf,
+        task: impl Into<String>,
+    ) -> PanelHarnessConfig {
+        let mut config = self.panel_config(binary);
+        config.hold_background_task = Some(task.into());
+        config
     }
 }
 
@@ -626,6 +719,45 @@ fn write_blocking_pod_metadata(data_home: &Path, pod_name: &str) -> Result<()> {
     fs::create_dir_all(&dir)?;
     fs::write(dir.join("metadata.json"), b"not valid metadata for e2e\n")?;
     Ok(())
+}
+
+fn output_has_enabled_mouse_capture(output: &[u8]) -> bool {
+    mouse_mode_enabled(output, b"\x1b[?1000h", b"\x1b[?1000l")
+        && mouse_mode_enabled(output, b"\x1b[?1006h", b"\x1b[?1006l")
+}
+
+fn mouse_mode_enabled(output: &[u8], enable: &[u8], disable: &[u8]) -> bool {
+    let last_enable = last_subsequence_index(output, enable);
+    let last_disable = last_subsequence_index(output, disable);
+    match (last_enable, last_disable) {
+        (Some(enable), Some(disable)) => enable > disable,
+        (Some(_), None) => true,
+        _ => false,
+    }
+}
+
+fn last_subsequence_index(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .rposition(|window| window == needle)
+}
+
+fn background_task_is_pending(events: &[HarnessEvent], task: &str) -> bool {
+    let mut pending = false;
+    for event in events {
+        if event.data.get("task").and_then(Value::as_str) != Some(task) {
+            continue;
+        }
+        match event.event.as_str() {
+            "background_task_started" => pending = true,
+            "background_task_finished" | "background_task_aborted" => pending = false,
+            _ => {}
+        }
+    }
+    pending
 }
 
 fn now_ms() -> u128 {
