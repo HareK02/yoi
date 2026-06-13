@@ -63,3 +63,111 @@ Acceptance refinement:
 - Failure artifact に scenario step、last observed events、screen snapshot、timing、binary path、workspace/runtime dirs が含まれる。
 
 ---
+
+<!-- event: decision author: orchestrator at: 2026-06-13T14:16:24Z -->
+
+## Decision
+
+Routing decision: implementation_ready
+
+Reason:
+- ユーザーが E2E harness を 1 Ticket として扱い、Playwright-like declarative API、structured feedback、production binary 非混入を前提に進めることを明示した。
+- Ticket body は旧名/旧構成を含むが、thread decisions により現在の binding direction は明確化済み: Pod subprocess/protocol E2E と TUI/Panel PTY E2E を同じ harness Ticket の phase として扱う。
+- 直近の Panel mouse selection / Panel Quit latency の regression から、実プロセス・実 PTY・structured event feedback・failure artifact を最小スライスに含める必要がある。
+- `TicketRelationQuery` では durable blocker はなく、関連 Ticket は context link のみ。
+- Orchestrator worktree は clean。implementation side effect は state acceptance 後に dedicated child worktree で行う。
+
+Evidence checked:
+- Ticket body / thread decisions。
+- relation records: `00001KV072V89` / `00001KV0723PC` への related links。
+- orchestration plan records: なし。
+- current workspace state: Orchestrator worktree clean、queued/inprogress work なし、implementation child Pods なし。
+- project context: AGENTS guidance の E2E 未設計、prompt/resource boundary、production binary contamination 回避方針、直近 Panel validation failure records。
+
+IntentPacket:
+
+Intent:
+- Yoi の E2E testing foundation を、実プロセス spawn と TUI/Panel PTY automation の両方を扱える opt-in harness として導入する。
+- 最初の vertical slice は、Playwright-like declarative API、structured UI feedback、failure artifact、Panel mouse selection / Panel quit latency の regression scenario を実装できる形にする。
+
+Binding decisions / invariants:
+- E2E harness は independent crate / test surface とし、normal release / normal `yoi` binary に harness logic を混ぜない。
+- 本番 binary 側に必要な変更は opt-in read-only observability hook に限定する。UI action/state mutation を test hook で bypass しない。
+- 実入力は PTY 経由で送る。structured event は synchronization / assertion / artifact のための観測情報であり、authority channel ではない。
+- fixed sleep + fixed input だけの blind script を acceptance にしない。
+- Pod/Ticket authority、prompt/resource boundary、public runtime behavior を E2E 都合で歪めない。
+
+Requirements / acceptance criteria:
+- E2E author が Rust code で `spawn` / `wait_for` / `click` / `press` / `expect_*` / `within` を使って scenario を宣言的に書ける。
+- Opt-in command（例: `cargo test -p e2e --features e2e` または同等）で通常 CI 既定から分離される。
+- TUI/Panel test は panel ready / rows rendered / selection changed / background task / quit events など structured feedback を待ってから PTY input を送る。
+- Panel mouse selection regression と Panel quit latency regression の少なくとも skeleton または minimal passing scenario が declarative harness 上で表現される。
+- Failure artifact として event log、input log、screen dump、timing、binary path、workspace/runtime dirs が残る。
+- Production binary contamination がないこと、または opt-in hook が normal runtime で無効/到達不能であることを reviewer が確認できる。
+
+Implementation latitude:
+- `tests/e2e/` crate か `crates/e2e_harness` + integration tests のどちらに置くかは Coder が codebase constraints を見て選んでよい。ただし normal build/release contamination は避ける。
+- PTY crate、terminal parser、event JSONL format、fixture workspace builder の具体設計は Coder が選んでよい。
+- 最初の slice は full provider E2E ではなく、Panel/TUI harness と minimal process lifecycle / artifact foundation を優先してよい。
+- 既存旧名 `INSOMNIA_*` / `pod` references は現在の `yoi` / config surface に合わせて整理してよい。
+
+Escalate if:
+- read-only observability hook では足りず、production UI action path を test-only command channel で直接操作したくなる場合。
+- normal release binary / normal CLI surface に test-only options を露出させる必要がある場合。
+- workspace structure、Cargo package layout、Nix/package source filter に大きな変更が必要になる場合。
+- Provider stub / Pod protocol E2E まで同時に広げないと Panel slice が進められない場合。
+
+Validation:
+- focused E2E harness tests / example scenarios。
+- `cargo fmt --check`。
+- `git diff --check`。
+- 変更範囲に応じて `cargo check --workspace --all-targets` または narrower package checks。
+- 新 E2E command が opt-in で実行可能であることを report する。
+
+Current code map:
+- `crates/yoi` / CLI launch path: hidden/test-only flag injection の候補。
+- `crates/tui/src/multi_pod.rs`: Panel events / observable state emission の候補。
+- `tests/e2e/` or new harness crate: declarative scenario API / PTY runner / artifact collector。
+- root `Cargo.toml` / package metadata: opt-in package registration と release contamination check。
+
+Critical risks / reviewer focus:
+- Harness code が production binary に混ざっていないこと。
+- Observability hook が read-only で、input/action path を bypass していないこと。
+- Test が fixed sleep 依存ではなく structured feedback / timeouts / artifacts を持つこと。
+- Panel mouse / quit latency regression が今後「unit test だけで done」にならない程度の user-visible path を cover すること。
+
+---
+
+<!-- event: intake_summary author: orchestrator at: 2026-06-13T14:16:54Z -->
+
+## Intake summary
+
+ユーザー確認により、既存 E2E harness Ticket は Pod subprocess E2E と TUI/Panel PTY E2E を一つの実装対象として扱う。Playwright-like declarative API、independent opt-in crate、production binary 非混入、read-only structured observability、PTY input、failure artifact、Panel mouse / quit latency regression scenario が受け入れ方向として明確化済み。
+
+---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-13T14:16:54Z from: planning to: ready reason: user_authorized_e2e_harness_implementation field: state -->
+
+## State changed
+
+Ticket planning が完了しました。state planning -> ready。
+
+
+---
+
+<!-- event: state_changed author: "yoi ticket" at: 2026-06-13T14:17:34Z from: ready to: queued reason: queued field: state -->
+
+## State changed
+
+Ticket を `yoi ticket` が queued にしました。
+
+
+---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-13T14:17:40Z from: queued to: inprogress reason: orchestrator_acceptance_after_user_authorization field: state -->
+
+## State changed
+
+ユーザーが明示的に inprogress 化して進めることを承認した。Ticket evidence / relation records / OrchestrationPlan accepted plan / Orchestrator worktree clean state を確認済みで、blocking relation はない。Implementation side effect の前に state を inprogress として記録する。
+
+---
