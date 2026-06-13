@@ -68,6 +68,8 @@ The following workflows are advertised resident. When a user request matches one
 
 pod_orchestration_guidance_section = "{% include \"$yoi/common/pod-orchestration\" %}"
 
+ticket_event_companion_notice = "{% include \"$yoi/pod/ticket_event_companion_notice\" %}"
+
 spawn_pod_tool_description = """\
 Spawn a new Pod process to work on a delegated task. The spawner's write scope is reduced by the scope passed here; the spawned Pod receives its own socket and starts running `task` immediately. The spawned Pod outlives the spawner's current turn and can be contacted again through its socket path.
 

@@ -95,6 +95,8 @@ pub enum PodPrompt {
     /// Trailing Pod orchestration guidance, appended when registered tools
     /// include Pod-management capabilities.
     PodOrchestrationGuidanceSection,
+    /// Weak Companion Notify payload for explicit Orchestrator Ticket events.
+    TicketEventCompanionNotice,
     /// LLM-facing description for the SpawnPod tool, including discovered
     /// profile selectors.
     SpawnPodToolDescription,
@@ -115,6 +117,7 @@ impl PodPrompt {
             Self::ResidentKnowledgeSection => "resident_knowledge_section",
             Self::ResidentWorkflowsSection => "resident_workflows_section",
             Self::PodOrchestrationGuidanceSection => "pod_orchestration_guidance_section",
+            Self::TicketEventCompanionNotice => "ticket_event_companion_notice",
             Self::SpawnPodToolDescription => "spawn_pod_tool_description",
         }
     }
@@ -135,6 +138,7 @@ impl PodPrompt {
         PodPrompt::ResidentKnowledgeSection,
         PodPrompt::ResidentWorkflowsSection,
         PodPrompt::PodOrchestrationGuidanceSection,
+        PodPrompt::TicketEventCompanionNotice,
         PodPrompt::SpawnPodToolDescription,
     ];
 
@@ -151,6 +155,7 @@ impl PodPrompt {
         "resident_knowledge_section",
         "resident_workflows_section",
         "pod_orchestration_guidance_section",
+        "ticket_event_companion_notice",
         "spawn_pod_tool_description",
     ];
 }

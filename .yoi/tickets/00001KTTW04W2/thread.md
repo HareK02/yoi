@@ -514,3 +514,268 @@ Non-blocking risk:
 - Added `minijinja` dependency to `crates/tui`; it is already used elsewhere in the workspace, and `Cargo.lock` / `package.nix` were updated with passing Nix build.
 
 ---
+
+---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-13T02:37:58Z from: closed to: planning reason: reopen_implementation_mismatch field: state -->
+
+## State changed
+
+実運用で、実装が Ticket の意図を逸脱していることが確認されたため reopen する。
+
+Reopen reason:
+- 現実の挙動は、Panel を開いているだけで periodic reload に連動して Companion へ progress notice を繰り返し送る形になっている。
+- Ticket は Orchestrator progress を Companion に共有することを求めていたが、Panel を actionless な notification feed source にすること、長文/スナップショット的 progress notice を Panel refresh ごとに送ることは要求していない。
+- `auto_run: false` は idle Pod を起こさないだけで、Notify は Companion history/model context に入るため、通知 spam / context 汚染として扱うべきだった。
+- Progress notice の発生源は Panel の定期 reload ではなく、Pod/Orchestrator の明示的な進捗イベント、または明示 user action に紐づくべきである。
+
+Next planning/fix question:
+- 既存 `Method::Notify { auto_run }` 互換部分は残すか。
+- Panel reload から Companion への automatic dispatch を削除または default-off にするか。
+- Orchestrator/Pod 起点でどの明示イベントだけを Companion に通知するか。
+- 送る場合の payload を snapshot ではなく bounded event notice に縮小するか。
+
+Until this is resolved, current Companion progress notice implementation should be treated as defective and not closed.
+
+---
+
+<!-- event: decision author: orchestrator at: 2026-06-13T03:32:03Z -->
+
+## Decision
+
+Routing decision: implementation_ready（再設計）
+
+User decision:
+- Panel に依存しない形で進める。
+- Companion へ送るのは、Orchestrator の明示的な Ticket event 通知だけにする。
+- Panel periodic reload / snapshot feed / actionless mass notification は実装しない。
+
+Reason:
+- Reopen 後の不足点は、通知発生源と通知粒度だった。ユーザー判断により、発生源は Panel ではなく Orchestrator/Pod 側の Ticket event、粒度は snapshot ではなく event notice と確定した。
+- 既存 `Method::Notify { auto_run }` / idle no-run semantics は有効な基盤として残せる。
+- `auto_run:false` は Companion を起こさない weak notification として使うが、通知は history-backed context になるため、明示 Ticket event に限定する。
+- Relation blocker はなく、現在 visible child Pod はない。Orchestrator worktree は clean。
+
+IntentPacket:
+
+Intent:
+- Orchestrator が Ticket tool により明示的な Ticket event（state change / decision / plan / implementation_report / review / close など）を記録した時だけ、live/reachable Companion に bounded event notice を `Notify { auto_run:false }` で送る。
+
+Binding decisions / invariants:
+- Panel reload、Panel periodic refresh、Panel snapshot から Companion へ通知しない。
+- 長文 snapshot、Ticket list 全体、full thread、Pod output、diagnostics、provider error detail を送らない。
+- 通知は Orchestrator/Pod 側の明示 Ticket event に紐づく event notice に限定する。
+- `auto_run:false` を使い、idle Companion を起こさない。
+- missing/stopped/unreachable Companion を spawn/restore しない。
+- Companion authority を増やさない。
+- 通知は history-backed Notify として扱い、hidden context-only injection はしない。
+- LLM-facing framing が必要なら `resources/prompts` に置き、Rust は bounded runtime values の組み立てと rendering に留める。
+
+Requirements / acceptance criteria:
+- Ticket event 記録時に、live/reachable Companion が bounded event notice を weak Notify として受け取れる。
+- Panel を開いているだけでは Companion に通知が飛ばない。
+- 同一 event につき通知は高々一回で、periodic reload による再送がない。
+- 通知 payload は Ticket id/title/state、event kind、short summary、source path/ref 程度に限定される。
+- missing/stopped Companion で spawn/restore しない。
+- `auto_run:false` の idle no-run semantics は維持される。
+- focused tests で Panel 非依存、event-triggered delivery、no snapshot/feed、missing/stopped no-op、bounded/sensitive-safe content を確認する。
+- `nix build .#yoi` が通る。
+
+Next action:
+- branch `ticket/orchestrator-ticket-event-companion-notify` / worktree `/home/hare/Projects/yoi/.worktree/orchestrator-ticket-event-companion-notify` で sibling coder に実装を委譲する。
+
+---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-13T03:32:03Z from: planning to: ready reason: planning_ready field: state -->
+
+## State changed
+
+ユーザー判断により、通知発生源・粒度・非目標が確定したため implementation-ready とする。
+
+---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-13T03:32:03Z from: ready to: queued reason: user_authorized_queue field: state -->
+
+## State changed
+
+ユーザーが実装続行を明示したため、Orchestrator routing 対象として queued にする。
+
+---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-13T03:32:03Z from: queued to: inprogress reason: orchestrator_acceptance field: state -->
+
+## State changed
+
+Ticket body/thread、reopen decision、relation blockers、accepted plan、current Orchestrator workspace state、visible Pods を再確認した。未解決 blocker や missing planning decision は残っていないため、implementation side effect 前に `queued -> inprogress` acceptance を記録する。
+
+---
+
+<!-- event: plan author: orchestrator at: 2026-06-13T03:33:09Z -->
+
+## Plan
+
+Implementation worktree created and coder delegated.
+
+- Ticket: `00001KTTW04W2`
+- Branch: `ticket/orchestrator-ticket-event-companion-notify`
+- Worktree: `/home/hare/Projects/yoi/.worktree/orchestrator-ticket-event-companion-notify`
+- Coder Pod: `yoi-coder-event-companion-notify`
+- Scope: write child worktree only; read child worktree plus minimal non-recursive runtime-root read required by spawn validation。
+- Task: implement Panel-independent Companion notification for explicit Orchestrator/Pod Ticket events only, using bounded `Notify { auto_run:false }` event notices; do not reintroduce Panel periodic reload/snapshot feed.
+
+---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-13T04:09:50Z -->
+
+## Implementation report
+
+Coder completed implementation and prompt-resource fix.
+
+Coder Pod:
+- `yoi-coder-event-companion-notify`
+
+Implementation branch/worktree:
+- Branch: `ticket/orchestrator-ticket-event-companion-notify`
+- Worktree: `/home/hare/Projects/yoi/.worktree/orchestrator-ticket-event-companion-notify`
+- Implementation commits:
+  - `465ef100 feat: notify Companion on Orchestrator ticket events`
+  - `6f8571f7 fix: render ticket event notice from prompt resource`
+- Worktree status: clean
+
+Changed surfaces:
+- `crates/pod/src/controller.rs`
+- `crates/pod/src/discovery.rs`
+- `crates/pod/src/lib.rs`
+- `crates/pod/src/pod.rs`
+- `crates/pod/src/prompt/catalog.rs`
+- `crates/pod/src/ticket_event_notify.rs`
+- `resources/prompts/internal.toml`
+- `resources/prompts/pod/ticket_event_companion_notice.md`
+
+Implementation summary:
+- Added Orchestrator-role Ticket tool post-call hook for explicit Ticket event tools.
+- Event tools include state/comment/plan/decision/implementation_report/review/close paths; passive reads/lists are ignored.
+- The hook sends a bounded event-scoped weak notification to live/reachable Companion peer via `Notify { auto_run:false }`.
+- missing/stopped/unreachable Companion is no-op; no spawn/restore.
+- Panel reload/open/periodic refresh path is not used and Panel progress feed remains removed.
+- Ticket event notice framing is prompt-resource backed by `resources/prompts/pod/ticket_event_companion_notice.md`; Rust fills bounded runtime values and renders the resource.
+- Companion authority is not expanded.
+
+Orchestrator-verified validation:
+- `cargo test -p pod ticket_event_notify`: pass。
+- `cargo test -p pod ticket_event`: pass。
+- `cargo test -p pod weak_notify_to_live_peer_uses_notify_without_auto_run_and_noops_when_missing`: pass。
+- `cargo test -p tui companion_progress`: pass（0 matched; Panel feed tests remain absent）。
+- `rg` check confirmed no `companion_progress` / progress feed / `send_weak_notify` references in `crates/tui/src/multi_pod.rs`。
+- `cargo fmt --check`: pass。
+- `git diff --check orchestration/yoi-orchestrator...HEAD`: pass。
+- `cargo run -p yoi -- ticket doctor`: `doctor: ok`。
+- `nix build .#yoi`: pass。
+
+Next:
+- Spawn read-only reviewer for the Panel-independent event-triggered design, prompt-resource boundary, weak notify semantics, no snapshot feed, and authority/no-spawn invariants.
+
+---
+
+<!-- event: review author: reviewer:yoi-reviewer-event-companion-notify at: 2026-06-13T04:20:19Z result: approve -->
+
+## Review: approve
+
+Review target:
+- Worktree: `/home/hare/Projects/yoi/.worktree/orchestrator-ticket-event-companion-notify`
+- Commits:
+  - `465ef100 feat: notify Companion on Orchestrator ticket events`
+  - `6f8571f7 fix: render ticket event notice from prompt resource`
+
+Evidence:
+- Panel 非依存: 通知処理は `crates/pod/src/ticket_event_notify.rs` の Pod/Orchestrator 側 hook として追加されており、Panel reload/open/periodic refresh 経路ではない。
+- `crates/tui/src/multi_pod.rs` に `send_weak_notify` / `ticket_event` / `companion_progress` の新規参照がない。
+- hook 登録は Orchestrator role 判定と lifecycle Ticket tool access に gated されている。
+- 対象は `TicketComment` / `TicketReview` / `TicketWorkflowState` / `TicketIntakeReady` / `TicketClose` の explicit mutating Ticket event のみで、passive read/list/show/query では発火しない。
+- tool error 時は通知しない。
+- payload は ticket id/title/state、event kind、summary、path/ref に限定され、full thread、Ticket snapshot、Pod output、diagnostics、provider error detail、長大 log を含めない。
+- LLM-facing notice framing は `resources/prompts/pod/ticket_event_companion_notice.md` と `resources/prompts/internal.toml` / `PodPrompt::TicketEventCompanionNotice` に置かれており、Rust 側は bounded runtime values を埋める。
+- `send_weak_notify_to_live_peer` は live/reachable peer にだけ `Method::Notify { auto_run:false }` を送り、missing/unreachable は no-op。spawn/restore 経路はない。
+- Companion authority expansion は見当たらない。
+- scheduler/feed loop/polling/periodic snapshot は追加されていない。
+
+Reviewer-run validation:
+- `cargo test -p pod ticket_event_notify -- --nocapture`: pass。
+- `cargo test -p pod weak_notify_to_live_peer_uses_notify_without_auto_run_and_noops_when_missing -- --nocapture`: pass。
+- `cargo test -p tui companion_progress -- --nocapture`: pass（0 matched）。
+- `cargo test -p pod ticket_event -- --nocapture`: pass。
+- `git diff --check orchestration/yoi-orchestrator...HEAD`: pass。
+- `git status --short --branch`: clean。
+- focused `rg` checks for Panel/feed references and notify hook references。
+
+Non-blocking note:
+- `cargo test -p tui companion_progress` は 0 matched。Panel 非通知は TUI diff がないことと `rg` で確認している。将来の回帰防止には Panel reload/open が Companion event notify を呼ばない明示 test を追加してもよい。
+- Reviewer は read-only 方針を優先して `nix build .#yoi` を再実行せず、Orchestrator の pass 証跡を採用した。
+
+---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-13T04:21:40Z -->
+
+## Implementation report
+
+Integration completed in the Orchestrator workspace.
+
+Integrated implementation:
+- Ticket: `00001KTTW04W2`
+- Implementation branch: `ticket/orchestrator-ticket-event-companion-notify`
+- Implementation commits:
+  - `465ef100 feat: notify Companion on Orchestrator ticket events`
+  - `6f8571f7 fix: render ticket event notice from prompt resource`
+- Reviewer result: approve, no blockers
+- Orchestrator merge commit: `2e5a60f4 merge: companion ticket event notify`
+- Integration target: `orchestration/yoi-orchestrator`
+
+Post-integration validation from Orchestrator worktree:
+- `cargo test -p pod ticket_event_notify`: pass。
+- `cargo test -p pod ticket_event`: pass。
+- `cargo test -p pod weak_notify_to_live_peer_uses_notify_without_auto_run_and_noops_when_missing`: pass。
+- `cargo test -p tui companion_progress`: pass（0 matched; Panel feed remains absent）。
+- `rg` check confirmed no `companion_progress` / progress feed / `send_weak_notify` references in `crates/tui/src/multi_pod.rs`。
+- `cargo fmt --check`: pass。
+- `git diff --check HEAD~1..HEAD`: pass。
+- `./result/bin/yoi ticket doctor`: `doctor: ok`。
+- `nix build .#yoi`: pass。
+
+Behavior now:
+- Panel reload/open/periodic refresh does not send Companion notifications。
+- Orchestrator-role lifecycle Ticket tool post-call events can send bounded weak notifications to live/reachable Companion peer only。
+- Passive Ticket reads/lists/show/query do not notify。
+- missing/stopped/unreachable Companion remains no-op; no spawn/restore。
+- LLM-facing event notice framing is prompt-resource backed。
+
+---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-13T04:21:40Z from: inprogress to: done reason: implementation_merged_and_validated field: state -->
+
+## State changed
+
+Implementation was merged into the Orchestrator branch, reviewer approved with no blockers, and post-integration validation passed. Cleanup and closure will be recorded next.
+
+---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-13T04:22:26Z -->
+
+## Implementation report
+
+Cleanup completed.
+
+- Stopped coder Pod: `yoi-coder-event-companion-notify`
+- Stopped reviewer Pod: `yoi-reviewer-event-companion-notify`
+- Removed child worktree: `/home/hare/Projects/yoi/.worktree/orchestrator-ticket-event-companion-notify`
+- Deleted implementation branch: `ticket/orchestrator-ticket-event-companion-notify`
+- Orchestrator worktree status after cleanup: clean
+
+Cleanup was limited to child implementation worktree/branch and related child Pods. Root/original workspace was not used as an implementation target.
+
+---
+
+<!-- event: closed author: orchestrator at: 2026-06-13T04:22:26Z -->
+
+## Closed
+
+Resolution written to `resolution.md`.
