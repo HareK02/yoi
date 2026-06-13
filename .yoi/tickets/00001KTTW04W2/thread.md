@@ -674,3 +674,40 @@ Orchestrator-verified validation:
 
 Next:
 - Spawn read-only reviewer for the Panel-independent event-triggered design, prompt-resource boundary, weak notify semantics, no snapshot feed, and authority/no-spawn invariants.
+
+---
+
+<!-- event: review author: reviewer:yoi-reviewer-event-companion-notify at: 2026-06-13T04:20:19Z result: approve -->
+
+## Review: approve
+
+Review target:
+- Worktree: `/home/hare/Projects/yoi/.worktree/orchestrator-ticket-event-companion-notify`
+- Commits:
+  - `465ef100 feat: notify Companion on Orchestrator ticket events`
+  - `6f8571f7 fix: render ticket event notice from prompt resource`
+
+Evidence:
+- Panel 非依存: 通知処理は `crates/pod/src/ticket_event_notify.rs` の Pod/Orchestrator 側 hook として追加されており、Panel reload/open/periodic refresh 経路ではない。
+- `crates/tui/src/multi_pod.rs` に `send_weak_notify` / `ticket_event` / `companion_progress` の新規参照がない。
+- hook 登録は Orchestrator role 判定と lifecycle Ticket tool access に gated されている。
+- 対象は `TicketComment` / `TicketReview` / `TicketWorkflowState` / `TicketIntakeReady` / `TicketClose` の explicit mutating Ticket event のみで、passive read/list/show/query では発火しない。
+- tool error 時は通知しない。
+- payload は ticket id/title/state、event kind、summary、path/ref に限定され、full thread、Ticket snapshot、Pod output、diagnostics、provider error detail、長大 log を含めない。
+- LLM-facing notice framing は `resources/prompts/pod/ticket_event_companion_notice.md` と `resources/prompts/internal.toml` / `PodPrompt::TicketEventCompanionNotice` に置かれており、Rust 側は bounded runtime values を埋める。
+- `send_weak_notify_to_live_peer` は live/reachable peer にだけ `Method::Notify { auto_run:false }` を送り、missing/unreachable は no-op。spawn/restore 経路はない。
+- Companion authority expansion は見当たらない。
+- scheduler/feed loop/polling/periodic snapshot は追加されていない。
+
+Reviewer-run validation:
+- `cargo test -p pod ticket_event_notify -- --nocapture`: pass。
+- `cargo test -p pod weak_notify_to_live_peer_uses_notify_without_auto_run_and_noops_when_missing -- --nocapture`: pass。
+- `cargo test -p tui companion_progress -- --nocapture`: pass（0 matched）。
+- `cargo test -p pod ticket_event -- --nocapture`: pass。
+- `git diff --check orchestration/yoi-orchestrator...HEAD`: pass。
+- `git status --short --branch`: clean。
+- focused `rg` checks for Panel/feed references and notify hook references。
+
+Non-blocking note:
+- `cargo test -p tui companion_progress` は 0 matched。Panel 非通知は TUI diff がないことと `rg` で確認している。将来の回帰防止には Panel reload/open が Companion event notify を呼ばない明示 test を追加してもよい。
+- Reviewer は read-only 方針を優先して `nix build .#yoi` を再実行せず、Orchestrator の pass 証跡を採用した。
