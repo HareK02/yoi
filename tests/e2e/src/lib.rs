@@ -10,7 +10,7 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -23,12 +23,118 @@ static FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub type Result<T> = std::result::Result<T, HarnessError>;
 
+#[derive(Clone, Debug, Serialize)]
+pub struct BinaryProviderInfo {
+    pub provider: String,
+    pub binary: PathBuf,
+    pub workspace_root: PathBuf,
+    pub cargo: Option<PathBuf>,
+    pub build_args: Vec<String>,
+    pub build_command: Option<String>,
+    pub profile: String,
+    pub tested_yoi_subprocess_env: TestedYoiEnvPolicy,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct EnvPolicy {
+    pub env_clear: bool,
+    pub allowlist: Vec<String>,
+    pub path_allowed: bool,
+    pub provider_credentials_default_deny: Vec<String>,
+    pub secret_patterns_default_deny: Vec<String>,
+    pub note: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct TestedYoiEnvPolicy {
+    pub fixture_setup: EnvPolicy,
+    pub panel: EnvPolicy,
+}
+
+impl BinaryProviderInfo {
+    fn log(&self) {
+        match &self.build_command {
+            Some(command) => eprintln!(
+                "yoi-e2e binary provider={} command={} binary={}",
+                self.provider,
+                command,
+                self.binary.display()
+            ),
+            None => eprintln!(
+                "yoi-e2e binary provider={} binary={}",
+                self.provider,
+                self.binary.display()
+            ),
+        }
+    }
+}
+
+fn env_policy(allowlist: &[&str], note: &str) -> EnvPolicy {
+    EnvPolicy {
+        env_clear: true,
+        allowlist: allowlist.iter().map(|name| (*name).to_owned()).collect(),
+        path_allowed: false,
+        provider_credentials_default_deny: vec![
+            "OPENAI_API_KEY".to_owned(),
+            "ANTHROPIC_API_KEY".to_owned(),
+            "GEMINI_API_KEY".to_owned(),
+        ],
+        secret_patterns_default_deny: vec![
+            "*_API_KEY".to_owned(),
+            "*_TOKEN".to_owned(),
+            "*_SECRET".to_owned(),
+            "*_CREDENTIAL*".to_owned(),
+        ],
+        note: note.to_owned(),
+    }
+}
+
+fn fixture_setup_env_policy() -> EnvPolicy {
+    env_policy(
+        &[
+            "HOME",
+            "XDG_DATA_HOME",
+            "XDG_STATE_HOME",
+            "XDG_CONFIG_HOME",
+            "YOI_POD_RUNTIME_COMMAND",
+        ],
+        "tested yoi fixture setup commands use env_clear and receive only fixture data/config homes plus the explicit runtime binary override",
+    )
+}
+
+fn panel_env_policy(include_hold_background_task: bool) -> EnvPolicy {
+    let mut allowlist = vec![
+        "HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+        "XDG_CONFIG_HOME",
+        "TERM",
+        "YOI_TUI_TEST_EVENTS",
+        "YOI_POD_RUNTIME_COMMAND",
+    ];
+    if include_hold_background_task {
+        allowlist.push("YOI_TUI_TEST_HOLD_BACKGROUND_TASK");
+    }
+    env_policy(
+        &allowlist,
+        "tested yoi panel subprocess uses env_clear and receives only fixture homes, terminal/test-observer variables, and the explicit runtime binary override",
+    )
+}
+
+fn tested_yoi_env_policy_overview() -> TestedYoiEnvPolicy {
+    TestedYoiEnvPolicy {
+        fixture_setup: fixture_setup_env_policy(),
+        panel: panel_env_policy(true),
+    }
+}
+
 #[derive(Debug)]
 pub enum HarnessError {
     Io(io::Error),
     Json(serde_json::Error),
     CommandFailed {
         program: PathBuf,
+        args: Vec<String>,
         status: ExitStatus,
         stdout: String,
         stderr: String,
@@ -51,13 +157,14 @@ impl std::fmt::Display for HarnessError {
             Self::Json(err) => write!(f, "json error: {err}"),
             Self::CommandFailed {
                 program,
+                args,
                 status,
                 stdout,
                 stderr,
             } => write!(
                 f,
                 "{} exited with {status}\nstdout:\n{stdout}\nstderr:\n{stderr}",
-                program.display()
+                command_display(program, args)
             ),
             Self::Timeout { what, artifacts } => write!(
                 f,
@@ -66,7 +173,7 @@ impl std::fmt::Display for HarnessError {
             ),
             Self::MissingBinary(path) => write!(
                 f,
-                "missing yoi binary {}; run `cargo build -p yoi --features e2e-test` or set YOI_E2E_BIN",
+                "missing yoi binary {}; set YOI_E2E_BIN to an existing binary or inspect target/e2e-artifacts/binary-provider.json",
                 path.display()
             ),
             Self::MouseCaptureNotEnabled { artifacts } => write!(
@@ -187,6 +294,7 @@ impl PanelHarness {
         fs::write(&artifacts.events_jsonl, "")?;
         fs::write(&artifacts.input_log, "")?;
         fs::write(&artifacts.output_log, "")?;
+        let env_policy = panel_env_policy(config.hold_background_task.is_some());
         fs::write(
             &artifacts.run_json,
             serde_json::to_vec_pretty(&serde_json::json!({
@@ -201,6 +309,7 @@ impl PanelHarness {
                     "rows": config.terminal_size.1,
                 },
                 "hold_background_task": config.hold_background_task,
+                "tested_yoi_env_policy": &env_policy,
             }))?,
         )?;
 
@@ -213,6 +322,7 @@ impl PanelHarness {
             .arg("panel")
             .arg("--workspace")
             .arg(&config.workspace)
+            .env_clear()
             .env("YOI_TUI_TEST_EVENTS", &artifacts.events_jsonl)
             .env("YOI_POD_RUNTIME_COMMAND", &config.binary)
             .env("HOME", &config.home)
@@ -496,13 +606,7 @@ pub struct FixtureWorkspace {
 
 impl FixtureWorkspace {
     pub fn new(binary: &Path) -> Result<Self> {
-        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(Path::parent)
-            .ok_or_else(|| {
-                HarnessError::Protocol("could not resolve workspace root for artifacts".to_owned())
-            })?
-            .to_path_buf();
+        let workspace_root = workspace_root()?;
         let root = workspace_root
             .join("target")
             .join("e2e-artifacts")
@@ -602,19 +706,146 @@ impl FixtureWorkspace {
     }
 }
 
-pub fn yoi_binary() -> PathBuf {
-    if let Some(path) = std::env::var_os("YOI_E2E_BIN") {
-        return PathBuf::from(path);
+pub fn yoi_binary() -> Result<PathBuf> {
+    Ok(yoi_binary_info()?.binary)
+}
+
+pub fn yoi_binary_info() -> Result<BinaryProviderInfo> {
+    static BINARY_INFO: OnceLock<std::result::Result<BinaryProviderInfo, String>> = OnceLock::new();
+    match BINARY_INFO.get_or_init(|| resolve_yoi_binary().map_err(|err| err.to_string())) {
+        Ok(info) => Ok(info.clone()),
+        Err(message) => Err(HarnessError::Protocol(message.clone())),
     }
-    let mut path = std::env::current_exe().expect("current executable path");
+}
+
+fn resolve_yoi_binary() -> Result<BinaryProviderInfo> {
+    if let Some(path) = std::env::var_os("YOI_E2E_BIN") {
+        let workspace_root = workspace_root()?;
+        let binary = PathBuf::from(path);
+        let binary = if binary.is_absolute() {
+            binary
+        } else {
+            workspace_root.join(binary)
+        };
+        if !binary.exists() {
+            return Err(HarnessError::MissingBinary(binary));
+        }
+        let info = BinaryProviderInfo {
+            provider: "YOI_E2E_BIN".to_owned(),
+            binary,
+            workspace_root,
+            cargo: None,
+            build_args: Vec::new(),
+            build_command: None,
+            profile: test_profile(),
+            tested_yoi_subprocess_env: tested_yoi_env_policy_overview(),
+        };
+        info.log();
+        write_binary_provider_artifact(&info)?;
+        return Ok(info);
+    }
+
+    let workspace_root = workspace_root()?;
+    let cargo = PathBuf::from(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
+    let mut args = vec![
+        "build".to_owned(),
+        "-p".to_owned(),
+        "yoi".to_owned(),
+        "--features".to_owned(),
+        "e2e-test".to_owned(),
+        "--bin".to_owned(),
+        "yoi".to_owned(),
+    ];
+    if test_profile() == "release" {
+        args.push("--release".to_owned());
+    }
+
+    let command = command_display(&cargo, &args);
+    eprintln!("yoi-e2e binary provider=cargo-build command={command}");
+    let output = Command::new(&cargo)
+        .args(&args)
+        .current_dir(&workspace_root)
+        .output()?;
+    if !output.status.success() {
+        return Err(HarnessError::CommandFailed {
+            program: cargo,
+            args,
+            status: output.status,
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        });
+    }
+
+    let binary = current_target_profile_dir()?.join(binary_name());
+    let info = BinaryProviderInfo {
+        provider: "cargo-build".to_owned(),
+        binary,
+        workspace_root,
+        cargo: Some(cargo),
+        build_args: args,
+        build_command: Some(command),
+        profile: test_profile(),
+        tested_yoi_subprocess_env: tested_yoi_env_policy_overview(),
+    };
+    info.log();
+    write_binary_provider_artifact(&info)?;
+    if !info.binary.exists() {
+        return Err(HarnessError::MissingBinary(info.binary));
+    }
+    Ok(info)
+}
+
+fn workspace_root() -> Result<PathBuf> {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .ok_or_else(|| HarnessError::Protocol("could not resolve workspace root".to_owned()))
+}
+
+fn current_target_profile_dir() -> Result<PathBuf> {
+    let mut path = std::env::current_exe()?;
     while let Some(name) = path.file_name().and_then(|name| name.to_str()) {
         if name == "debug" || name == "release" {
-            path.push("yoi");
-            return path;
+            return Ok(path);
         }
         path.pop();
     }
-    PathBuf::from("target/debug/yoi")
+    Ok(workspace_root()?.join("target").join(test_profile()))
+}
+
+fn test_profile() -> String {
+    let Ok(mut path) = std::env::current_exe() else {
+        return "debug".to_owned();
+    };
+    while let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+        if name == "debug" || name == "release" {
+            return name.to_owned();
+        }
+        path.pop();
+    }
+    "debug".to_owned()
+}
+
+fn binary_name() -> String {
+    format!("yoi{}", std::env::consts::EXE_SUFFIX)
+}
+
+fn write_binary_provider_artifact(info: &BinaryProviderInfo) -> Result<()> {
+    let dir = info.workspace_root.join("target").join("e2e-artifacts");
+    fs::create_dir_all(&dir)?;
+    fs::write(
+        dir.join("binary-provider.json"),
+        serde_json::to_vec_pretty(info)?,
+    )?;
+    Ok(())
+}
+
+fn command_display(program: &Path, args: &[String]) -> String {
+    std::iter::once(program.display().to_string())
+        .chain(args.iter().cloned())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn open_pty(size: (u16, u16)) -> Result<(File, File)> {
@@ -692,18 +923,25 @@ fn run_yoi_capture(
     config: &Path,
     args: &[&str],
 ) -> Result<String> {
-    let output = Command::new(binary)
+    let env_policy = fixture_setup_env_policy();
+    append_fixture_command_artifact(workspace, binary, args, &env_policy)?;
+
+    let mut command = Command::new(binary);
+    command
         .args(args)
         .current_dir(workspace)
+        .env_clear()
         .env("HOME", home)
         .env("XDG_DATA_HOME", data)
         .env("XDG_STATE_HOME", state)
         .env("XDG_CONFIG_HOME", config)
-        .env("YOI_POD_RUNTIME_COMMAND", binary)
-        .output()?;
+        .env("YOI_POD_RUNTIME_COMMAND", binary);
+
+    let output = command.output()?;
     if !output.status.success() {
         return Err(HarnessError::CommandFailed {
             program: binary.to_path_buf(),
+            args: args.iter().map(|arg| (*arg).to_owned()).collect(),
             status: output.status,
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
@@ -712,6 +950,37 @@ fn run_yoi_capture(
     let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
     text.push_str(&String::from_utf8_lossy(&output.stderr));
     Ok(text)
+}
+
+fn append_fixture_command_artifact(
+    workspace: &Path,
+    binary: &Path,
+    args: &[&str],
+    env_policy: &EnvPolicy,
+) -> Result<()> {
+    let fixture_root = workspace.parent().ok_or_else(|| {
+        HarnessError::Protocol(format!(
+            "fixture workspace {} has no parent for artifacts",
+            workspace.display()
+        ))
+    })?;
+    let artifacts_dir = fixture_root.join("artifacts");
+    fs::create_dir_all(&artifacts_dir)?;
+    let mut file = OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(artifacts_dir.join("fixture-commands.jsonl"))?;
+    serde_json::to_writer(
+        &mut file,
+        &serde_json::json!({
+            "ts_ms": now_ms(),
+            "binary": binary,
+            "args": args,
+            "tested_yoi_env_policy": env_policy,
+        }),
+    )?;
+    writeln!(file)?;
+    Ok(())
 }
 
 fn write_blocking_pod_metadata(data_home: &Path, pod_name: &str) -> Result<()> {
@@ -765,4 +1034,77 @@ fn now_ms() -> u128 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_host_credentials_default_denied(policy: &EnvPolicy) {
+        assert!(
+            policy.env_clear,
+            "tested yoi subprocesses must use env_clear"
+        );
+        assert!(
+            !policy.path_allowed,
+            "tested yoi subprocesses should not inherit or allow PATH"
+        );
+        assert!(
+            !policy.allowlist.iter().any(|name| name == "PATH"),
+            "PATH must not be allowlisted for tested yoi subprocesses"
+        );
+        for name in ["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY"] {
+            assert!(
+                !policy.allowlist.iter().any(|allowed| allowed == name),
+                "{name} must not be allowlisted for tested yoi subprocesses"
+            );
+            assert!(
+                policy
+                    .provider_credentials_default_deny
+                    .iter()
+                    .any(|denied| denied == name),
+                "{name} should be recorded as provider credential default-deny"
+            );
+        }
+    }
+
+    #[test]
+    fn tested_yoi_env_policy_is_env_clear_allowlist() {
+        let fixture = fixture_setup_env_policy();
+        assert_host_credentials_default_denied(&fixture);
+        assert_eq!(
+            fixture.allowlist,
+            [
+                "HOME",
+                "XDG_DATA_HOME",
+                "XDG_STATE_HOME",
+                "XDG_CONFIG_HOME",
+                "YOI_POD_RUNTIME_COMMAND",
+            ]
+        );
+
+        let panel = panel_env_policy(false);
+        assert_host_credentials_default_denied(&panel);
+        assert_eq!(
+            panel.allowlist,
+            [
+                "HOME",
+                "XDG_DATA_HOME",
+                "XDG_STATE_HOME",
+                "XDG_CONFIG_HOME",
+                "TERM",
+                "YOI_TUI_TEST_EVENTS",
+                "YOI_POD_RUNTIME_COMMAND",
+            ]
+        );
+
+        let panel_with_hold = panel_env_policy(true);
+        assert_host_credentials_default_denied(&panel_with_hold);
+        assert!(
+            panel_with_hold
+                .allowlist
+                .iter()
+                .any(|name| name == "YOI_TUI_TEST_HOLD_BACKGROUND_TASK")
+        );
+    }
 }

@@ -4,7 +4,7 @@ use yoi_e2e::{FixtureWorkspace, KeyPress, PanelHarness, yoi_binary};
 
 #[test]
 fn panel_mouse_click_selects_row_without_dispatching_action() -> yoi_e2e::Result<()> {
-    let binary = yoi_binary();
+    let binary = yoi_binary()?;
     let fixture = FixtureWorkspace::new(&binary)?;
     let mut panel = PanelHarness::spawn(fixture.panel_config(binary))?;
 
@@ -39,7 +39,7 @@ fn panel_mouse_click_selects_row_without_dispatching_action() -> yoi_e2e::Result
 
 #[test]
 fn panel_ctrl_c_exits_promptly_after_background_barrier() -> yoi_e2e::Result<()> {
-    let binary = yoi_binary();
+    let binary = yoi_binary()?;
     let fixture = FixtureWorkspace::new(&binary)?;
     let mut panel =
         PanelHarness::spawn(fixture.panel_config_holding_background_task(binary, "reload"))?;
