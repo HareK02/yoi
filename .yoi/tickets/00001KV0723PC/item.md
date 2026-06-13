@@ -2,7 +2,7 @@
 title: 'Panel Quit 時の断続的な遅延を調査して解消する'
 state: 'done'
 created_at: '2026-06-13T10:04:55Z'
-updated_at: '2026-06-13T11:41:26Z'
+updated_at: '2026-06-13T12:57:53Z'
 assignee: null
 readiness: 'spike_needed'
 risk_flags: ['tui-panel', 'shutdown-latency', 'async-cancellation']
