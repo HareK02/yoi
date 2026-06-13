@@ -514,3 +514,25 @@ Non-blocking risk:
 - Added `minijinja` dependency to `crates/tui`; it is already used elsewhere in the workspace, and `Cargo.lock` / `package.nix` were updated with passing Nix build.
 
 ---
+
+---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-13T02:37:58Z from: closed to: planning reason: reopen_implementation_mismatch field: state -->
+
+## State changed
+
+実運用で、実装が Ticket の意図を逸脱していることが確認されたため reopen する。
+
+Reopen reason:
+- 現実の挙動は、Panel を開いているだけで periodic reload に連動して Companion へ progress notice を繰り返し送る形になっている。
+- Ticket は Orchestrator progress を Companion に共有することを求めていたが、Panel を actionless な notification feed source にすること、長文/スナップショット的 progress notice を Panel refresh ごとに送ることは要求していない。
+- `auto_run: false` は idle Pod を起こさないだけで、Notify は Companion history/model context に入るため、通知 spam / context 汚染として扱うべきだった。
+- Progress notice の発生源は Panel の定期 reload ではなく、Pod/Orchestrator の明示的な進捗イベント、または明示 user action に紐づくべきである。
+
+Next planning/fix question:
+- 既存 `Method::Notify { auto_run }` 互換部分は残すか。
+- Panel reload から Companion への automatic dispatch を削除または default-off にするか。
+- Orchestrator/Pod 起点でどの明示イベントだけを Companion に通知するか。
+- 送る場合の payload を snapshot ではなく bounded event notice に縮小するか。
+
+Until this is resolved, current Companion progress notice implementation should be treated as defective and not closed.
