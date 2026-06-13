@@ -16,6 +16,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tempfile::TempDir;
 
 const DEFAULT_WAIT: Duration = Duration::from_secs(5);
 const DEFAULT_EXIT_WAIT: Duration = Duration::from_millis(1500);
@@ -96,9 +97,10 @@ fn fixture_setup_env_policy() -> EnvPolicy {
             "XDG_DATA_HOME",
             "XDG_STATE_HOME",
             "XDG_CONFIG_HOME",
+            "XDG_RUNTIME_DIR",
             "YOI_POD_RUNTIME_COMMAND",
         ],
-        "tested yoi fixture setup commands use env_clear and receive only fixture data/config homes plus the explicit runtime binary override",
+        "tested yoi fixture setup commands use env_clear and receive only fixture HOME, XDG data/state/config/runtime dirs, and the explicit runtime binary override",
     )
 }
 
@@ -108,6 +110,7 @@ fn panel_env_policy(include_hold_background_task: bool) -> EnvPolicy {
         "XDG_DATA_HOME",
         "XDG_STATE_HOME",
         "XDG_CONFIG_HOME",
+        "XDG_RUNTIME_DIR",
         "TERM",
         "YOI_TUI_TEST_EVENTS",
         "YOI_POD_RUNTIME_COMMAND",
@@ -117,7 +120,7 @@ fn panel_env_policy(include_hold_background_task: bool) -> EnvPolicy {
     }
     env_policy(
         &allowlist,
-        "tested yoi panel subprocess uses env_clear and receives only fixture homes, terminal/test-observer variables, and the explicit runtime binary override",
+        "tested yoi panel subprocess uses env_clear and receives only fixture HOME, XDG data/state/config/runtime dirs, terminal/test-observer variables, and the explicit runtime binary override",
     )
 }
 
@@ -208,6 +211,8 @@ pub struct PanelHarnessConfig {
     pub xdg_data_home: PathBuf,
     pub xdg_state_home: PathBuf,
     pub xdg_config_home: PathBuf,
+    pub xdg_runtime_dir: PathBuf,
+    pub fixture_root: PathBuf,
     pub terminal_size: (u16, u16),
     pub hold_background_task: Option<String>,
     pub artifacts_dir: PathBuf,
@@ -304,6 +309,13 @@ impl PanelHarness {
                 "xdg_data_home": config.xdg_data_home,
                 "xdg_state_home": config.xdg_state_home,
                 "xdg_config_home": config.xdg_config_home,
+                "xdg_runtime_dir": config.xdg_runtime_dir,
+                "fixture_root": config.fixture_root,
+                "runtime_policy": {
+                    "host_runtime_inherited": false,
+                    "host_xdg_runtime_dir_present": std::env::var_os("XDG_RUNTIME_DIR").is_some(),
+                    "tested_yoi_runtime_source": "fixture XDG_RUNTIME_DIR"
+                },
                 "terminal_size": {
                     "columns": config.terminal_size.0,
                     "rows": config.terminal_size.1,
@@ -329,6 +341,7 @@ impl PanelHarness {
             .env("XDG_DATA_HOME", &config.xdg_data_home)
             .env("XDG_STATE_HOME", &config.xdg_state_home)
             .env("XDG_CONFIG_HOME", &config.xdg_config_home)
+            .env("XDG_RUNTIME_DIR", &config.xdg_runtime_dir)
             .env("TERM", "xterm-256color")
             .stdin(Stdio::from(slave_for_stdin))
             .stdout(Stdio::from(slave_for_stdout))
@@ -593,92 +606,130 @@ impl Drop for PanelHarness {
     }
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct FixtureCleanupReport {
+    pub fixture_root: PathBuf,
+    pub artifacts_dir: PathBuf,
+    pub snapshot_dir: PathBuf,
+    pub cleanup_attempted: bool,
+    pub cleanup_success: bool,
+    pub fixture_root_exists_after: bool,
+    pub cleanup_error: Option<String>,
+    pub report_path: PathBuf,
+}
+
 #[derive(Debug)]
 pub struct FixtureWorkspace {
+    temp_root: Option<TempDir>,
     pub root: PathBuf,
     pub workspace: PathBuf,
     pub home: PathBuf,
     pub xdg_data_home: PathBuf,
     pub xdg_state_home: PathBuf,
     pub xdg_config_home: PathBuf,
+    pub xdg_runtime_dir: PathBuf,
     pub artifacts_dir: PathBuf,
 }
 
 impl FixtureWorkspace {
     pub fn new(binary: &Path) -> Result<Self> {
         let workspace_root = workspace_root()?;
-        let root = workspace_root
-            .join("target")
-            .join("e2e-artifacts")
-            .join(format!(
-                "{}-{}-{}",
-                std::process::id(),
-                now_ms(),
-                FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed)
-            ));
+        let target_dir = workspace_root.join("target");
+        let temp_parent = target_dir.join("e2e-tmp");
+        let artifact_parent = target_dir.join("e2e-artifacts");
+        fs::create_dir_all(&temp_parent)?;
+        fs::create_dir_all(&artifact_parent)?;
+
+        let fixture_id = format!(
+            "{}-{}-{}",
+            std::process::id(),
+            now_ms(),
+            FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
+        let temp_root = tempfile::Builder::new()
+            .prefix(&format!("yoi-e2e-{fixture_id}-"))
+            .tempdir_in(&temp_parent)?;
+        let root = temp_root.path().to_path_buf();
+        let artifacts_dir = artifact_parent.join(fixture_id);
         let workspace = root.join("workspace");
         let home = root.join("home");
         let xdg_data_home = root.join("data");
         let xdg_state_home = root.join("state");
         let xdg_config_home = root.join("config");
-        let artifacts_dir = root.join("artifacts");
+        let xdg_runtime_dir = root.join("runtime");
         for dir in [
             &workspace,
             &home,
             &xdg_data_home,
             &xdg_state_home,
             &xdg_config_home,
+            &xdg_runtime_dir,
             &artifacts_dir,
         ] {
             fs::create_dir_all(dir)?;
         }
-        write_blocking_pod_metadata(&xdg_data_home, "workspace")?;
-        write_blocking_pod_metadata(&xdg_data_home, "workspace-orchestrator")?;
-        run_yoi(
-            binary,
-            &workspace,
-            &home,
-            &xdg_data_home,
-            &xdg_state_home,
-            &xdg_config_home,
-            &["ticket", "init"],
-        )?;
-        let first = create_ticket(
-            binary,
-            &workspace,
-            &home,
-            &xdg_data_home,
-            &xdg_state_home,
-            &xdg_config_home,
-            "Ready E2E Ticket",
-        )?;
-        run_yoi(
-            binary,
-            &workspace,
-            &home,
-            &xdg_data_home,
-            &xdg_state_home,
-            &xdg_config_home,
-            &["ticket", "state", &first, "ready"],
-        )?;
-        let _second = create_ticket(
-            binary,
-            &workspace,
-            &home,
-            &xdg_data_home,
-            &xdg_state_home,
-            &xdg_config_home,
-            "Planning E2E Ticket",
-        )?;
-        Ok(Self {
+
+        let fixture = Self {
+            temp_root: Some(temp_root),
             root,
             workspace,
             home,
             xdg_data_home,
             xdg_state_home,
             xdg_config_home,
+            xdg_runtime_dir,
             artifacts_dir,
-        })
+        };
+        fixture.write_fixture_metadata("created", None)?;
+
+        write_blocking_pod_metadata(&fixture.xdg_data_home, "workspace")?;
+        write_blocking_pod_metadata(&fixture.xdg_data_home, "workspace-orchestrator")?;
+        run_yoi(
+            binary,
+            &fixture.workspace,
+            &fixture.home,
+            &fixture.xdg_data_home,
+            &fixture.xdg_state_home,
+            &fixture.xdg_config_home,
+            &fixture.xdg_runtime_dir,
+            &fixture.artifacts_dir,
+            &["ticket", "init"],
+        )?;
+        let first = create_ticket(
+            binary,
+            &fixture.workspace,
+            &fixture.home,
+            &fixture.xdg_data_home,
+            &fixture.xdg_state_home,
+            &fixture.xdg_config_home,
+            &fixture.xdg_runtime_dir,
+            &fixture.artifacts_dir,
+            "Ready E2E Ticket",
+        )?;
+        run_yoi(
+            binary,
+            &fixture.workspace,
+            &fixture.home,
+            &fixture.xdg_data_home,
+            &fixture.xdg_state_home,
+            &fixture.xdg_config_home,
+            &fixture.xdg_runtime_dir,
+            &fixture.artifacts_dir,
+            &["ticket", "state", &first, "ready"],
+        )?;
+        let _second = create_ticket(
+            binary,
+            &fixture.workspace,
+            &fixture.home,
+            &fixture.xdg_data_home,
+            &fixture.xdg_state_home,
+            &fixture.xdg_config_home,
+            &fixture.xdg_runtime_dir,
+            &fixture.artifacts_dir,
+            "Planning E2E Ticket",
+        )?;
+        fixture.write_fixture_metadata("ready", None)?;
+        Ok(fixture)
     }
 
     pub fn panel_config(&self, binary: PathBuf) -> PanelHarnessConfig {
@@ -689,6 +740,8 @@ impl FixtureWorkspace {
             xdg_data_home: self.xdg_data_home.clone(),
             xdg_state_home: self.xdg_state_home.clone(),
             xdg_config_home: self.xdg_config_home.clone(),
+            xdg_runtime_dir: self.xdg_runtime_dir.clone(),
+            fixture_root: self.root.clone(),
             terminal_size: (100, 32),
             hold_background_task: None,
             artifacts_dir: self.artifacts_dir.clone(),
@@ -703,6 +756,88 @@ impl FixtureWorkspace {
         let mut config = self.panel_config(binary);
         config.hold_background_task = Some(task.into());
         config
+    }
+
+    pub fn cleanup(mut self) -> Result<FixtureCleanupReport> {
+        self.cleanup_inner(true)
+    }
+
+    fn cleanup_inner(&mut self, strict: bool) -> Result<FixtureCleanupReport> {
+        let snapshot_dir = self.artifacts_dir.join("fixture-snapshot");
+        if snapshot_dir.exists() {
+            fs::remove_dir_all(&snapshot_dir)?;
+        }
+        copy_dir_recursive(&self.root, &snapshot_dir)?;
+
+        let mut cleanup_error = None;
+        if let Some(temp_root) = self.temp_root.take() {
+            if let Err(err) = temp_root.close() {
+                cleanup_error = Some(err.to_string());
+            }
+        }
+        let fixture_root_exists_after = self.root.exists();
+        let cleanup_success = cleanup_error.is_none() && !fixture_root_exists_after;
+        let report = FixtureCleanupReport {
+            fixture_root: self.root.clone(),
+            artifacts_dir: self.artifacts_dir.clone(),
+            snapshot_dir,
+            cleanup_attempted: true,
+            cleanup_success,
+            fixture_root_exists_after,
+            cleanup_error,
+            report_path: self.artifacts_dir.join("cleanup.json"),
+        };
+        fs::write(&report.report_path, serde_json::to_vec_pretty(&report)?)?;
+        self.write_fixture_metadata("cleaned", Some(&report))?;
+        if strict && !report.cleanup_success {
+            return Err(HarnessError::Protocol(format!(
+                "fixture cleanup failed for {}; see {}",
+                report.fixture_root.display(),
+                report.report_path.display()
+            )));
+        }
+        Ok(report)
+    }
+
+    fn write_fixture_metadata(
+        &self,
+        phase: &str,
+        cleanup: Option<&FixtureCleanupReport>,
+    ) -> Result<()> {
+        fs::create_dir_all(&self.artifacts_dir)?;
+        fs::write(
+            self.artifacts_dir.join("fixture.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "phase": phase,
+                "fixture_root": &self.root,
+                "workspace": &self.workspace,
+                "home": &self.home,
+                "xdg_data_home": &self.xdg_data_home,
+                "xdg_state_home": &self.xdg_state_home,
+                "xdg_config_home": &self.xdg_config_home,
+                "xdg_runtime_dir": &self.xdg_runtime_dir,
+                "artifacts_dir": &self.artifacts_dir,
+                "env_runtime_policy": {
+                    "tested_yoi_uses_env_clear": true,
+                    "host_runtime_inherited": false,
+                    "host_xdg_runtime_dir_present": std::env::var_os("XDG_RUNTIME_DIR").is_some(),
+                    "tested_yoi_runtime_source": "fixture XDG_RUNTIME_DIR",
+                    "tested_yoi_pod_registry": self.xdg_runtime_dir.join("yoi").join("pods.json"),
+                    "fixture_pod_metadata_root": self.xdg_data_home.join("yoi").join("pods")
+                },
+                "tested_yoi_env_policy": tested_yoi_env_policy_overview(),
+                "cleanup": cleanup,
+            }))?,
+        )?;
+        Ok(())
+    }
+}
+
+impl Drop for FixtureWorkspace {
+    fn drop(&mut self) {
+        if self.temp_root.is_some() {
+            let _ = self.cleanup_inner(false);
+        }
     }
 }
 
@@ -882,6 +1017,8 @@ fn create_ticket(
     data: &Path,
     state: &Path,
     config: &Path,
+    runtime: &Path,
+    artifacts_dir: &Path,
     title: &str,
 ) -> Result<String> {
     let output = run_yoi_capture(
@@ -891,6 +1028,8 @@ fn create_ticket(
         data,
         state,
         config,
+        runtime,
+        artifacts_dir,
         &["ticket", "create", "--title", title],
     )?;
     output
@@ -907,9 +1046,21 @@ fn run_yoi(
     data: &Path,
     state: &Path,
     config: &Path,
+    runtime: &Path,
+    artifacts_dir: &Path,
     args: &[&str],
 ) -> Result<()> {
-    let output = run_yoi_capture(binary, workspace, home, data, state, config, args)?;
+    let output = run_yoi_capture(
+        binary,
+        workspace,
+        home,
+        data,
+        state,
+        config,
+        runtime,
+        artifacts_dir,
+        args,
+    )?;
     drop(output);
     Ok(())
 }
@@ -921,10 +1072,12 @@ fn run_yoi_capture(
     data: &Path,
     state: &Path,
     config: &Path,
+    runtime: &Path,
+    artifacts_dir: &Path,
     args: &[&str],
 ) -> Result<String> {
     let env_policy = fixture_setup_env_policy();
-    append_fixture_command_artifact(workspace, binary, args, &env_policy)?;
+    append_fixture_command_artifact(artifacts_dir, workspace, binary, args, &env_policy)?;
 
     let mut command = Command::new(binary);
     command
@@ -935,6 +1088,7 @@ fn run_yoi_capture(
         .env("XDG_DATA_HOME", data)
         .env("XDG_STATE_HOME", state)
         .env("XDG_CONFIG_HOME", config)
+        .env("XDG_RUNTIME_DIR", runtime)
         .env("YOI_POD_RUNTIME_COMMAND", binary);
 
     let output = command.output()?;
@@ -953,19 +1107,13 @@ fn run_yoi_capture(
 }
 
 fn append_fixture_command_artifact(
+    artifacts_dir: &Path,
     workspace: &Path,
     binary: &Path,
     args: &[&str],
     env_policy: &EnvPolicy,
 ) -> Result<()> {
-    let fixture_root = workspace.parent().ok_or_else(|| {
-        HarnessError::Protocol(format!(
-            "fixture workspace {} has no parent for artifacts",
-            workspace.display()
-        ))
-    })?;
-    let artifacts_dir = fixture_root.join("artifacts");
-    fs::create_dir_all(&artifacts_dir)?;
+    fs::create_dir_all(artifacts_dir)?;
     let mut file = OpenOptions::new()
         .append(true)
         .create(true)
@@ -975,11 +1123,37 @@ fn append_fixture_command_artifact(
         &serde_json::json!({
             "ts_ms": now_ms(),
             "binary": binary,
+            "workspace": workspace,
             "args": args,
             "tested_yoi_env_policy": env_policy,
         }),
     )?;
     writeln!(file)?;
+    Ok(())
+}
+
+fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<()> {
+    if !source.exists() {
+        return Ok(());
+    }
+    fs::create_dir_all(destination)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let target = destination.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_dir_recursive(&entry.path(), &target)?;
+        } else if file_type.is_file() {
+            fs::copy(entry.path(), target)?;
+        } else if file_type.is_symlink() {
+            // Preserve enough diagnostics for E2E artifacts without following links out of
+            // the fixture temp root.
+            fs::write(
+                target,
+                format!("symlink -> {}\n", fs::read_link(entry.path())?.display()),
+            )?;
+        }
+    }
     Ok(())
 }
 

@@ -1,15 +1,23 @@
 use std::time::Duration;
 
-use yoi_e2e::{FixtureWorkspace, KeyPress, PanelHarness, yoi_binary};
+use yoi_e2e::{
+    FixtureCleanupReport, FixtureWorkspace, KeyPress, PanelHarness, RenderedPanelRow, yoi_binary,
+};
 
 #[test]
 fn panel_mouse_click_selects_row_without_dispatching_action() -> yoi_e2e::Result<()> {
     let binary = yoi_binary()?;
     let fixture = FixtureWorkspace::new(&binary)?;
+    assert_fixture_paths_are_isolated(&fixture);
     let mut panel = PanelHarness::spawn(fixture.panel_config(binary))?;
 
     panel.expect_mouse_capture_enabled()?;
     let rows = panel.wait_for_rows(2)?;
+    assert_no_runtime_or_host_pod_leak(
+        &fixture,
+        &rows.rows,
+        panel.artifacts().dir.display().to_string().as_str(),
+    );
     let selected = rows.selected.clone();
     let target = rows
         .rows
@@ -34,6 +42,8 @@ fn panel_mouse_click_selects_row_without_dispatching_action() -> yoi_e2e::Result
     panel.press(KeyPress::CtrlC)?;
     let status = panel.expect_exit_within(PanelHarness::default_exit_wait())?;
     assert!(status.success(), "panel should exit cleanly with Ctrl+C");
+    drop(panel);
+    assert_fixture_cleanup(fixture.cleanup()?);
     Ok(())
 }
 
@@ -41,6 +51,7 @@ fn panel_mouse_click_selects_row_without_dispatching_action() -> yoi_e2e::Result
 fn panel_ctrl_c_exits_promptly_after_background_barrier() -> yoi_e2e::Result<()> {
     let binary = yoi_binary()?;
     let fixture = FixtureWorkspace::new(&binary)?;
+    assert_fixture_paths_are_isolated(&fixture);
     let mut panel =
         PanelHarness::spawn(fixture.panel_config_holding_background_task(binary, "reload"))?;
 
@@ -68,5 +79,95 @@ fn panel_ctrl_c_exits_promptly_after_background_barrier() -> yoi_e2e::Result<()>
         "quit_requested observability event missing; artifacts at {}",
         panel.artifacts().dir.display()
     );
+    drop(panel);
+    assert_fixture_cleanup(fixture.cleanup()?);
     Ok(())
+}
+
+fn assert_fixture_paths_are_isolated(fixture: &FixtureWorkspace) {
+    assert!(
+        fixture.root.exists(),
+        "fixture temp root should exist during scenario"
+    );
+    assert!(fixture.workspace.starts_with(&fixture.root));
+    assert!(fixture.home.starts_with(&fixture.root));
+    assert!(fixture.xdg_data_home.starts_with(&fixture.root));
+    assert!(fixture.xdg_state_home.starts_with(&fixture.root));
+    assert!(fixture.xdg_config_home.starts_with(&fixture.root));
+    assert!(fixture.xdg_runtime_dir.starts_with(&fixture.root));
+    assert!(
+        !fixture.artifacts_dir.starts_with(&fixture.root),
+        "persistent artifacts must live outside the temp root so cleanup can remove the fixture"
+    );
+    if let Some(host_runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
+        assert_ne!(
+            fixture.xdg_runtime_dir,
+            std::path::PathBuf::from(host_runtime),
+            "tested yoi must not reuse host XDG_RUNTIME_DIR"
+        );
+    }
+}
+
+fn assert_no_runtime_or_host_pod_leak(
+    fixture: &FixtureWorkspace,
+    rows: &[RenderedPanelRow],
+    artifacts: &str,
+) {
+    let rendered = rows
+        .iter()
+        .map(|row| {
+            format!(
+                "{} {} {} {}",
+                row.key.kind,
+                row.key.id,
+                row.title,
+                row.status.as_deref().unwrap_or_default()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    for marker in [
+        "workspace-orchestrator",
+        "yoi-orchestrator-orchestrator",
+        "host-runtime-leak",
+    ] {
+        assert!(
+            !rendered.contains(marker),
+            "host/fixture runtime Pod marker {marker:?} leaked into panel rows; artifacts at {artifacts}\n{rendered}"
+        );
+    }
+    if let Some(host_runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
+        let host_runtime = host_runtime.to_string_lossy();
+        assert!(
+            !rendered.contains(host_runtime.as_ref()),
+            "host XDG_RUNTIME_DIR leaked into panel rows; artifacts at {artifacts}\n{rendered}"
+        );
+    }
+    assert!(
+        rendered.contains("E2E Ticket"),
+        "panel should be observing fixture-local Ticket data; artifacts at {artifacts}\n{rendered}"
+    );
+    assert!(fixture.xdg_runtime_dir.starts_with(&fixture.root));
+}
+
+fn assert_fixture_cleanup(report: FixtureCleanupReport) {
+    assert!(
+        report.cleanup_success,
+        "fixture cleanup failed; report at {}: {:?}",
+        report.report_path.display(),
+        report.cleanup_error
+    );
+    assert!(
+        !report.fixture_root.exists(),
+        "fixture temp root should be removed after scenario: {}",
+        report.fixture_root.display()
+    );
+    assert!(
+        report.report_path.exists(),
+        "cleanup artifact should persist"
+    );
+    assert!(
+        report.snapshot_dir.exists(),
+        "fixture snapshot should persist under target/e2e-artifacts before temp cleanup"
+    );
 }
