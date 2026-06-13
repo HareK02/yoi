@@ -726,7 +726,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Option<Method> {
     if app.rewind_picker.is_some() {
         match key.code {
             KeyCode::Esc => {
-                app.close_rewind_picker();
+                app.cancel_rewind_picker();
                 return None;
             }
             KeyCode::Enter => return app.submit_rewind_picker(),

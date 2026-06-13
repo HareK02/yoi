@@ -3,7 +3,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use protocol::{
-    AlertLevel, AlertSource, CompletionEntry, CompletionKind, Event, Method, PodStatus,
+    AlertLevel, AlertSource, CompletionEntry, CompletionKind, ErrorCode, Event, Method, PodStatus,
     RewindTarget, RunResult, Segment,
 };
 
@@ -69,6 +69,11 @@ pub struct RewindPickerState {
     pub targets: Vec<RewindTarget>,
     pub selected: usize,
     pub scroll: RewindPickerScroll,
+    /// True after Enter submitted an authoritative `RewindTo` and before the
+    /// Pod replies with either `RewindApplied` or `Error`. While set, the
+    /// picker remains visible but further submits/navigation are ignored so a
+    /// destructive rewind cannot be queued multiple times by key repeat.
+    pub applying: bool,
 }
 
 impl RewindPickerState {
@@ -79,6 +84,7 @@ impl RewindPickerState {
             targets,
             selected,
             scroll: RewindPickerScroll::default(),
+            applying: false,
         }
     }
 
@@ -276,6 +282,11 @@ pub struct App {
     /// Dedicated main-view rewind picker state.
     pub rewind_picker: Option<RewindPickerState>,
     rewind_request_pending: bool,
+    /// After a successful rewind restore, ignore any queued live-update events
+    /// until the authoritative Pod status/snapshot catches up. This prevents
+    /// old stream tail events that were already in transit from re-polluting the
+    /// just-restored display.
+    rewind_refresh_fence: bool,
     greeting: Option<protocol::Greeting>,
     /// In-TUI mirror of the Pod's session task store, reconstructed
     /// directly from observed `TaskCreate` / `TaskUpdate` tool calls and
@@ -337,6 +348,7 @@ impl App {
             completion: None,
             rewind_picker: None,
             rewind_request_pending: false,
+            rewind_refresh_fence: false,
             greeting: None,
             task_store: TaskStore::new(),
             task_pane_open: false,
@@ -799,6 +811,33 @@ impl App {
         });
     }
 
+    fn handle_error(&mut self, code: ErrorCode, message: String) {
+        let text = format!("[{code:?}] {message}");
+        let was_applying = if let Some(picker) = self.rewind_picker.as_mut() {
+            let applying = picker.applying;
+            picker.applying = false;
+            applying
+        } else {
+            false
+        };
+        if was_applying {
+            self.flash_actionbar_notice(
+                format!("Rewind failed: {text}"),
+                ActionbarNoticeLevel::Error,
+                ActionbarNoticeSource::Tui,
+                Duration::from_secs(6),
+            );
+        }
+        self.push_error(text);
+    }
+
+    fn rewind_submit_pending(&self) -> bool {
+        self.rewind_picker
+            .as_ref()
+            .map(|picker| picker.applying)
+            .unwrap_or(false)
+    }
+
     fn push_history_item(&mut self, item: &serde_json::Value) {
         let item_type = item["type"].as_str().unwrap_or("");
         match item_type {
@@ -927,6 +966,10 @@ impl App {
     }
 
     pub fn handle_pod_event(&mut self, event: Event) -> Option<Method> {
+        if self.rewind_refresh_fence && event_is_stale_after_rewind(&event) {
+            return None;
+        }
+
         match event {
             Event::UserMessage { segments } => {
                 self.turn_index += 1;
@@ -1148,7 +1191,7 @@ impl App {
                 self.run_output_tokens += output_tokens.unwrap_or(0);
             }
             Event::Error { code, message } => {
-                self.push_error(format!("[{code:?}] {message}"));
+                self.handle_error(code, message);
             }
             Event::RunEnd { result } => {
                 self.latest_llm_wait_event = None;
@@ -1231,10 +1274,12 @@ impl App {
                 greeting,
                 status,
             } => {
+                self.rewind_refresh_fence = false;
                 self.restore_snapshot(&entries, greeting);
                 self.set_pod_status(status);
             }
             Event::Status { status } => {
+                self.rewind_refresh_fence = false;
                 self.set_pod_status(status);
             }
             Event::Completions { kind, entries } => {
@@ -1262,9 +1307,8 @@ impl App {
                 input,
                 summary,
             } => {
-                if let Some(greeting) = self.greeting.clone() {
-                    self.restore_snapshot(&entries, greeting);
-                }
+                self.restore_rewind_snapshot(&entries);
+                self.rewind_refresh_fence = true;
                 let restored_composer = if self.input.is_empty() {
                     self.input.replace_with_segments(&input);
                     true
@@ -1610,6 +1654,10 @@ impl App {
     }
 
     pub fn request_rewind_picker(&mut self) -> Option<Method> {
+        if self.rewind_submit_pending() {
+            self.push_command_diagnostic("rewind is already applying; wait for the Pod response");
+            return None;
+        }
         if !self.connected {
             self.push_command_diagnostic("cannot rewind before the Pod is connected");
             return None;
@@ -1629,9 +1677,22 @@ impl App {
         self.rewind_request_pending = false;
     }
 
+    pub fn cancel_rewind_picker(&mut self) {
+        if self.rewind_submit_pending() {
+            self.flash_actionbar_notice(
+                "Rewind is applying; wait for the Pod response.",
+                ActionbarNoticeLevel::Warn,
+                ActionbarNoticeSource::Tui,
+                Duration::from_secs(3),
+            );
+            return;
+        }
+        self.close_rewind_picker();
+    }
+
     pub fn rewind_picker_up(&mut self) {
         if let Some(picker) = self.rewind_picker.as_mut() {
-            if picker.targets.is_empty() {
+            if picker.applying || picker.targets.is_empty() {
                 return;
             }
             picker.selected = if picker.selected == 0 {
@@ -1644,13 +1705,17 @@ impl App {
 
     pub fn rewind_picker_down(&mut self) {
         if let Some(picker) = self.rewind_picker.as_mut() {
-            if !picker.targets.is_empty() {
+            if !picker.applying && !picker.targets.is_empty() {
                 picker.selected = (picker.selected + 1) % picker.targets.len();
             }
         }
     }
 
     pub fn submit_rewind_picker(&mut self) -> Option<Method> {
+        if self.rewind_submit_pending() {
+            self.push_command_diagnostic("rewind is already applying; wait for the Pod response");
+            return None;
+        }
         if self.paused {
             self.push_command_diagnostic(
                 "cannot apply rewind while the Pod is paused; resume or wait for idle first",
@@ -1666,22 +1731,32 @@ impl App {
         let Some(picker) = self.rewind_picker.as_ref() else {
             return None;
         };
-        let Some(target) = picker.selected_target() else {
-            self.push_command_diagnostic("no rewind target is available");
-            return None;
-        };
-        if !target.eligible {
-            self.push_command_diagnostic(
-                target
-                    .disabled_reason
-                    .clone()
-                    .unwrap_or_else(|| "rewind target is disabled".into()),
-            );
+        if picker.applying {
+            self.push_command_diagnostic("rewind is already applying; wait for the Pod response");
             return None;
         }
+        let (target_id, expected_head_entries) = match picker.selected_target() {
+            Some(target) if target.eligible => (target.id.clone(), target.expected_head_entries),
+            Some(target) => {
+                self.push_command_diagnostic(
+                    target
+                        .disabled_reason
+                        .clone()
+                        .unwrap_or_else(|| "rewind target is disabled".into()),
+                );
+                return None;
+            }
+            None => {
+                self.push_command_diagnostic("no rewind target is available");
+                return None;
+            }
+        };
+        if let Some(picker) = self.rewind_picker.as_mut() {
+            picker.applying = true;
+        }
         Some(Method::RewindTo {
-            target: target.id.clone(),
-            expected_head_entries: target.expected_head_entries,
+            target: target_id,
+            expected_head_entries,
         })
     }
 
@@ -1836,12 +1911,50 @@ impl App {
         self.greeting = Some(greeting.clone());
         self.context_window = greeting.context_window;
         self.session_context_tokens = greeting.context_tokens;
+        self.restore_entries(entries, Some(greeting));
+    }
+
+    /// Restore after a successful destructive rewind. The Pod's
+    /// `RewindApplied` event already contains the authoritative post-rewind
+    /// session tail; always clear/replay from it even if this TUI instance has
+    /// somehow lost connect-time greeting metadata. Skipping the restore in
+    /// that case would leave old post-target output visible after success.
+    fn restore_rewind_snapshot(&mut self, entries: &[serde_json::Value]) {
+        let greeting = self.greeting.clone().or_else(|| {
+            self.blocks.iter().find_map(|b| match b {
+                Block::Greeting(g) => Some(g.clone()),
+                _ => None,
+            })
+        });
+        if let Some(greeting) = greeting.clone() {
+            self.greeting = Some(greeting.clone());
+            self.context_window = greeting.context_window;
+            self.session_context_tokens = greeting.context_tokens;
+        }
+        let missing_greeting = greeting.is_none();
+        self.restore_entries(entries, greeting);
+        if missing_greeting {
+            self.blocks.push(Block::Alert {
+                level: AlertLevel::Warn,
+                source: AlertSource::Pod,
+                message: "Rewind applied, but greeting metadata was unavailable; restored the session tail without the header.".to_owned(),
+            });
+        }
+    }
+
+    fn restore_entries(
+        &mut self,
+        entries: &[serde_json::Value],
+        greeting: Option<protocol::Greeting>,
+    ) {
         self.turn_index = 0;
         self.blocks.clear();
         self.cache = FileCache::new();
         self.task_store = TaskStore::new();
         self.task_pane_scroll = 0;
-        self.blocks.push(Block::Greeting(greeting));
+        if let Some(greeting) = greeting {
+            self.blocks.push(Block::Greeting(greeting));
+        }
         self.assistant_streaming = false;
 
         for entry in entries {
@@ -1865,6 +1978,7 @@ impl App {
         self.task_store = TaskStore::new();
         self.task_pane_scroll = 0;
         if let Some(g) = greeting {
+            self.greeting = Some(g.clone());
             self.blocks.push(Block::Greeting(g));
         }
     }
@@ -1960,6 +2074,38 @@ impl App {
             }
         }
     }
+}
+
+fn event_is_stale_after_rewind(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::Alert(_)
+            | Event::MemoryWorker(_)
+            | Event::CompactStart
+            | Event::CompactDone { .. }
+            | Event::CompactFailed { .. }
+            | Event::SegmentRotated { .. }
+            | Event::UserMessage { .. }
+            | Event::SystemItem { .. }
+            | Event::TurnStart { .. }
+            | Event::InvokeStart { .. }
+            | Event::LlmCallStart { .. }
+            | Event::LlmCallEnd { .. }
+            | Event::LlmRetry { .. }
+            | Event::LlmContinuation { .. }
+            | Event::TextDelta { .. }
+            | Event::TextDone { .. }
+            | Event::ThinkingStart
+            | Event::ThinkingDelta { .. }
+            | Event::ThinkingDone { .. }
+            | Event::ToolCallStart { .. }
+            | Event::ToolCallArgsDelta { .. }
+            | Event::ToolCallDone { .. }
+            | Event::ToolResult { .. }
+            | Event::Usage { .. }
+            | Event::TurnEnd { .. }
+            | Event::RunEnd { .. }
+    )
 }
 
 pub fn fmt_tokens(n: u64) -> String {
@@ -2106,6 +2252,159 @@ mod actionbar_notice_tests {
 
         app.clear_expired_actionbar_notice(now + duration);
         assert!(app.current_actionbar_notice(now).is_none());
+    }
+}
+
+#[cfg(test)]
+mod rewind_refresh_tests {
+    use super::*;
+
+    #[test]
+    fn rewind_applied_replaces_old_live_tail_and_restores_input() {
+        let mut app = app_with_rewind_picker();
+        app.greeting = Some(greeting());
+        app.blocks.push(Block::Greeting(greeting()));
+        app.blocks.push(Block::AssistantText {
+            text: "old post-target output".into(),
+        });
+
+        app.handle_pod_event(Event::RewindApplied {
+            entries: vec![],
+            input: vec![Segment::text("selected rewind input")],
+            summary: summary(3),
+        });
+
+        assert!(app.rewind_picker.is_none());
+        assert!(!blocks_contain(&app, "old post-target output"));
+        assert_eq!(composer_text(&app), "selected rewind input");
+        assert!(blocks_contain(&app, "Rewound session"));
+    }
+
+    #[test]
+    fn rewind_applied_clears_old_tail_even_when_greeting_is_missing() {
+        let mut app = app_with_rewind_picker();
+        app.blocks.push(Block::AssistantText {
+            text: "old live tail without greeting".into(),
+        });
+
+        app.handle_pod_event(Event::RewindApplied {
+            entries: vec![],
+            input: vec![Segment::text("rewound input")],
+            summary: summary(1),
+        });
+
+        assert!(!blocks_contain(&app, "old live tail without greeting"));
+        assert!(blocks_contain(&app, "greeting metadata was unavailable"));
+        assert_eq!(composer_text(&app), "rewound input");
+    }
+
+    #[test]
+    fn pending_rewind_submit_suppresses_duplicate_enter_and_failure_preserves_display() {
+        let mut app = app_with_rewind_picker();
+        app.blocks.push(Block::AssistantText {
+            text: "still-visible old display on failure".into(),
+        });
+
+        let first = app.submit_rewind_picker();
+        assert!(matches!(first, Some(Method::RewindTo { .. })));
+        assert!(app.rewind_picker.as_ref().unwrap().applying);
+        assert!(app.submit_rewind_picker().is_none());
+
+        app.handle_pod_event(Event::Error {
+            code: ErrorCode::InvalidRequest,
+            message: "stale rewind target".into(),
+        });
+
+        assert!(!app.rewind_picker.as_ref().unwrap().applying);
+        assert!(blocks_contain(&app, "still-visible old display on failure"));
+        let notice = app.current_actionbar_notice(Instant::now()).unwrap();
+        assert!(notice.text.contains("Rewind failed"));
+    }
+
+    #[test]
+    fn stale_live_update_after_success_does_not_repollute_restored_display() {
+        let mut app = app_with_rewind_picker();
+        app.greeting = Some(greeting());
+        app.blocks.push(Block::Greeting(greeting()));
+        app.blocks.push(Block::AssistantText {
+            text: "old tail before rewind".into(),
+        });
+
+        app.handle_pod_event(Event::RewindApplied {
+            entries: vec![],
+            input: vec![Segment::text("rewound input")],
+            summary: summary(2),
+        });
+        app.handle_pod_event(Event::TextDelta {
+            text: "stale tail after rewind".into(),
+        });
+        assert!(!blocks_contain(&app, "stale tail after rewind"));
+
+        app.handle_pod_event(Event::Status {
+            status: PodStatus::Idle,
+        });
+        app.handle_pod_event(Event::TextDelta {
+            text: "new live tail after status".into(),
+        });
+        assert!(blocks_contain(&app, "new live tail after status"));
+    }
+
+    fn app_with_rewind_picker() -> App {
+        let mut app = App::new("test".into());
+        app.connected = true;
+        app.rewind_picker = Some(RewindPickerState::new(
+            5,
+            vec![RewindTarget {
+                id: protocol::RewindTargetId {
+                    segment_id: uuid::Uuid::nil(),
+                    user_input_entry_index: 1,
+                },
+                expected_head_entries: 5,
+                truncate_entries: 2,
+                turn_index: 1,
+                timestamp_ms: None,
+                preview: "rewind target".into(),
+                eligible: true,
+                disabled_reason: None,
+                warning: None,
+            }],
+        ));
+        app
+    }
+
+    fn greeting() -> protocol::Greeting {
+        protocol::Greeting {
+            pod_name: "test".into(),
+            cwd: "/tmp".into(),
+            provider: "mock".into(),
+            model: "mock".into(),
+            scope_summary: "scope".into(),
+            tools: vec![],
+            context_window: 100,
+            context_tokens: 10,
+        }
+    }
+
+    fn summary(discarded_entries: usize) -> protocol::RewindSummary {
+        protocol::RewindSummary {
+            truncated_to_entries: 1,
+            discarded_entries,
+            tool_side_effect_warning: false,
+        }
+    }
+
+    fn blocks_contain(app: &App, needle: &str) -> bool {
+        app.blocks.iter().any(|block| match block {
+            Block::AssistantText { text }
+            | Block::SystemMessage { text }
+            | Block::Alert { message: text, .. } => text.contains(needle),
+            Block::UserMessage { segments } => Segment::flatten_to_text(segments).contains(needle),
+            _ => false,
+        })
+    }
+
+    fn composer_text(app: &App) -> String {
+        Segment::flatten_to_text(&app.input.submit_segments())
     }
 }
 
