@@ -27,7 +27,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget, Wrap};
 use serde::Serialize;
 use session_store::FsStore;
-use ticket::config::TicketConfig;
+use ticket::config::{GitBranchName, TicketConfig};
 use ticket::{LocalTicketBackend, TicketBackend, TicketIdOrSlug, TicketWorkflowState};
 use tokio::net::UnixStream;
 use unicode_width::UnicodeWidthStr;
@@ -2170,15 +2170,41 @@ struct OrchestrationWorktreeReady {
     status: OrchestrationWorktreeStatus,
 }
 
-fn orchestration_worktree_layout(workspace_root: &Path) -> OrchestrationWorktreeLayout {
+fn orchestration_worktree_layout_for_branch(
+    workspace_root: &Path,
+    branch: String,
+) -> OrchestrationWorktreeLayout {
     let stem = workspace_orchestrator_pod_name(workspace_root);
     OrchestrationWorktreeLayout {
         path: workspace_root
             .join(".worktree")
             .join("orchestration")
             .join(&stem),
-        branch: format!("orchestration/{stem}"),
+        branch,
     }
+}
+
+fn orchestration_worktree_layout(workspace_root: &Path) -> OrchestrationWorktreeLayout {
+    let stem = workspace_orchestrator_pod_name(workspace_root);
+    orchestration_worktree_layout_for_branch(workspace_root, format!("orchestration/{stem}"))
+}
+
+fn resolved_orchestration_worktree_layout(
+    workspace_root: &Path,
+) -> Result<OrchestrationWorktreeLayout, String> {
+    let config = TicketConfig::load_workspace(workspace_root)
+        .map_err(|err| format!("failed to load ticket config for orchestration branch: {err}"))?;
+    let branch = if let Some(branch) = config.orchestration.branch_name() {
+        branch.to_string()
+    } else {
+        orchestration_worktree_layout(workspace_root).branch
+    };
+    GitBranchName::new(branch.clone())
+        .map_err(|message| format!("invalid orchestration branch `{branch}`: {message}"))?;
+    Ok(orchestration_worktree_layout_for_branch(
+        workspace_root,
+        branch,
+    ))
 }
 
 fn build_orchestrator_launch_context(
@@ -2204,7 +2230,7 @@ fn build_orchestrator_launch_context(
 fn ensure_orchestration_worktree(
     workspace_root: &Path,
 ) -> Result<OrchestrationWorktreeReady, String> {
-    let layout = orchestration_worktree_layout(workspace_root);
+    let layout = resolved_orchestration_worktree_layout(workspace_root)?;
     if layout.path.exists() {
         if !layout.path.is_dir() {
             return Err(format!(
@@ -2267,7 +2293,7 @@ fn ensure_orchestration_worktree(
 fn prepare_orchestration_worktree_for_restore(
     workspace_root: &Path,
 ) -> Result<OrchestrationWorktreeReady, String> {
-    let layout = orchestration_worktree_layout(workspace_root);
+    let layout = resolved_orchestration_worktree_layout(workspace_root)?;
     if !layout.path.exists() {
         return Err(format!(
             "orchestration worktree is missing; cannot restore existing Pod state: {}",
@@ -2503,8 +2529,9 @@ async fn orchestrator_lifecycle(
                                 pod_name,
                                 OrchestratorPanelStatus::Restored,
                                 Some(format!(
-                                    "restored existing Pod state in orchestration worktree {}",
-                                    worktree.layout.path.display()
+                                    "restored existing Pod state in orchestration worktree {} on branch {}",
+                                    worktree.layout.path.display(),
+                                    worktree.layout.branch
                                 )),
                             ))
                             .mark_reload()
@@ -3406,7 +3433,15 @@ fn prepare_panel_queue_handoff(
         queue_check_failed("root-git-user", ticket_id, &root_top_level, message)
     })?;
 
-    let orchestration = orchestration_worktree_layout(&root_top_level);
+    let orchestration =
+        resolved_orchestration_worktree_layout(&root_top_level).map_err(|message| {
+            queue_check_failed(
+                "orchestration-branch-config",
+                ticket_id,
+                &root_top_level,
+                message,
+            )
+        })?;
     if !orchestration.path.exists() {
         return Err(queue_check_failed(
             "orchestration-worktree-identity",
@@ -5220,6 +5255,94 @@ mod tests {
     }
 
     #[test]
+    fn ensure_and_restore_use_configured_orchestration_branch() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("repo");
+        init_test_repo(&root);
+        write_test_ticket_config(
+            &root,
+            r#"
+[orchestration]
+branch = "orchestration/custom-panel"
+"#,
+        );
+        run_test_git(&root, &["add", ".yoi/ticket.config.toml"]).unwrap();
+        run_test_git(&root, &["commit", "-m", "ticket config"]).unwrap();
+
+        let resolved = resolved_orchestration_worktree_layout(&root).unwrap();
+        assert_eq!(resolved.branch, "orchestration/custom-panel");
+        assert!(
+            resolved
+                .path
+                .ends_with(".worktree/orchestration/repo-orchestrator")
+        );
+
+        let created = ensure_orchestration_worktree(&root).unwrap();
+        assert_eq!(created.status, OrchestrationWorktreeStatus::Created);
+        assert_eq!(created.layout, resolved);
+        let branch =
+            run_test_git_output(&created.layout.path, &["branch", "--show-current"]).unwrap();
+        assert_eq!(branch.trim(), "orchestration/custom-panel");
+
+        let restored = prepare_orchestration_worktree_for_restore(&root).unwrap();
+        assert_eq!(restored.status, OrchestrationWorktreeStatus::Reused);
+        assert_eq!(restored.layout, created.layout);
+    }
+
+    #[test]
+    fn invalid_configured_orchestration_branch_is_rejected_before_git_worktree_operations() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        write_test_ticket_config(
+            &root,
+            r#"
+[orchestration]
+branch = "orchestration/bad:branch"
+"#,
+        );
+
+        let err = ensure_orchestration_worktree(&root).unwrap_err();
+        assert!(err.contains("failed to load ticket config"));
+        assert!(err.contains("git branch name"));
+        assert!(!root.join(".worktree").exists());
+    }
+
+    #[test]
+    fn restore_rejects_mismatched_configured_orchestration_branch_without_checkout() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("repo");
+        init_test_repo(&root);
+        write_test_ticket_config(
+            &root,
+            r#"
+[orchestration]
+branch = "orchestration/custom-panel"
+"#,
+        );
+        run_test_git(&root, &["add", ".yoi/ticket.config.toml"]).unwrap();
+        run_test_git(&root, &["commit", "-m", "ticket config"]).unwrap();
+        let layout = resolved_orchestration_worktree_layout(&root).unwrap();
+        run_test_git(
+            &root,
+            &[
+                "worktree",
+                "add",
+                &layout.path.display().to_string(),
+                "-b",
+                "orchestration/other-panel",
+                "HEAD",
+            ],
+        )
+        .unwrap();
+
+        let err = prepare_orchestration_worktree_for_restore(&root).unwrap_err();
+        assert!(err.contains("expected orchestration/custom-panel"));
+        let branch = run_test_git_output(&layout.path, &["branch", "--show-current"]).unwrap();
+        assert_eq!(branch.trim(), "orchestration/other-panel");
+    }
+
+    #[test]
     fn restore_uses_existing_orchestration_worktree_even_when_dirty() {
         let temp = TempDir::new().unwrap();
         let root = temp.path().join("repo");
@@ -5309,6 +5432,12 @@ mod tests {
         assert!(layout.path.join("unrelated.txt").exists());
     }
 
+    fn write_test_ticket_config(root: &Path, content: &str) {
+        let config_dir = root.join(".yoi");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(config_dir.join("ticket.config.toml"), content).unwrap();
+    }
+
     fn init_test_repo(root: &Path) {
         std::fs::create_dir_all(root).unwrap();
         run_test_git(root, &["init"]).unwrap();
@@ -5338,6 +5467,22 @@ mod tests {
         let mut command = Command::new("git");
         command.arg("-C").arg(root).args(args);
         run_git_command(command, "run test git")
+    }
+
+    fn run_test_git_output(root: &Path, args: &[&str]) -> Result<String, String> {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .map_err(|error| format!("could not run test git: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "git failed to run test git: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
 
     use crate::pod_list::{LivePodInfo, PodEntrySummary, StoredMetadataState, StoredPodInfo};

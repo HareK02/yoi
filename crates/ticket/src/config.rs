@@ -35,6 +35,9 @@ pub fn ticket_config_scaffold() -> String {
     out.push_str(
         "\n# Optional durable Ticket record language. When unset, generated Ticket text keeps current defaults.\n# [ticket]\n# language = \"Japanese\"\n",
     );
+    out.push_str(
+        "\n# Optional Panel Orchestrator worktree branch. When unset, Panel uses orchestration/<workspace-orchestrator-pod-name>.\n# [orchestration]\n# branch = \"orchestration/<workspace-orchestrator-pod-name>\"\n",
+    );
     for role in TicketRole::ALL {
         out.push_str(&format!(
             "\n[roles.{role}]\nprofile = \"{}\"\nworkflow = \"{}\"\n",
@@ -67,7 +70,101 @@ pub enum TicketConfigError {
 pub struct TicketConfig {
     pub backend: TicketBackendConfig,
     pub ticket: TicketRecordConfig,
+    pub orchestration: TicketOrchestrationConfig,
     pub roles: TicketRoleProfiles,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TicketOrchestrationConfig {
+    pub branch: Option<GitBranchName>,
+}
+
+impl TicketOrchestrationConfig {
+    pub fn branch_name(&self) -> Option<&str> {
+        self.branch.as_ref().map(GitBranchName::as_str)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+pub struct GitBranchName(String);
+
+impl GitBranchName {
+    pub fn new(value: impl Into<String>) -> Result<Self, String> {
+        let value = value.into();
+        let trimmed = value.trim();
+        if trimmed != value {
+            return Err("git branch name must not have leading or trailing whitespace".to_string());
+        }
+        validate_git_branch_name_value(trimmed)?;
+        Ok(Self(trimmed.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl<'de> Deserialize<'de> for GitBranchName {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+impl fmt::Display for GitBranchName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+fn validate_git_branch_name_value(value: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err("git branch name must not be empty".to_string());
+    }
+    if value == "@" {
+        return Err("git branch name must not be `@`".to_string());
+    }
+    if value.starts_with('-') {
+        return Err("git branch name must not start with `-`".to_string());
+    }
+    if value.starts_with("refs/") {
+        return Err("git branch name must be a short branch name, not a full ref".to_string());
+    }
+    if value.starts_with('/') || value.ends_with('/') || value.contains("//") {
+        return Err("git branch name must not contain empty path components".to_string());
+    }
+    if value.contains("..") {
+        return Err("git branch name must not contain `..`".to_string());
+    }
+    if value.contains("@{") {
+        return Err("git branch name must not contain `@{`".to_string());
+    }
+    if value.ends_with('.') {
+        return Err("git branch name must not end with `.`".to_string());
+    }
+
+    for component in value.split('/') {
+        if component.starts_with('.') {
+            return Err("git branch name components must not start with `.`".to_string());
+        }
+        if component.ends_with(".lock") {
+            return Err("git branch name components must not end with `.lock`".to_string());
+        }
+    }
+
+    for ch in value.chars() {
+        if ch.is_control() || matches!(ch, ' ' | '~' | '^' | ':' | '?' | '*' | '[' | '\\') {
+            return Err(format!(
+                "git branch name contains unsupported character `{}`",
+                ch.escape_default()
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 impl TicketConfig {
@@ -76,6 +173,7 @@ impl TicketConfig {
         Self {
             backend: TicketBackendConfig::default_for_workspace(workspace_root),
             ticket: TicketRecordConfig::default(),
+            orchestration: TicketOrchestrationConfig::default(),
             roles: TicketRoleProfiles::default(),
         }
     }
@@ -528,7 +626,24 @@ struct RawTicketConfig {
     #[serde(default)]
     ticket: RawTicketRecordConfig,
     #[serde(default)]
+    orchestration: RawTicketOrchestrationConfig,
+    #[serde(default)]
     roles: BTreeMap<String, RawTicketRoleConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTicketOrchestrationConfig {
+    #[serde(default)]
+    branch: Option<GitBranchName>,
+}
+
+impl RawTicketOrchestrationConfig {
+    fn resolve(self) -> TicketOrchestrationConfig {
+        TicketOrchestrationConfig {
+            branch: self.branch,
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -576,6 +691,7 @@ impl RawTicketConfig {
                 }
             })?,
             ticket: self.ticket.resolve(),
+            orchestration: self.orchestration.resolve(),
             roles,
         })
     }
@@ -680,6 +796,7 @@ mod tests {
             temp.path().join(DEFAULT_TICKET_BACKEND_RELATIVE_PATH)
         );
         assert_eq!(config.ticket_record_language(), None);
+        assert_eq!(config.orchestration.branch_name(), None);
         for role in TicketRole::ALL {
             let role_config = config.role(role);
             assert_eq!(role_config.profile.as_str(), "inherit");
@@ -700,6 +817,9 @@ root = "custom-tickets"
 
 [ticket]
 language = "Japanese"
+
+[orchestration]
+branch = "orchestration/custom-panel"
 
 [roles.intake]
 profile = "project:intake"
@@ -731,6 +851,10 @@ workflow = "multi-agent-workflow"
         assert_eq!(config.backend.root, temp.path().join("custom-tickets"));
         assert_eq!(config.ticket_record_language(), Some("Japanese"));
         assert_eq!(
+            config.orchestration.branch_name(),
+            Some("orchestration/custom-panel")
+        );
+        assert_eq!(
             config.profile_for(TicketRole::Intake).as_str(),
             "project:intake"
         );
@@ -756,6 +880,9 @@ workflow = "multi-agent-workflow"
         assert!(scaffold.contains("provider = \"builtin:yoi_local\""));
         assert!(scaffold.contains("root = \".yoi/tickets\""));
         assert!(scaffold.contains("# [ticket]\n# language = \"Japanese\""));
+        assert!(scaffold.contains(
+            "# [orchestration]\n# branch = \"orchestration/<workspace-orchestrator-pod-name>\""
+        ));
         for role in TicketRole::ALL {
             assert!(scaffold.contains(&format!("[roles.{role}]")));
             assert!(scaffold.contains(&format!(
@@ -773,6 +900,7 @@ workflow = "multi-agent-workflow"
         )
         .unwrap();
         assert_eq!(config.backend_root(), temp.path().join(".yoi/tickets"));
+        assert_eq!(config.orchestration.branch_name(), None);
         for role in TicketRole::ALL {
             let role_config = config.role_launch_config(role).unwrap();
             assert_eq!(role_config.profile.as_str(), role.default_profile());
@@ -848,6 +976,32 @@ profile = "builtin:default"
             TicketRoleLaunchConfigError::MissingRoleTable {
                 role: TicketRole::Orchestrator
             }
+        );
+    }
+
+    #[test]
+    fn orchestration_branch_config_is_validated_as_git_branch_name() {
+        let temp = TempDir::new().unwrap();
+        write_config(
+            temp.path(),
+            r#"
+[orchestration]
+branch = "orchestration/panel:bad"
+"#,
+        );
+
+        let error = TicketConfig::load_workspace(temp.path()).unwrap_err();
+        assert!(error.to_string().contains("git branch name"));
+        assert!(error.to_string().contains("unsupported character"));
+    }
+
+    #[test]
+    fn orchestration_branch_rejects_full_refs_and_dash_prefixes() {
+        assert!(GitBranchName::new("refs/heads/orchestration/panel").is_err());
+        assert!(GitBranchName::new("-orchestration-panel").is_err());
+        assert_eq!(
+            GitBranchName::new("orchestration/panel").unwrap().as_str(),
+            "orchestration/panel"
         );
     }
 
