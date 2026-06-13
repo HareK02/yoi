@@ -1,12 +1,15 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use minijinja::Value as TemplateValue;
 use serde_json::Value;
+use std::collections::BTreeMap;
 use ticket::{LocalTicketBackend, TicketBackend, TicketIdOrSlug};
 use tracing::debug;
 
 use crate::discovery::PodDiscovery;
 use crate::hook::{Hook, HookPostToolAction, PostToolCall, ToolResultSummary};
+use crate::prompt::catalog::{PodPrompt, PromptCatalog};
 use pod_store::PodMetadataStore;
 
 const MAX_TITLE_CHARS: usize = 96;
@@ -89,26 +92,54 @@ fn build_ticket_event_notice(
         .ok()?;
 
     let event_kind = sanitize_one_line(&event_kind, MAX_EVENT_KIND_CHARS);
+    let ticket_id = ticket.meta.id.as_str();
     let title = sanitize_one_line(&ticket.meta.title, MAX_TITLE_CHARS);
     let state = ticket.meta.workflow_state.as_str();
     let output_summary = sanitize_one_line(&output.summary, MAX_SUMMARY_CHARS);
-    let ref_path = event_ref_path(&ticket.meta.id, summary.tool_name.as_str());
-    let raw_message = format!(
-        "Ticket event notice (weak; auto_run=false)\n\
-         ticket: {ticket_id}\n\
-         title: {title}\n\
-         state: {state}\n\
-         event: {event_kind}\n\
-         summary: {output_summary}\n\
-         ref: {ref_path}",
-        ticket_id = ticket.meta.id.as_str(),
-    );
+    let ref_path = event_ref_path(ticket_id, summary.tool_name.as_str());
+    let message = render_ticket_event_notice_message(TicketEventNoticeValues {
+        ticket_id,
+        title: &title,
+        state,
+        event_kind: &event_kind,
+        summary: &output_summary,
+        ref_path: &ref_path,
+    })?;
 
     Some(TicketEventNotice {
-        ticket_id: ticket.meta.id.as_str().to_string(),
+        ticket_id: ticket_id.to_string(),
         event_kind,
-        message: bound_chars(&raw_message, MAX_MESSAGE_CHARS),
+        message: bound_chars(&message, MAX_MESSAGE_CHARS),
     })
+}
+
+struct TicketEventNoticeValues<'a> {
+    ticket_id: &'a str,
+    title: &'a str,
+    state: &'a str,
+    event_kind: &'a str,
+    summary: &'a str,
+    ref_path: &'a str,
+}
+
+fn render_ticket_event_notice_message(values: TicketEventNoticeValues<'_>) -> Option<String> {
+    PromptCatalog::builtins_only()
+        .ok()?
+        .render(PodPrompt::TicketEventCompanionNotice, values.to_template())
+        .ok()
+}
+
+impl TicketEventNoticeValues<'_> {
+    fn to_template(&self) -> TemplateValue {
+        let mut values: BTreeMap<&'static str, TemplateValue> = BTreeMap::new();
+        values.insert("ticket_id", TemplateValue::from(self.ticket_id));
+        values.insert("title", TemplateValue::from(self.title));
+        values.insert("state", TemplateValue::from(self.state));
+        values.insert("event_kind", TemplateValue::from(self.event_kind));
+        values.insert("summary", TemplateValue::from(self.summary));
+        values.insert("ref_path", TemplateValue::from(self.ref_path));
+        TemplateValue::from(values)
+    }
 }
 
 fn explicit_ticket_event_kind(tool_name: &str, content: &Value) -> Option<String> {
@@ -230,6 +261,29 @@ mod tests {
         assert!(notice.message.contains("event: state/queued->inprogress"));
         assert!(notice.message.contains("ref: .yoi/tickets/"));
         assert!(notice.message.chars().count() <= MAX_MESSAGE_CHARS + 1);
+
+        let expected = PromptCatalog::builtins_only()
+            .expect("load prompt catalog")
+            .render(
+                PodPrompt::TicketEventCompanionNotice,
+                TicketEventNoticeValues {
+                    ticket_id: &notice.ticket_id,
+                    title: &sanitize_one_line(
+                        "A very long title that should be bounded but still identify the ticket precisely enough for Companion",
+                        MAX_TITLE_CHARS,
+                    ),
+                    state: "planning",
+                    event_kind: "state/queued->inprogress",
+                    summary: &sanitize_one_line(
+                        "Changed ticket state from queued to inprogress with a deliberately long summary that should be bounded before entering the weak notification payload and should not contain large logs",
+                        MAX_SUMMARY_CHARS,
+                    ),
+                    ref_path: &format!(".yoi/tickets/{}/item.md", ticket_id),
+                }
+                .to_template(),
+            )
+            .expect("render prompt resource");
+        assert_eq!(notice.message, bound_chars(&expected, MAX_MESSAGE_CHARS));
     }
 
     #[test]
@@ -392,7 +446,6 @@ mod tests {
             .await;
         assert_eq!(action, HookPostToolAction::Continue);
         let message = rx.recv().await.unwrap();
-        assert!(message.contains("Ticket event notice"));
         assert!(message.contains("event: state/queued->inprogress"));
         assert!(message.contains("title: Companion event hook"));
         companion.await.unwrap();
