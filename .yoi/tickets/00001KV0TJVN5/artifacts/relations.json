@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "relations": [
+    {
+      "ticket_id": "00001KV0TJVN5",
+      "kind": "related",
+      "target": "00001KSKBP9YG",
+      "note": "既存 E2E harness first slice の post-merge binary freshness gap を補正する follow-up。",
+      "author": "orchestrator",
+      "at": "2026-06-13T15:46:12Z"
+    }
+  ]
+}
