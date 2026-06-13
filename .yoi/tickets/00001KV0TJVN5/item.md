@@ -2,7 +2,7 @@
 title: 'E2E harness が最新 yoi binary を自動 build して使うようにする'
 state: 'inprogress'
 created_at: '2026-06-13T15:46:07Z'
-updated_at: '2026-06-13T15:47:00Z'
+updated_at: '2026-06-13T15:54:18Z'
 assignee: null
 readiness: 'ready'
 queued_by: 'yoi ticket'

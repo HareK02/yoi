@@ -10,7 +10,7 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -23,12 +23,42 @@ static FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub type Result<T> = std::result::Result<T, HarnessError>;
 
+#[derive(Clone, Debug, Serialize)]
+pub struct BinaryProviderInfo {
+    pub provider: String,
+    pub binary: PathBuf,
+    pub workspace_root: PathBuf,
+    pub cargo: Option<PathBuf>,
+    pub build_args: Vec<String>,
+    pub build_command: Option<String>,
+    pub profile: String,
+}
+
+impl BinaryProviderInfo {
+    fn log(&self) {
+        match &self.build_command {
+            Some(command) => eprintln!(
+                "yoi-e2e binary provider={} command={} binary={}",
+                self.provider,
+                command,
+                self.binary.display()
+            ),
+            None => eprintln!(
+                "yoi-e2e binary provider={} binary={}",
+                self.provider,
+                self.binary.display()
+            ),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum HarnessError {
     Io(io::Error),
     Json(serde_json::Error),
     CommandFailed {
         program: PathBuf,
+        args: Vec<String>,
         status: ExitStatus,
         stdout: String,
         stderr: String,
@@ -51,13 +81,14 @@ impl std::fmt::Display for HarnessError {
             Self::Json(err) => write!(f, "json error: {err}"),
             Self::CommandFailed {
                 program,
+                args,
                 status,
                 stdout,
                 stderr,
             } => write!(
                 f,
                 "{} exited with {status}\nstdout:\n{stdout}\nstderr:\n{stderr}",
-                program.display()
+                command_display(program, args)
             ),
             Self::Timeout { what, artifacts } => write!(
                 f,
@@ -66,7 +97,7 @@ impl std::fmt::Display for HarnessError {
             ),
             Self::MissingBinary(path) => write!(
                 f,
-                "missing yoi binary {}; run `cargo build -p yoi --features e2e-test` or set YOI_E2E_BIN",
+                "missing yoi binary {}; set YOI_E2E_BIN to an existing binary or inspect target/e2e-artifacts/binary-provider.json",
                 path.display()
             ),
             Self::MouseCaptureNotEnabled { artifacts } => write!(
@@ -496,13 +527,7 @@ pub struct FixtureWorkspace {
 
 impl FixtureWorkspace {
     pub fn new(binary: &Path) -> Result<Self> {
-        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(Path::parent)
-            .ok_or_else(|| {
-                HarnessError::Protocol("could not resolve workspace root for artifacts".to_owned())
-            })?
-            .to_path_buf();
+        let workspace_root = workspace_root()?;
         let root = workspace_root
             .join("target")
             .join("e2e-artifacts")
@@ -602,19 +627,134 @@ impl FixtureWorkspace {
     }
 }
 
-pub fn yoi_binary() -> PathBuf {
-    if let Some(path) = std::env::var_os("YOI_E2E_BIN") {
-        return PathBuf::from(path);
+pub fn yoi_binary() -> Result<PathBuf> {
+    Ok(yoi_binary_info()?.binary)
+}
+
+pub fn yoi_binary_info() -> Result<BinaryProviderInfo> {
+    static BINARY_INFO: OnceLock<std::result::Result<BinaryProviderInfo, String>> = OnceLock::new();
+    match BINARY_INFO.get_or_init(|| resolve_yoi_binary().map_err(|err| err.to_string())) {
+        Ok(info) => Ok(info.clone()),
+        Err(message) => Err(HarnessError::Protocol(message.clone())),
     }
-    let mut path = std::env::current_exe().expect("current executable path");
+}
+
+fn resolve_yoi_binary() -> Result<BinaryProviderInfo> {
+    if let Some(path) = std::env::var_os("YOI_E2E_BIN") {
+        let info = BinaryProviderInfo {
+            provider: "YOI_E2E_BIN".to_owned(),
+            binary: PathBuf::from(path),
+            workspace_root: workspace_root()?,
+            cargo: None,
+            build_args: Vec::new(),
+            build_command: None,
+            profile: test_profile(),
+        };
+        info.log();
+        write_binary_provider_artifact(&info)?;
+        return Ok(info);
+    }
+
+    let workspace_root = workspace_root()?;
+    let cargo = PathBuf::from(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
+    let mut args = vec![
+        "build".to_owned(),
+        "-p".to_owned(),
+        "yoi".to_owned(),
+        "--features".to_owned(),
+        "e2e-test".to_owned(),
+        "--bin".to_owned(),
+        "yoi".to_owned(),
+    ];
+    if test_profile() == "release" {
+        args.push("--release".to_owned());
+    }
+
+    let command = command_display(&cargo, &args);
+    eprintln!("yoi-e2e binary provider=cargo-build command={command}");
+    let output = Command::new(&cargo)
+        .args(&args)
+        .current_dir(&workspace_root)
+        .output()?;
+    if !output.status.success() {
+        return Err(HarnessError::CommandFailed {
+            program: cargo,
+            args,
+            status: output.status,
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        });
+    }
+
+    let binary = current_target_profile_dir()?.join(binary_name());
+    let info = BinaryProviderInfo {
+        provider: "cargo-build".to_owned(),
+        binary,
+        workspace_root,
+        cargo: Some(cargo),
+        build_args: args,
+        build_command: Some(command),
+        profile: test_profile(),
+    };
+    info.log();
+    write_binary_provider_artifact(&info)?;
+    if !info.binary.exists() {
+        return Err(HarnessError::MissingBinary(info.binary));
+    }
+    Ok(info)
+}
+
+fn workspace_root() -> Result<PathBuf> {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .ok_or_else(|| HarnessError::Protocol("could not resolve workspace root".to_owned()))
+}
+
+fn current_target_profile_dir() -> Result<PathBuf> {
+    let mut path = std::env::current_exe()?;
     while let Some(name) = path.file_name().and_then(|name| name.to_str()) {
         if name == "debug" || name == "release" {
-            path.push("yoi");
-            return path;
+            return Ok(path);
         }
         path.pop();
     }
-    PathBuf::from("target/debug/yoi")
+    Ok(workspace_root()?.join("target").join(test_profile()))
+}
+
+fn test_profile() -> String {
+    let Ok(mut path) = std::env::current_exe() else {
+        return "debug".to_owned();
+    };
+    while let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+        if name == "debug" || name == "release" {
+            return name.to_owned();
+        }
+        path.pop();
+    }
+    "debug".to_owned()
+}
+
+fn binary_name() -> String {
+    format!("yoi{}", std::env::consts::EXE_SUFFIX)
+}
+
+fn write_binary_provider_artifact(info: &BinaryProviderInfo) -> Result<()> {
+    let dir = info.workspace_root.join("target").join("e2e-artifacts");
+    fs::create_dir_all(&dir)?;
+    fs::write(
+        dir.join("binary-provider.json"),
+        serde_json::to_vec_pretty(info)?,
+    )?;
+    Ok(())
+}
+
+fn command_display(program: &Path, args: &[String]) -> String {
+    std::iter::once(program.display().to_string())
+        .chain(args.iter().cloned())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn open_pty(size: (u16, u16)) -> Result<(File, File)> {
@@ -704,6 +844,7 @@ fn run_yoi_capture(
     if !output.status.success() {
         return Err(HarnessError::CommandFailed {
             program: binary.to_path_buf(),
+            args: args.iter().map(|arg| (*arg).to_owned()).collect(),
             status: output.status,
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
