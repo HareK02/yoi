@@ -140,3 +140,30 @@ Residual risks:
 
 
 ---
+
+<!-- event: review author: hare at: 2026-06-13T11:19:22Z status: approve -->
+
+## Review: approve
+
+Approve.
+
+Evidence:
+- Reviewed Ticket 00001KV072V89 and diff `20daae0c..HEAD` in `/home/hare/Projects/yoi/.worktree/panel-mouse-selection`.
+- Implementation adds a bounded `PanelRowHitBox` hit-test cache from the rendered list area and only handles primary-button `MouseEventKind::Down`; non-row/list-empty clicks return no selection change.
+- Click handling calls `select_panel_key` only. I found no mouse path invoking Queue/Open/Close, ticket lifecycle mutation, Pod attach/open, or destructive workflow actions.
+- Existing keyboard/composer paths remain the execution/action paths: blank Enter/actionbar/detail display consume the selected row after selection; text input, arrows, Enter, Esc, and Tab behavior is still handled by the existing key handlers.
+- Modal/diagnostic state is guarded by `panel_diagnostic_open`, so background row clicks do not change selection while diagnostics are shown.
+- Mouse terminal mode remains the existing least-intrusive normal mouse + SGR setup (`?1000h` + `?1006h` via the local narrow capture command), with no drag-capture mode added.
+- Tests added/updated cover row hit testing for visible selectable rows, left-click selection feeding existing blank-Enter behavior, non-row no-op/preserved draft, and keyboard/composer preservation; the no-Queue/Open/Close guarantee is enforced by the mouse handler only selecting rows and leaving action dispatch on existing key/action paths.
+
+Validation performed:
+- `cargo test -p tui mouse_ --lib` — passed.
+- `cargo test -p tui row_hit_testing_maps_only_visible_selectable_rows --lib` — passed.
+- `cargo fmt --check` — passed.
+- `git diff --check 20daae0c..HEAD` — passed.
+
+Risks / notes:
+- I did not run the broader `cargo test -p tui multi_pod --lib` suite because the requested focused coverage passed and that broader suite was noted as having a likely unrelated existing failure.
+
+
+---
