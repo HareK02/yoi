@@ -84,3 +84,18 @@ Validation:
 Ticket evidence、relation records、orchestration plan、workspace state を確認した。This Ticket 自身を blocking する relation はなく、incoming dependent Ticket の前提として先に進めるべき。実装 side effect の前に inprogress acceptance を記録する。
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-13T18:42:45Z -->
+
+## Implementation report
+
+Implementation handoff started.
+
+- Worktree: `/home/hare/Projects/yoi/.worktree/remove-feature-hostauthority`
+- Branch: `ticket-00001KV0SP0TY-remove-feature-hostauthority`
+- Coder Pod: `coder-00001KV0SP0TY-hostauthority`
+- Scope: root workspace non-recursive read for launch validation only; child worktree read; writes limited to relevant feature/Ticket/tool/client/workflow/manifest/docs surfaces, target, and this Ticket record。
+
+Next: Coder implementation_report / commit / validation evidence を確認後、Reviewer を起動する。
+
+---

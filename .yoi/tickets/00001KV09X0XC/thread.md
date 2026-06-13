@@ -70,3 +70,18 @@ Validation:
 Ticket evidence、relation records、orchestration plan、workspace state を確認した。Blocking relation はなく、implementation-ready。実装 side effect の前に inprogress acceptance を記録する。
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-13T18:42:45Z -->
+
+## Implementation report
+
+Implementation handoff started.
+
+- Worktree: `/home/hare/Projects/yoi/.worktree/panel-return-planning`
+- Branch: `ticket-00001KV09X0XC-panel-return-planning`
+- Coder Pod: `coder-00001KV09X0XC-return-planning`
+- Scope: root workspace non-recursive read for launch validation only; child worktree read; writes limited to relevant TUI/Ticket/Client/Yoi/Pod role-session surfaces, target, and this Ticket record。
+
+Next: Coder implementation_report / commit / validation evidence を確認後、Reviewer を起動する。
+
+---
