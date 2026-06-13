@@ -153,3 +153,72 @@ Critical risks / reviewer focus:
 Ticket evidence、relation records、existing OrchestrationPlan waiting/conflict notes、related completed Panel mouse integration、visible Pod/worktree state、and clean Orchestrator workspace were checked. The prior conflict/capacity blocker is resolved; no durable dependency blockers remain. Implementation can proceed in a dedicated child worktree with a first-step code-path spike and focused regression test before changing Quit behavior.
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-06-13T11:35:16Z -->
+
+## Implementation report
+
+Implementation report for Ticket 00001KV0723PC
+
+Commit: cfe411e50d7361228e509a18699477b13c4bc3e7 (`fix: avoid panel quit notice wait`)
+
+Observed / identified delay cause:
+- In `crates/tui/src/multi_pod.rs`, the workspace Panel run loop handled a completed `PendingReload` before polling terminal input.
+- When the reload result requested Orchestrator queue-attention notification, the loop awaited `dispatch_orchestrator_queue_attention_notice(request)` inline.
+- That dispatch path can wait on Unix socket connect/read/write operations and their timeouts. While it was awaited inline, queued terminal events such as `Ctrl+C` / `Ctrl+D` could not be observed, so an explicit Quit could be delayed by non-essential notice dispatch work.
+
+Fix summary:
+- Added `PendingQueueAttentionNotice`, a cancellable background task wrapper for queue-attention notice dispatch.
+- Changed the Panel run loop to start queue-attention notice dispatch asynchronously after reload and only harvest the result when the task is already finished.
+- Added explicit quit cleanup through `abort_panel_background_work_for_quit`, aborting both pending reload and pending queue-attention notice work before returning `MultiPodOutcome::Quit`.
+- Also abort the background notice before foreground open/action paths that already abort reload work, so non-essential notice dispatch does not contend with user-directed operations.
+- Preserved terminal/backend shutdown behavior by keeping the existing return path and relying on explicit abort plus Rust `Drop` cleanup for background tasks.
+
+Files changed:
+- `crates/tui/src/multi_pod.rs`
+
+Regression coverage:
+- Added `multi_quit_aborts_background_reload_and_notice_without_waiting`, which starts never-completing reload and notice tasks, exercises the quit abort helper under a timeout, and verifies both tasks are cancelled.
+- Existing reload overlap behavior remains covered by `multi_poll_reload_does_not_overlap_in_flight_reload`.
+
+Validation commands/results:
+- `cargo fmt --check` — passed
+- `git diff --check` — passed
+- `cargo test -p tui multi_quit_aborts_background_reload_and_notice_without_waiting --lib` — passed
+- `cargo test -p tui multi_poll_reload_does_not_overlap_in_flight_reload --lib` — passed
+- `cargo check -p tui --all-targets` — passed
+
+Residual risks / manual validation notes:
+- No broad runtime-loop rewrite was done. Foreground user-directed operations that are already awaited by the Panel can still occupy the loop; this change targets the identified non-essential background notice dispatch delay path.
+- I did not run an interactive manual `yoi panel` session from this Coder environment. Recommended manual check: start `yoi panel`, trigger a reload/queued Ticket condition that would dispatch queue-attention notice, then press `Ctrl+C`/`Ctrl+D` while the notice target is slow or unavailable; the Panel should exit promptly while terminal state is restored.
+
+
+---
+
+<!-- event: review author: hare at: 2026-06-13T11:40:01Z status: approve -->
+
+## Review: approve
+
+Review: approve
+
+Evidence:
+- Reviewed Ticket intent/criteria and `git diff 9dacc90e..HEAD` for commits `cfe411e5` and `8de82836`.
+- The reported delay cause is plausible in the previous loop shape: a completed reload was processed before input polling and could inline-await queue-attention notice dispatch; that dispatch uses Pod socket connect/read/write paths, so queued `Ctrl+C` / `Ctrl+D` input could wait behind nonessential notice work.
+- The implementation changes only `crates/tui/src/multi_pod.rs` plus the implementation report. Queue-attention notice dispatch is now wrapped in a cancellable `PendingQueueAttentionNotice`, started in the background, and harvested only after completion. Reload dispatch is guarded against overlap.
+- Quit handling now calls `abort_panel_background_work_for_quit`, aborting pending reload and pending queue-attention notice tasks before returning the existing `MultiPodOutcome::Quit`; this keeps the established terminal/backend cleanup return path intact.
+- Existing foreground open/action helper paths also abort the nonessential pending notice before returning user-directed outcomes, so stale notice dispatch does not block those paths.
+- No Ticket lifecycle authority, Pod authority boundary, Panel row/action semantics, composer target semantics, prompt resources, or Ticket schema changes were introduced.
+- The regression test starts never-completing reload and notice futures, exercises the quit abort helper under a timeout, and verifies cancellation of both tasks. This is a meaningful regression for the pending-background-work latency path rather than only checking that a helper was wired.
+
+Validation performed:
+- `cargo test -p tui multi_quit_aborts_background_reload_and_notice_without_waiting --lib` — passed.
+- `cargo test -p tui multi_poll_reload_does_not_overlap_in_flight_reload --lib` — passed.
+- `cargo fmt --check` — passed.
+- `git diff --check` — passed.
+- `cargo check -p tui --all-targets` — passed.
+
+Risks / notes:
+- I did not run an interactive `yoi panel` manual latency check. The code-path review and focused tests cover the identified nonessential reload/notice wait path.
+
+
+---
