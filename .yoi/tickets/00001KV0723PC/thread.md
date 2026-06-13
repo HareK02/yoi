@@ -61,3 +61,21 @@ Escalate if:
 - 原因が Panel 外（OS terminal / shell / external command / specific provider/network）にある証拠が出た場合。
 
 ---
+
+<!-- event: decision author: orchestrator at: 2026-06-13T11:00:41Z -->
+
+## Decision
+
+Queue attention reviewed: no duplicate start.
+
+Actual state check:
+- `00001KV072V89` is `inprogress` with live spawned child `coder-00001KV072V89-panel-mouse` and worktree `/home/hare/Projects/yoi/.worktree/panel-mouse-selection`.
+- `00001KV04NJ8D` is `inprogress` with live spawned child `coder-00001KV04NJ8D-rewind` and worktree `/home/hare/Projects/yoi/.worktree/rewind-live-refresh`.
+- This Ticket remains `queued`.
+- `TicketRelationQuery` still shows no durable dependency blockers, but the existing OrchestrationPlan `conflicts_with` / `waiting_capacity_note` remains applicable: this Ticket likely touches the same Panel `multi_pod.rs` event-loop surface as `00001KV072V89` and should wait until that branch is integrated or conflict surface is re-evaluated.
+
+Decision:
+- Do not start another Coder Pod for this Ticket now.
+- Keep queued; re-evaluate after `00001KV072V89` completion/integration or explicit human override.
+
+---
