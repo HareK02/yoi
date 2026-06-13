@@ -2495,6 +2495,14 @@ async fn dispatch_panel_queue(
     }
 
     let preflight = prepare_panel_queue_handoff(workspace_root, backend, ticket_id)?;
+    let root_merge = sync_orchestration_to_root_before_queue(&preflight)?;
+    ensure_ticket_state(
+        backend,
+        ticket_id,
+        TicketWorkflowState::Ready,
+        "root-ticket-state-after-orchestration-merge",
+        &preflight.root_top_level,
+    )?;
     backend
         .queue_ready(TicketIdOrSlug::Id(ticket_id.to_owned()), "workspace-panel")
         .map_err(|error| TicketActionError::Ticket(error.to_string()))?;
@@ -2504,9 +2512,10 @@ async fn dispatch_panel_queue(
     let notification = notify_workspace_orchestrator(orchestrator, current_ticket).await;
     Ok(TicketActionOutcome {
         notice: format!(
-            "Queued Ticket {}; root Queue commit {}; orchestration sync {}; {}. Orchestrator routing is authorized; implementation side effects still require queued -> inprogress acceptance.",
+            "Queued Ticket {}; root Queue commit {}; {}; orchestration sync {}; {}. Orchestrator routing is authorized; implementation side effects still require queued -> inprogress acceptance.",
             ticket_id,
             commit.sha,
+            root_merge.sentence(),
             sync.sentence(),
             notification.sentence()
         ),
@@ -2524,6 +2533,28 @@ struct PanelQueueHandoffPreflight {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PanelQueueCommit {
     sha: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PanelQueueRootMerge {
+    branch: String,
+    head: String,
+    merge_commit: Option<String>,
+}
+
+impl PanelQueueRootMerge {
+    fn sentence(&self) -> String {
+        match &self.merge_commit {
+            Some(commit) => format!(
+                "merged orchestration branch {} ({}) into root before Queue: {}",
+                self.branch, self.head, commit
+            ),
+            None => format!(
+                "orchestration branch {} ({}) already present in root",
+                self.branch, self.head
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2576,7 +2607,7 @@ fn prepare_panel_queue_handoff(
     let root_branch = git_current_branch(&root_top_level).map_err(|message| {
         queue_check_failed("root-branch", ticket_id, &root_top_level, message)
     })?;
-    let root_branch = root_branch.ok_or_else(|| {
+    let _root_branch = root_branch.ok_or_else(|| {
         queue_check_failed(
             "root-branch",
             ticket_id,
@@ -2587,7 +2618,6 @@ fn prepare_panel_queue_handoff(
     ensure_git_effective_user(&root_top_level).map_err(|message| {
         queue_check_failed("root-git-user", ticket_id, &root_top_level, message)
     })?;
-    ensure_git_clean("root-clean", ticket_id, &root_top_level)?;
 
     let orchestration = orchestration_worktree_layout(&root_top_level);
     if !orchestration.path.exists() {
@@ -2657,23 +2687,6 @@ fn prepare_panel_queue_handoff(
         &root_top_level,
     )?;
 
-    let orchestration_head = git_rev_parse(&orchestration.path, "HEAD").map_err(|message| {
-        queue_check_failed("branch-divergence", ticket_id, &orchestration.path, message)
-    })?;
-    let root_head = git_rev_parse(&root_top_level, "HEAD").map_err(|message| {
-        queue_check_failed("branch-divergence", ticket_id, &root_top_level, message)
-    })?;
-    ensure_git_ancestor(&root_top_level, &orchestration_head, &root_head).map_err(|message| {
-        queue_check_failed(
-            "branch-divergence",
-            ticket_id,
-            &orchestration.path,
-            format!(
-                "orchestration HEAD {orchestration_head} is not an ancestor of root branch {root_branch} HEAD {root_head}: {message}"
-            ),
-        )
-    })?;
-
     let ticket_record_dir = backend.root().join(ticket_id);
     if !ticket_record_dir.join("item.md").is_file() {
         return Err(queue_check_failed(
@@ -2683,12 +2696,102 @@ fn prepare_panel_queue_handoff(
             "target Ticket item.md is missing".to_string(),
         ));
     }
+    ensure_git_path_clean(
+        "root-ticket-clean",
+        ticket_id,
+        &root_top_level,
+        &ticket_record_dir,
+    )?;
 
     Ok(PanelQueueHandoffPreflight {
         ticket_id: ticket_id.to_string(),
         root_top_level,
         orchestration,
         ticket_record_dir,
+    })
+}
+
+fn sync_orchestration_to_root_before_queue(
+    preflight: &PanelQueueHandoffPreflight,
+) -> Result<PanelQueueRootMerge, TicketActionError> {
+    let orchestration_head =
+        git_rev_parse(&preflight.orchestration.path, "HEAD").map_err(|message| {
+            queue_check_failed(
+                "root-orchestration-merge",
+                &preflight.ticket_id,
+                &preflight.orchestration.path,
+                message,
+            )
+        })?;
+    let root_head = git_rev_parse(&preflight.root_top_level, "HEAD").map_err(|message| {
+        queue_check_failed(
+            "root-orchestration-merge",
+            &preflight.ticket_id,
+            &preflight.root_top_level,
+            message,
+        )
+    })?;
+    if ensure_git_ancestor(&preflight.root_top_level, &orchestration_head, &root_head).is_ok() {
+        return Ok(PanelQueueRootMerge {
+            branch: preflight.orchestration.branch.clone(),
+            head: orchestration_head,
+            merge_commit: None,
+        });
+    }
+
+    let mut merge = Command::new("git");
+    merge
+        .arg("-C")
+        .arg(&preflight.root_top_level)
+        .arg("merge")
+        .arg("--autostash")
+        .arg("--no-ff")
+        .arg(&preflight.orchestration.branch)
+        .arg("-m")
+        .arg(format!(
+            "merge: sync orchestration before queue {}",
+            preflight.ticket_id
+        ));
+    if let Err(message) =
+        run_git_command(merge, "merge orchestration branch into root before Queue")
+    {
+        let mut abort = Command::new("git");
+        abort
+            .arg("-C")
+            .arg(&preflight.root_top_level)
+            .arg("merge")
+            .arg("--abort");
+        let abort_result = run_git_command(abort, "abort failed orchestration pre-Queue merge");
+        let detail = match abort_result {
+            Ok(()) => format!(
+                "could not merge orchestration branch {} ({}) into root before Queue; merge was aborted: {}",
+                preflight.orchestration.branch, orchestration_head, message
+            ),
+            Err(abort_error) => format!(
+                "could not merge orchestration branch {} ({}) into root before Queue, and merge abort failed: {}; original merge error: {}",
+                preflight.orchestration.branch, orchestration_head, abort_error, message
+            ),
+        };
+        return Err(queue_check_failed(
+            "root-orchestration-merge",
+            &preflight.ticket_id,
+            &preflight.root_top_level,
+            detail,
+        ));
+    }
+
+    let merge_commit = git_rev_parse(&preflight.root_top_level, "HEAD").map_err(|message| {
+        queue_check_failed(
+            "root-orchestration-merge",
+            &preflight.ticket_id,
+            &preflight.root_top_level,
+            message,
+        )
+    })?;
+    Ok(PanelQueueRootMerge {
+        branch: preflight.orchestration.branch.clone(),
+        head: orchestration_head,
+        merge_commit: Some(merge_commit),
     })
 }
 
@@ -2716,10 +2819,17 @@ fn commit_panel_queue_ticket_record(
         )
     })?;
 
+    let ticket_rel_string = git_path_string(&ticket_rel);
     let staged = git_capture(
         &preflight.root_top_level,
-        &["diff", "--cached", "--name-only"],
-        "list staged files",
+        &[
+            "diff",
+            "--cached",
+            "--name-only",
+            "--",
+            ticket_rel_string.as_str(),
+        ],
+        "list staged Queue Ticket files",
     )
     .map_err(|message| {
         queue_check_failed(
@@ -2741,22 +2851,6 @@ fn commit_panel_queue_ticket_record(
             "Queue mutation produced no staged Ticket record changes".to_string(),
         ));
     }
-    let ticket_rel_string = git_path_string(&ticket_rel);
-    let outside = staged_paths
-        .iter()
-        .find(|path| !git_status_path_is_inside(path, &ticket_rel_string));
-    if let Some(path) = outside {
-        return Err(queue_check_failed(
-            "queue-commit-pathscope",
-            &preflight.ticket_id,
-            &preflight.root_top_level,
-            format!(
-                "staged path {path} is outside target Ticket record {}",
-                ticket_rel.display()
-            ),
-        ));
-    }
-
     let message = format!("ticket: queue {}", preflight.ticket_id);
     let mut commit = Command::new("git");
     commit
@@ -2897,6 +2991,55 @@ fn ensure_ticket_state(
     Ok(())
 }
 
+fn ensure_git_path_clean(
+    check: &'static str,
+    ticket_id: &str,
+    root: &Path,
+    path: &Path,
+) -> Result<(), TicketActionError> {
+    let rel = path_relative_to_root(root, path, check, ticket_id)?;
+    let rel_string = git_path_string(&rel);
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .arg("status")
+        .arg("--porcelain")
+        .arg("--untracked-files=normal")
+        .arg("--")
+        .arg(&rel)
+        .output()
+        .map_err(|error| {
+            queue_check_failed(
+                check,
+                ticket_id,
+                path,
+                format!("git status failed: {error}"),
+            )
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(queue_check_failed(
+            check,
+            ticket_id,
+            path,
+            format!("git status failed: {}", stderr.trim()),
+        ));
+    }
+    let status = String::from_utf8_lossy(&output.stdout);
+    if !status.trim().is_empty() {
+        return Err(queue_check_failed(
+            check,
+            ticket_id,
+            path,
+            format!(
+                "target Ticket record {rel_string} has pre-existing changes; commit, stash, or revert them before Queue:\n{}",
+                status.trim_end()
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn ensure_git_clean(
     check: &'static str,
     ticket_id: &str,
@@ -3017,13 +3160,6 @@ fn git_path_string(path: &Path) -> String {
         .map(|component| component.as_os_str().to_string_lossy())
         .collect::<Vec<_>>()
         .join("/")
-}
-
-fn git_status_path_is_inside(path: &str, parent: &str) -> bool {
-    path == parent
-        || path
-            .strip_prefix(parent)
-            .is_some_and(|rest| rest.starts_with('/'))
 }
 
 fn queue_check_failed(
@@ -4467,9 +4603,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ticket_queue_action_blocks_dirty_root_without_mutation() {
+    async fn ticket_queue_action_allows_unrelated_dirty_root_changes() {
         let (temp, ticket_id, backend) = ready_ticket_git_workspace("panel-dirty-root");
+        fs::write(temp.path().join("README.md"), "dirty root notes\n").unwrap();
         fs::write(temp.path().join("dirty.txt"), "dirty").unwrap();
+
+        let outcome =
+            dispatch_ticket_action(request_for(&temp, ticket_id.clone(), NextUserAction::Queue))
+                .await
+                .unwrap();
+
+        assert!(outcome.notice.contains("Queued Ticket"));
+        assert!(temp.path().join("dirty.txt").is_file());
+        let root_status = git_status_porcelain(temp.path()).unwrap();
+        assert!(root_status.iter().any(|line| line.contains("README.md")));
+        assert!(root_status.iter().any(|line| line.contains("dirty.txt")));
+        let ticket = backend.show(TicketIdOrSlug::Id(ticket_id)).unwrap();
+        assert_eq!(ticket.meta.workflow_state, TicketWorkflowState::Queued);
+        assert_eq!(ticket.meta.queued_by.as_deref(), Some("workspace-panel"));
+    }
+
+    #[tokio::test]
+    async fn ticket_queue_action_blocks_preexisting_target_ticket_changes() {
+        let (temp, ticket_id, backend) = ready_ticket_git_workspace("panel-dirty-ticket");
+        fs::write(
+            backend.root().join(&ticket_id).join("thread.md"),
+            "local uncommitted ticket edit\n",
+        )
+        .unwrap();
 
         let error =
             dispatch_ticket_action(request_for(&temp, ticket_id.clone(), NextUserAction::Queue))
@@ -4477,22 +4638,51 @@ mod tests {
                 .unwrap_err();
         let message = error.to_string();
 
-        assert!(message.contains("root-clean"));
+        assert!(message.contains("root-ticket-clean"));
         assert!(message.contains(&ticket_id));
-        assert!(message.contains(&temp.path().display().to_string()));
-        assert!(message.contains("dirty.txt"));
+        assert!(message.contains("pre-existing changes"));
         let ticket = backend.show(TicketIdOrSlug::Id(ticket_id)).unwrap();
         assert_eq!(ticket.meta.workflow_state, TicketWorkflowState::Ready);
         assert!(ticket.meta.queued_by.is_none());
     }
 
     #[tokio::test]
-    async fn ticket_queue_action_blocks_orchestration_branch_divergence() {
+    async fn ticket_queue_action_merges_orchestration_branch_before_queue() {
         let (temp, ticket_id, backend) = ready_ticket_git_workspace("panel-diverged");
         let layout = orchestration_worktree_layout(temp.path());
         fs::write(layout.path.join("orchestrator-only.txt"), "diverged").unwrap();
         run_test_git(&layout.path, &["add", "orchestrator-only.txt"]).unwrap();
         run_test_git(&layout.path, &["commit", "-m", "orchestrator-only"]).unwrap();
+        let orchestration_commit = git_rev_parse(&layout.path, "HEAD").unwrap();
+
+        let outcome =
+            dispatch_ticket_action(request_for(&temp, ticket_id.clone(), NextUserAction::Queue))
+                .await
+                .unwrap();
+
+        let root_head = git_rev_parse(temp.path(), "HEAD").unwrap();
+        let orchestration_head = git_rev_parse(&layout.path, "HEAD").unwrap();
+        assert_eq!(root_head, orchestration_head);
+        assert!(temp.path().join("orchestrator-only.txt").is_file());
+        assert!(outcome.notice.contains("merged orchestration branch"));
+        assert!(outcome.notice.contains(&orchestration_commit));
+        assert!(outcome.notice.contains("root Queue commit"));
+        let ticket = backend.show(TicketIdOrSlug::Id(ticket_id)).unwrap();
+        assert_eq!(ticket.meta.workflow_state, TicketWorkflowState::Queued);
+        assert_eq!(ticket.meta.queued_by.as_deref(), Some("workspace-panel"));
+    }
+
+    #[tokio::test]
+    async fn ticket_queue_action_blocks_conflicting_orchestration_merge_without_mutation() {
+        let (temp, ticket_id, backend) = ready_ticket_git_workspace("panel-conflict");
+        let layout = orchestration_worktree_layout(temp.path());
+        fs::write(temp.path().join("README.md"), "root change\n").unwrap();
+        run_test_git(temp.path(), &["add", "README.md"]).unwrap();
+        run_test_git(temp.path(), &["commit", "-m", "root-change"]).unwrap();
+        fs::write(layout.path.join("README.md"), "orchestration change\n").unwrap();
+        run_test_git(&layout.path, &["add", "README.md"]).unwrap();
+        run_test_git(&layout.path, &["commit", "-m", "orchestration-change"]).unwrap();
+        let root_head_before = git_rev_parse(temp.path(), "HEAD").unwrap();
 
         let error =
             dispatch_ticket_action(request_for(&temp, ticket_id.clone(), NextUserAction::Queue))
@@ -4500,9 +4690,14 @@ mod tests {
                 .unwrap_err();
         let message = error.to_string();
 
-        assert!(message.contains("branch-divergence"));
+        assert!(message.contains("root-orchestration-merge"));
+        assert!(message.contains("merge was aborted"));
         assert!(message.contains(&ticket_id));
-        assert!(message.contains(&layout.path.display().to_string()));
+        assert_eq!(
+            git_rev_parse(temp.path(), "HEAD").unwrap(),
+            root_head_before
+        );
+        assert!(git_status_porcelain(temp.path()).unwrap().is_empty());
         let ticket = backend.show(TicketIdOrSlug::Id(ticket_id)).unwrap();
         assert_eq!(ticket.meta.workflow_state, TicketWorkflowState::Ready);
         assert!(ticket.meta.queued_by.is_none());
