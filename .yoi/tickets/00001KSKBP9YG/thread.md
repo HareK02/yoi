@@ -475,3 +475,58 @@ Next:
 E2E harness implementation branch was reviewed, approved after requested production-boundary changes, merged into the Orchestrator branch as `b3bd6b11`, and validated in the Orchestrator worktree. Opt-in Panel PTY E2E tests for mouse selection and quit latency passed, along with formatting, diff check, normal/e2e feature package checks, and E2E package check. Ticket implementation work is done; closure remains separate.
 
 ---
+
+<!-- event: comment author: orchestrator at: 2026-06-13T15:27:18Z -->
+
+## Comment
+
+Post-merge design gap: E2E harness の `yoi` binary freshness はまだ自動保証されていない。
+
+Current behavior:
+- `tests/e2e/src/lib.rs::yoi_binary()` は `YOI_E2E_BIN` があればその path を使う。
+- `YOI_E2E_BIN` が無い場合は E2E test binary の `current_exe()` から `target/{debug,release}/yoi` を推測し、最後に `target/debug/yoi` へ fallback する。
+- Harness は `PanelHarness::spawn` と fixture setup commands の両方でその binary path を使い、`YOI_POD_RUNTIME_COMMAND` も同じ binary に向ける。
+- しかし harness 自身は `cargo build -p yoi --features e2e-test` を実行しない。したがって任意タイミングの `cargo test -p yoi-e2e --features e2e` だけでは、最新 source から rebuild された binary が使われる保証はない。
+
+Gap:
+- 今回の validation は Orchestrator が事前に `cargo build -p yoi --features e2e-test` を実行したため正しい binary を使った。
+- ただし harness design としては freshness が runner/manual discipline に依存しており、stale `target/debug/yoi` や別 path の `YOI_E2E_BIN` を使っても test が走り得る。
+
+Follow-up direction:
+- `cargo xtask e2e` / `yoi-e2e-runner` / documented `just e2e` など、必ず `cargo build -p yoi --features e2e-test` を実行してから `YOI_E2E_BIN=<fresh target binary> cargo test -p yoi-e2e --features e2e ...` する single entrypoint が必要。
+- さらに harness は起動 binary が `e2e-test` feature 有効であることを handshake/event/version で検証し、可能なら source commit/build timestamp/path metadata を artifact に残して stale/mismatched binary を diagnostic にするべき。
+
+---
+
+<!-- event: decision author: orchestrator at: 2026-06-13T15:43:37Z -->
+
+## Decision
+
+Follow-up design note: E2E の `yoi` binary freshness は `cargo run` 直起動より、harness 内 `cargo build` + built binary spawn を標準にする。
+
+Decision candidate:
+- `cargo test -p yoi-e2e --features e2e` の test setup から `cargo build -p yoi --features e2e-test --bin yoi` を実行することは可能で、opt-in E2E では許容する。
+- ただし PTY scenario の process-under-test を `cargo run ... -- panel` にするのは避ける。Cargo wrapper の build output、process tree、signal forwarding、exit timing が混ざり、Panel quit latency の測定対象が曖昧になるため。
+- Harness には `BinaryProvider::CargoBuild` のような起動経路を持たせ、test 開始時に current workspace source から `yoi` を build し、得られた `target/{profile}/yoi` path を PTY で直接 spawn する。
+- これにより「任意タイミングの E2E 実行で最新 source から作った binary を使う」ことを起動経路として保証しつつ、実際の UI/latency 測定は Cargo wrapper ではなく `yoi` binary 本体を対象にできる。
+- 複数 test の重複 build は `OnceLock`/suite setup 等で 1 回にまとめる。parallel test 実行時の cargo target lock 待ちは opt-in E2E では許容し、必要なら serial 化する。
+
+Rationale:
+- 起動後 handshake で正しさを検証するより、起動経路として build step を harness に内蔵する方が単純。
+- `cargo run` は可能だが、`run` は build + wrapper spawn を同時に行うため、PTY/Signal/timing の被測定経路に Cargo が入ってしまう。`cargo build` と direct binary spawn に分ける方が E2E の oracle が明確。
+
+---
+
+<!-- event: decision author: orchestrator at: 2026-06-13T15:45:26Z -->
+
+## Decision
+
+Follow-up requested by user: E2E harness should build the current `yoi` binary itself instead of relying on a prebuilt `YOI_E2E_BIN` / inferred `target/debug/yoi`.
+
+Required correction:
+- Default E2E binary provider should run `cargo build -p yoi --features e2e-test --bin yoi` from the workspace root at test time, then spawn the resulting `target/{profile}/yoi` directly through PTY.
+- `YOI_E2E_BIN` may remain as an explicit override, but normal arbitrary `cargo test -p yoi-e2e --features e2e ...` should use a freshly built binary without requiring a separate manual build step.
+- Do not use `cargo run` as the process-under-test because that would put Cargo in the PTY/signal/quit-latency measurement path.
+- Preserve the existing production/non-production boundary and E2E feature gating.
+
+---
