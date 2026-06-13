@@ -79,3 +79,77 @@ Decision:
 - Keep queued; re-evaluate after `00001KV072V89` completion/integration or explicit human override.
 
 ---
+
+<!-- event: decision author: orchestrator at: 2026-06-13T11:27:26Z -->
+
+## Decision
+
+Routing decision: implementation_ready
+
+Reason:
+- Ticket は `queued` で、Quit 遅延の原因特定と修正の intent / requirements / acceptance criteria / binding invariants / implementation latitude / escalation conditions が揃っている。
+- `readiness: spike_needed` だが、調査対象は `crates/tui/src/multi_pod.rs` の Panel event loop / `PendingReload` / Quit handling / queue-attention notice dispatch / snapshot reload 周辺に bounded されており、専用 worktree の Coder に first-step code-path spike と修正を委ねられる。
+- `TicketRelationQuery` に durable dependency blocker はない。
+- 以前の OrchestrationPlan `conflicts_with` / `waiting_capacity_note` は `00001KV072V89`（Panel mouse selection）との同時編集 conflict を理由に queued 待機としていたが、同 Ticket は review/merge/validation/cleanup 済みで `done`。現在の Orchestrator worktree は clean で、related implementation Pods/worktrees も cleanup 済み。
+- risk flags は `tui-panel` / `shutdown-latency` / `async-cancellation` だが、Ticket は Quit の authority/invariants と escalation conditions を明記しており、実装前に追加の human decision は不要。
+
+Evidence checked:
+- Ticket body / thread / artifacts。
+- relation records: なし。
+- orchestration plan records: 既存 `conflicts_with` / `waiting_capacity_note` を確認し、blocking condition（`00001KV072V89` の未統合）は解消済み。
+- related Ticket `00001KTFMMZP0`: Panel non-blocking transition work は closed で、`PendingReload` / background refresh / attach-return path の背景として参照する。
+- current code/workspace state: `00001KV072V89` と `00001KV04NJ8D` は merge/validation/cleanup 済み。Orchestrator worktree clean。visible spawned implementation Pods なし。
+
+IntentPacket:
+
+Intent:
+- `yoi panel` / workspace Panel の Quit 操作で、ユーザー入力後に Panel の background reload / notice dispatch / snapshot load / Pod observation など非本質的処理待ちによる断続的な遅延が起きないよう、原因を特定して修正する。
+
+Binding decisions / invariants:
+- Quit はユーザーの明示的な終了意思であり、Panel の観測/reload/通知送信完了待ちで遅延してはならない。
+- 端末状態復旧、描画 backend の正常終了、Rust drop による安全な abort など、最小限の終了処理は維持する。
+- Ticket lifecycle authority、Pod authority boundary、Panel row/action semantics、Companion/Orchestrator composer target semantics は変更しない。
+- `resources/prompts` や durable Ticket schema 変更は想定しない。必要になった場合は escalation。
+
+Requirements / acceptance criteria:
+- `Ctrl+C` / `Ctrl+D` など現行 Quit 経路が pending background work によって目に見えて遅延しない。
+- 遅延原因と修正方針を implementation report に説明する。
+- 可能な範囲で unit test / regression test を追加し、Quit 経路が pending background work にブロックされないことを検証する。
+- 自動化が難しい場合は manual validation 手順と観測結果を report する。
+
+Implementation latitude:
+- まず `crates/tui/src/multi_pod.rs` の event loop / `PendingReload` / Quit handling / terminal event polling / queue-attention notice dispatch / snapshot load を code-path spike する。
+- 修正手段は、不要 await の回避、cancellable background work の abort/drop、event-loop priority adjustment、test seam 追加などから Coder が選んでよい。
+- 再現が難しい場合は遅延し得る code path を単体再現できる test seam を優先してよい。
+
+Escalate if:
+- Panel public UX、Ticket lifecycle semantics、Pod shutdown semantics、authority boundary の変更が必要になる。
+- 端末 cleanup や Pod process lifecycle safety を犠牲にしないと遅延を解消できない。
+- 原因が Panel 外（OS terminal / shell / external command / provider/network）にある証拠が出た。
+
+Validation:
+- focused test for Quit not waiting on pending background work。
+- `cargo fmt --check`。
+- `git diff --check`。
+- 変更範囲に応じて `cargo test -p tui ...` / `cargo check -p tui --all-targets`。
+- 可能なら manual `yoi panel` Quit observation を report。
+
+Current code map:
+- `crates/tui/src/multi_pod.rs`: Panel run loop、Quit key handling、`PendingReload`、background reload / attention notice / snapshot observation paths。
+- `crates/tui/src/workspace_panel.rs`: ViewModel は参照のみ。row/action semantics は変更しない。
+
+Critical risks / reviewer focus:
+- Quit を速くするために terminal cleanup / safe abort / Pod lifecycle を壊していないこと。
+- nonessential background work が Quit を block しないこと。
+- Panel/Ticket/Pod authority semantics と row/action semantics が変わっていないこと。
+- Regression test が実際に pending background work block を防ぐ性質を持つこと。
+
+---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-13T11:27:38Z from: queued to: inprogress reason: orchestrator_acceptance_after_conflict_resolved field: state -->
+
+## State changed
+
+Ticket evidence、relation records、existing OrchestrationPlan waiting/conflict notes、related completed Panel mouse integration、visible Pod/worktree state、and clean Orchestrator workspace were checked. The prior conflict/capacity blocker is resolved; no durable dependency blockers remain. Implementation can proceed in a dedicated child worktree with a first-step code-path spike and focused regression test before changing Quit behavior.
+
+---
