@@ -21,3 +21,12 @@ LocalTicketBackend によって作成されました。
 Intake refinement completed. ユーザーが draft を承認し、意図・受け入れ条件・binding invariants・implementation latitude・escalation conditions・validation が Orchestrator routing 可能な粒度で揃っている。
 
 ---
+
+<!-- event: state_changed author: workspace-panel at: 2026-06-13T16:33:26Z from: ready to: queued reason: queued field: state -->
+
+## State changed
+
+Ticket を `workspace-panel` が queued にしました。
+
+
+---
