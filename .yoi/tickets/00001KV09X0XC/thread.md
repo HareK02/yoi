@@ -70,3 +70,38 @@ Validation:
 Ticket evidence、relation records、orchestration plan、workspace state を確認した。Blocking relation はなく、implementation-ready。実装 side effect の前に inprogress acceptance を記録する。
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-06-13T19:01:36Z -->
+
+## Implementation report
+
+Commit: `f74146c6` (`tui: return ready tickets to planning from panel`)
+
+Files changed:
+- `crates/tui/src/multi_pod.rs`
+
+What changed:
+- Added a separate Panel path for selected `ready` Ticket rows when the composer target is Ticket Intake and the user submits non-empty refinement instructions.
+- The action rereads the Ticket through the typed local Ticket backend and records a typed `ready -> planning` `state_changed` event with the user's refinement instruction in the Ticket thread.
+- The action does not invoke Queue, `queued -> inprogress`, worktree creation, or implementation-role spawning.
+- After the state change it attempts the Intake continuation path:
+  - launch and claim a new Intake Pod when no local Intake claim exists,
+  - notify a live claimed Intake Pod,
+  - open/restore a restorable claimed Intake Pod,
+  - or leave a visible diagnostic for stale claims without launching a duplicate.
+- Added focused tests for stale-state rejection, state/event recording, action dispatch selection, launch-after-mutation followup, and role-session claim recording for post-launch Intake Pods.
+
+Validation:
+- `cargo test -p tui planning_return`
+- `cargo test -p tui intake_registry`
+- `cargo test -p tui workspace_panel`
+- `cargo test -p ticket`
+- `cargo fmt --check`
+- `git diff --check`
+
+Residual risks:
+- No real terminal/PTTY Panel E2E was run; coverage is focused unit/action-path validation.
+- The existing Panel composer model exposes this via Ticket Intake target + selected ready row + non-empty text, rather than adding a new visible button/menu surface.
+
+
+---
