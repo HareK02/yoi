@@ -109,3 +109,20 @@ Critical risks / reviewer focus:
 Ticket evidence、relations、orchestration plan、bounded code map、Orchestrator worktree clean state を確認した。blocking relation はなく、Panel mouse selection の binding invariants と acceptance criteria は実装可能な粒度で記録済み。実装 side effect の前に routing decision / IntentPacket / accepted plan を記録したため、専用 child worktree と Coder delegation に進む。
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-13T10:59:28Z -->
+
+## Implementation report
+
+Implementation handoff started.
+
+- Worktree: `/home/hare/Projects/yoi/.worktree/panel-mouse-selection`
+- Branch: `ticket-00001KV072V89-panel-mouse-selection`
+- Coder Pod: `coder-00001KV072V89-panel-mouse`
+- Scope: child worktree read, `crates/tui` write, this Ticket record write。`.yoi/memory` や local/runtime/log/lock/secret-like `.yoi` paths は write scope に含めていない。
+- Note: 初回 SpawnPod は runtime launch validation が workspace root `/home/hare/Projects/yoi` の readable grant を要求して失敗したため、非再帰 read grant のみ追加して再実行した。Coder には root/original workspace を inspect/write/git/validate/merge/cleanup しないよう明示済み。
+
+Next:
+- Coder の commit / implementation_report / validation evidence を確認後、Reviewer を read-only 基本で起動する。
+
+---
