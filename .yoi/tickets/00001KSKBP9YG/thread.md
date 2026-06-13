@@ -299,3 +299,39 @@ No source changes were made during review.
 
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-06-13T15:18:21Z -->
+
+## Implementation report
+
+Follow-up implementation update for reviewer request `559adb9a ticket: request e2e harness changes`:
+
+Production/non-production boundary fix:
+- Removed the normal-build no-op `e2e_observer` module path and now compile the observer module only behind `tui/e2e-test` via `#[cfg(feature = "e2e-test")] mod e2e_observer;`.
+- Added `#[cfg(feature = "e2e-test")]` to all Panel/TUI observability call sites that build JSON payloads, including terminal cleanup/exit, panel ready, rows-rendered, mouse click, selection changes, action requests, quit request, and background task lifecycle events.
+- `App::emit_rows_rendered`, `PanelE2eRowKey`, `PanelE2eRect`, `PanelE2eRenderedRow`, `PanelE2eRowsRendered`, and the conversion helpers are now compiled only with `tui/e2e-test`.
+- Normal builds no longer call `app.emit_rows_rendered()`, no longer evaluate `serde_json::json!` e2e payloads, and no longer retain the Panel E2E DTO/helper logic in the runtime path.
+- The background reload hold seam remains compiled/called only under `tui/e2e-test`; `YOI_TUI_TEST_EVENTS` and `YOI_TUI_TEST_HOLD_BACKGROUND_TASK` behavior remains feature-gated.
+
+Preserved E2E behavior:
+- Mouse E2E still verifies PTY output for normal mouse tracking + SGR mouse enable sequences before any raw SGR click can be sent.
+- `PanelHarness::click(...)` still fails if mouse capture was not observed.
+- Quit latency E2E still uses the feature-gated pending reload hold barrier and asserts the reload task is pending before Ctrl+C.
+
+Validation:
+- `cargo fmt --check` — passed.
+- `cargo check -p tui --all-targets` — passed.
+- `cargo check -p yoi --all-targets` — passed.
+- `cargo check -p tui --all-targets --features e2e-test` — passed.
+- `cargo check -p yoi --all-targets --features e2e-test` — passed.
+- `cargo build -p yoi --features e2e-test` — passed.
+- `YOI_E2E_BIN=/home/hare/Projects/yoi/.worktree/e2e-harness/target/debug/yoi cargo test -p yoi-e2e --features e2e --test panel -- --nocapture` — passed (2 tests).
+- `cargo check -p yoi-e2e --all-targets --features e2e` — passed.
+- `git diff --check` — passed.
+
+Remaining gaps / risks unchanged:
+- The E2E harness remains Unix PTY based.
+- The screen artifact remains raw PTY output rather than a parsed terminal snapshot.
+
+
+---

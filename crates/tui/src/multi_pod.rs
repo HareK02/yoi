@@ -133,6 +133,7 @@ pub(crate) async fn run(
         }
     }
     let mut next_poll = Instant::now() + MULTI_POD_POLL_INTERVAL;
+    #[cfg(feature = "e2e-test")]
     let mut emitted_panel_ready = false;
 
     loop {
@@ -147,11 +148,14 @@ pub(crate) async fn run(
         }
 
         terminal.draw(|f| draw(f, app))?;
-        if !emitted_panel_ready {
-            crate::e2e_observer::emit("panel", "panel_ready", serde_json::json!({}));
-            emitted_panel_ready = true;
+        #[cfg(feature = "e2e-test")]
+        {
+            if !emitted_panel_ready {
+                crate::e2e_observer::emit("panel", "panel_ready", serde_json::json!({}));
+                emitted_panel_ready = true;
+            }
+            app.emit_rows_rendered();
         }
-        app.emit_rows_rendered();
 
         let now = Instant::now();
         if now >= next_poll {
@@ -169,6 +173,7 @@ pub(crate) async fn run(
             TermEvent::Key(key) => match app.handle_key(key) {
                 MultiPodAction::None => {}
                 MultiPodAction::Quit => {
+                    #[cfg(feature = "e2e-test")]
                     crate::e2e_observer::emit("panel", "quit_requested", serde_json::json!({}));
                     abort_panel_background_work_for_quit(
                         &mut pending_reload,
@@ -177,6 +182,7 @@ pub(crate) async fn run(
                     return Ok(MultiPodOutcome::Quit);
                 }
                 MultiPodAction::Open => {
+                    #[cfg(feature = "e2e-test")]
                     crate::e2e_observer::emit(
                         "panel",
                         "action_requested",
@@ -188,6 +194,7 @@ pub(crate) async fn run(
                     }
                 }
                 MultiPodAction::DispatchTicketAction(request) => {
+                    #[cfg(feature = "e2e-test")]
                     crate::e2e_observer::emit(
                         "panel",
                         "action_requested",
@@ -204,6 +211,7 @@ pub(crate) async fn run(
                     next_poll = Instant::now() + MULTI_POD_POLL_INTERVAL;
                 }
                 MultiPodAction::LaunchIntake(request) => {
+                    #[cfg(feature = "e2e-test")]
                     crate::e2e_observer::emit(
                         "panel",
                         "action_requested",
@@ -220,6 +228,7 @@ pub(crate) async fn run(
                     next_poll = Instant::now() + MULTI_POD_POLL_INTERVAL;
                 }
                 MultiPodAction::SendCompanion(request) => {
+                    #[cfg(feature = "e2e-test")]
                     crate::e2e_observer::emit(
                         "panel",
                         "action_requested",
@@ -255,6 +264,7 @@ impl PendingReload {
         if self.handle.is_some() {
             return false;
         }
+        #[cfg(feature = "e2e-test")]
         crate::e2e_observer::emit(
             "panel",
             "background_task_started",
@@ -264,6 +274,7 @@ impl PendingReload {
             }),
         );
         self.handle = Some(tokio::spawn(async move {
+            #[cfg(feature = "e2e-test")]
             crate::e2e_observer::hold_background_task_if_requested("reload").await;
             load_multi_pod_snapshot(None, lifecycle_mode).await
         }));
@@ -288,6 +299,7 @@ impl PendingReload {
             return None;
         }
         let handle = self.handle.take()?;
+        #[cfg(feature = "e2e-test")]
         crate::e2e_observer::emit(
             "panel",
             "background_task_finished",
@@ -303,6 +315,7 @@ impl PendingReload {
 
     fn abort(&mut self) {
         if let Some(handle) = self.handle.take() {
+            #[cfg(feature = "e2e-test")]
             crate::e2e_observer::emit(
                 "panel",
                 "background_task_aborted",
@@ -799,12 +812,14 @@ impl PanelRowHitBox {
     }
 }
 
+#[cfg(feature = "e2e-test")]
 #[derive(Debug, Serialize)]
 struct PanelE2eRowKey {
     kind: &'static str,
     id: String,
 }
 
+#[cfg(feature = "e2e-test")]
 #[derive(Debug, Serialize)]
 struct PanelE2eRect {
     x: u16,
@@ -813,6 +828,7 @@ struct PanelE2eRect {
     height: u16,
 }
 
+#[cfg(feature = "e2e-test")]
 #[derive(Debug, Serialize)]
 struct PanelE2eRenderedRow {
     key: PanelE2eRowKey,
@@ -822,12 +838,14 @@ struct PanelE2eRenderedRow {
     rect: PanelE2eRect,
 }
 
+#[cfg(feature = "e2e-test")]
 #[derive(Debug, Serialize)]
 struct PanelE2eRowsRendered {
     selected: Option<PanelE2eRowKey>,
     rows: Vec<PanelE2eRenderedRow>,
 }
 
+#[cfg(feature = "e2e-test")]
 fn panel_e2e_row_key(key: &PanelRowKey) -> PanelE2eRowKey {
     match key {
         PanelRowKey::Ticket(id) => PanelE2eRowKey {
@@ -841,6 +859,7 @@ fn panel_e2e_row_key(key: &PanelRowKey) -> PanelE2eRowKey {
     }
 }
 
+#[cfg(feature = "e2e-test")]
 fn panel_e2e_rect(rect: Rect) -> PanelE2eRect {
     PanelE2eRect {
         x: rect.x,
@@ -1166,6 +1185,7 @@ impl MultiPodApp {
         else {
             return false;
         };
+        #[cfg(feature = "e2e-test")]
         crate::e2e_observer::emit(
             "panel",
             "mouse_click",
@@ -1183,6 +1203,7 @@ impl MultiPodApp {
         self.row_hit_boxes = row_hit_boxes(rows, area);
     }
 
+    #[cfg(feature = "e2e-test")]
     fn emit_rows_rendered(&self) {
         let rows = self
             .row_hit_boxes
@@ -1269,8 +1290,10 @@ impl MultiPodApp {
         if let PanelRowKey::Pod(name) = &key {
             self.list.selected_name = Some(name.clone());
         }
+        #[cfg(feature = "e2e-test")]
         let selected_key = key.clone();
         self.selected_row = Some(key);
+        #[cfg(feature = "e2e-test")]
         crate::e2e_observer::emit(
             "panel",
             "selection_changed",
@@ -1281,6 +1304,7 @@ impl MultiPodApp {
     fn clear_panel_selection(&mut self) {
         self.selected_row = None;
         self.list.selected_name = None;
+        #[cfg(feature = "e2e-test")]
         crate::e2e_observer::emit(
             "panel",
             "selection_changed",
