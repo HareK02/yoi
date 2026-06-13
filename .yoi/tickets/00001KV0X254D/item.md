@@ -2,7 +2,7 @@
 title: 'Panel Orchestrator の orchestration branch 名を ticket.config.toml で設定可能にする'
 state: 'inprogress'
 created_at: '2026-06-13T16:29:25Z'
-updated_at: '2026-06-13T18:41:25Z'
+updated_at: '2026-06-13T18:59:21Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['config-schema', 'git-worktree', 'panel-orchestration']
