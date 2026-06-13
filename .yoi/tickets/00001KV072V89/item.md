@@ -1,8 +1,8 @@
 ---
 title: 'Workspace panel の View item をマウスで選択できるようにする'
-state: 'queued'
+state: 'inprogress'
 created_at: '2026-06-13T10:05:19Z'
-updated_at: '2026-06-13T10:53:16Z'
+updated_at: '2026-06-13T10:56:05Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['tui-input', 'mouse-capture', 'panel-ux']

@@ -30,3 +30,82 @@ Ticket を `workspace-panel` が queued にしました。
 
 
 ---
+
+<!-- event: decision author: orchestrator at: 2026-06-13T10:55:52Z -->
+
+## Decision
+
+Routing decision: implementation_ready
+
+Reason:
+- Ticket は `queued` で、要件・受け入れ条件・binding invariants・implementation latitude・escalation conditions が揃っている。
+- `TicketRelationQuery` と `TicketOrchestrationPlanQuery` で blocker / ordering / conflict 記録は見つからなかった。
+- risk flags は `tui-input` / `mouse-capture` / `panel-ux` だが、Ticket は mouse capture 方針、click-only MVP、destructive action 非実行、composer 入力優先を binding invariant として明記しており、実装前に不足する設計判断はない。
+- 現 Orchestrator worktree は clean。root/original workspace では git/read/write/validate せず、実装は専用 child worktree に隔離する。
+- 併走候補のうち `00001KV0723PC` は同じ `crates/tui/src/multi_pod.rs` 周辺に触れる可能性が高いため、こちらの panel mouse selection を先に受理し、Quit 遅延 Ticket は queued のまま conflict/capacity 待ちにする。`00001KV04NJ8D` は single-Pod rewind / Pod protocol 周辺で主な変更面が異なるため並列開始候補にできる。
+
+Evidence checked:
+- Ticket body / thread / artifacts（artifacts なし）。
+- relation records: なし。
+- orchestration plan records: なし。
+- code map: `crates/tui/src/multi_pod.rs` の panel selection state / keyboard handling / draw paths、`crates/tui/src/workspace_panel.rs` の ViewModel / row data、既存 `EnableWheelMouseCapture` 方針は `crates/tui/src/single_pod.rs` にあることを確認。
+- related context: composer 入力優先、Panel selected-row actionbar 方針、least-intrusive mouse capture 方針は Ticket に binding invariant として反映済み。
+- workspace/Pod state: Orchestrator worktree clean、visible live implementation Pods なし。
+
+IntentPacket:
+
+Intent:
+- `yoi panel` の View item / row をマウスクリックでアプリ内選択できるようにし、クリック後の selected row に既存の blank Enter / actionbar / detail 表示が働くようにする。
+
+Binding decisions / invariants:
+- 対象は workspace Panel/View item selection に限定する。single-Pod conversation history 全体の block focus / navigation mode は実装しない。
+- マウス操作で selected-Pod direct-send semantics を復活させない。
+- composer text entry と既存 keyboard 操作を優先し、`↑` / `↓` / Enter / Esc / Tab の意味を壊さない。
+- クリックは selection のみで、Queue / Open / Close などの workflow state mutation / destructive action を即時実行しない。
+- 汎用 drag/text selection は作らない。
+- `?1000h` + `?1006h` の least-intrusive mouse capture 方針を優先し、drag tracking を有効化して端末選択への副作用を増やさない。
+
+Requirements / acceptance criteria:
+- Panel 表示中に View item / row をクリックすると対応 item が selected になる。
+- item 外クリックでは不正な selection change や composer draft loss が起きない。
+- selected item に対する既存 action / blank Enter / detail 表示がクリック後の selection に対して働く。
+- existing keyboard/composer behavior を維持する。
+- focused tests で row hit testing / click selection / non-row click no-op / keyboard preservation を確認する。
+
+Implementation latitude:
+- render 時の row rect registry、row coordinate mapping、hit-test helper の具体設計は coder が選んでよい。
+- MVP は click/down による Panel rows selection でよい。詳細 pane 内の個別要素クリックや hover selection は必須ではない。
+- 外部 crate は不要なら入れない。既存 Panel 構造を大きく歪める外部 crate 導入は escalation する。
+
+Escalate if:
+- mouse capture が端末通常選択・貼り付け・wheel・IME・composer 入力へ副作用を出す場合。
+- click selection と Enter / blank composer / Queue/Open/Close の境界が曖昧になる場合。
+- Panel 以外の view、single-Pod block focus、drag selection へ範囲が広がる場合。
+- hit testing のために大きな描画アーキテクチャ変更が必要になる場合。
+
+Validation:
+- focused `cargo test -p tui workspace_panel --lib` または該当 `multi_pod` / workspace panel tests。
+- `cargo fmt --check`。
+- `git diff --check`。
+- 変更範囲に応じて `cargo check --workspace --all-targets`。
+
+Current code map:
+- `crates/tui/src/multi_pod.rs`: panel event handling、`selected_row`、visible rows、draw/hotkey/action path、tests。
+- `crates/tui/src/workspace_panel.rs`: `WorkspacePanelViewModel` / `PanelRowKey` / row data。
+- `crates/tui/src/single_pod.rs`: existing narrow mouse capture implementation as reference only。
+
+Critical risks / reviewer focus:
+- click must select only, not execute workflow actions。
+- item 外 click must be no-op for selection and must not drop composer draft。
+- keyboard/composer target semantics must remain unchanged。
+- mouse capture must remain least-intrusive and not enable drag tracking unnecessarily。
+
+---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-13T10:56:05Z from: queued to: inprogress reason: orchestrator_acceptance field: state -->
+
+## State changed
+
+Ticket evidence、relations、orchestration plan、bounded code map、Orchestrator worktree clean state を確認した。blocking relation はなく、Panel mouse selection の binding invariants と acceptance criteria は実装可能な粒度で記録済み。実装 side effect の前に routing decision / IntentPacket / accepted plan を記録したため、専用 child worktree と Coder delegation に進む。
+
+---

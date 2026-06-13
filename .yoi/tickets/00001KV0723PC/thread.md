@@ -30,3 +30,34 @@ Ticket を `workspace-panel` が queued にしました。
 
 
 ---
+
+<!-- event: decision author: orchestrator at: 2026-06-13T10:57:14Z -->
+
+## Decision
+
+Routing decision: spike_needed / queued_waiting_capacity
+
+Reason:
+- Ticket は `queued` で要件は明確だが、readiness は `spike_needed`。遅延原因・再現条件・影響 async path は未特定で、まず `crates/tui/src/multi_pod.rs` の Panel event loop / `PendingReload` / Quit handling / queue-attention notice dispatch / snapshot reload 周辺の code-path analysis が必要。
+- `TicketRelationQuery` と `TicketOrchestrationPlanQuery` で durable blocker はなかったが、この queue review では `00001KV072V89`（Workspace panel mouse selection）を先に inprogress 受理した。
+- `00001KV0723PC` と `00001KV072V89` はどちらも Panel / `multi_pod.rs` の event/input/render/reload surface に触れる可能性が高く、同時 child worktree で進めると conflict risk と reviewer bottleneck が大きい。
+- `00001KV04NJ8D` は single-Pod rewind / Pod protocol 周辺の別 surface として parallel start 可能なため、現在の capacity は `00001KV072V89` と `00001KV04NJ8D` に割り当てる。
+
+Evidence checked:
+- Ticket body / thread / artifacts（artifacts なし）。
+- relation records: なし。
+- orchestration plan records: この routing pass で `00001KV072V89` との `conflicts_with` と waiting-capacity note を記録。
+- related closed Ticket `00001KTFMMZP0`: Panel non-blocking transition work は closed で、`PendingReload` / background refresh / attach-return path の背景として関連するが、今回の Quit 遅延とは別 follow-up。
+- code map: `crates/tui/src/multi_pod.rs` の run loop、`PendingReload`、Quit action、queue-attention notice dispatch、terminal event poll/reload interaction。
+- workspace/Pod state: Orchestrator worktree clean。implementation Pods はまだ起動していないが、この routing pass で 2 件を受理予定。
+
+Next action:
+- この Ticket は queued のまま保持する。
+- `00001KV072V89` の branch が統合されるか、panel surface conflict が低いと再評価できた時点で、改めて `queued -> inprogress` 受理を検討する。
+- 受理時の first step は read-only/code-path spike とし、Quit が pending background work / notice dispatch / snapshot reload で block される path を特定してから修正する。
+
+Escalate if:
+- Quit 遅延の修正が terminal cleanup、Pod lifecycle authority、Ticket workflow semantics、または broad TUI runtime-loop redesign を必要とする場合。
+- 原因が Panel 外（OS terminal / shell / external command / specific provider/network）にある証拠が出た場合。
+
+---
