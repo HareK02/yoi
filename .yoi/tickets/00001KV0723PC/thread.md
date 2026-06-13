@@ -260,3 +260,32 @@ Next:
 Implementation branch `ticket-00001KV0723PC-panel-quit-latency` was reviewed, approved, merged into the Orchestrator branch as `db7bad7a`, and validated in the Orchestrator worktree. Focused panel quit latency tests, formatting, diff check, and `cargo check -p tui --all-targets` passed. Ticket implementation work is done; closure remains separate.
 
 ---
+
+<!-- event: comment author: orchestrator at: 2026-06-13T12:57:53Z -->
+
+## Comment
+
+Post-merge measurement report: Panel quit latency is still present / not proven fixed.
+
+User report:
+- 「相変わらずPanelをquitする際の遅延も解決してない」
+
+Measurement performed after merge in Orchestrator worktree `/home/hare/Projects/yoi/.worktree/orchestration/yoi-orchestrator`:
+- Built current debug binary: `cargo build -p yoi`。
+- PTY measurement command shape: pipe `sleep <delay>; Ctrl+C` into `script -q -c 'target/debug/yoi panel --workspace ...'` and measure process elapsed.
+- Current debug binary `target/debug/yoi` results with Ctrl+C sent after 1.5s:
+  - approx after Ctrl+C: 2488ms, 2561ms, 2453ms, 2558ms, 2507ms。
+- Varying Ctrl+C send delay against current debug binary:
+  - delay 0.2s -> total 3958ms
+  - delay 1.0s -> total 3919ms
+  - delay 2.0s -> total 4062ms
+  - delay 3.5s -> total 4095ms
+  - delay 5.0s -> total 6309ms
+- Installed `/home/hare/.nix-profile/bin/yoi` showed approx 24-25ms after Ctrl+C in the same scripted shape, and also appeared not to contain the new test/symbol strings, so binary-path freshness differs between measurements.
+
+Conclusion:
+- The original merge was based on a plausible code-path fix and focused tests, but no interactive/user-path latency measurement was done before marking done。
+- The current debug binary still shows a roughly 4s startup/quit floor in the PTY measurement, so the merged fix did not prove the user's observed latency is gone and may have missed a different blocking path。
+- Follow-up must identify the actual user command/binary path and measure `yoi panel` quit latency before and after any further fix. If the relevant path is current source/debug, this Ticket should be treated as not actually resolved.
+
+---

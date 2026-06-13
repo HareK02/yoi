@@ -4,6 +4,8 @@ mod cache;
 mod command;
 mod composer_history;
 mod composer_keys;
+#[cfg(feature = "e2e-test")]
+mod e2e_observer;
 mod input;
 pub mod keys;
 mod markdown;
@@ -108,6 +110,8 @@ pub async fn launch(options: LaunchOptions) -> ExitCode {
     // Always restore the terminal first so any pending eprintln below
     // shows up cleanly in scrollback rather than inside an active
     // alternate-screen buffer.
+    #[cfg(feature = "e2e-test")]
+    e2e_observer::emit("tui", "terminal_cleanup_started", serde_json::json!({}));
     let mut stdout = io::stdout();
     let _ = execute!(
         stdout,
@@ -117,9 +121,15 @@ pub async fn launch(options: LaunchOptions) -> ExitCode {
     );
     let _ = disable_raw_mode();
     let _ = execute!(stdout, crossterm::cursor::Show);
+    #[cfg(feature = "e2e-test")]
+    e2e_observer::emit("tui", "terminal_cleanup_finished", serde_json::json!({}));
 
     match result {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(()) => {
+            #[cfg(feature = "e2e-test")]
+            e2e_observer::emit("tui", "exit", serde_json::json!({ "status": "success" }));
+            ExitCode::SUCCESS
+        }
         Err(e) => {
             // SpawnError has already been painted into the inline
             // viewport's final frame, so it's already visible in the
@@ -129,6 +139,8 @@ pub async fn launch(options: LaunchOptions) -> ExitCode {
             if e.downcast_ref::<spawn::SpawnError>().is_none() {
                 eprintln!("yoi: {e}");
             }
+            #[cfg(feature = "e2e-test")]
+            e2e_observer::emit("tui", "exit", serde_json::json!({ "status": "failure" }));
             ExitCode::FAILURE
         }
     }

@@ -220,3 +220,24 @@ Next:
 Implementation branch `ticket-00001KV072V89-panel-mouse-selection` was reviewed, approved, merged into the Orchestrator branch as `02311883`, and validated in the Orchestrator worktree. Focused mouse-selection tests, formatting, diff check, and `cargo check -p tui --all-targets` passed. Ticket implementation work is done; closure remains separate.
 
 ---
+
+<!-- event: comment author: orchestrator at: 2026-06-13T12:57:53Z -->
+
+## Comment
+
+Post-merge user verification report: mouse selection is still ineffective.
+
+User report:
+- 「マウス選択全く効かない」
+
+What was re-checked:
+- Merge commit for this Ticket: `02311883 merge: panel mouse selection`。
+- Implementation added `PanelRowHitBox` / `TermEvent::Mouse` handling in `crates/tui/src/multi_pod.rs` and focused tests, but there was no interactive `yoi panel` manual validation before marking done。
+- Current built debug binary contains `PanelRowHitBox` symbols; installed `/home/hare/.nix-profile/bin/yoi` did not contain those symbols in `strings` check, so at least one live/user-visible binary path may still be stale。
+- This does not fully explain the report if the user already rebuilt/restarted; the remaining likely failure areas are terminal mouse-event delivery, runtime binary freshness, hitbox coordinate mismatch, or lack of interactive validation coverage。
+
+Conclusion:
+- The original done decision was insufficient because it relied on internal hit-test/focused tests and did not prove actual terminal mouse selection in a live Panel.
+- Follow-up must include measured/manual validation with the same command/binary path the user runs, including a positive proof that a click changes selected row in `yoi panel`.
+
+---
