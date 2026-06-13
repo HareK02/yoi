@@ -182,3 +182,41 @@ Risks / notes:
 - I did not run the broader `cargo test -p tui multi_pod --lib` suite because the requested focused coverage passed and that broader suite was noted as having a likely unrelated existing failure.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-13T11:26:23Z -->
+
+## Implementation report
+
+Integration outcome: merged and validated.
+
+- Implementation branch: `ticket-00001KV072V89-panel-mouse-selection`
+- Implementation commits: `452c9df1 tui: select panel rows by mouse`, `c96a6c46 ticket: report panel mouse implementation`
+- Review commit: `6c7385e5 ticket: approve panel mouse selection`
+- Orchestrator merge commit: `02311883 merge: panel mouse selection`
+
+Reviewer result:
+- `approve`。Panel row hit-test cache、left-click selection-only path、non-row no-op / composer draft preservation、diagnostic guard、least-intrusive mouse capture、keyboard/composer preservation を確認済み。
+
+Orchestrator validation after merge:
+- `cargo test -p tui mouse_ --lib`: PASS（4 tests）
+- `cargo test -p tui row_hit_testing_maps_only_visible_selectable_rows --lib`: PASS（1 test）
+- `cargo fmt --check`: PASS
+- `git diff --check`: PASS
+- `cargo check -p tui --all-targets`: PASS
+
+Residual notes:
+- Broad `cargo test -p tui multi_pod --lib` は child validation で既知 unrelated failure があるため、Orchestrator validation では focused tests と `cargo check -p tui --all-targets` を採用した。
+- Click は selection のみで、Queue/Open/Close など workflow action は既存 key/action path に残っている。
+
+Next:
+- Ticket を `done` に遷移し、panel mouse child Pods / worktree / branch を cleanup する。close は別途明示権限がある場合に行う。
+
+---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-13T11:26:30Z from: inprogress to: done reason: merged_and_validated field: state -->
+
+## State changed
+
+Implementation branch `ticket-00001KV072V89-panel-mouse-selection` was reviewed, approved, merged into the Orchestrator branch as `02311883`, and validated in the Orchestrator worktree. Focused mouse-selection tests, formatting, diff check, and `cargo check -p tui --all-targets` passed. Ticket implementation work is done; closure remains separate.
+
+---
