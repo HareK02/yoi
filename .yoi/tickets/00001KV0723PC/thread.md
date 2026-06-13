@@ -222,3 +222,41 @@ Risks / notes:
 
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-13T11:41:19Z -->
+
+## Implementation report
+
+Integration outcome: merged and validated.
+
+- Implementation branch: `ticket-00001KV0723PC-panel-quit-latency`
+- Implementation commits: `cfe411e5 fix: avoid panel quit notice wait`, `8de82836 ticket: report panel quit latency fix`
+- Review commit: `2bb36cc4 ticket: approve panel quit latency`
+- Orchestrator merge commit: `db7bad7a merge: panel quit latency`
+
+Reviewer result:
+- `approve`。旧経路で reload 完了後に queue-attention notice dispatch を inline await していたことが Quit 遅延原因として妥当であること、実装が background/cancellable 化と Quit abort cleanup で解消していること、terminal/backend cleanup path と authority semantics を維持していることを確認済み。
+
+Orchestrator validation after merge:
+- `cargo test -p tui multi_quit_aborts_background_reload_and_notice_without_waiting --lib`: PASS
+- `cargo test -p tui multi_poll_reload_does_not_overlap_in_flight_reload --lib`: PASS
+- `cargo fmt --check`: PASS
+- `git diff --check`: PASS
+- `cargo check -p tui --all-targets`: PASS
+
+Residual notes:
+- Interactive `yoi panel` manual latency check は未実施。ただし、code-path review と focused tests で特定された nonessential reload/notice wait path は cover されている。
+- Ticket lifecycle authority、Pod authority boundary、Panel row/action semantics、composer target semantics、prompt resources、Ticket schema は変更していない。
+
+Next:
+- Ticket を `done` に遷移し、panel quit child Pods / worktree / branch を cleanup する。close は別途明示権限がある場合に行う。
+
+---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-13T11:41:26Z from: inprogress to: done reason: merged_and_validated field: state -->
+
+## State changed
+
+Implementation branch `ticket-00001KV0723PC-panel-quit-latency` was reviewed, approved, merged into the Orchestrator branch as `db7bad7a`, and validated in the Orchestrator worktree. Focused panel quit latency tests, formatting, diff check, and `cargo check -p tui --all-targets` passed. Ticket implementation work is done; closure remains separate.
+
+---
