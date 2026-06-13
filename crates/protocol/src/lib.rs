@@ -4,6 +4,14 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+fn default_true() -> bool {
+    true
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
+}
+
 // ---------------------------------------------------------------------------
 // Method (Client → Pod via Unix Socket)
 // ---------------------------------------------------------------------------
@@ -15,10 +23,15 @@ pub enum Method {
         input: Vec<Segment>,
     },
     /// Human-readable text injected into the target Pod's LLM context
-    /// as a non-blocking system message. No side effects beyond LLM
-    /// context; use `PodEvent` for typed lifecycle reports.
+    /// as a non-blocking system message. `auto_run` controls whether an
+    /// idle target is kicked into `RunForNotification`; weak notifications
+    /// (`auto_run: false`) are only queued for the next turn/resume/run.
+    /// No side effects beyond LLM context; use `PodEvent` for typed
+    /// lifecycle reports.
     Notify {
         message: String,
+        #[serde(default = "default_true", skip_serializing_if = "is_true")]
+        auto_run: bool,
     },
     /// Typed lifecycle report from a child Pod to its direct parent.
     PodEvent(PodEvent),
@@ -1027,15 +1040,26 @@ mod tests {
     }
 
     #[test]
-    fn method_notify_json_roundtrip() {
+    fn method_notify_json_roundtrip_defaults_to_auto_run() {
         let json = r#"{"method":"notify","params":{"message":"turn done"}}"#;
         let method: Method = serde_json::from_str(json).unwrap();
         assert!(matches!(
             method,
-            Method::Notify { ref message } if message == "turn done"
+            Method::Notify { ref message, auto_run: true } if message == "turn done"
         ));
         let serialized = serde_json::to_string(&method).unwrap();
         assert_eq!(serialized, json);
+    }
+
+    #[test]
+    fn method_notify_weak_json_roundtrip_serializes_auto_run_false() {
+        let json = r#"{"method":"notify","params":{"message":"progress","auto_run":false}}"#;
+        let method: Method = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            method,
+            Method::Notify { ref message, auto_run: false } if message == "progress"
+        ));
+        assert_eq!(serde_json::to_string(&method).unwrap(), json);
     }
 
     #[test]

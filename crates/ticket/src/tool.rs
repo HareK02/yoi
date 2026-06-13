@@ -131,6 +131,41 @@ explicit state decisions.";
 const DOCTOR_DESCRIPTION: &str = "Run typed Ticket backend consistency checks and return bounded \
 diagnostics through the typed backend without shelling out to external commands.";
 
+fn base_tool_description(name: &str) -> &'static str {
+    match name {
+        "TicketCreate" => CREATE_DESCRIPTION,
+        "TicketList" => LIST_DESCRIPTION,
+        "TicketShow" => SHOW_DESCRIPTION,
+        "TicketComment" => COMMENT_DESCRIPTION,
+        "TicketReview" => REVIEW_DESCRIPTION,
+        "TicketIntakeReady" => INTAKE_READY_DESCRIPTION,
+        "TicketWorkflowState" => WORKFLOW_STATE_DESCRIPTION,
+        "TicketClose" => CLOSE_DESCRIPTION,
+        "TicketRelationRecord" => RELATION_RECORD_DESCRIPTION,
+        "TicketRelationQuery" => RELATION_QUERY_DESCRIPTION,
+        "TicketOrchestrationPlanRecord" => ORCHESTRATION_PLAN_RECORD_DESCRIPTION,
+        "TicketOrchestrationPlanQuery" => ORCHESTRATION_PLAN_QUERY_DESCRIPTION,
+        "TicketDoctor" => DOCTOR_DESCRIPTION,
+        _ => "Ticket backend tool.",
+    }
+}
+
+/// Build the model-visible Ticket tool description for a configured Ticket backend.
+///
+/// `record_language` is the durable Ticket record/tool-body language, distinct from
+/// worker response language and Memory/Knowledge language. Keeping this on the tool
+/// surface ensures every Ticket-capable Pod sees the policy without hidden context
+/// injection or role-launch-only prose.
+pub fn ticket_tool_description(name: &str, record_language: Option<&str>) -> String {
+    let mut description = base_tool_description(name).to_string();
+    if let Some(language) = record_language.filter(|language| !language.trim().is_empty()) {
+        description.push_str("\n\nTicket record language: ");
+        description.push_str(language.trim());
+        description.push_str(". Use this language for durable Ticket record and Ticket tool body text, including Ticket item bodies, thread comments/plans/decisions/implementation reports, reviews, resolutions, intake summaries, and orchestration plan notes. This policy is distinct from worker.language for normal prose and memory.language for Memory/Knowledge. Preserve protocol literals, file paths, commands, logs, identifiers, and quoted external text when translation would reduce fidelity.");
+    }
+    description
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct TicketCreateParams {
     /// Ticket title. Must not be empty.
@@ -1273,18 +1308,15 @@ fn json_output(summary: String, value: impl Serialize) -> ToolOutput {
     }
 }
 
-fn tool_definition<T>(
-    name: &'static str,
-    description: &'static str,
-    backend: LocalTicketBackend,
-) -> ToolDefinition
+fn tool_definition<T>(name: &'static str, backend: LocalTicketBackend) -> ToolDefinition
 where
     T: Tool + From<LocalTicketBackend> + 'static,
 {
+    let description = ticket_tool_description(name, backend.record_language());
     Arc::new(move || {
         let schema_value = input_schema(name);
         let meta = ToolMeta::new(name)
-            .description(description)
+            .description(description.clone())
             .input_schema(schema_value);
         let tool: Arc<dyn Tool> = Arc::new(T::from(backend.clone()));
         (meta, tool)
@@ -1348,43 +1380,25 @@ impl_from_backend!(TicketDoctorTool);
 /// Build all MVP Ticket tool definitions over one local backend root.
 pub fn ticket_tools(backend: LocalTicketBackend) -> Vec<ToolDefinition> {
     vec![
-        tool_definition::<TicketCreateTool>("TicketCreate", CREATE_DESCRIPTION, backend.clone()),
-        tool_definition::<TicketListTool>("TicketList", LIST_DESCRIPTION, backend.clone()),
-        tool_definition::<TicketShowTool>("TicketShow", SHOW_DESCRIPTION, backend.clone()),
-        tool_definition::<TicketCommentTool>("TicketComment", COMMENT_DESCRIPTION, backend.clone()),
-        tool_definition::<TicketReviewTool>("TicketReview", REVIEW_DESCRIPTION, backend.clone()),
-        tool_definition::<TicketIntakeReadyTool>(
-            "TicketIntakeReady",
-            INTAKE_READY_DESCRIPTION,
-            backend.clone(),
-        ),
-        tool_definition::<TicketWorkflowStateTool>(
-            "TicketWorkflowState",
-            WORKFLOW_STATE_DESCRIPTION,
-            backend.clone(),
-        ),
-        tool_definition::<TicketCloseTool>("TicketClose", CLOSE_DESCRIPTION, backend.clone()),
-        tool_definition::<TicketRelationRecordTool>(
-            "TicketRelationRecord",
-            RELATION_RECORD_DESCRIPTION,
-            backend.clone(),
-        ),
-        tool_definition::<TicketRelationQueryTool>(
-            "TicketRelationQuery",
-            RELATION_QUERY_DESCRIPTION,
-            backend.clone(),
-        ),
+        tool_definition::<TicketCreateTool>("TicketCreate", backend.clone()),
+        tool_definition::<TicketListTool>("TicketList", backend.clone()),
+        tool_definition::<TicketShowTool>("TicketShow", backend.clone()),
+        tool_definition::<TicketCommentTool>("TicketComment", backend.clone()),
+        tool_definition::<TicketReviewTool>("TicketReview", backend.clone()),
+        tool_definition::<TicketIntakeReadyTool>("TicketIntakeReady", backend.clone()),
+        tool_definition::<TicketWorkflowStateTool>("TicketWorkflowState", backend.clone()),
+        tool_definition::<TicketCloseTool>("TicketClose", backend.clone()),
+        tool_definition::<TicketRelationRecordTool>("TicketRelationRecord", backend.clone()),
+        tool_definition::<TicketRelationQueryTool>("TicketRelationQuery", backend.clone()),
         tool_definition::<TicketOrchestrationPlanRecordTool>(
             "TicketOrchestrationPlanRecord",
-            ORCHESTRATION_PLAN_RECORD_DESCRIPTION,
             backend.clone(),
         ),
         tool_definition::<TicketOrchestrationPlanQueryTool>(
             "TicketOrchestrationPlanQuery",
-            ORCHESTRATION_PLAN_QUERY_DESCRIPTION,
             backend.clone(),
         ),
-        tool_definition::<TicketDoctorTool>("TicketDoctor", DOCTOR_DESCRIPTION, backend),
+        tool_definition::<TicketDoctorTool>("TicketDoctor", backend),
     ]
 }
 
@@ -1408,6 +1422,16 @@ mod tests {
             .find_map(|definition| {
                 let (meta, tool) = definition();
                 (meta.name == name).then_some(tool)
+            })
+            .expect("tool exists")
+    }
+
+    fn tool_description_by_name(backend: LocalTicketBackend, name: &str) -> String {
+        ticket_tools(backend)
+            .into_iter()
+            .find_map(|definition| {
+                let (meta, _) = definition();
+                (meta.name == name).then_some(meta.description)
             })
             .expect("tool exists")
     }
@@ -1461,6 +1485,29 @@ mod tests {
         let (meta, _) = definition();
         assert!(meta.description.contains("queued -> inprogress"));
         assert!(meta.description.contains("implementation side effects"));
+    }
+
+    #[test]
+    fn tool_descriptions_include_configured_ticket_record_language_guidance() {
+        let temp = TempDir::new().unwrap();
+        let backend = backend(&temp).with_record_language(Some("Japanese"));
+        let description = tool_description_by_name(backend, "TicketComment");
+
+        assert!(description.contains("Ticket record language: Japanese"));
+        assert!(description.contains("durable Ticket record and Ticket tool body text"));
+        assert!(description.contains("distinct from worker.language"));
+        assert!(description.contains("memory.language"));
+        assert!(description.contains("Preserve protocol literals"));
+        assert!(description.contains("file paths, commands, logs, identifiers"));
+    }
+
+    #[test]
+    fn tool_descriptions_omit_ticket_record_language_guidance_when_unset() {
+        let temp = TempDir::new().unwrap();
+        let description = tool_description_by_name(backend(&temp), "TicketComment");
+
+        assert!(!description.contains("Ticket record language:"));
+        assert!(!description.contains("worker.language"));
     }
 
     #[tokio::test]
@@ -2256,7 +2303,6 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let create = tool(tool_definition::<TicketCreateTool>(
             "TicketCreate",
-            CREATE_DESCRIPTION,
             backend(&temp),
         ));
         let _ = create;

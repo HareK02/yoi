@@ -149,3 +149,216 @@ Coder delegated.
 - Constraint: coder was instructed not to use root/original workspace for decision evidence or git/validation/cleanup, and not to create generated memory/local/runtime/log/lock/secret-like `.yoi` paths.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-12T15:01:02Z -->
+
+## Implementation report
+
+Coder completed implementation.
+
+Coder Pod:
+- `yoi-coder-panel-focus-model`
+
+Implementation branch/worktree:
+- Branch: `ticket/panel-focus-composer-row-selection`
+- Worktree: `/home/hare/Projects/yoi/.worktree/panel-focus-composer-row-selection`
+- Commit: `c5ef6f79 tui: clarify panel composer target and row selection`
+- Worktree status: clean
+
+Changed surfaces:
+- `crates/tui/src/multi_pod.rs`
+- `crates/tui/src/workspace_panel.rs`
+
+Implementation summary:
+- Removed user-visible `PanelFocus` / `ItemAction` style focus model.
+- `Tab` switches composer target without clearing selected row.
+- `Esc` clears row selection while preserving composer draft and target.
+- Non-empty composer prioritizes draft/text input and `Enter` targets composer send.
+- Blank composer uses selected row as `Enter` target for Ticket action / Pod open.
+- Title/status/actionbar/row hints no longer expose `global composer`, `item action`, or `Right action focus` as focus states.
+- `Left` / `Right` are presented as composer cursor movement, not Panel focus switching.
+
+Orchestrator-verified evidence from child worktree:
+- `git status --short --branch`: clean on `ticket/panel-focus-composer-row-selection`
+- Focused changed tests passed individually:
+  - `cargo test -p tui selected_ticket_row_with_non_empty_composer_shows_composer_enter_behavior`
+  - `cargo test -p tui multi_esc_clears_row_selection_without_quitting_and_preserves_draft`
+  - `cargo test -p tui multi_composer_target_switch_preserves_typed_text`
+  - `cargo test -p tui multi_blank_ticket_intake_enter_uses_selected_row_and_preserves_input`
+- `cargo fmt --check`: pass
+- `git diff --check`: pass
+- `cargo run -p yoi -- ticket doctor`: `doctor: ok`
+- `nix build .#yoi`: pass
+
+Known unrelated validation failure:
+- `cargo test -p tui multi_ --lib` fails one test: `multi_pod::tests::orchestrator_launch_context_uses_orchestration_root_for_runtime_workspace`.
+- The same focused failing test also fails on current Orchestrator branch before this implementation is merged, with `context.workspace_root` `/repo/yoi` vs expected `/repo/yoi/.worktree/orchestration/yoi-orchestrator`.
+- The failure is not in the changed focus/composer/row-selection path, but reviewer should still confirm it is unrelated and not introduced by this Ticket.
+
+Next:
+- Spawn read-only sibling reviewer against the recorded intent, binding decisions/invariants, acceptance criteria, commit `c5ef6f79`, diff, focused validation evidence, `nix build` evidence, and the known pre-existing unrelated `multi_` failure.
+
+---
+
+<!-- event: plan author: orchestrator at: 2026-06-12T15:01:54Z -->
+
+## Plan
+
+Reviewer delegated.
+
+- Reviewer Pod: `yoi-reviewer-panel-focus-model`
+- Target branch/worktree: `ticket/panel-focus-composer-row-selection` at `/home/hare/Projects/yoi/.worktree/panel-focus-composer-row-selection`
+- Commit under review: `c5ef6f79 tui: clarify panel composer target and row selection`
+- Scope: read-only child worktree plus minimal non-recursive runtime-root read required by spawn validation.
+- Review basis: recorded IntentPacket, binding decisions/invariants, acceptance criteria, implementation summary, diff, focused validation evidence, `nix build` evidence, and known pre-existing unrelated `multi_` failure evidence.
+- Reviewer focus: composer input protection, blank/non-blank Enter behavior, status/actionbar/key hint consistency, removal of user-visible `item action` / `Right action focus`, Ticket/Pod authority preservation, and staying within Panel scope.
+
+---
+
+<!-- event: review author: reviewer:yoi-reviewer-panel-focus-model at: 2026-06-12T15:07:09Z status: approve -->
+
+## Review: approve
+
+Approve.
+
+Review target:
+- Worktree: `/home/hare/Projects/yoi/.worktree/panel-focus-composer-row-selection`
+- Commit: `c5ef6f79 tui: clarify panel composer target and row selection`
+
+Evidence:
+- 差分は `crates/tui/src/multi_pod.rs` と `crates/tui/src/workspace_panel.rs` に限定され、single-Pod TUI transcript/block navigation は変更していない。
+- `Right action focus` / `global composer` / `item action` / `PanelFocus` / `ItemAction` は現行ツリー上で user-visible 文言・型として残っていない。
+- 非空 composer の `Enter` は composer target 送信 / Intake 起動に向き、row selection の Ticket action / Pod open は待機扱いになる。
+- 空 composer では selected row が `Enter` 対象になり、既存 Ticket action dispatch / Pod open 経路を使う。
+- `Tab` は composer target の切替のみで selected row と draft を保持する。
+- `Esc` は row selection を解除し、composer draft と target は保持する。
+- `Left` / `Right` は Panel focus 切替ではなく composer cursor 操作として扱われる。
+- Ticket action dispatch は従来通り stale/current authority re-check 経路を通り、`ready -> queued` などの明示 action semantics は弱められていない。
+- Companion send は workspace Companion 宛て固定の安全確認を維持し、selected Pod へ誤送信する形にはなっていない。
+
+Reviewer-run validation:
+- `cargo test -p tui selected_ticket_row_with_non_empty_composer_shows_composer_enter_behavior`: pass
+- `cargo test -p tui multi_esc_clears_row_selection_without_quitting_and_preserves_draft`: pass
+- `cargo test -p tui multi_composer_target_switch_preserves_typed_text`: pass
+- `cargo test -p tui multi_blank_ticket_intake_enter_uses_selected_row_and_preserves_input`: pass
+- `cargo fmt --check`: pass
+- `git diff --check orchestration/yoi-orchestrator...HEAD`: pass
+
+Known broad failure:
+- `cargo test -p tui multi_ --lib` fails only `multi_pod::tests::orchestrator_launch_context_uses_orchestration_root_for_runtime_workspace`.
+- The failure is the same `/repo/yoi` vs `/repo/yoi/.worktree/orchestration/yoi-orchestrator` mismatch already confirmed on the current Orchestrator branch, and this implementation does not change that launch-context path. It is pre-existing and not a blocker for this Ticket.
+
+Non-blocking risks:
+- None identified. The added tests directly cover key boundaries, draft protection, and target/row-selection display without brittle full UI snapshots.
+
+---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-12T15:08:05Z -->
+
+## Implementation report
+
+Integration completed in the Orchestrator workspace.
+
+Integrated implementation:
+- Ticket: `00001KTVJFT6F`
+- Implementation branch: `ticket/panel-focus-composer-row-selection`
+- Implementation commit: `c5ef6f79 tui: clarify panel composer target and row selection`
+- Reviewer result: approve, no blockers
+- Orchestrator merge commit: `d6166c72 merge: panel focus composer row selection`
+- Integration target: `orchestration/yoi-orchestrator`
+
+Post-integration validation from Orchestrator worktree:
+- `cargo test -p tui selected_ticket_row_with_non_empty_composer_shows_composer_enter_behavior`: pass
+- `cargo test -p tui multi_esc_clears_row_selection_without_quitting_and_preserves_draft`: pass
+- `cargo test -p tui multi_composer_target_switch_preserves_typed_text`: pass
+- `cargo test -p tui multi_blank_ticket_intake_enter_uses_selected_row_and_preserves_input`: pass
+- `cargo fmt --check`: pass
+- `git diff --check HEAD~1..HEAD`: pass
+- `./result/bin/yoi ticket doctor`: `doctor: ok`
+- `nix build .#yoi`: pass
+
+Known unrelated validation failure remains:
+- `cargo test -p tui multi_ --lib` still includes pre-existing failure `multi_pod::tests::orchestrator_launch_context_uses_orchestration_root_for_runtime_workspace`; this was verified on the Orchestrator branch before merge and reviewed as unrelated to this Ticket.
+
+Remaining risks:
+- None identified by reviewer for this Ticket.
+
+---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-12T15:08:11Z from: inprogress to: done reason: implementation_merged_and_validated field: state -->
+
+## State changed
+
+Implementation was merged into the Orchestrator branch, reviewer approved with no blockers, and post-integration validation passed. Cleanup and closure will be recorded next.
+
+---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-12T15:08:59Z -->
+
+## Implementation report
+
+Cleanup completed.
+
+- Stopped coder Pod: `yoi-coder-panel-focus-model`
+- Stopped reviewer Pod: `yoi-reviewer-panel-focus-model`
+- Removed child worktree: `/home/hare/Projects/yoi/.worktree/panel-focus-composer-row-selection`
+- Deleted implementation branch: `ticket/panel-focus-composer-row-selection`
+- Orchestrator worktree status after cleanup: clean
+
+Cleanup was limited to child implementation worktree/branch and related child Pods. Root/original workspace was not touched.
+
+---
+
+<!-- event: state_changed author: hare at: 2026-06-12T15:09:15Z from: done to: closed reason: closed field: state -->
+
+## State changed
+
+Ticket を closed にしました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-06-12T15:09:15Z status: closed -->
+
+## 完了
+
+Workspace panel の focus model を composer target と row selection に整理した。
+
+実装概要:
+- `yoi panel` の user-visible focus 表示から `item action focus` / `Right action focus` / `global composer` / `PanelFocus` / `ItemAction` 系の不要な focus model を除去した。
+- composer target は送信先、row selection は空 composer 時の navigation / Enter 対象として扱う表示・挙動へ整理した。
+- 非空 composer では composer draft / target を優先し、`Enter` は composer send / Intake 起動に向く。
+- 空 composer では selected row が `Enter` 対象になり、既存 Ticket action dispatch / Pod open 経路を使う。
+- `Tab` は composer target の切替のみで selected row と draft を保持する。
+- `Esc` は row selection を解除し、composer draft と target は保持する。
+- `Left` / `Right` は Panel focus 切替ではなく composer cursor 操作として扱う。
+- Ticket action dispatch、Pod open、Intake launch、Companion send の authority / safety semantics は維持した。
+
+Review / integration:
+- Implementation commit: `c5ef6f79 tui: clarify panel composer target and row selection`
+- Reviewer: `yoi-reviewer-panel-focus-model` が approve。
+- Orchestrator merge commit: `d6166c72 merge: panel focus composer row selection`
+- Ticket completion commit: `e330685e ticket: mark panel focus done`
+
+Validation:
+- `cargo test -p tui selected_ticket_row_with_non_empty_composer_shows_composer_enter_behavior`: pass
+- `cargo test -p tui multi_esc_clears_row_selection_without_quitting_and_preserves_draft`: pass
+- `cargo test -p tui multi_composer_target_switch_preserves_typed_text`: pass
+- `cargo test -p tui multi_blank_ticket_intake_enter_uses_selected_row_and_preserves_input`: pass
+- `cargo fmt --check`: pass
+- `git diff --check HEAD~1..HEAD`: pass
+- `./result/bin/yoi ticket doctor`: `doctor: ok`
+- `nix build .#yoi`: pass
+
+Known unrelated validation failure:
+- `cargo test -p tui multi_ --lib` still includes pre-existing failure `multi_pod::tests::orchestrator_launch_context_uses_orchestration_root_for_runtime_workspace`; this was verified on the Orchestrator branch before merge and reviewed as unrelated to this Ticket.
+
+Cleanup:
+- coder/reviewer Pods stopped。
+- child worktree `/home/hare/Projects/yoi/.worktree/panel-focus-composer-row-selection` removed。
+- branch `ticket/panel-focus-composer-row-selection` deleted。
+
+Non-blocking risks:
+- Reviewer found none for this Ticket.
+
+---

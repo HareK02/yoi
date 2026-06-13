@@ -127,3 +127,389 @@ Ticket を `workspace-panel` が queued にしました。
 
 
 ---
+
+<!-- event: decision author: orchestrator at: 2026-06-12T14:56:17Z -->
+
+## Decision
+
+Routing decision: leave queued for now (`waiting_capacity_note`)
+
+Reason:
+- This queue review already accepted and delegated three in-progress branches: `00001KTVJFT6F` (Panel focus model), `00001KTTW04W2` (Companion progress notification), and `00001KTVJGC0Y` (Ticket language guidance).
+- This Ticket concerns Orchestrator idle queued re-kick / active work-set behavior and overlaps conceptually with the active Companion progress notification and Panel lifecycle work. Starting it now would raise duplicate-start / scheduler-boundary / integration-conflict risk rather than safe independent parallelism.
+- Relation check: dependency relation target `00001KTG3MDFG` is closed, so this is not blocked by an unresolved relation; the current stop reason is capacity/conflict with active work.
+
+Evidence checked:
+- Ticket body/thread: active in-progress suppression, clean workspace gate, no queue-drain loop, active-work-set snapshot requirements, and escalation conditions.
+- TicketRelationQuery: two relation records checked; `depends_on` target `00001KTG3MDFG` is closed.
+- TicketOrchestrationPlanQuery: no prior records; added `waiting_capacity_note` `orch-plan-20260612-145604-1`.
+- Workspace/Pod state: Orchestrator worktree clean; active sibling coder Pods are running for Panel focus, Companion progress notification, and Ticket language guidance.
+
+Next action:
+- Keep `queued` and reconsider after at least Panel focus / Companion progress notification are merged or blocked, so this Ticket can validate against the current Panel/notification behavior without duplicate scheduler semantics.
+
+---
+
+<!-- event: decision author: orchestrator at: 2026-06-12T15:46:19Z -->
+
+## Decision
+
+Routing decision: implementation_ready
+
+Reason:
+- 前回の waiting reason は、Panel focus / Companion progress notification / Ticket language guidance の active in-progress work と重なる capacity/conflict だった。現在それらは merge/close/cleanup 済みで、visible child Pod は 0、Orchestrator worktree は clean。
+- Relation blocker はない。`depends_on` target `00001KTG3MDFG` は closed 済みで、incoming `related` は non-blocking context である。
+- Ticket body/thread は、session-lifetime work set discovery / re-kick policy、active_inprogress suppression、duplicate-start prevention、no scheduler/no polling/no blind spawn、`queued -> inprogress` acceptance gate を binding decisions として明確にしている。
+- risk flags は orchestration-policy / panel-lifecycle / persistence / role-session / authority-boundary / duplicate-start だが、bounded context check の結果、具体的な未決定 design/API/authority 判断は残っていない。実装方式は Panel/lifecycle/runtime boundary と local session work-set representation の local tactic に閉じている。
+- OrchestrationPlan に accepted plan `orch-plan-20260612-154541-2` を記録済み。
+
+Evidence checked:
+- Ticket body / thread / artifacts: requirements, acceptance criteria, binding decisions, previous waiting_capacity_note, and accepted plan を確認。
+- TicketRelationQuery: `depends_on` target `00001KTG3MDFG` closed、incoming `related` non-blocking。
+- Related Ticket: `00001KTG3MDFG` closed。OrchestrationPlan record/tool surface は実装済みで、この Ticket では再実装しない前提を確認。
+- Recent merged context: Panel focus model、Companion weak progress notify、Ticket language guidance は closed/merged/cleaned up 済み。
+- Code map: `crates/tui/src/workspace_panel.rs`, `crates/tui/src/multi_pod.rs`, `crates/tui/src/role_session_registry.rs`, Ticket state/action surfaces, Pod visibility/state surfaces, recent `companion_progress` weak notify path を確認。
+- Workspace/Pod state: Orchestrator branch `orchestration/yoi-orchestrator` is clean; visible child Pods 0。
+
+IntentPacket:
+
+Intent:
+- Orchestrator が idle で actionable queued work を見落とすことを防ぐ bounded starvation-prevention layer を実装する。
+- `active_inprogress` が導出されている間は queued/planned work があるだけでは re-kick しない。
+- re-kick は inspection / work-set incorporation / next planned acceptance を促す attention であり、scheduler や blind implementation start ではない。
+
+Binding decisions / invariants:
+- `new_queued` / `planned_queued` / `active_inprogress` / `actionable_inprogress` は core Ticket state に追加しない。Ticket `state`、session-lifetime work set、role/session claims、visible Pod/worktree state、OrchestrationPlan records から導出する分類に留める。
+- Work set は session-lifetime runtime state であり、Ticket ごとの durable artifact log として積まない。durable に残すべき判断だけ Ticket comment / state transition / OrchestrationPlan record に残す。
+- 常時 polling / unattended scheduler loop / queue drain loop を作らない。
+- `queued -> inprogress` acceptance なしに coder/reviewer Pod spawn、worktree 作成、implementation side effect を行わない。
+- active coder/reviewer/planning-sync/merge/cleanup 等の完了待ち中は queued/planned work の存在だけで re-kick しない。
+- duplicate Orchestrator/coder/reviewer/worktree start を防ぐ。
+- Panel は authority/backend/scheduler にならず、bounded attention surface に留まる。
+
+Requirements / acceptance criteria:
+- Orchestrator Pod が `Idle` で `new_queued` work があるとき、bounded work-list attention または session work set incorporation に進める。
+- `active_inprogress` がなく、planned queued work が unblocked/capacity-allowed のとき、next acceptance/routing に進める。
+- `active_inprogress` が導出される間は queued/planned work の存在だけで re-kick しない。
+- 開始しない planned queued work には session work set 上でユーザーに提示できる bounded waiting/blocking reason を保持する。
+- Ticket state、session work set、role/session claims、visible Pod/worktree state を使って duplicate start を避ける。
+- session work set が失われても `queued` Ticket から安全に再検出・再 inspection できる。
+
+Implementation latitude:
+- Panel open / Orchestrator restore/spawn / explicit user action のどの boundary で idle detection と attention payload を組むかは実装側で選んでよい。
+- Session work-set の具体的な runtime representation は既存 local role/session registry や Panel app state に合わせて選んでよい。
+- Bounded attention payload の具体形は実装側で選んでよいが、full Ticket thread / unbounded Pod output / hidden context-only injection は避ける。
+- OrchestrationPlan types の最小拡張は必要なら検討してよいが、core Ticket lifecycle state や旧 `workflow_state` は復活させない。
+
+Escalate if:
+- Durable scheduler state / persistent queue runner / polling loop が必要になる。
+- `queued -> inprogress` acceptance gate を迂回しないと実装できない。
+- Duplicate start prevention に新しい global lock/lease authority が必要になる。
+- Panel が lifecycle authority / scheduler になる必要が出る。
+- Role/session claims から active_inprogress を安全に導出できない。
+
+Validation:
+- idle Orchestrator + queued detection。
+- active_inprogress 導出時の re-kick suppression。
+- planned queued waiting reason retention。
+- duplicate-start prevention。
+- session work set loss から queued Ticket 再検出。
+- relevant `cargo test` for `tui` / panel / role session / ticket routing paths。
+- `cargo fmt --check`。
+- `git diff --check`。
+- `cargo run -p yoi -- ticket doctor` または同等。
+- `nix build .#yoi`。
+
+Current code map:
+- `crates/tui/src/workspace_panel.rs`: Ticket rows/actions and state-first Panel view model。
+- `crates/tui/src/multi_pod.rs`: Panel lifecycle, Companion/Orchestrator interactions, recent progress notice / header behavior。
+- `crates/tui/src/role_session_registry.rs`: local role/session claims。
+- `crates/pod-store`, `crates/pod-registry`, and protocol Pod status surfaces only if needed for visible Pod/worktree state derivation。
+- Ticket relation / OrchestrationPlan tool surfaces are already implemented and should be reused/read, not reimplemented as plan store。
+
+Critical risks / reviewer focus:
+- No scheduler / queue drain loop / background polling。
+- No blind worktree/Pod spawn before `queued -> inprogress` acceptance。
+- active_inprogress suppression works and avoids re-kick while coder/reviewer/merge/cleanup is active。
+- duplicate start prevention uses actual Ticket state + claims + visible Pods/worktrees, not heuristic title/labels。
+- session work set is runtime/session scoped, not a new durable per-Ticket artifact log。
+- Recent Companion weak progress notify and Panel focus behavior remain coherent.
+
+Next action:
+- `queued -> inprogress` を記録してから、branch `ticket/orchestrator-idle-queued-rekick` / worktree `/home/hare/Projects/yoi/.worktree/orchestrator-idle-queued-rekick` を作成し、sibling coder に narrow write scope で実装を委譲する。Reviewer は coder evidence 後に read-only で起動する。
+
+---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-12T15:46:28Z from: queued to: inprogress reason: orchestrator_acceptance field: state -->
+
+## State changed
+
+Routing accepted for implementation. Ticket body/thread, dependency relation target, incoming non-blocking relation, previous waiting-capacity note, current Orchestrator workspace state, visible Pods, recent merged Panel/Companion/Ticket-language context, and relevant Panel/lifecycle/role-session code map were rechecked. No unresolved blocker or missing planning decision remains. Implementation side effects will start only after this accepted `queued -> inprogress` transition is recorded, using accepted plan `orch-plan-20260612-154541-2`.
+
+---
+
+<!-- event: plan author: orchestrator at: 2026-06-12T15:47:00Z -->
+
+## Plan
+
+Implementation worktree created for multi-agent handoff.
+
+- Ticket: `00001KTJXS31R`
+- Branch: `ticket/orchestrator-idle-queued-rekick`
+- Worktree: `/home/hare/Projects/yoi/.worktree/orchestrator-idle-queued-rekick`
+- Base: Orchestrator workspace HEAD `e72a4536` (`orchestration/yoi-orchestrator`), including the accepted routing record and `queued -> inprogress` transition.
+- Scope rule: implementation work happens only in this child worktree. Root/original workspace must not be read, written, validated, merged, cleaned, or used for git operations.
+- Next: spawn sibling coder with narrow write scope to the implementation worktree. Reviewer will be started after coder evidence is available.
+
+---
+
+<!-- event: plan author: orchestrator at: 2026-06-12T15:47:50Z -->
+
+## Plan
+
+Coder delegated.
+
+- Coder Pod: `yoi-coder-idle-queued-rekick`
+- Worktree: `/home/hare/Projects/yoi/.worktree/orchestrator-idle-queued-rekick`
+- Branch: `ticket/orchestrator-idle-queued-rekick`
+- Scope: write `/home/hare/Projects/yoi/.worktree/orchestrator-idle-queued-rekick`; read child worktree plus minimal non-recursive runtime-root read required by spawn validation.
+- Task: implement bounded idle-Orchestrator queued-work attention / session work-set rediscovery without scheduler/polling/queue-drain behavior, preserve `queued -> inprogress` acceptance gate, suppress re-kick while active_inprogress work exists, prevent duplicate starts, and add focused tests plus required validation.
+- Constraint: coder was instructed not to use root/original workspace for decision evidence or git/validation/cleanup, and not to create generated memory/local/runtime/log/lock/secret-like `.yoi` paths.
+
+---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-12T16:04:17Z -->
+
+## Implementation report
+
+Coder completed implementation.
+
+Coder Pod:
+- `yoi-coder-idle-queued-rekick`
+
+Implementation branch/worktree:
+- Branch: `ticket/orchestrator-idle-queued-rekick`
+- Worktree: `/home/hare/Projects/yoi/.worktree/orchestrator-idle-queued-rekick`
+- Commit: `d2fae81a tui: add idle queued orchestrator attention`
+- Worktree status: clean
+
+Changed surfaces:
+- `crates/tui/src/multi_pod.rs`
+- `resources/prompts/panel/orchestrator_idle_queue_notice.md`
+
+Implementation summary:
+- Adds session-scoped `OrchestratorWorkSet` derived at Panel reload boundary.
+- Derives `active_inprogress`, new/actionable queued, planned queued, waiting reasons, and duplicate guards from Panel Ticket rows, local role-session claims, related Pods, blocked reasons, and live Orchestrator status.
+- Sends bounded Orchestrator attention only when Orchestrator is live/reachable/idle and queued work is actionable.
+- Suppresses attention when active_inprogress exists or duplicate-start guard indicates existing claim/Pod/worktree activity.
+- Retains waiting reason / planned queued information in Panel header detail for session-visible explanation.
+- Adds prompt resource `resources/prompts/panel/orchestrator_idle_queue_notice.md` for the attention payload, preserving the prompt-resource boundary.
+- Does not add scheduler loop, polling loop, queue drain loop, core Ticket states, or persistent work-set artifact store.
+
+Implementation note for reviewer attention:
+- Coder report used the phrase `workflow_state` for `TicketPanelEntry.workflow_state`; this is existing Panel model naming over the typed Ticket state enum, not reintroduction of obsolete Ticket frontmatter `workflow_state`.
+
+Orchestrator-verified evidence from child worktree:
+- `git status --short --branch`: clean on `ticket/orchestrator-idle-queued-rekick`
+- `cargo test -p tui queued_attention`: pass, 3 tests
+- `cargo test -p tui planned_queued_prompts`: pass, 1 test
+- `cargo test -p tui rediscovered_queued_work`: pass, 1 test
+- `cargo test -p tui active_inprogress_suppresses`: pass, 1 test
+- `cargo test -p tui idle_orchestrator_gets_bounded_attention`: pass, 1 test
+- `cargo test -p tui workspace_panel`: pass, 12 tests
+- `cargo check -p tui`: pass
+- `cargo fmt --check`: pass
+- `git diff --check orchestration/yoi-orchestrator...HEAD`: pass
+- `cargo run -p yoi -- ticket doctor`: `doctor: ok`
+- `nix build .#yoi`: pass
+
+Known broad-suite note from coder:
+- `cargo test -p tui` still fails unrelated existing/neighboring expectation tests:
+  - `multi_pod::tests::orchestrator_launch_context_uses_orchestration_root_for_runtime_workspace`
+  - `spawn::tests::profile_choices_use_project_registry_default`
+  - `spawn::tests::profile_choices_include_builtin_and_project_default_marker`
+- Focused tests for this Ticket pass; reviewer should confirm broad failures are unrelated and not introduced by this Ticket.
+
+Next:
+- Spawn read-only sibling reviewer against recorded intent, binding decisions/invariants, acceptance criteria, commit `d2fae81a`, diff, validation evidence, and known broad-suite failures.
+
+---
+
+<!-- event: plan author: orchestrator at: 2026-06-12T16:05:08Z -->
+
+## Plan
+
+Reviewer delegated.
+
+- Reviewer Pod: `yoi-reviewer-idle-queued-rekick`
+- Target branch/worktree: `ticket/orchestrator-idle-queued-rekick` at `/home/hare/Projects/yoi/.worktree/orchestrator-idle-queued-rekick`
+- Commit under review: `d2fae81a tui: add idle queued orchestrator attention`
+- Scope: read-only child worktree plus minimal non-recursive runtime-root read required by spawn validation.
+- Review basis: recorded IntentPacket, binding decisions/invariants, acceptance criteria, implementation summary, diff, focused validation evidence, `nix build` evidence, and known broad-suite failures.
+- Reviewer focus: no scheduler/polling/queue-drain behavior, no acceptance-gate bypass, active_inprogress suppression, duplicate-start prevention, session-scoped work set, prompt-resource boundary, recent Panel/Companion behavior compatibility, and robust focused tests.
+
+---
+
+<!-- event: review author: reviewer:yoi-reviewer-idle-queued-rekick at: 2026-06-12T16:10:24Z status: approve -->
+
+## Review: approve
+
+Approve.
+
+Review target:
+- Worktree: `/home/hare/Projects/yoi/.worktree/orchestrator-idle-queued-rekick`
+- Commit: `d2fae81a tui: add idle queued orchestrator attention`
+
+Evidence:
+- 差分は `crates/tui/src/multi_pod.rs` と `resources/prompts/panel/orchestrator_idle_queue_notice.md` のみ。
+- queued work への通知は idle かつ reachable な Orchestrator Pod に限定されている。
+- `Method::Notify { auto_run: true }` は bounded attention / re-kick として使われるだけで、Ticket 状態変更・Pod spawn・worktree 作成・queue drain は追加されていない。
+- Scheduler / queue drain / background worker は追加されていない。既存 Panel reload 後に fingerprint で重複抑制された通知を送る構成。
+- `queued -> inprogress` acceptance は bypass されていない。通知 payload は Ticket state verification と通常 acceptance 記録を明示し、implementation side effect は行わない。
+- `active_inprogress` suppression は実装されている。`TicketWorkflowState::InProgress` が存在する場合、queued attention は送られず、waiting reason として session work set に残る。
+- Duplicate-start guard は title/label ではなく、Ticket id に紐づく local claim / related visible Pods / worktree 表示情報から導出している。
+- Session work set は `MultiPodApp` 内の runtime/session-scoped state のみで、永続 per-Ticket artifact は追加されていない。
+- Prompt 本文は `resources/prompts/panel/orchestrator_idle_queue_notice.md` に置かれており、Rust 側は include/render の境界に留まっている。
+- `workflow_state` 命名は既存の typed `TicketWorkflowState` / Panel internal naming の利用であり、この差分で obsolete frontmatter authority を再導入しているものではない。
+
+Reviewer-run validation:
+- `cargo test -p tui queued_attention -- --nocapture`: pass, 3 tests
+- `cargo test -p tui planned_queued_prompts -- --nocapture`: pass
+- `cargo test -p tui rediscovered_queued_work -- --nocapture`: pass
+- `cargo test -p tui idle_orchestrator_gets_bounded_attention -- --nocapture`: pass
+- `cargo test -p tui active_inprogress_suppresses -- --nocapture`: pass
+- `cargo test -p tui workspace_panel -- --nocapture`: pass, 12 tests
+- `cargo check -p tui`: pass
+- `git diff --check orchestration/yoi-orchestrator...HEAD && cargo fmt --check`: pass
+
+Known broad-suite failures:
+- `cargo test -p tui`: expected broad-suite failure, 312 passed / 3 failed.
+- Failing tests:
+  - `multi_pod::tests::orchestrator_launch_context_uses_orchestration_root_for_runtime_workspace`
+  - `spawn::tests::profile_choices_use_project_registry_default`
+  - `spawn::tests::profile_choices_include_builtin_and_project_default_marker`
+- The two `spawn` failures are in untouched `crates/tui/src/spawn.rs`.
+- The `orchestrator_launch_context...` failure is in `multi_pod.rs`, but this diff does not touch `build_orchestrator_launch_context` or that test area; it remains the existing/neighboring expectation mismatch reported by coder. Not a blocker for this Ticket.
+
+Non-blocking risks:
+- Failed delivery is not fingerprint-marked, so a repeatedly reachable-but-rejecting socket can retry on subsequent Panel reloads; this is consistent with existing notice behavior but may be noisy.
+- Duplicate guard depends on the Panel’s existing visible claim/pod/worktree derivation, so it prevents duplicate starts for locally visible state but is not a full global scheduler/lock. This matches the Ticket’s bounded Panel-attention scope.
+
+---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-12T16:11:43Z -->
+
+## Implementation report
+
+Integration completed in the Orchestrator workspace.
+
+Integrated implementation:
+- Ticket: `00001KTJXS31R`
+- Implementation branch: `ticket/orchestrator-idle-queued-rekick`
+- Implementation commit: `d2fae81a tui: add idle queued orchestrator attention`
+- Reviewer result: approve, no blockers
+- Orchestrator merge commit: `9538feb1 merge: idle queued orchestrator attention`
+- Integration target: `orchestration/yoi-orchestrator`
+
+Post-integration validation from Orchestrator worktree:
+- `cargo test -p tui queued_attention`: pass, 3 tests
+- `cargo test -p tui planned_queued_prompts`: pass, 1 test
+- `cargo test -p tui rediscovered_queued_work`: pass, 1 test
+- `cargo test -p tui active_inprogress_suppresses`: pass, 1 test
+- `cargo test -p tui idle_orchestrator_gets_bounded_attention`: pass, 1 test
+- `cargo test -p tui workspace_panel`: pass, 12 tests
+- `cargo check -p tui`: pass
+- `cargo fmt --check`: pass
+- `git diff --check HEAD~1..HEAD`: pass
+- `./result/bin/yoi ticket doctor`: `doctor: ok`
+- `nix build .#yoi`: pass
+
+Known broad-suite failures:
+- Existing broad `cargo test -p tui` failures noted by coder/reviewer remain outside this Ticket and were not blockers for focused implementation/review.
+
+Remaining non-blocking risks:
+- Failed attention delivery is not fingerprint-marked, so a repeatedly reachable-but-rejecting socket can retry on subsequent Panel reloads; this is consistent with existing notice behavior but may be noisy.
+- Duplicate guard is bounded to Panel-visible claim/Pod/worktree derivation and is not a full global scheduler/lock, matching this Ticket's scoped attention model.
+
+---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-12T16:11:51Z from: inprogress to: done reason: implementation_merged_and_validated field: state -->
+
+## State changed
+
+Implementation was merged into the Orchestrator branch, reviewer approved with no blockers, and post-integration validation passed. Cleanup and closure will be recorded next.
+
+---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-12T16:12:22Z -->
+
+## Implementation report
+
+Cleanup completed.
+
+- Stopped coder Pod: `yoi-coder-idle-queued-rekick`
+- Stopped reviewer Pod: `yoi-reviewer-idle-queued-rekick`
+- Removed child worktree: `/home/hare/Projects/yoi/.worktree/orchestrator-idle-queued-rekick`
+- Deleted implementation branch: `ticket/orchestrator-idle-queued-rekick`
+- Orchestrator worktree status after cleanup: clean
+
+Cleanup was limited to child implementation worktree/branch and related child Pods. Root/original workspace was not touched.
+
+---
+
+<!-- event: state_changed author: hare at: 2026-06-12T16:12:42Z from: done to: closed reason: closed field: state -->
+
+## State changed
+
+Ticket を closed にしました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-06-12T16:12:42Z status: closed -->
+
+## 完了
+
+Orchestrator Idle 時に queued Ticket を見落とさない bounded attention layer を実装した。
+
+実装概要:
+- `crates/tui/src/multi_pod.rs` に session-scoped `OrchestratorWorkSet` を追加し、Panel reload 境界で queued/actionable/planned/active_inprogress を導出するようにした。
+- Idle かつ reachable な Orchestrator Pod にだけ bounded queued-work attention を送る。
+- `active_inprogress` がある場合は re-kick を抑制し、waiting reason を session work set / Panel header detail に保持する。
+- Duplicate-start guard は Ticket id に紐づく local claim / related visible Pods / worktree 表示情報から導出する。
+- Session work set は `MultiPodApp` 内 runtime/session state に留め、durable per-Ticket artifact store は追加していない。
+- `resources/prompts/panel/orchestrator_idle_queue_notice.md` を追加し、Orchestrator attention payload の prompt 本文を resource 化した。
+- Scheduler loop、polling loop、queue drain loop、core Ticket state、implementation side effect、acceptance gate bypass は追加していない。
+
+Review / integration:
+- Implementation commit: `d2fae81a tui: add idle queued orchestrator attention`
+- Reviewer: `yoi-reviewer-idle-queued-rekick` が approve。
+- Orchestrator merge commit: `9538feb1 merge: idle queued orchestrator attention`
+- Ticket completion commit: `60cf2d9f ticket: mark idle queued done`
+
+Validation:
+- `cargo test -p tui queued_attention`: pass, 3 tests
+- `cargo test -p tui planned_queued_prompts`: pass, 1 test
+- `cargo test -p tui rediscovered_queued_work`: pass, 1 test
+- `cargo test -p tui active_inprogress_suppresses`: pass, 1 test
+- `cargo test -p tui idle_orchestrator_gets_bounded_attention`: pass, 1 test
+- `cargo test -p tui workspace_panel`: pass, 12 tests
+- `cargo check -p tui`: pass
+- `cargo fmt --check`: pass
+- `git diff --check HEAD~1..HEAD`: pass
+- `./result/bin/yoi ticket doctor`: `doctor: ok`
+- `nix build .#yoi`: pass
+
+Known broad-suite failures:
+- Existing broad `cargo test -p tui` failures noted in thread remain outside this Ticket and were not blockers for focused implementation/review.
+
+Cleanup:
+- coder/reviewer Pods stopped。
+- child worktree `/home/hare/Projects/yoi/.worktree/orchestrator-idle-queued-rekick` removed。
+- branch `ticket/orchestrator-idle-queued-rekick` deleted。
+
+Non-blocking risks:
+- Failed attention delivery is not fingerprint-marked, so a repeatedly reachable-but-rejecting socket can retry on subsequent Panel reloads; this is consistent with existing notice behavior but may be noisy。
+- Duplicate guard is bounded to Panel-visible claim/Pod/worktree derivation and is not a full global scheduler/lock, matching this Ticket の scoped attention model。
+
+---
