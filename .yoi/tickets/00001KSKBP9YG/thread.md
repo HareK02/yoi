@@ -229,3 +229,202 @@ Reason:
 - The quit latency regression needs measured user-visible behavior under a synchronized pending-work condition, not a loose startup smoke test.
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-06-13T14:38:03Z -->
+
+## Implementation report
+
+Implemented an opt-in E2E testing foundation for real `yoi panel` process automation.
+
+API / harness shape:
+- Added workspace package `tests/e2e` (`yoi-e2e`) with required feature `e2e`, so scenarios are opt-in.
+- Added `PanelHarness::spawn(...)`, `wait_for(...)`, `wait_for_rows(...)`, `click(...)`, `press(...)`, `expect_selection(...)`, `expect_exit_within(...)`, and `artifacts()`.
+- Harness drives the real `yoi panel` binary through a Unix PTY and sends SGR mouse / keyboard bytes through that PTY only.
+- Harness captures artifacts under a per-run artifact directory: `events.jsonl`, `input.log`, `pty-output.log`, and `run.json`.
+
+Production / non-production boundary:
+- Harness logic stays in `tests/e2e` and is not mixed into production crates.
+- Production-side change is limited to an opt-in read-only TUI JSONL observer enabled only by `YOI_TUI_TEST_EVENTS`.
+- Observer records Panel/TUI synchronization and assertion events (`panel_ready`, `rows_rendered`, `selection_changed`, `mouse_click`, `action_requested`, `quit_requested`, background task lifecycle, terminal cleanup, exit).
+- The observer does not mutate UI state, inject input, bypass actions, or grant authority; real input remains PTY-only.
+
+Scenarios added:
+- Panel mouse selection regression: waits for rendered rows, sends an SGR mouse click through PTY, asserts selection changed, and asserts no panel action was dispatched.
+- Panel quit latency regression: waits for Panel ready plus background-task barrier, sends Ctrl+C through PTY, asserts clean exit within the threshold, and verifies the quit event.
+
+Files changed:
+- `Cargo.toml`, `Cargo.lock`
+- `crates/tui/src/lib.rs`
+- `crates/tui/src/multi_pod.rs`
+- `crates/tui/src/e2e_observer.rs`
+- `tests/e2e/Cargo.toml`
+- `tests/e2e/src/lib.rs`
+- `tests/e2e/tests/panel.rs`
+
+Validation:
+- `cargo build -p yoi` — passed.
+- `YOI_E2E_BIN=/home/hare/Projects/yoi/.worktree/e2e-harness/target/debug/yoi cargo test -p yoi-e2e --features e2e --test panel -- --nocapture` — passed (2 tests).
+- `cargo fmt --check` — passed.
+- `cargo check -p tui --all-targets` — passed.
+- `cargo check -p yoi --all-targets` — passed.
+- `cargo check -p yoi-e2e --all-targets --features e2e` — passed.
+- `git diff --check` — passed.
+
+Remaining gaps / risks:
+- The first slice is Unix PTY-based; cross-platform PTY support is not implemented.
+- The screen artifact is currently raw PTY output rather than a parsed terminal snapshot.
+- Fixture setup blocks Companion/Orchestrator role auto-spawn by placing intentionally invalid isolated test pod metadata in the fixture data dir; this avoids leaking live background Pods but should be replaced by a cleaner fixture strategy if the Panel gains an explicit test fixture mode.
+
+
+---
+
+<!-- event: implementation_report author: hare at: 2026-06-13T15:00:29Z -->
+
+## Implementation report
+
+Follow-up implementation update for review-required changes:
+
+Mouse E2E false-positive prevention:
+- `PanelHarness` now tracks the PTY output for terminal mouse mode enable/disable escape sequences.
+- It requires both normal mouse tracking (`ESC[?1000h`, with disable `ESC[?1000l`) and SGR mouse mode (`ESC[?1006h`, with disable `ESC[?1006l`) to have been observed as currently enabled.
+- Added `PanelHarness::expect_mouse_capture_enabled()` and the Panel mouse E2E calls it before clicking.
+- `PanelHarness::click(...)` also fails with `MouseCaptureNotEnabled` if mouse capture has not been observed, so raw SGR mouse injection alone cannot make the test pass.
+
+Production binary contamination reduction:
+- Added explicit feature gates:
+  - `tui/e2e-test`
+  - `yoi/e2e-test = ["tui/e2e-test"]`
+- The `YOI_TUI_TEST_EVENTS` JSONL event path and the background-task hold seam are compiled only under `tui/e2e-test`.
+- Normal builds still type-check a no-op facade so call sites stay simple, but env-var observability/hold behavior is compiled out unless the feature is enabled.
+- E2E binary build command is now: `cargo build -p yoi --features e2e-test`.
+
+Quit latency barrier strengthening:
+- Added a feature-gated test-only seam `YOI_TUI_TEST_HOLD_BACKGROUND_TASK=reload` that holds the Panel reload task pending in the E2E binary until quit aborts it.
+- Added `PanelHarness::expect_background_task_pending("reload")`, which verifies that a `background_task_started` event exists and no matching `background_task_finished` or `background_task_aborted` event has superseded it.
+- The quit latency test now uses the hold seam and asserts pending reload work immediately before sending Ctrl+C through the PTY.
+
+Harness/artifact adjustment:
+- E2E fixture artifacts now persist under workspace `target/e2e-artifacts/...` instead of package-local temporary dirs, so failure artifacts remain inspectable.
+
+Validation after update:
+- `cargo fmt --check` — passed.
+- `cargo build -p yoi --features e2e-test` — passed.
+- `YOI_E2E_BIN=/home/hare/Projects/yoi/.worktree/e2e-harness/target/debug/yoi cargo test -p yoi-e2e --features e2e --test panel -- --nocapture` — passed (2 tests).
+- `git diff --check` — passed.
+- `cargo check -p tui --all-targets` — passed.
+- `cargo check -p yoi --all-targets` — passed.
+- `cargo check -p tui --all-targets --features e2e-test` — passed.
+- `cargo check -p yoi --all-targets --features e2e-test` — passed.
+- `cargo check -p yoi-e2e --all-targets --features e2e` — passed.
+
+Remaining gaps / risks:
+- The E2E harness remains Unix PTY based.
+- The screen artifact remains raw PTY output, not a parsed terminal snapshot.
+- The test-only pending-task hold intentionally changes timing only for the `e2e-test` binary; it is not compiled into normal builds.
+
+
+---
+
+<!-- event: review author: hare at: 2026-06-13T15:05:52Z status: request_changes -->
+
+## Review: request changes
+
+Request changes.
+
+Evidence reviewed:
+- Inspected Ticket record and `git diff 134e8b8b..HEAD` for commits `96561897` and `10a1c383`.
+- `tests/e2e` provides a credible first declarative harness (`PanelHarness::spawn`, `wait_for`, `wait_for_rows`, `click`, `press`, `expect_selection`, `expect_exit_within`, artifacts/metadata/input/output/event logs). This is not merely a fixed-sleep shell script.
+- Mouse-selection scenario waits for rendered rows, verifies both normal mouse and SGR mouse capture before `click`, sends the click through PTY bytes, waits for `selection_changed`, and asserts no `action_requested` dispatch.
+- Quit-latency scenario creates a real feature-gated background-task hold barrier, waits until the task is actually waiting before sending Ctrl+C through the PTY, and measures bounded exit latency.
+- `yoi-e2e` is opt-in via package feature/test `required-features = ["e2e"]`; e2e tests are outside default members. `YOI_TUI_TEST_EVENTS` and `YOI_TUI_TEST_HOLD_BACKGROUND_TASK` env behavior is behind `tui/e2e-test` / `yoi/e2e-test` feature gates, and the hook is observability-only.
+
+Required change:
+- The normal production build still contains/evaluates too much e2e harness glue. In non-`e2e-test` builds, `crates/tui/src/e2e_observer.rs` exposes no-op `emit`/hold functions, but call sites still execute test-specific data construction. In particular `App::emit_rows_rendered` and its panel row key/rect DTOs are compiled unconditionally and `app.emit_rows_rendered()` is called from the panel render path, causing row snapshots to be built every draw even though emission is a no-op. Selection/action/quit call sites also construct `serde_json::json!` payloads before the no-op facade. This violates the recorded boundary that production binaries should not contain harness logic and production-side hooks must be feature-gated/compiled out for normal builds.
+  - Please cfg-gate the call sites/helpers/DTOs, or use a lazy cfg-gated macro/helper so normal builds do not evaluate or retain e2e event payload construction. A tiny compile-only facade is acceptable only if it does not execute or allocate e2e-specific work and does not keep harness DTO logic in the normal runtime path.
+
+Validation run in `/home/hare/Projects/yoi/.worktree/e2e-harness`:
+- `git diff --check 134e8b8b..HEAD` — passed.
+- `cargo fmt --check` — passed.
+- `cargo check -p tui --all-targets` — passed.
+- `cargo check -p yoi --all-targets` — passed.
+- `cargo build -p yoi --features e2e-test` — passed.
+- `YOI_E2E_BIN=/home/hare/Projects/yoi/.worktree/e2e-harness/target/debug/yoi cargo test -p yoi-e2e --features e2e --test panel -- --nocapture` — passed.
+- `cargo check -p tui --all-targets --features e2e-test` — passed.
+- `cargo check -p yoi --all-targets --features e2e-test` — passed.
+- `cargo check -p yoi-e2e --all-targets --features e2e` — passed.
+
+No source changes were made during review.
+
+
+---
+
+<!-- event: implementation_report author: hare at: 2026-06-13T15:18:21Z -->
+
+## Implementation report
+
+Follow-up implementation update for reviewer request `559adb9a ticket: request e2e harness changes`:
+
+Production/non-production boundary fix:
+- Removed the normal-build no-op `e2e_observer` module path and now compile the observer module only behind `tui/e2e-test` via `#[cfg(feature = "e2e-test")] mod e2e_observer;`.
+- Added `#[cfg(feature = "e2e-test")]` to all Panel/TUI observability call sites that build JSON payloads, including terminal cleanup/exit, panel ready, rows-rendered, mouse click, selection changes, action requests, quit request, and background task lifecycle events.
+- `App::emit_rows_rendered`, `PanelE2eRowKey`, `PanelE2eRect`, `PanelE2eRenderedRow`, `PanelE2eRowsRendered`, and the conversion helpers are now compiled only with `tui/e2e-test`.
+- Normal builds no longer call `app.emit_rows_rendered()`, no longer evaluate `serde_json::json!` e2e payloads, and no longer retain the Panel E2E DTO/helper logic in the runtime path.
+- The background reload hold seam remains compiled/called only under `tui/e2e-test`; `YOI_TUI_TEST_EVENTS` and `YOI_TUI_TEST_HOLD_BACKGROUND_TASK` behavior remains feature-gated.
+
+Preserved E2E behavior:
+- Mouse E2E still verifies PTY output for normal mouse tracking + SGR mouse enable sequences before any raw SGR click can be sent.
+- `PanelHarness::click(...)` still fails if mouse capture was not observed.
+- Quit latency E2E still uses the feature-gated pending reload hold barrier and asserts the reload task is pending before Ctrl+C.
+
+Validation:
+- `cargo fmt --check` — passed.
+- `cargo check -p tui --all-targets` — passed.
+- `cargo check -p yoi --all-targets` — passed.
+- `cargo check -p tui --all-targets --features e2e-test` — passed.
+- `cargo check -p yoi --all-targets --features e2e-test` — passed.
+- `cargo build -p yoi --features e2e-test` — passed.
+- `YOI_E2E_BIN=/home/hare/Projects/yoi/.worktree/e2e-harness/target/debug/yoi cargo test -p yoi-e2e --features e2e --test panel -- --nocapture` — passed (2 tests).
+- `cargo check -p yoi-e2e --all-targets --features e2e` — passed.
+- `git diff --check` — passed.
+
+Remaining gaps / risks unchanged:
+- The E2E harness remains Unix PTY based.
+- The screen artifact remains raw PTY output rather than a parsed terminal snapshot.
+
+
+---
+
+<!-- event: review author: hare at: 2026-06-13T15:21:30Z status: approve -->
+
+## Review: approve
+
+Approve.
+
+Delta reviewed:
+- Re-reviewed the fix commit `b30b43b9 test: cfg-gate e2e observer payloads` after the earlier request-changes review.
+- Inspected the updated observer module boundary and call sites in `crates/tui/src/lib.rs` and `crates/tui/src/multi_pod.rs`, plus the unchanged harness/tests in `tests/e2e`.
+
+Evidence:
+- `e2e_observer` is now only compiled from `crates/tui/src/lib.rs` under `#[cfg(feature = "e2e-test")]`; the previous normal-build no-op facade was removed.
+- Observer payload construction is gated at call sites with `#[cfg(feature = "e2e-test")]`, including `panel_ready`, `selection_changed`, `action_requested`, `quit_requested`, and `emit_rows_rendered` calls.
+- Panel E2E DTOs/helpers (`PanelE2eRowKey`, `PanelE2eRect`, `PanelE2eRenderedRow`, `PanelE2eRowsRendered`, `App::emit_rows_rendered`) are now behind `#[cfg(feature = "e2e-test")]`, so the normal panel render path no longer builds row snapshots or retains that runtime helper path.
+- The background-task hold seam is still feature-gated: `check_background_task_hold` and `release_background_task_hold` calls are under `#[cfg(feature = "e2e-test")]`, and `YOI_TUI_TEST_HOLD_BACKGROUND_TASK` behavior lives in the gated observer module.
+- Mouse capture tracking remains intact in the harness: it tracks `?1000h` and `?1006h`, `click(...)` requires both capture modes before injecting PTY bytes, the test waits for rendered rows, asserts `selection_changed`, and asserts no `action_requested` dispatch.
+- Quit-latency coverage remains intact: the test waits for `panel_ready`, then verifies an actual pending `reload` background-task barrier before sending Ctrl+C through the PTY and asserting bounded exit.
+- The production/non-production boundary now satisfies the Ticket intent: the harness remains opt-in, observability is read-only and feature-gated, and no UI input/action path is bypassed.
+
+Validation run in `/home/hare/Projects/yoi/.worktree/e2e-harness`:
+- `git diff --check 134e8b8b..HEAD` — passed.
+- `cargo fmt --check` — passed.
+- `cargo check -p tui --all-targets` — passed.
+- `cargo check -p yoi --all-targets` — passed.
+- `cargo check -p tui --all-targets --features e2e-test` — passed.
+- `cargo check -p yoi --all-targets --features e2e-test` — passed.
+- `cargo build -p yoi --features e2e-test` — passed.
+- `YOI_E2E_BIN=/home/hare/Projects/yoi/.worktree/e2e-harness/target/debug/yoi cargo test -p yoi-e2e --features e2e --test panel -- --nocapture` — passed; 2 tests passed.
+- `cargo check -p yoi-e2e --all-targets --features e2e` — passed.
+
+No source changes were made during re-review.
+
+
+---
