@@ -1,41 +1,38 @@
-Orchestrator progress を AutoKick なしで live/reachable Companion に通知する仕組みを実装した。
+Orchestrator の明示 Ticket event を Companion に weak notify する形へ再実装した。
 
 実装概要:
-- `Method::Notify { auto_run: bool }` を追加し、`auto_run: false` では idle Pod に `RunForNotification` を stage しない weak notification にした。
-- `auto_run: true` と legacy missing-field behavior は既存 Notify と互換にした。
-- Panel から live/reachable Companion へ bounded progress notice を `Notify { auto_run: false }` で送るようにした。
-- missing/stopped/unreachable Companion は best-effort no-op とし、spawn/restore しない。
-- Progress summary は Ticket id/title/state、role pod status、short reason、`.yoi/tickets/<id>` refs に限定し、full thread、Pod output、diagnostics、provider errors、secret-like content を含めない。
-- Panel に Companion progress freshness / last-updated indication を追加した。
-- Reviewer request_changes を受け、Companion progress notice の LLM-facing framing を Rust 直書きから `resources/prompts/panel/companion_progress_notice.md` へ移し、Rust は bounded runtime values の rendering に限定した。
-- Companion profile/tool authority は変更していない。
+- 以前の Panel reload / periodic refresh 起点の Companion progress feed は削除済みで、今回の実装でも再導入していない。
+- Orchestrator-role lifecycle Ticket tool の post-call event に限定して、live/reachable Companion peer へ `Notify { auto_run:false }` を送る。
+- 対象 event は state change、comment/plan/decision/implementation_report、review、close/resolution 系の explicit mutating Ticket event。
+- Passive Ticket reads/list/show/query では通知しない。
+- missing/stopped/unreachable Companion は no-op とし、spawn/restore しない。
+- Companion authority は増やしていない。
+- Payload は Ticket id/title/state、event kind、short summary、`.yoi/tickets/<id>` ref 程度の bounded event notice に限定し、Ticket list snapshot、full thread、Pod output、diagnostics、provider error details、長大 log は含めない。
+- LLM-facing notice framing は `resources/prompts/pod/ticket_event_companion_notice.md` に置き、Rust は bounded runtime values の構築と render に限定した。
 
 Review / integration:
 - Implementation commits:
-  - `a87d3154 feat: weak companion progress notify`
-  - `61e6c068 fix: resource-back companion progress notice`
-- Reviewer: `yoi-reviewer-companion-progress-notify` が初回 request_changes、fix 後 approve。
-- Orchestrator merge commit: `56b10a2d merge: companion weak progress notify`
-- Ticket completion commit: `2b64f428 ticket: mark companion notify done`
+  - `465ef100 feat: notify Companion on Orchestrator ticket events`
+  - `6f8571f7 fix: render ticket event notice from prompt resource`
+- Reviewer: `yoi-reviewer-event-companion-notify` が approve。
+- Orchestrator merge commit: `2e5a60f4 merge: companion ticket event notify`
+- Ticket completion commit: `ee6213ee ticket: mark event companion notify done`
 
 Validation:
-- `cargo test -p protocol`: pass, 39 tests
-- `cargo test -p pod --test controller_test`: pass, 36 tests
-- `cargo test -p tui companion_progress -- --nocapture`: pass, 6 tests
-- `cargo test -p tui send_notify_only_can_deliver_weak_notification_without_auto_run -- --nocapture`: pass, 1 test
-- `cargo check -p protocol -p pod -p tui`: pass
+- `cargo test -p pod ticket_event_notify`: pass
+- `cargo test -p pod ticket_event`: pass
+- `cargo test -p pod weak_notify_to_live_peer_uses_notify_without_auto_run_and_noops_when_missing`: pass
+- `cargo test -p tui companion_progress`: pass（0 matched; Panel feed remains absent）
+- `rg` check confirmed no `companion_progress` / progress feed / `send_weak_notify` references in `crates/tui/src/multi_pod.rs`
 - `cargo fmt --check`: pass
 - `git diff --check HEAD~1..HEAD`: pass
 - `./result/bin/yoi ticket doctor`: `doctor: ok`
 - `nix build .#yoi`: pass
 
-Known unrelated broad-suite failures:
-- Existing prompt/TUI broad-suite failures noted in thread remain outside this Ticket and were not blockers for focused implementation/review.
-
 Cleanup:
 - coder/reviewer Pods stopped。
-- child worktree `/home/hare/Projects/yoi/.worktree/orchestrator-progress-companion-notify` removed。
-- branch `ticket/orchestrator-progress-companion-notify` deleted。
+- child worktree `/home/hare/Projects/yoi/.worktree/orchestrator-ticket-event-companion-notify` removed。
+- branch `ticket/orchestrator-ticket-event-companion-notify` deleted。
 
-Non-blocking risk:
-- Added `minijinja` dependency to `crates/tui`; it is already used elsewhere in the workspace, and `Cargo.lock` / `package.nix` were updated with passing Nix build.
+Non-blocking note:
+- Panel 非通知は TUI diff absence / `rg` check と focused behavior tests で確認した。将来の回帰防止として、Panel reload/open が Companion event notify を呼ばない明示 test を追加してもよい。
