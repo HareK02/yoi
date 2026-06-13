@@ -23,6 +23,31 @@ members = [
     "crates/ticket",
     "crates/project-record",
     "crates/workflow",
+    "tests/e2e",
+]
+default-members = [
+    "crates/client",
+    "crates/daemon",
+    "crates/llm-worker",
+    "crates/llm-worker-macros",
+    "crates/session-store",
+    "crates/secrets",
+    "crates/manifest",
+    "crates/pod",
+    "crates/yoi",
+    "crates/pod-store",
+    "crates/protocol",
+    "crates/provider",
+    "crates/pod-registry",
+    "crates/session-metrics",
+    "crates/session-analytics",
+    "crates/lint-common",
+    "crates/tools",
+    "crates/tui",
+    "crates/memory",
+    "crates/ticket",
+    "crates/project-record",
+    "crates/workflow",
 ]
 
 [workspace.package]

@@ -133,6 +133,7 @@ pub(crate) async fn run(
         }
     }
     let mut next_poll = Instant::now() + MULTI_POD_POLL_INTERVAL;
+    let mut emitted_panel_ready = false;
 
     loop {
         if let Some(result) = pending_queue_attention_notice.finish_if_ready().await {
@@ -146,6 +147,11 @@ pub(crate) async fn run(
         }
 
         terminal.draw(|f| draw(f, app))?;
+        if !emitted_panel_ready {
+            crate::e2e_observer::emit("panel", "panel_ready", serde_json::json!({}));
+            emitted_panel_ready = true;
+        }
+        app.emit_rows_rendered();
 
         let now = Instant::now();
         if now >= next_poll {
@@ -163,6 +169,7 @@ pub(crate) async fn run(
             TermEvent::Key(key) => match app.handle_key(key) {
                 MultiPodAction::None => {}
                 MultiPodAction::Quit => {
+                    crate::e2e_observer::emit("panel", "quit_requested", serde_json::json!({}));
                     abort_panel_background_work_for_quit(
                         &mut pending_reload,
                         &mut pending_queue_attention_notice,
@@ -170,12 +177,22 @@ pub(crate) async fn run(
                     return Ok(MultiPodOutcome::Quit);
                 }
                 MultiPodAction::Open => {
+                    crate::e2e_observer::emit(
+                        "panel",
+                        "action_requested",
+                        serde_json::json!({ "action": "open" }),
+                    );
                     if let Some(request) = app.prepare_open() {
                         terminal.draw(|f| draw(f, app))?;
                         return Ok(MultiPodOutcome::Open(request));
                     }
                 }
                 MultiPodAction::DispatchTicketAction(request) => {
+                    crate::e2e_observer::emit(
+                        "panel",
+                        "action_requested",
+                        serde_json::json!({ "action": "ticket_action" }),
+                    );
                     pending_reload.abort();
                     pending_queue_attention_notice.abort();
                     terminal.draw(|f| draw(f, app))?;
@@ -187,6 +204,11 @@ pub(crate) async fn run(
                     next_poll = Instant::now() + MULTI_POD_POLL_INTERVAL;
                 }
                 MultiPodAction::LaunchIntake(request) => {
+                    crate::e2e_observer::emit(
+                        "panel",
+                        "action_requested",
+                        serde_json::json!({ "action": "launch_intake" }),
+                    );
                     pending_reload.abort();
                     pending_queue_attention_notice.abort();
                     terminal.draw(|f| draw(f, app))?;
@@ -198,6 +220,11 @@ pub(crate) async fn run(
                     next_poll = Instant::now() + MULTI_POD_POLL_INTERVAL;
                 }
                 MultiPodAction::SendCompanion(request) => {
+                    crate::e2e_observer::emit(
+                        "panel",
+                        "action_requested",
+                        serde_json::json!({ "action": "send_companion" }),
+                    );
                     pending_reload.abort();
                     pending_queue_attention_notice.abort();
                     terminal.draw(|f| draw(f, app))?;
@@ -228,6 +255,14 @@ impl PendingReload {
         if self.handle.is_some() {
             return false;
         }
+        crate::e2e_observer::emit(
+            "panel",
+            "background_task_started",
+            serde_json::json!({
+                "task": "reload",
+                "lifecycle_mode": format!("{lifecycle_mode:?}"),
+            }),
+        );
         self.handle = Some(tokio::spawn(async move {
             load_multi_pod_snapshot(None, lifecycle_mode).await
         }));
@@ -252,6 +287,11 @@ impl PendingReload {
             return None;
         }
         let handle = self.handle.take()?;
+        crate::e2e_observer::emit(
+            "panel",
+            "background_task_finished",
+            serde_json::json!({ "task": "reload" }),
+        );
         Some(match handle.await {
             Ok(result) => result,
             Err(e) => Err(MultiPodError::Io(io::Error::other(format!(
@@ -262,6 +302,11 @@ impl PendingReload {
 
     fn abort(&mut self) {
         if let Some(handle) = self.handle.take() {
+            crate::e2e_observer::emit(
+                "panel",
+                "background_task_aborted",
+                serde_json::json!({ "task": "reload" }),
+            );
             handle.abort();
         }
     }
@@ -753,6 +798,57 @@ impl PanelRowHitBox {
     }
 }
 
+#[derive(Debug, Serialize)]
+struct PanelE2eRowKey {
+    kind: &'static str,
+    id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct PanelE2eRect {
+    x: u16,
+    y: u16,
+    width: u16,
+    height: u16,
+}
+
+#[derive(Debug, Serialize)]
+struct PanelE2eRenderedRow {
+    key: PanelE2eRowKey,
+    title: String,
+    status: Option<String>,
+    action: Option<&'static str>,
+    rect: PanelE2eRect,
+}
+
+#[derive(Debug, Serialize)]
+struct PanelE2eRowsRendered {
+    selected: Option<PanelE2eRowKey>,
+    rows: Vec<PanelE2eRenderedRow>,
+}
+
+fn panel_e2e_row_key(key: &PanelRowKey) -> PanelE2eRowKey {
+    match key {
+        PanelRowKey::Ticket(id) => PanelE2eRowKey {
+            kind: "ticket",
+            id: id.clone(),
+        },
+        PanelRowKey::Pod(name) => PanelE2eRowKey {
+            kind: "pod",
+            id: name.clone(),
+        },
+    }
+}
+
+fn panel_e2e_rect(rect: Rect) -> PanelE2eRect {
+    PanelE2eRect {
+        x: rect.x,
+        y: rect.y,
+        width: rect.width,
+        height: rect.height,
+    }
+}
+
 pub(crate) struct MultiPodApp {
     pub(crate) list: PodList,
     pub(crate) panel: WorkspacePanelViewModel,
@@ -1069,12 +1165,57 @@ impl MultiPodApp {
         else {
             return false;
         };
+        crate::e2e_observer::emit(
+            "panel",
+            "mouse_click",
+            serde_json::json!({
+                "column": event.column,
+                "row": event.row,
+                "target": panel_e2e_row_key(&key),
+            }),
+        );
         self.select_panel_key(key);
         true
     }
 
     fn set_row_hit_boxes(&mut self, rows: &[PanelListRow], area: Rect) {
         self.row_hit_boxes = row_hit_boxes(rows, area);
+    }
+
+    fn emit_rows_rendered(&self) {
+        let rows = self
+            .row_hit_boxes
+            .iter()
+            .map(|hit| {
+                let panel_row = self.panel.row(&hit.key);
+                let (title, status, action) = match panel_row {
+                    Some(row) => (
+                        row.title.clone(),
+                        Some(row.status.clone()),
+                        row.next_action.map(NextUserAction::label),
+                    ),
+                    None => match &hit.key {
+                        PanelRowKey::Pod(name) => (name.clone(), None, None),
+                        PanelRowKey::Ticket(id) => (id.clone(), None, None),
+                    },
+                };
+                PanelE2eRenderedRow {
+                    key: panel_e2e_row_key(&hit.key),
+                    title,
+                    status,
+                    action,
+                    rect: panel_e2e_rect(hit.rect),
+                }
+            })
+            .collect();
+        crate::e2e_observer::emit(
+            "panel",
+            "rows_rendered",
+            PanelE2eRowsRendered {
+                selected: self.selected_row.as_ref().map(panel_e2e_row_key),
+                rows,
+            },
+        );
     }
 
     fn ensure_selection_visible(&mut self) {
@@ -1127,12 +1268,23 @@ impl MultiPodApp {
         if let PanelRowKey::Pod(name) = &key {
             self.list.selected_name = Some(name.clone());
         }
+        let selected_key = key.clone();
         self.selected_row = Some(key);
+        crate::e2e_observer::emit(
+            "panel",
+            "selection_changed",
+            serde_json::json!({ "selected": panel_e2e_row_key(&selected_key) }),
+        );
     }
 
     fn clear_panel_selection(&mut self) {
         self.selected_row = None;
         self.list.selected_name = None;
+        crate::e2e_observer::emit(
+            "panel",
+            "selection_changed",
+            serde_json::json!({ "selected": serde_json::Value::Null }),
+        );
     }
 
     fn ensure_composer_target_available(&mut self) {

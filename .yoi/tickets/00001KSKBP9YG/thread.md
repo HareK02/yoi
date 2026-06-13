@@ -171,3 +171,51 @@ Ticket を `yoi ticket` が queued にしました。
 ユーザーが明示的に inprogress 化して進めることを承認した。Ticket evidence / relation records / OrchestrationPlan accepted plan / Orchestrator worktree clean state を確認済みで、blocking relation はない。Implementation side effect の前に state を inprogress として記録する。
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-06-13T14:38:03Z -->
+
+## Implementation report
+
+Implemented an opt-in E2E testing foundation for real `yoi panel` process automation.
+
+API / harness shape:
+- Added workspace package `tests/e2e` (`yoi-e2e`) with required feature `e2e`, so scenarios are opt-in.
+- Added `PanelHarness::spawn(...)`, `wait_for(...)`, `wait_for_rows(...)`, `click(...)`, `press(...)`, `expect_selection(...)`, `expect_exit_within(...)`, and `artifacts()`.
+- Harness drives the real `yoi panel` binary through a Unix PTY and sends SGR mouse / keyboard bytes through that PTY only.
+- Harness captures artifacts under a per-run artifact directory: `events.jsonl`, `input.log`, `pty-output.log`, and `run.json`.
+
+Production / non-production boundary:
+- Harness logic stays in `tests/e2e` and is not mixed into production crates.
+- Production-side change is limited to an opt-in read-only TUI JSONL observer enabled only by `YOI_TUI_TEST_EVENTS`.
+- Observer records Panel/TUI synchronization and assertion events (`panel_ready`, `rows_rendered`, `selection_changed`, `mouse_click`, `action_requested`, `quit_requested`, background task lifecycle, terminal cleanup, exit).
+- The observer does not mutate UI state, inject input, bypass actions, or grant authority; real input remains PTY-only.
+
+Scenarios added:
+- Panel mouse selection regression: waits for rendered rows, sends an SGR mouse click through PTY, asserts selection changed, and asserts no panel action was dispatched.
+- Panel quit latency regression: waits for Panel ready plus background-task barrier, sends Ctrl+C through PTY, asserts clean exit within the threshold, and verifies the quit event.
+
+Files changed:
+- `Cargo.toml`, `Cargo.lock`
+- `crates/tui/src/lib.rs`
+- `crates/tui/src/multi_pod.rs`
+- `crates/tui/src/e2e_observer.rs`
+- `tests/e2e/Cargo.toml`
+- `tests/e2e/src/lib.rs`
+- `tests/e2e/tests/panel.rs`
+
+Validation:
+- `cargo build -p yoi` — passed.
+- `YOI_E2E_BIN=/home/hare/Projects/yoi/.worktree/e2e-harness/target/debug/yoi cargo test -p yoi-e2e --features e2e --test panel -- --nocapture` — passed (2 tests).
+- `cargo fmt --check` — passed.
+- `cargo check -p tui --all-targets` — passed.
+- `cargo check -p yoi --all-targets` — passed.
+- `cargo check -p yoi-e2e --all-targets --features e2e` — passed.
+- `git diff --check` — passed.
+
+Remaining gaps / risks:
+- The first slice is Unix PTY-based; cross-platform PTY support is not implemented.
+- The screen artifact is currently raw PTY output rather than a parsed terminal snapshot.
+- Fixture setup blocks Companion/Orchestrator role auto-spawn by placing intentionally invalid isolated test pod metadata in the fixture data dir; this avoids leaking live background Pods but should be replaced by a cleaner fixture strategy if the Panel gains an explicit test fixture mode.
+
+
+---
