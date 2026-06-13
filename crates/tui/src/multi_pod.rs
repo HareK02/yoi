@@ -11,7 +11,10 @@ use client::ticket_role::{
     launch_ticket_role_pod_with_options, plan_ticket_role_launch,
 };
 use client::{PodRuntimeCommand, SpawnConfig, spawn_pod};
-use crossterm::event::{Event as TermEvent, KeyCode, KeyEvent, KeyModifiers, poll, read};
+use crossterm::event::{
+    Event as TermEvent, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    poll, read,
+};
 use pod_store::FsPodStore;
 use protocol::stream::{JsonLineReader, JsonLineWriter};
 use protocol::{ErrorCode, Event, Method, PodStatus, Segment};
@@ -195,6 +198,9 @@ pub(crate) async fn run(
                 }
             },
             TermEvent::Paste(text) => app.input.insert_paste(text),
+            TermEvent::Mouse(mouse) => {
+                app.handle_mouse_event(mouse);
+            }
             TermEvent::Resize(_, _) => {}
             _ => {}
         }
@@ -651,11 +657,27 @@ struct OrchestratorQueueTemplateTicket {
     waiting_reason: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PanelRowHitBox {
+    rect: Rect,
+    key: PanelRowKey,
+}
+
+impl PanelRowHitBox {
+    fn contains(&self, column: u16, row: u16) -> bool {
+        column >= self.rect.x
+            && column < self.rect.x.saturating_add(self.rect.width)
+            && row >= self.rect.y
+            && row < self.rect.y.saturating_add(self.rect.height)
+    }
+}
+
 pub(crate) struct MultiPodApp {
     pub(crate) list: PodList,
     pub(crate) panel: WorkspacePanelViewModel,
     pub(crate) input: InputBuffer,
     selected_row: Option<PanelRowKey>,
+    row_hit_boxes: Vec<PanelRowHitBox>,
     composer_target: ComposerTarget,
     notice: Option<String>,
     panel_diagnostic: Option<PanelDiagnostic>,
@@ -689,6 +711,7 @@ impl MultiPodApp {
             panel,
             input: InputBuffer::new(),
             selected_row: None,
+            row_hit_boxes: Vec::new(),
             composer_target: ComposerTarget::Companion,
             notice: None,
             panel_diagnostic: None,
@@ -948,6 +971,29 @@ impl MultiPodApp {
             .and_then(|key| visible.iter().position(|visible_key| visible_key == key))
             .unwrap_or(0);
         self.select_panel_key(visible[selected_pos.saturating_sub(1)].clone());
+    }
+
+    fn handle_mouse_event(&mut self, event: MouseEvent) -> bool {
+        if !matches!(event.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return false;
+        }
+        if self.panel_diagnostic_open {
+            return false;
+        }
+        let Some(key) = self
+            .row_hit_boxes
+            .iter()
+            .find(|hit| hit.contains(event.column, event.row))
+            .map(|hit| hit.key.clone())
+        else {
+            return false;
+        };
+        self.select_panel_key(key);
+        true
+    }
+
+    fn set_row_hit_boxes(&mut self, rows: &[PanelListRow], area: Rect) {
+        self.row_hit_boxes = row_hit_boxes(rows, area);
     }
 
     fn ensure_selection_visible(&mut self) {
@@ -4199,48 +4245,102 @@ fn orchestrator_status_style(status: OrchestratorPanelStatus) -> Style {
     }
 }
 
-fn draw_list(frame: &mut Frame<'_>, app: &MultiPodApp, area: Rect) {
+fn draw_list(frame: &mut Frame<'_>, app: &mut MultiPodApp, area: Rect) {
     if area.width == 0 || area.height == 0 {
+        app.row_hit_boxes.clear();
         return;
     }
-    let lines = list_lines(app, area.width, area.height);
+    let rows = list_rows(app, area.width, area.height);
+    app.set_row_hit_boxes(&rows, area);
+    let lines = rows.into_iter().map(|row| row.line).collect::<Vec<_>>();
     Paragraph::new(lines).render(area, frame.buffer_mut());
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PanelListRow {
+    line: Line<'static>,
+    key: Option<PanelRowKey>,
+}
+
+impl PanelListRow {
+    fn inert(line: Line<'static>) -> Self {
+        Self { line, key: None }
+    }
+
+    fn selectable(line: Line<'static>, key: PanelRowKey) -> Self {
+        Self {
+            line,
+            key: Some(key),
+        }
+    }
+}
+
+#[cfg(test)]
 fn list_lines(app: &MultiPodApp, width: u16, height: u16) -> Vec<Line<'static>> {
+    list_rows(app, width, height)
+        .into_iter()
+        .map(|row| row.line)
+        .collect()
+}
+
+fn list_rows(app: &MultiPodApp, width: u16, height: u16) -> Vec<PanelListRow> {
     let sections = sectioned_entries(&app.list);
     let selected = app.selected_row.as_ref();
-    let diagnostic_lines = panel_diagnostic_lines(&app.panel, width);
-    let action_lines = panel_action_lines(&app.panel, selected, width);
-    let live_lines = sections
+    let diagnostic_rows = panel_diagnostic_lines(&app.panel, width)
+        .into_iter()
+        .map(PanelListRow::inert)
+        .collect::<Vec<_>>();
+    let action_rows = panel_action_rows(&app.panel, selected, width);
+    let live_rows = sections
         .iter()
         .filter(|section| section.kind != MultiPodSectionKind::Closed)
-        .flat_map(|section| section_lines(&app.list, section, selected, width))
+        .flat_map(|section| section_rows(&app.list, section, selected, width))
         .collect::<Vec<_>>();
-    let closed_lines = sections
+    let closed_rows = sections
         .iter()
         .find(|section| section.kind == MultiPodSectionKind::Closed)
-        .map(|section| section_lines(&app.list, section, selected, width))
+        .map(|section| section_rows(&app.list, section, selected, width))
         .unwrap_or_default();
 
     let available = height as usize;
-    let diagnostic_len = diagnostic_lines.len().min(available);
+    let diagnostic_len = diagnostic_rows.len().min(available);
     let remaining_after_diagnostics = available.saturating_sub(diagnostic_len);
-    let action_len = action_lines.len().min(remaining_after_diagnostics);
+    let action_len = action_rows.len().min(remaining_after_diagnostics);
     let remaining_after_actions = remaining_after_diagnostics.saturating_sub(action_len);
-    let closed_len = closed_lines.len().min(remaining_after_actions);
-    let live_len = live_lines
+    let closed_len = closed_rows.len().min(remaining_after_actions);
+    let live_len = live_rows
         .len()
         .min(remaining_after_actions.saturating_sub(closed_len));
     let spacer_len = available.saturating_sub(diagnostic_len + action_len + live_len + closed_len);
 
-    let mut lines = Vec::with_capacity(available);
-    lines.extend(diagnostic_lines.into_iter().take(diagnostic_len));
-    lines.extend(action_lines.into_iter().take(action_len));
-    lines.extend(live_lines.into_iter().take(live_len));
-    lines.extend(std::iter::repeat_with(|| Line::from(Span::raw(""))).take(spacer_len));
-    lines.extend(closed_lines.into_iter().take(closed_len));
-    lines
+    let mut rows = Vec::with_capacity(available);
+    rows.extend(diagnostic_rows.into_iter().take(diagnostic_len));
+    rows.extend(action_rows.into_iter().take(action_len));
+    rows.extend(live_rows.into_iter().take(live_len));
+    rows.extend(
+        std::iter::repeat_with(|| PanelListRow::inert(Line::from(Span::raw("")))).take(spacer_len),
+    );
+    rows.extend(closed_rows.into_iter().take(closed_len));
+    rows
+}
+
+fn row_hit_boxes(rows: &[PanelListRow], area: Rect) -> Vec<PanelRowHitBox> {
+    if area.width == 0 || area.height == 0 {
+        return Vec::new();
+    }
+    rows.iter()
+        .enumerate()
+        .filter_map(|(offset, row)| {
+            let y = area.y.checked_add(offset as u16)?;
+            if y >= area.y.saturating_add(area.height) {
+                return None;
+            }
+            Some(PanelRowHitBox {
+                rect: Rect::new(area.x, y, area.width, 1),
+                key: row.key.clone()?,
+            })
+        })
+        .collect()
 }
 
 fn panel_diagnostic_lines(panel: &WorkspacePanelViewModel, width: u16) -> Vec<Line<'static>> {
@@ -4260,11 +4360,11 @@ fn panel_diagnostic_lines(panel: &WorkspacePanelViewModel, width: u16) -> Vec<Li
         .collect()
 }
 
-fn panel_action_lines(
+fn panel_action_rows(
     panel: &WorkspacePanelViewModel,
     selected: Option<&PanelRowKey>,
     width: u16,
-) -> Vec<Line<'static>> {
+) -> Vec<PanelListRow> {
     let rows = panel
         .rows
         .iter()
@@ -4274,9 +4374,15 @@ fn panel_action_lines(
         return Vec::new();
     }
     let mut lines = Vec::with_capacity(rows.len() + 1);
-    lines.push(panel_action_header_line(rows.len(), width));
+    lines.push(PanelListRow::inert(panel_action_header_line(
+        rows.len(),
+        width,
+    )));
     for row in rows {
-        lines.push(panel_row_line(row, selected == Some(&row.key), width));
+        lines.push(PanelListRow::selectable(
+            panel_row_line(row, selected == Some(&row.key), width),
+            row.key.clone(),
+        ));
     }
     lines
 }
@@ -4399,31 +4505,35 @@ fn panel_priority_style(priority: ActionPriority) -> Style {
     }
 }
 
-fn section_lines(
+fn section_rows(
     list: &PodList,
     section: &MultiPodSection,
     selected: Option<&PanelRowKey>,
     width: u16,
-) -> Vec<Line<'static>> {
+) -> Vec<PanelListRow> {
     let visible = visible_section_indices(section);
     if visible.is_empty() {
         return Vec::new();
     }
 
-    let mut lines = Vec::with_capacity(visible.len() + 1);
-    lines.push(section_header_line(
+    let mut rows = Vec::with_capacity(visible.len() + 1);
+    rows.push(PanelListRow::inert(section_header_line(
         section.kind,
         section.entries.len(),
         section.hidden_count(),
         width,
-    ));
+    )));
     for index in visible {
         if let Some(entry) = list.entries.get(index) {
-            let selected = selected == Some(&PanelRowKey::Pod(entry.name.clone()));
-            lines.push(row_line(entry, selected, width));
+            let key = PanelRowKey::Pod(entry.name.clone());
+            let selected = selected == Some(&key);
+            rows.push(PanelListRow::selectable(
+                row_line(entry, selected, width),
+                key,
+            ));
         }
     }
-    lines
+    rows
 }
 
 fn row_line(entry: &PodListEntry, selected: bool, width: u16) -> Line<'static> {
@@ -5497,6 +5607,154 @@ mod tests {
                 .unwrap()
                 .contains("Workspace Companion is unavailable")
         );
+    }
+
+    #[test]
+    fn row_hit_testing_maps_only_visible_selectable_rows() {
+        let mut panel = WorkspacePanelViewModel::empty(Path::new("test"));
+        panel.rows.push(panel_test_ticket_row(
+            "TICKET-1",
+            "Ready",
+            ActionPriority::ReadyForQueue,
+            NextUserAction::Queue,
+            "ready",
+        ));
+        panel.rows.push(panel_test_ticket_row(
+            "TICKET-2",
+            "Queued",
+            ActionPriority::Background,
+            NextUserAction::Wait,
+            "queued",
+        ));
+        let list = PodList::from_sources(
+            PodVisibilitySource::ResumePicker,
+            vec![],
+            vec![live_info("alpha", PodStatus::Idle)],
+            None,
+            10,
+        );
+        let app = app_with_panel(list, panel);
+
+        let rows = list_rows(&app, 80, 8);
+        let boxes = row_hit_boxes(&rows, Rect::new(3, 5, 80, 8));
+
+        assert_eq!(boxes.len(), 3);
+        assert_eq!(boxes[0].key, PanelRowKey::Ticket("TICKET-1".into()));
+        assert_eq!(boxes[0].rect, Rect::new(3, 6, 80, 1));
+        assert_eq!(boxes[1].key, PanelRowKey::Ticket("TICKET-2".into()));
+        assert_eq!(boxes[1].rect, Rect::new(3, 7, 80, 1));
+        assert_eq!(boxes[2].key, PanelRowKey::Pod("alpha".into()));
+        assert!(boxes.iter().all(|hit| !hit.contains(2, hit.rect.y)));
+    }
+
+    #[test]
+    fn mouse_click_selects_panel_row_for_blank_enter_action() {
+        let mut panel = WorkspacePanelViewModel::empty(Path::new("test"));
+        panel.rows.push(panel_test_ticket_row(
+            "TICKET-1",
+            "Ready",
+            ActionPriority::ReadyForQueue,
+            NextUserAction::Queue,
+            "ready",
+        ));
+        panel.rows.push(panel_test_ticket_row(
+            "TICKET-2",
+            "Queued",
+            ActionPriority::Background,
+            NextUserAction::Wait,
+            "queued",
+        ));
+        let mut app = app_with_panel(
+            PodList::from_sources(PodVisibilitySource::ResumePicker, vec![], vec![], None, 10),
+            panel,
+        );
+        let rows = list_rows(&app, 80, 6);
+        app.set_row_hit_boxes(&rows, Rect::new(0, 0, 80, 6));
+
+        assert!(app.handle_mouse_event(left_click(2, 2)));
+        assert_eq!(
+            app.selected_row,
+            Some(PanelRowKey::Ticket("TICKET-2".into()))
+        );
+        assert_eq!(app.selected_panel_row().unwrap().title, "Queued");
+        assert_eq!(app.selected_ticket_action(), Some(NextUserAction::Wait));
+        assert!(plain_line(&target_status_line(&app)).contains("blank Enter Wait"));
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Enter)),
+            MultiPodAction::DispatchTicketAction(request) if request.ticket_id == "TICKET-2"
+        ));
+    }
+
+    #[test]
+    fn mouse_non_row_click_is_noop_and_preserves_composer_draft() {
+        let mut panel = WorkspacePanelViewModel::empty(Path::new("test"));
+        panel.rows.push(panel_test_ticket_row(
+            "TICKET-1",
+            "Ready",
+            ActionPriority::ReadyForQueue,
+            NextUserAction::Queue,
+            "ready",
+        ));
+        let mut app = app_with_panel(
+            PodList::from_sources(PodVisibilitySource::ResumePicker, vec![], vec![], None, 10),
+            panel,
+        );
+        let rows = list_rows(&app, 80, 6);
+        app.set_row_hit_boxes(&rows, Rect::new(10, 4, 80, 6));
+        app.input.insert_paste("draft".into());
+        let selected = app.selected_row.clone();
+
+        assert!(!app.handle_mouse_event(left_click(9, 5)));
+        assert_eq!(app.selected_row, selected);
+        assert_eq!(input_text(&app), "draft");
+    }
+
+    #[test]
+    fn mouse_click_does_not_override_existing_composer_keyboard_behavior() {
+        let mut panel = WorkspacePanelViewModel::empty(Path::new("test"));
+        panel.rows.push(panel_test_ticket_row(
+            "TICKET-1",
+            "Ready",
+            ActionPriority::ReadyForQueue,
+            NextUserAction::Queue,
+            "ready",
+        ));
+        panel.rows.push(panel_test_ticket_row(
+            "TICKET-2",
+            "Queued",
+            ActionPriority::Background,
+            NextUserAction::Wait,
+            "queued",
+        ));
+        let mut app = app_with_panel(
+            PodList::from_sources(PodVisibilitySource::ResumePicker, vec![], vec![], None, 10),
+            panel,
+        );
+        let rows = list_rows(&app, 80, 6);
+        app.set_row_hit_boxes(&rows, Rect::new(0, 0, 80, 6));
+
+        assert!(app.handle_mouse_event(left_click(2, 2)));
+        assert_eq!(
+            app.selected_row,
+            Some(PanelRowKey::Ticket("TICKET-2".into()))
+        );
+        app.input.insert_paste("hello".into());
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Enter)),
+            MultiPodAction::None
+        ));
+        assert_eq!(input_text(&app), "hello");
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Esc)),
+            MultiPodAction::None
+        ));
+        assert_eq!(app.selected_row, None);
+        assert_eq!(input_text(&app), "hello");
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Down)),
+            MultiPodAction::None
+        ));
+        assert_eq!(app.selected_row, None);
     }
 
     #[test]
@@ -7012,6 +7270,7 @@ mod tests {
             panel,
             input: InputBuffer::new(),
             selected_row: None,
+            row_hit_boxes: Vec::new(),
             composer_target: ComposerTarget::Companion,
             notice: None,
             panel_diagnostic: None,
@@ -7180,6 +7439,15 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         modified_key(code, KeyModifiers::NONE)
+    }
+
+    fn left_click(column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
     }
 
     fn modified_key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
