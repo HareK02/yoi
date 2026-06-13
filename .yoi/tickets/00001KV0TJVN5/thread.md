@@ -268,3 +268,25 @@ Next:
 E2E binary provider follow-up was reviewed, approved, merged into the Orchestrator branch as `8abc2b7f`, and validated in the Orchestrator worktree. Default E2E runs now build the current `yoi` binary before direct PTY spawn, `YOI_E2E_BIN` override remains available, and tested `yoi` subprocesses are isolated with `env_clear()` plus allowlist so host provider credentials are not inherited. Ticket implementation work is done; closure remains separate.
 
 ---
+
+<!-- event: comment author: orchestrator at: 2026-06-13T16:53:48Z -->
+
+## Comment
+
+Post-merge concern from user: E2E isolation may still have leaked or left visible Pod/worktree artifacts.
+
+Observed concern:
+- User reports Pods named `yoi-orchestrator-orchestrator` and `workspace-orchestrator` appeared.
+
+Current assessment:
+- Earlier E2E runs before the env isolation follow-up inherited host environment, including likely `XDG_RUNTIME_DIR`, so `yoi panel` could observe the host/global runtime Pod registry under `/run/user/...` even though `HOME`/`XDG_DATA_HOME` were fixture paths。
+- The fixture also intentionally writes blocking Pod metadata for `workspace` and `workspace-orchestrator` under fixture `XDG_DATA_HOME` to drive panel rows. That should be fixture-local, but if runtime/data isolation is wrong it can become visible outside the intended fixture。
+- The later `env_clear()` + allowlist fix prevents host env credential leak and likely prevents inheriting `XDG_RUNTIME_DIR`, causing runtime fallback to fixture HOME; however, no explicit regression assertion currently proves that E2E cannot see/create global runtime Pod state or workspace-orchestrator worktrees。
+
+Required follow-up direction:
+- Add explicit runtime isolation to E2E (`XDG_RUNTIME_DIR` or equivalent controlled fixture runtime path, or an assertion that fallback runtime is fixture-local)。
+- Add regression assertions/artifacts proving tested `yoi panel` sees only fixture Pod metadata/runtime state and does not observe host live Pods。
+- Ensure E2E cleanup removes any fixture Pod metadata/runtime/worktree artifacts it creates。
+- Investigate and clean any residual `yoi-orchestrator-orchestrator` / `workspace-orchestrator` artifacts only after confirming whether they are live Pods, fixture artifacts, or prior Panel-created worktrees。
+
+---
