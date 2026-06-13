@@ -1,76 +1,93 @@
 ---
 title: 'Extend pod::feature API for external protocol-backed capability providers'
-state: 'planning'
+state: 'ready'
 created_at: '2026-06-10T07:48:14Z'
-updated_at: '2026-06-10T07:48:14Z'
+updated_at: '2026-06-13T16:27:15Z'
 assignee: null
-readiness: 'requirements_sync_needed'
-risk_flags: ['authority-boundary', 'feature-api', 'tool-registry', 'permission-scope', 'process-exec', 'prompt-context']
+readiness: 'implementation_ready'
+risk_flags: ['feature-api', 'tool-registry', 'permission-scope', 'prompt-context', 'dynamic-registry', 'service-lifecycle']
 ---
 
 ## Background
 
-MCP integration を concrete work item として実装する前に、Yoi の `pod::feature` / Worker / ToolRegistry 境界が外部 protocol-backed capability provider を自然に扱える必要がある。
+Yoi needs `pod::feature` to serve as the common API substrate for capabilities that contribute Tools / Hooks / Services / BackgroundTasks. External protocol-backed providers such as MCP need to discover contributions at startup and expose them through the same Worker / ToolRegistry / permission / history / bounded-result paths as built-in tools.
 
-現行の `pod::feature` API は static descriptor / static tool contribution / host authority grant を中心にしており、MCP のように startup 時の protocol negotiation と discovery によって tools/resources/prompts surface が決まる provider には不足がある。MCP 実装側でこれを ad-hoc に迂回すると、permission、history、bounded result、service lifecycle、feature/plugin boundary が歪む。
+This Ticket defines the feature-layer API required for those providers. It does **not** define Plugin package permissions, MCP server trust policy, local process sandboxing, or a feature-level authority model. Plugin and MCP are separate layers that build on the feature API and own their own user-facing configuration and permission/trust decisions.
 
-Objective context: `00001KTR80WMN`。
+Objective context: `00001KTR80WMN`.
 
 ## Requirements
 
-- `pod::feature` が external protocol-backed capability provider を表現できるようにする。
-- local subprocess を起動する authority を明示的に表現する。
-  - 既存の filesystem/network/service authority に押し込まない。
-  - command / args / cwd / env / secret refs は explicit config/grant に基づく。
-- Pod lifetime に紐づく feature-provided service / connection manager の lifecycle を表現できるようにする。
-- startup / initialize / discovery 後に tool contribution を登録または更新できる host-mediated API を設計する。
-- dynamic contribution は通常の ToolRegistry / PreToolCall permission / history / bounded tool-result path を迂回しない。
-- tool metadata に、MCP など外部 provider が持つ追加 metadata を安全に保持・変換できる余地を作る。
-  - title
-  - output schema
-  - annotations
-  - icons or display metadata
-  - execution/task-support metadata
-- rich / structured tool result を bounded serialization できる共通 path を用意する。
-- capability metadata / schemas / descriptions / results は untrusted data として扱う。
-- live list-changed / registry refresh が current run の tool schema consistency を壊さない方針を決める。
-- API 拡張は MCP 固有名に寄せすぎず、将来の external plugin / bridge provider にも使える feature boundary として設計する。
+- Treat `pod::feature` as the API layer for contribution registration and lifecycle integration.
+  - Feature code exposes contribution types and installation/runtime hooks.
+  - Feature code does not decide Plugin trust, MCP enablement, or external-provider permissions.
+  - Do not add or rely on `HostAuthority` / authority grants for MCP, Plugin, or provider-process permissions.
+- Add a feature-owned provider/service lifecycle surface sufficient for protocol-backed providers.
+  - startup / ready / failed / stopped diagnostics
+  - Pod lifetime integration and deterministic shutdown hooks
+  - provider failure state that makes dependent dynamic tools unavailable with a clear diagnostic
+- Add dynamic contribution registration for startup-discovered tools.
+  - discovery happens before the tool schema is exposed to a model request
+  - registered tools use stable namespacing and normal ToolRegistry registration
+  - tool schema changes during an active run do not silently mutate the model-visible schema
+- Define bounded refresh semantics for provider list changes.
+  - initial implementation may defer live refresh to a turn boundary or report restart/reinitialize-required diagnostics
+  - silent stale or mid-run schema mutation is not allowed
+- Define provider metadata / schema / result normalization as untrusted data.
+  - descriptions, schemas, annotations, titles, and provider metadata cannot weaken system/developer instructions
+  - structured / rich results are converted through a bounded Yoi representation before entering history/model-visible output
+- Ensure dynamic tool calls do not bypass normal Yoi paths.
+  - PreToolCall permission hooks still run
+  - permission denial prevents the provider call
+  - tool results and errors are committed through normal history/result plumbing
+- Keep MCP-specific protocol details in Ticket `00001KTR82RB7`.
+  - command / args / cwd / env / stdio JSON-RPC / MCP lifecycle are MCP-layer concerns
+  - MCP may define its own enablement and trust policy on top of this feature API
+- Keep Plugin user-facing format and Plugin permission model outside this Ticket.
+  - Plugin packages/configs may use the feature API to contribute capabilities
+  - Plugin permission/trust policy belongs to the Plugin layer, not `pod::feature`
 
 ## Acceptance criteria
 
-- external protocol-backed provider を built-in feature として表現できる API がある。
-- subprocess execution authority が `HostAuthority` または同等の明示 grant として型で表現されている。
-- feature-owned long-running service lifecycle を Pod lifetime に接続できる。
-- discovery 後の dynamic tool contribution が通常 ToolRegistry と permission path に統合される。
-- external metadata / schema / result content が untrusted data として扱われる設計になっている。
-- `list_changed` 相当の dynamic registry change について、safe refresh / next-turn refresh / restart-required diagnostic のいずれかが明示され、silent stale にならない。
-- MCP 実装 Ticket が private/ad-hoc API ではなく、この拡張 API に乗って実装できる見通しがある。
-- focused tests で authority grant、dynamic registration、permission denial、bounded result、service diagnostics を確認できる。
-- Validation: relevant crate tests、`cargo fmt --check`、`cargo check --workspace --all-targets`、`nix build .#yoi`。
+- `pod::feature` can represent a provider/service that becomes ready, fails, and stops with install/runtime diagnostics visible to the host.
+- A mock protocol-backed provider can register at least one startup-discovered dynamic tool before the first model request that would expose its schema.
+- The dynamic tool is registered as an ordinary Yoi tool and is visible through the same model-visible schema path as built-in tools.
+- A PreToolCall permission denial for the dynamic tool prevents the mock provider from receiving a call.
+- Provider failure makes dependent dynamic tools unavailable with a bounded, comprehensible diagnostic rather than panic or stale silent failure.
+- Oversized or structured provider result data is bounded before being committed as a tool result.
+- A simulated list-changed/schema-change event is handled by a documented safe path: turn-boundary refresh, restart/reinitialize-required diagnostic, or explicit unsupported diagnostic.
+- Tests/docs make clear that `pod::feature` is not the Plugin permission layer and not the MCP server trust/sandbox layer.
+- No new `HostAuthority` / authority-grant dependency is introduced for external providers, Plugin permissions, or MCP local stdio execution.
+- Validation: focused feature/provider tests, affected crate tests, `cargo fmt --check`, `cargo check --workspace --all-targets`, and `nix build .#yoi`.
 
 ## Binding decisions / invariants
 
-- ToolRegistry / permission / history / bounded result の既存経路を迂回する API は作らない。
-- external provider 由来の schema / description / annotation / content は instruction ではなく untrusted data として扱う。
-- process execution は explicit authority として分離し、filesystem/network authority から暗黙に派生させない。
-- dynamic registry update は prompt/tool schema consistency と cache behavior を壊さないよう、turn boundary または restart/reinitialize diagnostic を持つ。
-- MCP specific shortcut ではなく、`pod::feature` の長期的な extension surface として成立させる。
+- `pod::feature` is an API/contribution substrate, not a security or trust-policy layer.
+- Plugin is a user-facing package/config/runtime layer that uses `pod::feature`; Plugin permissions are Plugin-layer policy.
+- MCP is a separate feature-backed integration layer; MCP enablement, local server trust, and MCP-specific permissions are MCP-layer policy.
+- Dynamic provider contributions must enter through ordinary Worker / ToolRegistry / permission / history / bounded-result paths.
+- Model-visible tool schemas are stable for the duration of a model request/run.
+- External provider metadata and output are untrusted content.
 
-## Implementation latitude
+## Out of scope
 
-- exact type names、crate placement、service handle の形、dynamic registration timing は実装側に委ねる。
-- 初期実装では rich content を provider-native multimodal block として渡さず、bounded structured text/JSON serialization に寄せてもよい。
-- live registry refresh が大きい場合は、まず restart/reinitialize-required diagnostic でもよい。ただし silent stale は避ける。
+- MCP protocol implementation and local stdio transport details.
+- Plugin package format, distribution, provenance, and Plugin runtime permission grants.
+- OS-level sandboxing of external provider processes.
+- Removing all existing `HostAuthority` code from the repository; cleanup is tracked separately by `00001KV0SP0TY` unless directly necessary for this API slice.
 
 ## Escalation conditions
 
-- current Worker / ToolRegistry architecture では dynamic contribution を安全に扱えない場合。
-- process execution authority と profile/config authority の責務境界が曖昧になる場合。
-- rich content を model-provider native content block に渡す必要が出た場合。
-- hook / feature / plugin contribution boundary の既存設計と矛盾する場合。
+- The feature API appears to need policy decisions about Plugin trust or MCP server permissions.
+- Dynamic registry refresh would require mutating model-visible tool schema during an active run.
+- Provider result normalization would require provider-native multimodal blocks to bypass normal bounded tool-result serialization.
+- MCP implementation pressure suggests adding private ToolRegistry/history/context bypasses instead of extending the feature API.
 
 ## Related work
 
 - Objective: `00001KTR80WMN`
+- MCP implementation: `00001KTR82RB7`
+- Plugin extension surface: `00001KSXRQ4G8`
+- Plugin package/discovery: `00001KT0Z4BK8`
+- Feature authority cleanup: `00001KV0SP0TY`
 - Decomposed from broad Ticket: `00001KST8H4M0`
-- Follow-up implementation Ticket: MCP local stdio implementation Ticket created by this intake split.
