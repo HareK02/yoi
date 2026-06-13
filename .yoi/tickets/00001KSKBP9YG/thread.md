@@ -428,3 +428,50 @@ No source changes were made during re-review.
 
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-13T15:23:35Z -->
+
+## Implementation report
+
+Integration outcome: merged and validated.
+
+- Implementation branch: `ticket-00001KSKBP9YG-e2e-harness`
+- Implementation commits: `96561897 test: add opt-in panel e2e harness`, `10a1c383 test: harden panel e2e harness`, `b30b43b9 test: cfg-gate e2e observer payloads`
+- Review commits/events: initial `request_changes` for production-boundary leakage, then `approve` after `e2e-test` cfg gating。
+- Orchestrator merge commit: `b3bd6b11 merge: e2e harness`
+
+Implemented first vertical slice:
+- Added opt-in `tests/e2e` package `yoi-e2e` with Playwright-like `PanelHarness` API for real `yoi panel` process automation through PTY.
+- Added feature-gated read-only TUI observer behind `tui/e2e-test` / `yoi/e2e-test`; normal builds do not compile observer module, event payload construction, row DTOs, or background hold seam.
+- Added Panel mouse selection E2E that waits for rendered rows, verifies terminal mouse capture output (`?1000h` and `?1006h`), sends click through PTY, asserts selection change, and asserts no action dispatch.
+- Added Panel quit latency E2E that creates a feature-gated pending reload barrier, sends Ctrl+C through PTY, and asserts bounded exit.
+- Artifacts include event log, input log, raw PTY output, and run metadata under `target/e2e-artifacts`.
+
+Orchestrator validation after merge:
+- `cargo fmt --check`: PASS
+- `cargo check -p tui --all-targets`: PASS
+- `cargo check -p yoi --all-targets`: PASS
+- `cargo check -p tui --all-targets --features e2e-test`: PASS
+- `cargo check -p yoi --all-targets --features e2e-test`: PASS
+- `cargo build -p yoi --features e2e-test`: PASS
+- `YOI_E2E_BIN=/home/hare/Projects/yoi/.worktree/orchestration/yoi-orchestrator/target/debug/yoi cargo test -p yoi-e2e --features e2e --test panel -- --nocapture`: PASS（2 tests）
+- `cargo check -p yoi-e2e --all-targets --features e2e`: PASS
+- `git diff --check`: PASS
+
+Remaining gaps / risks:
+- Harness is Unix PTY based。
+- Screen artifact is raw PTY output rather than parsed terminal snapshot。
+- This is a first vertical slice for Panel/TUI PTY E2E; broader Pod protocol/provider stub scenarios remain future work under this E2E harness direction。
+
+Next:
+- Mark Ticket `done` and clean up child coder/reviewer Pods plus implementation worktree/branch. Closure remains separate.
+
+---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-13T15:23:44Z from: inprogress to: done reason: merged_and_validated field: state -->
+
+## State changed
+
+E2E harness implementation branch was reviewed, approved after requested production-boundary changes, merged into the Orchestrator branch as `b3bd6b11`, and validated in the Orchestrator worktree. Opt-in Panel PTY E2E tests for mouse selection and quit latency passed, along with formatting, diff check, normal/e2e feature package checks, and E2E package check. Ticket implementation work is done; closure remains separate.
+
+---
