@@ -187,3 +187,28 @@ Critical risks / reviewer focus:
 Ticket evidence、relations、orchestration plan、関連 closed Ticket、bounded code map、Orchestrator worktree clean state を確認した。blocking relation はなく、rewind live refresh の要件・invariants・escalation conditions は実装可能な粒度で記録済み。実装 side effect の前に routing decision / IntentPacket / accepted plan を記録したため、専用 child worktree と Coder delegation に進む。
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-06-13T11:14:26Z -->
+
+## Implementation report
+
+Implementation report for commit 949ceb5a (fix: refresh tui after rewind)
+
+Files changed:
+- crates/tui/src/app.rs: added rewind apply-pending state, post-rewind live-update fence, authoritative RewindApplied restore path that always clears/replays retained entries, actionbar-visible failure handling, and focused rewind refresh tests.
+- crates/tui/src/single_pod.rs: route Esc through cancel_rewind_picker so submitted rewinds stay visibly pending until the Pod responds.
+- crates/tui/src/ui.rs: show an applying/waiting state in the rewind picker header while RewindTo is pending.
+
+Validation:
+- cargo test -p tui rewind_refresh_tests: PASS (4 tests).
+- cargo test -p tui single_pod::tests::rewind_picker: PASS (2 tests).
+- cargo fmt --check: PASS.
+- git diff --check: PASS.
+- cargo test -p tui: ATTEMPTED; unrelated failures remain in multi_pod::tests::orchestrator_launch_context_uses_orchestration_root_for_runtime_workspace and spawn::tests::{profile_choices_include_builtin_and_project_default_marker, profile_choices_use_project_registry_default}. The rewind-focused tests above passed.
+
+Residual risks:
+- The stale-update fence is intentionally short-lived and clears on authoritative Status/Snapshot after RewindApplied; it drops queued display-mutating live events during that window to avoid re-polluting the restored session tail.
+- No protocol or Pod persistence changes were made.
+
+
+---
