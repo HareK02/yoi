@@ -42,3 +42,11 @@ Implementation handoff resumed successfully after retry.
 The root workspace grant is non-recursive and is only for runtime launch validation. Coder instructions explicitly prohibit inspecting, writing, running git, validating, merging, or cleaning up in the root/original workspace.
 
 ---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-13T18:43:30Z from: queued to: inprogress reason: orchestrator_acceptance_recorded_after_spawn_retry field: state -->
+
+## State changed
+
+Coder Pod `coder-00001KV10SN02-e2e-critical` has been started after SpawnPod retry with explicit root non-recursive read grant. This records the missing acceptance marker before further implementation/review side effects continue; previous handoff report already documented the retry and scope.
+
+---
