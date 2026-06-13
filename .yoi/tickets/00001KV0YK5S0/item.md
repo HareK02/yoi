@@ -1,8 +1,8 @@
 ---
 title: 'E2E harness を完全な tmp runtime/data/workspace 隔離と cleanup に対応させる'
-state: 'inprogress'
+state: 'done'
 created_at: '2026-06-13T16:56:11Z'
-updated_at: '2026-06-13T17:31:57Z'
+updated_at: '2026-06-13T17:33:53Z'
 assignee: null
 readiness: 'ready'
 queued_by: 'yoi ticket'

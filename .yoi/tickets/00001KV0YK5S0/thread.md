@@ -150,3 +150,46 @@ Notes:
 Decision: approve.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-13T17:33:46Z -->
+
+## Implementation report
+
+Integration outcome: merged and validated.
+
+- Implementation branch: `ticket-00001KV0YK5S0-e2e-tmp-isolation`
+- Implementation commit: `07e754ce test: isolate e2e tmp runtime fixtures`
+- Review: Orchestrator direct review `approve`（Reviewer Pod は現 delegated scope の child launch validation 制約で起動できなかったため、Orchestrator が diff / validation / artifact を確認）
+- Orchestrator merge commit: `20184eeb merge: e2e tmp isolation`
+
+Implemented:
+- E2E fixture now creates per-scenario clean temp root under `target/e2e-tmp` with isolated workspace, HOME, XDG data/state/config, and explicit fixture `XDG_RUNTIME_DIR`。
+- Tested `yoi` subprocesses continue to use `env_clear()` and now receive fixture-local runtime dir, preventing host runtime / Pod registry observation。
+- Fixture metadata, run metadata, fixture snapshot, and cleanup report are persisted under `target/e2e-artifacts/<run>` before temp cleanup。
+- Fixture temp roots are removed after scenario completion, and cleanup reports record `cleanup_success` plus `fixture_root_exists_after`。
+- Existing binary provider, `YOI_E2E_BIN` override, credential env isolation, mouse capture guard, and quit pending barrier remain intact。
+
+Orchestrator validation after merge:
+- `cargo fmt --check`: PASS
+- `git diff --check`: PASS
+- `cargo check -p yoi-e2e --all-targets --features e2e`: PASS
+- `XDG_RUNTIME_DIR=/tmp/yoi-e2e-host-runtime-leak-test OPENAI_API_KEY=host-secret ANTHROPIC_API_KEY=host-secret GEMINI_API_KEY=host-secret cargo test -p yoi-e2e --features e2e --test panel -- --nocapture`: PASS（2 tests）
+- Artifact spot-check: latest `cleanup.json` files record `cleanup_success: true` and `fixture_root_exists_after: false`。
+- `target/e2e-tmp` direct child count after validation: 0。
+
+Residual notes:
+- Persistent diagnostic artifacts intentionally remain under `target/e2e-artifacts`。
+- Fixture snapshots may contain fixture-local `workspace` / `workspace-orchestrator` metadata, but those live under the copied artifact snapshot, not host runtime/data state。
+
+Next:
+- Mark Ticket `done` and clean up implementation worktree/branch.
+
+---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-13T17:33:53Z from: inprogress to: done reason: merged_and_validated field: state -->
+
+## State changed
+
+E2E tmp/runtime isolation follow-up was reviewed, merged into the Orchestrator branch as `20184eeb`, and validated in the Orchestrator worktree. Panel E2E now uses clean per-scenario tmp workspace/data/runtime fixtures, preserves artifacts under `target/e2e-artifacts`, removes fixture temp roots after runs, and does not inherit host runtime/credential environment. Ticket implementation work is done; closure remains separate.
+
+---
