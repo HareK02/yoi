@@ -84,3 +84,38 @@ Validation:
 Ticket evidence、relation records、orchestration plan、workspace state を確認した。This Ticket 自身を blocking する relation はなく、incoming dependent Ticket の前提として先に進めるべき。実装 side effect の前に inprogress acceptance を記録する。
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-06-13T18:53:02Z -->
+
+## Implementation report
+
+## Implementation report
+
+Commit: `5549c50d8679` (`feat: remove feature host authority API`)
+
+Files changed:
+- `crates/pod/src/feature.rs`
+  - Removed `HostAuthority`, `HostAuthorityRequest`, `HostAuthorityGrantSet`, host-authority denial errors, grant plumbing, and per-tool host-authority gates from the public feature API/install path.
+  - Kept ordinary contribution declaration diagnostics: duplicate names, undeclared/mismatched tools, undeclared hooks/background tasks/services, skipped contributions, and service requirement diagnostics.
+  - Kept install reports focused on installed/skipped contributions and diagnostics without security grant semantics.
+- `crates/pod/src/feature/builtin/ticket.rs`
+  - Stopped declaring TicketBackend host authority and registering Ticket tools with feature-layer authority requirements.
+  - Preserved explicit `TicketFeatureConfig`, backend provider/root validation, and access-level-controlled tool exposure.
+- `crates/pod/src/feature/builtin/task/mod.rs`
+  - Removed Task feature prose that referenced feature-layer host authorities.
+
+Validation:
+- `cargo test -p pod feature:: --lib` — passed (46 tests).
+- `cargo test -p pod feature::builtin::task --lib` — passed (18 tests).
+- `cargo test -p ticket` — passed (68 tests + doc-tests).
+- `cargo fmt --check` — passed.
+- `cargo check --workspace --all-targets` — passed.
+- `git diff --check` — passed before commit.
+- Source grep under `crates/**/*.rs` found no remaining `HostAuthority*`, `host_authority`, `with_host_authority`, `requested_host_authorities`, or `required_host_authorities` symbols/terminology after cleanup.
+
+Residual risks / notes:
+- `nix build .#yoi` was not run; this change does not modify dependencies, `Cargo.lock`, packaging, or source filters.
+- Related Plugin/MCP planning Ticket review was not performed from this delegated Coder scope because only Ticket `00001KV0SP0TY` is readable/writable in `.yoi/tickets`; no Plugin/MCP permission or trust policy was implemented.
+
+
+---
