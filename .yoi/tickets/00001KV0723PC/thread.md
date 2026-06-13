@@ -21,3 +21,12 @@ Panel から Quit するときに断続的な遅延が発生する問題につ�
 要件・受け入れ条件・binding decisions・調査焦点が揃っており、Orchestrator が spike/実装修正へ routing できるため ready にする。
 
 ---
+
+<!-- event: state_changed author: workspace-panel at: 2026-06-13T10:53:17Z from: ready to: queued reason: queued field: state -->
+
+## State changed
+
+Ticket を `workspace-panel` が queued にしました。
+
+
+---
