@@ -268,3 +268,21 @@ Next:
 E2E binary provider follow-up was reviewed, approved, merged into the Orchestrator branch as `8abc2b7f`, and validated in the Orchestrator worktree. Default E2E runs now build the current `yoi` binary before direct PTY spawn, `YOI_E2E_BIN` override remains available, and tested `yoi` subprocesses are isolated with `env_clear()` plus allowlist so host provider credentials are not inherited. Ticket implementation work is done; closure remains separate.
 
 ---
+
+<!-- event: state_changed author: hare at: 2026-06-13T16:34:06Z from: done to: closed reason: closed field: state -->
+
+## State changed
+
+Ticket を closed にしました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-06-13T16:34:06Z status: closed -->
+
+## 完了
+
+Closed after prior done-state completion.
+
+
+---

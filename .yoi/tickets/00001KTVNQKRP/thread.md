@@ -82,3 +82,21 @@ State changed to `done`.
 
 
 ---
+
+<!-- event: state_changed author: hare at: 2026-06-13T16:34:06Z from: done to: closed reason: closed field: state -->
+
+## State changed
+
+Ticket を closed にしました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-06-13T16:34:06Z status: closed -->
+
+## 完了
+
+Closed after prior done-state completion.
+
+
+---

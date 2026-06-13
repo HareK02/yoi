@@ -289,3 +289,21 @@ Conclusion:
 - Follow-up must identify the actual user command/binary path and measure `yoi panel` quit latency before and after any further fix. If the relevant path is current source/debug, this Ticket should be treated as not actually resolved.
 
 ---
+
+<!-- event: state_changed author: hare at: 2026-06-13T16:34:06Z from: done to: closed reason: closed field: state -->
+
+## State changed
+
+Ticket を closed にしました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-06-13T16:34:06Z status: closed -->
+
+## 完了
+
+Closed after prior done-state completion.
+
+
+---

@@ -297,3 +297,21 @@ Next:
 Implementation branch `ticket-00001KV04NJ8D-rewind-live-refresh` was reviewed, approved, merged into the Orchestrator branch as `802fa1f0`, and validated in the Orchestrator worktree. Focused rewind tests, formatting, diff check, and `cargo check -p protocol -p pod -p tui` passed. Remaining full `cargo test -p tui` failures noted by reviewer are unrelated known multi_pod/spawn tests. Ticket implementation work is done; closure remains separate.
 
 ---
+
+<!-- event: state_changed author: hare at: 2026-06-13T16:34:06Z from: done to: closed reason: closed field: state -->
+
+## State changed
+
+Ticket を closed にしました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-06-13T16:34:06Z status: closed -->
+
+## 完了
+
+Closed after prior done-state completion.
+
+
+---
