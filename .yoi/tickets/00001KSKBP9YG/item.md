@@ -2,7 +2,7 @@
 title: "E2E テストハーネス"
 state: 'inprogress'
 created_at: "2026-05-27T00:00:02Z"
-updated_at: '2026-06-13T14:17:40Z'
+updated_at: '2026-06-13T14:18:55Z'
 queued_by: 'yoi ticket'
 queued_at: '2026-06-13T14:17:34Z'
 ---

@@ -171,3 +171,21 @@ Ticket を `yoi ticket` が queued にしました。
 ユーザーが明示的に inprogress 化して進めることを承認した。Ticket evidence / relation records / OrchestrationPlan accepted plan / Orchestrator worktree clean state を確認済みで、blocking relation はない。Implementation side effect の前に state を inprogress として記録する。
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-13T14:18:55Z -->
+
+## Implementation report
+
+Implementation handoff started.
+
+- Worktree: `/home/hare/Projects/yoi/.worktree/e2e-harness`
+- Branch: `ticket-00001KSKBP9YG-e2e-harness`
+- Coder Pod: `coder-00001KSKBP9YG-e2e`
+- Scope: child worktree read、root `Cargo.toml` / `Cargo.lock` write、`tests/e2e` write、selected crates (`crates/tui`, `crates/yoi`, `crates/pod`, `crates/protocol`) write、`target` write、this Ticket record write。`.yoi/memory` や local/runtime/log/lock/secret-like `.yoi` paths は write scope に含めていない。
+- Note: runtime launch validation のため `/home/hare/Projects/yoi` に非再帰 read grant を付けたが、Coder には root/original workspace を inspect/write/git/validate/merge/cleanup しないよう明示済み。
+
+Next:
+- Coder は Playwright-like declarative E2E harness、read-only structured observability、PTY input、Panel mouse / quit latency regression scenario の first slice を実装する。
+- Coder の commit / implementation_report / validation evidence を確認後、Reviewer を read-only 基本で起動する。
+
+---
