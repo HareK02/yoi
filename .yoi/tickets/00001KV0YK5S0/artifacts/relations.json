@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "relations": [
+    {
+      "ticket_id": "00001KV0YK5S0",
+      "kind": "related",
+      "target": "00001KSKBP9YG",
+      "note": "E2E harness first slice の runtime/tmp isolation と cleanup follow-up。",
+      "author": "orchestrator",
+      "at": "2026-06-13T16:56:22Z"
+    },
+    {
+      "ticket_id": "00001KV0YK5S0",
+      "kind": "related",
+      "target": "00001KV0TJVN5",
+      "note": "E2E binary/env isolation follow-up の残課題（runtime/data/workspace isolation and cleanup）を補う。",
+      "author": "orchestrator",
+      "at": "2026-06-13T16:56:22Z"
+    }
+  ]
+}
