@@ -1,11 +1,13 @@
 ---
 title: 'Remove feature-layer HostAuthority model'
-state: 'ready'
+state: 'queued'
 created_at: '2026-06-13T15:30:22Z'
-updated_at: '2026-06-13T16:27:15Z'
+updated_at: '2026-06-13T16:33:15Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['feature-api', 'tool-registry', 'ticket-tools']
+queued_by: 'workspace-panel'
+queued_at: '2026-06-13T16:33:15Z'
 ---
 
 ## Background
