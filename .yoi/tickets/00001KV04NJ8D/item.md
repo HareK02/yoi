@@ -1,11 +1,13 @@
 ---
 title: 'TUI rewind picker の Enter 後に live 表示が巻き戻らない問題を調査・修正する'
-state: 'ready'
+state: 'queued'
 created_at: '2026-06-13T09:23:07Z'
-updated_at: '2026-06-13T10:02:13Z'
+updated_at: '2026-06-13T10:53:20Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['tui', 'pod-protocol', 'persistence', 'history-rewind']
+queued_by: 'workspace-panel'
+queued_at: '2026-06-13T10:53:20Z'
 ---
 
 ## Background

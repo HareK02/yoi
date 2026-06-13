@@ -100,3 +100,12 @@ LocalTicketBackend によって作成されました。
 ユーザーが Ticket の ready 化を明示したため、Orchestrator が routing できる状態にする。
 
 ---
+
+<!-- event: state_changed author: workspace-panel at: 2026-06-13T10:53:20Z from: ready to: queued reason: queued field: state -->
+
+## State changed
+
+Ticket を `workspace-panel` が queued にしました。
+
+
+---
