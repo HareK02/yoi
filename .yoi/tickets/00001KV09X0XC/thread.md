@@ -30,3 +30,43 @@ Ticket を `workspace-panel` が queued にしました。
 
 
 ---
+
+<!-- event: decision author: orchestrator at: 2026-06-13T18:41:14Z -->
+
+## Decision
+
+Routing decision: implementation_ready
+
+Reason:
+- Ticket は `queued` で、ready Ticket を Panel からユーザー指示付きで `planning` に戻し Intake を再開する action の intent / requirements / acceptance criteria / invariants が具体化されている。
+- `TicketRelationQuery` / `TicketOrchestrationPlanQuery` に blocker はない。
+- Risk は panel-action / ticket-lifecycle / role-session / authority-boundary だが、対象は `ready -> planning` のみ、typed backend 経由、Queue/Orchestrator/worktree/coder side effect 不発生という binding invariants が明記済み。
+- `00001KV0X254D` と同じ Panel 周辺に触れる可能性はあるが action dispatch と orchestration branch config は論理的に分離できる。merge conflict が出たらその Ticket を止めて報告する。
+
+Evidence checked:
+- Ticket body / thread / artifacts。
+- relation records: なし。
+- orchestration plan records: なし。
+- workspace state: Orchestrator worktree clean、dedicated child worktree で実装予定。
+
+IntentPacket:
+- Panel の ready Ticket row から Queue とは別に refinement/intake 再開 action を実行できるようにし、ユーザー指示を Ticket thread に保存して typed `ready -> planning` を記録し、Intake restore/launch を試行する。
+
+Binding decisions / invariants:
+- この action は implementation routing ではなく requirements sync への戻し。
+- `queued` / `inprogress` は範囲外。
+- stale state は再読込して拒否する。
+- Queue、`queued -> inprogress`、worktree 作成、coder/reviewer spawn は発生させない。
+
+Validation:
+- Focused Panel/action tests、Ticket lifecycle/role-session tests、`cargo test -p tui workspace_panel`、`cargo test -p ticket`、`cargo fmt --check`、`git diff --check`。
+
+---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-13T18:41:25Z from: queued to: inprogress reason: orchestrator_acceptance_unblocked field: state -->
+
+## State changed
+
+Ticket evidence、relation records、orchestration plan、workspace state を確認した。Blocking relation はなく、implementation-ready。実装 side effect の前に inprogress acceptance を記録する。
+
+---
