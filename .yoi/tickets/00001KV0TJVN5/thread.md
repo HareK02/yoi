@@ -225,3 +225,46 @@ Risks / follow-up:
 
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-13T16:09:20Z -->
+
+## Implementation report
+
+Integration outcome: merged and validated.
+
+- Implementation branch: `ticket-00001KV0TJVN5-e2e-binary-provider`
+- Implementation commits: `13d00530 test: build e2e yoi binary provider`, `47efeb01 test: isolate e2e yoi subprocess env`
+- Review commit/event: `7e24a8df ticket: approve e2e binary provider`
+- Orchestrator merge commit: `8abc2b7f merge: e2e binary provider`
+
+Implemented:
+- Default E2E binary provider now runs `${CARGO:-cargo} build -p yoi --features e2e-test --bin yoi` from workspace root, caches the result, and direct-spawns the produced `target/{profile}/yoi` binary for PTY tests。
+- `YOI_E2E_BIN=<path>` remains an explicit override and skips the default cargo-build provider。
+- `cargo run` is not used as process-under-test; Cargo is not in the PTY/signal/quit-latency measured path。
+- Tested `yoi` subprocesses (`PanelHarness::spawn` and fixture setup `run_yoi_capture`) now use `env_clear()` plus explicit allowlists only。
+- Host provider credentials / token / secret-like env are default-denied for tested `yoi` subprocesses。
+- Artifacts include binary provider/build command/binary path and tested subprocess env policy。
+
+Orchestrator validation after merge:
+- `cargo fmt --check`: PASS
+- `git diff --check`: PASS
+- `cargo check -p yoi-e2e --all-targets --features e2e`: PASS
+- `cargo test -p yoi-e2e --features e2e tested_yoi_env_policy_is_env_clear_allowlist -- --nocapture`: PASS
+- `unset YOI_E2E_BIN && OPENAI_API_KEY=host-secret ANTHROPIC_API_KEY=host-secret GEMINI_API_KEY=host-secret cargo test -p yoi-e2e --features e2e --test panel -- --nocapture`: PASS（default cargo-build provider used; 2 panel E2E tests passed）
+- `YOI_E2E_BIN=/home/hare/Projects/yoi/.worktree/orchestration/yoi-orchestrator/target/debug/yoi OPENAI_API_KEY=host-secret ANTHROPIC_API_KEY=host-secret GEMINI_API_KEY=host-secret cargo test -p yoi-e2e --features e2e --test panel -- --nocapture`: PASS（override provider used; 2 panel E2E tests passed）
+
+Residual note:
+- Cargo build provider intentionally uses build-tool environment; only tested `yoi` subprocesses are env-isolated. Future LLM/provider E2E should use fixture providers/canned servers/explicit test env, not host credentials。
+
+Next:
+- Mark Ticket `done` and clean up child coder/reviewer Pods plus implementation worktree/branch. Closure remains separate。
+
+---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-13T16:09:29Z from: inprogress to: done reason: merged_and_validated field: state -->
+
+## State changed
+
+E2E binary provider follow-up was reviewed, approved, merged into the Orchestrator branch as `8abc2b7f`, and validated in the Orchestrator worktree. Default E2E runs now build the current `yoi` binary before direct PTY spawn, `YOI_E2E_BIN` override remains available, and tested `yoi` subprocesses are isolated with `env_clear()` plus allowlist so host provider credentials are not inherited. Ticket implementation work is done; closure remains separate.
+
+---
